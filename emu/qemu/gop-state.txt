@@ -81,3 +81,19 @@ DMCUB_INBOX1_RPTR 2 0x01d7 0x0da5c 0x00000000
 
 # PSP (MP0 segment 0): bootloader ready; no sOS, the model runs no PSP firmware
 MP0_SMN_C2PMSG_35 0 0x0063 0x5818c 0x80000000
+# PSP bootloader version, as read on the RX 9070 XT (2026-09-27 survey)
+MP0_SMN_C2PMSG_59 0 0x007b 0x581ec 0x003a0d43
+
+# MM hub (mmhub 4.1.0 seg0 0x1a000) as the VBIOS leaves it, from the same
+# hardware survey: FB aperture MC 0x80_0000_0000..0x83fb_ffff_ffff, system
+# aperture over it, L2 off, VMID0 context off (fault enables only)
+MMMC_VM_FB_LOCATION_BASE 0 0x0554 0x69550 0x00008000
+MMMC_VM_FB_LOCATION_TOP 0 0x0555 0x69554 0x000083fb
+MMMC_VM_SYSTEM_APERTURE_LOW_ADDR 0 0x0559 0x69564 0x00200000
+MMMC_VM_SYSTEM_APERTURE_HIGH_ADDR 0 0x055a 0x69568 0x0020feff
+MMVM_L2_CNTL 0 0x04e4 0x69390 0x00080602
+MMVM_CONTEXT0_CNTL 0 0x0564 0x69590 0x03fffc00
+
+# NBIF (6.3.1 seg2 0xd20): HDP flush remapped into BAR5 by the VBIOS
+BIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL 2 0x012d 0x03934 0x0000385c
+BIF_BX0_REMAP_HDP_REG_FLUSH_CNTL 2 0x012e 0x03938 0x00003858

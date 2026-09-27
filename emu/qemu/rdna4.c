@@ -16,9 +16,13 @@
  *    DDC slave on one line), DP AUX (no sink attached), RCC_CONFIG_MEMSIZE,
  *    the DMUB inbox1 ring (QUERY_FEATURE_CAPS answered; the VBIOS-family
  *    SET_PIXEL_CLOCK / DIG1_TRANSMITTER_CONTROL / DIGX_ENCODER_CONTROL
- *    commands drive the model's PHY PLLs and transmitters) and the SMU (MP1)
- *    message mailbox. OTG_MASTER_UPDATE_LOCK holds the double-buffered OTG
- *    timing and HUBP surface registers until it is released.
+ *    commands drive the model's PHY PLLs and transmitters), the PSP (MP0)
+ *    bootloader mailbox and GPCOM ring (sOS components, ring creation,
+ *    LOAD_TOC, LOAD_IP_FW, fences; buffers are read through the MM hub's FB
+ *    aperture) and the SMU (MP1) mailbox, which, as on the card, only
+ *    answers once the SMU firmware came in through the PSP.
+ *    OTG_MASTER_UPDATE_LOCK holds the double-buffered OTG timing and HUBP
+ *    surface registers until it is released.
  *  - An attached monitor: the scanout only shows when the lit OTG's DIG
  *    drives an enabled transmitter at the OTG's pixel clock and the
  *    resulting timing is inside the EDID's range limits; otherwise the
@@ -184,6 +188,42 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define REG_SMU_RESP         ((MP1_SEG1 + 0x009a) * 4)
 #define SMU_RESP_OK          0x01
 #define SMU_RESP_UNKNOWN     0xfe
+#define SMU_PMFW_VERSION     0x00685000 /* smu_14_0_3.bin's ucode_version */
+
+/*
+ * PSP (MP0 14.0.3) mailbox: MPASP_SMN_C2PMSG_n, MP0 segment 0 (dword 0x16000).
+ * The bootloader takes components via C2PMSG_35/36; the sOS answers ring
+ * control in C2PMSG_64 and takes GPCOM frames when C2PMSG_67 moves.
+ */
+#define MP0_SEG0             0x16000
+#define REG_PSP(n)           ((MP0_SEG0 + (n)) * 4)
+#define REG_PSP_BL_CMD       REG_PSP(0x63)   /* C2PMSG_35 */
+#define REG_PSP_BL_BUF       REG_PSP(0x64)   /* C2PMSG_36: MC address >> 20 */
+#define REG_PSP_RING_CTL     REG_PSP(0x80)   /* C2PMSG_64 */
+#define REG_PSP_RING_WPTR    REG_PSP(0x83)   /* C2PMSG_67 (dwords) */
+#define REG_PSP_RING_LO      REG_PSP(0x85)   /* C2PMSG_69 */
+#define REG_PSP_RING_HI      REG_PSP(0x86)   /* C2PMSG_70 */
+#define REG_PSP_RING_SIZE    REG_PSP(0x87)   /* C2PMSG_71 */
+#define REG_PSP_SOS          REG_PSP(0x91)   /* C2PMSG_81: sOS sign of life */
+#define PSP_READY            0x80000000u
+#define PSP_BL_SYSDRV        0x10000
+#define PSP_BL_SOSDRV        0x20000
+#define PSP_SOS_VERSION      0x003a1214     /* psp_14_0_3_sos.bin's sOS */
+#define PSP_FRAME_SIZE       64
+#define PSP_CMD_ID           8              /* psp_gfx_cmd_resp.cmd_id */
+#define PSP_CMD_ARGS         28             /* .cmd */
+#define PSP_RESP_STATUS      864            /* .resp.status */
+#define PSP_RESP_FW_LO       872
+#define PSP_RESP_TMR_SIZE    880
+#define PSP_CMD_LOAD_IP_FW   0x06
+#define PSP_CMD_LOAD_TOC     0x20
+#define PSP_CMD_FB_RESERV    0x50
+#define PSP_FW_TYPE_SMU      18
+#define PSP_ERR_UNKNOWN_CMD  0x100
+#define PSP_TMR_SIZE         0x1400000      /* model's answer to LOAD_TOC */
+
+/* MM hub FB aperture (mmhub 4.1.0 segment 0, dword 0x1a000) */
+#define REG_MMHUB_FB_BASE    ((0x1a000 + 0x0554) * 4)
 
 #define ARB_STATUS_SHIFT     2          /* [3:2]: 0 idle, 1 SW, 2 HW/DMCU */
 #define ARB_STATUS_MASK      (3u << ARB_STATUS_SHIFT)
@@ -254,6 +294,13 @@ struct RDNA4State {
     RDNA4Pending pending[MAX_PENDING];  /* double-buffered writes under lock */
     unsigned     npending;
     RDNA4Scanout scanout;
+
+    /* PSP and SMU firmware state */
+    uint32_t     psp_bl_loaded;         /* bootloader commands taken, by bit */
+    uint64_t     psp_ring_mc;
+    uint32_t     psp_ring_size;
+    uint32_t     psp_rptr;              /* dwords */
+    bool         pmfw_loaded;           /* SMU firmware in: the mailbox answers */
 };
 
 static inline uint32_t reg_get(RDNA4State *s, uint32_t byte)
@@ -679,19 +726,24 @@ static void rdna4_dmub_wptr(RDNA4State *s, uint32_t wptr)
 
 /*
  * PPSMC message protocol (smu_v14_0): the driver clears RESP, stages PARAM
- * and writes the message id; the PMFW answers in RESP (and PARAM). Only the
- * messages the kext's diagnostics send are known; the version queries
- * report 0, as there is no PMFW to report a real one.
+ * and writes the message id; the PMFW answers in RESP (and PARAM). As on the
+ * card, nothing answers until the SMU firmware has been loaded through the
+ * PSP (LOAD_IP_FW, type SMU). Only the messages the kext sends are known.
  */
 static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
 {
     uint32_t resp = SMU_RESP_OK;
 
     reg_set(s, REG_SMU_MSG, msg);
+    if (!s->pmfw_loaded) {
+        return;                                    /* no PMFW: RESP stays 0 */
+    }
     switch (msg) {
     case 0x1:                                      /* TestMessage */
         break;
     case 0x2:                                      /* GetSmuVersion */
+        reg_set(s, REG_SMU_PARAM, SMU_PMFW_VERSION);
+        break;
     case 0x3:                                      /* GetDriverIfVersion */
         reg_set(s, REG_SMU_PARAM, 0);
         break;
@@ -700,6 +752,186 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
         break;
     }
     reg_set(s, REG_SMU_RESP, resp);
+}
+
+/* ---- PSP ------------------------------------------------------------------ */
+
+/*
+ * The firmware side of the PSP, as far as the kext's stage 2 needs it. It
+ * checks what a real PSP would reject outright (buffers that are empty or
+ * outside VRAM, an sOS without its system driver, a ring before the sOS) and
+ * otherwise accepts: it authenticates nothing and runs no firmware.
+ */
+
+/* VRAM offset of an MC address in the MM hub's FB aperture, or -1. */
+static int64_t rdna4_mc_to_vram(RDNA4State *s, uint64_t mc)
+{
+    uint64_t base = (uint64_t)(reg_get(s, REG_MMHUB_FB_BASE) & 0xffffff) << 24;
+
+    if (!base || mc < base || mc - base >= rdna4_vram_size()) {
+        return -1;
+    }
+    return mc - base;
+}
+
+static uint8_t *rdna4_mc_span(RDNA4State *s, uint64_t mc, uint64_t len)
+{
+    int64_t off = rdna4_mc_to_vram(s, mc);
+
+    return off < 0 ? NULL : rdna4_vram_span(s, off, len);
+}
+
+static uint32_t rdna4_mc_get(RDNA4State *s, uint64_t mc)
+{
+    uint8_t *p = rdna4_mc_span(s, mc, 4);
+
+    return p ? ldl_le_p(p) : 0;
+}
+
+static void rdna4_mc_set(RDNA4State *s, uint64_t mc, uint32_t val)
+{
+    uint8_t *p = rdna4_mc_span(s, mc, 4);
+
+    if (p) {
+        stl_le_p(p, val);
+    }
+}
+
+/* A buffer the driver claims to have filled: in VRAM and not all zero. */
+static bool rdna4_psp_buffer_ok(RDNA4State *s, uint64_t mc, uint32_t len)
+{
+    uint8_t *p = rdna4_mc_span(s, mc, len);
+
+    if (!p || !len) {
+        return false;
+    }
+    for (uint32_t i = 0; i < MIN(len, 256u); i++) {
+        if (p[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Bit for a bootloader command in psp_bl_loaded: the driver-component
+ * commands are 0x10000..0xF0000 (bits 1..15 by their [19:16]); SPL and
+ * SPDM (0x10000000, 0x20000000) take bits 16 and 17.
+ */
+static uint32_t rdna4_psp_bl_bit(uint32_t cmd)
+{
+    return cmd >= 0x10000000 ? 16 + ctz32(cmd >> 28) : (cmd >> 16) & 15;
+}
+
+static void rdna4_psp_bootloader(RDNA4State *s, uint32_t cmd)
+{
+    uint64_t buf = (uint64_t)reg_get(s, REG_PSP_BL_BUF) << 20;
+
+    reg_set(s, REG_PSP_BL_CMD, cmd);
+    if (reg_get(s, REG_PSP_SOS)) {
+        return;                         /* the bootloader is gone once the sOS runs */
+    }
+    if (!rdna4_psp_buffer_ok(s, buf, 1 * MiB)) {
+        fprintf(stderr, "rdna4: psp: bootloader command 0x%x with an empty or unmapped "
+                "buffer (MC 0x%" PRIx64 "), not answering\n", cmd, buf);
+        return;                         /* stays busy: the driver times out */
+    }
+    if (cmd == PSP_BL_SOSDRV) {
+        if (!(s->psp_bl_loaded & (1u << rdna4_psp_bl_bit(PSP_BL_SYSDRV)))) {
+            fprintf(stderr, "rdna4: psp: sOS without its system driver, not starting\n");
+            return;
+        }
+        reg_set(s, REG_PSP_SOS, PSP_SOS_VERSION);
+        reg_set(s, REG_PSP_RING_CTL, PSP_READY);     /* TOS ready for a ring */
+    }
+    s->psp_bl_loaded |= 1u << rdna4_psp_bl_bit(cmd);
+    fprintf(stderr, "rdna4: psp: bootloader took command 0x%x\n", cmd);
+    reg_set(s, REG_PSP_BL_CMD, PSP_READY);
+}
+
+static void rdna4_psp_ring_ctl(RDNA4State *s, uint32_t val)
+{
+    reg_set(s, REG_PSP_RING_CTL, val);
+    if (val != (2u << 16)) {            /* only KM (GPCOM) ring creation */
+        return;
+    }
+    s->psp_ring_mc = reg_get(s, REG_PSP_RING_LO) |
+                     ((uint64_t)reg_get(s, REG_PSP_RING_HI) << 32);
+    s->psp_ring_size = reg_get(s, REG_PSP_RING_SIZE);
+    if (!reg_get(s, REG_PSP_SOS) || s->psp_ring_size < PSP_FRAME_SIZE ||
+        s->psp_ring_size % PSP_FRAME_SIZE ||
+        !rdna4_mc_span(s, s->psp_ring_mc, s->psp_ring_size)) {
+        fprintf(stderr, "rdna4: psp: ring create refused (MC 0x%" PRIx64 ", %u bytes)\n",
+                 s->psp_ring_mc, s->psp_ring_size);
+        s->psp_ring_size = 0;
+        reg_set(s, REG_PSP_RING_CTL, PSP_READY | 0x1);   /* error status */
+        return;
+    }
+    s->psp_rptr = 0;
+    reg_set(s, REG_PSP_RING_WPTR, 0);
+    reg_set(s, REG_PSP_RING_CTL, PSP_READY);
+}
+
+static void rdna4_psp_command(RDNA4State *s, uint64_t cmd)
+{
+    uint32_t id = rdna4_mc_get(s, cmd + PSP_CMD_ID), status = 0;
+
+    switch (id) {
+    case PSP_CMD_LOAD_TOC: {
+        uint64_t toc = rdna4_mc_get(s, cmd + PSP_CMD_ARGS) |
+                       ((uint64_t)rdna4_mc_get(s, cmd + PSP_CMD_ARGS + 4) << 32);
+        uint32_t len = rdna4_mc_get(s, cmd + PSP_CMD_ARGS + 8);
+        if (rdna4_psp_buffer_ok(s, toc, len)) {
+            rdna4_mc_set(s, cmd + PSP_RESP_TMR_SIZE, PSP_TMR_SIZE);
+        } else {
+            status = 0xffff;
+        }
+        break;
+    }
+    case PSP_CMD_LOAD_IP_FW: {
+        uint64_t fw = rdna4_mc_get(s, cmd + PSP_CMD_ARGS) |
+                      ((uint64_t)rdna4_mc_get(s, cmd + PSP_CMD_ARGS + 4) << 32);
+        uint32_t len = rdna4_mc_get(s, cmd + PSP_CMD_ARGS + 8);
+        uint32_t type = rdna4_mc_get(s, cmd + PSP_CMD_ARGS + 12);
+        if (!rdna4_psp_buffer_ok(s, fw, len)) {
+            status = 0xffff;
+            break;
+        }
+        if (type == PSP_FW_TYPE_SMU) {
+            s->pmfw_loaded = true;
+        }
+        rdna4_mc_set(s, cmd + PSP_RESP_FW_LO, 0x1000 * type);  /* "TMR address" */
+        fprintf(stderr, "rdna4: psp: LOAD_IP_FW type %u, %u bytes\n", type, len);
+        break;
+    }
+    case PSP_CMD_FB_RESERV:
+        break;
+    default:
+        status = PSP_ERR_UNKNOWN_CMD;
+        break;
+    }
+    rdna4_mc_set(s, cmd + PSP_RESP_STATUS, status);
+}
+
+/* Consume GPCOM frames up to the new write pointer. */
+static void rdna4_psp_wptr(RDNA4State *s, uint32_t wptr)
+{
+    uint32_t ring_dw = s->psp_ring_size / 4;
+
+    reg_set(s, REG_PSP_RING_WPTR, wptr);
+    if (!ring_dw || wptr >= ring_dw) {
+        return;
+    }
+    while (s->psp_rptr != wptr) {
+        uint64_t frame = s->psp_ring_mc + s->psp_rptr * 4ull;
+        uint64_t cmd = rdna4_mc_get(s, frame) | ((uint64_t)rdna4_mc_get(s, frame + 4) << 32);
+        uint64_t fence = rdna4_mc_get(s, frame + 12) |
+                         ((uint64_t)rdna4_mc_get(s, frame + 16) << 32);
+
+        rdna4_psp_command(s, cmd);
+        rdna4_mc_set(s, fence, rdna4_mc_get(s, frame + 20));
+        s->psp_rptr = (s->psp_rptr + PSP_FRAME_SIZE / 4) % ring_dw;
+    }
 }
 
 /* ---- BAR5 --------------------------------------------------------------- */
@@ -761,6 +993,12 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         /* read-only */
     } else if (addr == REG_SMU_MSG) {
         rdna4_smu_msg(s, val);
+    } else if (addr == REG_PSP_BL_CMD) {
+        rdna4_psp_bootloader(s, val);
+    } else if (addr == REG_PSP_RING_CTL) {
+        rdna4_psp_ring_ctl(s, val);
+    } else if (addr == REG_PSP_RING_WPTR) {
+        rdna4_psp_wptr(s, val);
     } else if (dw >= DMU_SEG2 && dw < DMU_SEG3) {
         uint32_t d2 = dw - DMU_SEG2;
         if (d2 == DMCUB_INBOX1_WPTR) {
@@ -1152,6 +1390,11 @@ static void rdna4_reset(DeviceState *dev)
                MIN(s->discovery_len, RDNA4_DISCOVERY_TOP));
     }
     s->npending = 0;
+    s->psp_bl_loaded = 0;
+    s->psp_ring_mc = 0;
+    s->psp_ring_size = 0;
+    s->psp_rptr = 0;
+    s->pmfw_loaded = false;
     memset(s->symclk_khz, 0, sizeof(s->symclk_khz));
     memset(s->dig_mode, 0, sizeof(s->dig_mode));
     /*
