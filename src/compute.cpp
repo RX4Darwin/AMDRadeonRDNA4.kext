@@ -9,13 +9,23 @@
 
 #include "compute.hpp"
 
+#include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSString.h>
+#include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
 
 #define CLOG(fmt, ...)  IOLog("RDNA4FB: compute: " fmt "\n", ## __VA_ARGS__)
+
+// Lilu's vendor GUID; `nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail`
+// reads it back.
+static const char *kTrailKey = "4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail";
+// IONVRAM's "commit now, unthrottled" request key (IOKitKeys.h,
+// kIONVRAMForceSyncNowPropertyKey), handled by IODTNVRAM::setProperties.
+static const char *kNvramForceSync = "IONVRAM-FORCESYNCNOW-PROPERTY";
 
 using namespace GfxReg;
 
@@ -344,6 +354,53 @@ uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 }
 
 // ---------------------------------------------------------------------------
+// NVRAM breadcrumbs
+// ---------------------------------------------------------------------------
+
+// Only IORegistryEntry's own virtuals are called on the NVRAM entry: they
+// keep their vtable slots across releases. IODTNVRAM-specific virtuals
+// (sync, safeToSync) moved on Tahoe — calling them with an older SDK's
+// layout panics (seen in the VM through Lilu's NVStorage::sync).
+void RDNA4Compute::trail(const char *step) {
+	IORegistryEntry *nvram = IORegistryEntry::fromPath("/options", gIODTPlane);
+	if (!nvram)
+		return;
+	const OSSymbol *key = OSSymbol::withCString(kTrailKey);
+	OSString *value = OSString::withCString(step);
+	OSDictionary *sync = OSDictionary::withCapacity(1);
+	OSString *yes = OSString::withCString("1");
+	if (key && value)
+		nvram->setProperty(key, value);
+	if (sync && yes && sync->setObject(kNvramForceSync, yes))
+		nvram->setProperties(sync);
+	OSSafeReleaseNULL(yes);
+	OSSafeReleaseNULL(sync);
+	OSSafeReleaseNULL(value);
+	OSSafeReleaseNULL(key);
+	nvram->release();
+}
+
+void RDNA4Compute::logPreviousTrail() {
+	IORegistryEntry *nvram = IORegistryEntry::fromPath("/options", gIODTPlane);
+	if (!nvram)
+		return;
+	char text[96] {};
+	if (OSObject *prev = nvram->copyProperty(kTrailKey)) {
+		if (auto *s = OSDynamicCast(OSString, prev))
+			strlcpy(text, s->getCStringNoCopy(), sizeof(text));
+		else if (auto *d = OSDynamicCast(OSData, prev))
+			memcpy(text, d->getBytesNoCopy(),
+			       d->getLength() < sizeof(text) - 1 ? d->getLength() : sizeof(text) - 1);
+		prev->release();
+	}
+	if (text[0])
+		CLOG("previous boot's bring-up ended at: %s", text);
+	else
+		CLOG("no bring-up trail from a previous boot");
+	nvram->release();
+}
+
+// ---------------------------------------------------------------------------
 // Bring-up thread
 // ---------------------------------------------------------------------------
 
@@ -355,26 +412,32 @@ void RDNA4Compute::threadMain(void *arg, wait_result_t) {
 }
 
 void RDNA4Compute::runStages() {
+	// Read before this boot writes its own. Not at attach: that is before
+	// the EFI NVRAM driver has published the stored variables.
+	logPreviousTrail();
 	uint32_t done = StageSurvey;
+	char note[64];
+	auto stop = [&](const char *what) {
+		CLOG("%s failed; stopping, the display is not affected", what);
+		snprintf(note, sizeof(note), "stopped: %s failed (no hang)", what);
+		trail(note);
+		env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
+	};
 	if (target >= StagePsp) {
-		if (!stagePsp()) {
-			CLOG("stage 2 (psp) failed; stopping, the display is not affected");
-			env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
-			return;
-		}
+		if (!stagePsp())
+			return stop("stage 2 (psp)");
 		done = StagePsp;
 	}
 	if (target >= StageGfx) {
-		if (!stageGfx()) {
-			CLOG("stage 3 (gfx) failed; stopping, the display is not affected");
-			env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
-			return;
-		}
+		if (!stageGfx())
+			return stop("stage 3 (gfx)");
 		done = StageGfx;
 	}
 	if (target >= StageSdma)
 		CLOG("stage 4 (sdma) is not implemented yet; stopping after stage 3");
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
+	snprintf(note, sizeof(note), "finished at stage %u", done);
+	trail(note);
 	CLOG("bring-up finished at stage %u", done);
 }
 
@@ -504,6 +567,7 @@ bool RDNA4Compute::stagePsp() {
 	}
 
 	// 1. The secure OS, through the bootloader.
+	trail("s2: PSP bootloader (sOS components)");
 	uint32_t loaded = 0;
 	Psp::Result r = psp.loadSos(pkg, loaded);
 	CLOG("psp: bootloader: %s (0x%08x), %u component(s) loaded", r.what, r.value, loaded);
@@ -515,6 +579,7 @@ bool RDNA4Compute::stagePsp() {
 	}
 
 	// 2. The kernel-mode command ring.
+	trail("s2: GPCOM ring create");
 	r = psp.createRing();
 	CLOG("psp: %s (C2PMSG_64=0x%08x)", r.what, r.value);
 	put("RingCreated", r.ok);
@@ -526,6 +591,7 @@ bool RDNA4Compute::stagePsp() {
 	// 3. LOAD_TOC: a first command that changes nothing we depend on, and
 	//    tells how much TMR this firmware set needs (the boot-time TMR the
 	//    bootloader set up is used; no SETUP_TMR on this ASIC).
+	trail("s2: LOAD_TOC");
 	uint32_t tmr = 0;
 	r = psp.loadToc(pkg.part[AmdFw::PspToc], tmr);
 	CLOG("psp: %s status 0x%x, TMR size 0x%x", r.what, r.value, tmr);
@@ -537,6 +603,7 @@ bool RDNA4Compute::stagePsp() {
 	}
 
 	// 4. The SMU (power management) firmware.
+	trail("s2: LOAD_IP_FW SMU");
 	Psp::Response resp;
 	r = psp.loadIpFw(smu, Psp::FwSmu, resp);
 	CLOG("psp: LOAD_IP_FW(SMU) %s status 0x%x, TMR address 0x%08x%08x", r.what, r.value,
@@ -548,6 +615,7 @@ bool RDNA4Compute::stagePsp() {
 	}
 
 	// 5. Proof: the SMU now answers its mailbox (today it does not).
+	trail("s2: SMU ping");
 	uint32_t ret = 0, answer = 0;
 	for (int tries = 0; tries < 30 && answer != 1; tries++) {
 		answer = smuSend(kSmuMsgTest, 0xC0FFEE, ret, 100);
@@ -608,6 +676,9 @@ bool RDNA4Compute::stageGfx() {
 	// 1. Everything into the TMR, in amdgpu's order; RLC_G is last.
 	for (uint32_t i = 0; i < n; i++) {
 		Psp::Response resp;
+		char step[48];
+		snprintf(step, sizeof(step), "s3: LOAD_IP_FW %s", img[i].name);
+		trail(step);
 		Psp::Result r = psp.loadIpFw(img[i].payload, img[i].pspType, resp);
 		CLOG("gfx: LOAD_IP_FW %-21s type %2u %7u bytes -> %s (0x%x)", img[i].name,
 		     img[i].pspType, img[i].payload.size, r.what, r.value);
@@ -621,6 +692,7 @@ bool RDNA4Compute::stageGfx() {
 	put("ImagesLoaded", n);
 
 	// 2. Let the RLC boot GFX from the TMR.
+	trail("s3: AUTOLOAD_RLC");
 	Psp::Result r = psp.autoloadRlc();
 	CLOG("gfx: %s (0x%x)", r.what, r.value);
 	put("AutoloadStatus", r.value);
@@ -631,6 +703,7 @@ bool RDNA4Compute::stageGfx() {
 
 	// 3. gfx_v12_0_wait_for_rlc_autoload_complete: CP idle and the RLC
 	//    reports its bootload complete.
+	trail("s3: wait for RLC bootload");
 	uint32_t cpStat = kBad, boot = kBad;
 	bool complete = false;
 	for (uint32_t ms = 0; ms < 2000 && !complete; ms++) {

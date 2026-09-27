@@ -103,10 +103,16 @@ gated() {
 
 	gated "mode-setting survey" 'RDNA4FB: mode:' modedump
 
-	# Any stage (rdna4-compute=1..4), so not a gated "=1" section.
+	# Any stage (rdna4-compute=1..6), so not a gated "=1" section.
 	section "compute bring-up (rdna4-compute=<stage>)"
 	dmesg | grep -E 'RDNA4FB: compute:' || \
 		echo "(no compute lines — add rdna4-compute=1 to boot-args)"
+
+	# Written before every risky step and flushed, so it survives a hang:
+	# after a freeze, this names the step that never finished.
+	section "compute NVRAM trail (last step reached)"
+	nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail 2>/dev/null || \
+		echo "(no trail in NVRAM)"
 
 	section "ioreg: framebuffer properties"
 	ioreg -l -w0 | grep -E '"(Console|AtomBIOS|Discovery|VRAM|MMIO|EDID|GPU|SMU|PSP|Pipe|Modes|Compute),' || true

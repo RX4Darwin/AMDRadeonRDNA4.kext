@@ -138,6 +138,12 @@ private:
 	static void threadMain(void *arg, wait_result_t);
 	void runStages();
 
+	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
+	// flushed before each step that could hang the GPU, so the step a hard
+	// hang stopped at survives the reset. Logged by the next boot's survey.
+	void trail(const char *step);
+	void logPreviousTrail();
+
 	// The compute pool, mapped uncached through BAR0.
 	IOMemoryMap *poolMap { nullptr };
 	uint8_t     *poolCpu { nullptr };
