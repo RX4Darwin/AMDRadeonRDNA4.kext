@@ -226,7 +226,10 @@ Result Driver::submit(uint32_t cmdId, const uint32_t *args, uint32_t nargs, Resp
 	resp.tmrSize  = get32(kCmdOffset + Layout::kRespTmrSize);
 	for (uint32_t i = 0; i < 8; i++)
 		resp.uresp[i] = get32(kCmdOffset + Layout::kRespUresp + 4 * i);
-	return { resp.status == 0, resp.status == 0 ? "ok" : "PSP returned an error", resp.status };
+	// As psp_cmd_submit_buf: "some version of PSP FW doesn't write 0 to that
+	// field" even on success, so a nonzero status is a warning; only a fence
+	// timeout fails the command. The status stays in `value` for the log.
+	return { true, resp.status == 0 ? "ok" : "ok, with nonzero PSP status", resp.status };
 }
 
 Result Driver::loadToc(const AmdFw::Blob &toc, uint32_t &tmrSize) {

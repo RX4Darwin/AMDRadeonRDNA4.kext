@@ -87,6 +87,7 @@ constexpr uint32_t SdmaQ0RbWptr      = 0x0085;
 constexpr uint32_t SdmaMcuCntl       = 0x588e;
 constexpr uint32_t SdmaWatchdogCntl  = 0x002b;
 constexpr uint32_t SdmaUtcl1Cntl     = 0x0035;
+constexpr uint32_t SdmaUtcl1Page     = 0x0038;   // RD_L2_POLICY [13:12], WR_L2_POLICY [15:14]
 constexpr uint32_t SdmaQ0RbRptrHi    = 0x0084;
 constexpr uint32_t SdmaQ0RbWptrHi    = 0x0086;
 constexpr uint32_t SdmaQ0RptrAddrLo  = 0x0087;
@@ -111,6 +112,10 @@ constexpr uint32_t kSdmaMcuReset          = 1u << 1;
 constexpr uint32_t kSdmaUtcl1RedoMask     = 0x1fu;       // REDO_DELAY [4:0]
 constexpr uint32_t kSdmaUtcl1RespMask     = 0x3u << 9;   // RESP_MODE [10:9]
 constexpr uint32_t kSdmaWatchdogHangMask  = 0xffu;       // QUEUE_HANG_COUNT [7:0]
+// sdma_v7_0: clear the policy fields (& 0xFF0FFF), then read NOA (2) and
+// write BYPASS (3), the CACHE_*_POLICY_L2__DEFAULT values (sdma_common.h).
+constexpr uint32_t kSdmaUtcl1PagePolicyKeep = 0xff0fffu;
+constexpr uint32_t kSdmaUtcl1PagePolicy     = (2u << 12) | (3u << 14);
 
 // SDMA0_STATUS_REG
 constexpr uint32_t kSdmaIdle          = 1u << 0;
@@ -251,6 +256,9 @@ constexpr Reg CpMqdControl        { 0, 0x1fcb };
 constexpr Reg CpHqdEopBase        { 0, 0x1fce };   // MC >> 8
 constexpr Reg CpHqdEopBaseHi      { 0, 0x1fcf };
 constexpr Reg CpHqdEopControl     { 0, 0x1fd0 };   // EOP_SIZE [5:0]: 2^(n+1) dwords
+constexpr Reg CpHqdEopRptr        { 0, 0x1fd1 };   // INIT_FETCHER [31]
+constexpr Reg RlcCpSchedulers     { 1, 0x098a };   // scheduler0 [7:0]: 0x80 | me<<5 | pipe<<3 | queue
+constexpr uint32_t kEopInitFetcher  = 1u << 31;
 constexpr Reg CpHqdPqWptrLo       { 0, 0x1fdf };
 constexpr Reg CpHqdPqWptrHi       { 0, 0x1fe0 };
 constexpr Reg ScratchReg0         { 1, 0x2040 };   // UCONFIG: absolute dword 0xa000 + 0x2040
@@ -300,7 +308,8 @@ constexpr Reg ShMemConfig         { 1, 0x09e4 };   // per VMID (GRBM_GFX_CNTL.VM
 // DEFAULT_SH_MEM_CONFIG: 64-bit addressing, unaligned access, prefetch 3.
 constexpr uint32_t kShMemConfigDefault = (3u << 2) | (3u << 14);
 // COMPUTE_PGM_RSRC1: VGPR blocks [5:0] (wave32: 8 per block), FLOAT_MODE
-// [19:12] = 0xc0 (FP32/64 denormals on), MEM_ORDERED [30].
+// [19:12] = 0xc0 (FP16/64 denormals kept; clang emits 0xf0, which also
+// keeps FP32 denormals — irrelevant to integer kernels), MEM_ORDERED [30].
 constexpr uint32_t kRsrc1FloatDenorm   = 0xc0u << 12;
 constexpr uint32_t kRsrc1MemOrdered    = 1u << 30;
 // COMPUTE_PGM_RSRC2: USER_SGPR [5:1], TGID_X_EN [7], TIDIG_COMP_CNT [12:11].

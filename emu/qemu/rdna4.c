@@ -944,6 +944,7 @@ static void rdna4_psp_command(RDNA4State *s, uint64_t cmd)
         }
         if (type == PSP_FW_TYPE_SMU) {
             s->pmfw_loaded = true;
+            reg_set(s, REG_SMU_RESP, SMU_RESP_OK);   /* booted PMFW: ready for messages */
         }
         if (type < 128) {
             s->psp_fw_types[type / 64] |= 1ull << (type % 64);

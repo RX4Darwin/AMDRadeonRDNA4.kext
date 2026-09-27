@@ -114,6 +114,8 @@ enum : uint32_t {
 	kTypeRlcIram         = 26,
 	kTypeCpMes           = 33,
 	kTypeMesStack        = 34,
+	kTypeCpMesKiq        = 81,
+	kTypeMesKiqStack     = 82,
 	kTypeRlcDramBoot     = 48,
 	kTypeImuI            = 68,
 	kTypeImuD            = 69,
@@ -200,11 +202,16 @@ uint32_t buildGfxImages(const GfxBlobs &b, GfxImage *out, uint32_t cap, const ch
 	}
 
 	// MES (unified): mes_firmware_header_v1_0 — ucode size/offset @36/@40,
-	// data size/offset @48/@52.
+	// data size/offset @48/@52. amdgpu initialises both MES pipes; with
+	// unified MES both load uni_mes.bin, pipe 1 as CP_MES1 / CP_MES1_DATA
+	// (PSP types CP_MES_KIQ / MES_KIQ_STACK), in that ucode-id order.
 	if (!parseCommon(b.mes.data, b.mes.size, c) || c.headerMajor != 1)
 		return fail("mes header");
-	if (!bl.add("CP_MES", kTypeCpMes, span(b.mes, at(b.mes, 40), at(b.mes, 36))) ||
-	    !bl.add("CP_MES_DATA", kTypeMesStack, span(b.mes, at(b.mes, 52), at(b.mes, 48))))
+	const Blob mesCode = span(b.mes, at(b.mes, 40), at(b.mes, 36));
+	const Blob mesData = span(b.mes, at(b.mes, 52), at(b.mes, 48));
+	if (!bl.add("CP_MES", kTypeCpMes, mesCode) || !bl.add("CP_MES_DATA", kTypeMesStack, mesData) ||
+	    !bl.add("CP_MES1", kTypeCpMesKiq, mesCode) ||
+	    !bl.add("CP_MES1_DATA", kTypeMesKiqStack, mesData))
 		return fail(bl.why);
 
 	// IMU: imu_firmware_header_v1_0 — IRAM (size @32) at the array offset,

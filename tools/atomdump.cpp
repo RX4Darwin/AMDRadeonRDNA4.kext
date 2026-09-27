@@ -1368,6 +1368,7 @@ struct FakePsp {
 	uint32_t expectSize { 0 };
 	bool payloadOk { false };
 	bool bootloaderStuck { false };
+	uint32_t forceStatus { 0 };   // response status the sOS writes
 	int flushes { 0 };
 
 	uint8_t *at(uint64_t mc) { return vram.data() + (mc - mcBase); }
@@ -1415,7 +1416,7 @@ struct FakePsp {
 					p->payloadOk = p->expect && p->fwSize == p->expectSize &&
 					               !memcmp(p->at(fw), p->expect, p->expectSize);
 				}
-				p->set(cmd + Psp::Layout::kRespStatus, 0);
+				p->set(cmd + Psp::Layout::kRespStatus, p->forceStatus);
 				p->set(fence, fenceValue);
 				p->rptr = (p->rptr + Psp::Layout::kFrameSize / 4) % ringDw;
 			}
@@ -1500,6 +1501,13 @@ static int testPsp() {
 	                  "psp: ring wrap (%zu commands, fence %u)", fake.gpcom.size(), psp.fenceValue());
 	failures += check(fake.flushes >= 12, "psp: HDP flushes %d", fake.flushes);
 
+	// psp_cmd_submit_buf: a nonzero response status is a warning, not a failure.
+	fake.forceStatus = 0xa;
+	r = psp.submit(Psp::CmdFbFwReservAddr, nullptr, 0, resp);
+	failures += check(r.ok && r.value == 0xa, "psp: nonzero status should warn, not fail (%s)",
+	                  r.what);
+	fake.forceStatus = 0;
+
 	// A bootloader that never comes back stops at the first component.
 	FakePsp stuck;
 	stuck.mcBase = fake.mcBase;
@@ -1541,16 +1549,17 @@ static int testGfxImages() {
 	AmdFw::GfxImage img[AmdFw::kMaxGfxImages];
 	const char *why = nullptr;
 	uint32_t n = AmdFw::buildGfxImages(b, img, AmdFw::kMaxGfxImages, &why);
-	failures += check(n >= 15, "gfx images: %u built (%s)", n, why ? why : "-");
+	failures += check(n == 19, "gfx images: %u built (%s)", n, why ? why : "-");
 
 	// amdgpu's load order and types; RLC_G last (it triggers the autoload).
+	// Both MES pipes load uni_mes.bin (pipe 1 as the MES KIQ types 81/82).
 	static const struct { const char *name; uint32_t type; } expect[] = {
 		{ "SDMA_RS64", 71 }, { "RS64_PFP", 87 }, { "RS64_ME", 88 }, { "RS64_MEC", 89 },
 		{ "RS64_PFP_P0_STACK", 90 }, { "RS64_ME_P0_STACK", 92 }, { "RS64_MEC_P0_STACK", 94 },
 		{ "RS64_MEC_P1_STACK", 95 }, { "CP_MES", 33 }, { "CP_MES_DATA", 34 },
-		{ "IMU_I", 68 }, { "IMU_D", 69 },
+		{ "CP_MES1", 81 }, { "CP_MES1_DATA", 82 }, { "IMU_I", 68 }, { "IMU_D", 69 },
 	};
-	for (uint32_t i = 0; i < 12 && i < n; i++)
+	for (uint32_t i = 0; i < 14 && i < n; i++)
 		failures += check(!strcmp(img[i].name, expect[i].name) && img[i].pspType == expect[i].type,
 		                  "gfx images: [%u] %s/%u, expected %s/%u", i, img[i].name,
 		                  img[i].pspType, expect[i].name, expect[i].type);
@@ -1571,8 +1580,11 @@ static int testGfxImages() {
 		          img[i].payload.size <= 62u * 1024 * 1024;
 	}
 	failures += check(inside, "gfx images: payload outside its blob or misaligned");
-	failures += check(img[10].payload.size + img[11].payload.size == 132096,
-	                  "gfx images: IMU I+D = %u bytes", img[10].payload.size + img[11].payload.size);
+	failures += check(img[12].payload.size + img[13].payload.size == 132096,
+	                  "gfx images: IMU I+D = %u bytes", img[12].payload.size + img[13].payload.size);
+	failures += check(img[10].payload.data == img[8].payload.data &&
+	                  img[11].payload.data == img[9].payload.data,
+	                  "gfx images: MES1 must reuse the uni_mes ucode/data payloads");
 
 	// Truncated blobs are refused, not over-read.
 	AmdFw::GfxBlobs cut = b;
@@ -1603,7 +1615,7 @@ static int testSdmaPackets() {
 	failures += check(Sdma::constFill(p, b, 0x5A5AC0DE, 1u << 20) == 5 && p[0] == 0x8000000b &&
 	                  p[1] == 0x10000000 && p[2] == 0x80 && p[3] == 0x5A5AC0DE && p[4] == 0xfffff,
 	                  "sdma: CONST_FILL %08x .. %08x", p[0], p[4]);
-	failures += check(Sdma::copyLinear(p, a, b, 4096) == 8 && p[0] == 0x10000001 && p[1] == 4095 &&
+	failures += check(Sdma::copyLinear(p, a, b, 4096) == 8 && p[0] == 0x00080001 && p[1] == 4095 &&
 	                  p[3] == 0x09002000 && p[5] == 0x10000000 && p[7] == 0,
 	                  "sdma: COPY_LINEAR %08x %08x", p[0], p[1]);
 

@@ -634,12 +634,17 @@ bool RDNA4Compute::stagePsp() {
 
 	// 5. Proof: the SMU now answers its mailbox (today it does not).
 	trail("s2: SMU ping");
+	// The PMFW posts a nonzero response once it takes messages
+	// (__smu_cmn_poll_stat before the first send); then one message, polled
+	// — resending into a booting mailbox can leave it out of step.
 	uint32_t ret = 0, answer = 0;
-	for (int tries = 0; tries < 30 && answer != 1; tries++) {
-		answer = smuSend(kSmuMsgTest, 0xC0FFEE, ret, 100);
-		if (answer != 1)
-			IOSleep(100);
+	for (uint32_t ms = 0; ms < 3000; ms += 10) {
+		const uint32_t r0 = rd(IpDiscovery::HwMp1, SmuResp);
+		if (r0 != 0 && r0 != kBad)
+			break;
+		IOSleep(10);
 	}
+	answer = smuSend(kSmuMsgTest, 0xC0FFEE, ret, 2000);
 	if (answer != 1) {
 		CLOG("psp: SMU still silent after loading its firmware (resp 0x%x)", answer);
 		put("SMUAlive", 0);
@@ -826,10 +831,12 @@ bool RDNA4Compute::gcHubInit() {
 	wr(IpDiscovery::HwGc, GcMxL1TlbCntl, v);
 
 	// L2 cache.
+	// No default page: amdgpu points faults at its dummy page in system
+	// memory; with none here, a stray access must not reach a host address.
 	v = rdGc(GcL2Cntl);
 	v &= ~(kL2FragmentProcessing | kL2Pde0TagGenMode | kL2PdeFaultClassify | (3u << 19) |
-	       kL2IdentityFragMask);
-	v |= kL2EnableCache | kL2DefaultPageToSys | kL2Ctx1IdentityAccess;
+	       kL2IdentityFragMask | kL2DefaultPageToSys);
+	v |= kL2EnableCache | kL2Ctx1IdentityAccess;
 	wr(IpDiscovery::HwGc, GcL2Cntl, v);
 	wr(IpDiscovery::HwGc, GcL2Cntl2, rdGc(GcL2Cntl2) | kL2InvalidateL1Tlbs | kL2InvalidateL2Cache);
 	wr(IpDiscovery::HwGc, GcL2Cntl3,
@@ -903,6 +910,8 @@ bool RDNA4Compute::sdmaQueueInit() {
 	   (rdGc(sdma(0, SdmaWatchdogCntl)) & ~kSdmaWatchdogHangMask) | 1);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaUtcl1Cntl),
 	   (rdGc(sdma(0, SdmaUtcl1Cntl)) & ~(kSdmaUtcl1RespMask | kSdmaUtcl1RedoMask)) | (3u << 9) | 9);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaUtcl1Page),
+	   (rdGc(sdma(0, SdmaUtcl1Page)) & kSdmaUtcl1PagePolicyKeep) | kSdmaUtcl1PagePolicy);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaMcuCntl),
 	   rdGc(sdma(0, SdmaMcuCntl)) & ~(kSdmaMcuHalt | kSdmaMcuReset));
 
@@ -960,6 +969,8 @@ bool RDNA4Compute::stageSdma() {
 	*poolDw(kSdmaRptrOffset) = 0;
 	*poolDw(kSdmaTestOffset) = 0xCAFEDEAD;
 	*poolDw(kSdmaFenceOffset) = 0;
+	*poolDw(kSdmaWptrOffset) = 0;           // the MCU polls this from enable on
+	*poolDw(kSdmaWptrOffset + 4) = 0;
 	flushHdp();
 	sdmaQueueInit();
 	status();
@@ -1148,6 +1159,12 @@ bool RDNA4Compute::hqdInit() {
 	mqdDw(167, (kHqdEopControlDefault & ~0x3fu) | eopSize);
 	flushHdp();
 
+	// gfx_v12_0_kiq_setting: the RLC schedules this VMID0 queue (ME1, pipe 0,
+	// queue 0) — the low byte names it, bit 7 marks it valid.
+	const uint32_t sched = (rdGc(RlcCpSchedulers) & 0xffffff00u) | (1u << 5) | (0u << 3) | 0u;
+	wr(IpDiscovery::HwGc, RlcCpSchedulers, sched);
+	wr(IpDiscovery::HwGc, RlcCpSchedulers, sched | 0x80);
+
 	grbmSelect(1, 0, 0, 0);
 	wr(IpDiscovery::HwGc, CpPqWptrPollCntl, rdGc(CpPqWptrPollCntl) & ~kPqWptrPollEn);
 	wr(IpDiscovery::HwGc, CpHqdEopBase, static_cast<uint32_t>(eop));
@@ -1180,6 +1197,7 @@ bool RDNA4Compute::hqdInit() {
 	wr(IpDiscovery::HwGc, CpHqdPqWptrHi, 0);
 	wr(IpDiscovery::HwGc, CpHqdVmid, 0);
 	wr(IpDiscovery::HwGc, CpHqdPersistent, kHqdPersistentDefault);
+	wr(IpDiscovery::HwGc, CpHqdEopRptr, kEopInitFetcher);   // start the EOP fetcher (kfd hqd_load)
 	wr(IpDiscovery::HwGc, CpHqdActive, 1);
 	wr(IpDiscovery::HwGc, CpPqStatus, rdGc(CpPqStatus) | kPqStatusDoorbellEnable);
 	const uint32_t active = rdGc(CpHqdActive), pqc = rdGc(CpHqdPqControl);

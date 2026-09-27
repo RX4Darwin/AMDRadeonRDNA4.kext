@@ -33,7 +33,7 @@ constexpr uint32_t kSubLinear = 0;
 constexpr uint32_t header(uint32_t op, uint32_t sub = 0) { return (op & 0xff) | ((sub & 0xff) << 8); }
 constexpr uint32_t kFenceMtypeUc    = 3u << 16;   // FENCE: uncached write
 constexpr uint32_t kFillSizeDword   = 2u << 30;   // CONST_FILL: 4-byte pattern
-constexpr uint32_t kCopyCpv         = 1u << 28;   // COPY_LINEAR: CPV, set by sdma_v7_0
+constexpr uint32_t kCopyCpv         = 1u << 19;   // COPY_LINEAR: CPV (cpv_shift 19), set by sdma_v7_0
 
 // Packet sizes in dwords.
 constexpr uint32_t kWriteDwords = 5;   // header, addr lo/hi, count, 1 data dword
