@@ -1,27 +1,31 @@
 # RDNA4FB.kext
 
 A **display driver** for the AMD Radeon **RX 9070 XT** (Navi 48 / RDNA 4,
-PCI `0x1002:0x7550`) on x86_64 Hackintosh, built as a standalone IOKit kext
-against MacKernelSDK. Cross-compiles on Apple Silicon. No 3D/Metal
-acceleration (yet — see Scope below); rendering is software.
+PCI `0x1002:0x7550`) on x86_64 Hackintosh, built as a **Lilu plugin** against
+MacKernelSDK and injected by OpenCore. Cross-compiles on Apple Silicon and on
+Linux/WSL. No 3D/Metal acceleration (see Scope below); rendering is software.
 
-**Status: working.** Verified on real hardware (Ryzen 9 5950X, Big Sur
-11.7.10): boots to a 4K desktop with correct colors, real display identity
-via EDID (DP over AUX, HDMI over the DDC I2C engine), working display sleep
-(DP stream + sink DPCD power), and proven BAR5 register MMIO. Hardware
-cursor and emulated VBL are implemented behind boot-args pending hardware
-verification. Remaining major limitation: only the boot display lights up
-(mode setting for additional pipes is in progress).
+**Status.** The Lilu plugin is verified end to end in a macOS Tahoe 26 VM
+(QEMU/OSX-KVM): it loads from OpenCore, takes over the display requests of
+Apple's generic framebuffer driver, and System Settings → Displays shows the
+monitor by name with its EDID resolutions; switching between them resizes the
+VM display. On real hardware, the hardware side of this code (carried over
+unchanged from the earlier standalone build) was verified on Big Sur 11.7.10:
+4K desktop with correct colors, EDID over DP AUX and HDMI DDC, display sleep,
+BAR5 register MMIO. **The plugin build is not yet verified on hardware**, and
+only the boot display lights up: native mode setting (changing resolution on
+the card, more connectors) is in progress.
 
-> **Why not a Lilu plugin / OpenCore injection?** An `IOFramebuffer` subclass
-> must link against `com.apple.iokit.IOGraphicsFamily`, which on Big Sur+
-> lives in the *System* kernel collection — OpenCore can only inject into the
-> *Boot* KC, so injection fails with "Dependency ... was not found" (verified
-> on hardware). This kext therefore installs to `/Library/Extensions`, where
-> `kmutil` links it into the Aux KC with IOGraphicsFamily available. That
-> environment cannot resolve OC-injected Lilu symbols either, so the kext is
-> deliberately Lilu-free; Lilu integration can return later as a separate
-> boot-KC plugin if kernel patching becomes necessary.
+> **Why a Lilu plugin?** The earlier build was a standalone `IOFramebuffer`
+> subclass. That links against `com.apple.iokit.IOGraphicsFamily`, whose code
+> on macOS 11+ exists only inside the *System* kernel collection — OpenCore
+> injects into the *Boot* collection, so the kext was silently dropped. The
+> fallback, `/Library/Extensions` and the auxiliary collection, is closed to
+> ad-hoc-signed kexts on Tahoe (`syspolicyd` blocks them with no approval
+> button). Instead, RDNA4FB now extends the driver macOS already runs on an
+> unsupported GPU — Apple's `IONDRVFramebuffer` with its boot NDRV — at
+> runtime through Lilu, the way WhateverGreen and NootRX do. It is injected by
+> OpenCore after Lilu, like any other plugin.
 
 > **Scope, honestly.** macOS has *no* driver for RDNA 3 or RDNA 4 — Apple's AMD
 > support ends at RDNA 2 (Navi 2x), and spoofing is impossible (the RDNA 2
@@ -30,10 +34,10 @@ verification. Remaining major limitation: only the boot display lights up
 > already programmed and hand it to WindowServer, Linux `efifb`/`simpledrm`
 > style. It has outgrown that description: the driver now actively operates
 > the display controller — AUX and DDC-I2C engines for EDID, DPCD sink power
-> and stream blanking for display sleep, the cursor plane, discovery-derived
-> register addressing — all ported piecewise from `amdgpu`'s display core
-> (DC), which is this project's reference and upstream in spirit. Think of it
-> as an early, hand-rolled KMS driver growing toward native mode setting.
+> and stream blanking for display sleep, discovery-derived register
+> addressing — all ported piecewise from `amdgpu`'s display core (DC), which
+> is this project's reference and upstream in spirit. Think of it as an
+> early, hand-rolled KMS driver growing toward native mode setting.
 > **What it still is not:** a GPU accelerator. 3D/Metal needs the GFX12
 > command processor, ring buffers, memory management and a Metal userland —
 > a much larger project, acknowledged as the long-term goal rather than
@@ -44,32 +48,42 @@ verification. Remaining major limitation: only the boot display lights up
 
 ## How it works
 
-macOS's `IOPlatformExpert::getConsoleInfo()` returns `PE_state.video` — the base
-address, stride, width, height and depth of the framebuffer the bootloader set
-up. `RDNA4FB` is an `IOFramebuffer` subclass that:
+On a GPU without a macOS driver, macOS drives the GOP framebuffer with Apple's
+generic **`IONDRVFramebuffer`** (`com.apple.iokit.IONDRVSupport`) and its
+built-in boot NDRV (`IOBootNDRV`), which knows one fixed mode and nothing about
+the monitor. Every request that driver makes of its NDRV — Initialize, Open and
+each `csc` Control/Status call — goes through `IONDRVFramebuffer::doDriverIO`.
 
-1. Matches the Navi 48 family (`0x7550` RX 9070/9070 XT, `0x7551` R9700;
-   `GPU,Variant` in ioreg shows which). Navi 44 (RX 9060, `0x7590`) shares
-   DCN 4.1.0 and is a likely future addition once someone can test it.
-2. Reads the console framebuffer geometry in `start()` / `enableController()`.
-   **Hard-won detail:** `v_baseAddr` carries flag bits in its low bits (this
-   machine reads `0x840000001`); they must be masked off. Passing the raw
-   value shifts WindowServer's writes one byte from the true scanout base,
-   which recolours every pixel (R'=G, G'=B, B'=previous pixel's alpha) — it
-   presents as "inverted colors with a blue cast" and cost a week of DCN
-   register archaeology to trace. The hardware was configured correctly the
-   whole time.
-3. Exposes exactly **one** 32bpp display mode at that geometry.
-4. Returns that physical range from `getApertureRange()` so IOGraphics maps it
-   for scanout. The scanout surface and link training are never reprogrammed
-   and no DMA is issued; BAR5 MMIO drives the narrow, restorable state the
-   driver does own: AUX/DC_I2C transactions (EDID), the DP stream enable and
-   sink DPCD power for display sleep, and the cursor plane (opt-in).
+1. **Hook** (`src/plugin.cpp`): Lilu routes `doDriverIO`. Framebuffers whose
+   PCI device is the Navi 48 family (`0x7550` RX 9070/9070 XT, `0x7551`
+   R9700) are ours; everything else goes straight to Apple's code.
+2. **Device** (`src/device.cpp`): when Apple's driver opens our framebuffer,
+   RDNA4FB reads the console geometry, maps BAR5, loads the VBIOS and IP
+   discovery, finds the pipe the GOP lit, reads the sink's EDID and builds the
+   mode table. **Hard-won detail:** `v_baseAddr` carries flag bits in its low
+   bits (this machine reads `0x840000001`); they must be masked off. Passing
+   the raw value shifts WindowServer's writes one byte from the true scanout
+   base, which recolours every pixel (R'=G, G'=B, B'=previous pixel's alpha) —
+   it presents as "inverted colors with a blue cast" and cost a week of DCN
+   register archaeology to trace.
+3. **Answers** (`src/ndrv.cpp`): the mode list, per-mode video parameters and
+   timings, the current mode, the connection flags, the EDID blocks and DPMS
+   (`cscSetSync`) are answered from RDNA4FB's state, record for record the
+   way `IOBootNDRV` answers the same requests. The boot mode keeps
+   `IOBootNDRV`'s ID 100; the other modes get 100 + their mode-table ID.
+   Everything else (gamma, CLUT, power states, cursor) stays with
+   `IOBootNDRV`, and Apple's code keeps doing the IOFramebuffer side: mode
+   caching, pixel formats, aperture mapping, console, power management.
+4. **Mode switches** go to a backend. Every mode keeps the boot surface's
+   memory and pitch and is no larger than it, so a switch only moves the
+   timing and viewport. On the card the mode-set engine is not written yet,
+   so switches are refused and the pipe is left untouched; in `VMTEST`
+   builds QEMU's display is resized through its Bochs VBE interface.
 
-At startup the kext also parses the VBIOS (AtomBIOS tables + AMD IP discovery
-binary) and publishes the results as registry properties (`AtomBIOS,*`,
-`Discovery,*`, `Console,*`, `VRAM,TotalMB`, `MMIO,Verified`) so the state of
-every bring-up layer is visible in `ioreg` without kernel logs.
+The kext also publishes what each bring-up layer found as registry properties
+on the framebuffer (`AtomBIOS,*`, `Discovery,*`, `Console,*`, `Pipe,*`,
+`Modes,Count`, `VRAM,TotalMB`, `MMIO,Verified`), visible in `ioreg` without
+kernel logs.
 
 ## Boot arguments
 
@@ -77,45 +91,76 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 
 | Boot-arg | Effect |
 |----------|--------|
-| `rdna4-off=1` | Kill switch: `probe()` declines to match, restoring the macOS fallback framebuffer. Recovers from a bad build via OpenCore boot-args alone — no Safe Mode or filesystem surgery. |
-| `rdna4-cmap=N` | Diagnostic: permute the advertised R/G/B component masks (0–5). Note: WindowServer ignores these for 32-bit modes; kept for documentation of that finding. |
+| `rdna4-off=1` | Kill switch: the plugin does not hook anything and macOS runs its stock fallback framebuffer. Lilu's `-liluoff` disables all plugins. |
+| `rdna4-trace=1` | Log every NDRV request for our framebuffer and who answered it (`rdna4` or `boot`), up to 400 lines. On by default in `VMTEST` builds. Mode switches are always logged. |
+| `rdna4-modeset=1` | Offer the sink's EDID modes (DTDs, CTA DTDs/VICs, standard and established timings; ≤ boot framebuffer size, TMDS ≤ 340 MHz, ≤ 1.25 × boot pixel clock) instead of the boot mode alone. Until the HDMI mode-set engine lands, choosing a non-boot mode on the card is refused and the pipe is left untouched. |
+| `rdna4-nosleep=1` | Make display sleep a no-op (the screen stays on). Escape hatch if blank/unblank misbehaves. |
+| `rdna4-noedid=1` | Skip the EDID probe over AUX/DDC. Use if a sink misbehaves on DDC. |
 | `rdna4-lutbypass=1` | Force the MPC MCM stages (shaper/3D LUT/1D LUT) to bypass on all pipes. |
-| `rdna4-8bpc=1` | Experiment: switch the active DP stream 10 bpc → 8 bpc and update the MSA to match (first proven live register write). |
-| `rdna4-noedid=1` | Skip the EDID-over-AUX probe (default on; verified on hardware 2026-07-11). Use if a sink misbehaves on DDC. |
-| `rdna4-nosleep=1` | Disable display sleep handling (power changes become no-ops again, screen stays on). Escape hatch if blank/unblank misbehaves. |
-| `rdna4-modedump=1` | Read-only survey of the mode-setting registers: all OTG timings/enables, DIG front/back-ends, HUBP surface addresses, DCCG clock muxes, DMUB status. The lit DP pipe is the template for HDMI pipe bring-up. |
-| `rdna4-hwcursor=1` | Enable the DCN hardware cursor plane (sprite in VRAM after the framebuffer, overlaid at scanout). Fixes software-cursor lag under heavy repaint. Opt-in until hardware-verified. |
-| `rdna4-curmode=N` | Cursor pixel mode when hwcursor is on: 2 = premultiplied ARGB (default), 3 = straight alpha. Flip to 3 if the pointer shows dark/bright fringes. |
-| `rdna4-curtest=1` | Cursor bisect: fetch the sprite from the scanout base (proven-fetchable memory). A floating square of screen content proves the cursor engine and isolates the bug to sprite addressing. |
+| `rdna4-8bpc=1` | Experiment (DP only): switch the active DP stream 10 bpc → 8 bpc and update the MSA to match (first proven live register write). |
+| `rdna4-modedump=1` | Read-only survey of the mode-setting registers: all OTG timings/enables, DIG front/back-ends, HUBP surface addresses, DCCG clock muxes, DMUB status. The lit pipe is the template for further pipe bring-up. |
 | `rdna4-dmubping=1` | First contact with the DMUB display firmware: resolve the inbox1 ring through the DMCUB region windows, submit one QUERY_FEATURE_CAPS command, verify RPTR advances. Proves the mailbox route for mode setting. |
-| `rdna4-dmubhist=1` | Read-only decode of the GOP's recorded DMUB command ring — the exact VBIOS-family command sequence (encoder/transmitter/pixel-clock) the firmware accepted to light the DP display, as the template for HDMI-pipe mode setting. |
+| `rdna4-dmubhist=1` | Read-only decode of the GOP's recorded DMUB command ring — the exact VBIOS-family command sequence (encoder/transmitter/pixel-clock) the firmware accepted to light the display, as the template for mode setting. |
 | `rdna4-dmubver=1` | Read-only fingerprint of the GOP-loaded DMUB firmware: the full `DMCUB_SCRATCH` bank + boot/enable state (`SCRATCH00` decodes as `dmub_fw_boot_status`), then a scan of VRAM below the region4/mailbox anchor for the fw-meta magic (`0x444D5542` "DMUB") to read the embedded `fw_version`. Compares it against Debian's `dmesg \| grep -i dmub` version (`0x00010300`): a match means the GOP runs the same blob and the mainline VBIOS subtypes 0/1/2 are safe to replay; otherwise the GOP has its own dialect (its DP bring-up used 6/10/12/16) and the amdgpu capture is reference-only. |
-| `rdna4-dmubcursor=1` | (with `rdna4-hwcursor=1`) Ask the DMUB firmware to program the cursor plane from our register images (DMUB_CMD__UPDATE_CURSOR_INFO, two chained ring entries). White 64x64 square at (100,100) = firmware can light the cursor. |
 | `rdna4-smuping=1` | Read-only SMU (power-management firmware) handshake: TestMessage + PMFW/interface version queries over the MP1 mailbox. No DPM changes. Publishes `SMU,FirmwareVersion` / `SMU,Verified`. Prerequisite check for future clock control. |
-| `rdna4-ihdump=1` | Read-only interrupt-delivery survey: OSSSYS IH ring state, per-OTG vertical-interrupt line config, PCI MSI/MSI-X capability words. Groundwork for real VBL interrupts replacing the timer emulation. |
+| `rdna4-ihdump=1` | Read-only interrupt-delivery survey: OSSSYS IH ring state, per-OTG vertical-interrupt line config, PCI MSI/MSI-X capability words. Groundwork for real VBL interrupts. |
 | `rdna4-pspdump=1` | Read-only PSP (security processor) survey: bootloader/sOS/GPCOM-ring status from the MPASP scratch registers. Publishes `PSP,Alive` / `PSP,SOSVersion`. Decides whether loading fresh firmware (e.g. a current DMUB) is viable. |
-| `rdna4-vbl=1` | Provide an emulated vertical-blank interrupt (workloop timer at the EDID refresh rate). Engages IOFramebuffer's frame pacing (CVDisplayLink timestamps, deferred cursor sync) that is otherwise absent without a hardware IRQ handler. |
+| `rdna4-fakeedid=0` | `VMTEST=1` builds only: they serve the Lenovo fixture EDID and enable `rdna4-modeset` by default (so the mode list can be checked in a VM whose OpenCore pins boot-args); `=0` turns either off. |
+| `-rdna4dbg` | Lilu debug logging for the plugin (Lilu DEBUG builds). |
+
+The standalone build's hardware cursor (`rdna4-hwcursor`, `rdna4-curmode`,
+`rdna4-curtest`, `rdna4-dmubcursor`), emulated VBL (`rdna4-vbl`) and
+`rdna4-cmap` belonged to its IOFramebuffer glue and are gone for now; the
+cursor code is parked in `src/cursor.cpp` until the NDRV cursor path is wired.
+
+### The lit pipe
+
+At start the driver identifies the pipe the GOP lit instead of assuming
+OTG0/DP0 (`src/pipe.cpp`): the running OTG, the DIG front-end sourcing it
+(`DIG_SOURCE_SELECT`), its back-end/PHY (`STREAM_MAPPER_CONTROL`) and HPD, the
+OPP/HUBP feeding it, and the signal type from `DIG_BE_MODE` (DP or HDMI
+TMDS). The boot timing is read back from the OTG images; its pixel clock —
+which for TMDS lives in the PHY PLL, not in any register — is measured from
+the OTG frame counter and snapped to the matching EDID timing. Published as
+`Pipe,*` (`Pipe,Signal`, `Pipe,BootMode`, `Pipe,MeasuredPixelClockKHz`, …).
+Display power and the diagnostics use this pipe; on an HDMI boot display,
+display sleep blanks through the OPP's pattern generator (solid black) instead
+of toggling a DP stream.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `src/framebuffer.{hpp,cpp}` | The `IOFramebuffer` subclass (`RDNA4FB`): scanout adoption, AUX/DC_I2C engines, EDID/DDC service, display power, HW cursor, VBL. |
+| `src/plugin.cpp` | Lilu plugin entry: routes `IONDRVFramebuffer::doDriverIO`, recognises our framebuffers, creates the device state, hands NDRV requests to the translator. Checks the local NDRV record mirrors against the SDK at compile time. |
+| `src/device.{hpp,cpp}` | `RDNA4Device`: scanout adoption, BAR5 MMIO, VBIOS/IP discovery, lit pipe, AUX/DC_I2C engines and EDID, DMUB ring, SMU/PSP/IH diagnostics, display power, mode table. |
+| `src/ndrv.{hpp,cpp}` | Freestanding NDRV `csc` translator: mode list, video parameters, timings, current mode, connection, EDID blocks, DPMS, mode switch. Host-tested. |
+| `src/bochsvbe.{hpp,cpp}` | `VMTEST` only: mode switches on QEMU's `vmware-svga` through the Bochs VBE interface (the one OVMF's GOP uses on that card). |
+| `src/cursor.cpp` | Parked (not built): the DCN hardware-cursor code from the standalone build. |
 | `src/atombios.{hpp,cpp}` | Freestanding, bounds-checked AtomBIOS parser: data tables (connectors, GPIO LUT, firmwareinfo) + command-function directory. |
 | `src/ipdiscovery.{hpp,cpp}` | Parser for AMD's IP discovery binary — per-card IP versions and register segment bases (what amdgpu uses instead of hardcoded offsets; the key to ASIC portability). |
-| `src/edid.{hpp,cpp}` | EDID detailed-timing and CTA-861 extension parsers (sink timings and capabilities). |
+| `src/edid.{hpp,cpp}` | EDID parsers: base block (all descriptors, range limits, established/standard timings via a DMT table, physical size) and CTA-861 extension (DTDs, VICs via a CEA-861 table, HDMI VSDB). |
+| `src/modes.{hpp,cpp}` | EDID → deduplicated, filtered, deterministically ordered display-mode table with stable IDs. |
+| `src/pipe.{hpp,cpp}` | Lit-pipe discovery (OTG/DIG/link/OPP/HUBP, DP vs HDMI) and OTG-image → timing inversion. |
+| `src/dmub.hpp` | DMUB ring command ABI and builders for the VBIOS-family commands (transmitter control v1.7, set pixel clock v1.7, DIG encoder stream setup v1.5). |
 | `src/otgtiming.{hpp,cpp}` | EDID timing → DCN OTG register images, per amdgpu's `optc1_program_timing` (mode-set groundwork). |
-| `src/kmod_info.c` | Hand-written kmod glue (Xcode normally generates this). |
-| `tools/atomdump.cpp` | Host test harness: runs the parsers against the real ROM and captured EDID fixtures (`make test`). |
-| `Info.plist` | PCI framebuffer personality (`IOPCIPrimaryMatch`: 0x7550 RX 9070/XT, 0x7551 R9700 — the Navi 48 family). |
+| `src/kmod_info.c` | kmod glue pointing at Lilu's plugin start/stop. |
+| `Lilu/` | Lilu submodule (v1.7.3), for the plugin headers and `plugin_start.cpp`. |
+| `tools/atomdump.cpp` | Host test harness: parsers against the real ROM and captured EDID fixtures, pipe discovery, DMUB payloads, the NDRV translator (`make test`). |
+| `tools/vm-opencore.sh`, `tools/vm-ocplist.py` | Build a development OpenCore disk for an OSX-KVM VM with RDNA4FB injected after Lilu. |
+| `tools/logs-ssh.sh` | Pull the RDNA4FB kernel log and registry properties from a macOS machine over SSH. |
+| `tools/linux-capture.sh` | Ground-truth capture of amdgpu's display programming on Linux, for the mode-set engine. |
+| `Info.plist` | Lilu plugin personality (`IOResources`), OSBundleLibraries (Lilu, IOPCIFamily, KPIs). |
 | `Makefile` | Cross-compiles x86_64 on any host, assembles the `.kext`. |
 
-## Building (works on Apple Silicon)
+## Building
+
+Clone with the submodule (`git clone --recursive`, or
+`git submodule update --init` in an existing checkout).
 
 ```sh
 make            # -> build/RDNA4FB.kext  (x86_64, min macOS 11)
-make test       # build host-side atomdump, verify the AtomBIOS parser
-                # against firmware/Sapphire.RX9070XT.16384.241213.rom
+make test       # host-side tests: parsers against the real ROM and EDID
+                # fixtures, pipe discovery, DMUB payloads, NDRV translator
 make clean
 ```
 
@@ -125,103 +170,128 @@ Verify the output:
 file build/RDNA4FB.kext/Contents/MacOS/RDNA4FB   # Mach-O 64-bit kext bundle x86_64
 ```
 
-## Installing (on the Intel target)
+### Building on Linux / WSL (osxcross)
 
-1. **Do not add RDNA4FB.kext to OpenCore `Kernel → Add`** — injection cannot
-   work (see box above). Instead, on the running system (same commands to
-   update an existing install; remove the old bundle first):
+LLVM's `ld64.lld` cannot emit kext bundles, but Apple's ld64 can: build an
+[osxcross](https://github.com/tpoechtrager/osxcross) toolchain from a macOS SDK
+(the "Command Line Tools for Xcode 26.x" `.dmg` carries one, including
+`libkmodc++.a`), then:
 
-   ```sh
-   sudo rm -rf /Library/Extensions/RDNA4FB.kext
-   sudo rm -rf /Library/Extensions/RX9070XT.kext   # pre-rename installs (≤2026-07)
-   sudo cp -R build/RDNA4FB.kext /Library/Extensions/
-   sudo chown -R root:wheel /Library/Extensions/RDNA4FB.kext
-   sudo chmod -R 755 /Library/Extensions/RDNA4FB.kext
-   sudo kmutil install --volume-root / --update-all
-   sudo reboot
-   ```
+```sh
+tools/build-osxcross.sh            # -> build/RDNA4FB.kext
+tools/build-osxcross.sh VMTEST=1   # -> build-vmtest/RDNA4FB.kext
+make test                          # host tests need only clang++
+```
 
-   **Renamed 2026-07:** the bundle was `RX9070XT.kext` and the boot-args
-   were `rx9070xt-*`. The old bundle *must* be removed (two copies would
-   race for the same PCI device), and old `rx9070xt-*` boot-args in the
-   OpenCore config are inert against the new build — including the old kill
-   switch; the working one is now `rdna4-off=1`.
+On Windows checkouts without symlink support, Lilu's header symlinks become
+text files; the Makefile copies the real headers into `build*/liluhdr` first.
 
-   SIP must permit unsigned kexts (`csr-active-config` with
-   `CSR_ALLOW_UNTRUSTED_KEXTS`; standard hackintosh values like `0x03000067`
-   qualify). If `kmutil` complains about approval, allow the extension in
-   System Preferences → Security & Privacy and re-run.
+## Installing (OpenCore)
 
-2. *(Optional since the on-die discovery fallback)* Inject the **full
-   2 MiB flash dump** (the `.rom` in `firmware/`) as `ATY,bin_image` under
-   the GPU's PciRoot path in OpenCore `DeviceProperties`. Without it the
-   driver reads the PSP's IP-discovery copy from the top-of-VRAM TMR via
-   MM_INDEX/MM_DATA (`Discovery,Source` in ioreg shows which path won) and
-   the VBIOS data tables from the PCI expansion ROM.
+1. Use **Lilu 1.7.1 or newer** (older Lilu disables itself on macOS 26).
+2. Copy `build/RDNA4FB.kext` to `EFI/OC/Kexts/` and add a `Kernel → Add`
+   entry **after Lilu**:
 
-3. Recommended while bringing this up: `-v keepsyms=1` boot-args, and disable
-   other GPU-related kexts (WhateverGreen) so nothing fights over the device.
+   | Key | Value |
+   |-----|-------|
+   | `BundlePath` | `RDNA4FB.kext` |
+   | `ExecutablePath` | `Contents/MacOS/RDNA4FB` |
+   | `PlistPath` | `Contents/Info.plist` |
+   | `Arch` | `x86_64` |
+   | `Enabled` | `true` |
 
-**Recovery:** if a build misbehaves, add `rdna4-off=1` to boot-args — the
-kext declines to match and macOS falls back to its EFI framebuffer. Worst
-case (kext wedges boot before the kill switch existed): boot Safe Mode (`-x`),
-which skips the Aux KC entirely, then remove the bundle and rebuild the KC.
+   No code signing, SIP change or kext approval is involved: OpenCore
+   injects it into the boot collection like Lilu itself.
+3. Recommended while bringing this up: `-v keepsyms=1 rdna4-trace=1`
+   boot-args, and disable other GPU-related kexts (WhateverGreen) so nothing
+   fights over the device.
+4. *(Optional)* Inject the **full 2 MiB flash dump** (the `.rom` in
+   `firmware/`) as `ATY,bin_image` under the GPU's PciRoot path in OpenCore
+   `DeviceProperties`. Without it the driver reads the PSP's IP-discovery copy
+   from the top-of-VRAM TMR via MM_INDEX/MM_DATA (`Discovery,Source` in ioreg
+   shows which path won) and the VBIOS data tables from the PCI expansion ROM.
+
+Remove any `/Library/Extensions/RDNA4FB.kext` (or `RX9070XT.kext`) left over
+from the standalone build: it cannot load on Tahoe and only produces
+`kernelmanagerd` rejections.
+
+**Recovery:** keep a known-good copy of your EFI on a USB stick while testing.
+`rdna4-off=1` turns the plugin off, `-liluoff` turns off all Lilu plugins;
+both return macOS to its stock fallback framebuffer.
+
+## Testing in a VM
+
+`VMTEST=1` builds additionally treat QEMU's `vmware-svga` (`15ad:0405`) as
+ours: all register work is skipped (it has no BAR5), the Lenovo fixture EDID
+stands in for a monitor, and mode switches resize the VM display through the
+Bochs VBE interface. With an [OSX-KVM](https://github.com/kholia/OSX-KVM)
+guest:
+
+```sh
+tools/build-osxcross.sh VMTEST=1
+tools/vm-opencore.sh --kext build-vmtest/RDNA4FB.kext --lilu ~/kexts/Lilu.kext
+```
+
+`vm-opencore.sh` starts from the stock `OpenCore/OpenCore.qcow2` and writes
+`OpenCore-dev.qcow2`: verbose boot with the kernel log on the serial port,
+a picker that waits, WhateverGreen disabled, the given Lilu, RDNA4FB after
+Lilu, and a 1920x1080 console (`--resolution`; the fixture is a 1080p
+monitor, and its modes are only published when the console matches its
+preferred timing). Boot QEMU with that image; QEMU keeps an image open until
+it restarts. With Remote Login on and a key authorised,
+`REMOTE_USER=<account> tools/logs-ssh.sh` pulls the RDNA4FB log and registry
+properties back.
 
 ## Roadmap — from "framebuffer" to "real driver"
 
 Rough order of increasing difficulty. Each step needs iteration on the actual
-hardware; the `.rom` (NAVI48.bin AtomBIOS) in `../firmware` and the Linux
+hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
 `amdgpu` sources (`drivers/gpu/drm/amd/`) are the references.
 
 1. ~~**Confirm scanout adoption**~~ — **done.** Desktop verified on hardware
    with correct colors (after masking the `v_baseAddr` flag bits).
-2. ~~**EDID over DP AUX**~~ — **done.** The AUX software engine
+2. ~~**EDID over DP AUX and HDMI DDC**~~ — **done.** The AUX software engine
    (`auxTransaction`, following amdgpu's `dce_aux.c`) reads each DP sink's
    EDID over I2C-over-AUX; verified on hardware 2026-07-11 (Samsung 4K sink
-   on AUX0). The EDID (base + CTA extension) is served to IODisplay via
-   `hasDDCConnect()`/`getDDCBlock()` so macOS sees the real display identity.
-   HDMI/DVI sinks are read too, via the DC_I2C hardware engine (per amdgpu's
-   `dce_i2c_hw.c`: offset write + block read queued as two transactions in a
-   single GO) — verified on hardware 2026-07-12 against a Lenovo 1080p sink.
-3. **Native mode setting (DCN 4.1.0)** — program HUBP/DPP/OPP/OTG to change
-   resolution and light additional connectors; this is where
-   `enableController()` stops being a no-op. The register-offset workflow
-   (Linux `dcn_4_1_0_offset.h` + IP discovery segment bases) is established
-   from the color investigation. **Key constraint (verified against this
-   ROM):** the VBIOS carries *no* display command tables — only `asic_init`
-   survives; `setpixelclock`/`dig1transmittercontrol` are absent because
-   DCN 3.1+ moved that work to DMUB firmware mailbox commands. So the
-   PHY/PLL step needs either the DMUB mailbox (if the GOP left DMUB
-   running) or register-level reverse engineering from lit-vs-dormant pipe
-   diffs (`rdna4-modedump=1`). OTG timing and DIG encoder registers are
-   directly programmable either way.
-4. ~~**Display power management**~~ — **done** (verified on hardware
-   2026-07-11). The driver registers sleep/doze/wake power states with PM
-   (`registerPowerDriver` from `enableController()`, mirroring
-   `IONDRVFramebuffer::initForPM` — the subclass must do this itself, and
-   must not do it from `start()`, which hangs boot). On power changes it
-   disables the DP video stream (`DP_VID_STREAM_CNTL`) and puts the sink in
-   D3 via a native-AUX DPCD `SET_POWER` write (monitor enters true standby),
-   reversing both on wake. The timing generator and clocks are untouched.
-   **System sleep is deliberately vetoed** (`kIOPMPreventSystemSleep`, like
-   Apple's `IOBootNDRV`): after GPU power loss we cannot reprogram the
-   display pipe until native mode setting exists, so allowing it would mean
-   waking to a black screen. Opt out of display sleep handling with
-   `rdna4-nosleep=1`.
-5. **Power / clocks** — SMU firmware handshake so the card is stable, not
+   on AUX0). HDMI/DVI sinks are read via the DC_I2C hardware engine (per
+   amdgpu's `dce_i2c_hw.c`: offset write + block read queued as two
+   transactions in a single GO) — verified on hardware 2026-07-12 against a
+   Lenovo 1080p sink. Served to macOS through `cscGetDDCBlock`.
+3. ~~**Load on Tahoe**~~ — **done in a VM** (2026-09-27): Lilu plugin
+   extending `IONDRVFramebuffer`, injected by OpenCore; mode list, EDID
+   identity and (VM) mode switching verified in System Settings → Displays.
+   Hardware verification of the plugin build is next.
+4. **Native mode setting (DCN 4.1.0)** — program the pixel clock and
+   transmitter through DMUB, then OTG timing and HUBP viewport, to change
+   resolution and light additional connectors (`RDNA4Device::applyMode`).
+   **Key constraint (verified against this ROM):** the VBIOS carries *no*
+   display command tables — only `asic_init` survives;
+   `setpixelclock`/`dig1transmittercontrol` are absent because DCN 3.1+ moved
+   that work to DMUB firmware mailbox commands. The DMUB payloads are built
+   and host-tested (`src/dmub.hpp`); `tools/linux-capture.sh` records what
+   amdgpu programs on the same card as ground truth.
+5. **Display power management** — display sleep was verified on hardware
+   with the standalone build (DP: video stream off + sink D3 over native-AUX
+   DPCD `SET_POWER`; HDMI: OPP pattern generator blank). It now runs from
+   `cscSetSync` (DPMS); hardware verification of that path is pending.
+   System sleep stays vetoed (as `IOBootNDRV` does): after GPU power loss the
+   display pipe cannot be reprogrammed until native mode setting exists.
+6. **Power / clocks** — SMU firmware handshake so the card is stable, not
    stuck at boot clocks.
-6. **Acceleration (huge)** — a real accelerator: GFX12 command processor, ring
+7. **Acceleration (huge)** — a real accelerator: GFX12 command processor, ring
    buffers, memory controller, and a Metal driver. This is effectively
    reimplementing Apple's `AMDRadeonX6000` family for a new architecture and is
    out of scope for this repo's near term.
 
 ## Status
 
-- [x] Cross-compiles on Apple Silicon → x86_64 kext bundle
-- [x] Standalone (Lilu-free) kext, loads from /Library/Extensions via Aux KC
-- [x] Adopts firmware/GOP linear framebuffer, one fixed 32bpp mode
+- [x] Cross-compiles on Apple Silicon and Linux/WSL → x86_64 kext bundle
+- [x] Lilu plugin injected by OpenCore; extends `IONDRVFramebuffer` at
+      runtime (verified in a macOS Tahoe 26 VM)
+- [x] Mode list, EDID identity and mode switching answered through the NDRV
+      interface (verified in the VM: System Settings → Displays)
 - [x] **Boots to a 4K desktop on real hardware with correct colors**
-      (WindowServer verified compositing on this framebuffer)
+      (standalone build, Big Sur)
 - [x] AtomBIOS parser (rom header, master data table, firmwareinfo,
       display paths) verified against the real ROM via `make test`
 - [x] Runtime VBIOS acquisition (`ATY,bin_image` property / expansion ROM)
@@ -233,15 +303,13 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `../firmware` and the Linux
       and write (DP stream registers, MCM bypass)
 - [x] Kill-switch boot-arg (`rdna4-off=1`) for safe iteration
 - [x] DP AUX software engine + EDID read over I2C-over-AUX (verified on
-      hardware: Samsung 4K sink on AUX0), served via `getDDCBlock()`
+      hardware: Samsung 4K sink on AUX0)
 - [x] HDMI/DVI EDID over the DC_I2C hardware engine (verified on hardware:
       Lenovo 1080p sink on ddc2; the engine must be woken — soft-reset
       deasserted, RAM out of light sleep, DDC clock enabled — before
       arbitration is requested)
-- [x] Display sleep verified on hardware: stream blank + sink D3 over native
-      AUX on sleep, D0 + stream re-enable on wake (system sleep vetoed until
-      mode setting exists)
-- [ ] Hardware cursor via the DCN cursor plane (implemented behind
-      `rdna4-hwcursor=1`; needs hardware verification)
+- [x] Display sleep verified on hardware with the standalone build
+- [ ] Plugin build verified on hardware (RX 9070 XT, Tahoe)
 - [ ] Native mode setting (DCN 4.1.0) / multiple displays
+- [ ] Hardware cursor through the NDRV cursor path
 - [ ] Acceleration / Metal

@@ -1,25 +1,27 @@
 //
-//  framebuffer.cpp
+//  device.cpp
 //  RDNA4FB
 //
+//  Hardware side of RDNA4FB (see device.hpp). Moved out of the former
+//  IOFramebuffer subclass unchanged in behaviour when RDNA4FB became a Lilu
+//  plugin that extends Apple's IONDRVFramebuffer.
+//
 
-#include "framebuffer.hpp"
+#include "device.hpp"
 #include "edid.hpp"
 #include "dmub.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
-#include <IOKit/pwr_mgt/IOPM.h>
+#include <kern/clock.h>
 
 #define FBLOG(fmt, ...)  IOLog("RDNA4FB: " fmt "\n", ## __VA_ARGS__)
-
-OSDefineMetaClassAndStructors(RDNA4FB, IOFramebuffer)
 
 // ---------------------------------------------------------------------------
 // Console framebuffer discovery
 // ---------------------------------------------------------------------------
 
-bool RDNA4FB::captureConsoleInfo() {
-	IOPlatformExpert *platform = getPlatform();
+bool RDNA4Device::captureConsoleInfo() {
+	IOPlatformExpert *platform = IOService::getPlatform();
 	if (!platform) {
 		FBLOG("no platform expert");
 		return false;
@@ -68,12 +70,12 @@ bool RDNA4FB::captureConsoleInfo() {
 
 	// Publish what we adopted so `ioreg -lw0` on the target shows the
 	// geometry without needing the kernel log.
-	setProperty("Console,BaseAddress", fbPhysBase, 64);
-	setProperty("Console,Width", static_cast<uint64_t>(fbWidth), 32);
-	setProperty("Console,Height", static_cast<uint64_t>(fbHeight), 32);
-	setProperty("Console,RowBytes", static_cast<uint64_t>(fbRowBytes), 32);
-	setProperty("Console,Depth", static_cast<uint64_t>(fbDepth), 32);
-	setProperty("Console,Length", fbLength, 64);
+	owner->setProperty("Console,BaseAddress", fbPhysBase, 64);
+	owner->setProperty("Console,Width", static_cast<uint64_t>(fbWidth), 32);
+	owner->setProperty("Console,Height", static_cast<uint64_t>(fbHeight), 32);
+	owner->setProperty("Console,RowBytes", static_cast<uint64_t>(fbRowBytes), 32);
+	owner->setProperty("Console,Depth", static_cast<uint64_t>(fbDepth), 32);
+	owner->setProperty("Console,Length", fbLength, 64);
 	return true;
 }
 
@@ -85,7 +87,7 @@ bool RDNA4FB::captureConsoleInfo() {
 // the legacy image within it is ~58 KiB.
 static constexpr size_t kMaxVBIOSSize = 2 * 1024 * 1024;
 
-bool RDNA4FB::copyVBIOSFromProperty() {
+bool RDNA4Device::copyVBIOSFromProperty() {
 	// OpenCore DeviceProperties (or WhateverGreen) can inject the VBIOS as
 	// ATY,bin_image on the GPU's PCI node. Preferred: no hardware access.
 	auto *rom = OSDynamicCast(OSData, pciDevice->getProperty("ATY,bin_image"));
@@ -103,7 +105,7 @@ bool RDNA4FB::copyVBIOSFromProperty() {
 	return true;
 }
 
-bool RDNA4FB::copyVBIOSFromExpansionROM() {
+bool RDNA4Device::copyVBIOSFromExpansionROM() {
 	// Size the expansion ROM BAR, then map and copy it with decode enabled.
 	uint32_t saved = pciDevice->configRead32(kIOPCIConfigExpansionROMBase);
 	pciDevice->configWrite32(kIOPCIConfigExpansionROMBase, 0xFFFFF800);
@@ -142,7 +144,7 @@ bool RDNA4FB::copyVBIOSFromExpansionROM() {
 	return ok;
 }
 
-void RDNA4FB::freeVBIOS() {
+void RDNA4Device::freeVBIOS() {
 	if (vbiosData) {
 		IOFree(vbiosData, vbiosSize);
 		vbiosData = nullptr;
@@ -150,15 +152,15 @@ void RDNA4FB::freeVBIOS() {
 	}
 }
 
-void RDNA4FB::publishVBIOSInfo() {
+void RDNA4Device::publishVBIOSInfo() {
 	char name[64];
 	if (atomBios.configName(name, sizeof(name)))
-		setProperty("AtomBIOS,ImageName", name);
+		owner->setProperty("AtomBIOS,ImageName", name);
 
 	AtomBios::FirmwareInfo3 fw;
 	if (atomBios.getFirmwareInfo(fw)) {
-		setProperty("AtomBIOS,FirmwareRevision", fw.firmwareRevision, 32);
-		setProperty("AtomBIOS,FirmwareCapability", fw.firmwareCapability, 32);
+		owner->setProperty("AtomBIOS,FirmwareRevision", fw.firmwareRevision, 32);
+		owner->setProperty("AtomBIOS,FirmwareCapability", fw.firmwareCapability, 32);
 	}
 
 	AtomBios::DisplayPath paths[AtomBios::MaxDisplayPaths];
@@ -181,12 +183,12 @@ void RDNA4FB::publishVBIOSInfo() {
 			FBLOG("connector %zu: %s objid=0x%04x encoder=0x%04x ddc-line=%u hpd-pin=%u", i,
 			      conn, paths[i].connectorObjId, paths[i].encoderObjId, rec.ddcLine, rec.hpdPin);
 		}
-		setProperty("AtomBIOS,Connectors", list);
-		setProperty("AtomBIOS,ConnectorCount", static_cast<uint64_t>(n), 32);
+		owner->setProperty("AtomBIOS,Connectors", list);
+		owner->setProperty("AtomBIOS,ConnectorCount", static_cast<uint64_t>(n), 32);
 	}
 }
 
-bool RDNA4FB::loadVBIOS() {
+bool RDNA4Device::loadVBIOS() {
 	if (!copyVBIOSFromProperty() && !copyVBIOSFromExpansionROM()) {
 		FBLOG("VBIOS: no image available (inject ATY,bin_image via DeviceProperties)");
 		return false;
@@ -207,17 +209,17 @@ bool RDNA4FB::loadVBIOS() {
 	if (ipDiscovery.init(vbiosData, vbiosSize)) {
 		FBLOG("discovery: binary at +0x%zx, %u IPs", ipDiscovery.binaryOffset(),
 		      ipDiscovery.ipCount());
-		setProperty("Discovery,Source", "VBIOS image");
+		owner->setProperty("Discovery,Source", "VBIOS image");
 		IpDiscovery::IpEntry gc, dmu;
 		if (ipDiscovery.findIp(IpDiscovery::HwGc, 0, gc)) {
 			char ver[16];
 			snprintf(ver, sizeof(ver), "%u.%u.%u", gc.major, gc.minor, gc.revision);
-			setProperty("Discovery,GCVersion", ver);
+			owner->setProperty("Discovery,GCVersion", ver);
 		}
 		if (ipDiscovery.findIp(IpDiscovery::HwDmu, 0, dmu)) {
 			char ver[16];
 			snprintf(ver, sizeof(ver), "%u.%u.%u", dmu.major, dmu.minor, dmu.revision);
-			setProperty("Discovery,DCNVersion", ver);
+			owner->setProperty("Discovery,DCNVersion", ver);
 		}
 	} else {
 		FBLOG("discovery: not present in image (inject the full 2MiB flash dump to enable)");
@@ -245,7 +247,7 @@ bool RDNA4FB::loadVBIOS() {
 	return true;
 }
 
-bool RDNA4FB::loadOnDieDiscovery() {
+bool RDNA4Device::loadOnDieDiscovery() {
 	// The PSP keeps a copy of the IP discovery binary in a reserved region
 	// at the top of VRAM (upstream: DISCOVERY_TMR_OFFSET = 64 KiB below the
 	// end, DISCOVERY_TMR_SIZE = 10 KiB) — present on every powered-on card,
@@ -288,13 +290,13 @@ bool RDNA4FB::loadOnDieDiscovery() {
 	char ver[16];
 	if (ipDiscovery.findIp(IpDiscovery::HwGc, 0, gc)) {
 		snprintf(ver, sizeof(ver), "%u.%u.%u", gc.major, gc.minor, gc.revision);
-		setProperty("Discovery,GCVersion", ver);
+		owner->setProperty("Discovery,GCVersion", ver);
 	}
 	if (ipDiscovery.findIp(IpDiscovery::HwDmu, 0, dmu)) {
 		snprintf(ver, sizeof(ver), "%u.%u.%u", dmu.major, dmu.minor, dmu.revision);
-		setProperty("Discovery,DCNVersion", ver);
+		owner->setProperty("Discovery,DCNVersion", ver);
 	}
-	setProperty("Discovery,Source", "on-die TMR");
+	owner->setProperty("Discovery,Source", "on-die TMR");
 	return true;
 }
 
@@ -302,7 +304,7 @@ bool RDNA4FB::loadOnDieDiscovery() {
 // Register MMIO (BAR5)
 // ---------------------------------------------------------------------------
 
-bool RDNA4FB::mapRegisters() {
+bool RDNA4Device::mapRegisters() {
 	// On AMD dGPUs since Bonaire the register aperture is BAR5 (BAR0/1 is the
 	// VRAM aperture, BAR2/3 doorbells) — amdgpu_device.c does the same.
 	IODeviceMemory *bar = pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5);
@@ -323,7 +325,7 @@ bool RDNA4FB::mapRegisters() {
 	return true;
 }
 
-void RDNA4FB::unmapRegisters() {
+void RDNA4Device::unmapRegisters() {
 	rmmio = nullptr;
 	rmmioSize = 0;
 	if (rmmioMap) {
@@ -332,13 +334,13 @@ void RDNA4FB::unmapRegisters() {
 	}
 }
 
-uint32_t RDNA4FB::regRead32(uint32_t byteOffset) const {
+uint32_t RDNA4Device::regRead32(uint32_t byteOffset) const {
 	if (!rmmio || byteOffset + 4 > rmmioSize)
 		return 0xFFFFFFFF;
 	return rmmio[byteOffset / 4];
 }
 
-uint32_t RDNA4FB::regReadDmu(uint8_t baseIdx, uint32_t dwordOffset) const {
+uint32_t RDNA4Device::regReadDmu(uint8_t baseIdx, uint32_t dwordOffset) const {
 	uint32_t byteOffset;
 	if (!ipDiscovery.isValid() ||
 	    !ipDiscovery.regByteOffset(IpDiscovery::HwDmu, 0, baseIdx, dwordOffset, byteOffset))
@@ -346,7 +348,7 @@ uint32_t RDNA4FB::regReadDmu(uint8_t baseIdx, uint32_t dwordOffset) const {
 	return regRead32(byteOffset);
 }
 
-void RDNA4FB::dumpDCN() {
+void RDNA4Device::dumpDCN() {
 	if (!ipDiscovery.isValid()) {
 		FBLOG("dcn: no discovery bases, skipping register dump");
 		return;
@@ -471,11 +473,11 @@ constexpr uint8_t kDdcSlave  = 0x50; // VESA DDC/EDID I2C address
 constexpr uint8_t kAuxRetry  = 7;    // per-transaction defer retries
 } // namespace
 
-uint32_t RDNA4FB::auxDword(uint8_t inst, uint32_t reg) const {
+uint32_t RDNA4Device::auxDword(uint8_t inst, uint32_t reg) const {
 	return kAuxBase0 + static_cast<uint32_t>(inst) * kAuxStride + reg;
 }
 
-int RDNA4FB::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
+int RDNA4Device::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
                                const uint8_t *data, uint8_t len,
                                uint8_t *reply, uint8_t replyCap,
                                uint8_t *replyBytes) {
@@ -587,7 +589,7 @@ int RDNA4FB::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
 	return replyCode;
 }
 
-bool RDNA4FB::readEDID(uint8_t inst, uint8_t *edid, size_t count,
+bool RDNA4Device::readEDID(uint8_t inst, uint8_t *edid, size_t count,
                           uint8_t start) {
 	uint8_t rb = 0;
 
@@ -625,7 +627,7 @@ bool RDNA4FB::readEDID(uint8_t inst, uint8_t *edid, size_t count,
 	return true;
 }
 
-void RDNA4FB::probeEDID() {
+void RDNA4Device::probeEDID() {
 	// Default-on since the AUX path was verified on hardware (2026-07-11);
 	// "rdna4-noedid=1" opts out if a sink misbehaves.
 	uint32_t noedid = 0;
@@ -704,9 +706,9 @@ void RDNA4FB::probeEDID() {
 
 		char key[40];
 		snprintf(key, sizeof(key), "EDID,%s%u", bus, inst);
-		setProperty(key, edid, sizeof(edid));
+		owner->setProperty(key, edid, sizeof(edid));
 		snprintf(key, sizeof(key), "EDID,%s%u-Vendor", bus, inst);
-		setProperty(key, mfg);
+		owner->setProperty(key, mfg);
 
 		// Cache the first sink's EDID for hasDDCConnect()/getDDCBlock(). Only
 		// the boot display is scanned out, and that is AUX0/DP0 on this board.
@@ -789,7 +791,7 @@ constexpr uint32_t kI2cIndexWrite     = 1u << 31;
 constexpr uint32_t kMicrosecondTimeBaseDiv = 0x007b;
 } // namespace
 
-bool RDNA4FB::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
+bool RDNA4Device::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
                              uint8_t start) {
 	if (!ipDiscovery.isValid() || !rmmio || count == 0 || count > 256)
 		return false;
@@ -900,7 +902,7 @@ bool RDNA4FB::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
 	return true;
 }
 
-void RDNA4FB::dumpModeState() {
+void RDNA4Device::dumpModeState() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-modedump", &on, sizeof(on)) || on == 0)
 		return;
@@ -969,6 +971,106 @@ void RDNA4FB::dumpModeState() {
 }
 
 // ---------------------------------------------------------------------------
+// Boot pipe discovery
+// ---------------------------------------------------------------------------
+
+uint32_t RDNA4Device::pipeRead(void *ctx, uint8_t baseIdx, uint32_t dword) {
+	auto *self = static_cast<RDNA4Device *>(ctx);
+	return self->regReadDmu(baseIdx, dword);
+}
+
+// Time N frames of the live OTG's frame counter. The TMDS pixel clock sits in
+// the PHY PLL where no register exposes it, so frame period x totals is the
+// only way to learn the exact rate the GOP chose. Edges are detected by
+// polling every 10 us, so 10 frames give ~0.01 % precision. Returns 0 if the
+// counter does not move (OTG stopped / unreadable).
+uint64_t RDNA4Device::measureFramePeriodNs() {
+	if (!pipe.valid())
+		return 0;
+	constexpr uint32_t kFrames = 10;
+	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otgOff();
+
+	auto count = [&]() { return regReadDmu(2, reg) & 0xffffff; };
+	auto nowNs = [&]() {
+		uint64_t abs = 0, ns = 0;
+		clock_get_uptime(&abs);
+		absolutetime_to_nanoseconds(abs, &ns);
+		return ns;
+	};
+	// Wait for a frame edge, at most ~100 ms.
+	auto waitEdge = [&](uint32_t from, uint32_t &to) -> bool {
+		for (int i = 0; i < 10000; i++) {
+			uint32_t c = count();
+			if (c != from) {
+				to = c;
+				return true;
+			}
+			IODelay(10);
+		}
+		return false;
+	};
+
+	uint32_t c0 = count(), start = 0;
+	if (regReadDmu(2, reg) == 0xFFFFFFFF || !waitEdge(c0, start))
+		return 0;
+	uint64_t t0 = nowNs();
+	uint32_t c = start;
+	for (uint32_t n = 0; n < kFrames; n++) {
+		uint32_t next = 0;
+		if (!waitEdge(c, next))
+			return 0;
+		c = next;
+	}
+	uint64_t t1 = nowNs();
+	uint32_t frames = (c - start) & 0xffffff;
+	return frames ? (t1 - t0) / frames : 0;
+}
+
+void RDNA4Device::discoverPipe() {
+	if (!ipDiscovery.isValid() || !rmmio)
+		return;
+	if (!Pipe::discover(&RDNA4Device::pipeRead, this, pipe)) {
+		FBLOG("pipe: no running OTG found — keeping upstream pipe-0 assumptions");
+		return;
+	}
+	FBLOG("pipe: lit pipe OTG%u DIG%u -> link%u (HPD%u) OPP%u HUBP%u, signal %s",
+	      pipe.otg, pipe.dig, pipe.link, pipe.hpd, pipe.opp, pipe.hubp,
+	      Pipe::signalName(pipe.signal));
+	FBLOG("pipe: OTG h_total=0x%08x h_blank=0x%08x h_sync=0x%08x v_total=0x%08x "
+	      "v_blank=0x%08x v_sync=0x%08x pol h%c v%c; HUBP viewport %ux%u pitch %u px",
+	      pipe.hTotal, pipe.hBlank, pipe.hSync, pipe.vTotal, pipe.vBlank, pipe.vSync,
+	      pipe.hSyncNeg ? '-' : '+', pipe.vSyncNeg ? '-' : '+',
+	      pipe.viewportW, pipe.viewportH, pipe.pitchPx);
+
+	owner->setProperty("Pipe,OTG", static_cast<uint64_t>(pipe.otg), 32);
+	owner->setProperty("Pipe,DIG", static_cast<uint64_t>(pipe.dig), 32);
+	owner->setProperty("Pipe,Link", static_cast<uint64_t>(pipe.link), 32);
+	owner->setProperty("Pipe,HPD", static_cast<uint64_t>(pipe.hpd), 32);
+	owner->setProperty("Pipe,HUBP", static_cast<uint64_t>(pipe.hubp), 32);
+	owner->setProperty("Pipe,Signal", Pipe::signalName(pipe.signal));
+
+	bootTimingValid = Pipe::timingFromOtg(pipe, bootTiming);
+	if (!bootTimingValid) {
+		FBLOG("pipe: OTG timing did not decode");
+		return;
+	}
+	uint64_t periodNs = measureFramePeriodNs();
+	bootTiming.pixelClockKHz = Pipe::pixelClockFromFramePeriod(pipe, periodNs);
+	FBLOG("pipe: boot timing %ux%u, h %u/%u/%u v %u/%u/%u, frame %llu ns -> "
+	      "pixel clock ~%u kHz (%u.%03u Hz)",
+	      bootTiming.hActive, bootTiming.vActive,
+	      bootTiming.hSyncOffset, bootTiming.hSyncWidth, bootTiming.hBlank,
+	      bootTiming.vSyncOffset, bootTiming.vSyncWidth, bootTiming.vBlank,
+	      periodNs, bootTiming.pixelClockKHz,
+	      bootTiming.refreshMilliHz() / 1000, bootTiming.refreshMilliHz() % 1000);
+	char mode[40];
+	snprintf(mode, sizeof(mode), "%ux%u@%u.%03u", bootTiming.hActive, bootTiming.vActive,
+	         bootTiming.refreshMilliHz() / 1000, bootTiming.refreshMilliHz() % 1000);
+	owner->setProperty("Pipe,BootMode", mode);
+	owner->setProperty("Pipe,MeasuredPixelClockKHz", static_cast<uint64_t>(bootTiming.pixelClockKHz), 32);
+}
+
+// ---------------------------------------------------------------------------
 // DMUB mailbox (display firmware)
 // ---------------------------------------------------------------------------
 
@@ -976,16 +1078,102 @@ void RDNA4FB::dumpModeState() {
 // 0x0 / 0x4 / 0x18) — amdgpu_device_mm_access. Reaches any VRAM byte
 // through the register BAR; the way to touch the DMUB ring in top-of-VRAM
 // firmware memory that the 256 MiB CPU aperture cannot map.
-uint32_t RDNA4FB::vramRead32(uint64_t pos) {
+uint32_t RDNA4Device::vramRead32(uint64_t pos) {
+	if (!rmmio || rmmioSize < 0x1c)
+		return 0xFFFFFFFF;
 	rmmio[0x18 / 4] = static_cast<uint32_t>(pos >> 31);
 	rmmio[0]        = (static_cast<uint32_t>(pos) & 0x7ffffffc) | 0x80000000u;
 	return rmmio[1];
 }
 
-void RDNA4FB::vramWrite32(uint64_t pos, uint32_t value) {
+void RDNA4Device::vramWrite32(uint64_t pos, uint32_t value) {
+	if (!rmmio || rmmioSize < 0x1c)
+		return;
 	rmmio[0x18 / 4] = static_cast<uint32_t>(pos >> 31);
 	rmmio[0]        = (static_cast<uint32_t>(pos) & 0x7ffffffc) | 0x80000000u;
 	rmmio[1]        = value;
+}
+
+namespace {
+// DMCUB mailbox registers (dcn_4_1_0_offset.h, base_idx 2).
+constexpr uint32_t kDmcubRegion4Offset     = 0x0196;   // mailbox MC address, low
+constexpr uint32_t kDmcubRegion4OffsetHigh = 0x0197;
+constexpr uint32_t kDmcubInbox1Size        = 0x01d5;
+constexpr uint32_t kDmcubInbox1Wptr        = 0x01d6;
+constexpr uint32_t kDmcubInbox1Rptr        = 0x01d7;
+constexpr uint32_t kDcnVmFbLocationBase    = 0x0475;   // VRAM MC base, 16 MiB units
+} // namespace
+
+bool RDNA4Device::dmubRing(DmubRing &ring) {
+	ring = DmubRing {};
+	if (!ipDiscovery.isValid() || !rmmio)
+		return false;
+	// The ring lives in top-of-VRAM firmware memory (REGION4); its VRAM
+	// position is the REGION4 MC address minus the VRAM MC base.
+	uint64_t region4Mc = regReadDmu(2, kDmcubRegion4Offset) |
+	    (static_cast<uint64_t>(regReadDmu(2, kDmcubRegion4OffsetHigh)) << 32);
+	uint64_t vramMcBase =
+	    static_cast<uint64_t>(regReadDmu(2, kDcnVmFbLocationBase) & 0xffffff) << 24;
+	if (region4Mc <= vramMcBase) {
+		FBLOG("dmub: region4 mc 0x%llx not above vram base 0x%llx", region4Mc, vramMcBase);
+		return false;
+	}
+	uint32_t size = regReadDmu(2, kDmcubInbox1Size);
+	if (size == 0 || size > 0x100000 || (size % Dmub::kCmdSize) != 0) {
+		FBLOG("dmub: inbox1 size 0x%x not sane", size);
+		return false;
+	}
+	ring.base = region4Mc - vramMcBase;
+	ring.size = size;
+	return true;
+}
+
+bool RDNA4Device::dmubSubmit(const Dmub::Cmd *cmds, uint32_t count, const char *tag,
+                         uint64_t *firstSlot) {
+	DmubRing ring;
+	if (!cmds || count == 0 || !dmubRing(ring))
+		return false;
+	if (count * Dmub::kCmdSize >= ring.size) {
+		FBLOG("%s: %u commands do not fit the 0x%x-byte inbox", tag, count, ring.size);
+		return false;
+	}
+	// The GOP firmware services the inbox1 ring (it ignores register inbox0);
+	// only submit into an idle ring so we never race a firmware-side reader.
+	uint32_t wptr = regReadDmu(2, kDmcubInbox1Wptr);
+	uint32_t rptr = regReadDmu(2, kDmcubInbox1Rptr);
+	if (wptr != rptr || wptr >= ring.size || (wptr % Dmub::kCmdSize) != 0) {
+		FBLOG("%s: inbox not idle/sane (size=0x%x wptr=0x%x rptr=0x%x)",
+		      tag, ring.size, wptr, rptr);
+		return false;
+	}
+	if (firstSlot)
+		*firstSlot = ring.base + wptr;
+
+	uint32_t slot = wptr;
+	for (uint32_t c = 0; c < count; c++) {
+		uint64_t pos = ring.base + slot;
+		for (uint32_t i = 0; i < Dmub::kCmdSize / 4; i++)
+			vramWrite32(pos + 4 * i, cmds[c][i]);
+		// Proof the MM window writes the memory the firmware reads.
+		uint32_t rb = vramRead32(pos);
+		if (rb != cmds[c][0]) {
+			FBLOG("%s: ring write readback mismatch at +0x%x (0x%08x != 0x%08x), "
+			      "nothing submitted", tag, slot, rb, cmds[c][0]);
+			return false;
+		}
+		slot = (slot + Dmub::kCmdSize) % ring.size;
+	}
+
+	regWriteDmu(2, kDmcubInbox1Wptr, slot);
+	uint32_t nrptr = rptr;
+	for (int i = 0; i < 20000; i++) {          // 200 ms budget
+		nrptr = regReadDmu(2, kDmcubInbox1Rptr);
+		if (nrptr == slot)
+			return true;
+		IODelay(10);
+	}
+	FBLOG("%s: firmware did not consume (wptr=0x%x rptr stuck at 0x%x)", tag, slot, nrptr);
+	return false;
 }
 
 // rdna4-smuping=1: first contact with the SMU power-management firmware
@@ -1008,7 +1196,7 @@ void RDNA4FB::vramWrite32(uint64_t pos, uint32_t value) {
 // psp_v14_0.c and lemonade-sdk/mac-amdgpu (MIT), which drove the full
 // LOAD_IP_FW chain on this die from macOS. Nothing is written: this only
 // answers "is the GOP-posted PSP alive and command-able?".
-void RDNA4FB::dumpPSP() {
+void RDNA4Device::dumpPSP() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-pspdump", &on, sizeof(on)) || on == 0)
 		return;
@@ -1036,12 +1224,12 @@ void RDNA4FB::dumpPSP() {
 	      sol ? "ALIVE" : "not running",
 	      (ring & 0x80000000u) ? "configured" : "not configured");
 	if (sol) {
-		setProperty("PSP,SOSVersion", static_cast<uint64_t>(sol), 32);
-		setProperty("PSP,Alive", true);
+		owner->setProperty("PSP,SOSVersion", static_cast<uint64_t>(sol), 32);
+		owner->setProperty("PSP,Alive", true);
 	}
 }
 
-void RDNA4FB::dumpIH() {
+void RDNA4Device::dumpIH() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-ihdump", &on, sizeof(on)) || on == 0)
 		return;
@@ -1066,11 +1254,12 @@ void RDNA4FB::dumpIH() {
 	// lines, each with a raster position trigger and an enable. amdgpu uses
 	// line 0 for VUPDATE-ish events, line 2 for the VBLANK the DRM core
 	// consumes. All-zero controls mean the GOP never enabled any of them.
-	FBLOG("ih: OTG0 vline0 pos=0x%08x ctl=0x%08x  vline1 pos=0x%08x ctl=0x%08x  "
-	      "vline2 pos=0x%08x ctl=0x%08x",
-	      regReadDmu(2, 0x1b5f), regReadDmu(2, 0x1b60),
-	      regReadDmu(2, 0x1b61), regReadDmu(2, 0x1b62),
-	      regReadDmu(2, 0x1b63), regReadDmu(2, 0x1b64));
+	const uint32_t o = otgOff();
+	FBLOG("ih: OTG%u vline0 pos=0x%08x ctl=0x%08x  vline1 pos=0x%08x ctl=0x%08x  "
+	      "vline2 pos=0x%08x ctl=0x%08x", pipe.otg < Pipe::kMaxOtg ? pipe.otg : 0,
+	      regReadDmu(2, 0x1b5f + o), regReadDmu(2, 0x1b60 + o),
+	      regReadDmu(2, 0x1b61 + o), regReadDmu(2, 0x1b62 + o),
+	      regReadDmu(2, 0x1b63 + o), regReadDmu(2, 0x1b64 + o));
 
 	// PCI interrupt capability state: MSI (cap 0x05) and MSI-X (cap 0x11).
 	// A kext receives these via IOInterruptEventSource once enabled; this
@@ -1087,7 +1276,7 @@ void RDNA4FB::dumpIH() {
 	}
 }
 
-void RDNA4FB::smuPing() {
+void RDNA4Device::smuPing() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-smuping", &on, sizeof(on)) || on == 0)
 		return;
@@ -1144,13 +1333,13 @@ void RDNA4FB::smuPing() {
 	if (send(0x2, 0, &ret) == 1) {
 		FBLOG("smu: PMFW version 0x%08x (%u.%u.%u)", ret,
 		      (ret >> 16) & 0xff, (ret >> 8) & 0xff, ret & 0xff);
-		setProperty("SMU,FirmwareVersion", static_cast<uint64_t>(ret), 32);
+		owner->setProperty("SMU,FirmwareVersion", static_cast<uint64_t>(ret), 32);
 	}
 	if (send(0x3, 0, &ret) == 1) {
 		FBLOG("smu: driver interface version 0x%08x", ret);
-		setProperty("SMU,DriverIfVersion", static_cast<uint64_t>(ret), 32);
+		owner->setProperty("SMU,DriverIfVersion", static_cast<uint64_t>(ret), 32);
 	}
-	setProperty("SMU,Verified", true);
+	owner->setProperty("SMU,Verified", true);
 }
 
 // rdna4-dmubhist=1: read-only decode of the GOP's own DMUB command history.
@@ -1159,27 +1348,22 @@ void RDNA4FB::smuPing() {
 // entirely through this ring (VBIOS-family commands). Decoding them yields
 // the exact, firmware-accepted mode-set recipe for THIS silicon — the
 // template to adapt for the HDMI pipe. Pure MM_INDEX reads; writes nothing.
-void RDNA4FB::dmubHistory() {
+void RDNA4Device::dmubHistory() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-dmubhist", &on, sizeof(on)) || on == 0)
 		return;
 	if (!ipDiscovery.isValid() || !rmmio)
 		return;
 
-	uint32_t wptr = regReadDmu(2, 0x01d6);
+	uint32_t wptr = regReadDmu(2, kDmcubInbox1Wptr);
 	if (wptr == 0 || wptr > 0x2000 || (wptr % Dmub::kCmdSize) != 0) {
 		FBLOG("dmub-hist: wptr 0x%x not a sane command count", wptr);
 		return;
 	}
-	uint64_t region4Mc = regReadDmu(2, 0x0196) |
-	    (static_cast<uint64_t>(regReadDmu(2, 0x0197)) << 32);
-	uint64_t vramMcBase =
-	    static_cast<uint64_t>(regReadDmu(2, 0x0475) & 0xffffff) << 24;
-	if (region4Mc <= vramMcBase) {
-		FBLOG("dmub-hist: region4 mc below vram base");
+	DmubRing ring;
+	if (!dmubRing(ring))
 		return;
-	}
-	uint64_t ringBase = region4Mc - vramMcBase;
+	uint64_t ringBase = ring.base;
 	uint32_t count = wptr / Dmub::kCmdSize;
 	FBLOG("dmub-hist: decoding %u GOP commands from vram+0x%llx", count, ringBase);
 
@@ -1210,7 +1394,7 @@ void RDNA4FB::dmubHistory() {
 // boot state in the DMCUB_SCRATCH bank (SCRATCH0 = boot status; higher
 // slots carry version/build markers on most builds). Pure register reads —
 // no ring traffic, no state change, safe alongside the live DP0 console.
-void RDNA4FB::dumpDmubVersion() {
+void RDNA4Device::dumpDmubVersion() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-dmubver", &on, sizeof(on)) || on == 0)
 		return;
@@ -1229,8 +1413,8 @@ void RDNA4FB::dumpDmubVersion() {
 	}
 	// Enable/boot context plus region4 mc (the ring lives here) — the anchor
 	// for the fw-meta read we escalate to if the scratch bank is inconclusive.
-	uint64_t region4Mc = regReadDmu(2, 0x0196) |
-	    (static_cast<uint64_t>(regReadDmu(2, 0x0197)) << 32);
+	uint64_t region4Mc = regReadDmu(2, kDmcubRegion4Offset) |
+	    (static_cast<uint64_t>(regReadDmu(2, kDmcubRegion4OffsetHigh)) << 32);
 	FBLOG("dmubver: cntl=0x%08x cntl2=0x%08x region4 mc=0x%llx",
 	      regReadDmu(2, 0x01f6), regReadDmu(2, 0x0200), region4Mc);
 
@@ -1241,13 +1425,12 @@ void RDNA4FB::dumpDmubVersion() {
 	// downward from the region4 (mailbox) anchor for the magic and decode the
 	// real fw_version — the apples-to-apples value to diff against Debian's
 	// `version=0x...`. Pure MM_INDEX reads, bounded, writes nothing.
-	uint64_t vramMcBase =
-	    static_cast<uint64_t>(regReadDmu(2, 0x0475) & 0xffffff) << 24;
-	if (region4Mc <= vramMcBase) {
-		FBLOG("dmubver: region4 mc below vram base — skipping fw-meta scan");
+	DmubRing ring;
+	if (!dmubRing(ring)) {
+		FBLOG("dmubver: no usable region4 — skipping fw-meta scan");
 		return;
 	}
-	uint64_t region4Off = region4Mc - vramMcBase;
+	uint64_t region4Off = ring.base;
 	constexpr uint32_t kMetaMagic = 0x444d5542;   // "DMUB"
 	constexpr uint64_t kScanBytes = 0x100000;     // 1 MiB below the mailbox
 	uint64_t found = 0;
@@ -1273,7 +1456,7 @@ void RDNA4FB::dumpDmubVersion() {
 	      fwVersion, fwVersion == 0x00010300 ? "==" : "!=");
 }
 
-void RDNA4FB::dmubPing() {
+void RDNA4Device::dmubPing() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-dmubping", &on, sizeof(on)) || on == 0)
 		return;
@@ -1282,176 +1465,72 @@ void RDNA4FB::dmubPing() {
 		return;
 	}
 
-	// The GOP firmware demonstrably services the inbox1 RING (it consumed
-	// 0x4c0 bytes of GOP commands) but ignored the register inbox0 on
-	// hardware. The ring lives in top-of-VRAM firmware memory (REGION4);
-	// reach it via MM_INDEX/MM_DATA indirect VRAM access.
-	constexpr uint32_t kInbox1Size = 0x01d5;
-	constexpr uint32_t kInbox1Wptr = 0x01d6, kInbox1Rptr = 0x01d7;
-
-	uint32_t inboxSize = regReadDmu(2, kInbox1Size);
-	uint32_t wptr = regReadDmu(2, kInbox1Wptr);
-	uint32_t rptr = regReadDmu(2, kInbox1Rptr);
-	if (inboxSize == 0 || inboxSize > 0x100000 || wptr != rptr ||
-	    (wptr % Dmub::kCmdSize) != 0) {
-		FBLOG("dmub: inbox not idle/sane (size=0x%x wptr=0x%x rptr=0x%x)",
-		      inboxSize, wptr, rptr);
+	DmubRing ring;
+	if (!dmubRing(ring))
 		return;
-	}
+	uint32_t wptr = regReadDmu(2, kDmcubInbox1Wptr);
+	FBLOG("dmub: inbox1 ring at vram+0x%llx, size=0x%x wptr=0x%x",
+	      ring.base, ring.size, wptr);
 
-	// Ring VRAM position: REGION4 (mailbox) MC address minus the VRAM MC
-	// base from DCN_VM_FB_LOCATION_BASE (16 MiB units).
-	uint64_t region4Mc = regReadDmu(2, 0x0196) |
-	    (static_cast<uint64_t>(regReadDmu(2, 0x0197)) << 32);
-	uint64_t vramMcBase =
-	    static_cast<uint64_t>(regReadDmu(2, 0x0475) & 0xffffff) << 24;
-	if (region4Mc <= vramMcBase) {
-		FBLOG("dmub: region4 mc 0x%llx below vram base 0x%llx", region4Mc, vramMcBase);
-		return;
-	}
-	uint64_t ringPos = (region4Mc - vramMcBase) + wptr;
-	FBLOG("dmub: inbox1 ring at vram+0x%llx (region4 mc 0x%llx), wptr=0x%x",
-	      region4Mc - vramMcBase, region4Mc, wptr);
-
-	// Sanity: the entry at rptr-64 was written by the GOP; read it back as
+	// Sanity: the entry before wptr was written by the GOP; read it back as
 	// proof the MM window reads the same memory the firmware reads.
-	if (wptr >= Dmub::kCmdSize)
+	if (wptr >= Dmub::kCmdSize && wptr < ring.size)
 		FBLOG("dmub: previous GOP command header via MM: 0x%08x",
-		      vramRead32(ringPos - Dmub::kCmdSize));
+		      vramRead32(ring.base + wptr - Dmub::kCmdSize));
 
-	// Compose QUERY_FEATURE_CAPS at wptr and submit.
-	vramWrite32(ringPos, Dmub::headerWord(Dmub::CmdQueryFeatureCaps, 0,
-	                                      Dmub::kCmdSize - 4));
-	for (uint32_t i = 1; i < Dmub::kCmdSize / 4; i++)
-		vramWrite32(ringPos + 4 * i, 0);
-	uint32_t rb0 = vramRead32(ringPos);
-	if (rb0 != Dmub::headerWord(Dmub::CmdQueryFeatureCaps, 0, Dmub::kCmdSize - 4)) {
-		FBLOG("dmub: ring write readback mismatch (0x%08x), aborting", rb0);
-		return;
-	}
-
-	uint32_t newWptr = (wptr + Dmub::kCmdSize) % inboxSize;
-	regWriteDmu(2, kInbox1Wptr, newWptr);
-
-	uint32_t nrptr = rptr;
-	for (int i = 0; i < 20000; i++) {
-		nrptr = regReadDmu(2, kInbox1Rptr);
-		if (nrptr == newWptr)
-			break;
-		IODelay(10);
-	}
-	if (nrptr == newWptr)
-		FBLOG("dmub: PING OK — rptr advanced 0x%x -> 0x%x; reply: %08x %08x %08x",
-		      rptr, nrptr, vramRead32(ringPos), vramRead32(ringPos + 4),
-		      vramRead32(ringPos + 8));
+	// A harmless QUERY_FEATURE_CAPS: the firmware reports caps, changes nothing.
+	Dmub::Cmd cmd;
+	Dmub::clear(cmd);
+	cmd[0] = Dmub::headerWord(Dmub::CmdQueryFeatureCaps, 0, Dmub::kCmdSize - 4);
+	uint64_t slot = 0;
+	if (dmubSubmit(&cmd, 1, "dmub", &slot))
+		FBLOG("dmub: PING OK — consumed; reply: %08x %08x %08x",
+		      vramRead32(slot), vramRead32(slot + 4), vramRead32(slot + 8));
 	else
-		FBLOG("dmub: ping NOT consumed (wptr=0x%x rptr stuck at 0x%x)",
-		      newWptr, nrptr);
+		FBLOG("dmub: ping NOT consumed");
 }
 
-// rdna4-dmubcursor=1: the flanking move for the invisible-cursor saga —
-// hand the firmware our cursor register images via DMUB_CMD__UPDATE_CURSOR_
-// INFO (two chained ring entries, dc_send_update_cursor_info_to_dmu) and let
-// IT program the hardware. A white 64x64 square appearing at (100,100)
-// means AMD's own code can light the cursor plane where nine rounds of
-// direct programming could not; nothing appearing is decisive the other way.
-// Note: the DMUB position layout is x[15:0], y[31:16] — the OPPOSITE of the
-// dcn_4_1_0_sh_mask claim; whichever the FW writes is the silicon truth.
-void RDNA4FB::dmubCursorTest() {
-	uint32_t on = 0;
-	if (!PE_parse_boot_argn("rdna4-dmubcursor", &on, sizeof(on)) || on == 0)
-		return;
-	if (!hwCursorReady || !cursorVram) {
-		FBLOG("dmub: cursor test needs rdna4-hwcursor=1 (sprite slot)");
-		return;
-	}
-
-	// Opaque white 64x64 sprite in the (128-pixel-pitch) slot.
-	for (uint32_t i = 0; i < 128 * 128; i++)
-		cursorVram[i] = 0;
-	for (uint32_t r = 0; r < 64; r++)
-		for (uint32_t c = 0; c < 64; c++)
-			cursorVram[r * 128 + c] = 0xFFFFFFFFu;
-
-	constexpr uint32_t kInbox1Size = 0x01d5;
-	constexpr uint32_t kInbox1Wptr = 0x01d6, kInbox1Rptr = 0x01d7;
-	uint32_t inboxSize = regReadDmu(2, kInbox1Size);
-	uint32_t wptr = regReadDmu(2, kInbox1Wptr);
-	uint32_t rptr = regReadDmu(2, kInbox1Rptr);
-	if (inboxSize == 0 || inboxSize > 0x100000 || wptr != rptr) {
-		FBLOG("dmub: inbox busy, skipping cursor test");
-		return;
-	}
-	uint64_t region4Mc = regReadDmu(2, 0x0196) |
-	    (static_cast<uint64_t>(regReadDmu(2, 0x0197)) << 32);
-	uint64_t vramMcBase =
-	    static_cast<uint64_t>(regReadDmu(2, 0x0475) & 0xffffff) << 24;
-	uint64_t ringBase = region4Mc - vramMcBase;
-
-	// HUBP cursor control image in the DMUB union layout (enable, mode[10:8],
-	// pitch[17:16], lines_per_chunk[28:24]; REQ_MODE is not ours to set here).
-	const uint32_t hubpCtl = 1u | (hwCursorMode << 8) |
-	                         (1u << 16) /*pitch 128px*/ | (3u << 24);
-	const uint32_t dppCtl  = 1u | (hwCursorMode << 4);
-
-	uint32_t cmd0[16] = {
-		Dmub::headerWord(Dmub::CmdUpdateCursorInfo, 0, 52, false, /*multi=*/true),
-		100, 100, 64, 64,          // cursor_rect x,y,w,h
-		0,                         // debug flags
-		0x00020001,                // enable=1, pipe 0, VERSION_2 (external
-		                           // monitor support — v0 makes the FW park
-		                           // the cursor, observed on hardware), panel 0
-		hubpCtl,
-		100u | (100u << 16),       // position: x [15:0], y [31:16] per DMUB
-		0,                         // hot spot
-		0,                         // dst offset
-		dppCtl,
-		0,                         // position pipe_idx + padding
-		0,                         // otg_inst + padding
-		0, 0,
-	};
-	uint32_t cmd1[16] = {
-		Dmub::headerWord(Dmub::CmdUpdateCursorInfo, 0, 24),
-		static_cast<uint32_t>(cursorMcAddr >> 32) & 0xffff,   // SURFACE_ADDR_HIGH
-		static_cast<uint32_t>(cursorMcAddr),                  // SURFACE_ADDR
-		hubpCtl,
-		64u | (64u << 16),         // size: width, height
-		3u << 8,                   // settings: chunk_hdl_adjust
-		dppCtl,
-		0, 0, 0, 0, 0, 0, 0, 0, 0,
-	};
-
-	for (uint32_t i = 0; i < 16; i++)
-		vramWrite32(ringBase + wptr + 4 * i, cmd0[i]);
-	uint32_t slot1 = (wptr + Dmub::kCmdSize) % inboxSize;
-	for (uint32_t i = 0; i < 16; i++)
-		vramWrite32(ringBase + slot1 + 4 * i, cmd1[i]);
-
-	uint32_t newWptr = (wptr + 2 * Dmub::kCmdSize) % inboxSize;
-	regWriteDmu(2, kInbox1Wptr, newWptr);
-
-	uint32_t nrptr = rptr;
-	for (int i = 0; i < 20000; i++) {
-		nrptr = regReadDmu(2, kInbox1Rptr);
-		if (nrptr == newWptr)
-			break;
-		IODelay(10);
-	}
-	FBLOG("dmub: cursor-info %s (rptr 0x%x -> 0x%x); look for a white 64x64 "
-	      "square at (100,100); hubp ctl rb=0x%08x pos rb=0x%08x cm rb=0x%08x",
-	      nrptr == newWptr ? "CONSUMED" : "NOT consumed", rptr, nrptr,
-	      regReadDmu(2, 0x0679), regReadDmu(2, 0x067d),
-	      regReadDmu(2, 0x0cf1));
-}
-
-void RDNA4FB::setDisplayPower(bool on) {
+void RDNA4Device::setDisplayPower(bool on) {
 	if (!displaySleepEnabled || on == displayPowerOn)
 		return;
 	if (!ipDiscovery.isValid() || !rmmio)
 		return;
 
-	// DP0 stream encoder — the boot pipe (dcn_4_1_0_offset.h, base_idx 2).
-	constexpr uint32_t kDpVidStreamCntl = 0x2122;
+	// HDMI/DVI boot pipe: there is no DP stream or DPCD to toggle. Blank to
+	// solid black with the OPP's display pattern generator, the way
+	// opp2_set_disp_pattern_generator does for SOLID_COLOR (DPG colours 0,
+	// DPG_MODE = TEST_PATTERN_MODE_HORIZONTALBARS, DPG_EN).
+	if (pipe.valid() && pipe.isTmds()) {
+		constexpr uint32_t kDpgControl    = 0x1854;   // DPG_EN [0], DPG_MODE [6:4]
+		constexpr uint32_t kDpgDimensions = 0x1856;   // WIDTH [29:16], HEIGHT [13:0]
+		constexpr uint32_t kDpgColourRCr  = 0x1857;
+		constexpr uint32_t kDpgColourGY   = 0x1858;
+		constexpr uint32_t kDpgColourBCb  = 0x1859;
+		constexpr uint32_t kDpgModeHorizontalBars = 4;
+		const uint32_t o = oppOff();
+
+		ensureUpdateLatch();
+		if (!on) {
+			dpgSavedControl = regReadDmu(2, kDpgControl + o);
+			regWriteDmu(2, kDpgColourRCr + o, 0);
+			regWriteDmu(2, kDpgColourGY + o, 0);
+			regWriteDmu(2, kDpgColourBCb + o, 0);
+			regWriteDmu(2, kDpgDimensions + o,
+			            ((fbWidth & 0x3fff) << 16) | (fbHeight & 0x3fff));
+			regWriteDmu(2, kDpgControl + o,
+			            (dpgSavedControl & ~0x71u) | (kDpgModeHorizontalBars << 4) | 1u);
+		} else {
+			regWriteDmu(2, kDpgControl + o, dpgSavedControl & ~1u);
+		}
+		FBLOG("power: HDMI display %s via DPG on OPP%u (ctl 0x%08x)",
+		      on ? "unblanked" : "blanked", pipe.opp, regReadDmu(2, kDpgControl + o));
+		displayPowerOn = on;
+		return;
+	}
+
+	// DP stream encoder of the boot pipe (DP0 unless discovery found
+	// another DIG; dcn_4_1_0_offset.h, base_idx 2, DIG stride).
+	const uint32_t kDpVidStreamCntl = 0x2122 + digOff();
 	constexpr uint32_t kVidStreamEnable = 1u << 0;
 	// DPCD SET_POWER (native AUX address 0x600): D0 = 1, D3/sleep = 2.
 	constexpr uint32_t kDpcdSetPower = 0x600;
@@ -1495,450 +1574,71 @@ void RDNA4FB::setDisplayPower(bool on) {
 	displayPowerOn = on;
 }
 
-// ---------------------------------------------------------------------------
-// Emulated VBL interrupt
-// ---------------------------------------------------------------------------
-
-void RDNA4FB::fireVBL(IOTimerEventSource *sender) {
-	if (vblProc && vblEnabled)
-		vblProc(vblTarget, vblRef);
-	if (sender && vblEnabled)
-		sender->setTimeoutUS(vblPeriodUS);
-}
-
-IOReturn RDNA4FB::registerForInterruptType(IOSelect interruptType,
-                                              IOFBInterruptProc proc,
-                                              OSObject *target, void *ref,
-                                              void **interruptRef) {
-	if (interruptType != kIOFBVBLInterruptType || !vblRequested || !proc)
-		return super::registerForInterruptType(interruptType, proc, target,
-		                                       ref, interruptRef);
-
-	// Refine the tick period from the sink's EDID (59.996 Hz on the boot
-	// display reads as 16668 us; default stays 60 Hz).
-	Edid::DetailedTiming t {};
-	if (edidLen && Edid::preferredTiming(edidData, edidLen, t) &&
-	    t.refreshMilliHz() >= 30000 && t.refreshMilliHz() <= 240000)
-		vblPeriodUS = 1000000000u / t.refreshMilliHz();
-
-	vblProc = proc;
-	vblTarget = target;
-	vblRef = ref;
-
-	if (!vblTimer) {
-		vblTimer = IOTimerEventSource::timerEventSource(this,
-		    OSMemberFunctionCast(IOTimerEventSource::Action, this,
-		                         &RDNA4FB::fireVBL));
-		if (!vblTimer || !getWorkLoop() ||
-		    getWorkLoop()->addEventSource(vblTimer) != kIOReturnSuccess) {
-			if (vblTimer) {
-				vblTimer->release();
-				vblTimer = nullptr;
-			}
-			vblProc = nullptr;
-			return kIOReturnUnsupported;
-		}
-	}
-
-	vblEnabled = true;
-	vblTimer->setTimeoutUS(vblPeriodUS);
-	FBLOG("vbl: emulated VBL armed, period %u us", vblPeriodUS);
-	if (interruptRef)
-		*interruptRef = &vblProc;   // opaque token identifying our VBL slot
-	return kIOReturnSuccess;
-}
-
-IOReturn RDNA4FB::unregisterInterrupt(void *interruptRef) {
-	if (interruptRef != &vblProc)
-		return super::unregisterInterrupt(interruptRef);
-	vblEnabled = false;
-	if (vblTimer)
-		vblTimer->cancelTimeout();
-	vblProc = nullptr;
-	return kIOReturnSuccess;
-}
-
-IOReturn RDNA4FB::setInterruptState(void *interruptRef, UInt32 state) {
-	if (interruptRef != &vblProc)
-		return super::setInterruptState(interruptRef, state);
-	// IOFramebuffer throttles VBL when idle (vblThrottle) and re-enables it
-	// on demand; honoring the state keeps the timer from ticking pointlessly.
-	bool enable = (state == kEnabledInterruptState);
-	if (enable && !vblEnabled && vblTimer)
-		vblTimer->setTimeoutUS(vblPeriodUS);
-	if (!enable && vblTimer)
-		vblTimer->cancelTimeout();
-	vblEnabled = enable;
-	return kIOReturnSuccess;
-}
-
-// ---------------------------------------------------------------------------
-// Hardware cursor (DCN cursor plane, pipe 0)
-// ---------------------------------------------------------------------------
 
 namespace {
-// dcn_4_1_0_offset.h, all base_idx 2. HUBP-side CURSOR0_0 block plus the
-// DPP-side CM_CUR0 enable.
-constexpr uint32_t kCurControl  = 0x0679;
-constexpr uint32_t kCurAddr     = 0x067a;
-constexpr uint32_t kCurAddrHigh = 0x067b;
-constexpr uint32_t kCurSize     = 0x067c;
-constexpr uint32_t kCurPosition = 0x067d;
-constexpr uint32_t kCurHotSpot  = 0x067e;
-constexpr uint32_t kCurDstOffset = 0x0680;
-constexpr uint32_t kCmCur0Control = 0x0cf1;
-// DCN 4.01 cursor FP pipeline (new on this generation): cursor pixels are
-// multiplied by an FP16 scale before blending. The GOP never uses a cursor
-// and leaves scale at 0.0 — every register and the sprite data verify
-// perfectly while the cursor renders as nothing. 0x3c00 is FP16 1.0, the
-// default from dcn10_set_cursor_sdr_white_level; bias 0; matrix bypass (0).
-constexpr uint32_t kCmCur0FpScaleBiasGY = 0x0cf4;  // SCALE [15:0], BIAS [31:16]
-constexpr uint32_t kCmCur0FpScaleBiasRB = 0x0cf5;
-constexpr uint32_t kCmCur0MatrixMode    = 0x0cf6;
-constexpr uint32_t kCurFpScaleOne       = 0x3c00;  // FP16 1.0
-// Pipe update latching. Cursor/CM registers are double-buffered: writes go
-// to a pending copy that latches into live hardware at the frame boundary —
-// but only while OTG_MASTER_UPDATE_LOCK is released. The GOP programs its
-// pipe under the lock and has no reason to ever release it, which freezes
-// every later pipe update in pending space (reads return the pending values,
-// so all writes "verify" while the hardware never changes). LOCK bit 0 is
-// the request; UPDATE_LOCK_STATUS bit 8 and OTG_UPDATE_PENDING bit 0 of
-// DOUBLE_BUFFER_CONTROL are true status bits.
-constexpr uint32_t kOtgMasterUpdateLock  = 0x1b89;
+// OTG global-sync / update-lock registers of instance 0 (dcn_4_1_0_offset.h,
+// base_idx 2, OTG stride 0x80). Pipe updates are double-buffered: writes go
+// to a pending copy that latches into live hardware on the VUPDATE pulse,
+// and only while OTG_MASTER_UPDATE_LOCK is released. The GOP holds the lock
+// and programs no pulse, so without ensureUpdateLatch() nothing written to
+// the pipe after boot ever takes effect (writes read back fine regardless).
+constexpr uint32_t kOtgMasterUpdateLock  = 0x1b89;   // LOCK [0], UPDATE_LOCK_STATUS [8]
 constexpr uint32_t kOtgDoubleBufferCtl   = 0x1b5c;
-constexpr uint32_t kDppTopControl        = 0x0cc5;
-// Global sync: pipe updates latch on the VUPDATE pulse, which is a
-// PROGRAMMABLE event (offset/width lines, positioned via VSTARTUP). amdgpu
-// programs it at every modeset; a GOP that never updates its pipe again has
-// no reason to program a pulse at all — width 0 means the latch event never
-// fires and every double-buffered write stays pending forever. This also
-// retroactively explains the earlier 8bpc/MCM writes that read back changed
-// but never altered the picture. GLOBAL_SYNC_STATUS bit 8
-// (VUPDATE_EVENT_OCCURRED) is the ground truth.
+constexpr uint32_t kDppTopControl        = 0x0cc5;   // DPP_TOP0_DPP_CONTROL (log only)
 constexpr uint32_t kOtgVStartupParam     = 0x1b85;
-constexpr uint32_t kOtgVUpdateParam      = 0x1b86;
+constexpr uint32_t kOtgVUpdateParam      = 0x1b86;   // VUPDATE_WIDTH [25:16]
 constexpr uint32_t kOtgVReadyParam       = 0x1b87;
-constexpr uint32_t kOtgGlobalSyncStatus  = 0x1b88;
-// HUBPREQ0_CURSOR_SETTINGS — cursor fetch scheduling. amdgpu always programs
-// CHUNK_HDL_ADJUST=3 ([9:8]); without it and a correct LINES_PER_CHUNK the
-// cursor request pipeline can fetch nothing (sprite armed but invisible).
-constexpr uint32_t kCurSettings = 0x0653;
-constexpr uint32_t kCurChunkHdlAdjust = 3u << 8;
-
-// Field layout (dcn_4_1_0_sh_mask.h): CURSOR_CONTROL enable bit0, REQ_MODE
-// bit2, MODE [9:8], PITCH [17:16], LINES_PER_CHUNK [25:24]; SIZE height
-// [15:0] width [31:16]; POSITION y [14:0], x starts at bit 15 (NOT 16 on
-// this generation).
-// CURSOR_REQ_MODE=1 (fetch during display prefetch) is MANDATORY on DCN4x:
-// per dcn401_hubp.c, mode 0 (legacy fetch-just-in-time) "is no longer
-// supported" — with it the cursor simply never fetches (hardware-confirmed:
-// three rounds of perfect registers + verified sprite data, no pixels).
-constexpr uint32_t kCurReqMode    = 1u << 2;
-constexpr uint32_t kCurModeShift  = 8;
-constexpr uint32_t kCurPitchShift = 16;
-constexpr uint32_t kCurLpcShift   = 24;
-constexpr uint32_t kCurXShift     = 15;
-// CM_CUR0_CURSOR0_CONTROL: CUR0_ENABLE bit0, CUR0_MODE [6:4], plus two bits
-// captured from a WORKING amdgpu cursor on this exact GPU (register diff,
-// Debian, 2026-07-12: working value 0x000000a5 vs our 0x21): bit 7
-// (CUR0_PIXEL_ALPHA_MOD_EN) and bit 2 (CUR0_PIX_INV_MODE per the sh_mask).
-// Neither is set by dpp401_set_cursor_attributes — amdgpu programs them in
-// a layer we had not ported. Mirror the proven-working value.
-constexpr uint32_t kCur0ModeShift   = 4;
-constexpr uint32_t kCur0WorkingBits = (1u << 7) | (1u << 2);
-
-// hubp1_get_lines_per_chunk for color cursors: enum {1,2,4,8,16} lines
-// encodes as 0..4.
-static uint32_t cursorLinesPerChunk(uint32_t width) {
-	if (width <= 32)  return 4;  // 16 lines
-	if (width <= 64)  return 3;  // 8 lines
-	if (width <= 128) return 2;  // 4 lines
-	return 1;                    // 2 lines
-}
-
-// HUBPREQ0 scanout address registers — anchor for the sprite's GPU address.
-constexpr uint32_t kHubpPrimaryAddr     = 0x060a;
-constexpr uint32_t kHubpPrimaryAddrHigh = 0x060b;
-
-constexpr uint32_t kCursorPixels = 128;               // fixed 128x128 slot
-constexpr uint32_t kCursorPitchCode = 1;              // 0=64,1=128,2=256 px
-constexpr uint32_t kCursorBytes  = kCursorPixels * kCursorPixels * 4;
+constexpr uint32_t kOtgGlobalSyncStatus  = 0x1b88;   // VUPDATE_EVENT_OCCURRED [8]
 } // namespace
 
-bool RDNA4FB::initHWCursor() {
-	if (!hwCursorRequested || !ipDiscovery.isValid() || !rmmio ||
-	    fbPhysBase == 0 || fbLength == 0)
-		return false;
-
-	uint32_t lo = regReadDmu(2, kHubpPrimaryAddr);
-	uint32_t hi = regReadDmu(2, kHubpPrimaryAddrHigh);
-	if (lo == 0xFFFFFFFF || (lo == 0 && hi == 0)) {
-		FBLOG("cursor: scanout MC address unreadable, staying with software cursor");
-		return false;
-	}
-	uint64_t scanoutMc = (static_cast<uint64_t>(hi & 0xffff) << 32) | lo;
-	scanoutMcAddr = scanoutMc;
-
-	uint32_t ctest = 0;
-	if (PE_parse_boot_argn("rdna4-curtest", &ctest, sizeof(ctest)) && ctest != 0) {
-		hwCursorTest = true;
-		FBLOG("cursor: TEST MODE: sprite will fetch from the scanout base");
-	}
-
-	// Address-routing state (read-only): the DCHUBBUB FB/AGP windows and the
-	// per-HUBP system aperture decide where cursor memory requests actually
-	// go. Out-of-window requests return zeros without latching any error.
-	FBLOG("cursor: vm: fb_loc base=0x%08x top=0x%08x agp base=0x%08x "
-	      "bot=0x%08x top=0x%08x sys_ap=0x%08x/0x%08x l1_tlb=0x%08x",
-	      regReadDmu(2, 0x0475), regReadDmu(2, 0x0476),
-	      regReadDmu(2, 0x047a), regReadDmu(2, 0x0478), regReadDmu(2, 0x0479),
-	      regReadDmu(2, 0x062c), regReadDmu(2, 0x062d), regReadDmu(2, 0x063a));
-
-	// Sprite right after the framebuffer, 8 KiB aligned. The CPU sees VRAM
-	// through the BAR at the same linear offsets as the MC addresses, so the
-	// CPU-visible sprite address is fbPhysBase plus the identical delta.
-	cursorMcAddr = (scanoutMc + fbLength + 0x1FFFULL) & ~0x1FFFULL;
-	uint64_t delta = cursorMcAddr - scanoutMc;
-	// Stay well inside the 256 MiB non-ReBAR VRAM window.
-	if (delta + kCursorBytes > 192ULL * 1024 * 1024) {
-		FBLOG("cursor: sprite offset 0x%llx outside safe aperture window", delta);
-		return false;
-	}
-
-	IODeviceMemory *mem = IODeviceMemory::withRange(fbPhysBase + delta, kCursorBytes);
-	if (!mem)
-		return false;
-	cursorMap = mem->map();
-	mem->release();
-	if (!cursorMap) {
-		FBLOG("cursor: failed to map sprite VRAM");
-		return false;
-	}
-	cursorVram = reinterpret_cast<volatile uint32_t *>(cursorMap->getVirtualAddress());
-
-	cursorStage = static_cast<uint32_t *>(IOMalloc(kCursorBytes));
-	if (!cursorStage) {
-		cursorMap->release();
-		cursorMap = nullptr;
-		cursorVram = nullptr;
-		return false;
-	}
+void RDNA4Device::ensureUpdateLatch() {
+	if (updateLatchReady || !ipDiscovery.isValid() || !rmmio)
+		return;
+	const uint32_t o = otgOff();
 
 	// Release the OTG master update lock if the GOP left it held: with the
-	// lock asserted, every double-buffered cursor/CM write stays pending
-	// forever (writes read back fine, hardware never changes).
-	uint32_t lock = regReadDmu(2, kOtgMasterUpdateLock);
-	uint32_t dbc  = regReadDmu(2, kOtgDoubleBufferCtl);
-	FBLOG("cursor: OTG lock=0x%08x (status=%u) dbufctl=0x%08x dppctl=0x%08x",
-	      lock, (lock >> 8) & 1, dbc, regReadDmu(2, kDppTopControl));
+	// lock asserted, every double-buffered pipe write stays pending forever
+	// (writes read back fine, hardware never changes).
+	uint32_t lock = regReadDmu(2, kOtgMasterUpdateLock + o);
+	FBLOG("latch: OTG%u lock=0x%08x (status=%u) dbufctl=0x%08x dppctl=0x%08x",
+	      pipe.otg < Pipe::kMaxOtg ? pipe.otg : 0, lock, (lock >> 8) & 1,
+	      regReadDmu(2, kOtgDoubleBufferCtl + o), regReadDmu(2, kDppTopControl + dppOff()));
+	if (lock == 0xFFFFFFFF)
+		return;
 	if (lock & 1) {
-		regWriteDmu(2, kOtgMasterUpdateLock, 0);
-		FBLOG("cursor: released OTG master update lock (was 0x%08x, now 0x%08x)",
-		      lock, regReadDmu(2, kOtgMasterUpdateLock));
+		regWriteDmu(2, kOtgMasterUpdateLock + o, 0);
+		FBLOG("latch: released OTG master update lock (was 0x%08x, now 0x%08x)",
+		      lock, regReadDmu(2, kOtgMasterUpdateLock + o));
 	}
 
 	// Ensure the VUPDATE latch pulse exists. Without it, no pipe update we
 	// ever queue becomes live.
-	uint32_t vstartup = regReadDmu(2, kOtgVStartupParam);
-	uint32_t vupdate  = regReadDmu(2, kOtgVUpdateParam);
-	uint32_t sync     = regReadDmu(2, kOtgGlobalSyncStatus);
-	FBLOG("cursor: global sync: vstartup=0x%08x vupdate=0x%08x vready=0x%08x "
+	uint32_t vstartup = regReadDmu(2, kOtgVStartupParam + o);
+	uint32_t vupdate  = regReadDmu(2, kOtgVUpdateParam + o);
+	uint32_t sync     = regReadDmu(2, kOtgGlobalSyncStatus + o);
+	FBLOG("latch: global sync: vstartup=0x%08x vupdate=0x%08x vready=0x%08x "
 	      "status=0x%08x (vupdate_occurred=%u)",
-	      vstartup, vupdate, regReadDmu(2, kOtgVReadyParam), sync,
+	      vstartup, vupdate, regReadDmu(2, kOtgVReadyParam + o), sync,
 	      (sync >> 8) & 1);
 	if (((vupdate >> 16) & 0x3ff) == 0) {
 		// Pulse of 2 lines right at VSTARTUP. If VSTARTUP is also
-		// unprogrammed, place it inside the vertical blank (the Samsung
-		// timing has 62 blank lines; 40 is safely within any mode's blank).
-		if ((vstartup & 0x3ff) == 0)
-			regWriteDmu(2, kOtgVStartupParam, 40);
-		regWriteDmu(2, kOtgVUpdateParam, (2u << 16));
-		FBLOG("cursor: programmed VUPDATE pulse (vstartup=0x%08x vupdate=0x%08x)",
-		      regReadDmu(2, kOtgVStartupParam), regReadDmu(2, kOtgVUpdateParam));
-	}
-
-	FBLOG("cursor: HW cursor armed: scanout MC 0x%llx, sprite MC 0x%llx "
-	      "(cpu 0x%llx), mode %u", scanoutMc, cursorMcAddr,
-	      fbPhysBase + delta, hwCursorMode);
-	hwCursorReady = true;
-	return true;
-}
-
-IOReturn RDNA4FB::setCursorImage(void *cursorImage) {
-	if (!hwCursorReady)
-		return kIOReturnUnsupported;
-
-	IOHardwareCursorDescriptor desc {};
-	desc.majorVersion = kHardwareCursorDescriptorMajorVersion;
-	desc.minorVersion = kHardwareCursorDescriptorMinorVersion;
-	desc.height   = kCursorPixels;
-	desc.width    = kCursorPixels;
-	desc.bitDepth = 32;   // direct ARGB
-
-	IOHardwareCursorInfo info {};
-	info.majorVersion = kHardwareCursorInfoMajorVersion;
-	info.minorVersion = kHardwareCursorInfoMinorVersion;
-	info.hardwareCursorData = reinterpret_cast<UInt8 *>(cursorStage);
-
-	if (!convertCursorImage(cursorImage, &desc, &info))
-		return kIOReturnUnsupported;
-	uint32_t w = info.cursorWidth, h = info.cursorHeight;
-	if (w == 0 || h == 0 || w > kCursorPixels || h > kCursorPixels)
-		return kIOReturnUnsupported;
-
-	// Staging buffer is tightly packed (w*4); the VRAM slot has a fixed
-	// 128-pixel pitch. Clear the slot so stale pixels never show at edges.
-	for (uint32_t i = 0; i < kCursorPixels * kCursorPixels; i++)
-		cursorVram[i] = 0;
-	for (uint32_t row = 0; row < h; row++)
-		for (uint32_t col = 0; col < w; col++)
-			cursorVram[row * kCursorPixels + col] = cursorStage[row * w + col];
-
-	// Data-integrity check for the first images: find an opaque staging
-	// pixel and read the same location back from VRAM. Registers verifying
-	// while the pointer stays invisible means either the conversion made a
-	// fully transparent sprite (staging max-alpha 0) or the CPU->VRAM window
-	// is not where we think (VRAM readback mismatch).
-	if (cursorImgLogs < 3) {
-		uint32_t opaqueIdx = 0, opaqueVal = 0;
-		for (uint32_t i = 0; i < w * h; i++) {
-			if ((cursorStage[i] >> 24) > (opaqueVal >> 24)) {
-				opaqueVal = cursorStage[i];
-				opaqueIdx = i;
-			}
-			if ((opaqueVal >> 24) == 0xff)
-				break;
+		// unprogrammed, place it inside the vertical blank of the live mode
+		// (upstream used 40 lines, sized for its 4K display's 62-line blank).
+		if ((vstartup & 0x3ff) == 0) {
+			uint32_t start = 40;
+			if (bootTimingValid && bootTiming.vBlank > 4 && bootTiming.vBlank - 2 < start)
+				start = bootTiming.vBlank - 2u;
+			regWriteDmu(2, kOtgVStartupParam + o, start);
 		}
-		uint32_t row = opaqueIdx / w, col = opaqueIdx % w;
-		uint32_t vramVal = cursorVram[row * kCursorPixels + col];
-		FBLOG("cursor: pixel check: stage[%u,%u]=0x%08x vram=0x%08x %s",
-		      col, row, opaqueVal, vramVal,
-		      opaqueVal == vramVal ? "(match)" : "(MISMATCH - aperture wrong)");
+		regWriteDmu(2, kOtgVUpdateParam + o, (2u << 16));
+		FBLOG("latch: programmed VUPDATE pulse (vstartup=0x%08x vupdate=0x%08x)",
+		      regReadDmu(2, kOtgVStartupParam + o), regReadDmu(2, kOtgVUpdateParam + o));
 	}
-
-	uint64_t spriteAddr = hwCursorTest ? scanoutMcAddr : cursorMcAddr;
-	regWriteDmu(2, kCurAddrHigh, static_cast<uint32_t>(spriteAddr >> 32) & 0xffff);
-	regWriteDmu(2, kCurAddr, static_cast<uint32_t>(spriteAddr));
-	regWriteDmu(2, kCurSize, h | (w << 16));
-	// setCursorState receives hotspot-adjusted top-left coords, so the
-	// hardware hotspot stays zero.
-	regWriteDmu(2, kCurHotSpot, 0);
-	// Fetch scheduling (missing on first hardware try — sprite armed but
-	// invisible): chunk handle deadline adjust + lines per fetch chunk.
-	regWriteDmu(2, kCurSettings, kCurChunkHdlAdjust);
-	cursorCtlBase = (cursorLinesPerChunk(w) << kCurLpcShift) |
-	                (kCursorPitchCode << kCurPitchShift) |
-	                (hwCursorMode << kCurModeShift) |
-	                kCurReqMode;
-	regWriteDmu(2, kCurControl, cursorCtlBase | (hwCursorVisible ? 1u : 0u));
-	// The FP scale stage: without FP16 1.0 here the sprite is multiplied
-	// to invisibility (found on hardware 2026-07-12).
-	regWriteDmu(2, kCmCur0FpScaleBiasGY, kCurFpScaleOne);
-	regWriteDmu(2, kCmCur0FpScaleBiasRB, kCurFpScaleOne);
-	regWriteDmu(2, kCmCur0MatrixMode, 0);   // matrix bypass
-	regWriteDmu(2, kCmCur0Control,
-	            (hwCursorMode << kCur0ModeShift) | kCur0WorkingBits |
-	            (hwCursorVisible ? 1u : 0u));
-
-	if (cursorImgLogs < 3) {
-		cursorImgLogs++;
-		FBLOG("cursor: image %ux%u px0=0x%08x rb: ctl=0x%08x size=0x%08x "
-		      "addr=0x%08x/%04x set=0x%08x cm=0x%08x fp=0x%08x/0x%08x "
-		      "hubp_cntl=0x%08x cnvc=0x%08x/0x%08x",
-		      w, h, cursorStage[0],
-		      regReadDmu(2, kCurControl), regReadDmu(2, kCurSize),
-		      regReadDmu(2, kCurAddr), regReadDmu(2, kCurAddrHigh) & 0xffff,
-		      regReadDmu(2, kCurSettings), regReadDmu(2, kCmCur0Control),
-		      regReadDmu(2, kCmCur0FpScaleBiasGY),
-		      regReadDmu(2, kCmCur0FpScaleBiasRB),
-		      regReadDmu(2, 0x05f4),           // HUBP0_DCHUBP_CNTL
-		      regReadDmu(2, 0x0ccf),           // CNVC surface pixel format
-		      regReadDmu(2, 0x0cd0));          // CNVC format control
-	}
-	return kIOReturnSuccess;
+	updateLatchReady = true;
 }
 
-IOReturn RDNA4FB::setCursorState(SInt32 x, SInt32 y, bool visible) {
-	if (!hwCursorReady)
-		return kIOReturnUnsupported;
 
-	// Signed coords can go negative when the pointer overlaps the top/left
-	// edge; clamp (v1 accepts the sprite pinning at the edge there).
-	if (x < 0) x = 0;
-	if (y < 0) y = 0;
-	regWriteDmu(2, kCurPosition,
-	            (static_cast<uint32_t>(y) & 0x7fff) |
-	            (static_cast<uint32_t>(x) << kCurXShift));
-	// Cursor fetch deadline (hubp2_cursor_set_position): the source x offset
-	// scaled from pixel time to refclk time. 100 MHz refclk over the 533.25
-	// MHz boot pixel clock; precision is uncritical (it is a deadline hint).
-	regWriteDmu(2, kCurDstOffset,
-	            (static_cast<uint32_t>(x) * 100000u) / 533250u);
-	// Only touch the double-buffered control registers on visibility
-	// changes — rewriting them every move re-arms UPDATE_PENDING and hides
-	// whether latching ever completes.
-	if (visible != hwCursorVisible) {
-		if (cursorCtlBase)   // 0 until the first setCursorImage
-			regWriteDmu(2, kCurControl, cursorCtlBase | (visible ? 1u : 0u));
-		regWriteDmu(2, kCmCur0Control,
-		            (hwCursorMode << kCur0ModeShift) | kCur0WorkingBits |
-		            (visible ? 1u : 0u));
-	}
-	hwCursorVisible = visible;
-
-	// Log the first few calls, then a sparse sample of later ones — the
-	// later samples show whether CUR0_UPDATE_PENDING (cm bit 16) ever
-	// clears and whether VUPDATE events occur (sync bit 8) once the
-	// control registers are left alone between visibility changes.
-	cursorPosCalls++;
-	if (cursorPosLogs < 6 ||
-	    (cursorPosLogs < 14 && (cursorPosCalls & 0x1ff) == 0)) {
-		cursorPosLogs++;
-		FBLOG("cursor: state#%u x=%d y=%d vis=%d rb: pos=0x%08x ctl=0x%08x "
-		      "cm=0x%08x sync=0x%08x",
-		      cursorPosCalls, (int)x, (int)y, visible,
-		      regReadDmu(2, kCurPosition), regReadDmu(2, kCurControl),
-		      regReadDmu(2, kCmCur0Control),
-		      regReadDmu(2, kOtgGlobalSyncStatus));
-	}
-	return kIOReturnSuccess;
-}
-
-void RDNA4FB::initForPM() {
-	if (pmRegistered)
-		return;
-	pmRegistered = true;
-
-	// States and flags mirror IONDRVFramebuffer::initForPM: 0 = sleep,
-	// 1 = doze (display blanked, framebuffer preserved), 2 = wake.
-	static IOPMPowerState powerStates[3] = {
-		{ 1, 0,                0,            0,            0, 0, 0, 0, 0, 0, 0, 0 },
-		{ 1, 0,                0,            kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
-		{ 1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
-	};
-
-	// Like Apple's IOBootNDRV (the EFI fallback framebuffer): we cannot
-	// reprogram the display pipe after the GPU loses power, so a wake from
-	// system sleep would come back to a black screen. Veto system sleep from
-	// every state until native mode setting exists. Display sleep (doze) is
-	// unaffected.
-	for (auto &state : powerStates)
-		state.capabilityFlags |= kIOPMPreventSystemSleep;
-
-	// Register with the policy maker (IOFramebuffer::start already did
-	// PMinit + joinPMtree). Without this no power states exist for this
-	// device and setPowerState is never called.
-	registerPowerDriver(this, powerStates, 3);
-	// No sleep until children (the displays) allow it.
-	temporaryPowerClampOn();
-	// Do not drop below doze until system sleep.
-	changePowerStateTo(1);
-	if (pciDevice)
-		pciDevice->setProperty("IOPMIsPowerManaged", true);  // key is SDK-private
-	FBLOG("power: registered power states (doze-only, system sleep vetoed)");
-}
-
-bool RDNA4FB::regWriteDmu(uint8_t baseIdx, uint32_t dwordOffset, uint32_t value) {
+bool RDNA4Device::regWriteDmu(uint8_t baseIdx, uint32_t dwordOffset, uint32_t value) {
 	uint32_t byteOffset;
 	if (!ipDiscovery.isValid() ||
 	    !ipDiscovery.regByteOffset(IpDiscovery::HwDmu, 0, baseIdx, dwordOffset, byteOffset))
@@ -1949,7 +1649,7 @@ bool RDNA4FB::regWriteDmu(uint8_t baseIdx, uint32_t dwordOffset, uint32_t value)
 	return true;
 }
 
-void RDNA4FB::tryForce8bpc() {
+void RDNA4Device::tryForce8bpc() {
 	uint32_t v = 0;
 	if (!PE_parse_boot_argn("rdna4-8bpc", &v, sizeof(v)) || v == 0)
 		return;
@@ -1979,7 +1679,7 @@ void RDNA4FB::tryForce8bpc() {
 	      regReadDmu(2, kDpPixelFormat), regReadDmu(2, kDpMsaColorimetry));
 }
 
-void RDNA4FB::probeMemSize() {
+void RDNA4Device::probeMemSize() {
 	// RCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE (NBIF 6.3.1 seg 2, dword 0x00c3):
 	// VRAM size in MiB — amdgpu's nbif_v6_3_1_get_memsize. The byte offset
 	// below was derived from this card's IP discovery table (base 0xd20)
@@ -2000,425 +1700,214 @@ void RDNA4FB::probeMemSize() {
 	}
 
 	FBLOG("mmio: VRAM size %u MiB (RCC_CONFIG_MEMSIZE @ 0x%x)", memsizeMB, off);
-	setProperty("VRAM,TotalMB", static_cast<uint64_t>(memsizeMB), 32);
+	owner->setProperty("VRAM,TotalMB", static_cast<uint64_t>(memsizeMB), 32);
 	// Independent confirmation that register MMIO works — the gate for all
 	// future DCN (AUX/EDID, mode setting) work. The register reports usable
 	// VRAM (nominal size minus firmware reservations: 16304 on this 16 GiB
 	// card), so accept any plausible value rather than an exact match.
-	setProperty("MMIO,Verified", memsizeMB >= 1024 && memsizeMB <= 65536);
+	owner->setProperty("MMIO,Verified", memsizeMB >= 1024 && memsizeMB <= 65536);
 }
 
+
 // ---------------------------------------------------------------------------
-// IOService
+// Lifecycle
 // ---------------------------------------------------------------------------
 
-IOService *RDNA4FB::probe(IOService *provider, SInt32 *score) {
-	// Kill switch: boot-arg "rdna4-off=1" (no leading dash) disables the
-	// driver without removing it, so a bad build can be recovered from the
-	// OpenCore boot-args instead of Safe Mode / filesystem surgery.
-	uint32_t off = 0;
-	if (PE_parse_boot_argn("rdna4-off", &off, sizeof(off)) && off != 0) {
-		FBLOG("disabled by rdna4-off boot-arg");
-		return nullptr;
-	}
-
-	if (!super::probe(provider, score))
-		return nullptr;
-
-	auto *pci = OSDynamicCast(IOPCIDevice, provider);
-	if (!pci) {
-		FBLOG("provider is not an IOPCIDevice");
-		return nullptr;
-	}
-
-	uint32_t vendorDevice = pci->configRead32(kIOPCIConfigVendorID);
-	uint16_t device = static_cast<uint16_t>(vendorDevice >> 16);
-	FBLOG("probe on PCI device 0x%08x", vendorDevice);
-
-	// Vendor 0x1002 (AMD), Navi 48 family: 0x7550 (RX 9070 / 9070 XT),
-	// 0x7551 (Radeon AI PRO R9700 — same die, compute bring-up proven on
-	// macOS by lemonade-sdk/mac-amdgpu). Same DCN 4.1.0 display core.
-	if ((vendorDevice & 0xffff) != 0x1002 ||
-	    (device != 0x7550 && device != 0x7551)) {
-		FBLOG("device id mismatch, not matching");
-		return nullptr;
-	}
-	FBLOG("Navi 48 variant: %s",
-	      device == 0x7550 ? "RX 9070 / 9070 XT" : "R9700");
-
-	if (score) *score += 20000;
-	return this;
-}
-
-bool RDNA4FB::start(IOService *provider) {
-	pciDevice = OSDynamicCast(IOPCIDevice, provider);
-	if (!pciDevice) {
-		FBLOG("start: no PCI provider");
+bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
+	pciDevice = pci;
+	owner = ownerService;
+	if (!pciDevice || !owner)
 		return false;
-	}
-
-	uint32_t cmap = 0;
-	if (PE_parse_boot_argn("rdna4-cmap", &cmap, sizeof(cmap)) && cmap <= 5) {
-		channelMap = cmap;
-		FBLOG("start: using channel map %u", channelMap);
-	}
 
 	uint32_t nosleep = 0;
 	if (PE_parse_boot_argn("rdna4-nosleep", &nosleep, sizeof(nosleep)) && nosleep != 0) {
 		displaySleepEnabled = false;
-		FBLOG("start: display sleep disabled by rdna4-nosleep");
+		FBLOG("init: display sleep disabled by rdna4-nosleep");
 	}
 
-	uint32_t vbl = 0;
-	if (PE_parse_boot_argn("rdna4-vbl", &vbl, sizeof(vbl)) && vbl != 0)
-		vblRequested = true;
-
-	uint32_t hwcur = 0;
-	if (PE_parse_boot_argn("rdna4-hwcursor", &hwcur, sizeof(hwcur)) && hwcur != 0) {
-		hwCursorRequested = true;
-		uint32_t cmode = 0;
-		if (PE_parse_boot_argn("rdna4-curmode", &cmode, sizeof(cmode)) &&
-		    (cmode == 2 || cmode == 3))   // 2 premult, 3 straight alpha
-			hwCursorMode = cmode;
-	}
-
-	// Grab the bootloader-provided framebuffer before anything else touches it.
+	// The scanout the GOP left behind is what IONDRVFramebuffer shows too.
 	if (!captureConsoleInfo()) {
-		FBLOG("start: could not capture console framebuffer, aborting");
+		FBLOG("init: could not capture console framebuffer, leaving the display alone");
 		return false;
 	}
 
-	// Enable memory space so the aperture is reachable; do NOT enable bus
-	// mastering — we never issue DMA.
-	pciDevice->setMemoryEnable(true);
-
-	// Precise model on the PCI nub (System Report / ioreg diagnostics).
 	uint32_t vd = pciDevice->configRead32(kIOPCIConfigVendorID);
+	isAmd = (vd & 0xffff) == 0x1002;
 	const char *model = (vd >> 16) == 0x7551 ? "AMD Radeon AI PRO R9700"
 	                                         : "AMD Radeon RX 9070 XT";
-	pciDevice->setProperty("model", model);
-	setProperty("GPU,Variant", model);
+	if (!isAmd)
+		model = "VM test (vmware-svga)";
+	else
+		pciDevice->setProperty("model", model);   // System Report / ioreg
+	owner->setProperty("GPU,Variant", model);
 
-	// Registers first: the on-die discovery fallback needs MMIO.
-	bool haveMmio = mapRegisters();
+	if (isAmd) {
+		// Enable memory space so the aperture is reachable; never bus
+		// mastering — nothing here issues DMA.
+		pciDevice->setMemoryEnable(true);
 
-	// Best effort: connector layout and firmware info for later native
-	// mode-setting work. The framebuffer itself does not depend on this.
-	loadVBIOS();
+		// Registers first: the on-die discovery fallback needs MMIO.
+		bool haveMmio = mapRegisters();
 
-	// If the VBIOS route did not yield IP discovery (no full flash dump
-	// injected), read the PSP's on-die copy from top-of-VRAM — makes the
-	// ATY,bin_image injection optional.
-	if (haveMmio && !ipDiscovery.isValid())
-		loadOnDieDiscovery();
+		// Connector layout and firmware info for mode setting; the display
+		// itself does not depend on this.
+		loadVBIOS();
+		if (haveMmio && !ipDiscovery.isValid())
+			loadOnDieDiscovery();
 
-	// Best effort: prove register MMIO works with one safe read (VRAM size),
-	// then dump the DCN output-colour registers (read-only) for diagnosis.
-	if (haveMmio) {
-		probeMemSize();
-		dumpDCN();
-		tryForce8bpc();
-		probeEDID();
-		dumpModeState();
-		initHWCursor();
-		dmubHistory();
-		dumpDmubVersion();
-		dmubPing();
-		dmubCursorTest();
-		smuPing();
-		dumpIH();
-		dumpPSP();
+		if (haveMmio) {
+			// First: every per-pipe path below keys off the pipe the GOP lit.
+			discoverPipe();
+			probeMemSize();
+			dumpDCN();
+			// DP-stream experiment; meaningless (and aimed at DP0) on HDMI.
+			if (!pipe.isTmds())
+				tryForce8bpc();
+			probeEDID();
+			dumpModeState();
+			dmubHistory();
+			dumpDmubVersion();
+			dmubPing();
+			smuPing();
+			dumpIH();
+			dumpPSP();
+		}
 	}
 
-	if (!super::start(provider)) {
-		FBLOG("start: super::start failed");
-		return false;
-	}
-
-	FBLOG("started");
+	// Needs the boot timing (discoverPipe) and the sink's EDID (probeEDID).
+	buildModeTable();
+	FBLOG("init: device ready (%ux%u console, %lu mode(s))", fbWidth, fbHeight,
+	      static_cast<unsigned long>(modeCount));
 	return true;
 }
 
-void RDNA4FB::stop(IOService *provider) {
-	FBLOG("stop");
-	vblEnabled = false;
-	vblProc = nullptr;
-	if (vblTimer) {
-		vblTimer->cancelTimeout();
-		if (getWorkLoop())
-			getWorkLoop()->removeEventSource(vblTimer);
-		vblTimer->release();
-		vblTimer = nullptr;
-	}
-	hwCursorReady = false;
-	if (cursorStage) {
-		IOFree(cursorStage, kCursorBytes);
-		cursorStage = nullptr;
-	}
-	if (cursorMap) {
-		cursorMap->release();
-		cursorMap = nullptr;
-		cursorVram = nullptr;
-	}
+RDNA4Device::~RDNA4Device() {
 	if (onDieDisc) {
 		IOFree(onDieDisc, 10 << 10);
 		onDieDisc = nullptr;
 	}
 	unmapRegisters();
 	freeVBIOS();
-	super::stop(provider);
 }
 
 // ---------------------------------------------------------------------------
-// IOFramebuffer — bring-up
+// Mode table
 // ---------------------------------------------------------------------------
 
-IOReturn RDNA4FB::enableController() {
-	// The controller is already "enabled": the firmware programmed the display
-	// pipe and scanout address. We just re-validate the console geometry.
-	if (fbPhysBase == 0 && !captureConsoleInfo())
-		return kIOReturnNoResources;
+#ifdef RDNA4FB_VM_TEST
+// Lenovo G25-10 base block (the tools/atomdump.cpp fixture). With boot-arg
+// "rdna4-fakeedid=1" the VM test build serves it as the sink's EDID, so the
+// mode table and how a given macOS release presents it can be checked
+// without RDNA 4 hardware.
+static const uint8_t kVmFixtureEdid[128] = {
+	0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x30, 0xae, 0xfe, 0x65, 0x00, 0x00, 0x00, 0x00,
+	0x32, 0x1e, 0x01, 0x03, 0x80, 0x36, 0x1e, 0x78, 0x2a, 0x90, 0x55, 0xa7, 0x55, 0x53, 0xa0, 0x28,
+	0x13, 0x50, 0x54, 0xa1, 0x08, 0x00, 0xd1, 0xc0, 0xb3, 0x00, 0x81, 0xc0, 0x81, 0x80, 0x95, 0x00,
+	0xa9, 0xc0, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c,
+	0x45, 0x00, 0x20, 0x2f, 0x21, 0x00, 0x00, 0x1e, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x30, 0x90, 0x1e,
+	0xaa, 0x22, 0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x4c,
+	0x45, 0x4e, 0x20, 0x47, 0x32, 0x35, 0x2d, 0x31, 0x30, 0x0a, 0x20, 0x20, 0x00, 0x00, 0x00, 0xff,
+	0x00, 0x55, 0x34, 0x42, 0x34, 0x33, 0x30, 0x4e, 0x39, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x01, 0x71,
+};
+#endif
 
-	// Register power states here, not in start(): IOFramebuffer's power
-	// machinery is only ready once the framebuffer is opened (this is where
-	// IONDRVFramebuffer::enableController calls its initForPM too).
-	// Registering from start() hung boot: registerPowerDriver kicks off an
-	// immediate power change into IOFramebuffer::setPowerState before the
-	// controller/workloop state it needs exists.
-	initForPM();
+void RDNA4Device::buildModeTable() {
+	modeCount = 0;
+#ifdef RDNA4FB_VM_TEST
+	// VM test builds exercise the mode table by default (OpenCore images
+	// often pin boot-args, so opt-out rather than opt-in); "=0" disables.
+	uint32_t ms = 1, fake = 1;
+#else
+	uint32_t ms = 0;
+#endif
+	PE_parse_boot_argn("rdna4-modeset", &ms, sizeof(ms));
+	modesetRequested = ms != 0;
 
-	FBLOG("enableController: adopting firmware scanout %ux%u", fbWidth, fbHeight);
-	return kIOReturnSuccess;
-}
-
-bool RDNA4FB::isConsoleDevice() {
-	return true;
-}
-
-// ---------------------------------------------------------------------------
-// IOFramebuffer — memory
-// ---------------------------------------------------------------------------
-
-IODeviceMemory *RDNA4FB::getApertureRange(IOPixelAperture aperture) {
-	if (aperture != kIOFBSystemAperture)
-		return nullptr;
-	if (fbPhysBase == 0 || fbLength == 0)
-		return nullptr;
-
-	// A fresh instance (retain) per contract with the caller.
-	return IODeviceMemory::withRange(fbPhysBase, fbLength);
-}
-
-IODeviceMemory *RDNA4FB::getVRAMRange() {
-	// We expose only the scanout region as "VRAM"; we do not manage the card's
-	// full VRAM because we have no memory controller driver.
-	if (fbPhysBase == 0 || fbLength == 0)
-		return nullptr;
-	return IODeviceMemory::withRange(fbPhysBase, fbLength);
-}
-
-// ---------------------------------------------------------------------------
-// IOFramebuffer — pixel / mode description
-// ---------------------------------------------------------------------------
-
-const char *RDNA4FB::getPixelFormats() {
-	// NUL-separated, double-NUL terminated list. IO32BitDirectPixels is a
-	// string literal macro from IOGraphicsTypes.h.
-	static const char formats[] = IO32BitDirectPixels "\0";
-	return formats;
-}
-
-IOItemCount RDNA4FB::getDisplayModeCount() {
-	return 1;
-}
-
-IOReturn RDNA4FB::getDisplayModes(IODisplayModeID *allDisplayModes) {
-	if (!allDisplayModes)
-		return kIOReturnBadArgument;
-	allDisplayModes[0] = kRDNA4DisplayModeID;
-	return kIOReturnSuccess;
-}
-
-IOReturn RDNA4FB::getInformationForDisplayMode(IODisplayModeID displayMode,
-                                                  IODisplayModeInformation *info) {
-	if (displayMode != kRDNA4DisplayModeID || !info)
-		return kIOReturnBadArgument;
-
-	bzero(info, sizeof(*info));
-	info->nominalWidth  = fbWidth;
-	info->nominalHeight = fbHeight;
-	info->refreshRate   = 60 << 16;   // 60.0 Hz in 16.16 fixed point
-	info->maxDepthIndex = 0;
-	info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
-	return kIOReturnSuccess;
-}
-
-UInt64 RDNA4FB::getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) {
-	// Obsolete: must return 0.
-	return 0;
-}
-
-IOReturn RDNA4FB::getPixelInformation(IODisplayModeID displayMode, IOIndex depth,
-                                         IOPixelAperture aperture,
-                                         IOPixelInformation *pixelInfo) {
-	if (displayMode != kRDNA4DisplayModeID || depth != 0 ||
-	    aperture != kIOFBSystemAperture || !pixelInfo)
-		return kIOReturnBadArgument;
-
-	bzero(pixelInfo, sizeof(*pixelInfo));
-	pixelInfo->bytesPerRow      = fbRowBytes;
-	pixelInfo->bitsPerPixel     = 32;
-	pixelInfo->pixelType        = kIORGBDirectPixels;
-	pixelInfo->componentCount   = 3;
-	pixelInfo->bitsPerComponent = 8;
-
-	// Which memory byte (0=LSB..2) each colour component occupies, per the
-	// active channel map. Index [channelMap] -> {byteForR, byteForG, byteForB}.
-	static const uint8_t kMaps[6][3] = {
-		{2, 1, 0},  // 0: standard ARGB (RGB in bytes 2,1,0)
-		{1, 0, 2},  // 1: cancels observed (G,B,R) rotation
-		{0, 1, 2},  // 2: BGR swap
-		{2, 0, 1},  // 3
-		{1, 2, 0},  // 4
-		{0, 2, 1},  // 5
-	};
-	uint32_t idx = channelMap <= 5 ? channelMap : 0;
-	uint8_t byteR = kMaps[idx][0], byteG = kMaps[idx][1], byteB = kMaps[idx][2];
-
-	pixelInfo->componentMasks[0] = 0xFFu << (byteR * 8); // R
-	pixelInfo->componentMasks[1] = 0xFFu << (byteG * 8); // G
-	pixelInfo->componentMasks[2] = 0xFFu << (byteB * 8); // B
-
-	// Build a matching IOPixelEncoding string (MSB byte first). Some
-	// CoreGraphics paths key off this rather than the masks, so keep both
-	// consistent. Byte 3 is unused (X).
-	char letters[4] = { '-', '-', '-', '-' };  // index = byte number (0..3)
-	letters[byteR] = 'R';
-	letters[byteG] = 'G';
-	letters[byteB] = 'B';
-	char *p = pixelInfo->pixelFormat;
-	for (int b = 3; b >= 0; b--)
-		for (int i = 0; i < 8; i++)
-			*p++ = letters[b];
-	*p = '\0';
-
-	pixelInfo->activeWidth  = fbWidth;
-	pixelInfo->activeHeight = fbHeight;
-	return kIOReturnSuccess;
-}
-
-// ---------------------------------------------------------------------------
-// IOFramebuffer — current mode
-// ---------------------------------------------------------------------------
-
-IOReturn RDNA4FB::getCurrentDisplayMode(IODisplayModeID *displayMode, IOIndex *depth) {
-	if (displayMode) *displayMode = kRDNA4DisplayModeID;
-	if (depth)       *depth       = 0;
-	return kIOReturnSuccess;
-}
-
-IOReturn RDNA4FB::setDisplayMode(IODisplayModeID displayMode, IOIndex depth) {
-	// Only one mode/depth exists; accept it, reject anything else.
-	if (displayMode != kRDNA4DisplayModeID || depth != 0)
-		return kIOReturnUnsupported;
-	return kIOReturnSuccess;
-}
-
-// ---------------------------------------------------------------------------
-// IOFramebuffer — attributes / connection
-// ---------------------------------------------------------------------------
-
-IOReturn RDNA4FB::getAttribute(IOSelect attribute, uintptr_t *value) {
-	switch (attribute) {
-		case kIOHardwareCursorAttribute:
-			// Report the DCN cursor plane when armed; otherwise force the
-			// software cursor.
-			if (value) *value = hwCursorReady ? 1 : 0;
-			return kIOReturnSuccess;
-		default:
-			return super::getAttribute(attribute, value);
+#ifdef RDNA4FB_VM_TEST
+	PE_parse_boot_argn("rdna4-fakeedid", &fake, sizeof(fake));
+	if (!edidLen && fake) {
+		memcpy(edidData, kVmFixtureEdid, sizeof(kVmFixtureEdid));
+		edidLen = sizeof(kVmFixtureEdid);
+		FBLOG("modes: VM test build: serving the Lenovo fixture EDID");
 	}
-}
+#endif
 
-IOReturn RDNA4FB::setAttribute(IOSelect attribute, uintptr_t value) {
-	switch (attribute) {
-		case kIOPowerAttribute:
-			// IOFramebuffer asks the subclass to carry out its power state
-			// change here: 0 = off, 1 = doze, 2 = on. Doze and off both mean
-			// "stop showing pixels"; the framebuffer contents survive either
-			// way since we never power gate anything.
-			if (value >= 2) {
-				setDisplayPower(true);
-				handleEvent(kIOFBNotifyDidPowerOn);
-			} else {
-				handleEvent(kIOFBNotifyWillPowerOff);
-				setDisplayPower(false);
-			}
-			return kIOReturnSuccess;
-		default:
-			return super::setAttribute(attribute, value);
+	// Modes reuse the GOP framebuffer's memory and pitch, so none may be
+	// larger than it. TMDS stays below 340 MHz (no HDMI 2.0 scrambling yet)
+	// and within 25 % of the boot pixel clock, which the GOP's DISPCLK is
+	// known to carry, until DISPCLK is read and raised explicitly.
+	Modes::Limits lim {};
+	lim.maxHActive = fbWidth;
+	lim.maxVActive = fbHeight;
+	lim.maxPixelClockKHz = 340000;
+	if (bootTimingValid && bootTiming.pixelClockKHz && bootTiming.pixelClockKHz * 5 / 4 < 340000)
+		lim.maxPixelClockKHz = bootTiming.pixelClockKHz * 5 / 4;
+
+	if (modesetRequested && edidLen)
+		modeCount = Modes::build(edidData, edidLen, lim, modeTable, Modes::MaxModes);
+
+	Edid::BaseInfo base {};
+	if (edidLen && Edid::parseBaseBlock(edidData, edidLen, base)) {
+		imageWidthMm  = base.widthMm;
+		imageHeightMm = base.heightMm;
 	}
-}
 
-IOItemCount RDNA4FB::getConnectionCount() {
-	return 1;
-}
-
-IOReturn RDNA4FB::getAttributeForConnection(IOIndex connectIndex, IOSelect attribute,
-                                               uintptr_t *value) {
-	switch (attribute) {
-		case kConnectionEnable:
-			if (value) *value = 1;
-			return kIOReturnSuccess;
-		case kConnectionCheckEnable:
-			if (value) *value = 1;
-			return kIOReturnSuccess;
-		case kConnectionFlags:
-			if (value) *value = 0;
-			return kIOReturnSuccess;
-		case kConnectionSupportsHLDDCSense:
-			// Success (no value) tells IODisplay it may call hasDDCConnect()
-			// and getDDCBlock() for the real EDID.
-			return edidLen ? kIOReturnSuccess : kIOReturnUnsupported;
-		default:
-			return super::getAttributeForConnection(connectIndex, attribute, value);
+	// The live mode: the timing read back from the OTG, adopting the EDID
+	// entry it matches (for the exact pixel clock) or added as its own
+	// entry. Without a readable pipe (VM, unknown hardware), the EDID's
+	// preferred timing stands in when it matches the console geometry.
+	int bootIdx = -1;
+	if (bootTimingValid && bootTiming.pixelClockKHz) {
+		bootIdx = Modes::match(modeTable, modeCount, bootTiming);
+		if (bootIdx >= 0)
+			bootTiming.pixelClockKHz = modeTable[bootIdx].t.pixelClockKHz;
+		else
+			bootIdx = Modes::ensure(modeTable, modeCount, Modes::MaxModes, bootTiming,
+			                        Modes::SourceBoot);
+	} else if (edidLen) {
+		Edid::DetailedTiming pref {};
+		if (Edid::preferredTiming(edidData, edidLen, pref) &&
+		    pref.hActive == fbWidth && pref.vActive == fbHeight) {
+			bootIdx = Modes::match(modeTable, modeCount, pref);
+			if (bootIdx < 0)
+				bootIdx = Modes::ensure(modeTable, modeCount, Modes::MaxModes, pref,
+				                        Modes::SourceBoot);
+		}
 	}
-}
-
-IOReturn RDNA4FB::setAttributeForConnection(IOIndex connectIndex, IOSelect attribute,
-                                               uintptr_t value) {
-	switch (attribute) {
-		case kConnectionPower:
-			// Display-off path used by IODisplay (Energy Saver display
-			// sleep): 0 = off, nonzero = on.
-			setDisplayPower(value != 0);
-			return kIOReturnSuccess;
-		default:
-			return super::setAttributeForConnection(connectIndex, attribute, value);
+	if (bootIdx < 0) {
+		// The live timing is unknown, so no other mode could be switched to
+		// safely: keep upstream's single fixed mode.
+		modeCount = 0;
+		FBLOG("modes: live timing unknown — single fixed %ux%u mode", fbWidth, fbHeight);
+		return;
 	}
+
+	currentModeId = defaultModeId = modeTable[bootIdx].id;
+	for (size_t i = 0; i < modeCount; i++) {
+		const Modes::Mode &m = modeTable[i];
+		FBLOG("modes: id %u %ux%u@%u.%03u %u kHz%s%s", m.id, m.t.hActive, m.t.vActive,
+		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, m.t.pixelClockKHz,
+		      m.native ? " native" : "", m.id == currentModeId ? " (live)" : "");
+	}
+	FBLOG("modes: %lu mode(s), switching %s", static_cast<unsigned long>(modeCount),
+	      modesetRequested ? "requested (rdna4-modeset=1)" : "off (boot mode only)");
+	owner->setProperty("Modes,Count", static_cast<uint64_t>(modeCount), 32);
 }
 
-// ---------------------------------------------------------------------------
-// IOFramebuffer — DDC/EDID
-// ---------------------------------------------------------------------------
-
-bool RDNA4FB::hasDDCConnect(IOIndex connectIndex) {
-	return connectIndex == 0 && edidLen != 0;
+const Modes::Mode *RDNA4Device::findMode(uint32_t id) const {
+	for (size_t i = 0; i < modeCount; i++)
+		if (modeTable[i].id == id)
+			return &modeTable[i];
+	return nullptr;
 }
 
-IOReturn RDNA4FB::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber,
-                                 IOSelect blockType, IOOptionBits options,
-                                 UInt8 *data, IOByteCount *length) {
-	if (connectIndex != 0 || blockType != kIODDCBlockTypeEDID || !data || !length)
-		return kIOReturnUnsupported;
-
-	// Serve the blocks cached at start() (1 = base EDID, 2 = CTA extension).
-	// blockNumber is 1-based per the IOFramebuffer contract.
-	if (blockNumber < 1 || blockNumber * 128 > edidLen)
-		return kIOReturnNotFound;
-
-	IOByteCount n = *length < 128 ? *length : 128;
-	memcpy(data, edidData + (blockNumber - 1) * 128, n);
-	*length = n;
-	return kIOReturnSuccess;
+IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
+	// The HDMI mode-set engine (pixel clock + transmitter through DMUB, OTG
+	// timing, HUBP viewport) lands once the Linux ground-truth captures are
+	// in. Until then nothing on the pipe is touched.
+	FBLOG("modes: switch to id %u (%ux%u@%u.%03u) refused: mode-set engine not "
+	      "implemented yet", m.id, m.t.hActive, m.t.vActive,
+	      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000);
+	return kIOReturnUnsupported;
 }
+

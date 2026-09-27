@@ -74,6 +74,12 @@ gated() {
 	section "dmesg: EDID / I2C / HPD"
 	dmesg | grep -E 'RDNA4FB: (edid|i2c|cmd):' || true
 
+	section "dmesg: lit pipe + boot timing"
+	dmesg | grep -E 'RDNA4FB: (pipe|latch):' || true
+
+	section "dmesg: display modes"
+	dmesg | grep -E 'RDNA4FB: modes:' || true
+
 	section "dmesg: display power (sleep/wake)"
 	dmesg | grep -E 'RDNA4FB: power:' || true
 
@@ -96,7 +102,7 @@ gated() {
 	gated "mode-setting survey" 'RDNA4FB: mode:' modedump
 
 	section "ioreg: framebuffer properties"
-	ioreg -l -w0 | grep -E '"(Console|AtomBIOS|Discovery|VRAM|MMIO|EDID|GPU|SMU|PSP),' || true
+	ioreg -l -w0 | grep -E '"(Console|AtomBIOS|Discovery|VRAM|MMIO|EDID|GPU|SMU|PSP|Pipe|Modes),' || true
 
 	section "ioreg: what the OS sees (display identity)"
 	ioreg -lw0 | grep -E 'IODisplayEDID|DisplayProductID|DisplayVendorID' || true
@@ -109,6 +115,8 @@ gated() {
 echo "wrote $OUT"
 echo
 echo "Verdict lines to look for:"
+echo "  pipe: 'lit pipe OTGn DIGn -> linkn ... signal HDMI' + boot timing / pixel clock"
+echo "  modes: one line per mode; '(live)' marks the one on screen"
 echo "  smu:  'PING OK — TestMessage acked' + PMFW version"
 echo "  psp:  'verdict: bootloader READY, sOS ALIVE, ...'"
 echo "  ih:   RB cntl/base all-zero = GOP left no interrupt ring (expected)"

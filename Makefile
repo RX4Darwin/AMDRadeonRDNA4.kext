@@ -2,10 +2,13 @@
 # from any host, including Apple Silicon. Targets macOS 11 (Big Sur) ABI.
 #
 #   make            build RDNA4FB.kext
+#   make VMTEST=1   build a VM smoke-test variant into build-vmtest/ (see below)
 #   make clean      remove build products
 #
-# The kext links against Lilu at load time (OSBundleLibraries); Lilu symbols
-# are left undefined in the -kext bundle and resolved by the kernel loader.
+# RDNA4FB is a Lilu plugin (see src/plugin.cpp): Lilu's plugin_start.cpp is
+# compiled in, Lilu symbols are left undefined in the -kext bundle and
+# resolved by the kernel loader through OSBundleLibraries (as.vit9696.Lilu).
+# Install it with OpenCore (Kernel -> Add, after Lilu.kext).
 
 PRODUCT      := RDNA4FB
 BUNDLE_ID    := com.hackintosh.RDNA4FB
@@ -13,12 +16,29 @@ VERSION      := 0.0.1
 
 ARCH         := x86_64
 DEPLOY       := 11.0
-SDK          := $(shell xcrun --sdk macosx --show-sdk-path)
+SDK          ?= $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null)
 
 MKSDK        := MacKernelSDK
+LILU         := Lilu/Lilu
 
 BUILD        := build
+
+# VMTEST=1: the kext additionally adopts QEMU's vmware-svga (15ad:0405) boot
+# framebuffer, so loading and WindowServer behaviour on a given macOS release
+# can be checked in a VM without RDNA 4 hardware. All BAR5 register work is
+# skipped there because the device has no BAR5.
+VMTEST       ?= 0
+ifeq ($(VMTEST),1)
+BUILD        := build-vmtest
+endif
+
 KEXT         := $(BUILD)/$(PRODUCT).kext
+
+# Lilu/Lilu/Headers/{hde32.h,hde64.h,capstone} are git symlinks; checkouts
+# without symlink support (Windows, core.symlinks=false) turn them into
+# one-line text files. The shim holds real copies and is searched first.
+LILU_SHIM    := $(BUILD)/liluhdr
+LILU_STAMP   := $(LILU_SHIM)/.stamp
 MACOS        := $(KEXT)/Contents/MacOS
 EXEC         := $(MACOS)/$(PRODUCT)
 
@@ -27,11 +47,21 @@ CC           := clang
 
 # --- sources -----------------------------------------------------------------
 CXX_SRCS := \
-	src/framebuffer.cpp \
+	src/plugin.cpp \
+	src/device.cpp \
+	src/ndrv.cpp \
+	$(LILU)/Library/plugin_start.cpp \
 	src/atombios.cpp \
 	src/ipdiscovery.cpp \
 	src/edid.cpp \
-	src/otgtiming.cpp
+	src/otgtiming.cpp \
+	src/modes.cpp \
+	src/pipe.cpp
+
+# VM test builds switch modes on QEMU's vmware-svga through Bochs VBE.
+ifeq ($(VMTEST),1)
+CXX_SRCS += src/bochsvbe.cpp
+endif
 
 C_SRCS := \
 	src/kmod_info.c
@@ -45,12 +75,17 @@ COMMON_FLAGS := \
 	-target $(ARCH)-apple-macos$(DEPLOY) \
 	-isysroot $(SDK) \
 	-I$(MKSDK)/Headers \
+	-I$(LILU_SHIM) \
+	-I$(LILU) \
 	-mmacosx-version-min=$(DEPLOY) \
 	-DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
 	-D_FORTIFY_SOURCE=0 \
+	-DPRODUCT_NAME=$(PRODUCT) -DMODULE_VERSION=$(VERSION) \
 	-nostdinc \
 	-fno-builtin -fno-common -fno-stack-protector -mkernel -fapple-kext \
-	-Wall -Os -g
+	-fno-asynchronous-unwind-tables \
+	-Wall -Wno-vla -Wno-unknown-warning-option -Wno-ossharedptr-misuse -Os -g \
+	-MMD -MP
 
 # -fno-c++-static-destructors: at -Os clang can lower the gMetaClass static
 # object's destructor into an __cxa_atexit registration, which the kernel
@@ -60,6 +95,10 @@ COMMON_FLAGS := \
 CXXFLAGS := $(COMMON_FLAGS) -std=c++17 -fno-exceptions -fno-rtti -fcheck-new \
             -fno-c++-static-destructors
 CFLAGS   := $(COMMON_FLAGS)
+
+ifeq ($(VMTEST),1)
+CXXFLAGS += -DRDNA4FB_VM_TEST
+endif
 
 LDFLAGS := \
 	-arch $(ARCH) \
@@ -79,9 +118,9 @@ FIRMWARE := firmware/Sapphire.RX9070XT.16384.241213.rom
 .PHONY: all clean test
 all: $(KEXT)
 
-$(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp
+$(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp
 	@mkdir -p $(BUILD)
-	$(CXX) -std=c++17 -Wall -O2 -o $@ tools/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp
+	$(CXX) -std=c++17 -Wall -O2 -o $@ tools/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp
 
 atomdump: $(ATOMDUMP)
 
@@ -90,11 +129,17 @@ atomdump: $(ATOMDUMP)
 test: $(ATOMDUMP)
 	$(ATOMDUMP) $(FIRMWARE)
 
-$(BUILD)/%.o: %.cpp
+$(LILU_STAMP): $(LILU)/../hde/hde32.h $(LILU)/../hde/hde64.h
+	@mkdir -p $(LILU_SHIM)/Headers/capstone
+	cp $(LILU)/../hde/hde32.h $(LILU)/../hde/hde64.h $(LILU_SHIM)/Headers/
+	cp $(LILU)/../capstone/include/*.h $(LILU_SHIM)/Headers/capstone/
+	@touch $@
+
+$(BUILD)/%.o: %.cpp | $(LILU_STAMP)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/%.o: %.c
+$(BUILD)/%.o: %.c | $(LILU_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -113,7 +158,10 @@ $(KEXT): $(EXEC) Info.plist
 	@# Minimal, ad-hoc code signature so kextutil is happier during testing.
 	codesign --force --sign - $(KEXT) 2>/dev/null || true
 	@echo "Built $(KEXT) for $(ARCH) (min macOS $(DEPLOY))"
-	@file $(EXEC)
+	@command -v file >/dev/null && file $(EXEC) || true
 
 clean:
 	rm -rf $(BUILD)
+
+# Header dependencies from -MMD.
+-include $(OBJS:.o=.d)

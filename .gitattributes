@@ -1,0 +1,3 @@
+# Shell scripts run on macOS/Linux; keep LF even in Windows checkouts
+# (core.autocrlf=true would otherwise hand them over with CRLF).
+*.sh text eol=lf

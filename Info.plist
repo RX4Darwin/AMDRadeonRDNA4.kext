@@ -24,35 +24,33 @@
 	<string>Root</string>
 	<key>IOKitPersonalities</key>
 	<dict>
-		<!-- Framebuffer personality: matches the RX 9070 XT (Navi 48) PCI
-		     device. IOPCIPrimaryMatch is 0xDEVICEVENDOR = 0x7550 / 0x1002. -->
+		<!-- Lilu plugin personality: the plugin's IOService (declared by Lilu's
+		     plugin_start.hpp, named after PRODUCT_NAME) attaches to IOResources.
+		     The display work happens in the IONDRVFramebuffer hook, not here. -->
 		<key>RDNA4FB</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
 			<string>com.hackintosh.RDNA4FB</string>
 			<key>IOClass</key>
 			<string>RDNA4FB</string>
-			<key>IOProviderClass</key>
-			<string>IOPCIDevice</string>
-			<key>IOPCIPrimaryMatch</key>
-			<string>0x75501002 0x75511002</string>
-			<key>IOProbeScore</key>
-			<integer>200000</integer>
 			<key>IOMatchCategory</key>
-			<string>IOFramebuffer</string>
-			<!-- Properties merged onto our provider / published for tools. -->
-			<key>model</key>
-			<string>AMD Radeon RX 9070 Series</string>
-			<key>device_type</key>
-			<string>display</string>
+			<string>RDNA4FB</string>
+			<key>IOProviderClass</key>
+			<string>IOResources</string>
+			<key>IOResourceMatch</key>
+			<string>IOKit</string>
 		</dict>
 	</dict>
 	<key>OSBundleLibraries</key>
 	<dict>
+		<key>as.vit9696.Lilu</key>
+		<string>1.2.0</string>
 		<key>com.apple.iokit.IOPCIFamily</key>
-		<string>1.0</string>
-		<key>com.apple.iokit.IOGraphicsFamily</key>
-		<string>1.0</string>
+		<string>1.0.0b1</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>20.0.0</string>
+		<key>com.apple.kpi.dsep</key>
+		<string>20.0.0</string>
 		<key>com.apple.kpi.iokit</key>
 		<string>20.0.0</string>
 		<key>com.apple.kpi.libkern</key>

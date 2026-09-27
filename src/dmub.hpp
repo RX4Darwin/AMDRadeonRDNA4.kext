@@ -78,6 +78,109 @@ inline uint32_t headerWord(uint8_t type, uint8_t subType, uint8_t payloadBytes,
 	       ((static_cast<uint32_t>(payloadBytes) & 0x3f) << 24);
 }
 
+// A full ring entry: header dword + 15 payload dwords.
+using Cmd = uint32_t[kCmdSize / 4];
+
+// Little-endian byte packing into payload dwords (payload starts at dword 1).
+inline void putByte(Cmd cmd, uint32_t payloadOffset, uint8_t v) {
+	uint32_t &w = cmd[1 + payloadOffset / 4];
+	uint32_t shift = (payloadOffset % 4) * 8;
+	w = (w & ~(0xffu << shift)) | (static_cast<uint32_t>(v) << shift);
+}
+inline void putWord(Cmd cmd, uint32_t payloadOffset, uint32_t v) {
+	cmd[1 + payloadOffset / 4] = v;   // callers only use aligned offsets
+}
+inline void clear(Cmd cmd) {
+	for (uint32_t i = 0; i < kCmdSize / 4; i++)
+		cmd[i] = 0;
+}
+
+// Values used by the VBIOS-family payloads (atomfirmware.h).
+constexpr uint8_t EncoderModeDp   = 0;
+constexpr uint8_t EncoderModeDvi  = 2;
+constexpr uint8_t EncoderModeHdmi = 3;
+constexpr uint8_t TransmitterActionDisable = 0;
+constexpr uint8_t TransmitterActionEnable  = 1;
+constexpr uint8_t EncoderActionStreamSetup = 0x0f;
+
+// DMUB_CMD__VBIOS / DIG1_TRANSMITTER_CONTROL, payload
+// dmub_dig_transmitter_control_data_v1_7 (60 bytes). What
+// transmitter_control_dmcub_v1_7 sends: phyid 0 = UNIPHYA, digmode HDMI = 3,
+// 4 lanes for TMDS, symclk in 10 kHz already including the deep-colour
+// ratio, hpdsel 1-based, digfe_sel/connobj_id 0 as Linux sends them.
+struct TransmitterControl {
+	uint8_t  phyId;
+	uint8_t  action;
+	uint8_t  digMode;
+	uint8_t  laneNum;
+	uint32_t symclk10kHz;
+	uint8_t  hpdSel;
+	uint8_t  digFeSel;
+	uint8_t  connObjId;
+	uint8_t  hpoInstance;
+};
+inline void buildTransmitterControl(Cmd cmd, const TransmitterControl &p) {
+	clear(cmd);
+	cmd[0] = headerWord(CmdVbios, VbiosDig1TransmitterControl, 60);
+	putByte(cmd, 0, p.phyId);
+	putByte(cmd, 1, p.action);
+	putByte(cmd, 2, p.digMode);
+	putByte(cmd, 3, p.laneNum);
+	putWord(cmd, 4, p.symclk10kHz);
+	putByte(cmd, 8, p.hpdSel);
+	putByte(cmd, 9, p.digFeSel);
+	putByte(cmd, 10, p.connObjId);
+	putByte(cmd, 11, p.hpoInstance);
+}
+
+// DMUB_CMD__VBIOS / SET_PIXEL_CLOCK, payload set_pixel_clock_parameter_v1_7
+// (16 bytes). pll_id ATOM_COMBOPHY_PLL0..5 = 20..25; crtc_id = OTG instance;
+// deep_color_ratio 0 = 8 bpc.
+struct SetPixelClock {
+	uint32_t pixclk100Hz;
+	uint8_t  pllId;
+	uint8_t  encoderObjId;
+	uint8_t  encoderMode;
+	uint8_t  miscInfo;
+	uint8_t  crtcId;
+	uint8_t  deepColorRatio;
+};
+inline void buildSetPixelClock(Cmd cmd, const SetPixelClock &p) {
+	clear(cmd);
+	cmd[0] = headerWord(CmdVbios, VbiosSetPixelClock, 16);
+	putWord(cmd, 0, p.pixclk100Hz);
+	putByte(cmd, 4, p.pllId);
+	putByte(cmd, 5, p.encoderObjId);
+	putByte(cmd, 6, p.encoderMode);
+	putByte(cmd, 7, p.miscInfo);
+	putByte(cmd, 8, p.crtcId);
+	putByte(cmd, 9, p.deepColorRatio);
+}
+
+// DMUB_CMD__VBIOS / DIGX_ENCODER_CONTROL, payload
+// dig_encoder_stream_setup_parameters_v1_5 (12-byte union). Linux leaves
+// bitpercolor 0 on DCN401 (enc401 never sets color_depth).
+struct DigEncoderStreamSetup {
+	uint8_t  digId;
+	uint8_t  action;
+	uint8_t  digMode;
+	uint8_t  laneNum;
+	uint32_t pclk10kHz;
+	uint8_t  bitPerColor;
+	uint8_t  dpLinkRate270MHz;
+};
+inline void buildDigEncoderStreamSetup(Cmd cmd, const DigEncoderStreamSetup &p) {
+	clear(cmd);
+	cmd[0] = headerWord(CmdVbios, VbiosDigxEncoderControl, 12);
+	putByte(cmd, 0, p.digId);
+	putByte(cmd, 1, p.action);
+	putByte(cmd, 2, p.digMode);
+	putByte(cmd, 3, p.laneNum);
+	putWord(cmd, 4, p.pclk10kHz);
+	putByte(cmd, 8, p.bitPerColor);
+	putByte(cmd, 9, p.dpLinkRate270MHz);
+}
+
 } // namespace Dmub
 
 #endif /* dmub_hpp */
