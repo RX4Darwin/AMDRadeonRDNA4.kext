@@ -26,6 +26,8 @@
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
 #include "../src/pm4.hpp"
+#include "../src/codeobj.hpp"
+#include "../src/vadd_codeobj.h"
 
 #include <cstdarg>
 #include <cstdint>
@@ -1669,6 +1671,40 @@ static int testPm4Packets() {
 	return failures;
 }
 
+// The code-object loader against clang's own gfx1201 output (shaders/vadd.cl).
+static int testCodeObject() {
+	int failures = 0;
+	CodeObj::Kernel k;
+	const char *why = nullptr;
+	bool ok = CodeObj::findKernel(kVaddCodeObject, sizeof(kVaddCodeObject), "vadd", k, &why);
+	failures += check(ok, "codeobj: vadd not found (%s)", why ? why : "-");
+	if (ok) {
+		// llvm-readelf: .text at file offset 0x600, 0x280 bytes; the descriptor
+		// says 24 bytes of kernargs, RSRC1 0x600f0040, RSRC2 0x84 (2 user SGPRs,
+		// TGID_X_EN), kernarg pointer and wave32 enabled.
+		uint32_t first = static_cast<uint32_t>(kVaddCodeObject[k.codeOffset]) |
+		                 (kVaddCodeObject[k.codeOffset + 1] << 8) |
+		                 (kVaddCodeObject[k.codeOffset + 2] << 16) |
+		                 (static_cast<uint32_t>(kVaddCodeObject[k.codeOffset + 3]) << 24);
+		failures += check(k.codeOffset == 0x600 && k.codeSize == 0x280 && first == 0xf4004100,
+		                  "codeobj: code at 0x%x (%u bytes), first dword 0x%08x", k.codeOffset,
+		                  k.codeSize, first);
+		failures += check(k.kernargSize == 24 && k.rsrc1 == 0x600f0040 && k.rsrc2 == 0x84 &&
+		                  k.rsrc3 == 0 && k.userSgprCount() == 2 && k.wave32() &&
+		                  k.wantsKernargPtr() && !k.wantsDispatchPtr() && !k.groupSegmentSize &&
+		                  !k.privateSegmentSize,
+		                  "codeobj: descriptor kernarg %u rsrc1 0x%08x rsrc2 0x%08x props",
+		                  k.kernargSize, k.rsrc1, k.rsrc2);
+	}
+	failures += check(!CodeObj::findKernel(kVaddCodeObject, sizeof(kVaddCodeObject), "vsub", k, &why),
+	                  "codeobj: a missing kernel was found");
+	failures += check(!CodeObj::findKernel(kVaddCodeObject, 200, "vadd", k, &why),
+	                  "codeobj: a truncated file was accepted");
+	printf("\ncodeobj: clang's vadd code object: kernel, descriptor and code located %s\n",
+	       failures ? "FAILED" : "ok");
+	return failures;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
@@ -1861,6 +1897,7 @@ int main(int argc, char **argv) {
 	failures += testGfxImages();
 	failures += testSdmaPackets();
 	failures += testPm4Packets();
+	failures += testCodeObject();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);
