@@ -1641,6 +1641,18 @@ static int testPm4Packets() {
 	                  p[1] == 0x06600514 && p[2] == 0x20000000 && p[5] == 9 && p[7] == 0,
 	                  "pm4: RELEASE_MEM %08x %08x %08x", p[0], p[1], p[2]);
 
+	// PACKET3(SET_SH_REG, 2): COMPUTE_PGM_LO/HI (GC seg0 0x1260 + 0x1bac).
+	const uint32_t pgm[2] = { 0x80080e00, 0 };
+	failures += check(Pm4::setShReg(p, 0x1260 + 0x1bac, pgm, 2) == 4 && p[0] == 0xc0027600 &&
+	                  p[1] == 0x20c && p[2] == 0x80080e00, "pm4: SET_SH_REG %08x %08x", p[0], p[1]);
+	failures += check(Pm4::dispatchDirect(p, 4, 1, 1, Pm4::kDispatchShaderEn | Pm4::kDispatchWave32) == 5 &&
+	                  p[0] == 0xc0031500 && p[1] == 4 && p[4] == 0x8001,
+	                  "pm4: DISPATCH_DIRECT %08x %08x", p[0], p[4]);
+	// gfx_v12_0_emit_mem_sync's GCR_CNTL = 0xc3b1.
+	failures += check(Pm4::acquireMem(p, Pm4::kGcrMemSync) == 8 && p[0] == 0xc0065800 &&
+	                  p[2] == 0xffffffff && p[3] == 0xffffff && p[6] == 0xa && p[7] == 0xc3b1,
+	                  "pm4: ACQUIRE_MEM %08x gcr %08x", p[0], p[7]);
+
 	uint32_t mem[256];
 	Pm4::Queue q;
 	failures += check(q.init(mem, 0x800c002000ull, sizeof(mem)) && q.queueSizeField() == 7 &&

@@ -284,6 +284,29 @@ constexpr uint32_t kMecDoorbellLowerBytes   = 0;
 constexpr uint32_t kMecDoorbellUpperBytes   = (0x8a * 2) << 2;
 constexpr uint32_t kComputeDoorbellDword    = 3 * 2;
 
+// --- Compute dispatch state (SH registers, GC seg0; set through SET_SH_REG)
+constexpr Reg ComputeStartX       { 0, 0x1ba4 };   // START_X/Y/Z
+constexpr Reg ComputeNumThreadX   { 0, 0x1ba7 };   // NUM_THREAD_X/Y/Z
+constexpr Reg ComputePgmLo        { 0, 0x1bac };   // address >> 8
+constexpr Reg ComputePgmRsrc1     { 0, 0x1bb2 };   // RSRC1, RSRC2
+constexpr Reg ComputeResourceLim  { 0, 0x1bb5 };
+constexpr Reg ComputeThreadMgmtSe0{ 0, 0x1bb6 };   // SE0, SE1 (0x1bb7)
+constexpr Reg ComputeTmpringSize  { 0, 0x1bb8 };
+constexpr Reg ComputeThreadMgmtSe2{ 0, 0x1bb9 };   // SE2, SE3 (0x1bba)
+constexpr Reg ComputePgmRsrc3     { 0, 0x1bc8 };
+constexpr Reg ComputeThreadMgmtSe4{ 0, 0x1bcb };   // SE4..SE7 (0x1bcb..0x1bce)
+constexpr Reg ComputeUserData0    { 0, 0x1be0 };
+constexpr Reg ShMemConfig         { 1, 0x09e4 };   // per VMID (GRBM_GFX_CNTL.VMID)
+// DEFAULT_SH_MEM_CONFIG: 64-bit addressing, unaligned access, prefetch 3.
+constexpr uint32_t kShMemConfigDefault = (3u << 2) | (3u << 14);
+// COMPUTE_PGM_RSRC1: VGPR blocks [5:0] (wave32: 8 per block), FLOAT_MODE
+// [19:12] = 0xc0 (FP32/64 denormals on), MEM_ORDERED [30].
+constexpr uint32_t kRsrc1FloatDenorm   = 0xc0u << 12;
+constexpr uint32_t kRsrc1MemOrdered    = 1u << 30;
+// COMPUTE_PGM_RSRC2: USER_SGPR [5:1], TGID_X_EN [7], TIDIG_COMP_CNT [12:11].
+constexpr uint32_t kRsrc2UserSgprShift = 1;
+constexpr uint32_t kRsrc2TgidXEn       = 1u << 7;
+
 // --- NBIF 6.3.1 doorbell aperture and routing into GC (seg 2)
 constexpr Reg NbifDoorbellAperEn  { 2, 0x00c0 };   // RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN [0]
 constexpr Reg NbifS2aDoorbell0    { 2, 0x01cb };   // GDC_S2A0_S2A_DOORBELL_ENTRY_0_CTRL

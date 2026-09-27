@@ -40,6 +40,36 @@ uint32_t releaseMem(uint32_t *out, uint64_t addr, uint32_t seq) {
 	return 8;
 }
 
+uint32_t setShReg(uint32_t *out, uint32_t reg, const uint32_t *values, uint32_t n) {
+	out[0] = header(OpSetShReg, n);
+	out[1] = reg - kShStart;
+	for (uint32_t i = 0; i < n; i++)
+		out[2 + i] = values[i];
+	return 2 + n;
+}
+
+uint32_t dispatchDirect(uint32_t *out, uint32_t x, uint32_t y, uint32_t z, uint32_t initiator) {
+	out[0] = header(OpDispatchDirect, 3);
+	out[1] = x;
+	out[2] = y;
+	out[3] = z;
+	out[4] = initiator;
+	return 5;
+}
+
+// gfx_v12_0_emit_mem_sync: whole address range, poll interval 10.
+uint32_t acquireMem(uint32_t *out, uint32_t gcrCntl) {
+	out[0] = header(OpAcquireMem, 6);
+	out[1] = 0;            // CP_COHER_CNTL
+	out[2] = 0xffffffff;   // CP_COHER_SIZE
+	out[3] = 0x00ffffff;   // CP_COHER_SIZE_HI
+	out[4] = 0;            // CP_COHER_BASE
+	out[5] = 0;            // CP_COHER_BASE_HI
+	out[6] = 0x0000000a;   // POLL_INTERVAL
+	out[7] = gcrCntl;
+	return 8;
+}
+
 bool Queue::init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes) {
 	if (!cpu || sizeBytes < 256 || (sizeBytes & (sizeBytes - 1)) || (mc & 0xff))
 		return false;

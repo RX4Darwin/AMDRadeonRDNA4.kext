@@ -23,7 +23,11 @@
  *    answers once the SMU firmware came in through the PSP. After a complete
  *    AUTOLOAD_RLC the GC shows its booted state, the GC hub acknowledges TLB
  *    flushes, and SDMA0 queue 0 runs NOP/WRITE/COPY/FENCE/CONST_FILL packets
- *    through the GC hub (which must have been set up by the driver).
+ *    through the GC hub (which must have been set up by the driver). A MEC
+ *    compute queue, fed through the doorbell BAR, runs PM4 (SET_UCONFIG_REG,
+ *    SET_SH_REG, WRITE_DATA, ACQUIRE/RELEASE_MEM, DISPATCH_DIRECT); a
+ *    dispatch runs each work-item through a small GFX12 interpreter that
+ *    knows the test kernel's instructions.
  *    OTG_MASTER_UPDATE_LOCK holds the double-buffered OTG timing and HUBP
  *    surface registers until it is released.
  *  - An attached monitor: the scanout only shows when the lit OTG's DIG
@@ -1274,6 +1278,155 @@ static const MemoryRegionOps rdna4_inert_ops = {
 #define REG_CP_HQD_WPTR_LO   GC_SEG0(0x1fdf)
 #define REG_CP_HQD_WPTR_HI   GC_SEG0(0x1fe0)
 
+/*
+ * Compute dispatch. The model has no shader cores; it runs each work-item
+ * of a DISPATCH_DIRECT through a small GFX12 interpreter that knows the
+ * instructions of the kext's test kernel (shaders/probe.s, assembled by
+ * LLVM): SOPP s_endpgm/s_nop, SOP2 s_lshl_b32, VOP2 v_add_nc_u32 /
+ * v_lshlrev_b32 / v_mul_u32_u24 (with literals), VGLOBAL global_store_b32.
+ * Anything else stops the work-item and is reported.
+ */
+#define REG_SH_MEM_CONFIG    GC_SEG1(0x09e4)
+#define REG_CS_NUM_THREAD_X  GC_SEG0(0x1ba7)
+#define REG_CS_PGM_LO        GC_SEG0(0x1bac)
+#define REG_CS_PGM_HI        GC_SEG0(0x1bad)
+#define REG_CS_RSRC2         GC_SEG0(0x1bb3)
+#define REG_CS_THREAD_SE0    GC_SEG0(0x1bb6)
+#define REG_CS_USER_DATA_0   GC_SEG0(0x1be0)
+
+typedef struct RDNA4Lane {
+    uint32_t s[128];
+    uint32_t v[64];
+} RDNA4Lane;
+
+static uint32_t rdna4_isa_src(const RDNA4Lane *l, uint32_t src, uint32_t literal, bool *used_lit)
+{
+    if (src < 106) {
+        return l->s[src];
+    }
+    if (src >= 128 && src <= 192) {
+        return src - 128;
+    }
+    if (src >= 193 && src <= 208) {
+        return (uint32_t)-(int32_t)(src - 192);
+    }
+    if (src == 255) {
+        *used_lit = true;
+        return literal;
+    }
+    if (src >= 256) {
+        return l->v[(src - 256) & 63];
+    }
+    return 0;
+}
+
+/* Run one work-item from `pc`; false (and a message) on anything unknown. */
+static bool rdna4_isa_run(RDNA4State *s, uint64_t pc, RDNA4Lane *l)
+{
+    for (int steps = 0; steps < 4096; steps++) {
+        uint8_t *p = rdna4_gc_span(s, pc, 12);
+        if (!p) {
+            fprintf(stderr, "rdna4: cs: instruction fetch at 0x%" PRIx64 " not mapped\n", pc);
+            return false;
+        }
+        uint32_t dw = ldl_le_p(p), dw1 = ldl_le_p(p + 4), dw2 = ldl_le_p(p + 8);
+        bool lit = false;
+        uint32_t n = 1;
+
+        if ((dw >> 23) == 0x17f) {                          /* SOPP */
+            uint32_t op = (dw >> 16) & 0x7f;
+            if (op == 48) {
+                return true;                                /* s_endpgm */
+            }
+            if (op != 0) {
+                goto unknown;                               /* only s_nop */
+            }
+        } else if ((dw >> 24) == 0xee) {                    /* VGLOBAL */
+            uint32_t op = (dw >> 14) & 0xff, saddr = dw & 0x7f;
+            uint32_t data = (dw1 >> 23) & 0xff, vaddr = dw2 & 0xff;
+            int64_t ioff = ((int32_t)(dw2 & 0xffffff00)) >> 8;
+            uint64_t addr;
+            uint8_t *d;
+            if (op != 26) {                                 /* global_store_b32 */
+                goto unknown;
+            }
+            addr = saddr != 0x7c ?
+                   (l->s[saddr] | ((uint64_t)l->s[saddr + 1] << 32)) + l->v[vaddr & 63] :
+                   l->v[vaddr & 63] | ((uint64_t)l->v[(vaddr + 1) & 63] << 32);
+            addr += ioff;
+            d = rdna4_gc_span(s, addr, 4);
+            if (!d) {
+                fprintf(stderr, "rdna4: cs: global_store to 0x%" PRIx64 " not mapped\n", addr);
+                return false;
+            }
+            stl_le_p(d, l->v[data & 63]);
+            n = 3;
+        } else if ((dw >> 30) == 2 && (dw >> 28) != 0xb && (dw >> 23) < 0x17d) {   /* SOP2 */
+            uint32_t op = (dw >> 23) & 0x7f, sdst = (dw >> 16) & 0x7f;
+            uint32_t a = rdna4_isa_src(l, dw & 0xff, dw1, &lit);
+            uint32_t b = rdna4_isa_src(l, (dw >> 8) & 0xff, dw1, &lit);
+            if (op != 8 || sdst >= 106) {                   /* s_lshl_b32 */
+                goto unknown;
+            }
+            l->s[sdst] = a << (b & 31);
+        } else if (!(dw >> 31)) {                           /* VOP2 */
+            uint32_t op = (dw >> 25) & 0x3f, vdst = (dw >> 17) & 0xff;
+            uint32_t a = rdna4_isa_src(l, dw & 0x1ff, dw1, &lit);
+            uint32_t b = l->v[((dw >> 9) & 0xff) & 63];
+            switch (op) {
+            case 37: l->v[vdst & 63] = a + b; break;                           /* v_add_nc_u32 */
+            case 24: l->v[vdst & 63] = b << (a & 31); break;                   /* v_lshlrev_b32 */
+            case 11: l->v[vdst & 63] = (a & 0xffffff) * (b & 0xffffff); break; /* v_mul_u32_u24 */
+            default: goto unknown;
+            }
+        } else {
+            goto unknown;
+        }
+        pc += 4ull * (n + (lit ? 1 : 0));
+        continue;
+unknown:
+        fprintf(stderr, "rdna4: cs: unsupported instruction 0x%08x at 0x%" PRIx64 "\n", dw, pc);
+        return false;
+    }
+    fprintf(stderr, "rdna4: cs: work-item ran past 4096 instructions\n");
+    return false;
+}
+
+static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32_t dim_z,
+                           uint32_t initiator)
+{
+    uint64_t pgm = ((uint64_t)reg_get(s, REG_CS_PGM_LO) << 8) |
+                   ((uint64_t)reg_get(s, REG_CS_PGM_HI) << 40);
+    uint32_t rsrc2 = reg_get(s, REG_CS_RSRC2), nuser = (rsrc2 >> 1) & 0x1f;
+    uint32_t threads = reg_get(s, REG_CS_NUM_THREAD_X), ran = 0;
+
+    if (!(initiator & 1) || !reg_get(s, REG_SH_MEM_CONFIG) || !reg_get(s, REG_CS_THREAD_SE0) ||
+        !threads || dim_y != 1 || dim_z != 1) {
+        fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u refused (initiator 0x%x, SH_MEM_CONFIG "
+                "0x%x, CU mask SE0 0x%x, %u threads)\n", dim_x, dim_y, dim_z, initiator,
+                reg_get(s, REG_SH_MEM_CONFIG), reg_get(s, REG_CS_THREAD_SE0), threads);
+        return;
+    }
+    for (uint32_t g = 0; g < dim_x; g++) {
+        for (uint32_t t = 0; t < threads; t++) {
+            RDNA4Lane l = { 0 };
+            for (uint32_t i = 0; i < nuser && i < 16; i++) {
+                l.s[i] = reg_get(s, REG_CS_USER_DATA_0 + 4 * i);
+            }
+            if (rsrc2 & (1u << 7)) {                    /* TGID_X_EN */
+                l.s[nuser] = g;
+            }
+            l.v[0] = t & 0x3ff;                          /* packed ids: x [9:0] */
+            if (!rdna4_isa_run(s, pgm, &l)) {
+                fprintf(stderr, "rdna4: cs: dispatch stopped at group %u item %u\n", g, t);
+                return;
+            }
+            ran++;
+        }
+    }
+    fprintf(stderr, "rdna4: cs: dispatch %ux%u ran %u work-items\n", dim_x, threads, ran);
+}
+
 static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)
 {
     uint32_t hqd_db = reg_get(s, REG_CP_HQD_DOORBELL);
@@ -1329,12 +1482,19 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
             }
             break;
         case 0x79:                                   /* SET_UCONFIG_REG */
+        case 0x76:                                   /* SET_SH_REG */
             for (uint32_t i = 0; i < count; i++) {
-                uint32_t byte = (0xc000 + dw[1] + i) * 4;
+                uint32_t base = op == 0x79 ? 0xc000 : 0x2c00;
+                uint32_t byte = (base + dw[1] + i) * 4;
                 if (byte + 4 <= RDNA4_MMIO_SIZE) {
                     reg_set(s, byte, dw[2 + i]);
                 }
             }
+            break;
+        case 0x58:                                   /* ACQUIRE_MEM: coherent already */
+            break;
+        case 0x15:                                   /* DISPATCH_DIRECT */
+            rdna4_dispatch(s, dw[1], dw[2], dw[3], dw[4]);
             break;
         case 0x37: {                                 /* WRITE_DATA to memory */
             uint64_t a = (dw[2] & ~3u) | ((uint64_t)dw[3] << 32);

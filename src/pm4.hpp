@@ -20,8 +20,11 @@ namespace Pm4 {
 
 enum Op : uint32_t {
 	OpNop            = 0x10,
+	OpDispatchDirect = 0x15,
 	OpWriteData      = 0x37,
 	OpReleaseMem     = 0x49,
+	OpAcquireMem     = 0x58,
+	OpSetShReg       = 0x76,
 	OpSetUconfigReg  = 0x79,
 };
 
@@ -41,11 +44,27 @@ constexpr uint32_t kReleaseEventIndex5  = 5u << 8;
 constexpr uint32_t kReleaseData32       = 1u << 29; // DATA_SEL(1): low 32 bits of seq
 constexpr uint32_t kReleaseData64       = 2u << 29;
 
+constexpr uint32_t kShStart             = 0x2c00;   // PACKET3_SET_SH_REG_START
+
+// COMPUTE_DISPATCH_INITIATOR
+constexpr uint32_t kDispatchShaderEn    = 1u << 0;
+constexpr uint32_t kDispatchForceStart0 = 1u << 2;  // FORCE_START_AT_000
+constexpr uint32_t kDispatchWave32      = 1u << 15; // CS_W32_EN
+
+// gfx_v12_0_emit_mem_sync's GCR_CNTL: invalidate/write back GL2, GLM, GL1,
+// GLV, GLK and GLI, so what the CPU just wrote (e.g. shader code) is fetched.
+constexpr uint32_t kGcrMemSync = (1u << 0) | (1u << 4) | (1u << 5) | (1u << 7) | (1u << 8) |
+                                 (1u << 9) | (1u << 14) | (1u << 15);
+
 // Build into `out`; return the dwords written.
 // `reg` is the absolute register dword offset (UCONFIG space, >= 0xc000).
 uint32_t setUconfigReg(uint32_t *out, uint32_t reg, uint32_t value);
 uint32_t writeData(uint32_t *out, uint64_t addr, uint32_t value);
 uint32_t releaseMem(uint32_t *out, uint64_t addr, uint32_t seq);
+// `n` consecutive SH registers from absolute dword `reg` (0x2c00..0x2fff).
+uint32_t setShReg(uint32_t *out, uint32_t reg, const uint32_t *values, uint32_t n);
+uint32_t dispatchDirect(uint32_t *out, uint32_t x, uint32_t y, uint32_t z, uint32_t initiator);
+uint32_t acquireMem(uint32_t *out, uint32_t gcrCntl);
 
 // A queue of `sizeBytes` (power of two) at `cpu`; write pointer in dwords.
 class Queue {

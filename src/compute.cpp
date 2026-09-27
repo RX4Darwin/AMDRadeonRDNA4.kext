@@ -9,6 +9,7 @@
 
 #include "compute.hpp"
 #include "pm4.hpp"
+#include "probe_kernel.h"
 #include "sdma.hpp"
 
 #include <kern/clock.h>
@@ -447,8 +448,11 @@ void RDNA4Compute::runStages() {
 			return stop("stage 5 (compute)");
 		done = StageCompute;
 	}
-	if (target >= StageDispatch)
-		CLOG("stage 6 (dispatch) is not implemented yet; stopping after stage 5");
+	if (target >= StageDispatch) {
+		if (!stageDispatch())
+			return stop("stage 6 (dispatch)");
+		done = StageDispatch;
+	}
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
 	snprintf(note, sizeof(note), "finished at stage %u", done);
 	trail(note);
@@ -1197,7 +1201,7 @@ bool RDNA4Compute::stageCompute() {
 		return false;
 	}
 	trail("s5: HQD init");
-	Pm4::Queue q;
+	Pm4::Queue &q = pm4Queue;
 	if (!q.init(poolDw(kPqOffset), poolMc(kPqOffset), kPqSize) || !hqdInit()) {
 		status();
 		publish();
@@ -1221,12 +1225,12 @@ bool RDNA4Compute::stageCompute() {
 	uint32_t pkt[8];
 	q.emit(pkt, Pm4::setUconfigReg(pkt, scratchAbs, 0xDEADBEEF));
 	q.emit(pkt, Pm4::writeData(pkt, poolMc(kPm4TestOffset), 0x600DF00D));
-	q.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), 1));
+	q.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), ++pm4Fence));
 	pm4Kick(q.wptr());
 
 	bool done = false;
 	for (uint32_t us = 0; us < 500000 && !done; us += 10) {
-		done = *poolDw(kPm4FenceOffset) == 1;
+		done = *poolDw(kPm4FenceOffset) == pm4Fence;
 		if (!done)
 			IODelay(10);
 	}
@@ -1244,4 +1248,124 @@ bool RDNA4Compute::stageCompute() {
 	}
 	publish();
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 6: a kernel on the compute units
+// ---------------------------------------------------------------------------
+
+uint32_t RDNA4Compute::shAbs(const Reg &r) const {
+	uint32_t byte = 0;
+	return env.disc->regByteOffset(IpDiscovery::HwGc, 0, r.seg, r.dword, byte) ? byte / 4 : 0;
+}
+
+// The shape of amdgpu's run_shader (gfx_v9_4_2): SET_SH_REG the program,
+// its resources and user data, DISPATCH_DIRECT; with gfx_v12_0's
+// ACQUIRE_MEM first (the code was just written by the CPU) and its
+// RELEASE_MEM fence after. VMID0, wave32, 4 groups of 64 work-items.
+bool RDNA4Compute::stageDispatch() {
+	OSDictionary *d = OSDictionary::withCapacity(8);
+	auto put = [d](const char *key, uint64_t v) {
+		if (OSNumber *n = d ? OSNumber::withNumber(v, 64) : nullptr) {
+			d->setObject(key, n);
+			n->release();
+		}
+	};
+	auto publish = [this, d]() {
+		if (d) {
+			env.owner->setProperty("Compute,Dispatch", d);
+			d->release();
+		}
+	};
+	const uint32_t items = kDispatchGroups * kGroupSize;
+
+	// Code and a result buffer with a sentinel past its end.
+	trail("s6: kernel upload");
+	const uint32_t codeDw = sizeof(kProbeKernel) / 4;
+	for (uint32_t i = 0; i < codeDw; i++)
+		*poolDw(kShaderOffset + 4 * i) = kProbeKernel[i];
+	for (uint32_t i = 0; i <= items; i++)
+		*poolDw(kDispatchBuffer + 4 * i) = 0xFFFFFFFF;
+	*poolDw(kPm4FenceOffset) = 0;
+	flushHdp();
+
+	// Shader memory model for VMID0 (gfx_v12_0_constants_init).
+	grbmSelect(0, 0, 0, 0);
+	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
+
+	const uint64_t code = poolMc(kShaderOffset), buf = poolMc(kDispatchBuffer);
+	const uint32_t pgm[2] = { static_cast<uint32_t>(code >> 8), static_cast<uint32_t>(code >> 40) };
+	// 4 VGPRs (v0-v3): one block of 8 in wave32.
+	const uint32_t rsrc[2] = { 0 | kRsrc1FloatDenorm | kRsrc1MemOrdered,
+	                           (2u << kRsrc2UserSgprShift) | kRsrc2TgidXEn };
+	const uint32_t zero = 0, all[2] = { 0xffffffff, 0xffffffff };
+	const uint32_t all4[4] = { 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff };
+	const uint32_t start[3] = { 0, 0, 0 }, threads[3] = { kGroupSize, 1, 1 };
+	const uint32_t user[2] = { static_cast<uint32_t>(buf), static_cast<uint32_t>(buf >> 32) };
+
+	Pm4::Queue &q = pm4Queue;
+	uint32_t pkt[16];
+	q.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmLo), pgm, 2));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmRsrc1), rsrc, 2));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmRsrc3), &zero, 1));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeResourceLim), &zero, 1));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeTmpringSize), &zero, 1));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe0), all, 2));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe2), all, 2));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe4), all4, 4));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeStartX), start, 3));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeNumThreadX), threads, 3));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeUserData0), user, 2));
+	q.emit(pkt, Pm4::dispatchDirect(pkt, kDispatchGroups, 1, 1,
+	                                Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 |
+	                                Pm4::kDispatchWave32));
+	q.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), ++pm4Fence));
+
+	trail("s6: DISPATCH_DIRECT");
+	uint64_t t0 = mach_absolute_time();
+	pm4Kick(q.wptr());
+	bool done = false;
+	for (uint32_t us = 0; us < 1000000 && !done; us += 10) {
+		done = *poolDw(kPm4FenceOffset) == pm4Fence;
+		if (!done)
+			IODelay(10);
+	}
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	put("Fenced", done);
+	if (!done) {
+		CLOG("dispatch: the kernel's fence never came (0x%08x); buffer[0] 0x%08x",
+		     *poolDw(kPm4FenceOffset), *poolDw(kDispatchBuffer));
+		grbmSelect(1, 0, 0, 0);
+		CLOG("dispatch: GRBM 0x%08x CP_STAT 0x%08x CPC 0x%08x HQD rptr 0x%x wptr %llu",
+		     rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpCpcStatus), rdGc(CpHqdPqRptr),
+		     static_cast<unsigned long long>(q.wptr()));
+		grbmSelect(0, 0, 0, 0);
+		publish();
+		return false;
+	}
+
+	uint32_t bad = 0, firstBad = items;
+	for (uint32_t i = 0; i < items; i++) {
+		if (*poolDw(kDispatchBuffer + 4 * i) != 0x5EED0000u + 3 * i) {
+			if (!bad)
+				firstBad = i;
+			bad++;
+		}
+	}
+	const bool sentinel = *poolDw(kDispatchBuffer + 4 * items) == 0xFFFFFFFF;
+	put("Items", items);
+	put("WrongItems", bad);
+	put("SentinelIntact", sentinel);
+	put("Micros", ns / 1000);
+	if (bad)
+		CLOG("dispatch: %u of %u results wrong, first at %u: 0x%08x (want 0x%08x)", bad, items,
+		     firstBad, *poolDw(kDispatchBuffer + 4 * firstBad), 0x5EED0000u + 3 * firstBad);
+	else
+		CLOG("dispatch: kernel ran on the compute units: all %u work-items wrote their result "
+		     "(buffer[255] = 0x%08x) in %llu us, sentinel %s", items,
+		     *poolDw(kDispatchBuffer + 4 * (items - 1)), ns / 1000, sentinel ? "intact" : "OVERWRITTEN");
+	publish();
+	return !bad && sentinel;
 }

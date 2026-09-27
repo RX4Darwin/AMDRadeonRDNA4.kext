@@ -46,6 +46,7 @@
 #include "amdfw.hpp"
 #include "gfxregs.hpp"
 #include "ipdiscovery.hpp"
+#include "pm4.hpp"
 #include "psp.hpp"
 
 class RDNA4Compute {
@@ -197,6 +198,15 @@ private:
 	bool hqdInit();
 	void pm4Kick(uint64_t wptrDwords);
 	bool stageCompute();
+
+	// Stage 6: run a real kernel (shaders/probe.s) on the compute units.
+	static constexpr uint32_t kShaderOffset   = 14u << 20;            // code, 256-byte aligned
+	static constexpr uint32_t kDispatchBuffer = 20u << 20;            // results
+	static constexpr uint32_t kDispatchGroups = 4, kGroupSize = 64;
+	Pm4::Queue  pm4Queue;                   // set up by stage 5, fed again by stage 6
+	uint32_t    pm4Fence { 0 };             // last RELEASE_MEM sequence number
+	uint32_t shAbs(const GfxReg::Reg &r) const;   // absolute dword address of a GC register
+	bool stageDispatch();
 	// SMU mailbox (MP1): send one message, return the response code
 	// (1 = OK, 0 = no answer) and the argument register after it.
 	uint32_t smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs);
