@@ -178,6 +178,25 @@ private:
 	bool sdmaQueueInit();
 	void sdmaKick(uint32_t wptrBytes);
 	bool stageSdma();
+
+	// Stage 5: one MEC compute queue (ME1 pipe 0 queue 0) programmed
+	// directly, fed through its doorbell, running PM4.
+	static constexpr uint32_t kMqdOffset      = 12u << 20;            // 4 KiB MQD (kept zero)
+	static constexpr uint32_t kEopOffset      = kMqdOffset + 0x1000;  // 2 KiB EOP buffer
+	static constexpr uint32_t kPqOffset       = kMqdOffset + 0x2000;  // 4 KiB PM4 queue
+	static constexpr uint32_t kPqSize         = 0x1000;
+	static constexpr uint32_t kPqRptrOffset   = kMqdOffset + 0x3000;  // rptr report
+	static constexpr uint32_t kPqWptrOffset   = kPqRptrOffset + 0x40; // wptr poll copy
+	static constexpr uint32_t kPm4TestOffset  = kPqRptrOffset + 0x80; // WRITE_DATA target
+	static constexpr uint32_t kPm4FenceOffset = kPqRptrOffset + 0xc0; // RELEASE_MEM target
+	IOMemoryMap        *doorbellMap { nullptr };
+	volatile uint64_t  *doorbells { nullptr };
+	void grbmSelect(uint32_t me, uint32_t pipe, uint32_t queue, uint32_t vmid);
+	bool mecStart();
+	bool doorbellInit();
+	bool hqdInit();
+	void pm4Kick(uint64_t wptrDwords);
+	bool stageCompute();
 	// SMU mailbox (MP1): send one message, return the response code
 	// (1 = OK, 0 = no answer) and the argument register after it.
 	uint32_t smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs);

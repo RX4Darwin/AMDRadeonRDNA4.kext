@@ -25,6 +25,7 @@
 #include "../src/amdfw.hpp"
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
+#include "../src/pm4.hpp"
 
 #include <cstdarg>
 #include <cstdint>
@@ -1620,6 +1621,42 @@ static int testSdmaPackets() {
 	return failures;
 }
 
+// PM4 packets as gfx_v12_0 emits them (compute ring test, fence).
+static int testPm4Packets() {
+	int failures = 0;
+	uint32_t p[8];
+	const uint64_t a = 0x800c003080ull;
+
+	// PACKET3(SET_UCONFIG_REG, 1), SCRATCH_REG0 at 0xc040 -> 0x40.
+	failures += check(Pm4::setUconfigReg(p, 0xc040, 0xDEADBEEF) == 3 && p[0] == 0xc0017900 &&
+	                  p[1] == 0x40 && p[2] == 0xDEADBEEF,
+	                  "pm4: SET_UCONFIG_REG %08x %08x", p[0], p[1]);
+	// PACKET3(WRITE_DATA, 3), DST_SEL(5) | WR_CONFIRM.
+	failures += check(Pm4::writeData(p, a, 7) == 5 && p[0] == 0xc0033700 && p[1] == 0x00100500 &&
+	                  p[2] == 0x0c003080 && p[3] == 0x80 && p[4] == 7,
+	                  "pm4: WRITE_DATA %08x %08x", p[0], p[1]);
+	// PACKET3(RELEASE_MEM, 6): GCR_SEQ | GCR_GL2_WB | CACHE_POLICY(3) |
+	// EVENT_TYPE(0x14) | EVENT_INDEX(5); DATA_SEL(1).
+	failures += check(Pm4::releaseMem(p, a, 9) == 8 && p[0] == 0xc0064900 &&
+	                  p[1] == 0x06600514 && p[2] == 0x20000000 && p[5] == 9 && p[7] == 0,
+	                  "pm4: RELEASE_MEM %08x %08x %08x", p[0], p[1], p[2]);
+
+	uint32_t mem[256];
+	Pm4::Queue q;
+	failures += check(q.init(mem, 0x800c002000ull, sizeof(mem)) && q.queueSizeField() == 7 &&
+	                  mem[0] == 0xffff1000u, "pm4: queue init (QUEUE_SIZE %u, fill %08x)",
+	                  q.queueSizeField(), mem[0]);
+	bool ok = true;
+	for (int i = 0; i < 60 && ok; i++)
+		ok = q.emit(p, Pm4::releaseMem(p, a, static_cast<uint32_t>(i)));
+	failures += check(ok && q.wptr() == 480 && mem[(480 - 8) % 256] == 0xc0064900,
+	                  "pm4: queue wrap (wptr %llu)", static_cast<unsigned long long>(q.wptr()));
+
+	printf("\npm4: SET_UCONFIG_REG/WRITE_DATA/RELEASE_MEM encodings and queue wrap %s\n",
+	       failures ? "FAILED" : "ok");
+	return failures;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
@@ -1811,6 +1848,7 @@ int main(int argc, char **argv) {
 	failures += testPsp();
 	failures += testGfxImages();
 	failures += testSdmaPackets();
+	failures += testPm4Packets();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

@@ -8,6 +8,7 @@
 //
 
 #include "compute.hpp"
+#include "pm4.hpp"
 #include "sdma.hpp"
 
 #include <kern/clock.h>
@@ -441,8 +442,13 @@ void RDNA4Compute::runStages() {
 			return stop("stage 4 (sdma)");
 		done = StageSdma;
 	}
-	if (target >= StageCompute)
-		CLOG("stage 5 (compute) is not implemented yet; stopping after stage 4");
+	if (target >= StageCompute) {
+		if (!stageCompute())
+			return stop("stage 5 (compute)");
+		done = StageCompute;
+	}
+	if (target >= StageDispatch)
+		CLOG("stage 6 (dispatch) is not implemented yet; stopping after stage 5");
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
 	snprintf(note, sizeof(note), "finished at stage %u", done);
 	trail(note);
@@ -1014,4 +1020,228 @@ bool RDNA4Compute::stageSdma() {
 	put("FillGuardsIntact", guards);
 	publish();
 	return !bad && guards;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5: a MEC compute queue
+// ---------------------------------------------------------------------------
+
+// soc24_grbm_select: bank the CP_HQD_* / CP_MQD_* / per-pipe registers.
+void RDNA4Compute::grbmSelect(uint32_t me, uint32_t pipe, uint32_t queue, uint32_t vmid) {
+	wr(IpDiscovery::HwGc, GrbmGfxCntl,
+	   (pipe & 3) | ((me & 3) << 2) | ((vmid & 0xf) << 4) | ((queue & 7) << 8));
+}
+
+// gfx_v12_0_config_gfx_rs64 (the MEC half) + gfx_v12_0_cp_compute_enable:
+// point every MEC pipe at the firmware's entry, pulse the pipe resets, then
+// unhalt the MEC with all four pipes active.
+bool RDNA4Compute::mecStart() {
+#ifdef RDNA4FB_NO_FIRMWARE
+	return false;
+#else
+	const AmdFw::Blob mec = FW_BLOB(mec);
+	if (mec.size < 60)
+		return false;
+	auto le32 = [&](uint32_t off) {
+		return static_cast<uint32_t>(mec.data[off]) | (static_cast<uint32_t>(mec.data[off + 1]) << 8) |
+		       (static_cast<uint32_t>(mec.data[off + 2]) << 16) |
+		       (static_cast<uint32_t>(mec.data[off + 3]) << 24);
+	};
+	const uint32_t startLo = le32(52), startHi = le32(56);   // gfx_firmware_header_v2_0
+	for (uint32_t pipe = 0; pipe < 4; pipe++) {
+		grbmSelect(1, pipe, 0, 0);
+		wr(IpDiscovery::HwGc, CpMecPrgrmStart, (startLo >> 2) | (startHi << 30));
+		wr(IpDiscovery::HwGc, CpMecPrgrmStartHi, startHi >> 2);
+	}
+	grbmSelect(0, 0, 0, 0);
+	uint32_t v = rdGc(CpMecRs64Cntl);
+	wr(IpDiscovery::HwGc, CpMecRs64Cntl, v | kMecPipeResetMask);
+	wr(IpDiscovery::HwGc, CpMecRs64Cntl, v & ~kMecPipeResetMask);
+
+	v = rdGc(CpMecRs64Cntl);
+	v &= ~(kMecInvalidateIcache | kMecPipeResetMask | kRs64Halt);
+	v |= kMecPipeActiveMask;
+	wr(IpDiscovery::HwGc, CpMecRs64Cntl, v);
+	IODelay(50);
+	CLOG("mec: MEC entry 0x%08x%08x, CP_MEC_RS64_CNTL 0x%08x", startHi, startLo,
+	     rdGc(CpMecRs64Cntl));
+	return true;
+#endif
+}
+
+// soc24_common_hw_init's doorbell aperture + nbif_v6_3_1_gc_doorbell_init +
+// gfx_v12_0_cp_set_doorbell_range (MEC part), then map the doorbell BAR.
+bool RDNA4Compute::doorbellInit() {
+	CLOG("mec: doorbells before: aperture 0x%08x, S2A entry0 0x%08x entry3 0x%08x",
+	     rd(IpDiscovery::HwNbif, NbifDoorbellAperEn), rd(IpDiscovery::HwNbif, NbifS2aDoorbell0),
+	     rd(IpDiscovery::HwNbif, NbifS2aDoorbell3));
+	wr(IpDiscovery::HwNbif, NbifDoorbellAperEn, rd(IpDiscovery::HwNbif, NbifDoorbellAperEn) | 1);
+	wr(IpDiscovery::HwNbif, NbifS2aDoorbell0, kS2aDoorbell0Gc);
+	wr(IpDiscovery::HwNbif, NbifS2aDoorbell3, kS2aDoorbell3Gc);
+	wr(IpDiscovery::HwGc, CpMecDoorbellLower, kMecDoorbellLowerBytes);
+	wr(IpDiscovery::HwGc, CpMecDoorbellUpper, kMecDoorbellUpperBytes);
+
+	if (!doorbells) {
+		IODeviceMemory *bar2 = env.pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
+		if (!bar2 || bar2->getLength() < 0x1000)
+			return false;
+		doorbellMap = bar2->map(kIOMapInhibitCache);
+		if (!doorbellMap)
+			return false;
+		doorbells = reinterpret_cast<volatile uint64_t *>(doorbellMap->getVirtualAddress());
+	}
+	return doorbells != nullptr;
+}
+
+// gfx_v12_0_compute_mqd_init + gfx_v12_0_kiq_init_register for ME1 pipe 0
+// queue 0, VMID0, doorbell dword kComputeDoorbellDword.
+bool RDNA4Compute::hqdInit() {
+	for (uint32_t off = kMqdOffset; off < kPqOffset; off += 4)   // MQD + EOP
+		*poolDw(off) = 0;
+	*poolDw(kPqRptrOffset) = 0;
+	*poolDw(kPqWptrOffset) = 0;
+	*poolDw(kPqWptrOffset + 4) = 0;
+	flushHdp();
+
+	const uint64_t eop = poolMc(kEopOffset) >> 8, pq = poolMc(kPqOffset) >> 8;
+	const uint64_t mqd = poolMc(kMqdOffset), rptr = poolMc(kPqRptrOffset), wpoll = poolMc(kPqWptrOffset);
+	const uint32_t eopSize = 8;                 // 2^(8+1) dwords = GFX12_MEC_HPD_SIZE
+	const uint32_t queueSize = 9;               // 2^(9+1) dwords = 4 KiB
+	uint32_t pqControl = (kHqdPqControlDefault & ~(kPqQueueSizeMask | kPqRptrBlockMask |
+	                                               kPqTunnelDispatch)) |
+	                     queueSize | (9u << 8) | kPqUnordDispatch | kPqPrivState | kPqKmdQueue;
+	uint32_t doorbell = (kComputeDoorbellDword << kDoorbellOffsetShift) | kDoorbellEn;
+
+	grbmSelect(1, 0, 0, 0);
+	wr(IpDiscovery::HwGc, CpPqWptrPollCntl, rdGc(CpPqWptrPollCntl) & ~kPqWptrPollEn);
+	wr(IpDiscovery::HwGc, CpHqdEopBase, static_cast<uint32_t>(eop));
+	wr(IpDiscovery::HwGc, CpHqdEopBaseHi, static_cast<uint32_t>(eop >> 32));
+	wr(IpDiscovery::HwGc, CpHqdEopControl, (kHqdEopControlDefault & ~0x3fu) | eopSize);
+	wr(IpDiscovery::HwGc, CpHqdPqDoorbell, doorbell);
+	if (rdGc(CpHqdActive) & 1) {                // a queue left behind: drain it
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
+		for (uint32_t us = 0; us < 100000 && (rdGc(CpHqdActive) & 1); us += 10)
+			IODelay(10);
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+		wr(IpDiscovery::HwGc, CpHqdPqRptr, 0);
+		wr(IpDiscovery::HwGc, CpHqdPqWptrLo, 0);
+		wr(IpDiscovery::HwGc, CpHqdPqWptrHi, 0);
+	}
+	wr(IpDiscovery::HwGc, CpMqdBaseAddr, static_cast<uint32_t>(mqd) & ~3u);
+	wr(IpDiscovery::HwGc, CpMqdBaseAddrHi, static_cast<uint32_t>(mqd >> 32));
+	wr(IpDiscovery::HwGc, CpMqdControl, kMqdControlDefault & ~0xfu);
+	wr(IpDiscovery::HwGc, CpHqdPqBase, static_cast<uint32_t>(pq));
+	wr(IpDiscovery::HwGc, CpHqdPqBaseHi, static_cast<uint32_t>(pq >> 32));
+	wr(IpDiscovery::HwGc, CpHqdPqControl, pqControl);
+	wr(IpDiscovery::HwGc, CpHqdPqRptrReport, static_cast<uint32_t>(rptr) & ~3u);
+	wr(IpDiscovery::HwGc, CpHqdPqRptrReportHi, static_cast<uint32_t>(rptr >> 32) & 0xffff);
+	wr(IpDiscovery::HwGc, CpHqdPqWptrPoll, static_cast<uint32_t>(wpoll) & ~3u);
+	wr(IpDiscovery::HwGc, CpHqdPqWptrPollHi, static_cast<uint32_t>(wpoll >> 32) & 0xffff);
+	wr(IpDiscovery::HwGc, CpMecDoorbellLower, kMecDoorbellLowerBytes);
+	wr(IpDiscovery::HwGc, CpMecDoorbellUpper, kMecDoorbellUpperBytes);
+	wr(IpDiscovery::HwGc, CpHqdPqDoorbell, doorbell);
+	wr(IpDiscovery::HwGc, CpHqdPqWptrLo, 0);
+	wr(IpDiscovery::HwGc, CpHqdPqWptrHi, 0);
+	wr(IpDiscovery::HwGc, CpHqdVmid, 0);
+	wr(IpDiscovery::HwGc, CpHqdPersistent, kHqdPersistentDefault);
+	wr(IpDiscovery::HwGc, CpHqdActive, 1);
+	wr(IpDiscovery::HwGc, CpPqStatus, rdGc(CpPqStatus) | kPqStatusDoorbellEnable);
+	const uint32_t active = rdGc(CpHqdActive), pqc = rdGc(CpHqdPqControl);
+	grbmSelect(0, 0, 0, 0);
+	CLOG("mec: HQD ME1/pipe0/queue0: active %u, PQ_CONTROL 0x%08x, doorbell dword %u",
+	     active & 1, pqc, kComputeDoorbellDword);
+	return active & 1;
+}
+
+// gfx_v12_0_ring_set_wptr_compute: the wptr copy, then the 64-bit doorbell.
+void RDNA4Compute::pm4Kick(uint64_t wptrDwords) {
+	*poolDw(kPqWptrOffset) = static_cast<uint32_t>(wptrDwords);
+	*poolDw(kPqWptrOffset + 4) = static_cast<uint32_t>(wptrDwords >> 32);
+	flushHdp();
+	doorbells[kComputeDoorbellDword / 2] = wptrDwords;
+}
+
+bool RDNA4Compute::stageCompute() {
+	OSDictionary *d = OSDictionary::withCapacity(8);
+	auto put = [d](const char *key, uint64_t v) {
+		if (OSNumber *n = d ? OSNumber::withNumber(v, 64) : nullptr) {
+			d->setObject(key, n);
+			n->release();
+		}
+	};
+	auto publish = [this, d]() {
+		if (d) {
+			env.owner->setProperty("Compute,MEC", d);
+			d->release();
+		}
+	};
+	auto status = [this]() {
+		grbmSelect(1, 0, 0, 0);
+		const uint32_t rptr = rdGc(CpHqdPqRptr), active = rdGc(CpHqdActive);
+		grbmSelect(0, 0, 0, 0);
+		CLOG("mec: GRBM 0x%08x CP_STAT 0x%08x CPC 0x%08x MEC 0x%08x HQD active %u rptr 0x%x "
+		     "rptr report 0x%x", rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpCpcStatus),
+		     rdGc(CpMecRs64Cntl), active & 1, rptr, *poolDw(kPqRptrOffset));
+	};
+
+	trail("s5: MEC start");
+	wr(IpDiscovery::HwGc, GrbmCntl, (rdGc(GrbmCntl) & ~0xffu) | 0xff);   // READ_TIMEOUT
+	if (!mecStart()) {
+		publish();
+		return false;
+	}
+	trail("s5: doorbells");
+	if (!doorbellInit()) {
+		CLOG("mec: doorbell BAR unavailable");
+		publish();
+		return false;
+	}
+	trail("s5: HQD init");
+	Pm4::Queue q;
+	if (!q.init(poolDw(kPqOffset), poolMc(kPqOffset), kPqSize) || !hqdInit()) {
+		status();
+		publish();
+		return false;
+	}
+
+	// amdgpu's compute ring test (SCRATCH_REG0 through SET_UCONFIG_REG),
+	// a WRITE_DATA to VRAM, and the end-of-pipe fence it uses for jobs.
+	trail("s5: PM4 ring test");
+	uint32_t scratchByte = 0;
+	if (!env.disc->regByteOffset(IpDiscovery::HwGc, 0, ScratchReg0.seg, ScratchReg0.dword,
+	                             scratchByte)) {
+		publish();
+		return false;
+	}
+	const uint32_t scratchAbs = scratchByte / 4;   // SET_UCONFIG_REG takes the dword address
+	wr(IpDiscovery::HwGc, ScratchReg0, 0xCAFEDEAD);
+	*poolDw(kPm4TestOffset) = 0;
+	*poolDw(kPm4FenceOffset) = 0;
+	flushHdp();
+	uint32_t pkt[8];
+	q.emit(pkt, Pm4::setUconfigReg(pkt, scratchAbs, 0xDEADBEEF));
+	q.emit(pkt, Pm4::writeData(pkt, poolMc(kPm4TestOffset), 0x600DF00D));
+	q.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), 1));
+	pm4Kick(q.wptr());
+
+	bool done = false;
+	for (uint32_t us = 0; us < 500000 && !done; us += 10) {
+		done = *poolDw(kPm4FenceOffset) == 1;
+		if (!done)
+			IODelay(10);
+	}
+	const uint32_t scratch = rdGc(ScratchReg0), data = *poolDw(kPm4TestOffset);
+	put("ScratchReg", scratch);
+	put("WriteData", data);
+	put("Fence", *poolDw(kPm4FenceOffset));
+	CLOG("mec: PM4 on the MEC: SCRATCH_REG0 0x%08x (%s), WRITE_DATA 0x%08x (%s), "
+	     "RELEASE_MEM fence %s", scratch, scratch == 0xDEADBEEF ? "ok" : "not written", data,
+	     data == 0x600DF00D ? "ok" : "not written", done ? "signalled" : "NOT signalled");
+	if (!done || scratch != 0xDEADBEEF || data != 0x600DF00D) {
+		status();
+		publish();
+		return false;
+	}
+	publish();
+	return true;
 }

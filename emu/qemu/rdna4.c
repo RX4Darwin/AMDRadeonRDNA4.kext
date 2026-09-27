@@ -5,7 +5,7 @@
  * path touches, so the unmodified kext runs its real code paths in a VM.
  *
  *  - PCI identity and BAR layout of the card: BAR0/1 VRAM aperture, BAR2/3
- *    doorbells (inert), BAR4 I/O (inert), BAR5 registers, expansion ROM
+ *    doorbells (the MEC compute queue), BAR4 I/O (inert), BAR5 registers, expansion ROM
  *    (romfile=, normally the card's legacy AtomBIOS image + an EFI GOP driver).
  *  - VRAM: the aperture is RAM; the rest of VRAM is reachable through
  *    MM_INDEX/MM_DATA, with the top 64 MiB modelled (the IP discovery copy
@@ -1234,7 +1234,7 @@ static const MemoryRegionOps rdna4_mmio_ops = {
     .impl.max_access_size = 4,
 };
 
-/* BAR2 doorbells and BAR4 I/O: present, inert. */
+/* BAR4 I/O: present, inert. */
 static uint64_t rdna4_inert_read(void *opaque, hwaddr addr, unsigned size)
 {
     return 0;
@@ -1249,6 +1249,153 @@ static const MemoryRegionOps rdna4_inert_ops = {
     .read = rdna4_inert_read,
     .write = rdna4_inert_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+/* ---- MEC compute queue --------------------------------------------------- */
+
+/*
+ * One MEC queue, the one the driver programs (the model does not bank the
+ * CP_HQD_* registers by GRBM_GFX_CNTL). It runs when its doorbell rings and
+ * every piece of routing the driver owes is in place.
+ */
+#define REG_NBIF_DB_APER_EN  ((0xd20 + 0x00c0) * 4)   /* BIF_DOORBELL_APER_EN [0] */
+#define REG_NBIF_S2A_ENTRY0  ((0xd20 + 0x01cb) * 4)
+#define REG_CP_MEC_CNTL      GC_SEG1(0x2904)          /* HALT [30], PIPE0_ACTIVE [26] */
+#define REG_CP_MEC_PC_START  GC_SEG1(0x2900)
+#define REG_CP_PQ_STATUS     GC_SEG0(0x1e58)          /* DOORBELL_ENABLE [1] */
+#define REG_CP_HQD_ACTIVE    GC_SEG0(0x1fab)
+#define REG_CP_HQD_PQ_BASE   GC_SEG0(0x1fb1)          /* MC >> 8 */
+#define REG_CP_HQD_PQ_BASE_HI GC_SEG0(0x1fb2)
+#define REG_CP_HQD_PQ_RPTR   GC_SEG0(0x1fb3)          /* dwords */
+#define REG_CP_HQD_RPTR_REP  GC_SEG0(0x1fb4)
+#define REG_CP_HQD_RPTR_REP_HI GC_SEG0(0x1fb5)
+#define REG_CP_HQD_DOORBELL  GC_SEG0(0x1fb8)          /* OFFSET [27:2], EN [30] */
+#define REG_CP_HQD_PQ_CNTL   GC_SEG0(0x1fba)          /* QUEUE_SIZE [5:0] */
+#define REG_CP_HQD_WPTR_LO   GC_SEG0(0x1fdf)
+#define REG_CP_HQD_WPTR_HI   GC_SEG0(0x1fe0)
+
+static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)
+{
+    uint32_t hqd_db = reg_get(s, REG_CP_HQD_DOORBELL);
+    uint32_t mec = reg_get(s, REG_CP_MEC_CNTL);
+
+    *why = !s->gfx_booted ? "GFX not booted" :
+           !(reg_get(s, REG_NBIF_DB_APER_EN) & 1) ? "NBIF doorbell aperture off" :
+           reg_get(s, REG_NBIF_S2A_ENTRY0) != 0x30000007 ? "doorbells not routed to GC" :
+           !(reg_get(s, REG_CP_PQ_STATUS) & 2) ? "CP_PQ_STATUS.DOORBELL_ENABLE off" :
+           !(hqd_db & (1u << 30)) ? "HQD doorbell disabled" :
+           ((hqd_db >> 2) & 0x3ffffff) != db_dword ? "doorbell not the queue's" :
+           !(reg_get(s, REG_CP_HQD_ACTIVE) & 1) ? "HQD not active" :
+           (mec & (1u << 30)) || !(mec & (1u << 26)) ? "MEC halted / pipe 0 inactive" :
+           !reg_get(s, REG_CP_MEC_PC_START) ? "MEC entry point not set" : NULL;
+    return *why == NULL;
+}
+
+static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
+{
+    uint32_t size = 2u << (reg_get(s, REG_CP_HQD_PQ_CNTL) & 0x3f);   /* dwords */
+    uint64_t pq = ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE) << 8) |
+                  ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE_HI) << 40);
+    uint32_t rptr = reg_get(s, REG_CP_HQD_PQ_RPTR);
+    const char *why;
+
+    if (!rdna4_mec_ready(s, db_dword, &why)) {
+        fprintf(stderr, "rdna4: mec: doorbell dword %u ignored: %s\n", db_dword, why);
+        return;
+    }
+    reg_set(s, REG_CP_HQD_WPTR_LO, (uint32_t)wptr);
+    reg_set(s, REG_CP_HQD_WPTR_HI, (uint32_t)(wptr >> 32));
+    wptr %= size;
+    while (rptr != wptr) {
+        uint32_t dw[16];
+        for (int i = 0; i < 16; i++) {
+            uint8_t *p = rdna4_gc_span(s, pq + 4ull * ((rptr + i) % size), 4);
+            if (!p) {
+                fprintf(stderr, "rdna4: mec: queue MC 0x%" PRIx64 " not mapped\n", pq);
+                return;
+            }
+            dw[i] = ldl_le_p(p);
+        }
+        uint32_t hdr = dw[0], op = (hdr >> 8) & 0xff, count = (hdr >> 16) & 0x3fff;
+        uint32_t len = count + 2;
+        if ((hdr >> 30) != 3) {
+            fprintf(stderr, "rdna4: mec: not a type-3 packet 0x%08x at %u\n", hdr, rptr);
+            return;
+        }
+        switch (op) {
+        case 0x10:                                   /* NOP (0x3fff = one dword) */
+            if (count == 0x3fff) {
+                len = 1;
+            }
+            break;
+        case 0x79:                                   /* SET_UCONFIG_REG */
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t byte = (0xc000 + dw[1] + i) * 4;
+                if (byte + 4 <= RDNA4_MMIO_SIZE) {
+                    reg_set(s, byte, dw[2 + i]);
+                }
+            }
+            break;
+        case 0x37: {                                 /* WRITE_DATA to memory */
+            uint64_t a = (dw[2] & ~3u) | ((uint64_t)dw[3] << 32);
+            uint32_t n = count - 2;
+            uint8_t *p = ((dw[1] >> 8) & 0xf) == 5 ? rdna4_gc_span(s, a, 4ull * n) : NULL;
+            if (!p) {
+                fprintf(stderr, "rdna4: mec: WRITE_DATA to 0x%" PRIx64 " refused\n", a);
+                return;
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                stl_le_p(p + 4 * i, dw[4 + i]);
+            }
+            break;
+        }
+        case 0x49: {                                 /* RELEASE_MEM */
+            uint64_t a = (dw[3] & ~3u) | ((uint64_t)dw[4] << 32);
+            uint32_t sel = dw[2] >> 29;
+            uint8_t *p = rdna4_gc_span(s, a, sel == 2 ? 8 : 4);
+            if (!p) {
+                fprintf(stderr, "rdna4: mec: RELEASE_MEM to 0x%" PRIx64 " refused\n", a);
+                return;
+            }
+            if (sel == 2) {
+                stq_le_p(p, dw[5] | ((uint64_t)dw[6] << 32));
+            } else if (sel == 1) {
+                stl_le_p(p, dw[5]);
+            }
+            break;
+        }
+        default:
+            fprintf(stderr, "rdna4: mec: unknown PM4 op 0x%02x at %u, stopping\n", op, rptr);
+            return;
+        }
+        rptr = (rptr + len) % size;
+        reg_set(s, REG_CP_HQD_PQ_RPTR, rptr);
+    }
+    uint64_t rep = (reg_get(s, REG_CP_HQD_RPTR_REP) & ~3u) |
+                   ((uint64_t)(reg_get(s, REG_CP_HQD_RPTR_REP_HI) & 0xffff) << 32);
+    uint8_t *p = rdna4_gc_span(s, rep, 4);
+    if (p) {
+        stl_le_p(p, rptr);
+    }
+}
+
+/* BAR2: the doorbell aperture. 64-bit doorbells arrive whole (impl 8). */
+static uint64_t rdna4_doorbell_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 0;
+}
+
+static void rdna4_doorbell_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
+{
+    rdna4_mec_doorbell(opaque, addr / 4, data);
+}
+
+static const MemoryRegionOps rdna4_doorbell_ops = {
+    .read = rdna4_doorbell_read,
+    .write = rdna4_doorbell_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 8 },
+    .impl = { .min_access_size = 4, .max_access_size = 8 },
 };
 
 /* ---- scanout ------------------------------------------------------------ */
@@ -1657,7 +1804,7 @@ static void rdna4_realize(PCIDevice *dev, Error **errp)
     }
     memory_region_init_io(&s->mmio, obj, &rdna4_mmio_ops, s, "rdna4.mmio",
                           RDNA4_MMIO_SIZE);
-    memory_region_init_io(&s->doorbell, obj, &rdna4_inert_ops, s, "rdna4.doorbell",
+    memory_region_init_io(&s->doorbell, obj, &rdna4_doorbell_ops, s, "rdna4.doorbell",
                           RDNA4_DOORBELL_SIZE);
     memory_region_init_io(&s->io, obj, &rdna4_inert_ops, s, "rdna4.io",
                           RDNA4_IO_SIZE);

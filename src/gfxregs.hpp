@@ -222,6 +222,75 @@ constexpr uint32_t kVmCtxEnable   = 1u << 0;
 // VMx_L2_CNTL
 constexpr uint32_t kVmL2Enable    = 1u << 0;
 
+// --- MEC compute queues (GC). The CP_HQD_* / CP_MQD_* registers are banked
+// per ME/pipe/queue: select one with GRBM_GFX_CNTL first.
+constexpr Reg GrbmGfxCntl         { 1, 0x0900 };   // PIPEID [1:0], MEID [3:2], VMID [7:4], QUEUEID [10:8]
+constexpr Reg GrbmCntl            { 0, 0x0da0 };   // READ_TIMEOUT [7:0]
+constexpr Reg CpMecPrgrmStart     { 1, 0x2900 };   // CP_MEC_RS64_PRGRM_CNTR_START
+constexpr Reg CpMecPrgrmStartHi   { 1, 0x2938 };
+constexpr Reg CpPqWptrPollCntl    { 0, 0x1e23 };   // EN [31]
+constexpr Reg CpPqStatus          { 0, 0x1e58 };   // DOORBELL_ENABLE [1]
+constexpr Reg CpMecDoorbellLower  { 0, 0x1dfc };
+constexpr Reg CpMecDoorbellUpper  { 0, 0x1dfd };
+constexpr Reg CpMqdBaseAddr       { 0, 0x1fa9 };
+constexpr Reg CpMqdBaseAddrHi     { 0, 0x1faa };
+constexpr Reg CpHqdActive         { 0, 0x1fab };
+constexpr Reg CpHqdVmid           { 0, 0x1fac };
+constexpr Reg CpHqdPersistent     { 0, 0x1fad };
+constexpr Reg CpHqdPqBase         { 0, 0x1fb1 };   // MC >> 8
+constexpr Reg CpHqdPqBaseHi       { 0, 0x1fb2 };
+constexpr Reg CpHqdPqRptr         { 0, 0x1fb3 };
+constexpr Reg CpHqdPqRptrReport   { 0, 0x1fb4 };
+constexpr Reg CpHqdPqRptrReportHi { 0, 0x1fb5 };
+constexpr Reg CpHqdPqWptrPoll     { 0, 0x1fb6 };
+constexpr Reg CpHqdPqWptrPollHi   { 0, 0x1fb7 };
+constexpr Reg CpHqdPqDoorbell     { 0, 0x1fb8 };   // DOORBELL_OFFSET [27:2], EN [30]
+constexpr Reg CpHqdPqControl      { 0, 0x1fba };
+constexpr Reg CpHqdDequeueReq     { 0, 0x1fc1 };
+constexpr Reg CpMqdControl        { 0, 0x1fcb };
+constexpr Reg CpHqdEopBase        { 0, 0x1fce };   // MC >> 8
+constexpr Reg CpHqdEopBaseHi      { 0, 0x1fcf };
+constexpr Reg CpHqdEopControl     { 0, 0x1fd0 };   // EOP_SIZE [5:0]: 2^(n+1) dwords
+constexpr Reg CpHqdPqWptrLo       { 0, 0x1fdf };
+constexpr Reg CpHqdPqWptrHi       { 0, 0x1fe0 };
+constexpr Reg ScratchReg0         { 1, 0x2040 };   // UCONFIG: absolute dword 0xa000 + 0x2040
+
+// CP_MEC_RS64_CNTL
+constexpr uint32_t kMecInvalidateIcache = 1u << 4;
+constexpr uint32_t kMecPipeResetMask    = 0xfu << 16;   // PIPE0..3_RESET
+constexpr uint32_t kMecPipeActiveMask   = 0xfu << 26;   // PIPE0..3_ACTIVE
+// Reset values gfx_v12_0 builds the MQD from, and their fields.
+constexpr uint32_t kHqdEopControlDefault    = 0x00000006;
+constexpr uint32_t kMqdControlDefault       = 0x00000100;   // VMID [3:0] = 0
+constexpr uint32_t kHqdPqControlDefault     = 0x00308509;
+constexpr uint32_t kHqdPersistentDefault    = 0x0be05501;   // PRELOAD_SIZE [17:8] = 0x55
+constexpr uint32_t kPqQueueSizeMask         = 0x3fu;
+constexpr uint32_t kPqRptrBlockMask         = 0x3fu << 8;
+constexpr uint32_t kPqUnordDispatch         = 1u << 28;
+constexpr uint32_t kPqTunnelDispatch        = 1u << 29;
+constexpr uint32_t kPqPrivState             = 1u << 30;
+constexpr uint32_t kPqKmdQueue              = 1u << 31;
+constexpr uint32_t kDoorbellOffsetShift     = 2;
+constexpr uint32_t kDoorbellOffsetMask      = 0x3ffffffu << 2;
+constexpr uint32_t kDoorbellEn              = 1u << 30;
+constexpr uint32_t kDoorbellSourceHitMask   = (1u << 28) | (1u << 31);
+constexpr uint32_t kPqWptrPollEn            = 1u << 31;
+constexpr uint32_t kPqStatusDoorbellEnable  = 1u << 1;
+constexpr uint32_t kGfx12MecHpdSize         = 2048;         // EOP buffer bytes
+
+// Doorbells (amdgpu's soc24 layout): the MEC owns 64-bit slots 0..0x8a;
+// the first kernel compute ring is slot 3 = dword 6.
+constexpr uint32_t kMecDoorbellLowerBytes   = 0;
+constexpr uint32_t kMecDoorbellUpperBytes   = (0x8a * 2) << 2;
+constexpr uint32_t kComputeDoorbellDword    = 3 * 2;
+
+// --- NBIF 6.3.1 doorbell aperture and routing into GC (seg 2)
+constexpr Reg NbifDoorbellAperEn  { 2, 0x00c0 };   // RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN [0]
+constexpr Reg NbifS2aDoorbell0    { 2, 0x01cb };   // GDC_S2A0_S2A_DOORBELL_ENTRY_0_CTRL
+constexpr Reg NbifS2aDoorbell3    { 2, 0x01ce };   // GDC_S2A0_S2A_DOORBELL_ENTRY_3_CTRL
+constexpr uint32_t kS2aDoorbell0Gc = 0x30000007;   // nbif_v6_3_1_gc_doorbell_init
+constexpr uint32_t kS2aDoorbell3Gc = 0x3000000d;
+
 // --- NBIF 6.3.1: where a BAR5 write flushes the HDP (host data path) write
 // cache, so CPU writes to VRAM through BAR0 become visible to the GPU. Holds a
 // BAR5 byte offset; 0 = not set up.
