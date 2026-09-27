@@ -8,7 +8,7 @@
 # Build first: tools/emu-build.sh (QEMU + option ROM), and an OpenCore image
 # with the bare-metal kext:
 #   tools/vm-opencore.sh --kext build/RDNA4FB.kext --out OpenCore-emu.qcow2
-# Env: OSXKVM (~/OSX-KVM), QEMU_SRC (~/qemu-10.0.13), OC_IMAGE
+# Env: OSXKVM (~/OSX-KVM), QEMU_SRC (~/qemu-10.0.13), RAM_MB (16384), OC_IMAGE
 # (OpenCore-emu.qcow2 in $OSXKVM/OpenCore). Display: VNC 127.0.0.1:5900.
 set -euo pipefail
 
@@ -34,7 +34,7 @@ cd "$OSXKVM"
 
 MY_OPTIONS="+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt,check"
 args=(
-	-enable-kvm -m 8192
+	-enable-kvm -m "${RAM_MB:-16384}"
 	-cpu Skylake-Client,-hle,-rtm,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,"$MY_OPTIONS"
 	-machine q35
 	-smp 8,cores=4,sockets=1

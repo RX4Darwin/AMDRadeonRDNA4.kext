@@ -1,9 +1,10 @@
 # RX 9070 XT register image at OS handoff (what the GOP leaves behind),
 # for the rdna4 QEMU device (state=). Format of tools/linux-capture.sh:
 #   NAME base_idx dword_off byte_addr 0xVALUE
-# base_idx/dword_off are DMU (DCN 4.1.0) segment-relative; byte_addr is the
-# BAR5 offset through the card's IP discovery bases (seg1 0xc0, seg2 0x34c0,
-# seg3 0x9000). Unlisted registers power on as 0.
+# base_idx/dword_off are segment-relative within the register's IP block
+# (DMU = DCN 4.1.0 unless the name says MP0); byte_addr is the BAR5 offset
+# through the card's IP discovery bases (DMU seg1 0xc0, seg2 0x34c0, seg3
+# 0x9000; MP0 seg0 0x16000). Unlisted registers power on as 0.
 #
 # SYNTHESIZED, not captured: the layout follows amdgpu's register semantics
 # and the values the kext expects (see tools/atomdump.cpp testPipeDiscovery).
@@ -60,3 +61,17 @@ DP_AUX1_AUX_CONTROL 2 0x16ce 0x12e38 0x00000001
 DC_I2C_CONTROL 2 0x1e98 0x14d60 0x00000002
 DIO_MEM_PWR_CTRL 2 0x1ede 0x14e78 0x00000001
 MICROSECOND_TIME_BASE_DIV 1 0x007b 0x004ec 0x00120464
+
+# DMUB inbox1 ring in firmware memory 48 MiB below the top of VRAM
+
+# (REGION4 = MC 0x80_0000_0000 + 16256 MiB), idle; the GOP's own command
+
+# history is not known, so the ring starts empty
+DMCUB_REGION4_OFFSET 2 0x0196 0x0d958 0xf8000000
+DMCUB_REGION4_OFFSET_HIGH 2 0x0197 0x0d95c 0x00000083
+DMCUB_INBOX1_SIZE 2 0x01d5 0x0da54 0x00004000
+DMCUB_INBOX1_WPTR 2 0x01d6 0x0da58 0x00000000
+DMCUB_INBOX1_RPTR 2 0x01d7 0x0da5c 0x00000000
+
+# PSP (MP0 segment 0): bootloader ready; no sOS, the model runs no PSP firmware
+MP0_SMN_C2PMSG_35 0 0x0063 0x5818c 0x80000000

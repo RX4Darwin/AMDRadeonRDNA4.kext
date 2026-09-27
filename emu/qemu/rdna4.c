@@ -13,11 +13,21 @@
  *  - Registers: a flat BAR5 image, loaded at reset from a register image in
  *    tools/linux-capture.sh's format (state=), i.e. the state the GOP leaves.
  *  - Live engines: OTG frame counter and vblank status, DC_I2C (EDID from a
- *    DDC slave on one line), DP AUX (no sink attached), RCC_CONFIG_MEMSIZE.
+ *    DDC slave on one line), DP AUX (no sink attached), RCC_CONFIG_MEMSIZE,
+ *    the DMUB inbox1 ring (QUERY_FEATURE_CAPS answered; the VBIOS-family
+ *    SET_PIXEL_CLOCK / DIG1_TRANSMITTER_CONTROL / DIGX_ENCODER_CONTROL
+ *    commands drive the model's PHY PLLs and transmitters) and the SMU (MP1)
+ *    message mailbox. OTG_MASTER_UPDATE_LOCK holds the double-buffered OTG
+ *    timing and HUBP surface registers until it is released.
+ *  - An attached monitor: the scanout only shows when the lit OTG's DIG
+ *    drives an enabled transmitter at the OTG's pixel clock and the
+ *    resulting timing is inside the EDID's range limits; otherwise the
+ *    console says "no signal" / "out of range", as the monitor would.
  *  - Scanout: follows the lit OTG -> OPP -> MPCC -> HUBP surface registers
  *    into the QEMU console; the OPP pattern generator blanks it.
  *
- * Not a GPU: no GFX, SDMA, VCN, SMU or PSP behaviour.
+ * Not a GPU: no GFX, SDMA or VCN, and no PSP/DMUB/PMFW firmware — only the
+ * register protocols the display driver speaks to them.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -30,6 +40,7 @@
 #include "qemu/error-report.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pcie.h"
+#include "hw/pci/msi.h"
 #include "hw/qdev-properties.h"
 #include "qapi/error.h"
 #include "ui/console.h"
@@ -73,9 +84,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define OTG_H_BLANK          0x1b2b     /* START [14:0], END [30:16] */
 #define OTG_V_TOTAL          0x1b2f
 #define OTG_V_BLANK          0x1b38
+#define OTG_V_SYNC_A_CNTL    0x1b3a
 #define OTG_CONTROL          0x1b43     /* MASTER_EN [0], CURRENT_MASTER_EN_STATE [16] */
 #define OTG_STATUS           0x1b49     /* V_BLANK [0] */
 #define OTG_FRAME_COUNT      0x1b4d     /* [23:0] */
+#define OTG_MASTER_UPDATE_LOCK 0x1b89   /* LOCK [0], UPDATE_LOCK_STATUS [8] */
 #define ODM_STRIDE           0x10
 #define OPTC_DATA_SOURCE     0x1acb     /* SEG0_SRC_SEL [19:16] = OPP */
 /* OPP (seg2) */
@@ -87,7 +100,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define HUBP_SURFACE_PITCH   0x0607     /* [15:0] = pixels - 1 */
 #define HUBP_SURFACE_ADDR    0x060a
 #define HUBP_SURFACE_ADDR_HI 0x060b
+#define HUBP_DB_FIRST        0x05e5     /* DCSURF_SURFACE_CONFIG .. */
+#define HUBP_DB_LAST         0x060b     /* .. PRIMARY_SURFACE_ADDRESS_HIGH */
 #define DCN_VM_FB_LOC_BASE   0x0475     /* [23:0] = MC address >> 24 */
+/* DIG front-/back-ends (seg2) */
+#define DIG_STRIDE           0x124
+#define DIG_FE_CNTL          0x2093     /* SOURCE_SELECT [2:0] = OTG */
+#define DIG_FE_EN_CNTL       0x2095     /* ENABLE [0] */
+#define STREAM_MAPPER        0x1f0d     /* + dig: LINK_TARGET [2:0] */
+#define NUM_DIG              4
+#define NUM_PHY              8
 /* MPC (seg3) */
 #define MPCC_STRIDE          0x15
 #define MPCC_OPP_ID          0x0002     /* [3:0], 0xf = none */
@@ -129,6 +151,29 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define AUX_ST_DONE          (1u << 0)
 #define AUX_ST_HPD_DISCON    (1u << 9)
 
+/* DMCUB (seg2): the DMUB firmware's inbox1 ring lives in VRAM at REGION4 */
+#define DMCUB_REGION4_OFFSET    0x0196
+#define DMCUB_REGION4_OFFSET_HI 0x0197
+#define DMCUB_INBOX1_SIZE       0x01d5
+#define DMCUB_INBOX1_WPTR       0x01d6
+#define DMCUB_INBOX1_RPTR       0x01d7
+#define DMUB_CMD_SIZE           64
+#define DMUB_CMD_QUERY_FEATURE_CAPS 6
+#define DMUB_CMD_VBIOS          128
+#define VBIOS_DIGX_ENCODER_CONTROL     0
+#define VBIOS_DIG1_TRANSMITTER_CONTROL 1
+#define VBIOS_SET_PIXEL_CLOCK          2
+#define TRANSMITTER_ACTION_DISABLE     0
+#define TRANSMITTER_ACTION_ENABLE      1
+
+/* SMU message mailbox: MP1 C2PMSG_66/82/90, MP1 segment 1 (dword 0x16200) */
+#define MP1_SEG1             0x16200
+#define REG_SMU_MSG          ((MP1_SEG1 + 0x0082) * 4)
+#define REG_SMU_PARAM        ((MP1_SEG1 + 0x0092) * 4)
+#define REG_SMU_RESP         ((MP1_SEG1 + 0x009a) * 4)
+#define SMU_RESP_OK          0x01
+#define SMU_RESP_UNKNOWN     0xfe
+
 #define ARB_STATUS_SHIFT     2          /* [3:2]: 0 idle, 1 SW, 2 HW/DMCU */
 #define ARB_STATUS_MASK      (3u << ARB_STATUS_SHIFT)
 
@@ -155,9 +200,16 @@ typedef struct RDNA4I2C {
     uint8_t  edid_offset;    /* the DDC slave's word address */
 } RDNA4I2C;
 
+typedef struct RDNA4Pending {
+    uint32_t addr, val;
+} RDNA4Pending;
+
+#define MAX_PENDING 256
+
 typedef struct RDNA4Scanout {
     bool     active;         /* an OTG is running */
     bool     blank;          /* pattern generator on, or nothing to fetch */
+    const char *nosignal;    /* what the monitor would say, NULL = picture */
     uint32_t width, height, stride;
     uint64_t offset;         /* into the VRAM aperture */
 } RDNA4Scanout;
@@ -185,6 +237,11 @@ struct RDNA4State {
 
     RDNA4I2C     i2c;
     int64_t      otg_epoch[NUM_OTG];
+    uint32_t     pclk_khz[NUM_OTG];     /* PHY PLL feeding each OTG */
+    uint32_t     symclk_khz[NUM_PHY];   /* 0 = transmitter off */
+    uint8_t      dig_mode[NUM_DIG];     /* encoder mode last set up */
+    RDNA4Pending pending[MAX_PENDING];  /* double-buffered writes under lock */
+    unsigned     npending;
     RDNA4Scanout scanout;
 };
 
@@ -217,6 +274,14 @@ static uint8_t *rdna4_vram_ptr(RDNA4State *s, uint64_t off)
         return s->resv + (off - resv_base);
     }
     return NULL;
+}
+
+/* Host pointer for `len` bytes of VRAM at `off`, or NULL. */
+static uint8_t *rdna4_vram_span(RDNA4State *s, uint64_t off, uint64_t len)
+{
+    uint8_t *first = rdna4_vram_ptr(s, off);
+
+    return first && rdna4_vram_ptr(s, off + len - 4) == first + len - 4 ? first : NULL;
 }
 
 static uint64_t rdna4_mm_offset(RDNA4State *s)
@@ -254,20 +319,19 @@ static uint32_t rdna4_otg_reg(RDNA4State *s, int otg, uint32_t dw)
 }
 
 /*
- * Pixels scanned out since the OTG was enabled. The pixel clock lives in
- * the PHY PLL, which the model does not have yet: the OTG runs at 60 Hz of
- * whatever raster its timing registers describe.
+ * Pixels scanned out since the OTG was enabled, at the pixel clock of the
+ * PHY PLL feeding it (SET_PIXEL_CLOCK; at power-on the GOP's clock).
  */
 static bool rdna4_otg_position(RDNA4State *s, int otg, uint64_t *frame,
                                uint32_t *line)
 {
     uint64_t htot = (rdna4_otg_reg(s, otg, OTG_H_TOTAL) & 0x7fff) + 1;
     uint64_t vtot = (rdna4_otg_reg(s, otg, OTG_V_TOTAL) & 0x7fff) + 1;
-    uint64_t pclk = htot * vtot * 60;
+    uint64_t pclk = (uint64_t)s->pclk_khz[otg] * 1000;
     int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->otg_epoch[otg];
     uint64_t pixels;
 
-    if (!(rdna4_otg_reg(s, otg, OTG_CONTROL) & 1) || ns < 0 ||
+    if (!(rdna4_otg_reg(s, otg, OTG_CONTROL) & 1) || ns < 0 || !pclk ||
         pclk > UINT32_MAX) {
         return false;
     }
@@ -286,6 +350,8 @@ static uint32_t rdna4_otg_read(RDNA4State *s, int otg, uint32_t dw)
     switch (dw) {
     case OTG_CONTROL:
         return (val & ~(1u << 16)) | ((val & 1) << 16);
+    case OTG_MASTER_UPDATE_LOCK:
+        return (val & ~(1u << 8)) | ((val & 1) << 8);
     case OTG_FRAME_COUNT:
         if (rdna4_otg_position(s, otg, &frame, &line)) {
             return (val & ~0xffffffu) | (frame & 0xffffff);
@@ -302,14 +368,62 @@ static uint32_t rdna4_otg_read(RDNA4State *s, int otg, uint32_t dw)
     return val;
 }
 
+/*
+ * Double buffering: with OTG_MASTER_UPDATE_LOCK held on a running OTG,
+ * writes to its timing registers (and to the HUBP of the same pipe) stay
+ * pending and latch together when the lock is released. A stopped OTG or
+ * an unlocked one takes them at once (the next VUPDATE, in hardware).
+ */
+static bool rdna4_update_locked(RDNA4State *s, int otg)
+{
+    return (rdna4_otg_reg(s, otg, OTG_CONTROL) & 1) &&
+           (rdna4_otg_reg(s, otg, OTG_MASTER_UPDATE_LOCK) & 1);
+}
+
+static void rdna4_db_write(RDNA4State *s, int otg, uint32_t addr, uint32_t val)
+{
+    if (!rdna4_update_locked(s, otg)) {
+        reg_set(s, addr, val);
+        return;
+    }
+    for (unsigned i = 0; i < s->npending; i++) {
+        if (s->pending[i].addr == addr) {
+            s->pending[i].val = val;
+            return;
+        }
+    }
+    if (s->npending < MAX_PENDING) {
+        s->pending[s->npending++] = (RDNA4Pending){ addr, val };
+    } else {
+        reg_set(s, addr, val);
+    }
+}
+
+static void rdna4_latch_pending(RDNA4State *s)
+{
+    for (unsigned i = 0; i < s->npending; i++) {
+        reg_set(s, s->pending[i].addr, s->pending[i].val);
+    }
+    s->npending = 0;
+}
+
 static void rdna4_otg_write(RDNA4State *s, int otg, uint32_t dw, uint32_t val)
 {
     uint32_t old = rdna4_otg_reg(s, otg, dw);
+    uint32_t addr = SEG2(dw + otg * OTG_STRIDE);
 
+    if (dw >= OTG_H_TOTAL && dw <= OTG_V_SYNC_A_CNTL) {
+        rdna4_db_write(s, otg, addr, val);
+        return;
+    }
     if (dw == OTG_CONTROL && (val & 1) && !(old & 1)) {
         s->otg_epoch[otg] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     }
-    reg_set(s, SEG2(dw + otg * OTG_STRIDE), val);
+    reg_set(s, addr, val & (dw == OTG_MASTER_UPDATE_LOCK ? ~(1u << 8) : ~0u));
+    if ((dw == OTG_MASTER_UPDATE_LOCK && (old & 1) && !(val & 1)) ||
+        (dw == OTG_CONTROL && !(val & 1))) {
+        rdna4_latch_pending(s);
+    }
 }
 
 /* ---- DC_I2C ------------------------------------------------------------- */
@@ -472,6 +586,109 @@ static uint32_t rdna4_aux_read(RDNA4State *s, uint32_t base, uint32_t reg)
     return reg_get(s, SEG2(base + reg));
 }
 
+/* ---- DMUB inbox1 --------------------------------------------------------- */
+
+/*
+ * The display firmware's command ring. There is no DMUB firmware in the
+ * model: a WPTR write consumes every queued command at once, answers the
+ * ones with a defined reply and moves RPTR up to WPTR.
+ */
+static void rdna4_dmub_command(RDNA4State *s, uint8_t *cmd)
+{
+    uint8_t type = cmd[0], sub = cmd[1];
+
+    if (s->trace) {
+        fprintf(stderr, "rdna4: dmub cmd type %u sub %u: %08x %08x %08x %08x\n",
+                type, sub, ldl_le_p(cmd), ldl_le_p(cmd + 4), ldl_le_p(cmd + 8),
+                ldl_le_p(cmd + 12));
+    }
+    if (type == DMUB_CMD_QUERY_FEATURE_CAPS) {
+        memset(cmd + 4, 0, DMUB_CMD_SIZE - 4);    /* no optional features */
+        return;
+    }
+    if (type != DMUB_CMD_VBIOS) {
+        return;
+    }
+    switch (sub) {
+    case VBIOS_SET_PIXEL_CLOCK: {                  /* set_pixel_clock_parameter_v1_7 */
+        uint32_t pixclk_100hz = ldl_le_p(cmd + 4);
+        uint8_t crtc = cmd[12];
+        if (crtc < NUM_OTG) {
+            s->pclk_khz[crtc] = pixclk_100hz / 10;
+        }
+        break;
+    }
+    case VBIOS_DIG1_TRANSMITTER_CONTROL: {         /* dig_transmitter_control_data_v1_7 */
+        uint8_t phy = cmd[4], action = cmd[5];
+        uint32_t symclk_10khz = ldl_le_p(cmd + 8);
+        if (phy < NUM_PHY && action == TRANSMITTER_ACTION_ENABLE) {
+            s->symclk_khz[phy] = symclk_10khz * 10;
+        } else if (phy < NUM_PHY && action == TRANSMITTER_ACTION_DISABLE) {
+            s->symclk_khz[phy] = 0;
+        }
+        break;
+    }
+    case VBIOS_DIGX_ENCODER_CONTROL: {             /* dig_encoder_stream_setup_parameters_v1_5 */
+        uint8_t dig = cmd[4];
+        if (dig < NUM_DIG) {
+            s->dig_mode[dig] = cmd[6];
+        }
+        break;
+    }
+    }
+}
+
+static void rdna4_dmub_wptr(RDNA4State *s, uint32_t wptr)
+{
+    uint64_t region4 = ((uint64_t)reg_get(s, SEG2(DMCUB_REGION4_OFFSET_HI)) << 32) |
+                       reg_get(s, SEG2(DMCUB_REGION4_OFFSET));
+    uint64_t fb = (uint64_t)(reg_get(s, SEG2(DCN_VM_FB_LOC_BASE)) & 0xffffff) << 24;
+    uint32_t size = reg_get(s, SEG2(DMCUB_INBOX1_SIZE));
+    uint32_t rptr = reg_get(s, SEG2(DMCUB_INBOX1_RPTR));
+
+    reg_set(s, SEG2(DMCUB_INBOX1_WPTR), wptr);
+    if (region4 <= fb || !size || size % DMUB_CMD_SIZE || wptr >= size ||
+        wptr % DMUB_CMD_SIZE || rptr >= size || rptr % DMUB_CMD_SIZE) {
+        return;
+    }
+    while (rptr != wptr) {
+        uint8_t *cmd = rdna4_vram_span(s, region4 - fb + rptr, DMUB_CMD_SIZE);
+        if (!cmd) {
+            break;                                 /* ring outside modelled VRAM */
+        }
+        rdna4_dmub_command(s, cmd);
+        rptr = (rptr + DMUB_CMD_SIZE) % size;
+    }
+    reg_set(s, SEG2(DMCUB_INBOX1_RPTR), rptr);
+}
+
+/* ---- SMU mailbox ---------------------------------------------------------- */
+
+/*
+ * PPSMC message protocol (smu_v14_0): the driver clears RESP, stages PARAM
+ * and writes the message id; the PMFW answers in RESP (and PARAM). Only the
+ * messages the kext's diagnostics send are known; the version queries
+ * report 0, as there is no PMFW to report a real one.
+ */
+static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
+{
+    uint32_t resp = SMU_RESP_OK;
+
+    reg_set(s, REG_SMU_MSG, msg);
+    switch (msg) {
+    case 0x1:                                      /* TestMessage */
+        break;
+    case 0x2:                                      /* GetSmuVersion */
+    case 0x3:                                      /* GetDriverIfVersion */
+        reg_set(s, REG_SMU_PARAM, 0);
+        break;
+    default:
+        resp = SMU_RESP_UNKNOWN;
+        break;
+    }
+    reg_set(s, REG_SMU_RESP, resp);
+}
+
 /* ---- BAR5 --------------------------------------------------------------- */
 
 static uint64_t rdna4_mmio_read(void *opaque, hwaddr addr, unsigned size)
@@ -521,9 +738,16 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         rdna4_mm_write(s, val);
     } else if (addr == REG_CONFIG_MEMSIZE) {
         /* read-only */
+    } else if (addr == REG_SMU_MSG) {
+        rdna4_smu_msg(s, val);
     } else if (dw >= DMU_SEG2 && dw < DMU_SEG3) {
         uint32_t d2 = dw - DMU_SEG2;
-        if (d2 >= OTG_H_TOTAL && d2 < OTG_H_TOTAL + NUM_OTG * OTG_STRIDE) {
+        if (d2 == DMCUB_INBOX1_WPTR) {
+            rdna4_dmub_wptr(s, val);
+        } else if (d2 >= HUBP_DB_FIRST && d2 < HUBP_DB_FIRST + NUM_OTG * HUBP_STRIDE &&
+                   (d2 - HUBP_DB_FIRST) % HUBP_STRIDE <= HUBP_DB_LAST - HUBP_DB_FIRST) {
+            rdna4_db_write(s, (d2 - HUBP_DB_FIRST) / HUBP_STRIDE, addr, val);
+        } else if (d2 >= OTG_H_TOTAL && d2 < OTG_H_TOTAL + NUM_OTG * OTG_STRIDE) {
             uint32_t otg = (d2 - OTG_H_TOTAL) / OTG_STRIDE;
             rdna4_otg_write(s, otg, d2 - otg * OTG_STRIDE, val);
         } else if (rdna4_is_i2c(d2)) {
@@ -569,6 +793,67 @@ static const MemoryRegionOps rdna4_inert_ops = {
 
 /* ---- scanout ------------------------------------------------------------ */
 
+/* The EDID's display range limits descriptor (tag 0xfd), if any. */
+static bool rdna4_edid_range(RDNA4State *s, uint32_t *min_v, uint32_t *max_v,
+                             uint32_t *min_h_khz, uint32_t *max_h_khz,
+                             uint32_t *max_pclk_khz)
+{
+    for (int d = 54; d + 18 <= 126; d += 18) {
+        const uint8_t *p = s->edid + d;
+        if (!p[0] && !p[1] && p[3] == 0xfd) {
+            *min_v = p[5];
+            *max_v = p[6];
+            *min_h_khz = p[7];
+            *max_h_khz = p[8];
+            *max_pclk_khz = p[9] * 10000;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * What the attached monitor makes of OTG `otg`'s output: NULL if it shows
+ * a picture, else its complaint. The signal needs an enabled DIG sourcing
+ * the OTG, a transmitter on that DIG's link running at the OTG's pixel
+ * clock (TMDS, 8 bpc: symbol clock = pixel clock), and a raster inside the
+ * EDID's range limits.
+ */
+static const char *rdna4_monitor_check(RDNA4State *s, int otg)
+{
+    uint32_t htot = (rdna4_otg_reg(s, otg, OTG_H_TOTAL) & 0x7fff) + 1;
+    uint32_t vtot = (rdna4_otg_reg(s, otg, OTG_V_TOTAL) & 0x7fff) + 1;
+    uint32_t min_v, max_v, min_h, max_h, max_pclk;
+    uint64_t pclk_hz = (uint64_t)s->pclk_khz[otg] * 1000, vhz_milli, hkhz;
+    int dig = -1, link;
+
+    for (int d = 0; d < NUM_DIG && dig < 0; d++) {
+        uint32_t o = d * DIG_STRIDE;
+        if ((reg_get(s, SEG2(DIG_FE_EN_CNTL + o)) & 1) &&
+            (reg_get(s, SEG2(DIG_FE_CNTL + o)) & 7) == (uint32_t)otg) {
+            dig = d;
+        }
+    }
+    if (dig < 0) {
+        return "rdna4: no signal (no encoder on the OTG)";
+    }
+    link = reg_get(s, SEG2(STREAM_MAPPER + dig)) & 7;
+    if (!s->symclk_khz[link]) {
+        return "rdna4: no signal (transmitter off)";
+    }
+    if (!pclk_hz || s->symclk_khz[link] != s->pclk_khz[otg]) {
+        return "rdna4: out of range (TMDS clock != pixel clock)";
+    }
+    vhz_milli = pclk_hz * 1000 / ((uint64_t)htot * vtot);
+    hkhz = pclk_hz / htot / 1000;
+    if (rdna4_edid_range(s, &min_v, &max_v, &min_h, &max_h, &max_pclk) &&
+        (vhz_milli < min_v * 1000ull || vhz_milli > max_v * 1000ull ||
+         hkhz < min_h || hkhz > max_h || s->pclk_khz[otg] > max_pclk)) {
+        return "rdna4: out of range";
+    }
+    return NULL;
+}
+
 /* What the display pipe would put on the wire right now. */
 static void rdna4_get_scanout(RDNA4State *s, RDNA4Scanout *so)
 {
@@ -587,6 +872,10 @@ static void rdna4_get_scanout(RDNA4State *s, RDNA4Scanout *so)
         so->width = (hb & 0x7fff) - ((hb >> 16) & 0x7fff);
         so->height = (vb & 0x7fff) - ((vb >> 16) & 0x7fff);
         so->blank = true;
+        so->nosignal = rdna4_monitor_check(s, otg);
+        if (so->nosignal) {
+            return;
+        }
 
         opp = (reg_get(s, SEG2(OPTC_DATA_SOURCE + otg * ODM_STRIDE)) >> 16) & 0xf;
         if (opp >= NUM_OTG || (reg_get(s, SEG2(DPG_CONTROL + opp * OPP_STRIDE)) & 1)) {
@@ -627,8 +916,9 @@ static void rdna4_gfx_update(void *opaque)
     rdna4_get_scanout(s, &so);
     if (memcmp(&so, &s->scanout, sizeof(so)) != 0) {
         s->scanout = so;
-        if (!so.active) {
-            ds = qemu_create_placeholder_surface(640, 480, "rdna4: no signal");
+        if (!so.active || so.nosignal) {
+            ds = qemu_create_placeholder_surface(640, 480,
+                                                 so.nosignal ? so.nosignal : "rdna4: no signal");
         } else if (so.blank) {
             ds = qemu_create_displaysurface(so.width, so.height);
             memset(surface_data(ds), 0, (size_t)surface_stride(ds) * so.height);
@@ -641,7 +931,7 @@ static void rdna4_gfx_update(void *opaque)
         dpy_gfx_update_full(s->con);
         return;
     }
-    if (!so.active || so.blank) {
+    if (!so.active || so.blank || so.nosignal) {
         return;
     }
 
@@ -807,8 +1097,26 @@ static void rdna4_reset(DeviceState *dev)
         memcpy(s->resv + RDNA4_RESV_SIZE - RDNA4_DISCOVERY_TOP, s->discovery,
                MIN(s->discovery_len, RDNA4_DISCOVERY_TOP));
     }
+    s->npending = 0;
+    memset(s->symclk_khz, 0, sizeof(s->symclk_khz));
+    memset(s->dig_mode, 0, sizeof(s->dig_mode));
+    /*
+     * The GOP left each running OTG's PLL at 60 Hz of its raster and the
+     * transmitter of each enabled DIG's link on at the same clock.
+     */
     for (int otg = 0; otg < NUM_OTG; otg++) {
+        uint64_t htot = (rdna4_otg_reg(s, otg, OTG_H_TOTAL) & 0x7fff) + 1;
+        uint64_t vtot = (rdna4_otg_reg(s, otg, OTG_V_TOTAL) & 0x7fff) + 1;
         s->otg_epoch[otg] = now;
+        s->pclk_khz[otg] = (rdna4_otg_reg(s, otg, OTG_CONTROL) & 1) ?
+                           htot * vtot * 60 / 1000 : 0;
+    }
+    for (int d = 0; d < NUM_DIG; d++) {
+        uint32_t o = d * DIG_STRIDE;
+        uint32_t otg = reg_get(s, SEG2(DIG_FE_CNTL + o)) & 7;
+        if ((reg_get(s, SEG2(DIG_FE_EN_CNTL + o)) & 1) && otg < NUM_OTG) {
+            s->symclk_khz[reg_get(s, SEG2(STREAM_MAPPER + d)) & 7] = s->pclk_khz[otg];
+        }
     }
     memset(&s->scanout, 0xff, sizeof(s->scanout));   /* force a surface update */
 }
@@ -867,6 +1175,11 @@ static void rdna4_realize(PCIDevice *dev, Error **errp)
     } else {
         dev->cap_present &= ~QEMU_PCI_CAP_EXPRESS;
     }
+    /* The card has MSI; nothing raises interrupts yet. */
+    if (msi_init(dev, 0, 1, true, false, &err) < 0) {
+        warn_report_err(err);
+        err = NULL;
+    }
 
     s->con = graphic_console_init(DEVICE(dev), 0, &rdna4_gfx_ops, s);
     memory_region_set_log(&s->vram, true, DIRTY_MEMORY_VGA);
@@ -877,6 +1190,7 @@ static void rdna4_exit(PCIDevice *dev)
     RDNA4State *s = RDNA4(dev);
 
     graphic_console_close(s->con);
+    msi_uninit(dev);
     g_free(s->regs);
     g_free(s->resv);
     g_free(s->discovery);
