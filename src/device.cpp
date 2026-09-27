@@ -1891,6 +1891,8 @@ void RDNA4Device::buildModeTable() {
 	}
 
 	currentModeId = defaultModeId = modeTable[bootIdx].id;
+	liveTiming = modeTable[bootIdx].t;
+	liveTimingValid = bootTimingValid;
 	for (size_t i = 0; i < modeCount; i++) {
 		const Modes::Mode &m = modeTable[i];
 		FBLOG("modes: id %u %ux%u@%u.%03u %u kHz%s%s", m.id, m.t.hActive, m.t.vActive,
@@ -1909,13 +1911,133 @@ const Modes::Mode *RDNA4Device::findMode(uint32_t id) const {
 	return nullptr;
 }
 
+// The VBIOS display path wired to the lit pipe: the one whose HPD pin is
+// the back-end's DIG_HPD_SELECT.
+bool RDNA4Device::pathForPipe(AtomBios::DisplayPath &out) {
+	AtomBios::DisplayPath paths[AtomBios::MaxDisplayPaths];
+	size_t n = atomBios.getDisplayPaths(paths, AtomBios::MaxDisplayPaths);
+	for (size_t i = 0; i < n; i++) {
+		AtomBios::PathRecords rec;
+		if (atomBios.getPathRecords(paths[i], rec) && rec.hasHpd && rec.hpdPin == pipe.hpd) {
+			out = paths[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+// Let `frames` frames of the lit OTG pass, by its frame counter.
+bool RDNA4Device::waitFrames(uint32_t frames) {
+	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otgOff();
+	uint32_t last = regReadDmu(2, reg) & 0xffffff;
+	for (uint32_t seen = 0, us = 0; seen < frames; us += 100) {
+		if (us > frames * 100000u)                // 100 ms per frame is 10 Hz
+			return false;
+		IODelay(100);
+		uint32_t now = regReadDmu(2, reg) & 0xffffff;
+		if (now != last) {
+			seen += (now - last) & 0xffffff;
+			last = now;
+		}
+	}
+	return true;
+}
+
+bool RDNA4Device::runPlan(const ModeSet::Plan &plan) {
+	for (size_t i = 0; i < plan.count; i++) {
+		const ModeSet::Step &s = plan.steps[i];
+		switch (s.op) {
+		case ModeSet::Op::Write:
+			regWriteDmu(s.seg, s.dword, s.value);
+			break;
+		case ModeSet::Op::Update:
+			regWriteDmu(s.seg, s.dword, (regReadDmu(s.seg, s.dword) & ~s.mask) | s.value);
+			break;
+		case ModeSet::Op::WaitSet:
+		case ModeSet::Op::WaitClear: {
+			bool ok = false;
+			for (uint32_t us = 0;; us += 10) {
+				uint32_t v = regReadDmu(s.seg, s.dword) & s.mask;
+				if (s.op == ModeSet::Op::WaitSet ? v == s.mask : v == 0) {
+					ok = true;
+					break;
+				}
+				if (us >= s.arg)
+					break;
+				IODelay(10);
+			}
+			if (!ok) {
+				FBLOG("modeset: step %lu (%s) timed out%s", static_cast<unsigned long>(i),
+				      s.what, s.optional ? ", continuing" : "");
+				if (!s.optional)
+					return false;
+			}
+			break;
+		}
+		case ModeSet::Op::Dmub:
+			if (s.arg >= plan.ncmds || !dmubSubmit(&plan.cmds[s.arg], 1, "modeset")) {
+				FBLOG("modeset: step %lu (%s): DMUB did not take the command",
+				      static_cast<unsigned long>(i), s.what);
+				return false;
+			}
+			break;
+		case ModeSet::Op::WaitFrames:
+			if (!waitFrames(s.arg)) {
+				FBLOG("modeset: step %lu (%s): the OTG is not counting frames",
+				      static_cast<unsigned long>(i), s.what);
+				return false;
+			}
+			break;
+		}
+	}
+	return true;
+}
+
 IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
-	// The HDMI mode-set engine (pixel clock + transmitter through DMUB, OTG
-	// timing, HUBP viewport) lands once the Linux ground-truth captures are
-	// in. Until then nothing on the pipe is touched.
-	FBLOG("modes: switch to id %u (%ux%u@%u.%03u) refused: mode-set engine not "
-	      "implemented yet", m.id, m.t.hActive, m.t.vActive,
-	      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000);
-	return kIOReturnUnsupported;
+	if (!pipe.valid() || !pipe.isTmds() || !liveTimingValid || !rmmio || !ipDiscovery.isValid()) {
+		FBLOG("modes: switch to id %u refused: no programmable HDMI pipe", m.id);
+		return kIOReturnUnsupported;
+	}
+	AtomBios::DisplayPath path {};
+	if (!pathForPipe(path)) {
+		FBLOG("modes: switch to id %u refused: no VBIOS path for HPD%u", m.id, pipe.hpd);
+		return kIOReturnUnsupported;
+	}
+
+	ModeSet::Target t {};
+	t.otg = pipe.otg;
+	t.dig = pipe.dig;
+	t.link = pipe.link;
+	t.hpd = pipe.hpd;
+	t.opp = pipe.opp;
+	t.hubp = pipe.hubp;
+	t.encoderObjId = path.encoderObjId;
+	t.connectorObjId = path.connectorObjId;
+	t.pllId = 0x14;                  // ATOM_COMBOPHY_PLL0, amdgpu's first free PLL
+	t.from = liveTiming;
+	t.to = m.t;
+	const char *why = "";
+	if (!ModeSet::build(t, modePlan, &why)) {
+		FBLOG("modes: switch to id %u refused: %s", m.id, why);
+		return kIOReturnUnsupported;
+	}
+	FBLOG("modes: switching to id %u %ux%u@%u.%03u (%u kHz, vstartup %u): %lu steps, "
+	      "%lu DMUB commands", m.id, m.t.hActive, m.t.vActive, m.refreshMilliHz / 1000,
+	      m.refreshMilliHz % 1000, m.t.pixelClockKHz, ModeSet::vstartupLines(m.t),
+	      static_cast<unsigned long>(modePlan.count), static_cast<unsigned long>(modePlan.ncmds));
+	if (runPlan(modePlan)) {
+		liveTiming = m.t;
+		FBLOG("modes: now %ux%u@%u.%03u", m.t.hActive, m.t.vActive,
+		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000);
+		return kIOReturnSuccess;
+	}
+
+	// Put the previous timing back so the display is not left dark.
+	t.from = m.t;
+	t.to = liveTiming;
+	bool restored = ModeSet::build(t, modePlan, &why) && runPlan(modePlan);
+	FBLOG("modes: switch to id %u failed, previous mode %s", m.id,
+	      restored ? "restored" : "NOT restored");
+	return kIOReturnIOError;
 }
 

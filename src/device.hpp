@@ -25,6 +25,7 @@
 #include "dmub.hpp"
 #include "ipdiscovery.hpp"
 #include "modes.hpp"
+#include "modeset.hpp"
 #include "pipe.hpp"
 
 class RDNA4Device {
@@ -66,8 +67,8 @@ public:
 	// Physical image size from the EDID. 0 = unknown.
 	uint32_t    imageWidthMm { 0 }, imageHeightMm { 0 };
 	const Modes::Mode *findMode(uint32_t id) const;
-	// Program mode `m` on the lit pipe. Returns an error (and leaves the
-	// pipe untouched) until the mode-set engine exists.
+	// Program mode `m` on the lit HDMI pipe (modeset.hpp). On failure the
+	// previous timing is programmed back and an error returned.
 	IOReturn applyMode(const Modes::Mode &m);
 
 	// Display power (DPMS). Off = disable the DP video stream and put the
@@ -172,6 +173,14 @@ private:
 	void ensureUpdateLatch();
 
 	void buildModeTable();
+
+	// The timing on the pipe now: the boot timing, then each mode applied.
+	Edid::DetailedTiming liveTiming {};
+	bool liveTimingValid { false };
+	ModeSet::Plan modePlan {};
+	bool pathForPipe(AtomBios::DisplayPath &out);
+	bool runPlan(const ModeSet::Plan &plan);
+	bool waitFrames(uint32_t frames);
 };
 
 #endif /* RDNA4Device_hpp */

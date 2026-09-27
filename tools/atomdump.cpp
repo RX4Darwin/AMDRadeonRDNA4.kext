@@ -21,8 +21,10 @@
 #include "../src/dmub.hpp"
 #include "../src/pipe.hpp"
 #include "../src/ndrv.hpp"
+#include "../src/modeset.hpp"
 
 #include <cstdarg>
+#include <cstdint>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -885,6 +887,183 @@ static int testDmubPayloads() {
 
 // --- NDRV csc translator -----------------------------------------------------
 
+// --- HDMI modeset plan -------------------------------------------------------
+
+// A register file the plan runs against: writes land, polls are skipped.
+struct PlanRegs {
+	struct R { uint8_t seg; uint32_t dw, v; };
+	std::vector<R> regs;
+	uint32_t get(uint8_t seg, uint32_t dw) const {
+		for (const R &r : regs)
+			if (r.seg == seg && r.dw == dw)
+				return r.v;
+		return 0;
+	}
+	void set(uint8_t seg, uint32_t dw, uint32_t v) {
+		for (R &r : regs)
+			if (r.seg == seg && r.dw == dw) {
+				r.v = v;
+				return;
+			}
+		regs.push_back({ seg, dw, v });
+	}
+	static uint32_t read(void *ctx, uint8_t seg, uint32_t dw) {
+		return static_cast<PlanRegs *>(ctx)->get(seg, dw);
+	}
+	void run(const ModeSet::Plan &p) {
+		for (size_t i = 0; i < p.count; i++) {
+			const ModeSet::Step &s = p.steps[i];
+			if (s.op == ModeSet::Op::Write)
+				set(s.seg, s.dword, s.value);
+			else if (s.op == ModeSet::Op::Update)
+				set(s.seg, s.dword, (get(s.seg, s.dword) & ~s.mask) | s.value);
+		}
+	}
+};
+
+// The last write to `dw` in the plan (its final value).
+static const ModeSet::Step *findWrite(const ModeSet::Plan &p, uint32_t dw, size_t *at = nullptr) {
+	const ModeSet::Step *last = nullptr;
+	for (size_t i = 0; i < p.count; i++)
+		if (p.steps[i].op == ModeSet::Op::Write && p.steps[i].dword == dw) {
+			if (at)
+				*at = i;
+			last = &p.steps[i];
+		}
+	return last;
+}
+
+static int testModeSet() {
+	int failures = 0;
+	Edid::DetailedTiming t1080 {}, t720 {};
+	t1080.pixelClockKHz = 148500;
+	t1080.hActive = 1920; t1080.hBlank = 280; t1080.hSyncOffset = 88; t1080.hSyncWidth = 44;
+	t1080.vActive = 1080; t1080.vBlank = 45; t1080.vSyncOffset = 4; t1080.vSyncWidth = 5;
+	t1080.hSyncPositive = t1080.vSyncPositive = true;
+	t720.pixelClockKHz = 74250;                 // CEA VIC 4
+	t720.hActive = 1280; t720.hBlank = 370; t720.hSyncOffset = 110; t720.hSyncWidth = 40;
+	t720.vActive = 720; t720.vBlank = 30; t720.vSyncOffset = 5; t720.vSyncWidth = 5;
+	t720.hSyncPositive = t720.vSyncPositive = true;
+
+	// The emulated card's (and the recorded board's) HDMI pipe: OTG0 / OPP0 /
+	// HUBP0, DIG2 -> link 2 (UNIPHYC), HPD3, VBIOS path 0x330c / 0x2120.
+	ModeSet::Target t {};
+	t.otg = 0; t.dig = 2; t.link = 2; t.hpd = 3; t.opp = 0; t.hubp = 0;
+	t.encoderObjId = 0x2120; t.connectorObjId = 0x330c; t.pllId = 0x14;
+	t.from = t1080; t.to = t720;
+
+	static ModeSet::Plan plan;
+	const char *why = "";
+	if (!ModeSet::build(t, plan, &why))
+		return check(false, "modeset: 1080p -> 720p plan refused: %s", why);
+	failures += check(plan.ncmds == 4, "modeset: %zu DMUB commands, expected 4", plan.ncmds);
+
+	// DMUB payloads, in amdgpu's order: transmitter off, PLL, stream setup,
+	// transmitter on.
+	const Dmub::Cmd &off = plan.cmds[0], &pll = plan.cmds[1], &enc = plan.cmds[2], &on = plan.cmds[3];
+	failures += check(off[0] == 0x3c000180 && off[1] == 0x00030002 && (off[3] & 0xffff) == 0x0003 &&
+	                  ((off[3] >> 16) & 0xff) == 0x0c,
+	                  "modeset: transmitter disable %08x %08x %08x %08x", off[0], off[1], off[2], off[3]);
+	failures += check(pll[0] == 0x10000280 && pll[1] == 742500 && pll[2] == 0x00032014 &&
+	                  (pll[3] & 0xff) == 0,
+	                  "modeset: set pixel clock %08x %08x %08x %08x", pll[0], pll[1], pll[2], pll[3]);
+	failures += check(enc[0] == 0x0c000080 && enc[1] == 0x04030f02 && enc[2] == 7425,
+	                  "modeset: stream setup %08x %08x %08x", enc[0], enc[1], enc[2]);
+	failures += check(on[0] == 0x3c000180 && on[1] == 0x04030102 && on[2] == 7425 &&
+	                  (on[3] & 0xff) == 3,
+	                  "modeset: transmitter enable %08x %08x %08x %08x", on[0], on[1], on[2], on[3]);
+
+	// Timing images match amdgpu's for VIC 4 (optc1_program_timing).
+	struct { uint32_t dw, want; const char *name; } timing[] = {
+		{ 0x1b2a, 0x00000671, "h total" },   { 0x1b2b, 0x01040604, "h blank" },
+		{ 0x1b2c, 0x00280000, "h sync" },    { 0x1b2f, 0x000002ed, "v total" },
+		{ 0x1b38, 0x001902e9, "v blank" },   { 0x1b39, 0x00050000, "v sync" },
+		{ 0x05eb, 0x02d00500, "viewport" },  { 0x0d1f, 0x02d00500, "recout" },
+		{ 0x0d20, 0x02d00500, "mpc size" },  { 0x1856, 0x050002d0, "dpg size" },
+	};
+	for (auto &e : timing) {
+		const ModeSet::Step *s = findWrite(plan, e.dw);
+		failures += check(s && s->value == e.want, "modeset: %s = 0x%08x, expected 0x%08x",
+		                  e.name, s ? s->value : 0, e.want);
+	}
+	// VTG: VCOUNT_INIT = active end (745), FP2 = VSTARTUP - (blank end + 1).
+	const ModeSet::Step *vtg = findWrite(plan, 0x0530);
+	uint32_t vstartup = ModeSet::vstartupLines(t720);
+	failures += check(vtg && vtg->value == ((745u << 16) | (vstartup - 26)),
+	                  "modeset: vtg params 0x%08x (vstartup %u)", vtg ? vtg->value : 0, vstartup);
+
+	// Timing is written with the OTG stopped and the DMUB PLL command sent
+	// before the OTG runs again.
+	size_t hTotalAt = 0, otgOff = SIZE_MAX, otgOn = SIZE_MAX, pllAt = SIZE_MAX;
+	findWrite(plan, 0x1b2a, &hTotalAt);
+	for (size_t i = 0; i < plan.count; i++) {
+		const ModeSet::Step &s = plan.steps[i];
+		if (s.op == ModeSet::Op::Update && s.dword == 0x1b43 && (s.mask & 1))
+			(s.value & 1 ? otgOn : otgOff) = i;
+		if (s.op == ModeSet::Op::Dmub && s.arg == 1)
+			pllAt = i;
+	}
+	failures += check(otgOff < pllAt && pllAt < hTotalAt && hTotalAt < otgOn,
+	                  "modeset: order otg-off %zu, pll %zu, timing %zu, otg-on %zu",
+	                  otgOff, pllAt, hTotalAt, otgOn);
+
+	// Run it against the GOP-lit pipe: discovery must find the same pipe
+	// with the new raster.
+	PlanRegs regs;
+	OtgTiming::Regs rg {};
+	OtgTiming::compute(t1080, rg);
+	regs.set(2, 0x1b43, 0x00010001);
+	regs.set(2, 0x1b2a, rg.hTotal); regs.set(2, 0x1b2b, rg.hBlankStartEnd); regs.set(2, 0x1b2c, rg.hSyncA);
+	regs.set(2, 0x1b2f, rg.vTotal); regs.set(2, 0x1b38, rg.vBlankStartEnd); regs.set(2, 0x1b39, rg.vSyncA);
+	const uint32_t d2 = 2 * Pipe::Reg::kDigStride;
+	regs.set(2, Pipe::Reg::kDigFeCntl + d2, 0);
+	regs.set(2, Pipe::Reg::kDigFeEnCntl + d2, 1);
+	regs.set(2, Pipe::Reg::kDigFeClkCntl + d2, 0x13);
+	regs.set(2, Pipe::Reg::kStreamMapper + 2, 2);
+	regs.set(2, Pipe::Reg::kDigBeCntl + d2, (1u << 10) | (3u << 28));
+	regs.set(2, Pipe::Reg::kDigBeClkCntl + d2, 0x13);
+	for (uint32_t m = 0; m < 4; m++)
+		regs.set(3, Pipe::Reg::kMpccOppId + m * Pipe::Reg::kMpccStride, m == 0 ? 0 : 0xf);
+	regs.set(2, Pipe::Reg::kHubpViewportDim, 1920 | (1080u << 16));
+	regs.set(2, Pipe::Reg::kHubpSurfacePitch, 1919);
+	regs.run(plan);
+	// The model's OTG_CONTROL mirrors MASTER_EN into CURRENT_MASTER_EN_STATE.
+	regs.set(2, 0x1b43, regs.get(2, 0x1b43) | ((regs.get(2, 0x1b43) & 1) << 16));
+
+	Pipe::State s;
+	Edid::DetailedTiming back {};
+	bool found = Pipe::discover(&PlanRegs::read, &regs, s) && Pipe::timingFromOtg(s, back);
+	failures += check(found && s.otg == 0 && s.dig == 2 && s.link == 2 && s.hpd == 3 &&
+	                  s.opp == 0 && s.hubp == 0 && s.signal == Pipe::Signal::Hdmi,
+	                  "modeset: pipe after the plan otg=%u dig=%u link=%u hpd=%u opp=%u hubp=%u",
+	                  s.otg, s.dig, s.link, s.hpd, s.opp, s.hubp);
+	failures += check(found && back.hActive == 1280 && back.vActive == 720 &&
+	                  back.hBlank == 370 && back.hSyncOffset == 110 && back.hSyncWidth == 40 &&
+	                  back.vBlank == 30 && back.vSyncOffset == 5 && back.vSyncWidth == 5 &&
+	                  s.viewportW == 1280 && s.viewportH == 720 && s.pitchPx == 1920,
+	                  "modeset: pipe reads back %ux%u (viewport %ux%u pitch %u)",
+	                  back.hActive, back.vActive, s.viewportW, s.viewportH, s.pitchPx);
+	failures += check((regs.get(2, 0x1854) & 1) == 0 && (regs.get(2, 0x20a8 + d2) & 1) == 0 &&
+	                  (regs.get(2, 0x209b + d2) & 1) == 1 && (regs.get(2, 0x1b89) & 1) == 0,
+	                  "modeset: left blanked/muted/locked (dpg 0x%x gc 0x%x fifo 0x%x lock 0x%x)",
+	                  regs.get(2, 0x1854), regs.get(2, 0x20a8 + d2), regs.get(2, 0x209b + d2),
+	                  regs.get(2, 0x1b89));
+
+	const size_t steps = plan.count, cmds = plan.ncmds;
+
+	// Refusals: interlaced targets and clocks beyond single-link TMDS.
+	ModeSet::Target bad = t;
+	bad.to.interlaced = true;
+	failures += check(!ModeSet::build(bad, plan, &why), "modeset: interlaced target accepted");
+	bad = t;
+	bad.to.pixelClockKHz = 594000;
+	failures += check(!ModeSet::build(bad, plan, &why), "modeset: 594 MHz target accepted");
+
+	printf("\nmodeset: 1080p60 -> 720p60 on OTG0/DIG2/UNIPHYC: %zu steps, %zu DMUB commands, "
+	       "vstartup %u %s\n", steps, cmds, vstartup, failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
 struct FakeBackend {
 	uint64_t base = 0xc0000000ull;
 	uint32_t pitch = 1920 * 4, w = 1920, h = 1080;
@@ -1018,7 +1197,8 @@ static int testNdrv() {
 	failures += check(tr.status(Ndrv::cscGetVideoParameters, &vpr, ret) && ret == Ndrv::kBadArgument,
 	                  "ndrv: second depth not refused");
 
-	// Mode timing: valid + safe everywhere, default on the boot mode only.
+	// Mode timing: valid + safe everywhere, default on the boot mode only
+	// (without "safe", macOS 26 scales the default mode instead of switching).
 	Ndrv::VDTimingInfoRec ti {};
 	ti.csTimingMode = Ndrv::kBootModeId;
 	failures += check(tr.status(Ndrv::cscGetModeTiming, &ti, ret) && ret == Ndrv::kSuccess &&
@@ -1337,6 +1517,7 @@ int main(int argc, char **argv) {
 	failures += testPipeDiscovery();
 	failures += testDmubPayloads();
 	failures += testNdrv();
+	failures += testModeSet();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

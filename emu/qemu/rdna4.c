@@ -89,6 +89,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define OTG_STATUS           0x1b49     /* V_BLANK [0] */
 #define OTG_FRAME_COUNT      0x1b4d     /* [23:0] */
 #define OTG_MASTER_UPDATE_LOCK 0x1b89   /* LOCK [0], UPDATE_LOCK_STATUS [8] */
+#define OTG_CLOCK_CONTROL    0x1b84     /* EN [0], GATE_DIS [1], CLOCK_ON [8], BUSY [16] */
+#define OPTC_INPUT_CLOCK     0x1ad0     /* GATE_DIS [0], EN [1], CLK_ON [2] */
 #define ODM_STRIDE           0x10
 #define OPTC_DATA_SOURCE     0x1acb     /* SEG0_SRC_SEL [19:16] = OPP */
 /* OPP (seg2) */
@@ -106,7 +108,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 /* DIG front-/back-ends (seg2) */
 #define DIG_STRIDE           0x124
 #define DIG_FE_CNTL          0x2093     /* SOURCE_SELECT [2:0] = OTG */
+#define DIG_FE_CLK_CNTL      0x2094     /* FE_MODE [2:0], FE_CLK_EN [4] */
 #define DIG_FE_EN_CNTL       0x2095     /* ENABLE [0] */
+#define DIG_FIFO_CTRL0       0x209b     /* ENABLE [0], RESET [1], RESET_DONE [20] */
+#define DIG_HDMI_GC          0x20a8     /* AVMUTE [0] */
+#define DIG_BE_CLK_CNTL      0x20bb     /* BE_MODE [2:0], BE_CLK_EN [4] */
+#define DIG_BE_CNTL          0x20bc     /* FE_SOURCE_SELECT [14:8] */
+#define DIG_BE_EN_CNTL       0x20bd     /* BE_ENABLE [0] */
+#define DIG_MODE_HDMI        3
+#define DPP_STRIDE           0x16b
+#define DSCL_RECOUT_SIZE     0x0d1f     /* WIDTH [13:0], HEIGHT [29:16] */
 #define STREAM_MAPPER        0x1f0d     /* + dig: LINK_TARGET [2:0] */
 #define NUM_DIG              4
 #define NUM_PHY              8
@@ -352,6 +363,8 @@ static uint32_t rdna4_otg_read(RDNA4State *s, int otg, uint32_t dw)
         return (val & ~(1u << 16)) | ((val & 1) << 16);
     case OTG_MASTER_UPDATE_LOCK:
         return (val & ~(1u << 8)) | ((val & 1) << 8);
+    case OTG_CLOCK_CONTROL:                        /* running when enabled, never busy */
+        return (val & ~((1u << 8) | (1u << 16))) | ((val & 1) << 8);
     case OTG_FRAME_COUNT:
         if (rdna4_otg_position(s, otg, &frame, &line)) {
             return (val & ~0xffffffu) | (frame & 0xffffff);
@@ -703,7 +716,15 @@ static uint64_t rdna4_mmio_read(void *opaque, hwaddr addr, unsigned size)
         val = RDNA4_VRAM_MB;
     } else if (dw >= DMU_SEG2 && dw < DMU_SEG3) {
         uint32_t d2 = dw - DMU_SEG2;
-        if (d2 >= OTG_H_TOTAL && d2 < OTG_H_TOTAL + NUM_OTG * OTG_STRIDE) {
+        if (d2 >= OPTC_INPUT_CLOCK && d2 < OPTC_INPUT_CLOCK + NUM_OTG * ODM_STRIDE &&
+            (d2 - OPTC_INPUT_CLOCK) % ODM_STRIDE == 0) {
+            val = reg_get(s, addr);
+            val = (val & ~(1u << 2)) | (((val >> 1) & 1) << 2);   /* CLK_ON follows EN */
+        } else if (d2 >= DIG_FIFO_CTRL0 && d2 < DIG_FIFO_CTRL0 + NUM_DIG * DIG_STRIDE &&
+                   (d2 - DIG_FIFO_CTRL0) % DIG_STRIDE == 0) {
+            val = reg_get(s, addr);
+            val = (val & ~(1u << 20)) | (((val >> 1) & 1) << 20); /* RESET_DONE follows RESET */
+        } else if (d2 >= OTG_H_TOTAL && d2 < OTG_H_TOTAL + NUM_OTG * OTG_STRIDE) {
             uint32_t otg = (d2 - OTG_H_TOTAL) / OTG_STRIDE;
             val = rdna4_otg_read(s, otg, d2 - otg * OTG_STRIDE);
         } else if (rdna4_is_i2c(d2)) {
@@ -819,7 +840,7 @@ static bool rdna4_edid_range(RDNA4State *s, uint32_t *min_v, uint32_t *max_v,
  * clock (TMDS, 8 bpc: symbol clock = pixel clock), and a raster inside the
  * EDID's range limits.
  */
-static const char *rdna4_monitor_check(RDNA4State *s, int otg)
+static const char *rdna4_monitor_check(RDNA4State *s, int otg, int *dig_out)
 {
     uint32_t htot = (rdna4_otg_reg(s, otg, OTG_H_TOTAL) & 0x7fff) + 1;
     uint32_t vtot = (rdna4_otg_reg(s, otg, OTG_V_TOTAL) & 0x7fff) + 1;
@@ -837,7 +858,29 @@ static const char *rdna4_monitor_check(RDNA4State *s, int otg)
     if (dig < 0) {
         return "rdna4: no signal (no encoder on the OTG)";
     }
+    *dig_out = dig;
+    if (!(rdna4_otg_reg(s, otg, OTG_CLOCK_CONTROL) & 1) ||
+        !(reg_get(s, SEG2(OPTC_INPUT_CLOCK + otg * ODM_STRIDE)) & 2)) {
+        return "rdna4: no signal (OTG clock off)";
+    }
+    {
+        uint32_t o = dig * DIG_STRIDE;
+        uint32_t fe_clk = reg_get(s, SEG2(DIG_FE_CLK_CNTL + o));
+        if ((fe_clk & 7) != DIG_MODE_HDMI || !(fe_clk & 0x10) ||
+            !(reg_get(s, SEG2(DIG_FIFO_CTRL0 + o)) & 1)) {
+            return "rdna4: no signal (stream encoder off)";
+        }
+    }
     link = reg_get(s, SEG2(STREAM_MAPPER + dig)) & 7;
+    {
+        uint32_t o = link * DIG_STRIDE;
+        uint32_t be_clk = reg_get(s, SEG2(DIG_BE_CLK_CNTL + o));
+        if ((be_clk & 7) != DIG_MODE_HDMI || !(be_clk & 0x10) ||
+            !(reg_get(s, SEG2(DIG_BE_EN_CNTL + o)) & 1) ||
+            !(reg_get(s, SEG2(DIG_BE_CNTL + o)) & (1u << (8 + dig)))) {
+            return "rdna4: no signal (link encoder off)";
+        }
+    }
     if (!s->symclk_khz[link]) {
         return "rdna4: no signal (transmitter off)";
     }
@@ -861,7 +904,7 @@ static void rdna4_get_scanout(RDNA4State *s, RDNA4Scanout *so)
     for (int otg = 0; otg < NUM_OTG; otg++) {
         uint32_t hb, vb, opp, pitch, hp;
         uint64_t addr, fb;
-        int hubp = -1;
+        int hubp = -1, dig = -1;
 
         if (!(rdna4_otg_reg(s, otg, OTG_CONTROL) & 1)) {
             continue;
@@ -872,9 +915,12 @@ static void rdna4_get_scanout(RDNA4State *s, RDNA4Scanout *so)
         so->width = (hb & 0x7fff) - ((hb >> 16) & 0x7fff);
         so->height = (vb & 0x7fff) - ((vb >> 16) & 0x7fff);
         so->blank = true;
-        so->nosignal = rdna4_monitor_check(s, otg);
+        so->nosignal = rdna4_monitor_check(s, otg, &dig);
         if (so->nosignal) {
             return;
+        }
+        if (reg_get(s, SEG2(DIG_HDMI_GC + dig * DIG_STRIDE)) & 1) {
+            return;                                /* AV mute: the sink shows black */
         }
 
         opp = (reg_get(s, SEG2(OPTC_DATA_SOURCE + otg * ODM_STRIDE)) >> 16) & 0xf;
@@ -890,6 +936,14 @@ static void rdna4_get_scanout(RDNA4State *s, RDNA4Scanout *so)
             return;
         }
         hp = hubp * HUBP_STRIDE;
+        /* no scaler in the model: the fetched viewport and the scaler's
+         * output rectangle have to be the raster's active size */
+        if (reg_get(s, SEG2(HUBP_VIEWPORT_DIM + hp)) != ((so->width & 0x3fff) | (so->height << 16)) ||
+            reg_get(s, SEG2(DSCL_RECOUT_SIZE + hubp * DPP_STRIDE)) !=
+                ((so->width & 0x3fff) | (so->height << 16))) {
+            so->nosignal = "rdna4: pipe misprogrammed (viewport/recout != timing)";
+            return;
+        }
         addr = ((uint64_t)(reg_get(s, SEG2(HUBP_SURFACE_ADDR_HI + hp)) & 0xffff) << 32) |
                reg_get(s, SEG2(HUBP_SURFACE_ADDR + hp));
         fb = (uint64_t)(reg_get(s, SEG2(DCN_VM_FB_LOC_BASE)) & 0xffffff) << 24;

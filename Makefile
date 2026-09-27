@@ -50,6 +50,7 @@ CXX_SRCS := \
 	src/plugin.cpp \
 	src/device.cpp \
 	src/ndrv.cpp \
+	src/modeset.cpp \
 	$(LILU)/Library/plugin_start.cpp \
 	src/atombios.cpp \
 	src/ipdiscovery.cpp \
@@ -118,9 +119,9 @@ FIRMWARE := firmware/Sapphire.RX9070XT.16384.241213.rom
 .PHONY: all clean test
 all: $(KEXT)
 
-$(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp
+$(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp
 	@mkdir -p $(BUILD)
-	$(CXX) -std=c++17 -Wall -O2 -o $@ tools/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp
+	$(CXX) -std=c++17 -Wall -O2 -o $@ tools/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp src/modeset.cpp
 
 atomdump: $(ATOMDUMP)
 

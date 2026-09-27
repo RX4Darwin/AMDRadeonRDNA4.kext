@@ -190,7 +190,11 @@ int32_t Translator::getModeTiming(VDTimingInfoRec &r) const {
 	// comes from cscGetDetailedTiming, which it asks for independently.
 	r.csTimingFormat = kDeclROMtables;
 	r.csTimingData   = kTimingInvalid;
-	r.csTimingFlags  = kDisplayModeValidFlag | kDisplayModeSafeFlag;
+	// Every mode is valid and safe. A mode without the safe flag is not
+	// switched to on macOS 26: WindowServer offers it as a scaled rendering
+	// of the default mode instead ("Using a scaled resolution..."), so the
+	// driver would never see the switch.
+	r.csTimingFlags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
 	if (m->id == bootModeId)
 		r.csTimingFlags |= kDisplayModeDefaultFlag;
 	return kSuccess;
