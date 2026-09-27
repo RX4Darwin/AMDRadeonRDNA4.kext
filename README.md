@@ -242,6 +242,38 @@ it restarts. With Remote Login on and a key authorised,
 `REMOTE_USER=<account> tools/logs-ssh.sh` pulls the RDNA4FB log and registry
 properties back.
 
+### Emulated RX 9070 XT (no card needed, no VMTEST shortcuts)
+
+`emu/` holds a QEMU model of the card, so the **bare-metal build** runs its
+real code paths in the same OSX-KVM VM:
+
+- `emu/qemu/rdna4.c` — in-tree QEMU 10.0 PCI device `rdna4`: the card's PCI
+  identity (1002:7550, subsystem 1DA2:E489) and BAR layout, a 256 MiB VRAM
+  aperture plus MM_INDEX/MM_DATA access to the top of VRAM (where the IP
+  discovery copy sits), a BAR5 register file loaded from
+  `emu/qemu/gop-state.txt` (the state the GOP leaves; same format as
+  `tools/linux-capture.sh` register dumps — the current file is synthesized,
+  a real capture drops in), and live engines for what the kext polls: OTG
+  frame counter, DC_I2C with an EDID on HDMI line 2, DP AUX with nothing
+  attached, RCC_CONFIG_MEMSIZE. The QEMU console scans out whatever the
+  HUBP/OTG registers describe; the OPP pattern generator blanks it.
+- `emu/efi/RdnaGopDxe` — small EFI GOP driver for the device's option ROM,
+  which is the card's real legacy AtomBIOS image followed by this driver
+  (OVMF skips the legacy image, the kext reads it as on hardware).
+
+```sh
+tools/emu-build.sh        # QEMU 10.0.13 + device, edk2 BaseTools + GOP driver, build-emu/rdna4.rom
+tools/vm-opencore.sh --kext build/RDNA4FB.kext --lilu ~/kexts/Lilu.kext \
+    --out OpenCore-emu.qcow2 --args "-v keepsyms=1 debug=0x100 serial=3 rdna4-trace=1"
+tools/emu-boot.sh         # the VM on the emulated card (VNC :0, serial ~/tahoe-serial.log)
+```
+
+`tools/emu-boot.sh trace=on` logs every BAR5 access to the QEMU log. The
+device sits on the root bus: behind a `pcie-root-port`, macOS's PCI
+configurator closed the port's windows at boot. The QEMU device is
+GPL-2.0-or-later (QEMU's license) and the GOP driver BSD-2-Clause-Patent
+(edk2's); the rest of the repo stays BSD-3-Clause.
+
 ## Roadmap — from "framebuffer" to "real driver"
 
 Rough order of increasing difficulty. Each step needs iteration on the actual

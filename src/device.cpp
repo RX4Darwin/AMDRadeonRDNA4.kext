@@ -1701,6 +1701,14 @@ void RDNA4Device::probeMemSize() {
 
 	FBLOG("mmio: VRAM size %u MiB (RCC_CONFIG_MEMSIZE @ 0x%x)", memsizeMB, off);
 	owner->setProperty("VRAM,TotalMB", static_cast<uint64_t>(memsizeMB), 32);
+	// System Information's "VRAM (Total)" comes from these properties on the
+	// GPU's PCI device; without them macOS shows the framebuffer size (the
+	// "7 MB" of an unsupported card). The register counts usable VRAM, i.e.
+	// the nominal size minus firmware reservations: report the whole GiB.
+	uint64_t nominalMB = (static_cast<uint64_t>(memsizeMB) + 1023) / 1024 * 1024;
+	uint64_t nominalBytes = nominalMB << 20;
+	pciDevice->setProperty("VRAM,totalMB", nominalMB, 32);
+	pciDevice->setProperty("VRAM,totalsize", &nominalBytes, sizeof(nominalBytes));
 	// Independent confirmation that register MMIO works — the gate for all
 	// future DCN (AUX/EDID, mode setting) work. The register reports usable
 	// VRAM (nominal size minus firmware reservations: 16304 on this 16 GiB

@@ -3,10 +3,11 @@
 # RDNA4FB the way a real Hackintosh does: injected by OpenCore after Lilu.
 #
 #   tools/vm-opencore.sh [--kext build-vmtest/RDNA4FB.kext] [--lilu path/Lilu.kext]
-#                        [--args "<boot-args>"] [--resolution WxH]
+#                        [--args "<boot-args>"] [--resolution WxH] [--out NAME.qcow2]
 #
 # Starts from the stock $OSXKVM/OpenCore/OpenCore.qcow2 every time and writes
-# $OSXKVM/OpenCore/OpenCore-dev.qcow2 (boot the VM with that file). Changes:
+# $OSXKVM/OpenCore/OpenCore-dev.qcow2, or --out NAME in that directory (boot
+# the VM with that file; tools/emu-boot.sh uses OpenCore-emu.qcow2). Changes:
 #   - boot-args (default: verbose + kernel log on the serial port),
 #   - picker waits for a choice, WhateverGreen disabled,
 #   - GOP resolution (default 1920x1080, a 1080p monitor like the test
@@ -25,12 +26,14 @@ ARGS="-v keepsyms=1 debug=0x100 serial=3"
 KEXT=""
 LILU=""
 RES="1920x1080"
+OUTIMG="OpenCore-dev.qcow2"
 while [ $# -gt 0 ]; do
 	case $1 in
 		--kext) KEXT=$(realpath "$2"); shift ;;
 		--lilu) LILU=$(realpath "$2"); shift ;;
 		--args) ARGS=$2; shift ;;
 		--resolution) RES=$2; shift ;;
+		--out) OUTIMG=$(basename "$2"); shift ;;
 		*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 	shift
@@ -66,6 +69,6 @@ mcopy -o -i "$IMG" "$TMP/config.plist" ::/EFI/OC/config.plist
 mcopy -n -o -i "$IMG" ::/EFI/OC/config.plist "$TMP/config.check"
 cmp -s "$TMP/config.plist" "$TMP/config.check" || { echo "config.plist write-back mismatch" >&2; exit 1; }
 
-qemu-img convert -O qcow2 "$TMP/oc.raw" OpenCore-dev.new.qcow2
-mv -f OpenCore-dev.new.qcow2 OpenCore-dev.qcow2
-echo "built $OSXKVM/OpenCore/OpenCore-dev.qcow2"
+qemu-img convert -O qcow2 "$TMP/oc.raw" "$OUTIMG.new"
+mv -f "$OUTIMG.new" "$OUTIMG"
+echo "built $OSXKVM/OpenCore/$OUTIMG"

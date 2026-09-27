@@ -1,0 +1,39 @@
+## @file
+#  GOP driver for the emulated RX 9070 XT (QEMU `rdna4` device): exposes the
+#  scanout the device powers on with (1920x1080 BGRX at BAR0 offset 0) as
+#  the Graphics Output Protocol. Lives in the device's option ROM.
+#
+#  Derived from UefiPayloadPkg/GraphicsOutputDxe.
+#  Copyright (c) 2016, Intel Corporation. All rights reserved.<BR>
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = RdnaGopDxe
+  FILE_GUID                      = 5D1A2C4E-9B7F-4D3A-8E61-2F0C9A7B4D15
+  MODULE_TYPE                    = UEFI_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = RdnaGopEntry
+
+[Sources.common]
+  RdnaGop.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  DebugLib
+  MemoryAllocationLib
+  BaseMemoryLib
+  DevicePathLib
+  FrameBufferBltLib
+  UefiLib
+
+[Protocols]
+  gEfiGraphicsOutputProtocolGuid                ## BY_START
+  gEfiDevicePathProtocolGuid                    ## BY_START
+  gEfiPciIoProtocolGuid                         ## TO_START
