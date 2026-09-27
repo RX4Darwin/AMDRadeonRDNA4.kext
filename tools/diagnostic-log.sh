@@ -103,7 +103,7 @@ gated() {
 
 	gated "mode-setting survey" 'RDNA4FB: mode:' modedump
 
-	# Any stage (rdna4-compute=1..6), so not a gated "=1" section.
+	# Any stage (rdna4-compute=1..7), so not a gated "=1" section.
 	section "compute bring-up (rdna4-compute=<stage>)"
 	dmesg | grep -E 'RDNA4FB: compute:' || \
 		echo "(no compute lines — add rdna4-compute=1 to boot-args)"

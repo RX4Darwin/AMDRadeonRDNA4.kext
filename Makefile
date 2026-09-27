@@ -56,6 +56,7 @@ CXX_SRCS := \
 	src/psp.cpp \
 	src/sdma.cpp \
 	src/pm4.cpp \
+	src/codeobj.cpp \
 	$(LILU)/Library/plugin_start.cpp \
 	src/atombios.cpp \
 	src/ipdiscovery.cpp \

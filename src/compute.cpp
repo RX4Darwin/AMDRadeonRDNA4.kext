@@ -7,10 +7,12 @@
 //  pool in VRAM — never DCN, the MM hub or the scanout.
 //
 
+#include "codeobj.hpp"
 #include "compute.hpp"
 #include "pm4.hpp"
 #include "probe_kernel.h"
 #include "sdma.hpp"
+#include "vadd_codeobj.h"
 
 #include <kern/clock.h>
 
@@ -78,7 +80,7 @@ uint32_t RDNA4Compute::requestedStage() {
 	uint32_t stage = 0;
 	if (!PE_parse_boot_argn("rdna4-compute", &stage, sizeof(stage)))
 		return StageOff;
-	return stage > StageDispatch ? StageDispatch : stage;
+	return stage > StageKernel ? StageKernel : stage;
 }
 
 uint32_t RDNA4Compute::rd(uint16_t hwId, const Reg &r) const {
@@ -452,6 +454,11 @@ void RDNA4Compute::runStages() {
 		if (!stageDispatch())
 			return stop("stage 6 (dispatch)");
 		done = StageDispatch;
+	}
+	if (target >= StageKernel) {
+		if (!stageKernel())
+			return stop("stage 7 (kernel)");
+		done = StageKernel;
 	}
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
 	snprintf(note, sizeof(note), "finished at stage %u", done);
@@ -1311,8 +1318,65 @@ uint32_t RDNA4Compute::shAbs(const Reg &r) const {
 
 // The shape of amdgpu's run_shader (gfx_v9_4_2): SET_SH_REG the program,
 // its resources and user data, DISPATCH_DIRECT; with gfx_v12_0's
-// ACQUIRE_MEM first (the code was just written by the CPU) and its
-// RELEASE_MEM fence after. VMID0, wave32, 4 groups of 64 work-items.
+// ACQUIRE_MEM first (code and inputs were just written by the CPU) and its
+// RELEASE_MEM fence after (GL2 written back, so the CPU reads the results).
+bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
+	*poolDw(kPm4FenceOffset) = 0;
+	flushHdp();
+
+	// Shader memory model for VMID0 (gfx_v12_0_constants_init).
+	grbmSelect(0, 0, 0, 0);
+	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
+
+	const uint32_t pgm[2] = { static_cast<uint32_t>(l.code >> 8), static_cast<uint32_t>(l.code >> 40) };
+	const uint32_t rsrc[2] = { l.rsrc1, l.rsrc2 };
+	const uint32_t zero = 0, all[2] = { 0xffffffff, 0xffffffff };
+	const uint32_t all4[4] = { 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff };
+	const uint32_t start[3] = { 0, 0, 0 }, threads[3] = { l.groupSize, 1, 1 };
+
+	Pm4::Queue &q = pm4Queue;
+	uint32_t pkt[24];
+	q.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmLo), pgm, 2));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmRsrc1), rsrc, 2));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmRsrc3), &l.rsrc3, 1));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeResourceLim), &zero, 1));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeTmpringSize), &zero, 1));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe0), all, 2));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe2), all, 2));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe4), all4, 4));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeStartX), start, 3));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeNumThreadX), threads, 3));
+	if (l.userCount)
+		q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeUserData0), l.user, l.userCount));
+	q.emit(pkt, Pm4::dispatchDirect(pkt, l.groups, 1, 1,
+	                                Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 |
+	                                (l.wave32 ? Pm4::kDispatchWave32 : 0)));
+	q.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), ++pm4Fence));
+
+	uint64_t t0 = mach_absolute_time();
+	pm4Kick(q.wptr());
+	bool done = false;
+	for (uint32_t us = 0; us < 1000000 && !done; us += 10) {
+		done = *poolDw(kPm4FenceOffset) == pm4Fence;
+		if (!done)
+			IODelay(10);
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	if (!done) {
+		CLOG("%s: the kernel's fence never came (0x%08x, want 0x%08x)", tag,
+		     *poolDw(kPm4FenceOffset), pm4Fence);
+		grbmSelect(1, 0, 0, 0);
+		CLOG("%s: GRBM 0x%08x CP_STAT 0x%08x CPC 0x%08x HQD rptr 0x%x wptr %llu", tag,
+		     rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpCpcStatus), rdGc(CpHqdPqRptr),
+		     static_cast<unsigned long long>(q.wptr()));
+		grbmSelect(0, 0, 0, 0);
+	}
+	return done;
+}
+
+// shaders/probe.s: VMID0, wave32, 4 groups of 64 work-items, each writing
+// 0x5EED0000 + 3 * its global id.
 bool RDNA4Compute::stageDispatch() {
 	OSDictionary *d = OSDictionary::withCapacity(8);
 	auto put = [d](const char *key, uint64_t v) {
@@ -1336,62 +1400,26 @@ bool RDNA4Compute::stageDispatch() {
 		*poolDw(kShaderOffset + 4 * i) = kProbeKernel[i];
 	for (uint32_t i = 0; i <= items; i++)
 		*poolDw(kDispatchBuffer + 4 * i) = 0xFFFFFFFF;
-	*poolDw(kPm4FenceOffset) = 0;
-	flushHdp();
 
-	// Shader memory model for VMID0 (gfx_v12_0_constants_init).
-	grbmSelect(0, 0, 0, 0);
-	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
-
-	const uint64_t code = poolMc(kShaderOffset), buf = poolMc(kDispatchBuffer);
-	const uint32_t pgm[2] = { static_cast<uint32_t>(code >> 8), static_cast<uint32_t>(code >> 40) };
-	// 4 VGPRs (v0-v3): one block of 8 in wave32.
-	const uint32_t rsrc[2] = { 0 | kRsrc1FloatDenorm | kRsrc1MemOrdered,
-	                           (2u << kRsrc2UserSgprShift) | kRsrc2TgidXEn };
-	const uint32_t zero = 0, all[2] = { 0xffffffff, 0xffffffff };
-	const uint32_t all4[4] = { 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff };
-	const uint32_t start[3] = { 0, 0, 0 }, threads[3] = { kGroupSize, 1, 1 };
+	const uint64_t buf = poolMc(kDispatchBuffer);
 	const uint32_t user[2] = { static_cast<uint32_t>(buf), static_cast<uint32_t>(buf >> 32) };
-
-	Pm4::Queue &q = pm4Queue;
-	uint32_t pkt[16];
-	q.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmLo), pgm, 2));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmRsrc1), rsrc, 2));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmRsrc3), &zero, 1));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeResourceLim), &zero, 1));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeTmpringSize), &zero, 1));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe0), all, 2));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe2), all, 2));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe4), all4, 4));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeStartX), start, 3));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeNumThreadX), threads, 3));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeUserData0), user, 2));
-	q.emit(pkt, Pm4::dispatchDirect(pkt, kDispatchGroups, 1, 1,
-	                                Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 |
-	                                Pm4::kDispatchWave32));
-	q.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), ++pm4Fence));
+	Launch l {};
+	l.code = poolMc(kShaderOffset);
+	// 4 VGPRs (v0-v3): one block of 8 in wave32.
+	l.rsrc1 = 0 | kRsrc1FloatDenorm | kRsrc1MemOrdered;
+	l.rsrc2 = (2u << kRsrc2UserSgprShift) | kRsrc2TgidXEn;
+	l.user = user;
+	l.userCount = 2;
+	l.groups = kDispatchGroups;
+	l.groupSize = kGroupSize;
+	l.wave32 = true;
 
 	trail("s6: DISPATCH_DIRECT");
-	uint64_t t0 = mach_absolute_time();
-	pm4Kick(q.wptr());
-	bool done = false;
-	for (uint32_t us = 0; us < 1000000 && !done; us += 10) {
-		done = *poolDw(kPm4FenceOffset) == pm4Fence;
-		if (!done)
-			IODelay(10);
-	}
 	uint64_t ns = 0;
-	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	const bool done = launch(l, "dispatch", ns);
 	put("Fenced", done);
 	if (!done) {
-		CLOG("dispatch: the kernel's fence never came (0x%08x); buffer[0] 0x%08x",
-		     *poolDw(kPm4FenceOffset), *poolDw(kDispatchBuffer));
-		grbmSelect(1, 0, 0, 0);
-		CLOG("dispatch: GRBM 0x%08x CP_STAT 0x%08x CPC 0x%08x HQD rptr 0x%x wptr %llu",
-		     rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpCpcStatus), rdGc(CpHqdPqRptr),
-		     static_cast<unsigned long long>(q.wptr()));
-		grbmSelect(0, 0, 0, 0);
+		CLOG("dispatch: buffer[0] 0x%08x", *poolDw(kDispatchBuffer));
 		publish();
 		return false;
 	}
@@ -1416,6 +1444,136 @@ bool RDNA4Compute::stageDispatch() {
 		CLOG("dispatch: kernel ran on the compute units: all %u work-items wrote their result "
 		     "(buffer[255] = 0x%08x) in %llu us, sentinel %s", items,
 		     *poolDw(kDispatchBuffer + 4 * (items - 1)), ns / 1000, sentinel ? "intact" : "OVERWRITTEN");
+	publish();
+	return !bad && sentinel;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 7: a clang-built kernel from its code object
+// ---------------------------------------------------------------------------
+
+// shaders/vadd.cl as clang and ld.lld built it: the loader finds the kernel
+// and its descriptor in the ELF, and the launch is what the descriptor asks
+// for — RSRC1/2/3 as compiled, the kernarg pointer in the first user SGPRs.
+// c[i] = a[i] + 3 * b[i] over kVaddItems work-items.
+bool RDNA4Compute::stageKernel() {
+	OSDictionary *d = OSDictionary::withCapacity(10);
+	auto put = [d](const char *key, uint64_t v) {
+		if (OSNumber *n = d ? OSNumber::withNumber(v, 64) : nullptr) {
+			d->setObject(key, n);
+			n->release();
+		}
+	};
+	auto publish = [this, d]() {
+		if (d) {
+			env.owner->setProperty("Compute,Kernel", d);
+			d->release();
+		}
+	};
+
+	trail("s7: code object");
+	CodeObj::Kernel k {};
+	const char *why = nullptr;
+	if (!CodeObj::findKernel(kVaddCodeObject, sizeof(kVaddCodeObject), "vadd", k, &why)) {
+		CLOG("kernel: vadd not found in its code object (%s)", why ? why : "?");
+		publish();
+		return false;
+	}
+	CLOG("kernel: vadd: %u bytes of code, %u of kernargs, RSRC1 0x%08x RSRC2 0x%08x RSRC3 0x%08x, "
+	     "%u user SGPRs, wave%u", k.codeSize, k.kernargSize, k.rsrc1, k.rsrc2, k.rsrc3,
+	     k.userSgprCount(), k.wave32() ? 32 : 64);
+	put("CodeBytes", k.codeSize);
+	put("KernargBytes", k.kernargSize);
+	put("Rsrc1", k.rsrc1);
+	put("Rsrc2", k.rsrc2);
+
+	// What this launcher provides: the kernarg pointer, nothing else yet —
+	// no dispatch/queue pointers, no scratch, no LDS.
+	constexpr uint16_t kSgprRequests = 0x7f;   // kernel_code_properties [6:0]
+	const bool fits = (k.properties & kSgprRequests & ~(1u << 3)) == 0 &&
+	                  k.userSgprCount() == (k.wantsKernargPtr() ? 2u : 0u) &&
+	                  !k.privateSegmentSize && !k.groupSegmentSize &&
+	                  k.codeSize <= kCodeObjCodeMax && k.kernargSize <= kKernargMax;
+	if (!fits) {
+		CLOG("kernel: vadd asks for more than this launcher provides (properties 0x%x, "
+		     "scratch %u, LDS %u)", k.properties, k.privateSegmentSize, k.groupSegmentSize);
+		publish();
+		return false;
+	}
+
+	// Code, with a zeroed tail for the instruction prefetch.
+	trail("s7: upload");
+	const uint8_t *src = kVaddCodeObject + k.codeOffset;
+	for (uint32_t off = 0; off < k.codeSize + 0x100; off += 4) {
+		uint32_t w = 0;
+		for (uint32_t b = 0; b < 4; b++)
+			if (off + b < k.codeSize)
+				w |= static_cast<uint32_t>(src[off + b]) << (8 * b);
+		*poolDw(kCodeObjCode + off) = w;
+	}
+
+	// Inputs, a result buffer with a sentinel past its end, and the kernel
+	// arguments: three global pointers at 0/8/16, as vadd's signature lays
+	// them out; anything past them (hidden arguments) zero.
+	auto aOf = [](uint32_t i) { return i * 2654435761u; };
+	auto bOf = [](uint32_t i) { return i ^ 0x5A5A5A5Au; };
+	for (uint32_t i = 0; i < kVaddItems; i++) {
+		*poolDw(kVaddA + 4 * i) = aOf(i);
+		*poolDw(kVaddB + 4 * i) = bOf(i);
+		*poolDw(kVaddC + 4 * i) = 0xFFFFFFFF;
+	}
+	*poolDw(kVaddC + 4 * kVaddItems) = 0xFFFFFFFF;
+	for (uint32_t off = 0; off < ((k.kernargSize + 3) & ~3u); off += 4)
+		*poolDw(kKernargOffset + off) = 0;
+	const uint64_t args[3] = { poolMc(kVaddA), poolMc(kVaddB), poolMc(kVaddC) };
+	for (uint32_t i = 0; i < 3 && 8 * i + 8 <= k.kernargSize; i++) {
+		*poolDw(kKernargOffset + 8 * i) = static_cast<uint32_t>(args[i]);
+		*poolDw(kKernargOffset + 8 * i + 4) = static_cast<uint32_t>(args[i] >> 32);
+	}
+
+	const uint64_t kernarg = poolMc(kKernargOffset);
+	const uint32_t user[2] = { static_cast<uint32_t>(kernarg), static_cast<uint32_t>(kernarg >> 32) };
+	Launch l {};
+	l.code = poolMc(kCodeObjCode);
+	l.rsrc1 = k.rsrc1;
+	l.rsrc2 = k.rsrc2;
+	l.rsrc3 = k.rsrc3;
+	l.user = user;
+	l.userCount = k.userSgprCount();
+	l.groups = kVaddItems / kGroupSize;
+	l.groupSize = kGroupSize;              // vadd's reqd_work_group_size
+	l.wave32 = k.wave32();
+
+	trail("s7: DISPATCH_DIRECT vadd");
+	uint64_t ns = 0;
+	const bool done = launch(l, "kernel", ns);
+	put("Fenced", done);
+	if (!done) {
+		CLOG("kernel: c[0] 0x%08x (want 0x%08x)", *poolDw(kVaddC), aOf(0) + 3 * bOf(0));
+		publish();
+		return false;
+	}
+
+	uint32_t bad = 0, firstBad = kVaddItems;
+	for (uint32_t i = 0; i < kVaddItems; i++) {
+		if (*poolDw(kVaddC + 4 * i) != aOf(i) + 3 * bOf(i)) {
+			if (!bad)
+				firstBad = i;
+			bad++;
+		}
+	}
+	const bool sentinel = *poolDw(kVaddC + 4 * kVaddItems) == 0xFFFFFFFF;
+	put("Items", kVaddItems);
+	put("WrongItems", bad);
+	put("SentinelIntact", sentinel);
+	put("Micros", ns / 1000);
+	if (bad)
+		CLOG("kernel: %u of %u results wrong, first at %u: 0x%08x (want 0x%08x)", bad, kVaddItems,
+		     firstBad, *poolDw(kVaddC + 4 * firstBad), aOf(firstBad) + 3 * bOf(firstBad));
+	else
+		CLOG("kernel: clang's vadd ran from its code object: all %u results right "
+		     "(c[%u] = 0x%08x) in %llu us, sentinel %s", kVaddItems, kVaddItems - 1,
+		     *poolDw(kVaddC + 4 * (kVaddItems - 1)), ns / 1000, sentinel ? "intact" : "OVERWRITTEN");
 	publish();
 	return !bad && sentinel;
 }

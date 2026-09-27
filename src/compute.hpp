@@ -72,9 +72,10 @@ public:
 		StageSdma     = 4,
 		StageCompute  = 5,
 		StageDispatch = 6,
+		StageKernel   = 7,
 	};
 
-	// rdna4-compute=<stage>, clamped to StageDispatch. 0 when absent.
+	// rdna4-compute=<stage>, clamped to StageKernel. 0 when absent.
 	static uint32_t requestedStage();
 
 	// Run the survey now and, for stage >= 2, start the bring-up thread.
@@ -206,7 +207,29 @@ private:
 	Pm4::Queue  pm4Queue;                   // set up by stage 5, fed again by stage 6
 	uint32_t    pm4Fence { 0 };             // last RELEASE_MEM sequence number
 	uint32_t shAbs(const GfxReg::Reg &r) const;   // absolute dword address of a GC register
+	// One DISPATCH_DIRECT on the stage-5 queue, fenced; false if the fence
+	// never came (the engine state is logged under `tag`).
+	struct Launch {
+		uint64_t        code;               // MC address, 256-byte aligned
+		uint32_t        rsrc1, rsrc2, rsrc3;
+		const uint32_t *user;               // COMPUTE_USER_DATA_0..
+		uint32_t        userCount;
+		uint32_t        groups, groupSize;  // 1-D
+		bool            wave32;
+	};
+	bool launch(const Launch &l, const char *tag, uint64_t &ns);
 	bool stageDispatch();
+
+	// Stage 7: a clang-built kernel (shaders/vadd.cl) from its code object.
+	static constexpr uint32_t kCodeObjCode    = kShaderOffset + 0x10000;   // up to 64 KiB
+	static constexpr uint32_t kCodeObjCodeMax = 0x10000 - 0x100;          // + prefetch pad
+	static constexpr uint32_t kKernargOffset  = kShaderOffset + 0x20000;   // up to 4 KiB
+	static constexpr uint32_t kKernargMax     = 0x1000;
+	static constexpr uint32_t kVaddA          = 24u << 20;            // a, b, c: 64 KiB apart
+	static constexpr uint32_t kVaddB          = kVaddA + 0x10000;
+	static constexpr uint32_t kVaddC          = kVaddA + 0x20000;
+	static constexpr uint32_t kVaddItems      = 4096;                 // 64 groups of 64
+	bool stageKernel();
 	// SMU mailbox (MP1): send one message, return the response code
 	// (1 = OK, 0 = no answer) and the argument register after it.
 	uint32_t smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs);
