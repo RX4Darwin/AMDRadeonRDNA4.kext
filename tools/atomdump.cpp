@@ -24,6 +24,7 @@
 #include "../src/modeset.hpp"
 #include "../src/amdfw.hpp"
 #include "../src/psp.hpp"
+#include "../src/sdma.hpp"
 
 #include <cstdarg>
 #include <cstdint>
@@ -1584,6 +1585,41 @@ static int testGfxImages() {
 	return failures;
 }
 
+// SDMA 7 packets, as sdma_v7_0.c emits them (ring test, fence, fill, copy).
+static int testSdmaPackets() {
+	int failures = 0;
+	uint32_t p[8];
+	const uint64_t a = 0x8009002000ull, b = 0x8010000000ull;
+
+	failures += check(Sdma::writeDword(p, a, 0xDEADBEEF) == 5 && p[0] == 0x00000002 &&
+	                  p[1] == 0x09002000 && p[2] == 0x80 && p[3] == 0 && p[4] == 0xDEADBEEF,
+	                  "sdma: WRITE_LINEAR %08x %08x %08x %08x %08x", p[0], p[1], p[2], p[3], p[4]);
+	failures += check(Sdma::fence(p, a + 0x41, 7) == 4 && p[0] == 0x00030005 &&
+	                  p[1] == 0x09002040 && p[2] == 0x80 && p[3] == 7,
+	                  "sdma: FENCE %08x %08x %08x %08x", p[0], p[1], p[2], p[3]);
+	failures += check(Sdma::constFill(p, b, 0x5A5AC0DE, 1u << 20) == 5 && p[0] == 0x8000000b &&
+	                  p[1] == 0x10000000 && p[2] == 0x80 && p[3] == 0x5A5AC0DE && p[4] == 0xfffff,
+	                  "sdma: CONST_FILL %08x .. %08x", p[0], p[4]);
+	failures += check(Sdma::copyLinear(p, a, b, 4096) == 8 && p[0] == 0x10000001 && p[1] == 4095 &&
+	                  p[3] == 0x09002000 && p[5] == 0x10000000 && p[7] == 0,
+	                  "sdma: COPY_LINEAR %08x %08x", p[0], p[1]);
+
+	// Ring: 256-byte ring, wraps and keeps whole packets in order.
+	uint32_t mem[64];
+	Sdma::Ring r;
+	failures += check(r.init(mem, 0x8008800000ull, sizeof(mem)) && r.sizeLog2Dwords() == 6,
+	                  "sdma: ring init");
+	bool ok = true;
+	for (int i = 0; i < 20 && ok; i++)
+		ok = r.emit(p, Sdma::writeDword(p, a, static_cast<uint32_t>(i)));
+	failures += check(ok && r.wptr() == (20 * 5 * 4) % 256, "sdma: ring wrap (wptr %u)", r.wptr());
+	failures += check(!r.init(mem, 0x8008800010ull, sizeof(mem)), "sdma: unaligned ring accepted");
+
+	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR encodings and ring wrap %s\n",
+	       failures ? "FAILED" : "ok");
+	return failures;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
@@ -1774,6 +1810,7 @@ int main(int argc, char **argv) {
 	failures += testModeSet();
 	failures += testPsp();
 	failures += testGfxImages();
+	failures += testSdmaPackets();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

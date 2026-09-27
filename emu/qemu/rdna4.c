@@ -20,7 +20,10 @@
  *    bootloader mailbox and GPCOM ring (sOS components, ring creation,
  *    LOAD_TOC, LOAD_IP_FW, fences; buffers are read through the MM hub's FB
  *    aperture) and the SMU (MP1) mailbox, which, as on the card, only
- *    answers once the SMU firmware came in through the PSP.
+ *    answers once the SMU firmware came in through the PSP. After a complete
+ *    AUTOLOAD_RLC the GC shows its booted state, the GC hub acknowledges TLB
+ *    flushes, and SDMA0 queue 0 runs NOP/WRITE/COPY/FENCE/CONST_FILL packets
+ *    through the GC hub (which must have been set up by the driver).
  *    OTG_MASTER_UPDATE_LOCK holds the double-buffered OTG timing and HUBP
  *    surface registers until it is released.
  *  - An attached monitor: the scanout only shows when the lit OTG's DIG
@@ -237,6 +240,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define REG_GC_SDMA0_STATUS  GC_SEG0(0x0024)
 #define REG_GC_SDMA1_STATUS  GC_SEG0(0x0624)
 #define SDMA_STATUS_BOOTED   0x08000001u       /* UCODE_INIT_DONE | IDLE */
+
+/* GC hub: FB aperture, L1 TLB, VMID0 context and the GART flush engine. */
+#define REG_GCMC_FB_BASE     GC_SEG0(0x1614)   /* MC >> 24 */
+#define REG_GCMC_FB_TOP      GC_SEG0(0x1615)
+#define REG_GCMC_L1_TLB      GC_SEG0(0x161b)   /* ENABLE_L1_TLB [0] */
+#define REG_GCVM_CTX0_CNTL   GC_SEG0(0x1624)   /* ENABLE_CONTEXT [0] */
+#define REG_GCVM_INV17_REQ   GC_SEG0(0x1647 + 17)
+#define REG_GCVM_INV17_ACK   GC_SEG0(0x1659 + 17)
+
+/* SDMA0 queue 0 (GC seg0) and MCU control (hypervisor range, seg1). */
+#define REG_SDMA0_RB_CNTL    GC_SEG0(0x0080)   /* RB_ENABLE [0], RB_SIZE [5:1], RPTR_WB [12] */
+#define REG_SDMA0_RB_BASE    GC_SEG0(0x0081)   /* MC >> 8 */
+#define REG_SDMA0_RB_BASE_HI GC_SEG0(0x0082)   /* MC >> 40 */
+#define REG_SDMA0_RB_RPTR    GC_SEG0(0x0083)   /* bytes */
+#define REG_SDMA0_RB_WPTR    GC_SEG0(0x0085)   /* bytes */
+#define REG_SDMA0_RPTR_LO    GC_SEG0(0x0087)   /* rptr writeback address */
+#define REG_SDMA0_RPTR_HI    GC_SEG0(0x0088)
+#define REG_SDMA0_MCU_CNTL   GC_SEG1(0x588e)   /* HALT [0] */
 #define PSP_ERR_UNKNOWN_CMD  0x100
 #define PSP_TMR_SIZE         0x1400000      /* model's answer to LOAD_TOC */
 
@@ -961,6 +982,133 @@ static void rdna4_psp_command(RDNA4State *s, uint64_t cmd)
     rdna4_mc_set(s, cmd + PSP_RESP_STATUS, status);
 }
 
+/* ---- GC hub + SDMA -------------------------------------------------------- */
+
+/*
+ * VRAM offset of an MC address as the GC hub translates it for VMID0: only
+ * once the driver has set up the FB aperture, the L1 TLB and context 0 (the
+ * card's GC hub is cold after the RLC autoload in this model). -1 = fault.
+ */
+static int64_t rdna4_gc_to_vram(RDNA4State *s, uint64_t mc)
+{
+    uint64_t base = (uint64_t)(reg_get(s, REG_GCMC_FB_BASE) & 0xffffff) << 24;
+    uint64_t top = ((uint64_t)(reg_get(s, REG_GCMC_FB_TOP) & 0xffffff) << 24) | 0xffffff;
+
+    if (!(reg_get(s, REG_GCMC_L1_TLB) & 1) || !(reg_get(s, REG_GCVM_CTX0_CNTL) & 1) ||
+        !reg_get(s, REG_GCMC_FB_TOP) || mc < base || mc > top) {
+        return -1;
+    }
+    return mc - base;
+}
+
+static uint8_t *rdna4_gc_span(RDNA4State *s, uint64_t mc, uint64_t len)
+{
+    int64_t off = rdna4_gc_to_vram(s, mc);
+
+    return off < 0 ? NULL : rdna4_vram_span(s, off, len);
+}
+
+/*
+ * SDMA0 queue 0: run the packets between RPTR and the new WPTR. Knows the
+ * packets the kext uses: NOP, WRITE (linear), COPY (linear), FENCE and
+ * CONST_FILL. A fault or an unknown packet stops the engine where it is.
+ */
+static void rdna4_sdma_wptr(RDNA4State *s, uint32_t wptr)
+{
+    uint32_t cntl = reg_get(s, REG_SDMA0_RB_CNTL);
+    uint32_t size = 4u << ((cntl >> 1) & 0x1f);          /* bytes */
+    uint64_t ring = ((uint64_t)reg_get(s, REG_SDMA0_RB_BASE) << 8) |
+                    ((uint64_t)reg_get(s, REG_SDMA0_RB_BASE_HI) << 40);
+    uint32_t rptr = reg_get(s, REG_SDMA0_RB_RPTR);
+
+    reg_set(s, REG_SDMA0_RB_WPTR, wptr);
+    if (!s->gfx_booted || !(cntl & 1) || (reg_get(s, REG_SDMA0_MCU_CNTL) & 1)) {
+        return;                         /* no firmware, queue off, or halted */
+    }
+    wptr &= size - 1;
+    while (rptr != wptr) {
+        uint32_t dw[8];
+        for (int i = 0; i < 8; i++) {
+            uint8_t *p = rdna4_gc_span(s, ring + ((rptr + 4 * i) & (size - 1)), 4);
+            if (!p) {
+                fprintf(stderr, "rdna4: sdma: ring MC 0x%" PRIx64 " not mapped by the GC hub\n",
+                        ring);
+                return;
+            }
+            dw[i] = ldl_le_p(p);
+        }
+        uint32_t op = dw[0] & 0xff, sub = (dw[0] >> 8) & 0xff, len = 1;
+        uint64_t a = dw[1] | ((uint64_t)dw[2] << 32);
+        uint8_t *dst;
+        switch (op) {
+        case 0:                                         /* NOP */
+            len = 1 + ((dw[0] >> 16) & 0x3fff);
+            break;
+        case 2: {                                       /* WRITE linear, 1 dword */
+            len = 5;
+            if (sub || dw[3] != 0 || !(dst = rdna4_gc_span(s, a, 4))) {
+                goto fault;
+            }
+            stl_le_p(dst, dw[4]);
+            break;
+        }
+        case 5:                                         /* FENCE */
+            len = 4;
+            if (!(dst = rdna4_gc_span(s, a & ~3ull, 4))) {
+                goto fault;
+            }
+            stl_le_p(dst, dw[3]);
+            break;
+        case 11: {                                      /* CONST_FILL */
+            uint32_t bytes = dw[4] + 1, fsize = dw[0] >> 30;
+            len = 5;
+            if (!(dst = rdna4_gc_span(s, a, bytes))) {
+                goto fault;
+            }
+            if (fsize == 2) {
+                for (uint32_t i = 0; i + 4 <= bytes; i += 4) {
+                    stl_le_p(dst + i, dw[3]);
+                }
+            } else {
+                memset(dst, dw[3] & 0xff, bytes);
+            }
+            break;
+        }
+        case 1: {                                       /* COPY linear */
+            uint32_t bytes = dw[1] + 1;
+            uint64_t src = dw[3] | ((uint64_t)dw[4] << 32);
+            uint64_t d = dw[5] | ((uint64_t)dw[6] << 32);
+            uint8_t *sp = rdna4_gc_span(s, src, bytes);
+            len = 8;
+            if (sub || !sp || !(dst = rdna4_gc_span(s, d, bytes))) {
+                goto fault;
+            }
+            memmove(dst, sp, bytes);
+            break;
+        }
+        default:
+            fprintf(stderr, "rdna4: sdma: unknown packet 0x%08x at rptr 0x%x, stopping\n",
+                    dw[0], rptr);
+            return;
+        }
+        rptr = (rptr + 4 * len) & (size - 1);
+        reg_set(s, REG_SDMA0_RB_RPTR, rptr);
+        continue;
+fault:
+        fprintf(stderr, "rdna4: sdma: packet 0x%08x at rptr 0x%x: address 0x%" PRIx64
+                " not mapped by the GC hub, stopping\n", dw[0], rptr, a);
+        return;
+    }
+    if (cntl & (1u << 12)) {                            /* RPTR_WRITEBACK_ENABLE */
+        uint64_t wb = (reg_get(s, REG_SDMA0_RPTR_LO) & ~3u) |
+                      ((uint64_t)reg_get(s, REG_SDMA0_RPTR_HI) << 32);
+        uint8_t *p = rdna4_gc_span(s, wb, 8);
+        if (p) {
+            stq_le_p(p, rptr);
+        }
+    }
+}
+
 /* Consume GPCOM frames up to the new write pointer. */
 static void rdna4_psp_wptr(RDNA4State *s, uint32_t wptr)
 {
@@ -1047,6 +1195,11 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         rdna4_psp_ring_ctl(s, val);
     } else if (addr == REG_PSP_RING_WPTR) {
         rdna4_psp_wptr(s, val);
+    } else if (addr == REG_SDMA0_RB_WPTR) {
+        rdna4_sdma_wptr(s, val);
+    } else if (addr == REG_GCVM_INV17_REQ) {
+        reg_set(s, addr, val);
+        reg_set(s, REG_GCVM_INV17_ACK, val & 0xffff);   /* per-VMID ack */
     } else if (dw >= DMU_SEG2 && dw < DMU_SEG3) {
         uint32_t d2 = dw - DMU_SEG2;
         if (d2 == DMCUB_INBOX1_WPTR) {

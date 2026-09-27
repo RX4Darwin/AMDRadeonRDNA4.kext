@@ -8,6 +8,9 @@
 //
 
 #include "compute.hpp"
+#include "sdma.hpp"
+
+#include <kern/clock.h>
 
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
@@ -433,8 +436,13 @@ void RDNA4Compute::runStages() {
 			return stop("stage 3 (gfx)");
 		done = StageGfx;
 	}
-	if (target >= StageSdma)
-		CLOG("stage 4 (sdma) is not implemented yet; stopping after stage 3");
+	if (target >= StageSdma) {
+		if (!stageSdma())
+			return stop("stage 4 (sdma)");
+		done = StageSdma;
+	}
+	if (target >= StageCompute)
+		CLOG("stage 5 (compute) is not implemented yet; stopping after stage 4");
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
 	snprintf(note, sizeof(note), "finished at stage %u", done);
 	trail(note);
@@ -749,4 +757,261 @@ bool RDNA4Compute::stageGfx() {
 	publish();
 	return true;
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: GC hub + SDMA
+// ---------------------------------------------------------------------------
+
+// gfxhub_v12_0_gart_enable, reduced to VMID0 with no GART in use: VRAM is
+// reached through the FB aperture / system aperture, the context-0 page
+// table covers one unused page. The MM hub (display, PSP) is not touched.
+bool RDNA4Compute::gcHubInit() {
+	if (!sv.fbMcTop)
+		return false;
+	const uint32_t mmBase = sv.mmFbBase & 0xffffff, mmTop = sv.mmFbTop & 0xffffff;
+
+	// FB aperture: the VBIOS programs it on bare metal; if it reads back
+	// empty, mirror the MM hub's, as amdgpu does for a VF.
+	uint32_t gcBase = rdGc(GcFbLocationBase) & 0xffffff, gcTop = rdGc(GcFbLocationTop) & 0xffffff;
+	if (!gcTop || gcTop < gcBase) {
+		wr(IpDiscovery::HwGc, GcFbLocationBase, mmBase);
+		wr(IpDiscovery::HwGc, GcFbLocationTop, mmTop);
+		CLOG("sdma: GC hub FB aperture was empty; set to the MM hub's 0x%x..0x%x", mmBase, mmTop);
+	} else if (gcBase != mmBase || gcTop != mmTop) {
+		CLOG("sdma: GC hub FB aperture 0x%x..0x%x differs from the MM hub's 0x%x..0x%x",
+		     gcBase, gcTop, mmBase, mmTop);
+	}
+
+	// Context 0: a flat table over one page nobody uses (MC page 0).
+	for (uint32_t i = 0; i < 0x1000 / 4; i++)
+		*poolDw(kPtOffset + i * 4) = 0;
+	flushHdp();
+	const uint64_t pt = poolMc(kPtOffset);
+	wr(IpDiscovery::HwGc, GcCtx0PtBaseLo, static_cast<uint32_t>(pt) | 1);
+	wr(IpDiscovery::HwGc, GcCtx0PtBaseHi, static_cast<uint32_t>(pt >> 32));
+	wr(IpDiscovery::HwGc, GcCtx0PtStartLo, 0);
+	wr(IpDiscovery::HwGc, GcCtx0PtStartHi, 0);
+	wr(IpDiscovery::HwGc, GcCtx0PtEndLo, 0);
+	wr(IpDiscovery::HwGc, GcCtx0PtEndHi, 0);
+
+	// System aperture = the FB range, no AGP; defaults point at a scratch page.
+	wr(IpDiscovery::HwGc, GcAgpBase, 0);
+	wr(IpDiscovery::HwGc, GcAgpBot, 0xffffff);
+	wr(IpDiscovery::HwGc, GcAgpTop, 0);
+	wr(IpDiscovery::HwGc, GcSysApertureLow, static_cast<uint32_t>(sv.fbMcBase >> 18));
+	wr(IpDiscovery::HwGc, GcSysApertureHigh, static_cast<uint32_t>(sv.fbMcTop >> 18));
+	const uint64_t scratchVram = pool.offset + kScratchOffset;
+	wr(IpDiscovery::HwGc, GcSysDefaultLsb, static_cast<uint32_t>(scratchVram >> 12));
+	wr(IpDiscovery::HwGc, GcSysDefaultMsb, static_cast<uint32_t>(scratchVram >> 44));
+	const uint64_t scratchMc = poolMc(kScratchOffset);
+	wr(IpDiscovery::HwGc, GcL2FaultDefaultLo, static_cast<uint32_t>(scratchMc >> 12));
+	wr(IpDiscovery::HwGc, GcL2FaultDefaultHi, static_cast<uint32_t>(scratchMc >> 44));
+	wr(IpDiscovery::HwGc, GcL2FaultCntl2, rdGc(GcL2FaultCntl2) | kL2FaultRetryRead);
+
+	// L1 TLB.
+	uint32_t v = rdGc(GcMxL1TlbCntl);
+	v &= ~(kL1TlbSysAccess3 | kL1TlbSysUnmapped | kL1TlbEcoMask | kL1TlbMtypeMask);
+	v |= kL1TlbEnable | kL1TlbSysAccess3 | kL1TlbAdvDriver | kL1TlbMtypeUc;
+	wr(IpDiscovery::HwGc, GcMxL1TlbCntl, v);
+
+	// L2 cache.
+	v = rdGc(GcL2Cntl);
+	v &= ~(kL2FragmentProcessing | kL2Pde0TagGenMode | kL2PdeFaultClassify | (3u << 19) |
+	       kL2IdentityFragMask);
+	v |= kL2EnableCache | kL2DefaultPageToSys | kL2Ctx1IdentityAccess;
+	wr(IpDiscovery::HwGc, GcL2Cntl, v);
+	wr(IpDiscovery::HwGc, GcL2Cntl2, rdGc(GcL2Cntl2) | kL2InvalidateL1Tlbs | kL2InvalidateL2Cache);
+	wr(IpDiscovery::HwGc, GcL2Cntl3,
+	   (kL2Cntl3Default & ~(kL2Cntl3BankMask | kL2Cntl3BigKMask)) | 9 | (6u << 15));
+	wr(IpDiscovery::HwGc, GcL2Cntl4, kL2Cntl4Default & ~kL2Cntl4TapPhysMask);
+	wr(IpDiscovery::HwGc, GcL2Cntl5, kL2Cntl5Default & ~kL2Cntl5SmallKMask);
+
+	// VMID0 on, flat.
+	v = rdGc(GcCtx0Cntl);
+	v = (v & ~(kCtxDepthMask | kCtxRetryPermFault)) | kVmCtxEnable;
+	wr(IpDiscovery::HwGc, GcCtx0Cntl, v);
+
+	// Identity aperture off; every invalidation engine covers all addresses.
+	wr(IpDiscovery::HwGc, GcIdentLowLo, 0xffffffff);
+	wr(IpDiscovery::HwGc, GcIdentLowHi, 0xf);
+	wr(IpDiscovery::HwGc, GcIdentHighLo, 0);
+	wr(IpDiscovery::HwGc, GcIdentHighHi, 0);
+	wr(IpDiscovery::HwGc, GcIdentOffsetLo, 0);
+	wr(IpDiscovery::HwGc, GcIdentOffsetHi, 0);
+	for (uint32_t e = 0; e < kGcInvEngines; e++) {
+		wr(IpDiscovery::HwGc, Reg { 0, GcInvEng0RangeLo.dword + 2 * e }, 0xffffffff);
+		wr(IpDiscovery::HwGc, Reg { 0, GcInvEng0RangeHi.dword + 2 * e }, 0x1f);
+	}
+	flushHdp();
+	return gcHubFlush();
+}
+
+// gmc_v12_0_flush_vm_hub for VMID0 on the GC hub (engine 17, no semaphore).
+bool RDNA4Compute::gcHubFlush() {
+	wr(IpDiscovery::HwGc, Reg { 0, GcInvEng0Req.dword + kGcInvEngGart }, kInvReqVmid0);
+	for (uint32_t us = 0; us < 100000; us += 10) {
+		if (rdGc(Reg { 0, GcInvEng0Ack.dword + kGcInvEngGart }) & 1)
+			return true;
+		IODelay(10);
+	}
+	CLOG("sdma: GC hub TLB flush not acknowledged");
+	return false;
+}
+
+// sdma_v7_0_gfx_resume_instance for SDMA0 queue 0, without a doorbell: the
+// write pointer is posted by register (and mirrored where the MCU polls it).
+bool RDNA4Compute::sdmaQueueInit() {
+	const uint64_t ring = poolMc(kSdmaRingOffset);
+	const uint32_t sizeLog2 = 10;   // 4 KiB = 1024 dwords
+	uint32_t rb = rdGc(sdma(0, SdmaQ0RbCntl));
+	rb = (rb & ~(kSdmaRbSizeMask | kSdmaRbEnable)) | (sizeLog2 << kSdmaRbSizeShift) | kSdmaRbPriv;
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbCntl), rb);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbRptr), 0);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbRptrHi), 0);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), 0);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), 0);
+
+	const uint64_t wpoll = poolMc(kSdmaWptrOffset), rwb = poolMc(kSdmaRptrOffset);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0WptrPollLo), static_cast<uint32_t>(wpoll));
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0WptrPollHi), static_cast<uint32_t>(wpoll >> 32));
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RptrAddrHi), static_cast<uint32_t>(rwb >> 32));
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RptrAddrLo), static_cast<uint32_t>(rwb) & ~3u);
+
+	rb = (rb | kSdmaRbRptrWriteback | kSdmaRbMcuWptrPoll) & ~kSdmaRbWptrPoll;
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbBase), static_cast<uint32_t>(ring >> 8));
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbBaseHi), static_cast<uint32_t>(ring >> 40));
+
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0MinorPtrUpd), 1);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), 0);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), 0);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0Doorbell),
+	   rdGc(sdma(0, SdmaQ0Doorbell)) & ~kSdmaDoorbellEnable);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0MinorPtrUpd), 0);
+
+	wr(IpDiscovery::HwGc, sdma(0, SdmaWatchdogCntl),
+	   (rdGc(sdma(0, SdmaWatchdogCntl)) & ~kSdmaWatchdogHangMask) | 1);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaUtcl1Cntl),
+	   (rdGc(sdma(0, SdmaUtcl1Cntl)) & ~(kSdmaUtcl1RespMask | kSdmaUtcl1RedoMask)) | (3u << 9) | 9);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaMcuCntl),
+	   rdGc(sdma(0, SdmaMcuCntl)) & ~(kSdmaMcuHalt | kSdmaMcuReset));
+
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbCntl), rb | kSdmaRbEnable);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0IbCntl), rdGc(sdma(0, SdmaQ0IbCntl)) | kSdmaIbEnable);
+	return true;
+}
+
+void RDNA4Compute::sdmaKick(uint32_t wptrBytes) {
+	*poolDw(kSdmaWptrOffset) = wptrBytes;
+	*poolDw(kSdmaWptrOffset + 4) = 0;
+	flushHdp();
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), wptrBytes);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), 0);
+}
+
+bool RDNA4Compute::stageSdma() {
+	OSDictionary *d = OSDictionary::withCapacity(12);
+	auto put = [d](const char *key, uint64_t v) {
+		if (OSNumber *n = d ? OSNumber::withNumber(v, 64) : nullptr) {
+			d->setObject(key, n);
+			n->release();
+		}
+	};
+	auto publish = [this, d]() {
+		if (d) {
+			env.owner->setProperty("Compute,SDMA", d);
+			d->release();
+		}
+	};
+	auto status = [this]() {
+		CLOG("sdma: SDMA0 status 0x%08x rb_cntl 0x%08x rptr 0x%x wptr 0x%x mcu 0x%08x, "
+		     "rptr writeback 0x%x", rdGc(sdma(0, SdmaStatusReg)), rdGc(sdma(0, SdmaQ0RbCntl)),
+		     rdGc(sdma(0, SdmaQ0RbRptr)), rdGc(sdma(0, SdmaQ0RbWptr)),
+		     rdGc(sdma(0, SdmaMcuCntl)), *poolDw(kSdmaRptrOffset));
+	};
+
+	// 1. GC hub.
+	trail("s4: GC hub init");
+	if (!gcHubInit()) {
+		publish();
+		return false;
+	}
+	CLOG("sdma: GC hub up: fb 0x%08x..0x%08x sys 0x%08x..0x%08x l1 0x%08x l2 0x%08x ctx0 0x%08x",
+	     rdGc(GcFbLocationBase), rdGc(GcFbLocationTop), rdGc(GcSysApertureLow),
+	     rdGc(GcSysApertureHigh), rdGc(GcMxL1TlbCntl), rdGc(GcL2Cntl), rdGc(GcCtx0Cntl));
+
+	// 2. SDMA0 queue 0.
+	trail("s4: SDMA0 queue init");
+	Sdma::Ring ring;
+	if (!ring.init(poolDw(kSdmaRingOffset), poolMc(kSdmaRingOffset), kSdmaRingSize)) {
+		publish();
+		return false;
+	}
+	*poolDw(kSdmaRptrOffset) = 0;
+	*poolDw(kSdmaTestOffset) = 0xCAFEDEAD;
+	*poolDw(kSdmaFenceOffset) = 0;
+	flushHdp();
+	sdmaQueueInit();
+	status();
+
+	// 3. First packet: one dword written by the engine (amdgpu's ring test).
+	trail("s4: SDMA WRITE_LINEAR test");
+	uint32_t pkt[8];
+	ring.emit(pkt, Sdma::writeDword(pkt, poolMc(kSdmaTestOffset), 0xDEADBEEF));
+	sdmaKick(ring.wptr());
+	bool wrote = false;
+	for (uint32_t us = 0; us < 200000 && !wrote; us += 10) {
+		wrote = *poolDw(kSdmaTestOffset) == 0xDEADBEEF;
+		if (!wrote)
+			IODelay(10);
+	}
+	put("WriteTest", wrote);
+	if (!wrote) {
+		CLOG("sdma: WRITE_LINEAR did not land (test dword 0x%08x)", *poolDw(kSdmaTestOffset));
+		status();
+		publish();
+		return false;
+	}
+	CLOG("sdma: WRITE_LINEAR landed: the GPU wrote 0xDEADBEEF to VRAM");
+
+	// 4. The first real work: fill 1 MiB, fence, verify from the CPU.
+	trail("s4: SDMA CONST_FILL 1 MiB");
+	const uint32_t pattern = 0x5A5AC0DE;
+	*poolDw(kFillOffset - 4) = 0x11111111;             // guards either side
+	*poolDw(kFillOffset + kFillBytes) = 0x22222222;
+	*poolDw(kFillOffset) = 0;
+	*poolDw(kFillOffset + kFillBytes - 4) = 0;
+	flushHdp();
+	uint64_t t0 = mach_absolute_time();
+	ring.emit(pkt, Sdma::constFill(pkt, poolMc(kFillOffset), pattern, kFillBytes));
+	ring.emit(pkt, Sdma::fence(pkt, poolMc(kSdmaFenceOffset), 1));
+	sdmaKick(ring.wptr());
+	bool fenced = false;
+	for (uint32_t us = 0; us < 500000 && !fenced; us += 10) {
+		fenced = *poolDw(kSdmaFenceOffset) == 1;
+		if (!fenced)
+			IODelay(10);
+	}
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	put("FillFenced", fenced);
+	if (!fenced) {
+		CLOG("sdma: fill fence never came (0x%08x)", *poolDw(kSdmaFenceOffset));
+		status();
+		publish();
+		return false;
+	}
+	uint32_t bad = 0;
+	for (uint32_t off = 0; off < kFillBytes; off += 4096 + 4)   // a spread of dwords
+		bad += *poolDw(kFillOffset + (off & ~3u)) != pattern;
+	bad += *poolDw(kFillOffset + kFillBytes - 4) != pattern;
+	const bool guards = *poolDw(kFillOffset - 4) == 0x11111111 &&
+	                    *poolDw(kFillOffset + kFillBytes) == 0x22222222;
+	CLOG("sdma: CONST_FILL 1 MiB fenced in %llu us: %s, guards %s", ns / 1000,
+	     bad ? "MISMATCHED dwords" : "every sampled dword matches", guards ? "intact" : "OVERWRITTEN");
+	put("FillMicros", ns / 1000);
+	put("FillBadDwords", bad);
+	put("FillGuardsIntact", guards);
+	publish();
+	return !bad && guards;
 }

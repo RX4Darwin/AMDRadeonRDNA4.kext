@@ -85,6 +85,32 @@ constexpr uint32_t SdmaQ0RbBaseHi    = 0x0082;
 constexpr uint32_t SdmaQ0RbRptr      = 0x0083;
 constexpr uint32_t SdmaQ0RbWptr      = 0x0085;
 constexpr uint32_t SdmaMcuCntl       = 0x588e;
+constexpr uint32_t SdmaWatchdogCntl  = 0x002b;
+constexpr uint32_t SdmaUtcl1Cntl     = 0x0035;
+constexpr uint32_t SdmaQ0RbRptrHi    = 0x0084;
+constexpr uint32_t SdmaQ0RbWptrHi    = 0x0086;
+constexpr uint32_t SdmaQ0RptrAddrLo  = 0x0087;
+constexpr uint32_t SdmaQ0RptrAddrHi  = 0x0088;
+constexpr uint32_t SdmaQ0IbCntl      = 0x0089;
+constexpr uint32_t SdmaQ0Doorbell    = 0x008f;
+constexpr uint32_t SdmaQ0WptrPollLo  = 0x0098;
+constexpr uint32_t SdmaQ0WptrPollHi  = 0x0099;
+constexpr uint32_t SdmaQ0MinorPtrUpd = 0x009b;
+
+// SDMA0_QUEUE0_RB_CNTL fields
+constexpr uint32_t kSdmaRbSizeShift       = 1;          // [5:1] log2(dwords)
+constexpr uint32_t kSdmaRbSizeMask        = 0x1fu << 1;
+constexpr uint32_t kSdmaRbWptrPoll        = 1u << 8;
+constexpr uint32_t kSdmaRbMcuWptrPoll     = 1u << 11;
+constexpr uint32_t kSdmaRbRptrWriteback   = 1u << 12;
+constexpr uint32_t kSdmaRbPriv            = 1u << 23;
+// SDMA0_QUEUE0_IB_CNTL / DOORBELL / MCU_CNTL / UTCL1_CNTL / WATCHDOG_CNTL
+constexpr uint32_t kSdmaIbEnable          = 1u << 0;
+constexpr uint32_t kSdmaDoorbellEnable    = 1u << 28;
+constexpr uint32_t kSdmaMcuReset          = 1u << 1;
+constexpr uint32_t kSdmaUtcl1RedoMask     = 0x1fu;       // REDO_DELAY [4:0]
+constexpr uint32_t kSdmaUtcl1RespMask     = 0x3u << 9;   // RESP_MODE [10:9]
+constexpr uint32_t kSdmaWatchdogHangMask  = 0xffu;       // QUEUE_HANG_COUNT [7:0]
 
 // SDMA0_STATUS_REG
 constexpr uint32_t kSdmaIdle          = 1u << 0;
@@ -115,6 +141,67 @@ constexpr Reg GcCtx0Cntl          { 0, 0x1624 };
 constexpr Reg GcCtx0PtBaseLo      { 0, 0x168f };
 constexpr Reg GcCtx0PtBaseHi      { 0, 0x1690 };
 constexpr Reg GcCtx0PtStartLo     { 0, 0x16af };
+constexpr Reg GcCtx0PtStartHi     { 0, 0x16b0 };
+constexpr Reg GcCtx0PtEndLo       { 0, 0x16cf };
+constexpr Reg GcCtx0PtEndHi       { 0, 0x16d0 };
+constexpr Reg GcSysApertureHigh   { 0, 0x161a };   // MC address >> 18
+constexpr Reg GcSysDefaultLsb     { 0, 0x15a8 };   // VRAM offset >> 12
+constexpr Reg GcSysDefaultMsb     { 0, 0x15a9 };   // VRAM offset >> 44
+constexpr Reg GcL2FaultDefaultLo  { 0, 0x15d4 };   // address >> 12
+constexpr Reg GcL2FaultDefaultHi  { 0, 0x15d5 };   // address >> 44
+constexpr Reg GcL2FaultCntl2      { 0, 0x15cd };
+constexpr Reg GcL2Cntl2           { 0, 0x15c5 };
+constexpr Reg GcL2Cntl3           { 0, 0x15c6 };
+constexpr Reg GcL2Cntl4           { 0, 0x15dd };
+constexpr Reg GcL2Cntl5           { 0, 0x15e3 };
+constexpr Reg GcIdentLowLo        { 0, 0x15d7 };   // CONTEXT1 identity aperture
+constexpr Reg GcIdentLowHi        { 0, 0x15d8 };
+constexpr Reg GcIdentHighLo       { 0, 0x15d9 };
+constexpr Reg GcIdentHighHi       { 0, 0x15da };
+constexpr Reg GcIdentOffsetLo     { 0, 0x15db };
+constexpr Reg GcIdentOffsetHi     { 0, 0x15dc };
+constexpr Reg GcInvEng0Req        { 0, 0x1647 };   // + engine
+constexpr Reg GcInvEng0Ack        { 0, 0x1659 };   // + engine
+constexpr Reg GcInvEng0RangeLo    { 0, 0x166b };   // + 2 * engine
+constexpr Reg GcInvEng0RangeHi    { 0, 0x166c };
+constexpr uint32_t kGcInvEngines  = 18;
+constexpr uint32_t kGcInvEngGart  = 17;            // amdgpu's engine for VMID0 flushes
+
+// GCMC_VM_MX_L1_TLB_CNTL: L1 TLB on, system access mode 3 (unmapped ->
+// system aperture), advanced driver model, MTYPE UC.
+constexpr uint32_t kL1TlbEnable       = 1u << 0;
+constexpr uint32_t kL1TlbSysAccess3   = 3u << 3;
+constexpr uint32_t kL1TlbSysUnmapped  = 1u << 5;
+constexpr uint32_t kL1TlbAdvDriver    = 1u << 6;
+constexpr uint32_t kL1TlbEcoMask      = 0xfu << 7;
+constexpr uint32_t kL1TlbMtypeMask    = 0x7u << 11;
+constexpr uint32_t kL1TlbMtypeUc      = 3u << 11;
+// GCVM_L2_CNTL
+constexpr uint32_t kL2EnableCache         = 1u << 0;
+constexpr uint32_t kL2FragmentProcessing  = 1u << 1;
+constexpr uint32_t kL2Pde0TagGenMode      = 1u << 8;
+constexpr uint32_t kL2DefaultPageToSys    = 1u << 11;
+constexpr uint32_t kL2PdeFaultClassify    = 1u << 18;
+constexpr uint32_t kL2Ctx1IdentityAccess  = 1u << 19;
+constexpr uint32_t kL2IdentityFragMask    = 0x1fu << 21;
+// GCVM_L2_CNTL2
+constexpr uint32_t kL2InvalidateL1Tlbs    = 1u << 0;
+constexpr uint32_t kL2InvalidateL2Cache   = 1u << 1;
+// Reset values gfxhub_v12_0 starts from, and the fields it changes.
+constexpr uint32_t kL2Cntl3Default        = 0x80120007;
+constexpr uint32_t kL2Cntl4Default        = 0x000000c1;
+constexpr uint32_t kL2Cntl5Default        = 0x00003fe0;
+constexpr uint32_t kL2Cntl3BankMask       = 0x3fu;          // BANK_SELECT [5:0]
+constexpr uint32_t kL2Cntl3BigKMask       = 0x1fu << 15;    // BIGK_FRAGMENT_SIZE [19:15]
+constexpr uint32_t kL2Cntl4TapPhysMask    = 3u << 6;        // PDE/PTE_REQUEST_PHYSICAL
+constexpr uint32_t kL2Cntl5SmallKMask     = 0x1fu;          // SMALLK_FRAGMENT_SIZE
+constexpr uint32_t kL2FaultRetryRead      = 1u << 18;       // CNTL2 ACTIVE_PAGE_MIGRATION_PTE_READ_RETRY
+// GCVM_CONTEXT0_CNTL
+constexpr uint32_t kCtxDepthMask          = 3u << 1;
+constexpr uint32_t kCtxRetryPermFault     = 1u << 8;
+// GCVM_INVALIDATE_ENGx_REQ for VMID0, legacy flush: L2 PTEs, PDE0-2, L1 PTEs.
+constexpr uint32_t kInvReqVmid0           = (1u << 0) | (1u << 19) | (1u << 20) |
+                                            (1u << 21) | (1u << 22) | (1u << 23);
 
 // --- MM hub (MMMC / MMVM): display, PSP and the rest of the SoC -----------------
 constexpr Reg MmFbLocationBase    { 0, 0x0554 };

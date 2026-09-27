@@ -156,6 +156,28 @@ private:
 
 	// Stage 3.
 	bool stageGfx();
+
+	// Stage 4: the GC hub, then SDMA0 queue 0 and a VRAM fill. Pool layout
+	// past the PSP's first 4 MiB (offsets within the pool).
+	static constexpr uint32_t kPtOffset       = 4u << 20;             // VMID0 page table (unused range)
+	static constexpr uint32_t kScratchOffset  = kPtOffset + 0x1000;   // system-aperture default page
+	static constexpr uint32_t kSdmaRingOffset = 8u << 20;             // 4 KiB ring
+	static constexpr uint32_t kSdmaRingSize   = 0x1000;
+	static constexpr uint32_t kSdmaRptrOffset = kSdmaRingOffset + 0x1000;   // rptr writeback
+	static constexpr uint32_t kSdmaWptrOffset = kSdmaRptrOffset + 0x40;     // wptr poll copy
+	static constexpr uint32_t kSdmaTestOffset = kSdmaRingOffset + 0x2000;   // WRITE target
+	static constexpr uint32_t kSdmaFenceOffset = kSdmaTestOffset + 0x40;    // FENCE target
+	static constexpr uint32_t kFillOffset     = 16u << 20;            // CONST_FILL target
+	static constexpr uint32_t kFillBytes      = 1u << 20;
+	uint64_t poolMc(uint32_t off) const { return pool.mcAddress + off; }
+	volatile uint32_t *poolDw(uint32_t off) const {
+		return reinterpret_cast<volatile uint32_t *>(poolCpu + off);
+	}
+	bool gcHubInit();
+	bool gcHubFlush();
+	bool sdmaQueueInit();
+	void sdmaKick(uint32_t wptrBytes);
+	bool stageSdma();
 	// SMU mailbox (MP1): send one message, return the response code
 	// (1 = OK, 0 = no answer) and the argument register after it.
 	uint32_t smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs);
