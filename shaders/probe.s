@@ -2,7 +2,9 @@
 //
 // Every work-item i writes 0x5EED0000 + 3*i to buffer[i]. Launch state:
 //   s[0:1]  buffer address         (COMPUTE_USER_DATA_0/1, 2 user SGPRs)
-//   s2      work-group id x        (TGID_X_EN, right after the user SGPRs)
+//   ttmp9   work-group id x        (TGID_X_EN; GFX12 delivers work-group ids in
+//                                  ttmp9/ttmp7, not in the SGPRs after the user
+//                                  ones: architected SGPRs, as clang assumes)
 //   v0      work-item id x         (TIDIG_COMP_CNT = 0; y = z = 0)
 // with 64 work-items per group. Assembled by tools/build-shaders.sh
 // (llvm-mc) into src/probe_kernel.h.
@@ -11,7 +13,7 @@
 	.text
 	.globl	rdna4_probe
 rdna4_probe:
-	s_lshl_b32	s3, s2, 6			// group base = group id * 64
+	s_lshl_b32	s3, ttmp9, 6			// group base = group id * 64
 	v_add_nc_u32	v1, s3, v0			// global id
 	v_lshlrev_b32	v2, 2, v1			// byte offset
 	v_mul_u32_u24	v3, 3, v1			// 3 * id

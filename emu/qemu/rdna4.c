@@ -1301,7 +1301,7 @@ typedef struct RDNA4Lane {
 
 static uint32_t rdna4_isa_src(const RDNA4Lane *l, uint32_t src, uint32_t literal, bool *used_lit)
 {
-    if (src < 106) {
+    if (src < 106 || (src >= 108 && src <= 123)) {      /* SGPRs, TTMP0-15 */
         return l->s[src];
     }
     if (src >= 128 && src <= 192) {
@@ -1413,8 +1413,15 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
             for (uint32_t i = 0; i < nuser && i < 16; i++) {
                 l.s[i] = reg_get(s, REG_CS_USER_DATA_0 + 4 * i);
             }
+            /*
+             * GFX12 has architected SGPRs: the work-group ids arrive in
+             * TTMP9 (x) and TTMP7 (y [15:0], z [31:16]), not in the SGPRs
+             * after the user ones (LLVM's FeatureArchitectedSGPRs; clang's
+             * gfx1201 code reads ttmp9).
+             */
             if (rsrc2 & (1u << 7)) {                    /* TGID_X_EN */
-                l.s[nuser] = g;
+                l.s[108 + 9] = g;
+                l.s[108 + 7] = 0;
             }
             l.v[0] = t & 0x3ff;                          /* packed ids: x [9:0] */
             if (!rdna4_isa_run(s, pgm, &l)) {
