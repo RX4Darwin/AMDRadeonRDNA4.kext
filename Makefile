@@ -183,6 +183,10 @@ $(EXEC): $(OBJS)
 $(KEXT): $(EXEC) Info.plist
 	@mkdir -p $(KEXT)/Contents
 	cp Info.plist $(KEXT)/Contents/Info.plist
+	@# AMD's firmware license travels with the binary that embeds its firmware.
+	@if [ -n "$(ASM_SRCS)" ] && [ -f firmware/amdgpu/LICENSE.amdgpu ]; then \
+		mkdir -p $(KEXT)/Contents/Resources && \
+		cp firmware/amdgpu/LICENSE.amdgpu $(KEXT)/Contents/Resources/LICENSE.amdgpu; fi
 	@# Minimal, ad-hoc code signature so kextutil is happier during testing.
 	codesign --force --sign - $(KEXT) 2>/dev/null || true
 	@echo "Built $(KEXT) for $(ARCH) (min macOS $(DEPLOY))"

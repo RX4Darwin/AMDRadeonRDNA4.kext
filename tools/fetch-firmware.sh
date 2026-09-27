@@ -18,4 +18,4 @@ for f in psp_14_0_3_sos.bin psp_14_0_3_ta.bin smu_14_0_3.bin sdma_7_0_1.bin \
 	curl -fsSL -o "$D/$f" "$B/amdgpu/$f"
 	echo "fetched $f ($(wc -c < "$D/$f") bytes)"
 done
-curl -fsSL -o "$D/LICENSE.amdgpu" "$B/LICENSE.amdgpu"
+curl -fsSL -o "$D/LICENSE.amdgpu" "$B/LICENSES/LICENSE.amdgpu"

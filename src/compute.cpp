@@ -1116,6 +1116,38 @@ bool RDNA4Compute::hqdInit() {
 	                     queueSize | (9u << 8) | kPqUnordDispatch | kPqPrivState | kPqKmdQueue;
 	uint32_t doorbell = (kComputeDoorbellDword << kDoorbellOffsetShift) | kDoorbellEn;
 
+	// The MQD in memory, as gfx_v12_0_compute_mqd_init fills it (v12_compute_mqd
+	// dword offsets): the CP reads it back (CU masks, save/restore), so it
+	// must describe the same queue the registers below do.
+	auto mqdDw = [this](uint32_t dw, uint32_t v) { *poolDw(kMqdOffset + 4 * dw) = v; };
+	mqdDw(0, 0xC0310800);                             // header
+	mqdDw(11, 1);                                     // compute_pipelinestat_enable
+	mqdDw(23, 0xffffffff);                            // compute_static_thread_mgmt_se0
+	mqdDw(24, 0xffffffff);                            // ..._se1
+	mqdDw(26, 0xffffffff);                            // ..._se2
+	mqdDw(27, 0xffffffff);                            // ..._se3
+	mqdDw(32, 7);                                     // compute_misc_reserved
+	mqdDw(128, static_cast<uint32_t>(mqd) & ~3u);     // cp_mqd_base_addr_lo
+	mqdDw(129, static_cast<uint32_t>(mqd >> 32));
+	mqdDw(130, 1);                                    // cp_hqd_active
+	mqdDw(131, 0);                                    // cp_hqd_vmid
+	mqdDw(132, kHqdPersistentDefault);                // cp_hqd_persistent_state
+	mqdDw(135, (1u << 0) | (1u << 4) | (1u << 8));    // cp_hqd_quantum: EN, SCALE 1, DURATION 1
+	mqdDw(136, static_cast<uint32_t>(pq));            // cp_hqd_pq_base_lo
+	mqdDw(137, static_cast<uint32_t>(pq >> 32));
+	mqdDw(139, static_cast<uint32_t>(rptr) & ~3u);    // cp_hqd_pq_rptr_report_addr_lo
+	mqdDw(140, static_cast<uint32_t>(rptr >> 32) & 0xffff);
+	mqdDw(141, static_cast<uint32_t>(wpoll) & ~3u);   // cp_hqd_pq_wptr_poll_addr_lo
+	mqdDw(142, static_cast<uint32_t>(wpoll >> 32) & 0xffff);
+	mqdDw(143, doorbell);                             // cp_hqd_pq_doorbell_control
+	mqdDw(145, pqControl);                            // cp_hqd_pq_control
+	mqdDw(149, 0x00300000);                           // cp_hqd_ib_control: MIN_IB_AVAIL_SIZE 3
+	mqdDw(162, kMqdControlDefault & ~0xfu);           // cp_mqd_control: VMID 0
+	mqdDw(165, static_cast<uint32_t>(eop));           // cp_hqd_eop_base_addr_lo
+	mqdDw(166, static_cast<uint32_t>(eop >> 32));
+	mqdDw(167, (kHqdEopControlDefault & ~0x3fu) | eopSize);
+	flushHdp();
+
 	grbmSelect(1, 0, 0, 0);
 	wr(IpDiscovery::HwGc, CpPqWptrPollCntl, rdGc(CpPqWptrPollCntl) & ~kPqWptrPollEn);
 	wr(IpDiscovery::HwGc, CpHqdEopBase, static_cast<uint32_t>(eop));
