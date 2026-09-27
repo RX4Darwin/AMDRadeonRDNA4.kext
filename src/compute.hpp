@@ -18,10 +18,15 @@
 //    stage 2  psp       sOS components through the bootloader, the GPCOM
 //                       ring, LOAD_TOC, then the SMU firmware (LOAD_IP_FW);
 //                       verified by the SMU answering its mailbox.
-//    stage 3  gfx       GC firmware (SDMA, RS64 PFP/ME/MEC, IMU, RLC) into the
-//                       TMR, RLC autoload + IMU start, GC hub, an SDMA VRAM
-//                       fill and a compute-queue PM4 fence.
-//    stage 4  dispatch  an amdhsa code object (upstream LLVM, gfx1201).
+//    stage 3  gfx       the GC firmware set (SDMA, RS64 PFP/ME/MEC + stacks,
+//                       MES, IMU, RLC) into the TMR via LOAD_IP_FW, then
+//                       AUTOLOAD_RLC: the RLC boots GFX; verified by
+//                       RLC_RLCS_BOOTLOAD_STATUS.BOOTLOAD_COMPLETE.
+//    stage 4  sdma      GC hub apertures, one SDMA queue, a VRAM fill read
+//                       back by the CPU: the first work the GPU does for us.
+//    stage 5  compute   one MEC compute queue (HQD) programmed directly, a
+//                       PM4 fence.
+//    stage 6  dispatch  an amdhsa code object (upstream LLVM, gfx1201).
 //
 //  Selected with the boot-arg rdna4-compute=<stage>; absent/0 = off, and the
 //  plugin behaves exactly as without this file. Each stage runs the ones
@@ -63,7 +68,9 @@ public:
 		StageSurvey   = 1,
 		StagePsp      = 2,
 		StageGfx      = 3,
-		StageDispatch = 4,
+		StageSdma     = 4,
+		StageCompute  = 5,
+		StageDispatch = 6,
 	};
 
 	// rdna4-compute=<stage>, clamped to StageDispatch. 0 when absent.
@@ -140,6 +147,9 @@ private:
 	// Stage 2.
 	Psp::Driver psp;
 	bool stagePsp();
+
+	// Stage 3.
+	bool stageGfx();
 	// SMU mailbox (MP1): send one message, return the response code
 	// (1 = OK, 0 = no answer) and the argument register after it.
 	uint32_t smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs);

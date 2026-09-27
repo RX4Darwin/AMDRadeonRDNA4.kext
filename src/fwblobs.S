@@ -24,3 +24,21 @@ _rdna4_fw_smu:
 	.incbin "firmware/amdgpu/smu_14_0_3.bin"
 	.globl _rdna4_fw_smu_end
 _rdna4_fw_smu_end:
+
+// GC 12.0.1 set for the RLC autoload (stage 3), and SDMA 7.0.1.
+.macro FWBLOB name, file
+	.p2align 4
+	.globl _rdna4_fw_\name
+_rdna4_fw_\name:
+	.incbin "\file"
+	.globl _rdna4_fw_\name\()_end
+_rdna4_fw_\name\()_end:
+.endm
+
+	FWBLOB sdma, "firmware/amdgpu/sdma_7_0_1.bin"
+	FWBLOB pfp,  "firmware/amdgpu/gc_12_0_1_pfp.bin"
+	FWBLOB me,   "firmware/amdgpu/gc_12_0_1_me.bin"
+	FWBLOB mec,  "firmware/amdgpu/gc_12_0_1_mec.bin"
+	FWBLOB mes,  "firmware/amdgpu/gc_12_0_1_uni_mes.bin"
+	FWBLOB imu,  "firmware/amdgpu/gc_12_0_1_imu.bin"
+	FWBLOB rlc,  "firmware/amdgpu/gc_12_0_1_rlc.bin"

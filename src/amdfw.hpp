@@ -63,6 +63,35 @@ struct PspPackage {
 // only by some boards, are skipped as amdgpu does by default).
 bool parsePsp(const uint8_t *data, size_t size, PspPackage &out);
 
+// --- GC 12 firmware set ----------------------------------------------------------
+//
+// What the PSP loads into the TMR for the RLC autoload, in the order amdgpu
+// hands it over (AMDGPU_UCODE_ID order), each with its psp_gfx_fw_type. The
+// payloads are cut out of the blobs exactly as amdgpu_ucode_init_single_fw
+// does for PSP loading.
+
+struct GfxBlobs {
+	Blob sdma;      // sdma_7_0_1.bin       (sdma header v3)
+	Blob pfp;       // gc_12_0_1_pfp.bin    (gfx header v2: RS64 ucode + stack)
+	Blob me;        // gc_12_0_1_me.bin
+	Blob mec;       // gc_12_0_1_mec.bin
+	Blob mes;       // gc_12_0_1_uni_mes.bin (mes header v1: ucode + data)
+	Blob imu;       // gc_12_0_1_imu.bin    (imu header v1: IRAM + DRAM)
+	Blob rlc;       // gc_12_0_1_rlc.bin    (rlc header v2.2+)
+};
+
+struct GfxImage {
+	const char *name;
+	uint32_t    pspType;    // psp_gfx_fw_type
+	Blob        payload;
+};
+
+constexpr uint32_t kMaxGfxImages = 20;
+
+// Build the ordered load list. Returns the number of images, 0 if a blob is
+// missing or malformed (`why` says which).
+uint32_t buildGfxImages(const GfxBlobs &blobs, GfxImage *out, uint32_t cap, const char **why);
+
 } // namespace AmdFw
 
 #endif /* AmdFw_hpp */

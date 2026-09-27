@@ -97,3 +97,8 @@ MMVM_CONTEXT0_CNTL 0 0x0564 0x69590 0x03fffc00
 # NBIF (6.3.1 seg2 0xd20): HDP flush remapped into BAR5 by the VBIOS
 BIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL 2 0x012d 0x03934 0x0000385c
 BIF_BX0_REMAP_HDP_REG_FLUSH_CNTL 2 0x012e 0x03938 0x00003858
+
+# GC (12.0.1 seg0 0x1260, seg1 0xa000) cold, as surveyed: IMU core and data
+# in reset, GFX reset domains held (only bits 4-5 set), RLC off
+GFX_IMU_CORE_CTRL 1 0x40b6 0x382d8 0x00000009
+GFX_IMU_GFX_RESET_CTRL 1 0x40bc 0x382f0 0x00000030

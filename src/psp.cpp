@@ -259,4 +259,11 @@ Result Driver::loadIpFw(const AmdFw::Blob &ucode, uint32_t fwType, Response &res
 	return r;
 }
 
+Result Driver::autoloadRlc() {
+	Response resp;
+	Result r = submit(CmdAutoloadRlc, nullptr, 0, resp, 5000);
+	r.what = r.ok ? "AUTOLOAD_RLC" : r.what;
+	return r;
+}
+
 } // namespace Psp

@@ -24,7 +24,15 @@ using namespace GfxReg;
 extern "C" {
 extern const uint8_t rdna4_fw_psp_sos[], rdna4_fw_psp_sos_end[];
 extern const uint8_t rdna4_fw_smu[], rdna4_fw_smu_end[];
+extern const uint8_t rdna4_fw_sdma[], rdna4_fw_sdma_end[];
+extern const uint8_t rdna4_fw_pfp[], rdna4_fw_pfp_end[];
+extern const uint8_t rdna4_fw_me[], rdna4_fw_me_end[];
+extern const uint8_t rdna4_fw_mec[], rdna4_fw_mec_end[];
+extern const uint8_t rdna4_fw_mes[], rdna4_fw_mes_end[];
+extern const uint8_t rdna4_fw_imu[], rdna4_fw_imu_end[];
+extern const uint8_t rdna4_fw_rlc[], rdna4_fw_rlc_end[];
 }
+#define FW_BLOB(n) AmdFw::Blob { rdna4_fw_##n, static_cast<uint32_t>(rdna4_fw_##n##_end - rdna4_fw_##n) }
 #endif
 
 namespace {
@@ -356,8 +364,16 @@ void RDNA4Compute::runStages() {
 		}
 		done = StagePsp;
 	}
-	if (target >= StageGfx)
-		CLOG("stage 3 (gfx) is not implemented yet; stopping after stage 2");
+	if (target >= StageGfx) {
+		if (!stageGfx()) {
+			CLOG("stage 3 (gfx) failed; stopping, the display is not affected");
+			env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
+			return;
+		}
+		done = StageGfx;
+	}
+	if (target >= StageSdma)
+		CLOG("stage 4 (sdma) is not implemented yet; stopping after stage 3");
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
 	CLOG("bring-up finished at stage %u", done);
 }
@@ -550,6 +566,113 @@ bool RDNA4Compute::stagePsp() {
 	     (ver >> 16) & 0xff, (ver >> 8) & 0xff, ver & 0xff);
 	put("SMUAlive", 1);
 	put("SMUVersion", ver);
+	publish();
+	return true;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: GC firmware into the TMR, RLC autoload
+// ---------------------------------------------------------------------------
+
+bool RDNA4Compute::stageGfx() {
+#ifdef RDNA4FB_NO_FIRMWARE
+	return false;
+#else
+	OSDictionary *d = OSDictionary::withCapacity(12);
+	auto put = [d](const char *key, uint64_t v) {
+		if (OSNumber *n = d ? OSNumber::withNumber(v, 64) : nullptr) {
+			d->setObject(key, n);
+			n->release();
+		}
+	};
+	auto publish = [this, d]() {
+		if (d) {
+			env.owner->setProperty("Compute,GFX", d);
+			d->release();
+		}
+	};
+
+	const AmdFw::GfxBlobs blobs { FW_BLOB(sdma), FW_BLOB(pfp), FW_BLOB(me), FW_BLOB(mec),
+	                              FW_BLOB(mes), FW_BLOB(imu), FW_BLOB(rlc) };
+	AmdFw::GfxImage img[AmdFw::kMaxGfxImages];
+	const char *why = nullptr;
+	const uint32_t n = AmdFw::buildGfxImages(blobs, img, AmdFw::kMaxGfxImages, &why);
+	if (!n) {
+		CLOG("gfx: embedded GC firmware does not parse (%s)", why ? why : "?");
+		publish();
+		return false;
+	}
+	CLOG("gfx: %u firmware images for the RLC autoload", n);
+
+	// 1. Everything into the TMR, in amdgpu's order; RLC_G is last.
+	for (uint32_t i = 0; i < n; i++) {
+		Psp::Response resp;
+		Psp::Result r = psp.loadIpFw(img[i].payload, img[i].pspType, resp);
+		CLOG("gfx: LOAD_IP_FW %-21s type %2u %7u bytes -> %s (0x%x)", img[i].name,
+		     img[i].pspType, img[i].payload.size, r.what, r.value);
+		if (!r.ok) {
+			put("FailedImage", i);
+			put("FailedStatus", r.value);
+			publish();
+			return false;
+		}
+	}
+	put("ImagesLoaded", n);
+
+	// 2. Let the RLC boot GFX from the TMR.
+	Psp::Result r = psp.autoloadRlc();
+	CLOG("gfx: %s (0x%x)", r.what, r.value);
+	put("AutoloadStatus", r.value);
+	if (!r.ok) {
+		publish();
+		return false;
+	}
+
+	// 3. gfx_v12_0_wait_for_rlc_autoload_complete: CP idle and the RLC
+	//    reports its bootload complete.
+	uint32_t cpStat = kBad, boot = kBad;
+	bool complete = false;
+	for (uint32_t ms = 0; ms < 2000 && !complete; ms++) {
+		cpStat = rdGc(CpStat);
+		boot = rdGc(RlcBootloadStatus);
+		complete = cpStat == 0 && boot != kBad && (boot & kRlcBootComplete);
+		if (!complete)
+			IOSleep(1);
+	}
+	put("CP_STAT", cpStat);
+	put("RLC_BOOTLOAD_STATUS", boot);
+	if (!complete) {
+		CLOG("gfx: RLC autoload did not complete (CP_STAT 0x%08x, bootload 0x%08x)", cpStat, boot);
+		publish();
+		return false;
+	}
+
+	// What GFX looks like now, next to the stage 1 survey.
+	const uint32_t imu = rdGc(ImuCoreCtrl), gfxReset = rdGc(ImuGfxResetCtrl);
+	const uint32_t rlc = rdGc(RlcCntl), grbm = rdGc(GrbmStatus), mec = rdGc(CpMecRs64Cntl);
+	const uint32_t sdma0 = rdGc(sdma(0, SdmaStatusReg)), sdma1 = rdGc(sdma(1, SdmaStatusReg));
+	CLOG("gfx: RLC autoload complete: bootload 0x%08x, IMU core 0x%08x, GFX reset 0x%08x, "
+	     "RLC_CNTL 0x%08x, GRBM 0x%08x, MEC 0x%08x", boot, imu, gfxReset, rlc, grbm, mec);
+	CLOG("gfx: SDMA0 status 0x%08x (ucode init %s), SDMA1 status 0x%08x (ucode init %s)", sdma0,
+	     (sdma0 & kSdmaUcodeInitDone) ? "done" : "not done", sdma1,
+	     (sdma1 & kSdmaUcodeInitDone) ? "done" : "not done");
+	put("IMU_CORE_CTRL", imu);
+	put("IMU_GFX_RESET_CTRL", gfxReset);
+	put("RLC_CNTL", rlc);
+	put("SDMA0_STATUS", sdma0);
+	put("SDMA1_STATUS", sdma1);
+
+	// The GC hub read all-zero while GFX was in reset (stage 1). Now that GC
+	// is up, whether the VBIOS programmed its FB aperture decides how much
+	// of it stage 4 must set up itself.
+	const uint32_t fbBase = rdGc(GcFbLocationBase), fbTop = rdGc(GcFbLocationTop);
+	CLOG("gfx: GC hub now: fb base 0x%08x top 0x%08x offset 0x%08x, agp 0x%08x/0x%08x/0x%08x, "
+	     "sys_low 0x%08x, l2 0x%08x, ctx0 0x%08x, l1 tlb 0x%08x", fbBase, fbTop,
+	     rdGc(GcFbOffset), rdGc(GcAgpBase), rdGc(GcAgpBot), rdGc(GcAgpTop),
+	     rdGc(GcSysApertureLow), rdGc(GcL2Cntl), rdGc(GcCtx0Cntl), rdGc(GcMxL1TlbCntl));
+	put("GCMC_FB_BASE", fbBase);
+	put("GCMC_FB_TOP", fbTop);
 	publish();
 	return true;
 #endif

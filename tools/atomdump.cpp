@@ -1516,6 +1516,74 @@ static int testPsp() {
 	return failures;
 }
 
+// The GC 12 firmware set the PSP loads for the RLC autoload (stage 3).
+static int testGfxImages() {
+	int failures = 0;
+	static const char *const names[] = {
+		"firmware/amdgpu/sdma_7_0_1.bin", "firmware/amdgpu/gc_12_0_1_pfp.bin",
+		"firmware/amdgpu/gc_12_0_1_me.bin", "firmware/amdgpu/gc_12_0_1_mec.bin",
+		"firmware/amdgpu/gc_12_0_1_uni_mes.bin", "firmware/amdgpu/gc_12_0_1_imu.bin",
+		"firmware/amdgpu/gc_12_0_1_rlc.bin",
+	};
+	std::vector<uint8_t> files[7];
+	for (int i = 0; i < 7; i++)
+		if (!readFile(names[i], files[i])) {
+			printf("\ngfx images: %s absent, skipped\n", names[i]);
+			return 0;
+		}
+	auto blob = [&](int i) { return AmdFw::Blob { files[i].data(), static_cast<uint32_t>(files[i].size()) }; };
+	AmdFw::GfxBlobs b { blob(0), blob(1), blob(2), blob(3), blob(4), blob(5), blob(6) };
+
+	AmdFw::GfxImage img[AmdFw::kMaxGfxImages];
+	const char *why = nullptr;
+	uint32_t n = AmdFw::buildGfxImages(b, img, AmdFw::kMaxGfxImages, &why);
+	failures += check(n >= 15, "gfx images: %u built (%s)", n, why ? why : "-");
+
+	// amdgpu's load order and types; RLC_G last (it triggers the autoload).
+	static const struct { const char *name; uint32_t type; } expect[] = {
+		{ "SDMA_RS64", 71 }, { "RS64_PFP", 87 }, { "RS64_ME", 88 }, { "RS64_MEC", 89 },
+		{ "RS64_PFP_P0_STACK", 90 }, { "RS64_ME_P0_STACK", 92 }, { "RS64_MEC_P0_STACK", 94 },
+		{ "RS64_MEC_P1_STACK", 95 }, { "CP_MES", 33 }, { "CP_MES_DATA", 34 },
+		{ "IMU_I", 68 }, { "IMU_D", 69 },
+	};
+	for (uint32_t i = 0; i < 12 && i < n; i++)
+		failures += check(!strcmp(img[i].name, expect[i].name) && img[i].pspType == expect[i].type,
+		                  "gfx images: [%u] %s/%u, expected %s/%u", i, img[i].name,
+		                  img[i].pspType, expect[i].name, expect[i].type);
+	failures += check(n && !strcmp(img[n - 1].name, "RLC_G") && img[n - 1].pspType == 8 &&
+	                  img[n - 1].payload.size == 25088, "gfx images: RLC_G must come last");
+	failures += check(n >= 3 && !strcmp(img[n - 3].name, "RLC_IRAM") &&
+	                  !strcmp(img[n - 2].name, "RLC_DRAM"), "gfx images: RLC IRAM/DRAM before RLC_G");
+
+	// Every payload lies inside its blob, is dword-sized and fits the PSP
+	// staging area; IMU I+D cover the IMU ucode.
+	bool inside = true;
+	for (uint32_t i = 0; i < n; i++) {
+		bool ok = false;
+		for (auto &f : files)
+			ok |= img[i].payload.data >= f.data() &&
+			      img[i].payload.data + img[i].payload.size <= f.data() + f.size();
+		inside &= ok && img[i].payload.size % 4 == 0 &&
+		          img[i].payload.size <= 62u * 1024 * 1024;
+	}
+	failures += check(inside, "gfx images: payload outside its blob or misaligned");
+	failures += check(img[10].payload.size + img[11].payload.size == 132096,
+	                  "gfx images: IMU I+D = %u bytes", img[10].payload.size + img[11].payload.size);
+
+	// Truncated blobs are refused, not over-read.
+	AmdFw::GfxBlobs cut = b;
+	cut.rlc.size = 150;
+	failures += check(AmdFw::buildGfxImages(cut, img, AmdFw::kMaxGfxImages, &why) == 0,
+	                  "gfx images: truncated RLC accepted");
+
+	n = AmdFw::buildGfxImages(b, img, AmdFw::kMaxGfxImages, &why);
+	printf("\ngfx images: %u to load before AUTOLOAD_RLC:", n);
+	for (uint32_t i = 0; i < n; i++)
+		printf("%s %s(%u)", i % 4 ? "" : "\n ", img[i].name, img[i].payload.size);
+	printf("\n");
+	return failures;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
@@ -1705,6 +1773,7 @@ int main(int argc, char **argv) {
 	failures += testNdrv();
 	failures += testModeSet();
 	failures += testPsp();
+	failures += testGfxImages();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

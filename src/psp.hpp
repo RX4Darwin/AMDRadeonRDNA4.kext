@@ -146,6 +146,9 @@ public:
 	// LOAD_IP_FW: copy `ucode` to the staging area and have the PSP load it.
 	Result loadIpFw(const AmdFw::Blob &ucode, uint32_t fwType, Response &resp);
 
+	// AUTOLOAD_RLC: all GC firmware is in the TMR, let the RLC boot GFX.
+	Result autoloadRlc();
+
 	uint32_t fenceValue() const { return fence; }
 
 private:

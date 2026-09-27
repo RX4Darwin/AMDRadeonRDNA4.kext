@@ -73,7 +73,11 @@ C_SRCS := \
 # AMD firmware for the compute bring-up (src/compute.cpp, stage 2+): the
 # linux-firmware blobs in firmware/amdgpu/ are embedded when all are present;
 # otherwise the kext builds without them and those stages report it.
-FW_BLOBS := firmware/amdgpu/psp_14_0_3_sos.bin firmware/amdgpu/smu_14_0_3.bin
+FW_BLOBS := firmware/amdgpu/psp_14_0_3_sos.bin firmware/amdgpu/smu_14_0_3.bin \
+            firmware/amdgpu/sdma_7_0_1.bin firmware/amdgpu/gc_12_0_1_pfp.bin \
+            firmware/amdgpu/gc_12_0_1_me.bin firmware/amdgpu/gc_12_0_1_mec.bin \
+            firmware/amdgpu/gc_12_0_1_uni_mes.bin firmware/amdgpu/gc_12_0_1_imu.bin \
+            firmware/amdgpu/gc_12_0_1_rlc.bin
 ifeq ($(wildcard $(FW_BLOBS)),$(FW_BLOBS))
 ASM_SRCS := src/fwblobs.S
 FW_FLAGS :=

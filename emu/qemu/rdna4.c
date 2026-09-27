@@ -217,8 +217,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define PSP_RESP_TMR_SIZE    880
 #define PSP_CMD_LOAD_IP_FW   0x06
 #define PSP_CMD_LOAD_TOC     0x20
+#define PSP_CMD_AUTOLOAD_RLC 0x21
 #define PSP_CMD_FB_RESERV    0x50
 #define PSP_FW_TYPE_SMU      18
+#define PSP_ERR_AUTOLOAD     0x9            /* model: GC firmware set incomplete */
+
+/*
+ * GC 12.0.1 registers the RLC autoload changes (GC seg0 dword 0x1260, seg1
+ * 0xa000). The model does not run the firmware; after a complete
+ * AUTOLOAD_RLC it shows the state amdgpu waits for.
+ */
+#define GC_SEG0(dw)          ((0x1260 + (dw)) * 4)
+#define GC_SEG1(dw)          ((0xa000 + (dw)) * 4)
+#define REG_GC_CP_STAT       GC_SEG0(0x0f40)
+#define REG_GC_RLC_BOOTLOAD  GC_SEG1(0x4e7c)   /* BOOTLOAD_COMPLETE [31] */
+#define REG_GC_RLC_CNTL      GC_SEG1(0x4c00)
+#define REG_GC_IMU_CORE_CTRL GC_SEG1(0x40b6)   /* CRESET [0] */
+#define REG_GC_IMU_GFX_RESET GC_SEG1(0x40bc)   /* 0x1f = domains released */
+#define REG_GC_SDMA0_STATUS  GC_SEG0(0x0024)
+#define REG_GC_SDMA1_STATUS  GC_SEG0(0x0624)
+#define SDMA_STATUS_BOOTED   0x08000001u       /* UCODE_INIT_DONE | IDLE */
 #define PSP_ERR_UNKNOWN_CMD  0x100
 #define PSP_TMR_SIZE         0x1400000      /* model's answer to LOAD_TOC */
 
@@ -301,6 +319,8 @@ struct RDNA4State {
     uint32_t     psp_ring_size;
     uint32_t     psp_rptr;              /* dwords */
     bool         pmfw_loaded;           /* SMU firmware in: the mailbox answers */
+    uint64_t     psp_fw_types[2];       /* LOAD_IP_FW types seen, by bit */
+    bool         gfx_booted;            /* RLC autoload done */
 };
 
 static inline uint32_t reg_get(RDNA4State *s, uint32_t byte)
@@ -900,8 +920,36 @@ static void rdna4_psp_command(RDNA4State *s, uint64_t cmd)
         if (type == PSP_FW_TYPE_SMU) {
             s->pmfw_loaded = true;
         }
+        if (type < 128) {
+            s->psp_fw_types[type / 64] |= 1ull << (type % 64);
+        }
         rdna4_mc_set(s, cmd + PSP_RESP_FW_LO, 0x1000 * type);  /* "TMR address" */
         fprintf(stderr, "rdna4: psp: LOAD_IP_FW type %u, %u bytes\n", type, len);
+        break;
+    }
+    case PSP_CMD_AUTOLOAD_RLC: {
+        /* RLC_G, IMU I/D, SDMA, RS64 PFP/ME/MEC and their stacks, MES */
+        static const uint8_t need[] = { 8, 33, 34, 68, 69, 71, 87, 88, 89, 90, 92, 94, 95 };
+        for (unsigned i = 0; i < ARRAY_SIZE(need); i++) {
+            if (!(s->psp_fw_types[need[i] / 64] & (1ull << (need[i] % 64)))) {
+                fprintf(stderr, "rdna4: psp: AUTOLOAD_RLC without firmware type %u\n",
+                        need[i]);
+                status = PSP_ERR_AUTOLOAD;
+                break;
+            }
+        }
+        if (status) {
+            break;
+        }
+        s->gfx_booted = true;
+        reg_set(s, REG_GC_CP_STAT, 0);
+        reg_set(s, REG_GC_RLC_BOOTLOAD, 0x8000003f);
+        reg_set(s, REG_GC_RLC_CNTL, 1);
+        reg_set(s, REG_GC_IMU_CORE_CTRL, 0);
+        reg_set(s, REG_GC_IMU_GFX_RESET, reg_get(s, REG_GC_IMU_GFX_RESET) | 0x1f);
+        reg_set(s, REG_GC_SDMA0_STATUS, SDMA_STATUS_BOOTED);
+        reg_set(s, REG_GC_SDMA1_STATUS, SDMA_STATUS_BOOTED);
+        fprintf(stderr, "rdna4: psp: AUTOLOAD_RLC: GFX booted\n");
         break;
     }
     case PSP_CMD_FB_RESERV:
@@ -1395,6 +1443,8 @@ static void rdna4_reset(DeviceState *dev)
     s->psp_ring_size = 0;
     s->psp_rptr = 0;
     s->pmfw_loaded = false;
+    memset(s->psp_fw_types, 0, sizeof(s->psp_fw_types));
+    s->gfx_booted = false;
     memset(s->symclk_khz, 0, sizeof(s->symclk_khz));
     memset(s->dig_mode, 0, sizeof(s->dig_mode));
     /*
