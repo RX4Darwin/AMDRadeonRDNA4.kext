@@ -78,6 +78,12 @@ public:
 	void setDisplayPower(bool on);
 	bool displayPowerOn { true };
 
+	// Shared with the compute bring-up (compute.hpp): the BAR5 mapping and
+	// the IP discovery table. Null until init() found them.
+	volatile uint32_t *mmioBase() const { return rmmio; }
+	size_t mmioSize() const { return rmmioSize; }
+	const IpDiscovery *discovery() const { return ipDiscovery.isValid() ? &ipDiscovery : nullptr; }
+
 private:
 	IOPCIDevice *pciDevice { nullptr };
 	IOService   *owner { nullptr };

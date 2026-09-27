@@ -27,6 +27,7 @@
 #include <IOKit/ndrvsupport/IOMacOSTypes.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 
+#include "compute.hpp"
 #include "device.hpp"
 #include "ndrv.hpp"
 #ifdef RDNA4FB_VM_TEST
@@ -129,11 +130,13 @@ KernelPatcher::KextInfo kextIONDRVSupport {
 mach_vm_address_t orgDoDriverIO { 0 };
 bool traceEnabled { false };
 uint32_t traceBudget { 400 };   // bounded: gamma/CLUT calls can be frequent
+uint32_t computeStage { 0 };    // rdna4-compute=<stage>, see compute.hpp
 
 // What we keep for one of our framebuffers.
 struct FbState {
 	RDNA4Device      dev;
 	Ndrv::Translator ndrv;
+	RDNA4Compute     compute;
 };
 
 // Framebuffers seen so far, whether they drive one of our GPUs, and the
@@ -267,6 +270,14 @@ void attach(FbEntry &e) {
 	e.state = st;
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
+
+	// Compute bring-up runs after the display is answered for, and only
+	// when asked for: it must never be the reason the desktop is missing.
+	if (computeStage && dev.isAmd) {
+		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
+		                        dev.fbPhysBase, dev.fbLength };
+		st->compute.start(env, computeStage);
+	}
 }
 
 const char *commandName(UInt32 code) {
@@ -359,7 +370,9 @@ void pluginStart() {
 	if (!PE_parse_boot_argn("rdna4-trace", &trace, sizeof(trace)))
 		traceEnabled = true;
 #endif
-	FBLOG("Lilu plugin started (trace %s)", traceEnabled ? "on" : "off");
+	computeStage = RDNA4Compute::requestedStage();
+	FBLOG("Lilu plugin started (trace %s, compute stage %u)", traceEnabled ? "on" : "off",
+	      computeStage);
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
 }
 

@@ -51,6 +51,9 @@ CXX_SRCS := \
 	src/device.cpp \
 	src/ndrv.cpp \
 	src/modeset.cpp \
+	src/compute.cpp \
+	src/amdfw.cpp \
+	src/psp.cpp \
 	$(LILU)/Library/plugin_start.cpp \
 	src/atombios.cpp \
 	src/ipdiscovery.cpp \
@@ -67,7 +70,20 @@ endif
 C_SRCS := \
 	src/kmod_info.c
 
+# AMD firmware for the compute bring-up (src/compute.cpp, stage 2+): the
+# linux-firmware blobs in firmware/amdgpu/ are embedded when all are present;
+# otherwise the kext builds without them and those stages report it.
+FW_BLOBS := firmware/amdgpu/psp_14_0_3_sos.bin firmware/amdgpu/smu_14_0_3.bin
+ifeq ($(wildcard $(FW_BLOBS)),$(FW_BLOBS))
+ASM_SRCS := src/fwblobs.S
+FW_FLAGS :=
+else
+ASM_SRCS :=
+FW_FLAGS := -DRDNA4FB_NO_FIRMWARE
+endif
+
 OBJS := $(patsubst %.cpp,$(BUILD)/%.o,$(CXX_SRCS)) \
+        $(patsubst %.S,$(BUILD)/%.o,$(ASM_SRCS)) \
         $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
 
 # --- flags -------------------------------------------------------------------
@@ -94,7 +110,7 @@ COMMON_FLAGS := \
 # exports ___cxa_atexit"). Kext teardown is handled by the kmod _stop path,
 # so static destructors are never wanted here.
 CXXFLAGS := $(COMMON_FLAGS) -std=c++17 -fno-exceptions -fno-rtti -fcheck-new \
-            -fno-c++-static-destructors
+            -fno-c++-static-destructors $(FW_FLAGS)
 CFLAGS   := $(COMMON_FLAGS)
 
 ifeq ($(VMTEST),1)
@@ -119,9 +135,9 @@ FIRMWARE := firmware/Sapphire.RX9070XT.16384.241213.rom
 .PHONY: all clean test
 all: $(KEXT)
 
-$(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp
+$(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp src/amdfw.cpp src/amdfw.hpp src/psp.cpp src/psp.hpp
 	@mkdir -p $(BUILD)
-	$(CXX) -std=c++17 -Wall -O2 -o $@ tools/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp src/modeset.cpp
+	$(CXX) -std=c++17 -Wall -O2 -o $@ tools/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp src/modeset.cpp src/amdfw.cpp src/psp.cpp
 
 atomdump: $(ATOMDUMP)
 
@@ -143,6 +159,11 @@ $(BUILD)/%.o: %.cpp | $(LILU_STAMP)
 $(BUILD)/%.o: %.c | $(LILU_STAMP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# .incbin paths are relative to the repository root, where make runs.
+$(BUILD)/src/fwblobs.o: src/fwblobs.S $(FW_BLOBS)
+	@mkdir -p $(dir $@)
+	$(CC) -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -c $< -o $@
 
 # Ensure kmod_info.o is linked in the required position: user objects,
 # then -lkmodc++, then kmod_info.o, then -lkmod.

@@ -57,6 +57,8 @@ gated() {
 	         ihdump pspdump vbl; do
 		have_arg "$a" && found="$found rdna4-$a=1"
 	done
+	stage="$(echo "$BOOTARGS" | grep -oE ' rdna4-compute=[0-9]+ ' | tr -d ' ')"
+	[ -n "$stage" ] && found="$found $stage"
 	[ -n "$found" ] && echo "active:$found" || echo "(no rdna4-* boot-args set)"
 
 	section "kext loaded?"
@@ -101,8 +103,13 @@ gated() {
 
 	gated "mode-setting survey" 'RDNA4FB: mode:' modedump
 
+	# Any stage (rdna4-compute=1..4), so not a gated "=1" section.
+	section "compute bring-up (rdna4-compute=<stage>)"
+	dmesg | grep -E 'RDNA4FB: compute:' || \
+		echo "(no compute lines — add rdna4-compute=1 to boot-args)"
+
 	section "ioreg: framebuffer properties"
-	ioreg -l -w0 | grep -E '"(Console|AtomBIOS|Discovery|VRAM|MMIO|EDID|GPU|SMU|PSP|Pipe|Modes),' || true
+	ioreg -l -w0 | grep -E '"(Console|AtomBIOS|Discovery|VRAM|MMIO|EDID|GPU|SMU|PSP|Pipe|Modes|Compute),' || true
 
 	section "ioreg: what the OS sees (display identity)"
 	ioreg -lw0 | grep -E 'IODisplayEDID|DisplayProductID|DisplayVendorID' || true
@@ -124,3 +131,5 @@ echo "  dmub: 'PING OK — rptr advanced' + dmub-hist command decode"
 echo "  dmubver: SCRATCH bank — compare vs Debian 'dmesg | grep -i dmub'"
 echo "           version; a match => GOP DMUB speaks mainline VBIOS dialect"
 echo "  Discovery,Source = 'on-die TMR' if ATY,bin_image was removed"
+echo "  compute: 'verdict:' lines — PSP sOS, GFX/SDMA firmware state, GC/MM hub"
+echo "           apertures, and the VRAM pool chosen for compute"

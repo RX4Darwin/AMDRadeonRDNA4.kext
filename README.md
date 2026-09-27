@@ -105,6 +105,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-smuping=1` | Read-only SMU (power-management firmware) handshake: TestMessage + PMFW/interface version queries over the MP1 mailbox. No DPM changes. Publishes `SMU,FirmwareVersion` / `SMU,Verified`. Prerequisite check for future clock control. |
 | `rdna4-ihdump=1` | Read-only interrupt-delivery survey: OSSSYS IH ring state, per-OTG vertical-interrupt line config, PCI MSI/MSI-X capability words. Groundwork for real VBL interrupts. |
 | `rdna4-pspdump=1` | Read-only PSP (security processor) survey: bootloader/sOS/GPCOM-ring status from the MPASP scratch registers. Publishes `PSP,Alive` / `PSP,SOSVersion`. Decides whether loading fresh firmware (e.g. a current DMUB) is viable. |
+| `rdna4-compute=<stage>` | Compute bring-up, written from scratch (`src/compute.cpp`), run after the display is answered for and never with a GPU reset. `1` = read-only survey: GFX (IMU/RLC/PFP/ME/MEC/MES), both SDMA engines, GC and MM hub apertures, PSP, HDP flush remap, and the VRAM window chosen for compute; published as the `Compute,Survey` dictionary. `2` = PSP bring-up on a background thread 5 s after the desktop: the secure-OS components through the PSP bootloader, the GPCOM command ring, `LOAD_TOC`, then the SMU firmware via `LOAD_IP_FW`, proven by the SMU answering its mailbox; published as `Compute,PSP` and `Compute,Stage`. Needs the linux-firmware blobs in `firmware/amdgpu/` at build time. Stages 3 (GFX/SDMA firmware + RLC autoload + compute queue) and 4 (kernel dispatch) are in progress and currently stop after stage 2. |
 | `rdna4-fakeedid=0` | `VMTEST=1` builds only: they serve the Lenovo fixture EDID and enable `rdna4-modeset` by default (so the mode list can be checked in a VM whose OpenCore pins boot-args); `=0` turns either off. |
 | `-rdna4dbg` | Lilu debug logging for the plugin (Lilu DEBUG builds). |
 
@@ -133,6 +134,11 @@ of toggling a DP stream.
 |------|---------|
 | `src/plugin.cpp` | Lilu plugin entry: routes `IONDRVFramebuffer::doDriverIO`, recognises our framebuffers, creates the device state, hands NDRV requests to the translator. Checks the local NDRV record mirrors against the SDK at compile time. |
 | `src/device.{hpp,cpp}` | `RDNA4Device`: scanout adoption, BAR5 MMIO, VBIOS/IP discovery, lit pipe, AUX/DC_I2C engines and EDID, DMUB ring, SMU/PSP/IH diagnostics, display power, mode table. |
+| `src/compute.{hpp,cpp}` | `RDNA4Compute`: staged compute bring-up next to the display path (`rdna4-compute=<stage>`); stage 1 surveys the engines, hubs, PSP and VRAM layout. |
+| `src/gfxregs.hpp` | Register map of the compute side (GC 12.0.1, SDMA 7, GC/MM hubs, NBIF HDP remap, PSP and SMU mailboxes) as segment + dword offset pairs. |
+| `src/amdfw.{hpp,cpp}` | Freestanding parser for AMD firmware containers: common header, LOAD_IP_FW payloads, the PSP secure-OS package. Host-tested against the real blobs. |
+| `src/psp.{hpp,cpp}` | Freestanding PSP driver: bootloader component loading, GPCOM ring, command submission with fences, LOAD_TOC, LOAD_IP_FW. Host-tested against a simulated PSP. |
+| `src/fwblobs.S` | Embeds `firmware/amdgpu/psp_14_0_3_sos.bin` and `smu_14_0_3.bin` (linux-firmware, AMD redistributable license) into the kext. |
 | `src/ndrv.{hpp,cpp}` | Freestanding NDRV `csc` translator: mode list, video parameters, timings, current mode, connection, EDID blocks, DPMS, mode switch. Host-tested. |
 | `src/bochsvbe.{hpp,cpp}` | `VMTEST` only: mode switches on QEMU's `vmware-svga` through the Bochs VBE interface (the one OVMF's GOP uses on that card). |
 | `src/cursor.cpp` | Parked (not built): the DCN hardware-cursor code from the standalone build. |

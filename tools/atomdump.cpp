@@ -22,6 +22,8 @@
 #include "../src/pipe.hpp"
 #include "../src/ndrv.hpp"
 #include "../src/modeset.hpp"
+#include "../src/amdfw.hpp"
+#include "../src/psp.hpp"
 
 #include <cstdarg>
 #include <cstdint>
@@ -1330,6 +1332,190 @@ static int testNdrv() {
 	return failures;
 }
 
+// --- AMD firmware containers + PSP protocol ------------------------------------
+
+static bool readFile(const char *path, std::vector<uint8_t> &out) {
+	FILE *f = fopen(path, "rb");
+	if (!f)
+		return false;
+	fseek(f, 0, SEEK_END);
+	long len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	out.resize(static_cast<size_t>(len));
+	bool ok = fread(out.data(), 1, out.size(), f) == out.size();
+	fclose(f);
+	return ok;
+}
+
+// A PSP as the driver sees it: MP0 scratch registers plus the VRAM window.
+// Bootloader commands re-raise "ready"; the sOS command brings the sOS up;
+// ring creation latches the ring; each write-pointer update consumes frames,
+// answers LOAD_TOC / LOAD_IP_FW and writes the fence.
+struct FakePsp {
+	uint32_t regs[0x100] {};
+	std::vector<uint8_t> vram;
+	uint64_t mcBase { 0 };
+	std::vector<uint32_t> blCmds, blFirstDword, blBufferMc;
+	uint64_t ringMc { 0 };
+	uint32_t ringSize { 0 }, rptr { 0 };
+	std::vector<uint32_t> gpcom;
+	uint32_t fwType { 0 }, fwSize { 0 };
+	const uint8_t *expect { nullptr };
+	uint32_t expectSize { 0 };
+	bool payloadOk { false };
+	bool bootloaderStuck { false };
+	int flushes { 0 };
+
+	uint8_t *at(uint64_t mc) { return vram.data() + (mc - mcBase); }
+	uint32_t get(uint64_t mc) { uint32_t v; memcpy(&v, at(mc), 4); return v; }
+	void set(uint64_t mc, uint32_t v) { memcpy(at(mc), &v, 4); }
+
+	static uint32_t rd(void *c, uint32_t r) { return static_cast<FakePsp *>(c)->regs[r & 0xff]; }
+	static void delay(void *, uint32_t) {}
+	static void flush(void *c) { static_cast<FakePsp *>(c)->flushes++; }
+	static void wr(void *c, uint32_t r, uint32_t v) {
+		auto *p = static_cast<FakePsp *>(c);
+		p->regs[r & 0xff] = v;
+		if (r == Psp::Reg::kC2p35) {
+			uint64_t buf = static_cast<uint64_t>(p->regs[Psp::Reg::kC2p36]) << 20;
+			p->blCmds.push_back(v);
+			p->blBufferMc.push_back(p->regs[Psp::Reg::kC2p36]);
+			p->blFirstDword.push_back(p->get(buf));
+			if (v == Psp::BlSosDrv) {
+				p->regs[Psp::Reg::kC2p81] = 0x003a1214;
+				p->regs[Psp::Reg::kC2p64] = 0x80000000;
+			}
+			p->regs[Psp::Reg::kC2p35] = p->bootloaderStuck ? 0 : 0x80000000;
+		} else if (r == Psp::Reg::kC2p64 && v == (2u << 16)) {
+			p->ringMc = p->regs[Psp::Reg::kC2p69] |
+			            (static_cast<uint64_t>(p->regs[Psp::Reg::kC2p70]) << 32);
+			p->ringSize = p->regs[Psp::Reg::kC2p71];
+			p->rptr = 0;
+			p->regs[Psp::Reg::kC2p64] = 0x80000000;
+			p->regs[Psp::Reg::kC2p67] = 0;
+		} else if (r == Psp::Reg::kC2p67) {
+			const uint32_t ringDw = p->ringSize / 4;
+			while (p->rptr != v) {
+				uint64_t frame = p->ringMc + p->rptr * 4ull;
+				uint64_t cmd = p->get(frame) | (static_cast<uint64_t>(p->get(frame + 4)) << 32);
+				uint64_t fence = p->get(frame + 12) | (static_cast<uint64_t>(p->get(frame + 16)) << 32);
+				uint32_t fenceValue = p->get(frame + 20);
+				uint32_t id = p->get(cmd + Psp::Layout::kCmdId);
+				p->gpcom.push_back(id);
+				if (id == Psp::CmdLoadToc)
+					p->set(cmd + Psp::Layout::kRespTmrSize, 0x1400000);
+				if (id == Psp::CmdLoadIpFw) {
+					uint64_t fw = p->get(cmd + 28) | (static_cast<uint64_t>(p->get(cmd + 32)) << 32);
+					p->fwSize = p->get(cmd + 36);
+					p->fwType = p->get(cmd + 40);
+					p->payloadOk = p->expect && p->fwSize == p->expectSize &&
+					               !memcmp(p->at(fw), p->expect, p->expectSize);
+				}
+				p->set(cmd + Psp::Layout::kRespStatus, 0);
+				p->set(fence, fenceValue);
+				p->rptr = (p->rptr + Psp::Layout::kFrameSize / 4) % ringDw;
+			}
+		}
+	}
+};
+
+static int testPsp() {
+	int failures = 0;
+	std::vector<uint8_t> sosFile, smuFile;
+	if (!readFile("firmware/amdgpu/psp_14_0_3_sos.bin", sosFile) ||
+	    !readFile("firmware/amdgpu/smu_14_0_3.bin", smuFile)) {
+		printf("\npsp: firmware/amdgpu/ blobs absent, skipped\n");
+		return 0;
+	}
+
+	AmdFw::PspPackage pkg;
+	failures += check(AmdFw::parsePsp(sosFile.data(), sosFile.size(), pkg), "psp: sOS package rejected");
+	failures += check(pkg.count == 11 && pkg.part[AmdFw::PspKdb].valid() &&
+	                  pkg.part[AmdFw::PspToc].size == 2304 && pkg.part[AmdFw::PspSos].size == 125472 &&
+	                  pkg.version[AmdFw::PspSos] == 0x003a1214,
+	                  "psp: sOS package contents (count %u)", pkg.count);
+	failures += check(!AmdFw::parsePsp(sosFile.data(), 200, pkg), "psp: truncated package accepted");
+	AmdFw::parsePsp(sosFile.data(), sosFile.size(), pkg);
+	AmdFw::Blob smu;
+	failures += check(AmdFw::payload(smuFile.data(), smuFile.size(), smu) && smu.size == 327168,
+	                  "psp: SMU payload (%u bytes)", smu.size);
+
+	// The whole stage-2 sequence against the fake.
+	FakePsp fake;
+	fake.mcBase = 0x8008000000ull;
+	fake.vram.assign(8u << 20, 0xcc);
+	fake.regs[Psp::Reg::kC2p35] = 0x80000000;       // bootloader ready, sOS down
+	Psp::Bus bus { &fake, FakePsp::rd, FakePsp::wr, FakePsp::delay, FakePsp::flush };
+	Psp::Window win { fake.vram.data(), fake.mcBase, static_cast<uint32_t>(fake.vram.size()) };
+	Psp::Driver psp;
+	failures += check(psp.init(bus, win), "psp: init refused");
+	failures += check(!psp.sosAlive(), "psp: fake sOS alive before load");
+
+	uint32_t loaded = 0;
+	Psp::Result r = psp.loadSos(pkg, loaded);
+	failures += check(r.ok && loaded == 9 && psp.sosAlive(), "psp: loadSos %s (0x%x), %u loaded",
+	                  r.what, r.value, loaded);
+	static const uint32_t order[] = { Psp::BlKdb, Psp::BlSplTable, Psp::BlSysDrv, Psp::BlSocDrv,
+	                                  Psp::BlIntfDrv, Psp::BlHadDrv, Psp::BlRasDrv,
+	                                  Psp::BlIpKeyMgr, Psp::BlSosDrv };
+	static const uint32_t parts[] = { AmdFw::PspKdb, AmdFw::PspSpl, AmdFw::PspSysDrv,
+	                                  AmdFw::PspSocDrv, AmdFw::PspIntfDrv, AmdFw::PspDbgDrv,
+	                                  AmdFw::PspRasDrv, AmdFw::PspIpKeyMgrDrv, AmdFw::PspSos };
+	bool seqOk = fake.blCmds.size() == 9;
+	for (size_t i = 0; seqOk && i < 9; i++) {
+		uint32_t first;
+		memcpy(&first, pkg.part[parts[i]].data, 4);
+		seqOk = fake.blCmds[i] == order[i] && fake.blFirstDword[i] == first &&
+		        fake.blBufferMc[i] == static_cast<uint32_t>(fake.mcBase >> 20);
+	}
+	failures += check(seqOk, "psp: bootloader command sequence / buffer contents");
+	failures += check(psp.loadSos(pkg, loaded).ok && loaded == 0 && fake.blCmds.size() == 9,
+	                  "psp: second loadSos should be a no-op");
+
+	r = psp.createRing();
+	failures += check(r.ok && fake.ringMc == fake.mcBase + Psp::kRingOffset &&
+	                  fake.ringSize == Psp::kRingSize, "psp: createRing %s (0x%x)", r.what, r.value);
+
+	uint32_t tmr = 0;
+	r = psp.loadToc(pkg.part[AmdFw::PspToc], tmr);
+	failures += check(r.ok && tmr == 0x1400000, "psp: LOAD_TOC %s, tmr 0x%x", r.what, tmr);
+
+	fake.expect = smu.data;
+	fake.expectSize = smu.size;
+	Psp::Response resp;
+	r = psp.loadIpFw(smu, Psp::FwSmu, resp);
+	failures += check(r.ok && fake.fwType == Psp::FwSmu && fake.payloadOk,
+	                  "psp: LOAD_IP_FW(SMU) %s type %u size %u payload %s", r.what, fake.fwType,
+	                  fake.fwSize, fake.payloadOk ? "ok" : "MISMATCH");
+
+	// Run the ring past its 64 frames: wrap-around keeps fences in step.
+	bool wrapOk = true;
+	for (int i = 0; i < 70 && wrapOk; i++)
+		wrapOk = psp.submit(Psp::CmdFbFwReservAddr, nullptr, 0, resp).ok;
+	failures += check(wrapOk && fake.gpcom.size() == 72 && psp.fenceValue() == 72,
+	                  "psp: ring wrap (%zu commands, fence %u)", fake.gpcom.size(), psp.fenceValue());
+	failures += check(fake.flushes >= 12, "psp: HDP flushes %d", fake.flushes);
+
+	// A bootloader that never comes back stops at the first component.
+	FakePsp stuck;
+	stuck.mcBase = fake.mcBase;
+	stuck.vram.assign(8u << 20, 0);
+	stuck.regs[Psp::Reg::kC2p35] = 0x80000000;
+	stuck.bootloaderStuck = true;
+	Psp::Bus bus2 { &stuck, FakePsp::rd, FakePsp::wr, FakePsp::delay, FakePsp::flush };
+	Psp::Window win2 { stuck.vram.data(), stuck.mcBase, static_cast<uint32_t>(stuck.vram.size()) };
+	Psp::Driver psp2;
+	psp2.init(bus2, win2);
+	r = psp2.loadSos(pkg, loaded);
+	failures += check(!r.ok && loaded == 0 && !strcmp(r.what, "KDB"),
+	                  "psp: stuck bootloader should stop at KDB (got %s)", r.what);
+
+	printf("\npsp: sOS package %u parts (sOS 0x%08x), SMU %u bytes; bootloader, ring, LOAD_TOC, "
+	       "LOAD_IP_FW and wrap %s\n", pkg.count, pkg.version[AmdFw::PspSos], smu.size,
+	       failures ? "FAILED" : "ok");
+	return failures;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
@@ -1518,6 +1704,7 @@ int main(int argc, char **argv) {
 	failures += testDmubPayloads();
 	failures += testNdrv();
 	failures += testModeSet();
+	failures += testPsp();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);
