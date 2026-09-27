@@ -9,7 +9,8 @@
 # with the bare-metal kext:
 #   tools/vm-opencore.sh --kext build/RDNA4FB.kext --out OpenCore-emu.qcow2
 # Env: OSXKVM (~/OSX-KVM), QEMU_SRC (~/qemu-10.0.13), RAM_MB (16384), OC_IMAGE
-# (OpenCore-emu.qcow2 in $OSXKVM/OpenCore). Display: VNC 127.0.0.1:5900.
+# (OpenCore-emu.qcow2 in $OSXKVM/OpenCore). Display: VNC 127.0.0.1:5900;
+# VNC_WS=<port> adds a websocket listener for a browser client (noVNC).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -63,7 +64,7 @@ args=(
 	# closed the port's windows at boot and the card stopped decoding.
 	-vga none
 	-device "rdna4,bus=pcie.0,addr=0x10,romfile=$ROM,state=$STATE,flash=$FLASH$EXTRA"
-	-display none -vnc 127.0.0.1:0
+	-display none -vnc "127.0.0.1:0${VNC_WS:+,websocket=$VNC_WS}"
 )
 
 rm -f "$MONITOR"
