@@ -93,7 +93,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define NUM_DDC  8
 #define RDNA4_WORK_SLICE_NS 2000000ULL     /* hard upper bound from the W11 brief */
 #define RDNA4_WORK_REARM_NS 500000ULL      /* let vCPU/I/O work run between slices */
-#define RDNA4_WARM_GOP_DELAY_NS 100000000ULL /* firmware/GOP re-enables BM during boot */
+/* ASSUMPTION, not a measurement: how long after a warm reset the firmware/GOP
+ * re-enables PCI Bus Master.  Nothing in the logs, amdgpu or UEFI sources fixes
+ * it; it is the device property warm-gop-delay-ms.  The default is chosen, not
+ * known: a vblank IRQ whose IH write is refused while Bus Master is off is not
+ * raised again until acknowledged (a dead guest never does), so a delay above
+ * one vblank period (16.7 ms at 60 Hz) would count no post-reset DMA from a
+ * card left running.  8 ms keeps that no-quiesce case visible. */
+#define RDNA4_WARM_GOP_DELAY_MS_DEFAULT 8
 
 /*
  * DMU (DCN 4.1.0) register segment bases in dwords, from the card's IP
@@ -654,6 +661,8 @@ struct RDNA4State {
     bool         bus_master_before_reset;
     QEMUTimer   *warm_gop_timer;
     bool         warm_gop_restore;
+    uint32_t     warm_gop_delay_ms;   /* property warm-gop-delay-ms (an assumption) */
+    uint64_t     dma_after_reset_reads;
 
     /* Queue kicks are consumed by the QEMU main loop, never by an MMIO
      * handler.  The realtime timer re-arms the bottom half between slices. */
@@ -763,9 +772,12 @@ static bool rdna4_bus_master_enabled(RDNA4State *s)
     return (pci_get_word(pci->config + PCI_COMMAND) & PCI_COMMAND_MASTER) != 0;
 }
 
-/* Track the last Command.BusMaster value.  A machine reset may clear the
- * generic PCI config after the device reset callback, so warm-keep uses this
- * remembered state to model the firmware/GOP handoff that follows reset. */
+/* Track the last Command.BusMaster value.  QEMU resets children before their
+ * bus (resettable_phase_hold, hw/core/resettable.c:154-155), so this device's
+ * reset callback runs BEFORE pcibus_reset_hold clears Command
+ * (hw/pci/pci.c:583-591): inside rdna4_reset() the bit still has its pre-reset
+ * value and it is cleared right after.  The remembered value is what the
+ * delayed GOP handoff (rdna4_warm_gop_timer) restores. */
 static void rdna4_config_write(PCIDevice *dev, uint32_t address, uint32_t data,
                                int len)
 {
@@ -806,7 +818,16 @@ static MemTxResult rdna4_dma_read(RDNA4State *s, dma_addr_t address,
             fprintf(stderr, "rdna4: DMA read refused while PCI bus master is off\n");
         return MEMTX_ERROR;
     }
-    return pci_dma_read(PCI_DEVICE(s), address, buf, len);
+    MemTxResult result = pci_dma_read(PCI_DEVICE(s), address, buf, len);
+    if (result == MEMTX_OK && s->warm_dma_window) {
+        s->dma_after_reset_reads++;
+        if (s->dma_after_reset_reads <= 3) {
+            fprintf(stderr, "rdna4: warm-keep: DMA read after reset #%" PRIu64
+                    " at 0x%" PRIx64 " (%" PRIu64 " bytes)\n",
+                    s->dma_after_reset_reads, (uint64_t)address, (uint64_t)len);
+        }
+    }
+    return result;
 }
 
 static bool rdna4_engine_active(RDNA4State *s)
@@ -6421,10 +6442,12 @@ static void rdna4_reset(DeviceState *dev)
     RDNA4State *s = RDNA4(dev);
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    /* A warm platform reset clears PCI Command.BusMaster.  The GOP is the
-     * component that re-enables Bus Master before handing the card back; the
-     * warm-keep model schedules that delayed handoff while preserving the
-     * engines and counting any DMA after it. */
+    /* A warm platform reset clears PCI Command.BusMaster (QEMU does it in
+     * pcibus_reset_hold, AFTER this callback: see rdna4_config_write).  The
+     * firmware/GOP turns it back on while booting; the warm-keep model
+     * schedules that delayed handoff (rdna4_warm_gop_timer), keeps the engines
+     * and counts any DMA after it.  The engines themselves keep running
+     * VRAM-only work all along; only DMA is gated by Bus Master. */
     if (s->warm_keep && rdna4_engine_active(s)) {
         const bool restoreBusMaster = rdna4_bus_master_enabled(s) ||
                                       s->bus_master_before_reset;
@@ -6432,24 +6455,35 @@ static void rdna4_reset(DeviceState *dev)
                 rdna4_bus_master_enabled(s), s->bus_master_before_reset);
         s->warm_gop_restore = restoreBusMaster;
         if (s->warm_dma_window)
-            fprintf(stderr, "rdna4: warm-keep: DMA-after-reset writes: %" PRIu64 "\n",
-                    s->dma_after_reset_writes);
+            fprintf(stderr, "rdna4: warm-keep: DMA-after-reset writes: %" PRIu64
+                    " reads: %" PRIu64 "\n",
+                    s->dma_after_reset_writes, s->dma_after_reset_reads);
         else if (!rdna4_bus_master_enabled(s))
             fprintf(stderr, "rdna4: warm-keep: DMA-after-reset writes: 0 "
                     "(bus master was off at reset)\n");
         s->warm_dma_window = true;
         s->dma_after_reset_writes = 0;
+        s->dma_after_reset_reads = 0;
         fprintf(stderr, "rdna4: warm-keep: reset preserves IH/SDMA/MEC/GFX; "
                 "firmware/GOP will re-enable DMA during boot\n");
+        /* The generic reset may cancel a pending BH/timer although the queues
+         * were kept: re-kick the live work, as the card's engines carry on
+         * regardless of Bus Master (its DMA is refused until the handoff). */
+        rdna4_work_schedule(s);
         if (s->warm_gop_timer && s->warm_gop_restore) {
             timer_mod_ns(s->warm_gop_timer,
-                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + RDNA4_WARM_GOP_DELAY_NS);
+                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                         (int64_t)s->warm_gop_delay_ms * SCALE_MS);
         } else if (s->warm_gop_timer) {
             timer_del(s->warm_gop_timer);
         }
         return;
     }
 
+    if (s->warm_keep)
+        fprintf(stderr, "rdna4: warm-keep: reset found no live engines (quiesced): "
+                "nothing preserved, DMA-after-reset writes: 0 reads: 0 "
+                "(bus master %d at reset)\n", rdna4_bus_master_enabled(s));
     if (s->warm_gop_timer)
         timer_del(s->warm_gop_timer);
     s->warm_gop_restore = false;
@@ -6650,8 +6684,9 @@ static void rdna4_exit(PCIDevice *dev)
     RDNA4State *s = RDNA4(dev);
 
     if (s->warm_dma_window)
-        fprintf(stderr, "rdna4: warm-keep: DMA-after-reset writes: %" PRIu64 "\n",
-                s->dma_after_reset_writes);
+        fprintf(stderr, "rdna4: warm-keep: DMA-after-reset writes: %" PRIu64
+                " reads: %" PRIu64 "\n",
+                s->dma_after_reset_writes, s->dma_after_reset_reads);
 
     rdna4_dispatch_free(s->dispatch);
     s->dispatch = NULL;
@@ -6710,6 +6745,8 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_UINT32("smu-refuse", RDNA4State, smu_refuse, 0),
     DEFINE_PROP_UINT32("smu-refuse-skip", RDNA4State, smu_refuse_skip, 0),
     DEFINE_PROP_BOOL("warm-keep", RDNA4State, warm_keep, false),
+    DEFINE_PROP_UINT32("warm-gop-delay-ms", RDNA4State, warm_gop_delay_ms,
+                       RDNA4_WARM_GOP_DELAY_MS_DEFAULT),
     DEFINE_PROP_UINT32("gfx-break", RDNA4State, gfx_break, 0),
     DEFINE_PROP_BOOL("gfx-trace", RDNA4State, gfx_trace, false),
 };
