@@ -474,7 +474,11 @@ void RDNA4Compute::ihDcnObserveVblank(uint64_t now) {
 			return;
 		}
 	}
-	if (ihVblankCount[ihDcnOtg] == 1 || !(ihVblankCount[ihDcnOtg] % 60)) {
+	// First frame, the first second, then once a minute: with rdna4-ih=2 the
+	// desktop takes vblanks forever, and a line a second would wrap the
+	// kernel log that the diagnostic batch still reads.
+	const uint64_t n = ihVblankCount[ihDcnOtg];
+	if (n == 1 || n == 60 || !(n % 3600)) {
 		HLOG("vblank: OTG%u count %llu%s", ihDcnOtg, ihVblankCount[ihDcnOtg],
 		     interval ? " (acknowledged)" : "");
 		char value[96];
@@ -660,7 +664,10 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	    entry.srcId == kIhSrcPflipBase + ihDcnHubp) {
 		if (ihDcnHubp < Pipe::kMaxOtg)
 			ihPflipCount[ihDcnHubp]++;
-		if (ihPflipCount[ihDcnHubp] == 1 || !(ihPflipCount[ihDcnHubp] & 0x3f)) {
+		// Same thinning as vblank: once presents run every frame, a line per
+		// 64 flips would still wrap the log.
+		const uint64_t f = ihPflipCount[ihDcnHubp];
+		if (f == 1 || f == 64 || !(f % 4096)) {
 			HLOG("page flip: HUBP%u count %llu", ihDcnHubp, ihPflipCount[ihDcnHubp]);
 			char value[96];
 			snprintf(value, sizeof(value), "PASS pflip interrupts %llu", ihPflipCount[ihDcnHubp]);
