@@ -549,8 +549,10 @@ void RDNA4Compute::runStages() {
 	// in the trail, so the trail's normal ending comes after them.
 	if (done >= StageDispatch)
 		publishRuntime(done);
+	// G3: the first draw, once the runtime's device heap holds its rings.
+	const bool drew = gfxOk && stageGfxDraw();
 	snprintf(note, sizeof(note), "finished at stage %u%s%s%s", done,
-	         !gfxAsked ? "" : gfxOk ? ", gfx ring up" : ", gfx ring off",
+	         !gfxAsked ? "" : drew ? ", gfx draw right" : gfxOk ? ", gfx ring up" : ", gfx ring off",
 	         hungFeature[0] ? ", skipped after a hang: " : "", hungFeature);
 	trail(note);
 }

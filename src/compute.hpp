@@ -283,6 +283,16 @@ private:
 	static constexpr uint32_t kGfxCsbOffset   = kGfxOffset + 0x5000;     // clear-state buffer
 	static constexpr uint32_t kGfxCsbMax      = 0x1000;
 	static constexpr uint32_t kGfxIbOffset    = kGfxOffset + 0x10000;    // indirect buffers
+	// G3, the first draw (stageGfxDraw, after the runtime: its GE rings come
+	// from the device heap): the NGG VS and the PS, 1 KiB apart (256-byte
+	// aligned, prefetch-padded), the 256x256 RGBA8 target and the draw's
+	// own fence.
+	static constexpr uint32_t kGfxVsOffset    = kGfxOffset + 0x20000;
+	static constexpr uint32_t kGfxPsOffset    = kGfxOffset + 0x20400;
+	static constexpr uint32_t kGfxTargetOffset = kGfxOffset + 0x40000;   // 256 KiB
+	static constexpr uint32_t kGfxDrawFenceOffset = kGfxTestOffset + 0x20;
+	uint64_t   gfxRings { 0 };               // device-heap offset of the GE rings (0 = none)
+	bool stageGfxDraw();
 	Pm4::Queue gfxRing;
 	uint32_t   gfxFence { 0 };               // last RELEASE_MEM sequence number
 	uint32_t   gfxMode { 0 };                // 0 off, 1 MMIO write pointer, 2 doorbell
