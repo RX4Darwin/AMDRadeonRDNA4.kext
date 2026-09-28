@@ -128,6 +128,7 @@ uint32_t ihPipeRead(void *ctx, uint8_t baseIdx, uint32_t dword) {
 } // namespace
 
 RDNA4Compute::~RDNA4Compute() {
+	stopPresentationTimer();
 	ihStop();
 }
 

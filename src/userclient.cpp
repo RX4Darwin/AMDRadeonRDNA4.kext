@@ -93,6 +93,8 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sAllocHost,  2,          0,                          3,           0 },
 	{ sSensors,    0,          0,                          0,           sizeof(RDNA4Sensors) },
 	{ sSleepTest,  1,          0,                          0,           0 },
+	{ sPresentAsync, 2,        0,                          1,           0 },
+	{ sWaitPresent,  2,        0,                          1,           0 },
 	{ sSubmitIb,   3,          0,                          1,           0 },
 	{ sWaitFence,  2,          0,                          1,           0 },
 };
@@ -186,6 +188,17 @@ IOReturn RDNA4ComputeClient::sAllocHost(OSObject *t, void *, IOExternalMethodArg
 	return self(t)->compute->rtAllocHost(t, self(t)->task, a->scalarInput[0],
 	                                     a->scalarInput[1], a->scalarOutput[0],
 	                                     a->scalarOutput[1], a->scalarOutput[2]);
+}
+
+IOReturn RDNA4ComputeClient::sPresentAsync(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtPresentAsync(t, a->scalarInput[0], a->scalarInput[1],
+	                                       a->scalarOutput[0]);
+}
+
+IOReturn RDNA4ComputeClient::sWaitPresent(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtWaitPresent(t, a->scalarInput[0],
+	                                      static_cast<uint32_t>(a->scalarInput[1]),
+	                                      a->scalarOutput[0]);
 }
 
 IOReturn RDNA4ComputeClient::sSubmitIb(OSObject *t, void *, IOExternalMethodArguments *a) {

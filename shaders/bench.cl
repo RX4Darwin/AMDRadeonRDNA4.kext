@@ -196,20 +196,28 @@ void bf16gemm(__global const ushort *A, __global const ushort *Bt, __global floa
 	gemm16(A, Bt, C, n, As, Bs, true);
 }
 
-// One work-item per pixel. The integer iteration count is mapped through a
-// continuous palette so neighboring escape bands form a smooth ARGB8888
-// gradient while the CPU checker can repeat the same float32 operation order.
-__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
-void mandelbrot(__global uint *out, uint width, uint height, uint pitch)
+// One work-item per sample block. The host supplies the affine complex-plane
+// mapping so this kernel needs no floating-point division (which also keeps
+// the bring-up interpreter's instruction set small). A scale greater than one
+// lets the VM proof render a useful image with fewer work-items: one sample is
+// replicated into a clipped scale x scale block.
+static inline __attribute__((always_inline))
+void mandelbrotRender(__global uint *out, uint width, uint height, uint pitch,
+                      float x0, float dx, float y0, float dy, uint scale)
 {
-	const uint x = WG_ID(x) * 16u + LID_X;
-	const uint y = WG_ID(y) * 16u + LID_Y;
+	const uint blockX = WG_ID(x) * 16u + LID_X;
+	const uint blockY = WG_ID(y) * 16u + LID_Y;
+	if (!scale)
+		return;
+	const uint x = blockX * scale;
+	const uint y = blockY * scale;
 	if (x >= width || y >= height)
 		return;
-	const float cx = ((float)x / (float)width - 0.5f) * 3.2f - 0.7f;
-	const float cy = ((float)y / (float)height - 0.5f) * 2.2f;
+	const float cx = x0 + (float)x * dx;
+	const float cy = y0 + (float)y * dy;
 	float zx = 0.0f, zy = 0.0f;
 	uint iteration = 0;
+	#pragma clang loop unroll(disable)
 	for (; iteration < 256u; iteration++) {
 		const float zx2 = zx * zx;
 		const float zy2 = zy * zy;
@@ -227,5 +235,26 @@ void mandelbrot(__global uint *out, uint width, uint height, uint pitch)
 		const uint b = (uint)(80.0f + 175.0f * t);
 		color = 0xff000000u | (r << 16) | (g << 8) | b;
 	}
-	out[y * pitch + x] = color;
+	for (uint oy = 0; oy < scale; oy++) {
+		for (uint ox = 0; ox < scale; ox++) {
+			const uint px = x + ox;
+			const uint py = y + oy;
+			if (px < width && py < height)
+				out[py * pitch + px] = color;
+		}
+	}
+}
+
+__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
+void mandelbrot(__global uint *out, uint width, uint height, uint pitch,
+                float x0, float dx, float y0, float dy, uint scale)
+{
+	mandelbrotRender(out, width, height, pitch, x0, dx, y0, dy, scale);
+}
+
+__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
+void mandelbrot_zoom(__global uint *out, uint width, uint height, uint pitch,
+                     float x0, float dx, float y0, float dy, uint scale)
+{
+	mandelbrotRender(out, width, height, pitch, x0, dx, y0, dy, scale);
 }
