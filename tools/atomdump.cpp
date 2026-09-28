@@ -1769,9 +1769,10 @@ static int testCodeObject() {
 
 static int testGpuHeap() {
 	int failures = 0;
-	static GpuHeap::Heap h;                       // 32 KiB of state: not on the stack
-	constexpr uint64_t G = GpuHeap::Heap::kGranule, base = 32ull << 20;
-	h.init(base, 64 * G + 100);                   // the partial granule is dropped
+	GpuHeap::Heap h;
+	static uint8_t map[64];
+	constexpr uint64_t G = 4096, base = 32ull << 20;
+	h.init(base, 64 * G + 100, G, map, sizeof(map));   // the partial granule is dropped
 	failures += check(h.size() == 64 * G && h.freeBytes() == 64 * G, "heap: size %llu",
 	                  (unsigned long long)h.size());
 
@@ -1797,6 +1798,24 @@ static int testGpuHeap() {
 	h.free(d);
 	failures += check(h.freeBytes() == h.size() && h.alloc(64 * G, a) && a == base,
 	                  "heap: everything back in one piece");
+
+	// The device heap's shape: gigabytes in 64 KiB granules, the map cut
+	// short by its capacity, and allocations far from the base.
+	GpuHeap::Heap big;
+	static uint8_t bigMap[131072];
+	constexpr uint64_t BG = 64 << 10, vbase = 256ull << 20;
+	big.init(vbase, 8ull << 30, BG, bigMap, sizeof(bigMap));
+	failures += check(big.size() == 8ull << 30 && big.granule() == BG, "heap: big size %llu",
+	                  (unsigned long long)big.size());
+	uint64_t x = 0, y = 0, z = 0;
+	ok = big.alloc(768ull << 20, x) && big.alloc(1, y) && big.alloc(5ull << 30, z);
+	failures += check(ok && x == vbase && y == vbase + (768ull << 20) &&
+	                  z == y + BG && big.lengthOf(z) == 5ull << 30 && !big.alloc(3ull << 30, x),
+	                  "heap: big allocations (x 0x%llx y 0x%llx z 0x%llx)",
+	                  (unsigned long long)x, (unsigned long long)y, (unsigned long long)z);
+	GpuHeap::Heap none;
+	none.init(0, 1 << 20, 4096, nullptr, 0);
+	failures += check(!none.size() && !none.alloc(1, x), "heap: a heap without a map is empty");
 	// The struct the user client copies in is the one user space sends.
 	failures += check(sizeof(RDNA4Dispatch) == 2088 && RDNA4_MAX_KERNARG == 2048,
 	                  "abi: RDNA4Dispatch is %zu bytes", sizeof(RDNA4Dispatch));

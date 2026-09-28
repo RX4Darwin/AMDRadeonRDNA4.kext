@@ -351,9 +351,11 @@ void RDNA4Compute::choosePool() {
 		CLOG("display memory: %s at VRAM+0x%llx%s", what, off, in ? " — INSIDE the compute pool" : "");
 		return in;
 	};
-	bool hit = clash("DMUB mailbox (region4)",
-	                 rd(IpDiscovery::HwDmu, DmcubRegion4Offset) |
-	                 (static_cast<uint64_t>(rd(IpDiscovery::HwDmu, DmcubRegion4OffsetHigh)) << 32));
+	const uint64_t dmubMc = rd(IpDiscovery::HwDmu, DmcubRegion4Offset) |
+	                        (static_cast<uint64_t>(rd(IpDiscovery::HwDmu, DmcubRegion4OffsetHigh)) << 32);
+	if ((dmubMc & 0xffffffffull) != kBad && dmubMc > sv.fbMcBase)
+		dmubVram = dmubMc - sv.fbMcBase;           // the device heap stays below it
+	bool hit = clash("DMUB mailbox (region4)", dmubMc);
 	for (uint32_t i = 0; i < 4; i++) {
 		const char *names[4] = { "HUBP0 surface", "HUBP1 surface", "HUBP2 surface", "HUBP3 surface" };
 		const uint32_t lo = rd(IpDiscovery::HwDmu, Reg { 2, kHubpSurfaceLo + i * kHubpStride });
@@ -1257,7 +1259,7 @@ bool RDNA4Compute::stageSdma() {
 
 	// 2. SDMA0 queue 0.
 	trail("s4: SDMA0 queue init");
-	Sdma::Ring ring;
+	Sdma::Ring &ring = sdmaRing;              // kept: the runtime's DMA uses it
 	if (!ring.init(poolDw(kSdmaRingOffset), poolMc(kSdmaRingOffset), kSdmaRingSize)) {
 		publish();
 		return false;
@@ -1321,7 +1323,7 @@ bool RDNA4Compute::stageSdma() {
 	flushHdp();
 	uint64_t t0 = mach_absolute_time();
 	ring.emit(pkt, Sdma::constFill(pkt, poolMc(kFillOffset), pattern, kFillBytes));
-	ring.emit(pkt, Sdma::fence(pkt, poolMc(kSdmaFenceOffset), 1));
+	ring.emit(pkt, Sdma::fence(pkt, poolMc(kSdmaFenceOffset), sdmaFence = 1));
 	sdmaKick(ring.wptr());
 	bool fenced = false;
 	for (uint32_t us = 0; us < 500000 && !fenced; us += 10) {

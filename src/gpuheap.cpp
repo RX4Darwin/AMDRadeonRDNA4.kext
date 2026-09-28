@@ -9,19 +9,21 @@
 
 namespace GpuHeap {
 
-void Heap::init(uint64_t base, uint64_t size) {
+void Heap::init(uint64_t base, uint64_t size, uint32_t granule, uint8_t *m, uint32_t mapBytes) {
 	start = base;
-	uint64_t n = size / kGranule;
-	count = static_cast<uint32_t>(n > kMaxGranules ? kMaxGranules : n);
+	gran = granule ? granule : 4096;
+	map = m;
+	uint64_t n = m ? size / gran : 0;
+	count = static_cast<uint32_t>(n > mapBytes ? mapBytes : n);
 	freeCount = count;
-	for (uint32_t g = 0; g < kMaxGranules; g++)
+	for (uint32_t g = 0; g < count; g++)
 		map[g] = Free;
 }
 
 bool Heap::granuleOf(uint64_t offset, uint32_t &g) const {
-	if (offset < start || (offset - start) % kGranule)
+	if (offset < start || (offset - start) % gran)
 		return false;
-	uint64_t i = (offset - start) / kGranule;
+	uint64_t i = (offset - start) / gran;
 	if (i >= count)
 		return false;
 	g = static_cast<uint32_t>(i);
@@ -31,9 +33,10 @@ bool Heap::granuleOf(uint64_t offset, uint32_t &g) const {
 bool Heap::alloc(uint64_t bytes, uint64_t &offset) {
 	if (!bytes || bytes > size())
 		return false;
-	const uint32_t need = static_cast<uint32_t>((bytes + kGranule - 1) / kGranule);
-	if (need > freeCount)
+	const uint64_t need64 = (bytes + gran - 1) / gran;
+	if (need64 > freeCount)
 		return false;
+	const uint32_t need = static_cast<uint32_t>(need64);
 	uint32_t run = 0;
 	for (uint32_t g = 0; g < count; g++) {
 		run = map[g] == Free ? run + 1 : 0;
@@ -43,7 +46,7 @@ bool Heap::alloc(uint64_t bytes, uint64_t &offset) {
 			for (uint32_t i = first + 1; i <= g; i++)
 				map[i] = Body;
 			freeCount -= need;
-			offset = start + static_cast<uint64_t>(first) * kGranule;
+			offset = start + static_cast<uint64_t>(first) * gran;
 			return true;
 		}
 	}
@@ -70,7 +73,7 @@ uint64_t Heap::lengthOf(uint64_t offset) const {
 	uint32_t n = 1;
 	while (g + n < count && map[g + n] == Body)
 		n++;
-	return static_cast<uint64_t>(n) * kGranule;
+	return static_cast<uint64_t>(n) * gran;
 }
 
 } // namespace GpuHeap

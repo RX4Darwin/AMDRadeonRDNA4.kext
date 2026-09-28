@@ -20,6 +20,9 @@
  *               wait for it (the timeout is the caller's). Each work-group
  *               gets the kernel's own LDS plus dynamicLdsBytes.
  *  Buffers and programs belong to the connection and are freed with it.
+ *  With RDNA4_FLAG_DMA, Write/Read run on the GPU's copy engine (GB/s) and
+ *  buffers come from VRAM past the BAR (gigabytes); without it, the CPU
+ *  copies through the BAR and buffers share the 96 MiB CPU-visible heap.
  */
 
 #ifndef RDNA4Compute_h
@@ -28,7 +31,7 @@
 #include <stdint.h>
 
 #define RDNA4_COMPUTE_SERVICE   "RDNA4ComputeService"
-#define RDNA4_COMPUTE_ABI       2u   /* 2: dynamic LDS in RDNA4Dispatch */
+#define RDNA4_COMPUTE_ABI       3u   /* 2: dynamic LDS; 3: DMA transfers, VRAM past the BAR */
 
 /* Largest kernarg block a dispatch carries; bytes past what the caller
  * passes, up to the kernel's own kernarg size, are zero. */
@@ -63,6 +66,7 @@ enum {
 
 #define RDNA4_FLAG_READY   (1u << 0)   /* bring-up reached a dispatching stage */
 #define RDNA4_FLAG_WEDGED  (1u << 1)   /* a dispatch timed out: no more work */
+#define RDNA4_FLAG_DMA     (1u << 2)   /* Write/Read by SDMA; buffers from all of VRAM */
 
 typedef struct {
 	uint32_t program;

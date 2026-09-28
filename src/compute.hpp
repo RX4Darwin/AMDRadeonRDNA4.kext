@@ -55,6 +55,10 @@
 #include "pm4.hpp"
 #include "psp.hpp"
 #include "rdna4compute.h"
+#include "sdma.hpp"
+
+class IOBufferMemoryDescriptor;
+class IODMACommand;
 
 class RDNA4Compute {
 public:
@@ -199,6 +203,8 @@ private:
 	bool sdmaQueueInit();
 	void sdmaKick(uint32_t wptrBytes);
 	bool sdmaDoorbell { false };        // kick SDMA0 through its doorbell (amdgpu's way)
+	Sdma::Ring sdmaRing;                // SDMA0 queue 0: stage 4, then the runtime's DMA
+	uint32_t   sdmaFence { 0 };         // last FENCE value written by SDMA
 	bool doorbellMapBar();
 	bool stageSdma();
 
@@ -274,23 +280,58 @@ public:
 	void     rtRelease(const void *owner);
 
 private:
-	// The pool past kHeapOffset is the runtime's heap (buffers and code).
+	// The pool past kHeapOffset is the CPU-visible heap (code, and buffers
+	// when there is no DMA). With DMA, buffers come from the device heap:
+	// VRAM past the BAR, which the CPU never touches.
 	static constexpr uint32_t kHeapOffset  = 32u << 20;
 	static constexpr uint32_t kMaxBuffers  = 256;
 	static constexpr uint32_t kMaxPrograms = 32;
-	struct RtBuffer  { const void *owner; uint64_t offset, bytes; uint16_t gen; };
+	struct RtBuffer  {
+		const void *owner;
+		uint64_t    offset, bytes;             // heap offset (pool or VRAM), size
+		uint64_t    mc;                        // GPU address
+		uint16_t    gen;
+		bool        device;                    // from the device heap
+	};
 	struct RtProgram { const void *owner; uint64_t offset; CodeObj::Kernel k; uint16_t gen; };
 	IOLock        *rtLock { nullptr };
 	bool           rtReady { false };       // a dispatching stage finished
 	bool           rtWedged { false };      // a dispatch timed out
 	uint32_t       rtStage { 0 };
 	GpuHeap::Heap  heap;
+	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
 	RtBuffer       buffers[kMaxBuffers] {};
 	RtProgram      programs[kMaxPrograms] {};
 	IOService     *rtService { nullptr };
+	uint64_t       dmubVram { 0 };            // DMUB memory (VRAM offset), from choosePool
 	void publishRuntime(uint32_t stage);
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);
+
+	// DMA between host memory and VRAM (runtime.cpp). One pinned, physically
+	// contiguous bounce buffer; the GC hub's AGP aperture maps system memory
+	// up to its end (amdgpu's layout: MC = agpStart + bus address), and SDMA
+	// copies through it. Proven by a read-then-write self-test before use.
+	static constexpr uint32_t kBounceBytes    = 16u << 20;
+	static constexpr uint32_t kDmaTestOffset  = 28u << 20;   // pool scratch, 128 KiB
+	static constexpr uint32_t kDevHeapGranule = 64u << 10;
+	IOBufferMemoryDescriptor *bounce { nullptr };
+	IODMACommand  *bounceDma { nullptr };
+	uint8_t       *bounceVa { nullptr };
+	uint64_t       bounceBus { 0 };           // the device's address for it
+	uint64_t       agpStart { 0 };            // MC address of bus address 0
+	bool           dmaReady { false };
+	bool           busMasterSet { false }, busMasterWas { false };
+	GpuHeap::Heap  devHeap;                   // VRAM offsets
+	uint8_t       *devHeapMap { nullptr };
+	uint32_t       devHeapMapBytes { 0 };
+	bool dmaInit();
+	void dmaTeardown(const char *why);
+	void devHeapInit();
+	bool sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeoutMs);
+	bool bounceCopy(uint64_t vramMc, uint32_t hostOffset, uint32_t bytes, bool toGpu);
+	IOReturn dmaCopy(task_t task, mach_vm_address_t user, uint64_t mc, uint64_t length, bool toGpu);
+	uint64_t vramMc(uint64_t vramOffset) const { return sv.fbMcBase + vramOffset; }
 	// SMU mailbox (MP1): send one message, return the response code
 	// (1 = OK, 0 = no answer) and the argument register after it.
 	uint32_t smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs);

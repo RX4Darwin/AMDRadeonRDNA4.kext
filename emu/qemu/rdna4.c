@@ -45,6 +45,7 @@
 
 #include "qemu/osdep.h"
 #include <math.h>
+#include <sys/mman.h>
 #include "qemu/module.h"
 #include "qemu/units.h"
 #include "qemu/timer.h"
@@ -325,9 +326,12 @@ struct RDNA4State {
     bool     kiq_only;       /* model a MEC that runs only the RLC-named KIQ */
     bool     inv_noack;      /* model the card (2026-09-28): GC hub flushes never ack */
     bool     sdma_no_db;     /* model an SDMA that ignores its doorbell */
+    bool     dma_broken;     /* model a system-memory path that faults */
 
     uint32_t *regs;           /* BAR5 image, RDNA4_MMIO_SIZE bytes */
     uint8_t  *resv;           /* top RDNA4_RESV_SIZE bytes of VRAM */
+    uint8_t  *hidden;         /* VRAM past the aperture: reserved, touched lazily */
+    uint64_t hidden_size;
     uint8_t  edid[256];
     uint32_t edid_len;
     uint8_t  *discovery;      /* IP discovery binary from the flash image */
@@ -379,6 +383,9 @@ static uint8_t *rdna4_vram_ptr(RDNA4State *s, uint64_t off)
 
     if (off + 4 <= s->aperture) {
         return (uint8_t *)memory_region_get_ram_ptr(&s->vram) + off;
+    }
+    if (s->hidden && off >= s->aperture && off + 4 <= s->aperture + s->hidden_size) {
+        return s->hidden + (off - s->aperture);
     }
     if (off >= resv_base && off + 4 <= rdna4_vram_size()) {
         return s->resv + (off - resv_base);
@@ -1068,6 +1075,69 @@ static uint8_t *rdna4_gc_span(RDNA4State *s, uint64_t mc, uint64_t len)
     return off < 0 ? NULL : rdna4_vram_span(s, off, len);
 }
 
+#define REG_GCMC_AGP_TOP     GC_SEG0(0x1616)   /* MC >> 24 */
+#define REG_GCMC_AGP_BOT     GC_SEG0(0x1617)
+#define REG_GCMC_AGP_BASE    GC_SEG0(0x1618)   /* system address >> 24 */
+
+/*
+ * The system address of `len` bytes at MC `mc` in the GC hub's AGP
+ * aperture (system = mc - BOT + BASE, amdgpu keeps BASE 0), or -1.
+ */
+static int64_t rdna4_gc_agp(RDNA4State *s, uint64_t mc, uint64_t len)
+{
+    uint64_t bot = (uint64_t)(reg_get(s, REG_GCMC_AGP_BOT) & 0xffffff) << 24;
+    uint64_t top = ((uint64_t)(reg_get(s, REG_GCMC_AGP_TOP) & 0xffffff) << 24) | 0xffffff;
+    uint64_t base = (uint64_t)(reg_get(s, REG_GCMC_AGP_BASE) & 0xffffff) << 24;
+
+    if (!(reg_get(s, REG_GCMC_L1_TLB) & 1) || bot > top || mc < bot || mc + len - 1 > top) {
+        return -1;
+    }
+    return mc - bot + base;
+}
+
+/*
+ * SDMA COPY_LINEAR between VRAM and/or system memory. System memory is the
+ * guest's, reached by bus-master DMA, which the device must have enabled.
+ */
+static bool rdna4_sdma_copy(RDNA4State *s, uint64_t src, uint64_t dst, uint32_t bytes)
+{
+    PCIDevice *pci = PCI_DEVICE(s);
+    uint8_t *sp = rdna4_gc_span(s, src, bytes), *dp = rdna4_gc_span(s, dst, bytes);
+    int64_t sa = sp ? -1 : rdna4_gc_agp(s, src, bytes), da = dp ? -1 : rdna4_gc_agp(s, dst, bytes);
+    bool ok;
+
+    if ((!sp && sa < 0) || (!dp && da < 0)) {
+        fprintf(stderr, "rdna4: sdma: copy 0x%" PRIx64 " -> 0x%" PRIx64 " (%u bytes) outside "
+                "VRAM and the AGP aperture\n", src, dst, bytes);
+        return false;
+    }
+    if ((!sp || !dp) && !(pci_get_word(pci->config + PCI_COMMAND) & PCI_COMMAND_MASTER)) {
+        fprintf(stderr, "rdna4: sdma: system-memory copy with bus mastering off\n");
+        return false;
+    }
+    if (sp && dp) {
+        memmove(dp, sp, bytes);
+        return true;
+    }
+    if (s->dma_broken) {
+        return false;                               /* the engine stops on the packet */
+    }
+    if (sp) {
+        ok = pci_dma_write(pci, da, sp, bytes) == MEMTX_OK;          /* VRAM -> system */
+    } else if (dp) {
+        ok = pci_dma_read(pci, sa, dp, bytes) == MEMTX_OK;           /* system -> VRAM */
+    } else {
+        g_autofree uint8_t *tmp = g_malloc(bytes);
+        ok = pci_dma_read(pci, sa, tmp, bytes) == MEMTX_OK &&
+             pci_dma_write(pci, da, tmp, bytes) == MEMTX_OK;
+    }
+    if (!ok) {
+        fprintf(stderr, "rdna4: sdma: bus-master DMA %s 0x%" PRIx64 " failed\n",
+                sp ? "to" : "from", sp ? (uint64_t)da : (uint64_t)sa);
+    }
+    return ok;
+}
+
 /*
  * SDMA0 queue 0: run the packets between RPTR and the new WPTR. Knows the
  * packets the kext uses: NOP, WRITE (linear), COPY (linear), FENCE and
@@ -1138,12 +1208,10 @@ static void rdna4_sdma_wptr(RDNA4State *s, uint32_t wptr)
             uint32_t bytes = dw[1] + 1;
             uint64_t src = dw[3] | ((uint64_t)dw[4] << 32);
             uint64_t d = dw[5] | ((uint64_t)dw[6] << 32);
-            uint8_t *sp = rdna4_gc_span(s, src, bytes);
             len = 8;
-            if (sub || !sp || !(dst = rdna4_gc_span(s, d, bytes))) {
+            if (sub || !rdna4_sdma_copy(s, src, d, bytes)) {
                 goto fault;
             }
-            memmove(dst, sp, bytes);
             break;
         }
         default:
@@ -2349,6 +2417,19 @@ static void rdna4_realize(PCIDevice *dev, Error **errp)
     rdna4_load_discovery(s);
     s->regs = g_malloc0(RDNA4_MMIO_SIZE);
     s->resv = g_malloc0(RDNA4_RESV_SIZE);
+    /*
+     * The rest of VRAM, past the BAR the host sees: the kext's compute heap
+     * lives there. NORESERVE, so only pages the guest's GPU work touches
+     * take host memory.
+     */
+    s->hidden_size = rdna4_vram_size() - RDNA4_RESV_SIZE - s->aperture;
+    s->hidden = mmap(NULL, s->hidden_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (s->hidden == MAP_FAILED) {
+        warn_report("rdna4: no host reservation for VRAM past the aperture");
+        s->hidden = NULL;
+        s->hidden_size = 0;
+    }
     if (!rdna4_load_state(s, errp)) {
         return;
     }
@@ -2412,6 +2493,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("kiq-only", RDNA4State, kiq_only, false),
     DEFINE_PROP_BOOL("inv-noack", RDNA4State, inv_noack, false),
     DEFINE_PROP_BOOL("sdma-no-doorbell", RDNA4State, sdma_no_db, false),
+    DEFINE_PROP_BOOL("dma-broken", RDNA4State, dma_broken, false),
 };
 
 static void rdna4_class_init(ObjectClass *klass, void *data)

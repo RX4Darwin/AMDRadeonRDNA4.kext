@@ -205,8 +205,14 @@ Limits for now:
   that need dispatch/queue pointers or scratch are refused at load, with the
   reason in the kernel log.
 - Hidden (implicit) arguments are zero unless the caller writes them.
-- The heap is the CPU-visible part of the compute pool (96 MiB with a 256 MiB
-  BAR0).
+- Transfers: once its self-test passes, the runtime copies with the GPU's
+  own copy engine (SDMA) through a pinned 16 MiB bounce buffer in host
+  memory, which the GC hub's AGP aperture maps (amdgpu's layout; the
+  aperture ends at the buffer). That needs PCI bus mastering, enabled for the
+  compute path only; the self-test has the GPU read host memory first, so a
+  wrong mapping costs a mismatch, never a stray write. Buffers then come from
+  VRAM past the BAR (half of VRAM, up to 8 GiB). Without DMA, the CPU copies
+  through the BAR and buffers share the 96 MiB CPU-visible heap.
 - Every kernel runs in VMID0: it can reach all of VRAM, hence root only.
 - A dispatch that misses its timeout marks the runtime wedged until reboot,
   because there is no queue reset yet.
@@ -414,6 +420,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       every result exact; VRAM copy 208 GB/s vs 34 GB/s CPU memcpy.
       Host->GPU 333 MB/s but GPU->host only 5 MB/s (CPU reads through the
       BAR) — the next bottleneck
+- [ ] DMA transfers (SDMA + AGP aperture + bounce buffer) and buffers in all
+      of VRAM: in the emulator, 25-45x faster transfers and 7.7 GiB of
+      buffers; next hardware run
 - [ ] Native mode setting (DCN 4.1.0) / multiple displays
 - [ ] Hardware cursor through the NDRV cursor path
 - [ ] Acceleration / Metal

@@ -64,7 +64,62 @@ static int cmdInfo(rdna4_t *gpu) {
 	       (in.flags & RDNA4_FLAG_WEDGED) ? ", WEDGED (a dispatch timed out; reboot)" : "");
 	printf("heap: %llu MiB, %llu MiB free, GPU base 0x%llx\n", in.heapBytes >> 20,
 	       in.heapFree >> 20, in.heapBase);
+	printf("transfers: %s\n", (in.flags & RDNA4_FLAG_DMA)
+	       ? "DMA by the GPU's copy engine; buffers from VRAM past the BAR"
+	       : "the CPU through the BAR (no DMA)");
 	return 0;
+}
+
+static int hasDma(rdna4_t *gpu, uint64_t *heapFree) {
+	rdna4_info_t in;
+	if (rdna4_info(gpu, &in) != KERN_SUCCESS)
+		return 0;
+	if (heapFree)
+		*heapFree = in.heapFree;
+	return (in.flags & RDNA4_FLAG_DMA) != 0;
+}
+
+// With DMA: a buffer bigger than the BAR's heap, written and read back at
+// both ends and in the middle, plus an odd-sized, odd-offset transfer.
+// Returns the failures.
+static int testLargeBuffer(rdna4_t *gpu) {
+	const uint64_t size = 512ull << 20, part = 1u << 20;
+	rdna4_buffer_t big;
+	kern_return_t kr = rdna4_alloc(gpu, size, &big);
+	if (kr != KERN_SUCCESS) {
+		printf("  FAIL  a 512 MiB buffer: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	uint8_t *w = malloc(part), *r = malloc(part);
+	int fails = 0;
+	for (uint64_t i = 0; i < part; i++)
+		w[i] = (uint8_t)(i * 7 + 13);
+	const uint64_t at[3] = { 0, size / 2 + 12345, size - part };
+	for (int k = 0; k < 3 && !fails; k++) {
+		memset(r, 0, part);
+		if ((kr = rdna4_write(gpu, &big, at[k], w, part)) || (kr = rdna4_read(gpu, &big, at[k], r, part)) ||
+		    memcmp(w, r, part)) {
+			printf("  FAIL  512 MiB buffer at +0x%llx: %s\n", at[k], kr ? rdna4_error(kr) : "data differs");
+			fails++;
+		}
+	}
+	// 777 bytes at an odd offset, read back with a byte of margin each side.
+	if (!fails) {
+		memset(r, 0xEE, 779);
+		if ((kr = rdna4_write(gpu, &big, 3, w + 100, 777)) ||
+		    (kr = rdna4_read(gpu, &big, 3, r + 1, 777)) || memcmp(w + 100, r + 1, 777) ||
+		    r[0] != 0xEE || r[778] != 0xEE) {
+			printf("  FAIL  odd-sized transfer: %s\n", kr ? rdna4_error(kr) : "data differs");
+			fails++;
+		}
+	}
+	if (!fails)
+		printf("  ok    a 512 MiB buffer (GPU 0x%llx, past the BAR) written and read back at "
+		       "both ends and the middle, and an odd-sized transfer\n", big.gpu);
+	rdna4_free(gpu, &big);
+	free(w);
+	free(r);
+	return fails;
 }
 
 static int checkFailed(const char *what, kern_return_t kr) {
@@ -249,6 +304,8 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 
 	// 3. LDS and barriers, on a second kernel from a multi-kernel file.
 	fails += testLds(gpu);
+	if (hasDma(gpu, NULL))
+		fails += testLargeBuffer(gpu);
 
 	// 4. What the runtime must refuse.
 	rdna4_program_t bogus = prog;
@@ -312,7 +369,9 @@ static int cmdBench(rdna4_t *gpu, int small) {
 		printf("note: Accelerate is not available here: no CPU comparison\n");
 
 	// 1. Host <-> GPU: the CPU copies through the BAR window.
-	const uint64_t xfer = small ? (1u << 20) : (16u << 20);
+	uint64_t heapFree = 0;
+	const int dma = hasDma(gpu, &heapFree);
+	const uint64_t xfer = dma ? (small ? (16u << 20) : (256u << 20)) : (small ? (1u << 20) : (16u << 20));
 	uint8_t *h1 = malloc(xfer), *h2 = malloc(xfer);
 	rdna4_buffer_t x;
 	if (!h1 || !h2 || (kr = rdna4_alloc(gpu, xfer, &x))) {
@@ -338,7 +397,7 @@ static int cmdBench(rdna4_t *gpu, int small) {
 	rdna4_free(gpu, &x);
 
 	// 2. VRAM bandwidth: `copy` reads and writes 16 bytes per work-item.
-	const uint64_t cb = small ? (1u << 20) : (32u << 20);
+	const uint64_t cb = dma ? (small ? (4u << 20) : (256u << 20)) : (small ? (1u << 20) : (32u << 20));
 	const uint64_t edge = 64u << 10;                  // checked at both ends
 	rdna4_buffer_t src, dst;
 	if ((kr = rdna4_alloc(gpu, cb, &src)) || (kr = rdna4_alloc(gpu, cb, &dst))) {
@@ -393,13 +452,15 @@ static int cmdBench(rdna4_t *gpu, int small) {
 
 	// 3. SGEMM, C = A x B: GFLOPS from the best of a few runs, and exact
 	//    agreement with the CPU (every element up to 512, sampled rows above).
-	static const uint32_t sizes[] = { 64, 128, 256, 512, 1024, 2048 };
-	const uint32_t maxN = small ? 128 : 2048;
+	static const uint32_t sizes[] = { 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
+	const uint32_t maxN = small ? 128 : dma ? 8192 : 2048;
 	double bestSpeedup = 0;
 	uint32_t bestSpeedupN = 0;
 	for (unsigned si = 0; si < sizeof(sizes) / sizeof(sizes[0]) && sizes[si] <= maxN; si++) {
 		const uint32_t n = sizes[si];
 		const uint64_t bytes = (uint64_t)n * n * 4;
+		if (3 * bytes > heapFree)
+			break;                                  // the heap bounds the sizes
 		float *A = malloc(bytes), *B = malloc(bytes), *C = malloc(bytes);
 		rdna4_buffer_t a, b, c;
 		if (!A || !B || !C || (kr = rdna4_alloc(gpu, bytes, &a)) || (kr = rdna4_alloc(gpu, bytes, &b)) ||
@@ -432,7 +493,7 @@ static int cmdBench(rdna4_t *gpu, int small) {
 		double cpuUs = 0;
 		if (Cc) {
 			cpuUs = 1e30;
-			for (int r = 0; r < 3; r++) {
+			for (int r = 0; r < (n >= 4096 ? 1 : 3); r++) {
 				double t = nowUs();
 				cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)n, (int)n, (int)n, 1.0f, A,
 				            (int)n, B, (int)n, 0.0f, Cc, (int)n);
@@ -443,26 +504,34 @@ static int cmdBench(rdna4_t *gpu, int small) {
 		}
 		// Rows to check: all of them up to 512, else 64 spread ones. Both the
 		// GPU's and Accelerate's results must equal the exact reference.
-		const uint32_t rows = n <= 512 ? n : 64;
+		const uint32_t rows = n <= 512 ? n : n >= 4096 ? 16 : 64;
 		uint32_t bad = 0, br = 0, bc = 0, cpuBad = 0;
 		float got = 0, want = 0;
-		for (uint32_t k = 0; k < rows && !kr; k++) {
+		float *ref = malloc((uint64_t)n * 4);
+		for (uint32_t k = 0; k < rows && !kr && ref; k++) {
 			const uint32_t r = rows == n ? k : (uint32_t)(((uint64_t)k * 2654435761u) % n);
 			kr = rdna4_read(gpu, &c, (uint64_t)r * n * 4, C, (uint64_t)n * 4);
+			// The reference row, B walked row by row (cache-friendly); the
+			// order does not matter, every sum is exact.
+			memset(ref, 0, (uint64_t)n * 4);
+			for (uint32_t q = 0; q < n && !kr; q++) {
+				const float a = A[r * n + q];
+				const float *brow = B + (uint64_t)q * n;
+				for (uint32_t j = 0; j < n; j++)
+					ref[j] += a * brow[j];
+			}
 			for (uint32_t j = 0; j < n && !kr; j++) {
-				float acc = 0.0f;
-				for (uint32_t q = 0; q < n; q++)
-					acc += A[r * n + q] * B[q * n + j];
-				if (Cc && Cc[(uint64_t)r * n + j] != acc)
+				if (Cc && Cc[(uint64_t)r * n + j] != ref[j])
 					cpuBad++;
-				if (C[j] != acc && !bad++) {
+				if (C[j] != ref[j] && !bad++) {
 					br = r;
 					bc = j;
 					got = C[j];
-					want = acc;
+					want = ref[j];
 				}
 			}
 		}
+		free(ref);
 		const double gpuGflops = 2.0 * n * n * (double)n / best / 1000.0;
 		if (kr || bad) {
 			if (kr)
@@ -476,7 +545,7 @@ static int cmdBench(rdna4_t *gpu, int small) {
 			printf("  ok    sgemm n=%-4u GPU %8.1f GFLOPS (%8.3f ms) | CPU %7.1f GFLOPS (%8.3f ms, "
 			       "Accelerate) | GPU %.1fx; %s exact%s\n", n, gpuGflops, best / 1000.0, cpuGflops,
 			       cpuUs / 1000.0, gpuGflops / cpuGflops,
-			       rows == n ? "every element" : "64 sampled rows",
+			       rows == n ? "every element" : rows == 64 ? "64 sampled rows" : "16 sampled rows",
 			       cpuBad ? " (Accelerate's result differs!)" : "");
 			if (gpuGflops / cpuGflops > bestSpeedup) {
 				bestSpeedup = gpuGflops / cpuGflops;
@@ -484,7 +553,8 @@ static int cmdBench(rdna4_t *gpu, int small) {
 			}
 		} else {
 			printf("  ok    sgemm n=%-4u GPU %8.1f GFLOPS (%.3f ms), %s exact\n", n, gpuGflops,
-			       best / 1000.0, rows == n ? "every element" : "64 sampled rows");
+			       best / 1000.0,
+			       rows == n ? "every element" : rows == 64 ? "64 sampled rows" : "16 sampled rows");
 		}
 		free(Cc);
 		rdna4_free(gpu, &a);

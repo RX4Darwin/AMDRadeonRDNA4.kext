@@ -12,15 +12,24 @@
 //  with no reset to recover it, so the runtime then refuses further
 //  dispatches (RDNA4_FLAG_WEDGED) until the next boot.
 //
+//  Transfers: once the DMA self-test passes (RDNA4_FLAG_DMA), Write/Read go
+//  through SDMA and a pinned bounce buffer in host memory, and buffers come
+//  from VRAM past the BAR (gigabytes); otherwise the CPU copies through the
+//  BAR into the pool's heap, as before.
+//
 
 #include "compute.hpp"
 #include "userclient.hpp"
 
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IODMACommand.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <kern/clock.h>
 
 #define RLOG(fmt, ...)  IOLog("RDNA4FB: runtime: " fmt "\n", ## __VA_ARGS__)
+
+using namespace GfxReg;
 
 namespace {
 
@@ -81,8 +90,11 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 		RLOG("not published: %s", !rtLock ? "no lock" : "no room for a heap in the pool");
 		return;
 	}
+	// DMA first: its self-test drives SDMA directly, before any client can.
+	if (dmaInit())
+		devHeapInit();
 	IOLockLock(rtLock);
-	heap.init(kHeapOffset, pool.size - kHeapOffset);
+	heap.init(kHeapOffset, pool.size - kHeapOffset, 4096, heapMap, sizeof(heapMap));
 	rtStage = stage;
 	rtReady = true;
 	IOLockUnlock(rtLock);
@@ -96,7 +108,8 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 	svc->compute = this;
 	svc->setProperty("IOUserClientClass", "RDNA4ComputeClient");
 	svc->setProperty("ABI", static_cast<uint64_t>(RDNA4_COMPUTE_ABI), 32);
-	svc->setProperty("HeapBytes", heap.size(), 64);
+	svc->setProperty("HeapBytes", devHeap.size() ? devHeap.size() : heap.size(), 64);
+	svc->setProperty("DMA", dmaReady);
 	if (!svc->attach(env.pci)) {
 		svc->release();
 		RLOG("not published: could not attach to the GPU");
@@ -105,8 +118,12 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 	svc->registerService();
 	rtService = svc;             // the registry keeps it
 	svc->release();
-	RLOG("user-space runtime up: %s, heap %llu MiB at MC 0x%llx", RDNA4_COMPUTE_SERVICE,
-	     heap.size() >> 20, poolMc(kHeapOffset));
+	if (dmaReady)
+		RLOG("user-space runtime up: %s, DMA transfers, %llu MiB of VRAM for buffers at MC 0x%llx",
+		     RDNA4_COMPUTE_SERVICE, devHeap.size() >> 20, vramMc(devHeap.base()));
+	else
+		RLOG("user-space runtime up: %s, CPU transfers, heap %llu MiB at MC 0x%llx",
+		     RDNA4_COMPUTE_SERVICE, heap.size() >> 20, poolMc(kHeapOffset));
 }
 
 RDNA4Compute::RtBuffer *RDNA4Compute::bufferFor(const void *owner, uint64_t handle) {
@@ -131,10 +148,13 @@ IOReturn RDNA4Compute::rtInfo(uint64_t out[6]) {
 	Locked g(rtLock);
 	out[0] = RDNA4_COMPUTE_ABI;
 	out[1] = rtStage;
-	out[2] = (rtReady ? RDNA4_FLAG_READY : 0) | (rtWedged ? RDNA4_FLAG_WEDGED : 0);
-	out[3] = heap.size();
-	out[4] = heap.freeBytes();
-	out[5] = poolMc(kHeapOffset);
+	out[2] = (rtReady ? RDNA4_FLAG_READY : 0) | (rtWedged ? RDNA4_FLAG_WEDGED : 0) |
+	         (dmaReady ? RDNA4_FLAG_DMA : 0);
+	const bool dev = dmaReady && devHeap.size();          // where buffers come from
+	const GpuHeap::Heap &h = dev ? devHeap : heap;
+	out[3] = h.size();
+	out[4] = h.freeBytes();
+	out[5] = dev ? vramMc(devHeap.base()) : poolMc(kHeapOffset);
 	return kIOReturnSuccess;
 }
 
@@ -143,7 +163,9 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	Locked g(rtLock);
 	if (!rtReady)
 		return kIOReturnNotReady;
-	if (!bytes || bytes > heap.size())
+	const bool dev = dmaReady && devHeap.size();
+	GpuHeap::Heap &h = dev ? devHeap : heap;
+	if (!bytes || bytes > h.size())
 		return kIOReturnBadArgument;
 	uint32_t slot = 0;
 	while (slot < kMaxBuffers && buffers[slot].owner)
@@ -151,12 +173,12 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	if (slot == kMaxBuffers)
 		return kIOReturnNoResources;
 	uint64_t off;
-	if (!heap.alloc(bytes, off))
+	if (!h.alloc(bytes, off))
 		return kIOReturnNoMemory;
 	RtBuffer &b = buffers[slot];
-	b = { owner, off, bytes, nextGen(b.gen) };
+	b = { owner, off, bytes, dev ? vramMc(off) : poolMc(off), nextGen(b.gen), dev };
 	handle = makeHandle(slot, b.gen);
-	gpu = poolMc(off);
+	gpu = b.mc;
 	return kIOReturnSuccess;
 }
 
@@ -165,7 +187,7 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	RtBuffer *b = bufferFor(owner, handle);
 	if (!b)
 		return kIOReturnBadArgument;
-	heap.free(b->offset);
+	(b->device ? devHeap : heap).free(b->offset);
 	b->owner = nullptr;
 	return kIOReturnSuccess;
 }
@@ -180,6 +202,10 @@ IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offse
 		return kIOReturnBadArgument;
 	if (!length)
 		return kIOReturnSuccess;
+	if (dmaReady)
+		return dmaCopy(task, user, b->mc + offset, length, toGpu);
+	if (b->device)
+		return kIOReturnNotReady;
 	IOReturn r = userCopy(task, user, poolCpu + b->offset + offset, length, toGpu);
 	if (toGpu)
 		flushHdp();
@@ -326,7 +352,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	uint32_t nb = 0, np = 0;
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner) {
-			heap.free(b.offset);
+			(b.device ? devHeap : heap).free(b.offset);
 			b.owner = nullptr;
 			nb++;
 		}
@@ -340,4 +366,223 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	}
 	if (nb || np)
 		RLOG("client closed: freed %u buffer(s), %u program(s)", nb, np);
+}
+
+// ---------------------------------------------------------------------------
+// DMA: SDMA between VRAM and a pinned bounce buffer in host memory
+// ---------------------------------------------------------------------------
+
+// One packet on SDMA0 queue 0 with a FENCE after it; waits for the fence.
+bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeoutMs) {
+	uint32_t fence[Sdma::kFenceDwords];
+	const uint32_t value = ++sdmaFence;
+	Sdma::fence(fence, poolMc(kSdmaFenceOffset), value);
+	if (!sdmaRing.emit(pkt, dwords) || !sdmaRing.emit(fence, Sdma::kFenceDwords))
+		return false;
+	sdmaKick(sdmaRing.wptr());
+	uint64_t t0 = mach_absolute_time(), span = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000, &span);
+	for (uint32_t polls = 0;; polls++) {
+		if (*poolDw(kSdmaFenceOffset) == value)
+			return true;
+		if (mach_absolute_time() - t0 > span)
+			break;
+		if (polls < 200)
+			IODelay(10);
+		else
+			IOSleep(1);
+	}
+	RLOG("dma: SDMA fence %u never came (0x%08x)", value, *poolDw(kSdmaFenceOffset));
+	logGcFault("dma");
+	return false;
+}
+
+// One COPY_LINEAR between VRAM and the bounce buffer, through the AGP
+// aperture (bus address b is MC agpStart + b).
+bool RDNA4Compute::bounceCopy(uint64_t vram, uint32_t hostOffset, uint32_t bytes, bool toGpu) {
+	if (!bytes || hostOffset > kBounceBytes || bytes > kBounceBytes - hostOffset)
+		return false;
+	const uint64_t host = agpStart + bounceBus + hostOffset;
+	uint32_t pkt[Sdma::kCopyDwords];
+	Sdma::copyLinear(pkt, toGpu ? host : vram, toGpu ? vram : host, bytes);
+	return sdmaRun(pkt, Sdma::kCopyDwords, 2000);
+}
+
+bool RDNA4Compute::dmaInit() {
+	if (!poolCpu || !sdmaRing.sizeBytes() || !sv.fbMcTop) {
+		RLOG("dma: not set up: %s", !sdmaRing.sizeBytes() ? "no SDMA queue" : "no compute pool");
+		return false;
+	}
+	// 1. Pinned (buffer memory is wired), physically contiguous, 40-bit.
+	bounce = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+		kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, kBounceBytes,
+		0x000000fffffff000ull);
+	if (!bounce) {
+		dmaTeardown("no contiguous 16 MiB bounce buffer");
+		return false;
+	}
+	bounceVa = static_cast<uint8_t *>(bounce->getBytesNoCopy());
+
+	// 2. The address the device uses for it: an IOMapper's, if the system
+	//    has one, else the physical one. One segment, or no DMA.
+	bounceDma = IODMACommand::withSpecification(kIODMACommandOutputHost64, 40, 0,
+	                                            IODMACommand::kMapped, 0, 1);
+	UInt64 off = 0;
+	IODMACommand::Segment64 seg {};
+	UInt32 nseg = 1;
+	if (!bounceVa || !bounceDma || bounceDma->setMemoryDescriptor(bounce) != kIOReturnSuccess ||
+	    bounceDma->gen64IOVMSegments(&off, &seg, &nseg) != kIOReturnSuccess || nseg != 1 ||
+	    seg.fLength < kBounceBytes) {
+		dmaTeardown("the bounce buffer has no single DMA segment");
+		return false;
+	}
+	bounceBus = seg.fIOVMAddr;
+
+	// 3. amdgpu's AGP layout (amdgpu_gmc_agp_location, amdgpu_gmc_agp_addr,
+	//    gfxhub_v12_0_init_system_aperture_regs): AGP_BASE 0, the aperture
+	//    16 GiB-aligned right after the FB, bus address b at agpStart + b,
+	//    and the system aperture extended over it. It reaches bus addresses
+	//    up to the bounce buffer's end, not all of memory.
+	agpStart = (sv.fbMcTop + (16ull << 30)) & ~((16ull << 30) - 1);
+	const uint64_t agpEnd = agpStart + bounceBus + kBounceBytes - 1;
+	wr(IpDiscovery::HwGc, GcAgpBase, 0);
+	wr(IpDiscovery::HwGc, GcAgpBot, static_cast<uint32_t>(agpStart >> 24));
+	wr(IpDiscovery::HwGc, GcAgpTop, static_cast<uint32_t>(agpEnd >> 24));
+	wr(IpDiscovery::HwGc, GcSysApertureHigh, static_cast<uint32_t>(agpEnd >> 18));
+	gcHubFlush();
+
+	// 4. The GPU may master the bus from here on (the display never needs to).
+	busMasterWas = env.pci->setBusMasterEnable(true);
+	busMasterSet = true;
+
+	// 5. Self-test, reads first: until the GPU has fetched a known pattern
+	//    from the bounce buffer, a wrong mapping costs a mismatch, never a
+	//    write into memory that is not ours.
+	constexpr uint32_t n = 64 << 10;
+	auto pat1 = [](uint32_t i) { return 0xB0A7C0DEu ^ (i * 2654435761u); };
+	auto pat2 = [](uint32_t i) { return 0x5EEDF00Du + i * 7; };
+	uint32_t *host = reinterpret_cast<uint32_t *>(bounceVa);
+	for (uint32_t i = 0; i < 3 * n / 4; i++)
+		host[i] = i < n / 4 ? pat1(i) : 0;
+	bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, 3 * n);
+	for (uint32_t i = 0; i < 2 * n / 4; i++)
+		*poolDw(kDmaTestOffset + 4 * i) = i < n / 4 ? 0 : pat2(i - n / 4);
+	flushHdp();
+	bool ok = bounceCopy(poolMc(kDmaTestOffset), 0, n, true);
+	uint32_t bad = 0;
+	for (uint32_t i = 0; ok && i < n / 4; i++)
+		bad += *poolDw(kDmaTestOffset + 4 * i) != pat1(i);
+	if (!ok || bad) {
+		dmaTeardown(!ok ? "the host->VRAM test copy never finished"
+		                : "the host->VRAM test copy delivered wrong data (read only; nothing written)");
+		return false;
+	}
+	// 6. Then writes: VRAM into the buffer's second 64 KiB; the third must
+	//    stay untouched.
+	ok = bounceCopy(poolMc(kDmaTestOffset + n), n, n, false);
+	bounce->performOperation(kIOMemoryIncoherentIOFlush, n, 2 * n);
+	for (uint32_t i = 0; ok && i < n / 4; i++)
+		bad += host[n / 4 + i] != pat2(i) || host[n / 2 + i] != 0;
+	if (!ok || bad) {
+		dmaTeardown(!ok ? "the VRAM->host test copy never finished"
+		                : "the VRAM->host test copy delivered wrong data");
+		return false;
+	}
+
+	// 7. Speed, for the log: the whole buffer each way, into the pool's
+	//    heap area (not handed out yet).
+	uint64_t t0 = mach_absolute_time(), ns1 = 0, ns2 = 0;
+	ok = bounceCopy(poolMc(kHeapOffset), 0, kBounceBytes, true);
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns1);
+	t0 = mach_absolute_time();
+	ok = ok && bounceCopy(poolMc(kHeapOffset), 0, kBounceBytes, false);
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns2);
+	if (!ok) {
+		dmaTeardown("a 16 MiB test copy never finished");
+		return false;
+	}
+	dmaReady = true;
+	RLOG("dma: on — bounce buffer 16 MiB at bus 0x%llx, AGP aperture MC 0x%llx..0x%llx; self-test "
+	     "ok; SDMA host->VRAM %llu MB/s, VRAM->host %llu MB/s", bounceBus, agpStart, agpEnd,
+	     ns1 ? kBounceBytes * 1000ull / ns1 : 0, ns2 ? kBounceBytes * 1000ull / ns2 : 0);
+	return true;
+}
+
+void RDNA4Compute::dmaTeardown(const char *why) {
+	RLOG("dma: off — %s; transfers stay on the CPU through the BAR", why);
+	dmaReady = false;
+	wr(IpDiscovery::HwGc, GcAgpBase, 0);
+	wr(IpDiscovery::HwGc, GcAgpBot, 0xffffff);                 // aperture closed
+	wr(IpDiscovery::HwGc, GcAgpTop, 0);
+	wr(IpDiscovery::HwGc, GcSysApertureHigh, static_cast<uint32_t>(sv.fbMcTop >> 18));
+	if (busMasterSet) {
+		env.pci->setBusMasterEnable(busMasterWas);
+		busMasterSet = false;
+	}
+	if (bounceDma) {
+		bounceDma->clearMemoryDescriptor();
+		bounceDma->release();
+		bounceDma = nullptr;
+	}
+	OSSafeReleaseNULL(bounce);
+	bounceVa = nullptr;
+	bounceBus = 0;
+}
+
+// VRAM past the BAR and the compute pool: from the pool's end up to half
+// of the card's VRAM (at most 8 GiB), always below the DMUB memory the
+// display keeps near the top; the firmware's reservations (TMR, discovery)
+// sit above that too.
+void RDNA4Compute::devHeapInit() {
+	const uint64_t base = pool.offset + pool.size;
+	uint64_t top = static_cast<uint64_t>(sv.vramMiB) << 19;
+	if (top > (8ull << 30))
+		top = 8ull << 30;
+	if (dmubVram && dmubVram < top)
+		top = dmubVram;
+	top &= ~static_cast<uint64_t>(kDevHeapGranule - 1);
+	if (top <= base + (64ull << 20)) {
+		RLOG("dma: no VRAM past the BAR for buffers (top 0x%llx); buffers stay in the pool", top);
+		return;
+	}
+	const uint64_t granules = (top - base) / kDevHeapGranule;
+	devHeapMap = static_cast<uint8_t *>(IOMalloc(granules));
+	if (!devHeapMap) {
+		RLOG("dma: no memory for the device heap's map; buffers stay in the pool");
+		return;
+	}
+	devHeapMapBytes = static_cast<uint32_t>(granules);
+	devHeap.init(base, top - base, kDevHeapGranule, devHeapMap, devHeapMapBytes);
+	RLOG("dma: buffers from VRAM+0x%llx..+0x%llx (%llu MiB, past the BAR)", base, top,
+	     (top - base) >> 20);
+}
+
+// Write/Read through the bounce buffer, 16 MiB at a time. The buffer is
+// cacheable host memory and AGP accesses do not snoop, so the CPU caches are
+// flushed around each copy: before the GPU reads it, and before and after
+// the GPU writes it (no dirty line may land on the data later, and none
+// fetched meanwhile may be read).
+IOReturn RDNA4Compute::dmaCopy(task_t task, mach_vm_address_t user, uint64_t mc, uint64_t length,
+                               bool toGpu) {
+	for (uint64_t done = 0; done < length;) {
+		const uint32_t n = static_cast<uint32_t>(length - done < kBounceBytes ? length - done
+		                                                                        : kBounceBytes);
+		IOReturn r;
+		if (toGpu) {
+			if ((r = userCopy(task, user + done, bounceVa, n, true)) != kIOReturnSuccess)
+				return r;
+			bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+			if (!bounceCopy(mc + done, 0, n, true))
+				return kIOReturnIOError;
+		} else {
+			bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+			if (!bounceCopy(mc + done, 0, n, false))
+				return kIOReturnIOError;
+			bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+			if ((r = userCopy(task, user + done, bounceVa, n, false)) != kIOReturnSuccess)
+				return r;
+		}
+		done += n;
+	}
+	return kIOReturnSuccess;
 }
