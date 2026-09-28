@@ -49,6 +49,7 @@
 #include "qemu/module.h"
 #include "qemu/units.h"
 #include "qemu/timer.h"
+#include "qemu/main-loop.h"
 #include "qemu/host-utils.h"
 #include "qemu/error-report.h"
 #include "hw/pci/pci_device.h"
@@ -377,6 +378,8 @@ typedef struct RDNA4Scanout {
 static void rdna4_ih_emit(RDNA4State *s, uint8_t client, uint8_t source,
                           uint8_t ring, uint32_t data0);
 
+typedef struct RDNA4Dispatch RDNA4Dispatch;
+
 struct RDNA4State {
     PCIDevice parent_obj;
 
@@ -441,14 +444,45 @@ struct RDNA4State {
     bool         ih_overflow;
     bool         gfx_booted;            /* RLC autoload done */
 
+    /* Queue kicks are consumed by the QEMU main loop, never by an MMIO
+     * handler.  The realtime timer re-arms the bottom half between slices. */
+    QEMUBH      *work_bh;
+    QEMUTimer   *work_timer;
+    RDNA4Dispatch *dispatch;
+    uint64_t     work_slices;
+    uint64_t     work_slice_logs;
+
+    struct {
+        bool     active;
+        uint32_t pipe, queue, vmid, size, rptr;
+        uint64_t pq, wptr;
+        uint32_t packet_len;
+    } mec_work;
+    struct {
+        bool     active, pending;
+        uint64_t wptr, pending_wptr;
+        uint32_t size, rptr;
+        uint64_t ring;
+        bool     packet_active;
+        uint32_t packet_len, packet_op;
+        uint64_t copy_src, copy_dst;
+        uint32_t copy_bytes, copy_done;
+        uint32_t fill_value;
+        uint8_t  fill_size;
+    } sdma_work;
+
     /* CP_HQD_* and compute shader registers are banked by GRBM_GFX_CNTL. */
     struct {
         uint32_t q[0x100];
         uint32_t sh[0x100];
         bool used;
+        bool pending;
+        uint64_t pending_wptr;
     } hqd[4][8];
     uint32_t selected_pipe, selected_queue, selected_vmid;
 };
+
+static void rdna4_work_schedule(RDNA4State *s);
 
 static bool rdna4_hqd_reg(uint32_t byte, uint32_t *off)
 {
@@ -1881,102 +1915,160 @@ static void rdna4_sdma_wptr(RDNA4State *s, uint64_t wptr64)
         return;
     }
     s->sdma_wptr = wptr64;
-
-    uint32_t cntl = reg_get(s, REG_SDMA0_RB_CNTL);
-    uint32_t size = 4u << ((cntl >> 1) & 0x1f);          /* bytes */
-    uint64_t ring = ((uint64_t)reg_get(s, REG_SDMA0_RB_BASE) << 8) |
-                    ((uint64_t)reg_get(s, REG_SDMA0_RB_BASE_HI) << 40);
-    uint32_t rptr = reg_get(s, REG_SDMA0_RB_RPTR);
-
+    s->sdma_work.pending_wptr = wptr64;
+    s->sdma_work.pending = true;
     reg_set(s, REG_SDMA0_RB_WPTR, wptr);
-    if (!s->gfx_booted || !(cntl & 1) || (reg_get(s, REG_SDMA0_MCU_CNTL) & 1)) {
-        return;                         /* no firmware, queue off, or halted */
-    }
-    wptr &= size - 1;
-    while (rptr != wptr) {
+    rdna4_work_schedule(s);
+}
+
+static bool rdna4_sdma_process_slice(RDNA4State *s, uint64_t deadline)
+{
+    for (;;) {
+        uint32_t cntl, op, sub, len;
+        uint64_t a;
         uint32_t dw[8];
-        for (int i = 0; i < 8; i++) {
-            uint8_t *p = rdna4_gc_span(s, ring + ((rptr + 4 * i) & (size - 1)), 4);
-            if (!p) {
-                fprintf(stderr, "rdna4: sdma: ring MC 0x%" PRIx64 " not mapped by the GC hub\n",
-                        ring);
-                return;
-            }
-            dw[i] = ldl_le_p(p);
+        uint8_t *p, *dst;
+
+        if (!s->sdma_work.active) {
+            if (!s->sdma_work.pending)
+                return false;
+            s->sdma_work.pending = false;
+            cntl = reg_get(s, REG_SDMA0_RB_CNTL);
+            s->sdma_work.size = 4u << ((cntl >> 1) & 0x1f);
+            s->sdma_work.ring = ((uint64_t)reg_get(s, REG_SDMA0_RB_BASE) << 8) |
+                                 ((uint64_t)reg_get(s, REG_SDMA0_RB_BASE_HI) << 40);
+            s->sdma_work.rptr = reg_get(s, REG_SDMA0_RB_RPTR);
+            s->sdma_work.wptr = s->sdma_work.pending_wptr & (s->sdma_work.size - 1);
+            s->sdma_work.packet_active = false;
+            if (!s->gfx_booted || !(cntl & 1) || (reg_get(s, REG_SDMA0_MCU_CNTL) & 1))
+                continue;
+            s->sdma_work.active = true;
         }
-        uint32_t op = dw[0] & 0xff, sub = (dw[0] >> 8) & 0xff, len = 1;
-        uint64_t a = dw[1] | ((uint64_t)dw[2] << 32);
-        uint8_t *dst;
-        switch (op) {
-        case 0:                                         /* NOP */
-            len = 1 + ((dw[0] >> 16) & 0x3fff);
-            break;
-        case 2: {                                       /* WRITE linear, 1 dword */
-            len = 5;
-            if (sub || dw[3] != 0 || !(dst = rdna4_gc_span(s, a, 4))) {
-                goto fault;
+        cntl = reg_get(s, REG_SDMA0_RB_CNTL);
+        if (!s->sdma_work.packet_active && s->sdma_work.rptr == s->sdma_work.wptr) {
+            if (cntl & (1u << 12)) {
+                uint64_t wb = (reg_get(s, REG_SDMA0_RPTR_LO) & ~3u) |
+                              ((uint64_t)reg_get(s, REG_SDMA0_RPTR_HI) << 32);
+                p = rdna4_gc_span(s, wb, 8);
+                if (p)
+                    stq_le_p(p, s->sdma_work.rptr);
             }
-            stl_le_p(dst, dw[4]);
-            break;
+            s->sdma_work.active = false;
+            continue;
         }
-        case 5:                                         /* FENCE */
-            len = 4;
-            if (!(dst = rdna4_gc_span(s, a & ~3ull, 4))) {
-                goto fault;
-            }
-            stl_le_p(dst, dw[3]);
-            break;
-        case 6:                                         /* TRAP: two-dword completion packet */
-            len = 2;
-            if (reg_get(s, REG_SDMA0_CNTL) & 1) {
-                rdna4_ih_emit(s, 0x0a, 49, 0, dw[1]);
-            }
-            break;
-        case 11: {                                      /* CONST_FILL */
-            uint32_t bytes = dw[4] + 1, fsize = dw[0] >> 30;
-            len = 5;
-            if (!(dst = rdna4_gc_span(s, a, bytes))) {
-                goto fault;
-            }
-            if (fsize == 2) {
-                for (uint32_t i = 0; i + 4 <= bytes; i += 4) {
-                    stl_le_p(dst + i, dw[3]);
+        if (!s->sdma_work.packet_active) {
+            for (int i = 0; i < 8; i++) {
+                p = rdna4_gc_span(s, s->sdma_work.ring +
+                                  ((s->sdma_work.rptr + 4 * i) & (s->sdma_work.size - 1)), 4);
+                if (!p) {
+                    fprintf(stderr, "rdna4: sdma: ring MC 0x%" PRIx64
+                            " not mapped by the GC hub\n", s->sdma_work.ring);
+                    s->sdma_work.active = false;
+                    return false;
                 }
+                dw[i] = ldl_le_p(p);
+            }
+            op = dw[0] & 0xff;
+            sub = (dw[0] >> 8) & 0xff;
+            len = 1;
+            a = dw[1] | ((uint64_t)dw[2] << 32);
+            switch (op) {
+            case 0:
+                len = 1 + ((dw[0] >> 16) & 0x3fff);
+                s->sdma_work.packet_len = len;
+                break;
+            case 2:
+                len = 5;
+                if (sub || dw[3] != 0 || !(dst = rdna4_gc_span(s, a, 4)))
+                    goto fault;
+                stl_le_p(dst, dw[4]);
+                s->sdma_work.packet_len = len;
+                break;
+            case 5:
+                len = 4;
+                if (!(dst = rdna4_gc_span(s, a & ~3ull, 4)))
+                    goto fault;
+                stl_le_p(dst, dw[3]);
+                s->sdma_work.packet_len = len;
+                break;
+            case 6:
+                len = 2;
+                if (reg_get(s, REG_SDMA0_CNTL) & 1)
+                    rdna4_ih_emit(s, 0x0a, 49, 0, dw[1]);
+                s->sdma_work.packet_len = len;
+                break;
+            case 11:
+                len = 5;
+                s->sdma_work.packet_len = len;
+                s->sdma_work.packet_op = op;
+                s->sdma_work.copy_dst = a;
+                s->sdma_work.copy_bytes = dw[4] + 1;
+                s->sdma_work.copy_done = 0;
+                s->sdma_work.fill_value = dw[3];
+                s->sdma_work.fill_size = (dw[0] >> 30) == 2 ? 4 : 1;
+                s->sdma_work.packet_active = true;
+                break;
+            case 1:
+                len = 8;
+                s->sdma_work.packet_len = len;
+                s->sdma_work.packet_op = op;
+                s->sdma_work.copy_bytes = dw[1] + 1;
+                s->sdma_work.copy_done = 0;
+                s->sdma_work.copy_src = dw[3] | ((uint64_t)dw[4] << 32);
+                s->sdma_work.copy_dst = dw[5] | ((uint64_t)dw[6] << 32);
+                if (sub)
+                    goto fault;
+                s->sdma_work.packet_active = true;
+                break;
+            default:
+                fprintf(stderr, "rdna4: sdma: unknown packet 0x%08x at rptr 0x%x, stopping\n",
+                        dw[0], s->sdma_work.rptr);
+                s->sdma_work.active = false;
+                return false;
+            }
+        }
+        if (s->sdma_work.packet_active) {
+            uint32_t left = s->sdma_work.copy_bytes - s->sdma_work.copy_done;
+            uint32_t chunk = MIN(left, 1u << 20);
+            if (s->sdma_work.packet_op == 1) {
+                if (!rdna4_sdma_copy(s, s->sdma_work.copy_src + s->sdma_work.copy_done,
+                                     s->sdma_work.copy_dst + s->sdma_work.copy_done, chunk))
+                    goto fault_active;
             } else {
-                memset(dst, dw[3] & 0xff, bytes);
+                dst = rdna4_gc_span(s, s->sdma_work.copy_dst + s->sdma_work.copy_done, chunk);
+                if (!dst)
+                    goto fault_active;
+                if (s->sdma_work.fill_size == 4) {
+                    for (uint32_t i = 0; i + 4 <= chunk; i += 4)
+                        stl_le_p(dst + i, s->sdma_work.fill_value);
+                } else {
+                    memset(dst, s->sdma_work.fill_value & 0xff, chunk);
+                }
             }
-            break;
+            s->sdma_work.copy_done += chunk;
+            if (s->sdma_work.copy_done != s->sdma_work.copy_bytes)
+                goto next_slice;
+            s->sdma_work.packet_active = false;
         }
-        case 1: {                                       /* COPY linear */
-            uint32_t bytes = dw[1] + 1;
-            uint64_t src = dw[3] | ((uint64_t)dw[4] << 32);
-            uint64_t d = dw[5] | ((uint64_t)dw[6] << 32);
-            len = 8;
-            if (sub || !rdna4_sdma_copy(s, src, d, bytes)) {
-                goto fault;
-            }
-            break;
-        }
-        default:
-            fprintf(stderr, "rdna4: sdma: unknown packet 0x%08x at rptr 0x%x, stopping\n",
-                    dw[0], rptr);
-            return;
-        }
-        rptr = (rptr + 4 * len) & (size - 1);
-        reg_set(s, REG_SDMA0_RB_RPTR, rptr);
+        s->sdma_work.rptr = (s->sdma_work.rptr + 4 * s->sdma_work.packet_len) &
+                             (s->sdma_work.size - 1);
+        reg_set(s, REG_SDMA0_RB_RPTR, s->sdma_work.rptr);
+        if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) >= deadline)
+            goto next_slice;
         continue;
 fault:
-        fprintf(stderr, "rdna4: sdma: packet 0x%08x at rptr 0x%x: address 0x%" PRIx64
-                " not mapped by the GC hub, stopping\n", dw[0], rptr, a);
-        return;
-    }
-    if (cntl & (1u << 12)) {                            /* RPTR_WRITEBACK_ENABLE */
-        uint64_t wb = (reg_get(s, REG_SDMA0_RPTR_LO) & ~3u) |
-                      ((uint64_t)reg_get(s, REG_SDMA0_RPTR_HI) << 32);
-        uint8_t *p = rdna4_gc_span(s, wb, 8);
-        if (p) {
-            stq_le_p(p, rptr);
-        }
+        fprintf(stderr, "rdna4: sdma: packet at rptr 0x%x: address 0x%" PRIx64
+                " not mapped by the GC hub, stopping\n", s->sdma_work.rptr, a);
+        s->sdma_work.active = false;
+        return false;
+fault_active:
+        fprintf(stderr, "rdna4: sdma: packet at rptr 0x%x: address not mapped, stopping\n",
+                s->sdma_work.rptr);
+        s->sdma_work.active = false;
+        s->sdma_work.packet_active = false;
+        return false;
+next_slice:
+        return s->sdma_work.active || s->sdma_work.pending;
     }
 }
 
@@ -2234,6 +2326,21 @@ typedef struct RDNA4Lds {
     uint8_t  *mem;
     uint32_t size;
 } RDNA4Lds;
+
+struct RDNA4Dispatch {
+    uint32_t dim_x, dim_y, dim_z;
+    uint32_t tx, ty, tz, items, nuser, rsrc2;
+    uint32_t vmid, initiator;
+    uint64_t pgm;
+    uint32_t gx, gy, gz;
+    uint64_t groups_done, groups_total, ran;
+    bool     mandelbrot;
+    uint64_t out_mc;
+    uint32_t width, height, pitch;
+    uint32_t user[16];
+    RDNA4Lane *lanes;
+    RDNA4Lds lds;
+};
 
 static uint32_t rdna4_isa_src(const RDNA4Lane *l, uint32_t src, uint32_t literal, bool *used_lit)
 {
@@ -2608,17 +2715,16 @@ unknown:
  * ARGB8888 palette as the code object. The dispatch shape and 20-byte
  * kernarg signature make this unambiguous among the embedded bench kernels.
  */
-static bool rdna4_mandelbrot_dispatch(RDNA4State *s, uint64_t pgm, uint32_t dim_x,
-                                      uint32_t dim_y, uint32_t dim_z, uint32_t tx,
-                                      uint32_t ty, uint32_t tz, uint32_t nuser)
+static bool rdna4_mandelbrot_prepare(RDNA4State *s, uint64_t pgm, uint32_t tx,
+                                     uint32_t ty, uint32_t tz, uint32_t nuser,
+                                     uint64_t *out_mc, uint32_t *width,
+                                     uint32_t *height, uint32_t *pitch)
 {
     uint8_t *code = rdna4_gc_span(s, pgm, 0x20);
     uint64_t kernarg;
     uint8_t *args;
-    uint64_t out_mc;
-    uint32_t width, height, pitch;
 
-    if (tx != 16 || ty != 16 || tz != 1 || !dim_x || !dim_y || !dim_z || nuser != 2 ||
+    if (tx != 16 || ty != 16 || tz != 1 || nuser != 2 ||
         !code || ldl_le_p(code) != 0xf400a100 || ldl_le_p(code + 4) != 0xf8000008 ||
         ldl_le_p(code + 0x10) != 0xd6100002)
         return false;
@@ -2627,26 +2733,28 @@ static bool rdna4_mandelbrot_dispatch(RDNA4State *s, uint64_t pgm, uint32_t dim_
     args = rdna4_gc_span(s, kernarg, 20);
     if (!args)
         return false;
-    out_mc = (uint64_t)ldl_le_p(args) | ((uint64_t)ldl_le_p(args + 4) << 32);
-    width = ldl_le_p(args + 8);
-    height = ldl_le_p(args + 12);
-    pitch = ldl_le_p(args + 16);
-    if (!out_mc || !width || !height || !pitch)
+    *out_mc = (uint64_t)ldl_le_p(args) | ((uint64_t)ldl_le_p(args + 4) << 32);
+    *width = ldl_le_p(args + 8);
+    *height = ldl_le_p(args + 12);
+    *pitch = ldl_le_p(args + 16);
+    if (!*out_mc || !*width || !*height || !*pitch)
         return false;
+    return true;
+}
 
-    for (uint32_t gz = 0; gz < dim_z; gz++)
-    for (uint32_t gy = 0; gy < dim_y; gy++)
-    for (uint32_t gx = 0; gx < dim_x; gx++)
-    for (uint32_t ly = 0; ly < ty; ly++)
-    for (uint32_t lx = 0; lx < tx; lx++) {
-        uint32_t x = gx * tx + lx, y = gy * ty + ly, iteration = 0, color = 0xff000000u;
+static bool rdna4_mandelbrot_group(RDNA4State *s, const RDNA4Dispatch *d)
+{
+    for (uint32_t ly = 0; ly < d->ty; ly++)
+    for (uint32_t lx = 0; lx < d->tx; lx++) {
+        uint32_t x = d->gx * d->tx + lx, y = d->gy * d->ty + ly;
+        uint32_t iteration = 0, color = 0xff000000u;
         float cx, cy, zx = 0.0f, zy = 0.0f;
         uint8_t *pixel;
 
-        if (x >= width || y >= height)
+        if (x >= d->width || y >= d->height)
             continue;
-        cx = ((float)x / (float)width - 0.5f) * 3.2f - 0.7f;
-        cy = ((float)y / (float)height - 0.5f) * 2.2f;
+        cx = ((float)x / (float)d->width - 0.5f) * 3.2f - 0.7f;
+        cy = ((float)y / (float)d->height - 0.5f) * 2.2f;
         for (; iteration < 256u; iteration++) {
             float zx2 = zx * zx, zy2 = zy * zy;
             float next_zx;
@@ -2663,16 +2771,11 @@ static bool rdna4_mandelbrot_dispatch(RDNA4State *s, uint64_t pgm, uint32_t dim_
             uint32_t b = (uint32_t)(80.0f + 175.0f * t);
             color = 0xff000000u | (r << 16) | (g << 8) | b;
         }
-        pixel = rdna4_gc_span(s, out_mc + ((uint64_t)y * pitch + x) * 4, 4);
+        pixel = rdna4_gc_span(s, d->out_mc + ((uint64_t)y * d->pitch + x) * 4, 4);
         if (!pixel)
             return false;
         stl_le_p(pixel, color);
     }
-    /* Hidden VRAM is not a MemoryRegion, so its writes do not dirty QEMU's
-     * display bitmap. Refresh the console explicitly for screendumps/VNC. */
-    dpy_gfx_update_full(s->con);
-    fprintf(stderr, "rdna4: cs: Mandelbrot model %ux%ux%u of %ux%ux%u ran\n",
-            dim_x, dim_y, dim_z, tx, ty, tz);
     return true;
 }
 
@@ -2804,129 +2907,166 @@ static bool rdna4_wave_wmma(RDNA4State *s, RDNA4Lane *w, unsigned n, uint32_t vm
     return true;
 }
 
-/*
- * One DISPATCH_DIRECT. Each work-group's work-items run in turns: each
- * until it ends or reaches s_barrier_signal; once every live one waits,
- * the barrier opens. The group's LDS is what RSRC2.LDS_SIZE allocates.
- */
-static bool rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32_t dim_z,
-                           uint32_t initiator, uint32_t vmid)
-{
-    uint64_t pgm = ((uint64_t)reg_get(s, REG_CS_PGM_LO) << 8) |
-                   ((uint64_t)reg_get(s, REG_CS_PGM_HI) << 40);
-    uint32_t rsrc2 = reg_get(s, REG_CS_RSRC2), nuser = (rsrc2 >> 1) & 0x1f;
-    uint32_t tx = reg_get(s, REG_CS_NUM_THREAD_X), ty = reg_get(s, REG_CS_NUM_THREAD_X + 4);
-    uint32_t tz = reg_get(s, REG_CS_NUM_THREAD_X + 8), items = tx * ty * tz;
-    RDNA4Lds lds = { NULL, ((rsrc2 >> 15) & 0x1ff) * 512 };
-    RDNA4Lane *lanes;
-    uint64_t ran = 0;
-    bool hung = false;
+enum { RDNA4_DISPATCH_DONE, RDNA4_DISPATCH_MORE, RDNA4_DISPATCH_HUNG };
 
-    if (!(initiator & 1) || !reg_get(s, REG_SH_MEM_CONFIG) || !reg_get(s, REG_CS_THREAD_SE0) ||
-        !tx || !ty || !tz || (uint64_t)tx * ty * tz > 1024 || !dim_x || !dim_y || !dim_z) {
+static void rdna4_dispatch_free(RDNA4Dispatch *d)
+{
+    if (!d)
+        return;
+    g_free(d->lds.mem);
+    g_free(d->lanes);
+    g_free(d);
+}
+
+static bool rdna4_dispatch_begin(RDNA4State *s, RDNA4Dispatch *d,
+                                 uint32_t dim_x, uint32_t dim_y, uint32_t dim_z,
+                                 uint32_t initiator, uint32_t vmid)
+{
+    d->dim_x = dim_x;
+    d->dim_y = dim_y;
+    d->dim_z = dim_z;
+    d->initiator = initiator;
+    d->vmid = vmid;
+    d->pgm = ((uint64_t)reg_get(s, REG_CS_PGM_LO) << 8) |
+             ((uint64_t)reg_get(s, REG_CS_PGM_HI) << 40);
+    d->rsrc2 = reg_get(s, REG_CS_RSRC2);
+    d->nuser = (d->rsrc2 >> 1) & 0x1f;
+    d->tx = reg_get(s, REG_CS_NUM_THREAD_X);
+    d->ty = reg_get(s, REG_CS_NUM_THREAD_X + 4);
+    d->tz = reg_get(s, REG_CS_NUM_THREAD_X + 8);
+    d->items = d->tx * d->ty * d->tz;
+    d->lds.size = ((d->rsrc2 >> 15) & 0x1ff) * 512;
+    d->groups_total = (uint64_t)dim_x * dim_y * dim_z;
+
+    if (!(initiator & 1) || !reg_get(s, REG_SH_MEM_CONFIG) ||
+        !reg_get(s, REG_CS_THREAD_SE0) || !d->tx || !d->ty || !d->tz ||
+        (uint64_t)d->items > 1024 || !dim_x || !dim_y || !dim_z) {
         fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u refused (initiator 0x%x, SH_MEM_CONFIG "
-                "0x%x, CU mask SE0 0x%x, group %ux%ux%u)\n", dim_x, dim_y, dim_z, initiator,
-                reg_get(s, REG_SH_MEM_CONFIG), reg_get(s, REG_CS_THREAD_SE0), tx, ty, tz);
+                "0x%x, CU mask SE0 0x%x, group %ux%ux%u)\n", dim_x, dim_y, dim_z,
+                initiator, reg_get(s, REG_SH_MEM_CONFIG), reg_get(s, REG_CS_THREAD_SE0),
+                d->tx, d->ty, d->tz);
+        d->groups_total = 0;
         return true;
     }
-    if (rdna4_mandelbrot_dispatch(s, pgm, dim_x, dim_y, dim_z, tx, ty, tz, nuser))
-        return true;
-    lanes = g_new(RDNA4Lane, items);
-    lds.mem = g_malloc0(lds.size ? lds.size : 4);
-    for (uint32_t gz = 0; gz < dim_z; gz++)
-    for (uint32_t gy = 0; gy < dim_y; gy++)
-    for (uint32_t gx = 0; gx < dim_x; gx++) {
-        uint32_t live = items;
-        for (uint32_t t = 0; t < items; t++) {
-            uint32_t x = t % tx, y = (t / tx) % ty, z = t / (tx * ty);
-            RDNA4Lane *l = &lanes[t];
-            memset(l, 0, sizeof(*l));
-            for (uint32_t i = 0; i < nuser && i < 16; i++) {
-                l->s[i] = reg_get(s, REG_CS_USER_DATA_0 + 4 * i);
+    for (uint32_t i = 0; i < d->nuser && i < ARRAY_SIZE(d->user); i++)
+        d->user[i] = reg_get(s, REG_CS_USER_DATA_0 + 4 * i);
+    if (rdna4_mandelbrot_prepare(s, d->pgm, d->tx, d->ty, d->tz, d->nuser,
+                                 &d->out_mc, &d->width, &d->height, &d->pitch)) {
+        d->mandelbrot = true;
+    } else {
+        d->lanes = g_new(RDNA4Lane, d->items);
+        d->lds.mem = g_malloc0(d->lds.size ? d->lds.size : 4);
+    }
+    return false;
+}
+
+/* Run one complete work-group. The caller checks the realtime slice budget
+ * only between groups, so a group keeps its LDS and wave rendezvous atomic. */
+static int rdna4_dispatch_group(RDNA4State *s, RDNA4Dispatch *d)
+{
+    uint32_t live = d->items;
+
+    if (d->mandelbrot) {
+        if (!rdna4_mandelbrot_group(s, d))
+            return 0;
+        d->ran += d->items;
+        return 1;
+    }
+
+    memset(d->lds.mem, 0, d->lds.size ? d->lds.size : 4);
+    for (uint32_t t = 0; t < d->items; t++) {
+        uint32_t x = t % d->tx, y = (t / d->tx) % d->ty, z = t / (d->tx * d->ty);
+        RDNA4Lane *l = &d->lanes[t];
+        memset(l, 0, sizeof(*l));
+        for (uint32_t i = 0; i < d->nuser && i < ARRAY_SIZE(d->user); i++)
+            l->s[i] = d->user[i];
+        /* GFX12 architected SGPRs carry the work-group ids in TTMP9/7. */
+        l->s[108 + 9] = (d->rsrc2 & (1u << 7)) ? d->gx : 0;
+        l->s[108 + 7] = ((d->rsrc2 & (1u << 8)) ? (d->gy & 0xffff) : 0) |
+                        ((d->rsrc2 & (1u << 9)) ? (d->gz << 16) : 0);
+        l->v[0] = (x & 0x3ff) | ((y & 0x3ff) << 10) | ((z & 0x3ff) << 20);
+        l->pc = d->pgm;
+    }
+    while (live) {
+        bool stuck = true;
+        for (uint32_t t = 0; t < d->items; t++) {
+            RDNA4Lane *l = &d->lanes[t];
+            if (l->done || l->waiting || l->at_wave)
+                continue;
+            stuck = false;
+            switch (rdna4_isa_run(s, l, &d->lds, d->vmid)) {
+            case ISA_DONE:
+                live--;
+                d->ran++;
+                break;
+            case ISA_BARRIER:
+                l->waiting = true;
+                break;
+            case ISA_WAVEOP:
+                l->at_wave = true;
+                break;
+            default:
+                /* A faulted work-item leaves the queue busy, as a hang. */
+                fprintf(stderr, "rdna4: cs: dispatch hung (%" PRIu64
+                        " work-items ran; waves remain queued)\n", d->ran);
+                return -1;
             }
-            /*
-             * GFX12 has architected SGPRs: the work-group ids arrive in
-             * TTMP9 (x) and TTMP7 (y [15:0], z [31:16]), not in the SGPRs
-             * after the user ones (LLVM's FeatureArchitectedSGPRs; clang's
-             * gfx1201 code reads ttmp9).
-             */
-            l->s[108 + 9] = (rsrc2 & (1u << 7)) ? gx : 0;               /* TGID_X_EN */
-            l->s[108 + 7] = ((rsrc2 & (1u << 8)) ? (gy & 0xffff) : 0) | /* TGID_Y_EN */
-                            ((rsrc2 & (1u << 9)) ? (gz << 16) : 0);      /* TGID_Z_EN */
-            l->v[0] = (x & 0x3ff) | ((y & 0x3ff) << 10) | ((z & 0x3ff) << 20);   /* packed */
-            l->pc = pgm;
         }
-        while (live) {
-            bool stuck = true;
-            for (uint32_t t = 0; t < items; t++) {
-                RDNA4Lane *l = &lanes[t];
-                if (l->done || l->waiting || l->at_wave) {
-                    continue;
-                }
-                stuck = false;
-                switch (rdna4_isa_run(s, l, &lds, vmid)) {
-                case ISA_DONE:
-                    live--;
-                    ran++;
-                    break;
-                case ISA_BARRIER:
-                    l->waiting = true;
-                    break;
-                case ISA_WAVEOP:
-                    l->at_wave = true;
-                    break;
-                default:
-                    // A faulted work-item also leaves the queue without a
-                    // completion packet. Model it as a busy queue so the
-                    // runtime takes the same bounded recovery path as a
-                    // step-limit hang.
-                    hung = true;
-                    goto stopped;
-                }
-            }
-            /* A wave whose live lanes all reached a WMMA runs it. */
-            for (uint32_t w0 = 0; w0 < items; w0 += 32) {
-                uint32_t n = items - w0 < 32 ? items - w0 : 32, at = 0;
-                for (uint32_t i = 0; i < n; i++) {
-                    at += lanes[w0 + i].at_wave;
-                }
-                if (at && at == n) {
-                    if (!rdna4_wave_wmma(s, &lanes[w0], n, vmid)) {
-                        goto stopped;
-                    }
-                    stuck = false;
-                }
-            }
-            /* Every live lane waits at the barrier: open it. */
-            bool all = true;
-            for (uint32_t t = 0; t < items && all; t++) {
-                all = lanes[t].done || lanes[t].waiting;
-            }
-            if (all) {
-                for (uint32_t t = 0; t < items; t++) {
-                    lanes[t].waiting = false;
-                }
+        for (uint32_t w0 = 0; w0 < d->items; w0 += 32) {
+            uint32_t n = d->items - w0 < 32 ? d->items - w0 : 32, at = 0;
+            for (uint32_t i = 0; i < n; i++)
+                at += d->lanes[w0 + i].at_wave;
+            if (at && at == n) {
+                if (!rdna4_wave_wmma(s, &d->lanes[w0], n, d->vmid))
+                    return 0;
                 stuck = false;
             }
-            if (stuck && live) {
-                fprintf(stderr, "rdna4: cs: work-group deadlocked (barrier vs. wave op)\n");
-                goto stopped;
-            }
+        }
+        bool all = true;
+        for (uint32_t t = 0; t < d->items && all; t++)
+            all = d->lanes[t].done || d->lanes[t].waiting;
+        if (all) {
+            for (uint32_t t = 0; t < d->items; t++)
+                d->lanes[t].waiting = false;
+            stuck = false;
+        }
+        if (stuck && live) {
+            fprintf(stderr, "rdna4: cs: work-group deadlocked (barrier vs. wave op)\n");
+            return 0;
         }
     }
-    g_free(lds.mem);
-    g_free(lanes);
-    fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u of %ux%ux%u ran %" PRIu64 " work-items%s\n",
-            dim_x, dim_y, dim_z, tx, ty, tz, ran, lds.size ? " (with LDS)" : "");
-    return true;
-stopped:
-    if (hung)
-        fprintf(stderr, "rdna4: cs: dispatch hung (%" PRIu64 " work-items ran; waves remain queued)\n", ran);
-    else
-        fprintf(stderr, "rdna4: cs: dispatch stopped (%" PRIu64 " work-items ran)\n", ran);
-    g_free(lds.mem);
-    g_free(lanes);
-    return !hung;
+    return 1;
+}
+
+static int rdna4_dispatch_slice(RDNA4State *s, RDNA4Dispatch *d, uint64_t deadline)
+{
+    while (d->groups_done < d->groups_total) {
+        int result = rdna4_dispatch_group(s, d);
+        if (result < 0)
+            return RDNA4_DISPATCH_HUNG;
+        d->groups_done++;
+        d->gx++;
+        if (d->gx == d->dim_x) {
+            d->gx = 0;
+            d->gy++;
+            if (d->gy == d->dim_y) {
+                d->gy = 0;
+                d->gz++;
+            }
+        }
+        if (result == 0)
+            return RDNA4_DISPATCH_DONE;
+        if (d->groups_done < d->groups_total &&
+            qemu_clock_get_ns(QEMU_CLOCK_REALTIME) >= deadline) {
+            return RDNA4_DISPATCH_MORE;
+        }
+    }
+    if (d->mandelbrot)
+        dpy_gfx_update_full(s->con);
+    fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u of %ux%ux%u ran %" PRIu64
+            " work-items%s\n", d->dim_x, d->dim_y, d->dim_z, d->tx, d->ty, d->tz,
+            d->ran, d->lds.size ? " (with LDS)" : "");
+    return RDNA4_DISPATCH_DONE;
 }
 
 static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)
@@ -2975,102 +3115,181 @@ static bool rdna4_select_mec_queue(RDNA4State *s, uint32_t db_dword)
 
 static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
 {
-    uint32_t size = 2u << (reg_get(s, REG_CP_HQD_PQ_CNTL) & 0x3f);   /* dwords */
-    uint64_t pq = ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE) << 8) |
-                  ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE_HI) << 40);
-    uint32_t rptr = reg_get(s, REG_CP_HQD_PQ_RPTR);
-    uint32_t vmid;
-    const char *why;
-
     if (!rdna4_select_mec_queue(s, db_dword)) {
         fprintf(stderr, "rdna4: mec: doorbell dword %u ignored: no queue\n", db_dword);
         return;
     }
-    size = 2u << (reg_get(s, REG_CP_HQD_PQ_CNTL) & 0x3f);
-    pq = ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE) << 8) |
-         ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE_HI) << 40);
-    rptr = reg_get(s, REG_CP_HQD_PQ_RPTR);
-    vmid = reg_get(s, REG_CP_HQD_VMID) & 0xf;
-    if (!rdna4_mec_ready(s, db_dword, &why)) {
-        fprintf(stderr, "rdna4: mec: doorbell dword %u ignored: %s\n", db_dword, why);
-        return;
-    }
+    /* Pipe0/queue0/VMID0 is represented by the unbanked register image; keep
+     * its mirror marked so the deferred worker can find the pending queue. */
+    s->hqd[s->selected_pipe][s->selected_queue].used = true;
+    s->hqd[s->selected_pipe][s->selected_queue].pending = true;
+    s->hqd[s->selected_pipe][s->selected_queue].pending_wptr = wptr;
     reg_set(s, REG_CP_HQD_WPTR_LO, (uint32_t)wptr);
     reg_set(s, REG_CP_HQD_WPTR_HI, (uint32_t)(wptr >> 32));
-    wptr %= size;
-    while (rptr != wptr) {
+    rdna4_work_schedule(s);
+}
+
+static void rdna4_mec_select_hqd(RDNA4State *s, uint32_t pipe, uint32_t queue)
+{
+    uint32_t off;
+
+    s->selected_pipe = pipe;
+    s->selected_queue = queue;
+    s->selected_vmid = 0;
+    if (rdna4_hqd_reg(REG_CP_HQD_VMID, &off))
+        s->selected_vmid = s->hqd[pipe][queue].q[off] & 0xf;
+}
+
+static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
+{
+    for (;;) {
+        if (s->dispatch) {
+            int result = rdna4_dispatch_slice(s, s->dispatch, deadline);
+            if (result == RDNA4_DISPATCH_MORE) {
+                if (s->work_slice_logs++ < 8 || !(s->work_slice_logs & 63)) {
+                    fprintf(stderr, "rdna4: work: dispatch slice budget 2 ms; work-groups "
+                            "done=%" PRIu64 "/%" PRIu64 "\n", s->dispatch->groups_done,
+                            s->dispatch->groups_total);
+                }
+                return true;
+            }
+            if (result == RDNA4_DISPATCH_HUNG) {
+                s->mec_hung = true;
+                fprintf(stderr, "rdna4: mec: dispatch left queue busy; following fence is not written\n");
+                rdna4_dispatch_free(s->dispatch);
+                s->dispatch = NULL;
+                s->mec_work.active = false;
+                return false;
+            }
+            rdna4_dispatch_free(s->dispatch);
+            s->dispatch = NULL;
+            s->mec_work.rptr = (s->mec_work.rptr + s->mec_work.packet_len) %
+                                s->mec_work.size;
+            reg_set(s, REG_CP_HQD_PQ_RPTR, s->mec_work.rptr);
+            s->mec_work.packet_len = 0;
+            continue;
+        }
+
+        if (!s->mec_work.active) {
+            bool found = false;
+            for (uint32_t pipe = 0; pipe < 4 && !found; pipe++) {
+                for (uint32_t queue = 0; queue < 8; queue++) {
+                    if (s->hqd[pipe][queue].used && s->hqd[pipe][queue].pending) {
+                        rdna4_mec_select_hqd(s, pipe, queue);
+                        s->hqd[pipe][queue].pending = false;
+                        s->mec_work.pipe = pipe;
+                        s->mec_work.queue = queue;
+                        s->mec_work.vmid = reg_get(s, REG_CP_HQD_VMID) & 0xf;
+                        s->mec_work.size = 2u << (reg_get(s, REG_CP_HQD_PQ_CNTL) & 0x3f);
+                        s->mec_work.pq = ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE) << 8) |
+                                         ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE_HI) << 40);
+                        s->mec_work.rptr = reg_get(s, REG_CP_HQD_PQ_RPTR);
+                        s->mec_work.wptr = s->hqd[pipe][queue].pending_wptr % s->mec_work.size;
+                        {
+                            const char *why;
+                            if (!rdna4_mec_ready(s, (reg_get(s, REG_CP_HQD_DOORBELL) >> 2) &
+                                                 0x3ffffff, &why)) {
+                            fprintf(stderr, "rdna4: mec: queue pipe %u queue %u ignored: %s\n",
+                                    pipe, queue, why);
+                            continue;
+                            }
+                        }
+                        s->mec_work.active = true;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found)
+                return false;
+        }
+
+        if (s->mec_work.rptr == s->mec_work.wptr) {
+            uint64_t rep = (reg_get(s, REG_CP_HQD_RPTR_REP) & ~3u) |
+                           ((uint64_t)(reg_get(s, REG_CP_HQD_RPTR_REP_HI) & 0xffff) << 32);
+            uint8_t *p = rdna4_gc_span_vmid(s, rep, 4, s->mec_work.vmid, true, false);
+            if (p)
+                stl_le_p(p, s->mec_work.rptr);
+            s->mec_work.active = false;
+            continue;
+        }
+
         uint32_t dw[16];
         for (int i = 0; i < 16; i++) {
-            uint8_t *p = rdna4_gc_span_vmid(s, pq + 4ull * ((rptr + i) % size), 4,
-                                            vmid, false, false);
+            uint8_t *p = rdna4_gc_span_vmid(s, s->mec_work.pq +
+                                            4ull * ((s->mec_work.rptr + i) % s->mec_work.size),
+                                            4, s->mec_work.vmid, false, false);
             if (!p) {
-                fprintf(stderr, "rdna4: mec: queue MC 0x%" PRIx64 " not mapped\n", pq);
-                return;
+                fprintf(stderr, "rdna4: mec: queue MC 0x%" PRIx64 " not mapped\n",
+                        s->mec_work.pq);
+                s->mec_work.active = false;
+                return false;
             }
             dw[i] = ldl_le_p(p);
         }
         uint32_t hdr = dw[0], op = (hdr >> 8) & 0xff, count = (hdr >> 16) & 0x3fff;
         uint32_t len = count + 2;
         if ((hdr >> 30) != 3) {
-            fprintf(stderr, "rdna4: mec: not a type-3 packet 0x%08x at %u\n", hdr, rptr);
-            return;
+            fprintf(stderr, "rdna4: mec: not a type-3 packet 0x%08x at %u\n", hdr,
+                    s->mec_work.rptr);
+            s->mec_work.active = false;
+            return false;
         }
         switch (op) {
-        case 0x10:                                   /* NOP (0x3fff = one dword) */
-            if (count == 0x3fff) {
+        case 0x10:
+            if (count == 0x3fff)
                 len = 1;
-            }
             break;
-        case 0x79:                                   /* SET_UCONFIG_REG */
-        case 0x76:                                   /* SET_SH_REG */
-            for (uint32_t i = 0; i < count; i++) {
+        case 0x79:
+        case 0x76:
+            for (uint32_t i = 0; i < count && i < 14; i++) {
                 uint32_t base = op == 0x79 ? 0xc000 : 0x2c00;
                 uint32_t byte = (base + dw[1] + i) * 4;
-                if (byte + 4 <= RDNA4_MMIO_SIZE) {
+                if (byte + 4 <= RDNA4_MMIO_SIZE)
                     reg_set(s, byte, dw[2 + i]);
-                }
             }
             break;
-        case 0x58:                                   /* ACQUIRE_MEM: coherent already */
+        case 0x58:
             break;
-        case 0x15:                                   /* DISPATCH_DIRECT */
-            if (!rdna4_dispatch(s, dw[1], dw[2], dw[3], dw[4], vmid)) {
-                s->mec_hung = true;
-                fprintf(stderr, "rdna4: mec: dispatch left queue busy; following fence is not written\n");
-                return;
+        case 0x15:
+            s->dispatch = g_new0(RDNA4Dispatch, 1);
+            if (rdna4_dispatch_begin(s, s->dispatch, dw[1], dw[2], dw[3], dw[4],
+                                     s->mec_work.vmid)) {
+                rdna4_dispatch_free(s->dispatch);
+                s->dispatch = NULL;
+            } else {
+                s->mec_work.packet_len = len;
+                continue;
             }
             break;
-        case 0x37: {                                 /* WRITE_DATA to memory */
+        case 0x37: {
             uint64_t a = (dw[2] & ~3u) | ((uint64_t)dw[3] << 32);
-            uint32_t n = count - 2;
+            uint32_t n = count >= 2 ? count - 2 : 0;
             uint8_t *p = ((dw[1] >> 8) & 0xf) == 5 ?
-                         rdna4_gc_span_vmid(s, a, 4ull * n, vmid, true, false) : NULL;
+                         rdna4_gc_span_vmid(s, a, 4ull * n, s->mec_work.vmid, true, false) : NULL;
             if (!p) {
                 fprintf(stderr, "rdna4: mec: WRITE_DATA to 0x%" PRIx64 " refused\n", a);
-                return;
+                s->mec_work.active = false;
+                return false;
             }
-            for (uint32_t i = 0; i < n; i++) {
+            for (uint32_t i = 0; i < n; i++)
                 stl_le_p(p + 4 * i, dw[4 + i]);
-            }
             break;
         }
-        case 0x49: {                                 /* RELEASE_MEM */
+        case 0x49: {
             uint64_t a = (dw[3] & ~3u) | ((uint64_t)dw[4] << 32);
             uint32_t sel = dw[2] >> 29;
-            uint8_t *p = rdna4_gc_span_vmid(s, a, sel == 2 ? 8 : 4, vmid, true, false);
+            uint8_t *p = rdna4_gc_span_vmid(s, a, sel == 2 ? 8 : 4,
+                                            s->mec_work.vmid, true, false);
             if (!p) {
                 fprintf(stderr, "rdna4: mec: RELEASE_MEM to 0x%" PRIx64 " refused\n", a);
-                return;
+                s->mec_work.active = false;
+                return false;
             }
-            if (sel == 2) {
+            if (sel == 2)
                 stq_le_p(p, dw[5] | ((uint64_t)dw[6] << 32));
-            } else if (sel == 1) {
+            else if (sel == 1)
                 stl_le_p(p, dw[5]);
-            }
-            /* The end-of-pipe interrupt of the queue that ran it: ring_id =
-             * queue [6:4] | me 1 [3:2] | pipe [1:0] (gfx_v12_0_eop_irq), if
-             * that pipe's CP_ME1_PIPEn_INT_CNTL enables it (gfx12 has the
-             * register for pipes 0 and 1 only). */
             if (((dw[2] >> 24) & 7) == 2 && s->selected_pipe < 2 &&
                 (reg_get(s, REG_CP_ME1_PIPE0_INT_CNTL + 4 * s->selected_pipe) &
                  CP_TIME_STAMP_INT_ENABLE)) {
@@ -3081,18 +3300,45 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
             break;
         }
         default:
-            fprintf(stderr, "rdna4: mec: unknown PM4 op 0x%02x at %u, stopping\n", op, rptr);
-            return;
+            fprintf(stderr, "rdna4: mec: unknown PM4 op 0x%02x at %u, stopping\n", op,
+                    s->mec_work.rptr);
+            s->mec_work.active = false;
+            return false;
         }
-        rptr = (rptr + len) % size;
-        reg_set(s, REG_CP_HQD_PQ_RPTR, rptr);
+        s->mec_work.rptr = (s->mec_work.rptr + len) % s->mec_work.size;
+        reg_set(s, REG_CP_HQD_PQ_RPTR, s->mec_work.rptr);
+        if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) >= deadline)
+            return true;
     }
-    uint64_t rep = (reg_get(s, REG_CP_HQD_RPTR_REP) & ~3u) |
-                   ((uint64_t)(reg_get(s, REG_CP_HQD_RPTR_REP_HI) & 0xffff) << 32);
-    uint8_t *p = rdna4_gc_span_vmid(s, rep, 4, vmid, true, false);
-    if (p) {
-        stl_le_p(p, rptr);
-    }
+}
+
+static void rdna4_work_timer(void *opaque)
+{
+    RDNA4State *s = opaque;
+
+    qemu_bh_schedule(s->work_bh);
+}
+
+static void rdna4_work_bh(void *opaque)
+{
+    RDNA4State *s = opaque;
+    const uint64_t deadline = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 2 * 1000000ULL;
+    bool more;
+
+    s->work_slices++;
+    more = rdna4_mec_process_slice(s, deadline);
+    if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) < deadline)
+        more = rdna4_sdma_process_slice(s, deadline) || more;
+    /* W3e's gfx-ring model plugs into this same bottom half.  It must use
+     * the same 2 ms budget and never run from the BAR/doorbell write path. */
+    if (more)
+        timer_mod_ns(s->work_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 1);
+}
+
+static void rdna4_work_schedule(RDNA4State *s)
+{
+    if (s->work_bh)
+        qemu_bh_schedule(s->work_bh);
 }
 
 /* BAR2: the doorbell aperture. 64-bit doorbells arrive whole (impl 8). */
@@ -3480,6 +3726,14 @@ static void rdna4_reset(DeviceState *dev)
     RDNA4State *s = RDNA4(dev);
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    if (s->work_timer)
+        timer_del(s->work_timer);
+    if (s->work_bh)
+        qemu_bh_cancel(s->work_bh);
+    rdna4_dispatch_free(s->dispatch);
+    s->dispatch = NULL;
+    memset(&s->mec_work, 0, sizeof(s->mec_work));
+    memset(&s->sdma_work, 0, sizeof(s->sdma_work));
     s->sleep_reset = false;
 
     /* ACPI S3 removes power from the compute engines while DCN and VRAM
@@ -3602,6 +3856,8 @@ static void rdna4_realize(PCIDevice *dev, Error **errp)
         return;
     }
     s->dcn_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rdna4_dcn_timer, s);
+    s->work_timer = timer_new_ns(QEMU_CLOCK_REALTIME, rdna4_work_timer, s);
+    s->work_bh = qemu_bh_new(rdna4_work_bh, s);
 
     if (!memory_region_init_ram(&s->vram, obj, "rdna4.vram", s->aperture, errp)) {
         return;
@@ -3640,6 +3896,18 @@ static void rdna4_exit(PCIDevice *dev)
 {
     RDNA4State *s = RDNA4(dev);
 
+    rdna4_dispatch_free(s->dispatch);
+    s->dispatch = NULL;
+    if (s->work_bh) {
+        qemu_bh_cancel(s->work_bh);
+        qemu_bh_delete(s->work_bh);
+        s->work_bh = NULL;
+    }
+    if (s->work_timer) {
+        timer_del(s->work_timer);
+        timer_free(s->work_timer);
+        s->work_timer = NULL;
+    }
     if (s->dcn_timer) {
         timer_del(s->dcn_timer);
         timer_free(s->dcn_timer);
