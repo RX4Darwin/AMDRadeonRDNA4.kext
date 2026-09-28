@@ -717,8 +717,8 @@ static bool rdna4_hqd_reg(uint32_t byte, uint32_t *off)
 static bool rdna4_sh_reg(uint32_t byte, uint32_t *off)
 {
     uint32_t dword = byte / 4;
-    if (dword == 0xa000 + 0x09e4 || dword == 0xa000 + 0x09e5) {
-        *off = 0x80 + dword - (0xa000 + 0x09e4);
+    if (dword == 0xa000 + 0x09e4 || dword == 0xa000 + 0x09e3) {
+        *off = dword == 0xa000 + 0x09e4 ? 0x80 : 0x81;   /* CONFIG, BASES (gc_12_0_0_offset.h) */
         return true;
     }
     if (dword < 0x1260 + 0x1ba0 || dword > 0x1260 + 0x1c20)

@@ -340,9 +340,12 @@ constexpr Reg ComputePgmRsrc3     { 0, 0x1bc8 };
 constexpr Reg ComputeThreadMgmtSe4{ 0, 0x1bcb };   // SE4..SE7 (0x1bcb..0x1bce)
 constexpr Reg ComputeUserData0    { 0, 0x1be0 };
 constexpr Reg ShMemConfig         { 1, 0x09e4 };   // per VMID (GRBM_GFX_CNTL.VMID)
-constexpr Reg ShMemBases          { 1, 0x09e5 };   // PRIVATE_BASE [15:0], SHARED_BASE [31:16]
+constexpr Reg ShMemBases          { 1, 0x09e3 };   // SH_MEM_BASES (gc_12_0_0_offset.h:9259; 0x09e5 is SQ_DEBUG): PRIVATE_BASE [15:0], SHARED_BASE [31:16]
 // DEFAULT_SH_MEM_CONFIG: 64-bit addressing, unaligned access, prefetch 3.
 constexpr uint32_t kShMemConfigDefault = (3u << 2) | (3u << 14);
+// gfx_v12_0_init_compute_vmid: SHARED_BASE = LDS_APP_BASE 1, PRIVATE_BASE = SCRATCH_APP_BASE 2
+// (gfx_v12_0.c:1781-1782, 1796, 1804).
+constexpr uint32_t kShMemBasesDefault = (1u << 16) | 2u;
 // COMPUTE_PGM_RSRC1: VGPR blocks [5:0] (wave32: 8 per block), FLOAT_MODE
 // [19:12] = 0xc0 (FP16/64 denormals kept; clang emits 0xf0, which also
 // keeps FP32 denormals — irrelevant to integer kernels), MEM_ORDERED [30].
