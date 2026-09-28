@@ -492,8 +492,6 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (end < va || end > GpuVm::kVaEnd)
 		return false;
-	const bool fragment64k = (va & 0xffff) == 0 && (mc & 0xffff) == 0 &&
-		((bytes + 0xffff) & ~0xffffull) >= 0x10000;
 	auto entry = [&c](uint64_t off) -> uint64_t * {
 		return c.tableShadow + off / sizeof(uint64_t);
 	};
@@ -515,6 +513,13 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 		uint64_t flags = GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable;
 		if (executable)
 			flags |= GpuVm::kExecutable;
+		/* FRAG=4 says this PTE is part of a contiguous, 64 KiB-aligned run of
+		 * sixteen: only when the whole aligned block lies inside this mapping
+		 * (amdgpu_vm_pte_fragment); a lone 4 KiB page that merely happens to
+		 * be 64 KiB-aligned must stay FRAG=0. */
+		const uint64_t block = at & ~0xffffull;
+		const bool fragment64k = block >= va && block + 0x10000 <= end &&
+			((phys - (at - block)) & 0xffff) == 0;
 		*entry(pteOff) = GpuVm::encodePte(phys, flags, fragment64k);
 	}
 	/* The root, PDB1, and the PDB0 entry that points at the PT all have to
@@ -765,13 +770,13 @@ bool RDNA4Compute::vmBootSelfTest() {
 	}
 	/* gfx_v12_0_init_compute_vmid: every KFD VMID (8-15) gets SH_MEM_CONFIG
 	 * and SH_MEM_BASES (LDS_APP_BASE 1, SCRATCH_APP_BASE 2) before use.  The
-	 * register is SH_MEM_BASES = 0x09e3 (gc_12_0_0_offset.h); ShMemBases in
-	 * gfxregs.hpp (0x09e5) is SQ_DEBUG there, see vmfix2-findings.md. */
+	 * register is SH_MEM_BASES = 0x09e3 (gc_12_0_0_offset.h:9259); ShMemBases used to
+	 * be 0x09e5 (SQ_DEBUG) in gfxregs.hpp; fixed with the emulator map. */
 	trail("vm: compute vmid apertures");
 	for (uint32_t v = 8; v <= 15; v++) {
 		grbmSelect(0, 0, 0, v);
 		wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
-		wr(IpDiscovery::HwGc, Reg { 1, 0x09e3 }, (1u << 16) | 2u);
+		wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 	}
 	grbmSelect(0, 0, 0, 0);
 	trail("vm: VM context enable");
@@ -801,6 +806,36 @@ bool RDNA4Compute::vmBootSelfTest() {
 		RLOG("vm: diag%s: CONTEXT0 CNTL 0x%08x BASE 0x%08x:%08x START 0x%08x:%08x END 0x%08x:%08x", tag,
 		     rdGc(GcCtx0Cntl), rdGc(GcCtx0PtBaseHi), rdGc(GcCtx0PtBaseLo), rdGc(GcCtx0PtStartHi),
 		     rdGc(GcCtx0PtStartLo), rdGc(GcCtx0PtEndHi), rdGc(GcCtx0PtEndLo));
+	};
+	/* E1: the GC hub's MC-window registers next to the MM hub's.  amdgpu
+	 * never writes them; the IMU copies the MM hub's into the GC hub at GFX
+	 * power-up (imu_v12_init_gfxhub_settings, imu_v12_0.c), which our path
+	 * skips.  Offsets: gc_12_0_0_offset.h 0x15a0-0x15b3, mmhub_4_1_0_offset.h
+	 * 0x04c0-0x04d3. */
+	struct Win { const char *name; uint32_t gc, mm; bool mirror; };
+	static const Win wins[] = {
+		{ "LOCAL_FB_START", 0x15b1, 0x04d1, true }, { "LOCAL_FB_END", 0x15b2, 0x04d2, true },
+		{ "LOCAL_FB_LOCK", 0x15b3, 0x04d3, false },
+		{ "LOCAL_SYSMEM_START", 0x15ae, 0x04ce, true }, { "LOCAL_SYSMEM_END", 0x15af, 0x04cf, true },
+		{ "APT_CNTL", 0x15b0, 0x04d0, true },
+		{ "CACHEABLE_START", 0x15ac, 0x04cc, true }, { "CACHEABLE_END", 0x15ad, 0x04cd, true },
+		{ "NB_TOP_SLOT1", 0x15a4, 0x04c4, true }, { "NB_LOWER_TOP2", 0x15a5, 0x04c5, true },
+		{ "NB_UPPER_TOP2", 0x15a6, 0x04c6, true },
+		{ "NB_MMIOBASE", 0x15a0, 0x04c0, false }, { "NB_MMIOLIMIT", 0x15a1, 0x04c1, false },
+		{ "NB_PCI_CTRL", 0x15a2, 0x04c2, false }, { "NB_PCI_ARB", 0x15a3, 0x04c3, false },
+		{ "STEERING", 0x15aa, 0x04ca, false },
+	};
+	const uint32_t nWins = sizeof(wins) / sizeof(wins[0]);
+	auto dumpWindows = [&](const char *tag) {
+		for (uint32_t i = 0; i < nWins; i++) {
+			const uint32_t g = rdGc(Reg { 0, wins[i].gc });
+			const uint32_t m = rd(IpDiscovery::HwMmhub, Reg { 0, wins[i].mm });
+			RLOG("vm: E1%s: %-18s GC 0x%08x MM 0x%08x%s", tag, wins[i].name, g, m,
+			     g == m ? "" : "  DIFFERS");
+		}
+		RLOG("vm: E1%s: GCVM_L2_STATUS 0x%08x, FB base 0x%x top 0x%x offset 0x%x, sys aperture 0x%x..0x%x",
+		     tag, rdGc(GcL2Status), rdGc(GcFbLocationBase), rdGc(GcFbLocationTop), rdGc(GcFbOffset),
+		     rdGc(GcSysApertureLow), rdGc(GcSysApertureHigh));
 	};
 	auto dumpTables = [&](const char *tag) {
 		const uint32_t bytes = 0x4000;
@@ -843,6 +878,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 			     static_cast<unsigned long long>(pages[i].mc),
 			     inVram(pages[i].mc) ? "VRAM" : "SYSMEM");
 	};
+	const uint64_t ibVa = qva + 0x6000;      /* E4's IB page (VMID 8 VA) */
+	const uint32_t ibOff = dataOff;           /* same physical page as the data word, IB at +0x100 */
 	auto buildTables = [&]() -> bool {
 		bzero(c.tableShadow, kVmTableBytes);
 		c.tableShadow[0] = GpuVm::encodePde(c.rootPhys + 0x1000, GpuVm::kValid, 2);
@@ -853,7 +890,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 		       vmMap(c, rva, poolMc(qoff + kVmRptr), 0x1000, false) &&
 		       vmMap(c, wva, poolMc(qoff + kVmWptr), 0x1000, false) &&
 		       vmMap(c, dataVa, poolMc(dataOff), 0x1000, false) &&
-		       vmMap(c, fenceVa, poolMc(qoff + kVmFence), 0x1000, false);
+		       vmMap(c, fenceVa, poolMc(qoff + kVmFence), 0x1000, false) &&
+		       vmMap(c, ibVa, poolMc(ibOff), 0x1000, false);
 	};
 	auto hqdStop = [&]() {
 		grbmSelect(1, pipe, queue, vmid);
@@ -940,6 +978,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 	};
 	if (context) {
 		dumpSetup(" before kick");
+		dumpWindows(" before kick");
 		dumpTables(" before kick");
 		if (forceFail) {
 			/* Test hook (off by default): break the context's range so the
@@ -960,14 +999,34 @@ bool RDNA4Compute::vmBootSelfTest() {
 			const uint32_t savedC0[4] = { rdGc(GcCtx0PtStartLo), rdGc(GcCtx0PtStartHi),
 			                              rdGc(GcCtx0PtEndLo), rdGc(GcCtx0PtEndHi) };
 			const uint64_t savedPhys = c.rootPhys;
-			bool passed[3] = { false, false, false };
-			for (uint32_t v = 0; v < 3; v++) {
-				const char *tag = v == 0 ? " variant a (TAP_*_PHYSICAL=1)"
+			uint32_t savedWin[sizeof(wins) / sizeof(wins[0])] = {};
+			bool passed[4] = { false, false, false, false };
+			/* E2 first (it is the lead), then a, b, c. */
+			static const uint32_t order[4] = { 3, 0, 1, 2 };
+			dumpWindows(" after fault");
+			for (uint32_t k = 0; k < 4; k++) {
+				const uint32_t v = order[k];
+				const char *tag = v == 3 ? " variant E2 (GC windows := MM)"
+				                : v == 0 ? " variant a (TAP_*_PHYSICAL=1)"
 				                : v == 1 ? " variant b (ctx0 covers tables)"
 				                         : " variant c (MC-form table pointers)";
 				RLOG("vm: variant:%s", tag);
 				trail("vm: variant apply");
-				if (v == 0) {
+				if (v == 3) {
+					/* imu_v12_init_gfxhub_settings: the GC hub takes the MM hub's
+					 * FB/sysmem windows.  Only registers that differ are written;
+					 * a locked or read-only one shows in the readback. */
+					for (uint32_t i = 0; i < nWins; i++) {
+						savedWin[i] = rdGc(Reg { 0, wins[i].gc });
+						const uint32_t m = rd(IpDiscovery::HwMmhub, Reg { 0, wins[i].mm });
+						if (!wins[i].mirror || m == savedWin[i])
+							continue;
+						wr(IpDiscovery::HwGc, Reg { 0, wins[i].gc }, m);
+						RLOG("vm: E2: %s GC 0x%08x -> 0x%08x, reads back 0x%08x", wins[i].name,
+						     savedWin[i], m, rdGc(Reg { 0, wins[i].gc }));
+					}
+					(void)gcHubFlush();
+				} else if (v == 0) {
 					wr(IpDiscovery::HwGc, GcL2Cntl4, savedL4 | kL2Cntl4TapPhysMask);
 				} else if (v == 1) {
 					/* Flat context-0 entries for the table pages: pfn -> same
@@ -1000,7 +1059,12 @@ bool RDNA4Compute::vmBootSelfTest() {
 				     rdGc(GcL2FaultStatusLo));
 				(void)hqdStop();
 				trail("vm: variant restore");
-				if (v == 0) {
+				if (v == 3) {
+					for (uint32_t i = 0; i < nWins; i++)
+						if (wins[i].mirror && rdGc(Reg { 0, wins[i].gc }) != savedWin[i])
+							wr(IpDiscovery::HwGc, Reg { 0, wins[i].gc }, savedWin[i]);
+					(void)gcHubFlush();
+				} else if (v == 0) {
 					wr(IpDiscovery::HwGc, GcL2Cntl4, savedL4);
 				} else if (v == 1) {
 					for (uint32_t i = 0; i < 16; i++)
@@ -1019,8 +1083,60 @@ bool RDNA4Compute::vmBootSelfTest() {
 				gcFaultClear();
 				(void)vmInvalidate(vmid, "variant restore");
 			}
-			RLOG("vm: variants: a %s, b %s, c %s (baseline failed; runtime stays disabled)",
-			     passed[0] ? "PASS" : "fail", passed[1] ? "PASS" : "fail", passed[2] ? "PASS" : "fail");
+			RLOG("vm: variants: E2 %s, a %s, b %s, c %s (baseline failed; runtime stays disabled)",
+			     passed[3] ? "PASS" : "fail", passed[0] ? "PASS" : "fail", passed[1] ? "PASS" : "fail",
+			     passed[2] ? "PASS" : "fail");
+			/* E4: one IB fetched in VMID 8 from the working VMID 0 kernel ring
+			 * (ring, EOP, rptr, wptr, MQD all VMID 0), isolating the walker
+			 * from the VMID 8 HQD.  Passes: tables and hub are fine and the
+			 * fault is HQD-side.  Faults: hub or tables.  A stuck kernel ring
+			 * is recovered with the no-reset queue recovery (rdna4-hang=1),
+			 * so the probe is skipped without it. */
+			if (!hangRecoveryEnabled) {
+				RLOG("vm: E4: skipped (a fault could wedge the kernel ring; needs rdna4-hang=1)");
+			} else {
+				trail("vm: E4 IB probe");
+				uint32_t ibPkt[8];
+				const uint32_t ibDw = Pm4::writeData(ibPkt, dataVa, 0x600df00e);
+				for (uint32_t i = 0; i < ibDw; i++)
+					*poolDw(ibOff + 0x100 + i * 4) = ibPkt[i];
+				*poolDw(dataOff) = 0;
+				*poolDw(kPm4FenceOffset) = 0;
+				flushHdp();
+				const bool mapped = ibDw && vmMap(c, ibVa, poolMc(ibOff), 0x1000, false);
+				gcFaultClear();
+				(void)vmInvalidate(vmid, "E4");
+				bool e4Fence = false;
+				if (mapped) {
+					uint32_t pkt[8];
+					const uint32_t seq = pm4Fence + 1;
+					if (pm4Queue.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa + 0x100, ibDw, vmid)) &&
+					    pm4Queue.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), seq))) {
+						pm4Fence = seq;
+						pm4Kick(pm4Queue.wptr());
+						for (uint32_t us = 0; us < 200000 && !e4Fence; us += 10) {
+							e4Fence = *poolDw(kPm4FenceOffset) == seq;
+							if (!e4Fence)
+								IODelay(10);
+						}
+					}
+				}
+				const uint32_t e4Status = rdGc(GcL2FaultStatusLo);
+				RLOG("vm: E4: IB from the VMID0 ring, fetched in VMID %u: mapped %d fence %d data 0x%08x "
+				     "fault status 0x%08x => %s", vmid, mapped, e4Fence, *poolDw(dataOff), e4Status,
+				     e4Fence && *poolDw(dataOff) == 0x600df00e && !e4Status
+				         ? "PASS (walker and tables work; the VMID 8 HQD is the problem)"
+				         : "fail (hub or tables)");
+				if (e4Status)
+					logGcFault("vm: E4");
+				if (!e4Fence) {
+					trail("vm: E4 recover kernel ring");
+					if (!recoverComputeQueue("vm: E4", nullptr))
+						RLOG("vm: E4: kernel ring recovery failed, compute stays wedged this boot");
+				}
+				gcFaultClear();
+				(void)vmInvalidate(vmid, "E4 clean");
+			}
 			fence = baseFence; data = baseData; clean = baseClean;
 			hqd = false;
 		}
@@ -1963,7 +2079,7 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	 * chains it and fences it. */
 	grbmSelect(0, c->pipe, c->queue, c->vmid);
 	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
-	wr(IpDiscovery::HwGc, ShMemBases, (0x2000u << 16) | 0x1000u);
+	wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 	const uint32_t value = nextFence(c->fence);
 	uint32_t pkt[8];
 	if (!c->pm4.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync)) ||

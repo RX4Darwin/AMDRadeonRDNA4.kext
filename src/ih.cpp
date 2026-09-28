@@ -805,6 +805,17 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 		}
 		return;
 	}
+	/* The GC hub VM-fault interrupt (gmc_v12_0_process_interrupt): address =
+	 * src_data[0] << 12 | (src_data[1] & 0xf) << 44, WRITE/RETRY in src_data[1]. */
+	static uint32_t faultIvLogs;
+	if (entry.clientId == 10 && entry.srcId == 0 && faultIvLogs < 4) {
+		faultIvLogs++;
+		HLOG("VM fault IV: vmid %u vmid_src %d pasid %u ring %u src_data 0x%08x 0x%08x 0x%08x 0x%08x, "
+		     "VA 0x%llx", entry.vmid, entry.vmidSrc, entry.pasid, entry.ringId, entry.srcData[0],
+		     entry.srcData[1], entry.srcData[2], entry.srcData[3],
+		     (static_cast<unsigned long long>(entry.srcData[0]) << 12) |
+		     ((static_cast<unsigned long long>(entry.srcData[1]) & 0xf) << 44));
+	}
 	ihUnknown(entry.clientId, entry.srcId, entry.ringId);
 }
 
