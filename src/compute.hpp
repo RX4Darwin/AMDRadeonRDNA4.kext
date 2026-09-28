@@ -193,6 +193,8 @@ private:
 	}
 	bool gcHubInit();
 	bool gcHubFlush();
+	void logGcFault(const char *tag);   // GCVM_L2 protection fault status/address
+	bool sdmaStartMcus();               // sdma_v7_0_enable: unhalt before queue setup
 	bool sdmaQueueInit();
 	void sdmaKick(uint32_t wptrBytes);
 	bool stageSdma();
@@ -212,7 +214,7 @@ private:
 	void grbmSelect(uint32_t me, uint32_t pipe, uint32_t queue, uint32_t vmid);
 	bool mecStart();
 	bool doorbellInit();
-	bool hqdInit();
+	bool hqdInit(bool asKiq);
 	void pm4Kick(uint64_t wptrDwords);
 	bool stageCompute();
 

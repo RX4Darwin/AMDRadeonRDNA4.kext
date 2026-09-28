@@ -321,6 +321,7 @@ struct RDNA4State {
     char     *edid_file;
     uint32_t edid_line;
     bool     trace;
+    bool     kiq_only;       /* model a MEC that runs only the RLC-named KIQ */
 
     uint32_t *regs;           /* BAR5 image, RDNA4_MMIO_SIZE bytes */
     uint8_t  *resv;           /* top RDNA4_RESV_SIZE bytes of VRAM */
@@ -1586,6 +1587,8 @@ static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)
            !(hqd_db & (1u << 30)) ? "HQD doorbell disabled" :
            ((hqd_db >> 2) & 0x3ffffff) != db_dword ? "doorbell not the queue's" :
            !(reg_get(s, REG_CP_HQD_ACTIVE) & 1) ? "HQD not active" :
+           s->kiq_only && !(reg_get(s, GC_SEG1(0x098a)) & 0x80) ?
+               "queue is not the KIQ (kiq-only model)" :
            (mec & (1u << 30)) || !(mec & (1u << 26)) ? "MEC halted / pipe 0 inactive" :
            !reg_get(s, REG_CP_MEC_PC_START) ? "MEC entry point not set" : NULL;
     return *why == NULL;
@@ -2165,6 +2168,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_STRING("edid", RDNA4State, edid_file),
     DEFINE_PROP_UINT32("edid-line", RDNA4State, edid_line, 2),
     DEFINE_PROP_BOOL("trace", RDNA4State, trace, false),
+    DEFINE_PROP_BOOL("kiq-only", RDNA4State, kiq_only, false),
 };
 
 static void rdna4_class_init(ObjectClass *klass, void *data)

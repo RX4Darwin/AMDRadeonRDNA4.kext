@@ -556,7 +556,9 @@ void RDNA4Compute::flushHdp() {
 	if (!off || off == kBad || off + 4 > env.mmioSize)
 		return;
 	env.mmio[off / 4] = 0;
-	(void)env.mmio[off / 4];
+	// amdgpu_hdp_generic_flush posts the write with a read of the NBIF
+	// memory size register, not of the flush register.
+	(void)rd(IpDiscovery::HwNbif, NbifMemSize);
 }
 
 uint32_t RDNA4Compute::pspRead(void *ctx, uint32_t dword) {
@@ -949,23 +951,28 @@ bool RDNA4Compute::gcHubInit() {
 		return false;
 	const uint32_t mmBase = sv.mmFbBase & 0xffffff, mmTop = sv.mmFbTop & 0xffffff;
 
-	// FB aperture: the VBIOS programs it on bare metal; if it reads back
-	// empty, mirror the MM hub's, as amdgpu does for a VF.
+	// FB aperture: amdgpu takes the MM hub's as the truth for both hubs
+	// (gmc_v12_0_vram_gtt_location); make the GC hub's match it, offset too.
 	uint32_t gcBase = rdGc(GcFbLocationBase) & 0xffffff, gcTop = rdGc(GcFbLocationTop) & 0xffffff;
-	if (!gcTop || gcTop < gcBase) {
+	if (gcBase != mmBase || gcTop != mmTop) {
+		CLOG("sdma: GC hub FB aperture 0x%x..0x%x; set to the MM hub's 0x%x..0x%x", gcBase, gcTop,
+		     mmBase, mmTop);
 		wr(IpDiscovery::HwGc, GcFbLocationBase, mmBase);
 		wr(IpDiscovery::HwGc, GcFbLocationTop, mmTop);
-		CLOG("sdma: GC hub FB aperture was empty; set to the MM hub's 0x%x..0x%x", mmBase, mmTop);
-	} else if (gcBase != mmBase || gcTop != mmTop) {
-		CLOG("sdma: GC hub FB aperture 0x%x..0x%x differs from the MM hub's 0x%x..0x%x",
-		     gcBase, gcTop, mmBase, mmTop);
 	}
+	const uint32_t fbOffset = sv.mmFbOffset & 0xffffff;
+	wr(IpDiscovery::HwGc, GcFbOffset, fbOffset);
+	// Page-table and default-page addresses are physical (VRAM offset plus
+	// FB_OFFSET), as gmc_v12_0_get_vm_pde makes them, not MC addresses.
+	const uint64_t phys = static_cast<uint64_t>(fbOffset) << 24;
 
 	// Context 0: a flat table over one page nobody uses (MC page 0).
-	for (uint32_t i = 0; i < 0x1000 / 4; i++)
+	for (uint32_t i = 0; i < 0x1000 / 4; i++) {
 		*poolDw(kPtOffset + i * 4) = 0;
+		*poolDw(kScratchOffset + i * 4) = 0;
+	}
 	flushHdp();
-	const uint64_t pt = poolMc(kPtOffset);
+	const uint64_t pt = phys + pool.offset + kPtOffset;
 	wr(IpDiscovery::HwGc, GcCtx0PtBaseLo, static_cast<uint32_t>(pt) | 1);
 	wr(IpDiscovery::HwGc, GcCtx0PtBaseHi, static_cast<uint32_t>(pt >> 32));
 	wr(IpDiscovery::HwGc, GcCtx0PtStartLo, 0);
@@ -979,13 +986,17 @@ bool RDNA4Compute::gcHubInit() {
 	wr(IpDiscovery::HwGc, GcAgpTop, 0);
 	wr(IpDiscovery::HwGc, GcSysApertureLow, static_cast<uint32_t>(sv.fbMcBase >> 18));
 	wr(IpDiscovery::HwGc, GcSysApertureHigh, static_cast<uint32_t>(sv.fbMcTop >> 18));
-	const uint64_t scratchVram = pool.offset + kScratchOffset;
-	wr(IpDiscovery::HwGc, GcSysDefaultLsb, static_cast<uint32_t>(scratchVram >> 12));
-	wr(IpDiscovery::HwGc, GcSysDefaultMsb, static_cast<uint32_t>(scratchVram >> 44));
-	const uint64_t scratchMc = poolMc(kScratchOffset);
-	wr(IpDiscovery::HwGc, GcL2FaultDefaultLo, static_cast<uint32_t>(scratchMc >> 12));
-	wr(IpDiscovery::HwGc, GcL2FaultDefaultHi, static_cast<uint32_t>(scratchMc >> 44));
+	const uint64_t scratchPhys = phys + pool.offset + kScratchOffset;
+	wr(IpDiscovery::HwGc, GcSysDefaultLsb, static_cast<uint32_t>(scratchPhys >> 12));
+	wr(IpDiscovery::HwGc, GcSysDefaultMsb, static_cast<uint32_t>(scratchPhys >> 44));
+	wr(IpDiscovery::HwGc, GcL2FaultDefaultLo, static_cast<uint32_t>(scratchPhys >> 12));
+	wr(IpDiscovery::HwGc, GcL2FaultDefaultHi, static_cast<uint32_t>(scratchPhys >> 44));
 	wr(IpDiscovery::HwGc, GcL2FaultCntl2, rdGc(GcL2FaultCntl2) | kL2FaultRetryRead);
+	// A bad address then faults to the scratch page (logged below on a
+	// timeout) instead of halting the engine that issued it.
+	wr(IpDiscovery::HwGc, GcL2FaultCntl,
+	   (rdGc(GcL2FaultCntl) | kL2FaultEnableDefaults) & ~kL2FaultCrashBits);
+	wr(IpDiscovery::HwGc, CpDebug, rdGc(CpDebug) | kCpDebugUtcl1ErrorHaltDisable);
 
 	// L1 TLB.
 	uint32_t v = rdGc(GcMxL1TlbCntl);
@@ -1025,6 +1036,33 @@ bool RDNA4Compute::gcHubInit() {
 	}
 	flushHdp();
 	return gcHubFlush();
+}
+
+void RDNA4Compute::logGcFault(const char *tag) {
+	const uint32_t status = rdGc(GcL2FaultStatusLo);
+	const uint64_t addr = rdGc(GcL2FaultAddrLo) | (static_cast<uint64_t>(rdGc(GcL2FaultAddrHi)) << 32);
+	CLOG("%s: GC hub fault status 0x%08x%s, address 0x%llx", tag, status,
+	     status ? "" : " (no fault)", addr);
+}
+
+// sdma_v7_0_start on bare metal: every MCU is unhalted before any queue
+// register is written; the RS64 firmware's init (UCODE_INIT_DONE) may reset
+// the queue context, so the queue is programmed after it.
+bool RDNA4Compute::sdmaStartMcus() {
+	for (uint32_t i = 0; i < kSdmaInstances; i++)
+		wr(IpDiscovery::HwGc, sdma(i, SdmaMcuCntl),
+		   rdGc(sdma(i, SdmaMcuCntl)) & ~(kSdmaMcuHalt | kSdmaMcuReset));
+	uint32_t s0 = 0;
+	for (uint32_t ms = 0; ms < 100; ms++) {
+		s0 = rdGc(sdma(0, SdmaStatusReg));
+		if (s0 != kBad && (s0 & kSdmaUcodeInitDone))
+			break;
+		IOSleep(1);
+	}
+	const uint32_t s1 = rdGc(sdma(1, SdmaStatusReg));
+	CLOG("sdma: MCUs unhalted: SDMA0 status 0x%08x (ucode init %s), SDMA1 status 0x%08x", s0,
+	     (s0 & kSdmaUcodeInitDone) ? "done" : "NOT done", s1);
+	return s0 != kBad && (s0 & kSdmaUcodeInitDone);
 }
 
 // gmc_v12_0_flush_vm_hub for VMID0 on the GC hub (engine 17, no semaphore).
@@ -1110,6 +1148,7 @@ bool RDNA4Compute::stageSdma() {
 		     "rptr writeback 0x%x", rdGc(sdma(0, SdmaStatusReg)), rdGc(sdma(0, SdmaQ0RbCntl)),
 		     rdGc(sdma(0, SdmaQ0RbRptr)), rdGc(sdma(0, SdmaQ0RbWptr)),
 		     rdGc(sdma(0, SdmaMcuCntl)), *poolDw(kSdmaRptrOffset));
+		logGcFault("sdma");
 	};
 
 	// 1. GC hub.
@@ -1135,6 +1174,8 @@ bool RDNA4Compute::stageSdma() {
 	*poolDw(kSdmaWptrOffset) = 0;           // the MCU polls this from enable on
 	*poolDw(kSdmaWptrOffset + 4) = 0;
 	flushHdp();
+	trail("s4: SDMA MCU unhalt");
+	sdmaStartMcus();
 	sdmaQueueInit();
 	status();
 
@@ -1273,7 +1314,7 @@ bool RDNA4Compute::doorbellInit() {
 
 // gfx_v12_0_compute_mqd_init + gfx_v12_0_kiq_init_register for ME1 pipe 0
 // queue 0, VMID0, doorbell dword kComputeDoorbellDword.
-bool RDNA4Compute::hqdInit() {
+bool RDNA4Compute::hqdInit(bool asKiq) {
 	for (uint32_t off = kMqdOffset; off < kPqOffset; off += 4)   // MQD + EOP
 		*poolDw(off) = 0;
 	*poolDw(kPqRptrOffset) = 0;
@@ -1322,11 +1363,16 @@ bool RDNA4Compute::hqdInit() {
 	mqdDw(167, (kHqdEopControlDefault & ~0x3fu) | eopSize);
 	flushHdp();
 
-	// gfx_v12_0_kiq_setting: the RLC schedules this VMID0 queue (ME1, pipe 0,
-	// queue 0) — the low byte names it, bit 7 marks it valid.
+	// As the KIQ (gfx_v12_0_kiq_setting): the RLC names this queue (ME1,
+	// pipe 0, queue 0) in the low byte, bit 7 marks it valid. Otherwise
+	// it stays an ordinary MMIO-activated queue (kfd's hqd_load, gfx9-11).
 	const uint32_t sched = (rdGc(RlcCpSchedulers) & 0xffffff00u) | (1u << 5) | (0u << 3) | 0u;
-	wr(IpDiscovery::HwGc, RlcCpSchedulers, sched);
-	wr(IpDiscovery::HwGc, RlcCpSchedulers, sched | 0x80);
+	if (asKiq) {
+		wr(IpDiscovery::HwGc, RlcCpSchedulers, sched);
+		wr(IpDiscovery::HwGc, RlcCpSchedulers, sched | 0x80);
+	} else {
+		wr(IpDiscovery::HwGc, RlcCpSchedulers, sched & 0xffffff00u);
+	}
 
 	grbmSelect(1, 0, 0, 0);
 	wr(IpDiscovery::HwGc, CpPqWptrPollCntl, rdGc(CpPqWptrPollCntl) & ~kPqWptrPollEn);
@@ -1395,14 +1441,18 @@ bool RDNA4Compute::stageCompute() {
 	auto status = [this]() {
 		grbmSelect(1, 0, 0, 0);
 		const uint32_t rptr = rdGc(CpHqdPqRptr), active = rdGc(CpHqdActive);
+		const uint32_t hq = rdGc(CpHqdHqStatus0), pq = rdGc(CpPqStatus);
 		grbmSelect(0, 0, 0, 0);
-		CLOG("mec: GRBM 0x%08x CP_STAT 0x%08x CPC 0x%08x MEC 0x%08x HQD active %u rptr 0x%x "
-		     "rptr report 0x%x", rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpCpcStatus),
-		     rdGc(CpMecRs64Cntl), active & 1, rptr, *poolDw(kPqRptrOffset));
+		CLOG("mec: GRBM 0x%08x CP_STAT 0x%08x CPC 0x%08x CPC_BUSY 0x%08x MEC 0x%08x pc 0x%x",
+		     rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpCpcStatus), rdGc(CpCpcBusyStat),
+		     rdGc(CpMecRs64Cntl), rdGc(CpMecRs64InstrPntr));
+		CLOG("mec: HQD active %u rptr 0x%x rptr report 0x%x HQ_STATUS0 0x%08x PQ_STATUS 0x%08x",
+		     active & 1, rptr, *poolDw(kPqRptrOffset), hq, pq);
+		logGcFault("mec");
 	};
 
 	trail("s5: MEC start");
-	wr(IpDiscovery::HwGc, GrbmCntl, (rdGc(GrbmCntl) & ~0xffu) | 0xff);   // READ_TIMEOUT
+	wr(IpDiscovery::HwGc, GrbmCntl, (rdGc(GrbmCntl) & ~0xfffu) | 0xff);   // READ_TIMEOUT [11:0]
 	if (!mecStart()) {
 		publish();
 		return false;
@@ -1413,10 +1463,41 @@ bool RDNA4Compute::stageCompute() {
 		publish();
 		return false;
 	}
-	trail("s5: HQD init");
+
+	// Upstream has no MMIO-queue path on gfx12 (MES maps every queue), so
+	// the card decides: first a plain HQD, as kfd's hqd_load programs one on
+	// gfx9-11, then the same queue as the KIQ. Each is proven with a lone
+	// WRITE_DATA — the one packet amdgpu also uses on a KIQ.
 	Pm4::Queue &q = pm4Queue;
-	if (!q.init(poolDw(kPqOffset), poolMc(kPqOffset), kPqSize) || !hqdInit()) {
-		status();
+	auto writeTest = [&](const char *mode) -> bool {
+		*poolDw(kPm4TestOffset) = 0;
+		flushHdp();
+		uint32_t pkt[8];
+		q.emit(pkt, Pm4::writeData(pkt, poolMc(kPm4TestOffset), 0x600DF00D));
+		pm4Kick(q.wptr());
+		bool ok = false;
+		for (uint32_t ms = 0; ms < 200 && !ok; ms++) {
+			ok = *poolDw(kPm4TestOffset) == 0x600DF00D;
+			if (!ok)
+				IOSleep(1);
+		}
+		CLOG("mec: %s queue: WRITE_DATA %s", mode, ok ? "landed" : "did NOT land");
+		if (!ok)
+			status();
+		return ok;
+	};
+	trail("s5: HQD init (plain queue)");
+	uint32_t mode = 1;
+	bool running = q.init(poolDw(kPqOffset), poolMc(kPqOffset), kPqSize) && hqdInit(false) &&
+	               writeTest("plain");
+	if (!running) {
+		trail("s5: HQD init (as KIQ)");
+		mode = 2;
+		running = q.init(poolDw(kPqOffset), poolMc(kPqOffset), kPqSize) && hqdInit(true) &&
+		          writeTest("KIQ");
+	}
+	put("QueueMode", running ? mode : 0);
+	if (!running) {
 		publish();
 		return false;
 	}
@@ -1486,8 +1567,10 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 
 	const uint32_t pgm[2] = { static_cast<uint32_t>(l.code >> 8), static_cast<uint32_t>(l.code >> 40) };
 	const uint32_t rsrc[2] = { l.rsrc1, l.rsrc2 };
+	// Navi 48 has 4 shader engines: every CU of SE0-3, none of the absent
+	// SE4-7 (Mesa's gfx12_init_compute_preamble_state).
 	const uint32_t zero = 0, all[2] = { 0xffffffff, 0xffffffff };
-	const uint32_t all4[4] = { 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff };
+	const uint32_t none4[4] = { 0, 0, 0, 0 };
 	const uint32_t start[3] = { 0, 0, 0 };
 
 	Pm4::Queue &q = pm4Queue;
@@ -1500,7 +1583,7 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeTmpringSize), &zero, 1));
 	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe0), all, 2));
 	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe2), all, 2));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe4), all4, 4));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe4), none4, 4));
 	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeStartX), start, 3));
 	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeNumThreadX), l.groupSize, 3));
 	if (l.userCount)
@@ -1531,10 +1614,12 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 		CLOG("%s: the kernel's fence never came (0x%08x, want 0x%08x)", tag,
 		     *poolDw(kPm4FenceOffset), pm4Fence);
 		grbmSelect(1, 0, 0, 0);
-		CLOG("%s: GRBM 0x%08x CP_STAT 0x%08x CPC 0x%08x HQD rptr 0x%x wptr %llu", tag,
-		     rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpCpcStatus), rdGc(CpHqdPqRptr),
-		     static_cast<unsigned long long>(q.wptr()));
+		CLOG("%s: GRBM 0x%08x CP_STAT 0x%08x CPC 0x%08x CPC_BUSY 0x%08x HQD rptr 0x%x wptr %llu "
+		     "HQ_STATUS0 0x%08x MEC pc 0x%x", tag, rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpCpcStatus),
+		     rdGc(CpCpcBusyStat), rdGc(CpHqdPqRptr), static_cast<unsigned long long>(q.wptr()),
+		     rdGc(CpHqdHqStatus0), rdGc(CpMecRs64InstrPntr));
 		grbmSelect(0, 0, 0, 0);
+		logGcFault(tag);
 	}
 	return done;
 }

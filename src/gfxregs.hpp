@@ -154,7 +154,14 @@ constexpr Reg GcSysDefaultLsb     { 0, 0x15a8 };   // VRAM offset >> 12
 constexpr Reg GcSysDefaultMsb     { 0, 0x15a9 };   // VRAM offset >> 44
 constexpr Reg GcL2FaultDefaultLo  { 0, 0x15d4 };   // address >> 12
 constexpr Reg GcL2FaultDefaultHi  { 0, 0x15d5 };   // address >> 44
+constexpr Reg GcL2FaultCntl       { 0, 0x15cc };   // GCVM_L2_PROTECTION_FAULT_CNTL
 constexpr Reg GcL2FaultCntl2      { 0, 0x15cd };
+constexpr Reg GcL2FaultStatusLo   { 0, 0x15d0 };
+constexpr Reg GcL2FaultAddrLo     { 0, 0x15d2 };
+constexpr Reg GcL2FaultAddrHi     { 0, 0x15d3 };
+// gfxhub_v12_0_set_fault_enable_default(true): every *_PROTECTION_FAULT_
+// ENABLE_DEFAULT on, CRASH_ON_NO_RETRY_FAULT / CRASH_ON_RETRY_FAULT off.
+constexpr uint32_t kL2FaultEnableDefaults = 0x1ffcu, kL2FaultCrashBits = 0xc0000000u;
 constexpr Reg GcL2Cntl2           { 0, 0x15c5 };
 constexpr Reg GcL2Cntl3           { 0, 0x15c6 };
 constexpr Reg GcL2Cntl4           { 0, 0x15dd };
@@ -230,7 +237,12 @@ constexpr uint32_t kVmL2Enable    = 1u << 0;
 // --- MEC compute queues (GC). The CP_HQD_* / CP_MQD_* registers are banked
 // per ME/pipe/queue: select one with GRBM_GFX_CNTL first.
 constexpr Reg GrbmGfxCntl         { 1, 0x0900 };   // PIPEID [1:0], MEID [3:2], VMID [7:4], QUEUEID [10:8]
-constexpr Reg GrbmCntl            { 0, 0x0da0 };   // READ_TIMEOUT [7:0]
+constexpr Reg GrbmCntl            { 0, 0x0da0 };   // READ_TIMEOUT [11:0]
+constexpr Reg CpDebug             { 0, 0x1e1f };   // CPG_UTCL1_ERROR_HALT_DISABLE [15]
+constexpr Reg CpHqdHqStatus0      { 0, 0x1fc9 };
+constexpr Reg CpCpcBusyStat       { 0, 0x0e25 };
+constexpr Reg Gl2cCtrl5           { 1, 0x2e19 };   // golden_settings_gc_12_0_rev0: [6:4] = 2
+constexpr uint32_t kCpDebugUtcl1ErrorHaltDisable = 1u << 15;
 constexpr Reg CpMecPrgrmStart     { 1, 0x2900 };   // CP_MEC_RS64_PRGRM_CNTR_START
 constexpr Reg CpMecPrgrmStartHi   { 1, 0x2938 };
 constexpr Reg CpPqWptrPollCntl    { 0, 0x1e23 };   // EN [31]
