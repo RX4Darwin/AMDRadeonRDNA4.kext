@@ -19,8 +19,27 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
+# First come, first served: flock alone is not fair, and a checkout that
+# re-runs quickly could starve the others. Each run takes a ticket
+# (arrival time + pid) in ~/rdna4-vm.queue and waits until it is the oldest
+# live one; tickets of runs that died are dropped. The lock stays as the
+# guard around the VM itself.
+QUEUE=$HOME/rdna4-vm.queue
+mkdir -p "$QUEUE"
+TICKET=$(date +%s%N)-$$
+touch "$QUEUE/$TICKET"
+trap 'rm -f "$QUEUE/$TICKET"' EXIT
+echo "vm-test: queued as $TICKET (other checkouts may be testing)..."
+while :; do
+	first=""
+	for t in $(ls "$QUEUE" | sort); do
+		if kill -0 "${t##*-}" 2>/dev/null; then first=$t; break; fi
+		rm -f "$QUEUE/$t"
+	done
+	[ "$first" = "$TICKET" ] && break
+	sleep 2
+done
 exec 9>"$HOME/rdna4-vm.lock"
-echo "vm-test: waiting for the VM lock (another checkout may be testing)..."
 flock 9
 echo "vm-test: $REPO ($(git rev-parse --short HEAD 2>/dev/null || echo '?')), boot-args: $*, device options: ${RDNA4_DEV:-none}"
 
