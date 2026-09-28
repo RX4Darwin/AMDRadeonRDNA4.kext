@@ -3499,7 +3499,7 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                                bool passthru)
 {
     while (w->steps++ < 4096) {
-        uint32_t dw, dw1, dw2 = 0;
+        uint32_t dw, dw1, dw2 = 0, dw3 = 0;
         uint32_t n = 1;
 
         if (!rdna4_gfx_read_code(s, w->pc, &dw, &dw1)) {
@@ -3507,7 +3507,7 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                     ngg ? "NGG" : "PS", w->pc);
             return false;
         }
-        if (!rdna4_gfx_read_code(s, w->pc + 8, &dw2, &dw2)) {
+        if (!rdna4_gfx_read_code(s, w->pc + 8, &dw2, &dw3)) {
             /* The last s_endpgm needs no third dword; this fetch is only
              * required by the VOP3 forms below. */
             dw2 = 0;
