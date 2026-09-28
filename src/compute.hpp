@@ -299,6 +299,7 @@ private:
 	static constexpr uint32_t kMaxPrograms = 32;
 	static constexpr uint32_t kMaxClients = 8;
 	static constexpr uint32_t kVmTableBytes = 4u << 20;
+	static constexpr uint32_t kVmTableStage = 20u << 20;
 	static constexpr uint32_t kVmQueueBase = 26u << 20;
 	static constexpr uint32_t kVmQueueStride = 0x10000;
 	static constexpr uint32_t kVmMqd = 0x0000;
@@ -324,6 +325,7 @@ private:
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
 		uint32_t fence { 0 }, doorbell { 0 };
+		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
 		bool active { false };
 	};
@@ -347,6 +349,7 @@ private:
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);
 	RtClient  *clientFor(const void *owner);
+	bool vmTableSync(RtClient &client, uint32_t offset, uint32_t bytes);
 	bool vmMap(RtClient &client, uint64_t va, uint64_t mc, uint64_t bytes, bool executable);
 	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
 	bool vmContextInit(RtClient &client);
