@@ -2093,7 +2093,7 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
                 l->s[106] = 0;
             }
         } else if ((dw & 0xffff0000u) == 0xd44c0000u) {     /* v_cmp_gt_u32_e64 */
-            uint32_t sdst = (dw >> 8) & 0x7f;
+            uint32_t sdst = dw & 0xff;
             uint32_t a = rdna4_isa_src(l, dw1 & 0x1ff, dw2, &lit);
             uint32_t b = rdna4_isa_src(l, (dw1 >> 9) & 0x1ff, dw2, &lit);
             if (sdst > 106)
@@ -2244,8 +2244,8 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
                 l->v[vdst] = rdna4_u(fmaf(rdna4_f(a), rdna4_f(b), rdna4_f(c)));
                 break;                                                        /* v_fma_f32 */
             case 0x44c:                                                       /* v_cmp_gt_u32_e64 */
-                if (sdst <= 106)
-                    l->s[sdst] = l->s[126] && a > b;
+                if (vdst <= 106)
+                    l->s[vdst] = l->s[126] && a > b;
                 break;
             case 0x256: l->v[vdst] = (a << (b & 31)) | c; break;              /* v_lshl_or_b32 */
             case 0x246: l->v[vdst] = (a << (b & 31)) + c; break;              /* v_lshl_add_u32 */
