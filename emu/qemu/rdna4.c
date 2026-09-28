@@ -54,6 +54,7 @@
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pcie.h"
 #include "hw/pci/msi.h"
+#include "qapi/visitor.h"
 #include "hw/qdev-properties.h"
 #include "qapi/error.h"
 #include "ui/console.h"
@@ -820,6 +821,42 @@ static uint64_t rdna4_dcn_period_ns(RDNA4State *s, int otg)
 }
 
 static void rdna4_reset(DeviceState *dev);
+
+static void rdna4_sleep_reset_get(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    const Property *prop = opaque;
+    bool *src = object_field_prop_ptr(obj, prop);
+    visit_type_bool(v, name, src, errp);
+}
+
+static void rdna4_sleep_reset_default(ObjectProperty *op, const Property *prop)
+{
+    object_property_set_default_bool(op, prop->defval.u);
+}
+
+static void rdna4_sleep_reset_set(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    const Property *prop = opaque;
+    RDNA4State *s = RDNA4(obj);
+    bool *dst = object_field_prop_ptr(obj, prop);
+    if (!visit_type_bool(v, name, dst, errp) || !*dst)
+        return;
+    /* Make the already-running DCN timer observe this one-shot monitor
+     * request even when the next raster event has not been scheduled. */
+    if (s->dcn_timer)
+        timer_mod_ns(s->dcn_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+static const PropertyInfo rdna4_sleep_reset_prop = {
+    .type = "bool",
+    .description = "trigger a debug compute power reset",
+    .get = rdna4_sleep_reset_get,
+    .set = rdna4_sleep_reset_set,
+    .set_default_value = rdna4_sleep_reset_default,
+    .realized_set_allowed = true,
+};
 
 static void rdna4_dcn_vblank(RDNA4State *s, int otg, uint64_t frame)
 {
@@ -3635,7 +3672,8 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("ih-dead", RDNA4State, ih_dead, false),
     DEFINE_PROP_BOOL("dcn-irq-storm", RDNA4State, dcn_irq_storm, false),
     DEFINE_PROP_BOOL("hang-sticky", RDNA4State, hang_sticky, false),
-    DEFINE_PROP_BOOL("sleep-reset", RDNA4State, sleep_reset, false),
+    DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,
+                bool),
 };
 
 static void rdna4_class_init(ObjectClass *klass, void *data)
