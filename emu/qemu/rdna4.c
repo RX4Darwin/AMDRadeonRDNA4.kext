@@ -123,6 +123,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define HUBP_FLIP_CONTROL    0x0613     /* regHUBPREQ0_DCSURF_FLIP_CONTROL, BASE_IDX 2 */
 #define HUBP_FLIP_PENDING    (1u << 8)
 #define HUBP_DB_LAST         0x0613     /* .. regHUBPREQ0_DCSURF_FLIP_CONTROL */
+#define HUBP_CURSOR_SETTINGS 0x0653     /* regHUBPREQ0_CURSOR_SETTINGS, BASE_IDX 2 */
+#define HUBP_CURSOR_CONTROL  0x0679     /* regCURSOR0_0_CURSOR_CONTROL, BASE_IDX 2 */
+#define HUBP_CURSOR_ADDRESS  0x067a     /* regCURSOR0_0_CURSOR_SURFACE_ADDRESS, BASE_IDX 2 */
+#define HUBP_CURSOR_ADDRESS_HI 0x067b   /* regCURSOR0_0_CURSOR_SURFACE_ADDRESS_HIGH, BASE_IDX 2 */
+#define HUBP_CURSOR_SIZE     0x067c     /* regCURSOR0_0_CURSOR_SIZE, BASE_IDX 2 */
+#define HUBP_CURSOR_POSITION 0x067d     /* regCURSOR0_0_CURSOR_POSITION, BASE_IDX 2 */
+#define HUBP_CURSOR_HOT_SPOT 0x067e     /* regCURSOR0_0_CURSOR_HOT_SPOT, BASE_IDX 2 */
+#define HUBP_CURSOR_DST_OFFSET 0x0680   /* regCURSOR0_0_CURSOR_DST_OFFSET, BASE_IDX 2 */
+#define CURSOR_CM_CONTROL    0x0cf1     /* regCM_CUR0_CURSOR0_CONTROL, BASE_IDX 2 */
+#define CURSOR_CM_SCALE_GY   0x0cf4     /* regCM_CUR0_CURSOR0_FP_SCALE_BIAS_G_Y, BASE_IDX 2 */
+#define CURSOR_CM_SCALE_RB   0x0cf5     /* regCM_CUR0_CURSOR0_FP_SCALE_BIAS_RB_CRCB, BASE_IDX 2 */
+#define CURSOR_REQ_MODE      (1u << 2)
+#define CURSOR_MODE_SHIFT    8
+#define CURSOR_PITCH_SHIFT   16
+#define CURSOR_LINES_SHIFT   24
+#define CURSOR_CM_ENABLE     1u
+#define CURSOR_CM_MODE_SHIFT 4
+#define CURSOR_FP16_ONE      0x3c00
 #define DCN_VSTARTUP_ENABLE   (1u << 0)
 #define DCN_VSTARTUP_OCCURRED (1u << 2)
 #define DCN_VSTARTUP_STATUS   (1u << 3)
@@ -394,18 +412,29 @@ typedef struct RDNA4Flip {
     uint64_t request_frame;
 } RDNA4Flip;
 
+typedef struct RDNA4Cursor {
+    bool valid;
+    uint64_t offset;
+    uint32_t width, height;
+    int32_t x, y;
+} RDNA4Cursor;
+
 #define MAX_PENDING 256
 
 typedef struct RDNA4Scanout {
     bool     active;         /* an OTG is running */
+    int      otg;
     bool     blank;          /* pattern generator on, or nothing to fetch */
     const char *nosignal;    /* what the monitor would say, NULL = picture */
     uint32_t width, height, stride;
     uint64_t offset;         /* into the VRAM aperture */
+    RDNA4Cursor cursor;
 } RDNA4Scanout;
 
 static void rdna4_ih_emit(RDNA4State *s, uint8_t client, uint8_t source,
                           uint8_t ring, uint32_t data0);
+static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so,
+                             RDNA4Cursor *cursor);
 
 struct RDNA4State {
     PCIDevice parent_obj;
@@ -430,6 +459,8 @@ struct RDNA4State {
     bool     hang_sticky;    /* queue dequeue never completes */
     bool     sleep_reset;    /* monitor-triggered compute power reset */
     bool     gfx_hang;       /* accept gfx kicks but leave the ring stopped */
+    bool     cursor_enabled; /* strict DCN cursor plane/compositor */
+    bool     cursor_reject_logged;
 
     uint32_t *regs;           /* BAR5 image, RDNA4_MMIO_SIZE bytes */
     uint8_t  *resv;           /* top RDNA4_RESV_SIZE bytes of VRAM */
@@ -3745,6 +3776,7 @@ static const char *rdna4_monitor_check(RDNA4State *s, int otg, int *dig_out)
 static void rdna4_get_scanout(RDNA4State *s, RDNA4Scanout *so)
 {
     memset(so, 0, sizeof(*so));
+    so->otg = -1;
     for (int otg = 0; otg < NUM_OTG; otg++) {
         uint32_t hb, vb, opp, pitch, hp;
         uint64_t addr, fb;
@@ -3756,6 +3788,7 @@ static void rdna4_get_scanout(RDNA4State *s, RDNA4Scanout *so)
         hb = rdna4_otg_reg(s, otg, OTG_H_BLANK);
         vb = rdna4_otg_reg(s, otg, OTG_V_BLANK);
         so->active = true;
+        so->otg = otg;
         so->width = (hb & 0x7fff) - ((hb >> 16) & 0x7fff);
         so->height = (vb & 0x7fff) - ((vb >> 16) & 0x7fff);
         so->blank = true;
@@ -3806,6 +3839,104 @@ static void rdna4_get_scanout(RDNA4State *s, RDNA4Scanout *so)
     }
 }
 
+/* DCN cursor plane model. The kext must program the complete fetch contract:
+ * prefetch REQ_MODE, 64-pixel pitch, premultiplied ARGB mode, a valid VRAM
+ * address/size, and FP16 1.0 in both CM_CUR0 scale registers. A half-armed
+ * cursor is rejected instead of being silently drawn, which keeps the VM
+ * proof honest about the register programming. */
+static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so, RDNA4Cursor *cursor)
+{
+    memset(cursor, 0, sizeof(*cursor));
+    if (!s->cursor_enabled || !so->active || so->blank || so->nosignal)
+        return false;
+    const int hubp = rdna4_hubp_for_otg(s, so->otg);
+    if (hubp < 0)
+        return false;
+    const uint32_t hp = hubp * HUBP_STRIDE;
+    const uint32_t dpp = hubp * DPP_STRIDE;
+    const uint32_t control = reg_get(s, SEG2(HUBP_CURSOR_CONTROL + hp));
+    const uint32_t cm = reg_get(s, SEG2(CURSOR_CM_CONTROL + dpp));
+    const uint32_t scaleGy = reg_get(s, SEG2(CURSOR_CM_SCALE_GY + dpp)) & 0xffff;
+    const uint32_t scaleRb = reg_get(s, SEG2(CURSOR_CM_SCALE_RB + dpp)) & 0xffff;
+    if (!(control & 1) || !(cm & CURSOR_CM_ENABLE))
+        return false;
+    if (!(control & CURSOR_REQ_MODE) ||
+        ((control >> CURSOR_MODE_SHIFT) & 7) != 2 ||
+        ((control >> CURSOR_PITCH_SHIFT) & 3) != 0 ||
+        scaleGy != CURSOR_FP16_ONE || scaleRb != CURSOR_FP16_ONE) {
+        if (!s->cursor_reject_logged || s->trace)
+            fprintf(stderr, "rdna4: cursor: rejected control=0x%08x cm=0x%08x scale=0x%04x/%04x\n",
+                    control, cm, scaleGy, scaleRb);
+        s->cursor_reject_logged = true;
+        return false;
+    }
+    const uint32_t size = reg_get(s, SEG2(HUBP_CURSOR_SIZE + hp));
+    const uint32_t width = (size >> 16) & 0x1ff;
+    const uint32_t height = size & 0x1ff;
+    const uint64_t address = reg_get(s, SEG2(HUBP_CURSOR_ADDRESS + hp)) |
+        ((uint64_t)(reg_get(s, SEG2(HUBP_CURSOR_ADDRESS_HI + hp)) & 0xffff) << 32);
+    const uint64_t fb = (uint64_t)(reg_get(s, SEG2(DCN_VM_FB_LOC_BASE)) & 0xffffff) << 24;
+    if (!width || !height || width > 64 || height > 64 || address < fb ||
+        address - fb + (uint64_t)width * height * 4 > rdna4_vram_size()) {
+        if (!s->cursor_reject_logged || s->trace)
+            fprintf(stderr, "rdna4: cursor: rejected size=%ux%u address=0x%llx fb=0x%llx\n",
+                    width, height, address, fb);
+        s->cursor_reject_logged = true;
+        return false;
+    }
+    const uint32_t position = reg_get(s, SEG2(HUBP_CURSOR_POSITION + hp));
+    const uint32_t rawX = (position >> 15) & 0x7fff;
+    const uint32_t rawY = position & 0x7fff;
+    const int32_t x = (rawX & 0x4000) ? (int32_t)rawX - 0x8000 : (int32_t)rawX;
+    const int32_t y = (rawY & 0x4000) ? (int32_t)rawY - 0x8000 : (int32_t)rawY;
+    const uint32_t hot = reg_get(s, SEG2(HUBP_CURSOR_HOT_SPOT + hp));
+    cursor->valid = true;
+    cursor->offset = address - fb;
+    cursor->width = width;
+    cursor->height = height;
+    cursor->x = x - (int32_t)((hot >> 16) & 0xff);
+    cursor->y = y - (int32_t)(hot & 0xff);
+    s->cursor_reject_logged = false;
+    fprintf(stderr, "rdna4: cursor: plane HUBP%d addr=0x%llx size=%ux%u pos=%d,%d\n",
+            hubp, address, width, height, cursor->x, cursor->y);
+    return true;
+}
+
+static void rdna4_blend_cursor(RDNA4State *s, const RDNA4Scanout *so,
+                               DisplaySurface *surface)
+{
+    if (!so->cursor.valid)
+        return;
+    uint8_t *sprite = rdna4_vram_span(s, so->cursor.offset,
+                                      (uint64_t)so->cursor.width * so->cursor.height * 4);
+    if (!sprite)
+        return;
+    uint8_t *dst = surface_data(surface);
+    const int dstStride = surface_stride(surface);
+    for (uint32_t y = 0; y < so->cursor.height; y++) {
+        int32_t dy = so->cursor.y + (int32_t)y;
+        if (dy < 0 || dy >= (int32_t)so->height)
+            continue;
+        for (uint32_t x = 0; x < so->cursor.width; x++) {
+            int32_t dx = so->cursor.x + (int32_t)x;
+            if (dx < 0 || dx >= (int32_t)so->width)
+                continue;
+            uint32_t src = ldl_le_p(sprite + ((uint64_t)y * so->cursor.width + x) * 4);
+            uint32_t alpha = src >> 24;
+            if (!alpha)
+                continue;
+            uint32_t *out = (uint32_t *)(dst + (uint64_t)dy * dstStride + (uint64_t)dx * 4);
+            uint32_t old = *out;
+            uint32_t inv = 255 - alpha;
+            uint32_t r = ((src >> 16) & 0xff) + (((old >> 16) & 0xff) * inv + 127) / 255;
+            uint32_t g = ((src >> 8) & 0xff) + (((old >> 8) & 0xff) * inv + 127) / 255;
+            uint32_t b = (src & 0xff) + ((old & 0xff) * inv + 127) / 255;
+            *out = (r > 255 ? 255 : r) << 16 | (g > 255 ? 255 : g) << 8 |
+                   (b > 255 ? 255 : b);
+        }
+    }
+}
+
 static void rdna4_gfx_update(void *opaque)
 {
     RDNA4State *s = opaque;
@@ -3815,6 +3946,7 @@ static void rdna4_gfx_update(void *opaque)
     int y, ys;
 
     rdna4_get_scanout(s, &so);
+    rdna4_get_cursor(s, &so, &so.cursor);
     if (memcmp(&so, &s->scanout, sizeof(so)) != 0) {
         s->scanout = so;
         if (!so.active || so.nosignal) {
@@ -3829,6 +3961,12 @@ static void rdna4_gfx_update(void *opaque)
             if (!scanout) {
                 ds = qemu_create_placeholder_surface(640, 480,
                                                      "rdna4: scanout surface not mapped");
+            } else if (so.cursor.valid) {
+                ds = qemu_create_displaysurface(so.width, so.height);
+                for (int y = 0; y < (int)so.height; y++)
+                    memcpy(surface_data(ds) + (uint64_t)y * surface_stride(ds),
+                           scanout + (uint64_t)y * so.stride, so.width * 4);
+                rdna4_blend_cursor(s, &so, ds);
             } else {
                 ds = qemu_create_displaysurface_from(
                     so.width, so.height, PIXMAN_LE_x8r8g8b8, so.stride, scanout);
@@ -3839,6 +3977,26 @@ static void rdna4_gfx_update(void *opaque)
         return;
     }
     if (!so.active || so.blank || so.nosignal) {
+        return;
+    }
+
+    /* A copied surface is used while the cursor plane is armed so a cursor
+     * move or a dirty framebuffer region cannot erase the composited sprite. */
+    if (so.cursor.valid) {
+        uint8_t *scanout = rdna4_vram_span(s, so.offset,
+                                           (uint64_t)so.stride * so.height);
+        if (!scanout)
+            return;
+        ds = qemu_create_displaysurface(so.width, so.height);
+        for (int y = 0; y < (int)so.height; y++)
+            memcpy(surface_data(ds) + (uint64_t)y * surface_stride(ds),
+                   scanout + (uint64_t)y * so.stride, so.width * 4);
+        rdna4_blend_cursor(s, &so, ds);
+        dpy_gfx_replace_surface(s->con, ds);
+        dpy_gfx_update_full(s->con);
+        DirtyBitmapSnapshot *cursorSnap = memory_region_snapshot_and_clear_dirty(
+            &s->vram, so.offset, (uint64_t)so.stride * so.height, DIRTY_MEMORY_VGA);
+        g_free(cursorSnap);
         return;
     }
 
@@ -4185,6 +4343,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("flip-stuck", RDNA4State, flip_stuck, false),
     DEFINE_PROP_BOOL("ih-dead", RDNA4State, ih_dead, false),
     DEFINE_PROP_BOOL("dcn-irq-storm", RDNA4State, dcn_irq_storm, false),
+    DEFINE_PROP_BOOL("cursor", RDNA4State, cursor_enabled, false),
     DEFINE_PROP_BOOL("hang-sticky", RDNA4State, hang_sticky, false),
     DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,
                 bool),

@@ -49,6 +49,7 @@ CC           := clang
 CXX_SRCS := \
 	src/plugin.cpp \
 	src/device.cpp \
+	src/cursor.cpp \
 	src/ndrv.cpp \
 	src/modeset.cpp \
 	src/compute.cpp \

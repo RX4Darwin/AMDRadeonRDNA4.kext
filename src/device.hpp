@@ -26,7 +26,10 @@
 #include "ipdiscovery.hpp"
 #include "modes.hpp"
 #include "modeset.hpp"
+#include "ndrv.hpp"
 #include "pipe.hpp"
+
+class IOMemoryMap;
 
 class RDNA4Device {
 public:
@@ -77,6 +80,13 @@ public:
 	// makes it a no-op.
 	void setDisplayPower(bool on);
 	bool displayPowerOn { true };
+
+	// NDRV hardware-cursor csc backend. Cursor memory and register programming
+	// are enabled only by rdna4-cursor=1; the default remains software cursor.
+	bool supportsHardwareCursor() const { return hwCursorReady; }
+	IOReturn setHardwareCursor(void *cursorRef);
+	IOReturn drawHardwareCursor(int32_t x, int32_t y, uint32_t visible);
+	IOReturn getHardwareCursorDrawState(Ndrv::VDHardwareCursorDrawStateRec &state) const;
 
 	// Shared with the compute bring-up (compute.hpp): the BAR5 mapping and
 	// the IP discovery table. Null until init() found them.
@@ -188,6 +198,21 @@ private:
 	bool pathForPipe(AtomBios::DisplayPath &out);
 	bool runPlan(const ModeSet::Plan &plan);
 	bool waitFrames(uint32_t frames);
+
+	bool initHardwareCursor();
+	void freeHardwareCursor();
+	bool hwCursorRequested { false };
+	bool hwCursorReady { false };
+	bool hwCursorSet { false };
+	bool hwCursorVisible { false };
+	int32_t hwCursorX { 0 }, hwCursorY { 0 };
+	uint16_t hwCursorHotX { 0 }, hwCursorHotY { 0 };
+	uint32_t *cursorStage { nullptr };
+	volatile uint32_t *cursorVram { nullptr };
+	IODeviceMemory *cursorMemory { nullptr };
+	IOMemoryMap *cursorMap { nullptr };
+	uint64_t cursorMcAddr { 0 };
+	uint32_t cursorWidth { 0 }, cursorHeight { 0 };
 };
 
 #endif /* RDNA4Device_hpp */

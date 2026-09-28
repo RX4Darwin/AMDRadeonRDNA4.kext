@@ -45,9 +45,13 @@ enum : uint16_t {
 	cscGetVideoParameters = 18,
 	cscGetDDCBlock        = 27,
 	cscGetDetailedTiming  = 31,
+	cscSupportsHardwareCursor = 22,
+	cscGetHardwareCursorDrawState = 23,
 	// Control
 	cscSwitchMode         = 10,
 	cscSetSync            = 11,
+	cscSetHardwareCursor  = 22,
+	cscDrawHardwareCursor = 23,
 };
 
 // IOReturn values used here.
@@ -197,6 +201,36 @@ struct VDDetailedTimingRec {
 	uint32_t csReserved5, csReserved6, csReserved7, csReserved8;
 };
 
+// IOMacOSVideo.h cursor csc records (Apple IOGraphics).
+struct VDSetHardwareCursorRec {
+	void    *csCursorRef;
+	uint32_t csReserved1;
+	uint32_t csReserved2;
+};
+
+struct VDDrawHardwareCursorRec {
+	int32_t  csCursorX;
+	int32_t  csCursorY;
+	uint32_t csCursorVisible;
+	uint32_t csReserved1;
+	uint32_t csReserved2;
+};
+
+struct VDSupportsHardwareCursorRec {
+	uint32_t csSupportsHardwareCursor;
+	uint32_t csReserved1;
+	uint32_t csReserved2;
+};
+
+struct VDHardwareCursorDrawStateRec {
+	int32_t  csCursorX;
+	int32_t  csCursorY;
+	uint32_t csCursorVisible;
+	uint32_t csCursorSet;
+	uint32_t csReserved1;
+	uint32_t csReserved2;
+};
+
 
 // --- backend -----------------------------------------------------------------
 
@@ -216,6 +250,10 @@ struct Backend {
 	int32_t (*switchTo)(void *ctx, const Modes::Mode &m, bool isBoot);
 	// DPMS: display on or blanked.
 	void (*setPower)(void *ctx, bool on);
+	bool (*supportsHardwareCursor)(void *ctx);
+	int32_t (*setHardwareCursor)(void *ctx, void *cursorRef);
+	int32_t (*drawHardwareCursor)(void *ctx, int32_t x, int32_t y, uint32_t visible);
+	int32_t (*getHardwareCursorDrawState)(void *ctx, VDHardwareCursorDrawStateRec &state);
 };
 
 class Translator {
@@ -263,5 +301,19 @@ private:
 };
 
 } // namespace Ndrv
+
+// Opaque bridges to IONDRVFramebuffer's VSL services. The service is made
+// by Apple's VSLNewInterruptService; W1 only invokes VSLDoInterruptService
+// from its deferred IH work-loop action.
+namespace Ndrv {
+using VslDoInterruptService = int32_t (*)(void *service);
+using VslPrepareCursor = bool (*)(void *cursorRef, void *descriptor, void *info);
+void vslServiceCreated(void *service, VslDoInterruptService doService);
+void vslServiceDisposed(void *service);
+void vslPrepareCursorInstalled(VslPrepareCursor prepare);
+void setVblankEnabled(bool enabled);
+void signalVblank();
+bool prepareCursor(void *cursorRef, void *descriptor, void *info);
+}
 
 #endif /* Ndrv_hpp */
