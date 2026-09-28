@@ -1528,6 +1528,9 @@ bool RDNA4Compute::hqdInitFor(bool asKiq, uint32_t pipe, uint32_t queue, uint32_
 		wr(IpDiscovery::HwGc, CpHqdPqWptrLo, 0);
 		wr(IpDiscovery::HwGc, CpHqdPqWptrHi, 0);
 	}
+	/* A dequeued VM queue retains its read pointer; every fresh HQD starts
+	 * consuming the newly initialized ring at dword zero. */
+	wr(IpDiscovery::HwGc, CpHqdPqRptr, 0);
 	wr(IpDiscovery::HwGc, CpMqdBaseAddr, static_cast<uint32_t>(mqd) & ~3u);
 	wr(IpDiscovery::HwGc, CpMqdBaseAddrHi, static_cast<uint32_t>(mqd >> 32));
 	wr(IpDiscovery::HwGc, CpMqdControl, (kMqdControlDefault & ~0xfu) | vmid);
