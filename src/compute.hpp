@@ -155,6 +155,12 @@ private:
 	// flushed before each step that could hang the GPU, so the step a hard
 	// hang stopped at survives the reset. Logged by the next boot's survey.
 	void trail(const char *step);
+	// The pre-Metal features past the compute stages (W1-W5) name their
+	// trail steps "<feature>: ..." (gfx, ih, vm, flip, rt). If the previous
+	// boot died in one of those, only that feature sits this boot out; the
+	// stages and the other features run. featureAllowed("gfx") etc.
+	char hungFeature[8] {};
+	bool featureAllowed(const char *name) const;
 	// Log the previous boot's trail (into `text`); true if that boot died
 	// in the middle of a step rather than ending the bring-up itself.
 	bool logPreviousTrail(char *text, size_t size);

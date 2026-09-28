@@ -472,9 +472,22 @@ void RDNA4Compute::runStages() {
 	// Read before this boot writes its own. Not at attach: that is before
 	// the EFI NVRAM driver has published the stored variables.
 	char prev[96];
-	const bool hung = logPreviousTrail(prev, sizeof(prev));
+	bool hung = logPreviousTrail(prev, sizeof(prev));
 	uint32_t done = StageSurvey;
 	char note[96];
+	static const char *const kFeatures[] = { "gfx", "ih", "vm", "flip", "rt" };
+	for (size_t i = 0; hung && i < sizeof(kFeatures) / sizeof(kFeatures[0]); i++) {
+		const size_t n = strlen(kFeatures[i]);
+		if (!strncmp(prev, kFeatures[i], n) && prev[n] == ':') {
+			// A feature past the stages hung: the stages were fine, so only
+			// that feature is left out, once.
+			strlcpy(hungFeature, kFeatures[i], sizeof(hungFeature));
+			CLOG("the previous boot died during \"%s\": %s is off this boot, everything else runs "
+			     "(the next boot tries it again)", prev, hungFeature);
+			env.owner->setProperty("Compute,PreviousHang", prev);
+			hung = false;
+		}
+	}
 	if (hung) {
 		// Running the same steps again would most likely hang this boot too,
 		// before anyone can collect a log. Skip once; the trail this leaves
@@ -525,15 +538,25 @@ void RDNA4Compute::runStages() {
 	}
 	// W3: the gfx ring, when asked for. A failure only turns it off again.
 	bool gfxOk = false;
-	if (done >= StageKernel && (gfxMode = requestedGfx()) != 0)
+	const uint32_t gfxAsked = done >= StageKernel ? requestedGfx() : 0;
+	if (gfxAsked && featureAllowed("gfx")) {
+		gfxMode = gfxAsked;
 		gfxOk = stageGfxRing();
+	}
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
-	snprintf(note, sizeof(note), "finished at stage %u%s", done,
-	         !gfxMode && !gfxOk ? "" : gfxOk ? ", gfx ring up" : ", gfx ring failed");
-	trail(note);
 	CLOG("bring-up finished at stage %u", done);
+	// The runtime and what it starts leave their own "<feature>: ..." steps
+	// in the trail, so the trail's normal ending comes after them.
 	if (done >= StageDispatch)
 		publishRuntime(done);
+	snprintf(note, sizeof(note), "finished at stage %u%s%s%s", done,
+	         !gfxAsked ? "" : gfxOk ? ", gfx ring up" : ", gfx ring off",
+	         hungFeature[0] ? ", skipped after a hang: " : "", hungFeature);
+	trail(note);
+}
+
+bool RDNA4Compute::featureAllowed(const char *name) const {
+	return !hungFeature[0] || strcmp(hungFeature, name) != 0;
 }
 
 // The pool, uncached: the PSP reads what we write there and writes fences
