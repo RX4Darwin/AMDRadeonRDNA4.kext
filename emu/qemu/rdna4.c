@@ -4793,8 +4793,10 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
             s->gfx_rptr = st->pos;
             reg_set(s, REG_GFX_CP_RB0_RPTR, (uint32_t)(s->gfx_rptr % st->ring_dw));
             rdna4_gfx_rptr_writeback(s, (uint32_t)(s->gfx_rptr % st->ring_dw));
-            if (deadline_ns && qemu_clock_get_ns(QEMU_CLOCK_HOST) >= deadline_ns)
+            if (deadline_ns && qemu_clock_get_ns(QEMU_CLOCK_REALTIME) >= deadline_ns) {
+                s->gfx_budget_hit = true;
                 return true;                                /* resumable boundary */
+            }
         }
     }
     return true;
