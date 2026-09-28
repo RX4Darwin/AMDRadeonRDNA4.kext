@@ -150,6 +150,15 @@ constexpr Reg GcCtx0PtStartLo     { 0, 0x16af };
 constexpr Reg GcCtx0PtStartHi     { 0, 0x16b0 };
 constexpr Reg GcCtx0PtEndLo       { 0, 0x16cf };
 constexpr Reg GcCtx0PtEndHi       { 0, 0x16d0 };
+// VMID n uses CONTEXT1 + (n - 1) for the control register and the paired
+// address registers below.  gfxhub_v12_0 programs these for VMIDs 1..15.
+constexpr Reg GcCtx1Cntl          { 0, 0x1625 };
+constexpr Reg GcCtx1PtBaseLo      { 0, 0x1691 };
+constexpr Reg GcCtx1PtBaseHi      { 0, 0x1692 };
+constexpr Reg GcCtx1PtStartLo     { 0, 0x16b1 };
+constexpr Reg GcCtx1PtStartHi     { 0, 0x16b2 };
+constexpr Reg GcCtx1PtEndLo       { 0, 0x16d1 };
+constexpr Reg GcCtx1PtEndHi       { 0, 0x16d2 };
 constexpr Reg GcSysApertureHigh   { 0, 0x161a };   // MC address >> 18
 constexpr Reg GcSysDefaultLsb     { 0, 0x15a8 };   // VRAM offset >> 12
 constexpr Reg GcSysDefaultMsb     { 0, 0x15a9 };   // VRAM offset >> 44
@@ -326,6 +335,7 @@ constexpr Reg ComputePgmRsrc3     { 0, 0x1bc8 };
 constexpr Reg ComputeThreadMgmtSe4{ 0, 0x1bcb };   // SE4..SE7 (0x1bcb..0x1bce)
 constexpr Reg ComputeUserData0    { 0, 0x1be0 };
 constexpr Reg ShMemConfig         { 1, 0x09e4 };   // per VMID (GRBM_GFX_CNTL.VMID)
+constexpr Reg ShMemBases          { 1, 0x09e5 };   // PRIVATE_BASE [15:0], SHARED_BASE [31:16]
 // DEFAULT_SH_MEM_CONFIG: 64-bit addressing, unaligned access, prefetch 3.
 constexpr uint32_t kShMemConfigDefault = (3u << 2) | (3u << 14);
 // COMPUTE_PGM_RSRC1: VGPR blocks [5:0] (wave32: 8 per block), FLOAT_MODE

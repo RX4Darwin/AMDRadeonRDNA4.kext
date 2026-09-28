@@ -51,6 +51,7 @@
 #include "codeobj.hpp"
 #include "gfxregs.hpp"
 #include "gpuheap.hpp"
+#include "gpuvm.hpp"
 #include "ipdiscovery.hpp"
 #include "pm4.hpp"
 #include "psp.hpp"
@@ -88,6 +89,7 @@ public:
 
 	// rdna4-compute=<stage>, clamped to StageKernel. 0 when absent.
 	static uint32_t requestedStage();
+	static bool requestedVm();
 
 	// Run the survey now and, for stage >= 2, start the bring-up thread.
 	// Returns the last stage completed inline.
@@ -224,7 +226,11 @@ private:
 	bool mecStart();
 	bool doorbellInit();
 	bool hqdInit(bool asKiq);
+	bool hqdInitFor(bool asKiq, uint32_t pipe, uint32_t queue, uint32_t vmid,
+	                uint64_t mqd, uint64_t eop, uint64_t pq, uint64_t rptr,
+	                uint64_t wpoll, uint32_t doorbell);
 	void pm4Kick(uint64_t wptrDwords);
+	void pm4Kick(Pm4::Queue &queue, uint32_t doorbell, uint64_t wptrDwords);
 	bool stageCompute();
 
 	// Stage 6: run a real kernel (shaders/probe.s) on the compute units.
@@ -246,6 +252,10 @@ private:
 		bool            wave32;
 		uint32_t        timeoutUs;
 		uint32_t        ldsBytes;           // per work-group (RSRC2.LDS_SIZE)
+		Pm4::Queue     *queue;
+		uint32_t        vmid, pipe, queueId, fenceValue, doorbell;
+		uint64_t        fenceAddress;
+		volatile uint32_t *fenceCpu;
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
 	// What launch() can give a code-object kernel: the kernarg pointer and
@@ -268,7 +278,8 @@ public:
 	// User-space runtime (runtime.cpp), reached through RDNA4ComputeClient.
 	// `owner` is the client: its buffers and programs are only its own, and
 	// rtRelease frees them all. Every call takes rtLock.
-	IOReturn rtInfo(uint64_t out[6]);
+	IOReturn rtOpen(const void *owner);
+	IOReturn rtInfo(const void *owner, uint64_t out[9]);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtFree(const void *owner, uint64_t handle);
 	IOReturn rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
@@ -286,18 +297,44 @@ private:
 	static constexpr uint32_t kHeapOffset  = 32u << 20;
 	static constexpr uint32_t kMaxBuffers  = 256;
 	static constexpr uint32_t kMaxPrograms = 32;
+	static constexpr uint32_t kMaxClients = 8;
+	static constexpr uint32_t kVmTableBytes = 4u << 20;
+	static constexpr uint32_t kVmQueueBase = 26u << 20;
+	static constexpr uint32_t kVmQueueStride = 0x10000;
+	static constexpr uint32_t kVmMqd = 0x0000;
+	static constexpr uint32_t kVmEop = 0x1000;
+	static constexpr uint32_t kVmPq = 0x2000;
+	static constexpr uint32_t kVmRptr = 0x3000;
+	static constexpr uint32_t kVmWptr = 0x3040;
+	static constexpr uint32_t kVmFence = 0x3080;
+	static constexpr uint32_t kVmKernarg = 0x4000;
 	struct RtBuffer  {
 		const void *owner;
 		uint64_t    offset, bytes;             // heap offset (pool or VRAM), size
-		uint64_t    mc;                        // GPU address
+		uint64_t    mc, va;                    // physical MC and client GPU VA
 		uint16_t    gen;
 		bool        device;                    // from the device heap
 	};
-	struct RtProgram { const void *owner; uint64_t offset; CodeObj::Kernel k; uint16_t gen; };
+	struct RtProgram { const void *owner; uint64_t offset, va; CodeObj::Kernel k; uint16_t gen; };
+	struct RtClient {
+		const void *owner { nullptr };
+		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
+		uint64_t tableOffset { 0 }, rootMc { 0 }, nextVa { GpuVm::kVaStart };
+		uint64_t kernargVa { 0 }, fenceVa { 0 };
+		volatile uint32_t *kernargCpu { nullptr };
+		volatile uint32_t *fenceCpu { nullptr };
+		uint32_t fence { 0 }, doorbell { 0 };
+		Pm4::Queue pm4;
+		bool active { false };
+	};
 	IOLock        *rtLock { nullptr };
 	bool           rtReady { false };       // a dispatching stage finished
 	bool           rtWedged { false };      // a dispatch timed out
 	uint32_t       rtStage { 0 };
+	bool           vmEnabled { false };
+	bool           vmidUsed[16] {};
+	bool           queueUsed[4][8] {};
+	RtClient       clients[kMaxClients] {};
 	GpuHeap::Heap  heap;
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
 	RtBuffer       buffers[kMaxBuffers] {};
@@ -305,8 +342,16 @@ private:
 	IOService     *rtService { nullptr };
 	uint64_t       dmubVram { 0 };            // DMUB memory (VRAM offset), from choosePool
 	void publishRuntime(uint32_t stage);
+	bool initRuntimeHeap();
+	bool vmBootSelfTest();
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);
+	RtClient  *clientFor(const void *owner);
+	bool vmMap(RtClient &client, uint64_t va, uint64_t mc, uint64_t bytes, bool executable);
+	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
+	bool vmContextInit(RtClient &client);
+	bool vmInvalidate(uint32_t vmid, const char *tag);
+	void logClientFault(RtClient &client, const char *tag);
 
 	// DMA between host memory and VRAM (runtime.cpp). One pinned, physically
 	// contiguous bounce buffer; the GC hub's AGP aperture maps system memory

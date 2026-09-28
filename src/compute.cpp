@@ -90,6 +90,11 @@ uint32_t RDNA4Compute::requestedStage() {
 	return stage > StageKernel ? StageKernel : stage;
 }
 
+bool RDNA4Compute::requestedVm() {
+	uint32_t enabled = 0;
+	return PE_parse_boot_argn("rdna4-vm", &enabled, sizeof(enabled)) && enabled != 0;
+}
+
 uint32_t RDNA4Compute::rd(uint16_t hwId, const Reg &r) const {
 	uint32_t off;
 	if (!env.mmio || !env.disc || !env.disc->regByteOffset(hwId, 0, r.seg, r.dword, off) ||
@@ -374,6 +379,7 @@ void RDNA4Compute::choosePool() {
 
 uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 	env = e;
+	vmEnabled = requestedVm();
 	if (stage == StageOff)
 		return StageOff;
 	if (!env.pci || !env.owner || !env.mmio || !env.disc || !env.disc->isValid()) {
@@ -522,6 +528,10 @@ void RDNA4Compute::runStages() {
 		if (!stageKernel())
 			return stop("stage 7 (kernel)");
 		done = StageKernel;
+	}
+	if (vmEnabled && done >= StageKernel && !vmBootSelfTest()) {
+		vmEnabled = false;
+		CLOG("vm: boot self-test failed; per-client GPU VM disabled");
 	}
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
 	snprintf(note, sizeof(note), "finished at stage %u", done);
@@ -1434,26 +1444,36 @@ bool RDNA4Compute::doorbellMapBar() {
 // gfx_v12_0_compute_mqd_init + gfx_v12_0_kiq_init_register for ME1 pipe 0
 // queue 0, VMID0, doorbell dword kComputeDoorbellDword.
 bool RDNA4Compute::hqdInit(bool asKiq) {
-	for (uint32_t off = kMqdOffset; off < kPqOffset; off += 4)   // MQD + EOP
+	return hqdInitFor(asKiq, 0, 0, 0, poolMc(kMqdOffset), poolMc(kEopOffset) >> 8,
+	                  poolMc(kPqOffset) >> 8, poolMc(kPqRptrOffset), poolMc(kPqWptrOffset),
+	                  kComputeDoorbellDword);
+}
+
+bool RDNA4Compute::hqdInitFor(bool asKiq, uint32_t pipe, uint32_t queue, uint32_t vmid,
+	                            uint64_t mqd, uint64_t eop, uint64_t pq, uint64_t rptr,
+	                            uint64_t wpoll, uint32_t doorbell) {
+	const uint32_t mqdOff = static_cast<uint32_t>(mqd - pool.mcAddress);
+	const bool rptrCpu = rptr >= pool.mcAddress && rptr < pool.mcAddress + pool.size;
+	const uint32_t rptrOff = rptrCpu ? static_cast<uint32_t>(rptr - pool.mcAddress) : 0;
+	for (uint32_t off = mqdOff; off < mqdOff + 0x2000; off += 4)   // MQD + EOP
 		*poolDw(off) = 0;
-	*poolDw(kPqRptrOffset) = 0;
-	*poolDw(kPqWptrOffset) = 0;
-	*poolDw(kPqWptrOffset + 4) = 0;
+	if (rptrCpu) {
+		*poolDw(rptrOff) = 0;
+		*poolDw(rptrOff + 0x40) = 0;
+		*poolDw(rptrOff + 0x44) = 0;
+	}
 	flushHdp();
 
-	const uint64_t eop = poolMc(kEopOffset) >> 8, pq = poolMc(kPqOffset) >> 8;
-	const uint64_t mqd = poolMc(kMqdOffset), rptr = poolMc(kPqRptrOffset), wpoll = poolMc(kPqWptrOffset);
 	const uint32_t eopSize = 8;                 // 2^(8+1) dwords = GFX12_MEC_HPD_SIZE
 	const uint32_t queueSize = 9;               // 2^(9+1) dwords = 4 KiB
 	uint32_t pqControl = (kHqdPqControlDefault & ~(kPqQueueSizeMask | kPqRptrBlockMask |
 	                                               kPqTunnelDispatch)) |
 	                     queueSize | (9u << 8) | kPqUnordDispatch | kPqPrivState | kPqKmdQueue;
-	uint32_t doorbell = (kComputeDoorbellDword << kDoorbellOffsetShift) | kDoorbellEn;
 
 	// The MQD in memory, as gfx_v12_0_compute_mqd_init fills it (v12_compute_mqd
 	// dword offsets): the CP reads it back (CU masks, save/restore), so it
 	// must describe the same queue the registers below do.
-	auto mqdDw = [this](uint32_t dw, uint32_t v) { *poolDw(kMqdOffset + 4 * dw) = v; };
+	auto mqdDw = [this, mqdOff](uint32_t dw, uint32_t v) { *poolDw(mqdOff + 4 * dw) = v; };
 	mqdDw(0, 0xC0310800);                             // header
 	mqdDw(11, 1);                                     // compute_pipelinestat_enable
 	mqdDw(23, 0xffffffff);                            // compute_static_thread_mgmt_se0
@@ -1464,7 +1484,7 @@ bool RDNA4Compute::hqdInit(bool asKiq) {
 	mqdDw(128, static_cast<uint32_t>(mqd) & ~3u);     // cp_mqd_base_addr_lo
 	mqdDw(129, static_cast<uint32_t>(mqd >> 32));
 	mqdDw(130, 1);                                    // cp_hqd_active
-	mqdDw(131, 0);                                    // cp_hqd_vmid
+	mqdDw(131, vmid);                                 // cp_hqd_vmid
 	mqdDw(132, kHqdPersistentDefault);                // cp_hqd_persistent_state
 	mqdDw(135, (1u << 0) | (1u << 4) | (1u << 8));    // cp_hqd_quantum: EN, SCALE 1, DURATION 1
 	mqdDw(136, static_cast<uint32_t>(pq));            // cp_hqd_pq_base_lo
@@ -1473,10 +1493,10 @@ bool RDNA4Compute::hqdInit(bool asKiq) {
 	mqdDw(140, static_cast<uint32_t>(rptr >> 32) & 0xffff);
 	mqdDw(141, static_cast<uint32_t>(wpoll) & ~3u);   // cp_hqd_pq_wptr_poll_addr_lo
 	mqdDw(142, static_cast<uint32_t>(wpoll >> 32) & 0xffff);
-	mqdDw(143, doorbell);                             // cp_hqd_pq_doorbell_control
+	mqdDw(143, (doorbell << kDoorbellOffsetShift) | kDoorbellEn); // cp_hqd_pq_doorbell_control
 	mqdDw(145, pqControl);                            // cp_hqd_pq_control
 	mqdDw(149, 0x00300000);                           // cp_hqd_ib_control: MIN_IB_AVAIL_SIZE 3
-	mqdDw(162, kMqdControlDefault & ~0xfu);           // cp_mqd_control: VMID 0
+	mqdDw(162, (kMqdControlDefault & ~0xfu) | vmid); // cp_mqd_control: VMID
 	mqdDw(165, static_cast<uint32_t>(eop));           // cp_hqd_eop_base_addr_lo
 	mqdDw(166, static_cast<uint32_t>(eop >> 32));
 	mqdDw(167, (kHqdEopControlDefault & ~0x3fu) | eopSize);
@@ -1485,20 +1505,20 @@ bool RDNA4Compute::hqdInit(bool asKiq) {
 	// As the KIQ (gfx_v12_0_kiq_setting): the RLC names this queue (ME1,
 	// pipe 0, queue 0) in the low byte, bit 7 marks it valid. Otherwise
 	// it stays an ordinary MMIO-activated queue (kfd's hqd_load, gfx9-11).
-	const uint32_t sched = (rdGc(RlcCpSchedulers) & 0xffffff00u) | (1u << 5) | (0u << 3) | 0u;
-	if (asKiq) {
+	const uint32_t sched = (rdGc(RlcCpSchedulers) & 0xffffff00u) | (1u << 5) | (pipe << 3) | queue;
+	if (vmid == 0 && pipe == 0 && queue == 0 && asKiq) {
 		wr(IpDiscovery::HwGc, RlcCpSchedulers, sched);
 		wr(IpDiscovery::HwGc, RlcCpSchedulers, sched | 0x80);
-	} else {
+	} else if (vmid == 0 && pipe == 0 && queue == 0) {
 		wr(IpDiscovery::HwGc, RlcCpSchedulers, sched & 0xffffff00u);
 	}
 
-	grbmSelect(1, 0, 0, 0);
+	grbmSelect(1, pipe, queue, vmid);
 	wr(IpDiscovery::HwGc, CpPqWptrPollCntl, rdGc(CpPqWptrPollCntl) & ~kPqWptrPollEn);
 	wr(IpDiscovery::HwGc, CpHqdEopBase, static_cast<uint32_t>(eop));
 	wr(IpDiscovery::HwGc, CpHqdEopBaseHi, static_cast<uint32_t>(eop >> 32));
 	wr(IpDiscovery::HwGc, CpHqdEopControl, (kHqdEopControlDefault & ~0x3fu) | eopSize);
-	wr(IpDiscovery::HwGc, CpHqdPqDoorbell, doorbell);
+	wr(IpDiscovery::HwGc, CpHqdPqDoorbell, (doorbell << kDoorbellOffsetShift) | kDoorbellEn);
 	if (rdGc(CpHqdActive) & 1) {                // a queue left behind: drain it
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
 		for (uint32_t us = 0; us < 100000 && (rdGc(CpHqdActive) & 1); us += 10)
@@ -1510,7 +1530,7 @@ bool RDNA4Compute::hqdInit(bool asKiq) {
 	}
 	wr(IpDiscovery::HwGc, CpMqdBaseAddr, static_cast<uint32_t>(mqd) & ~3u);
 	wr(IpDiscovery::HwGc, CpMqdBaseAddrHi, static_cast<uint32_t>(mqd >> 32));
-	wr(IpDiscovery::HwGc, CpMqdControl, kMqdControlDefault & ~0xfu);
+	wr(IpDiscovery::HwGc, CpMqdControl, (kMqdControlDefault & ~0xfu) | vmid);
 	wr(IpDiscovery::HwGc, CpHqdPqBase, static_cast<uint32_t>(pq));
 	wr(IpDiscovery::HwGc, CpHqdPqBaseHi, static_cast<uint32_t>(pq >> 32));
 	wr(IpDiscovery::HwGc, CpHqdPqControl, pqControl);
@@ -1520,18 +1540,18 @@ bool RDNA4Compute::hqdInit(bool asKiq) {
 	wr(IpDiscovery::HwGc, CpHqdPqWptrPollHi, static_cast<uint32_t>(wpoll >> 32) & 0xffff);
 	wr(IpDiscovery::HwGc, CpMecDoorbellLower, kMecDoorbellLowerBytes);
 	wr(IpDiscovery::HwGc, CpMecDoorbellUpper, kMecDoorbellUpperBytes);
-	wr(IpDiscovery::HwGc, CpHqdPqDoorbell, doorbell);
+	wr(IpDiscovery::HwGc, CpHqdPqDoorbell, (doorbell << kDoorbellOffsetShift) | kDoorbellEn);
 	wr(IpDiscovery::HwGc, CpHqdPqWptrLo, 0);
 	wr(IpDiscovery::HwGc, CpHqdPqWptrHi, 0);
-	wr(IpDiscovery::HwGc, CpHqdVmid, 0);
+	wr(IpDiscovery::HwGc, CpHqdVmid, vmid);
 	wr(IpDiscovery::HwGc, CpHqdPersistent, kHqdPersistentDefault);
 	wr(IpDiscovery::HwGc, CpHqdEopRptr, kEopInitFetcher);   // start the EOP fetcher (kfd hqd_load)
 	wr(IpDiscovery::HwGc, CpHqdActive, 1);
 	wr(IpDiscovery::HwGc, CpPqStatus, rdGc(CpPqStatus) | kPqStatusDoorbellEnable);
 	const uint32_t active = rdGc(CpHqdActive), pqc = rdGc(CpHqdPqControl);
 	grbmSelect(0, 0, 0, 0);
-	CLOG("mec: HQD ME1/pipe0/queue0: active %u, PQ_CONTROL 0x%08x, doorbell dword %u",
-	     active & 1, pqc, kComputeDoorbellDword);
+	CLOG("mec: HQD ME1/pipe%u/queue%u VMID%u: active %u, PQ_CONTROL 0x%08x, doorbell dword %u",
+	     pipe, queue, vmid, active & 1, pqc, doorbell);
 	return active & 1;
 }
 
@@ -1541,6 +1561,12 @@ void RDNA4Compute::pm4Kick(uint64_t wptrDwords) {
 	*poolDw(kPqWptrOffset + 4) = static_cast<uint32_t>(wptrDwords >> 32);
 	flushHdp();
 	doorbells[kComputeDoorbellDword / 2] = wptrDwords;
+}
+
+void RDNA4Compute::pm4Kick(Pm4::Queue &queue, uint32_t doorbell, uint64_t wptrDwords) {
+	/* The VM queue's wptr report is mapped in its client VA; the CP owns it. */
+	flushHdp();
+	doorbells[doorbell / 2] = wptrDwords;
 }
 
 bool RDNA4Compute::stageCompute() {
@@ -1677,12 +1703,17 @@ uint32_t RDNA4Compute::shAbs(const Reg &r) const {
 // ACQUIRE_MEM first (code and inputs were just written by the CPU) and its
 // RELEASE_MEM fence after (GL2 written back, so the CPU reads the results).
 bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
-	*poolDw(kPm4FenceOffset) = 0;
+	const bool vm = l.queue != nullptr;
+	volatile uint32_t *fenceCpu = vm ? l.fenceCpu : poolDw(kPm4FenceOffset);
+	const uint32_t fenceValue = vm ? l.fenceValue : (pm4Fence + 1);
+	*fenceCpu = 0;
 	flushHdp();
 
-	// Shader memory model for VMID0 (gfx_v12_0_constants_init).
-	grbmSelect(0, 0, 0, 0);
+	// Shader memory model for the selected VMID (gfx_v12_0_constants_init).
+	grbmSelect(0, vm ? l.pipe : 0, vm ? l.queueId : 0, vm ? l.vmid : 0);
 	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
+	if (vm)
+		wr(IpDiscovery::HwGc, ShMemBases, (0x2000u << 16) | 0x1000u);
 
 	const uint32_t pgm[2] = { static_cast<uint32_t>(l.code >> 8), static_cast<uint32_t>(l.code >> 40) };
 	const uint32_t rsrc[2] = { l.rsrc1, (l.rsrc2 & ~kRsrc2LdsMask) | ldsSizeField(l.ldsBytes) };
@@ -1692,7 +1723,7 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	const uint32_t none4[4] = { 0, 0, 0, 0 };
 	const uint32_t start[3] = { 0, 0, 0 };
 
-	Pm4::Queue &q = pm4Queue;
+	Pm4::Queue &q = vm ? *l.queue : pm4Queue;
 	uint32_t pkt[24];
 	q.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync));
 	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmLo), pgm, 2));
@@ -1710,17 +1741,23 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	q.emit(pkt, Pm4::dispatchDirect(pkt, l.groups[0], l.groups[1], l.groups[2],
 	                                Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 |
 	                                (l.wave32 ? Pm4::kDispatchWave32 : 0)));
-	q.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), ++pm4Fence));
+	const uint64_t fenceAddress = vm ? l.fenceAddress : poolMc(kPm4FenceOffset);
+	q.emit(pkt, Pm4::releaseMem(pkt, fenceAddress, fenceValue));
 
 	// Spin for the first 2 ms (short kernels), then sleep between polls:
 	// user dispatches may run for seconds.
 	uint64_t t0 = mach_absolute_time(), span = 0;
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(l.timeoutUs ? l.timeoutUs : 1000000) * 1000,
 	                            &span);
-	pm4Kick(q.wptr());
+	if (vm)
+		pm4Kick(q, l.doorbell, q.wptr());
+	else {
+		pm4Fence = fenceValue;
+		pm4Kick(q.wptr());
+	}
 	bool done = false;
 	for (uint32_t polls = 0;; polls++) {
-		done = *poolDw(kPm4FenceOffset) == pm4Fence;
+		done = *fenceCpu == fenceValue;
 		if (done || mach_absolute_time() - t0 > span)
 			break;
 		if (polls < 200)
@@ -1731,14 +1768,23 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	if (!done) {
 		CLOG("%s: the kernel's fence never came (0x%08x, want 0x%08x)", tag,
-		     *poolDw(kPm4FenceOffset), pm4Fence);
-		grbmSelect(1, 0, 0, 0);
+		     *fenceCpu, fenceValue);
+		grbmSelect(1, vm ? l.pipe : 0, vm ? l.queueId : 0, vm ? l.vmid : 0);
 		CLOG("%s: GRBM 0x%08x CP_STAT 0x%08x CPC 0x%08x CPC_BUSY 0x%08x HQD rptr 0x%x wptr %llu "
 		     "HQ_STATUS0 0x%08x MEC pc 0x%x", tag, rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpCpcStatus),
 		     rdGc(CpCpcBusyStat), rdGc(CpHqdPqRptr), static_cast<unsigned long long>(q.wptr()),
 		     rdGc(CpHqdHqStatus0), rdGc(CpMecRs64InstrPntr));
 		grbmSelect(0, 0, 0, 0);
 		logGcFault(tag);
+	}
+	if (vm) {
+		const uint32_t status = rdGc(GcL2FaultStatusLo);
+		if (status) {
+			const uint64_t address = rdGc(GcL2FaultAddrLo) |
+				(static_cast<uint64_t>(rdGc(GcL2FaultAddrHi)) << 32);
+			CLOG("vmid %u: %s: GC hub fault status 0x%08x address 0x%llx", l.vmid, tag, status, address);
+			vmInvalidate(l.vmid, "dispatch fault clear");
+		}
 	}
 	return done;
 }
