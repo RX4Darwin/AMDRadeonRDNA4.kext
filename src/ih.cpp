@@ -427,6 +427,10 @@ bool RDNA4Compute::ihInit() {
 		} else {
 			HLOG("vblank self-test passed: 5 frames, expected %llu ns", ihDcnExpectedFrameNs);
 			publishResult("vblank", "PASS self-test, 5 frames");
+			// IOGraphics must not be handed a VBL service until the interrupt
+			// path has demonstrated that it can actually deliver five frames.
+			if (ihVblRequested && env.vblankServiceReady)
+				env.vblankServiceReady(env.owner);
 		}
 	}
 	HLOG("self-test totals: SDMA traps %u, CP EOP %u, interrupt wakeups %u",
@@ -436,9 +440,11 @@ bool RDNA4Compute::ihInit() {
 }
 
 void RDNA4Compute::ihDcnStopLocked(const char *why) {
+	// Stop callbacks before touching the DCN source. IONDRV owns the VSL
+	// service lifetime and disposes it through wrapVslDispose.
+	Ndrv::setVblankEnabled(false);
 	if (!ihDcnActive)
 		return;
-	Ndrv::setVblankEnabled(false);
 	if (ihDcnOtg < Pipe::kMaxOtg) {
 		const Reg r { 2, kDcnOtgGlobalSync + ihDcnOtg * kDcnOtgStride };
 		wr(IpDiscovery::HwDmu, r, rd(IpDiscovery::HwDmu, r) & ~kDcnVblankEnable);

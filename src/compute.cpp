@@ -643,7 +643,13 @@ void RDNA4Compute::runStages() {
 }
 
 bool RDNA4Compute::featureAllowed(const char *name) const {
-	return !hungFeature[0] || strcmp(hungFeature, name) != 0;
+	if (hungFeature[0] && !strcmp(hungFeature, name))
+		return false;
+	if (!strcmp(name, "flip")) {
+		uint32_t requested = 0;
+		return PE_parse_boot_argn("rdna4-flip", &requested, sizeof(requested)) && requested != 0;
+	}
+	return true;
 }
 
 // The pool, uncached: the PSP reads what we write there and writes fences
