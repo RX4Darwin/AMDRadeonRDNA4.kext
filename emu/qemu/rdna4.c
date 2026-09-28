@@ -3512,9 +3512,6 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
              * required by the VOP3 forms below. */
             dw2 = 0;
         }
-        if (s->gfx_trace)
-            fprintf(stderr, "rdna4: gfx: wave pc=0x%" PRIx64 " dw=0x%08x exec=0x%08x\\n",
-                    w->pc, dw, w->exec);
 
         if ((dw & 0xff800000u) == 0xbf800000u) {             /* SOPP */
             uint32_t op = (dw >> 16) & 0x7f;
@@ -3552,8 +3549,6 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                 if (!rdna4_gfx_set_sreg(w, dst, old))
                     goto unknown;
                 w->exec = old & rdna4_gfx_sreg(w, dw & 0xff);
-                fprintf(stderr, "rdna4: gfx: saveexec s%u=0x%08x src=0x%08x exec=0x%08x\\n",
-                        dst, old, rdna4_gfx_sreg(w, dw & 0xff), w->exec);
             } else if (op == 0) {                            /* s_mov_b32 */
                 if (!rdna4_gfx_set_sreg(w, dst, value))
                     goto unknown;
@@ -3672,10 +3667,6 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                 }
             } else if (target == 12) {                       /* SQ_EXP_POS */
                 if (!ngg || enable != 0xf) goto unknown;
-                if (s->gfx_trace)
-                    fprintf(stderr, "rdna4: gfx: POS export masks s20=0x%08x s21=0x%08x s22=0x%08x v4=(0x%08x,0x%08x,0x%08x) v5=(0x%08x,0x%08x,0x%08x)\\n",
-                            w->s[20], w->s[21], w->s[22], w->v[4][0], w->v[4][1], w->v[4][2],
-                            w->v[5][0], w->v[5][1], w->v[5][2]);
                 for (unsigned lane = 0; lane < 32; lane++) {
                     if ((w->exec >> lane) & 1u) {
                         for (unsigned c = 0; c < 4; c++)
@@ -3880,8 +3871,6 @@ static bool rdna4_gfx_ps_wave(RDNA4State *s, const RDNA4GfxTriangle *tri,
 
     w.pc = pgm;
     w.exec = count == 32 ? UINT32_MAX : ((1u << count) - 1u);
-    if (s->gfx_trace)
-        fprintf(stderr, "rdna4: gfx: PS wave pgm=0x%" PRIx64 " count=%u\\n", pgm, count);
     for (unsigned lane = 0; lane < count; lane++) {
         float area = (float)rdna4_gfx_edge(
             (int64_t)nearbyintf(tri->x[0] * 256.0f), (int64_t)nearbyintf(tri->y[0] * 256.0f),
@@ -3903,10 +3892,6 @@ static bool rdna4_gfx_ps_wave(RDNA4State *s, const RDNA4GfxTriangle *tri,
     }
     if (!rdna4_gfx_wave_run(s, &w, false, false))
         return false;
-    if (s->gfx_trace)
-        fprintf(stderr, "rdna4: gfx: PS export mask=0x%x valid=0x%08x\\n", w.mrt_enable,
-                (uint32_t)w.mrt_valid[0] | ((uint32_t)w.mrt_valid[1] << 1) |
-                ((uint32_t)w.mrt_valid[2] << 2));
     if (w.mrt_enable != (col_format == 4 ? 3u : 15u)) {
         fprintf(stderr, "rdna4: gfx: PS export mask 0x%x does not match COL0 format %u\n",
                 w.mrt_enable, col_format);
@@ -3988,11 +3973,6 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count)
     if (!ngg.prim_valid[0])
         return rdna4_gfx_draw_refuse(s, "NGG primitive export", "wave 0 did not export a primitive");
     prim = ngg.prim_export[0];
-    if (s->gfx_trace)
-        fprintf(stderr, "rdna4: gfx: NGG exports prim=0x%08x pos_valid=0x%08x exec=0x%08x s8=0x%08x s10=0x%08x s14=0x%08x s15=0x%08x\n",
-                prim, (uint32_t)ngg.pos_valid[0] | ((uint32_t)ngg.pos_valid[1] << 1) |
-                ((uint32_t)ngg.pos_valid[2] << 2), ngg.exec, ngg.s[8], ngg.s[10],
-                ngg.s[14], ngg.s[15]);
     if (prim & (1u << 31)) {
         fprintf(stderr, "rdna4: gfx: draw produced a null primitive\n");
         return true;
@@ -4030,9 +4010,6 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count)
         float area = (tri.x[1] - tri.x[0]) * (tri.y[2] - tri.y[0]) -
                      (tri.y[1] - tri.y[0]) * (tri.x[2] - tri.x[0]);
         uint32_t su = reg_get(s, REG_GFX_PA_SU_SC_MODE_CNTL);
-        if (s->gfx_trace)
-            fprintf(stderr, "rdna4: gfx: NGG positions %.3f,%.3f %.3f,%.3f %.3f,%.3f area=%.3f\\n",
-                    tri.x[0], tri.y[0], tri.x[1], tri.y[1], tri.x[2], tri.y[2], area);
         bool front = area > 0.0f;       /* FACE=CCW in the gfx12 stream */
         int64_t qx[3], qy[3];
         int minx, maxx, miny, maxy;
