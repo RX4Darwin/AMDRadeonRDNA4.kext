@@ -38,9 +38,10 @@ tools/vm-opencore.sh --kext build/RDNA4FB.kext --lilu ~/kexts/Lilu.kext \
 
 # 2. Boot, with the display viewable in a browser.
 setsid nohup python3 -m http.server 6080 --bind 127.0.0.1 --directory ~/noVNC \
-	> ~/novnc-http.log 2>&1 < /dev/null &
+	> ~/novnc-http.log 2>&1 < /dev/null 9>&- &
 : > ~/tahoe-serial.log
-VNC_WS=127.0.0.1:5700 setsid nohup tools/emu-boot.sh > ~/emu-boot.out 2>&1 < /dev/null &
+# (9>&-: the VM outlives this run and must not keep the lock.)
+VNC_WS=127.0.0.1:5700 setsid nohup tools/emu-boot.sh > ~/emu-boot.out 2>&1 < /dev/null 9>&- &
 pick() {        # the OpenCore picker: the macOS entry
 	python3 - <<'PY'
 import socket, time, os
