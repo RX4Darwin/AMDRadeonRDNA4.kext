@@ -68,12 +68,14 @@ triangle acceptance.
 
 ## Known risks
 
-On this card, GC-hub TLB invalidation through the MMIO
-`GCVM_INVALIDATE_ENG17` path may never acknowledge. The emulator reproduces
-that condition with `RDNA4_DEV=inv-noack=on`. In the VM or on hardware, the
-expected diagnostic line is `vmid N: VM invalidate timeout`; this is an
-expected VM FAIL result, not a crash. Compute remains up and per-client GPUVM
-turns off, while the rest of the batch continues. The compact
+VMIDs 8-15 use the GC-hub `GCVM_INVALIDATE_ENG17` MMIO path. On this card it
+acknowledges after `gfx_v12_0_config_gfx_rs64` has run (PFP/ME/MEC start
+addresses plus pipe reset); stage 5 performs that configuration first. The
+emulator reproduces a missing acknowledgement with
+`RDNA4_DEV=inv-noack=on`. If `vmid N: VM invalidate timeout` still appears in
+the VM or on hardware, this is an expected VM FAIL result, not a crash.
+Compute remains up and per-client GPUVM turns off, while the rest of the batch
+continues. The compact
 `RDNA4FB,Results` property records `vm = FAIL invalidate timeout` even if the
 dmesg buffer wrapped. The fix path is in-ring invalidation on the gfx/compute
 ring, planned by W12 D1.
