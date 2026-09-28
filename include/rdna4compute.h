@@ -65,6 +65,10 @@ enum {
 	kRDNA4MethodPresent,
 	/* restore the desktop surface for this connection */
 	kRDNA4MethodRestore,
+	/* handle, byte offset -> present id, width | height<<16, pitch */
+	kRDNA4MethodPresentAsync,
+	/* present id, timeout ms -> latched OTG frame count */
+	kRDNA4MethodWaitPresent,
 	kRDNA4MethodCount
 };
 

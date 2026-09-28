@@ -25,13 +25,26 @@
 #include <IOKit/IODMACommand.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOWorkLoop.h>
 #include <kern/clock.h>
+#include <libkern/c++/OSObject.h>
 
 #define RLOG(fmt, ...)  IOLog("RDNA4FB: runtime: " fmt "\n", ## __VA_ARGS__)
 
 using namespace GfxReg;
 
 namespace {
+
+class RDNA4PresentContext : public OSObject {
+	OSDeclareDefaultStructors(RDNA4PresentContext);
+
+public:
+	RDNA4Compute *compute { nullptr };
+	bool init() override { return OSObject::init(); }
+};
+
+OSDefineMetaClassAndStructors(RDNA4PresentContext, OSObject);
 
 // Handles: (generation << 16) | (slot + 1), so 0 is never one and a stale
 // handle of a reused slot does not match.
@@ -120,6 +133,8 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 	else
 		RLOG("user-space runtime up: %s, CPU transfers, heap %llu MiB at MC 0x%llx",
 		     RDNA4_COMPUTE_SERVICE, heap.size() >> 20, poolMc(kHeapOffset));
+	if (!initPresentationTimer())
+		RLOG("present async disabled: no runtime work-loop timer");
 }
 
 RDNA4Compute::RtBuffer *RDNA4Compute::bufferFor(const void *owner, uint64_t handle) {
@@ -487,6 +502,147 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	return kIOReturnSuccess;
 }
 
+bool RDNA4Compute::initPresentationTimer() {
+	if (presentTimer)
+		return true;
+	if (!env.owner || !(presentWorkLoop = env.owner->getWorkLoop()))
+		return false;
+	auto *context = OSTypeAlloc(RDNA4PresentContext);
+	if (!context || !context->init()) {
+		OSSafeReleaseNULL(context);
+		presentWorkLoop = nullptr;
+		return false;
+	}
+	context->compute = this;
+	presentContext = context;
+	presentTimer = IOTimerEventSource::timerEventSource(context, presentTimerAction);
+	if (!presentTimer || presentWorkLoop->addEventSource(presentTimer) != kIOReturnSuccess) {
+		OSSafeReleaseNULL(presentTimer);
+		context->compute = nullptr;
+		context->release();
+		presentContext = nullptr;
+		presentWorkLoop = nullptr;
+		return false;
+	}
+	return true;
+}
+
+void RDNA4Compute::stopPresentationTimer() {
+	if (presentTimer) {
+		presentTimer->cancelTimeout();
+		if (presentWorkLoop)
+			presentWorkLoop->removeEventSource(presentTimer);
+		presentTimer->release();
+		presentTimer = nullptr;
+	}
+	if (presentContext) {
+		static_cast<RDNA4PresentContext *>(presentContext)->compute = nullptr;
+		presentContext->release();
+		presentContext = nullptr;
+	}
+	presentWorkLoop = nullptr;
+}
+
+void RDNA4Compute::schedulePresentationTimer() {
+	if (presentTimer)
+		presentTimer->setTimeoutMS(1);
+}
+
+void RDNA4Compute::presentTimerAction(OSObject *owner, IOTimerEventSource *) {
+	auto *context = static_cast<RDNA4PresentContext *>(owner);
+	if (context && context->compute)
+		context->compute->presentTimerTick();
+}
+
+RDNA4Compute::PresentSlot *RDNA4Compute::presentSlot(uint64_t id, const void *owner) {
+	for (PresentSlot &slot : presentSlots)
+		if (slot.state && slot.id == id && slot.owner == owner)
+			return &slot;
+	return nullptr;
+}
+
+void RDNA4Compute::completePresentLocked(PresentSlot &slot, IOReturn result, uint64_t frame) {
+	if (slot.state == 1 && presentPending)
+		presentPending--;
+	slot.state = 2;
+	slot.result = result;
+	slot.frame = frame;
+}
+
+void RDNA4Compute::dropPendingPresentsLocked(IOReturn result) {
+	for (PresentSlot &slot : presentSlots)
+		if (slot.state == 1)
+			completePresentLocked(slot, result, 0);
+	if (!presentActive) {
+		presentOwner = nullptr;
+		presentHandle = 0;
+		presentOffset = 0;
+		presentSurface = {};
+	}
+}
+
+void RDNA4Compute::presentTimerTick() {
+	uint64_t id = 0;
+	const void *owner = nullptr;
+	Flip::Surface surface {};
+	for (;;) {
+		{
+			Locked g(rtLock);
+			checkPresentationTimeoutLocked();
+			for (const PresentSlot &slot : presentSlots) {
+				if (slot.state == 1 && (!id || slot.id < id)) {
+					id = slot.id;
+					owner = slot.owner;
+				}
+			}
+			if (!id)
+				return;
+			surface = presentSurface;
+		}
+
+		uint64_t frame = 0;
+		if (!Flip::waitNextVblank(*this, surface.otg, 100, frame)) {
+			if (presentTimer)
+				schedulePresentationTimer();
+			return;
+		}
+
+		bool again = false;
+		{
+			Locked g(rtLock);
+			checkPresentationTimeoutLocked();
+			PresentSlot *slot = presentSlot(id, owner);
+			if (slot && slot->state == 1) {
+				RtBuffer *buffer = bufferFor(owner, slot->handle);
+				const uint64_t bytes = Flip::surfaceBytes(surface.pitch, surface.height);
+				if (!buffer || !buffer->device || (slot->offset & 255u) ||
+				    slot->offset > buffer->bytes || bytes > buffer->bytes - slot->offset ||
+				    slot->offset > ~0ull - buffer->mc) {
+					completePresentLocked(*slot, kIOReturnAborted, 0);
+				} else if (!Flip::flipTo(*this, surface, buffer->mc + slot->offset, "present async")) {
+					completePresentLocked(*slot, kIOReturnNotResponding, 0);
+					if (!presentActive)
+						clearPresentationLocked();
+				} else {
+					presentActive = true;
+					presentOwner = owner;
+					presentHandle = slot->handle;
+					presentOffset = slot->offset;
+					presentStarted = mach_absolute_time();
+					presentSurface = surface;
+					completePresentLocked(*slot, kIOReturnSuccess, frame);
+				}
+			}
+			if (!presentActive && !presentPending)
+				clearPresentationLocked();
+			again = presentPending != 0;
+		}
+		if (again)
+			schedulePresentationTimer();
+		return;
+	}
+}
+
 void RDNA4Compute::clearPresentationLocked() {
 	presentActive = false;
 	presentOwner = nullptr;
@@ -497,8 +653,11 @@ void RDNA4Compute::clearPresentationLocked() {
 }
 
 IOReturn RDNA4Compute::restorePresentationLocked(const char *why) {
-	if (!presentActive)
+	dropPendingPresentsLocked(kIOReturnAborted);
+	if (!presentActive) {
+		clearPresentationLocked();
 		return kIOReturnSuccess;
+	}
 	const bool restored = Flip::flipTo(*this, presentSurface, presentSurface.desktop,
 	                                   why ? why : "restore");
 	if (restored)
@@ -785,7 +944,6 @@ IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t of
 	checkPresentationTimeoutLocked();
 	if (!rtReady)
 		return kIOReturnNotReady;
-
 	Flip::Surface surface {};
 	if (!handle) {
 		if (!Flip::findPipe(*this, surface))
@@ -795,8 +953,9 @@ IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t of
 		pitch = surface.pitch;
 		return kIOReturnSuccess;
 	}
-	if (presentActive && presentOwner != owner)
+	if (presentOwner && presentOwner != owner)
 		return kIOReturnBusy;
+	dropPendingPresentsLocked(kIOReturnAborted);
 	RtBuffer *b = bufferFor(owner, handle);
 	if (!b || !b->device || (offset & 255u))
 		return kIOReturnBadArgument;
@@ -825,10 +984,84 @@ IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t of
 	return kIOReturnSuccess;
 }
 
+IOReturn RDNA4Compute::rtPresentAsync(const void *owner, uint64_t handle, uint64_t offset,
+                                      uint64_t &presentId) {
+	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
+	if (!rtReady)
+		return kIOReturnNotReady;
+	if (!presentTimer)
+		return kIOReturnNotReady;
+	if (presentOwner && presentOwner != owner)
+		return kIOReturnBusy;
+	if (presentPending >= 2)
+		return kIOReturnBusy;
+	RtBuffer *b = bufferFor(owner, handle);
+	if (!b || !b->device || (offset & 255u))
+		return kIOReturnBadArgument;
+
+	Flip::Surface surface = presentSurface;
+	if (!presentOwner && !Flip::findPipe(*this, surface))
+		return kIOReturnNotReady;
+	const uint64_t bytes = Flip::surfaceBytes(surface.pitch, surface.height);
+	if (!bytes || offset > b->bytes || bytes > b->bytes - offset || offset > ~0ull - b->mc)
+		return kIOReturnBadArgument;
+	PresentSlot *slot = nullptr;
+	for (PresentSlot &candidate : presentSlots)
+		if (!candidate.state) {
+			slot = &candidate;
+			break;
+		}
+	if (!slot)
+		return kIOReturnBusy;
+	if (!presentOwner) {
+		presentOwner = owner;
+		presentSurface = surface;
+	}
+	presentId = nextPresentId++;
+	if (!presentId)
+		presentId = nextPresentId++;
+	*slot = PresentSlot { owner, handle, offset, presentId, 0, kIOReturnSuccess, 1 };
+	presentPending++;
+	schedulePresentationTimer();
+	RLOG("present async: queued id %llu buffer 0x%llx +0x%llx (%u/%u pending)",
+	     presentId, handle, offset, presentPending, 2u);
+	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4Compute::rtWaitPresent(const void *owner, uint64_t presentId, uint32_t timeoutMs,
+                                     uint64_t &frame) {
+	if (!presentId || timeoutMs > RDNA4_MAX_TIMEOUT_MS)
+		return kIOReturnBadArgument;
+	if (!timeoutMs)
+		timeoutMs = 1000;
+	uint64_t span = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000ull, &span);
+	const uint64_t start = mach_absolute_time();
+	for (;;) {
+		{
+			Locked g(rtLock);
+			checkPresentationTimeoutLocked();
+			PresentSlot *slot = presentSlot(presentId, owner);
+			if (!slot)
+				return kIOReturnBadArgument;
+			if (slot->state == 2) {
+				const IOReturn result = slot->result;
+				frame = slot->frame;
+				*slot = PresentSlot {};
+				return result;
+			}
+		}
+		if (mach_absolute_time() - start >= span)
+			return kIOReturnTimeout;
+		IOSleep(1);
+	}
+}
+
 IOReturn RDNA4Compute::rtRestore(const void *owner) {
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
-	if (!presentActive)
+	if (!presentOwner)
 		return kIOReturnSuccess;
 	if (presentOwner != owner)
 		return kIOReturnBusy;
@@ -840,8 +1073,11 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		return;
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
-	if (presentActive && presentOwner == owner)
+	if (presentOwner == owner)
 		(void)restorePresentationLocked("client close");
+	for (PresentSlot &slot : presentSlots)
+		if (slot.owner == owner)
+			slot = PresentSlot {};
 	RtClient *c = clientFor(owner);
 	uint32_t nb = 0, np = 0;
 	for (RtBuffer &b : buffers) {

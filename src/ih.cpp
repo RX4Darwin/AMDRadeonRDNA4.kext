@@ -106,6 +106,7 @@ void ihEventAction(OSObject *owner, IOInterruptEventSource *, int) {
 } // namespace
 
 RDNA4Compute::~RDNA4Compute() {
+	stopPresentationTimer();
 	ihStop();
 }
 

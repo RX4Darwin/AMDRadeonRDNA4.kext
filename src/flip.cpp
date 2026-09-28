@@ -115,6 +115,30 @@ bool findPipe(RDNA4Compute &compute, Surface &out) {
 	return true;
 }
 
+bool waitNextVblank(RDNA4Compute &compute, uint8_t otg, uint32_t timeoutMs,
+                    uint64_t &frame) {
+	auto dmuRead = [&](uint32_t dword) {
+		return compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { 2, dword });
+	};
+	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otg * Pipe::Reg::kOtgStride;
+	const uint32_t before = dmuRead(reg);
+	if (before == kBad)
+		return false;
+	uint64_t span = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000ull, &span);
+	const uint64_t start = mach_absolute_time();
+	for (;;) {
+		const uint32_t current = dmuRead(reg);
+		if (current != kBad && ((current - before) & 0xffffffu)) {
+			frame = current & 0xffffffu;
+			return true;
+		}
+		if (mach_absolute_time() - start >= span)
+			return false;
+		IOSleep(1);
+	}
+}
+
 bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
             const char *name, uint64_t *latencyUs) {
 	auto dmuRead = [&](uint8_t segment, uint32_t dword) {
