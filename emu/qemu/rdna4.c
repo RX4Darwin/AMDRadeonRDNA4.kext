@@ -6151,6 +6151,9 @@ static void rdna4_reset(DeviceState *dev)
         if (s->warm_dma_window)
             fprintf(stderr, "rdna4: warm-keep: DMA-after-reset writes: %" PRIu64 "\n",
                     s->dma_after_reset_writes);
+        else if (!rdna4_bus_master_enabled(s))
+            fprintf(stderr, "rdna4: warm-keep: DMA-after-reset writes: 0 "
+                    "(bus master was off at reset)\n");
         s->warm_dma_window = true;
         s->dma_after_reset_writes = 0;
         fprintf(stderr, "rdna4: warm-keep: reset preserves IH/SDMA/MEC/GFX; "
