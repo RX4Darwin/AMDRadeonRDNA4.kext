@@ -770,9 +770,10 @@ void RDNA4Compute::presentTimerTick() {
 		return;
 
 	uint64_t frame = 0;
-	// A zero-time poll keeps the IOGraphics work-loop gate free.  The
-	// timer is re-armed a bounded number of times if the display stopped.
-	if (!Flip::waitNextVblank(*this, surface.otg, 0, frame)) {
+	// A one-millisecond bounded poll avoids the old 100 ms work-loop stall,
+	// while still giving the emulator/card a chance to advance the frame
+	// counter between timer callbacks.  Re-arming remains bounded below.
+	if (!Flip::waitNextVblank(*this, surface.otg, 1, frame)) {
 		if (!IOLockTryLock(rtLock)) {
 			schedulePresentationTimer();
 			return;
