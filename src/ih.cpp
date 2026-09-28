@@ -64,12 +64,8 @@ constexpr uint32_t kDcnHubpFlipInterrupt    = 0x0617;
 constexpr uint32_t kDcnOtgStride            = 0x80;
 constexpr uint32_t kDcnHubpStride           = 0xdc;
 constexpr uint32_t kDcnVblankEnable        = 1u << 0;
-constexpr uint32_t kDcnVblankOccurred      = 1u << 2;
-constexpr uint32_t kDcnVblankStatus        = 1u << 3;
 constexpr uint32_t kDcnVblankAck           = 1u << 4;
 constexpr uint32_t kDcnPflipEnable        = 1u << 0;
-constexpr uint32_t kDcnPflipOccurred      = 1u << 16;
-constexpr uint32_t kDcnPflipStatus        = 1u << 17;
 constexpr uint32_t kDcnPflipAck           = 1u << 8;
 
 class RDNA4IHContext : public OSObject {
