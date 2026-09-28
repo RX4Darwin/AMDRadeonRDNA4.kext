@@ -403,6 +403,69 @@ peers_cleanup:
 static uint32_t aOf(uint32_t i) { return i * 2654435761u; }
 static uint32_t bOf(uint32_t i, uint32_t round) { return (i ^ 0x5A5A5A5Au) + round * 0x01000193u; }
 
+/* The host buffer test deliberately uses only the returned CPU pointers.  A
+ * stale GPU VA is dispatched once after Free so the VM fault path is covered
+ * without attempting to read the unmapped handle. */
+static int testHostZeroCopy(rdna4_t *gpu, const rdna4_program_t *prog, uint32_t items) {
+	const uint64_t bytes = (uint64_t)items * 4;
+	rdna4_buffer_t a = {}, b = {}, c = {};
+	uint32_t *ha = NULL, *hb = NULL, *hc = NULL;
+	void *pa = NULL, *pb = NULL, *pc = NULL;
+	kern_return_t kr;
+	int fails = 0;
+	if ((kr = rdna4_alloc_host(gpu, bytes, &a, &pa)) ||
+	    (kr = rdna4_alloc_host(gpu, bytes, &b, &pb)) ||
+	    (kr = rdna4_alloc_host(gpu, bytes, &c, &pc))) {
+		printf("  FAIL  host buffer allocation: %s\n", rdna4_error(kr));
+		if (c.handle) rdna4_free(gpu, &c);
+		if (b.handle) rdna4_free(gpu, &b);
+		if (a.handle) rdna4_free(gpu, &a);
+		return 1;
+	}
+	ha = (uint32_t *)pa;
+	hb = (uint32_t *)pb;
+	hc = (uint32_t *)pc;
+	for (uint32_t i = 0; i < items; i++) {
+		ha[i] = aOf(i);
+		hb[i] = bOf(i, 23);
+		hc[i] = 0xdeadbeefu;
+	}
+	const uint64_t args[3] = { a.gpu, b.gpu, c.gpu };
+	const uint32_t groups[3] = { items / 64, 1, 1 }, size[3] = { 64, 1, 1 };
+	if ((kr = rdna4_dispatch(gpu, prog, groups, size, args, sizeof(args), 5000, NULL))) {
+		printf("  FAIL  host-memory vadd dispatch: %s\n", rdna4_error(kr));
+		fails++;
+	} else {
+		uint32_t bad = 0;
+		for (uint32_t i = 0; i < items; i++)
+			bad += hc[i] != ha[i] + 3 * hb[i];
+		if (bad) {
+			printf("  FAIL  zero-copy vadd: %u of %u CPU-visible results wrong\n", bad, items);
+			fails++;
+		} else {
+			printf("  ok    zero-copy vadd: %u items read/written through CPU pointers\n", items);
+		}
+	}
+	const uint64_t stale = c.gpu;
+	if (rdna4_free(gpu, &c)) {
+		printf("  FAIL  free host result buffer\n");
+		fails++;
+	} else {
+		const uint64_t badArgs[3] = { a.gpu, b.gpu, stale };
+		kr = rdna4_dispatch(gpu, prog, groups, size, badArgs, sizeof(badArgs), 1000, NULL);
+		if (kr == kIOReturnTimeout) {
+			printf("  FAIL  dispatch through freed host VA timed out\n");
+			fails++;
+		} else {
+			printf("  ok    dispatch through freed host VA faulted cleanly (%s)\n",
+			       kr ? rdna4_error(kr) : "GPU fence landed after fault");
+		}
+	}
+	rdna4_free(gpu, &b);
+	rdna4_free(gpu, &a);
+	return fails;
+}
+
 static double nowUs(void) {
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
@@ -715,8 +778,16 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 	if (cmdInfo(gpu))
 		return 1;
 	rdna4_info_t initial;
-	if (rdna4_info(gpu, &initial) == KERN_SUCCESS && (initial.flags & RDNA4_FLAG_VM))
+	const int gpuVm = rdna4_info(gpu, &initial) == KERN_SUCCESS &&
+	                  (initial.flags & RDNA4_FLAG_VM);
+	if (gpuVm)
 		fails += testVmIsolationAndPeers(gpu);
+	else {
+		rdna4_buffer_t host = {};
+		void *cpu = NULL;
+		fails += checkFailed("AllocHost without GPUVM",
+		                     rdna4_alloc_host(gpu, 4096, &host, &cpu));
+	}
 
 	rdna4_program_t prog;
 	kern_return_t kr = rdna4_load(gpu, kVaddCodeObject, sizeof(kVaddCodeObject), "vadd", &prog);
@@ -726,6 +797,8 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 	}
 	printf("vadd: %llu-byte image, %llu bytes of kernargs, RSRC1 0x%08llx RSRC2 0x%08llx\n",
 	       prog.imageBytes, prog.kernargBytes, prog.rsrc1, prog.rsrc2);
+	if (gpuVm)
+		fails += testHostZeroCopy(gpu, &prog, items);
 
 	const uint64_t bytes = (uint64_t)items * 4;
 	rdna4_buffer_t a, b, c;
@@ -993,10 +1066,13 @@ static int cmdBench(rdna4_t *gpu, int small) {
 	       sgemm.ldsBytes);
 	printf("hgemm: 128x128 tiles, 8 waves of WMMA 16x16x16 (FP16/BF16 in, FP32 sums), %llu bytes "
 	       "of LDS per work-group\n", gemm16[0].ldsBytes);
-	int vm = 0;
-	size_t vmLen = sizeof(vm);
-	if (!sysctlbyname("kern.hv_vmm_present", &vm, &vmLen, NULL, 0) && vm)
+	int inVm = 0;
+	size_t vmLen = sizeof(inVm);
+	if (!sysctlbyname("kern.hv_vmm_present", &inVm, &vmLen, NULL, 0) && inVm)
 		printf("note: running in a VM — the GPU is emulated there, its speeds are not real\n");
+	rdna4_info_t info = {};
+	const int gpuVm = rdna4_info(gpu, &info) == KERN_SUCCESS &&
+	                  (info.flags & RDNA4_FLAG_VM);
 	const int blas = cblas_sgemm != NULL;
 	if (!blas)
 		printf("note: Accelerate is not available here: no CPU comparison\n");
@@ -1028,6 +1104,46 @@ static int cmdBench(rdna4_t *gpu, int small) {
 		       xfer / (t1 - t0), xfer / (t2 - t1), xfer >> 20);
 	}
 	rdna4_free(gpu, &x);
+
+	/* GPU-side read from a system-memory PTE into a VRAM destination. */
+	if (gpuVm) {
+		const uint64_t hostBytes = small ? (4u << 20) : (64u << 20);
+		rdna4_buffer_t host = {}, device = {};
+		void *cpu = NULL;
+		if ((kr = rdna4_alloc_host(gpu, hostBytes, &host, &cpu)) ||
+		    (kr = rdna4_alloc(gpu, hostBytes, &device))) {
+			printf("  FAIL  host-memory benchmark setup: %s\n", rdna4_error(kr));
+			fails++;
+			if (device.handle) rdna4_free(gpu, &device);
+			if (host.handle) rdna4_free(gpu, &host);
+		} else {
+			for (uint64_t i = 0; i < hostBytes; i++)
+				((uint8_t *)cpu)[i] = (uint8_t)(i * 17 + 11);
+			const uint64_t args[2] = { host.gpu, device.gpu };
+			const uint32_t groups[3] = { (uint32_t)(hostBytes / 16 / 256), 1, 1 };
+			const uint32_t size[3] = { 256, 1, 1 };
+			uint64_t best = ~0ull;
+			for (int r = 0; r < (small ? 1 : 5) && !kr; r++) {
+				uint64_t us = 0;
+				kr = rdna4_dispatch(gpu, &copy, groups, size, args, sizeof(args), 10000, &us);
+				if (us < best) best = us;
+			}
+			uint8_t *check = malloc(64u << 10);
+			int same = check && !kr && !rdna4_read(gpu, &device, 0, check, 64u << 10) &&
+			           !memcmp(check, cpu, 64u << 10);
+			if (kr || !same) {
+				printf("  FAIL  GPU read from host memory: %s\n",
+				       kr ? rdna4_error(kr) : "data differs");
+				fails++;
+			} else {
+				printf("  ok    GPU read host->VRAM %llu MiB: %.1f GB/s (%llu us)\n",
+				       hostBytes >> 20, hostBytes / (double)best / 1000.0, best);
+			}
+			free(check);
+			rdna4_free(gpu, &device);
+			rdna4_free(gpu, &host);
+		}
+	}
 
 	// 2. VRAM bandwidth: `copy` reads and writes 16 bytes per work-item.
 	const uint64_t cb = dma ? (small ? (4u << 20) : (256u << 20)) : (small ? (1u << 20) : (32u << 20));

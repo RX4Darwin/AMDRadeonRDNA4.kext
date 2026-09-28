@@ -1919,6 +1919,15 @@ static int testGpuVm() {
 	                  pde1 == (0x0000000000410000ull | GpuVm::kValid) &&
 	                  pde0 == (0x0000000000420000ull | GpuVm::kValid),
 	                  "gfx12 regular PDEs encode GPU physical address and VALID only");
+	const uint64_t bus = 0x00000012345000ull;
+	const uint64_t systemPte = GpuVm::encodePte(
+		bus, GpuVm::kSystem | GpuVm::kSnooped | GpuVm::kValid |
+		GpuVm::kReadable | GpuVm::kWritable, false);
+	failures += check(systemPte == ((bus & GpuVm::kPhysicalMask) |
+		                              GpuVm::kSystem | GpuVm::kSnooped |
+		                              GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable) &&
+	                  !(systemPte & GpuVm::kFragMask) && !(systemPte & GpuVm::kMtypeMask),
+	                  "gfx12 system PTE encodes bus address, SYSTEM/SNOOPED and cached MTYPE_NC");
 	uint64_t converted = 0;
 	failures += check(GpuVm::mcToPhysical(0x0000008012345000ull, 0x0000008000000000ull,
 	                                      0x12, converted) &&

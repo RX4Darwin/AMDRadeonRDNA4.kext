@@ -59,6 +59,23 @@ kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out) {
 	return kr;
 }
 
+kern_return_t rdna4_alloc_host(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out,
+                                void **cpu) {
+	const uint64_t in[2] = { bytes, 0 };
+	uint64_t o[3] = { 0 };
+	uint32_t n = 3;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodAllocHost,
+	                                             in, 2, o, &n);
+	if (kr == KERN_SUCCESS) {
+		out->handle = o[0];
+		out->gpu = o[1];
+		out->bytes = bytes;
+		if (cpu)
+			*cpu = (void *)(uintptr_t)o[2];
+	}
+	return kr;
+}
+
 kern_return_t rdna4_free(rdna4_t *dev, const rdna4_buffer_t *buf) {
 	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodFree, &buf->handle, 1, NULL, NULL);
 }
