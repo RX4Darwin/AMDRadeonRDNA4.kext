@@ -416,6 +416,7 @@ typedef struct RDNA4Cursor {
     bool valid;
     uint64_t offset;
     uint32_t width, height;
+    uint32_t pitch;
     int32_t x, y;
 } RDNA4Cursor;
 
@@ -3877,11 +3878,15 @@ static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so, RDNA4Cursor 
     const uint32_t cm = reg_get(s, SEG2(CURSOR_CM_CONTROL + dpp));
     const uint32_t scaleGy = reg_get(s, SEG2(CURSOR_CM_SCALE_GY + dpp)) & 0xffff;
     const uint32_t scaleRb = reg_get(s, SEG2(CURSOR_CM_SCALE_RB + dpp)) & 0xffff;
+    /* HUBP_CURSOR_CONTROL.CURSOR_PITCH follows the DCN card contract:
+     * codes 0/1/2 select 64/128/256 pixels per fetched row. */
+    const uint32_t pitchCode = (control >> CURSOR_PITCH_SHIFT) & 3;
+    const uint32_t pitch = 64u << pitchCode;
     if (!(control & 1) || !(cm & CURSOR_CM_ENABLE))
         return false;
     if (!(control & CURSOR_REQ_MODE) ||
         ((control >> CURSOR_MODE_SHIFT) & 7) != 2 ||
-        ((control >> CURSOR_PITCH_SHIFT) & 3) != 0 ||
+        pitchCode > 2 ||
         scaleGy != CURSOR_FP16_ONE || scaleRb != CURSOR_FP16_ONE) {
         if (!s->cursor_reject_logged || s->trace)
             fprintf(stderr, "rdna4: cursor: rejected control=0x%08x cm=0x%08x scale=0x%04x/%04x\n",
@@ -3896,7 +3901,7 @@ static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so, RDNA4Cursor 
         ((uint64_t)(reg_get(s, SEG2(HUBP_CURSOR_ADDRESS_HI + hp)) & 0xffff) << 32);
     const uint64_t fb = (uint64_t)(reg_get(s, SEG2(DCN_VM_FB_LOC_BASE)) & 0xffffff) << 24;
     if (!width || !height || width > 64 || height > 64 || address < fb ||
-        address - fb + (uint64_t)width * height * 4 > rdna4_vram_size()) {
+        address - fb + (uint64_t)pitch * height * 4 > rdna4_vram_size()) {
         if (!s->cursor_reject_logged || s->trace)
             fprintf(stderr, "rdna4: cursor: rejected size=%ux%u address=0x%" PRIu64
                     " fb=0x%" PRIu64 "\n", width, height, address, fb);
@@ -3913,6 +3918,7 @@ static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so, RDNA4Cursor 
     cursor->offset = address - fb;
     cursor->width = width;
     cursor->height = height;
+    cursor->pitch = pitch;
     cursor->x = x - (int32_t)((hot >> 16) & 0xff);
     cursor->y = y - (int32_t)(hot & 0xff);
     s->cursor_reject_logged = false;
@@ -3928,7 +3934,7 @@ static void rdna4_blend_cursor(RDNA4State *s, const RDNA4Scanout *so,
     if (!so->cursor.valid)
         return;
     uint8_t *sprite = rdna4_vram_span(s, so->cursor.offset,
-                                      (uint64_t)so->cursor.width * so->cursor.height * 4);
+                                      (uint64_t)so->cursor.pitch * so->cursor.height * 4);
     if (!sprite)
         return;
     uint8_t *dst = surface_data(surface);
@@ -3941,7 +3947,7 @@ static void rdna4_blend_cursor(RDNA4State *s, const RDNA4Scanout *so,
             int32_t dx = so->cursor.x + (int32_t)x;
             if (dx < 0 || dx >= (int32_t)so->width)
                 continue;
-            uint32_t src = ldl_le_p(sprite + ((uint64_t)y * so->cursor.width + x) * 4);
+            uint32_t src = ldl_le_p(sprite + ((uint64_t)y * so->cursor.pitch + x) * 4);
             uint32_t alpha = src >> 24;
             if (!alpha)
                 continue;
