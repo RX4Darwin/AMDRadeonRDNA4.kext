@@ -3688,8 +3688,13 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
     return false;
 
 unknown:
+    {
+        uint32_t bad_dw = 0;
+        uint32_t ignored = 0;
+        rdna4_gfx_read_code(s, w->pc, &bad_dw, &ignored);
     fprintf(stderr, "rdna4: gfx: %s shader unsupported instruction 0x%08x at pc 0x%" PRIx64 "\n",
-            ngg ? "NGG" : "PS", dw, w->pc);
+            ngg ? "NGG" : "PS", bad_dw, w->pc);
+    }
     return false;
 }
 
