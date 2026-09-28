@@ -3962,6 +3962,10 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count)
     if (!ngg.prim_valid[0])
         return rdna4_gfx_draw_refuse(s, "NGG primitive export", "wave 0 did not export a primitive");
     prim = ngg.prim_export[0];
+    if (s->gfx_trace)
+        fprintf(stderr, "rdna4: gfx: NGG exports prim=0x%08x pos_valid=0x%08x exec=0x%08x\n",
+                prim, (uint32_t)ngg.pos_valid[0] | ((uint32_t)ngg.pos_valid[1] << 1) |
+                ((uint32_t)ngg.pos_valid[2] << 2), ngg.exec);
     if (prim & (1u << 31)) {
         fprintf(stderr, "rdna4: gfx: draw produced a null primitive\n");
         return true;
