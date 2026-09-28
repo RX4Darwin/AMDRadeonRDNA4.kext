@@ -336,6 +336,17 @@ constexpr uint32_t kRsrc1MemOrdered    = 1u << 30;
 // COMPUTE_PGM_RSRC2: USER_SGPR [5:1], TGID_X_EN [7], TIDIG_COMP_CNT [12:11].
 constexpr uint32_t kRsrc2UserSgprShift = 1;
 constexpr uint32_t kRsrc2TgidXEn       = 1u << 7;
+// COMPUTE_PGM_RSRC2.LDS_SIZE [23:15]: the work-group's LDS, which the driver
+// fills in for a PM4 dispatch (the code object leaves it 0). Mesa's
+// ac_shader_encode_lds_size for gfx12 compute: align to the 1 KiB
+// allocation granularity, encode in 512-byte units.
+constexpr uint32_t kRsrc2LdsShift = 15, kRsrc2LdsMask = 0x1ffu << 15;
+constexpr uint32_t kLdsAllocGranule = 1024, kLdsEncodeGranule = 512;
+constexpr uint32_t kMaxLdsPerGroup = 65536;
+constexpr uint32_t ldsSizeField(uint32_t bytes) {
+	return ((bytes + kLdsAllocGranule - 1) / kLdsAllocGranule * kLdsAllocGranule / kLdsEncodeGranule)
+	       << kRsrc2LdsShift;
+}
 
 // --- NBIF 6.3.1 doorbell aperture and routing into GC (seg 2)
 constexpr Reg NbifDoorbellAperEn  { 2, 0x00c0 };   // RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN [0]

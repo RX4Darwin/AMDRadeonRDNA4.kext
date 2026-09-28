@@ -17,7 +17,8 @@
  *    Load       an AMDGPU code object (clang -mcpu=gfx1201, ld.lld -shared)
  *               and pick one kernel by name.
  *    Dispatch   run it over a 3-D grid with the caller's kernarg bytes, and
- *               wait for it (the timeout is the caller's).
+ *               wait for it (the timeout is the caller's). Each work-group
+ *               gets the kernel's own LDS plus dynamicLdsBytes.
  *  Buffers and programs belong to the connection and are freed with it.
  */
 
@@ -27,7 +28,7 @@
 #include <stdint.h>
 
 #define RDNA4_COMPUTE_SERVICE   "RDNA4ComputeService"
-#define RDNA4_COMPUTE_ABI       1u
+#define RDNA4_COMPUTE_ABI       2u   /* 2: dynamic LDS in RDNA4Dispatch */
 
 /* Largest kernarg block a dispatch carries; bytes past what the caller
  * passes, up to the kernel's own kernarg size, are zero. */
@@ -35,6 +36,7 @@
 #define RDNA4_MAX_NAME          64u        /* kernel name, NUL included */
 #define RDNA4_MAX_CODE_OBJECT   (4u << 20) /* ELF bytes accepted by Load */
 #define RDNA4_MAX_TIMEOUT_MS    10000u
+#define RDNA4_MAX_LDS           65536u     /* per work-group: static + dynamic */
 
 /* Selectors: scalar inputs -> scalar outputs, unless a struct is named. */
 enum {
@@ -49,7 +51,8 @@ enum {
 	/* handle, offset, user address, length: buffer -> user memory */
 	kRDNA4MethodRead,
 	/* user address, length of the ELF; struct in: kernel name (NUL-terminated)
-	 * -> program, kernarg bytes, code bytes, RSRC1, RSRC2, RSRC3, properties */
+	 * -> program, kernarg bytes, image bytes, RSRC1, RSRC2, RSRC3, properties,
+	 *    static LDS bytes */
 	kRDNA4MethodLoad,
 	/* program */
 	kRDNA4MethodUnload,
@@ -67,7 +70,7 @@ typedef struct {
 	uint32_t groupSize[3];      /* work-items per group; product <= 1024 */
 	uint32_t timeoutMs;         /* 0 = 1000, at most RDNA4_MAX_TIMEOUT_MS */
 	uint32_t kernargBytes;      /* valid bytes in kernargs */
-	uint32_t reserved;          /* 0 */
+	uint32_t dynamicLdsBytes;   /* LDS beyond the kernel's static size (ABI 1: reserved, 0) */
 	uint8_t  kernargs[RDNA4_MAX_KERNARG];
 } RDNA4Dispatch;
 

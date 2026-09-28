@@ -82,8 +82,8 @@ kern_return_t rdna4_load(rdna4_t *dev, const void *elf, size_t bytes, const char
 	if (nameBytes > RDNA4_MAX_NAME)
 		return kIOReturnBadArgument;
 	const uint64_t in[2] = { (uint64_t)(uintptr_t)elf, bytes };
-	uint64_t o[7] = { 0 };
-	uint32_t n = 7;
+	uint64_t o[8] = { 0 };
+	uint32_t n = 8;
 	kern_return_t kr = IOConnectCallMethod(dev->conn, kRDNA4MethodLoad, in, 2, kernel, nameBytes,
 	                                       o, &n, NULL, NULL);
 	if (kr == KERN_SUCCESS) {
@@ -94,6 +94,7 @@ kern_return_t rdna4_load(rdna4_t *dev, const void *elf, size_t bytes, const char
 		out->rsrc2 = o[4];
 		out->rsrc3 = o[5];
 		out->properties = o[6];
+		out->ldsBytes = o[7];
 	}
 	return kr;
 }
@@ -105,6 +106,14 @@ kern_return_t rdna4_unload(rdna4_t *dev, const rdna4_program_t *prog) {
 kern_return_t rdna4_dispatch(rdna4_t *dev, const rdna4_program_t *prog, const uint32_t groups[3],
                              const uint32_t groupSize[3], const void *kernargs,
                              uint32_t kernargBytes, uint32_t timeoutMs, uint64_t *micros) {
+	return rdna4_dispatch_lds(dev, prog, groups, groupSize, kernargs, kernargBytes, 0, timeoutMs,
+	                          micros);
+}
+
+kern_return_t rdna4_dispatch_lds(rdna4_t *dev, const rdna4_program_t *prog,
+                                 const uint32_t groups[3], const uint32_t groupSize[3],
+                                 const void *kernargs, uint32_t kernargBytes,
+                                 uint32_t dynamicLdsBytes, uint32_t timeoutMs, uint64_t *micros) {
 	if (kernargBytes > RDNA4_MAX_KERNARG || prog->handle > 0xffffffffu)
 		return kIOReturnBadArgument;
 	RDNA4Dispatch d;
@@ -116,6 +125,7 @@ kern_return_t rdna4_dispatch(rdna4_t *dev, const rdna4_program_t *prog, const ui
 	}
 	d.timeoutMs = timeoutMs;
 	d.kernargBytes = kernargBytes;
+	d.dynamicLdsBytes = dynamicLdsBytes;
 	if (kernargBytes)
 		memcpy(d.kernargs, kernargs, kernargBytes);
 	uint64_t us = 0;

@@ -44,6 +44,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/module.h"
 #include "qemu/units.h"
 #include "qemu/timer.h"
@@ -1339,11 +1340,14 @@ static const MemoryRegionOps rdna4_inert_ops = {
  * Compute dispatch. The model has no shader cores; it runs each work-item
  * of a DISPATCH_DIRECT through a small GFX12 interpreter that knows the
  * instructions of the kext's test kernels (shaders/probe.s, and clang's
- * code for shaders/vadd.cl): SOPP (endpgm, nop, delay/wait/sendmsg),
- * SMEM s_load_b32..b512, SOP2 s_lshl_b32, VOP1 v_mov_b32, VOP2 v_add_nc_u32 /
- * v_lshlrev_b32 / v_mul_u32_u24 / v_lshlrev_b64 / v_add_co_ci_u32, VOP3
- * v_lshl_or_b32 / v_add_co_u32 / v_mad_co_u64_u32, VGLOBAL global_load/
- * store_b32. Anything else stops the work-item and is reported.
+ * code for shaders/vadd.cl and shaders/bench.cl): SOPP (endpgm, branches,
+ * nop/clause/delay/wait/sendmsg, barrier wait), SOP1 s_mov_b32 /
+ * s_barrier_signal, SOPC unsigned compares, SMEM s_load_b32..b512, SOP2
+ * s_add_co / s_lshl_b32, VOP1 v_mov_b32, VOP2 integer ops and v_fmac_f32,
+ * VOP3 integer ops, VOPD (dual issue: fmac/fmaak/fmamk/mul/add/mov and
+ * the Y-only add/lshl/and), DS b32 loads/stores incl. 2addr, VGLOBAL
+ * global_load/store_b32..b128 and wb/inv. Work-groups share LDS and meet
+ * at barriers. Anything else stops the work-item and is reported.
  */
 #define REG_SH_MEM_CONFIG    GC_SEG1(0x09e4)
 #define REG_CS_NUM_THREAD_X  GC_SEG0(0x1ba7)
@@ -1355,8 +1359,19 @@ static const MemoryRegionOps rdna4_inert_ops = {
 
 typedef struct RDNA4Lane {
     uint32_t s[128];
-    uint32_t v[64];
+    uint32_t v[256];
+    uint64_t pc;
+    uint32_t steps;
+    bool     done, waiting;         /* ended / parked at a work-group barrier */
 } RDNA4Lane;
+
+enum { ISA_ERROR, ISA_DONE, ISA_BARRIER };
+
+/* The work-group's LDS, sized by COMPUTE_PGM_RSRC2.LDS_SIZE (512-byte units). */
+typedef struct RDNA4Lds {
+    uint8_t  *mem;
+    uint32_t size;
+} RDNA4Lds;
 
 static uint32_t rdna4_isa_src(const RDNA4Lane *l, uint32_t src, uint32_t literal, bool *used_lit)
 {
@@ -1374,34 +1389,71 @@ static uint32_t rdna4_isa_src(const RDNA4Lane *l, uint32_t src, uint32_t literal
         return literal;
     }
     if (src >= 256) {
-        return l->v[(src - 256) & 63];
+        return l->v[(src - 256) & 255];
     }
     return 0;
 }
 
 static uint64_t rdna4_isa_v64(const RDNA4Lane *l, uint32_t src)
 {
-    uint32_t r = (src - 256) & 63;
-    return l->v[r] | ((uint64_t)l->v[(r + 1) & 63] << 32);
+    uint32_t r = (src - 256) & 255;
+    return l->v[r] | ((uint64_t)l->v[(r + 1) & 255] << 32);
 }
 
 static void rdna4_isa_set_v64(RDNA4Lane *l, uint32_t vdst, uint64_t v)
 {
-    l->v[vdst & 63] = (uint32_t)v;
-    l->v[(vdst + 1) & 63] = (uint32_t)(v >> 32);
+    l->v[vdst & 255] = (uint32_t)v;
+    l->v[(vdst + 1) & 255] = (uint32_t)(v >> 32);
+}
+
+static float rdna4_f(uint32_t u)
+{
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+
+static uint32_t rdna4_u(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    return u;
+}
+
+/* The VOPD (dual-issue) operations clang uses, X and Y (Y-only from 16). */
+static bool rdna4_vopd_op(uint32_t op, uint32_t a, uint32_t b, uint32_t d, uint32_t lit,
+                          uint32_t *out)
+{
+    switch (op) {
+    case 0:  *out = rdna4_u(fmaf(rdna4_f(a), rdna4_f(b), rdna4_f(d))); return true;  /* fmac_f32 */
+    case 1:  *out = rdna4_u(fmaf(rdna4_f(a), rdna4_f(b), rdna4_f(lit))); return true; /* fmaak */
+    case 2:  *out = rdna4_u(fmaf(rdna4_f(a), rdna4_f(lit), rdna4_f(b))); return true; /* fmamk */
+    case 3:  *out = rdna4_u(rdna4_f(a) * rdna4_f(b)); return true;                   /* mul_f32 */
+    case 4:  *out = rdna4_u(rdna4_f(a) + rdna4_f(b)); return true;                   /* add_f32 */
+    case 8:  *out = a; return true;                                                  /* mov_b32 */
+    case 16: *out = a + b; return true;                                              /* add_nc_u32 */
+    case 17: *out = b << (a & 31); return true;                                      /* lshlrev_b32 */
+    case 18: *out = a & b; return true;                                              /* and_b32 */
+    default: return false;
+    }
 }
 
 /*
- * Run one work-item from `pc`; false (and a message) on anything unknown.
- * Per work-item, so VCC is one bit (lane-local carry) kept in s[106].
+ * Run one work-item from l->pc until it ends (ISA_DONE), reaches a
+ * work-group barrier (ISA_BARRIER, pc past the signal), or meets anything
+ * unknown (ISA_ERROR, reported). Per work-item, so VCC is one bit
+ * (lane-local carry) kept in s[106], and SCC is scalar state of the lane.
  */
-static bool rdna4_isa_run(RDNA4State *s, uint64_t pc, RDNA4Lane *l)
+static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
 {
-    for (int steps = 0; steps < 4096; steps++) {
+    uint64_t pc = l->pc;
+    uint32_t scc = l->s[127];               /* s[127] is not an addressable SGPR here */
+
+    for (; l->steps < (1u << 22); l->steps++) {
         uint8_t *p = rdna4_gc_span(s, pc, 12);
         if (!p) {
             fprintf(stderr, "rdna4: cs: instruction fetch at 0x%" PRIx64 " not mapped\n", pc);
-            return false;
+            return ISA_ERROR;
         }
         uint32_t dw = ldl_le_p(p), dw1 = ldl_le_p(p + 4), dw2 = ldl_le_p(p + 8);
         bool lit = false;
@@ -1409,17 +1461,50 @@ static bool rdna4_isa_run(RDNA4State *s, uint64_t pc, RDNA4Lane *l)
 
         if ((dw >> 23) == 0x17f) {                          /* SOPP */
             uint32_t op = (dw >> 16) & 0x7f;
+            int32_t simm = (int16_t)(dw & 0xffff);
             if (op == 48) {
-                return true;                                /* s_endpgm */
+                l->done = true;
+                return ISA_DONE;                            /* s_endpgm */
             }
-            /* s_nop, s_delay_alu, s_code_end, s_sendmsg, s_wait_*cnt:
-             * no effect on one in-order work-item */
-            if (op != 0 && op != 7 && op != 0x1f && op != 0x36 && (op < 0x40 || op > 0x47)) {
+            if (op == 32 || (op == 33 && !scc) || (op == 34 && scc)) {
+                pc += 4 + 4ll * simm;                       /* s_branch, s_cbranch_scc0/1 */
+                continue;
+            }
+            /* s_nop, s_clause, s_delay_alu, s_barrier_wait (the signal is
+             * the rendezvous), s_code_end, s_sendmsg, s_wait_*: nothing to
+             * do for one in-order work-item. */
+            if (op != 0 && op != 5 && op != 7 && op != 20 && op != 0x1f && op != 0x36 &&
+                op != 33 && op != 34 && (op < 0x40 || op > 0x49)) {
                 goto unknown;
+            }
+        } else if ((dw >> 23) == 0x17d) {                   /* SOP1 */
+            uint32_t op = (dw >> 8) & 0xff, sdst = (dw >> 16) & 0x7f;
+            uint32_t a = rdna4_isa_src(l, dw & 0xff, dw1, &lit);
+            if (op == 0x4e) {                               /* s_barrier_signal */
+                l->pc = pc + 4;
+                l->s[127] = scc;
+                return ISA_BARRIER;
+            }
+            if (op != 0 || sdst >= 106) {                   /* s_mov_b32 */
+                goto unknown;
+            }
+            l->s[sdst] = a;
+        } else if ((dw >> 23) == 0x17e) {                   /* SOPC */
+            uint32_t op = (dw >> 16) & 0x7f;
+            uint32_t a = rdna4_isa_src(l, dw & 0xff, dw1, &lit);
+            uint32_t b = rdna4_isa_src(l, (dw >> 8) & 0xff, dw1, &lit);
+            switch (op) {
+            case 6:  scc = a == b; break;                   /* s_cmp_eq_u32 */
+            case 7:  scc = a != b; break;                   /* s_cmp_lg_u32 */
+            case 8:  scc = a > b; break;                    /* s_cmp_gt_u32 */
+            case 9:  scc = a >= b; break;                   /* s_cmp_ge_u32 */
+            case 10: scc = a < b; break;                    /* s_cmp_lt_u32 */
+            case 11: scc = a <= b; break;                   /* s_cmp_le_u32 */
+            default: goto unknown;
             }
         } else if ((dw >> 26) == 0x3d) {                    /* SMEM loads */
             uint32_t op = (dw >> 13) & 0x3f, sbase = (dw & 0x3f) * 2, sdata = (dw >> 6) & 0x7f;
-            uint32_t soff = dw1 >> 25, count = op <= 4 ? 1u << op : 0;
+            uint32_t soff = dw1 >> 25, count = op <= 4 ? 1u << op : op == 5 ? 3 : 0;
             int64_t off = ((int32_t)(dw1 << 8)) >> 8;       /* signed 24-bit */
             uint64_t addr = (l->s[sbase] | ((uint64_t)l->s[sbase + 1] << 32)) + off +
                             (soff != 0x7c ? l->s[soff & 0x7f] : 0);
@@ -1431,53 +1516,116 @@ static bool rdna4_isa_run(RDNA4State *s, uint64_t pc, RDNA4Lane *l)
                 l->s[sdata + i] = ldl_le_p(m + 4 * i);
             }
             n = 2;
+        } else if ((dw >> 26) == 0x36) {                    /* DS (LDS) */
+            uint32_t op = (dw >> 18) & 0xff, off0 = dw & 0xff, off1 = (dw >> 8) & 0xff;
+            uint32_t addr = l->v[dw1 & 0xff], data0 = (dw1 >> 8) & 0xff;
+            uint32_t data1 = (dw1 >> 16) & 0xff, vdst = dw1 >> 24;
+            uint32_t at[2] = { addr + (off1 << 8 | off0), 0 }, count = 1;
+            if (op == 14 || op == 55) {                     /* 2addr: two dword slots */
+                at[0] = addr + off0 * 4;
+                at[1] = addr + off1 * 4;
+                count = 2;
+            }
+            for (uint32_t i = 0; i < count; i++) {
+                if (at[i] + 4 > lds->size) {
+                    fprintf(stderr, "rdna4: cs: LDS access at 0x%x beyond the work-group's %u "
+                            "bytes (COMPUTE_PGM_RSRC2.LDS_SIZE)\n", at[i], lds->size);
+                    return ISA_ERROR;
+                }
+            }
+            switch (op) {
+            case 13: stl_le_p(lds->mem + at[0], l->v[data0]); break;           /* ds_store_b32 */
+            case 14:                                                           /* ds_store_2addr_b32 */
+                stl_le_p(lds->mem + at[0], l->v[data0]);
+                stl_le_p(lds->mem + at[1], l->v[data1]);
+                break;
+            case 54: l->v[vdst] = ldl_le_p(lds->mem + at[0]); break;           /* ds_load_b32 */
+            case 55:                                                           /* ds_load_2addr_b32 */
+                l->v[vdst] = ldl_le_p(lds->mem + at[0]);
+                l->v[(vdst + 1) & 255] = ldl_le_p(lds->mem + at[1]);
+                break;
+            default: goto unknown;
+            }
+            n = 2;
         } else if ((dw >> 24) == 0xee) {                    /* VGLOBAL */
             uint32_t op = (dw >> 14) & 0xff, saddr = dw & 0x7f;
             uint32_t vdst = dw1 & 0xff, data = (dw1 >> 23) & 0xff, vaddr = dw2 & 0xff;
             int64_t ioff = ((int32_t)(dw2 & 0xffffff00)) >> 8;
+            uint32_t count = op >= 20 && op <= 23 ? op - 19 : op >= 26 && op <= 29 ? op - 25 : 0;
             uint64_t addr;
             uint8_t *d;
-            if (op != 20 && op != 26) {                     /* global_load/store_b32 */
+            n = 3;
+            if (op == 43 || op == 44) {                     /* global_inv / global_wb */
+                pc += 4ull * n;
+                continue;
+            }
+            if (!count) {                                   /* global_load/store_b32..b128 */
                 goto unknown;
             }
             addr = saddr != 0x7c ?
-                   (l->s[saddr] | ((uint64_t)l->s[saddr + 1] << 32)) + l->v[vaddr & 63] :
-                   l->v[vaddr & 63] | ((uint64_t)l->v[(vaddr + 1) & 63] << 32);
+                   (l->s[saddr] | ((uint64_t)l->s[saddr + 1] << 32)) + l->v[vaddr] :
+                   l->v[vaddr] | ((uint64_t)l->v[(vaddr + 1) & 255] << 32);
             addr += ioff;
-            d = rdna4_gc_span(s, addr, 4);
+            d = rdna4_gc_span(s, addr, 4 * count);
             if (!d) {
                 fprintf(stderr, "rdna4: cs: global access to 0x%" PRIx64 " not mapped\n", addr);
-                return false;
+                return ISA_ERROR;
             }
-            if (op == 26) {
-                stl_le_p(d, l->v[data & 63]);
-            } else {
-                l->v[vdst & 63] = ldl_le_p(d);
+            for (uint32_t i = 0; i < count; i++) {
+                if (op >= 26) {
+                    stl_le_p(d + 4 * i, l->v[(data + i) & 255]);
+                } else {
+                    l->v[(vdst + i) & 255] = ldl_le_p(d + 4 * i);
+                }
             }
-            n = 3;
+        } else if ((dw >> 26) == 0x32) {                    /* VOPD: two ops, one issue */
+            uint32_t opx = (dw >> 22) & 0xf, opy = (dw >> 17) & 0x1f;
+            uint32_t vdstx = dw1 >> 24, vdsty = (((dw1 >> 17) & 0x7f) << 1) | ((vdstx & 1) ^ 1);
+            uint32_t ax = rdna4_isa_src(l, dw & 0x1ff, dw2, &lit), bx = l->v[(dw >> 9) & 0xff];
+            uint32_t ay = rdna4_isa_src(l, dw1 & 0x1ff, dw2, &lit), by = l->v[(dw1 >> 9) & 0xff];
+            uint32_t rx, ry;
+            n = 2;
+            /* Both read their sources before either writes (no X/Y overlap). */
+            if (!rdna4_vopd_op(opx, ax, bx, l->v[vdstx], dw2, &rx) ||
+                !rdna4_vopd_op(opy, ay, by, l->v[vdsty & 255], dw2, &ry)) {
+                goto unknown;
+            }
+            if (opx == 1 || opx == 2 || opy == 1 || opy == 2) {
+                lit = true;                                 /* fmaak/fmamk carry one */
+            }
+            l->v[vdstx] = rx;
+            l->v[vdsty & 255] = ry;
         } else if ((dw >> 26) == 0x35) {                    /* VOP3 / VOP3B */
             uint32_t op = (dw >> 16) & 0x3ff, vdst = dw & 0xff, sdst = (dw >> 8) & 0x7f;
             uint32_t s0 = dw1 & 0x1ff, s1 = (dw1 >> 9) & 0x1ff, s2 = (dw1 >> 18) & 0x1ff;
-            uint32_t a = rdna4_isa_src(l, s0, 0, &lit), b = rdna4_isa_src(l, s1, 0, &lit);
+            uint32_t a = rdna4_isa_src(l, s0, dw2, &lit), b = rdna4_isa_src(l, s1, dw2, &lit);
+            uint32_t c = rdna4_isa_src(l, s2, dw2, &lit);
             n = 2;
-            if (lit) {
-                goto unknown;                               /* no VOP3 literals here */
+            /* No neg, abs, opsel or clamp in these kernels; VOP3B (the two
+             * carry-out ops) keeps SDST where the others keep abs/opsel. */
+            if (dw1 >> 29 || (op != 0x300 && op != 0x2fe && (dw & 0xff00))) {
+                goto unknown;
             }
             switch (op) {
-            case 0x256:                                     /* v_lshl_or_b32 */
-                l->v[vdst & 63] = (a << (b & 31)) | rdna4_isa_src(l, s2, 0, &lit);
+            case 0x256: l->v[vdst] = (a << (b & 31)) | c; break;              /* v_lshl_or_b32 */
+            case 0x246: l->v[vdst] = (a << (b & 31)) + c; break;              /* v_lshl_add_u32 */
+            case 0x255: l->v[vdst] = a + b + c; break;                        /* v_add3_u32 */
+            case 0x210:                                                       /* v_bfe_u32 */
+                l->v[vdst] = (c & 31) ? (a >> (b & 31)) & ((1u << (c & 31)) - 1) : 0;
                 break;
-            case 0x300: {                                   /* v_add_co_u32 */
+            case 0x20b: l->v[vdst] = (a & 0xffffff) * (b & 0xffffff) + c; break; /* v_mad_u32_u24 */
+            case 0x32c: l->v[vdst] = a * b; break;                            /* v_mul_lo_u32 */
+            case 0x300: {                                                     /* v_add_co_u32 */
                 uint64_t sum = (uint64_t)a + b;
-                l->v[vdst & 63] = (uint32_t)sum;
+                l->v[vdst] = (uint32_t)sum;
                 if (sdst == 106) {
                     l->s[106] = (uint32_t)(sum >> 32);
                 }
                 break;
             }
-            case 0x2fe: {                                   /* v_mad_co_u64_u32 */
-                uint64_t c = s2 >= 256 ? rdna4_isa_v64(l, s2) : rdna4_isa_src(l, s2, 0, &lit);
-                rdna4_isa_set_v64(l, vdst, (uint64_t)a * b + c);
+            case 0x2fe: {                                                     /* v_mad_co_u64_u32 */
+                uint64_t c64 = s2 >= 256 ? rdna4_isa_v64(l, s2) : c;
+                rdna4_isa_set_v64(l, vdst, (uint64_t)a * b + c64);
                 break;
             }
             default:
@@ -1489,30 +1637,53 @@ static bool rdna4_isa_run(RDNA4State *s, uint64_t pc, RDNA4Lane *l)
             if (op != 1) {                                  /* v_mov_b32 */
                 goto unknown;
             }
-            l->v[vdst & 63] = a;
+            l->v[vdst] = a;
         } else if ((dw >> 30) == 2 && (dw >> 28) != 0xb && (dw >> 23) < 0x17d) {   /* SOP2 */
             uint32_t op = (dw >> 23) & 0x7f, sdst = (dw >> 16) & 0x7f;
             uint32_t a = rdna4_isa_src(l, dw & 0xff, dw1, &lit);
             uint32_t b = rdna4_isa_src(l, (dw >> 8) & 0xff, dw1, &lit);
-            if (op != 8 || sdst >= 106) {                   /* s_lshl_b32 */
+            uint32_t r;
+            if (sdst >= 106) {
                 goto unknown;
             }
-            l->s[sdst] = a << (b & 31);
+            switch (op) {
+            case 0: {                                                          /* s_add_co_u32 */
+                uint64_t sum = (uint64_t)a + b;
+                r = (uint32_t)sum;
+                scc = sum >> 32;
+                break;
+            }
+            case 2: {                                                          /* s_add_co_i32 */
+                int64_t sum = (int64_t)(int32_t)a + (int32_t)b;
+                r = (uint32_t)sum;
+                scc = sum != (int32_t)r;
+                break;
+            }
+            case 8: r = a << (b & 31); scc = r != 0; break;                    /* s_lshl_b32 */
+            default: goto unknown;
+            }
+            l->s[sdst] = r;
         } else if (!(dw >> 31)) {                           /* VOP2 */
             uint32_t op = (dw >> 25) & 0x3f, vdst = (dw >> 17) & 0xff;
             uint32_t a = rdna4_isa_src(l, dw & 0x1ff, dw1, &lit);
-            uint32_t b = l->v[((dw >> 9) & 0xff) & 63];
+            uint32_t b = l->v[(dw >> 9) & 0xff];
             uint32_t vsrc1 = ((dw >> 9) & 0xff) + 256;
             switch (op) {
-            case 37: l->v[vdst & 63] = a + b; break;                           /* v_add_nc_u32 */
-            case 24: l->v[vdst & 63] = b << (a & 31); break;                   /* v_lshlrev_b32 */
-            case 11: l->v[vdst & 63] = (a & 0xffffff) * (b & 0xffffff); break; /* v_mul_u32_u24 */
+            case 37: l->v[vdst] = a + b; break;                                /* v_add_nc_u32 */
+            case 24: l->v[vdst] = b << (a & 31); break;                        /* v_lshlrev_b32 */
+            case 25: l->v[vdst] = b >> (a & 31); break;                        /* v_lshrrev_b32 */
+            case 27: l->v[vdst] = a & b; break;                                /* v_and_b32 */
+            case 29: l->v[vdst] = a ^ b; break;                                /* v_xor_b32 */
+            case 11: l->v[vdst] = (a & 0xffffff) * (b & 0xffffff); break;      /* v_mul_u32_u24 */
+            case 43:                                                           /* v_fmac_f32 */
+                l->v[vdst] = rdna4_u(fmaf(rdna4_f(a), rdna4_f(b), rdna4_f(l->v[vdst])));
+                break;
             case 31:                                                           /* v_lshlrev_b64 */
                 rdna4_isa_set_v64(l, vdst, rdna4_isa_v64(l, vsrc1) << (a & 63));
                 break;
             case 32: {                                                         /* v_add_co_ci_u32 */
                 uint64_t sum = (uint64_t)a + b + (l->s[106] & 1);
-                l->v[vdst & 63] = (uint32_t)sum;
+                l->v[vdst] = (uint32_t)sum;
                 l->s[106] = (uint32_t)(sum >> 32);
                 break;
             }
@@ -1524,13 +1695,19 @@ static bool rdna4_isa_run(RDNA4State *s, uint64_t pc, RDNA4Lane *l)
         pc += 4ull * (n + (lit ? 1 : 0));
         continue;
 unknown:
-        fprintf(stderr, "rdna4: cs: unsupported instruction 0x%08x at 0x%" PRIx64 "\n", dw, pc);
-        return false;
+        fprintf(stderr, "rdna4: cs: unsupported instruction 0x%08x 0x%08x at 0x%" PRIx64 "\n",
+                dw, dw1, pc);
+        return ISA_ERROR;
     }
-    fprintf(stderr, "rdna4: cs: work-item ran past 4096 instructions\n");
-    return false;
+    fprintf(stderr, "rdna4: cs: work-item ran past %u instructions\n", 1u << 22);
+    return ISA_ERROR;
 }
 
+/*
+ * One DISPATCH_DIRECT. Each work-group's work-items run in turns: each
+ * until it ends or reaches s_barrier_signal; once every live one waits,
+ * the barrier opens. The group's LDS is what RSRC2.LDS_SIZE allocates.
+ */
 static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32_t dim_z,
                            uint32_t initiator)
 {
@@ -1538,7 +1715,9 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
                    ((uint64_t)reg_get(s, REG_CS_PGM_HI) << 40);
     uint32_t rsrc2 = reg_get(s, REG_CS_RSRC2), nuser = (rsrc2 >> 1) & 0x1f;
     uint32_t tx = reg_get(s, REG_CS_NUM_THREAD_X), ty = reg_get(s, REG_CS_NUM_THREAD_X + 4);
-    uint32_t tz = reg_get(s, REG_CS_NUM_THREAD_X + 8);
+    uint32_t tz = reg_get(s, REG_CS_NUM_THREAD_X + 8), items = tx * ty * tz;
+    RDNA4Lds lds = { NULL, ((rsrc2 >> 15) & 0x1ff) * 512 };
+    RDNA4Lane *lanes;
     uint64_t ran = 0;
 
     if (!(initiator & 1) || !reg_get(s, REG_SH_MEM_CONFIG) || !reg_get(s, REG_CS_THREAD_SE0) ||
@@ -1548,14 +1727,18 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
                 reg_get(s, REG_SH_MEM_CONFIG), reg_get(s, REG_CS_THREAD_SE0), tx, ty, tz);
         return;
     }
+    lanes = g_new(RDNA4Lane, items);
+    lds.mem = g_malloc0(lds.size ? lds.size : 4);
     for (uint32_t gz = 0; gz < dim_z; gz++)
     for (uint32_t gy = 0; gy < dim_y; gy++)
     for (uint32_t gx = 0; gx < dim_x; gx++) {
-        for (uint32_t t = 0; t < tx * ty * tz; t++) {
+        uint32_t live = items;
+        for (uint32_t t = 0; t < items; t++) {
             uint32_t x = t % tx, y = (t / tx) % ty, z = t / (tx * ty);
-            RDNA4Lane l = { 0 };
+            RDNA4Lane *l = &lanes[t];
+            memset(l, 0, sizeof(*l));
             for (uint32_t i = 0; i < nuser && i < 16; i++) {
-                l.s[i] = reg_get(s, REG_CS_USER_DATA_0 + 4 * i);
+                l->s[i] = reg_get(s, REG_CS_USER_DATA_0 + 4 * i);
             }
             /*
              * GFX12 has architected SGPRs: the work-group ids arrive in
@@ -1563,20 +1746,43 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
              * after the user ones (LLVM's FeatureArchitectedSGPRs; clang's
              * gfx1201 code reads ttmp9).
              */
-            l.s[108 + 9] = (rsrc2 & (1u << 7)) ? gx : 0;                /* TGID_X_EN */
-            l.s[108 + 7] = ((rsrc2 & (1u << 8)) ? (gy & 0xffff) : 0) |  /* TGID_Y_EN */
-                           ((rsrc2 & (1u << 9)) ? (gz << 16) : 0);       /* TGID_Z_EN */
-            l.v[0] = (x & 0x3ff) | ((y & 0x3ff) << 10) | ((z & 0x3ff) << 20);   /* packed */
-            if (!rdna4_isa_run(s, pgm, &l)) {
-                fprintf(stderr, "rdna4: cs: dispatch stopped at group %u,%u,%u item %u\n",
-                        gx, gy, gz, t);
-                return;
+            l->s[108 + 9] = (rsrc2 & (1u << 7)) ? gx : 0;               /* TGID_X_EN */
+            l->s[108 + 7] = ((rsrc2 & (1u << 8)) ? (gy & 0xffff) : 0) | /* TGID_Y_EN */
+                            ((rsrc2 & (1u << 9)) ? (gz << 16) : 0);      /* TGID_Z_EN */
+            l->v[0] = (x & 0x3ff) | ((y & 0x3ff) << 10) | ((z & 0x3ff) << 20);   /* packed */
+            l->pc = pgm;
+        }
+        while (live) {
+            for (uint32_t t = 0; t < items; t++) {
+                RDNA4Lane *l = &lanes[t];
+                if (l->done || l->waiting) {
+                    continue;
+                }
+                switch (rdna4_isa_run(s, l, &lds)) {
+                case ISA_DONE:
+                    live--;
+                    ran++;
+                    break;
+                case ISA_BARRIER:
+                    l->waiting = true;
+                    break;
+                default:
+                    fprintf(stderr, "rdna4: cs: dispatch stopped at group %u,%u,%u item %u\n",
+                            gx, gy, gz, t);
+                    g_free(lds.mem);
+                    g_free(lanes);
+                    return;
+                }
             }
-            ran++;
+            for (uint32_t t = 0; t < items; t++) {          /* every live one waits: open */
+                lanes[t].waiting = false;
+            }
         }
     }
-    fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u of %ux%ux%u ran %" PRIu64 " work-items\n",
-            dim_x, dim_y, dim_z, tx, ty, tz, ran);
+    g_free(lds.mem);
+    g_free(lanes);
+    fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u of %ux%ux%u ran %" PRIu64 " work-items%s\n",
+            dim_x, dim_y, dim_z, tx, ty, tz, ran, lds.size ? " (with LDS)" : "");
 }
 
 static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)

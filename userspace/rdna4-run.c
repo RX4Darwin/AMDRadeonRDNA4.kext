@@ -5,9 +5,14 @@
  *  Command-line client of the RDNA4FB compute runtime (run as root):
  *
  *    rdna4-run info                        what the runtime reports
- *    rdna4-run selftest [items]            shaders/vadd.cl (embedded) on the
- *                                          GPU, every result checked, plus
- *                                          the runtime's refusals
+ *    rdna4-run selftest [items]            shaders/vadd.cl and bench.cl's
+ *                                          lds_reverse (embedded) on the GPU,
+ *                                          every result checked, plus the
+ *                                          runtime's refusals
+ *    rdna4-run bench [small]               host<->GPU copies, VRAM bandwidth
+ *                                          and SGEMM GFLOPS (bench.cl), every
+ *                                          SGEMM checked against the CPU;
+ *                                          `small` for the emulator
  *    rdna4-run load <file.hsaco> <kernel>  load a code object, describe the
  *                                          kernel, unload it
  *
@@ -15,11 +20,13 @@
  */
 
 #include "librdna4.h"
+#include "bench_codeobj.h"
 #include "vadd_codeobj.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static int openRuntime(rdna4_t *gpu) {
@@ -61,6 +68,73 @@ static int checkFailed(const char *what, kern_return_t kr) {
 
 static uint32_t aOf(uint32_t i) { return i * 2654435761u; }
 static uint32_t bOf(uint32_t i, uint32_t round) { return (i ^ 0x5A5A5A5Au) + round * 0x01000193u; }
+
+static double nowUs(void) {
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1e6 + t.tv_nsec / 1e3;
+}
+
+// LDS and a work-group barrier (bench.cl's lds_reverse): each group of 64
+// reverses its slice of a[] through LDS. Also checks what the runtime must
+// refuse about LDS. Returns the number of failures.
+static int testLds(rdna4_t *gpu) {
+	int fails = 0;
+	const uint32_t items = 4096, bytes = items * 4;
+	rdna4_program_t prog;
+	kern_return_t kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "lds_reverse", &prog);
+	if (kr != KERN_SUCCESS) {
+		printf("  FAIL  load lds_reverse: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	rdna4_buffer_t a, b, c;
+	uint32_t *ha = malloc(bytes), *hb = malloc(bytes), *hc = malloc(bytes);
+	if (!ha || !hb || !hc || (kr = rdna4_alloc(gpu, bytes, &a)) || (kr = rdna4_alloc(gpu, bytes, &b)) ||
+	    (kr = rdna4_alloc(gpu, bytes, &c))) {
+		printf("  FAIL  LDS test setup: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	for (uint32_t i = 0; i < items; i++) {
+		ha[i] = aOf(i);
+		hb[i] = bOf(i, 7);
+		hc[i] = 0xFFFFFFFFu;
+	}
+	const uint64_t args[3] = { a.gpu, b.gpu, c.gpu };
+	const uint32_t groups[3] = { items / 64, 1, 1 }, size[3] = { 64, 1, 1 };
+	if ((kr = rdna4_write(gpu, &a, 0, ha, bytes)) || (kr = rdna4_write(gpu, &b, 0, hb, bytes)) ||
+	    (kr = rdna4_write(gpu, &c, 0, hc, bytes)) ||
+	    (kr = rdna4_dispatch(gpu, &prog, groups, size, args, sizeof(args), 2000, NULL)) ||
+	    (kr = rdna4_read(gpu, &c, 0, hc, bytes))) {
+		printf("  FAIL  lds_reverse: %s\n", rdna4_error(kr));
+		fails++;
+	} else {
+		uint32_t bad = 0, first = items;
+		for (uint32_t i = 0; i < items; i++) {
+			uint32_t g = i & ~63u, want = aOf(g + 63 - (i & 63)) + bOf(i, 7);
+			if (hc[i] != want && !bad++)
+				first = i;
+		}
+		if (bad) {
+			printf("  FAIL  LDS + barrier: %u of %u wrong, first c[%u] = 0x%08x\n", bad, items, first,
+			       hc[first]);
+			fails++;
+		} else {
+			printf("  ok    LDS + barrier: %u items reversed per work-group through %llu bytes "
+			       "of LDS\n", items, prog.ldsBytes);
+		}
+	}
+	fails += checkFailed("a dispatch asking for more than 64 KiB of LDS",
+	                     rdna4_dispatch_lds(gpu, &prog, groups, size, args, sizeof(args), 65536, 0,
+	                                        NULL));
+	rdna4_free(gpu, &a);
+	rdna4_free(gpu, &b);
+	rdna4_free(gpu, &c);
+	rdna4_unload(gpu, &prog);
+	free(ha);
+	free(hb);
+	free(hc);
+	return fails;
+}
 
 static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 	int fails = 0;
@@ -163,7 +237,10 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 		printf("  ok    %u back-to-back dispatches of %u items, each checked\n", rounds, small);
 	fails += roundsBad != 0;
 
-	// 3. What the runtime must refuse.
+	// 3. LDS and barriers, on a second kernel from a multi-kernel file.
+	fails += testLds(gpu);
+
+	// 4. What the runtime must refuse.
 	rdna4_program_t bogus = prog;
 	bogus.handle ^= 0x10000;                                   // stale generation
 	fails += checkFailed("a dispatch of a stale program handle",
@@ -177,7 +254,7 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 	fails += checkFailed("a truncated code object",
 	                     rdna4_load(gpu, kVaddCodeObject, 200, "vadd", &bogus));
 
-	// 4. Release everything; a second free of the same buffer must fail.
+	// 5. Release everything; a second free of the same buffer must fail.
 	kr = rdna4_free(gpu, &a);
 	if (kr != KERN_SUCCESS) {
 		printf("  FAIL  free: %s\n", rdna4_error(kr));
@@ -192,6 +269,170 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 	free(hc);
 
 	printf("selftest: %s\n", fails ? "FAILED" : "PASS");
+	return fails ? 1 : 0;
+}
+
+// Multiples of 1/8 in [-1, 1]: every product is a multiple of 1/64 and every
+// partial sum of up to 2048 of them fits a float's 24-bit mantissa, so the
+// GPU must match the CPU bit for bit, whatever its summation order.
+static float mval(uint32_t i, uint32_t seed) {
+	uint32_t h = (i + seed) * 2654435761u;
+	return (float)((int)((h >> 16) % 17) - 8) / 8.0f;
+}
+
+static int cmdBench(rdna4_t *gpu, int small) {
+	int fails = 0;
+	kern_return_t kr;
+	if (cmdInfo(gpu))
+		return 1;
+	rdna4_program_t copy, sgemm;
+	if ((kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "copy", &copy)) ||
+	    (kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "sgemm", &sgemm))) {
+		fprintf(stderr, "bench: load: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	printf("sgemm: 64x64 tiles, 16x16 work-items, %llu bytes of LDS per work-group\n",
+	       sgemm.ldsBytes);
+
+	// 1. Host <-> GPU: the CPU copies through the BAR window.
+	const uint64_t xfer = small ? (1u << 20) : (16u << 20);
+	uint8_t *h1 = malloc(xfer), *h2 = malloc(xfer);
+	rdna4_buffer_t x;
+	if (!h1 || !h2 || (kr = rdna4_alloc(gpu, xfer, &x))) {
+		fprintf(stderr, "bench: transfer buffer: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	for (uint64_t i = 0; i < xfer; i++)
+		h1[i] = (uint8_t)(i * 131 + 7);
+	double t0 = nowUs();
+	kr = rdna4_write(gpu, &x, 0, h1, xfer);
+	double t1 = nowUs();
+	if (!kr)
+		kr = rdna4_read(gpu, &x, 0, h2, xfer);
+	double t2 = nowUs();
+	if (kr || memcmp(h1, h2, xfer)) {
+		printf("  FAIL  host<->GPU copy of %llu MiB: %s\n", xfer >> 20,
+		       kr ? rdna4_error(kr) : "data differs");
+		fails++;
+	} else {
+		printf("  ok    host->GPU %.0f MB/s, GPU->host %.0f MB/s (%llu MiB each way)\n",
+		       xfer / (t1 - t0), xfer / (t2 - t1), xfer >> 20);
+	}
+	rdna4_free(gpu, &x);
+
+	// 2. VRAM bandwidth: `copy` reads and writes 16 bytes per work-item.
+	const uint64_t cb = small ? (1u << 20) : (32u << 20);
+	const uint64_t edge = 64u << 10;                  // checked at both ends
+	rdna4_buffer_t src, dst;
+	if ((kr = rdna4_alloc(gpu, cb, &src)) || (kr = rdna4_alloc(gpu, cb, &dst))) {
+		fprintf(stderr, "bench: copy buffers: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	for (uint64_t i = 0; i < edge; i++)
+		h1[i] = (uint8_t)(i * 29 + 3);
+	rdna4_write(gpu, &src, 0, h1, edge);
+	rdna4_write(gpu, &src, cb - edge, h1, edge);
+	{
+		const uint64_t args[2] = { src.gpu, dst.gpu };
+		const uint32_t groups[3] = { (uint32_t)(cb / 16 / 256), 1, 1 }, size[3] = { 256, 1, 1 };
+		uint64_t best = ~0ull, us = 0;
+		for (int r = 0; r < (small ? 1 : 5) && !kr; r++) {
+			kr = rdna4_dispatch(gpu, &copy, groups, size, args, sizeof(args), 10000, &us);
+			if (us < best)
+				best = us;
+		}
+		int same = !kr && !rdna4_read(gpu, &dst, 0, h2, edge) && !memcmp(h1, h2, edge) &&
+		           !rdna4_read(gpu, &dst, cb - edge, h2, edge) && !memcmp(h1, h2, edge);
+		if (kr || !same) {
+			printf("  FAIL  VRAM copy: %s\n", kr ? rdna4_error(kr) : "data differs");
+			fails++;
+		} else {
+			printf("  ok    VRAM copy of %llu MiB: %.1f GB/s (read + write, %llu us)\n", cb >> 20,
+			       2.0 * cb / best / 1000.0, best);
+		}
+	}
+	rdna4_free(gpu, &src);
+	rdna4_free(gpu, &dst);
+	free(h1);
+	free(h2);
+
+	// 3. SGEMM, C = A x B: GFLOPS from the best of a few runs, and exact
+	//    agreement with the CPU (every element up to 512, sampled rows above).
+	static const uint32_t sizes[] = { 64, 128, 256, 512, 1024, 2048 };
+	const uint32_t maxN = small ? 128 : 2048;
+	for (unsigned si = 0; si < sizeof(sizes) / sizeof(sizes[0]) && sizes[si] <= maxN; si++) {
+		const uint32_t n = sizes[si];
+		const uint64_t bytes = (uint64_t)n * n * 4;
+		float *A = malloc(bytes), *B = malloc(bytes), *C = malloc(bytes);
+		rdna4_buffer_t a, b, c;
+		if (!A || !B || !C || (kr = rdna4_alloc(gpu, bytes, &a)) || (kr = rdna4_alloc(gpu, bytes, &b)) ||
+		    (kr = rdna4_alloc(gpu, bytes, &c))) {
+			printf("  FAIL  sgemm n=%u: buffers: %s\n", n, rdna4_error(kr));
+			fails++;
+			break;
+		}
+		for (uint32_t i = 0; i < n * n; i++) {
+			A[i] = mval(i, 1);
+			B[i] = mval(i, 2);
+		}
+		uint8_t args[32] = { 0 };
+		memcpy(args, &a.gpu, 8);
+		memcpy(args + 8, &b.gpu, 8);
+		memcpy(args + 16, &c.gpu, 8);
+		memcpy(args + 24, &n, 4);
+		const uint32_t groups[3] = { n / 64, n / 64, 1 }, size[3] = { 16, 16, 1 };
+		uint64_t best = ~0ull, us = 0;
+		kr = rdna4_write(gpu, &a, 0, A, bytes);
+		if (!kr)
+			kr = rdna4_write(gpu, &b, 0, B, bytes);
+		for (int r = 0; r < (small ? 1 : 3) && !kr; r++) {
+			kr = rdna4_dispatch(gpu, &sgemm, groups, size, args, 28, 10000, &us);
+			if (us < best)
+				best = us;
+		}
+		// Rows to check: all of them up to 512, else 64 spread ones.
+		const uint32_t rows = n <= 512 ? n : 64;
+		uint32_t bad = 0, br = 0, bc = 0;
+		float got = 0, want = 0;
+		for (uint32_t k = 0; k < rows && !kr; k++) {
+			const uint32_t r = rows == n ? k : (uint32_t)(((uint64_t)k * 2654435761u) % n);
+			kr = rdna4_read(gpu, &c, (uint64_t)r * n * 4, C, (uint64_t)n * 4);
+			for (uint32_t j = 0; j < n && !kr; j++) {
+				float acc = 0.0f;
+				for (uint32_t q = 0; q < n; q++)
+					acc += A[r * n + q] * B[q * n + j];
+				if (C[j] != acc && !bad++) {
+					br = r;
+					bc = j;
+					got = C[j];
+					want = acc;
+				}
+			}
+		}
+		if (kr || bad) {
+			if (kr)
+				printf("  FAIL  sgemm n=%u: %s\n", n, rdna4_error(kr));
+			else
+				printf("  FAIL  sgemm n=%u: %u wrong, first C[%u][%u] = %g (want %g)\n", n, bad, br,
+				       bc, got, want);
+			fails++;
+		} else {
+			printf("  ok    sgemm n=%-4u %8.1f GFLOPS (%.3f ms), %s exact\n", n,
+			       2.0 * n * n * (double)n / best / 1000.0, best / 1000.0,
+			       rows == n ? "every element" : "64 sampled rows");
+		}
+		rdna4_free(gpu, &a);
+		rdna4_free(gpu, &b);
+		rdna4_free(gpu, &c);
+		free(A);
+		free(B);
+		free(C);
+		if (kr)
+			break;
+	}
+	rdna4_unload(gpu, &copy);
+	rdna4_unload(gpu, &sgemm);
+	printf("bench: %s\n", fails ? "FAILED" : "PASS");
 	return fails ? 1 : 0;
 }
 
@@ -229,6 +470,7 @@ static int cmdLoad(rdna4_t *gpu, const char *path, const char *kernel) {
 static void usage(void) {
 	fprintf(stderr, "usage: rdna4-run info\n"
 	                "       rdna4-run selftest [items]\n"
+	                "       rdna4-run bench [small]\n"
 	                "       rdna4-run load <file.hsaco> <kernel>\n");
 }
 
@@ -247,6 +489,10 @@ int main(int argc, char **argv) {
 		if (!openRuntime(&gpu))
 			return 1;
 		rc = cmdSelftest(&gpu, argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 65536);
+	} else if (!strcmp(argv[1], "bench") && argc <= 3) {
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdBench(&gpu, argc == 3 && !strcmp(argv[2], "small"));
 	} else if (!strcmp(argv[1], "load") && argc == 4) {
 		if (!openRuntime(&gpu))
 			return 1;

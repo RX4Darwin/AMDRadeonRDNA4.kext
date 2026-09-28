@@ -49,6 +49,7 @@ typedef struct {
 	uint64_t kernargBytes;                  /* the kernel's kernarg segment */
 	uint64_t imageBytes;
 	uint64_t rsrc1, rsrc2, rsrc3, properties;
+	uint64_t ldsBytes;                      /* static LDS per work-group */
 } rdna4_program_t;
 
 kern_return_t rdna4_open(rdna4_t *dev);
@@ -71,6 +72,11 @@ kern_return_t rdna4_unload(rdna4_t *dev, const rdna4_program_t *prog);
 kern_return_t rdna4_dispatch(rdna4_t *dev, const rdna4_program_t *prog, const uint32_t groups[3],
                              const uint32_t groupSize[3], const void *kernargs,
                              uint32_t kernargBytes, uint32_t timeoutMs, uint64_t *micros);
+/* The same, with LDS per work-group beyond the kernel's static size. */
+kern_return_t rdna4_dispatch_lds(rdna4_t *dev, const rdna4_program_t *prog,
+                                 const uint32_t groups[3], const uint32_t groupSize[3],
+                                 const void *kernargs, uint32_t kernargBytes,
+                                 uint32_t dynamicLdsBytes, uint32_t timeoutMs, uint64_t *micros);
 
 const char *rdna4_error(kern_return_t kr);
 

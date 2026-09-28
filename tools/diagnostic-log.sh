@@ -138,6 +138,8 @@ gated() {
 	section "user-space compute runtime (rdna4-run selftest)"
 	if [ -f "$HERE/rdna4-run" ] && cp "$HERE/rdna4-run" /tmp/rdna4-run && chmod +x /tmp/rdna4-run; then
 		/tmp/rdna4-run selftest || echo "(rdna4-run exited $?)"
+		section "compute benchmarks (rdna4-run bench)"
+		/tmp/rdna4-run bench || echo "(rdna4-run bench exited $?)"
 	else
 		echo "(no rdna4-run next to this script)"
 	fi
@@ -169,3 +171,4 @@ echo "  Discovery,Source = 'on-die TMR' if ATY,bin_image was removed"
 echo "  compute: 'verdict:' lines — PSP sOS, GFX/SDMA firmware state, GC/MM hub"
 echo "           apertures, and the VRAM pool chosen for compute"
 echo "  runtime: 'selftest: PASS' — a user-space program ran vadd on the GPU"
+echo "  bench:   host<->GPU MB/s, VRAM GB/s, sgemm GFLOPS; 'bench: PASS' = all exact"

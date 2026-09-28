@@ -29,6 +29,8 @@
 #include "../src/codeobj.hpp"
 #include "../src/gpuheap.hpp"
 #include "../src/vadd_codeobj.h"
+#include "../src/bench_codeobj.h"
+#include "../src/gfxregs.hpp"
 #include "rdna4compute.h"
 
 #include <cstdarg>
@@ -1733,8 +1735,35 @@ static int testCodeObject() {
 	}
 	failures += check(!CodeObj::parseImage(kVaddCodeObject, 200, img, &why),
 	                  "codeobj: image of a truncated file accepted");
-	printf("\ncodeobj: clang's vadd code object: kernel, descriptor, code and image located %s\n",
-	       failures ? "FAILED" : "ok");
+
+	// bench.cl: three kernels in one file, each with its own descriptor and
+	// LDS (llvm-readelf --notes: group_segment_fixed_size 256 / 0 / 8320).
+	struct { const char *name; uint32_t lds, kernarg; } bench[] = {
+		{ "lds_reverse", 256, 24 }, { "copy", 0, 16 }, { "sgemm", 8320, 28 },
+	};
+	uint64_t entries[3] = {};
+	for (int i = 0; i < 3; i++) {
+		ok = CodeObj::findKernel(kBenchCodeObject, sizeof(kBenchCodeObject), bench[i].name, k, &why);
+		entries[i] = k.entryVa;
+		failures += check(ok && k.groupSegmentSize == bench[i].lds && k.kernargSize == bench[i].kernarg &&
+		                  !k.privateSegmentSize && k.wave32() && !(k.entryVa & 0xff),
+		                  "codeobj: bench %s: %s, LDS %u kernarg %u entry 0x%llx", bench[i].name,
+		                  ok ? "found" : why, k.groupSegmentSize, k.kernargSize,
+		                  (unsigned long long)k.entryVa);
+	}
+	ok = CodeObj::parseImage(kBenchCodeObject, sizeof(kBenchCodeObject), img, &why);
+	failures += check(ok && entries[0] != entries[1] && entries[1] != entries[2] &&
+	                  entries[2] < img.size, "codeobj: bench image %s, 0x%llx bytes",
+	                  ok ? "ok" : why, (unsigned long long)img.size);
+
+	// RSRC2.LDS_SIZE as Mesa encodes it for gfx12 compute: 1 KiB-aligned,
+	// in 512-byte units.
+	failures += check(GfxReg::ldsSizeField(0) == 0 && GfxReg::ldsSizeField(256) == (2u << 15) &&
+	                  GfxReg::ldsSizeField(8320) == (18u << 15) &&
+	                  GfxReg::ldsSizeField(65536) == (128u << 15),
+	                  "lds: RSRC2.LDS_SIZE encoding");
+	printf("\ncodeobj: clang's vadd and bench code objects: kernels, descriptors, LDS and image "
+	       "located %s\n", failures ? "FAILED" : "ok");
 	return failures;
 }
 

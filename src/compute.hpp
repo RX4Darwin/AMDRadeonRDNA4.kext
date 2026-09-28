@@ -239,10 +239,11 @@ private:
 		uint32_t        groupSize[3];       // work-items per group
 		bool            wave32;
 		uint32_t        timeoutUs;
+		uint32_t        ldsBytes;           // per work-group (RSRC2.LDS_SIZE)
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
 	// What launch() can give a code-object kernel: the kernarg pointer and
-	// nothing else yet — no dispatch/queue pointers, scratch or LDS.
+	// up to 64 KiB of LDS — no dispatch/queue pointers or scratch yet.
 	static bool kernelFits(const CodeObj::Kernel &k, const char **why);
 	bool stageDispatch();
 
@@ -267,7 +268,7 @@ public:
 	IOReturn rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
 	                mach_vm_address_t user, uint64_t length, bool toGpu);
 	IOReturn rtLoad(const void *owner, task_t task, mach_vm_address_t elf, uint64_t length,
-	                const char *name, uint64_t out[7]);
+	                const char *name, uint64_t out[8]);
 	IOReturn rtUnload(const void *owner, uint64_t program);
 	IOReturn rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros);
 	void     rtRelease(const void *owner);

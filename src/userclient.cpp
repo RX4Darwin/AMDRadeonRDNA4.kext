@@ -50,7 +50,7 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sFree,       1,          0,                          0,           0 },
 	{ sWrite,      4,          0,                          0,           0 },
 	{ sRead,       4,          0,                          0,           0 },
-	{ sLoad,       2,          kIOUCVariableStructureSize, 7,           0 },
+	{ sLoad,       2,          kIOUCVariableStructureSize, 8,           0 },
 	{ sUnload,     1,          0,                          0,           0 },
 	{ sDispatch,   0,          sizeof(RDNA4Dispatch),      1,           0 },
 };

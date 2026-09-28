@@ -1683,7 +1683,7 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
 
 	const uint32_t pgm[2] = { static_cast<uint32_t>(l.code >> 8), static_cast<uint32_t>(l.code >> 40) };
-	const uint32_t rsrc[2] = { l.rsrc1, l.rsrc2 };
+	const uint32_t rsrc[2] = { l.rsrc1, (l.rsrc2 & ~kRsrc2LdsMask) | ldsSizeField(l.ldsBytes) };
 	// Navi 48 has 4 shader engines: every CU of SE0-3, none of the absent
 	// SE4-7 (Mesa's gfx12_init_compute_preamble_state).
 	const uint32_t zero = 0, all[2] = { 0xffffffff, 0xffffffff };
@@ -1750,8 +1750,8 @@ bool RDNA4Compute::kernelFits(const CodeObj::Kernel &k, const char **why) {
 		w = "its user SGPR count does not match its requests";
 	else if (k.privateSegmentSize)
 		w = "it needs scratch memory";
-	else if (k.groupSegmentSize)
-		w = "it needs LDS (group segment)";
+	else if (k.groupSegmentSize > kMaxLdsPerGroup)
+		w = "it needs more than 64 KiB of LDS";
 	else if (k.kernargSize > kKernargMax)
 		w = "its kernel arguments exceed 4 KiB";
 	if (why)

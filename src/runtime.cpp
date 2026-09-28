@@ -187,7 +187,7 @@ IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offse
 }
 
 IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t elf, uint64_t length,
-                              const char *name, uint64_t out[7]) {
+                              const char *name, uint64_t out[8]) {
 	Locked g(rtLock);
 	if (!rtReady)
 		return kIOReturnNotReady;
@@ -243,8 +243,9 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 	out[4] = k.rsrc2;
 	out[5] = k.rsrc3;
 	out[6] = k.properties;
-	RLOG("loaded \"%s\": %llu-byte image at MC 0x%llx, entry +0x%llx, %u bytes of kernargs", name,
-	     img.size, poolMc(off), k.entryVa, k.kernargSize);
+	out[7] = k.groupSegmentSize;
+	RLOG("loaded \"%s\": %llu-byte image at MC 0x%llx, entry +0x%llx, %u bytes of kernargs, "
+	     "%u of LDS", name, img.size, poolMc(off), k.entryVa, k.kernargSize, k.groupSegmentSize);
 	return kIOReturnSuccess;
 }
 
@@ -265,7 +266,9 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	if (rtWedged)
 		return kIOReturnNotResponding;
 	RtProgram *p = programFor(owner, d.program);
-	if (!p || d.reserved || d.kernargBytes > RDNA4_MAX_KERNARG || d.timeoutMs > RDNA4_MAX_TIMEOUT_MS)
+	if (!p || d.kernargBytes > RDNA4_MAX_KERNARG || d.timeoutMs > RDNA4_MAX_TIMEOUT_MS ||
+	    d.dynamicLdsBytes > RDNA4_MAX_LDS ||
+	    p->k.groupSegmentSize + d.dynamicLdsBytes > RDNA4_MAX_LDS)
 		return kIOReturnBadArgument;
 	uint64_t items = 1;
 	for (int i = 0; i < 3; i++) {
@@ -302,6 +305,7 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	}
 	l.wave32 = k.wave32();
 	l.timeoutUs = (d.timeoutMs ? d.timeoutMs : 1000) * 1000;
+	l.ldsBytes = k.groupSegmentSize + d.dynamicLdsBytes;
 
 	uint64_t ns = 0;
 	const bool done = launch(l, "runtime", ns);
