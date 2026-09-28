@@ -2276,8 +2276,9 @@ unknown:
  * division sequence (frexp/rcp/ldexp) and a few gfx12 compare forms that are
  * outside this deliberately small ISA interpreter. Model that benchmark at
  * work-item granularity instead, with the same source-level float32 order and
- * ARGB8888 palette as the code object. The dispatch shape and 20-byte
- * kernarg signature make this unambiguous among the embedded bench kernels.
+ * ARGB8888 palette as the code object. The dispatch shape and entry signature
+ * make this unambiguous among the embedded bench kernels; the zoom variant
+ * adds one float to the kernarg block but uses the same model.
  */
 static bool rdna4_mandelbrot_dispatch(RDNA4State *s, uint64_t pgm, uint32_t dim_x,
                                       uint32_t dim_y, uint32_t dim_z, uint32_t tx,
@@ -2288,20 +2289,29 @@ static bool rdna4_mandelbrot_dispatch(RDNA4State *s, uint64_t pgm, uint32_t dim_
     uint8_t *args;
     uint64_t out_mc;
     uint32_t width, height, pitch;
+    float zoom = 1.0f;
+    const uint32_t first = code ? ldl_le_p(code) : 0;
+    const bool zoomed = first == 0xf4004100;
 
     if (tx != 16 || ty != 16 || tz != 1 || !dim_x || !dim_y || !dim_z || nuser != 2 ||
-        !code || ldl_le_p(code) != 0xf400a100 || ldl_le_p(code + 4) != 0xf8000008 ||
+        !code || (first != 0xf400a100 && !zoomed) || ldl_le_p(code + 4) != 0xf8000008 ||
         ldl_le_p(code + 0x10) != 0xd6100002)
         return false;
     kernarg = (uint64_t)reg_get(s, REG_CS_USER_DATA_0) |
               ((uint64_t)reg_get(s, REG_CS_USER_DATA_0 + 4) << 32);
-    args = rdna4_gc_span(s, kernarg, 20);
+    args = rdna4_gc_span(s, kernarg, zoomed ? 24 : 20);
     if (!args)
         return false;
     out_mc = (uint64_t)ldl_le_p(args) | ((uint64_t)ldl_le_p(args + 4) << 32);
     width = ldl_le_p(args + 8);
     height = ldl_le_p(args + 12);
     pitch = ldl_le_p(args + 16);
+    if (zoomed) {
+        uint32_t bits = ldl_le_p(args + 20);
+        memcpy(&zoom, &bits, sizeof(zoom));
+        if (!(zoom > 0.0f))
+            return false;
+    }
     if (!out_mc || !width || !height || !pitch)
         return false;
 
@@ -2316,8 +2326,13 @@ static bool rdna4_mandelbrot_dispatch(RDNA4State *s, uint64_t pgm, uint32_t dim_
 
         if (x >= width || y >= height)
             continue;
-        cx = ((float)x / (float)width - 0.5f) * 3.2f - 0.7f;
-        cy = ((float)y / (float)height - 0.5f) * 2.2f;
+        if (zoomed) {
+            cx = -0.7f + (((float)x / (float)width - 0.5f) * 3.2f) / zoom;
+            cy = (((float)y / (float)height - 0.5f) * 2.2f) / zoom;
+        } else {
+            cx = ((float)x / (float)width - 0.5f) * 3.2f - 0.7f;
+            cy = ((float)y / (float)height - 0.5f) * 2.2f;
+        }
         for (; iteration < 256u; iteration++) {
             float zx2 = zx * zx, zy2 = zy * zy;
             float next_zx;
@@ -2342,8 +2357,8 @@ static bool rdna4_mandelbrot_dispatch(RDNA4State *s, uint64_t pgm, uint32_t dim_
     /* Hidden VRAM is not a MemoryRegion, so its writes do not dirty QEMU's
      * display bitmap. Refresh the console explicitly for screendumps/VNC. */
     dpy_gfx_update_full(s->con);
-    fprintf(stderr, "rdna4: cs: Mandelbrot model %ux%ux%u of %ux%ux%u ran\n",
-            dim_x, dim_y, dim_z, tx, ty, tz);
+    fprintf(stderr, "rdna4: cs: Mandelbrot%s model %ux%ux%u of %ux%ux%u ran\n",
+            zoomed ? " zoom" : "", dim_x, dim_y, dim_z, tx, ty, tz);
     return true;
 }
 
