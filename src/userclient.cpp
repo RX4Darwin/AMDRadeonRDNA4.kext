@@ -98,6 +98,7 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sWaitPresent,  2,        0,                          1,           0 },
 	{ sSubmitIb,   3,          0,                          1,           0 },
 	{ sWaitFence,  2,          0,                          1,           0 },
+	{ sSensorsEx,  0,          0,                          0,           sizeof(RDNA4SensorsEx) },
 };
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -119,6 +120,12 @@ IOReturn RDNA4ComputeClient::sSensors(OSObject *t, void *, IOExternalMethodArgum
 	if (!a->structureOutput || a->structureOutputSize != sizeof(RDNA4Sensors))
 		return kIOReturnBadArgument;
 	return self(t)->compute->rtSensors(t, *static_cast<RDNA4Sensors *>(a->structureOutput));
+}
+
+IOReturn RDNA4ComputeClient::sSensorsEx(OSObject *t, void *, IOExternalMethodArguments *a) {
+	if (!a->structureOutput || a->structureOutputSize != sizeof(RDNA4SensorsEx))
+		return kIOReturnBadArgument;
+	return self(t)->compute->rtSensorsEx(t, *static_cast<RDNA4SensorsEx *>(a->structureOutput));
 }
 
 IOReturn RDNA4ComputeClient::sSleepTest(OSObject *t, void *, IOExternalMethodArguments *a) {

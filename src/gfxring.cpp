@@ -15,8 +15,8 @@
 //  end-of-pipe RELEASE_MEM fence (ring_emit_fence), an indirect buffer
 //  (ring_test_ib), and enough fenced IBs to wrap the ring several times.
 //
-//  Boot-arg rdna4-gfx: 1 = the write pointer goes to CP_RB0_WPTR (MMIO),
-//  2 = through the gfx ring's doorbell, as amdgpu kicks it. Absent = off:
+//  Boot-arg rdna4-gfx: 2 = the write pointer goes through the gfx ring's doorbell, as amdgpu kicks it (1 is an alias of 2: the MMIO write pointer halts PFP/ME on silicon).
+//  Absent = off:
 //  nothing here runs. It runs after the compute stages on the bring-up
 //  thread; a failure halts PFP/ME again and leaves compute as it was.
 //
@@ -52,7 +52,15 @@ uint32_t RDNA4Compute::requestedGfx() {
 	uint32_t mode = 0;
 	if (!PE_parse_boot_argn("rdna4-gfx", &mode, sizeof(mode)))
 		return 0;
-	return mode == 1 || mode == 2 ? mode : 0;
+	if (mode == 1) {
+		// gfx_v12_0_gfx_ring_init sets ring->use_doorbell = true (gfx_v12_0.c:990)
+		// and ring_set_wptr_gfx writes the doorbell then; the MMIO branch is
+		// only for a ring without one. On the real card the MMIO write
+		// pointer halts PFP/ME (round 2, R2-2), so 1 now means the doorbell.
+		IOLog("RDNA4FB: gfx: rdna4-gfx=1 (MMIO write pointer) halts PFP/ME on silicon; using the doorbell like amdgpu\n");
+		return 2;
+	}
+	return mode == 2 ? mode : 0;
 }
 
 // gfx_v12_0_get_csb_buffer's layout: the cluster count, then per cluster
@@ -121,14 +129,10 @@ bool RDNA4Compute::gfxRingResume() {
 
 	// gfx_v12_0_cp_gfx_set_doorbell (+ cp_set_doorbell_range's gfx half).
 	uint32_t db = rdGc(CpRbDoorbellControl) & ~(0x0ffffffcu | kCpRbDoorbellEn);
-	if (gfxMode == 2) {
-		db |= ((kGfxDoorbellDword << 2) & 0x0ffffffc) | kCpRbDoorbellEn;
-		wr(IpDiscovery::HwGc, CpRbDoorbellControl, db);
-		wr(IpDiscovery::HwGc, CpRbDoorbellRangeLower, (kGfxDoorbellDword << 2) & kCpRbDoorbellRangeMask);
-		wr(IpDiscovery::HwGc, CpRbDoorbellRangeUpper, kCpRbDoorbellRangeMask);
-	} else {
-		wr(IpDiscovery::HwGc, CpRbDoorbellControl, db);
-	}
+	db |= ((kGfxDoorbellDword << 2) & 0x0ffffffc) | kCpRbDoorbellEn;
+	wr(IpDiscovery::HwGc, CpRbDoorbellControl, db);
+	wr(IpDiscovery::HwGc, CpRbDoorbellRangeLower, (kGfxDoorbellDword << 2) & kCpRbDoorbellRangeMask);
+	wr(IpDiscovery::HwGc, CpRbDoorbellRangeUpper, kCpRbDoorbellRangeMask);
 	grbmSelect(0, 0, 0, 0);
 
 	wr(IpDiscovery::HwGc, CpMaxContext, kGfxMaxHwContexts - 1);
@@ -146,7 +150,7 @@ bool RDNA4Compute::gfxRingResume() {
 	}
 	GLOG("ring 0: %u KiB at MC 0x%llx, CP_RB0_CNTL 0x%08x, %s, CP_ME_CNTL 0x%08x, CP_STAT 0x%08x%s",
 	     kGfxRingSize >> 10, gfxRing.mc(), rdGc(CpRb0Cntl),
-	     gfxMode == 2 ? "doorbell" : "MMIO write pointer", rdGc(CpMeCntl), stat,
+	     "doorbell", rdGc(CpMeCntl), stat,
 	     stat ? " (did not idle: amdgpu reports and goes on)" : "");
 	return true;
 }
@@ -155,13 +159,10 @@ void RDNA4Compute::gfxKick(uint64_t wptrDwords) {
 	*poolDw(kGfxWptrOffset) = static_cast<uint32_t>(wptrDwords);
 	*poolDw(kGfxWptrOffset + 4) = static_cast<uint32_t>(wptrDwords >> 32);
 	flushHdp();
-	if (gfxMode == 2) {
-		doorbells[kGfxDoorbellDword / 2] = wptrDwords;
-	} else {
-		grbmSelect(0, 0, 0, 0);
-		wr(IpDiscovery::HwGc, CpRb0WptrHi, static_cast<uint32_t>(wptrDwords >> 32));
-		wr(IpDiscovery::HwGc, CpRb0Wptr, static_cast<uint32_t>(wptrDwords));
-	}
+	// gfx_v12_0_ring_set_wptr_gfx with use_doorbell (gfx_v12_0.c:4458): the
+	// wptr shadow above, then the 64-bit doorbell. The MMIO CP_RB0_WPTR path is
+	// gone: it halts PFP/ME on silicon (round 2, R2-2).
+	doorbells[kGfxDoorbellDword / 2] = wptrDwords;
 }
 
 bool RDNA4Compute::gfxFenceWait(uint32_t seq, uint32_t timeoutUs) {
@@ -216,7 +217,7 @@ bool RDNA4Compute::stageGfxRing() {
 
 	GLOG("bring-up (rdna4-gfx=%u): CP_ME_CNTL 0x%08x CP_STAT 0x%08x PFP pc 0x%x ME pc 0x%x", gfxMode,
 	     rdGc(CpMeCntl), rdGc(CpStat), rdGc(CpPfpInstrPntr), rdGc(CpMeInstrPntr));
-	if (gfxMode == 2 && !doorbells)
+	if (!doorbells)
 		return finish(false, "doorbell mode without the doorbell BAR");
 	trail("gfx: clear state + ring");
 	if (!gfxCsbInit())
@@ -302,7 +303,7 @@ bool RDNA4Compute::stageGfxRing() {
 	if (r != rounds)
 		return finish(false, "ring wrap");
 
-	GLOG("gfx ring ready (%s)", gfxMode == 2 ? "doorbell" : "MMIO write pointer");
+	GLOG("gfx ring ready (doorbell)");
 	return finish(true, "gfx ring");
 }
 
@@ -316,12 +317,19 @@ bool RDNA4Compute::stageGfxDraw() {
 		return false;
 	}
 	// The GE rings are sized for kMaxSe shader engines (they scale with its
-	// square): check the card's count first.
+	// square): check the card's count first. The count is the IP discovery
+	// gc_info one: gfx_v12_0 uses max_shader_engines and max_backends_per_se,
+	// which amdgpu_discovery_get_gc_info fills from that table
+	// (amdgpu_discovery.c:2016,2020). The decoded GB_ADDR_CONFIG field is not
+	// used as the SE count (gfx_v12_0.c:3648 decodes num_se from it and never
+	// reads it back); the card's 0x08200545 reads 16 through it
+	// (NUM_SHADER_ENGINES, gc_12_0_0_sh_mask.h:25752), so it is only logged.
 	const uint32_t gbAddr = rdGc(GbAddrConfig);
-	const uint32_t ses = 1u << ((gbAddr >> 19) & 0xf);
-	GLOG("draw: GB_ADDR_CONFIG 0x%08x: %u shader engines, %u RBs per SE, %u pipes", gbAddr, ses,
-	     1u << ((gbAddr >> 26) & 3), 1u << (gbAddr & 7));
-	if (gbAddr == 0xffffffff || ses > kMaxSe) {
+	uint32_t ses = 0, rbPerSe = 0, gcVer = 0;
+	const bool haveGc = env.disc && env.disc->gcInfo(ses, rbPerSe, &gcVer);
+	GLOG("draw: GB_ADDR_CONFIG 0x%08x, IP discovery gc_info %u.%u: %s%u shader engines, %u RBs per SE",
+	     gbAddr, gcVer >> 16, gcVer & 0xffff, haveGc ? "" : "absent, ", ses, rbPerSe);
+	if (!haveGc || !ses || ses > kMaxSe) {
 		GLOG("draw: the GE rings are sized for %u shader engines; skipped", kMaxSe);
 		publishResult("gfx", "SKIPPED unsupported shader-engine count");
 		return false;

@@ -239,6 +239,11 @@ bool RDNA4Compute::survey() {
 void RDNA4Compute::logSurvey() const {
 	CLOG("GC %u.%u.%u, registers %s", sv.gcMajor, sv.gcMinor, sv.gcRev,
 	     sv.gcReadable ? "readable" : "NOT readable (GRBM_STATUS all-ones)");
+	uint32_t gcSe = 0, gcRb = 0, gcVer = 0;
+	if (env.disc && env.disc->gcInfo(gcSe, gcRb, &gcVer))
+		CLOG("IP discovery gc_info %u.%u: %u shader engines, %u RBs per SE", gcVer >> 16, gcVer & 0xffff, gcSe, gcRb);
+	else
+		CLOG("IP discovery gc_info: absent or not a GC table");
 	if (sv.gcReadable) {
 		CLOG("grbm status=0x%08x status2=0x%08x cp_stat=0x%08x cpc=0x%08x cpf=0x%08x",
 		     sv.grbmStatus, sv.grbmStatus2, sv.cpStat, sv.cpcStatus, sv.cpfStatus);
@@ -625,13 +630,16 @@ void RDNA4Compute::runStages() {
 	bool hung = logPreviousTrail(prev, sizeof(prev));
 	uint32_t done = StageSurvey;
 	char note[96];
-	static const char *const kFeatures[] = { "gfx", "ih", "vm", "flip" };
+	static const char *const kFeatures[] = { "gfx", "ih", "vm", "flip", "pm" };
 	for (size_t i = 0; hung && i < sizeof(kFeatures) / sizeof(kFeatures[0]); i++) {
 		const size_t n = strlen(kFeatures[i]);
 		if (!strncmp(prev, kFeatures[i], n) && prev[n] == ':') {
 			// A feature past the stages hung: the stages were fine, so only
 			// that feature is left out, once.
 			strlcpy(hungFeature, kFeatures[i], sizeof(hungFeature));
+			// A hang between the cap probe and its restore leaves the GFXCLK
+			// soft max at 1001 MHz in the SMU across a warm reboot.
+			pmCapPending = !strncmp(prev, "pm: cap", 7);
 			CLOG("the previous boot died during \"%s\": %s is off this boot, everything else runs "
 			     "(the next boot tries it again)", prev, hungFeature);
 			env.owner->setProperty("Compute,PreviousHang", prev);
@@ -707,6 +715,15 @@ void RDNA4Compute::runStages() {
 		if (!bringupStepAllowed("gfx ring")) return;
 		gfxMode = gfxAsked;
 		gfxOk = stageGfxRing();
+	}
+	// W19: the GFX power-management experiment, only when asked for. It runs
+	// while trails are still allowed and leaves its own "pm: ..." steps.
+	if (pmCapPending && done >= StageGfx)
+		gfxPmRecoverCap();
+	const uint32_t pmAsked = done >= StageGfx ? requestedGfxPm() : 0;
+	if (pmAsked && featureAllowed("pm")) {
+		if (!bringupStepAllowed("pm experiment")) return;
+		gfxPmExperiment(pmAsked);
 	}
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
 	CLOG("bring-up finished at stage %u", done);
@@ -835,6 +852,184 @@ bool RDNA4Compute::readSensors(RDNA4Sensors &out) {
 	out.socketPowerW = u16(kSocketPower);
 	out.fanRpm = u16(kFanRpm);
 	return true;
+}
+
+// The power-management view of the same table: instantaneous GFX clock, the
+// activity counters and the VDD_GFX rail, plus MetricsCounter to prove the
+// table is live. amdgpu invalidates the HDP read path after
+// TransferTableSmu2Dram (smu_cmn_update_table_read_arg, smu_cmn.c:1147-1150),
+// but hdp_v7_0_funcs (hdp_v7_0.c:128-132) has no invalidate_hdp and soc24 sets
+// none, so on this ASIC that call is a no-op. Our mapping is uncached
+// (kIOMapInhibitCache), which leaves only a stale table to rule out: poison
+// MetricsCounter first, so a table the SMU did not rewrite reads back as poison
+// instead of an old sample.
+bool RDNA4Compute::readSensorsEx(RDNA4SensorsEx &out) {
+	if (!poolCpu || kSmuTableOffset + 0x1000 > pool.size)
+		return false;
+	uint8_t *table = poolCpu + kSmuTableOffset;
+	constexpr uint32_t kPoison = 0xFFFFFFFFu;
+	*reinterpret_cast<volatile uint32_t *>(table + RDNA4_SMU_METRICS_COUNTER) = kPoison;
+	flushHdp();
+	uint32_t ret = 0;
+	if (smuSend(kSmuMsgGetMetricsTable, 5, ret, 100) != kSmuRespOk)
+		return false;
+	flushHdp();
+	auto u8 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint8_t *>(table + off);
+	};
+	auto u16 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint16_t *>(table + off);
+	};
+	auto u32 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint32_t *>(table + off);
+	};
+	memset(&out, 0, sizeof(out));
+	out.metricsCounter = u32(RDNA4_SMU_METRICS_COUNTER);
+	if (out.metricsCounter != kPoison)
+		out.flags |= RDNA4_SENSORS_EX_LIVE;
+	out.currGfxclkMHz = u32(RDNA4_SMU_METRICS_CURR_CLOCK + RDNA4_SMU_METRICS_PPCLK_GFXCLK * 4);
+	out.avgGfxclkPreDsMHz = u16(RDNA4_SMU_METRICS_AVG_GFXCLK_PRE_DS);
+	out.avgGfxclkPostDsMHz = u16(RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS);
+	out.gfxActivity = u16(RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY);
+	out.uclkActivity = u16(RDNA4_SMU_METRICS_AVG_UCLK_ACTIVITY);
+	out.vddGfxMv = u16(RDNA4_SMU_METRICS_AVG_VOLTAGE + RDNA4_SMU_METRICS_SVI_VDD_GFX * 2);
+	out.vddGfxCurrentA = u16(RDNA4_SMU_METRICS_AVG_CURRENT + RDNA4_SMU_METRICS_SVI_VDD_GFX * 2);
+	out.socketPowerW = u16(RDNA4_SMU_METRICS_AVG_SOCKET_POWER);
+	out.hotspotTempC = u16(RDNA4_SMU_METRICS_AVG_TEMPERATURE + 1 * 2);
+	for (uint32_t i = 0; i < RDNA4_SMU_METRICS_THROTTLER_COUNT; i++) {
+		const uint32_t pct = u8(RDNA4_SMU_METRICS_THROTTLING_PCT + i);
+		out.throttlingPercent[i] = static_cast<uint8_t>(pct);
+		if (pct)
+			out.throttlingMask |= 1u << i;
+	}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// W19: GFX power-management experiment (rdna4-gfxpm), off unless asked for
+// ---------------------------------------------------------------------------
+//
+// r2-sensors-review.md: on the card, idle in Recovery, the SMU reports about
+// 300 W and 3.2 GHz on GFX. amdgpu sends these after
+// EnableAllSmuFeatures that this kext never does: SetWorkloadMask (the boot-up
+// default profile, smu_bump_power_profile_mode, amdgpu_smu.c:2394-2417 ->
+// smu_v14_0_2_set_power_profile_mode, smu_v14_0_2_ppt.c:1824-1876), and
+// AllowGfxOff. (amdgpu writes no soft limits at the AUTO level, because
+// dpm_level == level, amdgpu_smu.c:2462; bit 2 below is an experiment beyond
+// amdgpu that writes what its automatic branch would,
+// smu_v14_0_set_soft_freq_limited_range, smu_v14_0.c:1019-1050.) SetWorkloadMask
+// also skips amdgpu's smu_v14_0_deep_sleep_control(true), which is fine: the DS
+// features already run under the PMFW's own set. Each bit is followed by a
+// sampled readout so the real-card log shows which one moves
+// GFXCLK/activity/power. GFXOFF is deliberately not offered: with MMIO,
+// doorbell and queue access from this kext it would power GFX down under us.
+//
+//   rdna4-gfxpm=8   sample only: log the metrics, change nothing
+//   rdna4-gfxpm=1   + SetWorkloadMask(WORKLOAD_PPLIB_DEFAULT_BIT)
+//   rdna4-gfxpm=2   + SetSoftMax/MinByFreq(GFXCLK) back to automatic
+//   rdna4-gfxpm=4   + probe: cap GFXCLK soft max at 1000 MHz, sample, restore auto
+//
+// Every message has a bounded wait; an answer other than OK stops the
+// experiment, and the state it left is logged.
+uint32_t RDNA4Compute::requestedGfxPm() {
+	uint32_t mask = 0;
+	if (!PE_parse_boot_argn("rdna4-gfxpm", &mask, sizeof(mask)))
+		return 0;
+	return mask & (kPmSampleOnly | kPmWorkload | kPmSoftAuto | kPmCapProbe);
+}
+
+// Let the PMFW average for a moment, then log what the metrics table says.
+void RDNA4Compute::gfxPmSample(const char *tag) {
+	IOSleep(300);
+	RDNA4SensorsEx s;
+	if (!readSensorsEx(s)) {
+		CLOG("pm: %s: metrics query failed", tag);
+		return;
+	}
+	CLOG("pm: %s: GFXCLK %u MHz (avg pre-DS %u, post-DS %u), GFX activity %u %%, UCLK activity %u %%, "
+	     "VDD_GFX %u mV %u A, socket %u W, hotspot %u C, MetricsCounter %u (%s), throttle mask 0x%x, "
+	     "GRBM 0x%08x CP_STAT 0x%08x",
+	     tag, s.currGfxclkMHz, s.avgGfxclkPreDsMHz, s.avgGfxclkPostDsMHz, s.gfxActivity,
+	     s.uclkActivity, s.vddGfxMv, s.vddGfxCurrentA, s.socketPowerW, s.hotspotTempC,
+	     s.metricsCounter, (s.flags & RDNA4_SENSORS_EX_LIVE) ? "live" : "STALE", s.throttlingMask,
+	     rdGc(GrbmStatus), rdGc(CpStat));
+}
+
+// smu_v14_0_set_soft_freq_limited_range: param = (PPCLK_GFXCLK << 16) | value.
+bool RDNA4Compute::gfxPmSoftLimits(uint32_t maxParam, uint32_t minParam, const char *what) {
+	uint32_t ret = 0;
+	const uint32_t rMax = smuSend(kSmuMsgSetSoftMaxByFreq, maxParam, ret, 100);
+	const uint32_t rMin = minParam == kPmNoMin ? kSmuRespOk : smuSend(kSmuMsgSetSoftMinByFreq, minParam, ret, 100);
+	CLOG("pm: %s: SetSoftMaxByFreq(0x%08x) -> 0x%02x, SetSoftMinByFreq(0x%08x) -> 0x%02x", what,
+	     maxParam, rMax, minParam == kPmNoMin ? 0 : minParam, rMin);
+	return rMax == kSmuRespOk && rMin == kSmuRespOk;
+}
+
+// The GFXCLK soft max back to automatic, once and then once more if refused.
+bool RDNA4Compute::gfxPmRestoreAuto(const char *why) {
+	for (int attempt = 1; attempt <= 2; attempt++) {
+		if (gfxPmSoftLimits(kPmSoftMaxAuto, kPmNoMin, why))
+			return true;
+		CLOG("pm: %s: restore attempt %d was refused", why, attempt);
+	}
+	return false;
+}
+
+// The previous boot died inside "pm: cap probe" or "pm: cap restore": the SMU
+// may still hold the 1001 MHz soft max (a warm reboot keeps it). Lift it once.
+void RDNA4Compute::gfxPmRecoverCap() {
+	trail("pm: cap recover");
+	if (gfxPmRestoreAuto("previous boot died in a cap step: GFXCLK soft max -> automatic"))
+		CLOG("pm: the GFXCLK soft max was lifted");
+	else
+		CLOG("pm: WARNING: the GFXCLK soft max could not be lifted; compute may stay limited to about "
+		     "1000 MHz until a cold power cycle");
+}
+
+void RDNA4Compute::gfxPmExperiment(uint32_t mask) {
+	CLOG("pm: rdna4-gfxpm=0x%x: %s%s%s%s", mask, (mask & kPmSampleOnly) ? "sample " : "",
+	     (mask & kPmWorkload) ? "workload " : "", (mask & kPmSoftAuto) ? "soft-limits-auto " : "",
+	     (mask & kPmCapProbe) ? "cap-probe" : "");
+	if (!poolCpu) {
+		CLOG("pm: no compute pool; experiment skipped");
+		return;
+	}
+	trail("pm: baseline sample");
+	gfxPmSample("baseline (nothing changed)");
+	uint32_t ret = 0;
+	if (mask & kPmWorkload) {
+		trail("pm: SetWorkloadMask");
+		const uint32_t resp = smuSend(kSmuMsgSetWorkloadMask, 1u << kWorkloadPplibDefaultBit, ret, 100);
+		CLOG("pm: SetWorkloadMask(WORKLOAD_PPLIB_DEFAULT) -> 0x%02x", resp);
+		if (resp != kSmuRespOk) {
+			CLOG("pm: workload mask refused; experiment stopped");
+			return;
+		}
+		gfxPmSample("after SetWorkloadMask(DEFAULT)");
+	}
+	if (mask & kPmSoftAuto) {
+		trail("pm: soft limits auto");
+		if (!gfxPmSoftLimits(kPmSoftMaxAuto, 0, "GFXCLK soft limits -> automatic")) {
+			CLOG("pm: soft limits refused; experiment stopped");
+			return;
+		}
+		gfxPmSample("after GFXCLK soft limits automatic");
+	}
+	if (mask & kPmCapProbe) {
+		trail("pm: cap probe");
+		// SMU_V14_SOFT_FREQ_ROUND(max) is max + 1 (smu_v14_0.h:54).
+		const bool capped = gfxPmSoftLimits(kPmProbeMHz + 1, kPmNoMin, "probe: GFXCLK soft max 1000 MHz");
+		if (capped)
+			gfxPmSample("with GFXCLK soft max 1000 MHz");
+		trail("pm: cap restore");
+		if (gfxPmRestoreAuto("probe: GFXCLK soft max -> automatic"))
+			gfxPmSample("after the cap is lifted");
+		else
+			CLOG("pm: WARNING: the GFXCLK soft max could not be restored (2 attempts); compute stays limited "
+			     "to about 1000 MHz, possibly across warm reboots (the next boot retries once); "
+			     "a cold power cycle clears it");
+	}
+	CLOG("pm: experiment finished");
 }
 
 // ---------------------------------------------------------------------------

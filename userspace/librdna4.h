@@ -58,6 +58,7 @@ kern_return_t rdna4_open(rdna4_t *dev);
 void          rdna4_close(rdna4_t *dev);
 kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out);
 kern_return_t rdna4_sensors(rdna4_t *dev, RDNA4Sensors *out);
+kern_return_t rdna4_sensors_ex(rdna4_t *dev, RDNA4SensorsEx *out);
 /* Debug-only simulated sleep: phase 1 quiesces, phase 2 re-brings up. */
 kern_return_t rdna4_sleep_test(rdna4_t *dev, uint32_t phase);
 /* Debug-only root quiesce through the system shutdown/restart path. */

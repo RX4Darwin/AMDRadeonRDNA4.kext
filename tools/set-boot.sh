@@ -1,17 +1,19 @@
 #!/bin/bash
 # Set the boot-args for one boot of docs/real-card-plan.md on the OpenCore USB.
 #
-#   bash /Volumes/OPENCORE/set-boot.sh <0-6|8>
+#   bash /Volumes/OPENCORE/set-boot.sh <0-8>
 #
 #   0  this morning's known-good arguments (no new feature enabled)
 #   1  + interrupts and W6 opt-in            rdna4-ih=1 rdna4-hang=1
 #   2  + per-app GPU memory and W6 opt-in   rdna4-ih=1 rdna4-vm=1 rdna4-hang=1
 #   3  + display interrupts and page flips  ... rdna4-flip=1 rdna4-hang=1
-#   4  + gfx ring and first triangle        ... rdna4-gfx=1 rdna4-hang=1
-#   5  + gfx ring through doorbell          ... rdna4-gfx=2 rdna4-hang=1
+#   4  + gfx ring and first triangle        ... rdna4-gfx=2 rdna4-hang=1
+#   5  boot 4 without the VM (rdna4-vm off): the triangle independent of the VM  ... rdna4-gfx=2 rdna4-hang=1
 #   6  optional: vblank + cursor            ... rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1
+#   7  optional: GFX power-management probe rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15
+#      (samples the SMU metrics, sets the default workload mask, releases the
+#      GFXCLK soft limits, then caps GFXCLK at 1000 MHz for one sample and lifts it)
 #   8  W17 VM walker diagnostics            rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31
-#      (boot 7 is gfxpm on premetal/int; expect a merge here)
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
 # the one the next boot uses. A copy of the config is kept next to it first.
@@ -22,11 +24,12 @@ case "${1:-}" in
 	1) EXTRA="rdna4-ih=1 rdna4-hang=1" ;;
 	2) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1" ;;
 	3) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-hang=1" ;;
-	4) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=1 rdna4-hang=1" ;;
-	5) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
+	4) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
+	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1" ;;
+	7) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15" ;;
 	8) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31" ;;
-	*) echo "usage: bash $0 <0-6|8>   (see docs/real-card-plan.md)"; exit 1 ;;
+	*) echo "usage: bash $0 <0-8>   (see docs/real-card-plan.md)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"

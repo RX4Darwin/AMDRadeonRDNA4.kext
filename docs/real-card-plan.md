@@ -11,7 +11,7 @@ The USB stick `OPENCORE` holds the kext, `rdna4-run`, `diagnostic-log.sh`,
    It saves an absolute-path log next to the script and prints the
    PASS/FAIL/SKIPPED table.
 3. Select the next boot with `bash /Volumes/OPENCORE/set-boot.sh 2` (then 3,
-   4, 5; boot 6 is optional), reboot, and repeat.
+   4, 5; boots 6 and 7 are optional), reboot, and repeat.
 
 Boot 0 is today's known-good argument set: it enables no new behavior at all.
 The summary reads the
@@ -54,15 +54,15 @@ trail if it hangs.
    `anim: desktop restored`. A failed display test leaves `ih:` or `flip:` for
    the next boot; animation is skipped if its command is unavailable.
 
-4. **GFX ring and first draw (G3).** Add `rdna4-gfx=1` to boot 3.
+4. **GFX ring and first draw (G3).** Add `rdna4-gfx=2` to boot 3 (`=1`, the MMIO write pointer, halts PFP/ME on the card and is now an alias of 2).
    `gfx PASS` is recorded in the current boot's `RDNA4FB,Results` value,
    containing `THE TRIANGLE IS RIGHT` and 8192 pixels. The registry is read
    per boot, so this durable result is the batch evidence; a stale NVRAM trail
    never proves PASS. A ring or draw hang leaves a `gfx:` trail, and the next
    boot skips that feature once.
 
-5. **Doorbell GFX ring.** Replace mode 1 with:
-   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1`.
+5. **GFX ring without the VM.** Same as boot 4 but without `rdna4-vm=1`, so the triangle is tested independently of the VM failure:
+   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1`.
    Expect the same ring and triangle signs through the doorbell path. A
    failure leaves the `gfx:` trail and mode 1 remains the fallback.
 
@@ -85,6 +85,33 @@ separate power-management work.
    leaves the `cursor:` trail. W12's future `rdna4-run tri` gets the next plan
    slot; its PASS will require the app marker plus a durable registry result,
    with `tri:` as the hang fallback.
+
+7. **Optional W19 GFX power-management probe.**
+   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15`.
+   Run it after boots 0-6 (the round-2 idle reading of 300 W / 3.2 GHz is
+   what it investigates; see `docs/gfx-pm-audit.md`). Every boot's summary
+   already carries `sensors-idle` (an SMU metrics sample taken before any
+   selftest or bench) and `sensors-pm` (after them), each with two samples one
+   second apart and a verdict. `rdna4-gfxpm` adds one boot-time experiment,
+   logged as `pm:` lines (one `gfxpm` row): a baseline sample, then per bit 1
+   `SetWorkloadMask(DEFAULT)`, bit 2 GFXCLK soft limits back to automatic,
+   bit 4 a probe that caps the GFXCLK soft max at 1000 MHz for one sample and
+   lifts it, each followed by a sample (GFXCLK, GFX/UCLK activity, VDD_GFX,
+   power). `rdna4-gfxpm=8` only samples. PASS means the experiment finished,
+   not that anything improved: read the `pm:` lines. A hang leaves a `pm:`
+   trail and the next boot skips only this feature. Power is left as the SMU
+   had it, except that a failed restore of the soft max is logged as a
+   WARNING (compute stays capped at 1000 MHz until the next boot).
+
+Boots 0-6 are not byte-for-byte unchanged in one respect: `rdna4-run sensors`
+now also takes two `GetMetricsTable` samples one second apart (about five
+`GetMetricsTable` messages per boot instead of one: idle baseline and post-bench,
+each with its extra pair, plus 1 s of sleep each), and each request first
+poisons `MetricsCounter` in the driver table. The messages are read-only SMU
+traffic; no boot-arg is needed for them. If a `pm: cap probe` or `pm: cap
+restore` step ever hangs, the following boot sends `SetSoftMaxByFreq(GFXCLK,
+0xffff)` once (trail `pm: cap recover`); do a cold power cycle if compute still
+looks capped at about 1000 MHz.
 
 8. **W17 VM walker diagnostics (run last, only after boot 2 showed the VM failure).**
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31`

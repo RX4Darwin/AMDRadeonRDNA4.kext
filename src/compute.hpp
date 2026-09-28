@@ -221,6 +221,7 @@ private:
 	// boot died in one of those, only that feature sits this boot out; the
 	// stages and the other features run. featureAllowed("gfx") etc.
 	char hungFeature[8] {};
+	bool pmCapPending { false };       // the last boot died inside a "pm: cap ..." step
 	bool featureAllowed(const char *name) const;
 	// Log the previous boot's trail (into `text`); true if that boot died
 	// in the middle of a step rather than ending the bring-up itself.
@@ -246,6 +247,7 @@ private:
 	bool waitRlcAutoload(uint32_t ms, uint32_t &cpStat, uint32_t &boot);
 	static constexpr uint32_t kSmuTableOffset = 6u << 20;            // driver table, 64 KiB
 	bool readSensors(RDNA4Sensors &out);
+	bool readSensorsEx(RDNA4SensorsEx &out);
 
 	// Stage 4: the GC hub, then SDMA0 queue 0 and a VRAM fill. Pool layout
 	// past the PSP's first 4 MiB (offsets within the pool).
@@ -365,8 +367,8 @@ private:
 	bool stageKernel();
 
 	// W3, the gfx ring (gfxring.cpp): after the compute stages when the
-	// boot-arg rdna4-gfx is 1 (write pointer through CP_RB0_WPTR) or 2 (its
-	// doorbell). Pool layout past the DMA scratch, below the heap.
+	// boot-arg rdna4-gfx is 2 (1 is an alias); the write pointer goes through the
+	// ring's doorbell. Pool layout past the DMA scratch, below the heap.
 	static constexpr uint32_t kGfxOffset      = 30u << 20;
 	static constexpr uint32_t kGfxRingOffset  = kGfxOffset;              // 16 KiB ring
 	static constexpr uint32_t kGfxRingSize    = 0x4000;
@@ -389,8 +391,19 @@ private:
 	bool stageGfxDraw();
 	Pm4::Queue gfxRing;
 	uint32_t   gfxFence { 0 };               // last RELEASE_MEM sequence number
-	uint32_t   gfxMode { 0 };                // 0 off, 1 MMIO write pointer, 2 doorbell
+	uint32_t   gfxMode { 0 };                // 0 off, 2 doorbell (the only mode)
 	static uint32_t requestedGfx();
+	// W19: rdna4-gfxpm, the GFX power-management experiment.
+	static constexpr uint32_t kPmWorkload = 1, kPmSoftAuto = 2, kPmCapProbe = 4, kPmSampleOnly = 8;
+	static constexpr uint32_t kPmSoftMaxAuto = 0xffff;         // (PPCLK_GFXCLK << 16) | 0xffff
+	static constexpr uint32_t kPmNoMin = 0xffffffffu;          // leave SoftMin alone
+	static constexpr uint32_t kPmProbeMHz = 1000;
+	static uint32_t requestedGfxPm();
+	void gfxPmSample(const char *tag);
+	bool gfxPmSoftLimits(uint32_t maxParam, uint32_t minParam, const char *what);
+	void gfxPmExperiment(uint32_t mask);
+	bool gfxPmRestoreAuto(const char *why);
+	void gfxPmRecoverCap();
 	bool gfxCsbInit();
 	bool gfxRingResume();
 	void gfxKick(uint64_t wptrDwords);
@@ -478,6 +491,7 @@ public:
 	IOReturn rtOpen(const void *owner);
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
 	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
+	IOReturn rtSensorsEx(const void *owner, RDNA4SensorsEx &out);
 	IOReturn rtSleepTest(const void *owner, uint32_t phase);
 	IOReturn rtQuiesce(const void *owner);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);

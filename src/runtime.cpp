@@ -1621,6 +1621,14 @@ IOReturn RDNA4Compute::rtSensors(const void *owner, RDNA4Sensors &out) {
 	return readSensors(out) ? kIOReturnSuccess : kIOReturnNotResponding;
 }
 
+IOReturn RDNA4Compute::rtSensorsEx(const void *owner, RDNA4SensorsEx &out) {
+	Locked g(rtLock);
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	return readSensorsEx(out) ? kIOReturnSuccess : kIOReturnNotResponding;
+}
+
 IOReturn RDNA4Compute::rtSleepTest(const void *owner, uint32_t phase) {
 	uint32_t enabled = 0;
 	if (!requestedPowerManagement() ||

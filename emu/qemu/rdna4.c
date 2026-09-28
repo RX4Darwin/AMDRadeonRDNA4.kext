@@ -69,6 +69,14 @@
 #define RDNA4_SMU_METRICS_AVG_SOCKET_POWER  136u
 #define RDNA4_SMU_METRICS_AVG_TEMPERATURE   140u
 #define RDNA4_SMU_METRICS_AVG_FAN_RPM       170u
+#define RDNA4_SMU_METRICS_CURR_CLOCK          0u
+#define RDNA4_SMU_METRICS_AVG_GFXCLK_PRE_DS  46u
+#define RDNA4_SMU_METRICS_COUNTER           104u
+#define RDNA4_SMU_METRICS_AVG_VOLTAGE       108u
+#define RDNA4_SMU_METRICS_AVG_CURRENT       116u
+#define RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY  124u
+#define RDNA4_SMU_METRICS_AVG_UCLK_ACTIVITY 126u
+#define RDNA4_SMU_METRICS_THROTTLING_PCT    172u
 
 #define TYPE_RDNA4 "rdna4"
 OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
@@ -85,6 +93,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define NUM_DDC  8
 #define RDNA4_WORK_SLICE_NS 2000000ULL     /* hard upper bound from the W11 brief */
 #define RDNA4_WORK_REARM_NS 500000ULL      /* let vCPU/I/O work run between slices */
+#define RDNA4_WARM_GOP_DELAY_NS 100000000ULL /* firmware/GOP re-enables BM during boot */
 
 /*
  * DMU (DCN 4.1.0) register segment bases in dwords, from the card's IP
@@ -578,6 +587,12 @@ struct RDNA4State {
     bool     hang_sticky;    /* queue dequeue never completes */
     bool     sleep_reset;    /* monitor-triggered compute power reset */
     bool     gfx_hang;       /* accept gfx kicks but leave the ring stopped */
+    uint32_t smu_gfx_soft_max;   /* SetSoftMaxByFreq(GFXCLK) in MHz, 0 = automatic */
+    uint32_t smu_workload_mask;  /* last SetWorkloadMask */
+    uint32_t smu_refuse;         /* "smu-refuse": this SMU message answers CmdRejectedPrereq (0xfd) */
+    uint32_t smu_refuse_skip;    /* "smu-refuse-skip": ... but only after this many earlier sends of it */
+    uint32_t smu_refuse_seen;
+    bool     smu_stale;      /* metrics transfer acks but the table is never rewritten */
     bool     warm_keep;      /* reset keeps live engines/queues, like warm card restart */
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
     bool     cursor_reject_logged;
@@ -637,6 +652,8 @@ struct RDNA4State {
     bool         warm_dma_window;
     uint64_t     dma_after_reset_writes;
     bool         bus_master_before_reset;
+    QEMUTimer   *warm_gop_timer;
+    bool         warm_gop_restore;
 
     /* Queue kicks are consumed by the QEMU main loop, never by an MMIO
      * handler.  The realtime timer re-arms the bottom half between slices. */
@@ -686,6 +703,7 @@ struct RDNA4State {
 };
 
 static void rdna4_work_schedule(RDNA4State *s);
+static void rdna4_warm_gop_timer(void *opaque);
 
 static bool rdna4_hqd_reg(uint32_t byte, uint32_t *off)
 {
@@ -745,9 +763,9 @@ static bool rdna4_bus_master_enabled(RDNA4State *s)
     return (pci_get_word(pci->config + PCI_COMMAND) & PCI_COMMAND_MASTER) != 0;
 }
 
-/* QEMU resets the generic PCI config image before invoking the device reset
- * callback.  Remember the pre-reset command bit so warm-keep can distinguish
- * a live card from a quiesced one; the latter must remain DMA-disabled. */
+/* Track the last Command.BusMaster value.  A machine reset may clear the
+ * generic PCI config after the device reset callback, so warm-keep uses this
+ * remembered state to model the firmware/GOP handoff that follows reset. */
 static void rdna4_config_write(PCIDevice *dev, uint32_t address, uint32_t data,
                                int len)
 {
@@ -1544,6 +1562,29 @@ static void rdna4_gfx_autoload(RDNA4State *s)
     fprintf(stderr, "rdna4: gfx: IMU released by the PMFW, RLC autoload complete\n");
 }
 
+/* SmuMetrics_t power-management fields (smu14_driver_if_v14_0.h:1649-1727).
+ * The real PMFW bumps MetricsCounter on its own tick (about 1 ms), so it is the
+ * virtual clock in ms: two reads a second apart differ, and a table the SMU did
+ * not rewrite keeps whatever the driver put there. The activity values are the
+ * emulator's idle card (no queue is executing), not a claim about silicon. */
+static void rdna4_smu_metrics_pm_fields(RDNA4State *s, uint8_t *table)
+{
+    stl_le_p(table + RDNA4_SMU_METRICS_COUNTER,
+             (uint32_t)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) & 0x7fffffff));
+    /* PPCLK_GFXCLK follows a SetSoftMaxByFreq below the idle clock; the soft
+     * max message carries max + 1 (SMU_V14_SOFT_FREQ_ROUND). */
+    uint32_t gfxclk = 2100;
+    if (s->smu_gfx_soft_max && s->smu_gfx_soft_max - 1 < gfxclk)
+        gfxclk = s->smu_gfx_soft_max - 1;
+    stl_le_p(table + RDNA4_SMU_METRICS_CURR_CLOCK + 0 * 4, gfxclk);    /* PPCLK_GFXCLK */
+    stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFXCLK_PRE_DS, 2100);
+    stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY, 3);
+    stw_le_p(table + RDNA4_SMU_METRICS_AVG_UCLK_ACTIVITY, 1);
+    stw_le_p(table + RDNA4_SMU_METRICS_AVG_VOLTAGE + 0 * 2, 850);      /* SVI_PLANE_VDD_GFX, mV */
+    stw_le_p(table + RDNA4_SMU_METRICS_AVG_CURRENT + 0 * 2, 12);
+    table[RDNA4_SMU_METRICS_THROTTLING_PCT + 14] = 0;                  /* THROTTLER_PPT0 */
+}
+
 static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
 {
     uint32_t resp = SMU_RESP_OK, param = reg_get(s, REG_SMU_PARAM);
@@ -1551,6 +1592,13 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
     reg_set(s, REG_SMU_MSG, msg);
     if (!s->pmfw_loaded) {
         return;                                    /* no PMFW: RESP stays 0 */
+    }
+    /* PPSMC_Result_CmdRejectedPrereq, as the card answers under SCPM
+     * (SetAllowedMask on the real card, hw-logs): a fault option, off by default. */
+    if (s->smu_refuse && msg == s->smu_refuse && s->smu_refuse_seen++ >= s->smu_refuse_skip) {
+        fprintf(stderr, "rdna4: smu: message 0x%x refused with 0xfd (smu-refuse)\n", msg);
+        reg_set(s, REG_SMU_RESP, 0xfd);
+        return;
     }
     switch (msg) {
     case 0x1:                                      /* TestMessage */
@@ -1602,7 +1650,14 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
             resp = SMU_RESP_UNKNOWN;
             break;
         }
+        if (s->smu_stale) {
+            /* "smu-stale": the SMU acks the transfer but the driver table is
+             * left as the driver wrote it (a stale HDP/PCIe write path). */
+            fprintf(stderr, "rdna4: smu: metrics transfer acked, table NOT rewritten (smu-stale)\n");
+            break;
+        }
         memset(table, 0, 4096);
+        rdna4_smu_metrics_pm_fields(s, table);
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS, 2100);
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS, 1000);
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_TEMPERATURE + 0 * 2, 42);
@@ -1612,6 +1667,17 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
         fprintf(stderr, "rdna4: smu: synthetic metrics 42C/55C, 2100/1000 MHz, 120 W, 900 RPM\n");
         break;
     }
+    case 0x19:                                     /* SetSoftMinByFreq: accepted, no model */
+        break;
+    case 0x1a:                                     /* SetSoftMaxByFreq */
+        /* param = (PPCLK_e << 16) | MHz; 0xffff is the automatic (unlimited) max. */
+        if ((param >> 16) == 0)                    /* PPCLK_GFXCLK */
+            s->smu_gfx_soft_max = (param & 0xffff) == 0xffff ? 0 : (param & 0xffff);
+        break;
+    case 0x24:                                     /* SetWorkloadMask */
+        s->smu_workload_mask = param;
+        fprintf(stderr, "rdna4: smu: SetWorkloadMask 0x%x\n", param);
+        break;
     case 0x29:                                     /* DisallowGfxOff */
     case 0x36:                                     /* RunDcBtc */
         break;
@@ -4506,6 +4572,29 @@ unknown:
     return false;
 }
 
+/* Shader-engine count as amdgpu gets it: amdgpu_discovery_get_gc_info reads
+ * gc_num_se from the IP discovery GC table (table_list[1]; gpu_info_header is
+ * 12 bytes, gc_num_se follows).  GB_ADDR_CONFIG is not an SE count source:
+ * the card's 0x08200545 has NUM_SHADER_ENGINES [22:19] = 4 (16 by a 1<<n
+ * decode) on a 4-SE Navi 48.  0 when the table is absent. */
+static uint32_t rdna4_gfx_discovery_num_se(RDNA4State *s)
+{
+    uint32_t list, off;
+
+    if (!s->discovery || s->discovery_len < 32) {
+        return 0;
+    }
+    list = lduw_le_p(s->discovery + 4) >= 2 ? 16 : 12;
+    off = lduw_le_p(s->discovery + list + 8);
+    if (!off || off + 16 > s->discovery_len) {
+        return 0;
+    }
+    if (ldl_le_p(s->discovery + off) != 0x4347) { /* GC_TABLE_ID */
+        return 0;
+    }
+    return ldl_le_p(s->discovery + off + 12);
+}
+
 static bool rdna4_gfx_draw_refuse(RDNA4State *s, const char *reg,
                                   const char *why)
 {
@@ -4550,7 +4639,7 @@ static uint32_t rdna4_gfx_ring_bytes(RDNA4State *s, uint32_t base_reg,
 static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
 {
     uint32_t stages, ena, addr, col, info, attrib3, vte, cbcc, target, shader;
-    uint32_t gb, ses, pos_bytes, prim_bytes;
+    uint32_t ses, pos_bytes, prim_bytes;
 
     if (count == 0 || count > 30)
         return rdna4_gfx_draw_refuse(s, "INDEX_COUNT", "count is not modelled (1..30)");
@@ -4583,11 +4672,9 @@ static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
         return rdna4_gfx_draw_refuse(s, "SPI_PS_IN_CONTROL", "PS_W32_EN is off");
     if (!(reg_get(s, REG_GFX_SPI_SHADER_GS_OUT_CONFIG_PS) & (1u << 10)))
         return rdna4_gfx_draw_refuse(s, "SPI_SHADER_GS_OUT_CONFIG_PS", "NO_PC_EXPORT is off");
-
-    gb = reg_get(s, REG_GFX_GB_ADDR_CONFIG);
-    ses = 1u << ((gb >> 19) & 0xf);
+    ses = rdna4_gfx_discovery_num_se(s);
     if (!ses || ses > REG_GFX_GE_RING_MIN_SE)
-        return rdna4_gfx_draw_refuse(s, "GB_ADDR_CONFIG", "shader-engine count is not modelled");
+        return rdna4_gfx_draw_refuse(s, "gc_info gc_num_se", "shader-engine count is not modelled");
     pos_bytes = rdna4_gfx_ring_bytes(s, REG_GFX_GE_POS_RING_BASE,
                                      REG_GFX_GE_POS_RING_SIZE, 0x3fff, vmid);
     prim_bytes = rdna4_gfx_ring_bytes(s, REG_GFX_GE_PRIM_RING_BASE,
@@ -5790,6 +5877,28 @@ static void rdna4_work_schedule(RDNA4State *s)
         qemu_bh_schedule(s->work_bh);
 }
 
+/* A warm platform reset clears PCI Command.BusMaster.  The real platform's
+ * firmware/GOP turns it back on while booting, after which preserved engines
+ * resume their DMA.  Quiesce leaves bus mastering off, so it never arms this
+ * path. */
+static void rdna4_warm_gop_timer(void *opaque)
+{
+    RDNA4State *s = opaque;
+    if (!s->warm_gop_restore)
+        return;
+    s->warm_gop_restore = false;
+
+    PCIDevice *pci = PCI_DEVICE(s);
+    if (!rdna4_bus_master_enabled(s)) {
+        pci_set_word(pci->config + PCI_COMMAND,
+                     pci_get_word(pci->config + PCI_COMMAND) | PCI_COMMAND_MASTER);
+        fprintf(stderr, "rdna4: warm-keep: GOP re-enabled PCI bus master after reset\n");
+    } else {
+        fprintf(stderr, "rdna4: warm-keep: GOP observed PCI bus master already enabled\n");
+    }
+    rdna4_work_schedule(s);
+}
+
 /* BAR2: the doorbell aperture. 64-bit doorbells arrive whole (impl 8). */
 static uint64_t rdna4_doorbell_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -6314,17 +6423,14 @@ static void rdna4_reset(DeviceState *dev)
 
     /* A warm platform reset clears PCI Command.BusMaster.  The GOP is the
      * component that re-enables Bus Master before handing the card back; the
-     * warm-keep model restores it here only to expose the interval in which
-     * preserved engines could still DMA before GOP has done so. */
+     * warm-keep model schedules that delayed handoff while preserving the
+     * engines and counting any DMA after it. */
     if (s->warm_keep && rdna4_engine_active(s)) {
+        const bool restoreBusMaster = rdna4_bus_master_enabled(s) ||
+                                      s->bus_master_before_reset;
         fprintf(stderr, "rdna4: warm-keep: reset PCI bus master current=%d remembered=%d\n",
                 rdna4_bus_master_enabled(s), s->bus_master_before_reset);
-        if (!rdna4_bus_master_enabled(s) && s->bus_master_before_reset) {
-            PCIDevice *pci = PCI_DEVICE(s);
-            pci_set_word(pci->config + PCI_COMMAND,
-                         pci_get_word(pci->config + PCI_COMMAND) | PCI_COMMAND_MASTER);
-            fprintf(stderr, "rdna4: warm-keep: restoring PCI bus master for live engines\n");
-        }
+        s->warm_gop_restore = restoreBusMaster;
         if (s->warm_dma_window)
             fprintf(stderr, "rdna4: warm-keep: DMA-after-reset writes: %" PRIu64 "\n",
                     s->dma_after_reset_writes);
@@ -6334,15 +6440,19 @@ static void rdna4_reset(DeviceState *dev)
         s->warm_dma_window = true;
         s->dma_after_reset_writes = 0;
         fprintf(stderr, "rdna4: warm-keep: reset preserves IH/SDMA/MEC/GFX; "
-                "counting DMA writes until the next reset\n");
-        /* The generic QEMU reset path may cancel a pending BH/timer even
-         * though this device reset intentionally kept the queues.  Re-kick
-         * the live work so a warm reset models the card's engines continuing
-         * to DMA until the driver quiesces them. */
-        rdna4_work_schedule(s);
+                "firmware/GOP will re-enable DMA during boot\n");
+        if (s->warm_gop_timer && s->warm_gop_restore) {
+            timer_mod_ns(s->warm_gop_timer,
+                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + RDNA4_WARM_GOP_DELAY_NS);
+        } else if (s->warm_gop_timer) {
+            timer_del(s->warm_gop_timer);
+        }
         return;
     }
 
+    if (s->warm_gop_timer)
+        timer_del(s->warm_gop_timer);
+    s->warm_gop_restore = false;
     if (s->work_timer)
         timer_del(s->work_timer);
     if (s->work_bh)
@@ -6371,13 +6481,12 @@ static void rdna4_reset(DeviceState *dev)
             error_report_err(err);
         }
     }
-    /* Navi 48: four shader engines, four RBs per SE, two pipes.  amdgpu's
-     * gfx_v12_0 get_gb_addr_config() decodes these fields from
-     * GB_ADDR_CONFIG; the register is read-only in the model, so provide the
-     * GC 12.0 Navi 48 answer when the GOP image did not capture it. */
-    if (!reg_get(s, REG_GFX_GB_ADDR_CONFIG)) {
-        reg_set(s, REG_GFX_GB_ADDR_CONFIG, (2u << 19) | (2u << 26) | 1u);
-    }
+    /* The real Navi 48 GB_ADDR_CONFIG, read on the card (premetal hw-logs,
+     * round 2): 0x08200545.  Its NUM_SHADER_ENGINES field [22:19] reads 4, so
+     * a 1<<n decode gives 16 SEs on a 4-SE chip: the SE count comes from the
+     * IP discovery gc_info table, as in amdgpu_discovery_get_gc_info.  The
+     * register is read-only in the model; always present the card's value. */
+    reg_set(s, REG_GFX_GB_ADDR_CONFIG, 0x08200545u);
     if (dcn) {
         memcpy(s->regs + dcn_start, dcn, dcn_bytes);
         g_free(dcn);
@@ -6499,6 +6608,7 @@ static void rdna4_realize(PCIDevice *dev, Error **errp)
     }
     rdna4_init_earliest_inuse(s);
     s->dcn_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rdna4_dcn_timer, s);
+    s->warm_gop_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rdna4_warm_gop_timer, s);
     s->work_timer = timer_new_ns(QEMU_CLOCK_REALTIME, rdna4_work_timer, s);
     s->work_bh = qemu_bh_new(rdna4_work_bh, s);
 
@@ -6560,6 +6670,11 @@ static void rdna4_exit(PCIDevice *dev)
         timer_free(s->dcn_timer);
         s->dcn_timer = NULL;
     }
+    if (s->warm_gop_timer) {
+        timer_del(s->warm_gop_timer);
+        timer_free(s->warm_gop_timer);
+        s->warm_gop_timer = NULL;
+    }
     graphic_console_close(s->con);
     msi_uninit(dev);
     g_free(s->regs);
@@ -6591,6 +6706,9 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,
                 bool),
     DEFINE_PROP_BOOL("gfx-hang", RDNA4State, gfx_hang, false),
+    DEFINE_PROP_BOOL("smu-stale", RDNA4State, smu_stale, false),
+    DEFINE_PROP_UINT32("smu-refuse", RDNA4State, smu_refuse, 0),
+    DEFINE_PROP_UINT32("smu-refuse-skip", RDNA4State, smu_refuse_skip, 0),
     DEFINE_PROP_BOOL("warm-keep", RDNA4State, warm_keep, false),
     DEFINE_PROP_UINT32("gfx-break", RDNA4State, gfx_break, 0),
     DEFINE_PROP_BOOL("gfx-trace", RDNA4State, gfx_trace, false),

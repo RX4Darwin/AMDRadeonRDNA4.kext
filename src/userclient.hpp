@@ -68,6 +68,7 @@ private:
 	static IOReturn sWaitPresent(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sSubmitIb(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sWaitFence(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sSensorsEx(OSObject *t, void *, IOExternalMethodArguments *a);
 };
 
 #endif /* RDNA4UserClient_hpp */
