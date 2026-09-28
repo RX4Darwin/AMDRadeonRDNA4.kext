@@ -1845,10 +1845,19 @@ static uint8_t *rdna4_phys_span(RDNA4State *s, uint64_t physical, uint64_t len)
 
 static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va)
 {
-    /* CID is reported in the status word; retry is disabled by the kext. */
-    reg_set(s, REG_GCVM_FAULT_STATUS, 1u | ((vmid & 0xff) << 16));
-    reg_set(s, REG_GCVM_FAULT_ADDR_LO, (uint32_t)va);
-    reg_set(s, REG_GCVM_FAULT_ADDR_HI, (uint32_t)(va >> 32));
+    /* gc_12_0_0_sh_mask.h GCVM_L2_PROTECTION_FAULT_STATUS_LO32: MORE_FAULTS
+     * [0], PERMISSION_FAULTS [7:4] (bit 4: the valid bit), VMID [23:20].
+     * The first fault latches until an invalidation clears it; later ones
+     * only set MORE_FAULTS. FAULT_ADDR holds the logical page (VA >> 12:
+     * LOGICAL_PAGE_ADDR_LO32, HI4). Retry is disabled by the kext. */
+    uint32_t status = reg_get(s, REG_GCVM_FAULT_STATUS);
+    if (status) {
+        reg_set(s, REG_GCVM_FAULT_STATUS, status | 1u);
+        return;
+    }
+    reg_set(s, REG_GCVM_FAULT_STATUS, (1u << 4) | ((vmid & 0xfu) << 20));
+    reg_set(s, REG_GCVM_FAULT_ADDR_LO, (uint32_t)(va >> 12));
+    reg_set(s, REG_GCVM_FAULT_ADDR_HI, (uint32_t)(va >> 44) & 0xfu);
 }
 
 static bool rdna4_vm_entry(RDNA4State *s, uint64_t address, uint64_t *entry)
@@ -3413,6 +3422,8 @@ static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)
 /* Process one packet from the client compute IB.  The IB has its own cursor,
  * so a long stream and a dispatch inside it yield through the same MEC
  * bottom-half state machine as packets in the client queue. */
+static void rdna4_mec_eop_access(RDNA4State *s, uint32_t vmid);
+
 static bool rdna4_mec_ib_packet(RDNA4State *s)
 {
     uint32_t dw[16] = { 0 }, hdr, op, count, len;
@@ -3490,6 +3501,7 @@ static bool rdna4_mec_ib_packet(RDNA4State *s)
         uint32_t sel = dw[2] >> 29;
         uint64_t value = dw[5] | ((uint64_t)dw[6] << 32);
         uint32_t bytes = sel == 2 ? 8 : 4;
+        rdna4_mec_eop_access(s, s->mec_work.vmid);
         if (count < 6 || !rdna4_vm_access(s, a, (uint8_t *)&value, bytes,
                                           vmid, true, false)) {
             fprintf(stderr, "rdna4: mec: indirect RELEASE_MEM to 0x%" PRIx64
@@ -3567,6 +3579,62 @@ static void rdna4_mec_select_hqd(RDNA4State *s, uint32_t pipe, uint32_t queue)
     s->selected_vmid = 0;
     if (rdna4_hqd_reg(REG_CP_HQD_VMID, &off))
         s->selected_vmid = s->hqd[pipe][queue].q[off] & 0xf;
+}
+
+/* ---- MEC queue memory: the MQD and the EOP buffer (W16) ----
+ * The CP accesses a queue's MQD through CP_MQD_CONTROL.VMID, not through the
+ * queue's CP_HQD_VMID. amdgpu always keeps it 0 with a VMID0 (MC/GART) MQD
+ * address: gfx_v12_0_compute_mqd_init ("set MQD vmid to 0") and
+ * kfd_mqd_manager_v12 init_mqd (cp_mqd_control = PRIV_STATE only). The EOP
+ * buffer is in the queue's own VMID (kfd_mqd_manager_v12:
+ * cp_hqd_eop_base_addr = eop_ring_buffer_address >> 8, a process VA).
+ * On the real RX 9070 XT, a VMID8 queue whose MQD was an MC address under
+ * CP_MQD_CONTROL.VMID 8 raised a GC UTCL2 fault (IH client 0x0a source 0)
+ * and never executed its first packet: a faulting MQD access stalls the
+ * queue here too. An EOP access that faults is recorded in the fault status
+ * and, with retry off, goes to the fault-default page; the fence still
+ * lands, as nothing on the card says otherwise. */
+#define REG_CP_MQD_BASE_ADDR     GC_SEG0(0x1fa9)
+#define REG_CP_MQD_BASE_ADDR_HI  GC_SEG0(0x1faa)
+#define REG_CP_MQD_CONTROL       GC_SEG0(0x1fcb)       /* VMID [3:0] */
+#define REG_CP_HQD_EOP_BASE      GC_SEG0(0x1fce)       /* address >> 8 */
+#define REG_CP_HQD_EOP_BASE_HI   GC_SEG0(0x1fcf)
+
+/* One CP access to queue memory in the given VMID; false when it faults
+ * (the fault is recorded by the walk). */
+static bool rdna4_mec_queue_mem_ok(RDNA4State *s, uint64_t address, uint32_t vmid)
+{
+    RDNA4VmTarget target;
+
+    if (!vmid)      /* flat MC space; the existing VMID0 paths check their spans */
+        return true;
+    return rdna4_vm_target(s, address, 4, vmid, true, false, &target);
+}
+
+/* The selected HQD's MQD, as the CP reaches it when it takes up the queue. */
+static bool rdna4_mec_mqd_ok(RDNA4State *s, uint32_t pipe, uint32_t queue)
+{
+    uint64_t mqd = (reg_get(s, REG_CP_MQD_BASE_ADDR) & ~3u) |
+                   ((uint64_t)reg_get(s, REG_CP_MQD_BASE_ADDR_HI) << 32);
+    uint32_t vmid = reg_get(s, REG_CP_MQD_CONTROL) & 0xf;
+
+    if (rdna4_mec_queue_mem_ok(s, mqd, vmid))
+        return true;
+    fprintf(stderr, "rdna4: mec: queue pipe %u queue %u stalled: MQD 0x%" PRIx64
+            " faulted in CP_MQD_CONTROL VMID %u (amdgpu keeps it 0)\n",
+            pipe, queue, mqd, vmid);
+    return false;
+}
+
+/* RELEASE_MEM's end-of-pipe event goes through the queue's EOP buffer. */
+static void rdna4_mec_eop_access(RDNA4State *s, uint32_t vmid)
+{
+    uint64_t eop = ((uint64_t)reg_get(s, REG_CP_HQD_EOP_BASE) << 8) |
+                   ((uint64_t)reg_get(s, REG_CP_HQD_EOP_BASE_HI) << 40);
+
+    if (vmid && !rdna4_mec_queue_mem_ok(s, eop, vmid))
+        fprintf(stderr, "rdna4: mec: EOP buffer 0x%" PRIx64 " faulted in VMID %u\n",
+                eop, vmid);
 }
 
 static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
@@ -3649,6 +3717,8 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
                             continue;
                             }
                         }
+                        if (!rdna4_mec_mqd_ok(s, pipe, queue))
+                            continue;
                         s->mec_work.active = true;
                         found = true;
                         break;
@@ -3765,6 +3835,7 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
         case 0x49: {
             uint64_t a = (dw[3] & ~3u) | ((uint64_t)dw[4] << 32);
             uint32_t sel = dw[2] >> 29;
+            rdna4_mec_eop_access(s, s->mec_work.vmid);
             uint8_t *p = rdna4_gc_span_vmid(s, a, sel == 2 ? 8 : 4,
                                             s->mec_work.vmid, true, false);
             if (!p) {
