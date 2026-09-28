@@ -2321,8 +2321,8 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             case 8: r = a << (b & 31); scc = r != 0; break;                    /* s_lshl_b32 */
             case 44: r = a * b; break;                                         /* s_mul_i32 */
             case 22: r = a & b; scc = r != 0; break;                           /* s_and_b32 */
-            case 23: r = a | b; scc = r != 0; break;                           /* s_or_b32 */
-            case 24: r = a ^ b; scc = r != 0; break;                           /* s_xor_b32 */
+            case 24: r = a | b; scc = r != 0; break;                           /* s_or_b32 */
+            case 26: r = a ^ b; scc = r != 0; break;                           /* s_xor_b32 */
             case 34: r = a & ~b; scc = r != 0; break;                          /* s_and_not1_b32 */
             case 36: r = a | ~b; scc = r != 0; break;                          /* s_or_not1_b32 */
             case 21: r = a > b ? a : b; break;                                  /* s_max_u32 */
