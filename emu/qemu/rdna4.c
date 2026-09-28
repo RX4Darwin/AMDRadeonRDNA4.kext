@@ -1998,6 +1998,8 @@ static bool rdna4_vopd_op(uint32_t op, uint32_t a, uint32_t b, uint32_t d, uint3
  * work-group barrier (ISA_BARRIER, pc past the signal), or meets anything
  * unknown (ISA_ERROR, reported). Per work-item, so VCC is one bit
  * (lane-local carry) kept in s[106], and SCC is scalar state of the lane.
+ * This lane-local EXEC/SCC/VCC model is for the per-work-item interpreter;
+ * wave-wide mask operations are not modelled, while gfxemu uses lockstep.
  */
 static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vmid)
 {
@@ -2047,11 +2049,13 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
                 if (sdst <= 127)
                     l->s[sdst] = old;
                 l->s[126] = old & a;
+                scc = l->s[126] != 0;
             } else if (op == 0x30) {                        /* s_and_not1_saveexec_b32 */
                 uint32_t old = l->s[126];
                 if (sdst <= 127)
                     l->s[sdst] = old;
-                l->s[126] = old & ~a;
+                l->s[126] = a & ~old;
+                scc = l->s[126] != 0;
             } else if (op != 0 || sdst >= 106) {             /* s_mov_b32 */
                 goto unknown;
             } else {
@@ -2071,26 +2075,31 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             default: goto unknown;
             }
         } else if ((dw & 0xfe000000u) == 0x7c000000u) {     /* VOPC E32 */
-            uint32_t op = (dw >> 16) & 0x7f;
+            uint32_t op = (dw >> 17) & 0xff;
             uint32_t a = rdna4_isa_src(l, dw & 0x1ff, dw1, &lit);
             uint32_t b = rdna4_isa_src(l, ((dw >> 9) & 0xff) + 256, dw1, &lit);
             bool result;
 
             if (l->s[126]) {
                 switch (op) {
-                case 0x18: result = a > b; break;           /* v_cmp_gt_u32 */
-                case 0x3c:
+                case 0x4c: result = a > b; break;           /* v_cmp_gt_u32 */
+                case 0xcc: result = a > b; break;           /* v_cmpx_gt_u32 */
+                case 0x1e:
+                case 0x9e:
                     a = rdna4_isa_float_src(l, dw & 0x1ff, dw1, &lit);
                     b = rdna4_isa_float_src(l, ((dw >> 9) & 0xff) + 256, dw1, &lit);
-                    result = rdna4_f(a) >= rdna4_f(b);
+                    result = !(rdna4_f(a) < rdna4_f(b));
                     break;                                  /* v_cmp_nlt_f32 */
                 default: goto unknown;
                 }
-                l->s[106] = result;
-                if (((dw >> 24) & 0xff) == 0x7d)          /* v_cmpx_* */
+                if (op & 0x80) {                            /* v_cmpx_*: gfx10+ writes EXEC only */
                     l->s[126] = result;
+                } else {
+                    l->s[106] = result;
+                }
             } else {
-                l->s[106] = 0;
+                if (!(op & 0x80))                            /* inactive E32 VCC lane */
+                    l->s[106] = 0;
             }
         } else if ((dw & 0xffff0000u) == 0xd44c0000u) {     /* v_cmp_gt_u32_e64 */
             uint32_t sdst = dw & 0xff;
@@ -2098,8 +2107,7 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             uint32_t b = rdna4_isa_src(l, ((dw1 >> 9) & 0xff) + 256, dw2, &lit);
             if (sdst > 106)
                 goto unknown;
-            if (l->s[126])
-                l->s[sdst] = a > b;
+            l->s[sdst] = l->s[126] ? (a > b) : 0;
             n = 2;
         } else if ((dw >> 26) == 0x3d) {                    /* SMEM loads */
             uint32_t op = (dw >> 13) & 0x3f, sbase = (dw & 0x3f) * 2, sdata = (dw >> 6) & 0x7f;
@@ -2243,10 +2251,6 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
                 c = rdna4_isa_float_src(l, s2, dw2, &lit);
                 l->v[vdst] = rdna4_u(fmaf(rdna4_f(a), rdna4_f(b), rdna4_f(c)));
                 break;                                                        /* v_fma_f32 */
-            case 0x44c:                                                       /* v_cmp_gt_u32_e64 */
-                if (vdst <= 106)
-                    l->s[vdst] = l->s[126] && a > b;
-                break;
             case 0x256: l->v[vdst] = (a << (b & 31)) | c; break;              /* v_lshl_or_b32 */
             case 0x246: l->v[vdst] = (a << (b & 31)) + c; break;              /* v_lshl_add_u32 */
             case 0x255: l->v[vdst] = a + b + c; break;                        /* v_add3_u32 */
@@ -2293,7 +2297,8 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
                 l->v[vdst] = rdna4_u((float)a);
             } else if (op == 7) {                            /* v_cvt_u32_f32 */
                 float f = rdna4_f(a);
-                l->v[vdst] = f <= 0.0f ? 0 : f >= 4294967295.0f ? UINT32_MAX : (uint32_t)f;
+                l->v[vdst] = isnan(f) || f <= 0.0f ? 0 :
+                              f >= 4294967295.0f ? UINT32_MAX : (uint32_t)f;
             } else {
                 goto unknown;
             }
@@ -2325,7 +2330,7 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             case 26: r = a ^ b; scc = r != 0; break;                           /* s_xor_b32 */
             case 34: r = a & ~b; scc = r != 0; break;                          /* s_and_not1_b32 */
             case 36: r = a | ~b; scc = r != 0; break;                          /* s_or_not1_b32 */
-            case 21: r = a > b ? a : b; break;                                  /* s_max_u32 */
+            case 21: r = a > b ? a : b; scc = a > b; break;                      /* s_max_u32 */
             case 48: r = scc ? a : b; break;                                   /* s_cselect_b32 */
             default: goto unknown;
             }
