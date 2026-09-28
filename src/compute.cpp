@@ -317,14 +317,18 @@ void RDNA4Compute::choosePool() {
 	pool = Pool {};
 	if (!sv.bar0Size || !sv.fbMcTop || sv.scanoutOffset == ~0ull)
 		return;
-	constexpr uint64_t kAlign = 16 * kMiB, kWant = 64 * kMiB, kFloor = 128 * kMiB;
+	// The bring-up needs 64 MiB (its layout ends below kHeapOffset); the rest
+	// of BAR0, up to 128 MiB in all, becomes the user-space heap.
+	constexpr uint64_t kAlign = 16 * kMiB, kNeed = 64 * kMiB, kMost = 128 * kMiB;
+	constexpr uint64_t kFloor = 128 * kMiB;
 	uint64_t start = (sv.scanoutOffset + env.scanoutLength + kAlign - 1) & ~(kAlign - 1);
 	if (start < kFloor)
 		start = kFloor;
-	if (start + kWant > sv.bar0Size)
+	if (start + kNeed > sv.bar0Size)
 		return;
+	const uint64_t room = (sv.bar0Size - start) & ~(kAlign - 1);
 	pool.offset = start;
-	pool.size = kWant;
+	pool.size = room < kMost ? room : kMost;
 	pool.mcAddress = sv.fbMcBase + start;
 	pool.valid = pool.mcAddress + pool.size - 1 <= sv.fbMcTop;
 }
@@ -340,6 +344,8 @@ uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 		return StageOff;
 	}
 	CLOG("bring-up to stage %u requested", stage);
+	if (!rtLock)
+		rtLock = IOLockAlloc();
 
 	if (!survey())
 		return StageOff;
@@ -464,6 +470,8 @@ void RDNA4Compute::runStages() {
 	snprintf(note, sizeof(note), "finished at stage %u", done);
 	trail(note);
 	CLOG("bring-up finished at stage %u", done);
+	if (done >= StageDispatch)
+		publishRuntime(done);
 }
 
 // The pool, uncached: the PSP reads what we write there and writes fences
@@ -1332,7 +1340,7 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	const uint32_t rsrc[2] = { l.rsrc1, l.rsrc2 };
 	const uint32_t zero = 0, all[2] = { 0xffffffff, 0xffffffff };
 	const uint32_t all4[4] = { 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff };
-	const uint32_t start[3] = { 0, 0, 0 }, threads[3] = { l.groupSize, 1, 1 };
+	const uint32_t start[3] = { 0, 0, 0 };
 
 	Pm4::Queue &q = pm4Queue;
 	uint32_t pkt[24];
@@ -1346,21 +1354,29 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe2), all, 2));
 	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe4), all4, 4));
 	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeStartX), start, 3));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeNumThreadX), threads, 3));
+	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeNumThreadX), l.groupSize, 3));
 	if (l.userCount)
 		q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeUserData0), l.user, l.userCount));
-	q.emit(pkt, Pm4::dispatchDirect(pkt, l.groups, 1, 1,
+	q.emit(pkt, Pm4::dispatchDirect(pkt, l.groups[0], l.groups[1], l.groups[2],
 	                                Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 |
 	                                (l.wave32 ? Pm4::kDispatchWave32 : 0)));
 	q.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), ++pm4Fence));
 
-	uint64_t t0 = mach_absolute_time();
+	// Spin for the first 2 ms (short kernels), then sleep between polls:
+	// user dispatches may run for seconds.
+	uint64_t t0 = mach_absolute_time(), span = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(l.timeoutUs ? l.timeoutUs : 1000000) * 1000,
+	                            &span);
 	pm4Kick(q.wptr());
 	bool done = false;
-	for (uint32_t us = 0; us < 1000000 && !done; us += 10) {
+	for (uint32_t polls = 0;; polls++) {
 		done = *poolDw(kPm4FenceOffset) == pm4Fence;
-		if (!done)
+		if (done || mach_absolute_time() - t0 > span)
+			break;
+		if (polls < 200)
 			IODelay(10);
+		else
+			IOSleep(1);
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	if (!done) {
@@ -1373,6 +1389,24 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 		grbmSelect(0, 0, 0, 0);
 	}
 	return done;
+}
+
+bool RDNA4Compute::kernelFits(const CodeObj::Kernel &k, const char **why) {
+	constexpr uint16_t kSgprRequests = 0x7f;   // kernel_code_properties [6:0]
+	const char *w = nullptr;
+	if (k.properties & kSgprRequests & ~(1u << 3))
+		w = "it asks for dispatch/queue pointers, a dispatch id or scratch setup";
+	else if (k.userSgprCount() != (k.wantsKernargPtr() ? 2u : 0u))
+		w = "its user SGPR count does not match its requests";
+	else if (k.privateSegmentSize)
+		w = "it needs scratch memory";
+	else if (k.groupSegmentSize)
+		w = "it needs LDS (group segment)";
+	else if (k.kernargSize > kKernargMax)
+		w = "its kernel arguments exceed 4 KiB";
+	if (why)
+		*why = w;
+	return !w;
 }
 
 // shaders/probe.s: VMID0, wave32, 4 groups of 64 work-items, each writing
@@ -1410,8 +1444,10 @@ bool RDNA4Compute::stageDispatch() {
 	l.rsrc2 = (2u << kRsrc2UserSgprShift) | kRsrc2TgidXEn;
 	l.user = user;
 	l.userCount = 2;
-	l.groups = kDispatchGroups;
-	l.groupSize = kGroupSize;
+	l.groups[0] = kDispatchGroups;
+	l.groups[1] = l.groups[2] = 1;
+	l.groupSize[0] = kGroupSize;
+	l.groupSize[1] = l.groupSize[2] = 1;
 	l.wave32 = true;
 
 	trail("s6: DISPATCH_DIRECT");
@@ -1487,16 +1523,9 @@ bool RDNA4Compute::stageKernel() {
 	put("Rsrc1", k.rsrc1);
 	put("Rsrc2", k.rsrc2);
 
-	// What this launcher provides: the kernarg pointer, nothing else yet —
-	// no dispatch/queue pointers, no scratch, no LDS.
-	constexpr uint16_t kSgprRequests = 0x7f;   // kernel_code_properties [6:0]
-	const bool fits = (k.properties & kSgprRequests & ~(1u << 3)) == 0 &&
-	                  k.userSgprCount() == (k.wantsKernargPtr() ? 2u : 0u) &&
-	                  !k.privateSegmentSize && !k.groupSegmentSize &&
-	                  k.codeSize <= kCodeObjCodeMax && k.kernargSize <= kKernargMax;
-	if (!fits) {
-		CLOG("kernel: vadd asks for more than this launcher provides (properties 0x%x, "
-		     "scratch %u, LDS %u)", k.properties, k.privateSegmentSize, k.groupSegmentSize);
+	why = nullptr;
+	if (!kernelFits(k, &why) || k.codeSize > kCodeObjCodeMax) {
+		CLOG("kernel: vadd cannot be launched here: %s", why ? why : "code too large");
 		publish();
 		return false;
 	}
@@ -1540,8 +1569,10 @@ bool RDNA4Compute::stageKernel() {
 	l.rsrc3 = k.rsrc3;
 	l.user = user;
 	l.userCount = k.userSgprCount();
-	l.groups = kVaddItems / kGroupSize;
-	l.groupSize = kGroupSize;              // vadd's reqd_work_group_size
+	l.groups[0] = kVaddItems / kGroupSize;
+	l.groups[1] = l.groups[2] = 1;
+	l.groupSize[0] = kGroupSize;           // vadd's reqd_work_group_size
+	l.groupSize[1] = l.groupSize[2] = 1;
 	l.wave32 = k.wave32();
 
 	trail("s7: DISPATCH_DIRECT vadd");

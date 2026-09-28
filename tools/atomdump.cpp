@@ -27,7 +27,9 @@
 #include "../src/sdma.hpp"
 #include "../src/pm4.hpp"
 #include "../src/codeobj.hpp"
+#include "../src/gpuheap.hpp"
 #include "../src/vadd_codeobj.h"
+#include "rdna4compute.h"
 
 #include <cstdarg>
 #include <cstdint>
@@ -1690,6 +1692,7 @@ static int testCodeObject() {
 	const char *why = nullptr;
 	bool ok = CodeObj::findKernel(kVaddCodeObject, sizeof(kVaddCodeObject), "vadd", k, &why);
 	failures += check(ok, "codeobj: vadd not found (%s)", why ? why : "-");
+	const uint64_t entryVa = k.entryVa;
 	if (ok) {
 		// llvm-readelf: .text at file offset 0x600, 0x280 bytes; the descriptor
 		// says 24 bytes of kernargs, RSRC1 0x600f0040, RSRC2 0x84 (2 user SGPRs,
@@ -1712,8 +1715,64 @@ static int testCodeObject() {
 	                  "codeobj: a missing kernel was found");
 	failures += check(!CodeObj::findKernel(kVaddCodeObject, 200, "vadd", k, &why),
 	                  "codeobj: a truncated file was accepted");
-	printf("\ncodeobj: clang's vadd code object: kernel, descriptor and code located %s\n",
+
+	// The whole image (llvm-readelf -l): PT_LOADs at 0 (0x5c4 bytes),
+	// 0x1600 (.text, from file 0x600, 0x280) and 0x2880 (0x70 in the file,
+	// 0x780 in memory): 0x3000 bytes, code at +0x1600.
+	CodeObj::Image img;
+	ok = CodeObj::parseImage(kVaddCodeObject, sizeof(kVaddCodeObject), img, &why);
+	failures += check(ok && img.count == 3 && img.size == 0x3000 && entryVa == 0x1600,
+	                  "codeobj: image %s: %u segments, 0x%llx bytes, entry 0x%llx",
+	                  ok ? "ok" : why, img.count, (unsigned long long)img.size,
+	                  (unsigned long long)entryVa);
+	if (ok && img.count == 3) {
+		const auto &s = img.seg[1];
+		failures += check(s.fileOffset == 0x600 && s.fileSize == 0x280 && s.vaddr == 0x1600 &&
+		                  img.seg[2].fileSize == 0x70 && img.seg[2].memSize == 0x780,
+		                  "codeobj: segment layout");
+	}
+	failures += check(!CodeObj::parseImage(kVaddCodeObject, 200, img, &why),
+	                  "codeobj: image of a truncated file accepted");
+	printf("\ncodeobj: clang's vadd code object: kernel, descriptor, code and image located %s\n",
 	       failures ? "FAILED" : "ok");
+	return failures;
+}
+
+static int testGpuHeap() {
+	int failures = 0;
+	static GpuHeap::Heap h;                       // 32 KiB of state: not on the stack
+	constexpr uint64_t G = GpuHeap::Heap::kGranule, base = 32ull << 20;
+	h.init(base, 64 * G + 100);                   // the partial granule is dropped
+	failures += check(h.size() == 64 * G && h.freeBytes() == 64 * G, "heap: size %llu",
+	                  (unsigned long long)h.size());
+
+	uint64_t a = 0, b = 0, c = 0, d = 0;
+	bool ok = h.alloc(1, a) && h.alloc(3 * G, b) && h.alloc(G + 1, c);
+	failures += check(ok && a == base && b == base + G && c == base + 4 * G &&
+	                  h.lengthOf(b) == 3 * G && h.lengthOf(c) == 2 * G &&
+	                  h.freeBytes() == 58 * G, "heap: first-fit offsets");
+	failures += check(!h.alloc(0, d) && !h.alloc(65 * G, d), "heap: empty/oversized allocation");
+	failures += check(!h.free(b + G) && !h.free(base + 100) && !h.free(base + 64 * G),
+	                  "heap: free of a non-allocation accepted");
+	// A hole between a and c: a larger request goes past c, a fitting one
+	// fills the hole.
+	failures += check(h.free(b) && !h.free(b), "heap: free / double free");
+	ok = h.alloc(4 * G, d) && d == base + 6 * G && h.alloc(2 * G, b) && b == base + G;
+	failures += check(ok, "heap: hole reuse (d 0x%llx b 0x%llx)", (unsigned long long)d,
+	                  (unsigned long long)b);
+	// Adjacent allocations stay separate: freeing one leaves its neighbours.
+	failures += check(h.free(b) && h.lengthOf(c) == 2 * G && h.lengthOf(a) == G,
+	                  "heap: neighbours after a free");
+	h.free(a);
+	h.free(c);
+	h.free(d);
+	failures += check(h.freeBytes() == h.size() && h.alloc(64 * G, a) && a == base,
+	                  "heap: everything back in one piece");
+	// The struct the user client copies in is the one user space sends.
+	failures += check(sizeof(RDNA4Dispatch) == 2088 && RDNA4_MAX_KERNARG == 2048,
+	                  "abi: RDNA4Dispatch is %zu bytes", sizeof(RDNA4Dispatch));
+	printf("\nheap: first-fit VRAM heap allocates, frees and refuses %s\n",
+	       failures ? "FAILED" : "correctly");
 	return failures;
 }
 
@@ -1910,6 +1969,7 @@ int main(int argc, char **argv) {
 	failures += testSdmaPackets();
 	failures += testPm4Packets();
 	failures += testCodeObject();
+	failures += testGpuHeap();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

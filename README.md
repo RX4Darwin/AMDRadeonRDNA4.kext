@@ -105,7 +105,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-smuping=1` | Read-only SMU (power-management firmware) handshake: TestMessage + PMFW/interface version queries over the MP1 mailbox. No DPM changes. Publishes `SMU,FirmwareVersion` / `SMU,Verified`. Prerequisite check for future clock control. |
 | `rdna4-ihdump=1` | Read-only interrupt-delivery survey: OSSSYS IH ring state, per-OTG vertical-interrupt line config, PCI MSI/MSI-X capability words. Groundwork for real VBL interrupts. |
 | `rdna4-pspdump=1` | Read-only PSP (security processor) survey: bootloader/sOS/GPCOM-ring status from the MPASP scratch registers. Publishes `PSP,Alive` / `PSP,SOSVersion`. Decides whether loading fresh firmware (e.g. a current DMUB) is viable. |
-| `rdna4-compute=<stage>` | Compute bring-up, written from scratch (`src/compute.cpp`), run after the display is answered for and never with a GPU reset. `1` = read-only survey: GFX (IMU/RLC/PFP/ME/MEC/MES), both SDMA engines, GC and MM hub apertures, PSP, HDP flush remap, and the VRAM window chosen for compute; published as the `Compute,Survey` dictionary. `2` = PSP bring-up on a background thread 5 s after the desktop: the secure-OS components through the PSP bootloader, the GPCOM command ring, `LOAD_TOC`, then the SMU firmware via `LOAD_IP_FW`, proven by the SMU answering its mailbox; published as `Compute,PSP` and `Compute,Stage`. `3` = the 19 GC firmware images through the PSP and the RLC autoload (`Compute,GFX`). `4` = GC hub for VMID0, SDMA0 queue, a WRITE and a 1 MiB fill checked by the CPU (`Compute,SDMA`). `5` = a MEC compute queue programmed directly (no MES), fed through its doorbell, running PM4: the scratch-register ring test, WRITE_DATA and a RELEASE_MEM fence (`Compute,MEC`). `6` = a real gfx1201 kernel (`shaders/probe.s`) dispatched on the compute units, all 256 results checked (`Compute,Dispatch`). `7` = a clang-built kernel (`shaders/vadd.cl`) launched from its AMDGPU code object: the loader (`src/codeobj.cpp`) finds the kernel and its descriptor, the dispatch uses the compiled RSRC1/2/3 and a kernarg buffer, and 4096 results of `c = a + 3b` are checked (`Compute,Kernel`). Each step leaves a breadcrumb in NVRAM (`4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail`) so a hang names the step. Needs the linux-firmware blobs in `firmware/amdgpu/` at build time (`tools/fetch-firmware.sh`). |
+| `rdna4-compute=<stage>` | Compute bring-up, written from scratch (`src/compute.cpp`), run after the display is answered for and never with a GPU reset. `1` = read-only survey: GFX (IMU/RLC/PFP/ME/MEC/MES), both SDMA engines, GC and MM hub apertures, PSP, HDP flush remap, and the VRAM window chosen for compute; published as the `Compute,Survey` dictionary. `2` = PSP bring-up on a background thread 5 s after the desktop: the secure-OS components through the PSP bootloader, the GPCOM command ring, `LOAD_TOC`, then the SMU firmware via `LOAD_IP_FW`, proven by the SMU answering its mailbox; published as `Compute,PSP` and `Compute,Stage`. `3` = the 19 GC firmware images through the PSP and the RLC autoload (`Compute,GFX`). `4` = GC hub for VMID0, SDMA0 queue, a WRITE and a 1 MiB fill checked by the CPU (`Compute,SDMA`). `5` = a MEC compute queue programmed directly (no MES), fed through its doorbell, running PM4: the scratch-register ring test, WRITE_DATA and a RELEASE_MEM fence (`Compute,MEC`). `6` = a real gfx1201 kernel (`shaders/probe.s`) dispatched on the compute units, all 256 results checked (`Compute,Dispatch`). `7` = a clang-built kernel (`shaders/vadd.cl`) launched from its AMDGPU code object: the loader (`src/codeobj.cpp`) finds the kernel and its descriptor, the dispatch uses the compiled RSRC1/2/3 and a kernarg buffer, and 4096 results of `c = a + 3b` are checked (`Compute,Kernel`). After stage 6 or 7 the runtime is published for user space (see *User-space compute*). Each step leaves a breadcrumb in NVRAM (`4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail`) so a hang names the step. Needs the linux-firmware blobs in `firmware/amdgpu/` at build time (`tools/fetch-firmware.sh`). |
 | `rdna4-fakeedid=0` | `VMTEST=1` builds only: they serve the Lenovo fixture EDID and enable `rdna4-modeset` by default (so the mode list can be checked in a VM whose OpenCore pins boot-args); `=0` turns either off. |
 | `-rdna4dbg` | Lilu debug logging for the plugin (Lilu DEBUG builds). |
 
@@ -134,13 +134,18 @@ of toggling a DP stream.
 |------|---------|
 | `src/plugin.cpp` | Lilu plugin entry: routes `IONDRVFramebuffer::doDriverIO`, recognises our framebuffers, creates the device state, hands NDRV requests to the translator. Checks the local NDRV record mirrors against the SDK at compile time. |
 | `src/device.{hpp,cpp}` | `RDNA4Device`: scanout adoption, BAR5 MMIO, VBIOS/IP discovery, lit pipe, AUX/DC_I2C engines and EDID, DMUB ring, SMU/PSP/IH diagnostics, display power, mode table. |
-| `src/compute.{hpp,cpp}` | `RDNA4Compute`: staged compute bring-up next to the display path (`rdna4-compute=<stage>`); stage 1 surveys the engines, hubs, PSP and VRAM layout. |
+| `src/compute.{hpp,cpp}` | `RDNA4Compute`: staged compute bring-up next to the display path (`rdna4-compute=<stage>`): survey, PSP and SMU firmware, GC firmware and RLC autoload, GC hub and SDMA, a MEC queue, kernel dispatch. |
 | `src/gfxregs.hpp` | Register map of the compute side (GC 12.0.1, SDMA 7, GC/MM hubs, NBIF HDP remap, PSP and SMU mailboxes) as segment + dword offset pairs. |
 | `src/amdfw.{hpp,cpp}` | Freestanding parser for AMD firmware containers: common header, LOAD_IP_FW payloads, the PSP secure-OS package. Host-tested against the real blobs. |
 | `src/psp.{hpp,cpp}` | Freestanding PSP driver: bootloader component loading, GPCOM ring, command submission with fences, LOAD_TOC, LOAD_IP_FW. Host-tested against a simulated PSP. |
 | `src/fwblobs.S` | Embeds the PSP sOS, SMU, SDMA and GC 12.0.1 firmware from `firmware/amdgpu/` (linux-firmware, AMD redistributable license) into the kext. |
 | `src/sdma.{hpp,cpp}` | SDMA 7 packet builders (WRITE, FENCE, CONST_FILL, COPY) and ring writer. Host-tested. |
 | `src/pm4.{hpp,cpp}` | PM4 type-3 packet builders (SET_UCONFIG_REG, SET_SH_REG, WRITE_DATA, ACQUIRE/RELEASE_MEM, DISPATCH_DIRECT) and compute queue writer. Host-tested. |
+| `src/codeobj.{hpp,cpp}` | Freestanding AMDGPU code-object reader: a kernel's descriptor (RSRC1/2/3, kernarg size, SGPR requests) and the loadable image (PT_LOAD segments at their virtual addresses). Host-tested against clang's output. |
+| `src/runtime.cpp`, `src/gpuheap.{hpp,cpp}` | The user-space compute runtime: a 4 KiB-granule VRAM heap, buffers and programs per connection, synchronous dispatches on the MEC queue, hung-queue detection. The heap is host-tested. |
+| `src/userclient.{hpp,cpp}` | `RDNA4ComputeService` (published once stage 6/7 finished) and `RDNA4ComputeClient`, the IOUserClient that checks each call and hands it to the runtime. Root only. |
+| `include/rdna4compute.h` | The user-space ABI: selectors, scalar/struct shapes, the dispatch struct. Shared by the kext and user space. |
+| `userspace/librdna4.{h,c}`, `userspace/rdna4-run.c` | C library over the user client, and `rdna4-run` (`info`, `selftest`, `load`). Built with the kext (`build/rdna4-run`). |
 | `shaders/probe.s`, `src/probe_kernel.h` | The stage-6 test kernel (gfx1201 assembly) and its machine code, generated by `tools/build-shaders.sh` with upstream LLVM. |
 | `src/ndrv.{hpp,cpp}` | Freestanding NDRV `csc` translator: mode list, video parameters, timings, current mode, connection, EDID blocks, DPMS, mode switch. Host-tested. |
 | `src/bochsvbe.{hpp,cpp}` | `VMTEST` only: mode switches on QEMU's `vmware-svga` through the Bochs VBE interface (the one OVMF's GOP uses on that card). |
@@ -160,6 +165,47 @@ of toggling a DP stream.
 | `tools/linux-capture.sh` | Ground-truth capture of amdgpu's display programming on Linux, for the mode-set engine. |
 | `Info.plist` | Lilu plugin personality (`IOResources`), OSBundleLibraries (Lilu, IOPCIFamily, KPIs). |
 | `Makefile` | Cross-compiles x86_64 on any host, assembles the `.kext`. |
+
+## User-space compute (`rdna4-run`, `librdna4`)
+
+With `rdna4-compute=6` or `7`, once the bring-up finishes the kext publishes
+`RDNA4ComputeService` and any root process can run gfx1201 kernels on the
+card. The model is HSA's, kept synchronous: allocate VRAM buffers (their GPU
+addresses go into kernel arguments), copy data in and out, load a code
+object as clang builds it (`clang -target amdgcn-amd-amdhsa -mcpu=gfx1201`
+then `ld.lld -shared`), dispatch a kernel over a 3-D grid and wait for it.
+Buffers and programs belong to the connection and are freed when it closes.
+
+```sh
+sudo build/rdna4-run info                     # stage, heap size and free space
+sudo build/rdna4-run selftest [items]         # vadd on the GPU, every result checked
+sudo build/rdna4-run load k.hsaco my_kernel   # load a code object, describe a kernel
+```
+
+From C, `userspace/librdna4.h`:
+
+```c
+rdna4_t gpu;              rdna4_open(&gpu);
+rdna4_buffer_t a;         rdna4_alloc(&gpu, n * 4, &a);          // a.gpu -> kernargs
+rdna4_write(&gpu, &a, 0, host, n * 4);
+rdna4_program_t k;        rdna4_load(&gpu, elf, elfBytes, "vadd", &k);
+uint64_t args[3] = { a.gpu, b.gpu, c.gpu };
+uint32_t groups[3] = { n / 64, 1, 1 }, size[3] = { 64, 1, 1 };
+rdna4_dispatch(&gpu, &k, groups, size, args, sizeof args, 1000, NULL);
+rdna4_read(&gpu, &c, 0, host, n * 4);
+rdna4_close(&gpu);
+```
+
+Limits for now:
+- Kernels get the kernarg pointer and nothing else. Kernels that need
+  dispatch/queue pointers, scratch or LDS are refused at load, with the reason
+  in the kernel log.
+- Hidden (implicit) arguments are zero unless the caller writes them.
+- The heap is the CPU-visible part of the compute pool (96 MiB with a 256 MiB
+  BAR0).
+- Every kernel runs in VMID0: it can reach all of VRAM, hence root only.
+- A dispatch that misses its timeout marks the runtime wedged until reboot,
+  because there is no queue reset yet.
 
 ## Building
 

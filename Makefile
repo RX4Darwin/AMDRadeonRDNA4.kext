@@ -57,6 +57,9 @@ CXX_SRCS := \
 	src/sdma.cpp \
 	src/pm4.cpp \
 	src/codeobj.cpp \
+	src/gpuheap.cpp \
+	src/runtime.cpp \
+	src/userclient.cpp \
 	$(LILU)/Library/plugin_start.cpp \
 	src/atombios.cpp \
 	src/ipdiscovery.cpp \
@@ -99,6 +102,7 @@ COMMON_FLAGS := \
 	-target $(ARCH)-apple-macos$(DEPLOY) \
 	-isysroot $(SDK) \
 	-I$(MKSDK)/Headers \
+	-Iinclude \
 	-I$(LILU_SHIM) \
 	-I$(LILU) \
 	-mmacosx-version-min=$(DEPLOY) \
@@ -138,13 +142,26 @@ LDFLAGS := \
 ATOMDUMP := $(BUILD)/atomdump
 FIRMWARE := firmware/Sapphire.RX9070XT.16384.241213.rom
 
-# --- rules -------------------------------------------------------------------
-.PHONY: all clean test
-all: $(KEXT)
+# --- user space: the compute runtime's client (userspace/, macOS) -------------
+RUN_TOOL := $(BUILD)/rdna4-run
+USER_FLAGS := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
+              -mmacosx-version-min=$(DEPLOY) -std=c11 -O2 -Wall -Iinclude -Isrc
 
-$(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp src/amdfw.cpp src/amdfw.hpp src/psp.cpp src/psp.hpp src/sdma.cpp src/sdma.hpp src/pm4.cpp src/pm4.hpp src/codeobj.cpp src/codeobj.hpp src/vadd_codeobj.h
+# --- rules -------------------------------------------------------------------
+.PHONY: all clean test userspace
+all: $(KEXT) $(RUN_TOOL)
+
+$(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp src/amdfw.cpp src/amdfw.hpp src/psp.cpp src/psp.hpp src/sdma.cpp src/sdma.hpp src/pm4.cpp src/pm4.hpp src/codeobj.cpp src/codeobj.hpp src/vadd_codeobj.h src/gpuheap.cpp src/gpuheap.hpp include/rdna4compute.h
 	@mkdir -p $(BUILD)
-	$(CXX) -std=c++17 -Wall -O2 -o $@ tools/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp src/modeset.cpp src/amdfw.cpp src/psp.cpp src/sdma.cpp src/pm4.cpp src/codeobj.cpp
+	$(CXX) -std=c++17 -Wall -O2 -Iinclude -o $@ tools/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp src/modeset.cpp src/amdfw.cpp src/psp.cpp src/sdma.cpp src/pm4.cpp src/codeobj.cpp src/gpuheap.cpp
+
+# Linked by the C++ driver: it is the one pointed at ld64 (build-osxcross.sh).
+$(RUN_TOOL): userspace/rdna4-run.c userspace/librdna4.c userspace/librdna4.h include/rdna4compute.h src/vadd_codeobj.h
+	@mkdir -p $(BUILD)
+	$(CXX) -x c $(USER_FLAGS) userspace/rdna4-run.c userspace/librdna4.c \
+		-framework IOKit -framework CoreFoundation -o $@
+
+userspace: $(RUN_TOOL)
 
 atomdump: $(ATOMDUMP)
 

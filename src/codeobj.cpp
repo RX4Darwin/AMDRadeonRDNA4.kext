@@ -55,7 +55,68 @@ struct Elf {
 		return false;
 	}
 };
+
+// The ELF header checks both entry points share; nullptr when it is a
+// gfx1201 AMDGPU code object with sane section headers.
+const char *checkHeader(const uint8_t *d, size_t n, Elf &e) {
+	if (!d || n < 64 || d[0] != 0x7f || d[1] != 'E' || d[2] != 'L' || d[3] != 'F' ||
+	    d[4] != 2 /* ELFCLASS64 */ || d[5] != 1 /* little-endian */)
+		return "not an ELF64 little-endian file";
+	if (u16(d + 18) != kEmAmdgpu)
+		return "not an AMDGPU code object";
+	if ((u32(d + 48) & 0xff) != kMachGfx1201)
+		return "not built for gfx1201";
+	e = Elf { d, n, u64(d + 40), u16(d + 58), u16(d + 60) };
+	if (e.shentsize < 64 || !inside(n, e.shoff, static_cast<uint64_t>(e.shnum) * e.shentsize))
+		return "bad section headers";
+	return nullptr;
+}
 } // namespace
+
+bool parseImage(const uint8_t *d, size_t n, Image &out, const char **why) {
+	auto fail = [why](const char *w) {
+		if (why)
+			*why = w;
+		return false;
+	};
+	out = Image {};
+	Elf e {};
+	if (const char *w = checkHeader(d, n, e))
+		return fail(w);
+
+	const uint64_t phoff = u64(d + 32);
+	const uint16_t phentsize = u16(d + 54), phnum = u16(d + 56);
+	if (phentsize < 56 || !inside(n, phoff, static_cast<uint64_t>(phnum) * phentsize))
+		return fail("bad program headers");
+	for (uint32_t i = 0; i < phnum; i++) {
+		const uint8_t *p = d + phoff + static_cast<uint64_t>(i) * phentsize;
+		if (u32(p) != 1 /* PT_LOAD */)
+			continue;
+		const uint64_t off = u64(p + 8), va = u64(p + 16), fileSz = u64(p + 32), memSz = u64(p + 40);
+		if (fileSz > memSz || !inside(n, off, fileSz))
+			return fail("bad PT_LOAD segment");
+		if (va > Image::kMaxSize || memSz > Image::kMaxSize - va)
+			return fail("image larger than 16 MiB");
+		if (out.count == Image::kMaxSegments)
+			return fail("too many PT_LOAD segments");
+		out.seg[out.count++] = { off, fileSz, va, memSz };
+		if (va + memSz > out.size)
+			out.size = va + memSz;
+	}
+	if (!out.count || !out.size)
+		return fail("no loadable segments");
+
+	for (uint32_t i = 1; i < e.shnum; i++) {
+		const uint8_t *s = e.sh(i);
+		const uint32_t type = u32(s + 4);
+		const uint64_t flags = u64(s + 8), size = u64(s + 32);
+		if ((type == 4 /* SHT_RELA */ || type == 9 /* SHT_REL */) && (flags & 2 /* ALLOC */) && size)
+			return fail("it has dynamic relocations (not applied by this loader)");
+	}
+	if (why)
+		*why = nullptr;
+	return true;
+}
 
 bool findKernel(const uint8_t *d, size_t n, const char *name, Kernel &out, const char **why) {
 	auto fail = [why](const char *w) {
@@ -64,17 +125,9 @@ bool findKernel(const uint8_t *d, size_t n, const char *name, Kernel &out, const
 		return false;
 	};
 	out = Kernel {};
-	if (!d || n < 64 || d[0] != 0x7f || d[1] != 'E' || d[2] != 'L' || d[3] != 'F' ||
-	    d[4] != 2 /* ELFCLASS64 */ || d[5] != 1 /* little-endian */)
-		return fail("not an ELF64 little-endian file");
-	if (u16(d + 18) != kEmAmdgpu)
-		return fail("not an AMDGPU code object");
-	if ((u32(d + 48) & 0xff) != kMachGfx1201)
-		return fail("not built for gfx1201");
-
-	Elf e { d, n, u64(d + 40), u16(d + 58), u16(d + 60) };
-	if (e.shentsize < 64 || !inside(n, e.shoff, static_cast<uint64_t>(e.shnum) * e.shentsize))
-		return fail("bad section headers");
+	Elf e {};
+	if (const char *w = checkHeader(d, n, e))
+		return fail(w);
 
 	uint64_t codeVa = 0, kdVa = 0;
 	bool haveCode = false, haveKd = false;
@@ -133,6 +186,7 @@ bool findKernel(const uint8_t *d, size_t n, const char *name, Kernel &out, const
 		return fail("kernel code outside the file");
 	out.codeOffset = static_cast<uint32_t>(codeOff);
 	out.codeSize = codeLeft > 0xffffffffu ? 0xffffffffu : static_cast<uint32_t>(codeLeft);
+	out.entryVa = entryVa;
 	if (why)
 		*why = nullptr;
 	return true;

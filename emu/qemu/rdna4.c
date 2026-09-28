@@ -1481,17 +1481,22 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
     uint64_t pgm = ((uint64_t)reg_get(s, REG_CS_PGM_LO) << 8) |
                    ((uint64_t)reg_get(s, REG_CS_PGM_HI) << 40);
     uint32_t rsrc2 = reg_get(s, REG_CS_RSRC2), nuser = (rsrc2 >> 1) & 0x1f;
-    uint32_t threads = reg_get(s, REG_CS_NUM_THREAD_X), ran = 0;
+    uint32_t tx = reg_get(s, REG_CS_NUM_THREAD_X), ty = reg_get(s, REG_CS_NUM_THREAD_X + 4);
+    uint32_t tz = reg_get(s, REG_CS_NUM_THREAD_X + 8);
+    uint64_t ran = 0;
 
     if (!(initiator & 1) || !reg_get(s, REG_SH_MEM_CONFIG) || !reg_get(s, REG_CS_THREAD_SE0) ||
-        !threads || dim_y != 1 || dim_z != 1) {
+        !tx || !ty || !tz || (uint64_t)tx * ty * tz > 1024 || !dim_x || !dim_y || !dim_z) {
         fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u refused (initiator 0x%x, SH_MEM_CONFIG "
-                "0x%x, CU mask SE0 0x%x, %u threads)\n", dim_x, dim_y, dim_z, initiator,
-                reg_get(s, REG_SH_MEM_CONFIG), reg_get(s, REG_CS_THREAD_SE0), threads);
+                "0x%x, CU mask SE0 0x%x, group %ux%ux%u)\n", dim_x, dim_y, dim_z, initiator,
+                reg_get(s, REG_SH_MEM_CONFIG), reg_get(s, REG_CS_THREAD_SE0), tx, ty, tz);
         return;
     }
-    for (uint32_t g = 0; g < dim_x; g++) {
-        for (uint32_t t = 0; t < threads; t++) {
+    for (uint32_t gz = 0; gz < dim_z; gz++)
+    for (uint32_t gy = 0; gy < dim_y; gy++)
+    for (uint32_t gx = 0; gx < dim_x; gx++) {
+        for (uint32_t t = 0; t < tx * ty * tz; t++) {
+            uint32_t x = t % tx, y = (t / tx) % ty, z = t / (tx * ty);
             RDNA4Lane l = { 0 };
             for (uint32_t i = 0; i < nuser && i < 16; i++) {
                 l.s[i] = reg_get(s, REG_CS_USER_DATA_0 + 4 * i);
@@ -1502,19 +1507,20 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
              * after the user ones (LLVM's FeatureArchitectedSGPRs; clang's
              * gfx1201 code reads ttmp9).
              */
-            if (rsrc2 & (1u << 7)) {                    /* TGID_X_EN */
-                l.s[108 + 9] = g;
-                l.s[108 + 7] = 0;
-            }
-            l.v[0] = t & 0x3ff;                          /* packed ids: x [9:0] */
+            l.s[108 + 9] = (rsrc2 & (1u << 7)) ? gx : 0;                /* TGID_X_EN */
+            l.s[108 + 7] = ((rsrc2 & (1u << 8)) ? (gy & 0xffff) : 0) |  /* TGID_Y_EN */
+                           ((rsrc2 & (1u << 9)) ? (gz << 16) : 0);       /* TGID_Z_EN */
+            l.v[0] = (x & 0x3ff) | ((y & 0x3ff) << 10) | ((z & 0x3ff) << 20);   /* packed */
             if (!rdna4_isa_run(s, pgm, &l)) {
-                fprintf(stderr, "rdna4: cs: dispatch stopped at group %u item %u\n", g, t);
+                fprintf(stderr, "rdna4: cs: dispatch stopped at group %u,%u,%u item %u\n",
+                        gx, gy, gz, t);
                 return;
             }
             ran++;
         }
     }
-    fprintf(stderr, "rdna4: cs: dispatch %ux%u ran %u work-items\n", dim_x, threads, ran);
+    fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u of %ux%ux%u ran %" PRIu64 " work-items\n",
+            dim_x, dim_y, dim_z, tx, ty, tz, ran);
 }
 
 static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)

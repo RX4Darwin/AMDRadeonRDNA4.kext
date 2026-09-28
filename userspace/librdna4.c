@@ -1,0 +1,132 @@
+/*
+ *  librdna4.c
+ *  RDNA4FB
+ *
+ *  See librdna4.h.
+ */
+
+#include "librdna4.h"
+
+#include <mach/mach.h>
+#include <mach/mach_error.h>
+#include <string.h>
+
+kern_return_t rdna4_open(rdna4_t *dev) {
+	dev->conn = IO_OBJECT_NULL;
+	/* MACH_PORT_NULL: the default main port, on every macOS version. */
+	io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL,
+	                                               IOServiceMatching(RDNA4_COMPUTE_SERVICE));
+	if (svc == IO_OBJECT_NULL)
+		return kIOReturnNotFound;
+	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &dev->conn);
+	IOObjectRelease(svc);
+	return kr;
+}
+
+void rdna4_close(rdna4_t *dev) {
+	if (dev->conn != IO_OBJECT_NULL)
+		IOServiceClose(dev->conn);
+	dev->conn = IO_OBJECT_NULL;
+}
+
+kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out) {
+	uint64_t o[6] = { 0 };
+	uint32_t n = 6;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodInfo, NULL, 0, o, &n);
+	if (kr == KERN_SUCCESS) {
+		out->abi = o[0];
+		out->stage = o[1];
+		out->flags = o[2];
+		out->heapBytes = o[3];
+		out->heapFree = o[4];
+		out->heapBase = o[5];
+	}
+	return kr;
+}
+
+kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out) {
+	uint64_t o[2] = { 0 };
+	uint32_t n = 2;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodAlloc, &bytes, 1, o, &n);
+	if (kr == KERN_SUCCESS) {
+		out->handle = o[0];
+		out->gpu = o[1];
+		out->bytes = bytes;
+	}
+	return kr;
+}
+
+kern_return_t rdna4_free(rdna4_t *dev, const rdna4_buffer_t *buf) {
+	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodFree, &buf->handle, 1, NULL, NULL);
+}
+
+static kern_return_t copy(rdna4_t *dev, uint32_t sel, const rdna4_buffer_t *buf, uint64_t offset,
+                          const void *host, uint64_t bytes) {
+	const uint64_t in[4] = { buf->handle, offset, (uint64_t)(uintptr_t)host, bytes };
+	return IOConnectCallScalarMethod(dev->conn, sel, in, 4, NULL, NULL);
+}
+
+kern_return_t rdna4_write(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                          const void *src, uint64_t bytes) {
+	return copy(dev, kRDNA4MethodWrite, buf, offset, src, bytes);
+}
+
+kern_return_t rdna4_read(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                         void *dst, uint64_t bytes) {
+	return copy(dev, kRDNA4MethodRead, buf, offset, dst, bytes);
+}
+
+kern_return_t rdna4_load(rdna4_t *dev, const void *elf, size_t bytes, const char *kernel,
+                         rdna4_program_t *out) {
+	const size_t nameBytes = strlen(kernel) + 1;
+	if (nameBytes > RDNA4_MAX_NAME)
+		return kIOReturnBadArgument;
+	const uint64_t in[2] = { (uint64_t)(uintptr_t)elf, bytes };
+	uint64_t o[7] = { 0 };
+	uint32_t n = 7;
+	kern_return_t kr = IOConnectCallMethod(dev->conn, kRDNA4MethodLoad, in, 2, kernel, nameBytes,
+	                                       o, &n, NULL, NULL);
+	if (kr == KERN_SUCCESS) {
+		out->handle = o[0];
+		out->kernargBytes = o[1];
+		out->imageBytes = o[2];
+		out->rsrc1 = o[3];
+		out->rsrc2 = o[4];
+		out->rsrc3 = o[5];
+		out->properties = o[6];
+	}
+	return kr;
+}
+
+kern_return_t rdna4_unload(rdna4_t *dev, const rdna4_program_t *prog) {
+	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodUnload, &prog->handle, 1, NULL, NULL);
+}
+
+kern_return_t rdna4_dispatch(rdna4_t *dev, const rdna4_program_t *prog, const uint32_t groups[3],
+                             const uint32_t groupSize[3], const void *kernargs,
+                             uint32_t kernargBytes, uint32_t timeoutMs, uint64_t *micros) {
+	if (kernargBytes > RDNA4_MAX_KERNARG || prog->handle > 0xffffffffu)
+		return kIOReturnBadArgument;
+	RDNA4Dispatch d;
+	memset(&d, 0, sizeof(d));
+	d.program = (uint32_t)prog->handle;
+	for (int i = 0; i < 3; i++) {
+		d.groups[i] = groups[i];
+		d.groupSize[i] = groupSize[i];
+	}
+	d.timeoutMs = timeoutMs;
+	d.kernargBytes = kernargBytes;
+	if (kernargBytes)
+		memcpy(d.kernargs, kernargs, kernargBytes);
+	uint64_t us = 0;
+	uint32_t n = 1;
+	kern_return_t kr = IOConnectCallMethod(dev->conn, kRDNA4MethodDispatch, NULL, 0, &d, sizeof(d),
+	                                       &us, &n, NULL, NULL);
+	if (micros)
+		*micros = us;
+	return kr;
+}
+
+const char *rdna4_error(kern_return_t kr) {
+	return mach_error_string(kr);
+}

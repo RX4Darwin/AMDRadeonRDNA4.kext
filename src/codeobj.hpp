@@ -26,6 +26,9 @@ struct Kernel {
 	// to a 256-byte-aligned GPU address and point COMPUTE_PGM_LO/HI at it.
 	uint32_t codeOffset;
 	uint32_t codeSize;
+	// The code's virtual address in the image (see Image): load the image
+	// at a 256-byte-aligned base and the code is at base + entryVa.
+	uint64_t entryVa;
 
 	uint32_t groupSegmentSize;     // LDS bytes
 	uint32_t privateSegmentSize;   // scratch bytes per work-item
@@ -43,6 +46,22 @@ struct Kernel {
 // gfx12 AMDGPU code object or the kernel / its descriptor is missing.
 bool findKernel(const uint8_t *elf, size_t size, const char *name, Kernel &out,
                 const char **why);
+
+// The loadable image: the PT_LOAD segments at their virtual addresses in
+// one block of `size` bytes (ld.lld links code objects at 0), as ROCm's
+// loader places them, so PC-relative references from a kernel to .rodata
+// or to another function keep working. Bytes past a segment's file size
+// are zero. Dynamic relocations are not applied: a file with any is
+// refused.
+struct Image {
+	static constexpr uint32_t kMaxSegments = 8;
+	static constexpr uint64_t kMaxSize = 16ull << 20;
+	struct Segment { uint64_t fileOffset, fileSize, vaddr, memSize; };
+	Segment  seg[kMaxSegments];
+	uint32_t count;
+	uint64_t size;
+};
+bool parseImage(const uint8_t *elf, size_t size, Image &out, const char **why);
 
 } // namespace CodeObj
 

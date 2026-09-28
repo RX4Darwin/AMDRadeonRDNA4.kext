@@ -26,28 +26,35 @@
 //                       back by the CPU: the first work the GPU does for us.
 //    stage 5  compute   one MEC compute queue (HQD) programmed directly, a
 //                       PM4 fence.
-//    stage 6  dispatch  an amdhsa code object (upstream LLVM, gfx1201).
+//    stage 6  dispatch  a hand-written gfx1201 kernel on the compute units.
+//    stage 7  kernel    a clang-built kernel launched from its code object.
 //
 //  Selected with the boot-arg rdna4-compute=<stage>; absent/0 = off, and the
 //  plugin behaves exactly as without this file. Each stage runs the ones
 //  before it. Stage 1 runs inline; stages 2+ run on their own kernel thread
 //  a few seconds later, so the desktop never waits on (or for) them.
-//  Stages not implemented yet are logged and skipped.
+//
+//  Once stage 6 or 7 finished, the runtime (runtime.cpp) is published for
+//  user space as RDNA4ComputeService (userclient.cpp, include/rdna4compute.h).
 //
 
 #ifndef RDNA4Compute_hpp
 #define RDNA4Compute_hpp
 
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOService.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
 #include <kern/thread.h>
 
 #include "amdfw.hpp"
+#include "codeobj.hpp"
 #include "gfxregs.hpp"
+#include "gpuheap.hpp"
 #include "ipdiscovery.hpp"
 #include "pm4.hpp"
 #include "psp.hpp"
+#include "rdna4compute.h"
 
 class RDNA4Compute {
 public:
@@ -208,16 +215,21 @@ private:
 	uint32_t    pm4Fence { 0 };             // last RELEASE_MEM sequence number
 	uint32_t shAbs(const GfxReg::Reg &r) const;   // absolute dword address of a GC register
 	// One DISPATCH_DIRECT on the stage-5 queue, fenced; false if the fence
-	// never came (the engine state is logged under `tag`).
+	// never came within timeoutUs (the engine state is logged under `tag`).
 	struct Launch {
 		uint64_t        code;               // MC address, 256-byte aligned
 		uint32_t        rsrc1, rsrc2, rsrc3;
 		const uint32_t *user;               // COMPUTE_USER_DATA_0..
 		uint32_t        userCount;
-		uint32_t        groups, groupSize;  // 1-D
+		uint32_t        groups[3];          // work-groups per dimension
+		uint32_t        groupSize[3];       // work-items per group
 		bool            wave32;
+		uint32_t        timeoutUs;
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
+	// What launch() can give a code-object kernel: the kernarg pointer and
+	// nothing else yet — no dispatch/queue pointers, scratch or LDS.
+	static bool kernelFits(const CodeObj::Kernel &k, const char **why);
 	bool stageDispatch();
 
 	// Stage 7: a clang-built kernel (shaders/vadd.cl) from its code object.
@@ -230,6 +242,40 @@ private:
 	static constexpr uint32_t kVaddC          = kVaddA + 0x20000;
 	static constexpr uint32_t kVaddItems      = 4096;                 // 64 groups of 64
 	bool stageKernel();
+
+public:
+	// User-space runtime (runtime.cpp), reached through RDNA4ComputeClient.
+	// `owner` is the client: its buffers and programs are only its own, and
+	// rtRelease frees them all. Every call takes rtLock.
+	IOReturn rtInfo(uint64_t out[6]);
+	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
+	IOReturn rtFree(const void *owner, uint64_t handle);
+	IOReturn rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
+	                mach_vm_address_t user, uint64_t length, bool toGpu);
+	IOReturn rtLoad(const void *owner, task_t task, mach_vm_address_t elf, uint64_t length,
+	                const char *name, uint64_t out[7]);
+	IOReturn rtUnload(const void *owner, uint64_t program);
+	IOReturn rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros);
+	void     rtRelease(const void *owner);
+
+private:
+	// The pool past kHeapOffset is the runtime's heap (buffers and code).
+	static constexpr uint32_t kHeapOffset  = 32u << 20;
+	static constexpr uint32_t kMaxBuffers  = 256;
+	static constexpr uint32_t kMaxPrograms = 32;
+	struct RtBuffer  { const void *owner; uint64_t offset, bytes; uint16_t gen; };
+	struct RtProgram { const void *owner; uint64_t offset; CodeObj::Kernel k; uint16_t gen; };
+	IOLock        *rtLock { nullptr };
+	bool           rtReady { false };       // a dispatching stage finished
+	bool           rtWedged { false };      // a dispatch timed out
+	uint32_t       rtStage { 0 };
+	GpuHeap::Heap  heap;
+	RtBuffer       buffers[kMaxBuffers] {};
+	RtProgram      programs[kMaxPrograms] {};
+	IOService     *rtService { nullptr };
+	void publishRuntime(uint32_t stage);
+	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
+	RtProgram *programFor(const void *owner, uint64_t handle);
 	// SMU mailbox (MP1): send one message, return the response code
 	// (1 = OK, 0 = no answer) and the argument register after it.
 	uint32_t smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs);

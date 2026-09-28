@@ -20,6 +20,7 @@
 set -u
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo (dmesg needs root)"; exit 1; }
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="rdna4fb-diag-$(date +%Y%m%d-%H%M%S).txt"
 
 # Active rdna4-* boot-args (space-padded for whole-token matching).
@@ -114,6 +115,17 @@ gated() {
 	nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail 2>/dev/null || \
 		echo "(no trail in NVRAM)"
 
+	# The user-space runtime (published after stage 6/7): rdna4-run sits
+	# next to this script on the stick. Copied out first: FAT keeps no
+	# execute bit. The recovery shell is root, which opening it needs.
+	section "user-space compute runtime (rdna4-run selftest)"
+	if [ -f "$HERE/rdna4-run" ] && cp "$HERE/rdna4-run" /tmp/rdna4-run && chmod +x /tmp/rdna4-run; then
+		/tmp/rdna4-run selftest || echo "(rdna4-run exited $?)"
+	else
+		echo "(no rdna4-run next to this script)"
+	fi
+	dmesg | grep -E 'RDNA4FB: runtime:' || true
+
 	section "ioreg: framebuffer properties"
 	ioreg -l -w0 | grep -E '"(Console|AtomBIOS|Discovery|VRAM|MMIO|EDID|GPU|SMU|PSP|Pipe|Modes|Compute),' || true
 
@@ -139,3 +151,4 @@ echo "           version; a match => GOP DMUB speaks mainline VBIOS dialect"
 echo "  Discovery,Source = 'on-die TMR' if ATY,bin_image was removed"
 echo "  compute: 'verdict:' lines — PSP sOS, GFX/SDMA firmware state, GC/MM hub"
 echo "           apertures, and the VRAM pool chosen for compute"
+echo "  runtime: 'selftest: PASS' — a user-space program ran vadd on the GPU"
