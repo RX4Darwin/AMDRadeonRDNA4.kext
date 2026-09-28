@@ -1,10 +1,30 @@
 # RDNA4FB real-card batch plan
 
-Run each boot from Recovery as root:
+## How to run it (one loop per boot)
 
-```sh
-bash /Volumes/OPENCORE/diagnostic-log.sh
-```
+The USB stick "OPENCORE" holds the new kext, `rdna4-run`, `diagnostic-log.sh`,
+`set-boot.sh`, this plan, and a backup of the previous working setup in
+`backup-before-premetal/`. The stick is already set for **boot 1**.
+
+1. Boot the USB into macOS Recovery, open Terminal.
+2. Run the batch: `bash /Volumes/OPENCORE/diagnostic-log.sh`. It ends with the
+   PASS/FAIL/SKIPPED table and saves the log on the stick.
+3. Select the next boot: `bash /Volumes/OPENCORE/set-boot.sh 2` (then 3, 4, 5;
+   6 is optional), then reboot and repeat.
+
+You can stop after any boot; each one is useful on its own.
+`bash /Volumes/OPENCORE/set-boot.sh 0` returns to this morning's arguments.
+
+**To roll back the kext** if a boot misbehaves even with `set-boot.sh 0`,
+replace `EFI/OC/Kexts/RDNA4FB.kext` with the copy in
+`backup-before-premetal/` (from Windows, or from Recovery with
+`cp -R /Volumes/OPENCORE/backup-before-premetal/RDNA4FB.kext /Volumes/OPENCORE/EFI/OC/Kexts/`
+after removing the new one).
+
+## The boots
+
+Each boot's summary is described below. The arguments listed are the feature
+arguments; `set-boot.sh` adds them to the usual base arguments.
 
 The script writes a log on the USB stick and ends with a PASS, FAIL or
 SKIPPED line for runtime, SubmitIb, fault-page scrub, VM, IH, vblank, GFX,
@@ -58,14 +78,16 @@ with `rdna4-sleeptest=1`; use that argument in the emulator dry run, where
 the monitor supplies the device power reset. Native macOS S3 remains a
 platform test and is not required for this diagnostic selector.
 
-The remaining planned slots are intentionally reserved until their
-workstreams land. W14 will add a boot with `rdna4-vbl=1 rdna4-cursor=1`; its
-summary must report vblank and cursor PASS, with the `vbl:` or `cursor:` trail
-as the per-feature fallback. W12 will add `rdna4-run tri`; its summary must
-report the triangle PASS and fall back to the `gfx:` trail on a hang. These
-selectors are not read by this branch yet, so do not add them to a real-card
-boot until W14/W12 are merged; the current G3 slot above is the active
-triangle acceptance.
+6. **Optional: macOS vblank interrupts and the hardware cursor (W14).**
+   `set-boot.sh 6`: `rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=1`.
+   This one changes the live desktop, so run it last. Check by eye: the mouse
+   pointer shows and moves normally (a hardware-cursor failure falls back to
+   macOS's software cursor, which also looks normal). The kernel log should
+   show the VBL service created, `vblank: OTG0 count 60` and cursor csc calls;
+   the table still reports the other rows as in boot 3.
+
+W12 (`rdna4-run tri`, a triangle drawn by an app) is not merged yet and is not
+part of this batch.
 
 ## Known risks
 
