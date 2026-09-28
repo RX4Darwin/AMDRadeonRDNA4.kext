@@ -435,6 +435,7 @@ static void rdna4_ih_emit(RDNA4State *s, uint8_t client, uint8_t source,
                           uint8_t ring, uint32_t data0);
 static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so,
                              RDNA4Cursor *cursor);
+static void rdna4_gfx_update(void *opaque);
 
 static bool rdna4_is_cursor_register(uint32_t d2)
 {
@@ -2227,7 +2228,7 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
             reg_set(s, addr, val);
         }
         if (cursorWrite && s->cursor_enabled)
-            dpy_gfx_update_full(s->con);
+            rdna4_gfx_update(s);
     } else {
         reg_set(s, addr, val);
     }
