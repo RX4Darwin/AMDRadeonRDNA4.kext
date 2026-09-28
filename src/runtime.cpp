@@ -506,12 +506,16 @@ void RDNA4Compute::logClientFault(RtClient &c, const char *tag) {
 		(static_cast<uint64_t>(rdGc(GcL2FaultAddrHi)) << 32);
 	RLOG("vmid %u: %s: GC hub fault status 0x%08x address 0x%llx", c.vmid, tag, status, address);
 	vmInvalidate(c.vmid, "fault clear");
-	// A faulting access is redirected to the one L2 fault-default page, for
-	// every VMID (amdgpu's dummy page works the same way). A faulting write
-	// leaves its data there, and the next client's faulting read would get
-	// it. Scrub the page once the fault is handled. A write and a read
-	// faulting at the same moment can still meet; the page tables are the
-	// isolation, this closes the lingering channel.
+	scrubFaultPage();
+}
+
+// A faulting access is redirected to the one L2 fault-default page, for every
+// VMID (amdgpu's dummy page works the same way). A faulting write leaves its
+// data there, and the next client's faulting read would get it. Every path
+// that handles a client fault scrubs the page. A write and a read faulting at
+// the same moment can still meet; the page tables are the isolation, this
+// closes the lingering channel.
+void RDNA4Compute::scrubFaultPage() {
 	for (uint32_t i = 0; i < 0x1000 / 4; i++)
 		*poolDw(kScratchOffset + i * 4) = 0;
 	flushHdp();

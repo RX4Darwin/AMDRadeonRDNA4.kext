@@ -561,6 +561,7 @@ private:
 	bool vmContextInit(RtClient &client);
 	bool vmInvalidate(uint32_t vmid, const char *tag);
 	void logClientFault(RtClient &client, const char *tag);
+	void scrubFaultPage();
 	void releaseHost(RtBuffer &buffer);
 
 	// DMA between host memory and VRAM (runtime.cpp). One pinned, physically
