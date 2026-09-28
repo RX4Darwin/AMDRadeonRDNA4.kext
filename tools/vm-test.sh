@@ -5,6 +5,9 @@
 # `rdna4-run selftest` and `rdna4-run bench small` in it over SSH.
 #
 #   tools/vm-test.sh [extra boot-args...]     e.g. tools/vm-test.sh rdna4-ih=1
+#   RDNA4_DEV=ih-dead=on,flip-stuck=on tools/vm-test.sh ...
+#                                             emulated-card options (the rdna4
+#                                             device's fault switches), comma-separated
 #
 # The VM, its ports, the QEMU build tree (~/qemu-10.0.13) and the OpenCore
 # image are shared by every checkout, so the whole run holds
@@ -18,7 +21,7 @@ REPO=$PWD
 exec 9>"$HOME/rdna4-vm.lock"
 echo "vm-test: waiting for the VM lock (another checkout may be testing)..."
 flock 9
-echo "vm-test: $REPO ($(git rev-parse --short HEAD 2>/dev/null || echo '?'))"
+echo "vm-test: $REPO ($(git rev-parse --short HEAD 2>/dev/null || echo '?')), boot-args: $*, device options: ${RDNA4_DEV:-none}"
 
 ARGS="-v keepsyms=1 debug=0x100 serial=3 rdna4-trace=1 rdna4-compute=7 $*"
 SSH_KEY=$HOME/.ssh/tahoe_vm
@@ -41,7 +44,8 @@ setsid nohup python3 -m http.server 6080 --bind 127.0.0.1 --directory ~/noVNC \
 	> ~/novnc-http.log 2>&1 < /dev/null 9>&- &
 : > ~/tahoe-serial.log
 # (9>&-: the VM outlives this run and must not keep the lock.)
-VNC_WS=127.0.0.1:5700 setsid nohup tools/emu-boot.sh > ~/emu-boot.out 2>&1 < /dev/null 9>&- &
+VNC_WS=127.0.0.1:5700 setsid nohup tools/emu-boot.sh ${RDNA4_DEV:+"$RDNA4_DEV"} \
+	> ~/emu-boot.out 2>&1 < /dev/null 9>&- &
 pick() {        # the OpenCore picker: the macOS entry
 	python3 - <<'PY'
 import socket, time, os
