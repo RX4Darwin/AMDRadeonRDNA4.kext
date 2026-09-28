@@ -591,8 +591,13 @@ IOReturn RDNA4Device::drawHardwareCursor(int32_t x, int32_t y, uint32_t visible)
 	regWriteDmu(2, kCursorCmControl + dpp,
 	            kCursorCmWorkingBits | (kCursorModePremultipliedArgb << kCursorCmModeShift) |
 	            (hwCursorVisible ? 1u : 0u));
-	FBLOG("cursor: cscDrawHardwareCursor x=%d y=%d visible=%u pos=0x%08x",
-	      x, y, visible, regReadDmu(2, kCursorPosition + hubp));
+	cursorDrawCalls++;
+	if (cursorDrawLogs < 6 ||
+	    (cursorDrawLogs < 14 && (cursorDrawCalls & 0x1ff) == 0)) {
+		cursorDrawLogs++;
+		FBLOG("cursor: cscDrawHardwareCursor #%u x=%d y=%d visible=%u pos=0x%08x",
+		      cursorDrawCalls, x, y, visible, regReadDmu(2, kCursorPosition + hubp));
+	}
 	return kIOReturnSuccess;
 }
 

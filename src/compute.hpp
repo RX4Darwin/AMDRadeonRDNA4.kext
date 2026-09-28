@@ -102,6 +102,7 @@ public:
 		uint64_t            scanoutPhys;     // CPU physical address (BAR0)
 		uint64_t            scanoutLength;
 		uint64_t            scanoutFrameNs;  // 0 when the display timing is unknown
+		void (*vblankServiceReady)(IOService *framebuffer) { nullptr };
 	};
 
 	enum Stage : uint32_t {
@@ -547,6 +548,7 @@ private:
 	PresentSlot  presentSlots[kPresentSlots] {};
 	uint32_t     presentPending { 0 };
 	uint64_t     nextPresentId { 1 };
+	uint32_t     presentNoVblankTicks { 0 };
 	IOTimerEventSource *presentTimer { nullptr };
 	IOWorkLoop        *presentWorkLoop { nullptr };
 	OSObject          *presentContext { nullptr };
@@ -554,6 +556,7 @@ private:
 	bool     initPresentationTimer();
 	void     stopPresentationTimer();
 	void     schedulePresentationTimer();
+	void     schedulePresentationRetry();
 	void     presentTimerTick();
 	PresentSlot *presentSlot(uint64_t id, const void *owner);
 	void     completePresentLocked(PresentSlot &slot, IOReturn result, uint64_t frame);

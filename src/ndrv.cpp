@@ -9,6 +9,10 @@
 
 #include "ndrv.hpp"
 
+#ifdef KERNEL
+#include <IOKit/IOLocks.h>
+#endif
+
 namespace Ndrv {
 
 namespace {
@@ -16,24 +20,68 @@ void *gVblService { nullptr };
 VslDoInterruptService gVblDo { nullptr };
 VslPrepareCursor gPrepareCursor { nullptr };
 bool gVblankEnabled { false };
+#ifdef KERNEL
+IOLock *gVblLock { nullptr };
+#else
+bool gVblLock { false };
+#endif
+
+void vslLock() {
+#ifdef KERNEL
+	IOLockLock(gVblLock);
+#endif
+}
+
+void vslUnlock() {
+#ifdef KERNEL
+	IOLockUnlock(gVblLock);
+#endif
+}
+}
+
+void vslInit() {
+#ifdef KERNEL
+	if (!gVblLock)
+		gVblLock = IOLockAlloc();
+#else
+	gVblLock = true;
+#endif
 }
 
 void vslServiceCreated(void *service, VslDoInterruptService doService) {
-	if (service && doService && !gVblService) {
+	if (!gVblLock)
+		vslInit();
+	if (!gVblLock || !service || !doService)
+		return;
+	vslLock();
+	if (!gVblService) {
 		gVblService = service;
 		gVblDo = doService;
 	}
+	vslUnlock();
 }
 
-void vslServiceDisposed(void *service) {
-	if (service == gVblService) {
+bool vslServiceDisposed(void *service) {
+	if (!gVblLock)
+		return false;
+	vslLock();
+	const bool owned = service && service == gVblService;
+	if (owned) {
 		gVblService = nullptr;
 		gVblDo = nullptr;
+		gVblankEnabled = false;
 	}
+	vslUnlock();
+	return owned;
 }
 
 bool vslServicePresent() {
-	return gVblService != nullptr;
+	if (!gVblLock)
+		return false;
+	vslLock();
+	const bool present = gVblService != nullptr;
+	vslUnlock();
+	return present;
 }
 
 void vslPrepareCursorInstalled(VslPrepareCursor prepare) {
@@ -41,12 +89,22 @@ void vslPrepareCursorInstalled(VslPrepareCursor prepare) {
 }
 
 void setVblankEnabled(bool enabled) {
+	if (!gVblLock)
+		vslInit();
+	if (!gVblLock)
+		return;
+	vslLock();
 	gVblankEnabled = enabled;
+	vslUnlock();
 }
 
 void signalVblank() {
+	if (!gVblLock)
+		return;
+	vslLock();
 	if (gVblankEnabled && gVblService && gVblDo)
 		(void)gVblDo(gVblService);
+	vslUnlock();
 }
 
 bool prepareCursor(void *cursorRef, void *descriptor, void *info) {
@@ -134,15 +192,21 @@ bool Translator::status(uint16_t code, void *params, int32_t &ret) {
 	case cscSupportsHardwareCursor: {
 		if (!be.supportsHardwareCursor)
 			return false;
+		// With rdna4-cursor absent the device deliberately remains a software
+		// cursor.  Let IONDRV's original implementation answer both cursor
+		// status selectors instead of changing its contract to "unsupported".
+		if (!be.supportsHardwareCursor(be.ctx))
+			return false;
 		auto &r = *static_cast<VDSupportsHardwareCursorRec *>(params);
-		r.csSupportsHardwareCursor = be.supportsHardwareCursor(be.ctx) ? 1u : 0u;
+		r.csSupportsHardwareCursor = 1u;
 		r.csReserved1 = 0;
 		r.csReserved2 = 0;
 		ret = kSuccess;
 		return true;
 	}
 	case cscGetHardwareCursorDrawState:
-		if (!be.getHardwareCursorDrawState)
+		if (!be.getHardwareCursorDrawState || !be.supportsHardwareCursor ||
+		    !be.supportsHardwareCursor(be.ctx))
 			return false;
 		ret = be.getHardwareCursorDrawState(
 			be.ctx, *static_cast<VDHardwareCursorDrawStateRec *>(params));
