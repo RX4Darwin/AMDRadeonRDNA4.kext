@@ -1860,9 +1860,18 @@ static int testGpuVm() {
 	const uint64_t pde2 = GpuVm::encodePde(0x0000000000400000ull, GpuVm::kValid | GpuVm::kSnooped, 2);
 	const uint64_t pde1 = GpuVm::encodePde(0x0000000000410000ull, GpuVm::kValid | GpuVm::kSnooped, 1);
 	const uint64_t pde0 = GpuVm::encodePde(0x0000000000420000ull, GpuVm::kValid | GpuVm::kSnooped, 0);
-	failures += check((pde2 & GpuVm::kPdePte) && (pde1 & GpuVm::kPdePte) && !(pde0 & GpuVm::kPdePte) &&
-	                  ((pde1 >> 58) & 0x1f) == 9,
-	                  "gfx12 PDE levels carry PDE_PTE and PDB1 block fragment bits");
+	failures += check(pde2 == (0x0000000000400000ull | GpuVm::kValid) &&
+	                  pde1 == (0x0000000000410000ull | GpuVm::kValid) &&
+	                  pde0 == (0x0000000000420000ull | GpuVm::kValid),
+	                  "gfx12 regular PDEs encode GPU physical address and VALID only");
+	uint64_t converted = 0;
+	failures += check(GpuVm::mcToPhysical(0x0000008012345000ull, 0x0000008000000000ull,
+	                                      0x12, converted) &&
+	                  converted == 0x0000000024345000ull,
+	                  "gfx12 MC VRAM address converts to FB_OFFSET GPU physical address");
+	failures += check(!GpuVm::mcToPhysical(0x0000007ffff00000ull, 0x0000008000000000ull,
+	                                       0x12, converted),
+	                  "gfx12 MC conversion rejects an address below the VRAM aperture");
 
 	VmTestTable table { 0x0000000000400000ull, {} };
 	/* One compact table image, laid out at 4 KiB boundaries. */

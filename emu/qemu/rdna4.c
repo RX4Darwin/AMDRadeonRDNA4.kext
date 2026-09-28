@@ -250,6 +250,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 /* GC hub: FB aperture, L1 TLB, VMID0 context and the GART flush engine. */
 #define REG_GCMC_FB_BASE     GC_SEG0(0x1614)   /* MC >> 24 */
 #define REG_GCMC_FB_TOP      GC_SEG0(0x1615)
+#define REG_GCMC_FB_OFFSET   GC_SEG0(0x15a7)   /* GPU physical FB offset >> 24 */
 #define REG_GCMC_L1_TLB      GC_SEG0(0x161b)   /* ENABLE_L1_TLB [0] */
 #define REG_GCVM_CTX0_CNTL   GC_SEG0(0x1624)   /* ENABLE_CONTEXT [0] */
 #define REG_GCVM_CTX1_CNTL   GC_SEG0(0x1625)
@@ -1137,12 +1138,33 @@ static uint8_t *rdna4_gc_span(RDNA4State *s, uint64_t mc, uint64_t len)
     return off < 0 ? NULL : rdna4_vram_span(s, off, len);
 }
 
+/* VM table entries and VM physical addresses use the GC hub's GPU-physical
+ * FB_OFFSET basis, rather than the MC address used by SDMA and VMID0. */
+static int64_t rdna4_phys_to_vram(RDNA4State *s, uint64_t physical)
+{
+    uint64_t fb_offset = (uint64_t)(reg_get(s, REG_GCMC_FB_OFFSET) & 0xffffff) << 24;
+
+    if (!(reg_get(s, REG_GCMC_L1_TLB) & 1) || !(reg_get(s, REG_GCVM_CTX0_CNTL) & 1) ||
+        physical < fb_offset || physical - fb_offset >= rdna4_vram_size()) {
+        return -1;
+    }
+    return physical - fb_offset;
+}
+
+static uint8_t *rdna4_phys_span(RDNA4State *s, uint64_t physical, uint64_t len)
+{
+    int64_t off = rdna4_phys_to_vram(s, physical);
+
+    return off < 0 ? NULL : rdna4_vram_span(s, off, len);
+}
+
 /* gfx12 VM walk used by CP and shader accesses for runtime VMIDs. */
 #define RDNA4_VM_VALID       (1ull << 0)
 #define RDNA4_VM_EXECUTABLE  (1ull << 4)
 #define RDNA4_VM_READABLE    (1ull << 5)
 #define RDNA4_VM_WRITEABLE   (1ull << 6)
 #define RDNA4_VM_PHYS_MASK   0x0000FFFFFFFFF000ull
+#define RDNA4_VM_PDE_PTE     (1ull << 63)
 
 static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va)
 {
@@ -1154,7 +1176,7 @@ static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va)
 
 static bool rdna4_vm_entry(RDNA4State *s, uint64_t address, uint64_t *entry)
 {
-    uint8_t *p = rdna4_gc_span(s, address, 8);
+    uint8_t *p = rdna4_phys_span(s, address, 8);
     if (!p)
         return false;
     *entry = ldq_le_p(p);
@@ -1186,12 +1208,25 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
         if (!rdna4_vm_entry(s, table + (uint64_t)idx * 8, &entry) ||
             !(entry & RDNA4_VM_VALID))
             goto fault;
+        if (level < 3 && (entry & RDNA4_VM_PDE_PTE)) {
+            uint32_t page_shift = 12 + (3 - level) * 9;
+            uint64_t page_mask = (1ull << page_shift) - 1;
+            if (!(entry & RDNA4_VM_READABLE) || (write && !(entry & RDNA4_VM_WRITEABLE)) ||
+                (execute && !(entry & RDNA4_VM_EXECUTABLE)))
+                goto fault;
+            uint64_t physical = ((entry & RDNA4_VM_PHYS_MASK) & ~page_mask) |
+                                (va & page_mask);
+            int64_t off = rdna4_phys_to_vram(s, physical);
+            if (off < 0)
+                goto fault;
+            return rdna4_vram_span(s, off, len);
+        }
         if (level == 3) {
             if (!(entry & RDNA4_VM_READABLE) || (write && !(entry & RDNA4_VM_WRITEABLE)) ||
                 (execute && !(entry & RDNA4_VM_EXECUTABLE)))
                 goto fault;
             uint64_t physical = (entry & RDNA4_VM_PHYS_MASK) | (va & 0xfff);
-            int64_t off = rdna4_gc_to_vram(s, physical);
+            int64_t off = rdna4_phys_to_vram(s, physical);
             if (off < 0)
                 goto fault;
             return rdna4_vram_span(s, off, len);
@@ -1203,7 +1238,7 @@ fault:
     /* Retry is off: serve the configured dummy page so the queue can drain. */
     uint64_t dummy = ((uint64_t)reg_get(s, REG_GCVM_FAULT_DEFAULT_LO) |
                       ((uint64_t)reg_get(s, REG_GCVM_FAULT_DEFAULT_HI) << 32)) << 12;
-    int64_t off = rdna4_gc_to_vram(s, dummy);
+    int64_t off = rdna4_phys_to_vram(s, dummy);
     if (off >= 0 && len <= 0x1000 && (va & 0xfff) + len <= 0x1000)
         return rdna4_vram_span(s, off + (va & 0xfff), len);
     return NULL;
