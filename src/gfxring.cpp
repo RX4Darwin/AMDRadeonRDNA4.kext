@@ -196,6 +196,10 @@ bool RDNA4Compute::stageGfxRing() {
 	auto finish = [&](bool ok, const char *what) {
 		put("Mode", gfxMode);
 		put("Ready", ok);
+		char result[128];
+		snprintf(result, sizeof(result), "%s %s", ok ? "PASS" : "FAIL",
+		         ok ? "ring test" : (what ? what : "ring test"));
+		publishResult("gfx", result);
 		if (d) {
 			env.owner->setProperty("Compute,GFX", d);
 			d->release();
@@ -308,6 +312,7 @@ bool RDNA4Compute::stageGfxDraw() {
 	using namespace Gfx12Draw;
 	if (!gfxMode || !dmaReady || !devHeap.size() || !rtLock) {
 		GLOG("draw: skipped (%s)", !gfxMode ? "no gfx ring" : "no device heap");
+		publishResult("gfx", "SKIPPED draw prerequisites");
 		return false;
 	}
 	// The GE rings are sized for kMaxSe shader engines (they scale with its
@@ -318,6 +323,7 @@ bool RDNA4Compute::stageGfxDraw() {
 	     1u << ((gbAddr >> 26) & 3), 1u << (gbAddr & 7));
 	if (gbAddr == 0xffffffff || ses > kMaxSe) {
 		GLOG("draw: the GE rings are sized for %u shader engines; skipped", kMaxSe);
+		publishResult("gfx", "SKIPPED unsupported shader-engine count");
 		return false;
 	}
 
@@ -329,6 +335,7 @@ bool RDNA4Compute::stageGfxDraw() {
 	IOLockUnlock(rtLock);
 	if (!got) {
 		GLOG("draw: no %llu MiB for the GE rings in the device heap", (kRingBytes + kAlign) >> 20);
+		publishResult("gfx", "FAIL draw device heap allocation");
 		return false;
 	}
 	gfxRings = off;
@@ -376,6 +383,7 @@ bool RDNA4Compute::stageGfxDraw() {
 		GLOG("draw: did not finish (ring fence %s, draw fence 0x%x)", ringDone ? "ok" : "NOT signalled",
 		     drawFence);
 		gfxStatus("draw");
+		publishResult("gfx", "FAIL draw fence");
 		return false;
 	}
 
@@ -409,6 +417,11 @@ bool RDNA4Compute::stageGfxDraw() {
 	     "row 64 x %u..%u, row 190 x %u..%u", ok ? "THE TRIANGLE IS RIGHT" : "wrong image",
 	     ns / 1000, covered, kCoveredRgba, kCoveredPixels, other, minX, maxX, minY, maxY, row64[0],
 	     row64[1], row190[0], row190[1]);
+	char result[160];
+	snprintf(result, sizeof(result), "%s %s, draw %u px in %llu us",
+	         ok ? "PASS" : "FAIL", ok ? "ring test, THE TRIANGLE IS RIGHT" : "draw image",
+	         covered, static_cast<unsigned long long>(ns / 1000));
+	publishResult("gfx", result);
 	env.owner->setProperty("Compute,GFXDrawPixels", static_cast<uint64_t>(covered), 32);
 	return ok;
 }

@@ -17,6 +17,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSObject.h>
 #include <pexpert/pexpert.h>
 
@@ -131,6 +132,14 @@ uint32_t ihPipeRead(void *ctx, uint8_t baseIdx, uint32_t dword) {
 RDNA4Compute::~RDNA4Compute() {
 	stopPresentationTimer();
 	ihStop();
+	if (resultDictionary) {
+		resultDictionary->release();
+		resultDictionary = nullptr;
+	}
+	if (resultLock) {
+		IOLockFree(resultLock);
+		resultLock = nullptr;
+	}
 }
 
 uint32_t RDNA4Compute::ihDcnRead(uint8_t baseIdx, uint32_t dword) const {
@@ -141,23 +150,29 @@ bool RDNA4Compute::ihInit() {
 	uint32_t requested = 0;
 	if (!PE_parse_boot_argn("rdna4-ih", &requested, sizeof(requested)) || !requested)
 		return false;
+	auto fail = [this](const char *why) {
+		char value[128];
+		snprintf(value, sizeof(value), "FAIL %s", why ? why : "initialisation failed");
+		publishResult("ih", value);
+		return false;
+	};
 	ihDcnRequested = requested >= 2;
 	uint32_t vbl = 0;
 	ihVblRequested = ihDcnRequested &&
 	                 PE_parse_boot_argn("rdna4-vbl", &vbl, sizeof(vbl)) && vbl != 0;
 	if (!env.pci || !env.mmio || !env.disc || !env.disc->isValid() || !rtLock) {
 		HLOG("off: missing PCI, MMIO, discovery or runtime lock");
-		return false;
+		return fail("missing PCI/MMIO/discovery/runtime lock");
 	}
 	const uint16_t command = env.pci->configRead16(kIOPCIConfigCommand);
 	if (!(command & kIOPCICommandBusMaster)) {
 		HLOG("off: PCI bus mastering is not enabled (command 0x%04x)", command);
-		return false;
+		return fail("PCI bus mastering disabled");
 	}
 	ihLock = IOLockAlloc();
 	if (!ihLock) {
 		HLOG("off: could not allocate the IH wait lock");
-		return false;
+		return fail("IH wait lock allocation");
 	}
 
 	int msiIndex = -1;
@@ -173,7 +188,7 @@ bool RDNA4Compute::ihInit() {
 	}
 	if (msiIndex < 0) {
 		HLOG("off: no PCI MSI interrupt source");
-		return false;
+		return fail("no PCI MSI interrupt source");
 	}
 
 	const uint32_t beforeCntl = rd(IpDiscovery::HwOsssys, IhRbCntl);
@@ -197,14 +212,14 @@ bool RDNA4Compute::ihInit() {
 	    !mapDma(ihWptrMemory, &ihWptrDma, ihWptrBus)) {
 		HLOG("off: could not allocate/map the 256 KiB ring and wptr page");
 		ihStop();
-		return false;
+		return fail("ring or wptr allocation/map");
 	}
 	ihRingCpu = static_cast<volatile uint32_t *>(ihRingMemory->getBytesNoCopy());
 	ihWptrCpu = static_cast<volatile uint32_t *>(ihWptrMemory->getBytesNoCopy());
 	if (!ihRingCpu || !ihWptrCpu) {
 		HLOG("off: ring or wptr has no CPU mapping");
 		ihStop();
-		return false;
+		return fail("ring or wptr CPU mapping");
 	}
 	for (uint32_t i = 0; i < kIhRingBytes / 4; i++)
 		ihRingCpu[i] = 0;
@@ -234,7 +249,7 @@ bool RDNA4Compute::ihInit() {
 		OSSafeReleaseNULL(context);
 		HLOG("off: could not allocate the MSI callback context");
 		ihStop();
-		return false;
+		return fail("MSI callback context allocation");
 	}
 	context->compute = this;
 	ihContext = context;
@@ -243,7 +258,7 @@ bool RDNA4Compute::ihInit() {
 	if (!ihWorkLoop) {
 		HLOG("off: no kext work loop for MSI delivery");
 		ihStop();
-		return false;
+		return fail("kext work loop unavailable");
 	}
 	trail("ih: register MSI");
 	ihSource = IOFilterInterruptEventSource::filterInterruptEventSource(
@@ -251,13 +266,13 @@ bool RDNA4Compute::ihInit() {
 	if (!ihSource) {
 		HLOG("off: MSI registration failed (source %d may already be registered)", msiIndex);
 		ihStop();
-		return false;
+		return fail("MSI registration");
 	}
 	IOReturn r = ihWorkLoop->addEventSource(ihSource);
 	if (r != kIOReturnSuccess) {
 		HLOG("off: adding MSI source to work loop failed 0x%08x", r);
 		ihStop();
-		return false;
+		return fail("adding MSI source to work loop");
 	}
 
 	// The kext's queues are on MEC1: pipe 0 queue 0 (the kernel's) and the
@@ -334,6 +349,10 @@ bool RDNA4Compute::ihInit() {
 		if (!Pipe::discover(ihPipeRead, this, pipe) || !pipe.valid() ||
 		    pipe.otg >= Pipe::kMaxOtg || pipe.hubp >= Pipe::kMaxOtg) {
 			HLOG("DCN off: lit pipe discovery failed");
+			publishResult("vblank", "FAIL DCN pipe discovery");
+			HLOG("self-test totals: SDMA traps %u, CP EOP %u, interrupt wakeups %u",
+			     ihSdmaTrapCount, ihEopCount, ihDispatchWakeups + ihSdmaWakeups);
+			ihPublishResult();
 			return true;
 		}
 		ihDcnOtg = pipe.otg;
@@ -389,10 +408,15 @@ bool RDNA4Compute::ihInit() {
 		}
 		if (!vblankOk) {
 			ihDcnStop("vblank self-test timed out");
+			publishResult("vblank", "FAIL vblank self-test timeout");
 		} else {
 			HLOG("vblank self-test passed: 5 frames, expected %llu ns", ihDcnExpectedFrameNs);
+			publishResult("vblank", "PASS self-test, 5 frames");
 		}
 	}
+	HLOG("self-test totals: SDMA traps %u, CP EOP %u, interrupt wakeups %u",
+	     ihSdmaTrapCount, ihEopCount, ihDispatchWakeups + ihSdmaWakeups);
+	ihPublishResult();
 	return true;
 }
 
@@ -445,13 +469,18 @@ void RDNA4Compute::ihDcnObserveVblank(uint64_t now) {
 		if (interval && ihDcnExpectedFrameNs && interval * 2 < ihDcnExpectedFrameNs) {
 			HLOG("DCN IRQ storm: vblank interval %llu ns, expected %llu ns", interval,
 			     ihDcnExpectedFrameNs);
+			publishResult("vblank", "FAIL DCN IRQ storm");
 			ihDcnStop("interrupt rate exceeded 2x OTG timing");
 			return;
 		}
 	}
-	if (ihVblankCount[ihDcnOtg] == 1 || !(ihVblankCount[ihDcnOtg] % 60))
+	if (ihVblankCount[ihDcnOtg] == 1 || !(ihVblankCount[ihDcnOtg] % 60)) {
 		HLOG("vblank: OTG%u count %llu%s", ihDcnOtg, ihVblankCount[ihDcnOtg],
 		     interval ? " (acknowledged)" : "");
+		char value[96];
+		snprintf(value, sizeof(value), "PASS IRQ frames %llu", ihVblankCount[ihDcnOtg]);
+		publishResult("vblank", value);
+	}
 }
 
 bool RDNA4Compute::ihWaitVblank(uint32_t otg, uint32_t timeoutMs, uint64_t &count,
@@ -567,6 +596,30 @@ bool RDNA4Compute::ihHasWork() const {
 	return (wptr & kIhWptrOverflow) || Ih::hasEntries(ihRptr, wptr, kIhRingBytes);
 }
 
+void RDNA4Compute::ihPublishResult() {
+	if (!ihActive)
+		return;
+	const uint32_t wakeups = ihDispatchWakeups + ihSdmaWakeups;
+	char value[160];
+	snprintf(value, sizeof(value), "PASS ring up, %u interrupt wakeups%s", wakeups,
+	         (ihDispatchPolling || ihSdmaPolling) ? "; polling fallback" : "");
+	publishResult("ih", value);
+}
+
+bool RDNA4Compute::ihInterruptLogAllowed() {
+	const uint64_t now = mach_absolute_time();
+	if (!ihLastInterruptLog) {
+		ihLastInterruptLog = now;
+		return true;
+	}
+	uint64_t elapsed = 0;
+	absolutetime_to_nanoseconds(now - ihLastInterruptLog, &elapsed);
+	if (elapsed < 250000000)
+		return false;
+	ihLastInterruptLog = now;
+	return true;
+}
+
 void RDNA4Compute::ihUnknown(uint8_t client, uint8_t source, uint8_t ring) {
 	const uint8_t bit = static_cast<uint8_t>(1u << (source & 7));
 	uint8_t &seen = ihUnknownSeen[client][source >> 3];
@@ -585,13 +638,13 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	if (entry.clientId == kIhClientGfx && entry.srcId == kIhSrcCpEop &&
 	    ((entry.ringId >> 2) & 3) == 1) {
 		ihEopCount++;
-		if (ihEopCount == 1 || !(ihEopCount & 0x3f))
+		if (ihInterruptLogAllowed())
 			HLOG("CP EOP interrupt: count %u ring %u", ihEopCount, entry.ringId);
 		return;
 	}
 	if (entry.clientId == kIhClientGfx && entry.srcId == kIhSrcSdmaTrap) {
 		ihSdmaTrapCount++;
-		if (ihSdmaTrapCount == 1 || !(ihSdmaTrapCount & 0x3f))
+		if (ihInterruptLogAllowed())
 			HLOG("SDMA trap interrupt: count %u", ihSdmaTrapCount);
 		return;
 	}
@@ -607,8 +660,12 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	    entry.srcId == kIhSrcPflipBase + ihDcnHubp) {
 		if (ihDcnHubp < Pipe::kMaxOtg)
 			ihPflipCount[ihDcnHubp]++;
-		if (ihPflipCount[ihDcnHubp] == 1 || !(ihPflipCount[ihDcnHubp] & 0x3f))
+		if (ihPflipCount[ihDcnHubp] == 1 || !(ihPflipCount[ihDcnHubp] & 0x3f)) {
 			HLOG("page flip: HUBP%u count %llu", ihDcnHubp, ihPflipCount[ihDcnHubp]);
+			char value[96];
+			snprintf(value, sizeof(value), "PASS pflip interrupts %llu", ihPflipCount[ihDcnHubp]);
+			publishResult("flip", value);
+		}
 		ihDcnAckFlip();
 		return;
 	}
@@ -666,9 +723,13 @@ void RDNA4Compute::ihRecordWait(bool dispatch, bool slept, bool completed,
 	const bool sourceAdvanced = events != eventsBefore;
 	if (sourceAdvanced) {
 		misses = 0;
-		if (completed)
-			HLOG("%s wait woken by interrupt (IH source count %u)", dispatch ? "dispatch" : "SDMA",
-			     events);
+		if (completed) {
+			if (dispatch)
+				ihDispatchWakeups++;
+			else
+				ihSdmaWakeups++;
+			ihPublishResult();
+		}
 	} else if (Ih::missEligible(slept, completed, sourceAdvanced, recheckElapsed)) {
 		misses++;
 		if (misses >= 3 && !polling) {

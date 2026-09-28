@@ -84,6 +84,28 @@ bool fbApertureSet(uint32_t base, uint32_t top, uint32_t vramMiB) {
 }
 } // namespace
 
+void RDNA4Compute::publishResult(const char *feature, const char *value) {
+	if (!feature || !value || !env.owner || !resultLock)
+		return;
+	IOLockLock(resultLock);
+	OSDictionary *next = resultDictionary
+		? OSDictionary::withDictionary(resultDictionary, 12)
+		: OSDictionary::withCapacity(12);
+	if (next) {
+		if (OSString *s = OSString::withCString(value)) {
+			next->setObject(feature, s);
+			s->release();
+			env.owner->setProperty("RDNA4FB,Results", next);
+			if (resultDictionary)
+				resultDictionary->release();
+			resultDictionary = next;
+		} else {
+			next->release();
+		}
+	}
+	IOLockUnlock(resultLock);
+}
+
 uint32_t RDNA4Compute::requestedStage() {
 	uint32_t stage = 0;
 	if (!PE_parse_boot_argn("rdna4-compute", &stage, sizeof(stage)))
@@ -393,6 +415,9 @@ uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 	CLOG("bring-up to stage %u requested", stage);
 	if (!rtLock)
 		rtLock = IOLockAlloc();
+	if (!resultLock)
+		resultLock = IOLockAlloc();
+	publishResult("runtime", "SKIPPED bring-up in progress");
 
 	if (!survey())
 		return StageOff;

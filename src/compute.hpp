@@ -75,6 +75,7 @@ class IOTimerEventSource;
 class IOWorkLoop;
 class OSObject;
 class IOMemoryMap;
+class OSDictionary;
 
 class RDNA4Compute {
 public:
@@ -175,9 +176,12 @@ private:
 	Survey sv {};
 	Pool   pool {};
 	uint32_t target { StageOff };
+	IOLock *resultLock { nullptr };
+	OSDictionary *resultDictionary { nullptr };
 
 	uint32_t rd(uint16_t hwId, const GfxReg::Reg &r) const;
 	void     wr(uint16_t hwId, const GfxReg::Reg &r, uint32_t value);
+	void     publishResult(const char *feature, const char *value);
 	uint32_t rdGc(const GfxReg::Reg &r) const { return rd(IpDiscovery::HwGc, r); }
 
 	bool survey();
@@ -391,8 +395,11 @@ private:
 	uint32_t ihSdmaMisses { 0 };
 	uint32_t ihDispatchObserved { 0 };
 	uint32_t ihSdmaObserved { 0 };
+	uint32_t ihDispatchWakeups { 0 };
+	uint32_t ihSdmaWakeups { 0 };
 	uint32_t ihEopCount { 0 };
 	uint32_t ihSdmaTrapCount { 0 };
+	uint64_t ihLastInterruptLog { 0 };
 	uint32_t ihFaultCount { 0 };
 	uint32_t ihUnknownCount { 0 };
 	uint8_t ihUnknownSeen[256][32] {};
@@ -414,6 +421,8 @@ private:
 	void ihDcnAckVblank();
 	void ihDcnAckFlip();
 	void ihDcnObserveVblank(uint64_t now);
+	void ihPublishResult();
+	bool ihInterruptLogAllowed();
 	void ihDecodeEntry(const uint32_t *dw);
 	void ihUnknown(uint8_t client, uint8_t source, uint8_t ring);
 	void ihRecordWait(bool dispatch, bool slept, bool completed,
