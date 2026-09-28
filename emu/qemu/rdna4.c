@@ -3607,7 +3607,7 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
             case 24: value = a | b; if (!rdna4_gfx_set_sreg(w, dst, value)) goto unknown; break;
             default: goto unknown;
             }
-            n = 2;
+            n = ((dw & 0xffu) == 0xffu || ((dw >> 8) & 0xffu) == 0xffu) ? 2 : 1;
         } else if ((dw & 0xfc000000u) == 0xd4000000u) {     /* VOP3 */
             uint32_t op = (dw >> 16) & 0x3ff;
             uint32_t dst = dw & 0xff;
