@@ -443,7 +443,7 @@ static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
 		}
 		printf("show: CPU spot check 64 pixels, mismatches %u (iteration +/-1 %u, hard %u)\n",
 		       mismatches, tolerated, hardMismatches);
-		if (kr != KERN_SUCCESS || hardMismatches > 2)
+		if (kr != KERN_SUCCESS || hardMismatches > 0 || tolerated > 4)
 			goto done;
 	}
 	for (uint32_t left = seconds * 10; left && !showSignal; left--)
@@ -614,7 +614,7 @@ static int cmdAnim(rdna4_t *gpu, uint32_t seconds) {
 			}
 			printf("anim: CPU spot check 64 pixels, mismatches %u (iteration +/-1 %u, hard %u)\n",
 			       frameMismatches, tolerated, hardMismatches);
-			if (hardMismatches > 2)
+			if (hardMismatches > 0 || tolerated > 4)
 			goto done;
 		}
 		rendered++;
