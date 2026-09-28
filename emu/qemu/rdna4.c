@@ -4009,6 +4009,9 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count)
         float area = (tri.x[1] - tri.x[0]) * (tri.y[2] - tri.y[0]) -
                      (tri.y[1] - tri.y[0]) * (tri.x[2] - tri.x[0]);
         uint32_t su = reg_get(s, REG_GFX_PA_SU_SC_MODE_CNTL);
+        if (s->gfx_trace)
+            fprintf(stderr, "rdna4: gfx: NGG positions %.3f,%.3f %.3f,%.3f %.3f,%.3f area=%.3f\\n",
+                    tri.x[0], tri.y[0], tri.x[1], tri.y[1], tri.x[2], tri.y[2], area);
         bool front = area > 0.0f;       /* FACE=CCW in the gfx12 stream */
         int64_t qx[3], qy[3];
         int minx, maxx, miny, maxy;
