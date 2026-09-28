@@ -2969,7 +2969,7 @@ static bool rdna4_mec_run_ib(RDNA4State *s, uint64_t address, uint32_t dwords,
         if (dwords - pos < 1 || !rdna4_vm_access(s, address + 4ull * pos, (uint8_t *)&hdr,
                                                   sizeof(hdr), vmid, false, false)) {
             fprintf(stderr, "rdna4: mec: indirect buffer 0x%" PRIx64 " header fault\n",
-                    address + 4ull * pos);
+                    (uint64_t)(address + 4ull * pos));
             return false;
         }
         dw[0] = hdr;
@@ -3019,7 +3019,7 @@ static bool rdna4_mec_run_ib(RDNA4State *s, uint64_t address, uint32_t dwords,
                 if (!rdna4_vm_access(s, a + 4ull * i, (uint8_t *)&dw[4 + i], 4,
                                      vmid, true, false)) {
                     fprintf(stderr, "rdna4: mec: indirect WRITE_DATA to 0x%" PRIx64 " refused\n",
-                            a + 4ull * i);
+                            (uint64_t)(a + 4ull * i));
                     return false;
                 }
             }
