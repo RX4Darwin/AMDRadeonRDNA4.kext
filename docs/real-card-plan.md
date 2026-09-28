@@ -55,10 +55,11 @@ trail if it hangs.
    the next boot; animation is skipped if its command is unavailable.
 
 4. **GFX ring and first draw (G3).** Add `rdna4-gfx=1` to boot 3.
-   `gfx PASS` requires the current boot's draw command evidence and the
-   `RDNA4FB,Results` value containing `THE TRIANGLE IS RIGHT` and 8192 pixels.
-   A stale NVRAM trail never proves PASS. A ring or draw hang leaves a `gfx:`
-   trail, and the next boot skips that feature once.
+   `gfx PASS` is recorded in the current boot's `RDNA4FB,Results` value,
+   containing `THE TRIANGLE IS RIGHT` and 8192 pixels. The registry is read
+   per boot, so this durable result is the batch evidence; a stale NVRAM trail
+   never proves PASS. A ring or draw hang leaves a `gfx:` trail, and the next
+   boot skips that feature once.
 
 5. **Doorbell GFX ring.** Replace mode 1 with:
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1`.

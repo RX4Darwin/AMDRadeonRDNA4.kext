@@ -89,11 +89,29 @@ run_step() {
 	"$@" > "$STEP_FILE" 2>&1 &
 	step_pid=$!
 	(
-		sleep "$STEP_TIMEOUT"
+		timer_pid=""
+		grace_pid=""
+		watchdog_cleanup() {
+			[ -z "$timer_pid" ] || kill "$timer_pid" 2>/dev/null || true
+			[ -z "$grace_pid" ] || kill "$grace_pid" 2>/dev/null || true
+		}
+		watchdog_stop() {
+			watchdog_cleanup
+			exit 0
+		}
+		trap watchdog_cleanup EXIT
+		trap watchdog_stop TERM INT
+		sleep "$STEP_TIMEOUT" >/dev/null 2>&1 &
+		timer_pid=$!
+		wait "$timer_pid" || exit 0
+		timer_pid=""
 		if kill -0 "$step_pid" 2>/dev/null; then
 			echo timeout > "$TIMEOUT_FILE"
 			kill -TERM "$step_pid" 2>/dev/null || true
-			sleep 2
+			sleep 2 >/dev/null 2>&1 &
+			grace_pid=$!
+			wait "$grace_pid" || true
+			grace_pid=""
 			kill -KILL "$step_pid" 2>/dev/null || true
 		fi
 	) &
@@ -522,6 +540,9 @@ registry_value() {
 	printf "%-12s %-8s %s\n" FEATURE STATUS KEY
 	cat "$SUMMARY"
 } > "$OUT" 2>&1
+
+# Make the durable summary visible before reporting success to the caller.
+sync >/dev/null 2>&1 || true
 
 echo "wrote $OUT"
 echo
