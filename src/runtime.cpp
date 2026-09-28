@@ -456,6 +456,7 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	for (uint32_t off = 0; off < 0x7000; off += 4)
 		*poolDw(qoff + off) = 0;
 	c->kernargCpu = poolDw(qoff + kVmKernarg);
+	c->queueCpu = poolDw(qoff + kVmPq);
 	c->fenceCpu = poolDw(qoff + kVmFence);
 	const uint64_t qva = c->nextVa; c->nextVa += 0x1000;
 	const uint64_t eva = c->nextVa; c->nextVa += 0x1000;
@@ -463,6 +464,11 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	const uint64_t wva = c->nextVa; c->nextVa += 0x1000;
 	c->fenceVa = c->nextVa; c->nextVa += 0x1000;
 	c->kernargVa = c->nextVa; c->nextVa += 0x1000;
+	c->queueVa = qva;
+	c->mqdMc = poolMc(qoff + kVmMqd);
+	c->eopVa = eva;
+	c->rptrVa = rva;
+	c->wpollVa = wva;
 	if (!vmMap(*c, qva, poolMc(qoff + kVmPq), kPqSize, false) ||
 	    !vmMap(*c, eva, poolMc(qoff + kVmEop), 0x1000, false) ||
 	    !vmMap(*c, rva, poolMc(qoff + kVmRptr), 0x1000, false) ||
@@ -764,12 +770,20 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	l.doorbell = c ? c->doorbell : 0;
 	l.fenceAddress = c ? c->fenceVa : 0;
 	l.fenceCpu = c ? c->fenceCpu : nullptr;
+	l.queueCpu = c ? c->queueCpu : nullptr;
+	l.queueAddress = c ? c->queueVa : 0;
+	l.recoveryMqd = c ? c->mqdMc : 0;
+	l.recoveryEop = c ? c->eopVa >> 8 : 0;
+	l.recoveryRptr = c ? c->rptrVa : 0;
+	l.recoveryWpoll = c ? c->wpollVa : 0;
+	l.recoveryProofAddress = c ? c->fenceVa : 0;
+	l.recoveryProofCpu = c ? c->fenceCpu : nullptr;
 
 	uint64_t ns = 0;
 	const bool done = launch(l, "runtime", ns);
 	micros = ns / 1000;
 	if (!done) {
-		if (recoverComputeQueue("runtime")) {
+		if (recoverComputeQueue("runtime", &l)) {
 			rtWedged = false;
 			RLOG("dispatch timed out after %u ms; queue recovered without a GPU reset", l.timeoutUs / 1000);
 		} else {

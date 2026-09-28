@@ -292,11 +292,17 @@ private:
 		uint32_t        vmid, pipe, queueId, fenceValue, doorbell;
 		uint64_t        fenceAddress;
 		volatile uint32_t *fenceCpu;
+		volatile uint32_t *queueCpu;
+		uint64_t        queueAddress;
+		uint64_t        recoveryMqd, recoveryEop, recoveryRptr, recoveryWpoll;
+		uint64_t        recoveryProofAddress;
+		volatile uint32_t *recoveryProofCpu;
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
-	void logComputeQueueState(const char *tag);
-	bool queueWriteTest(const char *tag);
-	bool recoverComputeQueue(const char *tag);
+	void logComputeQueueState(const char *tag, uint32_t pipe = 0, uint32_t queue = 0,
+	                         uint32_t vmid = 0);
+	bool queueWriteTest(const char *tag, const Launch *l = nullptr);
+	bool recoverComputeQueue(const char *tag, const Launch *l = nullptr);
 	// What launch() can give a code-object kernel: the kernarg pointer and
 	// up to 64 KiB of LDS — no dispatch/queue pointers or scratch yet.
 	static bool kernelFits(const CodeObj::Kernel &k, const char **why);
@@ -453,6 +459,8 @@ private:
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
 		uint64_t tableOffset { 0 }, rootMc { 0 }, rootPhys { 0 }, nextVa { GpuVm::kVaStart };
 		uint64_t kernargVa { 0 }, fenceVa { 0 };
+		uint64_t queueVa { 0 }, mqdMc { 0 }, eopVa { 0 }, rptrVa { 0 }, wpollVa { 0 };
+		volatile uint32_t *queueCpu { nullptr };
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
 		uint32_t fence { 0 }, doorbell { 0 };
