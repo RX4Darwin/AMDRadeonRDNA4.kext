@@ -15,8 +15,8 @@
 //  end-of-pipe RELEASE_MEM fence (ring_emit_fence), an indirect buffer
 //  (ring_test_ib), and enough fenced IBs to wrap the ring several times.
 //
-//  Boot-arg rdna4-gfx: 1 = the write pointer goes to CP_RB0_WPTR (MMIO),
-//  2 = through the gfx ring's doorbell, as amdgpu kicks it. Absent = off:
+//  Boot-arg rdna4-gfx: 2 = the write pointer goes through the gfx ring's doorbell, as amdgpu kicks it (1 is an alias of 2: the MMIO write pointer halts PFP/ME on silicon).
+//  Absent = off:
 //  nothing here runs. It runs after the compute stages on the bring-up
 //  thread; a failure halts PFP/ME again and leaves compute as it was.
 //
@@ -52,7 +52,15 @@ uint32_t RDNA4Compute::requestedGfx() {
 	uint32_t mode = 0;
 	if (!PE_parse_boot_argn("rdna4-gfx", &mode, sizeof(mode)))
 		return 0;
-	return mode == 1 || mode == 2 ? mode : 0;
+	if (mode == 1) {
+		// gfx_v12_0_gfx_ring_init sets ring->use_doorbell = true (gfx_v12_0.c:990)
+		// and ring_set_wptr_gfx writes the doorbell then; the MMIO branch is
+		// only for a ring without one. On the real card the MMIO write
+		// pointer halts PFP/ME (round 2, R2-2), so 1 now means the doorbell.
+		IOLog("RDNA4FB: gfx: rdna4-gfx=1 (MMIO write pointer) halts PFP/ME on silicon; using the doorbell like amdgpu\n");
+		return 2;
+	}
+	return mode == 2 ? mode : 0;
 }
 
 // gfx_v12_0_get_csb_buffer's layout: the cluster count, then per cluster
@@ -316,12 +324,18 @@ bool RDNA4Compute::stageGfxDraw() {
 		return false;
 	}
 	// The GE rings are sized for kMaxSe shader engines (they scale with its
-	// square): check the card's count first.
+	// square): check the card's count first. amdgpu does not take the SE count
+	// from GB_ADDR_CONFIG: gfx_v12_0 uses max_shader_engines and
+	// max_backends_per_se, which amdgpu_discovery_get_gc_info fills from the
+	// IP discovery gc_info table (amdgpu_discovery.c:2016,2020). The register
+	// is only logged; its NUM_SHADER_ENGINES field (gc_12_0_0_sh_mask.h:25752)
+	// reads 16 on the real card's 0x08200545, so it is not an SE count.
 	const uint32_t gbAddr = rdGc(GbAddrConfig);
-	const uint32_t ses = 1u << ((gbAddr >> 19) & 0xf);
-	GLOG("draw: GB_ADDR_CONFIG 0x%08x: %u shader engines, %u RBs per SE, %u pipes", gbAddr, ses,
-	     1u << ((gbAddr >> 26) & 3), 1u << (gbAddr & 7));
-	if (gbAddr == 0xffffffff || ses > kMaxSe) {
+	uint32_t ses = 0, rbPerSe = 0;
+	const bool haveGc = env.disc && env.disc->gcInfo(ses, rbPerSe);
+	GLOG("draw: GB_ADDR_CONFIG 0x%08x, IP discovery gc_info: %s%u shader engines, %u RBs per SE, %u pipes",
+	     gbAddr, haveGc ? "" : "absent, ", ses, rbPerSe, 1u << (gbAddr & 7));
+	if (!haveGc || !ses || ses > kMaxSe) {
 		GLOG("draw: the GE rings are sized for %u shader engines; skipped", kMaxSe);
 		publishResult("gfx", "SKIPPED unsupported shader-engine count");
 		return false;

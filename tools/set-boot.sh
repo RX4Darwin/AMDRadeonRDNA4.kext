@@ -7,8 +7,8 @@
 #   1  + interrupts and W6 opt-in            rdna4-ih=1 rdna4-hang=1
 #   2  + per-app GPU memory and W6 opt-in   rdna4-ih=1 rdna4-vm=1 rdna4-hang=1
 #   3  + display interrupts and page flips  ... rdna4-flip=1 rdna4-hang=1
-#   4  + gfx ring and first triangle        ... rdna4-gfx=1 rdna4-hang=1
-#   5  + gfx ring through doorbell          ... rdna4-gfx=2 rdna4-hang=1
+#   4  + gfx ring and first triangle        ... rdna4-gfx=2 rdna4-hang=1
+#   5  same as 4 (rdna4-gfx=1, the MMIO wptr, halts PFP/ME on silicon)  ... rdna4-gfx=2 rdna4-hang=1
 #   6  optional: vblank + cursor            ... rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
@@ -20,7 +20,7 @@ case "${1:-}" in
 	1) EXTRA="rdna4-ih=1 rdna4-hang=1" ;;
 	2) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1" ;;
 	3) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-hang=1" ;;
-	4) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=1 rdna4-hang=1" ;;
+	4) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
 	5) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1" ;;
 	*) echo "usage: bash $0 <0-6>   (see docs/real-card-plan.md)"; exit 1 ;;

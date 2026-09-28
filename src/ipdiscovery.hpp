@@ -66,6 +66,12 @@ public:
 	// Find a specific IP block instance.
 	bool findIp(uint16_t hwId, uint8_t instance, IpEntry &out) const;
 
+	// The GC table (table_list[1]) as amdgpu_discovery_get_gc_info reads it
+	// (amdgpu_discovery.c:2016,2020 for v1; v2 has the same u32 slots): the
+	// shader-engine and render-backend-per-SE counts. False if the table is
+	// absent or of a version amdgpu does not handle either.
+	bool gcInfo(uint32_t &numSe, uint32_t &numRbPerSe) const;
+
 	// Convenience: absolute MMIO *byte* offset of a register, given its
 	// segment index and dword offset within the segment (the BASE_IDX /
 	// reg offset pair from Linux asic_reg headers). Returns false if the

@@ -102,6 +102,26 @@ bool IpDiscovery::init(const uint8_t *buffer, size_t bufferSize) {
 	return false;
 }
 
+bool IpDiscovery::gcInfo(uint32_t &numSe, uint32_t &numRbPerSe) const {
+	if (!valid)
+		return false;
+	uint16_t vmajor, tblOff;
+	if (!readU16(binBase + 4, vmajor))
+		return false;
+	// GC is table_list[1] (enum table in discovery.h); table_info is 8 bytes.
+	const size_t tableList = binBase + (vmajor >= 2 ? 16 : 12);
+	if (!readU16(tableList + 8, tblOff) || !tblOff)
+		return false;
+	// gpu_info_header is 12 bytes (u32 table_id, u16 major, u16 minor, u32
+	// size); gc_info v1_0 and v2_0 both put gc_num_se right after it and
+	// gc_num_rb_per_se three dwords on.
+	const size_t gc = binBase + tblOff;
+	uint16_t gcMajor;
+	if (!readU16(gc + 4, gcMajor) || (gcMajor != 1 && gcMajor != 2))
+		return false;
+	return readU32(gc + 12, numSe) && readU32(gc + 12 + 12, numRbPerSe);
+}
+
 bool IpDiscovery::ipAt(uint16_t index, IpEntry &out) const {
 	if (!valid || index >= numIps)
 		return false;

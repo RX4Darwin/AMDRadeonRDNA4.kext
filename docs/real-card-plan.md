@@ -54,7 +54,7 @@ trail if it hangs.
    `anim: desktop restored`. A failed display test leaves `ih:` or `flip:` for
    the next boot; animation is skipped if its command is unavailable.
 
-4. **GFX ring and first draw (G3).** Add `rdna4-gfx=1` to boot 3.
+4. **GFX ring and first draw (G3).** Add `rdna4-gfx=2` to boot 3 (`=1`, the MMIO write pointer, halts PFP/ME on the card and is now an alias of 2).
    `gfx PASS` is recorded in the current boot's `RDNA4FB,Results` value,
    containing `THE TRIANGLE IS RIGHT` and 8192 pixels. The registry is read
    per boot, so this durable result is the batch evidence; a stale NVRAM trail
