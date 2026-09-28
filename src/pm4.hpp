@@ -70,6 +70,9 @@ uint32_t acquireMem(uint32_t *out, uint32_t gcrCntl);
 // A gfx-ring INDIRECT_BUFFER (gfx_v12_0_ring_emit_ib_gfx, no VALID bit; the
 // compute form sets it): `dwords` at `addr` (dword aligned) under `vmid`.
 uint32_t indirectBufferGfx(uint32_t *out, uint64_t addr, uint32_t dwords, uint32_t vmid);
+// gfx_v12_0_ring_emit_ib_compute: VALID, length and VMID, with CHAIN and PRIV
+// clear. Compute IBs are unprivileged and execute in the client's VMID.
+uint32_t indirectBufferCompute(uint32_t *out, uint64_t addr, uint32_t dwords, uint32_t vmid);
 
 // A queue of `sizeBytes` (power of two) at `cpu`; write pointer in dwords.
 class Queue {

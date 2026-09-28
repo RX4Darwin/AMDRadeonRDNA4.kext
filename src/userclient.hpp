@@ -65,6 +65,8 @@ private:
 	static IOReturn sSleepTest(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPresentAsync(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sWaitPresent(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sSubmitIb(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sWaitFence(OSObject *t, void *, IOExternalMethodArguments *a);
 };
 
 #endif /* RDNA4UserClient_hpp */

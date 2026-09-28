@@ -1924,8 +1924,10 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	const bool vm = l.queue != nullptr;
 	volatile uint32_t *fenceCpu = vm ? l.fenceCpu : poolDw(kPm4FenceOffset);
 	const uint32_t fenceValue = vm ? l.fenceValue : (pm4Fence + 1);
-	*fenceCpu = 0;
-	flushHdp();
+	if (!vm || !l.preserveFence) {
+		*fenceCpu = 0;
+		flushHdp();
+	}
 
 	// Shader memory model for the selected VMID (gfx_v12_0_constants_init).
 	grbmSelect(0, vm ? l.pipe : 0, vm ? l.queueId : 0, vm ? l.vmid : 0);

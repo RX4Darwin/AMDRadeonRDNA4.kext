@@ -47,6 +47,7 @@ typedef struct {
 
 typedef struct {
 	uint64_t handle;
+	uint64_t gpu;                           /* GPU VA of the kernel entry point */
 	uint64_t kernargBytes;                  /* the kernel's kernarg segment */
 	uint64_t imageBytes;
 	uint64_t rsrc1, rsrc2, rsrc3, properties;
@@ -84,6 +85,14 @@ kern_return_t rdna4_dispatch_lds(rdna4_t *dev, const rdna4_program_t *prog,
                                  const uint32_t groups[3], const uint32_t groupSize[3],
                                  const void *kernargs, uint32_t kernargBytes,
                                  uint32_t dynamicLdsBytes, uint32_t timeoutMs, uint64_t *micros);
+
+/* Record an unprivileged compute PM4 IB in `buf` and append it to this client's
+ * queue. `offsetBytes` is relative to the buffer and the returned fence is
+ * ordered with kernel-built Dispatch calls on the same queue. */
+kern_return_t rdna4_submit_ib(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offsetBytes,
+                              uint32_t dwords, uint64_t *fence);
+kern_return_t rdna4_wait_fence(rdna4_t *dev, uint64_t fence, uint32_t timeoutMs,
+                               uint64_t *ns);
 
 kern_return_t rdna4_wait_vblank(rdna4_t *dev, uint32_t timeoutMs, uint64_t *count,
                                 uint64_t *timeNs);

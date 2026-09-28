@@ -28,6 +28,7 @@
 
 #include "librdna4.h"
 #include "bench_codeobj.h"
+#include "pm4build.h"
 #include "vadd_codeobj.h"
 
 #include <Accelerate/Accelerate.h>
@@ -516,6 +517,172 @@ static int testHostZeroCopy(rdna4_t *gpu, const rdna4_program_t *prog, uint32_t 
 	}
 	rdna4_free(gpu, &b);
 	rdna4_free(gpu, &a);
+	return fails;
+}
+
+static uint32_t recordVaddIb(uint32_t *ib, const rdna4_program_t *prog,
+                             uint64_t kernarg, uint32_t groups) {
+	uint32_t n = 0;
+	const uint32_t zero = 0, all[2] = { 0xffffffffu, 0xffffffffu };
+	const uint32_t none4[4] = { 0, 0, 0, 0 }, start[3] = { 0, 0, 0 };
+	const uint32_t threads[3] = { 64, 1, 1 };
+	const uint32_t pgm[2] = { (uint32_t)(prog->gpu >> 8), (uint32_t)(prog->gpu >> 40) };
+	const uint32_t rsrc[2] = { (uint32_t)prog->rsrc1, (uint32_t)prog->rsrc2 };
+	const uint32_t rsrc3 = (uint32_t)prog->rsrc3;
+	const uint32_t user[2] = { (uint32_t)kernarg, (uint32_t)(kernarg >> 32) };
+	n += rdna4_pm4_acquire_mem(ib + n, RDNA4_PM4_GCR_MEM_SYNC);
+	n += rdna4_pm4_set_sh_reg(ib + n, RDNA4_PM4_COMPUTE_PGM_LO, pgm, 2);
+	n += rdna4_pm4_set_sh_reg(ib + n, RDNA4_PM4_COMPUTE_PGM_RSRC1, rsrc, 2);
+	n += rdna4_pm4_set_sh_reg(ib + n, RDNA4_PM4_COMPUTE_PGM_RSRC3, &rsrc3, 1);
+	n += rdna4_pm4_set_sh_reg(ib + n, RDNA4_PM4_COMPUTE_RESOURCE_LIM, &zero, 1);
+	n += rdna4_pm4_set_sh_reg(ib + n, RDNA4_PM4_COMPUTE_TMPRING, &zero, 1);
+	n += rdna4_pm4_set_sh_reg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE0, all, 2);
+	n += rdna4_pm4_set_sh_reg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE2, all, 2);
+	n += rdna4_pm4_set_sh_reg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE4, none4, 4);
+	n += rdna4_pm4_set_sh_reg(ib + n, RDNA4_PM4_COMPUTE_START_X, start, 3);
+	n += rdna4_pm4_set_sh_reg(ib + n, RDNA4_PM4_COMPUTE_NUM_THREAD_X, threads, 3);
+	n += rdna4_pm4_set_sh_reg(ib + n, RDNA4_PM4_COMPUTE_USER_DATA0, user, 2);
+	n += rdna4_pm4_dispatch_direct(ib + n, groups, 1, 1,
+	                               RDNA4_PM4_DISPATCH_SHADER_EN |
+	                               RDNA4_PM4_DISPATCH_FORCE_START0 |
+	                               (prog->properties & (1u << 10) ? RDNA4_PM4_DISPATCH_WAVE32 : 0));
+	return n;
+}
+
+/* Record the same vadd setup as launch(), then let the kernel chain it through
+ * the client's VMID. The data and kernargs are read and checked through the
+ * returned host pointers only. */
+static int testIndirectBuffers(rdna4_t *gpu, const rdna4_program_t *prog, int badIb) {
+	const uint32_t items = 256, groups = items / 64, stride = 256;
+	const uint64_t bytes = items * 4ull;
+	rdna4_buffer_t ib = {}, kernarg = {}, a = {}, b = {}, c = {};
+	uint32_t *ibCpu = NULL, *kernargCpu = NULL, *ha = NULL, *hb = NULL, *hc = NULL;
+	void *p = NULL;
+	uint64_t fence = 0, ns = 0;
+	kern_return_t kr;
+	int fails = 0;
+	if ((kr = rdna4_alloc_host(gpu, 4096, &ib, &p)) ||
+	    (ibCpu = (uint32_t *)p) == NULL ||
+	    (kr = rdna4_alloc_host(gpu, 4096, &kernarg, &p)) ||
+	    (kernargCpu = (uint32_t *)p) == NULL ||
+	    (kr = rdna4_alloc_host(gpu, bytes, &a, &p)) || !(ha = (uint32_t *)p) ||
+	    (kr = rdna4_alloc_host(gpu, bytes, &b, &p)) || !(hb = (uint32_t *)p) ||
+	    (kr = rdna4_alloc_host(gpu, bytes, &c, &p)) || !(hc = (uint32_t *)p)) {
+		printf("  FAIL  SubmitIb host setup: %s\n", rdna4_error(kr));
+		fails++;
+		goto done;
+	}
+	for (uint32_t i = 0; i < items; i++) {
+		ha[i] = aOf(i + 41);
+		hb[i] = bOf(i, 41);
+		hc[i] = 0xdeadbeefu;
+	}
+	const uint64_t args[3] = { a.gpu, b.gpu, c.gpu };
+	memcpy(kernargCpu, args, sizeof(args));
+	uint32_t ibDwords = recordVaddIb(ibCpu, prog, kernarg.gpu, groups);
+	if (rdna4_submit_ib(gpu, &ib, 0, ibDwords, &fence) != KERN_SUCCESS ||
+	    (kr = rdna4_wait_fence(gpu, fence, 5000, &ns)) != KERN_SUCCESS) {
+		printf("  FAIL  SubmitIb vadd/wait: %s\n", rdna4_error(kr));
+		fails++;
+	} else {
+		uint32_t bad = 0;
+		for (uint32_t i = 0; i < items; i++)
+			bad += hc[i] != ha[i] + 3 * hb[i];
+		printf("  %s  SubmitIb vadd: %u CPU-visible results, fence %llu ns\n",
+		       bad ? "FAIL" : "ok", items, (unsigned long long)ns);
+		fails += bad != 0;
+	}
+
+	/* Keep several fences outstanding, then wait the oldest one.  The wait
+	 * must use >= semantics and leave the newer fence ordered behind it. */
+	uint64_t first = 0, third = 0;
+	kr = KERN_SUCCESS;
+	for (uint32_t i = 0; i < 3; i++) {
+		kr = rdna4_submit_ib(gpu, &ib, 0, ibDwords, &fence);
+		if (kr != KERN_SUCCESS)
+			break;
+		if (i == 0)
+			first = fence;
+		if (i == 2)
+			third = fence;
+	}
+	if (kr == KERN_SUCCESS)
+		kr = rdna4_wait_fence(gpu, first, 5000, &ns);
+	if (kr != KERN_SUCCESS) {
+		printf("  FAIL  three IBs then oldest-fence wait: %s\n", rdna4_error(kr));
+		fails++;
+	} else {
+		printf("  ok    three IBs back-to-back; oldest fence %llu returned before fence %llu\n",
+		       (unsigned long long)first, (unsigned long long)third);
+	}
+	if (kr == KERN_SUCCESS && third != first) {
+		kr = rdna4_wait_fence(gpu, third, 5000, &ns);
+		if (kr != KERN_SUCCESS) {
+			printf("  FAIL  newest fence after oldest-fence wait: %s\n", rdna4_error(kr));
+			fails++;
+		}
+	}
+
+	/* Ten distinct IB locations are chained before waiting for the last one. */
+	for (uint32_t i = 0; i < 10; i++)
+		recordVaddIb(ibCpu + (i * stride) / 4, prog, kernarg.gpu, groups);
+	uint64_t last = 0;
+	for (uint32_t i = 0; i < 10; i++) {
+		kr = rdna4_submit_ib(gpu, &ib, i * stride, ibDwords, &last);
+		if (kr != KERN_SUCCESS)
+			break;
+	}
+	if (kr == KERN_SUCCESS)
+		kr = rdna4_wait_fence(gpu, last, 5000, &ns);
+	uint32_t bad = 0;
+	for (uint32_t i = 0; i < items; i++)
+		bad += hc[i] != ha[i] + 3 * hb[i];
+	if (kr != KERN_SUCCESS || bad) {
+		printf("  FAIL  ten back-to-back IBs: %s%s\n", rdna4_error(kr), bad ? " (data differs)" : "");
+		fails++;
+	} else {
+		printf("  ok    ten back-to-back IBs completed in order; last fence %llu ns\n",
+		       (unsigned long long)ns);
+	}
+	rdna4_buffer_t outside = ib;
+	outside.gpu += 0x100000;
+	fence = 0;
+	fails += checkFailed("an IB VA outside the client's buffers",
+	                     rdna4_submit_ib(gpu, &outside, 0, ibDwords, &fence));
+
+	if (badIb) {
+		ibCpu[0] = 0xffffffffu;
+		kr = rdna4_submit_ib(gpu, &ib, 0, 1, &fence);
+		if (kr == KERN_SUCCESS)
+			kr = rdna4_wait_fence(gpu, fence, 200, &ns);
+		if (kr != kIOReturnTimeout) {
+			printf("  FAIL  invalid IB returned %s, want timeout after recovery\n", rdna4_error(kr));
+			fails++;
+		} else {
+			printf("  ok    invalid IB timed out; W6 queue recovery completed\n");
+		}
+		ibDwords = recordVaddIb(ibCpu, prog, kernarg.gpu, groups);
+		kr = rdna4_submit_ib(gpu, &ib, 0, ibDwords, &fence);
+		if (kr == KERN_SUCCESS)
+			kr = rdna4_wait_fence(gpu, fence, 5000, &ns);
+		bad = 0;
+		for (uint32_t i = 0; i < items; i++)
+			bad += hc[i] != ha[i] + 3 * hb[i];
+		if (kr != KERN_SUCCESS || bad) {
+			printf("  FAIL  vadd after invalid IB recovery: %s%s\n", rdna4_error(kr),
+			       bad ? " (data differs)" : "");
+			fails++;
+		} else {
+			printf("  ok    vadd after invalid IB recovery\n");
+		}
+	}
+
+done:
+	if (c.handle) rdna4_free(gpu, &c);
+	if (b.handle) rdna4_free(gpu, &b);
+	if (a.handle) rdna4_free(gpu, &a);
+	if (kernarg.handle) rdna4_free(gpu, &kernarg);
+	if (ib.handle) rdna4_free(gpu, &ib);
 	return fails;
 }
 
@@ -1071,7 +1238,7 @@ static int testWmma(rdna4_t *gpu) {
 	return fails;
 }
 
-static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
+static int cmdSelftest(rdna4_t *gpu, uint32_t items, int badIb) {
 	int fails = 0;
 	if (!items || items % 64) {
 		fprintf(stderr, "selftest: items must be a positive multiple of 64\n");
@@ -1089,6 +1256,10 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 		void *cpu = NULL;
 		fails += checkFailed("AllocHost without GPUVM",
 		                     rdna4_alloc_host(gpu, 4096, &host, &cpu));
+		rdna4_buffer_t ib = { 0, 0x1000, 4 };
+		uint64_t fence = 0;
+		fails += checkFailed("SubmitIb without GPUVM",
+		                     rdna4_submit_ib(gpu, &ib, 0, 1, &fence));
 	}
 
 	rdna4_program_t prog;
@@ -1101,6 +1272,8 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 	       prog.imageBytes, prog.kernargBytes, prog.rsrc1, prog.rsrc2);
 	if (gpuVm)
 		fails += testHostZeroCopy(gpu, &prog, items);
+	if (gpuVm)
+		fails += testIndirectBuffers(gpu, &prog, badIb);
 
 	const uint64_t bytes = (uint64_t)items * 4;
 	rdna4_buffer_t a, b, c;
@@ -1675,6 +1848,7 @@ static void usage(void) {
 	                "       rdna4-run sensors\n"
 	                "       rdna4-run selftest [items]\n"
 	                "       rdna4-run selftest hang\n"
+	                "       rdna4-run selftest ibbad\n"
 	                "       rdna4-run hangtest\n"
 	                "       rdna4-run bench [small]\n"
 	                "       rdna4-run vsync [n]\n"
@@ -1706,11 +1880,13 @@ int main(int argc, char **argv) {
 		if (!openRuntime(&gpu))
 			return 1;
 		if (argc == 3 && !strcmp(argv[2], "hang")) {
-			rc = cmdSelftest(&gpu, 65536);
+			rc = cmdSelftest(&gpu, 65536, 0);
 			if (!rc)
 				rc = cmdHangtest(&gpu);
+		} else if (argc == 3 && !strcmp(argv[2], "ibbad")) {
+			rc = cmdSelftest(&gpu, 65536, 1);
 		} else {
-			rc = cmdSelftest(&gpu, argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 65536);
+			rc = cmdSelftest(&gpu, argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 65536, 0);
 		}
 	} else if (!strcmp(argv[1], "hangtest") && argc == 2) {
 		if (!openRuntime(&gpu))
