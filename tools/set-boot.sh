@@ -7,8 +7,8 @@
 #   1  + interrupts and W6 opt-in            rdna4-ih=1 rdna4-hang=1
 #   2  + per-app GPU memory and W6 opt-in   rdna4-ih=1 rdna4-vm=1 rdna4-hang=1
 #   3  + display interrupts and page flips  ... rdna4-flip=1 rdna4-hang=1
-#   4  + gfx ring and first triangle        ... rdna4-gfx=1 rdna4-hang=1
-#   5  + gfx ring through doorbell          ... rdna4-gfx=2 rdna4-hang=1
+#   4  + gfx ring and first triangle        ... rdna4-gfx=2 rdna4-hang=1
+#   5  boot 4 without the VM (rdna4-vm off): the triangle independent of the VM  ... rdna4-gfx=2 rdna4-hang=1
 #   6  optional: vblank + cursor            ... rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1
 #   7  optional: GFX power-management probe rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15
 #      (samples the SMU metrics, sets the default workload mask, releases the
@@ -23,8 +23,8 @@ case "${1:-}" in
 	1) EXTRA="rdna4-ih=1 rdna4-hang=1" ;;
 	2) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1" ;;
 	3) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-hang=1" ;;
-	4) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=1 rdna4-hang=1" ;;
-	5) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
+	4) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
+	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1" ;;
 	7) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15" ;;
 	*) echo "usage: bash $0 <0-7>   (see docs/real-card-plan.md)"; exit 1 ;;

@@ -54,15 +54,15 @@ trail if it hangs.
    `anim: desktop restored`. A failed display test leaves `ih:` or `flip:` for
    the next boot; animation is skipped if its command is unavailable.
 
-4. **GFX ring and first draw (G3).** Add `rdna4-gfx=1` to boot 3.
+4. **GFX ring and first draw (G3).** Add `rdna4-gfx=2` to boot 3 (`=1`, the MMIO write pointer, halts PFP/ME on the card and is now an alias of 2).
    `gfx PASS` is recorded in the current boot's `RDNA4FB,Results` value,
    containing `THE TRIANGLE IS RIGHT` and 8192 pixels. The registry is read
    per boot, so this durable result is the batch evidence; a stale NVRAM trail
    never proves PASS. A ring or draw hang leaves a `gfx:` trail, and the next
    boot skips that feature once.
 
-5. **Doorbell GFX ring.** Replace mode 1 with:
-   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1`.
+5. **GFX ring without the VM.** Same as boot 4 but without `rdna4-vm=1`, so the triangle is tested independently of the VM failure:
+   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1`.
    Expect the same ring and triangle signs through the doorbell path. A
    failure leaves the `gfx:` trail and mode 1 remains the fallback.
 

@@ -239,6 +239,11 @@ bool RDNA4Compute::survey() {
 void RDNA4Compute::logSurvey() const {
 	CLOG("GC %u.%u.%u, registers %s", sv.gcMajor, sv.gcMinor, sv.gcRev,
 	     sv.gcReadable ? "readable" : "NOT readable (GRBM_STATUS all-ones)");
+	uint32_t gcSe = 0, gcRb = 0, gcVer = 0;
+	if (env.disc && env.disc->gcInfo(gcSe, gcRb, &gcVer))
+		CLOG("IP discovery gc_info %u.%u: %u shader engines, %u RBs per SE", gcVer >> 16, gcVer & 0xffff, gcSe, gcRb);
+	else
+		CLOG("IP discovery gc_info: absent or not a GC table");
 	if (sv.gcReadable) {
 		CLOG("grbm status=0x%08x status2=0x%08x cp_stat=0x%08x cpc=0x%08x cpf=0x%08x",
 		     sv.grbmStatus, sv.grbmStatus2, sv.cpStat, sv.cpcStatus, sv.cpfStatus);

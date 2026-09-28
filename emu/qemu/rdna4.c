@@ -4572,6 +4572,29 @@ unknown:
     return false;
 }
 
+/* Shader-engine count as amdgpu gets it: amdgpu_discovery_get_gc_info reads
+ * gc_num_se from the IP discovery GC table (table_list[1]; gpu_info_header is
+ * 12 bytes, gc_num_se follows).  GB_ADDR_CONFIG is not an SE count source:
+ * the card's 0x08200545 has NUM_SHADER_ENGINES [22:19] = 4 (16 by a 1<<n
+ * decode) on a 4-SE Navi 48.  0 when the table is absent. */
+static uint32_t rdna4_gfx_discovery_num_se(RDNA4State *s)
+{
+    uint32_t list, off;
+
+    if (!s->discovery || s->discovery_len < 32) {
+        return 0;
+    }
+    list = lduw_le_p(s->discovery + 4) >= 2 ? 16 : 12;
+    off = lduw_le_p(s->discovery + list + 8);
+    if (!off || off + 16 > s->discovery_len) {
+        return 0;
+    }
+    if (ldl_le_p(s->discovery + off) != 0x4347) { /* GC_TABLE_ID */
+        return 0;
+    }
+    return ldl_le_p(s->discovery + off + 12);
+}
+
 static bool rdna4_gfx_draw_refuse(RDNA4State *s, const char *reg,
                                   const char *why)
 {
@@ -4616,7 +4639,7 @@ static uint32_t rdna4_gfx_ring_bytes(RDNA4State *s, uint32_t base_reg,
 static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
 {
     uint32_t stages, ena, addr, col, info, attrib3, vte, cbcc, target, shader;
-    uint32_t gb, ses, pos_bytes, prim_bytes;
+    uint32_t ses, pos_bytes, prim_bytes;
 
     if (count == 0 || count > 30)
         return rdna4_gfx_draw_refuse(s, "INDEX_COUNT", "count is not modelled (1..30)");
@@ -4649,11 +4672,9 @@ static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
         return rdna4_gfx_draw_refuse(s, "SPI_PS_IN_CONTROL", "PS_W32_EN is off");
     if (!(reg_get(s, REG_GFX_SPI_SHADER_GS_OUT_CONFIG_PS) & (1u << 10)))
         return rdna4_gfx_draw_refuse(s, "SPI_SHADER_GS_OUT_CONFIG_PS", "NO_PC_EXPORT is off");
-
-    gb = reg_get(s, REG_GFX_GB_ADDR_CONFIG);
-    ses = 1u << ((gb >> 19) & 0xf);
+    ses = rdna4_gfx_discovery_num_se(s);
     if (!ses || ses > REG_GFX_GE_RING_MIN_SE)
-        return rdna4_gfx_draw_refuse(s, "GB_ADDR_CONFIG", "shader-engine count is not modelled");
+        return rdna4_gfx_draw_refuse(s, "gc_info gc_num_se", "shader-engine count is not modelled");
     pos_bytes = rdna4_gfx_ring_bytes(s, REG_GFX_GE_POS_RING_BASE,
                                      REG_GFX_GE_POS_RING_SIZE, 0x3fff, vmid);
     prim_bytes = rdna4_gfx_ring_bytes(s, REG_GFX_GE_PRIM_RING_BASE,
@@ -6460,13 +6481,12 @@ static void rdna4_reset(DeviceState *dev)
             error_report_err(err);
         }
     }
-    /* Navi 48: four shader engines, four RBs per SE, two pipes.  amdgpu's
-     * gfx_v12_0 get_gb_addr_config() decodes these fields from
-     * GB_ADDR_CONFIG; the register is read-only in the model, so provide the
-     * GC 12.0 Navi 48 answer when the GOP image did not capture it. */
-    if (!reg_get(s, REG_GFX_GB_ADDR_CONFIG)) {
-        reg_set(s, REG_GFX_GB_ADDR_CONFIG, (2u << 19) | (2u << 26) | 1u);
-    }
+    /* The real Navi 48 GB_ADDR_CONFIG, read on the card (premetal hw-logs,
+     * round 2): 0x08200545.  Its NUM_SHADER_ENGINES field [22:19] reads 4, so
+     * a 1<<n decode gives 16 SEs on a 4-SE chip: the SE count comes from the
+     * IP discovery gc_info table, as in amdgpu_discovery_get_gc_info.  The
+     * register is read-only in the model; always present the card's value. */
+    reg_set(s, REG_GFX_GB_ADDR_CONFIG, 0x08200545u);
     if (dcn) {
         memcpy(s->regs + dcn_start, dcn, dcn_bytes);
         g_free(dcn);
