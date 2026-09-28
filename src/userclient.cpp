@@ -63,6 +63,7 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sWaitVBlank, 1,          0,                          2,           0 },
 	{ sPresent,    2,          0,                          2,           0 },
 	{ sRestore,    0,          0,                          0,           0 },
+	{ sAllocHost,  2,          0,                          3,           0 },
 };
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -138,4 +139,10 @@ IOReturn RDNA4ComputeClient::sPresent(OSObject *t, void *, IOExternalMethodArgum
 
 IOReturn RDNA4ComputeClient::sRestore(OSObject *t, void *, IOExternalMethodArguments *) {
 	return self(t)->compute->rtRestore(t);
+}
+
+IOReturn RDNA4ComputeClient::sAllocHost(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtAllocHost(t, self(t)->task, a->scalarInput[0],
+	                                     a->scalarInput[1], a->scalarOutput[0],
+	                                     a->scalarOutput[1], a->scalarOutput[2]);
 }

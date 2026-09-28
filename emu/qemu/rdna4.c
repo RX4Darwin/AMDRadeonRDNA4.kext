@@ -1515,6 +1515,8 @@ static uint8_t *rdna4_phys_span(RDNA4State *s, uint64_t physical, uint64_t len)
 
 /* gfx12 VM walk used by CP and shader accesses for runtime VMIDs. */
 #define RDNA4_VM_VALID       (1ull << 0)
+#define RDNA4_VM_SYSTEM     (1ull << 1)
+#define RDNA4_VM_SNOOPED    (1ull << 2)
 #define RDNA4_VM_EXECUTABLE  (1ull << 4)
 #define RDNA4_VM_READABLE    (1ull << 5)
 #define RDNA4_VM_WRITEABLE   (1ull << 6)
@@ -1597,6 +1599,131 @@ fault:
     if (off >= 0 && len <= 0x1000 && (va & 0xfff) + len <= 0x1000)
         return rdna4_vram_span(s, off + (va & 0xfff), len);
     return NULL;
+}
+
+typedef struct RDNA4VmTarget {
+    bool system;
+    uint64_t address;
+} RDNA4VmTarget;
+
+/* Resolve one page of a VMID mapping.  GPU-physical VRAM and PCI bus
+ * addresses are deliberately kept distinct: an MC address in a page-table
+ * entry cannot accidentally reach the VRAM array. */
+static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
+                            uint32_t vmid, bool write, bool execute,
+                            RDNA4VmTarget *target)
+{
+    uint32_t n = vmid - 1;
+    uint32_t cntl = reg_get(s, REG_GCVM_CTX1_CNTL + n * 4);
+    uint64_t base, start, end, table, entry;
+
+    if (!(cntl & 1) || ((cntl >> 1) & 3) != 3 || va >= (1ull << 48) ||
+        !len || len > 0x1000 - (va & 0xfff))
+        goto fault;
+    start = reg_get(s, REG_GCVM_CTX1_START_LO + n * 8) |
+            ((uint64_t)reg_get(s, REG_GCVM_CTX1_START_HI + n * 8) << 32);
+    end = reg_get(s, REG_GCVM_CTX1_END_LO + n * 8) |
+          ((uint64_t)reg_get(s, REG_GCVM_CTX1_END_HI + n * 8) << 32);
+    if (va < start || va > end || len > (1ull << 48) - va || va + len - 1 > end)
+        goto fault;
+    base = reg_get(s, REG_GCVM_CTX1_BASE_LO + n * 8) |
+           ((uint64_t)reg_get(s, REG_GCVM_CTX1_BASE_HI + n * 8) << 32);
+    table = base & RDNA4_VM_PHYS_MASK;
+    for (uint32_t level = 0; level < 4; level++) {
+        uint32_t shift = 12 + (3 - level) * 9;
+        uint32_t idx = (va >> shift) & 0x1ff;
+        if (!rdna4_vm_entry(s, table + (uint64_t)idx * 8, &entry) ||
+            !(entry & RDNA4_VM_VALID))
+            goto fault;
+        if (level < 3 && (entry & RDNA4_VM_PDE_PTE)) {
+            uint32_t page_shift = 12 + (3 - level) * 9;
+            uint64_t page_mask = (1ull << page_shift) - 1;
+            if (entry & RDNA4_VM_SYSTEM || !(entry & RDNA4_VM_READABLE) ||
+                (write && !(entry & RDNA4_VM_WRITEABLE)) ||
+                (execute && !(entry & RDNA4_VM_EXECUTABLE)))
+                goto fault;
+            target->system = false;
+            target->address = ((entry & RDNA4_VM_PHYS_MASK) & ~page_mask) |
+                              (va & page_mask);
+            if (rdna4_phys_to_vram(s, target->address) < 0)
+                goto fault;
+            return true;
+        }
+        if (level == 3) {
+            if (!(entry & RDNA4_VM_READABLE) || (write && !(entry & RDNA4_VM_WRITEABLE)) ||
+                (execute && !(entry & RDNA4_VM_EXECUTABLE)))
+                goto fault;
+            target->system = (entry & RDNA4_VM_SYSTEM) != 0;
+            target->address = (entry & RDNA4_VM_PHYS_MASK) | (va & 0xfff);
+            if (!target->system && rdna4_phys_to_vram(s, target->address) < 0)
+                goto fault;
+            return true;
+        }
+        table = entry & RDNA4_VM_PHYS_MASK;
+    }
+fault:
+    rdna4_vm_fault(s, vmid, va);
+    return false;
+}
+
+/* Shader global memory operations can target system PTEs.  Accesses are split
+ * at page boundaries and use PCI DMA for system leaves, just like SDMA's AGP
+ * path. */
+static bool rdna4_vm_access(RDNA4State *s, uint64_t va, uint8_t *data, uint64_t len,
+                            uint32_t vmid, bool write, bool execute)
+{
+    while (len) {
+        uint64_t chunk = 0x1000 - (va & 0xfff);
+        if (chunk > len)
+            chunk = len;
+        if (!vmid) {
+            uint8_t *p = rdna4_gc_span(s, va, chunk);
+            if (!p)
+                return false;
+            if (write)
+                memcpy(p, data, chunk);
+            else
+                memcpy(data, p, chunk);
+        } else {
+            RDNA4VmTarget target;
+            if (!rdna4_vm_target(s, va, chunk, vmid, write, execute, &target)) {
+                /* Retry is disabled in the model; retain the existing dummy
+                 * page behaviour so a freed VA faults and drains cleanly. */
+                uint8_t *dummy = rdna4_gc_span_vmid(s, va, chunk, vmid, write, execute);
+                if (!dummy)
+                    return false;
+                if (write)
+                    memcpy(dummy, data, chunk);
+                else
+                    memcpy(data, dummy, chunk);
+            } else if (target.system) {
+                PCIDevice *pci = PCI_DEVICE(s);
+                if (!(pci_get_word(pci->config + PCI_COMMAND) & PCI_COMMAND_MASTER)) {
+                    rdna4_vm_fault(s, vmid, va);
+                    return false;
+                }
+                MemTxResult result = write ? pci_dma_write(pci, target.address, data, chunk)
+                                           : pci_dma_read(pci, target.address, data, chunk);
+                if (result != MEMTX_OK) {
+                    rdna4_vm_fault(s, vmid, va);
+                    return false;
+                }
+            } else {
+                int64_t off = rdna4_phys_to_vram(s, target.address);
+                uint8_t *p = off < 0 ? NULL : rdna4_vram_span(s, off, chunk);
+                if (!p)
+                    return false;
+                if (write)
+                    memcpy(p, data, chunk);
+                else
+                    memcpy(data, p, chunk);
+            }
+        }
+        va += chunk;
+        data += chunk;
+        len -= chunk;
+    }
+    return true;
 }
 
 #define REG_GCMC_AGP_TOP     GC_SEG0(0x1616)   /* MC >> 24 */
@@ -2232,7 +2359,7 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             int64_t ioff = ((int32_t)(dw2 & 0xffffff00)) >> 8;
             uint32_t count = op >= 20 && op <= 23 ? op - 19 : op >= 26 && op <= 29 ? op - 25 : 0;
             uint64_t addr;
-            uint8_t *d;
+            uint8_t io[16];
             n = 3;
             if (op == 43 || op == 44) {                     /* global_inv / global_wb */
                 pc += 4ull * n;
@@ -2245,17 +2372,17 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
                    (l->s[saddr] | ((uint64_t)l->s[saddr + 1] << 32)) + l->v[vaddr] :
                    l->v[vaddr] | ((uint64_t)l->v[(vaddr + 1) & 255] << 32);
             addr += ioff;
-            d = rdna4_gc_span_vmid(s, addr, 4 * count, vmid, op >= 26, false);
-            if (!d) {
+            if (op >= 26) {
+                for (uint32_t i = 0; i < count; i++)
+                    stl_le_p(io + 4 * i, l->v[(data + i) & 255]);
+            }
+            if (!rdna4_vm_access(s, addr, io, 4 * count, vmid, op >= 26, false)) {
                 fprintf(stderr, "rdna4: cs: global access to 0x%" PRIx64 " not mapped\n", addr);
                 return ISA_ERROR;
             }
-            for (uint32_t i = 0; i < count; i++) {
-                if (op >= 26) {
-                    stl_le_p(d + 4 * i, l->v[(data + i) & 255]);
-                } else {
-                    l->v[(vdst + i) & 255] = ldl_le_p(d + 4 * i);
-                }
+            if (op < 26) {
+                for (uint32_t i = 0; i < count; i++)
+                    l->v[(vdst + i) & 255] = ldl_le_p(io + 4 * i);
             }
         } else if ((dw >> 26) == 0x32) {                    /* VOPD: two ops, one issue */
             uint32_t opx = (dw >> 22) & 0xf, opy = (dw >> 17) & 0x1f;

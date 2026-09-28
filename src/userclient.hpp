@@ -56,6 +56,7 @@ private:
 	static IOReturn sWaitVBlank(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPresent(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sRestore(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sAllocHost(OSObject *t, void *, IOExternalMethodArguments *a);
 };
 
 #endif /* RDNA4UserClient_hpp */
