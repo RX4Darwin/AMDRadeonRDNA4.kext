@@ -53,10 +53,13 @@ case "$SLEEPTEST_MODE" in ''|*[!0-9]*) SLEEPTEST_MODE=0;; esac
 # needing bounded VM-sized diagnostics. Keep VM_MODE tied to the boot arg so
 # the VM feature row remains SKIPPED, and detect the emulated card separately.
 EMULATED_CARD=0
-if [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" = 1 ] ||
-	[ "$VM_MODE" -eq 0 ] && ioreg -r -w0 -l 2>/dev/null |
-		grep -q '"GPU,Variant"[[:space:]]*=[[:space:]]*"VM test'; then
+if [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" = 1 ]; then
 	EMULATED_CARD=1
+elif [ "$VM_MODE" -eq 0 ]; then
+	if ioreg -r -w0 -l 2>/dev/null |
+		grep -q '"GPU,Variant"[[:space:]]*=[[:space:]]*"VM test'; then
+		EMULATED_CARD=1
+	fi
 fi
 
 section() { echo; echo "=== $1 ==="; }
