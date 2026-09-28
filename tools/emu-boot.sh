@@ -38,6 +38,7 @@ args=(
 	-enable-kvm -m "${RAM_MB:-16384}"
 	-cpu Skylake-Client,-hle,-rtm,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,"$MY_OPTIONS"
 	-machine q35
+	-global ICH9-LPC.disable_s3=0
 	-smp 8,cores=4,sockets=1
 	-device qemu-xhci,id=xhci
 	-device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0

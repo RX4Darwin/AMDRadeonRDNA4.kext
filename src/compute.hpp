@@ -118,6 +118,8 @@ public:
 	// Run the survey now and, for stage >= 2, start the bring-up thread.
 	// Returns the last stage completed inline.
 	uint32_t start(const Env &env, uint32_t stage);
+	void powerWillSleep();
+	void powerDidWake();
 
 	// Snapshot of the engines, as read by the survey.
 	struct Survey {
@@ -180,7 +182,9 @@ private:
 
 	// Stages 2+ (bring-up thread).
 	static void threadMain(void *arg, wait_result_t);
+	static void resumeMain(void *arg, wait_result_t);
 	void runStages();
+	void resetRuntimeForResume();
 
 	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
 	// flushed before each step that could hang the GPU, so the step a hard
@@ -215,6 +219,7 @@ private:
 	uint64_t smuEnableFeatures(uint64_t allowed, uint32_t domain);
 	bool waitRlcAutoload(uint32_t ms, uint32_t &cpStat, uint32_t &boot);
 	static constexpr uint32_t kSmuTableOffset = 6u << 20;            // driver table, 64 KiB
+	bool readSensors(RDNA4Sensors &out);
 
 	// Stage 4: the GC hub, then SDMA0 queue 0 and a VRAM fill. Pool layout
 	// past the PSP's first 4 MiB (offsets within the pool).
@@ -415,6 +420,7 @@ public:
 	// rtRelease frees them all. Every call takes rtLock.
 	IOReturn rtOpen(const void *owner);
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
+	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtAllocHost(const void *owner, task_t task, uint64_t bytes, uint64_t flags,
 	                     uint64_t &handle, uint64_t &gpu, uint64_t &user);
@@ -479,10 +485,14 @@ private:
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
 		bool active { false };
+		bool aborted { false };
 	};
 	IOLock        *rtLock { nullptr };
 	bool           rtReady { false };       // a dispatching stage finished
 	bool           rtWedged { false };      // a dispatch timed out
+	bool           powerSleeping { false };
+	bool           resumed { false };
+	bool           resumePending { false };
 	bool           hangRecoveryEnabled { true }; // rdna4-hang=0 keeps the old wedge
 	uint32_t       rtStage { 0 };
 	bool           vmEnabled { false };
@@ -511,6 +521,7 @@ private:
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);
 	RtClient  *clientFor(const void *owner);
+	IOReturn ownerStateLocked(const void *owner) const;
 	bool vmTableSync(RtClient &client, uint32_t offset, uint32_t bytes);
 	bool vmMap(RtClient &client, uint64_t va, uint64_t mc, uint64_t bytes, bool executable);
 	bool vmMapHost(RtClient &client, uint64_t va, const uint64_t *pageBuses,

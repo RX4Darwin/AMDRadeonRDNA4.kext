@@ -78,6 +78,19 @@ static int cmdInfo(rdna4_t *gpu) {
 	return 0;
 }
 
+static int cmdSensors(rdna4_t *gpu) {
+	RDNA4Sensors s;
+	kern_return_t kr = rdna4_sensors(gpu, &s);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "sensors: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	printf("sensors: edge %u C, hotspot %u C, GFX %u MHz, memory %u MHz, "
+	       "socket %u W, fan %u RPM\n", s.edgeTempC, s.hotspotTempC,
+	       s.gfxClockMHz, s.memoryClockMHz, s.socketPowerW, s.fanRpm);
+	return 0;
+}
+
 static int cmdVsync(rdna4_t *gpu, uint32_t frames) {
 	uint64_t previous = 0, minNs = UINT64_MAX, maxNs = 0, sumNs = 0;
 	uint32_t intervals = 0;
@@ -1369,6 +1382,7 @@ static int cmdLoad(rdna4_t *gpu, const char *path, const char *kernel) {
 
 static void usage(void) {
 	fprintf(stderr, "usage: rdna4-run info\n"
+	                "       rdna4-run sensors\n"
 	                "       rdna4-run selftest [items]\n"
 	                "       rdna4-run selftest hang\n"
 	                "       rdna4-run hangtest\n"
@@ -1389,6 +1403,10 @@ int main(int argc, char **argv) {
 		if (!openRuntime(&gpu))
 			return 1;
 		rc = cmdInfo(&gpu);
+	} else if (!strcmp(argv[1], "sensors") && argc == 2) {
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdSensors(&gpu);
 	} else if (!strcmp(argv[1], "selftest") && argc <= 3) {
 		if (!openRuntime(&gpu))
 			return 1;

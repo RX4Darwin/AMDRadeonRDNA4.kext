@@ -16,6 +16,7 @@
 
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
+#include <IOKit/pwr_mgt/IOPMpowerState.h>
 
 #include "rdna4compute.h"
 
@@ -25,6 +26,9 @@ class RDNA4ComputeService : public IOService {
 	OSDeclareDefaultStructors(RDNA4ComputeService)
 public:
 	RDNA4Compute *compute;
+	bool registerPowerManagement(IOService *provider);
+	IOReturn setPowerState(unsigned long powerStateOrdinal,
+	                       IOService *whatDevice) APPLE_KEXT_OVERRIDE;
 };
 
 class RDNA4ComputeClient : public IOUserClient {
@@ -57,6 +61,7 @@ private:
 	static IOReturn sPresent(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sRestore(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sAllocHost(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sSensors(OSObject *t, void *, IOExternalMethodArguments *a);
 };
 
 #endif /* RDNA4UserClient_hpp */

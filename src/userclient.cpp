@@ -16,6 +16,28 @@
 OSDefineMetaClassAndStructors(RDNA4ComputeService, IOService)
 OSDefineMetaClassAndStructors(RDNA4ComputeClient, IOUserClient)
 
+static IOPMPowerState kComputePowerStates[2] = {
+	{ 1, kIOPMDeviceUsable | kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+	{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+};
+
+IOReturn RDNA4ComputeService::setPowerState(unsigned long powerStateOrdinal,
+                                             IOService *) {
+	if (!compute)
+		return kIOPMAckImplied;
+	if (powerStateOrdinal == 0)
+		compute->powerWillSleep();
+	else if (powerStateOrdinal == 1)
+		compute->powerDidWake();
+	return kIOPMAckImplied;
+}
+
+bool RDNA4ComputeService::registerPowerManagement(IOService *provider) {
+	PMinit();
+	joinPMtree(provider);
+	return registerPowerDriver(this, kComputePowerStates, 2) == kIOReturnSuccess;
+}
+
 // A kernel runs in VMID0 and can reach all of VRAM: only root may open.
 bool RDNA4ComputeClient::initWithTask(task_t owningTask, void *securityToken, UInt32 type,
                                       OSDictionary *properties) {
@@ -64,6 +86,7 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sPresent,    2,          0,                          2,           0 },
 	{ sRestore,    0,          0,                          0,           0 },
 	{ sAllocHost,  2,          0,                          3,           0 },
+	{ sSensors,    0,          0,                          0,           sizeof(RDNA4Sensors) },
 };
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -79,6 +102,12 @@ static RDNA4ComputeClient *self(OSObject *t) { return static_cast<RDNA4ComputeCl
 
 IOReturn RDNA4ComputeClient::sInfo(OSObject *t, void *, IOExternalMethodArguments *a) {
 	return self(t)->compute->rtInfo(t, a->scalarOutput);
+}
+
+IOReturn RDNA4ComputeClient::sSensors(OSObject *t, void *, IOExternalMethodArguments *a) {
+	if (!a->structureOutput || a->structureOutputSize != sizeof(RDNA4Sensors))
+		return kIOReturnBadArgument;
+	return self(t)->compute->rtSensors(t, *static_cast<RDNA4Sensors *>(a->structureOutput));
 }
 
 IOReturn RDNA4ComputeClient::sAlloc(OSObject *t, void *, IOExternalMethodArguments *a) {

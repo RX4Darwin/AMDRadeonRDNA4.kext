@@ -69,6 +69,8 @@ enum {
 	kRDNA4MethodRestore,
 	/* bytes, flags -> handle, GPU VA, user CPU address */
 	kRDNA4MethodAllocHost,
+	/* -> RDNA4Sensors, the current SMU metrics snapshot */
+	kRDNA4MethodSensors,
 	kRDNA4MethodCount
 };
 
@@ -79,6 +81,20 @@ enum {
 #define RDNA4_FLAG_WEDGED  (1u << 1)   /* a dispatch timed out: no more work */
 #define RDNA4_FLAG_DMA     (1u << 2)   /* Write/Read by SDMA; buffers from all of VRAM */
 #define RDNA4_FLAG_VM      (1u << 3)   /* this client has a private GPU VM and queue */
+#define RDNA4_FLAG_RESUMED (1u << 4)   /* runtime was re-published after system sleep */
+
+/* A compact view of the SMU 14.0.2/14.0.3 metrics table. */
+typedef struct {
+	uint32_t edgeTempC, hotspotTempC;
+	uint32_t gfxClockMHz, memoryClockMHz;
+	uint32_t socketPowerW, fanRpm;
+} RDNA4Sensors;
+
+#ifdef __cplusplus
+static_assert(sizeof(RDNA4Sensors) == 6 * sizeof(uint32_t), "RDNA4Sensors layout");
+#else
+_Static_assert(sizeof(RDNA4Sensors) == 6 * sizeof(uint32_t), "RDNA4Sensors layout");
+#endif
 
 typedef struct {
 	uint32_t program;

@@ -56,6 +56,7 @@ typedef struct {
 kern_return_t rdna4_open(rdna4_t *dev);
 void          rdna4_close(rdna4_t *dev);
 kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out);
+kern_return_t rdna4_sensors(rdna4_t *dev, RDNA4Sensors *out);
 
 kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out);
 /* Allocate snooped system memory, mapped into the client's GPUVM and task. */
