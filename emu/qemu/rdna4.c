@@ -1385,6 +1385,8 @@ static void rdna4_ih_reg_write(RDNA4State *s, uint32_t dw, uint32_t val)
         reg_set(s, byte, val);
         break;
     }
+}
+
 /* VM table entries and VM physical addresses use the GC hub's GPU-physical
  * FB_OFFSET basis, rather than the MC address used by SDMA and VMID0. */
 static int64_t rdna4_phys_to_vram(RDNA4State *s, uint64_t physical)
