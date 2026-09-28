@@ -77,6 +77,10 @@ enum {
 	kRDNA4MethodPresentAsync,
 	/* present id, timeout ms -> latched OTG frame count */
 	kRDNA4MethodWaitPresent,
+	/* IB GPU VA, dwords, flags -> fence value */
+	kRDNA4MethodSubmitIb,
+	/* fence value, timeout milliseconds -> elapsed nanoseconds */
+	kRDNA4MethodWaitFence,
 	kRDNA4MethodCount
 };
 

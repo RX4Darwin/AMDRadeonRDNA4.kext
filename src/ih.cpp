@@ -49,6 +49,10 @@ constexpr uint32_t kIhWptrOverflowClear     = 1u << 31;
 constexpr uint32_t kIhWptrOverflow          = 1u;
 constexpr uint32_t kIhMcSpaceBus            = 2u;
 
+static bool fenceReached(uint32_t current, uint32_t wanted) {
+	return static_cast<int32_t>(current - wanted) >= 0;
+}
+
 constexpr uint8_t kIhClientGfx              = 0x0a;
 constexpr uint8_t kIhClientUtcl2            = 0x1b;
 constexpr uint8_t kIhClientDcn              = 0x04;
@@ -679,7 +683,7 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 	bool done = false;
 	if (!useIh) {
 		for (uint32_t polls = 0;; polls++) {
-			done = *fence == value;
+			done = fenceReached(*fence, value);
 			if (done || mach_absolute_time() > deadline)
 				break;
 			if (polls < 200)
@@ -693,7 +697,7 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 		IOLockLock(ihLock);
 		bool slept = false;
 		for (;;) {
-			done = *fence == value;
+			done = fenceReached(*fence, value);
 			if (done || mach_absolute_time() > deadline)
 				break;
 			uint64_t sleepSpan = 0;
@@ -701,7 +705,7 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 			IOLockSleepDeadline(ihLock, ihWaitEvent, mach_absolute_time() + sleepSpan,
 			                    THREAD_UNINT);
 			slept = true;
-			done = *fence == value;
+			done = fenceReached(*fence, value);
 			if (!done)
 				continue;
 
