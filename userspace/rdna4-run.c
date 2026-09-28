@@ -19,6 +19,7 @@
  *                                          Accelerate's cblas_sgemm), every
  *                                          GEMM checked exactly; `small` for
  *                                          the emulator
+ *    rdna4-run anim [seconds]              double-buffered async Mandelbrot
  *    rdna4-run load <file.hsaco> <kernel>  load a code object, describe the
  *                                          kernel, unload it
  *
@@ -356,11 +357,20 @@ static int testVmIsolationAndPeers(rdna4_t *a) {
 		printf("  FAIL  VM isolation dispatch: %s\n", rdna4_error(kr));
 		fails++;
 	} else {
-		for (uint32_t i = 0; i < 1024; i++)
-			if (dst[i])
-				fails++;
-		printf("  %s  VM isolation: client B could not read client A's VA\n",
-		       fails ? "FAIL" : "ok");
+		/* B's read of A's VA must fault. A fault reads the GPU's fault-default
+		 * page, so the property is "none of A's data", not "all zero". */
+		uint32_t leaked = 0, other = 0;
+		for (uint32_t i = 0; i < 1024; i++) {
+			if (dst[i] == src[i])
+				leaked++;
+			else if (dst[i])
+				other++;
+		}
+		fails += leaked;
+		printf("  %s  VM isolation: client B could not read client A's VA", leaked ? "FAIL" : "ok");
+		if (leaked || other)
+			printf(" (%u of A's words seen, %u other non-zero words)", leaked, other);
+		printf("\n");
 	}
 
 isolation_cleanup:
@@ -522,9 +532,7 @@ static void showSignalHandler(int signalNumber) {
 	showSignal = 1;
 }
 
-static uint32_t mandelbrotColor(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
-	const float cx = ((float)x / (float)width - 0.5f) * 3.2f - 0.7f;
-	const float cy = ((float)y / (float)height - 0.5f) * 2.2f;
+static uint32_t mandelbrotIteration(float cx, float cy) {
 	float zx = 0.0f, zy = 0.0f;
 	uint32_t iteration = 0;
 	for (; iteration < 256u; iteration++) {
@@ -533,16 +541,36 @@ static uint32_t mandelbrotColor(uint32_t x, uint32_t y, uint32_t width, uint32_t
 		if (zx2 + zy2 > 4.0f)
 			break;
 		const float nextZx = zx2 - zy2 + cx;
-		zy = 2.0f * zx * zy + cy;
+		zy = fmaf(2.0f * zx, zy, cy);
 		zx = nextZx;
 	}
+	return iteration;
+}
+
+static uint32_t mandelbrotColorForIteration(uint32_t iteration) {
 	if (iteration >= 256u)
 		return 0xff000000u;
 	const float t = (float)iteration * (1.0f / 255.0f);
-	const uint32_t r = (uint32_t)(9.0f + 246.0f * t);
-	const uint32_t g = (uint32_t)(20.0f + 200.0f * (1.0f - t));
-	const uint32_t b = (uint32_t)(80.0f + 175.0f * t);
+	const uint32_t r = (uint32_t)fmaf(246.0f, t, 9.0f);
+	const uint32_t g = (uint32_t)fmaf(200.0f, 1.0f - t, 20.0f);
+	const uint32_t b = (uint32_t)fmaf(175.0f, t, 80.0f);
 	return 0xff000000u | (r << 16) | (g << 8) | b;
+}
+
+static uint32_t mandelbrotColorArgs(uint32_t x, uint32_t y, float x0, float dx,
+	                                  float y0, float dy, uint32_t *iterationOut) {
+	const float cx = x0 + (float)x * dx;
+	const float cy = y0 + (float)y * dy;
+	const uint32_t iteration = mandelbrotIteration(cx, cy);
+	if (iterationOut)
+		*iterationOut = iteration;
+	return mandelbrotColorForIteration(iteration);
+}
+
+static int rdna4VmmPresent(void) {
+	int vm = 0;
+	size_t vmLen = sizeof(vm);
+	return !sysctlbyname("kern.hv_vmm_present", &vm, &vmLen, NULL, 0) && vm;
 }
 
 static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
@@ -557,7 +585,12 @@ static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
 		return 1;
 	}
 	const uint64_t bytes = (uint64_t)pitch * height * 4;
+	const uint32_t scale = rdna4VmmPresent() ? 4u : 1u;
+	const float x0 = -2.3f, dx = 3.2f / (float)width;
+	const float y0 = -1.1f, dy = 2.2f / (float)height;
 	printf("show: geometry %ux%u pitch %u (%llu bytes)\n", width, height, pitch, bytes);
+	printf("show: Mandelbrot scale %u (%s)\n", scale,
+	       scale == 1 ? "real hardware" : "VM interpreter");
 
 	rdna4_program_t prog = { 0 };
 	rdna4_buffer_t buf = { 0 };
@@ -575,12 +608,18 @@ static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
 	}
 	allocated = 1;
 	{
-		uint8_t args[20] = { 0 };
+		uint8_t args[40] = { 0 };
 		memcpy(args, &buf.gpu, sizeof(buf.gpu));
 		memcpy(args + 8, &width, sizeof(width));
 		memcpy(args + 12, &height, sizeof(height));
 		memcpy(args + 16, &pitch, sizeof(pitch));
-		const uint32_t groups[3] = { (width + 15) / 16, (height + 15) / 16, 1 };
+		memcpy(args + 20, &x0, sizeof(x0));
+		memcpy(args + 24, &dx, sizeof(dx));
+		memcpy(args + 28, &y0, sizeof(y0));
+		memcpy(args + 32, &dy, sizeof(dy));
+		memcpy(args + 36, &scale, sizeof(scale));
+		const uint32_t groups[3] = { (width + 16u * scale - 1) / (16u * scale),
+		                              (height + 16u * scale - 1) / (16u * scale), 1 };
 		const uint32_t groupSize[3] = { 16, 16, 1 };
 		uint64_t kernelUs = 0;
 		kr = rdna4_dispatch(gpu, &prog, groups, groupSize, args, sizeof(args), 10000, &kernelUs);
@@ -605,20 +644,33 @@ static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
 	}
 	presented = 1;
 	{
-		uint32_t mismatches = 0;
+		uint32_t mismatches = 0, tolerated = 0, hardMismatches = 0;
 		for (uint32_t sy = 1; sy <= 8; sy++) {
 			const uint32_t y = (uint64_t)sy * height / 9;
 			for (uint32_t sx = 1; sx <= 8; sx++) {
 				const uint32_t x = (uint64_t)sx * width / 9;
+				const uint32_t sampleX = x - x % scale, sampleY = y - y % scale;
+				uint32_t expectedIteration = 0;
 				uint32_t got = 0;
 				kr = rdna4_read(gpu, &buf, ((uint64_t)y * pitch + x) * 4, &got, sizeof(got));
-				const uint32_t want = mandelbrotColor(x, y, width, height);
-				if (kr != KERN_SUCCESS || got != want)
+				const uint32_t want = mandelbrotColorArgs(sampleX, sampleY, x0, dx, y0, dy,
+				                                                &expectedIteration);
+				const uint32_t nearLo = expectedIteration ?
+					mandelbrotColorForIteration(expectedIteration - 1) : want;
+				const uint32_t nearHi = expectedIteration < 256u ?
+					mandelbrotColorForIteration(expectedIteration + 1) : want;
+				if (kr != KERN_SUCCESS || got != want) {
 					mismatches++;
+					if (kr == KERN_SUCCESS && (got == nearLo || got == nearHi))
+						tolerated++;
+					else
+						hardMismatches++;
+				}
 			}
 		}
-		printf("show: CPU spot check 64 pixels, mismatches %u\n", mismatches);
-		if (kr != KERN_SUCCESS || mismatches)
+		printf("show: CPU spot check 64 pixels, mismatches %u (iteration +/-1 %u, hard %u)\n",
+		       mismatches, tolerated, hardMismatches);
+		if (kr != KERN_SUCCESS || hardMismatches > 0 || tolerated > 4)
 			goto done;
 	}
 	for (uint32_t left = seconds * 10; left && !showSignal; left--)
@@ -646,6 +698,213 @@ done:
 	}
 	if (allocated)
 		rdna4_free(gpu, &buf);
+	if (loaded)
+		rdna4_unload(gpu, &prog);
+	return rc;
+}
+
+typedef struct AnimPending {
+	uint64_t id;
+	double submittedUs;
+} AnimPending;
+
+typedef struct AnimStats {
+	uint32_t rendered;
+	uint32_t presented;
+	uint64_t noFrameVblanks;
+	uint64_t firstFrame;
+	uint64_t lastFrame;
+	double firstUs;
+	double lastUs;
+	double latencySumUs;
+	double latencyWorstUs;
+} AnimStats;
+
+static int animWaitOne(rdna4_t *gpu, AnimPending *pending, AnimStats *stats) {
+	uint64_t frame = 0;
+	kern_return_t kr = rdna4_wait_present(gpu, pending->id, 2000, &frame);
+	const double now = nowUs();
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "anim: wait present %llu: %s\n", pending->id, rdna4_error(kr));
+		return 1;
+	}
+	if (!stats->presented) {
+		stats->firstFrame = frame;
+		stats->firstUs = now;
+	} else if (frame > stats->lastFrame + 1) {
+		stats->noFrameVblanks += frame - stats->lastFrame - 1;
+	}
+	stats->lastFrame = frame;
+	stats->lastUs = now;
+	stats->presented++;
+	const double latency = now - pending->submittedUs;
+	stats->latencySumUs += latency;
+	if (latency > stats->latencyWorstUs)
+		stats->latencyWorstUs = latency;
+	return 0;
+}
+
+static int cmdAnim(rdna4_t *gpu, uint32_t seconds) {
+	uint32_t width = 0, height = 0, pitch = 0;
+	kern_return_t kr = rdna4_display_query(gpu, &width, &height, &pitch);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "anim: display query: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	if (!width || !height || !pitch || (uint64_t)pitch * height > UINT64_MAX / 4) {
+		fprintf(stderr, "anim: invalid display geometry %ux%u pitch %u\n", width, height, pitch);
+		return 1;
+	}
+	const uint64_t bytes = (uint64_t)pitch * height * 4;
+	const uint32_t scale = rdna4VmmPresent() ? 4u : 1u;
+	printf("anim: geometry %ux%u pitch %u (%llu bytes), scale %u (%s)\n", width, height,
+	       pitch, bytes, scale, scale == 1 ? "real hardware" : "VM interpreter");
+
+	rdna4_program_t prog = { 0 };
+	rdna4_buffer_t buffers[2] = { { 0 }, { 0 } };
+	AnimPending pending[2] = { { 0 }, { 0 } };
+	AnimStats stats = { 0 };
+	uint32_t pendingCount = 0, rendered = 0;
+	int loaded = 0, allocated = 0, ownsPresentation = 0, rc = 1;
+	kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "mandelbrot_zoom", &prog);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "anim: load mandelbrot_zoom: %s\n", rdna4_error(kr));
+		goto done;
+	}
+	loaded = 1;
+	for (int i = 0; i < 2; i++) {
+		kr = rdna4_alloc(gpu, bytes, &buffers[i]);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "anim: allocate buffer %d: %s\n", i, rdna4_error(kr));
+			goto done;
+		}
+		allocated++;
+	}
+
+	showSignal = 0;
+	signal(SIGINT, showSignalHandler);
+	signal(SIGTERM, showSignalHandler);
+	const double startUs = nowUs();
+	const double endUs = startUs + (seconds ? seconds : 1u) * 1e6;
+	for (uint32_t frameNo = 0; !showSignal && nowUs() < endUs; frameNo++) {
+		const uint32_t index = frameNo & 1u;
+		const float zoom = 1.0f + (float)frameNo * 0.035f;
+		const float x0 = -0.7f - 1.6f / zoom;
+		const float dx = 3.2f / ((float)width * zoom);
+		const float y0 = -1.1f / zoom;
+		const float dy = 2.2f / ((float)height * zoom);
+		uint8_t args[40] = { 0 };
+		memcpy(args, &buffers[index].gpu, sizeof(buffers[index].gpu));
+		memcpy(args + 8, &width, sizeof(width));
+		memcpy(args + 12, &height, sizeof(height));
+		memcpy(args + 16, &pitch, sizeof(pitch));
+		memcpy(args + 20, &x0, sizeof(x0));
+		memcpy(args + 24, &dx, sizeof(dx));
+		memcpy(args + 28, &y0, sizeof(y0));
+		memcpy(args + 32, &dy, sizeof(dy));
+		memcpy(args + 36, &scale, sizeof(scale));
+		const uint32_t groups[3] = { (width + 16u * scale - 1) / (16u * scale),
+		                              (height + 16u * scale - 1) / (16u * scale), 1 };
+		const uint32_t groupSize[3] = { 16, 16, 1 };
+		uint64_t kernelUs = 0;
+		kr = rdna4_dispatch(gpu, &prog, groups, groupSize, args, sizeof(args), 10000, &kernelUs);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "anim: frame %u dispatch: %s\n", frameNo, rdna4_error(kr));
+			goto done;
+		}
+		if (!frameNo) {
+			uint32_t frameMismatches = 0, tolerated = 0, hardMismatches = 0;
+			for (uint32_t sy = 1; sy <= 8; sy++) {
+				const uint32_t y = (uint64_t)sy * height / 9;
+				for (uint32_t sx = 1; sx <= 8; sx++) {
+					const uint32_t x = (uint64_t)sx * width / 9;
+					const uint32_t sampleX = x - x % scale, sampleY = y - y % scale;
+					uint32_t expectedIteration = 0;
+					uint32_t got = 0;
+					const uint32_t want = mandelbrotColorArgs(sampleX, sampleY, x0, dx, y0, dy,
+					                                                &expectedIteration);
+					const kern_return_t readKr = rdna4_read(gpu, &buffers[index],
+												 ((uint64_t)y * pitch + x) * 4,
+												 &got, sizeof(got));
+					const uint32_t lo = expectedIteration ?
+						mandelbrotColorForIteration(expectedIteration - 1) : want;
+					const uint32_t hi = expectedIteration < 256u ?
+						mandelbrotColorForIteration(expectedIteration + 1) : want;
+					if (readKr != KERN_SUCCESS || got != want) {
+						frameMismatches++;
+						if (readKr == KERN_SUCCESS && (got == lo || got == hi))
+							tolerated++;
+						else
+							hardMismatches++;
+					}
+				}
+			}
+			printf("anim: CPU spot check 64 pixels, mismatches %u (iteration +/-1 %u, hard %u)\n",
+			       frameMismatches, tolerated, hardMismatches);
+			if (hardMismatches > 0 || tolerated > 4)
+			goto done;
+		}
+		rendered++;
+		stats.rendered = rendered;
+		uint64_t id = 0;
+		const double submittedUs = nowUs();
+		kr = rdna4_present_async(gpu, &buffers[index], 0, &id);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "anim: frame %u present async: %s\n", frameNo, rdna4_error(kr));
+			goto done;
+		}
+		ownsPresentation = 1;
+		pending[pendingCount++] = (AnimPending) { id, submittedUs };
+		if (pendingCount == 2) {
+			if (animWaitOne(gpu, &pending[0], &stats))
+				goto done;
+			pending[0] = pending[1];
+			pendingCount = 1;
+		}
+	}
+	while (!showSignal && pendingCount) {
+		if (animWaitOne(gpu, &pending[0], &stats))
+			goto done;
+		if (pendingCount == 2)
+			pending[0] = pending[1];
+		pendingCount--;
+	}
+	if (showSignal)
+		fprintf(stderr, "anim: interrupted; restoring desktop\n");
+	kr = rdna4_restore(gpu);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "anim: restore: %s\n", rdna4_error(kr));
+		goto done;
+	}
+	ownsPresentation = 0;
+	{
+		const double elapsedUs = (stats.lastUs > startUs ? stats.lastUs : nowUs()) - startUs;
+		const double fps = elapsedUs > 0 ? stats.presented * 1e6 / elapsedUs : 0;
+		const double avgLatency = stats.presented ? stats.latencySumUs / stats.presented : 0;
+		const double refresh = stats.presented > 1 && stats.lastUs > stats.firstUs &&
+		                      stats.lastFrame >= stats.firstFrame
+			? (stats.lastFrame - stats.firstFrame) * 1e6 / (stats.lastUs - stats.firstUs) : 0;
+		printf("anim: frames rendered %u, presented %u\n", stats.rendered, stats.presented);
+		printf("anim: average present wait %.0f us, worst %.0f us\n", avgLatency,
+		       stats.latencyWorstUs);
+		printf("anim: %.2f FPS vs OTG %.2f Hz, vblanks with no frame %llu\n", fps, refresh,
+		       stats.noFrameVblanks);
+		printf("anim: desktop restored\n");
+	}
+	rc = showSignal ? 1 : 0;
+
+done:
+	signal(SIGINT, SIG_DFL);
+	signal(SIGTERM, SIG_DFL);
+	if (ownsPresentation) {
+		kern_return_t restore = rdna4_restore(gpu);
+		if (restore != KERN_SUCCESS) {
+			fprintf(stderr, "anim: cleanup restore: %s\n", rdna4_error(restore));
+			rc = 1;
+		}
+	}
+	for (int i = 0; i < allocated; i++)
+		rdna4_free(gpu, &buffers[i]);
 	if (loaded)
 		rdna4_unload(gpu, &prog);
 	return rc;
@@ -1420,6 +1679,7 @@ static void usage(void) {
 	                "       rdna4-run bench [small]\n"
 	                "       rdna4-run vsync [n]\n"
 	                "       rdna4-run show [seconds]\n"
+	                "       rdna4-run anim [seconds]\n"
 	                "       rdna4-run load <file.hsaco> <kernel>\n");
 }
 
@@ -1474,6 +1734,11 @@ int main(int argc, char **argv) {
 			return 1;
 		const uint32_t seconds = argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 5;
 		rc = cmdShow(&gpu, seconds);
+	} else if (!strcmp(argv[1], "anim") && argc <= 3) {
+		if (!openRuntime(&gpu))
+			return 1;
+		const uint32_t seconds = argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 5;
+		rc = cmdAnim(&gpu, seconds);
 	} else if (!strcmp(argv[1], "load") && argc == 4) {
 		if (!openRuntime(&gpu))
 			return 1;

@@ -73,6 +73,10 @@ enum {
 	kRDNA4MethodSensors,
 	/* debug-only root sleep cycle: 1 quiesce, 2 re-bring-up */
 	kRDNA4MethodSleepTest,
+	/* handle, byte offset -> present id */
+	kRDNA4MethodPresentAsync,
+	/* present id, timeout ms -> latched OTG frame count */
+	kRDNA4MethodWaitPresent,
 	kRDNA4MethodCount
 };
 

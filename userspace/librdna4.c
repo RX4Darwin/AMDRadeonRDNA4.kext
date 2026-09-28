@@ -201,6 +201,34 @@ kern_return_t rdna4_present(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t of
 	return kr;
 }
 
+kern_return_t rdna4_present_async(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                                   uint64_t *presentId) {
+	if (!buf || !presentId)
+		return kIOReturnBadArgument;
+	const uint64_t in[2] = { buf->handle, offset };
+	uint64_t out = 0;
+	uint32_t n = 1;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodPresentAsync, in, 2,
+	                                              &out, &n);
+	if (kr == KERN_SUCCESS)
+		*presentId = out;
+	return kr;
+}
+
+kern_return_t rdna4_wait_present(rdna4_t *dev, uint64_t presentId, uint32_t timeoutMs,
+                                  uint64_t *frame) {
+	if (!presentId || !frame)
+		return kIOReturnBadArgument;
+	const uint64_t in[2] = { presentId, timeoutMs };
+	uint64_t out = 0;
+	uint32_t n = 1;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodWaitPresent, in, 2,
+	                                              &out, &n);
+	if (kr == KERN_SUCCESS)
+		*frame = out;
+	return kr;
+}
+
 kern_return_t rdna4_display_query(rdna4_t *dev, uint32_t *width, uint32_t *height,
                                   uint32_t *pitch) {
 	rdna4_buffer_t query = { 0, 0, 0 };

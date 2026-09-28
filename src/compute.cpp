@@ -2014,6 +2014,7 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 				(static_cast<uint64_t>(rdGc(GcL2FaultAddrHi)) << 32);
 			CLOG("vmid %u: %s: GC hub fault status 0x%08x address 0x%llx", l.vmid, tag, status, address);
 			vmInvalidate(l.vmid, "dispatch fault clear");
+			scrubFaultPage();
 		}
 	}
 	return done;
