@@ -3060,6 +3060,7 @@ static int rdna4_dispatch_group(RDNA4State *s, RDNA4Dispatch *d)
         uint32_t x = t % d->tx, y = (t / d->tx) % d->ty, z = t / (d->tx * d->ty);
         RDNA4Lane *l = &d->lanes[t];
         memset(l, 0, sizeof(*l));
+        l->s[126] = 1;                                /* EXEC_LO for this lane */
         for (uint32_t i = 0; i < d->nuser && i < ARRAY_SIZE(d->user); i++)
             l->s[i] = d->user[i];
         /* GFX12 architected SGPRs carry the work-group ids in TTMP9/7. */
