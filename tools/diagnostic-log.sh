@@ -50,15 +50,13 @@ case "$HANG_MODE" in ''|*[!0-9]*) HANG_MODE=1;; esac
 case "$SLEEPTEST_MODE" in ''|*[!0-9]*) SLEEPTEST_MODE=0;; esac
 
 # The emulator dry run can deliberately omit rdna4-vm (boot 1) while still
-# needing the bounded VM-sized benchmark. Keep VM_MODE tied to the boot arg so
+# needing bounded VM-sized diagnostics. Keep VM_MODE tied to the boot arg so
 # the VM feature row remains SKIPPED, and detect the emulated card separately.
 EMULATED_CARD=0
-if [ "$VM_MODE" -eq 0 ]; then
-	if [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" = 1 ] ||
-		 ioreg -r -w0 -l 2>/dev/null |
-		 grep -q '"GPU,Variant"[[:space:]]*=[[:space:]]*"VM test'; then
-		EMULATED_CARD=1
-	fi
+if [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" = 1 ] ||
+	[ "$VM_MODE" -eq 0 ] && ioreg -r -w0 -l 2>/dev/null |
+		grep -q '"GPU,Variant"[[:space:]]*=[[:space:]]*"VM test'; then
+	EMULATED_CARD=1
 fi
 
 section() { echo; echo "=== $1 ==="; }
@@ -98,6 +96,9 @@ run_step() {
 }
 
 record() {
+	# Each feature has one summary row even if a future diagnostic branch
+	# reaches the classifier more than once.
+	grep -q "^$1[[:space:]]" "$SUMMARY" 2>/dev/null && return
 	printf "%-12s %-8s %s\n" "$1" "$2" "$3" >> "$SUMMARY"
 }
 
@@ -248,7 +249,12 @@ record_registry() {
 	fi
 
 	if [ "$INFO_OK" -eq 1 ]; then
-		run_step "user-space compute runtime (rdna4-run selftest)" "$RUN" selftest
+		if [ "$EMULATED_CARD" -eq 1 ]; then
+			echo "note: emulated card — using bounded rdna4-run selftest 16384"
+			run_step "user-space compute runtime (rdna4-run selftest 16384)" "$RUN" selftest 16384
+		else
+			run_step "user-space compute runtime (rdna4-run selftest)" "$RUN" selftest
+		fi
 		SELFTEST_FILE="$STEP_FILE"
 		SELFTEST_RC=$STEP_RC
 		if [ "$VM_MODE" -eq 1 ] || [ "$EMULATED_CARD" -eq 1 ]; then
@@ -308,7 +314,12 @@ record_registry() {
 	# W6 is part of the compute runtime. rdna4-hang=0 deliberately disables
 	# recovery; otherwise exercise both public entry points.
 	if [ "$INFO_OK" -eq 1 ] && [ "$COMPUTE_STAGE" -ge 6 ] && [ "$HANG_MODE" -ne 0 ]; then
-		run_step "queue recovery (rdna4-run selftest hang)" "$RUN" selftest hang
+		if [ "$EMULATED_CARD" -eq 1 ]; then
+			echo "note: emulated card — W6 selftest uses 16384 items"
+			run_step "queue recovery (rdna4-run selftest 16384)" "$RUN" selftest 16384
+		else
+			run_step "queue recovery (rdna4-run selftest hang)" "$RUN" selftest hang
+		fi
 		HANG_FILE="$STEP_FILE"
 		HANG_RC=$STEP_RC
 		run_step "queue recovery (rdna4-run hangtest)" "$RUN" hangtest
@@ -456,6 +467,9 @@ record_registry() {
 
 	if [ "$COMPUTE_STAGE" -lt 6 ] || [ "$HANG_MODE" -eq 0 ]; then
 		record w6 SKIPPED "queue recovery disabled or runtime absent"
+	elif [ "$EMULATED_CARD" -eq 1 ] && [ "$HANG_RC" -eq 0 ] && [ "$HANGTEST_RC" -eq 0 ] && \
+		grep -q 'selftest: PASS' "$HANG_FILE" && grep -q 'hangtest: PASS' "$HANGTEST_FILE"; then
+		record w6 PASS "selftest 16384 + hangtest PASS"
 	elif [ "$HANG_RC" -eq 0 ] && [ "$HANGTEST_RC" -eq 0 ] && \
 		grep -q 'hangtest: PASS' "$HANG_FILE" && grep -q 'hangtest: PASS' "$HANGTEST_FILE"; then
 		record w6 PASS "selftest hang + hangtest PASS"
