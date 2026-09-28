@@ -433,6 +433,8 @@ constexpr uint32_t kCpRbDoorbellRangeMask = 0x00000ffc;
 // gfx_v12_0 sets ring->doorbell_index = doorbell_index.gfx_ring0 << 1.
 constexpr uint32_t kGfxDoorbellDword      = 0x08B * 2;
 constexpr uint32_t kGfxMaxHwContexts      = 8;          // gfx.config.max_hw_contexts
+// Read-only: NUM_SHADER_ENGINES [22:19] = log2(SEs), as gfx_v12_0 reads it.
+constexpr Reg GbAddrConfig        { 0, 0x13de };
 
 } // namespace GfxReg
 

@@ -553,8 +553,10 @@ void RDNA4Compute::runStages() {
 	// W5: the page-flip test, once the runtime's DMA and device heap exist.
 	if (done >= StageKernel && featureAllowed("flip"))
 		Flip::run(*this);
+	// G3: the first draw, once the runtime's device heap holds its rings.
+	const bool drew = gfxOk && stageGfxDraw();
 	snprintf(note, sizeof(note), "finished at stage %u%s%s%s", done,
-	         !gfxAsked ? "" : gfxOk ? ", gfx ring up" : ", gfx ring off",
+	         !gfxAsked ? "" : drew ? ", gfx draw right" : gfxOk ? ", gfx ring up" : ", gfx ring off",
 	         hungFeature[0] ? ", skipped after a hang: " : "", hungFeature);
 	trail(note);
 }

@@ -20,9 +20,20 @@
 //  nothing here runs. It runs after the compute stages on the bring-up
 //  thread; a failure halts PFP/ME again and leaves compute as it was.
 //
+//  G3, once the ring is up and the runtime's device heap exists: the first
+//  draw. One triangle from an NGG passthrough VS (shaders/ngg.s) and a
+//  constant-colour PS (shaders/psred.s) into a 256x256 R8G8B8A8 target, from
+//  the command stream in gfx12_draw.h (generated from Mesa's register
+//  database; premetal/gfx12-draw-notes.md cites every register), then the
+//  target is read back: 8192 pixels in rows 64..190 must be 0xFF0000FF and
+//  nothing else may change.
+//
 
 #include "compute.hpp"
+#include "gfx12_draw.h"
+#include "ngg_kernel.h"
 #include "pm4.hpp"
+#include "psred_kernel.h"
 
 #include "amdgpu/clearstate_defs.h"
 #include "amdgpu/clearstate_gfx12.h"
@@ -289,4 +300,115 @@ bool RDNA4Compute::stageGfxRing() {
 
 	GLOG("gfx ring ready (%s)", gfxMode == 2 ? "doorbell" : "MMIO write pointer");
 	return finish(true, "gfx ring");
+}
+
+// G3: the first draw. Needs the gfx ring up and the device heap (the GE
+// rings, 10.5 MiB, live there); everything else is in the pool.
+bool RDNA4Compute::stageGfxDraw() {
+	using namespace Gfx12Draw;
+	if (!gfxMode || !dmaReady || !devHeap.size() || !rtLock) {
+		GLOG("draw: skipped (%s)", !gfxMode ? "no gfx ring" : "no device heap");
+		return false;
+	}
+	// The GE rings are sized for kMaxSe shader engines (they scale with its
+	// square): check the card's count first.
+	const uint32_t gbAddr = rdGc(GbAddrConfig);
+	const uint32_t ses = 1u << ((gbAddr >> 19) & 0xf);
+	GLOG("draw: GB_ADDR_CONFIG 0x%08x: %u shader engines, %u RBs per SE, %u pipes", gbAddr, ses,
+	     1u << ((gbAddr >> 26) & 3), 1u << (gbAddr & 7));
+	if (gbAddr == 0xffffffff || ses > kMaxSe) {
+		GLOG("draw: the GE rings are sized for %u shader engines; skipped", kMaxSe);
+		return false;
+	}
+
+	// Rings: 64 KiB-granular bases; Mesa aligns the whole block to 2 MiB.
+	constexpr uint64_t kAlign = 2ull << 20;
+	uint64_t off = 0;
+	IOLockLock(rtLock);
+	const bool got = devHeap.alloc(kRingBytes + kAlign, off);
+	IOLockUnlock(rtLock);
+	if (!got) {
+		GLOG("draw: no %llu MiB for the GE rings in the device heap", (kRingBytes + kAlign) >> 20);
+		return false;
+	}
+	gfxRings = off;
+	const uint64_t ringVa = (vramMc(off) + kAlign - 1) & ~(kAlign - 1);
+	const uint64_t va[7] = {
+		poolMc(kGfxVsOffset), poolMc(kGfxPsOffset), poolMc(kGfxTargetOffset), ringVa,
+		ringVa + kAttrRingBytes, ringVa + kAttrRingBytes + kPosRingBytes, poolMc(kGfxDrawFenceOffset),
+	};
+
+	// Shaders, each followed by s_code_end padding for the SQ's prefetch.
+	auto place = [&](uint32_t at, const uint32_t *code, uint32_t dwords) {
+		for (uint32_t i = 0; i < 0x100; i++)
+			*poolDw(at + 4 * i) = i < dwords ? code[i] : 0xbf9f0000u;   // s_code_end
+	};
+	place(kGfxVsOffset, kNggKernel, sizeof(kNggKernel) / 4);
+	place(kGfxPsOffset, kPsredKernel, sizeof(kPsredKernel) / 4);
+
+	// The command stream, its addresses filled in.
+	constexpr uint32_t n = sizeof(kStream) / 4;
+	volatile uint32_t *ib = poolDw(kGfxIbOffset);
+	for (uint32_t i = 0; i < n; i++)
+		ib[i] = kStream[i];
+	for (const Reloc &r : kRelocs)
+		ib[r.dword] = static_cast<uint32_t>((va[r.sym] >> r.shift) & r.mask);
+
+	// The target, cleared; the fences, zero.
+	for (uint32_t i = 0; i < kWidth * kHeight; i++)
+		*poolDw(kGfxTargetOffset + 4 * i) = 0;
+	*poolDw(kGfxDrawFenceOffset) = 0;
+	flushHdp();
+	GLOG("draw: %u-dword stream at MC 0x%llx, VS 0x%llx PS 0x%llx, target 0x%llx, rings 0x%llx "
+	     "(%llu MiB)", n, poolMc(kGfxIbOffset), va[kVs], va[kPs], va[kCb], ringVa, kRingBytes >> 20);
+
+	trail("gfx: first draw");
+	uint32_t pkt[16];
+	gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, poolMc(kGfxIbOffset), n, 0));
+	gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), ++gfxFence));
+	uint64_t t0 = mach_absolute_time();
+	gfxKick(gfxRing.wptr());
+	const bool ringDone = gfxFenceWait(gfxFence, 500000);
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	const uint32_t drawFence = *poolDw(kGfxDrawFenceOffset);
+	if (!ringDone || drawFence != 1) {
+		GLOG("draw: did not finish (ring fence %s, draw fence 0x%x)", ringDone ? "ok" : "NOT signalled",
+		     drawFence);
+		gfxStatus("draw");
+		return false;
+	}
+
+	// Read back: count the covered pixels, their bounds, and anything else
+	// that changed.
+	uint32_t covered = 0, other = 0, minX = kWidth, maxX = 0, minY = kHeight, maxY = 0;
+	uint32_t row64[2] = { kWidth, 0 }, row190[2] = { kWidth, 0 };
+	for (uint32_t y = 0; y < kHeight; y++) {
+		for (uint32_t x = 0; x < kWidth; x++) {
+			const uint32_t p = *poolDw(kGfxTargetOffset + 4 * (y * kWidth + x));
+			if (p == kCoveredRgba) {
+				covered++;
+				minX = x < minX ? x : minX;
+				maxX = x > maxX ? x : maxX;
+				minY = y < minY ? y : minY;
+				maxY = y > maxY ? y : maxY;
+				uint32_t *span = y == 64 ? row64 : y == 190 ? row190 : nullptr;
+				if (span) {
+					span[0] = x < span[0] ? x : span[0];
+					span[1] = x > span[1] ? x : span[1];
+				}
+			} else if (p) {
+				other++;
+			}
+		}
+	}
+	// notes 3.9: 8192 pixels, rows 64..190, row 64 = x 64..191, row 190 = x 127..128.
+	const bool ok = covered == kCoveredPixels && !other && minY == 64 && maxY == 190 &&
+	                row64[0] == 64 && row64[1] == 191 && row190[0] == 127 && row190[1] == 128;
+	GLOG("draw: %s in %llu us: %u pixels 0x%08x (want %u), %u others; bounds x %u..%u y %u..%u, "
+	     "row 64 x %u..%u, row 190 x %u..%u", ok ? "THE TRIANGLE IS RIGHT" : "wrong image",
+	     ns / 1000, covered, kCoveredRgba, kCoveredPixels, other, minX, maxX, minY, maxY, row64[0],
+	     row64[1], row190[0], row190[1]);
+	env.owner->setProperty("Compute,GFXDrawPixels", static_cast<uint64_t>(covered), 32);
+	return ok;
 }
