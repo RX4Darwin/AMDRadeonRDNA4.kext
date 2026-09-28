@@ -36,6 +36,18 @@ make test 2>&1 | tail -2
 tools/build-osxcross.sh 2>&1 | grep -E 'error:|warning: [^o]|Built' || true
 [ -d build/RDNA4FB.kext ] || { echo "vm-test: kext build failed"; exit 1; }
 tools/emu-build.sh qemu 2>&1 | grep -E 'error|warning|built' | head -20
+# The option ROM (GOP driver + VBIOS image, build-emu/, not in git) is the
+# same for every checkout: a worktree without one takes the main checkout's.
+if [ ! -f build-emu/rdna4.rom ]; then
+	MAIN=$(dirname "$REPO")/RDNA4FB     # worktrees sit next to the main checkout
+	if [ -f "$MAIN/build-emu/rdna4.rom" ]; then
+		mkdir -p build-emu && cp "$MAIN"/build-emu/* build-emu/
+		echo "vm-test: option ROM copied from $MAIN/build-emu"
+	else
+		tools/emu-build.sh rom 2>&1 | tail -2
+	fi
+fi
+[ -f build-emu/rdna4.rom ] || { echo "vm-test: no build-emu/rdna4.rom"; exit 1; }
 tools/vm-opencore.sh --kext build/RDNA4FB.kext --lilu ~/kexts/Lilu.kext \
 	--out OpenCore-emu.qcow2 --args "$ARGS" 2>&1 | tail -1
 
