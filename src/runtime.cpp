@@ -453,8 +453,14 @@ bool RDNA4Compute::vmBootSelfTest() {
 	RtClient c {};
 	const uint32_t vmid = 8, pipe = 0, queue = 1, doorbell = 0x1a;
 	const uint32_t qoff = kVmQueueBase;
+	/* The same client-VA layout as rtOpen: the EOP buffer, rptr report and
+	 * wptr poll are addresses in the queue's VMID, as KFD programs them
+	 * (kfd_mqd_manager_v12: eop_ring_buffer_address, read_ptr, write_ptr).
+	 * Only the MQD stays a VMID0 MC address (hqdInitFor). */
 	const uint64_t qva = GpuVm::kVaStart;
-	const uint64_t rva = qva + 0x1000, dataVa = qva + 0x2000, fenceVa = qva + 0x3000;
+	const uint64_t eva = qva + 0x1000, rva = qva + 0x2000, wva = qva + 0x3000;
+	const uint64_t dataVa = qva + 0x4000, fenceVa = qva + 0x5000;
+	const uint32_t dataOff = qoff + kVmKernarg;
 	uint64_t table = 0;
 	if (!devHeap.size() || !devHeap.alloc(kVmTableBytes, table))
 		return false;
@@ -482,13 +488,15 @@ bool RDNA4Compute::vmBootSelfTest() {
 	c.kernargCpu = nullptr;
 	c.fenceCpu = poolDw(qoff + kVmFence);
 	const bool qMap = vmMap(c, qva, poolMc(qoff + kVmPq), kPqSize, false);
-	const bool rMap = qMap && vmMap(c, rva, poolMc(qoff + kVmRptr), 0x1000, false);
-	const bool dMap = rMap && vmMap(c, dataVa, poolMc(qoff + kVmWptr), 0x1000, false);
+	const bool eMap = qMap && vmMap(c, eva, poolMc(qoff + kVmEop), 0x1000, false);
+	const bool rMap = eMap && vmMap(c, rva, poolMc(qoff + kVmRptr), 0x1000, false);
+	const bool wMap = rMap && vmMap(c, wva, poolMc(qoff + kVmWptr), 0x1000, false);
+	const bool dMap = wMap && vmMap(c, dataVa, poolMc(dataOff), 0x1000, false);
 	const bool fMap = dMap && vmMap(c, fenceVa, poolMc(qoff + kVmFence), 0x1000, false);
 	const bool qInit = fMap && c.pm4.init(poolDw(qoff + kVmPq), qva, kPqSize);
 	if (!qInit) {
-		RLOG("vm: boot page-table setup q=%d r=%d data=%d fence=%d pm4=%d",
-		     qMap, rMap, dMap, fMap, qInit);
+		RLOG("vm: boot page-table setup q=%d eop=%d r=%d w=%d data=%d fence=%d pm4=%d",
+		     qMap, eMap, rMap, wMap, dMap, fMap, qInit);
 		RLOG("vm: boot page-table or queue setup failed");
 		IOFree(c.tableShadow, kVmTableBytes);
 		devHeap.free(table);
@@ -498,12 +506,20 @@ bool RDNA4Compute::vmBootSelfTest() {
 	bool context = vmContextInit(c);
 	if (!context)
 		RLOG("vm: boot VM context setup failed (VMID %u)", vmid);
-	bool hqd = false, inactive = true, fence = false;
+	bool hqd = false, inactive = true, fence = false, data = false, clean = false;
 	if (context) {
+		/* A fault latched before this test (an earlier boot, another
+		 * engine) would be blamed on the queue below: show it, then clear
+		 * it with the first invalidation of the new context. */
+		const uint32_t stale = rdGc(GcL2FaultStatusLo);
+		if (stale)
+			logGcFault("vm: boot: fault latched before the test");
+		trail("vm: context invalidate");
+		(void)vmInvalidate(vmid, "boot context enable");
 		trail("vm: HQD activate");
 		hqd = hqdInitFor(false, pipe, queue, vmid, poolMc(qoff + kVmMqd),
-		                 poolMc(qoff + kVmEop) >> 8, qva >> 8, rva, rva, doorbell);
-		*poolDw(qoff + kVmWptr) = 0;
+		                 eva >> 8, qva >> 8, rva, wva, doorbell);
+		*poolDw(dataOff) = 0;
 		*c.fenceCpu = 0;
 		flushHdp();
 		uint32_t pkt[8];
@@ -517,9 +533,30 @@ bool RDNA4Compute::vmBootSelfTest() {
 			if (!fence)
 				IODelay(10);
 		}
-		if (!fence || *poolDw(qoff + kVmWptr) != 0x600df00d)
-			RLOG("vm: boot queue test failed (fence 0x%08x, data 0x%08x)",
-			     *c.fenceCpu, *poolDw(qoff + kVmWptr));
+		data = *poolDw(dataOff) == 0x600df00d;
+		/* The queue's own accesses (MQD, ring, EOP, rptr report, WRITE_DATA,
+		 * fence) must all translate: any GC hub fault here is a setup bug,
+		 * even when the fault-default page let the fence land. */
+		const uint32_t status = rdGc(GcL2FaultStatusLo);
+		clean = status == 0;
+		if (!fence || !data || !clean) {
+			RLOG("vm: boot queue test failed (fence 0x%08x, data 0x%08x, fault status 0x%08x)",
+			     *c.fenceCpu, *poolDw(dataOff), status);
+			/* One bounded dump for the real-card log: where the HQD stopped,
+			 * what the CP reported, and what the doorbell holds. */
+			grbmSelect(1, pipe, queue, vmid);
+			RLOG("vm: boot HQD: MQD 0x%08x:%08x MQD_CONTROL 0x%08x EOP 0x%08x:%08x "
+			     "rptr report 0x%08x:%08x wptr poll 0x%08x:%08x",
+			     rdGc(CpMqdBaseAddrHi), rdGc(CpMqdBaseAddr), rdGc(CpMqdControl),
+			     rdGc(CpHqdEopBaseHi), rdGc(CpHqdEopBase), rdGc(CpHqdPqRptrReportHi),
+			     rdGc(CpHqdPqRptrReport), rdGc(CpHqdPqWptrPollHi), rdGc(CpHqdPqWptrPoll));
+			grbmSelect(0, 0, 0, 0);
+			RLOG("vm: boot ring: wptr %llu dwords, rptr report in memory 0x%08x, "
+			     "doorbell dword %u readback 0x%llx",
+			     static_cast<unsigned long long>(c.pm4.wptr()), *poolDw(qoff + kVmRptr), doorbell,
+			     static_cast<unsigned long long>(doorbells[doorbell / 2]));
+			logComputeQueueState("vm: boot", pipe, queue, vmid);
+		}
 	}
 	if (context && (hqd || !fence)) {
 		trail("vm: HQD dequeue");
@@ -545,7 +582,9 @@ bool RDNA4Compute::vmBootSelfTest() {
 	}
 	IOFree(c.tableShadow, kVmTableBytes);
 	devHeap.free(table);
-	const bool ok = context && hqd && fence && inactive && flushed;
+	if (context && !clean)
+		scrubFaultPage();   // D15: a faulting write may have left data there
+	const bool ok = context && hqd && fence && data && clean && inactive && flushed;
 	if (ok)
 		publishResult("vm", "PASS boot self-test");
 	else if (flushed)
@@ -557,9 +596,8 @@ void RDNA4Compute::logClientFault(RtClient &c, const char *tag) {
 	const uint32_t status = rdGc(GcL2FaultStatusLo);
 	if (!status)
 		return;
-	const uint64_t address = rdGc(GcL2FaultAddrLo) |
-		(static_cast<uint64_t>(rdGc(GcL2FaultAddrHi)) << 32);
-	RLOG("vmid %u: %s: GC hub fault status 0x%08x address 0x%llx", c.vmid, tag, status, address);
+	RLOG("vmid %u: %s: GC hub fault status 0x%08x (fault VMID %u) VA 0x%llx", c.vmid, tag,
+	     status, (status >> 20) & 0xf, gcFaultVa());
 	vmInvalidate(c.vmid, "fault clear");
 	scrubFaultPage();
 }
@@ -660,6 +698,10 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 		return kIOReturnNoMemory;
 	}
 	c->doorbell = (0x0d + slot) * 2;
+	/* A VMID taken by a new owner is flushed before first use (amdgpu_vmid_grab
+	 * sets needs_flush, amdgpu_vm_flush emits it): no stale translations from
+	 * an earlier client or an earlier boot. A timeout is logged, not fatal. */
+	(void)vmInvalidate(vmid, "client context enable");
 	vmidUsed[vmid] = true; queueUsed[pipe][queue] = true;
 	if (!hqdInitFor(false, pipe, queue, vmid, poolMc(qoff + kVmMqd), eva >> 8, qva >> 8,
 	               rva, wva, c->doorbell)) {

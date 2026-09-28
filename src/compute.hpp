@@ -252,6 +252,12 @@ private:
 	bool gcHubFlush();
 	void cpConfigRs64();                // gfx_v12_0_config_gfx_rs64 (PSP loading)
 	void logGcFault(const char *tag);   // GCVM_L2 protection fault status/address
+	// GCVM_L2_PROTECTION_FAULT_ADDR_LO32/HI32 hold the logical page
+	// (LOGICAL_PAGE_ADDR_LO32, HI4 in gc_12_0_0_sh_mask.h): the VA is page << 12.
+	uint64_t gcFaultVa() const {
+		return (rdGc(GfxReg::GcL2FaultAddrLo) |
+		        (static_cast<uint64_t>(rdGc(GfxReg::GcL2FaultAddrHi) & 0xf) << 32)) << 12;
+	}
 	bool sdmaStartMcus();               // sdma_v7_0_enable: unhalt before queue setup
 	bool sdmaQueueInit();
 	void sdmaKick(uint64_t wptrBytes);

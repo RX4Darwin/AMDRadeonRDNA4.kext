@@ -1199,9 +1199,9 @@ bool RDNA4Compute::gcHubInit() {
 
 void RDNA4Compute::logGcFault(const char *tag) {
 	const uint32_t status = rdGc(GcL2FaultStatusLo);
-	const uint64_t addr = rdGc(GcL2FaultAddrLo) | (static_cast<uint64_t>(rdGc(GcL2FaultAddrHi)) << 32);
-	CLOG("%s: GC hub fault status 0x%08x%s, address 0x%llx", tag, status,
-	     status ? "" : " (no fault)", addr);
+	CLOG("%s: GC hub fault status 0x%08x%s (VMID %u, CID 0x%x, %s), VA 0x%llx", tag, status,
+	     status ? "" : " (no fault)", (status >> 20) & 0xf, (status >> 9) & 0x1ff,
+	     (status >> 18) & 1 ? "write" : "read", gcFaultVa());
 }
 
 // sdma_v7_0_start on bare metal: every MCU is unhalted before any queue
@@ -1638,7 +1638,7 @@ bool RDNA4Compute::hqdInitFor(bool asKiq, uint32_t pipe, uint32_t queue, uint32_
 	mqdDw(143, (doorbell << kDoorbellOffsetShift) | kDoorbellEn); // cp_hqd_pq_doorbell_control
 	mqdDw(145, pqControl);                            // cp_hqd_pq_control
 	mqdDw(149, 0x00300000);                           // cp_hqd_ib_control: MIN_IB_AVAIL_SIZE 3
-	mqdDw(162, (kMqdControlDefault & ~0xfu) | vmid); // cp_mqd_control: VMID
+	mqdDw(162, kMqdControlDefault & ~0xfu);           // cp_mqd_control: VMID 0, always
 	mqdDw(165, static_cast<uint32_t>(eop));           // cp_hqd_eop_base_addr_lo
 	mqdDw(166, static_cast<uint32_t>(eop >> 32));
 	mqdDw(167, (kHqdEopControlDefault & ~0x3fu) | eopSize);
@@ -1675,7 +1675,12 @@ bool RDNA4Compute::hqdInitFor(bool asKiq, uint32_t pipe, uint32_t queue, uint32_
 	wr(IpDiscovery::HwGc, CpHqdPqRptr, 0);
 	wr(IpDiscovery::HwGc, CpMqdBaseAddr, static_cast<uint32_t>(mqd) & ~3u);
 	wr(IpDiscovery::HwGc, CpMqdBaseAddrHi, static_cast<uint32_t>(mqd >> 32));
-	wr(IpDiscovery::HwGc, CpMqdControl, (kMqdControlDefault & ~0xfu) | vmid);
+	/* The MQD is a kernel (VMID0 MC) address for every queue, whatever the
+	 * queue's own VMID: gfx_v12_0_compute_mqd_init ("set MQD vmid to 0") and
+	 * kfd_mqd_manager_v12 init_mqd (cp_mqd_control = PRIV_STATE only) keep
+	 * CP_MQD_CONTROL.VMID at 0. With the queue's VMID here the CP's MQD
+	 * accesses walked the client tables at an MC address and faulted (W16). */
+	wr(IpDiscovery::HwGc, CpMqdControl, kMqdControlDefault & ~0xfu);
 	wr(IpDiscovery::HwGc, CpHqdPqBase, static_cast<uint32_t>(pq));
 	wr(IpDiscovery::HwGc, CpHqdPqBaseHi, static_cast<uint32_t>(pq >> 32));
 	wr(IpDiscovery::HwGc, CpHqdPqControl, pqControl);
@@ -2042,9 +2047,8 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	if (vm) {
 		const uint32_t status = rdGc(GcL2FaultStatusLo);
 		if (status) {
-			const uint64_t address = rdGc(GcL2FaultAddrLo) |
-				(static_cast<uint64_t>(rdGc(GcL2FaultAddrHi)) << 32);
-			CLOG("vmid %u: %s: GC hub fault status 0x%08x address 0x%llx", l.vmid, tag, status, address);
+			CLOG("vmid %u: %s: GC hub fault status 0x%08x (fault VMID %u) VA 0x%llx", l.vmid, tag,
+			     status, (status >> 20) & 0xf, gcFaultVa());
 			vmInvalidate(l.vmid, "dispatch fault clear");
 			scrubFaultPage();
 		}
