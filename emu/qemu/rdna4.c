@@ -2325,7 +2325,11 @@ static bool rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
                     l->at_wave = true;
                     break;
                 default:
-                    hung = l->steps >= (1u << 22);
+                    // A faulted work-item also leaves the queue without a
+                    // completion packet. Model it as a busy queue so the
+                    // runtime takes the same bounded recovery path as a
+                    // step-limit hang.
+                    hung = true;
                     goto stopped;
                 }
             }
