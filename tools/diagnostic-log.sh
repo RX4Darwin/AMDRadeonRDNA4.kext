@@ -41,12 +41,14 @@ FLIP_MODE="$(arg_value flip)"
 GFX_MODE="$(arg_value gfx)"
 HANG_MODE=0
 SLEEPTEST_MODE="$(arg_value sleeptest)"
+GFXPM_MODE="$(arg_value gfxpm)"
 case "$COMPUTE_STAGE" in ''|*[!0-9]*) COMPUTE_STAGE=0;; esac
 case "$IH_MODE" in ''|*[!0-9]*) IH_MODE=0;; esac
 case "$VM_MODE" in ''|*[!0-9]*) VM_MODE=0;; esac
 case "$FLIP_MODE" in ''|*[!0-9]*) FLIP_MODE=0;; esac
 case "$GFX_MODE" in ''|*[!0-9]*) GFX_MODE=0;; esac
 case "$SLEEPTEST_MODE" in ''|*[!0-9]*) SLEEPTEST_MODE=0;; esac
+case "$GFXPM_MODE" in ''|*[!0-9]*) GFXPM_MODE=0;; esac
 
 # Queue recovery is an explicit last step. It is never part of an ordinary
 # collection, even when rdna4-hang=1 is present in the boot arguments.
@@ -193,6 +195,9 @@ registry_value() {
 	section "dmesg: display power (sleep/wake)"
 	dmesg | grep -E 'RDNA4FB: power:' || true
 
+	section "dmesg: GFX power-management experiment (rdna4-gfxpm)"
+	dmesg | grep -E 'RDNA4FB: compute: pm:' || echo "(rdna4-gfxpm not enabled or no pm: lines)"
+
 	section "dmesg: HW cursor (incl. vm routing + curtest)"
 	dmesg | grep -E 'RDNA4FB: cursor:' || true
 
@@ -241,6 +246,7 @@ registry_value() {
 	BENCH_FILE=""
 	SENSORS_RC=125
 	SENSORS_FILE=""
+	SENSORS_IDLE_FILE=""
 	VSYNC_RC=125
 	VSYNC_FILE=""
 	SHOW_RC=125
@@ -273,6 +279,11 @@ registry_value() {
 	fi
 
 	if [ "$INFO_OK" -eq 1 ]; then
+		# The idle reading: before any user-space workload, so the SMU's
+		# averages cannot be the tail of the selftest or the benchmarks
+		# (the round-2 300 W / 3.2 GHz reading was taken right after bench).
+		run_step "GPU sensors, idle baseline (before selftest and bench)" "$RUN" sensors
+		SENSORS_IDLE_FILE="$STEP_FILE"
 		if [ "$EMULATED_CARD" -eq 1 ]; then
 			echo "note: emulated card — using bounded rdna4-run selftest 16384"
 			run_step "user-space compute runtime (rdna4-run selftest 16384)" "$RUN" selftest 16384
@@ -289,7 +300,7 @@ registry_value() {
 		fi
 		BENCH_FILE="$STEP_FILE"
 		BENCH_RC=$STEP_RC
-		run_step "GPU sensors (rdna4-run sensors)" "$RUN" sensors
+		run_step "GPU sensors (rdna4-run sensors, right after the benchmarks)" "$RUN" sensors
 		SENSORS_FILE="$STEP_FILE"
 		SENSORS_RC=$STEP_RC
 	else
@@ -522,6 +533,15 @@ registry_value() {
 	# apart (see r2-sensors-review.md section 5). A stale table or a clock
 	# held at max at idle is a finding, not a tool failure, so it stays PASS.
 	if [ "$INFO_OK" -eq 0 ]; then
+		record sensors-idle SKIPPED "runtime unavailable"
+	elif [ -n "$SENSORS_IDLE_FILE" ] && grep -q '^sensors-pm: verdict ' "$SENSORS_IDLE_FILE"; then
+		idle_gfx="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_IDLE_FILE" | tail -1 | sed -E 's/^sensors-pm\[2\]: //' | cut -c1-110)"
+		idle_verdict="$(grep '^sensors-pm: verdict ' "$SENSORS_IDLE_FILE" | tail -1 | sed 's/^sensors-pm: verdict //')"
+		record sensors-idle PASS "$idle_verdict | $idle_gfx"
+	else
+		record sensors-idle FAIL "no idle power-management sample"
+	fi
+	if [ "$INFO_OK" -eq 0 ]; then
 		record sensors-pm SKIPPED "runtime unavailable"
 	elif grep -q '^sensors-pm: verdict ' "$SENSORS_FILE"; then
 		pm_gfx="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_FILE" | tail -1 | sed -E 's/^sensors-pm\[2\]: //' | cut -c1-110)"
@@ -529,6 +549,18 @@ registry_value() {
 		record sensors-pm PASS "$pm_verdict | $pm_gfx"
 	else
 		record sensors-pm FAIL "no power-management sample (kext without kRDNA4MethodSensorsEx?)"
+	fi
+
+	# rdna4-gfxpm: the experiment logs "pm: <step>: GFXCLK n MHz ..." after each
+	# step; show the first and the last so one row says whether anything moved.
+	if [ "$GFXPM_MODE" -eq 0 ]; then
+		record gfxpm SKIPPED "rdna4-gfxpm not enabled"
+	elif grep -q 'RDNA4FB: compute: pm: experiment finished' "$KLOG"; then
+		pm_first="$(grep 'RDNA4FB: compute: pm: baseline' "$KLOG" | tail -1 | sed -E 's/.*pm: baseline[^:]*: GFXCLK ([0-9]+) MHz.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
+		pm_last="$(grep 'RDNA4FB: compute: pm: .*GFXCLK [0-9]* MHz' "$KLOG" | tail -1 | sed -E 's/.*pm: ([^:]*): GFXCLK ([0-9]+) MHz.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1: \2 MHz \3% \4 W/')"
+		record gfxpm PASS "baseline $pm_first -> $pm_last"
+	else
+		record gfxpm FAIL "pm experiment did not finish (see the pm: lines)"
 	fi
 
 	if [ "$SLEEPTEST_MODE" -ne 1 ]; then

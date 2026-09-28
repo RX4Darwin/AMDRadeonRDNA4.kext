@@ -586,6 +586,8 @@ struct RDNA4State {
     bool     hang_sticky;    /* queue dequeue never completes */
     bool     sleep_reset;    /* monitor-triggered compute power reset */
     bool     gfx_hang;       /* accept gfx kicks but leave the ring stopped */
+    uint32_t smu_gfx_soft_max;   /* SetSoftMaxByFreq(GFXCLK) in MHz, 0 = automatic */
+    uint32_t smu_workload_mask;  /* last SetWorkloadMask */
     bool     smu_stale;      /* metrics transfer acks but the table is never rewritten */
     bool     warm_keep;      /* reset keeps live engines/queues, like warm card restart */
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
@@ -1560,10 +1562,14 @@ static void rdna4_gfx_autoload(RDNA4State *s)
  * emulator's idle card (no queue is executing), not a claim about silicon. */
 static void rdna4_smu_metrics_pm_fields(RDNA4State *s, uint8_t *table)
 {
-    (void)s;
     stl_le_p(table + RDNA4_SMU_METRICS_COUNTER,
              (uint32_t)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) & 0x7fffffff));
-    stl_le_p(table + RDNA4_SMU_METRICS_CURR_CLOCK + 0 * 4, 2100);      /* PPCLK_GFXCLK */
+    /* PPCLK_GFXCLK follows a SetSoftMaxByFreq below the idle clock; the soft
+     * max message carries max + 1 (SMU_V14_SOFT_FREQ_ROUND). */
+    uint32_t gfxclk = 2100;
+    if (s->smu_gfx_soft_max && s->smu_gfx_soft_max - 1 < gfxclk)
+        gfxclk = s->smu_gfx_soft_max - 1;
+    stl_le_p(table + RDNA4_SMU_METRICS_CURR_CLOCK + 0 * 4, gfxclk);    /* PPCLK_GFXCLK */
     stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFXCLK_PRE_DS, 2100);
     stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY, 3);
     stw_le_p(table + RDNA4_SMU_METRICS_AVG_UCLK_ACTIVITY, 1);
@@ -1647,6 +1653,17 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
         fprintf(stderr, "rdna4: smu: synthetic metrics 42C/55C, 2100/1000 MHz, 120 W, 900 RPM\n");
         break;
     }
+    case 0x19:                                     /* SetSoftMinByFreq: accepted, no model */
+        break;
+    case 0x1a:                                     /* SetSoftMaxByFreq */
+        /* param = (PPCLK_e << 16) | MHz; 0xffff is the automatic (unlimited) max. */
+        if ((param >> 16) == 0)                    /* PPCLK_GFXCLK */
+            s->smu_gfx_soft_max = (param & 0xffff) == 0xffff ? 0 : (param & 0xffff);
+        break;
+    case 0x24:                                     /* SetWorkloadMask */
+        s->smu_workload_mask = param;
+        fprintf(stderr, "rdna4: smu: SetWorkloadMask 0x%x\n", param);
+        break;
     case 0x29:                                     /* DisallowGfxOff */
     case 0x36:                                     /* RunDcBtc */
         break;

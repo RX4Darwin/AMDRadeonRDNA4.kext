@@ -392,6 +392,15 @@ private:
 	uint32_t   gfxFence { 0 };               // last RELEASE_MEM sequence number
 	uint32_t   gfxMode { 0 };                // 0 off, 1 MMIO write pointer, 2 doorbell
 	static uint32_t requestedGfx();
+	// W19: rdna4-gfxpm, the GFX power-management experiment.
+	static constexpr uint32_t kPmWorkload = 1, kPmSoftAuto = 2, kPmCapProbe = 4, kPmSampleOnly = 8;
+	static constexpr uint32_t kPmSoftMaxAuto = 0xffff;         // (PPCLK_GFXCLK << 16) | 0xffff
+	static constexpr uint32_t kPmNoMin = 0xffffffffu;          // leave SoftMin alone
+	static constexpr uint32_t kPmProbeMHz = 1000;
+	static uint32_t requestedGfxPm();
+	void gfxPmSample(const char *tag);
+	bool gfxPmSoftLimits(uint32_t maxParam, uint32_t minParam, const char *what);
+	void gfxPmExperiment(uint32_t mask);
 	bool gfxCsbInit();
 	bool gfxRingResume();
 	void gfxKick(uint64_t wptrDwords);
