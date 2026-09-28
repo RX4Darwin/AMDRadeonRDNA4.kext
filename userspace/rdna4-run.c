@@ -27,6 +27,7 @@
 #include "vadd_codeobj.h"
 
 #include <Accelerate/Accelerate.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -294,6 +295,142 @@ static double nowUs(void) {
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return t.tv_sec * 1e6 + t.tv_nsec / 1e3;
+}
+
+static volatile sig_atomic_t showSignal;
+
+static void showSignalHandler(int signalNumber) {
+	(void)signalNumber;
+	showSignal = 1;
+}
+
+static uint32_t mandelbrotColor(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+	const float cx = ((float)x / (float)width - 0.5f) * 3.2f - 0.7f;
+	const float cy = ((float)y / (float)height - 0.5f) * 2.2f;
+	float zx = 0.0f, zy = 0.0f;
+	uint32_t iteration = 0;
+	for (; iteration < 256u; iteration++) {
+		const float zx2 = zx * zx;
+		const float zy2 = zy * zy;
+		if (zx2 + zy2 > 4.0f)
+			break;
+		const float nextZx = zx2 - zy2 + cx;
+		zy = 2.0f * zx * zy + cy;
+		zx = nextZx;
+	}
+	if (iteration >= 256u)
+		return 0xff000000u;
+	const float t = (float)iteration * (1.0f / 255.0f);
+	const uint32_t r = (uint32_t)(9.0f + 246.0f * t);
+	const uint32_t g = (uint32_t)(20.0f + 200.0f * (1.0f - t));
+	const uint32_t b = (uint32_t)(80.0f + 175.0f * t);
+	return 0xff000000u | (r << 16) | (g << 8) | b;
+}
+
+static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
+	uint32_t width = 0, height = 0, pitch = 0;
+	kern_return_t kr = rdna4_display_query(gpu, &width, &height, &pitch);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: display query: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	if (!width || !height || !pitch || (uint64_t)pitch * height > UINT64_MAX / 4) {
+		fprintf(stderr, "show: invalid display geometry %ux%u pitch %u\n", width, height, pitch);
+		return 1;
+	}
+	const uint64_t bytes = (uint64_t)pitch * height * 4;
+	printf("show: geometry %ux%u pitch %u (%llu bytes)\n", width, height, pitch, bytes);
+
+	rdna4_program_t prog = { 0 };
+	rdna4_buffer_t buf = { 0 };
+	int loaded = 0, allocated = 0, presented = 0, rc = 1;
+	kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "mandelbrot", &prog);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: load mandelbrot: %s\n", rdna4_error(kr));
+		goto done;
+	}
+	loaded = 1;
+	kr = rdna4_alloc(gpu, bytes, &buf);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: allocate %llu bytes: %s\n", bytes, rdna4_error(kr));
+		goto done;
+	}
+	allocated = 1;
+	{
+		uint8_t args[20] = { 0 };
+		memcpy(args, &buf.gpu, sizeof(buf.gpu));
+		memcpy(args + 8, &width, sizeof(width));
+		memcpy(args + 12, &height, sizeof(height));
+		memcpy(args + 16, &pitch, sizeof(pitch));
+		const uint32_t groups[3] = { (width + 15) / 16, (height + 15) / 16, 1 };
+		const uint32_t groupSize[3] = { 16, 16, 1 };
+		uint64_t kernelUs = 0;
+		kr = rdna4_dispatch(gpu, &prog, groups, groupSize, args, sizeof(args), 10000, &kernelUs);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "show: Mandelbrot dispatch: %s\n", rdna4_error(kr));
+			goto done;
+		}
+		printf("show: Mandelbrot kernel %llu us\n", kernelUs);
+	}
+
+	showSignal = 0;
+	signal(SIGINT, showSignalHandler);
+	signal(SIGTERM, showSignalHandler);
+	{
+		const double presentStart = nowUs();
+		kr = rdna4_present(gpu, &buf, 0, &width, &height, &pitch);
+		printf("show: present latency %.0f us\n", nowUs() - presentStart);
+	}
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: present: %s\n", rdna4_error(kr));
+		goto done;
+	}
+	presented = 1;
+	{
+		uint32_t mismatches = 0;
+		for (uint32_t sy = 1; sy <= 8; sy++) {
+			const uint32_t y = (uint64_t)sy * height / 9;
+			for (uint32_t sx = 1; sx <= 8; sx++) {
+				const uint32_t x = (uint64_t)sx * width / 9;
+				uint32_t got = 0;
+				kr = rdna4_read(gpu, &buf, ((uint64_t)y * pitch + x) * 4, &got, sizeof(got));
+				const uint32_t want = mandelbrotColor(x, y, width, height);
+				if (kr != KERN_SUCCESS || got != want)
+					mismatches++;
+			}
+		}
+		printf("show: CPU spot check 64 pixels, mismatches %u\n", mismatches);
+		if (kr != KERN_SUCCESS || mismatches)
+			goto done;
+	}
+	for (uint32_t left = seconds * 10; left && !showSignal; left--)
+		usleep(100000);
+	if (showSignal)
+		fprintf(stderr, "show: interrupted; restoring desktop\n");
+	kr = rdna4_restore(gpu);
+	presented = 0;
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: restore: %s\n", rdna4_error(kr));
+		goto done;
+	}
+	printf("show: desktop restored\n");
+	rc = showSignal ? 1 : 0;
+
+done:
+	signal(SIGINT, SIG_DFL);
+	signal(SIGTERM, SIG_DFL);
+	if (presented) {
+		kern_return_t restore = rdna4_restore(gpu);
+		if (restore != KERN_SUCCESS) {
+			fprintf(stderr, "show: cleanup restore: %s\n", rdna4_error(restore));
+			rc = 1;
+		}
+	}
+	if (allocated)
+		rdna4_free(gpu, &buf);
+	if (loaded)
+		rdna4_unload(gpu, &prog);
+	return rc;
 }
 
 // LDS and a work-group barrier (bench.cl's lds_reverse): each group of 64
@@ -1006,6 +1143,7 @@ static void usage(void) {
 	fprintf(stderr, "usage: rdna4-run info\n"
 	                "       rdna4-run selftest [items]\n"
 	                "       rdna4-run bench [small]\n"
+	                "       rdna4-run show [seconds]\n"
 	                "       rdna4-run load <file.hsaco> <kernel>\n");
 }
 
@@ -1028,6 +1166,11 @@ int main(int argc, char **argv) {
 		if (!openRuntime(&gpu))
 			return 1;
 		rc = cmdBench(&gpu, argc == 3 && !strcmp(argv[2], "small"));
+	} else if (!strcmp(argv[1], "show") && argc <= 3) {
+		if (!openRuntime(&gpu))
+			return 1;
+		const uint32_t seconds = argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 5;
+		rc = cmdShow(&gpu, seconds);
 	} else if (!strcmp(argv[1], "load") && argc == 4) {
 		if (!openRuntime(&gpu))
 			return 1;

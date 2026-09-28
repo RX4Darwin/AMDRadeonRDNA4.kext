@@ -61,6 +61,10 @@ enum {
 	kRDNA4MethodUnload,
 	/* struct in: RDNA4Dispatch -> microseconds from doorbell to fence */
 	kRDNA4MethodDispatch,
+	/* handle, byte offset (0,0 queries geometry) -> width | height<<16, pitch */
+	kRDNA4MethodPresent,
+	/* restore the desktop surface for this connection */
+	kRDNA4MethodRestore,
 	kRDNA4MethodCount
 };
 

@@ -487,8 +487,40 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	return kIOReturnSuccess;
 }
 
+void RDNA4Compute::clearPresentationLocked() {
+	presentActive = false;
+	presentOwner = nullptr;
+	presentHandle = 0;
+	presentOffset = 0;
+	presentStarted = 0;
+	presentSurface = {};
+}
+
+IOReturn RDNA4Compute::restorePresentationLocked(const char *why) {
+	if (!presentActive)
+		return kIOReturnSuccess;
+	const bool restored = Flip::flipTo(*this, presentSurface, presentSurface.desktop,
+	                                   why ? why : "restore");
+	if (restored)
+		RLOG("present: restored desktop (%s)", why ? why : "requested");
+	else
+		RLOG("present: desktop restore failed (%s)", why ? why : "requested");
+	clearPresentationLocked();
+	return restored ? kIOReturnSuccess : kIOReturnNotResponding;
+}
+
+void RDNA4Compute::checkPresentationTimeoutLocked() {
+	if (!presentActive)
+		return;
+	uint64_t span = 0;
+	nanoseconds_to_absolutetime(30000000000ull, &span);
+	if (mach_absolute_time() - presentStarted >= span)
+		(void)restorePresentationLocked("timeout");
+}
+
 IOReturn RDNA4Compute::rtInfo(const void *owner, uint64_t out[9]) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	out[0] = RDNA4_COMPUTE_ABI;
 	out[1] = rtStage;
 	out[2] = (rtReady ? RDNA4_FLAG_READY : 0) | (rtWedged ? RDNA4_FLAG_WEDGED : 0) |
@@ -510,6 +542,7 @@ IOReturn RDNA4Compute::rtInfo(const void *owner, uint64_t out[9]) {
 // Contents are undefined, as with any GPU allocation; callers write first.
 IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	if (!rtReady)
 		return kIOReturnNotReady;
 	RtClient *c = clientFor(owner);
@@ -544,19 +577,24 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 
 IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	RtBuffer *b = bufferFor(owner, handle);
 	if (!b)
 		return kIOReturnBadArgument;
+	IOReturn restore = kIOReturnSuccess;
+	if (presentActive && presentOwner == owner && presentHandle == handle)
+		restore = restorePresentationLocked("buffer free");
 	if (RtClient *c = clientFor(owner))
 		vmUnmap(*c, b->va, b->bytes);
 	(b->device ? devHeap : heap).free(b->offset);
 	b->owner = nullptr;
-	return kIOReturnSuccess;
+	return restore;
 }
 
 IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
                               mach_vm_address_t user, uint64_t length, bool toGpu) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	if (!rtReady)
 		return kIOReturnNotReady;
 	RtBuffer *b = bufferFor(owner, handle);
@@ -577,6 +615,7 @@ IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offse
 IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t elf, uint64_t length,
                               const char *name, uint64_t out[8]) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	if (!rtReady)
 		return kIOReturnNotReady;
 	RtClient *c = clientFor(owner);
@@ -651,6 +690,7 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 
 IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	RtProgram *p = programFor(owner, program);
 	if (!p)
 		return kIOReturnBadArgument;
@@ -663,6 +703,7 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 
 IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	if (!rtReady)
 		return kIOReturnNotReady;
 	if (rtWedged)
@@ -738,10 +779,69 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	return kIOReturnSuccess;
 }
 
+IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t offset,
+                                 uint64_t &geometry, uint64_t &pitch) {
+	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
+	if (!rtReady)
+		return kIOReturnNotReady;
+
+	Flip::Surface surface {};
+	if (!handle) {
+		if (!Flip::findPipe(*this, surface))
+			return kIOReturnNotReady;
+		geometry = (static_cast<uint64_t>(surface.width) & 0xffffu) |
+		           ((static_cast<uint64_t>(surface.height) & 0xffffu) << 16);
+		pitch = surface.pitch;
+		return kIOReturnSuccess;
+	}
+	if (presentActive && presentOwner != owner)
+		return kIOReturnBusy;
+	RtBuffer *b = bufferFor(owner, handle);
+	if (!b || !b->device || (offset & 255u))
+		return kIOReturnBadArgument;
+	if (presentActive) {
+		surface = presentSurface;
+	} else if (!Flip::findPipe(*this, surface)) {
+		return kIOReturnNotReady;
+	}
+	const uint64_t bytes = Flip::surfaceBytes(surface.pitch, surface.height);
+	if (!bytes || offset > b->bytes || bytes > b->bytes - offset || offset > ~0ull - b->mc)
+		return kIOReturnBadArgument;
+	const uint64_t target = b->mc + offset;
+	if (!Flip::flipTo(*this, surface, target, "present"))
+		return kIOReturnNotResponding;
+	presentActive = true;
+	presentOwner = owner;
+	presentHandle = handle;
+	presentOffset = offset;
+	presentStarted = mach_absolute_time();
+	presentSurface = surface;
+	geometry = (static_cast<uint64_t>(surface.width) & 0xffffu) |
+	           ((static_cast<uint64_t>(surface.height) & 0xffffu) << 16);
+	pitch = surface.pitch;
+	RLOG("present: buffer 0x%llx +0x%llx, %ux%u pitch %u", handle, offset,
+	     surface.width, surface.height, surface.pitch);
+	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4Compute::rtRestore(const void *owner) {
+	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
+	if (!presentActive)
+		return kIOReturnSuccess;
+	if (presentOwner != owner)
+		return kIOReturnBusy;
+	return restorePresentationLocked("restore");
+}
+
 void RDNA4Compute::rtRelease(const void *owner) {
 	if (!rtLock || !owner)
 		return;
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
+	if (presentActive && presentOwner == owner)
+		(void)restorePresentationLocked("client close");
 	RtClient *c = clientFor(owner);
 	uint32_t nb = 0, np = 0;
 	for (RtBuffer &b : buffers) {

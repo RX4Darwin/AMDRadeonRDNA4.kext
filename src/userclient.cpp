@@ -60,6 +60,8 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sLoad,       2,          kIOUCVariableStructureSize, 8,           0 },
 	{ sUnload,     1,          0,                          0,           0 },
 	{ sDispatch,   0,          sizeof(RDNA4Dispatch),      1,           0 },
+	{ sPresent,    2,          0,                          2,           0 },
+	{ sRestore,    0,          0,                          0,           0 },
 };
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -116,4 +118,13 @@ IOReturn RDNA4ComputeClient::sDispatch(OSObject *t, void *, IOExternalMethodArgu
 		return kIOReturnBadArgument;
 	return self(t)->compute->rtDispatch(t, *static_cast<const RDNA4Dispatch *>(a->structureInput),
 	                                    a->scalarOutput[0]);
+}
+
+IOReturn RDNA4ComputeClient::sPresent(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtPresent(t, a->scalarInput[0], a->scalarInput[1],
+	                                   a->scalarOutput[0], a->scalarOutput[1]);
+}
+
+IOReturn RDNA4ComputeClient::sRestore(OSObject *t, void *, IOExternalMethodArguments *) {
+	return self(t)->compute->rtRestore(t);
 }
