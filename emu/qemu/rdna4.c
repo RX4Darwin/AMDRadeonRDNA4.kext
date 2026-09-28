@@ -2609,9 +2609,15 @@ static void rdna4_gfx_update(void *opaque)
             ds = qemu_create_displaysurface(so.width, so.height);
             memset(surface_data(ds), 0, (size_t)surface_stride(ds) * so.height);
         } else {
-            ds = qemu_create_displaysurface_from(
-                so.width, so.height, PIXMAN_LE_x8r8g8b8, so.stride,
-                (uint8_t *)memory_region_get_ram_ptr(&s->vram) + so.offset);
+            uint8_t *scanout = rdna4_vram_span(s, so.offset,
+                                                (uint64_t)so.stride * so.height);
+            if (!scanout) {
+                ds = qemu_create_placeholder_surface(640, 480,
+                                                     "rdna4: scanout surface not mapped");
+            } else {
+                ds = qemu_create_displaysurface_from(
+                    so.width, so.height, PIXMAN_LE_x8r8g8b8, so.stride, scanout);
+            }
         }
         dpy_gfx_replace_surface(s->con, ds);
         dpy_gfx_update_full(s->con);
