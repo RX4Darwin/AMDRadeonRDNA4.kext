@@ -393,7 +393,10 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 	sdmaKick(sdmaRing.wptr());
 	if (ihActive) {
 		uint64_t ns = 0;
-		return ihWaitFence(poolDw(kSdmaFenceOffset), value, timeoutMs, false, "dma", ns);
+		const bool done = ihWaitFence(poolDw(kSdmaFenceOffset), value, timeoutMs, false, "dma", ns);
+		if (!done)
+			RLOG("dma: SDMA queue remains wedged; this gfx12 path has no source-backed no-MES queue reset");
+		return done;
 	}
 	uint64_t t0 = mach_absolute_time(), span = 0;
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000, &span);
@@ -408,6 +411,10 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 			IOSleep(1);
 	}
 	RLOG("dma: SDMA fence %u never came (0x%08x)", value, *poolDw(kSdmaFenceOffset));
+	// The current gfx12 amdgpu source exposes SDMA reset through MES. There is
+	// no source-backed no-MES queue reset sequence for this bring-up path, so a
+	// timed-out SDMA queue remains wedged rather than risking the display.
+	RLOG("dma: SDMA queue remains wedged; no source-backed no-MES queue reset");
 	logGcFault("dma");
 	return false;
 }
