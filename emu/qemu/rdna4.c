@@ -100,6 +100,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define OTG_V_SYNC_A_CNTL    0x1b3a
 #define OTG_CONTROL          0x1b43     /* MASTER_EN [0], CURRENT_MASTER_EN_STATE [16] */
 #define OTG_STATUS           0x1b49     /* V_BLANK [0] */
+#define OTG_STATUS_POSITION  0x1b4a     /* LINE [31:16], HCOUNT [15:0] */
+#define OTG_STATUS_FRAME_COUNT 0x1b4c   /* [23:0], DCN spelling */
 #define OTG_FRAME_COUNT      0x1b4d     /* [23:0] */
 #define OTG_MASTER_UPDATE_LOCK 0x1b89   /* LOCK [0], UPDATE_LOCK_STATUS [8] */
 #define OTG_CLOCK_CONTROL    0x1b84     /* EN [0], GATE_DIS [1], CLOCK_ON [8], BUSY [16] */
@@ -115,8 +117,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define HUBP_SURFACE_PITCH   0x0607     /* [15:0] = pixels - 1 */
 #define HUBP_SURFACE_ADDR    0x060a
 #define HUBP_SURFACE_ADDR_HI 0x060b
+#define HUBP_FLIP_CONTROL    0x061b     /* SURFACE_FLIP_PENDING [8] */
+#define HUBP_FLIP_PENDING    (1u << 8)
 #define HUBP_DB_FIRST        0x05e5     /* DCSURF_SURFACE_CONFIG .. */
-#define HUBP_DB_LAST         0x060b     /* .. PRIMARY_SURFACE_ADDRESS_HIGH */
+#define HUBP_DB_LAST         0x061b     /* .. DCSURF_FLIP_CONTROL */
 #define DCN_VM_FB_LOC_BASE   0x0475     /* [23:0] = MC address >> 24 */
 /* DIG front-/back-ends (seg2) */
 #define DIG_STRIDE           0x124
@@ -300,6 +304,12 @@ typedef struct RDNA4Pending {
     uint32_t addr, val;
 } RDNA4Pending;
 
+/* ---- page flip (W5) ---------------------------------------------------- */
+typedef struct RDNA4Flip {
+    bool pending;
+    uint64_t request_frame;
+} RDNA4Flip;
+
 #define MAX_PENDING 256
 
 typedef struct RDNA4Scanout {
@@ -327,6 +337,7 @@ struct RDNA4State {
     bool     inv_noack;      /* model the card (2026-09-28): GC hub flushes never ack */
     bool     sdma_no_db;     /* model an SDMA that ignores its doorbell */
     bool     dma_broken;     /* model a system-memory path that faults */
+    bool     flip_stuck;     /* leave a surface flip pending forever */
 
     uint32_t *regs;           /* BAR5 image, RDNA4_MMIO_SIZE bytes */
     uint8_t  *resv;           /* top RDNA4_RESV_SIZE bytes of VRAM */
@@ -344,6 +355,7 @@ struct RDNA4State {
     uint8_t      dig_mode[NUM_DIG];     /* encoder mode last set up */
     RDNA4Pending pending[MAX_PENDING];  /* double-buffered writes under lock */
     unsigned     npending;
+    RDNA4Flip    flip[NUM_OTG];
     RDNA4Scanout scanout;
 
     /* PSP and SMU firmware state */
@@ -441,7 +453,7 @@ static uint32_t rdna4_otg_reg(RDNA4State *s, int otg, uint32_t dw)
  * PHY PLL feeding it (SET_PIXEL_CLOCK; at power-on the GOP's clock).
  */
 static bool rdna4_otg_position(RDNA4State *s, int otg, uint64_t *frame,
-                               uint32_t *line)
+                               uint32_t *line, uint32_t *horizontal)
 {
     uint64_t htot = (rdna4_otg_reg(s, otg, OTG_H_TOTAL) & 0x7fff) + 1;
     uint64_t vtot = (rdna4_otg_reg(s, otg, OTG_V_TOTAL) & 0x7fff) + 1;
@@ -456,14 +468,23 @@ static bool rdna4_otg_position(RDNA4State *s, int otg, uint64_t *frame,
     pixels = muldiv64(ns, (uint32_t)pclk, NANOSECONDS_PER_SECOND);
     *frame = pixels / (htot * vtot);
     *line = (pixels % (htot * vtot)) / htot;
+    *horizontal = pixels % htot;
     return true;
 }
+
+static bool rdna4_update_locked(RDNA4State *s, int otg);
+static void rdna4_latch_flips(RDNA4State *s, int otg, uint64_t frame);
 
 static uint32_t rdna4_otg_read(RDNA4State *s, int otg, uint32_t dw)
 {
     uint32_t val = rdna4_otg_reg(s, otg, dw);
     uint64_t frame;
-    uint32_t line, vb;
+    uint32_t line, horizontal, vb;
+    const bool running = rdna4_otg_position(s, otg, &frame, &line, &horizontal);
+
+    if (running) {
+        rdna4_latch_flips(s, otg, frame);
+    }
 
     switch (dw) {
     case OTG_CONTROL:
@@ -472,13 +493,19 @@ static uint32_t rdna4_otg_read(RDNA4State *s, int otg, uint32_t dw)
         return (val & ~(1u << 8)) | ((val & 1) << 8);
     case OTG_CLOCK_CONTROL:                        /* running when enabled, never busy */
         return (val & ~((1u << 8) | (1u << 16))) | ((val & 1) << 8);
+    case OTG_STATUS_POSITION:
+        if (running) {
+            return (line << 16) | (horizontal & 0xffff);
+        }
+        return val;
+    case OTG_STATUS_FRAME_COUNT:
     case OTG_FRAME_COUNT:
-        if (rdna4_otg_position(s, otg, &frame, &line)) {
+        if (running) {
             return (val & ~0xffffffu) | (frame & 0xffffff);
         }
         return val;
     case OTG_STATUS:
-        if (rdna4_otg_position(s, otg, &frame, &line)) {
+        if (running) {
             vb = rdna4_otg_reg(s, otg, OTG_V_BLANK);
             bool in_blank = line < ((vb >> 16) & 0x7fff) || line >= (vb & 0x7fff);
             return (val & ~1u) | in_blank;
@@ -500,31 +527,108 @@ static bool rdna4_update_locked(RDNA4State *s, int otg)
            (rdna4_otg_reg(s, otg, OTG_MASTER_UPDATE_LOCK) & 1);
 }
 
+/* ---- page flip (W5): an address requested under lock latches at vblank. */
+static int rdna4_flip_otg_for_address(uint32_t addr)
+{
+    for (int otg = 0; otg < NUM_OTG; otg++) {
+        if (addr == SEG2(HUBP_SURFACE_ADDR + otg * HUBP_STRIDE) ||
+            addr == SEG2(HUBP_SURFACE_ADDR_HI + otg * HUBP_STRIDE)) {
+            return otg;
+        }
+    }
+    return -1;
+}
+
+static void rdna4_latch_flips(RDNA4State *s, int otg, uint64_t frame)
+{
+    RDNA4Flip *flip = &s->flip[otg];
+
+    if (!flip->pending || s->flip_stuck || rdna4_update_locked(s, otg) ||
+        frame == flip->request_frame) {
+        return;
+    }
+    unsigned out = 0;
+    bool applied = false;
+    for (unsigned i = 0; i < s->npending; i++) {
+        if (rdna4_flip_otg_for_address(s->pending[i].addr) == otg) {
+            reg_set(s, s->pending[i].addr, s->pending[i].val);
+            applied = true;
+        } else {
+            s->pending[out++] = s->pending[i];
+        }
+    }
+    s->npending = out;
+    if (applied) {
+        flip->pending = false;
+    }
+}
+
 static void rdna4_db_write(RDNA4State *s, int otg, uint32_t addr, uint32_t val)
 {
     if (!rdna4_update_locked(s, otg)) {
         reg_set(s, addr, val);
         return;
     }
+    bool queued = false;
     for (unsigned i = 0; i < s->npending; i++) {
         if (s->pending[i].addr == addr) {
             s->pending[i].val = val;
-            return;
+            queued = true;
+            break;
         }
     }
-    if (s->npending < MAX_PENDING) {
-        s->pending[s->npending++] = (RDNA4Pending){ addr, val };
-    } else {
-        reg_set(s, addr, val);
+    if (!queued) {
+        if (s->npending < MAX_PENDING) {
+            s->pending[s->npending++] = (RDNA4Pending){ addr, val };
+            queued = true;
+        } else {
+            reg_set(s, addr, val);
+        }
+    }
+    if (queued && rdna4_flip_otg_for_address(addr) == otg) {
+        uint64_t frame = 0;
+        uint32_t line = 0, horizontal = 0;
+        if (!rdna4_otg_position(s, otg, &frame, &line, &horizontal)) {
+            frame = 0;
+        }
+        s->flip[otg].pending = true;
+        s->flip[otg].request_frame = frame;
     }
 }
 
 static void rdna4_latch_pending(RDNA4State *s)
 {
     for (unsigned i = 0; i < s->npending; i++) {
-        reg_set(s, s->pending[i].addr, s->pending[i].val);
+        if (rdna4_flip_otg_for_address(s->pending[i].addr) < 0) {
+            reg_set(s, s->pending[i].addr, s->pending[i].val);
+        }
     }
-    s->npending = 0;
+    unsigned out = 0;
+    for (unsigned i = 0; i < s->npending; i++) {
+        if (rdna4_flip_otg_for_address(s->pending[i].addr) >= 0) {
+            s->pending[out++] = s->pending[i];
+        }
+    }
+    s->npending = out;
+}
+
+static uint32_t rdna4_hubp_read(RDNA4State *s, int hubp, uint32_t dw)
+{
+    uint32_t val = reg_get(s, SEG2(dw + hubp * HUBP_STRIDE));
+
+    if (dw == HUBP_FLIP_CONTROL) {
+        uint64_t frame = 0;
+        uint32_t line = 0, horizontal = 0;
+        if (rdna4_otg_position(s, hubp, &frame, &line, &horizontal)) {
+            rdna4_latch_flips(s, hubp, frame);
+        }
+        if (s->flip[hubp].pending) {
+            val |= HUBP_FLIP_PENDING;
+        } else {
+            val &= ~HUBP_FLIP_PENDING;
+        }
+    }
+    return val;
 }
 
 static void rdna4_otg_write(RDNA4State *s, int otg, uint32_t dw, uint32_t val)
@@ -1295,6 +1399,10 @@ static uint64_t rdna4_mmio_read(void *opaque, hwaddr addr, unsigned size)
                    (d2 - DIG_FIFO_CTRL0) % DIG_STRIDE == 0) {
             val = reg_get(s, addr);
             val = (val & ~(1u << 20)) | (((val >> 1) & 1) << 20); /* RESET_DONE follows RESET */
+        } else if (d2 >= HUBP_DB_FIRST && d2 < HUBP_DB_FIRST + NUM_OTG * HUBP_STRIDE &&
+                   (d2 - HUBP_DB_FIRST) % HUBP_STRIDE <= HUBP_DB_LAST - HUBP_DB_FIRST) {
+            uint32_t hubp = (d2 - HUBP_DB_FIRST) / HUBP_STRIDE;
+            val = rdna4_hubp_read(s, hubp, d2 - hubp * HUBP_STRIDE);
         } else if (d2 >= OTG_H_TOTAL && d2 < OTG_H_TOTAL + NUM_OTG * OTG_STRIDE) {
             uint32_t otg = (d2 - OTG_H_TOTAL) / OTG_STRIDE;
             val = rdna4_otg_read(s, otg, d2 - otg * OTG_STRIDE);
@@ -2567,6 +2675,7 @@ static void rdna4_reset(DeviceState *dev)
                MIN(s->discovery_len, RDNA4_DISCOVERY_TOP));
     }
     s->npending = 0;
+    memset(s->flip, 0, sizeof(s->flip));
     s->psp_bl_loaded = 0;
     s->psp_ring_mc = 0;
     s->psp_ring_size = 0;
@@ -2705,6 +2814,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("inv-noack", RDNA4State, inv_noack, false),
     DEFINE_PROP_BOOL("sdma-no-doorbell", RDNA4State, sdma_no_db, false),
     DEFINE_PROP_BOOL("dma-broken", RDNA4State, dma_broken, false),
+    DEFINE_PROP_BOOL("flip-stuck", RDNA4State, flip_stuck, false),
 };
 
 static void rdna4_class_init(ObjectClass *klass, void *data)
