@@ -1,7 +1,7 @@
 #!/bin/bash
 # Set the boot-args for one boot of docs/real-card-plan.md on the OpenCore USB.
 #
-#   bash /Volumes/OPENCORE/set-boot.sh <0-6>
+#   bash /Volumes/OPENCORE/set-boot.sh <0-6|8>
 #
 #   0  this morning's known-good arguments (no new feature enabled)
 #   1  + interrupts and W6 opt-in            rdna4-ih=1 rdna4-hang=1
@@ -10,6 +10,8 @@
 #   4  + gfx ring and first triangle        ... rdna4-gfx=1 rdna4-hang=1
 #   5  + gfx ring through doorbell          ... rdna4-gfx=2 rdna4-hang=1
 #   6  optional: vblank + cursor            ... rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1
+#   8  W17 VM walker diagnostics            rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31
+#      (boot 7 is gfxpm on premetal/int; expect a merge here)
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
 # the one the next boot uses. A copy of the config is kept next to it first.
@@ -23,7 +25,8 @@ case "${1:-}" in
 	4) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=1 rdna4-hang=1" ;;
 	5) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1" ;;
-	*) echo "usage: bash $0 <0-6>   (see docs/real-card-plan.md)"; exit 1 ;;
+	8) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31" ;;
+	*) echo "usage: bash $0 <0-6|8>   (see docs/real-card-plan.md)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"

@@ -772,6 +772,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 	 * and SH_MEM_BASES (LDS_APP_BASE 1, SCRATCH_APP_BASE 2) before use.  The
 	 * register is SH_MEM_BASES = 0x09e3 (gc_12_0_0_offset.h:9259); ShMemBases used to
 	 * be 0x09e5 (SQ_DEBUG) in gfxregs.hpp; fixed with the emulator map. */
+	/* SPI_GDBG_PER_VMID_CNTL.TRAP_EN (gfx_v12_0.c:1806-1809) is not set: there is
+	 * no trap handler. */
 	trail("vm: compute vmid apertures");
 	for (uint32_t v = 8; v <= 15; v++) {
 		grbmSelect(0, 0, 0, v);
@@ -786,9 +788,21 @@ bool RDNA4Compute::vmBootSelfTest() {
 	bool hqd = false, inactive = true, fence = false, data = false, clean = false;
 	uint32_t forceFail = 0;
 	(void)PE_parse_boot_argn("rdna4-vm-force-fail", &forceFail, sizeof(forceFail));
+	/* rdna4-vm-diag (default 0 = off): which hardware-writing diagnostics may run
+	 * after the baseline queue fails.  bit0 E4 (IB from the VMID0 ring), bit1 a
+	 * (TAP_*_PHYSICAL), bit2 b (ctx0 covers the tables), bit3 c (MC-form
+	 * pointers), bit4 E2 (mirror LOCAL_FB/LOCAL_SYSMEM).  The E1 register dumps
+	 * and the SDMA table readback are read-only and always on with rdna4-vm=1.
+	 * The force-fail test hook only counts together with a diag mask. */
+	uint32_t diag = 0;
+	(void)PE_parse_boot_argn("rdna4-vm-diag", &diag, sizeof(diag));
+	diag &= 0x1f;
+	if (!diag)
+		forceFail = 0;
 
 	/* W17 diagnostics: page-table readback (through SDMA: the tables live in
-	 * VRAM past the BAR) next to the shadow copy the walker should see. */
+	 * VRAM past the BAR) next to the shadow copy.  It proves the SDMA writes
+	 * landed, not how the walker interprets the entries. */
 	auto inVram = [this](uint64_t mc) { return mc >= sv.fbMcBase && mc <= sv.fbMcTop; };
 	auto dumpSetup = [&](const char *tag) {
 		RLOG("vm: diag%s: rootMc 0x%llx rootPhys 0x%llx (FB_OFFSET 0x%x, fbMcBase 0x%llx)", tag,
@@ -808,8 +822,10 @@ bool RDNA4Compute::vmBootSelfTest() {
 		     rdGc(GcCtx0PtStartLo), rdGc(GcCtx0PtEndHi), rdGc(GcCtx0PtEndLo));
 	};
 	/* E1: both hubs' MC-window and aperture registers (vmDumpHubWindows), and
-	 * the four windows E2 may mirror (imu_v12_init_gfxhub_settings copies exactly
-	 * these MM registers into the GC hub: LOCAL_FB and LOCAL_SYSMEM start/end). */
+	 * the four windows E2 may mirror.  On this card the firmware (IMU/SMU) has
+	 * already mirrored most of the MM hub into the GC hub by the time we run
+	 * (hw log 202618 line 262); amdgpu's imu_v12_init_gfxhub_settings copies
+	 * exactly these four: LOCAL_FB and LOCAL_SYSMEM start/end. */
 	struct Mir { const char *name; uint32_t gc, mm; };
 	static const Mir mir[] = {
 		{ "LOCAL_FB_START", 0x15b1, 0x04d1 }, { "LOCAL_FB_END", 0x15b2, 0x04d2 },
@@ -826,6 +842,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 		if (!Sdma::copyLinear(pkt, c.rootMc, poolMc(kVmTableStage), bytes) ||
 		    !sdmaRun(pkt, Sdma::kCopyDwords, 2000)) {
 			RLOG("vm: diag%s: page-table readback via SDMA failed", tag);
+			logGcFault("vm: diag readback");
 			return;
 		}
 		const uint64_t *got = reinterpret_cast<const uint64_t *>(poolCpu + kVmTableStage);
@@ -977,73 +994,35 @@ bool RDNA4Compute::vmBootSelfTest() {
 		}
 		if (!(fence && data && clean)) {
 			const bool baseFence = fence, baseData = data, baseClean = clean;
-			/* Ladder: each variant changes one thing, re-kicks a fresh queue and
-			 * logs its fault status, then puts the setting back.  A passing
-			 * variant is only reported; the runtime stays disabled this boot. */
-			(void)hqdStop();
-			(void)vmInvalidate(vmid, "variant cleanup");
+			dumpWindows(" after fault");
+			/* Ladder (only with rdna4-vm-diag): each variant changes one thing,
+			 * re-kicks a fresh queue and logs its fault status, then puts the
+			 * setting back.  A passing variant is only reported; the runtime
+			 * stays disabled this boot.  A dequeue that times out abandons the
+			 * rest (an active HQD is never reprogrammed). */
+			bool abandon = !diag;
+			if (!diag) {
+				RLOG("vm: baseline failed; write diagnostics are off (rdna4-vm-diag=0x1f runs "
+				     "a, b, c, E2, E4)");
+			} else if (!hqdStop()) {
+				RLOG("vm: HQD dequeue timed out; diagnostics abandoned");
+				abandon = true;
+			} else {
+				(void)vmInvalidate(vmid, "variant cleanup");
+			}
 			const uint32_t savedL4 = rdGc(GcL2Cntl4);
 			const uint32_t savedC0[4] = { rdGc(GcCtx0PtStartLo), rdGc(GcCtx0PtStartHi),
 			                              rdGc(GcCtx0PtEndLo), rdGc(GcCtx0PtEndHi) };
 			const uint64_t savedPhys = c.rootPhys;
-			/* E4: one IB fetched in VMID 8 from the working VMID 0 kernel ring
-			 * (ring, EOP, rptr, wptr, MQD all VMID 0), isolating the walker
-			 * from the VMID 8 HQD.  Passes: tables and hub are fine and the
-			 * fault is HQD-side.  Faults: hub or tables.  A stuck kernel ring
-			 * is recovered with the no-reset queue recovery (rdna4-hang=1),
-			 * so the probe is skipped without it. */
-			if (!hangRecoveryEnabled) {
-				RLOG("vm: E4: skipped (a fault could wedge the kernel ring; needs rdna4-hang=1)");
-			} else {
-				trail("vm: E4 IB probe");
-				uint32_t ibPkt[8];
-				const uint32_t ibDw = Pm4::writeData(ibPkt, dataVa, 0x600df00e);
-				for (uint32_t i = 0; i < ibDw; i++)
-					*poolDw(ibOff + 0x100 + i * 4) = ibPkt[i];
-				*poolDw(dataOff) = 0;
-				*poolDw(kPm4FenceOffset) = 0;
-				flushHdp();
-				const bool mapped = ibDw && vmMap(c, ibVa, poolMc(ibOff), 0x1000, false);
-				gcFaultClear();
-				(void)vmInvalidate(vmid, "E4");
-				bool e4Fence = false;
-				if (mapped) {
-					uint32_t pkt[8];
-					const uint32_t seq = pm4Fence + 1;
-					if (pm4Queue.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa + 0x100, ibDw, vmid)) &&
-					    pm4Queue.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), seq))) {
-						pm4Fence = seq;
-						pm4Kick(pm4Queue.wptr());
-						for (uint32_t us = 0; us < 200000 && !e4Fence; us += 10) {
-							e4Fence = *poolDw(kPm4FenceOffset) == seq;
-							if (!e4Fence)
-								IODelay(10);
-						}
-					}
-				}
-				const uint32_t e4Status = rdGc(GcL2FaultStatusLo);
-				RLOG("vm: E4: IB from the VMID0 ring, fetched in VMID %u: mapped %d fence %d data 0x%08x "
-				     "fault status 0x%08x => %s", vmid, mapped, e4Fence, *poolDw(dataOff), e4Status,
-				     e4Fence && *poolDw(dataOff) == 0x600df00e && !e4Status
-				         ? "PASS (walker and tables work; the VMID 8 HQD is the problem)"
-				         : "fail (hub or tables)");
-				if (e4Status)
-					logGcFault("vm: E4");
-				if (!e4Fence) {
-					trail("vm: E4 recover kernel ring");
-					if (!recoverComputeQueue("vm: E4", nullptr))
-						RLOG("vm: E4: kernel ring recovery failed, compute stays wedged this boot");
-				}
-				gcFaultClear();
-				(void)vmInvalidate(vmid, "E4 clean");
-			}
 			uint32_t savedWin[4] = {};
 			bool passed[4] = { false, false, false, false };
-			/* E4 first (decisive), then a, b, c, and E2 last. */
+			/* a, b, c, E2, then E4 last (below). */
 			static const uint32_t order[4] = { 0, 1, 2, 3 };
-			dumpWindows(" after fault");
+			static const uint32_t bit[4] = { 2, 4, 8, 16 };
 			for (uint32_t k = 0; k < 4; k++) {
 				const uint32_t v = order[k];
+				if (abandon || !(diag & bit[v]))
+					continue;
 				const char *tag = v == 3 ? " variant E2 (GC windows := MM)"
 				                : v == 0 ? " variant a (TAP_*_PHYSICAL=1)"
 				                : v == 1 ? " variant b (ctx0 covers tables)"
@@ -1055,6 +1034,14 @@ bool RDNA4Compute::vmBootSelfTest() {
 					 * NB_TOP_OF_DRAM_* are never copied: the MM value is not the right
 					 * one for them).  A locked register shows in the readback. */
 					uint32_t written = 0;
+					RLOG("vm: E2: before any write, GC LOCAL_FB 0x%08x..0x%08x LOCAL_SYSMEM 0x%08x..0x%08x; "
+					     "MM LOCAL_FB 0x%08x..0x%08x LOCAL_SYSMEM 0x%08x..0x%08x",
+					     rdGc(Reg { 0, mir[0].gc }), rdGc(Reg { 0, mir[1].gc }),
+					     rdGc(Reg { 0, mir[2].gc }), rdGc(Reg { 0, mir[3].gc }),
+					     rd(IpDiscovery::HwMmhub, Reg { 0, mir[0].mm }),
+					     rd(IpDiscovery::HwMmhub, Reg { 0, mir[1].mm }),
+					     rd(IpDiscovery::HwMmhub, Reg { 0, mir[2].mm }),
+					     rd(IpDiscovery::HwMmhub, Reg { 0, mir[3].mm }));
 					for (uint32_t i = 0; i < nMir; i++) {
 						savedWin[i] = rdGc(Reg { 0, mir[i].gc });
 						const uint32_t m = rd(IpDiscovery::HwMmhub, Reg { 0, mir[i].mm });
@@ -1101,7 +1088,10 @@ bool RDNA4Compute::vmBootSelfTest() {
 				passed[v] = attempt(tag, false);
 				RLOG("vm: variant:%s -> %s (fault status 0x%08x)", tag, passed[v] ? "PASS" : "fail",
 				     rdGc(GcL2FaultStatusLo));
-				(void)hqdStop();
+				if (!hqdStop()) {
+					RLOG("vm: variant: HQD dequeue timed out; the rest is abandoned");
+					abandon = true;
+				}
 				trail("vm: variant restore");
 				if (v == 3) {
 					for (uint32_t i = 0; i < nMir; i++)
@@ -1126,6 +1116,59 @@ bool RDNA4Compute::vmBootSelfTest() {
 				}
 				gcFaultClear();
 				(void)vmInvalidate(vmid, "variant restore");
+			}
+			/* E4 (last: it relies on a recovery path never seen on the card): one IB fetched in VMID 8 from the working VMID 0 kernel ring
+			 * (ring, EOP, rptr, wptr, MQD all VMID 0), isolating the walker
+			 * from the VMID 8 HQD.  Passes: tables and hub are fine and the
+			 * fault is HQD-side.  Faults: hub or tables.  A stuck kernel ring
+			 * is recovered with the no-reset queue recovery (rdna4-hang=1),
+			 * so the probe is skipped without it. */
+			if (abandon || !(diag & 1)) {
+				/* not requested (or the ladder was abandoned) */
+			} else if (!hangRecoveryEnabled) {
+				RLOG("vm: E4: skipped (a fault could wedge the kernel ring; needs rdna4-hang=1)");
+			} else {
+				trail("vm: E4 IB probe");
+				uint32_t ibPkt[8];
+				const uint32_t ibDw = Pm4::writeData(ibPkt, dataVa, 0x600df00e);
+				for (uint32_t i = 0; i < ibDw; i++)
+					*poolDw(ibOff + 0x100 + i * 4) = ibPkt[i];
+				*poolDw(dataOff) = 0;
+				*poolDw(kPm4FenceOffset) = 0;
+				flushHdp();
+				const bool mapped = ibDw && vmMap(c, ibVa, poolMc(ibOff), 0x1000, false);
+				gcFaultClear();
+				(void)vmInvalidate(vmid, "E4");
+				bool e4Fence = false;
+				if (mapped) {
+					uint32_t pkt[8];
+					const uint32_t seq = pm4Fence + 1;
+					if (pm4Queue.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa + 0x100, ibDw, vmid)) &&
+					    pm4Queue.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), seq))) {
+						pm4Fence = seq;
+						pm4Kick(pm4Queue.wptr());
+						for (uint32_t us = 0; us < 200000 && !e4Fence; us += 10) {
+							e4Fence = *poolDw(kPm4FenceOffset) == seq;
+							if (!e4Fence)
+								IODelay(10);
+						}
+					}
+				}
+				const uint32_t e4Status = rdGc(GcL2FaultStatusLo);
+				RLOG("vm: E4: IB from the VMID0 ring, fetched in VMID %u: mapped %d fence %d data 0x%08x "
+				     "fault status 0x%08x => %s", vmid, mapped, e4Fence, *poolDw(dataOff), e4Status,
+				     e4Fence && *poolDw(dataOff) == 0x600df00e && !e4Status
+				         ? "PASS (walker and tables work; the VMID 8 HQD is the problem)"
+				         : "fail (hub or tables)");
+				if (e4Status)
+					logGcFault("vm: E4");
+				if (!e4Fence) {
+					trail("vm: E4 recover kernel ring");
+					if (!recoverComputeQueue("vm: E4", nullptr))
+						RLOG("vm: E4: kernel ring recovery failed, compute stays wedged this boot");
+				}
+				gcFaultClear();
+				(void)vmInvalidate(vmid, "E4 clean");
 			}
 			RLOG("vm: variants: a %s, b %s, c %s, E2 %s (baseline failed; runtime stays disabled)",
 			     passed[0] ? "PASS" : "fail", passed[1] ? "PASS" : "fail", passed[2] ? "PASS" : "fail",
