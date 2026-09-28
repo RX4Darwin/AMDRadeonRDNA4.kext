@@ -264,6 +264,30 @@ private:
 	static constexpr uint32_t kVaddItems      = 4096;                 // 64 groups of 64
 	bool stageKernel();
 
+	// W3, the gfx ring (gfxring.cpp): after the compute stages when the
+	// boot-arg rdna4-gfx is 1 (write pointer through CP_RB0_WPTR) or 2 (its
+	// doorbell). Pool layout past the DMA scratch, below the heap.
+	static constexpr uint32_t kGfxOffset      = 30u << 20;
+	static constexpr uint32_t kGfxRingOffset  = kGfxOffset;              // 16 KiB ring
+	static constexpr uint32_t kGfxRingSize    = 0x4000;
+	static constexpr uint32_t kGfxRptrOffset  = kGfxOffset + 0x4000;     // rptr writeback
+	static constexpr uint32_t kGfxWptrOffset  = kGfxRptrOffset + 0x40;   // wptr poll copy
+	static constexpr uint32_t kGfxFenceOffset = kGfxRptrOffset + 0x80;   // RELEASE_MEM target
+	static constexpr uint32_t kGfxTestOffset  = kGfxRptrOffset + 0xc0;   // WRITE_DATA targets
+	static constexpr uint32_t kGfxCsbOffset   = kGfxOffset + 0x5000;     // clear-state buffer
+	static constexpr uint32_t kGfxCsbMax      = 0x1000;
+	static constexpr uint32_t kGfxIbOffset    = kGfxOffset + 0x10000;    // indirect buffers
+	Pm4::Queue gfxRing;
+	uint32_t   gfxFence { 0 };               // last RELEASE_MEM sequence number
+	uint32_t   gfxMode { 0 };                // 0 off, 1 MMIO write pointer, 2 doorbell
+	static uint32_t requestedGfx();
+	bool gfxCsbInit();
+	bool gfxRingResume();
+	void gfxKick(uint64_t wptrDwords);
+	bool gfxFenceWait(uint32_t seq, uint32_t timeoutUs);
+	void gfxStatus(const char *tag);
+	bool stageGfxRing();
+
 public:
 	// User-space runtime (runtime.cpp), reached through RDNA4ComputeClient.
 	// `owner` is the client: its buffers and programs are only its own, and

@@ -523,8 +523,13 @@ void RDNA4Compute::runStages() {
 			return stop("stage 7 (kernel)");
 		done = StageKernel;
 	}
+	// W3: the gfx ring, when asked for. A failure only turns it off again.
+	bool gfxOk = false;
+	if (done >= StageKernel && (gfxMode = requestedGfx()) != 0)
+		gfxOk = stageGfxRing();
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
-	snprintf(note, sizeof(note), "finished at stage %u", done);
+	snprintf(note, sizeof(note), "finished at stage %u%s", done,
+	         !gfxMode && !gfxOk ? "" : gfxOk ? ", gfx ring up" : ", gfx ring failed");
 	trail(note);
 	CLOG("bring-up finished at stage %u", done);
 	if (done >= StageDispatch)

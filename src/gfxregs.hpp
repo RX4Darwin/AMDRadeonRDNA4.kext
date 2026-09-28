@@ -402,6 +402,35 @@ constexpr Reg PspBootStatus       { 0, 0x0063 };   // C2PMSG_35: bit31 bootloade
 constexpr Reg PspRingStatus       { 0, 0x0080 };   // C2PMSG_64
 constexpr Reg PspSosVersion       { 0, 0x0091 };   // C2PMSG_81: nonzero = sOS alive
 
+// --- The gfx ring (W3): gfx_v12_0_cp_gfx_resume / init_csb ------------------------
+constexpr Reg CpRb0Rptr           { 0, 0x0f60 };
+constexpr Reg CpRbWptrDelay       { 0, 0x0f61 };
+constexpr Reg CpRb0Base           { 0, 0x1de0 };   // MC >> 8
+constexpr Reg CpRb0Cntl           { 0, 0x1de1 };   // RB_BUFSZ [5:0], RB_BLKSZ [13:8]
+constexpr Reg CpRb0RptrAddr       { 0, 0x1de3 };
+constexpr Reg CpRb0RptrAddrHi     { 0, 0x1de4 };   // 16 bits
+constexpr Reg CpDeviceId          { 0, 0x1deb };
+constexpr Reg CpRbVmid            { 0, 0x1df1 };
+constexpr Reg CpRb0Wptr           { 0, 0x1df4 };
+constexpr Reg CpRb0WptrHi         { 0, 0x1df5 };
+constexpr Reg CpRbDoorbellRangeLower { 0, 0x1dfa };   // [11:2]
+constexpr Reg CpRbDoorbellRangeUpper { 0, 0x1dfb };   // [11:2]
+constexpr Reg CpMaxContext        { 0, 0x1e4e };
+constexpr Reg CpRb0BaseHi         { 0, 0x1e51 };
+constexpr Reg CpRbWptrPollAddrLo  { 0, 0x1e8b };
+constexpr Reg CpRbWptrPollAddrHi  { 0, 0x1e8c };
+constexpr Reg CpRbDoorbellControl { 0, 0x1e8d };   // DOORBELL_OFFSET [27:2], DOORBELL_EN [30]
+constexpr Reg CpRbActive          { 0, 0x1f40 };
+constexpr Reg RlcCsibAddrLo       { 1, 0x0987 };
+constexpr Reg RlcCsibAddrHi       { 1, 0x0988 };
+constexpr Reg RlcCsibLength       { 1, 0x0989 };   // dwords
+constexpr uint32_t kCpRbDoorbellEn        = 1u << 30;
+constexpr uint32_t kCpRbDoorbellRangeMask = 0x00000ffc;
+// AMDGPU_NAVI10_DOORBELL_GFX_RING0 (0x08B) in 64-bit doorbell dwords, as
+// gfx_v12_0 sets ring->doorbell_index = doorbell_index.gfx_ring0 << 1.
+constexpr uint32_t kGfxDoorbellDword      = 0x08B * 2;
+constexpr uint32_t kGfxMaxHwContexts      = 8;          // gfx.config.max_hw_contexts
+
 } // namespace GfxReg
 
 #endif /* GfxRegs_hpp */
