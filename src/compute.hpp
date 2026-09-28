@@ -221,6 +221,7 @@ private:
 	// boot died in one of those, only that feature sits this boot out; the
 	// stages and the other features run. featureAllowed("gfx") etc.
 	char hungFeature[8] {};
+	bool pmCapPending { false };       // the last boot died inside a "pm: cap ..." step
 	bool featureAllowed(const char *name) const;
 	// Log the previous boot's trail (into `text`); true if that boot died
 	// in the middle of a step rather than ending the bring-up itself.
@@ -401,6 +402,8 @@ private:
 	void gfxPmSample(const char *tag);
 	bool gfxPmSoftLimits(uint32_t maxParam, uint32_t minParam, const char *what);
 	void gfxPmExperiment(uint32_t mask);
+	bool gfxPmRestoreAuto(const char *why);
+	void gfxPmRecoverCap();
 	bool gfxCsbInit();
 	bool gfxRingResume();
 	void gfxKick(uint64_t wptrDwords);

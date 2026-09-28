@@ -103,6 +103,16 @@ separate power-management work.
    had it, except that a failed restore of the soft max is logged as a
    WARNING (compute stays capped at 1000 MHz until the next boot).
 
+Boots 0-6 are not byte-for-byte unchanged in one respect: `rdna4-run sensors`
+now also takes two `GetMetricsTable` samples one second apart (about five
+`GetMetricsTable` messages per boot instead of one: idle baseline and post-bench,
+each with its extra pair, plus 1 s of sleep each), and each request first
+poisons `MetricsCounter` in the driver table. The messages are read-only SMU
+traffic; no boot-arg is needed for them. If a `pm: cap probe` or `pm: cap
+restore` step ever hangs, the following boot sends `SetSoftMaxByFreq(GFXCLK,
+0xffff)` once (trail `pm: cap recover`); do a cold power cycle if compute still
+looks capped at about 1000 MHz.
+
 ## Known risks
 
 VMIDs 8-15 use the GC-hub `GCVM_INVALIDATE_ENG17` MMIO path. On this card it

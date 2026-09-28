@@ -34,8 +34,8 @@ holds them and `tools/atomdump.cpp` checks them against a compiler-laid-out mirr
   `amdgpu_hdp_invalidate` (`amdgpu/amdgpu_hdp.c:70-76`) does nothing. The pool mapping is uncached
   (`compute.cpp` `mapPool`, `kIOMapInhibitCache`), so a stale table is the only case left, and the
   poison catches it. The kext posts `flushHdp()` before and after, like the rest of the bring-up.
-- **Two samples, one second apart**, then a verdict line: `FIRMWARE-HOLDS-CLOCK` (clock >= 2500 MHz
-  with activity < 10 %), `GFX-REALLY-BUSY` (activity >= 50 %), `no anomaly`, or `INCONCLUSIVE`
+- **Two samples, one second apart**, then a verdict line: `CLOCK-STEADY-AT-LOW-ACTIVITY` (clock within 10 % of the highest
+  clock this run saw, activity < 10 %; it cannot know the DPM maximum, so it is a prompt for the cap probe, not a finding), `GFX-REALLY-BUSY` (activity >= 50 %), `no anomaly`, or `INCONCLUSIVE`
   (counter not advancing).
 - **`sensors-idle`** is taken before any user-space selftest or bench; `sensors-pm` after them. The
   round-2 reading came from the sample *after* bench (`diagnostic-log.sh` ran bench, then sensors).
@@ -126,7 +126,7 @@ ramp say heavy switching activity recently existed. So, in order:
    spins on a flag by design in the hang tests), a client queue, the gfx ring. `GRBM_STATUS`/`CP_STAT` in the
    `pm:` lines say which block is busy.
 3. **The PMFW holds max GFXCLK until the driver hand-off (`SetWorkloadMask`, `NotifyPowerSource`, soft-limit
-   release) that we skip.** Verdict `FIRMWARE-HOLDS-CLOCK`: clock at max with activity ~0. The section 3
+   release) that we skip.** Verdict `CLOCK-STEADY-AT-LOW-ACTIVITY`: clock high with activity ~0. The section 3
    mask refusal means the PMFW is running its own defaults, which supports "no driver policy yet". *Test:*
    `rdna4-gfxpm=1` then `=2` then `=4` (the cap probe proves the clock can be lowered and shows what power
    does). If `=1` alone drops the clock, that is the answer.

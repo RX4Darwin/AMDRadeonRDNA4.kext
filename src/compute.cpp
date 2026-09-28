@@ -632,6 +632,9 @@ void RDNA4Compute::runStages() {
 			// A feature past the stages hung: the stages were fine, so only
 			// that feature is left out, once.
 			strlcpy(hungFeature, kFeatures[i], sizeof(hungFeature));
+			// A hang between the cap probe and its restore leaves the GFXCLK
+			// soft max at 1001 MHz in the SMU across a warm reboot.
+			pmCapPending = !strncmp(prev, "pm: cap", 7);
 			CLOG("the previous boot died during \"%s\": %s is off this boot, everything else runs "
 			     "(the next boot tries it again)", prev, hungFeature);
 			env.owner->setProperty("Compute,PreviousHang", prev);
@@ -710,6 +713,8 @@ void RDNA4Compute::runStages() {
 	}
 	// W19: the GFX power-management experiment, only when asked for. It runs
 	// while trails are still allowed and leaves its own "pm: ..." steps.
+	if (pmCapPending && done >= StageGfx)
+		gfxPmRecoverCap();
 	const uint32_t pmAsked = done >= StageGfx ? requestedGfxPm() : 0;
 	if (pmAsked && featureAllowed("pm")) {
 		if (!bringupStepAllowed("pm experiment")) return;
@@ -900,16 +905,19 @@ bool RDNA4Compute::readSensorsEx(RDNA4SensorsEx &out) {
 // ---------------------------------------------------------------------------
 //
 // r2-sensors-review.md: on the card, idle in Recovery, the SMU reports about
-// 300 W and 3.2 GHz on GFX. amdgpu sends three things after
+// 300 W and 3.2 GHz on GFX. amdgpu sends these after
 // EnableAllSmuFeatures that this kext never does: SetWorkloadMask (the boot-up
 // default profile, smu_bump_power_profile_mode, amdgpu_smu.c:2394-2417 ->
-// smu_v14_0_2_set_power_profile_mode, smu_v14_0_2_ppt.c:1824-1876), the
-// soft-limit release of the AUTO level (smu_v14_0_set_soft_freq_limited_range
-// with automatic set, smu_v14_0.c:1019-1050), and AllowGfxOff. The first two
-// are offered here, one bit each, and each is followed by a sampled readout so
-// the real-card log shows which one moves GFXCLK/activity/power. GFXOFF is
-// deliberately not offered: with MMIO, doorbell and queue access from this kext
-// it would power GFX down under us.
+// smu_v14_0_2_set_power_profile_mode, smu_v14_0_2_ppt.c:1824-1876), and
+// AllowGfxOff. (amdgpu writes no soft limits at the AUTO level, because
+// dpm_level == level, amdgpu_smu.c:2462; bit 2 below is an experiment beyond
+// amdgpu that writes what its automatic branch would,
+// smu_v14_0_set_soft_freq_limited_range, smu_v14_0.c:1019-1050.) SetWorkloadMask
+// also skips amdgpu's smu_v14_0_deep_sleep_control(true), which is fine: the DS
+// features already run under the PMFW's own set. Each bit is followed by a
+// sampled readout so the real-card log shows which one moves
+// GFXCLK/activity/power. GFXOFF is deliberately not offered: with MMIO,
+// doorbell and queue access from this kext it would power GFX down under us.
 //
 //   rdna4-gfxpm=8   sample only: log the metrics, change nothing
 //   rdna4-gfxpm=1   + SetWorkloadMask(WORKLOAD_PPLIB_DEFAULT_BIT)
@@ -952,6 +960,27 @@ bool RDNA4Compute::gfxPmSoftLimits(uint32_t maxParam, uint32_t minParam, const c
 	return rMax == kSmuRespOk && rMin == kSmuRespOk;
 }
 
+// The GFXCLK soft max back to automatic, once and then once more if refused.
+bool RDNA4Compute::gfxPmRestoreAuto(const char *why) {
+	for (int attempt = 1; attempt <= 2; attempt++) {
+		if (gfxPmSoftLimits(kPmSoftMaxAuto, kPmNoMin, why))
+			return true;
+		CLOG("pm: %s: restore attempt %d was refused", why, attempt);
+	}
+	return false;
+}
+
+// The previous boot died inside "pm: cap probe" or "pm: cap restore": the SMU
+// may still hold the 1001 MHz soft max (a warm reboot keeps it). Lift it once.
+void RDNA4Compute::gfxPmRecoverCap() {
+	trail("pm: cap recover");
+	if (gfxPmRestoreAuto("previous boot died in a cap step: GFXCLK soft max -> automatic"))
+		CLOG("pm: the GFXCLK soft max was lifted");
+	else
+		CLOG("pm: WARNING: the GFXCLK soft max could not be lifted; compute may stay limited to about "
+		     "1000 MHz until a cold power cycle");
+}
+
 void RDNA4Compute::gfxPmExperiment(uint32_t mask) {
 	CLOG("pm: rdna4-gfxpm=0x%x: %s%s%s%s", mask, (mask & kPmSampleOnly) ? "sample " : "",
 	     (mask & kPmWorkload) ? "workload " : "", (mask & kPmSoftAuto) ? "soft-limits-auto " : "",
@@ -988,11 +1017,12 @@ void RDNA4Compute::gfxPmExperiment(uint32_t mask) {
 		if (capped)
 			gfxPmSample("with GFXCLK soft max 1000 MHz");
 		trail("pm: cap restore");
-		if (gfxPmSoftLimits(kPmSoftMaxAuto, kPmNoMin, "probe: GFXCLK soft max -> automatic"))
+		if (gfxPmRestoreAuto("probe: GFXCLK soft max -> automatic"))
 			gfxPmSample("after the cap is lifted");
 		else
-			CLOG("pm: WARNING: the GFXCLK soft max could not be restored; compute is limited to 1000 MHz "
-			     "until the next boot");
+			CLOG("pm: WARNING: the GFXCLK soft max could not be restored (2 attempts); compute stays limited "
+			     "to about 1000 MHz, possibly across warm reboots (the next boot retries once); "
+			     "a cold power cycle clears it");
 	}
 	CLOG("pm: experiment finished");
 }

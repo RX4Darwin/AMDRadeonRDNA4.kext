@@ -588,6 +588,9 @@ struct RDNA4State {
     bool     gfx_hang;       /* accept gfx kicks but leave the ring stopped */
     uint32_t smu_gfx_soft_max;   /* SetSoftMaxByFreq(GFXCLK) in MHz, 0 = automatic */
     uint32_t smu_workload_mask;  /* last SetWorkloadMask */
+    uint32_t smu_refuse;         /* "smu-refuse": this SMU message answers CmdRejectedPrereq (0xfd) */
+    uint32_t smu_refuse_skip;    /* "smu-refuse-skip": ... but only after this many earlier sends of it */
+    uint32_t smu_refuse_seen;
     bool     smu_stale;      /* metrics transfer acks but the table is never rewritten */
     bool     warm_keep;      /* reset keeps live engines/queues, like warm card restart */
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
@@ -1585,6 +1588,13 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
     reg_set(s, REG_SMU_MSG, msg);
     if (!s->pmfw_loaded) {
         return;                                    /* no PMFW: RESP stays 0 */
+    }
+    /* PPSMC_Result_CmdRejectedPrereq, as the card answers under SCPM
+     * (SetAllowedMask on the real card, hw-logs): a fault option, off by default. */
+    if (s->smu_refuse && msg == s->smu_refuse && s->smu_refuse_seen++ >= s->smu_refuse_skip) {
+        fprintf(stderr, "rdna4: smu: message 0x%x refused with 0xfd (smu-refuse)\n", msg);
+        reg_set(s, REG_SMU_RESP, 0xfd);
+        return;
     }
     switch (msg) {
     case 0x1:                                      /* TestMessage */
@@ -6644,6 +6654,8 @@ static const Property rdna4_properties[] = {
                 bool),
     DEFINE_PROP_BOOL("gfx-hang", RDNA4State, gfx_hang, false),
     DEFINE_PROP_BOOL("smu-stale", RDNA4State, smu_stale, false),
+    DEFINE_PROP_UINT32("smu-refuse", RDNA4State, smu_refuse, 0),
+    DEFINE_PROP_UINT32("smu-refuse-skip", RDNA4State, smu_refuse_skip, 0),
     DEFINE_PROP_BOOL("warm-keep", RDNA4State, warm_keep, false),
     DEFINE_PROP_UINT32("gfx-break", RDNA4State, gfx_break, 0),
     DEFINE_PROP_BOOL("gfx-trace", RDNA4State, gfx_trace, false),

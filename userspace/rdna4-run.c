@@ -106,6 +106,12 @@ static void printSensorsPm(int n, const RDNA4SensorsEx *s) {
 	       any ? "" : " none", s->throttlingMask);
 }
 
+/* Two clocks in MHz within a quarter of each other (or 100 MHz). */
+static int near(uint32_t x, uint32_t y) {
+	const uint32_t hi = x > y ? x : y, lo = x > y ? y : x;
+	return hi - lo <= 100 || hi - lo <= hi / 4;
+}
+
 static int cmdSensorsPm(rdna4_t *gpu) {
 	RDNA4SensorsEx a, b;
 	kern_return_t kr = rdna4_sensors_ex(gpu, &a);
@@ -125,9 +131,42 @@ static int cmdSensorsPm(rdna4_t *gpu) {
 	                 b.metricsCounter != a.metricsCounter;
 	printf("sensors-pm: MetricsCounter %u -> %u: table %s\n", a.metricsCounter,
 	       b.metricsCounter, live ? "LIVE" : "NOT advancing (stale or SMU idle-gated)");
-	if (live && b.currGfxclkMHz >= 2500 && b.gfxActivity < 10)
-		printf("sensors-pm: verdict FIRMWARE-HOLDS-CLOCK (GFX %u MHz at %u %% activity)\n",
-		       b.currGfxclkMHz, b.gfxActivity);
+	/* The card's driver interface is 0x33, amdgpu's tables are 0x2E: trust the
+	 * new fields only if they look like what they should be. */
+	int plausible = 1;
+	const char *why = "";
+	const RDNA4SensorsEx *both[2] = { &a, &b };
+	for (int i = 0; i < 2; i++) {
+		const RDNA4SensorsEx *s = both[i];
+		if (s->gfxActivity > 100 || s->uclkActivity > 100) {
+			plausible = 0; why = "activity above 100 %";
+		} else if (s->vddGfxMv < 300 || s->vddGfxMv > 1400) {
+			plausible = 0; why = "VDD_GFX outside 300-1400 mV";
+		} else if (!near(s->currGfxclkMHz, s->avgGfxclkPreDsMHz) &&
+		           !near(s->currGfxclkMHz, s->avgGfxclkPostDsMHz)) {
+			plausible = 0; why = "CurrClock not near either average";
+		}
+	}
+	if (live) {
+		const uint32_t delta = b.metricsCounter - a.metricsCounter;   /* about 1000 per second */
+		if (delta < 10 || delta > 1000000) {
+			plausible = 0; why = "MetricsCounter delta not about 1 ms per tick";
+		}
+	}
+	/* "at max" is relative to the highest clock this run saw, not a constant. */
+	uint32_t maxSeen = 0;
+	for (int i = 0; i < 2; i++) {
+		const RDNA4SensorsEx *s = both[i];
+		if (s->currGfxclkMHz > maxSeen) maxSeen = s->currGfxclkMHz;
+		if (s->avgGfxclkPreDsMHz > maxSeen) maxSeen = s->avgGfxclkPreDsMHz;
+		if (s->avgGfxclkPostDsMHz > maxSeen) maxSeen = s->avgGfxclkPostDsMHz;
+	}
+	if (live && !plausible)
+		printf("sensors-pm: activity field implausible (%s): verdict INCONCLUSIVE, read the raw fields\n", why);
+	else if (live && maxSeen && b.currGfxclkMHz >= maxSeen - maxSeen / 10 && b.gfxActivity < 10)
+		printf("sensors-pm: verdict CLOCK-STEADY-AT-LOW-ACTIVITY (GFX %u MHz at %u %% activity; no second clock "
+		       "level was seen, so whether this is the DPM maximum needs the DPM range or the rdna4-gfxpm "
+		       "cap probe)\n", b.currGfxclkMHz, b.gfxActivity);
 	else if (live && b.gfxActivity >= 50)
 		printf("sensors-pm: verdict GFX-REALLY-BUSY (%u %% activity: look for a spinning queue)\n",
 		       b.gfxActivity);
