@@ -404,6 +404,7 @@ struct RDNA4State {
     uint8_t  *resv;           /* top RDNA4_RESV_SIZE bytes of VRAM */
     uint8_t  *hidden;         /* VRAM past the aperture: reserved, touched lazily */
     uint64_t hidden_size;
+    uint8_t  vm_fault_page[0x1000]; /* zeroed sink for non-retrying VM faults */
     uint8_t  edid[256];
     uint32_t edid_len;
     uint8_t  *discovery;      /* IP discovery binary from the flash image */
@@ -1664,12 +1665,13 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
     }
 fault:
     rdna4_vm_fault(s, vmid, va);
-    /* Retry is off: serve the configured dummy page so the queue can drain. */
-    uint64_t dummy = ((uint64_t)reg_get(s, REG_GCVM_FAULT_DEFAULT_LO) |
-                      ((uint64_t)reg_get(s, REG_GCVM_FAULT_DEFAULT_HI) << 32)) << 12;
-    int64_t off = rdna4_phys_to_vram(s, dummy);
-    if (off >= 0 && len <= 0x1000 && (va & 0xfff) + len <= 0x1000)
-        return rdna4_vram_span(s, off + (va & 0xfff), len);
+    /* Retry is off: serve a zeroed per-device sink so a fault drains the
+     * queue without exposing stale data from another VMID.  Clear it for
+     * every fault so writes to the sink are discarded before the next use. */
+    if (len <= 0x1000 && (va & 0xfff) + len <= 0x1000) {
+        memset(s->vm_fault_page, 0, sizeof(s->vm_fault_page));
+        return s->vm_fault_page + (va & 0xfff);
+    }
     return NULL;
 }
 
