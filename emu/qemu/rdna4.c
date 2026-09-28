@@ -436,6 +436,21 @@ static void rdna4_ih_emit(RDNA4State *s, uint8_t client, uint8_t source,
 static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so,
                              RDNA4Cursor *cursor);
 
+static bool rdna4_is_cursor_register(uint32_t d2)
+{
+    for (uint32_t hubp = 0; hubp < NUM_OTG; hubp++) {
+        const uint32_t hp = hubp * HUBP_STRIDE;
+        if (d2 == HUBP_CURSOR_SETTINGS + hp ||
+            (d2 >= HUBP_CURSOR_CONTROL + hp && d2 <= HUBP_CURSOR_DST_OFFSET + hp))
+            return true;
+        const uint32_t dpp = hubp * DPP_STRIDE;
+        if (d2 == CURSOR_CM_CONTROL + dpp ||
+            d2 == CURSOR_CM_SCALE_GY + dpp || d2 == CURSOR_CM_SCALE_RB + dpp)
+            return true;
+    }
+    return false;
+}
+
 struct RDNA4State {
     PCIDevice parent_obj;
 
@@ -2182,6 +2197,7 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
             fprintf(stderr, "rdna4: mec: SQ_CMD killed VMID-selected waves (0x%08x)\n", val);
     } else if (dw >= DMU_SEG2 && dw < DMU_SEG3) {
         uint32_t d2 = dw - DMU_SEG2;
+        const bool cursorWrite = rdna4_is_cursor_register(d2);
         if (d2 == DMCUB_INBOX1_WPTR) {
             rdna4_dmub_wptr(s, val);
         } else if (d2 >= HUBP_FLIP_INTERRUPT &&
@@ -2210,6 +2226,8 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         } else {
             reg_set(s, addr, val);
         }
+        if (cursorWrite && s->cursor_enabled)
+            dpy_gfx_update_full(s->con);
     } else {
         reg_set(s, addr, val);
     }
@@ -3879,8 +3897,8 @@ static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so, RDNA4Cursor 
     if (!width || !height || width > 64 || height > 64 || address < fb ||
         address - fb + (uint64_t)width * height * 4 > rdna4_vram_size()) {
         if (!s->cursor_reject_logged || s->trace)
-            fprintf(stderr, "rdna4: cursor: rejected size=%ux%u address=0x%llx fb=0x%llx\n",
-                    width, height, address, fb);
+            fprintf(stderr, "rdna4: cursor: rejected size=%ux%u address=0x%" PRIu64
+                    " fb=0x%" PRIu64 "\n", width, height, address, fb);
         s->cursor_reject_logged = true;
         return false;
     }
@@ -3897,8 +3915,9 @@ static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so, RDNA4Cursor 
     cursor->x = x - (int32_t)((hot >> 16) & 0xff);
     cursor->y = y - (int32_t)(hot & 0xff);
     s->cursor_reject_logged = false;
-    fprintf(stderr, "rdna4: cursor: plane HUBP%d addr=0x%llx size=%ux%u pos=%d,%d\n",
-            hubp, address, width, height, cursor->x, cursor->y);
+    fprintf(stderr, "rdna4: cursor: plane HUBP%d addr=0x%" PRIu64
+            " size=%ux%u pos=%d,%d\n", hubp, address, width, height,
+            cursor->x, cursor->y);
     return true;
 }
 
@@ -3963,9 +3982,9 @@ static void rdna4_gfx_update(void *opaque)
                                                      "rdna4: scanout surface not mapped");
             } else if (so.cursor.valid) {
                 ds = qemu_create_displaysurface(so.width, so.height);
-                for (int y = 0; y < (int)so.height; y++)
-                    memcpy(surface_data(ds) + (uint64_t)y * surface_stride(ds),
-                           scanout + (uint64_t)y * so.stride, so.width * 4);
+                for (int row = 0; row < (int)so.height; row++)
+                    memcpy(surface_data(ds) + (uint64_t)row * surface_stride(ds),
+                           scanout + (uint64_t)row * so.stride, so.width * 4);
                 rdna4_blend_cursor(s, &so, ds);
             } else {
                 ds = qemu_create_displaysurface_from(
@@ -3988,9 +4007,9 @@ static void rdna4_gfx_update(void *opaque)
         if (!scanout)
             return;
         ds = qemu_create_displaysurface(so.width, so.height);
-        for (int y = 0; y < (int)so.height; y++)
-            memcpy(surface_data(ds) + (uint64_t)y * surface_stride(ds),
-                   scanout + (uint64_t)y * so.stride, so.width * 4);
+        for (int row = 0; row < (int)so.height; row++)
+            memcpy(surface_data(ds) + (uint64_t)row * surface_stride(ds),
+                   scanout + (uint64_t)row * so.stride, so.width * 4);
         rdna4_blend_cursor(s, &so, ds);
         dpy_gfx_replace_surface(s->con, ds);
         dpy_gfx_update_full(s->con);
