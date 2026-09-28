@@ -420,9 +420,12 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       every result exact; VRAM copy 208 GB/s vs 34 GB/s CPU memcpy.
       Host->GPU 333 MB/s but GPU->host only 5 MB/s (CPU reads through the
       BAR) — the next bottleneck
-- [ ] DMA transfers (SDMA + AGP aperture + bounce buffer) and buffers in all
-      of VRAM: in the emulator, 25-45x faster transfers and 7.7 GiB of
-      buffers; next hardware run
+- [x] DMA transfers (SDMA + AGP aperture + bounce buffer) and buffers in all
+      of VRAM, on the real card (2026-09-28,
+      `docs/hw-logs/2026-09-28-recovery-dma-pass.txt`): raw SDMA 12.6/13.2
+      GB/s, end-to-end host->GPU 4.8 GB/s and GPU->host 3.8 GB/s (from
+      0.33 and 0.005), 7896 MiB of buffers; SGEMM n=4096 11.2 TFLOPS (27x
+      Accelerate), n=8192 10.4 TFLOPS in 105 ms (22x), all exact
 - [ ] Native mode setting (DCN 4.1.0) / multiple displays
 - [ ] Hardware cursor through the NDRV cursor path
 - [ ] Acceleration / Metal
