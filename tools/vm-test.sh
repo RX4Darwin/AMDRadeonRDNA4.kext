@@ -7,6 +7,8 @@
 #   tools/vm-test.sh [extra boot-args...]     e.g. tools/vm-test.sh rdna4-ih=1
 #   RDNA4_DEV=ih-dead=on,flip-stuck=on tools/vm-test.sh ...
 #   RDNA4_POST='...bash...' tools/vm-test.sh    extra steps on the same boot, under the lock
+#   RDNA4_STEP_MAX=600 tools/vm-test.sh     cap each guest step (default 1800 s); a
+#                                             guest panic stops the run at once
 #                                             emulated-card options (the rdna4
 #                                             device's fault switches), comma-separated
 #
@@ -110,11 +112,43 @@ for i in $(seq 1 200); do
 done
 grep -aE "RDNA4FB: (compute: (bring-up finished|stage [0-9])|runtime: user-space)|panic" \
 	~/tahoe-serial.log | tail -3
+# A guest that panics leaves an SSH session to it hanging forever (09:20: a
+# run sat 15 minutes on a panicked VM, holding the lock). So every step in
+# the guest runs under a watchdog: it is stopped as soon as the serial log
+# shows a panic, or after RDNA4_STEP_MAX seconds (default 1800).
+panicked() {    # panicked <what>: fail the run if the guest has panicked
+	grep -aqiE 'panic\(cpu' ~/tahoe-serial.log || return 0
+	echo "vm-test: the guest PANICKED during $1:"
+	grep -aiE 'panic\(cpu' ~/tahoe-serial.log | head -3 | cut -c1-200
+	exit 1
+}
+guarded() {     # guarded <what> <bash command>
+	local pid t=0
+	setsid bash -c "$2" 9>&- &
+	pid=$!
+	while kill -0 "$pid" 2>/dev/null; do
+		grep -aqiE 'panic\(cpu' ~/tahoe-serial.log &&
+			{ kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true; panicked "$1"; }
+		if [ "$t" -ge "${RDNA4_STEP_MAX:-1800}" ]; then
+			kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+			echo "vm-test: $1 timed out after ${t}s"
+			exit 1
+		fi
+		sleep 2; t=$((t + 2))
+	done
+	wait "$pid"
+}
+selftest_bench() {
+	$SSH 'cd /tmp; echo "== selftest"; echo 1234 | sudo -S ./rdna4-run selftest 16384 2>&1 | grep -v Password;
+	      echo "== bench small"; echo 1234 | sudo -S ./rdna4-run bench small 2>&1 | grep -v Password'
+}
+export SSH SSH_KEY REPO
+export -f selftest_bench
+panicked "the boot"
 for i in $(seq 1 30); do $SSH true 2>/dev/null && break; sleep 4; done
 scp -q -o StrictHostKeyChecking=no -i "$SSH_KEY" -P 10022 build/rdna4-run miguer@127.0.0.1:/tmp/ ||
 	{ echo "vm-test: scp failed"; exit 1; }
-$SSH 'cd /tmp; echo "== selftest"; echo 1234 | sudo -S ./rdna4-run selftest 16384 2>&1 | grep -v Password;
-      echo "== bench small"; echo 1234 | sudo -S ./rdna4-run bench small 2>&1 | grep -v Password'
+guarded "selftest/bench" selftest_bench
 echo "== emulator"
 grep -aE "rdna4: cs: (unsupported|LDS access|dispatch stopped|work-item ran|WMMA)|rdna4: .*(fault|not modelled)" \
 	~/emu-boot.out | head -10 || true
@@ -127,6 +161,6 @@ grep -aE "rdna4: cs: (unsupported|LDS access|dispatch stopped|work-item ran|WMMA
 #      RDNA4_POST='$SSH "echo 1234 | sudo -S /tmp/rdna4-run show 3"' tools/vm-test.sh
 if [ -n "${RDNA4_POST:-}" ]; then
 	echo "== post (RDNA4_POST)"
-	SSH="$SSH" SSH_KEY="$SSH_KEY" VM_SCP_PORT=10022 MONITOR="$HOME/tahoe-monitor.sock" REPO="$REPO" \
-		bash -c "$RDNA4_POST" 9>&-
+	export VM_SCP_PORT=10022 MONITOR="$HOME/tahoe-monitor.sock"
+	guarded "RDNA4_POST" "$RDNA4_POST"
 fi
