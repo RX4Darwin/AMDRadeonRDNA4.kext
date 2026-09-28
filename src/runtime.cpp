@@ -149,12 +149,16 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 		publishResult("runtime", "FAIL service attach");
 		return;
 	}
-	if (!svc->registerPowerManagement(env.pci)) {
-		RLOG("not published: power management registration failed");
-		svc->terminate();
-		svc->release();
-		publishResult("runtime", "FAIL power management registration");
-		return;
+	if (requestedPowerManagement()) {
+		if (!svc->registerPowerManagement(env.pci)) {
+			RLOG("not published: power management registration failed");
+			svc->terminate();
+			svc->release();
+			publishResult("runtime", "FAIL power management registration");
+			return;
+		}
+	} else {
+		RLOG("power management disabled (rdna4-pm=1 required)");
 	}
 	svc->registerService();
 	rtService = svc;             // the registry keeps it
@@ -874,7 +878,8 @@ IOReturn RDNA4Compute::rtSensors(const void *owner, RDNA4Sensors &out) {
 
 IOReturn RDNA4Compute::rtSleepTest(const void *owner, uint32_t phase) {
 	uint32_t enabled = 0;
-	if (!PE_parse_boot_argn("rdna4-sleeptest", &enabled, sizeof(enabled)) || !enabled)
+	if (!requestedPowerManagement() ||
+	    !PE_parse_boot_argn("rdna4-sleeptest", &enabled, sizeof(enabled)) || !enabled)
 		return kIOReturnUnsupported;
 	if (phase != 1 && phase != 2)
 		return kIOReturnBadArgument;

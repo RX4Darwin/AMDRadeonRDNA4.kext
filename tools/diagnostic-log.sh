@@ -2,7 +2,7 @@
 #
 # rdna4fb-diagnose.sh — collect the RDNA4FB log and run the bounded feature
 # batch. Run on the target hackintosh as: sudo bash diagnostic-log.sh
-# Output: rdna4fb-diag-<timestamp>.txt in the current directory.
+# Output: rdna4fb-diag-<timestamp>.txt next to this script.
 #
 # The script is also used by the VM dry run. Keep every user-space test
 # behind run_step(): Recovery has no timeout(1), and a GPU fence must never
@@ -12,7 +12,7 @@ set -u
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo (dmesg needs root)"; exit 1; }
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-OUT="rdna4fb-diag-$(date +%Y%m%d-%H%M%S).txt"
+OUT="$HERE/rdna4fb-diag-$(date +%Y%m%d-%H%M%S).txt"
 SUMMARY="/tmp/rdna4fb-summary.$$"
 STEP_PREFIX="/tmp/rdna4fb-step.$$"
 KLOG="/tmp/rdna4fb-dmesg.$$"
@@ -39,15 +39,18 @@ IH_MODE="$(arg_value ih)"
 VM_MODE="$(arg_value vm)"
 FLIP_MODE="$(arg_value flip)"
 GFX_MODE="$(arg_value gfx)"
-HANG_MODE="$(arg_value hang)"
+HANG_MODE=0
 SLEEPTEST_MODE="$(arg_value sleeptest)"
 case "$COMPUTE_STAGE" in ''|*[!0-9]*) COMPUTE_STAGE=0;; esac
 case "$IH_MODE" in ''|*[!0-9]*) IH_MODE=0;; esac
 case "$VM_MODE" in ''|*[!0-9]*) VM_MODE=0;; esac
 case "$FLIP_MODE" in ''|*[!0-9]*) FLIP_MODE=0;; esac
 case "$GFX_MODE" in ''|*[!0-9]*) GFX_MODE=0;; esac
-case "$HANG_MODE" in ''|*[!0-9]*) HANG_MODE=1;; esac
 case "$SLEEPTEST_MODE" in ''|*[!0-9]*) SLEEPTEST_MODE=0;; esac
+
+# Queue recovery is an explicit last step. It is never part of an ordinary
+# collection, even when rdna4-hang=1 is present in the boot arguments.
+[ "${1:-}" = hang ] && HANG_MODE=1
 
 # The emulator dry run can deliberately omit rdna4-vm (boot 1) while still
 # needing bounded VM-sized diagnostics. Keep VM_MODE tied to the boot arg so
@@ -64,35 +67,44 @@ fi
 
 section() { echo; echo "=== $1 ==="; }
 
-# Run one command with a hard wall-clock bound. Perl's alarm is available in
-# the Recovery image; the background watchdog is the fallback for a minimal
-# image without Perl. STEP_FILE remains available for classification.
+snapshot_logs() {
+	dmesg > "$KLOG" 2>&1
+	REG_RESULTS="$(ioreg -r -w0 -l -k 'RDNA4FB,Results' 2>/dev/null || true)"
+}
+
+# Run one command with a hard wall-clock bound. STEP_FILE remains available
+# for classification; the pure-shell watchdog works in the Recovery image.
 run_step() {
 	local label="$1"
 	shift
 	STEP_SEQ=$((STEP_SEQ + 1))
 	STEP_FILE="${STEP_PREFIX}-${STEP_SEQ}.txt"
+	TIMEOUT_FILE="${STEP_PREFIX}-${STEP_SEQ}.timeout"
+	rm -f "$TIMEOUT_FILE"
 	section "$label"
-	if command -v perl >/dev/null 2>&1; then
-		perl -e 'alarm shift; exec @ARGV' "$STEP_TIMEOUT" "$@" > "$STEP_FILE" 2>&1
-		STEP_RC=$?
-	else
-		"$@" > "$STEP_FILE" 2>&1 &
-		step_pid=$!
-		(
-			sleep "$STEP_TIMEOUT"
-			kill -TERM "$step_pid" 2>/dev/null || exit 0
+	# Flush Recovery's journal before every operation which may touch the GPU.
+	sync >/dev/null 2>&1 || true
+	# Recovery does not guarantee Perl. Keep the watchdog in the shell and
+	# use 137 as the unambiguous timeout result in the report.
+	"$@" > "$STEP_FILE" 2>&1 &
+	step_pid=$!
+	(
+		sleep "$STEP_TIMEOUT"
+		if kill -0 "$step_pid" 2>/dev/null; then
+			echo timeout > "$TIMEOUT_FILE"
+			kill -TERM "$step_pid" 2>/dev/null || true
 			sleep 2
 			kill -KILL "$step_pid" 2>/dev/null || true
-		) &
-		watchdog_pid=$!
-		wait "$step_pid"
-		STEP_RC=$?
-		kill "$watchdog_pid" 2>/dev/null || true
-		wait "$watchdog_pid" 2>/dev/null || true
-	fi
-	if [ "$STEP_RC" -eq 142 ] || [ "$STEP_RC" -eq 143 ]; then
-		echo "(timed out after ${STEP_TIMEOUT}s; continuing)" >> "$STEP_FILE"
+		fi
+	) &
+	watchdog_pid=$!
+	wait "$step_pid"
+	STEP_RC=$?
+	kill "$watchdog_pid" 2>/dev/null || true
+	wait "$watchdog_pid" 2>/dev/null || true
+	if [ -f "$TIMEOUT_FILE" ] || [ "$STEP_RC" -eq 137 ]; then
+		STEP_RC=137
+		echo "(TIMEOUT after ${STEP_TIMEOUT}s; continuing)" >> "$STEP_FILE"
 	fi
 	cat "$STEP_FILE"
 	return 0
@@ -111,19 +123,6 @@ registry_value() {
 		tail -1
 }
 
-record_registry() {
-	local feature="$1" value
-	value="$(registry_value "$feature")"
-	[ -n "$value" ] || return 1
-	case "$value" in
-		PASS*) record "$feature" PASS "${value#PASS }" ;;
-		FAIL*) record "$feature" FAIL "${value#FAIL }" ;;
-		SKIPPED*) record "$feature" SKIPPED "${value#SKIPPED }" ;;
-		*) return 1 ;;
-	esac
-	return 0
-}
-
 {
 	section "system"
 	sw_vers
@@ -134,7 +133,7 @@ record_registry() {
 	found=""
 	for a in off cmap lutbypass 8bpc noedid nosleep modedump hwcursor \
 	         curmode curtest dmubping dmubhist dmubver dmubcursor smuping \
-	         ihdump pspdump vbl trace compute ih vm flip gfx hang sleeptest; do
+	         ihdump pspdump vbl cursor pm trace compute ih vm flip gfx hang sleeptest; do
 		value="$(arg_value "$a")"
 		[ -n "$value" ] && found="$found rdna4-$a=$value"
 	done
@@ -210,6 +209,10 @@ record_registry() {
 	section "compute NVRAM trail (last step reached)"
 	TRAIL_VALUE="$(nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail 2>/dev/null || true)"
 	[ -n "$TRAIL_VALUE" ] && echo "$TRAIL_VALUE" || echo "(no trail in NVRAM)"
+
+	# Capture durable evidence before any user-space command or display/GPU
+	# exercise. Refresh it after the steps below for the final registry values.
+	snapshot_logs
 
 	RUNTIME_ACTIVE=0
 	RUNTIME_READY=0
@@ -342,9 +345,10 @@ record_registry() {
 		echo "(inactive — add rdna4-sleeptest=1 for the emulator/debug cycle)"
 	fi
 
-	dmesg > "$KLOG" 2>&1
+	# The property is the durable result channel; the dmesg copy is retained
+	# for diagnosis and as the fallback when the property is unavailable.
+	snapshot_logs
 	section "IORegistry: compact feature results"
-	REG_RESULTS="$(ioreg -r -w0 -l -k 'RDNA4FB,Results' 2>/dev/null || true)"
 	[ -n "$REG_RESULTS" ] && echo "$REG_RESULTS" || echo "(no RDNA4FB,Results property)"
 	section "dmesg: feature lines (IH, VM, GFX, flip, trails and hangs)"
 	grep -E 'RDNA4FB: (.*ih:|.*vm:|.*vmid|.*gfx:|.*flip:|.*trail|.*hang|.*PreviousHang)' "$KLOG" || \
@@ -356,7 +360,8 @@ record_registry() {
 		record runtime SKIPPED "compute stage < 6"
 	elif [ "$INFO_OK" -eq 1 ] && [ "$SELFTEST_RC" -eq 0 ] && \
 		[ "$BENCH_RC" -eq 0 ] && grep -q 'selftest: PASS' "$SELFTEST_FILE" && \
-		grep -q 'bench: PASS' "$BENCH_FILE"; then
+		grep -q 'bench: PASS' "$BENCH_FILE" && \
+		case "$(registry_value runtime)" in PASS*) true;; *) false;; esac; then
 		record runtime PASS "selftest + bench PASS"
 	else
 		record runtime FAIL "info/selftest/bench did not all pass"
@@ -394,33 +399,33 @@ record_registry() {
 
 	if [ "$VM_MODE" -eq 0 ]; then
 		record vm SKIPPED "rdna4-vm not enabled"
-	elif record_registry vm; then
-		:
 	elif [ "$SELFTEST_RC" -eq 0 ] && \
 		grep -q 'VM isolation: client B could not read client A' "$SELFTEST_FILE" && \
-		grep -q 'two VM clients dispatched concurrently' "$SELFTEST_FILE"; then
+		grep -q 'two VM clients dispatched concurrently' "$SELFTEST_FILE" && \
+		case "$(registry_value vm)" in PASS*) true;; *) false;; esac; then
 		record vm PASS "isolation + concurrent queues"
+	elif printf '%s\n' "$(registry_value vm)" | grep -q '^FAIL'; then
+		record vm FAIL "$(registry_value vm)"
 	else
-		record vm FAIL "GPUVM selftest did not pass"
+		record vm FAIL "GPUVM command and RDNA4FB,Results did not both pass"
 	fi
 
 	if [ "$IH_MODE" -eq 0 ]; then
 		record ih SKIPPED "rdna4-ih not enabled"
-	elif record_registry ih; then
-		:
 	elif ! grep -q 'RDNA4FB: compute:' "$KLOG"; then
 		record ih SKIPPED "kernel compute log unavailable"
-	elif grep -q 'RDNA4FB: .*ih: ring up:' "$KLOG"; then
-		ih_key="ring up"
-		grep -q 'RDNA4FB: .*ih: self-test:.*polling' "$KLOG" && ih_key="ring up; polling fallback"
-		record ih PASS "$ih_key"
+	elif grep -q 'RDNA4FB: ih: self-test:' "$KLOG" && \
+		grep -q 'RDNA4FB: ih: self-test totals:' "$KLOG" && \
+		case "$(registry_value ih)" in PASS*) true;; *) false;; esac; then
+		record ih PASS "$(registry_value ih | sed 's/^PASS //')"
 	else
-		record ih FAIL "IH did not reach ring up"
+		record ih FAIL "IH self-test and RDNA4FB,Results did not both pass"
 	fi
 
 	if [ "$IH_MODE" -lt 2 ]; then
 		record vblank SKIPPED "requires rdna4-ih=2"
-	elif [ "$VSYNC_RC" -eq 0 ] && grep -q 'vsync: 120 vblanks' "$VSYNC_FILE"; then
+	elif [ "$VSYNC_RC" -eq 0 ] && grep -q 'vsync: 120 vblanks' "$VSYNC_FILE" && \
+		case "$(registry_value vblank)" in PASS*) true;; *) false;; esac; then
 		vblank_key="$(grep 'vsync: 120 vblanks' "$VSYNC_FILE" | tail -1)"
 		record vblank PASS "$vblank_key"
 	else
@@ -429,26 +434,20 @@ record_registry() {
 
 	if [ "$GFX_MODE" -eq 0 ]; then
 		record gfx SKIPPED "rdna4-gfx not enabled"
-	elif record_registry gfx; then
-		:
 	elif grep -Eq 'RDNA4FB: .*gfx: .*failure|RDNA4FB: .*stage gfx ring.*failed|RDNA4FB: .*gfx ring.*off' "$KLOG"; then
 		record gfx FAIL "ring/draw path reported a failure"
-	elif grep -Eq 'RDNA4FB: .*gfx: .*THE TRIANGLE IS RIGHT.*8192 pixels' "$KLOG"; then
-		gfx_key="THE TRIANGLE IS RIGHT; 8192 pixels"
-		record gfx PASS "$gfx_key"
-	elif printf '%s\n' "$TRAIL_VALUE" | grep -q 'gfx draw right'; then
-		record gfx PASS "G3 trail: gfx draw right (dmesg wrapped)"
+	elif printf '%s\n' "$(registry_value gfx)" | grep -q '^PASS'; then
+		record gfx PASS "$(registry_value gfx | sed 's/^PASS //')"
 	elif grep -Eq 'RDNA4FB: .*gfx: .*ring|RDNA4FB: .*gfx: .*draw' "$KLOG"; then
-		record gfx FAIL "ring/draw present but triangle proof missing"
+		record gfx FAIL "gfx command result and RDNA4FB,Results did not both pass"
 	else
 		record gfx SKIPPED "feature skipped before ring test"
 	fi
 
 	if [ "$FLIP_MODE" -eq 0 ]; then
 		record flip SKIPPED "rdna4-flip not enabled"
-	elif record_registry flip; then
-		:
-	elif [ "$SHOW_RC" -eq 0 ] && grep -q 'show: desktop restored' "$SHOW_FILE"; then
+	elif [ "$SHOW_RC" -eq 0 ] && grep -q 'show: desktop restored' "$SHOW_FILE" && \
+		case "$(registry_value flip)" in PASS*) true;; *) false;; esac; then
 		flip_key="show restored desktop"
 		grep -q 'RDNA4FB: .*flip:' "$KLOG" && flip_key="show restored desktop; kernel flip lines"
 		record flip PASS "$flip_key"
@@ -460,9 +459,10 @@ record_registry() {
 		record anim SKIPPED "flip/runtime not enabled"
 	elif [ -z "$ANIM_FILE" ]; then
 		record anim SKIPPED "command unavailable"
-	elif [ "$ANIM_RC" -eq 0 ]; then
+	elif [ "$ANIM_RC" -eq 0 ] && grep -q 'anim: frames rendered' "$ANIM_FILE" && \
+		grep -q 'anim: desktop restored' "$ANIM_FILE"; then
 		anim_key="frames rendered"
-		grep -q 'anim: desktop restored' "$ANIM_FILE" && anim_key="$(grep 'anim: frames rendered' "$ANIM_FILE" | tail -1); desktop restored"
+		anim_key="$(grep 'anim: frames rendered' "$ANIM_FILE" | tail -1); desktop restored"
 		record anim PASS "$anim_key"
 	else
 		record anim FAIL "animation command failed"

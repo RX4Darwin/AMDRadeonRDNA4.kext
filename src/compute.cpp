@@ -118,6 +118,11 @@ bool RDNA4Compute::requestedVm() {
 	return PE_parse_boot_argn("rdna4-vm", &enabled, sizeof(enabled)) && enabled != 0;
 }
 
+bool RDNA4Compute::requestedPowerManagement() {
+	uint32_t enabled = 0;
+	return PE_parse_boot_argn("rdna4-pm", &enabled, sizeof(enabled)) && enabled != 0;
+}
+
 uint32_t RDNA4Compute::rd(uint16_t hwId, const Reg &r) const {
 	uint32_t off;
 	if (!env.mmio || !env.disc || !env.disc->regByteOffset(hwId, 0, r.seg, r.dword, off) ||
@@ -402,8 +407,8 @@ void RDNA4Compute::choosePool() {
 
 uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 	env = e;
-	uint32_t hang = 1;
-	hangRecoveryEnabled = !PE_parse_boot_argn("rdna4-hang", &hang, sizeof(hang)) || hang != 0;
+	uint32_t hang = 0;
+	hangRecoveryEnabled = PE_parse_boot_argn("rdna4-hang", &hang, sizeof(hang)) && hang != 0;
 	CLOG("queue hang recovery %s (rdna4-hang=%u)", hangRecoveryEnabled ? "enabled" : "disabled", hang);
 	vmEnabled = requestedVm();
 	if (stage == StageOff)
@@ -546,7 +551,7 @@ void RDNA4Compute::runStages() {
 	bool hung = logPreviousTrail(prev, sizeof(prev));
 	uint32_t done = StageSurvey;
 	char note[96];
-	static const char *const kFeatures[] = { "gfx", "ih", "vm", "flip", "rt" };
+	static const char *const kFeatures[] = { "gfx", "ih", "vm", "flip" };
 	for (size_t i = 0; hung && i < sizeof(kFeatures) / sizeof(kFeatures[0]); i++) {
 		const size_t n = strlen(kFeatures[i]);
 		if (!strncmp(prev, kFeatures[i], n) && prev[n] == ':') {
@@ -625,15 +630,6 @@ void RDNA4Compute::runStages() {
 	// in the trail, so the trail's normal ending comes after them.
 	if (done >= StageDispatch)
 		publishRuntime(done);
-	if (done >= StageDispatch) {
-		RDNA4Sensors sensors {};
-		if (readSensors(sensors))
-			CLOG("sensors: edge %u C hotspot %u C GFX %u MHz memory %u MHz socket %u W fan %u RPM",
-			     sensors.edgeTempC, sensors.hotspotTempC, sensors.gfxClockMHz,
-			     sensors.memoryClockMHz, sensors.socketPowerW, sensors.fanRpm);
-		else
-			CLOG("sensors: SMU metrics table unavailable");
-	}
 	// W5: the page-flip test, once the runtime's DMA and device heap exist.
 	if (done >= StageKernel && featureAllowed("flip"))
 		Flip::run(*this);
@@ -719,7 +715,9 @@ bool RDNA4Compute::readSensors(RDNA4Sensors &out) {
 	if (!poolCpu || kSmuTableOffset + 0x1000 > pool.size)
 		return false;
 	uint32_t ret = 0;
-	if (smuSend(kSmuMsgGetMetricsTable, 0, ret, 100) != kSmuRespOk)
+	// TABLE_SMU_METRICS is table 5 in smu14_driver_if_v14_0.h. Table 0 is
+	// PPTABLE and is not the telemetry transfer requested by this reader.
+	if (smuSend(kSmuMsgGetMetricsTable, 5, ret, 100) != kSmuRespOk)
 		return false;
 	/* smu14_driver_if_v14_0.h, SmuMetrics_t: CurrClock[11], the average
 	 * clocks, then MetricsCounter, voltage/current arrays, power, temperatures,
@@ -1751,7 +1749,7 @@ bool RDNA4Compute::queueWriteTest(const char *tag, const Launch *l) {
 
 bool RDNA4Compute::recoverComputeQueue(const char *tag, const Launch *l) {
 	if (!hangRecoveryEnabled) {
-		CLOG("%s: queue recovery disabled by rdna4-hang=0", tag);
+		CLOG("%s: queue recovery disabled; rdna4-hang=1 is required", tag);
 		return false;
 	}
 	const bool client = l && l->queue;

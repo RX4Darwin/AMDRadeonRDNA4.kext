@@ -1464,8 +1464,14 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
     case 0xf:                                      /* SetDriverDramAddrLow */
         s->smu_table_mc = (s->smu_table_mc & 0xffffffff00000000ull) | param;
         break;
-    case 0x12: {                                   /* TransferTableSmu2Dram / GetMetricsTable */
-        /* smu14_driver_if_v14_0.h: fixed values make emulator telemetry
+	case 0x12: {                                   /* TransferTableSmu2Dram / GetMetricsTable */
+		/* TABLE_SMU_METRICS is id 5 in smu14_driver_if_v14_0.h. */
+		if (param != 5) {
+			fprintf(stderr, "rdna4: smu: metrics request table %u rejected (want 5)\n", param);
+			resp = SMU_RESP_UNKNOWN;
+			break;
+		}
+		/* smu14_driver_if_v14_0.h: fixed values make emulator telemetry
          * obvious in logs and tests. */
         uint8_t *table = rdna4_mc_span(s, s->smu_table_mc, 4096);
         if (!table) {

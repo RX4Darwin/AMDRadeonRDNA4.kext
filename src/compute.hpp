@@ -118,6 +118,7 @@ public:
 	// rdna4-compute=<stage>, clamped to StageKernel. 0 when absent.
 	static uint32_t requestedStage();
 	static bool requestedVm();
+	static bool requestedPowerManagement();
 
 	// Run the survey now and, for stage >= 2, start the bring-up thread.
 	// Returns the last stage completed inline.
@@ -520,7 +521,7 @@ private:
 	bool           powerSleeping { false };
 	bool           resumed { false };
 	bool           resumePending { false };
-	bool           hangRecoveryEnabled { true }; // rdna4-hang=0 keeps the old wedge
+	bool           hangRecoveryEnabled { false }; // opt in with rdna4-hang=1
 	uint32_t       rtStage { 0 };
 	bool           vmEnabled { false };
 	bool           vmidUsed[16] {};
