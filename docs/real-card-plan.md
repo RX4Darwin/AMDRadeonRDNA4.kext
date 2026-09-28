@@ -66,6 +66,18 @@ selectors are not read by this branch yet, so do not add them to a real-card
 boot until W14/W12 are merged; the current G3 slot above is the active
 triangle acceptance.
 
+## Known risks
+
+On this card, GC-hub TLB invalidation through the MMIO
+`GCVM_INVALIDATE_ENG17` path may never acknowledge. The emulator reproduces
+that condition with `RDNA4_DEV=inv-noack=on`. In the VM or on hardware, the
+expected diagnostic line is `vmid N: VM invalidate timeout`; this is an
+expected VM FAIL result, not a crash. Compute remains up and per-client GPUVM
+turns off, while the rest of the batch continues. The compact
+`RDNA4FB,Results` property records `vm = FAIL invalidate timeout` even if the
+dmesg buffer wrapped. The fix path is in-ring invalidation on the gfx/compute
+ring, planned by W12 D1.
+
 If a boot freezes before the summary is written, power-cycle into the USB
 Recovery environment and run the script with the same arguments. The last
 NVRAM trail identifies the risky step. On the next boot the matching feature

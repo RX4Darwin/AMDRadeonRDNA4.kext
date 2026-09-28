@@ -16,6 +16,7 @@ OUT="rdna4fb-diag-$(date +%Y%m%d-%H%M%S).txt"
 SUMMARY="/tmp/rdna4fb-summary.$$"
 STEP_PREFIX="/tmp/rdna4fb-step.$$"
 KLOG="/tmp/rdna4fb-dmesg.$$"
+REG_RESULTS=""
 STEP_TIMEOUT=120
 STEP_SEQ=0
 : > "$SUMMARY"
@@ -86,6 +87,25 @@ run_step() {
 
 record() {
 	printf "%-12s %-8s %s\n" "$1" "$2" "$3" >> "$SUMMARY"
+}
+
+registry_value() {
+	printf '%s\n' "$REG_RESULTS" |
+		sed -n -E "s/.*\"$1\"[[:space:]]*=[[:space:]]*\"([^\"]*)\".*/\1/p" |
+		tail -1
+}
+
+record_registry() {
+	local feature="$1" value
+	value="$(registry_value "$feature")"
+	[ -n "$value" ] || return 1
+	case "$value" in
+		PASS*) record "$feature" PASS "${value#PASS }" ;;
+		FAIL*) record "$feature" FAIL "${value#FAIL }" ;;
+		SKIPPED*) record "$feature" SKIPPED "${value#SKIPPED }" ;;
+		*) return 1 ;;
+	esac
+	return 0
 }
 
 {
@@ -297,6 +317,9 @@ record() {
 	fi
 
 	dmesg > "$KLOG" 2>&1
+	section "IORegistry: compact feature results"
+	REG_RESULTS="$(ioreg -r -w0 -l -k 'RDNA4FB,Results' 2>/dev/null || true)"
+	[ -n "$REG_RESULTS" ] && echo "$REG_RESULTS" || echo "(no RDNA4FB,Results property)"
 	section "dmesg: feature lines (IH, VM, GFX, flip, trails and hangs)"
 	grep -E 'RDNA4FB: (.*ih:|.*vm:|.*vmid|.*gfx:|.*flip:|.*trail|.*hang|.*PreviousHang)' "$KLOG" || \
 		echo "(no feature-specific lines)"
@@ -341,6 +364,8 @@ record() {
 
 	if [ "$VM_MODE" -eq 0 ]; then
 		record vm SKIPPED "rdna4-vm not enabled"
+	elif record_registry vm; then
+		:
 	elif [ "$SELFTEST_RC" -eq 0 ] && \
 		grep -q 'VM isolation: client B could not read client A' "$SELFTEST_FILE" && \
 		grep -q 'two VM clients dispatched concurrently' "$SELFTEST_FILE"; then
@@ -351,6 +376,8 @@ record() {
 
 	if [ "$IH_MODE" -eq 0 ]; then
 		record ih SKIPPED "rdna4-ih not enabled"
+	elif record_registry ih; then
+		:
 	elif ! grep -q 'RDNA4FB: compute:' "$KLOG"; then
 		record ih SKIPPED "kernel compute log unavailable"
 	elif grep -q 'RDNA4FB: .*ih: ring up:' "$KLOG"; then
@@ -372,6 +399,8 @@ record() {
 
 	if [ "$GFX_MODE" -eq 0 ]; then
 		record gfx SKIPPED "rdna4-gfx not enabled"
+	elif record_registry gfx; then
+		:
 	elif grep -Eq 'RDNA4FB: .*gfx: .*failure|RDNA4FB: .*stage gfx ring.*failed|RDNA4FB: .*gfx ring.*off' "$KLOG"; then
 		record gfx FAIL "ring/draw path reported a failure"
 	elif grep -Eq 'RDNA4FB: .*gfx: .*THE TRIANGLE IS RIGHT.*8192 pixels' "$KLOG"; then
@@ -387,6 +416,8 @@ record() {
 
 	if [ "$FLIP_MODE" -eq 0 ]; then
 		record flip SKIPPED "rdna4-flip not enabled"
+	elif record_registry flip; then
+		:
 	elif [ "$SHOW_RC" -eq 0 ] && grep -q 'show: desktop restored' "$SHOW_FILE"; then
 		flip_key="show restored desktop"
 		grep -q 'RDNA4FB: .*flip:' "$KLOG" && flip_key="show restored desktop; kernel flip lines"

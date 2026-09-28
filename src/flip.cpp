@@ -268,10 +268,12 @@ bool run(RDNA4Compute &compute) {
 		return true;
 	if (mode > 2) {
 		FLOG("invalid mode %u; feature disabled", mode);
+		compute.publishResult("flip", "FAIL invalid mode");
 		return true;
 	}
 	if (!compute.dmaReady || !compute.devHeap.size() || !compute.rtLock) {
 		FLOG("skip: SDMA/device heap unavailable");
+		compute.publishResult("flip", "SKIPPED SDMA/device heap unavailable");
 		return true;
 	}
 
@@ -279,6 +281,8 @@ bool run(RDNA4Compute &compute) {
 	IOLockLock(compute.rtLock);
 	const bool found = findPipe(compute, surface);
 	IOLockUnlock(compute.rtLock);
+	if (!found)
+		compute.publishResult("flip", "SKIPPED no running display pipe");
 	if (!found)
 		return true;
 	const uint64_t bytes = surfaceBytes(surface.pitch, surface.height);
@@ -289,6 +293,7 @@ bool run(RDNA4Compute &compute) {
 	IOLockUnlock(compute.rtLock);
 	if (!allocated) {
 		FLOG("skip: device heap allocation of %llu bytes failed", bytes);
+		compute.publishResult("flip", "FAIL device heap allocation");
 		return true;
 	}
 	const uint64_t buffer = compute.vramMc(bufferOffset);
@@ -369,6 +374,7 @@ bool run(RDNA4Compute &compute) {
 		FLOG("failure: device heap free of offset 0x%llx failed", bufferOffset);
 	else
 		FLOG("free: device heap offset 0x%llx", bufferOffset);
+	compute.publishResult("flip", ok ? "PASS boot flip restored desktop" : "FAIL boot flip");
 	return ok;
 }
 

@@ -110,6 +110,7 @@ IOReturn userCopy(task_t task, mach_vm_address_t user, void *kernel, uint64_t le
 void RDNA4Compute::publishRuntime(uint32_t stage) {
 	if (!initRuntimeHeap()) {
 		RLOG("not published: %s", !rtLock ? "no lock" : "no room for a heap in the pool");
+		publishResult("runtime", "FAIL runtime heap");
 		return;
 	}
 	IOLockLock(rtLock);
@@ -126,6 +127,7 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 			powerSleeping = false;
 		}
 		RLOG("user-space runtime up again: %s", RDNA4_COMPUTE_SERVICE);
+		publishResult("runtime", "PASS service ready");
 		return;
 	}
 
@@ -133,6 +135,7 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 	if (!svc || !svc->init()) {
 		OSSafeReleaseNULL(svc);
 		RLOG("not published: could not create the service");
+		publishResult("runtime", "FAIL service allocation");
 		return;
 	}
 	svc->compute = this;
@@ -143,12 +146,14 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 	if (!svc->attach(env.pci)) {
 		svc->release();
 		RLOG("not published: could not attach to the GPU");
+		publishResult("runtime", "FAIL service attach");
 		return;
 	}
 	if (!svc->registerPowerManagement(env.pci)) {
 		RLOG("not published: power management registration failed");
 		svc->terminate();
 		svc->release();
+		publishResult("runtime", "FAIL power management registration");
 		return;
 	}
 	svc->registerService();
@@ -160,6 +165,7 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 	else
 		RLOG("user-space runtime up: %s, CPU transfers, heap %llu MiB at MC 0x%llx",
 		     RDNA4_COMPUTE_SERVICE, heap.size() >> 20, poolMc(kHeapOffset));
+	publishResult("runtime", "PASS service ready");
 	if (!initPresentationTimer())
 		RLOG("present async disabled: no runtime work-loop timer");
 }
@@ -381,6 +387,7 @@ bool RDNA4Compute::vmInvalidate(uint32_t vmid, const char *tag) {
 	}
 	RLOG("vmid %u: VM invalidate timeout (%s), REQ 0x%08x ACK 0x%08x", vmid, tag,
 	     rdGc(req), rdGc(ack));
+	publishResult("vm", "FAIL invalidate timeout");
 	return false;
 }
 
@@ -421,8 +428,10 @@ void RDNA4Compute::retireIbFences(RtClient &c) {
 /* Boot-time proof of one translated MEC queue.  User clients never enter this
  * path: it runs before the runtime service is published. */
 bool RDNA4Compute::vmBootSelfTest() {
-	if (!initRuntimeHeap())
+	if (!initRuntimeHeap()) {
+		publishResult("vm", "FAIL runtime heap");
 		return false;
+	}
 	RtClient c {};
 	const uint32_t vmid = 8, pipe = 0, queue = 1, doorbell = 0x1a;
 	const uint32_t qoff = kVmQueueBase;
@@ -518,7 +527,12 @@ bool RDNA4Compute::vmBootSelfTest() {
 	}
 	IOFree(c.tableShadow, kVmTableBytes);
 	devHeap.free(table);
-	return context && hqd && fence && inactive && flushed;
+	const bool ok = context && hqd && fence && inactive && flushed;
+	if (ok)
+		publishResult("vm", "PASS boot self-test");
+	else if (flushed)
+		publishResult("vm", "FAIL boot self-test");
+	return ok;
 }
 
 void RDNA4Compute::logClientFault(RtClient &c, const char *tag) {
