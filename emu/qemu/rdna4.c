@@ -2483,13 +2483,13 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             int64_t off = ((int32_t)(dw1 << 8)) >> 8;       /* signed 24-bit */
             uint64_t addr = (l->s[sbase] | ((uint64_t)l->s[sbase + 1] << 32)) + off +
                             (soff != 0x7c ? l->s[soff & 0x7f] : 0);
-            uint8_t *m;
+            uint8_t io[64];
             if (!count || sdata + count > 106 ||
-                !(m = rdna4_gc_span_vmid(s, addr, 4 * count, vmid, false, false))) {
+                !rdna4_vm_access(s, addr, io, 4 * count, vmid, false, false)) {
                 goto unknown;
             }
             for (uint32_t i = 0; i < count; i++) {
-                l->s[sdata + i] = ldl_le_p(m + 4 * i);
+                l->s[sdata + i] = ldl_le_p(io + 4 * i);
             }
             n = 2;
         } else if ((dw >> 26) == 0x36) {                    /* DS (LDS) */
