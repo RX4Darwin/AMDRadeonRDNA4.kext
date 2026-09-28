@@ -794,22 +794,57 @@ bool RDNA4Compute::stageGfx() {
 		return false;
 	}
 
-	// 3. gfx_v12_0_wait_for_rlc_autoload_complete: CP idle and the RLC
+	// 3. amdgpu's smu_hw_init runs here, before the GFX block waits: on this
+	//    dGPU nothing else releases the IMU (IMU_CORE_CTRL 0x9 = CRESET |
+	//    DRESET, seen on the card with the autoload armed and no SMU setup).
+	//    First offer every feature except those that retune memory, fabric
+	//    or display clocks under the GOP's live scanout, and GFXOFF (it would
+	//    power GFX down under us); widen only if GFX does not come up.
+	CLOG("gfx: after AUTOLOAD_RLC: IMU core 0x%08x, GFX reset 0x%08x", rdGc(ImuCoreCtrl),
+	     rdGc(ImuGfxResetCtrl));
+	static const uint32_t kHeldBack[] = { kSmuFeatDpmUclk, kSmuFeatDpmFclk, kSmuFeatDpmDcn,
+	                                      kSmuFeatVmempScaling, kSmuFeatVddioMemScaling,
+	                                      kSmuFeatDsFclk, kSmuFeatDsDcfclk, kSmuFeatDsUclk,
+	                                      kSmuFeatGfxoff, kSmuFeatDfCstate, kSmuFeatAthubMmhubPg };
+	uint64_t displaySafe = ~0ull;
+	for (uint32_t bit : kHeldBack)
+		displaySafe &= ~(1ull << bit);
+	trail("s3: SMU features (display-safe mask)");
+	uint64_t running = smuEnableFeatures(displaySafe, 0);
+	put("SmuFeatures", running);
+
+	// 4. gfx_v12_0_wait_for_rlc_autoload_complete: CP idle and the RLC
 	//    reports its bootload complete.
 	trail("s3: wait for RLC bootload");
 	uint32_t cpStat = kBad, boot = kBad;
-	bool complete = false;
-	for (uint32_t ms = 0; ms < 2000 && !complete; ms++) {
-		cpStat = rdGc(CpStat);
-		boot = rdGc(RlcBootloadStatus);
-		complete = cpStat == 0 && boot != kBad && (boot & kRlcBootComplete);
-		if (!complete)
-			IOSleep(1);
+	bool complete = waitRlcAutoload(2000, cpStat, boot);
+	if (!complete) {
+		// The GFX power domain alone (amdgpu's enable_gfx_features, proven
+		// on 14.0.2; this card's MP1 is 14.0.3), then every feature.
+		CLOG("gfx: not up with the display-safe features; IMU core 0x%08x, GFX reset 0x%08x",
+		     rdGc(ImuCoreCtrl), rdGc(ImuGfxResetCtrl));
+		trail("s3: SMU EnableAllSmuFeatures(GFX)");
+		uint32_t ret = 0;
+		CLOG("gfx: EnableAllSmuFeatures(PWR_GFX) -> 0x%02x",
+		     smuSend(kSmuMsgEnableAllFeatures, kSmuPwrDomainGfx, ret, 2000));
+		complete = waitRlcAutoload(1000, cpStat, boot);
+	}
+	if (!complete) {
+		trail("s3: SMU features (full mask, fallback)");
+		running = smuEnableFeatures(~0ull, 0);
+		put("SmuFeatures", running);
+		complete = waitRlcAutoload(2000, cpStat, boot);
 	}
 	put("CP_STAT", cpStat);
 	put("RLC_BOOTLOAD_STATUS", boot);
 	if (!complete) {
 		CLOG("gfx: RLC autoload did not complete (CP_STAT 0x%08x, bootload 0x%08x)", cpStat, boot);
+		// How far GFX got: IMU out of reset? GFX domains released? RLC on?
+		CLOG("gfx: IMU core 0x%08x, GFX reset 0x%08x, RLC_CNTL 0x%08x, RLC_STAT 0x%08x, GRBM 0x%08x",
+		     rdGc(ImuCoreCtrl), rdGc(ImuGfxResetCtrl), rdGc(RlcCntl), rdGc(RlcStat),
+		     rdGc(GrbmStatus));
+		put("IMU_CORE_CTRL", rdGc(ImuCoreCtrl));
+		put("IMU_GFX_RESET_CTRL", rdGc(ImuGfxResetCtrl));
 		publish();
 		return false;
 	}
@@ -842,6 +877,64 @@ bool RDNA4Compute::stageGfx() {
 	publish();
 	return true;
 #endif
+}
+
+bool RDNA4Compute::waitRlcAutoload(uint32_t ms, uint32_t &cpStat, uint32_t &boot) {
+	for (uint32_t t = 0; t < ms; t++) {
+		cpStat = rdGc(CpStat);
+		boot = rdGc(RlcBootloadStatus);
+		if (cpStat == 0 && boot != kBad && (boot & kRlcBootComplete))
+			return true;
+		IOSleep(1);
+	}
+	return false;
+}
+
+// smu_smc_hw_setup's messages up to system_features_control (smu_v14_0_2):
+// driver table location, RunDcBtc, the allowed mask (refused with SCPM on:
+// the PMFW then runs the pptable's own feature set), EnableAllSmuFeatures.
+uint64_t RDNA4Compute::smuEnableFeatures(uint64_t allowed, uint32_t domain) {
+	uint32_t ret = 0, resp;
+	auto running = [this]() -> uint64_t {
+		uint32_t lo = 0, hi = 0;
+		if (smuSend(kSmuMsgGetRunningFeaturesLow, 0, lo, 100) != kSmuRespOk ||
+		    smuSend(kSmuMsgGetRunningFeaturesHigh, 0, hi, 100) != kSmuRespOk)
+			return 0;
+		return lo | (static_cast<uint64_t>(hi) << 32);
+	};
+
+	resp = smuSend(kSmuMsgGetDriverIfVersion, 0, ret, 100);
+	CLOG("smu: driver interface version 0x%x (resp 0x%02x; amdgpu expects 0x2e)", ret, resp);
+	CLOG("smu: running features before: 0x%016llx", running());
+
+	const uint64_t table = poolMc(kSmuTableOffset);
+	for (uint32_t off = 0; off < 0x10000; off += 4)
+		*poolDw(kSmuTableOffset + off) = 0;
+	flushHdp();
+	const uint32_t rh = smuSend(kSmuMsgSetDriverDramAddrHigh, static_cast<uint32_t>(table >> 32), ret, 100);
+	const uint32_t rl = smuSend(kSmuMsgSetDriverDramAddrLow, static_cast<uint32_t>(table), ret, 100);
+	CLOG("smu: driver table at MC 0x%llx (resp 0x%02x/0x%02x)", table, rh, rl);
+
+	resp = smuSend(kSmuMsgRunDcBtc, 0, ret, 2000);
+	CLOG("smu: RunDcBtc -> 0x%02x", resp);
+
+	const uint32_t mh = smuSend(kSmuMsgSetAllowedMaskHigh, static_cast<uint32_t>(allowed >> 32), ret, 100);
+	const uint32_t ml = smuSend(kSmuMsgSetAllowedMaskLow, static_cast<uint32_t>(allowed), ret, 100);
+	CLOG("smu: allowed features 0x%016llx -> 0x%02x/0x%02x%s", allowed, mh, ml,
+	     mh == kSmuRespRejectedPrereq ? " (refused: SCPM, the pptable decides)" : "");
+
+	resp = smuSend(kSmuMsgEnableAllFeatures, domain, ret, 2000);
+	CLOG("smu: EnableAllSmuFeatures(%u) -> 0x%02x", domain, resp);
+	// GFXOFF stays disallowed (amdgpu's initial gfx_off_req_count is 1).
+	resp = smuSend(kSmuMsgDisallowGfxOff, 0, ret, 100);
+
+	const uint64_t now = running();
+	auto on = [now](uint32_t bit) { return (now >> bit) & 1 ? "on" : "off"; };
+	CLOG("smu: running features after: 0x%016llx — GFX_IMU %s, GFXCLK DPM %s, UCLK DPM %s, "
+	     "FCLK DPM %s, DCN DPM %s, GFXOFF %s, FW_CTF %s, fan %s (DisallowGfxOff 0x%02x)", now,
+	     on(kSmuFeatGfxImu), on(kSmuFeatDpmGfxclk), on(kSmuFeatDpmUclk), on(kSmuFeatDpmFclk),
+	     on(kSmuFeatDpmDcn), on(kSmuFeatGfxoff), on(kSmuFeatFwCtf), on(kSmuFeatFanControl), resp);
+	return now;
 }
 
 // ---------------------------------------------------------------------------

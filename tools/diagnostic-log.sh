@@ -23,8 +23,12 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="rdna4fb-diag-$(date +%Y%m%d-%H%M%S).txt"
 
-# Active rdna4-* boot-args (space-padded for whole-token matching).
-BOOTARGS=" $(nvram boot-args 2>/dev/null | cut -f2- | tr -s '[:space:]' ' ') "
+# Active rdna4-* boot-args (space-padded for whole-token matching). The
+# kernel's own copy first: `nvram boot-args` has come back empty in the
+# recovery environment (2026-09-28) while the kernel had them.
+ARGS="$(sysctl -n kern.bootargs 2>/dev/null)"
+[ -n "$ARGS" ] || ARGS="$(nvram boot-args 2>/dev/null | cut -f2-)"
+BOOTARGS=" $(echo "$ARGS" | tr -s '[:space:]' ' ') "
 have_arg() { case "$BOOTARGS" in *" rdna4-$1=1 "*) return 0;; *) return 1;; esac; }
 
 section() { echo; echo "=== $1 ==="; }
@@ -78,6 +82,7 @@ gated() {
 	kextstat | grep -i rdna4 || echo "RDNA4FB NOT LOADED"
 
 	section "boot-args"
+	echo "kernel: $(sysctl -n kern.bootargs 2>/dev/null || echo '(unreadable)')"
 	nvram boot-args 2>/dev/null || echo "(nvram boot-args unreadable)"
 
 	section "dmesg: full RDNA4FB log"

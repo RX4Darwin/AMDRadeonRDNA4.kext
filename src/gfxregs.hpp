@@ -335,6 +335,27 @@ constexpr Reg SmuArg              { 1, 0x0092 };   // C2PMSG_82
 constexpr Reg SmuResp             { 1, 0x009a };   // C2PMSG_90
 constexpr uint32_t kSmuMsgTest       = 0x1;        // PPSMC_MSG_TestMessage
 constexpr uint32_t kSmuMsgGetVersion = 0x2;        // PPSMC_MSG_GetSmuVersion
+// smu_v14_0_2_ppsmc.h (the 14.0.2 message map also serves 14.0.3).
+constexpr uint32_t kSmuMsgGetDriverIfVersion    = 0x03;   // amdgpu expects 0x2E
+constexpr uint32_t kSmuMsgSetAllowedMaskLow     = 0x04;
+constexpr uint32_t kSmuMsgSetAllowedMaskHigh    = 0x05;
+constexpr uint32_t kSmuMsgEnableAllFeatures     = 0x06;   // param: FEATURE_PWR_DOMAIN_e (0 = all)
+constexpr uint32_t kSmuMsgGetRunningFeaturesLow = 0x0c;
+constexpr uint32_t kSmuMsgGetRunningFeaturesHigh = 0x0d;
+constexpr uint32_t kSmuMsgSetDriverDramAddrHigh = 0x0e;
+constexpr uint32_t kSmuMsgSetDriverDramAddrLow  = 0x0f;
+constexpr uint32_t kSmuMsgDisallowGfxOff        = 0x29;
+constexpr uint32_t kSmuMsgRunDcBtc              = 0x36;
+constexpr uint32_t kSmuPwrDomainGfx             = 4;      // FEATURE_PWR_GFX
+// Responses (smu_v14_0_2_ppsmc.h PPSMC_Result_*).
+constexpr uint32_t kSmuRespOk = 0x01, kSmuRespFailed = 0xff, kSmuRespUnknownCmd = 0xfe,
+                   kSmuRespRejectedPrereq = 0xfd, kSmuRespBusy = 0xfc;
+// smu14_driver_if_v14_0.h feature bits.
+constexpr uint32_t kSmuFeatDpmGfxclk = 1, kSmuFeatDpmUclk = 3, kSmuFeatDpmFclk = 4,
+                   kSmuFeatDpmDcn = 7, kSmuFeatVmempScaling = 8, kSmuFeatVddioMemScaling = 9,
+                   kSmuFeatDsFclk = 12, kSmuFeatDsDcfclk = 14, kSmuFeatDsUclk = 15,
+                   kSmuFeatGfxoff = 18, kSmuFeatFwCtf = 28, kSmuFeatFanControl = 29,
+                   kSmuFeatGfxImu = 36, kSmuFeatDfCstate = 40, kSmuFeatAthubMmhubPg = 47;
 
 // --- MP0 (PSP) scratch mailbox, segment 0 ----------------------------------------
 constexpr Reg PspBootStatus       { 0, 0x0063 };   // C2PMSG_35: bit31 bootloader ready

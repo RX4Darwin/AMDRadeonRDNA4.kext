@@ -345,6 +345,9 @@ struct RDNA4State {
     uint32_t     psp_rptr;              /* dwords */
     bool         pmfw_loaded;           /* SMU firmware in: the mailbox answers */
     uint64_t     psp_fw_types[2];       /* LOAD_IP_FW types seen, by bit */
+    uint64_t     smu_allowed;           /* SetAllowedFeaturesMask */
+    uint64_t     smu_running;           /* features the PMFW runs */
+    bool         autoload_armed;        /* AUTOLOAD_RLC accepted, IMU not released */
     bool         gfx_booted;            /* RLC autoload done */
 };
 
@@ -775,9 +778,33 @@ static void rdna4_dmub_wptr(RDNA4State *s, uint32_t wptr)
  * card, nothing answers until the SMU firmware has been loaded through the
  * PSP (LOAD_IP_FW, type SMU). Only the messages the kext sends are known.
  */
+#define SMU_FEATURE_GFX_IMU  36             /* smu14_driver_if_v14_0.h */
+
+/*
+ * The RLC autoload, once armed by the PSP, completes when the PMFW has
+ * GFX_IMU running: that is what releases the IMU on a dGPU (amdgpu reaches
+ * the autoload wait only after smu_hw_init's EnableAllSmuFeatures).
+ */
+static void rdna4_gfx_autoload(RDNA4State *s)
+{
+    if (!s->autoload_armed || s->gfx_booted ||
+        !(s->smu_running & (1ull << SMU_FEATURE_GFX_IMU))) {
+        return;
+    }
+    s->gfx_booted = true;
+    reg_set(s, REG_GC_CP_STAT, 0);
+    reg_set(s, REG_GC_RLC_BOOTLOAD, 0x8000003f);
+    reg_set(s, REG_GC_RLC_CNTL, 1);
+    reg_set(s, REG_GC_IMU_CORE_CTRL, 0);
+    reg_set(s, REG_GC_IMU_GFX_RESET, reg_get(s, REG_GC_IMU_GFX_RESET) | 0x1f);
+    reg_set(s, REG_GC_SDMA0_STATUS, SDMA_STATUS_BOOTED);
+    reg_set(s, REG_GC_SDMA1_STATUS, SDMA_STATUS_BOOTED);
+    fprintf(stderr, "rdna4: gfx: IMU released by the PMFW, RLC autoload complete\n");
+}
+
 static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
 {
-    uint32_t resp = SMU_RESP_OK;
+    uint32_t resp = SMU_RESP_OK, param = reg_get(s, REG_SMU_PARAM);
 
     reg_set(s, REG_SMU_MSG, msg);
     if (!s->pmfw_loaded) {
@@ -790,7 +817,33 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
         reg_set(s, REG_SMU_PARAM, SMU_PMFW_VERSION);
         break;
     case 0x3:                                      /* GetDriverIfVersion */
-        reg_set(s, REG_SMU_PARAM, 0);
+        reg_set(s, REG_SMU_PARAM, 0x2e);
+        break;
+    case 0x4:                                      /* SetAllowedFeaturesMaskLow */
+        s->smu_allowed = (s->smu_allowed & ~0xffffffffull) | param;
+        break;
+    case 0x5:                                      /* SetAllowedFeaturesMaskHigh */
+        s->smu_allowed = (s->smu_allowed & 0xffffffffull) | ((uint64_t)param << 32);
+        break;
+    case 0x6:                                      /* EnableAllSmuFeatures */
+        if (param != 0) {
+            resp = SMU_RESP_UNKNOWN;               /* 14.0.3: no per-domain enable */
+            break;
+        }
+        s->smu_running |= s->smu_allowed;          /* the pptable runs everything */
+        fprintf(stderr, "rdna4: smu: features running 0x%016" PRIx64 "\n", s->smu_running);
+        rdna4_gfx_autoload(s);
+        break;
+    case 0xc:                                      /* GetRunningSmuFeaturesLow */
+        reg_set(s, REG_SMU_PARAM, (uint32_t)s->smu_running);
+        break;
+    case 0xd:                                      /* GetRunningSmuFeaturesHigh */
+        reg_set(s, REG_SMU_PARAM, (uint32_t)(s->smu_running >> 32));
+        break;
+    case 0xe:                                      /* SetDriverDramAddrHigh */
+    case 0xf:                                      /* SetDriverDramAddrLow */
+    case 0x29:                                     /* DisallowGfxOff */
+    case 0x36:                                     /* RunDcBtc */
         break;
     default:
         resp = SMU_RESP_UNKNOWN;
@@ -967,15 +1020,13 @@ static void rdna4_psp_command(RDNA4State *s, uint64_t cmd)
         if (status) {
             break;
         }
-        s->gfx_booted = true;
-        reg_set(s, REG_GC_CP_STAT, 0);
-        reg_set(s, REG_GC_RLC_BOOTLOAD, 0x8000003f);
-        reg_set(s, REG_GC_RLC_CNTL, 1);
-        reg_set(s, REG_GC_IMU_CORE_CTRL, 0);
-        reg_set(s, REG_GC_IMU_GFX_RESET, reg_get(s, REG_GC_IMU_GFX_RESET) | 0x1f);
-        reg_set(s, REG_GC_SDMA0_STATUS, SDMA_STATUS_BOOTED);
-        reg_set(s, REG_GC_SDMA1_STATUS, SDMA_STATUS_BOOTED);
-        fprintf(stderr, "rdna4: psp: AUTOLOAD_RLC: GFX booted\n");
+        /*
+         * As on the card (2026-09-28): the command is accepted, but the IMU
+         * stays in reset until the PMFW powers GFX up (feature GFX_IMU).
+         */
+        s->autoload_armed = true;
+        fprintf(stderr, "rdna4: psp: AUTOLOAD_RLC: armed, waiting for the PMFW's GFX power-up\n");
+        rdna4_gfx_autoload(s);
         break;
     }
     case PSP_CMD_FB_RESERV:
@@ -2000,6 +2051,9 @@ static void rdna4_reset(DeviceState *dev)
     s->psp_rptr = 0;
     s->pmfw_loaded = false;
     memset(s->psp_fw_types, 0, sizeof(s->psp_fw_types));
+    s->smu_allowed = ~0ull;
+    s->smu_running = 0;
+    s->autoload_armed = false;
     s->gfx_booted = false;
     memset(s->symclk_khz, 0, sizeof(s->symclk_khz));
     memset(s->dig_mode, 0, sizeof(s->dig_mode));

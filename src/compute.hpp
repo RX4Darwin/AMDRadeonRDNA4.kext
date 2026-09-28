@@ -167,6 +167,13 @@ private:
 
 	// Stage 3.
 	bool stageGfx();
+	// What amdgpu's smu_hw_init sends between AUTOLOAD_RLC and the autoload
+	// wait: on a dGPU the PMFW's GFX power-up (feature GFX_IMU) is what
+	// releases the IMU that performs the autoload. `allowed` is the feature
+	// mask offered; returns the running mask (0 if unreadable).
+	uint64_t smuEnableFeatures(uint64_t allowed, uint32_t domain);
+	bool waitRlcAutoload(uint32_t ms, uint32_t &cpStat, uint32_t &boot);
+	static constexpr uint32_t kSmuTableOffset = 6u << 20;            // driver table, 64 KiB
 
 	// Stage 4: the GC hub, then SDMA0 queue 0 and a VRAM fill. Pool layout
 	// past the PSP's first 4 MiB (offsets within the pool).
