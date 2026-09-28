@@ -2057,7 +2057,7 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	grbmSelect(0, vm ? l.pipe : 0, vm ? l.queueId : 0, vm ? l.vmid : 0);
 	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
 	if (vm)
-		wr(IpDiscovery::HwGc, ShMemBases, (0x2000u << 16) | 0x1000u);
+		wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 
 	const uint32_t pgm[2] = { static_cast<uint32_t>(l.code >> 8), static_cast<uint32_t>(l.code >> 40) };
 	const uint32_t rsrc[2] = { l.rsrc1, (l.rsrc2 & ~kRsrc2LdsMask) | ldsSizeField(l.ldsBytes) };
