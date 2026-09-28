@@ -835,6 +835,7 @@ static void rdna4_dcn_timer(void *opaque)
 {
     RDNA4State *s = opaque;
     if (s->sleep_reset) {
+        fprintf(stderr, "rdna4: sleep-reset: property observed by DCN timer\n");
         s->sleep_reset = false;
         fprintf(stderr, "rdna4: sleep-reset: compute power reset; DCN and VRAM retained\n");
         rdna4_reset(DEVICE(s));
