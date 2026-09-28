@@ -3573,6 +3573,7 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
             break;
         case 0x3f: {                                 /* compute INDIRECT_BUFFER */
             uint32_t control = dw[3];
+            uint32_t ib_dwords = control & 0xfffff;
             if (!(control & (1u << 23))) {
                 fprintf(stderr, "rdna4: mec: indirect buffer missing VALID; queue stopped\n");
                 s->mec_hung = true;
@@ -3584,8 +3585,8 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
                 s->mec_hung = true;
                 return false;
             }
-            if (!rdna4_gc_span_vmid(s, (uint64_t)dw[1] | ((uint64_t)dw[2] << 32),
-                                    (uint64_t)(control & 0xfffff) * 4,
+            if (!ib_dwords || !rdna4_gc_span_vmid(s, (uint64_t)dw[1] | ((uint64_t)dw[2] << 32),
+                                    (uint64_t)ib_dwords * 4,
                                     s->mec_work.vmid, false, false)) {
                 fprintf(stderr, "rdna4: mec: invalid indirect buffer; queue stopped\n");
                 s->mec_hung = true;
@@ -3593,7 +3594,7 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
             }
             s->mec_ib.active = true;
             s->mec_ib.address = (uint64_t)dw[1] | ((uint64_t)dw[2] << 32);
-            s->mec_ib.dwords = control & 0xfffff;
+            s->mec_ib.dwords = ib_dwords;
             s->mec_ib.pos = 0;
             s->mec_ib.vmid = s->mec_work.vmid;
             s->mec_ib.depth = 0;
