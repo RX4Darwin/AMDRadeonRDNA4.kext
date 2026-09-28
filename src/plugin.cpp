@@ -230,8 +230,9 @@ void deviceSetPower(void *ctx, bool on) {
 }
 
 void createVblankService(IOService *framebuffer) {
-	uint32_t requested = 0;
-	if (!PE_parse_boot_argn("rdna4-vbl", &requested, sizeof(requested)) || !requested ||
+	uint32_t ih = 0, requested = 0;
+	if (!PE_parse_boot_argn("rdna4-ih", &ih, sizeof(ih)) || ih < 2 ||
+	    !PE_parse_boot_argn("rdna4-vbl", &requested, sizeof(requested)) || !requested ||
 	    Ndrv::vslServicePresent() || !orgVslNew || !orgVslDo || !framebuffer)
 		return;
 	IOService *provider = framebuffer->getProvider();
