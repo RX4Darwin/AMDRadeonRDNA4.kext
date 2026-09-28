@@ -357,11 +357,20 @@ static int testVmIsolationAndPeers(rdna4_t *a) {
 		printf("  FAIL  VM isolation dispatch: %s\n", rdna4_error(kr));
 		fails++;
 	} else {
-		for (uint32_t i = 0; i < 1024; i++)
-			if (dst[i])
-				fails++;
-		printf("  %s  VM isolation: client B could not read client A's VA\n",
-		       fails ? "FAIL" : "ok");
+		/* B's read of A's VA must fault. A fault reads the GPU's fault-default
+		 * page, so the property is "none of A's data", not "all zero". */
+		uint32_t leaked = 0, other = 0;
+		for (uint32_t i = 0; i < 1024; i++) {
+			if (dst[i] == src[i])
+				leaked++;
+			else if (dst[i])
+				other++;
+		}
+		fails += leaked;
+		printf("  %s  VM isolation: client B could not read client A's VA", leaked ? "FAIL" : "ok");
+		if (leaked || other)
+			printf(" (%u of A's words seen, %u other non-zero words)", leaked, other);
+		printf("\n");
 	}
 
 isolation_cleanup:
