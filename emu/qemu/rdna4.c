@@ -3357,7 +3357,7 @@ static bool rdna4_mec_ib_packet(RDNA4State *s)
     if (!rdna4_vm_access(s, address + 4ull * pos, (uint8_t *)&hdr,
                          sizeof(hdr), vmid, false, false)) {
         fprintf(stderr, "rdna4: mec: indirect buffer 0x%" PRIx64 " header fault\n",
-                address + 4ull * pos);
+                (uint64_t)(address + 4ull * pos));
         return false;
     }
     dw[0] = hdr;
@@ -3413,7 +3413,7 @@ static bool rdna4_mec_ib_packet(RDNA4State *s)
             if (!rdna4_vm_access(s, a + 4ull * i, (uint8_t *)&dw[4 + i], 4,
                                  vmid, true, false)) {
                 fprintf(stderr, "rdna4: mec: indirect WRITE_DATA to 0x%" PRIx64
-                        " refused\n", a + 4ull * i);
+                        " refused\n", (uint64_t)(a + 4ull * i));
                 return false;
             }
         }
@@ -5081,7 +5081,7 @@ typedef struct RDNA4GfxTraceTable {
 
 static uint64_t rdna4_gfx_trace_phys(RDNA4State *s, uint64_t off)
 {
-    return ((uint64_t)reg_get(s, REG_GCMC_FB_OFFSET) << 24) + off;
+    return ((uint64_t)(reg_get(s, REG_GCMC_FB_OFFSET) & 0xffffff) << 24) + off;
 }
 
 static bool rdna4_gfx_trace_table_entry(RDNA4State *s, uint64_t table,
