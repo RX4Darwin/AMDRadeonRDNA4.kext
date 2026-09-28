@@ -187,18 +187,25 @@ void bf16gemm(__global const ushort *A, __global const ushort *Bt, __global floa
 	gemm16(A, Bt, C, n, As, Bs, true);
 }
 
-// One work-item per pixel. The integer iteration count is mapped through a
-// continuous palette so neighboring escape bands form a smooth ARGB8888
-// gradient while the CPU checker can repeat the same float32 operation order.
+// One work-item per sample block. The host supplies the affine complex-plane
+// mapping so this kernel needs no floating-point division (which also keeps
+// the bring-up interpreter's instruction set small). A scale greater than one
+// lets the VM proof render a useful image with fewer work-items: one sample is
+// replicated into a clipped scale x scale block.
 __kernel __attribute__((reqd_work_group_size(16, 16, 1)))
-void mandelbrot(__global uint *out, uint width, uint height, uint pitch)
+void mandelbrot(__global uint *out, uint width, uint height, uint pitch,
+                float x0, float dx, float y0, float dy, uint scale)
 {
-	const uint x = WG_ID(x) * 16u + LID_X;
-	const uint y = WG_ID(y) * 16u + LID_Y;
+	const uint blockX = WG_ID(x) * 16u + LID_X;
+	const uint blockY = WG_ID(y) * 16u + LID_Y;
+	if (!scale)
+		return;
+	const uint x = blockX * scale;
+	const uint y = blockY * scale;
 	if (x >= width || y >= height)
 		return;
-	const float cx = ((float)x / (float)width - 0.5f) * 3.2f - 0.7f;
-	const float cy = ((float)y / (float)height - 0.5f) * 2.2f;
+	const float cx = x0 + (float)x * dx;
+	const float cy = y0 + (float)y * dy;
 	float zx = 0.0f, zy = 0.0f;
 	uint iteration = 0;
 	for (; iteration < 256u; iteration++) {
@@ -218,39 +225,12 @@ void mandelbrot(__global uint *out, uint width, uint height, uint pitch)
 		const uint b = (uint)(80.0f + 175.0f * t);
 		color = 0xff000000u | (r << 16) | (g << 8) | b;
 	}
-	out[y * pitch + x] = color;
-}
-
-// The same image with a zoom centered on the main cardioid. The fourth
-// argument keeps this separate from the fixed-geometry show kernel so old
-// clients and the existing Mandelbrot model retain their ABI.
-__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
-void mandelbrot_zoom(__global uint *out, uint width, uint height, uint pitch, float zoom)
-{
-	const uint x = WG_ID(x) * 16u + LID_X;
-	const uint y = WG_ID(y) * 16u + LID_Y;
-	if (x >= width || y >= height)
-		return;
-	const float cx = -0.7f + (((float)x / (float)width - 0.5f) * 3.2f) / zoom;
-	const float cy = (((float)y / (float)height - 0.5f) * 2.2f) / zoom;
-	float zx = 0.0f, zy = 0.0f;
-	uint iteration = 0;
-	for (; iteration < 256u; iteration++) {
-		const float zx2 = zx * zx;
-		const float zy2 = zy * zy;
-		if (zx2 + zy2 > 4.0f)
-			break;
-		const float nextZx = zx2 - zy2 + cx;
-		zy = 2.0f * zx * zy + cy;
-		zx = nextZx;
+	for (uint oy = 0; oy < scale; oy++) {
+		for (uint ox = 0; ox < scale; ox++) {
+			const uint px = x + ox;
+			const uint py = y + oy;
+			if (px < width && py < height)
+				out[py * pitch + px] = color;
+		}
 	}
-	uint color = 0xff000000u;
-	if (iteration < 256u) {
-		const float t = (float)iteration * (1.0f / 255.0f);
-		const uint r = (uint)(9.0f + 246.0f * t);
-		const uint g = (uint)(20.0f + 200.0f * (1.0f - t));
-		const uint b = (uint)(80.0f + 175.0f * t);
-		color = 0xff000000u | (r << 16) | (g << 8) | b;
-	}
-	out[y * pitch + x] = color;
 }

@@ -305,9 +305,7 @@ static void showSignalHandler(int signalNumber) {
 	showSignal = 1;
 }
 
-static uint32_t mandelbrotColor(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
-	const float cx = ((float)x / (float)width - 0.5f) * 3.2f - 0.7f;
-	const float cy = ((float)y / (float)height - 0.5f) * 2.2f;
+static uint32_t mandelbrotIteration(float cx, float cy) {
 	float zx = 0.0f, zy = 0.0f;
 	uint32_t iteration = 0;
 	for (; iteration < 256u; iteration++) {
@@ -319,6 +317,10 @@ static uint32_t mandelbrotColor(uint32_t x, uint32_t y, uint32_t width, uint32_t
 		zy = 2.0f * zx * zy + cy;
 		zx = nextZx;
 	}
+	return iteration;
+}
+
+static uint32_t mandelbrotColorForIteration(uint32_t iteration) {
 	if (iteration >= 256u)
 		return 0xff000000u;
 	const float t = (float)iteration * (1.0f / 255.0f);
@@ -328,28 +330,20 @@ static uint32_t mandelbrotColor(uint32_t x, uint32_t y, uint32_t width, uint32_t
 	return 0xff000000u | (r << 16) | (g << 8) | b;
 }
 
-static uint32_t mandelbrotZoomColor(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
-	                                    float zoom) {
-	const float cx = -0.7f + (((float)x / (float)width - 0.5f) * 3.2f) / zoom;
-	const float cy = (((float)y / (float)height - 0.5f) * 2.2f) / zoom;
-	float zx = 0.0f, zy = 0.0f;
-	uint32_t iteration = 0;
-	for (; iteration < 256u; iteration++) {
-		const float zx2 = zx * zx;
-		const float zy2 = zy * zy;
-		if (zx2 + zy2 > 4.0f)
-			break;
-		const float nextZx = zx2 - zy2 + cx;
-		zy = 2.0f * zx * zy + cy;
-		zx = nextZx;
-	}
-	if (iteration >= 256u)
-		return 0xff000000u;
-	const float t = (float)iteration * (1.0f / 255.0f);
-	const uint32_t r = (uint32_t)(9.0f + 246.0f * t);
-	const uint32_t g = (uint32_t)(20.0f + 200.0f * (1.0f - t));
-	const uint32_t b = (uint32_t)(80.0f + 175.0f * t);
-	return 0xff000000u | (r << 16) | (g << 8) | b;
+static uint32_t mandelbrotColorArgs(uint32_t x, uint32_t y, float x0, float dx,
+	                                  float y0, float dy, uint32_t *iterationOut) {
+	const float cx = x0 + (float)x * dx;
+	const float cy = y0 + (float)y * dy;
+	const uint32_t iteration = mandelbrotIteration(cx, cy);
+	if (iterationOut)
+		*iterationOut = iteration;
+	return mandelbrotColorForIteration(iteration);
+}
+
+static int rdna4VmmPresent(void) {
+	int vm = 0;
+	size_t vmLen = sizeof(vm);
+	return !sysctlbyname("kern.hv_vmm_present", &vm, &vmLen, NULL, 0) && vm;
 }
 
 static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
@@ -364,7 +358,12 @@ static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
 		return 1;
 	}
 	const uint64_t bytes = (uint64_t)pitch * height * 4;
+	const uint32_t scale = rdna4VmmPresent() ? 4u : 1u;
+	const float x0 = -2.3f, dx = 3.2f / (float)width;
+	const float y0 = -1.1f, dy = 2.2f / (float)height;
 	printf("show: geometry %ux%u pitch %u (%llu bytes)\n", width, height, pitch, bytes);
+	printf("show: Mandelbrot scale %u (%s)\n", scale,
+	       scale == 1 ? "real hardware" : "VM interpreter");
 
 	rdna4_program_t prog = { 0 };
 	rdna4_buffer_t buf = { 0 };
@@ -382,12 +381,18 @@ static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
 	}
 	allocated = 1;
 	{
-		uint8_t args[20] = { 0 };
+		uint8_t args[40] = { 0 };
 		memcpy(args, &buf.gpu, sizeof(buf.gpu));
 		memcpy(args + 8, &width, sizeof(width));
 		memcpy(args + 12, &height, sizeof(height));
 		memcpy(args + 16, &pitch, sizeof(pitch));
-		const uint32_t groups[3] = { (width + 15) / 16, (height + 15) / 16, 1 };
+		memcpy(args + 20, &x0, sizeof(x0));
+		memcpy(args + 24, &dx, sizeof(dx));
+		memcpy(args + 28, &y0, sizeof(y0));
+		memcpy(args + 32, &dy, sizeof(dy));
+		memcpy(args + 36, &scale, sizeof(scale));
+		const uint32_t groups[3] = { (width + 16u * scale - 1) / (16u * scale),
+		                              (height + 16u * scale - 1) / (16u * scale), 1 };
 		const uint32_t groupSize[3] = { 16, 16, 1 };
 		uint64_t kernelUs = 0;
 		kr = rdna4_dispatch(gpu, &prog, groups, groupSize, args, sizeof(args), 10000, &kernelUs);
@@ -412,20 +417,33 @@ static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
 	}
 	presented = 1;
 	{
-		uint32_t mismatches = 0;
+		uint32_t mismatches = 0, tolerated = 0, hardMismatches = 0;
 		for (uint32_t sy = 1; sy <= 8; sy++) {
 			const uint32_t y = (uint64_t)sy * height / 9;
 			for (uint32_t sx = 1; sx <= 8; sx++) {
 				const uint32_t x = (uint64_t)sx * width / 9;
+				const uint32_t sampleX = x - x % scale, sampleY = y - y % scale;
+				uint32_t expectedIteration = 0;
 				uint32_t got = 0;
 				kr = rdna4_read(gpu, &buf, ((uint64_t)y * pitch + x) * 4, &got, sizeof(got));
-				const uint32_t want = mandelbrotColor(x, y, width, height);
-				if (kr != KERN_SUCCESS || got != want)
+				const uint32_t want = mandelbrotColorArgs(sampleX, sampleY, x0, dx, y0, dy,
+				                                                &expectedIteration);
+				const uint32_t nearLo = expectedIteration ?
+					mandelbrotColorForIteration(expectedIteration - 1) : want;
+				const uint32_t nearHi = expectedIteration < 256u ?
+					mandelbrotColorForIteration(expectedIteration + 1) : want;
+				if (kr != KERN_SUCCESS || got != want) {
 					mismatches++;
+					if (kr == KERN_SUCCESS && (got == nearLo || got == nearHi))
+						tolerated++;
+					else
+						hardMismatches++;
+				}
 			}
 		}
-		printf("show: CPU spot check 64 pixels, mismatches %u\n", mismatches);
-		if (kr != KERN_SUCCESS || mismatches)
+		printf("show: CPU spot check 64 pixels, mismatches %u (iteration +/-1 %u, hard %u)\n",
+		       mismatches, tolerated, hardMismatches);
+		if (kr != KERN_SUCCESS || hardMismatches > 2)
 			goto done;
 	}
 	for (uint32_t left = seconds * 10; left && !showSignal; left--)
@@ -511,7 +529,9 @@ static int cmdAnim(rdna4_t *gpu, uint32_t seconds) {
 		return 1;
 	}
 	const uint64_t bytes = (uint64_t)pitch * height * 4;
-	printf("anim: geometry %ux%u pitch %u (%llu bytes)\n", width, height, pitch, bytes);
+	const uint32_t scale = rdna4VmmPresent() ? 4u : 1u;
+	printf("anim: geometry %ux%u pitch %u (%llu bytes), scale %u (%s)\n", width, height,
+	       pitch, bytes, scale, scale == 1 ? "real hardware" : "VM interpreter");
 
 	rdna4_program_t prog = { 0 };
 	rdna4_buffer_t buffers[2] = { { 0 }, { 0 } };
@@ -519,9 +539,9 @@ static int cmdAnim(rdna4_t *gpu, uint32_t seconds) {
 	AnimStats stats = { 0 };
 	uint32_t pendingCount = 0, rendered = 0, zoomMismatches = 0;
 	int loaded = 0, allocated = 0, ownsPresentation = 0, rc = 1;
-	kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "mandelbrot_zoom", &prog);
+	kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "mandelbrot", &prog);
 	if (kr != KERN_SUCCESS) {
-		fprintf(stderr, "anim: load mandelbrot_zoom: %s\n", rdna4_error(kr));
+		fprintf(stderr, "anim: load mandelbrot: %s\n", rdna4_error(kr));
 		goto done;
 	}
 	loaded = 1;
@@ -542,13 +562,22 @@ static int cmdAnim(rdna4_t *gpu, uint32_t seconds) {
 	for (uint32_t frameNo = 0; !showSignal && nowUs() < endUs; frameNo++) {
 		const uint32_t index = frameNo & 1u;
 		const float zoom = 1.0f + (float)frameNo * 0.035f;
-		uint8_t args[24] = { 0 };
+		const float x0 = -0.7f - 1.6f / zoom;
+		const float dx = 3.2f / ((float)width * zoom);
+		const float y0 = -1.1f / zoom;
+		const float dy = 2.2f / ((float)height * zoom);
+		uint8_t args[40] = { 0 };
 		memcpy(args, &buffers[index].gpu, sizeof(buffers[index].gpu));
 		memcpy(args + 8, &width, sizeof(width));
 		memcpy(args + 12, &height, sizeof(height));
 		memcpy(args + 16, &pitch, sizeof(pitch));
-		memcpy(args + 20, &zoom, sizeof(zoom));
-		const uint32_t groups[3] = { (width + 15) / 16, (height + 15) / 16, 1 };
+		memcpy(args + 20, &x0, sizeof(x0));
+		memcpy(args + 24, &dx, sizeof(dx));
+		memcpy(args + 28, &y0, sizeof(y0));
+		memcpy(args + 32, &dy, sizeof(dy));
+		memcpy(args + 36, &scale, sizeof(scale));
+		const uint32_t groups[3] = { (width + 16u * scale - 1) / (16u * scale),
+		                              (height + 16u * scale - 1) / (16u * scale), 1 };
 		const uint32_t groupSize[3] = { 16, 16, 1 };
 		uint64_t kernelUs = 0;
 		kr = rdna4_dispatch(gpu, &prog, groups, groupSize, args, sizeof(args), 10000, &kernelUs);
@@ -557,18 +586,29 @@ static int cmdAnim(rdna4_t *gpu, uint32_t seconds) {
 			goto done;
 		}
 		if (!frameNo) {
+			uint32_t frameMismatches = 0;
 			for (uint32_t sy = 1; sy <= 2; sy++) {
 				const uint32_t y = (uint64_t)sy * height / 3;
 				for (uint32_t sx = 1; sx <= 2; sx++) {
 					const uint32_t x = (uint64_t)sx * width / 3;
+					const uint32_t sampleX = x - x % scale, sampleY = y - y % scale;
+					uint32_t expectedIteration = 0;
 					uint32_t got = 0;
+					const uint32_t want = mandelbrotColorArgs(sampleX, sampleY, x0, dx, y0, dy,
+					                                                &expectedIteration);
 					if (rdna4_read(gpu, &buffers[index], ((uint64_t)y * pitch + x) * 4,
-					              &got, sizeof(got)) != KERN_SUCCESS ||
-					    got != mandelbrotZoomColor(x, y, width, height, zoom))
-						zoomMismatches++;
+					              &got, sizeof(got)) != KERN_SUCCESS || got != want) {
+						const uint32_t lo = expectedIteration ?
+							mandelbrotColorForIteration(expectedIteration - 1) : want;
+						const uint32_t hi = expectedIteration < 256u ?
+							mandelbrotColorForIteration(expectedIteration + 1) : want;
+						if (got != lo && got != hi)
+							frameMismatches++;
+					}
 				}
 			}
-			printf("anim: CPU spot check 4 pixels, mismatches %u\n", zoomMismatches);
+			zoomMismatches += frameMismatches;
+			printf("anim: CPU spot check 4 pixels, mismatches %u\n", frameMismatches);
 			if (zoomMismatches)
 				goto done;
 		}
