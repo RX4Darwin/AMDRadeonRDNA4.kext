@@ -178,10 +178,35 @@ bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 		const uint64_t start = mach_absolute_time();
 		for (;;) {
 			const uint32_t control = dmuRead2(kHubpFlipControl + hubpBase);
-			if (control != kBad && !(control & kHubpFlipPending))
+			if (control != kBad && !(control & kHubpFlipPending)) {
+				FLOG("%s: pending clear control 0x%08x", name, control);
 				return true;
+			}
 			if (mach_absolute_time() - start >= span)
+			{
+				FLOG("failure: %s pending timeout control 0x%08x", name, control);
 				return false;
+			}
+			IODelay(10);
+		}
+	};
+	auto waitForFrameAdvance = [&](uint32_t before, uint32_t &after, uint32_t &line) {
+		uint64_t span = 0;
+		nanoseconds_to_absolutetime(100000000, &span);
+		const uint64_t start = mach_absolute_time();
+		for (;;) {
+			uint32_t current = 0;
+			if (readPosition(current, line) && ((current - before) & 0xffffffu)) {
+				after = current;
+				FLOG("%s: OTG frame advanced %u->%u line %u", name, before, after, line);
+				return true;
+			}
+			if (mach_absolute_time() - start >= span) {
+				after = current;
+				FLOG("failure: %s vblank timeout frame %u->%u line %u", name,
+				     before, after, line);
+				return false;
+			}
 			IODelay(10);
 		}
 	};
@@ -203,6 +228,7 @@ bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 			IODelay(10);
 		}
 		if (!locked) {
+			FLOG("failure: %s update lock timeout state 0x%08x", name, dmuRead2(lockReg));
 			dmuWrite2(lockReg, before & ~1u);
 			return false;
 		}
@@ -226,6 +252,7 @@ bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 		FLOG("failure: %s could not read OTG position", name);
 		return false;
 	}
+	FLOG("%s: begin target 0x%llx frame %u line %u", name, target, beforeFrame, beforeLine);
 	uint64_t startNs = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time(), &startNs);
 	if (!writeAddress()) {
@@ -234,14 +261,18 @@ bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 	}
 	uint64_t readback = 0;
 	if (!readAddress(readback) || readback != target) {
-		FLOG("failure: %s readback 0x%llx expected 0x%llx", name, readback, target);
+		uint32_t frame = 0, line = 0;
+		(void)readPosition(frame, line);
+		FLOG("failure: %s readback 0x%llx expected 0x%llx pending control 0x%08x frame %u line %u",
+		     name, readback, target, dmuRead2(kHubpFlipControl + hubpBase), frame, line);
 		return false;
 	}
 	uint32_t afterFrame = 0, afterLine = 0;
-	if (!readPosition(afterFrame, afterLine)) {
-		FLOG("failure: %s could not read post-latch OTG position", name);
+	// DCN can clear SURFACE_FLIP_PENDING when it accepts the request, before
+	// the scanout reaches the next frame.  Treat the OTG frame counter as the
+	// latch completion signal, as DC does when it waits for the flip event.
+	if (!waitForFrameAdvance(beforeFrame, afterFrame, afterLine))
 		return false;
-	}
 	const uint32_t frameDelta = (afterFrame - beforeFrame) & 0xffffffu;
 	const uint32_t vtotalImage = dmuRead2(Pipe::Reg::kOtgVTotal +
 	                                      surface.otg * Pipe::Reg::kOtgStride);
@@ -253,10 +284,6 @@ bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 	const uint64_t elapsedUs = (endNs - startNs) / 1000;
 	if (latencyUs)
 		*latencyUs = elapsedUs;
-	if (!frameDelta) {
-		FLOG("failure: %s latched without a vblank frame advance", name);
-		return false;
-	}
 	FLOG("%s latched: address 0x%llx, latency %llu us, %llu scanlines, frame %u->%u",
 	     name, readback, elapsedUs, scanlines, beforeFrame, afterFrame);
 	return true;
