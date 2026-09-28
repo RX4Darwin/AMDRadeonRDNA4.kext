@@ -192,9 +192,9 @@ void bf16gemm(__global const ushort *A, __global const ushort *Bt, __global floa
 // the bring-up interpreter's instruction set small). A scale greater than one
 // lets the VM proof render a useful image with fewer work-items: one sample is
 // replicated into a clipped scale x scale block.
-__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
-void mandelbrot(__global uint *out, uint width, uint height, uint pitch,
-                float x0, float dx, float y0, float dy, uint scale)
+static inline __attribute__((always_inline))
+void mandelbrotRender(__global uint *out, uint width, uint height, uint pitch,
+                      float x0, float dx, float y0, float dy, uint scale)
 {
 	const uint blockX = WG_ID(x) * 16u + LID_X;
 	const uint blockY = WG_ID(y) * 16u + LID_Y;
@@ -233,4 +233,18 @@ void mandelbrot(__global uint *out, uint width, uint height, uint pitch,
 				out[py * pitch + px] = color;
 		}
 	}
+}
+
+__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
+void mandelbrot(__global uint *out, uint width, uint height, uint pitch,
+                float x0, float dx, float y0, float dy, uint scale)
+{
+	mandelbrotRender(out, width, height, pitch, x0, dx, y0, dy, scale);
+}
+
+__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
+void mandelbrot_zoom(__global uint *out, uint width, uint height, uint pitch,
+                     float x0, float dx, float y0, float dy, uint scale)
+{
+	mandelbrotRender(out, width, height, pitch, x0, dx, y0, dy, scale);
 }

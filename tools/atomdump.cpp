@@ -1771,12 +1771,12 @@ static int testCodeObject() {
 	failures += check(!CodeObj::parseImage(kVaddCodeObject, 200, img, &why),
 	                  "codeobj: image of a truncated file accepted");
 
-	// bench.cl: seven kernels in one file, each with its own descriptor and
+	// bench.cl: eight kernels in one file, each with its own descriptor and
 	// LDS (llvm-readelf --notes: group_segment_fixed_size).
 	struct { const char *name; uint32_t lds, kernarg; } bench[] = {
 		{ "lds_reverse", 256, 24 }, { "copy", 0, 16 }, { "sgemm", 8320, 28 },
 		{ "wmma16", 0, 24 }, { "hgemm", 20480, 28 }, { "bf16gemm", 20480, 28 },
-		{ "mandelbrot", 0, 40 },
+		{ "mandelbrot", 0, 40 }, { "mandelbrot_zoom", 0, 40 },
 	};
 	const int nBench = sizeof(bench) / sizeof(bench[0]);
 	uint64_t entries[nBench] = {};

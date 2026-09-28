@@ -539,9 +539,9 @@ static int cmdAnim(rdna4_t *gpu, uint32_t seconds) {
 	AnimStats stats = { 0 };
 	uint32_t pendingCount = 0, rendered = 0;
 	int loaded = 0, allocated = 0, ownsPresentation = 0, rc = 1;
-	kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "mandelbrot", &prog);
+	kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "mandelbrot_zoom", &prog);
 	if (kr != KERN_SUCCESS) {
-		fprintf(stderr, "anim: load mandelbrot: %s\n", rdna4_error(kr));
+		fprintf(stderr, "anim: load mandelbrot_zoom: %s\n", rdna4_error(kr));
 		goto done;
 	}
 	loaded = 1;
