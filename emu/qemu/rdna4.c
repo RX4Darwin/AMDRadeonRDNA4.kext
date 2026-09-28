@@ -276,8 +276,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 /* GC hub: FB aperture, L1 TLB, VMID0 context and the GART flush engine. */
 #define REG_GCMC_FB_BASE     GC_SEG0(0x1614)   /* MC >> 24 */
 #define REG_GCMC_FB_TOP      GC_SEG0(0x1615)
+#define REG_GCMC_FB_OFFSET   GC_SEG0(0x15a7)   /* GPU physical FB offset >> 24 */
 #define REG_GCMC_L1_TLB      GC_SEG0(0x161b)   /* ENABLE_L1_TLB [0] */
 #define REG_GCVM_CTX0_CNTL   GC_SEG0(0x1624)   /* ENABLE_CONTEXT [0] */
+#define REG_GCVM_CTX1_CNTL   GC_SEG0(0x1625)
+#define REG_GCVM_CTX1_BASE_LO GC_SEG0(0x1691)
+#define REG_GCVM_CTX1_BASE_HI GC_SEG0(0x1692)
+#define REG_GCVM_CTX1_START_LO GC_SEG0(0x16b1)
+#define REG_GCVM_CTX1_START_HI GC_SEG0(0x16b2)
+#define REG_GCVM_CTX1_END_LO GC_SEG0(0x16d1)
+#define REG_GCVM_CTX1_END_HI GC_SEG0(0x16d2)
+#define REG_GCVM_FAULT_STATUS GC_SEG0(0x15d0)
+#define REG_GCVM_FAULT_ADDR_LO GC_SEG0(0x15d2)
+#define REG_GCVM_FAULT_ADDR_HI GC_SEG0(0x15d3)
+#define REG_GCVM_FAULT_DEFAULT_LO GC_SEG0(0x15d4)
+#define REG_GCVM_FAULT_DEFAULT_HI GC_SEG0(0x15d5)
+#define REG_GRBM_GFX_CNTL GC_SEG1(0x0900)
 #define REG_GCVM_INV17_REQ   GC_SEG0(0x1647 + 17)
 #define REG_GCVM_INV17_ACK   GC_SEG0(0x1659 + 17)
 
@@ -399,15 +413,63 @@ struct RDNA4State {
     uint32_t     ih_wptr;
     bool         ih_overflow;
     bool         gfx_booted;            /* RLC autoload done */
+
+    /* CP_HQD_* and compute shader registers are banked by GRBM_GFX_CNTL. */
+    struct {
+        uint32_t q[0x100];
+        uint32_t sh[0x100];
+        bool used;
+    } hqd[4][8];
+    uint32_t selected_pipe, selected_queue, selected_vmid;
 };
+
+static bool rdna4_hqd_reg(uint32_t byte, uint32_t *off)
+{
+    uint32_t dword = byte / 4;
+    if (dword < 0x1260 + 0x1fa0 || dword > 0x1260 + 0x1fe0)
+        return false;
+    *off = dword - (0x1260 + 0x1fa0);
+    return true;
+}
+
+static bool rdna4_sh_reg(uint32_t byte, uint32_t *off)
+{
+    uint32_t dword = byte / 4;
+    if (dword == 0xa000 + 0x09e4 || dword == 0xa000 + 0x09e5) {
+        *off = 0x80 + dword - (0xa000 + 0x09e4);
+        return true;
+    }
+    if (dword < 0x1260 + 0x1ba0 || dword > 0x1260 + 0x1c20)
+        return false;
+    *off = dword - (0x1260 + 0x1ba0);
+    return true;
+}
 
 static inline uint32_t reg_get(RDNA4State *s, uint32_t byte)
 {
+    uint32_t off;
+    if (rdna4_hqd_reg(byte, &off) && s->selected_pipe < 4 && s->selected_queue < 8 &&
+        (s->selected_pipe || s->selected_queue || s->selected_vmid))
+        return s->hqd[s->selected_pipe][s->selected_queue].q[off];
+    if (rdna4_sh_reg(byte, &off) && s->selected_pipe < 4 && s->selected_queue < 8 &&
+        (s->selected_pipe || s->selected_queue || s->selected_vmid))
+        return s->hqd[s->selected_pipe][s->selected_queue].sh[off];
     return s->regs[byte / 4];
 }
 
 static inline void reg_set(RDNA4State *s, uint32_t byte, uint32_t val)
 {
+    uint32_t off;
+    if (rdna4_hqd_reg(byte, &off) && s->selected_pipe < 4 && s->selected_queue < 8 &&
+        (s->selected_pipe || s->selected_queue || s->selected_vmid)) {
+        s->hqd[s->selected_pipe][s->selected_queue].q[off] = val;
+        return;
+    }
+    if (rdna4_sh_reg(byte, &off) && s->selected_pipe < 4 && s->selected_queue < 8 &&
+        (s->selected_pipe || s->selected_queue || s->selected_vmid)) {
+        s->hqd[s->selected_pipe][s->selected_queue].sh[off] = val;
+        return;
+    }
     s->regs[byte / 4] = val;
 }
 
@@ -1323,6 +1385,110 @@ static void rdna4_ih_reg_write(RDNA4State *s, uint32_t dw, uint32_t val)
         reg_set(s, byte, val);
         break;
     }
+/* VM table entries and VM physical addresses use the GC hub's GPU-physical
+ * FB_OFFSET basis, rather than the MC address used by SDMA and VMID0. */
+static int64_t rdna4_phys_to_vram(RDNA4State *s, uint64_t physical)
+{
+    uint64_t fb_offset = (uint64_t)(reg_get(s, REG_GCMC_FB_OFFSET) & 0xffffff) << 24;
+
+    if (!(reg_get(s, REG_GCMC_L1_TLB) & 1) || !(reg_get(s, REG_GCVM_CTX0_CNTL) & 1) ||
+        physical < fb_offset || physical - fb_offset >= rdna4_vram_size()) {
+        return -1;
+    }
+    return physical - fb_offset;
+}
+
+static uint8_t *rdna4_phys_span(RDNA4State *s, uint64_t physical, uint64_t len)
+{
+    int64_t off = rdna4_phys_to_vram(s, physical);
+
+    return off < 0 ? NULL : rdna4_vram_span(s, off, len);
+}
+
+/* gfx12 VM walk used by CP and shader accesses for runtime VMIDs. */
+#define RDNA4_VM_VALID       (1ull << 0)
+#define RDNA4_VM_EXECUTABLE  (1ull << 4)
+#define RDNA4_VM_READABLE    (1ull << 5)
+#define RDNA4_VM_WRITEABLE   (1ull << 6)
+#define RDNA4_VM_PHYS_MASK   0x0000FFFFFFFFF000ull
+#define RDNA4_VM_PDE_PTE     (1ull << 63)
+
+static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va)
+{
+    /* CID is reported in the status word; retry is disabled by the kext. */
+    reg_set(s, REG_GCVM_FAULT_STATUS, 1u | ((vmid & 0xff) << 16));
+    reg_set(s, REG_GCVM_FAULT_ADDR_LO, (uint32_t)va);
+    reg_set(s, REG_GCVM_FAULT_ADDR_HI, (uint32_t)(va >> 32));
+}
+
+static bool rdna4_vm_entry(RDNA4State *s, uint64_t address, uint64_t *entry)
+{
+    uint8_t *p = rdna4_phys_span(s, address, 8);
+    if (!p)
+        return false;
+    *entry = ldq_le_p(p);
+    return true;
+}
+
+static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
+                                   uint32_t vmid, bool write, bool execute)
+{
+    if (!vmid)
+        return rdna4_gc_span(s, va, len);
+    uint32_t n = vmid - 1;
+    uint32_t cntl = reg_get(s, REG_GCVM_CTX1_CNTL + n * 4);
+    uint64_t base, start, end, table, entry;
+    if (!(cntl & 1) || ((cntl >> 1) & 3) != 3 || va >= (1ull << 48))
+        goto fault;
+    start = reg_get(s, REG_GCVM_CTX1_START_LO + n * 8) |
+            ((uint64_t)reg_get(s, REG_GCVM_CTX1_START_HI + n * 8) << 32);
+    end = reg_get(s, REG_GCVM_CTX1_END_LO + n * 8) |
+          ((uint64_t)reg_get(s, REG_GCVM_CTX1_END_HI + n * 8) << 32);
+    if (va < start || va > end || len > (1ull << 48) - va || va + len - 1 > end)
+        goto fault;
+    base = reg_get(s, REG_GCVM_CTX1_BASE_LO + n * 8) |
+           ((uint64_t)reg_get(s, REG_GCVM_CTX1_BASE_HI + n * 8) << 32);
+    table = base & RDNA4_VM_PHYS_MASK;
+    for (uint32_t level = 0; level < 4; level++) {
+        uint32_t shift = 12 + (3 - level) * 9;
+        uint32_t idx = (va >> shift) & 0x1ff;
+        if (!rdna4_vm_entry(s, table + (uint64_t)idx * 8, &entry) ||
+            !(entry & RDNA4_VM_VALID))
+            goto fault;
+        if (level < 3 && (entry & RDNA4_VM_PDE_PTE)) {
+            uint32_t page_shift = 12 + (3 - level) * 9;
+            uint64_t page_mask = (1ull << page_shift) - 1;
+            if (!(entry & RDNA4_VM_READABLE) || (write && !(entry & RDNA4_VM_WRITEABLE)) ||
+                (execute && !(entry & RDNA4_VM_EXECUTABLE)))
+                goto fault;
+            uint64_t physical = ((entry & RDNA4_VM_PHYS_MASK) & ~page_mask) |
+                                (va & page_mask);
+            int64_t off = rdna4_phys_to_vram(s, physical);
+            if (off < 0)
+                goto fault;
+            return rdna4_vram_span(s, off, len);
+        }
+        if (level == 3) {
+            if (!(entry & RDNA4_VM_READABLE) || (write && !(entry & RDNA4_VM_WRITEABLE)) ||
+                (execute && !(entry & RDNA4_VM_EXECUTABLE)))
+                goto fault;
+            uint64_t physical = (entry & RDNA4_VM_PHYS_MASK) | (va & 0xfff);
+            int64_t off = rdna4_phys_to_vram(s, physical);
+            if (off < 0)
+                goto fault;
+            return rdna4_vram_span(s, off, len);
+        }
+        table = entry & RDNA4_VM_PHYS_MASK;
+    }
+fault:
+    rdna4_vm_fault(s, vmid, va);
+    /* Retry is off: serve the configured dummy page so the queue can drain. */
+    uint64_t dummy = ((uint64_t)reg_get(s, REG_GCVM_FAULT_DEFAULT_LO) |
+                      ((uint64_t)reg_get(s, REG_GCVM_FAULT_DEFAULT_HI) << 32)) << 12;
+    int64_t off = rdna4_phys_to_vram(s, dummy);
+    if (off >= 0 && len <= 0x1000 && (va & 0xfff) + len <= 0x1000)
+        return rdna4_vram_span(s, off + (va & 0xfff), len);
+    return NULL;
 }
 
 #define REG_GCMC_AGP_TOP     GC_SEG0(0x1616)   /* MC >> 24 */
@@ -1606,6 +1772,22 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         if (!s->inv_noack) {
             reg_set(s, REG_GCVM_INV17_ACK, val & 0xffff);   /* per-VMID ack */
         }
+        if (val & (1u << 24)) {
+            reg_set(s, REG_GCVM_FAULT_STATUS, 0);
+            reg_set(s, REG_GCVM_FAULT_ADDR_LO, 0);
+            reg_set(s, REG_GCVM_FAULT_ADDR_HI, 0);
+        }
+    } else if (addr == REG_GRBM_GFX_CNTL) {
+        reg_set(s, addr, val);
+        s->selected_pipe = val & 3;
+        s->selected_vmid = (val >> 4) & 0xf;
+        s->selected_queue = (val >> 8) & 7;
+        if (s->selected_pipe || s->selected_queue || s->selected_vmid)
+            s->hqd[s->selected_pipe][s->selected_queue].used = true;
+    } else if (addr == GC_SEG0(0x1fc1)) {
+        reg_set(s, addr, val);
+        if (val & 1)
+            reg_set(s, GC_SEG0(0x1fab), 0);
     } else if (dw >= DMU_SEG2 && dw < DMU_SEG3) {
         uint32_t d2 = dw - DMU_SEG2;
         if (d2 == DMCUB_INBOX1_WPTR) {
@@ -1672,6 +1854,7 @@ static const MemoryRegionOps rdna4_inert_ops = {
 #define REG_CP_MEC_PC_START  GC_SEG1(0x2900)
 #define REG_CP_PQ_STATUS     GC_SEG0(0x1e58)          /* DOORBELL_ENABLE [1] */
 #define REG_CP_HQD_ACTIVE    GC_SEG0(0x1fab)
+#define REG_CP_HQD_VMID      GC_SEG0(0x1fac)
 #define REG_CP_HQD_PQ_BASE   GC_SEG0(0x1fb1)          /* MC >> 8 */
 #define REG_CP_HQD_PQ_BASE_HI GC_SEG0(0x1fb2)
 #define REG_CP_HQD_PQ_RPTR   GC_SEG0(0x1fb3)          /* dwords */
@@ -1795,13 +1978,13 @@ static bool rdna4_vopd_op(uint32_t op, uint32_t a, uint32_t b, uint32_t d, uint3
  * unknown (ISA_ERROR, reported). Per work-item, so VCC is one bit
  * (lane-local carry) kept in s[106], and SCC is scalar state of the lane.
  */
-static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
+static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vmid)
 {
     uint64_t pc = l->pc;
     uint32_t scc = l->s[127];               /* s[127] is not an addressable SGPR here */
 
     for (; l->steps < (1u << 22); l->steps++) {
-        uint8_t *p = rdna4_gc_span(s, pc, 12);
+        uint8_t *p = rdna4_gc_span_vmid(s, pc, 12, vmid, false, true);
         if (!p) {
             fprintf(stderr, "rdna4: cs: instruction fetch at 0x%" PRIx64 " not mapped\n", pc);
             return ISA_ERROR;
@@ -1861,7 +2044,8 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
             uint64_t addr = (l->s[sbase] | ((uint64_t)l->s[sbase + 1] << 32)) + off +
                             (soff != 0x7c ? l->s[soff & 0x7f] : 0);
             uint8_t *m;
-            if (!count || sdata + count > 106 || !(m = rdna4_gc_span(s, addr, 4 * count))) {
+            if (!count || sdata + count > 106 ||
+                !(m = rdna4_gc_span_vmid(s, addr, 4 * count, vmid, false, false))) {
                 goto unknown;
             }
             for (uint32_t i = 0; i < count; i++) {
@@ -1929,7 +2113,7 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
                    (l->s[saddr] | ((uint64_t)l->s[saddr + 1] << 32)) + l->v[vaddr] :
                    l->v[vaddr] | ((uint64_t)l->v[(vaddr + 1) & 255] << 32);
             addr += ioff;
-            d = rdna4_gc_span(s, addr, 4 * count);
+            d = rdna4_gc_span_vmid(s, addr, 4 * count, vmid, op >= 26, false);
             if (!d) {
                 fprintf(stderr, "rdna4: cs: global access to 0x%" PRIx64 " not mapped\n", addr);
                 return ISA_ERROR;
@@ -2152,9 +2336,9 @@ static bool rdna4_wmma_const(uint32_t src, float *out)
  * an inline constant, the same for every element. false (and a message) on
  * anything unexpected.
  */
-static bool rdna4_wave_wmma(RDNA4State *s, RDNA4Lane *w, unsigned n)
+static bool rdna4_wave_wmma(RDNA4State *s, RDNA4Lane *w, unsigned n, uint32_t vmid)
 {
-    uint8_t *p = rdna4_gc_span(s, w[0].pc, 8);
+    uint8_t *p = rdna4_gc_span_vmid(s, w[0].pc, 8, vmid, false, true);
     uint32_t dw, dw1, op, vdst, s0, s1, s2, neg, neg_hi;
     float a[16][16], b[16][16], c[16][16], kc = 0;
 
@@ -2219,7 +2403,7 @@ static bool rdna4_wave_wmma(RDNA4State *s, RDNA4Lane *w, unsigned n)
  * the barrier opens. The group's LDS is what RSRC2.LDS_SIZE allocates.
  */
 static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32_t dim_z,
-                           uint32_t initiator)
+                           uint32_t initiator, uint32_t vmid)
 {
     uint64_t pgm = ((uint64_t)reg_get(s, REG_CS_PGM_LO) << 8) |
                    ((uint64_t)reg_get(s, REG_CS_PGM_HI) << 40);
@@ -2270,7 +2454,7 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
                     continue;
                 }
                 stuck = false;
-                switch (rdna4_isa_run(s, l, &lds)) {
+                switch (rdna4_isa_run(s, l, &lds, vmid)) {
                 case ISA_DONE:
                     live--;
                     ran++;
@@ -2292,7 +2476,7 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
                     at += lanes[w0 + i].at_wave;
                 }
                 if (at && at == n) {
-                    if (!rdna4_wave_wmma(s, &lanes[w0], n)) {
+                    if (!rdna4_wave_wmma(s, &lanes[w0], n, vmid)) {
                         goto stopped;
                     }
                     stuck = false;
@@ -2345,14 +2529,48 @@ static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)
     return *why == NULL;
 }
 
+static bool rdna4_select_mec_queue(RDNA4State *s, uint32_t db_dword)
+{
+    uint32_t off;
+
+    s->selected_pipe = s->selected_queue = s->selected_vmid = 0;
+    if (rdna4_hqd_reg(REG_CP_HQD_DOORBELL, &off)) {
+        for (uint32_t pipe = 0; pipe < 4; pipe++) {
+            for (uint32_t queue = 0; queue < 8; queue++) {
+                uint32_t doorbell = s->hqd[pipe][queue].q[off];
+                if (s->hqd[pipe][queue].used && (doorbell & (1u << 30)) &&
+                    ((doorbell >> 2) & 0x3ffffff) == db_dword) {
+                    s->selected_pipe = pipe;
+                    s->selected_queue = queue;
+                    s->selected_vmid = s->hqd[pipe][queue].q[
+                        (REG_CP_HQD_VMID / 4) - (0x1260 + 0x1fa0)] & 0xf;
+                    return true;
+                }
+            }
+        }
+    }
+    return ((reg_get(s, REG_CP_HQD_DOORBELL) & (1u << 30)) &&
+            ((reg_get(s, REG_CP_HQD_DOORBELL) >> 2) & 0x3ffffff) == db_dword);
+}
+
 static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
 {
     uint32_t size = 2u << (reg_get(s, REG_CP_HQD_PQ_CNTL) & 0x3f);   /* dwords */
     uint64_t pq = ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE) << 8) |
                   ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE_HI) << 40);
     uint32_t rptr = reg_get(s, REG_CP_HQD_PQ_RPTR);
+    uint32_t vmid;
     const char *why;
 
+    if (!rdna4_select_mec_queue(s, db_dword)) {
+        fprintf(stderr, "rdna4: mec: doorbell dword %u ignored: no queue\n", db_dword);
+        return;
+    }
+    size = 2u << (reg_get(s, REG_CP_HQD_PQ_CNTL) & 0x3f);
+    pq = ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE) << 8) |
+         ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE_HI) << 40);
+    rptr = reg_get(s, REG_CP_HQD_PQ_RPTR);
+    vmid = reg_get(s, REG_CP_HQD_VMID) & 0xf;
     if (!rdna4_mec_ready(s, db_dword, &why)) {
         fprintf(stderr, "rdna4: mec: doorbell dword %u ignored: %s\n", db_dword, why);
         return;
@@ -2363,7 +2581,8 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
     while (rptr != wptr) {
         uint32_t dw[16];
         for (int i = 0; i < 16; i++) {
-            uint8_t *p = rdna4_gc_span(s, pq + 4ull * ((rptr + i) % size), 4);
+            uint8_t *p = rdna4_gc_span_vmid(s, pq + 4ull * ((rptr + i) % size), 4,
+                                            vmid, false, false);
             if (!p) {
                 fprintf(stderr, "rdna4: mec: queue MC 0x%" PRIx64 " not mapped\n", pq);
                 return;
@@ -2395,12 +2614,13 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
         case 0x58:                                   /* ACQUIRE_MEM: coherent already */
             break;
         case 0x15:                                   /* DISPATCH_DIRECT */
-            rdna4_dispatch(s, dw[1], dw[2], dw[3], dw[4]);
+            rdna4_dispatch(s, dw[1], dw[2], dw[3], dw[4], vmid);
             break;
         case 0x37: {                                 /* WRITE_DATA to memory */
             uint64_t a = (dw[2] & ~3u) | ((uint64_t)dw[3] << 32);
             uint32_t n = count - 2;
-            uint8_t *p = ((dw[1] >> 8) & 0xf) == 5 ? rdna4_gc_span(s, a, 4ull * n) : NULL;
+            uint8_t *p = ((dw[1] >> 8) & 0xf) == 5 ?
+                         rdna4_gc_span_vmid(s, a, 4ull * n, vmid, true, false) : NULL;
             if (!p) {
                 fprintf(stderr, "rdna4: mec: WRITE_DATA to 0x%" PRIx64 " refused\n", a);
                 return;
@@ -2413,7 +2633,7 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
         case 0x49: {                                 /* RELEASE_MEM */
             uint64_t a = (dw[3] & ~3u) | ((uint64_t)dw[4] << 32);
             uint32_t sel = dw[2] >> 29;
-            uint8_t *p = rdna4_gc_span(s, a, sel == 2 ? 8 : 4);
+            uint8_t *p = rdna4_gc_span_vmid(s, a, sel == 2 ? 8 : 4, vmid, true, false);
             if (!p) {
                 fprintf(stderr, "rdna4: mec: RELEASE_MEM to 0x%" PRIx64 " refused\n", a);
                 return;
@@ -2423,9 +2643,16 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
             } else if (sel == 1) {
                 stl_le_p(p, dw[5]);
             }
-            if (((dw[2] >> 24) & 7) == 2 &&
-                (reg_get(s, REG_CP_ME1_PIPE0_INT_CNTL) & CP_TIME_STAMP_INT_ENABLE)) {
-                rdna4_ih_emit(s, 0x0a, 181, 4, dw[5]);
+            /* The end-of-pipe interrupt of the queue that ran it: ring_id =
+             * queue [6:4] | me 1 [3:2] | pipe [1:0] (gfx_v12_0_eop_irq), if
+             * that pipe's CP_ME1_PIPEn_INT_CNTL enables it (gfx12 has the
+             * register for pipes 0 and 1 only). */
+            if (((dw[2] >> 24) & 7) == 2 && s->selected_pipe < 2 &&
+                (reg_get(s, REG_CP_ME1_PIPE0_INT_CNTL + 4 * s->selected_pipe) &
+                 CP_TIME_STAMP_INT_ENABLE)) {
+                rdna4_ih_emit(s, 0x0a, 181,
+                              (uint8_t)((s->selected_queue << 4) | (1u << 2) | s->selected_pipe),
+                              dw[5]);
             }
             break;
         }
@@ -2438,7 +2665,7 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
     }
     uint64_t rep = (reg_get(s, REG_CP_HQD_RPTR_REP) & ~3u) |
                    ((uint64_t)(reg_get(s, REG_CP_HQD_RPTR_REP_HI) & 0xffff) << 32);
-    uint8_t *p = rdna4_gc_span(s, rep, 4);
+    uint8_t *p = rdna4_gc_span_vmid(s, rep, 4, vmid, true, false);
     if (p) {
         stl_le_p(p, rptr);
     }
@@ -2825,6 +3052,8 @@ static void rdna4_reset(DeviceState *dev)
 
     memset(s->regs, 0, RDNA4_MMIO_SIZE);
     memset(s->resv, 0, RDNA4_RESV_SIZE);
+    memset(s->hqd, 0, sizeof(s->hqd));
+    s->selected_pipe = s->selected_queue = s->selected_vmid = 0;
     memset(&s->i2c, 0, sizeof(s->i2c));
     if (s->state_file) {
         Error *err = NULL;
