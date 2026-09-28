@@ -2329,7 +2329,11 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             case 48: r = scc ? a : b; break;                                   /* s_cselect_b32 */
             default: goto unknown;
             }
-            l->s[sdst] = r;
+            /* Each interpreter lane represents one wave bit (bit 0).  Keep
+             * EXEC's scalar mask lane-local when a SOP2 writes exec_lo;
+             * preserving a complement such as 0xfffffffe would make a
+             * zero-bit lane look active to the boolean checks below. */
+            l->s[sdst] = sdst == 126 ? r & 1u : r;
         } else if (!(dw >> 31)) {                           /* VOP2 */
             uint32_t op = (dw >> 25) & 0x3f, vdst = (dw >> 17) & 0xff;
             uint32_t a = rdna4_isa_src(l, dw & 0x1ff, dw1, &lit);
