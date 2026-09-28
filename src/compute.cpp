@@ -88,13 +88,19 @@ void RDNA4Compute::publishResult(const char *feature, const char *value) {
 	if (!feature || !value || !env.owner || !resultLock)
 		return;
 	IOLockLock(resultLock);
-	if (!resultDictionary)
-		resultDictionary = OSDictionary::withCapacity(12);
-	if (resultDictionary) {
+	OSDictionary *next = resultDictionary
+		? OSDictionary::withDictionary(resultDictionary, 12)
+		: OSDictionary::withCapacity(12);
+	if (next) {
 		if (OSString *s = OSString::withCString(value)) {
-			resultDictionary->setObject(feature, s);
+			next->setObject(feature, s);
 			s->release();
-			env.owner->setProperty("RDNA4FB,Results", resultDictionary);
+			env.owner->setProperty("RDNA4FB,Results", next);
+			if (resultDictionary)
+				resultDictionary->release();
+			resultDictionary = next;
+		} else {
+			next->release();
 		}
 	}
 	IOLockUnlock(resultLock);
