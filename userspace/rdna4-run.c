@@ -81,6 +81,100 @@ static int cmdInfo(rdna4_t *gpu) {
 	return 0;
 }
 
+/* Two power-management samples one second apart (SmuMetrics_t fields the
+ * SMU averages itself).  GFX activity near 0 with a max clock means the
+ * firmware is holding the clock (feature/PM problem); activity near 100 means
+ * something really keeps GFX busy; a MetricsCounter that does not advance means
+ * the table is stale. */
+static void printSensorsPm(int n, const RDNA4SensorsEx *s) {
+	printf("sensors-pm[%d]: GFXCLK curr %u MHz (avg pre-DS %u, post-DS %u), "
+	       "GFX activity %u %%, UCLK activity %u %%, VDD_GFX %u mV %u A, "
+	       "socket %u W, hotspot %u C, MetricsCounter %u%s\n", n,
+	       s->currGfxclkMHz, s->avgGfxclkPreDsMHz, s->avgGfxclkPostDsMHz,
+	       s->gfxActivity, s->uclkActivity, s->vddGfxMv, s->vddGfxCurrentA,
+	       s->socketPowerW, s->hotspotTempC, s->metricsCounter,
+	       (s->flags & RDNA4_SENSORS_EX_LIVE) ? "" : " (STALE: table not rewritten)");
+	printf("sensors-pm[%d]: throttling %%", n);
+	int any = 0;
+	for (int i = 0; i < RDNA4_SENSORS_THROTTLERS; i++) {
+		if (s->throttlingPercent[i]) {
+			printf(" #%d=%u", i, s->throttlingPercent[i]);
+			any = 1;
+		}
+	}
+	printf("%s (mask 0x%x; #12-17 = TDC/PPT, THROTTLER_*_BIT in smu14_driver_if_v14_0.h)\n",
+	       any ? "" : " none", s->throttlingMask);
+}
+
+/* Two clocks in MHz within a quarter of each other (or 100 MHz). */
+static int near(uint32_t x, uint32_t y) {
+	const uint32_t hi = x > y ? x : y, lo = x > y ? y : x;
+	return hi - lo <= 100 || hi - lo <= hi / 4;
+}
+
+static int cmdSensorsPm(rdna4_t *gpu) {
+	RDNA4SensorsEx a, b;
+	kern_return_t kr = rdna4_sensors_ex(gpu, &a);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "sensors-pm: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	sleep(1);
+	kr = rdna4_sensors_ex(gpu, &b);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "sensors-pm: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	printSensorsPm(1, &a);
+	printSensorsPm(2, &b);
+	const int live = (a.flags & b.flags & RDNA4_SENSORS_EX_LIVE) &&
+	                 b.metricsCounter != a.metricsCounter;
+	printf("sensors-pm: MetricsCounter %u -> %u: table %s\n", a.metricsCounter,
+	       b.metricsCounter, live ? "LIVE" : "NOT advancing (stale or SMU idle-gated)");
+	/* The card's driver interface is 0x33, amdgpu's tables are 0x2E: trust the
+	 * new fields only if they look like what they should be. */
+	int plausible = 1;
+	const char *why = "";
+	const RDNA4SensorsEx *both[2] = { &a, &b };
+	for (int i = 0; i < 2; i++) {
+		const RDNA4SensorsEx *s = both[i];
+		if (s->gfxActivity > 100 || s->uclkActivity > 100) {
+			plausible = 0; why = "activity above 100 %";
+		} else if (s->vddGfxMv < 300 || s->vddGfxMv > 1400) {
+			plausible = 0; why = "VDD_GFX outside 300-1400 mV";
+		} else if (!near(s->currGfxclkMHz, s->avgGfxclkPreDsMHz) &&
+		           !near(s->currGfxclkMHz, s->avgGfxclkPostDsMHz)) {
+			plausible = 0; why = "CurrClock not near either average";
+		}
+	}
+	if (live) {
+		const uint32_t delta = b.metricsCounter - a.metricsCounter;   /* about 1000 per second */
+		if (delta < 10 || delta > 1000000) {
+			plausible = 0; why = "MetricsCounter delta not about 1 ms per tick";
+		}
+	}
+	/* "at max" is relative to the highest clock this run saw, not a constant. */
+	uint32_t maxSeen = 0;
+	for (int i = 0; i < 2; i++) {
+		const RDNA4SensorsEx *s = both[i];
+		if (s->currGfxclkMHz > maxSeen) maxSeen = s->currGfxclkMHz;
+		if (s->avgGfxclkPreDsMHz > maxSeen) maxSeen = s->avgGfxclkPreDsMHz;
+		if (s->avgGfxclkPostDsMHz > maxSeen) maxSeen = s->avgGfxclkPostDsMHz;
+	}
+	if (live && !plausible)
+		printf("sensors-pm: activity field implausible (%s): verdict INCONCLUSIVE, read the raw fields\n", why);
+	else if (live && maxSeen && b.currGfxclkMHz >= maxSeen - maxSeen / 10 && b.gfxActivity < 10)
+		printf("sensors-pm: verdict CLOCK-STEADY-AT-LOW-ACTIVITY (GFX %u MHz at %u %% activity; no second clock "
+		       "level was seen, so whether this is the DPM maximum needs the DPM range or the rdna4-gfxpm "
+		       "cap probe)\n", b.currGfxclkMHz, b.gfxActivity);
+	else if (live && b.gfxActivity >= 50)
+		printf("sensors-pm: verdict GFX-REALLY-BUSY (%u %% activity: look for a spinning queue)\n",
+		       b.gfxActivity);
+	else
+		printf("sensors-pm: verdict %s\n", live ? "no anomaly" : "INCONCLUSIVE");
+	return 0;
+}
+
 static int cmdSensors(rdna4_t *gpu) {
 	RDNA4Sensors s;
 	kern_return_t kr = rdna4_sensors(gpu, &s);
@@ -91,6 +185,8 @@ static int cmdSensors(rdna4_t *gpu) {
 	printf("sensors: edge %u C, hotspot %u C, GFX %u MHz, memory %u MHz, "
 	       "socket %u W, fan %u RPM\n", s.edgeTempC, s.hotspotTempC,
 	       s.gfxClockMHz, s.memoryClockMHz, s.socketPowerW, s.fanRpm);
+	/* the power-management view is additive: its failure does not fail sensors */
+	(void)cmdSensorsPm(gpu);
 	return 0;
 }
 

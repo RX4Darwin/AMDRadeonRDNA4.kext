@@ -55,6 +55,14 @@ kern_return_t rdna4_sensors(rdna4_t *dev, RDNA4Sensors *out) {
 	                                 out, &n);
 }
 
+kern_return_t rdna4_sensors_ex(rdna4_t *dev, RDNA4SensorsEx *out) {
+	if (!out)
+		return kIOReturnBadArgument;
+	size_t n = sizeof(*out);
+	return IOConnectCallStructMethod(dev->conn, kRDNA4MethodSensorsEx, NULL, 0,
+	                                 out, &n);
+}
+
 kern_return_t rdna4_sleep_test(rdna4_t *dev, uint32_t phase) {
 	uint64_t input = phase;
 	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodSleepTest, &input, 1, NULL, NULL);
