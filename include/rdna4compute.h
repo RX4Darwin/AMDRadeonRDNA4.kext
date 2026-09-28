@@ -73,6 +73,10 @@ enum {
 	kRDNA4MethodSensors,
 	/* debug-only root sleep cycle: 1 quiesce, 2 re-bring-up */
 	kRDNA4MethodSleepTest,
+	/* IB GPU VA, dwords, flags -> fence value */
+	kRDNA4MethodSubmitIb,
+	/* fence value, timeout milliseconds -> elapsed nanoseconds */
+	kRDNA4MethodWaitFence,
 	kRDNA4MethodCount
 };
 

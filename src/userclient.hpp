@@ -63,6 +63,8 @@ private:
 	static IOReturn sAllocHost(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sSensors(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sSleepTest(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sSubmitIb(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sWaitFence(OSObject *t, void *, IOExternalMethodArguments *a);
 };
 
 #endif /* RDNA4UserClient_hpp */

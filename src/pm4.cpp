@@ -78,6 +78,15 @@ uint32_t indirectBufferGfx(uint32_t *out, uint64_t addr, uint32_t dwords, uint32
 	return 4;
 }
 
+uint32_t indirectBufferCompute(uint32_t *out, uint64_t addr, uint32_t dwords, uint32_t vmid) {
+	out[0] = header(OpIndirectBuffer, 2);
+	out[1] = static_cast<uint32_t>(addr) & ~3u;
+	out[2] = static_cast<uint32_t>(addr >> 32);
+	/* INDIRECT_BUFFER_VALID is bit 23; CHAIN, OFFLOAD_POLLING and PRIV stay 0. */
+	out[3] = (dwords & 0xfffff) | (1u << 23) | ((vmid & 0xf) << 24);
+	return 4;
+}
+
 bool Queue::init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes) {
 	if (!cpu || sizeBytes < 256 || (sizeBytes & (sizeBytes - 1)) || (mc & 0xff))
 		return false;

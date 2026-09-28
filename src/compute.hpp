@@ -432,6 +432,9 @@ public:
 	                const char *name, uint64_t out[8]);
 	IOReturn rtUnload(const void *owner, uint64_t program);
 	IOReturn rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros);
+	IOReturn rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags,
+	                    uint64_t &fence);
+	IOReturn rtWaitFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns);
 	IOReturn rtPresent(const void *owner, uint64_t handle, uint64_t offset,
 	                   uint64_t &geometry, uint64_t &pitch);
 	IOReturn rtRestore(const void *owner);
@@ -459,6 +462,7 @@ private:
 	static constexpr uint64_t kHostMaxBuffer = 256ull << 20;
 	static constexpr uint64_t kHostMaxClient = 1ull << 30;
 	static constexpr uint64_t kHostMaxTotal = 4ull << 30;
+	static constexpr uint32_t kMaxIbOutstanding = 16;
 	struct RtBuffer  {
 		const void *owner { nullptr };
 		uint64_t    offset { 0 }, bytes { 0 }; // heap offset (pool or VRAM), size
@@ -483,6 +487,8 @@ private:
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
 		uint32_t fence { 0 }, doorbell { 0 };
+		uint32_t ibFences[kMaxIbOutstanding] {};
+		uint32_t ibOutstanding { 0 };
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
 		bool active { false };
@@ -532,6 +538,7 @@ private:
 	bool vmInvalidate(uint32_t vmid, const char *tag);
 	void logClientFault(RtClient &client, const char *tag);
 	void releaseHost(RtBuffer &buffer);
+	void retireIbFences(RtClient &client);
 
 	// DMA between host memory and VRAM (runtime.cpp). One pinned, physically
 	// contiguous bounce buffer; the GC hub's AGP aperture maps system memory
