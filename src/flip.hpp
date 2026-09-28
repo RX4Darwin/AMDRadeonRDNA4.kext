@@ -50,6 +50,11 @@ constexpr uint32_t addressHi(uint64_t address) {
 // this function is also used by post-boot clients.
 bool findPipe(RDNA4Compute &compute, Surface &out);
 
+// Poll the OTG frame counter until it advances. This is the temporary W5c
+// vblank interface; replace its polling body with ihWaitVblank when W1b lands.
+bool waitNextVblank(RDNA4Compute &compute, uint8_t otg, uint32_t timeoutMs,
+                    uint64_t &frame);
+
 // Latch one address and verify its vblank advance and readback. The caller
 // serializes this with rtLock and supplies any boot trail before the call.
 bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,

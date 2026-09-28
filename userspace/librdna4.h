@@ -91,6 +91,10 @@ kern_return_t rdna4_wait_vblank(rdna4_t *dev, uint32_t timeoutMs, uint64_t *coun
  * geometry is the active scanout width, height and pitch in pixels. */
 kern_return_t rdna4_present(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
                             uint32_t *width, uint32_t *height, uint32_t *pitch);
+kern_return_t rdna4_present_async(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                                   uint64_t *presentId);
+kern_return_t rdna4_wait_present(rdna4_t *dev, uint64_t presentId, uint32_t timeoutMs,
+                                  uint64_t *frame);
 kern_return_t rdna4_display_query(rdna4_t *dev, uint32_t *width, uint32_t *height,
                                   uint32_t *pitch);
 kern_return_t rdna4_restore(rdna4_t *dev);

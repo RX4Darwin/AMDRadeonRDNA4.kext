@@ -67,8 +67,11 @@ class RDNA4Compute;
 
 namespace Flip {
 bool run(RDNA4Compute &compute);
+bool waitNextVblank(RDNA4Compute &compute, uint8_t otg, uint32_t timeoutMs,
+                    uint64_t &frame);
 }
 class IOFilterInterruptEventSource;
+class IOTimerEventSource;
 class IOWorkLoop;
 class OSObject;
 class IOMemoryMap;
@@ -163,6 +166,8 @@ public:
 private:
 	friend bool Flip::run(RDNA4Compute &compute);
 	friend bool Flip::findPipe(RDNA4Compute &compute, Flip::Surface &out);
+	friend bool Flip::waitNextVblank(RDNA4Compute &compute, uint8_t otg, uint32_t timeoutMs,
+	                                uint64_t &frame);
 	friend bool Flip::flipTo(RDNA4Compute &compute, const Flip::Surface &surface,
 	                         uint64_t target, const char *name, uint64_t *latencyUs);
 
@@ -434,6 +439,10 @@ public:
 	IOReturn rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros);
 	IOReturn rtPresent(const void *owner, uint64_t handle, uint64_t offset,
 	                   uint64_t &geometry, uint64_t &pitch);
+	IOReturn rtPresentAsync(const void *owner, uint64_t handle, uint64_t offset,
+	                        uint64_t &presentId);
+	IOReturn rtWaitPresent(const void *owner, uint64_t presentId, uint32_t timeoutMs,
+	                       uint64_t &frame);
 	IOReturn rtRestore(const void *owner);
 	void     rtRelease(const void *owner);
 
@@ -511,6 +520,27 @@ private:
 	uint64_t       presentOffset { 0 };
 	uint64_t       presentStarted { 0 };
 	Flip::Surface  presentSurface {};
+	static constexpr uint32_t kPresentSlots = 4;
+	struct PresentSlot {
+		const void *owner { nullptr };
+		uint64_t handle { 0 }, offset { 0 }, id { 0 }, frame { 0 };
+		IOReturn result { kIOReturnSuccess };
+		uint8_t state { 0 };                 // 0 free, 1 pending, 2 completed
+	};
+	PresentSlot  presentSlots[kPresentSlots] {};
+	uint32_t     presentPending { 0 };
+	uint64_t     nextPresentId { 1 };
+	IOTimerEventSource *presentTimer { nullptr };
+	IOWorkLoop        *presentWorkLoop { nullptr };
+	OSObject          *presentContext { nullptr };
+	static void presentTimerAction(OSObject *owner, IOTimerEventSource *timer);
+	bool     initPresentationTimer();
+	void     stopPresentationTimer();
+	void     schedulePresentationTimer();
+	void     presentTimerTick();
+	PresentSlot *presentSlot(uint64_t id, const void *owner);
+	void     completePresentLocked(PresentSlot &slot, IOReturn result, uint64_t frame);
+	void     dropPendingPresentsLocked(IOReturn result);
 	void     checkPresentationTimeoutLocked();
 	IOReturn restorePresentationLocked(const char *why);
 	void     clearPresentationLocked();
