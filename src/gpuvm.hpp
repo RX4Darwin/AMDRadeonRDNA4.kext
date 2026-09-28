@@ -44,6 +44,11 @@ constexpr uint64_t kPdePte     = 1ull << 63;  // AMDGPU_PDE_PTE_GFX12
 uint64_t encodePte(uint64_t physical, uint64_t flags, bool fragment64K);
 uint64_t encodePde(uint64_t physical, uint64_t flags, uint32_t level);
 
+/* Convert a VRAM MC address to the GPU-physical address gfx12 puts in VM
+ * entries.  The FB_OFFSET value is in 16 MiB units. */
+bool mcToPhysical(uint64_t mc, uint64_t fbMcBase, uint32_t fbOffset,
+                  uint64_t &physical);
+
 uint32_t index(uint64_t va, uint32_t level);
 uint64_t entryPhysical(uint64_t entry);
 

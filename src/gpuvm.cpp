@@ -20,14 +20,19 @@ uint64_t encodePte(uint64_t physical, uint64_t flags, bool fragment64K) {
 }
 
 uint64_t encodePde(uint64_t physical, uint64_t flags, uint32_t level) {
-	uint64_t value = physical & kPhysicalMask;
-	value |= flags & ~(kPhysicalMask | kPdeBfsMask | kPdePte);
-	/* gmc_v12_0_get_vm_pde leaves PDE_PTE set through PDB1 and clears it at PDB0. */
-	if (level >= 1)
-		value |= kPdePte;
-	if (level == 1)
-		value |= static_cast<uint64_t>(9) << 58;
-	return value;
+	(void)level;
+	/* gfx12.0 has no translate_further: a regular directory entry is just
+	 * its GPU-physical address and VALID.  PDE_PTE is reserved for a huge
+	 * page leaf and BFS is likewise meaningful only with that leaf format. */
+	return (physical & kPhysicalMask) | (flags & kValid);
+}
+
+bool mcToPhysical(uint64_t mc, uint64_t fbMcBase, uint32_t fbOffset,
+	               uint64_t &physical) {
+	if (mc < fbMcBase)
+		return false;
+	physical = (static_cast<uint64_t>(fbOffset & 0xffffff) << 24) + (mc - fbMcBase);
+	return true;
 }
 
 uint32_t index(uint64_t va, uint32_t level) {

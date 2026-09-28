@@ -974,6 +974,7 @@ bool RDNA4Compute::gcHubInit() {
 	}
 	const uint32_t fbOffset = sv.mmFbOffset & 0xffffff;
 	wr(IpDiscovery::HwGc, GcFbOffset, fbOffset);
+	sv.gcFbOffset = fbOffset;
 	// Page-table and default-page addresses are physical (VRAM offset plus
 	// FB_OFFSET), as gmc_v12_0_get_vm_pde makes them, not MC addresses.
 	const uint64_t phys = static_cast<uint64_t>(fbOffset) << 24;

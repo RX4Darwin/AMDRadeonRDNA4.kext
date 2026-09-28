@@ -320,7 +320,7 @@ private:
 	struct RtClient {
 		const void *owner { nullptr };
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
-		uint64_t tableOffset { 0 }, rootMc { 0 }, nextVa { GpuVm::kVaStart };
+		uint64_t tableOffset { 0 }, rootMc { 0 }, rootPhys { 0 }, nextVa { GpuVm::kVaStart };
 		uint64_t kernargVa { 0 }, fenceVa { 0 };
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
@@ -380,6 +380,9 @@ private:
 	bool bounceCopy(uint64_t vramMc, uint32_t hostOffset, uint32_t bytes, bool toGpu);
 	IOReturn dmaCopy(task_t task, mach_vm_address_t user, uint64_t mc, uint64_t length, bool toGpu);
 	uint64_t vramMc(uint64_t vramOffset) const { return sv.fbMcBase + vramOffset; }
+	bool gpuPhysical(uint64_t mc, uint64_t &physical) const {
+		return GpuVm::mcToPhysical(mc, sv.fbMcBase, sv.gcFbOffset, physical);
+	}
 	// SMU mailbox (MP1): send one message, return the response code
 	// (1 = OK, 0 = no answer) and the argument register after it.
 	uint32_t smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs);
