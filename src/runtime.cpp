@@ -988,7 +988,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 		if (forceFail == 2 && !(fence && data && clean)) {
 			/* Test hook, mode 2: the fault is "HQD side only": put the context back,
 			 * so E4 (an IB through the same tables) passes in the emulator. */
-			(void)hqdStop();
+			if (hqdStop())
+				hqd = false;
 			(void)vmContextInit(c);
 			(void)vmInvalidate(vmid, "force-fail 2");
 		}
@@ -1008,6 +1009,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 				RLOG("vm: HQD dequeue timed out; diagnostics abandoned");
 				abandon = true;
 			} else {
+				hqd = false;   /* stopped: nothing left to dequeue at the end */
 				(void)vmInvalidate(vmid, "variant cleanup");
 			}
 			const uint32_t savedL4 = rdGc(GcL2Cntl4);
@@ -1016,6 +1018,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 			const uint64_t savedPhys = c.rootPhys;
 			uint32_t savedWin[4] = {};
 			bool passed[4] = { false, false, false, false };
+			bool e2Skipped = false;
 			/* a, b, c, E2, then E4 last (below). */
 			static const uint32_t order[4] = { 0, 1, 2, 3 };
 			static const uint32_t bit[4] = { 2, 4, 8, 16 };
@@ -1054,6 +1057,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 					}
 					if (!written) {
 						RLOG("vm: E2: the four mirrored windows are already equal on both hubs; skipped");
+						e2Skipped = true;
 						continue;
 					}
 					(void)gcHubFlush();
@@ -1091,6 +1095,9 @@ bool RDNA4Compute::vmBootSelfTest() {
 				if (!hqdStop()) {
 					RLOG("vm: variant: HQD dequeue timed out; the rest is abandoned");
 					abandon = true;
+					hqd = true;    /* still active: the final cleanup dequeues it */
+				} else {
+					hqd = false;
 				}
 				trail("vm: variant restore");
 				if (v == 3) {
@@ -1172,9 +1179,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 			}
 			RLOG("vm: variants: a %s, b %s, c %s, E2 %s (baseline failed; runtime stays disabled)",
 			     passed[0] ? "PASS" : "fail", passed[1] ? "PASS" : "fail", passed[2] ? "PASS" : "fail",
-			     passed[3] ? "PASS" : "fail");
+			     e2Skipped ? "skipped" : passed[3] ? "PASS" : "fail");
 			fence = baseFence; data = baseData; clean = baseClean;
-			hqd = false;
 		}
 	}
 	if (context && (hqd || !fence)) {
@@ -2816,6 +2822,12 @@ void RDNA4Compute::vmDumpHubWindows(const char *tag) {
 	for (uint32_t b = 0; b < 2; b++) {
 		uint32_t g[20], m[20], differ = 0;
 		for (uint32_t i = 0; i < blocks[b].n; i++) {
+			/* GCMC_VM_SHARED_VIRT_RESET_REQ (GC 0x15ab, MM 0x04cb) is reset-named:
+			 * never read it. */
+			if (b == 0 && i == 11) {
+				g[i] = m[i] = 0;
+				continue;
+			}
 			g[i] = rdGc(GfxReg::Reg { 0, blocks[b].gc + i });
 			m[i] = rd(IpDiscovery::HwMmhub, GfxReg::Reg { 0, blocks[b].mm + i });
 			if (g[i] != m[i])
