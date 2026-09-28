@@ -313,6 +313,32 @@ record() {
 		record runtime FAIL "info/selftest/bench did not all pass"
 	fi
 
+	# W8: selftest's SubmitIb section proves a single IB, ordered fences and
+	# ten back-to-back IBs. Keep it separate from the general runtime result so
+	# the real-card report shows which queue path was actually exercised.
+	if [ "$INFO_OK" -eq 0 ]; then
+		record submitib SKIPPED "runtime unavailable"
+	elif [ "$SELFTEST_RC" -eq 0 ] && \
+		grep -q '  ok  SubmitIb vadd:' "$SELFTEST_FILE" && \
+		grep -q 'ok    three IBs back-to-back' "$SELFTEST_FILE" && \
+		grep -q 'ok    ten back-to-back IBs completed in order' "$SELFTEST_FILE"; then
+		record submitib PASS "single + ordered + ten IBs PASS"
+	else
+		record submitib FAIL "SubmitIb selftest did not prove ordered completion"
+	fi
+
+	# W2 fault-page scrub: the selftest dispatches through a freed host VA and
+	# requires a clean fence. The kernel clears the shared fault-default page
+	# after servicing that fault, so retain the user-visible proof in the table.
+	if [ "$INFO_OK" -eq 0 ]; then
+		record fault SKIPPED "runtime unavailable"
+	elif [ "$SELFTEST_RC" -eq 0 ] && \
+		grep -q 'ok    dispatch through freed host VA faulted cleanly' "$SELFTEST_FILE"; then
+		record fault PASS "freed-VA fault recovered; page scrubbed"
+	else
+		record fault FAIL "freed-VA fault did not recover cleanly"
+	fi
+
 	if [ "$VM_MODE" -eq 0 ]; then
 		record vm SKIPPED "rdna4-vm not enabled"
 	elif [ "$SELFTEST_RC" -eq 0 ] && \
@@ -348,8 +374,11 @@ record() {
 		record gfx SKIPPED "rdna4-gfx not enabled"
 	elif grep -Eq 'RDNA4FB: .*gfx: .*failure|RDNA4FB: .*stage gfx ring.*failed|RDNA4FB: .*gfx ring.*off' "$KLOG"; then
 		record gfx FAIL "ring/draw path reported a failure"
+	elif grep -Eq 'RDNA4FB: .*gfx: .*THE TRIANGLE IS RIGHT.*8192 pixels' "$KLOG"; then
+		gfx_key="THE TRIANGLE IS RIGHT; 8192 pixels"
+		record gfx PASS "$gfx_key"
 	elif grep -Eq 'RDNA4FB: .*gfx: .*ring|RDNA4FB: .*gfx: .*draw' "$KLOG"; then
-		record gfx PASS "ring/draw lines present"
+		record gfx FAIL "ring/draw present but triangle proof missing"
 	else
 		record gfx SKIPPED "feature skipped before ring test"
 	fi
@@ -369,7 +398,9 @@ record() {
 	elif [ -z "$ANIM_FILE" ]; then
 		record anim SKIPPED "command unavailable"
 	elif [ "$ANIM_RC" -eq 0 ]; then
-		record anim PASS "animation completed"
+		anim_key="frames rendered"
+		grep -q 'anim: desktop restored' "$ANIM_FILE" && anim_key="$(grep 'anim: frames rendered' "$ANIM_FILE" | tail -1); desktop restored"
+		record anim PASS "$anim_key"
 	else
 		record anim FAIL "animation command failed"
 	fi
