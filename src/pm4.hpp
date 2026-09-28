@@ -24,6 +24,7 @@ enum Op : uint32_t {
 	OpWriteData      = 0x37,
 	OpReleaseMem     = 0x49,
 	OpAcquireMem     = 0x58,
+	OpIndirectBuffer = 0x3f,
 	OpSetShReg       = 0x76,
 	OpSetUconfigReg  = 0x79,
 };
@@ -43,6 +44,7 @@ constexpr uint32_t kReleaseCachePolicy3 = 3u << 25;
 constexpr uint32_t kReleaseEventIndex5  = 5u << 8;
 constexpr uint32_t kReleaseData32       = 1u << 29; // DATA_SEL(1): low 32 bits of seq
 constexpr uint32_t kReleaseData64       = 2u << 29;
+constexpr uint32_t kReleaseIntSel2      = 2u << 24; // INT_SEL(2): interrupt after write
 
 constexpr uint32_t kShStart             = 0x2c00;   // PACKET3_SET_SH_REG_START
 
@@ -60,11 +62,14 @@ constexpr uint32_t kGcrMemSync = (1u << 0) | (1u << 4) | (1u << 5) | (1u << 7) |
 // `reg` is the absolute register dword offset (UCONFIG space, >= 0xc000).
 uint32_t setUconfigReg(uint32_t *out, uint32_t reg, uint32_t value);
 uint32_t writeData(uint32_t *out, uint64_t addr, uint32_t value);
-uint32_t releaseMem(uint32_t *out, uint64_t addr, uint32_t seq);
+uint32_t releaseMem(uint32_t *out, uint64_t addr, uint32_t seq, bool interrupt = false);
 // `n` consecutive SH registers from absolute dword `reg` (0x2c00..0x2fff).
 uint32_t setShReg(uint32_t *out, uint32_t reg, const uint32_t *values, uint32_t n);
 uint32_t dispatchDirect(uint32_t *out, uint32_t x, uint32_t y, uint32_t z, uint32_t initiator);
 uint32_t acquireMem(uint32_t *out, uint32_t gcrCntl);
+// A gfx-ring INDIRECT_BUFFER (gfx_v12_0_ring_emit_ib_gfx, no VALID bit; the
+// compute form sets it): `dwords` at `addr` (dword aligned) under `vmid`.
+uint32_t indirectBufferGfx(uint32_t *out, uint64_t addr, uint32_t dwords, uint32_t vmid);
 
 // A queue of `sizeBytes` (power of two) at `cpu`; write pointer in dwords.
 class Queue {

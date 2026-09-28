@@ -5,10 +5,13 @@
  *  Command-line client of the RDNA4FB compute runtime (run as root):
  *
  *    rdna4-run info                        what the runtime reports
+ *    rdna4-run sleeptest                  debug-only simulated sleep cycle
  *    rdna4-run selftest [items]            shaders/vadd.cl and bench.cl's
  *                                          lds_reverse and wmma16 (embedded)
  *                                          on the GPU, every result checked,
  *                                          plus the runtime's refusals
+ *    rdna4-run selftest hang               selftest, then queue recovery
+ *    rdna4-run hangtest                    hang recovery followed by vadd
  *    rdna4-run bench [small]               host<->GPU copies, VRAM bandwidth,
  *                                          SGEMM GFLOPS and the matrix units
  *                                          (FP16/BF16 GEMM) from bench.cl,
@@ -27,6 +30,7 @@
 #include "vadd_codeobj.h"
 
 #include <Accelerate/Accelerate.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +76,79 @@ static int cmdInfo(rdna4_t *gpu) {
 	       : "the CPU through the BAR (no DMA)");
 	if (in.flags & RDNA4_FLAG_VM)
 		printf("GPUVM: VMID %llu, MEC1 pipe %llu queue %llu\n", in.vmid, in.pipe, in.queue);
+	return 0;
+}
+
+static int cmdSensors(rdna4_t *gpu) {
+	RDNA4Sensors s;
+	kern_return_t kr = rdna4_sensors(gpu, &s);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "sensors: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	printf("sensors: edge %u C, hotspot %u C, GFX %u MHz, memory %u MHz, "
+	       "socket %u W, fan %u RPM\n", s.edgeTempC, s.hotspotTempC,
+	       s.gfxClockMHz, s.memoryClockMHz, s.socketPowerW, s.fanRpm);
+	return 0;
+}
+
+static int cmdSleepTest(rdna4_t *gpu) {
+	kern_return_t kr = rdna4_sleep_test(gpu, 1);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "sleeptest: phase 1: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	printf("sleeptest: sleep selector acknowledged; waiting for emulator reset\n");
+	fflush(stdout);
+	/* RDNA4_POST sets the QEMU sleep-reset property during this window. */
+	sleep(15);
+	kr = rdna4_sleep_test(gpu, 2);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "sleeptest: phase 2: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	printf("sleeptest: wake selector acknowledged; waiting for re-bring-up\n");
+	fflush(stdout);
+	sleep(15);
+	rdna4_info_t info;
+	kr = rdna4_info(gpu, &info);
+	if (kr != kIOReturnAborted) {
+		fprintf(stderr, "sleeptest: pre-sleep client returned %s, want aborted\n",
+		        rdna4_error(kr));
+		return 1;
+	}
+	printf("sleeptest: pre-sleep client aborted as expected\n");
+	return 0;
+}
+
+static int cmdVsync(rdna4_t *gpu, uint32_t frames) {
+	uint64_t previous = 0, minNs = UINT64_MAX, maxNs = 0, sumNs = 0;
+	uint32_t intervals = 0;
+	for (uint32_t i = 0; i < frames; i++) {
+		uint64_t count = 0, timeNs = 0;
+		kern_return_t kr = rdna4_wait_vblank(gpu, 1000, &count, &timeNs);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "vsync: vblank %u/%u: %s\n", i + 1, frames, rdna4_error(kr));
+			return 1;
+		}
+		if (previous) {
+			uint64_t interval = timeNs - previous;
+			if (interval < minNs)
+				minNs = interval;
+			if (interval > maxNs)
+				maxNs = interval;
+			sumNs += interval;
+			intervals++;
+		}
+		previous = timeNs;
+	}
+	if (!intervals) {
+		printf("vsync: %u vblank, no interval\n", frames);
+		return 0;
+	}
+	const double average = (double)sumNs / intervals;
+	printf("vsync: %u vblanks, refresh %.3f Hz, interval %.0f ns (jitter %llu..%llu ns)\n",
+	       frames, 1.0e9 / average, average, minNs, maxNs);
 	return 0;
 }
 
@@ -138,6 +215,85 @@ static int checkFailed(const char *what, kern_return_t kr) {
 
 static uint32_t aOf(uint32_t i);
 static uint32_t bOf(uint32_t i, uint32_t round);
+
+static int testVadd(rdna4_t *gpu, uint32_t items) {
+	int fails = 0;
+	const uint64_t bytes = (uint64_t)items * 4;
+	rdna4_program_t prog;
+	kern_return_t kr = rdna4_load(gpu, kVaddCodeObject, sizeof(kVaddCodeObject), "vadd", &prog);
+	if (kr != KERN_SUCCESS) {
+		printf("  FAIL  recovery vadd load: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	rdna4_buffer_t a, b, c;
+	uint32_t *ha = malloc(bytes), *hb = malloc(bytes), *hc = malloc(bytes);
+	if (!ha || !hb || !hc || (kr = rdna4_alloc(gpu, bytes, &a)) ||
+	    (kr = rdna4_alloc(gpu, bytes, &b)) || (kr = rdna4_alloc(gpu, bytes, &c))) {
+		printf("  FAIL  recovery vadd setup: %s\n", rdna4_error(kr));
+		free(ha); free(hb); free(hc); rdna4_unload(gpu, &prog);
+		return 1;
+	}
+	for (uint32_t i = 0; i < items; i++) {
+		ha[i] = aOf(i);
+		hb[i] = bOf(i, 0);
+		hc[i] = 0xffffffffu;
+	}
+	const uint64_t args[3] = { a.gpu, b.gpu, c.gpu };
+	const uint32_t groups[3] = { items / 64, 1, 1 }, size[3] = { 64, 1, 1 };
+	if ((kr = rdna4_write(gpu, &a, 0, ha, bytes)) || (kr = rdna4_write(gpu, &b, 0, hb, bytes)) ||
+	    (kr = rdna4_write(gpu, &c, 0, hc, bytes)) ||
+	    (kr = rdna4_dispatch(gpu, &prog, groups, size, args, sizeof(args), 2000, NULL)) ||
+	    (kr = rdna4_read(gpu, &c, 0, hc, bytes))) {
+		printf("  FAIL  recovery vadd: %s\n", rdna4_error(kr));
+		fails++;
+	} else {
+		for (uint32_t i = 0; i < items; i++) {
+			if (hc[i] != aOf(i) + 3 * bOf(i, 0)) {
+				printf("  FAIL  recovery vadd c[%u] = 0x%08x (want 0x%08x)\n", i, hc[i],
+				       aOf(i) + 3 * bOf(i, 0));
+				fails++;
+				break;
+			}
+		}
+		if (!fails)
+			printf("  ok    recovery vadd: %u results correct after queue reset\n", items);
+	}
+	rdna4_free(gpu, &a); rdna4_free(gpu, &b); rdna4_free(gpu, &c);
+	rdna4_unload(gpu, &prog);
+	free(ha); free(hb); free(hc);
+	return fails;
+}
+
+static int cmdHangtest(rdna4_t *gpu) {
+	int fails = 0;
+	rdna4_program_t spin;
+	kern_return_t kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "spin", &spin);
+	if (kr != KERN_SUCCESS) {
+		printf("hangtest: load spin: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	rdna4_buffer_t flag;
+	uint32_t zero = 0;
+	const uint32_t groups[3] = { 1, 1, 1 }, size[3] = { 1, 1, 1 };
+	if ((kr = rdna4_alloc(gpu, sizeof(zero), &flag)) || (kr = rdna4_write(gpu, &flag, 0, &zero, sizeof(zero)))) {
+		printf("hangtest: flag setup: %s\n", rdna4_error(kr));
+		rdna4_unload(gpu, &spin);
+		return 1;
+	}
+	const uint64_t args[1] = { flag.gpu };
+	kr = rdna4_dispatch(gpu, &spin, groups, size, args, sizeof(args), 200, NULL);
+	if (kr != kIOReturnTimeout) {
+		printf("  FAIL  spin dispatch returned %s (want timeout)\n", rdna4_error(kr));
+		fails++;
+	} else {
+		printf("  ok    spin dispatch timed out; queue recovery was attempted\n");
+	}
+	rdna4_free(gpu, &flag);
+	rdna4_unload(gpu, &spin);
+	fails += testVadd(gpu, 256);
+	printf("hangtest: %s\n", fails ? "FAILED" : "PASS");
+	return fails ? 1 : 0;
+}
 
 typedef struct VmPeerJob {
 	rdna4_t *gpu;
@@ -357,6 +513,142 @@ static double nowUs(void) {
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return t.tv_sec * 1e6 + t.tv_nsec / 1e3;
+}
+
+static volatile sig_atomic_t showSignal;
+
+static void showSignalHandler(int signalNumber) {
+	(void)signalNumber;
+	showSignal = 1;
+}
+
+static uint32_t mandelbrotColor(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+	const float cx = ((float)x / (float)width - 0.5f) * 3.2f - 0.7f;
+	const float cy = ((float)y / (float)height - 0.5f) * 2.2f;
+	float zx = 0.0f, zy = 0.0f;
+	uint32_t iteration = 0;
+	for (; iteration < 256u; iteration++) {
+		const float zx2 = zx * zx;
+		const float zy2 = zy * zy;
+		if (zx2 + zy2 > 4.0f)
+			break;
+		const float nextZx = zx2 - zy2 + cx;
+		zy = 2.0f * zx * zy + cy;
+		zx = nextZx;
+	}
+	if (iteration >= 256u)
+		return 0xff000000u;
+	const float t = (float)iteration * (1.0f / 255.0f);
+	const uint32_t r = (uint32_t)(9.0f + 246.0f * t);
+	const uint32_t g = (uint32_t)(20.0f + 200.0f * (1.0f - t));
+	const uint32_t b = (uint32_t)(80.0f + 175.0f * t);
+	return 0xff000000u | (r << 16) | (g << 8) | b;
+}
+
+static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
+	uint32_t width = 0, height = 0, pitch = 0;
+	kern_return_t kr = rdna4_display_query(gpu, &width, &height, &pitch);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: display query: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	if (!width || !height || !pitch || (uint64_t)pitch * height > UINT64_MAX / 4) {
+		fprintf(stderr, "show: invalid display geometry %ux%u pitch %u\n", width, height, pitch);
+		return 1;
+	}
+	const uint64_t bytes = (uint64_t)pitch * height * 4;
+	printf("show: geometry %ux%u pitch %u (%llu bytes)\n", width, height, pitch, bytes);
+
+	rdna4_program_t prog = { 0 };
+	rdna4_buffer_t buf = { 0 };
+	int loaded = 0, allocated = 0, presented = 0, rc = 1;
+	kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "mandelbrot", &prog);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: load mandelbrot: %s\n", rdna4_error(kr));
+		goto done;
+	}
+	loaded = 1;
+	kr = rdna4_alloc(gpu, bytes, &buf);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: allocate %llu bytes: %s\n", bytes, rdna4_error(kr));
+		goto done;
+	}
+	allocated = 1;
+	{
+		uint8_t args[20] = { 0 };
+		memcpy(args, &buf.gpu, sizeof(buf.gpu));
+		memcpy(args + 8, &width, sizeof(width));
+		memcpy(args + 12, &height, sizeof(height));
+		memcpy(args + 16, &pitch, sizeof(pitch));
+		const uint32_t groups[3] = { (width + 15) / 16, (height + 15) / 16, 1 };
+		const uint32_t groupSize[3] = { 16, 16, 1 };
+		uint64_t kernelUs = 0;
+		kr = rdna4_dispatch(gpu, &prog, groups, groupSize, args, sizeof(args), 10000, &kernelUs);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "show: Mandelbrot dispatch: %s\n", rdna4_error(kr));
+			goto done;
+		}
+		printf("show: Mandelbrot kernel %llu us\n", kernelUs);
+	}
+
+	showSignal = 0;
+	signal(SIGINT, showSignalHandler);
+	signal(SIGTERM, showSignalHandler);
+	{
+		const double presentStart = nowUs();
+		kr = rdna4_present(gpu, &buf, 0, &width, &height, &pitch);
+		printf("show: present latency %.0f us\n", nowUs() - presentStart);
+	}
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: present: %s\n", rdna4_error(kr));
+		goto done;
+	}
+	presented = 1;
+	{
+		uint32_t mismatches = 0;
+		for (uint32_t sy = 1; sy <= 8; sy++) {
+			const uint32_t y = (uint64_t)sy * height / 9;
+			for (uint32_t sx = 1; sx <= 8; sx++) {
+				const uint32_t x = (uint64_t)sx * width / 9;
+				uint32_t got = 0;
+				kr = rdna4_read(gpu, &buf, ((uint64_t)y * pitch + x) * 4, &got, sizeof(got));
+				const uint32_t want = mandelbrotColor(x, y, width, height);
+				if (kr != KERN_SUCCESS || got != want)
+					mismatches++;
+			}
+		}
+		printf("show: CPU spot check 64 pixels, mismatches %u\n", mismatches);
+		if (kr != KERN_SUCCESS || mismatches)
+			goto done;
+	}
+	for (uint32_t left = seconds * 10; left && !showSignal; left--)
+		usleep(100000);
+	if (showSignal)
+		fprintf(stderr, "show: interrupted; restoring desktop\n");
+	kr = rdna4_restore(gpu);
+	presented = 0;
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: restore: %s\n", rdna4_error(kr));
+		goto done;
+	}
+	printf("show: desktop restored\n");
+	rc = showSignal ? 1 : 0;
+
+done:
+	signal(SIGINT, SIG_DFL);
+	signal(SIGTERM, SIG_DFL);
+	if (presented) {
+		kern_return_t restore = rdna4_restore(gpu);
+		if (restore != KERN_SUCCESS) {
+			fprintf(stderr, "show: cleanup restore: %s\n", rdna4_error(restore));
+			rc = 1;
+		}
+	}
+	if (allocated)
+		rdna4_free(gpu, &buf);
+	if (loaded)
+		rdna4_unload(gpu, &prog);
+	return rc;
 }
 
 // LDS and a work-group barrier (bench.cl's lds_reverse): each group of 64
@@ -1120,8 +1412,14 @@ static int cmdLoad(rdna4_t *gpu, const char *path, const char *kernel) {
 
 static void usage(void) {
 	fprintf(stderr, "usage: rdna4-run info\n"
+	                "       rdna4-run sleeptest\n"
+	                "       rdna4-run sensors\n"
 	                "       rdna4-run selftest [items]\n"
+	                "       rdna4-run selftest hang\n"
+	                "       rdna4-run hangtest\n"
 	                "       rdna4-run bench [small]\n"
+	                "       rdna4-run vsync [n]\n"
+	                "       rdna4-run show [seconds]\n"
 	                "       rdna4-run load <file.hsaco> <kernel>\n");
 }
 
@@ -1136,14 +1434,46 @@ int main(int argc, char **argv) {
 		if (!openRuntime(&gpu))
 			return 1;
 		rc = cmdInfo(&gpu);
+	} else if (!strcmp(argv[1], "sleeptest") && argc == 2) {
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdSleepTest(&gpu);
+	} else if (!strcmp(argv[1], "sensors") && argc == 2) {
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdSensors(&gpu);
 	} else if (!strcmp(argv[1], "selftest") && argc <= 3) {
 		if (!openRuntime(&gpu))
 			return 1;
-		rc = cmdSelftest(&gpu, argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 65536);
+		if (argc == 3 && !strcmp(argv[2], "hang")) {
+			rc = cmdSelftest(&gpu, 65536);
+			if (!rc)
+				rc = cmdHangtest(&gpu);
+		} else {
+			rc = cmdSelftest(&gpu, argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 65536);
+		}
+	} else if (!strcmp(argv[1], "hangtest") && argc == 2) {
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdHangtest(&gpu);
 	} else if (!strcmp(argv[1], "bench") && argc <= 3) {
 		if (!openRuntime(&gpu))
 			return 1;
 		rc = cmdBench(&gpu, argc == 3 && !strcmp(argv[2], "small"));
+	} else if (!strcmp(argv[1], "vsync") && argc <= 3) {
+		uint32_t frames = argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 120;
+		if (!frames || frames > 100000) {
+			fprintf(stderr, "vsync: n must be 1..100000\n");
+			return 2;
+		}
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdVsync(&gpu, frames);
+	} else if (!strcmp(argv[1], "show") && argc <= 3) {
+		if (!openRuntime(&gpu))
+			return 1;
+		const uint32_t seconds = argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 5;
+		rc = cmdShow(&gpu, seconds);
 	} else if (!strcmp(argv[1], "load") && argc == 4) {
 		if (!openRuntime(&gpu))
 			return 1;

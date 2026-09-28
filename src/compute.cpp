@@ -9,6 +9,7 @@
 
 #include "codeobj.hpp"
 #include "compute.hpp"
+#include "flip.hpp"
 #include "pm4.hpp"
 #include "probe_kernel.h"
 #include "sdma.hpp"
@@ -379,6 +380,9 @@ void RDNA4Compute::choosePool() {
 
 uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 	env = e;
+	uint32_t hang = 1;
+	hangRecoveryEnabled = !PE_parse_boot_argn("rdna4-hang", &hang, sizeof(hang)) || hang != 0;
+	CLOG("queue hang recovery %s (rdna4-hang=%u)", hangRecoveryEnabled ? "enabled" : "disabled", hang);
 	vmEnabled = requestedVm();
 	if (stage == StageOff)
 		return StageOff;
@@ -474,13 +478,62 @@ void RDNA4Compute::threadMain(void *arg, wait_result_t) {
 	thread_terminate(current_thread());
 }
 
+void RDNA4Compute::resumeMain(void *arg, wait_result_t) {
+	auto *self = static_cast<RDNA4Compute *>(arg);
+	CLOG("power: wake received; re-bring-up scheduled on the bring-up thread");
+	self->resetRuntimeForResume();
+	self->runStages();
+	if (self->rtLock) {
+		IOLockLock(self->rtLock);
+		self->resumePending = false;
+		if (!self->rtReady)
+			self->powerSleeping = false;
+		IOLockUnlock(self->rtLock);
+	}
+	thread_terminate(current_thread());
+}
+
+void RDNA4Compute::powerDidWake() {
+	if (!rtLock)
+		return;
+	IOLockLock(rtLock);
+	if (!powerSleeping || resumePending) {
+		IOLockUnlock(rtLock);
+		return;
+	}
+	resumePending = true;
+	IOLockUnlock(rtLock);
+	thread_t th = nullptr;
+	if (kernel_thread_start(resumeMain, this, &th) == KERN_SUCCESS) {
+		thread_deallocate(th);
+	} else {
+		IOLockLock(rtLock);
+		resumePending = false;
+		IOLockUnlock(rtLock);
+		CLOG("power: could not start the wake bring-up thread; runtime stays not ready");
+	}
+}
+
 void RDNA4Compute::runStages() {
 	// Read before this boot writes its own. Not at attach: that is before
 	// the EFI NVRAM driver has published the stored variables.
 	char prev[96];
-	const bool hung = logPreviousTrail(prev, sizeof(prev));
+	bool hung = logPreviousTrail(prev, sizeof(prev));
 	uint32_t done = StageSurvey;
 	char note[96];
+	static const char *const kFeatures[] = { "gfx", "ih", "vm", "flip", "rt" };
+	for (size_t i = 0; hung && i < sizeof(kFeatures) / sizeof(kFeatures[0]); i++) {
+		const size_t n = strlen(kFeatures[i]);
+		if (!strncmp(prev, kFeatures[i], n) && prev[n] == ':') {
+			// A feature past the stages hung: the stages were fine, so only
+			// that feature is left out, once.
+			strlcpy(hungFeature, kFeatures[i], sizeof(hungFeature));
+			CLOG("the previous boot died during \"%s\": %s is off this boot, everything else runs "
+			     "(the next boot tries it again)", prev, hungFeature);
+			env.owner->setProperty("Compute,PreviousHang", prev);
+			hung = false;
+		}
+	}
 	if (hung) {
 		// Running the same steps again would most likely hang this boot too,
 		// before anyone can collect a log. Skip once; the trail this leaves
@@ -529,16 +582,46 @@ void RDNA4Compute::runStages() {
 			return stop("stage 7 (kernel)");
 		done = StageKernel;
 	}
-	if (vmEnabled && done >= StageKernel && !vmBootSelfTest()) {
+	if (vmEnabled && done >= StageKernel &&
+	    (!featureAllowed("vm") || !vmBootSelfTest())) {
 		vmEnabled = false;
 		CLOG("vm: boot self-test failed; per-client GPU VM disabled");
 	}
+	// W3: the gfx ring, when asked for. A failure only turns it off again.
+	bool gfxOk = false;
+	const uint32_t gfxAsked = done >= StageKernel ? requestedGfx() : 0;
+	if (gfxAsked && featureAllowed("gfx")) {
+		gfxMode = gfxAsked;
+		gfxOk = stageGfxRing();
+	}
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
-	snprintf(note, sizeof(note), "finished at stage %u", done);
-	trail(note);
 	CLOG("bring-up finished at stage %u", done);
+	// The runtime and what it starts leave their own "<feature>: ..." steps
+	// in the trail, so the trail's normal ending comes after them.
 	if (done >= StageDispatch)
 		publishRuntime(done);
+	if (done >= StageDispatch) {
+		RDNA4Sensors sensors {};
+		if (readSensors(sensors))
+			CLOG("sensors: edge %u C hotspot %u C GFX %u MHz memory %u MHz socket %u W fan %u RPM",
+			     sensors.edgeTempC, sensors.hotspotTempC, sensors.gfxClockMHz,
+			     sensors.memoryClockMHz, sensors.socketPowerW, sensors.fanRpm);
+		else
+			CLOG("sensors: SMU metrics table unavailable");
+	}
+	// W5: the page-flip test, once the runtime's DMA and device heap exist.
+	if (done >= StageKernel && featureAllowed("flip"))
+		Flip::run(*this);
+	// G3: the first draw, once the runtime's device heap holds its rings.
+	const bool drew = gfxOk && stageGfxDraw();
+	snprintf(note, sizeof(note), "finished at stage %u%s%s%s", done,
+	         !gfxAsked ? "" : drew ? ", gfx draw right" : gfxOk ? ", gfx ring up" : ", gfx ring off",
+	         hungFeature[0] ? ", skipped after a hang: " : "", hungFeature);
+	trail(note);
+}
+
+bool RDNA4Compute::featureAllowed(const char *name) const {
+	return !hungFeature[0] || strcmp(hungFeature, name) != 0;
 }
 
 // The pool, uncached: the PSP reads what we write there and writes fences
@@ -605,6 +688,34 @@ uint32_t RDNA4Compute::smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint
 	}
 	ret = rd(IpDiscovery::HwMp1, SmuArg);
 	return resp == kBad ? 0 : resp;
+}
+
+bool RDNA4Compute::readSensors(RDNA4Sensors &out) {
+	if (!poolCpu || kSmuTableOffset + 0x1000 > pool.size)
+		return false;
+	uint32_t ret = 0;
+	if (smuSend(kSmuMsgGetMetricsTable, 0, ret, 100) != kSmuRespOk)
+		return false;
+	/* smu14_driver_if_v14_0.h, SmuMetrics_t: CurrClock[11], the average
+	 * clocks, then MetricsCounter, voltage/current arrays, power, temperatures,
+	 * and fan tach. Keep this compact reader in sync with that public table
+	 * layout instead of copying the whole firmware ABI into our user ABI. */
+	const uint8_t *table = poolCpu + kSmuTableOffset;
+	auto u16 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint16_t *>(table + off);
+	};
+	constexpr uint32_t kAverageGfxPost = 44 + 2 * 2;
+	constexpr uint32_t kAverageMemPost = 44 + 6 * 2;
+	constexpr uint32_t kSocketPower = 136;
+	constexpr uint32_t kTemperatures = 140;
+	constexpr uint32_t kFanRpm = 172;
+	out.edgeTempC = u16(kTemperatures + 0 * 2);
+	out.hotspotTempC = u16(kTemperatures + 1 * 2);
+	out.gfxClockMHz = u16(kAverageGfxPost);
+	out.memoryClockMHz = u16(kAverageMemPost);
+	out.socketPowerW = u16(kSocketPower);
+	out.fanRpm = u16(kFanRpm);
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1567,6 +1678,107 @@ void RDNA4Compute::pm4Kick(uint64_t wptrDwords) {
 	doorbells[kComputeDoorbellDword / 2] = wptrDwords;
 }
 
+void RDNA4Compute::logComputeQueueState(const char *tag, uint32_t pipe, uint32_t queue,
+                                        uint32_t vmid) {
+	grbmSelect(1, pipe, queue, vmid);
+	CLOG("%s: GRBM 0x%08x GRBM2 0x%08x CP_STAT 0x%08x CPC 0x%08x CPC_BUSY 0x%08x",
+	     tag, rdGc(GrbmStatus), rdGc(GrbmStatus2), rdGc(CpStat), rdGc(CpCpcStatus),
+	     rdGc(CpCpcBusyStat));
+	CLOG("%s: HQD active 0x%08x vmid 0x%08x persistent 0x%08x PQ base 0x%08x:%08x rptr 0x%08x "
+	     "wptr 0x%08x:%08x doorbell 0x%08x PQ_CONTROL 0x%08x dequeue 0x%08x",
+	     tag, rdGc(CpHqdActive), rdGc(CpHqdVmid), rdGc(CpHqdPersistent), rdGc(CpHqdPqBaseHi),
+	     rdGc(CpHqdPqBase), rdGc(CpHqdPqRptr), rdGc(CpHqdPqWptrHi), rdGc(CpHqdPqWptrLo),
+	     rdGc(CpHqdPqDoorbell), rdGc(CpHqdPqControl), rdGc(CpHqdDequeueReq));
+	CLOG("%s: HQ_STATUS0 0x%08x EOP 0x%08x:%08x EOP_RPTR 0x%08x SQ_CMD 0x%08x MEC pc 0x%x",
+	     tag, rdGc(CpHqdHqStatus0), rdGc(CpHqdEopBaseHi), rdGc(CpHqdEopBase), rdGc(CpHqdEopRptr),
+	     rdGc(SqCmd), rdGc(CpMecRs64InstrPntr));
+	grbmSelect(0, 0, 0, 0);
+	logGcFault(tag);
+}
+
+bool RDNA4Compute::queueWriteTest(const char *tag, const Launch *l) {
+	const bool client = l && l->queue;
+	Pm4::Queue *queue = client ? l->queue : &pm4Queue;
+	const uint32_t doorbell = client ? l->doorbell : kComputeDoorbellDword;
+	const uint64_t address = client ? l->recoveryProofAddress : poolMc(kPm4TestOffset);
+	volatile uint32_t *cpu = client ? l->recoveryProofCpu : poolDw(kPm4TestOffset);
+	if (!queue || !cpu || !address)
+		return false;
+	*cpu = 0;
+	flushHdp();
+	uint32_t pkt[8];
+	if (!queue->emit(pkt, Pm4::writeData(pkt, address, 0x600DF00D)))
+		return false;
+	if (client)
+		pm4Kick(*queue, doorbell, queue->wptr());
+	else
+		pm4Kick(queue->wptr());
+	for (uint32_t ms = 0; ms < 200; ms++) {
+		if (*cpu == 0x600DF00D) {
+			CLOG("%s: recovered queue WRITE_DATA landed", tag);
+			return true;
+		}
+		IOSleep(1);
+	}
+	CLOG("%s: recovered queue WRITE_DATA did NOT land", tag);
+	return false;
+}
+
+bool RDNA4Compute::recoverComputeQueue(const char *tag, const Launch *l) {
+	if (!hangRecoveryEnabled) {
+		CLOG("%s: queue recovery disabled by rdna4-hang=0", tag);
+		return false;
+	}
+	const bool client = l && l->queue;
+	const uint32_t pipe = client ? l->pipe : 0;
+	const uint32_t queueId = client ? l->queueId : 0;
+	const uint32_t vmid = client ? l->vmid : 0;
+	CLOG("%s: recovering compute queue without a GPU reset", tag);
+	// gfx_v12_0_reset_kcq is MES-backed upstream. This is our no-MES sequence:
+	// the documented HQD RESET_WAVES dequeue, gfx12 SQ_CMD wave kill, then the
+	// same queue's HQD register set and a fenced WRITE_DATA proof.
+	logComputeQueueState(tag, pipe, queueId, vmid);
+	grbmSelect(1, pipe, queueId, vmid);
+	wr(IpDiscovery::HwGc, CpHqdDequeueReq, 2); // RESET_WAVES (amdgpu enum value)
+	// amdgpu_amdkfd_gfx_v12 exposes SQ_CMD wave_control_execute. CMD=3 is
+	// kill, MODE=1 selects all waves, CHECK_VMID=1 limits it to this VMID.
+	const uint32_t sqCmd = 3u | (1u << 4) | (1u << 7) | ((vmid & 0xf) << 28);
+	wr(IpDiscovery::HwGc, SqCmd, sqCmd);
+	bool inactive = false;
+	for (uint32_t us = 0; us < 100000; us += 10) {
+		if (!(rdGc(CpHqdActive) & 1)) {
+			inactive = true;
+			break;
+		}
+		IODelay(10);
+	}
+	wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+	if (!inactive) {
+		grbmSelect(0, 0, 0, 0);
+		CLOG("%s: HQD dequeue/wave kill did not clear CP_HQD_ACTIVE", tag);
+		logGcFault(tag);
+		return false;
+	}
+	if (client) {
+		if (!l->queueCpu || !l->queueAddress ||
+		    !l->queue->init(l->queueCpu, l->queueAddress, kPqSize) ||
+		    !hqdInitFor(false, pipe, queueId, vmid, l->recoveryMqd, l->recoveryEop,
+	                   l->queueAddress >> 8, l->recoveryRptr, l->recoveryWpoll, l->doorbell) ||
+		    !queueWriteTest(tag, l)) {
+			CLOG("%s: client queue reinitialisation or fenced WRITE_DATA failed; staying wedged", tag);
+			logComputeQueueState(tag, pipe, queueId, vmid);
+			return false;
+		}
+	} else if (!pm4Queue.init(poolDw(kPqOffset), poolMc(kPqOffset), kPqSize) ||
+	           !hqdInit(hqdMode == 2) || !queueWriteTest(tag)) {
+		CLOG("%s: queue reinitialisation or fenced WRITE_DATA failed; staying wedged", tag);
+		logComputeQueueState(tag);
+		return false;
+	}
+	CLOG("%s: queue recovered; subsequent clients may dispatch", tag);
+	return true;
+}
+
 void RDNA4Compute::pm4Kick(Pm4::Queue &queue, uint32_t doorbell, uint64_t wptrDwords) {
 	/* The VM queue's wptr report is mapped in its client VA; the CP owns it. */
 	flushHdp();
@@ -1646,6 +1858,8 @@ bool RDNA4Compute::stageCompute() {
 		          writeTest("KIQ");
 	}
 	put("QueueMode", running ? mode : 0);
+	if (running)
+		hqdMode = mode;
 	if (!running) {
 		publish();
 		return false;
@@ -1746,13 +1960,16 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	                                Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 |
 	                                (l.wave32 ? Pm4::kDispatchWave32 : 0)));
 	const uint64_t fenceAddress = vm ? l.fenceAddress : poolMc(kPm4FenceOffset);
-	q.emit(pkt, Pm4::releaseMem(pkt, fenceAddress, fenceValue));
+	const bool irq = l.useInterrupt && ihActive;
+	q.emit(pkt, Pm4::releaseMem(pkt, fenceAddress, fenceValue, irq));
 
-	// Spin for the first 2 ms (short kernels), then sleep between polls:
-	// user dispatches may run for seconds.
+	// The client's own queue (W2) or the kernel's; the end-of-pipe interrupt
+	// (W1) only wakes the wait, the fence decides. Without it: spin for the
+	// first 2 ms (short kernels), then sleep between polls, since user
+	// dispatches may run for seconds.
+	const uint32_t timeoutUs = l.timeoutUs ? l.timeoutUs : 1000000;
 	uint64_t t0 = mach_absolute_time(), span = 0;
-	nanoseconds_to_absolutetime(static_cast<uint64_t>(l.timeoutUs ? l.timeoutUs : 1000000) * 1000,
-	                            &span);
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutUs) * 1000, &span);
 	if (vm)
 		pm4Kick(q, l.doorbell, q.wptr());
 	else {
@@ -1760,16 +1977,23 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 		pm4Kick(q.wptr());
 	}
 	bool done = false;
-	for (uint32_t polls = 0;; polls++) {
-		done = *fenceCpu == fenceValue;
-		if (done || mach_absolute_time() - t0 > span)
-			break;
-		if (polls < 200)
-			IODelay(10);
-		else
-			IOSleep(1);
+	if (irq) {
+		done = ihWaitFence(fenceCpu, fenceValue, (timeoutUs + 999) / 1000, true, nullptr, ns);
+		// Time the whole dispatch, from before the kick (the emulator even
+		// runs it inside the kick), like the polling path below.
+		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	} else {
+		for (uint32_t polls = 0;; polls++) {
+			done = *fenceCpu == fenceValue;
+			if (done || mach_absolute_time() - t0 > span)
+				break;
+			if (polls < 200)
+				IODelay(10);
+			else
+				IOSleep(1);
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	}
-	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	if (!done) {
 		CLOG("%s: the kernel's fence never came (0x%08x, want 0x%08x)", tag,
 		     *fenceCpu, fenceValue);
@@ -1780,6 +2004,8 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 		     rdGc(CpHqdHqStatus0), rdGc(CpMecRs64InstrPntr));
 		grbmSelect(0, 0, 0, 0);
 		logGcFault(tag);
+		if (!vm)
+			logComputeQueueState(tag);
 	}
 	if (vm) {
 		const uint32_t status = rdGc(GcL2FaultStatusLo);

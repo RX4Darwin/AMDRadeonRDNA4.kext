@@ -35,6 +35,8 @@ constexpr Reg CpMeCntl            { 1, 0x0803 };
 constexpr Reg CpMecRs64Cntl       { 1, 0x2904 };
 constexpr Reg CpMecRs64InstrPntr  { 1, 0x2908 };
 constexpr Reg CpMesCntl           { 1, 0x2807 };
+constexpr Reg CpMe1Pipe0IntCntl   { 0, 0x1e25 };
+constexpr Reg CpMe1Pipe1IntCntl   { 0, 0x1e26 };   // gfx12 has these two only
 constexpr Reg RlcCntl             { 1, 0x4c00 };
 constexpr Reg RlcStat             { 1, 0x4c04 };
 constexpr Reg RlcGpmStat          { 1, 0x4e6c };
@@ -51,6 +53,8 @@ constexpr uint32_t kGrbm2RlcBusy  = 1u << 26;
 // CP_ME_CNTL
 constexpr uint32_t kCpMePfpHalt   = 1u << 26;
 constexpr uint32_t kCpMeMeHalt    = 1u << 28;
+// CP_ME1_PIPE0_INT_CNTL
+constexpr uint32_t kCpTimeStampIntEnable = 1u << 26;
 // CP_MEC_RS64_CNTL / CP_MES_CNTL
 constexpr uint32_t kRs64PipeActiveShift = 26;   // PIPE0..3_ACTIVE = bits 26..29
 constexpr uint32_t kRs64Halt      = 1u << 30;
@@ -292,6 +296,7 @@ constexpr uint32_t kEopInitFetcher  = 1u << 31;
 constexpr Reg CpHqdPqWptrLo       { 0, 0x1fdf };
 constexpr Reg CpHqdPqWptrHi       { 0, 0x1fe0 };
 constexpr Reg ScratchReg0         { 1, 0x2040 };   // UCONFIG: absolute dword 0xa000 + 0x2040
+constexpr Reg SqCmd               { 0, 0x111b };   // gfx12 SQ_CMD: kill waves selected by VMID
 
 // CP_MEC_RS64_CNTL
 constexpr uint32_t kMecInvalidateIcache = 1u << 4;
@@ -394,6 +399,7 @@ constexpr uint32_t kSmuMsgGetRunningFeaturesLow = 0x0c;
 constexpr uint32_t kSmuMsgGetRunningFeaturesHigh = 0x0d;
 constexpr uint32_t kSmuMsgSetDriverDramAddrHigh = 0x0e;
 constexpr uint32_t kSmuMsgSetDriverDramAddrLow  = 0x0f;
+constexpr uint32_t kSmuMsgGetMetricsTable       = 0x12;
 constexpr uint32_t kSmuMsgDisallowGfxOff        = 0x29;
 constexpr uint32_t kSmuMsgRunDcBtc              = 0x36;
 constexpr uint32_t kSmuPwrDomainGfx             = 4;      // FEATURE_PWR_GFX
@@ -411,6 +417,37 @@ constexpr uint32_t kSmuFeatDpmGfxclk = 1, kSmuFeatDpmUclk = 3, kSmuFeatDpmFclk =
 constexpr Reg PspBootStatus       { 0, 0x0063 };   // C2PMSG_35: bit31 bootloader ready
 constexpr Reg PspRingStatus       { 0, 0x0080 };   // C2PMSG_64
 constexpr Reg PspSosVersion       { 0, 0x0091 };   // C2PMSG_81: nonzero = sOS alive
+
+// --- The gfx ring (W3): gfx_v12_0_cp_gfx_resume / init_csb ------------------------
+constexpr Reg CpRb0Rptr           { 0, 0x0f60 };
+constexpr Reg CpRbWptrDelay       { 0, 0x0f61 };
+constexpr Reg CpRb0Base           { 0, 0x1de0 };   // MC >> 8
+constexpr Reg CpRb0Cntl           { 0, 0x1de1 };   // RB_BUFSZ [5:0], RB_BLKSZ [13:8]
+constexpr Reg CpRb0RptrAddr       { 0, 0x1de3 };
+constexpr Reg CpRb0RptrAddrHi     { 0, 0x1de4 };   // 16 bits
+constexpr Reg CpDeviceId          { 0, 0x1deb };
+constexpr Reg CpRbVmid            { 0, 0x1df1 };
+constexpr Reg CpRb0Wptr           { 0, 0x1df4 };
+constexpr Reg CpRb0WptrHi         { 0, 0x1df5 };
+constexpr Reg CpRbDoorbellRangeLower { 0, 0x1dfa };   // [11:2]
+constexpr Reg CpRbDoorbellRangeUpper { 0, 0x1dfb };   // [11:2]
+constexpr Reg CpMaxContext        { 0, 0x1e4e };
+constexpr Reg CpRb0BaseHi         { 0, 0x1e51 };
+constexpr Reg CpRbWptrPollAddrLo  { 0, 0x1e8b };
+constexpr Reg CpRbWptrPollAddrHi  { 0, 0x1e8c };
+constexpr Reg CpRbDoorbellControl { 0, 0x1e8d };   // DOORBELL_OFFSET [27:2], DOORBELL_EN [30]
+constexpr Reg CpRbActive          { 0, 0x1f40 };
+constexpr Reg RlcCsibAddrLo       { 1, 0x0987 };
+constexpr Reg RlcCsibAddrHi       { 1, 0x0988 };
+constexpr Reg RlcCsibLength       { 1, 0x0989 };   // dwords
+constexpr uint32_t kCpRbDoorbellEn        = 1u << 30;
+constexpr uint32_t kCpRbDoorbellRangeMask = 0x00000ffc;
+// AMDGPU_NAVI10_DOORBELL_GFX_RING0 (0x08B) in 64-bit doorbell dwords, as
+// gfx_v12_0 sets ring->doorbell_index = doorbell_index.gfx_ring0 << 1.
+constexpr uint32_t kGfxDoorbellDword      = 0x08B * 2;
+constexpr uint32_t kGfxMaxHwContexts      = 8;          // gfx.config.max_hw_contexts
+// Read-only: NUM_SHADER_ENGINES [22:19] = log2(SEs), as gfx_v12_0 reads it.
+constexpr Reg GbAddrConfig        { 0, 0x13de };
 
 } // namespace GfxReg
 

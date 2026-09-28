@@ -979,6 +979,11 @@ uint32_t RDNA4Device::pipeRead(void *ctx, uint8_t baseIdx, uint32_t dword) {
 	return self->regReadDmu(baseIdx, dword);
 }
 
+uint64_t RDNA4Device::liveFramePeriodNs() const {
+	const uint32_t refresh = liveTimingValid ? liveTiming.refreshMilliHz() : 0;
+	return refresh ? 1000000000000ULL / refresh : 0;
+}
+
 // Time N frames of the live OTG's frame counter. The TMDS pixel clock sits in
 // the PHY PLL where no register exposes it, so frame period x totals is the
 // only way to learn the exact rate the GOP chose. Edges are detected by

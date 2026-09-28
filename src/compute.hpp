@@ -49,21 +49,43 @@
 
 #include "amdfw.hpp"
 #include "codeobj.hpp"
+#include "flip.hpp"
 #include "gfxregs.hpp"
 #include "gpuheap.hpp"
+#include "ih.hpp"
 #include "gpuvm.hpp"
 #include "ipdiscovery.hpp"
 #include "pm4.hpp"
+#include "pipe.hpp"
 #include "psp.hpp"
 #include "rdna4compute.h"
 #include "sdma.hpp"
 
 class IOBufferMemoryDescriptor;
 class IODMACommand;
+class RDNA4Compute;
+
+namespace Flip {
+bool run(RDNA4Compute &compute);
+}
+class IOFilterInterruptEventSource;
+class IOWorkLoop;
+class OSObject;
 class IOMemoryMap;
 
 class RDNA4Compute {
 public:
+	~RDNA4Compute();
+	// Called by the IOKit filter/action callbacks; they only inspect the
+	// writeback pointer and drain the already-programmed ring.
+	bool ihHasWork() const;
+	void ihAction();
+	bool ihWaitVblank(uint32_t otg, uint32_t timeoutMs, uint64_t &count, uint64_t &timeNs);
+	bool ihWaitFlip(uint32_t hubp, uint64_t sinceCount, uint32_t timeoutMs);
+	// Bridge for Pipe::discover: DCN reads use the same discovered DMU path as
+	// the display device, while the IH code owns the callback context.
+	uint32_t ihDcnRead(uint8_t baseIdx, uint32_t dword) const;
+
 	// What the compute side borrows from the display device: the GPU, the
 	// service registry properties go on, the BAR5 mapping and the IP
 	// discovery table, and the scanout the GOP set up (to keep clear of it).
@@ -75,6 +97,7 @@ public:
 		const IpDiscovery  *disc;
 		uint64_t            scanoutPhys;     // CPU physical address (BAR0)
 		uint64_t            scanoutLength;
+		uint64_t            scanoutFrameNs;  // 0 when the display timing is unknown
 	};
 
 	enum Stage : uint32_t {
@@ -95,6 +118,8 @@ public:
 	// Run the survey now and, for stage >= 2, start the bring-up thread.
 	// Returns the last stage completed inline.
 	uint32_t start(const Env &env, uint32_t stage);
+	void powerWillSleep();
+	void powerDidWake();
 
 	// Snapshot of the engines, as read by the survey.
 	struct Survey {
@@ -136,6 +161,11 @@ public:
 	};
 
 private:
+	friend bool Flip::run(RDNA4Compute &compute);
+	friend bool Flip::findPipe(RDNA4Compute &compute, Flip::Surface &out);
+	friend bool Flip::flipTo(RDNA4Compute &compute, const Flip::Surface &surface,
+	                         uint64_t target, const char *name, uint64_t *latencyUs);
+
 	Env    env {};
 	Survey sv {};
 	Pool   pool {};
@@ -152,12 +182,20 @@ private:
 
 	// Stages 2+ (bring-up thread).
 	static void threadMain(void *arg, wait_result_t);
+	static void resumeMain(void *arg, wait_result_t);
 	void runStages();
+	void resetRuntimeForResume();
 
 	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
 	// flushed before each step that could hang the GPU, so the step a hard
 	// hang stopped at survives the reset. Logged by the next boot's survey.
 	void trail(const char *step);
+	// The pre-Metal features past the compute stages (W1-W5) name their
+	// trail steps "<feature>: ..." (gfx, ih, vm, flip, rt). If the previous
+	// boot died in one of those, only that feature sits this boot out; the
+	// stages and the other features run. featureAllowed("gfx") etc.
+	char hungFeature[8] {};
+	bool featureAllowed(const char *name) const;
 	// Log the previous boot's trail (into `text`); true if that boot died
 	// in the middle of a step rather than ending the bring-up itself.
 	bool logPreviousTrail(char *text, size_t size);
@@ -181,6 +219,7 @@ private:
 	uint64_t smuEnableFeatures(uint64_t allowed, uint32_t domain);
 	bool waitRlcAutoload(uint32_t ms, uint32_t &cpStat, uint32_t &boot);
 	static constexpr uint32_t kSmuTableOffset = 6u << 20;            // driver table, 64 KiB
+	bool readSensors(RDNA4Sensors &out);
 
 	// Stage 4: the GC hub, then SDMA0 queue 0 and a VRAM fill. Pool layout
 	// past the PSP's first 4 MiB (offsets within the pool).
@@ -240,6 +279,7 @@ private:
 	static constexpr uint32_t kDispatchGroups = 4, kGroupSize = 64;
 	Pm4::Queue  pm4Queue;                   // set up by stage 5, fed again by stage 6
 	uint32_t    pm4Fence { 0 };             // last RELEASE_MEM sequence number
+	uint32_t    hqdMode { 1 };              // 1 = plain MMIO HQD, 2 = KIQ fallback
 	uint32_t shAbs(const GfxReg::Reg &r) const;   // absolute dword address of a GC register
 	// One DISPATCH_DIRECT on the stage-5 queue, fenced; false if the fence
 	// never came within timeoutUs (the engine state is logged under `tag`).
@@ -253,12 +293,22 @@ private:
 		bool            wave32;
 		uint32_t        timeoutUs;
 		uint32_t        ldsBytes;           // per work-group (RSRC2.LDS_SIZE)
+		bool            useInterrupt;       // runtime only; the fence remains authoritative
 		Pm4::Queue     *queue;
 		uint32_t        vmid, pipe, queueId, fenceValue, doorbell;
 		uint64_t        fenceAddress;
 		volatile uint32_t *fenceCpu;
+		volatile uint32_t *queueCpu;
+		uint64_t        queueAddress;
+		uint64_t        recoveryMqd, recoveryEop, recoveryRptr, recoveryWpoll;
+		uint64_t        recoveryProofAddress;
+		volatile uint32_t *recoveryProofCpu;
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
+	void logComputeQueueState(const char *tag, uint32_t pipe = 0, uint32_t queue = 0,
+	                         uint32_t vmid = 0);
+	bool queueWriteTest(const char *tag, const Launch *l = nullptr);
+	bool recoverComputeQueue(const char *tag, const Launch *l = nullptr);
 	// What launch() can give a code-object kernel: the kernarg pointer and
 	// up to 64 KiB of LDS — no dispatch/queue pointers or scratch yet.
 	static bool kernelFits(const CodeObj::Kernel &k, const char **why);
@@ -275,12 +325,103 @@ private:
 	static constexpr uint32_t kVaddItems      = 4096;                 // 64 groups of 64
 	bool stageKernel();
 
+	// W3, the gfx ring (gfxring.cpp): after the compute stages when the
+	// boot-arg rdna4-gfx is 1 (write pointer through CP_RB0_WPTR) or 2 (its
+	// doorbell). Pool layout past the DMA scratch, below the heap.
+	static constexpr uint32_t kGfxOffset      = 30u << 20;
+	static constexpr uint32_t kGfxRingOffset  = kGfxOffset;              // 16 KiB ring
+	static constexpr uint32_t kGfxRingSize    = 0x4000;
+	static constexpr uint32_t kGfxRptrOffset  = kGfxOffset + 0x4000;     // rptr writeback
+	static constexpr uint32_t kGfxWptrOffset  = kGfxRptrOffset + 0x40;   // wptr poll copy
+	static constexpr uint32_t kGfxFenceOffset = kGfxRptrOffset + 0x80;   // RELEASE_MEM target
+	static constexpr uint32_t kGfxTestOffset  = kGfxRptrOffset + 0xc0;   // WRITE_DATA targets
+	static constexpr uint32_t kGfxCsbOffset   = kGfxOffset + 0x5000;     // clear-state buffer
+	static constexpr uint32_t kGfxCsbMax      = 0x1000;
+	static constexpr uint32_t kGfxIbOffset    = kGfxOffset + 0x10000;    // indirect buffers
+	// G3, the first draw (stageGfxDraw, after the runtime: its GE rings come
+	// from the device heap): the NGG VS and the PS, 1 KiB apart (256-byte
+	// aligned, prefetch-padded), the 256x256 RGBA8 target and the draw's
+	// own fence.
+	static constexpr uint32_t kGfxVsOffset    = kGfxOffset + 0x20000;
+	static constexpr uint32_t kGfxPsOffset    = kGfxOffset + 0x20400;
+	static constexpr uint32_t kGfxTargetOffset = kGfxOffset + 0x40000;   // 256 KiB
+	static constexpr uint32_t kGfxDrawFenceOffset = kGfxTestOffset + 0x20;
+	uint64_t   gfxRings { 0 };               // device-heap offset of the GE rings (0 = none)
+	bool stageGfxDraw();
+	Pm4::Queue gfxRing;
+	uint32_t   gfxFence { 0 };               // last RELEASE_MEM sequence number
+	uint32_t   gfxMode { 0 };                // 0 off, 1 MMIO write pointer, 2 doorbell
+	static uint32_t requestedGfx();
+	bool gfxCsbInit();
+	bool gfxRingResume();
+	void gfxKick(uint64_t wptrDwords);
+	bool gfxFenceWait(uint32_t seq, uint32_t timeoutUs);
+	void gfxStatus(const char *tag);
+	bool stageGfxRing();
+	// IH v7 ring and MSI delivery. The ring is brought up only after the
+	// runtime's DMA path has established bus mastering; stage bring-up keeps
+	// its existing bounded polling waits.
+	static constexpr uint32_t kIhRingBytes = 256u << 10;
+	static constexpr uint32_t kIhWptrBytes = 4096;
+	IOBufferMemoryDescriptor *ihRingMemory { nullptr };
+	IOBufferMemoryDescriptor *ihWptrMemory { nullptr };
+	IODMACommand *ihRingDma { nullptr };
+	IODMACommand *ihWptrDma { nullptr };
+	volatile uint32_t *ihRingCpu { nullptr };
+	volatile uint32_t *ihWptrCpu { nullptr };
+	uint64_t ihRingBus { 0 };
+	uint64_t ihWptrBus { 0 };
+	uint32_t ihRptr { 0 };
+	uint32_t ihRingMask { kIhRingBytes - 1 };
+	IOFilterInterruptEventSource *ihSource { nullptr };
+	IOWorkLoop *ihWorkLoop { nullptr };
+	OSObject *ihContext { nullptr };
+	IOLock *ihLock { nullptr };             // independent of rtLock; W2/W5 callers may not hold rtLock
+	void *ihWaitEvent { nullptr };
+	bool ihActive { false };
+	bool ihDispatchPolling { false };
+	bool ihSdmaPolling { false };
+	uint32_t ihDispatchMisses { 0 };
+	uint32_t ihSdmaMisses { 0 };
+	uint32_t ihDispatchObserved { 0 };
+	uint32_t ihSdmaObserved { 0 };
+	uint32_t ihEopCount { 0 };
+	uint32_t ihSdmaTrapCount { 0 };
+	uint32_t ihFaultCount { 0 };
+	uint32_t ihUnknownCount { 0 };
+	uint8_t ihUnknownSeen[256][32] {};
+	bool ihDcnRequested { false };
+	bool ihDcnActive { false };
+	uint8_t ihDcnOtg { Pipe::kNone };
+	uint8_t ihDcnHubp { Pipe::kNone };
+	uint64_t ihDcnExpectedFrameNs { 0 };
+	uint32_t ihDcnVblankFrames { 0 };
+	uint32_t ihDcnStorms { 0 };
+	uint64_t ihVblankCount[Pipe::kMaxOtg] {};
+	uint64_t ihVblankTime[Pipe::kMaxOtg] {};
+	uint64_t ihPflipCount[Pipe::kMaxOtg] {};
+
+	bool ihInit();
+	void ihStop();
+	void ihDcnStop(const char *why);
+	void ihDcnAckVblank();
+	void ihDcnAckFlip();
+	void ihDcnObserveVblank(uint64_t now);
+	void ihDecodeEntry(const uint32_t *dw);
+	void ihUnknown(uint8_t client, uint8_t source, uint8_t ring);
+	void ihRecordWait(bool dispatch, bool slept, bool completed,
+	                  bool recheckElapsed, uint32_t eventsBefore);
+	bool ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_t timeoutMs,
+	                bool dispatch, const char *tag, uint64_t &ns);
+
 public:
 	// User-space runtime (runtime.cpp), reached through RDNA4ComputeClient.
 	// `owner` is the client: its buffers and programs are only its own, and
 	// rtRelease frees them all. Every call takes rtLock.
 	IOReturn rtOpen(const void *owner);
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
+	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
+	IOReturn rtSleepTest(const void *owner, uint32_t phase);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtAllocHost(const void *owner, task_t task, uint64_t bytes, uint64_t flags,
 	                     uint64_t &handle, uint64_t &gpu, uint64_t &user);
@@ -291,6 +432,9 @@ public:
 	                const char *name, uint64_t out[8]);
 	IOReturn rtUnload(const void *owner, uint64_t program);
 	IOReturn rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros);
+	IOReturn rtPresent(const void *owner, uint64_t handle, uint64_t offset,
+	                   uint64_t &geometry, uint64_t &pitch);
+	IOReturn rtRestore(const void *owner);
 	void     rtRelease(const void *owner);
 
 private:
@@ -333,6 +477,8 @@ private:
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
 		uint64_t tableOffset { 0 }, rootMc { 0 }, rootPhys { 0 }, nextVa { GpuVm::kVaStart };
 		uint64_t kernargVa { 0 }, fenceVa { 0 };
+		uint64_t queueVa { 0 }, mqdMc { 0 }, eopVa { 0 }, rptrVa { 0 }, wpollVa { 0 };
+		volatile uint32_t *queueCpu { nullptr };
 		uint64_t hostBytes { 0 };
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
@@ -340,10 +486,15 @@ private:
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
 		bool active { false };
+		bool aborted { false };
 	};
 	IOLock        *rtLock { nullptr };
 	bool           rtReady { false };       // a dispatching stage finished
 	bool           rtWedged { false };      // a dispatch timed out
+	bool           powerSleeping { false };
+	bool           resumed { false };
+	bool           resumePending { false };
+	bool           hangRecoveryEnabled { true }; // rdna4-hang=0 keeps the old wedge
 	uint32_t       rtStage { 0 };
 	bool           vmEnabled { false };
 	bool           vmidUsed[16] {};
@@ -354,6 +505,15 @@ private:
 	RtBuffer       buffers[kMaxBuffers] {};
 	uint64_t       hostBytesTotal { 0 };
 	RtProgram      programs[kMaxPrograms] {};
+	bool           presentActive { false };
+	const void    *presentOwner { nullptr };
+	uint64_t       presentHandle { 0 };
+	uint64_t       presentOffset { 0 };
+	uint64_t       presentStarted { 0 };
+	Flip::Surface  presentSurface {};
+	void     checkPresentationTimeoutLocked();
+	IOReturn restorePresentationLocked(const char *why);
+	void     clearPresentationLocked();
 	IOService     *rtService { nullptr };
 	uint64_t       dmubVram { 0 };            // DMUB memory (VRAM offset), from choosePool
 	void publishRuntime(uint32_t stage);
@@ -362,6 +522,7 @@ private:
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);
 	RtClient  *clientFor(const void *owner);
+	IOReturn ownerStateLocked(const void *owner) const;
 	bool vmTableSync(RtClient &client, uint32_t offset, uint32_t bytes);
 	bool vmMap(RtClient &client, uint64_t va, uint64_t mc, uint64_t bytes, bool executable);
 	bool vmMapHost(RtClient &client, uint64_t va, const uint64_t *pageBuses,

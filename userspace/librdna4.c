@@ -47,6 +47,19 @@ kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out) {
 	return kr;
 }
 
+kern_return_t rdna4_sensors(rdna4_t *dev, RDNA4Sensors *out) {
+	if (!out)
+		return kIOReturnBadArgument;
+	size_t n = sizeof(*out);
+	return IOConnectCallStructMethod(dev->conn, kRDNA4MethodSensors, NULL, 0,
+	                                 out, &n);
+}
+
+kern_return_t rdna4_sleep_test(rdna4_t *dev, uint32_t phase) {
+	uint64_t input = phase;
+	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodSleepTest, &input, 1, NULL, NULL);
+}
+
 kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out) {
 	uint64_t o[2] = { 0 };
 	uint32_t n = 2;
@@ -155,6 +168,47 @@ kern_return_t rdna4_dispatch_lds(rdna4_t *dev, const rdna4_program_t *prog,
 	if (micros)
 		*micros = us;
 	return kr;
+}
+
+kern_return_t rdna4_wait_vblank(rdna4_t *dev, uint32_t timeoutMs, uint64_t *count,
+                                uint64_t *timeNs) {
+	uint64_t in = timeoutMs, out[2] = { 0, 0 };
+	uint32_t n = 2;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodWaitVBlank, &in, 1,
+	                                             out, &n);
+	if (kr == KERN_SUCCESS) {
+		if (count)
+			*count = out[0];
+		if (timeNs)
+			*timeNs = out[1];
+	}
+	return kr;
+}
+
+kern_return_t rdna4_present(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                            uint32_t *width, uint32_t *height, uint32_t *pitch) {
+	if (!buf || !width || !height || !pitch)
+		return kIOReturnBadArgument;
+	const uint64_t in[2] = { buf->handle, offset };
+	uint64_t out[2] = { 0, 0 };
+	uint32_t n = 2;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodPresent, in, 2, out, &n);
+	if (kr == KERN_SUCCESS) {
+		*width = (uint32_t)out[0] & 0xffffu;
+		*height = (uint32_t)(out[0] >> 16);
+		*pitch = (uint32_t)out[1];
+	}
+	return kr;
+}
+
+kern_return_t rdna4_display_query(rdna4_t *dev, uint32_t *width, uint32_t *height,
+                                  uint32_t *pitch) {
+	rdna4_buffer_t query = { 0, 0, 0 };
+	return rdna4_present(dev, &query, 0, width, height, pitch);
+}
+
+kern_return_t rdna4_restore(rdna4_t *dev) {
+	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodRestore, NULL, 0, NULL, NULL);
 }
 
 const char *rdna4_error(kern_return_t kr) {
