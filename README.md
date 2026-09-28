@@ -407,7 +407,13 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       a MEC compute queue running PM4, a hand-written and a clang-built gfx1201
       kernel dispatched and checked — with the display untouched
 - [x] User-space compute runtime on the real card: `rdna4-run selftest`
-      PASS (65536-item vadd in 103 us)
+      PASS (65536-item vadd in 103 us), LDS and barriers included
+- [x] `rdna4-run bench` on the real card (2026-09-28,
+      `docs/hw-logs/2026-09-28-recovery-bench-accelerate.txt`): SGEMM n=2048
+      at 10.7 TFLOPS, 23x the Ryzen 7 5700G with Accelerate (463 GFLOPS),
+      every result exact; VRAM copy 208 GB/s vs 34 GB/s CPU memcpy.
+      Host->GPU 333 MB/s but GPU->host only 5 MB/s (CPU reads through the
+      BAR) — the next bottleneck
 - [ ] Native mode setting (DCN 4.1.0) / multiple displays
 - [ ] Hardware cursor through the NDRV cursor path
 - [ ] Acceleration / Metal
