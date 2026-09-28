@@ -28,6 +28,7 @@
 #include "../src/pm4.hpp"
 #include "../src/codeobj.hpp"
 #include "../src/gpuheap.hpp"
+#include "../src/flip.hpp"
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
@@ -1834,6 +1835,23 @@ static int testGpuHeap() {
 	return failures;
 }
 
+static int testFlipArithmetic() {
+	int failures = 0;
+	failures += check(Flip::surfaceBytes(1920, 1080) == 1920ull * 1080 * 4,
+	                  "flip: 1920x1080 surface size");
+	failures += check(Flip::surfaceBytes(3840, 2160) == 3840ull * 2160 * 4,
+	                  "flip: 3840x2160 surface size");
+	failures += check(Flip::surfaceBytes(0, 1080) == 0 && Flip::surfaceBytes(1920, 0) == 0,
+	                  "flip: zero-sized surface accepted");
+	const uint64_t address = 0x123456789abcde00ull;
+	failures += check(Flip::addressLo(address) == 0x9abcde00u &&
+	                  Flip::addressHi(address) == 0x12345678u,
+	                  "flip: address split");
+	printf("\nflip: surface arithmetic and address split %s\n",
+	       failures ? "FAILED" : "ok");
+	return failures;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
@@ -2028,6 +2046,7 @@ int main(int argc, char **argv) {
 	failures += testPm4Packets();
 	failures += testCodeObject();
 	failures += testGpuHeap();
+	failures += testFlipArithmetic();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

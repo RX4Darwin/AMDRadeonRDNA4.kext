@@ -59,6 +59,11 @@
 
 class IOBufferMemoryDescriptor;
 class IODMACommand;
+class RDNA4Compute;
+
+namespace Flip {
+bool run(RDNA4Compute &compute);
+}
 
 class RDNA4Compute {
 public:
@@ -133,6 +138,8 @@ public:
 	};
 
 private:
+	friend bool Flip::run(RDNA4Compute &compute);
+
 	Env    env {};
 	Survey sv {};
 	Pool   pool {};

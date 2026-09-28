@@ -9,6 +9,7 @@
 
 #include "codeobj.hpp"
 #include "compute.hpp"
+#include "flip.hpp"
 #include "pm4.hpp"
 #include "probe_kernel.h"
 #include "sdma.hpp"
@@ -527,6 +528,8 @@ void RDNA4Compute::runStages() {
 	snprintf(note, sizeof(note), "finished at stage %u", done);
 	trail(note);
 	CLOG("bring-up finished at stage %u", done);
+	if (done >= StageKernel)
+		Flip::run(*this);
 	if (done >= StageDispatch)
 		publishRuntime(done);
 }
