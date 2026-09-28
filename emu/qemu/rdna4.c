@@ -562,6 +562,7 @@ struct RDNA4State {
     uint64_t     gfx_rptr;               /* GFX ring 0's consumed dwords */
     bool         gfx_csb_loaded;        /* the first valid kick loaded the CSB */
     bool         gfx_reinit;            /* CP_ME halt/restart has reset RB0 */
+    bool         gfx_trace_selfcheck_done;
     uint32_t     gfx_job_seq;           /* latest RELEASE_MEM fence value */
     uint32_t     gfx_num_instances;
     bool         gfx_draw_refused;
@@ -4309,6 +4310,9 @@ static bool rdna4_gfx_set_regs(RDNA4State *s, RDNA4GfxStream *st,
 }
 
 static void rdna4_gfx_rptr_writeback(RDNA4State *s, uint32_t rptr);
+static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
+                              uint64_t deadline_ns, bool ring);
+static bool rdna4_gfx_trace_selfcheck(RDNA4State *s);
 
 static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                               uint64_t deadline_ns, bool ring)
@@ -4631,6 +4635,7 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
             break;
         case 0x2d: {                                         /* DRAW_INDEX_AUTO */
             uint32_t index_count, initiator;
+            bool draw_ok;
 
             if (count != 1 || !rdna4_gfx_stream_dw(s, st, at + 1, &index_count) ||
                 !rdna4_gfx_stream_dw(s, st, at + 2, &initiator) ||
@@ -4638,8 +4643,13 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                 fprintf(stderr, "rdna4: gfx: DRAW_INDEX_AUTO SOURCE_SELECT or length refused, stopping\n");
                 return false;
             }
-            if (!rdna4_gfx_draw(s, index_count, st->vmid) && !s->gfx_draw_refused)
+            draw_ok = rdna4_gfx_draw(s, index_count, st->vmid);
+            if (!draw_ok && !s->gfx_draw_refused)
                 return false;
+            if (draw_ok && st->vmid == 0 && s->gfx_trace && !s->gfx_trace_selfcheck_done &&
+                !rdna4_gfx_trace_selfcheck(s)) {
+                return false;
+            }
             break;
         }
         default:
@@ -4656,6 +4666,278 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
         }
     }
     return true;
+}
+
+typedef struct RDNA4GfxTraceTable {
+    uint64_t key;
+    uint64_t off;
+} RDNA4GfxTraceTable;
+
+static uint64_t rdna4_gfx_trace_phys(RDNA4State *s, uint64_t off)
+{
+    return ((uint64_t)reg_get(s, REG_GCMC_FB_OFFSET) << 24) + off;
+}
+
+static bool rdna4_gfx_trace_table_entry(RDNA4State *s, uint64_t table,
+                                        uint32_t index, uint64_t value)
+{
+    uint8_t *p = rdna4_vram_span(s, table + (uint64_t)index * 8, 8);
+
+    if (!p)
+        return false;
+    stq_le_p(p, value);
+    return true;
+}
+
+static bool rdna4_gfx_trace_new_table(RDNA4State *s, uint64_t *cursor,
+                                      uint64_t *table)
+{
+    uint8_t *p;
+
+    *table = *cursor;
+    *cursor += 0x1000;
+    p = rdna4_vram_span(s, *table, 0x1000);
+    if (!p)
+        return false;
+    memset(p, 0, 0x1000);
+    return true;
+}
+
+static bool rdna4_gfx_trace_find_table(RDNA4State *s, uint64_t *cursor,
+                                       RDNA4GfxTraceTable *tables,
+                                       unsigned *count, unsigned max,
+                                       uint64_t key, uint64_t *table)
+{
+    for (unsigned i = 0; i < *count; i++) {
+        if (tables[i].key == key) {
+            *table = tables[i].off;
+            return true;
+        }
+    }
+    if (*count == max || !rdna4_gfx_trace_new_table(s, cursor, table))
+        return false;
+    tables[*count].key = key;
+    tables[*count].off = *table;
+    (*count)++;
+    return true;
+}
+
+static bool rdna4_gfx_trace_map_page(RDNA4State *s, uint64_t root,
+                                     uint64_t *cursor,
+                                     RDNA4GfxTraceTable *l1, unsigned *nl1,
+                                     RDNA4GfxTraceTable *l2, unsigned *nl2,
+                                     RDNA4GfxTraceTable *l3, unsigned *nl3,
+                                     uint64_t va, uint64_t mc)
+{
+    int64_t target_off = rdna4_gc_to_vram(s, mc & ~0xfffull);
+    uint32_t i0 = (va >> 39) & 0x1ff;
+    uint32_t i1 = (va >> 30) & 0x1ff;
+    uint32_t i2 = (va >> 21) & 0x1ff;
+    uint32_t i3 = (va >> 12) & 0x1ff;
+    uint64_t t1, t2, t3;
+
+    if (target_off < 0 || (uint64_t)target_off >= rdna4_vram_size())
+        return false;
+    if (!rdna4_gfx_trace_find_table(s, cursor, l1, nl1, 32, i0, &t1) ||
+        !rdna4_gfx_trace_table_entry(s, root, i0,
+                                     rdna4_gfx_trace_phys(s, t1) | RDNA4_VM_VALID))
+        return false;
+    if (!rdna4_gfx_trace_find_table(s, cursor, l2, nl2, 64,
+                                    ((uint64_t)i0 << 9) | i1, &t2) ||
+        !rdna4_gfx_trace_table_entry(s, t1, i1,
+                                     rdna4_gfx_trace_phys(s, t2) | RDNA4_VM_VALID))
+        return false;
+    if (!rdna4_gfx_trace_find_table(s, cursor, l3, nl3, 128,
+                                    ((uint64_t)i0 << 18) | ((uint64_t)i1 << 9) | i2,
+                                    &t3) ||
+        !rdna4_gfx_trace_table_entry(s, t2, i2,
+                                     rdna4_gfx_trace_phys(s, t3) | RDNA4_VM_VALID))
+        return false;
+    return rdna4_gfx_trace_table_entry(s, t3, i3,
+        rdna4_gfx_trace_phys(s, (uint64_t)target_off) |
+        RDNA4_VM_VALID | RDNA4_VM_READABLE | RDNA4_VM_WRITEABLE | RDNA4_VM_EXECUTABLE);
+}
+
+static bool rdna4_gfx_trace_map_range(RDNA4State *s, uint64_t root,
+                                      uint64_t *cursor,
+                                      RDNA4GfxTraceTable *l1, unsigned *nl1,
+                                      RDNA4GfxTraceTable *l2, unsigned *nl2,
+                                      RDNA4GfxTraceTable *l3, unsigned *nl3,
+                                      uint64_t va, uint64_t mc, uint64_t len)
+{
+    uint64_t first_va = va & ~0xfffull;
+    uint64_t first_mc = mc & ~0xfffull;
+    uint64_t end = (va & 0xfffull) + len;
+
+    if (!len || end < len)
+        return false;
+    for (uint64_t off = 0; off < end; off += 0x1000) {
+        if (!rdna4_gfx_trace_map_page(s, root, cursor, l1, nl1, l2, nl2,
+                                      l3, nl3, first_va + off, first_mc + off))
+            return false;
+    }
+    return true;
+}
+
+static uint32_t rdna4_gfx_trace_ib_ctl(uint32_t length, uint32_t vmid)
+{
+    return (length & 0xfffff) | ((vmid & 0xf) << 24);
+}
+
+static bool rdna4_gfx_trace_selfcheck(RDNA4State *s)
+{
+    RDNA4GfxTraceTable l1[32] = { 0 }, l2[64] = { 0 }, l3[128] = { 0 };
+    uint64_t old_base, root_off, cursor, packet_off, draw_mc, priv_mc, bad_mc;
+    uint64_t root_mc, cb, pos, prim, es, ps;
+    uint64_t end = rdna4_vram_size() - RDNA4_RESV_SIZE;
+    uint32_t old_vm[8], old_int, old_seq;
+    unsigned nl1 = 0, nl2 = 0, nl3 = 0;
+    uint32_t attrib2, pitch, height, pos_bytes, prim_bytes;
+    uint8_t *p;
+    bool draw_ok = false, priv_ok = false, bad_ok = false, pass = false;
+
+    s->gfx_trace_selfcheck_done = true;
+    old_vm[0] = reg_get(s, REG_GCVM_CTX1_CNTL + 7 * 4);
+    old_vm[1] = reg_get(s, REG_GCVM_CTX1_BASE_LO + 7 * 8);
+    old_vm[2] = reg_get(s, REG_GCVM_CTX1_BASE_HI + 7 * 8);
+    old_vm[3] = reg_get(s, REG_GCVM_CTX1_START_LO + 7 * 8);
+    old_vm[4] = reg_get(s, REG_GCVM_CTX1_START_HI + 7 * 8);
+    old_vm[5] = reg_get(s, REG_GCVM_CTX1_END_LO + 7 * 8);
+    old_vm[6] = reg_get(s, REG_GCVM_CTX1_END_HI + 7 * 8);
+    old_vm[7] = s->gfx_job_seq;
+    old_int = reg_get(s, REG_GFX_CP_INT_CNTL_RING0);
+    old_seq = s->gfx_job_seq;
+
+    if (end < 0x100000 || !s->hidden || s->hidden_size < 0x100000) {
+        fprintf(stderr, "rdna4: gfx: trace self-check unavailable (no scratch VRAM)\n");
+        return false;
+    }
+    old_base = ((uint64_t)reg_get(s, REG_GCMC_FB_BASE) & 0xffffff) << 24;
+    root_off = (end - 0x100000) & ~0xfffull;
+    cursor = root_off + 0x1000;
+    packet_off = root_off - 0x4000;
+    root_mc = old_base + packet_off;
+    draw_mc = root_mc + 0x1000;
+    priv_mc = root_mc + 0x2000;
+    bad_mc = root_mc + 0x3000;
+    old_seq = s->gfx_job_seq;
+
+    es = ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_ES) << 8) |
+         ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_HI_ES) << 40);
+    ps = ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_PS) << 8) |
+         ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_HI_PS) << 40);
+    cb = ((uint64_t)reg_get(s, REG_GFX_CB_COLOR0_BASE) << 8) |
+         ((uint64_t)(reg_get(s, REG_GFX_CB_COLOR0_BASE_EXT) & 0xff) << 40);
+    pos = (uint64_t)reg_get(s, REG_GFX_GE_POS_RING_BASE) << 16;
+    prim = (uint64_t)reg_get(s, REG_GFX_GE_PRIM_RING_BASE) << 16;
+    attrib2 = reg_get(s, REG_GFX_CB_COLOR0_ATTRIB2);
+    pitch = ((attrib2 & 0xffff) + 1) * 4;
+    height = ((attrib2 >> 16) & 0xffff) + 1;
+    pos_bytes = (reg_get(s, REG_GFX_GE_POS_RING_SIZE) & 0x3fff) << 5;
+    prim_bytes = (reg_get(s, REG_GFX_GE_PRIM_RING_SIZE) & 0x7ff) << 5;
+
+    p = rdna4_vram_span(s, root_off, 0x1000);
+    if (!p)
+        goto restore_vm;
+    memset(p, 0, 0x1000);
+    if (!rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   root_mc, root_mc, 0x4000) ||
+        !rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   es, es, 0x2000) ||
+        !rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   ps, ps, 0x2000) ||
+        !rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   pos, pos, pos_bytes) ||
+        !rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   prim, prim, prim_bytes) ||
+        !rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   cb, cb, (uint64_t)pitch * height)) {
+        fprintf(stderr, "rdna4: gfx: trace self-check failed to build VMID8 map\n");
+        return false;
+    }
+    if (cursor + 0x1000 > end) {
+        fprintf(stderr, "rdna4: gfx: trace self-check page tables overflow scratch VRAM\n");
+        return false;
+    }
+    reg_set(s, REG_GCVM_CTX1_CNTL + 7 * 4, 7);
+    reg_set(s, REG_GCVM_CTX1_BASE_LO + 7 * 8, (uint32_t)rdna4_gfx_trace_phys(s, root_off));
+    reg_set(s, REG_GCVM_CTX1_BASE_HI + 7 * 8, (uint32_t)(rdna4_gfx_trace_phys(s, root_off) >> 32));
+    reg_set(s, REG_GCVM_CTX1_START_LO + 7 * 8, 0);
+    reg_set(s, REG_GCVM_CTX1_START_HI + 7 * 8, 0);
+    reg_set(s, REG_GCVM_CTX1_END_LO + 7 * 8, 0xffffffff);
+    reg_set(s, REG_GCVM_CTX1_END_HI + 7 * 8, 0xffff);
+
+    /* The root stream points at a VMID-8 draw IB, so this covers the same
+     * packet path that a user submission takes rather than calling draw() by
+     * itself. */
+    p = rdna4_vram_span(s, packet_off, 0x4000);
+    if (!p) {
+        fprintf(stderr, "rdna4: gfx: trace self-check packet scratch is unmapped\n");
+        goto restore_vm;
+    }
+    memset(p, 0, 0x4000);
+    stl_le_p(p + 0, 0xc0023f00);
+    stl_le_p(p + 4, (uint32_t)draw_mc);
+    stl_le_p(p + 8, (uint32_t)(draw_mc >> 32));
+    stl_le_p(p + 12, rdna4_gfx_trace_ib_ctl(3, 8));
+    stl_le_p(p + 0x1000, 0xc0012d00);
+    stl_le_p(p + 0x1004, 3);
+    stl_le_p(p + 0x1008, 2);
+    RDNA4GfxStream st = { root_mc, 0, 4, 0, 0, true };
+    draw_ok = rdna4_gfx_packets(s, &st, true, 0, false) && st.pos == 4;
+    fprintf(stderr, "rdna4: gfx: trace self-check VMID8 draw %s\n",
+            draw_ok ? "PASS" : "FAIL");
+
+    /* Each bad IB is reached through INDIRECT_BUFFER, and both failures are
+     * before the parent packet can commit its cursor. */
+    stl_le_p(p + 0x2000, 0xc0033700);
+    stl_le_p(p + 0x2004, 0x00100000);
+    stl_le_p(p + 0x2008, REG_GC_CP_STAT);
+    stl_le_p(p + 0x200c, 0);
+    stl_le_p(p + 0x2010, 0x12345678);
+    stl_le_p(p + 0, 0xc0023f00);
+    stl_le_p(p + 4, (uint32_t)priv_mc);
+    stl_le_p(p + 8, (uint32_t)(priv_mc >> 32));
+    stl_le_p(p + 12, rdna4_gfx_trace_ib_ctl(5, 8));
+    old_int = reg_get(s, REG_GFX_CP_INT_CNTL_RING0);
+    reg_set(s, REG_GFX_CP_INT_CNTL_RING0, old_int | CP_PRIV_REG_INT_ENABLE |
+            CP_OPCODE_ERROR_INT_ENABLE | CP_TIME_STAMP_INT_ENABLE | CP_GENERIC0_INT_ENABLE);
+    uint32_t old_ih = s->ih_wptr;
+    st = (RDNA4GfxStream){ root_mc, 0, 4, 0, 0, true };
+    priv_ok = !rdna4_gfx_packets(s, &st, true, 0, false) && st.pos == 0 &&
+              s->ih_wptr == ((old_ih + IH_ENTRY_BYTES) & (IH_RING_BYTES - 1));
+
+    stl_le_p(p + 0x3000, 0xc000ff00);
+    stl_le_p(p + 0x3004, 0);
+    stl_le_p(p + 0, 0xc0023f00);
+    stl_le_p(p + 4, (uint32_t)bad_mc);
+    stl_le_p(p + 8, (uint32_t)(bad_mc >> 32));
+    stl_le_p(p + 12, rdna4_gfx_trace_ib_ctl(2, 8));
+    old_ih = s->ih_wptr;
+    st = (RDNA4GfxStream){ root_mc, 0, 4, 0, 0, true };
+    bad_ok = !rdna4_gfx_packets(s, &st, true, 0, false) && st.pos == 0 &&
+             s->ih_wptr == ((old_ih + IH_ENTRY_BYTES) & (IH_RING_BYTES - 1));
+    fprintf(stderr, "rdna4: gfx: trace self-check PRIV_REG IH %s; OPCODE_ERROR IH %s\n",
+            priv_ok ? "PASS" : "FAIL", bad_ok ? "PASS" : "FAIL");
+    pass = draw_ok && priv_ok && bad_ok;
+
+restore_vm:
+    reg_set(s, REG_GCVM_CTX1_CNTL + 7 * 4, old_vm[0]);
+    reg_set(s, REG_GCVM_CTX1_BASE_LO + 7 * 8, old_vm[1]);
+    reg_set(s, REG_GCVM_CTX1_BASE_HI + 7 * 8, old_vm[2]);
+    reg_set(s, REG_GCVM_CTX1_START_LO + 7 * 8, old_vm[3]);
+    reg_set(s, REG_GCVM_CTX1_START_HI + 7 * 8, old_vm[4]);
+    reg_set(s, REG_GCVM_CTX1_END_LO + 7 * 8, old_vm[5]);
+    reg_set(s, REG_GCVM_CTX1_END_HI + 7 * 8, old_vm[6]);
+    reg_set(s, REG_GFX_CP_INT_CNTL_RING0, old_int);
+    s->gfx_job_seq = old_seq;
+    return pass;
 }
 
 static void rdna4_gfx_rptr_writeback(RDNA4State *s, uint32_t rptr)
@@ -5197,6 +5479,7 @@ static void rdna4_reset(DeviceState *dev)
     s->gfx_rptr = 0;
     s->gfx_csb_loaded = false;
     s->gfx_reinit = false;
+    s->gfx_trace_selfcheck_done = false;
     s->gfx_job_seq = 0;
     s->gfx_num_instances = 0;
     s->gfx_draw_refused = false;
