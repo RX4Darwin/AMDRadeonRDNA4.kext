@@ -837,6 +837,57 @@ bool RDNA4Compute::readSensors(RDNA4Sensors &out) {
 	return true;
 }
 
+// The power-management view of the same table: instantaneous GFX clock, the
+// activity counters and the VDD_GFX rail, plus MetricsCounter to prove the
+// table is live. amdgpu invalidates the HDP read path after
+// TransferTableSmu2Dram (smu_cmn_update_table_read_arg, smu_cmn.c:1147-1150),
+// but hdp_v7_0_funcs (hdp_v7_0.c:128-132) has no invalidate_hdp and soc24 sets
+// none, so on this ASIC that call is a no-op. Our mapping is uncached
+// (kIOMapInhibitCache), which leaves only a stale table to rule out: poison
+// MetricsCounter first, so a table the SMU did not rewrite reads back as poison
+// instead of an old sample.
+bool RDNA4Compute::readSensorsEx(RDNA4SensorsEx &out) {
+	if (!poolCpu || kSmuTableOffset + 0x1000 > pool.size)
+		return false;
+	uint8_t *table = poolCpu + kSmuTableOffset;
+	constexpr uint32_t kPoison = 0xFFFFFFFFu;
+	*reinterpret_cast<volatile uint32_t *>(table + RDNA4_SMU_METRICS_COUNTER) = kPoison;
+	flushHdp();
+	uint32_t ret = 0;
+	if (smuSend(kSmuMsgGetMetricsTable, 5, ret, 100) != kSmuRespOk)
+		return false;
+	flushHdp();
+	auto u8 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint8_t *>(table + off);
+	};
+	auto u16 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint16_t *>(table + off);
+	};
+	auto u32 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint32_t *>(table + off);
+	};
+	memset(&out, 0, sizeof(out));
+	out.metricsCounter = u32(RDNA4_SMU_METRICS_COUNTER);
+	if (out.metricsCounter != kPoison)
+		out.flags |= RDNA4_SENSORS_EX_LIVE;
+	out.currGfxclkMHz = u32(RDNA4_SMU_METRICS_CURR_CLOCK + RDNA4_SMU_METRICS_PPCLK_GFXCLK * 4);
+	out.avgGfxclkPreDsMHz = u16(RDNA4_SMU_METRICS_AVG_GFXCLK_PRE_DS);
+	out.avgGfxclkPostDsMHz = u16(RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS);
+	out.gfxActivity = u16(RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY);
+	out.uclkActivity = u16(RDNA4_SMU_METRICS_AVG_UCLK_ACTIVITY);
+	out.vddGfxMv = u16(RDNA4_SMU_METRICS_AVG_VOLTAGE + RDNA4_SMU_METRICS_SVI_VDD_GFX * 2);
+	out.vddGfxCurrentA = u16(RDNA4_SMU_METRICS_AVG_CURRENT + RDNA4_SMU_METRICS_SVI_VDD_GFX * 2);
+	out.socketPowerW = u16(RDNA4_SMU_METRICS_AVG_SOCKET_POWER);
+	out.hotspotTempC = u16(RDNA4_SMU_METRICS_AVG_TEMPERATURE + 1 * 2);
+	for (uint32_t i = 0; i < RDNA4_SMU_METRICS_THROTTLER_COUNT; i++) {
+		const uint32_t pct = u8(RDNA4_SMU_METRICS_THROTTLING_PCT + i);
+		out.throttlingPercent[i] = static_cast<uint8_t>(pct);
+		if (pct)
+			out.throttlingMask |= 1u << i;
+	}
+	return true;
+}
+
 // ---------------------------------------------------------------------------
 // Stage 2: PSP secure OS, GPCOM ring, SMU firmware
 // ---------------------------------------------------------------------------

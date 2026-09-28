@@ -246,6 +246,7 @@ private:
 	bool waitRlcAutoload(uint32_t ms, uint32_t &cpStat, uint32_t &boot);
 	static constexpr uint32_t kSmuTableOffset = 6u << 20;            // driver table, 64 KiB
 	bool readSensors(RDNA4Sensors &out);
+	bool readSensorsEx(RDNA4SensorsEx &out);
 
 	// Stage 4: the GC hub, then SDMA0 queue 0 and a VRAM fill. Pool layout
 	// past the PSP's first 4 MiB (offsets within the pool).
@@ -478,6 +479,7 @@ public:
 	IOReturn rtOpen(const void *owner);
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
 	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
+	IOReturn rtSensorsEx(const void *owner, RDNA4SensorsEx &out);
 	IOReturn rtSleepTest(const void *owner, uint32_t phase);
 	IOReturn rtQuiesce(const void *owner);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);

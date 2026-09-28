@@ -69,6 +69,14 @@
 #define RDNA4_SMU_METRICS_AVG_SOCKET_POWER  136u
 #define RDNA4_SMU_METRICS_AVG_TEMPERATURE   140u
 #define RDNA4_SMU_METRICS_AVG_FAN_RPM       170u
+#define RDNA4_SMU_METRICS_CURR_CLOCK          0u
+#define RDNA4_SMU_METRICS_AVG_GFXCLK_PRE_DS  46u
+#define RDNA4_SMU_METRICS_COUNTER           104u
+#define RDNA4_SMU_METRICS_AVG_VOLTAGE       108u
+#define RDNA4_SMU_METRICS_AVG_CURRENT       116u
+#define RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY  124u
+#define RDNA4_SMU_METRICS_AVG_UCLK_ACTIVITY 126u
+#define RDNA4_SMU_METRICS_THROTTLING_PCT    172u
 
 #define TYPE_RDNA4 "rdna4"
 OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
@@ -578,6 +586,7 @@ struct RDNA4State {
     bool     hang_sticky;    /* queue dequeue never completes */
     bool     sleep_reset;    /* monitor-triggered compute power reset */
     bool     gfx_hang;       /* accept gfx kicks but leave the ring stopped */
+    bool     smu_stale;      /* metrics transfer acks but the table is never rewritten */
     bool     warm_keep;      /* reset keeps live engines/queues, like warm card restart */
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
     bool     cursor_reject_logged;
@@ -1544,6 +1553,25 @@ static void rdna4_gfx_autoload(RDNA4State *s)
     fprintf(stderr, "rdna4: gfx: IMU released by the PMFW, RLC autoload complete\n");
 }
 
+/* SmuMetrics_t power-management fields (smu14_driver_if_v14_0.h:1649-1727).
+ * The real PMFW bumps MetricsCounter on its own tick (about 1 ms), so it is the
+ * virtual clock in ms: two reads a second apart differ, and a table the SMU did
+ * not rewrite keeps whatever the driver put there. The activity values are the
+ * emulator's idle card (no queue is executing), not a claim about silicon. */
+static void rdna4_smu_metrics_pm_fields(RDNA4State *s, uint8_t *table)
+{
+    (void)s;
+    stl_le_p(table + RDNA4_SMU_METRICS_COUNTER,
+             (uint32_t)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) & 0x7fffffff));
+    stl_le_p(table + RDNA4_SMU_METRICS_CURR_CLOCK + 0 * 4, 2100);      /* PPCLK_GFXCLK */
+    stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFXCLK_PRE_DS, 2100);
+    stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY, 3);
+    stw_le_p(table + RDNA4_SMU_METRICS_AVG_UCLK_ACTIVITY, 1);
+    stw_le_p(table + RDNA4_SMU_METRICS_AVG_VOLTAGE + 0 * 2, 850);      /* SVI_PLANE_VDD_GFX, mV */
+    stw_le_p(table + RDNA4_SMU_METRICS_AVG_CURRENT + 0 * 2, 12);
+    table[RDNA4_SMU_METRICS_THROTTLING_PCT + 14] = 0;                  /* THROTTLER_PPT0 */
+}
+
 static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
 {
     uint32_t resp = SMU_RESP_OK, param = reg_get(s, REG_SMU_PARAM);
@@ -1602,7 +1630,14 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
             resp = SMU_RESP_UNKNOWN;
             break;
         }
+        if (s->smu_stale) {
+            /* "smu-stale": the SMU acks the transfer but the driver table is
+             * left as the driver wrote it (a stale HDP/PCIe write path). */
+            fprintf(stderr, "rdna4: smu: metrics transfer acked, table NOT rewritten (smu-stale)\n");
+            break;
+        }
         memset(table, 0, 4096);
+        rdna4_smu_metrics_pm_fields(s, table);
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS, 2100);
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS, 1000);
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_TEMPERATURE + 0 * 2, 42);
@@ -6591,6 +6626,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,
                 bool),
     DEFINE_PROP_BOOL("gfx-hang", RDNA4State, gfx_hang, false),
+    DEFINE_PROP_BOOL("smu-stale", RDNA4State, smu_stale, false),
     DEFINE_PROP_BOOL("warm-keep", RDNA4State, warm_keep, false),
     DEFINE_PROP_UINT32("gfx-break", RDNA4State, gfx_break, 0),
     DEFINE_PROP_BOOL("gfx-trace", RDNA4State, gfx_trace, false),

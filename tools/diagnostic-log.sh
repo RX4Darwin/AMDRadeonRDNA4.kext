@@ -518,6 +518,19 @@ registry_value() {
 		record sensors FAIL "metrics query did not complete"
 	fi
 
+	# Power-management view of the same SMU table: two samples one second
+	# apart (see r2-sensors-review.md section 5). A stale table or a clock
+	# held at max at idle is a finding, not a tool failure, so it stays PASS.
+	if [ "$INFO_OK" -eq 0 ]; then
+		record sensors-pm SKIPPED "runtime unavailable"
+	elif grep -q '^sensors-pm: verdict ' "$SENSORS_FILE"; then
+		pm_gfx="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_FILE" | tail -1 | sed -E 's/^sensors-pm\[2\]: //' | cut -c1-110)"
+		pm_verdict="$(grep '^sensors-pm: verdict ' "$SENSORS_FILE" | tail -1 | sed 's/^sensors-pm: verdict //')"
+		record sensors-pm PASS "$pm_verdict | $pm_gfx"
+	else
+		record sensors-pm FAIL "no power-management sample (kext without kRDNA4MethodSensorsEx?)"
+	fi
+
 	if [ "$SLEEPTEST_MODE" -ne 1 ]; then
 		record sleep SKIPPED "rdna4-sleeptest not enabled"
 	elif [ "$SLEEP_RC" -eq 0 ] && grep -q 'pre-sleep client aborted as expected' "$SLEEP_FILE"; then

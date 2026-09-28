@@ -1681,6 +1681,65 @@ static int testIhRing() {
 	return failures;
 }
 
+// SmuMetrics_t as smu14_driver_if_v14_0.h:1649-1727 declares it, with the
+// enum counts of that header (PPCLK_COUNT :467, SVI_PLANE_COUNT :563,
+// TEMP_COUNT :549, THROTTLER_COUNT :216). The compiler computes the offsets,
+// so this test checks the constants against the layout, not against themselves.
+namespace {
+struct SmuMetricsMirror {
+	uint32_t CurrClock[11];
+	uint16_t AverageGfxclkFrequencyTarget, AverageGfxclkFrequencyPreDs,
+	         AverageGfxclkFrequencyPostDs, AverageFclkFrequencyPreDs,
+	         AverageFclkFrequencyPostDs, AverageMemclkFrequencyPreDs,
+	         AverageMemclkFrequencyPostDs, AverageVclk0Frequency, AverageDclk0Frequency,
+	         AverageVclk1Frequency, AverageDclk1Frequency, AveragePCIeBusy, dGPU_W_MAX, padding;
+	uint16_t MovingAverageGfxclkFrequencyTarget, MovingAverageGfxclkFrequencyPreDs,
+	         MovingAverageGfxclkFrequencyPostDs, MovingAverageFclkFrequencyPreDs,
+	         MovingAverageFclkFrequencyPostDs, MovingAverageMemclkFrequencyPreDs,
+	         MovingAverageMemclkFrequencyPostDs, MovingAverageVclk0Frequency,
+	         MovingAverageDclk0Frequency, MovingAverageGfxActivity, MovingAverageUclkActivity,
+	         MovingAverageVcn0ActivityPercentage, MovingAveragePCIeBusy,
+	         MovingAverageUclkActivity_MAX, MovingAverageSocketPower, MovingAveragePadding;
+	uint32_t MetricsCounter;
+	uint16_t AvgVoltage[4];
+	uint16_t AvgCurrent[4];
+	uint16_t AverageGfxActivity, AverageUclkActivity, AverageVcn0ActivityPercentage,
+	         Vcn1ActivityPercentage;
+	uint32_t EnergyAccumulator;
+	uint16_t AverageSocketPower, AverageTotalBoardPower;
+	uint16_t AvgTemperature[12];
+	uint16_t AvgTemperatureFanIntake;
+	uint8_t  PcieRate, PcieWidth, AvgFanPwm, Padding[1];
+	uint16_t AvgFanRpm;
+	uint8_t  ThrottlingPercentage[21];
+	uint8_t  VmaxThrottlingPercentage, padding1[2];
+};
+}
+
+static int testSmuMetricsPmOffsets() {
+	int failures = 0;
+	failures += check(offsetof(SmuMetricsMirror, CurrClock) == RDNA4_SMU_METRICS_CURR_CLOCK &&
+	                  offsetof(SmuMetricsMirror, AverageGfxclkFrequencyPreDs) == RDNA4_SMU_METRICS_AVG_GFXCLK_PRE_DS &&
+	                  offsetof(SmuMetricsMirror, AverageGfxclkFrequencyPostDs) == RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS &&
+	                  offsetof(SmuMetricsMirror, AverageMemclkFrequencyPostDs) == RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS &&
+	                  offsetof(SmuMetricsMirror, MovingAverageGfxActivity) == RDNA4_SMU_METRICS_MOVING_AVG_GFX_ACT &&
+	                  offsetof(SmuMetricsMirror, MetricsCounter) == RDNA4_SMU_METRICS_COUNTER &&
+	                  offsetof(SmuMetricsMirror, AvgVoltage) == RDNA4_SMU_METRICS_AVG_VOLTAGE &&
+	                  offsetof(SmuMetricsMirror, AvgCurrent) == RDNA4_SMU_METRICS_AVG_CURRENT &&
+	                  offsetof(SmuMetricsMirror, AverageGfxActivity) == RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY &&
+	                  offsetof(SmuMetricsMirror, AverageUclkActivity) == RDNA4_SMU_METRICS_AVG_UCLK_ACTIVITY &&
+	                  offsetof(SmuMetricsMirror, AverageSocketPower) == RDNA4_SMU_METRICS_AVG_SOCKET_POWER &&
+	                  offsetof(SmuMetricsMirror, AvgTemperature) == RDNA4_SMU_METRICS_AVG_TEMPERATURE &&
+	                  offsetof(SmuMetricsMirror, AvgFanRpm) == RDNA4_SMU_METRICS_AVG_FAN_RPM &&
+	                  offsetof(SmuMetricsMirror, ThrottlingPercentage) == RDNA4_SMU_METRICS_THROTTLING_PCT &&
+	                  sizeof(((SmuMetricsMirror *)0)->ThrottlingPercentage) == RDNA4_SMU_METRICS_THROTTLER_COUNT,
+	                  "smu: pm metrics offsets vs the SmuMetrics_t layout (counter at %u, activity at %u)",
+	                  RDNA4_SMU_METRICS_COUNTER, RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY);
+	printf("\nsmu: SmuMetrics_t power-management offsets %s\n", failures ? "FAILED" : "ok");
+	return failures;
+}
+
+static int testSmuMetricsOffsets();
 static int testSmuMetricsOffsets() {
 	int failures = 0;
 	failures += check(RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS == 48u &&
@@ -1691,6 +1750,7 @@ static int testSmuMetricsOffsets() {
 	                  "smu: SmuMetrics_t offsets (fan at byte %u)",
 	                  RDNA4_SMU_METRICS_AVG_FAN_RPM);
 	printf("\nsmu: SmuMetrics_t telemetry offsets %s\n", failures ? "FAILED" : "ok");
+	failures += testSmuMetricsPmOffsets();
 	return failures;
 }
 
