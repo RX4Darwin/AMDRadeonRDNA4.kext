@@ -32,6 +32,9 @@
 #include "compute.hpp"
 #include "device.hpp"
 #include "ndrv.hpp"
+
+uint32_t rdna4TraceLevel { 0 };
+
 #ifdef RDNA4FB_VM_TEST
 #include "bochsvbe.hpp"
 #endif
@@ -495,11 +498,15 @@ void pluginStart() {
 		return;
 	}
 	uint32_t trace = 0;
-	traceEnabled = PE_parse_boot_argn("rdna4-trace", &trace, sizeof(trace)) && trace;
+	const bool traceArg = PE_parse_boot_argn("rdna4-trace", &trace, sizeof(trace));
+	rdna4TraceLevel = traceArg ? trace : 0;
+	traceEnabled = rdna4TraceLevel != 0;
 #ifdef RDNA4FB_VM_TEST
 	// VM test builds trace by default (OpenCore images often pin boot-args).
-	if (!PE_parse_boot_argn("rdna4-trace", &trace, sizeof(trace)))
+	if (!traceArg) {
+		rdna4TraceLevel = 1;
 		traceEnabled = true;
+	}
 #endif
 	computeStage = RDNA4Compute::requestedStage();
 	Ndrv::vslInit();

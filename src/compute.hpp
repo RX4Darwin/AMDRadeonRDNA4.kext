@@ -77,6 +77,10 @@ class OSObject;
 class IOMemoryMap;
 class OSDictionary;
 
+// The plugin owns the boot-arg value; runtime/display paths use the level to
+// keep high-rate diagnostics off the real card's normal trace setting.
+extern uint32_t rdna4TraceLevel;
+
 class RDNA4Compute {
 public:
 	~RDNA4Compute();
@@ -172,7 +176,8 @@ private:
 	friend bool Flip::waitNextVblank(RDNA4Compute &compute, uint8_t otg, uint32_t timeoutMs,
 	                                uint64_t &frame);
 	friend bool Flip::flipTo(RDNA4Compute &compute, const Flip::Surface &surface,
-	                         uint64_t target, const char *name, uint64_t *latencyUs);
+	                         uint64_t target, const char *name, uint64_t *latencyUs,
+	                         bool async);
 
 	Env    env {};
 	Survey sv {};

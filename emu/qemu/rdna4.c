@@ -130,6 +130,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define HUBP_SURFACE_ADDR    0x060a
 #define HUBP_SURFACE_ADDR_HI 0x060b
 #define HUBP_FLIP_INTERRUPT  0x0617     /* DCSURF_SURFACE_FLIP_INTERRUPT */
+#define HUBP_EARLIEST_ADDR   0x061c     /* DCSURF_SURFACE_EARLIEST_INUSE */
+#define HUBP_EARLIEST_ADDR_HI 0x061d   /* DCSURF_SURFACE_EARLIEST_INUSE_HIGH */
 #define HUBP_DB_FIRST        0x05e5     /* DCSURF_SURFACE_CONFIG .. */
 #define HUBP_FLIP_CONTROL    0x0613     /* regHUBPREQ0_DCSURF_FLIP_CONTROL, BASE_IDX 2 */
 #define HUBP_FLIP_PENDING    (1u << 8)
@@ -504,6 +506,7 @@ typedef struct RDNA4Pending {
 typedef struct RDNA4Flip {
     bool pending;
     uint64_t request_frame;
+    uint64_t latch_ns;       /* VUPDATE, a few scanlines before frame */
 } RDNA4Flip;
 
 typedef struct RDNA4Cursor {
@@ -822,6 +825,21 @@ static bool rdna4_otg_position(RDNA4State *s, int otg, uint64_t *frame,
 
 static bool rdna4_update_locked(RDNA4State *s, int otg);
 static void rdna4_latch_flips(RDNA4State *s, int otg, uint64_t frame);
+static uint64_t rdna4_dcn_period_ns(RDNA4State *s, int otg);
+static void rdna4_dcn_schedule(RDNA4State *s);
+
+static void rdna4_init_earliest_inuse(RDNA4State *s)
+{
+    for (int hubp = 0; hubp < NUM_OTG; hubp++) {
+        uint32_t primary = reg_get(s, SEG2(HUBP_SURFACE_ADDR + hubp * HUBP_STRIDE));
+        uint32_t primary_hi = reg_get(s, SEG2(HUBP_SURFACE_ADDR_HI + hubp * HUBP_STRIDE));
+        if (!reg_get(s, SEG2(HUBP_EARLIEST_ADDR + hubp * HUBP_STRIDE)) &&
+            !reg_get(s, SEG2(HUBP_EARLIEST_ADDR_HI + hubp * HUBP_STRIDE))) {
+            reg_set(s, SEG2(HUBP_EARLIEST_ADDR + hubp * HUBP_STRIDE), primary);
+            reg_set(s, SEG2(HUBP_EARLIEST_ADDR_HI + hubp * HUBP_STRIDE), primary_hi);
+        }
+    }
+}
 
 static uint32_t rdna4_otg_read(RDNA4State *s, int otg, uint32_t dw)
 {
@@ -914,7 +932,7 @@ static void rdna4_latch_flips(RDNA4State *s, int otg, uint64_t frame)
     const int hubp = rdna4_hubp_for_otg(s, otg);
 
     if (hubp < 0 || !flip->pending || s->flip_stuck || rdna4_update_locked(s, otg) ||
-        frame == flip->request_frame) {
+        !flip->latch_ns) {
         return;
     }
     unsigned out = 0;
@@ -929,11 +947,16 @@ static void rdna4_latch_flips(RDNA4State *s, int otg, uint64_t frame)
     }
     s->npending = out;
     if (applied) {
+        uint32_t primary = reg_get(s, SEG2(HUBP_SURFACE_ADDR + hubp * HUBP_STRIDE));
+        uint32_t primary_hi = reg_get(s, SEG2(HUBP_SURFACE_ADDR_HI + hubp * HUBP_STRIDE));
+        reg_set(s, SEG2(HUBP_EARLIEST_ADDR + hubp * HUBP_STRIDE), primary);
+        reg_set(s, SEG2(HUBP_EARLIEST_ADDR_HI + hubp * HUBP_STRIDE), primary_hi);
         flip->pending = false;
+        flip->latch_ns = 0;
         uint32_t addr = SEG2(HUBP_FLIP_INTERRUPT + hubp * HUBP_STRIDE);
         uint32_t status = reg_get(s, addr);
-        fprintf(stderr, "rdna4: dcn: HUBP%d flip latched at frame %" PRIu64 "\n",
-                hubp, frame);
+        fprintf(stderr, "rdna4: dcn: HUBP%d flip latched at VUPDATE before frame %" PRIu64
+                " (earliest 0x%08x:%08x)\n", hubp, frame, primary_hi, primary);
         if ((status & DCN_FLIP_ENABLE) && !(status & DCN_FLIP_STATUS)) {
             reg_set(s, addr, status | DCN_FLIP_OCCURRED | DCN_FLIP_STATUS);
             rdna4_ih_emit(s, DCN_CLIENT, DCN_SRC_PFLIP + hubp, 0, 0);
@@ -977,6 +1000,15 @@ static void rdna4_db_write(RDNA4State *s, int otg, uint32_t addr, uint32_t val)
         }
         s->flip[otg].pending = true;
         s->flip[otg].request_frame = frame;
+        const uint64_t period = rdna4_dcn_period_ns(s, otg);
+        const uint64_t vtotal = (rdna4_otg_reg(s, otg, OTG_V_TOTAL) & 0x7fff) + 1;
+        const uint64_t lead = MAX(period / MAX(vtotal, 1ull) * 4, 1ull);
+        uint64_t boundary = s->otg_epoch[otg] + (frame + 1) * period;
+        const uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        if (!period || boundary <= now + lead)
+            boundary += period;
+        s->flip[otg].latch_ns = period ? boundary - lead : 0;
+        rdna4_dcn_schedule(s);
     }
 }
 
@@ -1123,6 +1155,16 @@ static void rdna4_dcn_timer(void *opaque)
         uint64_t interval = s->dcn_irq_storm ? MAX(period / 10, 1ull) : period;
         if (!s->dcn_next_ns[otg])
             s->dcn_next_ns[otg] = now + interval;
+        RDNA4Flip *flip = &s->flip[otg];
+        if (flip->pending && flip->latch_ns && flip->latch_ns <= now) {
+            uint64_t frame = 0;
+            uint32_t line = 0;
+            uint32_t horizontal = 0;
+            if (rdna4_otg_position(s, otg, &frame, &line, &horizontal))
+                rdna4_latch_flips(s, otg, frame);
+            if (flip->pending && flip->latch_ns <= now)
+                flip->latch_ns += interval;
+        }
         while (s->dcn_next_ns[otg] <= now) {
             uint64_t frame = 0;
             uint32_t line = 0;
@@ -1139,6 +1181,8 @@ static void rdna4_dcn_timer(void *opaque)
         }
         if (!next || s->dcn_next_ns[otg] < next)
             next = s->dcn_next_ns[otg];
+        if (flip->pending && flip->latch_ns && flip->latch_ns < next)
+            next = flip->latch_ns;
     }
     if (next && s->dcn_timer)
         timer_mod_ns(s->dcn_timer, next);
@@ -6141,6 +6185,7 @@ static void rdna4_reset(DeviceState *dev)
         g_free(dcn);
         fprintf(stderr, "rdna4: power reset: compute state restored from gop-state; DCN and VRAM retained\n");
     }
+    rdna4_init_earliest_inuse(s);
     if (s->discovery) {
         memcpy(s->resv + RDNA4_RESV_SIZE - RDNA4_DISCOVERY_TOP, s->discovery,
                MIN(s->discovery_len, RDNA4_DISCOVERY_TOP));
@@ -6254,6 +6299,7 @@ static void rdna4_realize(PCIDevice *dev, Error **errp)
     if (!rdna4_load_state(s, errp)) {
         return;
     }
+    rdna4_init_earliest_inuse(s);
     s->dcn_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rdna4_dcn_timer, s);
     s->work_timer = timer_new_ns(QEMU_CLOCK_REALTIME, rdna4_work_timer, s);
     s->work_bh = qemu_bh_new(rdna4_work_bh, s);

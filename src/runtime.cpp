@@ -36,6 +36,10 @@ using namespace GfxReg;
 
 namespace {
 
+bool detailedFlipTrace() {
+	return rdna4TraceLevel >= 2;
+}
+
 class RDNA4PresentContext : public OSObject {
 	OSDeclareDefaultStructors(RDNA4PresentContext);
 
@@ -715,16 +719,20 @@ void RDNA4Compute::stopPresentationTimer() {
 }
 
 void RDNA4Compute::schedulePresentationTimer() {
-	if (presentTimer)
+	if (presentTimer) {
 		presentTimer->setTimeoutMS(1);
+	}
 }
 
 void RDNA4Compute::schedulePresentationRetry() {
 	// This is deliberately a racy hint: a present submission arms the timer,
 	// while a busy client must not turn the framebuffer work loop into a 1 kHz
 	// lock-poll.  If work is still pending, retry after a bounded backoff.
-	if (presentTimer && presentPending)
+	if (presentTimer && presentPending) {
 		presentTimer->setTimeoutMS(8);
+		if (detailedFlipTrace())
+			RLOG("present timer: retry armed in 8 ms (%u pending)", presentPending);
+	}
 }
 
 void RDNA4Compute::presentTimerAction(OSObject *owner, IOTimerEventSource *) {
@@ -768,6 +776,8 @@ void RDNA4Compute::presentTimerTick() {
 		// The framebuffer work-loop timer must never wait behind a client
 		// dispatch, SDMA transfer, or restore.  Retry only while a present is
 		// pending, with a backoff rather than a 1 ms lock poll.
+		if (detailedFlipTrace())
+			RLOG("present timer: rtLock busy; retry");
 		schedulePresentationRetry();
 		return;
 	}
@@ -781,15 +791,26 @@ void RDNA4Compute::presentTimerTick() {
 	if (id)
 		surface = presentSurface;
 	IOLockUnlock(rtLock);
-	if (!id)
+	if (!id) {
+		if (detailedFlipTrace())
+			RLOG("present timer: wake with no pending slot");
 		return;
+	}
+	if (!presentNoVblankTicks && detailedFlipTrace())
+		RLOG("present timer: service id %llu on OTG%u HUBP%u", id, surface.otg, surface.hubp);
 
 	uint64_t frame = 0;
 	// A one-millisecond bounded poll avoids the old 100 ms work-loop stall,
 	// while still giving the emulator/card a chance to advance the frame
 	// counter between timer callbacks.  Re-arming remains bounded below.
 	if (!Flip::waitNextVblank(*this, surface.otg, 1, frame)) {
+		if (detailedFlipTrace() &&
+		    (!presentNoVblankTicks || (presentNoVblankTicks % 25) == 24))
+			RLOG("present timer: id %llu no vblank in 1 ms (retry %u)", id,
+			     presentNoVblankTicks + 1);
 		if (!IOLockTryLock(rtLock)) {
+			if (detailedFlipTrace())
+				RLOG("present timer: rtLock busy after vblank miss; retry");
 			schedulePresentationRetry();
 			return;
 		}
@@ -811,8 +832,12 @@ void RDNA4Compute::presentTimerTick() {
 			schedulePresentationTimer();
 		return;
 	}
+	if (detailedFlipTrace())
+		RLOG("present timer: id %llu saw vblank frame %llu; attempting latch", id, frame);
 
 	if (!IOLockTryLock(rtLock)) {
+		if (detailedFlipTrace())
+			RLOG("present timer: rtLock busy after vblank; retry");
 		schedulePresentationRetry();
 		return;
 	}
@@ -835,11 +860,17 @@ void RDNA4Compute::presentTimerTick() {
 			presentOffset = slot->offset;
 			presentStarted = mach_absolute_time();
 			presentSurface = surface;
-			if (!Flip::flipTo(*this, surface, buffer->mc + slot->offset, "present async")) {
+			if (detailedFlipTrace())
+				RLOG("present timer: id %llu flip target 0x%llx", id, buffer->mc + slot->offset);
+			if (!Flip::flipTo(*this, surface, buffer->mc + slot->offset, "present async",
+			                  nullptr, true)) {
 				completePresentLocked(*slot, kIOReturnNotResponding, 0);
+				RLOG("present timer: id %llu latch failed; restoring desktop", id);
 				(void)restorePresentationLocked("present async failure");
 			} else {
 				completePresentLocked(*slot, kIOReturnSuccess, frame);
+				if (detailedFlipTrace())
+					RLOG("present timer: id %llu complete at frame %llu", id, frame);
 			}
 		}
 	}
@@ -1596,8 +1627,9 @@ IOReturn RDNA4Compute::rtPresentAsync(const void *owner, uint64_t handle, uint64
 	*slot = PresentSlot { owner, handle, offset, presentId, 0, kIOReturnSuccess, 1 };
 	presentPending++;
 	schedulePresentationTimer();
-	RLOG("present async: queued id %llu buffer 0x%llx +0x%llx (%u/%u pending)",
-	     presentId, handle, offset, presentPending, 2u);
+	if (detailedFlipTrace())
+		RLOG("present async: queued id %llu buffer 0x%llx +0x%llx (%u/%u pending), timer armed 1 ms",
+		     presentId, handle, offset, presentPending, 2u);
 	return kIOReturnSuccess;
 }
 
