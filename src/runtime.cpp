@@ -395,8 +395,11 @@ bool RDNA4Compute::vmContextInit(RtClient &c) {
 
 bool RDNA4Compute::vmInvalidate(uint32_t vmid, const char *tag) {
 	const Reg req { 0, GcInvEng0Req.dword + kGcInvEngGart }, ack { 0, GcInvEng0Ack.dword + kGcInvEngGart };
+	/* gfxhub_v12_0_get_invalidate_req: legacy flush of L2 PTEs, PDE0-2 and
+	 * L1 PTEs, with CLEAR_PROTECTION_FAULT_STATUS_ADDR (bit 24) left 0.
+	 * Fault status is cleared through FAULT_CNTL instead (gcFaultClear). */
 	const uint32_t request = (1u << vmid) | (1u << 19) | (1u << 20) | (1u << 21) | (1u << 22) |
-	                         (1u << 23) | (1u << 24); /* clear fault status */
+	                         (1u << 23);
 	wr(IpDiscovery::HwGc, req, request);
 	for (uint32_t us = 0; us < 100000; us += 10) {
 		if (rdGc(ack) & (1u << vmid))
@@ -510,10 +513,11 @@ bool RDNA4Compute::vmBootSelfTest() {
 	if (context) {
 		/* A fault latched before this test (an earlier boot, another
 		 * engine) would be blamed on the queue below: show it, then clear
-		 * it with the first invalidation of the new context. */
+		 * it the way amdgpu does. */
 		const uint32_t stale = rdGc(GcL2FaultStatusLo);
 		if (stale)
 			logGcFault("vm: boot: fault latched before the test");
+		gcFaultClear();
 		trail("vm: context invalidate");
 		(void)vmInvalidate(vmid, "boot context enable");
 		trail("vm: HQD activate");
@@ -526,6 +530,10 @@ bool RDNA4Compute::vmBootSelfTest() {
 		const uint32_t value = 0x564d0001;
 		c.pm4.emit(pkt, Pm4::writeData(pkt, dataVa, 0x600df00d));
 		c.pm4.emit(pkt, Pm4::releaseMem(pkt, fenceVa, value));
+		/* Anything set here came from the activation (the MQD access), not
+		 * from the packets: one line makes a failure below attributable. */
+		RLOG("vm: boot: fault status before the kick 0x%08x (stale 0x%08x, cleared)",
+		     rdGc(GcL2FaultStatusLo), stale);
 		trail("vm: queue kick");
 		pm4Kick(c.pm4, doorbell, c.pm4.wptr());
 		for (uint32_t us = 0; us < 200000 && !fence; us += 10) {
@@ -582,8 +590,10 @@ bool RDNA4Compute::vmBootSelfTest() {
 	}
 	IOFree(c.tableShadow, kVmTableBytes);
 	devHeap.free(table);
-	if (context && !clean)
+	if (context && !clean) {
+		gcFaultClear();
 		scrubFaultPage();   // D15: a faulting write may have left data there
+	}
 	const bool ok = context && hqd && fence && data && clean && inactive && flushed;
 	if (ok)
 		publishResult("vm", "PASS boot self-test");
@@ -598,6 +608,7 @@ void RDNA4Compute::logClientFault(RtClient &c, const char *tag) {
 		return;
 	RLOG("vmid %u: %s: GC hub fault status 0x%08x (fault VMID %u) VA 0x%llx", c.vmid, tag,
 	     status, (status >> 20) & 0xf, gcFaultVa());
+	gcFaultClear();
 	vmInvalidate(c.vmid, "fault clear");
 	scrubFaultPage();
 }

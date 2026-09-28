@@ -332,6 +332,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define REG_GCVM_CTX1_START_HI GC_SEG0(0x16b2)
 #define REG_GCVM_CTX1_END_LO GC_SEG0(0x16d1)
 #define REG_GCVM_CTX1_END_HI GC_SEG0(0x16d2)
+#define REG_GCVM_FAULT_CNTL   GC_SEG0(0x15cc)
 #define REG_GCVM_FAULT_STATUS GC_SEG0(0x15d0)
 #define REG_GCVM_FAULT_ADDR_LO GC_SEG0(0x15d2)
 #define REG_GCVM_FAULT_ADDR_HI GC_SEG0(0x15d3)
@@ -672,6 +673,7 @@ struct RDNA4State {
         bool used;
         bool pending;
         uint64_t pending_wptr;
+        uint64_t mqd_stall_logged;   /* MQD address | VMID last reported stalled */
     } hqd[4][8];
     uint32_t selected_pipe, selected_queue, selected_vmid;
 };
@@ -2464,7 +2466,16 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         if (!s->inv_noack) {
             reg_set(s, REG_GCVM_INV17_ACK, val & 0xffff);   /* per-VMID ack */
         }
-        if (val & (1u << 24)) {
+        /* The invalidation does not clear the fault status: amdgpu never
+         * relies on CLEAR_PROTECTION_FAULT_STATUS_ADDR here (bit 24, left 0
+         * by gfxhub_v12_0_get_invalidate_req); see REG_GCVM_FAULT_CNTL. */
+    } else if (addr == REG_GCVM_FAULT_CNTL) {
+        /* GCVM_L2_PROTECTION_FAULT_CNTL.CLEAR_PROTECTION_FAULT_STATUS_ADDR
+         * (bit 0) clears the latched status and address, as amdgpu's fault
+         * handler does (gmc_v12_0.c: WREG32_P(vm_l2_pro_fault_cntl, 1, ~1)).
+         * Modelled as a trigger that reads back 0. */
+        reg_set(s, addr, val & ~1u);
+        if (val & 1u) {
             reg_set(s, REG_GCVM_FAULT_STATUS, 0);
             reg_set(s, REG_GCVM_FAULT_ADDR_LO, 0);
             reg_set(s, REG_GCVM_FAULT_ADDR_HI, 0);
@@ -3618,11 +3629,19 @@ static bool rdna4_mec_mqd_ok(RDNA4State *s, uint32_t pipe, uint32_t queue)
                    ((uint64_t)reg_get(s, REG_CP_MQD_BASE_ADDR_HI) << 32);
     uint32_t vmid = reg_get(s, REG_CP_MQD_CONTROL) & 0xf;
 
-    if (rdna4_mec_queue_mem_ok(s, mqd, vmid))
+    uint64_t *logged = &s->hqd[pipe][queue].mqd_stall_logged;
+
+    if (rdna4_mec_queue_mem_ok(s, mqd, vmid)) {
+        *logged = 0;
         return true;
-    fprintf(stderr, "rdna4: mec: queue pipe %u queue %u stalled: MQD 0x%" PRIx64
-            " faulted in CP_MQD_CONTROL VMID %u (amdgpu keeps it 0)\n",
-            pipe, queue, mqd, vmid);
+    }
+    /* Once per HQD and MQD setup, not on every doorbell or slice. */
+    if (*logged != (mqd | vmid | 1)) {
+        *logged = mqd | vmid | 1;
+        fprintf(stderr, "rdna4: mec: queue pipe %u queue %u stalled: MQD 0x%" PRIx64
+                " faulted in CP_MQD_CONTROL VMID %u (amdgpu keeps it 0)\n",
+                pipe, queue, mqd, vmid);
+    }
     return false;
 }
 

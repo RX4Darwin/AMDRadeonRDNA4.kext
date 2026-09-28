@@ -258,6 +258,12 @@ private:
 		return (rdGc(GfxReg::GcL2FaultAddrLo) |
 		        (static_cast<uint64_t>(rdGc(GfxReg::GcL2FaultAddrHi) & 0xf) << 32)) << 12;
 	}
+	// gmc_v12_0_process_interrupt: WREG32_P(vm_l2_pro_fault_cntl, 1, ~1), i.e.
+	// GCVM_L2_PROTECTION_FAULT_CNTL.CLEAR_PROTECTION_FAULT_STATUS_ADDR (bit 0)
+	// clears the latched status and address.
+	void gcFaultClear() {
+		wr(IpDiscovery::HwGc, GfxReg::GcL2FaultCntl, rdGc(GfxReg::GcL2FaultCntl) | 1);
+	}
 	bool sdmaStartMcus();               // sdma_v7_0_enable: unhalt before queue setup
 	bool sdmaQueueInit();
 	void sdmaKick(uint64_t wptrBytes);

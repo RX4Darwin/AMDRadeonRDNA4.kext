@@ -2049,6 +2049,7 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 		if (status) {
 			CLOG("vmid %u: %s: GC hub fault status 0x%08x (fault VMID %u) VA 0x%llx", l.vmid, tag,
 			     status, (status >> 20) & 0xf, gcFaultVa());
+			gcFaultClear();
 			vmInvalidate(l.vmid, "dispatch fault clear");
 			scrubFaultPage();
 		}
