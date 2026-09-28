@@ -1800,6 +1800,9 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	bool done = false;
 	if (irq) {
 		done = ihWaitFence(fenceCpu, fenceValue, (timeoutUs + 999) / 1000, true, nullptr, ns);
+		// Time the whole dispatch, from before the kick (the emulator even
+		// runs it inside the kick), like the polling path below.
+		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	} else {
 		for (uint32_t polls = 0;; polls++) {
 			done = *fenceCpu == fenceValue;
