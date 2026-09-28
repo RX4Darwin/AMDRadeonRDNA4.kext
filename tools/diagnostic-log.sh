@@ -351,7 +351,9 @@ record_registry() {
 	# W8: selftest's SubmitIb section proves a single IB, ordered fences and
 	# ten back-to-back IBs. Keep it separate from the general runtime result so
 	# the real-card report shows which queue path was actually exercised.
-	if [ "$INFO_OK" -eq 0 ]; then
+	if [ "$VM_MODE" -eq 0 ]; then
+		record submitib SKIPPED "requires rdna4-vm=1"
+	elif [ "$INFO_OK" -eq 0 ]; then
 		record submitib SKIPPED "runtime unavailable"
 	elif [ "$SELFTEST_RC" -eq 0 ] && \
 		grep -q '  ok  SubmitIb vadd:' "$SELFTEST_FILE" && \
@@ -365,7 +367,9 @@ record_registry() {
 	# W2 fault-page scrub: the selftest dispatches through a freed host VA and
 	# requires a clean fence. The kernel clears the shared fault-default page
 	# after servicing that fault, so retain the user-visible proof in the table.
-	if [ "$INFO_OK" -eq 0 ]; then
+	if [ "$VM_MODE" -eq 0 ]; then
+		record fault SKIPPED "requires rdna4-vm=1"
+	elif [ "$INFO_OK" -eq 0 ]; then
 		record fault SKIPPED "runtime unavailable"
 	elif [ "$SELFTEST_RC" -eq 0 ] && \
 		grep -q 'ok    dispatch through freed host VA faulted cleanly' "$SELFTEST_FILE"; then
