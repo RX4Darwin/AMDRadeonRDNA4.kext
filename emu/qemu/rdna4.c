@@ -3655,7 +3655,13 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                 if (!ngg || enable != 1) goto unknown;
                 for (unsigned lane = 0; lane < 32; lane++) {
                     if ((w->exec >> lane) & 1u) {
-                        w->prim_export[lane] = w->v[src][lane];
+                        uint32_t raw = w->v[src][lane];
+                        /* The shader's packed byte lanes are converted at
+                         * SQ_EXP_PRIM to the 9-bit primitive index fields. */
+                        w->prim_export[lane] = (raw & 0xffu) |
+                            (((raw >> 8) & 0xffu) << 9) |
+                            (((raw >> 16) & 0xffu) << 18) |
+                            (raw & (1u << 31));
                         w->prim_valid[lane] = true;
                     }
                 }
