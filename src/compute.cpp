@@ -1116,6 +1116,8 @@ bool RDNA4Compute::stageGfx() {
 	     "sys_low 0x%08x, l2 0x%08x, ctx0 0x%08x, l1 tlb 0x%08x", fbBase, fbTop,
 	     rdGc(GcFbOffset), rdGc(GcAgpBase), rdGc(GcAgpBot), rdGc(GcAgpTop),
 	     rdGc(GcSysApertureLow), rdGc(GcL2Cntl), rdGc(GcCtx0Cntl), rdGc(GcMxL1TlbCntl));
+	if (requestedVm())
+		vmDumpHubWindows(" after SMU enable");   // W17 E1, read-only, before gcHubInit
 	put("GCMC_FB_BASE", fbBase);
 	put("GCMC_FB_TOP", fbTop);
 	publish();
