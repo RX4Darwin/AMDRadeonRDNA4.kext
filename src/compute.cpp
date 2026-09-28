@@ -1035,7 +1035,12 @@ bool RDNA4Compute::gcHubInit() {
 		wr(IpDiscovery::HwGc, Reg { 0, GcInvEng0RangeHi.dword + 2 * e }, 0x1f);
 	}
 	flushHdp();
-	return gcHubFlush();
+	// A flush that is never acknowledged (seen on the card, 2026-09-28) is
+	// logged, not fatal: nothing here is translated — VMID0 reaches VRAM
+	// through the FB/system aperture — and stage 4's WRITE decides.
+	if (!gcHubFlush())
+		CLOG("sdma: continuing without the flush: VMID0 accesses bypass translation");
+	return true;
 }
 
 void RDNA4Compute::logGcFault(const char *tag) {
@@ -1067,14 +1072,85 @@ bool RDNA4Compute::sdmaStartMcus() {
 
 // gmc_v12_0_flush_vm_hub for VMID0 on the GC hub (engine 17, no semaphore).
 bool RDNA4Compute::gcHubFlush() {
-	wr(IpDiscovery::HwGc, Reg { 0, GcInvEng0Req.dword + kGcInvEngGart }, kInvReqVmid0);
+	const Reg req { 0, GcInvEng0Req.dword + kGcInvEngGart }, ack { 0, GcInvEng0Ack.dword + kGcInvEngGart };
+	wr(IpDiscovery::HwGc, req, kInvReqVmid0);
 	for (uint32_t us = 0; us < 100000; us += 10) {
-		if (rdGc(Reg { 0, GcInvEng0Ack.dword + kGcInvEngGart }) & 1)
+		if (rdGc(ack) & 1)
 			return true;
 		IODelay(10);
 	}
-	CLOG("sdma: GC hub TLB flush not acknowledged");
+	CLOG("sdma: GC hub TLB flush not acknowledged: REQ 0x%08x ACK 0x%08x SEM 0x%08x, L2 status "
+	     "0x%08x cntl 0x%08x, ctx0 0x%08x, IMU core 0x%08x GFX reset 0x%08x RLC 0x%08x",
+	     rdGc(req), rdGc(ack), rdGc(Reg { 0, GcInvEng0Sem.dword + kGcInvEngGart }),
+	     rdGc(GcL2Status), rdGc(GcL2Cntl), rdGc(GcCtx0Cntl), rdGc(ImuCoreCtrl),
+	     rdGc(ImuGfxResetCtrl), rdGc(RlcCntl));
+	// Engine 0, for comparison: a hub that acks nothing, or just engine 17?
+	const Reg req0 { 0, GcInvEng0Req.dword }, ack0 { 0, GcInvEng0Ack.dword };
+	wr(IpDiscovery::HwGc, req0, kInvReqVmid0);
+	uint32_t a0 = 0;
+	for (uint32_t us = 0; us < 10000 && !(a0 & 1); us += 10) {
+		a0 = rdGc(ack0);
+		IODelay(10);
+	}
+	CLOG("sdma: engine 0 flush: ACK 0x%08x (%s)", a0, (a0 & 1) ? "acknowledged" : "not acknowledged");
 	return false;
+}
+
+// gfx_v12_0_config_gfx_rs64: amdgpu runs it after the autoload wait and
+// before the GC hub is enabled and flushed — every RS64 microengine gets its
+// start address from its firmware header and a pipe-reset pulse; nothing is
+// unhalted here (the MEC is, in stage 5).
+void RDNA4Compute::cpConfigRs64() {
+#ifndef RDNA4FB_NO_FIRMWARE
+	auto start = [](const AmdFw::Blob &b, uint32_t &lo, uint32_t &hi) {
+		if (b.size < 60)
+			return false;
+		auto le32 = [&b](uint32_t off) {
+			return static_cast<uint32_t>(b.data[off]) | (static_cast<uint32_t>(b.data[off + 1]) << 8) |
+			       (static_cast<uint32_t>(b.data[off + 2]) << 16) |
+			       (static_cast<uint32_t>(b.data[off + 3]) << 24);
+		};
+		lo = le32(52);                     // gfx_firmware_header_v2_0 ucode_start_addr_lo
+		hi = le32(56);
+		return true;
+	};
+	uint32_t lo = 0, hi = 0;
+	if (start(FW_BLOB(pfp), lo, hi)) {
+		for (uint32_t pipe = 0; pipe < 2; pipe++) {
+			grbmSelect(0, pipe, 0, 0);
+			wr(IpDiscovery::HwGc, CpPfpPrgrmStart, (hi << 30) | (lo >> 2));
+			wr(IpDiscovery::HwGc, CpPfpPrgrmStartHi, hi >> 2);
+		}
+		grbmSelect(0, 0, 0, 0);
+		const uint32_t v = rdGc(CpMeCntl);
+		wr(IpDiscovery::HwGc, CpMeCntl, v | kCpMePfpPipeReset);
+		wr(IpDiscovery::HwGc, CpMeCntl, v & ~kCpMePfpPipeReset);
+	}
+	if (start(FW_BLOB(me), lo, hi)) {
+		for (uint32_t pipe = 0; pipe < 2; pipe++) {
+			grbmSelect(0, pipe, 0, 0);
+			wr(IpDiscovery::HwGc, CpMePrgrmStart, (hi << 30) | (lo >> 2));
+			wr(IpDiscovery::HwGc, CpMePrgrmStartHi, hi >> 2);
+		}
+		grbmSelect(0, 0, 0, 0);
+		const uint32_t v = rdGc(CpMeCntl);
+		wr(IpDiscovery::HwGc, CpMeCntl, v | kCpMeMePipeReset);
+		wr(IpDiscovery::HwGc, CpMeCntl, v & ~kCpMeMePipeReset);
+	}
+	if (start(FW_BLOB(mec), lo, hi)) {
+		for (uint32_t pipe = 0; pipe < 4; pipe++) {
+			grbmSelect(1, pipe, 0, 0);
+			wr(IpDiscovery::HwGc, CpMecPrgrmStart, (lo >> 2) | (hi << 30));
+			wr(IpDiscovery::HwGc, CpMecPrgrmStartHi, hi >> 2);
+		}
+		grbmSelect(0, 0, 0, 0);
+		const uint32_t v = rdGc(CpMecRs64Cntl);
+		wr(IpDiscovery::HwGc, CpMecRs64Cntl, v | kMecPipeResetMask);
+		wr(IpDiscovery::HwGc, CpMecRs64Cntl, v & ~kMecPipeResetMask);
+	}
+	CLOG("gfx: RS64 microengines configured: CP_ME_CNTL 0x%08x CP_MEC_RS64_CNTL 0x%08x",
+	     rdGc(CpMeCntl), rdGc(CpMecRs64Cntl));
+#endif
 }
 
 // sdma_v7_0_gfx_resume_instance for SDMA0 queue 0, without a doorbell: the
@@ -1151,7 +1227,9 @@ bool RDNA4Compute::stageSdma() {
 		logGcFault("sdma");
 	};
 
-	// 1. GC hub.
+	// 1. GC hub, after the microengines' start addresses (amdgpu's order).
+	trail("s4: CP RS64 config");
+	cpConfigRs64();
 	trail("s4: GC hub init");
 	if (!gcHubInit()) {
 		publish();

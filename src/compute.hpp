@@ -193,6 +193,7 @@ private:
 	}
 	bool gcHubInit();
 	bool gcHubFlush();
+	void cpConfigRs64();                // gfx_v12_0_config_gfx_rs64 (PSP loading)
 	void logGcFault(const char *tag);   // GCVM_L2 protection fault status/address
 	bool sdmaStartMcus();               // sdma_v7_0_enable: unhalt before queue setup
 	bool sdmaQueueInit();

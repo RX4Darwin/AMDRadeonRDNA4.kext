@@ -245,6 +245,14 @@ constexpr Reg Gl2cCtrl5           { 1, 0x2e19 };   // golden_settings_gc_12_0_re
 constexpr uint32_t kCpDebugUtcl1ErrorHaltDisable = 1u << 15;
 constexpr Reg CpMecPrgrmStart     { 1, 0x2900 };   // CP_MEC_RS64_PRGRM_CNTR_START
 constexpr Reg CpMecPrgrmStartHi   { 1, 0x2938 };
+constexpr Reg CpPfpPrgrmStart     { 0, 0x1e44 };   // per pipe (GRBM_GFX_CNTL me 0)
+constexpr Reg CpMePrgrmStart      { 0, 0x1e45 };
+constexpr Reg CpPfpPrgrmStartHi   { 0, 0x1e59 };
+constexpr Reg CpMePrgrmStartHi    { 0, 0x1e79 };
+constexpr uint32_t kCpMePfpPipeReset = (1u << 18) | (1u << 19);   // CP_ME_CNTL PFP_PIPE0/1_RESET
+constexpr uint32_t kCpMeMePipeReset  = (1u << 20) | (1u << 21);   // ME_PIPE0/1_RESET
+constexpr Reg GcL2Status          { 0, 0x15c7 };   // GCVM_L2_STATUS: L2_BUSY [0], CONTEXT_DOMAIN_BUSY [16:1]
+constexpr Reg GcInvEng0Sem        { 0, 0x1635 };   // + engine
 constexpr Reg CpPqWptrPollCntl    { 0, 0x1e23 };   // EN [31]
 constexpr Reg CpPqStatus          { 0, 0x1e58 };   // DOORBELL_ENABLE [1]
 constexpr Reg CpMecDoorbellLower  { 0, 0x1dfc };
