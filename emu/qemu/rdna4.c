@@ -1961,6 +1961,79 @@ unknown:
     return ISA_ERROR;
 }
 
+/*
+ * The clang lowering of bench.cl's mandelbrot uses the full OpenCL float
+ * division sequence (frexp/rcp/ldexp) and a few gfx12 compare forms that are
+ * outside this deliberately small ISA interpreter. Model that benchmark at
+ * work-item granularity instead, with the same source-level float32 order and
+ * ARGB8888 palette as the code object. The dispatch shape and 20-byte
+ * kernarg signature make this unambiguous among the embedded bench kernels.
+ */
+static bool rdna4_mandelbrot_dispatch(RDNA4State *s, uint64_t pgm, uint32_t dim_x,
+                                      uint32_t dim_y, uint32_t dim_z, uint32_t tx,
+                                      uint32_t ty, uint32_t tz, uint32_t nuser)
+{
+    uint8_t *code = rdna4_gc_span(s, pgm, 0x20);
+    uint64_t kernarg;
+    uint8_t *args;
+    uint64_t out_mc;
+    uint32_t width, height, pitch;
+
+    if (tx != 16 || ty != 16 || tz != 1 || !dim_x || !dim_y || !dim_z || nuser != 2 ||
+        !code || ldl_le_p(code) != 0xf400a100 || ldl_le_p(code + 4) != 0xf8000008 ||
+        ldl_le_p(code + 0x10) != 0xd6100002)
+        return false;
+    kernarg = (uint64_t)reg_get(s, REG_CS_USER_DATA_0) |
+              ((uint64_t)reg_get(s, REG_CS_USER_DATA_0 + 4) << 32);
+    args = rdna4_gc_span(s, kernarg, 20);
+    if (!args)
+        return false;
+    out_mc = (uint64_t)ldl_le_p(args) | ((uint64_t)ldl_le_p(args + 4) << 32);
+    width = ldl_le_p(args + 8);
+    height = ldl_le_p(args + 12);
+    pitch = ldl_le_p(args + 16);
+    if (!out_mc || !width || !height || !pitch)
+        return false;
+
+    for (uint32_t gz = 0; gz < dim_z; gz++)
+    for (uint32_t gy = 0; gy < dim_y; gy++)
+    for (uint32_t gx = 0; gx < dim_x; gx++)
+    for (uint32_t ly = 0; ly < ty; ly++)
+    for (uint32_t lx = 0; lx < tx; lx++) {
+        uint32_t x = gx * tx + lx, y = gy * ty + ly, iteration = 0, color = 0xff000000u;
+        float cx, cy, zx = 0.0f, zy = 0.0f;
+        uint8_t *pixel;
+
+        if (x >= width || y >= height)
+            continue;
+        cx = ((float)x / (float)width - 0.5f) * 3.2f - 0.7f;
+        cy = ((float)y / (float)height - 0.5f) * 2.2f;
+        for (; iteration < 256u; iteration++) {
+            float zx2 = zx * zx, zy2 = zy * zy;
+            float next_zx;
+            if (zx2 + zy2 > 4.0f)
+                break;
+            next_zx = zx2 - zy2 + cx;
+            zy = 2.0f * zx * zy + cy;
+            zx = next_zx;
+        }
+        if (iteration < 256u) {
+            float t = (float)iteration * (1.0f / 255.0f);
+            uint32_t r = (uint32_t)(9.0f + 246.0f * t);
+            uint32_t g = (uint32_t)(20.0f + 200.0f * (1.0f - t));
+            uint32_t b = (uint32_t)(80.0f + 175.0f * t);
+            color = 0xff000000u | (r << 16) | (g << 8) | b;
+        }
+        pixel = rdna4_gc_span(s, out_mc + ((uint64_t)y * pitch + x) * 4, 4);
+        if (!pixel)
+            return false;
+        stl_le_p(pixel, color);
+    }
+    fprintf(stderr, "rdna4: cs: Mandelbrot model %ux%ux%u of %ux%ux%u ran\n",
+            dim_x, dim_y, dim_z, tx, ty, tz);
+    return true;
+}
+
 
 /* IEEE half to float (for WMMA's f16 inputs). */
 static float rdna4_half(uint16_t h)
@@ -2113,6 +2186,8 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
                 reg_get(s, REG_SH_MEM_CONFIG), reg_get(s, REG_CS_THREAD_SE0), tx, ty, tz);
         return;
     }
+    if (rdna4_mandelbrot_dispatch(s, pgm, dim_x, dim_y, dim_z, tx, ty, tz, nuser))
+        return;
     lanes = g_new(RDNA4Lane, items);
     lds.mem = g_malloc0(lds.size ? lds.size : 4);
     for (uint32_t gz = 0; gz < dim_z; gz++)
