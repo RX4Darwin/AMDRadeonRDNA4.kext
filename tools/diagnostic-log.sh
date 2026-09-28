@@ -444,8 +444,11 @@ registry_value() {
 		record gfx SKIPPED "rdna4-gfx not enabled"
 	elif grep -Eq 'RDNA4FB: .*gfx: .*failure|RDNA4FB: .*stage gfx ring.*failed|RDNA4FB: .*gfx ring.*off' "$KLOG"; then
 		record gfx FAIL "ring/draw path reported a failure"
-	elif printf '%s\n' "$(registry_value gfx)" | grep -q '^PASS'; then
+	elif printf '%s\n' "$(registry_value gfx)" |
+		grep -Eq '^PASS.*THE TRIANGLE IS RIGHT.*8192'; then
 		record gfx PASS "$(registry_value gfx | sed 's/^PASS //')"
+	elif printf '%s\n' "$(registry_value gfx)" | grep -q '^PASS'; then
+		record gfx FAIL "gfx ring passed but the draw result was not proven"
 	elif grep -Eq 'RDNA4FB: .*gfx: .*ring|RDNA4FB: .*gfx: .*draw' "$KLOG"; then
 		record gfx FAIL "gfx command result and RDNA4FB,Results did not both pass"
 	else
