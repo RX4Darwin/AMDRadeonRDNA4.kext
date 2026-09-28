@@ -52,6 +52,7 @@ CXX_SRCS := \
 	src/ndrv.cpp \
 	src/modeset.cpp \
 	src/compute.cpp \
+	src/gfxring.cpp \
 	src/amdfw.cpp \
 	src/psp.cpp \
 	src/sdma.cpp \
