@@ -13,6 +13,7 @@
 #include "pm4.hpp"
 #include "probe_kernel.h"
 #include "sdma.hpp"
+#include "smu_metrics.h"
 #include "vadd_codeobj.h"
 
 #include <kern/clock.h>
@@ -727,11 +728,11 @@ bool RDNA4Compute::readSensors(RDNA4Sensors &out) {
 	auto u16 = [table](uint32_t off) -> uint32_t {
 		return *reinterpret_cast<const volatile uint16_t *>(table + off);
 	};
-	constexpr uint32_t kAverageGfxPost = 44 + 2 * 2;
-	constexpr uint32_t kAverageMemPost = 44 + 6 * 2;
-	constexpr uint32_t kSocketPower = 136;
-	constexpr uint32_t kTemperatures = 140;
-	constexpr uint32_t kFanRpm = 172;
+	constexpr uint32_t kAverageGfxPost = RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS;
+	constexpr uint32_t kAverageMemPost = RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS;
+	constexpr uint32_t kSocketPower = RDNA4_SMU_METRICS_AVG_SOCKET_POWER;
+	constexpr uint32_t kTemperatures = RDNA4_SMU_METRICS_AVG_TEMPERATURE;
+	constexpr uint32_t kFanRpm = RDNA4_SMU_METRICS_AVG_FAN_RPM;
 	out.edgeTempC = u16(kTemperatures + 0 * 2);
 	out.hotspotTempC = u16(kTemperatures + 1 * 2);
 	out.gfxClockMHz = u16(kAverageGfxPost);

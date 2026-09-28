@@ -48,6 +48,7 @@
 #include <sys/mman.h>
 #include "qemu/module.h"
 #include "qemu/units.h"
+#include "../../src/smu_metrics.h"
 #include "qemu/timer.h"
 #include "qemu/main-loop.h"
 #include "qemu/host-utils.h"
@@ -1479,12 +1480,12 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
             break;
         }
         memset(table, 0, 4096);
-        stw_le_p(table + 44 + 2 * 2, 2100);       /* AverageGfxclkFrequencyPostDs */
-        stw_le_p(table + 44 + 6 * 2, 1000);       /* AverageMemclkFrequencyPostDs */
-        stw_le_p(table + 140 + 0 * 2, 42);         /* TEMP_EDGE */
-        stw_le_p(table + 140 + 1 * 2, 55);         /* TEMP_HOTSPOT */
-        stw_le_p(table + 136, 120);                /* AverageSocketPower, watts */
-        stw_le_p(table + 172, 900);                /* AvgFanRpm */
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS, 2100);
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS, 1000);
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_TEMPERATURE + 0 * 2, 42);
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_TEMPERATURE + 1 * 2, 55);
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_SOCKET_POWER, 120);
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_FAN_RPM, 900);
         fprintf(stderr, "rdna4: smu: synthetic metrics 42C/55C, 2100/1000 MHz, 120 W, 900 RPM\n");
         break;
     }
