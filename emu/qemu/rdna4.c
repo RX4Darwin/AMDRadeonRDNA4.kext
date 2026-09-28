@@ -3549,6 +3549,9 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                 if (!rdna4_gfx_set_sreg(w, dst, old))
                     goto unknown;
                 w->exec = old & rdna4_gfx_sreg(w, dw & 0xff);
+                if (s->gfx_trace)
+                    fprintf(stderr, "rdna4: gfx: saveexec s%u=0x%08x src=0x%08x exec=0x%08x\\n",
+                            dst, old, rdna4_gfx_sreg(w, dw & 0xff), w->exec);
             } else if (op == 0) {                            /* s_mov_b32 */
                 if (!rdna4_gfx_set_sreg(w, dst, value))
                     goto unknown;
