@@ -26,6 +26,15 @@ void lds_reverse(__global const uint *a, __global const uint *b, __global uint *
 	c[gid] = tile[63u - lid] + b[gid];
 }
 
+// A deliberately non-terminating work-item for the queue-recovery test. The
+// host never writes flag[0], so the runtime must time out and reset its queue.
+__kernel __attribute__((reqd_work_group_size(1, 1, 1)))
+void spin(__global const uint *flag)
+{
+	while (flag[0] == 0)
+		;
+}
+
 // Memory bandwidth: 16 bytes per work-item, read once and written once.
 __kernel __attribute__((reqd_work_group_size(256, 1, 1)))
 void copy(__global const uint4 *src, __global uint4 *dst)

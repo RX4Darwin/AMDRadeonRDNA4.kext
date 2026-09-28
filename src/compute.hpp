@@ -56,6 +56,7 @@
 #include "gpuvm.hpp"
 #include "ipdiscovery.hpp"
 #include "pm4.hpp"
+#include "pipe.hpp"
 #include "psp.hpp"
 #include "rdna4compute.h"
 #include "sdma.hpp"
@@ -78,6 +79,11 @@ public:
 	// writeback pointer and drain the already-programmed ring.
 	bool ihHasWork() const;
 	void ihAction();
+	bool ihWaitVblank(uint32_t otg, uint32_t timeoutMs, uint64_t &count, uint64_t &timeNs);
+	bool ihWaitFlip(uint32_t hubp, uint64_t sinceCount, uint32_t timeoutMs);
+	// Bridge for Pipe::discover: DCN reads use the same discovered DMU path as
+	// the display device, while the IH code owns the callback context.
+	uint32_t ihDcnRead(uint8_t baseIdx, uint32_t dword) const;
 
 	// What the compute side borrows from the display device: the GPU, the
 	// service registry properties go on, the BAR5 mapping and the IP
@@ -90,6 +96,7 @@ public:
 		const IpDiscovery  *disc;
 		uint64_t            scanoutPhys;     // CPU physical address (BAR0)
 		uint64_t            scanoutLength;
+		uint64_t            scanoutFrameNs;  // 0 when the display timing is unknown
 	};
 
 	enum Stage : uint32_t {
@@ -266,6 +273,7 @@ private:
 	static constexpr uint32_t kDispatchGroups = 4, kGroupSize = 64;
 	Pm4::Queue  pm4Queue;                   // set up by stage 5, fed again by stage 6
 	uint32_t    pm4Fence { 0 };             // last RELEASE_MEM sequence number
+	uint32_t    hqdMode { 1 };              // 1 = plain MMIO HQD, 2 = KIQ fallback
 	uint32_t shAbs(const GfxReg::Reg &r) const;   // absolute dword address of a GC register
 	// One DISPATCH_DIRECT on the stage-5 queue, fenced; false if the fence
 	// never came within timeoutUs (the engine state is logged under `tag`).
@@ -284,8 +292,17 @@ private:
 		uint32_t        vmid, pipe, queueId, fenceValue, doorbell;
 		uint64_t        fenceAddress;
 		volatile uint32_t *fenceCpu;
+		volatile uint32_t *queueCpu;
+		uint64_t        queueAddress;
+		uint64_t        recoveryMqd, recoveryEop, recoveryRptr, recoveryWpoll;
+		uint64_t        recoveryProofAddress;
+		volatile uint32_t *recoveryProofCpu;
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
+	void logComputeQueueState(const char *tag, uint32_t pipe = 0, uint32_t queue = 0,
+	                         uint32_t vmid = 0);
+	bool queueWriteTest(const char *tag, const Launch *l = nullptr);
+	bool recoverComputeQueue(const char *tag, const Launch *l = nullptr);
 	// What launch() can give a code-object kernel: the kernarg pointer and
 	// up to 64 KiB of LDS — no dispatch/queue pointers or scratch yet.
 	static bool kernelFits(const CodeObj::Kernel &k, const char **why);
@@ -367,12 +384,27 @@ private:
 	uint32_t ihFaultCount { 0 };
 	uint32_t ihUnknownCount { 0 };
 	uint8_t ihUnknownSeen[256][32] {};
+	bool ihDcnRequested { false };
+	bool ihDcnActive { false };
+	uint8_t ihDcnOtg { Pipe::kNone };
+	uint8_t ihDcnHubp { Pipe::kNone };
+	uint64_t ihDcnExpectedFrameNs { 0 };
+	uint32_t ihDcnVblankFrames { 0 };
+	uint32_t ihDcnStorms { 0 };
+	uint64_t ihVblankCount[Pipe::kMaxOtg] {};
+	uint64_t ihVblankTime[Pipe::kMaxOtg] {};
+	uint64_t ihPflipCount[Pipe::kMaxOtg] {};
 
 	bool ihInit();
 	void ihStop();
+	void ihDcnStop(const char *why);
+	void ihDcnAckVblank();
+	void ihDcnAckFlip();
+	void ihDcnObserveVblank(uint64_t now);
 	void ihDecodeEntry(const uint32_t *dw);
 	void ihUnknown(uint8_t client, uint8_t source, uint8_t ring);
-	void ihRecordWait(bool dispatch, bool woke, bool completed, uint32_t eventsBefore);
+	void ihRecordWait(bool dispatch, bool slept, bool completed,
+	                  bool recheckElapsed, uint32_t eventsBefore);
 	bool ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_t timeoutMs,
 	                bool dispatch, const char *tag, uint64_t &ns);
 
@@ -427,6 +459,8 @@ private:
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
 		uint64_t tableOffset { 0 }, rootMc { 0 }, rootPhys { 0 }, nextVa { GpuVm::kVaStart };
 		uint64_t kernargVa { 0 }, fenceVa { 0 };
+		uint64_t queueVa { 0 }, mqdMc { 0 }, eopVa { 0 }, rptrVa { 0 }, wpollVa { 0 };
+		volatile uint32_t *queueCpu { nullptr };
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
 		uint32_t fence { 0 }, doorbell { 0 };
@@ -437,6 +471,7 @@ private:
 	IOLock        *rtLock { nullptr };
 	bool           rtReady { false };       // a dispatching stage finished
 	bool           rtWedged { false };      // a dispatch timed out
+	bool           hangRecoveryEnabled { true }; // rdna4-hang=0 keeps the old wedge
 	uint32_t       rtStage { 0 };
 	bool           vmEnabled { false };
 	bool           vmidUsed[16] {};

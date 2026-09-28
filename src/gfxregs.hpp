@@ -296,6 +296,7 @@ constexpr uint32_t kEopInitFetcher  = 1u << 31;
 constexpr Reg CpHqdPqWptrLo       { 0, 0x1fdf };
 constexpr Reg CpHqdPqWptrHi       { 0, 0x1fe0 };
 constexpr Reg ScratchReg0         { 1, 0x2040 };   // UCONFIG: absolute dword 0xa000 + 0x2040
+constexpr Reg SqCmd               { 0, 0x111b };   // gfx12 SQ_CMD: kill waves selected by VMID
 
 // CP_MEC_RS64_CNTL
 constexpr uint32_t kMecInvalidateIcache = 1u << 4;

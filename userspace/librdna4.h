@@ -79,6 +79,8 @@ kern_return_t rdna4_dispatch_lds(rdna4_t *dev, const rdna4_program_t *prog,
                                  const void *kernargs, uint32_t kernargBytes,
                                  uint32_t dynamicLdsBytes, uint32_t timeoutMs, uint64_t *micros);
 
+kern_return_t rdna4_wait_vblank(rdna4_t *dev, uint32_t timeoutMs, uint64_t *count,
+                                uint64_t *timeNs);
 /* Present a 256-byte-aligned ARGB8888 slice of a device buffer. The returned
  * geometry is the active scanout width, height and pitch in pixels. */
 kern_return_t rdna4_present(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,

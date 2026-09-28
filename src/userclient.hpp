@@ -53,6 +53,7 @@ private:
 	static IOReturn sLoad(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sUnload(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sDispatch(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sWaitVBlank(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPresent(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sRestore(OSObject *t, void *, IOExternalMethodArguments *a);
 };

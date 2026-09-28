@@ -9,6 +9,10 @@
 
 namespace Ih {
 
+bool missEligible(bool slept, bool completed, bool sourceAdvanced, bool recheckElapsed) {
+	return slept && completed && recheckElapsed && !sourceAdvanced;
+}
+
 void decode(const uint32_t dw[kEntryDwords], Entry &out) {
 	out.clientId = static_cast<uint8_t>(dw[0] & 0xff);
 	out.srcId = static_cast<uint8_t>((dw[0] >> 8) & 0xff);

@@ -9,6 +9,8 @@
  *                                          lds_reverse and wmma16 (embedded)
  *                                          on the GPU, every result checked,
  *                                          plus the runtime's refusals
+ *    rdna4-run selftest hang               selftest, then queue recovery
+ *    rdna4-run hangtest                    hang recovery followed by vadd
  *    rdna4-run bench [small]               host<->GPU copies, VRAM bandwidth,
  *                                          SGEMM GFLOPS and the matrix units
  *                                          (FP16/BF16 GEMM) from bench.cl,
@@ -76,6 +78,37 @@ static int cmdInfo(rdna4_t *gpu) {
 	return 0;
 }
 
+static int cmdVsync(rdna4_t *gpu, uint32_t frames) {
+	uint64_t previous = 0, minNs = UINT64_MAX, maxNs = 0, sumNs = 0;
+	uint32_t intervals = 0;
+	for (uint32_t i = 0; i < frames; i++) {
+		uint64_t count = 0, timeNs = 0;
+		kern_return_t kr = rdna4_wait_vblank(gpu, 1000, &count, &timeNs);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "vsync: vblank %u/%u: %s\n", i + 1, frames, rdna4_error(kr));
+			return 1;
+		}
+		if (previous) {
+			uint64_t interval = timeNs - previous;
+			if (interval < minNs)
+				minNs = interval;
+			if (interval > maxNs)
+				maxNs = interval;
+			sumNs += interval;
+			intervals++;
+		}
+		previous = timeNs;
+	}
+	if (!intervals) {
+		printf("vsync: %u vblank, no interval\n", frames);
+		return 0;
+	}
+	const double average = (double)sumNs / intervals;
+	printf("vsync: %u vblanks, refresh %.3f Hz, interval %.0f ns (jitter %llu..%llu ns)\n",
+	       frames, 1.0e9 / average, average, minNs, maxNs);
+	return 0;
+}
+
 static int hasDma(rdna4_t *gpu, uint64_t *heapFree) {
 	rdna4_info_t in;
 	if (rdna4_info(gpu, &in) != KERN_SUCCESS)
@@ -139,6 +172,85 @@ static int checkFailed(const char *what, kern_return_t kr) {
 
 static uint32_t aOf(uint32_t i);
 static uint32_t bOf(uint32_t i, uint32_t round);
+
+static int testVadd(rdna4_t *gpu, uint32_t items) {
+	int fails = 0;
+	const uint64_t bytes = (uint64_t)items * 4;
+	rdna4_program_t prog;
+	kern_return_t kr = rdna4_load(gpu, kVaddCodeObject, sizeof(kVaddCodeObject), "vadd", &prog);
+	if (kr != KERN_SUCCESS) {
+		printf("  FAIL  recovery vadd load: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	rdna4_buffer_t a, b, c;
+	uint32_t *ha = malloc(bytes), *hb = malloc(bytes), *hc = malloc(bytes);
+	if (!ha || !hb || !hc || (kr = rdna4_alloc(gpu, bytes, &a)) ||
+	    (kr = rdna4_alloc(gpu, bytes, &b)) || (kr = rdna4_alloc(gpu, bytes, &c))) {
+		printf("  FAIL  recovery vadd setup: %s\n", rdna4_error(kr));
+		free(ha); free(hb); free(hc); rdna4_unload(gpu, &prog);
+		return 1;
+	}
+	for (uint32_t i = 0; i < items; i++) {
+		ha[i] = aOf(i);
+		hb[i] = bOf(i, 0);
+		hc[i] = 0xffffffffu;
+	}
+	const uint64_t args[3] = { a.gpu, b.gpu, c.gpu };
+	const uint32_t groups[3] = { items / 64, 1, 1 }, size[3] = { 64, 1, 1 };
+	if ((kr = rdna4_write(gpu, &a, 0, ha, bytes)) || (kr = rdna4_write(gpu, &b, 0, hb, bytes)) ||
+	    (kr = rdna4_write(gpu, &c, 0, hc, bytes)) ||
+	    (kr = rdna4_dispatch(gpu, &prog, groups, size, args, sizeof(args), 2000, NULL)) ||
+	    (kr = rdna4_read(gpu, &c, 0, hc, bytes))) {
+		printf("  FAIL  recovery vadd: %s\n", rdna4_error(kr));
+		fails++;
+	} else {
+		for (uint32_t i = 0; i < items; i++) {
+			if (hc[i] != aOf(i) + 3 * bOf(i, 0)) {
+				printf("  FAIL  recovery vadd c[%u] = 0x%08x (want 0x%08x)\n", i, hc[i],
+				       aOf(i) + 3 * bOf(i, 0));
+				fails++;
+				break;
+			}
+		}
+		if (!fails)
+			printf("  ok    recovery vadd: %u results correct after queue reset\n", items);
+	}
+	rdna4_free(gpu, &a); rdna4_free(gpu, &b); rdna4_free(gpu, &c);
+	rdna4_unload(gpu, &prog);
+	free(ha); free(hb); free(hc);
+	return fails;
+}
+
+static int cmdHangtest(rdna4_t *gpu) {
+	int fails = 0;
+	rdna4_program_t spin;
+	kern_return_t kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "spin", &spin);
+	if (kr != KERN_SUCCESS) {
+		printf("hangtest: load spin: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	rdna4_buffer_t flag;
+	uint32_t zero = 0;
+	const uint32_t groups[3] = { 1, 1, 1 }, size[3] = { 1, 1, 1 };
+	if ((kr = rdna4_alloc(gpu, sizeof(zero), &flag)) || (kr = rdna4_write(gpu, &flag, 0, &zero, sizeof(zero)))) {
+		printf("hangtest: flag setup: %s\n", rdna4_error(kr));
+		rdna4_unload(gpu, &spin);
+		return 1;
+	}
+	const uint64_t args[1] = { flag.gpu };
+	kr = rdna4_dispatch(gpu, &spin, groups, size, args, sizeof(args), 200, NULL);
+	if (kr != kIOReturnTimeout) {
+		printf("  FAIL  spin dispatch returned %s (want timeout)\n", rdna4_error(kr));
+		fails++;
+	} else {
+		printf("  ok    spin dispatch timed out; queue recovery was attempted\n");
+	}
+	rdna4_free(gpu, &flag);
+	rdna4_unload(gpu, &spin);
+	fails += testVadd(gpu, 256);
+	printf("hangtest: %s\n", fails ? "FAILED" : "PASS");
+	return fails ? 1 : 0;
+}
 
 typedef struct VmPeerJob {
 	rdna4_t *gpu;
@@ -1142,7 +1254,10 @@ static int cmdLoad(rdna4_t *gpu, const char *path, const char *kernel) {
 static void usage(void) {
 	fprintf(stderr, "usage: rdna4-run info\n"
 	                "       rdna4-run selftest [items]\n"
+	                "       rdna4-run selftest hang\n"
+	                "       rdna4-run hangtest\n"
 	                "       rdna4-run bench [small]\n"
+	                "       rdna4-run vsync [n]\n"
 	                "       rdna4-run show [seconds]\n"
 	                "       rdna4-run load <file.hsaco> <kernel>\n");
 }
@@ -1161,11 +1276,30 @@ int main(int argc, char **argv) {
 	} else if (!strcmp(argv[1], "selftest") && argc <= 3) {
 		if (!openRuntime(&gpu))
 			return 1;
-		rc = cmdSelftest(&gpu, argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 65536);
+		if (argc == 3 && !strcmp(argv[2], "hang")) {
+			rc = cmdSelftest(&gpu, 65536);
+			if (!rc)
+				rc = cmdHangtest(&gpu);
+		} else {
+			rc = cmdSelftest(&gpu, argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 65536);
+		}
+	} else if (!strcmp(argv[1], "hangtest") && argc == 2) {
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdHangtest(&gpu);
 	} else if (!strcmp(argv[1], "bench") && argc <= 3) {
 		if (!openRuntime(&gpu))
 			return 1;
 		rc = cmdBench(&gpu, argc == 3 && !strcmp(argv[2], "small"));
+	} else if (!strcmp(argv[1], "vsync") && argc <= 3) {
+		uint32_t frames = argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 120;
+		if (!frames || frames > 100000) {
+			fprintf(stderr, "vsync: n must be 1..100000\n");
+			return 2;
+		}
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdVsync(&gpu, frames);
 	} else if (!strcmp(argv[1], "show") && argc <= 3) {
 		if (!openRuntime(&gpu))
 			return 1;

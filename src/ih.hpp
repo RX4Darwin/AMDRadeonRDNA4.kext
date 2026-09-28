@@ -40,6 +40,10 @@ constexpr bool hasEntries(uint32_t rptr, uint32_t wptr, uint32_t ringBytes) {
 	return (rptr & (ringBytes - 1)) != (wptr & (ringBytes - 1));
 }
 
+// A completed fence is a missed interrupt only after the waiter slept and a
+// bounded recheck still finds no source vector five milliseconds later.
+bool missEligible(bool slept, bool completed, bool sourceAdvanced, bool recheckElapsed);
+
 // On overflow amdgpu starts at the entry after the vector that was
 // overwritten by the producer's write pointer.
 constexpr uint32_t overflowRecovery(uint32_t wptr, uint32_t ringBytes) {

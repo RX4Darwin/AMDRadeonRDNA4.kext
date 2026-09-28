@@ -380,6 +380,9 @@ void RDNA4Compute::choosePool() {
 
 uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 	env = e;
+	uint32_t hang = 1;
+	hangRecoveryEnabled = !PE_parse_boot_argn("rdna4-hang", &hang, sizeof(hang)) || hang != 0;
+	CLOG("queue hang recovery %s (rdna4-hang=%u)", hangRecoveryEnabled ? "enabled" : "disabled", hang);
 	vmEnabled = requestedVm();
 	if (stage == StageOff)
 		return StageOff;
@@ -1602,6 +1605,107 @@ void RDNA4Compute::pm4Kick(uint64_t wptrDwords) {
 	doorbells[kComputeDoorbellDword / 2] = wptrDwords;
 }
 
+void RDNA4Compute::logComputeQueueState(const char *tag, uint32_t pipe, uint32_t queue,
+                                        uint32_t vmid) {
+	grbmSelect(1, pipe, queue, vmid);
+	CLOG("%s: GRBM 0x%08x GRBM2 0x%08x CP_STAT 0x%08x CPC 0x%08x CPC_BUSY 0x%08x",
+	     tag, rdGc(GrbmStatus), rdGc(GrbmStatus2), rdGc(CpStat), rdGc(CpCpcStatus),
+	     rdGc(CpCpcBusyStat));
+	CLOG("%s: HQD active 0x%08x vmid 0x%08x persistent 0x%08x PQ base 0x%08x:%08x rptr 0x%08x "
+	     "wptr 0x%08x:%08x doorbell 0x%08x PQ_CONTROL 0x%08x dequeue 0x%08x",
+	     tag, rdGc(CpHqdActive), rdGc(CpHqdVmid), rdGc(CpHqdPersistent), rdGc(CpHqdPqBaseHi),
+	     rdGc(CpHqdPqBase), rdGc(CpHqdPqRptr), rdGc(CpHqdPqWptrHi), rdGc(CpHqdPqWptrLo),
+	     rdGc(CpHqdPqDoorbell), rdGc(CpHqdPqControl), rdGc(CpHqdDequeueReq));
+	CLOG("%s: HQ_STATUS0 0x%08x EOP 0x%08x:%08x EOP_RPTR 0x%08x SQ_CMD 0x%08x MEC pc 0x%x",
+	     tag, rdGc(CpHqdHqStatus0), rdGc(CpHqdEopBaseHi), rdGc(CpHqdEopBase), rdGc(CpHqdEopRptr),
+	     rdGc(SqCmd), rdGc(CpMecRs64InstrPntr));
+	grbmSelect(0, 0, 0, 0);
+	logGcFault(tag);
+}
+
+bool RDNA4Compute::queueWriteTest(const char *tag, const Launch *l) {
+	const bool client = l && l->queue;
+	Pm4::Queue *queue = client ? l->queue : &pm4Queue;
+	const uint32_t doorbell = client ? l->doorbell : kComputeDoorbellDword;
+	const uint64_t address = client ? l->recoveryProofAddress : poolMc(kPm4TestOffset);
+	volatile uint32_t *cpu = client ? l->recoveryProofCpu : poolDw(kPm4TestOffset);
+	if (!queue || !cpu || !address)
+		return false;
+	*cpu = 0;
+	flushHdp();
+	uint32_t pkt[8];
+	if (!queue->emit(pkt, Pm4::writeData(pkt, address, 0x600DF00D)))
+		return false;
+	if (client)
+		pm4Kick(*queue, doorbell, queue->wptr());
+	else
+		pm4Kick(queue->wptr());
+	for (uint32_t ms = 0; ms < 200; ms++) {
+		if (*cpu == 0x600DF00D) {
+			CLOG("%s: recovered queue WRITE_DATA landed", tag);
+			return true;
+		}
+		IOSleep(1);
+	}
+	CLOG("%s: recovered queue WRITE_DATA did NOT land", tag);
+	return false;
+}
+
+bool RDNA4Compute::recoverComputeQueue(const char *tag, const Launch *l) {
+	if (!hangRecoveryEnabled) {
+		CLOG("%s: queue recovery disabled by rdna4-hang=0", tag);
+		return false;
+	}
+	const bool client = l && l->queue;
+	const uint32_t pipe = client ? l->pipe : 0;
+	const uint32_t queueId = client ? l->queueId : 0;
+	const uint32_t vmid = client ? l->vmid : 0;
+	CLOG("%s: recovering compute queue without a GPU reset", tag);
+	// gfx_v12_0_reset_kcq is MES-backed upstream. This is our no-MES sequence:
+	// the documented HQD RESET_WAVES dequeue, gfx12 SQ_CMD wave kill, then the
+	// same queue's HQD register set and a fenced WRITE_DATA proof.
+	logComputeQueueState(tag, pipe, queueId, vmid);
+	grbmSelect(1, pipe, queueId, vmid);
+	wr(IpDiscovery::HwGc, CpHqdDequeueReq, 2); // RESET_WAVES (amdgpu enum value)
+	// amdgpu_amdkfd_gfx_v12 exposes SQ_CMD wave_control_execute. CMD=3 is
+	// kill, MODE=1 selects all waves, CHECK_VMID=1 limits it to this VMID.
+	const uint32_t sqCmd = 3u | (1u << 4) | (1u << 7) | ((vmid & 0xf) << 28);
+	wr(IpDiscovery::HwGc, SqCmd, sqCmd);
+	bool inactive = false;
+	for (uint32_t us = 0; us < 100000; us += 10) {
+		if (!(rdGc(CpHqdActive) & 1)) {
+			inactive = true;
+			break;
+		}
+		IODelay(10);
+	}
+	wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+	if (!inactive) {
+		grbmSelect(0, 0, 0, 0);
+		CLOG("%s: HQD dequeue/wave kill did not clear CP_HQD_ACTIVE", tag);
+		logGcFault(tag);
+		return false;
+	}
+	if (client) {
+		if (!l->queueCpu || !l->queueAddress ||
+		    !l->queue->init(l->queueCpu, l->queueAddress, kPqSize) ||
+		    !hqdInitFor(false, pipe, queueId, vmid, l->recoveryMqd, l->recoveryEop,
+	                   l->queueAddress >> 8, l->recoveryRptr, l->recoveryWpoll, l->doorbell) ||
+		    !queueWriteTest(tag, l)) {
+			CLOG("%s: client queue reinitialisation or fenced WRITE_DATA failed; staying wedged", tag);
+			logComputeQueueState(tag, pipe, queueId, vmid);
+			return false;
+		}
+	} else if (!pm4Queue.init(poolDw(kPqOffset), poolMc(kPqOffset), kPqSize) ||
+	           !hqdInit(hqdMode == 2) || !queueWriteTest(tag)) {
+		CLOG("%s: queue reinitialisation or fenced WRITE_DATA failed; staying wedged", tag);
+		logComputeQueueState(tag);
+		return false;
+	}
+	CLOG("%s: queue recovered; subsequent clients may dispatch", tag);
+	return true;
+}
+
 void RDNA4Compute::pm4Kick(Pm4::Queue &queue, uint32_t doorbell, uint64_t wptrDwords) {
 	/* The VM queue's wptr report is mapped in its client VA; the CP owns it. */
 	flushHdp();
@@ -1681,6 +1785,8 @@ bool RDNA4Compute::stageCompute() {
 		          writeTest("KIQ");
 	}
 	put("QueueMode", running ? mode : 0);
+	if (running)
+		hqdMode = mode;
 	if (!running) {
 		publish();
 		return false;
@@ -1825,6 +1931,8 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 		     rdGc(CpHqdHqStatus0), rdGc(CpMecRs64InstrPntr));
 		grbmSelect(0, 0, 0, 0);
 		logGcFault(tag);
+		if (!vm)
+			logComputeQueueState(tag);
 	}
 	if (vm) {
 		const uint32_t status = rdGc(GcL2FaultStatusLo);

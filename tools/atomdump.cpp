@@ -1666,7 +1666,12 @@ static int testIhRing() {
 	failures += check(Ih::advance(size - 16, 32, size) == 16 && Ih::hasEntries(size - 32, 0, size) &&
 	                  Ih::overflowRecovery(size - 32, size) == 0,
 	                  "ih: ring wrap/overflow arithmetic");
-	printf("\nih: v7 decode and ring wrap/overflow arithmetic %s\n",
+	failures += check(!Ih::missEligible(false, true, false, true) &&
+	                  !Ih::missEligible(true, true, false, false) &&
+	                  !Ih::missEligible(true, true, true, true) &&
+	                  Ih::missEligible(true, true, false, true),
+	                  "ih: miss qualification requires sleep, completion, and a 5 ms recheck");
+	printf("\nih: v7 decode, ring wrap/overflow arithmetic, and wait-miss qualification %s\n",
 	       failures ? "FAILED" : "ok");
 	return failures;
 }
@@ -1774,7 +1779,7 @@ static int testCodeObject() {
 	// bench.cl: seven kernels in one file, each with its own descriptor and
 	// LDS (llvm-readelf --notes: group_segment_fixed_size).
 	struct { const char *name; uint32_t lds, kernarg; } bench[] = {
-		{ "lds_reverse", 256, 24 }, { "copy", 0, 16 }, { "sgemm", 8320, 28 },
+		{ "lds_reverse", 256, 24 }, { "spin", 0, 8 }, { "copy", 0, 16 }, { "sgemm", 8320, 28 },
 		{ "wmma16", 0, 24 }, { "hgemm", 20480, 28 }, { "bf16gemm", 20480, 28 },
 		{ "mandelbrot", 0, 20 },
 	};
