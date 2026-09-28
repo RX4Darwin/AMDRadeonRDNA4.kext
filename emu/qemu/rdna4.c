@@ -267,6 +267,36 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define PSP_ERR_UNKNOWN_CMD  0x100
 #define PSP_TMR_SIZE         0x1400000      /* model's answer to LOAD_TOC */
 
+/* GFX ring 0 (GC): gfx_v12_0_cp_gfx_resume / cp_gfx_start. */
+#define REG_GFX_CP_RB0_RPTR       GC_SEG0(0x0f60)
+#define REG_GFX_CP_RB_WPTR_DELAY  GC_SEG0(0x0f61)
+#define REG_GFX_CP_RB0_BASE       GC_SEG0(0x1de0)
+#define REG_GFX_CP_RB0_CNTL       GC_SEG0(0x1de1)
+#define REG_GFX_CP_RB0_RPTR_ADDR  GC_SEG0(0x1de3)
+#define REG_GFX_CP_RB0_RPTR_HI    GC_SEG0(0x1de4)
+#define REG_GFX_CP_DEVICE_ID      GC_SEG0(0x1deb)
+#define REG_GFX_CP_RB_VMID        GC_SEG0(0x1df1)
+#define REG_GFX_CP_RB0_WPTR       GC_SEG0(0x1df4)
+#define REG_GFX_CP_RB0_WPTR_HI    GC_SEG0(0x1df5)
+#define REG_GFX_CP_RB_DB_LOWER    GC_SEG0(0x1dfa)
+#define REG_GFX_CP_RB_DB_UPPER    GC_SEG0(0x1dfb)
+#define REG_GFX_CP_MAX_CONTEXT    GC_SEG0(0x1e4e)
+#define REG_GFX_CP_RB0_BASE_HI    GC_SEG0(0x1e51)
+#define REG_GFX_CP_WPTR_POLL_LO   GC_SEG0(0x1e8b)
+#define REG_GFX_CP_WPTR_POLL_HI   GC_SEG0(0x1e8c)
+#define REG_GFX_CP_DB_CONTROL     GC_SEG0(0x1e8d)
+#define REG_GFX_CP_RB_ACTIVE      GC_SEG0(0x1f40)
+#define REG_GFX_CP_PFP_START      GC_SEG0(0x1e44)
+#define REG_GFX_CP_ME_START       GC_SEG0(0x1e45)
+#define REG_GFX_GRBM_GFX_CNTL     GC_SEG1(0x0900)
+#define REG_GFX_CP_ME_CNTL        GC_SEG1(0x0803)
+#define REG_GFX_RLC_CSIB_LO       GC_SEG1(0x0987)
+#define REG_GFX_RLC_CSIB_HI       GC_SEG1(0x0988)
+#define REG_GFX_RLC_CSIB_LENGTH   GC_SEG1(0x0989)
+#define GFX_DOORBELL_DWORD        0x116
+#define GFX_DOORBELL_RANGE_MASK   0x00000ffcu
+#define GFX_DOORBELL_OFFSET_MASK  0x0ffffffcu
+
 /* MM hub FB aperture (mmhub 4.1.0 segment 0, dword 0x1a000) */
 #define REG_MMHUB_FB_BASE    ((0x1a000 + 0x0554) * 4)
 
@@ -327,6 +357,7 @@ struct RDNA4State {
     bool     inv_noack;      /* model the card (2026-09-28): GC hub flushes never ack */
     bool     sdma_no_db;     /* model an SDMA that ignores its doorbell */
     bool     dma_broken;     /* model a system-memory path that faults */
+    bool     gfx_hang;       /* accept gfx kicks but leave the ring stopped */
 
     uint32_t *regs;           /* BAR5 image, RDNA4_MMIO_SIZE bytes */
     uint8_t  *resv;           /* top RDNA4_RESV_SIZE bytes of VRAM */
@@ -358,7 +389,12 @@ struct RDNA4State {
     bool         autoload_armed;        /* AUTOLOAD_RLC accepted, IMU not released */
     uint64_t     sdma_wptr;             /* SDMA0 queue 0's last wptr: 64-bit, monotonic */
     bool         gfx_booted;            /* RLC autoload done */
+    uint64_t     gfx_wptr;               /* GFX ring 0's last wptr: 64-bit, monotonic */
+    uint64_t     gfx_rptr;               /* GFX ring 0's consumed dwords */
+    bool         gfx_csb_loaded;        /* the first valid kick loaded the CSB */
 };
+
+static void rdna4_gfx_wptr(RDNA4State *s, uint64_t wptr, bool doorbell);
 
 static inline uint32_t reg_get(RDNA4State *s, uint32_t byte)
 {
@@ -1338,6 +1374,9 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         rdna4_psp_ring_ctl(s, val);
     } else if (addr == REG_PSP_RING_WPTR) {
         rdna4_psp_wptr(s, val);
+    } else if (addr == REG_GFX_CP_RB0_WPTR) {
+        rdna4_gfx_wptr(s, (uint64_t)val |
+                        ((uint64_t)reg_get(s, REG_GFX_CP_RB0_WPTR_HI) << 32), false);
     } else if (addr == REG_SDMA0_RB_WPTR) {
         rdna4_sdma_wptr(s, val | ((uint64_t)reg_get(s, REG_SDMA0_RB_WPTR + 4) << 32));
     } else if (addr == REG_GCVM_INV17_REQ) {
@@ -2177,6 +2216,429 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
     }
 }
 
+/* ---- GFX ring (W3) ------------------------------------------------------ */
+
+/* A packet stream is either the circular ring or one linear indirect buffer. */
+typedef struct RDNA4GfxStream {
+    uint64_t base;
+    uint64_t pos;
+    uint64_t end;
+    uint32_t ring_dw;                 /* zero for an indirect buffer */
+} RDNA4GfxStream;
+
+static bool rdna4_gfx_stream_dw(RDNA4State *s, const RDNA4GfxStream *st,
+                                uint64_t pos, uint32_t *out)
+{
+    uint64_t slot = st->ring_dw ? pos % st->ring_dw : pos;
+    uint64_t addr;
+    uint8_t *p;
+
+    if (pos >= st->end || slot > (UINT64_MAX - st->base) / 4) {
+        return false;
+    }
+    addr = st->base + 4 * slot;
+    p = rdna4_gc_span(s, addr, 4);
+    if (!p) {
+        return false;
+    }
+    *out = ldl_le_p(p);
+    return true;
+}
+
+/*
+ * Load gfx12_cs_data exactly as the RLC does. The register indices in this
+ * buffer are absolute dword numbers (0xa000 + context offset), not offsets
+ * that should be added to the context segment a second time.
+ */
+static bool rdna4_gfx_csb(RDNA4State *s, const char **why)
+{
+    uint64_t addr = (uint64_t)reg_get(s, REG_GFX_RLC_CSIB_LO) & ~3ull;
+    uint32_t len = reg_get(s, REG_GFX_RLC_CSIB_LENGTH);
+    uint64_t bytes;
+    uint8_t *p;
+    uint32_t clusters, at;
+
+    if (!len) {
+        *why = "CSB length is zero";
+        return false;
+    }
+    addr |= (uint64_t)reg_get(s, REG_GFX_RLC_CSIB_HI) << 32;
+    bytes = (uint64_t)len * 4;
+    if (bytes / 4 != len || !(p = rdna4_gc_span(s, addr, bytes))) {
+        *why = "CSB is outside the GC-mapped VRAM";
+        return false;
+    }
+    clusters = ldl_le_p(p);
+    if (!clusters || clusters > len - 1) {
+        *why = "CSB cluster count is invalid";
+        return false;
+    }
+    at = 1;
+    for (uint32_t c = 0; c < clusters; c++) {
+        uint32_t count, index;
+
+        if (at + 2 > len) {
+            *why = "CSB cluster header crosses LENGTH";
+            return false;
+        }
+        count = ldl_le_p(p + 4 * at);
+        index = ldl_le_p(p + 4 * at + 4);
+        at += 2;
+        if (count > len - at) {
+            *why = "CSB cluster values cross LENGTH";
+            return false;
+        }
+        if (index < 0xa000 || (uint64_t)index + count > RDNA4_MMIO_SIZE / 4) {
+            *why = "CSB cluster register index is outside GC segment 1";
+            return false;
+        }
+        at += count;
+    }
+    if (at != len) {
+        *why = "CSB LENGTH does not end after its clusters";
+        return false;
+    }
+
+    at = 1;
+    for (uint32_t c = 0; c < clusters; c++) {
+        uint32_t count = ldl_le_p(p + 4 * at);
+        uint32_t index = ldl_le_p(p + 4 * at + 4);
+        at += 2;
+        for (uint32_t i = 0; i < count; i++) {
+            /* index is already absolute: dword index = 0xa000 + offset. */
+            reg_set(s, (index + i) * 4, ldl_le_p(p + 4 * (at + i)));
+        }
+        at += count;
+    }
+    s->gfx_csb_loaded = true;
+    fprintf(stderr, "rdna4: gfx: CSB loaded (%u clusters, %u dwords at MC 0x%" PRIx64 ")\n",
+            clusters, len, addr);
+    return true;
+}
+
+static bool rdna4_gfx_ready(RDNA4State *s, bool doorbell, uint32_t db_dword,
+                            const char **why)
+{
+    uint32_t cntl = reg_get(s, REG_GFX_CP_RB0_CNTL);
+    uint32_t bufsz = cntl & 0x3f;
+    uint32_t me = reg_get(s, REG_GFX_CP_ME_CNTL);
+    uint32_t db = reg_get(s, REG_GFX_CP_DB_CONTROL);
+    uint64_t base = ((uint64_t)reg_get(s, REG_GFX_CP_RB0_BASE) << 8) |
+                    ((uint64_t)reg_get(s, REG_GFX_CP_RB0_BASE_HI) << 40);
+
+    *why = !s->gfx_booted ? "GFX not booted" :
+           (reg_get(s, REG_GFX_GRBM_GFX_CNTL) & 3) ? "GRBM_GFX_CNTL PIPEID is not 0" :
+           reg_get(s, REG_GFX_CP_RB_WPTR_DELAY) ? "CP_RB_WPTR_DELAY is not zero" :
+           reg_get(s, REG_GFX_CP_RB_VMID) ? "CP_RB_VMID is not zero" :
+           (me & (1u << 26)) ? "PFP halted" :
+           (me & (1u << 28)) ? "ME halted" :
+           !reg_get(s, REG_GFX_CP_PFP_START) ? "PFP program start not set" :
+           !reg_get(s, REG_GFX_CP_ME_START) ? "ME program start not set" :
+           !(reg_get(s, REG_GFX_CP_RB_ACTIVE) & 1) ? "CP_RB_ACTIVE is off" :
+           !base ? "ring base is not set" :
+           bufsz < 5 || bufsz > 20 ? "RB_BUFSZ is outside 5..20" :
+           ((cntl >> 8) & 0x3f) != bufsz - 2 ? "RB_BLKSZ does not match RB_BUFSZ" : NULL;
+    if (*why) {
+        return false;
+    }
+    if (doorbell) {
+        if (!(reg_get(s, REG_NBIF_DB_APER_EN) & 1)) {
+            *why = "NBIF doorbell aperture off";
+        } else if (reg_get(s, REG_NBIF_S2A_ENTRY0) != 0x30000007) {
+            *why = "doorbell S2A entry 0 not routing to GC";
+        } else if (!(db & (1u << 30))) {
+            *why = "gfx doorbell disabled";
+        } else if ((db & GFX_DOORBELL_OFFSET_MASK) != (GFX_DOORBELL_DWORD << 2)) {
+            *why = "gfx doorbell offset is not ring 0";
+        } else if ((reg_get(s, REG_GFX_CP_RB_DB_LOWER) & GFX_DOORBELL_RANGE_MASK) !=
+                   ((GFX_DOORBELL_DWORD << 2) & GFX_DOORBELL_RANGE_MASK)) {
+            *why = "gfx doorbell lower range is wrong";
+        } else if ((reg_get(s, REG_GFX_CP_RB_DB_UPPER) & GFX_DOORBELL_RANGE_MASK) !=
+                   GFX_DOORBELL_RANGE_MASK) {
+            *why = "gfx doorbell upper range is wrong";
+        } else if (db_dword != GFX_DOORBELL_DWORD) {
+            *why = "doorbell is not gfx ring 0's";
+        }
+    } else if (db & (1u << 30)) {
+        *why = "gfx doorbell mode enabled for an MMIO kick";
+    }
+    if (*why) {
+        return false;
+    }
+    if (!s->gfx_csb_loaded && !rdna4_gfx_csb(s, why)) {
+        return false;
+    }
+    return true;
+}
+
+static bool rdna4_gfx_set_regs(RDNA4State *s, RDNA4GfxStream *st,
+                               uint32_t op, uint32_t count)
+{
+    uint32_t start, base;
+
+    if (!count || !rdna4_gfx_stream_dw(s, st, st->pos + 1, &start)) {
+        fprintf(stderr, "rdna4: gfx: SET_* packet has no register offset, stopping\n");
+        return false;
+    }
+    base = op == 0x79 ? 0xc000 : op == 0x69 ? 0xa000 : 0x2c00;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t value;
+        uint64_t dword = (uint64_t)base + start + i;
+
+        if (!rdna4_gfx_stream_dw(s, st, st->pos + 2 + i, &value) ||
+            dword > RDNA4_MMIO_SIZE / 4 - 1) {
+            fprintf(stderr, "rdna4: gfx: SET_* register packet crosses unmapped MMIO, stopping\n");
+            return false;
+        }
+        reg_set(s, (uint32_t)dword * 4, value);
+    }
+    return true;
+}
+
+static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib)
+{
+    while (st->pos < st->end) {
+        uint64_t at = st->pos;
+        uint32_t hdr, op, count, len;
+
+        if (!rdna4_gfx_stream_dw(s, st, at, &hdr)) {
+            fprintf(stderr, "rdna4: gfx: packet at dword %" PRIu64 " is not mapped, stopping\n", at);
+            return false;
+        }
+        op = (hdr >> 8) & 0xff;
+        count = (hdr >> 16) & 0x3fff;
+        len = op == 0x10 && count == 0x3fff ? 1 : count + 2;
+        if ((hdr >> 30) != 3) {
+            fprintf(stderr, "rdna4: gfx: not a type-3 packet 0x%08x at dword %" PRIu64 ", stopping\n",
+                    hdr, at);
+            return false;
+        }
+        if (st->end - at < len) {
+            fprintf(stderr, "rdna4: gfx: packet 0x%02x at dword %" PRIu64 " crosses the wptr, stopping\n",
+                    op, at);
+            return false;
+        }
+        switch (op) {
+        case 0x10:                                           /* NOP */
+            break;
+        case 0x79:                                           /* SET_UCONFIG_REG */
+        case 0x69:                                           /* SET_CONTEXT_REG */
+        case 0x76:                                           /* SET_SH_REG */
+            if (!rdna4_gfx_set_regs(s, st, op, count)) {
+                return false;
+            }
+            break;
+        case 0x28:                                           /* CONTEXT_CONTROL */
+            if (count != 1) {
+                fprintf(stderr, "rdna4: gfx: CONTEXT_CONTROL length %u refused, stopping\n", len);
+                return false;
+            }
+            break;
+        case 0x46:                                           /* EVENT_WRITE */
+            if (count != 0) {
+                fprintf(stderr, "rdna4: gfx: EVENT_WRITE length %u refused, stopping\n", len);
+                return false;
+            }
+            break;
+        case 0x58:                                           /* ACQUIRE_MEM */
+            if (count != 6) {
+                fprintf(stderr, "rdna4: gfx: ACQUIRE_MEM length %u refused, stopping\n", len);
+                return false;
+            }
+            break;
+        case 0x42:                                           /* PFP_SYNC_ME */
+            if (count != 0) {
+                fprintf(stderr, "rdna4: gfx: PFP_SYNC_ME length %u refused, stopping\n", len);
+                return false;
+            }
+            break;
+        case 0x37: {                                         /* WRITE_DATA */
+            uint32_t ctl, lo, hi, value, n = count - 2;
+            uint64_t addr;
+
+            if (count < 3 || !rdna4_gfx_stream_dw(s, st, at + 1, &ctl) ||
+                !rdna4_gfx_stream_dw(s, st, at + 2, &lo) ||
+                !rdna4_gfx_stream_dw(s, st, at + 3, &hi)) {
+                fprintf(stderr, "rdna4: gfx: WRITE_DATA length %u refused, stopping\n", len);
+                return false;
+            }
+            addr = (uint64_t)(lo & ~3u) | ((uint64_t)hi << 32);
+            if (((ctl >> 8) & 0xf) == 5) {
+                uint8_t *p = rdna4_gc_span(s, addr, 4ull * n);
+                if (!p) {
+                    fprintf(stderr, "rdna4: gfx: WRITE_DATA memory 0x%" PRIx64 " refused, stopping\n", addr);
+                    return false;
+                }
+                for (uint32_t i = 0; i < n; i++) {
+                    if (!rdna4_gfx_stream_dw(s, st, at + 4 + i, &value)) {
+                        return false;
+                    }
+                    stl_le_p(p + 4 * i, value);
+                }
+            } else if (((ctl >> 8) & 0xf) == 0 && hi == 0 && addr + 4ull * n <= RDNA4_MMIO_SIZE) {
+                for (uint32_t i = 0; i < n; i++) {
+                    if (!rdna4_gfx_stream_dw(s, st, at + 4 + i, &value)) {
+                        return false;
+                    }
+                    reg_set(s, (uint32_t)addr + 4 * i, value);
+                }
+            } else {
+                fprintf(stderr, "rdna4: gfx: WRITE_DATA DST_SEL %u or address refused, stopping\n",
+                        (ctl >> 8) & 0xf);
+                return false;
+            }
+            break;
+        }
+        case 0x49: {                                         /* RELEASE_MEM */
+            uint32_t ctl, sel, int_sel, lo, hi, value;
+            uint64_t addr;
+            uint8_t *p;
+
+            if (count != 6 || !rdna4_gfx_stream_dw(s, st, at + 2, &ctl) ||
+                !rdna4_gfx_stream_dw(s, st, at + 3, &lo) ||
+                !rdna4_gfx_stream_dw(s, st, at + 4, &hi) ||
+                !rdna4_gfx_stream_dw(s, st, at + 5, &value)) {
+                fprintf(stderr, "rdna4: gfx: RELEASE_MEM length %u refused, stopping\n", len);
+                return false;
+            }
+            sel = (ctl >> 29) & 3;
+            int_sel = (ctl >> 24) & 3;
+            if (sel != 1 && sel != 2) {
+                fprintf(stderr, "rdna4: gfx: RELEASE_MEM DATA_SEL %u refused, stopping\n", sel);
+                return false;
+            }
+            addr = (uint64_t)(lo & ~3u) | ((uint64_t)hi << 32);
+            p = rdna4_gc_span(s, addr, sel == 2 ? 8 : 4);
+            if (!p) {
+                fprintf(stderr, "rdna4: gfx: RELEASE_MEM address 0x%" PRIx64 " refused, stopping\n", addr);
+                return false;
+            }
+            if (sel == 2) {
+                uint32_t hi_value;
+                if (!rdna4_gfx_stream_dw(s, st, at + 6, &hi_value)) {
+                    return false;
+                }
+                stq_le_p(p, value | ((uint64_t)hi_value << 32));
+            } else {
+                stl_le_p(p, value);
+            }
+            /* W1 hook: raise the end-of-pipe interrupt when INT_SEL != 0. */
+            if (int_sel && s->trace) {
+                fprintf(stderr, "rdna4: gfx: RELEASE_MEM INT_SEL %u (W1 interrupt hook)\n", int_sel);
+            }
+            break;
+        }
+        case 0x3f: {                                         /* INDIRECT_BUFFER */
+            uint32_t lo, hi, ctl, ib_len, vmid;
+            uint64_t addr;
+            RDNA4GfxStream ib;
+
+            if (!allow_ib || count != 2 ||
+                !rdna4_gfx_stream_dw(s, st, at + 1, &lo) ||
+                !rdna4_gfx_stream_dw(s, st, at + 2, &hi) ||
+                !rdna4_gfx_stream_dw(s, st, at + 3, &ctl)) {
+                fprintf(stderr, "rdna4: gfx: INDIRECT_BUFFER packet is nested or has wrong length, stopping\n");
+                return false;
+            }
+            addr = (uint64_t)(lo & ~3u) | ((uint64_t)hi << 32);
+            ib_len = ctl & 0xfffff;
+            vmid = (ctl >> 24) & 0xf;
+            if (lo & 3) {
+                fprintf(stderr, "rdna4: gfx: INDIRECT_BUFFER address is not dword aligned, stopping\n");
+                return false;
+            }
+            if (vmid) {
+                fprintf(stderr, "rdna4: gfx: INDIRECT_BUFFER VMID %u refused, stopping\n", vmid);
+                return false;
+            }
+            if (!ib_len || (uint64_t)ib_len * 4 / 4 != ib_len ||
+                !rdna4_gc_span(s, addr, (uint64_t)ib_len * 4)) {
+                fprintf(stderr, "rdna4: gfx: INDIRECT_BUFFER 0x%" PRIx64 " crosses unmapped memory, stopping\n",
+                        addr);
+                return false;
+            }
+            ib.base = addr;
+            ib.pos = 0;
+            ib.end = ib_len;
+            ib.ring_dw = 0;
+            if (!rdna4_gfx_packets(s, &ib, false)) {
+                return false;
+            }
+            break;
+        }
+        default:
+            fprintf(stderr, "rdna4: gfx: unknown PM4 op 0x%02x at dword %" PRIu64 ", stopping\n", op, at);
+            return false;
+        }
+        st->pos += len;
+    }
+    return true;
+}
+
+static void rdna4_gfx_rptr_writeback(RDNA4State *s, uint32_t rptr)
+{
+    uint64_t addr = (uint64_t)(reg_get(s, REG_GFX_CP_RB0_RPTR_ADDR) & ~3u) |
+                    ((uint64_t)(reg_get(s, REG_GFX_CP_RB0_RPTR_HI) & 0xffff) << 32);
+    uint8_t *p = rdna4_gc_span(s, addr, 4);
+
+    if (p) {
+        stl_le_p(p, rptr);
+    } else if (addr) {
+        fprintf(stderr, "rdna4: gfx: rptr writeback MC 0x%" PRIx64 " is not mapped\n", addr);
+    }
+}
+
+static void rdna4_gfx_wptr(RDNA4State *s, uint64_t wptr, bool doorbell)
+{
+    const char *why;
+    uint32_t cntl, ring_dw, rptr_slot;
+    uint64_t base, available;
+    RDNA4GfxStream st;
+
+    if (wptr < s->gfx_wptr) {
+        fprintf(stderr, "rdna4: gfx: wptr went back from 0x%" PRIx64 " to 0x%" PRIx64
+                ": ignored, the engine waits\n", s->gfx_wptr, wptr);
+        return;
+    }
+    s->gfx_wptr = wptr;
+    reg_set(s, REG_GFX_CP_RB0_WPTR, (uint32_t)wptr);
+    reg_set(s, REG_GFX_CP_RB0_WPTR_HI, (uint32_t)(wptr >> 32));
+    if (!rdna4_gfx_ready(s, doorbell, doorbell ? GFX_DOORBELL_DWORD : 0, &why)) {
+        fprintf(stderr, "rdna4: gfx: %s kick ignored: %s\n",
+                doorbell ? "doorbell" : "MMIO", why);
+        return;
+    }
+    cntl = reg_get(s, REG_GFX_CP_RB0_CNTL);
+    ring_dw = 2u << (cntl & 0x3f);
+    base = ((uint64_t)reg_get(s, REG_GFX_CP_RB0_BASE) << 8) |
+           ((uint64_t)reg_get(s, REG_GFX_CP_RB0_BASE_HI) << 40);
+    available = wptr - s->gfx_rptr;
+    if (available > ring_dw) {
+        fprintf(stderr, "rdna4: gfx: kick ignored: ring overrun (%" PRIu64 " dwords for %u)\n",
+                available, ring_dw);
+        return;
+    }
+    if (s->gfx_hang) {
+        reg_set(s, REG_GC_CP_STAT, 1);
+        fprintf(stderr, "rdna4: gfx: gfx-hang: kick accepted at wptr 0x%" PRIx64
+                ", ring does not advance\n", wptr);
+        return;
+    }
+    reg_set(s, REG_GC_CP_STAT, available ? 1 : 0);
+    st.base = base;
+    st.pos = s->gfx_rptr;
+    st.end = wptr;
+    st.ring_dw = ring_dw;
+    rdna4_gfx_packets(s, &st, true);
+    s->gfx_rptr = st.pos;
+    rptr_slot = (uint32_t)(s->gfx_rptr % ring_dw);
+    reg_set(s, REG_GFX_CP_RB0_RPTR, rptr_slot);
+    rdna4_gfx_rptr_writeback(s, rptr_slot);
+    reg_set(s, REG_GC_CP_STAT, 0);
+    fprintf(stderr, "rdna4: gfx: ring advanced rptr to 0x%x (wptr 0x%" PRIx64 ")\n",
+            rptr_slot, wptr);
+}
+
 /* BAR2: the doorbell aperture. 64-bit doorbells arrive whole (impl 8). */
 static uint64_t rdna4_doorbell_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -2212,6 +2674,10 @@ static void rdna4_sdma_doorbell(RDNA4State *s, uint64_t wptr)
 
 static void rdna4_doorbell_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
 {
+    if (addr / 4 == GFX_DOORBELL_DWORD) {
+        rdna4_gfx_wptr(opaque, data, true);
+        return;
+    }
     if (addr / 4 == SDMA0_DOORBELL_DWORD) {
         rdna4_sdma_doorbell(opaque, data);
         return;
@@ -2578,6 +3044,9 @@ static void rdna4_reset(DeviceState *dev)
     s->autoload_armed = false;
     s->sdma_wptr = 0;
     s->gfx_booted = false;
+    s->gfx_wptr = 0;
+    s->gfx_rptr = 0;
+    s->gfx_csb_loaded = false;
     memset(s->symclk_khz, 0, sizeof(s->symclk_khz));
     memset(s->dig_mode, 0, sizeof(s->dig_mode));
     /*
@@ -2705,6 +3174,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("inv-noack", RDNA4State, inv_noack, false),
     DEFINE_PROP_BOOL("sdma-no-doorbell", RDNA4State, sdma_no_db, false),
     DEFINE_PROP_BOOL("dma-broken", RDNA4State, dma_broken, false),
+    DEFINE_PROP_BOOL("gfx-hang", RDNA4State, gfx_hang, false),
 };
 
 static void rdna4_class_init(ObjectClass *klass, void *data)
