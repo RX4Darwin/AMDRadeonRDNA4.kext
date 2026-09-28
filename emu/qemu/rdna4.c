@@ -75,6 +75,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define NUM_OTG  4
 #define NUM_AUX  4
 #define NUM_DDC  8
+#define RDNA4_WORK_SLICE_NS 2000000ULL     /* hard upper bound from the W11 brief */
+#define RDNA4_WORK_REARM_NS 500000ULL      /* let vCPU/I/O work run between slices */
 
 /*
  * DMU (DCN 4.1.0) register segment bases in dwords, from the card's IP
@@ -3322,7 +3324,7 @@ static void rdna4_work_timer(void *opaque)
 static void rdna4_work_bh(void *opaque)
 {
     RDNA4State *s = opaque;
-    const uint64_t deadline = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 2 * 1000000ULL;
+    const uint64_t deadline = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + RDNA4_WORK_SLICE_NS;
     bool more;
 
     s->work_slices++;
@@ -3332,7 +3334,7 @@ static void rdna4_work_bh(void *opaque)
     /* W3e's gfx-ring model plugs into this same bottom half.  It must use
      * the same 2 ms budget and never run from the BAR/doorbell write path. */
     if (more)
-        timer_mod_ns(s->work_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 1);
+        timer_mod_ns(s->work_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + RDNA4_WORK_REARM_NS);
 }
 
 static void rdna4_work_schedule(RDNA4State *s)
