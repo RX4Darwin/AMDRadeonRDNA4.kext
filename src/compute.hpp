@@ -201,7 +201,7 @@ private:
 	// hang stopped at survives the reset. Logged by the next boot's survey.
 	void trail(const char *step);
 	// The pre-Metal features past the compute stages (W1-W5) name their
-	// trail steps "<feature>: ..." (gfx, ih, vm, flip, rt). If the previous
+	// trail steps "<feature>: ..." (gfx, ih, vm, flip). If the previous
 	// boot died in one of those, only that feature sits this boot out; the
 	// stages and the other features run. featureAllowed("gfx") etc.
 	char hungFeature[8] {};
