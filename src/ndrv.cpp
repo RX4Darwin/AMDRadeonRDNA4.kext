@@ -32,6 +32,10 @@ void vslServiceDisposed(void *service) {
 	}
 }
 
+bool vslServicePresent() {
+	return gVblService != nullptr;
+}
+
 void vslPrepareCursorInstalled(VslPrepareCursor prepare) {
 	gPrepareCursor = prepare;
 }

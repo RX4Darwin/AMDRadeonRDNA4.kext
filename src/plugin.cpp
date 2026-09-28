@@ -163,6 +163,10 @@ struct FbEntry {
 };
 FbEntry fbTable[8] {};
 
+// Forward declaration: the explicit open-time VBL service creation below
+// goes through the same wrapper as a legacy NDRV call.
+int32_t wrapVslNew(void *entryID, UInt32 type, void **service);
+
 // The GPU behind a framebuffer: its provider, or the provider's provider.
 IOPCIDevice *pciFor(IOService *provider) {
 	auto *pci = OSDynamicCast(IOPCIDevice, provider);
@@ -223,6 +227,25 @@ int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 
 void deviceSetPower(void *ctx, bool on) {
 	static_cast<RDNA4Device *>(ctx)->setDisplayPower(on);
+}
+
+void createVblankService(IOService *framebuffer) {
+	uint32_t requested = 0;
+	if (!PE_parse_boot_argn("rdna4-vbl", &requested, sizeof(requested)) || !requested ||
+	    Ndrv::vslServicePresent() || !orgVslNew || !orgVslDo || !framebuffer)
+		return;
+	IOService *provider = framebuffer->getProvider();
+	OSData *entry = provider ? OSDynamicCast(OSData,
+		provider->getProperty(kAAPLRegEntryIDKey)) : nullptr;
+	if (!entry || entry->getLength() < sizeof(RegEntryID)) {
+		FBLOG("ndrv: VBL service needs provider AAPL,RegEntryID");
+		return;
+	}
+	void *service = nullptr;
+	IOReturn ret = wrapVslNew(const_cast<void *>(entry->getBytesNoCopy()),
+	                          ::kVBLInterruptServiceType, &service);
+	if (ret != kIOReturnSuccess)
+		FBLOG("ndrv: open-time VBL service creation failed 0x%x", ret);
 }
 
 bool deviceSupportsHardwareCursor(void *ctx) {
@@ -301,6 +324,10 @@ void attach(FbEntry &e) {
 #endif
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidData, dev.edidLen, be);
 	e.state = st;
+	// Apple IOGraphics' IONDRVFramebuffer creates its VSL service from the
+	// provider's legacy registry ID before registering the VBL callback. See
+	// IONDRVFramebuffer.cpp:916-959 and its provider property setup at 541-544.
+	createVblankService(svc);
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
 
