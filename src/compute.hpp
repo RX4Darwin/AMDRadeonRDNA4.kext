@@ -49,6 +49,7 @@
 
 #include "amdfw.hpp"
 #include "codeobj.hpp"
+#include "flip.hpp"
 #include "gfxregs.hpp"
 #include "gpuheap.hpp"
 #include "ipdiscovery.hpp"
@@ -60,10 +61,6 @@
 class IOBufferMemoryDescriptor;
 class IODMACommand;
 class RDNA4Compute;
-
-namespace Flip {
-bool run(RDNA4Compute &compute);
-}
 
 class RDNA4Compute {
 public:
@@ -139,6 +136,9 @@ public:
 
 private:
 	friend bool Flip::run(RDNA4Compute &compute);
+	friend bool Flip::findPipe(RDNA4Compute &compute, Flip::Surface &out);
+	friend bool Flip::flipTo(RDNA4Compute &compute, const Flip::Surface &surface,
+	                         uint64_t target, const char *name, uint64_t *latencyUs);
 
 	Env    env {};
 	Survey sv {};
@@ -284,6 +284,9 @@ public:
 	                const char *name, uint64_t out[8]);
 	IOReturn rtUnload(const void *owner, uint64_t program);
 	IOReturn rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros);
+	IOReturn rtPresent(const void *owner, uint64_t handle, uint64_t offset,
+	                   uint64_t &geometry, uint64_t &pitch);
+	IOReturn rtRestore(const void *owner);
 	void     rtRelease(const void *owner);
 
 private:
@@ -309,6 +312,15 @@ private:
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
 	RtBuffer       buffers[kMaxBuffers] {};
 	RtProgram      programs[kMaxPrograms] {};
+	bool           presentActive { false };
+	const void    *presentOwner { nullptr };
+	uint64_t       presentHandle { 0 };
+	uint64_t       presentOffset { 0 };
+	uint64_t       presentStarted { 0 };
+	Flip::Surface  presentSurface {};
+	void     checkPresentationTimeoutLocked();
+	IOReturn restorePresentationLocked(const char *why);
+	void     clearPresentationLocked();
 	IOService     *rtService { nullptr };
 	uint64_t       dmubVram { 0 };            // DMUB memory (VRAM offset), from choosePool
 	void publishRuntime(uint32_t stage);
