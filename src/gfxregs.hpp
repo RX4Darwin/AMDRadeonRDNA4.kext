@@ -36,6 +36,7 @@ constexpr Reg CpMecRs64Cntl       { 1, 0x2904 };
 constexpr Reg CpMecRs64InstrPntr  { 1, 0x2908 };
 constexpr Reg CpMesCntl           { 1, 0x2807 };
 constexpr Reg CpMe1Pipe0IntCntl   { 0, 0x1e25 };
+constexpr Reg CpMe1Pipe1IntCntl   { 0, 0x1e26 };   // gfx12 has these two only
 constexpr Reg RlcCntl             { 1, 0x4c00 };
 constexpr Reg RlcStat             { 1, 0x4c04 };
 constexpr Reg RlcGpmStat          { 1, 0x4e6c };
@@ -153,6 +154,15 @@ constexpr Reg GcCtx0PtStartLo     { 0, 0x16af };
 constexpr Reg GcCtx0PtStartHi     { 0, 0x16b0 };
 constexpr Reg GcCtx0PtEndLo       { 0, 0x16cf };
 constexpr Reg GcCtx0PtEndHi       { 0, 0x16d0 };
+// VMID n uses CONTEXT1 + (n - 1) for the control register and the paired
+// address registers below.  gfxhub_v12_0 programs these for VMIDs 1..15.
+constexpr Reg GcCtx1Cntl          { 0, 0x1625 };
+constexpr Reg GcCtx1PtBaseLo      { 0, 0x1691 };
+constexpr Reg GcCtx1PtBaseHi      { 0, 0x1692 };
+constexpr Reg GcCtx1PtStartLo     { 0, 0x16b1 };
+constexpr Reg GcCtx1PtStartHi     { 0, 0x16b2 };
+constexpr Reg GcCtx1PtEndLo       { 0, 0x16d1 };
+constexpr Reg GcCtx1PtEndHi       { 0, 0x16d2 };
 constexpr Reg GcSysApertureHigh   { 0, 0x161a };   // MC address >> 18
 constexpr Reg GcSysDefaultLsb     { 0, 0x15a8 };   // VRAM offset >> 12
 constexpr Reg GcSysDefaultMsb     { 0, 0x15a9 };   // VRAM offset >> 44
@@ -332,6 +342,7 @@ constexpr Reg ComputePgmRsrc3     { 0, 0x1bc8 };
 constexpr Reg ComputeThreadMgmtSe4{ 0, 0x1bcb };   // SE4..SE7 (0x1bcb..0x1bce)
 constexpr Reg ComputeUserData0    { 0, 0x1be0 };
 constexpr Reg ShMemConfig         { 1, 0x09e4 };   // per VMID (GRBM_GFX_CNTL.VMID)
+constexpr Reg ShMemBases          { 1, 0x09e5 };   // PRIVATE_BASE [15:0], SHARED_BASE [31:16]
 // DEFAULT_SH_MEM_CONFIG: 64-bit addressing, unaligned access, prefetch 3.
 constexpr uint32_t kShMemConfigDefault = (3u << 2) | (3u << 14);
 // COMPUTE_PGM_RSRC1: VGPR blocks [5:0] (wave32: 8 per block), FLOAT_MODE
@@ -407,6 +418,37 @@ constexpr uint32_t kSmuFeatDpmGfxclk = 1, kSmuFeatDpmUclk = 3, kSmuFeatDpmFclk =
 constexpr Reg PspBootStatus       { 0, 0x0063 };   // C2PMSG_35: bit31 bootloader ready
 constexpr Reg PspRingStatus       { 0, 0x0080 };   // C2PMSG_64
 constexpr Reg PspSosVersion       { 0, 0x0091 };   // C2PMSG_81: nonzero = sOS alive
+
+// --- The gfx ring (W3): gfx_v12_0_cp_gfx_resume / init_csb ------------------------
+constexpr Reg CpRb0Rptr           { 0, 0x0f60 };
+constexpr Reg CpRbWptrDelay       { 0, 0x0f61 };
+constexpr Reg CpRb0Base           { 0, 0x1de0 };   // MC >> 8
+constexpr Reg CpRb0Cntl           { 0, 0x1de1 };   // RB_BUFSZ [5:0], RB_BLKSZ [13:8]
+constexpr Reg CpRb0RptrAddr       { 0, 0x1de3 };
+constexpr Reg CpRb0RptrAddrHi     { 0, 0x1de4 };   // 16 bits
+constexpr Reg CpDeviceId          { 0, 0x1deb };
+constexpr Reg CpRbVmid            { 0, 0x1df1 };
+constexpr Reg CpRb0Wptr           { 0, 0x1df4 };
+constexpr Reg CpRb0WptrHi         { 0, 0x1df5 };
+constexpr Reg CpRbDoorbellRangeLower { 0, 0x1dfa };   // [11:2]
+constexpr Reg CpRbDoorbellRangeUpper { 0, 0x1dfb };   // [11:2]
+constexpr Reg CpMaxContext        { 0, 0x1e4e };
+constexpr Reg CpRb0BaseHi         { 0, 0x1e51 };
+constexpr Reg CpRbWptrPollAddrLo  { 0, 0x1e8b };
+constexpr Reg CpRbWptrPollAddrHi  { 0, 0x1e8c };
+constexpr Reg CpRbDoorbellControl { 0, 0x1e8d };   // DOORBELL_OFFSET [27:2], DOORBELL_EN [30]
+constexpr Reg CpRbActive          { 0, 0x1f40 };
+constexpr Reg RlcCsibAddrLo       { 1, 0x0987 };
+constexpr Reg RlcCsibAddrHi       { 1, 0x0988 };
+constexpr Reg RlcCsibLength       { 1, 0x0989 };   // dwords
+constexpr uint32_t kCpRbDoorbellEn        = 1u << 30;
+constexpr uint32_t kCpRbDoorbellRangeMask = 0x00000ffc;
+// AMDGPU_NAVI10_DOORBELL_GFX_RING0 (0x08B) in 64-bit doorbell dwords, as
+// gfx_v12_0 sets ring->doorbell_index = doorbell_index.gfx_ring0 << 1.
+constexpr uint32_t kGfxDoorbellDword      = 0x08B * 2;
+constexpr uint32_t kGfxMaxHwContexts      = 8;          // gfx.config.max_hw_contexts
+// Read-only: NUM_SHADER_ENGINES [22:19] = log2(SEs), as gfx_v12_0 reads it.
+constexpr Reg GbAddrConfig        { 0, 0x13de };
 
 } // namespace GfxReg
 

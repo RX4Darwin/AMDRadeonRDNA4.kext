@@ -251,12 +251,15 @@ bool RDNA4Compute::ihInit() {
 		return false;
 	}
 
-	// The only queue owned by this kext is MEC1 pipe 0 queue 0. The source
-	// bits are enabled after IOKit registration, so a vector cannot arrive
-	// before the drain path exists.
+	// The kext's queues are on MEC1: pipe 0 queue 0 (the kernel's) and the
+	// runtime clients' queues (W2), on pipes 0 and 1 (the pipes gfx12 has
+	// CP_ME1_PIPEn_INT_CNTL for). The source bits are enabled after IOKit
+	// registration, so a vector cannot arrive before the drain path exists.
 	trail("ih: enable sources");
 	wr(IpDiscovery::HwGc, CpMe1Pipe0IntCntl,
 	   rd(IpDiscovery::HwGc, CpMe1Pipe0IntCntl) | kCpTimeStampIntEnable);
+	wr(IpDiscovery::HwGc, CpMe1Pipe1IntCntl,
+	   rd(IpDiscovery::HwGc, CpMe1Pipe1IntCntl) | kCpTimeStampIntEnable);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaCntl),
 	   rd(IpDiscovery::HwGc, sdma(0, SdmaCntl)) | 1u); // TRAP_ENABLE
 	trail("ih: enable ring");
@@ -505,6 +508,8 @@ void RDNA4Compute::ihStop() {
 		   rd(IpDiscovery::HwOsssys, IhRbCntl) & ~(kIhRbEnable | kIhEnableIntr));
 		wr(IpDiscovery::HwGc, CpMe1Pipe0IntCntl,
 		   rd(IpDiscovery::HwGc, CpMe1Pipe0IntCntl) & ~kCpTimeStampIntEnable);
+		wr(IpDiscovery::HwGc, CpMe1Pipe1IntCntl,
+		   rd(IpDiscovery::HwGc, CpMe1Pipe1IntCntl) & ~kCpTimeStampIntEnable);
 		wr(IpDiscovery::HwGc, sdma(0, SdmaCntl),
 		   rd(IpDiscovery::HwGc, sdma(0, SdmaCntl)) & ~1u);
 		ihActive = false;
@@ -564,7 +569,10 @@ void RDNA4Compute::ihUnknown(uint8_t client, uint8_t source, uint8_t ring) {
 void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	Ih::Entry entry {};
 	Ih::decode(dw, entry);
-	if (entry.clientId == kIhClientGfx && entry.srcId == kIhSrcCpEop && entry.ringId == 4) {
+	// ring_id = queue [6:4] | me [3:2] | pipe [1:0] (gfx_v12_0_eop_irq): any
+	// MEC1 queue, the kernel's or a runtime client's.
+	if (entry.clientId == kIhClientGfx && entry.srcId == kIhSrcCpEop &&
+	    ((entry.ringId >> 2) & 3) == 1) {
 		ihEopCount++;
 		if (ihEopCount == 1 || !(ihEopCount & 0x3f))
 			HLOG("CP EOP interrupt: count %u ring %u", ihEopCount, entry.ringId);

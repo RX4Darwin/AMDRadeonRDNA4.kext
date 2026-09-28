@@ -35,6 +35,7 @@ public:
 	                  OSDictionary *properties) APPLE_KEXT_OVERRIDE;
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	IOReturn clientClose() APPLE_KEXT_OVERRIDE;
+	IOReturn clientDied() APPLE_KEXT_OVERRIDE;
 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
 	                        IOExternalMethodDispatch *dispatch, OSObject *target,
 	                        void *reference) APPLE_KEXT_OVERRIDE;
@@ -53,6 +54,8 @@ private:
 	static IOReturn sUnload(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sDispatch(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sWaitVBlank(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sPresent(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sRestore(OSObject *t, void *, IOExternalMethodArguments *a);
 };
 
 #endif /* RDNA4UserClient_hpp */

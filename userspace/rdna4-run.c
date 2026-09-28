@@ -29,11 +29,13 @@
 #include "vadd_codeobj.h"
 
 #include <Accelerate/Accelerate.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
 #include <time.h>
+#include <pthread.h>
 #include <unistd.h>
 
 // Accelerate is weak-linked (-weak_framework): a recovery system may not
@@ -71,6 +73,8 @@ static int cmdInfo(rdna4_t *gpu) {
 	printf("transfers: %s\n", (in.flags & RDNA4_FLAG_DMA)
 	       ? "DMA by the GPU's copy engine; buffers from VRAM past the BAR"
 	       : "the CPU through the BAR (no DMA)");
+	if (in.flags & RDNA4_FLAG_VM)
+		printf("GPUVM: VMID %llu, MEC1 pipe %llu queue %llu\n", in.vmid, in.pipe, in.queue);
 	return 0;
 }
 
@@ -248,6 +252,154 @@ static int cmdHangtest(rdna4_t *gpu) {
 	return fails ? 1 : 0;
 }
 
+typedef struct VmPeerJob {
+	rdna4_t *gpu;
+	rdna4_program_t prog;
+	rdna4_buffer_t a, b, c;
+	uint32_t ha[256], hb[256], hc[256];
+	kern_return_t kr;
+	int bad;
+} VmPeerJob;
+
+static void *runVmPeer(void *opaque) {
+	VmPeerJob *j = (VmPeerJob *)opaque;
+	const uint64_t args[3] = { j->a.gpu, j->b.gpu, j->c.gpu };
+	const uint32_t groups[3] = { 4, 1, 1 }, size[3] = { 64, 1, 1 };
+	j->kr = rdna4_dispatch(j->gpu, &j->prog, groups, size, args, sizeof(args), 2000, NULL);
+	if (!j->kr)
+		j->kr = rdna4_read(j->gpu, &j->c, 0, j->hc, sizeof(j->hc));
+	if (!j->kr)
+		for (uint32_t i = 0; i < 256; i++)
+			if (j->hc[i] != j->ha[i] + 3 * j->hb[i])
+				j->bad++;
+	return NULL;
+}
+
+/* Prove that two VM clients have private address spaces and queues. */
+static int testVmIsolationAndPeers(rdna4_t *a) {
+	rdna4_t b;
+	memset(&b, 0, sizeof(b));
+	kern_return_t kr = rdna4_open(&b);
+	if (kr != KERN_SUCCESS) {
+		printf("  FAIL  VM isolation: second client: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	int fails = 0;
+	rdna4_program_t copy = {};
+	rdna4_buffer_t aPad1 = {}, aPad2 = {}, aSrc = {}, bDst = {};
+	uint32_t src[1024], dst[1024];
+	memset(dst, 0, sizeof(dst));
+	if ((kr = rdna4_load(&b, kBenchCodeObject, sizeof(kBenchCodeObject), "copy", &copy)) ||
+	    (kr = rdna4_alloc(a, 65536, &aPad1)) || (kr = rdna4_alloc(a, 65536, &aPad2)) ||
+	    (kr = rdna4_alloc(a, 65536, &aSrc)) || (kr = rdna4_alloc(&b, 65536, &bDst))) {
+		printf("  FAIL  VM isolation setup: %s\n", rdna4_error(kr));
+		fails++;
+		goto isolation_cleanup;
+	}
+	for (uint32_t i = 0; i < 1024; i++)
+		src[i] = 0xA5000000u ^ i;
+	if ((kr = rdna4_write(a, &aSrc, 0, src, sizeof(src))) ||
+	    (kr = rdna4_write(&b, &bDst, 0, dst, sizeof(dst)))) {
+		printf("  FAIL  VM isolation write: %s\n", rdna4_error(kr));
+		fails++;
+		goto isolation_cleanup;
+	}
+	{
+		const uint64_t args[2] = { aSrc.gpu, bDst.gpu };
+		const uint32_t groups[3] = { 1, 1, 1 }, size[3] = { 256, 1, 1 };
+		kr = rdna4_dispatch(&b, &copy, groups, size, args, sizeof(args), 2000, NULL);
+	}
+	if (kr || (kr = rdna4_read(&b, &bDst, 0, dst, sizeof(dst)))) {
+		printf("  FAIL  VM isolation dispatch: %s\n", rdna4_error(kr));
+		fails++;
+	} else {
+		for (uint32_t i = 0; i < 1024; i++)
+			if (dst[i])
+				fails++;
+		printf("  %s  VM isolation: client B could not read client A's VA\n",
+		       fails ? "FAIL" : "ok");
+	}
+
+isolation_cleanup:
+	if (bDst.handle)
+		rdna4_free(&b, &bDst);
+	if (aSrc.handle)
+		rdna4_free(a, &aSrc);
+	if (aPad2.handle)
+		rdna4_free(a, &aPad2);
+	if (aPad1.handle)
+		rdna4_free(a, &aPad1);
+	if (copy.handle)
+		rdna4_unload(&b, &copy);
+
+	VmPeerJob jobs[2];
+	memset(jobs, 0, sizeof(jobs));
+	jobs[0].gpu = a;
+	jobs[1].gpu = &b;
+	for (int j = 0; j < 2; j++) {
+		if ((kr = rdna4_load(jobs[j].gpu, kVaddCodeObject, sizeof(kVaddCodeObject), "vadd",
+		                     &jobs[j].prog)) ||
+		    (kr = rdna4_alloc(jobs[j].gpu, sizeof(jobs[j].ha), &jobs[j].a)) ||
+		    (kr = rdna4_alloc(jobs[j].gpu, sizeof(jobs[j].hb), &jobs[j].b)) ||
+		    (kr = rdna4_alloc(jobs[j].gpu, sizeof(jobs[j].hc), &jobs[j].c))) {
+			printf("  FAIL  VM peer setup: %s\n", rdna4_error(kr));
+			fails++;
+			goto peers_cleanup;
+		}
+		for (uint32_t i = 0; i < 256; i++) {
+			jobs[j].ha[i] = aOf(i + j * 17);
+			jobs[j].hb[i] = bOf(i, j + 3);
+			jobs[j].hc[i] = 0xffffffffu;
+		}
+		if ((kr = rdna4_write(jobs[j].gpu, &jobs[j].a, 0, jobs[j].ha, sizeof(jobs[j].ha))) ||
+		    (kr = rdna4_write(jobs[j].gpu, &jobs[j].b, 0, jobs[j].hb, sizeof(jobs[j].hb))) ||
+		    (kr = rdna4_write(jobs[j].gpu, &jobs[j].c, 0, jobs[j].hc, sizeof(jobs[j].hc)))) {
+			printf("  FAIL  VM peer write: %s\n", rdna4_error(kr));
+			fails++;
+			goto peers_cleanup;
+		}
+	}
+	{
+		pthread_t threads[2];
+		int made = 0;
+		for (; made < 2; made++)
+			if (pthread_create(&threads[made], NULL, runVmPeer, &jobs[made]))
+				break;
+		if (made != 2) {
+			printf("  FAIL  VM peer dispatch: could not create both threads\n");
+			fails++;
+			for (int j = 0; j < made; j++)
+				pthread_join(threads[j], NULL);
+		} else {
+			for (int j = 0; j < 2; j++)
+				pthread_join(threads[j], NULL);
+			for (int j = 0; j < 2; j++)
+				if (jobs[j].kr || jobs[j].bad) {
+					printf("  FAIL  VM peer %d: %s%s\n", j,
+					       jobs[j].kr ? rdna4_error(jobs[j].kr) : "wrong results",
+					       jobs[j].bad ? " (data mismatch)" : "");
+					fails++;
+				}
+			if (!fails)
+				printf("  ok    two VM clients dispatched concurrently; both results exact\n");
+		}
+	}
+
+peers_cleanup:
+	for (int j = 0; j < 2; j++) {
+		if (jobs[j].c.handle)
+			rdna4_free(jobs[j].gpu, &jobs[j].c);
+		if (jobs[j].b.handle)
+			rdna4_free(jobs[j].gpu, &jobs[j].b);
+		if (jobs[j].a.handle)
+			rdna4_free(jobs[j].gpu, &jobs[j].a);
+		if (jobs[j].prog.handle)
+			rdna4_unload(jobs[j].gpu, &jobs[j].prog);
+	}
+	rdna4_close(&b);
+	return fails;
+}
+
 static uint32_t aOf(uint32_t i) { return i * 2654435761u; }
 static uint32_t bOf(uint32_t i, uint32_t round) { return (i ^ 0x5A5A5A5Au) + round * 0x01000193u; }
 
@@ -255,6 +407,142 @@ static double nowUs(void) {
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return t.tv_sec * 1e6 + t.tv_nsec / 1e3;
+}
+
+static volatile sig_atomic_t showSignal;
+
+static void showSignalHandler(int signalNumber) {
+	(void)signalNumber;
+	showSignal = 1;
+}
+
+static uint32_t mandelbrotColor(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+	const float cx = ((float)x / (float)width - 0.5f) * 3.2f - 0.7f;
+	const float cy = ((float)y / (float)height - 0.5f) * 2.2f;
+	float zx = 0.0f, zy = 0.0f;
+	uint32_t iteration = 0;
+	for (; iteration < 256u; iteration++) {
+		const float zx2 = zx * zx;
+		const float zy2 = zy * zy;
+		if (zx2 + zy2 > 4.0f)
+			break;
+		const float nextZx = zx2 - zy2 + cx;
+		zy = 2.0f * zx * zy + cy;
+		zx = nextZx;
+	}
+	if (iteration >= 256u)
+		return 0xff000000u;
+	const float t = (float)iteration * (1.0f / 255.0f);
+	const uint32_t r = (uint32_t)(9.0f + 246.0f * t);
+	const uint32_t g = (uint32_t)(20.0f + 200.0f * (1.0f - t));
+	const uint32_t b = (uint32_t)(80.0f + 175.0f * t);
+	return 0xff000000u | (r << 16) | (g << 8) | b;
+}
+
+static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
+	uint32_t width = 0, height = 0, pitch = 0;
+	kern_return_t kr = rdna4_display_query(gpu, &width, &height, &pitch);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: display query: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	if (!width || !height || !pitch || (uint64_t)pitch * height > UINT64_MAX / 4) {
+		fprintf(stderr, "show: invalid display geometry %ux%u pitch %u\n", width, height, pitch);
+		return 1;
+	}
+	const uint64_t bytes = (uint64_t)pitch * height * 4;
+	printf("show: geometry %ux%u pitch %u (%llu bytes)\n", width, height, pitch, bytes);
+
+	rdna4_program_t prog = { 0 };
+	rdna4_buffer_t buf = { 0 };
+	int loaded = 0, allocated = 0, presented = 0, rc = 1;
+	kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "mandelbrot", &prog);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: load mandelbrot: %s\n", rdna4_error(kr));
+		goto done;
+	}
+	loaded = 1;
+	kr = rdna4_alloc(gpu, bytes, &buf);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: allocate %llu bytes: %s\n", bytes, rdna4_error(kr));
+		goto done;
+	}
+	allocated = 1;
+	{
+		uint8_t args[20] = { 0 };
+		memcpy(args, &buf.gpu, sizeof(buf.gpu));
+		memcpy(args + 8, &width, sizeof(width));
+		memcpy(args + 12, &height, sizeof(height));
+		memcpy(args + 16, &pitch, sizeof(pitch));
+		const uint32_t groups[3] = { (width + 15) / 16, (height + 15) / 16, 1 };
+		const uint32_t groupSize[3] = { 16, 16, 1 };
+		uint64_t kernelUs = 0;
+		kr = rdna4_dispatch(gpu, &prog, groups, groupSize, args, sizeof(args), 10000, &kernelUs);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "show: Mandelbrot dispatch: %s\n", rdna4_error(kr));
+			goto done;
+		}
+		printf("show: Mandelbrot kernel %llu us\n", kernelUs);
+	}
+
+	showSignal = 0;
+	signal(SIGINT, showSignalHandler);
+	signal(SIGTERM, showSignalHandler);
+	{
+		const double presentStart = nowUs();
+		kr = rdna4_present(gpu, &buf, 0, &width, &height, &pitch);
+		printf("show: present latency %.0f us\n", nowUs() - presentStart);
+	}
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: present: %s\n", rdna4_error(kr));
+		goto done;
+	}
+	presented = 1;
+	{
+		uint32_t mismatches = 0;
+		for (uint32_t sy = 1; sy <= 8; sy++) {
+			const uint32_t y = (uint64_t)sy * height / 9;
+			for (uint32_t sx = 1; sx <= 8; sx++) {
+				const uint32_t x = (uint64_t)sx * width / 9;
+				uint32_t got = 0;
+				kr = rdna4_read(gpu, &buf, ((uint64_t)y * pitch + x) * 4, &got, sizeof(got));
+				const uint32_t want = mandelbrotColor(x, y, width, height);
+				if (kr != KERN_SUCCESS || got != want)
+					mismatches++;
+			}
+		}
+		printf("show: CPU spot check 64 pixels, mismatches %u\n", mismatches);
+		if (kr != KERN_SUCCESS || mismatches)
+			goto done;
+	}
+	for (uint32_t left = seconds * 10; left && !showSignal; left--)
+		usleep(100000);
+	if (showSignal)
+		fprintf(stderr, "show: interrupted; restoring desktop\n");
+	kr = rdna4_restore(gpu);
+	presented = 0;
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "show: restore: %s\n", rdna4_error(kr));
+		goto done;
+	}
+	printf("show: desktop restored\n");
+	rc = showSignal ? 1 : 0;
+
+done:
+	signal(SIGINT, SIG_DFL);
+	signal(SIGTERM, SIG_DFL);
+	if (presented) {
+		kern_return_t restore = rdna4_restore(gpu);
+		if (restore != KERN_SUCCESS) {
+			fprintf(stderr, "show: cleanup restore: %s\n", rdna4_error(restore));
+			rc = 1;
+		}
+	}
+	if (allocated)
+		rdna4_free(gpu, &buf);
+	if (loaded)
+		rdna4_unload(gpu, &prog);
+	return rc;
 }
 
 // LDS and a work-group barrier (bench.cl's lds_reverse): each group of 64
@@ -426,6 +714,9 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 	}
 	if (cmdInfo(gpu))
 		return 1;
+	rdna4_info_t initial;
+	if (rdna4_info(gpu, &initial) == KERN_SUCCESS && (initial.flags & RDNA4_FLAG_VM))
+		fails += testVmIsolationAndPeers(gpu);
 
 	rdna4_program_t prog;
 	kern_return_t kr = rdna4_load(gpu, kVaddCodeObject, sizeof(kVaddCodeObject), "vadd", &prog);
@@ -967,6 +1258,7 @@ static void usage(void) {
 	                "       rdna4-run hangtest\n"
 	                "       rdna4-run bench [small]\n"
 	                "       rdna4-run vsync [n]\n"
+	                "       rdna4-run show [seconds]\n"
 	                "       rdna4-run load <file.hsaco> <kernel>\n");
 }
 
@@ -1008,6 +1300,11 @@ int main(int argc, char **argv) {
 		if (!openRuntime(&gpu))
 			return 1;
 		rc = cmdVsync(&gpu, frames);
+	} else if (!strcmp(argv[1], "show") && argc <= 3) {
+		if (!openRuntime(&gpu))
+			return 1;
+		const uint32_t seconds = argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 5;
+		rc = cmdShow(&gpu, seconds);
 	} else if (!strcmp(argv[1], "load") && argc == 4) {
 		if (!openRuntime(&gpu))
 			return 1;

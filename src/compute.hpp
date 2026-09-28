@@ -49,9 +49,11 @@
 
 #include "amdfw.hpp"
 #include "codeobj.hpp"
+#include "flip.hpp"
 #include "gfxregs.hpp"
 #include "gpuheap.hpp"
 #include "ih.hpp"
+#include "gpuvm.hpp"
 #include "ipdiscovery.hpp"
 #include "pm4.hpp"
 #include "pipe.hpp"
@@ -61,6 +63,11 @@
 
 class IOBufferMemoryDescriptor;
 class IODMACommand;
+class RDNA4Compute;
+
+namespace Flip {
+bool run(RDNA4Compute &compute);
+}
 class IOFilterInterruptEventSource;
 class IOWorkLoop;
 class OSObject;
@@ -105,6 +112,7 @@ public:
 
 	// rdna4-compute=<stage>, clamped to StageKernel. 0 when absent.
 	static uint32_t requestedStage();
+	static bool requestedVm();
 
 	// Run the survey now and, for stage >= 2, start the bring-up thread.
 	// Returns the last stage completed inline.
@@ -150,6 +158,11 @@ public:
 	};
 
 private:
+	friend bool Flip::run(RDNA4Compute &compute);
+	friend bool Flip::findPipe(RDNA4Compute &compute, Flip::Surface &out);
+	friend bool Flip::flipTo(RDNA4Compute &compute, const Flip::Surface &surface,
+	                         uint64_t target, const char *name, uint64_t *latencyUs);
+
 	Env    env {};
 	Survey sv {};
 	Pool   pool {};
@@ -172,6 +185,12 @@ private:
 	// flushed before each step that could hang the GPU, so the step a hard
 	// hang stopped at survives the reset. Logged by the next boot's survey.
 	void trail(const char *step);
+	// The pre-Metal features past the compute stages (W1-W5) name their
+	// trail steps "<feature>: ..." (gfx, ih, vm, flip, rt). If the previous
+	// boot died in one of those, only that feature sits this boot out; the
+	// stages and the other features run. featureAllowed("gfx") etc.
+	char hungFeature[8] {};
+	bool featureAllowed(const char *name) const;
 	// Log the previous boot's trail (into `text`); true if that boot died
 	// in the middle of a step rather than ending the bring-up itself.
 	bool logPreviousTrail(char *text, size_t size);
@@ -241,7 +260,11 @@ private:
 	bool mecStart();
 	bool doorbellInit();
 	bool hqdInit(bool asKiq);
+	bool hqdInitFor(bool asKiq, uint32_t pipe, uint32_t queue, uint32_t vmid,
+	                uint64_t mqd, uint64_t eop, uint64_t pq, uint64_t rptr,
+	                uint64_t wpoll, uint32_t doorbell);
 	void pm4Kick(uint64_t wptrDwords);
+	void pm4Kick(Pm4::Queue &queue, uint32_t doorbell, uint64_t wptrDwords);
 	bool stageCompute();
 
 	// Stage 6: run a real kernel (shaders/probe.s) on the compute units.
@@ -265,6 +288,10 @@ private:
 		uint32_t        timeoutUs;
 		uint32_t        ldsBytes;           // per work-group (RSRC2.LDS_SIZE)
 		bool            useInterrupt;       // runtime only; the fence remains authoritative
+		Pm4::Queue     *queue;
+		uint32_t        vmid, pipe, queueId, fenceValue, doorbell;
+		uint64_t        fenceAddress;
+		volatile uint32_t *fenceCpu;
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
 	void logComputeQueueState(const char *tag);
@@ -286,6 +313,39 @@ private:
 	static constexpr uint32_t kVaddItems      = 4096;                 // 64 groups of 64
 	bool stageKernel();
 
+	// W3, the gfx ring (gfxring.cpp): after the compute stages when the
+	// boot-arg rdna4-gfx is 1 (write pointer through CP_RB0_WPTR) or 2 (its
+	// doorbell). Pool layout past the DMA scratch, below the heap.
+	static constexpr uint32_t kGfxOffset      = 30u << 20;
+	static constexpr uint32_t kGfxRingOffset  = kGfxOffset;              // 16 KiB ring
+	static constexpr uint32_t kGfxRingSize    = 0x4000;
+	static constexpr uint32_t kGfxRptrOffset  = kGfxOffset + 0x4000;     // rptr writeback
+	static constexpr uint32_t kGfxWptrOffset  = kGfxRptrOffset + 0x40;   // wptr poll copy
+	static constexpr uint32_t kGfxFenceOffset = kGfxRptrOffset + 0x80;   // RELEASE_MEM target
+	static constexpr uint32_t kGfxTestOffset  = kGfxRptrOffset + 0xc0;   // WRITE_DATA targets
+	static constexpr uint32_t kGfxCsbOffset   = kGfxOffset + 0x5000;     // clear-state buffer
+	static constexpr uint32_t kGfxCsbMax      = 0x1000;
+	static constexpr uint32_t kGfxIbOffset    = kGfxOffset + 0x10000;    // indirect buffers
+	// G3, the first draw (stageGfxDraw, after the runtime: its GE rings come
+	// from the device heap): the NGG VS and the PS, 1 KiB apart (256-byte
+	// aligned, prefetch-padded), the 256x256 RGBA8 target and the draw's
+	// own fence.
+	static constexpr uint32_t kGfxVsOffset    = kGfxOffset + 0x20000;
+	static constexpr uint32_t kGfxPsOffset    = kGfxOffset + 0x20400;
+	static constexpr uint32_t kGfxTargetOffset = kGfxOffset + 0x40000;   // 256 KiB
+	static constexpr uint32_t kGfxDrawFenceOffset = kGfxTestOffset + 0x20;
+	uint64_t   gfxRings { 0 };               // device-heap offset of the GE rings (0 = none)
+	bool stageGfxDraw();
+	Pm4::Queue gfxRing;
+	uint32_t   gfxFence { 0 };               // last RELEASE_MEM sequence number
+	uint32_t   gfxMode { 0 };                // 0 off, 1 MMIO write pointer, 2 doorbell
+	static uint32_t requestedGfx();
+	bool gfxCsbInit();
+	bool gfxRingResume();
+	void gfxKick(uint64_t wptrDwords);
+	bool gfxFenceWait(uint32_t seq, uint32_t timeoutUs);
+	void gfxStatus(const char *tag);
+	bool stageGfxRing();
 	// IH v7 ring and MSI delivery. The ring is brought up only after the
 	// runtime's DMA path has established bus mastering; stage bring-up keeps
 	// its existing bounded polling waits.
@@ -346,7 +406,8 @@ public:
 	// User-space runtime (runtime.cpp), reached through RDNA4ComputeClient.
 	// `owner` is the client: its buffers and programs are only its own, and
 	// rtRelease frees them all. Every call takes rtLock.
-	IOReturn rtInfo(uint64_t out[6]);
+	IOReturn rtOpen(const void *owner);
+	IOReturn rtInfo(const void *owner, uint64_t out[9]);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtFree(const void *owner, uint64_t handle);
 	IOReturn rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
@@ -355,6 +416,9 @@ public:
 	                const char *name, uint64_t out[8]);
 	IOReturn rtUnload(const void *owner, uint64_t program);
 	IOReturn rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros);
+	IOReturn rtPresent(const void *owner, uint64_t handle, uint64_t offset,
+	                   uint64_t &geometry, uint64_t &pitch);
+	IOReturn rtRestore(const void *owner);
 	void     rtRelease(const void *owner);
 
 private:
@@ -364,28 +428,74 @@ private:
 	static constexpr uint32_t kHeapOffset  = 32u << 20;
 	static constexpr uint32_t kMaxBuffers  = 256;
 	static constexpr uint32_t kMaxPrograms = 32;
+	static constexpr uint32_t kMaxClients = 8;
+	static constexpr uint32_t kVmTableBytes = 4u << 20;
+	static constexpr uint32_t kVmTableStage = 20u << 20;
+	static constexpr uint32_t kVmQueueBase = 26u << 20;
+	static constexpr uint32_t kVmQueueStride = 0x10000;
+	static constexpr uint32_t kVmMqd = 0x0000;
+	static constexpr uint32_t kVmEop = 0x1000;
+	static constexpr uint32_t kVmPq = 0x2000;
+	static constexpr uint32_t kVmRptr = 0x3000;
+	static constexpr uint32_t kVmWptr = 0x4000;
+	static constexpr uint32_t kVmFence = 0x5000;
+	static constexpr uint32_t kVmKernarg = 0x6000;
 	struct RtBuffer  {
 		const void *owner;
 		uint64_t    offset, bytes;             // heap offset (pool or VRAM), size
-		uint64_t    mc;                        // GPU address
+		uint64_t    mc, va;                    // physical MC and client GPU VA
 		uint16_t    gen;
 		bool        device;                    // from the device heap
 	};
-	struct RtProgram { const void *owner; uint64_t offset; CodeObj::Kernel k; uint16_t gen; };
+	struct RtProgram { const void *owner; uint64_t offset, va; CodeObj::Kernel k; uint16_t gen; };
+	struct RtClient {
+		const void *owner { nullptr };
+		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
+		uint64_t tableOffset { 0 }, rootMc { 0 }, rootPhys { 0 }, nextVa { GpuVm::kVaStart };
+		uint64_t kernargVa { 0 }, fenceVa { 0 };
+		volatile uint32_t *kernargCpu { nullptr };
+		volatile uint32_t *fenceCpu { nullptr };
+		uint32_t fence { 0 }, doorbell { 0 };
+		uint64_t *tableShadow { nullptr };
+		Pm4::Queue pm4;
+		bool active { false };
+	};
 	IOLock        *rtLock { nullptr };
 	bool           rtReady { false };       // a dispatching stage finished
 	bool           rtWedged { false };      // a dispatch timed out
 	bool           hangRecoveryEnabled { true }; // rdna4-hang=0 keeps the old wedge
 	uint32_t       rtStage { 0 };
+	bool           vmEnabled { false };
+	bool           vmidUsed[16] {};
+	bool           queueUsed[4][8] {};
+	RtClient       clients[kMaxClients] {};
 	GpuHeap::Heap  heap;
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
 	RtBuffer       buffers[kMaxBuffers] {};
 	RtProgram      programs[kMaxPrograms] {};
+	bool           presentActive { false };
+	const void    *presentOwner { nullptr };
+	uint64_t       presentHandle { 0 };
+	uint64_t       presentOffset { 0 };
+	uint64_t       presentStarted { 0 };
+	Flip::Surface  presentSurface {};
+	void     checkPresentationTimeoutLocked();
+	IOReturn restorePresentationLocked(const char *why);
+	void     clearPresentationLocked();
 	IOService     *rtService { nullptr };
 	uint64_t       dmubVram { 0 };            // DMUB memory (VRAM offset), from choosePool
 	void publishRuntime(uint32_t stage);
+	bool initRuntimeHeap();
+	bool vmBootSelfTest();
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);
+	RtClient  *clientFor(const void *owner);
+	bool vmTableSync(RtClient &client, uint32_t offset, uint32_t bytes);
+	bool vmMap(RtClient &client, uint64_t va, uint64_t mc, uint64_t bytes, bool executable);
+	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
+	bool vmContextInit(RtClient &client);
+	bool vmInvalidate(uint32_t vmid, const char *tag);
+	void logClientFault(RtClient &client, const char *tag);
 
 	// DMA between host memory and VRAM (runtime.cpp). One pinned, physically
 	// contiguous bounce buffer; the GC hub's AGP aperture maps system memory
@@ -411,6 +521,9 @@ private:
 	bool bounceCopy(uint64_t vramMc, uint32_t hostOffset, uint32_t bytes, bool toGpu);
 	IOReturn dmaCopy(task_t task, mach_vm_address_t user, uint64_t mc, uint64_t length, bool toGpu);
 	uint64_t vramMc(uint64_t vramOffset) const { return sv.fbMcBase + vramOffset; }
+	bool gpuPhysical(uint64_t mc, uint64_t &physical) const {
+		return GpuVm::mcToPhysical(mc, sv.fbMcBase, sv.gcFbOffset, physical);
+	}
 	// SMU mailbox (MP1): send one message, return the response code
 	// (1 = OK, 0 = no answer) and the argument register after it.
 	uint32_t smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs);

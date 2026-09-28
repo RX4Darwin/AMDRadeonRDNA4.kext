@@ -29,6 +29,8 @@
 #include "../src/pm4.hpp"
 #include "../src/codeobj.hpp"
 #include "../src/gpuheap.hpp"
+#include "../src/flip.hpp"
+#include "../src/gpuvm.hpp"
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
@@ -1779,6 +1781,7 @@ static int testCodeObject() {
 	struct { const char *name; uint32_t lds, kernarg; } bench[] = {
 		{ "lds_reverse", 256, 24 }, { "spin", 0, 8 }, { "copy", 0, 16 }, { "sgemm", 8320, 28 },
 		{ "wmma16", 0, 24 }, { "hgemm", 20480, 28 }, { "bf16gemm", 20480, 28 },
+		{ "mandelbrot", 0, 20 },
 	};
 	const int nBench = sizeof(bench) / sizeof(bench[0]);
 	uint64_t entries[nBench] = {};
@@ -1867,6 +1870,84 @@ static int testGpuHeap() {
 	                  "abi: RDNA4Dispatch is %zu bytes", sizeof(RDNA4Dispatch));
 	printf("\nheap: first-fit VRAM heap allocates, frees and refuses %s\n",
 	       failures ? "FAILED" : "correctly");
+	return failures;
+}
+
+static int testFlipArithmetic() {
+	int failures = 0;
+	failures += check(Flip::surfaceBytes(1920, 1080) == 1920ull * 1080 * 4,
+	                  "flip: 1920x1080 surface size");
+	failures += check(Flip::surfaceBytes(3840, 2160) == 3840ull * 2160 * 4,
+	                  "flip: 3840x2160 surface size");
+	failures += check(Flip::surfaceBytes(0, 1080) == 0 && Flip::surfaceBytes(1920, 0) == 0,
+	                  "flip: zero-sized surface accepted");
+	const uint64_t address = 0x123456789abcde00ull;
+	failures += check(Flip::addressLo(address) == 0x9abcde00u &&
+	                  Flip::addressHi(address) == 0x12345678u,
+	                  "flip: address split");
+	printf("\nflip: surface arithmetic and address split %s\n",
+	       failures ? "FAILED" : "ok");
+	return failures;
+}
+
+struct VmTestTable {
+	uint64_t base;
+	uint64_t entries[4096];
+};
+
+static bool readVmTestEntry(void *ctx, uint64_t address, uint64_t &entry) {
+	VmTestTable *t = static_cast<VmTestTable *>(ctx);
+	if (address < t->base || address >= t->base + sizeof(t->entries) || (address & 7))
+		return false;
+	entry = t->entries[(address - t->base) / 8];
+	return true;
+}
+
+static int testGpuVm() {
+	int failures = 0;
+	const uint64_t physical = 0x0000123400000000ull;
+	const uint64_t pte = GpuVm::encodePte(physical,
+		GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable,
+		true);
+	failures += check((pte & GpuVm::kPhysicalMask) == physical && (pte & GpuVm::kValid) &&
+	                  ((pte >> 7) & 0x1f) == GpuVm::kFragment64K,
+	                  "gfx12 PTE encodes physical address, valid/write and 64 KiB fragment");
+	const uint64_t pde2 = GpuVm::encodePde(0x0000000000400000ull, GpuVm::kValid | GpuVm::kSnooped, 2);
+	const uint64_t pde1 = GpuVm::encodePde(0x0000000000410000ull, GpuVm::kValid | GpuVm::kSnooped, 1);
+	const uint64_t pde0 = GpuVm::encodePde(0x0000000000420000ull, GpuVm::kValid | GpuVm::kSnooped, 0);
+	failures += check(pde2 == (0x0000000000400000ull | GpuVm::kValid) &&
+	                  pde1 == (0x0000000000410000ull | GpuVm::kValid) &&
+	                  pde0 == (0x0000000000420000ull | GpuVm::kValid),
+	                  "gfx12 regular PDEs encode GPU physical address and VALID only");
+	uint64_t converted = 0;
+	failures += check(GpuVm::mcToPhysical(0x0000008012345000ull, 0x0000008000000000ull,
+	                                      0x12, converted) &&
+	                  converted == 0x0000000024345000ull,
+	                  "gfx12 MC VRAM address converts to FB_OFFSET GPU physical address");
+	failures += check(!GpuVm::mcToPhysical(0x0000007ffff00000ull, 0x0000008000000000ull,
+	                                       0x12, converted),
+	                  "gfx12 MC conversion rejects an address below the VRAM aperture");
+
+	VmTestTable table { 0x0000000000400000ull, {} };
+	/* One compact table image, laid out at 4 KiB boundaries. */
+	const uint64_t root = table.base;
+	const uint64_t pdb1 = root + 0x1000, pdb0 = root + 0x2000, ptb = root + 0x3000;
+	auto put = [&table](uint64_t address, uint64_t value) {
+		table.entries[(address - table.base) / 8] = value;
+	};
+	const uint64_t va = GpuVm::kVaStart + 0x12345000ull;
+	put(root + GpuVm::index(va, 0) * 8, GpuVm::encodePde(pdb1, GpuVm::kValid | GpuVm::kSnooped, 2));
+	put(pdb1 + GpuVm::index(va, 1) * 8, GpuVm::encodePde(pdb0, GpuVm::kValid | GpuVm::kSnooped, 1));
+	put(pdb0 + GpuVm::index(va, 2) * 8, GpuVm::encodePde(ptb, GpuVm::kValid | GpuVm::kSnooped, 0));
+	put(ptb + GpuVm::index(va, 3) * 8,
+	    GpuVm::encodePte(physical, GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable,
+	                      true));
+	uint64_t got = 0, flags = 0;
+	failures += check(GpuVm::walk(root, va + 0x345, readVmTestEntry, &table, got, flags) &&
+	                  got == physical + 0x345 && (flags & GpuVm::kWritable),
+	                  "gfx12 page-table walk returns the mapped physical address");
+	failures += check(!GpuVm::walk(root, 0x2000, readVmTestEntry, &table, got, flags),
+	                  "gfx12 page-table walk rejects an unmapped VA");
 	return failures;
 }
 
@@ -2065,6 +2146,8 @@ int main(int argc, char **argv) {
 	failures += testPm4Packets();
 	failures += testCodeObject();
 	failures += testGpuHeap();
+	failures += testFlipArithmetic();
+	failures += testGpuVm();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

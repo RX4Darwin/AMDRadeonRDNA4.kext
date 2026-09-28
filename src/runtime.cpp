@@ -86,17 +86,11 @@ IOReturn userCopy(task_t task, mach_vm_address_t user, void *kernel, uint64_t le
 } // namespace
 
 void RDNA4Compute::publishRuntime(uint32_t stage) {
-	if (!rtLock || !poolCpu || pool.size <= kHeapOffset) {
+	if (!initRuntimeHeap()) {
 		RLOG("not published: %s", !rtLock ? "no lock" : "no room for a heap in the pool");
 		return;
 	}
-	// DMA first: its self-test drives SDMA directly, before any client can.
-	if (dmaInit()) {
-		devHeapInit();
-		ihInit();
-	}
 	IOLockLock(rtLock);
-	heap.init(kHeapOffset, pool.size - kHeapOffset, 4096, heapMap, sizeof(heapMap));
 	rtStage = stage;
 	rtReady = true;
 	IOLockUnlock(rtLock);
@@ -146,8 +140,387 @@ RDNA4Compute::RtProgram *RDNA4Compute::programFor(const void *owner, uint64_t ha
 	return p.owner == owner && p.gen == gen ? &p : nullptr;
 }
 
-IOReturn RDNA4Compute::rtInfo(uint64_t out[6]) {
+RDNA4Compute::RtClient *RDNA4Compute::clientFor(const void *owner) {
+	if (!owner)
+		return nullptr;
+	for (RtClient &c : clients)
+		if (c.owner == owner && c.active)
+			return &c;
+	return nullptr;
+}
+
+bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, bool executable) {
+	if (!poolCpu || !c.tableShadow || !bytes || (va & (GpuVm::kPageBytes - 1)) ||
+	    (mc & (GpuVm::kPageBytes - 1)))
+		return false;
+	uint64_t physical = 0;
+	if (!gpuPhysical(mc, physical))
+		return false;
+	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
+	if (end < va || end > GpuVm::kVaEnd)
+		return false;
+	const bool fragment64k = (va & 0xffff) == 0 && (mc & 0xffff) == 0 &&
+		((bytes + 0xffff) & ~0xffffull) >= 0x10000;
+	auto entry = [&c](uint64_t off) -> uint64_t * {
+		return c.tableShadow + off / sizeof(uint64_t);
+	};
+	uint64_t firstPt = ~0ull, lastPt = 0;
+	for (uint64_t at = va, phys = physical; at < end;
+	     at += GpuVm::kPageBytes, phys += GpuVm::kPageBytes) {
+		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
+		const uint64_t ptOff = 0x3000 + relative * 0x1000;
+		if (at < GpuVm::kVaStart || ptOff + 0x1000 > kVmTableBytes)
+			return false;
+		const uint32_t pdeIndex = GpuVm::index(at, 2);
+		const uint64_t pdeOff = 0x2000 + static_cast<uint64_t>(pdeIndex) * 8;
+		if (!*entry(pdeOff))
+			*entry(pdeOff) = GpuVm::encodePde(c.rootPhys + ptOff, GpuVm::kValid, 0);
+		const uint64_t pteOff = ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8;
+		if (firstPt == ~0ull)
+			firstPt = ptOff;
+		lastPt = ptOff;
+		uint64_t flags = GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable;
+		if (executable)
+			flags |= GpuVm::kExecutable;
+		*entry(pteOff) = GpuVm::encodePte(phys, flags, fragment64k);
+	}
+	/* The root, PDB1, and the PDB0 entry that points at the PT all have to
+	 * reach VRAM before the queue can walk this mapping. */
+	if (firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
+		return false;
+	for (uint64_t pt = firstPt; pt <= lastPt; pt += 0x1000)
+		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
+			return false;
+	return true;
+}
+
+bool RDNA4Compute::initRuntimeHeap() {
+	if (!rtLock || !poolCpu || pool.size <= kHeapOffset)
+		return false;
+	if (heap.size())
+		return true;
+	/* DMA first: its self-test drives SDMA directly, before any client can;
+	 * then the interrupts (W1), off for one boot if the last one hung in
+	 * "ih: ...". */
+	if (dmaInit()) {
+		devHeapInit();
+		if (featureAllowed("ih"))
+			ihInit();
+	}
+	heap.init(kHeapOffset, pool.size - kHeapOffset, 4096, heapMap, sizeof(heapMap));
+	return heap.size() != 0;
+}
+
+void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
+	if (!poolCpu || !c.tableShadow || !bytes || va & (GpuVm::kPageBytes - 1))
+		return;
+	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
+	uint64_t firstPt = ~0ull, lastPt = 0;
+	for (uint64_t at = va; at < end && at >= va; at += GpuVm::kPageBytes) {
+		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
+		const uint64_t ptOff = 0x3000 + relative * 0x1000;
+		if (at < GpuVm::kVaStart || ptOff + 0x1000 > kVmTableBytes)
+			break;
+		const uint64_t pteOff = ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8;
+		c.tableShadow[pteOff / sizeof(uint64_t)] = 0;
+		if (firstPt == ~0ull)
+			firstPt = ptOff;
+		lastPt = ptOff;
+	}
+	for (uint64_t pt = firstPt; pt != ~0ull && pt <= lastPt; pt += 0x1000)
+		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
+			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
+}
+
+bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
+	if (!c.tableShadow || offset > kVmTableBytes || bytes > kVmTableBytes - offset ||
+	    !poolCpu || !devHeap.size() || offset & 0xfff || bytes & 0xfff) {
+		RLOG("vmid %u: page-table sync arguments rejected (offset 0x%x bytes 0x%x)",
+		     c.vmid, offset, bytes);
+		return false;
+	}
+	memcpy(poolCpu + kVmTableStage, reinterpret_cast<uint8_t *>(c.tableShadow) + offset, bytes);
+	(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + kVmTableStage);
+	flushHdp();
+	uint32_t pkt[Sdma::kCopyDwords];
+	if (!Sdma::copyLinear(pkt, poolMc(kVmTableStage), c.rootMc + offset, bytes)) {
+		RLOG("vmid %u: page-table COPY_LINEAR encoding failed", c.vmid);
+		return false;
+	}
+	if (!sdmaRun(pkt, Sdma::kCopyDwords, 2000)) {
+		RLOG("vmid %u: page-table SDMA sync failed (offset 0x%x bytes 0x%x)",
+		     c.vmid, offset, bytes);
+		return false;
+	}
+	return true;
+}
+
+bool RDNA4Compute::vmContextInit(RtClient &c) {
+	if (c.vmid < 1 || c.vmid > 15 || !c.rootPhys)
+		return false;
+	const uint32_t n = c.vmid - 1;
+	const uint32_t faultDefaults = ((1u << 14) - 1) << 10;
+	const uint32_t cntl = kVmCtxEnable | (GpuVm::kDepth << 1) |
+		((GpuVm::kBlockSize - 9) << 4) | faultDefaults;
+	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + n }, cntl);
+	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtBaseLo.dword + 2 * n },
+	   static_cast<uint32_t>(GpuVm::encodePde(c.rootPhys, GpuVm::kValid, 0)));
+	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtBaseHi.dword + 2 * n },
+	   static_cast<uint32_t>(GpuVm::encodePde(c.rootPhys, GpuVm::kValid, 0) >> 32));
+	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtStartLo.dword + 2 * n }, 0);
+	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtStartHi.dword + 2 * n }, 0);
+	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtEndLo.dword + 2 * n }, 0xffffffff);
+	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtEndHi.dword + 2 * n }, 0xffff);
+	return rdGc(Reg { 0, GcCtx1Cntl.dword + n }) == cntl;
+}
+
+bool RDNA4Compute::vmInvalidate(uint32_t vmid, const char *tag) {
+	const Reg req { 0, GcInvEng0Req.dword + kGcInvEngGart }, ack { 0, GcInvEng0Ack.dword + kGcInvEngGart };
+	const uint32_t request = (1u << vmid) | (1u << 19) | (1u << 20) | (1u << 21) | (1u << 22) |
+	                         (1u << 23) | (1u << 24); /* clear fault status */
+	wr(IpDiscovery::HwGc, req, request);
+	for (uint32_t us = 0; us < 100000; us += 10) {
+		if (rdGc(ack) & (1u << vmid))
+			return true;
+		IODelay(10);
+	}
+	RLOG("vmid %u: VM invalidate timeout (%s), REQ 0x%08x ACK 0x%08x", vmid, tag,
+	     rdGc(req), rdGc(ack));
+	return false;
+}
+
+/* Boot-time proof of one translated MEC queue.  User clients never enter this
+ * path: it runs before the runtime service is published. */
+bool RDNA4Compute::vmBootSelfTest() {
+	if (!initRuntimeHeap())
+		return false;
+	RtClient c {};
+	const uint32_t vmid = 8, pipe = 0, queue = 1, doorbell = 0x1a;
+	const uint32_t qoff = kVmQueueBase;
+	const uint64_t qva = GpuVm::kVaStart;
+	const uint64_t rva = qva + 0x1000, dataVa = qva + 0x2000, fenceVa = qva + 0x3000;
+	uint64_t table = 0;
+	if (!devHeap.size() || !devHeap.alloc(kVmTableBytes, table))
+		return false;
+	c.vmid = vmid;
+	c.pipe = pipe;
+	c.queue = queue;
+	c.tableOffset = table;
+	c.rootMc = vramMc(table);
+	if (!gpuPhysical(c.rootMc, c.rootPhys)) {
+		devHeap.free(table);
+		return false;
+	}
+	c.tableShadow = reinterpret_cast<uint64_t *>(IOMalloc(kVmTableBytes));
+	if (!c.tableShadow) {
+		devHeap.free(table);
+		return false;
+	}
+	bzero(c.tableShadow, kVmTableBytes);
+	c.tableShadow[0] =
+		GpuVm::encodePde(c.rootPhys + 0x1000, GpuVm::kValid, 2);
+	c.tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
+		GpuVm::encodePde(c.rootPhys + 0x2000, GpuVm::kValid, 1);
+	for (uint32_t off = 0; off < 0x7000; off += 4)
+		*poolDw(qoff + off) = 0;
+	c.kernargCpu = nullptr;
+	c.fenceCpu = poolDw(qoff + kVmFence);
+	const bool qMap = vmMap(c, qva, poolMc(qoff + kVmPq), kPqSize, false);
+	const bool rMap = qMap && vmMap(c, rva, poolMc(qoff + kVmRptr), 0x1000, false);
+	const bool dMap = rMap && vmMap(c, dataVa, poolMc(qoff + kVmWptr), 0x1000, false);
+	const bool fMap = dMap && vmMap(c, fenceVa, poolMc(qoff + kVmFence), 0x1000, false);
+	const bool qInit = fMap && c.pm4.init(poolDw(qoff + kVmPq), qva, kPqSize);
+	if (!qInit) {
+		RLOG("vm: boot page-table setup q=%d r=%d data=%d fence=%d pm4=%d",
+		     qMap, rMap, dMap, fMap, qInit);
+		RLOG("vm: boot page-table or queue setup failed");
+		IOFree(c.tableShadow, kVmTableBytes);
+		devHeap.free(table);
+		return false;
+	}
+	trail("vm: VM context enable");
+	bool context = vmContextInit(c);
+	if (!context)
+		RLOG("vm: boot VM context setup failed (VMID %u)", vmid);
+	bool hqd = false, inactive = true, fence = false;
+	if (context) {
+		trail("vm: HQD activate");
+		hqd = hqdInitFor(false, pipe, queue, vmid, poolMc(qoff + kVmMqd),
+		                 poolMc(qoff + kVmEop) >> 8, qva >> 8, rva, rva, doorbell);
+		*poolDw(qoff + kVmWptr) = 0;
+		*c.fenceCpu = 0;
+		flushHdp();
+		uint32_t pkt[8];
+		const uint32_t value = 0x564d0001;
+		c.pm4.emit(pkt, Pm4::writeData(pkt, dataVa, 0x600df00d));
+		c.pm4.emit(pkt, Pm4::releaseMem(pkt, fenceVa, value));
+		trail("vm: queue kick");
+		pm4Kick(c.pm4, doorbell, c.pm4.wptr());
+		for (uint32_t us = 0; us < 200000 && !fence; us += 10) {
+			fence = *c.fenceCpu == value;
+			if (!fence)
+				IODelay(10);
+		}
+		if (!fence || *poolDw(qoff + kVmWptr) != 0x600df00d)
+			RLOG("vm: boot queue test failed (fence 0x%08x, data 0x%08x)",
+			     *c.fenceCpu, *poolDw(qoff + kVmWptr));
+	}
+	if (context && (hqd || !fence)) {
+		trail("vm: HQD dequeue");
+		grbmSelect(1, pipe, queue, vmid);
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
+		inactive = false;
+		for (uint32_t us = 0; us < 100000; us += 10) {
+			if (!(rdGc(CpHqdActive) & 1)) { inactive = true; break; }
+			IODelay(10);
+		}
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+		if (!inactive)
+			RLOG("vm: boot HQD dequeue timed out (ACTIVE 0x%08x)", rdGc(CpHqdActive));
+		grbmSelect(0, 0, 0, 0);
+	}
+	bool flushed = true;
+	if (context) {
+		trail("vm: invalidate");
+		flushed = vmInvalidate(vmid, "boot self-test");
+		if (!flushed)
+			RLOG("vm: boot invalidation failed (VMID %u)", vmid);
+		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + vmid - 1 }, 0);
+	}
+	IOFree(c.tableShadow, kVmTableBytes);
+	devHeap.free(table);
+	return context && hqd && fence && inactive && flushed;
+}
+
+void RDNA4Compute::logClientFault(RtClient &c, const char *tag) {
+	const uint32_t status = rdGc(GcL2FaultStatusLo);
+	if (!status)
+		return;
+	const uint64_t address = rdGc(GcL2FaultAddrLo) |
+		(static_cast<uint64_t>(rdGc(GcL2FaultAddrHi)) << 32);
+	RLOG("vmid %u: %s: GC hub fault status 0x%08x address 0x%llx", c.vmid, tag, status, address);
+	vmInvalidate(c.vmid, "fault clear");
+}
+
+IOReturn RDNA4Compute::rtOpen(const void *owner) {
+	if (!vmEnabled)
+		return kIOReturnSuccess;
 	Locked g(rtLock);
+	if (clientFor(owner))
+		return kIOReturnSuccess;
+	RtClient *c = nullptr;
+	uint32_t slot = 0;
+	for (; slot < kMaxClients; slot++)
+		if (!clients[slot].active) { c = &clients[slot]; break; }
+	if (!c)
+		return kIOReturnNoResources;
+	uint32_t vmid = 0;
+	for (vmid = 8; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
+	if (vmid > 15)
+		return kIOReturnNoResources;
+	uint32_t pipe = 0, queue = 0;
+	for (; pipe < 4; pipe++) {
+		for (queue = 0; queue < 8; queue++)
+			if (!(pipe == 0 && queue == 0) && !queueUsed[pipe][queue])
+				break;
+		if (queue < 8)
+			break;
+	}
+	if (pipe == 4)
+		return kIOReturnNoResources;
+	uint64_t table = 0;
+	if (!devHeap.size() || !devHeap.alloc(kVmTableBytes, table))
+		return kIOReturnNoMemory;
+	if (kVmQueueBase + slot * kVmQueueStride + kVmKernarg + 0x1000 > pool.size) {
+		devHeap.free(table);
+		return kIOReturnNoMemory;
+	}
+	*c = RtClient {};
+	c->owner = owner; c->vmid = vmid; c->pipe = pipe; c->queue = queue;
+	c->tableOffset = table; c->rootMc = vramMc(table);
+	if (!gpuPhysical(c->rootMc, c->rootPhys)) {
+		devHeap.free(table); *c = RtClient {};
+		return kIOReturnNoMemory;
+	}
+	c->tableShadow = reinterpret_cast<uint64_t *>(IOMalloc(kVmTableBytes));
+	if (!c->tableShadow) {
+		devHeap.free(table); *c = RtClient {};
+		return kIOReturnNoMemory;
+	}
+	bzero(c->tableShadow, kVmTableBytes);
+	c->tableShadow[0] =
+		GpuVm::encodePde(c->rootPhys + 0x1000, GpuVm::kValid, 2);
+	c->tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
+		GpuVm::encodePde(c->rootPhys + 0x2000, GpuVm::kValid, 1);
+	const uint32_t qoff = kVmQueueBase + slot * kVmQueueStride;
+	for (uint32_t off = 0; off < 0x7000; off += 4)
+		*poolDw(qoff + off) = 0;
+	c->kernargCpu = poolDw(qoff + kVmKernarg);
+	c->fenceCpu = poolDw(qoff + kVmFence);
+	const uint64_t qva = c->nextVa; c->nextVa += 0x1000;
+	const uint64_t eva = c->nextVa; c->nextVa += 0x1000;
+	const uint64_t rva = c->nextVa; c->nextVa += 0x1000;
+	const uint64_t wva = c->nextVa; c->nextVa += 0x1000;
+	c->fenceVa = c->nextVa; c->nextVa += 0x1000;
+	c->kernargVa = c->nextVa; c->nextVa += 0x1000;
+	if (!vmMap(*c, qva, poolMc(qoff + kVmPq), kPqSize, false) ||
+	    !vmMap(*c, eva, poolMc(qoff + kVmEop), 0x1000, false) ||
+	    !vmMap(*c, rva, poolMc(qoff + kVmRptr), 0x1000, false) ||
+	    !vmMap(*c, wva, poolMc(qoff + kVmWptr), 0x1000, false) ||
+	    !vmMap(*c, c->fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
+	    !vmMap(*c, c->kernargVa, poolMc(qoff + kVmKernarg), 0x1000, false) ||
+	    !c->pm4.init(poolDw(qoff + kVmPq), qva, kPqSize) || !vmContextInit(*c)) {
+		IOFree(c->tableShadow, kVmTableBytes); devHeap.free(table); *c = RtClient {};
+		return kIOReturnNoMemory;
+	}
+	c->doorbell = (0x0d + slot) * 2;
+	vmidUsed[vmid] = true; queueUsed[pipe][queue] = true;
+	if (!hqdInitFor(false, pipe, queue, vmid, poolMc(qoff + kVmMqd), eva >> 8, qva >> 8,
+	               rva, wva, c->doorbell)) {
+		vmidUsed[vmid] = false; queueUsed[pipe][queue] = false;
+		IOFree(c->tableShadow, kVmTableBytes); devHeap.free(table); *c = RtClient {};
+		return kIOReturnNotResponding;
+	}
+	c->active = true;
+	RLOG("vmid %u: client queue activated MEC1 pipe %u queue %u, PDB2 MC 0x%llx physical 0x%llx, doorbell dword %u",
+	     vmid, pipe, queue, c->rootMc, c->rootPhys, c->doorbell);
+	return kIOReturnSuccess;
+}
+
+void RDNA4Compute::clearPresentationLocked() {
+	presentActive = false;
+	presentOwner = nullptr;
+	presentHandle = 0;
+	presentOffset = 0;
+	presentStarted = 0;
+	presentSurface = {};
+}
+
+IOReturn RDNA4Compute::restorePresentationLocked(const char *why) {
+	if (!presentActive)
+		return kIOReturnSuccess;
+	const bool restored = Flip::flipTo(*this, presentSurface, presentSurface.desktop,
+	                                   why ? why : "restore");
+	if (restored)
+		RLOG("present: restored desktop (%s)", why ? why : "requested");
+	else
+		RLOG("present: desktop restore failed (%s)", why ? why : "requested");
+	clearPresentationLocked();
+	return restored ? kIOReturnSuccess : kIOReturnNotResponding;
+}
+
+void RDNA4Compute::checkPresentationTimeoutLocked() {
+	if (!presentActive)
+		return;
+	uint64_t span = 0;
+	nanoseconds_to_absolutetime(30000000000ull, &span);
+	if (mach_absolute_time() - presentStarted >= span)
+		(void)restorePresentationLocked("timeout");
+}
+
+IOReturn RDNA4Compute::rtInfo(const void *owner, uint64_t out[9]) {
+	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	out[0] = RDNA4_COMPUTE_ABI;
 	out[1] = rtStage;
 	out[2] = (rtReady ? RDNA4_FLAG_READY : 0) | (rtWedged ? RDNA4_FLAG_WEDGED : 0) |
@@ -157,14 +530,24 @@ IOReturn RDNA4Compute::rtInfo(uint64_t out[6]) {
 	out[3] = h.size();
 	out[4] = h.freeBytes();
 	out[5] = dev ? vramMc(devHeap.base()) : poolMc(kHeapOffset);
+	RtClient *c = clientFor(owner);
+	out[6] = c ? c->vmid : 0;
+	out[7] = c ? c->pipe : 0;
+	out[8] = c ? c->queue : 0;
+	if (c)
+		out[2] |= RDNA4_FLAG_VM;
 	return kIOReturnSuccess;
 }
 
 // Contents are undefined, as with any GPU allocation; callers write first.
 IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	if (!rtReady)
 		return kIOReturnNotReady;
+	RtClient *c = clientFor(owner);
+	if (vmEnabled && !c)
+		return kIOReturnNoResources;
 	const bool dev = dmaReady && devHeap.size();
 	GpuHeap::Heap &h = dev ? devHeap : heap;
 	if (!bytes || bytes > h.size())
@@ -178,25 +561,40 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	if (!h.alloc(bytes, off))
 		return kIOReturnNoMemory;
 	RtBuffer &b = buffers[slot];
-	b = { owner, off, bytes, dev ? vramMc(off) : poolMc(off), nextGen(b.gen), dev };
+	b = { owner, off, bytes, dev ? vramMc(off) : poolMc(off), 0, nextGen(b.gen), dev };
+	if (c) {
+		b.va = (c->nextVa + 0xffff) & ~0xffffull;
+		c->nextVa = b.va + ((bytes + 0xffff) & ~0xffffull);
+		if (c->nextVa < b.va || !vmMap(*c, b.va, b.mc, bytes, false)) {
+			h.free(b.offset); b.owner = nullptr;
+			return kIOReturnNoMemory;
+		}
+	}
 	handle = makeHandle(slot, b.gen);
-	gpu = b.mc;
+	gpu = c ? b.va : b.mc;
 	return kIOReturnSuccess;
 }
 
 IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	RtBuffer *b = bufferFor(owner, handle);
 	if (!b)
 		return kIOReturnBadArgument;
+	IOReturn restore = kIOReturnSuccess;
+	if (presentActive && presentOwner == owner && presentHandle == handle)
+		restore = restorePresentationLocked("buffer free");
+	if (RtClient *c = clientFor(owner))
+		vmUnmap(*c, b->va, b->bytes);
 	(b->device ? devHeap : heap).free(b->offset);
 	b->owner = nullptr;
-	return kIOReturnSuccess;
+	return restore;
 }
 
 IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
                               mach_vm_address_t user, uint64_t length, bool toGpu) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	if (!rtReady)
 		return kIOReturnNotReady;
 	RtBuffer *b = bufferFor(owner, handle);
@@ -217,8 +615,12 @@ IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offse
 IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t elf, uint64_t length,
                               const char *name, uint64_t out[8]) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	if (!rtReady)
 		return kIOReturnNotReady;
+	RtClient *c = clientFor(owner);
+	if (vmEnabled && !c)
+		return kIOReturnNoResources;
 	if (!length || length > RDNA4_MAX_CODE_OBJECT)
 		return kIOReturnBadArgument;
 	uint32_t slot = 0;
@@ -263,7 +665,15 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 	}
 
 	RtProgram &p = programs[slot];
-	p = { owner, off, k, nextGen(p.gen) };
+	p = { owner, off, 0, k, nextGen(p.gen) };
+	if (c) {
+		p.va = (c->nextVa + 0xfff) & ~0xfffull;
+		c->nextVa = p.va + ((img.size + kCodePad + 0xffff) & ~0xffffull);
+		if (c->nextVa < p.va || !vmMap(*c, p.va, poolMc(off), img.size + kCodePad, true)) {
+			heap.free(off); p.owner = nullptr;
+			return kIOReturnNoMemory;
+		}
+	}
 	out[0] = makeHandle(slot, p.gen);
 	out[1] = k.kernargSize;
 	out[2] = img.size;
@@ -272,16 +682,20 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 	out[5] = k.rsrc3;
 	out[6] = k.properties;
 	out[7] = k.groupSegmentSize;
-	RLOG("loaded \"%s\": %llu-byte image at MC 0x%llx, entry +0x%llx, %u bytes of kernargs, "
-	     "%u of LDS", name, img.size, poolMc(off), k.entryVa, k.kernargSize, k.groupSegmentSize);
+	RLOG("loaded \"%s\": %llu-byte image at %s 0x%llx, entry +0x%llx, %u bytes of kernargs, "
+	     "%u of LDS", name, img.size, c ? "VA" : "MC", c ? p.va : poolMc(off), k.entryVa,
+	     k.kernargSize, k.groupSegmentSize);
 	return kIOReturnSuccess;
 }
 
 IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	RtProgram *p = programFor(owner, program);
 	if (!p)
 		return kIOReturnBadArgument;
+	if (RtClient *c = clientFor(owner))
+		vmUnmap(*c, p->va, heap.lengthOf(p->offset));
 	heap.free(p->offset);
 	p->owner = nullptr;
 	return kIOReturnSuccess;
@@ -289,10 +703,14 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 
 IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros) {
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
 	if (!rtReady)
 		return kIOReturnNotReady;
 	if (rtWedged)
 		return kIOReturnNotResponding;
+	RtClient *c = clientFor(owner);
+	if (vmEnabled && !c)
+		return kIOReturnNoResources;
 	RtProgram *p = programFor(owner, d.program);
 	if (!p || d.kernargBytes > RDNA4_MAX_KERNARG || d.timeoutMs > RDNA4_MAX_TIMEOUT_MS ||
 	    d.dynamicLdsBytes > RDNA4_MAX_LDS ||
@@ -313,15 +731,18 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	const CodeObj::Kernel &k = p->k;
 	uint32_t bytes = k.kernargSize > d.kernargBytes ? k.kernargSize : d.kernargBytes;
 	bytes = (bytes + 3) & ~3u;
+	volatile uint32_t *kernargCpu = c ? c->kernargCpu : poolDw(kKernargOffset);
 	for (uint32_t off = 0; off < bytes; off += 4)
-		*poolDw(kKernargOffset + off) = 0;
-	if (d.kernargBytes)
-		memcpy(poolCpu + kKernargOffset, d.kernargs, d.kernargBytes);
+		kernargCpu[off / 4] = 0;
+	if (d.kernargBytes) {
+		for (uint32_t off = 0; off < d.kernargBytes; off++)
+			reinterpret_cast<volatile uint8_t *>(kernargCpu)[off] = d.kernargs[off];
+	}
 
-	const uint64_t kernarg = poolMc(kKernargOffset);
+	const uint64_t kernarg = c ? c->kernargVa : poolMc(kKernargOffset);
 	const uint32_t user[2] = { static_cast<uint32_t>(kernarg), static_cast<uint32_t>(kernarg >> 32) };
 	Launch l {};
-	l.code = poolMc(p->offset) + k.entryVa;
+	l.code = (c ? p->va : poolMc(p->offset)) + k.entryVa;
 	l.rsrc1 = k.rsrc1;
 	l.rsrc2 = k.rsrc2;
 	l.rsrc3 = k.rsrc3;
@@ -335,6 +756,14 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	l.timeoutUs = (d.timeoutMs ? d.timeoutMs : 1000) * 1000;
 	l.ldsBytes = k.groupSegmentSize + d.dynamicLdsBytes;
 	l.useInterrupt = ihActive;
+	l.queue = c ? &c->pm4 : nullptr;
+	l.vmid = c ? c->vmid : 0;
+	l.pipe = c ? c->pipe : 0;
+	l.queueId = c ? c->queue : 0;
+	l.fenceValue = c ? ++c->fence : 0;
+	l.doorbell = c ? c->doorbell : 0;
+	l.fenceAddress = c ? c->fenceVa : 0;
+	l.fenceCpu = c ? c->fenceCpu : nullptr;
 
 	uint64_t ns = 0;
 	const bool done = launch(l, "runtime", ns);
@@ -350,16 +779,80 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 		}
 		return kIOReturnTimeout;
 	}
+	if (c)
+		logClientFault(*c, "dispatch");
 	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t offset,
+                                 uint64_t &geometry, uint64_t &pitch) {
+	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
+	if (!rtReady)
+		return kIOReturnNotReady;
+
+	Flip::Surface surface {};
+	if (!handle) {
+		if (!Flip::findPipe(*this, surface))
+			return kIOReturnNotReady;
+		geometry = (static_cast<uint64_t>(surface.width) & 0xffffu) |
+		           ((static_cast<uint64_t>(surface.height) & 0xffffu) << 16);
+		pitch = surface.pitch;
+		return kIOReturnSuccess;
+	}
+	if (presentActive && presentOwner != owner)
+		return kIOReturnBusy;
+	RtBuffer *b = bufferFor(owner, handle);
+	if (!b || !b->device || (offset & 255u))
+		return kIOReturnBadArgument;
+	if (presentActive) {
+		surface = presentSurface;
+	} else if (!Flip::findPipe(*this, surface)) {
+		return kIOReturnNotReady;
+	}
+	const uint64_t bytes = Flip::surfaceBytes(surface.pitch, surface.height);
+	if (!bytes || offset > b->bytes || bytes > b->bytes - offset || offset > ~0ull - b->mc)
+		return kIOReturnBadArgument;
+	const uint64_t target = b->mc + offset;
+	if (!Flip::flipTo(*this, surface, target, "present"))
+		return kIOReturnNotResponding;
+	presentActive = true;
+	presentOwner = owner;
+	presentHandle = handle;
+	presentOffset = offset;
+	presentStarted = mach_absolute_time();
+	presentSurface = surface;
+	geometry = (static_cast<uint64_t>(surface.width) & 0xffffu) |
+	           ((static_cast<uint64_t>(surface.height) & 0xffffu) << 16);
+	pitch = surface.pitch;
+	RLOG("present: buffer 0x%llx +0x%llx, %ux%u pitch %u", handle, offset,
+	     surface.width, surface.height, surface.pitch);
+	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4Compute::rtRestore(const void *owner) {
+	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
+	if (!presentActive)
+		return kIOReturnSuccess;
+	if (presentOwner != owner)
+		return kIOReturnBusy;
+	return restorePresentationLocked("restore");
 }
 
 void RDNA4Compute::rtRelease(const void *owner) {
 	if (!rtLock || !owner)
 		return;
 	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
+	if (presentActive && presentOwner == owner)
+		(void)restorePresentationLocked("client close");
+	RtClient *c = clientFor(owner);
 	uint32_t nb = 0, np = 0;
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner) {
+			if (c)
+				vmUnmap(*c, b.va, b.bytes);
 			(b.device ? devHeap : heap).free(b.offset);
 			b.owner = nullptr;
 			nb++;
@@ -367,6 +860,8 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	}
 	for (RtProgram &p : programs) {
 		if (p.owner == owner) {
+			if (c)
+				vmUnmap(*c, p.va, heap.lengthOf(p.offset));
 			heap.free(p.offset);
 			p.owner = nullptr;
 			np++;
@@ -374,6 +869,29 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	}
 	if (nb || np)
 		RLOG("client closed: freed %u buffer(s), %u program(s)", nb, np);
+	if (c) {
+		/* Dequeue is deliberately polled: W1's interrupt path is not required. */
+		grbmSelect(1, c->pipe, c->queue, c->vmid);
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
+		bool inactive = false;
+		for (uint32_t us = 0; us < 100000; us += 10) {
+			if (!(rdGc(CpHqdActive) & 1)) { inactive = true; break; }
+			IODelay(10);
+		}
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+		if (!inactive)
+			RLOG("vmid %u: queue MEC1 pipe %u queue %u dequeue timeout (ACTIVE 0x%08x)",
+			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
+		grbmSelect(0, 0, 0, 0);
+		vmInvalidate(c->vmid, "client close");
+		vmidUsed[c->vmid] = false;
+		queueUsed[c->pipe][c->queue] = false;
+		IOFree(c->tableShadow, kVmTableBytes);
+		devHeap.free(c->tableOffset);
+		RLOG("vmid %u: client closed, freed MEC1 pipe %u queue %u and page tables",
+		     c->vmid, c->pipe, c->queue);
+		*c = RtClient {};
+	}
 }
 
 // ---------------------------------------------------------------------------

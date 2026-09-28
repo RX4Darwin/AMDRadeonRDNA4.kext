@@ -32,7 +32,7 @@ bool RDNA4ComputeClient::start(IOService *provider) {
 	if (!svc || !svc->compute || !IOUserClient::start(provider))
 		return false;
 	compute = svc->compute;
-	return true;
+	return compute->rtOpen(this) == kIOReturnSuccess;
 }
 
 IOReturn RDNA4ComputeClient::clientClose() {
@@ -43,9 +43,16 @@ IOReturn RDNA4ComputeClient::clientClose() {
 	return kIOReturnSuccess;
 }
 
+IOReturn RDNA4ComputeClient::clientDied() {
+	if (compute)
+		compute->rtRelease(this);
+	compute = nullptr;
+	return IOUserClient::clientDied();
+}
+
 const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] = {
 	// function    scalars in  struct in                   scalars out  struct out
-	{ sInfo,       0,          0,                          6,           0 },
+	{ sInfo,       0,          0,                          9,           0 },
 	{ sAlloc,      1,          0,                          2,           0 },
 	{ sFree,       1,          0,                          0,           0 },
 	{ sWrite,      4,          0,                          0,           0 },
@@ -54,6 +61,8 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sUnload,     1,          0,                          0,           0 },
 	{ sDispatch,   0,          sizeof(RDNA4Dispatch),      1,           0 },
 	{ sWaitVBlank, 1,          0,                          2,           0 },
+	{ sPresent,    2,          0,                          2,           0 },
+	{ sRestore,    0,          0,                          0,           0 },
 };
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -68,7 +77,7 @@ IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodA
 static RDNA4ComputeClient *self(OSObject *t) { return static_cast<RDNA4ComputeClient *>(t); }
 
 IOReturn RDNA4ComputeClient::sInfo(OSObject *t, void *, IOExternalMethodArguments *a) {
-	return self(t)->compute->rtInfo(a->scalarOutput);
+	return self(t)->compute->rtInfo(t, a->scalarOutput);
 }
 
 IOReturn RDNA4ComputeClient::sAlloc(OSObject *t, void *, IOExternalMethodArguments *a) {
@@ -120,4 +129,13 @@ IOReturn RDNA4ComputeClient::sWaitVBlank(OSObject *t, void *, IOExternalMethodAr
 	a->scalarOutput[0] = count;
 	a->scalarOutput[1] = timeNs;
 	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4ComputeClient::sPresent(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtPresent(t, a->scalarInput[0], a->scalarInput[1],
+	                                   a->scalarOutput[0], a->scalarOutput[1]);
+}
+
+IOReturn RDNA4ComputeClient::sRestore(OSObject *t, void *, IOExternalMethodArguments *) {
+	return self(t)->compute->rtRestore(t);
 }

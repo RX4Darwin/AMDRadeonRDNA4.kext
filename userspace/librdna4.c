@@ -30,8 +30,8 @@ void rdna4_close(rdna4_t *dev) {
 }
 
 kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out) {
-	uint64_t o[6] = { 0 };
-	uint32_t n = 6;
+	uint64_t o[9] = { 0 };
+	uint32_t n = 9;
 	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodInfo, NULL, 0, o, &n);
 	if (kr == KERN_SUCCESS) {
 		out->abi = o[0];
@@ -40,6 +40,9 @@ kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out) {
 		out->heapBytes = o[3];
 		out->heapFree = o[4];
 		out->heapBase = o[5];
+		out->vmid = o[6];
+		out->pipe = o[7];
+		out->queue = o[8];
 	}
 	return kr;
 }
@@ -150,6 +153,32 @@ kern_return_t rdna4_wait_vblank(rdna4_t *dev, uint32_t timeoutMs, uint64_t *coun
 			*timeNs = out[1];
 	}
 	return kr;
+}
+
+kern_return_t rdna4_present(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                            uint32_t *width, uint32_t *height, uint32_t *pitch) {
+	if (!buf || !width || !height || !pitch)
+		return kIOReturnBadArgument;
+	const uint64_t in[2] = { buf->handle, offset };
+	uint64_t out[2] = { 0, 0 };
+	uint32_t n = 2;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodPresent, in, 2, out, &n);
+	if (kr == KERN_SUCCESS) {
+		*width = (uint32_t)out[0] & 0xffffu;
+		*height = (uint32_t)(out[0] >> 16);
+		*pitch = (uint32_t)out[1];
+	}
+	return kr;
+}
+
+kern_return_t rdna4_display_query(rdna4_t *dev, uint32_t *width, uint32_t *height,
+                                  uint32_t *pitch) {
+	rdna4_buffer_t query = { 0, 0, 0 };
+	return rdna4_present(dev, &query, 0, width, height, pitch);
+}
+
+kern_return_t rdna4_restore(rdna4_t *dev) {
+	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodRestore, NULL, 0, NULL, NULL);
 }
 
 const char *rdna4_error(kern_return_t kr) {
