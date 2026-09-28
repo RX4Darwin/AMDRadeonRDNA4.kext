@@ -28,6 +28,7 @@
 #include "../src/pm4.hpp"
 #include "../src/codeobj.hpp"
 #include "../src/gpuheap.hpp"
+#include "../src/gpuvm.hpp"
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
@@ -1834,6 +1835,58 @@ static int testGpuHeap() {
 	return failures;
 }
 
+struct VmTestTable {
+	uint64_t base;
+	uint64_t entries[4096];
+};
+
+static bool readVmTestEntry(void *ctx, uint64_t address, uint64_t &entry) {
+	VmTestTable *t = static_cast<VmTestTable *>(ctx);
+	if (address < t->base || address >= t->base + sizeof(t->entries) || (address & 7))
+		return false;
+	entry = t->entries[(address - t->base) / 8];
+	return true;
+}
+
+static int testGpuVm() {
+	int failures = 0;
+	const uint64_t physical = 0x0000123400000000ull;
+	const uint64_t pte = GpuVm::encodePte(physical,
+		GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable,
+		true);
+	failures += check((pte & GpuVm::kPhysicalMask) == physical && (pte & GpuVm::kValid) &&
+	                  ((pte >> 7) & 0x1f) == GpuVm::kFragment64K,
+	                  "gfx12 PTE encodes physical address, valid/write and 64 KiB fragment");
+	const uint64_t pde2 = GpuVm::encodePde(0x0000000000400000ull, GpuVm::kValid | GpuVm::kSnooped, 2);
+	const uint64_t pde1 = GpuVm::encodePde(0x0000000000410000ull, GpuVm::kValid | GpuVm::kSnooped, 1);
+	const uint64_t pde0 = GpuVm::encodePde(0x0000000000420000ull, GpuVm::kValid | GpuVm::kSnooped, 0);
+	failures += check((pde2 & GpuVm::kPdePte) && (pde1 & GpuVm::kPdePte) && !(pde0 & GpuVm::kPdePte) &&
+	                  ((pde1 >> 58) & 0x1f) == 9,
+	                  "gfx12 PDE levels carry PDE_PTE and PDB1 block fragment bits");
+
+	VmTestTable table { 0x0000000000400000ull, {} };
+	/* One compact table image, laid out at 4 KiB boundaries. */
+	const uint64_t root = table.base;
+	const uint64_t pdb1 = root + 0x1000, pdb0 = root + 0x2000, ptb = root + 0x3000;
+	auto put = [&table](uint64_t address, uint64_t value) {
+		table.entries[(address - table.base) / 8] = value;
+	};
+	const uint64_t va = GpuVm::kVaStart + 0x12345000ull;
+	put(root + GpuVm::index(va, 0) * 8, GpuVm::encodePde(pdb1, GpuVm::kValid | GpuVm::kSnooped, 2));
+	put(pdb1 + GpuVm::index(va, 1) * 8, GpuVm::encodePde(pdb0, GpuVm::kValid | GpuVm::kSnooped, 1));
+	put(pdb0 + GpuVm::index(va, 2) * 8, GpuVm::encodePde(ptb, GpuVm::kValid | GpuVm::kSnooped, 0));
+	put(ptb + GpuVm::index(va, 3) * 8,
+	    GpuVm::encodePte(physical, GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable,
+	                      true));
+	uint64_t got = 0, flags = 0;
+	failures += check(GpuVm::walk(root, va + 0x345, readVmTestEntry, &table, got, flags) &&
+	                  got == physical + 0x345 && (flags & GpuVm::kWritable),
+	                  "gfx12 page-table walk returns the mapped physical address");
+	failures += check(!GpuVm::walk(root, 0x2000, readVmTestEntry, &table, got, flags),
+	                  "gfx12 page-table walk rejects an unmapped VA");
+	return failures;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
@@ -2028,6 +2081,7 @@ int main(int argc, char **argv) {
 	failures += testPm4Packets();
 	failures += testCodeObject();
 	failures += testGpuHeap();
+	failures += testGpuVm();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

@@ -69,6 +69,8 @@ static int cmdInfo(rdna4_t *gpu) {
 	printf("transfers: %s\n", (in.flags & RDNA4_FLAG_DMA)
 	       ? "DMA by the GPU's copy engine; buffers from VRAM past the BAR"
 	       : "the CPU through the BAR (no DMA)");
+	if (in.flags & RDNA4_FLAG_VM)
+		printf("GPUVM: VMID %llu, MEC1 pipe %llu queue %llu\n", in.vmid, in.pipe, in.queue);
 	return 0;
 }
 

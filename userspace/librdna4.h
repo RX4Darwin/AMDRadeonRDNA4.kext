@@ -36,6 +36,7 @@ typedef struct {
 typedef struct {
 	uint64_t abi, stage, flags;             /* flags: RDNA4_FLAG_* */
 	uint64_t heapBytes, heapFree, heapBase;
+	uint64_t vmid, pipe, queue;
 } rdna4_info_t;
 
 typedef struct {

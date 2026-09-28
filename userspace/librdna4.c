@@ -30,8 +30,8 @@ void rdna4_close(rdna4_t *dev) {
 }
 
 kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out) {
-	uint64_t o[6] = { 0 };
-	uint32_t n = 6;
+	uint64_t o[9] = { 0 };
+	uint32_t n = 9;
 	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodInfo, NULL, 0, o, &n);
 	if (kr == KERN_SUCCESS) {
 		out->abi = o[0];
@@ -40,6 +40,9 @@ kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out) {
 		out->heapBytes = o[3];
 		out->heapFree = o[4];
 		out->heapBase = o[5];
+		out->vmid = o[6];
+		out->pipe = o[7];
+		out->queue = o[8];
 	}
 	return kr;
 }

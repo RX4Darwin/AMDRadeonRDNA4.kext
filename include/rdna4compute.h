@@ -31,7 +31,7 @@
 #include <stdint.h>
 
 #define RDNA4_COMPUTE_SERVICE   "RDNA4ComputeService"
-#define RDNA4_COMPUTE_ABI       3u   /* 2: dynamic LDS; 3: DMA transfers, VRAM past the BAR */
+#define RDNA4_COMPUTE_ABI       4u   /* 4: per-client GPUVM and one MEC queue per client */
 
 /* Largest kernarg block a dispatch carries; bytes past what the caller
  * passes, up to the kernel's own kernarg size, are zero. */
@@ -43,7 +43,7 @@
 
 /* Selectors: scalar inputs -> scalar outputs, unless a struct is named. */
 enum {
-	/* -> abi, stage, flags (RDNA4_FLAG_*), heap bytes, heap free, heap GPU base */
+	/* -> abi, stage, flags, heap bytes, heap free, heap GPU/VA base, VMID, pipe, queue */
 	kRDNA4MethodInfo = 0,
 	/* bytes -> handle, GPU address (4 KiB aligned) */
 	kRDNA4MethodAlloc,
@@ -67,6 +67,7 @@ enum {
 #define RDNA4_FLAG_READY   (1u << 0)   /* bring-up reached a dispatching stage */
 #define RDNA4_FLAG_WEDGED  (1u << 1)   /* a dispatch timed out: no more work */
 #define RDNA4_FLAG_DMA     (1u << 2)   /* Write/Read by SDMA; buffers from all of VRAM */
+#define RDNA4_FLAG_VM      (1u << 3)   /* this client has a private GPU VM and queue */
 
 typedef struct {
 	uint32_t program;
