@@ -3751,10 +3751,10 @@ static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count)
     stages = reg_get(s, REG_GFX_VGT_SHADER_STAGES_EN);
     if (!(stages & (1u << 22)) || (stages & ((1u << 2) | (1u << 5))))
         return rdna4_gfx_draw_refuse(s, "VGT_SHADER_STAGES_EN", "requires GS_W32_EN and no HS/GS");
-    if (!reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_ES) ||
+    if (!reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_ES) &&
         !reg_get(s, REG_GFX_SPI_SHADER_PGM_HI_ES))
         return rdna4_gfx_draw_refuse(s, "SPI_SHADER_PGM_ES", "NGG address is zero");
-    if (!reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_PS) ||
+    if (!reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_PS) &&
         !reg_get(s, REG_GFX_SPI_SHADER_PGM_HI_PS))
         return rdna4_gfx_draw_refuse(s, "SPI_SHADER_PGM_PS", "PS address is zero");
     if ((reg_get(s, REG_GFX_SPI_SHADER_POS_FORMAT) & 0xf) != 4)
