@@ -1168,7 +1168,7 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
         return rdna4_gc_span(s, va, len);
     uint32_t n = vmid - 1;
     uint32_t cntl = reg_get(s, REG_GCVM_CTX1_CNTL + n * 4);
-    uint64_t base, start, end, table, entry = 0, failedTable = 0;
+    uint64_t base = 0, start, end, table, entry = 0, failedTable = 0;
     uint32_t failedLevel = 0;
     if (!(cntl & 1) || ((cntl >> 1) & 3) != 3 || va >= (1ull << 48))
         goto fault;
@@ -2302,6 +2302,9 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
         }
         uint32_t hdr = dw[0], op = (hdr >> 8) & 0xff, count = (hdr >> 16) & 0x3fff;
         uint32_t len = count + 2;
+        if (vmid == 8)
+            fprintf(stderr, "rdna4: vm: VMID8 PM4 rptr %u hdr 0x%08x dw1 0x%08x count %u\n",
+                    rptr, hdr, dw[1], count);
         if ((hdr >> 30) != 3) {
             fprintf(stderr, "rdna4: mec: not a type-3 packet 0x%08x at %u\n", hdr, rptr);
             return;
