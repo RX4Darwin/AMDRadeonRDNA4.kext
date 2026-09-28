@@ -1710,10 +1710,18 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	q.emit(pkt, Pm4::dispatchDirect(pkt, l.groups[0], l.groups[1], l.groups[2],
 	                                Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 |
 	                                (l.wave32 ? Pm4::kDispatchWave32 : 0)));
-	q.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), ++pm4Fence));
+	q.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), ++pm4Fence,
+	                            l.useInterrupt && ihActive));
 
 	// Spin for the first 2 ms (short kernels), then sleep between polls:
 	// user dispatches may run for seconds.
+	if (l.useInterrupt && ihActive) {
+		pm4Kick(q.wptr());
+		return ihWaitFence(poolDw(kPm4FenceOffset), pm4Fence,
+		                   (l.timeoutUs ? l.timeoutUs : 1000000) / 1000,
+		                   true, tag, ns);
+	}
+
 	uint64_t t0 = mach_absolute_time(), span = 0;
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(l.timeoutUs ? l.timeoutUs : 1000000) * 1000,
 	                            &span);

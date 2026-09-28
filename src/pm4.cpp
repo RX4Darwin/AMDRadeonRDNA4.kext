@@ -27,11 +27,11 @@ uint32_t writeData(uint32_t *out, uint64_t addr, uint32_t value) {
 
 // gfx_v12_0_ring_emit_fence: end-of-pipe event with GL2 write-back, then
 // the sequence number to `addr`, no interrupt.
-uint32_t releaseMem(uint32_t *out, uint64_t addr, uint32_t seq) {
+uint32_t releaseMem(uint32_t *out, uint64_t addr, uint32_t seq, bool interrupt) {
 	out[0] = header(OpReleaseMem, 6);
 	out[1] = kReleaseGcrSeq | kReleaseGcrGl2Wb | kReleaseCachePolicy3 | kEventCacheFlushTs |
 	         kReleaseEventIndex5;
-	out[2] = kReleaseData32;
+	out[2] = kReleaseData32 | (interrupt ? kReleaseIntSel2 : 0);
 	out[3] = static_cast<uint32_t>(addr) & ~3u;
 	out[4] = static_cast<uint32_t>(addr >> 32);
 	out[5] = seq;
