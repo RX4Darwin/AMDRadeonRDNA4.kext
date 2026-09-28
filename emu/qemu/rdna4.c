@@ -2031,7 +2031,7 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
              * the rendezvous), s_code_end, s_sendmsg, s_wait_*: nothing to
              * do for one in-order work-item. */
             if (op != 0 && op != 5 && op != 7 && op != 20 && op != 0x1f && op != 0x36 &&
-                (op < 33 || op > 36) && (op < 0x40 || op > 0x49)) {
+                (op < 33 || op > 38) && (op < 0x40 || op > 0x49)) {
                 goto unknown;
             }
         } else if ((dw >> 23) == 0x17d) {                   /* SOP1 */
