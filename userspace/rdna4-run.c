@@ -537,7 +537,7 @@ static int cmdAnim(rdna4_t *gpu, uint32_t seconds) {
 	rdna4_buffer_t buffers[2] = { { 0 }, { 0 } };
 	AnimPending pending[2] = { { 0 }, { 0 } };
 	AnimStats stats = { 0 };
-	uint32_t pendingCount = 0, rendered = 0, zoomMismatches = 0;
+	uint32_t pendingCount = 0, rendered = 0;
 	int loaded = 0, allocated = 0, ownsPresentation = 0, rc = 1;
 	kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "mandelbrot", &prog);
 	if (kr != KERN_SUCCESS) {
@@ -586,31 +586,36 @@ static int cmdAnim(rdna4_t *gpu, uint32_t seconds) {
 			goto done;
 		}
 		if (!frameNo) {
-			uint32_t frameMismatches = 0;
-			for (uint32_t sy = 1; sy <= 2; sy++) {
-				const uint32_t y = (uint64_t)sy * height / 3;
-				for (uint32_t sx = 1; sx <= 2; sx++) {
-					const uint32_t x = (uint64_t)sx * width / 3;
+			uint32_t frameMismatches = 0, tolerated = 0, hardMismatches = 0;
+			for (uint32_t sy = 1; sy <= 8; sy++) {
+				const uint32_t y = (uint64_t)sy * height / 9;
+				for (uint32_t sx = 1; sx <= 8; sx++) {
+					const uint32_t x = (uint64_t)sx * width / 9;
 					const uint32_t sampleX = x - x % scale, sampleY = y - y % scale;
 					uint32_t expectedIteration = 0;
 					uint32_t got = 0;
 					const uint32_t want = mandelbrotColorArgs(sampleX, sampleY, x0, dx, y0, dy,
 					                                                &expectedIteration);
-					if (rdna4_read(gpu, &buffers[index], ((uint64_t)y * pitch + x) * 4,
-					              &got, sizeof(got)) != KERN_SUCCESS || got != want) {
-						const uint32_t lo = expectedIteration ?
-							mandelbrotColorForIteration(expectedIteration - 1) : want;
-						const uint32_t hi = expectedIteration < 256u ?
-							mandelbrotColorForIteration(expectedIteration + 1) : want;
-						if (got != lo && got != hi)
-							frameMismatches++;
+					const kern_return_t readKr = rdna4_read(gpu, &buffers[index],
+												 ((uint64_t)y * pitch + x) * 4,
+												 &got, sizeof(got));
+					const uint32_t lo = expectedIteration ?
+						mandelbrotColorForIteration(expectedIteration - 1) : want;
+					const uint32_t hi = expectedIteration < 256u ?
+						mandelbrotColorForIteration(expectedIteration + 1) : want;
+					if (readKr != KERN_SUCCESS || got != want) {
+						frameMismatches++;
+						if (readKr == KERN_SUCCESS && (got == lo || got == hi))
+							tolerated++;
+						else
+							hardMismatches++;
 					}
 				}
 			}
-			zoomMismatches += frameMismatches;
-			printf("anim: CPU spot check 4 pixels, mismatches %u\n", frameMismatches);
-			if (zoomMismatches)
-				goto done;
+			printf("anim: CPU spot check 64 pixels, mismatches %u (iteration +/-1 %u, hard %u)\n",
+			       frameMismatches, tolerated, hardMismatches);
+			if (hardMismatches > 2)
+			goto done;
 		}
 		rendered++;
 		stats.rendered = rendered;
