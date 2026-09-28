@@ -1168,7 +1168,8 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
         return rdna4_gc_span(s, va, len);
     uint32_t n = vmid - 1;
     uint32_t cntl = reg_get(s, REG_GCVM_CTX1_CNTL + n * 4);
-    uint64_t base, start, end, table, entry;
+    uint64_t base, start, end, table, entry = 0, failedTable = 0;
+    uint32_t failedLevel = 0;
     if (!(cntl & 1) || ((cntl >> 1) & 3) != 3 || va >= (1ull << 48))
         goto fault;
     start = reg_get(s, REG_GCVM_CTX1_START_LO + n * 8) |
@@ -1183,6 +1184,8 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
     for (uint32_t level = 0; level < 4; level++) {
         uint32_t shift = 12 + (3 - level) * 9;
         uint32_t idx = (va >> shift) & 0x1ff;
+        failedTable = table;
+        failedLevel = level;
         if (!rdna4_vm_entry(s, table + (uint64_t)idx * 8, &entry) ||
             !(entry & RDNA4_VM_VALID))
             goto fault;
@@ -1199,6 +1202,10 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
         table = entry & RDNA4_VM_PHYS_MASK;
     }
 fault:
+    if (vmid == 8)
+        fprintf(stderr, "rdna4: vm: VMID8 VA 0x%" PRIx64 " walk failed level %u table 0x%" PRIx64
+                " entry 0x%" PRIx64 " base 0x%" PRIx64 "\n",
+                va, failedLevel, failedTable, entry, base);
     rdna4_vm_fault(s, vmid, va);
     /* Retry is off: serve the configured dummy page so the queue can drain. */
     uint64_t dummy = ((uint64_t)reg_get(s, REG_GCVM_FAULT_DEFAULT_LO) |
