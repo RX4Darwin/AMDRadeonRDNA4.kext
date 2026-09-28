@@ -2048,8 +2048,13 @@ static bool rdna4_sdma_process_slice(RDNA4State *s, uint64_t deadline)
                 }
             }
             s->sdma_work.copy_done += chunk;
-            if (s->sdma_work.copy_done != s->sdma_work.copy_bytes)
-                goto next_slice;
+            if (s->sdma_work.copy_done != s->sdma_work.copy_bytes) {
+                /* Keep each DMA operation <= 1 MiB, but use the remainder of
+                 * this bounded callback for the next chunk. */
+                if (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) >= deadline)
+                    goto next_slice;
+                continue;
+            }
             s->sdma_work.packet_active = false;
         }
         s->sdma_work.rptr = (s->sdma_work.rptr + 4 * s->sdma_work.packet_len) &
