@@ -3626,13 +3626,21 @@ static bool rdna4_mec_mqd_ok(RDNA4State *s, uint32_t pipe, uint32_t queue)
     return false;
 }
 
-/* RELEASE_MEM's end-of-pipe event goes through the queue's EOP buffer. */
+/* RELEASE_MEM's end-of-pipe event goes through the running queue's EOP
+ * buffer. Its registers are read from that queue's bank, not through
+ * GRBM_GFX_CNTL, which the driver may have moved since the queue started. */
 static void rdna4_mec_eop_access(RDNA4State *s, uint32_t vmid)
 {
-    uint64_t eop = ((uint64_t)reg_get(s, REG_CP_HQD_EOP_BASE) << 8) |
-                   ((uint64_t)reg_get(s, REG_CP_HQD_EOP_BASE_HI) << 40);
+    uint32_t lo, hi;
 
-    if (vmid && !rdna4_mec_queue_mem_ok(s, eop, vmid))
+    if (!vmid || !rdna4_hqd_reg(REG_CP_HQD_EOP_BASE, &lo) ||
+        !rdna4_hqd_reg(REG_CP_HQD_EOP_BASE_HI, &hi) ||
+        s->mec_work.pipe >= 4 || s->mec_work.queue >= 8)
+        return;
+    uint64_t eop = ((uint64_t)s->hqd[s->mec_work.pipe][s->mec_work.queue].q[lo] << 8) |
+                   ((uint64_t)s->hqd[s->mec_work.pipe][s->mec_work.queue].q[hi] << 40);
+
+    if (!rdna4_mec_queue_mem_ok(s, eop, vmid))
         fprintf(stderr, "rdna4: mec: EOP buffer 0x%" PRIx64 " faulted in VMID %u\n",
                 eop, vmid);
 }
