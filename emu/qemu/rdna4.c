@@ -2344,9 +2344,6 @@ struct RDNA4Dispatch {
     bool     mandelbrot;
     uint64_t out_mc;
     uint32_t width, height, pitch;
-    bool     copy_model;
-    uint64_t copy_src, copy_dst, copy_bytes, copy_done;
-    uint8_t  *copy_tmp;
     uint32_t user[16];
     RDNA4Lane *lanes;
     RDNA4Lds lds;
@@ -2923,37 +2920,9 @@ static void rdna4_dispatch_free(RDNA4Dispatch *d)
 {
     if (!d)
         return;
-    g_free(d->copy_tmp);
     g_free(d->lds.mem);
     g_free(d->lanes);
     g_free(d);
-}
-
-/*
- * The benchmark's copy kernel is a fixed-shape, four-dword load/store.  Keep
- * it resumable at work-group granularity: this is the same memory operation
- * the shader performs, but avoids spending seconds interpreting 256 identical
- * work-items while retaining VM faults and the queue's completion ordering.
- */
-static bool rdna4_copy_prepare(RDNA4State *s, uint64_t pgm, uint32_t tx,
-                               uint32_t ty, uint32_t tz, uint32_t nuser,
-                               uint32_t vmid, uint64_t *src, uint64_t *dst)
-{
-    uint8_t *code = rdna4_gc_span_vmid(s, pgm, 16, vmid, false, true);
-    uint8_t args[16];
-    uint64_t kernarg;
-
-    if (tx != 256 || ty != 1 || tz != 1 || nuser != 2 || !code ||
-        ldl_le_p(code) != 0xf4004000 || ldl_le_p(code + 4) != 0xf8000000 ||
-        ldl_le_p(code + 8) != 0x7e020280 || ldl_le_p(code + 12) != 0xd6560000)
-        return false;
-    kernarg = (uint64_t)reg_get(s, REG_CS_USER_DATA_0) |
-              ((uint64_t)reg_get(s, REG_CS_USER_DATA_0 + 4) << 32);
-    if (!rdna4_vm_access(s, kernarg, args, sizeof(args), vmid, false, false))
-        return false;
-    *src = ldq_le_p(args);
-    *dst = ldq_le_p(args + 8);
-    return *src && *dst;
 }
 
 static bool rdna4_dispatch_begin(RDNA4State *s, RDNA4Dispatch *d,
@@ -2991,11 +2960,6 @@ static bool rdna4_dispatch_begin(RDNA4State *s, RDNA4Dispatch *d,
     if (rdna4_mandelbrot_prepare(s, d->pgm, d->tx, d->ty, d->tz, d->nuser,
                                  &d->out_mc, &d->width, &d->height, &d->pitch)) {
         d->mandelbrot = true;
-    } else if (rdna4_copy_prepare(s, d->pgm, d->tx, d->ty, d->tz, d->nuser,
-                                  d->vmid, &d->copy_src, &d->copy_dst)) {
-        d->copy_model = true;
-        d->copy_bytes = d->groups_total * (uint64_t)d->items * 16;
-        d->copy_tmp = g_malloc(d->items * 16);
     } else {
         d->lanes = g_new(RDNA4Lane, d->items);
         d->lds.mem = g_malloc0(d->lds.size ? d->lds.size : 4);
@@ -3012,18 +2976,6 @@ static int rdna4_dispatch_group(RDNA4State *s, RDNA4Dispatch *d)
     if (d->mandelbrot) {
         if (!rdna4_mandelbrot_group(s, d))
             return 0;
-        d->ran += d->items;
-        return 1;
-    }
-    if (d->copy_model) {
-        const uint64_t bytes = d->items * 16;
-
-        if (!rdna4_vm_access(s, d->copy_src + d->copy_done, d->copy_tmp, bytes,
-                             d->vmid, false, false) ||
-            !rdna4_vm_access(s, d->copy_dst + d->copy_done, d->copy_tmp, bytes,
-                             d->vmid, true, false))
-            return -1;
-        d->copy_done += bytes;
         d->ran += d->items;
         return 1;
     }
