@@ -668,6 +668,7 @@ static bool rdna4_otg_position(RDNA4State *s, int otg, uint64_t *frame,
 
 static bool rdna4_update_locked(RDNA4State *s, int otg);
 static void rdna4_latch_flips(RDNA4State *s, int otg, uint64_t frame);
+static void rdna4_gfx_update(void *opaque);
 
 static uint32_t rdna4_otg_read(RDNA4State *s, int otg, uint32_t dw)
 {
@@ -784,6 +785,10 @@ static void rdna4_latch_flips(RDNA4State *s, int otg, uint64_t frame)
             reg_set(s, addr, status | DCN_FLIP_OCCURRED | DCN_FLIP_STATUS);
             rdna4_ih_emit(s, DCN_CLIENT, DCN_SRC_PFLIP + hubp, 0, 0);
         }
+        /* The surface address becomes visible at this vblank.  Refresh the
+         * QEMU display after the latch so a screendump observes the new
+         * scanout rather than the pre-flip desktop surface. */
+        rdna4_gfx_update(s);
     }
 }
 

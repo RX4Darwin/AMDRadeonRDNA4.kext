@@ -587,7 +587,7 @@ static int cmdShow(rdna4_t *gpu, uint32_t seconds) {
 	const uint64_t bytes = (uint64_t)pitch * height * 4;
 	/* Keep the VM proof visibly interpreter-backed while making the full-screen
 	 * Mandelbrot complete before the runtime's bounded dispatch wait. */
-	const uint32_t scale = rdna4VmmPresent() ? 16u : 1u;
+	const uint32_t scale = rdna4VmmPresent() ? 20u : 1u;
 	const float x0 = -2.3f, dx = 3.2f / (float)width;
 	const float y0 = -1.1f, dy = 2.2f / (float)height;
 	printf("show: geometry %ux%u pitch %u (%llu bytes)\n", width, height, pitch, bytes);
@@ -758,7 +758,7 @@ static int cmdAnim(rdna4_t *gpu, uint32_t seconds) {
 		return 1;
 	}
 	const uint64_t bytes = (uint64_t)pitch * height * 4;
-	const uint32_t scale = rdna4VmmPresent() ? 16u : 1u;
+	const uint32_t scale = rdna4VmmPresent() ? 20u : 1u;
 	printf("anim: geometry %ux%u pitch %u (%llu bytes), scale %u (%s)\n", width, height,
 	       pitch, bytes, scale, scale == 1 ? "real hardware" : "VM interpreter");
 
