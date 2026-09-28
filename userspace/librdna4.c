@@ -137,6 +137,21 @@ kern_return_t rdna4_dispatch_lds(rdna4_t *dev, const rdna4_program_t *prog,
 	return kr;
 }
 
+kern_return_t rdna4_wait_vblank(rdna4_t *dev, uint32_t timeoutMs, uint64_t *count,
+                                uint64_t *timeNs) {
+	uint64_t in = timeoutMs, out[2] = { 0, 0 };
+	uint32_t n = 2;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodWaitVBlank, &in, 1,
+	                                             out, &n);
+	if (kr == KERN_SUCCESS) {
+		if (count)
+			*count = out[0];
+		if (timeNs)
+			*timeNs = out[1];
+	}
+	return kr;
+}
+
 const char *rdna4_error(kern_return_t kr) {
 	return mach_error_string(kr);
 }

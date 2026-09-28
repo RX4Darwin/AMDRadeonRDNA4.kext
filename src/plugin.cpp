@@ -275,7 +275,7 @@ void attach(FbEntry &e) {
 	// when asked for: it must never be the reason the desktop is missing.
 	if (computeStage && dev.isAmd) {
 		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
-		                        dev.fbPhysBase, dev.fbLength };
+		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs() };
 		st->compute.start(env, computeStage);
 	}
 }

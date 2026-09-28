@@ -78,6 +78,9 @@ kern_return_t rdna4_dispatch_lds(rdna4_t *dev, const rdna4_program_t *prog,
                                  const void *kernargs, uint32_t kernargBytes,
                                  uint32_t dynamicLdsBytes, uint32_t timeoutMs, uint64_t *micros);
 
+kern_return_t rdna4_wait_vblank(rdna4_t *dev, uint32_t timeoutMs, uint64_t *count,
+                                uint64_t *timeNs);
+
 const char *rdna4_error(kern_return_t kr);
 
 #endif /* LibRDNA4_h */

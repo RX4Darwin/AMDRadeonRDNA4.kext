@@ -83,6 +83,7 @@ public:
 	volatile uint32_t *mmioBase() const { return rmmio; }
 	size_t mmioSize() const { return rmmioSize; }
 	const IpDiscovery *discovery() const { return ipDiscovery.isValid() ? &ipDiscovery : nullptr; }
+	uint64_t liveFramePeriodNs() const;
 
 private:
 	IOPCIDevice *pciDevice { nullptr };

@@ -61,6 +61,8 @@ enum {
 	kRDNA4MethodUnload,
 	/* struct in: RDNA4Dispatch -> microseconds from doorbell to fence */
 	kRDNA4MethodDispatch,
+	/* timeout milliseconds -> vblank count, timestamp in nanoseconds */
+	kRDNA4MethodWaitVBlank,
 	kRDNA4MethodCount
 };
 

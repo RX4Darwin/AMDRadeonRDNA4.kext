@@ -72,6 +72,37 @@ static int cmdInfo(rdna4_t *gpu) {
 	return 0;
 }
 
+static int cmdVsync(rdna4_t *gpu, uint32_t frames) {
+	uint64_t previous = 0, minNs = UINT64_MAX, maxNs = 0, sumNs = 0;
+	uint32_t intervals = 0;
+	for (uint32_t i = 0; i < frames; i++) {
+		uint64_t count = 0, timeNs = 0;
+		kern_return_t kr = rdna4_wait_vblank(gpu, 1000, &count, &timeNs);
+		if (kr != KERN_SUCCESS) {
+			fprintf(stderr, "vsync: vblank %u/%u: %s\n", i + 1, frames, rdna4_error(kr));
+			return 1;
+		}
+		if (previous) {
+			uint64_t interval = timeNs - previous;
+			if (interval < minNs)
+				minNs = interval;
+			if (interval > maxNs)
+				maxNs = interval;
+			sumNs += interval;
+			intervals++;
+		}
+		previous = timeNs;
+	}
+	if (!intervals) {
+		printf("vsync: %u vblank, no interval\n", frames);
+		return 0;
+	}
+	const double average = (double)sumNs / intervals;
+	printf("vsync: %u vblanks, refresh %.3f Hz, interval %.0f ns (jitter %llu..%llu ns)\n",
+	       frames, 1.0e9 / average, average, minNs, maxNs);
+	return 0;
+}
+
 static int hasDma(rdna4_t *gpu, uint64_t *heapFree) {
 	rdna4_info_t in;
 	if (rdna4_info(gpu, &in) != KERN_SUCCESS)
@@ -849,6 +880,7 @@ static void usage(void) {
 	fprintf(stderr, "usage: rdna4-run info\n"
 	                "       rdna4-run selftest [items]\n"
 	                "       rdna4-run bench [small]\n"
+	                "       rdna4-run vsync [n]\n"
 	                "       rdna4-run load <file.hsaco> <kernel>\n");
 }
 
@@ -871,6 +903,15 @@ int main(int argc, char **argv) {
 		if (!openRuntime(&gpu))
 			return 1;
 		rc = cmdBench(&gpu, argc == 3 && !strcmp(argv[2], "small"));
+	} else if (!strcmp(argv[1], "vsync") && argc <= 3) {
+		uint32_t frames = argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 120;
+		if (!frames || frames > 100000) {
+			fprintf(stderr, "vsync: n must be 1..100000\n");
+			return 2;
+		}
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdVsync(&gpu, frames);
 	} else if (!strcmp(argv[1], "load") && argc == 4) {
 		if (!openRuntime(&gpu))
 			return 1;

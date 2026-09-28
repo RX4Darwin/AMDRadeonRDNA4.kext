@@ -53,6 +53,7 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sLoad,       2,          kIOUCVariableStructureSize, 8,           0 },
 	{ sUnload,     1,          0,                          0,           0 },
 	{ sDispatch,   0,          sizeof(RDNA4Dispatch),      1,           0 },
+	{ sWaitVBlank, 1,          0,                          2,           0 },
 };
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -109,4 +110,14 @@ IOReturn RDNA4ComputeClient::sDispatch(OSObject *t, void *, IOExternalMethodArgu
 		return kIOReturnBadArgument;
 	return self(t)->compute->rtDispatch(t, *static_cast<const RDNA4Dispatch *>(a->structureInput),
 	                                    a->scalarOutput[0]);
+}
+
+IOReturn RDNA4ComputeClient::sWaitVBlank(OSObject *t, void *, IOExternalMethodArguments *a) {
+	uint64_t count = 0, timeNs = 0;
+	if (!self(t)->compute->ihWaitVblank(Pipe::kNone, static_cast<uint32_t>(a->scalarInput[0]), count,
+	                                    timeNs))
+		return kIOReturnTimeout;
+	a->scalarOutput[0] = count;
+	a->scalarOutput[1] = timeNs;
+	return kIOReturnSuccess;
 }
