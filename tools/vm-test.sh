@@ -40,6 +40,9 @@ tools/build-osxcross.sh 2>&1 | grep -E 'error:|warning: [^o]|Built' || true
 # last; make sure this checkout's is what gets compiled, whatever the mtimes.
 touch emu/qemu/rdna4.c
 tools/emu-build.sh qemu 2>&1 | grep -E 'error|warning|built' | head -20
+# A failed build must not boot the previous binary.
+QEMU_BIN=${QEMU_SRC:-$HOME/qemu-10.0.13}/build/qemu-system-x86_64
+[ "$QEMU_BIN" -nt emu/qemu/rdna4.c ] || { echo "vm-test: the emulator did not build (see the errors above)"; exit 1; }
 # The option ROM (GOP driver + VBIOS image, build-emu/, not in git) is the
 # same for every checkout: a worktree without one takes the main checkout's.
 if [ ! -f build-emu/rdna4.rom ]; then
