@@ -1664,7 +1664,12 @@ static int testIhRing() {
 	failures += check(Ih::advance(size - 16, 32, size) == 16 && Ih::hasEntries(size - 32, 0, size) &&
 	                  Ih::overflowRecovery(size - 32, size) == 0,
 	                  "ih: ring wrap/overflow arithmetic");
-	printf("\nih: v7 decode and ring wrap/overflow arithmetic %s\n",
+	failures += check(!Ih::missEligible(false, true, false, true) &&
+	                  !Ih::missEligible(true, true, false, false) &&
+	                  !Ih::missEligible(true, true, true, true) &&
+	                  Ih::missEligible(true, true, false, true),
+	                  "ih: miss qualification requires sleep, completion, and a 5 ms recheck");
+	printf("\nih: v7 decode, ring wrap/overflow arithmetic, and wait-miss qualification %s\n",
 	       failures ? "FAILED" : "ok");
 	return failures;
 }

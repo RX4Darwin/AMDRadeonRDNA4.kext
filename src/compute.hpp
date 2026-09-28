@@ -333,7 +333,8 @@ private:
 	void ihDcnObserveVblank(uint64_t now);
 	void ihDecodeEntry(const uint32_t *dw);
 	void ihUnknown(uint8_t client, uint8_t source, uint8_t ring);
-	void ihRecordWait(bool dispatch, bool woke, bool completed, uint32_t eventsBefore);
+	void ihRecordWait(bool dispatch, bool slept, bool completed,
+	                  bool recheckElapsed, uint32_t eventsBefore);
 	bool ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_t timeoutMs,
 	                bool dispatch, const char *tag, uint64_t &ns);
 

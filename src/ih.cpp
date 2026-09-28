@@ -637,16 +637,18 @@ void RDNA4Compute::ihAction() {
 	IOLockUnlock(ihLock);
 }
 
-void RDNA4Compute::ihRecordWait(bool dispatch, bool woke, bool completed, uint32_t eventsBefore) {
+void RDNA4Compute::ihRecordWait(bool dispatch, bool slept, bool completed,
+                                bool recheckElapsed, uint32_t eventsBefore) {
 	const uint32_t events = dispatch ? ihEopCount : ihSdmaTrapCount;
 	uint32_t &misses = dispatch ? ihDispatchMisses : ihSdmaMisses;
 	bool &polling = dispatch ? ihDispatchPolling : ihSdmaPolling;
-	if (events != eventsBefore) {
+	const bool sourceAdvanced = events != eventsBefore;
+	if (sourceAdvanced) {
 		misses = 0;
 		if (completed)
 			HLOG("%s wait woken by interrupt (IH source count %u)", dispatch ? "dispatch" : "SDMA",
 			     events);
-	} else if (completed && !woke) {
+	} else if (Ih::missEligible(slept, completed, sourceAdvanced, recheckElapsed)) {
 		misses++;
 		if (misses >= 3 && !polling) {
 			polling = true;
@@ -666,7 +668,6 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 	uint32_t &observed = dispatch ? ihDispatchObserved : ihSdmaObserved;
 	const uint32_t eventsBefore = dispatch ? ihEopCount : ihSdmaTrapCount;
 	bool done = false;
-	bool recorded = false;
 	if (!useIh) {
 		for (uint32_t polls = 0;; polls++) {
 			done = *fence == value;
@@ -681,31 +682,43 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 		// This lock is intentionally separate from rtLock: bring-up and later
 		// queue owners may call this path without holding the runtime lock.
 		IOLockLock(ihLock);
+		bool slept = false;
 		for (;;) {
 			done = *fence == value;
 			if (done || mach_absolute_time() > deadline)
 				break;
 			uint64_t sleepSpan = 0;
 			nanoseconds_to_absolutetime(2000000, &sleepSpan);
-			const wait_result_t wr = IOLockSleepDeadline(ihLock, ihWaitEvent,
-		                                                mach_absolute_time() + sleepSpan,
-		                                                THREAD_UNINT);
-			const bool woke = wr != THREAD_TIMED_OUT;
+			IOLockSleepDeadline(ihLock, ihWaitEvent, mach_absolute_time() + sleepSpan,
+			                    THREAD_UNINT);
+			slept = true;
 			done = *fence == value;
-			ihRecordWait(dispatch, woke, done, eventsBefore);
-			recorded = true;
-			if (done || mach_absolute_time() > deadline)
+			if (!done)
+				continue;
+
+			// A fence may become visible before the IH work-loop drains its
+			// vector.  Check the source once, then perform the required 5 ms
+			// recheck without holding ihLock so the action can drain it.
+			const uint32_t eventsNow = dispatch ? ihEopCount : ihSdmaTrapCount;
+			if (eventsNow != eventsBefore) {
+				ihRecordWait(dispatch, slept, true, false, eventsBefore);
 				break;
+			}
+			uint64_t recheckSpan = 0;
+			nanoseconds_to_absolutetime(5000000, &recheckSpan);
+			const uint64_t recheckStart = mach_absolute_time();
+			if (recheckStart + recheckSpan > deadline)
+				break;
+			IOLockUnlock(ihLock);
+			IOSleep(5);
+			IOLockLock(ihLock);
+			ihRecordWait(dispatch, slept, true, true, eventsBefore);
+			break;
 		}
 		IOLockUnlock(ihLock);
 	}
-	if (useIh && done && !recorded) {
-		const uint32_t events = dispatch ? ihEopCount : ihSdmaTrapCount;
-		const bool source = events != observed;
-		ihRecordWait(dispatch, source, true, source ? observed : eventsBefore);
-	}
 	if (!useIh && done)
-		ihRecordWait(dispatch, false, true, eventsBefore);
+		ihRecordWait(dispatch, false, true, false, eventsBefore);
 	observed = dispatch ? ihEopCount : ihSdmaTrapCount;
 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	if (!done && tag)
