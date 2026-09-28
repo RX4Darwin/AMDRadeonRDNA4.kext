@@ -524,11 +524,13 @@ void RDNA4Compute::runStages() {
 		done = StageKernel;
 	}
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
+	if (done >= StageDispatch)
+		publishRuntime(done);
+	// IH self-test breadcrumbs are part of bring-up. Keep the normal ending
+	// marker last so a successful boot is never mistaken for a hang next time.
 	snprintf(note, sizeof(note), "finished at stage %u", done);
 	trail(note);
 	CLOG("bring-up finished at stage %u", done);
-	if (done >= StageDispatch)
-		publishRuntime(done);
 }
 
 // The pool, uncached: the PSP reads what we write there and writes fences
@@ -1716,10 +1718,6 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	// Spin for the first 2 ms (short kernels), then sleep between polls:
 	// user dispatches may run for seconds.
 	if (l.useInterrupt && ihActive) {
-		if (!ihDispatchKicked) {
-			ihDispatchKicked = true;
-			trail("ih: first CP kick");
-		}
 		pm4Kick(q.wptr());
 		return ihWaitFence(poolDw(kPm4FenceOffset), pm4Fence,
 		                   (l.timeoutUs ? l.timeoutUs : 1000000) / 1000,

@@ -385,10 +385,6 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 	if (!sdmaRing.emit(pkt, dwords) || !sdmaRing.emit(fence, Sdma::kFenceDwords) ||
 	    !sdmaRing.emit(trap, Sdma::kTrapDwords))
 		return false;
-	if (ihActive && !ihSdmaKicked) {
-		ihSdmaKicked = true;
-		trail("ih: first SDMA kick");
-	}
 	sdmaKick(sdmaRing.wptr());
 	if (ihActive) {
 		uint64_t ns = 0;

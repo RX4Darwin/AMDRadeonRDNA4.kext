@@ -307,9 +307,6 @@ private:
 	uint32_t ihFaultCount { 0 };
 	uint32_t ihUnknownCount { 0 };
 	uint8_t ihUnknownSeen[256][32] {};
-	bool ihSdmaKicked { false };
-	bool ihDispatchKicked { false };
-	bool ihDrained { false };
 
 	bool ihInit();
 	void ihStop();

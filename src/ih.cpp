@@ -242,6 +242,57 @@ bool RDNA4Compute::ihInit() {
 	ihSource->enable();
 	HLOG("ring up: bus 0x%llx, size %u KiB, wptr bus 0x%llx; MSI index %d registered; "
 	     "CP EOP and SDMA trap enabled", ihRingBus, kIhRingBytes >> 10, ihWptrBus, msiIndex);
+
+	// Exercise both interrupt sources before runStages writes its final
+	// "finished" trail. A source can remain active while its waits fall back
+	// to polling if the platform registers MSI but does not deliver this class
+	// of vector reliably.
+	trail("ih: self-test");
+	const uint32_t sdmaBefore = ihSdmaTrapCount;
+	uint32_t sdmaPacket[8];
+	const bool sdmaFence = sdmaRun(sdmaPacket,
+	                               Sdma::writeDword(sdmaPacket, poolMc(kSdmaTestOffset),
+	                                                0x1a5a5a5u),
+	                               2000);
+	for (uint32_t ms = 0; ms < 20 && ihSdmaTrapCount == sdmaBefore; ms++)
+		IOSleep(1);
+	if (!sdmaFence || ihSdmaTrapCount == sdmaBefore) {
+		ihSdmaPolling = true;
+		HLOG("self-test: SDMA fence/trap %s; SDMA waits will use polling",
+		     sdmaFence ? "did not deliver an IH source" : "failed");
+	} else {
+		HLOG("self-test: SDMA fence/trap delivered (source count %u)", ihSdmaTrapCount);
+	}
+
+	// stageCompute has already established the MEC queue by the time runtime
+	// publication reaches this point, so prove the CP EOP source with the
+	// smallest fenced packet as well.
+	const uint32_t eopBefore = ihEopCount;
+	const uint32_t eopFence = ++pm4Fence;
+	*poolDw(kPm4FenceOffset) = 0;
+	flushHdp();
+	uint32_t eopPacket[8];
+	const bool eopQueued = pm4Queue.emit(eopPacket,
+	                                      Pm4::releaseMem(eopPacket, poolMc(kPm4FenceOffset),
+	                                                       eopFence, true));
+	if (eopQueued) {
+		pm4Kick(pm4Queue.wptr());
+		uint64_t ns = 0;
+		const bool eopFenceDone = ihWaitFence(poolDw(kPm4FenceOffset), eopFence, 2000,
+		                                     true, "IH self-test CP", ns);
+		for (uint32_t ms = 0; ms < 20 && ihEopCount == eopBefore; ms++)
+			IOSleep(1);
+		if (!eopFenceDone || ihEopCount == eopBefore) {
+			ihDispatchPolling = true;
+			HLOG("self-test: CP RELEASE_MEM/EOP %s; dispatch waits will use polling",
+			     eopFenceDone ? "did not deliver an IH source" : "failed");
+		} else {
+			HLOG("self-test: CP EOP delivered (source count %u)", ihEopCount);
+		}
+	} else {
+		ihDispatchPolling = true;
+		HLOG("self-test: could not queue CP RELEASE_MEM; dispatch waits will use polling");
+	}
 	return true;
 }
 
@@ -348,10 +399,6 @@ void RDNA4Compute::ihAction() {
 	} else {
 		uint32_t bytes = wptr >= ihRptr ? wptr - ihRptr : kIhRingBytes - ihRptr;
 		if (bytes) {
-			if (!ihDrained) {
-				ihDrained = true;
-				trail("ih: first ring drain");
-			}
 			ihRingMemory->performOperation(kIOMemoryIncoherentIOFlush, ihRptr, bytes);
 		}
 		if (wptr < ihRptr && wptr)
