@@ -3651,6 +3651,11 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
             uint32_t enable = dw & 0xf;
             uint32_t src = dw1 & 0xff;
 
+            /* gfx12's MRT0 encoding carries target 8 in the adjacent target
+             * field form; primitive and position exports use [9:4]. */
+            if (!target)
+                target = (dw >> 8) & 0x3f;
+
             if (target == 20) {                              /* SQ_EXP_PRIM */
                 if (!ngg || enable != 1) goto unknown;
                 for (unsigned lane = 0; lane < 32; lane++) {
