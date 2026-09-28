@@ -425,13 +425,12 @@ bool RDNA4Compute::ihInit() {
 }
 
 void RDNA4Compute::ihDcnStop(const char *why) {
-	// A service advertised to IONDRV is valid only while this IH/DCN path is
-	// alive.  Dispose it on a storm and on the sleep teardown as well.
-	if (env.vblankServiceStop)
-		env.vblankServiceStop();
+	// Stop callbacks before touching the DCN source.  IONDRV owns the VSL
+	// service lifetime and will dispose it through wrapVslDispose; disposing
+	// it here could race a framebuffer teardown or display change.
+	Ndrv::setVblankEnabled(false);
 	if (!ihDcnActive)
 		return;
-	Ndrv::setVblankEnabled(false);
 	if (ihDcnOtg < Pipe::kMaxOtg) {
 		const Reg r { 2, kDcnOtgGlobalSync + ihDcnOtg * kDcnOtgStride };
 		wr(IpDiscovery::HwDmu, r, rd(IpDiscovery::HwDmu, r) & ~kDcnVblankEnable);

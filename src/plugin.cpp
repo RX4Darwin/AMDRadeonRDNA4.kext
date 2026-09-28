@@ -167,7 +167,6 @@ FbEntry fbTable[8] {};
 // Forward declaration: the explicit open-time VBL service creation below
 // goes through the same wrapper as a legacy NDRV call.
 int32_t wrapVslNew(void *entryID, UInt32 type, void **service);
-void disposeVblankService();
 
 // The GPU behind a framebuffer: its provider, or the provider's provider.
 IOPCIDevice *pciFor(IOService *provider) {
@@ -335,13 +334,9 @@ void attach(FbEntry &e) {
 	if (computeStage && dev.isAmd) {
 		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
 		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
-		                        createVblankService, disposeVblankService };
+		                        createVblankService };
 		st->compute.start(env, computeStage);
 	}
-}
-
-void disposeVblankService() {
-	Ndrv::disposeVblankService();
 }
 
 const char *commandName(UInt32 code) {
@@ -406,17 +401,18 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 	return ret;
 }
 
-// Apple IOGraphics IONDRVFramebuffer.cpp:916-1007 creates, disposes and
-// dispatches opaque VSL services. Keep the VBL service in that path: W1's IH
-// deferred action calls the original VSLDoInterruptService, so IONDRV runs
-// the registered IOFramebuffer callback exactly as it does for a real NDRV.
+// Apple IOGraphics IONDRVFramebuffer.cpp:849-890 creates and links the
+// service directly; unlike doControl/doStatus at :1159-1170, VSLNew does not
+// enter the controller work-loop gate.  The bring-up callback may therefore
+// call it from the IH bring-up thread.  W1's deferred action calls the
+// original VSLDoInterruptService, so IONDRV runs the registered IOFramebuffer
+// callback exactly as it does for a real NDRV.
 int32_t wrapVslNew(void *entryID, UInt32 type, void **service) {
 	auto org = FunctionCast(wrapVslNew, orgVslNew);
 	int32_t ret = org(entryID, type, service);
 	if (ret == kIOReturnSuccess && type == ::kVBLInterruptServiceType && service && *service) {
 		Ndrv::vslServiceCreated(*service,
-		                        reinterpret_cast<Ndrv::VslDoInterruptService>(orgVslDo),
-		                        reinterpret_cast<Ndrv::VslDisposeInterruptService>(orgVslDispose));
+		                        reinterpret_cast<Ndrv::VslDoInterruptService>(orgVslDo));
 		FBLOG("ndrv: VBL interrupt service created (%p)", *service);
 	}
 	return ret;

@@ -715,6 +715,14 @@ void RDNA4Compute::schedulePresentationTimer() {
 		presentTimer->setTimeoutMS(1);
 }
 
+void RDNA4Compute::schedulePresentationRetry() {
+	// This is deliberately a racy hint: a present submission arms the timer,
+	// while a busy client must not turn the framebuffer work loop into a 1 kHz
+	// lock-poll.  If work is still pending, retry after a bounded backoff.
+	if (presentTimer && presentPending)
+		presentTimer->setTimeoutMS(8);
+}
+
 void RDNA4Compute::presentTimerAction(OSObject *owner, IOTimerEventSource *) {
 	auto *context = static_cast<RDNA4PresentContext *>(owner);
 	if (context && context->compute)
@@ -754,8 +762,9 @@ void RDNA4Compute::presentTimerTick() {
 	Flip::Surface surface {};
 	if (!rtLock || !IOLockTryLock(rtLock)) {
 		// The framebuffer work-loop timer must never wait behind a client
-		// dispatch, SDMA transfer, or restore.  Try again on a later tick.
-		schedulePresentationTimer();
+		// dispatch, SDMA transfer, or restore.  Retry only while a present is
+		// pending, with a backoff rather than a 1 ms lock poll.
+		schedulePresentationRetry();
 		return;
 	}
 	checkPresentationTimeoutLocked();
@@ -777,7 +786,7 @@ void RDNA4Compute::presentTimerTick() {
 	// counter between timer callbacks.  Re-arming remains bounded below.
 	if (!Flip::waitNextVblank(*this, surface.otg, 1, frame)) {
 		if (!IOLockTryLock(rtLock)) {
-			schedulePresentationTimer();
+			schedulePresentationRetry();
 			return;
 		}
 		PresentSlot *slot = presentSlot(id, owner);
@@ -800,7 +809,7 @@ void RDNA4Compute::presentTimerTick() {
 	}
 
 	if (!IOLockTryLock(rtLock)) {
-		schedulePresentationTimer();
+		schedulePresentationRetry();
 		return;
 	}
 	presentNoVblankTicks = 0;

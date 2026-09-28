@@ -18,7 +18,6 @@ namespace Ndrv {
 namespace {
 void *gVblService { nullptr };
 VslDoInterruptService gVblDo { nullptr };
-VslDisposeInterruptService gVblDispose { nullptr };
 VslPrepareCursor gPrepareCursor { nullptr };
 bool gVblankEnabled { false };
 #ifdef KERNEL
@@ -49,8 +48,7 @@ void vslInit() {
 #endif
 }
 
-void vslServiceCreated(void *service, VslDoInterruptService doService,
-                       VslDisposeInterruptService disposeService) {
+void vslServiceCreated(void *service, VslDoInterruptService doService) {
 	if (!gVblLock)
 		vslInit();
 	if (!gVblLock || !service || !doService)
@@ -59,7 +57,6 @@ void vslServiceCreated(void *service, VslDoInterruptService doService,
 	if (!gVblService) {
 		gVblService = service;
 		gVblDo = doService;
-		gVblDispose = disposeService;
 	}
 	vslUnlock();
 }
@@ -72,28 +69,10 @@ bool vslServiceDisposed(void *service) {
 	if (owned) {
 		gVblService = nullptr;
 		gVblDo = nullptr;
-		gVblDispose = nullptr;
 		gVblankEnabled = false;
 	}
 	vslUnlock();
 	return owned;
-}
-
-void disposeVblankService() {
-	if (!gVblLock)
-		return;
-	void *service = nullptr;
-	VslDisposeInterruptService dispose = nullptr;
-	vslLock();
-	service = gVblService;
-	dispose = gVblDispose;
-	gVblService = nullptr;
-	gVblDo = nullptr;
-	gVblDispose = nullptr;
-	gVblankEnabled = false;
-	vslUnlock();
-	if (service && dispose)
-		(void)dispose(service);
 }
 
 bool vslServicePresent() {

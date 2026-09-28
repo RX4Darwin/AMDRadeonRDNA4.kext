@@ -103,7 +103,6 @@ public:
 		uint64_t            scanoutLength;
 		uint64_t            scanoutFrameNs;  // 0 when the display timing is unknown
 		void (*vblankServiceReady)(IOService *framebuffer) { nullptr };
-		void (*vblankServiceStop)() { nullptr };
 	};
 
 	enum Stage : uint32_t {
@@ -557,6 +556,7 @@ private:
 	bool     initPresentationTimer();
 	void     stopPresentationTimer();
 	void     schedulePresentationTimer();
+	void     schedulePresentationRetry();
 	void     presentTimerTick();
 	PresentSlot *presentSlot(uint64_t id, const void *owner);
 	void     completePresentLocked(PresentSlot &slot, IOReturn result, uint64_t frame);

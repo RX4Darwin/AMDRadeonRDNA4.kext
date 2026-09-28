@@ -307,13 +307,10 @@ private:
 // from its deferred IH work-loop action.
 namespace Ndrv {
 using VslDoInterruptService = int32_t (*)(void *service);
-using VslDisposeInterruptService = int32_t (*)(void *service);
 using VslPrepareCursor = bool (*)(void *cursorRef, void *descriptor, void *info);
 void vslInit();
-void vslServiceCreated(void *service, VslDoInterruptService doService,
-                       VslDisposeInterruptService disposeService);
+void vslServiceCreated(void *service, VslDoInterruptService doService);
 bool vslServiceDisposed(void *service);
-void disposeVblankService();
 bool vslServicePresent();
 void vslPrepareCursorInstalled(VslPrepareCursor prepare);
 void setVblankEnabled(bool enabled);
