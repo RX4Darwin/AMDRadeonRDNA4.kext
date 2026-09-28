@@ -242,6 +242,28 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
  */
 #define GC_SEG0(dw)          ((0x1260 + (dw)) * 4)
 #define GC_SEG1(dw)          ((0xa000 + (dw)) * 4)
+#define OSSSYS_SEG0          0x10a0
+#define OSSSYS(dw)           ((OSSSYS_SEG0 + (dw)) * 4)
+#define REG_IH_RB_CNTL       OSSSYS(0x0080)
+#define REG_IH_RB_RPTR       OSSSYS(0x0081)
+#define REG_IH_RB_WPTR       OSSSYS(0x0082)
+#define REG_IH_RB_BASE       OSSSYS(0x0083)
+#define REG_IH_RB_BASE_HI    OSSSYS(0x0084)
+#define REG_IH_WPTR_ADDR_HI  OSSSYS(0x0085)
+#define REG_IH_WPTR_ADDR_LO  OSSSYS(0x0086)
+#define REG_IH_DOORBELL      OSSSYS(0x0087)
+#define REG_IH_RB_CNTL_RING1 OSSSYS(0x008c)
+#define REG_IH_CHICKEN       OSSSYS(0x018a)
+#define IH_RB_ENABLE         (1u << 0)
+#define IH_WPTR_WRITEBACK    (1u << 8)
+#define IH_WPTR_OVERFLOW_EN  (1u << 16)
+#define IH_ENABLE_INTR       (1u << 17)
+#define IH_MC_SPACE_SHIFT    28
+#define IH_WPTR_OVERFLOW_CLR (1u << 31)
+#define IH_WPTR_OVERFLOW     1u
+#define IH_MC_SPACE_BUS      2u
+#define REG_CP_ME1_PIPE0_INT_CNTL GC_SEG0(0x1e25)
+#define CP_TIME_STAMP_INT_ENABLE  (1u << 26)
 #define REG_GC_CP_STAT       GC_SEG0(0x0f40)
 #define REG_GC_RLC_BOOTLOAD  GC_SEG1(0x4e7c)   /* BOOTLOAD_COMPLETE [31] */
 #define REG_GC_RLC_CNTL      GC_SEG1(0x4c00)
@@ -267,6 +289,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define REG_SDMA0_RB_WPTR    GC_SEG0(0x0085)   /* bytes */
 #define REG_SDMA0_RPTR_LO    GC_SEG0(0x0087)   /* rptr writeback address */
 #define REG_SDMA0_RPTR_HI    GC_SEG0(0x0088)
+#define REG_SDMA0_CNTL       GC_SEG0(0x000d)   /* TRAP_ENABLE [0] */
 #define REG_SDMA0_MCU_CNTL   GC_SEG1(0x588e)   /* HALT [0] */
 #define PSP_ERR_UNKNOWN_CMD  0x100
 #define PSP_TMR_SIZE         0x1400000      /* model's answer to LOAD_TOC */
@@ -338,6 +361,7 @@ struct RDNA4State {
     bool     sdma_no_db;     /* model an SDMA that ignores its doorbell */
     bool     dma_broken;     /* model a system-memory path that faults */
     bool     flip_stuck;     /* leave a surface flip pending forever */
+    bool     ih_dead;        /* IH writes the ring but never raises MSI */
 
     uint32_t *regs;           /* BAR5 image, RDNA4_MMIO_SIZE bytes */
     uint8_t  *resv;           /* top RDNA4_RESV_SIZE bytes of VRAM */
@@ -369,6 +393,11 @@ struct RDNA4State {
     uint64_t     smu_running;           /* features the PMFW runs */
     bool         autoload_armed;        /* AUTOLOAD_RLC accepted, IMU not released */
     uint64_t     sdma_wptr;             /* SDMA0 queue 0's last wptr: 64-bit, monotonic */
+    uint64_t     ih_ring_bus;
+    uint64_t     ih_wptr_bus;
+    uint32_t     ih_rptr;
+    uint32_t     ih_wptr;
+    bool         ih_overflow;
     bool         gfx_booted;            /* RLC autoload done */
 };
 
@@ -1209,6 +1238,93 @@ static uint8_t *rdna4_gc_span(RDNA4State *s, uint64_t mc, uint64_t len)
     return off < 0 ? NULL : rdna4_vram_span(s, off, len);
 }
 
+/* ---- IH v7: bus-addressed ring, writeback pointer and MSI model ---------- */
+
+#define IH_RING_BYTES (256u << 10)
+#define IH_ENTRY_BYTES 32u
+
+static bool rdna4_ih_ready(RDNA4State *s)
+{
+    uint32_t cntl = reg_get(s, REG_IH_RB_CNTL);
+    return (cntl & (IH_RB_ENABLE | IH_ENABLE_INTR)) ==
+               (IH_RB_ENABLE | IH_ENABLE_INTR) &&
+           ((cntl >> IH_MC_SPACE_SHIFT) & 7) == IH_MC_SPACE_BUS &&
+           reg_get(s, REG_IH_RB_BASE) != 0 &&
+           (reg_get(s, REG_IH_WPTR_ADDR_LO) & ~3u) != 0;
+}
+
+/* A GPU IH producer writes vectors into the system-memory ring and then
+ * writebacks the producer pointer. The QEMU card has no IOMMU, so the bus
+ * addresses programmed through MC_SPACE=2 are guest physical addresses. */
+static void rdna4_ih_emit(RDNA4State *s, uint8_t client, uint8_t source,
+                          uint8_t ring, uint32_t data0)
+{
+    if (!rdna4_ih_ready(s)) {
+        return;
+    }
+    PCIDevice *pci = PCI_DEVICE(s);
+    uint32_t wptr = s->ih_wptr & (IH_RING_BYTES - 1);
+    uint32_t next = (wptr + IH_ENTRY_BYTES) & (IH_RING_BYTES - 1);
+    if (next == s->ih_rptr) {
+        s->ih_overflow = true;
+    }
+
+    uint8_t entry[IH_ENTRY_BYTES] = { 0 };
+    stl_le_p(entry + 0, (uint32_t)client | ((uint32_t)source << 8) |
+                         ((uint32_t)ring << 16));
+    stl_le_p(entry + 1 * 4, s->ih_wptr / IH_ENTRY_BYTES);
+    stl_le_p(entry + 4 * 4, data0);
+    uint64_t ring_bus = ((uint64_t)reg_get(s, REG_IH_RB_BASE) << 8) |
+                        ((uint64_t)(reg_get(s, REG_IH_RB_BASE_HI) & 0xff) << 40);
+    if (pci_dma_write(pci, ring_bus + wptr, entry, sizeof(entry)) != MEMTX_OK) {
+        fprintf(stderr, "rdna4: ih: ring DMA write at 0x%" PRIx64 " failed\n",
+                ring_bus + wptr);
+        return;
+    }
+    s->ih_wptr = next;
+    uint32_t raw = next | (s->ih_overflow ? IH_WPTR_OVERFLOW : 0);
+    reg_set(s, REG_IH_RB_WPTR, raw);
+    if (reg_get(s, REG_IH_RB_CNTL) & IH_WPTR_WRITEBACK) {
+        uint64_t wb = (reg_get(s, REG_IH_WPTR_ADDR_LO) & ~3u) |
+                      ((uint64_t)(reg_get(s, REG_IH_WPTR_ADDR_HI) & 0xffff) << 32);
+        uint8_t bytes[4];
+        stl_le_p(bytes, raw);
+        if (pci_dma_write(pci, wb, bytes, sizeof(bytes)) != MEMTX_OK) {
+            fprintf(stderr, "rdna4: ih: wptr writeback at 0x%" PRIx64 " failed\n", wb);
+            return;
+        }
+    }
+    if (!s->ih_dead) {
+        msi_notify(pci, 0);
+    }
+}
+
+static void rdna4_ih_reg_write(RDNA4State *s, uint32_t dw, uint32_t val)
+{
+    uint32_t byte = OSSSYS(dw);
+    switch (dw) {
+    case 0x0080: { /* RB_CNTL; overflow clear is a pulse */
+        if (val & IH_WPTR_OVERFLOW_CLR) {
+            s->ih_overflow = false;
+        }
+        reg_set(s, byte, val & ~IH_WPTR_OVERFLOW_CLR);
+        break;
+    }
+    case 0x0081:
+        s->ih_rptr = val & (IH_RING_BYTES - 1);
+        reg_set(s, byte, s->ih_rptr);
+        break;
+    case 0x0082:
+        s->ih_wptr = val & (IH_RING_BYTES - 1);
+        s->ih_overflow = false;
+        reg_set(s, byte, s->ih_wptr);
+        break;
+    default:
+        reg_set(s, byte, val);
+        break;
+    }
+}
+
 #define REG_GCMC_AGP_TOP     GC_SEG0(0x1616)   /* MC >> 24 */
 #define REG_GCMC_AGP_BOT     GC_SEG0(0x1617)
 #define REG_GCMC_AGP_BASE    GC_SEG0(0x1618)   /* system address >> 24 */
@@ -1336,6 +1452,12 @@ static void rdna4_sdma_wptr(RDNA4State *s, uint64_t wptr64)
                 goto fault;
             }
             stl_le_p(dst, dw[3]);
+            break;
+        case 6:                                         /* TRAP: two-dword completion packet */
+            len = 2;
+            if (reg_get(s, REG_SDMA0_CNTL) & 1) {
+                rdna4_ih_emit(s, 0x0a, 49, 0, dw[1]);
+            }
             break;
         case 11: {                                      /* CONST_FILL */
             uint32_t bytes = dw[4] + 1, fsize = dw[0] >> 30;
@@ -1475,6 +1597,8 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         rdna4_psp_ring_ctl(s, val);
     } else if (addr == REG_PSP_RING_WPTR) {
         rdna4_psp_wptr(s, val);
+    } else if (dw >= OSSSYS_SEG0 && dw < OSSSYS_SEG0 + 0x300) {
+        rdna4_ih_reg_write(s, dw - OSSSYS_SEG0, val);
     } else if (addr == REG_SDMA0_RB_WPTR) {
         rdna4_sdma_wptr(s, val | ((uint64_t)reg_get(s, REG_SDMA0_RB_WPTR + 4) << 32));
     } else if (addr == REG_GCVM_INV17_REQ) {
@@ -2299,6 +2423,10 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
             } else if (sel == 1) {
                 stl_le_p(p, dw[5]);
             }
+            if (((dw[2] >> 24) & 7) == 2 &&
+                (reg_get(s, REG_CP_ME1_PIPE0_INT_CNTL) & CP_TIME_STAMP_INT_ENABLE)) {
+                rdna4_ih_emit(s, 0x0a, 181, 4, dw[5]);
+            }
             break;
         }
         default:
@@ -2720,6 +2848,11 @@ static void rdna4_reset(DeviceState *dev)
     s->smu_running = 0;
     s->autoload_armed = false;
     s->sdma_wptr = 0;
+    s->ih_ring_bus = 0;
+    s->ih_wptr_bus = 0;
+    s->ih_rptr = 0;
+    s->ih_wptr = 0;
+    s->ih_overflow = false;
     s->gfx_booted = false;
     memset(s->symclk_khz, 0, sizeof(s->symclk_khz));
     memset(s->dig_mode, 0, sizeof(s->dig_mode));
@@ -2849,6 +2982,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("sdma-no-doorbell", RDNA4State, sdma_no_db, false),
     DEFINE_PROP_BOOL("dma-broken", RDNA4State, dma_broken, false),
     DEFINE_PROP_BOOL("flip-stuck", RDNA4State, flip_stuck, false),
+    DEFINE_PROP_BOOL("ih-dead", RDNA4State, ih_dead, false),
 };
 
 static void rdna4_class_init(ObjectClass *klass, void *data)

@@ -51,6 +51,7 @@
 #include "codeobj.hpp"
 #include "gfxregs.hpp"
 #include "gpuheap.hpp"
+#include "ih.hpp"
 #include "ipdiscovery.hpp"
 #include "pm4.hpp"
 #include "psp.hpp"
@@ -64,9 +65,18 @@ class RDNA4Compute;
 namespace Flip {
 bool run(RDNA4Compute &compute);
 }
+class IOFilterInterruptEventSource;
+class IOWorkLoop;
+class OSObject;
 
 class RDNA4Compute {
 public:
+	~RDNA4Compute();
+	// Called by the IOKit filter/action callbacks; they only inspect the
+	// writeback pointer and drain the already-programmed ring.
+	bool ihHasWork() const;
+	void ihAction();
+
 	// What the compute side borrows from the display device: the GPU, the
 	// service registry properties go on, the BAR5 mapping and the IP
 	// discovery table, and the scanout the GOP set up (to keep clear of it).
@@ -259,6 +269,7 @@ private:
 		bool            wave32;
 		uint32_t        timeoutUs;
 		uint32_t        ldsBytes;           // per work-group (RSRC2.LDS_SIZE)
+		bool            useInterrupt;       // runtime only; the fence remains authoritative
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
 	// What launch() can give a code-object kernel: the kernarg pointer and
@@ -300,6 +311,46 @@ private:
 	bool gfxFenceWait(uint32_t seq, uint32_t timeoutUs);
 	void gfxStatus(const char *tag);
 	bool stageGfxRing();
+	// IH v7 ring and MSI delivery. The ring is brought up only after the
+	// runtime's DMA path has established bus mastering; stage bring-up keeps
+	// its existing bounded polling waits.
+	static constexpr uint32_t kIhRingBytes = 256u << 10;
+	static constexpr uint32_t kIhWptrBytes = 4096;
+	IOBufferMemoryDescriptor *ihRingMemory { nullptr };
+	IOBufferMemoryDescriptor *ihWptrMemory { nullptr };
+	IODMACommand *ihRingDma { nullptr };
+	IODMACommand *ihWptrDma { nullptr };
+	volatile uint32_t *ihRingCpu { nullptr };
+	volatile uint32_t *ihWptrCpu { nullptr };
+	uint64_t ihRingBus { 0 };
+	uint64_t ihWptrBus { 0 };
+	uint32_t ihRptr { 0 };
+	uint32_t ihRingMask { kIhRingBytes - 1 };
+	IOFilterInterruptEventSource *ihSource { nullptr };
+	IOWorkLoop *ihWorkLoop { nullptr };
+	OSObject *ihContext { nullptr };
+	IOLock *ihLock { nullptr };             // independent of rtLock; W2/W5 callers may not hold rtLock
+	void *ihWaitEvent { nullptr };
+	bool ihActive { false };
+	bool ihDispatchPolling { false };
+	bool ihSdmaPolling { false };
+	uint32_t ihDispatchMisses { 0 };
+	uint32_t ihSdmaMisses { 0 };
+	uint32_t ihDispatchObserved { 0 };
+	uint32_t ihSdmaObserved { 0 };
+	uint32_t ihEopCount { 0 };
+	uint32_t ihSdmaTrapCount { 0 };
+	uint32_t ihFaultCount { 0 };
+	uint32_t ihUnknownCount { 0 };
+	uint8_t ihUnknownSeen[256][32] {};
+
+	bool ihInit();
+	void ihStop();
+	void ihDecodeEntry(const uint32_t *dw);
+	void ihUnknown(uint8_t client, uint8_t source, uint8_t ring);
+	void ihRecordWait(bool dispatch, bool woke, bool completed, uint32_t eventsBefore);
+	bool ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_t timeoutMs,
+	                bool dispatch, const char *tag, uint64_t &ns);
 
 public:
 	// User-space runtime (runtime.cpp), reached through RDNA4ComputeClient.

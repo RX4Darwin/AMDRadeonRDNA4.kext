@@ -35,6 +35,7 @@ constexpr Reg CpMeCntl            { 1, 0x0803 };
 constexpr Reg CpMecRs64Cntl       { 1, 0x2904 };
 constexpr Reg CpMecRs64InstrPntr  { 1, 0x2908 };
 constexpr Reg CpMesCntl           { 1, 0x2807 };
+constexpr Reg CpMe1Pipe0IntCntl   { 0, 0x1e25 };
 constexpr Reg RlcCntl             { 1, 0x4c00 };
 constexpr Reg RlcStat             { 1, 0x4c04 };
 constexpr Reg RlcGpmStat          { 1, 0x4e6c };
@@ -51,6 +52,8 @@ constexpr uint32_t kGrbm2RlcBusy  = 1u << 26;
 // CP_ME_CNTL
 constexpr uint32_t kCpMePfpHalt   = 1u << 26;
 constexpr uint32_t kCpMeMeHalt    = 1u << 28;
+// CP_ME1_PIPE0_INT_CNTL
+constexpr uint32_t kCpTimeStampIntEnable = 1u << 26;
 // CP_MEC_RS64_CNTL / CP_MES_CNTL
 constexpr uint32_t kRs64PipeActiveShift = 26;   // PIPE0..3_ACTIVE = bits 26..29
 constexpr uint32_t kRs64Halt      = 1u << 30;

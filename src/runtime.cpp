@@ -91,8 +91,11 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 		return;
 	}
 	// DMA first: its self-test drives SDMA directly, before any client can.
-	if (dmaInit())
+	if (dmaInit()) {
 		devHeapInit();
+		if (featureAllowed("ih"))   // off for one boot if the last one hung in "ih: ..."
+			ihInit();
+	}
 	IOLockLock(rtLock);
 	heap.init(kHeapOffset, pool.size - kHeapOffset, 4096, heapMap, sizeof(heapMap));
 	rtStage = stage;
@@ -332,6 +335,7 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	l.wave32 = k.wave32();
 	l.timeoutUs = (d.timeoutMs ? d.timeoutMs : 1000) * 1000;
 	l.ldsBytes = k.groupSegmentSize + d.dynamicLdsBytes;
+	l.useInterrupt = ihActive;
 
 	uint64_t ns = 0;
 	const bool done = launch(l, "runtime", ns);
@@ -375,11 +379,18 @@ void RDNA4Compute::rtRelease(const void *owner) {
 // One packet on SDMA0 queue 0 with a FENCE after it; waits for the fence.
 bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeoutMs) {
 	uint32_t fence[Sdma::kFenceDwords];
+	uint32_t trap[Sdma::kTrapDwords];
 	const uint32_t value = ++sdmaFence;
 	Sdma::fence(fence, poolMc(kSdmaFenceOffset), value);
-	if (!sdmaRing.emit(pkt, dwords) || !sdmaRing.emit(fence, Sdma::kFenceDwords))
+	Sdma::trap(trap);
+	if (!sdmaRing.emit(pkt, dwords) || !sdmaRing.emit(fence, Sdma::kFenceDwords) ||
+	    !sdmaRing.emit(trap, Sdma::kTrapDwords))
 		return false;
 	sdmaKick(sdmaRing.wptr());
+	if (ihActive) {
+		uint64_t ns = 0;
+		return ihWaitFence(poolDw(kSdmaFenceOffset), value, timeoutMs, false, "dma", ns);
+	}
 	uint64_t t0 = mach_absolute_time(), span = 0;
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000, &span);
 	for (uint32_t polls = 0;; polls++) {

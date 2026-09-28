@@ -25,6 +25,7 @@
 #include "../src/amdfw.hpp"
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
+#include "../src/ih.hpp"
 #include "../src/pm4.hpp"
 #include "../src/codeobj.hpp"
 #include "../src/gpuheap.hpp"
@@ -1623,6 +1624,8 @@ static int testSdmaPackets() {
 	failures += check(Sdma::copyLinear(p, a, b, 4096) == 8 && p[0] == 0x00080001 && p[1] == 4095 &&
 	                  p[3] == 0x09002000 && p[5] == 0x10000000 && p[7] == 0,
 	                  "sdma: COPY_LINEAR %08x %08x", p[0], p[1]);
+	failures += check(Sdma::trap(p) == Sdma::kTrapDwords && p[0] == 0x00000006 && p[1] == 0,
+	                  "sdma: TRAP %08x %08x", p[0], p[1]);
 
 	// Ring: 256-byte ring; packets wrap in memory, the wptr never does
 	// (SDMA 7's 64-bit pointers: a wptr back at the start stalls the card).
@@ -1638,6 +1641,31 @@ static int testSdmaPackets() {
 	failures += check(!r.init(mem, 0x8008800010ull, sizeof(mem)), "sdma: unaligned ring accepted");
 
 	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR encodings and ring wrap %s\n",
+	       failures ? "FAILED" : "ok");
+	return failures;
+}
+
+// IH 7.0 vector fields and producer/consumer arithmetic.
+static int testIhRing() {
+	int failures = 0;
+	uint32_t dw[Ih::kEntryDwords] = {
+		0x8004030a, 0x11223344, 0x00005678, 0x00ab1234,
+		0xfeed0001, 0xfeed0002, 0xfeed0003, 0xfeed0004,
+	};
+	Ih::Entry e {};
+	Ih::decode(dw, e);
+	failures += check(e.clientId == 0x0a && e.srcId == 3 && e.ringId == 4 && e.vmid == 0 &&
+	                  e.vmidSrc && e.timestamp == 0x567811223344ull && e.pasid == 0x1234 &&
+	                  e.vmidSrcNode == 0xab && e.srcData[0] == 0xfeed0001 &&
+	                  e.srcData[3] == 0xfeed0004,
+	                  "ih: decode fields client=%u src=%u ring=%u timestamp=0x%llx",
+	                  e.clientId, e.srcId, e.ringId,
+	                  static_cast<unsigned long long>(e.timestamp));
+	constexpr uint32_t size = 256u << 10;
+	failures += check(Ih::advance(size - 16, 32, size) == 16 && Ih::hasEntries(size - 32, 0, size) &&
+	                  Ih::overflowRecovery(size - 32, size) == 0,
+	                  "ih: ring wrap/overflow arithmetic");
+	printf("\nih: v7 decode and ring wrap/overflow arithmetic %s\n",
 	       failures ? "FAILED" : "ok");
 	return failures;
 }
@@ -1661,6 +1689,9 @@ static int testPm4Packets() {
 	failures += check(Pm4::releaseMem(p, a, 9) == 8 && p[0] == 0xc0064900 &&
 	                  p[1] == 0x06600514 && p[2] == 0x20000000 && p[5] == 9 && p[7] == 0,
 	                  "pm4: RELEASE_MEM %08x %08x %08x", p[0], p[1], p[2]);
+	failures += check(Pm4::releaseMem(p, a, 10, true) == 8 &&
+	                  p[2] == (Pm4::kReleaseData32 | Pm4::kReleaseIntSel2),
+	                  "pm4: RELEASE_MEM interrupt select %08x", p[2]);
 
 	// PACKET3(SET_SH_REG, 2): COMPUTE_PGM_LO/HI (GC seg0 0x1260 + 0x1bac).
 	const uint32_t pgm[2] = { 0x80080e00, 0 };
@@ -2043,6 +2074,7 @@ int main(int argc, char **argv) {
 	failures += testPsp();
 	failures += testGfxImages();
 	failures += testSdmaPackets();
+	failures += testIhRing();
 	failures += testPm4Packets();
 	failures += testCodeObject();
 	failures += testGpuHeap();
