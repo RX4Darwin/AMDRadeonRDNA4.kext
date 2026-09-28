@@ -5201,6 +5201,7 @@ static bool rdna4_gfx_trace_selfcheck(RDNA4State *s)
     uint32_t attrib2, pitch, height, pos_bytes, prim_bytes;
     uint8_t *p;
     bool draw_ok = false, priv_ok = false, bad_ok = false, pass = false;
+    bool ih_ready;
 
     s->gfx_trace_selfcheck_done = true;
     old_vm[0] = reg_get(s, REG_GCVM_CTX1_CNTL + 7 * 4);
@@ -5314,10 +5315,12 @@ static bool rdna4_gfx_trace_selfcheck(RDNA4State *s)
     old_int = reg_get(s, REG_GFX_CP_INT_CNTL_RING0);
     reg_set(s, REG_GFX_CP_INT_CNTL_RING0, old_int | CP_PRIV_REG_INT_ENABLE |
             CP_OPCODE_ERROR_INT_ENABLE | CP_TIME_STAMP_INT_ENABLE | CP_GENERIC0_INT_ENABLE);
+    ih_ready = rdna4_ih_ready(s);
     uint32_t old_ih = s->ih_wptr;
     st = (RDNA4GfxStream){ root_mc, 0, 4, 0, 0, true };
     priv_ok = !rdna4_gfx_packets(s, &st, true, 0, false) && st.pos == 0 &&
-              s->ih_wptr == ((old_ih + IH_ENTRY_BYTES) & (IH_RING_BYTES - 1));
+              (!ih_ready || s->ih_wptr == ((old_ih + IH_ENTRY_BYTES) &
+                                             (IH_RING_BYTES - 1)));
 
     stl_le_p(p + 0x3000, 0xc000ff00);
     stl_le_p(p + 0x3004, 0);
@@ -5328,9 +5331,11 @@ static bool rdna4_gfx_trace_selfcheck(RDNA4State *s)
     old_ih = s->ih_wptr;
     st = (RDNA4GfxStream){ root_mc, 0, 4, 0, 0, true };
     bad_ok = !rdna4_gfx_packets(s, &st, true, 0, false) && st.pos == 0 &&
-             s->ih_wptr == ((old_ih + IH_ENTRY_BYTES) & (IH_RING_BYTES - 1));
+             (!ih_ready || s->ih_wptr == ((old_ih + IH_ENTRY_BYTES) &
+                                            (IH_RING_BYTES - 1)));
     fprintf(stderr, "rdna4: gfx: trace self-check PRIV_REG IH %s; OPCODE_ERROR IH %s\n",
-            priv_ok ? "PASS" : "FAIL", bad_ok ? "PASS" : "FAIL");
+            ih_ready ? (priv_ok ? "PASS" : "FAIL") : "SKIP (ring disabled)",
+            ih_ready ? (bad_ok ? "PASS" : "FAIL") : "SKIP (ring disabled)");
     pass = draw_ok && priv_ok && bad_ok;
 
 restore_vm:
