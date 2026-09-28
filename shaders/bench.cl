@@ -208,6 +208,7 @@ void mandelbrotRender(__global uint *out, uint width, uint height, uint pitch,
 	const float cy = y0 + (float)y * dy;
 	float zx = 0.0f, zy = 0.0f;
 	uint iteration = 0;
+	#pragma clang loop unroll(disable)
 	for (; iteration < 256u; iteration++) {
 		const float zx2 = zx * zx;
 		const float zy2 = zy * zy;

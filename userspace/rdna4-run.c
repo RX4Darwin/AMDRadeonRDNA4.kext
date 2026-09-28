@@ -314,7 +314,7 @@ static uint32_t mandelbrotIteration(float cx, float cy) {
 		if (zx2 + zy2 > 4.0f)
 			break;
 		const float nextZx = zx2 - zy2 + cx;
-		zy = 2.0f * zx * zy + cy;
+		zy = fmaf(2.0f * zx, zy, cy);
 		zx = nextZx;
 	}
 	return iteration;
@@ -324,9 +324,9 @@ static uint32_t mandelbrotColorForIteration(uint32_t iteration) {
 	if (iteration >= 256u)
 		return 0xff000000u;
 	const float t = (float)iteration * (1.0f / 255.0f);
-	const uint32_t r = (uint32_t)(9.0f + 246.0f * t);
-	const uint32_t g = (uint32_t)(20.0f + 200.0f * (1.0f - t));
-	const uint32_t b = (uint32_t)(80.0f + 175.0f * t);
+	const uint32_t r = (uint32_t)fmaf(246.0f, t, 9.0f);
+	const uint32_t g = (uint32_t)fmaf(200.0f, 1.0f - t, 20.0f);
+	const uint32_t b = (uint32_t)fmaf(175.0f, t, 80.0f);
 	return 0xff000000u | (r << 16) | (g << 8) | b;
 }
 

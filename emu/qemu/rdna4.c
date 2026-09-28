@@ -2001,8 +2001,6 @@ static bool rdna4_vopd_op(uint32_t op, uint32_t a, uint32_t b, uint32_t d, uint3
  */
 static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vmid)
 {
-    static unsigned mandelbrot_debug_args, mandelbrot_debug_coords, mandelbrot_debug_compares,
-        mandelbrot_debug_iters, mandelbrot_debug_vopd, mandelbrot_debug_colors, mandelbrot_debug_stores;
     uint64_t pc = l->pc;
     uint32_t scc = l->s[127];               /* s[127] is not an addressable SGPR here */
 
@@ -2089,9 +2087,6 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
                 default: goto unknown;
                 }
                 l->s[106] = result;
-                if ((dw == 0x7c3c14f6 || dw == 0x7c3c0cf6) && mandelbrot_debug_compares++ < 12)
-                    fprintf(stderr, "rdna4: debug compare pc=0x%" PRIx64 " a=%g b=%g result=%u exec=%u\\n",
-                            pc, rdna4_f(a), rdna4_f(b), result, l->s[126]);
                 if (((dw >> 24) & 0xff) == 0x7d)          /* v_cmpx_* */
                     l->s[126] = result;
             } else {
@@ -2120,9 +2115,6 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             for (uint32_t i = 0; i < count; i++) {
                 l->s[sdata + i] = ldl_le_p(m + 4 * i);
             }
-            if (dw == 0xf4006100 && dw1 == 0xf8000008 && mandelbrot_debug_args++ < 2)
-                fprintf(stderr, "rdna4: debug args s4..s11=%08x %08x %08x %08x %08x %08x %08x %08x\\n",
-                        l->s[4], l->s[5], l->s[6], l->s[7], l->s[8], l->s[9], l->s[10], l->s[11]);
             n = 2;
         } else if ((dw >> 26) == 0x36) {                    /* DS (LDS) */
             uint32_t op = (dw >> 18) & 0xff, off0 = dw & 0xff, off1 = (dw >> 8) & 0xff;
@@ -2196,10 +2188,6 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             }
             for (uint32_t i = 0; i < count; i++) {
                 if (op >= 26) {
-                    if (dw == 0xee06807c && dw1 == 0x04000000 && dw2 == 6 &&
-                        mandelbrot_debug_stores++ < 8)
-                        fprintf(stderr, "rdna4: debug store pc=0x%" PRIx64 " exec=%u data=0x%08x addr=0x%" PRIx64 "\\n",
-                                pc, l->s[126], l->v[(data + i) & 255], addr + 4 * i);
                     stl_le_p(d + 4 * i, l->v[(data + i) & 255]);
                 } else {
                     l->v[(vdst + i) & 255] = ldl_le_p(d + 4 * i);
@@ -2231,9 +2219,6 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
                 }
                 l->v[vdstx] = rx;
                 l->v[vdsty & 255] = ry;
-                if (dw == 0xc8c61309 && mandelbrot_debug_vopd++ < 6)
-                    fprintf(stderr, "rdna4: debug vopd mul ax=%g bx=%g rx=%g ay=%g by=%g ry=%g\\n",
-                            rdna4_f(ax), rdna4_f(bx), rdna4_f(rx), rdna4_f(ay), rdna4_f(by), rdna4_f(ry));
             }
         } else if ((dw >> 23) == 0x198 && ((dw >> 16) & 0x7f) >= 64 &&
                    ((dw >> 16) & 0x7f) <= 65) {             /* VOP3P WMMA: wave-wide */
@@ -2257,12 +2242,6 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
                 b = rdna4_isa_float_src(l, s1, dw2, &lit);
                 c = rdna4_isa_float_src(l, s2, dw2, &lit);
                 l->v[vdst] = rdna4_u(fmaf(rdna4_f(a), rdna4_f(b), rdna4_f(c)));
-                if ((dw == 0xd6130004 && dw1 == 0x001c1104) ||
-                    (dw == 0xd6130005 && dw1 == 0x00241505)) {
-                    if (mandelbrot_debug_coords++ < 4)
-                        fprintf(stderr, "rdna4: debug coord pc=0x%" PRIx64 " a=%g b=%g c=%g out=%g\\n",
-                                pc, rdna4_f(a), rdna4_f(b), rdna4_f(c), rdna4_f(l->v[vdst]));
-                }
                 break;                                                        /* v_fma_f32 */
             case 0x44c:                                                       /* v_cmp_gt_u32_e64 */
                 if (vdst <= 106)
@@ -2272,12 +2251,7 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             case 0x246: l->v[vdst] = (a << (b & 31)) + c; break;              /* v_lshl_add_u32 */
             case 0x255: l->v[vdst] = a + b + c; break;                        /* v_add3_u32 */
             case 0x247: l->v[vdst] = (a + b) << (c & 31); break;              /* v_add_lshl_u32 */
-            case 0x258:
-                l->v[vdst] = a | b | c;                                        /* v_or3_b32 */
-                if (dw == 0xd6580008 && mandelbrot_debug_colors++ < 8)
-                    fprintf(stderr, "rdna4: debug color pc=0x%" PRIx64 " exec=%u a=0x%08x b=0x%08x c=0x%08x out=0x%08x\\n",
-                            pc, l->s[126], a, b, c, l->v[vdst]);
-                break;
+            case 0x258: l->v[vdst] = a | b | c; break;                        /* v_or3_b32 */
             case 0x210:                                                       /* v_bfe_u32 */
                 l->v[vdst] = (c & 31) ? (a >> (b & 31)) & ((1u << (c & 31)) - 1) : 0;
                 break;
@@ -2316,9 +2290,6 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             } else if (op == 1) {                           /* v_mov_b32 */
                 l->v[vdst] = a;
             } else if (op == 6) {                            /* v_cvt_f32_u32 */
-                if (dw == 0x7e080d09 && mandelbrot_debug_iters++ < 4)
-                    fprintf(stderr, "rdna4: debug iter raw=0x%08x value=%u exec=%u\\n",
-                            a, a, l->s[126]);
                 l->v[vdst] = rdna4_u((float)a);
             } else if (op == 7) {                            /* v_cvt_u32_f32 */
                 float f = rdna4_f(a);
