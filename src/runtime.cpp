@@ -63,6 +63,15 @@ bool slotOf(uint64_t h, uint32_t max, uint32_t &slot, uint16_t &gen) {
 
 uint16_t nextGen(uint16_t g) { return static_cast<uint16_t>(g == 0xffff ? 1 : g + 1); }
 
+bool fenceReached(uint32_t current, uint32_t wanted) {
+	return static_cast<int32_t>(current - wanted) >= 0;
+}
+
+uint32_t nextFence(uint32_t previous) {
+	uint32_t value = previous + 1;
+	return value ? value : 1;
+}
+
 constexpr uint64_t kCopyChunk = 4ull << 20;   // wired at a time
 constexpr uint32_t kCodePad = 0x100;          // zeroed past the image: instruction prefetch
 
@@ -393,6 +402,20 @@ void RDNA4Compute::releaseHost(RtBuffer &b) {
 	}
 	b.hostUser = 0;
 	b.host = false;
+}
+
+void RDNA4Compute::retireIbFences(RtClient &c) {
+	if (!c.fenceCpu)
+		return;
+	const uint32_t current = *c.fenceCpu;
+	uint32_t retired = 0;
+	while (retired < c.ibOutstanding && fenceReached(current, c.ibFences[retired]))
+		retired++;
+	if (!retired)
+		return;
+	for (uint32_t i = retired; i < c.ibOutstanding; i++)
+		c.ibFences[i - retired] = c.ibFences[i];
+	c.ibOutstanding -= retired;
 }
 
 /* Boot-time proof of one translated MEC queue.  User clients never enter this
@@ -1146,6 +1169,7 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 	out[5] = k.rsrc3;
 	out[6] = k.properties;
 	out[7] = k.groupSegmentSize;
+	out[8] = (c ? p.va : poolMc(off)) + k.entryVa;
 	RLOG("loaded \"%s\": %llu-byte image at %s 0x%llx, entry +0x%llx, %u bytes of kernargs, "
 	     "%u of LDS", name, img.size, c ? "VA" : "MC", c ? p.va : poolMc(off), k.entryVa,
 	     k.kernargSize, k.groupSegmentSize);
@@ -1179,6 +1203,8 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	RtClient *c = clientFor(owner);
 	if (vmEnabled && !c)
 		return kIOReturnNoResources;
+	if (c)
+		retireIbFences(*c);
 	RtProgram *p = programFor(owner, d.program);
 	if (!p || d.kernargBytes > RDNA4_MAX_KERNARG || d.timeoutMs > RDNA4_MAX_TIMEOUT_MS ||
 	    d.dynamicLdsBytes > RDNA4_MAX_LDS ||
@@ -1224,11 +1250,14 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	l.timeoutUs = (d.timeoutMs ? d.timeoutMs : 1000) * 1000;
 	l.ldsBytes = k.groupSegmentSize + d.dynamicLdsBytes;
 	l.useInterrupt = ihActive;
+	l.preserveFence = c && c->ibOutstanding != 0;
 	l.queue = c ? &c->pm4 : nullptr;
 	l.vmid = c ? c->vmid : 0;
 	l.pipe = c ? c->pipe : 0;
 	l.queueId = c ? c->queue : 0;
-	l.fenceValue = c ? ++c->fence : 0;
+	l.fenceValue = c ? nextFence(c->fence) : 0;
+	if (c)
+		c->fence = l.fenceValue;
 	l.doorbell = c ? c->doorbell : 0;
 	l.fenceAddress = c ? c->fenceVa : 0;
 	l.fenceCpu = c ? c->fenceCpu : nullptr;
@@ -1245,6 +1274,8 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	const bool done = launch(l, "runtime", ns);
 	micros = ns / 1000;
 	if (!done) {
+		if (c)
+			c->ibOutstanding = 0;
 		if (recoverComputeQueue("runtime", &l)) {
 			rtWedged = false;
 			RLOG("dispatch timed out after %u ms; queue recovered without a GPU reset", l.timeoutUs / 1000);
@@ -1255,9 +1286,142 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 		}
 		return kIOReturnTimeout;
 	}
-	if (c)
+	if (c) {
+		retireIbFences(*c);
 		logClientFault(*c, "dispatch");
+	}
 	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwords,
+                                  uint64_t flags, uint64_t &fence) {
+	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;
+	RtClient *c = clientFor(owner);
+	if (!c)
+		return kIOReturnNoResources;
+	if (rtWedged)
+		return kIOReturnNotResponding;
+	if (!ibVa || (ibVa & 3) || !dwords || dwords > (1u << 20) || flags)
+		return kIOReturnBadArgument;
+	const uint64_t ibBytes = dwords * 4;
+	if (ibBytes / 4 != dwords)
+		return kIOReturnBadArgument;
+	RtBuffer *containing = nullptr;
+	for (RtBuffer &b : buffers) {
+		if (b.owner != owner || (!b.device && !b.host) || !b.va || ibVa < b.va)
+			continue;
+		const uint64_t offset = ibVa - b.va;
+		if (offset <= b.bytes && ibBytes <= b.bytes - offset) {
+			containing = &b;
+			break;
+		}
+	}
+	if (!containing)
+		return kIOReturnBadArgument;
+	retireIbFences(*c);
+	if (c->ibOutstanding >= kMaxIbOutstanding)
+		return kIOReturnBusy;
+
+	/* The same VMID-selected shader memory state as launch(): the user IB
+	 * supplies the program and resource registers, while this selector only
+	 * chains it and fences it. */
+	grbmSelect(0, c->pipe, c->queue, c->vmid);
+	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
+	wr(IpDiscovery::HwGc, ShMemBases, (0x2000u << 16) | 0x1000u);
+	const uint32_t value = nextFence(c->fence);
+	uint32_t pkt[8];
+	if (!c->pm4.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync)) ||
+	    !c->pm4.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), c->vmid)) ||
+	    !c->pm4.emit(pkt, Pm4::releaseMem(pkt, c->fenceVa, value,
+	                                      ihActive && c->pipe < 2)))
+		return kIOReturnNoResources;
+	c->fence = value;
+	flushHdp();
+	pm4Kick(c->pm4, c->doorbell, c->pm4.wptr());
+	c->ibFences[c->ibOutstanding++] = value;
+	fence = value;
+	RLOG("vmid %u: submitted unprivileged compute IB VA 0x%llx, %u dwords, fence %u",
+	     c->vmid, ibVa, static_cast<uint32_t>(dwords), value);
+	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t timeoutMs,
+                                   uint64_t &ns) {
+	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;
+	RtClient *c = clientFor(owner);
+	if (!c)
+		return kIOReturnNoResources;
+	if (rtWedged)
+		return kIOReturnNotResponding;
+	if (timeoutMs > RDNA4_MAX_TIMEOUT_MS ||
+	    static_cast<int32_t>(fence - c->fence) > 0)
+		return kIOReturnBadArgument;
+	const uint32_t waitMs = timeoutMs ? timeoutMs : 1000;
+	bool done = false;
+	if (ihActive && c->pipe < 2) {
+		done = ihWaitFence(c->fenceCpu, fence, waitMs, true, "IB", ns);
+	} else {
+		const uint64_t t0 = mach_absolute_time();
+		uint64_t span = 0;
+		nanoseconds_to_absolutetime(static_cast<uint64_t>(waitMs) * 1000000, &span);
+		for (uint32_t polls = 0;; polls++) {
+			done = fenceReached(*c->fenceCpu, fence);
+			if (done || mach_absolute_time() - t0 > span)
+				break;
+			if (polls < 200)
+				IODelay(10);
+			else
+				IOSleep(1);
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	}
+	if (done) {
+		retireIbFences(*c);
+		logClientFault(*c, "IB wait");
+		return kIOReturnSuccess;
+	}
+
+	Launch l {};
+	l.queue = &c->pm4;
+	l.vmid = c->vmid;
+	l.pipe = c->pipe;
+	l.queueId = c->queue;
+	l.doorbell = c->doorbell;
+	l.queueCpu = c->queueCpu;
+	l.queueAddress = c->queueVa;
+	l.recoveryMqd = c->mqdMc;
+	l.recoveryEop = c->eopVa >> 8;
+	l.recoveryRptr = c->rptrVa;
+	l.recoveryWpoll = c->wpollVa;
+	l.recoveryProofAddress = c->fenceVa;
+	l.recoveryProofCpu = c->fenceCpu;
+	const bool recovered = recoverComputeQueue("IB", &l);
+	c->ibOutstanding = 0;
+	if (recovered) {
+		/* W6's proof WRITE_DATA is not a client fence value. */
+		*c->fenceCpu = 0;
+		flushHdp();
+		rtWedged = false;
+		RLOG("IB fence %u timed out after %u ms; queue recovered without a GPU reset",
+		     fence, waitMs);
+	} else {
+		rtWedged = true;
+		RLOG("IB fence %u timed out after %u ms; queue recovery failed; runtime stays wedged",
+		     fence, waitMs);
+	}
+	return kIOReturnTimeout;
 }
 
 IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t offset,
@@ -1475,6 +1639,12 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			RLOG("vmid %u: queue MEC1 pipe %u queue %u dequeue timeout (ACTIVE 0x%08x)",
 			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
 		grbmSelect(0, 0, 0, 0);
+		/* The table allocation is reused by the next client.  Unmapping each
+		 * live object leaves untouched PDEs/PTEs behind, so clear the complete
+		 * image before releasing the VMID or its backing VRAM. */
+		bzero(c->tableShadow, kVmTableBytes);
+		if (!vmTableSync(*c, 0, kVmTableBytes))
+			RLOG("vmid %u: page-table teardown clear failed", c->vmid);
 		vmInvalidate(c->vmid, "client close");
 		vmidUsed[c->vmid] = false;
 		queueUsed[c->pipe][c->queue] = false;
