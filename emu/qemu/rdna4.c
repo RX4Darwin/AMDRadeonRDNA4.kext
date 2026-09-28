@@ -3512,6 +3512,9 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
              * required by the VOP3 forms below. */
             dw2 = 0;
         }
+        if (s->gfx_trace)
+            fprintf(stderr, "rdna4: gfx: wave pc=0x%" PRIx64 " dw=0x%08x exec=0x%08x\\n",
+                    w->pc, dw, w->exec);
 
         if ((dw & 0xff800000u) == 0xbf800000u) {             /* SOPP */
             uint32_t op = (dw >> 16) & 0x7f;
