@@ -4,12 +4,12 @@
 #   bash /Volumes/OPENCORE/set-boot.sh <0-6>
 #
 #   0  this morning's known-good arguments (no new feature enabled)
-#   1  + interrupts                          rdna4-ih=1
-#   2  + per-app GPU memory                  rdna4-ih=1 rdna4-vm=1
-#   3  + display interrupts and page flips   rdna4-ih=2 rdna4-vm=1 rdna4-flip=1
-#   4  + gfx ring and the first triangle     ... rdna4-gfx=1
-#   5  + gfx ring through its doorbell       ... rdna4-gfx=2
-#   6  optional: macOS vblank + hardware cursor  rdna4-ih=2 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=1
+#   1  + interrupts and W6 opt-in            rdna4-ih=1 rdna4-hang=1
+#   2  + per-app GPU memory and W6 opt-in   rdna4-ih=1 rdna4-vm=1 rdna4-hang=1
+#   3  + display interrupts and page flips  ... rdna4-flip=1 rdna4-hang=1
+#   4  + gfx ring and first triangle        ... rdna4-gfx=1 rdna4-hang=1
+#   5  + gfx ring through doorbell          ... rdna4-gfx=2 rdna4-hang=1
+#   6  optional: vblank + cursor            ... rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
 # the one the next boot uses. A copy of the config is kept next to it first.

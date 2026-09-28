@@ -13,12 +13,13 @@ The USB stick `OPENCORE` holds the kext, `rdna4-run`, `diagnostic-log.sh`,
 3. Select the next boot with `bash /Volumes/OPENCORE/set-boot.sh 2` (then 3,
    4, 5; boot 6 is optional), reboot, and repeat.
 
-Boot 0 is the baseline with no new RDNA4 arguments. The summary reads the
+Boot 0 is today's known-good argument set: it enables no new behavior at all.
+The summary reads the
 durable `RDNA4FB,Results` IORegistry dictionary first and uses the current
 boot's dmesg as supporting evidence. A PASS requires the command's result and
-the registry result to agree. Run
-`bash /Volumes/OPENCORE/diagnostic-log.sh hang` only as the explicit final W6
-step on boot 2; ordinary collection never runs a hang test.
+the registry result to agree. The optional
+`bash /Volumes/OPENCORE/diagnostic-log.sh hang` step is last, on boot 2;
+ordinary collection never runs a hang test.
 
 To roll back the kext, replace `EFI/OC/Kexts/RDNA4FB.kext` with the copy in
 `backup-before-premetal/`. `set-boot.sh` keeps the first config backup and
@@ -73,6 +74,8 @@ W9 sensors run only from `rdna4-run sensors`, with measured or emulator
 synthetic values. There is no boot-time sensor read. Power management and the
 W9 sleep cycle are not in this batch: they require the separate opt-in
 `rdna4-pm=1` and, for the emulator selector, `rdna4-sleeptest=1`.
+Do not put the Mac to sleep during this batch; leave sleep testing for the
+separate power-management work.
 
 6. **Optional W14 vblank service and hardware cursor.**
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1`.
