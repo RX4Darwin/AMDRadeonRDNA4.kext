@@ -34,8 +34,9 @@ is recorded and the script continues.
 
 1. **Interrupt ring.** Boot with
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1`. The summary should show
-   `ih PASS` with `ring up`, `submitib PASS`, `fault PASS`, runtime selftest
-   and bench PASS, and sensor values. The kernel log should contain
+   `ih PASS` with `ring up`, runtime selftest and bench PASS, and sensor
+   values. SubmitIb and freed-VA fault rows are SKIPPED because they require
+   `rdna4-vm=1`; boot 2 covers those VM-dependent checks. The kernel log should contain
    `RDNA4FB: ih: ring up` and the bounded SDMA/CP self-test result. A missing
    MSI or IH source is a FAIL or polling fallback; keep the log and continue
    to the next boot only after a reboot. If the interrupt source hangs, the

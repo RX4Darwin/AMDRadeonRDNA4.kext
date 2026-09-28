@@ -49,6 +49,18 @@ case "$GFX_MODE" in ''|*[!0-9]*) GFX_MODE=0;; esac
 case "$HANG_MODE" in ''|*[!0-9]*) HANG_MODE=1;; esac
 case "$SLEEPTEST_MODE" in ''|*[!0-9]*) SLEEPTEST_MODE=0;; esac
 
+# The emulator dry run can deliberately omit rdna4-vm (boot 1) while still
+# needing the bounded VM-sized benchmark. Keep VM_MODE tied to the boot arg so
+# the VM feature row remains SKIPPED, and detect the emulated card separately.
+EMULATED_CARD=0
+if [ "$VM_MODE" -eq 0 ]; then
+	if [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" = 1 ] ||
+		 ioreg -r -w0 -l 2>/dev/null |
+		 grep -q '"GPU,Variant"[[:space:]]*=[[:space:]]*"VM test'; then
+		EMULATED_CARD=1
+	fi
+fi
+
 section() { echo; echo "=== $1 ==="; }
 
 # Run one command with a hard wall-clock bound. Perl's alarm is available in
@@ -239,8 +251,8 @@ record_registry() {
 		run_step "user-space compute runtime (rdna4-run selftest)" "$RUN" selftest
 		SELFTEST_FILE="$STEP_FILE"
 		SELFTEST_RC=$STEP_RC
-		if [ "$VM_MODE" -eq 1 ]; then
-			echo "note: VM mode — using bounded rdna4-run bench small"
+		if [ "$VM_MODE" -eq 1 ] || [ "$EMULATED_CARD" -eq 1 ]; then
+			echo "note: emulated card — using bounded rdna4-run bench small"
 			run_step "compute benchmarks (rdna4-run bench small)" "$RUN" bench small
 		else
 			run_step "compute benchmarks (rdna4-run bench)" "$RUN" bench
@@ -339,7 +351,9 @@ record_registry() {
 	# W8: selftest's SubmitIb section proves a single IB, ordered fences and
 	# ten back-to-back IBs. Keep it separate from the general runtime result so
 	# the real-card report shows which queue path was actually exercised.
-	if [ "$INFO_OK" -eq 0 ]; then
+	if [ "$VM_MODE" -eq 0 ]; then
+		record submitib SKIPPED "requires rdna4-vm=1"
+	elif [ "$INFO_OK" -eq 0 ]; then
 		record submitib SKIPPED "runtime unavailable"
 	elif [ "$SELFTEST_RC" -eq 0 ] && \
 		grep -q '  ok  SubmitIb vadd:' "$SELFTEST_FILE" && \
@@ -353,7 +367,9 @@ record_registry() {
 	# W2 fault-page scrub: the selftest dispatches through a freed host VA and
 	# requires a clean fence. The kernel clears the shared fault-default page
 	# after servicing that fault, so retain the user-visible proof in the table.
-	if [ "$INFO_OK" -eq 0 ]; then
+	if [ "$VM_MODE" -eq 0 ]; then
+		record fault SKIPPED "requires rdna4-vm=1"
+	elif [ "$INFO_OK" -eq 0 ]; then
 		record fault SKIPPED "runtime unavailable"
 	elif [ "$SELFTEST_RC" -eq 0 ] && \
 		grep -q 'ok    dispatch through freed host VA faulted cleanly' "$SELFTEST_FILE"; then
