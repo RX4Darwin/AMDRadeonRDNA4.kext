@@ -27,6 +27,7 @@
 #include <IOKit/ndrvsupport/IOMacOSTypes.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include <IOKit/ndrvsupport/IONDRVLibraries.h>
+#include <pexpert/pexpert.h>
 
 #include "compute.hpp"
 #include "device.hpp"
@@ -166,6 +167,7 @@ FbEntry fbTable[8] {};
 // Forward declaration: the explicit open-time VBL service creation below
 // goes through the same wrapper as a legacy NDRV call.
 int32_t wrapVslNew(void *entryID, UInt32 type, void **service);
+void disposeVblankService();
 
 // The GPU behind a framebuffer: its provider, or the provider's provider.
 IOPCIDevice *pciFor(IOService *provider) {
@@ -325,10 +327,6 @@ void attach(FbEntry &e) {
 #endif
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidData, dev.edidLen, be);
 	e.state = st;
-	// Apple IOGraphics' IONDRVFramebuffer creates its VSL service from the
-	// provider's legacy registry ID before registering the VBL callback. See
-	// IONDRVFramebuffer.cpp:916-959 and its provider property setup at 541-544.
-	createVblankService(svc);
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
 
@@ -336,9 +334,14 @@ void attach(FbEntry &e) {
 	// when asked for: it must never be the reason the desktop is missing.
 	if (computeStage && dev.isAmd) {
 		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
-		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs() };
+		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
+		                        createVblankService, disposeVblankService };
 		st->compute.start(env, computeStage);
 	}
+}
+
+void disposeVblankService() {
+	Ndrv::disposeVblankService();
 }
 
 const char *commandName(UInt32 code) {
@@ -412,7 +415,8 @@ int32_t wrapVslNew(void *entryID, UInt32 type, void **service) {
 	int32_t ret = org(entryID, type, service);
 	if (ret == kIOReturnSuccess && type == ::kVBLInterruptServiceType && service && *service) {
 		Ndrv::vslServiceCreated(*service,
-		                        reinterpret_cast<Ndrv::VslDoInterruptService>(orgVslDo));
+		                        reinterpret_cast<Ndrv::VslDoInterruptService>(orgVslDo),
+		                        reinterpret_cast<Ndrv::VslDisposeInterruptService>(orgVslDispose));
 		FBLOG("ndrv: VBL interrupt service created (%p)", *service);
 	}
 	return ret;
@@ -447,6 +451,14 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d)",
 		      patcher.getError());
 	patcher.clearError();
+	uint32_t vbl = 0, cursor = 0;
+	const bool vslRequested =
+		(PE_parse_boot_argn("rdna4-vbl", &vbl, sizeof(vbl)) && vbl != 0) ||
+		(PE_parse_boot_argn("rdna4-cursor", &cursor, sizeof(cursor)) && cursor != 0);
+	if (!vslRequested) {
+		FBLOG("ndrv: VSL routes disabled (rdna4-vbl and rdna4-cursor are off)");
+		return;
+	}
 
 	KernelPatcher::RouteRequest vslNew {
 		"__ZN17IONDRVFramebuffer22VSLNewInterruptServiceEPvjPP11_VSLService",
@@ -494,6 +506,7 @@ void pluginStart() {
 		traceEnabled = true;
 #endif
 	computeStage = RDNA4Compute::requestedStage();
+	Ndrv::vslInit();
 	FBLOG("Lilu plugin started (trace %s, compute stage %u)", traceEnabled ? "on" : "off",
 	      computeStage);
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);

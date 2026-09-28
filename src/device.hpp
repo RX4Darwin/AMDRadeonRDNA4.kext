@@ -207,6 +207,7 @@ private:
 	bool hwCursorVisible { false };
 	int32_t hwCursorX { 0 }, hwCursorY { 0 };
 	uint16_t hwCursorHotX { 0 }, hwCursorHotY { 0 };
+	uint32_t cursorDrawCalls { 0 }, cursorDrawLogs { 0 };
 	uint32_t *cursorStage { nullptr };
 	volatile uint32_t *cursorVram { nullptr };
 	IODeviceMemory *cursorMemory { nullptr };

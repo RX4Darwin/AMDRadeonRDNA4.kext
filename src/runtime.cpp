@@ -166,8 +166,12 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 		RLOG("user-space runtime up: %s, CPU transfers, heap %llu MiB at MC 0x%llx",
 		     RDNA4_COMPUTE_SERVICE, heap.size() >> 20, poolMc(kHeapOffset));
 	publishResult("runtime", "PASS service ready");
-	if (!initPresentationTimer())
-		RLOG("present async disabled: no runtime work-loop timer");
+	if (featureAllowed("flip")) {
+		if (!initPresentationTimer())
+			RLOG("present async disabled: no runtime work-loop timer");
+	} else {
+		RLOG("present selectors disabled: rdna4-flip is not enabled");
+	}
 }
 
 RDNA4Compute::RtBuffer *RDNA4Compute::bufferFor(const void *owner, uint64_t handle) {
@@ -746,62 +750,89 @@ void RDNA4Compute::presentTimerTick() {
 	uint64_t id = 0;
 	const void *owner = nullptr;
 	Flip::Surface surface {};
-	for (;;) {
-		{
-			Locked g(rtLock);
-			checkPresentationTimeoutLocked();
-			for (const PresentSlot &slot : presentSlots) {
-				if (slot.state == 1 && (!id || slot.id < id)) {
-					id = slot.id;
-					owner = slot.owner;
-				}
-			}
-			if (!id)
-				return;
-			surface = presentSurface;
+	if (!rtLock || !IOLockTryLock(rtLock)) {
+		// The framebuffer work-loop timer must never wait behind a client
+		// dispatch, SDMA transfer, or restore.  Try again on a later tick.
+		schedulePresentationTimer();
+		return;
+	}
+	checkPresentationTimeoutLocked();
+	for (const PresentSlot &slot : presentSlots) {
+		if (slot.state == 1 && (!id || slot.id < id)) {
+			id = slot.id;
+			owner = slot.owner;
 		}
+	}
+	if (id)
+		surface = presentSurface;
+	IOLockUnlock(rtLock);
+	if (!id)
+		return;
 
-		uint64_t frame = 0;
-		if (!Flip::waitNextVblank(*this, surface.otg, 100, frame)) {
-			if (presentTimer)
-				schedulePresentationTimer();
+	uint64_t frame = 0;
+	// A zero-time poll keeps the IOGraphics work-loop gate free.  The
+	// timer is re-armed a bounded number of times if the display stopped.
+	if (!Flip::waitNextVblank(*this, surface.otg, 0, frame)) {
+		if (!IOLockTryLock(rtLock)) {
+			schedulePresentationTimer();
 			return;
 		}
-
-		bool again = false;
-		{
-			Locked g(rtLock);
-			checkPresentationTimeoutLocked();
-			PresentSlot *slot = presentSlot(id, owner);
-			if (slot && slot->state == 1) {
-				RtBuffer *buffer = bufferFor(owner, slot->handle);
-				const uint64_t bytes = Flip::surfaceBytes(surface.pitch, surface.height);
-				if (!buffer || !buffer->device || (slot->offset & 255u) ||
-				    slot->offset > buffer->bytes || bytes > buffer->bytes - slot->offset ||
-				    slot->offset > ~0ull - buffer->mc) {
-					completePresentLocked(*slot, kIOReturnAborted, 0);
-				} else if (!Flip::flipTo(*this, surface, buffer->mc + slot->offset, "present async")) {
-					completePresentLocked(*slot, kIOReturnNotResponding, 0);
-					if (!presentActive)
-						clearPresentationLocked();
-				} else {
-					presentActive = true;
-					presentOwner = owner;
-					presentHandle = slot->handle;
-					presentOffset = slot->offset;
-					presentStarted = mach_absolute_time();
-					presentSurface = surface;
-					completePresentLocked(*slot, kIOReturnSuccess, frame);
-				}
-			}
-			if (!presentActive && !presentPending)
+		PresentSlot *slot = presentSlot(id, owner);
+		if (slot && slot->state == 1 && ++presentNoVblankTicks >= 100) {
+			completePresentLocked(*slot, kIOReturnTimeout, 0);
+			for (PresentSlot &pending : presentSlots)
+				if (pending.state == 1)
+					completePresentLocked(pending, kIOReturnTimeout, 0);
+			if (presentActive)
+				(void)restorePresentationLocked("present vblank timeout");
+			else
 				clearPresentationLocked();
-			again = presentPending != 0;
+			presentNoVblankTicks = 0;
 		}
+		const bool again = presentPending != 0;
+		IOLockUnlock(rtLock);
 		if (again)
 			schedulePresentationTimer();
 		return;
 	}
+
+	if (!IOLockTryLock(rtLock)) {
+		schedulePresentationTimer();
+		return;
+	}
+	presentNoVblankTicks = 0;
+	checkPresentationTimeoutLocked();
+	PresentSlot *slot = presentSlot(id, owner);
+	if (slot && slot->state == 1) {
+		RtBuffer *buffer = bufferFor(owner, slot->handle);
+		const uint64_t bytes = Flip::surfaceBytes(surface.pitch, surface.height);
+		if (!buffer || !buffer->device || (slot->offset & 255u) ||
+		    slot->offset > buffer->bytes || bytes > buffer->bytes - slot->offset ||
+		    slot->offset > ~0ull - buffer->mc) {
+			completePresentLocked(*slot, kIOReturnAborted, 0);
+		} else {
+			// Arm rollback before touching the address: flipTo is allowed to
+			// report failure after the user address has latched.
+			presentActive = true;
+			presentOwner = owner;
+			presentHandle = slot->handle;
+			presentOffset = slot->offset;
+			presentStarted = mach_absolute_time();
+			presentSurface = surface;
+			if (!Flip::flipTo(*this, surface, buffer->mc + slot->offset, "present async")) {
+				completePresentLocked(*slot, kIOReturnNotResponding, 0);
+				(void)restorePresentationLocked("present async failure");
+			} else {
+				completePresentLocked(*slot, kIOReturnSuccess, frame);
+			}
+		}
+	}
+	if (!presentActive && !presentPending)
+		clearPresentationLocked();
+	const bool again = presentPending != 0;
+	IOLockUnlock(rtLock);
+	if (again)
+		schedulePresentationTimer();
 }
 
 void RDNA4Compute::clearPresentationLocked() {
@@ -811,6 +842,7 @@ void RDNA4Compute::clearPresentationLocked() {
 	presentOffset = 0;
 	presentStarted = 0;
 	presentSurface = {};
+	presentNoVblankTicks = 0;
 }
 
 IOReturn RDNA4Compute::restorePresentationLocked(const char *why) {
@@ -821,12 +853,16 @@ IOReturn RDNA4Compute::restorePresentationLocked(const char *why) {
 	}
 	const bool restored = Flip::flipTo(*this, presentSurface, presentSurface.desktop,
 	                                   why ? why : "restore");
-	if (restored)
+	if (restored) {
 		RLOG("present: restored desktop (%s)", why ? why : "requested");
-	else
-		RLOG("present: desktop restore failed (%s)", why ? why : "requested");
-	clearPresentationLocked();
-	return restored ? kIOReturnSuccess : kIOReturnNotResponding;
+		clearPresentationLocked();
+		return kIOReturnSuccess;
+	}
+	RLOG("present: desktop restore failed (%s)", why ? why : "requested");
+	// flipTo can fail after the user address has latched. Keep the state
+	// armed so a later client call retries the 30 s auto-restore.
+	presentStarted = mach_absolute_time();
+	return kIOReturnNotResponding;
 }
 
 void RDNA4Compute::checkPresentationTimeoutLocked() {
@@ -1448,6 +1484,8 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 
 IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t offset,
                                  uint64_t &geometry, uint64_t &pitch) {
+	if (!featureAllowed("flip"))
+		return kIOReturnUnsupported;
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
@@ -1478,14 +1516,19 @@ IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t of
 	if (!bytes || offset > b->bytes || bytes > b->bytes - offset || offset > ~0ull - b->mc)
 		return kIOReturnBadArgument;
 	const uint64_t target = b->mc + offset;
-	if (!Flip::flipTo(*this, surface, target, "present"))
-		return kIOReturnNotResponding;
+	// Keep a rollback target armed before the first address write.  flipTo
+	// can fail after the user address has latched, in which case the desktop
+	// must be restored immediately and remain eligible for auto-restore.
 	presentActive = true;
 	presentOwner = owner;
 	presentHandle = handle;
 	presentOffset = offset;
 	presentStarted = mach_absolute_time();
 	presentSurface = surface;
+	if (!Flip::flipTo(*this, surface, target, "present")) {
+		(void)restorePresentationLocked("present failure");
+		return kIOReturnNotResponding;
+	}
 	geometry = (static_cast<uint64_t>(surface.width) & 0xffffu) |
 	           ((static_cast<uint64_t>(surface.height) & 0xffffu) << 16);
 	pitch = surface.pitch;
@@ -1496,6 +1539,8 @@ IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t of
 
 IOReturn RDNA4Compute::rtPresentAsync(const void *owner, uint64_t handle, uint64_t offset,
                                       uint64_t &presentId) {
+	if (!featureAllowed("flip"))
+		return kIOReturnUnsupported;
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
 	if (!rtReady)
@@ -1541,6 +1586,8 @@ IOReturn RDNA4Compute::rtPresentAsync(const void *owner, uint64_t handle, uint64
 
 IOReturn RDNA4Compute::rtWaitPresent(const void *owner, uint64_t presentId, uint32_t timeoutMs,
                                      uint64_t &frame) {
+	if (!featureAllowed("flip"))
+		return kIOReturnUnsupported;
 	if (!presentId || timeoutMs > RDNA4_MAX_TIMEOUT_MS)
 		return kIOReturnBadArgument;
 	if (!timeoutMs)
