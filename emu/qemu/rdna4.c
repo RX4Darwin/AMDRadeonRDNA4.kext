@@ -2070,6 +2070,15 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             } else {
                 l->s[106] = 0;
             }
+        } else if ((dw & 0xffff0000u) == 0xd44c0000u) {     /* v_cmp_gt_u32_e64 */
+            uint32_t sdst = (dw >> 8) & 0x7f;
+            uint32_t a = rdna4_isa_src(l, dw1 & 0x1ff, dw2, &lit);
+            uint32_t b = rdna4_isa_src(l, (dw1 >> 9) & 0x1ff, dw2, &lit);
+            if (sdst > 106)
+                goto unknown;
+            if (l->s[126])
+                l->s[sdst] = a > b;
+            n = 2;
         } else if ((dw >> 26) == 0x3d) {                    /* SMEM loads */
             uint32_t op = (dw >> 13) & 0x3f, sbase = (dw & 0x3f) * 2, sdata = (dw >> 6) & 0x7f;
             uint32_t soff = dw1 >> 25, count = op <= 4 ? 1u << op : op == 5 ? 3 : 0;
