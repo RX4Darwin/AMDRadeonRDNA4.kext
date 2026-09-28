@@ -32,6 +32,7 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <time.h>
+#include <pthread.h>
 #include <unistd.h>
 
 // Accelerate is weak-linked (-weak_framework): a recovery system may not
@@ -133,6 +134,157 @@ static int checkFailed(const char *what, kern_return_t kr) {
 	}
 	printf("  ok    %s refused (%s)\n", what, rdna4_error(kr));
 	return 0;
+}
+
+static uint32_t aOf(uint32_t i);
+static uint32_t bOf(uint32_t i, uint32_t round);
+
+typedef struct VmPeerJob {
+	rdna4_t *gpu;
+	rdna4_program_t prog;
+	rdna4_buffer_t a, b, c;
+	uint32_t ha[256], hb[256], hc[256];
+	kern_return_t kr;
+	int bad;
+} VmPeerJob;
+
+static void *runVmPeer(void *opaque) {
+	VmPeerJob *j = (VmPeerJob *)opaque;
+	const uint64_t args[3] = { j->a.gpu, j->b.gpu, j->c.gpu };
+	const uint32_t groups[3] = { 4, 1, 1 }, size[3] = { 64, 1, 1 };
+	j->kr = rdna4_dispatch(j->gpu, &j->prog, groups, size, args, sizeof(args), 2000, NULL);
+	if (!j->kr)
+		j->kr = rdna4_read(j->gpu, &j->c, 0, j->hc, sizeof(j->hc));
+	if (!j->kr)
+		for (uint32_t i = 0; i < 256; i++)
+			if (j->hc[i] != j->ha[i] + 3 * j->hb[i])
+				j->bad++;
+	return NULL;
+}
+
+/* Prove that two VM clients have private address spaces and queues. */
+static int testVmIsolationAndPeers(rdna4_t *a) {
+	rdna4_t b;
+	memset(&b, 0, sizeof(b));
+	kern_return_t kr = rdna4_open(&b);
+	if (kr != KERN_SUCCESS) {
+		printf("  FAIL  VM isolation: second client: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	int fails = 0;
+	rdna4_program_t copy = {};
+	rdna4_buffer_t aPad1 = {}, aPad2 = {}, aSrc = {}, bDst = {};
+	uint32_t src[1024], dst[1024];
+	memset(dst, 0, sizeof(dst));
+	if ((kr = rdna4_load(&b, kBenchCodeObject, sizeof(kBenchCodeObject), "copy", &copy)) ||
+	    (kr = rdna4_alloc(a, 65536, &aPad1)) || (kr = rdna4_alloc(a, 65536, &aPad2)) ||
+	    (kr = rdna4_alloc(a, 65536, &aSrc)) || (kr = rdna4_alloc(&b, 65536, &bDst))) {
+		printf("  FAIL  VM isolation setup: %s\n", rdna4_error(kr));
+		fails++;
+		goto isolation_cleanup;
+	}
+	for (uint32_t i = 0; i < 1024; i++)
+		src[i] = 0xA5000000u ^ i;
+	if ((kr = rdna4_write(a, &aSrc, 0, src, sizeof(src))) ||
+	    (kr = rdna4_write(&b, &bDst, 0, dst, sizeof(dst)))) {
+		printf("  FAIL  VM isolation write: %s\n", rdna4_error(kr));
+		fails++;
+		goto isolation_cleanup;
+	}
+	{
+		const uint64_t args[2] = { aSrc.gpu, bDst.gpu };
+		const uint32_t groups[3] = { 1, 1, 1 }, size[3] = { 256, 1, 1 };
+		kr = rdna4_dispatch(&b, &copy, groups, size, args, sizeof(args), 2000, NULL);
+	}
+	if (kr || (kr = rdna4_read(&b, &bDst, 0, dst, sizeof(dst)))) {
+		printf("  FAIL  VM isolation dispatch: %s\n", rdna4_error(kr));
+		fails++;
+	} else {
+		for (uint32_t i = 0; i < 1024; i++)
+			if (dst[i])
+				fails++;
+		printf("  %s  VM isolation: client B could not read client A's VA\n",
+		       fails ? "FAIL" : "ok");
+	}
+
+isolation_cleanup:
+	if (bDst.handle)
+		rdna4_free(&b, &bDst);
+	if (aSrc.handle)
+		rdna4_free(a, &aSrc);
+	if (aPad2.handle)
+		rdna4_free(a, &aPad2);
+	if (aPad1.handle)
+		rdna4_free(a, &aPad1);
+	if (copy.handle)
+		rdna4_unload(&b, &copy);
+
+	VmPeerJob jobs[2];
+	memset(jobs, 0, sizeof(jobs));
+	jobs[0].gpu = a;
+	jobs[1].gpu = &b;
+	for (int j = 0; j < 2; j++) {
+		if ((kr = rdna4_load(jobs[j].gpu, kVaddCodeObject, sizeof(kVaddCodeObject), "vadd",
+		                     &jobs[j].prog)) ||
+		    (kr = rdna4_alloc(jobs[j].gpu, sizeof(jobs[j].ha), &jobs[j].a)) ||
+		    (kr = rdna4_alloc(jobs[j].gpu, sizeof(jobs[j].hb), &jobs[j].b)) ||
+		    (kr = rdna4_alloc(jobs[j].gpu, sizeof(jobs[j].hc), &jobs[j].c))) {
+			printf("  FAIL  VM peer setup: %s\n", rdna4_error(kr));
+			fails++;
+			goto peers_cleanup;
+		}
+		for (uint32_t i = 0; i < 256; i++) {
+			jobs[j].ha[i] = aOf(i + j * 17);
+			jobs[j].hb[i] = bOf(i, j + 3);
+			jobs[j].hc[i] = 0xffffffffu;
+		}
+		if ((kr = rdna4_write(jobs[j].gpu, &jobs[j].a, 0, jobs[j].ha, sizeof(jobs[j].ha))) ||
+		    (kr = rdna4_write(jobs[j].gpu, &jobs[j].b, 0, jobs[j].hb, sizeof(jobs[j].hb))) ||
+		    (kr = rdna4_write(jobs[j].gpu, &jobs[j].c, 0, jobs[j].hc, sizeof(jobs[j].hc)))) {
+			printf("  FAIL  VM peer write: %s\n", rdna4_error(kr));
+			fails++;
+			goto peers_cleanup;
+		}
+	}
+	{
+		pthread_t threads[2];
+		int made = 0;
+		for (; made < 2; made++)
+			if (pthread_create(&threads[made], NULL, runVmPeer, &jobs[made]))
+				break;
+		if (made != 2) {
+			printf("  FAIL  VM peer dispatch: could not create both threads\n");
+			fails++;
+			for (int j = 0; j < made; j++)
+				pthread_join(threads[j], NULL);
+		} else {
+			for (int j = 0; j < 2; j++)
+				pthread_join(threads[j], NULL);
+			for (int j = 0; j < 2; j++)
+				if (jobs[j].kr || jobs[j].bad) {
+					printf("  FAIL  VM peer %d: %s%s\n", j,
+					       jobs[j].kr ? rdna4_error(jobs[j].kr) : "wrong results",
+					       jobs[j].bad ? " (data mismatch)" : "");
+					fails++;
+				}
+			if (!fails)
+				printf("  ok    two VM clients dispatched concurrently; both results exact\n");
+		}
+	}
+
+peers_cleanup:
+	for (int j = 0; j < 2; j++) {
+		if (jobs[j].c.handle)
+			rdna4_free(jobs[j].gpu, &jobs[j].c);
+		if (jobs[j].b.handle)
+			rdna4_free(jobs[j].gpu, &jobs[j].b);
+		if (jobs[j].a.handle)
+			rdna4_free(jobs[j].gpu, &jobs[j].a);
+		if (jobs[j].prog.handle)
+			rdna4_unload(jobs[j].gpu, &jobs[j].prog);
+	}
+	rdna4_close(&b);
+	return fails;
 }
 
 static uint32_t aOf(uint32_t i) { return i * 2654435761u; }
@@ -313,6 +465,9 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 	}
 	if (cmdInfo(gpu))
 		return 1;
+	rdna4_info_t initial;
+	if (rdna4_info(gpu, &initial) == KERN_SUCCESS && (initial.flags & RDNA4_FLAG_VM))
+		fails += testVmIsolationAndPeers(gpu);
 
 	rdna4_program_t prog;
 	kern_return_t kr = rdna4_load(gpu, kVaddCodeObject, sizeof(kVaddCodeObject), "vadd", &prog);
