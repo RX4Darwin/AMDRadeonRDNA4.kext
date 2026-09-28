@@ -3033,6 +3033,125 @@ static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)
     return *why == NULL;
 }
 
+/* Execute one compute-form INDIRECT_BUFFER.  The queue packet is the only
+ * place where the kernel supplies VALID and the client's VMID; the IB itself
+ * is fetched through that VMID, so a host buffer exercises pci_dma as well as
+ * the shader's system-memory accesses.  One nesting level matches this W8
+ * model and avoids accepting an unbounded user command stream. */
+static bool rdna4_mec_run_ib(RDNA4State *s, uint64_t address, uint32_t dwords,
+                             uint32_t vmid, unsigned depth)
+{
+    if (!dwords || dwords > (1u << 20) || depth > 1) {
+        fprintf(stderr, "rdna4: mec: invalid indirect buffer length %u or nesting %u\n",
+                dwords, depth);
+        return false;
+    }
+    uint32_t pos = 0;
+    while (pos < dwords) {
+        uint32_t dw[16] = { 0 };
+        uint32_t hdr;
+        if (dwords - pos < 1 || !rdna4_vm_access(s, address + 4ull * pos, (uint8_t *)&hdr,
+                                                  sizeof(hdr), vmid, false, false)) {
+            fprintf(stderr, "rdna4: mec: indirect buffer 0x%" PRIx64 " header fault\n",
+                    (uint64_t)(address + 4ull * pos));
+            return false;
+        }
+        dw[0] = hdr;
+        uint32_t op = (hdr >> 8) & 0xff, count = (hdr >> 16) & 0x3fff;
+        uint32_t len = count + 2;
+        if (count == 0x3fff && op == 0x10)
+            len = 1;
+        if ((hdr >> 30) != 3 || !len || len > 16 || len > dwords - pos) {
+            fprintf(stderr, "rdna4: mec: invalid indirect packet 0x%08x at dword %u\n",
+                    hdr, pos);
+            return false;
+        }
+        if (len > 1 && !rdna4_vm_access(s, address + 4ull * pos + 4, (uint8_t *)&dw[1],
+                                        4ull * (len - 1), vmid, false, false)) {
+            fprintf(stderr, "rdna4: mec: indirect packet at dword %u is unmapped\n", pos);
+            return false;
+        }
+        switch (op) {
+        case 0x10:
+            break;
+        case 0x79:
+        case 0x76: {
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t base = op == 0x79 ? 0xc000 : 0x2c00;
+                uint32_t byte = (base + dw[1] + i) * 4;
+                if (byte + 4 <= RDNA4_MMIO_SIZE)
+                    reg_set(s, byte, dw[2 + i]);
+            }
+            break;
+        }
+        case 0x58:
+            break;
+        case 0x15:
+            if (!rdna4_dispatch(s, dw[1], dw[2], dw[3], dw[4], vmid)) {
+                fprintf(stderr, "rdna4: mec: indirect dispatch left queue busy\n");
+                return false;
+            }
+            break;
+        case 0x37: {
+            uint64_t a = (dw[2] & ~3u) | ((uint64_t)dw[3] << 32);
+            uint32_t n = count - 2;
+            if (count < 2 || n > 14) {
+                fprintf(stderr, "rdna4: mec: malformed indirect WRITE_DATA\n");
+                return false;
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                if (!rdna4_vm_access(s, a + 4ull * i, (uint8_t *)&dw[4 + i], 4,
+                                     vmid, true, false)) {
+                    fprintf(stderr, "rdna4: mec: indirect WRITE_DATA to 0x%" PRIx64 " refused\n",
+                            (uint64_t)(a + 4ull * i));
+                    return false;
+                }
+            }
+            break;
+        }
+        case 0x49: {
+            uint64_t a = (dw[3] & ~3u) | ((uint64_t)dw[4] << 32);
+            uint32_t sel = dw[2] >> 29;
+            uint64_t value = dw[5] | ((uint64_t)dw[6] << 32);
+            uint32_t bytes = sel == 2 ? 8 : 4;
+            if (count < 6 || !rdna4_vm_access(s, a, (uint8_t *)&value, bytes, vmid, true, false)) {
+                fprintf(stderr, "rdna4: mec: indirect RELEASE_MEM to 0x%" PRIx64 " refused\n", a);
+                return false;
+            }
+            if (((dw[2] >> 24) & 7) == 2 && s->selected_pipe < 2 &&
+                (reg_get(s, REG_CP_ME1_PIPE0_INT_CNTL + 4 * s->selected_pipe) &
+                 CP_TIME_STAMP_INT_ENABLE)) {
+                rdna4_ih_emit(s, 0x0a, 181,
+                              (uint8_t)((s->selected_queue << 4) | (1u << 2) | s->selected_pipe),
+                              dw[5]);
+            }
+            break;
+        }
+        case 0x3f: {
+            uint32_t control = dw[3];
+            uint32_t childVmid = (control >> 24) & 0xf;
+            if (!(control & (1u << 23))) {
+                fprintf(stderr, "rdna4: mec: indirect buffer missing VALID\n");
+                return false;
+            }
+            if (control & ((1u << 20) | (1u << 21) | (1u << 31)) || childVmid != vmid) {
+                fprintf(stderr, "rdna4: mec: indirect buffer chain/offload/privilege or VMID mismatch\n");
+                return false;
+            }
+            if (!rdna4_mec_run_ib(s, (uint64_t)dw[1] | ((uint64_t)dw[2] << 32),
+                                  control & 0xfffff, childVmid, depth + 1))
+                return false;
+            break;
+        }
+        default:
+            fprintf(stderr, "rdna4: mec: unknown indirect PM4 op 0x%02x at dword %u\n", op, pos);
+            return false;
+        }
+        pos += len;
+    }
+    return true;
+}
+
 static bool rdna4_select_mec_queue(RDNA4State *s, uint32_t db_dword)
 {
     uint32_t off;
@@ -3124,6 +3243,27 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
                 return;
             }
             break;
+        case 0x3f: {                                 /* compute INDIRECT_BUFFER */
+            uint32_t control = dw[3];
+            if (!(control & (1u << 23))) {
+                fprintf(stderr, "rdna4: mec: indirect buffer missing VALID; queue stopped\n");
+                s->mec_hung = true;
+                return;
+            }
+            if (control & ((1u << 20) | (1u << 21) | (1u << 31)) ||
+                ((control >> 24) & 0xf) != vmid) {
+                fprintf(stderr, "rdna4: mec: indirect buffer was privileged/chained or VMID mismatched; queue stopped\n");
+                s->mec_hung = true;
+                return;
+            }
+            if (!rdna4_mec_run_ib(s, (uint64_t)dw[1] | ((uint64_t)dw[2] << 32),
+                                  control & 0xfffff, vmid, 0)) {
+                fprintf(stderr, "rdna4: mec: invalid indirect buffer; queue stopped\n");
+                s->mec_hung = true;
+                return;
+            }
+            break;
+        }
         case 0x37: {                                 /* WRITE_DATA to memory */
             uint64_t a = (dw[2] & ~3u) | ((uint64_t)dw[3] << 32);
             uint32_t n = count - 2;
