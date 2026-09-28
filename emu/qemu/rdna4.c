@@ -2585,7 +2585,7 @@ static void rdna4_get_scanout(RDNA4State *s, RDNA4Scanout *so)
         pitch = (reg_get(s, SEG2(HUBP_SURFACE_PITCH + hp)) & 0xffff) + 1;
         so->stride = pitch * 4;
         if (addr < fb || so->width < 64 || so->height < 64 || pitch < so->width ||
-            addr - fb + (uint64_t)so->stride * so->height > s->aperture) {
+            addr - fb + (uint64_t)so->stride * so->height > rdna4_vram_size()) {
             return;
         }
         so->offset = addr - fb;
