@@ -181,7 +181,9 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 			flags |= GpuVm::kExecutable;
 		*entry(pteOff) = GpuVm::encodePte(pa, flags, fragment64k);
 	}
-	if (firstPt == ~0ull || !vmTableSync(c, 0, 0x2000))
+	/* The root, PDB1, and the PDB0 entry that points at the PT all have to
+	 * reach VRAM before the queue can walk this mapping. */
+	if (firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
 		return false;
 	for (uint64_t pt = firstPt; pt <= lastPt; pt += 0x1000)
 		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
