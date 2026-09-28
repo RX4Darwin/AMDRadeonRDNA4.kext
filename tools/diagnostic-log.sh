@@ -417,7 +417,15 @@ registry_value() {
 	elif grep -q 'RDNA4FB: ih: self-test:' "$KLOG" && \
 		grep -q 'RDNA4FB: ih: self-test totals:' "$KLOG" && \
 		case "$(registry_value ih)" in PASS*) true;; *) false;; esac; then
-		record ih PASS "$(registry_value ih | sed 's/^PASS //')"
+		ih_key="$(registry_value ih | sed 's/^PASS //')"
+		if grep -q 'RDNA4FB: ih: self-test: SDMA fence/trap delivered' "$KLOG"; then
+			ih_key="$ih_key; self-test SDMA trap delivered"
+		else
+			ih_key="$ih_key; self-test completed with polling fallback"
+		fi
+		grep -q 'RDNA4FB: ih: self-test: CP EOP delivered' "$KLOG" &&
+			ih_key="$ih_key; CP EOP delivered"
+		record ih PASS "$ih_key"
 	else
 		record ih FAIL "IH self-test and RDNA4FB,Results did not both pass"
 	fi
