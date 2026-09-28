@@ -1667,11 +1667,14 @@ static int testIhRing() {
 	failures += check(Ih::advance(size - 16, 32, size) == 16 && Ih::hasEntries(size - 32, 0, size) &&
 	                  Ih::overflowRecovery(size - 32, size) == 0,
 	                  "ih: ring wrap/overflow arithmetic");
-	failures += check(!Ih::missEligible(false, true, false, true) &&
-	                  !Ih::missEligible(true, true, false, false) &&
-	                  !Ih::missEligible(true, true, true, true) &&
-	                  Ih::missEligible(true, true, false, true),
-	                  "ih: miss qualification requires sleep, completion, and a 5 ms recheck");
+        failures += check(!Ih::missEligible(false, true, false, true) &&
+                          !Ih::missEligible(true, true, false, false) &&
+                          !Ih::missEligible(true, true, true, true) &&
+                          Ih::missEligible(true, true, false, true),
+                          "ih: miss qualification requires sleep, completion, and a 5 ms recheck");
+        failures += check(Ih::isMec1Pipe0Queue0(4) && !Ih::isMec1Pipe0Queue0(0) &&
+                          !Ih::isMec1Pipe0Queue0(5) && !Ih::isMec1Pipe0Queue0(20),
+                          "ih: EOP ring 4 is exactly ME1 pipe0 queue0");
 	printf("\nih: v7 decode, ring wrap/overflow arithmetic, and wait-miss qualification %s\n",
 	       failures ? "FAILED" : "ok");
 	return failures;

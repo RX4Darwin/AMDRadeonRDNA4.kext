@@ -421,9 +421,14 @@ uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 	CLOG("bring-up to stage %u requested", stage);
 	if (!rtLock)
 		rtLock = IOLockAlloc();
-	if (!resultLock)
-		resultLock = IOLockAlloc();
-	publishResult("runtime", "SKIPPED bring-up in progress");
+        if (!resultLock)
+                resultLock = IOLockAlloc();
+        shutdownQuiesced = false;
+        registerShutdownInterest();
+        // A warm restart can leave the GOP's engine state live. Disarm old
+        // producers before allocating or publishing any new DMA buffers.
+        defensiveStart();
+        publishResult("runtime", "SKIPPED bring-up in progress");
 
 	if (!survey())
 		return StageOff;

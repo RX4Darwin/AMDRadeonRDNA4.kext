@@ -574,6 +574,7 @@ struct RDNA4State {
     bool     hang_sticky;    /* queue dequeue never completes */
     bool     sleep_reset;    /* monitor-triggered compute power reset */
     bool     gfx_hang;       /* accept gfx kicks but leave the ring stopped */
+    bool     warm_keep;      /* reset keeps live engines/queues, like warm card restart */
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
     bool     cursor_reject_logged;
     uint32_t gfx_break;      /* corrupt one G3 MUST register at draw time */
@@ -629,6 +630,8 @@ struct RDNA4State {
     uint64_t     gfx_pending_wptr;
     uint64_t     gfx_work_base, gfx_work_pos, gfx_work_end;
     uint32_t     gfx_work_ring_dw;
+    bool         warm_dma_window;
+    uint64_t     dma_after_reset_writes;
 
     /* Queue kicks are consumed by the QEMU main loop, never by an MMIO
      * handler.  The realtime timer re-arms the bottom half between slices. */
@@ -728,6 +731,49 @@ static inline void reg_set(RDNA4State *s, uint32_t byte, uint32_t val)
         return;
     }
     s->regs[byte / 4] = val;
+}
+
+static bool rdna4_bus_master_enabled(RDNA4State *s)
+{
+    PCIDevice *pci = PCI_DEVICE(s);
+    return (pci_get_word(pci->config + PCI_COMMAND) & PCI_COMMAND_MASTER) != 0;
+}
+
+/* All device writes into guest/system memory use this gate. IH and writeback
+ * DMA must stop when PCI Command.BusMaster is cleared; a register-only reset
+ * must never let an old queue scribble into a new kernel's allocations. */
+static MemTxResult rdna4_dma_write(RDNA4State *s, dma_addr_t address,
+                                   const void *buf, dma_addr_t len)
+{
+    if (!rdna4_bus_master_enabled(s)) {
+        if (s->trace)
+            fprintf(stderr, "rdna4: DMA write refused while PCI bus master is off\n");
+        return MEMTX_ERROR;
+    }
+    MemTxResult result = pci_dma_write(PCI_DEVICE(s), address, buf, len);
+    if (result == MEMTX_OK && s->warm_dma_window) {
+        s->dma_after_reset_writes++;
+        if (s->dma_after_reset_writes <= 3) {
+            fprintf(stderr, "rdna4: warm-keep: DMA write after reset #%" PRIu64
+                    " at 0x%" PRIx64 " (%" PRIu64 " bytes)\n",
+                    s->dma_after_reset_writes, (uint64_t)address, (uint64_t)len);
+        }
+    }
+    return result;
+}
+
+static bool rdna4_engine_active(RDNA4State *s)
+{
+    if (s->dispatch || s->mec_work.active || s->mec_ib.active ||
+        s->sdma_work.active || s->gfx_active || s->gfx_pending || s->gfx_booted)
+        return true;
+    for (uint32_t pipe = 0; pipe < 4; pipe++)
+        for (uint32_t queue = 0; queue < 8; queue++)
+            if (s->hqd[pipe][queue].used || s->hqd[pipe][queue].pending)
+                return true;
+    return (s->ih_ring_bus &&
+            (reg_get(s, REG_IH_RB_CNTL) & (IH_RB_ENABLE | IH_ENABLE_INTR))) ||
+           (reg_get(s, REG_SDMA0_RB_CNTL) & 1u);
 }
 
 /* ---- VRAM --------------------------------------------------------------- */
@@ -1758,7 +1804,7 @@ static void rdna4_ih_emit_vmid(RDNA4State *s, uint8_t client, uint8_t source,
     stl_le_p(entry + 4 * 4, data0);
     uint64_t ring_bus = ((uint64_t)reg_get(s, REG_IH_RB_BASE) << 8) |
                         ((uint64_t)(reg_get(s, REG_IH_RB_BASE_HI) & 0xff) << 40);
-    if (pci_dma_write(pci, ring_bus + wptr, entry, sizeof(entry)) != MEMTX_OK) {
+    if (rdna4_dma_write(s, ring_bus + wptr, entry, sizeof(entry)) != MEMTX_OK) {
         fprintf(stderr, "rdna4: ih: ring DMA write at 0x%" PRIx64 " failed\n",
                 ring_bus + wptr);
         return;
@@ -1771,7 +1817,7 @@ static void rdna4_ih_emit_vmid(RDNA4State *s, uint8_t client, uint8_t source,
                       ((uint64_t)(reg_get(s, REG_IH_WPTR_ADDR_HI) & 0xffff) << 32);
         uint8_t bytes[4];
         stl_le_p(bytes, raw);
-        if (pci_dma_write(pci, wb, bytes, sizeof(bytes)) != MEMTX_OK) {
+        if (rdna4_dma_write(s, wb, bytes, sizeof(bytes)) != MEMTX_OK) {
             fprintf(stderr, "rdna4: ih: wptr writeback at 0x%" PRIx64 " failed\n", wb);
             return;
         }
@@ -2022,7 +2068,7 @@ static bool rdna4_vm_access(RDNA4State *s, uint64_t va, uint8_t *data, uint64_t 
                     rdna4_vm_fault(s, vmid, va);
                     return false;
                 }
-                MemTxResult result = write ? pci_dma_write(pci, target.address, data, chunk)
+                MemTxResult result = write ? rdna4_dma_write(s, target.address, data, chunk)
                                            : pci_dma_read(pci, target.address, data, chunk);
                 if (result != MEMTX_OK) {
                     rdna4_vm_fault(s, vmid, va);
@@ -2144,13 +2190,13 @@ static bool rdna4_sdma_copy(RDNA4State *s, uint64_t src, uint64_t dst, uint32_t 
         return false;                               /* the engine stops on the packet */
     }
     if (sp) {
-        ok = pci_dma_write(pci, da, sp, bytes) == MEMTX_OK;          /* VRAM -> system */
+        ok = rdna4_dma_write(s, da, sp, bytes) == MEMTX_OK;          /* VRAM -> system */
     } else if (dp) {
         ok = pci_dma_read(pci, sa, dp, bytes) == MEMTX_OK;           /* system -> VRAM */
     } else {
         g_autofree uint8_t *tmp = g_malloc(bytes);
         ok = pci_dma_read(pci, sa, tmp, bytes) == MEMTX_OK &&
-             pci_dma_write(pci, da, tmp, bytes) == MEMTX_OK;
+             rdna4_dma_write(s, da, tmp, bytes) == MEMTX_OK;
     }
     if (!ok) {
         fprintf(stderr, "rdna4: sdma: bus-master DMA %s 0x%" PRIx64 " failed\n",
@@ -3499,7 +3545,7 @@ static bool rdna4_mec_ib_packet(RDNA4State *s)
         if (((dw[2] >> 24) & 7) == 2 && s->selected_pipe < 2 &&
             (reg_get(s, REG_CP_ME1_PIPE0_INT_CNTL + 4 * s->selected_pipe) &
              CP_TIME_STAMP_INT_ENABLE)) {
-            rdna4_ih_emit(s, 0x0a, 181,
+            rdna4_ih_emit(s, 0x14, 181,
                           (uint8_t)((s->selected_queue << 4) | (1u << 2) | s->selected_pipe),
                           dw[5]);
         }
@@ -3779,7 +3825,7 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
             if (((dw[2] >> 24) & 7) == 2 && s->selected_pipe < 2 &&
                 (reg_get(s, REG_CP_ME1_PIPE0_INT_CNTL + 4 * s->selected_pipe) &
                  CP_TIME_STAMP_INT_ENABLE)) {
-                rdna4_ih_emit(s, 0x0a, 181,
+                rdna4_ih_emit(s, 0x14, 181,
                               (uint8_t)((s->selected_queue << 4) | (1u << 2) | s->selected_pipe),
                               dw[5]);
             }
@@ -6101,6 +6147,17 @@ static void rdna4_reset(DeviceState *dev)
     RDNA4State *s = RDNA4(dev);
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    if (s->warm_keep && rdna4_engine_active(s)) {
+        if (s->warm_dma_window)
+            fprintf(stderr, "rdna4: warm-keep: DMA-after-reset writes: %" PRIu64 "\n",
+                    s->dma_after_reset_writes);
+        s->warm_dma_window = true;
+        s->dma_after_reset_writes = 0;
+        fprintf(stderr, "rdna4: warm-keep: reset preserves IH/SDMA/MEC/GFX; "
+                "counting DMA writes until the next reset\n");
+        return;
+    }
+
     if (s->work_timer)
         timer_del(s->work_timer);
     if (s->work_bh)
@@ -6295,6 +6352,10 @@ static void rdna4_exit(PCIDevice *dev)
 {
     RDNA4State *s = RDNA4(dev);
 
+    if (s->warm_dma_window)
+        fprintf(stderr, "rdna4: warm-keep: DMA-after-reset writes: %" PRIu64 "\n",
+                s->dma_after_reset_writes);
+
     rdna4_dispatch_free(s->dispatch);
     s->dispatch = NULL;
     if (s->work_bh) {
@@ -6343,6 +6404,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,
                 bool),
     DEFINE_PROP_BOOL("gfx-hang", RDNA4State, gfx_hang, false),
+    DEFINE_PROP_BOOL("warm-keep", RDNA4State, warm_keep, false),
     DEFINE_PROP_UINT32("gfx-break", RDNA4State, gfx_break, 0),
     DEFINE_PROP_BOOL("gfx-trace", RDNA4State, gfx_trace, false),
 };

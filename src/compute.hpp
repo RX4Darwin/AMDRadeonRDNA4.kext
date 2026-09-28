@@ -76,6 +76,7 @@ class IOWorkLoop;
 class OSObject;
 class IOMemoryMap;
 class OSDictionary;
+class IONotifier;
 
 class RDNA4Compute {
 public:
@@ -192,9 +193,15 @@ private:
 	void choosePool();
 
 	// Stages 2+ (bring-up thread).
-	static void threadMain(void *arg, wait_result_t);
-	static void resumeMain(void *arg, wait_result_t);
-	void runStages();
+        static void threadMain(void *arg, wait_result_t);
+        static void resumeMain(void *arg, wait_result_t);
+        static IOReturn systemPowerMessage(void *target, void *refCon, UInt32 messageType,
+                                            IOService *provider, void *messageArgument,
+                                            vm_size_t argSize);
+        void registerShutdownInterest();
+        void defensiveStart();
+        void quiesceForShutdown(const char *why);
+        void runStages();
 	void resetRuntimeForResume();
 
 	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
@@ -528,7 +535,9 @@ private:
 		bool active { false };
 		bool aborted { false };
 	};
-	IOLock        *rtLock { nullptr };
+        IOLock        *rtLock { nullptr };
+        IONotifier   *shutdownInterest { nullptr };
+        bool           shutdownQuiesced { false };
 	bool           rtReady { false };       // a dispatching stage finished
 	bool           rtWedged { false };      // a dispatch timed out
 	bool           powerSleeping { false };

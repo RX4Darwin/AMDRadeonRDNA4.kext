@@ -17,6 +17,13 @@ namespace Ih {
 constexpr uint32_t kEntryDwords = 8;
 constexpr uint32_t kEntryBytes = kEntryDwords * 4;
 
+// gfx_v12_0_eop_irq packs ring_id as queue [6:4], ME [3:2], pipe [1:0].
+constexpr bool isMec1Pipe0Queue0(uint8_t ringId) {
+	return ((ringId & 0x0cu) >> 2) == 1 &&
+	       (ringId & 0x03u) == 0 &&
+	       ((ringId & 0x70u) >> 4) == 0;
+}
+
 struct Entry {
 	uint8_t  clientId;
 	uint8_t  srcId;
