@@ -421,6 +421,7 @@ public:
 	IOReturn rtOpen(const void *owner);
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
 	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
+	IOReturn rtSleepTest(const void *owner, uint32_t phase);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtAllocHost(const void *owner, task_t task, uint64_t bytes, uint64_t flags,
 	                     uint64_t &handle, uint64_t &gpu, uint64_t &user);

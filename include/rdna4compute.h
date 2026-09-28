@@ -71,6 +71,8 @@ enum {
 	kRDNA4MethodAllocHost,
 	/* -> RDNA4Sensors, the current SMU metrics snapshot */
 	kRDNA4MethodSensors,
+	/* debug-only root sleep cycle: 1 quiesce, 2 re-bring-up */
+	kRDNA4MethodSleepTest,
 	kRDNA4MethodCount
 };
 

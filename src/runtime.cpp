@@ -655,6 +655,29 @@ IOReturn RDNA4Compute::rtSensors(const void *owner, RDNA4Sensors &out) {
 	return readSensors(out) ? kIOReturnSuccess : kIOReturnNotResponding;
 }
 
+IOReturn RDNA4Compute::rtSleepTest(const void *owner, uint32_t phase) {
+	uint32_t enabled = 0;
+	if (!PE_parse_boot_argn("rdna4-sleeptest", &enabled, sizeof(enabled)) || !enabled)
+		return kIOReturnUnsupported;
+	if (phase != 1 && phase != 2)
+		return kIOReturnBadArgument;
+	/* IOUserClient::initWithTask already requires kIOClientPrivilegeAdministrator;
+	 * this selector is therefore root-only along with the rest of this service. */
+	{
+		Locked g(rtLock);
+		if (!clientFor(owner))
+			return kIOReturnNotFound;
+	}
+	if (phase == 1) {
+		RLOG("power: debug sleep selector phase 1");
+		powerWillSleep();
+	} else {
+		RLOG("power: debug sleep selector phase 2");
+		powerDidWake();
+	}
+	return kIOReturnSuccess;
+}
+
 // Contents are undefined, as with any GPU allocation; callers write first.
 IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	Locked g(rtLock);

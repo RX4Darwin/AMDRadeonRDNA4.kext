@@ -17,12 +17,17 @@ OSDefineMetaClassAndStructors(RDNA4ComputeService, IOService)
 OSDefineMetaClassAndStructors(RDNA4ComputeClient, IOUserClient)
 
 static IOPMPowerState kComputePowerStates[2] = {
-	{ 1, kIOPMDeviceUsable | kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+	/* IOKit ordinals run from the lowest power state to the highest. */
 	{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+	{ 1, kIOPMDeviceUsable | kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
 };
 
 IOReturn RDNA4ComputeService::setPowerState(unsigned long powerStateOrdinal,
                                              IOService *) {
+	uint64_t nowNs = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+	IOLog("RDNA4FB: power: setPowerState ordinal %lu at %llu ns\n",
+	      powerStateOrdinal, nowNs);
 	if (!compute)
 		return kIOPMAckImplied;
 	if (powerStateOrdinal == 0)
@@ -87,6 +92,7 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sRestore,    0,          0,                          0,           0 },
 	{ sAllocHost,  2,          0,                          3,           0 },
 	{ sSensors,    0,          0,                          0,           sizeof(RDNA4Sensors) },
+	{ sSleepTest,  1,          0,                          0,           0 },
 };
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -108,6 +114,10 @@ IOReturn RDNA4ComputeClient::sSensors(OSObject *t, void *, IOExternalMethodArgum
 	if (!a->structureOutput || a->structureOutputSize != sizeof(RDNA4Sensors))
 		return kIOReturnBadArgument;
 	return self(t)->compute->rtSensors(t, *static_cast<RDNA4Sensors *>(a->structureOutput));
+}
+
+IOReturn RDNA4ComputeClient::sSleepTest(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtSleepTest(t, static_cast<uint32_t>(a->scalarInput[0]));
 }
 
 IOReturn RDNA4ComputeClient::sAlloc(OSObject *t, void *, IOExternalMethodArguments *a) {

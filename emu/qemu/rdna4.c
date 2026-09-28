@@ -397,6 +397,7 @@ struct RDNA4State {
     bool     ih_dead;        /* IH writes the ring but never raises MSI */
     bool     dcn_irq_storm;  /* DCN vblank source runs at 10x */
     bool     hang_sticky;    /* queue dequeue never completes */
+    bool     sleep_reset;    /* monitor-triggered compute power reset */
 
     uint32_t *regs;           /* BAR5 image, RDNA4_MMIO_SIZE bytes */
     uint8_t  *resv;           /* top RDNA4_RESV_SIZE bytes of VRAM */
@@ -818,6 +819,8 @@ static uint64_t rdna4_dcn_period_ns(RDNA4State *s, int otg)
     return pclk ? htot * vtot * NANOSECONDS_PER_SECOND / pclk : 0;
 }
 
+static void rdna4_reset(DeviceState *dev);
+
 static void rdna4_dcn_vblank(RDNA4State *s, int otg, uint64_t frame)
 {
     uint32_t addr = SEG2(OTG_GLOBAL_SYNC_STATUS + otg * OTG_STRIDE);
@@ -831,6 +834,12 @@ static void rdna4_dcn_vblank(RDNA4State *s, int otg, uint64_t frame)
 static void rdna4_dcn_timer(void *opaque)
 {
     RDNA4State *s = opaque;
+    if (s->sleep_reset) {
+        s->sleep_reset = false;
+        fprintf(stderr, "rdna4: sleep-reset: compute power reset; DCN and VRAM retained\n");
+        rdna4_reset(DEVICE(s));
+        return;
+    }
     const uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint64_t next = 0;
     for (int otg = 0; otg < NUM_OTG; otg++) {
@@ -3433,6 +3442,8 @@ static void rdna4_reset(DeviceState *dev)
     RDNA4State *s = RDNA4(dev);
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    s->sleep_reset = false;
+
     /* ACPI S3 removes power from the compute engines while DCN and VRAM
      * remain observable by the display. Save the DMU segments across the
      * power-on image restore; the rest of BAR5 is rebuilt from gop-state. */
@@ -3623,6 +3634,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("ih-dead", RDNA4State, ih_dead, false),
     DEFINE_PROP_BOOL("dcn-irq-storm", RDNA4State, dcn_irq_storm, false),
     DEFINE_PROP_BOOL("hang-sticky", RDNA4State, hang_sticky, false),
+    DEFINE_PROP_BOOL("sleep-reset", RDNA4State, sleep_reset, false),
 };
 
 static void rdna4_class_init(ObjectClass *klass, void *data)

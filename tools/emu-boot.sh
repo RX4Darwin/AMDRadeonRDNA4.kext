@@ -64,7 +64,7 @@ args=(
 	# the root bus: behind a pcie-root-port, macOS's PCI configurator
 	# closed the port's windows at boot and the card stopped decoding.
 	-vga none
-	-device "rdna4,bus=pcie.0,addr=0x10,romfile=$ROM,state=$STATE,flash=$FLASH$EXTRA"
+	-device "rdna4,id=rdna4,bus=pcie.0,addr=0x10,romfile=$ROM,state=$STATE,flash=$FLASH$EXTRA"
 	-display none -vnc "127.0.0.1:0${VNC_WS:+,websocket=$VNC_WS}"
 )
 
