@@ -25,16 +25,23 @@ namespace {
 
 constexpr uint32_t kBad = 0xffffffffu;
 
+// DCN 4.1.0 offset header: regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS,
+// regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH, BASE_IDX 2.
 constexpr uint32_t kHubpAddressLo = 0x060a;
 constexpr uint32_t kHubpAddressHi = 0x060b;
-constexpr uint32_t kHubpFlipControl = 0x061b;
+// regHUBPREQ0_DCSURF_FLIP_CONTROL, BASE_IDX 2.
+constexpr uint32_t kHubpFlipControl = 0x0613;
 constexpr uint32_t kHubpFlipPending = 1u << 8;
 constexpr uint32_t kHubpFlipType = 1u << 1;
 constexpr uint32_t kHubpStereoMode = 3u << 12;
 constexpr uint32_t kHubpStereoIn = 1u << 16;
 
+// regOTG0_OTG_STATUS_POSITION and regOTG0_OTG_MASTER_UPDATE_LOCK, BASE_IDX 2.
 constexpr uint32_t kOtgStatusPosition = 0x1b4a;
 constexpr uint32_t kOtgMasterUpdateLock = 0x1b89;
+// regMPCC0_MPCC_TOP_SEL and regMPCC0_MPCC_OPP_ID, BASE_IDX 3.
+constexpr uint32_t kMpccTopSel = 0x0000;
+constexpr uint32_t kMpccOppId = 0x0002;
 constexpr uint32_t kMaxAddressBytes = 0xffffffffu;
 
 } // namespace
@@ -47,21 +54,23 @@ bool run(RDNA4Compute &compute) {
 		FLOG("invalid mode %u; feature disabled", mode);
 		return true;
 	}
-	if (!compute.dmaReady || !compute.devHeap.size()) {
+	if (!compute.dmaReady || !compute.devHeap.size() || !compute.rtLock) {
 		FLOG("skip: SDMA/device heap unavailable");
 		return true;
 	}
 
-	auto dmuRead = [&](uint32_t dword) {
-		return compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { 2, dword });
+	auto dmuRead = [&](uint8_t segment, uint32_t dword) {
+		return compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { segment, dword });
 	};
+	auto dmuRead2 = [&](uint32_t dword) { return dmuRead(2, dword); };
+	auto dmuRead3 = [&](uint32_t dword) { return dmuRead(3, dword); };
 	auto dmuWrite = [&](uint32_t dword, uint32_t value) {
 		compute.wr(IpDiscovery::HwDmu, GfxReg::Reg { 2, dword }, value);
 	};
 
 	uint8_t otg = Pipe::kNone;
 	for (uint8_t i = 0; i < Pipe::kMaxOtg; i++) {
-		const uint32_t control = dmuRead(Pipe::Reg::kOtgControl + i * Pipe::Reg::kOtgStride);
+		const uint32_t control = dmuRead2(Pipe::Reg::kOtgControl + i * Pipe::Reg::kOtgStride);
 		if (control != kBad && (control & 1) && (control & (1u << 16))) {
 			otg = i;
 			break;
@@ -73,7 +82,7 @@ bool run(RDNA4Compute &compute) {
 	}
 
 	const uint32_t oppReg = Pipe::Reg::kOptcDataSource + otg * Pipe::Reg::kOdmStride;
-	const uint32_t oppImage = dmuRead(oppReg);
+	const uint32_t oppImage = dmuRead2(oppReg);
 	if (oppImage == kBad) {
 		FLOG("skip: OTG%u OPP source unreadable", otg);
 		return true;
@@ -81,10 +90,13 @@ bool run(RDNA4Compute &compute) {
 	const uint8_t opp = static_cast<uint8_t>((oppImage >> 16) & 0xf);
 	uint8_t hubp = Pipe::kNone;
 	for (uint8_t i = 0; i < Pipe::kMaxOtg; i++) {
-		const uint32_t id = dmuRead(0x0002 + i * Pipe::Reg::kMpccStride);
+		const uint32_t id = dmuRead3(kMpccOppId + i * Pipe::Reg::kMpccStride);
 		if (id != kBad && (id & 0xf) == opp) {
-			hubp = i;
-			break;
+			const uint32_t top = dmuRead3(kMpccTopSel + i * Pipe::Reg::kMpccStride);
+			if (top != kBad && (top & 0xf) < Pipe::kMaxOtg) {
+				hubp = static_cast<uint8_t>(top & 0xf);
+				break;
+			}
 		}
 	}
 	if (hubp == Pipe::kNone) {
@@ -93,10 +105,10 @@ bool run(RDNA4Compute &compute) {
 	}
 
 	const uint32_t hubpBase = static_cast<uint32_t>(hubp) * Pipe::Reg::kHubpStride;
-	const uint32_t viewport = dmuRead(Pipe::Reg::kHubpViewportDim + hubpBase);
-	const uint32_t pitchImage = dmuRead(Pipe::Reg::kHubpSurfacePitch + hubpBase);
-	const uint32_t oldLo = dmuRead(kHubpAddressLo + hubpBase);
-	const uint32_t oldHi = dmuRead(kHubpAddressHi + hubpBase);
+	const uint32_t viewport = dmuRead2(Pipe::Reg::kHubpViewportDim + hubpBase);
+	const uint32_t pitchImage = dmuRead2(Pipe::Reg::kHubpSurfacePitch + hubpBase);
+	const uint32_t oldLo = dmuRead2(kHubpAddressLo + hubpBase);
+	const uint32_t oldHi = dmuRead2(kHubpAddressHi + hubpBase);
 	if (viewport == kBad || pitchImage == kBad || oldLo == kBad || oldHi == kBad) {
 		FLOG("skip: HUBP%u surface registers unreadable", hubp);
 		return true;
@@ -116,7 +128,10 @@ bool run(RDNA4Compute &compute) {
 	     otg, opp, hubp, original, width, height, pitch, bytes);
 
 	uint64_t bufferOffset = 0;
-	if (!compute.devHeap.alloc(bytes, bufferOffset)) {
+	IOLockLock(compute.rtLock);
+	const bool allocated = compute.devHeap.alloc(bytes, bufferOffset);
+	IOLockUnlock(compute.rtLock);
+	if (!allocated) {
 		FLOG("skip: device heap allocation of %llu bytes failed", bytes);
 		return true;
 	}
@@ -125,10 +140,16 @@ bool run(RDNA4Compute &compute) {
 
 	bool touchedSurface = false;
 	bool ok = true;
+	auto runSdmaLocked = [&](const uint32_t *packet, uint32_t dwords, uint32_t timeoutMs) {
+		IOLockLock(compute.rtLock);
+		const bool completed = compute.sdmaRun(packet, dwords, timeoutMs);
+		IOLockUnlock(compute.rtLock);
+		return completed;
+	};
 	uint32_t packet[Sdma::kCopyDwords];
 	compute.trail("flip: SDMA copy");
 	if (!Sdma::copyLinear(packet, original, buffer, static_cast<uint32_t>(bytes)) ||
-	    !compute.sdmaRun(packet, Sdma::kCopyDwords, 2000)) {
+	    !runSdmaLocked(packet, Sdma::kCopyDwords, 2000)) {
 		FLOG("failure: SDMA VRAM-to-VRAM copy did not complete");
 		ok = false;
 	} else {
@@ -149,7 +170,7 @@ bool run(RDNA4Compute &compute) {
 			compute.trail("flip: SDMA pattern fill");
 			if (!Sdma::constFill(fill, buffer + static_cast<uint64_t>(first) * rowBytes,
 			                    colours[bar], static_cast<uint32_t>(fillBytes)) ||
-			    !compute.sdmaRun(fill, Sdma::kFillDwords, 2000)) {
+			    !runSdmaLocked(fill, Sdma::kFillDwords, 2000)) {
 				FLOG("failure: pattern bar %u did not complete", bar);
 				ok = false;
 			} else {
@@ -159,16 +180,16 @@ bool run(RDNA4Compute &compute) {
 	}
 
 	auto readAddress = [&](uint64_t &address) {
-		const uint32_t lo = dmuRead(kHubpAddressLo + hubpBase);
-		const uint32_t hi = dmuRead(kHubpAddressHi + hubpBase);
+		const uint32_t lo = dmuRead2(kHubpAddressLo + hubpBase);
+		const uint32_t hi = dmuRead2(kHubpAddressHi + hubpBase);
 		if (lo == kBad || hi == kBad)
 			return false;
 		address = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
 		return true;
 	};
 	auto readPosition = [&](uint32_t &frame, uint32_t &line) {
-		const uint32_t f = dmuRead(Pipe::Reg::kOtgFrameCount + otg * Pipe::Reg::kOtgStride);
-		const uint32_t p = dmuRead(kOtgStatusPosition + otg * Pipe::Reg::kOtgStride);
+		const uint32_t f = dmuRead2(Pipe::Reg::kOtgFrameCount + otg * Pipe::Reg::kOtgStride);
+		const uint32_t p = dmuRead2(kOtgStatusPosition + otg * Pipe::Reg::kOtgStride);
 		if (f == kBad || p == kBad)
 			return false;
 		frame = f & 0xffffffu;
@@ -185,7 +206,7 @@ bool run(RDNA4Compute &compute) {
 		nanoseconds_to_absolutetime(100000000, &span);
 		const uint64_t start = mach_absolute_time();
 		for (;;) {
-			const uint32_t control = dmuRead(kHubpFlipControl + hubpBase);
+			const uint32_t control = dmuRead2(kHubpFlipControl + hubpBase);
 			if (control != kBad && !(control & kHubpFlipPending))
 				return true;
 			if (mach_absolute_time() - start >= span)
@@ -195,7 +216,7 @@ bool run(RDNA4Compute &compute) {
 	};
 	auto writeAddress = [&](uint64_t target, const char *step) {
 		compute.trail(step);
-		const uint32_t before = dmuRead(kOtgMasterUpdateLock + otg * Pipe::Reg::kOtgStride);
+		const uint32_t before = dmuRead2(kOtgMasterUpdateLock + otg * Pipe::Reg::kOtgStride);
 		if (before == kBad)
 			return false;
 		const uint32_t lockReg = kOtgMasterUpdateLock + otg * Pipe::Reg::kOtgStride;
@@ -205,7 +226,7 @@ bool run(RDNA4Compute &compute) {
 		const uint64_t lockStart = mach_absolute_time();
 		bool locked = false;
 		while (mach_absolute_time() - lockStart < span) {
-			const uint32_t lock = dmuRead(lockReg);
+			const uint32_t lock = dmuRead2(lockReg);
 			if (lock != kBad && (lock & (1u << 8))) {
 				locked = true;
 				break;
@@ -219,7 +240,7 @@ bool run(RDNA4Compute &compute) {
 
 		bool wrote = false;
 		const uint32_t flipReg = kHubpFlipControl + hubpBase;
-		uint32_t flipControl = dmuRead(flipReg);
+		uint32_t flipControl = dmuRead2(flipReg);
 		if (flipControl != kBad) {
 			flipControl &= ~(kHubpFlipType | kHubpStereoMode | kHubpStereoIn);
 			dmuWrite(flipReg, flipControl);
@@ -252,7 +273,7 @@ bool run(RDNA4Compute &compute) {
 			return false;
 		}
 		const uint32_t frameDelta = (afterFrame - beforeFrame) & 0xffffffu;
-		const uint32_t vtotalImage = dmuRead(Pipe::Reg::kOtgVTotal + otg * Pipe::Reg::kOtgStride);
+		const uint32_t vtotalImage = dmuRead2(Pipe::Reg::kOtgVTotal + otg * Pipe::Reg::kOtgStride);
 		const uint32_t vtotal = vtotalImage == kBad ? 0 : (vtotalImage & 0x7fffu) + 1;
 		const uint64_t scanlines = static_cast<uint64_t>(frameDelta) * vtotal +
 		                          (afterLine >= beforeLine ? afterLine - beforeLine : 0);
@@ -268,10 +289,10 @@ bool run(RDNA4Compute &compute) {
 	auto logFailure = [&](const char *why) {
 		uint64_t current = 0;
 		const bool haveAddress = readAddress(current);
-		const uint32_t lock = dmuRead(kOtgMasterUpdateLock + otg * Pipe::Reg::kOtgStride);
-		const uint32_t pending = dmuRead(kHubpFlipControl + hubpBase);
-		const uint32_t status = dmuRead(Pipe::Reg::kOtgStatus + otg * Pipe::Reg::kOtgStride);
-		const uint32_t position = dmuRead(kOtgStatusPosition + otg * Pipe::Reg::kOtgStride);
+		const uint32_t lock = dmuRead2(kOtgMasterUpdateLock + otg * Pipe::Reg::kOtgStride);
+		const uint32_t pending = dmuRead2(kHubpFlipControl + hubpBase);
+		const uint32_t status = dmuRead2(Pipe::Reg::kOtgStatus + otg * Pipe::Reg::kOtgStride);
+		const uint32_t position = dmuRead2(kOtgStatusPosition + otg * Pipe::Reg::kOtgStride);
 		FLOG("failure: %s; lock 0x%08x pending 0x%08x original 0x%llx current %s0x%llx "
 		     "OTG status 0x%08x position 0x%08x",
 		     why, lock, pending, original, haveAddress ? "" : "?", current, status, position);
@@ -296,7 +317,10 @@ bool run(RDNA4Compute &compute) {
 		FLOG("feature disabled for this boot");
 	}
 
-	if (!compute.devHeap.free(bufferOffset))
+	IOLockLock(compute.rtLock);
+	const bool freed = compute.devHeap.free(bufferOffset);
+	IOLockUnlock(compute.rtLock);
+	if (!freed)
 		FLOG("failure: device heap free of offset 0x%llx failed", bufferOffset);
 	else
 		FLOG("free: device heap offset 0x%llx", bufferOffset);
