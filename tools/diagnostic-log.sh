@@ -325,6 +325,8 @@ record() {
 
 	if [ "$IH_MODE" -eq 0 ]; then
 		record ih SKIPPED "rdna4-ih not enabled"
+	elif ! grep -q 'RDNA4FB: compute:' "$KLOG"; then
+		record ih SKIPPED "kernel compute log unavailable"
 	elif grep -q 'RDNA4FB: .*ih: ring up:' "$KLOG"; then
 		ih_key="ring up"
 		grep -q 'RDNA4FB: .*ih: self-test:.*polling' "$KLOG" && ih_key="ring up; polling fallback"
