@@ -152,23 +152,36 @@ void RDNA4Compute::defensiveStart() {
                 sdmaRb[instance] = rd(IpDiscovery::HwGc, sdma(instance, SdmaQ0RbCntl));
                 sdmaMcu[instance] = rd(IpDiscovery::HwGc, sdma(instance, SdmaMcuCntl));
         }
+        // Reset values are not evidence that the CP is running.  In
+        // particular, do not touch GRBM_GFX_CNTL on a cold card: the RLC
+        // survey must first show a live CP by one of its positive indicators.
+        const bool cpCanRun =
+                (sv.rlcBootload != kQuiesceBad && (sv.rlcBootload & kRlcBootComplete)) ||
+                (sv.mecPc != kQuiesceBad && sv.mecPc != 0) ||
+                (sv.mePc != kQuiesceBad && sv.mePc != 0) ||
+                (sv.rlcCntl != kQuiesceBad && (sv.rlcCntl & kRlcEnableF32));
+        if (!cpCanRun)
+                CLOG("quiesce: defensive start skipped CP/HQD survey; RLC/CP is not running");
         bool hqdActive[4][8] {};
         uint32_t hqdVmid[4][8] {};
-        for (uint32_t pipe = 0; pipe < 4; pipe++) {
-                for (uint32_t queue = 0; queue < 8; queue++) {
-                        grbmSelect(1, pipe, queue, 0);
-                        const uint32_t active = rdGc(CpHqdActive);
-                        hqdActive[pipe][queue] = active != kQuiesceBad && (active & 1);
-                        hqdVmid[pipe][queue] = rdGc(CpHqdVmid) & 0xf;
+        uint32_t gfxActive = kQuiesceBad;
+        uint32_t me = kQuiesceBad;
+        uint32_t mec = kQuiesceBad;
+        if (cpCanRun) {
+                for (uint32_t pipe = 0; pipe < 4; pipe++) {
+                        for (uint32_t queue = 0; queue < 8; queue++) {
+                                grbmSelect(1, pipe, queue, 0);
+                                const uint32_t active = rdGc(CpHqdActive);
+                                hqdActive[pipe][queue] = active != kQuiesceBad && (active & 1);
+                                hqdVmid[pipe][queue] = rdGc(CpHqdVmid) & 0xf;
+                        }
                 }
+                grbmSelect(0, 0, 0, 0);
+                gfxActive = rdGc(CpRbActive);
+                me = rdGc(CpMeCntl);
+                mec = rdGc(CpMecRs64Cntl);
         }
-        grbmSelect(0, 0, 0, 0);
-        const uint32_t gfxActive = rdGc(CpRbActive);
-        const uint32_t gfxCntl = rdGc(CpRb0Cntl);
-        const bool inheritedGfx = (gfxActive != kQuiesceBad && (gfxActive & 1)) ||
-                                  (gfxCntl != kQuiesceBad && gfxCntl != 0);
-        const uint32_t me = rdGc(CpMeCntl);
-        const uint32_t mec = rdGc(CpMecRs64Cntl);
+        const bool inheritedGfx = cpCanRun && gfxActive != kQuiesceBad && (gfxActive & 1);
         bool inheritedHqd = false;
         for (uint32_t pipe = 0; pipe < 4; pipe++)
                 for (uint32_t queue = 0; queue < 8; queue++)
@@ -198,27 +211,29 @@ void RDNA4Compute::defensiveStart() {
                 if (mcu != kQuiesceBad)
                         wr(IpDiscovery::HwGc, sdma(instance, SdmaMcuCntl), mcu | kSdmaMcuHalt);
         }
-        for (uint32_t pipe = 0; pipe < 4; pipe++) {
-                for (uint32_t queue = 0; queue < 8; queue++) {
-                        if (!hqdActive[pipe][queue])
-                                continue;
-                        const uint32_t vmid = hqdVmid[pipe][queue];
-                        grbmSelect(1, pipe, queue, vmid);
-                        CLOG("quiesce: defensive start draining HQD ME1 pipe%u queue%u VMID%u",
-                             pipe, queue, vmid);
-                        wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
-                        for (uint32_t us = 0; us < 100000 && (rdGc(CpHqdActive) & 1); us += 10)
-                                IODelay(10);
-                        if (rdGc(CpHqdActive) & 1)
-                                CLOG("quiesce: defensive HQD pipe%u queue%u VMID%u did not drain",
+        if (cpCanRun) {
+                for (uint32_t pipe = 0; pipe < 4; pipe++) {
+                        for (uint32_t queue = 0; queue < 8; queue++) {
+                                if (!hqdActive[pipe][queue])
+                                        continue;
+                                const uint32_t vmid = hqdVmid[pipe][queue];
+                                grbmSelect(1, pipe, queue, vmid);
+                                CLOG("quiesce: defensive start draining HQD ME1 pipe%u queue%u VMID%u",
                                      pipe, queue, vmid);
-                        wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+                                wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
+                                for (uint32_t us = 0; us < 100000 && (rdGc(CpHqdActive) & 1); us += 10)
+                                        IODelay(10);
+                                if (rdGc(CpHqdActive) & 1)
+                                        CLOG("quiesce: defensive HQD pipe%u queue%u VMID%u did not drain",
+                                             pipe, queue, vmid);
+                                wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+                        }
                 }
+                grbmSelect(0, 0, 0, 0);
         }
-        grbmSelect(0, 0, 0, 0);
         if (inheritedGfx || inheritedHqd) {
-                CLOG("quiesce: defensive start halting inherited GFX/MEC CP_RB_ACTIVE 0x%08x "
-                     "CP_RB0_CNTL 0x%08x", gfxActive, gfxCntl);
+                CLOG("quiesce: defensive start halting inherited GFX/MEC CP_RB_ACTIVE 0x%08x",
+                     gfxActive);
                 if (me != kQuiesceBad)
                         wr(IpDiscovery::HwGc, CpMeCntl, me | kCpMePfpHalt | kCpMeMeHalt);
                 if (inheritedHqd && mec != kQuiesceBad)
@@ -230,7 +245,6 @@ void RDNA4Compute::defensiveStart() {
         }
         if (!found)
                 CLOG("quiesce: defensive start found no inherited activity; PCI bus master untouched");
-        grbmSelect(0, 0, 0, 0);
 }
 
 void RDNA4Compute::quiesceForShutdown(const char *why) {

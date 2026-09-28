@@ -590,9 +590,11 @@ bool RDNA4Compute::bringupStepAllowed(const char *step) {
 	IOLockLock(rtLock);
 	const bool allowed = !shutdownQuiesced;
 	IOLockUnlock(rtLock);
-	if (!allowed)
-		CLOG("bring-up stopped before %s: shutdown is quiesced", step ? step : "next step");
-	return allowed;
+        if (!allowed) {
+                CLOG("bring-up stopped before %s: shutdown is quiesced", step ? step : "next step");
+                trail("stopped: shutdown");
+        }
+        return allowed;
 }
 
 void RDNA4Compute::runStages() {
