@@ -251,6 +251,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
  */
 #define GC_SEG0(dw)          ((0x1260 + (dw)) * 4)
 #define GC_SEG1(dw)          ((0xa000 + (dw)) * 4)
+#define REG_CP_HQD_ACTIVE_EARLY GC_SEG0(0x1fab)
+#define REG_CP_HQD_DEQUEUE_REQ  GC_SEG0(0x1fc1)
+#define REG_SQ_CMD              GC_SEG0(0x111b)
 #define OSSSYS_SEG0          0x10a0
 #define OSSSYS(dw)           ((OSSSYS_SEG0 + (dw)) * 4)
 #define REG_IH_RB_CNTL       OSSSYS(0x0080)
@@ -368,6 +371,7 @@ struct RDNA4State {
     bool     dma_broken;     /* model a system-memory path that faults */
     bool     ih_dead;        /* IH writes the ring but never raises MSI */
     bool     dcn_irq_storm;  /* DCN vblank source runs at 10x */
+    bool     hang_sticky;    /* queue dequeue never completes */
 
     uint32_t *regs;           /* BAR5 image, RDNA4_MMIO_SIZE bytes */
     uint8_t  *resv;           /* top RDNA4_RESV_SIZE bytes of VRAM */
@@ -401,6 +405,7 @@ struct RDNA4State {
     uint64_t     smu_running;           /* features the PMFW runs */
     bool         autoload_armed;        /* AUTOLOAD_RLC accepted, IMU not released */
     uint64_t     sdma_wptr;             /* SDMA0 queue 0's last wptr: 64-bit, monotonic */
+    bool         mec_hung;              /* dispatch waves are live and its fence is absent */
     uint64_t     ih_ring_bus;
     uint64_t     ih_wptr_bus;
     uint32_t     ih_rptr;
@@ -1617,6 +1622,25 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         if (!s->inv_noack) {
             reg_set(s, REG_GCVM_INV17_ACK, val & 0xffff);   /* per-VMID ack */
         }
+    } else if (addr == REG_CP_HQD_DEQUEUE_REQ) {
+        reg_set(s, addr, val);
+        if (val & 3) {
+            if (s->hang_sticky) {
+                fprintf(stderr, "rdna4: mec: HQD dequeue/wave kill held by hang-sticky\n");
+            } else {
+                /* CP_HQD_DEQUEUE_REQUEST RESET_WAVES: drop pending waves and deactivate. */
+                s->mec_hung = false;
+                reg_set(s, REG_CP_HQD_ACTIVE_EARLY, 0);
+                reg_set(s, GC_SEG0(0x1fb3), 0);
+                reg_set(s, GC_SEG0(0x1fdf), 0);
+                reg_set(s, GC_SEG0(0x1fe0), 0);
+                fprintf(stderr, "rdna4: mec: HQD dequeue reset waves; queue inactive\n");
+            }
+        }
+    } else if (addr == REG_SQ_CMD) {
+        reg_set(s, addr, val);
+        if ((val & 0xf) == 3)
+            fprintf(stderr, "rdna4: mec: SQ_CMD killed VMID-selected waves (0x%08x)\n", val);
     } else if (dw >= DMU_SEG2 && dw < DMU_SEG3) {
         uint32_t d2 = dw - DMU_SEG2;
         if (d2 == DMCUB_INBOX1_WPTR) {
@@ -2236,8 +2260,8 @@ static bool rdna4_wave_wmma(RDNA4State *s, RDNA4Lane *w, unsigned n)
  * until it ends or reaches s_barrier_signal; once every live one waits,
  * the barrier opens. The group's LDS is what RSRC2.LDS_SIZE allocates.
  */
-static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32_t dim_z,
-                           uint32_t initiator)
+static bool rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32_t dim_z,
+                            uint32_t initiator)
 {
     uint64_t pgm = ((uint64_t)reg_get(s, REG_CS_PGM_LO) << 8) |
                    ((uint64_t)reg_get(s, REG_CS_PGM_HI) << 40);
@@ -2247,13 +2271,14 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
     RDNA4Lds lds = { NULL, ((rsrc2 >> 15) & 0x1ff) * 512 };
     RDNA4Lane *lanes;
     uint64_t ran = 0;
+    bool hung = false;
 
     if (!(initiator & 1) || !reg_get(s, REG_SH_MEM_CONFIG) || !reg_get(s, REG_CS_THREAD_SE0) ||
         !tx || !ty || !tz || (uint64_t)tx * ty * tz > 1024 || !dim_x || !dim_y || !dim_z) {
         fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u refused (initiator 0x%x, SH_MEM_CONFIG "
                 "0x%x, CU mask SE0 0x%x, group %ux%ux%u)\n", dim_x, dim_y, dim_z, initiator,
                 reg_get(s, REG_SH_MEM_CONFIG), reg_get(s, REG_CS_THREAD_SE0), tx, ty, tz);
-        return;
+        return true;
     }
     lanes = g_new(RDNA4Lane, items);
     lds.mem = g_malloc0(lds.size ? lds.size : 4);
@@ -2300,6 +2325,7 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
                     l->at_wave = true;
                     break;
                 default:
+                    hung = l->steps >= (1u << 22);
                     goto stopped;
                 }
             }
@@ -2337,11 +2363,15 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
     g_free(lanes);
     fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u of %ux%ux%u ran %" PRIu64 " work-items%s\n",
             dim_x, dim_y, dim_z, tx, ty, tz, ran, lds.size ? " (with LDS)" : "");
-    return;
+    return true;
 stopped:
-    fprintf(stderr, "rdna4: cs: dispatch stopped (%" PRIu64 " work-items ran)\n", ran);
+    if (hung)
+        fprintf(stderr, "rdna4: cs: dispatch hung (%" PRIu64 " work-items ran; waves remain queued)\n", ran);
+    else
+        fprintf(stderr, "rdna4: cs: dispatch stopped (%" PRIu64 " work-items ran)\n", ran);
     g_free(lds.mem);
     g_free(lanes);
+    return !hung;
 }
 
 static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)
@@ -2350,6 +2380,7 @@ static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)
     uint32_t mec = reg_get(s, REG_CP_MEC_CNTL);
 
     *why = !s->gfx_booted ? "GFX not booted" :
+           s->mec_hung ? "queue has a hung wave; waiting for HQD reset" :
            !(reg_get(s, REG_NBIF_DB_APER_EN) & 1) ? "NBIF doorbell aperture off" :
            reg_get(s, REG_NBIF_S2A_ENTRY0) != 0x30000007 ? "doorbells not routed to GC" :
            !(reg_get(s, REG_CP_PQ_STATUS) & 2) ? "CP_PQ_STATUS.DOORBELL_ENABLE off" :
@@ -2413,7 +2444,11 @@ static void rdna4_mec_doorbell(RDNA4State *s, uint32_t db_dword, uint64_t wptr)
         case 0x58:                                   /* ACQUIRE_MEM: coherent already */
             break;
         case 0x15:                                   /* DISPATCH_DIRECT */
-            rdna4_dispatch(s, dw[1], dw[2], dw[3], dw[4]);
+            if (!rdna4_dispatch(s, dw[1], dw[2], dw[3], dw[4])) {
+                s->mec_hung = true;
+                fprintf(stderr, "rdna4: mec: dispatch left queue busy; following fence is not written\n");
+                return;
+            }
             break;
         case 0x37: {                                 /* WRITE_DATA to memory */
             uint64_t a = (dw[2] & ~3u) | ((uint64_t)dw[3] << 32);
@@ -2862,6 +2897,7 @@ static void rdna4_reset(DeviceState *dev)
     s->smu_running = 0;
     s->autoload_armed = false;
     s->sdma_wptr = 0;
+    s->mec_hung = false;
     s->ih_ring_bus = 0;
     s->ih_wptr_bus = 0;
     s->ih_rptr = 0;
@@ -3010,6 +3046,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("dma-broken", RDNA4State, dma_broken, false),
     DEFINE_PROP_BOOL("ih-dead", RDNA4State, ih_dead, false),
     DEFINE_PROP_BOOL("dcn-irq-storm", RDNA4State, dcn_irq_storm, false),
+    DEFINE_PROP_BOOL("hang-sticky", RDNA4State, hang_sticky, false),
 };
 
 static void rdna4_class_init(ObjectClass *klass, void *data)

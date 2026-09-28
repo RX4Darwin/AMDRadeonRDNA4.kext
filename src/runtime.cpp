@@ -340,9 +340,14 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	const bool done = launch(l, "runtime", ns);
 	micros = ns / 1000;
 	if (!done) {
-		rtWedged = true;
-		RLOG("dispatch timed out after %u ms: the queue is considered hung; no more dispatches "
-		     "until reboot", l.timeoutUs / 1000);
+		if (recoverComputeQueue("runtime")) {
+			rtWedged = false;
+			RLOG("dispatch timed out after %u ms; queue recovered without a GPU reset", l.timeoutUs / 1000);
+		} else {
+			rtWedged = true;
+			RLOG("dispatch timed out after %u ms: queue recovery failed; runtime stays wedged",
+			     l.timeoutUs / 1000);
+		}
 		return kIOReturnTimeout;
 	}
 	return kIOReturnSuccess;

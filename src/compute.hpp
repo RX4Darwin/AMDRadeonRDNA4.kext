@@ -250,6 +250,7 @@ private:
 	static constexpr uint32_t kDispatchGroups = 4, kGroupSize = 64;
 	Pm4::Queue  pm4Queue;                   // set up by stage 5, fed again by stage 6
 	uint32_t    pm4Fence { 0 };             // last RELEASE_MEM sequence number
+	uint32_t    hqdMode { 1 };              // 1 = plain MMIO HQD, 2 = KIQ fallback
 	uint32_t shAbs(const GfxReg::Reg &r) const;   // absolute dword address of a GC register
 	// One DISPATCH_DIRECT on the stage-5 queue, fenced; false if the fence
 	// never came within timeoutUs (the engine state is logged under `tag`).
@@ -266,6 +267,9 @@ private:
 		bool            useInterrupt;       // runtime only; the fence remains authoritative
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
+	void logComputeQueueState(const char *tag);
+	bool queueWriteTest(const char *tag);
+	bool recoverComputeQueue(const char *tag);
 	// What launch() can give a code-object kernel: the kernarg pointer and
 	// up to 64 KiB of LDS — no dispatch/queue pointers or scratch yet.
 	static bool kernelFits(const CodeObj::Kernel &k, const char **why);
@@ -371,6 +375,7 @@ private:
 	IOLock        *rtLock { nullptr };
 	bool           rtReady { false };       // a dispatching stage finished
 	bool           rtWedged { false };      // a dispatch timed out
+	bool           hangRecoveryEnabled { true }; // rdna4-hang=0 keeps the old wedge
 	uint32_t       rtStage { 0 };
 	GpuHeap::Heap  heap;
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
