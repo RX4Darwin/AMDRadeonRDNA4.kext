@@ -8,6 +8,7 @@
 //
 
 #include "compute.hpp"
+#include "ndrv.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODMACommand.h>
@@ -141,6 +142,9 @@ bool RDNA4Compute::ihInit() {
 	if (!PE_parse_boot_argn("rdna4-ih", &requested, sizeof(requested)) || !requested)
 		return false;
 	ihDcnRequested = requested >= 2;
+	uint32_t vbl = 0;
+	ihVblRequested = ihDcnRequested &&
+	                 PE_parse_boot_argn("rdna4-vbl", &vbl, sizeof(vbl)) && vbl != 0;
 	if (!env.pci || !env.mmio || !env.disc || !env.disc->isValid() || !rtLock) {
 		HLOG("off: missing PCI, MMIO, discovery or runtime lock");
 		return false;
@@ -348,6 +352,7 @@ bool RDNA4Compute::ihInit() {
 		wr(IpDiscovery::HwDmu, otgStatus, otgBefore | kDcnVblankEnable);
 		wr(IpDiscovery::HwDmu, flipStatus, flipBefore | kDcnPflipEnable);
 		ihDcnActive = true;
+		Ndrv::setVblankEnabled(ihVblRequested);
 		ihDcnVblankFrames = 0;
 		HLOG("DCN sources enabled: OTG_GLOBAL_SYNC_STATUS 0x%08x -> 0x%08x, "
 		     "HUBP%u FLIP_INTERRUPT 0x%08x -> 0x%08x (vblank src %u, pflip src %u)",
@@ -394,6 +399,7 @@ bool RDNA4Compute::ihInit() {
 void RDNA4Compute::ihDcnStop(const char *why) {
 	if (!ihDcnActive)
 		return;
+	Ndrv::setVblankEnabled(false);
 	if (ihDcnOtg < Pipe::kMaxOtg) {
 		const Reg r { 2, kDcnOtgGlobalSync + ihDcnOtg * kDcnOtgStride };
 		wr(IpDiscovery::HwDmu, r, rd(IpDiscovery::HwDmu, r) & ~kDcnVblankEnable);
@@ -592,6 +598,8 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	if (entry.clientId == kIhClientDcn && ihDcnActive &&
 	    entry.srcId == kIhSrcVblankBase + ihDcnOtg) {
 		ihDcnObserveVblank(mach_absolute_time());
+		if (ihDcnActive && ihVblRequested)
+			Ndrv::signalVblank();
 		ihDcnAckVblank();
 		return;
 	}

@@ -26,6 +26,7 @@
 #include <IOKit/graphics/IOGraphicsTypes.h>   // header-only types for IOMacOSVideo.h
 #include <IOKit/ndrvsupport/IOMacOSTypes.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
+#include <IOKit/ndrvsupport/IONDRVLibraries.h>
 
 #include "compute.hpp"
 #include "device.hpp"
@@ -88,7 +89,11 @@ static_assert(Ndrv::cscGetCurMode == ::cscGetCurMode && Ndrv::cscGetSync == ::cs
               Ndrv::cscGetVideoParameters == ::cscGetVideoParameters &&
               Ndrv::cscGetDDCBlock == ::cscGetDDCBlock &&
               Ndrv::cscGetDetailedTiming == ::cscGetDetailedTiming &&
-              Ndrv::cscSwitchMode == ::cscSwitchMode && Ndrv::cscSetSync == ::cscSetSync,
+              Ndrv::cscSupportsHardwareCursor == ::cscSupportsHardwareCursor &&
+              Ndrv::cscGetHardwareCursorDrawState == ::cscGetHardwareCursorDrawState &&
+              Ndrv::cscSwitchMode == ::cscSwitchMode && Ndrv::cscSetSync == ::cscSetSync &&
+              Ndrv::cscSetHardwareCursor == ::cscSetHardwareCursor &&
+              Ndrv::cscDrawHardwareCursor == ::cscDrawHardwareCursor,
               "csc selectors");
 static_assert(Ndrv::kDeclROMtables == static_cast<uint32_t>(::kDeclROMtables) &&
               Ndrv::kDepthMode1 == ::kDepthMode1 &&
@@ -104,6 +109,11 @@ static_assert(Ndrv::kDeclROMtables == static_cast<uint32_t>(::kDeclROMtables) &&
               Ndrv::kBadArgument == static_cast<int32_t>(kIOReturnBadArgument) &&
               Ndrv::kUnsupported == static_cast<int32_t>(kIOReturnUnsupported),
               "NDRV constants");
+static_assert(sizeof(Ndrv::VDSetHardwareCursorRec) == sizeof(::VDSetHardwareCursorRec) &&
+              sizeof(Ndrv::VDDrawHardwareCursorRec) == sizeof(::VDDrawHardwareCursorRec) &&
+              sizeof(Ndrv::VDSupportsHardwareCursorRec) == sizeof(::VDSupportsHardwareCursorRec) &&
+              sizeof(Ndrv::VDHardwareCursorDrawStateRec) == sizeof(::VDHardwareCursorDrawStateRec),
+              "NDRV cursor records");
 
 namespace {
 
@@ -128,6 +138,10 @@ KernelPatcher::KextInfo kextIONDRVSupport {
 };
 
 mach_vm_address_t orgDoDriverIO { 0 };
+mach_vm_address_t orgVslNew { 0 };
+mach_vm_address_t orgVslDispose { 0 };
+mach_vm_address_t orgVslDo { 0 };
+mach_vm_address_t orgVslPrepareCursor { 0 };
 bool traceEnabled { false };
 uint32_t traceBudget { 400 };   // bounded: gamma/CLUT calls can be frequent
 uint32_t computeStage { 0 };    // rdna4-compute=<stage>, see compute.hpp
@@ -148,6 +162,10 @@ struct FbEntry {
 	FbState *state;
 };
 FbEntry fbTable[8] {};
+
+// Forward declaration: the explicit open-time VBL service creation below
+// goes through the same wrapper as a legacy NDRV call.
+int32_t wrapVslNew(void *entryID, UInt32 type, void **service);
 
 // The GPU behind a framebuffer: its provider, or the provider's provider.
 IOPCIDevice *pciFor(IOService *provider) {
@@ -211,6 +229,43 @@ void deviceSetPower(void *ctx, bool on) {
 	static_cast<RDNA4Device *>(ctx)->setDisplayPower(on);
 }
 
+void createVblankService(IOService *framebuffer) {
+	uint32_t ih = 0, requested = 0;
+	if (!PE_parse_boot_argn("rdna4-ih", &ih, sizeof(ih)) || ih < 2 ||
+	    !PE_parse_boot_argn("rdna4-vbl", &requested, sizeof(requested)) || !requested ||
+	    Ndrv::vslServicePresent() || !orgVslNew || !orgVslDo || !framebuffer)
+		return;
+	IOService *provider = framebuffer->getProvider();
+	OSData *entry = provider ? OSDynamicCast(OSData,
+		provider->getProperty(kAAPLRegEntryIDKey)) : nullptr;
+	if (!entry || entry->getLength() < sizeof(RegEntryID)) {
+		FBLOG("ndrv: VBL service needs provider AAPL,RegEntryID");
+		return;
+	}
+	void *service = nullptr;
+	IOReturn ret = wrapVslNew(const_cast<void *>(entry->getBytesNoCopy()),
+	                          ::kVBLInterruptServiceType, &service);
+	if (ret != kIOReturnSuccess)
+		FBLOG("ndrv: open-time VBL service creation failed 0x%x", ret);
+}
+
+bool deviceSupportsHardwareCursor(void *ctx) {
+	return static_cast<RDNA4Device *>(ctx)->supportsHardwareCursor();
+}
+
+int32_t deviceSetHardwareCursor(void *ctx, void *cursorRef) {
+	return static_cast<RDNA4Device *>(ctx)->setHardwareCursor(cursorRef);
+}
+
+int32_t deviceDrawHardwareCursor(void *ctx, int32_t x, int32_t y, uint32_t visible) {
+	return static_cast<RDNA4Device *>(ctx)->drawHardwareCursor(x, y, visible);
+}
+
+int32_t deviceGetHardwareCursorDrawState(void *ctx,
+	                                         Ndrv::VDHardwareCursorDrawStateRec &state) {
+	return static_cast<RDNA4Device *>(ctx)->getHardwareCursorDrawState(state);
+}
+
 #ifdef RDNA4FB_VM_TEST
 // Size QEMU is scanning out (the last mode it took); one VM test device.
 uint16_t vmWidth { 0 }, vmHeight { 0 };
@@ -252,7 +307,9 @@ void attach(FbEntry &e) {
 		delete st;
 		return;
 	}
-	Ndrv::Backend be { &dev, deviceSurfaceFor, deviceSwitchTo, deviceSetPower };
+	Ndrv::Backend be { &dev, deviceSurfaceFor, deviceSwitchTo, deviceSetPower,
+	                   deviceSupportsHardwareCursor, deviceSetHardwareCursor,
+	                   deviceDrawHardwareCursor, deviceGetHardwareCursorDrawState };
 #ifdef RDNA4FB_VM_TEST
 	if (!dev.isAmd) {
 		pci->setIOEnable(true);
@@ -268,6 +325,10 @@ void attach(FbEntry &e) {
 #endif
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidData, dev.edidLen, be);
 	e.state = st;
+	// Apple IOGraphics' IONDRVFramebuffer creates its VSL service from the
+	// provider's legacy registry ID before registering the VBL callback. See
+	// IONDRVFramebuffer.cpp:916-959 and its provider property setup at 541-544.
+	createVblankService(svc);
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
 
@@ -342,6 +403,37 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 	return ret;
 }
 
+// Apple IOGraphics IONDRVFramebuffer.cpp:916-1007 creates, disposes and
+// dispatches opaque VSL services. Keep the VBL service in that path: W1's IH
+// deferred action calls the original VSLDoInterruptService, so IONDRV runs
+// the registered IOFramebuffer callback exactly as it does for a real NDRV.
+int32_t wrapVslNew(void *entryID, UInt32 type, void **service) {
+	auto org = FunctionCast(wrapVslNew, orgVslNew);
+	int32_t ret = org(entryID, type, service);
+	if (ret == kIOReturnSuccess && type == ::kVBLInterruptServiceType && service && *service) {
+		Ndrv::vslServiceCreated(*service,
+		                        reinterpret_cast<Ndrv::VslDoInterruptService>(orgVslDo));
+		FBLOG("ndrv: VBL interrupt service created (%p)", *service);
+	}
+	return ret;
+}
+
+int32_t wrapVslDispose(void *service) {
+	auto org = FunctionCast(wrapVslDispose, orgVslDispose);
+	Ndrv::vslServiceDisposed(service);
+	return org(service);
+}
+
+int32_t wrapVslDo(void *service) {
+	auto org = FunctionCast(wrapVslDo, orgVslDo);
+	return org(service);
+}
+
+bool wrapVslPrepareCursor(void *cursorRef, void *descriptor, void *info) {
+	auto org = FunctionCast(wrapVslPrepareCursor, orgVslPrepareCursor);
+	return org(cursorRef, descriptor, info);
+}
+
 void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address,
                  size_t size) {
 	if (index != kextIONDRVSupport.loadIndex)
@@ -354,6 +446,37 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	else
 		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d)",
 		      patcher.getError());
+	patcher.clearError();
+
+	KernelPatcher::RouteRequest vslNew {
+		"__ZN17IONDRVFramebuffer22VSLNewInterruptServiceEPvjPP11_VSLService",
+		wrapVslNew, orgVslNew,
+	};
+	if (!patcher.routeMultiple(index, &vslNew, 1, address, size))
+		FBLOG("ndrv: VSLNewInterruptService route unavailable (error %d)", patcher.getError());
+	patcher.clearError();
+	KernelPatcher::RouteRequest vslDispose {
+		"__ZN17IONDRVFramebuffer26VSLDisposeInterruptServiceEP11_VSLService",
+		wrapVslDispose, orgVslDispose,
+	};
+	if (!patcher.routeMultiple(index, &vslDispose, 1, address, size))
+		FBLOG("ndrv: VSLDisposeInterruptService route unavailable (error %d)", patcher.getError());
+	patcher.clearError();
+	KernelPatcher::RouteRequest vslDo {
+		"__ZN17IONDRVFramebuffer21VSLDoInterruptServiceEP11_VSLService",
+		wrapVslDo, orgVslDo,
+	};
+	if (!patcher.routeMultiple(index, &vslDo, 1, address, size))
+		FBLOG("ndrv: VSLDoInterruptService route unavailable (error %d)", patcher.getError());
+	patcher.clearError();
+	KernelPatcher::RouteRequest vslPrepare {
+		"__ZN17IONDRVFramebuffer33VSLPrepareCursorForHardwareCursorEPvP26IOHardwareCursorDescriptorP20IOHardwareCursorInfo",
+		wrapVslPrepareCursor, orgVslPrepareCursor,
+	};
+	if (patcher.routeMultiple(index, &vslPrepare, 1, address, size))
+		Ndrv::vslPrepareCursorInstalled(reinterpret_cast<Ndrv::VslPrepareCursor>(orgVslPrepareCursor));
+	else
+		FBLOG("ndrv: VSLPrepareCursor route unavailable (error %d)", patcher.getError());
 	patcher.clearError();
 }
 

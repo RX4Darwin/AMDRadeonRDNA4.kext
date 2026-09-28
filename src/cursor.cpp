@@ -390,3 +390,219 @@ void RDNA4Device::dmubCursorTest() {
 
 
 #endif
+
+// ---------------------------------------------------------------------------
+// NDRV hardware cursor (W14)
+// ---------------------------------------------------------------------------
+
+#include "device.hpp"
+#include "ndrv.hpp"
+
+#include <IOKit/IOLib.h>
+#include <IOKit/IODeviceMemory.h>
+#include <IOKit/graphics/IOGraphicsTypes.h>
+#include <IOKit/ndrvsupport/IOMacOSVideo.h>
+
+#define FBLOG(fmt, ...) IOLog("RDNA4FB: " fmt "\n", ## __VA_ARGS__)
+
+namespace {
+
+// Linux dcn_4_1_0_offset.h: regCURSOR0_0_* at lines 2334-2349,
+// all BASE_IDX 2; regCM_CUR0_* at lines 3326-3337, BASE_IDX 2.
+constexpr uint32_t kCursorControl = 0x0679;
+constexpr uint32_t kCursorAddress = 0x067a;
+constexpr uint32_t kCursorAddressHigh = 0x067b;
+constexpr uint32_t kCursorSize = 0x067c;
+constexpr uint32_t kCursorPosition = 0x067d;
+constexpr uint32_t kCursorHotSpot = 0x067e;
+constexpr uint32_t kCursorDstOffset = 0x0680;
+constexpr uint32_t kCursorSettings = 0x0653; // regHUBPREQ0_CURSOR_SETTINGS
+constexpr uint32_t kCursorCmControl = 0x0cf1;
+constexpr uint32_t kCursorCmScaleGY = 0x0cf4;
+constexpr uint32_t kCursorCmScaleRB = 0x0cf5;
+constexpr uint32_t kCursorCmMatrix = 0x0cf6;
+
+constexpr uint32_t kCursorWidth = 64;
+constexpr uint32_t kCursorHeight = 64;
+constexpr uint32_t kCursorPitch = 64;
+constexpr uint32_t kCursorBytes = kCursorWidth * kCursorHeight * sizeof(uint32_t);
+constexpr uint32_t kCursorModePremultipliedArgb = 2; // dc_cursor_color_format
+constexpr uint32_t kCursorFp16One = 0x3c00;
+constexpr uint32_t kCursorReqModePrefetch = 1u << 2;
+constexpr uint32_t kCursorModeShift = 8;
+constexpr uint32_t kCursorPitchShift = 16;
+constexpr uint32_t kCursorLinesPerChunkShift = 24;
+constexpr uint32_t kCursorCmModeShift = 4;
+constexpr uint32_t kCursorCmWorkingBits = (1u << 7) | (1u << 2);
+
+uint32_t premultiplyArgb(uint32_t pixel) {
+	const uint32_t alpha = pixel >> 24;
+	if (alpha == 0xff)
+		return pixel;
+	if (alpha == 0)
+		return 0;
+	const uint32_t r = ((pixel >> 16) & 0xff) * alpha;
+	const uint32_t g = ((pixel >> 8) & 0xff) * alpha;
+	const uint32_t b = (pixel & 0xff) * alpha;
+	return (alpha << 24) | (((r + 127) / 255) << 16) |
+	       (((g + 127) / 255) << 8) | ((b + 127) / 255);
+}
+
+} // namespace
+
+bool RDNA4Device::initHardwareCursor() {
+	if (!hwCursorRequested || !isAmd || !ipDiscovery.isValid() || !rmmio ||
+	    !fbPhysBase || !fbLength || pipe.hubp >= Pipe::kMaxOtg) {
+		FBLOG("cursor: unavailable; staying with software cursor");
+		return false;
+	}
+
+	const uint32_t hubp = hubpOff();
+	const uint64_t scanout = static_cast<uint64_t>(regReadDmu(2, 0x060a + hubp)) |
+	                         (static_cast<uint64_t>(regReadDmu(2, 0x060b + hubp) & 0xffff) << 32);
+	if (!scanout || scanout == 0xffffffffffffffffull) {
+		FBLOG("cursor: scanout address unavailable; staying with software cursor");
+		return false;
+	}
+
+	// Keep the sprite in the same CPU-visible VRAM aperture as the scanout,
+	// after the console allocation and on a page boundary.
+	cursorMcAddr = (scanout + fbLength + 0xfff) & ~0xfffull;
+	const uint64_t delta = cursorMcAddr - scanout;
+	if (delta + kCursorBytes > 192ull * 1024 * 1024) {
+		FBLOG("cursor: sprite offset 0x%llx outside the safe aperture", delta);
+		return false;
+	}
+
+	IODeviceMemory *memory = IODeviceMemory::withRange(fbPhysBase + delta, kCursorBytes);
+	if (!memory)
+		return false;
+	cursorMap = memory->map();
+	memory->release();
+	if (!cursorMap) {
+		FBLOG("cursor: VRAM sprite mapping failed; staying with software cursor");
+		return false;
+	}
+	cursorVram = reinterpret_cast<volatile uint32_t *>(cursorMap->getVirtualAddress());
+	cursorStage = static_cast<uint32_t *>(IOMalloc(kCursorBytes));
+	if (!cursorVram || !cursorStage) {
+		freeHardwareCursor();
+		return false;
+	}
+	memset(cursorStage, 0, kCursorBytes);
+	for (uint32_t i = 0; i < kCursorWidth * kCursorHeight; i++)
+		cursorVram[i] = 0;
+	ensureUpdateLatch();
+	hwCursorReady = true;
+	FBLOG("cursor: NDRV hardware cursor ready, HUBP%u sprite MC 0x%llx (%ux%u max)",
+	      pipe.hubp, cursorMcAddr, kCursorWidth, kCursorHeight);
+	return true;
+}
+
+void RDNA4Device::freeHardwareCursor() {
+	hwCursorReady = false;
+	hwCursorSet = false;
+	hwCursorVisible = false;
+	cursorVram = nullptr;
+	if (cursorMap) {
+		cursorMap->release();
+		cursorMap = nullptr;
+	}
+	if (cursorStage) {
+		IOFree(cursorStage, kCursorBytes);
+		cursorStage = nullptr;
+	}
+}
+
+IOReturn RDNA4Device::setHardwareCursor(void *cursorRef) {
+	if (!hwCursorReady || !cursorRef || !cursorStage || !cursorVram)
+		return kIOReturnUnsupported;
+
+	IOHardwareCursorDescriptor descriptor {};
+	descriptor.majorVersion = kHardwareCursorDescriptorMajorVersion;
+	descriptor.minorVersion = kHardwareCursorDescriptorMinorVersion;
+	descriptor.width = kCursorWidth;
+	descriptor.height = kCursorHeight;
+	descriptor.bitDepth = 32;
+	IOHardwareCursorInfo info {};
+	info.majorVersion = kHardwareCursorInfoMajorVersion;
+	info.minorVersion = kHardwareCursorInfoMinorVersion;
+	info.hardwareCursorData = reinterpret_cast<UInt8 *>(cursorStage);
+	if (!Ndrv::prepareCursor(cursorRef, &descriptor, &info) ||
+	    !info.cursorWidth || !info.cursorHeight || info.cursorWidth > kCursorWidth ||
+	    info.cursorHeight > kCursorHeight) {
+		FBLOG("cursor: VSLPrepareCursorForHardwareCursor refused image");
+		return kIOReturnUnsupported;
+	}
+
+	cursorWidth = info.cursorWidth;
+	cursorHeight = info.cursorHeight;
+	hwCursorHotX = info.cursorHotSpotX;
+	hwCursorHotY = info.cursorHotSpotY;
+	for (uint32_t i = 0; i < kCursorWidth * kCursorHeight; i++)
+		cursorStage[i] = premultiplyArgb(cursorStage[i]);
+	for (uint32_t i = 0; i < kCursorWidth * kCursorHeight; i++)
+		cursorVram[i] = 0;
+	for (uint32_t y = 0; y < cursorHeight; y++)
+		for (uint32_t x = 0; x < cursorWidth; x++)
+			cursorVram[y * kCursorPitch + x] = cursorStage[y * cursorWidth + x];
+
+	ensureUpdateLatch();
+	const uint32_t hubp = hubpOff();
+	const uint32_t dpp = dppOff();
+	regWriteDmu(2, kCursorAddressHigh + hubp, static_cast<uint32_t>(cursorMcAddr >> 32) & 0xffff);
+	regWriteDmu(2, kCursorAddress + hubp, static_cast<uint32_t>(cursorMcAddr));
+	regWriteDmu(2, kCursorSize + hubp, cursorHeight | (cursorWidth << 16));
+	regWriteDmu(2, kCursorHotSpot + hubp, hwCursorHotY | (static_cast<uint32_t>(hwCursorHotX) << 16));
+	regWriteDmu(2, kCursorSettings + hubp, 3u << 8); // CHUNK_HDL_ADJUST=3
+	const uint32_t hubpControl = kCursorReqModePrefetch |
+		(kCursorModePremultipliedArgb << kCursorModeShift) |
+		(0u << kCursorPitchShift) | (3u << kCursorLinesPerChunkShift);
+	regWriteDmu(2, kCursorControl + hubp, hubpControl | (hwCursorVisible ? 1u : 0u));
+	regWriteDmu(2, kCursorCmScaleGY + dpp, kCursorFp16One);
+	regWriteDmu(2, kCursorCmScaleRB + dpp, kCursorFp16One);
+	regWriteDmu(2, kCursorCmMatrix + dpp, 0);
+	regWriteDmu(2, kCursorCmControl + dpp,
+	            kCursorCmWorkingBits | (kCursorModePremultipliedArgb << kCursorCmModeShift) |
+	            (hwCursorVisible ? 1u : 0u));
+	hwCursorSet = true;
+	FBLOG("cursor: cscSetHardwareCursor image %ux%u hotspot %u,%u, addr 0x%llx ctl 0x%08x cm 0x%08x",
+	      cursorWidth, cursorHeight, hwCursorHotX, hwCursorHotY, cursorMcAddr,
+	      regReadDmu(2, kCursorControl + hubp), regReadDmu(2, kCursorCmControl + dpp));
+	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4Device::drawHardwareCursor(int32_t x, int32_t y, uint32_t visible) {
+	if (!hwCursorReady || !hwCursorSet)
+		return kIOReturnUnsupported;
+	hwCursorX = x;
+	hwCursorY = y;
+	hwCursorVisible = visible != 0;
+	ensureUpdateLatch();
+	const uint32_t hubp = hubpOff();
+	const uint32_t dpp = dppOff();
+	const uint32_t px = static_cast<uint32_t>(x) & 0x7fff;
+	const uint32_t py = static_cast<uint32_t>(y) & 0x7fff;
+	regWriteDmu(2, kCursorPosition + hubp, py | (px << 15));
+	regWriteDmu(2, kCursorDstOffset + hubp, x > 0 ? static_cast<uint32_t>(x) : 0);
+	const uint32_t control = kCursorReqModePrefetch |
+		(kCursorModePremultipliedArgb << kCursorModeShift) | (3u << kCursorLinesPerChunkShift);
+	regWriteDmu(2, kCursorControl + hubp, control | (hwCursorVisible ? 1u : 0u));
+	regWriteDmu(2, kCursorCmControl + dpp,
+	            kCursorCmWorkingBits | (kCursorModePremultipliedArgb << kCursorCmModeShift) |
+	            (hwCursorVisible ? 1u : 0u));
+	FBLOG("cursor: cscDrawHardwareCursor x=%d y=%d visible=%u pos=0x%08x",
+	      x, y, visible, regReadDmu(2, kCursorPosition + hubp));
+	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4Device::getHardwareCursorDrawState(
+	Ndrv::VDHardwareCursorDrawStateRec &state) const {
+	state.csCursorX = hwCursorX;
+	state.csCursorY = hwCursorY;
+	state.csCursorVisible = hwCursorVisible ? 1u : 0u;
+	state.csCursorSet = hwCursorSet ? 1u : 0u;
+	state.csReserved1 = 0;
+	state.csReserved2 = 0;
+	return kIOReturnSuccess;
+}

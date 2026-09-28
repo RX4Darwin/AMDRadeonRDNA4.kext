@@ -397,6 +397,7 @@ private:
 	uint32_t ihUnknownCount { 0 };
 	uint8_t ihUnknownSeen[256][32] {};
 	bool ihDcnRequested { false };
+	bool ihVblRequested { false };
 	bool ihDcnActive { false };
 	uint8_t ihDcnOtg { Pipe::kNone };
 	uint8_t ihDcnHubp { Pipe::kNone };

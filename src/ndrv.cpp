@@ -11,6 +11,48 @@
 
 namespace Ndrv {
 
+namespace {
+void *gVblService { nullptr };
+VslDoInterruptService gVblDo { nullptr };
+VslPrepareCursor gPrepareCursor { nullptr };
+bool gVblankEnabled { false };
+}
+
+void vslServiceCreated(void *service, VslDoInterruptService doService) {
+	if (service && doService && !gVblService) {
+		gVblService = service;
+		gVblDo = doService;
+	}
+}
+
+void vslServiceDisposed(void *service) {
+	if (service == gVblService) {
+		gVblService = nullptr;
+		gVblDo = nullptr;
+	}
+}
+
+bool vslServicePresent() {
+	return gVblService != nullptr;
+}
+
+void vslPrepareCursorInstalled(VslPrepareCursor prepare) {
+	gPrepareCursor = prepare;
+}
+
+void setVblankEnabled(bool enabled) {
+	gVblankEnabled = enabled;
+}
+
+void signalVblank() {
+	if (gVblankEnabled && gVblService && gVblDo)
+		(void)gVblDo(gVblService);
+}
+
+bool prepareCursor(void *cursorRef, void *descriptor, void *info) {
+	return gPrepareCursor && gPrepareCursor(cursorRef, descriptor, info);
+}
+
 void Translator::init(const Modes::Mode *table, size_t n, uint32_t bootId,
                       const uint8_t *edidBytes, size_t edidBytesLen, const Backend &backend) {
 	modes = table;
@@ -89,6 +131,22 @@ bool Translator::status(uint16_t code, void *params, int32_t &ret) {
 			return false;
 		ret = getSync(*static_cast<VDSyncInfoRec *>(params));
 		return true;
+	case cscSupportsHardwareCursor: {
+		if (!be.supportsHardwareCursor)
+			return false;
+		auto &r = *static_cast<VDSupportsHardwareCursorRec *>(params);
+		r.csSupportsHardwareCursor = be.supportsHardwareCursor(be.ctx) ? 1u : 0u;
+		r.csReserved1 = 0;
+		r.csReserved2 = 0;
+		ret = kSuccess;
+		return true;
+	}
+	case cscGetHardwareCursorDrawState:
+		if (!be.getHardwareCursorDrawState)
+			return false;
+		ret = be.getHardwareCursorDrawState(
+			be.ctx, *static_cast<VDHardwareCursorDrawStateRec *>(params));
+		return true;
 	default:
 		return false;
 	}
@@ -108,6 +166,21 @@ bool Translator::control(uint16_t code, void *params, int32_t &ret) {
 			return false;
 		ret = setSync(*static_cast<const VDSyncInfoRec *>(params));
 		return true;
+	case cscSetHardwareCursor: {
+		if (!be.setHardwareCursor)
+			return false;
+		auto &r = *static_cast<VDSetHardwareCursorRec *>(params);
+		ret = be.setHardwareCursor(be.ctx, r.csCursorRef);
+		return true;
+	}
+	case cscDrawHardwareCursor: {
+		if (!be.drawHardwareCursor)
+			return false;
+		auto &r = *static_cast<VDDrawHardwareCursorRec *>(params);
+		ret = be.drawHardwareCursor(be.ctx, r.csCursorX, r.csCursorY,
+		                            r.csCursorVisible);
+		return true;
+	}
 	default:
 		return false;
 	}

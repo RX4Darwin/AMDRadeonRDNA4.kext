@@ -1746,6 +1746,10 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 
 	uint32_t vd = pciDevice->configRead32(kIOPCIConfigVendorID);
 	isAmd = (vd & 0xffff) == 0x1002;
+	uint32_t cursor = 0;
+	hwCursorRequested = PE_parse_boot_argn("rdna4-cursor", &cursor, sizeof(cursor)) && cursor != 0;
+	if (hwCursorRequested)
+		FBLOG("cursor: hardware cursor requested by rdna4-cursor=1");
 	const char *model = (vd >> 16) == 0x7551 ? "AMD Radeon AI PRO R9700"
 	                                         : "AMD Radeon RX 9070 XT";
 	if (!isAmd)
@@ -1771,6 +1775,8 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 		if (haveMmio) {
 			// First: every per-pipe path below keys off the pipe the GOP lit.
 			discoverPipe();
+			if (hwCursorRequested)
+				initHardwareCursor();
 			probeMemSize();
 			dumpDCN();
 			// DP-stream experiment; meaningless (and aimed at DP0) on HDMI.
@@ -1795,6 +1801,7 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 }
 
 RDNA4Device::~RDNA4Device() {
+	freeHardwareCursor();
 	if (onDieDisc) {
 		IOFree(onDieDisc, 10 << 10);
 		onDieDisc = nullptr;
