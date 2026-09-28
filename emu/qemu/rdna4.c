@@ -330,6 +330,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define REG_GCVM_FAULT_DEFAULT_LO GC_SEG0(0x15d4)
 #define REG_GCVM_FAULT_DEFAULT_HI GC_SEG0(0x15d5)
 #define REG_GRBM_GFX_CNTL GC_SEG1(0x0900)
+#define REG_GCVM_INV0_REQ    GC_SEG0(0x1647)
+#define REG_GCVM_INV0_ACK    GC_SEG0(0x1659)
 #define REG_GCVM_INV17_REQ   GC_SEG0(0x1647 + 17)
 #define REG_GCVM_INV17_ACK   GC_SEG0(0x1659 + 17)
 
@@ -365,6 +367,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define REG_GFX_CP_WPTR_POLL_HI   GC_SEG0(0x1e8c)
 #define REG_GFX_CP_DB_CONTROL     GC_SEG0(0x1e8d)
 #define REG_GFX_CP_RB_ACTIVE      GC_SEG0(0x1f40)
+#define REG_GFX_CP_INT_CNTL_RING0 GC_SEG0(0x1e0a)
 #define REG_GFX_CP_PFP_START      GC_SEG0(0x1e44)
 #define REG_GFX_CP_ME_START       GC_SEG0(0x1e45)
 #define REG_GFX_GRBM_GFX_CNTL     GC_SEG1(0x0900)
@@ -375,6 +378,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define GFX_DOORBELL_DWORD        0x116
 #define GFX_DOORBELL_RANGE_MASK   0x00000ffcu
 #define GFX_DOORBELL_OFFSET_MASK  0x0ffffffcu
+#define CP_PRIV_INSTR_INT_ENABLE  (1u << 22)
+#define CP_PRIV_REG_INT_ENABLE    (1u << 23)
+#define CP_OPCODE_ERROR_INT_ENABLE (1u << 24)
+#define CP_GENERIC0_INT_ENABLE    (1u << 31)
 
 /* gfx12 graphics registers use the absolute dword numbers from Mesa's
  * gfx12.json.  SH registers are in GC segment 0; context/UCONFIG registers
@@ -511,6 +518,8 @@ typedef struct RDNA4Scanout {
     RDNA4Cursor cursor;
 } RDNA4Scanout;
 
+static void rdna4_ih_emit_vmid(RDNA4State *s, uint8_t client, uint8_t source,
+                               uint8_t ring, uint32_t vmid, uint32_t data0);
 static void rdna4_ih_emit(RDNA4State *s, uint8_t client, uint8_t source,
                           uint8_t ring, uint32_t data0);
 static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so,
@@ -605,6 +614,9 @@ struct RDNA4State {
     uint64_t     gfx_wptr;               /* GFX ring 0's last wptr: 64-bit, monotonic */
     uint64_t     gfx_rptr;               /* GFX ring 0's consumed dwords */
     bool         gfx_csb_loaded;        /* the first valid kick loaded the CSB */
+    bool         gfx_reinit;            /* CP_ME halt/restart has reset RB0 */
+    bool         gfx_trace_selfcheck_done;
+    uint32_t     gfx_job_seq;           /* latest RELEASE_MEM fence value */
     bool         gfx_pending, gfx_active, gfx_pending_doorbell, gfx_budget_hit;
     uint64_t     gfx_pending_wptr;
     uint64_t     gfx_work_base, gfx_work_pos, gfx_work_end;
@@ -1711,8 +1723,8 @@ static bool rdna4_ih_ready(RDNA4State *s)
 /* A GPU IH producer writes vectors into the system-memory ring and then
  * writebacks the producer pointer. The QEMU card has no IOMMU, so the bus
  * addresses programmed through MC_SPACE=2 are guest physical addresses. */
-static void rdna4_ih_emit(RDNA4State *s, uint8_t client, uint8_t source,
-                          uint8_t ring, uint32_t data0)
+static void rdna4_ih_emit_vmid(RDNA4State *s, uint8_t client, uint8_t source,
+                               uint8_t ring, uint32_t vmid, uint32_t data0)
 {
     if (!rdna4_ih_ready(s)) {
         return;
@@ -1726,7 +1738,7 @@ static void rdna4_ih_emit(RDNA4State *s, uint8_t client, uint8_t source,
 
     uint8_t entry[IH_ENTRY_BYTES] = { 0 };
     stl_le_p(entry + 0, (uint32_t)client | ((uint32_t)source << 8) |
-                         ((uint32_t)ring << 16));
+                         ((uint32_t)ring << 16) | ((vmid & 0xf) << 24));
     stl_le_p(entry + 1 * 4, s->ih_wptr / IH_ENTRY_BYTES);
     stl_le_p(entry + 4 * 4, data0);
     uint64_t ring_bus = ((uint64_t)reg_get(s, REG_IH_RB_BASE) << 8) |
@@ -1752,6 +1764,12 @@ static void rdna4_ih_emit(RDNA4State *s, uint8_t client, uint8_t source,
     if (!s->ih_dead) {
         msi_notify(pci, 0);
     }
+}
+
+static void rdna4_ih_emit(RDNA4State *s, uint8_t client, uint8_t source,
+                          uint8_t ring, uint32_t data0)
+{
+    rdna4_ih_emit_vmid(s, client, source, ring, 0, data0);
 }
 
 static void rdna4_ih_reg_write(RDNA4State *s, uint32_t dw, uint32_t val)
@@ -2011,6 +2029,56 @@ static bool rdna4_vm_access(RDNA4State *s, uint64_t va, uint8_t *data, uint64_t 
         len -= chunk;
     }
     return true;
+}
+
+static bool rdna4_gfx_mem_mapped(RDNA4State *s, uint64_t va, uint64_t len,
+                                 uint32_t vmid, bool write, bool execute)
+{
+    while (len) {
+        uint64_t chunk = 0x1000 - (va & 0xfff);
+
+        if (chunk > len)
+            chunk = len;
+        if (!vmid) {
+            if (!rdna4_gc_span(s, va, chunk))
+                return false;
+        } else {
+            RDNA4VmTarget target;
+            if (!rdna4_vm_target(s, va, chunk, vmid, write, execute, &target))
+                return false;
+        }
+        va += chunk;
+        len -= chunk;
+    }
+    return true;
+}
+
+static bool rdna4_gfx_mem_read(RDNA4State *s, uint64_t va, void *data,
+                               uint64_t len, uint32_t vmid, bool execute)
+{
+    if (!vmid) {
+        uint8_t *p = rdna4_gc_span(s, va, len);
+
+        if (!p)
+            return false;
+        memcpy(data, p, len);
+        return true;
+    }
+    return rdna4_vm_access(s, va, data, len, vmid, false, execute);
+}
+
+static bool rdna4_gfx_mem_write(RDNA4State *s, uint64_t va, const void *data,
+                                uint64_t len, uint32_t vmid)
+{
+    if (!vmid) {
+        uint8_t *p = rdna4_gc_span(s, va, len);
+
+        if (!p)
+            return false;
+        memcpy(p, data, len);
+        return true;
+    }
+    return rdna4_vm_access(s, va, (uint8_t *)(uintptr_t)data, len, vmid, true, false);
 }
 
 #define REG_GCMC_AGP_TOP     GC_SEG0(0x1616)   /* MC >> 24 */
@@ -2350,6 +2418,18 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         rdna4_psp_wptr(s, val);
     } else if (dw >= OSSSYS_SEG0 && dw < OSSSYS_SEG0 + 0x300) {
         rdna4_ih_reg_write(s, dw - OSSSYS_SEG0, val);
+    } else if (addr == REG_GFX_CP_ME_CNTL) {
+        reg_set(s, addr, val);
+        if (val & ((1u << 26) | (1u << 28))) {
+            s->gfx_reinit = true;
+            s->gfx_csb_loaded = false;
+            s->gfx_pending = false;
+            s->gfx_active = false;
+            reg_set(s, REG_GC_CP_STAT, 0);
+            fprintf(stderr, "rdna4: gfx: CP_ME_CNTL halted (0x%08x); RB0 recovery armed\n", val);
+        } else if (s->gfx_reinit) {
+            fprintf(stderr, "rdna4: gfx: CP_ME_CNTL unhalted (0x%08x); RB0 recovery may kick\n", val);
+        }
     } else if (addr == REG_GFX_CP_RB0_WPTR) {
         rdna4_gfx_wptr(s, (uint64_t)val |
                         ((uint64_t)reg_get(s, REG_GFX_CP_RB0_WPTR_HI) << 32), false);
@@ -3328,7 +3408,7 @@ static bool rdna4_mec_ib_packet(RDNA4State *s)
     if (!rdna4_vm_access(s, address + 4ull * pos, (uint8_t *)&hdr,
                          sizeof(hdr), vmid, false, false)) {
         fprintf(stderr, "rdna4: mec: indirect buffer 0x%" PRIx64 " header fault\n",
-                address + 4ull * pos);
+                (uint64_t)(address + 4ull * pos));
         return false;
     }
     dw[0] = hdr;
@@ -3384,7 +3464,7 @@ static bool rdna4_mec_ib_packet(RDNA4State *s)
             if (!rdna4_vm_access(s, a + 4ull * i, (uint8_t *)&dw[4 + i], 4,
                                  vmid, true, false)) {
                 fprintf(stderr, "rdna4: mec: indirect WRITE_DATA to 0x%" PRIx64
-                        " refused\n", a + 4ull * i);
+                        " refused\n", (uint64_t)(a + 4ull * i));
                 return false;
             }
         }
@@ -3711,6 +3791,8 @@ typedef struct RDNA4GfxStream {
     uint64_t pos;
     uint64_t end;
     uint32_t ring_dw;                 /* zero for an indirect buffer */
+    uint32_t vmid;                    /* VMID used for this packet stream */
+    bool     priv;                    /* PRIV bit for an indirect buffer */
 } RDNA4GfxStream;
 
 static bool rdna4_gfx_stream_dw(RDNA4State *s, const RDNA4GfxStream *st,
@@ -3718,17 +3800,16 @@ static bool rdna4_gfx_stream_dw(RDNA4State *s, const RDNA4GfxStream *st,
 {
     uint64_t slot = st->ring_dw ? pos % st->ring_dw : pos;
     uint64_t addr;
-    uint8_t *p;
+    uint8_t bytes[4];
 
     if (pos >= st->end || slot > (UINT64_MAX - st->base) / 4) {
         return false;
     }
     addr = st->base + 4 * slot;
-    p = rdna4_gc_span(s, addr, 4);
-    if (!p) {
+    if (!rdna4_gfx_mem_read(s, addr, bytes, sizeof(bytes), st->vmid, false)) {
         return false;
     }
-    *out = ldl_le_p(p);
+    *out = ldl_le_p(bytes);
     return true;
 }
 
@@ -3968,16 +4049,16 @@ static bool rdna4_gfx_set_sreg(RDNA4GfxWave *w, uint32_t dst, uint32_t value)
     return true;
 }
 
-static bool rdna4_gfx_read_code(RDNA4State *s, uint64_t pc, uint32_t *dw,
-                                uint32_t *dw1)
+static bool rdna4_gfx_read_code(RDNA4State *s, uint64_t pc, uint32_t vmid,
+                                uint32_t *dw, uint32_t *dw1)
 {
-    uint8_t *p = rdna4_gc_span(s, pc, 8);
+    uint8_t bytes[8];
 
-    if (!p) {
+    if (!rdna4_gfx_mem_read(s, pc, bytes, sizeof(bytes), vmid, true)) {
         return false;
     }
-    *dw = ldl_le_p(p);
-    *dw1 = ldl_le_p(p + 4);
+    *dw = ldl_le_p(bytes);
+    *dw1 = ldl_le_p(bytes + 4);
     return true;
 }
 
@@ -3985,18 +4066,18 @@ static bool rdna4_gfx_read_code(RDNA4State *s, uint64_t pc, uint32_t *dw,
  * SALU runs once, VALU runs only on EXEC lanes, and exports are captured as
  * the stage boundary.  This is intentionally not a native shader shortcut. */
 static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
-                               bool passthru)
+                               bool passthru, uint32_t vmid)
 {
     while (w->steps++ < 4096) {
         uint32_t dw, dw1, dw2 = 0, dw3 = 0;
         uint32_t n = 1;
 
-        if (!rdna4_gfx_read_code(s, w->pc, &dw, &dw1)) {
+        if (!rdna4_gfx_read_code(s, w->pc, vmid, &dw, &dw1)) {
             fprintf(stderr, "rdna4: gfx: %s shader fetch at 0x%" PRIx64 " refused\n",
                     ngg ? "NGG" : "PS", w->pc);
             return false;
         }
-        if (!rdna4_gfx_read_code(s, w->pc + 8, &dw2, &dw3)) {
+        if (!rdna4_gfx_read_code(s, w->pc + 8, vmid, &dw2, &dw3)) {
             /* The last s_endpgm needs no third dword; this fetch is only
              * required by the VOP3 forms below. */
             dw2 = 0;
@@ -4192,7 +4273,7 @@ unknown:
     {
         uint32_t bad_dw = 0;
         uint32_t ignored = 0;
-        rdna4_gfx_read_code(s, w->pc, &bad_dw, &ignored);
+        rdna4_gfx_read_code(s, w->pc, vmid, &bad_dw, &ignored);
     fprintf(stderr, "rdna4: gfx: %s shader unsupported instruction 0x%08x at pc 0x%" PRIx64 "\n",
             ngg ? "NGG" : "PS", bad_dw, w->pc);
     }
@@ -4229,16 +4310,18 @@ static void rdna4_gfx_break_must(RDNA4State *s)
 }
 
 static uint32_t rdna4_gfx_ring_bytes(RDNA4State *s, uint32_t base_reg,
-                                     uint32_t size_reg, uint32_t mask)
+                                     uint32_t size_reg, uint32_t mask,
+                                     uint32_t vmid)
 {
     uint64_t base = (uint64_t)reg_get(s, base_reg) << 16;
     uint64_t bytes = (uint64_t)(reg_get(s, size_reg) & mask) << 5;
 
     return base && bytes && bytes <= UINT32_MAX &&
-           rdna4_gc_span(s, base, bytes) ? (uint32_t)bytes : 0;
+           rdna4_gfx_mem_mapped(s, base, bytes, vmid, false, false) ?
+               (uint32_t)bytes : 0;
 }
 
-static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count)
+static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
 {
     uint32_t stages, ena, addr, col, info, attrib3, vte, cbcc, target, shader;
     uint32_t gb, ses, pos_bytes, prim_bytes;
@@ -4280,9 +4363,9 @@ static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count)
     if (!ses || ses > REG_GFX_GE_RING_MIN_SE)
         return rdna4_gfx_draw_refuse(s, "GB_ADDR_CONFIG", "shader-engine count is not modelled");
     pos_bytes = rdna4_gfx_ring_bytes(s, REG_GFX_GE_POS_RING_BASE,
-                                     REG_GFX_GE_POS_RING_SIZE, 0x3fff);
+                                     REG_GFX_GE_POS_RING_SIZE, 0x3fff, vmid);
     prim_bytes = rdna4_gfx_ring_bytes(s, REG_GFX_GE_PRIM_RING_BASE,
-                                      REG_GFX_GE_PRIM_RING_SIZE, 0x7ff);
+                                      REG_GFX_GE_PRIM_RING_SIZE, 0x7ff, vmid);
     if (!pos_bytes || pos_bytes < 0x40000)
         return rdna4_gfx_draw_refuse(s, "GE_POS_RING_BASE/SIZE", "position ring is unmapped or undersized");
     if (!prim_bytes || prim_bytes < 0xffc0)
@@ -4347,7 +4430,8 @@ static uint32_t rdna4_gfx_unorm8(float value)
 static bool rdna4_gfx_ps_wave(RDNA4State *s, const RDNA4GfxTriangle *tri,
                               const int *px, const int *py, unsigned count,
                               uint8_t *target, uint32_t pitch, uint32_t chan_mask,
-                              uint32_t col_format, uint32_t *written)
+                              uint32_t col_format, uint32_t vmid,
+                              uint32_t *written)
 {
     RDNA4GfxWave w = { 0 };
     uint64_t pgm = ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_PS) << 8) |
@@ -4379,7 +4463,7 @@ static bool rdna4_gfx_ps_wave(RDNA4State *s, const RDNA4GfxTriangle *tri,
         w.v[0][lane] = rdna4_u(area / denom);
         w.v[1][lane] = rdna4_u(area2 / denom);
     }
-    if (!rdna4_gfx_wave_run(s, &w, false, false))
+    if (!rdna4_gfx_wave_run(s, &w, false, false, vmid))
         return false;
     if (w.mrt_enable != (col_format == 4 ? 3u : 15u)) {
         fprintf(stderr, "rdna4: gfx: PS export mask 0x%x does not match COL0 format %u\n",
@@ -4388,7 +4472,7 @@ static bool rdna4_gfx_ps_wave(RDNA4State *s, const RDNA4GfxTriangle *tri,
     }
     for (unsigned lane = 0; lane < count; lane++) {
         float rgba[4];
-        uint8_t *p;
+        uint8_t pixel[4];
         uint64_t addr;
 
         if (!w.mrt_valid[lane])
@@ -4403,19 +4487,20 @@ static bool rdna4_gfx_ps_wave(RDNA4State *s, const RDNA4GfxTriangle *tri,
                 rgba[c] = rdna4_f(w.mrt_export[c][lane]);
         }
         addr = cb + (uint64_t)py[lane] * pitch + (uint64_t)px[lane] * 4;
-        p = rdna4_gc_span(s, addr, 4);
-        if (!p)
+        if (!rdna4_gfx_mem_read(s, addr, pixel, sizeof(pixel), vmid, false))
             return false;
         for (unsigned c = 0; c < 4; c++) {
             if ((chan_mask >> c) & 1u)
-                p[c] = (uint8_t)rdna4_gfx_unorm8(rgba[c]);
+                pixel[c] = (uint8_t)rdna4_gfx_unorm8(rgba[c]);
         }
+        if (!rdna4_gfx_mem_write(s, addr, pixel, sizeof(pixel), vmid))
+            return false;
         (*written)++;
     }
     return true;
 }
 
-static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count)
+static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
 {
     RDNA4GfxWave ngg = { 0 };
     RDNA4GfxTriangle tri = { 0 };
@@ -4426,7 +4511,7 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count)
 
     s->gfx_draw_refused = false;
     rdna4_gfx_break_must(s);
-    if (!rdna4_gfx_check_draw(s, count))
+    if (!rdna4_gfx_check_draw(s, count, vmid))
         return false;
     start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
     attrib2 = reg_get(s, REG_GFX_CB_COLOR0_ATTRIB2);
@@ -4451,7 +4536,7 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count)
     for (unsigned lane = 0; lane < count; lane++)
         ngg.v[3][lane] = lane;         /* auto-index VertexID */
     if (!rdna4_gfx_wave_run(s, &ngg, true,
-                            (stages & (1u << 26)) != 0))
+                            (stages & (1u << 26)) != 0, vmid))
         return false;
     if ((stages & (1u << 26)) != 0) {
         if (ngg.alloc_count)
@@ -4583,7 +4668,8 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count)
                         uint64_t cb = ((uint64_t)reg_get(s, REG_GFX_CB_COLOR0_BASE) << 8) |
                                       ((uint64_t)(reg_get(s, REG_GFX_CB_COLOR0_BASE_EXT) & 0xff) << 40);
                         if (!rdna4_gfx_ps_wave(s, &tri, px, py, np,
-                                               dummy, pitch, chan_mask, col_format, &written)) {
+                                               dummy, pitch, chan_mask, col_format,
+                                               vmid, &written)) {
                             g_free(px); g_free(py);
                             return false;
                         }
@@ -4594,7 +4680,7 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count)
             }
         }
         if (np && !rdna4_gfx_ps_wave(s, &tri, px, py, np, NULL, pitch,
-                                     chan_mask, col_format, &written)) {
+                                     chan_mask, col_format, vmid, &written)) {
             g_free(px); g_free(py);
             return false;
         }
@@ -4604,6 +4690,38 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count)
             written, qemu_clock_get_ns(QEMU_CLOCK_HOST) - start_ns);
     dpy_gfx_update_full(s->con);
     return true;
+}
+
+static bool rdna4_gfx_fault_enabled(RDNA4State *s, uint32_t source)
+{
+    uint32_t cntl = reg_get(s, REG_GFX_CP_INT_CNTL_RING0);
+
+    switch (source) {
+    case 183:
+        return (cntl & CP_OPCODE_ERROR_INT_ENABLE) != 0;
+    case 184:
+        return (cntl & CP_PRIV_REG_INT_ENABLE) != 0;
+    case 185:
+        return (cntl & CP_PRIV_INSTR_INT_ENABLE) != 0;
+    default:
+        return false;
+    }
+}
+
+static void rdna4_gfx_fault(RDNA4State *s, uint32_t vmid, uint32_t source,
+                            const char *name, uint64_t at)
+{
+    fprintf(stderr, "rdna4: gfx: %s at packet dword 0x%" PRIx64
+            " (VMID %u), stopping\n", name, at, vmid);
+    if (rdna4_gfx_fault_enabled(s, source))
+        rdna4_ih_emit_vmid(s, 0x14, source, 0, vmid, s->gfx_job_seq);
+}
+
+static bool rdna4_gfx_reg_allowed(uint64_t dword)
+{
+    return (dword >= 0x2c00 && dword < 0x3000) ||
+           (dword >= 0xa000 && dword < 0xc000) ||
+           (dword >= 0xc000 && dword <= 0xffff);
 }
 
 static bool rdna4_gfx_set_regs(RDNA4State *s, RDNA4GfxStream *st,
@@ -4616,6 +4734,14 @@ static bool rdna4_gfx_set_regs(RDNA4State *s, RDNA4GfxStream *st,
         return false;
     }
     base = op == 0x79 ? 0xc000 : op == 0x69 ? 0xa000 : 0x2c00;
+    if (!st->priv && op == 0x79 &&
+        ((uint64_t)base + start < 0xc000 ||
+         (uint64_t)base + start + count - 1 > 0xffff)) {
+        fprintf(stderr, "rdna4: gfx: SET_UCONFIG_REG 0x%08x..0x%08x is privileged, stopping\n",
+                base + start, base + start + count - 1);
+        rdna4_gfx_fault(s, st->vmid, 184, "PRIV_REG", st->pos);
+        return false;
+    }
     for (uint32_t i = 0; i < count; i++) {
         uint32_t value;
         uint64_t dword = (uint64_t)base + start + i;
@@ -4631,6 +4757,9 @@ static bool rdna4_gfx_set_regs(RDNA4State *s, RDNA4GfxStream *st,
 }
 
 static void rdna4_gfx_rptr_writeback(RDNA4State *s, uint32_t rptr);
+static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
+                              uint64_t deadline_ns, bool ring);
+static bool rdna4_gfx_trace_selfcheck(RDNA4State *s);
 
 static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                               uint64_t deadline_ns, bool ring)
@@ -4672,7 +4801,10 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
             }
             break;
         case 0x28:                                           /* CONTEXT_CONTROL */
-            if (count != 1) {
+            if (count != 1 ||
+                !rdna4_gfx_stream_dw(s, st, at + 1, &hdr) || hdr != 0x80000000 ||
+                !rdna4_gfx_stream_dw(s, st, at + 2, &hdr) ||
+                (hdr != 0 && hdr != 0x80000000)) {
                 fprintf(stderr, "rdna4: gfx: CONTEXT_CONTROL length %u refused, stopping\n", len);
                 return false;
             }
@@ -4695,8 +4827,71 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                 return false;
             }
             break;
+        case 0x3c: {                                         /* WAIT_REG_MEM */
+            uint32_t ctl, lo, hi, ref, mask, poll, value = 0;
+            uint64_t addr;
+            uint32_t function, operation, mem_space;
+            bool matched;
+
+            if (count != 5 ||
+                !rdna4_gfx_stream_dw(s, st, at + 1, &ctl) ||
+                !rdna4_gfx_stream_dw(s, st, at + 2, &lo) ||
+                !rdna4_gfx_stream_dw(s, st, at + 3, &hi) ||
+                !rdna4_gfx_stream_dw(s, st, at + 4, &ref) ||
+                !rdna4_gfx_stream_dw(s, st, at + 5, &mask) ||
+                !rdna4_gfx_stream_dw(s, st, at + 6, &poll)) {
+                fprintf(stderr, "rdna4: gfx: WAIT_REG_MEM length %u refused, stopping\n", len);
+                return false;
+            }
+            function = ctl & 7;
+            mem_space = (ctl >> 4) & 3;
+            operation = (ctl >> 6) & 3;
+            addr = (uint64_t)lo | ((uint64_t)hi << 32);
+            if (operation == 1) {
+                if (function != 3 || mem_space != 0 ||
+                    lo != REG_GCVM_INV0_REQ || hi != REG_GCVM_INV0_ACK ||
+                    ref != ((1u << st->vmid) | 0x00f80000u) ||
+                    mask != (1u << st->vmid)) {
+                    fprintf(stderr, "rdna4: gfx: WAIT_REG_MEM invalidate form refused, stopping\n");
+                    return false;
+                }
+                reg_set(s, REG_GCVM_INV0_REQ, ref);
+                reg_set(s, REG_GCVM_INV0_ACK, mask);
+                break;
+            }
+            if (operation != 0 || (function != 3 && function != 4 && function != 5) ||
+                mem_space > 1) {
+                fprintf(stderr, "rdna4: gfx: WAIT_REG_MEM operation/function refused, stopping\n");
+                return false;
+            }
+            if (mem_space) {
+                if (!rdna4_gfx_mem_read(s, addr, &value, sizeof(value), st->vmid, false)) {
+                    fprintf(stderr, "rdna4: gfx: WAIT_REG_MEM address 0x%" PRIx64
+                            " is unmapped, stopping\n", addr);
+                    return false;
+                }
+            } else if (addr < RDNA4_MMIO_SIZE) {
+                value = reg_get(s, (uint32_t)addr);
+            } else {
+                fprintf(stderr, "rdna4: gfx: WAIT_REG_MEM register 0x%" PRIx64
+                        " is unmapped, stopping\n", addr);
+                return false;
+            }
+            switch (function) {
+            case 3: matched = (value & mask) == (ref & mask); break;
+            case 4: matched = (value & mask) != (ref & mask); break;
+            default: matched = (value & mask) >= (ref & mask); break;
+            }
+            if (!matched) {
+                fprintf(stderr, "rdna4: gfx: WAIT_REG_MEM poll 0x%08x did not match, stopping\n",
+                        value);
+                return false;
+            }
+            (void)poll;
+            break;
+        }
         case 0x37: {                                         /* WRITE_DATA */
-            uint32_t ctl, lo, hi, value, n = count - 2;
+            uint32_t ctl, lo, hi, value, n;
             uint64_t addr;
 
             if (count < 3 || !rdna4_gfx_stream_dw(s, st, at + 1, &ctl) ||
@@ -4705,10 +4900,12 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                 fprintf(stderr, "rdna4: gfx: WRITE_DATA length %u refused, stopping\n", len);
                 return false;
             }
+            n = count - 2;
             addr = (uint64_t)(lo & ~3u) | ((uint64_t)hi << 32);
             if (((ctl >> 8) & 0xf) == 5) {
-                uint8_t *p = rdna4_gc_span(s, addr, 4ull * n);
-                if (!p) {
+                g_autofree uint8_t *bytes = g_malloc(4ull * n);
+
+                if (!rdna4_gfx_mem_mapped(s, addr, 4ull * n, st->vmid, true, false)) {
                     fprintf(stderr, "rdna4: gfx: WRITE_DATA memory 0x%" PRIx64 " refused, stopping\n", addr);
                     return false;
                 }
@@ -4716,9 +4913,21 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                     if (!rdna4_gfx_stream_dw(s, st, at + 4 + i, &value)) {
                         return false;
                     }
-                    stl_le_p(p + 4 * i, value);
+                    stl_le_p(bytes + 4 * i, value);
                 }
-            } else if (((ctl >> 8) & 0xf) == 0 && hi == 0 && addr + 4ull * n <= RDNA4_MMIO_SIZE) {
+                if (!rdna4_gfx_mem_write(s, addr, bytes, 4ull * n, st->vmid)) {
+                    return false;
+                }
+            } else if (((ctl >> 8) & 0xf) == 0 && hi == 0 &&
+                       addr + 4ull * n <= RDNA4_MMIO_SIZE) {
+                if (!st->priv) {
+                    for (uint32_t i = 0; i < n; i++) {
+                        if (!rdna4_gfx_reg_allowed((addr + 4ull * i) / 4)) {
+                            rdna4_gfx_fault(s, st->vmid, 184, "PRIV_REG", at);
+                            return false;
+                        }
+                    }
+                }
                 for (uint32_t i = 0; i < n; i++) {
                     if (!rdna4_gfx_stream_dw(s, st, at + 4 + i, &value)) {
                         return false;
@@ -4732,10 +4941,57 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
             }
             break;
         }
+        case 0x40: {                                         /* COPY_DATA */
+            uint32_t ctl, src_lo, src_hi, dst_lo, dst_hi, src_sel, dst_sel;
+            uint32_t value;
+            uint64_t src, dst;
+
+            if (count != 4 ||
+                !rdna4_gfx_stream_dw(s, st, at + 1, &ctl) ||
+                !rdna4_gfx_stream_dw(s, st, at + 2, &src_lo) ||
+                !rdna4_gfx_stream_dw(s, st, at + 3, &src_hi) ||
+                !rdna4_gfx_stream_dw(s, st, at + 4, &dst_lo) ||
+                !rdna4_gfx_stream_dw(s, st, at + 5, &dst_hi)) {
+                fprintf(stderr, "rdna4: gfx: COPY_DATA length %u refused, stopping\n", len);
+                return false;
+            }
+            src_sel = ctl & 0xf;
+            dst_sel = (ctl >> 8) & 0xf;
+            if ((dst_sel == 0 || dst_sel == 4) && !st->priv &&
+                (dst_sel == 4 || !rdna4_gfx_reg_allowed(dst_lo))) {
+                rdna4_gfx_fault(s, st->vmid, 184, "PRIV_REG", at);
+                return false;
+            }
+            src = (uint64_t)src_lo | ((uint64_t)src_hi << 32);
+            dst = (uint64_t)dst_lo | ((uint64_t)dst_hi << 32);
+            if (src_sel == 5) {
+                value = src_lo;
+            } else if (src_sel == 0 && src_hi == 0 && src < RDNA4_MMIO_SIZE) {
+                value = reg_get(s, (uint32_t)src);
+            } else if (src_sel == 1 && rdna4_gfx_mem_read(s, src, &value, sizeof(value),
+                                                            st->vmid, false)) {
+                /* value loaded below */
+            } else {
+                fprintf(stderr, "rdna4: gfx: COPY_DATA source selector %u refused, stopping\n",
+                        src_sel);
+                return false;
+            }
+            if (dst_sel == 0 && dst_hi == 0 && dst < RDNA4_MMIO_SIZE) {
+                reg_set(s, (uint32_t)dst * 4, value);
+            } else if (dst_sel == 5 && rdna4_gfx_mem_write(s, dst, &value, sizeof(value),
+                                                            st->vmid)) {
+                /* completed */
+            } else {
+                fprintf(stderr, "rdna4: gfx: COPY_DATA destination selector %u refused, stopping\n",
+                        dst_sel);
+                return false;
+            }
+            break;
+        }
         case 0x49: {                                         /* RELEASE_MEM */
             uint32_t event_ctl, ctl, sel, int_sel, lo, hi, value;
             uint64_t addr;
-            uint8_t *p;
+            uint8_t bytes[8];
 
             if (count != 6 || !rdna4_gfx_stream_dw(s, st, at + 1, &event_ctl) ||
                 !rdna4_gfx_stream_dw(s, st, at + 2, &ctl) ||
@@ -4755,8 +5011,7 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                 return false;
             }
             addr = (uint64_t)(lo & ~3u) | ((uint64_t)hi << 32);
-            p = rdna4_gc_span(s, addr, sel == 2 ? 8 : 4);
-            if (!p) {
+            if (!rdna4_gfx_mem_mapped(s, addr, sel == 2 ? 8 : 4, st->vmid, true, false)) {
                 fprintf(stderr, "rdna4: gfx: RELEASE_MEM address 0x%" PRIx64 " refused, stopping\n", addr);
                 return false;
             }
@@ -4765,13 +5020,21 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                 if (!rdna4_gfx_stream_dw(s, st, at + 6, &hi_value)) {
                     return false;
                 }
-                stq_le_p(p, value | ((uint64_t)hi_value << 32));
+                stq_le_p(bytes, value | ((uint64_t)hi_value << 32));
             } else {
-                stl_le_p(p, value);
+                stl_le_p(bytes, value);
             }
-            /* W1 hook: raise the end-of-pipe interrupt when INT_SEL != 0. */
-            if (int_sel && s->trace) {
-                fprintf(stderr, "rdna4: gfx: RELEASE_MEM INT_SEL %u (W1 interrupt hook)\n", int_sel);
+            if (!rdna4_gfx_mem_write(s, addr, bytes, sel == 2 ? 8 : 4, st->vmid)) {
+                return false;
+            }
+            s->gfx_job_seq = value;
+            if (int_sel && (reg_get(s, REG_GFX_CP_INT_CNTL_RING0) &
+                            (CP_TIME_STAMP_INT_ENABLE | CP_GENERIC0_INT_ENABLE)) ==
+                           (CP_TIME_STAMP_INT_ENABLE | CP_GENERIC0_INT_ENABLE)) {
+                rdna4_ih_emit_vmid(s, 0x14, 181, 0, st->vmid, value);
+            } else if (int_sel && s->trace) {
+                fprintf(stderr, "rdna4: gfx: RELEASE_MEM INT_SEL %u masked by CP_INT_CNTL_RING0\n",
+                        int_sel);
             }
             break;
         }
@@ -4794,12 +5057,12 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                 fprintf(stderr, "rdna4: gfx: INDIRECT_BUFFER address is not dword aligned, stopping\n");
                 return false;
             }
-            if (vmid) {
-                fprintf(stderr, "rdna4: gfx: INDIRECT_BUFFER VMID %u refused, stopping\n", vmid);
+            if (ctl & ((1u << 20) | (1u << 21) | (1u << 23))) {
+                fprintf(stderr, "rdna4: gfx: INDIRECT_BUFFER VALID/CHAIN/PRE_ENB form refused, stopping\n");
                 return false;
             }
             if (!ib_len || (uint64_t)ib_len * 4 / 4 != ib_len ||
-                !rdna4_gc_span(s, addr, (uint64_t)ib_len * 4)) {
+                !rdna4_gfx_mem_mapped(s, addr, (uint64_t)ib_len * 4, vmid, false, false)) {
                 fprintf(stderr, "rdna4: gfx: INDIRECT_BUFFER 0x%" PRIx64 " crosses unmapped memory, stopping\n",
                         addr);
                 return false;
@@ -4808,6 +5071,8 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
             ib.pos = 0;
             ib.end = ib_len;
             ib.ring_dw = 0;
+            ib.vmid = vmid;
+            ib.priv = (ctl >> 31) & 1;
             if (!rdna4_gfx_packets(s, &ib, false, 0, false)) {
                 return false;
             }
@@ -4825,6 +5090,7 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
             break;
         case 0x2d: {                                         /* DRAW_INDEX_AUTO */
             uint32_t index_count, initiator;
+            bool draw_ok;
 
             if (count != 1 || !rdna4_gfx_stream_dw(s, st, at + 1, &index_count) ||
                 !rdna4_gfx_stream_dw(s, st, at + 2, &initiator) ||
@@ -4832,12 +5098,17 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                 fprintf(stderr, "rdna4: gfx: DRAW_INDEX_AUTO SOURCE_SELECT or length refused, stopping\n");
                 return false;
             }
-            if (!rdna4_gfx_draw(s, index_count) && !s->gfx_draw_refused)
+            draw_ok = rdna4_gfx_draw(s, index_count, st->vmid);
+            if (!draw_ok && !s->gfx_draw_refused)
                 return false;
+            if (draw_ok && st->vmid == 0 && s->gfx_trace && !s->gfx_trace_selfcheck_done &&
+                !rdna4_gfx_trace_selfcheck(s)) {
+                return false;
+            }
             break;
         }
         default:
-            fprintf(stderr, "rdna4: gfx: unknown PM4 op 0x%02x at dword %" PRIu64 ", stopping\n", op, at);
+            rdna4_gfx_fault(s, st->vmid, 183, "OPCODE_ERROR", at);
             return false;
         }
         st->pos += len;
@@ -4852,6 +5123,283 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
         }
     }
     return true;
+}
+
+typedef struct RDNA4GfxTraceTable {
+    uint64_t key;
+    uint64_t off;
+} RDNA4GfxTraceTable;
+
+static uint64_t rdna4_gfx_trace_phys(RDNA4State *s, uint64_t off)
+{
+    return ((uint64_t)(reg_get(s, REG_GCMC_FB_OFFSET) & 0xffffff) << 24) + off;
+}
+
+static bool rdna4_gfx_trace_table_entry(RDNA4State *s, uint64_t table,
+                                        uint32_t index, uint64_t value)
+{
+    uint8_t *p = rdna4_vram_span(s, table + (uint64_t)index * 8, 8);
+
+    if (!p)
+        return false;
+    stq_le_p(p, value);
+    return true;
+}
+
+static bool rdna4_gfx_trace_new_table(RDNA4State *s, uint64_t *cursor,
+                                      uint64_t *table)
+{
+    uint8_t *p;
+
+    *table = *cursor;
+    *cursor += 0x1000;
+    p = rdna4_vram_span(s, *table, 0x1000);
+    if (!p)
+        return false;
+    memset(p, 0, 0x1000);
+    return true;
+}
+
+static bool rdna4_gfx_trace_find_table(RDNA4State *s, uint64_t *cursor,
+                                       RDNA4GfxTraceTable *tables,
+                                       unsigned *count, unsigned max,
+                                       uint64_t key, uint64_t *table)
+{
+    for (unsigned i = 0; i < *count; i++) {
+        if (tables[i].key == key) {
+            *table = tables[i].off;
+            return true;
+        }
+    }
+    if (*count == max || !rdna4_gfx_trace_new_table(s, cursor, table))
+        return false;
+    tables[*count].key = key;
+    tables[*count].off = *table;
+    (*count)++;
+    return true;
+}
+
+static bool rdna4_gfx_trace_map_page(RDNA4State *s, uint64_t root,
+                                     uint64_t *cursor,
+                                     RDNA4GfxTraceTable *l1, unsigned *nl1,
+                                     RDNA4GfxTraceTable *l2, unsigned *nl2,
+                                     RDNA4GfxTraceTable *l3, unsigned *nl3,
+                                     uint64_t va, uint64_t mc)
+{
+    int64_t target_off = rdna4_gc_to_vram(s, mc & ~0xfffull);
+    uint32_t i0 = (va >> 39) & 0x1ff;
+    uint32_t i1 = (va >> 30) & 0x1ff;
+    uint32_t i2 = (va >> 21) & 0x1ff;
+    uint32_t i3 = (va >> 12) & 0x1ff;
+    uint64_t t1, t2, t3;
+
+    if (target_off < 0 || (uint64_t)target_off >= rdna4_vram_size())
+        return false;
+    if (!rdna4_gfx_trace_find_table(s, cursor, l1, nl1, 32, i0, &t1) ||
+        !rdna4_gfx_trace_table_entry(s, root, i0,
+                                     rdna4_gfx_trace_phys(s, t1) | RDNA4_VM_VALID))
+        return false;
+    if (!rdna4_gfx_trace_find_table(s, cursor, l2, nl2, 64,
+                                    ((uint64_t)i0 << 9) | i1, &t2) ||
+        !rdna4_gfx_trace_table_entry(s, t1, i1,
+                                     rdna4_gfx_trace_phys(s, t2) | RDNA4_VM_VALID))
+        return false;
+    if (!rdna4_gfx_trace_find_table(s, cursor, l3, nl3, 128,
+                                    ((uint64_t)i0 << 18) | ((uint64_t)i1 << 9) | i2,
+                                    &t3) ||
+        !rdna4_gfx_trace_table_entry(s, t2, i2,
+                                     rdna4_gfx_trace_phys(s, t3) | RDNA4_VM_VALID))
+        return false;
+    return rdna4_gfx_trace_table_entry(s, t3, i3,
+        rdna4_gfx_trace_phys(s, (uint64_t)target_off) |
+        RDNA4_VM_VALID | RDNA4_VM_READABLE | RDNA4_VM_WRITEABLE | RDNA4_VM_EXECUTABLE);
+}
+
+static bool rdna4_gfx_trace_map_range(RDNA4State *s, uint64_t root,
+                                      uint64_t *cursor,
+                                      RDNA4GfxTraceTable *l1, unsigned *nl1,
+                                      RDNA4GfxTraceTable *l2, unsigned *nl2,
+                                      RDNA4GfxTraceTable *l3, unsigned *nl3,
+                                      uint64_t va, uint64_t mc, uint64_t len)
+{
+    uint64_t first_va = va & ~0xfffull;
+    uint64_t first_mc = mc & ~0xfffull;
+    uint64_t end = (va & 0xfffull) + len;
+
+    if (!len || end < len)
+        return false;
+    for (uint64_t off = 0; off < end; off += 0x1000) {
+        if (!rdna4_gfx_trace_map_page(s, root, cursor, l1, nl1, l2, nl2,
+                                      l3, nl3, first_va + off, first_mc + off))
+            return false;
+    }
+    return true;
+}
+
+static uint32_t rdna4_gfx_trace_ib_ctl(uint32_t length, uint32_t vmid)
+{
+    return (length & 0xfffff) | ((vmid & 0xf) << 24);
+}
+
+static bool rdna4_gfx_trace_selfcheck(RDNA4State *s)
+{
+    RDNA4GfxTraceTable l1[32] = { 0 }, l2[64] = { 0 }, l3[128] = { 0 };
+    uint64_t old_base, root_off, cursor, packet_off, draw_mc, priv_mc, bad_mc;
+    uint64_t root_mc, cb, pos, prim, es, ps;
+    uint64_t end = rdna4_vram_size() - RDNA4_RESV_SIZE;
+    uint32_t old_vm[8], old_int, old_seq;
+    unsigned nl1 = 0, nl2 = 0, nl3 = 0;
+    uint32_t attrib2, pitch, height, pos_bytes, prim_bytes;
+    uint8_t *p;
+    bool draw_ok = false, priv_ok = false, bad_ok = false, pass = false;
+    bool ih_ready;
+
+    s->gfx_trace_selfcheck_done = true;
+    old_vm[0] = reg_get(s, REG_GCVM_CTX1_CNTL + 7 * 4);
+    old_vm[1] = reg_get(s, REG_GCVM_CTX1_BASE_LO + 7 * 8);
+    old_vm[2] = reg_get(s, REG_GCVM_CTX1_BASE_HI + 7 * 8);
+    old_vm[3] = reg_get(s, REG_GCVM_CTX1_START_LO + 7 * 8);
+    old_vm[4] = reg_get(s, REG_GCVM_CTX1_START_HI + 7 * 8);
+    old_vm[5] = reg_get(s, REG_GCVM_CTX1_END_LO + 7 * 8);
+    old_vm[6] = reg_get(s, REG_GCVM_CTX1_END_HI + 7 * 8);
+    old_vm[7] = s->gfx_job_seq;
+    old_int = reg_get(s, REG_GFX_CP_INT_CNTL_RING0);
+    old_seq = s->gfx_job_seq;
+
+    if (end < 0x100000 || !s->hidden || s->hidden_size < 0x100000) {
+        fprintf(stderr, "rdna4: gfx: trace self-check unavailable (no scratch VRAM)\n");
+        return false;
+    }
+    old_base = ((uint64_t)reg_get(s, REG_GCMC_FB_BASE) & 0xffffff) << 24;
+    root_off = (end - 0x100000) & ~0xfffull;
+    cursor = root_off + 0x1000;
+    packet_off = root_off - 0x4000;
+    root_mc = old_base + packet_off;
+    draw_mc = root_mc + 0x1000;
+    priv_mc = root_mc + 0x2000;
+    bad_mc = root_mc + 0x3000;
+    old_seq = s->gfx_job_seq;
+
+    es = ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_ES) << 8) |
+         ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_HI_ES) << 40);
+    ps = ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_PS) << 8) |
+         ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_HI_PS) << 40);
+    cb = ((uint64_t)reg_get(s, REG_GFX_CB_COLOR0_BASE) << 8) |
+         ((uint64_t)(reg_get(s, REG_GFX_CB_COLOR0_BASE_EXT) & 0xff) << 40);
+    pos = (uint64_t)reg_get(s, REG_GFX_GE_POS_RING_BASE) << 16;
+    prim = (uint64_t)reg_get(s, REG_GFX_GE_PRIM_RING_BASE) << 16;
+    attrib2 = reg_get(s, REG_GFX_CB_COLOR0_ATTRIB2);
+    pitch = ((attrib2 & 0xffff) + 1) * 4;
+    height = ((attrib2 >> 16) & 0xffff) + 1;
+    pos_bytes = (reg_get(s, REG_GFX_GE_POS_RING_SIZE) & 0x3fff) << 5;
+    prim_bytes = (reg_get(s, REG_GFX_GE_PRIM_RING_SIZE) & 0x7ff) << 5;
+
+    p = rdna4_vram_span(s, root_off, 0x1000);
+    if (!p)
+        goto restore_vm;
+    memset(p, 0, 0x1000);
+    if (!rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   root_mc, root_mc, 0x4000) ||
+        !rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   es, es, 0x2000) ||
+        !rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   ps, ps, 0x2000) ||
+        !rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   pos, pos, pos_bytes) ||
+        !rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   prim, prim, prim_bytes) ||
+        !rdna4_gfx_trace_map_range(s, root_off, &cursor,
+                                   l1, &nl1, l2, &nl2, l3, &nl3,
+                                   cb, cb, (uint64_t)pitch * height)) {
+        fprintf(stderr, "rdna4: gfx: trace self-check failed to build VMID8 map\n");
+        return false;
+    }
+    if (cursor + 0x1000 > end) {
+        fprintf(stderr, "rdna4: gfx: trace self-check page tables overflow scratch VRAM\n");
+        return false;
+    }
+    reg_set(s, REG_GCVM_CTX1_CNTL + 7 * 4, 7);
+    reg_set(s, REG_GCVM_CTX1_BASE_LO + 7 * 8, (uint32_t)rdna4_gfx_trace_phys(s, root_off));
+    reg_set(s, REG_GCVM_CTX1_BASE_HI + 7 * 8, (uint32_t)(rdna4_gfx_trace_phys(s, root_off) >> 32));
+    reg_set(s, REG_GCVM_CTX1_START_LO + 7 * 8, 0);
+    reg_set(s, REG_GCVM_CTX1_START_HI + 7 * 8, 0);
+    reg_set(s, REG_GCVM_CTX1_END_LO + 7 * 8, 0xffffffff);
+    reg_set(s, REG_GCVM_CTX1_END_HI + 7 * 8, 0xffff);
+
+    /* The root stream points at a VMID-8 draw IB, so this covers the same
+     * packet path that a user submission takes rather than calling draw() by
+     * itself. */
+    p = rdna4_vram_span(s, packet_off, 0x4000);
+    if (!p) {
+        fprintf(stderr, "rdna4: gfx: trace self-check packet scratch is unmapped\n");
+        goto restore_vm;
+    }
+    memset(p, 0, 0x4000);
+    stl_le_p(p + 0, 0xc0023f00);
+    stl_le_p(p + 4, (uint32_t)draw_mc);
+    stl_le_p(p + 8, (uint32_t)(draw_mc >> 32));
+    stl_le_p(p + 12, rdna4_gfx_trace_ib_ctl(3, 8));
+    stl_le_p(p + 0x1000, 0xc0012d00);
+    stl_le_p(p + 0x1004, 3);
+    stl_le_p(p + 0x1008, 2);
+    RDNA4GfxStream st = { root_mc, 0, 4, 0, 0, true };
+    draw_ok = rdna4_gfx_packets(s, &st, true, 0, false) && st.pos == 4;
+    fprintf(stderr, "rdna4: gfx: trace self-check VMID8 draw %s\n",
+            draw_ok ? "PASS" : "FAIL");
+
+    /* Each bad IB is reached through INDIRECT_BUFFER, and both failures are
+     * before the parent packet can commit its cursor. */
+    stl_le_p(p + 0x2000, 0xc0033700);
+    stl_le_p(p + 0x2004, 0x00100000);
+    stl_le_p(p + 0x2008, REG_GC_CP_STAT);
+    stl_le_p(p + 0x200c, 0);
+    stl_le_p(p + 0x2010, 0x12345678);
+    stl_le_p(p + 0, 0xc0023f00);
+    stl_le_p(p + 4, (uint32_t)priv_mc);
+    stl_le_p(p + 8, (uint32_t)(priv_mc >> 32));
+    stl_le_p(p + 12, rdna4_gfx_trace_ib_ctl(5, 8));
+    old_int = reg_get(s, REG_GFX_CP_INT_CNTL_RING0);
+    reg_set(s, REG_GFX_CP_INT_CNTL_RING0, old_int | CP_PRIV_REG_INT_ENABLE |
+            CP_OPCODE_ERROR_INT_ENABLE | CP_TIME_STAMP_INT_ENABLE | CP_GENERIC0_INT_ENABLE);
+    ih_ready = rdna4_ih_ready(s);
+    uint32_t old_ih = s->ih_wptr;
+    st = (RDNA4GfxStream){ root_mc, 0, 4, 0, 0, true };
+    priv_ok = !rdna4_gfx_packets(s, &st, true, 0, false) && st.pos == 0 &&
+              (!ih_ready || s->ih_wptr == ((old_ih + IH_ENTRY_BYTES) &
+                                             (IH_RING_BYTES - 1)));
+
+    stl_le_p(p + 0x3000, 0xc000ff00);
+    stl_le_p(p + 0x3004, 0);
+    stl_le_p(p + 0, 0xc0023f00);
+    stl_le_p(p + 4, (uint32_t)bad_mc);
+    stl_le_p(p + 8, (uint32_t)(bad_mc >> 32));
+    stl_le_p(p + 12, rdna4_gfx_trace_ib_ctl(2, 8));
+    old_ih = s->ih_wptr;
+    st = (RDNA4GfxStream){ root_mc, 0, 4, 0, 0, true };
+    bad_ok = !rdna4_gfx_packets(s, &st, true, 0, false) && st.pos == 0 &&
+             (!ih_ready || s->ih_wptr == ((old_ih + IH_ENTRY_BYTES) &
+                                            (IH_RING_BYTES - 1)));
+    fprintf(stderr, "rdna4: gfx: trace self-check PRIV_REG IH %s; OPCODE_ERROR IH %s\n",
+            ih_ready ? (priv_ok ? "PASS" : "FAIL") : "SKIP (ring disabled)",
+            ih_ready ? (bad_ok ? "PASS" : "FAIL") : "SKIP (ring disabled)");
+    pass = draw_ok && priv_ok && bad_ok;
+
+restore_vm:
+    reg_set(s, REG_GCVM_CTX1_CNTL + 7 * 4, old_vm[0]);
+    reg_set(s, REG_GCVM_CTX1_BASE_LO + 7 * 8, old_vm[1]);
+    reg_set(s, REG_GCVM_CTX1_BASE_HI + 7 * 8, old_vm[2]);
+    reg_set(s, REG_GCVM_CTX1_START_LO + 7 * 8, old_vm[3]);
+    reg_set(s, REG_GCVM_CTX1_START_HI + 7 * 8, old_vm[4]);
+    reg_set(s, REG_GCVM_CTX1_END_LO + 7 * 8, old_vm[5]);
+    reg_set(s, REG_GCVM_CTX1_END_HI + 7 * 8, old_vm[6]);
+    reg_set(s, REG_GFX_CP_INT_CNTL_RING0, old_int);
+    s->gfx_job_seq = old_seq;
+    return pass;
 }
 
 static void rdna4_gfx_rptr_writeback(RDNA4State *s, uint32_t rptr)
@@ -4915,6 +5463,8 @@ static bool rdna4_gfx_process(RDNA4State *s, uint64_t deadline_ns)
     st.pos = s->gfx_work_pos;
     st.end = s->gfx_work_end;
     st.ring_dw = s->gfx_work_ring_dw;
+    st.vmid = 0;
+    st.priv = true;
     s->gfx_budget_hit = false;
     if (!rdna4_gfx_packets(s, &st, true, deadline_ns, true)) {
         s->gfx_active = false;
@@ -4924,7 +5474,6 @@ static bool rdna4_gfx_process(RDNA4State *s, uint64_t deadline_ns)
     s->gfx_work_pos = st.pos;
     if (s->gfx_budget_hit)
         return true;
-
     s->gfx_rptr = st.pos;
     rptr_slot = (uint32_t)(s->gfx_rptr % s->gfx_work_ring_dw);
     reg_set(s, REG_GFX_CP_RB0_RPTR, rptr_slot);
@@ -4938,6 +5487,22 @@ static bool rdna4_gfx_process(RDNA4State *s, uint64_t deadline_ns)
 
 static void rdna4_gfx_wptr(RDNA4State *s, uint64_t wptr, bool doorbell)
 {
+    if (s->gfx_reinit && wptr == 0) {
+        s->gfx_wptr = 0;
+        s->gfx_rptr = 0;
+        s->gfx_csb_loaded = false;
+        s->gfx_reinit = false;
+        s->gfx_pending = false;
+        s->gfx_active = false;
+        s->gfx_pending_wptr = 0;
+        s->gfx_work_base = 0;
+        s->gfx_work_pos = 0;
+        s->gfx_work_end = 0;
+        s->gfx_work_ring_dw = 0;
+        reg_set(s, REG_GFX_CP_RB0_RPTR, 0);
+        reg_set(s, REG_GC_CP_STAT, 0);
+        fprintf(stderr, "rdna4: gfx: CP_RB0 re-initialized at WPTR=0\n");
+    }
     if (wptr < s->gfx_wptr) {
         fprintf(stderr, "rdna4: gfx: wptr went back from 0x%" PRIx64 " to 0x%" PRIx64
                 ": ignored, the engine waits\n", s->gfx_wptr, wptr);
@@ -5578,6 +6143,9 @@ static void rdna4_reset(DeviceState *dev)
     s->gfx_wptr = 0;
     s->gfx_rptr = 0;
     s->gfx_csb_loaded = false;
+    s->gfx_reinit = false;
+    s->gfx_trace_selfcheck_done = false;
+    s->gfx_job_seq = 0;
     s->gfx_pending = false;
     s->gfx_active = false;
     s->gfx_pending_doorbell = false;
