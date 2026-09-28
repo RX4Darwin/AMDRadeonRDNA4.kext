@@ -15,6 +15,7 @@
 #include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <libkern/c++/OSDictionary.h>
@@ -56,6 +57,7 @@ static bool fenceReached(uint32_t current, uint32_t wanted) {
 }
 
 constexpr uint8_t kIhClientGfx              = 0x0a;
+constexpr uint8_t kIhClientCp               = 0x14; // SOC21_IH_CLIENTID_GRBM_CP
 constexpr uint8_t kIhClientUtcl2            = 0x1b;
 constexpr uint8_t kIhClientDcn              = 0x04;
 constexpr uint8_t kIhSrcSdmaTrap            = 49;
@@ -130,9 +132,13 @@ uint32_t ihPipeRead(void *ctx, uint8_t baseIdx, uint32_t dword) {
 } // namespace
 
 RDNA4Compute::~RDNA4Compute() {
-	stopPresentationTimer();
-	ihStop();
-	if (ihLock) {
+        quiesceForShutdown("destructor");
+        if (shutdownInterest) {
+                shutdownInterest->remove();
+                shutdownInterest->release();
+                shutdownInterest = nullptr;
+        }
+        if (ihLock) {
 		IOLockFree(ihLock);
 		ihLock = nullptr;
 	}
@@ -751,8 +757,10 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	Ih::decode(dw, entry);
 	// ring_id = queue [6:4] | me [3:2] | pipe [1:0] (gfx_v12_0_eop_irq): any
 	// MEC1 queue, the kernel's or a runtime client's.
-	if (entry.clientId == kIhClientGfx && entry.srcId == kIhSrcCpEop &&
-	    ((entry.ringId >> 2) & 3) == 1) {
+        // gfx_v12_0.c identifies CP EOP as GRBM_CP (client 0x14), not the
+        // GC/UTCL2 client 0x0a.  Its ring_id is queue[6:4]|ME[3:2]|pipe[1:0].
+        if (entry.clientId == kIhClientCp && entry.srcId == kIhSrcCpEop &&
+            Ih::isMec1Ring(entry.ringId)) {
 		ihEopCount++;
 		if (ihInterruptLogAllowed())
 			HLOG("CP EOP interrupt: count %u ring %u", ihEopCount, entry.ringId);

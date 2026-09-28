@@ -76,6 +76,7 @@ class IOWorkLoop;
 class OSObject;
 class IOMemoryMap;
 class OSDictionary;
+class IONotifier;
 
 // The plugin owns the boot-arg value; runtime/display paths use the level to
 // keep high-rate diagnostics off the real card's normal trace setting.
@@ -197,9 +198,18 @@ private:
 	void choosePool();
 
 	// Stages 2+ (bring-up thread).
-	static void threadMain(void *arg, wait_result_t);
-	static void resumeMain(void *arg, wait_result_t);
-	void runStages();
+        static void threadMain(void *arg, wait_result_t);
+        static void resumeMain(void *arg, wait_result_t);
+        static IOReturn systemPowerMessage(void *target, void *refCon, UInt32 messageType,
+                                            IOService *provider, void *messageArgument,
+                                            vm_size_t argSize);
+        void registerShutdownInterest();
+        void defensiveStart();
+        void quiesceForShutdown(const char *why);
+        void runStages();
+	bool beginBringup();
+	void endBringup();
+	bool bringupStepAllowed(const char *step);
 	void resetRuntimeForResume();
 
 	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
@@ -469,6 +479,7 @@ public:
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
 	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
 	IOReturn rtSleepTest(const void *owner, uint32_t phase);
+	IOReturn rtQuiesce(const void *owner);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtAllocHost(const void *owner, task_t task, uint64_t bytes, uint64_t flags,
 	                     uint64_t &handle, uint64_t &gpu, uint64_t &user);
@@ -545,7 +556,10 @@ private:
 		bool active { false };
 		bool aborted { false };
 	};
-	IOLock        *rtLock { nullptr };
+        IOLock        *rtLock { nullptr };
+        IONotifier   *shutdownInterest { nullptr };
+        bool           shutdownQuiesced { false };
+	bool           bringupRunning { false };
 	bool           rtReady { false };       // a dispatching stage finished
 	bool           rtWedged { false };      // a dispatch timed out
 	bool           powerSleeping { false };

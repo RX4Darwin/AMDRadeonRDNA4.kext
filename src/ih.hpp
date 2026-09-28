@@ -17,6 +17,13 @@ namespace Ih {
 constexpr uint32_t kEntryDwords = 8;
 constexpr uint32_t kEntryBytes = kEntryDwords * 4;
 
+// gfx_v12_0_eop_irq packs ring_id as queue [6:4], ME [3:2], pipe [1:0].
+// EOP is a CP source from MEC1 on every pipe and queue; ring 4 is only the
+// first queue used by the original self-test.
+constexpr bool isMec1Ring(uint8_t ringId) {
+	return ((ringId & 0x0cu) >> 2) == 1;
+}
+
 struct Entry {
 	uint8_t  clientId;
 	uint8_t  srcId;
