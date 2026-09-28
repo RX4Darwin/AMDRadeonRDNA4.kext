@@ -48,7 +48,6 @@
 #include <sys/mman.h>
 #include "qemu/module.h"
 #include "qemu/units.h"
-#include "../../src/smu_metrics.h"
 #include "qemu/timer.h"
 #include "qemu/main-loop.h"
 #include "qemu/host-utils.h"
@@ -62,6 +61,14 @@
 #include "ui/console.h"
 #include "ui/qemu-pixman.h"
 #include "qom/object.h"
+
+/* SmuMetrics_t offsets from smu14_driver_if_v14_0.h; QEMU compiles this
+ * source outside the repo, so keep the model's table ABI constants here. */
+#define RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS 48u
+#define RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS 56u
+#define RDNA4_SMU_METRICS_AVG_SOCKET_POWER  136u
+#define RDNA4_SMU_METRICS_AVG_TEMPERATURE   140u
+#define RDNA4_SMU_METRICS_AVG_FAN_RPM       170u
 
 #define TYPE_RDNA4 "rdna4"
 OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
