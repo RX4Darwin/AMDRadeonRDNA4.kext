@@ -752,9 +752,9 @@ static void rdna4_config_write(PCIDevice *dev, uint32_t address, uint32_t data,
         s->bus_master_before_reset = rdna4_bus_master_enabled(s);
 }
 
-/* All device writes into guest/system memory use this gate. IH and writeback
+/* All device accesses to guest/system memory use this gate. IH and writeback
  * DMA must stop when PCI Command.BusMaster is cleared; a register-only reset
- * must never let an old queue scribble into a new kernel's allocations. */
+ * must never let an old queue scribble into or fetch from new allocations. */
 static MemTxResult rdna4_dma_write(RDNA4State *s, dma_addr_t address,
                                    const void *buf, dma_addr_t len)
 {
@@ -773,6 +773,17 @@ static MemTxResult rdna4_dma_write(RDNA4State *s, dma_addr_t address,
         }
     }
     return result;
+}
+
+static MemTxResult rdna4_dma_read(RDNA4State *s, dma_addr_t address,
+                                  void *buf, dma_addr_t len)
+{
+    if (!rdna4_bus_master_enabled(s)) {
+        if (s->trace)
+            fprintf(stderr, "rdna4: DMA read refused while PCI bus master is off\n");
+        return MEMTX_ERROR;
+    }
+    return pci_dma_read(PCI_DEVICE(s), address, buf, len);
 }
 
 static bool rdna4_engine_active(RDNA4State *s)
@@ -2076,13 +2087,12 @@ static bool rdna4_vm_access(RDNA4State *s, uint64_t va, uint8_t *data, uint64_t 
                 else
                     memcpy(data, dummy, chunk);
             } else if (target.system) {
-                PCIDevice *pci = PCI_DEVICE(s);
-                if (!(pci_get_word(pci->config + PCI_COMMAND) & PCI_COMMAND_MASTER)) {
+                if (!rdna4_bus_master_enabled(s)) {
                     rdna4_vm_fault(s, vmid, va);
                     return false;
                 }
                 MemTxResult result = write ? rdna4_dma_write(s, target.address, data, chunk)
-                                           : pci_dma_read(pci, target.address, data, chunk);
+                                           : rdna4_dma_read(s, target.address, data, chunk);
                 if (result != MEMTX_OK) {
                     rdna4_vm_fault(s, vmid, va);
                     return false;
@@ -2205,10 +2215,10 @@ static bool rdna4_sdma_copy(RDNA4State *s, uint64_t src, uint64_t dst, uint32_t 
     if (sp) {
         ok = rdna4_dma_write(s, da, sp, bytes) == MEMTX_OK;          /* VRAM -> system */
     } else if (dp) {
-        ok = pci_dma_read(pci, sa, dp, bytes) == MEMTX_OK;           /* system -> VRAM */
+        ok = rdna4_dma_read(s, sa, dp, bytes) == MEMTX_OK;            /* system -> VRAM */
     } else {
         g_autofree uint8_t *tmp = g_malloc(bytes);
-        ok = pci_dma_read(pci, sa, tmp, bytes) == MEMTX_OK &&
+        ok = rdna4_dma_read(s, sa, tmp, bytes) == MEMTX_OK &&
              rdna4_dma_write(s, da, tmp, bytes) == MEMTX_OK;
     }
     if (!ok) {
@@ -6160,6 +6170,10 @@ static void rdna4_reset(DeviceState *dev)
     RDNA4State *s = RDNA4(dev);
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    /* A warm platform reset clears PCI Command.BusMaster.  The GOP is the
+     * component that re-enables Bus Master before handing the card back; the
+     * warm-keep model restores it here only to expose the interval in which
+     * preserved engines could still DMA before GOP has done so. */
     if (s->warm_keep && rdna4_engine_active(s)) {
         fprintf(stderr, "rdna4: warm-keep: reset PCI bus master current=%d remembered=%d\n",
                 rdna4_bus_master_enabled(s), s->bus_master_before_reset);

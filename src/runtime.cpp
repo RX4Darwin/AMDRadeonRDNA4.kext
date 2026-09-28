@@ -40,6 +40,7 @@ using namespace GfxReg;
 namespace {
 
 constexpr Reg kQuiesceIhRbCntl { 0, 0x0080 };
+constexpr uint32_t kQuiesceBad = 0xffffffffu;
 constexpr uint32_t kQuiesceIhEnable = 1u << 0;
 constexpr uint32_t kQuiesceIhWptrWriteback = 1u << 8;
 constexpr uint32_t kQuiesceIhIntr = 1u << 17;
@@ -140,77 +141,135 @@ void RDNA4Compute::registerShutdownInterest() {
 void RDNA4Compute::defensiveStart() {
         if (!env.pci || !env.disc)
                 return;
-        bool found = false;
+        // Survey every producer before writing any engine register.  A cold
+        // card reports reset values (including zero), which is not evidence
+        // that an engine is running; only positive activity justifies the
+        // defensive shutdown below.
         const uint32_t ih = rd(IpDiscovery::HwOsssys, kQuiesceIhRbCntl);
-        if (ih & (kQuiesceIhEnable | kQuiesceIhIntr | kQuiesceIhWptrWriteback)) {
-                CLOG("quiesce: defensive start disabling inherited IH RB_CNTL 0x%08x", ih);
-                wr(IpDiscovery::HwOsssys, kQuiesceIhRbCntl,
-                   ih & ~(kQuiesceIhEnable | kQuiesceIhIntr | kQuiesceIhWptrWriteback));
-                found = true;
-        }
+        uint32_t sdmaRb[GfxReg::kSdmaInstances] {};
+        uint32_t sdmaMcu[GfxReg::kSdmaInstances] {};
         for (uint32_t instance = 0; instance < GfxReg::kSdmaInstances; instance++) {
-                const uint32_t rb = rd(IpDiscovery::HwGc, sdma(instance, SdmaQ0RbCntl));
-                const uint32_t mcu = rd(IpDiscovery::HwGc, sdma(instance, SdmaMcuCntl));
-                if ((rb & kSdmaRbEnable) || !(mcu & kSdmaMcuHalt)) {
-                        CLOG("quiesce: defensive start disabling inherited SDMA%u RB 0x%08x MCU 0x%08x",
-                             instance, rb, mcu);
-                        wr(IpDiscovery::HwGc, sdma(instance, SdmaQ0RbCntl),
-                           rb & ~(kSdmaRbEnable | kSdmaRbRptrWriteback));
-                        wr(IpDiscovery::HwGc, sdma(instance, SdmaQ0Doorbell), 0);
-                        wr(IpDiscovery::HwGc, sdma(instance, SdmaMcuCntl), mcu | kSdmaMcuHalt);
-                        found = true;
-                }
+                sdmaRb[instance] = rd(IpDiscovery::HwGc, sdma(instance, SdmaQ0RbCntl));
+                sdmaMcu[instance] = rd(IpDiscovery::HwGc, sdma(instance, SdmaMcuCntl));
         }
+        bool hqdActive[4][8] {};
+        uint32_t hqdVmid[4][8] {};
         for (uint32_t pipe = 0; pipe < 4; pipe++) {
                 for (uint32_t queue = 0; queue < 8; queue++) {
-                        for (uint32_t vmid = 0; vmid < 16; vmid++) {
-                                grbmSelect(1, pipe, queue, vmid);
-                                if (!(rdGc(CpHqdActive) & 1))
-                                        continue;
-                                CLOG("quiesce: defensive start draining HQD ME1 pipe%u queue%u VMID%u",
-                                     pipe, queue, vmid);
-                                wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
-                                for (uint32_t us = 0; us < 100000 && (rdGc(CpHqdActive) & 1); us += 10)
-                                        IODelay(10);
-                                if (rdGc(CpHqdActive) & 1)
-                                        CLOG("quiesce: defensive HQD pipe%u queue%u VMID%u did not drain",
-                                             pipe, queue, vmid);
-                                wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
-                                found = true;
-                        }
+                        grbmSelect(1, pipe, queue, 0);
+                        const uint32_t active = rdGc(CpHqdActive);
+                        hqdActive[pipe][queue] = active != kQuiesceBad && (active & 1);
+                        hqdVmid[pipe][queue] = rdGc(CpHqdVmid) & 0xf;
                 }
         }
         grbmSelect(0, 0, 0, 0);
+        const uint32_t gfxActive = rdGc(CpRbActive);
+        const uint32_t gfxCntl = rdGc(CpRb0Cntl);
+        const bool inheritedGfx = (gfxActive != kQuiesceBad && (gfxActive & 1)) ||
+                                  (gfxCntl != kQuiesceBad && gfxCntl != 0);
         const uint32_t me = rdGc(CpMeCntl);
         const uint32_t mec = rdGc(CpMecRs64Cntl);
-        if (!(me & kCpMePfpHalt) || !(me & kCpMeMeHalt) || !(mec & kRs64Halt)) {
-                CLOG("quiesce: defensive start halting inherited GFX/MEC CP_ME 0x%08x MEC 0x%08x",
-                     me, mec);
-                wr(IpDiscovery::HwGc, CpMeCntl, me | kCpMePfpHalt | kCpMeMeHalt);
-                wr(IpDiscovery::HwGc, CpMecRs64Cntl, mec | kRs64Halt);
-                found = true;
+        bool inheritedHqd = false;
+        for (uint32_t pipe = 0; pipe < 4; pipe++)
+                for (uint32_t queue = 0; queue < 8; queue++)
+                        inheritedHqd |= hqdActive[pipe][queue];
+
+        bool found = ih != kQuiesceBad &&
+                     (ih & (kQuiesceIhEnable | kQuiesceIhIntr | kQuiesceIhWptrWriteback));
+        for (uint32_t instance = 0; instance < GfxReg::kSdmaInstances; instance++)
+                found |= sdmaRb[instance] != kQuiesceBad && (sdmaRb[instance] & kSdmaRbEnable);
+        found |= inheritedHqd || inheritedGfx;
+
+        if (ih != kQuiesceBad && (ih & (kQuiesceIhEnable | kQuiesceIhIntr | kQuiesceIhWptrWriteback))) {
+                CLOG("quiesce: defensive start disabling inherited IH RB_CNTL 0x%08x", ih);
+                wr(IpDiscovery::HwOsssys, kQuiesceIhRbCntl,
+                   ih & ~(kQuiesceIhEnable | kQuiesceIhIntr | kQuiesceIhWptrWriteback));
+        }
+        for (uint32_t instance = 0; instance < GfxReg::kSdmaInstances; instance++) {
+                const uint32_t rb = sdmaRb[instance];
+                if (rb == kQuiesceBad || !(rb & kSdmaRbEnable))
+                        continue;
+                const uint32_t mcu = sdmaMcu[instance];
+                CLOG("quiesce: defensive start disabling inherited SDMA%u RB 0x%08x MCU 0x%08x",
+                     instance, rb, mcu);
+                wr(IpDiscovery::HwGc, sdma(instance, SdmaQ0RbCntl),
+                   rb & ~(kSdmaRbEnable | kSdmaRbRptrWriteback));
+                wr(IpDiscovery::HwGc, sdma(instance, SdmaQ0Doorbell), 0);
+                if (mcu != kQuiesceBad)
+                        wr(IpDiscovery::HwGc, sdma(instance, SdmaMcuCntl), mcu | kSdmaMcuHalt);
+        }
+        for (uint32_t pipe = 0; pipe < 4; pipe++) {
+                for (uint32_t queue = 0; queue < 8; queue++) {
+                        if (!hqdActive[pipe][queue])
+                                continue;
+                        const uint32_t vmid = hqdVmid[pipe][queue];
+                        grbmSelect(1, pipe, queue, vmid);
+                        CLOG("quiesce: defensive start draining HQD ME1 pipe%u queue%u VMID%u",
+                             pipe, queue, vmid);
+                        wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
+                        for (uint32_t us = 0; us < 100000 && (rdGc(CpHqdActive) & 1); us += 10)
+                                IODelay(10);
+                        if (rdGc(CpHqdActive) & 1)
+                                CLOG("quiesce: defensive HQD pipe%u queue%u VMID%u did not drain",
+                                     pipe, queue, vmid);
+                        wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+                }
+        }
+        grbmSelect(0, 0, 0, 0);
+        if (inheritedGfx || inheritedHqd) {
+                CLOG("quiesce: defensive start halting inherited GFX/MEC CP_RB_ACTIVE 0x%08x "
+                     "CP_RB0_CNTL 0x%08x", gfxActive, gfxCntl);
+                if (me != kQuiesceBad)
+                        wr(IpDiscovery::HwGc, CpMeCntl, me | kCpMePfpHalt | kCpMeMeHalt);
+                if (inheritedHqd && mec != kQuiesceBad)
+                        wr(IpDiscovery::HwGc, CpMecRs64Cntl, mec | kRs64Halt);
         }
         if (found && (env.pci->configRead16(kIOPCIConfigCommand) & kIOPCICommandBusMaster)) {
                 CLOG("quiesce: defensive start clearing inherited PCI bus master last");
                 env.pci->setBusMasterEnable(false);
         }
+        if (!found)
+                CLOG("quiesce: defensive start found no inherited activity; PCI bus master untouched");
         grbmSelect(0, 0, 0, 0);
 }
 
 void RDNA4Compute::quiesceForShutdown(const char *why) {
-        if (shutdownQuiesced)
+        bool alreadyQuiesced = false;
+        if (rtLock) {
+                IOLockLock(rtLock);
+                alreadyQuiesced = shutdownQuiesced;
+                if (!alreadyQuiesced) {
+                        shutdownQuiesced = true;
+                        rtReady = false;
+                }
+                IOLockUnlock(rtLock);
+        } else {
+                alreadyQuiesced = shutdownQuiesced;
+                shutdownQuiesced = true;
+        }
+        if (alreadyQuiesced)
                 return;
-        shutdownQuiesced = true;
         CLOG("quiesce: begin %s", why ? why : "shutdown");
+
+        // Do not tear down MMIO while a bring-up stage is using it. The
+        // bring-up thread checks the flag between every stage and wakes this
+        // waiter when it has stopped. A stuck stage is bounded so shutdown
+        // still reaches the final Bus Master gate.
+        if (rtLock) {
+                uint64_t span = 0;
+                nanoseconds_to_absolutetime(2000000000ull, &span);
+                const uint64_t deadline = mach_absolute_time() + span;
+                IOLockLock(rtLock);
+                while (bringupRunning && mach_absolute_time() < deadline)
+                        IOLockSleepDeadline(rtLock, &bringupRunning, deadline, THREAD_UNINT);
+                if (bringupRunning)
+                        CLOG("quiesce: bring-up did not stop within 2 s; continuing bounded shutdown");
+                IOLockUnlock(rtLock);
+        }
         if (!env.pci || !env.disc) {
                 stopPresentationTimer();
                 CLOG("quiesce: no GPU environment; complete");
                 return;
-        }
-        if (rtLock) {
-                IOLockLock(rtLock);
-                rtReady = false;
-                IOLockUnlock(rtLock);
         }
 
         // amdgpu fini order: interrupt producers, every HQD/MEC, GFX, SDMA,
@@ -226,6 +285,19 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         wr(IpDiscovery::HwGc, CpMe1Pipe1IntCntl,
            rd(IpDiscovery::HwGc, CpMe1Pipe1IntCntl) & ~kCpTimeStampIntEnable);
 
+        // Restore the desktop while the display engine still has a valid
+        // source surface. Pending client presents are completed as aborted by
+        // restorePresentationLocked; simply dropping them would leave the
+        // user's last frame latched across restart.
+        if (rtLock) {
+                IOLockLock(rtLock);
+                if (presentActive)
+                        CLOG("quiesce: present active; restoring desktop before reset");
+                (void)restorePresentationLocked("shutdown");
+                IOLockUnlock(rtLock);
+        }
+        stopPresentationTimer();
+
         auto drain = [this](uint32_t pipe, uint32_t queue, uint32_t vmid) {
                 grbmSelect(1, pipe, queue, vmid);
                 if (!(rdGc(CpHqdActive) & 1))
@@ -239,6 +311,9 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
                              pipe, queue, vmid);
                 wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
         };
+        if (rtLock) {
+                IOLockLock(rtLock);
+        }
         drain(0, 0, 0);
         for (const RtClient &client : clients)
                 if (client.active)
@@ -259,16 +334,8 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         }
         wr(IpDiscovery::HwGc, sdma(0, SdmaCntl),
            rd(IpDiscovery::HwGc, sdma(0, SdmaCntl)) & ~1u);
-
-        stopPresentationTimer();
-        if (rtLock) {
-                IOLockLock(rtLock);
-                if (presentActive)
-                        CLOG("quiesce: present active; completing it as aborted before reset");
-                dropPendingPresentsLocked(kIOReturnAborted);
-                clearPresentationLocked();
+        if (rtLock)
                 IOLockUnlock(rtLock);
-        }
 
         // dmaTeardown clears the AGP aperture before releasing its memory and
         // clears PCI Command.BusMaster only here, after all producers stopped.
@@ -1125,6 +1192,9 @@ IOReturn RDNA4Compute::rtQuiesce(const void *owner) {
 	/* The user client is administrator-only.  This selector deliberately calls
 	 * the same path as the root-domain shutdown/restart notification so that a
 	 * monitor reset can compare a stopped card with an inherited live card. */
+	uint32_t enabled = 0;
+	if (!PE_parse_boot_argn("rdna4-quiesce-test", &enabled, sizeof(enabled)) || !enabled)
+		return kIOReturnUnsupported;
 	{
 		Locked g(rtLock);
 		if (!clientFor(owner))

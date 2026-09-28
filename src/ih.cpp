@@ -760,7 +760,7 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
         // gfx_v12_0.c identifies CP EOP as GRBM_CP (client 0x14), not the
         // GC/UTCL2 client 0x0a.  Its ring_id is queue[6:4]|ME[3:2]|pipe[1:0].
         if (entry.clientId == kIhClientCp && entry.srcId == kIhSrcCpEop &&
-            Ih::isMec1Pipe0Queue0(entry.ringId)) {
+            Ih::isMec1Ring(entry.ringId)) {
 		ihEopCount++;
 		if (ihInterruptLogAllowed())
 			HLOG("CP EOP interrupt: count %u ring %u", ihEopCount, entry.ringId);

@@ -423,15 +423,20 @@ uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 		rtLock = IOLockAlloc();
         if (!resultLock)
                 resultLock = IOLockAlloc();
-        shutdownQuiesced = false;
+        if (rtLock) {
+                IOLockLock(rtLock);
+                shutdownQuiesced = false;
+                bringupRunning = false;
+                IOLockUnlock(rtLock);
+        }
         registerShutdownInterest();
-        // A warm restart can leave the GOP's engine state live. Disarm old
-        // producers before allocating or publishing any new DMA buffers.
-        defensiveStart();
         publishResult("runtime", "SKIPPED bring-up in progress");
 
 	if (!survey())
 		return StageOff;
+	// A warm restart can leave the GOP's engine state live. Survey first so a
+	// cold card's reset values never cause writes into engines still in reset.
+	defensiveStart();
 	choosePool();
 	logSurvey();
 	publishSurvey();
@@ -517,8 +522,17 @@ void RDNA4Compute::threadMain(void *arg, wait_result_t) {
 void RDNA4Compute::resumeMain(void *arg, wait_result_t) {
 	auto *self = static_cast<RDNA4Compute *>(arg);
 	CLOG("power: wake received; re-bring-up scheduled on the bring-up thread");
+	if (!self->beginBringup()) {
+		CLOG("power: wake bring-up cancelled by shutdown");
+		thread_terminate(current_thread());
+		return;
+	}
+	const bool stopped = !self->bringupStepAllowed("resume reset");
+	if (!stopped)
 	self->resetRuntimeForResume();
-	self->runStages();
+	if (!stopped)
+		self->runStages();
+	self->endBringup();
 	if (self->rtLock) {
 		IOLockLock(self->rtLock);
 		self->resumePending = false;
@@ -550,7 +564,59 @@ void RDNA4Compute::powerDidWake() {
 	}
 }
 
+bool RDNA4Compute::beginBringup() {
+	if (!rtLock)
+		return false;
+	IOLockLock(rtLock);
+	const bool allowed = !shutdownQuiesced;
+	if (allowed)
+		bringupRunning = true;
+	IOLockUnlock(rtLock);
+	return allowed;
+}
+
+void RDNA4Compute::endBringup() {
+	if (!rtLock)
+		return;
+	IOLockLock(rtLock);
+	bringupRunning = false;
+	IOLockWakeup(rtLock, &bringupRunning, false);
+	IOLockUnlock(rtLock);
+}
+
+bool RDNA4Compute::bringupStepAllowed(const char *step) {
+	if (!rtLock)
+		return false;
+	IOLockLock(rtLock);
+	const bool allowed = !shutdownQuiesced;
+	IOLockUnlock(rtLock);
+	if (!allowed)
+		CLOG("bring-up stopped before %s: shutdown is quiesced", step ? step : "next step");
+	return allowed;
+}
+
 void RDNA4Compute::runStages() {
+	bool ownsBringup = false;
+	if (rtLock) {
+		IOLockLock(rtLock);
+		if (shutdownQuiesced) {
+			IOLockUnlock(rtLock);
+			CLOG("bring-up stopped before stages: shutdown is quiesced");
+			return;
+		}
+		if (!bringupRunning) {
+			bringupRunning = true;
+			ownsBringup = true;
+		}
+		IOLockUnlock(rtLock);
+	}
+	struct BringupGuard {
+		RDNA4Compute *self;
+		bool owns;
+		~BringupGuard() { if (owns) self->endBringup(); }
+	} guard { this, ownsBringup };
+	if (!bringupStepAllowed("stage start"))
+		return;
 	// Read before this boot writes its own. Not at attach: that is before
 	// the EFI NVRAM driver has published the stored variables.
 	char prev[96];
@@ -589,44 +655,54 @@ void RDNA4Compute::runStages() {
 		env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
 	};
 	if (target >= StagePsp) {
+		if (!bringupStepAllowed("stage 2 (psp)")) return;
 		if (!stagePsp())
 			return stop("stage 2 (psp)");
 		done = StagePsp;
 	}
 	if (target >= StageGfx) {
+		if (!bringupStepAllowed("stage 3 (gfx)")) return;
 		if (!stageGfx())
 			return stop("stage 3 (gfx)");
 		done = StageGfx;
 	}
 	if (target >= StageSdma) {
+		if (!bringupStepAllowed("stage 4 (sdma)")) return;
 		if (!stageSdma())
 			return stop("stage 4 (sdma)");
 		done = StageSdma;
 	}
 	if (target >= StageCompute) {
+		if (!bringupStepAllowed("stage 5 (compute)")) return;
 		if (!stageCompute())
 			return stop("stage 5 (compute)");
 		done = StageCompute;
 	}
 	if (target >= StageDispatch) {
+		if (!bringupStepAllowed("stage 6 (dispatch)")) return;
 		if (!stageDispatch())
 			return stop("stage 6 (dispatch)");
 		done = StageDispatch;
 	}
 	if (target >= StageKernel) {
+		if (!bringupStepAllowed("stage 7 (kernel)")) return;
 		if (!stageKernel())
 			return stop("stage 7 (kernel)");
 		done = StageKernel;
 	}
-	if (vmEnabled && done >= StageKernel &&
-	    (!featureAllowed("vm") || !vmBootSelfTest())) {
+	if (vmEnabled && done >= StageKernel) {
+		if (!bringupStepAllowed("VM self-test"))
+			return;
+		if (!featureAllowed("vm") || !vmBootSelfTest()) {
 		vmEnabled = false;
 		CLOG("vm: boot self-test failed; per-client GPU VM disabled");
+		}
 	}
 	// W3: the gfx ring, when asked for. A failure only turns it off again.
 	bool gfxOk = false;
 	const uint32_t gfxAsked = done >= StageKernel ? requestedGfx() : 0;
 	if (gfxAsked && featureAllowed("gfx")) {
+		if (!bringupStepAllowed("gfx ring")) return;
 		gfxMode = gfxAsked;
 		gfxOk = stageGfxRing();
 	}
@@ -635,11 +711,17 @@ void RDNA4Compute::runStages() {
 	// The runtime and what it starts leave their own "<feature>: ..." steps
 	// in the trail, so the trail's normal ending comes after them.
 	if (done >= StageDispatch)
+		if (!bringupStepAllowed("runtime publish")) return;
+	if (done >= StageDispatch)
 		publishRuntime(done);
 	// W5: the page-flip test, once the runtime's DMA and device heap exist.
 	if (done >= StageKernel && featureAllowed("flip"))
+		if (!bringupStepAllowed("flip")) return;
+	if (done >= StageKernel && featureAllowed("flip"))
 		Flip::run(*this);
 	// G3: the first draw, once the runtime's device heap holds its rings.
+	if (!bringupStepAllowed("gfx draw"))
+		return;
 	const bool drew = gfxOk && stageGfxDraw();
 	snprintf(note, sizeof(note), "finished at stage %u%s%s%s", done,
 	         !gfxAsked ? "" : drew ? ", gfx draw right" : gfxOk ? ", gfx ring up" : ", gfx ring off",

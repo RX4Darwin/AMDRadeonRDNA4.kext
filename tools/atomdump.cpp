@@ -1672,9 +1672,10 @@ static int testIhRing() {
                           !Ih::missEligible(true, true, true, true) &&
                           Ih::missEligible(true, true, false, true),
                           "ih: miss qualification requires sleep, completion, and a 5 ms recheck");
-        failures += check(Ih::isMec1Pipe0Queue0(4) && !Ih::isMec1Pipe0Queue0(0) &&
-                          !Ih::isMec1Pipe0Queue0(5) && !Ih::isMec1Pipe0Queue0(20),
-                          "ih: EOP ring 4 is exactly ME1 pipe0 queue0");
+		failures += check(Ih::isMec1Ring(4) && Ih::isMec1Ring(5) &&
+		                  Ih::isMec1Ring(0x74) && !Ih::isMec1Ring(0) &&
+		                  !Ih::isMec1Ring(0x10),
+		                  "ih: EOP accepts every MEC1 pipe/queue ring");
 	printf("\nih: v7 decode, ring wrap/overflow arithmetic, and wait-miss qualification %s\n",
 	       failures ? "FAILED" : "ok");
 	return failures;

@@ -202,6 +202,9 @@ private:
         void defensiveStart();
         void quiesceForShutdown(const char *why);
         void runStages();
+	bool beginBringup();
+	void endBringup();
+	bool bringupStepAllowed(const char *step);
 	void resetRuntimeForResume();
 
 	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
@@ -539,6 +542,7 @@ private:
         IOLock        *rtLock { nullptr };
         IONotifier   *shutdownInterest { nullptr };
         bool           shutdownQuiesced { false };
+	bool           bringupRunning { false };
 	bool           rtReady { false };       // a dispatching stage finished
 	bool           rtWedged { false };      // a dispatch timed out
 	bool           powerSleeping { false };
