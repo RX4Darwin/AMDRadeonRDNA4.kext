@@ -226,15 +226,25 @@ void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 
 bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
 	if (!c.tableShadow || offset > kVmTableBytes || bytes > kVmTableBytes - offset ||
-	    !poolCpu || !devHeap.size() || offset & 0xfff || bytes & 0xfff)
+	    !poolCpu || !devHeap.size() || offset & 0xfff || bytes & 0xfff) {
+		RLOG("vmid %u: page-table sync arguments rejected (offset 0x%x bytes 0x%x)",
+		     c.vmid, offset, bytes);
 		return false;
+	}
 	memcpy(poolCpu + kVmTableStage, reinterpret_cast<uint8_t *>(c.tableShadow) + offset, bytes);
 	(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + kVmTableStage);
 	flushHdp();
 	uint32_t pkt[Sdma::kCopyDwords];
-	if (!Sdma::copyLinear(pkt, poolMc(kVmTableStage), c.rootMc + offset, bytes))
+	if (!Sdma::copyLinear(pkt, poolMc(kVmTableStage), c.rootMc + offset, bytes)) {
+		RLOG("vmid %u: page-table COPY_LINEAR encoding failed", c.vmid);
 		return false;
-	return sdmaRun(pkt, Sdma::kCopyDwords, 2000);
+	}
+	if (!sdmaRun(pkt, Sdma::kCopyDwords, 2000)) {
+		RLOG("vmid %u: page-table SDMA sync failed (offset 0x%x bytes 0x%x)",
+		     c.vmid, offset, bytes);
+		return false;
+	}
+	return true;
 }
 
 bool RDNA4Compute::vmContextInit(RtClient &c) {
@@ -308,12 +318,15 @@ bool RDNA4Compute::vmBootSelfTest() {
 	    !vmMap(c, dataVa, poolMc(qoff + kVmWptr), 0x1000, false) ||
 	    !vmMap(c, fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
 	    !c.pm4.init(poolDw(qoff + kVmPq), qva, kPqSize)) {
+		RLOG("vm: boot page-table or queue setup failed");
 		IOFree(c.tableShadow, kVmTableBytes);
 		devHeap.free(table);
 		return false;
 	}
 	trail("vm: VM context enable");
 	bool context = vmContextInit(c);
+	if (!context)
+		RLOG("vm: boot VM context setup failed (VMID %u)", vmid);
 	bool hqd = false, inactive = true, fence = false;
 	if (context) {
 		trail("vm: HQD activate");
@@ -347,12 +360,16 @@ bool RDNA4Compute::vmBootSelfTest() {
 			IODelay(10);
 		}
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+		if (!inactive)
+			RLOG("vm: boot HQD dequeue timed out (ACTIVE 0x%08x)", rdGc(CpHqdActive));
 		grbmSelect(0, 0, 0, 0);
 	}
 	bool flushed = true;
 	if (context) {
 		trail("vm: invalidate");
 		flushed = vmInvalidate(vmid, "boot self-test");
+		if (!flushed)
+			RLOG("vm: boot invalidation failed (VMID %u)", vmid);
 		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + vmid - 1 }, 0);
 	}
 	IOFree(c.tableShadow, kVmTableBytes);
