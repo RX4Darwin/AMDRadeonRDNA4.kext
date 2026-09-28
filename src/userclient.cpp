@@ -60,6 +60,7 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sLoad,       2,          kIOUCVariableStructureSize, 8,           0 },
 	{ sUnload,     1,          0,                          0,           0 },
 	{ sDispatch,   0,          sizeof(RDNA4Dispatch),      1,           0 },
+	{ sAllocHost,  2,          0,                          3,           0 },
 };
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -116,4 +117,10 @@ IOReturn RDNA4ComputeClient::sDispatch(OSObject *t, void *, IOExternalMethodArgu
 		return kIOReturnBadArgument;
 	return self(t)->compute->rtDispatch(t, *static_cast<const RDNA4Dispatch *>(a->structureInput),
 	                                    a->scalarOutput[0]);
+}
+
+IOReturn RDNA4ComputeClient::sAllocHost(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtAllocHost(t, self(t)->task, a->scalarInput[0],
+	                                     a->scalarInput[1], a->scalarOutput[0],
+	                                     a->scalarOutput[1], a->scalarOutput[2]);
 }

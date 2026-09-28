@@ -60,6 +60,7 @@
 
 class IOBufferMemoryDescriptor;
 class IODMACommand;
+class IOMemoryMap;
 
 class RDNA4Compute {
 public:
@@ -281,6 +282,8 @@ public:
 	IOReturn rtOpen(const void *owner);
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
+	IOReturn rtAllocHost(const void *owner, task_t task, uint64_t bytes, uint64_t flags,
+	                     uint64_t &handle, uint64_t &gpu, uint64_t &user);
 	IOReturn rtFree(const void *owner, uint64_t handle);
 	IOReturn rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
 	                mach_vm_address_t user, uint64_t length, bool toGpu);
@@ -309,12 +312,20 @@ private:
 	static constexpr uint32_t kVmWptr = 0x4000;
 	static constexpr uint32_t kVmFence = 0x5000;
 	static constexpr uint32_t kVmKernarg = 0x6000;
+	static constexpr uint64_t kHostMaxBuffer = 256ull << 20;
+	static constexpr uint64_t kHostMaxClient = 1ull << 30;
+	static constexpr uint64_t kHostMaxTotal = 4ull << 30;
 	struct RtBuffer  {
-		const void *owner;
-		uint64_t    offset, bytes;             // heap offset (pool or VRAM), size
-		uint64_t    mc, va;                    // physical MC and client GPU VA
-		uint16_t    gen;
-		bool        device;                    // from the device heap
+		const void *owner { nullptr };
+		uint64_t    offset { 0 }, bytes { 0 }; // heap offset (pool or VRAM), size
+		uint64_t    mc { 0 }, va { 0 };        // physical MC and client GPU VA
+		uint16_t    gen { 0 };
+		bool        device { false };          // from the device heap
+		bool        host { false };
+		IOBufferMemoryDescriptor *hostMemory { nullptr };
+		IODMACommand *hostDma { nullptr };
+		IOMemoryMap *hostMap { nullptr };
+		uint64_t    hostUser { 0 };
 	};
 	struct RtProgram { const void *owner; uint64_t offset, va; CodeObj::Kernel k; uint16_t gen; };
 	struct RtClient {
@@ -322,6 +333,7 @@ private:
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
 		uint64_t tableOffset { 0 }, rootMc { 0 }, rootPhys { 0 }, nextVa { GpuVm::kVaStart };
 		uint64_t kernargVa { 0 }, fenceVa { 0 };
+		uint64_t hostBytes { 0 };
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
 		uint32_t fence { 0 }, doorbell { 0 };
@@ -340,6 +352,7 @@ private:
 	GpuHeap::Heap  heap;
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
 	RtBuffer       buffers[kMaxBuffers] {};
+	uint64_t       hostBytesTotal { 0 };
 	RtProgram      programs[kMaxPrograms] {};
 	IOService     *rtService { nullptr };
 	uint64_t       dmubVram { 0 };            // DMUB memory (VRAM offset), from choosePool
@@ -351,10 +364,13 @@ private:
 	RtClient  *clientFor(const void *owner);
 	bool vmTableSync(RtClient &client, uint32_t offset, uint32_t bytes);
 	bool vmMap(RtClient &client, uint64_t va, uint64_t mc, uint64_t bytes, bool executable);
+	bool vmMapHost(RtClient &client, uint64_t va, const uint64_t *pageBuses,
+	               uint64_t bytes, bool executable);
 	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
 	bool vmContextInit(RtClient &client);
 	bool vmInvalidate(uint32_t vmid, const char *tag);
 	void logClientFault(RtClient &client, const char *tag);
+	void releaseHost(RtBuffer &buffer);
 
 	// DMA between host memory and VRAM (runtime.cpp). One pinned, physically
 	// contiguous bounce buffer; the GC hub's AGP aperture maps system memory

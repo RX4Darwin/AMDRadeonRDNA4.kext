@@ -53,6 +53,7 @@ private:
 	static IOReturn sLoad(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sUnload(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sDispatch(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sAllocHost(OSObject *t, void *, IOExternalMethodArguments *a);
 };
 
 #endif /* RDNA4UserClient_hpp */

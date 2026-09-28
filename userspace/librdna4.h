@@ -58,6 +58,9 @@ void          rdna4_close(rdna4_t *dev);
 kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out);
 
 kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out);
+/* Allocate snooped system memory, mapped into the client's GPUVM and task. */
+kern_return_t rdna4_alloc_host(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out,
+                                void **cpu);
 kern_return_t rdna4_free(rdna4_t *dev, const rdna4_buffer_t *buf);
 kern_return_t rdna4_write(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
                           const void *src, uint64_t bytes);

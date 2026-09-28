@@ -194,6 +194,50 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	return true;
 }
 
+bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses,
+                             uint64_t bytes, bool executable) {
+	if (!poolCpu || !c.tableShadow || !pageBuses || !bytes ||
+	    (va & (GpuVm::kPageBytes - 1)))
+		return false;
+	const uint64_t mapped = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	const uint64_t end = va + mapped;
+	if (mapped < bytes || end < va || end > GpuVm::kVaEnd)
+		return false;
+	auto entry = [&c](uint64_t off) -> uint64_t * {
+		return c.tableShadow + off / sizeof(uint64_t);
+	};
+	uint64_t firstPt = ~0ull, lastPt = 0;
+	uint64_t page = 0;
+	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes, page++) {
+		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
+			return false;
+		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
+		const uint64_t ptOff = 0x3000 + relative * 0x1000;
+		if (at < GpuVm::kVaStart || ptOff + 0x1000 > kVmTableBytes)
+			return false;
+		const uint32_t pdeIndex = GpuVm::index(at, 2);
+		const uint64_t pdeOff = 0x2000 + static_cast<uint64_t>(pdeIndex) * 8;
+		if (!*entry(pdeOff))
+			*entry(pdeOff) = GpuVm::encodePde(c.rootPhys + ptOff, GpuVm::kValid, 0);
+		const uint64_t pteOff = ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8;
+		if (firstPt == ~0ull)
+			firstPt = ptOff;
+		lastPt = ptOff;
+		uint64_t flags = GpuVm::kSystem | GpuVm::kSnooped | GpuVm::kValid |
+		                 GpuVm::kReadable | GpuVm::kWritable;
+		if (executable)
+			flags |= GpuVm::kExecutable;
+		/* Cached GTT on gfx12.0 uses MTYPE_NC, encoded as zero. */
+		*entry(pteOff) = GpuVm::encodePte(pageBuses[page], flags, false);
+	}
+	if (firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
+		return false;
+	for (uint64_t pt = firstPt; pt <= lastPt; pt += 0x1000)
+		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
+			return false;
+	return true;
+}
+
 bool RDNA4Compute::initRuntimeHeap() {
 	if (!rtLock || !poolCpu || pool.size <= kHeapOffset)
 		return false;
@@ -282,6 +326,26 @@ bool RDNA4Compute::vmInvalidate(uint32_t vmid, const char *tag) {
 	RLOG("vmid %u: VM invalidate timeout (%s), REQ 0x%08x ACK 0x%08x", vmid, tag,
 	     rdGc(req), rdGc(ack));
 	return false;
+}
+
+void RDNA4Compute::releaseHost(RtBuffer &b) {
+	if (!b.host)
+		return;
+	if (b.hostMap) {
+		b.hostMap->release();
+		b.hostMap = nullptr;
+	}
+	if (b.hostDma) {
+		(void)b.hostDma->clearMemoryDescriptor();
+		b.hostDma->release();
+		b.hostDma = nullptr;
+	}
+	if (b.hostMemory) {
+		b.hostMemory->release();
+		b.hostMemory = nullptr;
+	}
+	b.hostUser = 0;
+	b.host = false;
 }
 
 /* Boot-time proof of one translated MEC queue.  User clients never enter this
@@ -523,7 +587,14 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	if (!h.alloc(bytes, off))
 		return kIOReturnNoMemory;
 	RtBuffer &b = buffers[slot];
-	b = { owner, off, bytes, dev ? vramMc(off) : poolMc(off), 0, nextGen(b.gen), dev };
+	const uint16_t generation = nextGen(b.gen);
+	b = RtBuffer {};
+	b.owner = owner;
+	b.offset = off;
+	b.bytes = bytes;
+	b.mc = dev ? vramMc(off) : poolMc(off);
+	b.gen = generation;
+	b.device = dev;
 	if (c) {
 		b.va = (c->nextVa + 0xffff) & ~0xffffull;
 		c->nextVa = b.va + ((bytes + 0xffff) & ~0xffffull);
@@ -537,14 +608,151 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	return kIOReturnSuccess;
 }
 
+IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t bytes,
+                                   uint64_t flags, uint64_t &handle, uint64_t &gpu,
+                                   uint64_t &user) {
+	Locked g(rtLock);
+	if (!rtReady)
+		return kIOReturnNotReady;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;
+	RtClient *c = clientFor(owner);
+	if (!c || !dmaReady || !busMasterSet)
+		return kIOReturnUnsupported;
+	if (!bytes || bytes > kHostMaxBuffer || (flags & ~static_cast<uint64_t>(RDNA4_HOST_EXECUTABLE)))
+		return bytes > kHostMaxBuffer ? kIOReturnNoResources : kIOReturnBadArgument;
+	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) &
+	                         ~(GpuVm::kPageBytes - 1);
+	if (rounded < bytes || rounded > kHostMaxBuffer ||
+	    rounded > kHostMaxClient - c->hostBytes ||
+	    rounded > kHostMaxTotal - hostBytesTotal)
+		return kIOReturnNoResources;
+	uint32_t slot = 0;
+	while (slot < kMaxBuffers && buffers[slot].owner)
+		slot++;
+	if (slot == kMaxBuffers)
+		return kIOReturnNoResources;
+
+	IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithOptions(
+		kernel_task, kIODirectionInOut, rounded, GpuVm::kPageBytes);
+	if (!memory)
+		return kIOReturnNoMemory;
+	IOMemoryMap *map = memory->createMappingInTask(task, 0, kIOMapAnywhere);
+	if (!map) {
+		memory->release();
+		return kIOReturnNoMemory;
+	}
+	const uint64_t pageCount = rounded / GpuVm::kPageBytes;
+	IODMACommand *dma = IODMACommand::withSpecification(
+		kIODMACommandOutputHost64, 48, 0, IODMACommand::kMapped, 0, GpuVm::kPageBytes);
+	if (!dma) {
+		map->release();
+		memory->release();
+		return kIOReturnNoMemory;
+	}
+	const uint64_t segBytes = pageCount * sizeof(IODMACommand::Segment64);
+	IODMACommand::Segment64 *segments =
+		static_cast<IODMACommand::Segment64 *>(IOMalloc(segBytes));
+	uint64_t *pageBuses = static_cast<uint64_t *>(IOMalloc(pageCount * sizeof(uint64_t)));
+	UInt64 dmaOffset = 0;
+	UInt32 segmentCount = static_cast<UInt32>(pageCount);
+	bool mapped = segments && pageBuses &&
+	             dma->setMemoryDescriptor(memory) == kIOReturnSuccess &&
+	             dma->gen64IOVMSegments(&dmaOffset, segments, &segmentCount) == kIOReturnSuccess;
+	uint64_t page = 0;
+	if (mapped) {
+		for (UInt32 i = 0; i < segmentCount && mapped; i++) {
+			const uint64_t address = segments[i].fIOVMAddr;
+			const uint64_t length = segments[i].fLength;
+			if ((address & (GpuVm::kPageBytes - 1)) ||
+			    (length & (GpuVm::kPageBytes - 1)) || !length) {
+				mapped = false;
+				break;
+			}
+			for (uint64_t at = 0; at < length; at += GpuVm::kPageBytes)
+				pageBuses[page++] = address + at;
+		}
+		mapped = mapped && page == pageCount;
+	}
+	if (segments)
+		IOFree(segments, segBytes);
+	if (!mapped) {
+		(void)dma->clearMemoryDescriptor();
+		dma->release();
+		if (pageBuses)
+			IOFree(pageBuses, pageCount * sizeof(uint64_t));
+		map->release();
+		memory->release();
+		return kIOReturnNoResources;
+	}
+
+	RtBuffer &b = buffers[slot];
+	const uint16_t generation = nextGen(b.gen);
+	b = RtBuffer {};
+	b.owner = owner;
+	b.bytes = bytes;
+	b.va = (c->nextVa + 0xffff) & ~0xffffull;
+	b.gen = generation;
+	b.host = true;
+	b.hostMemory = memory;
+	b.hostDma = dma;
+	b.hostMap = map;
+	b.hostUser = map->getAddress();
+	if (!b.hostUser ||
+	    b.va + rounded < b.va || b.va + rounded > GpuVm::kVaEnd ||
+	    !vmMapHost(*c, b.va, pageBuses, rounded,
+                (flags & RDNA4_HOST_EXECUTABLE) != 0)) {
+		if (pageBuses)
+			IOFree(pageBuses, pageCount * sizeof(uint64_t));
+		vmUnmap(*c, b.va, rounded);
+		releaseHost(b);
+		b.owner = nullptr;
+		return kIOReturnNoMemory;
+	}
+	if (pageBuses)
+		IOFree(pageBuses, pageCount * sizeof(uint64_t));
+	if (!vmInvalidate(c->vmid, "host map")) {
+		vmUnmap(*c, b.va, rounded);
+		releaseHost(b);
+		b.owner = nullptr;
+		return kIOReturnNotResponding;
+	}
+	c->nextVa = b.va + ((rounded + 0xffff) & ~0xffffull);
+	c->hostBytes += rounded;
+	hostBytesTotal += rounded;
+	handle = makeHandle(slot, b.gen);
+	gpu = b.va;
+	user = b.hostUser;
+	RLOG("vmid %u: host buffer %llu bytes mapped at GPU VA 0x%llx, user 0x%llx, %llu pages",
+	     c->vmid, bytes, b.va, b.hostUser, pageCount);
+	return kIOReturnSuccess;
+}
+
 IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	Locked g(rtLock);
 	RtBuffer *b = bufferFor(owner, handle);
 	if (!b)
 		return kIOReturnBadArgument;
-	if (RtClient *c = clientFor(owner))
+	RtClient *c = clientFor(owner);
+	const bool host = b->host;
+	if (c && b->va)
 		vmUnmap(*c, b->va, b->bytes);
-	(b->device ? devHeap : heap).free(b->offset);
+	if (host && c && !vmInvalidate(c->vmid, "host unmap"))
+		RLOG("vmid %u: host buffer unmap invalidation timed out", c->vmid);
+	if (host) {
+		if (c) {
+			const uint64_t rounded = (b->bytes + GpuVm::kPageBytes - 1) &
+			                         ~(GpuVm::kPageBytes - 1);
+			if (c->hostBytes >= rounded)
+				c->hostBytes -= rounded;
+			if (hostBytesTotal >= rounded)
+				hostBytesTotal -= rounded;
+		}
+		RLOG("vmid %u: host buffer handle 0x%llx unmapped", c ? c->vmid : 0, handle);
+		releaseHost(*b);
+	} else {
+		(b->device ? devHeap : heap).free(b->offset);
+	}
 	b->owner = nullptr;
 	return kIOReturnSuccess;
 }
@@ -557,6 +765,8 @@ IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offse
 	RtBuffer *b = bufferFor(owner, handle);
 	if (!b || offset > b->bytes || length > b->bytes - offset)
 		return kIOReturnBadArgument;
+	if (b->host)
+		return kIOReturnUnsupported;
 	if (!length)
 		return kIOReturnSuccess;
 	if (dmaReady)
@@ -738,12 +948,17 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	Locked g(rtLock);
 	RtClient *c = clientFor(owner);
 	uint32_t nb = 0, np = 0;
+	bool hostUnmapped = false;
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner) {
 			if (c)
 				vmUnmap(*c, b.va, b.bytes);
-			(b.device ? devHeap : heap).free(b.offset);
-			b.owner = nullptr;
+			if (b.host) {
+				hostUnmapped = true;
+			} else {
+				(b.device ? devHeap : heap).free(b.offset);
+				b.owner = nullptr;
+			}
 			nb++;
 		}
 	}
@@ -754,6 +969,21 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			heap.free(p.offset);
 			p.owner = nullptr;
 			np++;
+		}
+	}
+	if (c && hostUnmapped && !vmInvalidate(c->vmid, "host unmap"))
+		RLOG("vmid %u: host buffer cleanup invalidation timed out", c->vmid);
+	for (RtBuffer &b : buffers) {
+		if (b.owner == owner && b.host) {
+			const uint64_t rounded = (b.bytes + GpuVm::kPageBytes - 1) &
+			                         ~(GpuVm::kPageBytes - 1);
+			if (c && c->hostBytes >= rounded)
+				c->hostBytes -= rounded;
+			if (hostBytesTotal >= rounded)
+				hostBytesTotal -= rounded;
+			RLOG("vmid %u: host buffer unmapped during client close", c ? c->vmid : 0);
+			releaseHost(b);
+			b.owner = nullptr;
 		}
 	}
 	if (nb || np)

@@ -61,8 +61,13 @@ enum {
 	kRDNA4MethodUnload,
 	/* struct in: RDNA4Dispatch -> microseconds from doorbell to fence */
 	kRDNA4MethodDispatch,
+	/* bytes, flags -> handle, GPU VA, user CPU address */
+	kRDNA4MethodAllocHost,
 	kRDNA4MethodCount
 };
+
+/* AllocHost flags.  Host memory is non-executable unless this bit is set. */
+#define RDNA4_HOST_EXECUTABLE (1u << 0)
 
 #define RDNA4_FLAG_READY   (1u << 0)   /* bring-up reached a dispatching stage */
 #define RDNA4_FLAG_WEDGED  (1u << 1)   /* a dispatch timed out: no more work */
