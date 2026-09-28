@@ -3875,6 +3875,8 @@ static bool rdna4_gfx_ps_wave(RDNA4State *s, const RDNA4GfxTriangle *tri,
 
     w.pc = pgm;
     w.exec = count == 32 ? UINT32_MAX : ((1u << count) - 1u);
+    if (s->gfx_trace)
+        fprintf(stderr, "rdna4: gfx: PS wave pgm=0x%" PRIx64 " count=%u\\n", pgm, count);
     for (unsigned lane = 0; lane < count; lane++) {
         float area = (float)rdna4_gfx_edge(
             (int64_t)nearbyintf(tri->x[0] * 256.0f), (int64_t)nearbyintf(tri->y[0] * 256.0f),
@@ -3896,6 +3898,10 @@ static bool rdna4_gfx_ps_wave(RDNA4State *s, const RDNA4GfxTriangle *tri,
     }
     if (!rdna4_gfx_wave_run(s, &w, false, false))
         return false;
+    if (s->gfx_trace)
+        fprintf(stderr, "rdna4: gfx: PS export mask=0x%x valid=0x%08x\\n", w.mrt_enable,
+                (uint32_t)w.mrt_valid[0] | ((uint32_t)w.mrt_valid[1] << 1) |
+                ((uint32_t)w.mrt_valid[2] << 2));
     if (w.mrt_enable != (col_format == 4 ? 3u : 15u)) {
         fprintf(stderr, "rdna4: gfx: PS export mask 0x%x does not match COL0 format %u\n",
                 w.mrt_enable, col_format);
