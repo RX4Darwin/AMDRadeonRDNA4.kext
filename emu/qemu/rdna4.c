@@ -4227,11 +4227,12 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
             break;
         }
         case 0x49: {                                         /* RELEASE_MEM */
-            uint32_t ctl, sel, int_sel, lo, hi, value;
+            uint32_t event_ctl, ctl, sel, int_sel, lo, hi, value;
             uint64_t addr;
             uint8_t *p;
 
-            if (count != 6 || !rdna4_gfx_stream_dw(s, st, at + 2, &ctl) ||
+            if (count != 6 || !rdna4_gfx_stream_dw(s, st, at + 1, &event_ctl) ||
+                !rdna4_gfx_stream_dw(s, st, at + 2, &ctl) ||
                 !rdna4_gfx_stream_dw(s, st, at + 3, &lo) ||
                 !rdna4_gfx_stream_dw(s, st, at + 4, &hi) ||
                 !rdna4_gfx_stream_dw(s, st, at + 5, &value)) {
@@ -4240,7 +4241,7 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
             }
             sel = (ctl >> 29) & 3;
             int_sel = (ctl >> 24) & 3;
-            if (sel == 0 && (ctl & (1u << 31))) {             /* PWS wait-for-idle */
+            if (sel == 0 && (event_ctl & (1u << 31))) {       /* PWS wait-for-idle */
                 break;
             }
             if (sel != 1 && sel != 2) {
