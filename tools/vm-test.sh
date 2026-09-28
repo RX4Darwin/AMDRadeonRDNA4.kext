@@ -48,6 +48,9 @@ SSH_KEY=$HOME/.ssh/tahoe_vm
 SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=20 -i $SSH_KEY -p 10022 miguer@127.0.0.1"
 
 pkill -9 -f qemu-system-x86_64 || true
+# ...and any other QEMU on the macOS disk, whatever its binary is called: a
+# VM started outside this script would hold the image and block every run.
+pkill -9 -f 'mac_hdd_ng[.]img' || true
 pkill -f 'http.server 6080' || true
 sleep 1
 
