@@ -100,9 +100,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define OTG_V_SYNC_A_CNTL    0x1b3a
 #define OTG_CONTROL          0x1b43     /* MASTER_EN [0], CURRENT_MASTER_EN_STATE [16] */
 #define OTG_STATUS           0x1b49     /* V_BLANK [0] */
-#define OTG_STATUS_POSITION  0x1b4a     /* LINE [31:16], HCOUNT [15:0] */
-#define OTG_STATUS_FRAME_COUNT 0x1b4c   /* [23:0], DCN spelling */
-#define OTG_FRAME_COUNT      0x1b4d     /* [23:0] */
+#define OTG_STATUS_POSITION  0x1b4a     /* regOTG0_OTG_STATUS_POSITION, BASE_IDX 2 */
+#define OTG_FRAME_COUNT      0x1b4d     /* regOTG0_OTG_STATUS_FRAME_COUNT, BASE_IDX 2 */
 #define OTG_MASTER_UPDATE_LOCK 0x1b89   /* LOCK [0], UPDATE_LOCK_STATUS [8] */
 #define OTG_CLOCK_CONTROL    0x1b84     /* EN [0], GATE_DIS [1], CLOCK_ON [8], BUSY [16] */
 #define OPTC_INPUT_CLOCK     0x1ad0     /* GATE_DIS [0], EN [1], CLK_ON [2] */
@@ -115,12 +114,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define HUBP_STRIDE          0xdc
 #define HUBP_VIEWPORT_DIM    0x05eb
 #define HUBP_SURFACE_PITCH   0x0607     /* [15:0] = pixels - 1 */
-#define HUBP_SURFACE_ADDR    0x060a
-#define HUBP_SURFACE_ADDR_HI 0x060b
-#define HUBP_FLIP_CONTROL    0x061b     /* SURFACE_FLIP_PENDING [8] */
+#define HUBP_SURFACE_ADDR    0x060a     /* regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS, BASE_IDX 2 */
+#define HUBP_SURFACE_ADDR_HI 0x060b     /* regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH, BASE_IDX 2 */
+#define HUBP_FLIP_CONTROL    0x0613     /* regHUBPREQ0_DCSURF_FLIP_CONTROL, BASE_IDX 2 */
 #define HUBP_FLIP_PENDING    (1u << 8)
 #define HUBP_DB_FIRST        0x05e5     /* DCSURF_SURFACE_CONFIG .. */
-#define HUBP_DB_LAST         0x061b     /* .. DCSURF_FLIP_CONTROL */
+#define HUBP_DB_LAST         0x0613     /* .. regHUBPREQ0_DCSURF_FLIP_CONTROL */
 #define DCN_VM_FB_LOC_BASE   0x0475     /* [23:0] = MC address >> 24 */
 /* DIG front-/back-ends (seg2) */
 #define DIG_STRIDE           0x124
@@ -140,7 +139,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define NUM_PHY              8
 /* MPC (seg3) */
 #define MPCC_STRIDE          0x15
-#define MPCC_OPP_ID          0x0002     /* [3:0], 0xf = none */
+#define MPCC_TOP_SEL         0x0000     /* regMPCC0_MPCC_TOP_SEL, BASE_IDX 3 */
+#define MPCC_OPP_ID          0x0002     /* regMPCC0_MPCC_OPP_ID, BASE_IDX 3; [3:0], 0xf = none */
 
 /* DC_I2C (seg2) */
 #define I2C_CONTROL          0x1e98
@@ -498,7 +498,6 @@ static uint32_t rdna4_otg_read(RDNA4State *s, int otg, uint32_t dw)
             return (line << 16) | (horizontal & 0xffff);
         }
         return val;
-    case OTG_STATUS_FRAME_COUNT:
     case OTG_FRAME_COUNT:
         if (running) {
             return (val & ~0xffffffu) | (frame & 0xffffff);
@@ -528,11 +527,37 @@ static bool rdna4_update_locked(RDNA4State *s, int otg)
 }
 
 /* ---- page flip (W5): an address requested under lock latches at vblank. */
-static int rdna4_flip_otg_for_address(uint32_t addr)
+static int rdna4_flip_hubp_for_address(uint32_t addr)
+{
+    for (int hubp = 0; hubp < NUM_OTG; hubp++) {
+        if (addr == SEG2(HUBP_SURFACE_ADDR + hubp * HUBP_STRIDE) ||
+            addr == SEG2(HUBP_SURFACE_ADDR_HI + hubp * HUBP_STRIDE)) {
+            return hubp;
+        }
+    }
+    return -1;
+}
+
+static int rdna4_hubp_for_otg(RDNA4State *s, int otg)
+{
+    uint32_t opp = (reg_get(s, SEG2(OPTC_DATA_SOURCE + otg * ODM_STRIDE)) >> 16) & 0xf;
+
+    if (opp >= NUM_OTG) {
+        return -1;
+    }
+    for (int mpcc = 0; mpcc < NUM_OTG; mpcc++) {
+        if ((reg_get(s, SEG3(MPCC_OPP_ID + mpcc * MPCC_STRIDE)) & 0xf) == opp) {
+            uint32_t top = reg_get(s, SEG3(MPCC_TOP_SEL + mpcc * MPCC_STRIDE)) & 0xf;
+            return top < NUM_OTG ? (int)top : -1;
+        }
+    }
+    return -1;
+}
+
+static int rdna4_otg_for_hubp(RDNA4State *s, int hubp)
 {
     for (int otg = 0; otg < NUM_OTG; otg++) {
-        if (addr == SEG2(HUBP_SURFACE_ADDR + otg * HUBP_STRIDE) ||
-            addr == SEG2(HUBP_SURFACE_ADDR_HI + otg * HUBP_STRIDE)) {
+        if (rdna4_hubp_for_otg(s, otg) == hubp) {
             return otg;
         }
     }
@@ -542,15 +567,16 @@ static int rdna4_flip_otg_for_address(uint32_t addr)
 static void rdna4_latch_flips(RDNA4State *s, int otg, uint64_t frame)
 {
     RDNA4Flip *flip = &s->flip[otg];
+    const int hubp = rdna4_hubp_for_otg(s, otg);
 
-    if (!flip->pending || s->flip_stuck || rdna4_update_locked(s, otg) ||
+    if (hubp < 0 || !flip->pending || s->flip_stuck || rdna4_update_locked(s, otg) ||
         frame == flip->request_frame) {
         return;
     }
     unsigned out = 0;
     bool applied = false;
     for (unsigned i = 0; i < s->npending; i++) {
-        if (rdna4_flip_otg_for_address(s->pending[i].addr) == otg) {
+        if (rdna4_flip_hubp_for_address(s->pending[i].addr) == hubp) {
             reg_set(s, s->pending[i].addr, s->pending[i].val);
             applied = true;
         } else {
@@ -585,7 +611,9 @@ static void rdna4_db_write(RDNA4State *s, int otg, uint32_t addr, uint32_t val)
             reg_set(s, addr, val);
         }
     }
-    if (queued && rdna4_flip_otg_for_address(addr) == otg) {
+    const int hubp = rdna4_flip_hubp_for_address(addr);
+    const int owner = hubp < 0 ? -1 : rdna4_otg_for_hubp(s, hubp);
+    if (queued && owner == otg) {
         uint64_t frame = 0;
         uint32_t line = 0, horizontal = 0;
         if (!rdna4_otg_position(s, otg, &frame, &line, &horizontal)) {
@@ -599,13 +627,13 @@ static void rdna4_db_write(RDNA4State *s, int otg, uint32_t addr, uint32_t val)
 static void rdna4_latch_pending(RDNA4State *s)
 {
     for (unsigned i = 0; i < s->npending; i++) {
-        if (rdna4_flip_otg_for_address(s->pending[i].addr) < 0) {
+        if (rdna4_flip_hubp_for_address(s->pending[i].addr) < 0) {
             reg_set(s, s->pending[i].addr, s->pending[i].val);
         }
     }
     unsigned out = 0;
     for (unsigned i = 0; i < s->npending; i++) {
-        if (rdna4_flip_otg_for_address(s->pending[i].addr) >= 0) {
+        if (rdna4_flip_hubp_for_address(s->pending[i].addr) >= 0) {
             s->pending[out++] = s->pending[i];
         }
     }
@@ -617,12 +645,13 @@ static uint32_t rdna4_hubp_read(RDNA4State *s, int hubp, uint32_t dw)
     uint32_t val = reg_get(s, SEG2(dw + hubp * HUBP_STRIDE));
 
     if (dw == HUBP_FLIP_CONTROL) {
+        const int otg = rdna4_otg_for_hubp(s, hubp);
         uint64_t frame = 0;
         uint32_t line = 0, horizontal = 0;
-        if (rdna4_otg_position(s, hubp, &frame, &line, &horizontal)) {
-            rdna4_latch_flips(s, hubp, frame);
+        if (otg >= 0 && rdna4_otg_position(s, otg, &frame, &line, &horizontal)) {
+            rdna4_latch_flips(s, otg, frame);
         }
-        if (s->flip[hubp].pending) {
+        if (otg >= 0 && s->flip[otg].pending) {
             val |= HUBP_FLIP_PENDING;
         } else {
             val &= ~HUBP_FLIP_PENDING;
@@ -1459,7 +1488,9 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
             rdna4_dmub_wptr(s, val);
         } else if (d2 >= HUBP_DB_FIRST && d2 < HUBP_DB_FIRST + NUM_OTG * HUBP_STRIDE &&
                    (d2 - HUBP_DB_FIRST) % HUBP_STRIDE <= HUBP_DB_LAST - HUBP_DB_FIRST) {
-            rdna4_db_write(s, (d2 - HUBP_DB_FIRST) / HUBP_STRIDE, addr, val);
+            uint32_t hubp = (d2 - HUBP_DB_FIRST) / HUBP_STRIDE;
+            int otg = rdna4_otg_for_hubp(s, hubp);
+            rdna4_db_write(s, otg >= 0 ? otg : hubp, addr, val);
         } else if (d2 >= OTG_H_TOTAL && d2 < OTG_H_TOTAL + NUM_OTG * OTG_STRIDE) {
             uint32_t otg = (d2 - OTG_H_TOTAL) / OTG_STRIDE;
             rdna4_otg_write(s, otg, d2 - otg * OTG_STRIDE, val);
@@ -2452,7 +2483,10 @@ static void rdna4_get_scanout(RDNA4State *s, RDNA4Scanout *so)
         }
         for (int m = 0; m < NUM_OTG && hubp < 0; m++) {
             if ((reg_get(s, SEG3(MPCC_OPP_ID + m * MPCC_STRIDE)) & 0xf) == opp) {
-                hubp = m;
+                uint32_t top = reg_get(s, SEG3(MPCC_TOP_SEL + m * MPCC_STRIDE)) & 0xf;
+                if (top < NUM_OTG) {
+                    hubp = (int)top;
+                }
             }
         }
         if (hubp < 0) {
