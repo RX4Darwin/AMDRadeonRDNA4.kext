@@ -373,6 +373,11 @@ bool RDNA4Compute::ihInit() {
 		ihDcnActive = true;
 		Ndrv::setVblankEnabled(ihVblRequested);
 		ihDcnVblankFrames = 0;
+		ihDcnFrameCounter = 0;
+		ihDcnFrameEvents = 0;
+		ihDcnStormFrames = 0;
+		ihDcnShortIntervals = 0;
+		ihDcnFrameCounterValid = false;
 		HLOG("DCN sources enabled: OTG_GLOBAL_SYNC_STATUS 0x%08x -> 0x%08x, "
 		     "HUBP%u FLIP_INTERRUPT 0x%08x -> 0x%08x (vblank src %u, pflip src %u)",
 		     otgBefore, rd(IpDiscovery::HwDmu, otgStatus), ihDcnHubp, flipBefore,
@@ -466,9 +471,48 @@ void RDNA4Compute::ihDcnObserveVblank(uint64_t now) {
 	ihVblankCount[ihDcnOtg]++;
 	if (ihDcnVblankFrames < 100) {
 		ihDcnVblankFrames++;
-		if (interval && ihDcnExpectedFrameNs && interval * 2 < ihDcnExpectedFrameNs) {
-			HLOG("DCN IRQ storm: vblank interval %llu ns, expected %llu ns", interval,
-			     ihDcnExpectedFrameNs);
+		// The IH action timestamp is the drain time, not the vblank time. A
+		// delayed work loop can therefore make two ordinary entries look like
+		// a storm. Count entries against OTG_FRAME_COUNT instead: this is the
+		// DCN 4.1.0 OTG_FRAME_COUNT register (base 2, 0x1b4d), also used by
+		// Flip::waitNextVblank. Require two consecutive overloaded frames.
+		const Reg frameReg { 2, Pipe::Reg::kOtgFrameCount + ihDcnOtg * Pipe::Reg::kOtgStride };
+		const uint32_t frameImage = rd(IpDiscovery::HwDmu, frameReg);
+		const bool frameValid = frameImage != 0xffffffffu;
+		bool storm = false;
+		uint32_t frameDelta = 0;
+		uint32_t events = ihDcnFrameEvents;
+		if (frameValid) {
+			const uint32_t frame = frameImage & 0xffffffu;
+			if (!ihDcnFrameCounterValid) {
+				ihDcnFrameCounter = frame;
+				ihDcnFrameEvents = 1;
+				ihDcnFrameCounterValid = true;
+			} else {
+				frameDelta = (frame - ihDcnFrameCounter) & 0xffffffu;
+				if (frameDelta) {
+					events = ihDcnFrameEvents;
+					storm = frameDelta <= 100 && events > frameDelta * 2;
+					ihDcnStormFrames = storm ? ihDcnStormFrames + 1 : 0;
+					ihDcnFrameCounter = frame;
+					ihDcnFrameEvents = 1;
+				} else if (ihDcnFrameEvents != 0xffffffffu) {
+					ihDcnFrameEvents++;
+				}
+			}
+		} else {
+			// If the frame counter cannot be read, keep a conservative bounded
+			// fallback. A single short interval is never enough to disable DCN.
+			const bool shortInterval = interval && ihDcnExpectedFrameNs &&
+			                           interval * 2 < ihDcnExpectedFrameNs;
+			ihDcnShortIntervals = shortInterval ? ihDcnShortIntervals + 1 : 0;
+			storm = ihDcnShortIntervals >= 8;
+		}
+		if ((frameValid && ihDcnStormFrames >= 2) || (!frameValid && storm)) {
+			HLOG("DCN IRQ storm: %u vblanks in frame window, frame delta %u, "
+			     "OTG_FRAME_COUNT %s0x%06x, drain interval %llu ns (expected %llu ns)",
+			     events, frameDelta, frameValid ? "" : "unreadable/", frameValid ?
+			     (frameImage & 0xffffffu) : 0u, interval, ihDcnExpectedFrameNs);
 			publishResult("vblank", "FAIL DCN IRQ storm");
 			ihDcnStop("interrupt rate exceeded 2x OTG timing");
 			return;

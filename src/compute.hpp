@@ -412,6 +412,13 @@ private:
 	uint64_t ihDcnExpectedFrameNs { 0 };
 	uint32_t ihDcnVblankFrames { 0 };
 	uint32_t ihDcnStorms { 0 };
+	// OTG_FRAME_COUNT (DCN 4.1.0, base 2, 0x1b4d) distinguishes many
+	// interrupts in one raster frame from entries drained late by ihAction.
+	uint32_t ihDcnFrameCounter { 0 };
+	uint32_t ihDcnFrameEvents { 0 };
+	uint32_t ihDcnStormFrames { 0 };
+	uint32_t ihDcnShortIntervals { 0 };
+	bool ihDcnFrameCounterValid { false };
 	uint64_t ihVblankCount[Pipe::kMaxOtg] {};
 	uint64_t ihVblankTime[Pipe::kMaxOtg] {};
 	uint64_t ihPflipCount[Pipe::kMaxOtg] {};
