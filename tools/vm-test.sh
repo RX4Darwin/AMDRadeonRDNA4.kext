@@ -38,7 +38,8 @@ tools/build-osxcross.sh 2>&1 | grep -E 'error:|warning: [^o]|Built' || true
 # The QEMU build tree is shared and links whichever checkout's rdna4.c ran
 # last; make sure this checkout's is what gets compiled, whatever the mtimes.
 touch emu/qemu/rdna4.c
-tools/emu-build.sh qemu 2>&1 | grep -E 'error|warning|built' | head -20# The option ROM (GOP driver + VBIOS image, build-emu/, not in git) is the
+tools/emu-build.sh qemu 2>&1 | grep -E 'error|warning|built' | head -20
+# The option ROM (GOP driver + VBIOS image, build-emu/, not in git) is the
 # same for every checkout: a worktree without one takes the main checkout's.
 if [ ! -f build-emu/rdna4.rom ]; then
 	MAIN=$(dirname "$REPO")/RDNA4FB     # worktrees sit next to the main checkout
