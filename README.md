@@ -396,7 +396,14 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       deasserted, RAM out of light sleep, DDC clock enabled — before
       arbitration is requested)
 - [x] Display sleep verified on hardware with the standalone build
-- [ ] Plugin build verified on hardware (RX 9070 XT, Tahoe)
+- [x] Plugin build verified on hardware (RX 9070 XT, Tahoe 26.6 recovery, 2026-09-27)
+- [x] **Compute written from scratch, running on the real card** (2026-09-28,
+      `docs/hw-logs/2026-09-28-recovery-stage7-runtime-pass.txt`): PSP secure OS
+      and SMU firmware, GC firmware + RLC autoload, GC hub, SDMA (doorbell) fill,
+      a MEC compute queue running PM4, a hand-written and a clang-built gfx1201
+      kernel dispatched and checked — with the display untouched
+- [x] User-space compute runtime on the real card: `rdna4-run selftest`
+      PASS (65536-item vadd in 103 us)
 - [ ] Native mode setting (DCN 4.1.0) / multiple displays
 - [ ] Hardware cursor through the NDRV cursor path
 - [ ] Acceleration / Metal
