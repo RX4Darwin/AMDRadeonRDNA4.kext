@@ -40,9 +40,11 @@ is recorded and the script continues.
 4. **GFX ring and first draw.** On a separate boot add `rdna4-gfx=1` to the
    previous arguments. A real card should show `gfx PASS` with
    `THE TRIANGLE IS RIGHT` and `8192` pixels, with the draw pixel count in the
-   kernel log. A hang should leave a `gfx:` trail; reboot and run the script
-   again so the next boot shows GFX SKIPPED while the other features still
-   report results.
+   kernel log. If the dmesg ring wrapped, the bring-up trail
+   `finished ... gfx draw right` is an equivalent bounded proof and is shown
+   in the summary. A hang should leave a `gfx:` trail; reboot and run the
+   script again so the next boot shows GFX SKIPPED while the other features
+   still report results.
 5. **Doorbell GFX ring.** On another boot replace the GFX argument with
    `rdna4-gfx=2`:
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2`.

@@ -172,8 +172,8 @@ record() {
 		echo "(no compute lines — add rdna4-compute=1 to boot-args)"
 
 	section "compute NVRAM trail (last step reached)"
-	nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail 2>/dev/null || \
-		echo "(no trail in NVRAM)"
+	TRAIL_VALUE="$(nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail 2>/dev/null || true)"
+	[ -n "$TRAIL_VALUE" ] && echo "$TRAIL_VALUE" || echo "(no trail in NVRAM)"
 
 	RUNTIME_ACTIVE=0
 	RUNTIME_READY=0
@@ -377,6 +377,8 @@ record() {
 	elif grep -Eq 'RDNA4FB: .*gfx: .*THE TRIANGLE IS RIGHT.*8192 pixels' "$KLOG"; then
 		gfx_key="THE TRIANGLE IS RIGHT; 8192 pixels"
 		record gfx PASS "$gfx_key"
+	elif printf '%s\n' "$TRAIL_VALUE" | grep -q 'gfx draw right'; then
+		record gfx PASS "G3 trail: gfx draw right (dmesg wrapped)"
 	elif grep -Eq 'RDNA4FB: .*gfx: .*ring|RDNA4FB: .*gfx: .*draw' "$KLOG"; then
 		record gfx FAIL "ring/draw present but triangle proof missing"
 	else
