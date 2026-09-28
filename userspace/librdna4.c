@@ -146,7 +146,7 @@ kern_return_t rdna4_present(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t of
 	uint32_t n = 2;
 	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodPresent, in, 2, out, &n);
 	if (kr == KERN_SUCCESS) {
-		*width = (uint32_t)out[0];
+		*width = (uint32_t)out[0] & 0xffffu;
 		*height = (uint32_t)(out[0] >> 16);
 		*pitch = (uint32_t)out[1];
 	}
