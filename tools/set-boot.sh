@@ -29,7 +29,9 @@ DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"
 [ -f "$CFG" ] || { echo "no $CFG"; exit 1; }
 ARGS="$BASE${EXTRA:+ $EXTRA}"
-cp "$CFG" "$CFG.before-set-boot"
+# Keep the FIRST original: a later run must not overwrite it with an edited
+# config (backup-before-premetal/ on the stick has a second copy).
+[ -f "$CFG.before-set-boot" ] || cp "$CFG" "$CFG.before-set-boot"
 # Replace the <string> that follows <key>boot-args</key>.
 awk -v args="$ARGS" '
 	done == 0 && prev ~ /<key>boot-args<\/key>/ && $0 ~ /<string>/ {
@@ -37,7 +39,7 @@ awk -v args="$ARGS" '
 	}
 	{ print; prev = $0 }
 	END { if (!done) exit 3 }
-' "$CFG.before-set-boot" > "$CFG.new" || { rm -f "$CFG.new"; echo "boot-args entry not found; config unchanged"; exit 1; }
+' "$CFG" > "$CFG.new" || { rm -f "$CFG.new"; echo "boot-args entry not found; config unchanged"; exit 1; }
 mv "$CFG.new" "$CFG"
 echo "boot $1: next boot uses boot-args:"
 echo "  $ARGS"
