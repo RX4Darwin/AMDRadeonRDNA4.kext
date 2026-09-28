@@ -20,7 +20,7 @@ REG_RESULTS=""
 STEP_TIMEOUT=120
 STEP_SEQ=0
 : > "$SUMMARY"
-trap 'rm -f "$SUMMARY" "$KLOG" "$STEP_PREFIX"-*' EXIT
+trap 'rm -f "$SUMMARY" "$KLOG" "$STEP_PREFIX"-* "/tmp/rdna4fb-klogfb.$$"' EXIT
 
 # The kernel copy is preferred because Recovery's nvram command can return an
 # empty boot-args value while the running kernel still has its arguments.
@@ -68,6 +68,28 @@ elif [ "$VM_MODE" -eq 0 ]; then
 fi
 
 section() { echo; echo "=== $1 ==="; }
+
+# The kernel message buffer wraps on a long boot (round 2, boot 6: not one
+# RDNA4FB line survived, so the HW cursor and compute sections came out empty).
+# klines PATTERN prints the matching dmesg lines; when dmesg has none it falls
+# back to the same lines from the unified log (log show, read once per run).
+KFB="/tmp/rdna4fb-klogfb.$$"
+klog_fallback() {
+	if [ ! -e "$KFB" ]; then
+		log show --last boot --style compact --predicate 'eventMessage CONTAINS "RDNA4FB:"' 2>/dev/null |
+			grep 'RDNA4FB:' > "$KFB" || : > "$KFB"
+	fi
+	cat "$KFB"
+}
+klines() {
+	local out
+	out="$(dmesg | grep -E "$1")"
+	if [ -n "$out" ]; then
+		echo "$out"
+	else
+		klog_fallback | grep -E "$1" || true
+	fi
+}
 
 snapshot_logs() {
 	dmesg > "$KLOG" 2>&1
@@ -178,7 +200,7 @@ registry_value() {
 	fi
 
 	section "dmesg: full RDNA4FB log"
-	dmesg | grep 'RDNA4FB:' || echo "(no RDNA4FB dmesg lines — buffer wrapped or kext absent)"
+	dmesg | grep 'RDNA4FB:' || { echo "(no RDNA4FB dmesg lines — buffer wrapped or kext absent; unified log follows)"; klog_fallback; }
 
 	section "dmesg: discovery / variant"
 	dmesg | grep -E 'RDNA4FB: (probe|Navi 48|discovery):' || true
@@ -199,7 +221,17 @@ registry_value() {
 	dmesg | grep -E 'RDNA4FB: compute: pm:' || echo "(rdna4-gfxpm not enabled or no pm: lines)"
 
 	section "dmesg: HW cursor (incl. vm routing + curtest)"
-	dmesg | grep -E 'RDNA4FB: cursor:' || true
+	klines 'RDNA4FB: cursor:'
+	echo '--- registry copy (survives the kernel log wrapping): RDNA4FB,Cursor'
+	# ioreg prints the string with literal \n between lines; show one per line.
+	CUR_PROP="$(ioreg -l -w0 2>/dev/null | grep 'RDNA4FB,Cursor' || true)"
+	if [ -n "$CUR_PROP" ]; then
+		# One ioreg line; the kext joins its cursor lines with " ## ".
+		echo "$CUR_PROP" | sed 's/ ## /\
+/g'
+	else
+		echo "(no RDNA4FB,Cursor property: rdna4-cursor off or the kext never armed it)"
+	fi
 
 	# DMUB: catches both dmub: (ping) and dmub-hist: (GOP command decode).
 	gated() {
@@ -226,7 +258,7 @@ registry_value() {
 	gated "mode-setting survey" 'RDNA4FB: mode:' modedump
 
 	section "compute bring-up (rdna4-compute=<stage>)"
-	dmesg | grep -E 'RDNA4FB: compute:' || \
+	klines 'RDNA4FB: compute:' | grep . || \
 		echo "(no compute lines — add rdna4-compute=1 to boot-args)"
 
 	section "compute NVRAM trail (last step reached)"

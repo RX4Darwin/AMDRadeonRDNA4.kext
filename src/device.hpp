@@ -214,6 +214,20 @@ private:
 	IOMemoryMap *cursorMap { nullptr };
 	uint64_t cursorMcAddr { 0 };
 	uint32_t cursorWidth { 0 }, cursorHeight { 0 };
+	uint32_t cursorCtlBase { 0 };                // HUBP CURSOR_CONTROL without the enable bit
+	bool hwCursorEnabledHw { false };            // the enable bits as last written to the hardware
+	uint32_t cursorVisChanges { 0 };
+	// Evidence that survives the kernel log wrapping: registry property
+	// RDNA4FB,Cursor (cursor.cpp cursorNote).
+	char cursorTrail[2048] { 0 };
+	uint16_t cursorTrailLen { 0 };
+	bool cursorTrailFull { false };
+	void cursorNote(const char *fmt, ...) __printflike(2, 3);
+	void cursorDumpState(const char *why);
+	void cursorProgramPlane(bool enable);
+	void cursorSelfTest();
+	bool cursorHold { false };                   // rdna4-cursor=2: keep the test square, ignore macOS's cursor calls
+	uint32_t cursorHeldCalls { 0 };
 };
 
 #endif /* RDNA4Device_hpp */

@@ -442,6 +442,7 @@ private:
 	uint32_t ihEopCount { 0 };
 	uint32_t ihSdmaTrapCount { 0 };
 	uint64_t ihLastInterruptLog { 0 };
+	uint32_t ihInterruptLogCount { 0 };   // lines allowed so far (see ihInterruptLogAllowed)
 	uint32_t ihFaultCount { 0 };
 	uint32_t ihUnknownCount { 0 };
 	uint8_t ihUnknownSeen[256][32] {};
