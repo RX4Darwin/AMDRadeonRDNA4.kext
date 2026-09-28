@@ -61,8 +61,8 @@ trail if it hangs.
    never proves PASS. A ring or draw hang leaves a `gfx:` trail, and the next
    boot skips that feature once.
 
-5. **Doorbell GFX ring.** Replace mode 1 with:
-   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1`.
+5. **GFX ring without the VM.** Same as boot 4 but without `rdna4-vm=1`, so the triangle is tested independently of the VM failure:
+   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1`.
    Expect the same ring and triangle signs through the doorbell path. A
    failure leaves the `gfx:` trail and mode 1 remains the fallback.
 

@@ -70,7 +70,9 @@ public:
 	// (amdgpu_discovery.c:2016,2020 for v1; v2 has the same u32 slots): the
 	// shader-engine and render-backend-per-SE counts. False if the table is
 	// absent or of a version amdgpu does not handle either.
-	bool gcInfo(uint32_t &numSe, uint32_t &numRbPerSe) const;
+	// `version` (optional) gets the table version as major << 16 | minor.
+	// Like amdgpu_discovery_verify_table it requires table_id GC_TABLE_ID.
+	bool gcInfo(uint32_t &numSe, uint32_t &numRbPerSe, uint32_t *version = nullptr) const;
 
 	// Convenience: absolute MMIO *byte* offset of a register, given its
 	// segment index and dword offset within the segment (the BASE_IDX /

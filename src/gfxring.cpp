@@ -129,14 +129,10 @@ bool RDNA4Compute::gfxRingResume() {
 
 	// gfx_v12_0_cp_gfx_set_doorbell (+ cp_set_doorbell_range's gfx half).
 	uint32_t db = rdGc(CpRbDoorbellControl) & ~(0x0ffffffcu | kCpRbDoorbellEn);
-	if (gfxMode == 2) {
-		db |= ((kGfxDoorbellDword << 2) & 0x0ffffffc) | kCpRbDoorbellEn;
-		wr(IpDiscovery::HwGc, CpRbDoorbellControl, db);
-		wr(IpDiscovery::HwGc, CpRbDoorbellRangeLower, (kGfxDoorbellDword << 2) & kCpRbDoorbellRangeMask);
-		wr(IpDiscovery::HwGc, CpRbDoorbellRangeUpper, kCpRbDoorbellRangeMask);
-	} else {
-		wr(IpDiscovery::HwGc, CpRbDoorbellControl, db);
-	}
+	db |= ((kGfxDoorbellDword << 2) & 0x0ffffffc) | kCpRbDoorbellEn;
+	wr(IpDiscovery::HwGc, CpRbDoorbellControl, db);
+	wr(IpDiscovery::HwGc, CpRbDoorbellRangeLower, (kGfxDoorbellDword << 2) & kCpRbDoorbellRangeMask);
+	wr(IpDiscovery::HwGc, CpRbDoorbellRangeUpper, kCpRbDoorbellRangeMask);
 	grbmSelect(0, 0, 0, 0);
 
 	wr(IpDiscovery::HwGc, CpMaxContext, kGfxMaxHwContexts - 1);
@@ -154,7 +150,7 @@ bool RDNA4Compute::gfxRingResume() {
 	}
 	GLOG("ring 0: %u KiB at MC 0x%llx, CP_RB0_CNTL 0x%08x, %s, CP_ME_CNTL 0x%08x, CP_STAT 0x%08x%s",
 	     kGfxRingSize >> 10, gfxRing.mc(), rdGc(CpRb0Cntl),
-	     gfxMode == 2 ? "doorbell" : "MMIO write pointer", rdGc(CpMeCntl), stat,
+	     "doorbell", rdGc(CpMeCntl), stat,
 	     stat ? " (did not idle: amdgpu reports and goes on)" : "");
 	return true;
 }
@@ -163,13 +159,10 @@ void RDNA4Compute::gfxKick(uint64_t wptrDwords) {
 	*poolDw(kGfxWptrOffset) = static_cast<uint32_t>(wptrDwords);
 	*poolDw(kGfxWptrOffset + 4) = static_cast<uint32_t>(wptrDwords >> 32);
 	flushHdp();
-	if (gfxMode == 2) {
-		doorbells[kGfxDoorbellDword / 2] = wptrDwords;
-	} else {
-		grbmSelect(0, 0, 0, 0);
-		wr(IpDiscovery::HwGc, CpRb0WptrHi, static_cast<uint32_t>(wptrDwords >> 32));
-		wr(IpDiscovery::HwGc, CpRb0Wptr, static_cast<uint32_t>(wptrDwords));
-	}
+	// gfx_v12_0_ring_set_wptr_gfx with use_doorbell (gfx_v12_0.c:4458): the
+	// wptr shadow above, then the 64-bit doorbell. The MMIO CP_RB0_WPTR path is
+	// gone: it halts PFP/ME on silicon (round 2, R2-2).
+	doorbells[kGfxDoorbellDword / 2] = wptrDwords;
 }
 
 bool RDNA4Compute::gfxFenceWait(uint32_t seq, uint32_t timeoutUs) {
@@ -224,7 +217,7 @@ bool RDNA4Compute::stageGfxRing() {
 
 	GLOG("bring-up (rdna4-gfx=%u): CP_ME_CNTL 0x%08x CP_STAT 0x%08x PFP pc 0x%x ME pc 0x%x", gfxMode,
 	     rdGc(CpMeCntl), rdGc(CpStat), rdGc(CpPfpInstrPntr), rdGc(CpMeInstrPntr));
-	if (gfxMode == 2 && !doorbells)
+	if (!doorbells)
 		return finish(false, "doorbell mode without the doorbell BAR");
 	trail("gfx: clear state + ring");
 	if (!gfxCsbInit())
@@ -310,7 +303,7 @@ bool RDNA4Compute::stageGfxRing() {
 	if (r != rounds)
 		return finish(false, "ring wrap");
 
-	GLOG("gfx ring ready (%s)", gfxMode == 2 ? "doorbell" : "MMIO write pointer");
+	GLOG("gfx ring ready (doorbell)");
 	return finish(true, "gfx ring");
 }
 
@@ -324,17 +317,18 @@ bool RDNA4Compute::stageGfxDraw() {
 		return false;
 	}
 	// The GE rings are sized for kMaxSe shader engines (they scale with its
-	// square): check the card's count first. amdgpu does not take the SE count
-	// from GB_ADDR_CONFIG: gfx_v12_0 uses max_shader_engines and
-	// max_backends_per_se, which amdgpu_discovery_get_gc_info fills from the
-	// IP discovery gc_info table (amdgpu_discovery.c:2016,2020). The register
-	// is only logged; its NUM_SHADER_ENGINES field (gc_12_0_0_sh_mask.h:25752)
-	// reads 16 on the real card's 0x08200545, so it is not an SE count.
+	// square): check the card's count first. The count is the IP discovery
+	// gc_info one: gfx_v12_0 uses max_shader_engines and max_backends_per_se,
+	// which amdgpu_discovery_get_gc_info fills from that table
+	// (amdgpu_discovery.c:2016,2020). The decoded GB_ADDR_CONFIG field is not
+	// used as the SE count (gfx_v12_0.c:3648 decodes num_se from it and never
+	// reads it back); the card's 0x08200545 reads 16 through it
+	// (NUM_SHADER_ENGINES, gc_12_0_0_sh_mask.h:25752), so it is only logged.
 	const uint32_t gbAddr = rdGc(GbAddrConfig);
-	uint32_t ses = 0, rbPerSe = 0;
-	const bool haveGc = env.disc && env.disc->gcInfo(ses, rbPerSe);
-	GLOG("draw: GB_ADDR_CONFIG 0x%08x, IP discovery gc_info: %s%u shader engines, %u RBs per SE, %u pipes",
-	     gbAddr, haveGc ? "" : "absent, ", ses, rbPerSe, 1u << (gbAddr & 7));
+	uint32_t ses = 0, rbPerSe = 0, gcVer = 0;
+	const bool haveGc = env.disc && env.disc->gcInfo(ses, rbPerSe, &gcVer);
+	GLOG("draw: GB_ADDR_CONFIG 0x%08x, IP discovery gc_info %u.%u: %s%u shader engines, %u RBs per SE",
+	     gbAddr, gcVer >> 16, gcVer & 0xffff, haveGc ? "" : "absent, ", ses, rbPerSe);
 	if (!haveGc || !ses || ses > kMaxSe) {
 		GLOG("draw: the GE rings are sized for %u shader engines; skipped", kMaxSe);
 		publishResult("gfx", "SKIPPED unsupported shader-engine count");

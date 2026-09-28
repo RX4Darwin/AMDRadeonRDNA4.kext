@@ -4523,6 +4523,9 @@ static uint32_t rdna4_gfx_discovery_num_se(RDNA4State *s)
     if (!off || off + 16 > s->discovery_len) {
         return 0;
     }
+    if (ldl_le_p(s->discovery + off) != 0x4347) { /* GC_TABLE_ID */
+        return 0;
+    }
     return ldl_le_p(s->discovery + off + 12);
 }
 

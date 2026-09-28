@@ -365,8 +365,8 @@ private:
 	bool stageKernel();
 
 	// W3, the gfx ring (gfxring.cpp): after the compute stages when the
-	// boot-arg rdna4-gfx is 1 (write pointer through CP_RB0_WPTR) or 2 (its
-	// doorbell). Pool layout past the DMA scratch, below the heap.
+	// boot-arg rdna4-gfx is 2 (1 is an alias); the write pointer goes through the
+	// ring's doorbell. Pool layout past the DMA scratch, below the heap.
 	static constexpr uint32_t kGfxOffset      = 30u << 20;
 	static constexpr uint32_t kGfxRingOffset  = kGfxOffset;              // 16 KiB ring
 	static constexpr uint32_t kGfxRingSize    = 0x4000;
@@ -389,7 +389,7 @@ private:
 	bool stageGfxDraw();
 	Pm4::Queue gfxRing;
 	uint32_t   gfxFence { 0 };               // last RELEASE_MEM sequence number
-	uint32_t   gfxMode { 0 };                // 0 off, 1 MMIO write pointer, 2 doorbell
+	uint32_t   gfxMode { 0 };                // 0 off, 2 doorbell (the only mode)
 	static uint32_t requestedGfx();
 	bool gfxCsbInit();
 	bool gfxRingResume();

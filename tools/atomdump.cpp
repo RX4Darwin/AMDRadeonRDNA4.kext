@@ -1913,6 +1913,70 @@ static int testFlipArithmetic() {
 	return failures;
 }
 
+// A synthetic v1 discovery binary (binary_header + IPDS + one die + a GC
+// table) for IpDiscovery::gcInfo. init() needs a >= 512 byte buffer whose
+// checksum, IPDS and die header are right, so build those, then vary the GC
+// table: its offset, table_id, version and where it ends.
+static void buildDiscovery(uint8_t *b, uint16_t gcOff, uint32_t tableId, uint16_t gcMajor,
+                           uint32_t se, uint32_t rbPerSe) {
+	memset(b, 0, 512);
+	auto p16 = [&](size_t o, uint16_t v) { b[o] = v & 0xff; b[o + 1] = v >> 8; };
+	auto p32 = [&](size_t o, uint32_t v) { p16(o, v & 0xffff); p16(o + 2, v >> 16); };
+	p32(0, 0x28211407);                        // binary_header: signature
+	p16(4, 1); p16(6, 3);                      // version 1.3 (this card's ROM)
+	p16(10, 512);                              // binary_size
+	p16(12, 0x40); p16(16, 0x60);              // table_list[0] IP_DISCOVERY: offset, size
+	p16(20, gcOff);                            // table_list[1] GC: offset
+	p32(0x40, 0x53445049);                     // "IPDS"
+	p16(0x40 + 12, 1);                         // num_dies
+	p16(0x40 + 16, 0xb0);                      // die_info[0].die_offset
+	p16(0xb0 + 2, 1);                          // die_header.num_ips
+	if (gcOff) {
+		p32(gcOff, tableId);                   // gpu_info_header
+		p16(gcOff + 4, gcMajor); p16(gcOff + 6, 0);
+		if (gcOff + 12 < 512) p32(gcOff + 12, se);
+		if (gcOff + 24 < 512) p32(gcOff + 24, rbPerSe);
+	}
+	uint16_t sum = 0;
+	for (size_t i = 10; i < 512; i++)
+		sum = static_cast<uint16_t>(sum + b[i]);
+	p16(8, sum);
+}
+
+static int testGcInfo() {
+	int failures = 0;
+	uint8_t buf[512];
+	IpDiscovery d;
+	uint32_t se = 99, rb = 99, ver = 0;
+
+	buildDiscovery(buf, 0xc0, 0x4347, 1, 4, 4);
+	failures += check(d.init(buf, sizeof(buf)), "gc_info: the synthetic binary initialises");
+	failures += check(d.gcInfo(se, rb, &ver) && se == 4 && rb == 4 && ver == (1u << 16),
+	                  "gc_info: good v1.0 table gives 4 SEs, 4 RBs per SE, version 1.0");
+	buildDiscovery(buf, 0xc0, 0x4347, 2, 4, 4);
+	d.init(buf, sizeof(buf));
+	failures += check(d.gcInfo(se, rb, &ver) && ver == (2u << 16), "gc_info: v2 table accepted");
+
+	se = rb = 99;
+	buildDiscovery(buf, 0, 0x4347, 1, 4, 4);
+	d.init(buf, sizeof(buf));
+	failures += check(!d.gcInfo(se, rb) && se == 99 && rb == 99, "gc_info: zero table offset refused");
+	buildDiscovery(buf, 0xc0, 0x4347, 3, 4, 4);
+	d.init(buf, sizeof(buf));
+	failures += check(!d.gcInfo(se, rb) && se == 99, "gc_info: version 3 refused (amdgpu: Unhandled GC info table)");
+	buildDiscovery(buf, 0xc0, 0x4348, 1, 4, 4);
+	d.init(buf, sizeof(buf));
+	failures += check(!d.gcInfo(se, rb) && se == 99, "gc_info: wrong table_id refused (GC_TABLE_ID 0x4347)");
+	buildDiscovery(buf, 512 - 16, 0x4347, 1, 4, 4);   // gc_num_rb_per_se falls past the buffer
+	d.init(buf, sizeof(buf));
+	failures += check(!d.gcInfo(se, rb) && se == 99, "gc_info: table truncated by the buffer refused");
+	IpDiscovery none;
+	failures += check(!none.gcInfo(se, rb), "gc_info: no discovery refused");
+
+	printf("\ngc_info: %s\n", failures ? "FAILED" : "ok");
+	return failures;
+}
+
 struct VmTestTable {
 	uint64_t base;
 	uint64_t entries[4096];
@@ -2180,6 +2244,7 @@ int main(int argc, char **argv) {
 	failures += testCodeObject();
 	failures += testGpuHeap();
 	failures += testFlipArithmetic();
+	failures += testGcInfo();
 	failures += testGpuVm();
 
 	if (failures) {

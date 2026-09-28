@@ -102,7 +102,7 @@ bool IpDiscovery::init(const uint8_t *buffer, size_t bufferSize) {
 	return false;
 }
 
-bool IpDiscovery::gcInfo(uint32_t &numSe, uint32_t &numRbPerSe) const {
+bool IpDiscovery::gcInfo(uint32_t &numSe, uint32_t &numRbPerSe, uint32_t *version) const {
 	if (!valid)
 		return false;
 	uint16_t vmajor, tblOff;
@@ -116,10 +116,21 @@ bool IpDiscovery::gcInfo(uint32_t &numSe, uint32_t &numRbPerSe) const {
 	// size); gc_info v1_0 and v2_0 both put gc_num_se right after it and
 	// gc_num_rb_per_se three dwords on.
 	const size_t gc = binBase + tblOff;
-	uint16_t gcMajor;
-	if (!readU16(gc + 4, gcMajor) || (gcMajor != 1 && gcMajor != 2))
+	// GC_TABLE_ID (discovery.h:30) is what amdgpu checks the table with
+	// (amdgpu_discovery.c:648) before it reads a field.
+	uint32_t tableId;
+	uint16_t gcMajor, gcMinor;
+	if (!readU32(gc, tableId) || tableId != 0x4347 || !readU16(gc + 4, gcMajor) ||
+	    !readU16(gc + 6, gcMinor) || (gcMajor != 1 && gcMajor != 2))
 		return false;
-	return readU32(gc + 12, numSe) && readU32(gc + 12 + 12, numRbPerSe);
+	uint32_t se, rb;   // outputs only change on success
+	if (!readU32(gc + 12, se) || !readU32(gc + 12 + 12, rb))
+		return false;
+	numSe = se;
+	numRbPerSe = rb;
+	if (version)
+		*version = (static_cast<uint32_t>(gcMajor) << 16) | gcMinor;
+	return true;
 }
 
 bool IpDiscovery::ipAt(uint16_t index, IpEntry &out) const {
