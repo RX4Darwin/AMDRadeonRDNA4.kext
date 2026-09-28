@@ -293,18 +293,23 @@ private:
 	IOFilterInterruptEventSource *ihSource { nullptr };
 	IOWorkLoop *ihWorkLoop { nullptr };
 	OSObject *ihContext { nullptr };
-	IOLock *ihWaitLock { nullptr };
+	IOLock *ihLock { nullptr };             // independent of rtLock; W2/W5 callers may not hold rtLock
 	void *ihWaitEvent { nullptr };
 	bool ihActive { false };
 	bool ihDispatchPolling { false };
 	bool ihSdmaPolling { false };
 	uint32_t ihDispatchMisses { 0 };
 	uint32_t ihSdmaMisses { 0 };
+	uint32_t ihDispatchObserved { 0 };
+	uint32_t ihSdmaObserved { 0 };
 	uint32_t ihEopCount { 0 };
 	uint32_t ihSdmaTrapCount { 0 };
 	uint32_t ihFaultCount { 0 };
 	uint32_t ihUnknownCount { 0 };
 	uint8_t ihUnknownSeen[256][32] {};
+	bool ihSdmaKicked { false };
+	bool ihDispatchKicked { false };
+	bool ihDrained { false };
 
 	bool ihInit();
 	void ihStop();

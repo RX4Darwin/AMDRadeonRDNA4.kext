@@ -1716,6 +1716,10 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	// Spin for the first 2 ms (short kernels), then sleep between polls:
 	// user dispatches may run for seconds.
 	if (l.useInterrupt && ihActive) {
+		if (!ihDispatchKicked) {
+			ihDispatchKicked = true;
+			trail("ih: first CP kick");
+		}
 		pm4Kick(q.wptr());
 		return ihWaitFence(poolDw(kPm4FenceOffset), pm4Fence,
 		                   (l.timeoutUs ? l.timeoutUs : 1000000) / 1000,

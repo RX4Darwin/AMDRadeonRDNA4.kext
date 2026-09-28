@@ -122,6 +122,11 @@ bool RDNA4Compute::ihInit() {
 		HLOG("off: PCI bus mastering is not enabled (command 0x%04x)", command);
 		return false;
 	}
+	ihLock = IOLockAlloc();
+	if (!ihLock) {
+		HLOG("off: could not allocate the IH wait lock");
+		return false;
+	}
 
 	int msiIndex = -1;
 	for (int i = 0; i < 32; i++) {
@@ -176,6 +181,7 @@ bool RDNA4Compute::ihInit() {
 	ihWptrMemory->performOperation(kIOMemoryIncoherentIOFlush, 0, sizeof(uint32_t));
 
 	// Bus-address IH needs the OSSSYS GPA route in addition to MC_SPACE=2.
+	trail("ih: program ring");
 	wr(IpDiscovery::HwOsssys, IhChicken,
 	   rd(IpDiscovery::HwOsssys, IhChicken) | (1u << 4));
 	wr(IpDiscovery::HwOsssys, IhRbBase, static_cast<uint32_t>(ihRingBus >> 8));
@@ -200,7 +206,6 @@ bool RDNA4Compute::ihInit() {
 	}
 	context->compute = this;
 	ihContext = context;
-	ihWaitLock = rtLock;
 	ihWaitEvent = this;
 	ihWorkLoop = env.owner->getWorkLoop();
 	if (!ihWorkLoop) {
@@ -208,6 +213,7 @@ bool RDNA4Compute::ihInit() {
 		ihStop();
 		return false;
 	}
+	trail("ih: register MSI");
 	ihSource = IOFilterInterruptEventSource::filterInterruptEventSource(
 		context, ihEventAction, ihEventFilter, env.pci, msiIndex);
 	if (!ihSource) {
@@ -225,10 +231,12 @@ bool RDNA4Compute::ihInit() {
 	// The only queue owned by this kext is MEC1 pipe 0 queue 0. The source
 	// bits are enabled after IOKit registration, so a vector cannot arrive
 	// before the drain path exists.
+	trail("ih: enable sources");
 	wr(IpDiscovery::HwGc, CpMe1Pipe0IntCntl,
 	   rd(IpDiscovery::HwGc, CpMe1Pipe0IntCntl) | kCpTimeStampIntEnable);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaCntl),
 	   rd(IpDiscovery::HwGc, sdma(0, SdmaCntl)) | 1u); // TRAP_ENABLE
+	trail("ih: enable ring");
 	wr(IpDiscovery::HwOsssys, IhRbCntl, cntl | kIhRbEnable | kIhEnableIntr);
 	ihActive = true;
 	ihSource->enable();
@@ -260,8 +268,11 @@ void RDNA4Compute::ihStop() {
 		ihContext = nullptr;
 	}
 	ihWorkLoop = nullptr;
-	ihWaitLock = nullptr;
 	ihWaitEvent = nullptr;
+	if (ihLock) {
+		IOLockFree(ihLock);
+		ihLock = nullptr;
+	}
 	if (ihRingDma) {
 		ihRingDma->clearMemoryDescriptor();
 		ihRingDma->release();
@@ -301,12 +312,14 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	Ih::decode(dw, entry);
 	if (entry.clientId == kIhClientGfx && entry.srcId == kIhSrcCpEop && entry.ringId == 4) {
 		ihEopCount++;
-		HLOG("CP EOP interrupt: count %u ring %u", ihEopCount, entry.ringId);
+		if (ihEopCount == 1 || !(ihEopCount & 0x3f))
+			HLOG("CP EOP interrupt: count %u ring %u", ihEopCount, entry.ringId);
 		return;
 	}
 	if (entry.clientId == kIhClientGfx && entry.srcId == kIhSrcSdmaTrap) {
 		ihSdmaTrapCount++;
-		HLOG("SDMA trap interrupt: count %u", ihSdmaTrapCount);
+		if (ihSdmaTrapCount == 1 || !(ihSdmaTrapCount & 0x3f))
+			HLOG("SDMA trap interrupt: count %u", ihSdmaTrapCount);
 		return;
 	}
 	if (entry.clientId == kIhClientUtcl2) {
@@ -334,8 +347,13 @@ void RDNA4Compute::ihAction() {
 		wr(IpDiscovery::HwOsssys, IhRbCntl, cntl & ~kIhWptrOverflowClear);
 	} else {
 		uint32_t bytes = wptr >= ihRptr ? wptr - ihRptr : kIhRingBytes - ihRptr;
-		if (bytes)
+		if (bytes) {
+			if (!ihDrained) {
+				ihDrained = true;
+				trail("ih: first ring drain");
+			}
 			ihRingMemory->performOperation(kIOMemoryIncoherentIOFlush, ihRptr, bytes);
+		}
 		if (wptr < ihRptr && wptr)
 			ihRingMemory->performOperation(kIOMemoryIncoherentIOFlush, 0, wptr);
 		while (ihRptr != wptr) {
@@ -347,8 +365,11 @@ void RDNA4Compute::ihAction() {
 		}
 	}
 	wr(IpDiscovery::HwOsssys, IhRbRptr, ihRptr);
-	if (ihWaitLock)
-		IOLockWakeup(ihWaitLock, ihWaitEvent, false);
+	if (ihLock) {
+		IOLockLock(ihLock);
+		IOLockWakeup(ihLock, ihWaitEvent, false);
+		IOLockUnlock(ihLock);
+	}
 }
 
 void RDNA4Compute::ihRecordWait(bool dispatch, bool woke, bool completed, uint32_t eventsBefore) {
@@ -376,9 +397,11 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 	uint64_t span = 0;
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000, &span);
 	const uint64_t deadline = t0 + span;
-	const bool useIh = ihActive && !(dispatch ? ihDispatchPolling : ihSdmaPolling) && ihWaitLock;
+	const bool useIh = ihActive && !(dispatch ? ihDispatchPolling : ihSdmaPolling) && ihLock;
+	uint32_t &observed = dispatch ? ihDispatchObserved : ihSdmaObserved;
 	const uint32_t eventsBefore = dispatch ? ihEopCount : ihSdmaTrapCount;
 	bool done = false;
+	bool recorded = false;
 	if (!useIh) {
 		for (uint32_t polls = 0;; polls++) {
 			done = *fence == value;
@@ -390,24 +413,35 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 				IOSleep(1);
 		}
 	} else {
+		// This lock is intentionally separate from rtLock: bring-up and later
+		// queue owners may call this path without holding the runtime lock.
+		IOLockLock(ihLock);
 		for (;;) {
 			done = *fence == value;
 			if (done || mach_absolute_time() > deadline)
 				break;
 			uint64_t sleepSpan = 0;
 			nanoseconds_to_absolutetime(2000000, &sleepSpan);
-			const wait_result_t wr = IOLockSleepDeadline(ihWaitLock, ihWaitEvent,
+			const wait_result_t wr = IOLockSleepDeadline(ihLock, ihWaitEvent,
 		                                                mach_absolute_time() + sleepSpan,
 		                                                THREAD_UNINT);
 			const bool woke = wr != THREAD_TIMED_OUT;
 			done = *fence == value;
 			ihRecordWait(dispatch, woke, done, eventsBefore);
+			recorded = true;
 			if (done || mach_absolute_time() > deadline)
 				break;
 		}
+		IOLockUnlock(ihLock);
+	}
+	if (useIh && done && !recorded) {
+		const uint32_t events = dispatch ? ihEopCount : ihSdmaTrapCount;
+		const bool source = events != observed;
+		ihRecordWait(dispatch, source, true, source ? observed : eventsBefore);
 	}
 	if (!useIh && done)
 		ihRecordWait(dispatch, false, true, eventsBefore);
+	observed = dispatch ? ihEopCount : ihSdmaTrapCount;
 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	if (!done && tag)
 		HLOG("%s wait timed out: fence 0x%08x want 0x%08x", tag, *fence, value);
