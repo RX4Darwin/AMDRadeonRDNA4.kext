@@ -9,6 +9,7 @@
 
 #include "codeobj.hpp"
 #include "compute.hpp"
+#include "flip.hpp"
 #include "pm4.hpp"
 #include "probe_kernel.h"
 #include "sdma.hpp"
@@ -549,6 +550,9 @@ void RDNA4Compute::runStages() {
 	// in the trail, so the trail's normal ending comes after them.
 	if (done >= StageDispatch)
 		publishRuntime(done);
+	// W5: the page-flip test, once the runtime's DMA and device heap exist.
+	if (done >= StageKernel && featureAllowed("flip"))
+		Flip::run(*this);
 	snprintf(note, sizeof(note), "finished at stage %u%s%s%s", done,
 	         !gfxAsked ? "" : gfxOk ? ", gfx ring up" : ", gfx ring off",
 	         hungFeature[0] ? ", skipped after a hang: " : "", hungFeature);
