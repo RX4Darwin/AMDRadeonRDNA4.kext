@@ -313,11 +313,14 @@ bool RDNA4Compute::vmBootSelfTest() {
 		*poolDw(qoff + off) = 0;
 	c.kernargCpu = nullptr;
 	c.fenceCpu = poolDw(qoff + kVmFence);
-	if (!vmMap(c, qva, poolMc(qoff + kVmPq), kPqSize, false) ||
-	    !vmMap(c, rva, poolMc(qoff + kVmRptr), 0x1000, false) ||
-	    !vmMap(c, dataVa, poolMc(qoff + kVmWptr), 0x1000, false) ||
-	    !vmMap(c, fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
-	    !c.pm4.init(poolDw(qoff + kVmPq), qva, kPqSize)) {
+	const bool qMap = vmMap(c, qva, poolMc(qoff + kVmPq), kPqSize, false);
+	const bool rMap = qMap && vmMap(c, rva, poolMc(qoff + kVmRptr), 0x1000, false);
+	const bool dMap = rMap && vmMap(c, dataVa, poolMc(qoff + kVmWptr), 0x1000, false);
+	const bool fMap = dMap && vmMap(c, fenceVa, poolMc(qoff + kVmFence), 0x1000, false);
+	const bool qInit = fMap && c.pm4.init(poolDw(qoff + kVmPq), qva, kPqSize);
+	if (!qInit) {
+		RLOG("vm: boot page-table setup q=%d r=%d data=%d fence=%d pm4=%d",
+		     qMap, rMap, dMap, fMap, qInit);
 		RLOG("vm: boot page-table or queue setup failed");
 		IOFree(c.tableShadow, kVmTableBytes);
 		devHeap.free(table);
