@@ -309,7 +309,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 		GpuVm::encodePde(c.rootMc + 0x1000, GpuVm::kValid | GpuVm::kSnooped, 2);
 	c.tableShadow[0x1000 / sizeof(uint64_t) + 4] =
 		GpuVm::encodePde(c.rootMc + 0x2000, GpuVm::kValid | GpuVm::kSnooped, 1);
-	for (uint32_t off = 0; off < 0x5000; off += 4)
+	for (uint32_t off = 0; off < 0x7000; off += 4)
 		*poolDw(qoff + off) = 0;
 	c.kernargCpu = nullptr;
 	c.fenceCpu = poolDw(qoff + kVmFence);
@@ -437,7 +437,7 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	c->tableShadow[0x1000 / sizeof(uint64_t) + 4] =
 		GpuVm::encodePde(c->rootMc + 0x2000, GpuVm::kValid | GpuVm::kSnooped, 1);
 	const uint32_t qoff = kVmQueueBase + slot * kVmQueueStride;
-	for (uint32_t off = 0; off < 0x5000; off += 4)
+	for (uint32_t off = 0; off < 0x7000; off += 4)
 		*poolDw(qoff + off) = 0;
 	c->kernargCpu = poolDw(qoff + kVmKernarg);
 	c->fenceCpu = poolDw(qoff + kVmFence);

@@ -306,9 +306,9 @@ private:
 	static constexpr uint32_t kVmEop = 0x1000;
 	static constexpr uint32_t kVmPq = 0x2000;
 	static constexpr uint32_t kVmRptr = 0x3000;
-	static constexpr uint32_t kVmWptr = 0x3040;
-	static constexpr uint32_t kVmFence = 0x3080;
-	static constexpr uint32_t kVmKernarg = 0x4000;
+	static constexpr uint32_t kVmWptr = 0x4000;
+	static constexpr uint32_t kVmFence = 0x5000;
+	static constexpr uint32_t kVmKernarg = 0x6000;
 	struct RtBuffer  {
 		const void *owner;
 		uint64_t    offset, bytes;             // heap offset (pool or VRAM), size
