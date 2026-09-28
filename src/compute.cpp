@@ -428,24 +428,31 @@ void RDNA4Compute::trail(const char *step) {
 	nvram->release();
 }
 
-void RDNA4Compute::logPreviousTrail() {
+bool RDNA4Compute::logPreviousTrail(char *text, size_t size) {
+	text[0] = 0;
 	IORegistryEntry *nvram = IORegistryEntry::fromPath("/options", gIODTPlane);
 	if (!nvram)
-		return;
-	char text[96] {};
+		return false;
 	if (OSObject *prev = nvram->copyProperty(kTrailKey)) {
 		if (auto *s = OSDynamicCast(OSString, prev))
-			strlcpy(text, s->getCStringNoCopy(), sizeof(text));
-		else if (auto *d = OSDynamicCast(OSData, prev))
-			memcpy(text, d->getBytesNoCopy(),
-			       d->getLength() < sizeof(text) - 1 ? d->getLength() : sizeof(text) - 1);
+			strlcpy(text, s->getCStringNoCopy(), size);
+		else if (auto *d = OSDynamicCast(OSData, prev)) {
+			const size_t n = d->getLength() < size - 1 ? d->getLength() : size - 1;
+			memcpy(text, d->getBytesNoCopy(), n);
+			text[n] = 0;
+		}
 		prev->release();
 	}
-	if (text[0])
-		CLOG("previous boot's bring-up ended at: %s", text);
-	else
-		CLOG("no bring-up trail from a previous boot");
 	nvram->release();
+	if (!text[0]) {
+		CLOG("no bring-up trail from a previous boot");
+		return false;
+	}
+	CLOG("previous boot's bring-up ended at: %s", text);
+	// Every way a bring-up ends on its own leaves one of these; anything
+	// else is the step that was running when that boot died.
+	return strncmp(text, "finished", 8) && strncmp(text, "stopped", 7) &&
+	       strncmp(text, "skipped", 7);
 }
 
 // ---------------------------------------------------------------------------
@@ -462,9 +469,22 @@ void RDNA4Compute::threadMain(void *arg, wait_result_t) {
 void RDNA4Compute::runStages() {
 	// Read before this boot writes its own. Not at attach: that is before
 	// the EFI NVRAM driver has published the stored variables.
-	logPreviousTrail();
+	char prev[96];
+	const bool hung = logPreviousTrail(prev, sizeof(prev));
 	uint32_t done = StageSurvey;
-	char note[64];
+	char note[96];
+	if (hung) {
+		// Running the same steps again would most likely hang this boot too,
+		// before anyone can collect a log. Skip once; the trail this leaves
+		// is a normal ending, so the boot after this one tries again.
+		CLOG("the previous boot died during \"%s\"; stages 2+ are skipped this boot so it stays "
+		     "up (the next boot tries again)", prev);
+		snprintf(note, sizeof(note), "skipped: previous boot hung at %s", prev);
+		trail(note);
+		env.owner->setProperty("Compute,PreviousHang", prev);
+		env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
+		return;
+	}
 	auto stop = [&](const char *what) {
 		CLOG("%s failed; stopping, the display is not affected", what);
 		snprintf(note, sizeof(note), "stopped: %s failed (no hang)", what);

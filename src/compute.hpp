@@ -151,7 +151,9 @@ private:
 	// flushed before each step that could hang the GPU, so the step a hard
 	// hang stopped at survives the reset. Logged by the next boot's survey.
 	void trail(const char *step);
-	void logPreviousTrail();
+	// Log the previous boot's trail (into `text`); true if that boot died
+	// in the middle of a step rather than ending the bring-up itself.
+	bool logPreviousTrail(char *text, size_t size);
 
 	// The compute pool, mapped uncached through BAR0.
 	IOMemoryMap *poolMap { nullptr };
