@@ -528,10 +528,10 @@ void RDNA4Compute::runStages() {
 	snprintf(note, sizeof(note), "finished at stage %u", done);
 	trail(note);
 	CLOG("bring-up finished at stage %u", done);
-	if (done >= StageKernel)
-		Flip::run(*this);
 	if (done >= StageDispatch)
 		publishRuntime(done);
+	if (done >= StageKernel)
+		Flip::run(*this);
 }
 
 // The pool, uncached: the PSP reads what we write there and writes fences
