@@ -169,8 +169,10 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 	if (featureAllowed("flip")) {
 		if (!initPresentationTimer())
 			RLOG("present async disabled: no runtime work-loop timer");
+		else
+			RLOG("present timer installed: rdna4-flip is enabled");
 	} else {
-		RLOG("present selectors disabled: rdna4-flip is not enabled");
+		RLOG("present selectors/timer disabled: rdna4-flip is not enabled");
 	}
 }
 
