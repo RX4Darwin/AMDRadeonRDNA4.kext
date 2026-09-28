@@ -31,6 +31,10 @@ constexpr uint32_t kBad = 0xffffffffu;
 constexpr uint32_t kHubpAddressLo = 0x060a;
 // regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH, BASE_IDX 2.
 constexpr uint32_t kHubpAddressHi = 0x060b;
+// regHUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE, BASE_IDX 2.
+constexpr uint32_t kHubpEarliestLo = 0x061c;
+// regHUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE_HIGH, BASE_IDX 2.
+constexpr uint32_t kHubpEarliestHi = 0x061d;
 // regHUBPREQ0_DCSURF_FLIP_CONTROL, BASE_IDX 2.
 constexpr uint32_t kHubpFlipControl = 0x0613;
 constexpr uint32_t kHubpFlipPending = 1u << 8;
@@ -140,7 +144,8 @@ bool waitNextVblank(RDNA4Compute &compute, uint8_t otg, uint32_t timeoutMs,
 }
 
 bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
-            const char *name, uint64_t *latencyUs) {
+            const char *name, uint64_t *latencyUs, bool async) {
+	const bool detailed = !async || rdna4TraceLevel >= 2;
 	auto dmuRead = [&](uint8_t segment, uint32_t dword) {
 		return compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { segment, dword });
 	};
@@ -179,7 +184,8 @@ bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 		for (;;) {
 			const uint32_t control = dmuRead2(kHubpFlipControl + hubpBase);
 			if (control != kBad && !(control & kHubpFlipPending)) {
-				FLOG("%s: pending clear control 0x%08x", name, control);
+				if (detailed)
+					FLOG("%s: pending clear control 0x%08x", name, control);
 				return true;
 			}
 			if (mach_absolute_time() - start >= span)
@@ -198,7 +204,8 @@ bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 			uint32_t current = 0;
 			if (readPosition(current, line) && ((current - before) & 0xffffffu)) {
 				after = current;
-				FLOG("%s: OTG frame advanced %u->%u line %u", name, before, after, line);
+				if (detailed)
+					FLOG("%s: OTG frame advanced %u->%u line %u", name, before, after, line);
 				return true;
 			}
 			if (mach_absolute_time() - start >= span) {
@@ -252,7 +259,8 @@ bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 		FLOG("failure: %s could not read OTG position", name);
 		return false;
 	}
-	FLOG("%s: begin target 0x%llx frame %u line %u", name, target, beforeFrame, beforeLine);
+	if (detailed)
+		FLOG("%s: begin target 0x%llx frame %u line %u", name, target, beforeFrame, beforeLine);
 	uint64_t startNs = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time(), &startNs);
 	if (!writeAddress()) {
@@ -267,10 +275,32 @@ bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 		     name, readback, target, dmuRead2(kHubpFlipControl + hubpBase), frame, line);
 		return false;
 	}
+	uint64_t earliest = 0;
+	const uint32_t earliestLo = dmuRead2(kHubpEarliestLo + hubpBase);
+	const uint32_t earliestHi = dmuRead2(kHubpEarliestHi + hubpBase);
+	if (earliestLo == kBad || earliestHi == kBad) {
+		FLOG("failure: %s earliest-in-use unreadable (0x%08x/0x%08x)", name,
+		     earliestLo, earliestHi);
+		return false;
+	}
+	earliest = static_cast<uint64_t>(earliestLo) |
+	           (static_cast<uint64_t>(earliestHi) << 32);
+	// This is DC's hubp2_is_flip_pending test: pending clear plus the
+	// DCSURF_SURFACE_EARLIEST_INUSE pair matching the requested address.  The
+	// DCN 4.1.0 offsets are 0x061c/0x061d (BASE_IDX 2).
+	if (earliest != target) {
+		uint32_t frame = 0, line = 0;
+		(void)readPosition(frame, line);
+		FLOG("failure: %s earliest-in-use 0x%llx expected 0x%llx pending control 0x%08x frame %u line %u",
+		     name, earliest, target, dmuRead2(kHubpFlipControl + hubpBase), frame, line);
+		return false;
+	}
+	if (detailed)
+		FLOG("%s: earliest-in-use 0x%llx", name, earliest);
 	uint32_t afterFrame = 0, afterLine = 0;
-	// DCN can clear SURFACE_FLIP_PENDING when it accepts the request, before
-	// the scanout reaches the next frame.  Treat the OTG frame counter as the
-	// latch completion signal, as DC does when it waits for the flip event.
+	// The EARLIEST_INUSE pair above is the latch completion signal.  The OTG
+	// frame counter is sampled separately so the caller's latency and scanline
+	// report covers the frame containing the latch.
 	if (!waitForFrameAdvance(beforeFrame, afterFrame, afterLine))
 		return false;
 	const uint32_t frameDelta = (afterFrame - beforeFrame) & 0xffffffu;
@@ -284,8 +314,9 @@ bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 	const uint64_t elapsedUs = (endNs - startNs) / 1000;
 	if (latencyUs)
 		*latencyUs = elapsedUs;
-	FLOG("%s latched: address 0x%llx, latency %llu us, %llu scanlines, frame %u->%u",
-	     name, readback, elapsedUs, scanlines, beforeFrame, afterFrame);
+	if (detailed)
+		FLOG("%s latched: address 0x%llx, latency %llu us, %llu scanlines, frame %u->%u",
+		     name, readback, elapsedUs, scanlines, beforeFrame, afterFrame);
 	return true;
 }
 

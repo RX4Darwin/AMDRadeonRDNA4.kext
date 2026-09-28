@@ -58,7 +58,7 @@ bool waitNextVblank(RDNA4Compute &compute, uint8_t otg, uint32_t timeoutMs,
 // Latch one address and verify its vblank advance and readback. The caller
 // serializes this with rtLock and supplies any boot trail before the call.
 bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
-			const char *name, uint64_t *latencyUs = nullptr);
+			const char *name, uint64_t *latencyUs = nullptr, bool async = false);
 
 // Run the rdna4-flip=<mode> test once. False means the requested test failed
 // and the feature has been disabled after attempting to restore the desktop.
