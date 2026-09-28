@@ -1,0 +1,516 @@
+
+=== system ===
+ProductName:		macOS
+ProductVersion:		26.6.2
+BuildVersion:		25G83
+AMD Ryzen 7 5700G with Radeon Graphics         
+Mon Sep 28 03:46:35 UTC 2026
+
+=== active RDNA4FB boot-args ===
+active: rdna4-pspdump=1 rdna4-compute=7
+
+=== kext loaded? ===
+Executing: /usr/bin/kmutil showloaded
+No variant specified, falling back to release
+   57    0 0xffffff80041a6000 0x332000   0x332000   com.hackintosh.RDNA4FB (0.0.1) 37BEB0C3-59F2-3A4D-8682-D751A8B56BF6 <56 19 9 7 6 3 2 1>
+
+=== boot-args ===
+kernel: keepsyms=1 debug=0x100 npci=0x2000 -v -lilubetaall rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1 
+boot-args	keepsyms=1 debug=0x100 npci=0x2000 -v -lilubetaall rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1
+
+=== dmesg: full RDNA4FB log ===
+[   16.570543]: RDNA4FB: ndrv: framebuffer <ptr> (IONDRVFramebuffer) on provider VGA: ours
+[   16.570550]: RDNA4FB: ndrv: Initialize -> 0x0
+[   16.570571]: RDNA4FB: console base 0xd0000001 carries flag bits, using 0xd0000000
+[   16.570574]: RDNA4FB: console framebuffer: base=0xd0000000 1920x1080 stride=7680 depth=32 len=8294400
+[   16.570587]: RDNA4FB: mmio: BAR5 mapped, 512 KiB
+[   16.602608]: Sandbox apply: bluetoothd[68] <bytes>successfully truncated <redacted> to 336 bytessuccessfully truncated <redacted> to 408 bytesSandbox: pboard(117) deny(1) file-read-data /usr/libexecSandbox apply: iconservicesagent[130] <bytes>2 duplicate reports for Sandbox: pboard(117) deny(1) file-read-data /usr/libexecSandbox: iconservicesd(51) deny(1) file-read-metadata /Library4 duplicate reports for Sandbox: iconservicesd(51) deny(1) file-read-metadata /LibrarySandbox: iconservicesagent(130) deny(1) mach-lookup com.apple.tccd.systemRDNA4FB: VBIOS: 131072 bytes from expansion ROM at 0xfcd80000
+[   16.691528]: RDNA4FB: VBIOS: valid AtomBIOS image at +0x0, 58880 bytes
+[   16.691536]: RDNA4FB: connector 0: DisplayPort objid=0x3113 encoder=0x211e ddc-line=0 hpd-pin=1
+[   16.691539]: RDNA4FB: connector 1: DisplayPort objid=0x3213 encoder=0x221e ddc-line=1 hpd-pin=2
+[   16.691541]: RDNA4FB: connector 2: DisplayPort objid=0x3313 encoder=0x2120 ddc-line=2 hpd-pin=3
+[   16.691543]: RDNA4FB: connector 3: HDMI-A objid=0x340c encoder=0x2220 ddc-line=3 hpd-pin=4
+[   16.691560]: 1 duplicate report for Sandbox: iconservicesagent(130) deny(1) mach-lookup com.apple.tccd.systemSandbox: iconservicesagent(130) deny(1) mach-lookup com.apple.windowserver.activeRDNA4FB: discovery: not present in image (inject the full 2MiB flash dump to enable)
+[   16.691579]: RDNA4FB: cmd: setpixelclock absent
+[   16.691580]: RDNA4FB: cmd: dig1transmittercontrol absent
+[   16.691581]: RDNA4FB: cmd: digxencodercontrol absent
+[   16.691582]: RDNA4FB: cmd: enablecrtc absent
+[   16.691583]: RDNA4FB: cmd: setcrtc_usingdtdtiming absent
+[   16.691584]: RDNA4FB: cmd: enabledisppowergating absent
+[   16.691721]: Sandbox: iconservicesagent(130) deny(1) mach-lookup com.apple.windowserverSandbox: iconservicesagent(130) deny(1) mach-lookup com.apple.windowserver.activeSandbox: iconservicesagent(130) deny(1) mach-lookup com.apple.windowserverRDNA4FB: discovery: on-die TMR at vram+0x3faff0000, first dwords 28211407 00030001
+[   16.695415]: RDNA4FB: discovery: on-die binary valid, 46 IPs (no ROM injection needed)
+[   16.695455]: RDNA4FB: pipe: lit pipe OTG0 DIG3 -> link3 (HPD3) OPP0 HUBP0, signal DVI
+[   16.695457]: RDNA4FB: pipe: OTG h_total=0x00000897 h_blank=0x00c00840 h_sync=0x002c0000 v_total=0x00000464 v_blank=0x00290461 v_sync=0x00050000 pol h+ v+; HUBP viewport 1920x1080 pitch 1920 px
+[   16.875478]: RDNA4FB: pipe: boot timing 1920x1080, h 88/44/280 v 4/5/45, frame 16666597 ns -> pixel clock ~148501 kHz (60.000 Hz)
+[   16.875493]: RDNA4FB: mmio: VRAM size 16304 MiB (RCC_CONFIG_MEMSIZE @ 0x378c)
+[   16.875500]: RDNA4FB: dcn: register dump (encoders, read-only) ---
+[   16.875503]: RDNA4FB: dcn:   OTG0_OTG_CONTROL = 0x00010301
+[   16.875509]: RDNA4FB: dcn:   [0] HUBP_surf=0x00000008 DP_PIXEL_FORMAT=0x00000000 DP_MSA_COLORIMETRY=0x00000000 DIG_FE_CNTL=0x00000000
+[   16.875518]: RDNA4FB: dcn:   [1] HUBP_surf=0x00000008 DP_PIXEL_FORMAT=0x00000000 DP_MSA_COLORIMETRY=0x00000000 DIG_FE_CNTL=0x00000000
+[   16.875525]: RDNA4FB: dcn:   [2] HUBP_surf=0x00000008 DP_PIXEL_FORMAT=0x00000000 DP_MSA_COLORIMETRY=0x00000000 DIG_FE_CNTL=0x00000000
+[   16.875532]: RDNA4FB: dcn:   [3] HUBP_surf=0x00000008 DP_PIXEL_FORMAT=0x00000000 DP_MSA_COLORIMETRY=0x00000000 DIG_FE_CNTL=0x00000000
+[   16.875534]: RDNA4FB: dcn:   DP0_DP_MSA_MISC = 0x00000000 (MISC1..4)
+[   16.875537]: RDNA4FB: dcn:   DP0_DP_VID_STREAM_CNTL = 0x00100200
+[   16.875540]: RDNA4FB: dcn:   DP0_DP_SEC_CNTL  = 0x00000000 (GSP/VSC/ASP enables)
+[   16.875543]: RDNA4FB: dcn:   DP0_DP_SEC_CNTL1 = 0x00000000
+[   16.875545]: RDNA4FB: dcn:   DP0_DP_SEC_CNTL2 = 0x00000000
+[   16.875548]: RDNA4FB: dcn:   DP0_DP_SEC_CNTL7 = 0x00000000
+[   16.875551]: RDNA4FB: dcn:   DP0_DP_MSA_VBID_MISC = 0x00000000
+[   16.875556]: RDNA4FB: dcn:   MCM0 shaper=0x00000000 3dlut_mode=0x00000000 1dlut=0x00000000
+[   16.875561]: RDNA4FB: dcn:   MCM1 shaper=0x00000000 3dlut_mode=0x00000000 1dlut=0x00000000
+[   16.875568]: RDNA4FB: dcn:   MCM2 shaper=0x00000000 3dlut_mode=0x00000000 1dlut=0x00000000
+[   16.875573]: RDNA4FB: dcn:   MCM3 shaper=0x00000000 3dlut_mode=0x00000000 1dlut=0x00000000
+[   16.875575]: RDNA4FB: dcn: --- end register dump ---
+[   16.875578]: RDNA4FB: edid: HPD_Y=0x01000000 (hpd1=0 hpd2=0 hpd3=0 hpd4=1)
+[   16.875595]: RDNA4FB: edid: connector 0 (AUX0): no reply
+[   16.875612]: RDNA4FB: edid: connector 1 (AUX1): no reply
+[   16.875630]: RDNA4FB: edid: connector 2 (AUX2): no reply
+[   16.887777]: RDNA4FB: edid: connector 3 (DDC3): VIE product 0x2700 EDID 1.3
+[   16.887782]: RDNA4FB: edid: connector 3 (DDC3): preferred 1920x1080@60.000Hz pclk=148500kHz h(blank=280 fp=88 sw=44 +) v(blank=45 fp=4 sw=5 +)
+[   16.899919]: RDNA4FB: edid: connector 3 (DDC3): read extension block (tag 0x02)
+[   16.899931]: RDNA4FB: psp: boot(C2PMSG_35)=0x80000000 sos(C2PMSG_81)=0x00000000 ring(C2PMSG_64)=0x00000000
+[   16.899940]: RDNA4FB: psp: ring regs 69/70/71 = 0x00000000 0x00000000 0x00000000, fw ver 58/59 = 0x00000000 0x00000000
+[   16.899941]: RDNA4FB: psp: verdict: bootloader READY, sOS not running, GPCOM ring not configured
+[   16.899944]: RDNA4FB: modes: id 1 1920x1080@60.000 148501 kHz (live)
+[   16.899946]: RDNA4FB: modes: 1 mode(s), switching off (boot mode only)
+[   16.899949]: RDNA4FB: init: device ready (1920x1080 console, 1 mode(s))
+[   16.899950]: RDNA4FB: ndrv: answering for <ptr>: 1 mode(s), EDID 256 bytes
+[   16.899952]: RDNA4FB: compute: bring-up to stage 7 requested
+[   16.900032]: RDNA4FB: compute: display memory: DMUB mailbox (region4) at VRAM+0x3dac00000
+[   16.900037]: RDNA4FB: compute: display memory: HUBP0 surface at VRAM+0x0
+[   16.900046]: RDNA4FB: compute: GC 12.0.1, registers readable
+[   16.900048]: RDNA4FB: compute: grbm status=0x00000000 status2=0x00000000 cp_stat=0x00000000 cpc=0x00000000 cpf=0x00000000
+[   16.900049]: RDNA4FB: compute: cp me_cntl=0x00000000 mec_rs64_cntl=0x00000000 mes_cntl=0x00000000 pc pfp=0x0 me=0x0 mec=0x0
+[   16.900051]: RDNA4FB: compute: rlc cntl=0x00000000 stat=0x00000000 gpm_stat=0x00000000 bootload=0x00000000
+[   16.900052]: RDNA4FB: compute: imu core_ctrl=0x00000009 gfx_reset_ctrl=0x00000030
+[   16.900053]: RDNA4FB: compute: sdma0 mcu_cntl=0x00000000 status=0x00000000 ucode_rev=0x00000000 rb_cntl=0x00000000
+[   16.900055]: RDNA4FB: compute: sdma1 mcu_cntl=0x00000000 status=0x00000000 ucode_rev=0x00000000 rb_cntl=0x00000000
+[   16.900056]: RDNA4FB: compute: gchub fb base=0x00000000 top=0x00000000 offset=0x00000000 agp base=0x00000000 bot=0x00000000 top=0x00000000 sys_low=0x00000000
+[   16.900058]: RDNA4FB: compute: gchub l2_cntl=0x00000000 ctx0_cntl=0x00000000 ctx0_pt=0x0000000000000000
+[   16.900059]: RDNA4FB: compute: mmhub fb base=0x00008000 top=0x000083fb offset=0x00000000 agp base=0x00000000 bot=0x00000000 top=0x00000000 sys 0x00200000..0x0020feff
+[   16.900061]: RDNA4FB: compute: mmhub l2_cntl=0x00080602 ctx0_cntl=0x03fffc00 ctx0_pt=0x0000000000000000
+[   16.900063]: RDNA4FB: compute: psp boot=0x80000000 ring=0x00000000 sos=0x00000000
+[   16.900064]: RDNA4FB: compute: hdp flush remap mem=0x0000385c reg=0x00003858
+[   16.900065]: RDNA4FB: compute: memory: VRAM 16304 MiB, MC 0x8000000000..0x83fbffffff, BAR0 0xd0000000 (256 MiB), BAR2 2048 KiB, scanout at VRAM+0x0 (8100 KiB)
+[   16.900068]: RDNA4FB: compute: verdict: PSP sOS not running, bootloader ready, KM ring not created
+[   16.900069]: RDNA4FB: compute: verdict: GFX: IMU held in reset, GFX domains in reset, RLC disabled (bootload not complete), PFP not halted, ME not halted, MEC not halted (pipes 0x0), MES not halted
+[   16.900072]: RDNA4FB: compute: verdict: SDMA0: MCU not halted, ucode init not done, queue0 disabled
+[   16.900073]: RDNA4FB: compute: verdict: SDMA1: MCU not halted, ucode init not done, queue0 disabled
+[   16.900074]: RDNA4FB: compute: verdict: GC hub FB aperture NOT set, L2 no, VMID0 no
+[   16.900075]: RDNA4FB: compute: verdict: MM hub FB aperture set, L2 no, VMID0 no
+[   16.900077]: RDNA4FB: compute: pool: VRAM+0x8000000, 128 MiB (MC 0x8008000000) reserved for compute
+[   16.900102]: RDNA4FB: compute: stages 2..7 continue on the bring-up thread
+[   16.900105]: RDNA4FB: ndrv: Open -> 0x0
+[   16.900115]: RDNA4FB: ndrv: Status csc 32 -> 0xe00002c7 (boot)
+[   16.900118]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   16.900119]: RDNA4FB: ndrv: Control csc 5 -> 0xe00002c7 (boot)
+[   16.900120]: RDNA4FB: ndrv: Control csc 29 -> 0xe00002c7 (boot)
+[   16.900122]: RDNA4FB: ndrv: Status csc 30 -> 0xe00002c7 (boot)
+[   16.900124]: RDNA4FB: ndrv: Status csc 35 -> 0xe00002c7 (boot)
+[   16.900127]: RDNA4FB: ndrv: Status csc 8 -> 0xe00002c7 (boot)
+[   16.900129]: RDNA4FB: ndrv: Status csc 20 -> 0xe00002c7 (boot)
+[   16.900134]: RDNA4FB: ndrv: Status csc 12 -> 0x0 (rdna4)
+[   16.900136]: RDNA4FB: ndrv: Status csc 17 -> 0x0 (rdna4)
+[   16.900137]: RDNA4FB: ndrv: Status csc 13 -> 0x0 (rdna4)
+[   16.900138]: RDNA4FB: ndrv: Status csc 17 -> 0x0 (rdna4)
+[   16.900139]: RDNA4FB: ndrv: Control csc 6 -> 0xe00002c7 (boot)
+[   16.900140]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   16.900141]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   16.900142]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.900143]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.900144]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.900145]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.900146]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.900147]: RDNA4FB: ndrv: Status csc 13 -> 0x0 (rdna4)
+[   16.900149]: RDNA4FB: ndrv: Control csc 16 -> 0xe00002c7 (boot)
+[   16.900151]: RDNA4FB: ndrv: Status csc 25 -> 0xe00002c7 (boot)
+[   16.900202]: RDNA4FB: ndrv: Status csc 22 -> 0xe00002c7 (boot)
+[   16.900205]: RDNA4FB: ndrv: Status csc 38 -> 0xe00002c7 (boot)
+[   16.900207]: RDNA4FB: ndrv: Status csc 12 -> 0x0 (rdna4)
+[   16.900209]: RDNA4FB: ndrv: Status csc 17 -> 0x0 (rdna4)
+[   16.900209]: RDNA4FB: ndrv: Status csc 13 -> 0x0 (rdna4)
+[   16.900210]: RDNA4FB: ndrv: Status csc 17 -> 0x0 (rdna4)
+[   16.900212]: RDNA4FB: ndrv: Status csc 39 -> 0xe00002c7 (boot)
+[   16.900300]: RDNA4FB: ndrv: Status csc 12 -> 0x0 (rdna4)
+[   16.900304]: RDNA4FB: ndrv: Status csc 12 -> 0x0 (rdna4)
+[   16.900305]: RDNA4FB: ndrv: Status csc 27 -> 0x0 (rdna4)
+[   16.900306]: RDNA4FB: ndrv: Status csc 27 -> 0x0 (rdna4)
+[   16.900308]: RDNA4FB: ndrv: Status csc 12 -> 0x0 (rdna4)
+[   16.900338]: loadPrefs: IOService:/AppleACPIPlatformExpert/PCI0@0/AppleACPIPCI/GPP0@1,1/IOPP/SWUS@0/IOPP/SWDS@0/IOPP/VGA@0-5925-2700-cdd91ff80a719044 creating preferences under new keyRDNA4FB: ndrv: Status csc 12 -> 0x0 (rdna4)
+[   16.906404]: RDNA4FB: ndrv: Status csc 17 -> 0x0 (rdna4)
+[   16.906413]: RDNA4FB: ndrv: Status csc 17 -> 0x0 (rdna4)
+[   16.906428]: RDNA4FB: ndrv: Status csc 17 -> 0x0 (rdna4)
+[   16.906431]: RDNA4FB: ndrv: Status csc 17 -> 0x0 (rdna4)
+[   16.906432]: RDNA4FB: ndrv: Status csc 17 -> 0x0 (rdna4)
+[   16.906433]: RDNA4FB: ndrv: Status csc 17 -> 0x0 (rdna4)
+[   16.906445]: RDNA4FB: ndrv: Status csc 17 -> 0xe00002c2 (rdna4)
+[   16.906447]: RDNA4FB: ndrv: Status csc 17 -> 0x0 (rdna4)
+[   16.906451]: RDNA4FB: ndrv: Status csc 13 -> 0x0 (rdna4)
+[   16.906453]: RDNA4FB: ndrv: Status csc 13 -> 0x0 (rdna4)
+[   16.906454]: RDNA4FB: ndrv: Status csc 31 -> 0x0 (rdna4)
+[   16.906456]: RDNA4FB: ndrv: Status csc 36 -> 0xe00002c7 (boot)
+[   16.906575]: RDNA4FB: ndrv: Status csc 38 -> 0xe00002c7 (boot)
+[   16.906579]: RDNA4FB: ndrv: Status csc 38 -> 0xe00002c7 (boot)
+[   16.906580]: RDNA4FB: ndrv: Status csc 38 -> 0xe00002c7 (boot)
+[   16.906581]: RDNA4FB: ndrv: Status csc 38 -> 0xe00002c7 (boot)
+[   16.906582]: RDNA4FB: ndrv: Status csc 38 -> 0xe00002c7 (boot)
+[   16.906584]: RDNA4FB: ndrv: Status csc 38 -> 0xe00002c7 (boot)
+[   16.906713]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   16.909493]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   16.909503]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   16.909593]: RDNA4FB: ndrv: Status csc 13 -> 0x0 (rdna4)
+[   16.909595]: RDNA4FB: ndrv: switch to mode 100 -> 0x0 (rdna4)
+[   16.909596]: RDNA4FB: ndrv: Control csc 10 -> 0x0 (rdna4)
+[   16.909598]: RDNA4FB: ndrv: Control csc 2 -> 0xe00002c7 (boot)
+[   16.909600]: RDNA4FB: ndrv: Control csc 6 -> 0xe00002c7 (boot)
+[   16.909601]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   16.909602]: RDNA4FB: ndrv: Status csc 13 -> 0x0 (rdna4)
+[   16.909604]: RDNA4FB: ndrv: Status csc 39 -> 0xe00002c7 (boot)
+[   16.909606]: RDNA4FB: ndrv: Status csc 39 -> 0xe00002c7 (boot)
+[   16.909613]: RDNA4FB: ndrv: Status csc 22 -> 0xe00002c7 (boot)
+[   16.909615]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   16.909617]: RDNA4FB: ndrv: Status csc 13 -> 0x0 (rdna4)
+[   16.909618]: RDNA4FB: ndrv: Status csc 31 -> 0x0 (rdna4)
+[   16.909619]: RDNA4FB: ndrv: Status csc 36 -> 0xe00002c7 (boot)
+[   16.909623]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   16.909624]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   16.909748]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.909750]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.909752]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.909753]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.909754]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.909755]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.909757]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.910907]: RDNA4FB: ndrv: Status csc 22 -> 0xe00002c7 (boot)
+[   16.910910]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   16.910911]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.910913]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.910914]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.910915]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.910916]: RDNA4FB: ndrv: Status csc 18 -> 0xe00002c2 (rdna4)
+[   16.910917]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   16.910919]: RDNA4FB: ndrv: Status csc 13 -> 0x0 (rdna4)
+[   16.910920]: RDNA4FB: ndrv: Status csc 31 -> 0x0 (rdna4)
+[   16.910921]: RDNA4FB: ndrv: Status csc 36 -> 0xe00002c7 (boot)
+[   17.447830]: filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>filecache_entry_invalidate: invalidating <ptr>RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   17.622806]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   17.623124]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   17.623128]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   17.623784]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   17.623789]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   17.623796]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   17.623797]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   17.623827]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   17.623830]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   17.623833]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   17.623834]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   17.623860]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   17.623862]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   17.623865]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   17.623866]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   17.623892]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   17.623894]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   17.623897]: RDNA4FB: ndrv: Status csc 18 -> 0x0 (rdna4)
+[   17.623898]: RDNA4FB: ndrv: Status csc 10 -> 0x0 (rdna4)
+[   17.623947]: RDNA4FB: ndrv: Control csc 16 -> 0xe00002c7 (boot)
+[   17.624035]: RDNA4FB: ndrv: Control csc 4 -> 0x0 (boot)
+[   20.685844]: bpf0 attached to en0 by configd:38bpf0 closed and detached from en0 fcount 0 dcount 0 by configd:38bpf0 attached to en0 by configd:38bpf0 closed and detached from en0 fcount 0 dcount 0 by configd:38bpf0 attached to en0 by configd:38RDNA4FB: compute: previous boot's bring-up ended at: finished at stage 7
+[   21.901214]: RDNA4FB: compute: psp: pool mapped at VRAM+0x8000000 (MC 0x8008000000), first dwords 00000000 00000000 00000000 00000000
+[   21.901220]: RDNA4FB: compute: psp: firmware sOS 0x003a1214 (11 parts), SMU 327168 bytes
+[   21.995878]: RDNA4FB: compute: psp: bootloader: sOS running (0x047f1946), 9 component(s) loaded
+[   22.018734]: RDNA4FB: compute: psp: ring created (C2PMSG_64=0x80c20000)
+[   22.045577]: RDNA4FB: compute: psp: LOAD_TOC status 0x0, TMR size 0x0
+[   22.078366]: RDNA4FB: compute: psp: LOAD_IP_FW(SMU) LOAD_IP_FW status 0x0, TMR address 0x0000000000000000
+[   22.083007]: RDNA4FB: compute: psp: SMU answers: TestMessage ok, PMFW version 0x00685000 (104.80.0)
+[   22.083019]: RDNA4FB: compute: gfx: 19 firmware images for the RLC autoload
+[   22.088435]: RDNA4FB: compute: gfx: LOAD_IP_FW SDMA_RS64             type 71   46848 bytes -> LOAD_IP_FW (0x0)
+[   22.095347]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_PFP              type 87   92512 bytes -> LOAD_IP_FW (0x0)
+[   22.107054]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_ME               type 88  201024 bytes -> LOAD_IP_FW (0x0)
+[   22.117744]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_MEC              type 89  189152 bytes -> LOAD_IP_FW (0x0)
+[   22.125359]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_PFP_P0_STACK     type 90  262144 bytes -> LOAD_IP_FW (0x0)
+[   22.132292]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_ME_P0_STACK      type 92  262144 bytes -> LOAD_IP_FW (0x0)
+[   22.139265]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_MEC_P0_STACK     type 94  262144 bytes -> LOAD_IP_FW (0x0)
+[   22.146209]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_MEC_P1_STACK     type 95  262144 bytes -> LOAD_IP_FW (0x0)
+[   22.158030]: RDNA4FB: compute: gfx: LOAD_IP_FW CP_MES                type 33  209888 bytes -> LOAD_IP_FW (0x0)
+[   22.167511]: RDNA4FB: compute: gfx: LOAD_IP_FW CP_MES_DATA           type 34  524288 bytes -> LOAD_IP_FW (0x0)
+[   22.179342]: RDNA4FB: compute: gfx: LOAD_IP_FW CP_MES1               type 81  209888 bytes -> LOAD_IP_FW (0x0)
+[   22.188624]: RDNA4FB: compute: gfx: LOAD_IP_FW CP_MES1_DATA          type 82  524288 bytes -> LOAD_IP_FW (0x0)
+[   22.195369]: RDNA4FB: compute: gfx: LOAD_IP_FW IMU_I                 type 68   66048 bytes -> LOAD_IP_FW (0x0)
+[   22.200983]: RDNA4FB: compute: gfx: LOAD_IP_FW IMU_D                 type 69   66048 bytes -> LOAD_IP_FW (0x0)
+[   22.204940]: RDNA4FB: compute: gfx: LOAD_IP_FW RLC_RESTORE_LIST_GPM  type 20    2560 bytes -> LOAD_IP_FW (0x0)
+[   22.209264]: RDNA4FB: compute: gfx: LOAD_IP_FW RLC_RESTORE_LIST_SRM  type 21   23616 bytes -> LOAD_IP_FW (0x0)
+[   22.214938]: RDNA4FB: compute: gfx: LOAD_IP_FW RLC_IRAM              type 26   66048 bytes -> LOAD_IP_FW (0x0)
+[   22.219426]: RDNA4FB: compute: gfx: LOAD_IP_FW RLC_DRAM              type 48   33280 bytes -> LOAD_IP_FW (0x0)
+[   22.223677]: RDNA4FB: compute: gfx: LOAD_IP_FW RLC_G                 type  8   25088 bytes -> LOAD_IP_FW (0x0)
+[   22.225955]: RDNA4FB: compute: gfx: AUTOLOAD_RLC (0x0)
+[   22.225961]: RDNA4FB: compute: gfx: after AUTOLOAD_RLC: IMU core 0x00000008, GFX reset 0x00000030
+[   22.229040]: RDNA4FB: compute: smu: driver interface version 0x33 (resp 0x01; amdgpu expects 0x2e)
+[   22.231102]: RDNA4FB: compute: smu: running features before: 0x0000000000000000
+[   22.233568]: RDNA4FB: compute: smu: driver table at MC 0x8008600000 (resp 0x01/0x01)
+[   22.234617]: RDNA4FB: compute: smu: RunDcBtc -> 0x01
+[   22.236681]: RDNA4FB: compute: smu: allowed features 0xffff7efffffb2c67 -> 0xfd/0xfd (refused: SCPM, the pptable decides)
+[   22.276919]: RDNA4FB: compute: smu: EnableAllSmuFeatures(0) -> 0x01
+[   22.280018]: RDNA4FB: compute: smu: running features after: 0x048cf19e38fffcfb \M-b\M^@\M^T GFX_IMU on, GFXCLK DPM on, UCLK DPM on, FCLK DPM on, DCN DPM on, GFXOFF on, FW_CTF on, fan on (DisallowGfxOff 0x01)
+[   22.282554]: RDNA4FB: compute: gfx: RLC autoload complete: bootload 0x8000003f, IMU core 0x00000008, GFX reset 0x0000007f, RLC_CNTL 0x00000001, GRBM 0x0000382c, MEC 0x40030000
+[   22.282558]: RDNA4FB: compute: gfx: SDMA0 status 0x6e1ee557 (ucode init done), SDMA1 status 0x6e1ee557 (ucode init done)
+[   22.282575]: RDNA4FB: compute: gfx: GC hub now: fb base 0x00008000 top 0x000083fb offset 0x00000000, agp 0x00000000/0x00000000/0x00000000, sys_low 0x00200000, l2 0x00080602, ctx0 0x03fffc00, l1 tlb 0x00000501
+[   22.284631]: RDNA4FB: compute: gfx: RS64 microengines configured: CP_ME_CNTL 0x1500a000 CP_MEC_RS64_CNTL 0x40000000
+[   22.286773]: RDNA4FB: compute: sdma: GC hub up: fb 0x00008000..0x000083fb sys 0x00200000..0x0020feff l1 0x00001859 l2 0x00080601 ctx0 0x03fffc01
+[   22.290943]: RDNA4FB: compute: sdma: MCUs unhalted: SDMA0 status 0x6e1ee557 (ucode init done), SDMA1 status 0x6e1ee557
+[   22.291031]: RDNA4FB: compute: sdma: SDMA0 status 0x6e1ee557 rb_cntl 0x00841815 rptr 0x0 wptr 0x0 mcu 0x00000000, rptr writeback 0x0
+[   22.291043]: RDNA4FB: compute: sdma: GC hub fault status 0x00000000 (no fault), address 0x0
+[   22.294185]: RDNA4FB: compute: sdma: WRITE_LINEAR through the doorbell: landed
+[   22.294191]: RDNA4FB: compute: sdma: WRITE_LINEAR landed: the GPU wrote 0xDEADBEEF to VRAM
+[   22.296672]: RDNA4FB: compute: sdma: CONST_FILL 1 MiB fenced in 105 us: every sampled dword matches, guards intact
+[   22.298777]: RDNA4FB: compute: mec: MEC entry 0x0007000000003000, CP_MEC_RS64_CNTL 0x3c000000
+[   22.300810]: RDNA4FB: compute: mec: doorbells before: aperture 0x00000001, S2A entry0 0x00000000 entry3 0x00000000
+[   22.302974]: RDNA4FB: compute: mec: HQD ME1/pipe0/queue0: active 1, PQ_CONTROL 0xd0308909, doorbell dword 6
+[   22.304025]: RDNA4FB: compute: mec: plain queue: WRITE_DATA landed
+[   22.306163]: RDNA4FB: compute: mec: PM4 on the MEC: SCRATCH_REG0 0xdeadbeef (ok), WRITE_DATA 0x600df00d (ok), RELEASE_MEM fence signalled
+[   22.310823]: RDNA4FB: compute: dispatch: kernel ran on the compute units: all 256 work-items wrote their result (buffer[255] = 0x5eed02fd) in 77 us, sentinel intact
+[   22.312835]: RDNA4FB: compute: kernel: vadd: 640 bytes of code, 24 of kernargs, RSRC1 0x600f0040 RSRC2 0x00000084 RSRC3 0x00000000, 2 user SGPRs, wave32
+[   22.324190]: RDNA4FB: compute: kernel: clang's vadd ran from its code object: all 4096 results right (c[4095] = 0xe872973e) in 91 us, sentinel intact
+[   22.326240]: RDNA4FB: compute: bring-up finished at stage 7
+[   22.358624]: RDNA4FB: runtime: dma: on \M-b\M^@\M^T bounce buffer 16 MiB at bus 0x25a0a000, AGP aperture MC 0x8400000000..0x8426a09fff; self-test ok; SDMA host->VRAM 12516 MB/s, VRAM->host 12921 MB/s
+[   22.358698]: RDNA4FB: runtime: dma: buffers from VRAM+0x10000000..+0x1fd800000 (7896 MiB, past the BAR)
+[   22.358756]: RDNA4FB: runtime: user-space runtime up: RDNA4ComputeService, DMA transfers, 7896 MiB of VRAM for buffers at MC 0x8010000000
+
+=== dmesg: discovery / variant ===
+[   16.691560]: 1 duplicate report for Sandbox: iconservicesagent(130) deny(1) mach-lookup com.apple.tccd.systemSandbox: iconservicesagent(130) deny(1) mach-lookup com.apple.windowserver.activeRDNA4FB: discovery: not present in image (inject the full 2MiB flash dump to enable)
+[   16.691721]: Sandbox: iconservicesagent(130) deny(1) mach-lookup com.apple.windowserverSandbox: iconservicesagent(130) deny(1) mach-lookup com.apple.windowserver.activeSandbox: iconservicesagent(130) deny(1) mach-lookup com.apple.windowserverRDNA4FB: discovery: on-die TMR at vram+0x3faff0000, first dwords 28211407 00030001
+[   16.695415]: RDNA4FB: discovery: on-die binary valid, 46 IPs (no ROM injection needed)
+
+=== dmesg: EDID / I2C / HPD ===
+[   16.691579]: RDNA4FB: cmd: setpixelclock absent
+[   16.691580]: RDNA4FB: cmd: dig1transmittercontrol absent
+[   16.691581]: RDNA4FB: cmd: digxencodercontrol absent
+[   16.691582]: RDNA4FB: cmd: enablecrtc absent
+[   16.691583]: RDNA4FB: cmd: setcrtc_usingdtdtiming absent
+[   16.691584]: RDNA4FB: cmd: enabledisppowergating absent
+[   16.875578]: RDNA4FB: edid: HPD_Y=0x01000000 (hpd1=0 hpd2=0 hpd3=0 hpd4=1)
+[   16.875595]: RDNA4FB: edid: connector 0 (AUX0): no reply
+[   16.875612]: RDNA4FB: edid: connector 1 (AUX1): no reply
+[   16.875630]: RDNA4FB: edid: connector 2 (AUX2): no reply
+[   16.887777]: RDNA4FB: edid: connector 3 (DDC3): VIE product 0x2700 EDID 1.3
+[   16.887782]: RDNA4FB: edid: connector 3 (DDC3): preferred 1920x1080@60.000Hz pclk=148500kHz h(blank=280 fp=88 sw=44 +) v(blank=45 fp=4 sw=5 +)
+[   16.899919]: RDNA4FB: edid: connector 3 (DDC3): read extension block (tag 0x02)
+
+=== dmesg: lit pipe + boot timing ===
+[   16.695455]: RDNA4FB: pipe: lit pipe OTG0 DIG3 -> link3 (HPD3) OPP0 HUBP0, signal DVI
+[   16.695457]: RDNA4FB: pipe: OTG h_total=0x00000897 h_blank=0x00c00840 h_sync=0x002c0000 v_total=0x00000464 v_blank=0x00290461 v_sync=0x00050000 pol h+ v+; HUBP viewport 1920x1080 pitch 1920 px
+[   16.875478]: RDNA4FB: pipe: boot timing 1920x1080, h 88/44/280 v 4/5/45, frame 16666597 ns -> pixel clock ~148501 kHz (60.000 Hz)
+
+=== dmesg: display modes ===
+[   16.899944]: RDNA4FB: modes: id 1 1920x1080@60.000 148501 kHz (live)
+[   16.899946]: RDNA4FB: modes: 1 mode(s), switching off (boot mode only)
+
+=== dmesg: display power (sleep/wake) ===
+
+=== dmesg: HW cursor (incl. vm routing + curtest) ===
+
+=== DMUB mailbox + GOP command history ===
+(inactive — add rdna4-dmubping=1 to boot-args)
+
+=== DMUB firmware fingerprint (dialect check vs amdgpu) ===
+(inactive — add rdna4-dmubver=1 to boot-args)
+
+=== SMU handshake ===
+(inactive — add rdna4-smuping=1 to boot-args)
+
+=== interrupt-delivery survey ===
+(inactive — add rdna4-ihdump=1 to boot-args)
+
+=== PSP status ===
+[   16.899931]: RDNA4FB: psp: boot(C2PMSG_35)=0x80000000 sos(C2PMSG_81)=0x00000000 ring(C2PMSG_64)=0x00000000
+[   16.899940]: RDNA4FB: psp: ring regs 69/70/71 = 0x00000000 0x00000000 0x00000000, fw ver 58/59 = 0x00000000 0x00000000
+[   16.899941]: RDNA4FB: psp: verdict: bootloader READY, sOS not running, GPCOM ring not configured
+
+=== dmesg: emulated VBL ===
+
+=== mode-setting survey ===
+(inactive — add rdna4-modedump=1 to boot-args)
+
+=== compute bring-up (rdna4-compute=<stage>) ===
+[   16.899952]: RDNA4FB: compute: bring-up to stage 7 requested
+[   16.900032]: RDNA4FB: compute: display memory: DMUB mailbox (region4) at VRAM+0x3dac00000
+[   16.900037]: RDNA4FB: compute: display memory: HUBP0 surface at VRAM+0x0
+[   16.900046]: RDNA4FB: compute: GC 12.0.1, registers readable
+[   16.900048]: RDNA4FB: compute: grbm status=0x00000000 status2=0x00000000 cp_stat=0x00000000 cpc=0x00000000 cpf=0x00000000
+[   16.900049]: RDNA4FB: compute: cp me_cntl=0x00000000 mec_rs64_cntl=0x00000000 mes_cntl=0x00000000 pc pfp=0x0 me=0x0 mec=0x0
+[   16.900051]: RDNA4FB: compute: rlc cntl=0x00000000 stat=0x00000000 gpm_stat=0x00000000 bootload=0x00000000
+[   16.900052]: RDNA4FB: compute: imu core_ctrl=0x00000009 gfx_reset_ctrl=0x00000030
+[   16.900053]: RDNA4FB: compute: sdma0 mcu_cntl=0x00000000 status=0x00000000 ucode_rev=0x00000000 rb_cntl=0x00000000
+[   16.900055]: RDNA4FB: compute: sdma1 mcu_cntl=0x00000000 status=0x00000000 ucode_rev=0x00000000 rb_cntl=0x00000000
+[   16.900056]: RDNA4FB: compute: gchub fb base=0x00000000 top=0x00000000 offset=0x00000000 agp base=0x00000000 bot=0x00000000 top=0x00000000 sys_low=0x00000000
+[   16.900058]: RDNA4FB: compute: gchub l2_cntl=0x00000000 ctx0_cntl=0x00000000 ctx0_pt=0x0000000000000000
+[   16.900059]: RDNA4FB: compute: mmhub fb base=0x00008000 top=0x000083fb offset=0x00000000 agp base=0x00000000 bot=0x00000000 top=0x00000000 sys 0x00200000..0x0020feff
+[   16.900061]: RDNA4FB: compute: mmhub l2_cntl=0x00080602 ctx0_cntl=0x03fffc00 ctx0_pt=0x0000000000000000
+[   16.900063]: RDNA4FB: compute: psp boot=0x80000000 ring=0x00000000 sos=0x00000000
+[   16.900064]: RDNA4FB: compute: hdp flush remap mem=0x0000385c reg=0x00003858
+[   16.900065]: RDNA4FB: compute: memory: VRAM 16304 MiB, MC 0x8000000000..0x83fbffffff, BAR0 0xd0000000 (256 MiB), BAR2 2048 KiB, scanout at VRAM+0x0 (8100 KiB)
+[   16.900068]: RDNA4FB: compute: verdict: PSP sOS not running, bootloader ready, KM ring not created
+[   16.900069]: RDNA4FB: compute: verdict: GFX: IMU held in reset, GFX domains in reset, RLC disabled (bootload not complete), PFP not halted, ME not halted, MEC not halted (pipes 0x0), MES not halted
+[   16.900072]: RDNA4FB: compute: verdict: SDMA0: MCU not halted, ucode init not done, queue0 disabled
+[   16.900073]: RDNA4FB: compute: verdict: SDMA1: MCU not halted, ucode init not done, queue0 disabled
+[   16.900074]: RDNA4FB: compute: verdict: GC hub FB aperture NOT set, L2 no, VMID0 no
+[   16.900075]: RDNA4FB: compute: verdict: MM hub FB aperture set, L2 no, VMID0 no
+[   16.900077]: RDNA4FB: compute: pool: VRAM+0x8000000, 128 MiB (MC 0x8008000000) reserved for compute
+[   16.900102]: RDNA4FB: compute: stages 2..7 continue on the bring-up thread
+[   20.685844]: bpf0 attached to en0 by configd:38bpf0 closed and detached from en0 fcount 0 dcount 0 by configd:38bpf0 attached to en0 by configd:38bpf0 closed and detached from en0 fcount 0 dcount 0 by configd:38bpf0 attached to en0 by configd:38RDNA4FB: compute: previous boot's bring-up ended at: finished at stage 7
+[   21.901214]: RDNA4FB: compute: psp: pool mapped at VRAM+0x8000000 (MC 0x8008000000), first dwords 00000000 00000000 00000000 00000000
+[   21.901220]: RDNA4FB: compute: psp: firmware sOS 0x003a1214 (11 parts), SMU 327168 bytes
+[   21.995878]: RDNA4FB: compute: psp: bootloader: sOS running (0x047f1946), 9 component(s) loaded
+[   22.018734]: RDNA4FB: compute: psp: ring created (C2PMSG_64=0x80c20000)
+[   22.045577]: RDNA4FB: compute: psp: LOAD_TOC status 0x0, TMR size 0x0
+[   22.078366]: RDNA4FB: compute: psp: LOAD_IP_FW(SMU) LOAD_IP_FW status 0x0, TMR address 0x0000000000000000
+[   22.083007]: RDNA4FB: compute: psp: SMU answers: TestMessage ok, PMFW version 0x00685000 (104.80.0)
+[   22.083019]: RDNA4FB: compute: gfx: 19 firmware images for the RLC autoload
+[   22.088435]: RDNA4FB: compute: gfx: LOAD_IP_FW SDMA_RS64             type 71   46848 bytes -> LOAD_IP_FW (0x0)
+[   22.095347]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_PFP              type 87   92512 bytes -> LOAD_IP_FW (0x0)
+[   22.107054]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_ME               type 88  201024 bytes -> LOAD_IP_FW (0x0)
+[   22.117744]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_MEC              type 89  189152 bytes -> LOAD_IP_FW (0x0)
+[   22.125359]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_PFP_P0_STACK     type 90  262144 bytes -> LOAD_IP_FW (0x0)
+[   22.132292]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_ME_P0_STACK      type 92  262144 bytes -> LOAD_IP_FW (0x0)
+[   22.139265]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_MEC_P0_STACK     type 94  262144 bytes -> LOAD_IP_FW (0x0)
+[   22.146209]: RDNA4FB: compute: gfx: LOAD_IP_FW RS64_MEC_P1_STACK     type 95  262144 bytes -> LOAD_IP_FW (0x0)
+[   22.158030]: RDNA4FB: compute: gfx: LOAD_IP_FW CP_MES                type 33  209888 bytes -> LOAD_IP_FW (0x0)
+[   22.167511]: RDNA4FB: compute: gfx: LOAD_IP_FW CP_MES_DATA           type 34  524288 bytes -> LOAD_IP_FW (0x0)
+[   22.179342]: RDNA4FB: compute: gfx: LOAD_IP_FW CP_MES1               type 81  209888 bytes -> LOAD_IP_FW (0x0)
+[   22.188624]: RDNA4FB: compute: gfx: LOAD_IP_FW CP_MES1_DATA          type 82  524288 bytes -> LOAD_IP_FW (0x0)
+[   22.195369]: RDNA4FB: compute: gfx: LOAD_IP_FW IMU_I                 type 68   66048 bytes -> LOAD_IP_FW (0x0)
+[   22.200983]: RDNA4FB: compute: gfx: LOAD_IP_FW IMU_D                 type 69   66048 bytes -> LOAD_IP_FW (0x0)
+[   22.204940]: RDNA4FB: compute: gfx: LOAD_IP_FW RLC_RESTORE_LIST_GPM  type 20    2560 bytes -> LOAD_IP_FW (0x0)
+[   22.209264]: RDNA4FB: compute: gfx: LOAD_IP_FW RLC_RESTORE_LIST_SRM  type 21   23616 bytes -> LOAD_IP_FW (0x0)
+[   22.214938]: RDNA4FB: compute: gfx: LOAD_IP_FW RLC_IRAM              type 26   66048 bytes -> LOAD_IP_FW (0x0)
+[   22.219426]: RDNA4FB: compute: gfx: LOAD_IP_FW RLC_DRAM              type 48   33280 bytes -> LOAD_IP_FW (0x0)
+[   22.223677]: RDNA4FB: compute: gfx: LOAD_IP_FW RLC_G                 type  8   25088 bytes -> LOAD_IP_FW (0x0)
+[   22.225955]: RDNA4FB: compute: gfx: AUTOLOAD_RLC (0x0)
+[   22.225961]: RDNA4FB: compute: gfx: after AUTOLOAD_RLC: IMU core 0x00000008, GFX reset 0x00000030
+[   22.229040]: RDNA4FB: compute: smu: driver interface version 0x33 (resp 0x01; amdgpu expects 0x2e)
+[   22.231102]: RDNA4FB: compute: smu: running features before: 0x0000000000000000
+[   22.233568]: RDNA4FB: compute: smu: driver table at MC 0x8008600000 (resp 0x01/0x01)
+[   22.234617]: RDNA4FB: compute: smu: RunDcBtc -> 0x01
+[   22.236681]: RDNA4FB: compute: smu: allowed features 0xffff7efffffb2c67 -> 0xfd/0xfd (refused: SCPM, the pptable decides)
+[   22.276919]: RDNA4FB: compute: smu: EnableAllSmuFeatures(0) -> 0x01
+[   22.280018]: RDNA4FB: compute: smu: running features after: 0x048cf19e38fffcfb \M-b\M^@\M^T GFX_IMU on, GFXCLK DPM on, UCLK DPM on, FCLK DPM on, DCN DPM on, GFXOFF on, FW_CTF on, fan on (DisallowGfxOff 0x01)
+[   22.282554]: RDNA4FB: compute: gfx: RLC autoload complete: bootload 0x8000003f, IMU core 0x00000008, GFX reset 0x0000007f, RLC_CNTL 0x00000001, GRBM 0x0000382c, MEC 0x40030000
+[   22.282558]: RDNA4FB: compute: gfx: SDMA0 status 0x6e1ee557 (ucode init done), SDMA1 status 0x6e1ee557 (ucode init done)
+[   22.282575]: RDNA4FB: compute: gfx: GC hub now: fb base 0x00008000 top 0x000083fb offset 0x00000000, agp 0x00000000/0x00000000/0x00000000, sys_low 0x00200000, l2 0x00080602, ctx0 0x03fffc00, l1 tlb 0x00000501
+[   22.284631]: RDNA4FB: compute: gfx: RS64 microengines configured: CP_ME_CNTL 0x1500a000 CP_MEC_RS64_CNTL 0x40000000
+[   22.286773]: RDNA4FB: compute: sdma: GC hub up: fb 0x00008000..0x000083fb sys 0x00200000..0x0020feff l1 0x00001859 l2 0x00080601 ctx0 0x03fffc01
+[   22.290943]: RDNA4FB: compute: sdma: MCUs unhalted: SDMA0 status 0x6e1ee557 (ucode init done), SDMA1 status 0x6e1ee557
+[   22.291031]: RDNA4FB: compute: sdma: SDMA0 status 0x6e1ee557 rb_cntl 0x00841815 rptr 0x0 wptr 0x0 mcu 0x00000000, rptr writeback 0x0
+[   22.291043]: RDNA4FB: compute: sdma: GC hub fault status 0x00000000 (no fault), address 0x0
+[   22.294185]: RDNA4FB: compute: sdma: WRITE_LINEAR through the doorbell: landed
+[   22.294191]: RDNA4FB: compute: sdma: WRITE_LINEAR landed: the GPU wrote 0xDEADBEEF to VRAM
+[   22.296672]: RDNA4FB: compute: sdma: CONST_FILL 1 MiB fenced in 105 us: every sampled dword matches, guards intact
+[   22.298777]: RDNA4FB: compute: mec: MEC entry 0x0007000000003000, CP_MEC_RS64_CNTL 0x3c000000
+[   22.300810]: RDNA4FB: compute: mec: doorbells before: aperture 0x00000001, S2A entry0 0x00000000 entry3 0x00000000
+[   22.302974]: RDNA4FB: compute: mec: HQD ME1/pipe0/queue0: active 1, PQ_CONTROL 0xd0308909, doorbell dword 6
+[   22.304025]: RDNA4FB: compute: mec: plain queue: WRITE_DATA landed
+[   22.306163]: RDNA4FB: compute: mec: PM4 on the MEC: SCRATCH_REG0 0xdeadbeef (ok), WRITE_DATA 0x600df00d (ok), RELEASE_MEM fence signalled
+[   22.310823]: RDNA4FB: compute: dispatch: kernel ran on the compute units: all 256 work-items wrote their result (buffer[255] = 0x5eed02fd) in 77 us, sentinel intact
+[   22.312835]: RDNA4FB: compute: kernel: vadd: 640 bytes of code, 24 of kernargs, RSRC1 0x600f0040 RSRC2 0x00000084 RSRC3 0x00000000, 2 user SGPRs, wave32
+[   22.324190]: RDNA4FB: compute: kernel: clang's vadd ran from its code object: all 4096 results right (c[4095] = 0xe872973e) in 91 us, sentinel intact
+[   22.326240]: RDNA4FB: compute: bring-up finished at stage 7
+
+=== compute NVRAM trail (last step reached) ===
+4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail	finished at stage 7
+
+=== user-space compute runtime (rdna4-run selftest) ===
+ABI 3, bring-up stage 7, ready
+heap: 7896 MiB, 7896 MiB free, GPU base 0x8010000000
+transfers: DMA by the GPU's copy engine; buffers from VRAM past the BAR
+vadd: 12288-byte image, 24 bytes of kernargs, RSRC1 0x600f0040 RSRC2 0x00000084
+buffers: a 0x8010000000, b 0x8010040000, c 0x8010080000 (256 KiB each)
+  ok    65536 items of c = a + 3b right, 94 us on the GPU
+  FAIL  round 39: (iokit/common) General I/O error
+  FAIL  lds_reverse: (iokit/common) General I/O error
+  ok    a dispatch asking for more than 64 KiB of LDS refused ((iokit/common) invalid argument)
+  FAIL  512 MiB buffer at +0x0: (iokit/common) General I/O error
+  ok    a dispatch of a stale program handle refused ((iokit/common) invalid argument)
+  ok    a 2048-item work-group refused ((iokit/common) invalid argument)
+  ok    a read past the end of a buffer refused ((iokit/common) invalid argument)
+  ok    a kernel that is not in the code object refused ((iokit/common) data was not found)
+  ok    a truncated code object refused ((iokit/common) data was not found)
+  ok    a second free of the same buffer refused ((iokit/common) invalid argument)
+selftest: FAILED
+(rdna4-run exited 1)
+
+=== compute benchmarks (rdna4-run bench) ===
+ABI 3, bring-up stage 7, ready
+heap: 7896 MiB, 7896 MiB free, GPU base 0x8010000000
+transfers: DMA by the GPU's copy engine; buffers from VRAM past the BAR
+sgemm: 64x64 tiles, 16x16 work-items, 8320 bytes of LDS per work-group
+  FAIL  host<->GPU copy of 256 MiB: (iokit/common) General I/O error
+  FAIL  VRAM copy: data differs
+  FAIL  sgemm n=64: (iokit/common) General I/O error
+bench: FAILED
+(rdna4-run bench exited 1)
+[   22.358624]: RDNA4FB: runtime: dma: on \M-b\M^@\M^T bounce buffer 16 MiB at bus 0x25a0a000, AGP aperture MC 0x8400000000..0x8426a09fff; self-test ok; SDMA host->VRAM 12516 MB/s, VRAM->host 12921 MB/s
+[   22.358698]: RDNA4FB: runtime: dma: buffers from VRAM+0x10000000..+0x1fd800000 (7896 MiB, past the BAR)
+[   22.358756]: RDNA4FB: runtime: user-space runtime up: RDNA4ComputeService, DMA transfers, 7896 MiB of VRAM for buffers at MC 0x8010000000
+[   38.463973]: RDNA4FB: runtime: loaded "vadd": 12288-byte image at MC 0x800a000000, entry +0x1600, 24 bytes of kernargs, 0 of LDS
+[   40.471943]: RDNA4FB: runtime: dma: SDMA fence 86 never came (0x00000055)
+[   40.472557]: RDNA4FB: runtime: loaded "lds_reverse": 16384-byte image at MC 0x800a004000, entry +0x1d00, 24 bytes of kernargs, 256 of LDS
+[   42.473539]: RDNA4FB: runtime: dma: SDMA fence 87 never came (0x00000055)
+[   44.475736]: RDNA4FB: runtime: dma: SDMA fence 88 never came (0x00000055)
+[   44.475808]: RDNA4FB: runtime: load of "vsub" refused: kernel descriptor <name>.kd not found
+[   44.475840]: RDNA4FB: runtime: load of "vadd" refused: bad section headers
+[   44.478074]: responsibility for rdna4-run[246] set to that of rdna4-run[246]: /System/Volumes/Data/private/tmp/rdna4-runRDNA4FB: runtime: loaded "copy": 16384-byte image at MC 0x800a000000, entry +0x1e00, 16 bytes of kernargs, 0 of LDS
+[   44.486854]: RDNA4FB: runtime: loaded "sgemm": 16384-byte image at MC 0x800a005000, entry +0x1f00, 28 bytes of kernargs, 8320 of LDS
+[   46.614306]: RDNA4FB: runtime: dma: SDMA fence 89 never came (0x00000055)
+[   48.615276]: RDNA4FB: runtime: dma: SDMA fence 90 never came (0x00000055)
+[   50.616342]: RDNA4FB: runtime: dma: SDMA fence 91 never came (0x00000055)
+[   52.636989]: RDNA4FB: runtime: dma: SDMA fence 92 never came (0x00000055)
+[   54.872061]: RDNA4FB: runtime: dma: SDMA fence 93 never came (0x00000055)
+
+=== ioreg: framebuffer properties ===
+    | |   |           | |   "VRAM,totalsize" = <0000000004000000>
+    | |   |           | |   "VRAM,totalMB" = 16384
+    | |   |           | | |   "AtomBIOS,ConnectorCount" = 4
+    | |   |           | | |   "Console,Length" = 8294400
+    | |   |           | | |   "Compute,Survey" = {"GCVM_L2_CNTL"=0,"SDMA0_MCU_CNTL"=0,"PoolOffset"=134217728,"GCVM_CTX0_CNTL"=0,"MMVM_L2_CNTL"=525826,"SDMA1_STATUS"=0,"GCMC_FB_TOP"=0,"HDP_MEM_FLUSH_REMAP"=14428,"PoolSize"=134217728,"GRBM_STATUS"=0,"IMU_CORE_CTRL"=9,"RLC_CNTL"=0,"PSP_SOS"=0,"PSP_BOOT"=18446744071562067968,"CP_ME_CNTL"=0,"RLC_BOOTLOAD_STATUS"=0,"VRAM_MiB"=16304,"CP_MEC_RS64_CNTL"=0,"CP_MES_CNTL"=0,"IMU_GFX_RESET_CTRL"=48,"GCMC_FB_BASE"=0,"GRBM_STATUS2"=0,"SDMA0_STATUS"=0,"MMMC_FB_BASE"=32768,"GCVersion"=786433,"MMMC_FB_TOP"=33787,"MMVM_CTX0_CNTL"=67107840,"ScanoutOffset"=0,"SDMA1_MCU_CNTL"=0}
+    | |   |           | | |   "Pipe,Link" = 3
+    | |   |           | | |   "Console,Depth" = 32
+    | |   |           | | |   "Pipe,BootMode" = "1920x1080@60.000"
+    | |   |           | | |   "Pipe,DIG" = 3
+    | |   |           | | |   "Pipe,MeasuredPixelClockKHz" = 148501
+    | |   |           | | |   "Console,Height" = 1080
+    | |   |           | | |   "AtomBIOS,FirmwareRevision" = 386400324
+    | |   |           | | |   "Compute,Dispatch" = {"Micros"=77,"WrongItems"=0,"Fenced"=1,"Items"=256,"SentinelIntact"=1}
+    | |   |           | | |   "Pipe,OTG" = 0
+    | |   |           | | |   "GPU,Variant" = "AMD Radeon RX 9070 XT"
+    | |   |           | | |   "MMIO,Verified" = Yes
+    | |   |           | | |   "Console,RowBytes" = 7680
+    | |   |           | | |   "AtomBIOS,ImageName" = "NAVI48.bin"
+    | |   |           | | |   "Compute,PSP" = {"SMULoadStatus"=0,"SMUAlive"=1,"SOSVersion"=75438406,"SMUVersion"=6836224,"RingCreated"=1,"BootloaderLoaded"=9,"TMRSize"=0,"TOCStatus"=0}
+    | |   |           | | |   "EDID,DDC3-Vendor" = "VIE"
+    | |   |           | | |   "Console,BaseAddress" = 3489660928
+    | |   |           | | |   "EDID,DDC3" = <00ffffffffffff00592500270100000028210103803c2178ea2d36a75438ae260d4f54a10800d1c0b3009500818081c081003b800101023a801871382d40582c45000f282100001e000000fc00484f52495a4f4e205a32370a20000000fd003a3e1e5310000a202020202020000000ff003030303030303030300a2020200183>
+    | |   |           | | |   "AtomBIOS,FirmwareCapability" = 16384
+    | |   |           | | |   "Pipe,HPD" = 3
+    | |   |           | | |   "Compute,GFX" = {"CP_STAT"=0,"IMU_GFX_RESET_CTRL"=127,"AutoloadStatus"=0,"SmuFeatures"=327902534754630907,"RLC_CNTL"=1,"SDMA1_STATUS"=1847518551,"GCMC_FB_BASE"=32768,"RLC_BOOTLOAD_STATUS"=2147483711,"SDMA0_STATUS"=1847518551,"ImagesLoaded"=19,"GCMC_FB_TOP"=33787,"IMU_CORE_CTRL"=8}
+    | |   |           | | |   "AtomBIOS,Connectors" = "DisplayPort/ddc0/hpd1,DisplayPort/ddc1/hpd2,DisplayPort/ddc2/hpd3,HDMI-A/ddc3/hpd4"
+    | |   |           | | |   "Compute,MEC" = {"WriteData"=1611526157,"ScratchReg"=3735928559,"Fence"=1,"QueueMode"=1}
+    | |   |           | | |   "Pipe,HUBP" = 0
+    | |   |           | | |   "Discovery,GCVersion" = "12.0.1"
+    | |   |           | | |   "Compute,Stage" = 7
+    | |   |           | | |   "Modes,Count" = 1
+    | |   |           | | |   "Compute,Kernel" = {"Fenced"=1,"Micros"=91,"SentinelIntact"=1,"Items"=4096,"KernargBytes"=24,"CodeBytes"=640,"Rsrc2"=132,"WrongItems"=0,"Rsrc1"=1611595840}
+    | |   |           | | |   "Compute,SDMA" = {"WriteTest"=1,"Doorbell"=1,"FillGuardsIntact"=1,"FillMicros"=105,"FillFenced"=1,"FillBadDwords"=0}
+    | |   |           | | |   "Console,Width" = 1920
+    | |   |           | | |   "Pipe,Signal" = "DVI"
+    | |   |           | | |   "VRAM,TotalMB" = 16304
+    | |   |           | | |   "Discovery,DCNVersion" = "4.1.0"
+    | |   |           | | |   "Discovery,Source" = "on-die TMR"
+    | | |   "Entries" = ({"IOName"="display","IOClass"="IOPCIDevice","class-code"=<00000300>,"model"=<"Unknown Unknown">,"device-id"=<10680000>,"vendor-id"=<02100000>,"revision-id"=<00000000>,"subsystem-id"=<00000000>},{"IOClass"="IOFramebuffer","IOName"="IOFB","ParentIndex"=0},{"IOName"="IOAccelerator","CFBundleIdentifier"="com.unknown.bundle","ParentIndex"=0,"IOClass"="IOAccelerator","PerformanceStatistics"={"vramFreeBytes"=15728640},"IOGLBundleName"="AppleMetalGLRenderer","MetalPluginName"="AGXMetalA12","VRAM,totalMB"=16384},{"IOClass"="IOService","IOName"="platform","IOPath"="IODeviceTree:/efi/platform","system-id"=<dc31d7e0351aea58b1b44cfc314aa1e6>},{"IOClass"="IOService","IOName"="memory","compat-dimm-serial-number"=<"0x01234567","0x76543210">,"IOPath"="IODeviceTree:/memory"})
+    | |         "IOCompatibilityProperties" = {"IOName"="IOAccelerator","CFBundleIdentifier"="com.unknown.bundle","ParentIndex"=0,"IOClass"="IOAccelerator","PerformanceStatistics"={"vramFreeBytes"=15728640},"IOGLBundleName"="AppleMetalGLRenderer","MetalPluginName"="AGXMetalA12","VRAM,totalMB"=16384}
+
+=== ioreg: what the OS sees (display identity) ===
+    | |   |           | | |       "DisplayProductID" = 9984
+    | |   |           | | |       "IODisplayEDID" = <00ffffffffffff00592500270100000028210103803c2178ea2d36a75438ae260d4f54a10800d1c0b3009500818081c081003b800101023a801871382d40582c45000f282100001e000000fc00484f52495a4f4e205a32370a20000000fd003a3e1e5310000a202020202020000000ff003030303030303030300a2020200183020330f14790050403230907230907078301000067030c001000382d681a00000101304cede60607015b5b0fe305c0002a4480a07038274030203500a05a0000001e011d00bc52d01e20b8285540a05a0000001e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000cc>
+    | |   |           | | |       "DisplayVendorID" = 22821
+
+=== WindowServer attached? ===
+2 IOFramebufferUserClient instance(s)

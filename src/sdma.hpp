@@ -48,23 +48,26 @@ uint32_t constFill(uint32_t *out, uint64_t addr, uint32_t pattern, uint32_t byte
 uint32_t copyLinear(uint32_t *out, uint64_t src, uint64_t dst, uint32_t bytes);
 
 // A ring of `sizeBytes` (power of two) at `cpu` (the GPU sees it at `mc`).
-// The write pointer counts bytes, as SDMA0_QUEUE0_RB_WPTR does.
+// The write pointer counts bytes and never wraps: SDMA 7 pointers are 64-bit
+// (amdgpu's support_64bit_ptrs), and a wptr that goes back to the ring's
+// start stalls the engine (seen on the card, 2026-09-28). Packets wrap in
+// memory; the pointer does not.
 class Ring {
 public:
 	bool init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes);
 	uint64_t mc() const { return base; }
 	uint32_t sizeBytes() const { return size; }
 	uint32_t sizeLog2Dwords() const;          // RB_SIZE field
-	uint32_t wptr() const { return wp; }      // bytes
+	uint64_t wptr() const { return wp; }      // bytes, monotonic
 
-	// Append a packet (dwords); wraps around the end of the ring.
+	// Append a packet (dwords); it wraps around the end of the ring.
 	bool emit(const uint32_t *dw, uint32_t count);
 
 private:
 	volatile uint32_t *ring { nullptr };
 	uint64_t base { 0 };
 	uint32_t size { 0 };
-	uint32_t wp { 0 };
+	uint64_t wp { 0 };
 };
 
 } // namespace Sdma

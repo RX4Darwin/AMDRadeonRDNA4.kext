@@ -201,7 +201,7 @@ private:
 	void logGcFault(const char *tag);   // GCVM_L2 protection fault status/address
 	bool sdmaStartMcus();               // sdma_v7_0_enable: unhalt before queue setup
 	bool sdmaQueueInit();
-	void sdmaKick(uint32_t wptrBytes);
+	void sdmaKick(uint64_t wptrBytes);
 	bool sdmaDoorbell { false };        // kick SDMA0 through its doorbell (amdgpu's way)
 	Sdma::Ring sdmaRing;                // SDMA0 queue 0: stage 4, then the runtime's DMA
 	uint32_t   sdmaFence { 0 };         // last FENCE value written by SDMA

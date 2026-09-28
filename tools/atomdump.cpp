@@ -1623,7 +1623,8 @@ static int testSdmaPackets() {
 	                  p[3] == 0x09002000 && p[5] == 0x10000000 && p[7] == 0,
 	                  "sdma: COPY_LINEAR %08x %08x", p[0], p[1]);
 
-	// Ring: 256-byte ring, wraps and keeps whole packets in order.
+	// Ring: 256-byte ring; packets wrap in memory, the wptr never does
+	// (SDMA 7's 64-bit pointers: a wptr back at the start stalls the card).
 	uint32_t mem[64];
 	Sdma::Ring r;
 	failures += check(r.init(mem, 0x8008800000ull, sizeof(mem)) && r.sizeLog2Dwords() == 6,
@@ -1631,7 +1632,8 @@ static int testSdmaPackets() {
 	bool ok = true;
 	for (int i = 0; i < 20 && ok; i++)
 		ok = r.emit(p, Sdma::writeDword(p, a, static_cast<uint32_t>(i)));
-	failures += check(ok && r.wptr() == (20 * 5 * 4) % 256, "sdma: ring wrap (wptr %u)", r.wptr());
+	failures += check(ok && r.wptr() == 20 * 5 * 4 && mem[((19 * 5 + 4) * 4 % 256) / 4] == 19,
+	                  "sdma: ring wrap (wptr %llu)", static_cast<unsigned long long>(r.wptr()));
 	failures += check(!r.init(mem, 0x8008800010ull, sizeof(mem)), "sdma: unaligned ring accepted");
 
 	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR encodings and ring wrap %s\n",

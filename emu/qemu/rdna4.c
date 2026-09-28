@@ -356,6 +356,7 @@ struct RDNA4State {
     uint64_t     smu_allowed;           /* SetAllowedFeaturesMask */
     uint64_t     smu_running;           /* features the PMFW runs */
     bool         autoload_armed;        /* AUTOLOAD_RLC accepted, IMU not released */
+    uint64_t     sdma_wptr;             /* SDMA0 queue 0's last wptr: 64-bit, monotonic */
     bool         gfx_booted;            /* RLC autoload done */
 };
 
@@ -1142,9 +1143,23 @@ static bool rdna4_sdma_copy(RDNA4State *s, uint64_t src, uint64_t dst, uint32_t 
  * SDMA0 queue 0: run the packets between RPTR and the new WPTR. Knows the
  * packets the kext uses: NOP, WRITE (linear), COPY (linear), FENCE and
  * CONST_FILL. A fault or an unknown packet stops the engine where it is.
+ *
+ * As on the card (SDMA 7, 64-bit pointers), the wptr only grows: a value
+ * below the last one is ignored and the engine waits, which is what a
+ * driver that wraps its pointer at the ring's end gets (2026-09-28). Zero
+ * starts over (the queue being programmed).
  */
-static void rdna4_sdma_wptr(RDNA4State *s, uint32_t wptr)
+static void rdna4_sdma_wptr(RDNA4State *s, uint64_t wptr64)
 {
+    uint32_t wptr = (uint32_t)wptr64;
+
+    if (wptr64 && wptr64 < s->sdma_wptr) {
+        fprintf(stderr, "rdna4: sdma: wptr went back from 0x%" PRIx64 " to 0x%" PRIx64
+                ": ignored, the engine waits\n", s->sdma_wptr, wptr64);
+        return;
+    }
+    s->sdma_wptr = wptr64;
+
     uint32_t cntl = reg_get(s, REG_SDMA0_RB_CNTL);
     uint32_t size = 4u << ((cntl >> 1) & 0x1f);          /* bytes */
     uint64_t ring = ((uint64_t)reg_get(s, REG_SDMA0_RB_BASE) << 8) |
@@ -1324,7 +1339,7 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
     } else if (addr == REG_PSP_RING_WPTR) {
         rdna4_psp_wptr(s, val);
     } else if (addr == REG_SDMA0_RB_WPTR) {
-        rdna4_sdma_wptr(s, val);
+        rdna4_sdma_wptr(s, val | ((uint64_t)reg_get(s, REG_SDMA0_RB_WPTR + 4) << 32));
     } else if (addr == REG_GCVM_INV17_REQ) {
         reg_set(s, addr, val);
         if (!s->inv_noack) {
@@ -1997,7 +2012,7 @@ static void rdna4_sdma_doorbell(RDNA4State *s, uint64_t wptr)
         fprintf(stderr, "rdna4: sdma: doorbell ignored: %s\n", why);
         return;
     }
-    rdna4_sdma_wptr(s, (uint32_t)wptr);
+    rdna4_sdma_wptr(s, wptr);
 }
 
 static void rdna4_doorbell_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
@@ -2366,6 +2381,7 @@ static void rdna4_reset(DeviceState *dev)
     s->smu_allowed = ~0ull;
     s->smu_running = 0;
     s->autoload_armed = false;
+    s->sdma_wptr = 0;
     s->gfx_booted = false;
     memset(s->symclk_khz, 0, sizeof(s->symclk_khz));
     memset(s->dig_mode, 0, sizeof(s->dig_mode));

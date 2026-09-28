@@ -70,8 +70,8 @@ bool Ring::emit(const uint32_t *dw, uint32_t count) {
 	if (!ring || count * 4 >= size)
 		return false;
 	for (uint32_t i = 0; i < count; i++) {
-		ring[wp / 4] = dw[i];
-		wp = (wp + 4) & (size - 1);
+		ring[(wp & (size - 1)) / 4] = dw[i];
+		wp += 4;
 	}
 	return true;
 }

@@ -1211,16 +1211,16 @@ bool RDNA4Compute::sdmaQueueInit() {
 
 // sdma_v7_0_ring_set_wptr: the wptr copy, then the 64-bit doorbell (bytes);
 // without a doorbell, the RB_WPTR registers (its non-doorbell branch).
-void RDNA4Compute::sdmaKick(uint32_t wptrBytes) {
-	*poolDw(kSdmaWptrOffset) = wptrBytes;
-	*poolDw(kSdmaWptrOffset + 4) = 0;
+void RDNA4Compute::sdmaKick(uint64_t wptrBytes) {
+	*poolDw(kSdmaWptrOffset) = static_cast<uint32_t>(wptrBytes);
+	*poolDw(kSdmaWptrOffset + 4) = static_cast<uint32_t>(wptrBytes >> 32);
 	flushHdp();
 	if (sdmaDoorbell && doorbells) {
 		doorbells[kSdmaDoorbellDword / 2] = wptrBytes;
 		return;
 	}
-	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), wptrBytes);
-	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), 0);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), static_cast<uint32_t>(wptrBytes));
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), static_cast<uint32_t>(wptrBytes >> 32));
 }
 
 bool RDNA4Compute::stageSdma() {
