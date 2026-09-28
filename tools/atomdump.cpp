@@ -26,6 +26,7 @@
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
 #include "../src/ih.hpp"
+#include "../src/smu_metrics.h"
 #include "../src/pm4.hpp"
 #include "../src/codeobj.hpp"
 #include "../src/gpuheap.hpp"
@@ -1676,6 +1677,19 @@ static int testIhRing() {
 	return failures;
 }
 
+static int testSmuMetricsOffsets() {
+	int failures = 0;
+	failures += check(RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS == 48u &&
+	                  RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS == 56u &&
+	                  RDNA4_SMU_METRICS_AVG_SOCKET_POWER == 136u &&
+	                  RDNA4_SMU_METRICS_AVG_TEMPERATURE == 140u &&
+	                  RDNA4_SMU_METRICS_AVG_FAN_RPM == 170u,
+	                  "smu: SmuMetrics_t offsets (fan at byte %u)",
+	                  RDNA4_SMU_METRICS_AVG_FAN_RPM);
+	printf("\nsmu: SmuMetrics_t telemetry offsets %s\n", failures ? "FAILED" : "ok");
+	return failures;
+}
+
 // PM4 packets as gfx_v12_0 emits them (compute ring test, fence).
 static int testPm4Packets() {
 	int failures = 0;
@@ -2157,6 +2171,7 @@ int main(int argc, char **argv) {
 	failures += testGfxImages();
 	failures += testSdmaPackets();
 	failures += testIhRing();
+	failures += testSmuMetricsOffsets();
 	failures += testPm4Packets();
 	failures += testCodeObject();
 	failures += testGpuHeap();

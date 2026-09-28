@@ -62,6 +62,14 @@
 #include "ui/qemu-pixman.h"
 #include "qom/object.h"
 
+/* SmuMetrics_t offsets from smu14_driver_if_v14_0.h; QEMU compiles this
+ * source outside the repo, so keep the model's table ABI constants here. */
+#define RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS 48u
+#define RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS 56u
+#define RDNA4_SMU_METRICS_AVG_SOCKET_POWER  136u
+#define RDNA4_SMU_METRICS_AVG_TEMPERATURE   140u
+#define RDNA4_SMU_METRICS_AVG_FAN_RPM       170u
+
 #define TYPE_RDNA4 "rdna4"
 OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 
@@ -1464,8 +1472,14 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
     case 0xf:                                      /* SetDriverDramAddrLow */
         s->smu_table_mc = (s->smu_table_mc & 0xffffffff00000000ull) | param;
         break;
-    case 0x12: {                                   /* TransferTableSmu2Dram / GetMetricsTable */
-        /* smu14_driver_if_v14_0.h: fixed values make emulator telemetry
+	case 0x12: {                                   /* TransferTableSmu2Dram / GetMetricsTable */
+		/* TABLE_SMU_METRICS is id 5 in smu14_driver_if_v14_0.h. */
+		if (param != 5) {
+			fprintf(stderr, "rdna4: smu: metrics request table %u rejected (want 5)\n", param);
+			resp = SMU_RESP_UNKNOWN;
+			break;
+		}
+		/* smu14_driver_if_v14_0.h: fixed values make emulator telemetry
          * obvious in logs and tests. */
         uint8_t *table = rdna4_mc_span(s, s->smu_table_mc, 4096);
         if (!table) {
@@ -1473,12 +1487,12 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
             break;
         }
         memset(table, 0, 4096);
-        stw_le_p(table + 44 + 2 * 2, 2100);       /* AverageGfxclkFrequencyPostDs */
-        stw_le_p(table + 44 + 6 * 2, 1000);       /* AverageMemclkFrequencyPostDs */
-        stw_le_p(table + 140 + 0 * 2, 42);         /* TEMP_EDGE */
-        stw_le_p(table + 140 + 1 * 2, 55);         /* TEMP_HOTSPOT */
-        stw_le_p(table + 136, 120);                /* AverageSocketPower, watts */
-        stw_le_p(table + 172, 900);                /* AvgFanRpm */
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS, 2100);
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS, 1000);
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_TEMPERATURE + 0 * 2, 42);
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_TEMPERATURE + 1 * 2, 55);
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_SOCKET_POWER, 120);
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_FAN_RPM, 900);
         fprintf(stderr, "rdna4: smu: synthetic metrics 42C/55C, 2100/1000 MHz, 120 W, 900 RPM\n");
         break;
     }
@@ -1738,7 +1752,9 @@ static void rdna4_ih_emit_vmid(RDNA4State *s, uint8_t client, uint8_t source,
     uint8_t entry[IH_ENTRY_BYTES] = { 0 };
     stl_le_p(entry + 0, (uint32_t)client | ((uint32_t)source << 8) |
                          ((uint32_t)ring << 16) | ((vmid & 0xf) << 24));
-    stl_le_p(entry + 1 * 4, s->ih_wptr / IH_ENTRY_BYTES);
+    uint64_t timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) & ((1ull << 48) - 1);
+    stl_le_p(entry + 1 * 4, (uint32_t)timestamp);
+    stl_le_p(entry + 2 * 4, (uint32_t)(timestamp >> 32) & 0xffff);
     stl_le_p(entry + 4 * 4, data0);
     uint64_t ring_bus = ((uint64_t)reg_get(s, REG_IH_RB_BASE) << 8) |
                         ((uint64_t)(reg_get(s, REG_IH_RB_BASE_HI) & 0xff) << 40);

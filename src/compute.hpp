@@ -119,6 +119,7 @@ public:
 	// rdna4-compute=<stage>, clamped to StageKernel. 0 when absent.
 	static uint32_t requestedStage();
 	static bool requestedVm();
+	static bool requestedPowerManagement();
 
 	// Run the survey now and, for stage >= 2, start the bring-up thread.
 	// Returns the last stage completed inline.
@@ -201,7 +202,7 @@ private:
 	// hang stopped at survives the reset. Logged by the next boot's survey.
 	void trail(const char *step);
 	// The pre-Metal features past the compute stages (W1-W5) name their
-	// trail steps "<feature>: ..." (gfx, ih, vm, flip, rt). If the previous
+	// trail steps "<feature>: ..." (gfx, ih, vm, flip). If the previous
 	// boot died in one of those, only that feature sits this boot out; the
 	// stages and the other features run. featureAllowed("gfx") etc.
 	char hungFeature[8] {};
@@ -387,7 +388,7 @@ private:
 	IOFilterInterruptEventSource *ihSource { nullptr };
 	IOWorkLoop *ihWorkLoop { nullptr };
 	OSObject *ihContext { nullptr };
-	IOLock *ihLock { nullptr };             // independent of rtLock; W2/W5 callers may not hold rtLock
+	IOLock *ihLock { nullptr };             // independent of rtLock; kept until object destruction
 	void *ihWaitEvent { nullptr };
 	bool ihActive { false };
 	bool ihDispatchPolling { false };
@@ -412,6 +413,17 @@ private:
 	uint64_t ihDcnExpectedFrameNs { 0 };
 	uint32_t ihDcnVblankFrames { 0 };
 	uint32_t ihDcnStorms { 0 };
+	// OTG_FRAME_COUNT (DCN 4.1.0, base 2, 0x1b4d) distinguishes many
+	// interrupts in one raster frame from entries drained late by ihAction.
+	uint32_t ihDcnFrameCounter { 0 };
+	uint32_t ihDcnFrameEvents { 0 };
+	uint32_t ihDcnStormFrames { 0 };
+	uint32_t ihDcnShortIntervals { 0 };
+	bool ihDcnFrameCounterValid { false };
+	uint64_t ihDcnLastIvTimestamp { 0 };
+	uint64_t ihDcnExpectedIvTicks { 0 };
+	uint32_t ihDcnIvShortIntervals { 0 };
+	bool ihDcnIvTimestampValid { false };
 	uint64_t ihVblankCount[Pipe::kMaxOtg] {};
 	uint64_t ihVblankTime[Pipe::kMaxOtg] {};
 	uint64_t ihPflipCount[Pipe::kMaxOtg] {};
@@ -419,9 +431,10 @@ private:
 	bool ihInit();
 	void ihStop();
 	void ihDcnStop(const char *why);
+	void ihDcnStopLocked(const char *why);
 	void ihDcnAckVblank();
 	void ihDcnAckFlip();
-	void ihDcnObserveVblank(uint64_t now);
+	void ihDcnObserveVblank(uint64_t now, uint64_t ivTimestamp);
 	void ihPublishResult();
 	bool ihInterruptLogAllowed();
 	void ihDecodeEntry(const uint32_t *dw);
@@ -521,7 +534,7 @@ private:
 	bool           powerSleeping { false };
 	bool           resumed { false };
 	bool           resumePending { false };
-	bool           hangRecoveryEnabled { true }; // rdna4-hang=0 keeps the old wedge
+	bool           hangRecoveryEnabled { false }; // opt in with rdna4-hang=1
 	uint32_t       rtStage { 0 };
 	bool           vmEnabled { false };
 	bool           vmidUsed[16] {};
