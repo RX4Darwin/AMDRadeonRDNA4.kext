@@ -814,7 +814,6 @@ static bool rdna4_otg_position(RDNA4State *s, int otg, uint64_t *frame,
 
 static bool rdna4_update_locked(RDNA4State *s, int otg);
 static void rdna4_latch_flips(RDNA4State *s, int otg, uint64_t frame);
-static void rdna4_gfx_update(void *opaque);
 
 static uint32_t rdna4_otg_read(RDNA4State *s, int otg, uint32_t dw)
 {
