@@ -560,6 +560,7 @@ private:
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);
 	RtClient  *clientFor(const void *owner);
+	RtClient  *vmClientFor(const void *owner);
 	IOReturn ownerStateLocked(const void *owner) const;
 	bool vmTableSync(RtClient &client, uint32_t offset, uint32_t bytes);
 	bool vmMap(RtClient &client, uint64_t va, uint64_t mc, uint64_t bytes, bool executable);

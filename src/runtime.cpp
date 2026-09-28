@@ -191,6 +191,14 @@ RDNA4Compute::RtClient *RDNA4Compute::clientFor(const void *owner) {
 	return nullptr;
 }
 
+/* Without rdna4-vm every connection still has a client record (W9 tracks
+ * aborted clients across sleep), but no page tables or queue: only paths
+ * that map memory or use the client's queue ask for this one. */
+RDNA4Compute::RtClient *RDNA4Compute::vmClientFor(const void *owner) {
+	RtClient *c = clientFor(owner);
+	return vmEnabled && c && c->tableShadow ? c : nullptr;
+}
+
 IOReturn RDNA4Compute::ownerStateLocked(const void *owner) const {
 	if (!rtReady)
 		return kIOReturnNotReady;
@@ -831,7 +839,7 @@ IOReturn RDNA4Compute::rtInfo(const void *owner, uint64_t out[9]) {
 	out[3] = h.size();
 	out[4] = h.freeBytes();
 	out[5] = dev ? vramMc(devHeap.base()) : poolMc(kHeapOffset);
-	RtClient *c = clientFor(owner);
+	RtClient *c = vmClientFor(owner);
 	out[6] = c ? c->vmid : 0;
 	out[7] = c ? c->pipe : 0;
 	out[8] = c ? c->queue : 0;
@@ -880,7 +888,7 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
 		return state;
-	RtClient *c = clientFor(owner);
+	RtClient *c = vmClientFor(owner);
 	if (vmEnabled && !c)
 		return kIOReturnNoResources;
 	const bool dev = dmaReady && devHeap.size();
@@ -926,7 +934,7 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 		return state;
 	if (!vmEnabled)
 		return kIOReturnUnsupported;
-	RtClient *c = clientFor(owner);
+	RtClient *c = vmClientFor(owner);
 	if (!c || !dmaReady || !busMasterSet)
 		return kIOReturnUnsupported;
 	if (!bytes || bytes > kHostMaxBuffer || (flags & ~static_cast<uint64_t>(RDNA4_HOST_EXECUTABLE)))
@@ -1050,7 +1058,7 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	IOReturn restore = kIOReturnSuccess;
 	if (presentActive && presentOwner == owner && presentHandle == handle)
 		restore = restorePresentationLocked("buffer free");
-	RtClient *c = clientFor(owner);
+	RtClient *c = vmClientFor(owner);
 	const bool host = b->host;
 	if (c && b->va)
 		vmUnmap(*c, b->va, b->bytes);
@@ -1105,7 +1113,7 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
 		return state;
-	RtClient *c = clientFor(owner);
+	RtClient *c = vmClientFor(owner);
 	if (vmEnabled && !c)
 		return kIOReturnNoResources;
 	if (!length || length > RDNA4_MAX_CODE_OBJECT)
@@ -1185,7 +1193,7 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 	RtProgram *p = programFor(owner, program);
 	if (!p)
 		return kIOReturnBadArgument;
-	if (RtClient *c = clientFor(owner))
+	if (RtClient *c = vmClientFor(owner))
 		vmUnmap(*c, p->va, heap.lengthOf(p->offset));
 	heap.free(p->offset);
 	p->owner = nullptr;
@@ -1200,7 +1208,7 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 		return state;
 	if (rtWedged)
 		return kIOReturnNotResponding;
-	RtClient *c = clientFor(owner);
+	RtClient *c = vmClientFor(owner);
 	if (vmEnabled && !c)
 		return kIOReturnNoResources;
 	if (c)
@@ -1302,7 +1310,7 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 		return state;
 	if (!vmEnabled)
 		return kIOReturnUnsupported;
-	RtClient *c = clientFor(owner);
+	RtClient *c = vmClientFor(owner);
 	if (!c)
 		return kIOReturnNoResources;
 	if (rtWedged)
@@ -1360,7 +1368,7 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 		return state;
 	if (!vmEnabled)
 		return kIOReturnUnsupported;
-	RtClient *c = clientFor(owner);
+	RtClient *c = vmClientFor(owner);
 	if (!c)
 		return kIOReturnNoResources;
 	if (rtWedged)
