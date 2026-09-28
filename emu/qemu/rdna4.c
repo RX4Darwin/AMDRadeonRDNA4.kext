@@ -2029,6 +2029,9 @@ static bool rdna4_mandelbrot_dispatch(RDNA4State *s, uint64_t pgm, uint32_t dim_
             return false;
         stl_le_p(pixel, color);
     }
+    /* Hidden VRAM is not a MemoryRegion, so its writes do not dirty QEMU's
+     * display bitmap. Refresh the console explicitly for screendumps/VNC. */
+    dpy_gfx_update_full(s->con);
     fprintf(stderr, "rdna4: cs: Mandelbrot model %ux%ux%u of %ux%ux%u ran\n",
             dim_x, dim_y, dim_z, tx, ty, tz);
     return true;
