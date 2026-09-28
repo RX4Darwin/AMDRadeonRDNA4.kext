@@ -387,7 +387,7 @@ private:
 	IOFilterInterruptEventSource *ihSource { nullptr };
 	IOWorkLoop *ihWorkLoop { nullptr };
 	OSObject *ihContext { nullptr };
-	IOLock *ihLock { nullptr };             // independent of rtLock; W2/W5 callers may not hold rtLock
+	IOLock *ihLock { nullptr };             // independent of rtLock; kept until object destruction
 	void *ihWaitEvent { nullptr };
 	bool ihActive { false };
 	bool ihDispatchPolling { false };
@@ -419,6 +419,10 @@ private:
 	uint32_t ihDcnStormFrames { 0 };
 	uint32_t ihDcnShortIntervals { 0 };
 	bool ihDcnFrameCounterValid { false };
+	uint64_t ihDcnLastIvTimestamp { 0 };
+	uint64_t ihDcnExpectedIvTicks { 0 };
+	uint32_t ihDcnIvShortIntervals { 0 };
+	bool ihDcnIvTimestampValid { false };
 	uint64_t ihVblankCount[Pipe::kMaxOtg] {};
 	uint64_t ihVblankTime[Pipe::kMaxOtg] {};
 	uint64_t ihPflipCount[Pipe::kMaxOtg] {};
@@ -426,9 +430,10 @@ private:
 	bool ihInit();
 	void ihStop();
 	void ihDcnStop(const char *why);
+	void ihDcnStopLocked(const char *why);
 	void ihDcnAckVblank();
 	void ihDcnAckFlip();
-	void ihDcnObserveVblank(uint64_t now);
+	void ihDcnObserveVblank(uint64_t now, uint64_t ivTimestamp);
 	void ihPublishResult();
 	bool ihInterruptLogAllowed();
 	void ihDecodeEntry(const uint32_t *dw);

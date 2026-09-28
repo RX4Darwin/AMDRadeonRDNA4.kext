@@ -132,6 +132,10 @@ uint32_t ihPipeRead(void *ctx, uint8_t baseIdx, uint32_t dword) {
 RDNA4Compute::~RDNA4Compute() {
 	stopPresentationTimer();
 	ihStop();
+	if (ihLock) {
+		IOLockFree(ihLock);
+		ihLock = nullptr;
+	}
 	if (resultDictionary) {
 		resultDictionary->release();
 		resultDictionary = nullptr;
@@ -169,10 +173,12 @@ bool RDNA4Compute::ihInit() {
 		HLOG("off: PCI bus mastering is not enabled (command 0x%04x)", command);
 		return fail("PCI bus mastering disabled");
 	}
-	ihLock = IOLockAlloc();
 	if (!ihLock) {
-		HLOG("off: could not allocate the IH wait lock");
-		return fail("IH wait lock allocation");
+		ihLock = IOLockAlloc();
+		if (!ihLock) {
+			HLOG("off: could not allocate the IH wait lock");
+			return fail("IH wait lock allocation");
+		}
 	}
 
 	int msiIndex = -1;
@@ -378,6 +384,10 @@ bool RDNA4Compute::ihInit() {
 		ihDcnStormFrames = 0;
 		ihDcnShortIntervals = 0;
 		ihDcnFrameCounterValid = false;
+		ihDcnLastIvTimestamp = 0;
+		ihDcnExpectedIvTicks = 0;
+		ihDcnIvShortIntervals = 0;
+		ihDcnIvTimestampValid = false;
 		HLOG("DCN sources enabled: OTG_GLOBAL_SYNC_STATUS 0x%08x -> 0x%08x, "
 		     "HUBP%u FLIP_INTERRUPT 0x%08x -> 0x%08x (vblank src %u, pflip src %u)",
 		     otgBefore, rd(IpDiscovery::HwDmu, otgStatus), ihDcnHubp, flipBefore,
@@ -425,7 +435,7 @@ bool RDNA4Compute::ihInit() {
 	return true;
 }
 
-void RDNA4Compute::ihDcnStop(const char *why) {
+void RDNA4Compute::ihDcnStopLocked(const char *why) {
 	if (!ihDcnActive)
 		return;
 	Ndrv::setVblankEnabled(false);
@@ -442,6 +452,18 @@ void RDNA4Compute::ihDcnStop(const char *why) {
 	HLOG("DCN sources disabled: %s (vblank %llu, pflip %llu)", why ? why : "failure",
 	     ihDcnOtg < Pipe::kMaxOtg ? ihVblankCount[ihDcnOtg] : 0,
 	     ihDcnHubp < Pipe::kMaxOtg ? ihPflipCount[ihDcnHubp] : 0);
+	if (ihLock && ihWaitEvent)
+		IOLockWakeup(ihLock, ihWaitEvent, false);
+}
+
+void RDNA4Compute::ihDcnStop(const char *why) {
+	if (!ihLock) {
+		ihDcnStopLocked(why);
+		return;
+	}
+	IOLockLock(ihLock);
+	ihDcnStopLocked(why);
+	IOLockUnlock(ihLock);
 }
 
 void RDNA4Compute::ihDcnAckVblank() {
@@ -460,7 +482,7 @@ void RDNA4Compute::ihDcnAckFlip() {
 	wr(IpDiscovery::HwDmu, r, (value & ~kDcnPflipAck) | kDcnPflipAck);
 }
 
-void RDNA4Compute::ihDcnObserveVblank(uint64_t now) {
+void RDNA4Compute::ihDcnObserveVblank(uint64_t now, uint64_t ivTimestamp) {
 	if (ihDcnOtg >= Pipe::kMaxOtg)
 		return;
 	uint64_t previous = ihVblankTime[ihDcnOtg];
@@ -482,6 +504,27 @@ void RDNA4Compute::ihDcnObserveVblank(uint64_t now) {
 		bool storm = false;
 		uint32_t frameDelta = 0;
 		uint32_t events = ihDcnFrameEvents;
+		uint64_t ivDelta = 0;
+		bool ivStorm = false;
+		// IH v7 timestamps are 48 bits (dw1 | (dw2 & 0xffff) << 32),
+		// captured when the vector is written. They keep queued vectors at
+		// their real spacing even when ihAction drains them together.
+		constexpr uint64_t kIvTimestampMask = (1ull << 48) - 1;
+		if (ivTimestamp) {
+			ivTimestamp &= kIvTimestampMask;
+			if (ihDcnIvTimestampValid) {
+				ivDelta = (ivTimestamp - ihDcnLastIvTimestamp) & kIvTimestampMask;
+				if (ivDelta && !ihDcnExpectedIvTicks) {
+					ihDcnExpectedIvTicks = ivDelta;
+				} else if (ivDelta && ihDcnExpectedIvTicks) {
+					const bool shortInterval = ivDelta * 2 < ihDcnExpectedIvTicks;
+					ihDcnIvShortIntervals = shortInterval ? ihDcnIvShortIntervals + 1 : 0;
+					ivStorm = ihDcnIvShortIntervals >= 8;
+				}
+			}
+			ihDcnLastIvTimestamp = ivTimestamp;
+			ihDcnIvTimestampValid = true;
+		}
 		if (frameValid) {
 			const uint32_t frame = frameImage & 0xffffffu;
 			if (!ihDcnFrameCounterValid) {
@@ -500,21 +543,24 @@ void RDNA4Compute::ihDcnObserveVblank(uint64_t now) {
 					ihDcnFrameEvents++;
 				}
 			}
-		} else {
-			// If the frame counter cannot be read, keep a conservative bounded
-			// fallback. A single short interval is never enough to disable DCN.
+		} else if (!ivTimestamp || !ihDcnIvTimestampValid) {
+			// If neither the frame counter nor the IV timestamp is available,
+			// keep a conservative bounded fallback. A single short interval is
+			// never enough to disable DCN.
 			const bool shortInterval = interval && ihDcnExpectedFrameNs &&
 			                           interval * 2 < ihDcnExpectedFrameNs;
 			ihDcnShortIntervals = shortInterval ? ihDcnShortIntervals + 1 : 0;
 			storm = ihDcnShortIntervals >= 8;
 		}
-		if ((frameValid && ihDcnStormFrames >= 2) || (!frameValid && storm)) {
+		if ((frameValid && ihDcnStormFrames >= 2) || ivStorm || (!frameValid && storm)) {
 			HLOG("DCN IRQ storm: %u vblanks in frame window, frame delta %u, "
-			     "OTG_FRAME_COUNT %s0x%06x, drain interval %llu ns (expected %llu ns)",
+			     "OTG_FRAME_COUNT %s0x%06x, IV delta %llu (expected %llu), "
+			     "drain interval %llu ns (expected %llu ns)",
 			     events, frameDelta, frameValid ? "" : "unreadable/", frameValid ?
-			     (frameImage & 0xffffffu) : 0u, interval, ihDcnExpectedFrameNs);
+			     (frameImage & 0xffffffu) : 0u,
+			     ivDelta, ihDcnExpectedIvTicks, interval, ihDcnExpectedFrameNs);
 			publishResult("vblank", "FAIL DCN IRQ storm");
-			ihDcnStop("interrupt rate exceeded 2x OTG timing");
+			ihDcnStopLocked("interrupt rate exceeded 2x OTG timing");
 			return;
 		}
 	}
@@ -533,14 +579,21 @@ void RDNA4Compute::ihDcnObserveVblank(uint64_t now) {
 
 bool RDNA4Compute::ihWaitVblank(uint32_t otg, uint32_t timeoutMs, uint64_t &count,
                                 uint64_t &timeNs) {
+	IOLock *lock = ihLock;
+	if (!lock)
+		return false;
+	IOLockLock(lock);
 	if (otg == Pipe::kNone)
 		otg = ihDcnOtg;
-	if (!ihDcnActive || otg >= Pipe::kMaxOtg || otg != ihDcnOtg || !ihLock)
+	if (!ihDcnActive || otg >= Pipe::kMaxOtg || otg != ihDcnOtg || !ihWaitEvent) {
+		IOLockUnlock(lock);
 		return false;
+	}
+	const uint32_t boundedTimeout = timeoutMs > RDNA4_MAX_TIMEOUT_MS ?
+	                                RDNA4_MAX_TIMEOUT_MS : timeoutMs;
 	uint64_t span = 0;
-	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000, &span);
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(boundedTimeout) * 1000000, &span);
 	const uint64_t deadline = mach_absolute_time() + span;
-	IOLockLock(ihLock);
 	const uint64_t before = ihVblankCount[otg];
 	for (;;) {
 		if (!ihDcnActive)
@@ -548,7 +601,7 @@ bool RDNA4Compute::ihWaitVblank(uint32_t otg, uint32_t timeoutMs, uint64_t &coun
 		if (ihVblankCount[otg] > before) {
 			count = ihVblankCount[otg];
 			absolutetime_to_nanoseconds(ihVblankTime[otg], &timeNs);
-			IOLockUnlock(ihLock);
+			IOLockUnlock(lock);
 			return true;
 		}
 		const uint64_t now = mach_absolute_time();
@@ -557,24 +610,31 @@ bool RDNA4Compute::ihWaitVblank(uint32_t otg, uint32_t timeoutMs, uint64_t &coun
 		uint64_t sleepSpan = 0;
 		nanoseconds_to_absolutetime(2000000, &sleepSpan);
 		const uint64_t wake = now + sleepSpan < deadline ? now + sleepSpan : deadline;
-		IOLockSleepDeadline(ihLock, ihWaitEvent, wake, THREAD_UNINT);
+		IOLockSleepDeadline(lock, ihWaitEvent, wake, THREAD_INTERRUPTIBLE);
 	}
-	IOLockUnlock(ihLock);
+	IOLockUnlock(lock);
 	return false;
 }
 
 bool RDNA4Compute::ihWaitFlip(uint32_t hubp, uint64_t sinceCount, uint32_t timeoutMs) {
-	if (!ihDcnActive || hubp >= Pipe::kMaxOtg || hubp != ihDcnHubp || !ihLock)
+	IOLock *lock = ihLock;
+	if (!lock)
 		return false;
+	IOLockLock(lock);
+	if (!ihDcnActive || hubp >= Pipe::kMaxOtg || hubp != ihDcnHubp || !ihWaitEvent) {
+		IOLockUnlock(lock);
+		return false;
+	}
+	const uint32_t boundedTimeout = timeoutMs > RDNA4_MAX_TIMEOUT_MS ?
+	                                RDNA4_MAX_TIMEOUT_MS : timeoutMs;
 	uint64_t span = 0;
-	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000, &span);
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(boundedTimeout) * 1000000, &span);
 	const uint64_t deadline = mach_absolute_time() + span;
-	IOLockLock(ihLock);
 	for (;;) {
 		if (!ihDcnActive)
 			break;
 		if (ihPflipCount[hubp] > sinceCount) {
-			IOLockUnlock(ihLock);
+			IOLockUnlock(lock);
 			return true;
 		}
 		const uint64_t now = mach_absolute_time();
@@ -583,14 +643,16 @@ bool RDNA4Compute::ihWaitFlip(uint32_t hubp, uint64_t sinceCount, uint32_t timeo
 		uint64_t sleepSpan = 0;
 		nanoseconds_to_absolutetime(2000000, &sleepSpan);
 		const uint64_t wake = now + sleepSpan < deadline ? now + sleepSpan : deadline;
-		IOLockSleepDeadline(ihLock, ihWaitEvent, wake, THREAD_UNINT);
+		IOLockSleepDeadline(lock, ihWaitEvent, wake, THREAD_INTERRUPTIBLE);
 	}
-	IOLockUnlock(ihLock);
+	IOLockUnlock(lock);
 	return false;
 }
 
 void RDNA4Compute::ihStop() {
-	ihDcnStop("IH stopped");
+	if (ihLock)
+		IOLockLock(ihLock);
+	ihDcnStopLocked("IH stopped");
 	if (ihActive) {
 		wr(IpDiscovery::HwOsssys, IhRbCntl,
 		   rd(IpDiscovery::HwOsssys, IhRbCntl) & ~(kIhRbEnable | kIhEnableIntr));
@@ -601,6 +663,11 @@ void RDNA4Compute::ihStop() {
 		wr(IpDiscovery::HwGc, sdma(0, SdmaCntl),
 		   rd(IpDiscovery::HwGc, sdma(0, SdmaCntl)) & ~1u);
 		ihActive = false;
+	}
+	if (ihLock) {
+		if (ihWaitEvent)
+			IOLockWakeup(ihLock, ihWaitEvent, false);
+		IOLockUnlock(ihLock);
 	}
 	if (ihSource) {
 		ihSource->disable();
@@ -615,11 +682,6 @@ void RDNA4Compute::ihStop() {
 		ihContext = nullptr;
 	}
 	ihWorkLoop = nullptr;
-	ihWaitEvent = nullptr;
-	if (ihLock) {
-		IOLockFree(ihLock);
-		ihLock = nullptr;
-	}
 	if (ihRingDma) {
 		ihRingDma->clearMemoryDescriptor();
 		ihRingDma->release();
@@ -698,7 +760,7 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	}
 	if (entry.clientId == kIhClientDcn && ihDcnActive &&
 	    entry.srcId == kIhSrcVblankBase + ihDcnOtg) {
-		ihDcnObserveVblank(mach_absolute_time());
+		ihDcnObserveVblank(mach_absolute_time(), entry.timestamp);
 		if (ihDcnActive && ihVblRequested)
 			Ndrv::signalVblank();
 		ihDcnAckVblank();
@@ -738,6 +800,10 @@ void RDNA4Compute::ihAction() {
 	if (!ihLock)
 		return;
 	IOLockLock(ihLock);
+	if (!ihActive || !ihRingCpu || !ihWptrCpu || !ihRingMemory || !ihWaitEvent) {
+		IOLockUnlock(ihLock);
+		return;
+	}
 	const uint32_t raw = *ihWptrCpu;
 	const uint32_t wptr = raw & ihRingMask;
 	if (raw & kIhWptrOverflow) {

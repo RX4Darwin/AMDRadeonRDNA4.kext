@@ -1745,7 +1745,9 @@ static void rdna4_ih_emit_vmid(RDNA4State *s, uint8_t client, uint8_t source,
     uint8_t entry[IH_ENTRY_BYTES] = { 0 };
     stl_le_p(entry + 0, (uint32_t)client | ((uint32_t)source << 8) |
                          ((uint32_t)ring << 16) | ((vmid & 0xf) << 24));
-    stl_le_p(entry + 1 * 4, s->ih_wptr / IH_ENTRY_BYTES);
+    uint64_t timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) & ((1ull << 48) - 1);
+    stl_le_p(entry + 1 * 4, (uint32_t)timestamp);
+    stl_le_p(entry + 2 * 4, (uint32_t)(timestamp >> 32) & 0xffff);
     stl_le_p(entry + 4 * 4, data0);
     uint64_t ring_bus = ((uint64_t)reg_get(s, REG_IH_RB_BASE) << 8) |
                         ((uint64_t)(reg_get(s, REG_IH_RB_BASE_HI) & 0xff) << 40);
