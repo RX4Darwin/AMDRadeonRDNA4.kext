@@ -1381,6 +1381,12 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			RLOG("vmid %u: queue MEC1 pipe %u queue %u dequeue timeout (ACTIVE 0x%08x)",
 			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
 		grbmSelect(0, 0, 0, 0);
+		/* The table allocation is reused by the next client.  Unmapping each
+		 * live object leaves untouched PDEs/PTEs behind, so clear the complete
+		 * image before releasing the VMID or its backing VRAM. */
+		bzero(c->tableShadow, kVmTableBytes);
+		if (!vmTableSync(*c, 0, kVmTableBytes))
+			RLOG("vmid %u: page-table teardown clear failed", c->vmid);
 		vmInvalidate(c->vmid, "client close");
 		vmidUsed[c->vmid] = false;
 		queueUsed[c->pipe][c->queue] = false;
