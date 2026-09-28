@@ -1738,13 +1738,15 @@ static int testCodeObject() {
 	failures += check(!CodeObj::parseImage(kVaddCodeObject, 200, img, &why),
 	                  "codeobj: image of a truncated file accepted");
 
-	// bench.cl: three kernels in one file, each with its own descriptor and
-	// LDS (llvm-readelf --notes: group_segment_fixed_size 256 / 0 / 8320).
+	// bench.cl: six kernels in one file, each with its own descriptor and
+	// LDS (llvm-readelf --notes: group_segment_fixed_size).
 	struct { const char *name; uint32_t lds, kernarg; } bench[] = {
 		{ "lds_reverse", 256, 24 }, { "copy", 0, 16 }, { "sgemm", 8320, 28 },
+		{ "wmma16", 0, 24 }, { "hgemm", 20480, 28 }, { "bf16gemm", 20480, 28 },
 	};
-	uint64_t entries[3] = {};
-	for (int i = 0; i < 3; i++) {
+	const int nBench = sizeof(bench) / sizeof(bench[0]);
+	uint64_t entries[nBench] = {};
+	for (int i = 0; i < nBench; i++) {
 		ok = CodeObj::findKernel(kBenchCodeObject, sizeof(kBenchCodeObject), bench[i].name, k, &why);
 		entries[i] = k.entryVa;
 		failures += check(ok && k.groupSegmentSize == bench[i].lds && k.kernargSize == bench[i].kernarg &&
@@ -1754,9 +1756,15 @@ static int testCodeObject() {
 		                  (unsigned long long)k.entryVa);
 	}
 	ok = CodeObj::parseImage(kBenchCodeObject, sizeof(kBenchCodeObject), img, &why);
-	failures += check(ok && entries[0] != entries[1] && entries[1] != entries[2] &&
-	                  entries[2] < img.size, "codeobj: bench image %s, 0x%llx bytes",
-	                  ok ? "ok" : why, (unsigned long long)img.size);
+	bool distinct = true;
+	for (int i = 0; i < nBench; i++) {
+		distinct = distinct && entries[i] < img.size;
+		for (int j = i + 1; j < nBench; j++)
+			distinct = distinct && entries[i] != entries[j];
+	}
+	failures += check(ok && distinct,
+	                  "codeobj: bench image %s, 0x%llx bytes", ok ? "ok" : why,
+	                  (unsigned long long)img.size);
 
 	// RSRC2.LDS_SIZE as Mesa encodes it for gfx12 compute: 1 KiB-aligned,
 	// in 512-byte units.

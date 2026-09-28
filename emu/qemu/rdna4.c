@@ -1428,9 +1428,10 @@ static const MemoryRegionOps rdna4_inert_ops = {
  * s_barrier_signal, SOPC unsigned compares, SMEM s_load_b32..b512, SOP2
  * s_add_co / s_lshl_b32, VOP1 v_mov_b32, VOP2 integer ops and v_fmac_f32,
  * VOP3 integer ops, VOPD (dual issue: fmac/fmaak/fmamk/mul/add/mov and
- * the Y-only add/lshl/and), DS b32 loads/stores incl. 2addr, VGLOBAL
- * global_load/store_b32..b128 and wb/inv. Work-groups share LDS and meet
- * at barriers. Anything else stops the work-item and is reported.
+ * the Y-only add/lshl/and), DS b32/b128 loads/stores incl. 2addr, VGLOBAL
+ * global_load/store_b32..b128 and wb/inv, and the wave-wide
+ * v_wmma_f32_16x16x16_f16/bf16. Work-groups share LDS and meet at
+ * barriers. Anything else stops the work-item and is reported.
  */
 #define REG_SH_MEM_CONFIG    GC_SEG1(0x09e4)
 #define REG_CS_NUM_THREAD_X  GC_SEG0(0x1ba7)
@@ -1446,9 +1447,10 @@ typedef struct RDNA4Lane {
     uint64_t pc;
     uint32_t steps;
     bool     done, waiting;         /* ended / parked at a work-group barrier */
+    bool     at_wave;               /* parked at a wave-wide instruction (WMMA) at pc */
 } RDNA4Lane;
 
-enum { ISA_ERROR, ISA_DONE, ISA_BARRIER };
+enum { ISA_ERROR, ISA_DONE, ISA_BARRIER, ISA_WAVEOP };
 
 /* The work-group's LDS, sized by COMPUTE_PGM_RSRC2.LDS_SIZE (512-byte units). */
 typedef struct RDNA4Lds {
@@ -1458,8 +1460,11 @@ typedef struct RDNA4Lds {
 
 static uint32_t rdna4_isa_src(const RDNA4Lane *l, uint32_t src, uint32_t literal, bool *used_lit)
 {
-    if (src < 106 || (src >= 108 && src <= 123)) {      /* SGPRs, TTMP0-15 */
+    if (src <= 106 || (src >= 108 && src <= 123)) {     /* SGPRs, VCC_LO, TTMP0-15 */
         return l->s[src];
+    }
+    if (src == 126) {                                   /* EXEC_LO: this lane is on */
+        return 1;
     }
     if (src >= 128 && src <= 192) {
         return src - 128;
@@ -1549,15 +1554,16 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
                 l->done = true;
                 return ISA_DONE;                            /* s_endpgm */
             }
-            if (op == 32 || (op == 33 && !scc) || (op == 34 && scc)) {
-                pc += 4 + 4ll * simm;                       /* s_branch, s_cbranch_scc0/1 */
+            if (op == 32 || (op == 33 && !scc) || (op == 34 && scc) ||
+                (op == 35 && !(l->s[106] & 1)) || (op == 36 && (l->s[106] & 1))) {
+                pc += 4 + 4ll * simm;           /* s_branch, s_cbranch_scc0/1, _vccz/nz */
                 continue;
             }
             /* s_nop, s_clause, s_delay_alu, s_barrier_wait (the signal is
              * the rendezvous), s_code_end, s_sendmsg, s_wait_*: nothing to
              * do for one in-order work-item. */
             if (op != 0 && op != 5 && op != 7 && op != 20 && op != 0x1f && op != 0x36 &&
-                op != 33 && op != 34 && (op < 0x40 || op > 0x49)) {
+                (op < 33 || op > 36) && (op < 0x40 || op > 0x49)) {
                 goto unknown;
             }
         } else if ((dw >> 23) == 0x17d) {                   /* SOP1 */
@@ -1604,13 +1610,14 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
             uint32_t addr = l->v[dw1 & 0xff], data0 = (dw1 >> 8) & 0xff;
             uint32_t data1 = (dw1 >> 16) & 0xff, vdst = dw1 >> 24;
             uint32_t at[2] = { addr + (off1 << 8 | off0), 0 }, count = 1;
+            uint32_t bytes = op == 223 || op == 255 ? 16 : 4;
             if (op == 14 || op == 55) {                     /* 2addr: two dword slots */
                 at[0] = addr + off0 * 4;
                 at[1] = addr + off1 * 4;
                 count = 2;
             }
             for (uint32_t i = 0; i < count; i++) {
-                if (at[i] + 4 > lds->size) {
+                if (at[i] + bytes > lds->size) {
                     fprintf(stderr, "rdna4: cs: LDS access at 0x%x beyond the work-group's %u "
                             "bytes (COMPUTE_PGM_RSRC2.LDS_SIZE)\n", at[i], lds->size);
                     return ISA_ERROR;
@@ -1626,6 +1633,16 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
             case 55:                                                           /* ds_load_2addr_b32 */
                 l->v[vdst] = ldl_le_p(lds->mem + at[0]);
                 l->v[(vdst + 1) & 255] = ldl_le_p(lds->mem + at[1]);
+                break;
+            case 223:                                                          /* ds_store_b128 */
+                for (uint32_t i = 0; i < 4; i++) {
+                    stl_le_p(lds->mem + at[0] + 4 * i, l->v[(data0 + i) & 255]);
+                }
+                break;
+            case 255:                                                          /* ds_load_b128 */
+                for (uint32_t i = 0; i < 4; i++) {
+                    l->v[(vdst + i) & 255] = ldl_le_p(lds->mem + at[0] + 4 * i);
+                }
                 break;
             default: goto unknown;
             }
@@ -1678,6 +1695,11 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
             }
             l->v[vdstx] = rx;
             l->v[vdsty & 255] = ry;
+        } else if ((dw >> 23) == 0x198 && ((dw >> 16) & 0x7f) >= 64 &&
+                   ((dw >> 16) & 0x7f) <= 65) {             /* VOP3P WMMA: wave-wide */
+            l->pc = pc;
+            l->s[127] = scc;
+            return ISA_WAVEOP;
         } else if ((dw >> 26) == 0x35) {                    /* VOP3 / VOP3B */
             uint32_t op = (dw >> 16) & 0x3ff, vdst = dw & 0xff, sdst = (dw >> 8) & 0x7f;
             uint32_t s0 = dw1 & 0x1ff, s1 = (dw1 >> 9) & 0x1ff, s2 = (dw1 >> 18) & 0x1ff;
@@ -1686,13 +1708,15 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
             n = 2;
             /* No neg, abs, opsel or clamp in these kernels; VOP3B (the two
              * carry-out ops) keeps SDST where the others keep abs/opsel. */
-            if (dw1 >> 29 || (op != 0x300 && op != 0x2fe && (dw & 0xff00))) {
+            if (dw1 >> 29 || (op != 0x300 && op != 0x2fe && op != 0x120 && (dw & 0xff00))) {
                 goto unknown;
             }
             switch (op) {
             case 0x256: l->v[vdst] = (a << (b & 31)) | c; break;              /* v_lshl_or_b32 */
             case 0x246: l->v[vdst] = (a << (b & 31)) + c; break;              /* v_lshl_add_u32 */
             case 0x255: l->v[vdst] = a + b + c; break;                        /* v_add3_u32 */
+            case 0x247: l->v[vdst] = (a + b) << (c & 31); break;              /* v_add_lshl_u32 */
+            case 0x258: l->v[vdst] = a | b | c; break;                        /* v_or3_b32 */
             case 0x210:                                                       /* v_bfe_u32 */
                 l->v[vdst] = (c & 31) ? (a >> (b & 31)) & ((1u << (c & 31)) - 1) : 0;
                 break;
@@ -1701,8 +1725,16 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
             case 0x300: {                                                     /* v_add_co_u32 */
                 uint64_t sum = (uint64_t)a + b;
                 l->v[vdst] = (uint32_t)sum;
-                if (sdst == 106) {
-                    l->s[106] = (uint32_t)(sum >> 32);
+                if (sdst <= 106) {
+                    l->s[sdst] = (uint32_t)(sum >> 32);
+                }
+                break;
+            }
+            case 0x120: {                                                     /* v_add_co_ci_u32 */
+                uint64_t sum = (uint64_t)a + b + (c & 1);
+                l->v[vdst] = (uint32_t)sum;
+                if (sdst <= 106) {
+                    l->s[sdst] = (uint32_t)(sum >> 32);
                 }
                 break;
             }
@@ -1726,7 +1758,7 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
             uint32_t a = rdna4_isa_src(l, dw & 0xff, dw1, &lit);
             uint32_t b = rdna4_isa_src(l, (dw >> 8) & 0xff, dw1, &lit);
             uint32_t r;
-            if (sdst >= 106) {
+            if (sdst > 106) {
                 goto unknown;
             }
             switch (op) {
@@ -1743,6 +1775,9 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
                 break;
             }
             case 8: r = a << (b & 31); scc = r != 0; break;                    /* s_lshl_b32 */
+            case 44: r = a * b; break;                                         /* s_mul_i32 */
+            case 22: r = a & b; scc = r != 0; break;                           /* s_and_b32 */
+            case 48: r = scc ? a : b; break;                                   /* s_cselect_b32 */
             default: goto unknown;
             }
             l->s[sdst] = r;
@@ -1756,6 +1791,7 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds)
             case 24: l->v[vdst] = b << (a & 31); break;                        /* v_lshlrev_b32 */
             case 25: l->v[vdst] = b >> (a & 31); break;                        /* v_lshrrev_b32 */
             case 27: l->v[vdst] = a & b; break;                                /* v_and_b32 */
+            case 28: l->v[vdst] = a | b; break;                                /* v_or_b32 */
             case 29: l->v[vdst] = a ^ b; break;                                /* v_xor_b32 */
             case 11: l->v[vdst] = (a & 0xffffff) * (b & 0xffffff); break;      /* v_mul_u32_u24 */
             case 43:                                                           /* v_fmac_f32 */
@@ -1784,6 +1820,134 @@ unknown:
     }
     fprintf(stderr, "rdna4: cs: work-item ran past %u instructions\n", 1u << 22);
     return ISA_ERROR;
+}
+
+
+/* IEEE half to float (for WMMA's f16 inputs). */
+static float rdna4_half(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h >> 15) << 31, exp = (h >> 10) & 0x1f, man = h & 0x3ff, u;
+
+    if (exp == 0x1f) {
+        u = sign | 0x7f800000u | (man << 13);                /* inf / nan */
+    } else if (exp) {
+        u = sign | ((exp + 112) << 23) | (man << 13);        /* normal */
+    } else if (man) {                                        /* subnormal: renormalise */
+        exp = 113;
+        while (!(man & 0x400)) {
+            man <<= 1;
+            exp--;
+        }
+        u = sign | (exp << 23) | ((man & 0x3ff) << 13);
+    } else {
+        u = sign;
+    }
+    return rdna4_f(u);
+}
+
+/*
+ * The gfx12 (RDNA4) wave32 layout of a 16x16x16 WMMA, element i (0..7) of
+ * lane l (0..31): A holds row l % 16, k (l / 16) * 8 + i; B holds column
+ * l % 16, the same k; C/D hold row (l / 16) * 8 + i, column l % 16 (RDNA4
+ * ISA 7.12.2, GPUOpen's WMMA guide). A and B pack two 16-bit values per
+ * VGPR, low half first. The ISA numbers k differently for 16-bit A/B, but
+ * the same way for both, so the sums are the same.
+ */
+static void rdna4_wmma_ab(unsigned l, unsigned i, unsigned *rc, unsigned *k)
+{
+    *rc = l % 16;
+    *k = (l / 16) * 8 + i;
+}
+
+static void rdna4_wmma_cd(unsigned l, unsigned i, unsigned *row, unsigned *col)
+{
+    *row = (l / 16) * 8 + i;
+    *col = l % 16;
+}
+
+/* An inline constant as WMMA's C: the integers, and the float constants. */
+static bool rdna4_wmma_const(uint32_t src, float *out)
+{
+    static const float fc[8] = { 0.5f, -0.5f, 1.0f, -1.0f, 2.0f, -2.0f, 4.0f, -4.0f };
+
+    if (src >= 128 && src <= 208) {
+        *out = rdna4_f(src <= 192 ? src - 128 : (uint32_t)-(int32_t)(src - 192));
+        return true;
+    }
+    if (src >= 240 && src <= 247) {
+        *out = fc[src - 240];
+        return true;
+    }
+    return false;
+}
+
+/*
+ * V_WMMA_F32_16X16X16_F16 / _BF16 (VOP3P op 64 / 65) for the 32 lanes of
+ * one wave, all parked at the same pc: D = A x B + C, then each lane
+ * resumes past it (EXEC does not apply to WMMA). NEG / NEG_HI negate the
+ * low / high 16-bit values of A and B; on C they are NEG and ABS. C may be
+ * an inline constant, the same for every element. false (and a message) on
+ * anything unexpected.
+ */
+static bool rdna4_wave_wmma(RDNA4State *s, RDNA4Lane *w, unsigned n)
+{
+    uint8_t *p = rdna4_gc_span(s, w[0].pc, 8);
+    uint32_t dw, dw1, op, vdst, s0, s1, s2, neg, neg_hi;
+    float a[16][16], b[16][16], c[16][16], kc = 0;
+
+    if (!p || n != 32) {
+        fprintf(stderr, "rdna4: cs: WMMA needs a full wave of 32 (have %u)\n", n);
+        return false;
+    }
+    dw = ldl_le_p(p);
+    dw1 = ldl_le_p(p + 4);
+    op = (dw >> 16) & 0x7f;
+    vdst = dw & 0xff;
+    s0 = dw1 & 0x1ff;
+    s1 = (dw1 >> 9) & 0x1ff;
+    s2 = (dw1 >> 18) & 0x1ff;
+    neg = dw1 >> 29;
+    neg_hi = (dw >> 8) & 7;
+    if (s0 < 256 || s1 < 256 || (s2 < 256 && !rdna4_wmma_const(s2, &kc)) || (dw & 0x8000)) {
+        fprintf(stderr, "rdna4: cs: WMMA operands 0x%08x 0x%08x not modelled\n", dw, dw1);
+        return false;
+    }
+    for (unsigned l = 0; l < 32; l++) {
+        if (w[l].pc != w[0].pc) {
+            fprintf(stderr, "rdna4: cs: WMMA lanes diverged\n");
+            return false;
+        }
+        for (unsigned i = 0; i < 8; i++) {
+            unsigned rc, k, row, col;
+            uint32_t va = w[l].v[(s0 - 256 + i / 2) & 255], vb = w[l].v[(s1 - 256 + i / 2) & 255];
+            uint16_t ha = (uint16_t)(va >> (16 * (i & 1))), hb = (uint16_t)(vb >> (16 * (i & 1)));
+            uint32_t half_neg = (i & 1) ? neg_hi : neg;
+            float cv = s2 < 256 ? kc : rdna4_f(w[l].v[(s2 - 256 + i) & 255]);
+            rdna4_wmma_ab(l, i, &rc, &k);
+            a[rc][k] = op == 64 ? rdna4_half(ha) : rdna4_f((uint32_t)ha << 16);
+            b[k][rc] = op == 64 ? rdna4_half(hb) : rdna4_f((uint32_t)hb << 16);
+            a[rc][k] = (half_neg & 1) ? -a[rc][k] : a[rc][k];
+            b[k][rc] = (half_neg & 2) ? -b[k][rc] : b[k][rc];
+            cv = (neg_hi & 4) ? fabsf(cv) : cv;
+            rdna4_wmma_cd(l, i, &row, &col);
+            c[row][col] = (neg & 4) ? -cv : cv;
+        }
+    }
+    for (unsigned l = 0; l < 32; l++) {
+        for (unsigned i = 0; i < 8; i++) {
+            unsigned row, col;
+            float d;
+            rdna4_wmma_cd(l, i, &row, &col);
+            d = c[row][col];
+            for (unsigned k = 0; k < 16; k++) {
+                d = fmaf(a[row][k], b[k][col], d);
+            }
+            w[l].v[(vdst + i) & 255] = rdna4_u(d);
+        }
+        w[l].pc += 8;
+        w[l].at_wave = false;
+    }
+    return true;
 }
 
 /*
@@ -1836,11 +2000,13 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
             l->pc = pgm;
         }
         while (live) {
+            bool stuck = true;
             for (uint32_t t = 0; t < items; t++) {
                 RDNA4Lane *l = &lanes[t];
-                if (l->done || l->waiting) {
+                if (l->done || l->waiting || l->at_wave) {
                     continue;
                 }
+                stuck = false;
                 switch (rdna4_isa_run(s, l, &lds)) {
                 case ISA_DONE:
                     live--;
@@ -1849,16 +2015,40 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
                 case ISA_BARRIER:
                     l->waiting = true;
                     break;
+                case ISA_WAVEOP:
+                    l->at_wave = true;
+                    break;
                 default:
-                    fprintf(stderr, "rdna4: cs: dispatch stopped at group %u,%u,%u item %u\n",
-                            gx, gy, gz, t);
-                    g_free(lds.mem);
-                    g_free(lanes);
-                    return;
+                    goto stopped;
                 }
             }
-            for (uint32_t t = 0; t < items; t++) {          /* every live one waits: open */
-                lanes[t].waiting = false;
+            /* A wave whose live lanes all reached a WMMA runs it. */
+            for (uint32_t w0 = 0; w0 < items; w0 += 32) {
+                uint32_t n = items - w0 < 32 ? items - w0 : 32, at = 0;
+                for (uint32_t i = 0; i < n; i++) {
+                    at += lanes[w0 + i].at_wave;
+                }
+                if (at && at == n) {
+                    if (!rdna4_wave_wmma(s, &lanes[w0], n)) {
+                        goto stopped;
+                    }
+                    stuck = false;
+                }
+            }
+            /* Every live lane waits at the barrier: open it. */
+            bool all = true;
+            for (uint32_t t = 0; t < items && all; t++) {
+                all = lanes[t].done || lanes[t].waiting;
+            }
+            if (all) {
+                for (uint32_t t = 0; t < items; t++) {
+                    lanes[t].waiting = false;
+                }
+                stuck = false;
+            }
+            if (stuck && live) {
+                fprintf(stderr, "rdna4: cs: work-group deadlocked (barrier vs. wave op)\n");
+                goto stopped;
             }
         }
     }
@@ -1866,6 +2056,11 @@ static void rdna4_dispatch(RDNA4State *s, uint32_t dim_x, uint32_t dim_y, uint32
     g_free(lanes);
     fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u of %ux%ux%u ran %" PRIu64 " work-items%s\n",
             dim_x, dim_y, dim_z, tx, ty, tz, ran, lds.size ? " (with LDS)" : "");
+    return;
+stopped:
+    fprintf(stderr, "rdna4: cs: dispatch stopped (%" PRIu64 " work-items ran)\n", ran);
+    g_free(lds.mem);
+    g_free(lanes);
 }
 
 static bool rdna4_mec_ready(RDNA4State *s, uint32_t db_dword, const char **why)

@@ -6,14 +6,16 @@
  *
  *    rdna4-run info                        what the runtime reports
  *    rdna4-run selftest [items]            shaders/vadd.cl and bench.cl's
- *                                          lds_reverse (embedded) on the GPU,
- *                                          every result checked, plus the
- *                                          runtime's refusals
- *    rdna4-run bench [small]               host<->GPU copies, VRAM bandwidth
- *                                          and SGEMM GFLOPS (bench.cl), next
- *                                          to the CPU (memcpy, Accelerate's
- *                                          cblas_sgemm), every SGEMM checked
- *                                          exactly; `small` for the emulator
+ *                                          lds_reverse and wmma16 (embedded)
+ *                                          on the GPU, every result checked,
+ *                                          plus the runtime's refusals
+ *    rdna4-run bench [small]               host<->GPU copies, VRAM bandwidth,
+ *                                          SGEMM GFLOPS and the matrix units
+ *                                          (FP16/BF16 GEMM) from bench.cl,
+ *                                          next to the CPU (memcpy,
+ *                                          Accelerate's cblas_sgemm), every
+ *                                          GEMM checked exactly; `small` for
+ *                                          the emulator
  *    rdna4-run load <file.hsaco> <kernel>  load a code object, describe the
  *                                          kernel, unload it
  *
@@ -201,6 +203,106 @@ static int testLds(rdna4_t *gpu) {
 	return fails;
 }
 
+// A float that is exactly an IEEE half (or zero) as its 16 bits; and as
+// BF16, the top half of the float. The matrix tests only use such values.
+static uint16_t toHalf(float f) {
+	uint32_t u;
+	memcpy(&u, &f, 4);
+	uint32_t sign = (u >> 16) & 0x8000u, exp = (u >> 23) & 0xff;
+	if (!exp)
+		return (uint16_t)sign;
+	return (uint16_t)(sign | ((exp - 112) << 10) | ((u >> 13) & 0x3ff));
+}
+
+static uint16_t toBf16(float f) {
+	uint32_t u;
+	memcpy(&u, &f, 4);
+	return (uint16_t)(u >> 16);
+}
+
+// The matrix units' register layout (bench.cl's wmma16: one wave, one
+// 16x16x16 FP16 product, D = A x B + C). Lane l holds, 8 values each, row
+// l % 16 of A and column l % 16 of B for k = (l / 16) * 8 + i, and D/C rows
+// (l / 16) * 8 + i of column l % 16. C[r][c] = 64 * (16r + c), far apart,
+// so a wrong result shows which element of D landed there. Returns the
+// failures.
+static int testWmma(rdna4_t *gpu) {
+	rdna4_program_t prog;
+	kern_return_t kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "wmma16", &prog);
+	if (kr != KERN_SUCCESS) {
+		printf("  FAIL  load wmma16: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	float A[16][16], B[16][16], D[16][16];
+	uint16_t fa[32][8], fb[32][8];
+	float fc[32][8];
+	for (int r = 0; r < 16; r++) {
+		for (int c = 0; c < 16; c++) {
+			A[r][c] = (float)((r * 16 + c) * 7 % 17 - 8) / 8.0f;
+			B[r][c] = (float)((r * 16 + c) * 11 % 17 - 8) / 8.0f;
+		}
+	}
+	for (int r = 0; r < 16; r++) {
+		for (int c = 0; c < 16; c++) {
+			D[r][c] = 64.0f * (float)(r * 16 + c);
+			for (int k = 0; k < 16; k++)
+				D[r][c] += A[r][k] * B[k][c];
+		}
+	}
+	for (int l = 0; l < 32; l++) {
+		for (int i = 0; i < 8; i++) {
+			const int rc = l % 16, k = (l / 16) * 8 + i;
+			fa[l][i] = toHalf(A[rc][k]);
+			fb[l][i] = toHalf(B[k][rc]);
+			fc[l][i] = 64.0f * (float)(k * 16 + rc);          // C[k][rc]: row k, column rc
+		}
+	}
+	rdna4_buffer_t a, b, c;
+	int fails = 0;
+	if ((kr = rdna4_alloc(gpu, sizeof(fa), &a)) || (kr = rdna4_alloc(gpu, sizeof(fb), &b)) ||
+	    (kr = rdna4_alloc(gpu, sizeof(fc), &c))) {
+		printf("  FAIL  WMMA test setup: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	const uint64_t args[3] = { a.gpu, b.gpu, c.gpu };
+	const uint32_t groups[3] = { 1, 1, 1 }, size[3] = { 32, 1, 1 };
+	if ((kr = rdna4_write(gpu, &a, 0, fa, sizeof(fa))) || (kr = rdna4_write(gpu, &b, 0, fb, sizeof(fb))) ||
+	    (kr = rdna4_write(gpu, &c, 0, fc, sizeof(fc))) ||
+	    (kr = rdna4_dispatch(gpu, &prog, groups, size, args, sizeof(args), 2000, NULL)) ||
+	    (kr = rdna4_read(gpu, &c, 0, fc, sizeof(fc)))) {
+		printf("  FAIL  wmma16: %s\n", rdna4_error(kr));
+		fails++;
+	} else {
+		int bad = 0;
+		for (int l = 0; l < 32; l++) {
+			for (int i = 0; i < 8; i++) {
+				const int row = (l / 16) * 8 + i, col = l % 16;
+				if (fc[l][i] == D[row][col])
+					continue;
+				if (bad++ < 6) {
+					// Which element of C this is nearest to, and what remains
+					// of the product once that is taken off.
+					const int q = (int)(fc[l][i] / 64.0f + (fc[l][i] < 0 ? -0.5f : 0.5f));
+					printf("        lane %2d value %d: got %g (want %g = D[%d][%d]); nearest C[%d][%d], "
+					       "product part %g\n", l, i, fc[l][i], D[row][col], row, col, q / 16, q % 16,
+					       fc[l][i] - 64.0f * (float)q);
+				}
+			}
+		}
+		if (bad) {
+			printf("  FAIL  matrix units (WMMA 16x16x16 FP16): %d of 256 results wrong\n", bad);
+			fails++;
+		} else {
+			printf("  ok    matrix units: one WMMA 16x16x16 FP16 product, all 256 results exact\n");
+		}
+	}
+	rdna4_free(gpu, &a);
+	rdna4_free(gpu, &b);
+	rdna4_free(gpu, &c);
+	rdna4_unload(gpu, &prog);
+	return fails;
+}
+
 static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 	int fails = 0;
 	if (!items || items % 64) {
@@ -302,8 +404,10 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 		printf("  ok    %u back-to-back dispatches of %u items, each checked\n", rounds, small);
 	fails += roundsBad != 0;
 
-	// 3. LDS and barriers, on a second kernel from a multi-kernel file.
+	// 3. LDS and barriers, on a second kernel from a multi-kernel file; the
+	//    matrix units' layout.
 	fails += testLds(gpu);
+	fails += testWmma(gpu);
 	if (hasDma(gpu, NULL))
 		fails += testLargeBuffer(gpu);
 
@@ -340,11 +444,130 @@ static int cmdSelftest(rdna4_t *gpu, uint32_t items) {
 }
 
 // Multiples of 1/8 in [-1, 1]: every product is a multiple of 1/64 and every
-// partial sum of up to 2048 of them fits a float's 24-bit mantissa, so the
-// GPU must match the CPU bit for bit, whatever its summation order.
+// partial sum of up to 8192 of them fits a float's 24-bit mantissa, so the
+// GPU must match the CPU bit for bit, whatever its summation order. They
+// are exact as FP16 and BF16 too.
 static float mval(uint32_t i, uint32_t seed) {
 	uint32_t h = (i + seed) * 2654435761u;
 	return (float)((int)((h >> 16) % 17) - 8) / 8.0f;
+}
+
+// The matrix units: C = A x Bt^T with 16-bit inputs (bench.cl's hgemm for
+// FP16, bf16gemm for BF16) and FP32 accumulation, both checked exactly
+// against the CPU (mval()'s values are exact in both formats). Next to
+// the FP32 SGEMM on the GPU and Accelerate at the same n, from the SGEMM
+// pass (sgemmGflops / cpuGflops, 0 where it did not run). Returns the
+// failures; *bestTflops gets the fastest FP16 result.
+static const uint32_t kGemmSizes[] = { 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
+#define GEMM_SIZES (sizeof(kGemmSizes) / sizeof(kGemmSizes[0]))
+
+static int benchGemm16(rdna4_t *gpu, rdna4_program_t prog[2], uint32_t maxN, uint64_t heapFree,
+                       int small, const double *sgemmGflops, const double *cpuGflops,
+                       double *bestTflops, uint32_t *bestN) {
+	static const char *const name[2] = { "hgemm FP16", "hgemm BF16" };
+	int fails = 0;
+	kern_return_t kr = KERN_SUCCESS;
+	for (unsigned si = 1; si < GEMM_SIZES && kGemmSizes[si] <= maxN; si++) {
+		const uint32_t n = kGemmSizes[si];
+		const uint64_t nn = (uint64_t)n * n;
+		if (8 * nn > heapFree)
+			break;                                  // 2 + 2 + 4 bytes per element
+		const uint32_t rows = n <= 512 ? n : n >= 4096 ? 16 : 64;
+		float *A = malloc(nn * 4), *Bt = malloc(nn * 4), *C = malloc((uint64_t)n * 4);
+		float *ref = malloc((uint64_t)rows * n * 4);
+		uint16_t *h = malloc(nn * 2);
+		rdna4_buffer_t a, b, c;
+		if (!A || !Bt || !C || !ref || !h || (kr = rdna4_alloc(gpu, nn * 2, &a)) ||
+		    (kr = rdna4_alloc(gpu, nn * 2, &b)) || (kr = rdna4_alloc(gpu, nn * 4, &c))) {
+			printf("  FAIL  hgemm n=%u: buffers: %s\n", n, rdna4_error(kr));
+			return fails + 1;
+		}
+		for (uint64_t i = 0; i < nn; i++) {
+			A[i] = mval((uint32_t)i, 3);
+			Bt[i] = mval((uint32_t)i, 4);
+		}
+		// The exact reference for the checked rows: C[r][j] = A[r] . Bt[j].
+		for (uint32_t k = 0; k < rows; k++) {
+			const uint32_t r = rows == n ? k : (uint32_t)(((uint64_t)k * 2654435761u) % n);
+			const float *ar = A + (uint64_t)r * n;
+			for (uint32_t j = 0; j < n; j++) {
+				const float *bj = Bt + (uint64_t)j * n;
+				float s = 0;
+				for (uint32_t q = 0; q < n; q++)
+					s += ar[q] * bj[q];
+				ref[(uint64_t)k * n + j] = s;
+			}
+		}
+		uint8_t args[32] = { 0 };
+		memcpy(args, &a.gpu, 8);
+		memcpy(args + 8, &b.gpu, 8);
+		memcpy(args + 16, &c.gpu, 8);
+		memcpy(args + 24, &n, 4);
+		const uint32_t groups[3] = { n / 128, n / 128, 1 }, size[3] = { 256, 1, 1 };
+		for (int bf = 0; bf < 2 && !kr; bf++) {
+			for (uint64_t i = 0; i < nn; i++)
+				h[i] = bf ? toBf16(A[i]) : toHalf(A[i]);
+			kr = rdna4_write(gpu, &a, 0, h, nn * 2);
+			for (uint64_t i = 0; i < nn && !kr; i++)
+				h[i] = bf ? toBf16(Bt[i]) : toHalf(Bt[i]);
+			if (!kr)
+				kr = rdna4_write(gpu, &b, 0, h, nn * 2);
+			uint64_t best = ~0ull, us = 0;
+			for (int r = 0; r < (small ? 1 : 5) && !kr; r++) {
+				kr = rdna4_dispatch(gpu, &prog[bf], groups, size, args, 28, 10000, &us);
+				if (us < best)
+					best = us;
+			}
+			uint32_t bad = 0, br = 0, bc = 0;
+			float got = 0, want = 0;
+			for (uint32_t k = 0; k < rows && !kr; k++) {
+				const uint32_t r = rows == n ? k : (uint32_t)(((uint64_t)k * 2654435761u) % n);
+				kr = rdna4_read(gpu, &c, (uint64_t)r * n * 4, C, (uint64_t)n * 4);
+				for (uint32_t j = 0; j < n && !kr; j++) {
+					if (C[j] != ref[(uint64_t)k * n + j] && !bad++) {
+						br = r;
+						bc = j;
+						got = C[j];
+						want = ref[(uint64_t)k * n + j];
+					}
+				}
+			}
+			const char *checked = rows == n ? "every element" : rows == 64 ? "64 sampled rows"
+			                                                                 : "16 sampled rows";
+			const double gflops = 2.0 * n * n * (double)n / best / 1000.0;
+			if (kr || bad) {
+				if (kr)
+					printf("  FAIL  %s n=%u: %s\n", name[bf], n, rdna4_error(kr));
+				else
+					printf("  FAIL  %s n=%u: %u wrong, first C[%u][%u] = %g (want %g)\n", name[bf], n,
+					       bad, br, bc, got, want);
+				fails++;
+				break;
+			}
+			printf("  ok    %s n=%-4u GPU %8.1f GFLOPS (%8.3f ms)", name[bf], n, gflops, best / 1000.0);
+			if (sgemmGflops[si] > 0)
+				printf(" | %.1fx FP32 sgemm", gflops / sgemmGflops[si]);
+			if (cpuGflops[si] > 0)
+				printf(gflops / cpuGflops[si] < 10 ? " | %.1fx Accelerate" : " | %.0fx Accelerate",
+				       gflops / cpuGflops[si]);
+			printf("; %s exact\n", checked);
+			if (!bf && gflops / 1000.0 > *bestTflops) {
+				*bestTflops = gflops / 1000.0;
+				*bestN = n;
+			}
+		}
+		rdna4_free(gpu, &a);
+		rdna4_free(gpu, &b);
+		rdna4_free(gpu, &c);
+		free(A);
+		free(Bt);
+		free(C);
+		free(ref);
+		free(h);
+		if (kr || fails)
+			return fails ? fails : 1;
+	}
+	return fails;
 }
 
 static int cmdBench(rdna4_t *gpu, int small) {
@@ -352,14 +575,18 @@ static int cmdBench(rdna4_t *gpu, int small) {
 	kern_return_t kr;
 	if (cmdInfo(gpu))
 		return 1;
-	rdna4_program_t copy, sgemm;
+	rdna4_program_t copy, sgemm, gemm16[2];
 	if ((kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "copy", &copy)) ||
-	    (kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "sgemm", &sgemm))) {
+	    (kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "sgemm", &sgemm)) ||
+	    (kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "hgemm", &gemm16[0])) ||
+	    (kr = rdna4_load(gpu, kBenchCodeObject, sizeof(kBenchCodeObject), "bf16gemm", &gemm16[1]))) {
 		fprintf(stderr, "bench: load: %s\n", rdna4_error(kr));
 		return 1;
 	}
 	printf("sgemm: 64x64 tiles, 16x16 work-items, %llu bytes of LDS per work-group\n",
 	       sgemm.ldsBytes);
+	printf("hgemm: 128x128 tiles, 8 waves of WMMA 16x16x16 (FP16/BF16 in, FP32 sums), %llu bytes "
+	       "of LDS per work-group\n", gemm16[0].ldsBytes);
 	int vm = 0;
 	size_t vmLen = sizeof(vm);
 	if (!sysctlbyname("kern.hv_vmm_present", &vm, &vmLen, NULL, 0) && vm)
@@ -452,12 +679,11 @@ static int cmdBench(rdna4_t *gpu, int small) {
 
 	// 3. SGEMM, C = A x B: GFLOPS from the best of a few runs, and exact
 	//    agreement with the CPU (every element up to 512, sampled rows above).
-	static const uint32_t sizes[] = { 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
 	const uint32_t maxN = small ? 128 : dma ? 8192 : 2048;
-	double bestSpeedup = 0;
+	double bestSpeedup = 0, sgemmAt[GEMM_SIZES] = { 0 }, cpuAt[GEMM_SIZES] = { 0 };
 	uint32_t bestSpeedupN = 0;
-	for (unsigned si = 0; si < sizeof(sizes) / sizeof(sizes[0]) && sizes[si] <= maxN; si++) {
-		const uint32_t n = sizes[si];
+	for (unsigned si = 0; si < GEMM_SIZES && kGemmSizes[si] <= maxN; si++) {
+		const uint32_t n = kGemmSizes[si];
 		const uint64_t bytes = (uint64_t)n * n * 4;
 		if (3 * bytes > heapFree)
 			break;                                  // the heap bounds the sizes
@@ -547,6 +773,8 @@ static int cmdBench(rdna4_t *gpu, int small) {
 			       cpuUs / 1000.0, gpuGflops / cpuGflops,
 			       rows == n ? "every element" : rows == 64 ? "64 sampled rows" : "16 sampled rows",
 			       cpuBad ? " (Accelerate's result differs!)" : "");
+			sgemmAt[si] = gpuGflops;
+			cpuAt[si] = cpuGflops;
 			if (gpuGflops / cpuGflops > bestSpeedup) {
 				bestSpeedup = gpuGflops / cpuGflops;
 				bestSpeedupN = n;
@@ -555,6 +783,7 @@ static int cmdBench(rdna4_t *gpu, int small) {
 			printf("  ok    sgemm n=%-4u GPU %8.1f GFLOPS (%.3f ms), %s exact\n", n, gpuGflops,
 			       best / 1000.0,
 			       rows == n ? "every element" : rows == 64 ? "64 sampled rows" : "16 sampled rows");
+			sgemmAt[si] = gpuGflops;
 		}
 		free(Cc);
 		rdna4_free(gpu, &a);
@@ -566,11 +795,21 @@ static int cmdBench(rdna4_t *gpu, int small) {
 		if (kr)
 			break;
 	}
+	// 4. The matrix units.
+	double bestTflops = 0;
+	uint32_t bestTflopsN = 0;
+	fails += benchGemm16(gpu, gemm16, maxN, heapFree, small, sgemmAt, cpuAt, &bestTflops,
+	                     &bestTflopsN);
+
 	rdna4_unload(gpu, &copy);
 	rdna4_unload(gpu, &sgemm);
+	rdna4_unload(gpu, &gemm16[0]);
+	rdna4_unload(gpu, &gemm16[1]);
 	if (bestSpeedupN)
 		printf("bench: SGEMM on the GPU is up to %.1fx the CPU with Accelerate (n=%u)\n",
 		       bestSpeedup, bestSpeedupN);
+	if (bestTflopsN)
+		printf("bench: the matrix units reach %.1f TFLOPS in FP16 (n=%u)\n", bestTflops, bestTflopsN);
 	printf("bench: %s\n", fails ? "FAILED" : "PASS");
 	return fails ? 1 : 0;
 }

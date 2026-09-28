@@ -81,3 +81,108 @@ void sgemm(__global const float *A, __global const float *B, __global float *C, 
 		for (int j = 0; j < WPT; j++)
 			C[(row0 + ty + 16u * i) * n + col0 + tx + 16u * j] = acc[i][j];
 }
+
+// The matrix units: V_WMMA_F32_16X16X16_F16 / _BF16, one 16x16x16 product
+// per wave per instruction, 16-bit inputs and FP32 accumulation. On gfx12
+// lane l of a wave32 holds, as 8 16-bit values, row l % 16 of A
+// (k = (l / 16) * 8 + 0..7) and column l % 16 of B (same k); as 8 floats,
+// rows (l / 16) * 8 + 0..7 of column l % 16 of C.
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+typedef half  half8  __attribute__((ext_vector_type(8)));
+typedef float float8 __attribute__((ext_vector_type(8)));
+
+static inline __attribute__((always_inline))
+float8 mma(ushort8 a, ushort8 b, float8 c, bool bf16)
+{
+	return bf16 ? __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(
+	                  __builtin_astype(a, short8), __builtin_astype(b, short8), c)
+	            : __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+	                  __builtin_astype(a, half8), __builtin_astype(b, half8), c);
+}
+
+// One wave, one 16x16x16 FP16 product: the layout check. Lane l gets
+// fragment l of a and b and writes fragment l of c.
+__kernel __attribute__((reqd_work_group_size(32, 1, 1)))
+void wmma16(__global const ushort8 *a, __global const ushort8 *b, __global float8 *c)
+{
+	uint l = LID_X;
+	c[l] = mma(a[l], b[l], c[l], false);
+}
+
+// C = A x Bt^T: A is n x n row-major 16-bit values, Bt is B transposed
+// (n x n, row j = column j of B: the layout of a weight matrix), C is n x n
+// floats, n a multiple of 128. 8 waves compute a 128x128 tile of C, 64x32
+// each (4x2 WMMA tiles), staging 32-deep slices of A and Bt through LDS
+// with k contiguous, so every fragment is one 16-byte LDS read. The next
+// slice is fetched into registers while the current one is multiplied.
+#define HT  128     // tile of C per work-group
+#define HK  32      // depth of each LDS slice
+#define HKP 40      // LDS row pitch in 16-bit values: 80 bytes, 16-byte aligned
+
+static inline __attribute__((always_inline))
+void gemm16(__global const ushort *A, __global const ushort *Bt, __global float *C, uint n,
+            __local ushort *As, __local ushort *Bs, bool bf16)
+{
+	const uint tid = LID_X, lane = tid % 32u, wave = tid / 32u;
+	const uint row0 = WG_ID(y) * HT, col0 = WG_ID(x) * HT;
+	const uint wr = (wave / 4u) * 64u, wc = (wave % 4u) * 32u;   // the wave's 64x32
+	const uint fr = lane % 16u, fk = (lane / 16u) * 8u;           // its fragment slot
+	// Each work-item moves two 16-byte pieces of A's slice and two of Bt's:
+	// rows r[e], k offset kq, of the 128 x 32 slices.
+	const uint kq = (tid % 4u) * 8u, r[2] = { tid / 4u, tid / 4u + 64u };
+	float8 acc[4][2];
+	ushort8 pa[2], pb[2];
+	for (int i = 0; i < 4; i++)
+		for (int j = 0; j < 2; j++)
+			acc[i][j] = (float8)(0.0f);
+	for (int e = 0; e < 2; e++) {
+		pa[e] = *(__global const ushort8 *)&A[(row0 + r[e]) * n + kq];
+		pb[e] = *(__global const ushort8 *)&Bt[(col0 + r[e]) * n + kq];
+	}
+
+	for (uint k0 = 0; k0 < n; k0 += HK) {
+		BARRIER();                              // the last slice is used up
+		for (int e = 0; e < 2; e++) {
+			*(__local ushort8 *)&As[r[e] * HKP + kq] = pa[e];
+			*(__local ushort8 *)&Bs[r[e] * HKP + kq] = pb[e];
+		}
+		BARRIER();
+		if (k0 + HK < n) {
+			for (int e = 0; e < 2; e++) {
+				pa[e] = *(__global const ushort8 *)&A[(row0 + r[e]) * n + k0 + HK + kq];
+				pb[e] = *(__global const ushort8 *)&Bt[(col0 + r[e]) * n + k0 + HK + kq];
+			}
+		}
+		for (uint kk = 0; kk < HK; kk += 16u) {
+			ushort8 a[4], b[2];
+			for (int i = 0; i < 4; i++)
+				a[i] = *(__local const ushort8 *)&As[(wr + 16u * i + fr) * HKP + kk + fk];
+			for (int j = 0; j < 2; j++)
+				b[j] = *(__local const ushort8 *)&Bs[(wc + 16u * j + fr) * HKP + kk + fk];
+			for (int i = 0; i < 4; i++)
+				for (int j = 0; j < 2; j++)
+					acc[i][j] = mma(a[i], b[j], acc[i][j], bf16);
+		}
+	}
+	// Element e of acc[i][j] is row fk + e, column fr of that 16x16 tile.
+	for (int i = 0; i < 4; i++)
+		for (int j = 0; j < 2; j++)
+			for (int e = 0; e < 8; e++)
+				C[(row0 + wr + 16u * i + fk + e) * n + col0 + wc + 16u * j + fr] = acc[i][j][e];
+}
+
+// FP16 inputs (IEEE half).
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void hgemm(__global const ushort *A, __global const ushort *Bt, __global float *C, uint n)
+{
+	__local ushort As[HT * HKP], Bs[HT * HKP];
+	gemm16(A, Bt, C, n, As, Bs, false);
+}
+
+// BF16 inputs (the top half of a float).
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void bf16gemm(__global const ushort *A, __global const ushort *Bt, __global float *C, uint n)
+{
+	__local ushort As[HT * HKP], Bs[HT * HKP];
+	gemm16(A, Bt, C, n, As, Bs, true);
+}

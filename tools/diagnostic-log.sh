@@ -172,4 +172,5 @@ echo "  compute: 'verdict:' lines — PSP sOS, GFX/SDMA firmware state, GC/MM hu
 echo "           apertures, and the VRAM pool chosen for compute"
 echo "  runtime: 'selftest: PASS' — a user-space program ran vadd on the GPU"
 echo "  bench:   host<->GPU MB/s, VRAM GB/s vs CPU memcpy, sgemm GFLOPS vs the CPU"
-echo "           (Accelerate) and 'GPU Nx'; 'bench: PASS' = every result exact"
+echo "           (Accelerate) and 'GPU Nx', then 'hgemm FP16/BF16' = the matrix"
+echo "           units (WMMA); 'bench: PASS' = every result exact"
