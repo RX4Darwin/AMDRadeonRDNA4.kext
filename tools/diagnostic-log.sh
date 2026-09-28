@@ -29,6 +29,18 @@ have_arg() { case "$BOOTARGS" in *" rdna4-$1=1 "*) return 0;; *) return 1;; esac
 
 section() { echo; echo "=== $1 ==="; }
 
+# Stages 2+ run on their own thread after the desktop: let the bring-up
+# finish (or stop) before collecting, for up to 2 minutes.
+case "$BOOTARGS" in *" rdna4-compute="[2-9]" "*)
+	echo "waiting for the compute bring-up to finish (up to 2 minutes)..."
+	for i in $(seq 1 120); do
+		dmesg | grep -qE 'RDNA4FB: compute: (bring-up finished|.*failed; stopping|could not start)' && break
+		sleep 1
+	done
+	dmesg | grep -E 'RDNA4FB: compute: (bring-up finished|.*failed; stopping)' | tail -1
+	;;
+esac
+
 # gated <title> <grep-ERE> <boot-arg-name>
 # Prints matching dmesg lines; if none, distinguishes "arg inactive" from
 # "arg active but produced nothing" (a build/version red flag).

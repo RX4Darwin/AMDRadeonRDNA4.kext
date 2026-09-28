@@ -59,6 +59,13 @@ constexpr uint64_t kMiB = 1ull << 20;
 // RCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE (NBIF 6.3.1 seg 2): usable VRAM in MiB.
 constexpr Reg NbifMemSize { 2, 0x00c3 };
 
+// Display memory the GOP set up (DCN 4.1, seg 2; the same registers the
+// display side uses): the DMUB mailbox (REGION4, MC address) and each
+// HUBP's primary surface (MC address, per-pipe stride 0xdc).
+constexpr Reg DmcubRegion4Offset     { 2, 0x0196 };
+constexpr Reg DmcubRegion4OffsetHigh { 2, 0x0197 };
+constexpr uint32_t kHubpSurfaceLo = 0x060a, kHubpSurfaceHi = 0x060b, kHubpStride = 0xdc;
+
 const char *onOff(bool v) { return v ? "yes" : "no"; }
 
 // A VMx FB aperture (MC address >> 24 in [23:0]) is set when it spans at
@@ -331,6 +338,34 @@ void RDNA4Compute::choosePool() {
 	pool.size = room < kMost ? room : kMost;
 	pool.mcAddress = sv.fbMcBase + start;
 	pool.valid = pool.mcAddress + pool.size - 1 <= sv.fbMcTop;
+
+	// Nothing the display depends on may live in the pool: the compute
+	// stages overwrite it. Seen on the RX 9070 XT, the DMUB memory is at the
+	// top of VRAM and the one lit surface at VRAM+0; if a card differs, it
+	// runs without compute rather than without a display.
+	auto clash = [this](const char *what, uint64_t mc) {
+		if (!mc || mc == ~0ull || (mc & 0xffffffffull) == kBad || mc < sv.fbMcBase)
+			return false;
+		const uint64_t off = mc - sv.fbMcBase;
+		const bool in = off >= pool.offset && off < pool.offset + pool.size;
+		CLOG("display memory: %s at VRAM+0x%llx%s", what, off, in ? " — INSIDE the compute pool" : "");
+		return in;
+	};
+	bool hit = clash("DMUB mailbox (region4)",
+	                 rd(IpDiscovery::HwDmu, DmcubRegion4Offset) |
+	                 (static_cast<uint64_t>(rd(IpDiscovery::HwDmu, DmcubRegion4OffsetHigh)) << 32));
+	for (uint32_t i = 0; i < 4; i++) {
+		const char *names[4] = { "HUBP0 surface", "HUBP1 surface", "HUBP2 surface", "HUBP3 surface" };
+		const uint32_t lo = rd(IpDiscovery::HwDmu, Reg { 2, kHubpSurfaceLo + i * kHubpStride });
+		const uint32_t hi = rd(IpDiscovery::HwDmu, Reg { 2, kHubpSurfaceHi + i * kHubpStride });
+		if (lo != kBad && hi != kBad)
+			hit |= clash(names[i], lo | (static_cast<uint64_t>(hi & 0xffff) << 32));
+	}
+	if (hit && pool.valid) {
+		CLOG("pool: display memory lies in VRAM+0x%llx..+0x%llx; compute disabled to keep the "
+		     "display safe", pool.offset, pool.offset + pool.size);
+		pool.valid = false;
+	}
 }
 
 // ---------------------------------------------------------------------------
