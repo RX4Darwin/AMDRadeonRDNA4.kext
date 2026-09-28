@@ -322,6 +322,8 @@ struct RDNA4State {
     uint32_t edid_line;
     bool     trace;
     bool     kiq_only;       /* model a MEC that runs only the RLC-named KIQ */
+    bool     inv_noack;      /* model the card (2026-09-28): GC hub flushes never ack */
+    bool     sdma_no_db;     /* model an SDMA that ignores its doorbell */
 
     uint32_t *regs;           /* BAR5 image, RDNA4_MMIO_SIZE bytes */
     uint8_t  *resv;           /* top RDNA4_RESV_SIZE bytes of VRAM */
@@ -1256,7 +1258,9 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         rdna4_sdma_wptr(s, val);
     } else if (addr == REG_GCVM_INV17_REQ) {
         reg_set(s, addr, val);
-        reg_set(s, REG_GCVM_INV17_ACK, val & 0xffff);   /* per-VMID ack */
+        if (!s->inv_noack) {
+            reg_set(s, REG_GCVM_INV17_ACK, val & 0xffff);   /* per-VMID ack */
+        }
     } else if (dw >= DMU_SEG2 && dw < DMU_SEG3) {
         uint32_t d2 = dw - DMU_SEG2;
         if (d2 == DMCUB_INBOX1_WPTR) {
@@ -1695,8 +1699,39 @@ static uint64_t rdna4_doorbell_read(void *opaque, hwaddr addr, unsigned size)
     return 0;
 }
 
+#define REG_SDMA0_DOORBELL     GC_SEG0(0x008f)   /* ENABLE [28] */
+#define REG_SDMA0_DOORBELL_OFF GC_SEG0(0x0091)   /* OFFSET [27:2]: dword index */
+#define REG_NBIF_S2A_ENTRY2    ((0xd20 + 0x01cd) * 4)
+#define SDMA0_DOORBELL_DWORD   0x200             /* sDMA_ENGINE0 << 1 */
+
+/*
+ * SDMA0's doorbell (sdma_v7_0 always uses one): it counts only if the
+ * aperture is on, NBIF S2A entry 2 routes the SDMA range, and the queue has
+ * its doorbell enabled at that index. The value is the wptr in bytes.
+ */
+static void rdna4_sdma_doorbell(RDNA4State *s, uint64_t wptr)
+{
+    uint32_t e2 = reg_get(s, REG_NBIF_S2A_ENTRY2), db = reg_get(s, REG_SDMA0_DOORBELL);
+    const char *why =
+        s->sdma_no_db ? "SDMA doorbells ignored (sdma-no-doorbell model)" :
+        !(reg_get(s, REG_NBIF_DB_APER_EN) & 1) ? "NBIF doorbell aperture off" :
+        !(e2 & 1) || ((e2 >> 7) & 0x3ff) != SDMA0_DOORBELL_DWORD ? "S2A entry 2 not routing SDMA" :
+        !(db & (1u << 28)) ? "SDMA0 doorbell disabled" :
+        ((reg_get(s, REG_SDMA0_DOORBELL_OFF) >> 2) & 0x3ffffff) != SDMA0_DOORBELL_DWORD ?
+            "SDMA0 doorbell offset not its index" : NULL;
+    if (why) {
+        fprintf(stderr, "rdna4: sdma: doorbell ignored: %s\n", why);
+        return;
+    }
+    rdna4_sdma_wptr(s, (uint32_t)wptr);
+}
+
 static void rdna4_doorbell_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
 {
+    if (addr / 4 == SDMA0_DOORBELL_DWORD) {
+        rdna4_sdma_doorbell(opaque, data);
+        return;
+    }
     rdna4_mec_doorbell(opaque, addr / 4, data);
 }
 
@@ -2169,6 +2204,8 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_UINT32("edid-line", RDNA4State, edid_line, 2),
     DEFINE_PROP_BOOL("trace", RDNA4State, trace, false),
     DEFINE_PROP_BOOL("kiq-only", RDNA4State, kiq_only, false),
+    DEFINE_PROP_BOOL("inv-noack", RDNA4State, inv_noack, false),
+    DEFINE_PROP_BOOL("sdma-no-doorbell", RDNA4State, sdma_no_db, false),
 };
 
 static void rdna4_class_init(ObjectClass *klass, void *data)

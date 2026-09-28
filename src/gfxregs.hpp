@@ -94,6 +94,7 @@ constexpr uint32_t SdmaQ0RptrAddrLo  = 0x0087;
 constexpr uint32_t SdmaQ0RptrAddrHi  = 0x0088;
 constexpr uint32_t SdmaQ0IbCntl      = 0x0089;
 constexpr uint32_t SdmaQ0Doorbell    = 0x008f;
+constexpr uint32_t SdmaQ0DoorbellOffset = 0x0091;   // OFFSET [27:2]: doorbell dword index
 constexpr uint32_t SdmaQ0WptrPollLo  = 0x0098;
 constexpr uint32_t SdmaQ0WptrPollHi  = 0x0099;
 constexpr uint32_t SdmaQ0MinorPtrUpd = 0x009b;
@@ -342,6 +343,14 @@ constexpr Reg NbifS2aDoorbell0    { 2, 0x01cb };   // GDC_S2A0_S2A_DOORBELL_ENTR
 constexpr Reg NbifS2aDoorbell3    { 2, 0x01ce };   // GDC_S2A0_S2A_DOORBELL_ENTRY_3_CTRL
 constexpr uint32_t kS2aDoorbell0Gc = 0x30000007;   // nbif_v6_3_1_gc_doorbell_init
 constexpr uint32_t kS2aDoorbell3Gc = 0x3000000d;
+// nbif_v6_3_1_sdma_doorbell_range (instance 0): ENABLE [0], AWID [5:1] = 0xe,
+// RANGE_OFFSET [16:7] = SDMA0's doorbell index, RANGE_SIZE [24:17] = 20 per
+// engine x 2, AWADDR_31_28 [31:28] = 3 — read-modify-write over these fields.
+constexpr Reg NbifS2aDoorbell2    { 2, 0x01cd };   // GDC_S2A0_S2A_DOORBELL_ENTRY_2_CTRL
+constexpr uint32_t kSdmaDoorbellDword = 0x200;       // AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 << 1
+constexpr uint32_t kS2aDoorbell2Mask  = 0xf1ffffbfu;
+constexpr uint32_t kS2aDoorbell2Sdma  = 1u | (0xeu << 1) | (kSdmaDoorbellDword << 7) | (40u << 17) |
+                                        (3u << 28);   // 0x3051001d
 
 // --- NBIF 6.3.1: where a BAR5 write flushes the HDP (host data path) write
 // cache, so CPU writes to VRAM through BAR0 become visible to the GPU. Holds a

@@ -198,6 +198,8 @@ private:
 	bool sdmaStartMcus();               // sdma_v7_0_enable: unhalt before queue setup
 	bool sdmaQueueInit();
 	void sdmaKick(uint32_t wptrBytes);
+	bool sdmaDoorbell { false };        // kick SDMA0 through its doorbell (amdgpu's way)
+	bool doorbellMapBar();
 	bool stageSdma();
 
 	// Stage 5: one MEC compute queue (ME1 pipe 0 queue 0) programmed

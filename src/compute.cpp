@@ -1179,8 +1179,18 @@ bool RDNA4Compute::sdmaQueueInit() {
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0MinorPtrUpd), 1);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), 0);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), 0);
-	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0Doorbell),
-	   rdGc(sdma(0, SdmaQ0Doorbell)) & ~kSdmaDoorbellEnable);
+	// sdma_v7_0 always uses a doorbell (use_doorbell = true): SDMA0 on
+	// dword kSdmaDoorbellDword, routed by NBIF S2A entry 2.
+	const uint32_t db = rdGc(sdma(0, SdmaQ0Doorbell));
+	if (sdmaDoorbell) {
+		wr(IpDiscovery::HwGc, sdma(0, SdmaQ0Doorbell), db | kSdmaDoorbellEnable);
+		wr(IpDiscovery::HwGc, sdma(0, SdmaQ0DoorbellOffset),
+		   (rdGc(sdma(0, SdmaQ0DoorbellOffset)) & ~(0x3ffffffu << 2)) | (kSdmaDoorbellDword << 2));
+		wr(IpDiscovery::HwNbif, NbifS2aDoorbell2,
+		   (rd(IpDiscovery::HwNbif, NbifS2aDoorbell2) & ~kS2aDoorbell2Mask) | kS2aDoorbell2Sdma);
+	} else {
+		wr(IpDiscovery::HwGc, sdma(0, SdmaQ0Doorbell), db & ~kSdmaDoorbellEnable);
+	}
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0MinorPtrUpd), 0);
 
 	wr(IpDiscovery::HwGc, sdma(0, SdmaWatchdogCntl),
@@ -1197,10 +1207,16 @@ bool RDNA4Compute::sdmaQueueInit() {
 	return true;
 }
 
+// sdma_v7_0_ring_set_wptr: the wptr copy, then the 64-bit doorbell (bytes);
+// without a doorbell, the RB_WPTR registers (its non-doorbell branch).
 void RDNA4Compute::sdmaKick(uint32_t wptrBytes) {
 	*poolDw(kSdmaWptrOffset) = wptrBytes;
 	*poolDw(kSdmaWptrOffset + 4) = 0;
 	flushHdp();
+	if (sdmaDoorbell && doorbells) {
+		doorbells[kSdmaDoorbellDword / 2] = wptrBytes;
+		return;
+	}
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), wptrBytes);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), 0);
 }
@@ -1254,21 +1270,39 @@ bool RDNA4Compute::stageSdma() {
 	flushHdp();
 	trail("s4: SDMA MCU unhalt");
 	sdmaStartMcus();
+	sdmaDoorbell = doorbellMapBar();
 	sdmaQueueInit();
 	status();
 
-	// 3. First packet: one dword written by the engine (amdgpu's ring test).
+	// 3. First packet: one dword written by the engine (amdgpu's ring test),
+	//    kicked through the doorbell as amdgpu does; if it does not land,
+	//    the doorbell goes off and the RB_WPTR registers are tried.
 	trail("s4: SDMA WRITE_LINEAR test");
 	uint32_t pkt[8];
 	ring.emit(pkt, Sdma::writeDword(pkt, poolMc(kSdmaTestOffset), 0xDEADBEEF));
+	auto landed = [this]() {
+		for (uint32_t ms = 0; ms < 200; ms++) {
+			if (*poolDw(kSdmaTestOffset) == 0xDEADBEEF)
+				return true;
+			IOSleep(1);
+		}
+		return false;
+	};
 	sdmaKick(ring.wptr());
-	bool wrote = false;
-	for (uint32_t us = 0; us < 200000 && !wrote; us += 10) {
-		wrote = *poolDw(kSdmaTestOffset) == 0xDEADBEEF;
-		if (!wrote)
-			IODelay(10);
+	bool wrote = landed();
+	CLOG("sdma: WRITE_LINEAR through the %s: %s", sdmaDoorbell ? "doorbell" : "RB_WPTR registers",
+	     wrote ? "landed" : "did NOT land");
+	if (!wrote && sdmaDoorbell) {
+		status();
+		sdmaDoorbell = false;
+		wr(IpDiscovery::HwGc, sdma(0, SdmaQ0Doorbell),
+		   rdGc(sdma(0, SdmaQ0Doorbell)) & ~kSdmaDoorbellEnable);
+		sdmaKick(ring.wptr());
+		wrote = landed();
+		CLOG("sdma: WRITE_LINEAR through the RB_WPTR registers: %s", wrote ? "landed" : "did NOT land");
 	}
 	put("WriteTest", wrote);
+	put("Doorbell", sdmaDoorbell);
 	if (!wrote) {
 		CLOG("sdma: WRITE_LINEAR did not land (test dword 0x%08x)", *poolDw(kSdmaTestOffset));
 		status();
@@ -1372,12 +1406,17 @@ bool RDNA4Compute::doorbellInit() {
 	CLOG("mec: doorbells before: aperture 0x%08x, S2A entry0 0x%08x entry3 0x%08x",
 	     rd(IpDiscovery::HwNbif, NbifDoorbellAperEn), rd(IpDiscovery::HwNbif, NbifS2aDoorbell0),
 	     rd(IpDiscovery::HwNbif, NbifS2aDoorbell3));
-	wr(IpDiscovery::HwNbif, NbifDoorbellAperEn, rd(IpDiscovery::HwNbif, NbifDoorbellAperEn) | 1);
 	wr(IpDiscovery::HwNbif, NbifS2aDoorbell0, kS2aDoorbell0Gc);
 	wr(IpDiscovery::HwNbif, NbifS2aDoorbell3, kS2aDoorbell3Gc);
 	wr(IpDiscovery::HwGc, CpMecDoorbellLower, kMecDoorbellLowerBytes);
 	wr(IpDiscovery::HwGc, CpMecDoorbellUpper, kMecDoorbellUpperBytes);
+	return doorbellMapBar();
+}
 
+// The doorbell aperture on (soc24_common_hw_init) and BAR2 mapped; stage 4
+// needs it first, for SDMA's doorbell.
+bool RDNA4Compute::doorbellMapBar() {
+	wr(IpDiscovery::HwNbif, NbifDoorbellAperEn, rd(IpDiscovery::HwNbif, NbifDoorbellAperEn) | 1);
 	if (!doorbells) {
 		IODeviceMemory *bar2 = env.pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
 		if (!bar2 || bar2->getLength() < 0x1000)
