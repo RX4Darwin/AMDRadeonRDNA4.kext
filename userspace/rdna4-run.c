@@ -10,9 +10,10 @@
  *                                          every result checked, plus the
  *                                          runtime's refusals
  *    rdna4-run bench [small]               host<->GPU copies, VRAM bandwidth
- *                                          and SGEMM GFLOPS (bench.cl), every
- *                                          SGEMM checked against the CPU;
- *                                          `small` for the emulator
+ *                                          and SGEMM GFLOPS (bench.cl), next
+ *                                          to the CPU (memcpy, Accelerate's
+ *                                          cblas_sgemm), every SGEMM checked
+ *                                          exactly; `small` for the emulator
  *    rdna4-run load <file.hsaco> <kernel>  load a code object, describe the
  *                                          kernel, unload it
  *
@@ -23,11 +24,20 @@
 #include "bench_codeobj.h"
 #include "vadd_codeobj.h"
 
+#include <Accelerate/Accelerate.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
+
+// Accelerate is weak-linked (-weak_framework): a recovery system may not
+// carry it, and rdna4-run must still run there. Null when it is absent.
+extern void cblas_sgemm(const enum CBLAS_ORDER, const enum CBLAS_TRANSPOSE,
+                        const enum CBLAS_TRANSPOSE, const int, const int, const int, const float,
+                        const float *, const int, const float *, const int, const float, float *,
+                        const int) __attribute__((weak_import));
 
 static int openRuntime(rdna4_t *gpu) {
 	kern_return_t kr = rdna4_open(gpu);
@@ -293,6 +303,13 @@ static int cmdBench(rdna4_t *gpu, int small) {
 	}
 	printf("sgemm: 64x64 tiles, 16x16 work-items, %llu bytes of LDS per work-group\n",
 	       sgemm.ldsBytes);
+	int vm = 0;
+	size_t vmLen = sizeof(vm);
+	if (!sysctlbyname("kern.hv_vmm_present", &vm, &vmLen, NULL, 0) && vm)
+		printf("note: running in a VM — the GPU is emulated there, its speeds are not real\n");
+	const int blas = cblas_sgemm != NULL;
+	if (!blas)
+		printf("note: Accelerate is not available here: no CPU comparison\n");
 
 	// 1. Host <-> GPU: the CPU copies through the BAR window.
 	const uint64_t xfer = small ? (1u << 20) : (16u << 20);
@@ -343,13 +360,31 @@ static int cmdBench(rdna4_t *gpu, int small) {
 		}
 		int same = !kr && !rdna4_read(gpu, &dst, 0, h2, edge) && !memcmp(h1, h2, edge) &&
 		           !rdna4_read(gpu, &dst, cb - edge, h2, edge) && !memcmp(h1, h2, edge);
+		// The CPU's own copy between two buffers of the same size, for scale;
+		// called through a volatile pointer, or the unused copy is optimised out.
+		double cpuBest = 1e30;
+		uint8_t *m1 = malloc(cb), *m2 = malloc(cb);
+		void *(*volatile cpy)(void *, const void *, size_t) = memcpy;
+		if (m1 && m2) {
+			memset(m1, 1, cb);
+			memset(m2, 2, cb);
+			for (int r = 0; r < 3; r++) {
+				double t = nowUs();
+				cpy(m2, m1, cb);
+				t = nowUs() - t;
+				if (t < cpuBest)
+					cpuBest = t;
+			}
+		}
 		if (kr || !same) {
 			printf("  FAIL  VRAM copy: %s\n", kr ? rdna4_error(kr) : "data differs");
 			fails++;
 		} else {
-			printf("  ok    VRAM copy of %llu MiB: %.1f GB/s (read + write, %llu us)\n", cb >> 20,
-			       2.0 * cb / best / 1000.0, best);
+			printf("  ok    VRAM copy of %llu MiB: GPU %.1f GB/s (%llu us) | CPU memcpy %.1f GB/s\n",
+			       cb >> 20, 2.0 * cb / best / 1000.0, best, 2.0 * cb / cpuBest / 1000.0);
 		}
+		free(m1);
+		free(m2);
 	}
 	rdna4_free(gpu, &src);
 	rdna4_free(gpu, &dst);
@@ -360,6 +395,8 @@ static int cmdBench(rdna4_t *gpu, int small) {
 	//    agreement with the CPU (every element up to 512, sampled rows above).
 	static const uint32_t sizes[] = { 64, 128, 256, 512, 1024, 2048 };
 	const uint32_t maxN = small ? 128 : 2048;
+	double bestSpeedup = 0;
+	uint32_t bestSpeedupN = 0;
 	for (unsigned si = 0; si < sizeof(sizes) / sizeof(sizes[0]) && sizes[si] <= maxN; si++) {
 		const uint32_t n = sizes[si];
 		const uint64_t bytes = (uint64_t)n * n * 4;
@@ -390,9 +427,24 @@ static int cmdBench(rdna4_t *gpu, int small) {
 			if (us < best)
 				best = us;
 		}
-		// Rows to check: all of them up to 512, else 64 spread ones.
+		// The same product on the CPU with Accelerate (all cores), best of 3.
+		float *Cc = blas ? malloc(bytes) : NULL;
+		double cpuUs = 0;
+		if (Cc) {
+			cpuUs = 1e30;
+			for (int r = 0; r < 3; r++) {
+				double t = nowUs();
+				cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)n, (int)n, (int)n, 1.0f, A,
+				            (int)n, B, (int)n, 0.0f, Cc, (int)n);
+				t = nowUs() - t;
+				if (t < cpuUs)
+					cpuUs = t;
+			}
+		}
+		// Rows to check: all of them up to 512, else 64 spread ones. Both the
+		// GPU's and Accelerate's results must equal the exact reference.
 		const uint32_t rows = n <= 512 ? n : 64;
-		uint32_t bad = 0, br = 0, bc = 0;
+		uint32_t bad = 0, br = 0, bc = 0, cpuBad = 0;
 		float got = 0, want = 0;
 		for (uint32_t k = 0; k < rows && !kr; k++) {
 			const uint32_t r = rows == n ? k : (uint32_t)(((uint64_t)k * 2654435761u) % n);
@@ -401,6 +453,8 @@ static int cmdBench(rdna4_t *gpu, int small) {
 				float acc = 0.0f;
 				for (uint32_t q = 0; q < n; q++)
 					acc += A[r * n + q] * B[q * n + j];
+				if (Cc && Cc[(uint64_t)r * n + j] != acc)
+					cpuBad++;
 				if (C[j] != acc && !bad++) {
 					br = r;
 					bc = j;
@@ -409,6 +463,7 @@ static int cmdBench(rdna4_t *gpu, int small) {
 				}
 			}
 		}
+		const double gpuGflops = 2.0 * n * n * (double)n / best / 1000.0;
 		if (kr || bad) {
 			if (kr)
 				printf("  FAIL  sgemm n=%u: %s\n", n, rdna4_error(kr));
@@ -416,11 +471,22 @@ static int cmdBench(rdna4_t *gpu, int small) {
 				printf("  FAIL  sgemm n=%u: %u wrong, first C[%u][%u] = %g (want %g)\n", n, bad, br,
 				       bc, got, want);
 			fails++;
+		} else if (Cc) {
+			const double cpuGflops = 2.0 * n * n * (double)n / cpuUs / 1000.0;
+			printf("  ok    sgemm n=%-4u GPU %8.1f GFLOPS (%8.3f ms) | CPU %7.1f GFLOPS (%8.3f ms, "
+			       "Accelerate) | GPU %.1fx; %s exact%s\n", n, gpuGflops, best / 1000.0, cpuGflops,
+			       cpuUs / 1000.0, gpuGflops / cpuGflops,
+			       rows == n ? "every element" : "64 sampled rows",
+			       cpuBad ? " (Accelerate's result differs!)" : "");
+			if (gpuGflops / cpuGflops > bestSpeedup) {
+				bestSpeedup = gpuGflops / cpuGflops;
+				bestSpeedupN = n;
+			}
 		} else {
-			printf("  ok    sgemm n=%-4u %8.1f GFLOPS (%.3f ms), %s exact\n", n,
-			       2.0 * n * n * (double)n / best / 1000.0, best / 1000.0,
-			       rows == n ? "every element" : "64 sampled rows");
+			printf("  ok    sgemm n=%-4u GPU %8.1f GFLOPS (%.3f ms), %s exact\n", n, gpuGflops,
+			       best / 1000.0, rows == n ? "every element" : "64 sampled rows");
 		}
+		free(Cc);
 		rdna4_free(gpu, &a);
 		rdna4_free(gpu, &b);
 		rdna4_free(gpu, &c);
@@ -432,6 +498,9 @@ static int cmdBench(rdna4_t *gpu, int small) {
 	}
 	rdna4_unload(gpu, &copy);
 	rdna4_unload(gpu, &sgemm);
+	if (bestSpeedupN)
+		printf("bench: SGEMM on the GPU is up to %.1fx the CPU with Accelerate (n=%u)\n",
+		       bestSpeedup, bestSpeedupN);
 	printf("bench: %s\n", fails ? "FAILED" : "PASS");
 	return fails ? 1 : 0;
 }

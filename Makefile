@@ -159,7 +159,7 @@ $(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscover
 $(RUN_TOOL): userspace/rdna4-run.c userspace/librdna4.c userspace/librdna4.h include/rdna4compute.h src/vadd_codeobj.h src/bench_codeobj.h
 	@mkdir -p $(BUILD)
 	$(CXX) -x c $(USER_FLAGS) userspace/rdna4-run.c userspace/librdna4.c \
-		-framework IOKit -framework CoreFoundation -o $@
+		-framework IOKit -framework CoreFoundation -weak_framework Accelerate -o $@
 
 userspace: $(RUN_TOOL)
 

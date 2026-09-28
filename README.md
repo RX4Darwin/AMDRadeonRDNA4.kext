@@ -180,7 +180,8 @@ Buffers and programs belong to the connection and are freed when it closes.
 ```sh
 sudo build/rdna4-run info                     # stage, heap size and free space
 sudo build/rdna4-run selftest [items]         # vadd and an LDS/barrier kernel, every result checked
-sudo build/rdna4-run bench [small]            # host<->GPU MB/s, VRAM GB/s, SGEMM GFLOPS vs the CPU
+sudo build/rdna4-run bench [small]            # host<->GPU MB/s, VRAM GB/s, SGEMM GFLOPS, each vs the
+                                              # CPU (memcpy; Accelerate's cblas_sgemm, weak-linked)
 sudo build/rdna4-run load k.hsaco my_kernel   # load a code object, describe a kernel
 ```
 
