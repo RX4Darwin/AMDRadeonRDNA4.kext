@@ -6,6 +6,7 @@
 #
 #   tools/vm-test.sh [extra boot-args...]     e.g. tools/vm-test.sh rdna4-ih=1
 #   RDNA4_DEV=ih-dead=on,flip-stuck=on tools/vm-test.sh ...
+#   RDNA4_POST='...bash...' tools/vm-test.sh    extra steps on the same boot, under the lock
 #                                             emulated-card options (the rdna4
 #                                             device's fault switches), comma-separated
 #
@@ -92,3 +93,15 @@ $SSH 'cd /tmp; echo "== selftest"; echo 1234 | sudo -S ./rdna4-run selftest 1638
 echo "== emulator"
 grep -aE "rdna4: cs: (unsupported|LDS access|dispatch stopped|work-item ran|WMMA)|rdna4: .*(fault|not modelled)" \
 	~/emu-boot.out | head -10 || true
+
+# 4. Optional: more steps on the same boot, still holding the lock (nobody
+#    can reboot the VM under them). RDNA4_POST is a bash script; it gets
+#    SSH (a command prefix to the VM), SSH_KEY, VM_SCP_PORT=10022,
+#    MONITOR (the QEMU monitor socket, e.g. for "screendump /tmp/x.ppm")
+#    and REPO. Example:
+#      RDNA4_POST='$SSH "echo 1234 | sudo -S /tmp/rdna4-run show 3"' tools/vm-test.sh
+if [ -n "${RDNA4_POST:-}" ]; then
+	echo "== post (RDNA4_POST)"
+	SSH="$SSH" SSH_KEY="$SSH_KEY" VM_SCP_PORT=10022 MONITOR="$HOME/tahoe-monitor.sock" REPO="$REPO" \
+		bash -c "$RDNA4_POST" 9>&-
+fi
