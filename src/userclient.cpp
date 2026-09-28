@@ -93,6 +93,7 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sAllocHost,  2,          0,                          3,           0 },
 	{ sSensors,    0,          0,                          0,           sizeof(RDNA4Sensors) },
 	{ sSleepTest,  1,          0,                          0,           0 },
+	{ sQuiesce,    0,          0,                          0,           0 },
 	{ sPresentAsync, 2,        0,                          1,           0 },
 	{ sWaitPresent,  2,        0,                          1,           0 },
 	{ sSubmitIb,   3,          0,                          1,           0 },
@@ -122,6 +123,10 @@ IOReturn RDNA4ComputeClient::sSensors(OSObject *t, void *, IOExternalMethodArgum
 
 IOReturn RDNA4ComputeClient::sSleepTest(OSObject *t, void *, IOExternalMethodArguments *a) {
 	return self(t)->compute->rtSleepTest(t, static_cast<uint32_t>(a->scalarInput[0]));
+}
+
+IOReturn RDNA4ComputeClient::sQuiesce(OSObject *t, void *, IOExternalMethodArguments *) {
+	return self(t)->compute->rtQuiesce(t);
 }
 
 IOReturn RDNA4ComputeClient::sAlloc(OSObject *t, void *, IOExternalMethodArguments *a) {

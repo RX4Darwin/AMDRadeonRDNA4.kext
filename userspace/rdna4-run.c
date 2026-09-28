@@ -123,6 +123,16 @@ static int cmdSleepTest(rdna4_t *gpu) {
 	return 0;
 }
 
+static int cmdQuiesce(rdna4_t *gpu) {
+	kern_return_t kr = rdna4_quiesce(gpu);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "quiesce: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	printf("quiesce: shutdown/restart path complete; card is safe to reset\n");
+	return 0;
+}
+
 static int cmdVsync(rdna4_t *gpu, uint32_t frames) {
 	uint64_t previous = 0, minNs = UINT64_MAX, maxNs = 0, sumNs = 0;
 	uint32_t intervals = 0;
@@ -1847,6 +1857,7 @@ static int cmdLoad(rdna4_t *gpu, const char *path, const char *kernel) {
 static void usage(void) {
 	fprintf(stderr, "usage: rdna4-run info\n"
 	                "       rdna4-run sleeptest\n"
+	                "       rdna4-run quiesce\n"
 	                "       rdna4-run sensors\n"
 	                "       rdna4-run selftest [items]\n"
 	                "       rdna4-run selftest hang\n"
@@ -1874,6 +1885,10 @@ int main(int argc, char **argv) {
 		if (!openRuntime(&gpu))
 			return 1;
 		rc = cmdSleepTest(&gpu);
+	} else if (!strcmp(argv[1], "quiesce") && argc == 2) {
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdQuiesce(&gpu);
 	} else if (!strcmp(argv[1], "sensors") && argc == 2) {
 		if (!openRuntime(&gpu))
 			return 1;

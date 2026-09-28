@@ -60,6 +60,8 @@ kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out);
 kern_return_t rdna4_sensors(rdna4_t *dev, RDNA4Sensors *out);
 /* Debug-only simulated sleep: phase 1 quiesces, phase 2 re-brings up. */
 kern_return_t rdna4_sleep_test(rdna4_t *dev, uint32_t phase);
+/* Debug-only root quiesce through the system shutdown/restart path. */
+kern_return_t rdna4_quiesce(rdna4_t *dev);
 
 kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out);
 /* Allocate snooped system memory, mapped into the client's GPUVM and task. */

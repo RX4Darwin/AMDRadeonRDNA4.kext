@@ -60,6 +60,10 @@ kern_return_t rdna4_sleep_test(rdna4_t *dev, uint32_t phase) {
 	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodSleepTest, &input, 1, NULL, NULL);
 }
 
+kern_return_t rdna4_quiesce(rdna4_t *dev) {
+	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodQuiesce, NULL, 0, NULL, NULL);
+}
+
 kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out) {
 	uint64_t o[2] = { 0 };
 	uint32_t n = 2;

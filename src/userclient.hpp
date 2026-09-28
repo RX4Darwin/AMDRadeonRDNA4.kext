@@ -63,6 +63,7 @@ private:
 	static IOReturn sAllocHost(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sSensors(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sSleepTest(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sQuiesce(OSObject *t, void *, IOExternalMethodArguments *);
 	static IOReturn sPresentAsync(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sWaitPresent(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sSubmitIb(OSObject *t, void *, IOExternalMethodArguments *a);

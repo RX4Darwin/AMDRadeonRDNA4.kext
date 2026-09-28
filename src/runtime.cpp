@@ -1121,6 +1121,19 @@ IOReturn RDNA4Compute::rtSleepTest(const void *owner, uint32_t phase) {
 	return kIOReturnSuccess;
 }
 
+IOReturn RDNA4Compute::rtQuiesce(const void *owner) {
+	/* The user client is administrator-only.  This selector deliberately calls
+	 * the same path as the root-domain shutdown/restart notification so that a
+	 * monitor reset can compare a stopped card with an inherited live card. */
+	{
+		Locked g(rtLock);
+		if (!clientFor(owner))
+			return kIOReturnNotFound;
+	}
+	quiesceForShutdown("debug quiesce");
+	return kIOReturnSuccess;
+}
+
 // Contents are undefined, as with any GPU allocation; callers write first.
 IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	Locked g(rtLock);

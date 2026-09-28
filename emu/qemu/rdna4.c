@@ -632,6 +632,7 @@ struct RDNA4State {
     uint32_t     gfx_work_ring_dw;
     bool         warm_dma_window;
     uint64_t     dma_after_reset_writes;
+    bool         bus_master_before_reset;
 
     /* Queue kicks are consumed by the QEMU main loop, never by an MMIO
      * handler.  The realtime timer re-arms the bottom half between slices. */
@@ -737,6 +738,18 @@ static bool rdna4_bus_master_enabled(RDNA4State *s)
 {
     PCIDevice *pci = PCI_DEVICE(s);
     return (pci_get_word(pci->config + PCI_COMMAND) & PCI_COMMAND_MASTER) != 0;
+}
+
+/* QEMU resets the generic PCI config image before invoking the device reset
+ * callback.  Remember the pre-reset command bit so warm-keep can distinguish
+ * a live card from a quiesced one; the latter must remain DMA-disabled. */
+static void rdna4_config_write(PCIDevice *dev, uint32_t address, uint32_t data,
+                               int len)
+{
+    RDNA4State *s = RDNA4(dev);
+    pci_default_write_config(dev, address, data, len);
+    if (address < PCI_COMMAND + 2 && address + len > PCI_COMMAND)
+        s->bus_master_before_reset = rdna4_bus_master_enabled(s);
 }
 
 /* All device writes into guest/system memory use this gate. IH and writeback
@@ -6148,6 +6161,14 @@ static void rdna4_reset(DeviceState *dev)
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (s->warm_keep && rdna4_engine_active(s)) {
+        fprintf(stderr, "rdna4: warm-keep: reset PCI bus master current=%d remembered=%d\n",
+                rdna4_bus_master_enabled(s), s->bus_master_before_reset);
+        if (!rdna4_bus_master_enabled(s) && s->bus_master_before_reset) {
+            PCIDevice *pci = PCI_DEVICE(s);
+            pci_set_word(pci->config + PCI_COMMAND,
+                         pci_get_word(pci->config + PCI_COMMAND) | PCI_COMMAND_MASTER);
+            fprintf(stderr, "rdna4: warm-keep: restoring PCI bus master for live engines\n");
+        }
         if (s->warm_dma_window)
             fprintf(stderr, "rdna4: warm-keep: DMA-after-reset writes: %" PRIu64 "\n",
                     s->dma_after_reset_writes);
@@ -6158,6 +6179,11 @@ static void rdna4_reset(DeviceState *dev)
         s->dma_after_reset_writes = 0;
         fprintf(stderr, "rdna4: warm-keep: reset preserves IH/SDMA/MEC/GFX; "
                 "counting DMA writes until the next reset\n");
+        /* The generic QEMU reset path may cancel a pending BH/timer even
+         * though this device reset intentionally kept the queues.  Re-kick
+         * the live work so a warm reset models the card's engines continuing
+         * to DMA until the driver quiesces them. */
+        rdna4_work_schedule(s);
         return;
     }
 
@@ -6425,6 +6451,7 @@ static void rdna4_class_init(ObjectClass *klass, void *data)
     k->subsystem_id = 0xe489;
     k->realize = rdna4_realize;
     k->exit = rdna4_exit;
+    k->config_write = rdna4_config_write;
     device_class_set_legacy_reset(dc, rdna4_reset);
     device_class_set_props(dc, rdna4_properties);
     dc->desc = "AMD Radeon RX 9070 XT display-engine model (RDNA4FB development)";
