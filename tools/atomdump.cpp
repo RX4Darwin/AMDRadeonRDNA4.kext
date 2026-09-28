@@ -1710,6 +1710,11 @@ static int testPm4Packets() {
 	failures += check(Pm4::acquireMem(p, Pm4::kGcrMemSync) == 8 && p[0] == 0xc0065800 &&
 	                  p[2] == 0xffffffff && p[3] == 0xffffff && p[6] == 0xa && p[7] == 0xc3b1,
 	                  "pm4: ACQUIRE_MEM %08x gcr %08x", p[0], p[7]);
+	failures += check(Pm4::indirectBufferCompute(p, a, 37, 8) == 4 && p[0] == 0xc0023f00 &&
+	                  p[1] == 0x0c003080 && p[2] == 0x80 && p[3] == 0x08800025,
+	                  "pm4: compute INDIRECT_BUFFER VALID/VMID %08x", p[3]);
+	failures += check(!(p[3] & ((1u << 20) | (1u << 21) | (1u << 31))),
+	                  "pm4: compute INDIRECT_BUFFER is unprivileged and unchained");
 
 	uint32_t mem[256];
 	Pm4::Queue q;

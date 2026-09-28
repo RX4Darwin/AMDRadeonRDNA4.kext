@@ -162,7 +162,7 @@ $(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscover
 	$(CXX) -std=c++17 -Wall -O2 -Iinclude -o $@ tools/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp src/modeset.cpp src/amdfw.cpp src/psp.cpp src/sdma.cpp src/ihdecode.cpp src/pm4.cpp src/codeobj.cpp src/gpuheap.cpp src/gpuvm.cpp
 
 # Linked by the C++ driver: it is the one pointed at ld64 (build-osxcross.sh).
-$(RUN_TOOL): userspace/rdna4-run.c userspace/librdna4.c userspace/librdna4.h include/rdna4compute.h src/vadd_codeobj.h src/bench_codeobj.h
+$(RUN_TOOL): userspace/rdna4-run.c userspace/librdna4.c userspace/librdna4.h userspace/pm4build.h include/rdna4compute.h src/vadd_codeobj.h src/bench_codeobj.h
 	@mkdir -p $(BUILD)
 	$(CXX) -x c $(USER_FLAGS) userspace/rdna4-run.c userspace/librdna4.c \
 		-framework IOKit -framework CoreFoundation -weak_framework Accelerate -o $@
