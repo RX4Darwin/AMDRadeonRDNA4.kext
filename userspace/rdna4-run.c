@@ -5,6 +5,7 @@
  *  Command-line client of the RDNA4FB compute runtime (run as root):
  *
  *    rdna4-run info                        what the runtime reports
+ *    rdna4-run sleeptest                  debug-only simulated sleep cycle
  *    rdna4-run selftest [items]            shaders/vadd.cl and bench.cl's
  *                                          lds_reverse and wmma16 (embedded)
  *                                          on the GPU, every result checked,
@@ -75,6 +76,48 @@ static int cmdInfo(rdna4_t *gpu) {
 	       : "the CPU through the BAR (no DMA)");
 	if (in.flags & RDNA4_FLAG_VM)
 		printf("GPUVM: VMID %llu, MEC1 pipe %llu queue %llu\n", in.vmid, in.pipe, in.queue);
+	return 0;
+}
+
+static int cmdSensors(rdna4_t *gpu) {
+	RDNA4Sensors s;
+	kern_return_t kr = rdna4_sensors(gpu, &s);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "sensors: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	printf("sensors: edge %u C, hotspot %u C, GFX %u MHz, memory %u MHz, "
+	       "socket %u W, fan %u RPM\n", s.edgeTempC, s.hotspotTempC,
+	       s.gfxClockMHz, s.memoryClockMHz, s.socketPowerW, s.fanRpm);
+	return 0;
+}
+
+static int cmdSleepTest(rdna4_t *gpu) {
+	kern_return_t kr = rdna4_sleep_test(gpu, 1);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "sleeptest: phase 1: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	printf("sleeptest: sleep selector acknowledged; waiting for emulator reset\n");
+	fflush(stdout);
+	/* RDNA4_POST sets the QEMU sleep-reset property during this window. */
+	sleep(15);
+	kr = rdna4_sleep_test(gpu, 2);
+	if (kr != KERN_SUCCESS) {
+		fprintf(stderr, "sleeptest: phase 2: %s\n", rdna4_error(kr));
+		return 1;
+	}
+	printf("sleeptest: wake selector acknowledged; waiting for re-bring-up\n");
+	fflush(stdout);
+	sleep(15);
+	rdna4_info_t info;
+	kr = rdna4_info(gpu, &info);
+	if (kr != kIOReturnAborted) {
+		fprintf(stderr, "sleeptest: pre-sleep client returned %s, want aborted\n",
+		        rdna4_error(kr));
+		return 1;
+	}
+	printf("sleeptest: pre-sleep client aborted as expected\n");
 	return 0;
 }
 
@@ -1369,6 +1412,8 @@ static int cmdLoad(rdna4_t *gpu, const char *path, const char *kernel) {
 
 static void usage(void) {
 	fprintf(stderr, "usage: rdna4-run info\n"
+	                "       rdna4-run sleeptest\n"
+	                "       rdna4-run sensors\n"
 	                "       rdna4-run selftest [items]\n"
 	                "       rdna4-run selftest hang\n"
 	                "       rdna4-run hangtest\n"
@@ -1389,6 +1434,14 @@ int main(int argc, char **argv) {
 		if (!openRuntime(&gpu))
 			return 1;
 		rc = cmdInfo(&gpu);
+	} else if (!strcmp(argv[1], "sleeptest") && argc == 2) {
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdSleepTest(&gpu);
+	} else if (!strcmp(argv[1], "sensors") && argc == 2) {
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdSensors(&gpu);
 	} else if (!strcmp(argv[1], "selftest") && argc <= 3) {
 		if (!openRuntime(&gpu))
 			return 1;

@@ -54,6 +54,7 @@
 #include "hw/pci/pci_device.h"
 #include "hw/pci/pcie.h"
 #include "hw/pci/msi.h"
+#include "qapi/visitor.h"
 #include "hw/qdev-properties.h"
 #include "qapi/error.h"
 #include "ui/console.h"
@@ -397,6 +398,7 @@ struct RDNA4State {
     bool     ih_dead;        /* IH writes the ring but never raises MSI */
     bool     dcn_irq_storm;  /* DCN vblank source runs at 10x */
     bool     hang_sticky;    /* queue dequeue never completes */
+    bool     sleep_reset;    /* monitor-triggered compute power reset */
 
     uint32_t *regs;           /* BAR5 image, RDNA4_MMIO_SIZE bytes */
     uint8_t  *resv;           /* top RDNA4_RESV_SIZE bytes of VRAM */
@@ -428,6 +430,7 @@ struct RDNA4State {
     uint64_t     psp_fw_types[2];       /* LOAD_IP_FW types seen, by bit */
     uint64_t     smu_allowed;           /* SetAllowedFeaturesMask */
     uint64_t     smu_running;           /* features the PMFW runs */
+    uint64_t     smu_table_mc;          /* driver metrics table address */
     bool         autoload_armed;        /* AUTOLOAD_RLC accepted, IMU not released */
     uint64_t     sdma_wptr;             /* SDMA0 queue 0's last wptr: 64-bit, monotonic */
     bool         mec_hung;              /* dispatch waves are live and its fence is absent */
@@ -817,6 +820,44 @@ static uint64_t rdna4_dcn_period_ns(RDNA4State *s, int otg)
     return pclk ? htot * vtot * NANOSECONDS_PER_SECOND / pclk : 0;
 }
 
+static void rdna4_reset(DeviceState *dev);
+
+static void rdna4_sleep_reset_get(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    const Property *prop = opaque;
+    bool *src = object_field_prop_ptr(obj, prop);
+    visit_type_bool(v, name, src, errp);
+}
+
+static void rdna4_sleep_reset_default(ObjectProperty *op, const Property *prop)
+{
+    object_property_set_default_bool(op, prop->defval.u);
+}
+
+static void rdna4_sleep_reset_set(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    const Property *prop = opaque;
+    RDNA4State *s = RDNA4(obj);
+    bool *dst = object_field_prop_ptr(obj, prop);
+    if (!visit_type_bool(v, name, dst, errp) || !*dst)
+        return;
+    /* Make the already-running DCN timer observe this one-shot monitor
+     * request even when the next raster event has not been scheduled. */
+    if (s->dcn_timer)
+        timer_mod_ns(s->dcn_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+static const PropertyInfo rdna4_sleep_reset_prop = {
+    .type = "bool",
+    .description = "trigger a debug compute power reset",
+    .get = rdna4_sleep_reset_get,
+    .set = rdna4_sleep_reset_set,
+    .set_default_value = rdna4_sleep_reset_default,
+    .realized_set_allowed = true,
+};
+
 static void rdna4_dcn_vblank(RDNA4State *s, int otg, uint64_t frame)
 {
     uint32_t addr = SEG2(OTG_GLOBAL_SYNC_STATUS + otg * OTG_STRIDE);
@@ -830,6 +871,13 @@ static void rdna4_dcn_vblank(RDNA4State *s, int otg, uint64_t frame)
 static void rdna4_dcn_timer(void *opaque)
 {
     RDNA4State *s = opaque;
+    if (s->sleep_reset) {
+        fprintf(stderr, "rdna4: sleep-reset: property observed by DCN timer\n");
+        s->sleep_reset = false;
+        fprintf(stderr, "rdna4: sleep-reset: compute power reset; DCN and VRAM retained\n");
+        rdna4_reset(DEVICE(s));
+        return;
+    }
     const uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint64_t next = 0;
     for (int otg = 0; otg < NUM_OTG; otg++) {
@@ -1114,6 +1162,8 @@ static void rdna4_dmub_wptr(RDNA4State *s, uint32_t wptr)
 
 /* ---- SMU mailbox ---------------------------------------------------------- */
 
+static uint8_t *rdna4_mc_span(RDNA4State *s, uint64_t mc, uint64_t len);
+
 /*
  * PPSMC message protocol (smu_v14_0): the driver clears RESP, stages PARAM
  * and writes the message id; the PMFW answers in RESP (and PARAM). As on the
@@ -1183,7 +1233,29 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
         reg_set(s, REG_SMU_PARAM, (uint32_t)(s->smu_running >> 32));
         break;
     case 0xe:                                      /* SetDriverDramAddrHigh */
+        s->smu_table_mc = (s->smu_table_mc & 0xffffffffull) | ((uint64_t)param << 32);
+        break;
     case 0xf:                                      /* SetDriverDramAddrLow */
+        s->smu_table_mc = (s->smu_table_mc & 0xffffffff00000000ull) | param;
+        break;
+    case 0x12: {                                   /* TransferTableSmu2Dram / GetMetricsTable */
+        /* smu14_driver_if_v14_0.h: fixed values make emulator telemetry
+         * obvious in logs and tests. */
+        uint8_t *table = rdna4_mc_span(s, s->smu_table_mc, 4096);
+        if (!table) {
+            resp = SMU_RESP_UNKNOWN;
+            break;
+        }
+        memset(table, 0, 4096);
+        stw_le_p(table + 44 + 2 * 2, 2100);       /* AverageGfxclkFrequencyPostDs */
+        stw_le_p(table + 44 + 6 * 2, 1000);       /* AverageMemclkFrequencyPostDs */
+        stw_le_p(table + 140 + 0 * 2, 42);         /* TEMP_EDGE */
+        stw_le_p(table + 140 + 1 * 2, 55);         /* TEMP_HOTSPOT */
+        stw_le_p(table + 136, 120);                /* AverageSocketPower, watts */
+        stw_le_p(table + 172, 900);                /* AvgFanRpm */
+        fprintf(stderr, "rdna4: smu: synthetic metrics 42C/55C, 2100/1000 MHz, 120 W, 900 RPM\n");
+        break;
+    }
     case 0x29:                                     /* DisallowGfxOff */
     case 0x36:                                     /* RunDcBtc */
         break;
@@ -3408,6 +3480,15 @@ static void rdna4_reset(DeviceState *dev)
     RDNA4State *s = RDNA4(dev);
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
+    s->sleep_reset = false;
+
+    /* ACPI S3 removes power from the compute engines while DCN and VRAM
+     * remain observable by the display. Save the DMU segments across the
+     * power-on image restore; the rest of BAR5 is rebuilt from gop-state. */
+    const size_t dcn_start = SEG2(0);
+    const size_t dcn_bytes = SEG3(0) - dcn_start;
+    uint8_t *dcn = s->regs ? g_memdup2(s->regs + dcn_start, dcn_bytes) : NULL;
+
     memset(s->regs, 0, RDNA4_MMIO_SIZE);
     memset(s->resv, 0, RDNA4_RESV_SIZE);
     memset(s->hqd, 0, sizeof(s->hqd));
@@ -3418,6 +3499,11 @@ static void rdna4_reset(DeviceState *dev)
         if (!rdna4_load_state(s, &err)) {
             error_report_err(err);
         }
+    }
+    if (dcn) {
+        memcpy(s->regs + dcn_start, dcn, dcn_bytes);
+        g_free(dcn);
+        fprintf(stderr, "rdna4: power reset: compute state restored from gop-state; DCN and VRAM retained\n");
     }
     if (s->discovery) {
         memcpy(s->resv + RDNA4_RESV_SIZE - RDNA4_DISCOVERY_TOP, s->discovery,
@@ -3433,6 +3519,7 @@ static void rdna4_reset(DeviceState *dev)
     memset(s->psp_fw_types, 0, sizeof(s->psp_fw_types));
     s->smu_allowed = ~0ull;
     s->smu_running = 0;
+    s->smu_table_mc = 0;
     s->autoload_armed = false;
     s->sdma_wptr = 0;
     s->mec_hung = false;
@@ -3585,6 +3672,8 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("ih-dead", RDNA4State, ih_dead, false),
     DEFINE_PROP_BOOL("dcn-irq-storm", RDNA4State, dcn_irq_storm, false),
     DEFINE_PROP_BOOL("hang-sticky", RDNA4State, hang_sticky, false),
+    DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,
+                bool),
 };
 
 static void rdna4_class_init(ObjectClass *klass, void *data)

@@ -399,6 +399,7 @@ constexpr uint32_t kSmuMsgGetRunningFeaturesLow = 0x0c;
 constexpr uint32_t kSmuMsgGetRunningFeaturesHigh = 0x0d;
 constexpr uint32_t kSmuMsgSetDriverDramAddrHigh = 0x0e;
 constexpr uint32_t kSmuMsgSetDriverDramAddrLow  = 0x0f;
+constexpr uint32_t kSmuMsgGetMetricsTable       = 0x12;
 constexpr uint32_t kSmuMsgDisallowGfxOff        = 0x29;
 constexpr uint32_t kSmuMsgRunDcBtc              = 0x36;
 constexpr uint32_t kSmuPwrDomainGfx             = 4;      // FEATURE_PWR_GFX

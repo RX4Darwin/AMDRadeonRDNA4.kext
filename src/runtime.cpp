@@ -94,6 +94,18 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 	rtStage = stage;
 	rtReady = true;
 	IOLockUnlock(rtLock);
+	if (rtService) {
+		// Wake re-bring-up keeps the original IOService and its user clients;
+		// only the hardware/runtime state was rebuilt.
+		rtService->setProperty("HeapBytes", devHeap.size() ? devHeap.size() : heap.size(), 64);
+		rtService->setProperty("DMA", dmaReady);
+		if (resumePending) {
+			resumed = true;
+			powerSleeping = false;
+		}
+		RLOG("user-space runtime up again: %s", RDNA4_COMPUTE_SERVICE);
+		return;
+	}
 
 	auto *svc = OSTypeAlloc(RDNA4ComputeService);
 	if (!svc || !svc->init()) {
@@ -109,6 +121,12 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 	if (!svc->attach(env.pci)) {
 		svc->release();
 		RLOG("not published: could not attach to the GPU");
+		return;
+	}
+	if (!svc->registerPowerManagement(env.pci)) {
+		RLOG("not published: power management registration failed");
+		svc->terminate();
+		svc->release();
 		return;
 	}
 	svc->registerService();
@@ -147,6 +165,15 @@ RDNA4Compute::RtClient *RDNA4Compute::clientFor(const void *owner) {
 		if (c.owner == owner && c.active)
 			return &c;
 	return nullptr;
+}
+
+IOReturn RDNA4Compute::ownerStateLocked(const void *owner) const {
+	if (!rtReady)
+		return kIOReturnNotReady;
+	for (const RtClient &c : clients)
+		if (c.owner == owner && c.active)
+			return c.aborted ? kIOReturnAborted : kIOReturnSuccess;
+	return kIOReturnSuccess;
 }
 
 bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, bool executable) {
@@ -467,17 +494,23 @@ void RDNA4Compute::logClientFault(RtClient &c, const char *tag) {
 }
 
 IOReturn RDNA4Compute::rtOpen(const void *owner) {
-	if (!vmEnabled)
-		return kIOReturnSuccess;
 	Locked g(rtLock);
-	if (clientFor(owner))
-		return kIOReturnSuccess;
+	if (!rtReady)
+		return kIOReturnNotReady;
+	if (RtClient *old = clientFor(owner))
+		return old->aborted ? kIOReturnAborted : kIOReturnSuccess;
 	RtClient *c = nullptr;
 	uint32_t slot = 0;
 	for (; slot < kMaxClients; slot++)
 		if (!clients[slot].active) { c = &clients[slot]; break; }
 	if (!c)
 		return kIOReturnNoResources;
+	if (!vmEnabled) {
+		*c = RtClient {};
+		c->owner = owner;
+		c->active = true;
+		return kIOReturnSuccess;
+	}
 	uint32_t vmid = 0;
 	for (vmid = 8; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
 	if (vmid > 15)
@@ -590,6 +623,9 @@ void RDNA4Compute::checkPresentationTimeoutLocked() {
 
 IOReturn RDNA4Compute::rtInfo(const void *owner, uint64_t out[9]) {
 	Locked g(rtLock);
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
 	checkPresentationTimeoutLocked();
 	out[0] = RDNA4_COMPUTE_ABI;
 	out[1] = rtStage;
@@ -604,8 +640,41 @@ IOReturn RDNA4Compute::rtInfo(const void *owner, uint64_t out[9]) {
 	out[6] = c ? c->vmid : 0;
 	out[7] = c ? c->pipe : 0;
 	out[8] = c ? c->queue : 0;
-	if (c)
+	if (vmEnabled && c)
 		out[2] |= RDNA4_FLAG_VM;
+	if (resumed)
+		out[2] |= RDNA4_FLAG_RESUMED;
+	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4Compute::rtSensors(const void *owner, RDNA4Sensors &out) {
+	Locked g(rtLock);
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	return readSensors(out) ? kIOReturnSuccess : kIOReturnNotResponding;
+}
+
+IOReturn RDNA4Compute::rtSleepTest(const void *owner, uint32_t phase) {
+	uint32_t enabled = 0;
+	if (!PE_parse_boot_argn("rdna4-sleeptest", &enabled, sizeof(enabled)) || !enabled)
+		return kIOReturnUnsupported;
+	if (phase != 1 && phase != 2)
+		return kIOReturnBadArgument;
+	/* IOUserClient::initWithTask already requires kIOClientPrivilegeAdministrator;
+	 * this selector is therefore root-only along with the rest of this service. */
+	{
+		Locked g(rtLock);
+		if (!clientFor(owner))
+			return kIOReturnNotFound;
+	}
+	if (phase == 1) {
+		RLOG("power: debug sleep selector phase 1");
+		powerWillSleep();
+	} else {
+		RLOG("power: debug sleep selector phase 2");
+		powerDidWake();
+	}
 	return kIOReturnSuccess;
 }
 
@@ -613,8 +682,9 @@ IOReturn RDNA4Compute::rtInfo(const void *owner, uint64_t out[9]) {
 IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
-	if (!rtReady)
-		return kIOReturnNotReady;
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
 	RtClient *c = clientFor(owner);
 	if (vmEnabled && !c)
 		return kIOReturnNoResources;
@@ -656,8 +726,9 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
                                    uint64_t flags, uint64_t &handle, uint64_t &gpu,
                                    uint64_t &user) {
 	Locked g(rtLock);
-	if (!rtReady)
-		return kIOReturnNotReady;
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
 	if (!vmEnabled)
 		return kIOReturnUnsupported;
 	RtClient *c = clientFor(owner);
@@ -774,6 +845,9 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 
 IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	Locked g(rtLock);
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
 	checkPresentationTimeoutLocked();
 	RtBuffer *b = bufferFor(owner, handle);
 	if (!b)
@@ -809,8 +883,9 @@ IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offse
                               mach_vm_address_t user, uint64_t length, bool toGpu) {
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
-	if (!rtReady)
-		return kIOReturnNotReady;
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
 	RtBuffer *b = bufferFor(owner, handle);
 	if (!b || offset > b->bytes || length > b->bytes - offset)
 		return kIOReturnBadArgument;
@@ -832,8 +907,9 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
                               const char *name, uint64_t out[8]) {
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
-	if (!rtReady)
-		return kIOReturnNotReady;
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
 	RtClient *c = clientFor(owner);
 	if (vmEnabled && !c)
 		return kIOReturnNoResources;
@@ -906,6 +982,9 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 
 IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 	Locked g(rtLock);
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
 	checkPresentationTimeoutLocked();
 	RtProgram *p = programFor(owner, program);
 	if (!p)
@@ -920,8 +999,9 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros) {
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
-	if (!rtReady)
-		return kIOReturnNotReady;
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
 	if (rtWedged)
 		return kIOReturnNotResponding;
 	RtClient *c = clientFor(owner);
@@ -1012,8 +1092,9 @@ IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t of
                                  uint64_t &geometry, uint64_t &pitch) {
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
-	if (!rtReady)
-		return kIOReturnNotReady;
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
 
 	Flip::Surface surface {};
 	if (!handle) {
@@ -1056,6 +1137,9 @@ IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t of
 
 IOReturn RDNA4Compute::rtRestore(const void *owner) {
 	Locked g(rtLock);
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
 	checkPresentationTimeoutLocked();
 	if (!presentActive)
 		return kIOReturnSuccess;
@@ -1069,6 +1153,14 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		return;
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
+	RtClient *early = clientFor(owner);
+	if (powerSleeping || (early && early->aborted)) {
+		// Hardware is off or has already been rebuilt. The resume cleanup owns
+		// the old allocations; never touch a dead HQD from clientClose().
+		if (early)
+			*early = RtClient {};
+		return;
+	}
 	if (presentActive && presentOwner == owner)
 		(void)restorePresentationLocked("client close");
 	RtClient *c = clientFor(owner);
@@ -1113,7 +1205,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	}
 	if (nb || np)
 		RLOG("client closed: freed %u buffer(s), %u program(s)", nb, np);
-	if (c) {
+	if (c && vmEnabled) {
 		/* Dequeue is deliberately polled: W1's interrupt path is not required. */
 		grbmSelect(1, c->pipe, c->queue, c->vmid);
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
@@ -1135,7 +1227,125 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		RLOG("vmid %u: client closed, freed MEC1 pipe %u queue %u and page tables",
 		     c->vmid, c->pipe, c->queue);
 		*c = RtClient {};
+	} else if (c) {
+		*c = RtClient {};
 	}
+}
+
+void RDNA4Compute::powerWillSleep() {
+	if (!rtLock)
+		return;
+	Locked g(rtLock);
+	if (powerSleeping)
+		return;
+	rtReady = false;
+	powerSleeping = true;
+	resumePending = false;
+	RLOG("power: quiesce begin (runtime not ready)");
+	// Calls serialize on rtLock, so no dispatch or SDMA fence can still be
+	// executing here. Drain every HQD with the same bounded poll used by W6.
+	auto drainQueue = [this](uint32_t pipe, uint32_t queue, uint32_t vmid,
+	                     const Launch *recovery) {
+		grbmSelect(1, pipe, queue, vmid);
+		if (!(rdGc(CpHqdActive) & 1)) {
+			grbmSelect(0, 0, 0, 0);
+			return true;
+		}
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
+		bool inactive = false;
+		for (uint32_t us = 0; us < 100000; us += 10) {
+			if (!(rdGc(CpHqdActive) & 1)) { inactive = true; break; }
+			IODelay(10);
+		}
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+		if (!inactive && recovery) {
+			RLOG("power: HQD %u/%u VMID %u timed out; invoking W6 recovery", pipe, queue, vmid);
+			inactive = recoverComputeQueue("sleep", recovery);
+		}
+		if (!inactive)
+			RLOG("power: HQD %u/%u VMID %u did not drain within the bound", pipe, queue, vmid);
+		grbmSelect(0, 0, 0, 0);
+		return inactive;
+	};
+	(void)drainQueue(0, 0, 0, nullptr);
+	for (RtClient &c : clients) {
+		if (!c.active || !c.vmid)
+			continue;
+		Launch recovery {};
+		recovery.queue = &c.pm4;
+		recovery.queueCpu = c.queueCpu;
+		recovery.queueAddress = c.queueVa;
+		recovery.vmid = c.vmid;
+		recovery.pipe = c.pipe;
+		recovery.queueId = c.queue;
+		recovery.doorbell = c.doorbell;
+		recovery.recoveryMqd = c.mqdMc;
+		recovery.recoveryEop = c.eopVa;
+		recovery.recoveryRptr = c.rptrVa;
+		recovery.recoveryWpoll = c.wpollVa;
+		recovery.recoveryProofAddress = c.fenceVa;
+		recovery.recoveryProofCpu = c.fenceCpu;
+		(void)drainQueue(c.pipe, c.queue, c.vmid, &recovery);
+	}
+	if (ihActive)
+		ihStop();
+	// The flip implementation has no independent timer in this worktree;
+	// IH DCN teardown is the hook that stops its vblank/pflip activity.
+	RLOG("power: IH disabled, flip timer hook stopped");
+	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
+	wr(IpDiscovery::HwGc, CpMecRs64Cntl, rdGc(CpMecRs64Cntl) | kRs64Halt);
+	dmaTeardown("system sleep");
+	RLOG("power: quiesce complete; compute engines halted");
+}
+
+void RDNA4Compute::resetRuntimeForResume() {
+	if (!rtLock)
+		return;
+	Locked g(rtLock);
+	for (RtBuffer &b : buffers) {
+		if (!b.owner)
+			continue;
+		if (b.host)
+			releaseHost(b);
+		else if (b.device)
+			devHeap.free(b.offset);
+		else
+			heap.free(b.offset);
+		b = RtBuffer {};
+	}
+	for (RtProgram &p : programs) {
+		if (p.owner) {
+			heap.free(p.offset);
+			p = RtProgram {};
+		}
+	}
+	for (RtClient &c : clients) {
+		if (!c.active)
+			continue;
+		if (c.tableShadow) {
+			IOFree(c.tableShadow, kVmTableBytes);
+			c.tableShadow = nullptr;
+		}
+		c.aborted = true;
+		c.tableOffset = c.rootMc = c.rootPhys = 0;
+		c.queueCpu = nullptr;
+		c.kernargCpu = c.fenceCpu = nullptr;
+	}
+	bzero(vmidUsed, sizeof(vmidUsed));
+	bzero(queueUsed, sizeof(queueUsed));
+	if (devHeapMap) {
+		IOFree(devHeapMap, devHeapMapBytes);
+		devHeapMap = nullptr;
+		devHeapMapBytes = 0;
+	}
+	heap = GpuHeap::Heap {};
+	devHeap = GpuHeap::Heap {};
+	hostBytesTotal = 0;
+	presentActive = false;
+	presentOwner = nullptr;
+	rtWedged = false;
+	rtReady = false;
+	RLOG("power: old runtime buffers, heaps and VM contexts discarded; client objects retained as aborted");
 }
 
 // ---------------------------------------------------------------------------

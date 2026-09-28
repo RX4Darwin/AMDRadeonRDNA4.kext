@@ -478,6 +478,42 @@ void RDNA4Compute::threadMain(void *arg, wait_result_t) {
 	thread_terminate(current_thread());
 }
 
+void RDNA4Compute::resumeMain(void *arg, wait_result_t) {
+	auto *self = static_cast<RDNA4Compute *>(arg);
+	CLOG("power: wake received; re-bring-up scheduled on the bring-up thread");
+	self->resetRuntimeForResume();
+	self->runStages();
+	if (self->rtLock) {
+		IOLockLock(self->rtLock);
+		self->resumePending = false;
+		if (!self->rtReady)
+			self->powerSleeping = false;
+		IOLockUnlock(self->rtLock);
+	}
+	thread_terminate(current_thread());
+}
+
+void RDNA4Compute::powerDidWake() {
+	if (!rtLock)
+		return;
+	IOLockLock(rtLock);
+	if (!powerSleeping || resumePending) {
+		IOLockUnlock(rtLock);
+		return;
+	}
+	resumePending = true;
+	IOLockUnlock(rtLock);
+	thread_t th = nullptr;
+	if (kernel_thread_start(resumeMain, this, &th) == KERN_SUCCESS) {
+		thread_deallocate(th);
+	} else {
+		IOLockLock(rtLock);
+		resumePending = false;
+		IOLockUnlock(rtLock);
+		CLOG("power: could not start the wake bring-up thread; runtime stays not ready");
+	}
+}
+
 void RDNA4Compute::runStages() {
 	// Read before this boot writes its own. Not at attach: that is before
 	// the EFI NVRAM driver has published the stored variables.
@@ -564,6 +600,15 @@ void RDNA4Compute::runStages() {
 	// in the trail, so the trail's normal ending comes after them.
 	if (done >= StageDispatch)
 		publishRuntime(done);
+	if (done >= StageDispatch) {
+		RDNA4Sensors sensors {};
+		if (readSensors(sensors))
+			CLOG("sensors: edge %u C hotspot %u C GFX %u MHz memory %u MHz socket %u W fan %u RPM",
+			     sensors.edgeTempC, sensors.hotspotTempC, sensors.gfxClockMHz,
+			     sensors.memoryClockMHz, sensors.socketPowerW, sensors.fanRpm);
+		else
+			CLOG("sensors: SMU metrics table unavailable");
+	}
 	// W5: the page-flip test, once the runtime's DMA and device heap exist.
 	if (done >= StageKernel && featureAllowed("flip"))
 		Flip::run(*this);
@@ -643,6 +688,34 @@ uint32_t RDNA4Compute::smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint
 	}
 	ret = rd(IpDiscovery::HwMp1, SmuArg);
 	return resp == kBad ? 0 : resp;
+}
+
+bool RDNA4Compute::readSensors(RDNA4Sensors &out) {
+	if (!poolCpu || kSmuTableOffset + 0x1000 > pool.size)
+		return false;
+	uint32_t ret = 0;
+	if (smuSend(kSmuMsgGetMetricsTable, 0, ret, 100) != kSmuRespOk)
+		return false;
+	/* smu14_driver_if_v14_0.h, SmuMetrics_t: CurrClock[11], the average
+	 * clocks, then MetricsCounter, voltage/current arrays, power, temperatures,
+	 * and fan tach. Keep this compact reader in sync with that public table
+	 * layout instead of copying the whole firmware ABI into our user ABI. */
+	const uint8_t *table = poolCpu + kSmuTableOffset;
+	auto u16 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint16_t *>(table + off);
+	};
+	constexpr uint32_t kAverageGfxPost = 44 + 2 * 2;
+	constexpr uint32_t kAverageMemPost = 44 + 6 * 2;
+	constexpr uint32_t kSocketPower = 136;
+	constexpr uint32_t kTemperatures = 140;
+	constexpr uint32_t kFanRpm = 172;
+	out.edgeTempC = u16(kTemperatures + 0 * 2);
+	out.hotspotTempC = u16(kTemperatures + 1 * 2);
+	out.gfxClockMHz = u16(kAverageGfxPost);
+	out.memoryClockMHz = u16(kAverageMemPost);
+	out.socketPowerW = u16(kSocketPower);
+	out.fanRpm = u16(kFanRpm);
+	return true;
 }
 
 // ---------------------------------------------------------------------------
