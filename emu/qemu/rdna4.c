@@ -3661,6 +3661,10 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                 }
             } else if (target == 12) {                       /* SQ_EXP_POS */
                 if (!ngg || enable != 0xf) goto unknown;
+                if (s->gfx_trace)
+                    fprintf(stderr, "rdna4: gfx: POS export masks s20=0x%08x s21=0x%08x s22=0x%08x v4=(0x%08x,0x%08x,0x%08x) v5=(0x%08x,0x%08x,0x%08x)\\n",
+                            w->s[20], w->s[21], w->s[22], w->v[4][0], w->v[4][1], w->v[4][2],
+                            w->v[5][0], w->v[5][1], w->v[5][2]);
                 for (unsigned lane = 0; lane < 32; lane++) {
                     if ((w->exec >> lane) & 1u) {
                         for (unsigned c = 0; c < 4; c++)
