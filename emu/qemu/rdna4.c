@@ -1956,6 +1956,24 @@ static uint32_t rdna4_u(float f)
     return u;
 }
 
+/* Inline constants are decoded by the ALU according to the operand type:
+ * integer VALU ops see 0..64/-1..-16, while FP VALU ops see their IEEE-754
+ * bit patterns (including the 0.5/1/2/4 constants used by mandelbrot). */
+static uint32_t rdna4_isa_float_src(const RDNA4Lane *l, uint32_t src,
+                                     uint32_t literal, bool *used_lit)
+{
+    static const float fc[8] = { 0.5f, -0.5f, 1.0f, -1.0f,
+                                 2.0f, -2.0f, 4.0f, -4.0f };
+
+    if (src >= 128 && src <= 192)
+        return rdna4_u((float)(src - 128));
+    if (src >= 193 && src <= 208)
+        return rdna4_u((float)-(int32_t)(src - 192));
+    if (src >= 240 && src <= 247)
+        return rdna4_u(fc[src - 240]);
+    return rdna4_isa_src(l, src, literal, used_lit);
+}
+
 /* The VOPD (dual-issue) operations clang uses, X and Y (Y-only from 16). */
 static bool rdna4_vopd_op(uint32_t op, uint32_t a, uint32_t b, uint32_t d, uint32_t lit,
                           uint32_t *out)
@@ -2061,7 +2079,11 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             if (l->s[126]) {
                 switch (op) {
                 case 0x18: result = a > b; break;           /* v_cmp_gt_u32 */
-                case 0x3c: result = rdna4_f(a) >= rdna4_f(b); break; /* v_cmp_nlt_f32 */
+                case 0x3c:
+                    a = rdna4_isa_float_src(l, dw & 0x1ff, dw1, &lit);
+                    b = rdna4_isa_float_src(l, (dw >> 9) & 0x1ff, dw1, &lit);
+                    result = rdna4_f(a) >= rdna4_f(b);
+                    break;                                  /* v_cmp_nlt_f32 */
                 default: goto unknown;
                 }
                 l->s[106] = result;
@@ -2179,6 +2201,14 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             uint32_t rx, ry;
             n = 2;
             if (l->s[126]) {
+                if (opx <= 5) {
+                    ax = rdna4_isa_float_src(l, dw & 0x1ff, dw2, &lit);
+                    bx = rdna4_isa_float_src(l, ((dw >> 9) & 0xff) + 256, dw2, &lit);
+                }
+                if (opy <= 5) {
+                    ay = rdna4_isa_float_src(l, dw1 & 0x1ff, dw2, &lit);
+                    by = rdna4_isa_float_src(l, ((dw1 >> 9) & 0xff) + 256, dw2, &lit);
+                }
                 /* Both read their sources before either writes (no X/Y overlap). */
                 if (!rdna4_vopd_op(opx, ax, bx, l->v[vdstx], dw2, &rx) ||
                     !rdna4_vopd_op(opy, ay, by, l->v[vdsty & 255], dw2, &ry)) {
@@ -2207,7 +2237,11 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
                 goto unknown;
             }
             if (l->s[126]) switch (op) {
-            case 0x213: l->v[vdst] = rdna4_u(fmaf(rdna4_f(a), rdna4_f(b), rdna4_f(c)));
+            case 0x213:
+                a = rdna4_isa_float_src(l, s0, dw2, &lit);
+                b = rdna4_isa_float_src(l, s1, dw2, &lit);
+                c = rdna4_isa_float_src(l, s2, dw2, &lit);
+                l->v[vdst] = rdna4_u(fmaf(rdna4_f(a), rdna4_f(b), rdna4_f(c)));
                 break;                                                        /* v_fma_f32 */
             case 0x44c:                                                       /* v_cmp_gt_u32_e64 */
                 if (sdst <= 106)
@@ -2301,6 +2335,10 @@ static int rdna4_isa_run(RDNA4State *s, RDNA4Lane *l, RDNA4Lds *lds, uint32_t vm
             uint32_t a = rdna4_isa_src(l, dw & 0x1ff, dw1, &lit);
             uint32_t b = l->v[(dw >> 9) & 0xff];
             uint32_t vsrc1 = ((dw >> 9) & 0xff) + 256;
+            if (op == 3 || op == 4 || op == 8 || op == 43 || op == 45) {
+                a = rdna4_isa_float_src(l, dw & 0x1ff, dw1, &lit);
+                b = rdna4_isa_float_src(l, ((dw >> 9) & 0xff) + 256, dw1, &lit);
+            }
             if (l->s[126]) switch (op) {
             case 3:  l->v[vdst] = rdna4_u(rdna4_f(a) + rdna4_f(b)); break;       /* v_add_f32 */
             case 4:  l->v[vdst] = rdna4_u(rdna4_f(a) - rdna4_f(b)); break;       /* v_sub_f32 */
