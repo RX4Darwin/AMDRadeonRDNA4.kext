@@ -1744,6 +1744,7 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
             reg_set(s, GC_SEG1(0x4c49), 0x0001003c);   /* RLC_CGCG_CGLS_CTRL */
             reg_set(s, GC_SEG1(0x4c48), 0x000007ff);   /* RLC_CGTT_MGCG_OVERRIDE */
             reg_set(s, GC_SEG0(0x1e0a), 0);            /* CP_INT_CNTL_RING0 */
+            reg_set(s, GC_SEG0(0x000d), reg_get(s, GC_SEG0(0x000d)) & ~1u);   /* SDMA0_CNTL.TRAP_ENABLE */
             s->gpm_restoring_reads = 2;
             fprintf(stderr, "rdna4: smu: DisallowGfxOff, GC powered up; HQD registers lost\n");
         }

@@ -456,7 +456,7 @@ private:
 	IOLock *smuLock { nullptr };                // serializes the SMU mailbox
 	void gcWake(uint32_t what) const;
 	void gfxOffAfterWake(uint32_t what);
-	void gcEnsureAwake(uint32_t what);          // wake GFX before a submitter emits into pm4Queue
+	bool gcEnsureAwake(uint32_t what);          // wake GFX before a submitter emits into pm4Queue; false = still held
 	void gfxOffSnapshot();
 	uint32_t gfxOffRestoreRegs();
 	bool gfxOffAllowedNow(const char **why);

@@ -1210,6 +1210,11 @@ void RDNA4Compute::gcWake(uint32_t what) const {
 	RDNA4Compute *self = const_cast<RDNA4Compute *>(this);
 	if (!gcLock)
 		return;
+	if (gcOwner == current_thread()) {
+		CLOG("gfxoff: BUG: gcWake(0x%x) called by the thread that is restoring GC state; ignored (it would "
+		     "relock gcLock)", what);
+		return;
+	}
 	IOLockLock(gcLock);
 	if (gcState == kGcOff || gcState == kGcAllowing) {
 		uint32_t ret = 0, resp = 0;
@@ -1249,6 +1254,7 @@ static const GcSnapReg kGcSnap[] = {
 	{ CpPqWptrPollCntl,    "CP_PQ_WPTR_POLL_CNTL",        false },
 	{ CpMe1Pipe0IntCntl,   "CP_ME1_PIPE0_INT_CNTL",       false },
 	{ CpMe1Pipe1IntCntl,   "CP_ME1_PIPE1_INT_CNTL",       false },
+	{ sdma(0, SdmaCntl),   "SDMA0_CNTL (TRAP_ENABLE)",    false },
 	{ CpIntCntl,           "CP_INT_CNTL",                 false },
 	{ CpIntCntlRing0,      "CP_INT_CNTL_RING0",           false },
 	{ RlcCgcgCglsCtrl,     "RLC_CGCG_CGLS_CTRL",          true  },
@@ -1272,15 +1278,29 @@ void RDNA4Compute::gfxOffSnapshot() {
 uint32_t RDNA4Compute::gfxOffRestoreRegs() {
 	if (!gcSnapValid)
 		return 0;
-	uint32_t lost = 0, stuck = 0;
-	bool safe = false;
+	uint32_t lost = 0, stuck = 0, skipped = 0;
+	bool safe = false, safeTried = false;
 	for (uint32_t i = 0; i < kGcSnapCount; i++) {
 		const uint32_t now = rdGc(kGcSnap[i].reg);
 		if (now == gcSnapVal[i])
 			continue;
 		lost++;
-		if (kGcSnap[i].cg && !safe && (rdGc(RlcCntl) & kRlcEnableF32))
-			safe = rlcSafeMode(true);
+		if (kGcSnap[i].cg) {
+			// amdgpu never writes the gating registers outside RLC safe mode: no acknowledgement, no write.
+			if (!safeTried) {
+				safeTried = true;
+				if (rdGc(RlcCntl) & kRlcEnableF32)
+					safe = rlcSafeMode(true);
+				if (!safe)
+					CLOG("gfxoff: RLC safe mode not acknowledged after the wake: clock-gating registers left as found");
+			}
+			if (!safe) {
+				CLOG("gfxoff: %s changed across the power-down: 0x%08x (saved 0x%08x), NOT restored (no safe mode)",
+				     kGcSnap[i].name, now, gcSnapVal[i]);
+				skipped++;
+				continue;
+			}
+		}
 		wr(IpDiscovery::HwGc, kGcSnap[i].reg, gcSnapVal[i]);
 		const uint32_t back = rdGc(kGcSnap[i].reg);
 		CLOG("gfxoff: %s changed across the power-down: 0x%08x -> restored 0x%08x (read back 0x%08x%s)",
@@ -1288,10 +1308,10 @@ uint32_t RDNA4Compute::gfxOffRestoreRegs() {
 		if (back != gcSnapVal[i])
 			stuck++;
 	}
-	if (safe)
-		rlcSafeMode(false);
-	CLOG("gfxoff: register check after the wake: %u of %u registers differed, %u did not stick", lost,
-	     kGcSnapCount, stuck);
+	if (safeTried && (rdGc(RlcCntl) & kRlcEnableF32))
+		rlcSafeMode(false);                         // the exit is sent even after a missed acknowledgement, as amdgpu does
+	CLOG("gfxoff: register check after the wake: %u of %u registers differed, %u did not stick, %u left as found",
+	     lost, kGcSnapCount, stuck, skipped);
 	return lost;
 }
 
@@ -1317,9 +1337,15 @@ bool RDNA4Compute::gfxOffAllowedNow(const char **why) {
 	return true;
 }
 
-void RDNA4Compute::gcEnsureAwake(uint32_t what) {
+bool RDNA4Compute::gcEnsureAwake(uint32_t what) {
+	// The waking thread runs gfxOffAfterWake (HQD restore: queueWriteTest -> here) while it holds
+	// gcLock and gcState is still not On: waking again would relock gcLock on the same thread
+	// (self-deadlock, review W29 delta). GC is up for it, and its accesses bypass the guard.
+	if (gcOwner == current_thread())
+		return true;
 	if (gcState != kGcOn)
 		gcWake(what);
+	return gcState == kGcOn;                        // D1: kGcHold after a failed wake
 }
 
 // After DisallowGfxOff is acknowledged, GC has been powered back up but its state is not the state
@@ -2823,7 +2849,10 @@ void RDNA4Compute::logComputeQueueState(const char *tag, uint32_t pipe, uint32_t
 }
 
 bool RDNA4Compute::queueWriteTest(const char *tag, const Launch *l) {
-	gcEnsureAwake(0xfffffff0u);              // see launch(): wake before emitting, not at the doorbell
+	if (!gcEnsureAwake(0xfffffff0u)) {       // see launch(): wake before emitting, not at the doorbell
+		CLOG("%s: GFX could not be woken from GFXOFF; not submitting", tag);
+		return false;
+	}
 	const bool client = l && l->queue;
 	Pm4::Queue *queue = client ? l->queue : &pm4Queue;
 	const uint32_t doorbell = client ? l->doorbell : kComputeDoorbellDword;
@@ -3054,7 +3083,10 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	// pm4Queue (and the client queues) are emitted into by one submitter at a time, under rtLock, and
 	// only after a GC access: a wake caused by the first access must finish (it may re-initialise the
 	// boot HQD and the ring bookkeeping) BEFORE this thread emits a packet, so wake explicitly (S5).
-	gcEnsureAwake(0xfffffff0u);
+	if (!gcEnsureAwake(0xfffffff0u)) {
+		CLOG("%s: GFX could not be woken from GFXOFF; dispatch not submitted", tag);
+		return false;
+	}
 	const bool vm = l.queue != nullptr;
 	volatile uint32_t *fenceCpu = vm ? l.fenceCpu : poolDw(kPm4FenceOffset);
 	const uint32_t fenceValue = vm ? l.fenceValue : (pm4Fence + 1);
