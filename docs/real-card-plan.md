@@ -89,11 +89,11 @@ separate power-management work.
    by diagnostic-log.sh). **Boot 9** is the same with `rdna4-cursor=2`: a magenta
    64x64 square at (100,100) that macOS's pointer does not replace; see
    `docs/cursor-audit.md` for how to read the result.
-   **W32 (round 5): the cursor's request scheduling.** The trail now has `ttu:` and `gate:` lines at arming, self-test, after each
-   boot flip and at macOS's first cursor calls (`DCN_CUR0/SURF0_TTU_CNTL`, HUBP clock, cursor memory power, MPCC0 selects, sprite
-   pixels read back). Boot 9 also programs `DCN_CUR0_TTU_CNTL0/1` DML-style (`CUR0 TTU programmed: ...`); **boot 18**
-   (`rdna4-cursorttu=0`) is the control: same dump, the CUR0 pair not written. Square in 9 but not 18 = this was the missing
-   piece. `docs/cursor-ttu.md` says what each line means.
+   **W32/W34 (round 5): the cursor plane's DLG state.** The trail has `ttu:` and `gate:` lines at arming, self-test, after each
+   boot flip and at macOS's first cursor calls (TTU/QoS/`HUBPREQ_DEBUG_DB`, HUBP clock, cursor memory power, MPCC0 selects, sprite
+   pixels read back). With `rdna4-cursor=2` the kext also writes amdgpu's `HUBPREQ_DEBUG_DB = 1 << 8` (DLG mission mode,
+   `dcn401_hubp.c:329`; old value logged; `rdna4-cursordlg=0` skips it as the control). The DML-style `DCN_CUR0_TTU_CNTL0/1` write is
+   an opt-in (`rdna4-cursorttu=1`): amdgpu leaves that pair 0 on DCN 4.01. `docs/cursor-ttu.md` says what each line means.
 
 6b. **Round 4 draw (W23).** Boot 10 (`rdna4-gfx=2 rdna4-gfxdiag=11`): the gfx golden registers are written at ring
    bring-up (rev_id from the NBIF RCC_STRAP0 at dword 0x1c); if the draw is still empty the ladder re-runs it with one open

@@ -240,7 +240,8 @@ private:
 	void cursorSelfTest();
 	// W32: cursor request scheduling (DCN_CUR0_TTU_CNTL0/1). cursorRegProbe only reads and is callable from
 	// the compute thread (flip hook); cursorProgramTtu writes, only inside the rdna4-cursor=2 lock bracket.
-	bool cursorProgramTtu();
+	bool cursorProgramTtu();            // opt-in: rdna4-cursorttu=1
+	bool cursorProgramMissionMode();    // W34: HUBPREQ_DEBUG_DB = 1 << 8 as amdgpu does (rdna4-cursordlg=0 skips)
 	uint32_t cursorProbeLogs { 0 };
 	bool cursorProbedSet { false }, cursorProbedDraw { false };
 	IOLock *cursorTrailLock { nullptr };   // the trail is appended from the display and the compute thread

@@ -482,6 +482,8 @@ constexpr uint32_t kHubpreqDebugDb = 0x05fc, kHubpClkCntl = 0x05f5;
 constexpr uint32_t kCursorStereo = 0x067f, kCursorMemPwrCtrl = 0x0681, kCursorMemPwrStatus = 0x0682;
 constexpr uint32_t kMpccTopSel = 0x0000, kMpccBotSel = 0x0001, kMpccOppId = 0x0002;
 constexpr uint32_t kTtuDeliveryMask = 0x007fffff;
+constexpr uint32_t kMissionMode = 1u << 8;        // HUBPREQ_DEBUG_DB value amdgpu writes (dcn401_hubp.c:329)
+constexpr uint32_t kTtuMaxStreamKHz = 600000;     // above this ODM combine halves the per-DPP clock
 constexpr uint32_t kTtuQosFixedCur0 = 8;   // dml_display_rq_dlg_calc.c:497 qos_level_fixed_cur0 = 8, ramp not disabled (:500)
 constexpr uint32_t kCursorProbeMax = 10;   // trail budget: arming, self-test, up to three flips, first set/draw calls
 
@@ -636,24 +638,61 @@ void RDNA4Device::cursorRegProbe(const char *why) {
 	           cursorHold ? (pxMid == 0xffff00ffu ? " (self-test data ok)" : " (SELF-TEST DATA GONE)") : "");
 }
 
-// W32, rdna4-cursor=2 only (call inside the lock bracket): program the cursor's request scheduling the way DC
-// does from DML, DCN_CUR0_TTU_CNTL0/1 (hubp401_program_deadline dcn401_hubp.c:406-409, _setup_interdependent
+// W34 (W32 review S1), rdna4-cursor=2 only: the one DLG-side write amdgpu makes at the top of
+// hubp401_program_deadline (dcn401_hubp.c:329) and the kext never did: REG_WRITE(HUBPREQ_DEBUG_DB, 1 << 8),
+// "put DLG in mission mode". The whole register is written, not a bit (DC's REG_WRITE), and only when it does not
+// already hold exactly that; the old value, the new one and a readback are logged. rdna4-cursordlg=0 skips it.
+// This is what DCN401 does for every plane before its pipes are enabled; on the card nothing did it for the
+// GOP-lit pipe, whose cursor path was never brought into mission mode.
+bool RDNA4Device::cursorProgramMissionMode() {
+	uint32_t enable = 1;
+	if (PE_parse_boot_argn("rdna4-cursordlg", &enable, sizeof(enable)) && enable == 0) {
+		cursorNote("rdna4-cursordlg=0: HUBPREQ_DEBUG_DB left alone (control)");
+		return false;
+	}
+	const uint32_t reg = kHubpreqDebugDb + hubpOff();
+	const uint32_t old = regReadDmu(2, reg);
+	if (old == 0xffffffffu) {
+		cursorNote("HUBPREQ_DEBUG_DB unreadable (0x%08x): mission mode not written", old);
+		return false;
+	}
+	if (old == kMissionMode) {
+		cursorNote("HUBPREQ_DEBUG_DB is already 0x%08x (1 << 8, DLG mission mode): nothing to write", old);
+		return false;
+	}
+	regWriteDmu(2, reg, kMissionMode);
+	cursorNote("HUBPREQ_DEBUG_DB was 0x%08x%s, wrote 0x%08x (DLG mission mode, dcn401_hubp.c:329); reads back 0x%08x",
+	           old, (old & kMissionMode) ? " (bit 8 already set, other bits cleared as DC does)" : "", kMissionMode,
+	           regReadDmu(2, reg));
+	return true;
+}
+
+// W32, opt-in since W34 (rdna4-cursor=2 with rdna4-cursorttu=1, call inside the lock bracket). NOT what amdgpu does
+// on DCN 4.01: DML 2.1 (using_dml21, dcn401_resource.c:784) never fills refcyc_per_req_delivery_cur0, so amdgpu
+// writes DCN_CUR0_TTU_CNTL0/1 = 0 there and its cursor works (W32 review S1). The values below are the LEGACY DML2
+// (dml2_0 core, DCN3.x-style) ones, an untested combination on this ASIC, kept as a secondary experiment.
+// The registers are DCN_CUR0_TTU_CNTL0/1 (hubp401_program_deadline dcn401_hubp.c:406-409, _setup_interdependent
 // :473-474). DML (display_mode_core.c:3441-3448, VRatio <= 1, HRatio 1) delivers one cursor request every
 //   CursorRequestDeliveryTime [us] = width / pixel clock [MHz] / cursor_req_per_width,
 //   cursor_req_per_width = ceil(width * 32 bpp / 256 / 8) = 1 for the 64 px slot;
 // dml_display_rq_dlg_calc.c:403-404,486-487 turns it into DCHUB ref cycles times 2^10, with QoS_LEVEL_FIXED 8 and
 // the ramp enabled (:497,:500); the prefetch pair (_PRE) is the same value while VRatioPrefetchY <= 1. The
 // pixel clock is the boot timing's, the ref clock the DCHUB one read at arming. Without a pixel clock the value
-// falls back to the surface's own SURF0 delivery value (the analysis' first cheap test). rdna4-cursorttu=0
-// skips it (the A/B control: same dump, no write).
+// falls back to the surface's own SURF0 delivery value (the analysis' first cheap test). Only written with
+// rdna4-cursorttu=1 (default off: amdgpu leaves the pair at 0).
 bool RDNA4Device::cursorProgramTtu() {
-	uint32_t enable = 1;
-	if (PE_parse_boot_argn("rdna4-cursorttu", &enable, sizeof(enable)) && enable == 0) {
-		cursorNote("rdna4-cursorttu=0: DCN_CUR0_TTU_CNTL0/1 are left alone (control)");
+	uint32_t enable = 0;
+	if (!PE_parse_boot_argn("rdna4-cursorttu", &enable, sizeof(enable)) || enable != 1) {
+		cursorNote("DCN_CUR0_TTU_CNTL0/1 left alone (rdna4-cursorttu=1 writes DML-style values; amdgpu on DCN 4.01 leaves them 0)");
 		return false;
 	}
 	const uint32_t hubp = hubpOff();
 	const uint32_t pixelKHz = bootTimingValid ? bootTiming.pixelClockKHz : 0;
+	if (pixelKHz > kTtuMaxStreamKHz) {   // ODM combine feeds each DPP half the stream clock: the formula would be off by 2
+		cursorNote("CUR0 TTU not programmed: stream clock %u kHz is above %u kHz (ODM combine, the DML value would be doubled)",
+		           pixelKHz, kTtuMaxStreamKHz);
+		return false;
+	}
 	uint32_t delivery = 0;
 	const char *source = "";
 	if (pixelKHz) {
@@ -672,9 +711,9 @@ bool RDNA4Device::cursorProgramTtu() {
 	const uint32_t cntl0 = delivery | (kTtuQosFixedCur0 << 24);
 	regWriteDmu(2, kTtuCur0Cntl0 + hubp, cntl0);
 	regWriteDmu(2, kTtuCur0Cntl1 + hubp, delivery);
-	cursorNote("CUR0 TTU programmed: CNTL0 0x%08x CNTL1 0x%08x (delivery %u = 0x%x ref cycles * 2^10; pixel clock %u kHz, "
-	           "ref clock %u kHz; %s); reads back 0x%08x/0x%08x", cntl0, delivery, delivery, delivery, pixelKHz,
-	           cursorRefClkKHz, source, regReadDmu(2, kTtuCur0Cntl0 + hubp), regReadDmu(2, kTtuCur0Cntl1 + hubp));
+	cursorNote("CUR0 TTU (legacy DML2, opt-in): CNTL0 0x%08x CNTL1 0x%08x (pixel %u kHz, ref %u kHz); reads back 0x%08x/0x%08x",
+	           cntl0, delivery, pixelKHz, cursorRefClkKHz, regReadDmu(2, kTtuCur0Cntl0 + hubp),
+	           regReadDmu(2, kTtuCur0Cntl1 + hubp));
 	return true;
 }
 
@@ -688,8 +727,9 @@ void RDNA4Device::cursorSelfTest() {
 	const uint32_t hubp = hubpOff();
 	// One lock bracket around position and attributes: they latch together at the unlock, so
 	// the square is never armed at (0,0) (the order inside a bracket does not matter).
+	cursorProgramMissionMode();   // W34: amdgpu's HUBPREQ_DEBUG_DB = 1 << 8, before the cursor is enabled
 	cursorMpcLock(true);
-	cursorProgramTtu();   // W32: DML-style request scheduling for the plane, latched with the rest
+	cursorProgramTtu();   // W32, opt-in (rdna4-cursorttu=1): legacy-DML request scheduling, latched with the rest
 	regWriteDmu(2, kCursorPosition + hubp, 100u | (100u << 15));
 	regWriteDmu(2, kCursorDstOffset + hubp, cursorDstXOffset(100));
 	cursorProgramPlane(true);   // nested: does not touch the lock register
@@ -789,11 +829,15 @@ bool RDNA4Device::cursorWaitLatched(const char *why, uint32_t maxMs) {
 }
 
 bool RDNA4Device::initHardwareCursor() {
+	if (!cursorTrailLock)
+		cursorTrailLock = IOLockAlloc();
+	if (cursorTrailLock)   // the compute thread's flip hook may append at the same time (W32 review NIT)
+		IOLockLock(cursorTrailLock);
 	cursorTrail[0] = '\0';
 	cursorTrailLen = 0;
 	cursorTrailFull = false;
-	if (!cursorTrailLock)
-		cursorTrailLock = IOLockAlloc();
+	if (cursorTrailLock)
+		IOLockUnlock(cursorTrailLock);
 	if (!hwCursorRequested || !isAmd || !ipDiscovery.isValid() || !rmmio ||
 	    !fbPhysBase || !fbLength || pipe.hubp >= Pipe::kMaxOtg) {
 		cursorNote("unavailable (requested %d amd %d discovery %d mmio %d fb 0x%llx+0x%llx hubp %u); "

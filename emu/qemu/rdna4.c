@@ -621,7 +621,7 @@ struct RDNA4State {
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
     bool     cursor_lock_stuck; /* the GOP left the MPC cursor lock (CUR_VUPDATE_LOCK_SET0) held */
     bool     cursor_reject_logged;
-    bool     cursor_ttu_strict; /* reject the cursor plane while DCN_CUR0_TTU_CNTL0's delivery is 0 (cursor-ttu-strict) */
+    bool     cursor_ttu_hypothesis; /* reject the cursor plane while DCN_CUR0_TTU_CNTL0's delivery is 0 (cursor-ttu-hypothesis) */
     uint32_t gfx_break;      /* corrupt one G3 MUST register at draw time */
     bool     gfx_golden_strict; /* refuse a draw when the amdgpu golden registers are unset (gfx-golden-strict) */
     bool     gfx_golden_warned;
@@ -6298,13 +6298,13 @@ static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so, RDNA4Cursor 
         return false;
     const uint32_t hp = hubp * HUBP_STRIDE;
     const uint32_t dpp = hubp * DPP_STRIDE;
-    /* cursor-ttu-strict: the rank-1 hypothesis of premetal/cursor-invisible-analysis.md (a cursor requestor whose
+    /* cursor-ttu-hypothesis: the rank-1 hypothesis of premetal/cursor-invisible-analysis.md (a cursor requestor whose
      * delivery rate DCN_CUR0_TTU_CNTL0.REFCYC_PER_REQ_DELIVERY [22:0] is 0 fetches nothing). It is NOT known
      * hardware behaviour: like gfx-golden-strict it only proves that the kext writes the register. */
-    if (s->cursor_ttu_strict &&
+    if (s->cursor_ttu_hypothesis &&
         !(reg_get(s, SEG2(HUBP_CUR0_TTU_CNTL0 + hp)) & 0x7fffff)) {
         if (!s->cursor_reject_logged || s->trace)
-            fprintf(stderr, "rdna4: cursor: rejected, DCN_CUR0_TTU_CNTL0 delivery is 0 (cursor-ttu-strict)\n");
+            fprintf(stderr, "rdna4: cursor: rejected, DCN_CUR0_TTU_CNTL0 delivery is 0 (cursor-ttu-hypothesis)\n");
         s->cursor_reject_logged = true;
         return false;
     }
@@ -6928,7 +6928,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("dcn-irq-storm", RDNA4State, dcn_irq_storm, false),
     DEFINE_PROP_BOOL("cursor", RDNA4State, cursor_enabled, false),
     DEFINE_PROP_BOOL("cursor-lock-stuck", RDNA4State, cursor_lock_stuck, false),
-    DEFINE_PROP_BOOL("cursor-ttu-strict", RDNA4State, cursor_ttu_strict, false),
+    DEFINE_PROP_BOOL("cursor-ttu-hypothesis", RDNA4State, cursor_ttu_hypothesis, false),
     DEFINE_PROP_BOOL("hang-sticky", RDNA4State, hang_sticky, false),
     DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,
                 bool),

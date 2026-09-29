@@ -1,57 +1,55 @@
-# W32: cursor request scheduling (TTU) — evidence and the DML-style test
+# W32/W34: cursor request scheduling and DLG mission mode — evidence and tests
 
-Source: `premetal/cursor-invisible-analysis.md` (rank 1, sections 5.1 and 5.3). Round 4 showed the cursor plane enabled and latched
-(`LATCHED`, no lock held, all cursor registers as amdgpu writes them) yet neither the pointer (`rdna4-cursor=1`) nor the magenta square
-(`rdna4-cursor=2`) ever appeared. The one block nobody programmed is the cursor's **request scheduling**: `HUBPREQ0_DCN_CUR0_TTU_CNTL0/1`.
+Source: `premetal/cursor-invisible-analysis.md` (rank 1) and `premetal/w32-review.md`. Round 4 showed the cursor plane enabled and latched (`LATCHED`, no lock held, all cursor
+registers as amdgpu writes them) yet neither the pointer (`rdna4-cursor=1`) nor the magenta square (`rdna4-cursor=2`) ever appeared.
 
-## 1. What amdgpu writes and where DML gets the numbers
+## 1. The correction (W32 review S1): amdgpu does not program a cursor rate on DCN 4.01
 
-| Register (dcn_4_1_0, base idx 2, HUBP0) | dword | amdgpu | Value source |
-|---|---|---|---|
-| `DCN_CUR0_TTU_CNTL0` | 0x0627 | `hubp401_program_deadline`, `dcn401_hubp.c:406-409` | `REFCYC_PER_REQ_DELIVERY` [22:0] = `refcyc_per_req_delivery_cur0`, `QoS_LEVEL_FIXED` [27:24] = 8, `QoS_RAMP_DISABLE` [28] = 0 |
-| `DCN_CUR0_TTU_CNTL1` | 0x0628 | `hubp401_setup_interdependent`, `:473-474` | `REFCYC_PER_REQ_DELIVERY_PRE` [22:0] = `refcyc_per_req_delivery_pre_cur0` |
-| `HUBPREQ_DEBUG_DB` | 0x05fc | `hubp401_program_deadline` `:329` writes `1 << 8` ("put DLG in mission mode") | logged only, not written (the task limits writes to the CUR0 pair) |
+DCN401 uses DML 2.1 (`using_dml21 = true`, `dcn401_resource.c:784`). Its pipe-register calculation (`dml2_core_dcn4_calcs.c:12796-12806`) fills the surface pairs only; there is no
+`cur0` value anywhere in `dml21`, and the per-pipe register set is zeroed first. `hubp401_program_deadline` therefore writes `DCN_CUR0_TTU_CNTL0/1 = 0`
+(`dcn401_hubp.c:406-409`, `:473-474`) and the Linux cursor works on this ASIC. So "the CUR0 pair is zero" (rank 1) cannot by itself be why the plane shows nothing.
+The formula W32 computed (`display_mode_core.c:3441-3448`, `dml_display_rq_dlg_calc.c:403-404,486-487,497,500`) belongs to the *legacy* DML2 (dml2_0 core, DCN3.x-style): an untested
+combination on this ASIC, so it is now a **secondary opt-in** (`rdna4-cursorttu=1`, default off).
 
-DML (`dc/dml2_0`):
+## 2. What amdgpu writes and the kext did not: HUBPREQ_DEBUG_DB = 1 << 8
 
-- `display_mode_core.c:3441-3448` (VRatio <= 1): `CursorRequestDeliveryTime[us] = CursorWidth / HRatio / PixelClock[MHz] / cursor_req_per_width`,
-  `cursor_req_per_width = ceil(CursorWidth * CursorBPP / 256 / 8)` (= 1 for the 64 px, 32 bpp slot); the prefetch variant is the same while `VRatioPrefetchY <= 1`.
-- `dml_display_rq_dlg_calc.c:403-404`: `refcyc_per_req_delivery_cur0 = CursorRequestDeliveryTime * refclk_freq_in_mhz` (and `_pre_`); `:486-487`: the register value is that times 2^10;
-  `:497,:500`: `qos_level_fixed_cur0 = 8`, `qos_ramp_disable_cur0 = 0`.
+`hubp401_program_deadline` starts with `REG_WRITE(HUBPREQ_DEBUG_DB, 1 << 8)` ("put DLG in mission mode", `dcn401_hubp.c:329`); `HUBPREQ0_HUBPREQ_DEBUG_DB` is dword `0x05fc`
+(base idx 2, `+ hubpOff()`). The GOP-lit pipe never went through that function. Under `rdna4-cursor=2` the kext now (`cursorProgramMissionMode`, before the cursor lock bracket):
 
-For the boot timing (1920x1080@60, 148.511 MHz) and the 50 MHz DCHUB reference clock the kext already uses for `CURSOR_DST_X_OFFSET`:
-`64 / 148.511 = 0.4310 us`, `* 50 = 21.55` ref cycles, `* 1024 = 22064` (0x5630); `CNTL0 = 0x08005630`, `CNTL1 = 0x00005630`.
+- reads the register; if it is already exactly `0x100` it says so and writes nothing;
+- otherwise writes the whole register (`0x100`, as DC's `REG_WRITE` does), logs `HUBPREQ_DEBUG_DB was 0x... , wrote 0x100 ...; reads back 0x...`;
+- `rdna4-cursordlg=0` skips it (the control: same dumps).
 
-## 2. Why it is rank 1
+`rdna4-cursor=1` never writes it.
 
-`CURSOR_REQ_MODE = 1` (mandatory on DCN4x) starts the cursor fetch at the beginning of display prefetch, paced by exactly these registers. The GOP set up one
-surface and no cursor, so the CUR0 pair very likely holds a reset or zero rate. A requestor with a zero delivery rate can fetch nothing for **any** image
-(the pointer, the square, a sprite at the scanout base), which is what the three rounds show, while every cursor register still reads back "right".
-Not a fact: nothing in the logs has read these registers yet.
+## 3. Read-only evidence (unchanged, `rdna4-cursor` = 1 or 2)
 
-## 3. What the kext does now
+Two lines per probe in the `RDNA4FB,Cursor` trail and the kernel log, at `armed`, `selftest`, after every boot flip (compute-thread hook `Env::cursorProbe`), and at the first
+`cscSetHardwareCursor` / `cscDrawHardwareCursor` (max 10 probes):
 
-- **Read-only evidence** (`cursorRegProbe`, `rdna4-cursor` = 1 or 2, into the `RDNA4FB,Cursor` trail and the kernel log). Two lines per probe:
-  - `ttu: cur0 <CNTL0>/<CNTL1> surf0 <CNTL0>/<CNTL1> surf1 <CNTL0> global <GLOBAL_TTU_CNTL> qos_wm <QOS_WM> debug_db <HUBPREQ_DEBUG_DB>`
-  - `gate: hubp clk <HUBP_CLK_CNTL> cursor mem pwr <CTRL>/<STATUS> stereo <STEREO_CONTROL> | mpcc<N> top/bot/opp <MPCC_TOP_SEL/BOT_SEL/OPP_ID> | sprite px first/mid/last <VRAM readback>`
-- Probed at: `armed`; `selftest` (after the programming below); after every boot flip (`flip`, `flip back`, `restore original`; the compute thread calls it through
-  `Env::cursorProbe`, and the trail is now taken under a lock); `first cscSetHardwareCursor`; `first cscDrawHardwareCursor` (the state seen when macOS first talks to the plane, analysis rank 3).
-  Capped at 10 probes; the trail buffer is 12 KiB (was 8).
-- **Decisive test (rdna4-cursor=2 only):** `cursorProgramTtu()` writes `DCN_CUR0_TTU_CNTL0/1` DML-style inside the same MPC cursor lock bracket as the position and attributes,
-  and logs the value, its inputs and the readback (`CUR0 TTU programmed: ...`). Without a pixel clock it copies `SURF0_TTU_CNTL0`'s delivery value. `rdna4-cursor=1` never writes them.
-- **Control:** `rdna4-cursorttu=0` (set-boot boot 18): the same dump, the CUR0 pair NOT written.
+- `ttu: cur0 <CNTL0>/<CNTL1> surf0 <CNTL0>/<CNTL1> surf1 <CNTL0> global <GLOBAL_TTU_CNTL> qos_wm <QOS_WM> debug_db <HUBPREQ_DEBUG_DB>`
+- `gate: hubp clk <HUBP_CLK_CNTL> cursor mem pwr <CTRL>/<STATUS> stereo <STEREO_CONTROL> | mpcc<N> top/bot/opp <MPCC_TOP_SEL/BOT_SEL/OPP_ID> | sprite px first/mid/last <VRAM readback>`
 
-## 4. Reading the next round (boot 9 = programmed, boot 18 = control)
+## 4. Reading the next round
 
 | Log | Meaning |
 |---|---|
-| `armed: ttu: cur0 0x00000000/0x00000000` next to a non-zero `surf0` | rank 1 confirmed as far as the register goes: the plane had no delivery rate |
-| `cur0` already non-zero at arming | the GOP/reset value was something; compare with the DML value in `CUR0 TTU programmed` |
-| the square appears in boot 9, not in boot 18 | request scheduling was the missing piece; the fix is the DML values for the timing (the kext computes them; then `rdna4-cursor=1` gets the same write) |
-| square in neither | `gate:` line next: `mpcc top/bot/opp` must select DPP0/OPP0; `hubp clk` clock-on bits; `cursor mem pwr status` non-zero (shutdown/light sleep); `sprite px ... (SELF-TEST DATA GONE)` = the data is not there (rank 4) |
-| `cur0`/`gate:` differ between `armed` and `flip`/`first cscDrawHardwareCursor` | the state is clobbered after arming (rank 3): a re-program is needed from the flip/first-draw path |
+| `armed: ttu: ... debug_db 0x00000000` (bit 8 clear) and the square appears after `wrote 0x00000100` | DLG mission mode was the missing piece; make it part of the cursor bring-up (also for `rdna4-cursor=1`) |
+| `debug_db` already `0x00000100` at arming | mission mode was not it; look at `gate:` and the other DLG registers below |
+| the square does not appear either way | `gate:` next: `mpcc top/bot/opp` must select DPP0/OPP0, `hubp clk` clock-on bits, `cursor mem pwr status` (shutdown/light sleep), `sprite px ... (SELF-TEST DATA GONE)` (data), and `global`/`qos_wm`/`surf0` against a Linux dump of the same HUBP |
+| `cur0`/`gate:` differ between `armed` and `flip` / `first cscDrawHardwareCursor` | state clobbered after arming: re-program from the flip/first-draw path |
+| square only with `rdna4-cursorttu=1` | a legacy-DML value is sufficient; amdgpu proves 0 is sufficient in the presence of whatever else it programs (mission mode, DLG registers), so look at what else differs |
 
-## 5. Emulator
+The best single piece of evidence would be a Linux boot on the same card reading `DCN_CUR0_TTU_CNTL0/1`, `HUBPREQ_DEBUG_DB`, `DCN_GLOBAL_TTU_CNTL` and `DCN_TTU_QOS_WM` (umr / amdgpu_regs).
 
-`cursor-ttu-strict=on` (emulator option) rejects the plane while `CUR0_TTU_CNTL0.REFCYC_PER_REQ_DELIVERY` is 0. It encodes the rank-1 **hypothesis**, not known hardware behaviour, like
-`gfx-golden-strict`: a pass says only that the kext writes the register (boot 9 shape: square; `rdna4-cursorttu=0`: no square).
+## 5. The opt-in TTU write (`rdna4-cursorttu=1`, `rdna4-cursor=2` only)
+
+`cursorProgramTtu` writes `DCN_CUR0_TTU_CNTL0 = delivery | 8 << 24`, `CNTL1 = delivery` inside the MPC cursor lock bracket, with
+`delivery = 64 * refclk_kHz * 1024 / (pixel_clock_kHz * cursor_req_per_width)` (1080p60 + 50 MHz DCHUB ref: 22064). Not written when the stream clock is above 600 MHz (ODM combine would
+double the value) or no usable value exists. Whether the pair latches inside the cursor lock or under the OTG master update lock is not established; compare the write's readback
+with the next `ttu:` line.
+
+## 6. Emulator
+
+`cursor-ttu-hypothesis=on` (emulator option, formerly `cursor-ttu-strict`) rejects the plane while `CUR0_TTU_CNTL0` delivery is 0. Given section 1 it models something amdgpu
+contradicts; a VM pass with it says only that the kext writes the register (`rdna4-cursorttu=1`), never anything about the card. Default off.
