@@ -99,6 +99,10 @@ separate power-management work.
    can hang the gfx pipeline and there is no reset, so if its result says `hang/` do a cold power cycle before anything else.
    `docs/gfx-draw-audit.md` lists the suspects and what each log line means. A `gfx-golden-strict` emulator result says
    nothing about the card, it only shows that the kext writes the registers.
+   **Round 5 (W31): boots 10-12 also run `rdna4-gfxprobe=1`.** The draw stream is split at `NUM_INSTANCES` and `COPY_DATA` packets
+   copy 22 context/SH/uconfig registers into memory on the ring (`draw probe mid/post: CP view ... N of M registers equal what the
+   stream wrote`); `fault after <step>` shows which bring-up step makes the CPG read VA 0; `RS64 DC_BASE0 ...` prints the microengine
+   base registers. The earlier MMIO context readback lags one context, so read the CP view instead (`docs/gfx-context-audit.md`).
 
 7. **Optional W19 GFX power-management probe.**
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31`.

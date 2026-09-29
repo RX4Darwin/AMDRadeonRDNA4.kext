@@ -222,11 +222,14 @@ bool RDNA4Compute::stageGfxRing() {
 	if (!doorbells)
 		return finish(false, "doorbell mode without the doorbell BAR");
 	gfxGoldenInit();   // amdgpu's 3D-pipeline golden registers, before the CP starts
+	gfxFaultMark("bring-up start (clears what earlier stages left)");
+	gfxRs64Evidence("bring-up");
 	trail("gfx: clear state + ring");
 	if (!gfxCsbInit())
 		return finish(false, "clear-state buffer");
 	if (!gfxRingResume())
 		return finish(false, "ring setup");
+	gfxFaultMark("ring setup and unhalt");
 
 	// 1. amdgpu's ring test: SCRATCH_REG0 through SET_UCONFIG_REG.
 	trail("gfx: ring test");
@@ -246,6 +249,7 @@ bool RDNA4Compute::stageGfxRing() {
 	GLOG("ring test: SCRATCH_REG0 0x%08x (%s)", scratch, scratch == 0xDEADBEEF ? "ok" : "not written");
 	if (scratch != 0xDEADBEEF)
 		return finish(false, "ring test");
+	gfxFaultMark("ring test");
 
 	// 2. A WRITE_DATA and the end-of-pipe fence amdgpu's jobs end with.
 	*poolDw(kGfxTestOffset) = 0;
@@ -260,6 +264,7 @@ bool RDNA4Compute::stageGfxRing() {
 	     fenced ? "signalled" : "NOT signalled");
 	if (!fenced || data != 0x600DF00D)
 		return finish(false, "fence test");
+	gfxFaultMark("WRITE_DATA + fence test");
 
 	// 3. amdgpu's IB test: an indirect buffer with a WRITE_DATA, fenced.
 	trail("gfx: IB test");
@@ -278,6 +283,7 @@ bool RDNA4Compute::stageGfxRing() {
 	     ibData == 0x1B0B1B0B ? "ok" : "not written", fenced ? "signalled" : "NOT signalled");
 	if (!fenced || ibData != 0x1B0B1B0B)
 		return finish(false, "IB test");
+	gfxFaultMark("IB test");
 
 	// 4. Fenced IBs until the ring has wrapped a few times (64-bit write
 	//    pointer, never wrapped by us), each one's own value checked.
@@ -306,6 +312,7 @@ bool RDNA4Compute::stageGfxRing() {
 	if (r != rounds)
 		return finish(false, "ring wrap");
 
+	gfxFaultMark("ring wrap");
 	GLOG("gfx ring ready (doorbell)");
 	return finish(true, "gfx ring");
 }
@@ -434,7 +441,119 @@ int findStreamReg(const uint32_t *stream, uint32_t dwords, uint32_t opcode, uint
 constexpr uint32_t kOpSetShReg = 0x76, kOpSetContextReg = 0x69;
 constexpr uint32_t kShBase = 0x19a0, kMarkerValue = 0xc0de0001;
 
+// The state the CP itself holds, read back with COPY_DATA on the ring (rdna4-gfxprobe=1). MMIO reads
+// of context registers are NOT reliable evidence: on the card the first draw's readback showed random
+// values and the next draw's showed exactly what the stream had written, i.e. the MMIO view lags the
+// context the CP is using. A COPY_DATA (gfx_v12_0_ring_emit_rreg, gfx_v12_0.c:4697) is executed by the
+// CP in stream order, so it reports the state at that point. kind 0 = context register (SET_CONTEXT_REG
+// offset = the header dword), 1 = SH register (offset = dword - kShBase), 2 = UCONFIG (dword - 0x2000).
+struct ProbeReg { const char *name; uint8_t seg; uint16_t dword; uint8_t kind; };
+constexpr uint32_t kProbeMax = 32;
+const ProbeReg kProbe[] = {
+	{ "VGT_SHADER_STAGES_EN", 1, 0x02a6, 0 }, { "CB_TARGET_MASK", 1, 0x0214, 0 }, { "CB_SHADER_MASK", 1, 0x0215, 0 },
+	{ "CB_COLOR_CONTROL", 1, 0x0216, 0 }, { "CB_COLOR0_BASE", 1, 0x0318, 0 }, { "CB_COLOR0_ATTRIB2", 1, 0x031e, 0 },
+	{ "CB_COLOR0_ATTRIB3", 1, 0x031f, 0 }, { "CB_COLOR0_INFO", 1, 0x03b0, 0 }, { "SPI_SHADER_POS_FORMAT", 1, 0x0193, 0 },
+	{ "SPI_SHADER_COL_FORMAT", 1, 0x0195, 0 }, { "SPI_PS_INPUT_ENA", 1, 0x0197, 0 }, { "DB_SHADER_CONTROL", 1, 0x001b, 0 },
+	{ "PA_CL_VTE_CNTL", 1, 0x0205, 0 }, { "PA_SC_SCREEN_SCISSOR_BR", 1, 0x0061, 0 }, { "PA_SC_VPORT_SCISSOR_0_BR", 1, 0x0095, 0 },
+	{ "PGM_LO_ES", 0, 0x1a29, 1 }, { "PGM_LO_PS", 0, 0x19a8, 1 }, { "RSRC1_GS", 0, 0x1a2a, 1 }, { "RSRC1_PS", 0, 0x19aa, 1 },
+	{ "VGT_PRIMITIVE_TYPE", 1, 0x2242, 2 }, { "GE_POS_RING_BASE", 1, 0x2268, 2 }, { "GE_PRIM_RING_BASE", 1, 0x226a, 2 },
+};
+constexpr uint32_t kProbeCount = sizeof(kProbe) / sizeof(kProbe[0]);
+static_assert(kProbeCount <= kProbeMax, "probe table larger than its buffer");
+
+uint32_t probeOpcode(const ProbeReg &p) { return p.kind == 0 ? 0x69 : p.kind == 1 ? 0x76 : 0x79; }
+uint32_t probeOffset(const ProbeReg &p) {
+	return p.kind == 0 ? p.dword : p.kind == 1 ? p.dword - 0x19a0u : p.dword - 0x2000u;
+}
+
+// The first packet of `opcode` in the stream (dword index), or 0.
+uint32_t findStreamPacket(const uint32_t *stream, uint32_t dwords, uint32_t opcode) {
+	for (uint32_t i = 0; i < dwords;) {
+		const uint32_t h = stream[i];
+		if ((h >> 30) != 3) {
+			i++;
+			continue;
+		}
+		if (((h >> 8) & 0xff) == opcode)
+			return i;
+		i += 1 + ((h >> 16) & 0x3fff) + 1;
+	}
+	return 0;
+}
+
 } // namespace
+
+uint32_t RDNA4Compute::requestedGfxProbe() {
+	uint32_t v = 0;
+	return PE_parse_boot_argn("rdna4-gfxprobe", &v, sizeof(v)) && v ? 1 : 0;
+}
+
+// One COPY_DATA per probed register into the result buffer at `poolOff` (slot i = kProbe[i]).
+void RDNA4Compute::gfxEmitProbe(uint32_t poolOff) {
+	uint32_t pkt[16];
+	for (uint32_t i = 0; i < kProbeCount; i++) {
+		uint32_t byteOff = 0;
+		if (!env.disc || !env.disc->regByteOffset(IpDiscovery::HwGc, 0, kProbe[i].seg, kProbe[i].dword, byteOff))
+			continue;   // the slot keeps its sentinel
+		gfxRing.emit(pkt, Pm4::copyDataRegToMem(pkt, byteOff / 4, poolMc(poolOff + 4 * i)));
+	}
+}
+
+// Log what the CP reported and how many registers equal what the stream wrote (the IB copy `ib`).
+void RDNA4Compute::gfxProbeReport(const char *label, uint32_t poolOff, volatile uint32_t *ib) {
+	constexpr uint32_t n = sizeof(Gfx12Draw::kStream) / 4;
+	char line[240], diff[300];
+	uint32_t len = 0, match = 0, counted = 0, ndiff = 0, dl = 0;
+	line[0] = diff[0] = '\0';
+	for (uint32_t i = 0; i < kProbeCount; i++) {
+		const uint32_t val = *poolDw(poolOff + 4 * i);
+		len += snprintf(line + len, sizeof(line) - len, "%s=0x%08x ", kProbe[i].name, val);
+		if (len > 150) {
+			GLOG("%s: CP view: %s", label, line);
+			len = 0;
+			line[0] = '\0';
+		}
+		const int at = findStreamReg(Gfx12Draw::kStream, n, probeOpcode(kProbe[i]), probeOffset(kProbe[i]));
+		if (at < 0)
+			continue;
+		counted++;
+		const uint32_t want = ib[at];
+		if (val == want) {
+			match++;
+		} else if (ndiff++ < 8 && dl < sizeof(diff) - 60) {
+			dl += snprintf(diff + dl, sizeof(diff) - dl, "%s got 0x%08x want 0x%08x; ", kProbe[i].name, val, want);
+		}
+	}
+	if (len)
+		GLOG("%s: CP view: %s", label, line);
+	GLOG("%s: CP view: %u of %u registers equal what the stream wrote%s%s", label, match, counted,
+	     ndiff ? "; differ: " : "", diff);
+}
+
+// The GC hub fault status, logged and cleared, so the log says which bring-up step first makes the
+// CP read an unmapped address (round 4: CPG read VA 0, status 0x0d3d, already before the first draw).
+void RDNA4Compute::gfxFaultMark(const char *tag) {
+	const uint32_t status = rdGc(GcL2FaultStatusLo);
+	if (status && status != 0xffffffffu) {
+		GLOG("fault after %s: GC hub fault status 0x%08x (VMID %u, CID 0x%x, %s), VA 0x%llx", tag, status,
+		     (status >> 20) & 0xf, (status >> 9) & 0x1ff, (status >> 18) & 1 ? "write" : "read", gcFaultVa());
+		gcFaultClear();
+	} else {
+		GLOG("no fault after %s", tag);
+	}
+}
+
+// The RS64 PFP/ME data-cache and instruction-cache bases: the CP reads its stack and data through
+// DC_BASE0/1; zero there would be a CPG read of VA 0.
+void RDNA4Compute::gfxRs64Evidence(const char *tag) {
+	grbmSelect(0, 0, 0, 0);
+	GLOG("%s: RS64 DC_BASE0 0x%08x_%08x DC_BASE1 0x%08x_%08x DC_BASE_CNTL 0x%08x | PFP IC_BASE 0x%08x_%08x cntl 0x%08x | "
+	     "ME IC_BASE 0x%08x_%08x cntl 0x%08x | INSTR_PNTR0/1 0x%x/0x%x", tag,
+	     rdGc(CpRs64DcBase0Hi), rdGc(CpRs64DcBase0Lo), rdGc(CpRs64DcBase1Hi), rdGc(CpRs64DcBase1Lo),
+	     rdGc(CpRs64DcBaseCntl), rdGc(CpPfpIcBaseHi), rdGc(CpPfpIcBaseLo), rdGc(CpPfpIcBaseCntl),
+	     rdGc(CpMeIcBaseHi), rdGc(CpMeIcBaseLo), rdGc(CpMeIcBaseCntl), rdGc(CpGfxRs64InstrPntr0),
+	     rdGc(CpGfxRs64InstrPntr1));
+}
 
 // What round 4 needs to see: the engine status right after the draw, and the pipeline
 // state as the hardware holds it (context and SH registers read back over MMIO).
@@ -575,7 +694,20 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		const uint32_t ud[2] = { static_cast<uint32_t>(marker), static_cast<uint32_t>(marker >> 32) };
 		gfxRing.emit(pkt, Pm4::setShReg(pkt, 0x2c00 + (0x19ac - kShBase), ud, 2));
 	}
-	gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, poolMc(kGfxIbOffset), n, 0));
+	// rdna4-gfxprobe=1: split the stream at NUM_INSTANCES (state | draw) and read the CP's own view of the
+	// state between the two halves and again after the draw (COPY_DATA on the ring, in stream order).
+	const uint32_t split = requestedGfxProbe() ? findStreamPacket(kStream, n, 0x2f) : 0;
+	if (split) {
+		for (uint32_t i = 0; i < 2 * kProbeMax; i++)
+			*poolDw(kGfxProbeOffset + 4 * i) = 0xdeadf00du;
+		flushHdp();
+		gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, poolMc(kGfxIbOffset), split, 0));
+		gfxEmitProbe(kGfxProbeOffset);
+		gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, poolMc(kGfxIbOffset) + 4ull * split, n - split, 0));
+		gfxEmitProbe(kGfxProbePost);
+	} else {
+		gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, poolMc(kGfxIbOffset), n, 0));
+	}
 	gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), ++gfxFence));
 	uint64_t t0 = mach_absolute_time();
 	gfxKick(gfxRing.wptr());
@@ -585,6 +717,14 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	r.ns = ns;
 	r.drawFence = *poolDw(kGfxDrawFenceOffset);
 	gfxEvidence(label, true);
+	if (split && r.ringDone) {
+		char what[40];
+		snprintf(what, sizeof(what), "%s probe mid", label);
+		gfxProbeReport(what, kGfxProbeOffset, ib);
+		snprintf(what, sizeof(what), "%s probe post", label);
+		gfxProbeReport(what, kGfxProbePost, ib);
+	}
+	gfxFaultMark(label);
 	if (!r.ringDone || r.drawFence != 1) {
 		GLOG("%s: did not finish (ring fence %s, draw fence 0x%x)", label,
 		     r.ringDone ? "ok" : "NOT signalled", r.drawFence);
@@ -672,6 +812,7 @@ bool RDNA4Compute::stageGfxDraw() {
 	};
 
 	GfxDrawResult base;
+	gfxRs64Evidence("before draw");
 	gfxEvidence("before draw", false);
 	const bool ran = gfxDrawRun("draw", 0, va, base);
 	if (!ran) {

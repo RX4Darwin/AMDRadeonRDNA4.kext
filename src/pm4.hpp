@@ -21,6 +21,7 @@ namespace Pm4 {
 enum Op : uint32_t {
 	OpNop            = 0x10,
 	OpDispatchDirect = 0x15,
+	OpCopyData       = 0x40,
 	OpWriteData      = 0x37,
 	OpReleaseMem     = 0x49,
 	OpAcquireMem     = 0x58,
@@ -62,6 +63,10 @@ constexpr uint32_t kGcrMemSync = (1u << 0) | (1u << 4) | (1u << 5) | (1u << 7) |
 // `reg` is the absolute register dword offset (UCONFIG space, >= 0xc000).
 uint32_t setUconfigReg(uint32_t *out, uint32_t reg, uint32_t value);
 uint32_t writeData(uint32_t *out, uint64_t addr, uint32_t value);
+// gfx_v12_0_ring_emit_rreg (gfx_v12_0.c:4697-4706): COPY_DATA of one register (src_sel 0, the MMIO
+// dword offset the CP reads it at) to memory (dst_sel 5) with write confirm. The CP executes it in
+// order on the ring, so it reports the state the CP itself holds at that point of the stream.
+uint32_t copyDataRegToMem(uint32_t *out, uint32_t regDword, uint64_t addr);
 uint32_t releaseMem(uint32_t *out, uint64_t addr, uint32_t seq, bool interrupt = false);
 // `n` consecutive SH registers from absolute dword `reg` (0x2c00..0x2fff).
 uint32_t setShReg(uint32_t *out, uint32_t reg, const uint32_t *values, uint32_t n);
