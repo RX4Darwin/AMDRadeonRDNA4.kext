@@ -445,9 +445,21 @@ private:
 	};
 	mutable volatile SInt32 gcState { 0 };      // kGcOn until the end-of-bring-up Allow
 	mutable volatile SInt32 gcBusy { 0 };       // GC accessors inside an access
+	mutable thread_t gcOwner { nullptr };       // the thread that is restoring GC state after a GFXOFF wake
+	bool bootQueueLive { false };               // stage 5's plain HQD is up ...
+	uint32_t bringupGen { 0 };                  // ... in THIS bring-up: bumped at every runStages start
+	uint32_t bootQueueGen { 0 };
+	static constexpr uint32_t kGcSnapMax = 16;
+	uint32_t gcSnapVal[kGcSnapMax] {};          // GC registers we program by MMIO, read just before AllowGfxOff
+	bool gcSnapValid { false };
 	IOLock *gcLock { nullptr };
 	IOLock *smuLock { nullptr };                // serializes the SMU mailbox
 	void gcWake(uint32_t what) const;
+	void gfxOffAfterWake(uint32_t what);
+	void gcEnsureAwake(uint32_t what);          // wake GFX before a submitter emits into pm4Queue
+	void gfxOffSnapshot();
+	uint32_t gfxOffRestoreRegs();
+	bool gfxOffAllowedNow(const char **why);
 	// Persistent "GFXOFF may be allowed" flag in NVRAM (set before AllowGfxOff, cleared
 	// after a successful DisallowGfxOff), read at the next start.
 	static bool gfxOffFlagGet();
@@ -460,7 +472,8 @@ private:
 	static bool requestedGfxOff();
 	static uint32_t gfxOffMode();               // rdna4-gfxoff value; 2 = test hook: only leave the NVRAM flag set
 	static constexpr uint32_t kCgStepCoarse = 1, kCgStepMedium = 2, kCgStepFine = 4, kCgStepGuiIdle = 8;
-	static bool requestedGfxCg(uint32_t &mask);
+	static bool requestedGfxCg(uint32_t &mask);       // default 15 (amdgpu's late init); rdna4-gfxcg=0 disables
+	static bool gfxCgIsDefault();                      // no rdna4-gfxcg boot-arg
 	bool rlcSafeMode(bool enter);
 	void gfxCgRmw(const GfxReg::Reg &r, const char *name, uint32_t clear, uint32_t set);
 	void gfxCgCoarse(bool enable);

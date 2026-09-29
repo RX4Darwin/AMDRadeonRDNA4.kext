@@ -98,6 +98,10 @@ constexpr uint32_t kCgEn = 1u << 0, kCglsEn = 1u << 1, kCgRepDelayShift = 2, kCg
 // CP_INT_CNTL / CP_INT_CNTL_RING0: CMP_BUSY [18], CNTX_BUSY [19], CNTX_EMPTY [20], GFX_IDLE [21]
 constexpr uint32_t kCpIntGuiIdleBits = (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21);
 constexpr uint32_t kSdmaCgcgIntEnable = 1u << 1;   // SDMAn_RLC_CGCG_CTRL.CGCG_INT_ENABLE
+// RLC_GPM_STAT (gc_12_0_0_sh_mask.h:21688-21712): GFX power state as the RLC sees it
+constexpr uint32_t kGpmGfxPowerStatus = 1u << 1, kGpmSavingRegs = 1u << 9, kGpmRestoringRegs = 1u << 10,
+                   kGpmGfx3dChanging = 1u << 11, kGpmCmpChanging = 1u << 12,
+                   kGpmStaticWgpUp = 1u << 13, kGpmDynWgpUp = 1u << 15;
 constexpr uint32_t kSmuMsgAllowGfxOff = 0x28;      // PPSMC_MSG_AllowGfxOff (smu_v14_0_2_ppsmc.h:86)   // RLC_CGCG_CGLS_CTRL: CGCG_EN [0], CGLS_EN [1]
 constexpr Reg RlcBootloadStatus   { 1, 0x4e7c };
 constexpr Reg ImuCoreCtrl         { 1, 0x40b6 };

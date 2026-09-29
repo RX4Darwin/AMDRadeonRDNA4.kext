@@ -612,6 +612,7 @@ struct RDNA4State {
     int64_t  gfxoff_arm_ns;
     uint32_t reset_count;
     bool     smu_preloaded;      /* "smu-preloaded": the PMFW the VBIOS loaded at POST answers the mailbox from reset on */
+    uint32_t gpm_restoring_reads; /* RLC_GPM_STAT reports RESTORING_REGISTERS for this many reads after a wake */
     bool     gfxoff_active;      /* AllowGfxOff seen and no DisallowGfxOff since: the GC block is powered down */
     uint32_t gfxoff_violations;  /* GC register/doorbell accesses made while it was */
     uint32_t smu_refuse;         /* "smu-refuse": this SMU message answers CmdRejectedPrereq (0xfd) */
@@ -1734,7 +1735,17 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
     case 0x29:                                     /* DisallowGfxOff */
         s->gfxoff_pending = false;
         if (s->gfxoff_active) {
-            fprintf(stderr, "rdna4: smu: DisallowGfxOff, GC powered up\n");
+            /* Round 4 on the card: the directly programmed MMIO HQD does not survive the
+             * power-down (CP_HQD_ACTIVE, PQ base, doorbell, rptr/wptr read 0 after the wake). */
+            memset(s->hqd, 0, sizeof(s->hqd));
+            reg_set(s, REG_CP_HQD_ACTIVE_EARLY, 0);
+            /* Worst case for the registers the kext restores (the RLC save/restore list decides on
+             * silicon): clock gating and the CP interrupt enables go back to reset values. */
+            reg_set(s, GC_SEG1(0x4c49), 0x0001003c);   /* RLC_CGCG_CGLS_CTRL */
+            reg_set(s, GC_SEG1(0x4c48), 0x000007ff);   /* RLC_CGTT_MGCG_OVERRIDE */
+            reg_set(s, GC_SEG0(0x1e0a), 0);            /* CP_INT_CNTL_RING0 */
+            s->gpm_restoring_reads = 2;
+            fprintf(stderr, "rdna4: smu: DisallowGfxOff, GC powered up; HQD registers lost\n");
         }
         s->gfxoff_active = false;
         break;
@@ -2658,6 +2669,16 @@ static uint64_t rdna4_mmio_read(void *opaque, hwaddr addr, unsigned size)
     addr &= ~3ull;
     if (rdna4_gc_dword(dw) && rdna4_gfxoff_hazard(s, "read", addr)) {
         return 0xffffffffu;
+    }
+    if (addr == GC_SEG1(0x4e6c)) {
+        /* RLC_GPM_STAT: GFX_POWER_STATUS [1] while powered; RESTORING_REGISTERS [10] for a
+         * couple of reads right after a GFXOFF wake, as the RLC restores its save/restore list. */
+        val = 0x2;
+        if (s->gpm_restoring_reads) {
+            val |= 1u << 10;
+            s->gpm_restoring_reads--;
+        }
+        return val;
     }
     if (addr == REG_MM_DATA) {
         val = rdna4_mm_read(s);
