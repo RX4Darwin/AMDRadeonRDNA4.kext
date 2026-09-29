@@ -89,6 +89,11 @@ separate power-management work.
    by diagnostic-log.sh). **Boot 9** is the same with `rdna4-cursor=2`: a magenta
    64x64 square at (100,100) that macOS's pointer does not replace; see
    `docs/cursor-audit.md` for how to read the result.
+   **W32/W34 (round 5): the cursor plane's DLG state.** The trail has `ttu:` and `gate:` lines at arming, self-test, after each
+   boot flip and at macOS's first cursor calls (TTU/QoS/`HUBPREQ_DEBUG_DB`, HUBP clock, cursor memory power, MPCC0 selects, sprite
+   pixels read back). With `rdna4-cursor=2` the kext also writes amdgpu's `HUBPREQ_DEBUG_DB = 1 << 8` (DLG mission mode,
+   `dcn401_hubp.c:329`; old value logged; `rdna4-cursordlg=0` skips it as the control). The DML-style `DCN_CUR0_TTU_CNTL0/1` write is
+   an opt-in (`rdna4-cursorttu=1`): amdgpu leaves that pair 0 on DCN 4.01. `docs/cursor-ttu.md` says what each line means.
 
 6b. **Round 4 draw (W23).** Boot 10 (`rdna4-gfx=2 rdna4-gfxdiag=11`): the gfx golden registers are written at ring
    bring-up (rev_id from the NBIF RCC_STRAP0 at dword 0x1c); if the draw is still empty the ladder re-runs it with one open
@@ -99,6 +104,13 @@ separate power-management work.
    can hang the gfx pipeline and there is no reset, so if its result says `hang/` do a cold power cycle before anything else.
    `docs/gfx-draw-audit.md` lists the suspects and what each log line means. A `gfx-golden-strict` emulator result says
    nothing about the card, it only shows that the kext writes the registers.
+   **Round 5 (W31): boots 10-12 also run `rdna4-gfxprobe=1`.** The draw stream is split at `NUM_INSTANCES` and `COPY_DATA` packets
+   copy 22 context/SH/uconfig registers into memory on the ring (`draw probe mid/post: CP view ... N of M registers equal what the
+   stream wrote`); `fault after <step>` shows which bring-up step makes the CPG read VA 0; `RS64 DC_BASE0 ...` prints the microengine
+   base registers. The earlier MMIO context readback lags one context, so read the CP view instead (`docs/gfx-context-audit.md`).
+   **W33 additions:** `single-packet probe NOP / WRITE_DATA / RELEASE_MEM / ACQUIRE_MEM` with a `fault after single <packet>` line each (the first one naming
+   `CID 0x6` is the packet that makes the CPG read VA 0), a `sentinel:` line saying whether the CP-side read tracks context writes (read `probe mid` only if it does),
+   `probe consistency` in the ladder, RS64 bases for both pipes. The fault marks and RS64 evidence run on every `rdna4-gfx=2` boot and clear the fault status.
 
 7. **Optional W19 GFX power-management probe.**
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31`.

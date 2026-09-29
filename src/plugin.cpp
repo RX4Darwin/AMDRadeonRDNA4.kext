@@ -265,6 +265,10 @@ int32_t deviceDrawHardwareCursor(void *ctx, int32_t x, int32_t y, uint32_t visib
 	return static_cast<RDNA4Device *>(ctx)->drawHardwareCursor(x, y, visible);
 }
 
+void deviceCursorProbe(void *ctx, const char *why) {
+	static_cast<RDNA4Device *>(ctx)->cursorRegProbe(why);
+}
+
 int32_t deviceGetHardwareCursorDrawState(void *ctx,
 	                                         Ndrv::VDHardwareCursorDrawStateRec &state) {
 	return static_cast<RDNA4Device *>(ctx)->getHardwareCursorDrawState(state);
@@ -337,7 +341,7 @@ void attach(FbEntry &e) {
 	if (computeStage && dev.isAmd) {
 		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
 		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
-		                        createVblankService };
+		                        createVblankService, deviceCursorProbe, &dev };
 		st->compute.start(env, computeStage);
 	}
 }

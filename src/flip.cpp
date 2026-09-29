@@ -370,6 +370,9 @@ bool run(RDNA4Compute &compute) {
 		IOLockLock(compute.rtLock);
 		const bool completed = flipTo(compute, surface, target, name);
 		IOLockUnlock(compute.rtLock);
+		// W32: is the cursor plane still as programmed after a flip? Read-only and bounded; only set with rdna4-cursor.
+		if (completed && compute.env.cursorProbe)
+			compute.env.cursorProbe(compute.env.cursorProbeCtx, name);
 		return completed;
 	};
 

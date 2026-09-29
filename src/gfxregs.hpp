@@ -39,6 +39,24 @@ constexpr Reg CbHwControl1        { 0, 0x1425 };
 // bits [27:24]. (0x0021 is STRAP16 in that map; the earlier 0x0021 came from the 6.3.2 header.)
 constexpr Reg NbifStrap0          { 2, 0x001c };
 constexpr Reg NbifStrap16         { 2, 0x0021 };   // logged next to STRAP0 so a wrong pick is visible
+// PFP/ME (RS64) data- and instruction-cache base registers (gc_12_0_0_offset.h, GC seg 1): the CPG reads
+// its stack/data through DC_BASE0/1 (programmed by gfx_v12_0.c:2494-2505,2639-2650 when the driver
+// loads the microcode itself; with the PSP autoload they are set on the driver's behalf). A 0 there
+// would make the CP fetch VA 0.
+constexpr Reg CpRs64DcBase0Lo     { 1, 0x5863 };
+constexpr Reg CpRs64DcBase1Lo     { 1, 0x5864 };
+constexpr Reg CpRs64DcBase0Hi     { 1, 0x5865 };
+constexpr Reg CpRs64DcBase1Hi     { 1, 0x5866 };
+constexpr Reg CpRs64DcBaseCntl    { 1, 0x2a08 };
+constexpr Reg CpRs64DcOpCntl      { 1, 0x2a09 };
+constexpr Reg CpPfpIcBaseLo       { 1, 0x5840 };
+constexpr Reg CpPfpIcBaseHi       { 1, 0x5841 };
+constexpr Reg CpPfpIcBaseCntl     { 1, 0x5842 };
+constexpr Reg CpMeIcBaseLo        { 1, 0x5844 };
+constexpr Reg CpMeIcBaseHi        { 1, 0x5845 };
+constexpr Reg CpMeIcBaseCntl      { 1, 0x5846 };
+constexpr Reg CpGfxRs64InstrPntr0 { 1, 0x2a44 };
+constexpr Reg CpGfxRs64InstrPntr1 { 1, 0x2a45 };
 constexpr Reg CpStat              { 0, 0x0f40 };
 constexpr Reg CpCpcStatus         { 0, 0x0e24 };
 constexpr Reg CpCpfStatus         { 0, 0x0e27 };
