@@ -326,10 +326,17 @@ void RDNA4Compute::gfxGoldenInit() {
 	// not draw (the golden set is the fix under test in round 4).
 	uint32_t useGolden = 1;
 	if (PE_parse_boot_argn("rdna4-gfxgolden", &useGolden, sizeof(useGolden)) && useGolden == 0) {
-		GLOG("golden: skipped by rdna4-gfxgolden=0");
+		// Skipping writes nothing and undoes nothing: these registers keep an earlier
+		// boot's values across a warm restart, so this is a control only after a cold
+		// power cycle. Say what is in force.
+		grbmSelect(0, 0, 0, 0);
+		GLOG("golden: skipped by rdna4-gfxgolden=0; in force now: DB_MEM_CONFIG 0x%08x CB_HW_CONTROL_1 0x%08x "
+		     "GL2C_CTRL5 0x%08x (a golden value here came from an earlier boot: power-cycle first for a clean control)",
+		     rdGc(DbMemConfig), rdGc(CbHwControl1), rdGc(Gl2cCtrl5));
 		return;
 	}
 	const uint32_t strap = rd(IpDiscovery::HwNbif, NbifStrap0);
+	const uint32_t strap16 = rd(IpDiscovery::HwNbif, NbifStrap16);
 	const uint32_t rev = strap == 0xffffffffu ? 0xff : (strap >> 24) & 0xf;
 	const uint32_t pciRev = env.pci ? env.pci->configRead8(kIOPCIConfigRevisionID) : 0xff;
 	struct Golden { const char *name; Reg reg; uint32_t mask, value; bool rev0Only; };
@@ -339,10 +346,12 @@ void RDNA4Compute::gfxGoldenInit() {
 		{ "CB_HW_CONTROL_1", CbHwControl1,  0x03000000, 0x03000000, true },
 		{ "GL2C_CTRL5",      Gl2cCtrl5,     0x00000070, 0x00000020, true },
 	};
-	GLOG("golden: NBIF STRAP0 0x%08x -> rev_id %u (PCI revision 0x%02x): %s", strap, rev, pciRev,
+	GLOG("golden: NBIF RCC_STRAP0 (0x1c) 0x%08x -> rev_id %u (PCI revision 0x%02x; STRAP16 (0x21) reads 0x%08x): %s",
+	     strap, rev, pciRev, strap16,
 	     rev == 0 ? "golden_settings_gc_12_0 and _rev0 apply" : "golden_settings_gc_12_0 only");
 	trail("gfx: golden registers");
 	grbmSelect(0, 0, 0, 0);
+	uint32_t changed = 0, seen = 0;
 	for (const Golden &g : table) {
 		if (g.rev0Only && rev != 0)
 			continue;
@@ -352,10 +361,15 @@ void RDNA4Compute::gfxGoldenInit() {
 			continue;
 		}
 		const uint32_t after = (before & ~g.mask) | (g.value & g.mask);
+		seen++;
+		changed += after != before;
 		wr(IpDiscovery::HwGc, g.reg, after);
 		GLOG("golden: %s (mask 0x%08x value 0x%08x): 0x%08x -> 0x%08x, reads back 0x%08x", g.name,
 		     g.mask, g.value, before, after, rdGc(g.reg));
 	}
+	if (seen && !changed)
+		GLOG("golden: already in force from an earlier boot (nothing changed): a warm restart keeps them, so "
+		     "rdna4-gfxgolden=0 cannot undo this; power-cycle for a clean control");
 }
 
 uint32_t RDNA4Compute::requestedGfxDiag() {
@@ -679,7 +693,12 @@ bool RDNA4Compute::stageGfxDraw() {
 		char summary[200];
 		summary[0] = '\0';
 		size_t used = 0;
-		for (uint32_t bit = 1; bit <= 8; bit <<= 1) {
+		// By information and risk: the marker store (8) first, then the register-only variants
+		// (2, 1), and the GS_ALLOC_REQ shader (4) last: it can hang the NGG pipeline and there is
+		// no reset (W23 review S3), so boot 12 runs it alone (rdna4-gfxdiag=4). After a "hang/"
+		// result the next boot needs a cold power cycle: the GC state survives a warm restart.
+		static const uint32_t order[4] = { 8, 2, 1, 4 };
+		for (uint32_t bit : order) {
 			if (!(diag & bit))
 				continue;
 			char label[16];

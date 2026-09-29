@@ -34,8 +34,8 @@ runs (`gfx_v12_0.c:253-261`):
 The notes' section 4.2 listed them as "should be in place before the first draw"; the kext defined `Gl2cCtrl5` in
 `gfxregs.hpp` but nothing ever wrote any of the four (grep of `src/`). `CB_HW_CONTROL_1` and `DB_MEM_CONFIG` belong to the
 colour and depth blocks that a first draw exercises; the compute stages never touch them, which is why compute works
-without them. amdgpu's `rev_id` is `STRAP_ATI_REV_ID` of the NBIF strap (`nbif_v6_3_1.c` `get_rev_id`,
-`RCC_STRAP0_RCC_DEV0_EPF0_STRAP0` [27:24]), not the PCI revision byte.
+without them. amdgpu's `rev_id` is `STRAP_ATI_REV_ID` of the NBIF strap (`nbif_v6_3_1.c:112-124` `get_rev_id`,
+`RCC_STRAP0_RCC_DEV0_EPF0_STRAP0`, NBIF dword `0x001c` (`nbif_6_3_1_offset.h:1705`), [27:24]; 0x0021 is STRAP16), not the PCI revision byte.
 
 Fix: `RDNA4Compute::gfxGoldenInit` (`gfxring.cpp`) applies them at gfx-ring bring-up (while PFP/ME are still halted) and logs
 strap, rev_id, PCI revision, and each register before/after/readback (`gfx: golden: ...`). The A/B control on the card is
@@ -89,7 +89,7 @@ For the baseline draw and every ladder variant, in this order:
    scissors, `GE_POS/PRIM_RING_*`, ...).
 4. `draw: wrong image ...` with covered/other counts, first non-zero pixel and bounds; for an empty target the 2 ms and
    flushed recounts.
-5. With `rdna4-gfxdiag=<mask>`: `diag 1|2|4|8:` variant lines (bit 1 USER_SGPR, 2 INST_PREF_SIZE, 4 GS_ALLOC_REQ shader,
+5. With `rdna4-gfxdiag=<mask>`: `diag 1|2|4|8:` variant lines (bit 1 USER_SGPR, 2 INST_PREF_SIZE, 4 GS_ALLOC_REQ shader (run last, boot 12 alone),
    8 PS marker store; bit 16 runs them even when the baseline passed) and a summary `diag ladder: baseline N px; variants ...`, also
    in the registry property `Compute,GFXDiag`.
 

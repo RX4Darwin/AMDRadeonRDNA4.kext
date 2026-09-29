@@ -4701,11 +4701,13 @@ static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
      * (gfx_v12_0_init_golden_registers, gfx_v12_0.c:3671-3690): DB_MEM_CONFIG
      * bit 15 always, and for rev_id 0 DB_MEM_CONFIG[3:0]=0xf, CB_HW_CONTROL_1[25:24]=3,
      * GL2C_CTRL5[6:4]=2. rev_id is the NBIF strap (nbif_v6_3_1_get_rev_id,
-     * RCC_STRAP0 [27:24]; the model's strap reads 0). Whether the silicon draws
+     * RCC_STRAP0 at NBIF dword 0x1c, [27:24]; the model's strap reads 0). Whether the silicon draws
      * without them is not known: the round-3 card did not draw and had none, so the
-     * model reports the omission; gfx-golden-strict=on refuses the draw. */
+     * model reports the omission; gfx-golden-strict=on refuses the draw. Strict mode
+     * encodes that hypothesis: its result is NOT evidence about the card, it only
+     * shows that the kext writes the registers. */
     {
-        uint32_t rev_id = (reg_get(s, (0xd20 + 0x21) * 4) >> 24) & 0xf;
+        uint32_t rev_id = (reg_get(s, (0xd20 + 0x1c) * 4) >> 24) & 0xf;
         uint32_t db = reg_get(s, REG_GFX_DB_MEM_CONFIG);
         uint32_t cb = reg_get(s, REG_GFX_CB_HW_CONTROL_1);
         uint32_t gl2 = reg_get(s, REG_GFX_GL2C_CTRL5);
