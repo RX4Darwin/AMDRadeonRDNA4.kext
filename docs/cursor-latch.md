@@ -123,12 +123,12 @@ Behind `rdna4-cursor` (both `=1` and `=2`), `cursor.cpp`:
 
 - `cursorMpcLock(bool)` writes `CUR_VUPDATE_LOCK_SET<opp>` (MPC seg 3, dword `0x02c1 + 5*opp + 4`); nested calls count. Every cursor update is
   bracketed as amdgpu does: attributes (`cursorProgramPlane`), position/enable (`drawHardwareCursor`), and the self-test's position + attributes in one bracket.
-- At arming the kext reads all five lock-set registers and both MPC pending-status registers (`armed, as the GOP left it: mpc locks ...`) and
-  releases a held cursor lock (`released a held CUR_VUPDATE_LOCK_SET`).
+- At arming the kext reads all five lock-set registers and both MPC pending-status registers (`armed, as the GOP left it: mpc locks ...`); a held
+  cursor lock is NOT released there (W25 review S1: only programmed state may latch) but by the unlock that ends the first bracket (`released the GOP-held CUR_VUPDATE_LOCK_SET at the end of the first bracket`).
 - After each unlock the kext polls `CUR0_UPDATE_PENDING` for up to 40 ms and logs `cursor update LATCHED after N ms` or `still PENDING` (first
   10 checks, off the per-move path except for the first three moves).
 - Every state dump also prints the `mpc locks` line.
-- `rdna4-cursorlock=0` (set-boot.sh boot 13 = boot 9 plus it) leaves the lock alone: the A/B control on the card.
+- `rdna4-cursorlock=0` (set-boot.sh boot 17 = boot 9 plus it) leaves the lock alone: the A/B control on the card.
 
 Emulator: the model now honours the cursor lock (no cursor plane while `CUR_VUPDATE_LOCK_SET0` is 1, `emu/qemu/rdna4.c` `rdna4_get_cursor`) and the
 option `cursor-lock-stuck=on` starts it held. This encodes the hypothesis, not a measurement: it shows that the kext handles a held lock, not that the
@@ -144,4 +144,4 @@ card's lock was held. Runs (boot-6 arguments, `RDNA4_DEV=cursor=on,...`, `rdna4-
 Boot 9: read the `mpc locks` line of `armed, as the GOP left it`. `CUR=0x00000001` confirms the hypothesis; the square should then appear and
 `cursor update LATCHED` be logged. `CUR=0x00000000` with `still PENDING` means the cursor lock was not the problem: plan item 3
 (`MPCC_UPDATE_LOCK_SEL` / MPC pending status, DPP update domain) is next, and the `dpp pending` / `misc pending` values are the first clue.
-Boot 13 repeats boot 9 without the lock handling as the control.
+Boot 17 repeats boot 9 without the lock handling as the control.

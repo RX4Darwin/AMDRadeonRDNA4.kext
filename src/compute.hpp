@@ -406,11 +406,16 @@ private:
 	uint32_t   gfxMode { 0 };                // 0 off, 2 doorbell (the only mode)
 	static uint32_t requestedGfx();
 	// W19: rdna4-gfxpm, the GFX power-management experiment.
-	static constexpr uint32_t kPmWorkload = 1, kPmSoftAuto = 2, kPmCapProbe = 4, kPmSampleOnly = 8;
+	static constexpr uint32_t kPmWorkload = 1, kPmSoftAuto = 2, kPmCapProbe = 4, kPmSampleOnly = 8,
+	                               kPmSurvey = 16;      // W24: engine busy/CG survey at each bring-up stage
+	static constexpr uint32_t kGfxCapMinMHz = 200, kGfxCapMaxMHz = 5000;
 	static constexpr uint32_t kPmSoftMaxAuto = 0xffff;         // (PPCLK_GFXCLK << 16) | 0xffff
 	static constexpr uint32_t kPmNoMin = 0xffffffffu;          // leave SoftMin alone
 	static constexpr uint32_t kPmProbeMHz = 1000;
 	static uint32_t requestedGfxPm();
+	static bool requestedGfxCap(uint32_t &mhz);      // rdna4-gfxcap: false when absent
+	void gfxPmSurvey(const char *tag);
+	void gfxCapApply(uint32_t mhz);
 	void gfxPmSample(const char *tag);
 	bool gfxPmSoftLimits(uint32_t maxParam, uint32_t minParam, const char *what);
 	void gfxPmExperiment(uint32_t mask);
