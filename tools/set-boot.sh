@@ -1,7 +1,7 @@
 #!/bin/bash
 # Set the boot-args for one boot of docs/real-card-plan.md on the OpenCore USB.
 #
-#   bash /Volumes/OPENCORE/set-boot.sh <0-12>
+#   bash /Volumes/OPENCORE/set-boot.sh <0-13>
 #
 #   0  this morning's known-good arguments (no new feature enabled)
 #   1  + interrupts and W6 opt-in            rdna4-ih=1 rdna4-hang=1
@@ -18,6 +18,7 @@
 #  10  round 4 draw: boot 5 with the golden registers (default) and the rdna4-gfxdiag=11 ladder (8, 2, 1) if the draw is empty
 #  11  A/B control: boot 10 with rdna4-gfxgolden=0. The goldens survive a warm restart: POWER-CYCLE first (or run 11 before 10)
 #  12  GS_ALLOC_REQ shader variant alone (rdna4-gfxdiag=4): it can hang the gfx pipe; cold power cycle afterwards if it reports hang/
+#  13  cursor A/B control: boot 9 with rdna4-cursorlock=0 (the MPC cursor lock left alone, as before W25)
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
 # the one the next boot uses. A copy of the config is kept next to it first.
@@ -37,7 +38,8 @@ case "${1:-}" in
 	10) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-gfxdiag=11 rdna4-hang=1" ;;
 	11) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-gfxgolden=0 rdna4-gfxdiag=11 rdna4-hang=1" ;;
 	12) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-gfxdiag=4 rdna4-hang=1" ;;
-	*) echo "usage: bash $0 <0-12>   (see docs/real-card-plan.md)"; exit 1 ;;
+	13) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorlock=0 rdna4-hang=1" ;;
+	*) echo "usage: bash $0 <0-13>   (see docs/real-card-plan.md)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"

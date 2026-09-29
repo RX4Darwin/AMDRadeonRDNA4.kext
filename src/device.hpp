@@ -226,6 +226,13 @@ private:
 	void cursorDumpState(const char *why);
 	void latchNote(const char *fmt, ...) __printflike(2, 3);   // "latch:" line, also into the cursor trail
 	void cursorTrailAppend(const char *line);
+	// The MPC cursor lock (CUR_VUPDATE_LOCK_SET<opp>, dc/mpc/dcn10/dcn10_mpc.c:458-463) that
+	// brackets every cursor update in amdgpu; nested calls are counted.
+	void cursorMpcLock(bool lock);
+	void cursorLockNote(const char *why);
+	bool cursorWaitLatched(const char *why, uint32_t maxMs);
+	uint32_t cursorLockDepth { 0 }, cursorLatchLogs { 0 };
+	bool cursorUseLock { true };   // rdna4-cursorlock=0 turns the lock handling off (A/B control)
 	void cursorProgramPlane(bool enable);
 	void cursorSelfTest();
 	uint32_t cursorDstXOffset(uint32_t px) const;

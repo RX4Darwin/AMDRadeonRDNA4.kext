@@ -545,6 +545,7 @@ void RDNA4Device::latchNote(const char *fmt, ...) {
 // way amdgpu's set_cursor_attributes does, enabled or not.
 void RDNA4Device::cursorProgramPlane(bool enable) {
 	ensureUpdateLatch();
+	cursorMpcLock(true);   // dcn10_cursor_lock: the writes below latch together at the unlock
 	const uint32_t hubp = hubpOff();
 	const uint32_t dpp = dppOff();
 	regWriteDmu(2, kCursorAddressHigh + hubp, static_cast<uint32_t>(cursorMcAddr >> 32) & 0xffff);
@@ -567,6 +568,9 @@ void RDNA4Device::cursorProgramPlane(bool enable) {
 	            kCursorCmWorkingBits | (kCursorModePremultipliedArgb << kCursorCmModeShift) |
 	            (enable ? 1u : 0u));
 	hwCursorEnabledHw = enable;
+	cursorMpcLock(false);
+	if (!cursorLockDepth)   // outermost bracket closed: does the update latch?
+		cursorWaitLatched(enable ? "attributes+enable" : "attributes", 40);
 }
 
 // CURSOR_DST_X_OFFSET (hubp401_cursor_set_position): x scaled from pixel-clock
@@ -586,10 +590,14 @@ void RDNA4Device::cursorSelfTest() {
 	for (uint32_t i = 0; i < kCursorWidth * kCursorHeight; i++)
 		cursorVram[i] = 0xffff00ffu;   // premultiplied ARGB: opaque magenta
 	const uint32_t hubp = hubpOff();
-	// Position first, then the enable, so the square is never armed at (0,0).
+	// One lock bracket around position and attributes: they latch together at the unlock, so
+	// the square is never armed at (0,0) (the order inside a bracket does not matter).
+	cursorMpcLock(true);
 	regWriteDmu(2, kCursorPosition + hubp, 100u | (100u << 15));
 	regWriteDmu(2, kCursorDstOffset + hubp, cursorDstXOffset(100));
-	cursorProgramPlane(true);
+	cursorProgramPlane(true);   // nested: does not touch the lock register
+	cursorMpcLock(false);
+	cursorWaitLatched("selftest", 40);
 	cursorNote("SELF-TEST (rdna4-cursor=2): an opaque magenta 64x64 square is programmed at (100,100)");
 	cursorNote("self-test state: hwCursorVisible %d hwCursorEnabledHw %d (macOS calls are ignored)", hwCursorVisible, hwCursorEnabledHw);
 	cursorDumpState("selftest");
@@ -625,6 +633,56 @@ void RDNA4Device::cursorDumpState(const char *why) {
 	           regReadDmu(3, kMpccControl + mpcc), regReadDmu(3, kMpccUpdateLockSel + mpcc),
 	           regReadDmu(3, kMpccStatus + mpcc),
 	           regReadDmu(3, kMpcOutMux + (pipe.otg < Pipe::kMaxOtg ? pipe.otg * kMpcOutStride : 0)));
+	cursorLockNote(why);
+}
+
+// The cursor lock of this pipe's OPP: MPC seg 3, kMpcLockBase + 5 * opp + 4. amdgpu writes
+// 1 before a cursor update and 0 after (dc_stream.c:313,332 / 476,491 -> dcn10_cursor_lock ->
+// mpc1_cursor_lock); while it is 1 the HUBP/DPP cursor registers stay pending. Nested calls
+// (the self-test wraps position + attributes in one bracket) count, and only the outer pair
+// touches the register.
+void RDNA4Device::cursorMpcLock(bool lock) {
+	if (!cursorUseLock)
+		return;
+	const uint32_t opp = pipe.opp < Pipe::kMaxOtg ? pipe.opp : 0;
+	const uint32_t reg = kMpcLockBase + kMpcLockStride * opp + kMpcCurLock;
+	if (lock) {
+		if (cursorLockDepth++ == 0)
+			regWriteDmu(3, reg, 1);
+	} else if (cursorLockDepth > 0 && --cursorLockDepth == 0) {
+		regWriteDmu(3, reg, 0);
+	}
+}
+
+// Every lock-set register of this OPP and the MPC's pending status: the picture that says
+// which lock, if any, is holding the cursor update back.
+void RDNA4Device::cursorLockNote(const char *why) {
+	const uint32_t opp = pipe.opp < Pipe::kMaxOtg ? pipe.opp : 0;
+	const uint32_t b = kMpcLockBase + kMpcLockStride * opp;
+	cursorNote("%s: mpc locks opp%u: adr_cfg_cur=0x%08x adr_cfg=0x%08x adr=0x%08x cfg=0x%08x CUR=0x%08x | "
+	           "dpp pending=0x%08x misc pending=0x%08x", why, opp, regReadDmu(3, b), regReadDmu(3, b + 1),
+	           regReadDmu(3, b + 2), regReadDmu(3, b + 3), regReadDmu(3, b + kMpcCurLock),
+	           regReadDmu(3, kMpcDppPending), regReadDmu(3, kMpcPendingMisc));
+}
+
+// After the unlock the cursor registers latch at the next VUPDATE (at most one frame, ~17 ms):
+// poll CM_CUR0's CUR0_UPDATE_PENDING (bit 16) for up to maxMs and say how it went, for the first
+// few calls (evidence for the card; the wait is bounded and only used off the per-move path).
+bool RDNA4Device::cursorWaitLatched(const char *why, uint32_t maxMs) {
+	const uint32_t reg = kCursorCmControl + dppOff();
+	uint32_t waited = 0, cm = regReadDmu(2, reg);
+	while ((cm >> 16) & 1 && waited < maxMs && cm != 0xffffffffu) {
+		IOSleep(1);
+		waited++;
+		cm = regReadDmu(2, reg);
+	}
+	const bool latched = !((cm >> 16) & 1);
+	if (cursorLatchLogs < 10) {
+		cursorLatchLogs++;
+		cursorNote("%s: cursor update %s after %u ms (cm ctl 0x%08x)", why,
+		           latched ? "LATCHED" : "still PENDING", waited, cm);
+	}
+	return latched;
 }
 
 bool RDNA4Device::initHardwareCursor() {
@@ -677,6 +735,26 @@ bool RDNA4Device::initHardwareCursor() {
 	for (uint32_t i = 0; i < kCursorWidth * kCursorHeight; i++)
 		cursorVram[i] = 0;
 	ensureUpdateLatch();
+	// The GOP never used a cursor and has no reason to leave the MPC cursor lock in a defined
+	// state. amdgpu only ever writes it around an update (mpc1_cursor_lock); a lock left at 1
+	// holds every cursor write pending forever (the symptom the card showed:
+	// CUR0_UPDATE_PENDING stuck at 1; the value the GOP left is what this reads). Release a held lock.
+	{
+		const uint32_t opp = pipe.opp < Pipe::kMaxOtg ? pipe.opp : 0;
+		const uint32_t lockReg = kMpcLockBase + kMpcLockStride * opp + kMpcCurLock;
+		const uint32_t held = regReadDmu(3, lockReg);
+		cursorLockNote("armed, as the GOP left it");
+		uint32_t useLock = 1;
+		if (PE_parse_boot_argn("rdna4-cursorlock", &useLock, sizeof(useLock)) && useLock == 0) {
+			cursorUseLock = false;
+			cursorNote("rdna4-cursorlock=0: the MPC cursor lock is left alone (the pre-W25 behaviour)");
+		}
+		if (cursorUseLock && held != 0xffffffffu && (held & 1)) {
+			regWriteDmu(3, lockReg, 0);
+			cursorNote("released a held CUR_VUPDATE_LOCK_SET (was 0x%08x, now 0x%08x)", held,
+			           regReadDmu(3, lockReg));
+		}
+	}
 	hwCursorReady = true;
 	{
 		const uint32_t timer = regReadDmu(2, kDchubGlobalTimerCntl);
@@ -804,6 +882,7 @@ IOReturn RDNA4Device::drawHardwareCursor(int32_t x, int32_t y, uint32_t visible)
 	hwCursorX = x;
 	hwCursorY = y;
 	hwCursorVisible = visible != 0;
+	cursorMpcLock(true);   // dcn10_cursor_lock before the position/enable writes (dc_stream.c:476)
 	const uint32_t hubp = hubpOff();
 	const uint32_t dpp = dppOff();
 
@@ -823,18 +902,24 @@ IOReturn RDNA4Device::drawHardwareCursor(int32_t x, int32_t y, uint32_t visible)
 	// Like amdgpu, touch the enables only when the visibility changes:
 	// rewriting the double-buffered control registers on every move re-arms
 	// CUR0_UPDATE_PENDING each time (hubp401: if cur_enable != cur_en).
+	bool changed = false;
 	if (hwCursorVisible != hwCursorEnabledHw) {
 		regWriteDmu(2, kCursorControl + hubp, cursorCtlBase | (hwCursorVisible ? 1u : 0u));
 		regWriteDmu(2, kCursorCmControl + dpp,
 		            kCursorCmWorkingBits | (kCursorModePremultipliedArgb << kCursorCmModeShift) |
 		            (hwCursorVisible ? 1u : 0u));
 		hwCursorEnabledHw = hwCursorVisible;
-		if (cursorVisChanges < 6) {
-			cursorVisChanges++;
-			cursorDumpState(hwCursorVisible ? "shown" : "hidden");
-		}
+		changed = true;
 	}
+	cursorMpcLock(false);   // program_cursor_position: unlock; the update latches at the next VUPDATE
 	cursorDrawCalls++;
+	if (changed && cursorVisChanges < 6) {
+		cursorVisChanges++;
+		cursorWaitLatched(hwCursorVisible ? "shown" : "hidden", 40);
+		cursorDumpState(hwCursorVisible ? "shown" : "hidden");
+	} else if (cursorDrawCalls <= 3) {
+		cursorWaitLatched("move", 40);
+	}
 	// The first moves, then a slow sample: it shows whether CUR0_UPDATE_PENDING
 	// ever clears and whether the position registers hold what was written.
 	if (cursorDrawLogs < 5 || (cursorDrawLogs < 12 && (cursorDrawCalls & 0x1ff) == 0)) {

@@ -609,6 +609,7 @@ struct RDNA4State {
     bool     smu_stale;      /* metrics transfer acks but the table is never rewritten */
     bool     warm_keep;      /* reset keeps live engines/queues, like warm card restart */
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
+    bool     cursor_lock_stuck; /* the GOP left the MPC cursor lock (CUR_VUPDATE_LOCK_SET0) held */
     bool     cursor_reject_logged;
     uint32_t gfx_break;      /* corrupt one G3 MUST register at draw time */
     bool     gfx_golden_strict; /* refuse a draw when the amdgpu golden registers are unset (gfx-golden-strict) */
@@ -6214,6 +6215,13 @@ static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so, RDNA4Cursor 
     const int hubp = rdna4_hubp_for_otg(s, so->otg);
     if (hubp < 0)
         return false;
+    /* The MPC cursor lock (regCUR_VUPDATE_LOCK_SET<opp> at MPC dword 0x02c5 + 5 * opp, base idx 3;
+     * amdgpu writes it around every cursor update: mpc1_cursor_lock, dc/mpc/dcn10/dcn10_mpc.c:458-463).
+     * While it is 1 the cursor registers stay pending and the plane does not change: the model
+     * shows no cursor until the driver has released it (cursor-lock-stuck=on starts it held,
+     * as a GOP might leave it). */
+    if (reg_get(s, SEG3(0x02c5 + 5 * so->otg)) & 1)
+        return false;
     const uint32_t hp = hubp * HUBP_STRIDE;
     const uint32_t dpp = hubp * DPP_STRIDE;
     const uint32_t control = reg_get(s, SEG2(HUBP_CURSOR_CONTROL + hp));
@@ -6596,6 +6604,8 @@ static void rdna4_reset(DeviceState *dev)
      * IP discovery gc_info table, as in amdgpu_discovery_get_gc_info.  The
      * register is read-only in the model; always present the card's value. */
     reg_set(s, REG_GFX_GB_ADDR_CONFIG, 0x08200545u);
+    if (s->cursor_lock_stuck)
+        reg_set(s, SEG3(0x02c5), 1);
     if (dcn) {
         memcpy(s->regs + dcn_start, dcn, dcn_bytes);
         g_free(dcn);
@@ -6812,6 +6822,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("ih-dead", RDNA4State, ih_dead, false),
     DEFINE_PROP_BOOL("dcn-irq-storm", RDNA4State, dcn_irq_storm, false),
     DEFINE_PROP_BOOL("cursor", RDNA4State, cursor_enabled, false),
+    DEFINE_PROP_BOOL("cursor-lock-stuck", RDNA4State, cursor_lock_stuck, false),
     DEFINE_PROP_BOOL("hang-sticky", RDNA4State, hang_sticky, false),
     DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,
                 bool),
