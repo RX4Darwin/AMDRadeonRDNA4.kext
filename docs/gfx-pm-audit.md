@@ -331,3 +331,38 @@ violations with the guard (verified: 0 in the dry runs). The negative case (guar
   WRITE_DATA. Client queues are created after any wake (their open touches GC first), so only the boot queue needs it.
 - Emulator: `DisallowGfxOff` after an `AllowGfxOff` now clears the HQD registers and `RLC_GPM_STAT` reports
   RESTORING_REGISTERS for two reads, so the wake path is exercised in the VM.
+
+### W29 review fixes (S4-S7, S2; S1 and S3 accepted)
+
+- **S4, bring-up generation.** `bootQueueLive` is now tied to `bringupGen` (bumped at every `runStages` start) and cleared
+  at the start of each bring-up and in the quiesce; `gfxOffAfterWake` returns at once for the wake at the start of a
+  bring-up (`what == 0xffffffff`) as well as for the quiesce, so a re-bring-up after sleep never programs an HQD (or polls
+  a possibly stopped RLC) on a GPU that is not brought up yet.
+- **S5, no race, enforced by order and stated.** `pm4Queue` and the client queues are emitted into by one submitter at a
+  time under `rtLock`, and only after a GC access. To make "the wake finishes before anyone emits" hold by construction
+  rather than by accident, `launch()` and `queueWriteTest()` call `gcEnsureAwake()` first (a wake before the packet, not at
+  the doorbell). If a doorbell write is ever the waking access, the restore is skipped and logged (a packet is in flight, a
+  re-init would discard it and publish a stale wptr); the hang recovery is the fallback. A stronger lock over the ring
+  bookkeeping was not added: no second submitter exists.
+- **S6, what GFXOFF may lose.** Refused instead of restored: the **gfx ring** (`rdna4-gfx`: CP_RB0, doorbell, goldens) and
+  any **open runtime client** (its HQD, SH_MEM_BASES for VMIDs 8-15 and VM state): `AllowGfxOff` is not sent, the log says
+  why. Restored: a snapshot taken just before the Allow of the registers we program by MMIO (MEC doorbell range,
+  CP_PQ_WPTR_POLL_CNTL, CP_ME1_PIPE0/1_INT_CNTL, CP_INT_CNTL, CP_INT_CNTL_RING0, the clock-gating set: RLC_CGCG_CGLS_CTRL,
+  _3D, RLC_CGTT_MGCG_OVERRIDE, CP_RB_WPTR_POLL_CNTL, SDMA0/1_RLC_CGCG_CTRL) is compared after the wake; every difference is
+  logged (`gfxoff: NAME changed across the power-down: old -> restored new`) and written back (clock-gating ones inside
+  RLC safe mode), followed by one summary line, then the boot HQD. That is also the loss-map for round 5. SDMA and the GC hub
+  are not restored: round 4 showed DMA and a dispatch working after a wake, so they survive.
+- **S7, hang recovery.** No watchdog thread exists; recovery is inline (`recoverComputeQueue`, needs `rdna4-hang=1`) and runs
+  on the submitter's thread after the wake completed, so it cannot race the restore. If the restore fails, the first dispatch
+  times out and the recovery rebuilds the queue (round 4's bench passing after the timeout was exactly that). Client queues are
+  not restored on a wake; with the "no open client" rule at Allow time none exists to lose.
+- **S2, carry-over.** One line at attach: `cg: state found at start ...` with RLC_CGCG_CGLS_CTRL (CGCG_EN/CGLS_EN),
+  RLC_CGTT_MGCG_OVERRIDE and CP_INT_CNTL_RING0, i.e. what an earlier boot left in the RLC (cold boots read reset values).
+  Clock gating persisting across a warm restart is a second persistent variable next to the golden registers: a boot that
+  compares against an earlier round needs a power cycle, or an `rdna4-gfxcg=0` boot first.
+- **S1, accepted.** Default clock gating also runs on boots that never had hardware evidence (no IH, VM, gfx ladders); the
+  GUI-idle interrupt bits are set even when the IH ring is off, and gating is applied after a possibly recovered draw. Only
+  boot 14 (`ih=1`) ran on the card. It is the amdgpu enable sequence and safe mode is bounded, so it stays default; the first
+  hardware boots without `rdna4-ih` will show whether anything differs.
+- **S3, accepted.** `rdna4-gfxcg=0` runs the disable mirror, so no arg leaves the RLC untouched any more; a value that skips the
+  apply entirely was not added.

@@ -464,6 +464,13 @@ uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 	choosePool();
 	logSurvey();
 	publishSurvey();
+	// S2: clock gating persists in the RLC across a warm restart; say what this start found.
+	{
+		const uint32_t cgcg = rdGc(RlcCgcgCglsCtrl), ovr = rdGc(RlcCgttMgcgOverride), ring0 = rdGc(CpIntCntlRing0);
+		CLOG("cg: state found at start (carry-over from an earlier boot when warm): RLC_CGCG_CGLS_CTRL 0x%08x "
+		     "(CGCG_EN %u, CGLS_EN %u), RLC_CGTT_MGCG_OVERRIDE 0x%08x, CP_INT_CNTL_RING0 0x%08x",
+		     cgcg, cgcg & 1, (cgcg >> 1) & 1, ovr, ring0);
+	}
 
 	if (stage >= StagePsp) {
 		target = stage;
@@ -641,7 +648,11 @@ void RDNA4Compute::runStages() {
 		bool owns;
 		~BringupGuard() { if (owns) self->endBringup(); }
 	} guard { this, ownsBringup };
-	// W27: a bring-up (or a re-bring-up after sleep) starts with GFX powered.
+	// W27: a bring-up (or a re-bring-up after sleep) starts with GFX powered. Nothing of an earlier
+	// bring-up is alive: forget its boot queue and register snapshot (S4).
+	bringupGen++;
+	bootQueueLive = false;
+	gcSnapValid = false;
 	gcWake(0xffffffffu);
 	gfxOffPreflight(false);
 	if (gcState == kGcHold) {
@@ -1200,7 +1211,7 @@ void RDNA4Compute::gcWake(uint32_t what) const {
 		uint32_t ret = 0, resp = 0;
 		for (int attempt = 0; attempt < 2 && resp != kSmuRespOk; attempt++)
 			resp = self->smuSend(kSmuMsgDisallowGfxOff, 0, ret, 100);
-		const char *who = what == 0xffffffffu ? "the start of a bring-up" : what == 0xfffffffeu ? "the shutdown quiesce" :
+		const char *who = what == 0xffffffffu ? "the start of a bring-up" : what == 0xfffffffeu ? "the shutdown quiesce" : what == 0xfffffff0u ? "a dispatch/queue test (before it emitted)" :
 		                  (what >> 24) == 0xdb ? "a doorbell write, dword" : "a GC register access, seg<<16|dword";
 		if (resp == kSmuRespOk) {
 			CLOG("gfxoff: GFXOFF ended by %s 0x%x (thread %p): DisallowGfxOff -> 0x%02x; GFXOFF stays "
@@ -1221,6 +1232,92 @@ void RDNA4Compute::gcWake(uint32_t what) const {
 	IOLockUnlock(gcLock);
 }
 
+// GC registers this kext programs by MMIO (bring-up, the runtime, IH, clock gating). GFXOFF's
+// power-down may or may not keep them (the RLC save/restore list decides, not documented for
+// GC 12.0.1): snapshot them just before AllowGfxOff, and after the wake compare, log every
+// difference and write the saved value back (review W29 S6). Not covered, on purpose: the gfx ring
+// (AllowGfxOff is refused while rdna4-gfx is on), client queues (refused while a client is open),
+// SDMA and the GC hub (round 4: DMA and dispatch worked after a wake, so they survive).
+struct GcSnapReg { Reg reg; const char *name; bool cg; };
+static const GcSnapReg kGcSnap[] = {
+	{ CpMecDoorbellLower,  "CP_MEC_DOORBELL_RANGE_LOWER", false },
+	{ CpMecDoorbellUpper,  "CP_MEC_DOORBELL_RANGE_UPPER", false },
+	{ CpPqWptrPollCntl,    "CP_PQ_WPTR_POLL_CNTL",        false },
+	{ CpMe1Pipe0IntCntl,   "CP_ME1_PIPE0_INT_CNTL",       false },
+	{ CpMe1Pipe1IntCntl,   "CP_ME1_PIPE1_INT_CNTL",       false },
+	{ CpIntCntl,           "CP_INT_CNTL",                 false },
+	{ CpIntCntlRing0,      "CP_INT_CNTL_RING0",           false },
+	{ RlcCgcgCglsCtrl,     "RLC_CGCG_CGLS_CTRL",          true  },
+	{ RlcCgcgCglsCtrl3d,   "RLC_CGCG_CGLS_CTRL_3D",       true  },
+	{ RlcCgttMgcgOverride, "RLC_CGTT_MGCG_OVERRIDE",      true  },
+	{ CpRbWptrPollCntl,    "CP_RB_WPTR_POLL_CNTL",        true  },
+	{ Sdma0RlcCgcgCtrl,    "SDMA0_RLC_CGCG_CTRL",         true  },
+	{ Sdma1RlcCgcgCtrl,    "SDMA1_RLC_CGCG_CTRL",         true  },
+};
+static constexpr uint32_t kGcSnapCount = sizeof(kGcSnap) / sizeof(kGcSnap[0]);
+static_assert(kGcSnapCount <= 16, "RDNA4Compute::kGcSnapMax");
+
+void RDNA4Compute::gfxOffSnapshot() {
+	for (uint32_t i = 0; i < kGcSnapCount; i++)
+		gcSnapVal[i] = rdGc(kGcSnap[i].reg);
+	gcSnapValid = true;
+}
+
+// After the wake, on the waking thread (gcOwner): compare and write back, clock-gating registers
+// inside RLC safe mode like amdgpu's update. Returns how many registers had to be restored.
+uint32_t RDNA4Compute::gfxOffRestoreRegs() {
+	if (!gcSnapValid)
+		return 0;
+	uint32_t lost = 0, stuck = 0;
+	bool safe = false;
+	for (uint32_t i = 0; i < kGcSnapCount; i++) {
+		const uint32_t now = rdGc(kGcSnap[i].reg);
+		if (now == gcSnapVal[i])
+			continue;
+		lost++;
+		if (kGcSnap[i].cg && !safe && (rdGc(RlcCntl) & kRlcEnableF32))
+			safe = rlcSafeMode(true);
+		wr(IpDiscovery::HwGc, kGcSnap[i].reg, gcSnapVal[i]);
+		const uint32_t back = rdGc(kGcSnap[i].reg);
+		CLOG("gfxoff: %s changed across the power-down: 0x%08x -> restored 0x%08x (read back 0x%08x%s)",
+		     kGcSnap[i].name, now, gcSnapVal[i], back, back == gcSnapVal[i] ? "" : ", DID NOT STICK");
+		if (back != gcSnapVal[i])
+			stuck++;
+	}
+	if (safe)
+		rlcSafeMode(false);
+	CLOG("gfxoff: register check after the wake: %u of %u registers differed, %u did not stick", lost,
+	     kGcSnapCount, stuck);
+	return lost;
+}
+
+// The wake is only safe for what we can restore: refuse the Allow while the gfx ring is up or a
+// runtime client (VM queue, VMID state) is open.
+bool RDNA4Compute::gfxOffAllowedNow(const char **why) {
+	if (gfxMode != 0) {
+		*why = "the gfx ring (rdna4-gfx) is up and its CP_RB0/doorbell registers are not restored after a wake";
+		return false;
+	}
+	bool client = false;
+	if (rtLock) {
+		IOLockLock(rtLock);
+		for (uint32_t i = 0; i < kMaxClients; i++)
+			if (clients[i].owner)
+				client = true;
+		IOLockUnlock(rtLock);
+	}
+	if (client) {
+		*why = "a runtime client is open (its HQD/SH_MEM/VMID state would not be restored after a wake)";
+		return false;
+	}
+	return true;
+}
+
+void RDNA4Compute::gcEnsureAwake(uint32_t what) {
+	if (gcState != kGcOn)
+		gcWake(what);
+}
+
 // After DisallowGfxOff is acknowledged, GC has been powered back up but its state is not the state
 // we left. Round 4 on the card: the first dispatch after the wake timed out with CP_HQD_ACTIVE 0
 // and PQ base/doorbell/rptr/wptr all zero (the directly programmed MMIO HQD is lost across the
@@ -1234,8 +1331,10 @@ void RDNA4Compute::gcWake(uint32_t what) const {
 //      recoverComputeQueue uses) and prove it with a fenced WRITE_DATA.
 // Runs on the waking thread with gcOwner set (its GC accesses bypass the guard).
 void RDNA4Compute::gfxOffAfterWake(uint32_t what) {
-	if (what == 0xfffffffeu)
-		return;                                     // shutdown quiesce: nothing to restore
+	// Nothing to restore for a shutdown quiesce, and none at the start of a bring-up (S4): the GPU
+	// is not brought up yet, programming an HQD before stage 1 would write an uninitialised block.
+	if (what >= 0xfffffffeu)
+		return;
 	uint32_t stat = 0;
 	uint32_t us = 0;
 	const uint32_t busyMask = kGpmSavingRegs | kGpmRestoringRegs | kGpmGfx3dChanging | kGpmCmpChanging |
@@ -1248,8 +1347,18 @@ void RDNA4Compute::gfxOffAfterWake(uint32_t what) {
 	}
 	CLOG("gfxoff: after the wake RLC_GPM_STAT 0x%08x after %u us (%s)", stat, us,
 	     us >= 200000 ? "NOT settled within 200 ms, continuing" : "settled");
-	if (!bootQueueLive)
+	gfxOffRestoreRegs();
+	if (!bootQueueLive || bootQueueGen != bringupGen)
+		return;                                     // no boot queue in THIS bring-up
+	if (what == (0xdb000000u | kComputeDoorbellDword)) {
+		// The boot queue's own doorbell woke GFX: its packet is already in pm4Queue and its wptr is
+		// already computed, so re-initialising the queue here would discard the packet and then
+		// publish a stale wptr (S5). Every submitter calls gcEnsureAwake() first, so this should
+		// not happen; if it does, leave the HQD to the hang recovery. (A wake by the SDMA doorbell,
+		// which the selftest's first transfer rings, has no packet in the boot queue: restore.)
+		CLOG("gfxoff: woken by the boot queue's doorbell: the boot HQD is NOT restored here (a packet is in flight)");
 		return;
+	}
 	grbmSelect(1, 0, 0, 0);
 	const uint32_t active = rdGc(CpHqdActive);
 	grbmSelect(0, 0, 0, 0);
@@ -1331,6 +1440,12 @@ void RDNA4Compute::gfxOffProbe() {
 		     gfxOffFlagGet() ? "SET" : "clear");
 		return;
 	}
+	const char *why = "";
+	if (!gfxOffAllowedNow(&why)) {
+		CLOG("gfxoff: AllowGfxOff refused: %s", why);
+		return;
+	}
+	gfxOffSnapshot();
 	trail("pm: gfxoff allow");
 	if (!gfxOffAllow()) {
 		CLOG("gfxoff: not allowed; GFX stays powered");
@@ -2699,6 +2814,7 @@ void RDNA4Compute::logComputeQueueState(const char *tag, uint32_t pipe, uint32_t
 }
 
 bool RDNA4Compute::queueWriteTest(const char *tag, const Launch *l) {
+	gcEnsureAwake(0xfffffff0u);              // see launch(): wake before emitting, not at the doorbell
 	const bool client = l && l->queue;
 	Pm4::Queue *queue = client ? l->queue : &pm4Queue;
 	const uint32_t doorbell = client ? l->doorbell : kComputeDoorbellDword;
@@ -2863,6 +2979,7 @@ bool RDNA4Compute::stageCompute() {
 	if (running) {
 		hqdMode = mode;
 		bootQueueLive = true;
+		bootQueueGen = bringupGen;
 	}
 	if (!running) {
 		publish();
@@ -2925,6 +3042,10 @@ uint32_t RDNA4Compute::shAbs(const Reg &r) const {
 // ACQUIRE_MEM first (code and inputs were just written by the CPU) and its
 // RELEASE_MEM fence after (GL2 written back, so the CPU reads the results).
 bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
+	// pm4Queue (and the client queues) are emitted into by one submitter at a time, under rtLock, and
+	// only after a GC access: a wake caused by the first access must finish (it may re-initialise the
+	// boot HQD and the ring bookkeeping) BEFORE this thread emits a packet, so wake explicitly (S5).
+	gcEnsureAwake(0xfffffff0u);
 	const bool vm = l.queue != nullptr;
 	volatile uint32_t *fenceCpu = vm ? l.fenceCpu : poolDw(kPm4FenceOffset);
 	const uint32_t fenceValue = vm ? l.fenceValue : (pm4Fence + 1);

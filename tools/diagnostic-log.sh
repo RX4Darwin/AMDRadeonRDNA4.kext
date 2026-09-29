@@ -641,6 +641,9 @@ registry_value() {
 		record gfxoff SKIPPED "rdna4-gfxoff not enabled"
 	elif dmesg | grep -q 'RDNA4FB: compute: gfxoff:.*WAKE FAILED'; then
 		record gfxoff FAIL "the guard could not wake GFX (see the gfxoff: lines)"
+	elif dmesg | grep -q 'RDNA4FB: compute: gfxoff: AllowGfxOff refused'; then
+		go_why="$(dmesg | grep -a -o 'gfxoff: AllowGfxOff refused: [^[]*' | tail -1 | cut -c1-160)"
+		record gfxoff SKIPPED "$go_why"
 	elif dmesg | grep -q 'RDNA4FB: compute: gfxoff: 1.5 s after AllowGfxOff'; then
 		go_line="$(dmesg | grep 'RDNA4FB: compute: gfxoff: 1.5 s after AllowGfxOff' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
 		go_wake="no GC access yet"

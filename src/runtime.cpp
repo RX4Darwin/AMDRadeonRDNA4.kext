@@ -295,6 +295,8 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         // bounded so a broken engine cannot hold system restart indefinitely.
         // W27: GFXOFF is lifted before the first GC access of the quiesce (this also clears
         // the persistent flag). If it cannot be lifted every GC access below is dropped.
+        bootQueueLive = false;
+        gcSnapValid = false;
         gcWake(0xfffffffeu);
         if (gcState == kGcHold)
                 CLOG("quiesce: GFXOFF could not be lifted; the GC quiesce steps are dropped and engines may keep running");

@@ -1734,6 +1734,11 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
              * power-down (CP_HQD_ACTIVE, PQ base, doorbell, rptr/wptr read 0 after the wake). */
             memset(s->hqd, 0, sizeof(s->hqd));
             reg_set(s, REG_CP_HQD_ACTIVE_EARLY, 0);
+            /* Worst case for the registers the kext restores (the RLC save/restore list decides on
+             * silicon): clock gating and the CP interrupt enables go back to reset values. */
+            reg_set(s, GC_SEG1(0x4c49), 0x0001003c);   /* RLC_CGCG_CGLS_CTRL */
+            reg_set(s, GC_SEG1(0x4c48), 0x000007ff);   /* RLC_CGTT_MGCG_OVERRIDE */
+            reg_set(s, GC_SEG0(0x1e0a), 0);            /* CP_INT_CNTL_RING0 */
             s->gpm_restoring_reads = 2;
             fprintf(stderr, "rdna4: smu: DisallowGfxOff, GC powered up; HQD registers lost\n");
         }
