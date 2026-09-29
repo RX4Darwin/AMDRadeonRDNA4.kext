@@ -85,6 +85,10 @@ separate power-management work.
    leaves the `cursor:` trail. W12's future `rdna4-run tri` gets the next plan
    slot; its PASS will require the app marker plus a durable registry result,
    with `tri:` as the hang fallback.
+   The cursor evidence is also in the registry property `RDNA4FB,Cursor` (printed
+   by diagnostic-log.sh). **Boot 9** is the same with `rdna4-cursor=2`: a magenta
+   64x64 square at (100,100) that macOS's pointer does not replace; see
+   `docs/cursor-audit.md` for how to read the result.
 
 7. **Optional W19 GFX power-management probe.**
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15`.

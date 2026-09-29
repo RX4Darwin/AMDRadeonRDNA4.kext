@@ -729,9 +729,15 @@ void RDNA4Compute::ihPublishResult() {
 }
 
 bool RDNA4Compute::ihInterruptLogAllowed() {
+	// Per-interrupt lines are what wrapped the kernel log on the card (round 2,
+	// boot 6: every early line lost). Below trace 2 the first few are enough to
+	// show delivery; rdna4-trace=2 keeps the 4-per-second sample.
+	if (rdna4TraceLevel < 2 && ihInterruptLogCount >= 3)
+		return false;
 	const uint64_t now = mach_absolute_time();
 	if (!ihLastInterruptLog) {
 		ihLastInterruptLog = now;
+		ihInterruptLogCount++;
 		return true;
 	}
 	uint64_t elapsed = 0;
@@ -739,6 +745,7 @@ bool RDNA4Compute::ihInterruptLogAllowed() {
 	if (elapsed < 250000000)
 		return false;
 	ihLastInterruptLog = now;
+	ihInterruptLogCount++;
 	return true;
 }
 

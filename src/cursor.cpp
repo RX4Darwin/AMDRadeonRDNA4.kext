@@ -392,12 +392,14 @@ void RDNA4Device::dmubCursorTest() {
 #endif
 
 // ---------------------------------------------------------------------------
-// NDRV hardware cursor (W14)
+// NDRV hardware cursor (W14, W21)
 // ---------------------------------------------------------------------------
 
 #include "device.hpp"
 #include "ndrv.hpp"
 
+#include <stdarg.h>
+#include <pexpert/pexpert.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
@@ -421,7 +423,21 @@ constexpr uint32_t kCursorCmControl = 0x0cf1;
 constexpr uint32_t kCursorCmScaleGY = 0x0cf4;
 constexpr uint32_t kCursorCmScaleRB = 0x0cf5;
 constexpr uint32_t kCursorCmMatrix = 0x0cf6;
+// Address routing (log only): regDCN_VM_FB_LOCATION_BASE/TOP 0x0475/0x0476,
+// regDCN_VM_AGP_BOT/TOP/BASE 0x0478/0x0479/0x047a, per HUBP
+// regHUBPREQ0_DCN_VM_SYSTEM_APERTURE_LOW/HIGH_ADDR 0x062c/0x062d and
+// regHUBPREQ0_DCN_VM_MX_L1_TLB_CNTL 0x063a; OTG0 regs below are +otgOff().
+constexpr uint32_t kVmFbBase = 0x0475, kVmFbTop = 0x0476;
+constexpr uint32_t kVmAgpBot = 0x0478, kVmAgpTop = 0x0479, kVmAgpBase = 0x047a;
+constexpr uint32_t kSysApLow = 0x062c, kSysApHigh = 0x062d, kL1TlbCntl = 0x063a;
+constexpr uint32_t kOtgMasterUpdateLock = 0x1b89, kOtgDoubleBufferCtl = 0x1b5c;
+constexpr uint32_t kOtgGlobalSyncStatus = 0x1b88;
 
+// The cursor surface is one fixed 64x64 slot, the way amdgpu's DM hands the
+// hardware a whole cursor buffer (attr->width/height = the buffer, the image
+// sits in its top-left corner over transparent pixels). The size, the pitch and
+// LINES_PER_CHUNK (hubp2_get_lines_per_chunk: 33..64 px wide = 8 lines) must
+// all describe that slot, not the image inside it.
 constexpr uint32_t kCursorWidth = 64;
 constexpr uint32_t kCursorHeight = 64;
 constexpr uint32_t kCursorPitch = 64;
@@ -430,10 +446,12 @@ constexpr uint32_t kCursorModePremultipliedArgb = 2; // dc_cursor_color_format
 constexpr uint32_t kCursorFp16One = 0x3c00;
 constexpr uint32_t kCursorReqModePrefetch = 1u << 2;
 constexpr uint32_t kCursorModeShift = 8;
-constexpr uint32_t kCursorPitchShift = 16;
+constexpr uint32_t kCursorPitchShift = 16;   // CURSOR_PITCH: 0 = 64 px
 constexpr uint32_t kCursorLinesPerChunkShift = 24;
+constexpr uint32_t kCursorLinesPer8 = 3;     // enum cursor_lines_per_chunk: 1,2,4,8,16 = 0..4
 constexpr uint32_t kCursorCmModeShift = 4;
 constexpr uint32_t kCursorCmWorkingBits = (1u << 7) | (1u << 2);
+constexpr uint32_t kDchubGlobalTimerCntl = 0x0527;   // regDCHUBBUB_GLOBAL_TIMER_CNTL (REFDIV [3:0], ENABLE bit 12)
 
 uint32_t premultiplyArgb(uint32_t pixel) {
 	const uint32_t alpha = pixel >> 24;
@@ -450,10 +468,126 @@ uint32_t premultiplyArgb(uint32_t pixel) {
 
 } // namespace
 
+// Every cursor line goes to the kernel log AND to a registry property, because
+// the macOS kernel message buffer wraps before the diagnostic batch reads it
+// (boot 6 of round 2 lost every early line). The property is the durable copy:
+// ioreg -l | grep RDNA4FB,Cursor. It fills once (the first ~30 lines are the
+// evidence; later per-move samples only go to the log).
+void RDNA4Device::cursorNote(const char *fmt, ...) {
+	char line[288];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	IOLog("RDNA4FB: cursor: %s\n", line);
+	const size_t n = strlen(line);
+	// One line in ioreg: the lines are joined with " ## " (diagnostic-log.sh splits them).
+	if (cursorTrailFull || cursorTrailLen + n + 5 > sizeof(cursorTrail)) {
+		if (!cursorTrailFull) {
+			cursorTrailFull = true;
+			strlcat(cursorTrail, "...(full)", sizeof(cursorTrail));
+			if (owner)
+				owner->setProperty("RDNA4FB,Cursor", cursorTrail);
+		}
+		return;
+	}
+	memcpy(cursorTrail + cursorTrailLen, line, n);
+	cursorTrailLen += static_cast<uint16_t>(n);
+	memcpy(cursorTrail + cursorTrailLen, " ## ", 4);
+	cursorTrailLen += 4;
+	cursorTrail[cursorTrailLen] = '\0';
+	if (owner)
+		owner->setProperty("RDNA4FB,Cursor", cursorTrail);
+}
+
+// Program the cursor plane's attributes (everything except the position) the
+// way amdgpu's set_cursor_attributes does, enabled or not.
+void RDNA4Device::cursorProgramPlane(bool enable) {
+	ensureUpdateLatch();
+	const uint32_t hubp = hubpOff();
+	const uint32_t dpp = dppOff();
+	regWriteDmu(2, kCursorAddressHigh + hubp, static_cast<uint32_t>(cursorMcAddr >> 32) & 0xffff);
+	regWriteDmu(2, kCursorAddress + hubp, static_cast<uint32_t>(cursorMcAddr));
+	// hubp32_cursor_set_attributes: SIZE is the buffer, not the image inside it.
+	regWriteDmu(2, kCursorSize + hubp, kCursorHeight | (kCursorWidth << 16));
+	// The hardware hot spot stays 0: IOFramebuffer hands cscDrawHardwareCursor the
+	// hot-spot-adjusted top-left corner (the parked cursor.cpp said so as well), and
+	// the hot spot register subtracts a second time (hubp401_cursor_set_position).
+	// drawHardwareCursor uses it only to represent a corner above/left of the screen.
+	regWriteDmu(2, kCursorHotSpot + hubp, 0);
+	regWriteDmu(2, kCursorSettings + hubp, 3u << 8); // CURSOR0_CHUNK_HDL_ADJUST=3, DST_Y_OFFSET=0
+	cursorCtlBase = kCursorReqModePrefetch | (kCursorModePremultipliedArgb << kCursorModeShift) |
+	                (0u << kCursorPitchShift) | (kCursorLinesPer8 << kCursorLinesPerChunkShift);
+	regWriteDmu(2, kCursorControl + hubp, cursorCtlBase | (enable ? 1u : 0u));
+	regWriteDmu(2, kCursorCmScaleGY + dpp, kCursorFp16One);
+	regWriteDmu(2, kCursorCmScaleRB + dpp, kCursorFp16One);
+	regWriteDmu(2, kCursorCmMatrix + dpp, 0);
+	regWriteDmu(2, kCursorCmControl + dpp,
+	            kCursorCmWorkingBits | (kCursorModePremultipliedArgb << kCursorCmModeShift) |
+	            (enable ? 1u : 0u));
+	hwCursorEnabledHw = enable;
+}
+
+// CURSOR_DST_X_OFFSET (hubp401_cursor_set_position): x scaled from pixel-clock
+// to DCHUB refclk time. The refclk is read back like dcn20_hubbub.c:560-582
+// (DCHUBBUB_GLOBAL_TIMER_CNTL; DC asserts 40-60 MHz), else DC's ~50 MHz; the value
+// and its source are logged at arming. No pixel clock (bootTiming) gives 0.
+uint32_t RDNA4Device::cursorDstXOffset(uint32_t px) const {
+	const uint32_t pixelKHz = bootTimingValid ? bootTiming.pixelClockKHz : 0;
+	return pixelKHz ? static_cast<uint32_t>((static_cast<uint64_t>(px) * cursorRefClkKHz) / pixelKHz) : 0;
+}
+
+// rdna4-cursor=2: at arming, show an opaque magenta 64x64 square at (100,100)
+// through the same programming path macOS's cursor uses. Whether it appears on the
+// card is a yes/no answer that does not depend on macOS's cursor image (which can
+// be blank early on) or its calls. macOS's first cscSetHardwareCursor replaces it.
+void RDNA4Device::cursorSelfTest() {
+	for (uint32_t i = 0; i < kCursorWidth * kCursorHeight; i++)
+		cursorVram[i] = 0xffff00ffu;   // premultiplied ARGB: opaque magenta
+	const uint32_t hubp = hubpOff();
+	// Position first, then the enable, so the square is never armed at (0,0).
+	regWriteDmu(2, kCursorPosition + hubp, 100u | (100u << 15));
+	regWriteDmu(2, kCursorDstOffset + hubp, cursorDstXOffset(100));
+	cursorProgramPlane(true);
+	cursorNote("SELF-TEST (rdna4-cursor=2): an opaque magenta 64x64 square is programmed at (100,100)");
+	cursorNote("self-test state: hwCursorVisible %d hwCursorEnabledHw %d (macOS calls are ignored)", hwCursorVisible, hwCursorEnabledHw);
+	cursorDumpState("selftest");
+	cursorHold = true;
+	hwCursorSet = true;
+}
+
+// One line of everything that decides whether the plane shows: the HUBP
+// cursor registers, the DPP/CM side (CUR0_UPDATE_PENDING is bit 16), and the
+// OTG's double-buffer lock and global sync state (why a write would not latch).
+void RDNA4Device::cursorDumpState(const char *why) {
+	const uint32_t hubp = hubpOff(), dpp = dppOff(), otg = otgOff();
+	const uint32_t cm = regReadDmu(2, kCursorCmControl + dpp);
+	cursorNote("%s: hubp ctl=0x%08x addr=0x%08x/%04x size=0x%08x pos=0x%08x hot=0x%08x "
+	           "dst=0x%08x set=0x%08x", why,
+	           regReadDmu(2, kCursorControl + hubp), regReadDmu(2, kCursorAddress + hubp),
+	           regReadDmu(2, kCursorAddressHigh + hubp) & 0xffff,
+	           regReadDmu(2, kCursorSize + hubp), regReadDmu(2, kCursorPosition + hubp),
+	           regReadDmu(2, kCursorHotSpot + hubp), regReadDmu(2, kCursorDstOffset + hubp),
+	           regReadDmu(2, kCursorSettings + hubp));
+	cursorNote("%s: cm ctl=0x%08x (update pending %u) fp=0x%08x/0x%08x mtx=0x%08x | "
+	           "otg lock=0x%08x dbuf=0x%08x sync=0x%08x", why, cm, (cm >> 16) & 1,
+	           regReadDmu(2, kCursorCmScaleGY + dpp), regReadDmu(2, kCursorCmScaleRB + dpp),
+	           regReadDmu(2, kCursorCmMatrix + dpp),
+	           regReadDmu(2, kOtgMasterUpdateLock + otg), regReadDmu(2, kOtgDoubleBufferCtl + otg),
+	           regReadDmu(2, kOtgGlobalSyncStatus + otg));
+}
+
 bool RDNA4Device::initHardwareCursor() {
+	cursorTrail[0] = '\0';
+	cursorTrailLen = 0;
+	cursorTrailFull = false;
 	if (!hwCursorRequested || !isAmd || !ipDiscovery.isValid() || !rmmio ||
 	    !fbPhysBase || !fbLength || pipe.hubp >= Pipe::kMaxOtg) {
-		FBLOG("cursor: unavailable; staying with software cursor");
+		cursorNote("unavailable (requested %d amd %d discovery %d mmio %d fb 0x%llx+0x%llx hubp %u); "
+		           "staying with software cursor", hwCursorRequested, isAmd,
+		           ipDiscovery.isValid(), rmmio != nullptr,
+		           static_cast<unsigned long long>(fbPhysBase),
+		           static_cast<unsigned long long>(fbLength), pipe.hubp);
 		return false;
 	}
 
@@ -461,7 +595,7 @@ bool RDNA4Device::initHardwareCursor() {
 	const uint64_t scanout = static_cast<uint64_t>(regReadDmu(2, 0x060a + hubp)) |
 	                         (static_cast<uint64_t>(regReadDmu(2, 0x060b + hubp) & 0xffff) << 32);
 	if (!scanout || scanout == 0xffffffffffffffffull) {
-		FBLOG("cursor: scanout address unavailable; staying with software cursor");
+		cursorNote("scanout address unavailable; staying with software cursor");
 		return false;
 	}
 
@@ -470,7 +604,7 @@ bool RDNA4Device::initHardwareCursor() {
 	cursorMcAddr = (scanout + fbLength + 0xfff) & ~0xfffull;
 	const uint64_t delta = cursorMcAddr - scanout;
 	if (delta + kCursorBytes > 192ull * 1024 * 1024) {
-		FBLOG("cursor: sprite offset 0x%llx outside the safe aperture", delta);
+		cursorNote("sprite offset 0x%llx outside the safe aperture", delta);
 		return false;
 	}
 
@@ -480,7 +614,7 @@ bool RDNA4Device::initHardwareCursor() {
 	cursorMap = memory->map();
 	memory->release();
 	if (!cursorMap) {
-		FBLOG("cursor: VRAM sprite mapping failed; staying with software cursor");
+		cursorNote("VRAM sprite mapping failed; staying with software cursor");
 		return false;
 	}
 	cursorVram = reinterpret_cast<volatile uint32_t *>(cursorMap->getVirtualAddress());
@@ -494,8 +628,37 @@ bool RDNA4Device::initHardwareCursor() {
 		cursorVram[i] = 0;
 	ensureUpdateLatch();
 	hwCursorReady = true;
-	FBLOG("cursor: NDRV hardware cursor ready, HUBP%u sprite MC 0x%llx (%ux%u max)",
-	      pipe.hubp, cursorMcAddr, kCursorWidth, kCursorHeight);
+	{
+		const uint32_t timer = regReadDmu(2, kDchubGlobalTimerCntl);
+		const char *src = "DCHUBBUB_GLOBAL_TIMER_CNTL, DCCG ref assumed 100 MHz";
+		uint32_t khz = 0;
+		if (timer != 0xffffffffu && (timer & (1u << 12)))
+			khz = (timer & 0xf) == 2 ? 50000 : 100000;
+		if (khz < 40000 || khz > 60000) {
+			khz = 50000;
+			src = "timer disabled or out of DC's 40-60 MHz range: DC's ~50 MHz";
+		}
+		cursorRefClkKHz = khz;
+		cursorNote("DCHUB ref clock %u kHz for CURSOR_DST_X_OFFSET (%s; timer cntl 0x%08x); pixel clock %u kHz%s",
+		           khz, src, timer, bootTimingValid ? bootTiming.pixelClockKHz : 0,
+		           bootTimingValid && bootTiming.pixelClockKHz ? "" : " (unknown: DST_X_OFFSET written as 0)");
+	}
+	cursorNote("NDRV hardware cursor ready: HUBP%u DPP%u OTG%u, scanout MC 0x%llx (fb len 0x%llx), "
+	           "sprite MC 0x%llx = cpu 0x%llx (%ux%u slot)", pipe.hubp, pipe.hubp, pipe.otg,
+	           scanout, static_cast<unsigned long long>(fbLength), cursorMcAddr,
+	           static_cast<unsigned long long>(fbPhysBase + delta), kCursorWidth, kCursorHeight);
+	// Where cursor fetches go: an address outside these windows returns zeros
+	// without latching any error (the reason a sprite can be armed and invisible).
+	cursorNote("vm: fb_loc base=0x%08x top=0x%08x agp bot=0x%08x top=0x%08x base=0x%08x "
+	           "sys_ap low=0x%08x high=0x%08x l1_tlb=0x%08x",
+	           regReadDmu(2, kVmFbBase), regReadDmu(2, kVmFbTop), regReadDmu(2, kVmAgpBot),
+	           regReadDmu(2, kVmAgpTop), regReadDmu(2, kVmAgpBase),
+	           regReadDmu(2, kSysApLow + hubp), regReadDmu(2, kSysApHigh + hubp),
+	           regReadDmu(2, kL1TlbCntl + hubp));
+	cursorDumpState("armed");
+	uint32_t mode = 0;
+	if (PE_parse_boot_argn("rdna4-cursor", &mode, sizeof(mode)) && mode == 2)
+		cursorSelfTest();
 	return true;
 }
 
@@ -517,6 +680,12 @@ void RDNA4Device::freeHardwareCursor() {
 IOReturn RDNA4Device::setHardwareCursor(void *cursorRef) {
 	if (!hwCursorReady || !cursorRef || !cursorStage || !cursorVram)
 		return kIOReturnUnsupported;
+	if (cursorHold) {   // rdna4-cursor=2: keep the test square
+		hwCursorSet = true;
+		if (++cursorHeldCalls <= 3)
+			cursorNote("self-test: cscSetHardwareCursor ignored, macOS calls the hardware cursor path");
+		return kIOReturnSuccess;
+	}
 
 	IOHardwareCursorDescriptor descriptor {};
 	descriptor.majorVersion = kHardwareCursorDescriptorMajorVersion;
@@ -531,7 +700,8 @@ IOReturn RDNA4Device::setHardwareCursor(void *cursorRef) {
 	if (!Ndrv::prepareCursor(cursorRef, &descriptor, &info) ||
 	    !info.cursorWidth || !info.cursorHeight || info.cursorWidth > kCursorWidth ||
 	    info.cursorHeight > kCursorHeight) {
-		FBLOG("cursor: VSLPrepareCursorForHardwareCursor refused image");
+		cursorNote("VSLPrepareCursorForHardwareCursor refused the image (%ux%u)",
+		           info.cursorWidth, info.cursorHeight);
 		return kIOReturnUnsupported;
 	}
 
@@ -539,64 +709,88 @@ IOReturn RDNA4Device::setHardwareCursor(void *cursorRef) {
 	cursorHeight = info.cursorHeight;
 	hwCursorHotX = info.cursorHotSpotX;
 	hwCursorHotY = info.cursorHotSpotY;
-	for (uint32_t i = 0; i < kCursorWidth * kCursorHeight; i++)
+	// The image is tightly packed (cursorWidth per row) in the staging buffer;
+	// the VRAM slot has a fixed 64-pixel pitch and everything outside the image
+	// stays transparent.
+	uint32_t maxAlpha = 0, opaqueIdx = 0;
+	for (uint32_t i = 0; i < cursorWidth * cursorHeight; i++) {
 		cursorStage[i] = premultiplyArgb(cursorStage[i]);
+		if ((cursorStage[i] >> 24) > maxAlpha) {
+			maxAlpha = cursorStage[i] >> 24;
+			opaqueIdx = i;
+		}
+	}
 	for (uint32_t i = 0; i < kCursorWidth * kCursorHeight; i++)
 		cursorVram[i] = 0;
 	for (uint32_t y = 0; y < cursorHeight; y++)
 		for (uint32_t x = 0; x < cursorWidth; x++)
 			cursorVram[y * kCursorPitch + x] = cursorStage[y * cursorWidth + x];
+	// Data path check: the most opaque pixel must read back from VRAM. A
+	// fully transparent conversion (max alpha 0) or a mismatch explains an
+	// invisible sprite without any register being wrong.
+	const uint32_t rbIdx = (opaqueIdx / cursorWidth) * kCursorPitch + (opaqueIdx % cursorWidth);
+	cursorNote("image %ux%u hot %u,%u: max alpha 0x%02x stage[%u]=0x%08x vram=0x%08x %s",
+	           cursorWidth, cursorHeight, hwCursorHotX, hwCursorHotY, maxAlpha, opaqueIdx,
+	           cursorStage[opaqueIdx], cursorVram[rbIdx],
+	           cursorStage[opaqueIdx] == cursorVram[rbIdx] ? "(match)" : "(MISMATCH)");
 
-	ensureUpdateLatch();
-	const uint32_t hubp = hubpOff();
-	const uint32_t dpp = dppOff();
-	regWriteDmu(2, kCursorAddressHigh + hubp, static_cast<uint32_t>(cursorMcAddr >> 32) & 0xffff);
-	regWriteDmu(2, kCursorAddress + hubp, static_cast<uint32_t>(cursorMcAddr));
-	regWriteDmu(2, kCursorSize + hubp, cursorHeight | (cursorWidth << 16));
-	regWriteDmu(2, kCursorHotSpot + hubp, hwCursorHotY | (static_cast<uint32_t>(hwCursorHotX) << 16));
-	regWriteDmu(2, kCursorSettings + hubp, 3u << 8); // CHUNK_HDL_ADJUST=3
-	const uint32_t hubpControl = kCursorReqModePrefetch |
-		(kCursorModePremultipliedArgb << kCursorModeShift) |
-		(0u << kCursorPitchShift) | (3u << kCursorLinesPerChunkShift);
-	regWriteDmu(2, kCursorControl + hubp, hubpControl | (hwCursorVisible ? 1u : 0u));
-	regWriteDmu(2, kCursorCmScaleGY + dpp, kCursorFp16One);
-	regWriteDmu(2, kCursorCmScaleRB + dpp, kCursorFp16One);
-	regWriteDmu(2, kCursorCmMatrix + dpp, 0);
-	regWriteDmu(2, kCursorCmControl + dpp,
-	            kCursorCmWorkingBits | (kCursorModePremultipliedArgb << kCursorCmModeShift) |
-	            (hwCursorVisible ? 1u : 0u));
+	cursorProgramPlane(hwCursorVisible);
 	hwCursorSet = true;
-	FBLOG("cursor: cscSetHardwareCursor image %ux%u hotspot %u,%u, addr 0x%llx ctl 0x%08x cm 0x%08x",
-	      cursorWidth, cursorHeight, hwCursorHotX, hwCursorHotY, cursorMcAddr,
-	      regReadDmu(2, kCursorControl + hubp), regReadDmu(2, kCursorCmControl + dpp));
+	cursorDumpState("set");
 	return kIOReturnSuccess;
 }
 
 IOReturn RDNA4Device::drawHardwareCursor(int32_t x, int32_t y, uint32_t visible) {
 	if (!hwCursorReady || !hwCursorSet)
 		return kIOReturnUnsupported;
+	if (cursorHold) {   // rdna4-cursor=2: the test square stays, macOS's pointer is not programmed
+		hwCursorX = x;
+		hwCursorY = y;
+		hwCursorVisible = visible != 0;
+		if (++cursorHeldCalls <= 3)
+			cursorNote("self-test: cscDrawHardwareCursor #%u (%d,%d visible %u) ignored", cursorHeldCalls, x, y, visible);
+		return kIOReturnSuccess;
+	}
 	hwCursorX = x;
 	hwCursorY = y;
 	hwCursorVisible = visible != 0;
-	ensureUpdateLatch();
 	const uint32_t hubp = hubpOff();
 	const uint32_t dpp = dppOff();
-	const uint32_t px = static_cast<uint32_t>(x) & 0x7fff;
-	const uint32_t py = static_cast<uint32_t>(y) & 0x7fff;
+
+	// x,y is the image's top-left corner. Where it lies above or left of the
+	// screen, position pins at 0 and the hot spot register carries the excess
+	// (hubp401_cursor_set_position: the plane starts at position - hot spot).
+	const uint32_t px = x > 0 ? static_cast<uint32_t>(x) & 0x7fff : 0;
+	const uint32_t py = y > 0 ? static_cast<uint32_t>(y) & 0x7fff : 0;
+	const uint32_t hx = x < 0 ? static_cast<uint32_t>(-x < 255 ? -x : 255) : 0;
+	const uint32_t hy = y < 0 ? static_cast<uint32_t>(-y < 255 ? -y : 255) : 0;
 	regWriteDmu(2, kCursorPosition + hubp, py | (px << 15));
-	regWriteDmu(2, kCursorDstOffset + hubp, x > 0 ? static_cast<uint32_t>(x) : 0);
-	const uint32_t control = kCursorReqModePrefetch |
-		(kCursorModePremultipliedArgb << kCursorModeShift) | (3u << kCursorLinesPerChunkShift);
-	regWriteDmu(2, kCursorControl + hubp, control | (hwCursorVisible ? 1u : 0u));
-	regWriteDmu(2, kCursorCmControl + dpp,
-	            kCursorCmWorkingBits | (kCursorModePremultipliedArgb << kCursorCmModeShift) |
-	            (hwCursorVisible ? 1u : 0u));
+	regWriteDmu(2, kCursorHotSpot + hubp, hy | (hx << 16));
+	// CURSOR_DST_X_OFFSET is the fetch deadline in refclk time: x scaled from
+	// pixel clock to refclk (hubp401_cursor_set_position).
+	regWriteDmu(2, kCursorDstOffset + hubp, cursorDstXOffset(px));
+
+	// Like amdgpu, touch the enables only when the visibility changes:
+	// rewriting the double-buffered control registers on every move re-arms
+	// CUR0_UPDATE_PENDING each time (hubp401: if cur_enable != cur_en).
+	if (hwCursorVisible != hwCursorEnabledHw) {
+		regWriteDmu(2, kCursorControl + hubp, cursorCtlBase | (hwCursorVisible ? 1u : 0u));
+		regWriteDmu(2, kCursorCmControl + dpp,
+		            kCursorCmWorkingBits | (kCursorModePremultipliedArgb << kCursorCmModeShift) |
+		            (hwCursorVisible ? 1u : 0u));
+		hwCursorEnabledHw = hwCursorVisible;
+		if (cursorVisChanges < 6) {
+			cursorVisChanges++;
+			cursorDumpState(hwCursorVisible ? "shown" : "hidden");
+		}
+	}
 	cursorDrawCalls++;
-	if (cursorDrawLogs < 6 ||
-	    (cursorDrawLogs < 14 && (cursorDrawCalls & 0x1ff) == 0)) {
+	// The first moves, then a slow sample: it shows whether CUR0_UPDATE_PENDING
+	// ever clears and whether the position registers hold what was written.
+	if (cursorDrawLogs < 5 || (cursorDrawLogs < 12 && (cursorDrawCalls & 0x1ff) == 0)) {
 		cursorDrawLogs++;
-		FBLOG("cursor: cscDrawHardwareCursor #%u x=%d y=%d visible=%u pos=0x%08x",
-		      cursorDrawCalls, x, y, visible, regReadDmu(2, kCursorPosition + hubp));
+		cursorDumpState("move");
+		cursorNote("move #%u x=%d y=%d visible=%u", cursorDrawCalls, x, y, visible);
 	}
 	return kIOReturnSuccess;
 }
