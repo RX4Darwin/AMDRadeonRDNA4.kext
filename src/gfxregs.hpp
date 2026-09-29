@@ -60,7 +60,27 @@ constexpr Reg CpCpfBusyStat       { 0, 0x0e28 };   // CP_CPF_BUSY_STAT
 constexpr Reg CpGfxHqdActive      { 0, 0x1e80 };   // CP_GFX_HQD_ACTIVE, banked by GRBM_GFX_CNTL (ME0)
 constexpr Reg RlcSafeMode         { 1, 0x0980 };   // RLC_SAFE_MODE
 constexpr Reg RlcCgttMgcgOverride { 1, 0x4c48 };   // RLC_CGTT_MGCG_OVERRIDE: bits set = that gating is overridden (off)
-constexpr Reg RlcCgcgCglsCtrl     { 1, 0x4c49 };   // RLC_CGCG_CGLS_CTRL: CGCG_EN [0], CGLS_EN [1]
+constexpr Reg RlcCgcgCglsCtrl     { 1, 0x4c49 };
+// W27 clock gating (gc_12_0_0_offset.h / gc_12_0_0_sh_mask.h)
+constexpr Reg CpRbWptrPollCntl    { 0, 0x0f62 };   // POLL_FREQUENCY [15:0], IDLE_POLL_COUNT [31:16]
+constexpr Reg CpIntCntl           { 0, 0x1de9 };
+constexpr Reg CpIntCntlRing0      { 0, 0x1e0a };   // ME0 pipe 0 (gfx_v12_0_get_cpg_int_cntl)
+constexpr Reg RlcCgcgCglsCtrl3d   { 1, 0x4cc5 };
+constexpr Reg Sdma0RlcCgcgCtrl    { 0, 0x0055 };
+constexpr Reg Sdma1RlcCgcgCtrl    { 0, 0x0655 };
+constexpr uint32_t kRlcSafeModeCmd = 1u << 0, kRlcSafeModeMsgShift = 1;   // RLC_SAFE_MODE CMD, MESSAGE [4:1]
+// RLC_CGTT_MGCG_OVERRIDE bits (a set bit holds that gating off)
+constexpr uint32_t kCgOvrRlcRepeaterFgcg = 1u << 0, kCgOvrRlcSclk = 1u << 1, kCgOvrMgcg = 1u << 2,
+                   kCgOvrCgcg = 1u << 3, kCgOvrCgls = 1u << 4, kCgOvrGrbmSclk = 1u << 5,
+                   kCgOvr3d = 1u << 7, kCgOvrFgcg = 1u << 8, kCgOvrRepeaterFgcg = 1u << 9,
+                   kCgOvrPerfmon = 1u << 10;
+// RLC_CGCG_CGLS_CTRL and _3D fields
+constexpr uint32_t kCgEn = 1u << 0, kCglsEn = 1u << 1, kCgRepDelayShift = 2, kCgRepDelayMask = 0xFCu,
+                   kCgIdleThresholdShift = 8, kCgIdleThresholdMask = 0x07FFFF00u;
+// CP_INT_CNTL / CP_INT_CNTL_RING0: CMP_BUSY [18], CNTX_BUSY [19], CNTX_EMPTY [20], GFX_IDLE [21]
+constexpr uint32_t kCpIntGuiIdleBits = (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21);
+constexpr uint32_t kSdmaCgcgIntEnable = 1u << 1;   // SDMAn_RLC_CGCG_CTRL.CGCG_INT_ENABLE
+constexpr uint32_t kSmuMsgAllowGfxOff = 0x28;      // PPSMC_MSG_AllowGfxOff (smu_v14_0_2_ppsmc.h:86)   // RLC_CGCG_CGLS_CTRL: CGCG_EN [0], CGLS_EN [1]
 constexpr Reg RlcBootloadStatus   { 1, 0x4e7c };
 constexpr Reg ImuCoreCtrl         { 1, 0x40b6 };
 constexpr Reg ImuGfxResetCtrl     { 1, 0x40bc };

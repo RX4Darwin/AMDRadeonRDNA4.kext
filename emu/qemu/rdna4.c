@@ -603,6 +603,14 @@ struct RDNA4State {
     bool     gfx_hang;       /* accept gfx kicks but leave the ring stopped */
     uint32_t smu_gfx_soft_max;   /* SetSoftMaxByFreq(GFXCLK) in MHz, 0 = automatic */
     uint32_t smu_workload_mask;  /* last SetWorkloadMask */
+    bool     gfxoff_preset;      /* "gfxoff-preset": every reset leaves the GC block powered down (an earlier boot allowed GFXOFF and the ASIC kept it) */
+    uint32_t gfxoff_arm_ms;      /* "gfxoff-arm-ms": ... from this many virtual ms after the reset, so the firmware phase (which a real card re-POSTs) is not hit */
+    bool     gfxoff_pending;
+    int64_t  gfxoff_arm_ns;
+    uint32_t reset_count;
+    bool     smu_preloaded;      /* "smu-preloaded": the PMFW the VBIOS loaded at POST answers the mailbox from reset on */
+    bool     gfxoff_active;      /* AllowGfxOff seen and no DisallowGfxOff since: the GC block is powered down */
+    uint32_t gfxoff_violations;  /* GC register/doorbell accesses made while it was */
     uint32_t smu_refuse;         /* "smu-refuse": this SMU message answers CmdRejectedPrereq (0xfd) */
     uint32_t smu_refuse_skip;    /* "smu-refuse-skip": ... but only after this many earlier sends of it */
     uint32_t smu_refuse_seen;
@@ -1694,7 +1702,10 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS, 1000);
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_TEMPERATURE + 0 * 2, 42);
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_TEMPERATURE + 1 * 2, 55);
-        stw_le_p(table + RDNA4_SMU_METRICS_AVG_SOCKET_POWER, 120);
+        stw_le_p(table + RDNA4_SMU_METRICS_AVG_SOCKET_POWER, s->gfxoff_active ? 8 : 120);
+        if (s->gfxoff_active) {
+            stw_le_p(table + RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY, 0);
+        }
         stw_le_p(table + RDNA4_SMU_METRICS_AVG_FAN_RPM, 900);
         fprintf(stderr, "rdna4: smu: synthetic metrics 42C/55C, 2100/1000 MHz, 120 W, 900 RPM\n");
         break;
@@ -1710,7 +1721,18 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
         s->smu_workload_mask = param;
         fprintf(stderr, "rdna4: smu: SetWorkloadMask 0x%x\n", param);
         break;
+    case 0x28:                                     /* AllowGfxOff: entered at once in the model */
+        s->gfxoff_pending = false;
+        s->gfxoff_active = true;
+        fprintf(stderr, "rdna4: smu: AllowGfxOff, GC powered down\n");
+        break;
     case 0x29:                                     /* DisallowGfxOff */
+        s->gfxoff_pending = false;
+        if (s->gfxoff_active) {
+            fprintf(stderr, "rdna4: smu: DisallowGfxOff, GC powered up\n");
+        }
+        s->gfxoff_active = false;
+        break;
     case 0x36:                                     /* RunDcBtc */
         break;
     default:
@@ -2586,12 +2608,43 @@ static void rdna4_psp_wptr(RDNA4State *s, uint32_t wptr)
 
 /* ---- BAR5 --------------------------------------------------------------- */
 
+/* GFXOFF hazard model (W27). The GC block, which holds the CP, RLC, SDMA, GCVM and
+ * GRBM registers and the MEC/gfx/SDMA doorbells, is powered down while GFXOFF is
+ * allowed. On a real card an MMIO or doorbell access to it can hang the bus (amdgpu
+ * disallows GFXOFF around every direct GC access, amdgpu_gfx_off_ctrl). The emulator
+ * cannot hang, so it makes the violation loud: reads return all ones, writes are
+ * dropped, and every access is counted and logged. Register windows are this
+ * emulator's GC segment 0 (0x1260) and 1 (0xa000). */
+static bool rdna4_gc_dword(uint32_t dw)
+{
+    return (dw >= 0x1260 && dw < 0x1260 + 0x2200) || (dw >= 0xa000 && dw < 0xa000 + 0x5000);
+}
+
+static bool rdna4_gfxoff_hazard(RDNA4State *s, const char *what, hwaddr addr)
+{
+    if (s->gfxoff_pending && qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->gfxoff_arm_ns) {
+        s->gfxoff_pending = false;
+        s->gfxoff_active = true;
+        fprintf(stderr, "rdna4: gfxoff-preset armed: GC powered down\n");
+    }
+    if (!s->gfxoff_active) {
+        return false;
+    }
+    s->gfxoff_violations++;
+    fprintf(stderr, "rdna4: GC %s 0x%05" HWADDR_PRIx " while GFXOFF is allowed (violation %u): "
+            "a real card can hang here\n", what, addr, s->gfxoff_violations);
+    return true;
+}
+
 static uint64_t rdna4_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     RDNA4State *s = opaque;
     uint32_t dw = addr / 4, val;
 
     addr &= ~3ull;
+    if (rdna4_gc_dword(dw) && rdna4_gfxoff_hazard(s, "read", addr)) {
+        return 0xffffffffu;
+    }
     if (addr == REG_MM_DATA) {
         val = rdna4_mm_read(s);
     } else if (addr == REG_CONFIG_MEMSIZE) {
@@ -2638,6 +2691,15 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
     uint32_t dw = addr / 4, val = data;
 
     addr &= ~3ull;
+    if (rdna4_gc_dword(dw) && rdna4_gfxoff_hazard(s, "write", addr)) {
+        return;
+    }
+    if (addr == GC_SEG1(0x0980)) {
+        /* RLC_SAFE_MODE: the RLC firmware acknowledges a request by clearing CMD (bit 0)
+         * and putting the answer in RESPONSE [11:8] (gfx_v12_0_set_safe_mode waits for
+         * CMD to clear). MESSAGE 1 = enter safe mode. */
+        val = (val & 1) ? (((val >> 1) & 0xf) == 1 ? (1u << 8) : 0) : val;
+    }
     if (s->trace && addr != REG_MM_DATA) {
         fprintf(stderr, "rdna4: W 0x%05" HWADDR_PRIx " = 0x%08x\n", addr, val);
     }
@@ -6037,6 +6099,9 @@ static void rdna4_sdma_doorbell(RDNA4State *s, uint64_t wptr)
 
 static void rdna4_doorbell_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
 {
+    if (rdna4_gfxoff_hazard(opaque, "doorbell write", addr)) {
+        return;
+    }
     if (addr / 4 == GFX_DOORBELL_DWORD) {
         rdna4_gfx_wptr(opaque, data, true);
         return;
@@ -6628,7 +6693,13 @@ static void rdna4_reset(DeviceState *dev)
     s->psp_ring_mc = 0;
     s->psp_ring_size = 0;
     s->psp_rptr = 0;
-    s->pmfw_loaded = false;
+    s->pmfw_loaded = s->smu_preloaded;
+    if (s->gfxoff_preset) {
+        s->gfxoff_pending = true;
+        s->gfxoff_arm_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + (int64_t)s->gfxoff_arm_ms * SCALE_MS;
+        fprintf(stderr, "rdna4: reset: the GC block will be powered down in %u ms (gfxoff-preset), PMFW %s\n",
+                s->gfxoff_arm_ms, s->pmfw_loaded ? "answering (smu-preloaded)" : "not loaded");
+    }
     memset(s->psp_fw_types, 0, sizeof(s->psp_fw_types));
     s->smu_allowed = ~0ull;
     s->smu_running = 0;
@@ -6808,9 +6879,24 @@ static void rdna4_exit(PCIDevice *dev)
     g_free(s->discovery);
 }
 
+static bool rdna4_get_gfxoff_force(Object *obj, Error **errp)
+{
+    return RDNA4(obj)->gfxoff_active;
+}
+
+/* qom-set /machine/peripheral/rdna4 gfxoff-force true: the GC block is powered down as if
+ * an earlier boot had allowed GFXOFF. gfxoff_active is not touched by a device reset, so it
+ * survives a warm restart, as the real ASIC's state would. */
+static void rdna4_set_gfxoff_force(Object *obj, bool value, Error **errp)
+{
+    RDNA4(obj)->gfxoff_active = value;
+    fprintf(stderr, "rdna4: gfxoff-force %s\n", value ? "on: GC powered down" : "off");
+}
+
 static void rdna4_instance_init(Object *obj)
 {
     PCI_DEVICE(obj)->cap_present |= QEMU_PCI_CAP_EXPRESS;
+    object_property_add_bool(obj, "gfxoff-force", rdna4_get_gfxoff_force, rdna4_set_gfxoff_force);
 }
 
 static const Property rdna4_properties[] = {
@@ -6834,6 +6920,9 @@ static const Property rdna4_properties[] = {
                 bool),
     DEFINE_PROP_BOOL("gfx-hang", RDNA4State, gfx_hang, false),
     DEFINE_PROP_BOOL("smu-stale", RDNA4State, smu_stale, false),
+    DEFINE_PROP_BOOL("gfxoff-preset", RDNA4State, gfxoff_preset, false),
+    DEFINE_PROP_UINT32("gfxoff-arm-ms", RDNA4State, gfxoff_arm_ms, 0),
+    DEFINE_PROP_BOOL("smu-preloaded", RDNA4State, smu_preloaded, false),
     DEFINE_PROP_UINT32("smu-refuse", RDNA4State, smu_refuse, 0),
     DEFINE_PROP_UINT32("smu-refuse-skip", RDNA4State, smu_refuse_skip, 0),
     DEFINE_PROP_BOOL("warm-keep", RDNA4State, warm_keep, false),
