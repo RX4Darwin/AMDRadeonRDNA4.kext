@@ -432,6 +432,16 @@ constexpr uint32_t kVmAgpBot = 0x0478, kVmAgpTop = 0x0479, kVmAgpBase = 0x047a;
 constexpr uint32_t kSysApLow = 0x062c, kSysApHigh = 0x062d, kL1TlbCntl = 0x063a;
 constexpr uint32_t kOtgMasterUpdateLock = 0x1b89, kOtgDoubleBufferCtl = 0x1b5c;
 constexpr uint32_t kOtgGlobalSyncStatus = 0x1b88;
+// The other DPP-side double-buffered blocks and the MPC that gates their update
+// (dcn_4_1_0_offset.h): CNVC_CFG0_FORMAT_CONTROL 0x0cd0 (CNVC_UPDATE_PENDING bit 20),
+// CM0_CM_CONTROL 0x0d67 (CM_UPDATE_PENDING bit 8), DPP_TOP0_DPP_CONTROL 0x0cc5 (base 2,
+// stride 0x16b per DPP); base 3: MPCC0_MPCC_CONTROL 0x0003, _UPDATE_LOCK_SEL 0x0005
+// (SEL [3:0], LOCKED_STATUS [6:4]), _STATUS 0x000e (stride 0x15), MPC_OUT0_MUX 0x02f2
+// (stride 4). If these pend or stay locked too, the whole DPP update domain is not
+// latching, not just the cursor.
+constexpr uint32_t kCnvcFormatControl = 0x0cd0, kCmControl = 0x0d67, kDppTopControl = 0x0cc5;
+constexpr uint32_t kMpccControl = 0x0003, kMpccUpdateLockSel = 0x0005, kMpccStatus = 0x000e;
+constexpr uint32_t kMpccStride = 0x15, kMpcOutMux = 0x02f2, kMpcOutStride = 4;
 
 // The cursor surface is one fixed 64x64 slot, the way amdgpu's DM hands the
 // hardware a whole cursor buffer (attr->width/height = the buffer, the image
@@ -471,18 +481,15 @@ uint32_t premultiplyArgb(uint32_t pixel) {
 // Every cursor line goes to the kernel log AND to a registry property, because
 // the macOS kernel message buffer wraps before the diagnostic batch reads it
 // (boot 6 of round 2 lost every early line). The property is the durable copy:
-// ioreg -l | grep RDNA4FB,Cursor. It fills once (the first ~30 lines are the
-// evidence; later per-move samples only go to the log).
-void RDNA4Device::cursorNote(const char *fmt, ...) {
-	char line[288];
-	va_list ap;
-	va_start(ap, fmt);
-	vsnprintf(line, sizeof(line), fmt, ap);
-	va_end(ap);
-	IOLog("RDNA4FB: cursor: %s\n", line);
+// ioreg -l | grep RDNA4FB,Cursor. The trail is 8 KiB and append-only: it keeps
+// EVERY cursor line and every "latch:" line until it is full (round 3 filled the
+// old 2 KiB after 13 lines, so the later shown/hidden states were dropped);
+// a full trail ends in "...(full)" so a cut-off is never mistaken for the end.
+void RDNA4Device::cursorTrailAppend(const char *line) {
 	const size_t n = strlen(line);
 	// One line in ioreg: the lines are joined with " ## " (diagnostic-log.sh splits them).
-	if (cursorTrailFull || cursorTrailLen + n + 5 > sizeof(cursorTrail)) {
+	const size_t reserve = 5 + sizeof("...(full)");
+	if (cursorTrailFull || cursorTrailLen + n + reserve > sizeof(cursorTrail)) {
 		if (!cursorTrailFull) {
 			cursorTrailFull = true;
 			strlcat(cursorTrail, "...(full)", sizeof(cursorTrail));
@@ -498,6 +505,33 @@ void RDNA4Device::cursorNote(const char *fmt, ...) {
 	cursorTrail[cursorTrailLen] = '\0';
 	if (owner)
 		owner->setProperty("RDNA4FB,Cursor", cursorTrail);
+}
+
+void RDNA4Device::cursorNote(const char *fmt, ...) {
+	char line[288];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	IOLog("RDNA4FB: cursor: %s\n", line);
+	cursorTrailAppend(line);
+}
+
+// The OTG update-latch lines (device.cpp ensureUpdateLatch) keep their own
+// "RDNA4FB: latch:" log prefix; with the cursor requested they also go into the
+// trail, where they explain why a cursor write stays pending.
+void RDNA4Device::latchNote(const char *fmt, ...) {
+	char line[288];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	IOLog("RDNA4FB: latch: %s\n", line);
+	if (hwCursorRequested) {
+		char tagged[300];
+		snprintf(tagged, sizeof(tagged), "latch: %s", line);
+		cursorTrailAppend(tagged);
+	}
 }
 
 // Program the cursor plane's attributes (everything except the position) the
@@ -575,6 +609,15 @@ void RDNA4Device::cursorDumpState(const char *why) {
 	           regReadDmu(2, kCursorCmMatrix + dpp),
 	           regReadDmu(2, kOtgMasterUpdateLock + otg), regReadDmu(2, kOtgDoubleBufferCtl + otg),
 	           regReadDmu(2, kOtgGlobalSyncStatus + otg));
+	const uint32_t cnvc = regReadDmu(2, kCnvcFormatControl + dpp);
+	const uint32_t cmc = regReadDmu(2, kCmControl + dpp);
+	const uint32_t mpcc = pipe.hubp < Pipe::kMaxOtg ? pipe.hubp * kMpccStride : 0;
+	cursorNote("%s: latch domains: cnvc fmt=0x%08x (pending %u) cm ctl=0x%08x (pending %u) dpp top=0x%08x | "
+	           "mpcc ctl=0x%08x lock_sel=0x%08x status=0x%08x out mux=0x%08x", why, cnvc, (cnvc >> 20) & 1,
+	           cmc, (cmc >> 8) & 1, regReadDmu(2, kDppTopControl + dpp),
+	           regReadDmu(3, kMpccControl + mpcc), regReadDmu(3, kMpccUpdateLockSel + mpcc),
+	           regReadDmu(3, kMpccStatus + mpcc),
+	           regReadDmu(3, kMpcOutMux + (pipe.otg < Pipe::kMaxOtg ? pipe.otg * kMpcOutStride : 0)));
 }
 
 bool RDNA4Device::initHardwareCursor() {

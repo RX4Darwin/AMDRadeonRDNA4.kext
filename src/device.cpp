@@ -1605,14 +1605,14 @@ void RDNA4Device::ensureUpdateLatch() {
 	// lock asserted, every double-buffered pipe write stays pending forever
 	// (writes read back fine, hardware never changes).
 	uint32_t lock = regReadDmu(2, kOtgMasterUpdateLock + o);
-	FBLOG("latch: OTG%u lock=0x%08x (status=%u) dbufctl=0x%08x dppctl=0x%08x",
+	latchNote("OTG%u lock=0x%08x (status=%u) dbufctl=0x%08x dppctl=0x%08x",
 	      pipe.otg < Pipe::kMaxOtg ? pipe.otg : 0, lock, (lock >> 8) & 1,
 	      regReadDmu(2, kOtgDoubleBufferCtl + o), regReadDmu(2, kDppTopControl + dppOff()));
 	if (lock == 0xFFFFFFFF)
 		return;
 	if (lock & 1) {
 		regWriteDmu(2, kOtgMasterUpdateLock + o, 0);
-		FBLOG("latch: released OTG master update lock (was 0x%08x, now 0x%08x)",
+		latchNote("released OTG master update lock (was 0x%08x, now 0x%08x)",
 		      lock, regReadDmu(2, kOtgMasterUpdateLock + o));
 	}
 
@@ -1621,7 +1621,7 @@ void RDNA4Device::ensureUpdateLatch() {
 	uint32_t vstartup = regReadDmu(2, kOtgVStartupParam + o);
 	uint32_t vupdate  = regReadDmu(2, kOtgVUpdateParam + o);
 	uint32_t sync     = regReadDmu(2, kOtgGlobalSyncStatus + o);
-	FBLOG("latch: global sync: vstartup=0x%08x vupdate=0x%08x vready=0x%08x "
+	latchNote("global sync: vstartup=0x%08x vupdate=0x%08x vready=0x%08x "
 	      "status=0x%08x (vupdate_occurred=%u)",
 	      vstartup, vupdate, regReadDmu(2, kOtgVReadyParam + o), sync,
 	      (sync >> 8) & 1);
@@ -1636,7 +1636,7 @@ void RDNA4Device::ensureUpdateLatch() {
 			regWriteDmu(2, kOtgVStartupParam + o, start);
 		}
 		regWriteDmu(2, kOtgVUpdateParam + o, (2u << 16));
-		FBLOG("latch: programmed VUPDATE pulse (vstartup=0x%08x vupdate=0x%08x)",
+		latchNote("programmed VUPDATE pulse (vstartup=0x%08x vupdate=0x%08x)",
 		      regReadDmu(2, kOtgVStartupParam + o), regReadDmu(2, kOtgVUpdateParam + o));
 	}
 	updateLatchReady = true;

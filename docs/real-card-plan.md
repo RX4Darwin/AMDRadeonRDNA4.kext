@@ -90,6 +90,16 @@ separate power-management work.
    64x64 square at (100,100) that macOS's pointer does not replace; see
    `docs/cursor-audit.md` for how to read the result.
 
+6b. **Round 4 draw (W23).** Boot 10 (`rdna4-gfx=2 rdna4-gfxdiag=11`): the gfx golden registers are written at ring
+   bring-up (rev_id from the NBIF RCC_STRAP0 at dword 0x1c); if the draw is still empty the ladder re-runs it with one open
+   question changed at a time, in the order 8 (a PS that stores a marker), 2 (INST_PREF_SIZE), 1 (USER_SGPR).
+   **A/B control (boot 11, `rdna4-gfxgolden=0`): the goldens are not undone by skipping them and survive a warm restart, so
+   power-cycle the machine before boot 11 (or run boot 11 before boot 10);** the log says `golden: already in force from
+   an earlier boot` when a boot found them set. **Boot 12** (`rdna4-gfxdiag=4`) runs the GS_ALLOC_REQ NGG shader alone: it
+   can hang the gfx pipeline and there is no reset, so if its result says `hang/` do a cold power cycle before anything else.
+   `docs/gfx-draw-audit.md` lists the suspects and what each log line means. A `gfx-golden-strict` emulator result says
+   nothing about the card, it only shows that the kext writes the registers.
+
 7. **Optional W19 GFX power-management probe.**
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31`.
    Run it after boots 0-6 (the round-2 idle reading of 300 W / 3.2 GHz is
