@@ -166,14 +166,14 @@ void RDNA4Compute::defensiveStart() {
                 (sv.rlcCntl != kQuiesceBad && (sv.rlcCntl & kRlcEnableF32));
         if (!cpCanRun)
                 CLOG("quiesce: defensive start skipped CP/HQD survey; RLC/CP is not running");
-        bool hqdActive[4][8] {};
-        uint32_t hqdVmid[4][8] {};
+        bool hqdActive[2][4] {};   // GC 12.0.x: 2 MEC pipes x 4 queues (gfx_v12_0.c:1415-1423)
+        uint32_t hqdVmid[2][4] {};
         uint32_t gfxActive = kQuiesceBad;
         uint32_t me = kQuiesceBad;
         uint32_t mec = kQuiesceBad;
         if (cpCanRun) {
-                for (uint32_t pipe = 0; pipe < 4; pipe++) {
-                        for (uint32_t queue = 0; queue < 8; queue++) {
+                for (uint32_t pipe = 0; pipe < 2; pipe++) {
+                        for (uint32_t queue = 0; queue < 4; queue++) {
                                 grbmSelect(1, pipe, queue, 0);
                                 const uint32_t active = rdGc(CpHqdActive);
                                 hqdActive[pipe][queue] = active != kQuiesceBad && (active & 1);
@@ -187,8 +187,8 @@ void RDNA4Compute::defensiveStart() {
         }
         const bool inheritedGfx = cpCanRun && gfxActive != kQuiesceBad && (gfxActive & 1);
         bool inheritedHqd = false;
-        for (uint32_t pipe = 0; pipe < 4; pipe++)
-                for (uint32_t queue = 0; queue < 8; queue++)
+        for (uint32_t pipe = 0; pipe < 2; pipe++)
+                for (uint32_t queue = 0; queue < 4; queue++)
                         inheritedHqd |= hqdActive[pipe][queue];
 
         bool found = ih != kQuiesceBad &&
@@ -216,8 +216,8 @@ void RDNA4Compute::defensiveStart() {
                         wr(IpDiscovery::HwGc, sdma(instance, SdmaMcuCntl), mcu | kSdmaMcuHalt);
         }
         if (cpCanRun) {
-                for (uint32_t pipe = 0; pipe < 4; pipe++) {
-                        for (uint32_t queue = 0; queue < 8; queue++) {
+                for (uint32_t pipe = 0; pipe < 2; pipe++) {
+                        for (uint32_t queue = 0; queue < 4; queue++) {
                                 if (!hqdActive[pipe][queue])
                                         continue;
                                 const uint32_t vmid = hqdVmid[pipe][queue];
@@ -1369,12 +1369,30 @@ bool RDNA4Compute::vmBootSelfTest() {
 			     rdGc(GcL2Cntl), *reinterpret_cast<volatile uint32_t *>(fpMem->getBytesNoCopy()),
 			     *(reinterpret_cast<volatile uint32_t *>(fpMem->getBytesNoCopy()) + 1));
 		}
-		if (fpDma) {
-			(void)fpDma->clearMemoryDescriptor();
-			fpDma->release();
+		/* The host page goes away only once the hub is idle (nothing can still be
+		 * answered from it): GCVM_L2_STATUS L2_BUSY [0] and CONTEXT_DOMAIN_BUSY [16:1]
+		 * clear, plus a short settle.  If the hub does not go idle the page is kept
+		 * (deliberately leaked until reboot) rather than freed under a live engine. */
+		bool fpHubIdle = true;
+		if (fpOn) {
+			fpHubIdle = false;
+			for (uint32_t ms = 0; ms < 100 && !fpHubIdle; ms++) {
+				fpHubIdle = !(rdGc(GcL2Status) & 0x1ffffu);
+				if (!fpHubIdle)
+					IOSleep(1);
+			}
+			IOSleep(5);
+			RLOG("vm: F: hub %s before the dummy page is released (GCVM_L2_STATUS 0x%08x)",
+			     fpHubIdle ? "idle" : "NOT idle: the page is kept", rdGc(GcL2Status));
 		}
-		if (fpMem)
-			fpMem->release();
+		if (fpHubIdle) {
+			if (fpDma) {
+				(void)fpDma->clearMemoryDescriptor();
+				fpDma->release();
+			}
+			if (fpMem)
+				fpMem->release();
+		}
 	}
 	if (context && (hqd || !fence)) {
 		trail("vm: HQD dequeue");

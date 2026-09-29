@@ -668,6 +668,10 @@ void RDNA4Compute::runStages() {
 			pmCapPending = !strncmp(prev, "pm: cap", 7) || !strncmp(prev, "pm: gfxcap", 10);
 			CLOG("the previous boot died during \"%s\": %s is off this boot, everything else runs "
 			     "(the next boot tries it again)", prev, hungFeature);
+			if (!strcmp(hungFeature, "vm"))
+				CLOG("REMINDER: the previous boot died in a vm: step; if rdna4-vm-diag had bit 512 (vm: F) on, "
+				     "the GC hub may still send faulting accesses to a host dummy page that is no longer "
+				     "ours until the kext's gcHubInit runs: do a COLD power cycle before the next boot");
 			env.owner->setProperty("Compute,PreviousHang", prev);
 			hung = false;
 		}

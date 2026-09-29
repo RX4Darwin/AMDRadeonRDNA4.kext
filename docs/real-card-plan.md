@@ -164,7 +164,7 @@ looks capped at about 1000 MHz.
    LOCAL_FB/LOCAL_SYSMEM, only where they differ): run it only if boot 8 still
    fails everywhere. Each test restores what it changed. The last log line
    `vm: variants (ran/PASS): ...` is the summary. `rdna4-vm-diag` is a bit mask:
-   1 E4, 2 a, 4 b, 8 c, 16 E2, 32 d, 64 e, 128 g, 256 T, 512 F, 1024 o, 2048 V (4065 = boot 8, 30 = boot 16). `o`: the VMID 8 context reprogrammed in amdgpu's order plus an L2 invalidate; `V`: the control on VMID 12. GC 12.0.x has only MEC pipes 0-1 with 4 queues each (gfx_v12_0.c:1415-1423): the tests use pipe 1 queues 0-2 and pipe 0 queues 2-3 (E4: pipe 1 queue 3).
+   1 E4, 2 a, 4 b, 8 c, 16 E2, 32 d, 64 e, 128 g, 256 T, 512 F, 1024 o, 2048 V (g and T run on slots that already took a fault: read them only together with the `HQD doorbell control ... consumed / did NOT service` line; after a hang in any `vm:` trail with F on, do a COLD power cycle before the next boot, the next boot logs a REMINDER) (4065 = boot 8, 30 = boot 16). `o`: the VMID 8 context reprogrammed in amdgpu's order plus an L2 invalidate; `V`: the control on VMID 12. GC 12.0.x has only MEC pipes 0-1 with 4 queues each (gfx_v12_0.c:1415-1423): the tests use pipe 1 queues 0-2 and pipe 0 queues 2-3 (E4: pipe 1 queue 3).
    Read: table MISMATCH = tables did not land; E4 PASS = walker and tables fine,
    the VMID 8 HQD is the problem; a variant that PASSes names the fix; control
    passing means the baseline fault was slot-specific. The runtime stays without
