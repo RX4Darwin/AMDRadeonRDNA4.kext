@@ -226,6 +226,8 @@ private:
 	void cursorDumpState(const char *why);
 	void cursorProgramPlane(bool enable);
 	void cursorSelfTest();
+	uint32_t cursorDstXOffset(uint32_t px) const;
+	uint32_t cursorRefClkKHz { 50000 };          // DCHUB refclk for CURSOR_DST_X_OFFSET
 	bool cursorHold { false };                   // rdna4-cursor=2: keep the test square, ignore macOS's cursor calls
 	uint32_t cursorHeldCalls { 0 };
 };

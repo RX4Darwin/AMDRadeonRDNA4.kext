@@ -72,7 +72,7 @@ CM_CUR0 bits 2 and 7, `3c713b7`). The W14 port kept those register values; nobod
    readback equal to the move, `otg lock` released, `sync` bit 8 set. All right and still invisible points at
    items 6 and 7 (the DMUB-owned bits and cursor offload), not at anything the host programs.
 
-## rdna4-cursor=2 (boot 8): a yes/no answer that does not depend on macOS
+## rdna4-cursor=2 (boot 9): a yes/no answer that does not depend on macOS
 
 `rdna4-cursor=2` programs an opaque magenta 64x64 square at (100,100) through the same `cursorProgramPlane()` macOS's
 pointer uses, and then ignores macOS's `cscSetHardwareCursor`/`cscDrawHardwareCursor` (logged as ignored) so the

@@ -628,6 +628,7 @@ private:
 	void publishRuntime(uint32_t stage);
 	bool initRuntimeHeap();
 	bool vmBootSelfTest();
+	void vmDumpHubWindows(const char *tag);   // W17 E1, read-only
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);
 	RtClient  *clientFor(const void *owner);

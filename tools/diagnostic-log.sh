@@ -20,7 +20,7 @@ REG_RESULTS=""
 STEP_TIMEOUT=120
 STEP_SEQ=0
 : > "$SUMMARY"
-trap 'rm -f "$SUMMARY" "$KLOG" "$STEP_PREFIX"-* "/tmp/rdna4fb-klogfb.$$"' EXIT
+trap 'rm -f "$SUMMARY" "$KLOG" "$STEP_PREFIX"-* "/tmp/rdna4fb-klogfb.$$" "/tmp/rdna4fb-klogfb.$$.raw"' EXIT
 
 # The kernel copy is preferred because Recovery's nvram command can return an
 # empty boot-args value while the running kernel still has its arguments.
@@ -76,8 +76,26 @@ section() { echo; echo "=== $1 ==="; }
 KFB="/tmp/rdna4fb-klogfb.$$"
 klog_fallback() {
 	if [ ! -e "$KFB" ]; then
-		log show --last boot --style compact --predicate 'eventMessage CONTAINS "RDNA4FB:"' 2>/dev/null |
-			grep 'RDNA4FB:' > "$KFB" || : > "$KFB"
+		# log show can run for minutes on a big unified log and macOS has no
+		# timeout(1): run it in the background and stop it after 60 s. Whatever it
+		# printed by then is used.
+		local lpid t=0
+		: > "$KFB.raw"
+		log show --last boot --style compact --predicate 'eventMessage CONTAINS "RDNA4FB:"' \
+			> "$KFB.raw" 2>/dev/null &
+		lpid=$!
+		while kill -0 "$lpid" 2>/dev/null && [ "$t" -lt 60 ]; do
+			sleep 1
+			t=$((t + 1))
+		done
+		if kill -0 "$lpid" 2>/dev/null; then
+			kill "$lpid" 2>/dev/null || true
+			sleep 1
+			kill -9 "$lpid" 2>/dev/null || true
+			echo "(log show stopped after ${t} s; the unified-log lines below are partial)" >&2
+		fi
+		grep 'RDNA4FB:' "$KFB.raw" > "$KFB" 2>/dev/null || : > "$KFB"
+		rm -f "$KFB.raw"
 	fi
 	cat "$KFB"
 }
@@ -230,7 +248,7 @@ registry_value() {
 		echo "$CUR_PROP" | sed 's/ ## /\
 /g'
 	else
-		echo "(no RDNA4FB,Cursor property: rdna4-cursor off or the kext never armed it)"
+		echo "(no RDNA4FB,Cursor property: the kext never reached cursor init; with rdna4-cursor off it holds only the "unavailable" line)"
 	fi
 
 	# DMUB: catches both dmub: (ping) and dmub-hist: (GOP command decode).

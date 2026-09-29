@@ -85,6 +85,10 @@ separate power-management work.
    leaves the `cursor:` trail. W12's future `rdna4-run tri` gets the next plan
    slot; its PASS will require the app marker plus a durable registry result,
    with `tri:` as the hang fallback.
+   The cursor evidence is also in the registry property `RDNA4FB,Cursor` (printed
+   by diagnostic-log.sh). **Boot 9** is the same with `rdna4-cursor=2`: a magenta
+   64x64 square at (100,100) that macOS's pointer does not replace; see
+   `docs/cursor-audit.md` for how to read the result.
 
 7. **Optional W19 GFX power-management probe.**
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15`.
@@ -112,6 +116,26 @@ traffic; no boot-arg is needed for them. If a `pm: cap probe` or `pm: cap
 restore` step ever hangs, the following boot sends `SetSoftMaxByFreq(GFXCLK,
 0xffff)` once (trail `pm: cap recover`); do a cold power cycle if compute still
 looks capped at about 1000 MHz.
+
+8. **W17 VM walker diagnostics (run last, only after boot 2 showed the VM failure).**
+   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31`
+   (`set-boot.sh 8`). Boot 2 alone (no `rdna4-vm-diag`) already logs the read-only
+   evidence: `vm: E1 after SMU enable / before kick / after fault` (both hubs'
+   window and aperture registers), `vm: diag before kick` (context and L2
+   registers, page-table entries read back through SDMA as `ok`/`MISMATCH`) and
+   the fault status. Boot 8 adds hardware-writing diagnostics after the baseline
+   fails, each restoring what it changed: `variant a` (TAP_*_PHYSICAL=1),
+   `variant b` (context 0 covers the tables), `variant c` (MC-form table
+   pointers), `variant E2` (mirror only LOCAL_FB/LOCAL_SYSMEM start/end from the
+   MM hub, only where they differ; the saved values are logged first), then
+   E4 last: `vm: E4: IB from the VMID0 ring, fetched in VMID 8 ... => PASS/fail`
+   (needs `rdna4-hang=1`; it can stall the kernel ring, which is recovered without
+   a reset, and a later compute test may then fail). `rdna4-vm-diag` is a bit mask:
+   1 E4, 2 a, 4 b, 8 c, 16 E2. Read: table MISMATCH = tables did not land; E4 PASS =
+   walker and tables fine, the VMID 8 HQD is the problem; a/b/c/E2 PASS names the
+   fix. The runtime stays without per-client VM on this boot whatever happens.
+   `rdna4-vm-force-fail` is an emulator-only test hook and is ignored without
+   `rdna4-vm-diag`; never set it on the card.
 
 ## Known risks
 

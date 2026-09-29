@@ -451,7 +451,7 @@ constexpr uint32_t kCursorLinesPerChunkShift = 24;
 constexpr uint32_t kCursorLinesPer8 = 3;     // enum cursor_lines_per_chunk: 1,2,4,8,16 = 0..4
 constexpr uint32_t kCursorCmModeShift = 4;
 constexpr uint32_t kCursorCmWorkingBits = (1u << 7) | (1u << 2);
-constexpr uint32_t kCursorRefClkKHz = 100000;   // DCHUB refclk (dc_cursor_mi_param.ref_clk_khz)
+constexpr uint32_t kDchubGlobalTimerCntl = 0x0527;   // regDCHUBBUB_GLOBAL_TIMER_CNTL (REFDIV [3:0], ENABLE bit 12)
 
 uint32_t premultiplyArgb(uint32_t pixel) {
 	const uint32_t alpha = pixel >> 24;
@@ -528,6 +528,15 @@ void RDNA4Device::cursorProgramPlane(bool enable) {
 	hwCursorEnabledHw = enable;
 }
 
+// CURSOR_DST_X_OFFSET (hubp401_cursor_set_position): x scaled from pixel-clock
+// to DCHUB refclk time. The refclk is read back like dcn20_hubbub.c:560-582
+// (DCHUBBUB_GLOBAL_TIMER_CNTL; DC asserts 40-60 MHz), else DC's ~50 MHz; the value
+// and its source are logged at arming. No pixel clock (bootTiming) gives 0.
+uint32_t RDNA4Device::cursorDstXOffset(uint32_t px) const {
+	const uint32_t pixelKHz = bootTimingValid ? bootTiming.pixelClockKHz : 0;
+	return pixelKHz ? static_cast<uint32_t>((static_cast<uint64_t>(px) * cursorRefClkKHz) / pixelKHz) : 0;
+}
+
 // rdna4-cursor=2: at arming, show an opaque magenta 64x64 square at (100,100)
 // through the same programming path macOS's cursor uses. Whether it appears on the
 // card is a yes/no answer that does not depend on macOS's cursor image (which can
@@ -535,13 +544,13 @@ void RDNA4Device::cursorProgramPlane(bool enable) {
 void RDNA4Device::cursorSelfTest() {
 	for (uint32_t i = 0; i < kCursorWidth * kCursorHeight; i++)
 		cursorVram[i] = 0xffff00ffu;   // premultiplied ARGB: opaque magenta
-	cursorProgramPlane(true);
 	const uint32_t hubp = hubpOff();
-	const uint32_t pixelKHz = bootTimingValid ? bootTiming.pixelClockKHz : 0;
+	// Position first, then the enable, so the square is never armed at (0,0).
 	regWriteDmu(2, kCursorPosition + hubp, 100u | (100u << 15));
-	regWriteDmu(2, kCursorDstOffset + hubp,
-	            pixelKHz ? static_cast<uint32_t>((100ull * kCursorRefClkKHz) / pixelKHz) : 0);
+	regWriteDmu(2, kCursorDstOffset + hubp, cursorDstXOffset(100));
+	cursorProgramPlane(true);
 	cursorNote("SELF-TEST (rdna4-cursor=2): an opaque magenta 64x64 square is programmed at (100,100)");
+	cursorNote("self-test state: hwCursorVisible %d hwCursorEnabledHw %d (macOS calls are ignored)", hwCursorVisible, hwCursorEnabledHw);
 	cursorDumpState("selftest");
 	cursorHold = true;
 	hwCursorSet = true;
@@ -619,6 +628,21 @@ bool RDNA4Device::initHardwareCursor() {
 		cursorVram[i] = 0;
 	ensureUpdateLatch();
 	hwCursorReady = true;
+	{
+		const uint32_t timer = regReadDmu(2, kDchubGlobalTimerCntl);
+		const char *src = "DCHUBBUB_GLOBAL_TIMER_CNTL, DCCG ref assumed 100 MHz";
+		uint32_t khz = 0;
+		if (timer != 0xffffffffu && (timer & (1u << 12)))
+			khz = (timer & 0xf) == 2 ? 50000 : 100000;
+		if (khz < 40000 || khz > 60000) {
+			khz = 50000;
+			src = "timer disabled or out of DC's 40-60 MHz range: DC's ~50 MHz";
+		}
+		cursorRefClkKHz = khz;
+		cursorNote("DCHUB ref clock %u kHz for CURSOR_DST_X_OFFSET (%s; timer cntl 0x%08x); pixel clock %u kHz%s",
+		           khz, src, timer, bootTimingValid ? bootTiming.pixelClockKHz : 0,
+		           bootTimingValid && bootTiming.pixelClockKHz ? "" : " (unknown: DST_X_OFFSET written as 0)");
+	}
 	cursorNote("NDRV hardware cursor ready: HUBP%u DPP%u OTG%u, scanout MC 0x%llx (fb len 0x%llx), "
 	           "sprite MC 0x%llx = cpu 0x%llx (%ux%u slot)", pipe.hubp, pipe.hubp, pipe.otg,
 	           scanout, static_cast<unsigned long long>(fbLength), cursorMcAddr,
@@ -744,9 +768,7 @@ IOReturn RDNA4Device::drawHardwareCursor(int32_t x, int32_t y, uint32_t visible)
 	regWriteDmu(2, kCursorHotSpot + hubp, hy | (hx << 16));
 	// CURSOR_DST_X_OFFSET is the fetch deadline in refclk time: x scaled from
 	// pixel clock to refclk (hubp401_cursor_set_position).
-	const uint32_t pixelKHz = bootTimingValid ? bootTiming.pixelClockKHz : 0;
-	regWriteDmu(2, kCursorDstOffset + hubp,
-	            pixelKHz ? static_cast<uint32_t>((static_cast<uint64_t>(px) * kCursorRefClkKHz) / pixelKHz) : 0);
+	regWriteDmu(2, kCursorDstOffset + hubp, cursorDstXOffset(px));
 
 	// Like amdgpu, touch the enables only when the visibility changes:
 	// rewriting the double-buffered control registers on every move re-arms
