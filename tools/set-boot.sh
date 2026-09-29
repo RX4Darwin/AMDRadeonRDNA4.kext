@@ -13,7 +13,7 @@
 #   7  optional: GFX power-management probe rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31
 #      (samples the SMU metrics, sets the default workload mask, releases the
 #      GFXCLK soft limits, then caps GFXCLK at 1000 MHz for one sample and lifts it)
-#   8  W17 VM walker diagnostics            rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=481 (E4, control, PTE-only tests d/e/g/T: no hub writes)
+#   8  W17 VM walker diagnostics            rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=4065 (F fault default page, E4, control, o, V, PTE-only d/e/g/T)
 #   9  optional: cursor self-test: boot 6 with rdna4-cursor=2 (a magenta 64x64 square at (100,100), macOS pointer ignored)
 #  10  round 4 draw: boot 5 with the golden registers (default) and the rdna4-gfxdiag=11 ladder (8, 2, 1) if the draw is empty
 #  11  A/B control: boot 10 with rdna4-gfxgolden=0. The goldens survive a warm restart: POWER-CYCLE first (or run 11 before 10)
@@ -37,7 +37,7 @@ case "${1:-}" in
 	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1" ;;
 	7) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31" ;;
-	8) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=481" ;;
+	8) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=4065" ;;
 	9) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-hang=1" ;;
 	10) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-gfxdiag=11 rdna4-hang=1" ;;
 	11) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-gfxgolden=0 rdna4-gfxdiag=11 rdna4-hang=1" ;;

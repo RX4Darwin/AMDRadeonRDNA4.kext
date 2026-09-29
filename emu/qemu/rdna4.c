@@ -352,6 +352,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define REG_GCVM_CTX1_END_HI GC_SEG0(0x16d2)
 #define REG_GCVM_FAULT_CNTL   GC_SEG0(0x15cc)
 #define REG_GCVM_FAULT_STATUS GC_SEG0(0x15d0)
+#define REG_GCVM_L2_CNTL GC_SEG0(0x15c4)
 #define REG_GCVM_FAULT_ADDR_LO GC_SEG0(0x15d2)
 #define REG_GCVM_FAULT_ADDR_HI GC_SEG0(0x15d3)
 #define REG_GCVM_FAULT_DEFAULT_LO GC_SEG0(0x15d4)
@@ -2157,7 +2158,16 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
     }
 fault:
     rdna4_vm_fault(s, vmid, va);
-    /* Retry is off: serve the configured dummy page so the queue can drain. */
+    /* Retry is off: serve the configured dummy page so the queue can drain.
+     * GCVM_L2_CNTL.ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY [11] (amdgpu sets it,
+     * gfxhub_v12_0.c:248) makes it a system-memory page: modelled as one shared zeroed
+     * page whose writes are discarded, never a VRAM address. */
+    if (reg_get(s, REG_GCVM_L2_CNTL) & (1u << 11)) {
+        static uint8_t sys_dummy_page[0x1000];
+        if (len <= 0x1000 && (va & 0xfff) + len <= 0x1000)
+            return sys_dummy_page + (va & 0xfff);
+        return NULL;
+    }
     uint64_t dummy = ((uint64_t)reg_get(s, REG_GCVM_FAULT_DEFAULT_LO) |
                       ((uint64_t)reg_get(s, REG_GCVM_FAULT_DEFAULT_HI) << 32)) << 12;
     int64_t off = rdna4_phys_to_vram(s, dummy);
@@ -2755,9 +2765,12 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
         }
     } else if (addr == REG_GRBM_GFX_CNTL) {
         reg_set(s, addr, val);
-        s->selected_pipe = val & 3;
+        /* MEC1 has 2 pipes x 4 queues on GC 12.0.x (gfx_v12_0.c:1415-1423); the missing
+         * pipe/queue ID bits alias real slots (round 4 log: a queue on "pipe 2" read back the
+         * kernel ring's HQD). */
+        s->selected_pipe = val & 1;
         s->selected_vmid = (val >> 4) & 0xf;
-        s->selected_queue = (val >> 8) & 7;
+        s->selected_queue = (val >> 8) & 3;
         if (s->selected_pipe || s->selected_queue || s->selected_vmid)
             s->hqd[s->selected_pipe][s->selected_queue].used = true;
     } else if (addr == REG_CP_HQD_DEQUEUE_REQ) {

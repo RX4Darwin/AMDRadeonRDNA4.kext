@@ -166,14 +166,14 @@ void RDNA4Compute::defensiveStart() {
                 (sv.rlcCntl != kQuiesceBad && (sv.rlcCntl & kRlcEnableF32));
         if (!cpCanRun)
                 CLOG("quiesce: defensive start skipped CP/HQD survey; RLC/CP is not running");
-        bool hqdActive[4][8] {};
-        uint32_t hqdVmid[4][8] {};
+        bool hqdActive[2][4] {};   // GC 12.0.x: 2 MEC pipes x 4 queues (gfx_v12_0.c:1415-1423)
+        uint32_t hqdVmid[2][4] {};
         uint32_t gfxActive = kQuiesceBad;
         uint32_t me = kQuiesceBad;
         uint32_t mec = kQuiesceBad;
         if (cpCanRun) {
-                for (uint32_t pipe = 0; pipe < 4; pipe++) {
-                        for (uint32_t queue = 0; queue < 8; queue++) {
+                for (uint32_t pipe = 0; pipe < 2; pipe++) {
+                        for (uint32_t queue = 0; queue < 4; queue++) {
                                 grbmSelect(1, pipe, queue, 0);
                                 const uint32_t active = rdGc(CpHqdActive);
                                 hqdActive[pipe][queue] = active != kQuiesceBad && (active & 1);
@@ -187,8 +187,8 @@ void RDNA4Compute::defensiveStart() {
         }
         const bool inheritedGfx = cpCanRun && gfxActive != kQuiesceBad && (gfxActive & 1);
         bool inheritedHqd = false;
-        for (uint32_t pipe = 0; pipe < 4; pipe++)
-                for (uint32_t queue = 0; queue < 8; queue++)
+        for (uint32_t pipe = 0; pipe < 2; pipe++)
+                for (uint32_t queue = 0; queue < 4; queue++)
                         inheritedHqd |= hqdActive[pipe][queue];
 
         bool found = ih != kQuiesceBad &&
@@ -216,8 +216,8 @@ void RDNA4Compute::defensiveStart() {
                         wr(IpDiscovery::HwGc, sdma(instance, SdmaMcuCntl), mcu | kSdmaMcuHalt);
         }
         if (cpCanRun) {
-                for (uint32_t pipe = 0; pipe < 4; pipe++) {
-                        for (uint32_t queue = 0; queue < 8; queue++) {
+                for (uint32_t pipe = 0; pipe < 2; pipe++) {
+                        for (uint32_t queue = 0; queue < 4; queue++) {
                                 if (!hqdActive[pipe][queue])
                                         continue;
                                 const uint32_t vmid = hqdVmid[pipe][queue];
@@ -810,10 +810,10 @@ bool RDNA4Compute::vmBootSelfTest() {
 	 * the CPU).  Any bit also runs the control test.  The E1 register dumps
 	 * and the SDMA table readback are read-only and always on with rdna4-vm=1.
 	 * The force-fail test hook only counts together with a diag mask. */
-	uint32_t curPipe = pipe, curQueue = queue, curDoorbell = doorbell;
+	uint32_t curPipe = pipe, curQueue = queue, curDoorbell = doorbell, curVmid = vmid;
 	uint32_t diag = 0;
 	(void)PE_parse_boot_argn("rdna4-vm-diag", &diag, sizeof(diag));
-	diag &= 0x1ff;
+	diag &= 0xfff;
 	if (!diag)
 		forceFail = 0;
 
@@ -834,6 +834,10 @@ bool RDNA4Compute::vmBootSelfTest() {
 		RLOG("vm: diag%s: L2_CNTL 0x%08x CNTL2 0x%08x CNTL3 0x%08x CNTL4 0x%08x TLB 0x%08x FAULT_CNTL 0x%08x",
 		     tag, rdGc(GcL2Cntl), rdGc(GcL2Cntl2), rdGc(GcL2Cntl3), rdGc(GcL2Cntl4),
 		     rdGc(GcMxL1TlbCntl), rdGc(GcL2FaultCntl));
+		RLOG("vm: diag%s: invalidate engine 17 REQ 0x%08x ACK 0x%08x SEM 0x%08x, L2_STATUS 0x%08x", tag,
+		     rdGc(Reg { 0, GcInvEng0Req.dword + kGcInvEngGart }),
+		     rdGc(Reg { 0, GcInvEng0Ack.dword + kGcInvEngGart }),
+		     rdGc(Reg { 0, GcInvEng0Sem.dword + kGcInvEngGart }), rdGc(GcL2Status));
 		RLOG("vm: diag%s: CONTEXT0 CNTL 0x%08x BASE 0x%08x:%08x START 0x%08x:%08x END 0x%08x:%08x", tag,
 		     rdGc(GcCtx0Cntl), rdGc(GcCtx0PtBaseHi), rdGc(GcCtx0PtBaseLo), rdGc(GcCtx0PtStartHi),
 		     rdGc(GcCtx0PtStartLo), rdGc(GcCtx0PtEndHi), rdGc(GcCtx0PtEndLo));
@@ -908,7 +912,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 		       vmMap(c, ibVa, poolMc(ibOff), 0x1000, false);
 	};
 	auto hqdStop = [&]() {
-		grbmSelect(1, curPipe, curQueue, vmid);
+		grbmSelect(1, curPipe, curQueue, curVmid);
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
 		bool idle = false;
 		for (uint32_t us = 0; us < 100000; us += 10) {
@@ -933,7 +937,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 			logGcFault("vm: boot: fault latched before the test");
 		gcFaultClear();
 		trail(first ? "vm: context invalidate" : "vm: variant invalidate");
-		(void)vmInvalidate(vmid, "boot context enable");
+		(void)vmInvalidate(curVmid, "boot context enable");
 		if (!first) {
 			/* A fresh queue: clear the report/poll/data/fence pages and the
 			 * ring, and start the PM4 writer over. */
@@ -942,7 +946,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 			c.pm4.init(poolDw(qoff + kVmPq), qva, kPqSize);
 		}
 		trail(first ? "vm: HQD activate" : "vm: variant HQD activate");
-		hqd = hqdInitFor(false, curPipe, curQueue, vmid, poolMc(qoff + kVmMqd),
+		hqd = hqdInitFor(false, curPipe, curQueue, curVmid, poolMc(qoff + kVmMqd),
 		                 eva >> 8, qva >> 8, rva, wva, curDoorbell);
 		*poolDw(dataOff) = 0;
 		*c.fenceCpu = 0;
@@ -974,7 +978,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 			     *c.fenceCpu, *poolDw(dataOff), status);
 			/* One bounded dump for the real-card log: where the HQD stopped,
 			 * what the CP reported, and what the doorbell holds. */
-			grbmSelect(1, curPipe, curQueue, vmid);
+			grbmSelect(1, curPipe, curQueue, curVmid);
 			{
 				const uint32_t dbc = rdGc(CpHqdPqDoorbell);
 				RLOG("vm: boot%s: MEC pipe %u queue %u, HQD doorbell control 0x%08x: the MEC %s the doorbell",
@@ -990,7 +994,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 			     "doorbell dword %u readback 0x%llx", tag,
 			     static_cast<unsigned long long>(c.pm4.wptr()), *poolDw(qoff + kVmRptr), curDoorbell,
 			     static_cast<unsigned long long>(doorbells[curDoorbell / 2]));
-			logComputeQueueState("vm: boot", curPipe, curQueue, vmid);
+			logComputeQueueState("vm: boot", curPipe, curQueue, curVmid);
 			return false;
 		}
 		return true;
@@ -999,6 +1003,57 @@ bool RDNA4Compute::vmBootSelfTest() {
 		dumpSetup(" before kick");
 		dumpWindows(" before kick");
 		dumpTables(" before kick");
+		/* F (bit 9): amdgpu's fault handling.  GCVM_L2_CNTL.ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY = 1
+		 * (gfxhub_v12_0.c:248) and GCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR = the dummy page
+		 * (gfxhub_v12_0.c:186-191, amdgpu's adev->dummy_page_addr, a system page), so a
+		 * faulting access is answered from the dummy page instead of stalling its engine.
+		 * With the bit set the address is a SYSTEM address, so the page must be host memory
+		 * that is ours: a zeroed, DMA-mapped page allocated here, scrubbed and freed after.
+		 * (A VRAM page would be read as a host physical address with this bit set.) */
+		IOBufferMemoryDescriptor *fpMem = nullptr;
+		IODMACommand *fpDma = nullptr;
+		uint32_t fpSavedL2 = 0, fpSavedLo = 0, fpSavedHi = 0;
+		bool fpOn = false;
+		if (diag & 512) {
+			uint64_t fpBus = 0;
+			bool fpOk = dmaReady && busMasterSet;
+			if (fpOk) {
+				fpMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+					kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x1000,
+					0x000000fffffff000ull);
+				UInt64 off = 0;
+				IODMACommand::Segment64 seg {};
+				UInt32 nseg = 1;
+				fpDma = IODMACommand::withSpecification(kIODMACommandOutputHost64, 40, 0,
+				                                        IODMACommand::kMapped, 0, 1);
+				fpOk = fpMem && fpDma && fpMem->getBytesNoCopy() &&
+				       fpDma->setMemoryDescriptor(fpMem) == kIOReturnSuccess &&
+				       fpDma->gen64IOVMSegments(&off, &seg, &nseg) == kIOReturnSuccess && nseg == 1 &&
+				       seg.fLength >= 0x1000 && !(seg.fIOVMAddr & 0xfff);
+				if (fpOk) {
+					bzero(fpMem->getBytesNoCopy(), 0x1000);
+					fpMem->performOperation(kIOMemoryIncoherentIOFlush, 0, 0x1000);
+					fpBus = seg.fIOVMAddr;
+				}
+			}
+			if (!fpOk) {
+				RLOG("vm: F: no DMA-mapped dummy page (DMA %s); fault default page left as it was",
+				     dmaReady ? "up" : "not up");
+			} else {
+				trail("vm: F fault default page");
+				fpSavedL2 = rdGc(GcL2Cntl);
+				fpSavedLo = rdGc(GcL2FaultDefaultLo);
+				fpSavedHi = rdGc(GcL2FaultDefaultHi);
+				wr(IpDiscovery::HwGc, GcL2FaultDefaultLo, static_cast<uint32_t>(fpBus >> 12));
+				wr(IpDiscovery::HwGc, GcL2FaultDefaultHi, static_cast<uint32_t>(fpBus >> 44));
+				wr(IpDiscovery::HwGc, GcL2Cntl, fpSavedL2 | kL2DefaultPageToSys);
+				(void)gcHubFlush();
+				fpOn = true;
+				RLOG("vm: F: fault default page = system page bus 0x%llx, L2_CNTL 0x%08x -> 0x%08x "
+				     "(was default addr 0x%08x:%08x)", static_cast<unsigned long long>(fpBus),
+				     fpSavedL2, rdGc(GcL2Cntl), fpSavedHi, fpSavedLo);
+			}
+		}
 		if (forceFail) {
 			/* Test hook (off by default): break the context's range so the
 			 * baseline faults and the diagnostics below run. */
@@ -1029,8 +1084,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 			 * disabled this boot.  A dequeue that times out abandons the rest. */
 			bool abandon = !diag;
 			if (!diag) {
-				RLOG("vm: baseline failed; write diagnostics are off (rdna4-vm-diag=481 runs "
-				     "E4, control, d, e, g, T; 30 runs a, b, c, E2)");
+				RLOG("vm: baseline failed; write diagnostics are off (rdna4-vm-diag=4065 runs "
+				     "F, E4, control, o, V, d, e, g, T; 30 runs a, b, c, E2)");
 			} else if (!hqdStop()) {
 				RLOG("vm: HQD dequeue timed out; diagnostics abandoned");
 				abandon = true;
@@ -1117,23 +1172,29 @@ bool RDNA4Compute::vmBootSelfTest() {
 			}
 
 			/* The queue tests: control (nothing changed), then one change each. */
-			enum { kControl, kA, kB, kC, kE2, kD, kE, kG, kT, kTests };
-			static const uint32_t bitOf[kTests] = { 0, 2, 4, 8, 16, 32, 64, 128, 256 };
+			enum { kControl, kA, kB, kC, kE2, kD, kE, kG, kT, kO, kV, kTests };
+			static const uint32_t bitOf[kTests] = { 0, 2, 4, 8, 16, 32, 64, 128, 256, 1024, 2048 };
 			static const char *const nameOf[kTests] = {
 				" control (no change, fresh pipe)", " variant a (TAP_*_PHYSICAL=1)",
 				" variant b (ctx0 covers tables)", " variant c (MC-form table pointers)",
 				" variant E2 (GC windows := MM)", " variant d (IS_PTE bit 63 on leaf PTEs)",
 				" variant e (no SNOOPED on VRAM PTEs)", " variant g (EXECUTABLE on leaf PTEs)",
-				" variant T (tables built by the CPU in the pool)" };
+				" variant T (tables built by the CPU in the pool)",
+				" variant o (context reprogrammed in amdgpu's order + L2 invalidate)",
+				" variant V (control on VMID 12)" };
 			uint32_t savedWin[4] = {};
 			bool passed[kTests] = {}, ran[kTests] = {};
-			/* Safe PTE-only tests first, hub-writing ones last; slots fill pipe 1 first
-			 * (amdgpu warns about pipes 2/3, amdgpu_gfx.c:289-294): pipe 1 queues 0-2
-			 * (queue 3 is E4's), then pipe 2, pipe 3 last. */
-			static const uint32_t order[kTests] = { kControl, kD, kE, kG, kT, kA, kB, kC, kE2 };
-			static const uint8_t slotPipe[9] = { 1, 1, 1, 2, 2, 2, 2, 3, 3 };
-			static const uint8_t slotQueue[9] = { 0, 1, 2, 0, 1, 2, 3, 0, 1 };
-			uint32_t slot = e4Wedged ? 3 : 0;
+			/* Safe tests first, hub-writing ones last.  GC 12.0.x has only MEC pipes 0-1 with
+			 * queues 0-3 (gfx_v12_0.c:1415-1423; the round-4 control on "pipe 2" aliased the
+			 * kernel ring): pipe 0 queue 0 is the kernel ring, queue 1 the baseline, pipe 1
+			 * queue 3 E4's scratch queue; the tests take pipe 1 queues 0-2, then pipe 0
+			 * queues 2-3, and reuse them round-robin when there are more tests than slots
+			 * (a reused slot that took a fault may show "not serviced", the log says so). */
+			static const uint32_t order[kTests] = { kControl, kO, kV, kD, kE, kG, kT, kA, kB, kC, kE2 };
+			static const uint8_t slotPipe[5] = { 1, 1, 1, 0, 0 };
+			static const uint8_t slotQueue[5] = { 0, 1, 2, 2, 3 };
+			const uint32_t slotFirst = e4Wedged ? 3 : 0, slotCount = 5 - slotFirst;
+			uint32_t slot = 0;
 			for (uint32_t oi = 0; oi < kTests; oi++) {
 				const uint32_t v = order[oi];
 				if (abandon || (v == kControl ? !diag : !(diag & bitOf[v])))
@@ -1201,6 +1262,32 @@ bool RDNA4Compute::vmBootSelfTest() {
 					vmPteClear = v == kE ? GpuVm::kSnooped : 0;
 					if (!buildTables())
 						RLOG("vm: variant: table rebuild failed");
+				} else if (v == kO) {
+					/* The context in the order amdgpu ends up with: disabled, base, range,
+					 * caches invalidated (gfxhub_v12_0_init_cache_regs CNTL2 pulses), then
+					 * enabled (setup_vmid_config writes range and CNTL before any base is
+					 * flushed in by the ring, gmc_v12_0_emit_flush_gpu_tlb). */
+					const uint32_t n = curVmid - 1;
+					const uint32_t cntl = kVmCtxEnable | (GpuVm::kDepth << 1) |
+						((GpuVm::kBlockSize - 9) << 4) | (((1u << 14) - 1) << 10);
+					wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + n }, 0);
+					wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtBaseLo.dword + 2 * n },
+					   static_cast<uint32_t>(GpuVm::encodePde(c.rootPhys, GpuVm::kValid, 0)));
+					wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtBaseHi.dword + 2 * n },
+					   static_cast<uint32_t>(GpuVm::encodePde(c.rootPhys, GpuVm::kValid, 0) >> 32));
+					wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtStartLo.dword + 2 * n }, 0);
+					wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtStartHi.dword + 2 * n }, 0);
+					wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtEndLo.dword + 2 * n }, 0xffffffff);
+					wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtEndHi.dword + 2 * n }, 0xf);
+					wr(IpDiscovery::HwGc, GcL2Cntl2,
+					   rdGc(GcL2Cntl2) | kL2InvalidateL1Tlbs | kL2InvalidateL2Cache);
+					wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + n }, cntl);
+				} else if (v == kV) {
+					/* The same context and tables on another KFD VMID: is VMID 8 special? */
+					curVmid = 12;
+					c.vmid = curVmid;
+					if (!vmContextInit(c))
+						RLOG("vm: variant V: VMID %u context setup failed", curVmid);
 				} else if (v == kT) {
 					/* The same tables written by the CPU through the BAR (amdgpu_vm_cpu
 					 * style + HDP flush) into the CPU-visible pool, no SDMA involved. */
@@ -1213,14 +1300,11 @@ bool RDNA4Compute::vmBootSelfTest() {
 				dumpSetup(tag);
 				if (v == kC || v == kT || v == kD)
 					dumpTables(tag);
-				/* A fresh queue slot for every test: MEC pipes 1-3, queues 0-3. */
-				if (slot >= 9) {
-					RLOG("vm: variant: no queue slot left");
-					break;
-				}
-				curPipe = slotPipe[slot];
-				curQueue = slotQueue[slot];
-				curDoorbell = 0x1a + 2 * (slot + 1);
+				/* A fresh queue slot for every test where the ASIC has one. */
+				const uint32_t si = slotFirst + slot % slotCount;
+				curPipe = slotPipe[si];
+				curQueue = slotQueue[si];
+				curDoorbell = 0x1a + 2 * (si + 1);
 				slot++;
 				ran[v] = true;
 				passed[v] = attempt(tag, false);
@@ -1250,6 +1334,11 @@ bool RDNA4Compute::vmBootSelfTest() {
 					wr(IpDiscovery::HwGc, GcCtx0PtEndLo, savedC0[2]);
 					wr(IpDiscovery::HwGc, GcCtx0PtEndHi, savedC0[3]);
 					(void)gcHubFlush();
+				} else if (v == kV) {
+					wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + curVmid - 1 }, 0);
+					(void)vmInvalidate(curVmid, "variant V restore");
+					curVmid = vmid;
+					c.vmid = vmid;
 				} else if (v == kC || v == kD || v == kE || v == kG || v == kT) {
 					vmPteSet = vmPteClear = 0;
 					vmTableCpu = 0;
@@ -1262,20 +1351,54 @@ bool RDNA4Compute::vmBootSelfTest() {
 				(void)vmInvalidate(vmid, "variant restore");
 			}
 			if (diag) {
-				RLOG("vm: variants (ran/PASS): control %d/%d, a %d/%d, b %d/%d, c %d/%d, E2 %d/%d, d %d/%d, "
+				RLOG("vm: variants (ran/PASS): control %d/%d, o %d/%d, V %d/%d, a %d/%d, b %d/%d, c %d/%d, E2 %d/%d, d %d/%d, "
 				     "e %d/%d, g %d/%d, T %d/%d (baseline failed; runtime stays disabled)",
-				     ran[kControl], passed[kControl], ran[kA], passed[kA], ran[kB], passed[kB],
+				     ran[kControl], passed[kControl], ran[kO], passed[kO], ran[kV], passed[kV], ran[kA], passed[kA], ran[kB], passed[kB],
 				     ran[kC], passed[kC], ran[kE2], passed[kE2], ran[kD], passed[kD], ran[kE], passed[kE],
 				     ran[kG], passed[kG], ran[kT], passed[kT]);
 			}
 			fence = baseFence; data = baseData; clean = baseClean;
+		}
+		if (fpOn) {
+			trail("vm: F restore");
+			wr(IpDiscovery::HwGc, GcL2Cntl, fpSavedL2);
+			wr(IpDiscovery::HwGc, GcL2FaultDefaultLo, fpSavedLo);
+			wr(IpDiscovery::HwGc, GcL2FaultDefaultHi, fpSavedHi);
+			(void)gcHubFlush();
+			RLOG("vm: F: fault default page restored (L2_CNTL 0x%08x); dummy page first dwords 0x%08x 0x%08x",
+			     rdGc(GcL2Cntl), *reinterpret_cast<volatile uint32_t *>(fpMem->getBytesNoCopy()),
+			     *(reinterpret_cast<volatile uint32_t *>(fpMem->getBytesNoCopy()) + 1));
+		}
+		/* The host page goes away only once the hub is idle (nothing can still be
+		 * answered from it): GCVM_L2_STATUS L2_BUSY [0] and CONTEXT_DOMAIN_BUSY [16:1]
+		 * clear, plus a short settle.  If the hub does not go idle the page is kept
+		 * (deliberately leaked until reboot) rather than freed under a live engine. */
+		bool fpHubIdle = true;
+		if (fpOn) {
+			fpHubIdle = false;
+			for (uint32_t ms = 0; ms < 100 && !fpHubIdle; ms++) {
+				fpHubIdle = !(rdGc(GcL2Status) & 0x1ffffu);
+				if (!fpHubIdle)
+					IOSleep(1);
+			}
+			IOSleep(5);
+			RLOG("vm: F: hub %s before the dummy page is released (GCVM_L2_STATUS 0x%08x)",
+			     fpHubIdle ? "idle" : "NOT idle: the page is kept", rdGc(GcL2Status));
+		}
+		if (fpHubIdle) {
+			if (fpDma) {
+				(void)fpDma->clearMemoryDescriptor();
+				fpDma->release();
+			}
+			if (fpMem)
+				fpMem->release();
 		}
 	}
 	if (context && (hqd || !fence)) {
 		trail("vm: HQD dequeue");
 		if (curPipe != pipe || curQueue != queue)
 			RLOG("vm: final dequeue of the last test slot (pipe %u queue %u)", curPipe, curQueue);
-		grbmSelect(1, curPipe, curQueue, vmid);
+		grbmSelect(1, curPipe, curQueue, curVmid);
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
 		inactive = false;
 		for (uint32_t us = 0; us < 100000; us += 10) {
@@ -1354,15 +1477,18 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	for (vmid = 8; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
 	if (vmid > 15)
 		return kIOReturnNoResources;
+	/* GC 12.0.x has one MEC with 2 pipes of 4 queues (gfx_v12_0.c:1415-1423): pipe
+	 * and queue numbers above that alias real slots (round 4: a queue on "pipe 2"
+	 * read back the kernel ring's HQD), so at most 7 client queues exist. */
 	uint32_t pipe = 0, queue = 0;
-	for (; pipe < 4; pipe++) {
-		for (queue = 0; queue < 8; queue++)
+	for (; pipe < 2; pipe++) {
+		for (queue = 0; queue < 4; queue++)
 			if (!(pipe == 0 && queue == 0) && !queueUsed[pipe][queue])
 				break;
-		if (queue < 8)
+		if (queue < 4)
 			break;
 	}
-	if (pipe == 4)
+	if (pipe == 2)
 		return kIOReturnNoResources;
 	uint64_t table = 0;
 	if (!devHeap.size() || !devHeap.alloc(kVmTableBytes, table))

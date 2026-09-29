@@ -668,6 +668,10 @@ void RDNA4Compute::runStages() {
 			pmCapPending = !strncmp(prev, "pm: cap", 7) || !strncmp(prev, "pm: gfxcap", 10);
 			CLOG("the previous boot died during \"%s\": %s is off this boot, everything else runs "
 			     "(the next boot tries it again)", prev, hungFeature);
+			if (!strcmp(hungFeature, "vm"))
+				CLOG("REMINDER: the previous boot died in a vm: step; if rdna4-vm-diag had bit 512 (vm: F) on, "
+				     "the GC hub may still send faulting accesses to a host dummy page that is no longer "
+				     "ours until the kext's gcHubInit runs: do a COLD power cycle before the next boot");
 			env.owner->setProperty("Compute,PreviousHang", prev);
 			hung = false;
 		}
@@ -2498,6 +2502,11 @@ bool RDNA4Compute::hqdInit(bool asKiq) {
 bool RDNA4Compute::hqdInitFor(bool asKiq, uint32_t pipe, uint32_t queue, uint32_t vmid,
 	                            uint64_t mqd, uint64_t eop, uint64_t pq, uint64_t rptr,
 	                            uint64_t wpoll, uint32_t doorbell) {
+	if (pipe >= 2 || queue >= 4) {
+		// GC 12.0.x: one MEC, 2 pipes x 4 queues (gfx_v12_0.c:1415-1423); anything above aliases a real slot.
+		CLOG("hqd: pipe %u queue %u does not exist (2 pipes x 4 queues); refused", pipe, queue);
+		return false;
+	}
 	const uint32_t mqdOff = static_cast<uint32_t>(mqd - pool.mcAddress);
 	const bool rptrCpu = rptr >= pool.mcAddress && rptr < pool.mcAddress + pool.size;
 	const uint32_t rptrOff = rptrCpu ? static_cast<uint32_t>(rptr - pool.mcAddress) : 0;

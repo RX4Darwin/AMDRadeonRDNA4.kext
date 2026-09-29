@@ -140,7 +140,7 @@ restore` step ever hangs, the following boot sends `SetSoftMaxByFreq(GFXCLK,
 looks capped at about 1000 MHz.
 
 8. **W17 VM walker diagnostics (run last, only after boot 2 showed the VM failure).**
-   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=481`
+   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=4065`
    (`set-boot.sh 8`). Boot 2 alone (no `rdna4-vm-diag`) already logs the read-only
    evidence: `vm: E1 after SMU enable / before kick / after fault` (both hubs'
    window and aperture registers), `vm: diag before kick` (context and L2
@@ -150,8 +150,9 @@ looks capped at about 1000 MHz.
    stays set, no fault latches), so every test gets a FRESH queue slot on MEC
    pipes 1-3 (pipe 0 keeps the kernel ring; pipe 1 is filled first, pipe 3 last,
    because amdgpu warns about pipes 2/3, amdgpu_gfx.c:289-294), and the log says
-   whether the MEC serviced the doorbell. Boot 8 (mask 481) runs only tests that
-   write no hub register: `vm: E4` (one IB fetched in VMID 8 from a scratch
+   whether the MEC serviced the doorbell. Boot 8 (mask 4065) first programs amdgpu's fault handling (`vm: F`: the L2
+   default-page-to-system-memory bit plus a DMA-mapped zeroed dummy page of ours, restored
+   at the end), then runs the tests below, which write no other hub register: `vm: E4` (one IB fetched in VMID 8 from a scratch
    privileged VMID0 queue on pipe 1 queue 3, so it cannot wedge compute), then
    `control` (nothing changed, fresh pipe: it must fault like the baseline, or
    the fresh-slot approach itself is not working), `d` (IS_PTE bit 63 on leaf PTEs,
@@ -163,7 +164,7 @@ looks capped at about 1000 MHz.
    LOCAL_FB/LOCAL_SYSMEM, only where they differ): run it only if boot 8 still
    fails everywhere. Each test restores what it changed. The last log line
    `vm: variants (ran/PASS): ...` is the summary. `rdna4-vm-diag` is a bit mask:
-   1 E4, 2 a, 4 b, 8 c, 16 E2, 32 d, 64 e, 128 g, 256 T (481 = boot 8, 30 = boot 16).
+   1 E4, 2 a, 4 b, 8 c, 16 E2, 32 d, 64 e, 128 g, 256 T, 512 F, 1024 o, 2048 V (g and T run on slots that already took a fault: read them only together with the `HQD doorbell control ... consumed / did NOT service` line; after a hang in any `vm:` trail with F on, do a COLD power cycle before the next boot, the next boot logs a REMINDER) (4065 = boot 8, 30 = boot 16). `o`: the VMID 8 context reprogrammed in amdgpu's order plus an L2 invalidate; `V`: the control on VMID 12. GC 12.0.x has only MEC pipes 0-1 with 4 queues each (gfx_v12_0.c:1415-1423): the tests use pipe 1 queues 0-2 and pipe 0 queues 2-3 (E4: pipe 1 queue 3).
    Read: table MISMATCH = tables did not land; E4 PASS = walker and tables fine,
    the VMID 8 HQD is the problem; a variant that PASSes names the fix; control
    passing means the baseline fault was slot-specific. The runtime stays without
