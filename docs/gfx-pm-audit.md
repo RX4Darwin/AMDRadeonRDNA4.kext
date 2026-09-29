@@ -299,3 +299,9 @@ violations with the guard (verified: 0 in the dry runs). The negative case (guar
 - **S3, emulator.** `gfxoff_active` already survives a reset; new options `gfxoff-preset` (every reset leaves the GC
   block powered down) and `smu-preloaded` (the POST-loaded PMFW answers the mailbox from reset on) model "the ASIC kept
   GFXOFF across the restart", and `qom-set /machine/peripheral/rdna4 gfxoff-force` changes it at run time.
+
+### Re-review fixes S5/S6 and the hooks
+
+- **S5:** `gfxOffFlagSet` returns whether the read-back agrees; `gfxOffAllow` does not send `AllowGfxOff` unless the flag read back as 1 (log: "persistent flag could not be written").
+- **S6:** a timed-out `AllowGfxOff` (response 0) is treated as possibly allowed: the flag stays set and `gcState` is Off, so the first GC access goes through the guard and sends `DisallowGfxOff`. Explicit refusals clear the flag as before.
+- **Hooks:** the real Allow needs exactly `rdna4-gfxoff=1` (any other value, e.g. 10, is ignored). `=2` and `=3` are honoured only when CPUID reports a hypervisor (the emulated device); on hardware they log "TEST HOOK ... ignored".

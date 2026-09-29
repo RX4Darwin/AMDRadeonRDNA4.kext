@@ -436,7 +436,9 @@ private:
 	// Persistent "GFXOFF may be allowed" flag in NVRAM (set before AllowGfxOff, cleared
 	// after a successful DisallowGfxOff), read at the next start.
 	static bool gfxOffFlagGet();
-	static void gfxOffFlagSet(bool set);
+	static bool gfxOffFlagSet(bool set);         // true when the read-back agrees
+	static bool runsUnderHypervisor();            // CPUID.1:ECX[31]: the emulated device runs in a VM
+	static uint32_t gfxOffHook();                 // rdna4-gfxoff=2/3, honoured only under a hypervisor
 	void gfxOffPreflight(bool attach);
 	bool gfxOffAllow();
 	void gfxOffProbe();
