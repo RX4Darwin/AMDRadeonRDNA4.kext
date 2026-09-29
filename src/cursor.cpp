@@ -642,8 +642,12 @@ void RDNA4Device::cursorRegProbe(const char *why) {
 // hubp401_program_deadline (dcn401_hubp.c:329) and the kext never did: REG_WRITE(HUBPREQ_DEBUG_DB, 1 << 8),
 // "put DLG in mission mode". The whole register is written, not a bit (DC's REG_WRITE), and only when it does not
 // already hold exactly that; the old value, the new one and a readback are logged. rdna4-cursordlg=0 skips it.
-// This is what DCN401 does for every plane before its pipes are enabled; on the card nothing did it for the
-// GOP-lit pipe, whose cursor path was never brought into mission mode.
+// W35 (W34 review S1): bit 8 is not cursor-only. amdgpu's own comments call it "disable dlg test mode" / "hack mode
+// disable" (dcn20_hubp.c:176, dcn10_hubp.c:129): it takes the whole HUBP request generator, the primary surface
+// included, from the DLG test mode to the mode that follows the programmed DLG/TTU registers, and DC writes it in
+// the same call that programs those registers. So it is written only when the GOP already programmed the DLG
+// (DCN_SURF0_TTU_CNTL0 delivery non-zero) and bit 8 is clear; otherwise the primary plane would start following
+// registers nobody set (underflow / blank, misread as a cursor symptom) and the write is skipped and logged.
 bool RDNA4Device::cursorProgramMissionMode() {
 	uint32_t enable = 1;
 	if (PE_parse_boot_argn("rdna4-cursordlg", &enable, sizeof(enable)) && enable == 0) {
@@ -656,14 +660,19 @@ bool RDNA4Device::cursorProgramMissionMode() {
 		cursorNote("HUBPREQ_DEBUG_DB unreadable (0x%08x): mission mode not written", old);
 		return false;
 	}
-	if (old == kMissionMode) {
-		cursorNote("HUBPREQ_DEBUG_DB is already 0x%08x (1 << 8, DLG mission mode): nothing to write", old);
+	if (old & kMissionMode) {
+		cursorNote("HUBPREQ_DEBUG_DB is already 0x%08x (bit 8 set, DLG mission mode): nothing to write", old);
+		return false;
+	}
+	const uint32_t surf0 = regReadDmu(2, kTtuSurf0Cntl0 + hubpOff()) & kTtuDeliveryMask;
+	if (!surf0) {
+		cursorNote("DLG registers not programmed by the GOP (SURF0_TTU_CNTL0 delivery 0, HUBPREQ_DEBUG_DB 0x%08x); "
+		           "mission mode NOT written", old);
 		return false;
 	}
 	regWriteDmu(2, reg, kMissionMode);
-	cursorNote("HUBPREQ_DEBUG_DB was 0x%08x%s, wrote 0x%08x (DLG mission mode, dcn401_hubp.c:329); reads back 0x%08x",
-	           old, (old & kMissionMode) ? " (bit 8 already set, other bits cleared as DC does)" : "", kMissionMode,
-	           regReadDmu(2, reg));
+	cursorNote("HUBPREQ_DEBUG_DB was 0x%08x (SURF0 delivery 0x%x programmed by the GOP), wrote 0x%08x (DLG mission mode, "
+	           "dcn401_hubp.c:329); reads back 0x%08x", old, surf0, kMissionMode, regReadDmu(2, reg));
 	return true;
 }
 

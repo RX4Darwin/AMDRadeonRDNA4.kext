@@ -16,8 +16,12 @@ combination on this ASIC, so it is now a **secondary opt-in** (`rdna4-cursorttu=
 `hubp401_program_deadline` starts with `REG_WRITE(HUBPREQ_DEBUG_DB, 1 << 8)` ("put DLG in mission mode", `dcn401_hubp.c:329`); `HUBPREQ0_HUBPREQ_DEBUG_DB` is dword `0x05fc`
 (base idx 2, `+ hubpOff()`). The GOP-lit pipe never went through that function. Under `rdna4-cursor=2` the kext now (`cursorProgramMissionMode`, before the cursor lock bracket):
 
-- reads the register; if it is already exactly `0x100` it says so and writes nothing;
-- otherwise writes the whole register (`0x100`, as DC's `REG_WRITE` does), logs `HUBPREQ_DEBUG_DB was 0x... , wrote 0x100 ...; reads back 0x...`;
+- reads the register; if bit 8 is already set it says so and writes nothing;
+- **W35 (W34 review S1): bit 8 is not cursor-only.** amdgpu's own comments call it "disable dlg test mode" / "hack mode disable" (`dcn20_hubp.c:176`, `dcn10_hubp.c:129`): it takes the whole
+  HUBP request generator, the primary surface included, from the DLG test mode to the mode that follows the programmed DLG/TTU registers, and DC writes it in the same call that programs
+  them. So the kext writes it only when the GOP already programmed the DLG (`DCN_SURF0_TTU_CNTL0` delivery non-zero) and bit 8 is clear; otherwise it logs
+  `DLG registers not programmed by the GOP (SURF0_TTU_CNTL0 delivery 0, ...); mission mode NOT written` and skips. A black or corrupt primary after `rdna4-cursor=2` without `rdna4-cursordlg=0` would be caused by this write;
+- when it writes: the whole register (`0x100`, as DC's `REG_WRITE` does), logs `HUBPREQ_DEBUG_DB was 0x... (SURF0 delivery ...), wrote 0x100 ...; reads back ...`;
 - `rdna4-cursordlg=0` skips it (the control: same dumps).
 
 `rdna4-cursor=1` never writes it.
