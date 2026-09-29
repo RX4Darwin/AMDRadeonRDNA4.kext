@@ -164,7 +164,7 @@ void RDNA4Compute::gfxKick(uint64_t wptrDwords) {
 	// gfx_v12_0_ring_set_wptr_gfx with use_doorbell (gfx_v12_0.c:4458): the
 	// wptr shadow above, then the 64-bit doorbell. The MMIO CP_RB0_WPTR path is
 	// gone: it halts PFP/ME on silicon (round 2, R2-2).
-	doorbells[kGfxDoorbellDword / 2] = wptrDwords;
+	{ GcAccess g(*this, 0xdb000000u | kGfxDoorbellDword); doorbells[kGfxDoorbellDword / 2] = wptrDwords; }   // W27
 }
 
 bool RDNA4Compute::gfxFenceWait(uint32_t seq, uint32_t timeoutUs) {

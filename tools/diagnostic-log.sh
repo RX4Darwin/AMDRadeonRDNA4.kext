@@ -42,6 +42,8 @@ GFX_MODE="$(arg_value gfx)"
 HANG_MODE=0
 SLEEPTEST_MODE="$(arg_value sleeptest)"
 GFXPM_MODE="$(arg_value gfxpm)"
+GFXCG_MODE="$(arg_value gfxcg)"
+GFXOFF_MODE="$(arg_value gfxoff)"
 case "$COMPUTE_STAGE" in ''|*[!0-9]*) COMPUTE_STAGE=0;; esac
 case "$IH_MODE" in ''|*[!0-9]*) IH_MODE=0;; esac
 case "$VM_MODE" in ''|*[!0-9]*) VM_MODE=0;; esac
@@ -251,7 +253,7 @@ registry_value() {
 	dmesg | grep -E 'RDNA4FB: power:' || true
 
 	section "dmesg: GFX power-management experiment (rdna4-gfxpm)"
-	dmesg | grep -E 'RDNA4FB: compute: pm:' || echo "(rdna4-gfxpm not enabled or no pm: lines)"
+	dmesg | grep -E 'RDNA4FB: compute: (pm|cg|gfxoff):' || echo "(rdna4-gfxpm/gfxcg/gfxoff not enabled or no such lines)"
 
 	section "dmesg: HW cursor (incl. vm routing + curtest)"
 	klines 'RDNA4FB: cursor:'
@@ -614,6 +616,34 @@ registry_value() {
 		record sensors-pm PASS "$pm_verdict | $pm_gfx"
 	else
 		record sensors-pm FAIL "no power-management sample (kext without kRDNA4MethodSensorsEx?)"
+	fi
+
+	# rdna4-gfxcg: "cg: ..." lines with a sample before and after (SMU average clock,
+	# activity, power). PASS = the enable sequence finished; read the values.
+	if [ -z "$GFXCG_MODE" ]; then
+		record gfxcg SKIPPED "rdna4-gfxcg not enabled"
+	elif dmesg | grep -q 'RDNA4FB: compute: cg: finished'; then
+		cg_before="$(dmesg | grep 'RDNA4FB: compute: pm: cg before:' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
+		cg_after="$(dmesg | grep 'RDNA4FB: compute: pm: cg after (+1.3 s):' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
+		record gfxcg PASS "before $cg_before -> after $cg_after"
+	else
+		record gfxcg FAIL "clock gating did not finish (see the cg: / pm: lines)"
+	fi
+
+	# rdna4-gfxoff: AllowGfxOff at the very end of bring-up, guarded on every GC access.
+	# The sample is SMU-only. "first GC access" is the guard waking GFX; WAKE FAILED is a FAIL.
+	if [ -z "$GFXOFF_MODE" ] || [ "$GFXOFF_MODE" = 0 ]; then
+		record gfxoff SKIPPED "rdna4-gfxoff not enabled"
+	elif dmesg | grep -q 'RDNA4FB: compute: gfxoff:.*WAKE FAILED'; then
+		record gfxoff FAIL "the guard could not wake GFX (see the gfxoff: lines)"
+	elif dmesg | grep -q 'RDNA4FB: compute: gfxoff: 1.5 s after AllowGfxOff'; then
+		go_line="$(dmesg | grep 'RDNA4FB: compute: gfxoff: 1.5 s after AllowGfxOff' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
+		go_wake="no GC access yet"
+		dmesg | grep -q 'RDNA4FB: compute: gfxoff: GFXOFF ended by' && go_wake="the guard woke GFX on a later GC access"
+		dmesg | grep -q 'not a GFXOFF reading' && go_wake="a user-space GC access ended GFXOFF inside the wait: the sample is NOT a GFXOFF reading"
+		record gfxoff PASS "1.5 s after Allow: $go_line; $go_wake"
+	else
+		record gfxoff FAIL "GFXOFF was not allowed (see the gfxoff: lines)"
 	fi
 
 	# rdna4-gfxpm: the experiment logs "pm: <step>: GFXCLK n MHz ..." after each

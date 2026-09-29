@@ -159,6 +159,32 @@ looks capped at about 1000 MHz.
    `rdna4-vm-force-fail` is an emulator-only test hook and is ignored without
    `rdna4-vm-diag`; never set it on the card.
 
+14. **Optional W27 clock gating (`rdna4-gfxcg=15`).**
+    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=24 rdna4-gfxcg=15`.
+    Run it after the round-4 survey boot (7) has shown which engine is busy and CGCG/CGLS are off.
+    After every boot self-test the kext mirrors `gfx_v12_0_update_gfx_clock_gating` (see
+    `docs/gfx-pm-audit.md`, section 9): in RLC safe mode it writes the coarse-grain (CGCG/CGLS and 3D),
+    medium-grain (MGCG), fine-grain (repeater/SRAM FGCG, perf clock) settings and the CP GUI-idle
+    interrupt, one bit each of the mask (1, 2, 4, 8), logging every register old -> new, a survey and SMU
+    activity/power samples before and 0.3 s / 1.3 s after. The `gfxcg` summary row shows the before and
+    after average clock, activity and watts; the success criterion is the power at idle, not the
+    activity percentage. Clock gating persists in the RLC across warm reboots: `rdna4-gfxcg=0` writes
+    amdgpu's disable branch. A hang leaves a `pm: cg ...` trail and the next boot skips only the `pm`
+    feature. To try one step at a time use `rdna4-gfxcg=1`, then 3, 7, 15.
+
+15. **Optional W27 clock gating + GFXOFF (`rdna4-gfxoff=1`).**
+    Boot 14's arguments plus `rdna4-gfxoff=1`. As the very last bring-up step the kext sends
+    `AllowGfxOff`, waits 1.5 s and samples the SMU table only (no GC register access). The `gfxoff`
+    row reports that sample and whether the guard later had to wake GFX. **Guard:** every GC register
+    access (`rd`/`wr` with the GC hardware id) and every doorbell write first goes through `GcAccess`, which
+    sends `DisallowGfxOff` before touching the block if GFXOFF is allowed, and waits for in-flight
+    accesses before an Allow; the wake is sticky until the next boot (the first `rdna4-run selftest`/`bench`
+    wakes GFX for good; `rdna4-run info` and `sensors` are SMU-only and do not, so `sensors-idle` is the
+    GFXOFF reading). If a wake ever fails (`WAKE FAILED` in the log, `gfxoff` FAIL) stop testing this
+    boot and power-cycle. Highest risk of the set: a GC access to a powered-off block can hang the bus,
+    which is why the guard sits in the register accessors themselves. Details in `docs/gfx-pm-audit.md`
+    section 9.
+
 ## Known risks
 
 VMIDs 8-15 use the GC-hub `GCVM_INVALIDATE_ENG17` MMIO path. On this card it

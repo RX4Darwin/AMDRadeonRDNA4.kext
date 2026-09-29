@@ -416,6 +416,31 @@ private:
 	static bool requestedGfxCap(uint32_t &mhz);      // rdna4-gfxcap: false when absent
 	void gfxPmSurvey(const char *tag);
 	void gfxCapApply(uint32_t mhz);
+	// W27: rdna4-gfxoff (GFXOFF allowed at the very end of bring-up, guarded on every
+	// GC access) and rdna4-gfxcg (clock gating), see the comments in compute.cpp.
+	static constexpr SInt32 kGcOn = 0, kGcAllowing = 1, kGcOff = 2;
+	struct GcAccess {
+		const RDNA4Compute &c;
+		explicit GcAccess(const RDNA4Compute &comp, uint32_t what);   // what: (seg << 16) | dword, or 0xdb000000 | doorbell dword
+		~GcAccess();
+	};
+	mutable volatile SInt32 gcState { 0 };      // kGcOn until the end-of-bring-up Allow
+	mutable volatile SInt32 gcBusy { 0 };       // GC accessors inside an access
+	IOLock *gcLock { nullptr };
+	IOLock *smuLock { nullptr };                // serializes the SMU mailbox
+	void gcWake(uint32_t what) const;
+	bool gfxOffAllow();
+	void gfxOffProbe();
+	static bool requestedGfxOff();
+	static constexpr uint32_t kCgStepCoarse = 1, kCgStepMedium = 2, kCgStepFine = 4, kCgStepGuiIdle = 8;
+	static bool requestedGfxCg(uint32_t &mask);
+	bool rlcSafeMode(bool enter);
+	void gfxCgRmw(const GfxReg::Reg &r, const char *name, uint32_t clear, uint32_t set);
+	void gfxCgCoarse(bool enable);
+	void gfxCgMedium(bool enable);
+	void gfxCgFine(bool enable);
+	void gfxCgGuiIdle(bool enable);
+	void gfxCgApply(uint32_t mask);
 	void gfxPmSample(const char *tag);
 	bool gfxPmSoftLimits(uint32_t maxParam, uint32_t minParam, const char *what);
 	void gfxPmExperiment(uint32_t mask);

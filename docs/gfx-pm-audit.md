@@ -222,3 +222,60 @@ Logs `premetal/hw-logs/rdna4fb-diag-20260929-01*.txt` (boot 7 = `...-015441.txt`
 - A `pm: gfxcap` trail is recovered like the W19 cap (the next boot lifts the soft max once). Any boot with a pm
   boot-arg logs a reminder that a soft max survives warm reboots; `set-boot.sh 10` (`rdna4-gfxcap=0`) lifts it.
   A cap-less boot with no pm boot-arg cannot know a cap is in force, so it stays silent by design.
+
+## 9. W27: opt-in clock gating and GFXOFF (`premetal/pm3`)
+
+### rdna4-gfxcg=<mask>
+
+Mirrors amdgpu's late-init clock gating for GC 12.0.1. Source of truth: `amdgpu_device_ip_late_init`
+(`amdgpu_device.c:2772`) -> `gfx_v12_0_set_clockgating_state` (`gfx_v12_0.c:4370-4384`) ->
+`gfx_v12_0_update_gfx_clock_gating` (`gfx_v12_0.c:4342-4366`), with cg_flags CGCG, CGLS, MGCG, 3D CGCG/CGLS,
+REPEATER_FGCG, FGCG, PERF_CLK (`soc24.c:369-381`). The kext applies it after every boot self-test, inside RLC
+safe mode (`amdgpu_gfx_rlc_enter_safe_mode`, `amdgpu_rlc.c:38-53`; `gfx_v12_0_set_safe_mode` writes
+`RLC_SAFE_MODE = CMD | (1 << MESSAGE)` and waits for CMD to clear, `gfx_v12_0.c:4029-4041`; unset writes CMD,
+`:4043-4047`), each register read-modify-write and written only if changed (amdgpu's `def != data`).
+
+| Bit | Step | amdgpu | Registers written (gc_12_0_0_offset.h) |
+|---|---|---|---|
+| 1 | coarse | `update_coarse_grain_clock_gating`, `gfx_v12_0.c:4151-4247` | `RLC_CGTT_MGCG_OVERRIDE` (0x4c48) clear CGCG(3)/CGLS(4)/GFX3D(7); `RLC_CGCG_CGLS_CTRL` (0x4c49) idle threshold 0x36 + CGCG_EN, delay 0xF + CGLS_EN; `RLC_CGCG_CGLS_CTRL_3D` (0x4cc5) same; `CP_RB_WPTR_POLL_CNTL` (0x0f62) 0x00900100; `CP_INT_CNTL` (0x1de9) CMP_BUSY/CNTX_BUSY/CNTX_EMPTY/GFX_IDLE enables; `SDMA0/1_RLC_CGCG_CTRL` (0x0055/0x0655) CGCG_INT_ENABLE |
+| 2 | medium | `update_medium_grain_clock_gating`, `:4268-4300` | `RLC_CGTT_MGCG_OVERRIDE` clear GRBM_CGTT_SCLK(5)/RLC_CGTT_SCLK(1)/GFXIP_MGCG(2) |
+| 4 | fine | `update_repeater_fgcg :4302`, `update_sram_fgcg :4323`, `update_perf_clk :4055` | `RLC_CGTT_MGCG_OVERRIDE` clear REPEATER_FGCG(9)+RLC_REPEATER_FGCG(0), then FGCG(8), then PERFMON_CLOCK_STATE(10) |
+| 8 | gui idle | `gfx_v12_0_enable_gui_idle_interrupt`, `:1909-1935` (ME0 pipe 0 only, `:1874-1886`) | `CP_INT_CNTL_RING0` (0x1e0a) same four bits |
+
+`rdna4-gfxcg=15` is all of them in amdgpu's order; `=0` is the `enable=false` mirror (`:4249-4265`, `:4290-4298`).
+Before/after logging: `cg:` lines per register (old -> new), `pm: cg before` / `cg after (+0.3 s)` / `cg after (+1.3 s)`
+samples and two `pm: survey` blocks. Bounded: the safe-mode wait is 20 ms; if it does not acknowledge, nothing is
+written. Trails `pm: cg ...` (a hang disables only the `pm` feature next boot, never "pm: cap", so no cap recovery is
+triggered).
+
+### rdna4-gfxoff=1 and the GC-access guard
+
+`AllowGfxOff` (0x28, `smu_v14_0_2_ppsmc.h:86`) is sent once, as the very last step of bring-up, only if the kext
+is not inside a GC access (`gfxOffAllow`). The SMU has no `GetGfxOffStatus` message on 14.0.2, so the effect is read
+from the metrics table (SMU only, 1.5 s later). The real-card hazard is a GC register or doorbell access while the
+block is powered down. amdgpu prevents that by keeping GFXOFF disallowed around direct GC accesses
+(`amdgpu_gfx_off_ctrl(adev, false)`, `gfx_v12_0.c:5074,5247,5283`) and allowing it only 100 ms after the last user
+(`amdgpu_gfx.c:925-985`). The kext guarantees it structurally:
+
+1. The kext reaches GC only through `rd()`/`wr()` with the GC hardware id and through four doorbell writes
+   (compute, VM queue, SDMA, gfx ring). `env.mmio` is dereferenced nowhere else in the GC-capable code (grep:
+   `compute.cpp` `rd`, `wr`, `flushHdp`; HDP flush is NBIF). IH uses OSSSYS/DMU registers only, flip uses DMU
+   only, sensors use the SMU mailbox and the pool. All of them therefore either never touch GC or go through
+   the two chokepoints.
+2. Both chokepoints construct a `GcAccess` (compute.cpp, "W27: GFXOFF guard"). It increments `gcBusy`, then
+   checks `gcState`; if GFXOFF is allowed (or being allowed) it decrements, calls `gcWake()` (`DisallowGfxOff`,
+   0x29, which the SMU answers once GFX is powered; retried once) and retries. It proceeds only after seeing
+   `gcState == On` with its increment in place.
+3. `gfxOffAllow()` first sets `gcState = Allowing`, executes a locked instruction (full barrier on x86), waits at
+   most 50 ms for `gcBusy == 0` and only then sends the message; accessors racing in wait on `gcLock`. If anything
+   is still inside, Allow is not sent.
+4. The wake is sticky (until the next boot, or a re-bring-up, which starts with `gcWake()`): GFXOFF covers only the
+   idle window between the end of bring-up and the first GC access. `rdna4-run info`/`sensors` do not end it.
+5. `smuSend` takes `smuLock`, so a wake from any thread cannot interleave with another SMU message.
+6. Not covered, on purpose: interrupt context (nothing there reaches GC) and a failed wake (logged as `WAKE
+   FAILED`; the following access would still be attempted).
+
+Emulator: models the hazard, not the power saving. After `AllowGfxOff` any GC register read/write or doorbell write
+is counted and logged as `GC ... while GFXOFF is allowed (violation N)` (reads return all ones, writes drop); the
+metrics report activity 0 and 8 W while allowed (the model's numbers, not silicon's). The dry run must show zero
+violations with the guard (verified: 0 in the dry runs). The negative case (guard compiled out, expecting violations) was NOT run.
