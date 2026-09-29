@@ -1024,8 +1024,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 			 * disabled this boot.  A dequeue that times out abandons the rest. */
 			bool abandon = !diag;
 			if (!diag) {
-				RLOG("vm: baseline failed; write diagnostics are off (rdna4-vm-diag=0x1ff runs "
-				     "E4, control, a, b, c, E2, d, e, g, T)");
+				RLOG("vm: baseline failed; write diagnostics are off (rdna4-vm-diag=481 runs "
+				     "E4, control, d, e, g, T; 30 runs a, b, c, E2)");
 			} else if (!hqdStop()) {
 				RLOG("vm: HQD dequeue timed out; diagnostics abandoned");
 				abandon = true;
@@ -1038,9 +1038,10 @@ bool RDNA4Compute::vmBootSelfTest() {
 			                              rdGc(GcCtx0PtEndLo), rdGc(GcCtx0PtEndHi) };
 			const uint64_t savedPhys = c.rootPhys, savedMc = c.rootMc;
 
+			bool e4Wedged = false;
 			/* E4: one IB fetched in VMID 8 from a scratch VMID 0 (privileged, like
 			 * amdgpu's kernel compute rings, gfx_v12_0.c:3250-3251) queue on MEC
-			 * pipe 3 queue 3, slot 7's pool area (unused at boot).  Passes: tables
+			 * pipe 1 queue 3, slot 7's pool area (unused at boot).  Passes: tables
 			 * and hub are fine and the fault is HQD-side.  Faults: hub or tables. */
 			if (!abandon && (diag & 1)) {
 				trail("vm: E4 IB probe");
@@ -1062,7 +1063,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 				volatile uint32_t *e4FenceCpu = poolDw(q7 + kVmFence);
 				const uint32_t seq = 0x564d0004;
 				if (queueOk) {
-					e4Hqd = hqdInitFor(false, 3, 3, 0, poolMc(q7 + kVmMqd), poolMc(q7 + kVmEop) >> 8,
+					e4Hqd = hqdInitFor(false, 1, 3, 0, poolMc(q7 + kVmMqd), poolMc(q7 + kVmEop) >> 8,
 					                   poolMc(q7 + kVmPq) >> 8, poolMc(q7 + kVmRptr),
 					                   poolMc(q7 + kVmWptr), db);
 					uint32_t pkt[8];
@@ -1078,7 +1079,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 					}
 				}
 				const uint32_t e4Status = rdGc(GcL2FaultStatusLo);
-				RLOG("vm: E4: IB from a VMID0 queue (pipe 3 queue 3), fetched in VMID %u: mapped %d "
+				RLOG("vm: E4: IB from a VMID0 queue (pipe 1 queue 3), fetched in VMID %u: mapped %d "
 				     "queue %d fence %d data 0x%08x fault status 0x%08x => %s", vmid, mapped, e4Hqd,
 				     e4Fence, *poolDw(dataOff), e4Status,
 				     e4Fence && *poolDw(dataOff) == 0x600df00e && !e4Status
@@ -1087,7 +1088,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 				if (e4Status)
 					logGcFault("vm: E4");
 				if (e4Hqd) {
-					grbmSelect(1, 3, 3, 0);
+					grbmSelect(1, 1, 3, 0);
 					{
 						const uint32_t dbc = rdGc(CpHqdPqDoorbell);
 						RLOG("vm: E4: doorbell control 0x%08x: the MEC %s the doorbell", dbc,
@@ -1103,7 +1104,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 					wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
 					grbmSelect(0, 0, 0, 0);
 					if (!idle)
-						RLOG("vm: E4: scratch queue did not dequeue (pipe 3 stays wedged; not used again)");
+						RLOG("vm: E4: scratch queue did not dequeue (pipe 1 is not used again; tests move to pipe 2)");
+						e4Wedged = true;
 				}
 				gcFaultClear();
 				(void)vmInvalidate(vmid, "E4 clean");
@@ -1120,8 +1122,15 @@ bool RDNA4Compute::vmBootSelfTest() {
 				" variant T (tables built by the CPU in the pool)" };
 			uint32_t savedWin[4] = {};
 			bool passed[kTests] = {}, ran[kTests] = {};
-			uint32_t slot = 0;
-			for (uint32_t v = 0; v < kTests; v++) {
+			/* Safe PTE-only tests first, hub-writing ones last; slots fill pipe 1 first
+			 * (amdgpu warns about pipes 2/3, amdgpu_gfx.c:289-294): pipe 1 queues 0-2
+			 * (queue 3 is E4's), then pipe 2, pipe 3 last. */
+			static const uint32_t order[kTests] = { kControl, kD, kE, kG, kT, kA, kB, kC, kE2 };
+			static const uint8_t slotPipe[9] = { 1, 1, 1, 2, 2, 2, 2, 3, 3 };
+			static const uint8_t slotQueue[9] = { 0, 1, 2, 0, 1, 2, 3, 0, 1 };
+			uint32_t slot = e4Wedged ? 3 : 0;
+			for (uint32_t oi = 0; oi < kTests; oi++) {
+				const uint32_t v = order[oi];
 				if (abandon || (v == kControl ? !diag : !(diag & bitOf[v])))
 					continue;
 				const char *tag = nameOf[v];
@@ -1200,8 +1209,12 @@ bool RDNA4Compute::vmBootSelfTest() {
 				if (v == kC || v == kT || v == kD)
 					dumpTables(tag);
 				/* A fresh queue slot for every test: MEC pipes 1-3, queues 0-3. */
-				curPipe = 1 + slot % 3;
-				curQueue = slot / 3;
+				if (slot >= 9) {
+					RLOG("vm: variant: no queue slot left");
+					break;
+				}
+				curPipe = slotPipe[slot];
+				curQueue = slotQueue[slot];
 				curDoorbell = 0x1a + 2 * (slot + 1);
 				slot++;
 				ran[v] = true;
@@ -1211,6 +1224,9 @@ bool RDNA4Compute::vmBootSelfTest() {
 				if (!hqdStop()) {
 					RLOG("vm: variant: HQD dequeue timed out; the rest is abandoned");
 					abandon = true;
+					hqd = true;    /* still active: the final cleanup retries this slot */
+				} else {
+					hqd = false;
 				}
 				trail("vm: variant restore");
 				if (v == kE2) {
@@ -1252,7 +1268,9 @@ bool RDNA4Compute::vmBootSelfTest() {
 	}
 	if (context && (hqd || !fence)) {
 		trail("vm: HQD dequeue");
-		grbmSelect(1, pipe, queue, vmid);
+		if (curPipe != pipe || curQueue != queue)
+			RLOG("vm: final dequeue of the last test slot (pipe %u queue %u)", curPipe, curQueue);
+		grbmSelect(1, curPipe, curQueue, vmid);
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
 		inactive = false;
 		for (uint32_t us = 0; us < 100000; us += 10) {
