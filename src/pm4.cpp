@@ -16,6 +16,19 @@ uint32_t setUconfigReg(uint32_t *out, uint32_t reg, uint32_t value) {
 	return 3;
 }
 
+uint32_t setContextReg(uint32_t *out, uint32_t offset, uint32_t value) {
+	out[0] = header(OpSetContextReg, 1);
+	out[1] = offset;
+	out[2] = value;
+	return 3;
+}
+
+uint32_t nop(uint32_t *out) {
+	out[0] = header(OpNop, 0);
+	out[1] = 0;
+	return 2;
+}
+
 uint32_t writeData(uint32_t *out, uint64_t addr, uint32_t value) {
 	out[0] = header(OpWriteData, 3);
 	out[1] = kWriteDstMemory | kWriteConfirm;
@@ -23,6 +36,16 @@ uint32_t writeData(uint32_t *out, uint64_t addr, uint32_t value) {
 	out[3] = static_cast<uint32_t>(addr >> 32);
 	out[4] = value;
 	return 5;
+}
+
+uint32_t copyDataRegToMem(uint32_t *out, uint32_t regDword, uint64_t addr) {
+	out[0] = header(OpCopyData, 4);
+	out[1] = (0u << 0) | (5u << 8) | kWriteConfirm;   // src: register, dst: memory, wait for the write
+	out[2] = regDword;
+	out[3] = 0;
+	out[4] = static_cast<uint32_t>(addr) & ~3u;
+	out[5] = static_cast<uint32_t>(addr >> 32);
+	return 6;
 }
 
 // gfx_v12_0_ring_emit_fence: end-of-pipe event with GL2 write-back, then
