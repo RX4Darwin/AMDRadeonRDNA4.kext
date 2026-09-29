@@ -470,6 +470,21 @@ constexpr uint32_t kCursorCmModeShift = 4;
 constexpr uint32_t kCursorCmWorkingBits = (1u << 7) | (1u << 2);
 constexpr uint32_t kDchubGlobalTimerCntl = 0x0527;   // regDCHUBBUB_GLOBAL_TIMER_CNTL (REFDIV [3:0], ENABLE bit 12)
 
+// W32: the cursor request scheduling block (dcn_4_1_0_offset.h, all base idx 2, HUBP0 values, + hubpOff()):
+// HUBPREQ0_DCN_TTU_QOS_WM 0x0621, _GLOBAL_TTU_CNTL 0x0622, _SURF0_TTU_CNTL0/1 0x0623/0x0624,
+// _SURF1_TTU_CNTL0 0x0625, _CUR0_TTU_CNTL0/1 0x0627/0x0628; HUBP0_HUBPREQ_DEBUG_DB 0x05fc, _HUBP_CLK_CNTL 0x05f5;
+// CURSOR0_0_CURSOR_STEREO_CONTROL 0x067f, _MEM_PWR_CTRL/STATUS 0x0681/0x0682; MPCC0_MPCC_TOP_SEL/BOT_SEL/OPP_ID
+// 0x0000/0x0001/0x0002 (base idx 3, stride kMpccStride). CUR0_TTU_CNTL0: REFCYC_PER_REQ_DELIVERY [22:0],
+// QoS_LEVEL_FIXED [27:24], QoS_RAMP_DISABLE [28] (sh_mask:7550-7555); CNTL1: REFCYC_PER_REQ_DELIVERY_PRE [22:0].
+constexpr uint32_t kTtuQosWm = 0x0621, kTtuGlobal = 0x0622, kTtuSurf0Cntl0 = 0x0623, kTtuSurf0Cntl1 = 0x0624;
+constexpr uint32_t kTtuSurf1Cntl0 = 0x0625, kTtuCur0Cntl0 = 0x0627, kTtuCur0Cntl1 = 0x0628;
+constexpr uint32_t kHubpreqDebugDb = 0x05fc, kHubpClkCntl = 0x05f5;
+constexpr uint32_t kCursorStereo = 0x067f, kCursorMemPwrCtrl = 0x0681, kCursorMemPwrStatus = 0x0682;
+constexpr uint32_t kMpccTopSel = 0x0000, kMpccBotSel = 0x0001, kMpccOppId = 0x0002;
+constexpr uint32_t kTtuDeliveryMask = 0x007fffff;
+constexpr uint32_t kTtuQosFixedCur0 = 8;   // dml_display_rq_dlg_calc.c:497 qos_level_fixed_cur0 = 8, ramp not disabled (:500)
+constexpr uint32_t kCursorProbeMax = 10;   // trail budget: arming, self-test, up to three flips, first set/draw calls
+
 uint32_t premultiplyArgb(uint32_t pixel) {
 	const uint32_t alpha = pixel >> 24;
 	if (alpha == 0xff)
@@ -493,6 +508,15 @@ uint32_t premultiplyArgb(uint32_t pixel) {
 // old 2 KiB after 13 lines, so the later shown/hidden states were dropped);
 // a full trail ends in "...(full)" so a cut-off is never mistaken for the end.
 void RDNA4Device::cursorTrailAppend(const char *line) {
+	// The compute thread's flip hook (cursorRegProbe) appends too; the lock exists from initHardwareCursor on.
+	if (cursorTrailLock)
+		IOLockLock(cursorTrailLock);
+	cursorTrailAppendLocked(line);
+	if (cursorTrailLock)
+		IOLockUnlock(cursorTrailLock);
+}
+
+void RDNA4Device::cursorTrailAppendLocked(const char *line) {
 	const size_t n = strlen(line);
 	// One line in ioreg: the lines are joined with " ## " (diagnostic-log.sh splits them).
 	const size_t reserve = 5 + sizeof("...(full)");
@@ -582,6 +606,78 @@ uint32_t RDNA4Device::cursorDstXOffset(uint32_t px) const {
 	return pixelKHz ? static_cast<uint32_t>((static_cast<uint64_t>(px) * cursorRefClkKHz) / pixelKHz) : 0;
 }
 
+// W32 read-only dump (docs/cursor-ttu.md, analysis rank 1/2/3/4/5): the cursor's request scheduling next to the
+// surface's (a CUR0 pair of 0 beside a programmed SURF0 pair is the rank-1 signature), the clock/memory power
+// state of the HUBP and its cursor memory, which DPP/OPP MPCC0 really selects, and three sprite pixels read back
+// from VRAM. Taken at arming, after the self-test programming, after every boot flip (compute thread) and at the
+// first macOS cursor calls: the state seen at the screen, not only the state right after init.
+void RDNA4Device::cursorRegProbe(const char *why) {
+	if (!hwCursorReady || cursorProbeLogs >= kCursorProbeMax)
+		return;
+	cursorProbeLogs++;
+	const uint32_t hubp = hubpOff();
+	const uint32_t mpcc = pipe.hubp < Pipe::kMaxOtg ? pipe.hubp * kMpccStride : 0;
+	cursorNote("%s: ttu: cur0 0x%08x/0x%08x surf0 0x%08x/0x%08x surf1 0x%08x global 0x%08x qos_wm 0x%08x "
+	           "debug_db 0x%08x", why,
+	           regReadDmu(2, kTtuCur0Cntl0 + hubp), regReadDmu(2, kTtuCur0Cntl1 + hubp),
+	           regReadDmu(2, kTtuSurf0Cntl0 + hubp), regReadDmu(2, kTtuSurf0Cntl1 + hubp),
+	           regReadDmu(2, kTtuSurf1Cntl0 + hubp), regReadDmu(2, kTtuGlobal + hubp),
+	           regReadDmu(2, kTtuQosWm + hubp), regReadDmu(2, kHubpreqDebugDb + hubp));
+	// Sprite pixels: first, centre, last of the 64x64 slot (the self-test fills 0xffff00ff).
+	const uint32_t px0 = cursorVram ? cursorVram[0] : 0;
+	const uint32_t pxMid = cursorVram ? cursorVram[(kCursorHeight / 2) * kCursorPitch + kCursorWidth / 2] : 0;
+	const uint32_t pxLast = cursorVram ? cursorVram[kCursorHeight * kCursorPitch - 1] : 0;
+	cursorNote("%s: gate: hubp clk 0x%08x cursor mem pwr 0x%08x/0x%08x stereo 0x%08x | mpcc%u top 0x%08x bot 0x%08x "
+	           "opp 0x%08x | sprite px first/mid/last 0x%08x/0x%08x/0x%08x%s", why,
+	           regReadDmu(2, kHubpClkCntl + hubp), regReadDmu(2, kCursorMemPwrCtrl + hubp),
+	           regReadDmu(2, kCursorMemPwrStatus + hubp), regReadDmu(2, kCursorStereo + hubp),
+	           pipe.hubp, regReadDmu(3, kMpccTopSel + mpcc), regReadDmu(3, kMpccBotSel + mpcc),
+	           regReadDmu(3, kMpccOppId + mpcc), px0, pxMid, pxLast,
+	           cursorHold ? (pxMid == 0xffff00ffu ? " (self-test data ok)" : " (SELF-TEST DATA GONE)") : "");
+}
+
+// W32, rdna4-cursor=2 only (call inside the lock bracket): program the cursor's request scheduling the way DC
+// does from DML, DCN_CUR0_TTU_CNTL0/1 (hubp401_program_deadline dcn401_hubp.c:406-409, _setup_interdependent
+// :473-474). DML (display_mode_core.c:3441-3448, VRatio <= 1, HRatio 1) delivers one cursor request every
+//   CursorRequestDeliveryTime [us] = width / pixel clock [MHz] / cursor_req_per_width,
+//   cursor_req_per_width = ceil(width * 32 bpp / 256 / 8) = 1 for the 64 px slot;
+// dml_display_rq_dlg_calc.c:403-404,486-487 turns it into DCHUB ref cycles times 2^10, with QoS_LEVEL_FIXED 8 and
+// the ramp enabled (:497,:500); the prefetch pair (_PRE) is the same value while VRatioPrefetchY <= 1. The
+// pixel clock is the boot timing's, the ref clock the DCHUB one read at arming. Without a pixel clock the value
+// falls back to the surface's own SURF0 delivery value (the analysis' first cheap test). rdna4-cursorttu=0
+// skips it (the A/B control: same dump, no write).
+bool RDNA4Device::cursorProgramTtu() {
+	uint32_t enable = 1;
+	if (PE_parse_boot_argn("rdna4-cursorttu", &enable, sizeof(enable)) && enable == 0) {
+		cursorNote("rdna4-cursorttu=0: DCN_CUR0_TTU_CNTL0/1 are left alone (control)");
+		return false;
+	}
+	const uint32_t hubp = hubpOff();
+	const uint32_t pixelKHz = bootTimingValid ? bootTiming.pixelClockKHz : 0;
+	uint32_t delivery = 0;
+	const char *source = "";
+	if (pixelKHz) {
+		const uint64_t reqPerWidth = (static_cast<uint64_t>(kCursorWidth) * 32 + 2047) / 2048;
+		delivery = static_cast<uint32_t>((static_cast<uint64_t>(kCursorWidth) * cursorRefClkKHz * 1024) /
+		                                 (static_cast<uint64_t>(pixelKHz) * reqPerWidth));
+		source = "DML: width / pixel clock / req_per_width * ref clock * 2^10";
+	} else {
+		delivery = regReadDmu(2, kTtuSurf0Cntl0 + hubp) & kTtuDeliveryMask;
+		source = "no pixel clock: SURF0_TTU_CNTL0's delivery value copied";
+	}
+	if (!delivery || delivery >= kTtuDeliveryMask) {
+		cursorNote("CUR0 TTU not programmed: no usable delivery value (0x%x from %s)", delivery, source);
+		return false;
+	}
+	const uint32_t cntl0 = delivery | (kTtuQosFixedCur0 << 24);
+	regWriteDmu(2, kTtuCur0Cntl0 + hubp, cntl0);
+	regWriteDmu(2, kTtuCur0Cntl1 + hubp, delivery);
+	cursorNote("CUR0 TTU programmed: CNTL0 0x%08x CNTL1 0x%08x (delivery %u = 0x%x ref cycles * 2^10; pixel clock %u kHz, "
+	           "ref clock %u kHz; %s); reads back 0x%08x/0x%08x", cntl0, delivery, delivery, delivery, pixelKHz,
+	           cursorRefClkKHz, source, regReadDmu(2, kTtuCur0Cntl0 + hubp), regReadDmu(2, kTtuCur0Cntl1 + hubp));
+	return true;
+}
+
 // rdna4-cursor=2: at arming, show an opaque magenta 64x64 square at (100,100)
 // through the same programming path macOS's cursor uses. Whether it appears on the
 // card is a yes/no answer that does not depend on macOS's cursor image (which can
@@ -593,6 +689,7 @@ void RDNA4Device::cursorSelfTest() {
 	// One lock bracket around position and attributes: they latch together at the unlock, so
 	// the square is never armed at (0,0) (the order inside a bracket does not matter).
 	cursorMpcLock(true);
+	cursorProgramTtu();   // W32: DML-style request scheduling for the plane, latched with the rest
 	regWriteDmu(2, kCursorPosition + hubp, 100u | (100u << 15));
 	regWriteDmu(2, kCursorDstOffset + hubp, cursorDstXOffset(100));
 	cursorProgramPlane(true);   // nested: does not touch the lock register
@@ -603,6 +700,7 @@ void RDNA4Device::cursorSelfTest() {
 	cursorDumpState("selftest");
 	cursorHold = true;
 	hwCursorSet = true;
+	cursorRegProbe("selftest");
 }
 
 // One line of everything that decides whether the plane shows: the HUBP
@@ -694,6 +792,8 @@ bool RDNA4Device::initHardwareCursor() {
 	cursorTrail[0] = '\0';
 	cursorTrailLen = 0;
 	cursorTrailFull = false;
+	if (!cursorTrailLock)
+		cursorTrailLock = IOLockAlloc();
 	if (!hwCursorRequested || !isAmd || !ipDiscovery.isValid() || !rmmio ||
 	    !fbPhysBase || !fbLength || pipe.hubp >= Pipe::kMaxOtg) {
 		cursorNote("unavailable (requested %d amd %d discovery %d mmio %d fb 0x%llx+0x%llx hubp %u); "
@@ -792,6 +892,7 @@ bool RDNA4Device::initHardwareCursor() {
 	           regReadDmu(2, kSysApLow + hubp), regReadDmu(2, kSysApHigh + hubp),
 	           regReadDmu(2, kL1TlbCntl + hubp));
 	cursorDumpState("armed");
+	cursorRegProbe("armed");
 	uint32_t mode = 0;
 	if (PE_parse_boot_argn("rdna4-cursor", &mode, sizeof(mode)) && mode == 2)
 		cursorSelfTest();
@@ -816,6 +917,10 @@ void RDNA4Device::freeHardwareCursor() {
 IOReturn RDNA4Device::setHardwareCursor(void *cursorRef) {
 	if (!hwCursorReady || !cursorRef || !cursorStage || !cursorVram)
 		return kIOReturnUnsupported;
+	if (!cursorProbedSet) {   // W32: the plane's state when macOS first talks to it
+		cursorProbedSet = true;
+		cursorRegProbe("first cscSetHardwareCursor");
+	}
 	if (cursorHold) {   // rdna4-cursor=2: keep the test square
 		hwCursorSet = true;
 		if (++cursorHeldCalls <= 3)
@@ -879,6 +984,10 @@ IOReturn RDNA4Device::setHardwareCursor(void *cursorRef) {
 IOReturn RDNA4Device::drawHardwareCursor(int32_t x, int32_t y, uint32_t visible) {
 	if (!hwCursorReady || !hwCursorSet)
 		return kIOReturnUnsupported;
+	if (!cursorProbedDraw) {
+		cursorProbedDraw = true;
+		cursorRegProbe("first cscDrawHardwareCursor");
+	}
 	if (cursorHold) {   // rdna4-cursor=2: the test square stays, macOS's pointer is not programmed
 		hwCursorX = x;
 		hwCursorY = y;

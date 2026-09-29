@@ -1802,6 +1802,10 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 
 RDNA4Device::~RDNA4Device() {
 	freeHardwareCursor();
+	if (cursorTrailLock) {
+		IOLockFree(cursorTrailLock);
+		cursorTrailLock = nullptr;
+	}
 	if (onDieDisc) {
 		IOFree(onDieDisc, 10 << 10);
 		onDieDisc = nullptr;

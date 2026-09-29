@@ -108,6 +108,9 @@ public:
 		uint64_t            scanoutLength;
 		uint64_t            scanoutFrameNs;  // 0 when the display timing is unknown
 		void (*vblankServiceReady)(IOService *framebuffer) { nullptr };
+		// W32: read-only cursor register dump the display device offers (flip.cpp calls it after each flip).
+		void (*cursorProbe)(void *ctx, const char *why) { nullptr };
+		void *cursorProbeCtx { nullptr };
 	};
 
 	enum Stage : uint32_t {

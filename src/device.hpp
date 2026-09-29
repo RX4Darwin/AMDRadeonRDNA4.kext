@@ -86,6 +86,7 @@ public:
 	bool supportsHardwareCursor() const { return hwCursorReady; }
 	IOReturn setHardwareCursor(void *cursorRef);
 	IOReturn drawHardwareCursor(int32_t x, int32_t y, uint32_t visible);
+	void cursorRegProbe(const char *why);   // W32: read-only cursor plane dump (also called from the compute thread after a flip)
 	IOReturn getHardwareCursorDrawState(Ndrv::VDHardwareCursorDrawStateRec &state) const;
 
 	// Shared with the compute bring-up (compute.hpp): the BAR5 mapping and
@@ -219,13 +220,14 @@ private:
 	uint32_t cursorVisChanges { 0 };
 	// Evidence that survives the kernel log wrapping: registry property
 	// RDNA4FB,Cursor (cursor.cpp cursorNote).
-	char cursorTrail[8192] { 0 };
+	char cursorTrail[12288] { 0 };
 	uint16_t cursorTrailLen { 0 };
 	bool cursorTrailFull { false };
 	void cursorNote(const char *fmt, ...) __printflike(2, 3);
 	void cursorDumpState(const char *why);
 	void latchNote(const char *fmt, ...) __printflike(2, 3);   // "latch:" line, also into the cursor trail
 	void cursorTrailAppend(const char *line);
+	void cursorTrailAppendLocked(const char *line);
 	// The MPC cursor lock (CUR_VUPDATE_LOCK_SET<opp>, dc/mpc/dcn10/dcn10_mpc.c:458-463) that
 	// brackets every cursor update in amdgpu; nested calls are counted.
 	void cursorMpcLock(bool lock);
@@ -236,6 +238,12 @@ private:
 	bool cursorGopHeld { false };  // the lock was found held at arming; released at the end of the first bracket
 	void cursorProgramPlane(bool enable);
 	void cursorSelfTest();
+	// W32: cursor request scheduling (DCN_CUR0_TTU_CNTL0/1). cursorRegProbe only reads and is callable from
+	// the compute thread (flip hook); cursorProgramTtu writes, only inside the rdna4-cursor=2 lock bracket.
+	bool cursorProgramTtu();
+	uint32_t cursorProbeLogs { 0 };
+	bool cursorProbedSet { false }, cursorProbedDraw { false };
+	IOLock *cursorTrailLock { nullptr };   // the trail is appended from the display and the compute thread
 	uint32_t cursorDstXOffset(uint32_t px) const;
 	uint32_t cursorRefClkKHz { 50000 };          // DCHUB refclk for CURSOR_DST_X_OFFSET
 	bool cursorHold { false };                   // rdna4-cursor=2: keep the test square, ignore macOS's cursor calls
