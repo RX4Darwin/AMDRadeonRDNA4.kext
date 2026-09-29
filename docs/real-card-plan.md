@@ -90,6 +90,11 @@ separate power-management work.
    64x64 square at (100,100) that macOS's pointer does not replace; see
    `docs/cursor-audit.md` for how to read the result.
 
+6b. **Round 4 draw (W23).** Boot 10 (`rdna4-gfx=2 rdna4-gfxdiag=15`): the gfx golden registers are now written at ring
+   bring-up; if the draw is still empty the ladder re-runs it with one open question changed at a time (USER_SGPR,
+   INST_PREF_SIZE, GS_ALLOC_REQ shader, PS marker store). Boot 11 is the same with `rdna4-gfxgolden=0` (round 3 behaviour)
+   as the A/B control. `docs/gfx-draw-audit.md` lists the suspects and what each log line means.
+
 7. **Optional W19 GFX power-management probe.**
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15`.
    Run it after boots 0-6 (the round-2 idle reading of 300 W / 3.2 GHz is

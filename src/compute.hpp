@@ -387,8 +387,20 @@ private:
 	static constexpr uint32_t kGfxPsOffset    = kGfxOffset + 0x20400;
 	static constexpr uint32_t kGfxTargetOffset = kGfxOffset + 0x40000;   // 256 KiB
 	static constexpr uint32_t kGfxDrawFenceOffset = kGfxTestOffset + 0x20;
+	static constexpr uint32_t kGfxMarkerOffset = kGfxTestOffset + 0x40;   // the PS-store diagnostic marker
 	uint64_t   gfxRings { 0 };               // device-heap offset of the GE rings (0 = none)
 	bool stageGfxDraw();
+	struct GfxDrawResult {
+		bool ok, ringDone;
+		uint32_t drawFence, covered, other, firstNonZero, marker;
+		uint32_t minX, maxX, minY, maxY, row64[2], row190[2];
+		uint64_t ns;
+	};
+	bool gfxDrawRun(const char *label, uint32_t variant, const uint64_t *va, GfxDrawResult &r);
+	void gfxCountTarget(GfxDrawResult &r);
+	void gfxEvidence(const char *tag, bool state);
+	void gfxGoldenInit();
+	static uint32_t requestedGfxDiag();
 	Pm4::Queue gfxRing;
 	uint32_t   gfxFence { 0 };               // last RELEASE_MEM sequence number
 	uint32_t   gfxMode { 0 };                // 0 off, 2 doorbell (the only mode)

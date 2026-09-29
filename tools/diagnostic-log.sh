@@ -20,7 +20,7 @@ REG_RESULTS=""
 STEP_TIMEOUT=120
 STEP_SEQ=0
 : > "$SUMMARY"
-trap 'rm -f "$SUMMARY" "$KLOG" "$STEP_PREFIX"-* "/tmp/rdna4fb-klogfb.$$" "/tmp/rdna4fb-klogfb.$$.raw"' EXIT
+trap 'rm -f "$SUMMARY" "$KLOG" "$STEP_PREFIX"-* "/tmp/rdna4fb-klogfb.$$" "/tmp/rdna4fb-klogfb.$$.raw" "/tmp/rdna4fb-klogfb.$$.err"' EXIT
 
 # The kernel copy is preferred because Recovery's nvram command can return an
 # empty boot-args value while the running kernel still has its arguments.
@@ -74,28 +74,43 @@ section() { echo; echo "=== $1 ==="; }
 # klines PATTERN prints the matching dmesg lines; when dmesg has none it falls
 # back to the same lines from the unified log (log show, read once per run).
 KFB="/tmp/rdna4fb-klogfb.$$"
+# One bounded `log show` attempt: run it in the background and stop it after
+# $1 seconds (macOS has no timeout(1)); the rest of the arguments are log show's.
+# Output goes to $KFB.raw, errors to $KFB.err. Returns 0 when RDNA4FB lines came out.
+klog_try() {
+	local secs="$1" lpid t=0
+	shift
+	: > "$KFB.raw"
+	log show "$@" --style compact --info --debug \
+		--predicate 'eventMessage CONTAINS "RDNA4FB:"' > "$KFB.raw" 2>> "$KFB.err" &
+	lpid=$!
+	while kill -0 "$lpid" 2>/dev/null && [ "$t" -lt "$secs" ]; do
+		sleep 1
+		t=$((t + 1))
+	done
+	if kill -0 "$lpid" 2>/dev/null; then
+		kill "$lpid" 2>/dev/null || true
+		sleep 1
+		kill -9 "$lpid" 2>/dev/null || true
+		echo "log show $* stopped after ${t} s" >> "$KFB.err"
+	fi
+	grep -q 'RDNA4FB:' "$KFB.raw" 2>/dev/null
+}
 klog_fallback() {
 	if [ ! -e "$KFB" ]; then
-		# log show can run for minutes on a big unified log and macOS has no
-		# timeout(1): run it in the background and stop it after 60 s. Whatever it
-		# printed by then is used.
-		local lpid t=0
-		: > "$KFB.raw"
-		log show --last boot --style compact --predicate 'eventMessage CONTAINS "RDNA4FB:"' \
-			> "$KFB.raw" 2>/dev/null &
-		lpid=$!
-		while kill -0 "$lpid" 2>/dev/null && [ "$t" -lt 60 ]; do
-			sleep 1
-			t=$((t + 1))
-		done
-		if kill -0 "$lpid" 2>/dev/null; then
-			kill "$lpid" 2>/dev/null || true
-			sleep 1
-			kill -9 "$lpid" 2>/dev/null || true
-			echo "(log show stopped after ${t} s; the unified-log lines below are partial)" >&2
+		# Round 3: the single `log show --last boot` printed nothing and its error
+		# was thrown away. Try the boot, then the last hour, then everything the
+		# store still holds (20 s each), and keep log show's own messages so an
+		# empty result says why.
+		: > "$KFB.err"
+		if klog_try 20 --last boot || klog_try 20 --last 1h || klog_try 20; then
+			grep 'RDNA4FB:' "$KFB.raw" > "$KFB"
+		else
+			: > "$KFB"
+			echo "# log show fallback found no RDNA4FB lines (no unified-log store in this environment?):" >> "$KFB"
+			head -5 "$KFB.err" | sed 's/^/# /' >> "$KFB"
 		fi
-		grep 'RDNA4FB:' "$KFB.raw" > "$KFB" 2>/dev/null || : > "$KFB"
-		rm -f "$KFB.raw"
+		rm -f "$KFB.raw" "$KFB.err"
 	fi
 	cat "$KFB"
 }

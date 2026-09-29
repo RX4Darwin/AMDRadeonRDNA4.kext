@@ -438,6 +438,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 #define REG_GFX_SPI_SHADER_GS_OUT_CONFIG_PS GFX12_SH_DW(0x2c31)
 #define REG_GFX_SPI_SHADER_PGM_RSRC4_PS GFX12_SH_DW(0x2c07)
 #define REG_GFX_SPI_SHADER_PGM_LO_PS GFX12_SH_DW(0x2c08)
+#define REG_GFX_SPI_SHADER_PGM_RSRC2_PS GFX12_SH_DW(0x2c0b)
+#define REG_GFX_SPI_SHADER_USER_DATA_PS_0 GFX12_SH_DW(0x2c0c)
+#define REG_GFX_SPI_SHADER_USER_DATA_PS_1 GFX12_SH_DW(0x2c0d)
+/* amdgpu golden registers (gfx_v12_0.c:253-261): DB_MEM_CONFIG, CB_HW_CONTROL_1 (GC seg 0), GL2C_CTRL5 (seg 1). */
+#define REG_GFX_DB_MEM_CONFIG     GC_SEG0(0x13d2)
+#define REG_GFX_CB_HW_CONTROL_1   GC_SEG0(0x1425)
+#define REG_GFX_GL2C_CTRL5        GC_SEG1(0x2e19)
 #define REG_GFX_SPI_SHADER_PGM_HI_PS GFX12_SH_DW(0x2c09)
 #define REG_GFX_SPI_SHADER_RSRC1_PS GFX12_SH_DW(0x2c0a)
 #define REG_GFX_SPI_SHADER_RSRC2_PS GFX12_SH_DW(0x2c0b)
@@ -604,6 +611,8 @@ struct RDNA4State {
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
     bool     cursor_reject_logged;
     uint32_t gfx_break;      /* corrupt one G3 MUST register at draw time */
+    bool     gfx_golden_strict; /* refuse a draw when the amdgpu golden registers are unset (gfx-golden-strict) */
+    bool     gfx_golden_warned;
     bool     gfx_trace;      /* trace G3 vertices and effective scissors */
 
     uint32_t *regs;           /* BAR5 image, RDNA4_MMIO_SIZE bytes */
@@ -4524,6 +4533,32 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                 if ((w->exec >> lane) & 1u)
                     w->v[dst][lane] = rdna4_gfx_vsrc(w, dw & 0x1ff, lane, dw1);
             }
+            if ((dw & 0x1ffu) == 0xffu)                      /* a literal follows */
+                n = 2;
+        } else if ((dw & 0xff000000u) == 0xee000000u && ((dw >> 14) & 0x7f) == 0x1a) {
+            /* VGLOBAL global_store_b32 vaddr, vdata, saddr (96-bit form, encodings
+             * taken from llvm-mc -mcpu=gfx1201): dw0 [6:0] saddr, dw1 [30:23] vdata,
+             * dw2 [7:0] vaddr (32-bit offset added to the SGPR-pair base). The PS
+             * diagnostic variant (shaders/psstore.s) stores a marker with it. */
+            uint32_t saddr = dw & 0x7f, vdata = (dw1 >> 23) & 0xff, vaddr = dw2 & 0xff;
+            uint64_t base;
+
+            if (saddr >= 106 || (dw2 & 0x00ffff00u))
+                goto unknown;
+            base = (uint64_t)w->s[saddr] | ((uint64_t)w->s[saddr + 1] << 32);
+            for (unsigned lane = 0; lane < 32; lane++) {
+                if ((w->exec >> lane) & 1u) {
+                    uint32_t value = w->v[vdata][lane];
+
+                    if (!rdna4_gfx_mem_write(s, base + w->v[vaddr][lane], &value,
+                                             sizeof(value), vmid)) {
+                        fprintf(stderr, "rdna4: gfx: PS global_store to 0x%" PRIx64 " faulted\n",
+                                base + w->v[vaddr][lane]);
+                        return false;
+                    }
+                }
+            }
+            n = 3;
         } else if ((dw & 0xffff0000u) == 0xf8000000u) {     /* EXPORT */
             uint32_t target = (dw >> 4) & 0x3f;
             uint32_t enable = dw & 0xf;
@@ -4662,6 +4697,33 @@ static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
     uint32_t stages, ena, addr, col, info, attrib3, vte, cbcc, target, shader;
     uint32_t ses, pos_bytes, prim_bytes;
 
+    /* amdgpu programs the 3D pipeline's golden registers before it starts the CP
+     * (gfx_v12_0_init_golden_registers, gfx_v12_0.c:3671-3690): DB_MEM_CONFIG
+     * bit 15 always, and for rev_id 0 DB_MEM_CONFIG[3:0]=0xf, CB_HW_CONTROL_1[25:24]=3,
+     * GL2C_CTRL5[6:4]=2. rev_id is the NBIF strap (nbif_v6_3_1_get_rev_id,
+     * RCC_STRAP0 [27:24]; the model's strap reads 0). Whether the silicon draws
+     * without them is not known: the round-3 card did not draw and had none, so the
+     * model reports the omission; gfx-golden-strict=on refuses the draw. */
+    {
+        uint32_t rev_id = (reg_get(s, (0xd20 + 0x21) * 4) >> 24) & 0xf;
+        uint32_t db = reg_get(s, REG_GFX_DB_MEM_CONFIG);
+        uint32_t cb = reg_get(s, REG_GFX_CB_HW_CONTROL_1);
+        uint32_t gl2 = reg_get(s, REG_GFX_GL2C_CTRL5);
+        bool golden = (db & 0x8000) &&
+            (rev_id != 0 || ((db & 0xf) == 0xf && ((cb >> 24) & 3) == 3 && ((gl2 >> 4) & 7) == 2));
+
+        if (!golden) {
+            if (!s->gfx_golden_warned) {
+                fprintf(stderr, "rdna4: gfx: draw without the amdgpu golden registers "
+                        "(rev_id %u: DB_MEM_CONFIG 0x%08x CB_HW_CONTROL_1 0x%08x GL2C_CTRL5 0x%08x)\n",
+                        rev_id, db, cb, gl2);
+                s->gfx_golden_warned = true;
+            }
+            if (s->gfx_golden_strict)
+                return rdna4_gfx_draw_refuse(s, "golden registers",
+                                             "gfx_v12_0_init_golden_registers was not applied");
+        }
+    }
     if (count == 0 || count > 30)
         return rdna4_gfx_draw_refuse(s, "INDEX_COUNT", "count is not modelled (1..30)");
     if (s->gfx_num_instances != 1)
@@ -4777,6 +4839,17 @@ static bool rdna4_gfx_ps_wave(RDNA4State *s, const RDNA4GfxTriangle *tri,
     (void)target;
 
     w.pc = pgm;
+    /* The user SGPRs the driver asked for (RSRC2_PS.USER_SGPR [5:1]) arrive as
+     * s0.. from SPI_SHADER_USER_DATA_PS_n: the diagnostic PS takes a memory
+     * address there. */
+    {
+        uint32_t nuser = (reg_get(s, REG_GFX_SPI_SHADER_PGM_RSRC2_PS) >> 1) & 0x1f;
+
+        if (nuser > 0)
+            w.s[0] = reg_get(s, REG_GFX_SPI_SHADER_USER_DATA_PS_0);
+        if (nuser > 1)
+            w.s[1] = reg_get(s, REG_GFX_SPI_SHADER_USER_DATA_PS_1);
+    }
     w.exec = count == 32 ? UINT32_MAX : ((1u << count) - 1u);
     for (unsigned lane = 0; lane < count; lane++) {
         float area = (float)rdna4_gfx_edge(
@@ -6748,6 +6821,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_UINT32("warm-gop-delay-ms", RDNA4State, warm_gop_delay_ms,
                        RDNA4_WARM_GOP_DELAY_MS_DEFAULT),
     DEFINE_PROP_UINT32("gfx-break", RDNA4State, gfx_break, 0),
+    DEFINE_PROP_BOOL("gfx-golden-strict", RDNA4State, gfx_golden_strict, false),
     DEFINE_PROP_BOOL("gfx-trace", RDNA4State, gfx_trace, false),
 };
 

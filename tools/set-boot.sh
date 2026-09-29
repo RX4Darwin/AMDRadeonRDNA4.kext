@@ -1,7 +1,7 @@
 #!/bin/bash
 # Set the boot-args for one boot of docs/real-card-plan.md on the OpenCore USB.
 #
-#   bash /Volumes/OPENCORE/set-boot.sh <0-9>
+#   bash /Volumes/OPENCORE/set-boot.sh <0-11>
 #
 #   0  this morning's known-good arguments (no new feature enabled)
 #   1  + interrupts and W6 opt-in            rdna4-ih=1 rdna4-hang=1
@@ -15,6 +15,8 @@
 #      GFXCLK soft limits, then caps GFXCLK at 1000 MHz for one sample and lifts it)
 #   8  W17 VM walker diagnostics            rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31
 #   9  optional: cursor self-test: boot 6 with rdna4-cursor=2 (a magenta 64x64 square at (100,100), macOS pointer ignored)
+#  10  round 4 draw: boot 5 with the golden registers (default) and the rdna4-gfxdiag=15 ladder if the draw is empty
+#  11  round 4 A/B control: boot 10 with rdna4-gfxgolden=0 (no golden registers, as in round 3)
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
 # the one the next boot uses. A copy of the config is kept next to it first.
@@ -31,7 +33,9 @@ case "${1:-}" in
 	7) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15" ;;
 	8) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31" ;;
 	9) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-hang=1" ;;
-	*) echo "usage: bash $0 <0-9>   (see docs/real-card-plan.md)"; exit 1 ;;
+	10) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-gfxdiag=15 rdna4-hang=1" ;;
+	11) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-gfxgolden=0 rdna4-gfxdiag=15 rdna4-hang=1" ;;
+	*) echo "usage: bash $0 <0-11>   (see docs/real-card-plan.md)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"

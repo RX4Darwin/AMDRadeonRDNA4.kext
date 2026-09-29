@@ -26,6 +26,17 @@ struct Reg {
 // --- GC: GRBM / CP / RLC / IMU ------------------------------------------------
 constexpr Reg GrbmStatus          { 0, 0x0da4 };
 constexpr Reg GrbmStatus2         { 0, 0x0da2 };
+constexpr Reg GrbmStatusSe0       { 0, 0x0da5 };
+constexpr Reg GrbmStatusSe1       { 0, 0x0da6 };
+constexpr Reg GrbmStatusSe2       { 0, 0x0dae };
+constexpr Reg GrbmStatusSe3       { 0, 0x0daf };
+constexpr Reg SpiDebugBusy        { 0, 0x11f0 };
+// gfx_v12_0 golden registers (gfx_v12_0.c:253-261): DB_MEM_CONFIG, CB_HW_CONTROL_1.
+constexpr Reg DbMemConfig         { 0, 0x13d2 };
+constexpr Reg CbHwControl1        { 0, 0x1425 };
+// amdgpu rev_id (nbif_v6_3_1_get_rev_id): RCC_STRAP0_RCC_DEV0_EPF0_STRAP0 (NBIF seg 2;
+// 0x0021 in nbio_6_3_2_offset.h, whose RCC_CONFIG_MEMSIZE 0x00c3 matches ours) bits [27:24].
+constexpr Reg NbifStrap0          { 2, 0x0021 };
 constexpr Reg CpStat              { 0, 0x0f40 };
 constexpr Reg CpCpcStatus         { 0, 0x0e24 };
 constexpr Reg CpCpfStatus         { 0, 0x0e27 };

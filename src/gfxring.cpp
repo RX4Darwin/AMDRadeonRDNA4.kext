@@ -32,8 +32,10 @@
 #include "compute.hpp"
 #include "gfx12_draw.h"
 #include "ngg_kernel.h"
+#include "nggmsg_kernel.h"
 #include "pm4.hpp"
 #include "psred_kernel.h"
+#include "psstore_kernel.h"
 
 #include "amdgpu/clearstate_defs.h"
 #include "amdgpu/clearstate_gfx12.h"
@@ -219,6 +221,7 @@ bool RDNA4Compute::stageGfxRing() {
 	     rdGc(CpMeCntl), rdGc(CpStat), rdGc(CpPfpInstrPntr), rdGc(CpMeInstrPntr));
 	if (!doorbells)
 		return finish(false, "doorbell mode without the doorbell BAR");
+	gfxGoldenInit();   // amdgpu's 3D-pipeline golden registers, before the CP starts
 	trail("gfx: clear state + ring");
 	if (!gfxCsbInit())
 		return finish(false, "clear-state buffer");
@@ -307,6 +310,307 @@ bool RDNA4Compute::stageGfxRing() {
 	return finish(true, "gfx ring");
 }
 
+// gfx_v12_0_init_golden_registers (gfx_v12_0.c:3671-3690): the 3D-pipeline
+// settings amdgpu writes before it enables the CP and the kext never wrote.
+//   golden_settings_gc_12_0 (12.0.0 and 12.0.1): DB_MEM_CONFIG mask 0x8000 = 0x8000;
+//   golden_settings_gc_12_0_rev0 (rev_id 0 only): DB_MEM_CONFIG mask 0xf = 0xf,
+//   CB_HW_CONTROL_1 mask 0x03000000 = 0x03000000, GL2C_CTRL5 mask 0x70 = 0x20
+// (gfx_v12_0.c:253-261). soc15_program_register_sequence: value = old & ~mask |
+// (or & mask). amdgpu's rev_id is not the PCI revision byte: nbif_v6_3_1_get_rev_id
+// reads STRAP_ATI_REV_ID from RCC_STRAP0_RCC_DEV0_EPF0_STRAP0 [27:24]; that is what
+// decides the rev0 set here, with the PCI revision logged next to it. If the strap
+// cannot be read only the unconditional set is applied. The round-3 draw (covered 0)
+// ran without any of these.
+void RDNA4Compute::gfxGoldenInit() {
+	// rdna4-gfxgolden=0 leaves them out again: the A/B control for a card that does
+	// not draw (the golden set is the fix under test in round 4).
+	uint32_t useGolden = 1;
+	if (PE_parse_boot_argn("rdna4-gfxgolden", &useGolden, sizeof(useGolden)) && useGolden == 0) {
+		GLOG("golden: skipped by rdna4-gfxgolden=0");
+		return;
+	}
+	const uint32_t strap = rd(IpDiscovery::HwNbif, NbifStrap0);
+	const uint32_t rev = strap == 0xffffffffu ? 0xff : (strap >> 24) & 0xf;
+	const uint32_t pciRev = env.pci ? env.pci->configRead8(kIOPCIConfigRevisionID) : 0xff;
+	struct Golden { const char *name; Reg reg; uint32_t mask, value; bool rev0Only; };
+	const Golden table[] = {
+		{ "DB_MEM_CONFIG",   DbMemConfig,   0x00008000, 0x00008000, false },
+		{ "DB_MEM_CONFIG",   DbMemConfig,   0x0000000f, 0x0000000f, true },
+		{ "CB_HW_CONTROL_1", CbHwControl1,  0x03000000, 0x03000000, true },
+		{ "GL2C_CTRL5",      Gl2cCtrl5,     0x00000070, 0x00000020, true },
+	};
+	GLOG("golden: NBIF STRAP0 0x%08x -> rev_id %u (PCI revision 0x%02x): %s", strap, rev, pciRev,
+	     rev == 0 ? "golden_settings_gc_12_0 and _rev0 apply" : "golden_settings_gc_12_0 only");
+	trail("gfx: golden registers");
+	grbmSelect(0, 0, 0, 0);
+	for (const Golden &g : table) {
+		if (g.rev0Only && rev != 0)
+			continue;
+		const uint32_t before = rdGc(g.reg);
+		if (before == 0xffffffff) {
+			GLOG("golden: %s unreadable, skipped", g.name);
+			continue;
+		}
+		const uint32_t after = (before & ~g.mask) | (g.value & g.mask);
+		wr(IpDiscovery::HwGc, g.reg, after);
+		GLOG("golden: %s (mask 0x%08x value 0x%08x): 0x%08x -> 0x%08x, reads back 0x%08x", g.name,
+		     g.mask, g.value, before, after, rdGc(g.reg));
+	}
+}
+
+uint32_t RDNA4Compute::requestedGfxDiag() {
+	uint32_t mask = 0;
+	if (!PE_parse_boot_argn("rdna4-gfxdiag", &mask, sizeof(mask)))
+		return 0;
+	return mask & 0x1f;   // bits 1,2,4,8 = variants, 16 = run them even if the baseline passed
+}
+
+namespace {
+
+// The registers the stream writes, by name, for the after-the-draw readback. SH
+// registers are GC segment 0 (dword = header value), context registers segment 1;
+// all values from gc_12_0_0_offset.h. A register that reads back different from what
+// the stream wrote (see gfx12_draw.h) did not latch.
+struct StateReg { const char *name; Reg reg; };
+const StateReg kShState[] = {
+	{ "PGM_LO_ES",  { 0, 0x1a29 } }, { "PGM_HI_ES",  { 0, 0x1a26 } },
+	{ "RSRC1_GS",   { 0, 0x1a2a } }, { "RSRC2_GS",   { 0, 0x1a2b } }, { "RSRC4_GS", { 0, 0x1a28 } },
+	{ "PGM_LO_PS",  { 0, 0x19a8 } }, { "PGM_HI_PS",  { 0, 0x19a9 } },
+	{ "RSRC1_PS",   { 0, 0x19aa } }, { "RSRC2_PS",   { 0, 0x19ab } }, { "RSRC4_PS", { 0, 0x19a7 } },
+	{ "USERDATA_PS0", { 0, 0x19ac } }, { "USERDATA_PS1", { 0, 0x19ad } },
+};
+const StateReg kCtxState[] = {
+	{ "VGT_SHADER_STAGES_EN", { 1, 0x02a6 } }, { "VGT_PRIMITIVE_TYPE", { 1, 0x2242 } },
+	{ "CB_TARGET_MASK",  { 1, 0x0214 } }, { "CB_SHADER_MASK", { 1, 0x0215 } },
+	{ "CB_COLOR_CONTROL", { 1, 0x0216 } }, { "CB_COLOR0_BASE", { 1, 0x0318 } },
+	{ "CB_COLOR0_ATTRIB", { 1, 0x031b } }, { "CB_COLOR0_ATTRIB2", { 1, 0x031e } },
+	{ "CB_COLOR0_ATTRIB3", { 1, 0x031f } }, { "CB_COLOR0_INFO", { 1, 0x03b0 } },
+	{ "SPI_SHADER_POS_FORMAT", { 1, 0x0193 } }, { "SPI_SHADER_COL_FORMAT", { 1, 0x0195 } },
+	{ "SPI_PS_INPUT_ENA", { 1, 0x0197 } }, { "SPI_PS_INPUT_ADDR", { 1, 0x0198 } },
+	{ "DB_SHADER_CONTROL", { 1, 0x001b } }, { "DB_RENDER_CONTROL", { 1, 0x0000 } },
+	{ "PA_CL_VTE_CNTL", { 1, 0x0205 } }, { "PA_SU_SC_MODE_CNTL", { 1, 0x0207 } },
+	{ "PA_SC_SCREEN_SCISSOR_TL", { 1, 0x0060 } }, { "PA_SC_SCREEN_SCISSOR_BR", { 1, 0x0061 } },
+	{ "PA_SC_VPORT_SCISSOR_0_TL", { 1, 0x0094 } }, { "PA_SC_VPORT_SCISSOR_0_BR", { 1, 0x0095 } },
+	{ "GE_POS_RING_BASE", { 1, 0x2268 } }, { "GE_POS_RING_SIZE", { 1, 0x2269 } },
+	{ "GE_PRIM_RING_BASE", { 1, 0x226a } }, { "GE_PRIM_RING_SIZE", { 1, 0x226b } },
+};
+
+// The packet in `stream` that sets register `reg` (offset within the SET_SH_REG or
+// SET_CONTEXT_REG range) and the index of its value, or -1: how the diagnostic
+// variants patch one register in the IB copy without regenerating the stream.
+int findStreamReg(const uint32_t *stream, uint32_t dwords, uint32_t opcode, uint32_t reg) {
+	for (uint32_t i = 0; i < dwords;) {
+		const uint32_t h = stream[i];
+		if ((h >> 30) != 3) {
+			i++;
+			continue;
+		}
+		const uint32_t op = (h >> 8) & 0xff, count = ((h >> 16) & 0x3fff) + 1;
+		if (op == opcode && i + 1 + count <= dwords) {
+			const uint32_t start = stream[i + 1];
+			for (uint32_t k = 0; k + 1 < count; k++)
+				if (start + k == reg)
+					return static_cast<int>(i + 2 + k);
+		}
+		i += 1 + count;
+	}
+	return -1;
+}
+
+constexpr uint32_t kOpSetShReg = 0x76, kOpSetContextReg = 0x69;
+constexpr uint32_t kShBase = 0x19a0, kMarkerValue = 0xc0de0001;
+
+} // namespace
+
+// What round 4 needs to see: the engine status right after the draw, and the pipeline
+// state as the hardware holds it (context and SH registers read back over MMIO).
+void RDNA4Compute::gfxEvidence(const char *tag, bool state) {
+	grbmSelect(0, 0, 0, 0);
+	GLOG("%s: GRBM 0x%08x GRBM2 0x%08x SE0-3 0x%08x/0x%08x/0x%08x/0x%08x SPI_BUSY 0x%08x", tag,
+	     rdGc(GrbmStatus), rdGc(GrbmStatus2), rdGc(GrbmStatusSe0), rdGc(GrbmStatusSe1),
+	     rdGc(GrbmStatusSe2), rdGc(GrbmStatusSe3), rdGc(SpiDebugBusy));
+	GLOG("%s: CP_STAT 0x%08x RB0 rptr 0x%x wptr 0x%x (driver %llu), draw fence 0x%x, ring fence 0x%x/%u",
+	     tag, rdGc(CpStat), rdGc(CpRb0Rptr), rdGc(CpRb0Wptr),
+	     static_cast<unsigned long long>(gfxRing.wptr()), *poolDw(kGfxDrawFenceOffset),
+	     *poolDw(kGfxFenceOffset), gfxFence);
+	logGcFault(tag);
+	if (!state)
+		return;
+	char line[240];
+	uint32_t n = 0;
+	auto flush = [&](const char *what) {
+		if (n) {
+			GLOG("%s: %s: %s", tag, what, line);
+			n = 0;
+		}
+	};
+	line[0] = '\0';
+	for (const StateReg &r : kShState) {
+		n += snprintf(line + n, sizeof(line) - n, "%s=0x%08x ", r.name, rdGc(r.reg));
+		if (n > 150)
+			flush("SH");
+	}
+	flush("SH");
+	for (const StateReg &r : kCtxState) {
+		n += snprintf(line + n, sizeof(line) - n, "%s=0x%08x ", r.name, rdGc(r.reg));
+		if (n > 150)
+			flush("CTX");
+	}
+	flush("CTX");
+}
+
+// Count the target: pixels equal to the expected colour, other non-zero pixels, and
+// the bounds of the covered ones (the stage-G3 check).
+void RDNA4Compute::gfxCountTarget(GfxDrawResult &r) {
+	using namespace Gfx12Draw;
+	r.covered = r.other = 0;
+	r.minX = kWidth; r.maxX = 0; r.minY = kHeight; r.maxY = 0;
+	r.row64[0] = kWidth; r.row64[1] = 0; r.row190[0] = kWidth; r.row190[1] = 0;
+	r.firstNonZero = 0xffffffffu;
+	for (uint32_t y = 0; y < kHeight; y++) {
+		for (uint32_t x = 0; x < kWidth; x++) {
+			const uint32_t p = *poolDw(kGfxTargetOffset + 4 * (y * kWidth + x));
+			if (p == kCoveredRgba) {
+				r.covered++;
+				r.minX = x < r.minX ? x : r.minX;
+				r.maxX = x > r.maxX ? x : r.maxX;
+				r.minY = y < r.minY ? y : r.minY;
+				r.maxY = y > r.maxY ? y : r.maxY;
+				uint32_t *span = y == 64 ? r.row64 : y == 190 ? r.row190 : nullptr;
+				if (span) {
+					span[0] = x < span[0] ? x : span[0];
+					span[1] = x > span[1] ? x : span[1];
+				}
+			} else if (p) {
+				r.other++;
+				if (r.firstNonZero == 0xffffffffu)
+					r.firstNonZero = y * kWidth + x;
+			}
+		}
+	}
+	// notes 3.9: 8192 pixels, rows 64..190, row 64 = x 64..191, row 190 = x 127..128.
+	r.ok = r.covered == kCoveredPixels && !r.other && r.minY == 64 && r.maxY == 190 &&
+	       r.row64[0] == 64 && r.row64[1] == 191 && r.row190[0] == 127 && r.row190[1] == 128;
+}
+
+// One draw of the stream into the cleared target, with the diagnostic variant
+// `variant` (a bit set of rdna4-gfxdiag: 1 = one user SGPR on the NGG stage, 2 =
+// INST_PREF_SIZE like Mesa, 4 = the GS_ALLOC_REQ NGG shader, 8 = a pixel shader that
+// stores a marker to memory first). 0 is the plain stream. `va` are the addresses
+// the stream's relocations take.
+bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_t *va, GfxDrawResult &r) {
+	using namespace Gfx12Draw;
+	memset(&r, 0, sizeof(r));
+
+	// Shaders, each followed by s_code_end padding for the SQ's prefetch.
+	auto place = [&](uint32_t at, const uint32_t *code, uint32_t dwords) {
+		for (uint32_t i = 0; i < 0x100; i++)
+			*poolDw(at + 4 * i) = i < dwords ? code[i] : 0xbf9f0000u;   // s_code_end
+	};
+	if (variant & 4)
+		place(kGfxVsOffset, kNggmsgKernel, sizeof(kNggmsgKernel) / 4);
+	else
+		place(kGfxVsOffset, kNggKernel, sizeof(kNggKernel) / 4);
+	if (variant & 8)
+		place(kGfxPsOffset, kPsstoreKernel, sizeof(kPsstoreKernel) / 4);
+	else
+		place(kGfxPsOffset, kPsredKernel, sizeof(kPsredKernel) / 4);
+
+	// The command stream, its addresses filled in.
+	constexpr uint32_t n = sizeof(kStream) / 4;
+	volatile uint32_t *ib = poolDw(kGfxIbOffset);
+	for (uint32_t i = 0; i < n; i++)
+		ib[i] = kStream[i];
+	for (const Reloc &rl : kRelocs)
+		ib[rl.dword] = static_cast<uint32_t>((va[rl.sym] >> rl.shift) & rl.mask);
+	auto patch = [&](uint32_t opcode, uint32_t reg, uint32_t mask, uint32_t value, const char *what) {
+		const int at = findStreamReg(kStream, n, opcode, reg);
+		if (at < 0) {
+			GLOG("%s: variant patch %s: register not in the stream", label, what);
+			return;
+		}
+		const uint32_t old = ib[at];
+		ib[at] = (old & ~mask) | (value & mask);
+		GLOG("%s: variant patch %s: 0x%08x -> 0x%08x", label, what, old, ib[at]);
+	};
+	if (variant & 1)   // RSRC2_GS.USER_SGPR = 1 (open question 4: Mesa always has user SGPRs)
+		patch(kOpSetShReg, 0x1a2b - kShBase, 0x0000003e, 1u << 1, "SPI_SHADER_PGM_RSRC2_GS.USER_SGPR=1");
+	if (variant & 2) { // INST_PREF_SIZE like Mesa (open question 5): VS 3, PS 2 units of 128 B
+		patch(kOpSetShReg, 0x1a28 - kShBase, 0x7f800000, 3u << 23, "SPI_SHADER_PGM_RSRC4_GS.INST_PREF_SIZE=3");
+		patch(kOpSetShReg, 0x19a7 - kShBase, 0x00ff0000, 2u << 16, "SPI_SHADER_PGM_RSRC4_PS.INST_PREF_SIZE=2");
+	}
+	if (variant & 4)   // VGT_SHADER_STAGES_EN.PRIMGEN_PASSTHRU_NO_MSG = 0 (the shader sends GS_ALLOC_REQ)
+		patch(kOpSetContextReg, 0x02a6, 0x04000000, 0, "VGT_SHADER_STAGES_EN.PRIMGEN_PASSTHRU_NO_MSG=0");
+	if (variant & 8)   // two user SGPRs on the PS carry the marker address
+		patch(kOpSetShReg, 0x19ab - kShBase, 0x0000003e, 2u << 1, "SPI_SHADER_PGM_RSRC2_PS.USER_SGPR=2");
+
+	// The target, cleared; the fences and the marker, zero.
+	for (uint32_t i = 0; i < kWidth * kHeight; i++)
+		*poolDw(kGfxTargetOffset + 4 * i) = 0;
+	*poolDw(kGfxDrawFenceOffset) = 0;
+	*poolDw(kGfxMarkerOffset) = 0;
+	flushHdp();
+	GLOG("%s: %u-dword stream at MC 0x%llx, VS 0x%llx PS 0x%llx, target 0x%llx, rings 0x%llx "
+	     "(%llu MiB)%s", label, n, poolMc(kGfxIbOffset), va[kVs], va[kPs], va[kCb], va[kAttrRing],
+	     kRingBytes >> 20, variant ? "" : " (baseline)");
+
+	trail(variant ? "gfx: draw variant" : "gfx: first draw");
+	uint32_t pkt[16];
+	if (variant & 8) {   // the marker's address goes to SPI_SHADER_USER_DATA_PS_0/1 first
+		const uint64_t marker = poolMc(kGfxMarkerOffset);
+		const uint32_t ud[2] = { static_cast<uint32_t>(marker), static_cast<uint32_t>(marker >> 32) };
+		gfxRing.emit(pkt, Pm4::setShReg(pkt, 0x2c00 + (0x19ac - kShBase), ud, 2));
+	}
+	gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, poolMc(kGfxIbOffset), n, 0));
+	gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), ++gfxFence));
+	uint64_t t0 = mach_absolute_time();
+	gfxKick(gfxRing.wptr());
+	r.ringDone = gfxFenceWait(gfxFence, 500000);
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	r.ns = ns;
+	r.drawFence = *poolDw(kGfxDrawFenceOffset);
+	gfxEvidence(label, true);
+	if (!r.ringDone || r.drawFence != 1) {
+		GLOG("%s: did not finish (ring fence %s, draw fence 0x%x)", label,
+		     r.ringDone ? "ok" : "NOT signalled", r.drawFence);
+		gfxStatus("draw");
+		return false;
+	}
+
+	gfxCountTarget(r);
+	r.marker = *poolDw(kGfxMarkerOffset);
+	if (variant & 8)
+		GLOG("%s: pixel-shader marker 0x%08x (%s)", label, r.marker,
+		     r.marker == kMarkerValue ? "the PS ran and stored to memory" : "NOT written");
+	GLOG("%s: %s in %llu us: %u pixels 0x%08x (want %u), %u others (first at %d); bounds x %u..%u y %u..%u, "
+	     "row 64 x %u..%u, row 190 x %u..%u", label, r.ok ? "THE TRIANGLE IS RIGHT" : "wrong image",
+	     r.ns / 1000, r.covered, kCoveredRgba, kCoveredPixels, r.other,
+	     r.firstNonZero == 0xffffffffu ? -1 : static_cast<int>(r.firstNonZero), r.minX, r.maxX, r.minY,
+	     r.maxY, r.row64[0], r.row64[1], r.row190[0], r.row190[1]);
+
+	if (!r.ok && r.covered == 0 && !r.other) {
+		// Nothing landed. Two cheap questions before blaming the pipeline: is the write
+		// merely late, and is it stuck in a cache? Look again after 2 ms, then force a
+		// full GL2 write-back/invalidate (the gfx_v12_0_emit_mem_sync GCR bits) and a fresh
+		// end-of-pipe fence, and look a third time.
+		IOSleep(2);
+		GfxDrawResult again;
+		gfxCountTarget(again);
+		gfxRing.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync));
+		gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), ++gfxFence));
+		gfxKick(gfxRing.wptr());
+		const bool flushed = gfxFenceWait(gfxFence, 500000);
+		GfxDrawResult flush;
+		gfxCountTarget(flush);
+		GLOG("%s: target still empty: after 2 ms %u px/%u other; after a full ACQUIRE_MEM GL2 write-back "
+		     "(fence %s) %u px/%u other", label, again.covered, again.other, flushed ? "ok" : "NOT signalled",
+		     flush.covered, flush.other);
+		gfxEvidence("after flush", false);
+	}
+	return true;
+}
+
 // G3: the first draw. Needs the gfx ring up and the device heap (the GE
 // rings, 10.5 MiB, live there); everything else is in the pool.
 bool RDNA4Compute::stageGfxDraw() {
@@ -353,83 +657,45 @@ bool RDNA4Compute::stageGfxDraw() {
 		ringVa + kAttrRingBytes, ringVa + kAttrRingBytes + kPosRingBytes, poolMc(kGfxDrawFenceOffset),
 	};
 
-	// Shaders, each followed by s_code_end padding for the SQ's prefetch.
-	auto place = [&](uint32_t at, const uint32_t *code, uint32_t dwords) {
-		for (uint32_t i = 0; i < 0x100; i++)
-			*poolDw(at + 4 * i) = i < dwords ? code[i] : 0xbf9f0000u;   // s_code_end
-	};
-	place(kGfxVsOffset, kNggKernel, sizeof(kNggKernel) / 4);
-	place(kGfxPsOffset, kPsredKernel, sizeof(kPsredKernel) / 4);
-
-	// The command stream, its addresses filled in.
-	constexpr uint32_t n = sizeof(kStream) / 4;
-	volatile uint32_t *ib = poolDw(kGfxIbOffset);
-	for (uint32_t i = 0; i < n; i++)
-		ib[i] = kStream[i];
-	for (const Reloc &r : kRelocs)
-		ib[r.dword] = static_cast<uint32_t>((va[r.sym] >> r.shift) & r.mask);
-
-	// The target, cleared; the fences, zero.
-	for (uint32_t i = 0; i < kWidth * kHeight; i++)
-		*poolDw(kGfxTargetOffset + 4 * i) = 0;
-	*poolDw(kGfxDrawFenceOffset) = 0;
-	flushHdp();
-	GLOG("draw: %u-dword stream at MC 0x%llx, VS 0x%llx PS 0x%llx, target 0x%llx, rings 0x%llx "
-	     "(%llu MiB)", n, poolMc(kGfxIbOffset), va[kVs], va[kPs], va[kCb], ringVa, kRingBytes >> 20);
-
-	trail("gfx: first draw");
-	uint32_t pkt[16];
-	gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, poolMc(kGfxIbOffset), n, 0));
-	gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), ++gfxFence));
-	uint64_t t0 = mach_absolute_time();
-	gfxKick(gfxRing.wptr());
-	const bool ringDone = gfxFenceWait(gfxFence, 500000);
-	uint64_t ns = 0;
-	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
-	const uint32_t drawFence = *poolDw(kGfxDrawFenceOffset);
-	if (!ringDone || drawFence != 1) {
-		GLOG("draw: did not finish (ring fence %s, draw fence 0x%x)", ringDone ? "ok" : "NOT signalled",
-		     drawFence);
-		gfxStatus("draw");
+	GfxDrawResult base;
+	gfxEvidence("before draw", false);
+	const bool ran = gfxDrawRun("draw", 0, va, base);
+	if (!ran) {
 		publishResult("gfx", "FAIL draw fence");
 		return false;
 	}
-
-	// Read back: count the covered pixels, their bounds, and anything else
-	// that changed.
-	uint32_t covered = 0, other = 0, minX = kWidth, maxX = 0, minY = kHeight, maxY = 0;
-	uint32_t row64[2] = { kWidth, 0 }, row190[2] = { kWidth, 0 };
-	for (uint32_t y = 0; y < kHeight; y++) {
-		for (uint32_t x = 0; x < kWidth; x++) {
-			const uint32_t p = *poolDw(kGfxTargetOffset + 4 * (y * kWidth + x));
-			if (p == kCoveredRgba) {
-				covered++;
-				minX = x < minX ? x : minX;
-				maxX = x > maxX ? x : maxX;
-				minY = y < minY ? y : minY;
-				maxY = y > maxY ? y : maxY;
-				uint32_t *span = y == 64 ? row64 : y == 190 ? row190 : nullptr;
-				if (span) {
-					span[0] = x < span[0] ? x : span[0];
-					span[1] = x > span[1] ? x : span[1];
-				}
-			} else if (p) {
-				other++;
-			}
-		}
-	}
-	// notes 3.9: 8192 pixels, rows 64..190, row 64 = x 64..191, row 190 = x 127..128.
-	const bool ok = covered == kCoveredPixels && !other && minY == 64 && maxY == 190 &&
-	                row64[0] == 64 && row64[1] == 191 && row190[0] == 127 && row190[1] == 128;
-	GLOG("draw: %s in %llu us: %u pixels 0x%08x (want %u), %u others; bounds x %u..%u y %u..%u, "
-	     "row 64 x %u..%u, row 190 x %u..%u", ok ? "THE TRIANGLE IS RIGHT" : "wrong image",
-	     ns / 1000, covered, kCoveredRgba, kCoveredPixels, other, minX, maxX, minY, maxY, row64[0],
-	     row64[1], row190[0], row190[1]);
 	char result[160];
 	snprintf(result, sizeof(result), "%s %s, draw %u px in %llu us",
-	         ok ? "PASS" : "FAIL", ok ? "ring test, THE TRIANGLE IS RIGHT" : "draw image",
-	         covered, static_cast<unsigned long long>(ns / 1000));
+	         base.ok ? "PASS" : "FAIL", base.ok ? "ring test, THE TRIANGLE IS RIGHT" : "draw image",
+	         base.covered, static_cast<unsigned long long>(base.ns / 1000));
 	publishResult("gfx", result);
-	env.owner->setProperty("Compute,GFXDrawPixels", static_cast<uint64_t>(covered), 32);
-	return ok;
+	env.owner->setProperty("Compute,GFXDrawPixels", static_cast<uint64_t>(base.covered), 32);
+
+	// The diagnostic ladder (rdna4-gfxdiag=<mask>, default off): the same stream with
+	// one open question changed at a time, each logged with the same evidence, so that
+	// round 4 sees which stage of the pipeline works. Only the baseline decides PASS.
+	const uint32_t diag = requestedGfxDiag();
+	if (diag && (!base.ok || (diag & 16))) {
+		char summary[200];
+		summary[0] = '\0';
+		size_t used = 0;
+		for (uint32_t bit = 1; bit <= 8; bit <<= 1) {
+			if (!(diag & bit))
+				continue;
+			char label[16];
+			snprintf(label, sizeof(label), "diag %u", bit);
+			GfxDrawResult r;
+			const bool did = gfxDrawRun(label, bit, va, r);
+			used += snprintf(summary + used, sizeof(summary) - used, "%s%u:%s%u", used ? " " : "", bit,
+			                 did ? "" : "hang/", did ? r.covered : 0);
+			if (bit == 8 && did)
+				used += snprintf(summary + used, sizeof(summary) - used, "/marker %s",
+				                 r.marker == kMarkerValue ? "yes" : "no");
+			if (!did)
+				break;   // a variant that did not finish leaves the ring in an unknown state
+		}
+		GLOG("diag ladder: baseline %u px; variants (bit:pixels) %s", base.covered, summary);
+		env.owner->setProperty("Compute,GFXDiag", summary);
+	}
+	return base.ok;
 }

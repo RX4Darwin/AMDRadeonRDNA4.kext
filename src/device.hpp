@@ -219,11 +219,13 @@ private:
 	uint32_t cursorVisChanges { 0 };
 	// Evidence that survives the kernel log wrapping: registry property
 	// RDNA4FB,Cursor (cursor.cpp cursorNote).
-	char cursorTrail[2048] { 0 };
+	char cursorTrail[8192] { 0 };
 	uint16_t cursorTrailLen { 0 };
 	bool cursorTrailFull { false };
 	void cursorNote(const char *fmt, ...) __printflike(2, 3);
 	void cursorDumpState(const char *why);
+	void latchNote(const char *fmt, ...) __printflike(2, 3);   // "latch:" line, also into the cursor trail
+	void cursorTrailAppend(const char *line);
 	void cursorProgramPlane(bool enable);
 	void cursorSelfTest();
 	uint32_t cursorDstXOffset(uint32_t px) const;
