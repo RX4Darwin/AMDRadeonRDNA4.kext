@@ -26,6 +26,19 @@ struct Reg {
 // --- GC: GRBM / CP / RLC / IMU ------------------------------------------------
 constexpr Reg GrbmStatus          { 0, 0x0da4 };
 constexpr Reg GrbmStatus2         { 0, 0x0da2 };
+constexpr Reg GrbmStatusSe0       { 0, 0x0da5 };
+constexpr Reg GrbmStatusSe1       { 0, 0x0da6 };
+constexpr Reg GrbmStatusSe2       { 0, 0x0dae };
+constexpr Reg GrbmStatusSe3       { 0, 0x0daf };
+constexpr Reg SpiDebugBusy        { 0, 0x11f0 };
+// gfx_v12_0 golden registers (gfx_v12_0.c:253-261): DB_MEM_CONFIG, CB_HW_CONTROL_1.
+constexpr Reg DbMemConfig         { 0, 0x13d2 };
+constexpr Reg CbHwControl1        { 0, 0x1425 };
+// amdgpu rev_id (nbif_v6_3_1_get_rev_id, nbif_v6_3_1.c:112-124): RCC_STRAP0_RCC_DEV0_EPF0_STRAP0 of
+// the NBIF 6.3.1 map, dword 0x001c (nbif_6_3_1_offset.h:1705, base idx 2), STRAP_ATI_REV_ID_DEV0_F0 =
+// bits [27:24]. (0x0021 is STRAP16 in that map; the earlier 0x0021 came from the 6.3.2 header.)
+constexpr Reg NbifStrap0          { 2, 0x001c };
+constexpr Reg NbifStrap16         { 2, 0x0021 };   // logged next to STRAP0 so a wrong pick is visible
 constexpr Reg CpStat              { 0, 0x0f40 };
 constexpr Reg CpCpcStatus         { 0, 0x0e24 };
 constexpr Reg CpCpfStatus         { 0, 0x0e27 };
@@ -40,6 +53,14 @@ constexpr Reg CpMe1Pipe1IntCntl   { 0, 0x1e26 };   // gfx12 has these two only
 constexpr Reg RlcCntl             { 1, 0x4c00 };
 constexpr Reg RlcStat             { 1, 0x4c04 };
 constexpr Reg RlcGpmStat          { 1, 0x4e6c };
+// W24 survey (gc_12_0_0_offset.h): busy/idle and clock-gating state, read only.
+constexpr Reg CpBusyStat          { 0, 0x0f3f };   // CP_BUSY_STAT
+constexpr Reg CpCpfBusyStat       { 0, 0x0e28 };   // CP_CPF_BUSY_STAT
+// GrbmStatusSe0..3 (GRBM_STATUS_SE0..3) are defined at the top of this file.
+constexpr Reg CpGfxHqdActive      { 0, 0x1e80 };   // CP_GFX_HQD_ACTIVE, banked by GRBM_GFX_CNTL (ME0)
+constexpr Reg RlcSafeMode         { 1, 0x0980 };   // RLC_SAFE_MODE
+constexpr Reg RlcCgttMgcgOverride { 1, 0x4c48 };   // RLC_CGTT_MGCG_OVERRIDE: bits set = that gating is overridden (off)
+constexpr Reg RlcCgcgCglsCtrl     { 1, 0x4c49 };   // RLC_CGCG_CGLS_CTRL: CGCG_EN [0], CGLS_EN [1]
 constexpr Reg RlcBootloadStatus   { 1, 0x4e7c };
 constexpr Reg ImuCoreCtrl         { 1, 0x40b6 };
 constexpr Reg ImuGfxResetCtrl     { 1, 0x40bc };

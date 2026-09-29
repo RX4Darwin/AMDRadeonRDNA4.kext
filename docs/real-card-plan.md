@@ -90,8 +90,18 @@ separate power-management work.
    64x64 square at (100,100) that macOS's pointer does not replace; see
    `docs/cursor-audit.md` for how to read the result.
 
+6b. **Round 4 draw (W23).** Boot 10 (`rdna4-gfx=2 rdna4-gfxdiag=11`): the gfx golden registers are written at ring
+   bring-up (rev_id from the NBIF RCC_STRAP0 at dword 0x1c); if the draw is still empty the ladder re-runs it with one open
+   question changed at a time, in the order 8 (a PS that stores a marker), 2 (INST_PREF_SIZE), 1 (USER_SGPR).
+   **A/B control (boot 11, `rdna4-gfxgolden=0`): the goldens are not undone by skipping them and survive a warm restart, so
+   power-cycle the machine before boot 11 (or run boot 11 before boot 10);** the log says `golden: already in force from
+   an earlier boot` when a boot found them set. **Boot 12** (`rdna4-gfxdiag=4`) runs the GS_ALLOC_REQ NGG shader alone: it
+   can hang the gfx pipeline and there is no reset, so if its result says `hang/` do a cold power cycle before anything else.
+   `docs/gfx-draw-audit.md` lists the suspects and what each log line means. A `gfx-golden-strict` emulator result says
+   nothing about the card, it only shows that the kext writes the registers.
+
 7. **Optional W19 GFX power-management probe.**
-   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15`.
+   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31`.
    Run it after boots 0-6 (the round-2 idle reading of 300 W / 3.2 GHz is
    what it investigates; see `docs/gfx-pm-audit.md`). Every boot's summary
    already carries `sensors-idle` (an SMU metrics sample taken before any
@@ -106,6 +116,18 @@ separate power-management work.
    trail and the next boot skips only this feature. Power is left as the SMU
    had it, except that a failed restore of the soft max is logged as a
    WARNING (compute stays capped at 1000 MHz until the next boot).
+   Bit 16 (`gfxpm=31` includes it) adds the W24 engine survey: at the end of
+   each bring-up stage (3-7, the gfx ring, the pm baseline and the end) the
+   kext logs read-only `pm: survey <stage>:` lines with GRBM_STATUS/2 and
+   GRBM_STATUS_SE0-3, CP_STAT/BUSY, CPC/CPF status/busy, RLC state, MES/ME/MEC
+   halt state, SDMA status, the clock-gating registers, every active MEC and
+   gfx HQD, and the SMU's average clock/activity/power, so the first stage at
+   which the SMU reports 100 % activity is visible next to which engine is
+   busy. `rdna4-gfxcap=<MHz>` (default off) sets the GFXCLK soft max through
+   the proven SetSoftMaxByFreq path as a stopgap; the SMU keeps it across
+   warm reboots, so remove it with `rdna4-gfxcap=0` (or a cold power cycle),
+   not by dropping the boot-arg (`set-boot.sh 10` writes `rdna4-gfxcap=0`).
+
 
 Boots 0-6 are not byte-for-byte unchanged in one respect: `rdna4-run sensors`
 now also takes two `GetMetricsTable` samples one second apart (about five
@@ -118,27 +140,30 @@ restore` step ever hangs, the following boot sends `SetSoftMaxByFreq(GFXCLK,
 looks capped at about 1000 MHz.
 
 8. **W17 VM walker diagnostics (run last, only after boot 2 showed the VM failure).**
-   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=511`
+   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=481`
    (`set-boot.sh 8`). Boot 2 alone (no `rdna4-vm-diag`) already logs the read-only
    evidence: `vm: E1 after SMU enable / before kick / after fault` (both hubs'
    window and aperture registers), `vm: diag before kick` (context and L2
    registers, page-table entries read back through SDMA as `ok`/`MISMATCH`) and
    the fault status. Boot 8 adds hardware-writing diagnostics after the baseline
    fails. Round 3 showed a VM fault leaves that HQD slot unserviced (doorbell HIT
-   stays set, no fault latches), so every test now gets a FRESH queue slot on MEC
-   pipes 1-3 (pipe 0 keeps the kernel ring), and the log says whether the MEC
-   serviced the doorbell. Order: `vm: E4` first (one IB fetched in VMID 8 from a
-   scratch privileged VMID0 queue on pipe 3 queue 3: it cannot wedge compute),
-   then `control` (nothing changed, fresh pipe: it must fault like the baseline,
-   or the fresh-slot approach itself is not working), `variant a`
-   (TAP_*_PHYSICAL=1), `b` (context 0 covers the tables), `c` (MC-form table
-   pointers), `E2` (mirror only LOCAL_FB/LOCAL_SYSMEM, only where they differ),
-   `d` (IS_PTE bit 63 on leaf PTEs, as KFD's SVM PTEs on gfx12,
-   kfd_svm.c:1375), `e` (no SNOOPED on VRAM PTEs, amdgpu_ttm.c:1457), `g`
-   (EXECUTABLE on leaf PTEs) and `T` (tables written by the CPU through the BAR
-   into the pool instead of by SDMA). Each restores what it changed. The last log
-   line `vm: variants (ran/PASS): ...` is the summary. `rdna4-vm-diag` is a bit
-   mask: 1 E4, 2 a, 4 b, 8 c, 16 E2, 32 d, 64 e, 128 g, 256 T (511 = all).
+   stays set, no fault latches), so every test gets a FRESH queue slot on MEC
+   pipes 1-3 (pipe 0 keeps the kernel ring; pipe 1 is filled first, pipe 3 last,
+   because amdgpu warns about pipes 2/3, amdgpu_gfx.c:289-294), and the log says
+   whether the MEC serviced the doorbell. Boot 8 (mask 481) runs only tests that
+   write no hub register: `vm: E4` (one IB fetched in VMID 8 from a scratch
+   privileged VMID0 queue on pipe 1 queue 3, so it cannot wedge compute), then
+   `control` (nothing changed, fresh pipe: it must fault like the baseline, or
+   the fresh-slot approach itself is not working), `d` (IS_PTE bit 63 on leaf PTEs,
+   as KFD's SVM PTEs on gfx12, kfd_svm.c:1375), `e` (no SNOOPED on VRAM PTEs,
+   amdgpu_ttm.c:1457), `g` (EXECUTABLE on leaf PTEs) and `T` (tables written by
+   the CPU through the BAR into the pool instead of by SDMA). Boot 16 (mask 30) is
+   the later round with the hub-write variants `a` (TAP_*_PHYSICAL=1), `b`
+   (context 0 covers the tables), `c` (MC-form table pointers) and `E2` (mirror
+   LOCAL_FB/LOCAL_SYSMEM, only where they differ): run it only if boot 8 still
+   fails everywhere. Each test restores what it changed. The last log line
+   `vm: variants (ran/PASS): ...` is the summary. `rdna4-vm-diag` is a bit mask:
+   1 E4, 2 a, 4 b, 8 c, 16 E2, 32 d, 64 e, 128 g, 256 T (481 = boot 8, 30 = boot 16).
    Read: table MISMATCH = tables did not land; E4 PASS = walker and tables fine,
    the VMID 8 HQD is the problem; a variant that PASSes names the fix; control
    passing means the baseline fault was slot-specific. The runtime stays without

@@ -387,18 +387,35 @@ private:
 	static constexpr uint32_t kGfxPsOffset    = kGfxOffset + 0x20400;
 	static constexpr uint32_t kGfxTargetOffset = kGfxOffset + 0x40000;   // 256 KiB
 	static constexpr uint32_t kGfxDrawFenceOffset = kGfxTestOffset + 0x20;
+	static constexpr uint32_t kGfxMarkerOffset = kGfxTestOffset + 0x40;   // the PS-store diagnostic marker
 	uint64_t   gfxRings { 0 };               // device-heap offset of the GE rings (0 = none)
 	bool stageGfxDraw();
+	struct GfxDrawResult {
+		bool ok, ringDone;
+		uint32_t drawFence, covered, other, firstNonZero, marker;
+		uint32_t minX, maxX, minY, maxY, row64[2], row190[2];
+		uint64_t ns;
+	};
+	bool gfxDrawRun(const char *label, uint32_t variant, const uint64_t *va, GfxDrawResult &r);
+	void gfxCountTarget(GfxDrawResult &r);
+	void gfxEvidence(const char *tag, bool state);
+	void gfxGoldenInit();
+	static uint32_t requestedGfxDiag();
 	Pm4::Queue gfxRing;
 	uint32_t   gfxFence { 0 };               // last RELEASE_MEM sequence number
 	uint32_t   gfxMode { 0 };                // 0 off, 2 doorbell (the only mode)
 	static uint32_t requestedGfx();
 	// W19: rdna4-gfxpm, the GFX power-management experiment.
-	static constexpr uint32_t kPmWorkload = 1, kPmSoftAuto = 2, kPmCapProbe = 4, kPmSampleOnly = 8;
+	static constexpr uint32_t kPmWorkload = 1, kPmSoftAuto = 2, kPmCapProbe = 4, kPmSampleOnly = 8,
+	                               kPmSurvey = 16;      // W24: engine busy/CG survey at each bring-up stage
+	static constexpr uint32_t kGfxCapMinMHz = 200, kGfxCapMaxMHz = 5000;
 	static constexpr uint32_t kPmSoftMaxAuto = 0xffff;         // (PPCLK_GFXCLK << 16) | 0xffff
 	static constexpr uint32_t kPmNoMin = 0xffffffffu;          // leave SoftMin alone
 	static constexpr uint32_t kPmProbeMHz = 1000;
 	static uint32_t requestedGfxPm();
+	static bool requestedGfxCap(uint32_t &mhz);      // rdna4-gfxcap: false when absent
+	void gfxPmSurvey(const char *tag);
+	void gfxCapApply(uint32_t mhz);
 	void gfxPmSample(const char *tag);
 	bool gfxPmSoftLimits(uint32_t maxParam, uint32_t minParam, const char *what);
 	void gfxPmExperiment(uint32_t mask);

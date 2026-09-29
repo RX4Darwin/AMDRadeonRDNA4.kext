@@ -20,7 +20,7 @@ REG_RESULTS=""
 STEP_TIMEOUT=120
 STEP_SEQ=0
 : > "$SUMMARY"
-trap 'rm -f "$SUMMARY" "$KLOG" "$STEP_PREFIX"-* "/tmp/rdna4fb-klogfb.$$" "/tmp/rdna4fb-klogfb.$$.raw"' EXIT
+trap 'rm -f "$SUMMARY" "$KLOG" "$STEP_PREFIX"-* "/tmp/rdna4fb-klogfb.$$" "/tmp/rdna4fb-klogfb.$$.raw" "/tmp/rdna4fb-klogfb.$$.err"' EXIT
 
 # The kernel copy is preferred because Recovery's nvram command can return an
 # empty boot-args value while the running kernel still has its arguments.
@@ -74,28 +74,43 @@ section() { echo; echo "=== $1 ==="; }
 # klines PATTERN prints the matching dmesg lines; when dmesg has none it falls
 # back to the same lines from the unified log (log show, read once per run).
 KFB="/tmp/rdna4fb-klogfb.$$"
+# One bounded `log show` attempt: run it in the background and stop it after
+# $1 seconds (macOS has no timeout(1)); the rest of the arguments are log show's.
+# Output goes to $KFB.raw, errors to $KFB.err. Returns 0 when RDNA4FB lines came out.
+klog_try() {
+	local secs="$1" lpid t=0
+	shift
+	: > "$KFB.raw"
+	log show "$@" --style compact --info --debug \
+		--predicate 'eventMessage CONTAINS "RDNA4FB:"' > "$KFB.raw" 2>> "$KFB.err" &
+	lpid=$!
+	while kill -0 "$lpid" 2>/dev/null && [ "$t" -lt "$secs" ]; do
+		sleep 1
+		t=$((t + 1))
+	done
+	if kill -0 "$lpid" 2>/dev/null; then
+		kill "$lpid" 2>/dev/null || true
+		sleep 1
+		kill -9 "$lpid" 2>/dev/null || true
+		echo "log show $* stopped after ${t} s" >> "$KFB.err"
+	fi
+	grep -q 'RDNA4FB:' "$KFB.raw" 2>/dev/null
+}
 klog_fallback() {
 	if [ ! -e "$KFB" ]; then
-		# log show can run for minutes on a big unified log and macOS has no
-		# timeout(1): run it in the background and stop it after 60 s. Whatever it
-		# printed by then is used.
-		local lpid t=0
-		: > "$KFB.raw"
-		log show --last boot --style compact --predicate 'eventMessage CONTAINS "RDNA4FB:"' \
-			> "$KFB.raw" 2>/dev/null &
-		lpid=$!
-		while kill -0 "$lpid" 2>/dev/null && [ "$t" -lt 60 ]; do
-			sleep 1
-			t=$((t + 1))
-		done
-		if kill -0 "$lpid" 2>/dev/null; then
-			kill "$lpid" 2>/dev/null || true
-			sleep 1
-			kill -9 "$lpid" 2>/dev/null || true
-			echo "(log show stopped after ${t} s; the unified-log lines below are partial)" >&2
+		# Round 3: the single `log show --last boot` printed nothing and its error
+		# was thrown away. Try the boot, then the last hour, then everything the
+		# store still holds (20 s each), and keep log show's own messages so an
+		# empty result says why.
+		: > "$KFB.err"
+		if klog_try 20 --last boot || klog_try 20 --last 1h || klog_try 20; then
+			grep 'RDNA4FB:' "$KFB.raw" > "$KFB"
+		else
+			: > "$KFB"
+			echo "# log show fallback found no RDNA4FB lines (no unified-log store in this environment?):" >> "$KFB"
+			head -5 "$KFB.err" | sed 's/^/# /' >> "$KFB"
 		fi
-		grep 'RDNA4FB:' "$KFB.raw" > "$KFB" 2>/dev/null || : > "$KFB"
-		rm -f "$KFB.raw"
+		rm -f "$KFB.raw" "$KFB.err"
 	fi
 	cat "$KFB"
 }
@@ -585,7 +600,7 @@ registry_value() {
 	if [ "$INFO_OK" -eq 0 ]; then
 		record sensors-idle SKIPPED "runtime unavailable"
 	elif [ -n "$SENSORS_IDLE_FILE" ] && grep -q '^sensors-pm: verdict ' "$SENSORS_IDLE_FILE"; then
-		idle_gfx="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_IDLE_FILE" | tail -1 | sed -E 's/^sensors-pm\[2\]: //' | cut -c1-110)"
+		idle_gfx="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_IDLE_FILE" | tail -1 | sed -E 's/^sensors-pm\[2\]: GFXCLK avg pre-DS ([0-9]+).*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/avg GFXCLK \1 MHz, activity \2%, \3 W/')"
 		idle_verdict="$(grep '^sensors-pm: verdict ' "$SENSORS_IDLE_FILE" | tail -1 | sed 's/^sensors-pm: verdict //')"
 		record sensors-idle PASS "$idle_verdict | $idle_gfx"
 	else
@@ -594,7 +609,7 @@ registry_value() {
 	if [ "$INFO_OK" -eq 0 ]; then
 		record sensors-pm SKIPPED "runtime unavailable"
 	elif grep -q '^sensors-pm: verdict ' "$SENSORS_FILE"; then
-		pm_gfx="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_FILE" | tail -1 | sed -E 's/^sensors-pm\[2\]: //' | cut -c1-110)"
+		pm_gfx="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_FILE" | tail -1 | sed -E 's/^sensors-pm\[2\]: GFXCLK avg pre-DS ([0-9]+).*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/avg GFXCLK \1 MHz, activity \2%, \3 W/')"
 		pm_verdict="$(grep '^sensors-pm: verdict ' "$SENSORS_FILE" | tail -1 | sed 's/^sensors-pm: verdict //')"
 		record sensors-pm PASS "$pm_verdict | $pm_gfx"
 	else
@@ -606,8 +621,8 @@ registry_value() {
 	if [ "$GFXPM_MODE" -eq 0 ]; then
 		record gfxpm SKIPPED "rdna4-gfxpm not enabled"
 	elif grep -q 'RDNA4FB: compute: pm: experiment finished' "$KLOG"; then
-		pm_first="$(grep 'RDNA4FB: compute: pm: baseline' "$KLOG" | tail -1 | sed -E 's/.*pm: baseline[^:]*: GFXCLK ([0-9]+) MHz.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
-		pm_last="$(grep 'RDNA4FB: compute: pm: .*GFXCLK [0-9]* MHz' "$KLOG" | tail -1 | sed -E 's/.*pm: ([^:]*): GFXCLK ([0-9]+) MHz.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1: \2 MHz \3% \4 W/')"
+		pm_first="$(grep 'RDNA4FB: compute: pm: baseline' "$KLOG" | tail -1 | sed -E 's/.*pm: baseline[^:]*: avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
+		pm_last="$(grep 'RDNA4FB: compute: pm: ' "$KLOG" | grep -v 'pm: survey ' | grep 'avg GFXCLK pre-DS [0-9]*'  | tail -1 | sed -E 's/.*pm: ([^:]*): avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1: \2 MHz \3% \4 W/')"
 		record gfxpm PASS "baseline $pm_first -> $pm_last"
 	else
 		record gfxpm FAIL "pm experiment did not finish (see the pm: lines)"

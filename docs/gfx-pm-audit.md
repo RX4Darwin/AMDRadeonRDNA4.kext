@@ -161,3 +161,64 @@ It does **not** model the SCPM refusal of the allowed mask (real card: 0xFD); no
 Expected on the card when it works: `pm: baseline` then one line per step; `MetricsCounter ... (live)` on
 every line; the clock and power moving after the step that matters. When it fails: `(STALE)` (metrics path),
 a `-> 0xfd/0xfc/0xff` answer (refused), or the last `pm:` trail after a hang.
+
+## 8. Round 3 (real card) and W24
+
+Logs `premetal/hw-logs/rdna4fb-diag-20260929-01*.txt` (boot 7 = `...-015441.txt`).
+
+- **The SMU reports GFX activity 97-100 % from the earliest sample (22.7 s) on every boot**, average GFXCLK about
+  3200 MHz, 285-313 W. So section 6 hypothesis 1 (bench tail) is dead, and hypotheses 2 and 3 need reading with
+  the next fact.
+- **`SetWorkloadMask(DEFAULT)` and the soft-limit release did nothing** (activity stays 100 %, clock 2200-2800 avg,
+  power 91-193 W is the DPM hunting, not a fix).
+- **The 1000 MHz soft-max cap worked**: average 1012 MHz, 46 W, activity still 100 %; lifting it brought 285 W back.
+  Power follows clock at a constant "activity", so what the card burns is clock-and-voltage cost of a block the SMU
+  believes is fully busy.
+- **The graphics pipeline itself reads idle at the same moment.** Baseline sample: `GRBM 0x0000382c CP_STAT 0x00000000`.
+  In `gc_12_0_0_sh_mask.h` GRBM_STATUS: bit 31 GUI_ACTIVE = 0, bit 29 CP_BUSY = 0, bit 27 ANY_ACTIVE = 0, bit 22
+  SPI_BUSY = 0, bits 11-13 SC/DB/CB_CLEAN = 1. No shader wave, no CP work, yet activity 100 %.
+- **Metrics layout on IF 0x33:** `CurrClock[GFXCLK]` reads a constant 1000 and `AvgCurrent` 8000-54000 A, so those
+  offsets are wrong for this interface; averages, activity, power, temperatures and the counter look right.
+  `MetricsCounter` in kernel samples was 320, 272, 305, 291, 288 (not monotonic): use it only as "the table changed".
+  W24 makes the verdict ignore CurrClock and AvgCurrent (printed, labelled untrusted).
+- **Leading hypothesis (revised): clock gating was never enabled, so the GFX block is never seen as idle.** Nothing
+  in the kext programs `RLC_CGCG_CGLS_CTRL` or `RLC_CGTT_MGCG_OVERRIDE`; amdgpu does, in RLC safe mode, at the end
+  of device init (`gfx_v12_0_update_gfx_clock_gating`, `gfx_v12_0.c:4342-4366`, CGCG `:4151`, MGCG `:4268`, called
+  from `amdgpu_device_ip_late_init`, `amdgpu_device.c:2772`). With gating off the GFX clock is always running, which
+  fits "activity 100 % while GRBM is idle" if the PMFW's activity measure is clock-on based, and fits the power law
+  above. This is an inference, not proof.
+- **Other candidates** (all checked by the survey): MES firmware running (`CP_MES_CNTL`), an RLC/IMU state
+  (`RLC_STAT`, `RLC_GPM_STAT`, `RLC_SAFE_MODE`), our MEC queue polling its wptr (`CP_HQD_ACTIVE` per pipe/queue,
+  `CPC_STATUS/BUSY`), the gfx ring (`CP_GFX_HQD_ACTIVE`, `CP_ME_CNTL`), SDMA (`SDMA_STATUS`, `GRBM_STATUS2`).
+
+### W24 additions (`premetal/pm2`)
+
+- **`rdna4-gfxpm` bit 16 (`gfxpm=31` = boot 7)**: read-only `pm: survey <stage>:` lines after stages 3, 4, 5, 6, 7,
+  the gfx ring, the pm baseline and the end of bring-up. Each survey logs: `GRBM_STATUS`, `GRBM_STATUS2`,
+  `GRBM_STATUS_SE0-3` (`0x0da5,0x0da6,0x0dae,0x0daf`), `CP_STAT`, `CP_BUSY_STAT` (`0x0f3f`), `CP_CPC_STATUS` and
+  `CP_CPC_BUSY_STAT`, `CP_CPF_STATUS` and `CP_CPF_BUSY_STAT` (`0x0e28`), `RLC_CNTL`, `RLC_STAT`, `RLC_GPM_STAT`,
+  `RLC_SAFE_MODE` (`0x0980`), `CP_MES_CNTL`, `CP_ME_CNTL`, `CP_MEC_RS64_CNTL`, both SDMA status registers,
+  `RLC_CGTT_MGCG_OVERRIDE` (`0x4c48`, override bits set = gating held off) and `RLC_CGCG_CGLS_CTRL` (`0x4c49`,
+  CGCG_EN bit 0, CGLS_EN bit 1), the list of active HQDs for MEC pipes 0-3 x queues 0-7 (`CP_HQD_ACTIVE`, banked by
+  `GRBM_GFX_CNTL`) and gfx pipes 0-1 x queues 0-1 (`CP_GFX_HQD_ACTIVE`, `0x1e80`), and the SMU's average clock,
+  activity, power and counter. Register offsets: `gc_12_0_0_offset.h`; bit meanings: `gc_12_0_0_sh_mask.h`.
+  It is read-only apart from selecting the register bank with `GRBM_GFX_CNTL`, which it restores to 0.
+  Reading the first stage where activity turns 100 % says whether it precedes any of our compute queues.
+- **Verdict** ignores CurrClock and AvgCurrent; new words `SMU-REPORTS-GFX-BUSY` and `LOW-ACTIVITY`.
+  The diagnostic parser failed on the card because the implausible-case line did not start with
+  `sensors-pm: verdict`; it does now, and the row extractors use the averaged clock.
+- **`rdna4-gfxcap=<MHz>` (proposal, default off)**: soft max through the SetSoftMaxByFreq path proven in round 3
+  (param `MHz + 1`, `smu_v14_0.h:54`), accepted 200-5000, `0` lifts the cap. It is a stopgap (46 W at 1000 MHz);
+  the SMU keeps the limit across warm reboots, so removing the boot-arg alone does not lift it.
+- **Round 5 proposal, not implemented**: an opt-in `rdna4-gfxcg=1` that mirrors `gfx_v12_0_update_gfx_clock_gating`
+  in RLC safe mode, if the survey shows CGCG/MGCG off and no engine busy.
+
+### W24 review fixes
+
+- The end-of-bring-up survey (and every survey) now requires `done >= StageGfx` and `bringupStepAllowed`, so no
+  `GRBM_GFX_CNTL` write happens while GC may be in reset or during a shutdown quiesce.
+- The HQD scan follows amdgpu's GC 12.0.0/12.0.1 geometry (`gfx_v12_0.c:1416-1424`: one MEC of 2 pipes x 4 queues,
+  one ME of 1 pipe x 8 queues); a read of `0xffffffff` counts as "not implemented", never as active, and the count is logged.
+- A `pm: gfxcap` trail is recovered like the W19 cap (the next boot lifts the soft max once). Any boot with a pm
+  boot-arg logs a reminder that a soft max survives warm reboots; `set-boot.sh 10` (`rdna4-gfxcap=0`) lifts it.
+  A cap-less boot with no pm boot-arg cannot know a cap is in force, so it stays silent by design.
