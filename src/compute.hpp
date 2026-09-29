@@ -527,6 +527,9 @@ private:
 	static constexpr uint32_t kMaxClients = 8;
 	static constexpr uint32_t kVmTableBytes = 4u << 20;
 	static constexpr uint32_t kVmTableStage = 20u << 20;
+	static constexpr uint32_t kVmTableCpu = 28u << 20;    // W22 variant T: CPU-written tables (0x4000)
+	uint64_t vmPteSet { 0 }, vmPteClear { 0 };            // W22 diagnostics: extra/removed leaf PTE bits
+	uint32_t vmTableCpu { 0 };                            // W22 variant T: pool offset of CPU-written tables
 	static constexpr uint32_t kVmQueueBase = 26u << 20;
 	static constexpr uint32_t kVmQueueStride = 0x10000;
 	static constexpr uint32_t kVmMqd = 0x0000;

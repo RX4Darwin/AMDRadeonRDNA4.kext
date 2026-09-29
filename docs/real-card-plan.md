@@ -118,24 +118,33 @@ restore` step ever hangs, the following boot sends `SetSoftMaxByFreq(GFXCLK,
 looks capped at about 1000 MHz.
 
 8. **W17 VM walker diagnostics (run last, only after boot 2 showed the VM failure).**
-   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31`
+   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=511`
    (`set-boot.sh 8`). Boot 2 alone (no `rdna4-vm-diag`) already logs the read-only
    evidence: `vm: E1 after SMU enable / before kick / after fault` (both hubs'
    window and aperture registers), `vm: diag before kick` (context and L2
    registers, page-table entries read back through SDMA as `ok`/`MISMATCH`) and
    the fault status. Boot 8 adds hardware-writing diagnostics after the baseline
-   fails, each restoring what it changed: `variant a` (TAP_*_PHYSICAL=1),
-   `variant b` (context 0 covers the tables), `variant c` (MC-form table
-   pointers), `variant E2` (mirror only LOCAL_FB/LOCAL_SYSMEM start/end from the
-   MM hub, only where they differ; the saved values are logged first), then
-   E4 last: `vm: E4: IB from the VMID0 ring, fetched in VMID 8 ... => PASS/fail`
-   (needs `rdna4-hang=1`; it can stall the kernel ring, which is recovered without
-   a reset, and a later compute test may then fail). `rdna4-vm-diag` is a bit mask:
-   1 E4, 2 a, 4 b, 8 c, 16 E2. Read: table MISMATCH = tables did not land; E4 PASS =
-   walker and tables fine, the VMID 8 HQD is the problem; a/b/c/E2 PASS names the
-   fix. The runtime stays without per-client VM on this boot whatever happens.
-   `rdna4-vm-force-fail` is an emulator-only test hook and is ignored without
-   `rdna4-vm-diag`; never set it on the card.
+   fails. Round 3 showed a VM fault leaves that HQD slot unserviced (doorbell HIT
+   stays set, no fault latches), so every test now gets a FRESH queue slot on MEC
+   pipes 1-3 (pipe 0 keeps the kernel ring), and the log says whether the MEC
+   serviced the doorbell. Order: `vm: E4` first (one IB fetched in VMID 8 from a
+   scratch privileged VMID0 queue on pipe 3 queue 3: it cannot wedge compute),
+   then `control` (nothing changed, fresh pipe: it must fault like the baseline,
+   or the fresh-slot approach itself is not working), `variant a`
+   (TAP_*_PHYSICAL=1), `b` (context 0 covers the tables), `c` (MC-form table
+   pointers), `E2` (mirror only LOCAL_FB/LOCAL_SYSMEM, only where they differ),
+   `d` (IS_PTE bit 63 on leaf PTEs, as KFD's SVM PTEs on gfx12,
+   kfd_svm.c:1375), `e` (no SNOOPED on VRAM PTEs, amdgpu_ttm.c:1457), `g`
+   (EXECUTABLE on leaf PTEs) and `T` (tables written by the CPU through the BAR
+   into the pool instead of by SDMA). Each restores what it changed. The last log
+   line `vm: variants (ran/PASS): ...` is the summary. `rdna4-vm-diag` is a bit
+   mask: 1 E4, 2 a, 4 b, 8 c, 16 E2, 32 d, 64 e, 128 g, 256 T (511 = all).
+   Read: table MISMATCH = tables did not land; E4 PASS = walker and tables fine,
+   the VMID 8 HQD is the problem; a variant that PASSes names the fix; control
+   passing means the baseline fault was slot-specific. The runtime stays without
+   per-client VM on this boot whatever happens. `rdna4-vm-force-fail` is an
+   emulator-only test hook and is ignored without `rdna4-vm-diag`; never set it
+   on the card.
 
 ## Known risks
 
