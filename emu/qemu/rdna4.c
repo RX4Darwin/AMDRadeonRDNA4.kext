@@ -2096,7 +2096,7 @@ static uint8_t *rdna4_phys_span(RDNA4State *s, uint64_t physical, uint64_t len)
 #define RDNA4_VM_PHYS_MASK   0x0000FFFFFFFFF000ull
 #define RDNA4_VM_PDE_PTE     (1ull << 63)
 
-static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va)
+static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va, bool mapping_err)
 {
     /* gc_12_0_0_sh_mask.h GCVM_L2_PROTECTION_FAULT_STATUS_LO32: MORE_FAULTS
      * [0], PERMISSION_FAULTS [7:4] (bit 4: the valid bit), VMID [23:20].
@@ -2108,7 +2108,14 @@ static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va)
         reg_set(s, REG_GCVM_FAULT_STATUS, status | 1u);
         return;
     }
-    reg_set(s, REG_GCVM_FAULT_STATUS, (1u << 4) | ((vmid & 0xfu) << 20));
+    /* A walk that ended on a non-PTE (mapping error) reads back like the card's first
+     * VMID 8 fault, 0x00800b3b: MORE_FAULTS (the CP retries), WALKER_ERROR 5,
+     * PERMISSION_FAULTS 3, MAPPING_ERROR, CID 5 (CPC), VMID (gc_12_0_0_sh_mask.h:9002-9025). */
+    if (mapping_err)
+        reg_set(s, REG_GCVM_FAULT_STATUS, 1u | (5u << 1) | (3u << 4) | (1u << 8) | (5u << 9) |
+                                          ((vmid & 0xfu) << 20));
+    else
+        reg_set(s, REG_GCVM_FAULT_STATUS, (1u << 4) | ((vmid & 0xfu) << 20));
     reg_set(s, REG_GCVM_FAULT_ADDR_LO, (uint32_t)(va >> 12));
     reg_set(s, REG_GCVM_FAULT_ADDR_HI, (uint32_t)(va >> 44) & 0xfu);
 }
@@ -2130,6 +2137,7 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
     uint32_t n = vmid - 1;
     uint32_t cntl = reg_get(s, REG_GCVM_CTX1_CNTL + n * 4);
     uint64_t base, start, end, table, entry;
+    bool mapping_err = false;
     if (!(cntl & 1) || ((cntl >> 1) & 3) != 3 || va >= (1ull << 48))
         goto fault;
     start = reg_get(s, REG_GCVM_CTX1_START_LO + n * 8) |
@@ -2161,6 +2169,14 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
             return rdna4_vram_span(s, off, len);
         }
         if (level == 3) {
+            /* GFX12: a last-level entry without IS_PTE (bit 63) is a directory entry; the
+             * walker reads one more entry from the page it points at (a data page: zeros)
+             * and faults with MAPPING_ERROR (umr access_vram_ai.c:1063-1069; amdgpu sets
+             * bit 63 on every leaf, amdgpu_ttm.c:1477 + gmc_v12_0.c:794-796). */
+            if (!(entry & RDNA4_VM_PDE_PTE)) {
+                mapping_err = true;
+                goto fault;
+            }
             if (!(entry & RDNA4_VM_READABLE) || (write && !(entry & RDNA4_VM_WRITEABLE)) ||
                 (execute && !(entry & RDNA4_VM_EXECUTABLE)))
                 goto fault;
@@ -2173,7 +2189,7 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
         table = entry & RDNA4_VM_PHYS_MASK;
     }
 fault:
-    rdna4_vm_fault(s, vmid, va);
+    rdna4_vm_fault(s, vmid, va, mapping_err);
     /* Retry is off: serve the configured dummy page so the queue can drain.
      * GCVM_L2_CNTL.ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY [11] (amdgpu sets it,
      * gfxhub_v12_0.c:248) makes it a system-memory page: modelled as one shared zeroed
@@ -2207,6 +2223,7 @@ static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
     uint32_t n = vmid - 1;
     uint32_t cntl = reg_get(s, REG_GCVM_CTX1_CNTL + n * 4);
     uint64_t base, start, end, table, entry;
+    bool mapping_err = false;
 
     if (!(cntl & 1) || ((cntl >> 1) & 3) != 3 || va >= (1ull << 48) ||
         !len || len > 0x1000 - (va & 0xfff))
@@ -2241,6 +2258,10 @@ static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
             return true;
         }
         if (level == 3) {
+            if (!(entry & RDNA4_VM_PDE_PTE)) {   /* GFX12: no IS_PTE = a directory entry */
+                mapping_err = true;
+                goto fault;
+            }
             if (!(entry & RDNA4_VM_READABLE) || (write && !(entry & RDNA4_VM_WRITEABLE)) ||
                 (execute && !(entry & RDNA4_VM_EXECUTABLE)))
                 goto fault;
@@ -2253,7 +2274,7 @@ static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
         table = entry & RDNA4_VM_PHYS_MASK;
     }
 fault:
-    rdna4_vm_fault(s, vmid, va);
+    rdna4_vm_fault(s, vmid, va, mapping_err);
     return false;
 }
 
@@ -2289,13 +2310,13 @@ static bool rdna4_vm_access(RDNA4State *s, uint64_t va, uint8_t *data, uint64_t 
                     memcpy(data, dummy, chunk);
             } else if (target.system) {
                 if (!rdna4_bus_master_enabled(s)) {
-                    rdna4_vm_fault(s, vmid, va);
+                    rdna4_vm_fault(s, vmid, va, false);
                     return false;
                 }
                 MemTxResult result = write ? rdna4_dma_write(s, target.address, data, chunk)
                                            : rdna4_dma_read(s, target.address, data, chunk);
                 if (result != MEMTX_OK) {
-                    rdna4_vm_fault(s, vmid, va);
+                    rdna4_vm_fault(s, vmid, va, false);
                     return false;
                 }
             } else {
@@ -4086,7 +4107,7 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
         for (int i = 0; i < 16; i++) {
             uint8_t *p = rdna4_gc_span_vmid(s, s->mec_work.pq +
                                             4ull * ((s->mec_work.rptr + i) % s->mec_work.size),
-                                            4, s->mec_work.vmid, false, false);
+                                            4, s->mec_work.vmid, false, true);   /* the CP fetches the ring with EXE */
             if (!p) {
                 fprintf(stderr, "rdna4: mec: queue MC 0x%" PRIx64 " not mapped\n",
                         s->mec_work.pq);
@@ -4147,7 +4168,7 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
             const uint32_t ib_vmid = s->mec_work.priv ? (control >> 24) & 0xf : s->mec_work.vmid;
             if (!ib_dwords || !rdna4_gc_span_vmid(s, (uint64_t)dw[1] | ((uint64_t)dw[2] << 32),
                                     (uint64_t)ib_dwords * 4,
-                                    ib_vmid, false, false)) {
+                                    ib_vmid, false, true)) {   /* IB fetch requests EXE */
                 fprintf(stderr, "rdna4: mec: invalid indirect buffer; queue stopped\n");
                 s->mec_hung = true;
                 return false;

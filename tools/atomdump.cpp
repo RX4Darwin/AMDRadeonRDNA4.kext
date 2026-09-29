@@ -2054,7 +2054,7 @@ static int testGpuVm() {
 	int failures = 0;
 	const uint64_t physical = 0x0000123400000000ull;
 	const uint64_t pte = GpuVm::encodePte(physical,
-		GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable,
+		GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable | GpuVm::kIsPte,
 		true);
 	failures += check((pte & GpuVm::kPhysicalMask) == physical && (pte & GpuVm::kValid) &&
 	                  ((pte >> 7) & 0x1f) == GpuVm::kFragment64K,
@@ -2096,7 +2096,7 @@ static int testGpuVm() {
 	put(pdb1 + GpuVm::index(va, 1) * 8, GpuVm::encodePde(pdb0, GpuVm::kValid | GpuVm::kSnooped, 1));
 	put(pdb0 + GpuVm::index(va, 2) * 8, GpuVm::encodePde(ptb, GpuVm::kValid | GpuVm::kSnooped, 0));
 	put(ptb + GpuVm::index(va, 3) * 8,
-	    GpuVm::encodePte(physical, GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable,
+	    GpuVm::encodePte(physical, GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable | GpuVm::kIsPte,
 	                      true));
 	uint64_t got = 0, flags = 0;
 	failures += check(GpuVm::walk(root, va + 0x345, readVmTestEntry, &table, got, flags) &&
@@ -2104,6 +2104,12 @@ static int testGpuVm() {
 	                  "gfx12 page-table walk returns the mapped physical address");
 	failures += check(!GpuVm::walk(root, 0x2000, readVmTestEntry, &table, got, flags),
 	                  "gfx12 page-table walk rejects an unmapped VA");
+	/* Negative control: the round 2-4 leaf (no bit 63) is a directory entry to GFX12 and faults. */
+	put(ptb + GpuVm::index(va, 3) * 8,
+	    GpuVm::encodePte(physical, GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable,
+	                      true));
+	failures += check(!GpuVm::walk(root, va + 0x345, readVmTestEntry, &table, got, flags),
+	                  "gfx12 page-table walk faults on a leaf PTE without IS_PTE (bit 63)");
 	return failures;
 }
 
