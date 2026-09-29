@@ -592,8 +592,10 @@ void RDNA4Compute::gfxPacketProbe() {
 		     rdGc(CpRb0Rptr), static_cast<unsigned long long>(gfxRing.wptr()),
 		     dataCheck ? (*poolDw(kGfxTestOffset + 0x10) == 0x57ee1e57 ? ", data written" : ", data NOT written") : "");
 		gfxFaultMark(tag);
-		if (!done && !waitFence)
-			break;   // a packet the CP does not finish: the later ones would only pile up behind it
+		if (!done) {   // W35 (W33 review S1): the first unfinished step ends the probe, on ANY packet (RELEASE_MEM included)
+			GLOG("single-packet probe: %s did not finish; the probe stops here (a CP that does not finish needs a cold power cycle before the next boot)", name);
+			break;
+		}
 	}
 }
 
@@ -602,14 +604,22 @@ void RDNA4Compute::gfxPacketProbe() {
 // so no state is left behind), read it back on the ring, write sentinel B, read again, and read once over MMIO for
 // comparison. Reads: A then B = the CP-side read tracks writes; A then A = it lags one write (the MMIO lag, so 'probe mid'
 // of the FIRST draw cannot be trusted); anything else = it does not observe context writes at all.
-void RDNA4Compute::gfxSentinelCheck() {
+bool RDNA4Compute::gfxSentinelCheck() {
 	constexpr uint32_t kCtxOffset = 0x0215;   // CB_SHADER_MASK, set again by the draw stream
-	constexpr uint32_t kA = 0x0a5a5a5au, kB = 0x05a5a5a5u;
 	uint32_t byteOff = 0;
 	if (!env.disc || !env.disc->regByteOffset(IpDiscovery::HwGc, 0, 1, kCtxOffset, byteOff)) {
 		GLOG("sentinel: cannot locate the context register, skipped");
-		return;
+		return true;   // nothing was submitted: the draw may go on
 	}
+	// W35 (W33 review NIT): the value the register holds before A is written is logged, and the sentinels are
+	// chosen so that neither equals it (a warm state holding a sentinel would make the verdicts collide).
+	const uint32_t before = rdGc(Reg { 1, kCtxOffset });
+	uint32_t kA = 0x0a5a5a5au, kB = 0x05a5a5a5u;
+	if (before == kA || before == kB) {
+		kA = 0x0c3c3c3cu;
+		kB = 0x03c3c3c3u;
+	}
+	GLOG("sentinel: CB_SHADER_MASK holds 0x%08x before the check", before);
 	for (uint32_t i = 0; i < 4; i++)
 		*poolDw(kGfxProbeOffset + 4 * i) = 0xdeadf00du;
 	flushHdp();
@@ -632,6 +642,7 @@ void RDNA4Compute::gfxSentinelCheck() {
 	GLOG("sentinel: wrote 0x%08x then 0x%08x to CB_SHADER_MASK; CP-side reads 0x%08x then 0x%08x, MMIO after 0x%08x: %s",
 	     kA, kB, r0, r1, mmio, verdict);
 	gfxFaultMark("sentinel check");
+	return fenced;
 }
 
 // The GC hub fault status, logged and cleared, so the log says which bring-up step first makes the
@@ -930,7 +941,11 @@ bool RDNA4Compute::stageGfxDraw() {
 	gfxRs64Evidence("before draw");
 	gfxEvidence("before draw", false);
 	if (requestedGfxProbe())
-		gfxSentinelCheck();   // W33 S2: does the CP-side readback see a context write? (decides how to read 'probe mid')
+		if (!gfxSentinelCheck()) {   // W33 S2: does the CP-side readback see a context write? (decides how to read 'probe mid')
+			GLOG("draw: skipped, the sentinel submission did not finish (the ring is not healthy; power-cycle before the next boot)");
+			publishResult("gfx", "FAIL sentinel did not finish");
+			return false;
+		}
 	const bool ran = gfxDrawRun("draw", 0, va, base);
 	if (!ran) {
 		publishResult("gfx", "FAIL draw fence");

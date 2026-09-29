@@ -620,6 +620,7 @@ struct RDNA4State {
     bool     smu_stale;      /* metrics transfer acks but the table is never rewritten */
     bool     warm_keep;      /* reset keeps live engines/queues, like warm card restart */
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
+    bool     gop_dlg;        /* the GOP left the HUBP DLG/TTU registers programmed (DCN_SURF0_TTU_CNTL0 delivery non-zero) */
     bool     cursor_lock_stuck; /* the GOP left the MPC cursor lock (CUR_VUPDATE_LOCK_SET0) held */
     bool     cursor_reject_logged;
     bool     cursor_ttu_hypothesis; /* reject the cursor plane while DCN_CUR0_TTU_CNTL0's delivery is 0 (cursor-ttu-hypothesis) */
@@ -6703,6 +6704,8 @@ static void rdna4_reset(DeviceState *dev)
     reg_set(s, REG_GFX_GB_ADDR_CONFIG, 0x08200545u);
     if (s->cursor_lock_stuck)
         reg_set(s, SEG3(0x02c5), 1);
+    if (s->gop_dlg)   /* regHUBPREQ0_DCN_SURF0_TTU_CNTL0 0x0623: a GOP that ran DML for its one surface */
+        reg_set(s, SEG2(0x0623), 0x08005630u);
     if (dcn) {
         memcpy(s->regs + dcn_start, dcn, dcn_bytes);
         g_free(dcn);
@@ -6941,6 +6944,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("dcn-irq-storm", RDNA4State, dcn_irq_storm, false),
     DEFINE_PROP_BOOL("cursor", RDNA4State, cursor_enabled, false),
     DEFINE_PROP_BOOL("cursor-lock-stuck", RDNA4State, cursor_lock_stuck, false),
+    DEFINE_PROP_BOOL("gop-dlg", RDNA4State, gop_dlg, false),
     DEFINE_PROP_BOOL("cursor-ttu-hypothesis", RDNA4State, cursor_ttu_hypothesis, false),
     DEFINE_PROP_BOOL("hang-sticky", RDNA4State, hang_sticky, false),
     DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,

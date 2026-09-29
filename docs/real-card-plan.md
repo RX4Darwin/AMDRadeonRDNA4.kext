@@ -91,7 +91,7 @@ separate power-management work.
    `docs/cursor-audit.md` for how to read the result.
    **W32/W34 (round 5): the cursor plane's DLG state.** The trail has `ttu:` and `gate:` lines at arming, self-test, after each
    boot flip and at macOS's first cursor calls (TTU/QoS/`HUBPREQ_DEBUG_DB`, HUBP clock, cursor memory power, MPCC0 selects, sprite
-   pixels read back). With `rdna4-cursor=2` the kext also writes amdgpu's `HUBPREQ_DEBUG_DB = 1 << 8` (DLG mission mode,
+   pixels read back). With `rdna4-cursor=2` the kext may write amdgpu's `HUBPREQ_DEBUG_DB = 1 << 8` (only if the GOP already programmed the DLG: SURF0 delivery non-zero, bit 8 clear; otherwise logged and skipped) (DLG mission mode,
    `dcn401_hubp.c:329`; old value logged; `rdna4-cursordlg=0` skips it as the control). The DML-style `DCN_CUR0_TTU_CNTL0/1` write is
    an opt-in (`rdna4-cursorttu=1`): amdgpu leaves that pair 0 on DCN 4.01. `docs/cursor-ttu.md` says what each line means.
 
@@ -111,6 +111,9 @@ separate power-management work.
    **W33 additions:** `single-packet probe NOP / WRITE_DATA / RELEASE_MEM / ACQUIRE_MEM` with a `fault after single <packet>` line each (the first one naming
    `CID 0x6` is the packet that makes the CPG read VA 0), a `sentinel:` line saying whether the CP-side read tracks context writes (read `probe mid` only if it does),
    `probe consistency` in the ladder, RS64 bases for both pipes. The fault marks and RS64 evidence run on every `rdna4-gfx=2` boot and clear the fault status.
+   **Power-cycle rule (W35):** if the log shows `single-packet probe ... did not finish`, `NOT idle`, a NOT-signalled fence, or `draw: skipped, the sentinel submission did not finish`, do a
+   cold power cycle before the next boot (there is no GPU reset), like after an `rdna4-gfxdiag=4` hang. The single-packet probe stops at the first unfinished step; the sentinel logs
+   the value CB_SHADER_MASK held before it writes its two values and skips the draw if its own submission did not finish.
 
 7. **Optional W19 GFX power-management probe.**
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31`.

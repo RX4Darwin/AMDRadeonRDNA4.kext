@@ -413,7 +413,7 @@ private:
 	void gfxProbeReport(const char *label, uint32_t poolOff, volatile uint32_t *ib, uint32_t *equal = nullptr,
 	                    uint32_t *counted = nullptr);
 	void gfxPacketProbe();                   // W33 S1: NOP / WRITE_DATA / RELEASE_MEM / ACQUIRE_MEM alone, a fault mark after each
-	void gfxSentinelCheck();                 // W33 S2: does a CP-side read observe a context write made just before it?
+	bool gfxSentinelCheck();   // false only when its submission did not finish                 // W33 S2: does a CP-side read observe a context write made just before it?
 	void gfxFaultMark(const char *tag);      // GC hub fault status: log and clear, to pin the step that faults
 	void gfxRs64Evidence(const char *tag);   // PFP/ME/MEC data-cache and instruction-cache base registers
 	Pm4::Queue gfxRing;
