@@ -69,3 +69,22 @@ the second draw's context readback show the classic packets taking effect.
 Reading it: `probe mid` all equal and still no pixels and no marker: state is right, look downstream of the CP (GE/SPI/PA), the `fault after`
 line and the RS64 bases decide whether the CP itself is unhealthy. Some registers differ: they were not applied (a `SET_*` packet the CP ignores or
 a filter); fix that packet form. DC_BASE 0: program the firmware's data base as the direct-load path does.
+
+## 5. W33: the W31 review follow-ups (`premetal/w31-review.md`)
+
+- **S1, which packet makes the CPG read and write VA 0.** The IH vectors of round 4 are a *read and a write* at VA 0 (`src_data[1]` 0x40 and 0x20) and they recur with every
+  submission that carries a `RELEASE_MEM`; the IH ring only comes up after the ring tests, so a fault during the bring-up left no IV. Instead of moving IH earlier
+  (the ring tests would then depend on the IH stage), `gfxPacketProbe` (`rdna4-gfxprobe=1`, right after the ring test) submits **one packet per submission** and reads
+  the fault status after each: `single NOP`, `single WRITE_DATA`, `single RELEASE_MEM` (fence), `single ACQUIRE_MEM` (the GL2 write-back flush). The status is cleared first
+  (`fault after single-packet probe start`), each packet gets a 2 ms settle time, and the first `fault after single <PACKET>` line that names `CID 0x6` is the packet.
+  If none does, the fault comes from the later steps (fence test, IB test, wrap: each has its own mark).
+- **S2, is the CP-side read decisive?** `gfxSentinelCheck` (`rdna4-gfxprobe=1`, before the baseline draw) writes sentinel A to CB_SHADER_MASK (a register the draw stream sets
+  again, so no state is left), reads it back with `COPY_DATA` on the ring, writes sentinel B, reads again, and reads once over MMIO. Verdicts printed on the `sentinel:` line:
+  A then B = the CP-side read tracks writes (`probe mid` is trustworthy); A then A = it lags one write like MMIO (the first draw's `probe mid` is stale, do not read it as
+  "not applied"); the same stale value twice = it does not observe context writes. The ladder also prints `probe consistency (mid, equal/compared)` with the baseline next to
+  every variant; a baseline below its variants says the same lag.
+- **S3, fault marks and RS64 evidence run on every `rdna4-gfx=2` boot** (they always did: they are not behind `rdna4-gfxprobe`), and they clear the status. The commit message of
+  W31 said otherwise; the decision (with the lead) is to keep it, so on boots 4, 5 and 10-12 the `before draw` fault line means "since the previous mark". RS64 evidence now reads both ME0
+  pipes (the registers are per pipe). Read-only, and DC_BASE must not be programmed from the kext without the PSP-loaded data image's address.
+- **A bug found on the way:** the PS marker (`kGfxTestOffset + 0x40`) and probe slot 0 (`kGfxProbeOffset`) were the same dword, so `VGT_SHADER_STAGES_EN got 0xc0de0001` in the
+  emulator's `diag 8` probe was the marker, not a register. The probe buffers moved to `kGfxRptrOffset + 0x200/0x280`.

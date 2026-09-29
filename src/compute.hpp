@@ -388,8 +388,8 @@ private:
 	static constexpr uint32_t kGfxTargetOffset = kGfxOffset + 0x40000;   // 256 KiB
 	static constexpr uint32_t kGfxDrawFenceOffset = kGfxTestOffset + 0x20;
 	static constexpr uint32_t kGfxMarkerOffset = kGfxTestOffset + 0x40;   // the PS-store diagnostic marker
-	static constexpr uint32_t kGfxProbeOffset  = kGfxRptrOffset + 0x100;  // CP-view readback, state before the draw (32 dwords)
-	static constexpr uint32_t kGfxProbePost    = kGfxRptrOffset + 0x180;  // ... and after it
+	static constexpr uint32_t kGfxProbeOffset  = kGfxRptrOffset + 0x200;  // CP-view readback, state before the draw (32 dwords); +0x100 is the PS marker (W33: they overlapped)
+	static constexpr uint32_t kGfxProbePost    = kGfxRptrOffset + 0x280;  // ... and after it
 	uint64_t   gfxRings { 0 };               // device-heap offset of the GE rings (0 = none)
 	bool stageGfxDraw();
 	struct GfxDrawResult {
@@ -397,6 +397,8 @@ private:
 		uint32_t drawFence, covered, other, firstNonZero, marker;
 		uint32_t minX, maxX, minY, maxY, row64[2], row190[2];
 		uint64_t ns;
+		bool probeSeen;                         // rdna4-gfxprobe: the CP-side readback ran for this draw
+		uint32_t probeEqual, probeCounted;      // 'probe mid': registers equal to the stream / registers compared
 	};
 	bool gfxDrawRun(const char *label, uint32_t variant, const uint64_t *va, GfxDrawResult &r);
 	void gfxCountTarget(GfxDrawResult &r);
@@ -405,7 +407,10 @@ private:
 	static uint32_t requestedGfxDiag();
 	static uint32_t requestedGfxProbe();     // rdna4-gfxprobe=1: read the CP's own view of the state (COPY_DATA)
 	void gfxEmitProbe(uint32_t poolOff);
-	void gfxProbeReport(const char *label, uint32_t poolOff, volatile uint32_t *ib);
+	void gfxProbeReport(const char *label, uint32_t poolOff, volatile uint32_t *ib, uint32_t *equal = nullptr,
+	                    uint32_t *counted = nullptr);
+	void gfxPacketProbe();                   // W33 S1: NOP / WRITE_DATA / RELEASE_MEM / ACQUIRE_MEM alone, a fault mark after each
+	void gfxSentinelCheck();                 // W33 S2: does a CP-side read observe a context write made just before it?
 	void gfxFaultMark(const char *tag);      // GC hub fault status: log and clear, to pin the step that faults
 	void gfxRs64Evidence(const char *tag);   // PFP/ME/MEC data-cache and instruction-cache base registers
 	Pm4::Queue gfxRing;

@@ -103,6 +103,9 @@ separate power-management work.
    copy 22 context/SH/uconfig registers into memory on the ring (`draw probe mid/post: CP view ... N of M registers equal what the
    stream wrote`); `fault after <step>` shows which bring-up step makes the CPG read VA 0; `RS64 DC_BASE0 ...` prints the microengine
    base registers. The earlier MMIO context readback lags one context, so read the CP view instead (`docs/gfx-context-audit.md`).
+   **W33 additions:** `single-packet probe NOP / WRITE_DATA / RELEASE_MEM / ACQUIRE_MEM` with a `fault after single <packet>` line each (the first one naming
+   `CID 0x6` is the packet that makes the CPG read VA 0), a `sentinel:` line saying whether the CP-side read tracks context writes (read `probe mid` only if it does),
+   `probe consistency` in the ladder, RS64 bases for both pipes. The fault marks and RS64 evidence run on every `rdna4-gfx=2` boot and clear the fault status.
 
 7. **Optional W19 GFX power-management probe.**
    `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31`.

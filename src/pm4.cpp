@@ -16,6 +16,19 @@ uint32_t setUconfigReg(uint32_t *out, uint32_t reg, uint32_t value) {
 	return 3;
 }
 
+uint32_t setContextReg(uint32_t *out, uint32_t offset, uint32_t value) {
+	out[0] = header(OpSetContextReg, 1);
+	out[1] = offset;
+	out[2] = value;
+	return 3;
+}
+
+uint32_t nop(uint32_t *out) {
+	out[0] = header(OpNop, 0);
+	out[1] = 0;
+	return 2;
+}
+
 uint32_t writeData(uint32_t *out, uint64_t addr, uint32_t value) {
 	out[0] = header(OpWriteData, 3);
 	out[1] = kWriteDstMemory | kWriteConfirm;
