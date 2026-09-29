@@ -22,8 +22,10 @@ uint64_t encodePte(uint64_t physical, uint64_t flags, bool fragment64K) {
 uint64_t encodePde(uint64_t physical, uint64_t flags, uint32_t level) {
 	(void)level;
 	/* gfx12.0 has no translate_further: a regular directory entry is just
-	 * its GPU-physical address and VALID.  PDE_PTE is reserved for a huge
-	 * page leaf and BFS is likewise meaningful only with that leaf format. */
+	 * its GPU-physical address and VALID.  Bit 63 is set on a directory entry
+	 * only when it is a huge-page leaf (amdgpu_vm_pt.c:411, 685); BFS is
+	 * meaningful only with that leaf format.  Leaf PTEs at the last level are
+	 * the opposite: they MUST carry bit 63 (kIsPte, see gpuvm.hpp). */
 	return (physical & kPhysicalMask) | (flags & kValid);
 }
 
@@ -55,6 +57,12 @@ bool walk(uint64_t root, uint64_t va, ReadEntry read, void *context,
 		if (!read(context, address, entry) || !(entry & kValid))
 			return false;
 		if (level + 1 == kLevels) {
+			/* GFX12: a last-level entry without IS_PTE is a directory entry and the
+			 * walk goes one level further (umr access_vram_ai.c:1063-1069).  That
+			 * further level is not modelled: it is a fault, as it is on the card
+			 * for every zeroed data page. */
+			if (!(entry & kIsPte))
+				return false;
 			flags = entry;
 			physical = entryPhysical(entry) | (va & (kPageBytes - 1));
 			return true;
