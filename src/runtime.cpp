@@ -513,6 +513,7 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 		uint64_t flags = GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable;
 		if (executable)
 			flags |= GpuVm::kExecutable;
+		flags = (flags | vmPteSet) & ~vmPteClear;   /* W22 diagnostics only, 0 otherwise */
 		/* FRAG=4 says this PTE is part of a contiguous, 64 KiB-aligned run of
 		 * sixteen: only when the whole aligned block lies inside this mapping
 		 * (amdgpu_vm_pte_fragment); a lone 4 KiB page that merely happens to
@@ -620,6 +621,14 @@ bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
 		RLOG("vmid %u: page-table sync arguments rejected (offset 0x%x bytes 0x%x)",
 		     c.vmid, offset, bytes);
 		return false;
+	}
+	if (vmTableCpu) {
+		/* W22 variant T: the table lives in the CPU-visible pool and is written
+		 * by the CPU through the BAR (amdgpu_vm_cpu style), then an HDP flush. */
+		memcpy(poolCpu + vmTableCpu + offset, reinterpret_cast<uint8_t *>(c.tableShadow) + offset, bytes);
+		(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + vmTableCpu + offset);
+		flushHdp();
+		return true;
 	}
 	memcpy(poolCpu + kVmTableStage, reinterpret_cast<uint8_t *>(c.tableShadow) + offset, bytes);
 	(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + kVmTableStage);
@@ -789,14 +798,17 @@ bool RDNA4Compute::vmBootSelfTest() {
 	uint32_t forceFail = 0;
 	(void)PE_parse_boot_argn("rdna4-vm-force-fail", &forceFail, sizeof(forceFail));
 	/* rdna4-vm-diag (default 0 = off): which hardware-writing diagnostics may run
-	 * after the baseline queue fails.  bit0 E4 (IB from the VMID0 ring), bit1 a
-	 * (TAP_*_PHYSICAL), bit2 b (ctx0 covers the tables), bit3 c (MC-form
-	 * pointers), bit4 E2 (mirror LOCAL_FB/LOCAL_SYSMEM).  The E1 register dumps
+	 * after the baseline queue fails.  bit0 E4 (IB in VMID 8 from a scratch VMID0
+	 * queue), bit1 a (TAP_*_PHYSICAL), bit2 b (ctx0 covers the tables), bit3 c
+	 * (MC-form pointers), bit4 E2 (mirror LOCAL_FB/LOCAL_SYSMEM), bit5 d (IS_PTE on
+	 * leaf PTEs), bit6 e (no SNOOPED), bit7 g (EXECUTABLE), bit8 T (tables built by
+	 * the CPU).  Any bit also runs the control test.  The E1 register dumps
 	 * and the SDMA table readback are read-only and always on with rdna4-vm=1.
 	 * The force-fail test hook only counts together with a diag mask. */
+	uint32_t curPipe = pipe, curQueue = queue, curDoorbell = doorbell;
 	uint32_t diag = 0;
 	(void)PE_parse_boot_argn("rdna4-vm-diag", &diag, sizeof(diag));
-	diag &= 0x1f;
+	diag &= 0x1ff;
 	if (!diag)
 		forceFail = 0;
 
@@ -891,7 +903,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 		       vmMap(c, ibVa, poolMc(ibOff), 0x1000, false);
 	};
 	auto hqdStop = [&]() {
-		grbmSelect(1, pipe, queue, vmid);
+		grbmSelect(1, curPipe, curQueue, vmid);
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
 		bool idle = false;
 		for (uint32_t us = 0; us < 100000; us += 10) {
@@ -925,8 +937,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 			c.pm4.init(poolDw(qoff + kVmPq), qva, kPqSize);
 		}
 		trail(first ? "vm: HQD activate" : "vm: variant HQD activate");
-		hqd = hqdInitFor(false, pipe, queue, vmid, poolMc(qoff + kVmMqd),
-		                 eva >> 8, qva >> 8, rva, wva, doorbell);
+		hqd = hqdInitFor(false, curPipe, curQueue, vmid, poolMc(qoff + kVmMqd),
+		                 eva >> 8, qva >> 8, rva, wva, curDoorbell);
 		*poolDw(dataOff) = 0;
 		*c.fenceCpu = 0;
 		flushHdp();
@@ -939,7 +951,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 		RLOG("vm: boot%s: fault status before the kick 0x%08x (stale 0x%08x, cleared)", tag,
 		     rdGc(GcL2FaultStatusLo), stale);
 		trail(first ? "vm: queue kick" : "vm: variant queue kick");
-		pm4Kick(c.pm4, doorbell, c.pm4.wptr());
+		pm4Kick(c.pm4, curDoorbell, c.pm4.wptr());
 		fence = false;
 		for (uint32_t us = 0; us < 200000 && !fence; us += 10) {
 			fence = *c.fenceCpu == value;
@@ -957,7 +969,12 @@ bool RDNA4Compute::vmBootSelfTest() {
 			     *c.fenceCpu, *poolDw(dataOff), status);
 			/* One bounded dump for the real-card log: where the HQD stopped,
 			 * what the CP reported, and what the doorbell holds. */
-			grbmSelect(1, pipe, queue, vmid);
+			grbmSelect(1, curPipe, curQueue, vmid);
+			{
+				const uint32_t dbc = rdGc(CpHqdPqDoorbell);
+				RLOG("vm: boot%s: MEC pipe %u queue %u, HQD doorbell control 0x%08x: the MEC %s the doorbell",
+				     tag, curPipe, curQueue, dbc, (dbc >> 31) ? "did NOT service (HIT still set)" : "consumed");
+			}
 			RLOG("vm: boot%s HQD: MQD 0x%08x:%08x MQD_CONTROL 0x%08x EOP 0x%08x:%08x "
 			     "rptr report 0x%08x:%08x wptr poll 0x%08x:%08x", tag,
 			     rdGc(CpMqdBaseAddrHi), rdGc(CpMqdBaseAddr), rdGc(CpMqdControl),
@@ -966,9 +983,9 @@ bool RDNA4Compute::vmBootSelfTest() {
 			grbmSelect(0, 0, 0, 0);
 			RLOG("vm: boot%s ring: wptr %llu dwords, rptr report in memory 0x%08x, "
 			     "doorbell dword %u readback 0x%llx", tag,
-			     static_cast<unsigned long long>(c.pm4.wptr()), *poolDw(qoff + kVmRptr), doorbell,
-			     static_cast<unsigned long long>(doorbells[doorbell / 2]));
-			logComputeQueueState("vm: boot", pipe, queue, vmid);
+			     static_cast<unsigned long long>(c.pm4.wptr()), *poolDw(qoff + kVmRptr), curDoorbell,
+			     static_cast<unsigned long long>(doorbells[curDoorbell / 2]));
+			logComputeQueueState("vm: boot", curPipe, curQueue, vmid);
 			return false;
 		}
 		return true;
@@ -979,7 +996,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 		dumpTables(" before kick");
 		if (forceFail) {
 			/* Test hook (off by default): break the context's range so the
-			 * baseline faults and the variants below run. */
+			 * baseline faults and the diagnostics below run. */
 			RLOG("vm: boot: rdna4-vm-force-fail set, END_ADDR forced to 0 for the baseline");
 			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtEndLo.dword + 2 * (vmid - 1) }, 0);
 			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtEndHi.dword + 2 * (vmid - 1) }, 0);
@@ -987,7 +1004,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 		(void)attempt("", true);
 		if (forceFail == 2 && !(fence && data && clean)) {
 			/* Test hook, mode 2: the fault is "HQD side only": put the context back,
-			 * so E4 (an IB through the same tables) passes in the emulator. */
+			 * so the tests below (an IB through the same tables) pass in the emulator. */
 			if (hqdStop())
 				hqd = false;
 			(void)vmContextInit(c);
@@ -996,15 +1013,19 @@ bool RDNA4Compute::vmBootSelfTest() {
 		if (!(fence && data && clean)) {
 			const bool baseFence = fence, baseData = data, baseClean = clean;
 			dumpWindows(" after fault");
-			/* Ladder (only with rdna4-vm-diag): each variant changes one thing,
-			 * re-kicks a fresh queue and logs its fault status, then puts the
-			 * setting back.  A passing variant is only reported; the runtime
-			 * stays disabled this boot.  A dequeue that times out abandons the
-			 * rest (an active HQD is never reprogrammed). */
+			/* Diagnostics (only with rdna4-vm-diag).  Round 3 on the card showed that
+			 * after the first VM fault the same HQD slot is not serviced again (its
+			 * doorbell HIT stays set, no fault is latched), so every test below gets
+			 * a FRESH queue slot on MEC pipes 1-3 (pipe 0 hosts the kernel ring and
+			 * the baseline queue), and the IB probe (E4) runs first, as a scratch
+			 * VMID0 queue of its own, so a fault can never wedge the kernel ring.
+			 * Each test changes one thing, logs its fault status and puts the
+			 * setting back.  A passing test is only reported; the runtime stays
+			 * disabled this boot.  A dequeue that times out abandons the rest. */
 			bool abandon = !diag;
 			if (!diag) {
-				RLOG("vm: baseline failed; write diagnostics are off (rdna4-vm-diag=0x1f runs "
-				     "a, b, c, E2, E4)");
+				RLOG("vm: baseline failed; write diagnostics are off (rdna4-vm-diag=481 runs "
+				     "E4, control, d, e, g, T; 30 runs a, b, c, E2)");
 			} else if (!hqdStop()) {
 				RLOG("vm: HQD dequeue timed out; diagnostics abandoned");
 				abandon = true;
@@ -1015,24 +1036,107 @@ bool RDNA4Compute::vmBootSelfTest() {
 			const uint32_t savedL4 = rdGc(GcL2Cntl4);
 			const uint32_t savedC0[4] = { rdGc(GcCtx0PtStartLo), rdGc(GcCtx0PtStartHi),
 			                              rdGc(GcCtx0PtEndLo), rdGc(GcCtx0PtEndHi) };
-			const uint64_t savedPhys = c.rootPhys;
+			const uint64_t savedPhys = c.rootPhys, savedMc = c.rootMc;
+
+			bool e4Wedged = false;
+			/* E4: one IB fetched in VMID 8 from a scratch VMID 0 (privileged, like
+			 * amdgpu's kernel compute rings, gfx_v12_0.c:3250-3251) queue on MEC
+			 * pipe 1 queue 3, slot 7's pool area (unused at boot).  Passes: tables
+			 * and hub are fine and the fault is HQD-side.  Faults: hub or tables. */
+			if (!abandon && (diag & 1)) {
+				trail("vm: E4 IB probe");
+				const uint32_t q7 = kVmQueueBase + 7 * kVmQueueStride, db = 0x32;
+				for (uint32_t off = 0; off < 0x7000; off += 4)
+					*poolDw(q7 + off) = 0;
+				uint32_t ibPkt[8];
+				const uint32_t ibDw = Pm4::writeData(ibPkt, dataVa, 0x600df00e);
+				for (uint32_t i = 0; i < ibDw; i++)
+					*poolDw(ibOff + 0x100 + i * 4) = ibPkt[i];
+				*poolDw(dataOff) = 0;
+				flushHdp();
+				Pm4::Queue eq;
+				const bool mapped = ibDw && vmMap(c, ibVa, poolMc(ibOff), 0x1000, false);
+				const bool queueOk = mapped && eq.init(poolDw(q7 + kVmPq), poolMc(q7 + kVmPq), kPqSize);
+				gcFaultClear();
+				(void)vmInvalidate(vmid, "E4");
+				bool e4Fence = false, e4Hqd = false;
+				volatile uint32_t *e4FenceCpu = poolDw(q7 + kVmFence);
+				const uint32_t seq = 0x564d0004;
+				if (queueOk) {
+					e4Hqd = hqdInitFor(false, 1, 3, 0, poolMc(q7 + kVmMqd), poolMc(q7 + kVmEop) >> 8,
+					                   poolMc(q7 + kVmPq) >> 8, poolMc(q7 + kVmRptr),
+					                   poolMc(q7 + kVmWptr), db);
+					uint32_t pkt[8];
+					if (e4Hqd &&
+					    eq.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa + 0x100, ibDw, vmid)) &&
+					    eq.emit(pkt, Pm4::releaseMem(pkt, poolMc(q7 + kVmFence), seq))) {
+						pm4Kick(eq, db, eq.wptr());
+						for (uint32_t us = 0; us < 200000 && !e4Fence; us += 10) {
+							e4Fence = *e4FenceCpu == seq;
+							if (!e4Fence)
+								IODelay(10);
+						}
+					}
+				}
+				const uint32_t e4Status = rdGc(GcL2FaultStatusLo);
+				RLOG("vm: E4: IB from a VMID0 queue (pipe 1 queue 3), fetched in VMID %u: mapped %d "
+				     "queue %d fence %d data 0x%08x fault status 0x%08x => %s", vmid, mapped, e4Hqd,
+				     e4Fence, *poolDw(dataOff), e4Status,
+				     e4Fence && *poolDw(dataOff) == 0x600df00e && !e4Status
+				         ? "PASS (walker and tables work; the VMID 8 HQD is the problem)"
+				         : "fail (hub or tables)");
+				if (e4Status)
+					logGcFault("vm: E4");
+				if (e4Hqd) {
+					grbmSelect(1, 1, 3, 0);
+					{
+						const uint32_t dbc = rdGc(CpHqdPqDoorbell);
+						RLOG("vm: E4: doorbell control 0x%08x: the MEC %s the doorbell", dbc,
+						     (dbc >> 31) ? "did NOT service (HIT still set)" : "consumed");
+					}
+					wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
+					bool idle = false;
+					for (uint32_t us = 0; us < 100000 && !idle; us += 10) {
+						idle = !(rdGc(CpHqdActive) & 1);
+						if (!idle)
+							IODelay(10);
+					}
+					wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+					grbmSelect(0, 0, 0, 0);
+					if (!idle)
+						RLOG("vm: E4: scratch queue did not dequeue (pipe 1 is not used again; tests move to pipe 2)");
+						e4Wedged = true;
+				}
+				gcFaultClear();
+				(void)vmInvalidate(vmid, "E4 clean");
+			}
+
+			/* The queue tests: control (nothing changed), then one change each. */
+			enum { kControl, kA, kB, kC, kE2, kD, kE, kG, kT, kTests };
+			static const uint32_t bitOf[kTests] = { 0, 2, 4, 8, 16, 32, 64, 128, 256 };
+			static const char *const nameOf[kTests] = {
+				" control (no change, fresh pipe)", " variant a (TAP_*_PHYSICAL=1)",
+				" variant b (ctx0 covers tables)", " variant c (MC-form table pointers)",
+				" variant E2 (GC windows := MM)", " variant d (IS_PTE bit 63 on leaf PTEs)",
+				" variant e (no SNOOPED on VRAM PTEs)", " variant g (EXECUTABLE on leaf PTEs)",
+				" variant T (tables built by the CPU in the pool)" };
 			uint32_t savedWin[4] = {};
-			bool passed[4] = { false, false, false, false };
-			bool e2Skipped = false;
-			/* a, b, c, E2, then E4 last (below). */
-			static const uint32_t order[4] = { 0, 1, 2, 3 };
-			static const uint32_t bit[4] = { 2, 4, 8, 16 };
-			for (uint32_t k = 0; k < 4; k++) {
-				const uint32_t v = order[k];
-				if (abandon || !(diag & bit[v]))
+			bool passed[kTests] = {}, ran[kTests] = {};
+			/* Safe PTE-only tests first, hub-writing ones last; slots fill pipe 1 first
+			 * (amdgpu warns about pipes 2/3, amdgpu_gfx.c:289-294): pipe 1 queues 0-2
+			 * (queue 3 is E4's), then pipe 2, pipe 3 last. */
+			static const uint32_t order[kTests] = { kControl, kD, kE, kG, kT, kA, kB, kC, kE2 };
+			static const uint8_t slotPipe[9] = { 1, 1, 1, 2, 2, 2, 2, 3, 3 };
+			static const uint8_t slotQueue[9] = { 0, 1, 2, 0, 1, 2, 3, 0, 1 };
+			uint32_t slot = e4Wedged ? 3 : 0;
+			for (uint32_t oi = 0; oi < kTests; oi++) {
+				const uint32_t v = order[oi];
+				if (abandon || (v == kControl ? !diag : !(diag & bitOf[v])))
 					continue;
-				const char *tag = v == 3 ? " variant E2 (GC windows := MM)"
-				                : v == 0 ? " variant a (TAP_*_PHYSICAL=1)"
-				                : v == 1 ? " variant b (ctx0 covers tables)"
-				                         : " variant c (MC-form table pointers)";
+				const char *tag = nameOf[v];
 				RLOG("vm: variant:%s", tag);
 				trail("vm: variant apply");
-				if (v == 3) {
+				if (v == kE2) {
 					/* Mirror only the windows that differ (APT_CNTL, CACHEABLE_DRAM_* and
 					 * NB_TOP_OF_DRAM_* are never copied: the MM value is not the right
 					 * one for them).  A locked register shows in the readback. */
@@ -1057,13 +1161,12 @@ bool RDNA4Compute::vmBootSelfTest() {
 					}
 					if (!written) {
 						RLOG("vm: E2: the four mirrored windows are already equal on both hubs; skipped");
-						e2Skipped = true;
 						continue;
 					}
 					(void)gcHubFlush();
-				} else if (v == 0) {
+				} else if (v == kA) {
 					wr(IpDiscovery::HwGc, GcL2Cntl4, savedL4 | kL2Cntl4TapPhysMask);
-				} else if (v == 1) {
+				} else if (v == kB) {
 					/* Flat context-0 entries for the table pages: pfn -> same
 					 * VRAM physical page, in the (otherwise unused) ctx0 table. */
 					const uint64_t first = c.rootPhys >> 12;
@@ -1080,34 +1183,60 @@ bool RDNA4Compute::vmBootSelfTest() {
 					wr(IpDiscovery::HwGc, GcCtx0PtEndLo, static_cast<uint32_t>(first + 7));
 					wr(IpDiscovery::HwGc, GcCtx0PtEndHi, static_cast<uint32_t>((first + 7) >> 32));
 					(void)gcHubFlush();
-				} else {
+				} else if (v == kC) {
 					c.rootPhys = c.rootMc;
 					if (!buildTables() || !vmContextInit(c))
 						RLOG("vm: variant c: table rebuild failed");
+				} else if (v == kD || v == kE || v == kG) {
+					/* PTE flag variants, rebuilt through the normal table path.
+					 * d: KFD's own leaf PTEs carry IS_PTE on gfx12 (kfd_svm.c:1375);
+					 * e: amdgpu sets SNOOPED on VRAM only for cached BOs
+					 * (amdgpu_ttm.c:1457); g: KFD maps compute code EXECUTABLE. */
+					vmPteSet = v == kD ? GpuVm::kPdePte : v == kG ? GpuVm::kExecutable : 0;
+					vmPteClear = v == kE ? GpuVm::kSnooped : 0;
+					if (!buildTables())
+						RLOG("vm: variant: table rebuild failed");
+				} else if (v == kT) {
+					/* The same tables written by the CPU through the BAR (amdgpu_vm_cpu
+					 * style + HDP flush) into the CPU-visible pool, no SDMA involved. */
+					vmTableCpu = kVmTableCpu;
+					c.rootMc = poolMc(kVmTableCpu);
+					if (!gpuPhysical(c.rootMc, c.rootPhys) || !buildTables() || !vmContextInit(c))
+						RLOG("vm: variant T: table build failed");
 				}
 				gcFaultClear();
 				dumpSetup(tag);
-				if (v == 2)
+				if (v == kC || v == kT || v == kD)
 					dumpTables(tag);
+				/* A fresh queue slot for every test: MEC pipes 1-3, queues 0-3. */
+				if (slot >= 9) {
+					RLOG("vm: variant: no queue slot left");
+					break;
+				}
+				curPipe = slotPipe[slot];
+				curQueue = slotQueue[slot];
+				curDoorbell = 0x1a + 2 * (slot + 1);
+				slot++;
+				ran[v] = true;
 				passed[v] = attempt(tag, false);
 				RLOG("vm: variant:%s -> %s (fault status 0x%08x)", tag, passed[v] ? "PASS" : "fail",
 				     rdGc(GcL2FaultStatusLo));
 				if (!hqdStop()) {
 					RLOG("vm: variant: HQD dequeue timed out; the rest is abandoned");
 					abandon = true;
-					hqd = true;    /* still active: the final cleanup dequeues it */
+					hqd = true;    /* still active: the final cleanup retries this slot */
 				} else {
 					hqd = false;
 				}
 				trail("vm: variant restore");
-				if (v == 3) {
+				if (v == kE2) {
 					for (uint32_t i = 0; i < nMir; i++)
 						if (rdGc(Reg { 0, mir[i].gc }) != savedWin[i])
 							wr(IpDiscovery::HwGc, Reg { 0, mir[i].gc }, savedWin[i]);
 					(void)gcHubFlush();
-				} else if (v == 0) {
+				} else if (v == kA) {
 					wr(IpDiscovery::HwGc, GcL2Cntl4, savedL4);
-				} else if (v == 1) {
+				} else if (v == kB) {
 					for (uint32_t i = 0; i < 16; i++)
 						*poolDw(kPtOffset + i * 4) = 0;
 					flushHdp();
@@ -1116,76 +1245,32 @@ bool RDNA4Compute::vmBootSelfTest() {
 					wr(IpDiscovery::HwGc, GcCtx0PtEndLo, savedC0[2]);
 					wr(IpDiscovery::HwGc, GcCtx0PtEndHi, savedC0[3]);
 					(void)gcHubFlush();
-				} else {
+				} else if (v == kC || v == kD || v == kE || v == kG || v == kT) {
+					vmPteSet = vmPteClear = 0;
+					vmTableCpu = 0;
 					c.rootPhys = savedPhys;
+					c.rootMc = savedMc;
 					if (!buildTables() || !vmContextInit(c))
-						RLOG("vm: variant c: table restore failed");
+						RLOG("vm: variant: table restore failed");
 				}
 				gcFaultClear();
 				(void)vmInvalidate(vmid, "variant restore");
 			}
-			/* E4 (last: it relies on a recovery path never seen on the card): one IB fetched in VMID 8 from the working VMID 0 kernel ring
-			 * (ring, EOP, rptr, wptr, MQD all VMID 0), isolating the walker
-			 * from the VMID 8 HQD.  Passes: tables and hub are fine and the
-			 * fault is HQD-side.  Faults: hub or tables.  A stuck kernel ring
-			 * is recovered with the no-reset queue recovery (rdna4-hang=1),
-			 * so the probe is skipped without it. */
-			if (abandon || !(diag & 1)) {
-				/* not requested (or the ladder was abandoned) */
-			} else if (!hangRecoveryEnabled) {
-				RLOG("vm: E4: skipped (a fault could wedge the kernel ring; needs rdna4-hang=1)");
-			} else {
-				trail("vm: E4 IB probe");
-				uint32_t ibPkt[8];
-				const uint32_t ibDw = Pm4::writeData(ibPkt, dataVa, 0x600df00e);
-				for (uint32_t i = 0; i < ibDw; i++)
-					*poolDw(ibOff + 0x100 + i * 4) = ibPkt[i];
-				*poolDw(dataOff) = 0;
-				*poolDw(kPm4FenceOffset) = 0;
-				flushHdp();
-				const bool mapped = ibDw && vmMap(c, ibVa, poolMc(ibOff), 0x1000, false);
-				gcFaultClear();
-				(void)vmInvalidate(vmid, "E4");
-				bool e4Fence = false;
-				if (mapped) {
-					uint32_t pkt[8];
-					const uint32_t seq = pm4Fence + 1;
-					if (pm4Queue.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa + 0x100, ibDw, vmid)) &&
-					    pm4Queue.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), seq))) {
-						pm4Fence = seq;
-						pm4Kick(pm4Queue.wptr());
-						for (uint32_t us = 0; us < 200000 && !e4Fence; us += 10) {
-							e4Fence = *poolDw(kPm4FenceOffset) == seq;
-							if (!e4Fence)
-								IODelay(10);
-						}
-					}
-				}
-				const uint32_t e4Status = rdGc(GcL2FaultStatusLo);
-				RLOG("vm: E4: IB from the VMID0 ring, fetched in VMID %u: mapped %d fence %d data 0x%08x "
-				     "fault status 0x%08x => %s", vmid, mapped, e4Fence, *poolDw(dataOff), e4Status,
-				     e4Fence && *poolDw(dataOff) == 0x600df00e && !e4Status
-				         ? "PASS (walker and tables work; the VMID 8 HQD is the problem)"
-				         : "fail (hub or tables)");
-				if (e4Status)
-					logGcFault("vm: E4");
-				if (!e4Fence) {
-					trail("vm: E4 recover kernel ring");
-					if (!recoverComputeQueue("vm: E4", nullptr))
-						RLOG("vm: E4: kernel ring recovery failed, compute stays wedged this boot");
-				}
-				gcFaultClear();
-				(void)vmInvalidate(vmid, "E4 clean");
+			if (diag) {
+				RLOG("vm: variants (ran/PASS): control %d/%d, a %d/%d, b %d/%d, c %d/%d, E2 %d/%d, d %d/%d, "
+				     "e %d/%d, g %d/%d, T %d/%d (baseline failed; runtime stays disabled)",
+				     ran[kControl], passed[kControl], ran[kA], passed[kA], ran[kB], passed[kB],
+				     ran[kC], passed[kC], ran[kE2], passed[kE2], ran[kD], passed[kD], ran[kE], passed[kE],
+				     ran[kG], passed[kG], ran[kT], passed[kT]);
 			}
-			RLOG("vm: variants: a %s, b %s, c %s, E2 %s (baseline failed; runtime stays disabled)",
-			     passed[0] ? "PASS" : "fail", passed[1] ? "PASS" : "fail", passed[2] ? "PASS" : "fail",
-			     e2Skipped ? "skipped" : passed[3] ? "PASS" : "fail");
 			fence = baseFence; data = baseData; clean = baseClean;
 		}
 	}
 	if (context && (hqd || !fence)) {
 		trail("vm: HQD dequeue");
-		grbmSelect(1, pipe, queue, vmid);
+		if (curPipe != pipe || curQueue != queue)
+			RLOG("vm: final dequeue of the last test slot (pipe %u queue %u)", curPipe, curQueue);
+		grbmSelect(1, curPipe, curQueue, vmid);
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
 		inactive = false;
 		for (uint32_t us = 0; us < 100000; us += 10) {

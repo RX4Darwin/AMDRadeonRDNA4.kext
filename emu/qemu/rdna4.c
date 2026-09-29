@@ -684,6 +684,7 @@ struct RDNA4State {
     struct {
         bool     active;
         uint32_t pipe, queue, vmid, size, rptr;
+        bool     priv;
         uint64_t pq, wptr;
         uint32_t packet_len;
     } mec_work;
@@ -3939,6 +3940,10 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
                         s->mec_work.pipe = pipe;
                         s->mec_work.queue = queue;
                         s->mec_work.vmid = reg_get(s, REG_CP_HQD_VMID) & 0xf;
+                        /* CP_HQD_PQ_CONTROL.PRIV_STATE [30]: kernel queues (amdgpu sets it
+                         * for kernel compute rings, gfx_v12_0.c:3250) may fetch an IB in
+                         * any VMID, the job's (gfx_v12_0_ring_emit_ib_compute). */
+                        s->mec_work.priv = (reg_get(s, REG_CP_HQD_PQ_CNTL) >> 30) & 1;
                         s->mec_work.size = 2u << (reg_get(s, REG_CP_HQD_PQ_CNTL) & 0x3f);
                         s->mec_work.pq = ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE) << 8) |
                                          ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE_HI) << 40);
@@ -4032,14 +4037,15 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
                 return false;
             }
             if (control & ((1u << 20) | (1u << 21) | (1u << 31)) ||
-                ((control >> 24) & 0xf) != s->mec_work.vmid) {
+                (!s->mec_work.priv && ((control >> 24) & 0xf) != s->mec_work.vmid)) {
                 fprintf(stderr, "rdna4: mec: indirect buffer was privileged/chained or VMID mismatched; queue stopped\n");
                 s->mec_hung = true;
                 return false;
             }
+            const uint32_t ib_vmid = s->mec_work.priv ? (control >> 24) & 0xf : s->mec_work.vmid;
             if (!ib_dwords || !rdna4_gc_span_vmid(s, (uint64_t)dw[1] | ((uint64_t)dw[2] << 32),
                                     (uint64_t)ib_dwords * 4,
-                                    s->mec_work.vmid, false, false)) {
+                                    ib_vmid, false, false)) {
                 fprintf(stderr, "rdna4: mec: invalid indirect buffer; queue stopped\n");
                 s->mec_hung = true;
                 return false;
@@ -4048,7 +4054,7 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
             s->mec_ib.address = (uint64_t)dw[1] | ((uint64_t)dw[2] << 32);
             s->mec_ib.dwords = ib_dwords;
             s->mec_ib.pos = 0;
-            s->mec_ib.vmid = s->mec_work.vmid;
+            s->mec_ib.vmid = ib_vmid;
             s->mec_ib.depth = 0;
             s->mec_ib.packet_len = 0;
             s->mec_ib.outer_len = len;

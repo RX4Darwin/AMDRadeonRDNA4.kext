@@ -56,10 +56,7 @@ constexpr Reg RlcGpmStat          { 1, 0x4e6c };
 // W24 survey (gc_12_0_0_offset.h): busy/idle and clock-gating state, read only.
 constexpr Reg CpBusyStat          { 0, 0x0f3f };   // CP_BUSY_STAT
 constexpr Reg CpCpfBusyStat       { 0, 0x0e28 };   // CP_CPF_BUSY_STAT
-constexpr Reg GrbmStatusSe0       { 0, 0x0da5 };   // GRBM_STATUS_SE0..3: SC/DB/CB clean, UTCL1/TCP/PC/PA/TA/SX busy
-constexpr Reg GrbmStatusSe1       { 0, 0x0da6 };
-constexpr Reg GrbmStatusSe2       { 0, 0x0dae };
-constexpr Reg GrbmStatusSe3       { 0, 0x0daf };
+// GrbmStatusSe0..3 (GRBM_STATUS_SE0..3) are defined at the top of this file.
 constexpr Reg CpGfxHqdActive      { 0, 0x1e80 };   // CP_GFX_HQD_ACTIVE, banked by GRBM_GFX_CNTL (ME0)
 constexpr Reg RlcSafeMode         { 1, 0x0980 };   // RLC_SAFE_MODE
 constexpr Reg RlcCgttMgcgOverride { 1, 0x4c48 };   // RLC_CGTT_MGCG_OVERRIDE: bits set = that gating is overridden (off)
