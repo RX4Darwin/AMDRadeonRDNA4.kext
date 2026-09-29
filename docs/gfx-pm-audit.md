@@ -279,3 +279,23 @@ Emulator: models the hazard, not the power saving. After `AllowGfxOff` any GC re
 is counted and logged as `GC ... while GFXOFF is allowed (violation N)` (reads return all ones, writes drop); the
 metrics report activity 0 and 8 W while allowed (the model's numbers, not silicon's). The dry run must show zero
 violations with the guard (verified: 0 in the dry runs). The negative case (guard compiled out, expecting violations) was NOT run.
+
+### Review B1/S1/S3 fixes (`premetal/pm3`)
+
+- **B1, the guard across boots.** A fresh kext instance starts with `gcState == On`, so the first GC read (the
+  stage-1 survey, `defensiveStart`) was unguarded if a previous boot left GFXOFF allowed and the ASIC kept it.
+  Layer 1: `quiesceForShutdown` calls `gcWake(...)` before its first GC access (this also clears the flag).
+  Layer 2: an NVRAM flag (`...:rdna4-gfxoff`) is written before `AllowGfxOff` and cleared after a successful
+  `DisallowGfxOff`; `gfxOffPreflight` reads it at the start of `start()`, before the survey, and sends
+  `DisallowGfxOff` first. The SMU mailbox is MP1 (`SmuMsg/SmuArg/SmuResp` = MP1 C2PMSG_66/82/90, `gfxregs.hpp`), not
+  GC, so it is reachable while GC is powered down; whether it answers that early is not proven on the card (the
+  PSP loads the SMU firmware in stage 2 on a cold boot; after a warm restart the previous boot's PMFW is still
+  running). If it does not answer, `kGcHold`: `start()` returns before the survey and every GC access this boot is
+  dropped. **Caveat:** the code comment in `runStages` says NVRAM is not published yet at attach; the preflight logs
+  whether the flag was readable at attach, and `runStages` checks again after the 5 s wait (a late flag still lifts
+  GFXOFF before stage 2, but the stage-1 reads cannot then be protected, and the log says so).
+- **S1.** A failed `DisallowGfxOff` now sets `kGcHold`: `GcAccess::ok` is false, `rd()` returns `kBad`, `wr()` and the
+  doorbell writes do nothing; nothing proceeds to a block that may be powered down.
+- **S3, emulator.** `gfxoff_active` already survives a reset; new options `gfxoff-preset` (every reset leaves the GC
+  block powered down) and `smu-preloaded` (the POST-loaded PMFW answers the mailbox from reset on) model "the ASIC kept
+  GFXOFF across the restart", and `qom-set /machine/peripheral/rdna4 gfxoff-force` changes it at run time.

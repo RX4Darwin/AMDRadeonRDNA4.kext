@@ -418,9 +418,13 @@ private:
 	void gfxCapApply(uint32_t mhz);
 	// W27: rdna4-gfxoff (GFXOFF allowed at the very end of bring-up, guarded on every
 	// GC access) and rdna4-gfxcg (clock gating), see the comments in compute.cpp.
-	static constexpr SInt32 kGcOn = 0, kGcAllowing = 1, kGcOff = 2;
+	// kGcHold: GFXOFF could not be lifted (the SMU did not answer). Every GC access is
+	// dropped for the rest of the boot: rd() reads kBad, wr() and doorbells do nothing.
+	static constexpr SInt32 kGcOn = 0, kGcAllowing = 1, kGcOff = 2, kGcHold = 3;
 	struct GcAccess {
 		const RDNA4Compute &c;
+		bool ok { true };            // false: the access must be dropped
+		bool counted { false };
 		explicit GcAccess(const RDNA4Compute &comp, uint32_t what);   // what: (seg << 16) | dword, or 0xdb000000 | doorbell dword
 		~GcAccess();
 	};
@@ -429,9 +433,15 @@ private:
 	IOLock *gcLock { nullptr };
 	IOLock *smuLock { nullptr };                // serializes the SMU mailbox
 	void gcWake(uint32_t what) const;
+	// Persistent "GFXOFF may be allowed" flag in NVRAM (set before AllowGfxOff, cleared
+	// after a successful DisallowGfxOff), read at the next start.
+	static bool gfxOffFlagGet();
+	static void gfxOffFlagSet(bool set);
+	void gfxOffPreflight(bool attach);
 	bool gfxOffAllow();
 	void gfxOffProbe();
 	static bool requestedGfxOff();
+	static uint32_t gfxOffMode();               // rdna4-gfxoff value; 2 = test hook: only leave the NVRAM flag set
 	static constexpr uint32_t kCgStepCoarse = 1, kCgStepMedium = 2, kCgStepFine = 4, kCgStepGuiIdle = 8;
 	static bool requestedGfxCg(uint32_t &mask);
 	bool rlcSafeMode(bool enter);
@@ -569,6 +579,9 @@ private:
 	static constexpr uint32_t kMaxClients = 8;
 	static constexpr uint32_t kVmTableBytes = 4u << 20;
 	static constexpr uint32_t kVmTableStage = 20u << 20;
+	static constexpr uint32_t kVmTableCpu = 28u << 20;    // W22 variant T: CPU-written tables (0x4000)
+	uint64_t vmPteSet { 0 }, vmPteClear { 0 };            // W22 diagnostics: extra/removed leaf PTE bits
+	uint32_t vmTableCpu { 0 };                            // W22 variant T: pool offset of CPU-written tables
 	static constexpr uint32_t kVmQueueBase = 26u << 20;
 	static constexpr uint32_t kVmQueueStride = 0x10000;
 	static constexpr uint32_t kVmMqd = 0x0000;

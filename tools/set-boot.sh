@@ -1,7 +1,7 @@
 #!/bin/bash
 # Set the boot-args for one boot of docs/real-card-plan.md on the OpenCore USB.
 #
-#   bash /Volumes/OPENCORE/set-boot.sh <0-15>
+#   bash /Volumes/OPENCORE/set-boot.sh <0-17>
 #
 #   0  this morning's known-good arguments (no new feature enabled)
 #   1  + interrupts and W6 opt-in            rdna4-ih=1 rdna4-hang=1
@@ -13,7 +13,7 @@
 #   7  optional: GFX power-management probe rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31
 #      (samples the SMU metrics, sets the default workload mask, releases the
 #      GFXCLK soft limits, then caps GFXCLK at 1000 MHz for one sample and lifts it)
-#   8  W17 VM walker diagnostics            rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31
+#   8  W17 VM walker diagnostics            rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=481 (E4, control, PTE-only tests d/e/g/T: no hub writes)
 #   9  optional: cursor self-test: boot 6 with rdna4-cursor=2 (a magenta 64x64 square at (100,100), macOS pointer ignored)
 #  10  round 4 draw: boot 5 with the golden registers (default) and the rdna4-gfxdiag=11 ladder (8, 2, 1) if the draw is empty
 #  11  A/B control: boot 10 with rdna4-gfxgolden=0. The goldens survive a warm restart: POWER-CYCLE first (or run 11 before 10)
@@ -21,6 +21,8 @@
 #  13  lift a GFXCLK cap: boot 1 + rdna4-gfxcap=0 (a cap survives warm reboots; also lifted by a cold power cycle)
 #  14  W27 clock gating: boot 1 + survey + rdna4-gfxcg=15 (RLC CGCG/CGLS/MGCG/FGCG + GUI-idle interrupt, applied last; rdna4-gfxcg=0 undoes it)
 #  15  W27 clock gating + GFXOFF: boot 14 + rdna4-gfxoff=1 (AllowGfxOff at the very end, every GC access wakes it first; sticky until reboot)
+#  16  W17 VM hub-write variants a/b/c/E2 (rdna4-vm-diag=30): a later round, only if boot 8 (481) is still all-fail
+#  17  cursor A/B control: boot 9 with rdna4-cursorlock=0 (the MPC cursor lock left alone, as before W25)
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
 # the one the next boot uses. A copy of the config is kept next to it first.
@@ -35,7 +37,7 @@ case "${1:-}" in
 	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1" ;;
 	7) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31" ;;
-	8) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31" ;;
+	8) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=481" ;;
 	9) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-hang=1" ;;
 	10) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-gfxdiag=11 rdna4-hang=1" ;;
 	11) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-gfxgolden=0 rdna4-gfxdiag=11 rdna4-hang=1" ;;
@@ -43,7 +45,9 @@ case "${1:-}" in
 	13) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxcap=0" ;;
 	14) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=24 rdna4-gfxcg=15" ;;
 	15) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=24 rdna4-gfxcg=15 rdna4-gfxoff=1" ;;
-	*) echo "usage: bash $0 <0-15>   (see docs/real-card-plan.md)"; exit 1 ;;
+	16) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=30" ;;
+	17) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorlock=0 rdna4-hang=1" ;;
+	*) echo "usage: bash $0 <0-17>   (see docs/real-card-plan.md)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"

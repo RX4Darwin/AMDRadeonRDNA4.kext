@@ -603,6 +603,12 @@ struct RDNA4State {
     bool     gfx_hang;       /* accept gfx kicks but leave the ring stopped */
     uint32_t smu_gfx_soft_max;   /* SetSoftMaxByFreq(GFXCLK) in MHz, 0 = automatic */
     uint32_t smu_workload_mask;  /* last SetWorkloadMask */
+    bool     gfxoff_preset;      /* "gfxoff-preset": every reset leaves the GC block powered down (an earlier boot allowed GFXOFF and the ASIC kept it) */
+    uint32_t gfxoff_arm_ms;      /* "gfxoff-arm-ms": ... from this many virtual ms after the reset, so the firmware phase (which a real card re-POSTs) is not hit */
+    bool     gfxoff_pending;
+    int64_t  gfxoff_arm_ns;
+    uint32_t reset_count;
+    bool     smu_preloaded;      /* "smu-preloaded": the PMFW the VBIOS loaded at POST answers the mailbox from reset on */
     bool     gfxoff_active;      /* AllowGfxOff seen and no DisallowGfxOff since: the GC block is powered down */
     uint32_t gfxoff_violations;  /* GC register/doorbell accesses made while it was */
     uint32_t smu_refuse;         /* "smu-refuse": this SMU message answers CmdRejectedPrereq (0xfd) */
@@ -611,6 +617,7 @@ struct RDNA4State {
     bool     smu_stale;      /* metrics transfer acks but the table is never rewritten */
     bool     warm_keep;      /* reset keeps live engines/queues, like warm card restart */
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
+    bool     cursor_lock_stuck; /* the GOP left the MPC cursor lock (CUR_VUPDATE_LOCK_SET0) held */
     bool     cursor_reject_logged;
     uint32_t gfx_break;      /* corrupt one G3 MUST register at draw time */
     bool     gfx_golden_strict; /* refuse a draw when the amdgpu golden registers are unset (gfx-golden-strict) */
@@ -686,6 +693,7 @@ struct RDNA4State {
     struct {
         bool     active;
         uint32_t pipe, queue, vmid, size, rptr;
+        bool     priv;
         uint64_t pq, wptr;
         uint32_t packet_len;
     } mec_work;
@@ -1714,10 +1722,12 @@ static void rdna4_smu_msg(RDNA4State *s, uint32_t msg)
         fprintf(stderr, "rdna4: smu: SetWorkloadMask 0x%x\n", param);
         break;
     case 0x28:                                     /* AllowGfxOff: entered at once in the model */
+        s->gfxoff_pending = false;
         s->gfxoff_active = true;
         fprintf(stderr, "rdna4: smu: AllowGfxOff, GC powered down\n");
         break;
     case 0x29:                                     /* DisallowGfxOff */
+        s->gfxoff_pending = false;
         if (s->gfxoff_active) {
             fprintf(stderr, "rdna4: smu: DisallowGfxOff, GC powered up\n");
         }
@@ -2612,6 +2622,11 @@ static bool rdna4_gc_dword(uint32_t dw)
 
 static bool rdna4_gfxoff_hazard(RDNA4State *s, const char *what, hwaddr addr)
 {
+    if (s->gfxoff_pending && qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) >= s->gfxoff_arm_ns) {
+        s->gfxoff_pending = false;
+        s->gfxoff_active = true;
+        fprintf(stderr, "rdna4: gfxoff-preset armed: GC powered down\n");
+    }
     if (!s->gfxoff_active) {
         return false;
     }
@@ -3988,6 +4003,10 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
                         s->mec_work.pipe = pipe;
                         s->mec_work.queue = queue;
                         s->mec_work.vmid = reg_get(s, REG_CP_HQD_VMID) & 0xf;
+                        /* CP_HQD_PQ_CONTROL.PRIV_STATE [30]: kernel queues (amdgpu sets it
+                         * for kernel compute rings, gfx_v12_0.c:3250) may fetch an IB in
+                         * any VMID, the job's (gfx_v12_0_ring_emit_ib_compute). */
+                        s->mec_work.priv = (reg_get(s, REG_CP_HQD_PQ_CNTL) >> 30) & 1;
                         s->mec_work.size = 2u << (reg_get(s, REG_CP_HQD_PQ_CNTL) & 0x3f);
                         s->mec_work.pq = ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE) << 8) |
                                          ((uint64_t)reg_get(s, REG_CP_HQD_PQ_BASE_HI) << 40);
@@ -4081,14 +4100,15 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
                 return false;
             }
             if (control & ((1u << 20) | (1u << 21) | (1u << 31)) ||
-                ((control >> 24) & 0xf) != s->mec_work.vmid) {
+                (!s->mec_work.priv && ((control >> 24) & 0xf) != s->mec_work.vmid)) {
                 fprintf(stderr, "rdna4: mec: indirect buffer was privileged/chained or VMID mismatched; queue stopped\n");
                 s->mec_hung = true;
                 return false;
             }
+            const uint32_t ib_vmid = s->mec_work.priv ? (control >> 24) & 0xf : s->mec_work.vmid;
             if (!ib_dwords || !rdna4_gc_span_vmid(s, (uint64_t)dw[1] | ((uint64_t)dw[2] << 32),
                                     (uint64_t)ib_dwords * 4,
-                                    s->mec_work.vmid, false, false)) {
+                                    ib_vmid, false, false)) {
                 fprintf(stderr, "rdna4: mec: invalid indirect buffer; queue stopped\n");
                 s->mec_hung = true;
                 return false;
@@ -4097,7 +4117,7 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
             s->mec_ib.address = (uint64_t)dw[1] | ((uint64_t)dw[2] << 32);
             s->mec_ib.dwords = ib_dwords;
             s->mec_ib.pos = 0;
-            s->mec_ib.vmid = s->mec_work.vmid;
+            s->mec_ib.vmid = ib_vmid;
             s->mec_ib.depth = 0;
             s->mec_ib.packet_len = 0;
             s->mec_ib.outer_len = len;
@@ -6266,6 +6286,13 @@ static bool rdna4_get_cursor(RDNA4State *s, const RDNA4Scanout *so, RDNA4Cursor 
     const int hubp = rdna4_hubp_for_otg(s, so->otg);
     if (hubp < 0)
         return false;
+    /* The MPC cursor lock (regCUR_VUPDATE_LOCK_SET<opp> at MPC dword 0x02c5 + 5 * opp, base idx 3;
+     * amdgpu writes it around every cursor update: mpc1_cursor_lock, dc/mpc/dcn10/dcn10_mpc.c:458-463).
+     * While it is 1 the cursor registers stay pending and the plane does not change: the model
+     * shows no cursor until the driver has released it (cursor-lock-stuck=on starts it held,
+     * as a GOP might leave it). */
+    if (reg_get(s, SEG3(0x02c5 + 5 * so->otg)) & 1)
+        return false;
     const uint32_t hp = hubp * HUBP_STRIDE;
     const uint32_t dpp = hubp * DPP_STRIDE;
     const uint32_t control = reg_get(s, SEG2(HUBP_CURSOR_CONTROL + hp));
@@ -6648,6 +6675,8 @@ static void rdna4_reset(DeviceState *dev)
      * IP discovery gc_info table, as in amdgpu_discovery_get_gc_info.  The
      * register is read-only in the model; always present the card's value. */
     reg_set(s, REG_GFX_GB_ADDR_CONFIG, 0x08200545u);
+    if (s->cursor_lock_stuck)
+        reg_set(s, SEG3(0x02c5), 1);
     if (dcn) {
         memcpy(s->regs + dcn_start, dcn, dcn_bytes);
         g_free(dcn);
@@ -6664,7 +6693,13 @@ static void rdna4_reset(DeviceState *dev)
     s->psp_ring_mc = 0;
     s->psp_ring_size = 0;
     s->psp_rptr = 0;
-    s->pmfw_loaded = false;
+    s->pmfw_loaded = s->smu_preloaded;
+    if (s->gfxoff_preset) {
+        s->gfxoff_pending = true;
+        s->gfxoff_arm_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + (int64_t)s->gfxoff_arm_ms * SCALE_MS;
+        fprintf(stderr, "rdna4: reset: the GC block will be powered down in %u ms (gfxoff-preset), PMFW %s\n",
+                s->gfxoff_arm_ms, s->pmfw_loaded ? "answering (smu-preloaded)" : "not loaded");
+    }
     memset(s->psp_fw_types, 0, sizeof(s->psp_fw_types));
     s->smu_allowed = ~0ull;
     s->smu_running = 0;
@@ -6844,9 +6879,24 @@ static void rdna4_exit(PCIDevice *dev)
     g_free(s->discovery);
 }
 
+static bool rdna4_get_gfxoff_force(Object *obj, Error **errp)
+{
+    return RDNA4(obj)->gfxoff_active;
+}
+
+/* qom-set /machine/peripheral/rdna4 gfxoff-force true: the GC block is powered down as if
+ * an earlier boot had allowed GFXOFF. gfxoff_active is not touched by a device reset, so it
+ * survives a warm restart, as the real ASIC's state would. */
+static void rdna4_set_gfxoff_force(Object *obj, bool value, Error **errp)
+{
+    RDNA4(obj)->gfxoff_active = value;
+    fprintf(stderr, "rdna4: gfxoff-force %s\n", value ? "on: GC powered down" : "off");
+}
+
 static void rdna4_instance_init(Object *obj)
 {
     PCI_DEVICE(obj)->cap_present |= QEMU_PCI_CAP_EXPRESS;
+    object_property_add_bool(obj, "gfxoff-force", rdna4_get_gfxoff_force, rdna4_set_gfxoff_force);
 }
 
 static const Property rdna4_properties[] = {
@@ -6864,11 +6914,15 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("ih-dead", RDNA4State, ih_dead, false),
     DEFINE_PROP_BOOL("dcn-irq-storm", RDNA4State, dcn_irq_storm, false),
     DEFINE_PROP_BOOL("cursor", RDNA4State, cursor_enabled, false),
+    DEFINE_PROP_BOOL("cursor-lock-stuck", RDNA4State, cursor_lock_stuck, false),
     DEFINE_PROP_BOOL("hang-sticky", RDNA4State, hang_sticky, false),
     DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,
                 bool),
     DEFINE_PROP_BOOL("gfx-hang", RDNA4State, gfx_hang, false),
     DEFINE_PROP_BOOL("smu-stale", RDNA4State, smu_stale, false),
+    DEFINE_PROP_BOOL("gfxoff-preset", RDNA4State, gfxoff_preset, false),
+    DEFINE_PROP_UINT32("gfxoff-arm-ms", RDNA4State, gfxoff_arm_ms, 0),
+    DEFINE_PROP_BOOL("smu-preloaded", RDNA4State, smu_preloaded, false),
     DEFINE_PROP_UINT32("smu-refuse", RDNA4State, smu_refuse, 0),
     DEFINE_PROP_UINT32("smu-refuse-skip", RDNA4State, smu_refuse_skip, 0),
     DEFINE_PROP_BOOL("warm-keep", RDNA4State, warm_keep, false),
