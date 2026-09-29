@@ -801,7 +801,7 @@ void RDNA4Compute::runStages() {
 		if (!bringupStepAllowed("clock gating")) return;
 		gfxCgApply(cgMask);
 	}
-	if (done >= StageGfx && featureAllowed("pm") && requestedGfxOff()) {
+	if (done >= StageGfx && featureAllowed("pm") && (requestedGfxOff() || gfxOffHook())) {
 		if (!bringupStepAllowed("gfxoff")) return;
 		gfxOffProbe();
 	}
@@ -1080,10 +1080,10 @@ bool RDNA4Compute::gfxOffFlagGet() {
 	return set;
 }
 
-void RDNA4Compute::gfxOffFlagSet(bool set) {
+bool RDNA4Compute::gfxOffFlagSet(bool set) {
 	IORegistryEntry *nvram = IORegistryEntry::fromPath("/options", gIODTPlane);
 	if (!nvram)
-		return;
+		return false;
 	const OSSymbol *key = OSSymbol::withCString(kGfxOffKey);
 	OSString *value = OSString::withCString(set ? "1" : "0");
 	OSDictionary *sync = OSDictionary::withCapacity(1);
@@ -1097,6 +1097,7 @@ void RDNA4Compute::gfxOffFlagSet(bool set) {
 	OSSafeReleaseNULL(value);
 	OSSafeReleaseNULL(key);
 	nvram->release();
+	return gfxOffFlagGet() == set;              // read it back: a flag that did not stick protects nothing
 }
 
 // Called before the first GC read of a start (attach == true) and again once NVRAM is
@@ -1104,7 +1105,7 @@ void RDNA4Compute::gfxOffFlagSet(bool set) {
 void RDNA4Compute::gfxOffPreflight(bool attach) {
 	// Test hook (VM only): the guest NVRAM does not survive between vm-test runs, so
 	// rdna4-gfxoff=3 pretends the flag was found set; 2 leaves it set and reads it back.
-	const bool pretend = gfxOffMode() == 3;
+	const bool pretend = gfxOffHook() == 3;
 	const bool flag = gfxOffFlagGet() || pretend;
 	CLOG("gfxoff: %s: previous-boot GFXOFF flag %s%s%s", attach ? "attach" : "bring-up start",
 	     flag ? "SET" : "clear", pretend ? " (TEST HOOK rdna4-gfxoff=3 pretends it)" : "",
@@ -1232,10 +1233,22 @@ bool RDNA4Compute::gfxOffAllow() {
 		uint32_t ret = 0;
 		// Persist "GFXOFF may be allowed" BEFORE the message: the next boot reads it and
 		// sends DisallowGfxOff before it touches GC, even after a crash or a hard reset.
-		gfxOffFlagSet(true);
+		if (!gfxOffFlagSet(true)) {
+			// S5: without the flag the next boot cannot know; do not allow GFXOFF at all.
+			CLOG("gfxoff: the persistent flag could not be written (read-back is not 1); AllowGfxOff NOT sent");
+			gcState = kGcOn;
+			IOLockUnlock(gcLock);
+			return false;
+		}
 		const uint32_t resp = smuSend(kSmuMsgAllowGfxOff, 0, ret, 100);
 		CLOG("gfxoff: AllowGfxOff -> 0x%02x", resp);
 		if (resp == kSmuRespOk) {
+			gcState = kGcOff;
+			ok = true;
+		} else if (resp == 0) {
+			// S6: a timeout is ambiguous, the SMU may still have processed the message. Treat it as
+			// possibly allowed: keep the flag set and go through the guard as if allowed.
+			CLOG("gfxoff: AllowGfxOff timed out: treated as possibly allowed (flag kept, the guard stays armed)");
 			gcState = kGcOff;
 			ok = true;
 		} else {
@@ -1254,9 +1267,10 @@ bool RDNA4Compute::gfxOffAllow() {
 void RDNA4Compute::gfxOffProbe() {
 	if (!poolCpu)
 		return;
-	if (gfxOffMode() == 3)
+	const uint32_t hook = gfxOffHook();
+	if (hook == 3)
 		return;                                 // test hook: preflight only, nothing is allowed
-	if (gfxOffMode() == 2) {
+	if (hook == 2) {
 		// Test hook (rdna4-gfxoff=2, VM only): behave as if a boot had allowed GFXOFF and then died
 		// before waking it: the persistent flag stays set, nothing is allowed. The next start must
 		// send DisallowGfxOff before its first GC read.
@@ -1285,6 +1299,25 @@ void RDNA4Compute::gfxOffProbe() {
 		CLOG("gfxoff: metrics query failed after AllowGfxOff");
 }
 
+bool RDNA4Compute::runsUnderHypervisor() {
+	uint32_t a = 1, b = 0, c = 0, d = 0;
+	__asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+	return (c >> 31) & 1;
+}
+
+// rdna4-gfxoff=2 and =3 are VM test hooks. On real hardware (no hypervisor) they are ignored
+// and logged, so a stray value can neither pretend a flag nor leave one behind.
+uint32_t RDNA4Compute::gfxOffHook() {
+	const uint32_t v = gfxOffMode();
+	if (v != 2 && v != 3)
+		return 0;
+	if (!runsUnderHypervisor()) {
+		CLOG("gfxoff: TEST HOOK rdna4-gfxoff=%u ignored: this is not an emulated device", v);
+		return 0;
+	}
+	return v;
+}
+
 uint32_t RDNA4Compute::gfxOffMode() {
 	uint32_t v = 0;
 	if (!PE_parse_boot_argn("rdna4-gfxoff", &v, sizeof(v)))
@@ -1292,8 +1325,9 @@ uint32_t RDNA4Compute::gfxOffMode() {
 	return v;
 }
 
+// The real AllowGfxOff needs exactly rdna4-gfxoff=1; any other value (a typo, 10) is ignored.
 bool RDNA4Compute::requestedGfxOff() {
-	return gfxOffMode() != 0;
+	return gfxOffMode() == 1;
 }
 
 // ---------------------------------------------------------------------------
