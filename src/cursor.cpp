@@ -442,6 +442,13 @@ constexpr uint32_t kOtgGlobalSyncStatus = 0x1b88;
 constexpr uint32_t kCnvcFormatControl = 0x0cd0, kCmControl = 0x0d67, kDppTopControl = 0x0cc5;
 constexpr uint32_t kMpccControl = 0x0003, kMpccUpdateLockSel = 0x0005, kMpccStatus = 0x000e;
 constexpr uint32_t kMpccStride = 0x15, kMpcOutMux = 0x02f2, kMpcOutStride = 4;
+// The MPC cursor lock and its neighbours (dcn_4_1_0_offset.h:5455-5467, base 3, opp 0): five
+// lock-set registers per OPP in this order (stride 5): ADR_CFG_CUR, ADR_CFG, ADR, CFG,
+// CUR_VUPDATE_LOCK_SET0 (0x02c5, bit 0). DC writes only the last one (mpc1_cursor_lock,
+// dcn10_mpc.c:458-463), around every cursor update. MPC_DPP_PENDING_STATUS 0x02bf and
+// MPC_PENDING_STATUS_MISC 0x02c0 show which blocks still have updates pending.
+constexpr uint32_t kMpcDppPending = 0x02bf, kMpcPendingMisc = 0x02c0;
+constexpr uint32_t kMpcLockBase = 0x02c1, kMpcLockStride = 5, kMpcCurLock = 4;
 
 // The cursor surface is one fixed 64x64 slot, the way amdgpu's DM hands the
 // hardware a whole cursor buffer (attr->width/height = the buffer, the image
