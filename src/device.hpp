@@ -233,6 +233,7 @@ private:
 	bool cursorWaitLatched(const char *why, uint32_t maxMs);
 	uint32_t cursorLockDepth { 0 }, cursorLatchLogs { 0 };
 	bool cursorUseLock { true };   // rdna4-cursorlock=0 turns the lock handling off (A/B control)
+	bool cursorGopHeld { false };  // the lock was found held at arming; released at the end of the first bracket
 	void cursorProgramPlane(bool enable);
 	void cursorSelfTest();
 	uint32_t cursorDstXOffset(uint32_t px) const;

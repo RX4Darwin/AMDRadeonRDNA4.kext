@@ -651,6 +651,11 @@ void RDNA4Device::cursorMpcLock(bool lock) {
 			regWriteDmu(3, reg, 1);
 	} else if (cursorLockDepth > 0 && --cursorLockDepth == 0) {
 		regWriteDmu(3, reg, 0);
+		if (cursorGopHeld) {   // the lock the GOP left held ends here, after the first programming
+			cursorGopHeld = false;
+			cursorNote("released the GOP-held CUR_VUPDATE_LOCK_SET at the end of the first bracket "
+			           "(reads 0x%08x now)", regReadDmu(3, reg));
+		}
 	}
 }
 
@@ -749,10 +754,13 @@ bool RDNA4Device::initHardwareCursor() {
 			cursorUseLock = false;
 			cursorNote("rdna4-cursorlock=0: the MPC cursor lock is left alone (the pre-W25 behaviour)");
 		}
+		// Not released here (W25 review S1): between a release and the first programming the
+		// next VUPDATE would latch whatever the cursor registers hold (GOP or reset state). The
+		// first bracket of cursorMpcLock re-asserts the lock, programs, and its unlock is what
+		// releases a held one, so only programmed state ever latches.
 		if (cursorUseLock && held != 0xffffffffu && (held & 1)) {
-			regWriteDmu(3, lockReg, 0);
-			cursorNote("released a held CUR_VUPDATE_LOCK_SET (was 0x%08x, now 0x%08x)", held,
-			           regReadDmu(3, lockReg));
+			cursorGopHeld = true;
+			cursorNote("CUR_VUPDATE_LOCK_SET is held (0x%08x) as the GOP left it; the first cursor bracket releases it", held);
 		}
 	}
 	hwCursorReady = true;
