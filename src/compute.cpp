@@ -639,7 +639,7 @@ void RDNA4Compute::runStages() {
 			strlcpy(hungFeature, kFeatures[i], sizeof(hungFeature));
 			// A hang between the cap probe and its restore leaves the GFXCLK
 			// soft max at 1001 MHz in the SMU across a warm reboot.
-			pmCapPending = !strncmp(prev, "pm: cap", 7);
+			pmCapPending = !strncmp(prev, "pm: cap", 7) || !strncmp(prev, "pm: gfxcap", 10);
 			CLOG("the previous boot died during \"%s\": %s is off this boot, everything else runs "
 			     "(the next boot tries it again)", prev, hungFeature);
 			env.owner->setProperty("Compute,PreviousHang", prev);
@@ -659,8 +659,18 @@ void RDNA4Compute::runStages() {
 		return;
 	}
 	// W24: engine busy survey at each stage, only with rdna4-gfxpm bit 16.
+	// A GFXCLK soft max survives warm reboots in the SMU (rdna4-gfxcap, the pm
+	// cap probe): remind whenever a pm boot-arg is present.
+	uint32_t capArg = 0;
+	if (requestedGfxPm() || requestedGfxCap(capArg))
+		CLOG("pm: reminder: a GFXCLK soft max set by an earlier boot (rdna4-gfxcap, or a cap probe that was not "
+		     "restored) stays in force across warm reboots; rdna4-gfxcap=0 (boot 10 in set-boot.sh) or a cold "
+		     "power cycle lifts it");
 	const bool pmSurveyOn = (requestedGfxPm() & kPmSurvey) && featureAllowed("pm");
-	auto survey = [&](const char *tag) { if (pmSurveyOn) gfxPmSurvey(tag); };
+	auto survey = [&](const char *tag) {
+		if (pmSurveyOn && done >= StageGfx && bringupStepAllowed("pm survey"))
+			gfxPmSurvey(tag);
+	};
 	auto stop = [&](const char *what) {
 		CLOG("%s failed; stopping, the display is not affected", what);
 		snprintf(note, sizeof(note), "stopped: %s failed (no hang)", what);
@@ -1011,24 +1021,34 @@ void RDNA4Compute::gfxPmSurvey(const char *tag) {
 	     rdGc(CpMeCntl), rdGc(CpMecRs64Cntl), rdGc(sdma(0, SdmaStatusReg)), rdGc(sdma(1, SdmaStatusReg)));
 	CLOG("pm: survey %s: RLC_CGTT_MGCG_OVERRIDE 0x%08x RLC_CGCG_CGLS_CTRL 0x%08x (CGCG_EN bit0, CGLS_EN bit1; "
 	     "override bits set = gating held off)", tag, rdGc(RlcCgttMgcgOverride), rdGc(RlcCgcgCglsCtrl));
-	char mec[200], gfx[40];
+	char mec[200], gfx[64];
 	size_t nm = 0, ng = 0;
 	uint32_t activeMec = 0, activeGfx = 0;
 	mec[0] = gfx[0] = 0;
-	for (uint32_t pipe = 0; pipe < 4; pipe++) {
-		for (uint32_t q = 0; q < 8; q++) {
+	// amdgpu's geometry for GC 12.0.0/12.0.1: one MEC with 2 pipes x 4 queues
+	// (gfx_v12_0_sw_init, gfx_v12_0.c:1416-1424), one ME with 1 pipe x 8 queues.
+	// A read of 0xffffffff means the bank is not implemented, never "active".
+	uint32_t notImplemented = 0;
+	for (uint32_t pipe = 0; pipe < 2; pipe++) {
+		for (uint32_t q = 0; q < 4; q++) {
 			grbmSelect(1, pipe, q, 0);
-			if (rdGc(CpHqdActive) & 1) {
+			const uint32_t v = rdGc(CpHqdActive);
+			if (v == kBad)
+				notImplemented++;
+			else if (v & 1) {
 				activeMec++;
 				if (nm + 8 < sizeof(mec))
 					nm += snprintf(mec + nm, sizeof(mec) - nm, " %u/%u", pipe, q);
 			}
 		}
 	}
-	for (uint32_t pipe = 0; pipe < 2; pipe++) {
-		for (uint32_t q = 0; q < 2; q++) {
+	for (uint32_t pipe = 0; pipe < 1; pipe++) {
+		for (uint32_t q = 0; q < 8; q++) {
 			grbmSelect(0, pipe, q, 0);
-			if (rdGc(CpGfxHqdActive) & 1) {
+			const uint32_t v = rdGc(CpGfxHqdActive);
+			if (v == kBad)
+				notImplemented++;
+			else if (v & 1) {
 				activeGfx++;
 				if (ng + 8 < sizeof(gfx))
 					ng += snprintf(gfx + ng, sizeof(gfx) - ng, " %u/%u", pipe, q);
@@ -1036,8 +1056,9 @@ void RDNA4Compute::gfxPmSurvey(const char *tag) {
 		}
 	}
 	grbmSelect(0, 0, 0, 0);
-	CLOG("pm: survey %s: active HQDs: MEC(pipe/queue) %u:%s; gfx(pipe/queue) %u:%s", tag, activeMec,
-	     activeMec ? mec : " none", activeGfx, activeGfx ? gfx : " none");
+	CLOG("pm: survey %s: active HQDs: MEC(pipe/queue) %u:%s; gfx(pipe/queue) %u:%s; %u bank reads 0xffffffff "
+	     "(not implemented)", tag, activeMec, activeMec ? mec : " none", activeGfx, activeGfx ? gfx : " none",
+	     notImplemented);
 	RDNA4SensorsEx s;
 	if (poolCpu && readSensorsEx(s))
 		CLOG("pm: survey %s: SMU avg GFXCLK pre-DS %u post-DS %u MHz, GFX activity %u %%, socket %u W, "

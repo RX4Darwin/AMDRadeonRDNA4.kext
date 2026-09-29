@@ -212,3 +212,13 @@ Logs `premetal/hw-logs/rdna4fb-diag-20260929-01*.txt` (boot 7 = `...-015441.txt`
   the SMU keeps the limit across warm reboots, so removing the boot-arg alone does not lift it.
 - **Round 5 proposal, not implemented**: an opt-in `rdna4-gfxcg=1` that mirrors `gfx_v12_0_update_gfx_clock_gating`
   in RLC safe mode, if the survey shows CGCG/MGCG off and no engine busy.
+
+### W24 review fixes
+
+- The end-of-bring-up survey (and every survey) now requires `done >= StageGfx` and `bringupStepAllowed`, so no
+  `GRBM_GFX_CNTL` write happens while GC may be in reset or during a shutdown quiesce.
+- The HQD scan follows amdgpu's GC 12.0.0/12.0.1 geometry (`gfx_v12_0.c:1416-1424`: one MEC of 2 pipes x 4 queues,
+  one ME of 1 pipe x 8 queues); a read of `0xffffffff` counts as "not implemented", never as active, and the count is logged.
+- A `pm: gfxcap` trail is recovered like the W19 cap (the next boot lifts the soft max once). Any boot with a pm
+  boot-arg logs a reminder that a soft max survives warm reboots; `set-boot.sh 10` (`rdna4-gfxcap=0`) lifts it.
+  A cap-less boot with no pm boot-arg cannot know a cap is in force, so it stays silent by design.

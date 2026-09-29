@@ -607,7 +607,7 @@ registry_value() {
 		record gfxpm SKIPPED "rdna4-gfxpm not enabled"
 	elif grep -q 'RDNA4FB: compute: pm: experiment finished' "$KLOG"; then
 		pm_first="$(grep 'RDNA4FB: compute: pm: baseline' "$KLOG" | tail -1 | sed -E 's/.*pm: baseline[^:]*: avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
-		pm_last="$(grep 'RDNA4FB: compute: pm: [^s].*avg GFXCLK pre-DS [0-9]*' "$KLOG" | tail -1 | sed -E 's/.*pm: ([^:]*): avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1: \2 MHz \3% \4 W/')"
+		pm_last="$(grep 'RDNA4FB: compute: pm: ' "$KLOG" | grep -v 'pm: survey ' | grep 'avg GFXCLK pre-DS [0-9]*'  | tail -1 | sed -E 's/.*pm: ([^:]*): avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1: \2 MHz \3% \4 W/')"
 		record gfxpm PASS "baseline $pm_first -> $pm_last"
 	else
 		record gfxpm FAIL "pm experiment did not finish (see the pm: lines)"

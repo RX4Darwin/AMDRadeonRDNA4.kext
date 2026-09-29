@@ -116,7 +116,7 @@ separate power-management work.
    busy. `rdna4-gfxcap=<MHz>` (default off) sets the GFXCLK soft max through
    the proven SetSoftMaxByFreq path as a stopgap; the SMU keeps it across
    warm reboots, so remove it with `rdna4-gfxcap=0` (or a cold power cycle),
-   not by dropping the boot-arg.
+   not by dropping the boot-arg (`set-boot.sh 10` writes `rdna4-gfxcap=0`).
 
 
 Boots 0-6 are not byte-for-byte unchanged in one respect: `rdna4-run sensors`
