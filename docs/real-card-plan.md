@@ -171,6 +171,20 @@ looks capped at about 1000 MHz.
    emulator-only test hook and is ignored without `rdna4-vm-diag`; never set it
    on the card.
 
+**W29: clock gating is now the default on every boot** (round 4 on the card, boot 14: 2541 MHz / 100 % / 131 W
+before, 803 MHz / 3 % / 20 W after, selftest and bench PASS at 48.5 TFLOPS FP16 with gating on). It is applied
+after all self-tests when the compute bring-up reached stage 7, exactly the sequence of entry 14 below;
+`rdna4-gfxcg=0` writes amdgpu's disable branch instead (boot 18 = boot 1 with gating off, the A/B control) and
+`rdna4-gfxcg=<mask>` selects steps. The `gfxcg` summary row now appears on every boot. Entries 14 and 15 keep their
+explicit `rdna4-gfxcg=15`, which is now the same as the default.
+
+**W29: GFXOFF wake.** Round 4, boot 15: after the guard woke GFX the first selftest dispatch timed out. The log
+showed why: `CP_HQD_ACTIVE 0`, PQ base, doorbell, rptr and wptr all 0. The directly programmed HQD does not survive the
+GFXOFF power-down (amdgpu's queues survive because the CP restores them from the MQD in memory). The wake now waits
+(bounded 200 ms) for `RLC_GPM_STAT` to show GFX powered with no register save/restore or WGP power-up in progress,
+logs the value, and re-programs the boot HQD if it was lost, proving it with a fenced WRITE_DATA, all before any
+other thread can touch GC. Look for `gfxoff: after the wake RLC_GPM_STAT ...` and `gfxoff: the boot HQD is back`.
+
 14. **Optional W27 clock gating (`rdna4-gfxcg=15`).**
     `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=24 rdna4-gfxcg=15`.
     Run it after the round-4 survey boot (7) has shown which engine is busy and CGCG/CGLS are off.

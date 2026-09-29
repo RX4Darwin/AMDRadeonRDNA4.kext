@@ -620,12 +620,17 @@ registry_value() {
 
 	# rdna4-gfxcg: "cg: ..." lines with a sample before and after (SMU average clock,
 	# activity, power). PASS = the enable sequence finished; read the values.
-	if [ -z "$GFXCG_MODE" ]; then
-		record gfxcg SKIPPED "rdna4-gfxcg not enabled"
-	elif dmesg | grep -q 'RDNA4FB: compute: cg: finished'; then
+	# Clock gating is on by default; the row reports the before/after sample of the "cg:" block.
+	if dmesg | grep -q 'RDNA4FB: compute: cg: finished'; then
 		cg_before="$(dmesg | grep 'RDNA4FB: compute: pm: cg before:' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
 		cg_after="$(dmesg | grep 'RDNA4FB: compute: pm: cg after (+1.3 s):' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
-		record gfxcg PASS "before $cg_before -> after $cg_after"
+		cg_kind="default on"
+		[ -n "$GFXCG_MODE" ] && cg_kind="rdna4-gfxcg=$GFXCG_MODE"
+		record gfxcg PASS "$cg_kind: before $cg_before -> after $cg_after"
+	elif dmesg | grep -q 'RDNA4FB: compute: cg: RLC is not running\|RLC safe mode did not acknowledge'; then
+		record gfxcg FAIL "clock gating not applied (see the cg: lines)"
+	elif [ -z "$GFXCG_MODE" ]; then
+		record gfxcg SKIPPED "bring-up did not reach stage 7, so the default clock gating was not applied"
 	else
 		record gfxcg FAIL "clock gating did not finish (see the cg: / pm: lines)"
 	fi
@@ -641,7 +646,10 @@ registry_value() {
 		go_wake="no GC access yet"
 		dmesg | grep -q 'RDNA4FB: compute: gfxoff: GFXOFF ended by' && go_wake="the guard woke GFX on a later GC access"
 		dmesg | grep -q 'not a GFXOFF reading' && go_wake="a user-space GC access ended GFXOFF inside the wait: the sample is NOT a GFXOFF reading"
-		record gfxoff PASS "1.5 s after Allow: $go_line; $go_wake"
+		go_q=""
+		dmesg | grep -q 'RDNA4FB: compute: gfxoff: the boot HQD is back' && go_q="; boot HQD lost in the power-down and restored"
+		dmesg | grep -q 'RDNA4FB: compute: gfxoff: the boot HQD could not be restored' && go_q="; BOOT HQD LOST AND NOT RESTORED"
+		record gfxoff PASS "1.5 s after Allow: $go_line; $go_wake$go_q"
 	else
 		record gfxoff FAIL "GFXOFF was not allowed (see the gfxoff: lines)"
 	fi

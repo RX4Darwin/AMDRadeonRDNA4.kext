@@ -305,3 +305,29 @@ violations with the guard (verified: 0 in the dry runs). The negative case (guar
 - **S5:** `gfxOffFlagSet` returns whether the read-back agrees; `gfxOffAllow` does not send `AllowGfxOff` unless the flag read back as 1 (log: "persistent flag could not be written").
 - **S6:** a timed-out `AllowGfxOff` (response 0) is treated as possibly allowed: the flag stays set and `gcState` is Off, so the first GC access goes through the guard and sends `DisallowGfxOff`. Explicit refusals clear the flag as before.
 - **Hooks:** the real Allow needs exactly `rdna4-gfxoff=1` (any other value, e.g. 10, is ignored). `=2` and `=3` are honoured only when CPUID reports a hypervisor (the emulated device); on hardware they log "TEST HOOK ... ignored".
+
+## 10. W29: clock gating on by default, GFXOFF wake (`premetal/pm4`)
+
+- **Default on.** Real card, round 4, boot 14 (`hw-logs/rdna4fb-diag-20260929-083313.txt`): the coarse/medium/fine
+  sequence of section 9 took the card from 2541 MHz / 100 % activity / 131 W to 803 MHz / 3 % / 20 W, the
+  selftest passed and the bench reached 48.5 TFLOPS in FP16. The reset values it replaced were `RLC_CGTT_MGCG_OVERRIDE
+  0x7ff`, `RLC_CGCG_CGLS_CTRL 0x0001003c`, `..._3D 0x3c`, `CP_RB_WPTR_POLL_CNTL 0x00400000`; after: `0x741`/`0x40`,
+  `0x363f`, `0x363f`, `0x00900100`. It is applied when the compute bring-up reaches stage 7 (or, with an explicit
+  `rdna4-gfxcg`, stage 3), after the self-tests, as amdgpu does at late init (`amdgpu_device.c:2772`).
+- **RLC safe mode for later direct MMIO: not added, and why.** amdgpu's only use of RLC safe mode in gfx12 is the
+  clock-gating update itself (`gfx_v12_0.c:4345`, the single `amdgpu_gfx_rlc_enter_safe_mode` call site); it never
+  programs HQDs or dispatches by MMIO, so there is no amdgpu precedent to copy. The evidence that our direct programming
+  is fine with gating on: on the card, boot 14 ran the runtime selftest (direct HQD init, SQ/dispatch MMIO) and the
+  bench after the gating was enabled and both passed, repeatedly. If a hang ever shows up there, bracketing
+  `hqdInitFor`/`launch()` in `rlcSafeMode(true/false)` is the fallback.
+- **GFXOFF wake (round 4, boot 15).** The first user dispatch after the guard woke GFX timed out; the log dump showed
+  the boot HQD registers all zero (`CP_HQD_ACTIVE 0`, PQ base/doorbell/rptr/wptr 0, `PQ_CONTROL` back to a reset value):
+  the plain-MMIO HQD is lost across the GFXOFF power-down. `gfxOffAfterWake` (in `gcWake`, after the `DisallowGfxOff`
+  answer and before `gcState` becomes On, with the waking thread bypassing the guard) (1) polls `RLC_GPM_STAT`
+  (`0x4e6c`, gc_12_0_0_sh_mask.h:21688-21712) until GFX_POWER_STATUS is set and SAVING/RESTORING_REGISTERS, WGP power-up
+  and power-state-changing bits are clear, bounded 200 ms, and logs it; amdgpu does not poll anything after the answer
+  (`smu_v14_0_gfx_off_control` is synchronous, `amdgpu_gfx.c:925-985`), so this is extra; (2) if the boot HQD is no
+  longer active, re-programs it (`pm4Queue.init` + `hqdInit`, the recovery sequence) and proves it with a fenced
+  WRITE_DATA. Client queues are created after any wake (their open touches GC first), so only the boot queue needs it.
+- Emulator: `DisallowGfxOff` after an `AllowGfxOff` now clears the HQD registers and `RLC_GPM_STAT` reports
+  RESTORING_REGISTERS for two reads, so the wake path is exercised in the VM.

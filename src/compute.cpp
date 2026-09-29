@@ -688,7 +688,7 @@ void RDNA4Compute::runStages() {
 	// A GFXCLK soft max survives warm reboots in the SMU (rdna4-gfxcap, the pm
 	// cap probe): remind whenever a pm boot-arg is present.
 	uint32_t capArg = 0, cgArg = 0;
-	if (requestedGfxPm() || requestedGfxCap(capArg) || requestedGfxCg(cgArg) || requestedGfxOff())
+	if (requestedGfxPm() || requestedGfxCap(capArg) || !gfxCgIsDefault() || requestedGfxOff())
 		CLOG("pm: reminder: a GFXCLK soft max set by an earlier boot (rdna4-gfxcap, or a cap probe that was not "
 		     "restored) and clock gating written by rdna4-gfxcg stay in force across warm reboots; "
 		     "rdna4-gfxcap=0 (boot 13 in set-boot.sh), rdna4-gfxcg=0 or a cold power cycle lifts them");
@@ -797,7 +797,7 @@ void RDNA4Compute::runStages() {
 	// self-test. Nothing after gfxOffProbe() may touch the GC domain except through
 	// GcAccess, which wakes GFX first.
 	uint32_t cgMask = 0;
-	if (done >= StageGfx && featureAllowed("pm") && requestedGfxCg(cgMask)) {
+	if (done >= (gfxCgIsDefault() ? StageKernel : StageGfx) && featureAllowed("pm") && requestedGfxCg(cgMask)) {
 		if (!bringupStepAllowed("clock gating")) return;
 		gfxCgApply(cgMask);
 	}
@@ -1168,6 +1168,8 @@ void RDNA4Compute::gfxOffPreflight(bool attach) {
 // OSSSYS and DMU registers only) and a failed wake (logged; the next GC access
 // would still be attempted, which is the risk of the whole feature).
 RDNA4Compute::GcAccess::GcAccess(const RDNA4Compute &comp, uint32_t what) : c(comp) {
+	if (c.gcOwner == current_thread())
+		return;                     // the waker restoring GC state: it holds gcLock, GC is up
 	for (int tries = 0;; tries++) {
 		OSIncrementAtomic(&c.gcBusy);
 		if (c.gcState == kGcOn) {
@@ -1201,9 +1203,14 @@ void RDNA4Compute::gcWake(uint32_t what) const {
 		const char *who = what == 0xffffffffu ? "the start of a bring-up" : what == 0xfffffffeu ? "the shutdown quiesce" :
 		                  (what >> 24) == 0xdb ? "a doorbell write, dword" : "a GC register access, seg<<16|dword";
 		if (resp == kSmuRespOk) {
-			gcState = kGcOn;
 			CLOG("gfxoff: GFXOFF ended by %s 0x%x (thread %p): DisallowGfxOff -> 0x%02x; GFXOFF stays "
 			     "disallowed until the next boot", who, what & 0xffffff, current_thread(), resp);
+			// GC state does not survive the power-down: wait for the RLC to finish restoring, then
+			// bring the boot HQD back, before any other thread can use GC (gcState is still not On).
+			gcOwner = current_thread();
+			self->gfxOffAfterWake(what);
+			gcOwner = nullptr;
+			gcState = kGcOn;
 			gfxOffFlagSet(false);
 		} else {
 			gcState = kGcHold;
@@ -1212,6 +1219,51 @@ void RDNA4Compute::gcWake(uint32_t what) const {
 		}
 	}
 	IOLockUnlock(gcLock);
+}
+
+// After DisallowGfxOff is acknowledged, GC has been powered back up but its state is not the state
+// we left. Round 4 on the card: the first dispatch after the wake timed out with CP_HQD_ACTIVE 0
+// and PQ base/doorbell/rptr/wptr all zero (the directly programmed MMIO HQD is lost across the
+// GFXOFF power-down: amdgpu's queues survive because the CP restores them from their MQD in
+// memory, which a plain-MMIO HQD does not have), and only the hang recovery brought it back.
+// amdgpu itself does not poll anything after the DisallowGfxOff answer (smu_v14_0_gfx_off_control
+// is synchronous, amdgpu_gfx.c:925-985; gfx_v12_0.c has no RLC_GPM_STAT poll); we additionally
+//   1. wait (bounded 200 ms) until RLC_GPM_STAT reports GFX powered and no save/restore or WGP
+//      power-up in progress, and log what it said;
+//   2. if the boot queue's HQD is no longer active, program it again (the same reinit
+//      recoverComputeQueue uses) and prove it with a fenced WRITE_DATA.
+// Runs on the waking thread with gcOwner set (its GC accesses bypass the guard).
+void RDNA4Compute::gfxOffAfterWake(uint32_t what) {
+	if (what == 0xfffffffeu)
+		return;                                     // shutdown quiesce: nothing to restore
+	uint32_t stat = 0;
+	uint32_t us = 0;
+	const uint32_t busyMask = kGpmSavingRegs | kGpmRestoringRegs | kGpmGfx3dChanging | kGpmCmpChanging |
+	                          kGpmStaticWgpUp | kGpmDynWgpUp;
+	for (; us < 200000; us += 100) {
+		stat = rdGc(RlcGpmStat);
+		if (stat != kBad && (stat & kGpmGfxPowerStatus) && !(stat & busyMask))
+			break;
+		IODelay(100);
+	}
+	CLOG("gfxoff: after the wake RLC_GPM_STAT 0x%08x after %u us (%s)", stat, us,
+	     us >= 200000 ? "NOT settled within 200 ms, continuing" : "settled");
+	if (!bootQueueLive)
+		return;
+	grbmSelect(1, 0, 0, 0);
+	const uint32_t active = rdGc(CpHqdActive);
+	grbmSelect(0, 0, 0, 0);
+	if (active != kBad && (active & 1)) {
+		CLOG("gfxoff: the boot HQD survived the power-down (CP_HQD_ACTIVE 0x%08x)", active);
+		return;
+	}
+	CLOG("gfxoff: the boot HQD was lost in the power-down (CP_HQD_ACTIVE 0x%08x): programming it again", active);
+	logComputeQueueState("gfxoff wake", 0, 0, 0);
+	if (pm4Queue.init(poolDw(kPqOffset), poolMc(kPqOffset), kPqSize) && hqdInit(hqdMode == 2) &&
+	    queueWriteTest("gfxoff wake"))
+		CLOG("gfxoff: the boot HQD is back (fenced WRITE_DATA landed)");
+	else
+		CLOG("gfxoff: the boot HQD could not be restored; the first dispatch will need the hang recovery");
 }
 
 bool RDNA4Compute::gfxOffAllow() {
@@ -1432,10 +1484,20 @@ void RDNA4Compute::gfxCgGuiIdle(bool enable) {
 	CLOG("cg: CP_INT_CNTL_RING0 -> 0x%08x", v);
 }
 
+// Clock gating is on by default, as in amdgpu (late init, amdgpu_device.c:2772): the round-4 card
+// went from 2541 MHz / 100 % / 131 W to 803 MHz / 3 % / 20 W with it. rdna4-gfxcg=<mask> selects
+// steps, rdna4-gfxcg=0 writes amdgpu's disable branch.
+bool RDNA4Compute::gfxCgIsDefault() {
+	uint32_t v = 0;
+	return !PE_parse_boot_argn("rdna4-gfxcg", &v, sizeof(v));
+}
+
 bool RDNA4Compute::requestedGfxCg(uint32_t &mask) {
 	uint32_t v = 0;
-	if (!PE_parse_boot_argn("rdna4-gfxcg", &v, sizeof(v)))
-		return false;
+	if (!PE_parse_boot_argn("rdna4-gfxcg", &v, sizeof(v))) {
+		mask = kCgStepCoarse | kCgStepMedium | kCgStepFine | kCgStepGuiIdle;
+		return true;
+	}
 	mask = v & (kCgStepCoarse | kCgStepMedium | kCgStepFine | kCgStepGuiIdle);
 	return true;
 }
@@ -1444,8 +1506,9 @@ bool RDNA4Compute::requestedGfxCg(uint32_t &mask) {
 // with a survey and SMU samples before and after. mask 0 = the disable mirror.
 void RDNA4Compute::gfxCgApply(uint32_t mask) {
 	const bool enable = mask != 0;
-	CLOG("cg: rdna4-gfxcg=0x%x: %s (%s%s%s%s); persists in the RLC across warm reboots, "
-	     "rdna4-gfxcg=0 undoes it", mask, enable ? "enable clock gating" : "disable clock gating",
+	CLOG("cg: rdna4-gfxcg=0x%x%s: %s (%s%s%s%s); persists in the RLC across warm reboots, "
+	     "rdna4-gfxcg=0 undoes it", mask, gfxCgIsDefault() ? " (default)" : "",
+	     enable ? "enable clock gating" : "disable clock gating",
 	     (mask & kCgStepCoarse) ? "coarse " : "", (mask & kCgStepMedium) ? "medium " : "",
 	     (mask & kCgStepFine) ? "fine " : "", (mask & kCgStepGuiIdle) ? "gui-idle" : "");
 	if (!(rdGc(RlcCntl) & kRlcEnableF32)) {
@@ -2797,8 +2860,10 @@ bool RDNA4Compute::stageCompute() {
 		          writeTest("KIQ");
 	}
 	put("QueueMode", running ? mode : 0);
-	if (running)
+	if (running) {
 		hqdMode = mode;
+		bootQueueLive = true;
+	}
 	if (!running) {
 		publish();
 		return false;

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Set the boot-args for one boot of docs/real-card-plan.md on the OpenCore USB.
 #
-#   bash /Volumes/OPENCORE/set-boot.sh <0-17>
+#   bash /Volumes/OPENCORE/set-boot.sh <0-18>
 #
 #   0  this morning's known-good arguments (no new feature enabled)
 #   1  + interrupts and W6 opt-in            rdna4-ih=1 rdna4-hang=1
@@ -22,6 +22,7 @@
 #  14  W27 clock gating: boot 1 + survey + rdna4-gfxcg=15 (RLC CGCG/CGLS/MGCG/FGCG + GUI-idle interrupt, applied last; rdna4-gfxcg=0 undoes it)
 #  15  W27 clock gating + GFXOFF: boot 14 + rdna4-gfxoff=1 (AllowGfxOff at the very end, every GC access wakes it first; sticky until reboot)
 #  16  W17 VM hub-write variants a/b/c/E2 (rdna4-vm-diag=30): a later round, only if boot 8 (481) is still all-fail
+#  18  W29 A/B control: boot 1 with clock gating off (rdna4-gfxcg=0; CG is on by default since W29)
 #  17  cursor A/B control: boot 9 with rdna4-cursorlock=0 (the MPC cursor lock left alone, as before W25)
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
@@ -47,7 +48,8 @@ case "${1:-}" in
 	15) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=24 rdna4-gfxcg=15 rdna4-gfxoff=1" ;;
 	16) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=30" ;;
 	17) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorlock=0 rdna4-hang=1" ;;
-	*) echo "usage: bash $0 <0-17>   (see docs/real-card-plan.md)"; exit 1 ;;
+	18) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxcg=0" ;;
+	*) echo "usage: bash $0 <0-18>   (see docs/real-card-plan.md)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"
