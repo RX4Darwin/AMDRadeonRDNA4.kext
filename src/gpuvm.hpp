@@ -38,7 +38,14 @@ constexpr uint64_t kWritable   = 1ull << 6;
 constexpr uint64_t kFragMask   = 0x1full << 7;
 constexpr uint64_t kMtypeMask  = 3ull << 54;  // AMDGPU_PTE_MTYPE_GFX12
 constexpr uint64_t kPdeBfsMask = 0x1full << 58;
-constexpr uint64_t kPdePte     = 1ull << 63;  // AMDGPU_PDE_PTE_GFX12
+constexpr uint64_t kPdePte     = 1ull << 63;  // AMDGPU_PDE_PTE_GFX12: a directory entry that is a leaf
+/* AMDGPU_PTE_IS_PTE (amdgpu_vm.h:133) is the SAME bit 63.  On GC 12 every normal leaf PTE
+ * carries it: amdgpu_ttm_tt_pte_flags() ORs adev->gart.gart_pte_flags (MTYPE_UC |
+ * EXECUTABLE | IS_PTE, gmc_v12_0.c:794-796) into every BO mapping (amdgpu_ttm.c:1477) and
+ * nothing clears it afterwards.  Without it the walker takes a valid last-level entry for one
+ * more directory level (umr decode_pte_entry.c: "Inverted logic for GFX12", is_pde = !pte)
+ * and walks into the data page: MAPPING_ERROR on the first access (round 2-4, 0x00800b3b). */
+constexpr uint64_t kIsPte      = 1ull << 63;
 
 /* Flags are intentionally explicit at call sites: no hidden permission policy. */
 uint64_t encodePte(uint64_t physical, uint64_t flags, bool fragment64K);
