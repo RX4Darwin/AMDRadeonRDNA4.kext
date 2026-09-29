@@ -585,7 +585,7 @@ registry_value() {
 	if [ "$INFO_OK" -eq 0 ]; then
 		record sensors-idle SKIPPED "runtime unavailable"
 	elif [ -n "$SENSORS_IDLE_FILE" ] && grep -q '^sensors-pm: verdict ' "$SENSORS_IDLE_FILE"; then
-		idle_gfx="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_IDLE_FILE" | tail -1 | sed -E 's/^sensors-pm\[2\]: //' | cut -c1-110)"
+		idle_gfx="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_IDLE_FILE" | tail -1 | sed -E 's/^sensors-pm\[2\]: GFXCLK avg pre-DS ([0-9]+).*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/avg GFXCLK \1 MHz, activity \2%, \3 W/')"
 		idle_verdict="$(grep '^sensors-pm: verdict ' "$SENSORS_IDLE_FILE" | tail -1 | sed 's/^sensors-pm: verdict //')"
 		record sensors-idle PASS "$idle_verdict | $idle_gfx"
 	else
@@ -594,7 +594,7 @@ registry_value() {
 	if [ "$INFO_OK" -eq 0 ]; then
 		record sensors-pm SKIPPED "runtime unavailable"
 	elif grep -q '^sensors-pm: verdict ' "$SENSORS_FILE"; then
-		pm_gfx="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_FILE" | tail -1 | sed -E 's/^sensors-pm\[2\]: //' | cut -c1-110)"
+		pm_gfx="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_FILE" | tail -1 | sed -E 's/^sensors-pm\[2\]: GFXCLK avg pre-DS ([0-9]+).*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/avg GFXCLK \1 MHz, activity \2%, \3 W/')"
 		pm_verdict="$(grep '^sensors-pm: verdict ' "$SENSORS_FILE" | tail -1 | sed 's/^sensors-pm: verdict //')"
 		record sensors-pm PASS "$pm_verdict | $pm_gfx"
 	else
@@ -606,8 +606,8 @@ registry_value() {
 	if [ "$GFXPM_MODE" -eq 0 ]; then
 		record gfxpm SKIPPED "rdna4-gfxpm not enabled"
 	elif grep -q 'RDNA4FB: compute: pm: experiment finished' "$KLOG"; then
-		pm_first="$(grep 'RDNA4FB: compute: pm: baseline' "$KLOG" | tail -1 | sed -E 's/.*pm: baseline[^:]*: GFXCLK ([0-9]+) MHz.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
-		pm_last="$(grep 'RDNA4FB: compute: pm: .*GFXCLK [0-9]* MHz' "$KLOG" | tail -1 | sed -E 's/.*pm: ([^:]*): GFXCLK ([0-9]+) MHz.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1: \2 MHz \3% \4 W/')"
+		pm_first="$(grep 'RDNA4FB: compute: pm: baseline' "$KLOG" | tail -1 | sed -E 's/.*pm: baseline[^:]*: avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
+		pm_last="$(grep 'RDNA4FB: compute: pm: [^s].*avg GFXCLK pre-DS [0-9]*' "$KLOG" | tail -1 | sed -E 's/.*pm: ([^:]*): avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1: \2 MHz \3% \4 W/')"
 		record gfxpm PASS "baseline $pm_first -> $pm_last"
 	else
 		record gfxpm FAIL "pm experiment did not finish (see the pm: lines)"

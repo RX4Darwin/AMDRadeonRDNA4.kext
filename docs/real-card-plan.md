@@ -91,7 +91,7 @@ separate power-management work.
    `docs/cursor-audit.md` for how to read the result.
 
 7. **Optional W19 GFX power-management probe.**
-   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15`.
+   `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31`.
    Run it after boots 0-6 (the round-2 idle reading of 300 W / 3.2 GHz is
    what it investigates; see `docs/gfx-pm-audit.md`). Every boot's summary
    already carries `sensors-idle` (an SMU metrics sample taken before any
@@ -106,6 +106,18 @@ separate power-management work.
    trail and the next boot skips only this feature. Power is left as the SMU
    had it, except that a failed restore of the soft max is logged as a
    WARNING (compute stays capped at 1000 MHz until the next boot).
+   Bit 16 (`gfxpm=31` includes it) adds the W24 engine survey: at the end of
+   each bring-up stage (3-7, the gfx ring, the pm baseline and the end) the
+   kext logs read-only `pm: survey <stage>:` lines with GRBM_STATUS/2 and
+   GRBM_STATUS_SE0-3, CP_STAT/BUSY, CPC/CPF status/busy, RLC state, MES/ME/MEC
+   halt state, SDMA status, the clock-gating registers, every active MEC and
+   gfx HQD, and the SMU's average clock/activity/power, so the first stage at
+   which the SMU reports 100 % activity is visible next to which engine is
+   busy. `rdna4-gfxcap=<MHz>` (default off) sets the GFXCLK soft max through
+   the proven SetSoftMaxByFreq path as a stopgap; the SMU keeps it across
+   warm reboots, so remove it with `rdna4-gfxcap=0` (or a cold power cycle),
+   not by dropping the boot-arg.
+
 
 Boots 0-6 are not byte-for-byte unchanged in one respect: `rdna4-run sensors`
 now also takes two `GetMetricsTable` samples one second apart (about five

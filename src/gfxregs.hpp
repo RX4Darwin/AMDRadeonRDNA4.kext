@@ -40,6 +40,17 @@ constexpr Reg CpMe1Pipe1IntCntl   { 0, 0x1e26 };   // gfx12 has these two only
 constexpr Reg RlcCntl             { 1, 0x4c00 };
 constexpr Reg RlcStat             { 1, 0x4c04 };
 constexpr Reg RlcGpmStat          { 1, 0x4e6c };
+// W24 survey (gc_12_0_0_offset.h): busy/idle and clock-gating state, read only.
+constexpr Reg CpBusyStat          { 0, 0x0f3f };   // CP_BUSY_STAT
+constexpr Reg CpCpfBusyStat       { 0, 0x0e28 };   // CP_CPF_BUSY_STAT
+constexpr Reg GrbmStatusSe0       { 0, 0x0da5 };   // GRBM_STATUS_SE0..3: SC/DB/CB clean, UTCL1/TCP/PC/PA/TA/SX busy
+constexpr Reg GrbmStatusSe1       { 0, 0x0da6 };
+constexpr Reg GrbmStatusSe2       { 0, 0x0dae };
+constexpr Reg GrbmStatusSe3       { 0, 0x0daf };
+constexpr Reg CpGfxHqdActive      { 0, 0x1e80 };   // CP_GFX_HQD_ACTIVE, banked by GRBM_GFX_CNTL (ME0)
+constexpr Reg RlcSafeMode         { 1, 0x0980 };   // RLC_SAFE_MODE
+constexpr Reg RlcCgttMgcgOverride { 1, 0x4c48 };   // RLC_CGTT_MGCG_OVERRIDE: bits set = that gating is overridden (off)
+constexpr Reg RlcCgcgCglsCtrl     { 1, 0x4c49 };   // RLC_CGCG_CGLS_CTRL: CGCG_EN [0], CGLS_EN [1]
 constexpr Reg RlcBootloadStatus   { 1, 0x4e7c };
 constexpr Reg ImuCoreCtrl         { 1, 0x40b6 };
 constexpr Reg ImuGfxResetCtrl     { 1, 0x40bc };

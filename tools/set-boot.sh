@@ -10,7 +10,7 @@
 #   4  + gfx ring and first triangle        ... rdna4-gfx=2 rdna4-hang=1
 #   5  boot 4 without the VM (rdna4-vm off): the triangle independent of the VM  ... rdna4-gfx=2 rdna4-hang=1
 #   6  optional: vblank + cursor            ... rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1
-#   7  optional: GFX power-management probe rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15
+#   7  optional: GFX power-management probe rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31
 #      (samples the SMU metrics, sets the default workload mask, releases the
 #      GFXCLK soft limits, then caps GFXCLK at 1000 MHz for one sample and lifts it)
 #   8  W17 VM walker diagnostics            rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31
@@ -28,7 +28,7 @@ case "${1:-}" in
 	4) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
 	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-gfx=2 rdna4-hang=1" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-hang=1" ;;
-	7) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15" ;;
+	7) EXTRA="rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=31" ;;
 	8) EXTRA="rdna4-ih=1 rdna4-vm=1 rdna4-hang=1 rdna4-vm-diag=31" ;;
 	9) EXTRA="rdna4-ih=2 rdna4-vm=1 rdna4-flip=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-hang=1" ;;
 	*) echo "usage: bash $0 <0-9>   (see docs/real-card-plan.md)"; exit 1 ;;
