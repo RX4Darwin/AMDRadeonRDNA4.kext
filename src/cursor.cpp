@@ -485,6 +485,15 @@ constexpr uint32_t kTtuDeliveryMask = 0x007fffff;
 constexpr uint32_t kMissionMode = 1u << 8;        // HUBPREQ_DEBUG_DB value amdgpu writes (dcn401_hubp.c:329)
 constexpr uint32_t kTtuMaxStreamKHz = 600000;     // above this ODM combine halves the per-DPP clock
 constexpr uint32_t kTtuQosFixedCur0 = 8;   // dml_display_rq_dlg_calc.c:497 qos_level_fixed_cur0 = 8, ramp not disabled (:500)
+// W38 (dcn_4_1_0_offset.h, base idx 2 unless noted; DPP0/HUBP0/OTG0 values, + dppOff()/hubpOff()/otgOff()):
+constexpr uint32_t kDsclSclMode = 0x0d08, kDsclControl = 0x0d0a, kDsclUpdate = 0x0d18, kDsclAutocal = 0x0d19;
+constexpr uint32_t kDsclRecoutStart = 0x0d1e, kDsclRecoutSize = 0x0d1f, kDsclMpcSize = 0x0d20;
+constexpr uint32_t kDsclLbFormat = 0x0d21, kDsclLbMemCtrl = 0x0d22, kDsclMemPwrCtrl = 0x0d24, kDsclMemPwrStatus = 0x0d25;
+constexpr uint32_t kDsclObuf = 0x0d26, kDsclEasfH = 0x0d28, kDsclEasfV = 0x0d29, kDsclIsharp = 0x0d55;
+constexpr uint32_t kDchubpCntl = 0x05f4, kMallConfig = 0x05f7, kExpansionMode = 0x0620, kHubpreqStatus2 = 0x0663;
+constexpr uint32_t kOtgPipeUpdateStatus = 0x1b9e, kOtgFrameCount = 0x1b4d, kOtgGlobalCtrl2 = 0x1b90;
+constexpr uint32_t kOtgCrcCntl = 0x1b65, kOtgCrcWindowAX = 0x1b66, kOtgCrcWindowAY = 0x1b67;
+constexpr uint32_t kOtgCrcWindowBX = 0x1b68, kOtgCrcWindowBY = 0x1b69, kOtgCrcDataRg = 0x1b6a, kOtgCrcDataB = 0x1b6b;
 constexpr uint32_t kCursorProbeMax = 10;   // trail budget: arming, self-test, up to three flips, first set/draw calls
 
 uint32_t premultiplyArgb(uint32_t pixel) {
@@ -584,6 +593,11 @@ void RDNA4Device::cursorProgramPlane(bool enable) {
 	// drawHardwareCursor uses it only to represent a corner above/left of the screen.
 	regWriteDmu(2, kCursorHotSpot + hubp, 0);
 	regWriteDmu(2, kCursorSettings + hubp, 3u << 8); // CURSOR0_CHUNK_HDL_ADJUST=3, DST_Y_OFFSET=0
+	if (cursorPipeFixesOn) {   // W38: REG_UPDATE(DCHUBP_MALL_CONFIG, USE_MALL_FOR_CURSOR, cursor_size > 16384) (dcn32_hubp.c:133,165)
+		const uint32_t mall = regReadDmu(2, kMallConfig + hubp);
+		if (mall != 0xffffffffu && (mall & 4u))
+			regWriteDmu(2, kMallConfig + hubp, mall & ~4u);   // 64x64 ARGB is exactly 16384 bytes: not above the limit
+	}
 	cursorCtlBase = kCursorReqModePrefetch | (kCursorModePremultipliedArgb << kCursorModeShift) |
 	                (0u << kCursorPitchShift) | (kCursorLinesPer8 << kCursorLinesPerChunkShift);
 	regWriteDmu(2, kCursorControl + hubp, cursorCtlBase | (enable ? 1u : 0u));
@@ -726,6 +740,237 @@ bool RDNA4Device::cursorProgramTtu() {
 	return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// W38 (premetal/rootcause-cursor.md), rdna4-cursor=2 only: DSCL/pipe state dump, the pipe-level fields amdgpu writes
+// and we never did, the DSCL scaler-bypass set (opt-in) and the OTG CRC A/B that lets the card say by itself whether
+// the cursor pixels reach the output.
+// ---------------------------------------------------------------------------
+
+// Read-only. dcn_4_1_0_offset.h, base idx 2, DPP0/HUBP0 values (+ dppOff()/hubpOff()): DSCL0_SCL_MODE 0x0d08,
+// _RECOUT_START/SIZE 0x0d1e/0x0d1f, _MPC_SIZE 0x0d20, _LB_DATA_FORMAT/_LB_MEMORY_CTRL 0x0d21/0x0d22,
+// _DSCL_MEM_PWR_CTRL/STATUS 0x0d24/0x0d25, _OBUF_CONTROL 0x0d26, _DSCL_UPDATE 0x0d18, _DSCL_AUTOCAL 0x0d19,
+// _DSCL_CONTROL 0x0d0a, _DSCL_EASF_H/V_MODE 0x0d28/0x0d29, _ISHARP_MODE 0x0d55; HUBP0_DCHUBP_CNTL 0x05f4,
+// _DCHUBP_MALL_CONFIG 0x05f7; HUBPREQ0_DCN_EXPANSION_MODE 0x0620, _HUBPREQ_STATUS_REG2 0x0663;
+// OTG0_OTG_PIPE_UPDATE_STATUS 0x1b9e. MPCC0_MPCC_UPDATE_LOCK_SEL is MPC (base idx 3) 0x0005 (kMpccUpdateLockSel).
+void RDNA4Device::cursorDsclDump(const char *why) {
+	const uint32_t dpp = dppOff(), hubp = hubpOff(), otg = otgOff();
+	const uint32_t mpcc = pipe.hubp < Pipe::kMaxOtg ? pipe.hubp * kMpccStride : 0;
+	const uint32_t mode = regReadDmu(2, kDsclSclMode + dpp);
+	cursorNote("%s: dscl: scl_mode 0x%08x (DSCL_MODE %u) recout 0x%08x/0x%08x mpc_size 0x%08x lb 0x%08x/0x%08x "
+	           "mem_pwr 0x%08x/0x%08x obuf 0x%08x update 0x%08x autocal 0x%08x ctl 0x%08x easf h/v 0x%08x/0x%08x "
+	           "isharp 0x%08x", why, mode, mode & 7, regReadDmu(2, kDsclRecoutStart + dpp),
+	           regReadDmu(2, kDsclRecoutSize + dpp), regReadDmu(2, kDsclMpcSize + dpp),
+	           regReadDmu(2, kDsclLbFormat + dpp), regReadDmu(2, kDsclLbMemCtrl + dpp),
+	           regReadDmu(2, kDsclMemPwrCtrl + dpp), regReadDmu(2, kDsclMemPwrStatus + dpp),
+	           regReadDmu(2, kDsclObuf + dpp), regReadDmu(2, kDsclUpdate + dpp), regReadDmu(2, kDsclAutocal + dpp),
+	           regReadDmu(2, kDsclControl + dpp), regReadDmu(2, kDsclEasfH + dpp), regReadDmu(2, kDsclEasfV + dpp),
+	           regReadDmu(2, kDsclIsharp + dpp));
+	const uint32_t mall = regReadDmu(2, kMallConfig + hubp), exp = regReadDmu(2, kExpansionMode + hubp);
+	cursorNote("%s: pipe: dchubp_cntl 0x%08x mall_cfg 0x%08x (USE_MALL_FOR_CURSOR %u) expansion 0x%08x (CRQ %u) "
+	           "cursor mem pwr 0x%08x/0x%08x mpcc%u lock_sel 0x%08x | otg pipe_update_status 0x%08x "
+	           "hubpreq_status2 0x%08x", why, regReadDmu(2, kDchubpCntl + hubp), mall, (mall >> 2) & 1, exp,
+	           (exp >> 2) & 3, regReadDmu(2, kCursorMemPwrCtrl + hubp), regReadDmu(2, kCursorMemPwrStatus + hubp),
+	           pipe.hubp, regReadDmu(3, kMpccUpdateLockSel + mpcc), regReadDmu(2, kOtgPipeUpdateStatus + otg),
+	           regReadDmu(2, kHubpreqStatus2 + hubp));
+}
+
+// The pipe-level cursor fields amdgpu writes (rdna4-cursorpipe=0 skips them: the control), each with its source:
+//  - CRQ_EXPANSION_MODE = 1: hubp401_program_requestor writes DCN_EXPANSION_MODE from DML's crq_expansion_mode
+//    (dcn401_hubp.c:293-305), which DML 2.1 sets to 1 (dml2_core_dcn4_calcs.c:12509). Only the CRQ field [3:2] is
+//    touched here; amdgpu writes all four fields.
+//  - the cursor return buffer memory (CURSOR_MEM_PWR_CTRL/STATUS 0x0681/0x0682): DC never writes it, so on Linux it
+//    is at its reset value; if the status says it is not powered, FORCE is cleared (0 = no forcing) and the status
+//    read again.
+//  - rdna4-cursormpcsel=1: MPCC_UPDATE_LOCK_SEL = OPP number, "Configure VUPDATE lock set for this MPCC to map to
+//    the OPP" (dcn10_mpc.c:221-222). The GOP left 0xf. Mapping it puts the MPCC's updates under the OTG master
+//    update lock, which changes when everything on this MPCC latches, so it has its own control.
+// USE_MALL_FOR_CURSOR is written with every attribute set (cursorProgramPlane), like dcn32_hubp.c:133,165.
+void RDNA4Device::cursorPipeFixes() {
+	uint32_t enable = 1;
+	if (PE_parse_boot_argn("rdna4-cursorpipe", &enable, sizeof(enable)) && enable == 0) {
+		cursorPipeFixesOn = false;
+		cursorNote("rdna4-cursorpipe=0: USE_MALL_FOR_CURSOR / CRQ_EXPANSION_MODE / cursor memory power left alone (control)");
+		return;
+	}
+	cursorPipeFixesOn = true;
+	const uint32_t hubp = hubpOff();
+	const uint32_t exp = regReadDmu(2, kExpansionMode + hubp);
+	if (exp != 0xffffffffu && ((exp >> 2) & 3) != 1) {
+		regWriteDmu(2, kExpansionMode + hubp, (exp & ~0xcu) | (1u << 2));
+		cursorNote("DCN_EXPANSION_MODE was 0x%08x (CRQ %u), CRQ_EXPANSION_MODE set to 1 (dcn401_hubp.c:293-305); reads back 0x%08x",
+		           exp, (exp >> 2) & 3, regReadDmu(2, kExpansionMode + hubp));
+	} else {
+		cursorNote("DCN_EXPANSION_MODE is already 0x%08x (CRQ %u): nothing to write", exp, (exp >> 2) & 3);
+	}
+	const uint32_t status = regReadDmu(2, kCursorMemPwrStatus + hubp);
+	const uint32_t ctrl = regReadDmu(2, kCursorMemPwrCtrl + hubp);
+	if (status != 0xffffffffu && (status & 3)) {
+		regWriteDmu(2, kCursorMemPwrCtrl + hubp, ctrl & ~3u);
+		uint32_t waited = 0, now = regReadDmu(2, kCursorMemPwrStatus + hubp);
+		while ((now & 3) && waited < 5) {
+			IOSleep(1);
+			waited++;
+			now = regReadDmu(2, kCursorMemPwrStatus + hubp);
+		}
+		cursorNote("cursor memory power: STATUS was 0x%08x (CTRL 0x%08x), CROB_MEM_PWR_FORCE cleared; CTRL now 0x%08x "
+		           "STATUS 0x%08x after %u ms", status, ctrl, regReadDmu(2, kCursorMemPwrCtrl + hubp), now, waited);
+	} else {
+		cursorNote("cursor memory power: STATUS 0x%08x (powered), CTRL 0x%08x: nothing to write", status, ctrl);
+	}
+	uint32_t sel = 0;
+	if (PE_parse_boot_argn("rdna4-cursormpcsel", &sel, sizeof(sel)) && sel == 1) {
+		const uint32_t mpcc = pipe.hubp < Pipe::kMaxOtg ? pipe.hubp * kMpccStride : 0;
+		const uint32_t opp = pipe.opp < Pipe::kMaxOtg ? pipe.opp : 0;
+		const uint32_t old = regReadDmu(3, kMpccUpdateLockSel + mpcc);
+		regWriteDmu(3, kMpccUpdateLockSel + mpcc, opp);
+		cursorNote("MPCC%u_MPCC_UPDATE_LOCK_SEL was 0x%08x, set to OPP %u (dcn10_mpc.c:221-222); reads back 0x%08x",
+		           pipe.hubp, old, opp, regReadDmu(3, kMpccUpdateLockSel + mpcc));
+	} else {
+		cursorNote("MPCC_UPDATE_LOCK_SEL left alone (rdna4-cursormpcsel=1 maps it to the OPP as amdgpu does)");
+	}
+}
+
+// rdna4-cursordscl=1 (with rdna4-cursor=2): if the DSCL is in full bypass (DSCL_MODE 6) or RECOUT/MPC_SIZE are not
+// the plane size, program the mode-0 (SCALING_444_BYPASS) set amdgpu writes for a 1:1 RGB plane
+// (dpp401_dscl_set_scaler_manual_scale, dcn401_dpp_dscl.c:1067-1161; DCN401 never selects DSCL_BYPASS for RGB,
+// :120-133, dc_spl.c:784-791), under the OTG update lock like modeset.cpp:292-300. The GOP's values are logged
+// first so they can be restored.
+void RDNA4Device::cursorDsclDecide() {
+	const uint32_t dpp = dppOff(), otg = otgOff();
+	uint32_t want = 0;
+	const bool asked = PE_parse_boot_argn("rdna4-cursordscl", &want, sizeof(want)) && want == 1;
+	const uint32_t mode = regReadDmu(2, kDsclSclMode + dpp) & 7;
+	const uint32_t recout = regReadDmu(2, kDsclRecoutSize + dpp), mpc = regReadDmu(2, kDsclMpcSize + dpp);
+	const uint32_t w = fbWidth, h = fbHeight, size = w | (h << 16);
+	const bool bypass = mode == 6, wrong = recout != size || mpc != size;
+	if (!asked) {
+		cursorNote("DSCL decision: DSCL_MODE %u, RECOUT 0x%08x, MPC_SIZE 0x%08x, plane 0x%08x -> %s; not written "
+		           "(rdna4-cursordscl=1 programs amdgpu's mode-0 set)", mode, recout, mpc, size,
+		           bypass || wrong ? "the #1 candidate is LIVE" : "the #1 candidate is eliminated");
+		return;
+	}
+	if (!bypass && !wrong) {
+		cursorNote("DSCL decision: DSCL_MODE %u with RECOUT 0x%08x and MPC_SIZE 0x%08x equal to the plane 0x%08x: "
+		           "nothing to fix, not written", mode, recout, mpc, size);
+		return;
+	}
+	if (!w || !h) {
+		cursorNote("DSCL decision: no plane size known (fb %ux%u): not written", w, h);
+		return;
+	}
+	cursorNote("DSCL decision: DSCL_MODE %u, RECOUT 0x%08x, MPC_SIZE 0x%08x differ from amdgpu's mode-0 set for a %ux%u plane: "
+	           "programming it (GOP values above, restore with them if the screen breaks)", mode, recout, mpc, w, h);
+	// dcn401_program_pipe: OTG update lock, wait for it to be held (modeset.cpp:292-294).
+	regWriteDmu(2, kOtgGlobalCtrl2 + otg, (regReadDmu(2, kOtgGlobalCtrl2 + otg) & ~(0x7u << 25)) |
+	                                      (static_cast<uint32_t>(pipe.otg) << 25));
+	regWriteDmu(2, kOtgMasterUpdateLock + otg, regReadDmu(2, kOtgMasterUpdateLock + otg) | 1u);
+	uint32_t waited = 0;
+	while (!(regReadDmu(2, kOtgMasterUpdateLock + otg) & (1u << 8)) && waited < 10) {
+		IOSleep(1);
+		waited++;
+	}
+	if (!(regReadDmu(2, kOtgMasterUpdateLock + otg) & (1u << 8))) {
+		regWriteDmu(2, kOtgMasterUpdateLock + otg, regReadDmu(2, kOtgMasterUpdateLock + otg) & ~1u);
+		cursorNote("DSCL write: the OTG update lock was not held after 10 ms; nothing written");
+		return;
+	}
+	// dpp401_power_on_dscl (dcn401_dpp_dscl.c:149-163): LUT memory out of force before the DSCL is used.
+	const uint32_t mp = regReadDmu(2, kDsclMemPwrCtrl + dpp);
+	if (regReadDmu(2, kDsclMemPwrStatus + dpp) & 3) {
+		regWriteDmu(2, kDsclMemPwrCtrl + dpp, mp & ~3u);
+		for (uint32_t ms = 0; ms < 5 && (regReadDmu(2, kDsclMemPwrStatus + dpp) & 3); ms++)
+			IOSleep(1);
+	}
+	regWriteDmu(2, kDsclAutocal + dpp, 0);                    // AUTOCAL_MODE off
+	regWriteDmu(2, kDsclControl + dpp, 0);                    // SCL_BOUNDARY_MODE 0
+	regWriteDmu(2, kDsclRecoutStart + dpp, 0);
+	regWriteDmu(2, kDsclRecoutSize + dpp, size);
+	regWriteDmu(2, kDsclMpcSize + dpp, size);
+	regWriteDmu(2, kDsclSclMode + dpp, regReadDmu(2, kDsclSclMode + dpp) & ~7u);   // DSCL_MODE = 0 (444 bypass)
+	regWriteDmu(2, kDsclLbFormat + dpp, 0);                   // INTERLEAVE_EN 0, ALPHA_EN 0
+	regWriteDmu(2, kDsclLbMemCtrl + dpp, 63u << 8);           // MEMORY_CONFIG 0, LB_MAX_PARTITIONS 63
+	regWriteDmu(2, kDsclEasfH + dpp, regReadDmu(2, kDsclEasfH + dpp) & ~1u);       // prefer_easf: EASF off at 1:1
+	regWriteDmu(2, kDsclEasfV + dpp, regReadDmu(2, kDsclEasfV + dpp) & ~1u);
+	regWriteDmu(2, kDsclIsharp + dpp, regReadDmu(2, kDsclIsharp + dpp) & ~1u);     // ISHARP off
+	regWriteDmu(2, kOtgMasterUpdateLock + otg, regReadDmu(2, kOtgMasterUpdateLock + otg) & ~1u);
+	uint32_t pend = 0;
+	for (; pend < 50 && (regReadDmu(2, kDsclUpdate + dpp) & 1); pend++)
+		IOSleep(1);
+	cursorNote("DSCL mode-0 set written; DSCL_UPDATE pending cleared after %u ms (%s)", pend,
+	           (regReadDmu(2, kDsclUpdate + dpp) & 1) ? "STILL PENDING" : "latched");
+	cursorDsclDump("after the DSCL write");
+}
+
+// Frames of the OTG (OTG_STATUS_FRAME_COUNT 0x1b4d [23:0]); bounded, 40 ms per frame.
+bool RDNA4Device::cursorWaitFrames(uint32_t n) {
+	const uint32_t reg = kOtgFrameCount + otgOff();
+	uint32_t last = regReadDmu(2, reg) & 0xffffff;
+	for (uint32_t f = 0; f < n; f++) {
+		uint32_t waited = 0, now = last;
+		while (now == last && waited < 40) {
+			IOSleep(1);
+			waited++;
+			now = regReadDmu(2, reg) & 0xffffff;
+		}
+		if (now == last)
+			return false;
+		last = now;
+	}
+	return true;
+}
+
+// OTG CRC A/B (rootcause-cursor.md section 3). dcn401 uses optc1_configure_crc / optc1_get_crc
+// (dcn401_optc.c:507-508, dcn10_optc.c:1465-1576): the windows, then OTG_CRC_CNTL CONT_EN, CRC0_SELECT and EN.
+// Registers (dcn_4_1_0_offset.h base idx 2, + otgOff()): OTG_CRC_CNTL 0x1b65 (EN 0, CONT_EN 4, CRC0_SELECT [22:20]),
+// OTG_CRC0_WINDOWA_X/Y_CONTROL 0x1b66/0x1b67 (START [14:0], END [30:16]), WINDOWB_X/Y 0x1b68/0x1b69,
+// OTG_CRC0_DATA_RG 0x1b6a (R [15:0], G [31:16]), OTG_CRC0_DATA_B 0x1b6b (B [15:0]). The window covers the 64x64
+// square at (100,100). The CRC is read with the cursor on, off, on, off; equal pairs that differ from each other
+// mean the cursor pixels reach the OTG.
+void RDNA4Device::cursorCrcCheck() {
+	const uint32_t otg = otgOff();
+	const uint32_t x = 100u | ((100u + kCursorWidth) << 16), y = 100u | ((100u + kCursorHeight) << 16);
+	regWriteDmu(2, kOtgCrcWindowAX + otg, x);
+	regWriteDmu(2, kOtgCrcWindowAY + otg, y);
+	regWriteDmu(2, kOtgCrcWindowBX + otg, x);
+	regWriteDmu(2, kOtgCrcWindowBY + otg, y);
+	const uint32_t cntl = regReadDmu(2, kOtgCrcCntl + otg);
+	regWriteDmu(2, kOtgCrcCntl + otg, (cntl & ~(0x7u << 20)) | (1u << 4) | 1u);   // SELECT 0, CONT_EN, EN
+	if (!(regReadDmu(2, kOtgCrcCntl + otg) & 1)) {
+		cursorNote("CRC A/B: OTG_CRC_CNTL.EN did not stick (0x%08x): no verdict", regReadDmu(2, kOtgCrcCntl + otg));
+		return;
+	}
+	struct Crc { uint32_t rg, b; } c[4];
+	bool frames = true;
+	for (int i = 0; i < 4; i++) {
+		const bool on = (i & 1) == 0;
+		if (i > 0)
+			cursorProgramPlane(on);   // attributes with CURSOR_ENABLE / CUR0_ENABLE set as asked, waits for the latch
+		frames = cursorWaitFrames(3) && frames;
+		c[i].rg = regReadDmu(2, kOtgCrcDataRg + otg);
+		c[i].b = regReadDmu(2, kOtgCrcDataB + otg);
+	}
+	// the plane is back on (i = 3 was "off": switch it on again) and the CRC engine is released
+	cursorProgramPlane(true);
+	regWriteDmu(2, kOtgCrcCntl + otg, regReadDmu(2, kOtgCrcCntl + otg) & ~1u);
+	auto same = [](const Crc &a, const Crc &b) { return a.rg == b.rg && a.b == b.b; };
+	const char *verdict;
+	if (!frames)
+		verdict = "INCONCLUSIVE (the OTG frame counter did not advance)";
+	else if (!c[0].rg && !c[0].b && !c[1].rg && !c[1].b && !c[2].rg && !c[2].b && !c[3].rg && !c[3].b)
+		verdict = "INCONCLUSIVE (every CRC reads 0: the engine is not counting)";
+	else if (same(c[0], c[2]) && same(c[1], c[3]) && !same(c[0], c[1]))
+		verdict = "YES";
+	else if (same(c[0], c[1]) && same(c[1], c[2]) && same(c[2], c[3]))
+		verdict = "NO";
+	else
+		verdict = "INCONCLUSIVE (the desktop under the window changed between reads)";
+	cursorNote("CRC A/B, window (100,100)..(%u,%u): cursor on %04x/%08x, off %04x/%08x, on %04x/%08x, off %04x/%08x "
+	           "(R.G/B per read, optc1_configure_crc dcn10_optc.c:1465): cursor pixels reach the output: %s",
+	           100 + kCursorWidth, 100 + kCursorHeight, c[0].b, c[0].rg, c[1].b, c[1].rg, c[2].b, c[2].rg, c[3].b,
+	           c[3].rg, verdict);
+}
+
 // rdna4-cursor=2: at arming, show an opaque magenta 64x64 square at (100,100)
 // through the same programming path macOS's cursor uses. Whether it appears on the
 // card is a yes/no answer that does not depend on macOS's cursor image (which can
@@ -736,6 +981,9 @@ void RDNA4Device::cursorSelfTest() {
 	const uint32_t hubp = hubpOff();
 	// One lock bracket around position and attributes: they latch together at the unlock, so
 	// the square is never armed at (0,0) (the order inside a bracket does not matter).
+	cursorDsclDump("selftest pre");   // W38: what the GOP left in the DSCL / HUBP request state, before any write
+	cursorPipeFixes();                // W38: CRQ_EXPANSION_MODE, cursor memory power, USE_MALL_FOR_CURSOR per update
+	cursorDsclDecide();               // W38: DSCL_MODE / RECOUT / MPC_SIZE verdict (+ amdgpu's mode-0 set with rdna4-cursordscl=1)
 	cursorProgramMissionMode();   // W34: amdgpu's HUBPREQ_DEBUG_DB = 1 << 8, before the cursor is enabled
 	cursorMpcLock(true);
 	cursorProgramTtu();   // W32, opt-in (rdna4-cursorttu=1): legacy-DML request scheduling, latched with the rest
@@ -750,6 +998,8 @@ void RDNA4Device::cursorSelfTest() {
 	cursorHold = true;
 	hwCursorSet = true;
 	cursorRegProbe("selftest");
+	cursorDsclDump("selftest post");
+	cursorCrcCheck();   // W38: does the square reach the OTG? decided by the OTG CRC with the cursor on/off/on/off
 }
 
 // One line of everything that decides whether the plane shows: the HUBP
