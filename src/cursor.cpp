@@ -776,12 +776,13 @@ void RDNA4Device::cursorDsclDump(const char *why) {
 }
 
 // The pipe-level cursor fields amdgpu writes (rdna4-cursorpipe=0 skips them: the control), each with its source:
-//  - CRQ_EXPANSION_MODE = 1: hubp401_program_requestor writes DCN_EXPANSION_MODE from DML's crq_expansion_mode
-//    (dcn401_hubp.c:293-305), which DML 2.1 sets to 1 (dml2_core_dcn4_calcs.c:12509). Only the CRQ field [3:2] is
-//    touched here; amdgpu writes all four fields.
+//  - rdna4-cursorcrq=1: CRQ_EXPANSION_MODE = 1. hubp401_program_requestor writes DCN_EXPANSION_MODE (DRQ/PRQ/CRQ/MRQ)
+//    from DML for every plane (dcn401_hubp.c:293-305, dml2_core_dcn4_calcs.c:12500-12509): it is a SURFACE requestor
+//    field of the live primary pipe, not a cursor field (W38 review S2), so it is opt-in and only the CRQ field
+//    [3:2] is touched (amdgpu writes all four). By default it is only logged.
 //  - the cursor return buffer memory (CURSOR_MEM_PWR_CTRL/STATUS 0x0681/0x0682): DC never writes it, so on Linux it
-//    is at its reset value; if the status says it is not powered, FORCE is cleared (0 = no forcing) and the status
-//    read again.
+//    is at its reset value; CROB_MEM_PWR_FORCE [1:0] is cleared only if it is set (a non-zero STATUS alone is a
+//    normal light sleep) and the status read again.
 //  - rdna4-cursormpcsel=1: MPCC_UPDATE_LOCK_SEL = OPP number, "Configure VUPDATE lock set for this MPCC to map to
 //    the OPP" (dcn10_mpc.c:221-222). The GOP left 0xf. Mapping it puts the MPCC's updates under the OTG master
 //    update lock, which changes when everything on this MPCC latches, so it has its own control.
@@ -790,13 +791,17 @@ void RDNA4Device::cursorPipeFixes() {
 	uint32_t enable = 1;
 	if (PE_parse_boot_argn("rdna4-cursorpipe", &enable, sizeof(enable)) && enable == 0) {
 		cursorPipeFixesOn = false;
-		cursorNote("rdna4-cursorpipe=0: USE_MALL_FOR_CURSOR / CRQ_EXPANSION_MODE / cursor memory power left alone (control)");
+		cursorNote("rdna4-cursorpipe=0: USE_MALL_FOR_CURSOR / cursor memory power left alone (control)");
 		return;
 	}
 	cursorPipeFixesOn = true;
 	const uint32_t hubp = hubpOff();
 	const uint32_t exp = regReadDmu(2, kExpansionMode + hubp);
-	if (exp != 0xffffffffu && ((exp >> 2) & 3) != 1) {
+	uint32_t crq = 0;
+	if (!(PE_parse_boot_argn("rdna4-cursorcrq", &crq, sizeof(crq)) && crq == 1)) {
+		cursorNote("DCN_EXPANSION_MODE 0x%08x (CRQ %u) left alone: a surface-requestor field of the primary pipe "
+		           "(rdna4-cursorcrq=1 writes CRQ = 1)", exp, (exp >> 2) & 3);
+	} else if (exp != 0xffffffffu && ((exp >> 2) & 3) != 1) {
 		regWriteDmu(2, kExpansionMode + hubp, (exp & ~0xcu) | (1u << 2));
 		cursorNote("DCN_EXPANSION_MODE was 0x%08x (CRQ %u), CRQ_EXPANSION_MODE set to 1 (dcn401_hubp.c:293-305); reads back 0x%08x",
 		           exp, (exp >> 2) & 3, regReadDmu(2, kExpansionMode + hubp));
@@ -805,7 +810,7 @@ void RDNA4Device::cursorPipeFixes() {
 	}
 	const uint32_t status = regReadDmu(2, kCursorMemPwrStatus + hubp);
 	const uint32_t ctrl = regReadDmu(2, kCursorMemPwrCtrl + hubp);
-	if (status != 0xffffffffu && (status & 3)) {
+	if (status != 0xffffffffu && (status & 3) && (ctrl & 3)) {
 		regWriteDmu(2, kCursorMemPwrCtrl + hubp, ctrl & ~3u);
 		uint32_t waited = 0, now = regReadDmu(2, kCursorMemPwrStatus + hubp);
 		while ((now & 3) && waited < 5) {
@@ -816,7 +821,8 @@ void RDNA4Device::cursorPipeFixes() {
 		cursorNote("cursor memory power: STATUS was 0x%08x (CTRL 0x%08x), CROB_MEM_PWR_FORCE cleared; CTRL now 0x%08x "
 		           "STATUS 0x%08x after %u ms", status, ctrl, regReadDmu(2, kCursorMemPwrCtrl + hubp), now, waited);
 	} else {
-		cursorNote("cursor memory power: STATUS 0x%08x (powered), CTRL 0x%08x: nothing to write", status, ctrl);
+		cursorNote("cursor memory power: STATUS 0x%08x, CTRL 0x%08x: CROB_MEM_PWR_FORCE already 0, nothing to write",
+		           status, ctrl);
 	}
 	uint32_t sel = 0;
 	if (PE_parse_boot_argn("rdna4-cursormpcsel", &sel, sizeof(sel)) && sel == 1) {
@@ -831,11 +837,12 @@ void RDNA4Device::cursorPipeFixes() {
 	}
 }
 
-// rdna4-cursordscl=1 (with rdna4-cursor=2): if the DSCL is in full bypass (DSCL_MODE 6) or RECOUT/MPC_SIZE are not
-// the plane size, program the mode-0 (SCALING_444_BYPASS) set amdgpu writes for a 1:1 RGB plane
-// (dpp401_dscl_set_scaler_manual_scale, dcn401_dpp_dscl.c:1067-1161; DCN401 never selects DSCL_BYPASS for RGB,
-// :120-133, dc_spl.c:784-791), under the OTG update lock like modeset.cpp:292-300. The GOP's values are logged
-// first so they can be restored.
+// rdna4-cursordscl=1 (with rdna4-cursor=2): ONLY if the DSCL is in full bypass (DSCL_MODE 6), program the mode-0
+// (SCALING_444_BYPASS) set amdgpu writes for a 1:1 RGB plane (dpp401_dscl_set_scaler_manual_scale,
+// dcn401_dpp_dscl.c:1067-1161; DCN401 never selects DSCL_BYPASS for RGB, :120-133, dc_spl.c:784-791), under the OTG
+// update lock like modeset.cpp:292-300. A scaling setup (modes 1-5, RECOUT/MPC_SIZE different from the plane) is a
+// legitimate GOP configuration and is never overwritten (W38 review S3); mode 0 with an unset RECOUT is only
+// reported. The GOP's values are logged first so they can be restored.
 void RDNA4Device::cursorDsclDecide() {
 	const uint32_t dpp = dppOff(), otg = otgOff();
 	uint32_t want = 0;
@@ -844,23 +851,31 @@ void RDNA4Device::cursorDsclDecide() {
 	const uint32_t recout = regReadDmu(2, kDsclRecoutSize + dpp), mpc = regReadDmu(2, kDsclMpcSize + dpp);
 	const uint32_t w = fbWidth, h = fbHeight, size = w | (h << 16);
 	const bool bypass = mode == 6, wrong = recout != size || mpc != size;
+	const char *kase;
+	if (bypass)
+		kase = "case A: full bypass, the #1 candidate is LIVE";
+	else if (mode == 0 && wrong)
+		kase = "case B: mode 0 with RECOUT/MPC_SIZE unset or not the plane size, the #1 candidate may be live, never written";
+	else if (mode != 0)
+		kase = "case C: a scaling mode, a legitimate GOP setup, never overwritten";
+	else
+		kase = "case D: mode 0 with RECOUT/MPC_SIZE equal to the plane, the #1 candidate is eliminated";
 	if (!asked) {
 		cursorNote("DSCL decision: DSCL_MODE %u, RECOUT 0x%08x, MPC_SIZE 0x%08x, plane 0x%08x -> %s; not written "
-		           "(rdna4-cursordscl=1 programs amdgpu's mode-0 set)", mode, recout, mpc, size,
-		           bypass || wrong ? "the #1 candidate is LIVE" : "the #1 candidate is eliminated");
+		           "(rdna4-cursordscl=1 programs amdgpu's mode-0 set in case A only)", mode, recout, mpc, size, kase);
 		return;
 	}
-	if (!bypass && !wrong) {
-		cursorNote("DSCL decision: DSCL_MODE %u with RECOUT 0x%08x and MPC_SIZE 0x%08x equal to the plane 0x%08x: "
-		           "nothing to fix, not written", mode, recout, mpc, size);
+	if (!bypass) {
+		cursorNote("DSCL decision: DSCL_MODE %u, RECOUT 0x%08x, MPC_SIZE 0x%08x, plane 0x%08x -> %s; not written",
+		           mode, recout, mpc, size, kase);
 		return;
 	}
 	if (!w || !h) {
 		cursorNote("DSCL decision: no plane size known (fb %ux%u): not written", w, h);
 		return;
 	}
-	cursorNote("DSCL decision: DSCL_MODE %u, RECOUT 0x%08x, MPC_SIZE 0x%08x differ from amdgpu's mode-0 set for a %ux%u plane: "
-	           "programming it (GOP values above, restore with them if the screen breaks)", mode, recout, mpc, w, h);
+	cursorNote("DSCL decision: DSCL_MODE %u, RECOUT 0x%08x, MPC_SIZE 0x%08x -> %s; programming amdgpu's mode-0 set for a "
+	           "%ux%u plane (GOP values above, restore with them if the screen breaks)", mode, recout, mpc, kase, w, h);
 	// dcn401_program_pipe: OTG update lock, wait for it to be held (modeset.cpp:292-294).
 	regWriteDmu(2, kOtgGlobalCtrl2 + otg, (regReadDmu(2, kOtgGlobalCtrl2 + otg) & ~(0x7u << 25)) |
 	                                      (static_cast<uint32_t>(pipe.otg) << 25));
@@ -924,31 +939,56 @@ bool RDNA4Device::cursorWaitFrames(uint32_t n) {
 // (dcn401_optc.c:507-508, dcn10_optc.c:1465-1576): the windows, then OTG_CRC_CNTL CONT_EN, CRC0_SELECT and EN.
 // Registers (dcn_4_1_0_offset.h base idx 2, + otgOff()): OTG_CRC_CNTL 0x1b65 (EN 0, CONT_EN 4, CRC0_SELECT [22:20]),
 // OTG_CRC0_WINDOWA_X/Y_CONTROL 0x1b66/0x1b67 (START [14:0], END [30:16]), WINDOWB_X/Y 0x1b68/0x1b69,
-// OTG_CRC0_DATA_RG 0x1b6a (R [15:0], G [31:16]), OTG_CRC0_DATA_B 0x1b6b (B [15:0]). The window covers the 64x64
-// square at (100,100). The CRC is read with the cursor on, off, on, off; equal pairs that differ from each other
-// mean the cursor pixels reach the OTG.
+// OTG_CRC0_DATA_RG 0x1b6a (R [15:0], G [31:16]), OTG_CRC0_DATA_B 0x1b6b (B [15:0]; [31:16] is CRC0_C, never read by DC).
+// The window is the 64x64 square at (100,100) shrunk by kCrcMargin on each side: whether END is inclusive is not
+// stated in the tree, and an edge pixel of the scrolling verbose console must not enter an "on" read (W38 review S1).
+// The CRC is read with the cursor on, off, on, off. The sprite is opaque and covers the window, so an "on" CRC
+// is a constant that does not depend on the desktop; only the "off" reads vary while the console scrolls:
+//   YES  = on0 == on2, and on0 differs from BOTH off reads (the off reads may differ from each other)
+//   NO   = on0 equals both off reads (the sprite adds nothing at the OTG)
+//   else INCONCLUSIVE. With a static desktop this is the plain A/B rule.
+// Each DATA_RG/DATA_B sample is read twice and repeated (<= 3 tries) until both agree, against a pair torn across a frame.
 void RDNA4Device::cursorCrcCheck() {
 	const uint32_t otg = otgOff();
-	const uint32_t x = 100u | ((100u + kCursorWidth) << 16), y = 100u | ((100u + kCursorHeight) << 16);
+	constexpr uint32_t kCrcMargin = 4;
+	const uint32_t x0 = 100 + kCrcMargin, x1 = 100 + kCursorWidth - kCrcMargin;
+	const uint32_t y0 = 100 + kCrcMargin, y1 = 100 + kCursorHeight - kCrcMargin;
+	const uint32_t x = x0 | (x1 << 16), y = y0 | (y1 << 16);
 	regWriteDmu(2, kOtgCrcWindowAX + otg, x);
 	regWriteDmu(2, kOtgCrcWindowAY + otg, y);
 	regWriteDmu(2, kOtgCrcWindowBX + otg, x);
 	regWriteDmu(2, kOtgCrcWindowBY + otg, y);
 	const uint32_t cntl = regReadDmu(2, kOtgCrcCntl + otg);
 	regWriteDmu(2, kOtgCrcCntl + otg, (cntl & ~(0x7u << 20)) | (1u << 4) | 1u);   // SELECT 0, CONT_EN, EN
+	// what latched: a GOP that left WINDOW_DB_EN set would show here as windows that are not the ones written
+	cursorNote("CRC programmed: OTG_CRC_CNTL 0x%08x (was 0x%08x) winA x 0x%08x y 0x%08x winB x 0x%08x y 0x%08x "
+	           "(wrote x 0x%08x y 0x%08x)", regReadDmu(2, kOtgCrcCntl + otg), cntl,
+	           regReadDmu(2, kOtgCrcWindowAX + otg), regReadDmu(2, kOtgCrcWindowAY + otg),
+	           regReadDmu(2, kOtgCrcWindowBX + otg), regReadDmu(2, kOtgCrcWindowBY + otg), x, y);
 	if (!(regReadDmu(2, kOtgCrcCntl + otg) & 1)) {
-		cursorNote("CRC A/B: OTG_CRC_CNTL.EN did not stick (0x%08x): no verdict", regReadDmu(2, kOtgCrcCntl + otg));
+		cursorNote("CRC A/B: OTG_CRC_CNTL.EN did not stick: no verdict");
 		return;
 	}
 	struct Crc { uint32_t rg, b; } c[4];
 	bool frames = true;
+	uint32_t torn = 0;
 	for (int i = 0; i < 4; i++) {
 		const bool on = (i & 1) == 0;
 		if (i > 0)
 			cursorProgramPlane(on);   // attributes with CURSOR_ENABLE / CUR0_ENABLE set as asked, waits for the latch
 		frames = cursorWaitFrames(3) && frames;
-		c[i].rg = regReadDmu(2, kOtgCrcDataRg + otg);
-		c[i].b = regReadDmu(2, kOtgCrcDataB + otg);
+		Crc a { 0, 0 }, b { 0, 0 };
+		bool agreed = false;
+		for (int t = 0; t < 3 && !agreed; t++) {
+			a.rg = regReadDmu(2, kOtgCrcDataRg + otg);
+			a.b = regReadDmu(2, kOtgCrcDataB + otg) & 0xffff;
+			b.rg = regReadDmu(2, kOtgCrcDataRg + otg);
+			b.b = regReadDmu(2, kOtgCrcDataB + otg) & 0xffff;
+			agreed = a.rg == b.rg && a.b == b.b;
+		}
+		if (!agreed)
+			torn++;
+		c[i] = b;
 	}
 	// the plane is back on (i = 3 was "off": switch it on again) and the CRC engine is released
 	cursorProgramPlane(true);
@@ -959,16 +999,19 @@ void RDNA4Device::cursorCrcCheck() {
 		verdict = "INCONCLUSIVE (the OTG frame counter did not advance)";
 	else if (!c[0].rg && !c[0].b && !c[1].rg && !c[1].b && !c[2].rg && !c[2].b && !c[3].rg && !c[3].b)
 		verdict = "INCONCLUSIVE (every CRC reads 0: the engine is not counting)";
-	else if (same(c[0], c[2]) && same(c[1], c[3]) && !same(c[0], c[1]))
+	else if (same(c[0], c[2]) && !same(c[0], c[1]) && !same(c[0], c[3]))
 		verdict = "YES";
-	else if (same(c[0], c[1]) && same(c[1], c[2]) && same(c[2], c[3]))
+	else if (same(c[0], c[1]) && same(c[0], c[3]))
 		verdict = "NO";
+	else if (!same(c[0], c[2]))
+		verdict = "INCONCLUSIVE (the two 'on' reads differ: the window is not covered by the square)";
 	else
-		verdict = "INCONCLUSIVE (the desktop under the window changed between reads)";
-	cursorNote("CRC A/B, window (100,100)..(%u,%u): cursor on %04x/%08x, off %04x/%08x, on %04x/%08x, off %04x/%08x "
-	           "(R.G/B per read, optc1_configure_crc dcn10_optc.c:1465): cursor pixels reach the output: %s",
-	           100 + kCursorWidth, 100 + kCursorHeight, c[0].b, c[0].rg, c[1].b, c[1].rg, c[2].b, c[2].rg, c[3].b,
-	           c[3].rg, verdict);
+		verdict = "INCONCLUSIVE (one 'off' read equals 'on', the other does not)";
+	cursorNote("CRC A/B window (%u,%u)..(%u,%u) R.G/B: on %04x.%04x/%04x off %04x.%04x/%04x on %04x.%04x/%04x "
+	           "off %04x.%04x/%04x torn %u (optc1_configure_crc dcn10_optc.c:1465): cursor pixels reach the output: %s",
+	           x0, y0, x1, y1,
+	           c[0].rg & 0xffff, c[0].rg >> 16, c[0].b, c[1].rg & 0xffff, c[1].rg >> 16, c[1].b,
+	           c[2].rg & 0xffff, c[2].rg >> 16, c[2].b, c[3].rg & 0xffff, c[3].rg >> 16, c[3].b, torn, verdict);
 }
 
 // rdna4-cursor=2: at arming, show an opaque magenta 64x64 square at (100,100)
