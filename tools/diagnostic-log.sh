@@ -626,13 +626,33 @@ registry_value() {
 			record vmidtest PASS "$VT"
 		fi
 	fi
+	# Late probes (mask bit 8): the client-style probes repeated after clock gating (hypothesis H7: timing vs the clients, which run after cg).
+	if [ $((VMIDTEST_MODE & 8)) -eq 0 ]; then
+		record vmidtest-late SKIPPED "rdna4-vmid-test bit 8 (late probes) not set"
+	else
+		VTL="$(registry_value vmidtest-late)"
+		if [ -z "$VTL" ]; then
+			record vmidtest-late FAIL "no RDNA4FB,Results vmidtest-late: the late probes did not run or finish (an early shader probe hung, or bring-up did not reach them)"
+		elif printf '%s\n' "$VTL" | grep -Eq '=[FHD]( |$)'; then
+			record vmidtest-late FAIL "$VTL  (compare with the early row: a probe that passes early and fails late points at clock gating / timing, H7)"
+		else
+			record vmidtest-late PASS "$VTL"
+		fi
+	fi
 	# Surveys at the flow points (GRBM_STATUS bit 31 = GUI_ACTIVE): which step first leaves the GC busy.
 	if [ $((VMIDTEST_MODE & 2)) -eq 0 ]; then
 		record vm-survey SKIPPED "rdna4-vmid-test bit 2 (surveys) not set"
 	else
 		SURV="$(klines 'RDNA4FB: vmidtest: survey .*: GRBM 0x' || true)"
+		SURV_SRC="kernel log"
 		if [ -z "$SURV" ]; then
-			record vm-survey FAIL "no survey lines in the kernel log window (and no Compute,VMSurvey copy parsed): bring-up lines lost"
+			# The kernel log window lost the bring-up lines: use the registry copy (entries "<tag> G<grbm>/<grbm2> C... ## ").
+			SURV="$(ioreg -l -w0 2>/dev/null | grep '"Compute,VMSurvey"' | sed -n -E 's/.*"Compute,VMSurvey" = "([^"]*)".*/\1/p' | head -1 | sed 's/ ## /\
+/g' | sed -n -E 's/^(.*) G([0-9a-fA-F]{8})\/.*$/vmidtest: survey \1: GRBM 0x\2/p')"
+			SURV_SRC="Compute,VMSurvey registry copy"
+		fi
+		if [ -z "$SURV" ]; then
+			record vm-survey FAIL "no survey lines in the kernel log window and no parsable Compute,VMSurvey property: bring-up lines lost"
 		else
 			SURV_FIRST=""
 			SURV_LIST=""
@@ -645,9 +665,9 @@ registry_value() {
 $SURV
 SURVEOF
 			if [ -n "$SURV_FIRST" ]; then
-				record vm-survey PASS "GRBM bit 31 (GUI_ACTIVE) first set at '$SURV_FIRST';$SURV_LIST"
+				record vm-survey PASS "GRBM bit 31 (GUI_ACTIVE) first set at '$SURV_FIRST' (from the $SURV_SRC);$SURV_LIST"
 			else
-				record vm-survey PASS "GRBM bit 31 never set at any survey point;$SURV_LIST"
+				record vm-survey PASS "GRBM bit 31 never set at any survey point (from the $SURV_SRC);$SURV_LIST"
 			fi
 		fi
 	fi

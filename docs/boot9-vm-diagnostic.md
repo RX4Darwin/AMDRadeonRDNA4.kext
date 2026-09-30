@@ -21,13 +21,13 @@ confound; every other hypothesis (H1-H8) is read from either boot's survey/probe
 
 | Boot | boot-args added to the base (`keepsyms=1 debug=0x100 npci=0x2000 -v -lilubetaall rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1`) |
 |---|---|
-| **9** | `rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vmid-test=7 rdna4-gfxpm=24` |
+| **9** | `rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vmid-test=15 rdna4-gfxpm=24` |
 | **9b** | boot 9 + `rdna4-vm-diag=4065` |
 
 - **Round 6's boot 2 minus `rdna4-vbl=1 rdna4-cursor=1`**: both flood the kernel log (the round 6 window began 146 s into the boot and held no bring-up line [M]).
 - **`rdna4-compute=7` stays.** (The lead's question: "compute=1 stops at the survey stage".) `rdna4-compute=<stage>` runs bring-up up to that stage and **1 is the survey stage only**; 7 is
   the full bring-up whose `compute:` lines (mec/vm/runtime/pm) this boot needs [M: `runStages`, `kFeatures`]. My hub-task-311 note "+ `rdna4-compute=1`" was a mistake.
-- **`rdna4-vmid-test=7`** = Forge's mask: 1 probes (T0 SH_MEM + SPI_GDBG readback, T1/T2 slot reuse, T3 U1/U2, T5 vadd via IB, T4a/b/c client-style queue first activation / reactivation /
+- **`rdna4-vmid-test=15`** = Forge's mask (S1 round 2, `premetal/w13` 0cfa416: hub/L2 + SMU in every survey, `Compute,VMSurvey`/`Compute,VMOps` persistence, refusal traces, **bit 8 = the client-style probes T4a/T4d/T5b repeated after clock gating**, row `vmidtest-late`): 1 probes (T0 SH_MEM + SPI_GDBG readback, T1/T2 slot reuse, T3 U1/U2, T5 vadd via IB, T4a/b/c client-style queue first activation / reactivation /
   VMID 3, **T5c incremental stream bisect + sibling queues**, T5b launch-exact stream, T6 no-EXEC page, T7 negative control), 2 read-only surveys of engines and all 8 MEC HQDs at the
   flow points (before and after `vmBootSelfTest`, after the flip test, after clock gating, after the first client opens), 4 a bounded (64-line) client-operation trace.
 - **`rdna4-gfxpm=24`** = sample (8) + per-stage survey (16) and nothing else: the existing `pm: survey ...` lines after stages 3-7 and the `cg before/after` samples with SMU activity and
