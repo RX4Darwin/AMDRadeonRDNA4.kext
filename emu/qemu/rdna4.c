@@ -5228,9 +5228,11 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
     ngg.s[3] = 0x10000103;             /* merged_wave_info: wave 0 of 1 */
     /* W46: gfx12 hands the NGG wave the primitive export value ALREADY PACKED in VGPR0 ("NGG passthrough mode: the HW already packs the
      * primitive export value to a single register", ac_nir_lower_intrinsics_to_args.c; the vertices are ubfe(v0, 9 * v, 8), ac_nir_lower_ngg.c):
-     * indices 0,1,2 at a 9-bit stride, no edge flags. The earlier model gave byte-packed indices (0x04020100) and converted them at the
-     * export; that conversion is not what the hardware does (the shader exports v0 unchanged). */
-    ngg.v[0][0] = 0x00080200;
+     * indices 0,1,2 at a 9-bit stride. The earlier model gave byte-packed indices (0x04020100) and converted them at the
+     * export; that conversion is not what the hardware does (the shader exports v0 unchanged). The value the card really hands lane 0 was
+     * measured by nggvgpr under Linux (docs/linux-replay.md): 0x040a0300 = the indices 0, 1, 2 plus the three edge-flag bits (8, 17, 26).
+     * The triangle assembly below reads only the 8-bit index fields and bit 31 (null primitive), so the edge bits change nothing here. */
+    ngg.v[0][0] = 0x040a0300;
     for (unsigned lane = 0; lane < count; lane++)
         ngg.v[3][lane] = lane;         /* auto-index VertexID */
     if (!rdna4_gfx_wave_run(s, &ngg, true,
