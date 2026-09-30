@@ -5,6 +5,16 @@ Evidence tags: **[M]** measured (log file:line, or a header/source line I read),
 Logs: `/run/media/miguer/OPENCORE/rdna4fb-diag-2026093*.txt` and `old-logs/` (read-only). "053316" = round 5 boot 2, "061829" = round 6 boot 2,
 "062351" = round 6 boot 3 (same args plus `rdna4-gfx=2`).
 
+## Erratum (found while defining boot 9, `docs/boot9-vm-diagnostic.md`)
+
+**The round 6 VM boots carried `rdna4-vm-diag=4065`** (real boot-args line: `061829` line 17). The diagnostic script's `active:` list (line 10) does not list `vm-diag`, so this document
+treated them as plain `rdna4-vm=1` boots. Bit 512 of that mask ("F": the GC hub's fault default page pointed at a system page, `GCVM_L2_CNTL` default-page-out-to-system set, restored
+after the boot test) is active **even when the baseline passes**; the other diagnostic bits run only after a failure [M, code]. Consequences for what is written below:
+- §0 item 2 and H1 ("the pin appears in every `vm=1` boot") are **confounded with F**: the round 5 and 6 VM boots all had it; no plain VM boot has been measured with clock gating on. New hypothesis **H9**: F's window or restore leaves the GC L2/hub in a state that stalls MEC service. Discriminator: boot 9 (plain, no vm-diag) vs boot 9b (round 6's exact arguments).
+- "Client path == boot test" (§3) still holds for the registers compared; the boot test of round 6 was, however, the F-instrumented one.
+- §9 said `+ rdna4-compute=1`: wrong. `rdna4-compute=1` stops bring-up at the survey stage; the boot keeps `rdna4-compute=7`.
+The final definition of the boots is `docs/boot9-vm-diagnostic.md` on branch `premetal/vmdiag`.
+
 ## 0. Verdict
 
 **The root cause is not provable from the code and the logs. I do not propose a fix yet.** What the evidence does settle:
