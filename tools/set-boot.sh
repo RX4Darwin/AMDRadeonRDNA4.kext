@@ -22,9 +22,8 @@
 #      Needs docs/w12k-gfx-submit.md's dependency (W13 S0: rtFree invalidates device buffers) before it is enabled on the real card.
 #  10  boot 8 + rdna4-gfxidle=1 (power P2/P3, docs/power-gfx.md s.9): software-only idle accounting (idle:/Compute,GFXIdle) next to the SMU's view; diagnostic-log.sh rows post-idle
 #      (sensors 3 s after the application steps: FAIL when activity stays >= 10 % or power >= 40 W) and gfx-idle-acct. Changes no hardware state.
-#  11  boot 8 + rdna4-pm=1 rdna4-gfxidle=1: the real-card SLEEP/WAKE boot (P7). NEVER RUN ON THE CARD BEFORE: run it LAST, power-cycle afterwards. Sequence: `/tmp/rdna4-run tri` (copied from the stick first), `pmset sleepnow`,
-#      wake with the power button, `/tmp/rdna4-run tri` again (docs/final-test-plan.md). Expected: power: sleep requested / quiesce lines, no gfx: draw / flip: lines between the wake and "user-space runtime up again" (the
-#      wake skips the bring-up tests; rdna4-resume-tests=1 brings them back), a client wait that was in progress returns Aborted (rdna4-sleepabort=0 disables).
+#  11  boot 8 + rdna4-pm=1 rdna4-gfxidle=1: only for a REAL system sleep from a full macOS that has a Sleep menu entry. NOT in Recovery: there `pmset sleepnow` is a display sleep only and the screen stays black
+#      (docs/final-test-plan.md). Not part of the final plan (its sleep test is 11s). Never run on the card.
 #   9  THE VM-CLIENT DIAGNOSTIC (docs/vm-client-rootcause.md, hub-task-311/320): the VM boot of round 6 WITHOUT rdna4-vbl/cursor (so the kernel log window keeps the bring-up
 #      lines; round 6's began 146 s into the boot) and WITHOUT rdna4-vm-diag, plus rdna4-vmid-test=15 (1 = probes T0-T7 incl. the incremental-stream bisect T5c and T4d, 2 = read-only
 #      surveys of engines + all 8 MEC HQDs + hub/L2 + SMU at the flow points, 4 = a bounded client-op trace, 8 = the late probes T4a/T4d/T5b repeated after clock gating) and rdna4-gfxpm=24 (the existing per-stage `pm: survey` lines + SMU samples; it only
@@ -32,7 +31,7 @@
 #      round 6 boots DID carry rdna4-vm-diag=4065 (061829 line 17; the diagnostic script did not list that arg), whose bit 512 "F" points the GC hub's fault default page at a
 #      system page during the boot test, and the round 5 and 6 VM boots had it: "a clean VM boot pins the GPU at idle" is unproven. Run 9 first, then 9b.
 #   9b boot 9 + rdna4-vm-diag=4065: the exact round 6 VM configuration with the full instrumentation (run after 9: A/B on the confound).
-#  11s boot 11 + rdna4-sleeptest=1: FALLBACK if a real system sleep cannot be triggered in Recovery. diagnostic-log.sh then runs the DRIVER'S OWN SIMULATED sleep cycle by itself
+#  11s boot 11 + rdna4-sleeptest=1: THE SLEEP TEST of the final plan (run LAST, power-cycle after). diagnostic-log.sh then runs the DRIVER'S OWN SIMULATED sleep cycle by itself
 #      (`rdna4-run sleeptest`: powerWillSleep, 15 s, powerDidWake, row `sleep`). It is NOT a system sleep: the machine stays on and the card is not power-gated (docs/final-test-plan.md).
 #  12  boot 9 + rdna4-vmshared=1: the CANDIDATE FIX under the same diagnostics (client compute jobs run on two shared VMID-0 MEC queues as INDIRECT_BUFFER(vmid), the model amdgpu
 #      uses on gfx12 without MES, docs/w13-vmid.md design B; default off elsewhere). Same rows as boot 9 (vmidtest, vm-survey, vm-trace, idle-pin) plus the runtime/submitib rows, which are the

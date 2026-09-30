@@ -78,29 +78,17 @@ WHAT TO LOOK FOR (only so you know if something looks odd; do not judge)
   Idle test. Rows post-idle and gfx-idle-acct. post-idle FAIL means the GPU
   stays busy after the programs closed (a measurement, not a disaster).
 
-== BOOT 11 ==
-  SLEEP / WAKE. NEVER TRIED ON THIS CARD BEFORE, so it is LAST.
-  Extra steps AFTER the diagnostic-log.sh table, in the same Terminal window.
-  (Programs on the stick cannot be started directly in Recovery: copy first.)
-     1. type:   cp /Volumes/OPENCORE/rdna4-run /tmp/rdna4-run
-        type:   chmod +x /tmp/rdna4-run
-        type:   /tmp/rdna4-run tri               (expect the word PASS)
-     2. type:   pmset sleepnow
-        The screen should go dark. Wait at least 10 seconds. Then wake the
-        Mac with a short tap of the POWER BUTTON (a key may also work).
-        (The Apple menu in Recovery is not believed to have a Sleep entry: use
-        the pmset line.)
-     3. When the screen is back and Terminal is usable, type:
-                /tmp/rdna4-run tri               (expect PASS again)
-  If "pmset sleepnow" prints an error, or nothing happens within 30 seconds:
-  do not force it. Type  bash /Volumes/OPENCORE/set-boot.sh 11s , restart,
-  run diagnostic-log.sh as usual. That variant does NOT put the Mac to
-  sleep: the driver simulates a sleep cycle by itself (a 30 second test
-  inside the driver, the row called "sleep" in the table). It is the
-  fallback, and less complete than a real sleep.
-  If the Mac does not come back or the screen stays black: hold the power
-  button, power off for 10 seconds, and tell Claude. Then POWER OFF after
-  this boot whatever happened.
+== BOOT 11s ==
+  SLEEP TEST. NEVER TRIED ON THIS CARD BEFORE, so it is LAST. You do not
+  have to do anything extra: diagnostic-log.sh runs a simulated sleep
+  cycle by itself (about 30 seconds inside the driver; the Mac does NOT go
+  to sleep, and the screen should stay on). The table row is called
+  "sleep". Do NOT try to sleep the Mac by hand in Recovery: there is no
+  Sleep entry in its Apple menu, and the command "pmset sleepnow" only
+  switches the display off, after which it may never come back.
+  If the screen goes black or the Mac freezes during this boot: hold the
+  power button, power off for 10 seconds, and tell Claude. Then POWER OFF
+  (Shut Down) after this boot whatever happened.
 
 IF SOMETHING GOES WRONG (freeze, panic, black screen, reboot loop)
   - Take a photo of the screen if there is anything on it.

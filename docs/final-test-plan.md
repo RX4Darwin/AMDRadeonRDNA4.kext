@@ -33,12 +33,12 @@ together with `tools/set-boot.sh` and `tools/diagnostic-log.sh`).
 | 6 | **8** | Applications compute + draw through the old path (W12k `rdna4-run tri`/`tricol`) | Yes |
 | 7 | **13** | Boot 8 + `rdna4-vmshared=1` (same apps, shared-queue compute path) | Yes |
 | 8 | **10** | Boot 8 + `rdna4-gfxidle=1`: idle accounting + post-client idle | Yes |
-| 9 | **11** | Sleep/wake (`rdna4-pm=1`): **LAST, never run on the card before**, power-cycle afterwards | (last) |
+| 9 | **11s** | The driver's simulated sleep cycle (`rdna4-pm=1 rdna4-sleeptest=1`): **LAST, never run on the card before**, power-cycle afterwards | (last) |
 | end | **1** (daily) or **0** (known good, no feature) | | |
 
 **Decision after steps 2-4** (read `docs/boot9-vm-diagnostic.md` s.3 for the full table): boot 9 clients PASS and 9b FAIL => the F diagnostic (`rdna4-vm-diag` bit 512) is the culprit: use
-`NOVMDIAG=1 bash set-boot.sh <id>` for every later VM boot (3, 8, 13, 10, 11) and drop `rdna4-vm-diag` from the plan. Both FAIL and boot 12 PASS => the shared-queue path is the fix; use it (`rdna4-vmshared=1`) for 8's
-replacement (boot 13) and later boots. All three FAIL => keep going with 3/8/10/11 for the non-client results, and send the logs: `vm-survey`, `vmidtest`, `vm-trace` name the failing step.
+`NOVMDIAG=1 bash set-boot.sh <id>` for every later VM boot (3, 8, 13, 10, 11s) and drop `rdna4-vm-diag` from the plan. Both FAIL and boot 12 PASS => the shared-queue path is the fix; use it (`rdna4-vmshared=1`) for 8's
+replacement (boot 13) and later boots. All three FAIL => keep going with 3/8/10/11s for the non-client results, and send the logs: `vm-survey`, `vmidtest`, `vm-trace` name the failing step.
 
 ## 3. What each boot should print (rows of the summary table)
 
@@ -78,21 +78,15 @@ The W13 S0 dependency of W12k (rtFree invalidates device buffers) is in the tree
 Boot 8 + `rdna4-gfxidle=1`. Rows: `gfx-idle-acct PASS` (`Compute,GFXIdle`: `idle for N ms ... transitions T`; lines `idle: busy -> idle after N ms busy`), **`post-idle`** (3 s after the application steps: PASS < 10 % and < 40 W;
 FAIL `STAYS HIGH` = the VM pin survives the clients closing), `idle-pin`. Changes no hardware state, so a FAIL is a measurement, not a regression.
 
-### Boot 11 (sleep/wake, LAST) and its fallback 11s
-Boot 11 = boot 8 + `rdna4-pm=1 rdna4-gfxidle=1`. **Never run on the card.** Sequence, in the Recovery Terminal after `diagnostic-log.sh`:
-1. `cp /Volumes/OPENCORE/rdna4-run /tmp/rdna4-run; chmod +x /tmp/rdna4-run; /tmp/rdna4-run tri` (PASS). Reason: `diagnostic-log.sh` itself copies `rdna4-run` to `/tmp` and `chmod +x`es it before running it
-   (`RUN=/tmp/rdna4-run`, rounds 5-7); running it straight from the FAT stick is **not** something the logs show working, so the plan never does it.
-2. `pmset sleepnow` (a real system sleep through IOPMrootDomain, which calls the driver's `setPowerState(0)` because boot 11 has `rdna4-pm=1`). **`/usr/bin/pmset` exists in the Recovery image** [M: listing of the stick's
-   BaseSystem.dmg, `macOS Base System/usr/bin/pmset`]; that it puts a machine in *Recovery* to sleep, and that this Hackintosh wakes from S3, are [U]. Recovery's Apple menu has no Sleep entry [I: not verified on the card; Kiln was asked
-   for a screendump]. Wait >= 10 s, **wake with a short tap of the power button** (a key may also work; [U]).
-3. `/tmp/rdna4-run tri` again (a NEW connection; the old one is `Aborted` after the wake).
-Expect in the log: `power: sleep requested`, `power: quiesce begin`, `power: gfx: no client gfx IB in flight at sleep`, `power: quiesce complete`, `power: wake received`, `power: resume: skipping the G3/G4 draws, the gfx client
-self-test and the flip test`, **no** `gfx: draw` / `flip:` lines before `user-space runtime up again`, then `PASS  tri:`. If the machine does not come back or the screen stays black: **power-cycle**, `set-boot.sh 1`; send the
-`rdna4-trail` and the log. Power-cycle after this boot either way (GC state across S3 is [U]).
-
-**Fallback 11s** (= boot 11 + `rdna4-sleeptest=1`), if `pmset sleepnow` errors or does nothing: `diagnostic-log.sh` runs the **driver's own simulated sleep cycle** by itself (`rdna4-run sleeptest`: `powerWillSleep`, a 15 s pause,
-`powerDidWake`, a 15 s wait for the re-bring-up; row `sleep`). It is **not a system sleep**: the machine stays on, the card is not power-gated and not reset (the emulator resets it during that window, the real card is not);
-so it proves the driver's quiesce and re-bring-up, not what S3 does to the card. It has never run on the card either, and re-running the bring-up (PSP, firmware autoload) on a live GPU is itself unproven.
+### Boot 11s (the sleep test, LAST)
+Args: boot 8 + `rdna4-pm=1 rdna4-gfxidle=1 rdna4-sleeptest=1`. **Never run on the card.** Nothing to do by hand: `diagnostic-log.sh` runs the **driver's own simulated sleep cycle** (`rdna4-run sleeptest`: `powerSleepRequest` + `powerWillSleep`, a 15 s pause,
+`powerDidWake`, a 15 s wait for the re-bring-up) and records row `sleep`. **Why not a real system sleep** (Kiln, emulator Recovery, hub-task-344, observed): Recovery's Apple menu has only Startup Disk / Restart / Shut Down (no Sleep); `/usr/bin/pmset`
+exists and `pmset sleepnow` is a **display sleep only** (powerd goes to DarkWake, the kext never receives `setPowerState(0)`), and afterwards **the screen stays black** (no "Display is turned on", no kext un-blank). So the plan never uses `pmset sleepnow` or an
+Apple-menu Sleep in Recovery. A real system sleep could only be tried from a full macOS that has a Sleep entry; that is outside this plan (the old boot 11 = boot 8 + `rdna4-pm=1 rdna4-gfxidle=1` stays in `set-boot.sh` for that, unused).
+Expected in the log: `power: debug sleep selector phase 1`, `power: sleep requested`, `power: quiesce begin`, `power: gfx: no client gfx IB in flight at sleep`, `power: quiesce complete`, `power: wake received`, then the whole bring-up again (PSP, RLC autoload, SMU), **`sdma: resume without a power loss? engine
+pointers rptr ... wptr ...: the ring resumes at 0x...`**, `power: resume: skipping the G3/G4 draws, the gfx client self-test and the flip test`, **no** `gfx: draw` / `flip:` lines before `user-space runtime up again`; row `sleep PASS` (the pre-sleep client comes back `Aborted`).
+Validated on the emulator only, **with and without a power loss** in the window (Kiln, hub-task-363): both pass. **What that does not cover**: the simulated cycle does not power-gate the card (the machine stays on), so it proves the driver's quiesce and re-bring-up, not what S3 does; and re-running PSP `LOAD_IP_FW`/autoload on a **live** GPU is
+unproven on the card. If the screen goes black or the machine hangs: power-cycle, `set-boot.sh 1`, send the `rdna4-trail` and the log. Power-cycle after this boot either way.
 
 ## 4. Getting back
 - **Daily use**: `set-boot.sh 1` (base + real pointer) — or `0` for the known-good argument set without any new feature.
@@ -106,11 +100,11 @@ boot 9/9b/12: `runtime/submitib/fault/vm PASS`, `vmidtest` **all P** (T5c, T5b, 
 (`vmshared: shared queue 0: MEC1 pipe 0 queue 2, VMID 0, doorbell dword 74`). Boot 3: `gfx PASS`, `gfx-col FAIL` (emulator does not model G4). Boot 8: `gfx-client PASS`, `gfx-app-tri PASS`, `gfx-app-tricol FAIL` (G4).
 Boot 10: `gfx-idle-acct PASS` with the expected `idle:` transitions. **Findings and what was done:**
 - **Boot 13 gfx rows FAILED** (`tri: SubmitGfxIb: resource shortage`, `gfx-client FAIL setup`): `rtOpenShared` did not set the client's gfx fence. Fixed in `4365f84` (same two lines Kiln confirmed); the rule "gfx rows of boot 13 = boot 8" holds again (Kiln's scratch run); the fixed tree is not re-run in the emulator yet.
-- **Boot 11s FAILED on the emulator** (`sleep FAIL`): after the simulated sleep the re-bring-up stopped at stage 4 (SDMA): the engine still held its 64-bit pointers (0x17604) and the kext restarted the ring at wptr 0, which SDMA 7 treats as "nothing to do" (card-proven rule, `ae70f2e`). Kiln's run never triggered the emulator's sleep reset (its `power reset` line is at VM start), so this **was the no-power-loss case, which is what the real card is in after the driver's simulated sleep**; it was *not* an emulator gap. Fixed in `12ac79b` (the ring resumes at the engine's own pointers after a wake; emulator: ring position = RB_RPTR mod size); **re-run pending** (Kiln, hub-task-363). What the emulator still cannot validate: the rest of the re-bring-up (PSP/firmware autoload again on a live GPU) and what a real S3 does to the card. Treat 11s as a low-value fallback.
+- **Boot 11s FAILED on the emulator** (`sleep FAIL`): after the simulated sleep the re-bring-up stopped at stage 4 (SDMA): the engine still held its 64-bit pointers (0x17604) and the kext restarted the ring at wptr 0, which SDMA 7 treats as "nothing to do" (card-proven rule, `ae70f2e`). Kiln's run never triggered the emulator's sleep reset (its `power reset` line is at VM start), so this **was the no-power-loss case, which is what the real card is in after the driver's simulated sleep**; it was *not* an emulator gap. Fixed in `12ac79b` (the ring resumes at the engine's own pointers after a wake; emulator: ring position = RB_RPTR mod size); **re-run **passes with and without a power loss** (Kiln, hub-task-363). What the emulator still cannot validate: the rest of the re-bring-up (PSP/firmware autoload again on a live GPU) and what a real S3 does to the card. Treat 11s as a low-value fallback.
 - `post-idle FAIL` and every idle figure on the emulator come from a constant synthetic SMU (3 % / 120 W): not a kext result. `vmidtest` all-P means **the emulator does not reproduce the round 6 card failure**: what breaks the clients on the card is not modelled (this is what boots 9/9b/12 are for).
-- Boot 11 on the emulator triggers no sleep (needs a real system sleep): the `pmset` question (hub-task-344) is still open.
+- `pmset sleepnow` in the emulator's Recovery is a display sleep only and the display does not come back (hub-task-344): see the plan for boot 11s and `docs/power-gfx.md` s.9.7.
 
 ## 5. What is not known
 - Every boot id above is **unrun on the card** in this tree. The `vmidtest` probes and `rdna4-vmshared` have run on the emulator only (Kiln's whole-plan dry run: see the hub-task-331 report); whether the emulator reproduces the round 6 client failure is [U].
-- Boots 2/3/8/10/11/13 carry `rdna4-vm-diag=4065` unless `NOVMDIAG=1` (round 6 had it; whether it matters is what boots 9/9b decide).
+- Boots 2/3/8/10/11s/13 carry `rdna4-vm-diag=4065` unless `NOVMDIAG=1` (round 6 had it; whether it matters is what boots 9/9b decide).
 - P2/P3/P7 (idle accounting, post-idle row, sleep hardening) have not run outside the build; see `docs/power-gfx.md` s.9.
