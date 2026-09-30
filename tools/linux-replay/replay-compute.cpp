@@ -21,6 +21,7 @@
 //
 // Build and run: REPLAY_IP=compute REPLAY_COMPUTE_OK=1 tools/linux-replay/run.sh
 
+#include <vector>
 #include "vadd_codeobj.h"     // src/
 #include "codeobj.hpp"        // src/ (compiled in: replay.cpp builds without it, see run.sh)
 #include "pm4build.h"         // userspace/
@@ -103,8 +104,24 @@ int main() {
 	const uint32_t count = getenv("REPLAY_COMPUTE_COUNT") ? strtoul(getenv("REPLAY_COMPUTE_COUNT"), nullptr, 0) : 1;
 	if (count < 1 || count > 64) { fprintf(stderr, "REPLAY_COMPUTE_COUNT is 1..64\n"); return 1; }
 
+	// REPLAY_CODEOBJ=<file>: run that gfx1201 code object's kernel "vadd" instead of the embedded one (E3 of docs/metal-spike.md: a gfx1030
+	// kernel translated by tools/e3/g10to12.py). Same launch, same inputs, same check: c[i] = a[i] + 3 * b[i]. Reviewed before any run.
+	std::vector<uint8_t> external;
 	const uint8_t *elf = kVaddCodeObject;
-	const size_t elfSize = sizeof(kVaddCodeObject);
+	size_t elfSize = sizeof(kVaddCodeObject);
+	if (const char *path = getenv("REPLAY_CODEOBJ")) {
+		FILE *f = fopen(path, "rb");
+		if (!f) { perror(path); return 1; }
+		fseek(f, 0, SEEK_END);
+		const long n = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		external.resize(n > 0 ? static_cast<size_t>(n) : 0);
+		if (external.empty() || fread(external.data(), 1, external.size(), f) != external.size()) { fprintf(stderr, "%s: short read\n", path); fclose(f); return 1; }
+		fclose(f);
+		elf = external.data();
+		elfSize = external.size();
+		printf("code object: %s (%zu bytes) instead of the embedded vadd\n", path, elfSize);
+	}
 	CodeObj::Kernel k;
 	CodeObj::Image img;
 	const char *why = nullptr;
