@@ -532,7 +532,7 @@ registry_value() {
 	section "dmesg: runtime client lines (open, close, dequeue, dispatch, wedge, recovery; host buffer map/unmap noise removed)"
 	klines 'RDNA4FB: runtime:' | grep -v 'host buffer' || true
 	section "dmesg: MEC / HQD / VM boot-test lines (compute: mec|vm|runtime|hqd|pm: survey)"
-	klines 'RDNA4FB: compute: (mec|vm|runtime|hqd|pm: survey)' || true
+	klines 'RDNA4FB: (compute: (mec|vm|runtime|hqd|pm: survey)|ih: .*(VM page fault|VM fault IV))' || true
 	section "registry copies that survive the kernel log wrapping: Compute,VMSurvey / Compute,VMOps / RDNA4FB,Results"
 	for prop in VMSurvey VMOps; do
 		echo "--- Compute,$prop"

@@ -14,8 +14,9 @@ together with `tools/set-boot.sh` and `tools/diagnostic-log.sh`).
 
 ## 1. How to run one boot (unchanged loop)
 
-1. `bash /Volumes/OPENCORE/set-boot.sh <id>` (Recovery Terminal, stick mounted), reboot into the OpenCore entry, log in to the desktop and leave it alone for ~1 minute (bring-up starts 5 s after load).
-2. Back in Recovery (or from the desktop): `bash /Volumes/OPENCORE/diagnostic-log.sh`. It writes `rdna4fb-diag-<date>-<time>.txt` next to the script and prints the summary table. **Keep every log; send them all.**
+1. Boot 1 (or whatever the stick is set to) into macOS Recovery, open Terminal (Utilities > Terminal), run `bash /Volumes/OPENCORE/set-boot.sh <id>`, then restart (Apple menu > Restart).
+2. The restarted boot again lands in Recovery (as in rounds 5-7): open Terminal and **immediately** run `bash /Volumes/OPENCORE/diagnostic-log.sh` (it waits up to 2 minutes for the bring-up, which starts 5 s after the kext
+   loads). It writes `rdna4fb-diag-<date>-<time>.txt` next to the script and prints the summary table. **Keep every log; send them all.** (`tools/stage-stick.sh` generates `START-HERE.txt` with the same steps in plain words.)
 3. If a boot hangs or the screen does not come back: power-cycle, pick the stick again, `set-boot.sh 1` (or 0). The NVRAM trail (`rdna4-trail`) makes the next boot skip the feature that hung, once: boot the same id a second
    time before drawing conclusions from the skip.
 4. `NOVMDIAG=1 bash set-boot.sh <id>` gives the same boot without `rdna4-vm-diag=4065` (see step 3 of the order).
