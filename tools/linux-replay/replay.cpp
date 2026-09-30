@@ -14,12 +14,13 @@
 // Environment:
 //   REPLAY_VS=new|old|file:<hex>  new (default) = the committed src/ngg_kernel.h,
 //                        old = the round-6 ngg.s (edc5f81, s_and_saveexec: 0 px on the card)
-//   REPLAY_VARIANT=<n>   the kext's register-only ladder patches (1, 2, 128, 256, 2048, 64)
+//   REPLAY_VARIANT=<n>   the kext's ladder patches (1, 2, 128, 256, 2048, 64; 4096 = wave64 ngg64.s)
 //
 // Build and run: tools/linux-replay/run.sh. Findings: docs/linux-replay.md
 
 #include "gfx12tri.h"         // userspace/: the shared builder rdna4-run tri uses (gfx12_draw.h, ngg, psred)
 #include "ngg_old_kernel.h"
+#include "ngg64_kernel.h"
 
 #include <amdgpu.h>
 #include <amdgpu_drm.h>
@@ -135,7 +136,9 @@ int main() {
 		fclose(f);
 		printf("VS from %s: %u dwords\n", vsSel + 5, nk);
 		place(0, k, nk);
-	} else if (!strcmp(vsSel, "old"))
+	} else if (variant & 4096)   // the wave64 fallback (ngg64.s), as the kext's ladder variant 4096
+		place(0, kNgg64Kernel, sizeof(kNgg64Kernel) / 4);
+	else if (!strcmp(vsSel, "old"))
 		place(0, kNggOldKernel, sizeof(kNggOldKernel) / 4);
 	else if (strcmp(vsSel, "new")) {
 		fprintf(stderr, "REPLAY_VS: new, old or file:<hex>\n");
@@ -178,6 +181,10 @@ int main() {
 		patch(0x69, 0x204, 0x00010000, 0x00010000, "PA_CL_CLIP_CNTL.CLIP_DISABLE=1");
 	if (variant & 256)
 		patch(0x69, 0x20b, 0x0000000f, 0x0000000f, "PA_SU_PRIM_FILTER_CNTL.*_FILTER_DISABLE=1");
+	if (variant & 4096) {   // wave64: GS_W32_EN off, 12 VGPRs (granules of 4 in wave64)
+		patch(0x69, 0x2a6, 0x00400000, 0, "VGT_SHADER_STAGES_EN.GS_W32_EN=0 (wave64 NGG)");
+		patch(0x76, 0x8a, 0x0000003f, 2, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=2 (wave64)");
+	}
 	if (variant & 2048)
 		patch(0x79, 0x26b, 0xffffffff, 0x000007fe, "GE_PRIM_RING_SIZE = MEM_SIZE only");
 

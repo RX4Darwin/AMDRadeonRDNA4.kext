@@ -14,7 +14,9 @@ mkdir -p build/shaders
 # Raw machine code from assembly.
 for src in shaders/*.s; do
 	name=$(basename "$src" .s)
-	"$LLVM/bin/llvm-mc" -triple=amdgcn-amd-amdhsa -mcpu=gfx1201 -filetype=obj \
+	attr=
+	case "$name" in *64) attr=-mattr=+wavefrontsize64 ;; esac   # shaders/*64.s are wave64 (ngg64.s)
+	"$LLVM/bin/llvm-mc" -triple=amdgcn-amd-amdhsa -mcpu=gfx1201 $attr -filetype=obj \
 		-o "build/shaders/$name.o" "$src"
 	"$LLVM/bin/llvm-objcopy" -O binary --only-section=.text "build/shaders/$name.o" \
 		"build/shaders/$name.bin"

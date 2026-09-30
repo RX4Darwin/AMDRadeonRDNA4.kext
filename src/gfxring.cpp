@@ -37,6 +37,7 @@
 #include "nggstore_kernel.h"
 #include "nggvgpr_kernel.h"
 #include "nggconst_kernel.h"
+#include "ngg64_kernel.h"
 #include "pm4.hpp"
 #include "psred_kernel.h"
 #include "psstore_kernel.h"
@@ -1364,6 +1365,8 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		place(kGfxVsOffset, kNggvgprKernel, sizeof(kNggvgprKernel) / 4);
 	else if (variant & 1024)   // W46: the NGG shader that takes nothing from its VGPR inputs (constant primitive, lane-id vertices)
 		place(kGfxVsOffset, kNggconstKernel, sizeof(kNggconstKernel) / 4);
+	else if (variant & 4096)   // the wave64 fallback: ngg.s as a wave64 NGG shader, the way RADV draws this triangle
+		place(kGfxVsOffset, kNgg64Kernel, sizeof(kNgg64Kernel) / 4);
 	else
 		place(kGfxVsOffset, kNggKernel, sizeof(kNggKernel) / 4);
 	if (variant & 32) {   // the two literal dwords of its s_mov_b32 sN, literal carry the marker address
@@ -1432,6 +1435,10 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	if (variant & (32 | 512 | 1024))   // the marker shader uses v8/v9: 10 VGPRs = 2 granules of 8 (VGPRS field = granules - 1)
 		patch(kOpSetShReg, 0x1a2a - kShBase, 0x0000003f, 1, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=1");
 
+	if (variant & 4096) {   // wave64 (proven on the card under Linux: tools/linux-replay REPLAY_VARIANT=4096, 8192 px)
+		patch(kOpSetContextReg, 0x02a6, 0x00400000, 0, "VGT_SHADER_STAGES_EN.GS_W32_EN=0 (wave64 NGG)");
+		patch(kOpSetShReg, 0x1a2a - kShBase, 0x0000003f, 2, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=2 (12 VGPRs: wave64 granules of 4)");
+	}
 	if (variant & 2048)   // W46: GE_PRIM_RING_SIZE without Mesa's GL2 hints (SCOPE, PAF/PAB_TEMPORAL, FORCE_SE_SCOPE, PAB_NOFILL): MEM_SIZE only
 		patch(0x79, 0x26b, 0xffffffff, 0x000007fe, "GE_PRIM_RING_SIZE = MEM_SIZE only (no GL2 hints)");
 	if (variant & 128)   // W45: PA_CL_CLIP_CNTL.CLIP_DISABLE: if the primitive survives, the clipper was dropping it
@@ -1686,7 +1693,7 @@ bool RDNA4Compute::stageGfxDraw() {
 	// The diagnostic ladder (rdna4-gfxdiag=<mask>, default off): the same stream with
 	// one open question changed at a time, each logged with the same evidence, so that
 	// round 4 sees which stage of the pipeline works. Only the baseline decides PASS.
-	const uint32_t diag = requestedGfxDiag() | (requestedGfxDiag() && requestedGfxProbe() ? (32u | 64u | 128u | 256u | 512u | 1024u | 2048u) : 0u);   // W37: the NGG marker joins the ladder of a probe boot
+	const uint32_t diag = requestedGfxDiag() | (requestedGfxDiag() && requestedGfxProbe() ? (32u | 64u | 128u | 256u | 512u | 1024u | 2048u | 4096u) : 0u);   // W37: the NGG marker joins the ladder of a probe boot
 	if (diag && (!base.ok || (diag & 16))) {
 		char summary[400], probes[240];
 		summary[0] = probes[0] = '\0';
@@ -1701,7 +1708,9 @@ bool RDNA4Compute::stageGfxDraw() {
 		// primitive reaches the clipper (C_INVOCATIONS 1) and is dropped there (C_PRIMITIVES 0).
 		// W46: round 6 on the card: cprim stays 0 with CLIP_DISABLE (128) and the filters off (256), so the two new variants come first: 1024 takes
 		// nothing from the wave's VGPR inputs, 2048 removes the GE ring's GL2 hints.
-		static const uint32_t order[11] = { 32, 1024, 2048, 512, 128, 256, 64, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
+		// The wave64 fallback (4096) right after the marker: it is RADV's configuration for this draw and the other wave size, proven
+		// on the card under Linux; if the wave32 baseline is empty on macOS but 4096 draws, the difference is the wave size there.
+		static const uint32_t order[12] = { 32, 4096, 1024, 2048, 512, 128, 256, 64, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
 		for (uint32_t bit : order) {
 			if (!(diag & bit))
 				continue;
@@ -1714,7 +1723,7 @@ bool RDNA4Compute::stageGfxDraw() {
 			if (bit == 8 && did)
 				used += snprintf(summary + used, sizeof(summary) - used, "/marker %s",
 				                 r.marker == kMarkerValue ? "yes" : "no");
-			if ((bit == 32 || bit == 128 || bit == 256 || bit == 512 || bit == 1024 || bit == 2048) && did && r.probeSeen)
+			if ((bit == 32 || bit == 128 || bit == 256 || bit == 512 || bit == 1024 || bit == 2048 || bit == 4096) && did && r.probeSeen)
 				used += snprintf(summary + used, sizeof(summary) - used, "/cprim %u", r.cPrim);
 			if (bit == 64 && did)
 				used += snprintf(summary + used, sizeof(summary) - used, "/primtype-idx");

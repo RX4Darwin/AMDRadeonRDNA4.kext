@@ -70,6 +70,22 @@ OPCODE_ERROR fault) and all its SET_UCONFIG_REG writes are in the unprivileged r
 replay and decodes the packets around our INDIRECT_BUFFER. That shows what the kernel wraps a user gfx IB
 with on this card, which is the reference for the kext side of W12k.
 
+## The wave64 fallback (ladder variant 4096)
+
+`shaders/ngg64.s` is `ngg.s` as a wave64 NGG shader (64-bit EXEC and compare masks; `tools/build-shaders.sh`
+assembles `*64.s` with `+wavefrontsize64`). Variant 4096 places it, clears `VGT_SHADER_STAGES_EN.GS_W32_EN`
+and sets `SPI_SHADER_PGM_RSRC1_GS.VGPRS = 2`. On the card (`REPLAY_VARIANT=4096`) it draws **8192 px**, with
+the same counters as the wave32 baseline.
+
+With VGPRS = 0 it draws 0 px. That shows wave64 VGPR granules of 4 are in effect, so the variant really
+runs as wave64. With VGPRS = 1 (8 VGPRs) it draws. The same binary also draws in wave32 mode, because the
+low halves of its masks are all wave32 reads. That is expected, so the VGPR control is the proof.
+
+It joins every probe boot's ladder right after the NGG marker. The ladder only runs when the baseline draw
+is not right. If boot 3's wave32 baseline were still empty on macOS, `diag 4096` says whether the wave size
+matters there. The emulator refuses wave64 draws ("requires GS_W32_EN"): the draw is skipped, 0 px, no
+false pass.
+
 ## Next
 
 Real-card round 7, boot 3 (`set-boot.sh 3`): the baseline draw should report `PASS ... THE TRIANGLE IS RIGHT,
