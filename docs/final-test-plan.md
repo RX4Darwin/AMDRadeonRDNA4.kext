@@ -100,6 +100,16 @@ so it proves the driver's quiesce and re-bring-up, not what S3 does to the card.
 - `set-boot.sh` keeps the first config backup (`config.plist.before-set-boot`) and validates with `plutil`.
 - After any GPU-side hang: power-cycle (not a warm reboot): clock-gating and SMU state persist across warm reboots ([M] `docs/gfx-pm-audit.md`).
 
+## 4b. Emulator dry run of this plan (Kiln, hub-task-350, tree `6cf90aa` + scripts; QEMU rebuilt from that tree's `rdna4.c`)
+Every boot reached Recovery, **no panic, no shell error in `diagnostic-log.sh`, zero `STALE TRANSLATION`, zero `unknown source`**. Rows that matter:
+boot 9/9b/12: `runtime/submitib/fault/vm PASS`, `vmidtest` **all P** (T5c, T5b, T6, T7 included), `vmidtest-late PASS`, `vm-trace PASS` (96 op lines), `vm-survey` 5+ points; boot 12's clients ran on the shared queues
+(`vmshared: shared queue 0: MEC1 pipe 0 queue 2, VMID 0, doorbell dword 74`). Boot 3: `gfx PASS`, `gfx-col FAIL` (emulator does not model G4). Boot 8: `gfx-client PASS`, `gfx-app-tri PASS`, `gfx-app-tricol FAIL` (G4).
+Boot 10: `gfx-idle-acct PASS` with the expected `idle:` transitions. **Findings and what was done:**
+- **Boot 13 gfx rows FAILED** (`tri: SubmitGfxIb: resource shortage`, `gfx-client FAIL setup`): `rtOpenShared` did not set the client's gfx fence. Fixed in `4365f84` (same two lines Kiln confirmed); the rule "gfx rows of boot 13 = boot 8" holds again (Kiln's scratch run); the fixed tree is not re-run in the emulator yet.
+- **Boot 11s FAILS on the emulator** (`sleep FAIL`): after the simulated sleep the re-bring-up stops at stage 4 (SDMA) because the emulator's simulated power reset does not reset the SDMA rptr/wptr [Kiln, inferred: emulator gap]. So **the resume path is not validated by the emulator**; on the card the fallback 11s re-runs the whole bring-up on a live GPU, which is unproven. Treat 11s as low-value: use it only when `pmset sleepnow` cannot be used, and expect it may not come back.
+- `post-idle FAIL` and every idle figure on the emulator come from a constant synthetic SMU (3 % / 120 W): not a kext result. `vmidtest` all-P means **the emulator does not reproduce the round 6 card failure**: what breaks the clients on the card is not modelled (this is what boots 9/9b/12 are for).
+- Boot 11 on the emulator triggers no sleep (needs a real system sleep): the `pmset` question (hub-task-344) is still open.
+
 ## 5. What is not known
 - Every boot id above is **unrun on the card** in this tree. The `vmidtest` probes and `rdna4-vmshared` have run on the emulator only (Kiln's whole-plan dry run: see the hub-task-331 report); whether the emulator reproduces the round 6 client failure is [U].
 - Boots 2/3/8/10/11/13 carry `rdna4-vm-diag=4065` unless `NOVMDIAG=1` (round 6 had it; whether it matters is what boots 9/9b decide).
