@@ -36,6 +36,7 @@
 #include "nggmsg_kernel.h"
 #include "nggstore_kernel.h"
 #include "nggvgpr_kernel.h"
+#include "nggconst_kernel.h"
 #include "pm4.hpp"
 #include "psred_kernel.h"
 #include "psstore_kernel.h"
@@ -46,6 +47,7 @@
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
 #include <libkern/c++/OSDictionary.h>
+#include <stdarg.h>
 #include <libkern/c++/OSNumber.h>
 #include <pexpert/pexpert.h>
 
@@ -405,7 +407,7 @@ uint32_t RDNA4Compute::requestedGfxDiag() {
 	uint32_t mask = 0;
 	if (!PE_parse_boot_argn("rdna4-gfxdiag", &mask, sizeof(mask)))
 		return 0;
-	return mask & 0x3ff;   // bits 1,2,4,8,32,64,128,256,512 = variants, 16 = run them even if the baseline passed
+	return mask & 0xfff;   // bits 1,2,4,8,32,64,128,256,512 = variants, 16 = run them even if the baseline passed
 }
 
 namespace {
@@ -1132,6 +1134,10 @@ void RDNA4Compute::gfxClipReport(const char *label, uint32_t poolOff, volatile u
 		GLOG("%s: clip state (CP view after the draw): %s", label, line);
 	GLOG("%s: clip state: %u of %u registers equal what the stream / the sane block wrote%s%s", label, equal, compared,
 	     ndiff ? "; differ: " : "", diff);
+	gfxClipEq = equal;
+	gfxClipCmp = compared;
+	gfxClipSw = ((clipCntl >> 16) & 1) | (((clipCntl >> 21) & 1) << 1) | (((clipCntl >> 22) & 1) << 2) | ((modeCntl & 1) << 3) |
+	            (((modeCntl >> 1) & 1) << 4) | ((primFilter & 1) << 5);
 	// The switches that drop a primitive in the clipper / setup, spelled out (bit numbers from gfx12.json).
 	GLOG("%s: clip switches: CLIP_DISABLE %u VTX_KILL_OR %u DX_RASTERIZATION_KILL %u DX_CLIP_SPACE_DEF %u ZCLIP_NEAR_DISABLE %u "
 	     "ZCLIP_FAR_DISABLE %u | CULL_FRONT %u CULL_BACK %u FACE %u POLY_MODE %u | VTE scale/offset enables 0x%02x W0_FMT %u | "
@@ -1139,6 +1145,95 @@ void RDNA4Compute::gfxClipReport(const char *label, uint32_t poolOff, volatile u
 	     (clipCntl >> 16) & 1, (clipCntl >> 21) & 1, (clipCntl >> 22) & 1, (clipCntl >> 19) & 1, (clipCntl >> 26) & 1,
 	     (clipCntl >> 27) & 1, modeCntl & 1, (modeCntl >> 1) & 1, (modeCntl >> 2) & 1, (modeCntl >> 3) & 3, vte & 0x3f,
 	     (vte >> 10) & 1, primFilter & 1, (smallFilter & 1) ? "on" : "off", (smallFilter & 2) ? " (triangles exempt)" : "");
+}
+
+// ---------------------------------------------------------------------------
+// W46: persistent verdicts and the parked pipe (round 6 boot 3: the kernel log window had already moved on when the diagnostic script ran,
+// so none of the `gfx:` lines survived; only the registry property Compute,GFXDiag did).
+// ---------------------------------------------------------------------------
+
+// Append one entry to the registry property Compute,GFXVerdict (the same route as Compute,GFXDiag): it survives the kernel log wrapping and
+// a late script run. The buffer is bounded; a full buffer ends in "...(full)". Entries are short (about 120 characters per draw).
+void RDNA4Compute::gfxVerdictAdd(const char *fmt, ...) {
+	char entry[220];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(entry, sizeof(entry), fmt, ap);
+	va_end(ap);
+	const size_t n = strlen(entry);
+	if (gfxVerdictFull || gfxVerdictLen + n + 4 + sizeof("...(full)") > sizeof(gfxVerdict)) {
+		if (!gfxVerdictFull) {
+			gfxVerdictFull = true;
+			strlcat(gfxVerdict, "...(full)", sizeof(gfxVerdict));
+			if (env.owner)
+				env.owner->setProperty("Compute,GFXVerdict", gfxVerdict);
+		}
+		return;
+	}
+	memcpy(gfxVerdict + gfxVerdictLen, entry, n);
+	gfxVerdictLen += static_cast<uint32_t>(n);
+	memcpy(gfxVerdict + gfxVerdictLen, " ## ", 4);
+	gfxVerdictLen += 4;
+	gfxVerdict[gfxVerdictLen] = '\0';
+	if (env.owner)
+		env.owner->setProperty("Compute,GFXVerdict", gfxVerdict);
+}
+
+// The one-line summary of a draw that the property keeps: the pipeline counters (IA prims/verts, VS, C_INV, C_PRIM, PS), the pixels, the
+// clip-state readback (registers equal to what was written / compared, and the kill-cull-filter switches as a bit mask: 1 CLIP_DISABLE,
+// 2 VTX_KILL_OR, 4 DX_RASTERIZATION_KILL, 8 CULL_FRONT, 16 CULL_BACK, 32 TRIANGLE prim filter disabled), the NGG marker and, for the VGPR
+// variant (512), whether VertexID was the lane index and the positions were what the shader intends, with lane 0's v0.
+void RDNA4Compute::gfxVerdictDraw(const char *label, uint32_t variant, const GfxDrawResult &r) {
+	const uint64_t *d = gfxPstatLast;
+	char extra[80];
+	extra[0] = '\0';
+	if (variant & 32)
+		snprintf(extra, sizeof(extra), " mk %s", r.nggMarker == 0xc0de0002u ? "ran" : "NO");
+	else if (variant & 512)
+		snprintf(extra, sizeof(extra), " vid %s pos %s v0 %08x", gfxNggVid ? "lane" : "NOT", gfxNggPos ? "ok" : "NOT", gfxNggV0);
+	gfxVerdictAdd("%s: ia %llu/%llu vs %llu ci %llu cp %llu ps %llu px %u ring %s clip %u/%u sw %x%s", label,
+	              static_cast<unsigned long long>(d[6]), static_cast<unsigned long long>(d[7]),
+	              static_cast<unsigned long long>(d[3]), static_cast<unsigned long long>(d[2]),
+	              static_cast<unsigned long long>(d[1]), static_cast<unsigned long long>(d[0]), r.covered,
+	              r.ringDone ? "ok" : "HUNG", gfxClipEq, gfxClipCmp, gfxClipSw, extra);
+}
+
+bool RDNA4Compute::requestedGfxPark() {
+	uint32_t v = 1;
+	return requestedGfxProbe() && !(PE_parse_boot_argn("rdna4-gfxpark", &v, sizeof(v)) && v == 0);
+}
+
+// After a probe boot's draws (and ladder) the gfx pipe is left running: PFP/ME unhalted with the ring idle, and the SMU reported GFX activity
+// 100 % / 81 W idle with later runtime clients timing out (dequeue timeout, ACTIVE 1). CP_STAT and GRBM_STATUS read idle after every
+// draw in the round-6 log, so nothing is wedged, but the microengines keep polling and GFXOFF is disallowed while gfxMode is set. Park
+// it: wait (bounded) for the CP to idle, halt PFP and ME exactly like the failure path of the ring bring-up does (gfx_v12_0_cp_gfx_enable(false)),
+// and log the SMU's GFX activity / power before and after. rdna4-gfxpark=0 leaves the pipe running (probe boots only).
+void RDNA4Compute::gfxPark() {
+	if (!requestedGfxPark() || !gfxMode)
+		return;
+	RDNA4SensorsEx before {}, after {};
+	const bool haveBefore = readSensorsEx(before);
+	grbmSelect(0, 0, 0, 0);
+	uint32_t stat = 0xffffffffu;
+	for (uint32_t us = 0; us < 50000; us += 10) {
+		stat = rdGc(CpStat);
+		if (stat == 0)
+			break;
+		IODelay(10);
+	}
+	const uint32_t cntl0 = rdGc(CpMeCntl);
+	wr(IpDiscovery::HwGc, CpMeCntl, cntl0 | kCpMePfpHalt | kCpMeMeHalt);
+	IOSleep(20);
+	const uint32_t cntl1 = rdGc(CpMeCntl);
+	GLOG("park: after the draws CP_STAT 0x%08x%s, PFP/ME halted: CP_ME_CNTL 0x%08x -> 0x%08x, GRBM 0x%08x, RB0 rptr 0x%x wptr 0x%x",
+	     stat, stat ? " (did not idle)" : "", cntl0, cntl1, rdGc(GrbmStatus), rdGc(CpRb0Rptr), rdGc(CpRb0Wptr));
+	IOSleep(200);   // the SMU averages: give the metrics a moment to see the pipe idle
+	const bool haveAfter = readSensorsEx(after);
+	GLOG("park: SMU GFX activity %u%% -> %u%%, socket power %u W -> %u W, GFXCLK %u -> %u MHz (0 = not read)",
+	     haveBefore ? before.gfxActivity : 0, haveAfter ? after.gfxActivity : 0, haveBefore ? before.socketPowerW : 0,
+	     haveAfter ? after.socketPowerW : 0, haveBefore ? before.currGfxclkMHz : 0, haveAfter ? after.currGfxclkMHz : 0);
+	gfxVerdictAdd("park: cp_stat %x me_cntl %x->%x gfx %u->%u%% pwr %u->%uW", stat, cntl0, cntl1, haveBefore ? before.gfxActivity : 0,
+	              haveAfter ? after.gfxActivity : 0, haveBefore ? before.socketPowerW : 0, haveAfter ? after.socketPowerW : 0);
 }
 
 // The GC hub fault status, logged and cleared, so the log says which bring-up step first makes the
@@ -1267,6 +1362,8 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		place(kGfxVsOffset, kNggstoreKernel, sizeof(kNggstoreKernel) / 4);
 	else if (variant & 512)   // W45: the NGG shader that stores what it gets and computes, per lane
 		place(kGfxVsOffset, kNggvgprKernel, sizeof(kNggvgprKernel) / 4);
+	else if (variant & 1024)   // W46: the NGG shader that takes nothing from its VGPR inputs (constant primitive, lane-id vertices)
+		place(kGfxVsOffset, kNggconstKernel, sizeof(kNggconstKernel) / 4);
 	else
 		place(kGfxVsOffset, kNggKernel, sizeof(kNggKernel) / 4);
 	if (variant & 32) {   // the two literal dwords of its s_mov_b32 sN, literal carry the marker address
@@ -1332,9 +1429,11 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 			     label, oldHdr, ib[at - 2], oldOff, ib[at - 1]);
 		}
 	}
-	if (variant & (32 | 512))   // the marker shader uses v8/v9: 10 VGPRs = 2 granules of 8 (VGPRS field = granules - 1)
+	if (variant & (32 | 512 | 1024))   // the marker shader uses v8/v9: 10 VGPRs = 2 granules of 8 (VGPRS field = granules - 1)
 		patch(kOpSetShReg, 0x1a2a - kShBase, 0x0000003f, 1, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=1");
 
+	if (variant & 2048)   // W46: GE_PRIM_RING_SIZE without Mesa's GL2 hints (SCOPE, PAF/PAB_TEMPORAL, FORCE_SE_SCOPE, PAB_NOFILL): MEM_SIZE only
+		patch(0x79, 0x26b, 0xffffffff, 0x000007fe, "GE_PRIM_RING_SIZE = MEM_SIZE only (no GL2 hints)");
 	if (variant & 128)   // W45: PA_CL_CLIP_CNTL.CLIP_DISABLE: if the primitive survives, the clipper was dropping it
 		patch(kOpSetContextReg, 0x204, 0x00010000, 0x00010000, "PA_CL_CLIP_CNTL.CLIP_DISABLE=1");
 	if (variant & 256) {   // W45: the primitive filters off: PA_SU_PRIM_FILTER_CNTL disable bits 0-3, small-prim filter off
@@ -1433,6 +1532,9 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		const bool vidOk = v3[0] == 0 && v3[1] == 1 && v3[2] == 2;
 		const bool posOk = px[0] == 0xbf000000u && px[1] == 0x3f000000u && px[2] == 0 && py[0] == 0xbf000000u &&
 		                   py[1] == 0xbf000000u && py[2] == 0x3f000000u;
+		gfxNggVid = vidOk;
+		gfxNggPos = posOk;
+		gfxNggV0 = v0[0];
 		GLOG("%s: NGG inputs say: VertexID %s the lane index (v3 = 0,1,2), the exported positions %s what ngg.s intends "
 		     "((-0.5,-0.5) (0.5,-0.5) (0,0.5))", label, vidOk ? "IS" : "is NOT", posOk ? "are" : "are NOT");
 	}
@@ -1467,11 +1569,13 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	if (!r.ringDone || r.drawFence != 1) {
 		GLOG("%s: did not finish (ring fence %s, draw fence 0x%x)", label,
 		     r.ringDone ? "ok" : "NOT signalled", r.drawFence);
+		gfxVerdictDraw(label, variant, r);
 		gfxStatus("draw");
 		return false;
 	}
 
 	gfxCountTarget(r);
+	gfxVerdictDraw(label, variant, r);   // W46: the persistent one-line summary of this draw
 	r.marker = *poolDw(kGfxMarkerOffset);
 	if (variant & 8)
 		GLOG("%s: pixel-shader marker 0x%08x (%s)", label, r.marker,
@@ -1582,7 +1686,7 @@ bool RDNA4Compute::stageGfxDraw() {
 	// The diagnostic ladder (rdna4-gfxdiag=<mask>, default off): the same stream with
 	// one open question changed at a time, each logged with the same evidence, so that
 	// round 4 sees which stage of the pipeline works. Only the baseline decides PASS.
-	const uint32_t diag = requestedGfxDiag() | (requestedGfxDiag() && requestedGfxProbe() ? (32u | 64u | 128u | 256u | 512u) : 0u);   // W37: the NGG marker joins the ladder of a probe boot
+	const uint32_t diag = requestedGfxDiag() | (requestedGfxDiag() && requestedGfxProbe() ? (32u | 64u | 128u | 256u | 512u | 1024u | 2048u) : 0u);   // W37: the NGG marker joins the ladder of a probe boot
 	if (diag && (!base.ok || (diag & 16))) {
 		char summary[400], probes[240];
 		summary[0] = probes[0] = '\0';
@@ -1595,7 +1699,9 @@ bool RDNA4Compute::stageGfxDraw() {
 		// result the next boot needs a cold power cycle: the GC state survives a warm restart.
 		// W45: the clip variants (128 clip off, 256 primitive filters off) and the NGG inputs (512) right after the marker: round 5 showed the
 		// primitive reaches the clipper (C_INVOCATIONS 1) and is dropped there (C_PRIMITIVES 0).
-		static const uint32_t order[9] = { 32, 128, 256, 512, 64, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
+		// W46: round 6 on the card: cprim stays 0 with CLIP_DISABLE (128) and the filters off (256), so the two new variants come first: 1024 takes
+		// nothing from the wave's VGPR inputs, 2048 removes the GE ring's GL2 hints.
+		static const uint32_t order[11] = { 32, 1024, 2048, 512, 128, 256, 64, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
 		for (uint32_t bit : order) {
 			if (!(diag & bit))
 				continue;
@@ -1608,7 +1714,7 @@ bool RDNA4Compute::stageGfxDraw() {
 			if (bit == 8 && did)
 				used += snprintf(summary + used, sizeof(summary) - used, "/marker %s",
 				                 r.marker == kMarkerValue ? "yes" : "no");
-			if ((bit == 32 || bit == 128 || bit == 256 || bit == 512) && did && r.probeSeen)
+			if ((bit == 32 || bit == 128 || bit == 256 || bit == 512 || bit == 1024 || bit == 2048) && did && r.probeSeen)
 				used += snprintf(summary + used, sizeof(summary) - used, "/cprim %u", r.cPrim);
 			if (bit == 64 && did)
 				used += snprintf(summary + used, sizeof(summary) - used, "/primtype-idx");

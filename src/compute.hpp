@@ -410,6 +410,16 @@ private:
 	void gfxEmitClipProbe(uint32_t poolOff); // W45: COPY_DATA of the clip state after the draw
 	void gfxClipReport(const char *label, uint32_t poolOff, volatile uint32_t *ib);
 	uint64_t gfxPstatLast[8] {};             // the last pipeline-statistics deltas (PS, C_PRIM, C_INV, VS, GS_INV, GS_PRIM, IA_PRIM, IA_VERT)
+	struct GfxDrawResult;
+	void gfxVerdictAdd(const char *fmt, ...) __printflike(2, 3);   // W46: append to the registry property Compute,GFXVerdict
+	void gfxVerdictDraw(const char *label, uint32_t variant, const GfxDrawResult &r);
+	static bool requestedGfxPark();          // probe boots: park PFP/ME after the draws unless rdna4-gfxpark=0
+	void gfxPark();
+	char gfxVerdict[3072] {};
+	uint32_t gfxVerdictLen { 0 };
+	bool gfxVerdictFull { false };
+	uint32_t gfxClipEq { 0 }, gfxClipCmp { 0 }, gfxClipSw { 0 };   // the last clip-state readback summary
+	uint32_t gfxNggVid { 0 }, gfxNggPos { 0 }, gfxNggV0 { 0 };    // the last NGG VGPR variant verdict
 	void gfxLinuxDiff(const char *tag);      // W42: the VM/queue/RLC/CP registers next to what Linux 7.2.2 reads on this card
 	void gfxClearStatePre();                 // W39: clear-state registers before the first CSB replay (CP view + MMIO)
 	void gfxEmitCsbReplay();                 // the clear-state extents as SET_CONTEXT_REG on the ring before the draw
