@@ -4225,6 +4225,12 @@ static bool rdna4_select_mec_queue(RDNA4State *s, uint32_t db_dword)
         for (uint32_t pipe = 0; pipe < 4; pipe++) {
             for (uint32_t queue = 0; queue < 8; queue++) {
                 uint32_t doorbell = s->hqd[pipe][queue].q[off];
+                uint32_t act_off;
+                /* A doorbell goes to an ACTIVE HQD that owns the dword. A dequeued queue keeps its doorbell register, and the S1 probe queues and the
+                 * shared queues of rdna4-vmshared=1 use the same dwords (hub-task-347): routing to the first queue ever used with the dword sent the
+                 * shared queues' doorbells to a dead HQD ("ignored: HQD not active") and their jobs never ran. */
+                if (!rdna4_hqd_reg(REG_CP_HQD_ACTIVE, &act_off) || !(s->hqd[pipe][queue].q[act_off] & 1))
+                    continue;
                 if (s->hqd[pipe][queue].used && (doorbell & (1u << 30)) &&
                     ((doorbell >> 2) & 0x3ffffff) == db_dword) {
                     s->selected_pipe = pipe;
