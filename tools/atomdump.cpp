@@ -34,6 +34,7 @@
 #include "../src/gpuvm.hpp"
 #include "../src/vmid.hpp"
 #include "../src/ptpages.hpp"
+#include "../src/gpuvmtable.hpp"
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
@@ -47,6 +48,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <map>
+#include <utility>
 
 // The Samsung LS27DG702 (Odyssey G70D) full 256-byte EDID (base + CTA-861
 // extension) captured from the live system's IODisplayEDID (2026-07-11) —
@@ -2378,7 +2381,7 @@ static int testPtPages() {
 	PtPages::Backend be { fakeAllocChunk, fakeFreeChunk, &chunks };
 	static PtPages::Table t;
 	t.init(PtPages::kMaxPages);
-	uint64_t off = 0, prev = 0;
+	uint64_t off = 0;
 
 	// A client's first pages (root, PDB1, PDB0, one PT) live in ONE 64 KiB chunk, 4 KiB apart.
 	bool ok = true;
@@ -2460,6 +2463,390 @@ static int testPtPages() {
 	f += check(!PtPages::areaFor(base, 0, 0, gfx, area) && !PtPages::areaFor(0xfffff000u, 0x10000, 1, 0xffffffffu, area),
 	           "layout: a zero stride and a 32-bit overflow are refused");
 	return f;
+}
+
+// --- hub-task-340: differential test of the page-table writing ---------------------------------------------------------------
+// The pre-S8 code (tools/legacy-vmtable-ref.inc, verbatim from commit 0cfa416) against src/gpuvmtable.cpp, which the kext now runs for vmMap, vmMapHost
+// and vmUnmap, on the contiguous 4 MiB image of modes 0 and 1: return values, the PT pages handed to vmTableSync, and the whole image byte for byte
+// (PDEs, PTE flags: IS_PTE bit 63, EXECUTABLE, SNOOPED/SYSTEM, FRAG, the W22 set/clear masks). A third image is built with the sparse accessor of
+// rdna4-vmshared=2 and compared logically (every PTE equal, PDE validity equal).
+
+#include "legacy-vmtable-ref.inc"
+
+namespace {
+
+constexpr uint64_t kTableBytes = 4u << 20;
+constexpr uint64_t kRootPhys = 0x10000000ull;
+constexpr uint64_t kFbMcBase = 0x8000000000ull;
+
+struct PolicySet { bool isPteOff, execOff; uint64_t pteSet, pteClear; const char *name; };
+const PolicySet kPolicies[] = {
+	{ false, false, 0, 0, "default" },
+	{ false, true, 0, 0, "rdna4-vm-exec=0" },
+	{ true, false, 0, 0, "rdna4-vm-ispte=0" },
+	{ false, false, 1ull << 54, GpuVm::kExecutable, "set MTYPE bit, clear EXECUTABLE" },
+	{ true, true, GpuVm::kSnooped, 0, "ispte=0, exec=0, SNOOPED set" },
+};
+
+// The new code behind an accessor, with the kernel wrappers' (runtime.cpp vmMap/vmMapHost/vmUnmap) argument checks and sync order mirrored.
+struct NewImage {
+	std::vector<uint64_t> words;              // contiguous image (legacy accessor)
+	uint64_t rootPhys { kRootPhys };
+	GpuVmTable::Policy pol {};
+	uint64_t fbMcBase { kFbMcBase };
+	uint32_t fbOffset { 0 };
+	std::vector<std::pair<uint32_t, uint32_t>> syncs;
+	bool failSync { false };
+	// sparse
+	bool sparse { false };
+	PtPages::Table table;
+	std::map<uint32_t, std::vector<uint64_t>> shadow;
+	struct Chunks { uint64_t next { 0x2000000 }; uint32_t live { 0 }; } chunks;
+	bool create { true };
+
+	bool sync(uint32_t offset, uint32_t bytes) { syncs.push_back({ offset, bytes }); return !failSync; }
+};
+
+bool fakeChunkAlloc(void *ctx, uint64_t &off) { auto *c = static_cast<NewImage::Chunks *>(ctx); off = c->next; c->next += 0x10000; c->live++; return true; }
+void fakeChunkFree(void *ctx, uint64_t) { static_cast<NewImage::Chunks *>(ctx)->live--; }
+
+uint64_t *newEntry(void *ctx, uint64_t off) {
+	auto *n = static_cast<NewImage *>(ctx);
+	if (!n->sparse)
+		return off < kTableBytes ? GpuVmTable::legacyEntry(n->words.data(), off) : nullptr;
+	const uint32_t page = static_cast<uint32_t>(off >> 12);
+	if (page >= PtPages::kMaxPages)
+		return nullptr;
+	auto it = n->shadow.find(page);
+	if (it == n->shadow.end()) {
+		if (!n->create)
+			return nullptr;
+		uint64_t heapOff = 0;
+		PtPages::Backend be { fakeChunkAlloc, fakeChunkFree, &n->chunks };
+		if (!n->table.page(page, be, heapOff))
+			return nullptr;
+		it = n->shadow.emplace(page, std::vector<uint64_t>(512, 0)).first;
+	}
+	return it->second.data() + (off & 0xfff) / 8;
+}
+
+bool newPhys(void *ctx, uint64_t off, uint64_t &phys) {
+	auto *n = static_cast<NewImage *>(ctx);
+	if (!n->sparse) {
+		phys = GpuVmTable::legacyPhys(n->rootPhys, off);
+		return true;
+	}
+	const uint32_t page = static_cast<uint32_t>(off >> 12);
+	if (!n->table.has(page))
+		return false;
+	phys = 0x4000000000ull + n->table.offsetOf(page) + (off & 0xfff);
+	return true;
+}
+
+bool newVmMap(NewImage &n, uint64_t va, uint64_t mc, uint64_t bytes, bool executable) {
+	if (!bytes || (va & (GpuVm::kPageBytes - 1)) || (mc & (GpuVm::kPageBytes - 1)))
+		return false;
+	uint64_t physical = 0;
+	if (!GpuVm::mcToPhysical(mc, n.fbMcBase, n.fbOffset, physical))
+		return false;
+	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
+	if (end < va || end > GpuVm::kVaEnd)
+		return false;
+	n.create = true;
+	const GpuVmTable::Access access { newEntry, newPhys, &n };
+	GpuVmTable::Span span;
+	if (!GpuVmTable::mapVram(access, n.pol, kTableBytes, va, end, physical, executable, span))
+		return false;
+	if (span.firstPt == ~0ull || !n.sync(0, 0x3000))
+		return false;
+	for (uint64_t pt = span.firstPt; pt <= span.lastPt; pt += 0x1000)
+		if (!n.sync(static_cast<uint32_t>(pt), 0x1000))
+			return false;
+	return true;
+}
+
+bool newVmMapHost(NewImage &n, uint64_t va, const uint64_t *pageBuses, uint64_t bytes, bool executable) {
+	if (!pageBuses || !bytes || (va & (GpuVm::kPageBytes - 1)))
+		return false;
+	const uint64_t mapped = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	const uint64_t end = va + mapped;
+	if (mapped < bytes || end < va || end > GpuVm::kVaEnd)
+		return false;
+	n.create = true;
+	const GpuVmTable::Access access { newEntry, newPhys, &n };
+	GpuVmTable::Span span;
+	if (!GpuVmTable::mapHost(access, n.pol, kTableBytes, va, end, pageBuses, executable, span))
+		return false;
+	if (span.firstPt == ~0ull || !n.sync(0, 0x3000))
+		return false;
+	for (uint64_t pt = span.firstPt; pt <= span.lastPt; pt += 0x1000)
+		if (!n.sync(static_cast<uint32_t>(pt), 0x1000))
+			return false;
+	return true;
+}
+
+void newVmUnmap(NewImage &n, uint64_t va, uint64_t bytes) {
+	if (!bytes || va & (GpuVm::kPageBytes - 1))
+		return;
+	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
+	n.create = false;
+	const GpuVmTable::Access access { newEntry, newPhys, &n };
+	GpuVmTable::Span span;
+	GpuVmTable::unmap(access, kTableBytes, va, end, span);
+	for (uint64_t pt = span.firstPt; pt != ~0ull && pt <= span.lastPt; pt += 0x1000)
+		n.sync(static_cast<uint32_t>(pt), 0x1000);
+}
+
+// rtOpen's initial image: root -> PDB1 -> PDB0.
+void initLegacy(std::vector<uint64_t> &w, uint64_t rootPhys) {
+	std::fill(w.begin(), w.end(), 0);
+	w[0] = GpuVm::encodePde(rootPhys + 0x1000, GpuVm::kValid, 2);
+	w[0x1000 / 8 + GpuVm::index(GpuVm::kVaStart, 1)] = GpuVm::encodePde(rootPhys + 0x2000, GpuVm::kValid, 1);
+}
+
+void initSparse(NewImage &n) {
+	n.shadow.clear();
+	PtPages::Backend be { fakeChunkAlloc, fakeChunkFree, &n.chunks };
+	n.table.release(be);
+	n.table.init(PtPages::kMaxPages);
+	n.create = true;
+	uint64_t off = 0;
+	for (uint32_t i = 0; i < 3; i++)
+		n.table.page(i, be, off);
+	for (uint32_t i = 0; i < 3; i++)
+		n.shadow[i] = std::vector<uint64_t>(512, 0);
+	uint64_t p1 = 0, p2 = 0;
+	newPhys(&n, 0x1000, p1);
+	newPhys(&n, 0x2000, p2);
+	n.shadow[0][0] = GpuVm::encodePde(p1, GpuVm::kValid, 2);
+	n.shadow[1][GpuVm::index(GpuVm::kVaStart, 1)] = GpuVm::encodePde(p2, GpuVm::kValid, 1);
+}
+
+struct Pair {
+	LegacyRef ref;
+	NewImage nw, sp;
+	std::vector<uint64_t> refWords;
+	int failures { 0 };
+	const char *policy { "" };
+	uint32_t ops { 0 }, okMaps { 0 }, failedMaps { 0 }, okHost { 0 }, failedHost { 0 }, unmaps { 0 }, leafPagesMax { 0 };
+
+	void setup(const PolicySet &p, uint32_t fbOffset) {
+		refWords.assign(kTableBytes / 8, 0);
+		ref.shadow = refWords.data();
+		ref.rootPhys = kRootPhys;
+		ref.tableBytes = kTableBytes;
+		ref.pol = { p.isPteOff, p.execOff, p.pteSet, p.pteClear };
+		ref.fbMcBase = kFbMcBase;
+		ref.fbOffset = fbOffset;
+		for (NewImage *n : { &nw, &sp }) {
+			n->pol = GpuVmTable::Policy { p.isPteOff, p.execOff, p.pteSet, p.pteClear };
+			n->fbMcBase = kFbMcBase;
+			n->fbOffset = fbOffset;
+		}
+		nw.words.assign(kTableBytes / 8, 0);
+		sp.sparse = true;
+		policy = p.name;
+		reopen();
+	}
+	void reopen() {
+		initLegacy(refWords, kRootPhys);
+		nw.words = refWords;
+		initSparse(sp);
+		ref.syncs.clear();
+		nw.syncs.clear();
+		sp.syncs.clear();
+	}
+	void setFailSync(bool f) { ref.failSync = nw.failSync = sp.failSync = f; }
+
+	// After one operation: same result, same syncs, same bytes; the sparse image equal entry for entry.
+	void compare(const char *what, bool rr, bool rn, bool rs) {
+		ops++;
+		auto fail = [&](const char *why) {
+			if (failures < 5)
+				fprintf(stderr, "FAIL: vmtable diff [%s] op %u %s: %s\n", policy, ops, what, why);
+			failures++;
+		};
+		if (rr != rn)
+			fail("return value differs from the pre-S8 code");
+		if (ref.syncs != nw.syncs)
+			fail("the PT pages handed to vmTableSync differ");
+		if (memcmp(refWords.data(), nw.words.data(), kTableBytes) != 0) {
+			uint64_t i = 0;
+			while (refWords[i] == nw.words[i])
+				i++;
+			char buf[160];
+			snprintf(buf, sizeof(buf), "image differs at byte 0x%llx: old 0x%016llx new 0x%016llx", (unsigned long long)(i * 8),
+			         (unsigned long long)refWords[i], (unsigned long long)nw.words[i]);
+			fail(buf);
+		}
+		if (rr != rs)
+			fail("sparse return value differs");
+		for (uint32_t page = 3; page < PtPages::kMaxPages; page++) {
+			auto it = sp.shadow.find(page);
+			for (uint32_t e = 0; e < 512; e++) {
+				const uint64_t want = refWords[page * 512 + e], got = it == sp.shadow.end() ? 0 : it->second[e];
+				if (want != got) {
+					fail("sparse leaf differs");
+					page = PtPages::kMaxPages;
+					break;
+				}
+			}
+		}
+		for (uint32_t e = 0; e < 512; e++) {
+			const uint64_t top[2] = { refWords[0x1000 / 8 + e], refWords[0x2000 / 8 + e] };
+			const uint64_t stop[2] = { sp.shadow[1][e], sp.shadow[2][e] };
+			if (((top[0] ^ stop[0]) & GpuVm::kValid) || ((top[1] ^ stop[1]) & GpuVm::kValid)) {
+				fail("sparse PDE validity differs");
+				break;
+			}
+			if (e < 512 && (top[1] & GpuVm::kValid)) {
+				// Whatever PT page the legacy PDE names (the legacy layout shares PDB0[n] between PT pages n and n + 512 once a mapping
+				// passes 1 GiB: a first-writer-wins quirk the new code must keep), the sparse PDE names the same logical page.
+				uint64_t phys = 0;
+				const uint64_t legacyOff = GpuVm::entryPhysical(top[1]) - kRootPhys;
+				if (!newPhys(&sp, legacyOff, phys) || GpuVm::entryPhysical(stop[1]) != (phys & GpuVm::kPhysicalMask)) {
+					fail("sparse PDE does not point at its PT page");
+					break;
+				}
+			}
+		}
+		ref.syncs.clear();
+		nw.syncs.clear();
+		sp.syncs.clear();
+	}
+
+	void map(uint64_t va, uint64_t mc, uint64_t bytes, bool exec) {
+		const bool a = legacyVmMap(ref, va, mc, bytes, exec), b = newVmMap(nw, va, mc, bytes, exec), c = newVmMap(sp, va, mc, bytes, exec);
+		(a ? okMaps : failedMaps)++;
+		compare("map", a, b, c);
+	}
+	void mapHost(uint64_t va, const std::vector<uint64_t> &buses, uint64_t bytes, bool exec) {
+		const bool a = legacyVmMapHost(ref, va, buses.data(), bytes, exec), b = newVmMapHost(nw, va, buses.data(), bytes, exec),
+		           c = newVmMapHost(sp, va, buses.data(), bytes, exec);
+		(a ? okHost : failedHost)++;
+		compare("mapHost", a, b, c);
+	}
+	void unmap(uint64_t va, uint64_t bytes) {
+		legacyVmUnmap(ref, va, bytes);
+		newVmUnmap(nw, va, bytes);
+		newVmUnmap(sp, va, bytes);
+		unmaps++;
+		if (sp.table.pages() > leafPagesMax)
+			leafPagesMax = sp.table.pages();
+		compare("unmap", true, true, true);
+	}
+};
+
+struct Rng {
+	uint64_t s;
+	uint64_t next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; }
+	uint64_t below(uint64_t n) { return next() % n; }
+};
+
+} // namespace
+
+static int testVmTableDifferential() {
+	int failures = 0;
+	uint32_t totOps = 0, totOk = 0, totBad = 0, totHostOk = 0, totHostBad = 0, totUnmap = 0, maxPages = 0;
+	const uint64_t V = GpuVm::kVaStart;
+	const uint64_t MC = kFbMcBase;
+	for (const PolicySet &pol : kPolicies) {
+		for (uint32_t fbOffset : { 0u, 0x10u }) {
+			static Pair pair;
+			pair = Pair {};
+			pair.setup(pol, fbOffset);
+			Pair &P = pair;
+
+			// 1. The boot self-test / rtOpen layout: ring (executable), EOP, rptr, wptr, fence, kernarg, then user buffers.
+			P.map(V + 0x0000, MC + 0x1a000000, 0x1000, true);
+			for (uint32_t i = 1; i < 6; i++)
+				P.map(V + 0x1000ull * i, MC + 0x1a000000 + 0x1000ull * i, 0x1000, false);
+			// a program image (12 KiB, executable), a 256 KiB device buffer on a 64 KiB boundary (FRAG=4), one that is not aligned to it
+			P.map(V + 0x10000, MC + 0x20000000, 0x3000, true);
+			P.map(V + 0x40000, MC + 0x30000000, 0x40000, false);
+			P.map(V + 0x80000 + 0x1000, MC + 0x31000000 + 0x1000, 0x40000, false);
+			// 2. host buffers: 64 KiB of 16 bus pages mapped, unmapped, then mapped again elsewhere (rdna4-run's host vadd and freed-VA sequence)
+			std::vector<uint64_t> buses(16);
+			for (uint32_t i = 0; i < 16; i++)
+				buses[i] = 0x104048000ull + 0x3000ull * i;
+			P.mapHost(V + 0xb0000, buses, 0x10000, false);
+			P.unmap(V + 0xb0000, 0x10000);                       // the freed buffer; the next dispatch through it must fault
+			P.mapHost(V + 0xd0000, buses, 0x10000, true);
+			P.unmap(V + 0x10000, 0x3000);                        // the program is unloaded
+			P.map(V + 0x10000, MC + 0x21000000, 0x3000, true);   // and its VA reused
+			// 3. across a 2 MiB boundary (two PT pages) and a large device buffer
+			P.map(V + 0x1ff000, MC + 0x40000000, 0x3000, false);
+			P.map(V + 0x400000, MC + 0x50000000, 0x600000, false);
+			// 3b. the legacy layout's first-writer-wins quirk: PT pages 88 and 88 + 512 (1.2 GiB up) share PDB0[88]; whichever is mapped first owns the PDE
+			P.map(V + 600ull * 0x200000, MC + 0x60000000, 0x1000, false);
+			P.map(V + 88ull * 0x200000, MC + 0x61000000, 0x1000, false);
+			// 4. client close and reopen on the same tables
+			P.reopen();
+			P.map(V + 0x0000, MC + 0x1a000000, 0x1000, true);
+			P.map(V + 0x7000, MC + 0x1a007000, 0x2000, false);
+			P.unmap(V + 0x7000, 0x2000);
+			// 5. argument failures, and a vmTableSync failure
+			P.map(V + 0x1001, MC, 0x1000, false);                // unaligned va
+			P.map(V, MC + 0x1001, 0x1000, false);                // unaligned mc
+			P.map(V, MC - 0x1000, 0x1000, false);                // mc below the FB base
+			P.map(V, MC, 0, false);                              // zero bytes
+			P.map(V - 0x1000, MC, 0x2000, false);                // starts below kVaStart
+			P.map(V + 2046ull * 0x100000 + 0x10000, MC, 0x400000, false);   // runs past the end of the 4 MiB image
+			P.map(~0ull - 0xfff, MC, 0x2000, false);             // overflow
+			P.setFailSync(true);
+			P.map(V + 0x300000, MC + 0x1000000, 0x2000, false);
+			P.setFailSync(false);
+
+			// 6. fuzz: random histories, seeded
+			Rng r { 0x9e3779b97f4a7c15ull ^ (static_cast<uint64_t>(fbOffset) << 7) ^ reinterpret_cast<uintptr_t>(pol.name) };
+			P.reopen();
+			for (uint32_t op = 0; op < 160; op++) {
+				const uint64_t kind = r.below(100);
+				uint64_t va = V + r.below(0x40000000 / 0x1000) * 0x1000;       // anywhere in the first GiB
+				if (r.below(25) == 0)
+					va = V + r.below(0x1000) * 0x1000 + 0x1ff000;            // straddle the first 2 MiB boundary
+				if (r.below(40) == 0)
+					va += 0x123;                                              // unaligned
+				if (r.below(60) == 0)
+					va = V - 0x1000 * (1 + r.below(4));                        // below the start
+				uint64_t pages = 1 + r.below(16);
+				if (r.below(4) == 0)
+					pages = 16 + r.below(600);
+				if (r.below(25) == 0)
+					pages = 1024 + r.below(512);
+				const uint64_t bytes = pages * 0x1000 - (r.below(8) == 0 ? r.below(0x1000) : 0);
+				if (kind < 40) {
+					uint64_t mc = MC + (r.below(0x100000) << 12);
+					if (r.below(30) == 0)
+						mc = MC - 0x1000 * (1 + r.below(8));                  // below the FB base
+					if (r.below(50) == 0)
+						mc += 0x100;                                          // unaligned
+					P.map(va, mc, bytes, r.below(2) != 0);
+				} else if (kind < 60) {
+					std::vector<uint64_t> bus(pages + 1);
+					for (uint64_t i = 0; i < bus.size(); i++)
+						bus[i] = (r.below(1ull << 28) << 12);
+					if (r.below(40) == 0)
+						bus[r.below(pages)] |= 0x40;                          // a misaligned bus address
+					P.mapHost(va, bus, bytes, r.below(2) != 0);
+				} else if (kind < 92) {
+					P.unmap(va, bytes);
+				} else if (kind < 97) {
+					P.reopen();
+				} else {
+					P.setFailSync(!P.ref.failSync);
+				}
+			}
+			failures += P.failures;
+			totOps += P.ops; totOk += P.okMaps; totBad += P.failedMaps; totHostOk += P.okHost; totHostBad += P.failedHost; totUnmap += P.unmaps;
+			if (P.leafPagesMax > maxPages)
+				maxPages = P.leafPagesMax;
+		}
+	}
+	printf("vmtable differential: %u operations (%u maps ok, %u refused, %u host maps ok, %u refused, %u unmaps), up to %u sparse pages, "
+	       "pre-S8 code vs src/gpuvmtable.cpp vs the sparse accessor: identical\n", totOps, totOk, totBad, totHostOk, totHostBad, totUnmap, maxPages);
+	return failures + check(totOk > 200 && totBad > 50 && totHostOk > 100 && totHostBad > 10 && totUnmap > 100,
+	                        "vmtable differential: the histories cover successful and refused maps, host maps and unmaps");
 }
 
 int main(int argc, char **argv) {
@@ -2663,6 +3050,7 @@ int main(int argc, char **argv) {
 	failures += testGpuVm();
 	failures += testVmidPool();
 	failures += testPtPages();
+	failures += testVmTableDifferential();
 	failures += testLinuxRefFormat();
 
 	if (failures) {

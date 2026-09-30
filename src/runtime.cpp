@@ -518,7 +518,7 @@ void RDNA4Compute::sparseFreeChunk(void *ctx, uint64_t off) {
  * page is backed (VRAM page from a chunk + a wired 4 KiB shadow) on first use when `create`. nullptr when that fails (quota, memory). */
 uint64_t *RDNA4Compute::ptEntry(RtClient &c, uint64_t off, bool create) {
 	if (!c.sp)
-		return c.tableShadow ? c.tableShadow + off / sizeof(uint64_t) : nullptr;
+		return GpuVmTable::legacyEntry(c.tableShadow, off);
 	const uint32_t page = static_cast<uint32_t>(off >> 12);
 	if (page >= PtPages::kMaxPages)
 		return nullptr;
@@ -544,7 +544,7 @@ uint64_t *RDNA4Compute::ptEntry(RtClient &c, uint64_t off, bool create) {
 /* The GPU-physical address of logical offset `off` (what a PDE holds). */
 bool RDNA4Compute::ptPhys(RtClient &c, uint64_t off, uint64_t &phys) {
 	if (!c.sp) {
-		phys = c.rootPhys + off;
+		phys = GpuVmTable::legacyPhys(c.rootPhys, off);
 		return true;
 	}
 	const uint32_t page = static_cast<uint32_t>(off >> 12);
@@ -605,6 +605,16 @@ void RDNA4Compute::sparseTeardown(RtClient &c, bool clearVram) {
 	c.rootMc = c.rootPhys = 0;
 }
 
+uint64_t *RDNA4Compute::ptEntryThunk(void *ctx, uint64_t off) {
+	auto *p = static_cast<PtCtx *>(ctx);
+	return p->self->ptEntry(*p->c, off, p->create);
+}
+
+bool RDNA4Compute::ptPhysThunk(void *ctx, uint64_t off, uint64_t &phys) {
+	auto *p = static_cast<PtCtx *>(ctx);
+	return p->self->ptPhys(*p->c, off, phys);
+}
+
 bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, bool executable) {
 	if (!poolCpu || !hasTables(c) || !bytes || (va & (GpuVm::kPageBytes - 1)) ||
 	    (mc & (GpuVm::kPageBytes - 1)))
@@ -615,55 +625,17 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (end < va || end > GpuVm::kVaEnd)
 		return false;
-	auto entry = [this, &c](uint64_t off) -> uint64_t * { return ptEntry(c, off); };
-	uint64_t firstPt = ~0ull, lastPt = 0;
-	for (uint64_t at = va, phys = physical; at < end;
-	     at += GpuVm::kPageBytes, phys += GpuVm::kPageBytes) {
-		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
-		const uint64_t ptOff = 0x3000 + relative * 0x1000;
-		if (at < GpuVm::kVaStart || ptOff + 0x1000 > kVmTableBytes)
-			return false;
-		const uint32_t pdeIndex = GpuVm::index(at, 2);
-		const uint64_t pdeOff = 0x2000 + static_cast<uint64_t>(pdeIndex) * 8;
-		uint64_t *pde = entry(pdeOff), *pte = entry(ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8);
-		uint64_t ptPhysical = 0;
-		if (!pde || !pte || !ptPhys(c, ptOff, ptPhysical))
-			return false;
-		if (!*pde)
-			*pde = GpuVm::encodePde(ptPhysical, GpuVm::kValid, 0);
-		const uint64_t pteOff = ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8;
-		(void)pteOff;
-		if (firstPt == ~0ull)
-			firstPt = ptOff;
-		lastPt = ptOff;
-		/* amdgpu's composition for a VRAM BO on GC 12: VALID, READABLE, WRITEABLE, IS_PTE
-		 * (gart_pte_flags, amdgpu_ttm.c:1477; gmc_v12_0.c:794-796), EXECUTABLE when asked
-		 * (gmc_v12_0_get_vm_pte), MTYPE NC = 0, and no SNOOPED: amdgpu_ttm_tt_pde_flags adds it for
-		 * VRAM only when the BO is cached (amdgpu_ttm.c:1456-1458). */
-		uint64_t flags = GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable |
-		                 (vmIsPteOff ? 0 : GpuVm::kIsPte);
-		/* Linux's own tables on this card (rdna4-groundtruth vm-walk.txt) have EXE, READ and
-		 * WRITE on every leaf (0x...5f1 / 0x...3f1): the CP fetches the EOP buffer, the ring and
-		 * IBs with EXECUTE (IV src_data[1] 0x50 = READ|EXE; round 5: PERMISSION_FAULTS 8 on the EOP
-		 * page mapped R|W).  Mesa maps every BO R|W|X the same way (ac_linux_drm.c:235).
-		 * rdna4-vm-exec=0 restores the old R|W-only pages (negative control). */
-		if (executable || !vmExecOff)
-			flags |= GpuVm::kExecutable;
-		flags = (flags | vmPteSet) & ~vmPteClear;   /* W22 diagnostics only, 0 otherwise */
-		/* FRAG=4 says this PTE is part of a contiguous, 64 KiB-aligned run of
-		 * sixteen: only when the whole aligned block lies inside this mapping
-		 * (amdgpu_vm_pte_fragment); a lone 4 KiB page that merely happens to
-		 * be 64 KiB-aligned must stay FRAG=0. */
-		const uint64_t block = at & ~0xffffull;
-		const bool fragment64k = block >= va && block + 0x10000 <= end &&
-			((phys - (at - block)) & 0xffff) == 0;
-		*pte = GpuVm::encodePte(phys, flags, fragment64k);
-	}
+	/* The entries are written by GpuVmTable::mapVram (src/gpuvmtable.cpp): the pre-S8 loop, byte-compared against the old code by the host test. */
+	PtCtx ctx { this, &c, true };
+	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
+	GpuVmTable::Span span;
+	if (!GpuVmTable::mapVram(access, vmPolicy(), kVmTableBytes, va, end, physical, executable, span))
+		return false;
 	/* The root, PDB1, and the PDB0 entry that points at the PT all have to
 	 * reach VRAM before the queue can walk this mapping. */
-	if (firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
+	if (span.firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
 		return false;
-	for (uint64_t pt = firstPt; pt <= lastPt; pt += 0x1000)
+	for (uint64_t pt = span.firstPt; pt <= span.lastPt; pt += 0x1000)
 		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
 			return false;
 	return true;
@@ -678,37 +650,14 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 	const uint64_t end = va + mapped;
 	if (mapped < bytes || end < va || end > GpuVm::kVaEnd)
 		return false;
-	auto entry = [this, &c](uint64_t off) -> uint64_t * { return ptEntry(c, off); };
-	uint64_t firstPt = ~0ull, lastPt = 0;
-	uint64_t page = 0;
-	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes, page++) {
-		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
-			return false;
-		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
-		const uint64_t ptOff = 0x3000 + relative * 0x1000;
-		if (at < GpuVm::kVaStart || ptOff + 0x1000 > kVmTableBytes)
-			return false;
-		const uint32_t pdeIndex = GpuVm::index(at, 2);
-		const uint64_t pdeOff = 0x2000 + static_cast<uint64_t>(pdeIndex) * 8;
-		uint64_t *pde = entry(pdeOff), *pte = entry(ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8);
-		uint64_t ptPhysical = 0;
-		if (!pde || !pte || !ptPhys(c, ptOff, ptPhysical))
-			return false;
-		if (!*pde)
-			*pde = GpuVm::encodePde(ptPhysical, GpuVm::kValid, 0);
-		if (firstPt == ~0ull)
-			firstPt = ptOff;
-		lastPt = ptOff;
-		uint64_t flags = GpuVm::kSystem | GpuVm::kSnooped | GpuVm::kValid |
-		                 GpuVm::kReadable | GpuVm::kWritable | (vmIsPteOff ? 0 : GpuVm::kIsPte);
-		if (executable || !vmExecOff)
-			flags |= GpuVm::kExecutable;
-		/* Cached GTT on gfx12.0 uses MTYPE_NC, encoded as zero. */
-		*pte = GpuVm::encodePte(pageBuses[page], flags, false);
-	}
-	if (firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
+	PtCtx ctx { this, &c, true };
+	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
+	GpuVmTable::Span span;
+	if (!GpuVmTable::mapHost(access, vmPolicy(), kVmTableBytes, va, end, pageBuses, executable, span))
 		return false;
-	for (uint64_t pt = firstPt; pt <= lastPt; pt += 0x1000)
+	if (span.firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
+		return false;
+	for (uint64_t pt = span.firstPt; pt <= span.lastPt; pt += 0x1000)
 		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
 			return false;
 	return true;
@@ -736,20 +685,11 @@ void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 		return;
 	c.tlbSeq++;      /* a removed PTE: the next job on any VMID this client owns flushes first (amdgpu's tlb_seq) */
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
-	uint64_t firstPt = ~0ull, lastPt = 0;
-	for (uint64_t at = va; at < end && at >= va; at += GpuVm::kPageBytes) {
-		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
-		const uint64_t ptOff = 0x3000 + relative * 0x1000;
-		if (at < GpuVm::kVaStart || ptOff + 0x1000 > kVmTableBytes)
-			break;
-		const uint64_t pteOff = ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8;
-		if (uint64_t *pte = ptEntry(c, pteOff, false))
-			*pte = 0;
-		if (firstPt == ~0ull)
-			firstPt = ptOff;
-		lastPt = ptOff;
-	}
-	for (uint64_t pt = firstPt; pt != ~0ull && pt <= lastPt; pt += 0x1000)
+	PtCtx ctx { this, &c, false };      // never back a page just to clear a PTE in it
+	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
+	GpuVmTable::Span span;
+	GpuVmTable::unmap(access, kVmTableBytes, va, end, span);
+	for (uint64_t pt = span.firstPt; pt != ~0ull && pt <= span.lastPt; pt += 0x1000)
 		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
 			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
 }
@@ -3236,7 +3176,8 @@ void RDNA4Compute::resetRuntimeForResume() {
 		}
 		if (c.sp)
 			sparseTeardown(c, false);   // the VRAM is gone after the sleep; only the host memory goes back
-		c.vmid = 0;
+		if (vmShared == 2)
+			c.vmid = 0;        // pooled clients hold no VMID; the other modes keep what they had
 		c.aborted = true;
 		c.tableOffset = c.rootMc = c.rootPhys = 0;
 		c.queueCpu = nullptr;

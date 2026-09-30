@@ -56,6 +56,7 @@
 #include "gpuvm.hpp"
 #include "ipdiscovery.hpp"
 #include "pm4.hpp"
+#include "gpuvmtable.hpp"
 #include "ptpages.hpp"
 #include "vmid.hpp"
 #include "pipe.hpp"
@@ -810,6 +811,10 @@ private:
 	static void sparseFreeChunk(void *ctx, uint64_t off);
 	PtPages::Backend sparseBackend() { return PtPages::Backend { sparseAllocChunk, sparseFreeChunk, this }; }
 	uint64_t *ptEntry(RtClient &c, uint64_t off, bool create = true);
+	struct PtCtx { RDNA4Compute *self; RtClient *c; bool create; };
+	static uint64_t *ptEntryThunk(void *ctx, uint64_t off);
+	static bool ptPhysThunk(void *ctx, uint64_t off, uint64_t &phys);
+	GpuVmTable::Policy vmPolicy() const { return GpuVmTable::Policy { vmIsPteOff, vmExecOff, vmPteSet, vmPteClear }; }
 	bool ptPhys(RtClient &c, uint64_t off, uint64_t &phys);
 	bool hasTables(const RtClient &c) const { return c.tableShadow || c.sp; }
 	bool sparseOpen(RtClient &c, uint32_t quotaPages);
