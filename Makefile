@@ -71,6 +71,7 @@ CXX_SRCS := \
 	src/vmtest.cpp \
 	src/vmshared.cpp \
 	src/userclient.cpp \
+	src/accelcensus.cpp \
 	$(LILU)/Library/plugin_start.cpp \
 	src/atombios.cpp \
 	src/ipdiscovery.cpp \
@@ -159,7 +160,7 @@ USER_FLAGS := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK
               -mmacosx-version-min=$(DEPLOY) -std=c11 -O2 -Wall -Iinclude -Isrc
 
 # --- rules -------------------------------------------------------------------
-.PHONY: all clean test userspace check-isa
+.PHONY: all clean test userspace check-isa census-tool
 all: $(KEXT) $(RUN_TOOL)
 
 $(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp src/amdfw.cpp src/amdfw.hpp src/psp.cpp src/psp.hpp src/sdma.cpp src/sdma.hpp src/pm4.cpp src/pm4.hpp src/codeobj.cpp src/codeobj.hpp src/vadd_codeobj.h src/bench_codeobj.h src/gfxregs.hpp src/linuxref.hpp src/gpuheap.cpp src/gpuheap.hpp src/flip.hpp include/rdna4compute.h src/ihdecode.cpp src/ih.hpp src/gpuvm.cpp src/gpuvm.hpp src/vmid.cpp src/vmid.hpp src/ptpages.cpp src/ptpages.hpp src/gpuvmtable.cpp src/gpuvmtable.hpp
@@ -173,6 +174,15 @@ $(RUN_TOOL): userspace/rdna4-run.c userspace/librdna4.c userspace/librdna4.h use
 		-framework IOKit -framework CoreFoundation -weak_framework Accelerate -o $@
 
 userspace: $(RUN_TOOL)
+
+# E1 trigger (docs/metal-spike.md): Objective-C, runs in Recovery next to rdna4-run.
+CENSUS_TOOL := $(BUILD)/rdna4-census
+$(CENSUS_TOOL): tools/accelcensus/census.m
+	@mkdir -p $(BUILD)
+	$(CXX) -x objective-c -fobjc-arc -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
+		-mmacosx-version-min=$(DEPLOY) -std=gnu11 -O1 -Wall $< -framework Foundation -framework Metal -framework IOKit -o $@
+
+census-tool: $(CENSUS_TOOL)
 
 check-isa:
 	bash tools/check-isa.sh

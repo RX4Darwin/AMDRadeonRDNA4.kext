@@ -29,6 +29,7 @@
 #include <IOKit/ndrvsupport/IONDRVLibraries.h>
 #include <pexpert/pexpert.h>
 
+#include "accelcensus.hpp"
 #include "compute.hpp"
 #include "device.hpp"
 #include "ndrv.hpp"
@@ -149,6 +150,7 @@ mach_vm_address_t orgVslPrepareCursor { 0 };
 bool traceEnabled { false };
 uint32_t traceBudget { 400 };   // bounded: gamma/CLUT calls can be frequent
 uint32_t computeStage { 0 };    // rdna4-compute=<stage>, see compute.hpp
+uint32_t accelCensus { 0 };     // rdna4-accelcensus=1|2: the E1 impostor-IOAccelerator census (accelcensus.hpp), emulator only
 
 // What we keep for one of our framebuffers.
 struct FbState {
@@ -336,6 +338,10 @@ void attach(FbEntry &e) {
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
 
+	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
+	if (accelCensus && dev.isAmd)
+		RDNA4AccelCensus::publish(pci, accelCensus);
+
 	// Compute bring-up runs after the display is answered for, and only
 	// when asked for: it must never be the reason the desktop is missing.
 	if (computeStage && dev.isAmd) {
@@ -513,9 +519,11 @@ void pluginStart() {
 	}
 #endif
 	computeStage = RDNA4Compute::requestedStage();
+	if (!PE_parse_boot_argn("rdna4-accelcensus", &accelCensus, sizeof(accelCensus)) || accelCensus > 2)
+		accelCensus = 0;
 	Ndrv::vslInit();
-	FBLOG("Lilu plugin started (trace %s, compute stage %u)", traceEnabled ? "on" : "off",
-	      computeStage);
+	FBLOG("Lilu plugin started (trace %s, compute stage %u%s)", traceEnabled ? "on" : "off",
+	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "");
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
 }
 
