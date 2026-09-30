@@ -26,20 +26,11 @@ nggvgpr:
 	global_store_b32   v8, v0, s[24:25]
 	global_store_b32   v8, v3, s[26:27]
 
-	// primitive export: lanes [0, primitives)
-	s_bfe_u32          s9, s3, 0x80008          // s9 = merged_wave_info[15:8]
-	s_bfm_b64          s[12:13], s9, 0          // lane mask of the primitives
-	s_and_saveexec_b32 s14, s12
-	s_cbranch_execz    skip_prim
-	export             prim v0, off, off, off done
-skip_prim:
-	s_mov_b32          exec_lo, s14
-
 	// position export: lanes [0, vertices)
 	s_and_b32          s8, s3, 0xff
 	s_bfm_b64          s[10:11], s8, 0
 	s_and_saveexec_b32 s15, s10
-	s_cbranch_execz    done_vs
+	s_cbranch_execz    skip_pos
 	v_cmp_eq_u32_e64   s20, 0, v3
 	v_cmp_eq_u32_e64   s21, 1, v3
 	v_cmp_eq_u32_e64   s22, 2, v3
@@ -51,5 +42,17 @@ skip_prim:
 	global_store_b32   v8, v4, s[28:29]
 	global_store_b32   v8, v5, s[30:31]
 	export             pos0 v4, v5, v6, v7 done
+skip_pos:
+	s_mov_b32          exec_lo, s15
+
+	// primitive export: lanes [0, primitives), LAST. gfx11+ has no early primitive export: RADV sets
+	// has_ngg_early_prim_export = gfx_level < GFX11 and ACO emits pos0 done, s_wait_expcnt 0, prim done
+	// (docs/linux-radv-triangle.md: the same triangle drawn by RADV on this card).
+	s_wait_expcnt      0x0
+	s_bfe_u32          s9, s3, 0x80008          // s9 = merged_wave_info[15:8]
+	s_bfm_b64          s[12:13], s9, 0          // lane mask of the primitives
+	s_and_saveexec_b32 s14, s12
+	s_cbranch_execz    done_vs
+	export             prim v0, off, off, off done
 done_vs:
 	s_endpgm
