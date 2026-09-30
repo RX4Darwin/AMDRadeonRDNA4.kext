@@ -8,6 +8,10 @@
 # Every register value is built from named fields that are validated against gfx12.json.
 import json, os, struct, sys
 
+# G4 (the colour triangle): modes header-col / table-col / stream-col / info-col build the same stream with the register deltas
+# G4 needs (docs/g4-colour.md); every other mode is the G3 stream, byte-identical to src/gfx12_draw.h.
+COL = len(sys.argv) > 1 and sys.argv[1].endswith('-col')
+
 JPATH = os.environ.get('MESA_GFX12_JSON', '/home/miguer/src/mesa/src/amd/registers/gfx12.json')
 try:
     J = json.load(open(JPATH))
@@ -246,10 +250,13 @@ setreg('PA_SC_EDGERULE', V('PA_SC_EDGERULE', ER_TRI=0xA, ER_POINT=0x6, ER_RECT=0
 # dsa
 setreg('DB_DEPTH_CONTROL', 0, 'si_state.c:1511', 'Z/stencil test off')
 # NGG shader (gs pm4 state)
-vs_rsrc1 = V('SPI_SHADER_PGM_RSRC1_GS', VGPRS=0, FLOAT_MODE=0xC0, GS_VGPR_COMP_CNT=0)
+vs_rsrc1 = V('SPI_SHADER_PGM_RSRC1_GS', VGPRS=1 if COL else 0, FLOAT_MODE=0xC0, GS_VGPR_COMP_CNT=0)
 vs_rsrc2 = V('SPI_SHADER_PGM_RSRC2_GS', SCRATCH_EN=0, USER_SGPR=0, ES_VGPR_COMP_CNT=0, OC_LDS_EN=0, LDS_SIZE=0)
 setreg('SPI_SHADER_PGM_LO_ES', (VS_VA >> 8) & 0xffffffff, 'si_state_shaders.cpp:1128-1129; radv_shader.c:2128', 'NGG program address (gfx12 uses the *_ES pair; *_LO/HI_GS feed s0/s1)', 'VA>>8', reloc=('VS', 8, 0xffffffff))
-setreg('SPI_SHADER_PGM_RSRC1_GS', vs_rsrc1, 'si_state_shaders.cpp:1134-1139', 'VGPRS=ceil(8/8)-1 (wave32); no DX10_CLAMP/MEM_ORDERED on gfx12', 'VGPRS=0 FLOAT_MODE=0xC0 GS_VGPR_COMP_CNT=0')
+if COL:
+    setreg('SPI_SHADER_PGM_RSRC1_GS', vs_rsrc1, 'shaders/nggcol.s (13 VGPRs); G3 citation si_state_shaders.cpp:1134-1139', 'G4 delta: VGPRS=1 (13 VGPRs -> 2 granules of 8, wave32; field = granules - 1); RADV G4 uses wave64 VGPRS=2', 'VGPRS=1 FLOAT_MODE=0xC0 GS_VGPR_COMP_CNT=0')
+else:
+    setreg('SPI_SHADER_PGM_RSRC1_GS', vs_rsrc1, 'si_state_shaders.cpp:1134-1139', 'VGPRS=ceil(8/8)-1 (wave32); no DX10_CLAMP/MEM_ORDERED on gfx12', 'VGPRS=0 FLOAT_MODE=0xC0 GS_VGPR_COMP_CNT=0')
 setreg('SPI_SHADER_PGM_RSRC2_GS', vs_rsrc2, 'si_state_shaders.cpp:1140-1147', 'no user SGPRs beyond the 8 system SGPRs, VertexID only, no LDS', 'USER_SGPR=0 ES_VGPR_COMP_CNT=0 LDS_SIZE=0')
 setreg('GE_MAX_OUTPUT_PER_SUBGROUP', V('GE_MAX_OUTPUT_PER_SUBGROUP', MAX_VERTS_PER_SUBGROUP=128), 'si_state_shaders.cpp:850-852,1158', 'max_out_verts', 'MAX_VERTS_PER_SUBGROUP=128')
 setreg('GE_NGG_SUBGRP_CNTL', V('GE_NGG_SUBGRP_CNTL', PRIM_AMP_FACTOR=1, THDS_PER_SUBGRP=0), 'si_state_shaders.cpp:853-854,1176; radv_shader.c:1951-1952', '', 'PRIM_AMP_FACTOR=1 THDS_PER_SUBGRP=0')
@@ -260,16 +267,24 @@ setreg('PA_CL_VTE_CNTL', V('PA_CL_VTE_CNTL', VPORT_X_SCALE_ENA=1, VPORT_X_OFFSET
 setreg('VGT_PRIMITIVEID_EN', 0, 'si_state_shaders.cpp:865-867,1182-1184', '')
 setreg('SPI_SHADER_PGM_RSRC4_GS', V('SPI_SHADER_PGM_RSRC4_GS', WAVE_LIMIT=0x3ff, GLG_FORCE_DISABLE=1, SPI_SHADER_LATE_ALLOC_GS=127, INST_PREF_SIZE=0), 'si_state_shaders.cpp:870-872,1216-1219', 'INST_PREF_SIZE=0 = no explicit prefetch (Mesa: ac_binary.c:146-165)', 'WAVE_LIMIT=0x3FF GLG_FORCE_DISABLE=1 LATE_ALLOC_GS=127')
 # PS
-ps_rsrc1 = V('SPI_SHADER_PGM_RSRC1_PS', VGPRS=0, FLOAT_MODE=0xC0)
+ps_rsrc1 = V('SPI_SHADER_PGM_RSRC1_PS', VGPRS=1 if COL else 0, FLOAT_MODE=0xC0)
 setreg('SPI_SHADER_PGM_RSRC4_PS', V('SPI_SHADER_PGM_RSRC4_PS', WAVE_LIMIT=0x3ff, LDS_GROUP_SIZE=1, INST_PREF_SIZE=0), 'si_state_shaders.cpp:1806-1810', '', 'WAVE_LIMIT=0x3FF LDS_GROUP_SIZE=1')
 setreg('SPI_SHADER_PGM_LO_PS', (PS_VA >> 8) & 0xffffffff, 'si_state_shaders.cpp:1820-1821', '', 'VA>>8', reloc=('PS', 8, 0xffffffff))
 setreg('SPI_SHADER_PGM_HI_PS', V('SPI_SHADER_PGM_HI_PS', MEM_BASE=(PS_VA >> 40) & 0xff), 'si_state_shaders.cpp:1822-1823', '', 'MEM_BASE=VA>>40', reloc=('PS', 40, 0xff))
-setreg('SPI_SHADER_PGM_RSRC1_PS', ps_rsrc1, 'si_state_shaders.cpp:1825-1830', '4 VGPRs used -> VGPRS=0 (wave32 granule 8)', 'VGPRS=0 FLOAT_MODE=0xC0')
-setreg('SPI_SHADER_PGM_RSRC2_PS', 0, 'si_state_shaders.cpp:1833-1838', 'no user SGPRs/LDS/scratch')
+if COL:
+    setreg('SPI_SHADER_PGM_RSRC1_PS', ps_rsrc1, 'shaders/pscol.s (9 VGPRs); G3 citation si_state_shaders.cpp:1825-1830', 'G4 delta: VGPRS=1 (9 VGPRs -> 2 granules of 8, wave32); RADV G4 uses wave64 VGPRS=2, FLOAT_MODE 0xCC (kept 0xC0: fp32 only)', 'VGPRS=1 FLOAT_MODE=0xC0')
+    setreg('SPI_SHADER_PGM_RSRC2_PS', V('SPI_SHADER_PGM_RSRC2_PS', USER_SGPR=2), 'radv-shaders-and-ibs.txt:2134-2140 (SPI_SHADER_PGM_RSRC2_PS <- 4)', 'G4 delta: 2 user SGPRs like RADV, so that PrimMask (first system SGPR) is s2 as in the ground-truth PS (pscol.s: s_mov_b32 m0, s2)', 'USER_SGPR=2')
+    setreg('SPI_SHADER_USER_DATA_PS_0', 0, 'radv-shaders-and-ibs.txt:486-487 (RADV: the ring table pointer)', 'G4 delta: the two user SGPRs s0/s1 of the PS; pscol.s does not read them', '')
+    setreg('SPI_SHADER_USER_DATA_PS_1', 0, 'radv-shaders-and-ibs.txt:486-487', 'see PS_0', '')
+else:
+    setreg('SPI_SHADER_PGM_RSRC1_PS', ps_rsrc1, 'si_state_shaders.cpp:1825-1830', '4 VGPRs used -> VGPRS=0 (wave32 granule 8)', 'VGPRS=0 FLOAT_MODE=0xC0')
+    setreg('SPI_SHADER_PGM_RSRC2_PS', 0, 'si_state_shaders.cpp:1833-1838', 'no user SGPRs/LDS/scratch')
 setreg('SPI_SHADER_Z_FORMAT', 0, 'si_state_shaders.cpp:1625-1626', 'no depth/stencil/mask export', 'Z_EXPORT_FORMAT=ZERO')
 setreg('SPI_SHADER_COL_FORMAT', V('SPI_SHADER_COL_FORMAT', COL0_EXPORT_FORMAT=9), 'si_state_shaders.cpp:1627-1628', 'MRT0 = 4x fp32', 'COL0_EXPORT_FORMAT=32_ABGR(9)')
 setreg('SPI_PS_INPUT_ENA', V('SPI_PS_INPUT_ENA', PERSP_CENTER_ENA=1), 'si_state_shaders.cpp:1629-1630; required 1645-1653', 'MUST: at least one PERSP/LINEAR bary enabled or the GPU hangs', 'PERSP_CENTER_ENA=1')
 setreg('SPI_PS_INPUT_ADDR', V('SPI_PS_INPUT_ADDR', PERSP_CENTER_ENA=1) if 'SPI_PS_INPUT_ADDR' in REGS and REGS['SPI_PS_INPUT_ADDR'].get('type_ref') else 2, 'si_state_shaders.cpp:1631-1632', 'same as ENA', 'PERSP_CENTER_ENA=1')
+if COL:
+    setreg('SPI_PS_INPUT_CNTL_0', 0, 'radv-shaders-and-ibs.txt:1879-1892 (RADV G4 writes it, G3 did not)', 'G4 delta: PS input 0 = attribute slot 0 (OFFSET=0), smooth (FLAT_SHADE=0), no default value, no primitive attribute, not a point sprite', 'OFFSET=0 FLAT_SHADE=0 DEFAULT_VAL=0 PRIM_ATTR=0 ATTR0_VALID=0 ATTR1_VALID=0')
 setreg('CB_SHADER_MASK', V('CB_SHADER_MASK', OUTPUT0_ENABLE=0xf), 'si_state_shaders.cpp:1633-1634,1761', 'PS writes RGBA of MRT0', 'OUTPUT0_ENABLE=0xF')
 setreg('PA_SC_HISZ_CONTROL', V('PA_SC_HISZ_CONTROL', ROUND=2), 'si_state_shaders.cpp:1635-1636,1700-1701; radv_cmd_buffer.c:4020', 'ROUND=2 is the required minimum', 'ROUND=2')
 # framebuffer
@@ -339,7 +354,10 @@ setreg('PA_CL_VPORT_ZOFFSET', fbits(0.5), 'si_state_viewport.c:533', '', '0.5f')
 setreg('PA_SC_VPORT_ZMIN_0', fbits(0.0), 'si_state_viewport.c:534', '', '0.0f')
 setreg('PA_SC_VPORT_ZMAX_0', fbits(1.0), 'si_state_viewport.c:535', '', '1.0f')
 # spi map
-setreg('SPI_SHADER_GS_OUT_CONFIG_PS', V('SPI_SHADER_GS_OUT_CONFIG_PS', VS_EXPORT_COUNT=0, PRIM_EXPORT_COUNT=0, NO_PC_EXPORT=1, NUM_INTERP=0), 'si_state_shaders.cpp:4446-4449,1220-1222,1768', 'gfx12 replacement of SPI_VS_OUT_CONFIG (+NUM_INTERP moved here)', 'VS_EXPORT_COUNT=0 NO_PC_EXPORT=1 NUM_INTERP=0')
+if COL:
+    setreg('SPI_SHADER_GS_OUT_CONFIG_PS', V('SPI_SHADER_GS_OUT_CONFIG_PS', VS_EXPORT_COUNT=0, PRIM_EXPORT_COUNT=0, NO_PC_EXPORT=0, NUM_INTERP=1), 'radv-shaders-and-ibs.txt:2153-2157 (G4 0x800; G3 0x400 at :1934-1938)', 'G4 delta: one param export (VS_EXPORT_COUNT = params - 1 = 0) and one PS input: NO_PC_EXPORT=0 (the NGG stage exports a parameter), NUM_INTERP=1', 'VS_EXPORT_COUNT=0 NO_PC_EXPORT=0 NUM_INTERP=1')
+else:
+    setreg('SPI_SHADER_GS_OUT_CONFIG_PS', V('SPI_SHADER_GS_OUT_CONFIG_PS', VS_EXPORT_COUNT=0, PRIM_EXPORT_COUNT=0, NO_PC_EXPORT=1, NUM_INTERP=0), 'si_state_shaders.cpp:4446-4449,1220-1222,1768', 'gfx12 replacement of SPI_VS_OUT_CONFIG (+NUM_INTERP moved here)', 'VS_EXPORT_COUNT=0 NO_PC_EXPORT=1 NUM_INTERP=0')
 setreg('SPI_PS_IN_CONTROL', V('SPI_PS_IN_CONTROL', PS_W32_EN=1), 'si_state_shaders.cpp:4451-4453,1767-1768', 'PS is wave32', 'PS_W32_EN=1')
 # window rectangles
 setreg('PA_SC_CLIPRECT_RULE', V('PA_SC_CLIPRECT_RULE', CLIP_RULE=0xffff), 'si_state_viewport.c:629-646', 'MUST: 0 would reject every pixel', 'CLIP_RULE=0xFFFF')
@@ -383,8 +401,104 @@ def build(seq, grouping=True):
         i = j
     return out
 
+def emit_header_g3(stream, relocs, lines):
+    print('//')
+    print('//  gfx12_draw.h: generated by tools/gen-gfx12-draw.py header from Mesa\'s')
+    print('//  gfx12.json (see premetal/gfx12-draw-notes.md). Do not edit; regenerate.')
+    print('//')
+    print('//  One non-indexed triangle from an NGG passthrough VS (shaders/ngg_tri.s) and a')
+    print('//  constant-colour PS (shaders/ps_red.s) into a %ux%u linear R8G8B8A8_UNORM' % (W, H))
+    print('//  target, then an end-of-pipe RELEASE_MEM with a GL2 write-back writing 1 to')
+    print('//  the fence. Address fields are zero here; kGfx12DrawRelocs fills them in.')
+    print('//')
+    print('')
+    print('#pragma once')
+    print('#include <stdint.h>')
+    print('')
+    print('// C and C++: the kext uses Gfx12Draw::, user space (userspace/gfx12tri.h) includes it from C.')
+    print('#ifdef __cplusplus')
+    print('namespace Gfx12Draw {')
+    print('#define GFX12_DRAW_CONST constexpr')
+    print('#else')
+    print('#define GFX12_DRAW_CONST static const')
+    print('#endif')
+    print('')
+    print('enum Sym { kVs, kPs, kCb, kAttrRing, kPosRing, kPrimRing, kFence };')
+    print('typedef struct Reloc { uint16_t dword; uint8_t sym, shift; uint32_t mask; } Reloc;   // (va >> shift) & mask')
+    print('')
+    print('GFX12_DRAW_CONST uint32_t kWidth = %u, kHeight = %u;' % (W, H))
+    print('GFX12_DRAW_CONST uint32_t kMaxSe = %u;                       // shader engines the rings are sized for' % MAX_SE)
+    print('GFX12_DRAW_CONST uint64_t kAttrRingBytes = 0x%X, kPosRingBytes = 0x%X, kPrimRingBytes = 0x%X;' % (attr_total, pos_total, prim_total))
+    print('GFX12_DRAW_CONST uint64_t kRingBytes = 0x%X;                  // attribute, position, primitive, in that order' % RING_TOTAL)
+    print('GFX12_DRAW_CONST uint32_t kCoveredPixels = 8192;             // notes 3.9: rows 64..190, 0xFF0000FF')
+    print('GFX12_DRAW_CONST uint32_t kCoveredRgba = 0xFF0000FFu;')
+    print('')
+    print('static const uint32_t kStream[%d] = {' % len(stream))
+    print('\n'.join(lines))
+    print('};')
+    print('')
+    print('static const Reloc kRelocs[%d] = {' % len(relocs))
+    for d, sy, sh, m in relocs:
+        print('\t{ %u, %s, %u, 0x%08x },' % (d, ['kVs', 'kPs', 'kCb', 'kAttrRing', 'kPosRing', 'kPrimRing', 'kFence'][sy], sh, m))
+    print('};')
+    print('')
+    print('#ifdef __cplusplus')
+    print('} // namespace Gfx12Draw')
+    print('#endif')
+
+
+def emit_header_col(stream, relocs, lines):
+    print('//')
+    print('//  gfx12_draw_col.h: generated by tools/gen-gfx12-draw.py header-col from Mesa\'s gfx12.json. Do not edit; regenerate.')
+    print('//')
+    print('//  G4: the G3 triangle (gfx12_draw.h) with one per-vertex attribute: an NGG VS (shaders/nggcol.s) that stores the vertex colour')
+    print('//  (0 red, 1 green, 2 blue) to the attribute ring and a PS (shaders/pscol.s) that interpolates it and writes it as fp32 to MRT0.')
+    print('//  The register deltas against gfx12_draw.h, each cited in the generator and in docs/g4-colour.md: SPI_SHADER_PGM_RSRC1_GS/PS')
+    print('//  VGPRS, SPI_SHADER_PGM_RSRC2_PS USER_SGPR=2 (+ SPI_SHADER_USER_DATA_PS_0/1), SPI_PS_INPUT_CNTL_0, SPI_SHADER_GS_OUT_CONFIG_PS.')
+    print('//  Address fields are zero here; kColRelocs fills them in. Names carry a Col prefix so that this header and gfx12_draw.h can')
+    print('//  be included together (also from C).')
+    print('//')
+    print('')
+    print('#pragma once')
+    print('#include <stdint.h>')
+    print('')
+    print('// C and C++: the kext would use Gfx12DrawCol::, user space (userspace/gfx12tricol.h) includes it from C.')
+    print('#ifdef __cplusplus')
+    print('namespace Gfx12DrawCol {')
+    print('#define GFX12_DRAW_COL_CONST constexpr')
+    print('#else')
+    print('#define GFX12_DRAW_COL_CONST static const')
+    print('#endif')
+    print('')
+    print('enum ColSym { kColVs, kColPs, kColCb, kColAttrRing, kColPosRing, kColPrimRing, kColFence };')
+    print('typedef struct ColReloc { uint16_t dword; uint8_t sym, shift; uint32_t mask; } ColReloc;   // (va >> shift) & mask')
+    print('')
+    print('GFX12_DRAW_COL_CONST uint32_t kColWidth = %u, kColHeight = %u;' % (W, H))
+    print('GFX12_DRAW_COL_CONST uint32_t kColMaxSe = %u;                       // shader engines the rings are sized for' % MAX_SE)
+    print('GFX12_DRAW_COL_CONST uint64_t kColAttrRingBytes = 0x%X, kColPosRingBytes = 0x%X, kColPrimRingBytes = 0x%X;' % (attr_total, pos_total, prim_total))
+    print('GFX12_DRAW_COL_CONST uint64_t kColRingBytes = 0x%X;                  // attribute, position, primitive, in that order' % RING_TOTAL)
+    print('GFX12_DRAW_COL_CONST uint32_t kColCoveredPixels = 8192;             // the G3 triangle: rows 64..190')
+    print('// Colour check (docs/g4-colour.md): every covered pixel is 255 * the barycentric weights of (v0 red, v1 green, v2 blue) at the')
+    print('// pixel centre; RADV on the card measured a largest channel error of 0.5 and |R+G+B - 255| <= 1. The builder allows this many.')
+    print('GFX12_DRAW_COL_CONST uint32_t kColChannelTolerance = 3;')
+    print('')
+    print('static const uint32_t kColStream[%d] = {' % len(stream))
+    print('\n'.join(lines))
+    print('};')
+    print('')
+    print('static const ColReloc kColRelocs[%d] = {' % len(relocs))
+    for d, sy, sh, m in relocs:
+        print('\t{ %u, %s, %u, 0x%08x },' % (d, ['kColVs', 'kColPs', 'kColCb', 'kColAttrRing', 'kColPosRing', 'kColPrimRing', 'kColFence'][sy], sh, m))
+    print('};')
+    print('')
+    print('#ifdef __cplusplus')
+    print('} // namespace Gfx12DrawCol')
+    print('#endif')
+
 if __name__ == '__main__':
     mode = sys.argv[1] if len(sys.argv) > 1 else 'table'
+    if COL:
+        mode = mode[:-len('-col')]
     if mode == 'table':
         print('| # | Register | Pkt | Byte offset | Abs dword | Value | Fields | Why | Source |')
         print('|---|---|---|---|---|---|---|---|---|')
@@ -431,49 +545,10 @@ if __name__ == '__main__':
             stream += vals
         # every relocated field must be fully inside its register (checked on
         # the example addresses: the relocated value equals the original)
-        print('//')
-        print('//  gfx12_draw.h: generated by tools/gen-gfx12-draw.py header from Mesa\'s')
-        print('//  gfx12.json (see premetal/gfx12-draw-notes.md). Do not edit; regenerate.')
-        print('//')
-        print('//  One non-indexed triangle from an NGG passthrough VS (shaders/ngg_tri.s) and a')
-        print('//  constant-colour PS (shaders/ps_red.s) into a %ux%u linear R8G8B8A8_UNORM' % (W, H))
-        print('//  target, then an end-of-pipe RELEASE_MEM with a GL2 write-back writing 1 to')
-        print('//  the fence. Address fields are zero here; kGfx12DrawRelocs fills them in.')
-        print('//')
-        print('')
-        print('#pragma once')
-        print('#include <stdint.h>')
-        print('')
-        print('// C and C++: the kext uses Gfx12Draw::, user space (userspace/gfx12tri.h) includes it from C.')
-        print('#ifdef __cplusplus')
-        print('namespace Gfx12Draw {')
-        print('#define GFX12_DRAW_CONST constexpr')
-        print('#else')
-        print('#define GFX12_DRAW_CONST static const')
-        print('#endif')
-        print('')
-        print('enum Sym { kVs, kPs, kCb, kAttrRing, kPosRing, kPrimRing, kFence };')
-        print('typedef struct Reloc { uint16_t dword; uint8_t sym, shift; uint32_t mask; } Reloc;   // (va >> shift) & mask')
-        print('')
-        print('GFX12_DRAW_CONST uint32_t kWidth = %u, kHeight = %u;' % (W, H))
-        print('GFX12_DRAW_CONST uint32_t kMaxSe = %u;                       // shader engines the rings are sized for' % MAX_SE)
-        print('GFX12_DRAW_CONST uint64_t kAttrRingBytes = 0x%X, kPosRingBytes = 0x%X, kPrimRingBytes = 0x%X;' % (attr_total, pos_total, prim_total))
-        print('GFX12_DRAW_CONST uint64_t kRingBytes = 0x%X;                  // attribute, position, primitive, in that order' % RING_TOTAL)
-        print('GFX12_DRAW_CONST uint32_t kCoveredPixels = 8192;             // notes 3.9: rows 64..190, 0xFF0000FF')
-        print('GFX12_DRAW_CONST uint32_t kCoveredRgba = 0xFF0000FFu;')
-        print('')
-        print('static const uint32_t kStream[%d] = {' % len(stream))
-        print('\n'.join(lines))
-        print('};')
-        print('')
-        print('static const Reloc kRelocs[%d] = {' % len(relocs))
-        for d, sy, sh, m in relocs:
-            print('\t{ %u, %s, %u, 0x%08x },' % (d, ['kVs', 'kPs', 'kCb', 'kAttrRing', 'kPosRing', 'kPrimRing', 'kFence'][sy], sh, m))
-        print('};')
-        print('')
-        print('#ifdef __cplusplus')
-        print('} // namespace Gfx12Draw')
-        print('#endif')
+        if COL:
+            emit_header_col(stream, relocs, lines)
+        else:
+            emit_header_g3(stream, relocs, lines)
     elif mode == 'info':
         print('attr_per_se=0x%X pos_per_se=0x%X prim_per_se=0x%X' % (attr_per_se, pos_per_se, prim_per_se))
         print('attr_total=0x%X pos_total=0x%X prim_total=0x%X ring_total=0x%X' % (attr_total, pos_total, prim_total, RING_TOTAL))

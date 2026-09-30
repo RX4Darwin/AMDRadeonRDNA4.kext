@@ -20,6 +20,11 @@
 //                        VGPRS 2). Any other bit (4, 8, 32, 64, 512, 1024, ...) is rejected. Bits are applied one at a time as in
 //                        the kext's ladder; do not combine 4096 with the marker shaders.
 //   REPLAY_SET=...       extra register writes before the draw (see below).
+//   REPLAY_DRAW=col      the G4 colour triangle (src/gfx12_draw_col.h, userspace/gfx12tricol.h: nggcol.s + pscol.s, vertex 0 red,
+//                        1 green, 2 blue through the attribute ring) instead of G3, with the colour check of docs/g4-colour.md;
+//                        afterwards the non-pattern dwords of the attribute ring are listed. Only with REPLAY_VARIANT 0, and only
+//                        with REPLAY_COL_OK=1: new hand-written shaders plus an attribute ring can fault or hang the queue, so a
+//                        run needs the reviewer's go-ahead (docs/g4-colour.md).
 // Exit status: 0 = the triangle is right (8192 px of the expected colour and no other pixel), 2 = wrong image, 1 = error
 // (including a patch whose register is not in the stream).
 //
@@ -28,6 +33,7 @@
 #include "gfx12tri.h"         // userspace/: the shared builder rdna4-run tri uses (gfx12_draw.h, ngg, psred)
 #include "ngg_old_kernel.h"
 #include "ngg64_kernel.h"
+#include "gfx12tricol.h"      // userspace/: the G4 (colour) builder, src/gfx12_draw_col.h
 
 #include <amdgpu.h>
 #include <amdgpu_drm.h>
@@ -89,6 +95,21 @@ static int findStreamReg(const uint32_t *s, uint32_t n, uint32_t opcode, uint32_
 }
 
 int main() {
+	const char *drawSel = getenv("REPLAY_DRAW") ? getenv("REPLAY_DRAW") : "g3";
+	if (strcmp(drawSel, "g3") && strcmp(drawSel, "col")) {
+		fprintf(stderr, "REPLAY_DRAW: g3 (default) or col\n");
+		return 1;
+	}
+	const bool col = !strcmp(drawSel, "col");
+	if (col && !(getenv("REPLAY_COL_OK") && !strcmp(getenv("REPLAY_COL_OK"), "1"))) {
+		fprintf(stderr, "REPLAY_DRAW=col submits new hand-written shaders and a new attribute ring stream to the GPU; set REPLAY_COL_OK=1 "
+		        "only after the review (docs/g4-colour.md)\n");
+		return 3;
+	}
+	if (col && (getenv("REPLAY_VARIANT") || getenv("REPLAY_VS") || getenv("REPLAY_SET"))) {
+		fprintf(stderr, "REPLAY_DRAW=col runs the plain G4 stream: no REPLAY_VARIANT / REPLAY_VS / REPLAY_SET\n");
+		return 1;
+	}
 	const char *vsSel = getenv("REPLAY_VS") ? getenv("REPLAY_VS") : "new";
 	const uint32_t variant = getenv("REPLAY_VARIANT") ? strtoul(getenv("REPLAY_VARIANT"), nullptr, 0) : 0;
 	if (variant & ~(1u | 2u | 128u | 256u | 2048u | 4096u)) {
@@ -126,13 +147,20 @@ int main() {
 	const uint64_t vramCpu = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
 	Buf code = alloc(0x2000, 0x1000, AMDGPU_GEM_DOMAIN_VRAM, vramCpu);                 // VS at 0, PS at 0x1000
 	Buf target = alloc(kWidth * kHeight * 4, 0x1000, AMDGPU_GEM_DOMAIN_VRAM, vramCpu);
-	Buf rings = alloc(kRingBytes, 2ull << 20, AMDGPU_GEM_DOMAIN_VRAM, 0, false);              // Mesa aligns the block to 2 MiB
+	if (col && rdna4_tricol_ring_bytes() != kRingBytes) { fprintf(stderr, "G4 ring size differs from G3\n"); return 1; }
+	// G4: the ring is CPU-visible and pre-filled with a pattern so that what the NGG stage stored can be listed afterwards.
+	Buf rings = alloc(kRingBytes, 2ull << 20, AMDGPU_GEM_DOMAIN_VRAM, col ? vramCpu : 0, col);   // Mesa aligns the block to 2 MiB
+	if (col)
+		memset(rings.cpu, 0xee, rings.size);
 	Buf misc = alloc(0x1000, 0x1000, AMDGPU_GEM_DOMAIN_GTT, 0);                         // fence 0, pstat pre 0x100, post 0x200
 	Buf ibuf = alloc(0x4000, 0x1000, AMDGPU_GEM_DOMAIN_GTT, 0);
 
 	// Shaders: the shared builder places ngg.s + psred.s (what rdna4-run tri runs); REPLAY_VS may then swap
 	// the VS, padded with s_code_end the same way.
-	rdna4_tri_place_shaders(code.cpu);
+	if (col)
+		rdna4_tricol_place_shaders(code.cpu, rings.va);
+	else
+		rdna4_tri_place_shaders(code.cpu);
 	auto place = [&](uint32_t at, const uint32_t *k, uint32_t dwords) {
 		uint32_t *p = reinterpret_cast<uint32_t *>(static_cast<char *>(code.cpu) + at);
 		for (uint32_t i = 0; i < RDNA4_TRI_SHADER_PAD; i++)
@@ -173,11 +201,14 @@ int main() {
 	printf("code 0x%llx target 0x%llx rings 0x%llx fence 0x%llx (VS %s, variant %u)\n",
 	       (unsigned long long)tva.code, (unsigned long long)tva.target, (unsigned long long)tva.rings,
 	       (unsigned long long)tva.fence, vsSel, variant);
-	constexpr uint32_t n = sizeof(kStream) / 4;
-	uint32_t s[n];
-	if (rdna4_tri_record(s, &tva) != n) { fprintf(stderr, "rdna4_tri_record refused the addresses\n"); return 1; }
+	const uint32_t n = col ? rdna4_tricol_ib_dwords() : rdna4_tri_ib_dwords();
+	const uint32_t *streamTab = col ? Gfx12DrawCol::kColStream : kStream;
+	static uint32_t s[1024];
+	if (n > sizeof(s) / 4) { fprintf(stderr, "stream of %u dwords does not fit\n", n); return 1; }
+	const rdna4_tricol_va cva = { code.va, target.va, rings.va, misc.va };
+	if ((col ? rdna4_tricol_record(s, &cva) : rdna4_tri_record(s, &tva)) != n) { fprintf(stderr, "the builder refused the addresses\n"); return 1; }
 	auto patch = [&](uint32_t opcode, uint32_t reg, uint32_t mask, uint32_t value, const char *what) {
-		const int at = findStreamReg(kStream, n, opcode, reg);
+		const int at = findStreamReg(streamTab, n, opcode, reg);
 		if (at < 0) { fprintf(stderr, "patch %s: register not in the stream\n", what); exit(1); }
 		const uint32_t old = s[at];
 		s[at] = (old & ~mask) | (value & mask);
@@ -265,6 +296,35 @@ int main() {
 	printf("submission: %s (query %d), context reset state %u\n", expired ? "done" : "NOT done in 5 s", r, state);
 
 	const uint32_t *px = static_cast<const uint32_t *>(target.cpu);
+	if (col) {   // the G4 report: the colour check, the fence, the pipeline statistics, the attribute ring
+		rdna4_tricol_result cr;
+		const int ok = rdna4_tricol_check(px, &cr);
+		printf("colour: %u covered pixels (want %u), %u with alpha != 0xFF, %u not dominated by the nearest vertex's colour\n", cr.covered,
+		       Gfx12DrawCol::kColCoveredPixels, cr.badAlpha, cr.notDominant);
+		printf("colour: max |channel - exact barycentric| %.2f, max |R+G+B - 255| %.0f (tolerance %u)\n", cr.maxChannelError, cr.maxSumError,
+		       Gfx12DrawCol::kColChannelTolerance);
+		printf("colour: near v0 (66,65) 0x%08x  near v1 (189,65) 0x%08x  near v2 (128,188) 0x%08x  centroid (128,106) 0x%08x (want ~85,85,85)\n",
+		       cr.near0, cr.near1, cr.near2, cr.centroid);
+		printf("colour: %s\n", ok ? "THE COLOUR TRIANGLE IS RIGHT" : "wrong colour image");
+		printf("draw fence: 0x%08x\n", *static_cast<uint32_t *>(misc.cpu));
+		const uint32_t *ar = static_cast<const uint32_t *>(rings.cpu);
+		uint32_t touched = 0, shown = 0;
+		for (uint64_t i = 0; i < Gfx12DrawCol::kColAttrRingBytes / 4; i++)
+			if (ar[i] != 0xeeeeeeeeu) {
+				touched++;
+				if (shown < 48) { printf("attr ring +0x%06llx: 0x%08x\n", (unsigned long long)(4 * i), ar[i]); shown++; }
+			}
+		printf("attr ring: %u dwords changed from the 0xee pattern%s\n", touched, touched > shown ? " (first 48 listed)" : "");
+		static const char *cnames[8] = { "PS_INV", "C_PRIM", "C_INV", "VS_INV", "GS_INV", "GS_PRIM", "IA_PRIM", "IA_VERT" };
+		printf("stats:");
+		for (uint32_t i = 0; i < 8; i++) {
+			if (pre[2 * i] == 0xdeadf00du || post[2 * i] == 0xdeadf00du) { printf(" %s unwritten", cnames[i]); continue; }
+			const uint64_t a0 = pre[2 * i] | (uint64_t)pre[2 * i + 1] << 32, b0 = post[2 * i] | (uint64_t)post[2 * i + 1] << 32;
+			printf(" %s %llu", cnames[i], (unsigned long long)(b0 - a0));
+		}
+		printf("\n");
+		return ok && expired ? 0 : 2;
+	}
 	uint32_t builderOthers = 0;
 	const uint32_t builderRed = rdna4_tri_count(px, &builderOthers);
 	uint32_t red = 0, other = 0, minX = kWidth, maxX = 0, minY = kHeight, maxY = 0;
