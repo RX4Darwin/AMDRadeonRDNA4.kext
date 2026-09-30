@@ -408,7 +408,7 @@ uint32_t RDNA4Compute::requestedGfxDiag() {
 	uint32_t mask = 0;
 	if (!PE_parse_boot_argn("rdna4-gfxdiag", &mask, sizeof(mask)))
 		return 0;
-	return mask & 0xfff;   // bits 1,2,4,8,32,64,128,256,512 = variants, 16 = run them even if the baseline passed
+	return mask & 0x1fff;   // bits 1,2,4,8,32,64,128,256,512,1024,2048,4096 = variants, 16 = run them even if the baseline passed
 }
 
 namespace {

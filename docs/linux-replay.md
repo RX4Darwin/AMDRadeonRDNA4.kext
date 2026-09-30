@@ -77,9 +77,12 @@ assembles `*64.s` with `+wavefrontsize64`). Variant 4096 places it, clears `VGT_
 and sets `SPI_SHADER_PGM_RSRC1_GS.VGPRS = 2`. On the card (`REPLAY_VARIANT=4096`) it draws **8192 px**, with
 the same counters as the wave32 baseline.
 
-With VGPRS = 0 it draws 0 px. That shows wave64 VGPR granules of 4 are in effect, so the variant really
-runs as wave64. With VGPRS = 1 (8 VGPRs) it draws. The same binary also draws in wave32 mode, because the
-low halves of its masks are all wave32 reads. That is expected, so the VGPR control is the proof.
+Proof that it runs as wave64: the same `ngg64` binary with the same `VGPRS = 0` (8 VGPRs in wave32, 4 in wave64)
+and only `GS_W32_EN` differing. Wave32 mode draws 8192 px; wave64 mode draws 0 px (PS 0, C_INV 1; C_PRIM read 0, 4 or 8 over six runs, so the pixel count is the signal, not C_PRIM). With
+`VGPRS = 1` (8 VGPRs in wave64) it draws again. Reproduce, after `run.sh` has built `tools/linux-replay/build/replay`:
+
+    REPLAY_VARIANT=4096 REPLAY_SET="c:0x2a6=0x04400000;s:0x8a=0x000c0000" tools/linux-replay/build/replay   # wave32: 8192 px
+    REPLAY_VARIANT=4096 REPLAY_SET="s:0x8a=0x000c0000" tools/linux-replay/build/replay                      # wave64: 0 px
 
 It joins every probe boot's ladder right after the NGG marker. The ladder only runs when the baseline draw
 is not right. If boot 3's wave32 baseline were still empty on macOS, `diag 4096` says whether the wave size

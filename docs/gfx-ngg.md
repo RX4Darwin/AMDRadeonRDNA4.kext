@@ -33,7 +33,7 @@ Nothing in the shader ABI or the registers differs from Mesa. What remains:
 - **Persistence**: the registry property `Compute,GFXVerdict` (like `Compute,GFXDiag`), one entry per draw, so a late script run sees it:
   `<label>: ia <prims>/<verts> vs <n> ci <C_INVOCATIONS> cp <C_PRIMITIVES> ps <n> px <pixels> ring ok|HUNG clip <equal>/<compared> sw <mask>[ mk ran|NO | vid lane|NOT pos ok|NOT v0 <hex>]`
   (`sw` mask: 1 CLIP_DISABLE, 2 VTX_KILL_OR, 4 DX_RASTERIZATION_KILL, 8 CULL_FRONT, 16 CULL_BACK, 32 triangle prim filter disabled), plus `park: ...`. Bounded (3 KiB, ends `...(full)`).
-- **Ladder variants** (probe boots, order 32, 1024, 2048, 512, 128, 256, 64, 8, 2, 1, 4):
+- **Ladder variants** (probe boots, order 32, 1024, 2048, 512, 128, 256, 64, 8, 2, 1, 4; since premetal/wave64 the wave64 fallback 4096 runs second, order 32, 4096, 1024, ..., see `docs/linux-replay.md`):
   - **1024** (`shaders/nggconst.s`): nothing taken from the VGPR inputs: a constant primitive (`0x00080200`) and the lane id as the vertex index. cprim > 0 = the wave's inputs were wrong (see 512 for which).
   - **2048**: `GE_PRIM_RING_SIZE` = MEM_SIZE only (no GL2 hints). cprim > 0 = the ring attributes were the problem (move the rings to NC memory).
   - 512 (W45) is now also recorded in the property; 128/256 stay as the negative results they gave.
