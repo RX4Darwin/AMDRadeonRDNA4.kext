@@ -61,6 +61,25 @@ int main(void) {
 	EXPECT(!rdna4_trirun_rings_fit(0x100010000ull, 0xA80000ull, 0xA80000ull));      /* no slack: alignment pushes it out */
 	EXPECT(rdna4_trirun_rings_fit(0x100000000ull, 0xA80000ull, 0xA80000ull));        /* already aligned: fits exactly */
 
+	/* Two different address sets (tools/linux-replay's and rdna4-run's) change only the relocated dwords: the bytes the replay proves on the card
+	 * through amdgpu are, apart from those fields, the bytes rdna4-run tri submits. */
+	{
+		static uint32_t a[1024], b[1024];
+		const rdna4_tri_va va1 = { 0x100000000ull, 0x100002000ull, 0x100200000ull, 0x100042000ull };   /* the replay's layout */
+		const rdna4_tri_va va2 = { 0x100240000ull, 0x100280000ull, 0x100600000ull, 0x100340000ull };   /* some rdna4-run layout */
+		EXPECT(rdna4_tri_record(a, &va1) == 489 && rdna4_tri_record(b, &va2) == 489);
+		uint32_t diff = 0, inReloc = 0;
+		for (uint32_t i = 0; i < 489; i++) {
+			if (a[i] == b[i])
+				continue;
+			diff++;
+			for (uint32_t r = 0; r < sizeof(kRelocs) / sizeof(kRelocs[0]); r++)
+				if (kRelocs[r].dword == i)
+					inReloc++;
+		}
+		EXPECT(diff > 0 && diff == inReloc);
+	}
+
 	/* G3 builder refusals */
 	{
 		rdna4_tri_va v = { 0x100000000ull, 0x100002000ull, 0x100200000ull, 0x100042000ull };
