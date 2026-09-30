@@ -42,6 +42,22 @@ struct Span {
 inline uint64_t *legacyEntry(uint64_t *shadow, uint64_t off) { return shadow ? shadow + off / sizeof(uint64_t) : nullptr; }
 inline uint64_t legacyPhys(uint64_t rootPhys, uint64_t off) { return rootPhys + off; }
 
+// ---- the multi-level layout of rdna4-vmshared=2 (docs/w13-vmid.md s.5.10) ----
+// The contiguous image above has ONE PDB1 entry and ONE PDB0 page, so a client's VA is limited to 1 GiB above kVaStart (and a map across that line
+// leaves the far side unreachable). Here every directory is a page of its own that exists only when something lives below it: the root (level 0, key 0),
+// PDB1 pages (level 1, key va >> 39), PDB0 pages (level 2, key va >> 30), PT pages (level 3, key va >> 21). The VA limit is the client's page quota.
+struct Tree {
+	// The page (level, key): its 512 shadow entries, GPU-physical address and id. With `create` it is backed on first use. False: absent, or over quota.
+	bool (*page)(void *context, uint32_t level, uint64_t key, bool create, uint64_t *&entries, uint64_t &phys, uint32_t &id);
+	void (*dirty)(void *context, uint32_t id);       // the page's shadow changed and has to reach VRAM
+	void *context;
+};
+
+// Same contract as mapVram / mapHost / unmap, for a Tree. The pages that changed are reported through Tree::dirty; the caller syncs them.
+bool treeMapVram(const Tree &t, const Policy &p, uint64_t va, uint64_t end, uint64_t physical, bool executable);
+bool treeMapHost(const Tree &t, const Policy &p, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable);
+void treeUnmap(const Tree &t, uint64_t va, uint64_t end);
+
 // Map [va, end) to `physical` upward (VRAM, no SNOOPED). The caller validated the alignment, `end` and the VA range. False on a failure that the old code
 // also returned false for (VA below kVaStart or past the image, `tableBytes`), or an entry the accessor refused; entries written before it stay written.
 bool mapVram(const Access &a, const Policy &p, uint64_t tableBytes, uint64_t va, uint64_t end, uint64_t physical, bool executable, Span &out);

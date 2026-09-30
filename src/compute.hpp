@@ -717,10 +717,10 @@ private:
 		uint64_t    hostUser { 0 };
 	};
 	struct RtProgram { const void *owner; uint64_t offset, va; CodeObj::Kernel k; uint16_t gen; };
-	// Sparse page tables (rdna4-vmshared=2; ptpages.hpp): the logical image is the legacy one, pages are backed on demand.
+	// Sparse page tables (rdna4-vmshared=2; ptpages.hpp, gpuvmtable.hpp): root, PDB1, PDB0 and PT pages exist only where VA is mapped, so a client's VA
+	// reaches as far as its page quota allows (the contiguous image of modes 0/1 stops at 1 GiB above kVaStart).
 	struct SparseTables {
-		PtPages::Table t;
-		uint64_t *shadow[PtPages::kMaxPages];
+		PtPages::Sparse s;
 	};
 	struct RtClient {
 		const void *owner { nullptr };
@@ -804,14 +804,22 @@ private:
 	void publishRuntime(uint32_t stage);
 	bool initRuntimeHeap();
 	bool vmBootSelfTest();
-	// Sparse page tables (rdna4-vmshared=2). The logical image is the legacy one; pages are backed on demand.
+	// Sparse page tables (rdna4-vmshared=2): a multi-level tree, pages backed on demand.
 	static constexpr uint32_t kSparseShadowMax = 8192;        // wired 4 KiB shadow pages over all clients (32 MiB)
 	uint32_t sparseShadowPages { 0 };
 	static bool sparseAllocChunk(void *ctx, uint64_t &off);
 	static void sparseFreeChunk(void *ctx, uint64_t off);
 	PtPages::Backend sparseBackend() { return PtPages::Backend { sparseAllocChunk, sparseFreeChunk, this }; }
-	uint64_t *ptEntry(RtClient &c, uint64_t off, bool create = true);
-	struct PtCtx { RDNA4Compute *self; RtClient *c; bool create; };
+	static uint64_t *sparseAllocShadow(void *ctx);
+	static void sparseFreeShadow(void *ctx, uint64_t *page);
+	static bool sparsePhysOf(void *ctx, uint64_t heapOffset, uint64_t &physical);
+	PtPages::Host sparseHost() { return PtPages::Host { sparseBackend(), sparseAllocShadow, sparseFreeShadow, sparsePhysOf, this }; }
+	struct TreeCtx { RDNA4Compute *self; RtClient *c; };
+	static bool treePageThunk(void *ctx, uint32_t level, uint64_t key, bool create, uint64_t *&entries, uint64_t &phys, uint32_t &id);
+	static void treeDirtyThunk(void *ctx, uint32_t id);
+	bool sparseSync(RtClient &c);      // every page whose shadow changed goes to its VRAM page
+	uint64_t *ptEntry(RtClient &c, uint64_t off);
+	struct PtCtx { RDNA4Compute *self; RtClient *c; };
 	static uint64_t *ptEntryThunk(void *ctx, uint64_t off);
 	static bool ptPhysThunk(void *ctx, uint64_t off, uint64_t &phys);
 	GpuVmTable::Policy vmPolicy() const { return GpuVmTable::Policy { vmIsPteOff, vmExecOff, vmPteSet, vmPteClear }; }

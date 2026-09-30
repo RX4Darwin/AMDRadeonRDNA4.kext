@@ -514,67 +514,96 @@ void RDNA4Compute::sparseFreeChunk(void *ctx, uint64_t off) {
 	static_cast<RDNA4Compute *>(ctx)->devHeap.free(off);
 }
 
-/* The shadow entry at logical byte offset `off` of the client's table image. Legacy tables: a pointer into the contiguous image. Sparse: the
- * page is backed (VRAM page from a chunk + a wired 4 KiB shadow) on first use when `create`. nullptr when that fails (quota, memory). */
-uint64_t *RDNA4Compute::ptEntry(RtClient &c, uint64_t off, bool create) {
-	if (!c.sp)
-		return GpuVmTable::legacyEntry(c.tableShadow, off);
-	const uint32_t page = static_cast<uint32_t>(off >> 12);
-	if (page >= PtPages::kMaxPages)
-		return nullptr;
-	if (!c.sp->shadow[page]) {
-		if (!create || sparseShadowPages >= kSparseShadowMax)
-			return nullptr;
-		uint64_t heapOff = 0;
-		const PtPages::Backend be = sparseBackend();
-		if (!c.sp->t.page(page, be, heapOff))
-			return nullptr;
-		auto *mem = static_cast<uint64_t *>(IOMalloc(0x1000));
-		if (!mem) {
-			c.sp->t.drop(page, be);
-			return nullptr;
-		}
-		bzero(mem, 0x1000);
-		c.sp->shadow[page] = mem;
-		sparseShadowPages++;
-	}
-	return c.sp->shadow[page] + (off & 0xfff) / sizeof(uint64_t);
+/* Modes 0/1: the shadow entry at logical byte offset `off` of the client's contiguous table image (GpuVmTable::legacyEntry / legacyPhys, which the host
+ * test compares against the pre-S8 code). Sparse clients never come through here: they use the tree below. */
+uint64_t *RDNA4Compute::ptEntry(RtClient &c, uint64_t off) {
+	return GpuVmTable::legacyEntry(c.tableShadow, off);
 }
 
-/* The GPU-physical address of logical offset `off` (what a PDE holds). */
 bool RDNA4Compute::ptPhys(RtClient &c, uint64_t off, uint64_t &phys) {
-	if (!c.sp) {
-		phys = GpuVmTable::legacyPhys(c.rootPhys, off);
-		return true;
-	}
-	const uint32_t page = static_cast<uint32_t>(off >> 12);
-	if (!c.sp->t.has(page))
-		return false;
-	uint64_t base = 0;
-	if (!gpuPhysical(vramMc(c.sp->t.offsetOf(page)), base))
-		return false;
-	phys = base + (off & 0xfff);
+	phys = GpuVmTable::legacyPhys(c.rootPhys, off);
 	return true;
 }
 
-/* Root, PDB1 and PDB0 (logical pages 0-2) and the two PDEs that chain them, exactly what rtOpen builds in the contiguous image. */
+/* ---- the tree (rdna4-vmshared=2) ---- */
+
+uint64_t *RDNA4Compute::sparseAllocShadow(void *ctx) {
+	auto *self = static_cast<RDNA4Compute *>(ctx);
+	if (self->sparseShadowPages >= kSparseShadowMax)
+		return nullptr;
+	auto *mem = static_cast<uint64_t *>(IOMalloc(0x1000));
+	if (!mem)
+		return nullptr;
+	bzero(mem, 0x1000);
+	self->sparseShadowPages++;
+	return mem;
+}
+
+void RDNA4Compute::sparseFreeShadow(void *ctx, uint64_t *page) {
+	auto *self = static_cast<RDNA4Compute *>(ctx);
+	IOFree(page, 0x1000);
+	if (self->sparseShadowPages)
+		self->sparseShadowPages--;
+}
+
+bool RDNA4Compute::sparsePhysOf(void *ctx, uint64_t heapOffset, uint64_t &physical) {
+	auto *self = static_cast<RDNA4Compute *>(ctx);
+	return self->gpuPhysical(self->vramMc(heapOffset), physical);
+}
+
+bool RDNA4Compute::treePageThunk(void *ctx, uint32_t level, uint64_t key, bool create, uint64_t *&entries, uint64_t &phys, uint32_t &id) {
+	auto *t = static_cast<TreeCtx *>(ctx);
+	PtPages::Page page;
+	if (!t->c->sp->s.get(t->self->sparseHost(), level, key, create, page))
+		return false;
+	entries = page.entries;
+	phys = page.phys;
+	id = page.id;
+	return true;
+}
+
+void RDNA4Compute::treeDirtyThunk(void *ctx, uint32_t id) {
+	auto *t = static_cast<TreeCtx *>(ctx);
+	t->c->sp->s.markDirty(id);
+}
+
+/* Every page whose shadow changed goes to its own VRAM page (staging + SDMA). A page stays marked until its copy worked. */
+bool RDNA4Compute::sparseSync(RtClient &c) {
+	if (!c.sp || !poolCpu || !devHeap.size())
+		return false;
+	uint32_t id = 0;
+	uint64_t *shadow = nullptr, heapOffset = 0;
+	while (c.sp->s.nextDirty(id, shadow, heapOffset)) {
+		memcpy(poolCpu + kVmTableStage, shadow, 0x1000);
+		(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + kVmTableStage);
+		flushHdp();
+		uint32_t pkt[Sdma::kCopyDwords];
+		if (!Sdma::copyLinear(pkt, poolMc(kVmTableStage), vramMc(heapOffset), 0x1000) ||
+		    !sdmaRun(pkt, Sdma::kCopyDwords, 2000)) {
+			RLOG("vmid %u: sparse page-table SDMA sync failed (page %u)", c.vmid, id);
+			return false;
+		}
+		c.sp->s.clean(id);
+	}
+	return true;
+}
+
+/* The root (always the first page, so id 0) is the client's page directory; nothing below it exists until a mapping needs it. */
 bool RDNA4Compute::sparseOpen(RtClient &c, uint32_t quotaPages) {
 	c.sp = static_cast<SparseTables *>(IOMalloc(sizeof(SparseTables)));
 	if (!c.sp)
 		return false;
 	bzero(c.sp, sizeof(SparseTables));
-	c.sp->t.init(quotaPages);
-	uint64_t p1 = 0, p2 = 0;
-	uint64_t *root = ptEntry(c, 0), *pdb1 = ptEntry(c, 0x1000 + GpuVm::index(GpuVm::kVaStart, 1) * 8), *pdb0 = ptEntry(c, 0x2000);
-	if (!root || !pdb1 || !pdb0 || !ptPhys(c, 0x1000, p1) || !ptPhys(c, 0x2000, p2) ||
-	    !gpuPhysical(vramMc(c.sp->t.offsetOf(0)), c.rootPhys)) {
+	c.sp->s.init(quotaPages);
+	PtPages::Page root;
+	uint64_t *shadow = nullptr, heapOffset = 0;
+	if (!c.sp->s.get(sparseHost(), 0, 0, true, root) || root.id != 0 || !c.sp->s.pageAt(0, shadow, heapOffset)) {
 		sparseTeardown(c, false);
 		return false;
 	}
-	c.rootMc = vramMc(c.sp->t.offsetOf(0));
-	*root = GpuVm::encodePde(p1, GpuVm::kValid, 2);
-	*pdb1 = GpuVm::encodePde(p2, GpuVm::kValid, 1);
-	if (!vmTableSync(c, 0, 0x3000)) {
+	c.rootMc = vramMc(heapOffset);
+	c.rootPhys = root.phys;
+	if (!sparseSync(c)) {
 		sparseTeardown(c, true);
 		return false;
 	}
@@ -586,20 +615,17 @@ bool RDNA4Compute::sparseOpen(RtClient &c, uint32_t quotaPages) {
 void RDNA4Compute::sparseTeardown(RtClient &c, bool clearVram) {
 	if (!c.sp)
 		return;
-	for (uint32_t page = 0; page < PtPages::kMaxPages; page++) {
-		if (!c.sp->shadow[page])
-			continue;
-		if (clearVram) {
-			bzero(c.sp->shadow[page], 0x1000);
-			(void)vmTableSync(c, page << 12, 0x1000);
+	if (clearVram) {
+		for (uint32_t id = 0; id < c.sp->s.idCount(); id++) {
+			uint64_t *shadow = nullptr, heapOffset = 0;
+			if (!c.sp->s.pageAt(id, shadow, heapOffset))
+				continue;
+			bzero(shadow, 0x1000);
+			c.sp->s.markDirty(id);
 		}
-		IOFree(c.sp->shadow[page], 0x1000);
-		c.sp->shadow[page] = nullptr;
-		if (sparseShadowPages)
-			sparseShadowPages--;
+		(void)sparseSync(c);
 	}
-	if (clearVram)
-		c.sp->t.release(sparseBackend());
+	c.sp->s.releaseAll(sparseHost(), clearVram);
 	IOFree(c.sp, sizeof(SparseTables));
 	c.sp = nullptr;
 	c.rootMc = c.rootPhys = 0;
@@ -607,7 +633,7 @@ void RDNA4Compute::sparseTeardown(RtClient &c, bool clearVram) {
 
 uint64_t *RDNA4Compute::ptEntryThunk(void *ctx, uint64_t off) {
 	auto *p = static_cast<PtCtx *>(ctx);
-	return p->self->ptEntry(*p->c, off, p->create);
+	return p->self->ptEntry(*p->c, off);
 }
 
 bool RDNA4Compute::ptPhysThunk(void *ctx, uint64_t off, uint64_t &phys) {
@@ -625,8 +651,14 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (end < va || end > GpuVm::kVaEnd)
 		return false;
+	if (c.sp) {
+		/* Sparse tables: GpuVmTable::treeMapVram creates the directories and PT pages the range needs; the pages it changed are synced. */
+		TreeCtx tc { this, &c };
+		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
+		return GpuVmTable::treeMapVram(tree, vmPolicy(), va, end, physical, executable) && sparseSync(c);
+	}
 	/* The entries are written by GpuVmTable::mapVram (src/gpuvmtable.cpp): the pre-S8 loop, byte-compared against the old code by the host test. */
-	PtCtx ctx { this, &c, true };
+	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	if (!GpuVmTable::mapVram(access, vmPolicy(), kVmTableBytes, va, end, physical, executable, span))
@@ -650,7 +682,12 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 	const uint64_t end = va + mapped;
 	if (mapped < bytes || end < va || end > GpuVm::kVaEnd)
 		return false;
-	PtCtx ctx { this, &c, true };
+	if (c.sp) {
+		TreeCtx tc { this, &c };
+		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
+		return GpuVmTable::treeMapHost(tree, vmPolicy(), va, end, pageBuses, executable) && sparseSync(c);
+	}
+	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	if (!GpuVmTable::mapHost(access, vmPolicy(), kVmTableBytes, va, end, pageBuses, executable, span))
@@ -685,7 +722,15 @@ void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 		return;
 	c.tlbSeq++;      /* a removed PTE: the next job on any VMID this client owns flushes first (amdgpu's tlb_seq) */
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
-	PtCtx ctx { this, &c, false };      // never back a page just to clear a PTE in it
+	if (c.sp) {
+		TreeCtx tc { this, &c };   // treeUnmap never backs a page just to clear a PTE in it
+		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
+		GpuVmTable::treeUnmap(tree, va, end);
+		if (!sparseSync(c))
+			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
+		return;
+	}
+	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	GpuVmTable::unmap(access, kVmTableBytes, va, end, span);
@@ -695,29 +740,13 @@ void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 }
 
 bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
+	if (c.sp)
+		return sparseSync(c);       // the tree tracks what changed; (offset, bytes) only describe the contiguous image
 	if (!hasTables(c) || offset > kVmTableBytes || bytes > kVmTableBytes - offset ||
 	    !poolCpu || !devHeap.size() || offset & 0xfff || bytes & 0xfff) {
 		RLOG("vmid %u: page-table sync arguments rejected (offset 0x%x bytes 0x%x)",
 		     c.vmid, offset, bytes);
 		return false;
-	}
-	if (c.sp) {
-		/* Sparse tables: every BACKED page in the range goes to its own VRAM page; unbacked ones hold nothing. */
-		for (uint32_t off = offset; off < offset + bytes; off += 0x1000) {
-			const uint32_t page = off >> 12;
-			if (!c.sp->shadow[page] || !c.sp->t.has(page))
-				continue;
-			memcpy(poolCpu + kVmTableStage, c.sp->shadow[page], 0x1000);
-			(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + kVmTableStage);
-			flushHdp();
-			uint32_t pkt[Sdma::kCopyDwords];
-			if (!Sdma::copyLinear(pkt, poolMc(kVmTableStage), vramMc(c.sp->t.offsetOf(page)), 0x1000) ||
-			    !sdmaRun(pkt, Sdma::kCopyDwords, 2000)) {
-				RLOG("vmid %u: sparse page-table SDMA sync failed (page %u)", c.vmid, page);
-				return false;
-			}
-		}
-		return true;
 	}
 	if (vmTableCpu) {
 		/* W22 variant T: the table lives in the CPU-visible pool and is written
@@ -1805,7 +1834,7 @@ IOReturn RDNA4Compute::rtOpenPooled(const void *owner, uint32_t slot, RtClient *
 	c->doorbell = sharedQ[sq].doorbell;
 	c->active = true;
 	RLOG("client slot %u (PASID %u) opened on shared queue %u: %u table pages (%u chunk), no VMID until its first job, %u shadow pages wired in all",
-	     slot, c->pasid, sq, c->sp->t.pages(), c->sp->t.chunksHeld(), sparseShadowPages);
+	     slot, c->pasid, sq, c->sp->s.pages(), c->sp->s.chunksHeld(), sparseShadowPages);
 	vmOpTrace("open (pooled)", 0, c->pipe, c->queue);
 	if (!vmSurveyClientDone) {
 		vmSurveyClientDone = true;

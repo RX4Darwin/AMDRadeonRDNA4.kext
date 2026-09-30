@@ -2439,7 +2439,7 @@ static int testPtPages() {
 			unique &= chunks.freed[i] != chunks.freed[j];
 	f += check(unique, "ptpages: no chunk was freed twice");
 
-	// Worst case: the whole 4 MiB image backed = 1024 pages = 64 chunks.
+	// Worst case: a client holding its whole quota, kMaxPages pages = kMaxPages / 16 chunks.
 	PtPages::Table w;
 	FakeChunks c4;
 	PtPages::Backend b4 { fakeAllocChunk, fakeFreeChunk, &c4 };
@@ -2447,7 +2447,8 @@ static int testPtPages() {
 	bool all = true;
 	for (uint32_t i = 0; i < PtPages::kMaxPages; i++)
 		all &= w.page(i, b4, off);
-	f += check(all && w.pages() == 1024 && w.chunksHeld() == 64, "ptpages: a fully mapped 4 MiB image takes 64 chunks");
+	f += check(all && w.pages() == PtPages::kMaxPages && w.chunksHeld() == PtPages::kMaxPages / PtPages::kChunkPages,
+	           "ptpages: a client holding its whole quota takes kMaxPages / 16 chunks");
 	w.release(b4);
 	f += check(c4.live == 0, "ptpages: and gives them all back");
 
@@ -2497,49 +2498,16 @@ struct NewImage {
 	uint32_t fbOffset { 0 };
 	std::vector<std::pair<uint32_t, uint32_t>> syncs;
 	bool failSync { false };
-	// sparse
-	bool sparse { false };
-	PtPages::Table table;
-	std::map<uint32_t, std::vector<uint64_t>> shadow;
-	struct Chunks { uint64_t next { 0x2000000 }; uint32_t live { 0 }; } chunks;
-	bool create { true };
-
 	bool sync(uint32_t offset, uint32_t bytes) { syncs.push_back({ offset, bytes }); return !failSync; }
 };
 
-bool fakeChunkAlloc(void *ctx, uint64_t &off) { auto *c = static_cast<NewImage::Chunks *>(ctx); off = c->next; c->next += 0x10000; c->live++; return true; }
-void fakeChunkFree(void *ctx, uint64_t) { static_cast<NewImage::Chunks *>(ctx)->live--; }
-
 uint64_t *newEntry(void *ctx, uint64_t off) {
 	auto *n = static_cast<NewImage *>(ctx);
-	if (!n->sparse)
-		return off < kTableBytes ? GpuVmTable::legacyEntry(n->words.data(), off) : nullptr;
-	const uint32_t page = static_cast<uint32_t>(off >> 12);
-	if (page >= PtPages::kMaxPages)
-		return nullptr;
-	auto it = n->shadow.find(page);
-	if (it == n->shadow.end()) {
-		if (!n->create)
-			return nullptr;
-		uint64_t heapOff = 0;
-		PtPages::Backend be { fakeChunkAlloc, fakeChunkFree, &n->chunks };
-		if (!n->table.page(page, be, heapOff))
-			return nullptr;
-		it = n->shadow.emplace(page, std::vector<uint64_t>(512, 0)).first;
-	}
-	return it->second.data() + (off & 0xfff) / 8;
+	return off < kTableBytes ? GpuVmTable::legacyEntry(n->words.data(), off) : nullptr;
 }
 
 bool newPhys(void *ctx, uint64_t off, uint64_t &phys) {
-	auto *n = static_cast<NewImage *>(ctx);
-	if (!n->sparse) {
-		phys = GpuVmTable::legacyPhys(n->rootPhys, off);
-		return true;
-	}
-	const uint32_t page = static_cast<uint32_t>(off >> 12);
-	if (!n->table.has(page))
-		return false;
-	phys = 0x4000000000ull + n->table.offsetOf(page) + (off & 0xfff);
+	phys = GpuVmTable::legacyPhys(static_cast<NewImage *>(ctx)->rootPhys, off);
 	return true;
 }
 
@@ -2552,7 +2520,6 @@ bool newVmMap(NewImage &n, uint64_t va, uint64_t mc, uint64_t bytes, bool execut
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (end < va || end > GpuVm::kVaEnd)
 		return false;
-	n.create = true;
 	const GpuVmTable::Access access { newEntry, newPhys, &n };
 	GpuVmTable::Span span;
 	if (!GpuVmTable::mapVram(access, n.pol, kTableBytes, va, end, physical, executable, span))
@@ -2572,7 +2539,6 @@ bool newVmMapHost(NewImage &n, uint64_t va, const uint64_t *pageBuses, uint64_t 
 	const uint64_t end = va + mapped;
 	if (mapped < bytes || end < va || end > GpuVm::kVaEnd)
 		return false;
-	n.create = true;
 	const GpuVmTable::Access access { newEntry, newPhys, &n };
 	GpuVmTable::Span span;
 	if (!GpuVmTable::mapHost(access, n.pol, kTableBytes, va, end, pageBuses, executable, span))
@@ -2589,7 +2555,6 @@ void newVmUnmap(NewImage &n, uint64_t va, uint64_t bytes) {
 	if (!bytes || va & (GpuVm::kPageBytes - 1))
 		return;
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
-	n.create = false;
 	const GpuVmTable::Access access { newEntry, newPhys, &n };
 	GpuVmTable::Span span;
 	GpuVmTable::unmap(access, kTableBytes, va, end, span);
@@ -2604,31 +2569,13 @@ void initLegacy(std::vector<uint64_t> &w, uint64_t rootPhys) {
 	w[0x1000 / 8 + GpuVm::index(GpuVm::kVaStart, 1)] = GpuVm::encodePde(rootPhys + 0x2000, GpuVm::kValid, 1);
 }
 
-void initSparse(NewImage &n) {
-	n.shadow.clear();
-	PtPages::Backend be { fakeChunkAlloc, fakeChunkFree, &n.chunks };
-	n.table.release(be);
-	n.table.init(PtPages::kMaxPages);
-	n.create = true;
-	uint64_t off = 0;
-	for (uint32_t i = 0; i < 3; i++)
-		n.table.page(i, be, off);
-	for (uint32_t i = 0; i < 3; i++)
-		n.shadow[i] = std::vector<uint64_t>(512, 0);
-	uint64_t p1 = 0, p2 = 0;
-	newPhys(&n, 0x1000, p1);
-	newPhys(&n, 0x2000, p2);
-	n.shadow[0][0] = GpuVm::encodePde(p1, GpuVm::kValid, 2);
-	n.shadow[1][GpuVm::index(GpuVm::kVaStart, 1)] = GpuVm::encodePde(p2, GpuVm::kValid, 1);
-}
-
 struct Pair {
 	LegacyRef ref;
-	NewImage nw, sp;
+	NewImage nw;
 	std::vector<uint64_t> refWords;
 	int failures { 0 };
 	const char *policy { "" };
-	uint32_t ops { 0 }, okMaps { 0 }, failedMaps { 0 }, okHost { 0 }, failedHost { 0 }, unmaps { 0 }, leafPagesMax { 0 };
+	uint32_t ops { 0 }, okMaps { 0 }, failedMaps { 0 }, okHost { 0 }, failedHost { 0 }, unmaps { 0 };
 
 	void setup(const PolicySet &p, uint32_t fbOffset) {
 		refWords.assign(kTableBytes / 8, 0);
@@ -2638,28 +2585,23 @@ struct Pair {
 		ref.pol = { p.isPteOff, p.execOff, p.pteSet, p.pteClear };
 		ref.fbMcBase = kFbMcBase;
 		ref.fbOffset = fbOffset;
-		for (NewImage *n : { &nw, &sp }) {
-			n->pol = GpuVmTable::Policy { p.isPteOff, p.execOff, p.pteSet, p.pteClear };
-			n->fbMcBase = kFbMcBase;
-			n->fbOffset = fbOffset;
-		}
+		nw.pol = GpuVmTable::Policy { p.isPteOff, p.execOff, p.pteSet, p.pteClear };
+		nw.fbMcBase = kFbMcBase;
+		nw.fbOffset = fbOffset;
 		nw.words.assign(kTableBytes / 8, 0);
-		sp.sparse = true;
 		policy = p.name;
 		reopen();
 	}
 	void reopen() {
 		initLegacy(refWords, kRootPhys);
 		nw.words = refWords;
-		initSparse(sp);
 		ref.syncs.clear();
 		nw.syncs.clear();
-		sp.syncs.clear();
 	}
-	void setFailSync(bool f) { ref.failSync = nw.failSync = sp.failSync = f; }
+	void setFailSync(bool f) { ref.failSync = nw.failSync = f; }
 
-	// After one operation: same result, same syncs, same bytes; the sparse image equal entry for entry.
-	void compare(const char *what, bool rr, bool rn, bool rs) {
+	// After one operation: same result, same syncs, same bytes.
+	void compare(const char *what, bool rr, bool rn) {
 		ops++;
 		auto fail = [&](const char *why) {
 			if (failures < 5)
@@ -2679,61 +2621,25 @@ struct Pair {
 			         (unsigned long long)refWords[i], (unsigned long long)nw.words[i]);
 			fail(buf);
 		}
-		if (rr != rs)
-			fail("sparse return value differs");
-		for (uint32_t page = 3; page < PtPages::kMaxPages; page++) {
-			auto it = sp.shadow.find(page);
-			for (uint32_t e = 0; e < 512; e++) {
-				const uint64_t want = refWords[page * 512 + e], got = it == sp.shadow.end() ? 0 : it->second[e];
-				if (want != got) {
-					fail("sparse leaf differs");
-					page = PtPages::kMaxPages;
-					break;
-				}
-			}
-		}
-		for (uint32_t e = 0; e < 512; e++) {
-			const uint64_t top[2] = { refWords[0x1000 / 8 + e], refWords[0x2000 / 8 + e] };
-			const uint64_t stop[2] = { sp.shadow[1][e], sp.shadow[2][e] };
-			if (((top[0] ^ stop[0]) & GpuVm::kValid) || ((top[1] ^ stop[1]) & GpuVm::kValid)) {
-				fail("sparse PDE validity differs");
-				break;
-			}
-			if (e < 512 && (top[1] & GpuVm::kValid)) {
-				// Whatever PT page the legacy PDE names (the legacy layout shares PDB0[n] between PT pages n and n + 512 once a mapping
-				// passes 1 GiB: a first-writer-wins quirk the new code must keep), the sparse PDE names the same logical page.
-				uint64_t phys = 0;
-				const uint64_t legacyOff = GpuVm::entryPhysical(top[1]) - kRootPhys;
-				if (!newPhys(&sp, legacyOff, phys) || GpuVm::entryPhysical(stop[1]) != (phys & GpuVm::kPhysicalMask)) {
-					fail("sparse PDE does not point at its PT page");
-					break;
-				}
-			}
-		}
 		ref.syncs.clear();
 		nw.syncs.clear();
-		sp.syncs.clear();
 	}
 
 	void map(uint64_t va, uint64_t mc, uint64_t bytes, bool exec) {
-		const bool a = legacyVmMap(ref, va, mc, bytes, exec), b = newVmMap(nw, va, mc, bytes, exec), c = newVmMap(sp, va, mc, bytes, exec);
+		const bool a = legacyVmMap(ref, va, mc, bytes, exec), b = newVmMap(nw, va, mc, bytes, exec);
 		(a ? okMaps : failedMaps)++;
-		compare("map", a, b, c);
+		compare("map", a, b);
 	}
 	void mapHost(uint64_t va, const std::vector<uint64_t> &buses, uint64_t bytes, bool exec) {
-		const bool a = legacyVmMapHost(ref, va, buses.data(), bytes, exec), b = newVmMapHost(nw, va, buses.data(), bytes, exec),
-		           c = newVmMapHost(sp, va, buses.data(), bytes, exec);
+		const bool a = legacyVmMapHost(ref, va, buses.data(), bytes, exec), b = newVmMapHost(nw, va, buses.data(), bytes, exec);
 		(a ? okHost : failedHost)++;
-		compare("mapHost", a, b, c);
+		compare("mapHost", a, b);
 	}
 	void unmap(uint64_t va, uint64_t bytes) {
 		legacyVmUnmap(ref, va, bytes);
 		newVmUnmap(nw, va, bytes);
-		newVmUnmap(sp, va, bytes);
 		unmaps++;
-		if (sp.table.pages() > leafPagesMax)
-			leafPagesMax = sp.table.pages();
-		compare("unmap", true, true, true);
+		compare("unmap", true, true);
 	}
 };
 
@@ -2747,7 +2653,7 @@ struct Rng {
 
 static int testVmTableDifferential() {
 	int failures = 0;
-	uint32_t totOps = 0, totOk = 0, totBad = 0, totHostOk = 0, totHostBad = 0, totUnmap = 0, maxPages = 0;
+	uint32_t totOps = 0, totOk = 0, totBad = 0, totHostOk = 0, totHostBad = 0, totUnmap = 0;
 	const uint64_t V = GpuVm::kVaStart;
 	const uint64_t MC = kFbMcBase;
 	for (const PolicySet &pol : kPolicies) {
@@ -2839,14 +2745,275 @@ static int testVmTableDifferential() {
 			}
 			failures += P.failures;
 			totOps += P.ops; totOk += P.okMaps; totBad += P.failedMaps; totHostOk += P.okHost; totHostBad += P.failedHost; totUnmap += P.unmaps;
-			if (P.leafPagesMax > maxPages)
-				maxPages = P.leafPagesMax;
 		}
 	}
-	printf("vmtable differential: %u operations (%u maps ok, %u refused, %u host maps ok, %u refused, %u unmaps), up to %u sparse pages, "
-	       "pre-S8 code vs src/gpuvmtable.cpp vs the sparse accessor: identical\n", totOps, totOk, totBad, totHostOk, totHostBad, totUnmap, maxPages);
+	printf("vmtable differential: %u operations (%u maps ok, %u refused, %u host maps ok, %u refused, %u unmaps), "
+	       "pre-S8 code vs src/gpuvmtable.cpp (contiguous image of modes 0/1): identical\n", totOps, totOk, totBad, totHostOk, totHostBad, totUnmap);
 	return failures + check(totOk > 200 && totBad > 50 && totHostOk > 100 && totHostBad > 10 && totUnmap > 100,
 	                        "vmtable differential: the histories cover successful and refused maps, host maps and unmaps");
+}
+
+// ---- the multi-level layout of rdna4-vmshared=2 (hub-task-346): VA beyond 1 GiB ----
+namespace {
+// A fake device for PtPages::Sparse: chunks from a counter, shadow pages from the host, and a "VRAM" that only ever holds what sync() copied, so a walk over
+// it proves the dirty tracking too (a page that was changed but not marked never reaches it).
+struct TreeEnv {
+	PtPages::Sparse sp;
+	uint64_t nextChunk { 0x2000000 };
+	uint32_t chunksLive { 0 }, shadowLive { 0 }, shadowLimit { 0xffffffffu };
+	std::map<uint64_t, std::vector<uint64_t>> vram;           // heap offset -> synced page
+	std::vector<uint64_t> dirtyLog;
+	uint64_t rootPhys { 0 };
+	bool dropDirty { false };                                   // mutation switch: the tree forgets to mark pages
+	PtPages::Host host;
+	static constexpr uint64_t kBase = 0x4000000000ull;
+
+	static bool allocChunk(void *c, uint64_t &off) { auto *e = static_cast<TreeEnv *>(c); off = e->nextChunk; e->nextChunk += 0x10000; e->chunksLive++; return true; }
+	static void freeChunk(void *c, uint64_t) { static_cast<TreeEnv *>(c)->chunksLive--; }
+	static uint64_t *allocShadow(void *c) {
+		auto *e = static_cast<TreeEnv *>(c);
+		if (e->shadowLive >= e->shadowLimit)
+			return nullptr;
+		e->shadowLive++;
+		return static_cast<uint64_t *>(calloc(512, 8));
+	}
+	static void freeShadow(void *c, uint64_t *p) { static_cast<TreeEnv *>(c)->shadowLive--; free(p); }
+	static bool physOf(void *, uint64_t heapOffset, uint64_t &phys) { phys = kBase + heapOffset; return true; }
+	static bool treePage(void *c, uint32_t level, uint64_t key, bool create, uint64_t *&entries, uint64_t &phys, uint32_t &id) {
+		auto *e = static_cast<TreeEnv *>(c);
+		PtPages::Page p;
+		if (!e->sp.get(e->host, level, key, create, p))
+			return false;
+		entries = p.entries; phys = p.phys; id = p.id;
+		return true;
+	}
+	static void treeDirty(void *c, uint32_t id) {
+		auto *e = static_cast<TreeEnv *>(c);
+		e->dirtyLog.push_back(id);
+		if (!e->dropDirty)
+			e->sp.markDirty(id);
+	}
+	GpuVmTable::Tree tree() { return GpuVmTable::Tree { treePage, treeDirty, this }; }
+
+	void open(uint32_t quota) {
+		host = PtPages::Host { PtPages::Backend { allocChunk, freeChunk, this }, allocShadow, freeShadow, physOf, this };
+		sp.init(quota);
+		PtPages::Page root;
+		sp.get(host, 0, 0, true, root);
+		rootPhys = root.phys;
+		sync();
+	}
+	void sync() {
+		uint32_t id; uint64_t *shadow, off;
+		while (sp.nextDirty(id, shadow, off)) {
+			vram[off] = std::vector<uint64_t>(shadow, shadow + 512);
+			sp.clean(id);
+		}
+	}
+	static bool readEntry(void *c, uint64_t address, uint64_t &entry) {
+		auto *e = static_cast<TreeEnv *>(c);
+		auto it = e->vram.find((address & ~0xfffull) - kBase);
+		if (it == e->vram.end())
+			return false;                                       // the walker reads a VRAM page that never got written: a fault
+		entry = it->second[(address & 0xfff) / 8];
+		return true;
+	}
+	// The GPU's view: walk the SYNCED pages from the root.
+	bool translate(uint64_t va, uint64_t &physical) {
+		uint64_t flags = 0;
+		return GpuVm::walk(rootPhys, va, readEntry, this, physical, flags);
+	}
+	void close() {
+		sp.releaseAll(host, true);
+		vram.clear();
+		dirtyLog.clear();
+	}
+};
+
+bool treeMap(TreeEnv &e, uint64_t va, uint64_t mc, uint64_t bytes) {
+	const GpuVmTable::Policy pol {};
+	uint64_t physical = 0;
+	GpuVm::mcToPhysical(mc, kFbMcBase, 0, physical);
+	const uint64_t end = va + ((bytes + 0xfff) & ~0xfffull);
+	const bool ok = GpuVmTable::treeMapVram(e.tree(), pol, va, end, physical, false);
+	e.sync();
+	return ok;
+}
+
+// Every page of [va, va + bytes) translates to physical + offset (and nothing else does outside).
+bool treeResolves(TreeEnv &e, uint64_t va, uint64_t mc, uint64_t bytes) {
+	uint64_t physical0 = 0;
+	GpuVm::mcToPhysical(mc, kFbMcBase, 0, physical0);
+	for (uint64_t off = 0; off < bytes; off += 0x1000) {
+		uint64_t phys = 0;
+		if (!e.translate(va + off, phys) || phys != physical0 + off)
+			return false;
+	}
+	return true;
+}
+} // namespace
+
+static int testSparseTree() {
+	int f = 0;
+	const uint64_t V = GpuVm::kVaStart, G = 1ull << 30;
+	const uint64_t MC = kFbMcBase + 0x1000000;
+	static TreeEnv e;
+	e = TreeEnv {};
+	e.open(PtPages::kMaxPages);
+	f += check(e.sp.pages() == 1 && e.sp.chunksHeld() == 1 && e.shadowLive == 1, "tree: a fresh client is one page (the root), nothing below it");
+	uint64_t phys = 0;
+	f += check(!e.translate(V, phys), "tree: before any mapping every VA faults");
+
+	// A map inside the first GiB: root + PDB1 + PDB0 + one PT.
+	f += check(treeMap(e, V + 0x1000, MC, 0x3000) && treeResolves(e, V + 0x1000, MC, 0x3000) && e.sp.pages() == 4,
+	           "tree: a first mapping backs root, PDB1, PDB0 and one PT page (4 pages)");
+	f += check(!e.translate(V, phys) && !e.translate(V + 0x4000, phys), "tree: the neighbouring unmapped pages still fault");
+	// A second map into the SAME, already synced PT page: only the dirty mark gets it to VRAM (a new page is dirty from birth, an old one is not).
+	f += check(treeMap(e, V + 0x8000, MC + 0x50000, 0x2000) && treeResolves(e, V + 0x8000, MC + 0x50000, 0x2000) && e.sp.pages() == 4,
+	           "tree: a later map into an existing PT page reaches VRAM and backs no new page");
+
+	// THE FIX: a map that crosses 1 GiB. It needs a second PDB0 page (PDB1 entry 5 of the same PDB1 page).
+	const uint64_t cross = V + G - 0x10000, crossMc = MC + 0x100000;
+	bool ok = treeMap(e, cross, crossMc, 0x20000);
+	f += check(ok && treeResolves(e, cross, crossMc, 0x20000), "tree: a 128 KiB map across the 1 GiB line succeeds and every page translates");
+	f += check(e.sp.pages() == 4 + 1 /*PT of the far side*/ + 1 /*PT of the near side*/ + 1 /*second PDB0*/, "tree: the crossing cost exactly two PT pages and one more PDB0");
+	// The walk above already proves the far side is reachable; check the structure too: PDB1 entries 4 and 5 name two different PDB0 pages.
+	{
+		uint64_t *p1 = nullptr, *p0a = nullptr, *p0b = nullptr, ph1 = 0, ph2 = 0, ph3 = 0;
+		uint32_t i1 = 0, i2 = 0, i3 = 0;
+		const bool got = TreeEnv::treePage(&e, 1, V >> 39, false, p1, ph1, i1) && TreeEnv::treePage(&e, 2, V >> 30, false, p0a, ph2, i2) &&
+		                 TreeEnv::treePage(&e, 2, (V + G) >> 30, false, p0b, ph3, i3);
+		f += check(got && i2 != i3 && GpuVm::entryPhysical(p1[GpuVm::index(V, 1)]) == ph2 && GpuVm::entryPhysical(p1[GpuVm::index(V + G, 1)]) == ph3,
+		           "tree: PDB1 entries 4 and 5 name two different PDB0 pages");
+	}
+
+	// NEGATIVE CONTROL: the contiguous layout of modes 0/1 accepts the same map and then cannot reach the far side. This is the defect being fixed;
+	// without it the test above would pass for a walker that never reads PDB1.
+	{
+		NewImage n;
+		n.words.assign(kTableBytes / 8, 0);
+		initLegacy(n.words, kRootPhys);
+		const bool mapped = newVmMap(n, cross, crossMc, 0x20000, false);
+		auto legacyRead = [](void *c, uint64_t address, uint64_t &entry) {
+			auto *img = static_cast<NewImage *>(c);
+			const uint64_t off = address - kRootPhys;
+			if (off >= kTableBytes)
+				return false;
+			entry = img->words[off / 8];
+			return true;
+		};
+		uint64_t pa = 0, fl = 0;
+		const bool nearOk = GpuVm::walk(kRootPhys, cross, legacyRead, &n, pa, fl);
+		const bool farOk = GpuVm::walk(kRootPhys, cross + 0x10000, legacyRead, &n, pa, fl);
+		f += check(mapped && nearOk && !farOk, "negative control: the contiguous layout takes a map across 1 GiB but the far side does not translate (PDB1 entry 5 is empty)");
+	}
+
+	// Far apart: another PDB1 page (512 GiB up), and the top of the 48-bit space.
+	const uint64_t far = V + (600ull << 30);
+	f += check(treeMap(e, far, MC + 0x200000, 0x1000) && treeResolves(e, far, MC + 0x200000, 0x1000), "tree: a map 600 GiB up (root entry 1, its own PDB1 page) translates");
+	const uint64_t top = GpuVm::kVaEnd - 0x2000;
+	f += check(treeMap(e, top, MC + 0x300000, 0x2000) && treeResolves(e, top, MC + 0x300000, 0x2000), "tree: the last two pages of the 48-bit space translate");
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V - 0x1000, V + 0x1000, 0x1000, false), "tree: a map starting below kVaStart is refused");
+	f += check(treeResolves(e, cross, crossMc, 0x20000) && treeResolves(e, V + 0x1000, MC, 0x3000), "tree: the earlier mappings are undisturbed by the later ones");
+
+	// Unmap: PTEs go (through the dirty path), pages stay, nothing is created for a range that was never mapped.
+	const uint32_t before = e.sp.pages();
+	GpuVmTable::treeUnmap(e.tree(), cross, cross + 0x20000);
+	e.sync();
+	f += check(!e.translate(cross, phys) && !e.translate(cross + 0x10000, phys) && treeResolves(e, V + 0x1000, MC, 0x3000),
+	           "tree: unmap clears exactly its PTEs, on both sides of the line");
+	GpuVmTable::treeUnmap(e.tree(), V + 40 * G, V + 40 * G + 0x100000);
+	f += check(e.sp.pages() == before, "tree: unmapping a range that was never backed backs nothing");
+	// Host mapping through the same tree.
+	{
+		std::vector<uint64_t> buses(8);
+		for (uint32_t i = 0; i < 8; i++)
+			buses[i] = 0x104048000ull + 0x3000ull * i;
+		const uint64_t hv = V + 3 * G + 0x7000;
+		const bool hm = GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, hv, hv + 0x8000, buses.data(), false);
+		e.sync();
+		bool all = hm;
+		for (uint32_t i = 0; i < 8; i++)
+			all &= e.translate(hv + 0x1000ull * i, phys) && phys == buses[i];
+		f += check(all, "tree: a host mapping in the fourth GiB translates to its bus addresses");
+		// and a second one into the same, already synced PT page
+		const uint64_t hv2 = hv + 0x10000;
+		const bool hm2 = GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, hv2, hv2 + 0x2000, buses.data(), false);
+		e.sync();
+		f += check(hm2 && e.translate(hv2, phys) && phys == buses[0] && e.translate(hv2 + 0x1000, phys) && phys == buses[1],
+		           "tree: a later host mapping into an existing PT page reaches VRAM");
+		buses[3] |= 0x40;
+		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, hv + 0x20000, hv + 0x28000, buses.data(), false), "tree: a misaligned bus address is refused");
+	}
+
+	// Quota: the VA limit is the page quota. Nothing half-made, earlier mappings survive.
+	{
+		static TreeEnv q;
+		q = TreeEnv {};
+		q.open(8);
+		// root + PDB1 + PDB0 + 5 PT pages = 8
+		bool fine = true;
+		for (uint32_t i = 0; i < 5; i++)
+			fine &= treeMap(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		f += check(fine && q.sp.pages() == 8, "quota: root, PDB1, PDB0 and five PT pages fill a quota of 8");
+		f += check(!treeMap(q, V + 5 * 0x200000ull, MC, 0x1000) && q.sp.pages() == 8, "quota: the sixth PT page is refused and leaves no page behind");
+		f += check(!treeMap(q, V + G, MC, 0x1000) && q.sp.pages() == 8, "quota: a map into a new GiB (needs PDB0 + PT) is refused too");
+		bool still = true;
+		for (uint32_t i = 0; i < 5; i++)
+			still &= treeResolves(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		f += check(still, "quota: what was mapped before the refusal still translates");
+		q.close();
+		f += check(q.chunksLive == 0 && q.shadowLive == 0, "quota: close returns every chunk and shadow page");
+		// host memory exhaustion behaves like the quota
+		q = TreeEnv {};
+		q.shadowLimit = 3;
+		q.open(PtPages::kMaxPages);
+		f += check(!treeMap(q, V, MC, 0x1000) && q.sp.pages() <= 3, "quota: running out of host shadow pages fails the map cleanly");
+		q.close();
+		f += check(q.chunksLive == 0 && q.shadowLive == 0, "quota: and close still returns everything");
+	}
+
+	// A wide client: many GiB at once, including straddles of each 1 GiB line; everything resolves.
+	{
+		static TreeEnv w;
+		w = TreeEnv {};
+		w.open(PtPages::kMaxPages);
+		bool all = true;
+		for (uint32_t g = 0; g < 40; g++)
+			all &= treeMap(w, V + (g + 1ull) * G - 0x2000, MC + 0x400000 + g * 0x10000ull, 0x4000);
+		for (uint32_t g = 0; g < 40; g++)
+			all &= treeResolves(w, V + (g + 1ull) * G - 0x2000, MC + 0x400000 + g * 0x10000ull, 0x4000);
+		f += check(all && w.sp.pages() > 40 * 2, "tree: 40 straddles of consecutive 1 GiB lines (a 40 GiB client) all translate");
+		w.close();
+		f += check(w.chunksLive == 0 && w.shadowLive == 0, "tree: close returns everything");
+	}
+
+	// The directory: collisions, duplicates, misses.
+	{
+		static PtPages::Directory d;
+		d.init();
+		bool ok2 = true;
+		for (uint16_t i = 0; i < 2048; i++)
+			ok2 &= d.insert(0x1000000000ull + i * 512ull, i);
+		for (uint16_t i = 0; i < 2048; i++)
+			ok2 &= d.find(0x1000000000ull + i * 512ull) == i;
+		f += check(ok2 && d.find(12345) == -1 && !d.insert(0x1000000000ull, 7), "directory: 2048 keys found, a miss is -1, a duplicate is refused");
+	}
+
+	// Mutation switch (the checker of the checks): a tree that forgets to mark pages dirty must be caught by the walk over the synced VRAM.
+	{
+		static TreeEnv m;
+		m = TreeEnv {};
+		m.open(PtPages::kMaxPages);
+		m.dropDirty = true;
+		const bool mapped = treeMap(m, V, MC, 0x2000);
+		f += check(mapped && !treeResolves(m, V, MC, 0x2000), "mutation check: if the walker forgot Tree::dirty the GPU's view would fault (the test sees it)");
+		m.close();
+	}
+	e.close();
+	f += check(e.chunksLive == 0 && e.shadowLive == 0, "tree: close returns every chunk and shadow page");
+	printf("sparse tree: multi-level layout ok (VA beyond 1 GiB, quota, dirty sync, negative control)\n");
+	return f;
 }
 
 int main(int argc, char **argv) {
@@ -3051,6 +3218,7 @@ int main(int argc, char **argv) {
 	failures += testVmidPool();
 	failures += testPtPages();
 	failures += testVmTableDifferential();
+	failures += testSparseTree();
 	failures += testLinuxRefFormat();
 
 	if (failures) {
