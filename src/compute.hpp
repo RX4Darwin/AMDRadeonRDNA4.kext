@@ -403,13 +403,15 @@ private:
 	bool stageGfxDraw();
 	// W37 (rootcause-draw.md #1-#4).
 	void gfxSrmEnable();                     // RLC_SRM_CNTL |= AUTO_INCR_ADDR | SRM_ENABLE after the CSB init, as amdgpu
+	void gfxLinuxDiff(const char *tag);      // W42: the VM/queue/RLC/CP registers next to what Linux 7.2.2 reads on this card
 	void gfxClearStatePre();                 // W39: clear-state registers before the first CSB replay (CP view + MMIO)
 	void gfxEmitCsbReplay();                 // the clear-state extents as SET_CONTEXT_REG on the ring before the draw
 	void gfxContextDump(const char *tag);    // MMIO read of the clear-state registers and their neighbours
 	void gfxQueueEvidence(const char *tag);  // MQD / HQD / RS64 local-base registers the kext never programs
-	void gfxMapVa0();                        // VMID0 VA 0 -> a private zeroed page (rdna4-gfxprobe=1), flushes the GC TLB
+	void gfxMapVa0();                        // VMID0 VA 0 -> a private zeroed page (own opt-in rdna4-gfxva0=1), flushes the GC TLB
 	void gfxDumpVa0(const char *tag);        // what the CP wrote at VA 0
 	void gfxPstatReport(const char *label);  // deltas of the two SAMPLE_PIPELINESTAT buffers
+	static bool requestedGfxVa0();           // rdna4-gfxva0=1: map VMID0 VA 0 (own opt-in since W41, not part of rdna4-gfxprobe)
 	static bool requestedGfxSrm();           // rdna4-gfxsrm=0 turns SRM off (A/B control)
 	static bool requestedGfxCsbReplay();     // rdna4-gfxcsb=0 turns the replay off (A/B control)
 	struct GfxDrawResult {

@@ -81,3 +81,20 @@ This encodes the round-4 hypothesis (like `gfx-golden-strict`): a pass says the 
 | `VA 0: ... (PTE ..., IS_PTE set); GC TLB flush NOT acked` | the flush is never acked on this card and the ack is not required; the mapping needs IS_PTE (bit 63, W36) or it is a directory entry and does nothing; a silent VA-0 fault afterwards means the mapping took effect; the mapping stays for the boot, so a probe boot is not a clean fault-status baseline |
 
 The `draw probe mid` clear-state line is read AFTER the replay: with the replay on it reads 0 whatever SRM did, so only boot 6 (no replay) or the pre-replay line attribute #1. The 1024-register context dump runs for the baseline and the first variant only.
+
+## 8. W41 (premetal/verify-draw.md): the clean boot 3
+
+An adversarial verification rates the SRM/CSB fix **DOUBTFUL (~12%)**: of the 49 CSB registers the stream never writes, 32 are gfx12's implicit viewport scissor (off in the stream), most of the
+rest are gated off by the stream's own state (HiZ off, ZCLIP_PROG_NEAR off, CLIPRECT_RULE 0xffff, binning disabled); only `PA_RATE_CNTL` and `CONTEXT_RESERVED_REG0/1` could matter. SRM is amdgpu's
+CGPG/gfxoff save/restore engine (its enable is inherited from gfx10/11, where ring `CLEAR_STATE` initialised the context), and gfx12 has no CP clear-state mechanism at all. Also,
+`rootcause-draw.md` 1.5 was wrong: the garbage readback was taken AFTER draw 1 (corrected there). So round 5's value for the triangle is **diagnosis**, and boot 3 is made as clean as possible:
+
+- **`rdna4-gfxva0=1`** (own opt-in, not in boots 3/6): `gfxMapVa0`/`gfxDumpVa0` no longer ride on `rdna4-gfxprobe`, so the baseline draw is not confounded by a VA-0 mapping.
+- **First lines after every draw** (baseline and every ladder variant): `pipeline statistics say: ...` then the NGG marker line (the marker only exists in variant 32; the clean baseline says so and variant 32 is the
+  first ladder draw), then the evidence. Pipeline statistics run in every draw of a probe boot.
+- **`VGT_PRIMITIVE_TYPE`**: it reads 0 over MMIO on the card while the stream writes 4 (TRILIST). Each draw now prints `VGT_PRIMITIVE_TYPE: CP view mid/post, the stream wrote, MMIO` (COPY_DATA of uconfig `0x242`).
+  radeonsi writes it with a plain `SET_UCONFIG_REG` (`si_state_draw.cpp:1277-1278`); RADV with `SET_UCONFIG_REG_INDEX` (opcode `0x7a`), **index 1** in bits `[31:28]` of the offset dword
+  (`radv_cmd_buffer.c:4685`, `ac_cmdbuf.h ac_cmdbuf_set_ucfg_reg_idx`). New ladder variant **64** patches the stream's packet the same way (`header 0xc0017900 -> 0xc0017a00`, offset `0x242 -> 0x10000242`); a probe boot's ladder
+  is now 32, 64, 8, 2, 1, 4. `DI_PT_NONE` would give exactly "fence, no pixel wave": if the CP view of the primitive type is 0 while the stream wrote 4, the plain packet did not latch on gfx12.
+- Reading boot 3 first: `pipeline statistics say` (IA = 0: GE/queue A1/B; C_INV > 0 and C_PRIM = 0: clip/cull; C_PRIM > 0 and PS = 0: SC/raster state), then `VGT_PRIMITIVE_TYPE`, then the NGG marker
+  (variant 32), then `clear state BEFORE any CSB replay` (the first silicon read of a CSB register).
