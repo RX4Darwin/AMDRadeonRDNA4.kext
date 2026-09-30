@@ -6,6 +6,9 @@
 // 1 -> (0.5,-0.5), 2 -> (0,0.5), z 0, w 1, a constant red PS. The target is
 // read back and the red pixels counted (the kext wants 8192).
 //
+// TRI_COLOR=1 draws the G4 triangle instead: tri_col.vert / tri_col.frag, vertex 0 red, 1 green, 2 blue, interpolated by
+// the PS; the readback is then checked against the exact barycentric colour of every covered pixel (see checkColour).
+//
 // Build and run: tools/radv-triangle/run.sh (dumps with RADV_DEBUG).
 
 #include <vulkan/vulkan.h>
@@ -13,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #define W 256
 #define H 256
@@ -52,11 +56,56 @@ static VkShaderModule loadShader(VkDevice dev, const char *path) {
 	return m;
 }
 
+// The G4 check. Vertices in pixels: v0 (64,64) red, v1 (192,64) green, v2 (128,192) blue (viewport 256x256, NDC (-.5,-.5) (.5,-.5) (0,.5)).
+// For each covered pixel (alpha 0xFF) the expected colour is 255 * barycentrics at the pixel centre. Reports the measured tolerances:
+// the largest |channel - expected| over all pixels, the largest |R+G+B - 255|, and the colours at the vertex-nearest and centroid pixels.
+// Returns 0 when every pixel is within `tol` of the exact barycentric colour and the vertex/centroid spot checks hold.
+static int checkColour(const uint32_t *px, uint32_t covered) {
+	const double x0 = 64, y0 = 64, x1 = 192, y1 = 64, x2 = 128, y2 = 192;
+	const double den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+	double maxErr = 0, maxSum = 0;
+	uint32_t n = 0, bad = 0, ownDominant = 0;
+	for (uint32_t y = 0; y < H; y++)
+		for (uint32_t x = 0; x < W; x++) {
+			uint32_t v = px[y * W + x];
+			if (!v)
+				continue;
+			n++;
+			const double cx = x + 0.5, cy = y + 0.5;
+			const double l0 = ((y1 - y2) * (cx - x2) + (x2 - x1) * (cy - y2)) / den;
+			const double l1 = ((y2 - y0) * (cx - x2) + (x0 - x2) * (cy - y2)) / den;
+			const double l2 = 1.0 - l0 - l1;
+			const double e[3] = { 255 * l0, 255 * l1, 255 * l2 };
+			const int c[3] = { v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff };
+			if ((v >> 24) != 0xff)
+				bad++;
+			int sum = c[0] + c[1] + c[2];
+			if (fabs(sum - 255.0) > maxSum) maxSum = fabs(sum - 255.0);
+			for (int k = 0; k < 3; k++)
+				if (fabs(c[k] - e[k]) > maxErr) maxErr = fabs(c[k] - e[k]);
+			int dom = c[0] >= c[1] && c[0] >= c[2] ? 0 : c[1] >= c[2] ? 1 : 2;
+			int want = l0 >= l1 && l0 >= l2 ? 0 : l1 >= l2 ? 1 : 2;
+			ownDominant += dom == want;
+		}
+	const uint32_t near0 = px[65 * W + 66], near1 = px[65 * W + 189], near2 = px[188 * W + 128], cen = px[106 * W + 128];
+	printf("colour: %u covered pixels (want %u), %u with alpha != 0xFF\n", n, covered, bad);
+	printf("colour: max |channel - exact barycentric| %.2f, max |R+G+B - 255| %.0f, dominant channel = nearest vertex's in %u/%u pixels\n",
+	       maxErr, maxSum, ownDominant, n);
+	printf("colour: near v0 (66,65) 0x%08x  near v1 (189,65) 0x%08x  near v2 (128,188) 0x%08x  centroid (128,106) 0x%08x (want ~85,85,85)\n",
+	       near0, near1, near2, cen);
+	const int ok = n == covered && !bad && maxErr <= 3.0 && maxSum <= 3.0 && ownDominant == n &&
+	               (near0 & 0xff) > 200 && ((near1 >> 8) & 0xff) > 200 && ((near2 >> 16) & 0xff) > 200 &&
+	               abs((int)(cen & 0xff) - 85) <= 6 && abs((int)((cen >> 8) & 0xff) - 85) <= 6 && abs((int)((cen >> 16) & 0xff) - 85) <= 6;
+	printf("colour: %s\n", ok ? "THE COLOUR TRIANGLE IS RIGHT" : "wrong colour image");
+	return !ok;
+}
+
 int main(int argc, char **argv) {
 	const char *dir = argc > 1 ? argv[1] : ".";
 	char vsPath[4096], fsPath[4096];
-	snprintf(vsPath, sizeof(vsPath), "%s/tri.vert.spv", dir);
-	snprintf(fsPath, sizeof(fsPath), "%s/tri.frag.spv", dir);
+	const int colour = getenv("TRI_COLOR") != NULL;
+	snprintf(vsPath, sizeof(vsPath), "%s/%s.vert.spv", dir, colour ? "tri_col" : "tri");
+	snprintf(fsPath, sizeof(fsPath), "%s/%s.frag.spv", dir, colour ? "tri_col" : "tri");
 
 	VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "radv-triangle", 1, NULL, 0, VK_API_VERSION_1_3 };
 	VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 0, NULL };
@@ -221,11 +270,13 @@ int main(int argc, char **argv) {
 	uint32_t *px;
 	CHECK(vkMapMemory(dev, bufMem, 0, W * H * 4, 0, (void **)&px));
 	uint32_t red = 0, other = 0, minX = W, maxX = 0, minY = H, maxY = 0;
+	uint32_t coveredAny = 0;
 	for (uint32_t y = 0; y < H; y++)
 		for (uint32_t x = 0; x < W; x++) {
 			uint32_t v = px[y * W + x];
 			if (!v)
 				continue;
+			coveredAny++;
 			if (v == 0xFF0000FFu) red++; else other++;
 			if (x < minX) minX = x;
 			if (x > maxX) maxX = x;
@@ -244,8 +295,11 @@ int main(int argc, char **argv) {
 			(unsigned long long)s[3], (unsigned long long)s[4], (unsigned long long)s[5]);
 	}
 
+	const int colourBad = colour ? checkColour(px, 8192) : 0;
 	vkDeviceWaitIdle(dev);
 	vkDestroyDevice(dev, NULL);
 	vkDestroyInstance(inst, NULL);
+	if (colour)
+		return colourBad || coveredAny != 8192 ? 2 : 0;
 	return red == 8192 ? 0 : 2;
 }

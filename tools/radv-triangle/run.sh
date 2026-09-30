@@ -3,6 +3,8 @@
 # pixel count + pipeline stats, the shader ISA/config (RADV_DEBUG=shaders)
 # and the command stream (RADV_DEBUG=dumpibs). No root needed.
 #   tools/radv-triangle/run.sh [outdir]
+# TRI_COLOR=1 draws the G4 colour triangle (tri_col.vert/.frag) and checks every pixel's colour
+# (docs/g4-colour.md); the output goes to $OUT/<variant>/ as usual.
 # Variants: default (RADV's choice), nonggc (NGG culling off = passthrough,
 # like shaders/ngg.s).
 set -eu
@@ -12,7 +14,9 @@ VKH=${VULKAN_HEADERS:-$HOME/work/tools/vulkan-headers/include}
 mkdir -p "$OUT"
 glslc -o "$OUT/tri.vert.spv" "$HERE/tri.vert"
 glslc -o "$OUT/tri.frag.spv" "$HERE/tri.frag"
-cc -O1 -g -Wall -I"$VKH" -o "$OUT/radv-triangle" "$HERE/radv-triangle.c" -lvulkan
+glslc -o "$OUT/tri_col.vert.spv" "$HERE/tri_col.vert"
+glslc -o "$OUT/tri_col.frag.spv" "$HERE/tri_col.frag"
+cc -O1 -g -Wall -I"$VKH" -o "$OUT/radv-triangle" "$HERE/radv-triangle.c" -lvulkan -lm
 { uname -a; pacman -Q mesa linux-firmware 2>/dev/null || true; } > "$OUT/env.txt"
 for v in default nonggc; do
 	dbg=shaders,dumpibs
