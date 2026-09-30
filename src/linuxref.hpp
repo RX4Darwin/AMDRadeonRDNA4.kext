@@ -15,7 +15,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+// snprintf: the kext builds with -nostdinc and MacKernelSDK has no top-level stdio.h (only sys/stdio.h); an unqualified <stdio.h> there
+// resolves to libc++'s wrapper, which does not declare snprintf, so the header only compiled when another header had already pulled
+// libkern in first (W44). KERNEL is defined by the kext build (-DKERNEL); the host test (tools/atomdump.cpp) is a plain userland build.
+#ifdef KERNEL
+#include <libkern/libkern.h>
+#else
 #include <stdio.h>
+#endif
 
 #include "gfxregs.hpp"
 
