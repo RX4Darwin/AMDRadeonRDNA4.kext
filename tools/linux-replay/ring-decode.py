@@ -19,8 +19,15 @@ for f in sorted(glob.glob(os.path.join(out, 'amdgpu_ring_gfx*.bin'))):
     ring = list(struct.unpack_from(f'<{(len(raw) - 12) // 4}I', raw, 12))
     n = len(ring)
     hits = [i for i in range(n) if (ring[i] >> 8) & 0xff == 0x3f and ring[i] >> 30 == 3
-            and (ring[(i + 1) % n] | ring[(i + 2) % n] << 32) & ~3 == ibva]
+            and (ring[(i + 1) % n] | (ring[(i + 2) % n] & 0xffff) << 32) & ~3 == ibva & 0xffffffffffff]   # IB_BASE_HI: 16 address bits
     print(f'== {os.path.basename(f)}: {n} dwords, rptr {rptr} wptr {wptr}; our IB at {hits}')
+    if not hits:
+        # ours was overwritten (the desktop wraps a 2048-dword ring within milliseconds): every user gfx IB
+        # gets the same wrapping, so decode the newest one before the write pointer instead
+        ibs = [i for i in range(n) if ring[i] >> 30 == 3 and (ring[i] >> 8) & 0xff == 0x3f and (ring[i] >> 16) & 0x3fff == 2]
+        if ibs:
+            hits = [max(ibs, key=lambda i: (i - wptr) % n)]
+            print(f'   our IB is gone; decoding the newest user IB instead, at {hits[0]} (VMID {(ring[(hits[0] + 3) % n] >> 24) & 0xf})')
     def plen(hdr):
         # amdgpu pads rings with PACKET3(NOP, 0x3fff) = 0xffff1000, which the CP consumes as ONE dword
         if hdr == 0xffff1000 or hdr >> 30 != 3:
@@ -55,6 +62,6 @@ for f in sorted(glob.glob(os.path.join(out, 'amdgpu_ring_gfx*.bin'))):
                 continue
             op, cnt = (hdr >> 8) & 0xff, (hdr >> 16) & 0x3fff
             body = [ring[(i + 1 + k) % n] for k in range(cnt + 1)]
-            mark = '  <== OUR IB' if i % n == h else ''
+            mark = '  <== THE IB' if i % n == h else ''
             print(f'  {i % n:6d}: {hdr:08x} {NAMES.get(op, hex(op)):22s} ' + ' '.join(f'{d:08x}' for d in body[:12]) + (' ...' if len(body) > 12 else '') + mark)
             i += plen(hdr)
