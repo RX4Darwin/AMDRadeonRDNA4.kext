@@ -35,6 +35,7 @@
 #include "ngg_kernel.h"
 #include "nggmsg_kernel.h"
 #include "nggstore_kernel.h"
+#include "nggvgpr_kernel.h"
 #include "pm4.hpp"
 #include "psred_kernel.h"
 #include "psstore_kernel.h"
@@ -404,7 +405,7 @@ uint32_t RDNA4Compute::requestedGfxDiag() {
 	uint32_t mask = 0;
 	if (!PE_parse_boot_argn("rdna4-gfxdiag", &mask, sizeof(mask)))
 		return 0;
-	return mask & 0x7f;   // bits 1,2,4,8,32,64 = variants, 16 = run them even if the baseline passed
+	return mask & 0x3ff;   // bits 1,2,4,8,32,64,128,256,512 = variants, 16 = run them even if the baseline passed
 }
 
 namespace {
@@ -915,6 +916,8 @@ void RDNA4Compute::gfxPstatReport(const char *label) {
 	}
 	if (n)
 		GLOG("%s: pipeline statistics: %s", label, line);
+	for (uint32_t i = 0; i < 8; i++)
+		gfxPstatLast[i] = d[i];
 	const uint64_t ps = d[0], cprim = d[1], cinv = d[2], iaPrim = d[6], iaVert = d[7];
 	const char *where = !allWritten ? "the SAMPLE_PIPELINESTAT events wrote nothing (counters unavailable on this path)"
 	                  : (!iaVert && !iaPrim) ? "IA = 0: the GE dropped the draw (queue mode / VA 0, #2)"
@@ -988,6 +991,154 @@ void RDNA4Compute::gfxLinuxDiff(const char *tag) {
 		GLOG("%s: linux diff: %s", tag, line);
 	}
 	GLOG("%s: linux diff: %u registers compared with the Linux 7.2.2 capture (vkcube), %u differ (the ones listed above)", tag, compared, differ);
+}
+
+// ---------------------------------------------------------------------------
+// W45: the clip / cull / viewport / scissor state of the first draw (round 5 boot 3 on the card: IA_PRIMITIVES 1, VS_INVOCATIONS 3,
+// C_INVOCATIONS 1, C_PRIMITIVES 0, PS_INVOCATIONS 0, the NGG wave ran: the primitive is dropped in the clipper / primitive assembly).
+// ---------------------------------------------------------------------------
+
+// rdna4-gfxsane=0 leaves the explicit "sane clip state" block out (the A/B control).
+bool RDNA4Compute::requestedGfxSane() {
+	uint32_t v = 1;
+	return !(PE_parse_boot_argn("rdna4-gfxsane", &v, sizeof(v)) && v == 0);
+}
+
+// The front-end registers the draw stream (Mesa's gfx12 preamble + one triangle) leaves at whatever the context holds: the implicit
+// viewport scissor rectangles (PA_SC_VPORT_0..15_TL/BR), the user clip planes, the programmable near-clip Z, the four cliprects, the
+// scissors of viewports 1..15, the polygon offset, stereo, line stipple, tessellation and streamout offsets. On the card the context
+// SRAM powers up with garbage and the CSB/SRM/replay only zero the CSB extents (62 registers); everything else the stream does not write
+// (335 registers) stays garbage. Each one is gated off by the stream's own state for this draw (verify-draw.md: implicit scissor
+// disabled, HiZ off, ZCLIP_PROG_NEAR off, CLIPRECT_RULE 0xffff, one viewport, no UCP, no poly offset), but "gated off" is an
+// argument, not a measurement, so they are all written explicitly before the draw to their neutral value: rectangles are the full
+// screen (0,0)..(0xffff,0xffff), everything else 0. Emitted right before the draw IB, after the CSB replay; the stream's own writes
+// (Mesa's values) come later and win for the overlaps. rdna4-gfxsane=0 leaves it out.
+void RDNA4Compute::gfxEmitSaneClip() {
+	uint32_t buf[64], vals[40];
+	uint32_t packets = 0, regs = 0, dwords = 0;
+	auto put = [&](uint32_t offset, uint32_t count, bool rect) {
+		for (uint32_t i = 0; i < count; i++)
+			vals[i] = rect ? ((i & 1) ? 0xffffffffu : 0u) : 0u;   // rect: TL = 0, BR = 0xffffffff
+		const uint32_t n = Pm4::setContextRegs(buf, offset, vals, count);
+		gfxRing.emit(buf, n);
+		packets++;
+		regs += count;
+		dwords += n;
+	};
+	put(0x040, 32, true);    // PA_SC_VPORT_0..15_TL/BR: the implicit viewport scissor rectangles
+	put(0x084, 8, true);     // PA_SC_CLIPRECT_0..3_TL/BR
+	put(0x096, 30, true);    // PA_SC_VPORT_SCISSOR_1..15_TL/BR (viewport 0's is the stream's)
+	put(0x0b4, 24, false);   // PA_CL_UCP_0..5_X/Y/Z/W
+	put(0x0cc, 1, false);    // PA_CL_PROG_NEAR_CLIP_Z
+	put(0x0dd, 4, false);    // PA_SC_CLIPRECT_0..3_EXT
+	put(0x2de, 6, false);    // PA_SU_POLY_OFFSET_DB_FMT_CNTL, _CLAMP, FRONT/BACK SCALE/OFFSET
+	put(0x211, 1, false);    // PA_STATE_STEREO_X
+	put(0x283, 1, false);    // PA_SC_LINE_STIPPLE
+	put(0x291, 1, false);    // PA_SC_LINE_STIPPLE_RESET
+	put(0x2a9, 1, false);    // VGT_TF_PARAM
+	put(0x2cb, 2, false);    // VGT_STRMOUT_DRAW_OPAQUE_BUFFER_FILLED_SIZE, _VERTEX_STRIDE
+	put(0x2d6, 1, false);    // VGT_LS_HS_CONFIG
+	GLOG("sane clip state: %u packets, %u registers, %u ring dwords before the draw (rectangles full screen, the rest 0)",
+	     packets, regs, dwords);
+}
+
+namespace {
+
+// The clip / cull / viewport / scissor / front-end registers read back through the CP right after the draw (COPY_DATA on the ring):
+// what the CP holds for the draw that was just dropped. dword = the register in GC segment 1 (context: the context offset;
+// uconfig: 0x2000 + the uconfig offset). The stream's own value (or the sane block's neutral value) is the expectation.
+struct ClipReg { const char *name; uint16_t dword; uint32_t sane; bool hasSane; };
+const ClipReg kClip[] = {
+	{ "PA_CL_CLIP_CNTL", 0x204, 0, false }, { "PA_CL_VTE_CNTL", 0x205, 0, false }, { "PA_CL_VS_OUT_CNTL", 0x206, 0, false },
+	{ "PA_SU_SC_MODE_CNTL", 0x207, 0, false }, { "PA_CL_NANINF_CNTL", 0x208, 0, false },
+	{ "PA_SU_PRIM_FILTER_CNTL", 0x20b, 0, false }, { "PA_SU_SMALL_PRIM_FILTER_CNTL", 0x20c, 0, false },
+	{ "PA_CL_NGG_CNTL", 0x20e, 0, false }, { "PA_CL_VRS_CNTL", 0x212, 0, false },
+	{ "PA_SC_MODE_CNTL_0", 0x292, 0, false }, { "PA_SC_MODE_CNTL_1", 0x293, 0, false }, { "PA_SU_VTX_CNTL", 0x2f9, 0, false },
+	{ "PA_CL_GB_VERT_CLIP_ADJ", 0x10b, 0, false }, { "PA_CL_GB_VERT_DISC_ADJ", 0x10c, 0, false },
+	{ "PA_CL_GB_HORZ_CLIP_ADJ", 0x10d, 0, false }, { "PA_CL_GB_HORZ_DISC_ADJ", 0x10e, 0, false },
+	{ "PA_CL_VPORT_XSCALE", 0x10f, 0, false }, { "PA_CL_VPORT_XOFFSET", 0x110, 0, false },
+	{ "PA_CL_VPORT_YSCALE", 0x111, 0, false }, { "PA_CL_VPORT_YOFFSET", 0x112, 0, false },
+	{ "PA_CL_VPORT_ZSCALE", 0x113, 0, false }, { "PA_CL_VPORT_ZOFFSET", 0x114, 0, false },
+	{ "PA_SC_VPORT_ZMIN_0", 0x115, 0, false }, { "PA_SC_VPORT_ZMAX_0", 0x116, 0, false },
+	{ "PA_SC_VPORT_SCISSOR_0_TL", 0x094, 0, false }, { "PA_SC_VPORT_SCISSOR_0_BR", 0x095, 0, false },
+	{ "PA_SC_SCREEN_SCISSOR_TL", 0x060, 0, false }, { "PA_SC_SCREEN_SCISSOR_BR", 0x061, 0, false },
+	{ "PA_SC_GENERIC_SCISSOR_TL", 0x090, 0, false }, { "PA_SC_GENERIC_SCISSOR_BR", 0x091, 0, false },
+	{ "PA_SC_WINDOW_SCISSOR_TL", 0x081, 0, false }, { "PA_SC_WINDOW_SCISSOR_BR", 0x082, 0, false },
+	{ "PA_SC_WINDOW_OFFSET", 0x080, 0, false }, { "PA_SC_CLIPRECT_RULE", 0x083, 0, false },
+	{ "PA_SU_HARDWARE_SCREEN_OFFSET", 0x08d, 0, false }, { "PA_SC_EDGERULE", 0x08c, 0, false },
+	{ "PA_SC_VPORT_0_TL", 0x040, 0, false }, { "PA_SC_VPORT_0_BR", 0x041, 0xffffffffu, true },
+	{ "PA_SC_CLIPRECT_0_TL", 0x084, 0, true }, { "PA_SC_CLIPRECT_0_BR", 0x085, 0xffffffffu, true },
+	{ "PA_CL_UCP_0_X", 0x0b4, 0, true }, { "PA_CL_PROG_NEAR_CLIP_Z", 0x0cc, 0, true },
+	{ "PA_SU_POLY_OFFSET_DB_FMT_CNTL", 0x2de, 0, true },
+	{ "PA_SC_BINNER_CNTL_0", 0x311, 0, false }, { "PA_SC_NGG_MODE_CNTL", 0x314, 0, false },
+	{ "GE_MAX_OUTPUT_PER_SUBGROUP", 0x1ff, 0, false }, { "VGT_GS_MAX_VERT_OUT", 0x2ce, 0, false },
+	{ "GE_NGG_SUBGRP_CNTL", 0x2d3, 0, false },
+	{ "GE_CNTL", 0x225b, 0, false }, { "GE_STEREO_CNTL", 0x225f, 0, false }, { "VGT_GS_OUT_PRIM_TYPE", 0x2266, 0, false },
+	{ "VGT_PRIMITIVEID_EN", 0x2262, 0, false },
+};
+constexpr uint32_t kClipCount = sizeof(kClip) / sizeof(kClip[0]);
+static_assert(kClipCount <= 64, "clip probe table larger than its buffer");
+
+uint32_t clipOpcode(const ClipReg &c) { return c.dword >= 0x2000 ? 0x79 : 0x69; }
+uint32_t clipOffset(const ClipReg &c) { return c.dword >= 0x2000 ? c.dword - 0x2000u : c.dword; }
+
+} // namespace
+
+// One COPY_DATA per register into the buffer at `poolOff` (slot i = kClip[i]); emitted after the draw IB.
+void RDNA4Compute::gfxEmitClipProbe(uint32_t poolOff) {
+	uint32_t pkt[16];
+	for (uint32_t i = 0; i < kClipCount; i++) {
+		uint32_t byteOff = 0;
+		if (!env.disc || !env.disc->regByteOffset(IpDiscovery::HwGc, 0, 1, kClip[i].dword, byteOff))
+			continue;   // the slot keeps its sentinel
+		gfxRing.emit(pkt, Pm4::copyDataRegToMem(pkt, byteOff / 4, poolMc(poolOff + 4 * i)));
+	}
+}
+
+// What the CP holds for the dropped draw: every register, the ones that differ from what the stream (or the sane block) wrote, and
+// the kill/cull switches spelled out.
+void RDNA4Compute::gfxClipReport(const char *label, uint32_t poolOff, volatile uint32_t *ib) {
+	constexpr uint32_t n = sizeof(Gfx12Draw::kStream) / 4;
+	char line[240], diff[300];
+	uint32_t len = 0, equal = 0, compared = 0, dl = 0, ndiff = 0;
+	line[0] = diff[0] = '\0';
+	uint32_t clipCntl = 0, modeCntl = 0, primFilter = 0, smallFilter = 0, vte = 0;
+	for (uint32_t i = 0; i < kClipCount; i++) {
+		const uint32_t val = *poolDw(poolOff + 4 * i);
+		const uint32_t dw = kClip[i].dword;
+		if (dw == 0x204) clipCntl = val;
+		if (dw == 0x207) modeCntl = val;
+		if (dw == 0x20b) primFilter = val;
+		if (dw == 0x20c) smallFilter = val;
+		if (dw == 0x205) vte = val;
+		len += snprintf(line + len, sizeof(line) - len, "%s=0x%08x ", kClip[i].name, val);
+		if (len > 150) {
+			GLOG("%s: clip state (CP view after the draw): %s", label, line);
+			len = 0;
+			line[0] = '\0';
+		}
+		const int at = findStreamReg(Gfx12Draw::kStream, n, clipOpcode(kClip[i]), clipOffset(kClip[i]));
+		if (at < 0 && !kClip[i].hasSane)
+			continue;
+		const uint32_t want = at >= 0 ? ib[at] : kClip[i].sane;
+		compared++;
+		if (val == want) {
+			equal++;
+		} else if (ndiff++ < 8 && dl < sizeof(diff) - 70) {
+			dl += snprintf(diff + dl, sizeof(diff) - dl, "%s got 0x%08x want 0x%08x; ", kClip[i].name, val, want);
+		}
+	}
+	if (len)
+		GLOG("%s: clip state (CP view after the draw): %s", label, line);
+	GLOG("%s: clip state: %u of %u registers equal what the stream / the sane block wrote%s%s", label, equal, compared,
+	     ndiff ? "; differ: " : "", diff);
+	// The switches that drop a primitive in the clipper / setup, spelled out (bit numbers from gfx12.json).
+	GLOG("%s: clip switches: CLIP_DISABLE %u VTX_KILL_OR %u DX_RASTERIZATION_KILL %u DX_CLIP_SPACE_DEF %u ZCLIP_NEAR_DISABLE %u "
+	     "ZCLIP_FAR_DISABLE %u | CULL_FRONT %u CULL_BACK %u FACE %u POLY_MODE %u | VTE scale/offset enables 0x%02x W0_FMT %u | "
+	     "prim filter TRI_DISABLE %u small-prim filter %s%s", label,
+	     (clipCntl >> 16) & 1, (clipCntl >> 21) & 1, (clipCntl >> 22) & 1, (clipCntl >> 19) & 1, (clipCntl >> 26) & 1,
+	     (clipCntl >> 27) & 1, modeCntl & 1, (modeCntl >> 1) & 1, (modeCntl >> 2) & 1, (modeCntl >> 3) & 3, vte & 0x3f,
+	     (vte >> 10) & 1, primFilter & 1, (smallFilter & 1) ? "on" : "off", (smallFilter & 2) ? " (triangles exempt)" : "");
 }
 
 // The GC hub fault status, logged and cleared, so the log says which bring-up step first makes the
@@ -1114,6 +1265,8 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		place(kGfxVsOffset, kNggmsgKernel, sizeof(kNggmsgKernel) / 4);
 	else if (variant & 32)   // W37 #4: the NGG shader that stores a marker before anything else
 		place(kGfxVsOffset, kNggstoreKernel, sizeof(kNggstoreKernel) / 4);
+	else if (variant & 512)   // W45: the NGG shader that stores what it gets and computes, per lane
+		place(kGfxVsOffset, kNggvgprKernel, sizeof(kNggvgprKernel) / 4);
 	else
 		place(kGfxVsOffset, kNggKernel, sizeof(kNggKernel) / 4);
 	if (variant & 32) {   // the two literal dwords of its s_mov_b32 sN, literal carry the marker address
@@ -1130,6 +1283,16 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	else
 		place(kGfxPsOffset, kPsredKernel, sizeof(kPsredKernel) / 4);
 
+	if (variant & 512) {   // the eight literal dwords of nggvgpr.s carry the four array bases (0x80 bytes apart)
+		for (uint32_t i = 0; i < sizeof(kNggvgprKernel) / 4; i++) {
+			const uint32_t lit = *poolDw(kGfxVsOffset + 4 * i);
+			if (lit >= 0xdead0001u && lit <= 0xdead0008u) {
+				const uint32_t k = lit - 0xdead0001u;
+				const uint64_t base = poolMc(kGfxVgprOffset + 0x80 * (k / 2));
+				*poolDw(kGfxVsOffset + 4 * i) = (k & 1) ? static_cast<uint32_t>(base >> 32) : static_cast<uint32_t>(base);
+			}
+		}
+	}
 	// The command stream, its addresses filled in.
 	constexpr uint32_t n = sizeof(kStream) / 4;
 	volatile uint32_t *ib = poolDw(kGfxIbOffset);
@@ -1169,9 +1332,15 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 			     label, oldHdr, ib[at - 2], oldOff, ib[at - 1]);
 		}
 	}
-	if (variant & 32)   // the marker shader uses v8/v9: 10 VGPRs = 2 granules of 8 (VGPRS field = granules - 1)
+	if (variant & (32 | 512))   // the marker shader uses v8/v9: 10 VGPRs = 2 granules of 8 (VGPRS field = granules - 1)
 		patch(kOpSetShReg, 0x1a2a - kShBase, 0x0000003f, 1, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=1");
 
+	if (variant & 128)   // W45: PA_CL_CLIP_CNTL.CLIP_DISABLE: if the primitive survives, the clipper was dropping it
+		patch(kOpSetContextReg, 0x204, 0x00010000, 0x00010000, "PA_CL_CLIP_CNTL.CLIP_DISABLE=1");
+	if (variant & 256) {   // W45: the primitive filters off: PA_SU_PRIM_FILTER_CNTL disable bits 0-3, small-prim filter off
+		patch(kOpSetContextReg, 0x20b, 0x0000000f, 0x0000000f, "PA_SU_PRIM_FILTER_CNTL.*_FILTER_DISABLE=1");
+		patch(kOpSetContextReg, 0x20c, 0x00000001, 0x00000000, "PA_SU_SMALL_PRIM_FILTER_CNTL.SMALL_PRIM_FILTER_ENABLE=0");
+	}
 	// The target, cleared; the fences and the marker, zero.
 	for (uint32_t i = 0; i < kWidth * kHeight; i++)
 		*poolDw(kGfxTargetOffset + 4 * i) = 0;
@@ -1179,6 +1348,10 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	*poolDw(kGfxMarkerOffset) = 0;
 	for (uint32_t i = 0; i < 3; i++)
 		*poolDw(kGfxNggMarkOffset + 4 * i) = 0;
+	for (uint32_t i = 0; i < 128; i++)   // W45: the per-lane VGPR arrays (variant 512) and the clip-state readback slots
+		*poolDw(kGfxVgprOffset + 4 * i) = 0;
+	for (uint32_t i = 0; i < 64; i++)
+		*poolDw(kGfxClipOffset + 4 * i) = 0xdeadf00du;
 	flushHdp();
 	GLOG("%s: %u-dword stream at MC 0x%llx, VS 0x%llx PS 0x%llx, target 0x%llx, rings 0x%llx "
 	     "(%llu MiB)%s", label, n, poolMc(kGfxIbOffset), va[kVs], va[kPs], va[kCb], va[kAttrRing],
@@ -1193,6 +1366,8 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	}
 	if (requestedGfxCsbReplay())
 		gfxEmitCsbReplay();   // W37 #1: the draw never depends on SRM having applied the clear state
+	if (requestedGfxSane())
+		gfxEmitSaneClip();   // W45: every clip/cull/viewport/scissor register the stream leaves at power-up garbage, explicitly neutral
 	const bool pstat = requestedGfxProbe();
 	if (pstat) {   // W37 #4: pipeline statistics around the draw (both buffers pre-filled with a sentinel)
 		for (uint32_t i = 0; i < 28; i++) {
@@ -1217,6 +1392,8 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	} else {
 		gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, poolMc(kGfxIbOffset), n, 0));
 	}
+	if (split)
+		gfxEmitClipProbe(kGfxClipOffset);   // W45: the clip state as the CP holds it right after the draw
 	if (pstat)
 		gfxRing.emit(pkt, Pm4::eventWriteAddr(pkt, 0x1e | (2u << 8), poolMc(kGfxPstatPost)));
 	gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), ++gfxFence));
@@ -1228,8 +1405,12 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	r.ns = ns;
 	r.drawFence = *poolDw(kGfxDrawFenceOffset);
 	// W41 (verify-draw.md 7): the FIRST lines after a draw are the pipeline-statistics verdict and the NGG marker, then the evidence.
-	if (pstat && r.ringDone)
+	if (pstat && r.ringDone) {
 		gfxPstatReport(label);
+		r.cInv = static_cast<uint32_t>(gfxPstatLast[2]);
+		r.cPrim = static_cast<uint32_t>(gfxPstatLast[1]);
+		r.ps = static_cast<uint32_t>(gfxPstatLast[0]);
+	}
 	if (variant & 32) {   // W37 #4: did the NGG wave launch at all?
 		r.nggMarker = *poolDw(kGfxNggMarkOffset);
 		r.nggS2 = *poolDw(kGfxNggMarkOffset + 4);
@@ -1237,6 +1418,23 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		GLOG("%s: NGG marker 0x%08x (%s), s2 (gs_tg_info) 0x%08x, s3 (merged_wave_info) 0x%08x", label, r.nggMarker,
 		     r.nggMarker == 0xc0de0002u ? "the NGG wave ran and stored to memory" : "NOT written: the NGG wave did not run",
 		     r.nggS2, r.nggS3);
+	}
+	if (variant & 512) {   // W45: what the NGG wave got (v0, v3) and computed (x, y), lane by lane
+		uint32_t v0[4], v3[4], px[4], py[4];
+		for (uint32_t l = 0; l < 4; l++) {
+			v0[l] = *poolDw(kGfxVgprOffset + 4 * l);
+			v3[l] = *poolDw(kGfxVgprOffset + 0x80 + 4 * l);
+			px[l] = *poolDw(kGfxVgprOffset + 0x100 + 4 * l);
+			py[l] = *poolDw(kGfxVgprOffset + 0x180 + 4 * l);
+		}
+		GLOG("%s: NGG VGPRs per lane: v0 0x%08x 0x%08x 0x%08x 0x%08x | v3 (VertexID) %u %u %u %u | x 0x%08x 0x%08x 0x%08x 0x%08x | "
+		     "y 0x%08x 0x%08x 0x%08x 0x%08x", label, v0[0], v0[1], v0[2], v0[3], v3[0], v3[1], v3[2], v3[3], px[0], px[1],
+		     px[2], px[3], py[0], py[1], py[2], py[3]);
+		const bool vidOk = v3[0] == 0 && v3[1] == 1 && v3[2] == 2;
+		const bool posOk = px[0] == 0xbf000000u && px[1] == 0x3f000000u && px[2] == 0 && py[0] == 0xbf000000u &&
+		                   py[1] == 0xbf000000u && py[2] == 0x3f000000u;
+		GLOG("%s: NGG inputs say: VertexID %s the lane index (v3 = 0,1,2), the exported positions %s what ngg.s intends "
+		     "((-0.5,-0.5) (0.5,-0.5) (0,0.5))", label, vidOk ? "IS" : "is NOT", posOk ? "are" : "are NOT");
 	}
 	if (requestedGfxProbe() && !variant)
 		GLOG("%s: NGG marker: not part of the clean baseline (ngg.s); ladder variant 32 (marker) runs next if the draw is empty", label);
@@ -1260,6 +1458,8 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		snprintf(what, sizeof(what), "%s probe post", label);
 		gfxProbeReport(what, kGfxProbePost, ib);
 	}
+	if (split && r.ringDone)
+		gfxClipReport(label, kGfxClipOffset, ib);   // W45
 	static uint32_t ctxDumps = 0;   // W37 review NIT: the 1024-register dump only for the baseline and the first variant
 	if (requestedGfxProbe() && r.ringDone && ctxDumps++ < 2)
 		gfxContextDump(label);   // W37 #1: what the clear-state registers and their neighbours hold now
@@ -1382,9 +1582,9 @@ bool RDNA4Compute::stageGfxDraw() {
 	// The diagnostic ladder (rdna4-gfxdiag=<mask>, default off): the same stream with
 	// one open question changed at a time, each logged with the same evidence, so that
 	// round 4 sees which stage of the pipeline works. Only the baseline decides PASS.
-	const uint32_t diag = requestedGfxDiag() | (requestedGfxDiag() && requestedGfxProbe() ? (32u | 64u) : 0u);   // W37: the NGG marker joins the ladder of a probe boot
+	const uint32_t diag = requestedGfxDiag() | (requestedGfxDiag() && requestedGfxProbe() ? (32u | 64u | 128u | 256u | 512u) : 0u);   // W37: the NGG marker joins the ladder of a probe boot
 	if (diag && (!base.ok || (diag & 16))) {
-		char summary[200], probes[160];
+		char summary[400], probes[240];
 		summary[0] = probes[0] = '\0';
 		size_t used = 0, pused = 0;
 		if (base.probeSeen)   // W33 S2: 'probe mid' equal/compared, baseline next to every variant
@@ -1393,7 +1593,9 @@ bool RDNA4Compute::stageGfxDraw() {
 		// (2, 1), and the GS_ALLOC_REQ shader (4) last: it can hang the NGG pipeline and there is
 		// no reset (W23 review S3), so boot 12 runs it alone (rdna4-gfxdiag=4). After a "hang/"
 		// result the next boot needs a cold power cycle: the GC state survives a warm restart.
-		static const uint32_t order[6] = { 32, 64, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
+		// W45: the clip variants (128 clip off, 256 primitive filters off) and the NGG inputs (512) right after the marker: round 5 showed the
+		// primitive reaches the clipper (C_INVOCATIONS 1) and is dropped there (C_PRIMITIVES 0).
+		static const uint32_t order[9] = { 32, 128, 256, 512, 64, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
 		for (uint32_t bit : order) {
 			if (!(diag & bit))
 				continue;
@@ -1406,6 +1608,8 @@ bool RDNA4Compute::stageGfxDraw() {
 			if (bit == 8 && did)
 				used += snprintf(summary + used, sizeof(summary) - used, "/marker %s",
 				                 r.marker == kMarkerValue ? "yes" : "no");
+			if ((bit == 32 || bit == 128 || bit == 256 || bit == 512) && did && r.probeSeen)
+				used += snprintf(summary + used, sizeof(summary) - used, "/cprim %u", r.cPrim);
 			if (bit == 64 && did)
 				used += snprintf(summary + used, sizeof(summary) - used, "/primtype-idx");
 			if (bit == 32 && did)

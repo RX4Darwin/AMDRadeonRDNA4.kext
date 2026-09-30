@@ -399,10 +399,17 @@ private:
 	static constexpr uint32_t kGfxPstatPost    = kGfxRptrOffset + 0x400;
 	static constexpr uint32_t kGfxNggMarkOffset = kGfxRptrOffset + 0x500;
 	static constexpr uint32_t kGfxVa0Offset    = kGfxOffset + 0x80000;    // 4 KiB, page aligned
+	static constexpr uint32_t kGfxClipOffset   = kGfxRptrOffset + 0x600;  // W45: clip-state readback, 64 dwords
+	static constexpr uint32_t kGfxVgprOffset   = kGfxRptrOffset + 0x800;  // W45: per-lane VGPR arrays of variant 512, 4 x 0x80 bytes
 	uint64_t   gfxRings { 0 };               // device-heap offset of the GE rings (0 = none)
 	bool stageGfxDraw();
 	// W37 (rootcause-draw.md #1-#4).
 	void gfxSrmEnable();                     // RLC_SRM_CNTL |= AUTO_INCR_ADDR | SRM_ENABLE after the CSB init, as amdgpu
+	static bool requestedGfxSane();          // rdna4-gfxsane=0 leaves the explicit clip state block out
+	void gfxEmitSaneClip();                  // W45: the clip/cull/viewport/scissor registers the stream leaves undefined, neutral, before the draw
+	void gfxEmitClipProbe(uint32_t poolOff); // W45: COPY_DATA of the clip state after the draw
+	void gfxClipReport(const char *label, uint32_t poolOff, volatile uint32_t *ib);
+	uint64_t gfxPstatLast[8] {};             // the last pipeline-statistics deltas (PS, C_PRIM, C_INV, VS, GS_INV, GS_PRIM, IA_PRIM, IA_VERT)
 	void gfxLinuxDiff(const char *tag);      // W42: the VM/queue/RLC/CP registers next to what Linux 7.2.2 reads on this card
 	void gfxClearStatePre();                 // W39: clear-state registers before the first CSB replay (CP view + MMIO)
 	void gfxEmitCsbReplay();                 // the clear-state extents as SET_CONTEXT_REG on the ring before the draw
@@ -417,6 +424,7 @@ private:
 	struct GfxDrawResult {
 		bool ok, ringDone;
 		uint32_t drawFence, covered, other, firstNonZero, marker;
+		uint32_t cInv, cPrim, ps;              // W45: pipeline statistics deltas of this draw (probe boots)
 		uint32_t nggMarker, nggS2, nggS3;      // W37: the NGG marker variant (bit 32)
 		uint32_t minX, maxX, minY, maxY, row64[2], row190[2];
 		uint64_t ns;
