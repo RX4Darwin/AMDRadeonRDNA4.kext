@@ -197,11 +197,20 @@ the GFXOFF **hazard detector** (any GC register or doorbell access while allowed
 | P2 | **Idle accounting** (`gcUsers`, `gfxIdleSince`, registry property `Compute,GFXIdle`, a `idle: busy->idle after N ms` log line; W12k fences retired by a 100 ms poll) | `rdna4-gfxidle=1` | software only | counters balance over a mixed compute/gfx/DMA load; retire poll works for clients that never wait | boot 8 + `rdna4-run tri`; the line must print after the tri |
 | P3 | **Post-client idle measurement**: add `rdna4-run sensors` before/after `tri`/`tricol` to `diagnostic-log.sh` and a `gfx-app-idle` row (PASS when activity < 10 % and power < 40 W 2 s after the last client exits) | none (diag script) | script only | n/a (emulator metrics are fixed) | boot 8 |
 | P4 | **Workload profile** à la `amdgpu_gfx_profile_ring_begin_use`: `SetWorkloadMask` (COMPUTE/3D bit) on first use, back to DEFAULT after 1 s idle | `rdna4-gfxprofile=1` | one SMU message pair, serialized by `smuLock` | messages seen in order, none while DisallowGfxOff races | boot 8 with a bench loop: clock/power under load vs without; expect perf change or none (unmeasured) |
-| P5 | **GFXOFF with the ring up, measurement only**: Allow at the end of bring-up even though `gfxMode != 0`; snapshot `CP_RB0_*`, `CP_GFX_HQD_*`, doorbell range, golden regs; after the first wake compare, log, **re-init the ring (`gfxRingResume`) and prove it with a ring WRITE_DATA+fence**; result row `gfxoff-ring` | `rdna4-gfxoff=1 rdna4-gfxoff-ring=1` (needs `rdna4-gfx=2`, no probe) | `gfxOffAllowedNow` relaxed only under the new arg; `gfxOffAfterWake` gains the ring restore | model gets "worst case: gfx ring regs lost" (like the HQD): the restore + proof run with zero violations | **boot 10** (§7) |
-| P6 | **Delayed GFXOFF** (§3.3): idle timer 100 ms, re-Allow after the last client closes, refuse while any client is open | `rdna4-gfxidle=2` (needs P2, P5 PASS, P1) | timer on the existing work loop (`presentWorkLoop`) or its own | zero violations across a 200-iteration submit/idle/submit loop; no Allow while a client is open | boot 10b: idle 16-19 W between `tri` runs, `tri` passes after each wake |
 | P7 | **Sleep/wake hardening** (§4.2 items 1-6) | `rdna4-pm=1` (existing) + `rdna4-resume-tests=0` default-on new behaviour only under `rdna4-pm=1` | `sleepRequested`, gfx drain at sleep, resume guard | `rdna4-run sleeptest` with a client mid-wait and mid-gfx-IB: wait returns Aborted fast, no wedge, wake bring-up prints no draw/flip-test lines, `RDNA4_FLAG_RESUMED` | **boot 11**, last, power-cycle note |
 
-Stop conditions: any `WAKE FAILED`, any fence timeout after a wake, any GC hang -> the boot's log + power cycle, and the step stays off. P5/P6/P7 are the ones that can hang the card; P0/P2/P3/P4 cannot
+### 6.1 Later / perf items (dropped from pre-Metal by the lead, hub-task-311)
+
+GFXOFF is worth about 3 W (16 W vs 19 W, F7) against real risk (lost HQD/CP state, wake hazards, the sticky-100 % after a wake that is still unexplained). P5 and P6 are therefore **not** part of the pre-Metal plan; they stay here, unchanged, as perf items for after Metal. P0 is folded into the VM-client investigation (`docs/vm-client-rootcause.md`); P2-P4 and P7 stay in the plan, after that blocker.
+
+| # | Step (later) |
+|---|---|
+| P5 | **GFXOFF with the ring up, measurement only**: Allow at the end of bring-up even though `gfxMode != 0`; snapshot `CP_RB0_*`, `CP_GFX_HQD_*`, doorbell range, golden regs; after the first wake compare, log, **re-init the ring (`gfxRingResume`) and prove it with a ring WRITE_DATA+fence**; result row `gfxoff-ring` |
+| P6 | **Delayed GFXOFF** (§3.3): idle timer 100 ms, re-Allow after the last client closes, refuse while any client is open |
+
+(The full rows, with boot-args, verification and boot 10/10b, are in the git history of this file, commit 761122f.)
+
+Stop conditions: any `WAKE FAILED`, any fence timeout after a wake, any GC hang -> the boot's log + power cycle, and the step stays off. P7 (and the later P5/P6) are the ones that can hang the card; P0/P2/P3/P4 cannot
 touch GC beyond reads/logging and one SMU message.
 
 ## 7. Real-card boots and expected lines
