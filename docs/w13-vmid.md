@@ -478,11 +478,18 @@ user's final real-card test. 3) two shared queues, C deferred. 4) yes, old path 
 Purpose: turn U1 and U2 into measurements in the one boot the user will run, and attribute the "GFX busy at idle / client dispatch hangs" failure of section 1.1. It is a
 **spec**: the self-test code is step S1, after the lead's review of this round.
 
-**Boot arguments.** The VM boot of `docs/real-card-plan.md` (boot 2: `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1`) plus
-`rdna4-vmid-test=1` (new: runs the checks below right after `vmBootSelfTest`, before the runtime service is published, like the boot test) and `rdna4-gfxpm=16` (existing: the read-only
-engine survey, so the 100 % activity can be attributed). Nothing else; no gfx ring in this boot.
+**Boot arguments (as implemented, `d52f1d8`).** The VM boot of `docs/real-card-plan.md` (boot 2: `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1`) plus
+`rdna4-vmid-test=7`: a mask, 1 = the probes (run right after `vmBootSelfTest`, before the runtime service is published), 2 = read-only surveys at the points of the
+*normal* flow (before and after `vmBootSelfTest`, after the flip test, after clock gating, after the first client opens; all 8 MEC HQDs plus `RLC_CP_SCHEDULERS`, CPC/CPF/CP status,
+RS64 control, `CP_PQ_STATUS`, the doorbell range), 4 = a bounded trace (64 lines) of client operations (open, dispatch entry/done/timeout, SubmitIb kick, release before/after dequeue).
+Use `rdna4-compute=1`-style minimal extras (no vblank/cursor) so the dmesg window keeps the bring-up lines. No gfx ring in this boot. The implemented probe set is larger than the
+table below: it adds **T2** (a never-used slot), **T4a/b/c** (client-style queue: first activation, reactivation of the same slot, HQD VMID 3 instead of 8), **T5c** (the incremental
+stream WRITE_DATA, +ACQUIRE_MEM, +SET_SH_REGs, +DISPATCH of an `s_endpgm`-only kernel, +vadd, +RELEASE_MEM on one fresh queue, with rptr/HIT/CPC/fault after each step, the first stalled
+step named, then sibling queues probed on the same and the other pipe) and **T5b** (the `launch()`-exact stream, only if T5c passed). Anvil's H1/H2/H3 requests (hub-task-317) shaped these.
+Result string: `RDNA4FB,Results vmidtest` (`P` pass, `F` fail, `H` shader hang, `S` skipped, `D` SH_MEM readback differs). It has **not been run anywhere**: built, reviewed, and its
+emulator-side assumptions pinned by `tools/emu-qtest-vm.py` (35 checks); a macOS-guest dry run is for Kiln's loop.
 
-**What `rdna4-vmid-test=1` does** (all on one spare MEC slot, never a slot a client can have, with the same EOP/rptr discipline as the boot test):
+**What `rdna4-vmid-test` bit 1 does** (all on one spare MEC slot, never a slot a client can have, with the same EOP/rptr discipline as the boot test):
 
 | # | Check | Pass | What a failure means |
 |---|---|---|---|
