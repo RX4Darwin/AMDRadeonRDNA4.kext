@@ -753,6 +753,7 @@ struct RDNA4State {
     GHashTable *tlb[5];              /* 0 L1 leaf, 1 L2 leaf, 2..4 L2 PDE of walk level 0..2 */
     bool        tlb_used;            /* the walk in progress used a cached entry */
     bool        tlb_verify;          /* a verification walk: no cache reads or fills, no faults */
+    bool        tlb_faulted;         /* the walk in progress ended in a fault (the span walker then answers with the dummy page) */
     uint64_t    tlb_rng;
     uint64_t    tlb_hits, tlb_fills, tlb_stale;
     /* E2: the 18 invalidation engines. The invalidation takes effect, and ACK shows, when the ACK
@@ -2471,6 +2472,7 @@ static uint8_t *rdna4_gc_span_vmid_walk(RDNA4State *s, uint64_t va, uint64_t len
 fault:
     if (s->tlb_verify)
         return NULL;
+    s->tlb_faulted = true;
     rdna4_vm_fault(s, vmid, va, fault_kind, rdna4_vm_access_bits(write, execute));
     /* Retry is off: serve the configured dummy page so the queue can drain.
      * GCVM_L2_CNTL.ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY [11] (amdgpu sets it,
@@ -2498,8 +2500,12 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
     if (!vmid || s->tlb_verify)
         return rdna4_gc_span_vmid_walk(s, va, len, vmid, write, execute);
     s->tlb_used = false;
+    s->tlb_faulted = false;
     uint8_t *p = rdna4_gc_span_vmid_walk(s, va, len, vmid, write, execute);
-    if (p && s->tlb_used) {
+    /* A faulting walk returns the fault-default (dummy) page, which a clean verification walk cannot reproduce: that is the fault, not a stale
+     * translation (Kiln's dry run, hub-task-333: every 'STALE' line was an access at exactly a VA the kext logged a fault for, reached through a
+     * cached upper-level PDE). Only a walk that completed is compared. */
+    if (p && s->tlb_used && !s->tlb_faulted) {
         s->tlb_verify = true;
         uint8_t *live = rdna4_gc_span_vmid_walk(s, va, len, vmid, write, execute);
         s->tlb_verify = false;

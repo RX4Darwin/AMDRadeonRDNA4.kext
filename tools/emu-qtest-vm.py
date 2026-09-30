@@ -488,13 +488,31 @@ def test_vmid_rebind_protocol():
     finally:
         sc.close()
 
+def test_fault_is_not_stale():
+    """Kiln's dry run (hub-task-333) flagged 16640 'STALE TRANSLATION' lines, every one at a VA the kext had logged a fault for: a faulting access that
+    passed through a cached upper-level PDE made the span walker return the fault-default page, which the verification walk could not reproduce. A fault
+    is not a stale translation; a REAL stale translation must still be caught (negative control)."""
+    sc = tlb_scenario("S8 fix: an access that FAULTS after cached PDEs are not reported as a stale translation; a real stale one still is")
+    try:
+        sc.write_x(0x1)                                      # caches the PDEs and the leaf of the region
+        check(sc.stale_count() == 0, "a normal access: no stale report")
+        sc.q.wreg(REG_FAULT_STATUS, 0)
+        sc.submit(write_data(va(9), 0xdead), timeout=1.0)    # VA 9: same page table, no PTE: a write fault through cached PDEs
+        check(sc.q.reg(REG_FAULT_STATUS) != 0, "the access faulted (status 0x%08x)" % sc.q.reg(REG_FAULT_STATUS))
+        check(sc.stale_count() == 0, "a fault through cached PDEs is NOT reported as a stale translation (was: one report per faulting access)")
+        sc.map(PT, X, P2)                                    # a real stale translation
+        sc.write_x(0x2)
+        check(sc.stale_count() >= 1 and sc.q.vram_r32(P1) == 0x2, "negative control: a real stale leaf is still caught")
+    finally:
+        sc.close()
+
 def main():
     if not os.path.exists(QEMU):
         print("QEMU not found: %s (set QEMU=)" % QEMU)
         return 2
     for t in (test_stale_until_invalidated, test_level_bits, test_context_rebind_needs_flush, test_ack_latency,
               test_engines_and_noack, test_tlb_off_is_the_old_model, test_sh_mem_per_vmid, test_ih_lut_and_fault_vector,
-              test_u1_priv_queue_model, test_vmid_rebind_protocol):
+              test_u1_priv_queue_model, test_vmid_rebind_protocol, test_fault_is_not_stale):
         try:
             t()
         except Exception as e:                                          # a scenario that cannot run is a failure, loudly
