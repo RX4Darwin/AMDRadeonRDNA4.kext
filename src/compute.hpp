@@ -56,6 +56,9 @@
 #include "gpuvm.hpp"
 #include "ipdiscovery.hpp"
 #include "pm4.hpp"
+#include "gpuvmtable.hpp"
+#include "ptpages.hpp"
+#include "vmid.hpp"
 #include "pipe.hpp"
 #include "psp.hpp"
 #include "rdna4compute.h"
@@ -353,6 +356,8 @@ private:
 		volatile uint32_t *ibCpu;
 		uint64_t        ibVa;
 		uint32_t        ibVmid;
+		uint64_t        queueFenceAddr;       // rdna4-vmshared=2: a second ring-level fence on the shared queue's own word (the pool's idleness test)
+		uint32_t        queueFenceSeq;
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
 	void logComputeQueueState(const char *tag, uint32_t pipe = 0, uint32_t queue = 0,
@@ -666,9 +671,18 @@ private:
 	// when there is no DMA). With DMA, buffers come from the device heap:
 	// VRAM past the BAR, which the CPU never touches.
 	static constexpr uint32_t kHeapOffset  = 32u << 20;
-	static constexpr uint32_t kMaxBuffers  = 256;
+	static constexpr uint32_t kMaxBuffers  = 256;          // the legacy global caps (modes 0 and 1)
 	static constexpr uint32_t kMaxPrograms = 32;
-	static constexpr uint32_t kMaxClients = 8;
+	static constexpr uint32_t kBufferSlots  = 1024;        // rdna4-vmshared=2: array sizes; the cap is per client (accounting), not global
+	static constexpr uint32_t kProgramSlots = 256;
+	static constexpr uint32_t kClientBuffers  = 128;
+	static constexpr uint32_t kClientPrograms = 16;
+	uint32_t bufferCap() const { return vmShared == 2 ? kBufferSlots : kMaxBuffers; }
+	uint32_t programCap() const { return vmShared == 2 ? kProgramSlots : kMaxPrograms; }
+	bool clientOverQuota(const void *owner, bool program) const;   // rdna4-vmshared=2: per-client buffer/program counts
+	static constexpr uint32_t kMaxClients = 8;              // the per-client-HQD path and rdna4-vmshared=1 (static VMIDs 8-15)
+	static constexpr uint32_t kClientSlots = 64;            // rdna4-vmshared=2 (VMIDs from the pool): the array size, bounded by memory not hardware
+	uint32_t clientCap() const { return vmShared == 2 ? kClientSlots : kMaxClients; }
 	static constexpr uint32_t kVmTableBytes = 4u << 20;
 	static constexpr uint32_t kVmTableStage = 20u << 20;
 	static constexpr uint32_t kVmTableCpu = 28u << 20;    // W22 variant T: CPU-written tables (0x4000)
@@ -678,6 +692,10 @@ private:
 	uint32_t vmTableCpu { 0 };                            // W22 variant T: pool offset of CPU-written tables
 	static constexpr uint32_t kVmQueueBase = 26u << 20;
 	static constexpr uint32_t kVmQueueStride = 0x10000;
+	// rdna4-vmshared=2 keeps a client's kernarg, fence word and IB page in a compact 12 KiB pool area, not a 64 KiB slot; poolOff is set so
+	// that poolOff + kVmFence / kVmKernarg / kVmIb land on them. The area must end below the gfx region (PtPages::areaFor).
+	static constexpr uint32_t kVmDynBase = kVmQueueBase + (16u << 16);
+	static constexpr uint32_t kVmDynStride = 0x3000;
 	static constexpr uint32_t kVmMqd = 0x0000;
 	static constexpr uint32_t kVmEop = 0x1000;
 	static constexpr uint32_t kVmPq = 0x2000;
@@ -703,6 +721,11 @@ private:
 		uint64_t    hostUser { 0 };
 	};
 	struct RtProgram { const void *owner; uint64_t offset, va; CodeObj::Kernel k; uint16_t gen; };
+	// Sparse page tables (rdna4-vmshared=2; ptpages.hpp, gpuvmtable.hpp): root, PDB1, PDB0 and PT pages exist only where VA is mapped, so a client's VA
+	// reaches as far as its page quota allows (the contiguous image of modes 0/1 stops at 1 GiB above kVaStart).
+	struct SparseTables {
+		PtPages::Sparse s;
+	};
 	struct RtClient {
 		const void *owner { nullptr };
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
@@ -714,6 +737,9 @@ private:
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
 		uint32_t fence { 0 }, doorbell { 0 };
+		SparseTables *sp { nullptr };   // rdna4-vmshared=2: demand-allocated page tables (ptpages.hpp) instead of tableShadow
+		uint64_t tlbSeq { 0 };            // bumped whenever a PTE is removed: the next job on a VMID owned by this client flushes (amdgpu's tlb_seq)
+		uint32_t pasid { 0 };             // what the IH_VMID_LUT of this client's VMID holds, so a fault names the client (slot + 1)
 		bool     shared { false };        // rdna4-vmshared: no HQD of its own; its jobs run on a shared VMID-0 queue
 		uint8_t  sq { 0 };                // which shared queue (fixed at open: a client's jobs stay in order)
 		uint32_t poolOff { 0 };           // this client's pool slot area (kVmQueueBase + slot * stride)
@@ -746,12 +772,12 @@ private:
 	bool           vmEnabled { false };
 	bool           vmidUsed[16] {};
 	bool           queueUsed[4][8] {};
-	RtClient       clients[kMaxClients] {};
+	RtClient       clients[kClientSlots] {};
 	GpuHeap::Heap  heap;
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
-	RtBuffer       buffers[kMaxBuffers] {};
+	RtBuffer       buffers[kBufferSlots] {};
 	uint64_t       hostBytesTotal { 0 };
-	RtProgram      programs[kMaxPrograms] {};
+	RtProgram      programs[kProgramSlots] {};
 	bool           presentActive { false };
 	const void    *presentOwner { nullptr };
 	uint64_t       presentHandle { 0 };
@@ -825,6 +851,29 @@ private:
 	void publishRuntime(uint32_t stage);
 	bool initRuntimeHeap();
 	bool vmBootSelfTest();
+	// Sparse page tables (rdna4-vmshared=2): a multi-level tree, pages backed on demand.
+	static constexpr uint32_t kSparseShadowMax = 8192;        // wired 4 KiB shadow pages over all clients (32 MiB)
+	uint32_t sparseShadowPages { 0 };
+	static bool sparseAllocChunk(void *ctx, uint64_t &off);
+	static void sparseFreeChunk(void *ctx, uint64_t off);
+	PtPages::Backend sparseBackend() { return PtPages::Backend { sparseAllocChunk, sparseFreeChunk, this }; }
+	static uint64_t *sparseAllocShadow(void *ctx);
+	static void sparseFreeShadow(void *ctx, uint64_t *page);
+	static bool sparsePhysOf(void *ctx, uint64_t heapOffset, uint64_t &physical);
+	PtPages::Host sparseHost() { return PtPages::Host { sparseBackend(), sparseAllocShadow, sparseFreeShadow, sparsePhysOf, this }; }
+	struct TreeCtx { RDNA4Compute *self; RtClient *c; };
+	static bool treePageThunk(void *ctx, uint32_t level, uint64_t key, bool create, uint64_t *&entries, uint64_t &phys, uint32_t &id);
+	static void treeDirtyThunk(void *ctx, uint32_t id);
+	bool sparseSync(RtClient &c);      // every page whose shadow changed goes to its VRAM page
+	uint64_t *ptEntry(RtClient &c, uint64_t off);
+	struct PtCtx { RDNA4Compute *self; RtClient *c; };
+	static uint64_t *ptEntryThunk(void *ctx, uint64_t off);
+	static bool ptPhysThunk(void *ctx, uint64_t off, uint64_t &phys);
+	GpuVmTable::Policy vmPolicy() const { return GpuVmTable::Policy { vmIsPteOff, vmExecOff, vmPteSet, vmPteClear }; }
+	bool ptPhys(RtClient &c, uint64_t off, uint64_t &phys);
+	bool hasTables(const RtClient &c) const { return c.tableShadow || c.sp; }
+	bool sparseOpen(RtClient &c, uint32_t quotaPages);
+	void sparseTeardown(RtClient &c, bool clearVram);
 	// W13 S7-lite (docs/w13-vmid.md): with rdna4-vmshared=1 clients own no HQD. Two kernel-owned MEC queues (VMID 0, PRIV_STATE|KMD_QUEUE,
 	// one per MEC pipe) run every client job as INDIRECT_BUFFER(vmid = the client's) followed by a ring-level fence, as amdgpu's kernel
 	// compute rings do. Clients keep a static VMID 8-15. Default off; the per-client-HQD path is unchanged when off.
@@ -832,12 +881,28 @@ private:
 		bool up { false }, wedged { false };
 		uint32_t pipe { 0 }, queue { 0 }, doorbell { 0 }, area { 0 };   // area: pool offset of MQD/EOP/PQ/rptr/wptr pages
 		Pm4::Queue pm;
+		// rdna4-vmshared=2: a per-queue fence (amdgpu's per-ring fence) every job also writes, and the ring space the jobs in flight occupy
+		volatile uint32_t *fenceCpu { nullptr };
+		uint64_t fenceMc { 0 };
+		uint32_t seq { 0 };
+		struct Job { uint32_t seq, dwords; };
+		Job      jobs[64] {};
+		uint32_t jobHead { 0 }, jobCount { 0 }, ringUsed { 0 };
 	};
 	static constexpr uint32_t kSharedQueues = 2;
 	SharedQueue sharedQ[kSharedQueues] {};
-	bool vmShared { false };
+	uint32_t vmShared { 0 };          // rdna4-vmshared: 0 off, 1 static VMIDs 8-15, 2 VMIDs from the pool per job
 	bool sharedInit { false };
-	static bool requestedVmShared();
+	Vmid::Pool vmPool;
+	static uint32_t requestedVmShared();
+	bool sharedFenceReached(uint32_t domain, uint32_t seq);
+	int vmClientSlotByPasid(uint32_t pasid) const;     // rdna4-vmshared=2: which client a fault vector's PASID names (-1: none); a racy read, for logs only
+	static bool poolFenceReached(void *context, uint32_t domain, uint32_t seq);
+	bool sharedReserve(uint32_t k, uint32_t dwords);
+	void sharedCommit(uint32_t k, uint32_t seq, uint32_t dwords);
+	uint32_t vmAcquire(RtClient &c);                 // a VMID bound to the client's tables, rebound/flushed as needed; 0 = none available
+	void vmReleaseVmids(RtClient &c);                // client closes: every VMID it owns goes back, contexts off
+	IOReturn rtOpenPooled(const void *owner, uint32_t slot, RtClient *c);
 	bool vmSharedEnsure();
 	IOReturn rtOpenShared(const void *owner, uint32_t slot, RtClient *c);
 	IOReturn rtOpenInner(const void *owner);
@@ -886,6 +951,7 @@ private:
 	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
 	bool vmContextInit(RtClient &client);
 	bool vmInvalidate(uint32_t vmid, const char *tag);
+	bool vmInvalidateOwned(RtClient &c, const char *tag);
 	void logClientFault(RtClient &client, const char *tag);
 	void scrubFaultPage();
 	void releaseHost(RtBuffer &buffer);
