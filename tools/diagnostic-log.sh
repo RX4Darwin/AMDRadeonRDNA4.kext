@@ -533,8 +533,8 @@ registry_value() {
 	klines 'RDNA4FB: runtime:' | grep -v 'host buffer' || true
 	section "dmesg: MEC / HQD / VM boot-test lines (compute: mec|vm|runtime|hqd|pm: survey)"
 	klines 'RDNA4FB: (compute: (mec|vm|runtime|hqd|pm: survey)|ih: .*(VM page fault|VM fault IV))' || true
-	section "registry copies that survive the kernel log wrapping: Compute,VMSurvey / Compute,VMOps / RDNA4FB,Results"
-	for prop in VMSurvey VMOps; do
+	section "registry copies that survive the kernel log wrapping: Compute,VMSurvey / VMOps / VMProbeOps / RDNA4FB,Results"
+	for prop in VMSurvey VMOps VMProbeOps; do
 		echo "--- Compute,$prop"
 		REGP="$(ioreg -l -w0 2>/dev/null | grep "\"Compute,$prop\"" | sed -E "s/.*\"Compute,$prop\" = \"([^\"]*)\".*/\1/" | head -1)"
 		if [ -n "$REGP" ]; then
