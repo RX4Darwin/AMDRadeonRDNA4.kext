@@ -403,6 +403,7 @@ private:
 	bool stageGfxDraw();
 	// W37 (rootcause-draw.md #1-#4).
 	void gfxSrmEnable();                     // RLC_SRM_CNTL |= AUTO_INCR_ADDR | SRM_ENABLE after the CSB init, as amdgpu
+	void gfxClearStatePre();                 // W39: clear-state registers before the first CSB replay (CP view + MMIO)
 	void gfxEmitCsbReplay();                 // the clear-state extents as SET_CONTEXT_REG on the ring before the draw
 	void gfxContextDump(const char *tag);    // MMIO read of the clear-state registers and their neighbours
 	void gfxQueueEvidence(const char *tag);  // MQD / HQD / RS64 local-base registers the kext never programs

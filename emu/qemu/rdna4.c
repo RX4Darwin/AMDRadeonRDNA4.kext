@@ -621,7 +621,7 @@ struct RDNA4State {
     bool     smu_stale;      /* metrics transfer acks but the table is never rewritten */
     bool     warm_keep;      /* reset keeps live engines/queues, like warm card restart */
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
-    bool     ctx_garbage;    /* context registers power up as garbage, not 0 (W37, rootcause-draw.md #1); ctx-garbage=off restores the old model */
+    bool     ctx_garbage;    /* HYPOTHESIS MODEL, opt-in (ctx-garbage=on; W39: default off like gfx-golden-strict): context registers power up as garbage, not 0 (W37, rootcause-draw.md #1) */
     uint64_t pstat[14];      /* SAMPLE_PIPELINESTAT counters (si_query.c order: PS, C_PRIM, C_INV, VS, GS_INV, GS_PRIM, IA_PRIM, IA_VERT, ...) */
     bool     gop_dlg;        /* the GOP left the HUBP DLG/TTU registers programmed (DCN_SURF0_TTU_CNTL0 delivery non-zero) */
     bool     cursor_lock_stuck; /* the GOP left the MPC cursor lock (CUR_VUPDATE_LOCK_SET0) held */
@@ -4863,7 +4863,7 @@ static uint32_t rdna4_gfx_ring_bytes(RDNA4State *s, uint32_t base_reg,
  * VGT_SHADER_STAGES_EN=0xfd1ffe88 before the first draw, different each boot); amdgpu hands the RLC a
  * clear-state buffer (gfx12_cs_data, six extents) and enables SRM so the registers Mesa never writes end up 0.
  * The old model read every unwritten register as 0, which is why the emulator drew when the card did not.
- * ctx-garbage=on (default): the 1024 context registers (seg 1 dwords 0..0x3ff) start as a fixed non-zero pattern,
+ * ctx-garbage=on (OPT-IN since W39, default off; a run with it off is the neutral baseline): the 1024 context registers (seg 1 dwords 0..0x3ff) start as a fixed non-zero pattern,
  * and a draw is refused while a clear-state register still holds it (a hypothesis model like
  * gfx-golden-strict: it only shows whether the kext clears them). */
 static const struct { uint16_t index, count; } rdna4_csb_extents[] = {
@@ -4972,7 +4972,7 @@ static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
             /* the primitive reaches the clipper and is lost before the pixel shader (pipeline statistics: C_PRIM > 0, PS = 0) */
             s->pstat[2] += 1;
             s->pstat[1] += 1;
-            fprintf(stderr, "rdna4: gfx: draw lost: %u clear-state registers still hold power-up garbage "
+            fprintf(stderr, "rdna4: gfx: HYPOTHESIS MODEL (ctx-garbage=on): draw lost: %u clear-state registers still hold power-up garbage "
                     "(first: context 0x%03x = 0x%08x); the RLC clear state (SRM) or a CSB replay is missing\n",
                     nbad, first, reg_get(s, GC_SEG1((uint32_t)first)));
             return rdna4_gfx_draw_refuse(s, "clear state", "context registers hold power-up garbage");
@@ -7217,7 +7217,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_UINT32("dscl-mode", RDNA4State, dscl_mode, 0),
     DEFINE_PROP_BOOL("desktop-churn", RDNA4State, desktop_churn, false),
     DEFINE_PROP_BOOL("gop-dlg", RDNA4State, gop_dlg, false),
-    DEFINE_PROP_BOOL("ctx-garbage", RDNA4State, ctx_garbage, true),
+    DEFINE_PROP_BOOL("ctx-garbage", RDNA4State, ctx_garbage, false),
     DEFINE_PROP_BOOL("cursor-ttu-hypothesis", RDNA4State, cursor_ttu_hypothesis, false),
     DEFINE_PROP_BOOL("hang-sticky", RDNA4State, hang_sticky, false),
     DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,

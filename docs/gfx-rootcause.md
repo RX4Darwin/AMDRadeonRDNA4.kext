@@ -35,7 +35,7 @@ The round-4 readback `VGT_SHADER_STAGES_EN=0xfd1ffe88` has bits where gfx12 defi
 
 ## 4. Emulator
 
-The emulator drew because it read every unwritten register as 0 and loaded the CSB by itself when the ring started. `ctx-garbage=on` (the new default; `ctx-garbage=off` restores the old model):
+The emulator drew because it read every unwritten register as 0 and loaded the CSB by itself when the ring started. `ctx-garbage=on` (OPT-IN since W39, default off; a run with it off is the neutral baseline):
 
 - the 1024 context registers power up as a fixed non-zero pattern (`0x9e3779b1 * (off + 1) | 0x00010001`), so an unwritten register reads garbage;
 - the CSB reaches them only through the RLC: a write of `RLC_SRM_CNTL.SRM_ENABLE` applies the buffer in `RLC_CSIB_*`; the CP no longer loads it on its own;
@@ -63,3 +63,21 @@ This encodes the round-4 hypothesis (like `gfx-golden-strict`): a pass says the 
 | `C_INVOCATIONS > 0`, `C_PRIMITIVES = 0` | clipped or culled: context state, look at the non-zero context registers |
 | `C_PRIMITIVES > 0`, `PS_INVOCATIONS = 0` | between the clipper and the pixel shader: SC/raster state, garbage registers |
 | `VA 0 page: N dwords non-zero` | the CPG wrote there; the dwords fingerprint the structure |
+
+## 7. W39 (W37 review): the two round-5 boots and which lines to read
+
+- **Boot 3** = base + `rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11`: SRM **and** replay (most likely to draw).
+- **Boot 6** = the same + `rdna4-gfxcsb=0`: SRM only, amdgpu-exact (no replay), for attribution.
+- Order: the `rdna4-gfxsrm=0` control (both off) first or after a cold power cycle. RLC state survives a warm restart like CG: read
+  `SRM: RLC_SRM_CNTL found at start 0x...` on every gfx boot; if `SRM_ENABLE` is already set the line says so and a `rdna4-gfxsrm=0` control is void. Power-cycle before a GFXOFF boot.
+
+| Line | Read it as |
+|---|---|
+| `SRM: RLC_SRM_CNTL found at start 0x..` then `-> 0x..` | whether SRM persisted from an earlier boot, and what we set |
+| `clear state BEFORE any CSB replay: CP view N of 7 non-zero` (+ the MMIO line, + `says: ...`) | **the attribution line.** Read once per boot before the first replay is emitted. All zero = the clear state is already applied (SRM landed it or the registers reset to 0); non-zero (power-up garbage) = the CSB handoff / SRM enable alone did not land it |
+| boot 3 draws (8192 px) and boot 6 draws | SRM alone is enough; the replay is belt and braces |
+| boot 3 draws, boot 6 does not (and its pre-replay line shows garbage) | #1 confirmed: SRM does not land the clear state, the replay is the fix |
+| neither draws | #1 is not (the whole) cause: `pipeline statistics say` and the NGG marker (bit 32) pick #2/#3/#4; `VA 0 page` and `queue:` lines for #2 |
+| `VA 0: ... (PTE ..., IS_PTE set); GC TLB flush NOT acked` | the flush is never acked on this card and the ack is not required; the mapping needs IS_PTE (bit 63, W36) or it is a directory entry and does nothing; a silent VA-0 fault afterwards means the mapping took effect; the mapping stays for the boot, so a probe boot is not a clean fault-status baseline |
+
+The `draw probe mid` clear-state line is read AFTER the replay: with the replay on it reads 0 whatever SRM did, so only boot 6 (no replay) or the pre-replay line attribute #1. The 1024-register context dump runs for the baseline and the first variant only.
