@@ -45,6 +45,8 @@ SLEEPTEST_MODE="$(arg_value sleeptest)"
 GFXPM_MODE="$(arg_value gfxpm)"
 GFXCG_MODE="$(arg_value gfxcg)"
 GFXOFF_MODE="$(arg_value gfxoff)"
+VMIDTEST_MODE="$(arg_value vmid-test)"     # W13 S1 / boot 9: mask, 1 probes, 2 surveys at the flow points, 4 client-op trace
+VMDIAG_MODE="$(arg_value vm-diag)"
 case "$COMPUTE_STAGE" in ''|*[!0-9]*) COMPUTE_STAGE=0;; esac
 case "$IH_MODE" in ''|*[!0-9]*) IH_MODE=0;; esac
 case "$VM_MODE" in ''|*[!0-9]*) VM_MODE=0;; esac
@@ -53,6 +55,7 @@ case "$GFX_MODE" in ''|*[!0-9]*) GFX_MODE=0;; esac
 case "$GFXCOL_MODE" in ''|*[!0-9]*) GFXCOL_MODE=0;; esac
 case "$SLEEPTEST_MODE" in ''|*[!0-9]*) SLEEPTEST_MODE=0;; esac
 case "$GFXPM_MODE" in ''|*[!0-9]*) GFXPM_MODE=0;; esac
+case "$VMIDTEST_MODE" in ''|*[!0-9]*) VMIDTEST_MODE=0;; esac
 
 # Queue recovery is an explicit last step. It is never part of an ordinary
 # collection, even when rdna4-hang=1 is present in the boot arguments.
@@ -212,7 +215,8 @@ registry_value() {
 	found=""
 	for a in off cmap lutbypass 8bpc noedid nosleep modedump hwcursor \
 	         curmode curtest dmubping dmubhist dmubver dmubcursor smuping \
-	         ihdump pspdump vbl cursor pm trace compute ih vm flip gfx gfxcol hang sleeptest; do
+	         ihdump pspdump vbl cursor pm trace compute ih vm vm-diag vm-exec vm-ispte vm-force-fail vmid-test flip gfx gfxcol \
+	         gfxpm gfxcg gfxoff gfxcap hang sleeptest; do
 		value="$(arg_value "$a")"
 		[ -n "$value" ] && found="$found rdna4-$a=$value"
 	done
@@ -452,6 +456,33 @@ registry_value() {
 	grep -E 'RDNA4FB: (.*ih:|.*vm:|.*vmid|.*gfx:|.*flip:|.*trail|.*hang|.*PreviousHang)' "$KLOG" || \
 		echo "(no feature-specific lines)"
 
+	# Boot 9 (docs/vm-client-rootcause.md). The feature-line filter above drops every runtime line without "vmid" in it (round 6 lost all the
+	# "dispatch timed out" / recovery lines that way), so the VM/queue evidence gets sections of its own, with registry copies for the day the
+	# kernel log window has lost the bring-up lines (round 6 had: its window began 146 s into the boot).
+	section "dmesg: VM/queue diagnostic (rdna4-vmid-test: probes T0-T7, surveys at the flow points, client-op trace)"
+	if [ "$VMIDTEST_MODE" -eq 0 ]; then
+		echo "(inactive - add rdna4-vmid-test=7 to boot-args)"
+	else
+		klines 'RDNA4FB: vmidtest:' || true
+	fi
+	section "dmesg: runtime client lines (open, close, dequeue, dispatch, wedge, recovery; host buffer map/unmap noise removed)"
+	klines 'RDNA4FB: runtime:' | grep -v 'host buffer' || true
+	section "dmesg: MEC / HQD / VM boot-test lines (compute: mec|vm|runtime|hqd|pm: survey)"
+	klines 'RDNA4FB: compute: (mec|vm|runtime|hqd|pm: survey)' || true
+	section "registry copies that survive the kernel log wrapping: Compute,VMSurvey / Compute,VMOps / RDNA4FB,Results"
+	for prop in VMSurvey VMOps; do
+		echo "--- Compute,$prop"
+		REGP="$(ioreg -l -w0 2>/dev/null | grep "\"Compute,$prop\"" | sed -E "s/.*\"Compute,$prop\" = \"([^\"]*)\".*/\1/" | head -1)"
+		if [ -n "$REGP" ]; then
+			echo "$REGP" | sed 's/ ## /\
+/g'
+		else
+			echo "(no Compute,$prop property: the kext build has no registry copy of the survey/trace, or rdna4-vmid-test is off)"
+		fi
+	done
+	echo "--- RDNA4FB,Results"
+	echo "$REG_RESULTS"
+
 	# Feature summary. PASS means the bounded command and its result marker
 	# succeeded. SKIPPED means its boot-arg or command is absent.
 	if [ "$RUNTIME_ACTIVE" -eq 0 ]; then
@@ -570,6 +601,84 @@ registry_value() {
 		record gfx-col FAIL "colour draw logged but RDNA4FB,Results has no result"
 	else
 		record gfx-col SKIPPED "G4 not reached (the gfx stage did not get to the draw)"
+	fi
+
+	# Boot 9 rows (docs/vm-client-rootcause.md). vm-confound: the round 6 boots carried rdna4-vm-diag=4065 (bit 512 "F" = the GC hub's fault default
+	# page pointed at a system page while the boot test runs); the script's "active:" list did not show it, so the confound was invisible.
+	if [ "$VM_MODE" -eq 0 ]; then
+		record vm-confound SKIPPED "rdna4-vm not enabled"
+	elif [ -z "$VMDIAG_MODE" ]; then
+		record vm-confound INFO "plain VM boot: no rdna4-vm-diag (no F fault-default-page, no variants)"
+	else
+		record vm-confound INFO "rdna4-vm-diag=$VMDIAG_MODE set (bit 512 = F fault default page to system memory, active during the boot test): the round 6 configuration"
+	fi
+	if [ "$VMIDTEST_MODE" -eq 0 ]; then
+		record vmidtest SKIPPED "rdna4-vmid-test not enabled"
+	elif [ $((VMIDTEST_MODE & 1)) -eq 0 ]; then
+		record vmidtest SKIPPED "rdna4-vmid-test=$VMIDTEST_MODE has no probe bit (1)"
+	else
+		VT="$(registry_value vmidtest)"
+		if [ -z "$VT" ]; then
+			record vmidtest FAIL "no RDNA4FB,Results vmidtest: the probes did not finish (see the vmidtest: lines and the NVRAM trail)"
+		elif printf '%s\n' "$VT" | grep -Eq '=[FHD]( |$)'; then
+			record vmidtest FAIL "$VT  (F fail, H shader hang, D SH_MEM readback differs, S skipped; the first =F/=H is the first failing step)"
+		else
+			record vmidtest PASS "$VT"
+		fi
+	fi
+	# Surveys at the flow points (GRBM_STATUS bit 31 = GUI_ACTIVE): which step first leaves the GC busy.
+	if [ $((VMIDTEST_MODE & 2)) -eq 0 ]; then
+		record vm-survey SKIPPED "rdna4-vmid-test bit 2 (surveys) not set"
+	else
+		SURV="$(klines 'RDNA4FB: vmidtest: survey .*: GRBM 0x' || true)"
+		if [ -z "$SURV" ]; then
+			record vm-survey FAIL "no survey lines in the kernel log window (and no Compute,VMSurvey copy parsed): bring-up lines lost"
+		else
+			SURV_FIRST=""
+			SURV_LIST=""
+			while IFS= read -r sl; do
+				stag="$(printf '%s\n' "$sl" | sed -E 's/.*vmidtest: survey (.*): GRBM 0x.*/\1/')"
+				sg="$(printf '%s\n' "$sl" | sed -E 's/.*: GRBM 0x([0-9a-fA-F]{8}).*/\1/')"
+				SURV_LIST="$SURV_LIST [$stag: $sg]"
+				case "$sg" in [89a-fA-F]*) [ -z "$SURV_FIRST" ] && SURV_FIRST="$stag";; esac
+			done <<SURVEOF
+$SURV
+SURVEOF
+			if [ -n "$SURV_FIRST" ]; then
+				record vm-survey PASS "GRBM bit 31 (GUI_ACTIVE) first set at '$SURV_FIRST';$SURV_LIST"
+			else
+				record vm-survey PASS "GRBM bit 31 never set at any survey point;$SURV_LIST"
+			fi
+		fi
+	fi
+	# The client-op trace: does a refusal/timeout/dequeue timeout appear, and where.
+	if [ $((VMIDTEST_MODE & 4)) -eq 0 ]; then
+		record vm-trace SKIPPED "rdna4-vmid-test bit 4 (client-op trace) not set"
+	else
+		OPS="$(klines 'RDNA4FB: vmidtest: op ' || true)"
+		if [ -z "$OPS" ]; then
+			record vm-trace FAIL "no op-trace lines (no client opened, or the window lost them)"
+		else
+			OPS_N="$(printf '%s\n' "$OPS" | grep -c .)"
+			OPS_REF="$(printf '%s\n' "$OPS" | grep -c 'REFUSED' || true)"
+			OPS_TO="$(printf '%s\n' "$OPS" | grep -c 'TIMED OUT\|TIMEOUT' || true)"
+			OPS_FIRST="$(printf '%s\n' "$OPS" | grep 'REFUSED\|TIMED OUT\|TIMEOUT' | head -1 | sed 's/^.*vmidtest: //')"
+			record vm-trace PASS "$OPS_N op lines, $OPS_REF refused, $OPS_TO timeouts; first problem: ${OPS_FIRST:-none}"
+		fi
+	fi
+	# The idle pin itself, from the SMU (what the round 6 logs call "100 % / 80 W"), taken before the selftest.
+	IDLE_LINE="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_FILE" 2>/dev/null | tail -1)"
+	if [ -n "$IDLE_LINE" ]; then
+		IDLE_ACT="$(printf '%s\n' "$IDLE_LINE" | sed -E 's/.*GFX activity ([0-9]+) %.*/\1/')"
+		IDLE_W="$(printf '%s\n' "$IDLE_LINE" | sed -E 's/.*socket ([0-9]+) W.*/\1/')"
+		case "$IDLE_ACT" in ''|*[!0-9]*) IDLE_ACT="";; esac
+		if [ -z "$IDLE_ACT" ]; then
+			record idle-pin SKIPPED "no parsable SMU sample"
+		elif [ "$IDLE_ACT" -ge 50 ]; then
+			record idle-pin FAIL "PINNED: GFX activity ${IDLE_ACT} %, ${IDLE_W} W at idle (the round 6 VM-boot signature; clean boots read 3-8 % / 20-45 W)"
+		else
+			record idle-pin PASS "idle: GFX activity ${IDLE_ACT} %, ${IDLE_W} W"
+		fi
 	fi
 
 	if [ "$FLIP_MODE" -eq 0 ]; then

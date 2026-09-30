@@ -1,7 +1,7 @@
 #!/bin/bash
 # Set the boot-args for one boot of docs/real-card-plan.md on the OpenCore USB.
 #
-#   bash /Volumes/OPENCORE/set-boot.sh <0-7>
+#   bash /Volumes/OPENCORE/set-boot.sh <0-7|9|9b>
 #
 #   Round 5 plan (D23): every test boot runs on the PROVEN base, rdna4-ih=2 rdna4-flip=1 rdna4-hang=1
 #   (interrupts, vblank + page flips, queue recovery; clock gating is on by default since W29).
@@ -16,6 +16,13 @@
 #   6  boot 3 with SRM only, no replay and no sane-clip block (amdgpu-exact; attributes the fix)   ... rdna4-gfxcsb=0 rdna4-gfxsane=0   (no gfxcol: a clean A/B control of the G3 fix)
 #   4  (retired: the real pointer is part of boot 1 since round 6)
 #   5  base + GFXOFF (optional, ALWAYS LAST, then power off)   rdna4-gfxpm=24 rdna4-gfxoff=1
+#   9  THE VM-CLIENT DIAGNOSTIC (docs/vm-client-rootcause.md, hub-task-311/320): the VM boot of round 6 WITHOUT rdna4-vbl/cursor (so the kernel log window keeps the bring-up
+#      lines; round 6's began 146 s into the boot) and WITHOUT rdna4-vm-diag, plus rdna4-vmid-test=7 (1 = probes T0-T7 incl. the incremental-stream bisect T5c, 2 = read-only
+#      surveys of engines + all 8 MEC HQDs at the flow points, 4 = a bounded client-op trace) and rdna4-gfxpm=24 (the existing per-stage `pm: survey` lines + SMU samples; it only
+#      samples). rdna4-compute stays 7: the compute: log lines (mec/vm/runtime) are what this boot is for; =1 would stop bring-up after the survey stage. Why no vm-diag: the
+#      round 6 boots DID carry rdna4-vm-diag=4065 (061829 line 17; the diagnostic script did not list that arg), whose bit 512 "F" points the GC hub's fault default page at a
+#      system page during the boot test, and the round 5 and 6 VM boots had it: "a clean VM boot pins the GPU at idle" is unproven. Run 9 first, then 9b.
+#   9b boot 9 + rdna4-vm-diag=4065: the exact round 6 VM configuration with the full instrumentation (run after 9: A/B on the confound).
 #   7  base + cursor self-test: magenta 64x64 square at (100,100), macOS pointer ignored   rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1 (CRC A/B: GOP state, after the CM_BYPASS clear)
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
@@ -29,8 +36,10 @@ case "${1:-}" in
 	3) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11 rdna4-gfxcol=1" ;;
 	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfxpm=24 rdna4-gfxoff=1" ;;
 	7) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1" ;;
+	9) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vmid-test=7 rdna4-gfxpm=24" ;;
+	9b) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vmid-test=7 rdna4-gfxpm=24" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11 rdna4-gfxcsb=0 rdna4-gfxsane=0" ;;
-	*) echo "usage: bash $0 <0-7>   (see docs/real-card-plan.md)"; exit 1 ;;
+	*) echo "usage: bash $0 <0-7|9|9b>   (see docs/real-card-plan.md)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"
