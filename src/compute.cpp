@@ -591,6 +591,9 @@ void RDNA4Compute::powerDidWake() {
 		return;
 	}
 	resumePending = true;
+	// P7: the sleep is over. The request flag must not outlive it: the wake's bring-up waits (the IH self-test's CP EOP wait, dispatch tests) would
+	// otherwise see "a sleep is requested" and abort (Kiln's 11s runs: 'IH self-test CP wait timed out: fence 0 want 8' on every wake).
+	powerSleepClear();
 	IOLockUnlock(rtLock);
 	thread_t th = nullptr;
 	if (kernel_thread_start(resumeMain, this, &th) == KERN_SUCCESS) {

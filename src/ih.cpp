@@ -912,7 +912,7 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 			done = fenceReached(*fence, value);
 			if (done || mach_absolute_time() > deadline)
 				break;
-			if (dispatch && sleepAbortWanted()) {      // P7: client compute waits end when a sleep is requested (DMA waits are short and never abort)
+			if (dispatch && !bringupRunning && sleepAbortWanted()) {      // P7: client compute waits end when a sleep is requested (DMA waits are short and never abort)
 				waitAborted = true;
 				break;
 			}
@@ -930,7 +930,7 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 			done = fenceReached(*fence, value);
 			if (done || mach_absolute_time() > deadline)
 				break;
-			if (dispatch && sleepAbortWanted()) {      // P7
+			if (dispatch && !bringupRunning && sleepAbortWanted()) {      // P7
 				waitAborted = true;
 				break;
 			}
