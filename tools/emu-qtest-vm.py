@@ -383,12 +383,72 @@ def test_ih_lut_and_fault_vector():
     finally:
         sc.close()
 
+REG_FB_BASE, REG_FB_TOP = GC0(0x1614), GC0(0x1615)
+MC_BASE = 0x8000000000           # FB_BASE 0x8000 << 24
+P_PRIV_RING, P_PRIV_RPTR, P_PRIV_EOP, P_PRIV_FENCE, P_IB = 0x220000, 0x221000, 0x222000, 0x223000, 0x224000
+
+def ib_packet(addr, dwords, vmid):
+    return [0xC0000000 | (2 << 16) | (0x3f << 8), addr & 0xffffffff, addr >> 32, dwords | (1 << 23) | (vmid << 24)]
+
+def release_mem(mc, seq):
+    return [0xC0000000 | (6 << 16) | (0x49 << 8), 0x00000000, 1 << 29, mc & 0xffffffff, mc >> 32, seq, 0, 0]
+
+def test_u1_priv_queue_model():
+    """What the S1 self-test (src/vmtest.cpp, T3/T7) expects of the emulator: a VMID-0 privileged MEC queue runs an
+    IB in the VMID of the IB packet. This is the emulator's statement of assumption U1, NOT evidence for the card."""
+    sc = tlb_scenario("E6/S1 model: a VMID-0 PRIV_STATE queue runs an IB in the packet's VMID (assumption U1 as code); a VMID with no context faults with that VMID")
+    try:
+        q = sc.q
+        q.wreg(REG_FB_BASE, MC_BASE >> 24); q.wreg(REG_FB_TOP, (MC_BASE >> 24) + 15)
+        q.vram_w(P_IB, bytes(0x1000))
+        sc.map(PT, 4, P_IB)                                            # VA page 4 = the IB, in VMID 3's tables
+        for page in (P_PRIV_RING, P_PRIV_RPTR, P_PRIV_EOP, P_PRIV_FENCE):
+            q.vram_w(page, bytes(0x1000))
+        def prog():
+            q.wreg(REG_GRBM_GFX_CNTL, grbm(0, pipe=1, queue=3, me=1))
+            q.wreg(H["VMID"], 0)
+            q.wreg(H["PQ_BASE"], (MC_BASE + P_PRIV_RING) >> 8); q.wreg(H["PQ_BASE_HI"], (MC_BASE + P_PRIV_RING) >> 40)
+            q.wreg(H["RPTR_REP"], (MC_BASE + P_PRIV_RPTR) & 0xffffffff); q.wreg(H["RPTR_REP_HI"], (MC_BASE + P_PRIV_RPTR) >> 32)
+            q.wreg(H["EOP"], (MC_BASE + P_PRIV_EOP) >> 8); q.wreg(H["EOP_HI"], (MC_BASE + P_PRIV_EOP) >> 40)
+            q.wreg(H["DOORBELL"], (0x32 << 2) | (1 << 30))
+            q.wreg(H["PQ_CNTL"], 9 | (1 << 30))                      # 1024 dwords, PRIV_STATE
+            q.wreg(H["WPTR_LO"], 0); q.wreg(H["WPTR_HI"], 0); q.wreg(H["PQ_RPTR"], 0)
+            q.wreg(H["ACTIVE"], 1)
+            q.wreg(REG_GRBM_GFX_CNTL, grbm(0))
+        prog()
+        wp = [0]
+        def job(vmid, seq):
+            pk = ib_packet(va(4), 8, vmid) + release_mem(MC_BASE + P_PRIV_FENCE, seq)
+            q.vram_w(P_PRIV_RING + 4 * wp[0], b"".join(struct.pack("<I", d) for d in pk))
+            wp[0] += len(pk)
+            q.writeq(BAR2 + 0x32 * 4, wp[0])
+            end = time.time() + 2.0
+            while time.time() < end:
+                if q.vram_r32(P_PRIV_FENCE) == seq:
+                    return True
+                time.sleep(0.01)
+            return False
+        ib = write_data(va(X), 0xa5a50003) + [0xffff1000] * 3
+        ib = ib[:8] + [0xffff1000] * (8 - len(ib)) if len(ib) < 8 else ib
+        q.vram_w(P_IB, b"".join(struct.pack("<I", d) for d in ib))
+        check(job(3, 0x11) and q.vram_r32(P1) == 0xa5a50003, "IB packet VMID 3 on the VMID-0 queue: the fence lands and the IB wrote through VMID 3's tables")
+        check(q.reg(REG_FAULT_STATUS) == 0, "no fault")
+        q.vram_w32(P1, 0)
+        sc.map(PT, 4, P_IB)
+        ok = job(9, 0x12)                                              # VMID 9: context never enabled
+        st = q.reg(REG_FAULT_STATUS)
+        check(not ok and q.vram_r32(P1) == 0 and st != 0 and ((st >> 20) & 0xf) == 9,
+              "IB packet VMID 9 (no context): no fence, no data, fault status names VMID 9 (0x%08x)" % st)
+    finally:
+        sc.close()
+
 def main():
     if not os.path.exists(QEMU):
         print("QEMU not found: %s (set QEMU=)" % QEMU)
         return 2
     for t in (test_stale_until_invalidated, test_level_bits, test_context_rebind_needs_flush, test_ack_latency,
-              test_engines_and_noack, test_tlb_off_is_the_old_model, test_sh_mem_per_vmid, test_ih_lut_and_fault_vector):
+              test_engines_and_noack, test_tlb_off_is_the_old_model, test_sh_mem_per_vmid, test_ih_lut_and_fault_vector,
+              test_u1_priv_queue_model):
         try:
             t()
         except Exception as e:                                          # a scenario that cannot run is a failure, loudly

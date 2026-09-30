@@ -768,6 +768,16 @@ private:
 	void publishRuntime(uint32_t stage);
 	bool initRuntimeHeap();
 	bool vmBootSelfTest();
+	void vmIdTest();                          // W13 S1 (vmtest.cpp): rdna4-vmid-test=1, the VMID/queue diagnostic
+	static bool requestedVmIdTest();
+	static uint32_t vmIdTestMask();          // rdna4-vmid-test: 1 probes, 2 flow-point surveys, 4 client-op trace
+	void vmIdSurvey(const char *tag);
+	void vmOpTrace(const char *op, uint32_t vmid, uint32_t pipe, uint32_t queue);
+	void vmSurvey(const char *tag) { if (vmSurveyOn) vmIdSurvey(tag); }
+	bool     vmSurveyOn { false };
+	bool     vmOpTraceOn { false };
+	uint32_t vmOpTraceLines { 0 };
+	bool     vmSurveyClientDone { false };
 	void vmDumpHubWindows(const char *tag);   // W17 E1, read-only
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);

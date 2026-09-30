@@ -1583,6 +1583,11 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	c->active = true;
 	RLOG("vmid %u: client queue activated MEC1 pipe %u queue %u, PDB2 MC 0x%llx physical 0x%llx, doorbell dword %u",
 	     vmid, pipe, queue, c->rootMc, c->rootPhys, c->doorbell);
+	vmOpTrace("open", vmid, pipe, queue);
+	if (!vmSurveyClientDone) {
+		vmSurveyClientDone = true;
+		vmSurvey("after the first client opened");
+	}
 	return kIOReturnSuccess;
 }
 
@@ -2319,8 +2324,12 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	l.recoveryProofCpu = c ? c->fenceCpu : nullptr;
 
 	uint64_t ns = 0;
+	if (c)
+		vmOpTrace("dispatch entry", l.vmid, l.pipe, l.queueId);
 	const bool done = launch(l, "runtime", ns);
 	micros = ns / 1000;
+	if (c)
+		vmOpTrace(done ? "dispatch done" : "dispatch TIMED OUT", l.vmid, l.pipe, l.queueId);
 	if (!done) {
 		if (c)
 			c->ibOutstanding = 0;
@@ -2392,6 +2401,7 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	c->fence = value;
 	flushHdp();
 	pm4Kick(c->pm4, c->doorbell, c->pm4.wptr());
+	vmOpTrace("submitib kicked", c->vmid, c->pipe, c->queue);
 	c->ibFences[c->ibOutstanding++] = value;
 	fence = value;
 	RLOG("vmid %u: submitted unprivileged compute IB VA 0x%llx, %u dwords, fence %u",
@@ -2687,6 +2697,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		RLOG("client closed: freed %u buffer(s), %u program(s)", nb, np);
 	if (c && vmEnabled) {
 		/* Dequeue is deliberately polled: W1's interrupt path is not required. */
+		vmOpTrace("release before dequeue", c->vmid, c->pipe, c->queue);
 		grbmSelect(1, c->pipe, c->queue, c->vmid);
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
 		bool inactive = false;
@@ -2699,6 +2710,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			RLOG("vmid %u: queue MEC1 pipe %u queue %u dequeue timeout (ACTIVE 0x%08x)",
 			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
 		grbmSelect(0, 0, 0, 0);
+		vmOpTrace(inactive ? "release after dequeue" : "release after dequeue TIMEOUT", c->vmid, c->pipe, c->queue);
 		/* The table allocation is reused by the next client.  Unmapping each
 		 * live object leaves untouched PDEs/PTEs behind, so clear the complete
 		 * image before releasing the VMID or its backing VRAM. */

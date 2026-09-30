@@ -651,6 +651,11 @@ void RDNA4Compute::runStages() {
 	// W27: a bring-up (or a re-bring-up after sleep) starts with GFX powered. Nothing of an earlier
 	// bring-up is alive: forget its boot queue and register snapshot (S4).
 	bringupGen++;
+	{   const uint32_t m = vmIdTestMask();     // W13 S1 diagnostics (vmtest.cpp)
+		vmSurveyOn = (m & 2) != 0;
+		vmOpTraceOn = (m & 4) != 0;
+		vmOpTraceLines = 0;
+		vmSurveyClientDone = false; }
 	bootQueueLive = false;
 	gcSnapValid = false;
 	gcWake(0xffffffffu);
@@ -667,7 +672,7 @@ void RDNA4Compute::runStages() {
 	bool hung = logPreviousTrail(prev, sizeof(prev));
 	uint32_t done = StageSurvey;
 	char note[96];
-	static const char *const kFeatures[] = { "gfx", "ih", "vm", "flip", "pm" };
+	static const char *const kFeatures[] = { "gfx", "ih", "vm", "flip", "pm", "vmidtest" };
 	for (size_t i = 0; hung && i < sizeof(kFeatures) / sizeof(kFeatures[0]); i++) {
 		const size_t n = strlen(kFeatures[i]);
 		if (!strncmp(prev, kFeatures[i], n) && prev[n] == ':') {
@@ -762,10 +767,18 @@ void RDNA4Compute::runStages() {
 	if (vmEnabled && done >= StageKernel) {
 		if (!bringupStepAllowed("VM self-test"))
 			return;
+		vmSurvey("before vmBootSelfTest");
 		if (!featureAllowed("vm") || !vmBootSelfTest()) {
 		vmEnabled = false;
 		CLOG("vm: boot self-test failed; per-client GPU VM disabled");
 		}
+		vmSurvey("after vmBootSelfTest");
+	}
+	// W13 S1: the VMID/queue diagnostic, only with rdna4-vmid-test=1. It needs the runtime heap and DMA (initRuntimeHeap), not a
+	// passing VM self-test: a failing one is when it is most useful.
+	if (done >= StageKernel && requestedVmIdTest() && featureAllowed("vmidtest")) {
+		if (!bringupStepAllowed("vmid test")) return;
+		vmIdTest();
 	}
 	// W3: the gfx ring, when asked for. A failure only turns it off again.
 	bool gfxOk = false;
@@ -804,6 +817,8 @@ void RDNA4Compute::runStages() {
 		if (!bringupStepAllowed("flip")) return;
 	if (done >= StageKernel && featureAllowed("flip"))
 		Flip::run(*this);
+	if (done >= StageKernel)
+		vmSurvey("after the flip test");
 	// G3: the first draw, once the runtime's device heap holds its rings.
 	if (!bringupStepAllowed("gfx draw"))
 		return;
@@ -817,6 +832,7 @@ void RDNA4Compute::runStages() {
 	if (done >= (gfxCgIsDefault() ? StageKernel : StageGfx) && featureAllowed("pm") && requestedGfxCg(cgMask)) {
 		if (!bringupStepAllowed("clock gating")) return;
 		gfxCgApply(cgMask);
+		vmSurvey("after clock gating");
 	}
 	if (done >= StageGfx && featureAllowed("pm") && (requestedGfxOff() || gfxOffHook())) {
 		if (!bringupStepAllowed("gfxoff")) return;
