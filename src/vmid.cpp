@@ -75,6 +75,7 @@ void Pool::dropOtherSlotsOf(uintptr_t owner, uint32_t keep) {
 void Pool::bind(uint32_t v, uintptr_t owner, uint64_t pd, uint64_t tlbSeq, Grant &out) {
 	Slot &s = slot[v];
 	out.stolen = s.owner != 0 && s.owner != owner;
+	out.prevOwner = s.owner != owner ? s.owner : 0;
 	s.owner = owner;
 	s.pd = pd;
 	s.boundSeq = tlbSeq;

@@ -56,6 +56,7 @@ struct Grant {
 	bool rebind { false };     // the caller must write this client's page directory into the VMID's context (and IH LUT)
 	bool flush { false };      // the caller must invalidate the VMID's TLB (always true with rebind)
 	bool stolen { false };     // rebind took the VMID from another owner (for logs)
+	uintptr_t prevOwner { 0 }; // who owned the VMID before a rebind (0 = nobody): a fault latched for it belongs to that owner
 	uint32_t waitDomain { 0 }; // Busy: the fence to wait on
 	uint32_t waitSeq { 0 };
 };

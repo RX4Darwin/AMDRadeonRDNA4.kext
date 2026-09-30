@@ -442,6 +442,52 @@ def test_u1_priv_queue_model():
     finally:
         sc.close()
 
+def test_vmid_rebind_protocol():
+    """S8's B-V1: one VMID re-targeted between two clients over MMIO on an idle VMID: write the page-directory base, set the IH LUT, invalidate
+    (src/vmshared.cpp vmAcquire). The negative control skips the invalidate: the emulator's TLB must then serve the OLD client's mapping and name it."""
+    sc = tlb_scenario("S8 B-V1: a VMID rebound between two clients: rebind + invalidate isolates them; without the invalidate the emulator catches it")
+    try:
+        q = sc.q
+        # Client A = the scenario's tables (X -> P1). Client B = a second set (X -> P2).
+        for t in (0x110000, 0x111000, 0x112000, 0x113000):
+            q.vram_w(t, bytes(0x1000))
+        q.vram_w64(0x110000, 0x111000 | VALID); q.vram_w64(0x111000 + 4 * 8, 0x112000 | VALID); q.vram_w64(0x112000, 0x113000 | VALID)
+        for i, p in ((0, P_RING), (1, P_EOP), (2, P_RPTR), (X, P2)):
+            sc.map(0x113000, i, p)
+        ring, wb = 0x01000000, 0x01100000
+        q.memwrite(ring, bytes(256)); q.memwrite(wb, bytes(8))
+        q.wreg(OSS(0x83), ring >> 8); q.wreg(OSS(0x84), 0); q.wreg(OSS(0x86), wb); q.wreg(OSS(0x85), 0)
+        q.wreg(OSS(0x80), 1 | (1 << 8) | (1 << 17) | (2 << 28))
+        V = sc.VMID
+        def rebind(pdb, pasid, invalidate=True):
+            sc.bind(pdb)                                      # CNTL, base, range
+            q.wreg(OSS(V), pasid)                             # IH_VMID_n_LUT
+            if invalidate:
+                sc.invalidate((1 << V) | INV_ALL)
+        rebind(PDB2, 0x11)
+        sc.write_x(0xa1)
+        check(q.vram_r32(P1) == 0xa1 and q.vram_r32(P2) == 0, "client A's job wrote through A's tables (P1)")
+        rebind(0x110000, 0x22)
+        sc.write_x(0xb1)
+        check(q.vram_r32(P2) == 0xb1 and q.vram_r32(P1) == 0xa1, "after rebind + invalidate client B's job wrote through B's tables (P2), A's page untouched")
+        check(sc.stale_count() == 0, "no stale translation was used by the correct protocol")
+        q.wreg(REG_FAULT_STATUS, 0)
+        sc.submit(write_data(va(9), 0xdead), timeout=1.0)    # a fault while the VMID is B's
+        iv = struct.unpack("<8I", q.memread(ring, 32))
+        check((iv[3] & 0xffff) == 0x22, "the fault vector names client B's PASID (0x%04x)" % (iv[3] & 0xffff))
+        q.wreg(REG_FAULT_STATUS, 0)
+        # Negative control: rebind to A but SKIP the invalidate (a kext bug): the TLB still holds B's translation for X.
+        rebind(PDB2, 0x11, invalidate=False)
+        before = sc.stale_count()
+        sc.write_x(0xa2)
+        check(q.vram_r32(P2) == 0xa2 and q.vram_r32(P1) == 0xa1, "negative control: without the invalidate client A's job reaches B's page (the cross-client leak a missing flush causes)")
+        check(sc.stale_count() > before, "negative control: the emulator names the STALE TRANSLATION")
+        sc.invalidate((1 << V) | INV_ALL)
+        sc.write_x(0xa3)
+        check(q.vram_r32(P1) == 0xa3, "with the invalidate A's job is back in A's tables")
+    finally:
+        sc.close()
+
 def test_fault_is_not_stale():
     """Kiln's dry run (hub-task-333) flagged 16640 'STALE TRANSLATION' lines, every one at a VA the kext had logged a fault for: a faulting access that
     passed through a cached upper-level PDE made the span walker return the fault-default page, which the verification walk could not reproduce. A fault
@@ -466,7 +512,7 @@ def main():
         return 2
     for t in (test_stale_until_invalidated, test_level_bits, test_context_rebind_needs_flush, test_ack_latency,
               test_engines_and_noack, test_tlb_off_is_the_old_model, test_sh_mem_per_vmid, test_ih_lut_and_fault_vector,
-              test_u1_priv_queue_model, test_fault_is_not_stale):
+              test_u1_priv_queue_model, test_vmid_rebind_protocol, test_fault_is_not_stale):
         try:
             t()
         except Exception as e:                                          # a scenario that cannot run is a failure, loudly
