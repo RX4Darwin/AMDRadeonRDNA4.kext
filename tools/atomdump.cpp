@@ -35,6 +35,7 @@
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
+#include "../src/linuxref.hpp"
 #include "rdna4compute.h"
 
 #include <cstdarg>
@@ -1956,6 +1957,53 @@ static int testGpuHeap() {
 	return failures;
 }
 
+// W43: the `linux diff:` formatter is bounded. Worst-case 'why' strings and every capacity from 1 up must leave the canary bytes
+// after the buffer untouched, keep the string NUL-terminated inside the capacity, and never report a length past it.
+static int testLinuxRefFormat() {
+	int failures = 0;
+	static char longWhy[4096];
+	memset(longWhy, 'w', sizeof(longWhy) - 1);
+	longWhy[sizeof(longWhy) - 1] = '\0';
+	const LinuxRefTable::Ref worst = { "A_VERY_LONG_REGISTER_NAME_FOR_THE_TEST", { 1, 0xffff }, 0xffffffffu, 0xffffffffu, longWhy };
+	const LinuxRefTable::Ref noWhy = { "R", { 0, 1 }, 1, 0xffffffffu, "" };
+	const LinuxRefTable::Ref nullWhy = { "R", { 0, 1 }, 1, 0xffffffffu, nullptr };
+	bool ok = true;
+	size_t maxReal = 0;
+	for (size_t cap = 1; cap <= 600 && ok; cap++) {
+		char buf[700];
+		memset(buf, 0xA5, sizeof(buf));
+		for (int which = 0; which < 3 && ok; which++) {
+			const LinuxRefTable::Ref &r = which == 0 ? worst : which == 1 ? noWhy : nullWhy;
+			memset(buf, 0xA5, sizeof(buf));
+			const size_t len = LinuxRefTable::format(buf, cap, r, 0x12345678u);
+			bool canary = true;
+			for (size_t i = cap; i < sizeof(buf); i++)
+				canary = canary && static_cast<unsigned char>(buf[i]) == 0xA5;
+			ok = canary && len < cap && buf[len] == '\0' && strlen(buf) == len;
+			if (!ok)
+				printf("  linuxref: cap %zu entry %d: len %zu canary %d\n", cap, which, len, (int)canary);
+		}
+	}
+	failures += check(ok, "linuxref: every capacity 1..600 stays inside its buffer with a %zu-char why", strlen(longWhy));
+	char zero[4] = { 'x', 'x', 'x', 'x' };
+	failures += check(LinuxRefTable::format(zero, 0, worst, 1) == 0 && zero[0] == 'x', "linuxref: capacity 0 writes nothing");
+	failures += check(LinuxRefTable::format(nullptr, 8, worst, 1) == 0, "linuxref: a null buffer is refused");
+	// The real table: every entry fits the line the kext uses without truncation.
+	bool fits = true;
+	for (size_t i = 0; i < LinuxRefTable::kCount; i++) {
+		char line[LinuxRefTable::kLineMax];
+		const size_t len = LinuxRefTable::format(line, sizeof(line), LinuxRefTable::kRefs[i], 0xffffffffu);
+		maxReal = len > maxReal ? len : maxReal;
+		const size_t full = strlen(LinuxRefTable::kRefs[i].name) + strlen(LinuxRefTable::kRefs[i].why) + 64;
+		fits = fits && len < sizeof(line) - 1 && full < sizeof(line) * 2;
+		fits = fits && (len == 0 || line[len] == '\0');
+	}
+	failures += check(fits && maxReal + 1 < LinuxRefTable::kLineMax, "linuxref: the real table's longest line is %zu of %zu bytes (not truncated)",
+	                  maxReal, LinuxRefTable::kLineMax);
+	printf("\nlinuxref: the linux-diff formatter is bounded %s\n", failures ? "FAILED" : "ok");
+	return failures;
+}
+
 static int testFlipArithmetic() {
 	int failures = 0;
 	failures += check(Flip::surfaceBytes(1920, 1080) == 1920ull * 1080 * 4,
@@ -2312,6 +2360,7 @@ int main(int argc, char **argv) {
 	failures += testFlipArithmetic();
 	failures += testGcInfo();
 	failures += testGpuVm();
+	failures += testLinuxRefFormat();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

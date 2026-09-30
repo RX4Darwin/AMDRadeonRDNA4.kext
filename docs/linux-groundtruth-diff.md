@@ -33,3 +33,10 @@ the vkcube draw state). Read-only. The kext now logs the same registers next to 
 ## Kept
 
 The pipeline-statistics verdict and the NGG marker stay the first lines after every draw (W41), together with the CP-side reads and the clear-state evidence.
+
+## Caveats (W43)
+
+- **No control run for the applied `GCVM_CONTEXT1..15_CNTL = 0x03fffc07`.** The W36 `ispte=0` control (a leaf without IS_PTE faults, with IS_PTE it works) was characterised on the card with bits 24-25 **clear** (`0x00fffc07`). The value Linux uses
+  (and the reset default) has never been run with the kext's VM path; if a VM boot behaves differently from the W36 characterisation, suspect these two bits first (they are the fault-enable defaults Linux keeps).
+- **The diff logger is bounded** (W43, review BLOCKER): `gfxLinuxDiff` used to append entries into a `char[300]` with unchecked `snprintf` lengths, which could overflow the stack buffer with long `why` strings. It now logs one line per register through
+  `LinuxRefTable::format` (`src/linuxref.hpp`), which never writes past its capacity; `tools/atomdump.cpp` (`make test`, `testLinuxRefFormat`) feeds it a 4095-character `why`, capacities 1..600 with canary bytes, capacity 0 and a null buffer.

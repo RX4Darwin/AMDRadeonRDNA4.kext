@@ -31,6 +31,7 @@
 
 #include "compute.hpp"
 #include "gfx12_draw.h"
+#include "linuxref.hpp"
 #include "ngg_kernel.h"
 #include "nggmsg_kernel.h"
 #include "nggstore_kernel.h"
@@ -971,77 +972,21 @@ void RDNA4Compute::gfxClearStatePre() {
 // reads in the registers that decide VM translation, the gfx queue, the RLC and the CP, compared with ours at the same
 // point. Read-only. `mask` limits the comparison to bits that are meaningful (ring size, addresses and doorbell index differ by design);
 // `why` says what a known difference is. Logged once per gfx boot, right before the draw, as `linux diff: DIFF name ours 0x.. linux 0x..`.
-struct LinuxRef { const char *name; Reg reg; uint32_t linux_; uint32_t mask; const char *why; };
-static const LinuxRef kLinuxRef[] = {
-	{ "GCVM_L2_CNTL", { 0, 0x15c4 }, 0x00080e01, 0xffffffff, "bit 11 ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY: Linux points faults at a system dummy page; ours is VRAM, so it stays off" },
-	{ "GCVM_L2_CNTL2", { 0, 0x15c5 }, 0x00000003, 0xffffffff, "" },
-	{ "GCVM_L2_CNTL3", { 0, 0x15c6 }, 0x80130009, 0xffffffff, "" },
-	{ "GCVM_L2_CNTL4", { 0, 0x15dd }, 0x00000001, 0xffffffff, "" },
-	{ "GCVM_L2_CNTL5", { 0, 0x15e3 }, 0x00003fe0, 0xffffffff, "" },
-	{ "GCVM_L2_PROTECTION_FAULT_CNTL", { 0, 0x15cc }, 0x3ffffffc, 0xffffffff, "" },
-	{ "GCVM_L2_PROTECTION_FAULT_CNTL2", { 0, 0x15cd }, 0x00060000, 0xffffffff, "" },
-	{ "GCMC_VM_MX_L1_TLB_CNTL", { 0, 0x161b }, 0x00001859, 0xffffffff, "" },
-	{ "GCVM_CONTEXTS_DISABLE", { 0, 0x1634 }, 0x00000000, 0xffffffff, "" },
-	{ "GCVM_CONTEXT0_CNTL", { 0, 0x1624 }, 0x03fffc01, 0xffffffff, "Linux: 3-level GART range 0..0x1ffff pages; ours: flat, one page" },
-	{ "GCVM_CONTEXT1_CNTL", { 0, 0x1625 }, 0x03fffc07, 0xffffffff, "bits 24-25 are reset defaults Linux keeps (RMW); ours wrote them as 0 until W42" },
-	{ "GCVM_CONTEXT8_CNTL", { 0, 0x162c }, 0x03fffc07, 0xffffffff, "bits 24-25, as CONTEXT1" },
-	{ "GCMC_VM_FB_LOCATION_BASE", { 0, 0x1614 }, 0x00008000, 0xffffffff, "" },
-	{ "GCMC_VM_FB_LOCATION_TOP", { 0, 0x1615 }, 0x000083fb, 0xffffffff, "" },
-	{ "GCMC_VM_FB_OFFSET", { 0, 0x15a7 }, 0x00000000, 0xffffffff, "" },
-	{ "GCMC_VM_SYSTEM_APERTURE_LOW", { 0, 0x1619 }, 0x00200000, 0xffffffff, "" },
-	{ "GCMC_VM_SYSTEM_APERTURE_HIGH", { 0, 0x161a }, 0x0020febf, 0xffffffff, "Linux ends the aperture 16 MiB below FB top; ours covers the whole FB (a superset)" },
-	{ "GCMC_VM_AGP_BOT", { 0, 0x1617 }, 0x00ffffff, 0xffffffff, "" },
-	{ "GCMC_VM_AGP_TOP", { 0, 0x1616 }, 0x00000000, 0xffffffff, "" },
-	{ "GCMC_VM_AGP_BASE", { 0, 0x1618 }, 0x00000000, 0xffffffff, "" },
-	{ "RLC_SRM_CNTL", { 1, 0x4c80 }, 0x00000003, 0xffffffff, "" },
-	{ "RLC_CNTL", { 1, 0x4c00 }, 0x00000001, 0xffffffff, "" },
-	{ "RLC_CSIB_LENGTH", { 1, 0x0989 }, 0x0000004b, 0xffffffff, "" },
-	{ "CP_ME_CNTL", { 1, 0x0803 }, 0x0000a000, 0xffffffff, "bit 24 CE_HALT: amdgpu never writes it; Linux reads 0, ours still 1 (rdna4-gfxce=1 clears it)" },
-	{ "CP_RB_ACTIVE", { 0, 0x1f40 }, 0x00000001, 0xffffffff, "" },
-	{ "CP_RB0_CNTL", { 0, 0x1de1 }, 0x00f0088a, 0x00f0c0c0, "ring size differs by design (BUFSZ/BLKSZ masked); bits 20-23 MIN_AVAILSZ/MIN_IB_AVAILSZ = 3 come from the MQD's reset-default CNTL (rdna4-gfxrbmin=1 sets them)" },
-	{ "CP_GFX_HQD_ACTIVE", { 0, 0x1e80 }, 0x00000001, 0xffffffff, "Linux runs the gfx queue through an HQD/MQD; ours is a bare RB0 (rootcause-draw.md #2)" },
-	{ "CP_GFX_HQD_CNTL", { 0, 0x1e8f }, 0x00f0088a, 0x00f0c0c0, "as CP_RB0_CNTL: the MQD/HQD path" },
-	{ "CP_GFX_MQD_BASE_ADDR_HI", { 0, 0x1e7f }, 0x00000080, 0xffffffff, "Linux: MQD in VRAM (0x80_00108000); ours has no MQD" },
-	{ "CP_GFX_HQD_VMID", { 0, 0x1e81 }, 0x00000000, 0xffffffff, "" },
-	{ "GB_ADDR_CONFIG", { 0, 0x13de }, 0x08200545, 0xffffffff, "" },
-	{ "GRBM_CNTL", { 0, 0x0da0 }, 0x00300018, 0xffffffff, "" },
-	{ "SH_MEM_CONFIG (VMID 0)", { 1, 0x09e4 }, 0x0000c00c, 0xffffffff, "" },
-	{ "SH_MEM_BASES (VMID 0)", { 1, 0x09e3 }, 0x00000000, 0xffffffff, "" },
-	{ "CP_MEC_RS64_CNTL", { 1, 0x2904 }, 0x3c000000, 0xffffffff, "" },
-	{ "CP_MES_CNTL", { 1, 0x2807 }, 0x0c000000, 0xffffffff, "" },
-	{ "CP_GFX_RS64_DC_BASE0_HI", { 1, 0x5865 }, 0x00000003, 0xffffffff, "Linux: data cache bases set by the PSP loader (0x3_f9600000 / 0x3_f9700000); 0 here = the loader did not set them" },
-	{ "CP_GFX_RS64_DC_BASE1_HI", { 1, 0x5866 }, 0x00000003, 0xffffffff, "" },
-	{ "GE_CNTL", { 1, 0x225b }, 0xa0010080, 0xffffffff, "" },
-	{ "PA_SC_MODE_CNTL_0", { 1, 0x0292 }, 0x00000022, 0xffffffff, "" },
-	{ "VGT_PRIMITIVE_TYPE", { 1, 0x2242 }, 0x00000000, 0xffffffff, "Linux reads 0 too (idle and with vkcube running): a 0 readback is NOT evidence of a missing primitive type" },
-};
-
 void RDNA4Compute::gfxLinuxDiff(const char *tag) {
 	grbmSelect(0, 0, 0, 0);   // VMID 0 for the banked SH_MEM_*
-	uint32_t compared = 0, differ = 0, len = 0;
-	char line[300];
-	line[0] = '\0';
-	auto flush = [&]() {
-		if (len) {
-			GLOG("%s: linux diff: %s", tag, line);
-			len = 0;
-			line[0] = '\0';
-		}
-	};
-	for (const LinuxRef &r : kLinuxRef) {
+	uint32_t compared = 0, differ = 0;
+	// One GLOG per register (W43, review BLOCKER): no accumulating buffer, so no length arithmetic to get wrong;
+	// LinuxRefTable::format is bounded (host-tested with worst-case 'why' strings).
+	for (const LinuxRefTable::Ref &r : LinuxRefTable::kRefs) {
 		const uint32_t v = rdGc(r.reg);
 		compared++;
-		if ((v & r.mask) == (r.linux_ & r.mask))
+		if ((v & r.mask) == (r.linuxValue & r.mask))
 			continue;
 		differ++;
-		len += snprintf(line + len, sizeof(line) - len, "DIFF %s ours 0x%08x linux 0x%08x", r.name, v, r.linux_);
-		if (r.why[0])
-			len += snprintf(line + len, sizeof(line) - len, " (%s)", r.why);
-		len += snprintf(line + len, sizeof(line) - len, "; ");
-		if (len > 180)
-			flush();
+		char line[LinuxRefTable::kLineMax];
+		LinuxRefTable::format(line, sizeof(line), r, v);
+		GLOG("%s: linux diff: %s", tag, line);
 	}
-	flush();
 	GLOG("%s: linux diff: %u registers compared with the Linux 7.2.2 capture (vkcube), %u differ (the ones listed above)", tag, compared, differ);
 }
 
