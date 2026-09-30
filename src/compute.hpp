@@ -287,6 +287,7 @@ private:
 	}
 	bool sdmaStartMcus();               // sdma_v7_0_enable: unhalt before queue setup
 	bool sdmaQueueInit();
+	uint64_t sdmaStartPtr { 0 };             // P7: the SDMA ring's 64-bit pointers after a wake without power loss (0 at boot and after a real power loss)
 	void sdmaKick(uint64_t wptrBytes);
 	bool sdmaDoorbell { false };        // kick SDMA0 through its doorbell (amdgpu's way)
 	Sdma::Ring sdmaRing;                // SDMA0 queue 0: stage 4, then the runtime's DMA

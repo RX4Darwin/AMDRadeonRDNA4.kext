@@ -169,3 +169,8 @@ would print its usage and exit non-zero (row FAIL). The kext on the stick must b
 **Expected on the emulator (Kiln's / the Windows dry run), boot 8:** `gfx` PASS (G3), `gfx-client` PASS (the self-test's WRITE_DATA IB in a client VMID is modelled by W12e), `gfx-app-info` implicit (the GFX line is
 printed), **`gfx-app-tri` PASS** (the same stream the replay proves; the emulator models it in a client VMID), **`gfx-app-tricol` FAIL** and `gfx-col` FAIL: the G4 attribute-ring path is not modelled there
 (`docs/g4-colour.md` section 7: the draw is refused, 0 px), so `rdna4-run tricol` reports `FAIL  tricol: 0 px ...`. That FAIL is expected on the emulator and is not a regression; on the real card both should PASS.
+
+## Integration note (hub-task-357): shared-queue clients need the gfx fence fields
+
+`rtOpenInner` sets `c->gfxFenceCpu` / `c->gfxFenceMc` (the client's gfx fence dword, `kVmFence + kGfxFenceSlot`); `rtOpenShared` (W13 S7-lite, `rdna4-vmshared=1`) did not, so boot 13 failed (`gfx-client FAIL setup`,
+`SubmitGfxIb: resource shortage`, Kiln's whole-plan dry run). Fixed on `premetal/final` (4365f84). **S8's open path (`rdna4-vmshared=2`) must set the same two fields** when S8 merges.

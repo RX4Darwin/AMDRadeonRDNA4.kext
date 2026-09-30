@@ -2793,6 +2793,8 @@ static void rdna4_sdma_wptr(RDNA4State *s, uint64_t wptr64)
 {
     uint32_t wptr = (uint32_t)wptr64;
 
+    if (!wptr64 && s->sdma_wptr)
+        fprintf(stderr, "rdna4: sdma: wptr restarted at 0 (was 0x%" PRIx64 "): the queue is being programmed\n", s->sdma_wptr);
     if (wptr64 && wptr64 < s->sdma_wptr) {
         fprintf(stderr, "rdna4: sdma: wptr went back from 0x%" PRIx64 " to 0x%" PRIx64
                 ": ignored, the engine waits\n", s->sdma_wptr, wptr64);
@@ -2821,7 +2823,9 @@ static bool rdna4_sdma_process_slice(RDNA4State *s, uint64_t deadline)
             s->sdma_work.size = 4u << ((cntl >> 1) & 0x1f);
             s->sdma_work.ring = ((uint64_t)reg_get(s, REG_SDMA0_RB_BASE) << 8) |
                                  ((uint64_t)reg_get(s, REG_SDMA0_RB_BASE_HI) << 40);
-            s->sdma_work.rptr = reg_get(s, REG_SDMA0_RB_RPTR);
+            /* The engine's pointers are 64-bit and monotonic; the ring position is the pointer modulo the ring size (a driver that resumes at the
+             * engine's own pointers after a wake without power loss programs RB_RPTR = RB_WPTR = 0x17604 etc.). */
+            s->sdma_work.rptr = reg_get(s, REG_SDMA0_RB_RPTR) & (s->sdma_work.size - 1);
             s->sdma_work.wptr = s->sdma_work.pending_wptr & (s->sdma_work.size - 1);
             s->sdma_work.packet_active = false;
             if (!s->gfx_booted || !(cntl & 1) || (reg_get(s, REG_SDMA0_MCU_CNTL) & 1))

@@ -2468,10 +2468,11 @@ bool RDNA4Compute::sdmaQueueInit() {
 	uint32_t rb = rdGc(sdma(0, SdmaQ0RbCntl));
 	rb = (rb & ~(kSdmaRbSizeMask | kSdmaRbEnable)) | (sizeLog2 << kSdmaRbSizeShift) | kSdmaRbPriv;
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbCntl), rb);
-	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbRptr), 0);
-	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbRptrHi), 0);
-	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), 0);
-	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), 0);
+	// Fresh engine: 0 (sdma_v7_0_gfx_resume_instance). After a wake WITHOUT power loss: the engine's own 64-bit pointers (sdmaStartPtr, P7).
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbRptr), static_cast<uint32_t>(sdmaStartPtr));
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbRptrHi), static_cast<uint32_t>(sdmaStartPtr >> 32));
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), static_cast<uint32_t>(sdmaStartPtr));
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), static_cast<uint32_t>(sdmaStartPtr >> 32));
 
 	const uint64_t wpoll = poolMc(kSdmaWptrOffset), rwb = poolMc(kSdmaRptrOffset);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0WptrPollLo), static_cast<uint32_t>(wpoll));
@@ -2484,8 +2485,8 @@ bool RDNA4Compute::sdmaQueueInit() {
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbBaseHi), static_cast<uint32_t>(ring >> 40));
 
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0MinorPtrUpd), 1);
-	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), 0);
-	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), 0);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), static_cast<uint32_t>(sdmaStartPtr));
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), static_cast<uint32_t>(sdmaStartPtr >> 32));
 	// sdma_v7_0 always uses a doorbell (use_doorbell = true): SDMA0 on
 	// dword kSdmaDoorbellDword, routed by NBIF S2A entry 2.
 	const uint32_t db = rdGc(sdma(0, SdmaQ0Doorbell));
@@ -2564,16 +2565,32 @@ bool RDNA4Compute::stageSdma() {
 
 	// 2. SDMA0 queue 0.
 	trail("s4: SDMA0 queue init");
+	// P7 (docs/power-gfx.md s.9.6): a bring-up after a wake WITHOUT a power loss finds the engine still holding its 64-bit pointers (the boot's DMA
+	// advanced them: 0x17604 in the emulator's 11s run). SDMA 7 pointers only grow (commit ae70f2e, measured on the card: a lower wptr reads as
+	// nothing to do and the engine waits for ever), so the ring RESUMES at the engine's pointers instead of restarting at 0. After a real power loss
+	// they read 0 and this is the old behaviour. A first boot never takes this branch: the proven path is unchanged.
+	uint64_t startPtr = 0;
+	if (resumePending) {
+		const uint32_t rl = rdGc(sdma(0, SdmaQ0RbRptr)), rh = rdGc(sdma(0, SdmaQ0RbRptrHi));
+		const uint32_t wl = rdGc(sdma(0, SdmaQ0RbWptr)), wh = rdGc(sdma(0, SdmaQ0RbWptrHi));
+		if (rl != kBad && rh != kBad && wl != kBad && wh != kBad) {
+			const uint64_t rp = (static_cast<uint64_t>(rh) << 32) | rl, wp = (static_cast<uint64_t>(wh) << 32) | wl;
+			startPtr = (rp > wp ? rp : wp) & ~3ull;
+			CLOG("sdma: resume without a power loss? engine pointers rptr 0x%llx wptr 0x%llx: the ring resumes at 0x%llx (0 = the engine was reset)",
+			     static_cast<unsigned long long>(rp), static_cast<unsigned long long>(wp), static_cast<unsigned long long>(startPtr));
+		}
+	}
+	sdmaStartPtr = startPtr;
 	Sdma::Ring &ring = sdmaRing;              // kept: the runtime's DMA uses it
-	if (!ring.init(poolDw(kSdmaRingOffset), poolMc(kSdmaRingOffset), kSdmaRingSize)) {
+	if (!ring.init(poolDw(kSdmaRingOffset), poolMc(kSdmaRingOffset), kSdmaRingSize, startPtr)) {
 		publish();
 		return false;
 	}
-	*poolDw(kSdmaRptrOffset) = 0;
+	*poolDw(kSdmaRptrOffset) = static_cast<uint32_t>(startPtr);
 	*poolDw(kSdmaTestOffset) = 0xCAFEDEAD;
 	*poolDw(kSdmaFenceOffset) = 0;
-	*poolDw(kSdmaWptrOffset) = 0;           // the MCU polls this from enable on
-	*poolDw(kSdmaWptrOffset + 4) = 0;
+	*poolDw(kSdmaWptrOffset) = static_cast<uint32_t>(startPtr);           // the MCU polls this from enable on
+	*poolDw(kSdmaWptrOffset + 4) = static_cast<uint32_t>(startPtr >> 32);
 	flushHdp();
 	trail("s4: SDMA MCU unhalt");
 	sdmaStartMcus();

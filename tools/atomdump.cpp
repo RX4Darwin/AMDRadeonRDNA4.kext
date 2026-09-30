@@ -1644,6 +1644,18 @@ static int testSdmaPackets() {
 	failures += check(ok && r.wptr() == 20 * 5 * 4 && mem[((19 * 5 + 4) * 4 % 256) / 4] == 19,
 	                  "sdma: ring wrap (wptr %llu)", static_cast<unsigned long long>(r.wptr()));
 	failures += check(!r.init(mem, 0x8008800010ull, sizeof(mem)), "sdma: unaligned ring accepted");
+	// P7: a ring that RESUMES at the engine's own 64-bit pointers (a wake without power loss): the wptr continues monotonically from there and the packets
+	// land at the pointer modulo the ring size.
+	{
+		uint32_t rm[64];
+		Sdma::Ring rr;
+		const uint64_t start = 0x17604;            // the emulator's 11s run: 95748 bytes
+		ok = rr.init(rm, 0x8008800000ull, sizeof(rm), start) && rr.wptr() == start && rm[0] == 0;
+		ok = ok && rr.emit(p, Sdma::writeDword(p, a, 0x77)) && rr.wptr() == start + 5 * 4;
+		failures += check(ok && rm[(start & 255) / 4] == p[0] && rr.wptr() > start,
+		                  "sdma: ring resumed at the engine's pointers (wptr 0x%llx)", static_cast<unsigned long long>(rr.wptr()));
+		failures += check(rr.init(rm, 0x8008800000ull, sizeof(rm), 0x17607) && rr.wptr() == 0x17604, "sdma: a resume pointer is dword aligned");
+	}
 
 	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR encodings and ring wrap %s\n",
 	       failures ? "FAILED" : "ok");
