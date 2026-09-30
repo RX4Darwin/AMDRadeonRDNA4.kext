@@ -868,16 +868,21 @@ private:
 	void vmRegistryAdd(const char *prop, char *buf, size_t cap, uint32_t &len, bool &full, const char *entry);
 	bool     vmSurveyOn { false };
 	bool     vmOpTraceOn { false };
-	uint32_t vmOpTraceLines { 0 };
+	uint32_t vmOpTraceLines { 0 };        // runtime clients (boot self-tests, diagnostic-log clients, the user client)
+	uint32_t vmOpProbeLines { 0 };        // the S1 probes of vmIdTest: their own budget, so they cannot use up the clients' (hub-task-347)
+	bool     vmOpInProbe { false };
 	bool     vmSurveyClientDone { false };
 	bool     vmSurveyDispatchDone { false };
 	bool     vmIdShaderHung { false };        // an early S1 shader probe hung: the late ones are skipped
 	char     vmSurveyBuf[3072] {};
 	uint32_t vmSurveyLen { 0 };
 	bool     vmSurveyFull { false };
-	char     vmOpsBuf[1536] {};
+	char     vmOpsBuf[3072] {};               // Compute,VMOps: runtime clients
 	uint32_t vmOpsLen { 0 };
 	bool     vmOpsFull { false };
+	char     vmProbeOpsBuf[1536] {};          // Compute,VMProbeOps: the S1 probes' own operations
+	uint32_t vmProbeOpsLen { 0 };
+	bool     vmProbeOpsFull { false };
 	void vmDumpHubWindows(const char *tag);   // W17 E1, read-only
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);

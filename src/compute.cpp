@@ -661,7 +661,8 @@ void RDNA4Compute::runStages() {
 	{   const uint32_t m = vmIdTestMask();     // W13 S1 diagnostics (vmtest.cpp)
 		vmSurveyOn = (m & 2) != 0;
 		vmOpTraceOn = (m & 4) != 0;
-		vmOpTraceLines = 0;
+		vmOpTraceLines = vmOpProbeLines = 0;
+		vmOpInProbe = false;
 		vmSurveyClientDone = false; }
 	vmShared = requestedVmShared();
 	bootQueueLive = false;
