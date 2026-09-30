@@ -154,10 +154,33 @@ START=$(date +%s)
 for i in $(seq 1 90); do grep -aq "BdsDxe: starting" "$SERIAL" 2>/dev/null && break; sleep 1; done
 sleep "${PICKER_DELAY:-14}"
 shot picker
-mon ${PICKER_KEYS:-"sendkey right" "sendkey ret"}
-say "picker answered after $(( $(date +%s) - START )) s"
-for i in $(seq 1 30); do grep -aq "Darwin Kernel" "$SERIAL" && break; sleep 2; done
-grep -aq "Darwin Kernel" "$SERIAL" || { say "no kernel yet, picking again"; shot picker2; mon ${PICKER_KEYS:-"sendkey right" "sendkey ret"}; }
+tile() {   # efi | base | none: which OpenCore picker tile is highlighted (the grey box behind it)
+	mon "screendump $RUN/pick.ppm" >/dev/null 2>&1
+	python3 - "$RUN/pick.ppm" <<'PY'
+import sys
+d = open(sys.argv[1], 'rb').read()
+parts = d.split(b'\n', 3)
+w, h = map(int, parts[1].split())
+px = parts[3]
+g = lambda x, y: px[(y * w + x) * 3]
+e, b = g(820, 470), g(972, 470)
+print("efi" if e > 60 and b < 30 else "base" if b > 60 and e < 30 else "none")
+PY
+	rm -f "$RUN/pick.ppm"
+}
+# The picker sometimes drops a key (seen: both presses lost once in ten runs), and "right" from
+# the Recovery tile wraps to EFI, which relaunches OpenCore: so look before every key press.
+for try in 1 2 3 4 5 6; do
+	t=$(tile)
+	case $t in
+		base) mon "sendkey ret" ;;
+		efi) mon ${PICKER_KEYS:-"sendkey right" "sendkey ret"} ;;
+		*) sleep 5; continue ;;
+	esac
+	say "picker ($t selected) answered after $(( $(date +%s) - START )) s"
+	for i in $(seq 1 20); do grep -aq "Darwin Kernel" "$SERIAL" && break 2; sleep 2; done
+	say "no kernel yet, looking at the picker again"; shot picker$try
+done
 
 # Done when Recovery is up and the kext has finished (its bring-up line or a
 # failure), plus a grace period for late lines; or on panic / the time limit.
