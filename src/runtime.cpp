@@ -1500,6 +1500,8 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 		c->active = true;
 		return kIOReturnSuccess;
 	}
+	if (vmShared)
+		return rtOpenShared(owner, slot, c);
 	uint32_t vmid = 0;
 	for (vmid = 8; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
 	if (vmid > 15)
@@ -1584,6 +1586,74 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	RLOG("vmid %u: client queue activated MEC1 pipe %u queue %u, PDB2 MC 0x%llx physical 0x%llx, doorbell dword %u",
 	     vmid, pipe, queue, c->rootMc, c->rootPhys, c->doorbell);
 	vmOpTrace("open", vmid, pipe, queue);
+	if (!vmSurveyClientDone) {
+		vmSurveyClientDone = true;
+		vmSurvey("after the first client opened");
+	}
+	return kIOReturnSuccess;
+}
+
+/* rdna4-vmshared=1 (vmshared.cpp): the client has a VMID and page tables but no queue. Same VA layout for the pages it keeps (kernarg, fence), plus
+ * the IB page the kernel writes each dispatch into. */
+IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *c) {
+	if (!vmSharedEnsure())
+		return kIOReturnNotReady;
+	uint32_t vmid = 0;
+	for (vmid = 8; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
+	if (vmid > 15)
+		return kIOReturnNoResources;
+	const uint32_t sq = slot & 1;
+	if (sharedQ[sq].wedged || !sharedQ[sq].up)
+		return kIOReturnNotResponding;
+	uint64_t table = 0;
+	if (!devHeap.size() || !devHeap.alloc(kVmTableBytes, table))
+		return kIOReturnNoMemory;
+	if (kVmQueueBase + slot * kVmQueueStride + kVmIb + 0x1000 > pool.size) {
+		devHeap.free(table);
+		return kIOReturnNoMemory;
+	}
+	*c = RtClient {};
+	c->owner = owner; c->vmid = vmid; c->shared = true; c->sq = static_cast<uint8_t>(sq);
+	c->pipe = sharedQ[sq].pipe; c->queue = sharedQ[sq].queue;   // for reporting; the client owns no HQD
+	c->tableOffset = table; c->rootMc = vramMc(table);
+	if (!gpuPhysical(c->rootMc, c->rootPhys)) {
+		devHeap.free(table); *c = RtClient {};
+		return kIOReturnNoMemory;
+	}
+	c->tableShadow = reinterpret_cast<uint64_t *>(IOMalloc(kVmTableBytes));
+	if (!c->tableShadow) {
+		devHeap.free(table); *c = RtClient {};
+		return kIOReturnNoMemory;
+	}
+	bzero(c->tableShadow, kVmTableBytes);
+	c->tableShadow[0] = GpuVm::encodePde(c->rootPhys + 0x1000, GpuVm::kValid, 2);
+	c->tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
+		GpuVm::encodePde(c->rootPhys + 0x2000, GpuVm::kValid, 1);
+	const uint32_t qoff = kVmQueueBase + slot * kVmQueueStride;
+	c->poolOff = qoff;
+	for (uint32_t off = 0; off < 0x8000; off += 4)
+		*poolDw(qoff + off) = 0;
+	flushHdp();
+	c->kernargCpu = poolDw(qoff + kVmKernarg);
+	c->fenceCpu = poolDw(qoff + kVmFence);
+	/* The same VA slots as the HQD path (six pages), of which the queue's four stay unmapped, then the IB page. */
+	c->nextVa += 4 * 0x1000;
+	c->fenceVa = c->nextVa; c->nextVa += 0x1000;
+	c->kernargVa = c->nextVa; c->nextVa += 0x1000;
+	c->ibVa = c->nextVa; c->nextVa += 0x1000;
+	if (!vmMap(*c, c->fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
+	    !vmMap(*c, c->kernargVa, poolMc(qoff + kVmKernarg), 0x1000, false) ||
+	    !vmMap(*c, c->ibVa, poolMc(qoff + kVmIb), 0x1000, true) || !vmContextInit(*c)) {
+		IOFree(c->tableShadow, kVmTableBytes); devHeap.free(table); *c = RtClient {};
+		return kIOReturnNoMemory;
+	}
+	c->doorbell = sharedQ[sq].doorbell;
+	(void)vmInvalidate(vmid, "client context enable");
+	vmidUsed[vmid] = true;
+	c->active = true;
+	RLOG("vmid %u: shared-queue client (rdna4-vmshared) on shared queue %u (MEC1 pipe %u queue %u, VMID 0), PDB2 MC 0x%llx, IB VA 0x%llx",
+	     vmid, sq, sharedQ[sq].pipe, sharedQ[sq].queue, c->rootMc, c->ibVa);
+	vmOpTrace("open", vmid, c->pipe, c->queue);
 	if (!vmSurveyClientDone) {
 		vmSurveyClientDone = true;
 		vmSurvey("after the first client opened");
@@ -2251,9 +2321,9 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
 		return state;
-	if (rtWedged)
-		return kIOReturnNotResponding;
 	RtClient *c = vmClientFor(owner);
+	if (rtWedged && !(c && c->shared))
+		return kIOReturnNotResponding;
 	if (vmEnabled && !c)
 		return kIOReturnNoResources;
 	if (c)
@@ -2322,6 +2392,22 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	l.recoveryWpoll = c ? c->wpollVa : 0;
 	l.recoveryProofAddress = c ? c->fenceVa : 0;
 	l.recoveryProofCpu = c ? c->fenceCpu : nullptr;
+	if (c && c->shared) {
+		/* rdna4-vmshared: the job runs on the client's shared VMID-0 queue as INDIRECT_BUFFER(vmid) + a ring-level fence to the client's
+		 * fence word (an MC address). The packets are written into the client's IB page. */
+		SharedQueue &sq = sharedQ[c->sq];
+		if (sq.wedged || !sq.up)
+			return kIOReturnNotResponding;
+		l.queue = &sq.pm;
+		l.pipe = sq.pipe;
+		l.queueId = sq.queue;
+		l.doorbell = sq.doorbell;
+		l.fenceAddress = poolMc(c->poolOff + kVmFence);
+		l.ibCpu = poolDw(c->poolOff + kVmIb);
+		l.ibVa = c->ibVa;
+		l.ibVmid = vmidForSubmit(*c);
+		l.queueCpu = nullptr;
+	}
 
 	uint64_t ns = 0;
 	if (c)
@@ -2333,6 +2419,14 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	if (!done) {
 		if (c)
 			c->ibOutstanding = 0;
+		if (c && c->shared) {
+			if (recoverSharedQueue(c->sq, c->vmid, "runtime")) {
+				RLOG("dispatch timed out after %u ms; shared queue recovered without a GPU reset", l.timeoutUs / 1000);
+			} else {
+				RLOG("dispatch timed out after %u ms: shared queue %u recovery failed; that queue stays wedged", l.timeoutUs / 1000, c->sq);
+			}
+			return kIOReturnTimeout;
+		}
 		if (recoverComputeQueue("runtime", &l)) {
 			rtWedged = false;
 			RLOG("dispatch timed out after %u ms; queue recovered without a GPU reset", l.timeoutUs / 1000);
@@ -2362,7 +2456,9 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	RtClient *c = vmClientFor(owner);
 	if (!c)
 		return kIOReturnNoResources;
-	if (rtWedged)
+	if (rtWedged && !c->shared)
+		return kIOReturnNotResponding;
+	if (c->shared && (sharedQ[c->sq].wedged || !sharedQ[c->sq].up))
 		return kIOReturnNotResponding;
 	if (!ibVa || (ibVa & 3) || !dwords || dwords > (1u << 20) || flags)
 		return kIOReturnBadArgument;
@@ -2382,25 +2478,31 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	if (!containing)
 		return kIOReturnBadArgument;
 	retireIbFences(*c);
-	if (c->ibOutstanding >= kMaxIbOutstanding)
+	/* A shared queue's ring (4 KiB) carries the jobs of up to four clients: 8 outstanding jobs of 20 dwords each keep it far from full. */
+	if (c->ibOutstanding >= (c->shared ? 8u : kMaxIbOutstanding))
 		return kIOReturnBusy;
 
 	/* The same VMID-selected shader memory state as launch(): the user IB
 	 * supplies the program and resource registers, while this selector only
-	 * chains it and fences it. */
-	grbmSelect(0, c->pipe, c->queue, c->vmid);
-	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
-	wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
+	 * chains it and fences it. (Shared mode: SH_MEM was written for every VMID at the queues' start.) */
+	if (!c->shared) {
+		grbmSelect(0, c->pipe, c->queue, c->vmid);
+		wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
+		wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
+	}
 	const uint32_t value = nextFence(c->fence);
 	uint32_t pkt[8];
-	if (!c->pm4.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync)) ||
-	    !c->pm4.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), c->vmid)) ||
-	    !c->pm4.emit(pkt, Pm4::releaseMem(pkt, c->fenceVa, value,
-	                                      ihActive && c->pipe < 2)))
+	Pm4::Queue &ring = c->shared ? sharedQ[c->sq].pm : c->pm4;
+	/* Shared: the fence is a ring-level write to the client's fence word (MC address); else a write through the client's VM. */
+	const uint64_t fenceAt = c->shared ? poolMc(c->poolOff + kVmFence) : c->fenceVa;
+	if (!ring.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync)) ||
+	    !ring.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), vmidForSubmit(*c))) ||
+	    !ring.emit(pkt, Pm4::releaseMem(pkt, fenceAt, value,
+	                                    ihActive && c->pipe < 2)))
 		return kIOReturnNoResources;
 	c->fence = value;
 	flushHdp();
-	pm4Kick(c->pm4, c->doorbell, c->pm4.wptr());
+	pm4Kick(ring, c->doorbell, ring.wptr());
 	vmOpTrace("submitib kicked", c->vmid, c->pipe, c->queue);
 	c->ibFences[c->ibOutstanding++] = value;
 	fence = value;
@@ -2421,7 +2523,7 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 	RtClient *c = vmClientFor(owner);
 	if (!c)
 		return kIOReturnNoResources;
-	if (rtWedged)
+	if (rtWedged && !c->shared)
 		return kIOReturnNotResponding;
 	if (timeoutMs > RDNA4_MAX_TIMEOUT_MS ||
 	    static_cast<int32_t>(fence - c->fence) > 0)
@@ -2451,6 +2553,18 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 		return kIOReturnSuccess;
 	}
 
+	if (c->shared) {
+		/* The shared queue's recovery kills this client's waves only (SQ_CMD CHECK_VMID) and re-initialises the queue. */
+		const bool ok = recoverSharedQueue(c->sq, c->vmid, "IB");
+		c->ibOutstanding = 0;
+		if (ok) {
+			*c->fenceCpu = 0;
+			flushHdp();
+		}
+		RLOG("IB fence %u timed out after %u ms; shared queue %u %s", fence, waitMs, c->sq,
+		     ok ? "recovered without a GPU reset" : "recovery failed; that queue stays wedged");
+		return kIOReturnTimeout;
+	}
 	Launch l {};
 	l.queue = &c->pm4;
 	l.vmid = c->vmid;
@@ -2696,6 +2810,19 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	if (nb || np)
 		RLOG("client closed: freed %u buffer(s), %u program(s)", nb, np);
 	if (c && vmEnabled) {
+		if (c->shared) {
+			/* No HQD to dequeue. Jobs still in flight on the shared queue must finish before the tables go: wait (bounded) for
+			 * the client's fence, and recover the queue (kill this VMID's waves) if they do not. */
+			vmOpTrace("release (shared)", c->vmid, c->pipe, c->queue);
+			if (c->ibOutstanding) {
+				const uint32_t want = c->fence;
+				for (uint32_t ms = 0; ms < 500 && !fenceReached(*c->fenceCpu, want); ms++)
+					IOSleep(1);
+				if (!fenceReached(*c->fenceCpu, want))
+					(void)recoverSharedQueue(c->sq, c->vmid, "client close");
+			}
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + c->vmid - 1 }, 0);   // the context goes off before its tables do
+		} else {
 		/* Dequeue is deliberately polled: W1's interrupt path is not required. */
 		vmOpTrace("release before dequeue", c->vmid, c->pipe, c->queue);
 		grbmSelect(1, c->pipe, c->queue, c->vmid);
@@ -2711,6 +2838,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
 		grbmSelect(0, 0, 0, 0);
 		vmOpTrace(inactive ? "release after dequeue" : "release after dequeue TIMEOUT", c->vmid, c->pipe, c->queue);
+		}
 		/* The table allocation is reused by the next client.  Unmapping each
 		 * live object leaves untouched PDEs/PTEs behind, so clear the complete
 		 * image before releasing the VMID or its backing VRAM. */
@@ -2719,11 +2847,15 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			RLOG("vmid %u: page-table teardown clear failed", c->vmid);
 		vmInvalidate(c->vmid, "client close");
 		vmidUsed[c->vmid] = false;
-		queueUsed[c->pipe][c->queue] = false;
+		if (!c->shared)
+			queueUsed[c->pipe][c->queue] = false;
 		IOFree(c->tableShadow, kVmTableBytes);
 		devHeap.free(c->tableOffset);
-		RLOG("vmid %u: client closed, freed MEC1 pipe %u queue %u and page tables",
-		     c->vmid, c->pipe, c->queue);
+		if (c->shared)
+			RLOG("vmid %u: shared-queue client closed, freed its page tables", c->vmid);
+		else
+			RLOG("vmid %u: client closed, freed MEC1 pipe %u queue %u and page tables",
+			     c->vmid, c->pipe, c->queue);
 		*c = RtClient {};
 	} else if (c) {
 		*c = RtClient {};
@@ -2766,8 +2898,11 @@ void RDNA4Compute::powerWillSleep() {
 		return inactive;
 	};
 	(void)drainQueue(0, 0, 0, nullptr);
+	/* rdna4-vmshared: the shared queues are the only HQDs the clients use; they are re-created at the next open after the wake. */
+	if (vmShared && sharedInit)
+		sharedStopAll("system sleep");
 	for (RtClient &c : clients) {
-		if (!c.active || !c.vmid)
+		if (!c.active || !c.vmid || c.shared)
 			continue;
 		Launch recovery {};
 		recovery.queue = &c.pm4;
@@ -2831,6 +2966,9 @@ void RDNA4Compute::resetRuntimeForResume() {
 	}
 	bzero(vmidUsed, sizeof(vmidUsed));
 	bzero(queueUsed, sizeof(queueUsed));
+	for (SharedQueue &q : sharedQ)
+		q.up = q.wedged = false;
+	sharedInit = false;
 	if (devHeapMap) {
 		IOFree(devHeapMap, devHeapMapBytes);
 		devHeapMap = nullptr;

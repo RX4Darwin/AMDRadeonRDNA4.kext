@@ -67,6 +67,7 @@ CXX_SRCS := \
 	src/vmid.cpp \
 	src/runtime.cpp \
 	src/vmtest.cpp \
+	src/vmshared.cpp \
 	src/userclient.cpp \
 	$(LILU)/Library/plugin_start.cpp \
 	src/atombios.cpp \

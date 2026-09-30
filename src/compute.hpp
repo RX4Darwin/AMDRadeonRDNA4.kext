@@ -347,6 +347,11 @@ private:
 		uint64_t        recoveryMqd, recoveryEop, recoveryRptr, recoveryWpoll;
 		uint64_t        recoveryProofAddress;
 		volatile uint32_t *recoveryProofCpu;
+		// W13 S7-lite (rdna4-vmshared=1): the packets go into the client's IB page (ibCpu, at VA ibVa in the client's VM) and the
+		// shared VMID-0 queue `queue` runs INDIRECT_BUFFER(ibVmid) + a ring-level RELEASE_MEM to fenceAddress (an MC address).
+		volatile uint32_t *ibCpu;
+		uint64_t        ibVa;
+		uint32_t        ibVmid;
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
 	void logComputeQueueState(const char *tag, uint32_t pipe = 0, uint32_t queue = 0,
@@ -676,6 +681,7 @@ private:
 	static constexpr uint32_t kVmWptr = 0x4000;
 	static constexpr uint32_t kVmFence = 0x5000;
 	static constexpr uint32_t kVmKernarg = 0x6000;
+	static constexpr uint32_t kVmIb = 0x7000;                 // shared mode: the client's IB page
 	static constexpr uint64_t kHostMaxBuffer = 256ull << 20;
 	static constexpr uint64_t kHostMaxClient = 1ull << 30;
 	static constexpr uint64_t kHostMaxTotal = 4ull << 30;
@@ -704,6 +710,10 @@ private:
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
 		uint32_t fence { 0 }, doorbell { 0 };
+		bool     shared { false };        // rdna4-vmshared: no HQD of its own; its jobs run on a shared VMID-0 queue
+		uint8_t  sq { 0 };                // which shared queue (fixed at open: a client's jobs stay in order)
+		uint32_t poolOff { 0 };           // this client's pool slot area (kVmQueueBase + slot * stride)
+		uint64_t ibVa { 0 };              // shared mode: the kernel-written IB page, mapped executable in the client's VM
 		uint32_t ibFences[kMaxIbOutstanding] {};
 		uint32_t ibOutstanding { 0 };
 		uint64_t *tableShadow { nullptr };
@@ -768,6 +778,27 @@ private:
 	void publishRuntime(uint32_t stage);
 	bool initRuntimeHeap();
 	bool vmBootSelfTest();
+	// W13 S7-lite (docs/w13-vmid.md): with rdna4-vmshared=1 clients own no HQD. Two kernel-owned MEC queues (VMID 0, PRIV_STATE|KMD_QUEUE,
+	// one per MEC pipe) run every client job as INDIRECT_BUFFER(vmid = the client's) followed by a ring-level fence, as amdgpu's kernel
+	// compute rings do. Clients keep a static VMID 8-15. Default off; the per-client-HQD path is unchanged when off.
+	struct SharedQueue {
+		bool up { false }, wedged { false };
+		uint32_t pipe { 0 }, queue { 0 }, doorbell { 0 }, area { 0 };   // area: pool offset of MQD/EOP/PQ/rptr/wptr pages
+		Pm4::Queue pm;
+	};
+	static constexpr uint32_t kSharedQueues = 2;
+	SharedQueue sharedQ[kSharedQueues] {};
+	bool vmShared { false };
+	bool sharedInit { false };
+	static bool requestedVmShared();
+	bool vmSharedEnsure();
+	IOReturn rtOpenShared(const void *owner, uint32_t slot, RtClient *c);
+	bool sharedStart(uint32_t k);
+	void sharedStopAll(const char *why);
+	bool recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const char *tag);
+	// The VMID a client's submissions run in. One place, so the VMID pool (docs/w13-vmid.md s.5.6) can substitute its grab later; W12k's
+	// gfx submit takes the IB's VMID from here too.
+	uint32_t vmidForSubmit(const RtClient &c) const { return c.vmid; }
 	void vmIdTest();                          // W13 S1 (vmtest.cpp): rdna4-vmid-test=1, the VMID/queue diagnostic
 	static bool requestedVmIdTest();
 	static uint32_t vmIdTestMask();          // rdna4-vmid-test: 1 probes, 2 flow-point surveys, 4 client-op trace
