@@ -242,6 +242,13 @@ private:
 	// the compute thread (flip hook); cursorProgramTtu writes, only inside the rdna4-cursor=2 lock bracket.
 	bool cursorProgramTtu();            // opt-in: rdna4-cursorttu=1
 	bool cursorProgramMissionMode();    // W34: HUBPREQ_DEBUG_DB = 1 << 8 as amdgpu does (rdna4-cursordlg=0 skips)
+	// W38 (premetal/rootcause-cursor.md), rdna4-cursor=2 only:
+	void cursorDsclDump(const char *why);   // read-only: DSCL, HUBP request and MPCC lock state the GOP left
+	void cursorPipeFixes();                 // CRQ_EXPANSION_MODE, cursor memory power, (rdna4-cursormpcsel=1) MPCC_UPDATE_LOCK_SEL
+	void cursorDsclDecide();                // DSCL_MODE/RECOUT verdict; rdna4-cursordscl=1 writes amdgpu's mode-0 set
+	bool cursorWaitFrames(uint32_t n);
+	void cursorCrcCheck();                  // OTG CRC over the square's window, cursor on/off/on/off: YES/NO by itself
+	bool cursorPipeFixesOn { false };
 	uint32_t cursorProbeLogs { 0 };
 	bool cursorProbedSet { false }, cursorProbedDraw { false };
 	IOLock *cursorTrailLock { nullptr };   // the trail is appended from the display and the compute thread

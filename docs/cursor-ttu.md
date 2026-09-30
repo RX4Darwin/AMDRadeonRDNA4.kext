@@ -57,3 +57,46 @@ with the next `ttu:` line.
 
 `cursor-ttu-hypothesis=on` (emulator option, formerly `cursor-ttu-strict`) rejects the plane while `CUR0_TTU_CNTL0` delivery is 0. Given section 1 it models something amdgpu
 contradicts; a VM pass with it says only that the kext writes the register (`rdna4-cursorttu=1`), never anything about the card. Default off.
+
+## 7. W38: DSCL / pipe state, per-update fields and the CRC self-check (`rdna4-cursor=2`)
+
+Source: premetal/rootcause-cursor.md (candidates #1 DSCL stage, #3 cursor-only state, #4 MPCC lock-set mapping). Everything logs into `RDNA4FB,Cursor`, every wait is bounded (<= 50 ms),
+only display registers are touched, the GPU is never reset.
+
+Order inside the self-test: `dscl:`/`pipe:` dump (`selftest pre`) -> per-update fields -> `DSCL decision:` -> mission mode (W34) -> arm -> `dscl:`/`pipe:` dump (`selftest post`) -> CRC check.
+
+| Boot-arg | Default | Effect |
+|---|---|---|
+| `rdna4-cursorpipe=0` | on | skips CRQ_EXPANSION_MODE=1 (`0x0620` [3:2], dcn401_hubp.c:293-305), CROB memory power un-force (`0x0681/0x0682`, only if STATUS says gated) and the per-update clear of USE_MALL_FOR_CURSOR (`0x05f7` bit 2, dcn32_hubp.c:133,165; 64x64 ARGB = 16384 B, not above the limit) |
+| `rdna4-cursormpcsel=1` | off | `MPCC_UPDATE_LOCK_SEL` = OPP number (dcn10_mpc.c:221-222); the GOP left 0xf. Changes when the MPCC latches, hence its own arg |
+| `rdna4-cursordscl=1` | off | only if the dump shows `DSCL_MODE == 6` (full bypass) or `RECOUT_SIZE`/`MPC_SIZE` != plane size: amdgpu's mode-0 set (section 4B of the root-cause doc; dcn401_dpp_dscl.c:1067-1161) under the OTG update lock (`0x1b89`, held-wait bit 8). GOP values are logged first |
+
+Register offsets verified in dcn_4_1_0_offset.h (DSCL0_SCL_MODE 0x0d08, RECOUT_START/SIZE 0x0d1e/0x0d1f, MPC_SIZE 0x0d20, LB_DATA_FORMAT/MEMORY_CTRL 0x0d21/0x0d22, DSCL_MEM_PWR_CTRL/STATUS
+0x0d24/0x0d25, OBUF_CONTROL 0x0d26, HUBP0_DCHUBP_MALL_CONFIG 0x05f7, HUBPREQ0_DCN_EXPANSION_MODE 0x0620, OTG0_OTG_CRC_CNTL 0x1b65 ... OTG_CRC0_DATA_B 0x1b6b).
+
+### Reading the verdict
+
+`DSCL decision: ... -> the #1 candidate is LIVE / eliminated` says whether the GOP's DSCL state matches what amdgpu programs. The CRC check is the one that answers the user's question:
+
+    CRC A/B window (104,104)..(160,160) R.G/B: on 1f80.9e16/... off f303.f303/... on ... off ... torn 0: cursor pixels reach the output: YES
+    cursor pixels reach the output: NO      (on == off: the OTG sees no square, so the loss is upstream of the OTG)
+    cursor pixels reach the output: INCONCLUSIVE (...)   (the two "on" reads differ, or one "off" read equals "on" and the other does not)
+
+The method is optc1_configure_crc / optc1_get_crc (dcn10_optc.c:1465-1576); the cursor is read on, off, on, off, back to back. The sprite is opaque, so an "on" CRC does not depend on the desktop; the verbose console scrolls under the window, so only the "off" reads may differ. **YES** = on0 == on2 and on0 differs from both off reads; **NO** = on0 equals both off reads. The window is the square shrunk by 4 px per side (104..160): END's inclusive/exclusive convention is not in the tree, and an edge text pixel must not enter an "on" read. Each sample is read twice and repeated until both agree (`torn` counts the samples that never did); `DATA_B` is masked to 16 bits. `CRC programmed:` prints `OTG_CRC_CNTL` and the four window registers as they read back, so a window that did not latch (`WINDOW_DB_EN`) is visible.
+`NO` with the pipe fixes applied means the cursor never leaves the HUBP/DPP side: continue with candidate #2 (`rdna4-cursordlg`, DLG), then #4 (`rdna4-cursormpcsel=1`).
+
+### Emulator
+
+`cursor=on` composites the plane; the model returns `OTG_CRC0_DATA_RG/B` as a CRC-16 over the composited scanout in the window of `OTG_CRC0_WINDOWA_X/Y` while `OTG_CRC_CNTL.EN` is set. This is
+NOT the silicon CRC algorithm or its values (unknown to the model), and it takes the window in active-area coordinates, which the silicon may not (blanking offset unverified). It
+can only demonstrate that the kext's CRC program/compare logic works and that a plane the model composites is detected; it says nothing about the card's DSCL or MPC dropping the cursor.
+
+Emulator options for the W38 review tests (`RDNA4_DEV=cursor=on,...`, boot-4 arguments plus `rdna4-cursordscl=1`; `tools/vm-test.sh`):
+
+| Option | Effect |
+|---|---|
+| `dscl-mode=N` | the GOP left `DSCL0_SCL_MODE.DSCL_MODE = N`; 6 also leaves RECOUT/MPC_SIZE 0 (bypass: the model then does not check RECOUT), 1-5 leave a 1280x720 RECOUT (a scaling setup; the model has no scaler and shows "no signal", so the CRC reads 0 and the verdict is INCONCLUSIVE, but the decision line is what the test asserts) |
+| `desktop-churn=on` | one desktop pixel inside the CRC window changes with the OTG frame number, like a scrolling console; only the "off" reads see it because the sprite is opaque |
+
+Expected log lines: `dscl-mode=6` -> `case A` + `programming amdgpu's mode-0 set` + `DSCL mode-0 set written`; `dscl-mode=3` -> `case C` + `not written`; default (mode 0, RECOUT = plane) -> `case D` + `not written`;
+with `desktop-churn=on` every run must still end in `cursor pixels reach the output: YES` (the previous strict rule reads INCONCLUSIVE there). The model cannot know whether a real DSCL in bypass drops the cursor plane: it composites it.
