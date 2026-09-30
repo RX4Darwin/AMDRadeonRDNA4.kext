@@ -339,7 +339,7 @@ void RDNA4Compute::vmIdTest(bool late) {
 		*poolDw(dp + off) = 0;
 	/* The s_endpgm-only kernel of T5c: a wave that does nothing and touches no memory. */
 	for (uint32_t i = 0; i < 64; i++)
-		*poolDw(dp + 0x9000 + 4 * i) = i ? 0xbf9f0000u : 0xbf810000u;   // s_endpgm, then s_code_end padding
+		*poolDw(dp + 0x9000 + 4 * i) = i ? 0xbf9f0000u : 0xbfb00000u;   // s_endpgm (SOPP op 48 on gfx11/12; 0xbf810000 is the gfx6-10 encoding), then s_code_end padding
 	uint8_t *codeCpu = poolCpu + dp + 0x6000;
 	for (uint32_t i = 0; i < img.count; i++) {
 		const auto &s = img.seg[i];
