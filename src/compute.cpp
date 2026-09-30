@@ -808,6 +808,8 @@ void RDNA4Compute::runStages() {
 	if (!bringupStepAllowed("gfx draw"))
 		return;
 	const bool drew = gfxOk && stageGfxDraw();
+	if (gfxOk)
+		gfxPark();   // W46: a probe boot leaves the gfx microengines halted, not polling
 	// W27: clock gating, then GFXOFF, are the last things bring-up does, after every
 	// self-test. Nothing after gfxOffProbe() may touch the GC domain except through
 	// GcAccess, which wakes GFX first.

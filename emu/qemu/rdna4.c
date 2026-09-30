@@ -4770,12 +4770,8 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                 for (unsigned lane = 0; lane < 32; lane++) {
                     if ((w->exec >> lane) & 1u) {
                         uint32_t raw = w->v[src][lane];
-                        /* The shader's packed byte lanes are converted at
-                         * SQ_EXP_PRIM to the 9-bit primitive index fields. */
-                        w->prim_export[lane] = (raw & 0xffu) |
-                            (((raw >> 8) & 0xffu) << 9) |
-                            (((raw >> 16) & 0xffu) << 18) |
-                            (raw & (1u << 31));
+                        /* The export value is taken as is: 9-bit index fields at 0, 9, 18 (W46). */
+                        w->prim_export[lane] = raw;
                         w->prim_valid[lane] = true;
                     }
                 }
@@ -5226,7 +5222,11 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
     ngg.s[1] = reg_get(s, REG_GFX_SPI_SHADER_PGM_HI_GS);
     ngg.s[2] = 0x00403000;             /* gs_tg_info: 3 verts, 1 prim */
     ngg.s[3] = 0x10000103;             /* merged_wave_info: wave 0 of 1 */
-    ngg.v[0][0] = 0x04020100;          /* primitive indices 0,1,2 + edge flags */
+    /* W46: gfx12 hands the NGG wave the primitive export value ALREADY PACKED in VGPR0 ("NGG passthrough mode: the HW already packs the
+     * primitive export value to a single register", ac_nir_lower_intrinsics_to_args.c; the vertices are ubfe(v0, 9 * v, 8), ac_nir_lower_ngg.c):
+     * indices 0,1,2 at a 9-bit stride, no edge flags. The earlier model gave byte-packed indices (0x04020100) and converted them at the
+     * export; that conversion is not what the hardware does (the shader exports v0 unchanged). */
+    ngg.v[0][0] = 0x00080200;
     for (unsigned lane = 0; lane < count; lane++)
         ngg.v[3][lane] = lane;         /* auto-index VertexID */
     if (!rdna4_gfx_wave_run(s, &ngg, true,
