@@ -31,6 +31,7 @@
 
 #include "compute.hpp"
 #include "gfx12_draw.h"
+#include "isa.hpp"
 #include "linuxref.hpp"
 #include "ngg_kernel.h"
 #include "nggmsg_kernel.h"
@@ -1372,7 +1373,7 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	// Shaders, each followed by s_code_end padding for the SQ's prefetch.
 	auto place = [&](uint32_t at, const uint32_t *code, uint32_t dwords) {
 		for (uint32_t i = 0; i < 0x100; i++)
-			*poolDw(at + 4 * i) = i < dwords ? code[i] : 0xbf9f0000u;   // s_code_end
+			*poolDw(at + 4 * i) = i < dwords ? code[i] : Isa::kSCodeEnd;   // s_code_end
 	};
 	if (variant & 4)
 		place(kGfxVsOffset, kNggmsgKernel, sizeof(kNggmsgKernel) / 4);
