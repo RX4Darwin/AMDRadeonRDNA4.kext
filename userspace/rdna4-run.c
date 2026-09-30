@@ -22,12 +22,23 @@
  *    rdna4-run anim [seconds]              double-buffered async Mandelbrot
  *    rdna4-run load <file.hsaco> <kernel>  load a code object, describe the
  *                                          kernel, unload it
+ *    rdna4-run tri                         W12k: the G3 triangle recorded by this
+ *                                          program (userspace/gfx12tri.h) into its
+ *                                          own buffers and submitted as its own
+ *                                          gfx IB; the image is checked (8192 px)
+ *    rdna4-run tricol                      the same with a per-vertex colour
+ *                                          through the attribute ring (G4,
+ *                                          userspace/gfx12tricol.h); the colour
+ *                                          check of docs/g4-colour.md
  *
  *  Exit status 0 only when everything asked for succeeded.
  */
 
 #include "librdna4.h"
 #include "bench_codeobj.h"
+#include "gfx12tri.h"
+#include "gfx12tricol.h"
+#include "gfx12trirun.h"
 #include "pm4build.h"
 #include "vadd_codeobj.h"
 
@@ -1939,6 +1950,113 @@ static int cmdLoad(rdna4_t *gpu, const char *path, const char *kernel) {
 	return 0;
 }
 
+/* W12k: the triangle as an application's own gfx IB (docs/w12k-gfx-submit.md). Everything the stream touches is this program's: five device
+ * buffers in its own GPU VM, the IB recorded by userspace/gfx12tri.h (or gfx12tricol.h) with their addresses, submitted with
+ * rdna4_submit_gfx_ib and fenced per client. The bytes are the ones tools/linux-replay proves on the card through amdgpu. */
+static int cmdTri(rdna4_t *gpu, int col) {
+	const char *name = col ? "tricol" : "tri";
+	static uint32_t codeImg[RDNA4_TRI_CODE_BYTES / 4], zeros[256 * 256], img[256 * 256], ibImg[1024];
+	rdna4_info_t info;
+	kern_return_t kr = rdna4_info(gpu, &info);
+	if (kr != KERN_SUCCESS) {
+		printf("  FAIL  %s: info: %s\n", name, rdna4_error(kr));
+		return 1;
+	}
+	if (!(info.flags & RDNA4_FLAG_VM)) {
+		printf("  FAIL  %s: this client has no private GPU VM (boot with rdna4-vm=1)\n", name);
+		return 1;
+	}
+	if (!(info.flags & RDNA4_FLAG_GFX)) {
+		printf("  FAIL  %s: the gfx ring is not available to clients (boot with rdna4-gfx=2; not on probe boots, where the microengines are "
+		       "parked; not after a timed-out client gfx IB)\n", name);
+		return 1;
+	}
+	const uint64_t ringBytes = col ? rdna4_tricol_ring_bytes() : rdna4_tri_ring_bytes();
+	const uint32_t ibDwords = col ? rdna4_tricol_ib_dwords() : rdna4_tri_ib_dwords();
+	if (ibDwords > sizeof(ibImg) / 4 || ibDwords * 4 > RDNA4_TRIRUN_PAGE) {
+		printf("  FAIL  %s: the stream does not fit its page\n", name);
+		return 1;
+	}
+	rdna4_buffer_t code = { 0 }, target = { 0 }, rings = { 0 }, misc = { 0 }, ib = { 0 };
+	int rc = 1;
+	rdna4_buffer_t *all[5] = { &code, &target, &rings, &misc, &ib };
+	const uint64_t sizes[5] = { RDNA4_TRI_CODE_BYTES, RDNA4_TRI_TARGET_BYTES, ringBytes + RDNA4_TRIRUN_RING_SLACK,
+	                            RDNA4_TRIRUN_PAGE, RDNA4_TRIRUN_PAGE };
+	for (int i = 0; i < 5; i++)
+		if ((kr = rdna4_alloc(gpu, sizes[i], all[i])) != KERN_SUCCESS) {
+			printf("  FAIL  %s: alloc %llu bytes: %s\n", name, (unsigned long long)sizes[i], rdna4_error(kr));
+			goto out;
+		}
+	if (!rdna4_trirun_rings_fit(rings.gpu, rings.bytes, ringBytes)) {
+		printf("  FAIL  %s: the 2 MiB-aligned ring block does not fit its allocation (VA 0x%llx)\n", name, (unsigned long long)rings.gpu);
+		goto out;
+	}
+	{
+		const uint64_t ringVa = rdna4_trirun_rings_va(rings.gpu);
+		uint32_t n;
+		if (col) {
+			const rdna4_tricol_va va = { code.gpu, target.gpu, ringVa, misc.gpu };
+			rdna4_tricol_place_shaders(codeImg, ringVa);   /* the attribute ring's address goes into nggcol's buffer descriptor */
+			n = rdna4_tricol_record(ibImg, &va);
+		} else {
+			const rdna4_tri_va va = { code.gpu, target.gpu, ringVa, misc.gpu };
+			rdna4_tri_place_shaders(codeImg);
+			n = rdna4_tri_record(ibImg, &va);
+		}
+		if (n != ibDwords) {
+			printf("  FAIL  %s: the builder refused the addresses (code 0x%llx target 0x%llx rings 0x%llx fence 0x%llx)\n", name,
+			       (unsigned long long)code.gpu, (unsigned long long)target.gpu, (unsigned long long)ringVa, (unsigned long long)misc.gpu);
+			goto out;
+		}
+		const uint32_t zero = 0;
+		if ((kr = rdna4_write(gpu, &code, 0, codeImg, RDNA4_TRI_CODE_BYTES)) != KERN_SUCCESS ||
+		    (kr = rdna4_write(gpu, &target, 0, zeros, RDNA4_TRI_TARGET_BYTES)) != KERN_SUCCESS ||
+		    (kr = rdna4_write(gpu, &misc, 0, &zero, 4)) != KERN_SUCCESS ||
+		    (kr = rdna4_write(gpu, &ib, 0, ibImg, ibDwords * 4)) != KERN_SUCCESS) {
+			printf("  FAIL  %s: writing the buffers: %s\n", name, rdna4_error(kr));
+			goto out;
+		}
+		uint64_t fence = 0, ns = 0;
+		if ((kr = rdna4_submit_gfx_ib(gpu, &ib, 0, ibDwords, &fence)) != KERN_SUCCESS) {
+			printf("  FAIL  %s: SubmitGfxIb: %s\n", name, rdna4_error(kr));
+			goto out;
+		}
+		if ((kr = rdna4_wait_gfx_fence(gpu, fence, 5000, &ns)) != KERN_SUCCESS) {
+			printf("  FAIL  %s: the gfx IB did not finish (fence %llu): %s%s\n", name, (unsigned long long)fence, rdna4_error(kr),
+			       kr == kIOReturnTimeout ? "; the kernel has wedged the gfx ring until the next bring-up" : "");
+			goto out;
+		}
+		uint32_t streamFence = 0;
+		if ((kr = rdna4_read(gpu, &target, 0, img, RDNA4_TRI_TARGET_BYTES)) != KERN_SUCCESS ||
+		    (kr = rdna4_read(gpu, &misc, 0, &streamFence, 4)) != KERN_SUCCESS) {
+			printf("  FAIL  %s: reading back: %s\n", name, rdna4_error(kr));
+			goto out;
+		}
+		int ok;
+		if (col) {
+			rdna4_tricol_result cr;
+			ok = rdna4_tricol_check(img, &cr);
+			printf("  %s  tricol: %u px, max channel error %.2f, max |R+G+B-255| %u, bounds x %u..%u y %u..%u, centroid 0x%08x, stream fence %u, "
+			       "kernel fence %llu in %llu us\n", ok && streamFence == 1 ? "PASS" : "FAIL", cr.covered, cr.maxChannelErr256 / 256.0,
+			       cr.maxSumErr, cr.minX, cr.maxX, cr.minY, cr.maxY, cr.centroid, streamFence, (unsigned long long)fence,
+			       (unsigned long long)(ns / 1000));
+		} else {
+			uint32_t others = 0;
+			const uint32_t red = rdna4_tri_count(img, &others);
+			ok = rdna4_tri_ok(red, others);
+			printf("  %s  tri: %u px of 0x%08x (want %u), %u others, stream fence %u, kernel fence %llu in %llu us\n",
+			       ok && streamFence == 1 ? "PASS" : "FAIL", red, RDNA4_TRI(kCoveredRgba), RDNA4_TRI(kCoveredPixels), others, streamFence,
+			       (unsigned long long)fence, (unsigned long long)(ns / 1000));
+		}
+		rc = ok && streamFence == 1 ? 0 : 1;
+	}
+out:
+	for (int i = 4; i >= 0; i--)
+		if (all[i]->handle)
+			rdna4_free(gpu, all[i]);
+	return rc;
+}
+
 static void usage(void) {
 	fprintf(stderr, "usage: rdna4-run info\n"
 	                "       rdna4-run sleeptest\n"
@@ -1952,7 +2070,9 @@ static void usage(void) {
 	                "       rdna4-run vsync [n]\n"
 	                "       rdna4-run show [seconds]\n"
 	                "       rdna4-run anim [seconds]\n"
-	                "       rdna4-run load <file.hsaco> <kernel>\n");
+	                "       rdna4-run load <file.hsaco> <kernel>\n"
+	                "       rdna4-run tri\n"
+	                "       rdna4-run tricol\n");
 }
 
 int main(int argc, char **argv) {
@@ -2017,6 +2137,10 @@ int main(int argc, char **argv) {
 			return 1;
 		const uint32_t seconds = argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 5;
 		rc = cmdAnim(&gpu, seconds);
+	} else if ((!strcmp(argv[1], "tri") || !strcmp(argv[1], "tricol")) && argc == 2) {
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdTri(&gpu, !strcmp(argv[1], "tricol"));
 	} else if (!strcmp(argv[1], "load") && argc == 4) {
 		if (!openRuntime(&gpu))
 			return 1;
