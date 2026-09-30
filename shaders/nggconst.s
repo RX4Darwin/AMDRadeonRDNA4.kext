@@ -11,23 +11,15 @@
 .text
 .globl nggconst
 nggconst:
+	s_mov_b32          exec_lo, -1              // the wave starts with EXEC = lane 0 only (see ngg.s): v9/v10 for every lane
 	v_mbcnt_lo_u32_b32 v10, -1, 0               // lane id: the vertex index
 	v_mov_b32          v9, 0x00080200           // primitive export: vertex indices 0, 1, 2 (9-bit stride), edge flags 0
-
-	// primitive export: lanes [0, primitives)
-	s_bfe_u32          s9, s3, 0x80008          // s9 = merged_wave_info[15:8]
-	s_bfm_b64          s[12:13], s9, 0          // lane mask of the primitives
-	s_and_saveexec_b32 s14, s12
-	s_cbranch_execz    skip_prim
-	export             prim v9, off, off, off done
-skip_prim:
-	s_mov_b32          exec_lo, s14
 
 	// position export: lanes [0, vertices)
 	s_and_b32          s8, s3, 0xff
 	s_bfm_b64          s[10:11], s8, 0
-	s_and_saveexec_b32 s15, s10
-	s_cbranch_execz    done_vs
+	s_mov_b32          exec_lo, s10
+	s_cbranch_execz    skip_pos
 	v_cmp_eq_u32_e64   s20, 0, v10
 	v_cmp_eq_u32_e64   s21, 1, v10
 	v_cmp_eq_u32_e64   s22, 2, v10
@@ -37,5 +29,15 @@ skip_prim:
 	v_mov_b32          v6, 0                    // z
 	v_mov_b32          v7, 1.0                  // w
 	export             pos0 v4, v5, v6, v7 done
+skip_pos:
+
+	// primitive export: lanes [0, primitives), after the positions like ACO (pos0 done, s_wait_expcnt 0,
+	// prim done). Either order draws on the card (docs/linux-replay.md); this one is Mesa's.
+	s_wait_expcnt      0x0
+	s_bfe_u32          s9, s3, 0x80008          // s9 = merged_wave_info[15:8]
+	s_bfm_b64          s[12:13], s9, 0          // lane mask of the primitives
+	s_mov_b32          exec_lo, s12
+	s_cbranch_execz    done_vs
+	export             prim v9, off, off, off done
 done_vs:
 	s_endpgm
