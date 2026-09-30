@@ -390,6 +390,7 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 		if (resumePending) {
 			resumed = true;
 			powerSleeping = false;
+			powerSleepClear();
 		}
 		RLOG("user-space runtime up again: %s", RDNA4_COMPUTE_SERVICE);
 		publishResult("runtime", "PASS service ready");
@@ -1614,6 +1615,7 @@ bool RDNA4Compute::initPresentationTimer() {
 }
 
 void RDNA4Compute::stopPresentationTimer() {
+	idleStop();        // P2: the idle accounting's poll timer goes away with the presentation timer (shutdown/quiesce)
 	if (presentTimer) {
 		presentTimer->cancelTimeout();
 		if (presentWorkLoop)
@@ -1892,6 +1894,7 @@ IOReturn RDNA4Compute::rtSleepTest(const void *owner, uint32_t phase) {
 	}
 	if (phase == 1) {
 		RLOG("power: debug sleep selector phase 1");
+		powerSleepRequest();
 		powerWillSleep();
 	} else {
 		RLOG("power: debug sleep selector phase 2");
@@ -2122,6 +2125,7 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
                               mach_vm_address_t user, uint64_t length, bool toGpu) {
 	Locked g(rtLock);
+	IdleUse idle(this, "copy");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
@@ -2239,6 +2243,7 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 
 IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros) {
 	Locked g(rtLock);
+	IdleUse idle(this, "dispatch");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
@@ -2316,8 +2321,17 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	l.recoveryProofCpu = c ? c->fenceCpu : nullptr;
 
 	uint64_t ns = 0;
+	waitAborted = false;
 	const bool done = launch(l, "runtime", ns);
 	micros = ns / 1000;
+	if (!done && waitAborted) {
+		/* P7: a sleep was requested while this dispatch waited. Not a timeout: no recovery, no wedge; powerWillSleep drains the HQD. */
+		waitAborted = false;
+		if (c)
+			c->ibOutstanding = 0;
+		RLOG("dispatch wait aborted: a sleep was requested");
+		return kIOReturnAborted;
+	}
 	if (!done) {
 		if (c)
 			c->ibOutstanding = 0;
@@ -2341,6 +2355,7 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwords,
                                   uint64_t flags, uint64_t &fence) {
 	Locked g(rtLock);
+	IdleUse idle(this, "submit-ib");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
@@ -2400,6 +2415,7 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t timeoutMs,
                                    uint64_t &ns) {
 	Locked g(rtLock);
+	IdleUse idle(this, "wait-fence");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
@@ -2416,6 +2432,7 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 		return kIOReturnBadArgument;
 	const uint32_t waitMs = timeoutMs ? timeoutMs : 1000;
 	bool done = false;
+	waitAborted = false;
 	if (ihActive && c->pipe < 2) {
 		done = ihWaitFence(c->fenceCpu, fence, waitMs, true, "IB", ns);
 	} else {
@@ -2426,6 +2443,10 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 			done = fenceReached(*c->fenceCpu, fence);
 			if (done || mach_absolute_time() - t0 > span)
 				break;
+			if (sleepAbortWanted()) {          // P7
+				waitAborted = true;
+				break;
+			}
 			if (polls < 200)
 				IODelay(10);
 			else
@@ -2437,6 +2458,13 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 		retireIbFences(*c);
 		logClientFault(*c, "IB wait");
 		return kIOReturnSuccess;
+	}
+	if (waitAborted) {
+		/* P7: a sleep was requested: not a timeout, so no queue recovery and no wedge. */
+		waitAborted = false;
+		c->ibOutstanding = 0;
+		RLOG("IB fence %u wait aborted: a sleep was requested", fence);
+		return kIOReturnAborted;
 	}
 
 	Launch l {};
@@ -2482,7 +2510,7 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 IOReturn RDNA4Compute::gfxClientReady() const {
 	if (!gfxMode)
 		return kIOReturnUnsupported;                 // rdna4-gfx=2 is not set, or the ring bring-up failed
-	if (bringupRunning || shutdownQuiesced || powerSleeping)
+	if (bringupRunning || shutdownQuiesced || powerSleeping || sleepAbortWanted())
 		return kIOReturnNotReady;                    // the kernel still owns the ring (bring-up draws), or hardware is going away
 	if (gfxParked)
 		return kIOReturnNotReady;                    // probe boots halt PFP/ME after their draws
@@ -2575,6 +2603,12 @@ bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs
 		done = fenceReached(*c.gfxFenceCpu, fence);
 		if (done || mach_absolute_time() - t0 > span)
 			break;
+		if (sleepAbortWanted()) {              // P7: a sleep was requested: end the wait WITHOUT wedging the ring (a timeout would halt PFP/ME)
+			waitAborted = true;
+			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+			RLOG("vmid %u: gfx fence %u wait aborted: a sleep was requested (%s)", c.vmid, fence, why);
+			return false;
+		}
 		if (polls < 200)
 			IODelay(10);
 		else
@@ -2601,6 +2635,7 @@ void RDNA4Compute::gfxClientDrain(RtClient &c, const char *why) {
 
 IOReturn RDNA4Compute::rtSubmitGfxIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags, uint64_t &fence) {
 	Locked g(rtLock);
+	IdleUse idle(this, "submit-gfx");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
@@ -2640,6 +2675,7 @@ IOReturn RDNA4Compute::rtSubmitGfxIb(const void *owner, uint64_t ibVa, uint64_t 
 
 IOReturn RDNA4Compute::rtWaitGfxFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns) {
 	Locked g(rtLock);
+	IdleUse idle(this, "wait-gfx");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
@@ -2655,7 +2691,14 @@ IOReturn RDNA4Compute::rtWaitGfxFence(const void *owner, uint32_t fence, uint32_
 		return kIOReturnBadArgument;
 	if (gfxWedged)
 		return kIOReturnNotResponding;
-	return gfxClientWait(*c, fence, timeoutMs ? timeoutMs : 1000, ns, "IB wait") ? kIOReturnSuccess : kIOReturnTimeout;
+	waitAborted = false;
+	if (gfxClientWait(*c, fence, timeoutMs ? timeoutMs : 1000, ns, "IB wait"))
+		return kIOReturnSuccess;
+	if (waitAborted) {                               // P7
+		waitAborted = false;
+		return kIOReturnAborted;
+	}
+	return kIOReturnTimeout;
 }
 
 /* rdna4-gfxclient=1, on the bring-up thread after the G3 baseline passed: a synthetic client (internal owner token, its own VMID and page
@@ -2979,6 +3022,7 @@ void RDNA4Compute::powerWillSleep() {
 	powerSleeping = true;
 	resumePending = false;
 	RLOG("power: quiesce begin (runtime not ready)");
+	gcWake(0xfffffffdu);        // P7: lift GFXOFF explicitly first (every GC access below would wake it anyway); a clean log and no sleeping GC under the drain
 	// Calls serialize on rtLock, so no dispatch or SDMA fence can still be
 	// executing here. Drain every HQD with the same bounded poll used by W6.
 	auto drainQueue = [this](uint32_t pipe, uint32_t queue, uint32_t vmid,
@@ -3029,6 +3073,7 @@ void RDNA4Compute::powerWillSleep() {
 	// The flip implementation has no independent timer in this worktree;
 	// IH DCN teardown is the hook that stops its vblank/pflip activity.
 	RLOG("power: IH disabled, flip timer hook stopped");
+	gfxSleepDrain();            // P7: give client gfx IBs 100 ms, then drop them (no wedge), BEFORE PFP/ME are halted
 	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
 	wr(IpDiscovery::HwGc, CpMecRs64Cntl, rdGc(CpMecRs64Cntl) | kRs64Halt);
 	dmaTeardown("system sleep");

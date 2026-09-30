@@ -46,6 +46,7 @@ SLEEPTEST_MODE="$(arg_value sleeptest)"
 GFXPM_MODE="$(arg_value gfxpm)"
 GFXCG_MODE="$(arg_value gfxcg)"
 GFXOFF_MODE="$(arg_value gfxoff)"
+GFXIDLE_MODE="$(arg_value gfxidle)"   # P2: idle accounting (software only)
 case "$COMPUTE_STAGE" in ''|*[!0-9]*) COMPUTE_STAGE=0;; esac
 case "$IH_MODE" in ''|*[!0-9]*) IH_MODE=0;; esac
 case "$VM_MODE" in ''|*[!0-9]*) VM_MODE=0;; esac
@@ -55,6 +56,7 @@ case "$GFXCOL_MODE" in ''|*[!0-9]*) GFXCOL_MODE=0;; esac
 case "$GFXCLIENT_MODE" in ''|*[!0-9]*) GFXCLIENT_MODE=0;; esac
 case "$SLEEPTEST_MODE" in ''|*[!0-9]*) SLEEPTEST_MODE=0;; esac
 case "$GFXPM_MODE" in ''|*[!0-9]*) GFXPM_MODE=0;; esac
+case "$GFXIDLE_MODE" in ''|*[!0-9]*) GFXIDLE_MODE=0;; esac
 
 # Queue recovery is an explicit last step. It is never part of an ordinary
 # collection, even when rdna4-hang=1 is present in the boot arguments.
@@ -214,7 +216,7 @@ registry_value() {
 	found=""
 	for a in off cmap lutbypass 8bpc noedid nosleep modedump hwcursor \
 	         curmode curtest dmubping dmubhist dmubver dmubcursor smuping \
-	         ihdump pspdump vbl cursor pm trace compute ih vm flip gfx gfxcol gfxclient hang sleeptest; do
+	         ihdump pspdump vbl cursor pm trace compute ih vm flip gfx gfxcol gfxclient gfxidle sleepabort resume-tests hang sleeptest; do
 		value="$(arg_value "$a")"
 		[ -n "$value" ] && found="$found rdna4-$a=$value"
 	done
@@ -255,6 +257,10 @@ registry_value() {
 
 	section "dmesg: display power (sleep/wake)"
 	dmesg | grep -E 'RDNA4FB: power:' || true
+
+	section "dmesg: idle accounting (rdna4-gfxidle=1) and the Compute,GFXIdle registry copy"
+	dmesg | grep -E 'RDNA4FB: idle:' || echo "(no idle: lines - rdna4-gfxidle not enabled, or no transition yet)"
+	ioreg -l -w0 2>/dev/null | grep '"Compute,GFXIdle"' | sed -n -E 's/.*"Compute,GFXIdle" = "([^"]*)".*/Compute,GFXIdle: \1/p' | head -1
 
 	section "dmesg: GFX power-management experiment (rdna4-gfxpm)"
 	dmesg | grep -E 'RDNA4FB: compute: (pm|cg|gfxoff):' || echo "(rdna4-gfxpm/gfxcg/gfxoff not enabled or no such lines)"
@@ -455,6 +461,20 @@ registry_value() {
 		else
 			echo "(inactive — $GFXAPP_WHY)"
 		fi
+	fi
+
+	# P3 (docs/power-gfx.md): after the application steps every client is closed. Does the GPU go back to idle? The SMU figure is taken 3 s after the last
+	# client closed (the PMFW averages over a window). `rdna4-run sensors` itself opens one short-lived connection: it is the reader, it does not use the GPU.
+	POSTIDLE_RC=125
+	POSTIDLE_FILE=""
+	if [ "$INFO_OK" -eq 1 ]; then
+		sleep 3
+		run_step "GPU sensors after the application steps (P3: post-client idle, 3 s after the last client closed)" "$RUN" sensors
+		POSTIDLE_FILE="$STEP_FILE"
+		POSTIDLE_RC=$STEP_RC
+	else
+		section "GPU sensors after the application steps (P3: post-client idle)"
+		echo "(inactive - runtime unavailable)"
 	fi
 
 	# W6 is part of the compute runtime. rdna4-hang=0 deliberately disables
@@ -762,6 +782,38 @@ registry_value() {
 		record gfxpm PASS "baseline $pm_first -> $pm_last"
 	else
 		record gfxpm FAIL "pm experiment did not finish (see the pm: lines)"
+	fi
+
+	# P3: post-client idle. FAIL when the SMU still reports high GFX activity or power after every client closed.
+	if [ "$INFO_OK" -eq 0 ] || [ -z "$POSTIDLE_FILE" ]; then
+		record post-idle SKIPPED "runtime unavailable"
+	else
+		PI_LINE="$(grep '^sensors-pm\[2\]: GFXCLK' "$POSTIDLE_FILE" 2>/dev/null | tail -1)"
+		PI_ACT="$(printf '%s\n' "$PI_LINE" | sed -n -E 's/.*GFX activity ([0-9]+) %.*/\1/p')"
+		PI_W="$(printf '%s\n' "$PI_LINE" | sed -n -E 's/.*socket ([0-9]+) W.*/\1/p')"
+		PI_BASE="$(grep '^sensors-pm\[2\]: GFXCLK' "$SENSORS_IDLE_FILE" 2>/dev/null | tail -1 | sed -n -E 's/.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 %, \2 W/p')"
+		case "$PI_ACT$PI_W" in
+		'' | *[!0-9]*) record post-idle FAIL "no parsable SMU sample after the application steps (rc $POSTIDLE_RC)" ;;
+		*)
+			if [ "$PI_ACT" -lt 10 ] && [ "$PI_W" -lt 40 ]; then
+				record post-idle PASS "idle after the clients closed: GFX activity ${PI_ACT} %, ${PI_W} W (baseline before the selftest: ${PI_BASE:-n/a})"
+			else
+				record post-idle FAIL "STAYS HIGH after the clients closed: GFX activity ${PI_ACT} %, ${PI_W} W (baseline before the selftest: ${PI_BASE:-n/a}; PASS needs < 10 % and < 40 W)"
+			fi ;;
+		esac
+	fi
+	# P2: the kext's own (software) idle view, for comparison with the SMU's.
+	if [ "$GFXIDLE_MODE" -eq 0 ]; then
+		record gfx-idle-acct SKIPPED "rdna4-gfxidle not enabled"
+	else
+		IDLE_PROP="$(ioreg -l -w0 2>/dev/null | grep '"Compute,GFXIdle"' | sed -n -E 's/.*"Compute,GFXIdle" = "([^"]*)".*/\1/p' | head -1)"
+		if [ -n "$IDLE_PROP" ]; then
+			record gfx-idle-acct PASS "$IDLE_PROP"
+		elif dmesg | grep -q 'RDNA4FB: idle: accounting on'; then
+			record gfx-idle-acct FAIL "accounting started but the Compute,GFXIdle property was never written (no transition)"
+		else
+			record gfx-idle-acct FAIL "rdna4-gfxidle=1 but no idle: line: the kext build has no idle accounting, or bring-up did not reach publish"
+		fi
 	fi
 
 	if [ "$SLEEPTEST_MODE" -ne 1 ]; then

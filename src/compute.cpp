@@ -569,6 +569,7 @@ void RDNA4Compute::resumeMain(void *arg, wait_result_t) {
 		self->resumePending = false;
 		if (!self->rtReady)
 			self->powerSleeping = false;
+		self->powerSleepClear();
 		IOLockUnlock(self->rtLock);
 	}
 	thread_terminate(current_thread());
@@ -579,6 +580,8 @@ void RDNA4Compute::powerDidWake() {
 		return;
 	IOLockLock(rtLock);
 	if (!powerSleeping || resumePending) {
+		if (!powerSleeping)
+			powerSleepClear();          // P7: a sleep request that never reached powerWillSleep must not leave waits aborting
 		IOLockUnlock(rtLock);
 		return;
 	}
@@ -799,15 +802,21 @@ void RDNA4Compute::runStages() {
 		if (!bringupStepAllowed("runtime publish")) return;
 	if (done >= StageDispatch)
 		publishRuntime(done);
+	idleStart();   // P2: idle accounting (rdna4-gfxidle=1), software only
 	// W5: the page-flip test, once the runtime's DMA and device heap exist.
 	if (done >= StageKernel && featureAllowed("flip"))
 		if (!bringupStepAllowed("flip")) return;
-	if (done >= StageKernel && featureAllowed("flip"))
+	// P7: a wake re-runs bring-up, but not its tests: the G3/G4 draws, the gfx client self-test and the flip test (which flips the screen to a test
+	// surface and back) are proofs for the first boot, not for every resume. rdna4-resume-tests=1 brings them back (the emulator's sleep test).
+	const bool resumeSkip = resumePending && !requestedResumeTests();
+	if (resumeSkip)
+		CLOG("power: resume: skipping the G3/G4 draws, the gfx client self-test and the flip test (rdna4-resume-tests=1 runs them)");
+	if (done >= StageKernel && featureAllowed("flip") && !resumeSkip)
 		Flip::run(*this);
 	// G3: the first draw, once the runtime's device heap holds its rings.
 	if (!bringupStepAllowed("gfx draw"))
 		return;
-	const bool drew = gfxOk && stageGfxDraw();
+	const bool drew = gfxOk && !resumeSkip && stageGfxDraw();
 	if (drew && requestedGfxClient())
 		(void)gfxClientSelfTest();   // W12k: a synthetic client gfx IB (rdna4-gfxclient=1), only after the G3 baseline passed
 	if (gfxOk)
@@ -3091,6 +3100,7 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 		CLOG("%s: GFX could not be woken from GFXOFF; dispatch not submitted", tag);
 		return false;
 	}
+	waitAborted = false;   // P7: only a wait of THIS launch may set it
 	const bool vm = l.queue != nullptr;
 	volatile uint32_t *fenceCpu = vm ? l.fenceCpu : poolDw(kPm4FenceOffset);
 	const uint32_t fenceValue = vm ? l.fenceValue : (pm4Fence + 1);
@@ -3159,12 +3169,20 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 			done = *fenceCpu == fenceValue;
 			if (done || mach_absolute_time() - t0 > span)
 				break;
+			if (vm && sleepAbortWanted()) {              // P7: a client dispatch ends when a sleep is requested
+				waitAborted = true;
+				break;
+			}
 			if (polls < 200)
 				IODelay(10);
 			else
 				IOSleep(1);
 		}
 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	}
+	if (!done && waitAborted) {
+		CLOG("%s: dispatch wait aborted: a sleep was requested (no timeout, no recovery)", tag);
+		return false;
 	}
 	if (!done) {
 		CLOG("%s: the kernel's fence never came (0x%08x, want 0x%08x)", tag,

@@ -30,8 +30,10 @@ IOReturn RDNA4ComputeService::setPowerState(unsigned long powerStateOrdinal,
 	      powerStateOrdinal, nowNs);
 	if (!compute)
 		return kIOPMAckImplied;
-	if (powerStateOrdinal == 0)
+	if (powerStateOrdinal == 0) {
+		compute->powerSleepRequest();    // P7: before powerWillSleep takes rtLock, so a client wait holding it ends with Aborted
 		compute->powerWillSleep();
+	}
 	else if (powerStateOrdinal == 1)
 		compute->powerDidWake();
 	return kIOPMAckImplied;

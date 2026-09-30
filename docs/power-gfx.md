@@ -247,3 +247,59 @@ If the machine does not come back: power-cycle; the last `rdna4-trail` names the
 - The −3 W GFXOFF figure is a single boot (`054800`) with a 1.5 s settle; the 16 W reading shows `VDD_GFX 39 mV` and the tool flags it `INCONCLUSIVE` (activity implausible), but power 16 W and 14-0 MHz agree.
 - `SetWorkloadMask` has no measured effect at idle (round 3); its benefit under load is unmeasured.
 - amdgpu reads are to the 7.2.2 tree; the PMFW's behaviour for GC 12.0.1 with SCPM is not in the kernel source.
+
+## 9. Implemented (hub-task-328): P2 idle accounting, P3 post-client idle row, P7 sleep/wake hardening
+
+Branch `premetal/power` on `premetal/w12k` (f43d3c9). New file `src/pmidle.cpp`; call sites are one-liners (`IdleUse` guards, abort checks, three guards in `runStages`). **Nothing here has run on the card or
+(yet) on the emulator**; build and `nm -u` are the only verification so far (§9.5).
+
+### 9.1 P2 — idle accounting (`rdna4-gfxidle=1`, default off)
+
+- **Software only.** No SMU message, no GC register access. It makes the idle state observable; nothing depends on it.
+- **Busy** while any of: bring-up / runtime not ready / sleeping; a synchronous client operation in progress (`IdleUse` guard under `rtLock` in `rtDispatch`, `rtSubmitIb`, `rtWaitFence`,
+  `rtSubmitGfxIb`, `rtWaitGfxFence`, `rtCopy`); a **client fence still outstanding** (`ibOutstanding`, `gfxOutstanding`, `gfxClientPending`); or < **100 ms** since the last use (amdgpu's GFXOFF delay).
+  Present/flip paths do not count (DCN is not GC, §3.1).
+- **Fences end from retirement, not from waits**: a 50 ms timer on the service's work loop (`idleTimer`, created by `idleStart` after `publishRuntime`, removed with the presentation timer at quiesce and at
+  sleep) `TryLock`s `rtLock` (it never waits behind a client), retires the fences of every client by reading their fence dwords (`retireIbFences`, `gfxClientRetire`: host memory only), and declares idle when
+  nothing is busy. A client that submits and never waits therefore cannot keep the runtime busy for ever; one that waits is covered by the `IdleUse` guard while it waits.
+- **Output**: log lines `idle: idle -> busy after N ms idle (<what>)` / `idle: busy -> idle after N ms busy (last use: <what>, ...)` (first 64 transitions, then every 64th) and the registry property
+  `Compute,GFXIdle` = `idle|busy for N ms (<why>); total busy M ms idle K ms, T transitions; last use: <what>` (updated on the first 32 transitions, then every 8th). `diagnostic-log.sh` row `gfx-idle-acct`.
+- Not done (by design): no hook in `rtAlloc`/`rtLoad` (CPU copies), no SDMA-engine busy probe, no SMU coupling. The 100 ms / 50 ms constants are in `pmidle.cpp` (`kIdleDelayMs`, `kIdlePollMs`).
+
+### 9.2 P3 — post-client idle (`tools/diagnostic-log.sh`, no kext change)
+
+After the application steps (`tri`/`tricol`, or whatever clients ran) and before the recovery/sleep steps: `sleep 3`, then `rdna4-run sensors`; row **`post-idle`**: PASS when SMU GFX activity < 10 % **and**
+socket power < 40 W, FAIL `STAYS HIGH` otherwise, with the pre-selftest baseline in the text; SKIPPED when the runtime is unavailable. (`sensors` opens one short connection; it reads the SMU, it does not use
+the GPU.) In a VM boot with the round 6 pin this row will FAIL until the VM blocker is fixed: that is what it is for. Tested offline on synthetic sample lines (PASS / FAIL / SKIPPED, `gfx-idle-acct` with and without the property).
+
+### 9.3 P7 — sleep/wake hardening
+
+| Item | Change | Default |
+|---|---|---|
+| Abortable waits | `sleepRequested` (atomic) is set by `setPowerState(0)` and the debug sleep selector **before** `powerWillSleep` takes `rtLock` (`powerSleepRequest`). Waits that hold `rtLock` poll it: `rtWaitFence` (poll and IH paths), a client `rtDispatch` (`launch()` wait, poll and IH paths), `gfxClientWait` (`rtWaitGfxFence`, `gfxClientDrain`) end at once with **`kIOReturnAborted`**, with **no queue recovery, no `rtWedged`, no `gfxClientWedge`** (a timeout would have halted PFP/ME). DMA waits (`dispatch == false` in `ihWaitFence`) never abort: they are short. New gfx submissions are refused (`gfxClientReady` -> NotReady) once a sleep is requested. Cleared when the wake's bring-up publishes the runtime (and in `resumeMain`, and by a `powerDidWake` that finds no sleep). | **ON**; `rdna4-sleepabort=0` restores the old behaviour |
+| gfx at sleep | `gfxSleepDrain` (in `powerWillSleep`, `rtLock` held, before PFP/ME are halted): if client gfx IBs are in flight, wait up to 100 ms for their fences; whatever is left is **dropped** (counters zeroed) without wedging: the ring is reset by the wake's `stageGfxRing`/`gfxClientReset`, and every old connection only ever sees `Aborted`. Also: explicit `gcWake` first (clean log; a sleeping GC under the drain), `idleStop()` (the latter in `powerSleepRequest`, deliberately outside `rtLock`). | on (it only runs in `powerWillSleep`, i.e. under `rdna4-pm=1`) |
+| No tests on resume | `runStages` skips the **G3/G4 draws, the gfx client self-test and the flip test** when `resumePending` (a wake); one log line says so. The VM boot self-test, the gfx ring bring-up and everything the runtime needs still run. | on (resume only); `rdna4-resume-tests=1` restores the old behaviour (the emulator's sleep test) |
+
+**Why the abort is strictly safer (the argument for default-on).** It only acts while a sleep has been requested. Before, such a wait held `rtLock` until its fence or its timeout (up to 10 s), delaying the sleep handler
+behind it, and a timeout on the gfx side wedged the ring (PFP/ME halted) although the sleep was about to reset it anyway. After the wake every selector of the old connection returns `Aborted` (`ownerStateLocked`), so the
+client sees the same error either way; it just sees it immediately and the ring/queue is not declared dead. A failure path only: nothing changes when no sleep is requested, and `rdna4-sleepabort=0` undoes it.
+Residual risk [I]: a client wait aborted early leaves its fence outstanding while the HQD is drained by `powerWillSleep` (W6 recovery if the dequeue times out): the same state a sleep taken a moment later would have found.
+
+### 9.4 The display order guarantee (what the code promises, and what it does not)
+
+amdgpu suspends the display first and resumes it last (`amdgpu_device.c`, `amdgpu_device_suspend`/`resume`). This kext cannot order the framebuffer's power callbacks (`RDNA4Device::setDisplayPower`, `device.cpp`) against the
+compute service's (`RDNA4ComputeService::setPowerState`): they are separate IOKit power-plane clients [I, no ordering in the code]. What it guarantees instead:
+1. **The compute path touches no display state on resume except the IH interrupt re-enable**, and only after the GPU bring-up finished: the flip self-test (which flipped the screen to a test surface and back) no longer
+   runs on a wake (P7), and the present path is aborted (`dropPendingPresentsLocked`, `presentActive` cleared in `resetRuntimeForResume`) before the rebuilt heap exists.
+2. **Scanout never depends on the compute path**: DCN reads the boot surface from VRAM through DCHUB; the flip/present code uses DMU registers only (§3.1). So the order in which the two callbacks run cannot leave the
+   display waiting for the GPU, and a wake that fails to bring the compute side up leaves the display as the framebuffer driver restored it.
+3. The compute sleep handler **does not wait for the display**, and does not wait for clients longer than 100 ms (gfx drain) plus the bounded HQD drains; it never blocks behind a client wait (abortable, §9.3).
+What is **not** guaranteed: that the display is blanked before the GPU's MEC/PFP/ME are halted, or unblanked after the GPU is back. Neither is needed for correctness (1, 2), but it is an observable difference from amdgpu.
+
+### 9.5 Verification so far, and what is open
+
+- Kext + `rdna4-run` build (`OSXCROSS=$HOME/.local/share/osxcross bash tools/build-osxcross.sh`, exit 0; one pre-existing warning `cgArg`); `nm -u` of the new kext identical to `RDNA4FB-int`'s; `bash -n` on the scripts.
+- Emulator dry runs requested from Kiln (boot 8 + `rdna4-gfxidle=1`; `rdna4-sleeptest=1` sleep path with and without `rdna4-resume-tests=1`; a wait in flight during the debug sleep selector): results in the hub-task-328 report.
+- Not verified anywhere: the idle state machine against a real client mix; that `removeEventSource` in `powerWillSleep` (under `rtLock`) cannot deadlock against `idleTick` (it only `TryLock`s; the present timer's stop path has the same shape) [I]; the abort while a real wave runs.
+- Real-card boots (`tools/set-boot.sh`): **10** = boot 8 + `rdna4-gfxidle=1` (P2/P3, no hardware change); **11** = boot 8 + `rdna4-pm=1 rdna4-gfxidle=1`, the sleep/wake boot: **never run on the card, run it last**,
+  power-cycle after. (Boot numbers 9/9b belong to the VM diagnostic on `premetal/vmdiag`; the numbering in §7 above predates that and its "boot 9/10/11" are superseded by this list and by `docs/boot9-vm-diagnostic.md`.)

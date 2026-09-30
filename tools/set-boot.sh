@@ -1,7 +1,7 @@
 #!/bin/bash
 # Set the boot-args for one boot of docs/real-card-plan.md on the OpenCore USB.
 #
-#   bash /Volumes/OPENCORE/set-boot.sh <0-8>
+#   bash /Volumes/OPENCORE/set-boot.sh <0-8|10|11>
 #
 #   Round 5 plan (D23): every test boot runs on the PROVEN base, rdna4-ih=2 rdna4-flip=1 rdna4-hang=1
 #   (interrupts, vblank + page flips, queue recovery; clock gating is on by default since W29).
@@ -20,6 +20,11 @@
 #      draws, so no client could draw there). Bring-up draws G3 (+G4) and runs the kernel's synthetic client-IB self-test (gfx-client); diagnostic-log.sh then runs
 #      `rdna4-run info` (must show GFX), `rdna4-run tri` and `rdna4-run tricol` (rows gfx-app-tri / gfx-app-tricol). On the emulator: tri PASS, tricol FAIL (G4 is not modelled).
 #      Needs docs/w12k-gfx-submit.md's dependency (W13 S0: rtFree invalidates device buffers) before it is enabled on the real card.
+#  10  boot 8 + rdna4-gfxidle=1 (power P2/P3, docs/power-gfx.md s.9): software-only idle accounting (idle:/Compute,GFXIdle) next to the SMU's view; diagnostic-log.sh rows post-idle
+#      (sensors 3 s after the application steps: FAIL when activity stays >= 10 % or power >= 40 W) and gfx-idle-acct. Changes no hardware state.
+#  11  boot 8 + rdna4-pm=1 rdna4-gfxidle=1: the real-card SLEEP/WAKE boot (P7). NEVER RUN ON THE CARD BEFORE: run it LAST, power-cycle afterwards. Sequence: `rdna4-run tri` (PASS), sleep the
+#      Mac for >= 10 s, wake, `rdna4-run tri` again. Expected: power: sleep requested / quiesce lines, no gfx: draw / flip: lines between the wake and "user-space runtime up again" (the
+#      wake skips the bring-up tests; rdna4-resume-tests=1 brings them back), a client wait that was in progress returns Aborted (rdna4-sleepabort=0 disables).
 #   7  base + cursor self-test: magenta 64x64 square at (100,100), macOS pointer ignored   rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1 (CRC A/B: GOP state, after the CM_BYPASS clear)
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
@@ -34,8 +39,10 @@ case "${1:-}" in
 	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfxpm=24 rdna4-gfxoff=1" ;;
 	7) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11 rdna4-gfxcsb=0 rdna4-gfxsane=0" ;;
+	10) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1 rdna4-gfxidle=1" ;;
+	11) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1 rdna4-pm=1 rdna4-gfxidle=1" ;;
 	8) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1" ;;
-	*) echo "usage: bash $0 <0-8>   (see docs/real-card-plan.md)"; exit 1 ;;
+	*) echo "usage: bash $0 <0-8|10|11>   (see docs/real-card-plan.md)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"

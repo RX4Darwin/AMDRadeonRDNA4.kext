@@ -133,6 +133,7 @@ public:
 	// Returns the last stage completed inline.
 	uint32_t start(const Env &env, uint32_t stage);
 	void powerWillSleep();
+	void powerSleepRequest();   // P7: setPowerState(0) / the debug sleep selector call this first, without rtLock (src/pmidle.cpp)
 	void powerDidWake();
 
 	// Snapshot of the engines, as read by the survey.
@@ -767,6 +768,42 @@ private:
 	void     schedulePresentationTimer();
 	void     schedulePresentationRetry();
 	void     presentTimerTick();
+	// P2 idle accounting (rdna4-gfxidle=1) and P7 sleep/wake hardening (docs/power-gfx.md): src/pmidle.cpp.
+	// Idle accounting is software only: it counts synchronous client operations (IdleUse, under rtLock) and looks at fences that are still
+	// outstanding; it sends no SMU message and touches no GC register. Its state is a log line per transition and the property Compute,GFXIdle.
+	struct IdleUse {
+		RDNA4Compute *c;
+		IdleUse(RDNA4Compute *self, const char *what) : c(self) { c->idleBegin(what); }
+		~IdleUse() { c->idleEnd(); }
+	};
+	static bool requestedGfxIdle();            // rdna4-gfxidle=1
+	static bool requestedSleepAbort();         // default ON; rdna4-sleepabort=0 restores waits that hold rtLock until their timeout
+	static bool requestedResumeTests();        // rdna4-resume-tests=1: the wake re-runs the G3/G4 draws, the gfx client self-test and the flip test
+	void     idleStart();                      // bring-up finished: create the poll timer, start counting (idempotent)
+	void     idleStop();                       // shutdown / sleep: cancel the timer
+	void     idleBegin(const char *what);      // rtLock held
+	void     idleEnd();                        // rtLock held
+	void     idleTouchLocked(const char *what);
+	void     idleEvaluateLocked();             // retire fences, then busy -> idle if nothing has used the GPU for 100 ms
+	void     idleTick();                       // the timer's body: TryLock rtLock, evaluate, re-arm while busy
+	void     idleReport(const char *why);      // registry property Compute,GFXIdle
+	static void idleTimerAction(OSObject *owner, IOTimerEventSource *timer);
+	bool     idleOn { false };
+	bool     idleBusy { true };                // the accounting state: bring-up counts as busy
+	uint32_t idleSync { 0 };                   // synchronous client operations in progress
+	uint64_t idleLastUseAbs { 0 }, idleStateAbs { 0 }, idleBusyNs { 0 }, idleIdleNs { 0 };
+	uint32_t idleTransitions { 0 };
+	char     idleLastWhat[24] {};
+	IOTimerEventSource *idleTimer { nullptr };
+	IOWorkLoop         *idleWorkLoop { nullptr };
+	OSObject           *idleContext { nullptr };
+	// P7: set by the power callback BEFORE it takes rtLock; waits that hold rtLock poll it and return kIOReturnAborted.
+	volatile uint32_t sleepRequested { 0 };
+	bool     sleepAbortOn { true };
+	bool     waitAborted { false };            // the last wait ended because of sleepRequested (rtLock held by the waiter)
+	bool     sleepAbortWanted() const { return sleepAbortOn && __atomic_load_n(&sleepRequested, __ATOMIC_ACQUIRE) != 0; }
+	void     powerSleepClear();                // the wake finished (or was cancelled)
+	void     gfxSleepDrain();                  // powerWillSleep, rtLock held: wait <= 100 ms for client gfx IBs, then drop them (no wedge)
 	PresentSlot *presentSlot(uint64_t id, const void *owner);
 	void     completePresentLocked(PresentSlot &slot, IOReturn result, uint64_t frame);
 	void     dropPendingPresentsLocked(IOReturn result);

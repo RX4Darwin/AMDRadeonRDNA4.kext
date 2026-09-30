@@ -54,6 +54,7 @@ CXX_SRCS := \
 	src/modeset.cpp \
 	src/compute.cpp \
 	src/gfxring.cpp \
+	src/pmidle.cpp \
 	src/flip.cpp \
 	src/amdfw.cpp \
 	src/psp.cpp \
