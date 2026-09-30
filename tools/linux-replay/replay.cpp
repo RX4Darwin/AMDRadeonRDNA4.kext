@@ -348,7 +348,7 @@ int main() {
 		const uint32_t *m = reinterpret_cast<const uint32_t *>(static_cast<char *>(misc.cpu) + 0x300);
 		for (uint32_t row = 0; row < 4; row++) {   // nggvgpr.s: v0, v3, x, y arrays 0x80 apart; nggstore.s: row 0
 			printf("marker +0x%02x:", 0x80 * row);
-			for (uint32_t i = 0; i < 4; i++)
+			for (uint32_t i = 0; i < 8; i++)   // 8 dwords: nggsgpr.s stores 6 (s0 s1 s2 s3 s4 s5)
 				printf(" 0x%08x", m[0x20 * row + i]);
 			printf("\n");
 		}

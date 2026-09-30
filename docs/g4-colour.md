@@ -131,8 +131,11 @@ the same `rings.va` the stream's relocation uses.
 1. **The descriptor's `size`/`stride` and the swizzle layout are copied from RADV, not measured for our ring.** The kext's rings are in VMID0 UC memory on
    macOS and in one VRAM BO under Linux; the layout arithmetic is the hardware's, but the first run is the first test that the attribute lands where SPI reads it.
 2. **`s5` really is gs_attr_offset under our configuration.** Mesa says so (radv_shader_args.c:797-798) for merged NGG on gfx11+, and RADV's dump works on this card
-   with USER_SGPR 2; the kext's RSRC2_GS has USER_SGPR 0, which does not move the 8 system SGPRs, but it has not been measured (gs_tg_info s2 and merged_wave_info s3 were).
-   The replay lists the dwords of the attribute ring that changed, which shows where the store went.
+   with USER_SGPR 2. Probed on the card with the plain G3 stream (`shaders/nggsgpr.s`, `REPLAY_VS=file:<hex> REPLAY_DUMP_MARKER=1`, 10 runs, 8192 px each): the NGG wave's
+   initial `s0 s1 s2 s3 s4 s5` = `0 0 0x00403000 0x10000103 <x> 0`, with `s5 = 0` in 10/10 runs and `s4` (tess_offchip_offset, unused) 0 in 7, 0x8 in 1 and 0x88888888 in 2 (so
+   the unused system SGPRs are not reliably zeroed, which makes a constant `s5 = 0` more credible than stale). `s2`/`s3` reproduce the earlier measurement and `s0/s1 = 0` (nothing
+   programs the GS pointer registers in the G3 stream). `(s5 & 0x7fff) << 9 = 0`: the first subgroup sits at the start of the attribute ring, well inside 0x580000. **Caveat:** G3
+   exports no parameter (`NO_PC_EXPORT = 1`), so the hardware may have no reason to allocate ring space; in G4 (`NUM_INTERP = 1`) `s5` can differ. The G4 replay lists the ring dwords that changed.
 3. **`SPI_INTERP_CONTROL_0`.** The kext's G3 stream writes 0x869 (radeonsi: FLAT_SHADE_ENA 1, point-sprite overrides); RADV never writes it. With
    `SPI_PS_INPUT_CNTL_0.FLAT_SHADE = 0` the interpolation should be smooth either way, but RADV's effective value is unknown (needs umr + root). If the first image is flat-shaded,
    this is the first suspect.
