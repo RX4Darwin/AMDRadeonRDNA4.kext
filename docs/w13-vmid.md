@@ -388,6 +388,16 @@ No change to `rtPresent*` (physical MC addresses, DCN). Two consequences to keep
 `aborted`, `runtime.cpp:2799-2810`) **only if** their page tables survive the sleep (VRAM content across S3 is a W4 question — not assumed here).
 GFXOFF gating can be relaxed from "any client open" to "any VMID bound or job in flight" once B-V is in, because the soft state can be rebuilt.
 
+### 5.9 S7-lite as built (`a38634f`, `rdna4-vmshared=1`, default off)
+
+Clients keep a static VMID 8-15 but own no HQD. Two kernel queues (MEC1 pipe 0 and 1, queue 2; `CP_HQD_VMID` 0, `PRIV_STATE | KMD_QUEUE`, every address an MC address) run every job as
+`INDIRECT_BUFFER(vmidForSubmit(client), the client's IB page)` followed by a ring-level `RELEASE_MEM` to the client's own fence word, so the existing fence/retire/wait code is unchanged; a client is pinned to one queue
+(slot & 1) so its fences stay in order. `rtDispatch` writes its packets into the client's IB page (`launch()` with `ibCpu`); `rtSubmitIb` chains the user's IB (8 outstanding at most in this mode, the 4 KiB ring carries four clients).
+`SH_MEM_CONFIG/BASES` are written for VMIDs 1-15 once when the queues start. Hang recovery per queue (`recoverSharedQueue`: `RESET_WAVES`, `SQ_CMD` kill of the guilty VMID only, same ring re-initialised, a `WRITE_DATA` proof; needs `rdna4-hang=1`);
+other clients' jobs behind the hung one are lost with the ring and time out in turn (first version). `rtWedged` no longer gates shared clients; each queue has its own `wedged`. Power: the queues are stopped at sleep and re-created at the next open.
+Why this mode exists: amdgpu has no gfx12 precedent for MMIO-loaded HQDs with a non-zero VMID (KFD needs MES); VMID-0 kernel queues + the IB's VMID is what amdgpu uses without MES, and `replay-compute` proved that shape on this card (2026-10-01).
+**Not run anywhere**: built and reviewed only.
+
 ## 6. Implementation plan — small steps, each with a test
 
 "Emu" = QEMU `rdna4` device + macOS guest (the Linux emulator loop being built by Kiln, workstream #1) and the host unit tests
@@ -478,11 +488,25 @@ user's final real-card test. 3) two shared queues, C deferred. 4) yes, old path 
 Purpose: turn U1 and U2 into measurements in the one boot the user will run, and attribute the "GFX busy at idle / client dispatch hangs" failure of section 1.1. It is a
 **spec**: the self-test code is step S1, after the lead's review of this round.
 
-**Boot arguments.** The VM boot of `docs/real-card-plan.md` (boot 2: `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1`) plus
-`rdna4-vmid-test=1` (new: runs the checks below right after `vmBootSelfTest`, before the runtime service is published, like the boot test) and `rdna4-gfxpm=16` (existing: the read-only
-engine survey, so the 100 % activity can be attributed). Nothing else; no gfx ring in this boot.
+**Boot arguments (as implemented, `d52f1d8`).** The VM boot of `docs/real-card-plan.md` (boot 2: `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1`) plus
+`rdna4-vmid-test=7`: a mask, 1 = the probes (run right after `vmBootSelfTest`, before the runtime service is published), 2 = read-only surveys at the points of the
+*normal* flow (before and after `vmBootSelfTest`, after the flip test, after clock gating, after the first client opens; all 8 MEC HQDs plus `RLC_CP_SCHEDULERS`, CPC/CPF/CP status,
+RS64 control, `CP_PQ_STATUS`, the doorbell range), 4 = a bounded trace (64 lines) of client operations (open, dispatch entry/done/timeout, SubmitIb kick, release before/after dequeue).
+Use `rdna4-compute=1`-style minimal extras (no vblank/cursor) so the dmesg window keeps the bring-up lines. No gfx ring in this boot. The implemented probe set is larger than the
+table below: it adds **T2** (a never-used slot), **T4a/b/c** (client-style queue: first activation, reactivation of the same slot, HQD VMID 3 instead of 8), **T5c** (the incremental
+stream WRITE_DATA, +ACQUIRE_MEM, +SET_SH_REGs, +DISPATCH of an `s_endpgm`-only kernel, +vadd, +RELEASE_MEM on one fresh queue, with rptr/HIT/CPC/fault after each step, the first stalled
+step named, then sibling queues probed on the same and the other pipe) and **T5b** (the `launch()`-exact stream, only if T5c passed). Anvil's H1/H2/H3 requests (hub-task-317) shaped these.
+**Added after Anvil's review (hub-task-323, `premetal/w13`):** mask bit 8 = **late probes** after clock gating (T4a, T4d, T5b repeated, results key `vmidtest-late`, log lines tagged `vmidtest late:`), so the boot plan uses `rdna4-vmid-test=15`;
+**T4d** (a client-style HQD activated, idle 50 ms, dequeued with *no packet at all*: separates "drain times out with no work" from every shader/fence explanation); every survey now also prints the GC hub L2 state
+(`GCVM_L2_CNTL` incl. bit 11 default-page-to-system, fault default address, `L2_STATUS` busy bits, fault status, which VMID contexts are enabled) — the round-6 boots ran with `rdna4-vm-diag=4065`, whose bit 512 points the fault default page at a system page
+during the baseline attempt, so "a clean vm=1 boot pins the GPU" was never shown — and an SMU line (avg GFXCLK, activity, socket W; 300 ms settle before the point after `vmBootSelfTest`, 1 s after clock gating);
+surveys and the op trace are also appended as compact entries to the registry properties `Compute,VMSurvey` and `Compute,VMOps` (` ## ` separated, bounded), because the dmesg window loses bring-up lines;
+the op trace logs refusals (`dispatch/submitib/waitfence REFUSED: rtWedged`), every `rtWedged = true` with its cause, and `open FAILED`; one survey is taken after the first client dispatch, done or timed out.
+**Boot 9 runs WITHOUT `rdna4-vm-diag`; 9b replicates round 6 with it.** With `rdna4-vmshared=1` the same boot exercises S7-lite (section 5.9).
+Result string: `RDNA4FB,Results vmidtest` (`P` pass, `F` fail, `H` shader hang, `S` skipped, `D` SH_MEM readback differs). It has **not been run anywhere**: built, reviewed, and its
+emulator-side assumptions pinned by `tools/emu-qtest-vm.py` (35 checks); a macOS-guest dry run is for Kiln's loop.
 
-**What `rdna4-vmid-test=1` does** (all on one spare MEC slot, never a slot a client can have, with the same EOP/rptr discipline as the boot test):
+**What `rdna4-vmid-test` bit 1 does** (all on one spare MEC slot, never a slot a client can have, with the same EOP/rptr discipline as the boot test):
 
 | # | Check | Pass | What a failure means |
 |---|---|---|---|

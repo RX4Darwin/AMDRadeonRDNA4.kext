@@ -114,6 +114,11 @@ uint32_t RDNA4Compute::requestedStage() {
 	return stage > StageKernel ? StageKernel : stage;
 }
 
+bool RDNA4Compute::requestedVmShared() {
+	uint32_t enabled = 0;
+	return PE_parse_boot_argn("rdna4-vmshared", &enabled, sizeof(enabled)) && enabled != 0;
+}
+
 bool RDNA4Compute::requestedVm() {
 	uint32_t enabled = 0;
 	return PE_parse_boot_argn("rdna4-vm", &enabled, sizeof(enabled)) && enabled != 0;
@@ -651,6 +656,12 @@ void RDNA4Compute::runStages() {
 	// W27: a bring-up (or a re-bring-up after sleep) starts with GFX powered. Nothing of an earlier
 	// bring-up is alive: forget its boot queue and register snapshot (S4).
 	bringupGen++;
+	{   const uint32_t m = vmIdTestMask();     // W13 S1 diagnostics (vmtest.cpp)
+		vmSurveyOn = (m & 2) != 0;
+		vmOpTraceOn = (m & 4) != 0;
+		vmOpTraceLines = 0;
+		vmSurveyClientDone = false; }
+	vmShared = requestedVmShared();
 	bootQueueLive = false;
 	gcSnapValid = false;
 	gcWake(0xffffffffu);
@@ -667,7 +678,7 @@ void RDNA4Compute::runStages() {
 	bool hung = logPreviousTrail(prev, sizeof(prev));
 	uint32_t done = StageSurvey;
 	char note[96];
-	static const char *const kFeatures[] = { "gfx", "ih", "vm", "flip", "pm" };
+	static const char *const kFeatures[] = { "gfx", "ih", "vm", "flip", "pm", "vmidtest" };
 	for (size_t i = 0; hung && i < sizeof(kFeatures) / sizeof(kFeatures[0]); i++) {
 		const size_t n = strlen(kFeatures[i]);
 		if (!strncmp(prev, kFeatures[i], n) && prev[n] == ':') {
@@ -762,10 +773,18 @@ void RDNA4Compute::runStages() {
 	if (vmEnabled && done >= StageKernel) {
 		if (!bringupStepAllowed("VM self-test"))
 			return;
+		vmSurvey("before vmBootSelfTest");
 		if (!featureAllowed("vm") || !vmBootSelfTest()) {
 		vmEnabled = false;
 		CLOG("vm: boot self-test failed; per-client GPU VM disabled");
 		}
+		vmSurvey("after vmBootSelfTest", 300);
+	}
+	// W13 S1: the VMID/queue diagnostic, only with rdna4-vmid-test=1. It needs the runtime heap and DMA (initRuntimeHeap), not a
+	// passing VM self-test: a failing one is when it is most useful.
+	if (done >= StageKernel && requestedVmIdTest() && featureAllowed("vmidtest")) {
+		if (!bringupStepAllowed("vmid test")) return;
+		vmIdTest(false);
 	}
 	// W3: the gfx ring, when asked for. A failure only turns it off again.
 	bool gfxOk = false;
@@ -804,6 +823,8 @@ void RDNA4Compute::runStages() {
 		if (!bringupStepAllowed("flip")) return;
 	if (done >= StageKernel && featureAllowed("flip"))
 		Flip::run(*this);
+	if (done >= StageKernel)
+		vmSurvey("after the flip test");
 	// G3: the first draw, once the runtime's device heap holds its rings.
 	if (!bringupStepAllowed("gfx draw"))
 		return;
@@ -819,6 +840,12 @@ void RDNA4Compute::runStages() {
 	if (done >= (gfxCgIsDefault() ? StageKernel : StageGfx) && featureAllowed("pm") && requestedGfxCg(cgMask)) {
 		if (!bringupStepAllowed("clock gating")) return;
 		gfxCgApply(cgMask);
+		vmSurvey("after clock gating", 1000);
+	}
+	// W13 S1 late probes (mask bit 8): the client-style queue probes again after clock gating, bounded, on the same spare slots.
+	if (done >= StageKernel && (vmIdTestMask() & 8) && featureAllowed("vmidtest")) {
+		if (!bringupStepAllowed("vmid test (late)")) return;
+		vmIdTest(true);
 	}
 	if (done >= StageGfx && featureAllowed("pm") && (requestedGfxOff() || gfxOffHook())) {
 		if (!bringupStepAllowed("gfxoff")) return;
@@ -3099,11 +3126,16 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 		flushHdp();
 	}
 
+	// W13 S7-lite: a shared-queue job is an IB (ibCpu) fetched in the client's VMID; SH_MEM was written for every VMID once at the
+	// shared queues' start (vmSharedEnsure), as amdgpu does (gfx_v12_0_constants_init), not at every launch.
+	const bool viaIb = vm && l.ibCpu != nullptr;
 	// Shader memory model for the selected VMID (gfx_v12_0_constants_init).
-	grbmSelect(0, vm ? l.pipe : 0, vm ? l.queueId : 0, vm ? l.vmid : 0);
-	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
-	if (vm)
-		wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
+	if (!viaIb) {
+		grbmSelect(0, vm ? l.pipe : 0, vm ? l.queueId : 0, vm ? l.vmid : 0);
+		wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
+		if (vm)
+			wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
+	}
 
 	const uint32_t pgm[2] = { static_cast<uint32_t>(l.code >> 8), static_cast<uint32_t>(l.code >> 40) };
 	const uint32_t rsrc[2] = { l.rsrc1, (l.rsrc2 & ~kRsrc2LdsMask) | ldsSizeField(l.ldsBytes) };
@@ -3115,24 +3147,51 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 
 	Pm4::Queue &q = vm ? *l.queue : pm4Queue;
 	uint32_t pkt[24];
-	q.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmLo), pgm, 2));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmRsrc1), rsrc, 2));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmRsrc3), &l.rsrc3, 1));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeResourceLim), &zero, 1));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeTmpringSize), &zero, 1));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe0), all, 2));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe2), all, 2));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe4), none4, 4));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeStartX), start, 3));
-	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeNumThreadX), l.groupSize, 3));
+	// The dispatch stream goes into the queue, or, in shared mode, into the client's IB page (at most one page).
+	uint32_t ibN = 0;
+	bool ibFull = false;
+	auto put = [&](uint32_t n) {
+		if (!viaIb) {
+			q.emit(pkt, n);
+			return;
+		}
+		if (ibN + n > 0x400 - 8) {
+			ibFull = true;
+			return;
+		}
+		for (uint32_t i = 0; i < n; i++)
+			l.ibCpu[ibN + i] = pkt[i];
+		ibN += n;
+	};
+	put(Pm4::acquireMem(pkt, Pm4::kGcrMemSync));
+	put(Pm4::setShReg(pkt, shAbs(ComputePgmLo), pgm, 2));
+	put(Pm4::setShReg(pkt, shAbs(ComputePgmRsrc1), rsrc, 2));
+	put(Pm4::setShReg(pkt, shAbs(ComputePgmRsrc3), &l.rsrc3, 1));
+	put(Pm4::setShReg(pkt, shAbs(ComputeResourceLim), &zero, 1));
+	put(Pm4::setShReg(pkt, shAbs(ComputeTmpringSize), &zero, 1));
+	put(Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe0), all, 2));
+	put(Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe2), all, 2));
+	put(Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe4), none4, 4));
+	put(Pm4::setShReg(pkt, shAbs(ComputeStartX), start, 3));
+	put(Pm4::setShReg(pkt, shAbs(ComputeNumThreadX), l.groupSize, 3));
 	if (l.userCount)
-		q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputeUserData0), l.user, l.userCount));
-	q.emit(pkt, Pm4::dispatchDirect(pkt, l.groups[0], l.groups[1], l.groups[2],
-	                                Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 |
-	                                (l.wave32 ? Pm4::kDispatchWave32 : 0)));
+		put(Pm4::setShReg(pkt, shAbs(ComputeUserData0), l.user, l.userCount));
+	put(Pm4::dispatchDirect(pkt, l.groups[0], l.groups[1], l.groups[2],
+	                        Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 |
+	                        (l.wave32 ? Pm4::kDispatchWave32 : 0)));
 	const uint64_t fenceAddress = vm ? l.fenceAddress : poolMc(kPm4FenceOffset);
 	const bool irq = l.useInterrupt && ihActive;
+	if (viaIb) {
+		if (ibFull) {
+			CLOG("%s: the dispatch stream does not fit the IB page", tag);
+			return false;
+		}
+		while (ibN & 7)
+			l.ibCpu[ibN++] = 0xffff1000u;                          // the one-dword PKT3 NOP pad, as the replay on the card used
+		flushHdp();
+		// The job on the VMID-0 queue: INDIRECT_BUFFER in the client's VMID, then the fence as a ring packet (amdgpu_fence_emit).
+		q.emit(pkt, Pm4::indirectBufferCompute(pkt, l.ibVa, ibN, l.ibVmid));
+	}
 	q.emit(pkt, Pm4::releaseMem(pkt, fenceAddress, fenceValue, irq));
 
 	// The client's own queue (W2) or the kernel's; the end-of-pipe interrupt
@@ -3188,6 +3247,11 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 			vmInvalidate(l.vmid, "dispatch fault clear");
 			scrubFaultPage();
 		}
+	}
+	// W13 S1: one engine survey after the first client dispatch, whichever way it ended (Anvil hub-task-323 G4).
+	if (vm && vmSurveyOn && !vmSurveyDispatchDone && tag && !strcmp(tag, "runtime")) {
+		vmSurveyDispatchDone = true;
+		vmSurvey(done ? "after the first client dispatch (done)" : "after the first client dispatch (TIMEOUT)");
 	}
 	return done;
 }

@@ -347,6 +347,11 @@ private:
 		uint64_t        recoveryMqd, recoveryEop, recoveryRptr, recoveryWpoll;
 		uint64_t        recoveryProofAddress;
 		volatile uint32_t *recoveryProofCpu;
+		// W13 S7-lite (rdna4-vmshared=1): the packets go into the client's IB page (ibCpu, at VA ibVa in the client's VM) and the
+		// shared VMID-0 queue `queue` runs INDIRECT_BUFFER(ibVmid) + a ring-level RELEASE_MEM to fenceAddress (an MC address).
+		volatile uint32_t *ibCpu;
+		uint64_t        ibVa;
+		uint32_t        ibVmid;
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
 	void logComputeQueueState(const char *tag, uint32_t pipe = 0, uint32_t queue = 0,
@@ -679,6 +684,7 @@ private:
 	static constexpr uint32_t kVmWptr = 0x4000;
 	static constexpr uint32_t kVmFence = 0x5000;
 	static constexpr uint32_t kVmKernarg = 0x6000;
+	static constexpr uint32_t kVmIb = 0x7000;                 // shared mode: the client's IB page
 	static constexpr uint64_t kHostMaxBuffer = 256ull << 20;
 	static constexpr uint64_t kHostMaxClient = 1ull << 30;
 	static constexpr uint64_t kHostMaxTotal = 4ull << 30;
@@ -707,6 +713,10 @@ private:
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
 		uint32_t fence { 0 }, doorbell { 0 };
+		bool     shared { false };        // rdna4-vmshared: no HQD of its own; its jobs run on a shared VMID-0 queue
+		uint8_t  sq { 0 };                // which shared queue (fixed at open: a client's jobs stay in order)
+		uint32_t poolOff { 0 };           // this client's pool slot area (kVmQueueBase + slot * stride)
+		uint64_t ibVa { 0 };              // shared mode: the kernel-written IB page, mapped executable in the client's VM
 		uint32_t ibFences[kMaxIbOutstanding] {};
 		uint32_t ibOutstanding { 0 };
 		// W12k: this client's gfx fence: a dword of its own in the fence page (+0x40; the gfx ring writes it at the VMID0 MC
@@ -778,6 +788,49 @@ private:
 	void publishRuntime(uint32_t stage);
 	bool initRuntimeHeap();
 	bool vmBootSelfTest();
+	// W13 S7-lite (docs/w13-vmid.md): with rdna4-vmshared=1 clients own no HQD. Two kernel-owned MEC queues (VMID 0, PRIV_STATE|KMD_QUEUE,
+	// one per MEC pipe) run every client job as INDIRECT_BUFFER(vmid = the client's) followed by a ring-level fence, as amdgpu's kernel
+	// compute rings do. Clients keep a static VMID 8-15. Default off; the per-client-HQD path is unchanged when off.
+	struct SharedQueue {
+		bool up { false }, wedged { false };
+		uint32_t pipe { 0 }, queue { 0 }, doorbell { 0 }, area { 0 };   // area: pool offset of MQD/EOP/PQ/rptr/wptr pages
+		Pm4::Queue pm;
+	};
+	static constexpr uint32_t kSharedQueues = 2;
+	SharedQueue sharedQ[kSharedQueues] {};
+	bool vmShared { false };
+	bool sharedInit { false };
+	static bool requestedVmShared();
+	bool vmSharedEnsure();
+	IOReturn rtOpenShared(const void *owner, uint32_t slot, RtClient *c);
+	IOReturn rtOpenInner(const void *owner);
+	bool sharedStart(uint32_t k);
+	void sharedStopAll(const char *why);
+	bool recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const char *tag);
+	// The VMID a client's submissions run in. One place, so the VMID pool (docs/w13-vmid.md s.5.6) can substitute its grab later; W12k's
+	// gfx submit takes the IB's VMID from here too.
+	uint32_t vmidForSubmit(const RtClient &c) const { return c.vmid; }
+	static bool requestedVmIdTest();
+	static uint32_t vmIdTestMask();          // rdna4-vmid-test: 1 probes, 2 flow-point surveys, 4 client-op trace
+	void vmIdSurvey(const char *tag, uint32_t settleMs = 0);
+	void vmOpTrace(const char *op, uint32_t vmid, uint32_t pipe, uint32_t queue);
+	void vmSurvey(const char *tag, uint32_t settleMs = 0) { if (vmSurveyOn) vmIdSurvey(tag, settleMs); }
+	void vmIdTest(bool late);                 // late = the probes that repeat after clock gating (mask bit 8)
+	// Compact one-line entries for the registry (properties Compute,VMSurvey and Compute,VMOps), " ## " separated, bounded, like the gfx verdict:
+	// the dmesg window loses bring-up lines, the registry does not.
+	void vmRegistryAdd(const char *prop, char *buf, size_t cap, uint32_t &len, bool &full, const char *entry);
+	bool     vmSurveyOn { false };
+	bool     vmOpTraceOn { false };
+	uint32_t vmOpTraceLines { 0 };
+	bool     vmSurveyClientDone { false };
+	bool     vmSurveyDispatchDone { false };
+	bool     vmIdShaderHung { false };        // an early S1 shader probe hung: the late ones are skipped
+	char     vmSurveyBuf[3072] {};
+	uint32_t vmSurveyLen { 0 };
+	bool     vmSurveyFull { false };
+	char     vmOpsBuf[1536] {};
+	uint32_t vmOpsLen { 0 };
+	bool     vmOpsFull { false };
 	void vmDumpHubWindows(const char *tag);   // W17 E1, read-only
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);
@@ -795,9 +848,6 @@ private:
 	void scrubFaultPage();
 	void releaseHost(RtBuffer &buffer);
 	void retireIbFences(RtClient &client);
-	// The VMID an IB submitted for `client` runs in (the INDIRECT_BUFFER packet's VMID field and the SH_MEM state selected for it), from this ONE
-	// function: the client's fixed VMID today. W13's VMID pool (docs/w13-vmid.md 5.6) substitutes its per-submission grab here.
-	uint32_t vmidForSubmit(const RtClient &client) const { return client.vmid; }
 	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
 	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
 	// so the two never use the ring at the same time. Everything below runs under rtLock.
