@@ -2506,6 +2506,9 @@ void RDNA4Compute::gfxClientRetire(RtClient &c) {
 }
 
 void RDNA4Compute::gfxClientReset() {
+	// Called from stageGfxRing on the bring-up thread (no rtLock held): take it, clients open and close concurrently.
+	if (rtLock)
+		IOLockLock(rtLock);
 	gfxWedged = false;
 	gfxParked = false;
 	gfxClientPending = 0;
@@ -2515,6 +2518,8 @@ void RDNA4Compute::gfxClientReset() {
 			*c.gfxFenceCpu = 0;
 		c.gfxFence = 0;
 	}
+	if (rtLock)
+		IOLockUnlock(rtLock);
 }
 
 void RDNA4Compute::gfxClientWedge(const char *why) {

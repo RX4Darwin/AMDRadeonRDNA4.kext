@@ -46,8 +46,8 @@ submission.
 
 Selectors `SubmitGfxIb` (IB VA, dwords, flags -> fence) and `WaitGfxFence` (fence, timeout -> ns) in `include/rdna4compute.h` (additive: the ABI stays 4, new selectors at the end,
 `RDNA4_FLAG_GFX` in Info says a submit can run *now*); `rtSubmitGfxIb` / `rtWaitGfxFence` in `src/runtime.cpp`; `librdna4` wraps them; `rdna4-run tri` and `tricol` are the clients.
-Nothing else changed in existing behaviour: the G3/G4 draws, the compute runtime and the display paths are untouched (the kext diff is additive except one `gfxPark` flag and one line in
-`stageGfxRing`).
+Nothing else changed in existing behaviour: the G3/G4 draws, the compute runtime and the display paths are untouched (the kext diff is insertions only: the new selectors and helpers, a flag set in `gfxPark`,
+a reset call in `stageGfxRing`, the self-test hook in `runStages`, the gfx-fence fields in `rtOpen`/`rtInfo`/`rtFree`/`rtRelease`/the resume reset).
 
 ### The ring packets, against amdgpu's 13 steps (table above)
 
