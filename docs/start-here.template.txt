@@ -15,8 +15,8 @@ WHAT THIS ROUND IS
 BEFORE YOU START
   - The stick is set for BOOT 1 now (the safe base).
   - Start from a FULL POWER-OFF: Shut Down, wait 10 seconds, power on.
-  - Nothing else needs to be open. Do not browse, do not sleep the Mac
-    (except in the very last boot, where the steps say to).
+  - Nothing else needs to be open. Do not browse, and do not try to sleep
+    the Mac by hand (the last boot tests sleep by itself).
 
 HOW TO RUN ONE BOOT (the same loop every time)
   A. Start the Mac, pick the stick, boot macOS Recovery, open Terminal

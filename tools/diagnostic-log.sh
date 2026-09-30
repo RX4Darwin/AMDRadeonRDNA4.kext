@@ -640,6 +640,14 @@ registry_value() {
 	elif printf '%s\n' "$(registry_value gfx)" |
 		grep -Eq '^PASS.*THE TRIANGLE IS RIGHT.*8192'; then
 		record gfx PASS "$(registry_value gfx | sed 's/^PASS //')"
+	elif printf '%s\n' "$(registry_value gfx)" | grep -q '^PASS' && grep -q 'RDNA4FB: .*power: resume: skipping the G3/G4 draws' "$KLOG"; then
+		# A sleep cycle (rdna4-sleeptest=1, boot 11s) overwrote the durable gfx result with the wake's ring test: the wake skips the draws on purpose (P7).
+		# The draw verdict is the one from before the sleep step, in the kernel log.
+		if grep -q 'RDNA4FB: .*gfx: draw: THE TRIANGLE IS RIGHT' "$KLOG"; then
+			record gfx PASS "ring test after the sleep cycle (the wake skips the draws by design); draw proven BEFORE the sleep: $(grep 'RDNA4FB: .*gfx: draw: THE TRIANGLE IS RIGHT' "$KLOG" | head -1 | sed -E 's/.*(THE TRIANGLE IS RIGHT[^,]*).*/\1/')"
+		else
+			record gfx SKIPPED "after a sleep cycle the wake skips the draws by design; the pre-sleep draw line is not in the kernel log window (see the earlier boots for the draw verdict)"
+		fi
 	elif printf '%s\n' "$(registry_value gfx)" | grep -q '^PASS'; then
 		record gfx FAIL "gfx ring passed but the draw result was not proven"
 	elif grep -Eq 'RDNA4FB: .*gfx: .*ring|RDNA4FB: .*gfx: .*draw' "$KLOG"; then
