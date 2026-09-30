@@ -1,7 +1,8 @@
 RDNA4FB real-card test, FINAL round - start here
 =================================================
-Kit @COMMIT@ (@BRANCH@), staged @DATE@.   Written for someone who does not
-read code: follow the numbers. If a step says STOP, stop and tell Claude.
+Kit @COMMIT@ (@BRANCH@), staged @DATE@.
+Written for someone who does not read code: follow the numbers. If a step
+says STOP, stop and tell Claude.
 
 WHAT THIS ROUND IS
   One long session of short test boots. Each boot changes a few boot
@@ -102,9 +103,11 @@ HOW TO GO BACK
   - Known-good, no new feature: bash /Volumes/OPENCORE/set-boot.sh 0
     (then Shut Down; wait 10 s)
   - Old driver (kext): this kit saved everything it replaced in the folder
-    @BACKUP@ on this stick. To go back to the previous driver, copy
-    @BACKUP@/RDNA4FB.kext over EFI/OC/Kexts/RDNA4FB.kext.
-  - Older copies: backup-prev-round7-kext.kext (round 7), backup-before-premetal.
+         @BACKUP@
+    on this stick. To go back to the previous driver, copy its RDNA4FB.kext
+    over EFI/OC/Kexts/RDNA4FB.kext.
+  - Older copies: backup-prev-round7-kext.kext (round 7) and
+    backup-before-premetal (the original driver).
 
 WHEN YOU ARE FINISHED
   1. bash /Volumes/OPENCORE/set-boot.sh 1

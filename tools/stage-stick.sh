@@ -95,10 +95,18 @@ done
 		else
 			printf '  STEP %s: type  bash /Volumes/OPENCORE/set-boot.sh %s\n' "$n" "$id"
 			printf '        %s\n' "$what" | fold -s -w 76 | sed '2,$s/^/        /'
-			printf '        If it FAILS: %s\n' "$cont" | fold -s -w 76 | sed '2,$s/^/        /'
+			case "$cont" in
+				No:*)    msg="If it FAILS: STOP -${cont#No:}" ;;
+				Yes:*)   msg="If it FAILS: carry on with the next step (${cont#Yes: })." ;;
+				Yes)     msg="If it FAILS: carry on with the next step." ;;
+				After*)  msg="If it hangs or freezes:${cont#After a hang:} (see IF SOMETHING GOES WRONG below)." ;;
+				"(last)") msg="This is the last test boot; afterwards follow WHEN YOU ARE FINISHED below." ;;
+				*)       msg="If it FAILS: $cont" ;;
+			esac
+			printf '        %s\n' "$msg" | fold -s -w 76 | sed '2,$s/^/        /'
 		fi
 	done < "$TMPD/order.tsv"
-} > "$TMPD/order.txt"
+} | sed 's/ *$//' > "$TMPD/order.txt"
 sed -e "s|@COMMIT@|$COMMIT|g" -e "s|@BRANCH@|$BRANCH|g" -e "s|@DATE@|$(date +%Y-%m-%d)|g" -e "s|@BACKUP@|$BK|g" "$TEMPLATE" |
 	awk -v f="$TMPD/order.txt" '/^@ORDER@$/ { while ((getline l < f) > 0) print l; next } { print }' > "$TMPD/START-HERE.txt"
 grep -q '@[A-Z]*@' "$TMPD/START-HERE.txt" && die "unreplaced @PLACEHOLDER@ in the generated START-HERE.txt"
