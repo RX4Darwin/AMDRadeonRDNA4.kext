@@ -12,7 +12,7 @@
 #   2  base + per-app GPU memory (W36 IS_PTE fix; ladder only if the baseline still fails)   rdna4-vm=1 rdna4-vm-diag=4065
 #   3  base + first triangle (W37: RLC SRM enable + clear-state replay) with the CP-side probe   rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11
 #   6  boot 3 with SRM only, no replay (amdgpu-exact; attributes the fix)   ... rdna4-gfxcsb=0
-#   4  base + cursor self-test: magenta 64x64 square at (100,100)   rdna4-vbl=1 rdna4-cursor=2 rdna4-cursordscl=1 (CRC self-check, DSCL fix only if the GOP left bypass)
+#   4  base + cursor self-test: magenta 64x64 square at (100,100)   rdna4-vbl=1 rdna4-cursor=2 rdna4-cursordscl=1 rdna4-cursorcm=1 rdna4-cursormpcc=1 (CRC A/B: GOP state, after CM_BYPASS clear, after MPCC mode fix; mpcsel left off)
 #   5  base + GFXOFF (optional, ALWAYS LAST, then power off)   rdna4-gfxpm=24 rdna4-gfxoff=1
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
@@ -24,7 +24,7 @@ case "${1:-}" in
 	1) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1" ;;
 	2) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065" ;;
 	3) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11" ;;
-	4) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-cursordscl=1" ;;
+	4) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-cursordscl=1 rdna4-cursorcm=1 rdna4-cursormpcc=1" ;;
 	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-gfxpm=24 rdna4-gfxoff=1" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11 rdna4-gfxcsb=0" ;;
 	*) echo "usage: bash $0 <0-6>   (see docs/real-card-plan.md)"; exit 1 ;;
