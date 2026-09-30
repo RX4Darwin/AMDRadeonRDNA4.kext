@@ -64,6 +64,10 @@ static inline uint32_t rdna4_tri_record(uint32_t *ib, const rdna4_tri_va *v) {
 	if ((v->code & 0xff) || (v->target & 0xff) || (v->rings & (RDNA4_TRI_RING_ALIGN - 1)) || (v->fence & 3) ||
 	    ((v->code | v->target | v->rings | v->fence) >> 48))
 		return 0;
+	/* the ends too: every relocated address (the rings are addressed up to 2^48 in 64 KiB units) must stay below 2^48 */
+	if (((v->code + RDNA4_TRI_CODE_BYTES) >> 48) || ((v->target + RDNA4_TRI_TARGET_BYTES) >> 48) ||
+	    ((v->rings + RDNA4_TRI(kRingBytes)) >> 48) || ((v->fence + 4) >> 48))
+		return 0;
 	va[RDNA4_TRI(kVs)] = v->code;
 	va[RDNA4_TRI(kPs)] = v->code + RDNA4_TRI_PS_OFFSET;
 	va[RDNA4_TRI(kCb)] = v->target;

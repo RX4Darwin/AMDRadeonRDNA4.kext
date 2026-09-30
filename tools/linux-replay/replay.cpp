@@ -14,7 +14,14 @@
 // Environment:
 //   REPLAY_VS=new|old|file:<hex>  new (default) = the committed src/ngg_kernel.h,
 //                        old = the round-6 ngg.s (edc5f81, s_and_saveexec: 0 px on the card)
-//   REPLAY_VARIANT=<n>   the kext's ladder patches (1, 2, 128, 256, 2048, 64; 4096 = wave64 ngg64.s)
+//                        REPLAY_VS=file: wins over the shader a variant would place (4096 with file: keeps the file's shader
+//                        and only applies 4096's register patches), unlike the kext, where the variant picks the shader.
+//   REPLAY_VARIANT=<n>   the kext's ladder patches; implemented: 1, 2, 128, 256, 2048, 4096 (= wave64 ngg64.s + GS_W32_EN 0 +
+//                        VGPRS 2). Any other bit (4, 8, 32, 64, 512, 1024, ...) is rejected. Bits are applied one at a time as in
+//                        the kext's ladder; do not combine 4096 with the marker shaders.
+//   REPLAY_SET=...       extra register writes before the draw (see below).
+// Exit status: 0 = the triangle is right (8192 px of the expected colour and no other pixel), 2 = wrong image, 1 = error
+// (including a patch whose register is not in the stream).
 //
 // Build and run: tools/linux-replay/run.sh. Findings: docs/linux-replay.md
 
@@ -84,6 +91,11 @@ static int findStreamReg(const uint32_t *s, uint32_t n, uint32_t opcode, uint32_
 int main() {
 	const char *vsSel = getenv("REPLAY_VS") ? getenv("REPLAY_VS") : "new";
 	const uint32_t variant = getenv("REPLAY_VARIANT") ? strtoul(getenv("REPLAY_VARIANT"), nullptr, 0) : 0;
+	if (variant & ~(1u | 2u | 128u | 256u | 2048u | 4096u)) {
+		fprintf(stderr, "REPLAY_VARIANT 0x%x: unsupported bits 0x%x (implemented: 1, 2, 128, 256, 2048, 4096)\n", variant,
+		        variant & ~(1u | 2u | 128u | 256u | 2048u | 4096u));
+		return 1;
+	}
 
 	int fd = -1;
 	for (int m = 128; m < 136 && fd < 0; m++) {
@@ -166,7 +178,7 @@ int main() {
 	if (rdna4_tri_record(s, &tva) != n) { fprintf(stderr, "rdna4_tri_record refused the addresses\n"); return 1; }
 	auto patch = [&](uint32_t opcode, uint32_t reg, uint32_t mask, uint32_t value, const char *what) {
 		const int at = findStreamReg(kStream, n, opcode, reg);
-		if (at < 0) { printf("patch %s: register not in the stream\n", what); return; }
+		if (at < 0) { fprintf(stderr, "patch %s: register not in the stream\n", what); exit(1); }
 		const uint32_t old = s[at];
 		s[at] = (old & ~mask) | (value & mask);
 		printf("patch %s: 0x%08x -> 0x%08x\n", what, old, s[at]);
@@ -292,5 +304,5 @@ int main() {
 		printf(" %s %llu", names[i], (unsigned long long)(b - a));
 	}
 	printf("\n");
-	return red == kCoveredPixels ? 0 : 2;
+	return rdna4_tri_ok(builderRed, builderOthers) ? 0 : 2;
 }

@@ -6,11 +6,13 @@
 #
 #   python3 tools/gen-gfx12-draw.py header > src/gfx12_draw.h   (needs ~/src/mesa)
 # Every register value is built from named fields that are validated against gfx12.json.
-import json, struct, sys
+import json, os, struct, sys
 
-import os
 JPATH = os.environ.get('MESA_GFX12_JSON', '/home/miguer/src/mesa/src/amd/registers/gfx12.json')
-J = json.load(open(JPATH))
+try:
+    J = json.load(open(JPATH))
+except OSError as e:
+    sys.exit('gen-gfx12-draw.py: cannot read Mesa\'s gfx12.json at %s (%s); set MESA_GFX12_JSON=<path to src/amd/registers/gfx12.json>' % (JPATH, e.strerror))
 REGS = {r['name']: r for r in J['register_mappings']}
 TYPES = J['register_types']
 
