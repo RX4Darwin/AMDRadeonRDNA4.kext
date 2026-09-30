@@ -4679,6 +4679,15 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                 }
                 if (dst >= 106 || !rdna4_gfx_set_sreg(w, dst, mask))
                     goto unknown;
+            } else if (op == 0x31f) {                        /* v_mbcnt_lo_u32_b32 (shaders/nggvgpr.s: the lane id) */
+                for (unsigned lane = 0; lane < 32; lane++) {
+                    if ((w->exec >> lane) & 1u) {
+                        uint32_t mask = rdna4_gfx_vsrc(w, s0, lane, dw2);
+                        uint32_t below = lane ? mask & ((1u << lane) - 1u) : 0;
+
+                        w->v[dst][lane] = (uint32_t)__builtin_popcount(below) + rdna4_gfx_vsrc(w, s1, lane, dw2);
+                    }
+                }
             } else if (op == 0x101) {                        /* v_cndmask_b32_e64 */
                 uint32_t cond = rdna4_gfx_sreg(w, s2);
                 for (unsigned lane = 0; lane < 32; lane++) {
@@ -4701,6 +4710,15 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                     w->v[dst][lane] = rdna4_gfx_vsrc(w, dw & 0x1ff, lane, dw1);
             }
             if ((dw & 0x1ffu) == 0xffu)                      /* a literal follows */
+                n = 2;
+        } else if ((dw & 0x80000000u) == 0 && ((dw >> 25) & 0x3f) == 0x18) {   /* VOP2 v_lshlrev_b32 */
+            uint32_t dst = (dw >> 17) & 0xff, vsrc1 = (dw >> 9) & 0xff, src0 = dw & 0x1ff;
+
+            for (unsigned lane = 0; lane < 32; lane++) {
+                if ((w->exec >> lane) & 1u)
+                    w->v[dst][lane] = w->v[vsrc1][lane] << (rdna4_gfx_vsrc(w, src0, lane, dw1) & 31);
+            }
+            if (src0 == 0xffu)
                 n = 2;
         } else if ((dw & 0xff000000u) == 0xee000000u && ((dw >> 14) & 0x7f) == 0x1a) {
             /* VGLOBAL global_store_b32 vaddr, vdata, saddr (96-bit form, encodings
