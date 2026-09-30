@@ -53,6 +53,23 @@ Ruled out along the way (all on the card): the export order (`linux-radv-triangl
     REPLAY_VS=old tools/linux-replay/run.sh                   # the round-6 ngg.s (edc5f81): 0 px
     REPLAY_SET="c:0x10b=0x43800000" tools/linux-replay/run.sh # any register override
 
+## W12k groundwork: the app-side triangle IB
+
+`userspace/gfx12tri.h` is the triangle as an application records it: `rdna4_tri_place_shaders`,
+`rdna4_tri_record` (the stream with the app's code/target/ring/fence addresses) and `rdna4_tri_count`.
+It is plain C (rdna4-run) and C++ (the replay), over `src/gfx12_draw.h`, which the generator now emits
+for both languages. The regenerated stream and relocations are byte-identical and the kext's code is
+unchanged. The replay records through it, so the exact bytes `rdna4-run tri` will submit are proven on
+the card as an unprivileged IB in a per-process VMID: 8192 px, and the stream's own RELEASE_MEM
+writes the fence the app waits on.
+
+The emulator (W12e) agrees for this stream in a client VMID: every opcode is modelled (none takes the
+OPCODE_ERROR fault) and all its SET_UCONFIG_REG writes are in the unprivileged range.
+
+`tools/linux-replay/ring-capture.sh` (needs sudo, read-only) dumps amdgpu's gfx rings right after a
+replay and decodes the packets around our INDIRECT_BUFFER. That shows what the kernel wraps a user gfx IB
+with on this card, which is the reference for the kext side of W12k.
+
 ## Next
 
 Real-card round 7, boot 3 (`set-boot.sh 3`): the baseline draw should report `PASS ... THE TRIANGLE IS RIGHT,

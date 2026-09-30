@@ -18,10 +18,8 @@
 //
 // Build and run: tools/linux-replay/run.sh. Findings: docs/linux-replay.md
 
-#include "gfx12_draw.h"
-#include "ngg_kernel.h"
+#include "gfx12tri.h"         // userspace/: the shared builder rdna4-run tri uses (gfx12_draw.h, ngg, psred)
 #include "ngg_old_kernel.h"
-#include "psred_kernel.h"
 
 #include <amdgpu.h>
 #include <amdgpu_drm.h>
@@ -119,10 +117,12 @@ int main() {
 	Buf misc = alloc(0x1000, 0x1000, AMDGPU_GEM_DOMAIN_GTT, 0);                         // fence 0, pstat pre 0x100, post 0x200
 	Buf ibuf = alloc(0x4000, 0x1000, AMDGPU_GEM_DOMAIN_GTT, 0);
 
-	// Shaders, each followed by s_code_end padding for the SQ's prefetch (gfxDrawRun place()).
+	// Shaders: the shared builder places ngg.s + psred.s (what rdna4-run tri runs); REPLAY_VS may then swap
+	// the VS, padded with s_code_end the same way.
+	rdna4_tri_place_shaders(code.cpu);
 	auto place = [&](uint32_t at, const uint32_t *k, uint32_t dwords) {
 		uint32_t *p = reinterpret_cast<uint32_t *>(static_cast<char *>(code.cpu) + at);
-		for (uint32_t i = 0; i < 0x100; i++)
+		for (uint32_t i = 0; i < RDNA4_TRI_SHADER_PAD; i++)
 			p[i] = i < dwords ? k[i] : 0xbf9f0000u;
 	};
 	if (!strncmp(vsSel, "file:", 5)) {   // raw dwords in hex, one or more per line (e.g. RADV's VS from its dump)
@@ -135,11 +135,12 @@ int main() {
 		fclose(f);
 		printf("VS from %s: %u dwords\n", vsSel + 5, nk);
 		place(0, k, nk);
-	} else if (!strcmp(vsSel, "new"))
-		place(0, kNggKernel, sizeof(kNggKernel) / 4);
-	else
+	} else if (!strcmp(vsSel, "old"))
 		place(0, kNggOldKernel, sizeof(kNggOldKernel) / 4);
-	place(0x1000, kPsredKernel, sizeof(kPsredKernel) / 4);
+	else if (strcmp(vsSel, "new")) {
+		fprintf(stderr, "REPLAY_VS: new, old or file:<hex>\n");
+		return 1;
+	}
 	// Marker literals (nggstore.s / nggvgpr.s convention): 0xdead0001 + 2k / + 2k+1 = low / high of misc + 0x300 + 0x80 k.
 	{
 		uint32_t *p = static_cast<uint32_t *>(code.cpu);
@@ -152,18 +153,14 @@ int main() {
 		memset(static_cast<char *>(misc.cpu) + 0x300, 0xee, 0x200);
 	}
 
-	const uint64_t va[7] = { code.va, code.va + 0x1000, target.va, rings.va, rings.va + kAttrRingBytes,
-	                         rings.va + kAttrRingBytes + kPosRingBytes, misc.va };
-	printf("VS 0x%llx PS 0x%llx target 0x%llx rings 0x%llx fence 0x%llx (VS %s, variant %u)\n",
-	       (unsigned long long)va[kVs], (unsigned long long)va[kPs], (unsigned long long)va[kCb],
-	       (unsigned long long)va[kAttrRing], (unsigned long long)va[kFence], vsSel, variant);
-
-	// The stream, its addresses filled in exactly as gfxDrawRun does.
+	// The stream with its addresses: the shared builder (rdna4_tri_record), as rdna4-run tri records it.
+	const rdna4_tri_va tva = { code.va, target.va, rings.va, misc.va };
+	printf("code 0x%llx target 0x%llx rings 0x%llx fence 0x%llx (VS %s, variant %u)\n",
+	       (unsigned long long)tva.code, (unsigned long long)tva.target, (unsigned long long)tva.rings,
+	       (unsigned long long)tva.fence, vsSel, variant);
 	constexpr uint32_t n = sizeof(kStream) / 4;
 	uint32_t s[n];
-	memcpy(s, kStream, sizeof(s));
-	for (const Reloc &rl : kRelocs)
-		s[rl.dword] = static_cast<uint32_t>((va[rl.sym] >> rl.shift) & rl.mask);
+	if (rdna4_tri_record(s, &tva) != n) { fprintf(stderr, "rdna4_tri_record refused the addresses\n"); return 1; }
 	auto patch = [&](uint32_t opcode, uint32_t reg, uint32_t mask, uint32_t value, const char *what) {
 		const int at = findStreamReg(kStream, n, opcode, reg);
 		if (at < 0) { printf("patch %s: register not in the stream\n", what); return; }
@@ -249,6 +246,8 @@ int main() {
 	printf("submission: %s (query %d), context reset state %u\n", expired ? "done" : "NOT done in 5 s", r, state);
 
 	const uint32_t *px = static_cast<const uint32_t *>(target.cpu);
+	uint32_t builderOthers = 0;
+	const uint32_t builderRed = rdna4_tri_count(px, &builderOthers);
 	uint32_t red = 0, other = 0, minX = kWidth, maxX = 0, minY = kHeight, maxY = 0;
 	for (uint32_t y = 0; y < kHeight; y++)
 		for (uint32_t x = 0; x < kWidth; x++) {
@@ -263,6 +262,8 @@ int main() {
 		}
 	printf("pixels: %u 0x%08x (want %u), %u others; bounds x %u..%u y %u..%u\n", red, kCoveredRgba,
 	       kCoveredPixels, other, minX, maxX, minY, maxY);
+	printf("rdna4_tri_count: %u px, %u others: %s\n", builderRed, builderOthers,
+	       rdna4_tri_ok(builderRed, builderOthers) ? "THE TRIANGLE IS RIGHT" : "wrong image");
 	printf("draw fence: 0x%08x\n", *static_cast<uint32_t *>(misc.cpu));
 	if (getenv("REPLAY_DUMP_MARKER")) {
 		const uint32_t *m = reinterpret_cast<const uint32_t *>(static_cast<char *>(misc.cpu) + 0x300);

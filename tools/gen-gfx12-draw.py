@@ -8,7 +8,8 @@
 # Every register value is built from named fields that are validated against gfx12.json.
 import json, struct, sys
 
-JPATH = '/home/miguer/src/mesa/src/amd/registers/gfx12.json'
+import os
+JPATH = os.environ.get('MESA_GFX12_JSON', '/home/miguer/src/mesa/src/amd/registers/gfx12.json')
 J = json.load(open(JPATH))
 REGS = {r['name']: r for r in J['register_mappings']}
 TYPES = J['register_types']
@@ -441,17 +442,23 @@ if __name__ == '__main__':
         print('#pragma once')
         print('#include <stdint.h>')
         print('')
+        print('// C and C++: the kext uses Gfx12Draw::, user space (userspace/gfx12tri.h) includes it from C.')
+        print('#ifdef __cplusplus')
         print('namespace Gfx12Draw {')
+        print('#define GFX12_DRAW_CONST constexpr')
+        print('#else')
+        print('#define GFX12_DRAW_CONST static const')
+        print('#endif')
         print('')
-        print('enum Sym : uint8_t { kVs, kPs, kCb, kAttrRing, kPosRing, kPrimRing, kFence };')
-        print('struct Reloc { uint16_t dword; uint8_t sym, shift; uint32_t mask; };   // (va >> shift) & mask')
+        print('enum Sym { kVs, kPs, kCb, kAttrRing, kPosRing, kPrimRing, kFence };')
+        print('typedef struct Reloc { uint16_t dword; uint8_t sym, shift; uint32_t mask; } Reloc;   // (va >> shift) & mask')
         print('')
-        print('constexpr uint32_t kWidth = %u, kHeight = %u;' % (W, H))
-        print('constexpr uint32_t kMaxSe = %u;                       // shader engines the rings are sized for' % MAX_SE)
-        print('constexpr uint64_t kAttrRingBytes = 0x%X, kPosRingBytes = 0x%X, kPrimRingBytes = 0x%X;' % (attr_total, pos_total, prim_total))
-        print('constexpr uint64_t kRingBytes = 0x%X;                  // attribute, position, primitive, in that order' % RING_TOTAL)
-        print('constexpr uint32_t kCoveredPixels = 8192;             // notes 3.9: rows 64..190, 0xFF0000FF')
-        print('constexpr uint32_t kCoveredRgba = 0xFF0000FFu;')
+        print('GFX12_DRAW_CONST uint32_t kWidth = %u, kHeight = %u;' % (W, H))
+        print('GFX12_DRAW_CONST uint32_t kMaxSe = %u;                       // shader engines the rings are sized for' % MAX_SE)
+        print('GFX12_DRAW_CONST uint64_t kAttrRingBytes = 0x%X, kPosRingBytes = 0x%X, kPrimRingBytes = 0x%X;' % (attr_total, pos_total, prim_total))
+        print('GFX12_DRAW_CONST uint64_t kRingBytes = 0x%X;                  // attribute, position, primitive, in that order' % RING_TOTAL)
+        print('GFX12_DRAW_CONST uint32_t kCoveredPixels = 8192;             // notes 3.9: rows 64..190, 0xFF0000FF')
+        print('GFX12_DRAW_CONST uint32_t kCoveredRgba = 0xFF0000FFu;')
         print('')
         print('static const uint32_t kStream[%d] = {' % len(stream))
         print('\n'.join(lines))
@@ -462,7 +469,9 @@ if __name__ == '__main__':
             print('\t{ %u, %s, %u, 0x%08x },' % (d, ['kVs', 'kPs', 'kCb', 'kAttrRing', 'kPosRing', 'kPrimRing', 'kFence'][sy], sh, m))
         print('};')
         print('')
+        print('#ifdef __cplusplus')
         print('} // namespace Gfx12Draw')
+        print('#endif')
     elif mode == 'info':
         print('attr_per_se=0x%X pos_per_se=0x%X prim_per_se=0x%X' % (attr_per_se, pos_per_se, prim_per_se))
         print('attr_total=0x%X pos_total=0x%X prim_total=0x%X ring_total=0x%X' % (attr_total, pos_total, prim_total, RING_TOTAL))

@@ -11,17 +11,23 @@
 #pragma once
 #include <stdint.h>
 
+// C and C++: the kext uses Gfx12Draw::, user space (userspace/gfx12tri.h) includes it from C.
+#ifdef __cplusplus
 namespace Gfx12Draw {
+#define GFX12_DRAW_CONST constexpr
+#else
+#define GFX12_DRAW_CONST static const
+#endif
 
-enum Sym : uint8_t { kVs, kPs, kCb, kAttrRing, kPosRing, kPrimRing, kFence };
-struct Reloc { uint16_t dword; uint8_t sym, shift; uint32_t mask; };   // (va >> shift) & mask
+enum Sym { kVs, kPs, kCb, kAttrRing, kPosRing, kPrimRing, kFence };
+typedef struct Reloc { uint16_t dword; uint8_t sym, shift; uint32_t mask; } Reloc;   // (va >> shift) & mask
 
-constexpr uint32_t kWidth = 256, kHeight = 256;
-constexpr uint32_t kMaxSe = 4;                       // shader engines the rings are sized for
-constexpr uint64_t kAttrRingBytes = 0x580000, kPosRingBytes = 0x400000, kPrimRingBytes = 0x100000;
-constexpr uint64_t kRingBytes = 0xA80000;                  // attribute, position, primitive, in that order
-constexpr uint32_t kCoveredPixels = 8192;             // notes 3.9: rows 64..190, 0xFF0000FF
-constexpr uint32_t kCoveredRgba = 0xFF0000FFu;
+GFX12_DRAW_CONST uint32_t kWidth = 256, kHeight = 256;
+GFX12_DRAW_CONST uint32_t kMaxSe = 4;                       // shader engines the rings are sized for
+GFX12_DRAW_CONST uint64_t kAttrRingBytes = 0x580000, kPosRingBytes = 0x400000, kPrimRingBytes = 0x100000;
+GFX12_DRAW_CONST uint64_t kRingBytes = 0xA80000;                  // attribute, position, primitive, in that order
+GFX12_DRAW_CONST uint32_t kCoveredPixels = 8192;             // notes 3.9: rows 64..190, 0xFF0000FF
+GFX12_DRAW_CONST uint32_t kCoveredRgba = 0xFF0000FFu;
 
 static const uint32_t kStream[489] = {
 	// PHASE 0: CONTEXT_CONTROL (no load/shadow), initial cache invalidation
@@ -305,4 +311,6 @@ static const Reloc kRelocs[13] = {
 	{ 485, kFence, 32, 0xffffffff },
 };
 
+#ifdef __cplusplus
 } // namespace Gfx12Draw
+#endif
