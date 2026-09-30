@@ -100,3 +100,36 @@ Emulator options for the W38 review tests (`RDNA4_DEV=cursor=on,...`, boot-4 arg
 
 Expected log lines: `dscl-mode=6` -> `case A` + `programming amdgpu's mode-0 set` + `DSCL mode-0 set written`; `dscl-mode=3` -> `case C` + `not written`; default (mode 0, RECOUT = plane) -> `case D` + `not written`;
 with `desktop-churn=on` every run must still end in `cursor pixels reach the output: YES` (the previous strict rule reads INCONCLUSIVE there). The model cannot know whether a real DSCL in bypass drops the cursor plane: it composites it.
+
+## 8. W40: CM bypass (`rdna4-cursorcm=1`, `rdna4-cursor=2` only)
+
+Source: premetal/verify-cursor.md sections 2, 7.1 and 8. The card logs `latch domains: ... cm ctl=0x00000001` (hw-logs/rdna4fb-diag-20260929-082237.txt:245): the GOP left `CM0_CM_CONTROL.CM_BYPASS = 1`.
+amdgpu clears it whenever a plane is enabled (`dcn401_dpp.c:223` `.dpp_program_gamcor_lut = dpp3_program_gamcor_lut` -> `dpp3_enable_cm_block`, `dcn30_dpp_cm.c:43-54, 219-227`, `REG_UPDATE(CM_CONTROL, CM_BYPASS, 0)`;
+`debug.cm_in_bypass` is never set for DCN401), and on DCN4 the cursor unit (`CM_CUR0`) sits inside the CM block. Whether the bypass mux sits before or after the cursor blend is undocumented: the CRC A/B decides.
+
+Read-only, always with `rdna4-cursor=2` (`selftest pre`): the `cm:` line (`CM0_CM_CONTROL 0x0d67`, `POST_CSC_CONTROL 0x0d68`, `BIAS_CR_R/Y_G_CB_B 0x0d75/0x0d76`, `GAMCOR_CONTROL 0x0d77`, `HDR_MULT_COEF 0x0dc1`,
+`MEM_PWR_CTRL/STATUS 0x0dc2/0x0dc3`, `DEALPHA 0x0dc5`; offsets verified in dcn_4_1_0_offset.h, base idx 2, `+ dppOff()`) and three `dlg 0x063b/0x0644/0x064d:` lines (the DLG/TTU registers 0x063b-0x0655, `+ hubpOff()`, nine per line).
+
+With `rdna4-cursorcm=1`, in the same boot: CRC A/B `[GOP CM state]` -> CM write -> CRC A/B `[after CM enable]` -> `CM bypass: before NO/YES, after NO/YES`. The write happens under the OTG update lock
+(same bracket as modeset.cpp:292-300, held-wait <= 10 ms), each value as amdgpu leaves an SDR RGB plane without degamma:
+
+| Register | Value | amdgpu |
+|---|---|---|
+| `CM_POST_CSC_CONTROL` | 0 (bypass) | `dcn30_dpp.c:118-120` |
+| `CM_BIAS_CR_R`, `CM_BIAS_Y_G_CB_B` | 0 | `dcn30_dpp_cm.c:160-170` |
+| `CM_DEALPHA` | 0 | `dcn30_dpp_cm.c:149-158` |
+| `CM_GAMCOR_CONTROL` | 0 (whole-register REG_SET) | `dcn30_dpp_cm.c:229-230` |
+| `CM_HDR_MULT_COEF` | RMW [18:0] = 0x1f000 (1.0, s6e12) | `dcn30_dpp_cm.c:308-314`, `dcn10_hwseq.c:3247` |
+| `CM_CONTROL` | RMW bit 0 = 0, last | `dcn30_dpp_cm.c:43-54` |
+
+Then `CM_UPDATE_PENDING` (`CM_CONTROL` bit 8) is polled clear for at most 50 ms. If the CM is already amdgpu's identity nothing is written and the second CRC is not run. The GOP values are in the `selftest pre: cm:` line to restore by hand.
+
+| Log | Reading |
+|---|---|
+| `CM bypass: before NO, after YES` | CM_BYPASS was routing the pixel stream around the cursor blend: the fix |
+| `before NO, after NO` | not the CM (or not enough): continue with the DLG lines (`dlg`) and mission mode, then DSCL |
+| `before YES, after ...` | the cursor already reaches the OTG on this card; look downstream (the panel path) |
+| `after INCONCLUSIVE` | the picture changed under the window (a mode change from the CM write would show as a colour shift) |
+
+Emulator: it has no CM (`rdna4_get_cursor` does not read `CM_CONTROL`), and nothing in amdgpu justifies a model of "CM_BYPASS drops the cursor" (it is a guess, [G] in verify-cursor.md section 2.4), so the emulator cannot show the effect.
+`cm-bypass=on` only leaves `CM0_CM_CONTROL = 1` in the register file, as the GOP does, to exercise the kext's decision/write/latch path: the two CRCs are equal there by construction.
