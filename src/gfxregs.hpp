@@ -114,6 +114,7 @@ constexpr uint32_t kGrbmGuiActive = 1u << 31;
 constexpr uint32_t kGrbm2SdmaBusy = 1u << 21;
 constexpr uint32_t kGrbm2RlcBusy  = 1u << 26;
 // CP_ME_CNTL
+constexpr uint32_t kCpMeCeHalt    = 1u << 24;   // amdgpu never writes it (no CE on gfx12); Linux reads it 0, the kext leaves it 1
 constexpr uint32_t kCpMePfpHalt   = 1u << 26;
 constexpr uint32_t kCpMeMeHalt    = 1u << 28;
 // CP_ME1_PIPE0_INT_CNTL

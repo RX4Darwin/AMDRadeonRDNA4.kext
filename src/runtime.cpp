@@ -662,7 +662,9 @@ bool RDNA4Compute::vmContextInit(RtClient &c) {
 	if (c.vmid < 1 || c.vmid > 15 || !c.rootPhys)
 		return false;
 	const uint32_t n = c.vmid - 1;
-	const uint32_t faultDefaults = ((1u << 14) - 1) << 10;
+	// W42 (Linux ground truth): GCVM_CONTEXT1..15_CNTL read 0x03fffc07 under amdgpu: the fault-enable defaults are bits 10..25 (16 bits;
+	// the header names only 10..23, bits 24-25 are reset defaults Linux keeps through its read-modify-write). Ours wrote 0x00fffc07.
+	const uint32_t faultDefaults = ((1u << 16) - 1) << 10;
 	const uint32_t cntl = kVmCtxEnable | (GpuVm::kDepth << 1) |
 		((GpuVm::kBlockSize - 9) << 4) | faultDefaults;
 	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + n }, cntl);
@@ -1284,7 +1286,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 					 * flushed in by the ring, gmc_v12_0_emit_flush_gpu_tlb). */
 					const uint32_t n = curVmid - 1;
 					const uint32_t cntl = kVmCtxEnable | (GpuVm::kDepth << 1) |
-						((GpuVm::kBlockSize - 9) << 4) | (((1u << 14) - 1) << 10);
+						((GpuVm::kBlockSize - 9) << 4) | (((1u << 16) - 1) << 10);   // W42: bits 10..25 as Linux
 					wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + n }, 0);
 					wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtBaseLo.dword + 2 * n },
 					   static_cast<uint32_t>(GpuVm::encodePde(c.rootPhys, GpuVm::kValid, 0)));

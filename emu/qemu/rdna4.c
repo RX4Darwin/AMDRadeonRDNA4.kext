@@ -5407,8 +5407,17 @@ static bool rdna4_gfx_set_regs(RDNA4State *s, RDNA4GfxStream *st,
         fprintf(stderr, "rdna4: gfx: SET_* packet has no register offset, stopping\n");
         return false;
     }
-    base = op == 0x79 ? 0xc000 : op == 0x69 ? 0xa000 : 0x2c00;
-    if (!st->priv && op == 0x79 &&
+    base = (op == 0x79 || op == 0x7a) ? 0xc000 : op == 0x69 ? 0xa000 : 0x2c00;
+    if (op == 0x7a) {
+        /* SET_UCONFIG_REG_INDEX (radv: VGT_PRIMITIVE_TYPE with index 1, ac_cmdbuf_set_ucfg_reg_idx): the offset
+         * dword carries the index in [31:28]. Modelled as a plain SET_UCONFIG_REG of one register with index 1. */
+        if (count != 1 || (start >> 28) != 1) {
+            fprintf(stderr, "rdna4: gfx: SET_UCONFIG_REG_INDEX count %u index %u refused, stopping\n", count, start >> 28);
+            return false;
+        }
+        start &= 0x0fffffffu;
+    }
+    if (!st->priv && (op == 0x79 || op == 0x7a) &&
         ((uint64_t)base + start < 0xc000 ||
          (uint64_t)base + start + count - 1 > 0xffff)) {
         fprintf(stderr, "rdna4: gfx: SET_UCONFIG_REG 0x%08x..0x%08x is privileged, stopping\n",
@@ -5468,6 +5477,7 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
         case 0x10:                                           /* NOP */
             break;
         case 0x79:                                           /* SET_UCONFIG_REG */
+        case 0x7a:                                           /* SET_UCONFIG_REG_INDEX (W41) */
         case 0x69:                                           /* SET_CONTEXT_REG */
         case 0x76:                                           /* SET_SH_REG */
             if (!rdna4_gfx_set_regs(s, st, op, count)) {

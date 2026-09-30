@@ -114,7 +114,15 @@ bool RDNA4Compute::gfxRingResume() {
 	uint32_t bufsz = 0;                                     // order_base_2(ring bytes / 8)
 	while ((8u << bufsz) < kGfxRingSize)
 		bufsz++;
-	const uint32_t cntl = (bufsz & 0x3f) | (((bufsz - 2) & 0x3f) << 8);
+	uint32_t cntl = (bufsz & 0x3f) | (((bufsz - 2) & 0x3f) << 8);
+	{   // W42 (opt-in): amdgpu's MES/MQD path builds CP_GFX_HQD_CNTL from the register default, which carries MIN_AVAILSZ=3 and
+		// MIN_IB_AVAILSZ=3 (bits 20-23): Linux reads CP_RB0_CNTL = 0x00f0088a. The proven ring tests ran without them, so it is off by default.
+		uint32_t rbmin = 0;
+		if (PE_parse_boot_argn("rdna4-gfxrbmin", &rbmin, sizeof(rbmin)) && rbmin == 1) {
+			cntl |= (3u << 20) | (3u << 22);
+			GLOG("ring 0: rdna4-gfxrbmin=1: CP_RB0_CNTL gets MIN_AVAILSZ=3 and MIN_IB_AVAILSZ=3 like the Linux queue (0x%08x)", cntl);
+		}
+	}
 	wr(IpDiscovery::HwGc, CpRb0Cntl, cntl);
 	wr(IpDiscovery::HwGc, CpRb0Wptr, 0);
 	wr(IpDiscovery::HwGc, CpRb0WptrHi, 0);
@@ -144,6 +152,13 @@ bool RDNA4Compute::gfxRingResume() {
 	// gfx_v12_0_cp_gfx_enable: unhalt PFP and ME, wait for the CP to idle.
 	trail("gfx: unhalt PFP/ME");
 	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) & ~(kCpMePfpHalt | kCpMeMeHalt));
+	{   // W42 (opt-in): Linux reads CP_ME_CNTL = 0xa000 (CE_HALT clear) while ours keeps CE_HALT set; amdgpu itself never writes the bit.
+		uint32_t ce = 0;
+		if (PE_parse_boot_argn("rdna4-gfxce", &ce, sizeof(ce)) && ce == 1) {
+			wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) & ~kCpMeCeHalt);
+			GLOG("ring 0: rdna4-gfxce=1: CE_HALT cleared, CP_ME_CNTL 0x%08x", rdGc(CpMeCntl));
+		}
+	}
 	uint32_t stat = 0xffffffff;
 	for (uint32_t us = 0; us < 100000; us += 10) {
 		stat = rdGc(CpStat);
@@ -388,7 +403,7 @@ uint32_t RDNA4Compute::requestedGfxDiag() {
 	uint32_t mask = 0;
 	if (!PE_parse_boot_argn("rdna4-gfxdiag", &mask, sizeof(mask)))
 		return 0;
-	return mask & 0x3f;   // bits 1,2,4,8,32 = variants, 16 = run them even if the baseline passed
+	return mask & 0x7f;   // bits 1,2,4,8,32,64 = variants, 16 = run them even if the baseline passed
 }
 
 namespace {
@@ -670,6 +685,13 @@ bool RDNA4Compute::gfxSentinelCheck() {
 // W37 (premetal/rootcause-draw.md): the context state, the queue, and where the primitive is lost.
 // ---------------------------------------------------------------------------
 
+// W41: the VA-0 mapping is its own opt-in (rdna4-gfxva0=1), not part of rdna4-gfxprobe: it changes what the CPG can fault on,
+// so it confounds the baseline draw and stays out of boots 3 and 6.
+bool RDNA4Compute::requestedGfxVa0() {
+	uint32_t v = 0;
+	return PE_parse_boot_argn("rdna4-gfxva0", &v, sizeof(v)) && v == 1;
+}
+
 bool RDNA4Compute::requestedGfxSrm() {
 	uint32_t v = 1;
 	return !(PE_parse_boot_argn("rdna4-gfxsrm", &v, sizeof(v)) && v == 0);
@@ -803,7 +825,7 @@ void RDNA4Compute::gfxQueueEvidence(const char *tag) {
 // shared scratch page) becomes a private zeroed VRAM page (VALID | READABLE | WRITEABLE, amdgpu_vm.h:57,67,68),
 // as amdgpu's GART would be there. The CPG's stray access at VA 0 (round 4: status 0x0d3d, a read and a write
 // IV pair) then lands in a page we can dump after the draw: the dwords it writes fingerprint the structure.
-// rdna4-gfxprobe=1 only, and only right before the baseline draw, after the single-packet probe has looked at
+// rdna4-gfxva0=1 only (its own opt-in since W41: it confounds the baseline draw), right before the baseline draw, after the single-packet probe has looked at
 // the faults (mapping the page makes the fault disappear).
 void RDNA4Compute::gfxMapVa0() {
 	for (uint32_t i = 0; i < 1024; i++)
@@ -943,6 +965,84 @@ void RDNA4Compute::gfxClearStatePre() {
 	GLOG("clear state BEFORE any CSB replay says: %s", cpNz == 0
 	     ? "all zero: the clear state is already applied (SRM landed it, or the registers reset to 0)"
 	     : "power-up garbage: the clear state did NOT land from the CSB handoff / SRM enable alone (#1: the replay or another trigger is needed)");
+}
+
+// W42 (hub-task-274): what Linux amdgpu (kernel 7.2.2, this RX 9070 XT, E:\linux\rdna4-groundtruth-{idle,vkcube}-*\gc-regs.txt)
+// reads in the registers that decide VM translation, the gfx queue, the RLC and the CP, compared with ours at the same
+// point. Read-only. `mask` limits the comparison to bits that are meaningful (ring size, addresses and doorbell index differ by design);
+// `why` says what a known difference is. Logged once per gfx boot, right before the draw, as `linux diff: DIFF name ours 0x.. linux 0x..`.
+struct LinuxRef { const char *name; Reg reg; uint32_t linux_; uint32_t mask; const char *why; };
+static const LinuxRef kLinuxRef[] = {
+	{ "GCVM_L2_CNTL", { 0, 0x15c4 }, 0x00080e01, 0xffffffff, "bit 11 ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY: Linux points faults at a system dummy page; ours is VRAM, so it stays off" },
+	{ "GCVM_L2_CNTL2", { 0, 0x15c5 }, 0x00000003, 0xffffffff, "" },
+	{ "GCVM_L2_CNTL3", { 0, 0x15c6 }, 0x80130009, 0xffffffff, "" },
+	{ "GCVM_L2_CNTL4", { 0, 0x15dd }, 0x00000001, 0xffffffff, "" },
+	{ "GCVM_L2_CNTL5", { 0, 0x15e3 }, 0x00003fe0, 0xffffffff, "" },
+	{ "GCVM_L2_PROTECTION_FAULT_CNTL", { 0, 0x15cc }, 0x3ffffffc, 0xffffffff, "" },
+	{ "GCVM_L2_PROTECTION_FAULT_CNTL2", { 0, 0x15cd }, 0x00060000, 0xffffffff, "" },
+	{ "GCMC_VM_MX_L1_TLB_CNTL", { 0, 0x161b }, 0x00001859, 0xffffffff, "" },
+	{ "GCVM_CONTEXTS_DISABLE", { 0, 0x1634 }, 0x00000000, 0xffffffff, "" },
+	{ "GCVM_CONTEXT0_CNTL", { 0, 0x1624 }, 0x03fffc01, 0xffffffff, "Linux: 3-level GART range 0..0x1ffff pages; ours: flat, one page" },
+	{ "GCVM_CONTEXT1_CNTL", { 0, 0x1625 }, 0x03fffc07, 0xffffffff, "bits 24-25 are reset defaults Linux keeps (RMW); ours wrote them as 0 until W42" },
+	{ "GCVM_CONTEXT8_CNTL", { 0, 0x162c }, 0x03fffc07, 0xffffffff, "bits 24-25, as CONTEXT1" },
+	{ "GCMC_VM_FB_LOCATION_BASE", { 0, 0x1614 }, 0x00008000, 0xffffffff, "" },
+	{ "GCMC_VM_FB_LOCATION_TOP", { 0, 0x1615 }, 0x000083fb, 0xffffffff, "" },
+	{ "GCMC_VM_FB_OFFSET", { 0, 0x15a7 }, 0x00000000, 0xffffffff, "" },
+	{ "GCMC_VM_SYSTEM_APERTURE_LOW", { 0, 0x1619 }, 0x00200000, 0xffffffff, "" },
+	{ "GCMC_VM_SYSTEM_APERTURE_HIGH", { 0, 0x161a }, 0x0020febf, 0xffffffff, "Linux ends the aperture 16 MiB below FB top; ours covers the whole FB (a superset)" },
+	{ "GCMC_VM_AGP_BOT", { 0, 0x1617 }, 0x00ffffff, 0xffffffff, "" },
+	{ "GCMC_VM_AGP_TOP", { 0, 0x1616 }, 0x00000000, 0xffffffff, "" },
+	{ "GCMC_VM_AGP_BASE", { 0, 0x1618 }, 0x00000000, 0xffffffff, "" },
+	{ "RLC_SRM_CNTL", { 1, 0x4c80 }, 0x00000003, 0xffffffff, "" },
+	{ "RLC_CNTL", { 1, 0x4c00 }, 0x00000001, 0xffffffff, "" },
+	{ "RLC_CSIB_LENGTH", { 1, 0x0989 }, 0x0000004b, 0xffffffff, "" },
+	{ "CP_ME_CNTL", { 1, 0x0803 }, 0x0000a000, 0xffffffff, "bit 24 CE_HALT: amdgpu never writes it; Linux reads 0, ours still 1 (rdna4-gfxce=1 clears it)" },
+	{ "CP_RB_ACTIVE", { 0, 0x1f40 }, 0x00000001, 0xffffffff, "" },
+	{ "CP_RB0_CNTL", { 0, 0x1de1 }, 0x00f0088a, 0x00f0c0c0, "ring size differs by design (BUFSZ/BLKSZ masked); bits 20-23 MIN_AVAILSZ/MIN_IB_AVAILSZ = 3 come from the MQD's reset-default CNTL (rdna4-gfxrbmin=1 sets them)" },
+	{ "CP_GFX_HQD_ACTIVE", { 0, 0x1e80 }, 0x00000001, 0xffffffff, "Linux runs the gfx queue through an HQD/MQD; ours is a bare RB0 (rootcause-draw.md #2)" },
+	{ "CP_GFX_HQD_CNTL", { 0, 0x1e8f }, 0x00f0088a, 0x00f0c0c0, "as CP_RB0_CNTL: the MQD/HQD path" },
+	{ "CP_GFX_MQD_BASE_ADDR_HI", { 0, 0x1e7f }, 0x00000080, 0xffffffff, "Linux: MQD in VRAM (0x80_00108000); ours has no MQD" },
+	{ "CP_GFX_HQD_VMID", { 0, 0x1e81 }, 0x00000000, 0xffffffff, "" },
+	{ "GB_ADDR_CONFIG", { 0, 0x13de }, 0x08200545, 0xffffffff, "" },
+	{ "GRBM_CNTL", { 0, 0x0da0 }, 0x00300018, 0xffffffff, "" },
+	{ "SH_MEM_CONFIG (VMID 0)", { 1, 0x09e4 }, 0x0000c00c, 0xffffffff, "" },
+	{ "SH_MEM_BASES (VMID 0)", { 1, 0x09e3 }, 0x00000000, 0xffffffff, "" },
+	{ "CP_MEC_RS64_CNTL", { 1, 0x2904 }, 0x3c000000, 0xffffffff, "" },
+	{ "CP_MES_CNTL", { 1, 0x2807 }, 0x0c000000, 0xffffffff, "" },
+	{ "CP_GFX_RS64_DC_BASE0_HI", { 1, 0x5865 }, 0x00000003, 0xffffffff, "Linux: data cache bases set by the PSP loader (0x3_f9600000 / 0x3_f9700000); 0 here = the loader did not set them" },
+	{ "CP_GFX_RS64_DC_BASE1_HI", { 1, 0x5866 }, 0x00000003, 0xffffffff, "" },
+	{ "GE_CNTL", { 1, 0x225b }, 0xa0010080, 0xffffffff, "" },
+	{ "PA_SC_MODE_CNTL_0", { 1, 0x0292 }, 0x00000022, 0xffffffff, "" },
+	{ "VGT_PRIMITIVE_TYPE", { 1, 0x2242 }, 0x00000000, 0xffffffff, "Linux reads 0 too (idle and with vkcube running): a 0 readback is NOT evidence of a missing primitive type" },
+};
+
+void RDNA4Compute::gfxLinuxDiff(const char *tag) {
+	grbmSelect(0, 0, 0, 0);   // VMID 0 for the banked SH_MEM_*
+	uint32_t compared = 0, differ = 0, len = 0;
+	char line[300];
+	line[0] = '\0';
+	auto flush = [&]() {
+		if (len) {
+			GLOG("%s: linux diff: %s", tag, line);
+			len = 0;
+			line[0] = '\0';
+		}
+	};
+	for (const LinuxRef &r : kLinuxRef) {
+		const uint32_t v = rdGc(r.reg);
+		compared++;
+		if ((v & r.mask) == (r.linux_ & r.mask))
+			continue;
+		differ++;
+		len += snprintf(line + len, sizeof(line) - len, "DIFF %s ours 0x%08x linux 0x%08x", r.name, v, r.linux_);
+		if (r.why[0])
+			len += snprintf(line + len, sizeof(line) - len, " (%s)", r.why);
+		len += snprintf(line + len, sizeof(line) - len, "; ");
+		if (len > 180)
+			flush();
+	}
+	flush();
+	GLOG("%s: linux diff: %u registers compared with the Linux 7.2.2 capture (vkcube), %u differ (the ones listed above)", tag, compared, differ);
 }
 
 // The GC hub fault status, logged and cleared, so the log says which bring-up step first makes the
@@ -1112,6 +1212,18 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		patch(kOpSetContextReg, 0x02a6, 0x04000000, 0, "VGT_SHADER_STAGES_EN.PRIMGEN_PASSTHRU_NO_MSG=0");
 	if (variant & 8)   // two user SGPRs on the PS carry the marker address
 		patch(kOpSetShReg, 0x19ab - kShBase, 0x0000003e, 2u << 1, "SPI_SHADER_PGM_RSRC2_PS.USER_SGPR=2");
+	if (variant & 64) {   // W41: VGT_PRIMITIVE_TYPE through SET_UCONFIG_REG_INDEX (0x7a) with index 1, as RADV (radv_cmd_buffer.c:4685; ac_cmdbuf.h ac_cmdbuf_set_ucfg_reg_idx: offset | idx << 28)
+		const int at = findStreamReg(kStream, n, 0x79, 0x242);
+		if (at < 2 || (((ib[at - 2] >> 16) & 0x3fff) != 1)) {
+			GLOG("%s: variant patch VGT_PRIMITIVE_TYPE index 1: not a single-register SET_UCONFIG_REG in the stream", label);
+		} else {
+			const uint32_t oldHdr = ib[at - 2], oldOff = ib[at - 1];
+			ib[at - 2] = (oldHdr & ~0x0000ff00u) | (0x7au << 8);
+			ib[at - 1] = oldOff | (1u << 28);
+			GLOG("%s: variant patch VGT_PRIMITIVE_TYPE via SET_UCONFIG_REG_INDEX index 1: header 0x%08x -> 0x%08x, offset 0x%08x -> 0x%08x",
+			     label, oldHdr, ib[at - 2], oldOff, ib[at - 1]);
+		}
+	}
 	if (variant & 32)   // the marker shader uses v8/v9: 10 VGPRs = 2 granules of 8 (VGPRS field = granules - 1)
 		patch(kOpSetShReg, 0x1a2a - kShBase, 0x0000003f, 1, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=1");
 
@@ -1170,15 +1282,7 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	r.ns = ns;
 	r.drawFence = *poolDw(kGfxDrawFenceOffset);
-	gfxEvidence(label, true);
-	if (split && r.ringDone) {
-		char what[40];
-		snprintf(what, sizeof(what), "%s probe mid", label);
-		r.probeSeen = true;
-		gfxProbeReport(what, kGfxProbeOffset, ib, &r.probeEqual, &r.probeCounted);
-		snprintf(what, sizeof(what), "%s probe post", label);
-		gfxProbeReport(what, kGfxProbePost, ib);
-	}
+	// W41 (verify-draw.md 7): the FIRST lines after a draw are the pipeline-statistics verdict and the NGG marker, then the evidence.
 	if (pstat && r.ringDone)
 		gfxPstatReport(label);
 	if (variant & 32) {   // W37 #4: did the NGG wave launch at all?
@@ -1188,6 +1292,28 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		GLOG("%s: NGG marker 0x%08x (%s), s2 (gs_tg_info) 0x%08x, s3 (merged_wave_info) 0x%08x", label, r.nggMarker,
 		     r.nggMarker == 0xc0de0002u ? "the NGG wave ran and stored to memory" : "NOT written: the NGG wave did not run",
 		     r.nggS2, r.nggS3);
+	}
+	if (requestedGfxProbe() && !variant)
+		GLOG("%s: NGG marker: not part of the clean baseline (ngg.s); ladder variant 32 (marker) runs next if the draw is empty", label);
+	if (split && r.ringDone) {   // W41 (verify-draw.md 5, A1): VGT_PRIMITIVE_TYPE reads 0 over MMIO on the card while the stream writes 4
+		for (uint32_t i = 0; i < kProbeCount; i++) {
+			if (strcmp(kProbe[i].name, "VGT_PRIMITIVE_TYPE") != 0)
+				continue;
+			const int at = findStreamReg(kStream, n, probeOpcode(kProbe[i]), probeOffset(kProbe[i]));
+			GLOG("%s: VGT_PRIMITIVE_TYPE: CP view mid 0x%08x post 0x%08x, the stream wrote 0x%08x (%s), MMIO 0x%08x", label,
+			     *poolDw(kGfxProbeOffset + 4 * i), *poolDw(kGfxProbePost + 4 * i), at >= 0 ? ib[at] : 0u,
+			     (variant & 64) ? "SET_UCONFIG_REG_INDEX index 1, like RADV" : "plain SET_UCONFIG_REG, like radeonsi",
+			     rdGc(Reg { kProbe[i].seg, kProbe[i].dword }));
+		}
+	}
+	gfxEvidence(label, true);
+	if (split && r.ringDone) {
+		char what[40];
+		snprintf(what, sizeof(what), "%s probe mid", label);
+		r.probeSeen = true;
+		gfxProbeReport(what, kGfxProbeOffset, ib, &r.probeEqual, &r.probeCounted);
+		snprintf(what, sizeof(what), "%s probe post", label);
+		gfxProbeReport(what, kGfxProbePost, ib);
 	}
 	static uint32_t ctxDumps = 0;   // W37 review NIT: the 1024-register dump only for the baseline and the first variant
 	if (requestedGfxProbe() && r.ringDone && ctxDumps++ < 2)
@@ -1282,7 +1408,8 @@ bool RDNA4Compute::stageGfxDraw() {
 	GfxDrawResult base;
 	gfxRs64Evidence("before draw");
 	gfxQueueEvidence("before draw");
-	if (requestedGfxProbe())
+	gfxLinuxDiff("before draw");   // W42
+	if (requestedGfxVa0())
 		gfxMapVa0();   // W37 #2: after the single-packet probe has looked at the faults; the CPG's stray VA-0 access lands in a page we dump
 	gfxEvidence("before draw", false);
 	if (requestedGfxProbe())
@@ -1294,7 +1421,7 @@ bool RDNA4Compute::stageGfxDraw() {
 	if (requestedGfxProbe())
 		gfxClearStatePre();   // W39 S3: before the first CSB replay
 	const bool ran = gfxDrawRun("draw", 0, va, base);
-	if (requestedGfxProbe())
+	if (requestedGfxVa0())
 		gfxDumpVa0("after the baseline draw");   // W37 #2: what the CP wrote at VA 0 during the draw
 	if (!ran) {
 		publishResult("gfx", "FAIL draw fence");
@@ -1310,7 +1437,7 @@ bool RDNA4Compute::stageGfxDraw() {
 	// The diagnostic ladder (rdna4-gfxdiag=<mask>, default off): the same stream with
 	// one open question changed at a time, each logged with the same evidence, so that
 	// round 4 sees which stage of the pipeline works. Only the baseline decides PASS.
-	const uint32_t diag = requestedGfxDiag() | (requestedGfxDiag() && requestedGfxProbe() ? 32u : 0u);   // W37: the NGG marker joins the ladder of a probe boot
+	const uint32_t diag = requestedGfxDiag() | (requestedGfxDiag() && requestedGfxProbe() ? (32u | 64u) : 0u);   // W37: the NGG marker joins the ladder of a probe boot
 	if (diag && (!base.ok || (diag & 16))) {
 		char summary[200], probes[160];
 		summary[0] = probes[0] = '\0';
@@ -1321,7 +1448,7 @@ bool RDNA4Compute::stageGfxDraw() {
 		// (2, 1), and the GS_ALLOC_REQ shader (4) last: it can hang the NGG pipeline and there is
 		// no reset (W23 review S3), so boot 12 runs it alone (rdna4-gfxdiag=4). After a "hang/"
 		// result the next boot needs a cold power cycle: the GC state survives a warm restart.
-		static const uint32_t order[5] = { 32, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
+		static const uint32_t order[6] = { 32, 64, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
 		for (uint32_t bit : order) {
 			if (!(diag & bit))
 				continue;
@@ -1334,6 +1461,8 @@ bool RDNA4Compute::stageGfxDraw() {
 			if (bit == 8 && did)
 				used += snprintf(summary + used, sizeof(summary) - used, "/marker %s",
 				                 r.marker == kMarkerValue ? "yes" : "no");
+			if (bit == 64 && did)
+				used += snprintf(summary + used, sizeof(summary) - used, "/primtype-idx");
 			if (bit == 32 && did)
 				used += snprintf(summary + used, sizeof(summary) - used, "/ngg %s",
 				                 r.nggMarker == 0xc0de0002u ? "ran" : "NOT run");
@@ -1349,7 +1478,7 @@ bool RDNA4Compute::stageGfxDraw() {
 			                                           "trust 'probe post' and the sentinel line)" : "");
 		env.owner->setProperty("Compute,GFXDiag", summary);
 	}
-	if (requestedGfxProbe())
+	if (requestedGfxVa0())
 		gfxDumpVa0("after all draws");   // W37 #2
 	gfxQueueEvidence("after draw");
 	return base.ok;

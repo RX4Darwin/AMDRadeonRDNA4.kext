@@ -31,7 +31,7 @@ Mesa `~/src/mesa/src` (eda9ace). Logs `premetal/hw-logs/rdna4fb-diag-20260929-08
    - [I] So the read+write at VA 0 is tied to cache-control/EOP packets, not to the NGG rings (those are at 0x8010xxxxxx).
    - [F] The first CPG read fault was latched during gfx bring-up, which has no `ACQUIRE_MEM` (L4a:270 no fault → L4a:335).
 5. **Context registers are backed by full-width SRAM [I].**
-   - Before the first draw, the readback shows values with bits set where gfx12 defines no field. Example: `VGT_SHADER_STAGES_EN=0xfd1ffe88` (L4a:345), when the register only has bits 2,5,19,21,22,24,26 (`gfx12.json`).
+   - **CORRECTION (verify-draw.md, W41): this readback is AFTER draw 1, not before it** (the draw fence is 1 at L4a:341, before the readback at L4a:345), and the registers it shows are ones the stream WRITES. None of the 62 CSB registers was read in round 4, so the CSB-specific half of this hypothesis has no direct evidence. Original text: the readback shows values with bits set where gfx12 defines no field. Example: `VGT_SHADER_STAGES_EN=0xfd1ffe88` (L4a:345), when the register only has bits 2,5,19,21,22,24,26 (`gfx12.json`).
    - The values differ between boots (L4b:343).
    - Unwritten SH registers are garbage too: `USERDATA_PS0/1` (L4a:344).
    - [I] So SRAM powers up with garbage, and an unwritten register is *not* 0 on silicon.
