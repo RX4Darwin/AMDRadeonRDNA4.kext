@@ -806,8 +806,9 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	if (entry.clientId == kIhClientUtcl2) {
 		ihFaultCount++;
 		if (ihFaultCount == 1 || ihFaultCount == 4 || (ihFaultCount & 0x3f) == 0) {
-			HLOG("GC UTCL2 protection fault: source %u status 0x%08x address 0x%08x%08x",
-			     entry.srcId, entry.srcData[0], entry.srcData[2], entry.srcData[1]);
+			HLOG("GC UTCL2 protection fault: source %u status 0x%08x address 0x%08x%08x (VMID %u, PASID %u = client slot %d)",
+			     entry.srcId, entry.srcData[0], entry.srcData[2], entry.srcData[1], entry.vmid, entry.pasid,
+			     vmClientSlotByPasid(entry.pasid));
 			logGcFault("IH");
 		}
 		return;
@@ -817,8 +818,8 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	static uint32_t faultIvLogs;
 	if (entry.clientId == 10 && entry.srcId == 0 && faultIvLogs < 4) {
 		faultIvLogs++;
-		HLOG("VM fault IV: vmid %u vmid_src %d pasid %u ring %u src_data 0x%08x 0x%08x 0x%08x 0x%08x, "
-		     "VA 0x%llx", entry.vmid, entry.vmidSrc, entry.pasid, entry.ringId, entry.srcData[0],
+		HLOG("VM fault IV: vmid %u vmid_src %d pasid %u (client slot %d) ring %u src_data 0x%08x 0x%08x 0x%08x 0x%08x, "
+		     "VA 0x%llx", entry.vmid, entry.vmidSrc, entry.pasid, vmClientSlotByPasid(entry.pasid), entry.ringId, entry.srcData[0],
 		     entry.srcData[1], entry.srcData[2], entry.srcData[3],
 		     (static_cast<unsigned long long>(entry.srcData[0]) << 12) |
 		     ((static_cast<unsigned long long>(entry.srcData[1]) & 0xf) << 44));

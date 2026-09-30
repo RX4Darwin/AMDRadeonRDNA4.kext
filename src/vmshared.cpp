@@ -24,6 +24,15 @@
 
 using namespace GfxReg;
 
+static bool fenceAtLeast(uint32_t current, uint32_t wanted) {
+	return static_cast<int32_t>(current - wanted) >= 0;
+}
+
+// The pool asks whether a fence domain (a shared queue) has reached a sequence number.
+bool RDNA4Compute::poolFenceReached(void *context, uint32_t domain, uint32_t seq) {
+	return static_cast<RDNA4Compute *>(context)->sharedFenceReached(domain, seq);
+}
+
 // The two shared queues' homes: one per MEC pipe, queue 2 (queue 0 of pipe 0 is the boot queue, (0,1) is the boot self-test's slot). They use the
 // pool areas past the client slots (kVmQueueBase + 8 and 9 strides), so no client slot is touched.
 bool RDNA4Compute::sharedStart(uint32_t k) {
@@ -38,6 +47,10 @@ bool RDNA4Compute::sharedStart(uint32_t k) {
 	for (uint32_t off = 0; off < 0x7000; off += 4)
 		*poolDw(s.area + off) = 0;
 	flushHdp();
+	s.fenceCpu = poolDw(s.area + kVmFence);      // the queue's own fence word (vmshared=2), zero with the area
+	s.fenceMc = poolMc(s.area + kVmFence);
+	s.seq = 0;
+	s.jobHead = s.jobCount = s.ringUsed = 0;
 	if (!s.pm.init(poolDw(s.area + kVmPq), poolMc(s.area + kVmPq), kPqSize))
 		return false;
 	s.up = hqdInitFor(false, s.pipe, s.queue, 0, poolMc(s.area + kVmMqd), poolMc(s.area + kVmEop) >> 8,
@@ -69,7 +82,12 @@ bool RDNA4Compute::vmSharedEnsure() {
 		return false;
 	}
 	sharedInit = true;
-	SLOG("rdna4-vmshared=1: client jobs run on %u shared VMID-0 queues (IB VMID = the client's, static VMIDs 8-15)", kSharedQueues);
+	if (vmShared == 2) {
+		vmPool.init(poolFenceReached, this, 0);
+		SLOG("rdna4-vmshared=2: client jobs run on %u shared VMID-0 queues, VMIDs 1-15 are bound per job from the pool", kSharedQueues);
+	} else {
+		SLOG("rdna4-vmshared=1: client jobs run on %u shared VMID-0 queues (IB VMID = the client's, static VMIDs 8-15)", kSharedQueues);
+	}
 	return true;
 }
 
@@ -145,6 +163,119 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 	}
 	s.up = up;
 	s.wedged = !proof;
+	/* The ring was re-initialised: the jobs that were in it are gone. Their queue-fence numbers count as reached so the VMIDs they held are idle
+	 * again (they never ran to completion, their clients' own fences never signal and those waits time out), and the ring is empty. */
+	*s.fenceCpu = s.seq;
+	s.jobHead = s.jobCount = s.ringUsed = 0;
+	flushHdp();
 	SLOG("%s: shared queue %u %s", tag, k, proof ? "recovered (WRITE_DATA proof landed)" : "NOT recovered: wedged");
 	return proof;
+}
+
+/* ---- rdna4-vmshared=2: VMIDs from the pool ---------------------------------------------------------------------- */
+
+bool RDNA4Compute::sharedFenceReached(uint32_t domain, uint32_t seq) {
+	if (domain >= kSharedQueues || !sharedQ[domain].fenceCpu)
+		return true;
+	return fenceAtLeast(*sharedQ[domain].fenceCpu, seq);
+}
+
+// Room in the 4 KiB ring of shared queue k for a job of about `dwords`: retire the jobs whose queue fence was reached, then wait (bounded) for
+// more if the ring is too full. The ring carries the jobs of every client on the queue, so the producer must not run past the consumer.
+bool RDNA4Compute::sharedReserve(uint32_t k, uint32_t dwords) {
+	SharedQueue &s = sharedQ[k];
+	const uint32_t capacity = s.pm.sizeDwords() - 16;
+	for (uint32_t ms = 0; ms < 2000; ms++) {
+		while (s.jobCount && fenceAtLeast(*s.fenceCpu, s.jobs[s.jobHead].seq)) {
+			s.ringUsed -= s.jobs[s.jobHead].dwords;
+			s.jobHead = (s.jobHead + 1) % 64;
+			s.jobCount--;
+		}
+		if (s.ringUsed + dwords <= capacity && s.jobCount < 64)
+			return true;
+		IOSleep(1);
+	}
+	SLOG("shared queue %u: no ring space for %u dwords after 2 s (%u dwords in flight, %u jobs)", k, dwords, s.ringUsed, s.jobCount);
+	return false;
+}
+
+void RDNA4Compute::sharedCommit(uint32_t k, uint32_t seq, uint32_t dwords) {
+	SharedQueue &s = sharedQ[k];
+	if (s.jobCount >= 64)
+		return;
+	const uint32_t tail = (s.jobHead + s.jobCount) % 64;
+	s.jobs[tail] = SharedQueue::Job { seq, dwords };
+	s.jobCount++;
+	s.ringUsed += dwords;
+}
+
+// The VMID for the client's next job. The pool decides (reuse the VMID the client still owns, else the least recently used IDLE one, never one with
+// work in flight, else wait); this binds it: if it is new to the client, write its page directory into the VMID's context over MMIO, set the IH
+// LUT so a fault names the client, and invalidate; if only a flush is owed (the client removed PTEs), invalidate. Safe because the pool only hands
+// out a VMID none of whose jobs is still queued or running (B-V1 of docs/w13-vmid.md).
+uint32_t RDNA4Compute::vmAcquire(RtClient &c) {
+	Vmid::Grant g;
+	Vmid::Result r = Vmid::Result::Busy;
+	for (uint32_t ms = 0; ms < 5000; ms++) {
+		r = vmPool.grab(reinterpret_cast<uintptr_t>(&c), c.rootPhys, c.tlbSeq, g);
+		if (r != Vmid::Result::Busy)
+			break;
+		IOSleep(1);          // every VMID has a job in flight: the pool named the fence; jobs finish without this lock
+	}
+	if (r != Vmid::Result::Ok) {
+		SLOG("no VMID available for client slot %d (%s)", static_cast<int>(&c - clients), r == Vmid::Result::Busy ? "all 15 busy for 5 s" : "none usable");
+		return 0;
+	}
+	if (g.rebind) {
+		/* A fault latched while the VMID was the previous owner's is the previous owner's: say so, and clear it before the VMID is re-targeted. */
+		const uint32_t st = rdGc(GcL2FaultStatusLo);
+		if (st && ((st >> 20) & 0xf) == g.vmid) {
+			const RtClient *prev = reinterpret_cast<const RtClient *>(g.prevOwner);
+			SLOG("VMID %u: fault status 0x%08x latched before its rebind belongs to its previous owner (client slot %d), cleared", g.vmid, st,
+			     prev >= clients && prev < clients + kClientSlots ? static_cast<int>(prev - clients) : -1);
+			gcFaultClear();
+		}
+		c.vmid = g.vmid;
+		if (!vmContextInit(c)) {
+			SLOG("VMID %u: context programming for client slot %d failed", g.vmid, static_cast<int>(&c - clients));
+			uint32_t dropped = 0;
+			vmPool.forget(reinterpret_cast<uintptr_t>(&c), true, dropped);
+			return 0;
+		}
+		wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, c.pasid);      // IH_VMID_n_LUT = PASID: a fault vector from this VMID names the client
+		(void)vmInvalidate(g.vmid, "vmpool rebind");
+		if (g.stolen)
+			SLOG("VMID %u: rebound from client slot %d to slot %d (PASID %u)", g.vmid,
+			     reinterpret_cast<const RtClient *>(g.prevOwner) >= clients ? static_cast<int>(reinterpret_cast<const RtClient *>(g.prevOwner) - clients) : -1,
+			     static_cast<int>(&c - clients), c.pasid);
+	} else {
+		c.vmid = g.vmid;
+		if (g.flush)
+			(void)vmInvalidate(g.vmid, "vmpool flush");
+	}
+	return g.vmid;
+}
+
+// The client closes: every VMID it owns goes back to the pool with its context switched off, its IH LUT entry cleared and its TLB flushed.
+void RDNA4Compute::vmReleaseVmids(RtClient &c) {
+	const uintptr_t owner = reinterpret_cast<uintptr_t>(&c);
+	for (uint32_t v = Vmid::kFirst; v <= Vmid::kLast; v++) {
+		if (vmPool.ownerOf(v) != owner)
+			continue;
+		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + v - 1 }, 0);
+		wr(IpDiscovery::HwOsssys, Reg { 0, v }, 0);
+		(void)vmInvalidate(v, "vmpool release");
+	}
+	uint32_t first = 0;
+	vmPool.forget(owner, true, first);
+	c.vmid = 0;
+}
+
+int RDNA4Compute::vmClientSlotByPasid(uint32_t pasid) const {
+	if (!pasid || vmShared != 2)
+		return -1;
+	for (uint32_t i = 0; i < kClientSlots; i++)
+		if (clients[i].active && clients[i].pasid == pasid)
+			return static_cast<int>(i);
+	return -1;
 }

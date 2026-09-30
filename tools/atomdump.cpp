@@ -2228,6 +2228,7 @@ static int testVmidPool() {
 	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.rebind && g.stolen && g.vmid == v2,
 	           "vmid: steal takes the least recently used idle VMID (got %u want %u)", g.vmid, v2);
 	f += check(pool.ownerOf(v2) == 16, "vmid: the thief owns the stolen VMID");
+	f += check(g.prevOwner == 2, "vmid: a steal reports the previous owner (a fault latched for it is attributed to it, not to the thief)");
 	f += check(pool.grab(2, 0x2000, 0, g) == Result::Ok && g.rebind && g.vmid != v2,
 	           "vmid: the victim comes back through a rebind on another VMID");
 
