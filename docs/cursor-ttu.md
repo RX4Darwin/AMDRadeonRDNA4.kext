@@ -170,3 +170,22 @@ in `end` is the next candidate list (in the VM almost everything differs because
 
 `rdna4-cursormpcc=1` writes `MPCC_CONTROL.MPCC_MODE = 2` and `MPCC_ALPHA_MULTIPLIED_MODE = 0` (RMW, OTG update lock, only with no bottom layer; dcn10_mpc.c:216 and :84-90), after the CM step, then a third CRC A/B
 (`[after MPCC mode]`) and `MPCC mode: before X, after Y`. The trail buffer is 16 KiB now.
+
+## 10. W45: the CM_BYPASS clear in the normal cursor mode (real-card result)
+
+Round 5 boot 4 on the real card (E:\rdna4fb-diag-20260930-054257.txt): `CRC A/B [GOP CM state] ... cursor pixels reach the output: NO` -> `CM write: CM_BYPASS was 1` -> `CRC A/B [after CM enable] ... YES`,
+`CM bypass: before NO, after YES`: the magenta square was visible. `MPCC mode: before YES, after YES`: the MPCC write was not needed (`rdna4-cursormpcc=1` stays opt-in). The GOP state on the card (`linuxdiff pre`):
+`CM_CONTROL=1`, `DSCL0_SCL_MODE=1` (mode 1, RECOUT equal to the plane: the DSCL candidate is eliminated), `CURSOR_CONTROL=0x01000000`, `MPCC_CONTROL=0xffff0461`, `MPCC_UPDATE_LOCK_SEL=0xf`.
+
+Problem: `rdna4-cursor=2` deliberately ignores macOS's `cscSetHardwareCursor`/`cscDrawHardwareCursor`. The fix is in the normal mode (`rdna4-cursor=1`):
+
+* `cursorCmAuto` runs at arming (end of `initHardwareCursor`): `armed pre: cm:` dump, `linuxdiff armed pre`, `cursorCmApply` (the same OTG-locked write with the same identity guard: nothing is written if the CM is already amdgpu's identity),
+  `linuxdiff armed end`. It is the default; `rdna4-cursorcm=0` is the escape (in both modes; in the self-test `rdna4-cursorcm` is now also on by default, boot 7 keeps the explicit `=1`).
+* The self-test (`rdna4-cursor=2`) still does the write itself between the two CRC A/B reads, so it is not applied twice.
+* The macOS path programs the same registers as the self-test: `setHardwareCursor` -> `cursorProgramPlane` (cursor address, `CURSOR_SIZE` 0x00400040 = the 64x64 buffer, `HOT_SPOT` 0, `CURSOR_SETTINGS` 0x300,
+  `CURSOR_CONTROL` = `cursorCtlBase` 0x03000204 | enable, FP scale/bias 0x3c00, matrix mode 0, `CM_CUR0_CURSOR0_CONTROL` 0xa4 | enable) and `drawHardwareCursor` -> `CURSOR_POSITION`, `HOT_SPOT` (excess only), `CURSOR_DST_OFFSET`
+  (`cursorDstXOffset`), and the two enables together on a visibility change, all inside the MPC cursor lock. The self-test writes the same set through `cursorProgramPlane` plus position/DST offset. Log to compare on the card:
+  `set: hubp ctl=0x03000204..05 ... size=0x00400040 ... set=0x00000300`, `shown: ... cm ctl=0x000000a5`, `move #n x= y=`.
+* Not carried over from the self-test (the card did not need them): DLG mission mode, CROB/MALL/CRQ pipe fixes, DSCL write, MPCC write.
+
+`tools/set-boot.sh`: boot 4 = base + `rdna4-vbl=1 rdna4-cursor=1` (the real pointer, CM clear by default); new boot 7 = base + `rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1` (the magenta self-test with the CRC A/B).

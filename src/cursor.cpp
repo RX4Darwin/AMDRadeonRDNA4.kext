@@ -1044,7 +1044,7 @@ bool RDNA4Device::cursorCmApply() {
 		return false;
 	}
 	cursorNote("CM write: CM_BYPASS was %u; programming amdgpu's SDR RGB CM state under the OTG update lock "
-	           "(GOP values in the 'selftest pre: cm:' line, restore with them if the picture breaks)", ctl & 1);
+	           "(GOP values in the preceding 'cm:' line, restore with them if the picture breaks)", ctl & 1);
 	if (!cursorOtgUpdateLock(true)) {
 		cursorNote("CM write: the OTG update lock was not held after 10 ms; nothing written");
 		return false;
@@ -1067,6 +1067,27 @@ bool RDNA4Device::cursorCmApply() {
 	           regReadDmu(2, kCmControl + dpp));
 	cursorCmDump("after the CM write");
 	return true;
+}
+
+// W45: the normal cursor mode (rdna4-cursor=1, macOS cscSetHardwareCursor/cscDrawHardwareCursor). The real card showed the
+// self-test square only after the CM_BYPASS clear of cursorCmApply (boot 4 of round 5: CRC A/B "NO" -> CM write -> "YES"), so the
+// same write, with the same OTG-lock bracket and the same identity guard, runs at arming whenever the GOP left the CM
+// not amdgpu-like (CM_BYPASS = 1). rdna4-cursorcm=0 is the escape. The self-test (rdna4-cursor=2) does it itself between two CRC
+// A/B reads, so it is not repeated there. The dump before and the linuxdiff lines stay in the trail.
+void RDNA4Device::cursorCmAuto(const char *why) {
+	uint32_t cm = 1;
+	PE_parse_boot_argn("rdna4-cursorcm", &cm, sizeof(cm));
+	if (cm == 0) {
+		cursorNote("%s: rdna4-cursorcm=0: CM_CONTROL.CM_BYPASS left as the GOP left it", why);
+		return;
+	}
+	cursorCmDump(why);
+	cursorLinuxDiff(why);
+	if (cursorCmApply())
+		cursorNote("%s: CM_BYPASS cleared for the macOS cursor path (as amdgpu does when a plane is enabled)", why);
+	else
+		cursorNote("%s: CM state left unchanged", why);
+	cursorLinuxDiff("armed end");
 }
 
 // rdna4-cursormpcc=1 (with rdna4-cursor=2): the Linux capture has MPCC0_MPCC_CONTROL = 0xffff0422, the card's GOP leaves 0xffff0461:
@@ -1234,8 +1255,9 @@ void RDNA4Device::cursorSelfTest() {
 	// W38: does the square reach the OTG? decided by the OTG CRC with the cursor on/off/on/off
 	const char *before = cursorCrcCheck("GOP CM state");
 	const char *last = before;
-	uint32_t cm = 0;
-	if (PE_parse_boot_argn("rdna4-cursorcm", &cm, sizeof(cm)) && cm == 1) {
+	uint32_t cm = 1;   // W45: on by default, rdna4-cursorcm=0 leaves the GOP's CM_BYPASS alone
+	PE_parse_boot_argn("rdna4-cursorcm", &cm, sizeof(cm));
+	if (cm != 0) {
 		// W40: the same boot attributes the CM change: CRC before (above) and after
 		if (cursorCmApply()) {
 			const char *after = cursorCrcCheck("after CM enable");
@@ -1245,8 +1267,7 @@ void RDNA4Device::cursorSelfTest() {
 			cursorNote("CM bypass: before %s, after not run (CM state unchanged)", before);
 		}
 	} else {
-		cursorNote("CM bypass: not changed (rdna4-cursorcm=1 clears CM_BYPASS and sets the CM identity as amdgpu does); "
-		           "CRC %s", before);
+		cursorNote("CM bypass: not changed (rdna4-cursorcm=0 leaves the GOP's CM state); CRC %s", before);
 	}
 	uint32_t mp = 0;
 	if (PE_parse_boot_argn("rdna4-cursormpcc", &mp, sizeof(mp)) && mp == 1) {
@@ -1457,6 +1478,8 @@ bool RDNA4Device::initHardwareCursor() {
 	uint32_t mode = 0;
 	if (PE_parse_boot_argn("rdna4-cursor", &mode, sizeof(mode)) && mode == 2)
 		cursorSelfTest();
+	else
+		cursorCmAuto("armed pre");   // W45: the real macOS cursor path needs the CM out of bypass as well
 	return true;
 }
 

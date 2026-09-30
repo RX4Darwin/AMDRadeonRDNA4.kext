@@ -251,7 +251,8 @@ private:
 	// W40 (premetal/verify-cursor.md): the DPP colour-management block
 	void cursorCmDump(const char *why);     // read-only: CM0_CM_CONTROL and the CM sub-blocks
 	void cursorDlgDump(const char *why);    // read-only: the DLG/TTU registers 0x063b-0x0655
-	bool cursorCmApply();                   // rdna4-cursorcm=1: CM_BYPASS = 0 + amdgpu's SDR identity CM state, OTG-locked
+	bool cursorCmApply();                   // CM_BYPASS = 0 + amdgpu's SDR identity CM state, OTG-locked (default on; rdna4-cursorcm=0 skips)
+	void cursorCmAuto(const char *why);     // W45: cursorCmApply at arming in the normal cursor mode (rdna4-cursor=1)
 	bool cursorMpccApply();                 // rdna4-cursormpcc=1: MPCC_MODE TOP_LAYER_ONLY, ALPHA_MULTIPLIED 0, as the Linux capture
 	void cursorLinuxDiff(const char *why);  // read-only: static pipe registers that differ from the Linux capture
 	bool cursorOtgUpdateLock(bool lock);    // the modeset OTG update-lock bracket, bounded
