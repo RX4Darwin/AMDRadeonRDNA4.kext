@@ -5033,8 +5033,13 @@ static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
         return rdna4_gfx_draw_refuse(s, "SPI_PS_INPUT_ADDR", "does not cover SPI_PS_INPUT_ENA");
     if (!(reg_get(s, REG_GFX_SPI_PS_IN_CONTROL) & (1u << 15)))
         return rdna4_gfx_draw_refuse(s, "SPI_PS_IN_CONTROL", "PS_W32_EN is off");
+    /* NO_PC_EXPORT = 0 (with NUM_INTERP > 0) is the attribute-ring path of the G4 colour triangle (rdna4-gfxcol=1, docs/g4-colour.md): the NGG stage
+     * stores the colour with buffer_store_b128 and the PS reads it with ds_param_load / v_interp, none of which this model has. It is refused HERE, before
+     * any shader runs, like the wave64 case: the ring is not stopped, the stream's own RELEASE_MEM still completes the fence, the target stays empty (0 px)
+     * and the kext reports "gfx-col FAIL" (never a false PASS). G4 is deliberately not modelled. */
     if (!(reg_get(s, REG_GFX_SPI_SHADER_GS_OUT_CONFIG_PS) & (1u << 10)))
-        return rdna4_gfx_draw_refuse(s, "SPI_SHADER_GS_OUT_CONFIG_PS", "NO_PC_EXPORT is off");
+        return rdna4_gfx_draw_refuse(s, "SPI_SHADER_GS_OUT_CONFIG_PS",
+                                     "NO_PC_EXPORT is off: the attribute-ring path (G4: buffer stores, ds_param_load, v_interp) is not modelled");
     ses = rdna4_gfx_discovery_num_se(s);
     if (!ses || ses > REG_GFX_GE_RING_MIN_SE)
         return rdna4_gfx_draw_refuse(s, "gc_info gc_num_se", "shader-engine count is not modelled");

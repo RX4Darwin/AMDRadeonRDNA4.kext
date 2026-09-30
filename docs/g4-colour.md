@@ -194,3 +194,56 @@ attribute ring is transient by design (written by the NGG stage, consumed by SPI
 one the listing scans (the listing covers the first `kColAttrRingBytes` = 0x580000 of the ring block only), or the data travels through a path that never touches this BO. **Against it:** the stream's own end-of-pipe RELEASE_MEM already has `GL2_WB = 1` (gen-gfx12-draw.py, the fence packet), which should have written dirty GL2 lines back before the fence, so if the hypothesis
 is right the ring data must be in a state that write-back does not cover. How to tell: an explicit GL2 write-back + invalidate (`ACQUIRE_MEM`) after the draw, then the CPU read, a listing of the whole 0xA80000 block, or a run of RADV's colour triangle with the same kind of read of its ring.
 Until one of these is done this stays a hypothesis.
+
+## 7. Kext wiring (boot-arg `rdna4-gfxcol=1`)
+
+The kext draws the G4 colour triangle on a macOS boot when `rdna4-gfxcol=1` (default OFF) is set, **after the G3 baseline has passed**, with the same evidence G3 has.
+Code: `src/gfxring.cpp` (`requestedGfxCol`, `gfxColDrawRun`, `gfxVerdictCol`, the hook in `stageGfxDraw`), `src/compute.hpp`; the shaders, the attribute-ring
+descriptor and the colour check come from the same header the Linux replay uses, `userspace/gfx12tricol.h` (freestanding: `<stdint.h>` and integer arithmetic only;
+the kext includes it as `../userspace/gfx12tricol.h`, since its flags carry no `-Isrc`/`-Iuserspace`).
+
+**Gate and flow.** `stageGfxDraw`: G3 baseline (`gfxDrawRun("draw", 0, ...)`) -> result published (`gfx`, `Compute,GFXDrawPixels`) -> **G4** (only if `rdna4-gfxcol=1`):
+baseline failed -> `gfx-col SKIPPED G3 baseline did not pass`, no draw; baseline passed -> `gfxColDrawRun("col", ...)` -> `gfx-col` published -> the diagnostic ladder. G4 runs
+*before* the ladder: the ladder runs only when the baseline failed (or `rdna4-gfxdiag` has bit 16), so normally the two never both run; when both are requested, a ladder variant that hangs
+cannot pre-empt G4, and a G4 draw that does not finish (`FAIL colour draw fence`) skips the ladder ("the ring is in an unknown state"). The stage's return value is still the G3 baseline's.
+G3's stream, `gfxDrawRun` and its variants are untouched (the diff to existing code is one condition: `diag && !colHung && ...`).
+
+**The draw (`gfxColDrawRun`).** Own code slots in the pool (`kGfxColVsOffset = +0x28000`, `kGfxColPsOffset = +0x28400`: nothing G3 or the ladder uses is overwritten); the same target (cleared),
+draw fence, IB area, GE ring block (`ringVa`, the same 2 MiB-aligned VMID0 MC address G3's relocations use) and relocation order; `kColStream`/`kColRelocs` copied and relocated exactly as
+`gfxDrawRun` does `kStream`/`kRelocs`; `nggcol.s`'s three descriptor literals patched by `rdna4_tricol_vs_dword(i, ringVa)` (dword0 = VA low, dword1 = VA[47:32] | 0xc0000000 | 16 << 16, dword2 =
+`kColRingBytes` = 0xA80000; dword3 constant, all as `userspace/gfx12tricol.h` and the Linux run). Then the same ring discipline: CSB replay and sane clip state (same boot-args), PIPELINESTAT sampling on
+probe boots, the stream as one indirect buffer, one RELEASE_MEM fence, `gfxFenceWait(…, 500000)`, `gfxEvidence`, `gfxFaultMark`, the same "did not finish" handling, and the same "target empty:
+look again after 2 ms, then a full ACQUIRE_MEM GL2 write-back" re-check. The probe split of G3 (CP-side register readback) is not repeated for G4.
+
+**The check** is `rdna4_tricol_check`, now integer-only (the kext is built `-mkernel`, no SSE; `gfxring.o` has no new SSE use and the kext's `nm -u` list is unchanged). Same tolerances as section 1/6
+(channel error <= 3, here measured in 1/256 units; the RADV and first-run value 0.50 is 127/256 on the exact rounded image), the same bounds (x 64..191, y 64..190), 8192 covered pixels, alpha 0xFF,
+nearest-vertex dominance within the tolerance, vertex spot pixels and centroid ~85. The host test (`userspace/test-gfx12tricol.c`) runs the same function.
+
+**Evidence.**
+- `RDNA4FB,Results` key **`gfx-col`**: `PASS colour triangle, THE COLOUR TRIANGLE IS RIGHT, draw 8192 px, max channel error 0.49, centroid 0xff555654 in N us` / `FAIL colour image, draw N px, ...` /
+  `FAIL colour draw fence` / `SKIPPED G3 baseline did not pass`. (The error prints as hundredths truncated from 1/256 units: 127/256 -> 0.49.)
+- `Compute,GFXColPixels` (like `Compute,GFXDrawPixels`), and a `Compute,GFXVerdict` entry labelled `col`: `col: ia 1/3 vs 3 ci 1 cp 4 ps 8192 px 8192 ring ok err 0.49 sum 1 cen ff555654 RIGHT`
+  (the counters are real on probe boots, zeros otherwise; no clip-state fields: G4 does not run the clip probe).
+- Kernel log, `RDNA4FB: gfx: col: ...` lines in G3's style: the stream/addresses/descriptor line, the pipeline-statistics verdict (probe boots), and
+  `col: THE COLOUR TRIANGLE IS RIGHT in N us: 8192 pixels (want 8192), bounds x 64..191 y 64..190; max channel error 0.49 (tolerance 3), max |R+G+B-255| 1, 0 bad alpha, 0 not dominated by the nearest vertex's colour; near v0 (66,65) 0xff0303f9, near v1 (189,65) 0xff03f903, near v2 (128,188) 0xfff80402, centroid (128,106) 0xff555654 (want ~85,85,85)`
+  (or `wrong colour image` with the measured errors, or `did not finish ...`).
+- `tools/set-boot.sh`: **boot 3** adds `rdna4-gfxcol=1` (boot 6, the A/B control of the G3 fix, deliberately does not). `tools/diagnostic-log.sh`: the boot-arg list shows `rdna4-gfxcol`, the feature summary has a
+  **`gfx-col`** row (SKIPPED when the boot-arg is absent or G3 did not pass, PASS only with `THE COLOUR TRIANGLE IS RIGHT ... 8192`, else FAIL), `Compute,GFXColPixels` and `Compute,GFXVerdict` are in the existing `Compute,` ioreg capture, and the
+  `gfx:` dmesg filter already matches the `col:` lines.
+
+**What boot 3 should print (real card).** After the G3 `PASS ... THE TRIANGLE IS RIGHT, draw 8192 px`: `gfx-col PASS colour triangle, THE COLOUR TRIANGLE IS RIGHT, draw 8192 px, max channel error 0.4x, centroid 0xff555654`. The macOS path differs
+from the Linux run in exactly the ways section 4 item 8 lists (bare RB0, VMID0, UC memory): a FAIL with a sane-looking statistics line (PS 8192 but wrong colours) would point at the attribute ring's memory attributes
+(the GL2 hypothesis of section 6), 0 px with `ci 1 cp 0` at the NGG/ring path, `did not finish` at a hang (power-cycle before the next boot, as for any draw that hangs).
+
+**The emulator (Windows dry run of boot 3; static analysis of `emu/qemu/rdna4.c`, not run here).** The G4 stream uses only packets the emulator already models (`SET_*_REG` are generic register writes, so the new `SPI_PS_INPUT_CNTL_0`,
+`SPI_SHADER_USER_DATA_PS_0/1`, the changed `RSRC*` values are accepted). At the draw, `rdna4_gfx_check_draw` runs the same checks as for G3 and the first that fails is
+`SPI_SHADER_GS_OUT_CONFIG_PS`: `NO_PC_EXPORT` is off (G4 sets 0x800). That is a *draw refusal* (`rdna4_gfx_draw_refuse`): it happens before any shader is interpreted (so `nggcol`'s `buffer_store_b128`, `pscol`'s
+`ds_param_load`/`v_interp` are never reached and cannot stop the ring), `gfx_draw_refused` makes the packet loop continue, the stream's own `RELEASE_MEM` completes the draw fence, and the target stays empty. No hang, no stopped ring.
+The refusal message is now explicit (it used to say only "NO_PC_EXPORT is off"); nothing of G4 is modelled. Expected emulator log for boot 3:
+
+    rdna4: gfx: draw refused: SPI_SHADER_GS_OUT_CONFIG_PS NO_PC_EXPORT is off: the attribute-ring path (G4: buffer stores, ds_param_load, v_interp) is not modelled
+
+and in the kext log, after the G3 `THE TRIANGLE IS RIGHT`: `gfx: col: 492-dword stream at MC ...`, (probe boots) `col: pipeline statistics say: IA > 0 but C_INVOCATIONS = 0: lost in the NGG / export path ...` (the model counts IA/VS before refusing),
+`col: wrong colour image in N us: 0 pixels (want 8192), bounds x 255..0 y 255..0; max channel error 0.00 ...`, `col: target still empty: after 2 ms 0 px; after a full ACQUIRE_MEM GL2 write-back (fence ok) 0 px`;
+results: `gfx-col FAIL colour image, draw 0 px, max channel error 0.00, centroid 0x00000000`, feature summary row `gfx-col FAIL`, `Compute,GFXColPixels` 0. **That FAIL is expected on the emulator** (and G3's `gfx PASS` is
+unaffected); it is not a regression. The emulator needs a real model of `ds_param_load`, `v_interp_p10/p2` and buffer stores before `gfx-col` can pass there.
