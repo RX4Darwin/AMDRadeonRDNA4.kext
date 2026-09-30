@@ -22,8 +22,8 @@
 #      Needs docs/w12k-gfx-submit.md's dependency (W13 S0: rtFree invalidates device buffers) before it is enabled on the real card.
 #  10  boot 8 + rdna4-gfxidle=1 (power P2/P3, docs/power-gfx.md s.9): software-only idle accounting (idle:/Compute,GFXIdle) next to the SMU's view; diagnostic-log.sh rows post-idle
 #      (sensors 3 s after the application steps: FAIL when activity stays >= 10 % or power >= 40 W) and gfx-idle-acct. Changes no hardware state.
-#  11  boot 8 + rdna4-pm=1 rdna4-gfxidle=1: the real-card SLEEP/WAKE boot (P7). NEVER RUN ON THE CARD BEFORE: run it LAST, power-cycle afterwards. Sequence: `rdna4-run tri` (PASS), sleep the
-#      Mac for >= 10 s, wake, `rdna4-run tri` again. Expected: power: sleep requested / quiesce lines, no gfx: draw / flip: lines between the wake and "user-space runtime up again" (the
+#  11  boot 8 + rdna4-pm=1 rdna4-gfxidle=1: the real-card SLEEP/WAKE boot (P7). NEVER RUN ON THE CARD BEFORE: run it LAST, power-cycle afterwards. Sequence: `/tmp/rdna4-run tri` (copied from the stick first), `pmset sleepnow`,
+#      wake with the power button, `/tmp/rdna4-run tri` again (docs/final-test-plan.md). Expected: power: sleep requested / quiesce lines, no gfx: draw / flip: lines between the wake and "user-space runtime up again" (the
 #      wake skips the bring-up tests; rdna4-resume-tests=1 brings them back), a client wait that was in progress returns Aborted (rdna4-sleepabort=0 disables).
 #   9  THE VM-CLIENT DIAGNOSTIC (docs/vm-client-rootcause.md, hub-task-311/320): the VM boot of round 6 WITHOUT rdna4-vbl/cursor (so the kernel log window keeps the bring-up
 #      lines; round 6's began 146 s into the boot) and WITHOUT rdna4-vm-diag, plus rdna4-vmid-test=15 (1 = probes T0-T7 incl. the incremental-stream bisect T5c and T4d, 2 = read-only

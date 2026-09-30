@@ -80,11 +80,23 @@ WHAT TO LOOK FOR (only so you know if something looks odd; do not judge)
 
 == BOOT 11 ==
   SLEEP / WAKE. NEVER TRIED ON THIS CARD BEFORE, so it is LAST.
-  Extra steps after the diagnostic-log.sh table (still in Recovery):
-     1. type:   /Volumes/OPENCORE/rdna4-run tri      (expect PASS)
-     2. Apple menu > Sleep. Wait at least 10 seconds. Wake the Mac (key or
-        mouse).
-     3. type:   /Volumes/OPENCORE/rdna4-run tri      again (expect PASS)
+  Extra steps AFTER the diagnostic-log.sh table, in the same Terminal window.
+  (Programs on the stick cannot be started directly in Recovery: copy first.)
+     1. type:   cp /Volumes/OPENCORE/rdna4-run /tmp/rdna4-run
+        type:   chmod +x /tmp/rdna4-run
+        type:   /tmp/rdna4-run tri               (expect the word PASS)
+     2. type:   pmset sleepnow
+        The screen should go dark. Wait at least 10 seconds. Then wake the
+        Mac with a short tap of the POWER BUTTON (a key may also work).
+        The Apple menu in Recovery has no Sleep entry: do not look for one.
+     3. When the screen is back and Terminal is usable, type:
+                /tmp/rdna4-run tri               (expect PASS again)
+  If "pmset sleepnow" prints an error, or nothing happens within 30 seconds:
+  do not force it. Type  bash /Volumes/OPENCORE/set-boot.sh 11s , restart,
+  run diagnostic-log.sh as usual. That variant does NOT put the Mac to
+  sleep: the driver simulates a sleep cycle by itself (a 30 second test
+  inside the driver, the row called "sleep" in the table). It is the
+  fallback, and less complete than a real sleep.
   If the Mac does not come back or the screen stays black: hold the power
   button, power off for 10 seconds, and tell Claude. Then POWER OFF after
   this boot whatever happened.

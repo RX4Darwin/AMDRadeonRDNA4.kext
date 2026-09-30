@@ -78,11 +78,21 @@ The W13 S0 dependency of W12k (rtFree invalidates device buffers) is in the tree
 Boot 8 + `rdna4-gfxidle=1`. Rows: `gfx-idle-acct PASS` (`Compute,GFXIdle`: `idle for N ms ... transitions T`; lines `idle: busy -> idle after N ms busy`), **`post-idle`** (3 s after the application steps: PASS < 10 % and < 40 W;
 FAIL `STAYS HIGH` = the VM pin survives the clients closing), `idle-pin`. Changes no hardware state, so a FAIL is a measurement, not a regression.
 
-### Boot 11 (sleep/wake, LAST)
-Boot 8 + `rdna4-pm=1 rdna4-gfxidle=1`. **Never run on the card.** Sequence: let the batch finish, run `rdna4-run tri` (PASS), put the Mac to sleep for >= 10 s, wake it, run `rdna4-run tri` again (a NEW connection).
+### Boot 11 (sleep/wake, LAST) and its fallback 11s
+Boot 11 = boot 8 + `rdna4-pm=1 rdna4-gfxidle=1`. **Never run on the card.** Sequence, in the Recovery Terminal after `diagnostic-log.sh`:
+1. `cp /Volumes/OPENCORE/rdna4-run /tmp/rdna4-run; chmod +x /tmp/rdna4-run; /tmp/rdna4-run tri` (PASS). Reason: `diagnostic-log.sh` itself copies `rdna4-run` to `/tmp` and `chmod +x`es it before running it
+   (`RUN=/tmp/rdna4-run`, rounds 5-7); running it straight from the FAT stick is **not** something the logs show working, so the plan never does it.
+2. `pmset sleepnow` (a real system sleep through IOPMrootDomain, which calls the driver's `setPowerState(0)` because boot 11 has `rdna4-pm=1`). **`/usr/bin/pmset` exists in the Recovery image** [M: listing of the stick's
+   BaseSystem.dmg, `macOS Base System/usr/bin/pmset`]; that it puts a machine in *Recovery* to sleep, and that this Hackintosh wakes from S3, are [U]. Recovery's Apple menu has no Sleep entry [I: not verified on the card; Kiln was asked
+   for a screendump]. Wait >= 10 s, **wake with a short tap of the power button** (a key may also work; [U]).
+3. `/tmp/rdna4-run tri` again (a NEW connection; the old one is `Aborted` after the wake).
 Expect in the log: `power: sleep requested`, `power: quiesce begin`, `power: gfx: no client gfx IB in flight at sleep`, `power: quiesce complete`, `power: wake received`, `power: resume: skipping the G3/G4 draws, the gfx client
-self-test and the flip test`, **no** `gfx: draw` / `flip:` lines before `user-space runtime up again`, then `PASS  tri:`. If the machine does not come back or the screen stays black: **power-cycle**, `set-boot.sh 1`;
-send the `rdna4-trail` and the log. Power-cycle after this boot either way (GC state across S3 is [U]).
+self-test and the flip test`, **no** `gfx: draw` / `flip:` lines before `user-space runtime up again`, then `PASS  tri:`. If the machine does not come back or the screen stays black: **power-cycle**, `set-boot.sh 1`; send the
+`rdna4-trail` and the log. Power-cycle after this boot either way (GC state across S3 is [U]).
+
+**Fallback 11s** (= boot 11 + `rdna4-sleeptest=1`), if `pmset sleepnow` errors or does nothing: `diagnostic-log.sh` runs the **driver's own simulated sleep cycle** by itself (`rdna4-run sleeptest`: `powerWillSleep`, a 15 s pause,
+`powerDidWake`, a 15 s wait for the re-bring-up; row `sleep`). It is **not a system sleep**: the machine stays on, the card is not power-gated and not reset (the emulator resets it during that window, the real card is not);
+so it proves the driver's quiesce and re-bring-up, not what S3 does to the card. It has never run on the card either, and re-running the bring-up (PSP, firmware autoload) on a live GPU is itself unproven.
 
 ## 4. Getting back
 - **Daily use**: `set-boot.sh 1` (base + real pointer) — or `0` for the known-good argument set without any new feature.
