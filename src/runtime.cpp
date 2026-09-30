@@ -1649,6 +1649,10 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 	flushHdp();
 	c->kernargCpu = poolDw(qoff + kVmKernarg);
 	c->fenceCpu = poolDw(qoff + kVmFence);
+	/* W12k: the client's gfx fence dword (same page, zeroed above): without it a shared-queue client cannot submit gfx IBs (Kiln's boot 13 dry run:
+	 * SubmitGfxIb 'resource shortage', gfx-client 'setup'); rtOpenInner sets the same two fields. */
+	c->gfxFenceCpu = poolDw(qoff + kVmFence + kGfxFenceSlot);
+	c->gfxFenceMc = poolMc(qoff + kVmFence + kGfxFenceSlot);
 	/* The same VA slots as the HQD path (six pages), of which the queue's four stay unmapped, then the IB page. */
 	c->nextVa += 4 * 0x1000;
 	c->fenceVa = c->nextVa; c->nextVa += 0x1000;
