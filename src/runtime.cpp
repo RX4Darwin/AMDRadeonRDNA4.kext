@@ -523,7 +523,12 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 		 * VRAM only when the BO is cached (amdgpu_ttm.c:1456-1458). */
 		uint64_t flags = GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable |
 		                 (vmIsPteOff ? 0 : GpuVm::kIsPte);
-		if (executable)
+		/* Linux's own tables on this card (rdna4-groundtruth vm-walk.txt) have EXE, READ and
+		 * WRITE on every leaf (0x...5f1 / 0x...3f1): the CP fetches the EOP buffer, the ring and
+		 * IBs with EXECUTE (IV src_data[1] 0x50 = READ|EXE; round 5: PERMISSION_FAULTS 8 on the EOP
+		 * page mapped R|W).  Mesa maps every BO R|W|X the same way (ac_linux_drm.c:235).
+		 * rdna4-vm-exec=0 restores the old R|W-only pages (negative control). */
+		if (executable || !vmExecOff)
 			flags |= GpuVm::kExecutable;
 		flags = (flags | vmPteSet) & ~vmPteClear;   /* W22 diagnostics only, 0 otherwise */
 		/* FRAG=4 says this PTE is part of a contiguous, 64 KiB-aligned run of
@@ -576,7 +581,7 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 		lastPt = ptOff;
 		uint64_t flags = GpuVm::kSystem | GpuVm::kSnooped | GpuVm::kValid |
 		                 GpuVm::kReadable | GpuVm::kWritable | (vmIsPteOff ? 0 : GpuVm::kIsPte);
-		if (executable)
+		if (executable || !vmExecOff)
 			flags |= GpuVm::kExecutable;
 		/* Cached GTT on gfx12.0 uses MTYPE_NC, encoded as zero. */
 		*entry(pteOff) = GpuVm::encodePte(pageBuses[page], flags, false);
@@ -746,6 +751,11 @@ bool RDNA4Compute::vmBootSelfTest() {
 		 * encoding); the first VMID 8 access must then fault with MAPPING_ERROR (0x00800b3b). */
 		uint32_t isPte = 1;
 		vmIsPteOff = PE_parse_boot_argn("rdna4-vm-ispte", &isPte, sizeof(isPte)) && !isPte;
+		uint32_t exec = 1;
+		vmExecOff = PE_parse_boot_argn("rdna4-vm-exec", &exec, sizeof(exec)) && !exec;
+		if (vmExecOff)
+			RLOG("vm: rdna4-vm-exec=0: only the ring and IB pages are EXECUTABLE (negative control, "
+			     "expect fault 0x00800880 on the EOP page)");
 		if (vmIsPteOff)
 			RLOG("vm: rdna4-vm-ispte=0: IS_PTE (bit 63) is NOT set on leaf PTEs (negative control, "
 			     "expect fault 0x00800b3b)");
@@ -1196,7 +1206,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 				" control (no change, fresh pipe)", " variant a (TAP_*_PHYSICAL=1)",
 				" variant b (ctx0 covers tables)", " variant c (MC-form table pointers)",
 				" variant E2 (GC windows := MM)", " variant d (OLD encoding: NO IS_PTE on leaf PTEs)",
-				" variant e (SNOOPED on VRAM PTEs)", " variant g (EXECUTABLE on every leaf PTE)",
+				" variant e (SNOOPED on VRAM PTEs)", " variant g (OLD encoding: leaf PTEs not EXECUTABLE except ring/IB)",
 				" variant T (tables built by the CPU in the pool)",
 				" variant o (context reprogrammed in amdgpu's order + L2 invalidate)",
 				" variant V (control on VMID 12)" };
@@ -1275,8 +1285,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 					/* PTE flag variants against the default (amdgpu's) encoding, rebuilt
 					 * through the normal table path.  d: the round 2-4 encoding without
 					 * IS_PTE; e: SNOOPED added to VRAM PTEs; g: every leaf EXECUTABLE. */
-					vmPteSet = v == kE ? GpuVm::kSnooped : v == kG ? GpuVm::kExecutable : 0;
-					vmPteClear = v == kD ? GpuVm::kIsPte : 0;
+					vmPteSet = v == kE ? GpuVm::kSnooped : 0;
+					vmPteClear = v == kD ? GpuVm::kIsPte : v == kG ? GpuVm::kExecutable : 0;
 					if (!buildTables())
 						RLOG("vm: variant: table rebuild failed");
 				} else if (v == kO) {
