@@ -81,8 +81,8 @@ awk -F'|' '
 		print n "\t" id "\t" what "\t" cont
 	}' "$PLAN" > "$TMPD/order.tsv"
 [ -s "$TMPD/order.tsv" ] || die "could not read the order table of $PLAN"
-IDS_PLAN="$(awk -F'\t' '$1 != "end" { print $2 }' "$TMPD/order.tsv" | sort | tr '\n' ' ')"
-IDS_TPL="$(sed -n 's/^== BOOT \(.*\) ==$/\1/p' "$TEMPLATE" | sort | tr '\n' ' ')"
+IDS_PLAN="$(awk -F'\t' '$1 != "end" { print $2 }' "$TMPD/order.tsv" | sort -u | tr '\n' ' ')"
+IDS_TPL="$(sed -n 's/^== BOOT \(.*\) ==$/\1/p' "$TEMPLATE" | sort -u | tr '\n' ' ')"
 [ "$IDS_PLAN" = "$IDS_TPL" ] || die "boot ids differ: plan table [$IDS_PLAN] vs template sections [$IDS_TPL]: update docs/start-here.template.txt"
 # The ids must also exist in set-boot.sh.
 for id in $IDS_PLAN; do
@@ -100,7 +100,8 @@ done
 				Yes:*)   msg="If it FAILS: carry on with the next step (${cont#Yes: })." ;;
 				Yes)     msg="If it FAILS: carry on with the next step." ;;
 				After*)  msg="If it hangs or freezes:${cont#After a hang:} (see IF SOMETHING GOES WRONG below)." ;;
-				"(last)") msg="This is the last test boot; afterwards follow WHEN YOU ARE FINISHED below." ;;
+				"(optional)") msg="This step is OPTIONAL (see OPTIONAL LAST STEP below); skip it if you are short of time." ;;
+				"(last)") msg="This is the last test boot: afterwards Shut Down (power-cycle), then the OPTIONAL LAST STEP below or WHEN YOU ARE FINISHED." ;;
 				*)       msg="If it FAILS: $cont" ;;
 			esac
 			printf '        %s\n' "$msg" | fold -s -w 76 | sed '2,$s/^/        /'

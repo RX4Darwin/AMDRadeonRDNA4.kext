@@ -91,6 +91,11 @@ WHAT TO LOOK FOR (only so you know if something looks odd; do not judge)
   (Shut Down) after this boot whatever happened.
 
 IF SOMETHING GOES WRONG (freeze, panic, black screen, reboot loop)
+  - If the screen goes black DURING A PAUSE (macOS turns the display off after
+    10 idle minutes): press a key or move the mouse. If the picture does not
+    come back within about 10 seconds, hold the power button to power off,
+    then continue with the next step as usual and tell Claude it happened
+    (and in which boot).
   - Take a photo of the screen if there is anything on it.
   - POWER OFF (hold the power button; do NOT restart), wait 10 seconds.
   - Power on, pick the stick, boot Recovery, open Terminal and type:
@@ -109,6 +114,20 @@ HOW TO GO BACK
     over EFI/OC/Kexts/RDNA4FB.kext.
   - Older copies: backup-prev-round7-kext.kext (round 7) and
     backup-before-premetal (the original driver).
+
+OPTIONAL LAST STEP (only if you have the time): the idle-display check
+  After the sleep test boot and a Shut Down (power-cycle, wait 10 s):
+  1. Start the Mac, pick the stick, Recovery, Terminal, and type
+         bash /Volumes/OPENCORE/set-boot.sh 1
+     then RESTART and pick the stick again into Recovery (Terminal).
+  2. Run NOTHING. Leave the Mac idle for 11 minutes (do not touch it).
+     The display may turn itself off: that is the thing being tested.
+  3. Press a key. Does the picture come back? (Write down: yes / no /
+     after how many seconds.) If it does not come back within about 10
+     seconds, hold the power button to power off and tell Claude.
+  4. If it came back, open Terminal and run
+         bash /Volumes/OPENCORE/diagnostic-log.sh
+     so the log carries the display power lines.
 
 WHEN YOU ARE FINISHED
   1. bash /Volumes/OPENCORE/set-boot.sh 1

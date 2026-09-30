@@ -34,11 +34,16 @@ together with `tools/set-boot.sh` and `tools/diagnostic-log.sh`).
 | 7 | **13** | Boot 8 + `rdna4-vmshared=1` (same apps, shared-queue compute path) | Yes |
 | 8 | **10** | Boot 8 + `rdna4-gfxidle=1`: idle accounting + post-client idle | Yes |
 | 9 | **11s** | The driver's simulated sleep cycle (`rdna4-pm=1 rdna4-sleeptest=1`): **LAST, never run on the card before**, power-cycle afterwards | (last) |
+| 10 | **1** | OPTIONAL last step, after 11s and a power-cycle: the idle-display check (boot 1 in Recovery, run nothing, idle 11 min, press a key; then `diagnostic-log.sh`) | (optional) |
 | end | **1** (daily) or **0** (known good, no feature) | | |
 
 **Decision after steps 2-4** (read `docs/boot9-vm-diagnostic.md` s.3 for the full table): boot 9 clients PASS and 9b FAIL => the F diagnostic (`rdna4-vm-diag` bit 512) is the culprit: use
 `NOVMDIAG=1 bash set-boot.sh <id>` for every later VM boot (3, 8, 13, 10, 11s) and drop `rdna4-vm-diag` from the plan. Both FAIL and boot 12 PASS => the shared-queue path is the fix; use it (`rdna4-vmshared=1`) for 8's
 replacement (boot 13) and later boots. All three FAIL => keep going with 3/8/10/11s for the non-client results, and send the logs: `vm-survey`, `vmidtest`, `vm-trace` name the failing step.
+
+**Display sleep during a pause** (macOS `displaysleep` = 10 min in Recovery; decision of the lead: no `rdna4-nosleep=1` in the test boots, it would change the args vs round 6 and hide the untested path): if the screen goes black during a pause, press a key or move the
+mouse; if it does not come back within ~10 s, hold the power button to power off, continue with the next step as usual and report that it happened (and in which boot). The kext's DPG blank/un-blank path has **never run on the card** [M: empty section in every stick log].
+**Optional last step (10):** after 11s and a power-cycle, boot 1 in Recovery, run nothing, leave it idle 11 minutes, press a key: does the picture come back? Then `diagnostic-log.sh`: its `display power` section prints `power: HDMI display blanked/unblanked via DPG` (DP: `power: display off/on`) and `ndrv: Control csc 11` lines.
 
 ## 3. What each boot should print (rows of the summary table)
 

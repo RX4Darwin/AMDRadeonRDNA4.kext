@@ -261,8 +261,11 @@ registry_value() {
 	section "dmesg: display modes"
 	dmesg | grep -E 'RDNA4FB: modes:' || true
 
-	section "dmesg: display power (sleep/wake)"
-	dmesg | grep -E 'RDNA4FB: power:' || true
+	section "dmesg: display power (sleep/wake; the DPG blank/un-blank of macOS display sleep, DPMS csc 11)"
+	# bd442a0: the blank/un-blank path has never run on the card; these are its lines: "power: HDMI display blanked/unblanked via DPG", "power: display on/off (... sink D0/D3 ...)"
+	# (DP) and the framebuffer's "ndrv: Control csc 11 -> 0x.." (the DPMS request macOS sent). klines falls back to the unified log when the kernel buffer wrapped.
+	klines 'RDNA4FB: (power:|.*ndrv: Control csc 11|.*display (un)?blanked|.*display sleep)' | sed 's/^/  /' || true
+	echo "(no line above = no display power event in the log window; after the optional idle step of START-HERE a blank AND an un-blank are expected)"
 
 	section "dmesg: idle accounting (rdna4-gfxidle=1) and the Compute,GFXIdle registry copy"
 	dmesg | grep -E 'RDNA4FB: idle:' || echo "(no idle: lines - rdna4-gfxidle not enabled, or no transition yet)"
