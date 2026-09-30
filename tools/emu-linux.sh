@@ -146,7 +146,7 @@ QPID=$!
 ( while kill -0 "$QPID" 2>/dev/null; do
 	echo "$(stat -c %s "$RUN/qemu.out" 2>/dev/null || echo 0) $(stat -c %s "$SERIAL" 2>/dev/null || echo 0)"
 	sleep 0.1
-done > "$RUN/offsets.txt" ) 9>&- &
+done > "$RUN/offsets.txt" ) > /dev/null 2>&1 9>&- &
 cleanup() { [ "$KEEP" = 1 ] || { pkill -f "$QPAT.*$MON" 2>/dev/null || true; }; }
 trap cleanup EXIT
 
