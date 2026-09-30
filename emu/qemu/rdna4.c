@@ -621,6 +621,8 @@ struct RDNA4State {
     bool     smu_stale;      /* metrics transfer acks but the table is never rewritten */
     bool     warm_keep;      /* reset keeps live engines/queues, like warm card restart */
     bool     cursor_enabled; /* strict DCN cursor plane/compositor */
+    bool     ctx_garbage;    /* HYPOTHESIS MODEL, opt-in (ctx-garbage=on; W39: default off like gfx-golden-strict): context registers power up as garbage, not 0 (W37, rootcause-draw.md #1) */
+    uint64_t pstat[14];      /* SAMPLE_PIPELINESTAT counters (si_query.c order: PS, C_PRIM, C_INV, VS, GS_INV, GS_PRIM, IA_PRIM, IA_VERT, ...) */
     bool     gop_dlg;        /* the GOP left the HUBP DLG/TTU registers programmed (DCN_SURF0_TTU_CNTL0 delivery non-zero) */
     bool     cursor_lock_stuck; /* the GOP left the MPC cursor lock (CUR_VUPDATE_LOCK_SET0) held */
     uint32_t dscl_mode;     /* dscl-mode=N (1..7): the GOP left DSCL0_SCL_MODE.DSCL_MODE = N (0 = as gop-state) */
@@ -1243,6 +1245,7 @@ static uint64_t rdna4_dcn_period_ns(RDNA4State *s, int otg)
 }
 
 static void rdna4_reset(DeviceState *dev);
+static void rdna4_rlc_srm_apply(RDNA4State *s);
 
 static void rdna4_sleep_reset_get(Object *obj, Visitor *v, const char *name,
                                    void *opaque, Error **errp)
@@ -2830,6 +2833,13 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
             reg_set(s, REG_GCVM_FAULT_ADDR_LO, 0);
             reg_set(s, REG_GCVM_FAULT_ADDR_HI, 0);
         }
+    } else if (addr == GC_SEG1(0x4c80)) {
+        /* RLC_SRM_CNTL (gfx_v12_0_rlc_enable_srm sets SRM_ENABLE | AUTO_INCR_ADDR): the RLC then applies the
+         * clear-state buffer it was given (RLC_CSIB_*) to the context registers. Model of the mechanism
+         * premetal/rootcause-draw.md #1 names; it is not verified on the card. */
+        reg_set(s, addr, val);
+        if (val & 1u)
+            rdna4_rlc_srm_apply(s);
     } else if (addr == REG_GRBM_GFX_CNTL) {
         reg_set(s, addr, val);
         /* MEC1 has 2 pipes x 4 queues on GC 12.0.x (gfx_v12_0.c:1415-1423); the missing
@@ -4338,20 +4348,25 @@ static bool rdna4_gfx_csb(RDNA4State *s, const char **why)
         return false;
     }
 
+    /* ctx-garbage=on (W37): the CSB reaches the registers only through the RLC's SRM (rdna4_rlc_srm_apply, on the
+     * RLC_SRM_CNTL write). Without SRM the buffer is validated and nothing lands, the round-4 hypothesis:
+     * premetal/rootcause-draw.md #1. ctx-garbage=off keeps the old model (the CP loads it when the ring starts). */
+    bool land = !s->ctx_garbage || (reg_get(s, GC_SEG1(0x4c80)) & 1u);
+
     at = 1;
     for (uint32_t c = 0; c < clusters; c++) {
         uint32_t count = ldl_le_p(p + 4 * at);
         uint32_t index = ldl_le_p(p + 4 * at + 4);
         at += 2;
-        for (uint32_t i = 0; i < count; i++) {
+        for (uint32_t i = 0; land && i < count; i++) {
             /* index is already absolute: dword index = 0xa000 + offset. */
             reg_set(s, (index + i) * 4, ldl_le_p(p + 4 * (at + i)));
         }
         at += count;
     }
     s->gfx_csb_loaded = true;
-    fprintf(stderr, "rdna4: gfx: CSB loaded (%u clusters, %u dwords at MC 0x%" PRIx64 ")\n",
-            clusters, len, addr);
+    fprintf(stderr, "rdna4: gfx: CSB %s (%u clusters, %u dwords at MC 0x%" PRIx64 ")\n",
+            land ? "loaded" : "seen, not applied (SRM off)", clusters, len, addr);
     return true;
 }
 
@@ -4583,7 +4598,7 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
         } else if ((dw & 0xff800000u) == 0xbe800000u) {     /* SOP1 */
             uint32_t op = (dw >> 8) & 0xff;
             uint32_t dst = (dw >> 16) & 0x7f;
-            uint32_t value = rdna4_gfx_sreg(w, dw & 0xff);
+            uint32_t value = rdna4_gfx_sreg_lit(w, dw & 0xff, dw1);
 
             if (op == 0x20) {                                /* saveexec */
                 uint32_t old = w->exec;
@@ -4593,6 +4608,8 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
             } else if (op == 0) {                            /* s_mov_b32 */
                 if (!rdna4_gfx_set_sreg(w, dst, value))
                     goto unknown;
+                if ((dw & 0xffu) == 0xffu)                   /* a literal follows (shaders/nggstore.s) */
+                    n = 2;
             } else {
                 goto unknown;
             }
@@ -4841,6 +4858,78 @@ static uint32_t rdna4_gfx_ring_bytes(RDNA4State *s, uint32_t base_reg,
                (uint32_t)bytes : 0;
 }
 
+/* W37: context-register power-up garbage and the clear state (premetal/rootcause-draw.md #1).
+ * On silicon the context registers are SRAM that powers up with garbage (round 4 read
+ * VGT_SHADER_STAGES_EN=0xfd1ffe88 before the first draw, different each boot); amdgpu hands the RLC a
+ * clear-state buffer (gfx12_cs_data, six extents) and enables SRM so the registers Mesa never writes end up 0.
+ * The old model read every unwritten register as 0, which is why the emulator drew when the card did not.
+ * ctx-garbage=on (OPT-IN since W39, default off; a run with it off is the neutral baseline): the 1024 context registers (seg 1 dwords 0..0x3ff) start as a fixed non-zero pattern,
+ * and a draw is refused while a clear-state register still holds it (a hypothesis model like
+ * gfx-golden-strict: it only shows whether the kext clears them). */
+static const struct { uint16_t index, count; } rdna4_csb_extents[] = {
+    { 0x03e, 34 }, { 0x0cc, 2 }, { 0x0d8, 1 }, { 0x0db, 6 }, { 0x2e5, 11 }, { 0x3c0, 8 },
+};
+
+static uint32_t rdna4_ctx_garbage(uint32_t off)
+{
+    return (0x9e3779b1u * (off + 1)) | 0x00010001u;   /* never 0 */
+}
+
+static void rdna4_ctx_poison(RDNA4State *s)
+{
+    for (uint32_t off = 0; off < 0x400; off++) {
+        reg_set(s, GC_SEG1(off), rdna4_ctx_garbage(off));
+    }
+}
+
+static void rdna4_rlc_srm_apply(RDNA4State *s)
+{
+    uint64_t csib = reg_get(s, GC_SEG1(0x0987)) | ((uint64_t)reg_get(s, GC_SEG1(0x0988)) << 32);
+    uint32_t len = reg_get(s, GC_SEG1(0x0989));
+    uint32_t buf[256];
+
+    if (!csib || !len || len > 256) {
+        fprintf(stderr, "rdna4: rlc: SRM enabled without a usable clear-state buffer (0x%" PRIx64 ", %u dwords)\n",
+                csib, len);
+        return;
+    }
+    if (!rdna4_gfx_mem_read(s, csib, buf, len * 4, 0, false)) {
+        fprintf(stderr, "rdna4: rlc: SRM cannot read the clear-state buffer at 0x%" PRIx64 "\n", csib);
+        return;
+    }
+    uint32_t clusters = buf[0], at = 1, regs = 0;
+    for (uint32_t c = 0; c < clusters && at + 2 <= len; c++) {
+        uint32_t n = buf[at], first = buf[at + 1];
+        at += 2;
+        for (uint32_t i = 0; i < n && at < len; i++, at++) {
+            reg_set(s, (first + i) * 4, buf[at]);
+            regs++;
+        }
+    }
+    fprintf(stderr, "rdna4: rlc: SRM applied the clear-state buffer: %u clusters, %u registers\n", clusters, regs);
+}
+
+/* First clear-state register still holding the power-up pattern, or -1; *count = how many. */
+static int rdna4_csb_garbage(RDNA4State *s, uint32_t *count)
+{
+    int first = -1;
+
+    *count = 0;
+    for (unsigned e = 0; e < sizeof(rdna4_csb_extents) / sizeof(rdna4_csb_extents[0]); e++) {
+        for (uint32_t i = 0; i < rdna4_csb_extents[e].count; i++) {
+            uint32_t off = rdna4_csb_extents[e].index + i;
+
+            if (reg_get(s, GC_SEG1(off)) == rdna4_ctx_garbage(off)) {
+                if (first < 0) {
+                    first = (int)off;
+                }
+                (*count)++;
+            }
+        }
+    }
+    return first;
+}
+
 static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
 {
     uint32_t stages, ena, addr, col, info, attrib3, vte, cbcc, target, shader;
@@ -4873,6 +4962,20 @@ static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
             if (s->gfx_golden_strict)
                 return rdna4_gfx_draw_refuse(s, "golden registers",
                                              "gfx_v12_0_init_golden_registers was not applied");
+        }
+    }
+    if (s->ctx_garbage) {
+        uint32_t nbad;
+        int first = rdna4_csb_garbage(s, &nbad);
+
+        if (first >= 0) {
+            /* the primitive reaches the clipper and is lost before the pixel shader (pipeline statistics: C_PRIM > 0, PS = 0) */
+            s->pstat[2] += 1;
+            s->pstat[1] += 1;
+            fprintf(stderr, "rdna4: gfx: HYPOTHESIS MODEL (ctx-garbage=on): draw lost: %u clear-state registers still hold power-up garbage "
+                    "(first: context 0x%03x = 0x%08x); the RLC clear state (SRM) or a CSB replay is missing\n",
+                    nbad, first, reg_get(s, GC_SEG1((uint32_t)first)));
+            return rdna4_gfx_draw_refuse(s, "clear state", "context registers hold power-up garbage");
         }
     }
     if (count == 0 || count > 30)
@@ -5069,6 +5172,9 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
 
     s->gfx_draw_refused = false;
     rdna4_gfx_break_must(s);
+    s->pstat[7] += count;                              /* IA_VERTICES */
+    s->pstat[6] += count / 3;                          /* IA_PRIMITIVES */
+    s->pstat[3] += count;                              /* VS_INVOCATIONS (the NGG stage) */
     if (!rdna4_gfx_check_draw(s, count, vmid))
         return false;
     start_ns = qemu_clock_get_ns(QEMU_CLOCK_HOST);
@@ -5244,6 +5350,9 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
         }
         g_free(px); g_free(py);
     }
+    s->pstat[2] += 1;                                  /* C_INVOCATIONS */
+    s->pstat[1] += 1;                                  /* C_PRIMITIVES */
+    s->pstat[0] += written;                            /* PS_INVOCATIONS */
     fprintf(stderr, "rdna4: gfx: draw: primitives=1 pixels shaded=%u time=%" PRIu64 " ns\n",
             written, qemu_clock_get_ns(QEMU_CLOCK_HOST) - start_ns);
     dpy_gfx_update_full(s->con);
@@ -5378,6 +5487,20 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
             if (count != 0 && count != 2) {
                 fprintf(stderr, "rdna4: gfx: EVENT_WRITE length %u refused, stopping\n", len);
                 return false;
+            }
+            if (count == 2) {
+                uint32_t ev, lo, hi;
+
+                if (!rdna4_gfx_stream_dw(s, st, at + 1, &ev) || !rdna4_gfx_stream_dw(s, st, at + 2, &lo) ||
+                    !rdna4_gfx_stream_dw(s, st, at + 3, &hi)) {
+                    return false;
+                }
+                if ((ev & 0xff) == 0x1e && !rdna4_gfx_mem_write(s, ((uint64_t)hi << 32) | (lo & ~7u), s->pstat,
+                                                                  sizeof(s->pstat), st->vmid)) {
+                    fprintf(stderr, "rdna4: gfx: SAMPLE_PIPELINESTAT to 0x%" PRIx64 " refused, stopping\n",
+                            ((uint64_t)hi << 32) | lo);
+                    return false;
+                }
             }
             break;
         case 0x58:                                           /* ACQUIRE_MEM */
@@ -6837,6 +6960,8 @@ static void rdna4_reset(DeviceState *dev)
      * IP discovery gc_info table, as in amdgpu_discovery_get_gc_info.  The
      * register is read-only in the model; always present the card's value. */
     reg_set(s, REG_GFX_GB_ADDR_CONFIG, 0x08200545u);
+    if (s->ctx_garbage)
+        rdna4_ctx_poison(s);
     if (s->cursor_lock_stuck)
         reg_set(s, SEG3(0x02c5), 1);
     if (s->dscl_mode) {   /* DSCL0_SCL_MODE 0x0d08, RECOUT_SIZE 0x0d1f, MPC_SIZE 0x0d20 */
@@ -7092,6 +7217,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_UINT32("dscl-mode", RDNA4State, dscl_mode, 0),
     DEFINE_PROP_BOOL("desktop-churn", RDNA4State, desktop_churn, false),
     DEFINE_PROP_BOOL("gop-dlg", RDNA4State, gop_dlg, false),
+    DEFINE_PROP_BOOL("ctx-garbage", RDNA4State, ctx_garbage, false),
     DEFINE_PROP_BOOL("cursor-ttu-hypothesis", RDNA4State, cursor_ttu_hypothesis, false),
     DEFINE_PROP_BOOL("hang-sticky", RDNA4State, hang_sticky, false),
     DEFINE_PROP("sleep-reset", RDNA4State, sleep_reset, rdna4_sleep_reset_prop,

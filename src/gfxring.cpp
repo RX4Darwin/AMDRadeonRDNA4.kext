@@ -33,6 +33,7 @@
 #include "gfx12_draw.h"
 #include "ngg_kernel.h"
 #include "nggmsg_kernel.h"
+#include "nggstore_kernel.h"
 #include "pm4.hpp"
 #include "psred_kernel.h"
 #include "psstore_kernel.h"
@@ -224,9 +225,11 @@ bool RDNA4Compute::stageGfxRing() {
 	gfxGoldenInit();   // amdgpu's 3D-pipeline golden registers, before the CP starts
 	gfxFaultMark("bring-up start (clears what earlier stages left)");
 	gfxRs64Evidence("bring-up");
+	gfxQueueEvidence("bring-up");
 	trail("gfx: clear state + ring");
 	if (!gfxCsbInit())
 		return finish(false, "clear-state buffer");
+	gfxSrmEnable();   // W37 #1: amdgpu enables the SRM right after the CSB init (gfx_v12_0_rlc_resume)
 	if (!gfxRingResume())
 		return finish(false, "ring setup");
 	gfxFaultMark("ring setup and unhalt");
@@ -385,7 +388,7 @@ uint32_t RDNA4Compute::requestedGfxDiag() {
 	uint32_t mask = 0;
 	if (!PE_parse_boot_argn("rdna4-gfxdiag", &mask, sizeof(mask)))
 		return 0;
-	return mask & 0x1f;   // bits 1,2,4,8 = variants, 16 = run them even if the baseline passed
+	return mask & 0x3f;   // bits 1,2,4,8,32 = variants, 16 = run them even if the baseline passed
 }
 
 namespace {
@@ -449,7 +452,7 @@ constexpr uint32_t kShBase = 0x19a0, kMarkerValue = 0xc0de0001;
 // context the CP is using. A COPY_DATA (gfx_v12_0_ring_emit_rreg, gfx_v12_0.c:4697) is executed by the
 // CP in stream order, so it reports the state at that point. kind 0 = context register (SET_CONTEXT_REG
 // offset = the header dword), 1 = SH register (offset = dword - kShBase), 2 = UCONFIG (dword - 0x2000).
-struct ProbeReg { const char *name; uint8_t seg; uint16_t dword; uint8_t kind; };
+struct ProbeReg { const char *name; uint8_t seg; uint16_t dword; uint8_t kind; uint8_t csb; };   // csb = a clear-state-extent register (W37)
 constexpr uint32_t kProbeMax = 32;
 const ProbeReg kProbe[] = {
 	{ "VGT_SHADER_STAGES_EN", 1, 0x02a6, 0 }, { "CB_TARGET_MASK", 1, 0x0214, 0 }, { "CB_SHADER_MASK", 1, 0x0215, 0 },
@@ -459,6 +462,12 @@ const ProbeReg kProbe[] = {
 	{ "PA_CL_VTE_CNTL", 1, 0x0205, 0 }, { "PA_SC_SCREEN_SCISSOR_BR", 1, 0x0061, 0 }, { "PA_SC_VPORT_SCISSOR_0_BR", 1, 0x0095, 0 },
 	{ "PGM_LO_ES", 0, 0x1a29, 1 }, { "PGM_LO_PS", 0, 0x19a8, 1 }, { "RSRC1_GS", 0, 0x1a2a, 1 }, { "RSRC1_PS", 0, 0x19aa, 1 },
 	{ "VGT_PRIMITIVE_TYPE", 1, 0x2242, 2 }, { "GE_POS_RING_BASE", 1, 0x2268, 2 }, { "GE_PRIM_RING_BASE", 1, 0x226a, 2 },
+	// W37: registers of the clear-state extents that the stream never writes (rootcause-draw.md #1). Zero in the CP's
+	// view = the clear state landed (or the replay wrote it); non-zero = power-up garbage.
+	{ "PA_RATE_CNTL", 1, 0x00cd, 0, 1 }, { "CONTEXT_RESERVED_REG0", 1, 0x00db, 0, 1 }, { "CONTEXT_RESERVED_REG1", 1, 0x00dc, 0, 1 },
+	{ "PA_SC_CLIPRECT_0_EXT", 1, 0x00dd, 0, 1 }, { "PA_SC_BINNER_OUTPUT_TIMEOUT_CNTL", 1, 0x02ed, 0, 1 },
+	{ "PA_SC_BINNER_DYNAMIC_BATCH_LIMIT", 1, 0x02ee, 0, 1 }, { "PA_SC_VPORT_0_TL", 1, 0x0040, 0, 1 },
+	{ "PA_SC_RASTER_CONFIG", 1, 0x00d4, 0, 0 },
 };
 constexpr uint32_t kProbeCount = sizeof(kProbe) / sizeof(kProbe[0]);
 static_assert(kProbeCount <= kProbeMax, "probe table larger than its buffer");
@@ -506,10 +515,20 @@ void RDNA4Compute::gfxProbeReport(const char *label, uint32_t poolOff, volatile 
                                   uint32_t *countedOut) {
 	constexpr uint32_t n = sizeof(Gfx12Draw::kStream) / 4;
 	char line[240], diff[300];
-	uint32_t len = 0, match = 0, counted = 0, ndiff = 0, dl = 0;
+	uint32_t len = 0, match = 0, counted = 0, ndiff = 0, dl = 0, csbTotal = 0, csbNz = 0, cl = 0;
+	char csbNames[200];
+	csbNames[0] = 0;
 	line[0] = diff[0] = '\0';
 	for (uint32_t i = 0; i < kProbeCount; i++) {
 		const uint32_t val = *poolDw(poolOff + 4 * i);
+		if (kProbe[i].csb) {   // W37 #1: a clear-state register the stream never writes
+			csbTotal++;
+			if (val) {
+				csbNz++;
+				if (cl < sizeof(csbNames) - 50)
+					cl += snprintf(csbNames + cl, sizeof(csbNames) - cl, "%s=0x%08x ", kProbe[i].name, val);
+			}
+		}
 		len += snprintf(line + len, sizeof(line) - len, "%s=0x%08x ", kProbe[i].name, val);
 		if (len > 150) {
 			GLOG("%s: CP view: %s", label, line);
@@ -531,6 +550,8 @@ void RDNA4Compute::gfxProbeReport(const char *label, uint32_t poolOff, volatile 
 		GLOG("%s: CP view: %s", label, line);
 	GLOG("%s: CP view: %u of %u registers equal what the stream wrote%s%s", label, match, counted,
 	     ndiff ? "; differ: " : "", diff);
+	GLOG("%s: CP view: %u of %u clear-state registers (never written by the stream) are non-zero%s%s%s", label, csbNz, csbTotal,
+	     csbNz ? ": " : " (the clear state landed or the replay wrote it)", csbNames, csbNz ? " (power-up garbage: #1)" : "");
 	if (equalOut)
 		*equalOut = match;
 	if (countedOut)
@@ -643,6 +664,285 @@ bool RDNA4Compute::gfxSentinelCheck() {
 	     kA, kB, r0, r1, mmio, verdict);
 	gfxFaultMark("sentinel check");
 	return fenced;
+}
+
+// ---------------------------------------------------------------------------
+// W37 (premetal/rootcause-draw.md): the context state, the queue, and where the primitive is lost.
+// ---------------------------------------------------------------------------
+
+bool RDNA4Compute::requestedGfxSrm() {
+	uint32_t v = 1;
+	return !(PE_parse_boot_argn("rdna4-gfxsrm", &v, sizeof(v)) && v == 0);
+}
+
+bool RDNA4Compute::requestedGfxCsbReplay() {
+	uint32_t v = 1;
+	return !(PE_parse_boot_argn("rdna4-gfxcsb", &v, sizeof(v)) && v == 0);
+}
+
+// rootcause-draw.md #1. With PSP-loaded firmware amdgpu's gfx_v12_0_rlc_resume runs gfx_v12_0_init_csb AND
+// gfx_v12_0_rlc_enable_srm (RLC_SRM_CNTL |= AUTO_INCR_ADDR | SRM_ENABLE, gfx_v12_0.c:2005-2008, called at :2106-2112).
+// The kext handed the RLC the clear-state buffer and never enabled SRM, so the clear state may never have landed:
+// the context registers power up as SRAM garbage (the round-4 readback VGT_SHADER_STAGES_EN=0xfd1ffe88 has bits
+// where gfx12 defines no field, different each boot) and unwritten ones keep it. Same point of the bring-up as
+// amdgpu: right after the CSB init. rdna4-gfxsrm=0 leaves it out (the control).
+void RDNA4Compute::gfxSrmEnable() {
+	const uint32_t before = rdGc(RlcSrmCntl);
+	// W39 (W37 review S3b): RLC state survives a warm restart (like CG), so what the register holds at the start of this boot is
+	// evidence of its own: SRM_ENABLE already set means an earlier boot's enable persisted.
+	GLOG("SRM: RLC_SRM_CNTL found at start 0x%08x%s", before, (before & kRlcSrmEnable) && before != 0xffffffffu
+	     ? " (SRM_ENABLE already set: persisted from an earlier boot; a rdna4-gfxsrm=0 control is void, power-cycle first)" : "");
+	if (!requestedGfxSrm()) {
+		GLOG("SRM: rdna4-gfxsrm=0, RLC_SRM_CNTL left at 0x%08x (control)", before);
+		return;
+	}
+	if (before == 0xffffffffu) {
+		GLOG("SRM: RLC_SRM_CNTL unreadable (0x%08x), not written", before);
+		return;
+	}
+	wr(IpDiscovery::HwGc, RlcSrmCntl, before | kRlcSrmAutoIncr | kRlcSrmEnable);
+	GLOG("SRM: RLC_SRM_CNTL 0x%08x -> 0x%08x (gfx_v12_0_rlc_enable_srm: AUTO_INCR_ADDR | SRM_ENABLE)", before,
+	     rdGc(RlcSrmCntl));
+}
+
+// Belt and braces for #1: the clear-state buffer's six extents (62 registers, 74 dwords with the headers) as
+// SET_CONTEXT_REG on the ring, right before the draw, with the CSB's own values (gfx12_cs_data: all zero), so the
+// draw never depends on SRM. They are registers Mesa never writes (PA_RATE_CNTL, CONTEXT_RESERVED_REG0/1,
+// PA_SC_BINNER_*, PA_SC_VPORT_0..15, PA_SC_CLIPRECT_n_EXT, the HiZ/HiS base and size registers); the stream's own
+// later writes (SC_MEM_*, HIZ/HIS_INFO, ...) override the overlaps. rdna4-gfxcsb=0 leaves it out (the control).
+void RDNA4Compute::gfxEmitCsbReplay() {
+	uint32_t buf[64], extents = 0, regs = 0, dwords = 0;
+	for (const cs_section_def *sect = gfx12_cs_data; sect->section; sect++) {
+		if (sect->id != SECT_CONTEXT)
+			continue;
+		for (const cs_extent_def *ext = sect->section; ext->extent; ext++) {
+			if (ext->reg_count + 2 > sizeof(buf) / sizeof(buf[0]) || ext->reg_index < 0xa000)
+				continue;
+			const uint32_t n = Pm4::setContextRegs(buf, ext->reg_index - 0xa000, ext->extent, ext->reg_count);
+			gfxRing.emit(buf, n);
+			extents++;
+			regs += ext->reg_count;
+			dwords += n;
+		}
+	}
+	GLOG("CSB replay: %u extents, %u registers, %u ring dwords of SET_CONTEXT_REG before the draw", extents, regs, dwords);
+}
+
+// The registers of the clear-state extents that the round-4 doc singles out, then every other context register
+// (seg 1, dwords 0..0x3ff) that is non-zero although the draw stream never writes it: on silicon those are the
+// power-up garbage (or what a context roll copied forward). '*' marks a register of the clear-state extents.
+void RDNA4Compute::gfxContextDump(const char *tag) {
+	struct Named { const char *name; uint32_t dword; };
+	static const Named named[] = {
+		{ "PA_RATE_CNTL", 0x00cd }, { "CONTEXT_RESERVED_REG0", 0x00db }, { "CONTEXT_RESERVED_REG1", 0x00dc },
+		{ "PA_SC_CLIPRECT_0_EXT", 0x00dd }, { "PA_SC_BINNER_OUTPUT_TIMEOUT_CNTL", 0x02ed },
+		{ "PA_SC_BINNER_DYNAMIC_BATCH_LIMIT", 0x02ee }, { "PA_SC_VPORT_0_TL", 0x0040 }, { "PA_SC_RASTER_CONFIG", 0x00d4 },
+	};
+	char line[240];
+	uint32_t n = 0;
+	line[0] = '\0';
+	for (const Named &r : named) {
+		n += snprintf(line + n, sizeof(line) - n, "%s=0x%08x ", r.name, rdGc(Reg { 1, r.dword }));
+		if (n > 150) {
+			GLOG("%s: clear-state registers: %s", tag, line);
+			n = 0;
+			line[0] = '\0';
+		}
+	}
+	if (n)
+		GLOG("%s: clear-state registers: %s", tag, line);
+	constexpr uint32_t sn = sizeof(Gfx12Draw::kStream) / 4;
+	uint32_t nonzero = 0, csbNonzero = 0, shown = 0;
+	n = 0;
+	line[0] = '\0';
+	for (uint32_t off = 0; off < 0x400; off++) {
+		if (findStreamReg(Gfx12Draw::kStream, sn, 0x69, off) >= 0)
+			continue;   // the stream writes it: not garbage
+		const uint32_t v = rdGc(Reg { 1, off });
+		if (!v || v == 0xffffffffu)
+			continue;
+		bool inCsb = false;
+		for (const cs_section_def *sect = gfx12_cs_data; sect->section; sect++)
+			for (const cs_extent_def *ext = sect->section; ext->extent; ext++)
+				if (off + 0xa000 >= ext->reg_index && off + 0xa000 < ext->reg_index + ext->reg_count)
+					inCsb = true;
+		nonzero++;
+		csbNonzero += inCsb;
+		if (shown < 48) {
+			shown++;
+			n += snprintf(line + n, sizeof(line) - n, "%s0x%03x=0x%08x ", inCsb ? "*" : "", off, v);
+			if (n > 170) {
+				GLOG("%s: context registers the stream never writes, non-zero: %s", tag, line);
+				n = 0;
+				line[0] = '\0';
+			}
+		}
+	}
+	if (n)
+		GLOG("%s: context registers the stream never writes, non-zero: %s", tag, line);
+	GLOG("%s: %u context registers the stream never writes read non-zero (%u of them in the clear-state extents)%s",
+	     tag, nonzero, csbNonzero, shown < nonzero ? "; first 48 shown" : "");
+}
+
+// rootcause-draw.md #2: the registers a gfx queue would get from an MQD (gfx_v12_0_gfx_mqd_init) and the
+// RS64 local base. amdgpu never runs gfx12 on a bare RB0: its kernel queue has an MQD/HQD. Read-only; the ones
+// that read 0 are the candidates for what the CPG resolves at VA 0.
+void RDNA4Compute::gfxQueueEvidence(const char *tag) {
+	grbmSelect(0, 0, 0, 0);
+	GLOG("%s: queue: CP_GFX_MQD_BASE 0x%08x_%08x CP_MQD_BASE 0x%08x_%08x CP_GFX_MQD_CONTROL 0x%08x HPD_OSPRE_FENCE 0x%08x_%08x",
+	     tag, rdGc(CpGfxMqdBaseHi), rdGc(CpGfxMqdBaseLo), rdGc(CpMqdBaseAddrHi), rdGc(CpMqdBaseAddr),
+	     rdGc(CpGfxMqdControl), rdGc(CpGfxHpdOspreFenceHi), rdGc(CpGfxHpdOspreFenceLo));
+	GLOG("%s: queue: HQD ACTIVE 0x%08x VMID 0x%08x BASE 0x%08x_%08x CNTL 0x%08x RPTR 0x%08x RPTR_ADDR 0x%08x_%08x "
+	     "WPTR 0x%08x_%08x HQ_STATUS0 0x%08x HQ_CONTROL0 0x%08x | RS64 LOCAL_BASE0_LO 0x%08x", tag,
+	     rdGc(CpGfxHqdActive), rdGc(CpGfxHqdVmid), rdGc(CpGfxHqdBaseHi), rdGc(CpGfxHqdBase), rdGc(CpGfxHqdCntl),
+	     rdGc(CpGfxHqdRptr), rdGc(CpGfxHqdRptrAddrHi), rdGc(CpGfxHqdRptrAddr), rdGc(CpGfxHqdWptrHi),
+	     rdGc(CpGfxHqdWptr), rdGc(CpGfxHqdHqStatus0), rdGc(CpGfxHqdHqControl0), rdGc(CpGfxRs64LocalBase0Lo));
+}
+
+// rootcause-draw.md #2 test: VMID0 VA 0 (context 0, page 0: a one-page table, PTE 0 = invalid, faults to the
+// shared scratch page) becomes a private zeroed VRAM page (VALID | READABLE | WRITEABLE, amdgpu_vm.h:57,67,68),
+// as amdgpu's GART would be there. The CPG's stray access at VA 0 (round 4: status 0x0d3d, a read and a write
+// IV pair) then lands in a page we can dump after the draw: the dwords it writes fingerprint the structure.
+// rdna4-gfxprobe=1 only, and only right before the baseline draw, after the single-packet probe has looked at
+// the faults (mapping the page makes the fault disappear).
+void RDNA4Compute::gfxMapVa0() {
+	for (uint32_t i = 0; i < 1024; i++)
+		*poolDw(kGfxVa0Offset + 4 * i) = 0;
+	const uint64_t phys = static_cast<uint64_t>(rdGc(GcFbOffset) & 0xffffff) << 24;
+	const uint64_t page = phys + pool.offset + kGfxVa0Offset;
+	// W39 (W37 review S1): VALID | READABLE | WRITEABLE | IS_PTE. On GC 12 a last-level entry WITHOUT IS_PTE (bit 63) is a
+	// directory entry to the walker (W36), so the mapping would silently do nothing and the dump would read 'nothing wrote there'.
+	const uint64_t pte = page | 0x61 | GpuVm::kIsPte;
+	*poolDw(kPtOffset) = static_cast<uint32_t>(pte);
+	*poolDw(kPtOffset + 4) = static_cast<uint32_t>(pte >> 32);
+	flushHdp();
+	const Reg req { 0, GcInvEng0Req.dword + kGcInvEngGart }, ack { 0, GcInvEng0Ack.dword + kGcInvEngGart };
+	wr(IpDiscovery::HwGc, req, kInvReqVmid0);
+	bool acked = false;
+	for (uint32_t us = 0; us < 20000 && !acked; us += 10) {
+		acked = rdGc(ack) & 1u;
+		if (!acked)
+			IODelay(10);
+	}
+	GLOG("VA 0: VMID0 page 0 mapped to a private zeroed page at MC 0x%llx (PTE 0x%016llx, IS_PTE set); GC TLB flush %s. The mapping stays for the rest of "
+	     "the boot: later fault marks no longer show a VA-0 fault, so this boot is not a clean baseline for the fault status",
+	     poolMc(kGfxVa0Offset), static_cast<unsigned long long>(pte),
+	     acked ? "acked" : "NOT acked: the card never acks these and the ack is not required (a stale invalid entry in the TLB could still hide the mapping: read a silent VA-0 fault as 'the mapping took effect')");
+}
+
+void RDNA4Compute::gfxDumpVa0(const char *tag) {
+	uint32_t nonzero = 0, shown = 0, n = 0;
+	char line[240];
+	line[0] = '\0';
+	for (uint32_t i = 0; i < 1024; i++) {
+		const uint32_t v = *poolDw(kGfxVa0Offset + 4 * i);
+		if (!v)
+			continue;
+		nonzero++;
+		if (shown < 24) {
+			shown++;
+			n += snprintf(line + n, sizeof(line) - n, "[%u]=0x%08x ", i, v);
+			if (n > 170) {
+				GLOG("%s: VA 0 page: %s", tag, line);
+				n = 0;
+				line[0] = '\0';
+			}
+		}
+	}
+	if (n)
+		GLOG("%s: VA 0 page: %s", tag, line);
+	GLOG("%s: VA 0 page: %u of 1024 dwords are non-zero%s", tag, nonzero,
+	     nonzero ? " (something wrote there, if the mapping took effect: see the VA 0 line and the fault marks)" : " (nothing wrote there, if the mapping took effect)");
+}
+
+// rootcause-draw.md #4: SAMPLE_PIPELINESTAT before and after the draw (si_query.c:854-857; 14 x u64, dword
+// offsets si_query_pipestat_dw_offset: PS_INVOCATIONS 0, C_PRIMITIVES 2, C_INVOCATIONS 4, VS 6, GS_INV 8, GS_PRIM 10,
+// IA_PRIMITIVES 12, IA_VERTICES 14). Reading it: IA = 0: the GE dropped the draw; IA > 0 and C_INV = 0: the NGG /
+// export path; C_INV > 0 and C_PRIM = 0: clip or cull; C_PRIM > 0 and PS = 0: SC / scissor / raster state (#1);
+// PS > 0: pixel shaders ran.
+void RDNA4Compute::gfxPstatReport(const char *label) {
+	auto q = [&](uint32_t base, uint32_t idx, bool &written) {
+		const uint32_t lo = *poolDw(base + 8 * idx), hi = *poolDw(base + 8 * idx + 4);
+		written = lo != 0xdeadf00du;
+		return (static_cast<uint64_t>(hi) << 32) | lo;
+	};
+	static const struct { const char *name; uint32_t idx; } stat[] = {
+		{ "PS_INVOCATIONS", 0 }, { "C_PRIMITIVES", 1 }, { "C_INVOCATIONS", 2 }, { "VS_INVOCATIONS", 3 },
+		{ "GS_INVOCATIONS", 4 }, { "GS_PRIMITIVES", 5 }, { "IA_PRIMITIVES", 6 }, { "IA_VERTICES", 7 },
+	};
+	uint64_t d[8];
+	bool any = false, allWritten = true;
+	char line[240];
+	uint32_t n = 0;
+	line[0] = '\0';
+	for (uint32_t i = 0; i < 8; i++) {
+		bool w0, w1;
+		const uint64_t a = q(kGfxPstatPre, stat[i].idx, w0), b = q(kGfxPstatPost, stat[i].idx, w1);
+		allWritten = allWritten && w0 && w1;
+		d[i] = b - a;
+		any = any || d[i];
+		n += snprintf(line + n, sizeof(line) - n, "%s %llu (%llu->%llu) ", stat[i].name,
+		              static_cast<unsigned long long>(d[i]), static_cast<unsigned long long>(a),
+		              static_cast<unsigned long long>(b));
+		if (n > 150) {
+			GLOG("%s: pipeline statistics: %s", label, line);
+			n = 0;
+			line[0] = '\0';
+		}
+	}
+	if (n)
+		GLOG("%s: pipeline statistics: %s", label, line);
+	const uint64_t ps = d[0], cprim = d[1], cinv = d[2], iaPrim = d[6], iaVert = d[7];
+	const char *where = !allWritten ? "the SAMPLE_PIPELINESTAT events wrote nothing (counters unavailable on this path)"
+	                  : (!iaVert && !iaPrim) ? "IA = 0: the GE dropped the draw (queue mode / VA 0, #2)"
+	                  : !cinv ? "IA > 0 but C_INVOCATIONS = 0: lost in the NGG / export path (#4, #3)"
+	                  : !cprim ? "C_INVOCATIONS > 0 but C_PRIMITIVES = 0: clipped or culled (context state, #1)"
+	                  : !ps ? "C_PRIMITIVES > 0 but PS_INVOCATIONS = 0: lost between the clipper and the pixel shader (SC / raster state, #1)"
+	                  : "pixel shaders ran";
+	GLOG("%s: pipeline statistics say: %s%s", label, where, any ? "" : " (all deltas 0)");
+}
+
+// W39 (W37 review S3): the clear-state evidence BEFORE the CSB replay is emitted, once per boot, so that SRM's effect is
+// attributable: with the replay on, the CP-view read after it (draw probe mid) reads 0 whether or not SRM landed the clear
+// state. Boot 3 (SRM + replay) reads this before the replay; boot 6 (rdna4-gfxcsb=0) has no replay at all, so this is the
+// state its draw sees. COPY_DATA on the ring plus an MMIO read of the same registers.
+void RDNA4Compute::gfxClearStatePre() {
+	uint32_t regs[16], k = 0;
+	for (uint32_t i = 0; i < kProbeCount && k < 16; i++)
+		if (kProbe[i].csb)
+			regs[k++] = i;
+	for (uint32_t i = 0; i < k; i++)
+		*poolDw(kGfxProbeOffset + 4 * i) = 0xdeadf00du;
+	flushHdp();
+	uint32_t pkt[16];
+	for (uint32_t i = 0; i < k; i++) {
+		uint32_t byteOff = 0;
+		if (env.disc && env.disc->regByteOffset(IpDiscovery::HwGc, 0, kProbe[regs[i]].seg, kProbe[regs[i]].dword, byteOff))
+			gfxRing.emit(pkt, Pm4::copyDataRegToMem(pkt, byteOff / 4, poolMc(kGfxProbeOffset + 4 * i)));
+	}
+	gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), ++gfxFence));
+	gfxKick(gfxRing.wptr());
+	const bool fenced = gfxFenceWait(gfxFence, 200000);
+	char cp[300], mm[300];
+	uint32_t cl = 0, ml = 0, cpNz = 0, mmNz = 0;
+	cp[0] = mm[0] = '\0';
+	for (uint32_t i = 0; i < k; i++) {
+		const uint32_t v = *poolDw(kGfxProbeOffset + 4 * i);
+		const uint32_t m = rdGc(Reg { kProbe[regs[i]].seg, kProbe[regs[i]].dword });
+		cpNz += v != 0;
+		mmNz += m != 0;
+		if (cl < sizeof(cp) - 48)
+			cl += snprintf(cp + cl, sizeof(cp) - cl, "%s=0x%08x ", kProbe[regs[i]].name, v);
+		if (ml < sizeof(mm) - 48)
+			ml += snprintf(mm + ml, sizeof(mm) - ml, "0x%08x ", m);
+	}
+	const uint32_t srm = rdGc(RlcSrmCntl);
+	GLOG("clear state BEFORE any CSB replay (RLC_SRM_CNTL now 0x%08x%s): CP view %u of %u non-zero: %s", srm,
+	     fenced ? "" : ", the ring did not finish", cpNz, k, cp);
+	GLOG("clear state BEFORE any CSB replay: MMIO %u of %u non-zero: %s", mmNz, k, mm);
+	GLOG("clear state BEFORE any CSB replay says: %s", cpNz == 0
+	     ? "all zero: the clear state is already applied (SRM landed it, or the registers reset to 0)"
+	     : "power-up garbage: the clear state did NOT land from the CSB handoff / SRM enable alone (#1: the replay or another trigger is needed)");
 }
 
 // The GC hub fault status, logged and cleared, so the log says which bring-up step first makes the
@@ -767,8 +1067,19 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	};
 	if (variant & 4)
 		place(kGfxVsOffset, kNggmsgKernel, sizeof(kNggmsgKernel) / 4);
+	else if (variant & 32)   // W37 #4: the NGG shader that stores a marker before anything else
+		place(kGfxVsOffset, kNggstoreKernel, sizeof(kNggstoreKernel) / 4);
 	else
 		place(kGfxVsOffset, kNggKernel, sizeof(kNggKernel) / 4);
+	if (variant & 32) {   // the two literal dwords of its s_mov_b32 sN, literal carry the marker address
+		const uint64_t mark = poolMc(kGfxNggMarkOffset);
+		for (uint32_t i = 0; i < sizeof(kNggstoreKernel) / 4; i++) {
+			if (*poolDw(kGfxVsOffset + 4 * i) == 0xdead0001u)
+				*poolDw(kGfxVsOffset + 4 * i) = static_cast<uint32_t>(mark);
+			else if (*poolDw(kGfxVsOffset + 4 * i) == 0xdead0002u)
+				*poolDw(kGfxVsOffset + 4 * i) = static_cast<uint32_t>(mark >> 32);
+		}
+	}
 	if (variant & 8)
 		place(kGfxPsOffset, kPsstoreKernel, sizeof(kPsstoreKernel) / 4);
 	else
@@ -801,12 +1112,16 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		patch(kOpSetContextReg, 0x02a6, 0x04000000, 0, "VGT_SHADER_STAGES_EN.PRIMGEN_PASSTHRU_NO_MSG=0");
 	if (variant & 8)   // two user SGPRs on the PS carry the marker address
 		patch(kOpSetShReg, 0x19ab - kShBase, 0x0000003e, 2u << 1, "SPI_SHADER_PGM_RSRC2_PS.USER_SGPR=2");
+	if (variant & 32)   // the marker shader uses v8/v9: 10 VGPRs = 2 granules of 8 (VGPRS field = granules - 1)
+		patch(kOpSetShReg, 0x1a2a - kShBase, 0x0000003f, 1, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=1");
 
 	// The target, cleared; the fences and the marker, zero.
 	for (uint32_t i = 0; i < kWidth * kHeight; i++)
 		*poolDw(kGfxTargetOffset + 4 * i) = 0;
 	*poolDw(kGfxDrawFenceOffset) = 0;
 	*poolDw(kGfxMarkerOffset) = 0;
+	for (uint32_t i = 0; i < 3; i++)
+		*poolDw(kGfxNggMarkOffset + 4 * i) = 0;
 	flushHdp();
 	GLOG("%s: %u-dword stream at MC 0x%llx, VS 0x%llx PS 0x%llx, target 0x%llx, rings 0x%llx "
 	     "(%llu MiB)%s", label, n, poolMc(kGfxIbOffset), va[kVs], va[kPs], va[kCb], va[kAttrRing],
@@ -818,6 +1133,18 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		const uint64_t marker = poolMc(kGfxMarkerOffset);
 		const uint32_t ud[2] = { static_cast<uint32_t>(marker), static_cast<uint32_t>(marker >> 32) };
 		gfxRing.emit(pkt, Pm4::setShReg(pkt, 0x2c00 + (0x19ac - kShBase), ud, 2));
+	}
+	if (requestedGfxCsbReplay())
+		gfxEmitCsbReplay();   // W37 #1: the draw never depends on SRM having applied the clear state
+	const bool pstat = requestedGfxProbe();
+	if (pstat) {   // W37 #4: pipeline statistics around the draw (both buffers pre-filled with a sentinel)
+		for (uint32_t i = 0; i < 28; i++) {
+			*poolDw(kGfxPstatPre + 4 * i) = 0xdeadf00du;
+			*poolDw(kGfxPstatPost + 4 * i) = 0xdeadf00du;
+		}
+		flushHdp();
+		gfxRing.emit(pkt, Pm4::eventWrite(pkt, 0x19));   // PIPELINESTAT_START (event 25)
+		gfxRing.emit(pkt, Pm4::eventWriteAddr(pkt, 0x1e | (2u << 8), poolMc(kGfxPstatPre)));   // SAMPLE_PIPELINESTAT (event 30, index 2)
 	}
 	// rdna4-gfxprobe=1: split the stream at NUM_INSTANCES (state | draw) and read the CP's own view of the
 	// state between the two halves and again after the draw (COPY_DATA on the ring, in stream order).
@@ -833,6 +1160,8 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	} else {
 		gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, poolMc(kGfxIbOffset), n, 0));
 	}
+	if (pstat)
+		gfxRing.emit(pkt, Pm4::eventWriteAddr(pkt, 0x1e | (2u << 8), poolMc(kGfxPstatPost)));
 	gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), ++gfxFence));
 	uint64_t t0 = mach_absolute_time();
 	gfxKick(gfxRing.wptr());
@@ -850,6 +1179,19 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		snprintf(what, sizeof(what), "%s probe post", label);
 		gfxProbeReport(what, kGfxProbePost, ib);
 	}
+	if (pstat && r.ringDone)
+		gfxPstatReport(label);
+	if (variant & 32) {   // W37 #4: did the NGG wave launch at all?
+		r.nggMarker = *poolDw(kGfxNggMarkOffset);
+		r.nggS2 = *poolDw(kGfxNggMarkOffset + 4);
+		r.nggS3 = *poolDw(kGfxNggMarkOffset + 8);
+		GLOG("%s: NGG marker 0x%08x (%s), s2 (gs_tg_info) 0x%08x, s3 (merged_wave_info) 0x%08x", label, r.nggMarker,
+		     r.nggMarker == 0xc0de0002u ? "the NGG wave ran and stored to memory" : "NOT written: the NGG wave did not run",
+		     r.nggS2, r.nggS3);
+	}
+	static uint32_t ctxDumps = 0;   // W37 review NIT: the 1024-register dump only for the baseline and the first variant
+	if (requestedGfxProbe() && r.ringDone && ctxDumps++ < 2)
+		gfxContextDump(label);   // W37 #1: what the clear-state registers and their neighbours hold now
 	gfxFaultMark(label);
 	if (!r.ringDone || r.drawFence != 1) {
 		GLOG("%s: did not finish (ring fence %s, draw fence 0x%x)", label,
@@ -939,6 +1281,9 @@ bool RDNA4Compute::stageGfxDraw() {
 
 	GfxDrawResult base;
 	gfxRs64Evidence("before draw");
+	gfxQueueEvidence("before draw");
+	if (requestedGfxProbe())
+		gfxMapVa0();   // W37 #2: after the single-packet probe has looked at the faults; the CPG's stray VA-0 access lands in a page we dump
 	gfxEvidence("before draw", false);
 	if (requestedGfxProbe())
 		if (!gfxSentinelCheck()) {   // W33 S2: does the CP-side readback see a context write? (decides how to read 'probe mid')
@@ -946,7 +1291,11 @@ bool RDNA4Compute::stageGfxDraw() {
 			publishResult("gfx", "FAIL sentinel did not finish");
 			return false;
 		}
+	if (requestedGfxProbe())
+		gfxClearStatePre();   // W39 S3: before the first CSB replay
 	const bool ran = gfxDrawRun("draw", 0, va, base);
+	if (requestedGfxProbe())
+		gfxDumpVa0("after the baseline draw");   // W37 #2: what the CP wrote at VA 0 during the draw
 	if (!ran) {
 		publishResult("gfx", "FAIL draw fence");
 		return false;
@@ -961,7 +1310,7 @@ bool RDNA4Compute::stageGfxDraw() {
 	// The diagnostic ladder (rdna4-gfxdiag=<mask>, default off): the same stream with
 	// one open question changed at a time, each logged with the same evidence, so that
 	// round 4 sees which stage of the pipeline works. Only the baseline decides PASS.
-	const uint32_t diag = requestedGfxDiag();
+	const uint32_t diag = requestedGfxDiag() | (requestedGfxDiag() && requestedGfxProbe() ? 32u : 0u);   // W37: the NGG marker joins the ladder of a probe boot
 	if (diag && (!base.ok || (diag & 16))) {
 		char summary[200], probes[160];
 		summary[0] = probes[0] = '\0';
@@ -972,7 +1321,7 @@ bool RDNA4Compute::stageGfxDraw() {
 		// (2, 1), and the GS_ALLOC_REQ shader (4) last: it can hang the NGG pipeline and there is
 		// no reset (W23 review S3), so boot 12 runs it alone (rdna4-gfxdiag=4). After a "hang/"
 		// result the next boot needs a cold power cycle: the GC state survives a warm restart.
-		static const uint32_t order[4] = { 8, 2, 1, 4 };
+		static const uint32_t order[5] = { 32, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
 		for (uint32_t bit : order) {
 			if (!(diag & bit))
 				continue;
@@ -985,6 +1334,9 @@ bool RDNA4Compute::stageGfxDraw() {
 			if (bit == 8 && did)
 				used += snprintf(summary + used, sizeof(summary) - used, "/marker %s",
 				                 r.marker == kMarkerValue ? "yes" : "no");
+			if (bit == 32 && did)
+				used += snprintf(summary + used, sizeof(summary) - used, "/ngg %s",
+				                 r.nggMarker == 0xc0de0002u ? "ran" : "NOT run");
 			if (r.probeSeen && pused + 24 < sizeof(probes))
 				pused += snprintf(probes + pused, sizeof(probes) - pused, " %u:%u/%u", bit, r.probeEqual, r.probeCounted);
 			if (!did)
@@ -997,5 +1349,8 @@ bool RDNA4Compute::stageGfxDraw() {
 			                                           "trust 'probe post' and the sentinel line)" : "");
 		env.owner->setProperty("Compute,GFXDiag", summary);
 	}
+	if (requestedGfxProbe())
+		gfxDumpVa0("after all draws");   // W37 #2
+	gfxQueueEvidence("after draw");
 	return base.ok;
 }
