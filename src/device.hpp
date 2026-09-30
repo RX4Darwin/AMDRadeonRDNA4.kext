@@ -220,7 +220,7 @@ private:
 	uint32_t cursorVisChanges { 0 };
 	// Evidence that survives the kernel log wrapping: registry property
 	// RDNA4FB,Cursor (cursor.cpp cursorNote).
-	char cursorTrail[12288] { 0 };
+	char cursorTrail[16384] { 0 };   // W40: 16 KiB, the Linux diff and the CM/MPCC lines came on top of the 12 KiB trail
 	uint16_t cursorTrailLen { 0 };
 	bool cursorTrailFull { false };
 	void cursorNote(const char *fmt, ...) __printflike(2, 3);
@@ -247,7 +247,14 @@ private:
 	void cursorPipeFixes();                 // CRQ_EXPANSION_MODE, cursor memory power, (rdna4-cursormpcsel=1) MPCC_UPDATE_LOCK_SEL
 	void cursorDsclDecide();                // DSCL_MODE/RECOUT verdict; rdna4-cursordscl=1 writes amdgpu's mode-0 set
 	bool cursorWaitFrames(uint32_t n);
-	void cursorCrcCheck();                  // OTG CRC over the square's window, cursor on/off/on/off: YES/NO by itself
+	const char *cursorCrcCheck(const char *label);   // OTG CRC over the square's window, cursor on/off/on/off: "YES"/"NO"/"INCONCLUSIVE"
+	// W40 (premetal/verify-cursor.md): the DPP colour-management block
+	void cursorCmDump(const char *why);     // read-only: CM0_CM_CONTROL and the CM sub-blocks
+	void cursorDlgDump(const char *why);    // read-only: the DLG/TTU registers 0x063b-0x0655
+	bool cursorCmApply();                   // rdna4-cursorcm=1: CM_BYPASS = 0 + amdgpu's SDR identity CM state, OTG-locked
+	bool cursorMpccApply();                 // rdna4-cursormpcc=1: MPCC_MODE TOP_LAYER_ONLY, ALPHA_MULTIPLIED 0, as the Linux capture
+	void cursorLinuxDiff(const char *why);  // read-only: static pipe registers that differ from the Linux capture
+	bool cursorOtgUpdateLock(bool lock);    // the modeset OTG update-lock bracket, bounded
 	bool cursorPipeFixesOn { false };
 	uint32_t cursorProbeLogs { 0 };
 	bool cursorProbedSet { false }, cursorProbedDraw { false };

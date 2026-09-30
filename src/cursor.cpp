@@ -494,6 +494,13 @@ constexpr uint32_t kDchubpCntl = 0x05f4, kMallConfig = 0x05f7, kExpansionMode = 
 constexpr uint32_t kOtgPipeUpdateStatus = 0x1b9e, kOtgFrameCount = 0x1b4d, kOtgGlobalCtrl2 = 0x1b90;
 constexpr uint32_t kOtgCrcCntl = 0x1b65, kOtgCrcWindowAX = 0x1b66, kOtgCrcWindowAY = 0x1b67;
 constexpr uint32_t kOtgCrcWindowBX = 0x1b68, kOtgCrcWindowBY = 0x1b69, kOtgCrcDataRg = 0x1b6a, kOtgCrcDataB = 0x1b6b;
+// W40 (dcn_4_1_0_offset.h, base idx 2, DPP0 values, + dppOff(); DPP stride 0x16b = CM1_CM_CONTROL 0x0ed2 - 0x0d67):
+constexpr uint32_t kCmPostCscControl = 0x0d68, kCmBiasCrR = 0x0d75, kCmBiasYgCbB = 0x0d76;
+constexpr uint32_t kCmGamcorControl = 0x0d77, kCmHdrMult = 0x0dc1, kCmMemPwrCtrl = 0x0dc2, kCmMemPwrStatus = 0x0dc3;
+constexpr uint32_t kCmDealpha = 0x0dc5;
+constexpr uint32_t kHdrMultOne = 0x1f000;   // 1.0 in s6e12, CM_HDR_MULT_COEF [18:0] (dcn10_hwseq.c:3247)
+// HUBPREQ0 DLG/TTU block written by hubp401_program_requestor / _program_dlg (dcn401_hubp.c:321-409), + hubpOff():
+constexpr uint32_t kDlgFirst = 0x063b, kDlgLast = 0x0655;
 constexpr uint32_t kCursorProbeMax = 10;   // trail budget: arming, self-test, up to three flips, first set/draw calls
 
 uint32_t premultiplyArgb(uint32_t pixel) {
@@ -775,6 +782,76 @@ void RDNA4Device::cursorDsclDump(const char *why) {
 	           regReadDmu(2, kHubpreqStatus2 + hubp));
 }
 
+// W40 (hub-task-273), read-only: every static register of the display pipe compared with what Linux amdgpu 7.2.2 leaves on
+// this card with a visible cursor (E:\linux\rdna4-groundtruth-vkcube-20260929-232026, identical to the idle capture apart
+// from addresses, positions and counters, which are not in the table). Only the differences are logged, as
+// NAME=got/want (both masked), so the whole comparison costs a few lines of the trail.
+struct LinuxRef { const char *name; uint8_t kind, seg; uint16_t off; uint32_t mask, want; };
+static const LinuxRef kLinuxRef[] = {
+#include "cursor_linux_ref.inc"
+};
+
+void RDNA4Device::cursorLinuxDiff(const char *why) {
+	const uint32_t hubp = hubpOff(), dpp = dppOff();
+	const uint32_t mpcc = pipe.hubp < Pipe::kMaxOtg ? pipe.hubp * kMpccStride : 0;
+	char line[250];
+	size_t n = 0;
+	uint32_t total = 0, diff = 0, shown = 0, dead = 0, part = 0;
+	line[0] = '\0';
+	for (const LinuxRef &r : kLinuxRef) {
+		total++;
+		const uint32_t delta = r.kind == 1 ? hubp : r.kind == 2 ? dpp : r.kind == 3 ? mpcc : 0;
+		const uint32_t v = regReadDmu(r.seg, r.off + delta);
+		if (v == 0xffffffffu) {
+			dead++;
+			continue;
+		}
+		if (!((v ^ r.want) & r.mask))
+			continue;
+		diff++;
+		if (shown >= 70)
+			continue;
+		char item[56];
+		const size_t m = static_cast<size_t>(snprintf(item, sizeof(item), " %s=%x/%x", r.name, v & r.mask, r.want));
+		if (n + m >= sizeof(line)) {
+			cursorNote("linuxdiff %s #%u:%s", why, ++part, line);
+			n = 0;
+			line[0] = '\0';
+		}
+		memcpy(line + n, item, m + 1);
+		n += m;
+		shown++;
+	}
+	if (n)
+		cursorNote("linuxdiff %s #%u:%s", why, ++part, line);
+	cursorNote("linuxdiff %s: %u of %u registers differ from the Linux capture (%u shown as NAME=got/want, %u unreadable)",
+	           why, diff, total, shown, dead);
+}
+
+// W40, read-only: the DPP colour-management block the GOP left (CM0_CM_CONTROL.CM_BYPASS is the candidate,
+// premetal/verify-cursor.md section 2) and the DLG/TTU registers 0x063b-0x0655 (HUBPREQ0_BLANK_OFFSET_0 ..
+// _DST_Y_DELTA_DRQ_LIMIT), nine per line to stay inside the 288-byte note.
+void RDNA4Device::cursorCmDump(const char *why) {
+	const uint32_t dpp = dppOff();
+	const uint32_t ctl = regReadDmu(2, kCmControl + dpp);
+	cursorNote("%s: cm: control 0x%08x (CM_BYPASS %u, UPDATE_PENDING %u) post_csc 0x%08x bias 0x%08x/0x%08x gamcor 0x%08x "
+	           "hdr_mult 0x%08x mem_pwr 0x%08x/0x%08x dealpha 0x%08x", why, ctl, ctl & 1, (ctl >> 8) & 1,
+	           regReadDmu(2, kCmPostCscControl + dpp), regReadDmu(2, kCmBiasCrR + dpp), regReadDmu(2, kCmBiasYgCbB + dpp),
+	           regReadDmu(2, kCmGamcorControl + dpp), regReadDmu(2, kCmHdrMult + dpp), regReadDmu(2, kCmMemPwrCtrl + dpp),
+	           regReadDmu(2, kCmMemPwrStatus + dpp), regReadDmu(2, kCmDealpha + dpp));
+}
+
+void RDNA4Device::cursorDlgDump(const char *why) {
+	const uint32_t hubp = hubpOff();
+	for (uint32_t base = kDlgFirst; base <= kDlgLast; base += 9) {
+		char line[200];
+		size_t n = static_cast<size_t>(snprintf(line, sizeof(line), "%s: dlg 0x%04x:", why, base));
+		for (uint32_t r = base; r < base + 9 && r <= kDlgLast && n < sizeof(line) - 12; r++)
+			n += static_cast<size_t>(snprintf(line + n, sizeof(line) - n, " %08x", regReadDmu(2, r + hubp)));
+		cursorNote("%s", line);
+	}
+}
+
 // The pipe-level cursor fields amdgpu writes (rdna4-cursorpipe=0 skips them: the control), each with its source:
 //  - rdna4-cursorcrq=1: CRQ_EXPANSION_MODE = 1. hubp401_program_requestor writes DCN_EXPANSION_MODE (DRQ/PRQ/CRQ/MRQ)
 //    from DML for every plane (dcn401_hubp.c:293-305, dml2_core_dcn4_calcs.c:12500-12509): it is a SURFACE requestor
@@ -917,6 +994,114 @@ void RDNA4Device::cursorDsclDecide() {
 	cursorDsclDump("after the DSCL write");
 }
 
+// The OTG master update lock bracket the modeset path uses (modeset.cpp:292-300, dcn401_program_pipe): lock select,
+// lock, wait for it to be held (<= 10 ms). Returns false, with the lock released, if it was not held.
+bool RDNA4Device::cursorOtgUpdateLock(bool lock) {
+	const uint32_t otg = otgOff();
+	if (!lock) {
+		regWriteDmu(2, kOtgMasterUpdateLock + otg, regReadDmu(2, kOtgMasterUpdateLock + otg) & ~1u);
+		return true;
+	}
+	regWriteDmu(2, kOtgGlobalCtrl2 + otg, (regReadDmu(2, kOtgGlobalCtrl2 + otg) & ~(0x7u << 25)) |
+	                                      (static_cast<uint32_t>(pipe.otg) << 25));
+	regWriteDmu(2, kOtgMasterUpdateLock + otg, regReadDmu(2, kOtgMasterUpdateLock + otg) | 1u);
+	for (uint32_t waited = 0; waited < 10; waited++) {
+		if (regReadDmu(2, kOtgMasterUpdateLock + otg) & (1u << 8))
+			return true;
+		IOSleep(1);
+	}
+	if (regReadDmu(2, kOtgMasterUpdateLock + otg) & (1u << 8))
+		return true;
+	regWriteDmu(2, kOtgMasterUpdateLock + otg, regReadDmu(2, kOtgMasterUpdateLock + otg) & ~1u);
+	return false;
+}
+
+// rdna4-cursorcm=1 (with rdna4-cursor=2): DCN4 put the cursor unit inside the DPP colour-management block, and the
+// GOP leaves CM0_CM_CONTROL.CM_BYPASS = 1 where amdgpu always clears it when a plane is enabled
+// (premetal/verify-cursor.md section 2). Program the CM the way amdgpu leaves it for an SDR RGB plane without a
+// degamma, under the OTG update lock; the GOP values were logged first by cursorCmDump("selftest pre"):
+//   CM_POST_CSC_CONTROL = 0   POST_CSC_MODE bypass       (dpp3_program_post_csc, dcn30_dpp.c:118-120; RGB selects BYPASS)
+//   CM_BIAS_CR_R = CM_BIAS_Y_G_CB_B = 0                  (dpp3_program_cm_bias, dcn30_dpp_cm.c:160-170)
+//   CM_DEALPHA = 0            dealpha off                (dpp3_program_cm_dealpha, dcn30_dpp_cm.c:149-158)
+//   CM_GAMCOR_CONTROL = 0     GAMCOR_MODE bypass, whole-register REG_SET (dpp3_program_gamcor_lut, dcn30_dpp_cm.c:229-230)
+//   CM_HDR_MULT_COEF [18:0] = 0x1f000 (1.0, s6e12)       (dpp3_set_hdr_multiplier, dcn30_dpp_cm.c:308-314; dcn10_hwseq.c:3247)
+//   CM_CONTROL.CM_BYPASS = 0, LAST                       (dpp3_enable_cm_block, dcn30_dpp_cm.c:43-54, reached from
+//                                                         dpp3_program_gamcor_lut, dcn401_dpp.c:223)
+// then CM_UPDATE_PENDING (CM_CONTROL bit 8) is polled clear (<= 50 ms). Returns whether anything was written and latched.
+bool RDNA4Device::cursorCmApply() {
+	const uint32_t dpp = dppOff();
+	const uint32_t ctl = regReadDmu(2, kCmControl + dpp);
+	if (ctl == 0xffffffffu) {
+		cursorNote("CM write: CM0_CM_CONTROL reads all ones (the block is not powered): nothing written");
+		return false;
+	}
+	const bool identity = !(ctl & 1) && !(regReadDmu(2, kCmPostCscControl + dpp) & 3) &&
+	                      !regReadDmu(2, kCmBiasCrR + dpp) && !regReadDmu(2, kCmBiasYgCbB + dpp) &&
+	                      !(regReadDmu(2, kCmDealpha + dpp) & 3) && !(regReadDmu(2, kCmGamcorControl + dpp) & 3) &&
+	                      (regReadDmu(2, kCmHdrMult + dpp) & 0x7ffff) == kHdrMultOne;
+	if (identity) {
+		cursorNote("CM write: CM_BYPASS is 0 and the sub-blocks are already the identity amdgpu leaves: nothing to write");
+		return false;
+	}
+	cursorNote("CM write: CM_BYPASS was %u; programming amdgpu's SDR RGB CM state under the OTG update lock "
+	           "(GOP values in the 'selftest pre: cm:' line, restore with them if the picture breaks)", ctl & 1);
+	if (!cursorOtgUpdateLock(true)) {
+		cursorNote("CM write: the OTG update lock was not held after 10 ms; nothing written");
+		return false;
+	}
+	regWriteDmu(2, kCmPostCscControl + dpp, 0);
+	regWriteDmu(2, kCmBiasCrR + dpp, 0);
+	regWriteDmu(2, kCmBiasYgCbB + dpp, 0);
+	regWriteDmu(2, kCmDealpha + dpp, 0);
+	regWriteDmu(2, kCmGamcorControl + dpp, 0);
+	regWriteDmu(2, kCmHdrMult + dpp, (regReadDmu(2, kCmHdrMult + dpp) & ~0x7ffffu) | kHdrMultOne);
+	regWriteDmu(2, kCmControl + dpp, regReadDmu(2, kCmControl + dpp) & ~1u);   // CM_BYPASS = 0, last
+	cursorOtgUpdateLock(false);
+	uint32_t pend = 0;
+	while (pend < 50 && (regReadDmu(2, kCmControl + dpp) & (1u << 8))) {
+		IOSleep(1);
+		pend++;
+	}
+	const bool stuck = (regReadDmu(2, kCmControl + dpp) & (1u << 8)) != 0;
+	cursorNote("CM written; CM_UPDATE_PENDING %s after %u ms; CM_CONTROL now 0x%08x", stuck ? "STILL SET" : "cleared", pend,
+	           regReadDmu(2, kCmControl + dpp));
+	cursorCmDump("after the CM write");
+	return true;
+}
+
+// rdna4-cursormpcc=1 (with rdna4-cursor=2): the Linux capture has MPCC0_MPCC_CONTROL = 0xffff0422, the card's GOP leaves 0xffff0461:
+// MPCC_MODE 1 (TOP_LAYER_PASSTHROUGH, the state mpc1_remove_mpcc_from_tree leaves, dcn10_mpc.c:309) against 2 (TOP_LAYER_ONLY,
+// what mpc1_insert_plane programs for a plane with no bottom layer, dcn10_mpc.c:216), and MPCC_ALPHA_MULTIPLIED_MODE 1 against 0
+// (mpc1_update_blending writes it from blnd_cfg->pre_multiplied_alpha, dcn10_mpc.c:84-90). Only those two fields are written
+// (RMW), under the OTG update lock, and only if the MPCC has no bottom layer.
+bool RDNA4Device::cursorMpccApply() {
+	constexpr uint32_t kModeMask = 3u, kAlphaMult = 1u << 6;
+	const uint32_t mpcc = pipe.hubp < Pipe::kMaxOtg ? pipe.hubp * kMpccStride : 0;
+	const uint32_t ctl = regReadDmu(3, kMpccControl + mpcc), bot = regReadDmu(3, kMpccBotSel + mpcc) & 0xf;
+	if (ctl == 0xffffffffu) {
+		cursorNote("MPCC write: MPCC_CONTROL reads all ones: nothing written");
+		return false;
+	}
+	if (bot != 0xf) {
+		cursorNote("MPCC write: MPCC%u has a bottom layer (BOT_SEL %u): nothing written", pipe.hubp, bot);
+		return false;
+	}
+	if ((ctl & kModeMask) == 2 && !(ctl & kAlphaMult)) {
+		cursorNote("MPCC write: MPCC_CONTROL 0x%08x is already TOP_LAYER_ONLY, ALPHA_MULTIPLIED 0: nothing to write", ctl);
+		return false;
+	}
+	cursorNote("MPCC write: MPCC_CONTROL was 0x%08x (MODE %u, ALPHA_MULTIPLIED %u); setting MODE 2 (TOP_LAYER_ONLY), "
+	           "ALPHA_MULTIPLIED 0 as amdgpu does (Linux reads 0xffff0422)", ctl, ctl & kModeMask, (ctl >> 6) & 1);
+	if (!cursorOtgUpdateLock(true)) {
+		cursorNote("MPCC write: the OTG update lock was not held after 10 ms; nothing written");
+		return false;
+	}
+	regWriteDmu(3, kMpccControl + mpcc, (ctl & ~(kModeMask | kAlphaMult)) | 2u);
+	cursorOtgUpdateLock(false);
+	cursorNote("MPCC written; MPCC_CONTROL now 0x%08x", regReadDmu(3, kMpccControl + mpcc));
+	return true;
+}
+
 // Frames of the OTG (OTG_STATUS_FRAME_COUNT 0x1b4d [23:0]); bounded, 40 ms per frame.
 bool RDNA4Device::cursorWaitFrames(uint32_t n) {
 	const uint32_t reg = kOtgFrameCount + otgOff();
@@ -948,7 +1133,7 @@ bool RDNA4Device::cursorWaitFrames(uint32_t n) {
 //   NO   = on0 equals both off reads (the sprite adds nothing at the OTG)
 //   else INCONCLUSIVE. With a static desktop this is the plain A/B rule.
 // Each DATA_RG/DATA_B sample is read twice and repeated (<= 3 tries) until both agree, against a pair torn across a frame.
-void RDNA4Device::cursorCrcCheck() {
+const char *RDNA4Device::cursorCrcCheck(const char *label) {
 	const uint32_t otg = otgOff();
 	constexpr uint32_t kCrcMargin = 4;
 	const uint32_t x0 = 100 + kCrcMargin, x1 = 100 + kCursorWidth - kCrcMargin;
@@ -966,8 +1151,8 @@ void RDNA4Device::cursorCrcCheck() {
 	           regReadDmu(2, kOtgCrcWindowAX + otg), regReadDmu(2, kOtgCrcWindowAY + otg),
 	           regReadDmu(2, kOtgCrcWindowBX + otg), regReadDmu(2, kOtgCrcWindowBY + otg), x, y);
 	if (!(regReadDmu(2, kOtgCrcCntl + otg) & 1)) {
-		cursorNote("CRC A/B: OTG_CRC_CNTL.EN did not stick: no verdict");
-		return;
+		cursorNote("CRC A/B [%s]: OTG_CRC_CNTL.EN did not stick: no verdict", label);
+		return "INCONCLUSIVE";
 	}
 	struct Crc { uint32_t rg, b; } c[4];
 	bool frames = true;
@@ -1007,11 +1192,12 @@ void RDNA4Device::cursorCrcCheck() {
 		verdict = "INCONCLUSIVE (the two 'on' reads differ: the window is not covered by the square)";
 	else
 		verdict = "INCONCLUSIVE (one 'off' read equals 'on', the other does not)";
-	cursorNote("CRC A/B window (%u,%u)..(%u,%u) R.G/B: on %04x.%04x/%04x off %04x.%04x/%04x on %04x.%04x/%04x "
-	           "off %04x.%04x/%04x torn %u (optc1_configure_crc dcn10_optc.c:1465): cursor pixels reach the output: %s",
-	           x0, y0, x1, y1,
+	cursorNote("CRC A/B [%s] (%u,%u)..(%u,%u) R.G/B: on %04x.%04x/%04x off %04x.%04x/%04x on %04x.%04x/%04x "
+	           "off %04x.%04x/%04x torn %u: cursor pixels reach the output: %s",
+	           label, x0, y0, x1, y1,
 	           c[0].rg & 0xffff, c[0].rg >> 16, c[0].b, c[1].rg & 0xffff, c[1].rg >> 16, c[1].b,
 	           c[2].rg & 0xffff, c[2].rg >> 16, c[2].b, c[3].rg & 0xffff, c[3].rg >> 16, c[3].b, torn, verdict);
+	return verdict[0] == 'Y' ? "YES" : verdict[0] == 'N' ? "NO" : "INCONCLUSIVE";
 }
 
 // rdna4-cursor=2: at arming, show an opaque magenta 64x64 square at (100,100)
@@ -1025,6 +1211,9 @@ void RDNA4Device::cursorSelfTest() {
 	// One lock bracket around position and attributes: they latch together at the unlock, so
 	// the square is never armed at (0,0) (the order inside a bracket does not matter).
 	cursorDsclDump("selftest pre");   // W38: what the GOP left in the DSCL / HUBP request state, before any write
+	cursorCmDump("selftest pre");     // W40: CM0_CM_CONTROL.CM_BYPASS and the CM sub-blocks the GOP left
+	cursorDlgDump("selftest pre");    // W40: the DLG/TTU registers 0x063b-0x0655
+	cursorLinuxDiff("pre");           // W40: everything static in the pipe that differs from the Linux capture, before any write
 	cursorPipeFixes();                // W38: CRQ_EXPANSION_MODE, cursor memory power, USE_MALL_FOR_CURSOR per update
 	cursorDsclDecide();               // W38: DSCL_MODE / RECOUT / MPC_SIZE verdict (+ amdgpu's mode-0 set with rdna4-cursordscl=1)
 	cursorProgramMissionMode();   // W34: amdgpu's HUBPREQ_DEBUG_DB = 1 << 8, before the cursor is enabled
@@ -1042,7 +1231,33 @@ void RDNA4Device::cursorSelfTest() {
 	hwCursorSet = true;
 	cursorRegProbe("selftest");
 	cursorDsclDump("selftest post");
-	cursorCrcCheck();   // W38: does the square reach the OTG? decided by the OTG CRC with the cursor on/off/on/off
+	// W38: does the square reach the OTG? decided by the OTG CRC with the cursor on/off/on/off
+	const char *before = cursorCrcCheck("GOP CM state");
+	const char *last = before;
+	uint32_t cm = 0;
+	if (PE_parse_boot_argn("rdna4-cursorcm", &cm, sizeof(cm)) && cm == 1) {
+		// W40: the same boot attributes the CM change: CRC before (above) and after
+		if (cursorCmApply()) {
+			const char *after = cursorCrcCheck("after CM enable");
+			cursorNote("CM bypass: before %s, after %s", before, after);
+			last = after;
+		} else {
+			cursorNote("CM bypass: before %s, after not run (CM state unchanged)", before);
+		}
+	} else {
+		cursorNote("CM bypass: not changed (rdna4-cursorcm=1 clears CM_BYPASS and sets the CM identity as amdgpu does); "
+		           "CRC %s", before);
+	}
+	uint32_t mp = 0;
+	if (PE_parse_boot_argn("rdna4-cursormpcc", &mp, sizeof(mp)) && mp == 1) {
+		if (cursorMpccApply()) {
+			const char *after = cursorCrcCheck("after MPCC mode");
+			cursorNote("MPCC mode: before %s, after %s", last, after);
+		} else {
+			cursorNote("MPCC mode: before %s, after not run (MPCC state unchanged)", last);
+		}
+	}
+	cursorLinuxDiff("end");   // W40: what still differs from the Linux capture after the writes above
 }
 
 // One line of everything that decides whether the plane shows: the HUBP

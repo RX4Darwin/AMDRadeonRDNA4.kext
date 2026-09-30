@@ -625,6 +625,7 @@ struct RDNA4State {
     uint64_t pstat[14];      /* SAMPLE_PIPELINESTAT counters (si_query.c order: PS, C_PRIM, C_INV, VS, GS_INV, GS_PRIM, IA_PRIM, IA_VERT, ...) */
     bool     gop_dlg;        /* the GOP left the HUBP DLG/TTU registers programmed (DCN_SURF0_TTU_CNTL0 delivery non-zero) */
     bool     cursor_lock_stuck; /* the GOP left the MPC cursor lock (CUR_VUPDATE_LOCK_SET0) held */
+    bool     cm_bypass;     /* the GOP left CM0_CM_CONTROL.CM_BYPASS = 1 (register state only: the model has no CM) */
     uint32_t dscl_mode;     /* dscl-mode=N (1..7): the GOP left DSCL0_SCL_MODE.DSCL_MODE = N (0 = as gop-state) */
     bool     desktop_churn; /* the pixels under the OTG CRC window change every frame (a scrolling verbose console) */
     bool     cursor_reject_logged;
@@ -6964,6 +6965,8 @@ static void rdna4_reset(DeviceState *dev)
         rdna4_ctx_poison(s);
     if (s->cursor_lock_stuck)
         reg_set(s, SEG3(0x02c5), 1);
+    if (s->cm_bypass)     /* CM0_CM_CONTROL 0x0d67, as the card logs it ("cm ctl=0x00000001") */
+        reg_set(s, SEG2(0x0d67), 1);
     if (s->dscl_mode) {   /* DSCL0_SCL_MODE 0x0d08, RECOUT_SIZE 0x0d1f, MPC_SIZE 0x0d20 */
         reg_set(s, SEG2(0x0d08), s->dscl_mode & 7);
         if ((s->dscl_mode & 7) == 6) {              /* full bypass: the GOP never wrote the scaler's rectangles */
@@ -7215,6 +7218,7 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("cursor", RDNA4State, cursor_enabled, false),
     DEFINE_PROP_BOOL("cursor-lock-stuck", RDNA4State, cursor_lock_stuck, false),
     DEFINE_PROP_UINT32("dscl-mode", RDNA4State, dscl_mode, 0),
+    DEFINE_PROP_BOOL("cm-bypass", RDNA4State, cm_bypass, false),
     DEFINE_PROP_BOOL("desktop-churn", RDNA4State, desktop_churn, false),
     DEFINE_PROP_BOOL("gop-dlg", RDNA4State, gop_dlg, false),
     DEFINE_PROP_BOOL("ctx-garbage", RDNA4State, ctx_garbage, false),
