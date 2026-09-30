@@ -1,7 +1,7 @@
 #!/bin/bash
 # Set the boot-args for one boot of docs/real-card-plan.md on the OpenCore USB.
 #
-#   bash /Volumes/OPENCORE/set-boot.sh <0-5>
+#   bash /Volumes/OPENCORE/set-boot.sh <0-6>
 #
 #   Round 5 plan (D23): every test boot runs on the PROVEN base, rdna4-ih=2 rdna4-flip=1 rdna4-hang=1
 #   (interrupts, vblank + page flips, queue recovery; clock gating is on by default since W29).
@@ -9,8 +9,9 @@
 #
 #   0  known-good arguments (no new feature enabled): the way back
 #   1  the proven base: also the setting for daily use
-#   2  base + per-app GPU memory ladder   rdna4-vm=1 rdna4-vm-diag=4065 (F default page, E4, control, o, V, d/e/g/T)
-#   3  base + first triangle with the CP-side probe   rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11
+#   2  base + per-app GPU memory (W36 IS_PTE fix; ladder only if the baseline still fails)   rdna4-vm=1 rdna4-vm-diag=4065
+#   3  base + first triangle (W37: RLC SRM enable + clear-state replay) with the CP-side probe   rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11
+#   6  boot 3 with SRM only, no replay (amdgpu-exact; attributes the fix)   ... rdna4-gfxcsb=0
 #   4  base + cursor self-test: magenta 64x64 square at (100,100)   rdna4-vbl=1 rdna4-cursor=2 rdna4-cursordscl=1 (CRC self-check, DSCL fix only if the GOP left bypass)
 #   5  base + GFXOFF (optional, ALWAYS LAST, then power off)   rdna4-gfxpm=24 rdna4-gfxoff=1
 #
@@ -25,7 +26,8 @@ case "${1:-}" in
 	3) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11" ;;
 	4) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-cursordscl=1" ;;
 	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-gfxpm=24 rdna4-gfxoff=1" ;;
-	*) echo "usage: bash $0 <0-5>   (see docs/real-card-plan.md)"; exit 1 ;;
+	6) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11 rdna4-gfxcsb=0" ;;
+	*) echo "usage: bash $0 <0-6>   (see docs/real-card-plan.md)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"
