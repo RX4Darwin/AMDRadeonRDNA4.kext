@@ -157,6 +157,10 @@ int main(int argc, char **argv) {
 	};
 	VkPipeline pipe;
 	CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, NULL, &pipe));
+	if (getenv("TRI_COMPILE_ONLY")) {   // shaders dumped (RADV_DEBUG=shaders), nothing submitted to the GPU
+		printf("compile only: pipeline created, nothing submitted\n");
+		return 0;
+	}
 
 	// Pipeline statistics, the same counters the kext reads.
 	VkQueryPoolCreateInfo qpci = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_PIPELINE_STATISTICS, 1,

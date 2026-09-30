@@ -1,5 +1,12 @@
 # The first triangle drawn by RADV on this card: what the kext does differently
 
+> **Update 2026-09-30 04:20: the export-order hypothesis below is DISPROVEN on the card.** RADV patched to
+> export the primitive first (the kext's old order; `tools/radv-triangle/mesa-26.2.2-force-early-prim.patch`,
+> `RADV_FORCE_EARLY_PRIM=1`) still draws 8192 px with C_PRIMITIVES > 0 on this RX 9070 XT. Mesa's late
+> primitive export is a choice, not a hardware rule. The reordered kext shaders are harmless (Mesa's order)
+> but do not fix the triangle. The "second tier" table is still open, and the next test is replaying the
+> kext's own stream through amdgpu on Linux.
+
 Linux side of the handoff (`docs/HANDOFF-linux.md`, "what we need from Linux"), 2026-09-30, on the same PC
 (RX 9070 XT, Arch Linux 7.2.2, Mesa 26.2.2, linux-firmware 20260810). No root needed.
 
@@ -22,7 +29,7 @@ kext's configuration: `VGT_SHADER_STAGES_EN.PRIMGEN_PASSTHRU_NO_MSG=1`, `GE_CNTL
 `GE_NGG_SUBGRP_CNTL 1`, `GE_MAX_OUTPUT_PER_SUBGROUP 0x80`, `SPI_SHADER_IDX_FORMAT 1`,
 `SPI_SHADER_POS_FORMAT 4`, `VGT_PRIMITIVE_TYPE 4`, `VGT_GS_OUT_PRIM_TYPE 2`, the same as `gfx12_draw.h`.
 
-## The difference: the primitive export comes LAST on gfx11+
+## The difference: the primitive export comes LAST on gfx11+ (disproven as the cause, see top)
 
 RADV's NGG shader for this triangle (ACO, gfx1201):
 
@@ -48,7 +55,7 @@ opposite: **prim export first, position export after**. Mesa never emits that or
     radv_shader_info.c:  has_ngg_early_prim_export = gfx_level < GFX11 && exec_list_is_singular(...)
     ac_nir_lower_ngg.c:  if (!state.early_prim_export) { ... late primitive export at the end of the shader }
 
-This fits the card's numbers: the primitive reaches the clipper (C_INVOCATIONS 1) and is dropped with no
+It seemed to fit the card's numbers: the primitive reaches the clipper (C_INVOCATIONS 1) and is dropped with no
 position data behind it (C_PRIMITIVES 0). It is also the one thing every ladder variant shared, which
 explains why no register experiment (CLIP_DISABLE, prim filters, ring hints) could move it.
 

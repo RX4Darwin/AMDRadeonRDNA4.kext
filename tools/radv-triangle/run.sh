@@ -24,3 +24,7 @@ for v in default nonggc; do
 	head -3 "$OUT/$v/run.txt"
 done
 echo "results in $OUT"
+# Hypothesis tests without rebooting: build Mesa 26.2.2 RADV with
+# mesa-26.2.2-force-early-prim.patch (meson -Dvulkan-drivers=amd -Dllvm=disabled ...),
+# point VK_ICD_FILENAMES at it and run with RADV_FORCE_EARLY_PRIM=1. TRI_COMPILE_ONLY=1
+# only compiles (dumps the ISA) without submitting anything to the GPU.
