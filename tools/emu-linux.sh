@@ -50,12 +50,12 @@ while [ $# -gt 0 ]; do
 		--diag) DIAG=1 ;;
 		--no-build) BUILD=0 ;;
 		-h|--help) sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
-		[0-9]) BOOT=$1 ;;
+		[0-9]*) BOOT=$1 ;;   # a boot of set-boot.sh: 0-13, 9b ...
 		*) echo "unknown argument: $1 (try -h)" >&2; exit 2 ;;
 	esac
 	shift
 done
-[ -n "$BOOT" ] || [ -n "$ARGS" ] || { echo "usage: $0 <0-9> [options] (try -h)" >&2; exit 2; }
+[ -n "$BOOT" ] || [ -n "$ARGS" ] || { echo "usage: $0 <boot> [options] (try -h)" >&2; exit 2; }
 
 for f in "$QEMU_BIN" "$HERE/build-emu/rdna4.rom" "$KEXT/Contents/MacOS/RDNA4FB" \
 	"$LILU/Contents/Info.plist" "$BASE_IMG" "$OSXKVM/OpenCore/OpenCore.qcow2" "$EMU/local/bin/mcopy"; do
