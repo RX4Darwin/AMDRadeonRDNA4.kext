@@ -886,7 +886,9 @@ void RDNA4Compute::gfxDumpVa0(const char *tag) {
 // offsets si_query_pipestat_dw_offset: PS_INVOCATIONS 0, C_PRIMITIVES 2, C_INVOCATIONS 4, VS 6, GS_INV 8, GS_PRIM 10,
 // IA_PRIMITIVES 12, IA_VERTICES 14). Reading it: IA = 0: the GE dropped the draw; IA > 0 and C_INV = 0: the NGG /
 // export path; C_INV > 0 and C_PRIM = 0: clip or cull; C_PRIM > 0 and PS = 0: SC / scissor / raster state (#1);
-// PS > 0: pixel shaders ran.
+// PS > 0: pixel shaders ran. C_PRIMITIVES is supporting evidence only: on the card a good triangle reads 4, the old s_and_saveexec
+// shader read 0 in 3/3 runs, but one failing draw (wave64, VGPRS 0, 0 px) read 0, 0, 4, 0, 0, 8 in six runs. The signal is PS_INVOCATIONS
+// and the pixels; the "where" line below names a stage from the counters, it does not prove it.
 void RDNA4Compute::gfxPstatReport(const char *label) {
 	auto q = [&](uint32_t base, uint32_t idx, bool &written) {
 		const uint32_t lo = *poolDw(base + 8 * idx), hi = *poolDw(base + 8 * idx + 4);
@@ -925,8 +927,8 @@ void RDNA4Compute::gfxPstatReport(const char *label) {
 	const char *where = !allWritten ? "the SAMPLE_PIPELINESTAT events wrote nothing (counters unavailable on this path)"
 	                  : (!iaVert && !iaPrim) ? "IA = 0: the GE dropped the draw (queue mode / VA 0, #2)"
 	                  : !cinv ? "IA > 0 but C_INVOCATIONS = 0: lost in the NGG / export path (#4, #3)"
-	                  : !cprim ? "C_INVOCATIONS > 0 but C_PRIMITIVES = 0: clipped or culled (context state, #1)"
-	                  : !ps ? "C_PRIMITIVES > 0 but PS_INVOCATIONS = 0: lost between the clipper and the pixel shader (SC / raster state, #1)"
+	                  : !cprim ? "C_INVOCATIONS > 0 but C_PRIMITIVES 0 (not reliable alone: check PS_INVOCATIONS and the pixels): maybe clipped or culled (context state, #1)"
+	                  : !ps ? "C_PRIMITIVES > 0 but PS_INVOCATIONS = 0 (C_PRIMITIVES is not reliable alone): maybe lost between the clipper and the pixel shader (SC / raster state, #1)"
 	                  : "pixel shaders ran";
 	GLOG("%s: pipeline statistics say: %s%s", label, where, any ? "" : " (all deltas 0)");
 }
@@ -998,7 +1000,8 @@ void RDNA4Compute::gfxLinuxDiff(const char *tag) {
 
 // ---------------------------------------------------------------------------
 // W45: the clip / cull / viewport / scissor state of the first draw (round 5 boot 3 on the card: IA_PRIMITIVES 1, VS_INVOCATIONS 3,
-// C_INVOCATIONS 1, C_PRIMITIVES 0, PS_INVOCATIONS 0, the NGG wave ran: the primitive is dropped in the clipper / primitive assembly).
+// C_INVOCATIONS 1, C_PRIMITIVES 0, PS_INVOCATIONS 0, the NGG wave ran: the primitive is lost at or after the clipper; the root cause turned out to
+// be the shader's EXEC, docs/linux-replay.md. C_PRIMITIVES alone is not a reliable signature, PS_INVOCATIONS and the pixels are).
 // ---------------------------------------------------------------------------
 
 // rdna4-gfxsane=0 leaves the explicit "sane clip state" block out (the A/B control).
@@ -1365,7 +1368,7 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		place(kGfxVsOffset, kNggvgprKernel, sizeof(kNggvgprKernel) / 4);
 	else if (variant & 1024)   // W46: the NGG shader that takes nothing from its VGPR inputs (constant primitive, lane-id vertices)
 		place(kGfxVsOffset, kNggconstKernel, sizeof(kNggconstKernel) / 4);
-	else if (variant & 4096)   // the wave64 fallback: ngg.s as a wave64 NGG shader, the way RADV draws this triangle
+	else if (variant & 4096)   // the wave64 fallback: ngg.s as a wave64 NGG shader, the way RADV runs its NGG (GS) stage (PS stays wave32)
 		place(kGfxVsOffset, kNgg64Kernel, sizeof(kNgg64Kernel) / 4);
 	else
 		place(kGfxVsOffset, kNggKernel, sizeof(kNggKernel) / 4);
@@ -1432,6 +1435,8 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 			     label, oldHdr, ib[at - 2], oldOff, ib[at - 1]);
 		}
 	}
+	// The variant bits are applied one per draw (the ladder runs a single bit at a time): 4096 must not be combined with the wave32
+	// marker shaders (32 / 512 / 1024), whose VGPRS=1 patch it would overwrite with 2 while clearing GS_W32_EN.
 	if (variant & (32 | 512 | 1024))   // the marker shader uses v8/v9: 10 VGPRs = 2 granules of 8 (VGPRS field = granules - 1)
 		patch(kOpSetShReg, 0x1a2a - kShBase, 0x0000003f, 1, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=1");
 
@@ -1526,6 +1531,8 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		     r.nggS2, r.nggS3);
 	}
 	if (variant & 512) {   // W45: what the NGG wave got (v0, v3) and computed (x, y), lane by lane
+		// Only lane 0 holds the packed primitive in v0 (0x040a0300 on the card); v0 of lanes 1-3 is whatever those lanes hold (garbage by
+		// design, the wave has one primitive). x/y are stored under the 3-lane position exec, so lane 3 of x/y is the cleared slot (stale).
 		uint32_t v0[4], v3[4], px[4], py[4];
 		for (uint32_t l = 0; l < 4; l++) {
 			v0[l] = *poolDw(kGfxVgprOffset + 4 * l);
@@ -1705,11 +1712,12 @@ bool RDNA4Compute::stageGfxDraw() {
 		// no reset (W23 review S3), so boot 12 runs it alone (rdna4-gfxdiag=4). After a "hang/"
 		// result the next boot needs a cold power cycle: the GC state survives a warm restart.
 		// W45: the clip variants (128 clip off, 256 primitive filters off) and the NGG inputs (512) right after the marker: round 5 showed the
-		// primitive reaches the clipper (C_INVOCATIONS 1) and is dropped there (C_PRIMITIVES 0).
-		// W46: round 6 on the card: cprim stays 0 with CLIP_DISABLE (128) and the filters off (256), so the two new variants come first: 1024 takes
+		// primitive reaches the clipper (C_INVOCATIONS 1) and C_PRIMITIVES reads 0 (supporting evidence only: pixels and PS_INVOCATIONS are the signal).
+		// W46: round 6 on the card: cprim read 0 with CLIP_DISABLE (128) and the filters off (256) as well, so the two new variants come first: 1024 takes
 		// nothing from the wave's VGPR inputs, 2048 removes the GE ring's GL2 hints.
-		// The wave64 fallback (4096) right after the marker: it is RADV's configuration for this draw and the other wave size, proven
-		// on the card under Linux; if the wave32 baseline is empty on macOS but 4096 draws, the difference is the wave size there.
+		// The wave64 fallback (4096) right after the marker: RADV's NGG (GS) half for this draw, the other wave size (RADV also runs the PS as
+		// wave64, PS_W32_EN = 0; 4096 keeps the PS wave32), proven on the card under Linux; if the wave32 baseline is empty on macOS but 4096
+		// draws, the difference is the GS wave size there.
 		static const uint32_t order[12] = { 32, 4096, 1024, 2048, 512, 128, 256, 64, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
 		for (uint32_t bit : order) {
 			if (!(diag & bit))

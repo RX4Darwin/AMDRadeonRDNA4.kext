@@ -60,7 +60,7 @@ This encodes the round-4 hypothesis (like `gfx-golden-strict`): a pass says the 
 | triangle drawn (8192 px) with SRM + replay | fixed; run the control (`rdna4-gfxsrm=0 rdna4-gfxcsb=0`) on the next boot to attribute it |
 | still 0 px; `pipeline statistics say: IA = 0` | the GE never got the draw: #2 (queue, VA 0); read the VA-0 dump and the queue lines |
 | `IA > 0` and `C_INVOCATIONS = 0`, marker `NOT written` | the NGG wave did not run or its primitive never reached the clipper: #4/#3 |
-| `C_INVOCATIONS > 0`, `C_PRIMITIVES = 0` | clipped or culled: context state, look at the non-zero context registers |
+| `C_INVOCATIONS > 0`, `C_PRIMITIVES = 0` | maybe clipped or culled (context state, look at the non-zero context registers); C_PRIMITIVES is not reliable alone, check PS_INVOCATIONS and the pixels |
 | `C_PRIMITIVES > 0`, `PS_INVOCATIONS = 0` | between the clipper and the pixel shader: SC/raster state, garbage registers |
 | `VA 0 page: N dwords non-zero` | the CPG wrote there; the dwords fingerprint the structure |
 
