@@ -10,6 +10,10 @@
 #   --extra "ARGS"  more boot-args after the table's (e.g. "rdna4-gfxcol=0")
 #   --args "ARGS"   replace the table: use exactly these boot-args
 #   --dev OPTS      rdna4 device options, e.g. trace=on or ih-dead=on
+#   --diag          after the kext is done, open the Recovery Terminal (Cmd+Shift+T) and
+#                   run tools/diagnostic-log.sh with build/rdna4-run from a read-only
+#                   FAT disk, as the user does on the stick; its feature table and full
+#                   log come back over the serial console (diag-summary.txt, diag.txt)
 #   --keep          leave the VM running afterwards (monitor socket in the run dir)
 #   --no-build      reuse the OpenCore image of the previous run of this boot
 #   -h              this text
@@ -34,7 +38,7 @@ LILU=${LILU:-$EMU/kexts/Lilu.kext}
 BASE_IMG=${BASE_IMG:-$EMU/images/BaseSystem.img}
 export PATH="$QEMU_SRC/build:$EMU/local/bin:$PATH"   # qemu-img, mcopy/mdeltree
 
-WAIT=420 EXTRA="" ARGS="" DEV="" KEEP=0 BUILD=1 BOOT=""
+WAIT=420 EXTRA="" ARGS="" DEV="" KEEP=0 BUILD=1 BOOT="" DIAG=0
 while [ $# -gt 0 ]; do
 	case $1 in
 		--wait) WAIT=$2; shift ;;
@@ -42,6 +46,7 @@ while [ $# -gt 0 ]; do
 		--args) ARGS=$2; shift ;;
 		--dev) DEV=$2; shift ;;
 		--keep) KEEP=1 ;;
+		--diag) DIAG=1 ;;
 		--no-build) BUILD=0 ;;
 		-h|--help) sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
 		[0-7]) BOOT=$1 ;;
@@ -90,6 +95,20 @@ QPAT="^$QEMU_SRC/build/qemu-system-x86_64 "
 pkill -f "$QPAT" 2>/dev/null || true   # never two VMs at once
 for i in $(seq 1 20); do pgrep -f "$QPAT" >/dev/null || break; sleep 0.5; done
 cp "$OSXKVM/OVMF_VARS-1920x1080.fd" "$RUN/vars.fd"
+if [ "$DIAG" = 1 ]; then
+	[ -f "$HERE/build/rdna4-run" ] || { echo "emu-linux: --diag needs build/rdna4-run (tools/build-osxcross.sh)" >&2; exit 1; }
+	mkdir -p "$RUN/share"
+	cp "$HERE/tools/diagnostic-log.sh" "$HERE/build/rdna4-run" "$RUN/share/"
+	# Run from /tmp (the disk is read-only) and hand the output to the serial console.
+	cat > "$RUN/share/run-diag.sh" <<'GUEST'
+cp /Volumes/QEMU*/diagnostic-log.sh /Volumes/QEMU*/rdna4-run /tmp/ && cd /tmp || exit 1
+echo RDNA4DIAG-RUNNING > /dev/console
+bash ./diagnostic-log.sh > /tmp/diag.out 2>&1
+(echo RDNA4DIAG-BEGIN; cat /tmp/diag.out; echo RDNA4DIAG-FULL; cat /tmp/rdna4fb-diag-*.txt; echo RDNA4DIAG-END) |
+	sed 's/^/RDNA4DIAG|/' > /dev/console
+GUEST
+	export EXTRA_QEMU="${EXTRA_QEMU:-} -drive id=share,if=none,format=raw,readonly=on,file=fat:ro:$RUN/share -device usb-storage,bus=xhci.0,drive=share"
+fi
 : > "$SERIAL"
 OC_IMAGE=$OCIMG RAM_MB=${RAM_MB:-8192} MONITOR=$MON SERIAL_LOG=$SERIAL BASE_IMG=$BASE_IMG MACHDD=none \
 	OVMF_CODE=$OSXKVM/OVMF_CODE_4M.fd OVMF_VARS=$RUN/vars.fd VNC_DISPLAY=${VNC_DISPLAY:-0} \
@@ -149,16 +168,38 @@ while [ $(( $(date +%s) - START )) -lt "$WAIT" ]; do
 	[ -n "$DONE_AT" ] && [ $(( $(date +%s) - DONE_AT )) -ge "${GRACE_S:-45}" ] && break
 done
 [ "$REC" = 1 ] || say "Recovery NOT reached"
+if [ "$DIAG" = 1 ] && [ "$REC" = 1 ]; then
+	mon "sendkey meta_l-shift-t"
+	sleep 5
+	shot terminal
+	python3 "$HERE/tools/emu-type.py" "$MON" 'bash /Volumes/QEMU*/run-diag.sh\n'
+	D0=$(date +%s)
+	while [ $(( $(date +%s) - D0 )) -lt "${DIAG_WAIT:-900}" ]; do
+		sleep 3
+		grep -aq "RDNA4DIAG|RDNA4DIAG-END" "$SERIAL" && break
+		grep -aqiE 'panic\(cpu' "$SERIAL" && { say "GUEST PANIC during the diagnostic"; break; }
+	done
+	sleep 2
+	shot diag
+	if grep -aq "RDNA4DIAG|RDNA4DIAG-END" "$SERIAL"; then
+		say "diagnostic finished after $(( $(date +%s) - D0 )) s"
+		sed -n 's/^.*RDNA4DIAG|//p' "$SERIAL" | tr -d '\r' > "$RUN/diag.txt"
+		sed -n '/^RDNA4DIAG-BEGIN/,/^RDNA4DIAG-FULL/p' "$RUN/diag.txt" | sed '1d;$d' > "$RUN/diag-summary.txt"
+		{ echo "== diagnostic-log.sh summary (guest)"; sed -n '/^Feature summary:/,/^Key log sections/p' "$RUN/diag-summary.txt"; } | tee -a "$RUN/summary.txt"
+	else
+		say "the diagnostic did not finish in ${DIAG_WAIT:-900} s (see screen-diag.png)"
+	fi
+fi
 LAST=$(stat -c %s "$SERIAL")
 say "kernel log ${LAST} bytes after $(( $(date +%s) - START )) s"
 shot final
-grep -a "RDNA4FB" "$SERIAL" > "$RUN/rdna4fb.log" || true
+grep -a "RDNA4FB" "$SERIAL" | grep -av "RDNA4DIAG|" > "$RUN/rdna4fb.log" || true
 say "$(wc -l < "$RUN/rdna4fb.log") RDNA4FB lines -> $RUN/rdna4fb.log"
 # The headline results the kext itself prints (user-space rows such as "vm PASS"
 # come from diagnostic-log.sh, not from the kernel log).
 {
 	echo "== verdicts from the kernel log"
-	grep -aE "compute: bring-up finished|runtime: user-space runtime up|THE TRIANGLE IS RIGHT|gfx: draw: .*(EMPTY|wrong|empty)|gfx: col: (wrong|THE|target still)|ih: (self-test totals|page flip|vblank)" "$SERIAL" |
+	grep -aE "compute: bring-up finished|runtime: user-space runtime up|THE TRIANGLE IS RIGHT|gfx: draw: .*(EMPTY|wrong|empty)|gfx: col: (wrong|THE|target still)|ih: (self-test totals|page flip|vblank self-test passed)" "$RUN/rdna4fb.log" |
 		sed 's/^.*RDNA4FB: /RDNA4FB: /' | cut -c1-230 | awk '!seen[$0]++'
 } | tee -a "$RUN/summary.txt"
 echo "$RUN"

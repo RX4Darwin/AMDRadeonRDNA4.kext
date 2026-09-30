@@ -15,7 +15,7 @@
 # sets them for the Linux dry run): OVMF_CODE, OVMF_VARS (writable copy, made from
 # OVMF_VARS_SRC if absent), BASE_IMG (Recovery disk), MACHDD (set to "none" to
 # leave the macOS disk out), MONITOR (QEMU monitor socket), SERIAL_LOG, VNC_DISPLAY
-# (default 0 = 127.0.0.1:5900).
+# (default 0 = 127.0.0.1:5900), EXTRA_QEMU (more QEMU arguments, word-split).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -79,6 +79,9 @@ args=(
 if [ "$MACHDD" != none ]; then
 	args+=(-drive id=MacHDD,if=none,file="$MACHDD",format=qcow2 -device ide-hd,bus=sata.4,drive=MacHDD)
 fi
+
+# shellcheck disable=SC2206
+args+=(${EXTRA_QEMU:-})
 
 rm -f "$MONITOR"
 exec "$QEMU" -L "$QEMU_SRC/pc-bios" "${args[@]}"
