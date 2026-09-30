@@ -38,29 +38,77 @@
 
 #include <IOKit/IOLib.h>
 
-#define VLOG(fmt, ...) IOLog("RDNA4FB: vmidtest: " fmt "\n", ## __VA_ARGS__)
+static const char *gVtPhase = "";     // "" for the early probes, " late" for the ones repeated after clock gating
+#define VLOG(fmt, ...) IOLog("RDNA4FB: vmidtest%s: " fmt "\n", gVtPhase, ## __VA_ARGS__)
 
 using namespace GfxReg;
 
 // rdna4-vmid-test is a mask: 1 = the probes (vmIdTest), 2 = engine/HQD surveys at the points of the normal flow (vmIdSurvey),
-// 4 = a bounded trace of the client operations (vmOpTrace). The boot plan uses 7.
+// 4 = a bounded trace of the client operations (vmOpTrace), 8 = the late probes after clock gating (vmIdTest(true)). The boot plan uses 15.
 uint32_t RDNA4Compute::vmIdTestMask() {
 	uint32_t v = 0;
-	return PE_parse_boot_argn("rdna4-vmid-test", &v, sizeof(v)) ? v & 7 : 0;
+	return PE_parse_boot_argn("rdna4-vmid-test", &v, sizeof(v)) ? v & 15 : 0;
 }
 
 bool RDNA4Compute::requestedVmIdTest() {
 	return (vmIdTestMask() & 1) != 0;
 }
 
-// What is busy and what every MEC HQD holds, at one point of the flow. Read-only. Anvil's H1 needs it at: before
-// vmBootSelfTest, right after it, after the flip test, after clock gating, after the first client opens.
-void RDNA4Compute::vmIdSurvey(const char *tag) {
+void RDNA4Compute::vmRegistryAdd(const char *prop, char *buf, size_t cap, uint32_t &len, bool &full, const char *entry) {
+	const size_t n = strlen(entry);
+	if (full || len + n + 4 + sizeof("...(full)") > cap) {
+		if (!full) {
+			full = true;
+			strlcat(buf, "...(full)", cap);
+			if (env.owner)
+				env.owner->setProperty(prop, buf);
+		}
+		return;
+	}
+	memcpy(buf + len, entry, n);
+	len += static_cast<uint32_t>(n);
+	memcpy(buf + len, " ## ", 4);
+	len += 4;
+	buf[len] = '\0';
+	if (env.owner)
+		env.owner->setProperty(prop, buf);
+}
+
+// What is busy and what every MEC HQD holds, at one point of the flow. Read-only. Anvil's H1 needs it at: before vmBootSelfTest, right after
+// it, after the flip test, after clock gating, after the first client opens and after its first dispatch. `settleMs` lets the SMU's averaged
+// activity/clock catch up (it lags ~300 ms) before the sample is taken. The GC hub's L2/fault-default-page/context state is printed too: the
+// round-6 boots ran with rdna4-vm-diag=4065, whose bit 512 points the fault default page at a system page for the baseline attempt.
+// One compact line goes to the registry property Compute,VMSurvey.
+void RDNA4Compute::vmIdSurvey(const char *tag, uint32_t settleMs) {
+	if (settleMs)
+		IOSleep(settleMs);
 	grbmSelect(0, 0, 0, 0);
+	const uint32_t grbm = rdGc(GrbmStatus), grbm2 = rdGc(GrbmStatus2), cpc = rdGc(CpCpcStatus), cpcb = rdGc(CpCpcBusyStat),
+	               cpf = rdGc(CpCpfStatus), cpfb = rdGc(CpCpfBusyStat), cps = rdGc(CpStat), gpm = rdGc(RlcGpmStat),
+	               sched = rdGc(RlcCpSchedulers), rs64 = rdGc(CpMecRs64Cntl), pqs = rdGc(CpPqStatus),
+	               dbl = rdGc(CpMecDoorbellLower), dbu = rdGc(CpMecDoorbellUpper);
 	VLOG("survey %s: GRBM 0x%08x/0x%08x CPC 0x%08x/0x%08x CPF 0x%08x/0x%08x CP_STAT 0x%08x RLC_GPM 0x%08x RLC_CP_SCHED 0x%08x "
-	     "MEC_RS64 0x%08x PQ_STATUS 0x%08x DB_RANGE 0x%08x..0x%08x", tag, rdGc(GrbmStatus), rdGc(GrbmStatus2),
-	     rdGc(CpCpcStatus), rdGc(CpCpcBusyStat), rdGc(CpCpfStatus), rdGc(CpCpfBusyStat), rdGc(CpStat), rdGc(RlcGpmStat),
-	     rdGc(RlcCpSchedulers), rdGc(CpMecRs64Cntl), rdGc(CpPqStatus), rdGc(CpMecDoorbellLower), rdGc(CpMecDoorbellUpper));
+	     "MEC_RS64 0x%08x PQ_STATUS 0x%08x DB_RANGE 0x%08x..0x%08x", tag, grbm, grbm2, cpc, cpcb, cpf, cpfb, cps, gpm, sched, rs64, pqs,
+	     dbl, dbu);
+	const uint32_t l2c = rdGc(GcL2Cntl), fdl = rdGc(GcL2FaultDefaultLo), fdh = rdGc(GcL2FaultDefaultHi), l2s = rdGc(GcL2Status),
+	               fst = rdGc(GcL2FaultStatusLo);
+	uint32_t ctxMask = 0;
+	for (uint32_t v = 1; v <= 15; v++)
+		ctxMask |= (rdGc(Reg { 0, GcCtx1Cntl.dword + v - 1 }) & 1) << v;
+	VLOG("survey %s: GC hub: L2_CNTL 0x%08x (bit 11 DEFAULT_PAGE_OUT_TO_SYSTEM %s) FAULT_DEFAULT 0x%08x:%08x L2_STATUS 0x%08x (L2_BUSY %u, "
+	     "CONTEXT_DOMAIN_BUSY 0x%04x) FAULT_STATUS 0x%08x contexts enabled (VMID mask) 0x%04x", tag, l2c, (l2c >> 11) & 1 ? "SET" : "clear",
+	     fdh, fdl, l2s, l2s & 1, (l2s >> 1) & 0xffff, fst, ctxMask >> 1);
+	RDNA4SensorsEx sm {};
+	const bool smu = readSensorsEx(sm);
+	if (smu)
+		VLOG("survey %s: SMU avg GFXCLK %u MHz, GFX activity %u %%, socket %u W, hotspot %u C, metrics %s", tag, sm.avgGfxclkPostDsMHz,
+		     sm.gfxActivity, sm.socketPowerW, sm.hotspotTempC, (sm.flags & RDNA4_SENSORS_EX_LIVE) ? "live" : "STALE");
+	else
+		VLOG("survey %s: SMU metrics query failed", tag);
+
+	char entry[600];
+	size_t en = snprintf(entry, sizeof(entry), "%s G%08x/%08x C%08x/%08x F%08x/%08x S%08x P%08x K%08x R%08x Q%08x", tag, grbm, grbm2, cpc,
+	                     cpcb, cpf, cpfb, cps, gpm, sched, rs64, pqs);
 	char idle[64];
 	size_t n = 0;
 	idle[0] = 0;
@@ -70,6 +118,9 @@ void RDNA4Compute::vmIdSurvey(const char *tag) {
 			const uint32_t act = rdGc(CpHqdActive), vm = rdGc(CpHqdVmid), rp = rdGc(CpHqdPqRptr), wl = rdGc(CpHqdPqWptrLo),
 			               wh = rdGc(CpHqdPqWptrHi), db = rdGc(CpHqdPqDoorbell), pc = rdGc(CpHqdPqControl),
 			               hq = rdGc(CpHqdHqStatus0), er = rdGc(CpHqdEopRptr);
+			if (en + 48 < sizeof(entry))
+				en += snprintf(entry + en, sizeof(entry) - en, " %u%u:a%u v%u r%u w%u H%u E%x", pipe, q, act & 1, vm & 0xf, rp, wl,
+				               db >> 31, er);
 			if ((act & 1) || rp || wl || wh || (db & 0x80000000u) || hq)
 				VLOG("survey %s: HQD %u/%u ACTIVE %u VMID %u rptr %u wptr 0x%x:%08x doorbell 0x%08x%s PQ_CONTROL 0x%08x (bit 15 = PQ_EMPTY "
 				     "status) HQ_STATUS0 0x%08x EOP_RPTR 0x%08x", tag, pipe, q, act & 1, vm & 0xf, rp, wh, wl, db,
@@ -80,20 +131,27 @@ void RDNA4Compute::vmIdSurvey(const char *tag) {
 	}
 	grbmSelect(0, 0, 0, 0);
 	VLOG("survey %s: HQDs with no state at all:%s", tag, n ? idle : " none");
+	if (en + 96 < sizeof(entry))
+		snprintf(entry + en, sizeof(entry) - en, " L2C%08x D%08x:%08x B%08x X%04x | SMU %u MHz %u%% %uW", l2c, fdh, fdl, l2s, ctxMask >> 1,
+		         smu ? sm.avgGfxclkPostDsMHz : 0, smu ? sm.gfxActivity : 0, smu ? sm.socketPowerW : 0);
+	vmRegistryAdd("Compute,VMSurvey", vmSurveyBuf, sizeof(vmSurveyBuf), vmSurveyLen, vmSurveyFull, entry);
 }
 
 // A bounded trace of one client operation: the runtime's own view (wedged, client slot) and the HQD's (active, rptr/wptr,
 // doorbell HIT) plus the latched fault. At most 64 lines per boot.
 void RDNA4Compute::vmOpTrace(const char *op, uint32_t vmid, uint32_t pipe, uint32_t queue) {
-	if (!vmOpTraceOn || vmOpTraceLines >= 64)
+	if (!vmOpTraceOn || vmOpTraceLines >= 48)
 		return;
 	vmOpTraceLines++;
 	grbmSelect(1, pipe, queue, vmid);
 	const uint32_t act = rdGc(CpHqdActive), rp = rdGc(CpHqdPqRptr), wl = rdGc(CpHqdPqWptrLo), db = rdGc(CpHqdPqDoorbell);
 	grbmSelect(0, 0, 0, 0);
+	const uint32_t cpcb = rdGc(CpCpcBusyStat), flt = rdGc(GcL2FaultStatusLo);
 	VLOG("op %s: client VMID %u HQD %u/%u wedged %d: ACTIVE %u rptr %u wptr %u doorbell 0x%08x%s CPC_BUSY 0x%08x fault 0x%08x", op,
-	     vmid, pipe, queue, rtWedged, act & 1, rp, wl, db, (db >> 31) ? " HIT" : "", rdGc(CpCpcBusyStat),
-	     rdGc(GcL2FaultStatusLo));
+	     vmid, pipe, queue, rtWedged, act & 1, rp, wl, db, (db >> 31) ? " HIT" : "", cpcb, flt);
+	char entry[160];
+	snprintf(entry, sizeof(entry), "%s v%u %u/%u W%d a%u r%u w%u H%u C%x F%x", op, vmid, pipe, queue, rtWedged, act & 1, rp, wl, db >> 31, cpcb, flt);
+	vmRegistryAdd("Compute,VMOps", vmOpsBuf, sizeof(vmOpsBuf), vmOpsLen, vmOpsFull, entry);
 }
 
 namespace {
@@ -162,12 +220,14 @@ uint32_t recordDispatch(uint32_t *ib, const CodeObj::Kernel &k, uint32_t groups)
 
 } // namespace
 
-void RDNA4Compute::vmIdTest() {
-	VLOG("rdna4-vmid-test=1: S1 diagnostic (docs/w13-vmid.md s.8.1); one line per probe, a dump on failure");
+void RDNA4Compute::vmIdTest(bool late) {
+	gVtPhase = late ? " late" : "";
+	const char *const resultKey = late ? "vmidtest-late" : "vmidtest";
+	VLOG("S1 diagnostic (docs/w13-vmid.md s.8.1)%s; one line per probe, a dump on failure", late ? ": the probes repeated after clock gating" : "");
 	trail("vmidtest: start");
 	if (!initRuntimeHeap() || !devHeap.size() || !poolCpu) {
 		VLOG("skipped: the runtime heap/DMA is not up");
-		publishResult("vmidtest", "SKIPPED no runtime heap");
+		publishResult(resultKey, "SKIPPED no runtime heap");
 		return;
 	}
 
@@ -179,13 +239,13 @@ void RDNA4Compute::vmIdTest() {
 	    !CodeObj::parseImage(kVaddCodeObject, sizeof(kVaddCodeObject), img, &why) ||
 	    img.size > 3 * 0x1000 || !kern.wantsKernargPtr() || kern.userSgprCount() != 2) {
 		VLOG("skipped: the vadd code object is not usable here (%s)", why ? why : "shape");
-		publishResult("vmidtest", "SKIPPED vadd image");
+		publishResult(resultKey, "SKIPPED vadd image");
 		return;
 	}
 
 	if (kVmQueueBase + 7 * kVmQueueStride + 0xa000 > pool.size) {
 		VLOG("skipped: the pool is too small for the test areas");
-		publishResult("vmidtest", "SKIPPED pool size");
+		publishResult(resultKey, "SKIPPED pool size");
 		return;
 	}
 
@@ -235,9 +295,11 @@ void RDNA4Compute::vmIdTest() {
 				n += snprintf(line + n, sizeof(line) - n, " v%u %08x/%08x", v, cfg, bases);
 		}
 		grbmSelect(0, 0, 0, 0);
+		if (!late) {
 		VLOG("T0 SH_MEM_CONFIG/BASES written for VMIDs 1-15, read back (config/bases):%s; %u of 15 differ from what was written%s",
 		     line, bad, bad ? " <-- the banked register does not hold per VMID" : "");
 		note("T0", bad ? 'D' : 'P');
+		}
 		/* amdgpu sets SPI_GDBG_PER_VMID_CNTL.TRAP_EN only for the KFD VMIDs 8-15 (gfx_v12_0.c:1795-1799); the kext sets it for none. */
 		n = 0;
 		for (uint32_t v = 1; v <= 15; v++) {
@@ -245,14 +307,15 @@ void RDNA4Compute::vmIdTest() {
 			n += snprintf(line + n, sizeof(line) - n, " v%u %x", v, rdGc(Reg { 0, 0x1f72 }));
 		}
 		grbmSelect(0, 0, 0, 0);
-		VLOG("T0 SPI_GDBG_PER_VMID_CNTL per VMID:%s", line);
+		if (!late)
+			VLOG("T0 SPI_GDBG_PER_VMID_CNTL per VMID:%s", line);
 	}
 	vmIdSurvey("vmidtest start");
 
 	/* ---- tables (one set; the context of each VMID under test points at it) ------------------ */
 	uint64_t table = 0;
 	if (!devHeap.alloc(kVmTableBytes, table)) {
-		publishResult("vmidtest", "SKIPPED no table memory");
+		publishResult(resultKey, "SKIPPED no table memory");
 		return;
 	}
 	RtClient c {};
@@ -263,7 +326,7 @@ void RDNA4Compute::vmIdTest() {
 		if (c.tableShadow)
 			IOFree(c.tableShadow, kVmTableBytes);
 		devHeap.free(table);
-		publishResult("vmidtest", "SKIPPED tables");
+		publishResult(resultKey, "SKIPPED tables");
 		return;
 	}
 	bzero(c.tableShadow, kVmTableBytes);
@@ -284,7 +347,7 @@ void RDNA4Compute::vmIdTest() {
 			VLOG("skipped: vadd segment does not fit");
 			IOFree(c.tableShadow, kVmTableBytes);
 			devHeap.free(table);
-			publishResult("vmidtest", "SKIPPED image layout");
+			publishResult(resultKey, "SKIPPED image layout");
 			return;
 		}
 		memcpy(codeCpu + s.vaddr, kVaddCodeObject + s.fileOffset, s.fileSize);
@@ -340,7 +403,7 @@ void RDNA4Compute::vmIdTest() {
 		VLOG("skipped: page-table setup failed");
 		IOFree(c.tableShadow, kVmTableBytes);
 		devHeap.free(table);
-		publishResult("vmidtest", "SKIPPED page tables");
+		publishResult(resultKey, "SKIPPED page tables");
 		return;
 	}
 
@@ -494,14 +557,16 @@ void RDNA4Compute::vmIdTest() {
 		return up && fence && data && idle;
 	};
 	Q q01 = mkq(0, 0, 1), q11 = mkq(1, 1, 1);
-	note("T1a", plainProbe("T1a slot (0,1) first use after the boot test", q01, 0x7e570001) ? 'P' : 'F');
-	note("T1b", plainProbe("T1b slot (0,1) reactivated", q01, 0x7e570002) ? 'P' : 'F');
-	note("T2", plainProbe("T2 never-used slot (1,1)", q11, 0x7e570003) ? 'P' : 'F');
+	if (!late) {
+		note("T1a", plainProbe("T1a slot (0,1) first use after the boot test", q01, 0x7e570001) ? 'P' : 'F');
+		note("T1b", plainProbe("T1b slot (0,1) reactivated", q01, 0x7e570002) ? 'P' : 'F');
+		note("T2", plainProbe("T2 never-used slot (1,1)", q11, 0x7e570003) ? 'P' : 'F');
+	}
 
 	/* ---- T3: U1 / U2: VMID-0 queue, IB in VMID n ----------------------------------------------- */
 	Q q13 = mkq(2, 1, 3);
 	bool t3Up = false, t3Vmid8 = false;
-	{
+	if (!late) {
 		trail("vmidtest: T3 queue");
 		t3Up = kqStart(q13);
 		VLOG("T3: VMID-0 kernel queue on 1/3 activated %d (PRIV_STATE|KMD_QUEUE, CP_HQD_VMID 0, MQD VMID 0)", t3Up);
@@ -559,7 +624,7 @@ void RDNA4Compute::vmIdTest() {
 			(void)hqdDequeue("T5", q13, 8, true);
 		}
 		gcFaultClear();
-	} else {
+	} else if (!late) {
 		VLOG("T5 skipped: T3 (IB in VMID 8 from a VMID-0 queue) did not pass");
 		note("T5", 'S');
 	}
@@ -606,18 +671,35 @@ void RDNA4Compute::vmIdTest() {
 	note("T4a", t4a ? 'P' : 'F');
 	const bool t4aIdle = hqdDequeue("T4a", q12, 8, true);
 	note("T4a-deq", t4aIdle ? 'P' : 'F');
-	const bool t4b = clientWriteData("T4b reactivated after the dequeue", 0x7e570202, 8);
-	note("T4b", t4b ? 'P' : 'F');
-	(void)hqdDequeue("T4b", q12, 8, true);
-	vmIdSurvey("vmidtest after T4b");
-	/* T4c: the same queue with HQD VMID 3 (amdgpu's own VMIDs are 1-7, KFD's 8-15). */
-	const bool t4c = clientWriteData("T4c HQD VMID 3 (the gfx range)", 0x7e570203, 3);
-	note("T4c", t4c ? 'P' : 'F');
-	(void)hqdDequeue("T4c", q12, 3, true);
+	bool t4b = false;
+	if (!late) {
+		t4b = clientWriteData("T4b reactivated after the dequeue", 0x7e570202, 8);
+		note("T4b", t4b ? 'P' : 'F');
+		(void)hqdDequeue("T4b", q12, 8, true);
+		vmIdSurvey("vmidtest after T4b");
+		/* T4c: the same queue with HQD VMID 3 (amdgpu's own VMIDs are 1-7, KFD's 8-15). */
+		const bool t4c = clientWriteData("T4c HQD VMID 3 (the gfx range)", 0x7e570203, 3);
+		note("T4c", t4c ? 'P' : 'F');
+		(void)hqdDequeue("T4c", q12, 3, true);
+	}
+	/* T4d: a client-style HQD activated on the slot and left idle for ~50 ms, then dequeued WITHOUT any packet: clients that never kicked
+	 * anything still logged "dequeue timeout" on the card, independent of shader or ACQUIRE_MEM. */
+	{
+		trail("vmidtest: T4d idle activation");
+		const bool up = clientStart(8);
+		IOSleep(50);
+		hqdLine("T4d after 50 ms idle", q12, 8);
+		const bool idle = hqdDequeue("T4d", q12, 8, true);
+		VLOG("T4d: client-style HQD VMID 8 activated (%d), idle 50 ms, dequeued with no packet => %s", up,
+		     up && idle ? "PASS" : "FAIL (a drain timeout with no work at all: not a shader, fence or ACQUIRE_MEM problem)");
+		note("T4d", up && idle ? 'P' : 'F');
+		if (!(up && idle))
+			dumpFail("T4d", q12, 8);
+	}
 
 	/* ---- T5c: the incremental stream on a fresh client-style queue ---------------------------------- */
 	bool t5cDone = false;
-	if (!shaderHang && t4b) {
+	if (!late && !shaderHang && t4b) {
 		trail("vmidtest: T5c incremental");
 		const bool up = clientStart(8);
 		fillVadd();
@@ -706,13 +788,13 @@ void RDNA4Compute::vmIdTest() {
 		}
 		(void)hqdDequeue("T5c", q12, 8, true);
 		gcFaultClear();
-	} else {
+	} else if (!late) {
 		VLOG("T5c skipped: %s", shaderHang ? "a shader probe already hung" : "T4b did not pass");
 		note("T5c", 'S');
 	}
 
 	/* ---- T5b: rtDispatch's stream: direct ring packets on the VMID-8 queue ---------------------- */
-	if (!shaderHang && t4b && t5cDone) {
+	if (!shaderHang && !vmIdShaderHung && (late ? t4a : (t4b && t5cDone))) {
 		trail("vmidtest: T5b vadd direct");
 		const bool up = clientStart(8);
 		fillVadd();
@@ -744,13 +826,13 @@ void RDNA4Compute::vmIdTest() {
 		(void)hqdDequeue("T5b", q12, 8, true);
 		gcFaultClear();
 	} else {
-		VLOG("T5b skipped: %s", shaderHang ? "a shader probe already hung" : !t4b ? "T4b did not pass" : "T5c did not pass (it is the same stream, bisected)");
+		VLOG("T5b skipped: %s", shaderHang || vmIdShaderHung ? "a shader probe already hung" : late ? "T4a did not pass" : !t4b ? "T4b did not pass" : "T5c did not pass (it is the same stream, bisected)");
 		note("T5b", 'S');
 	}
 
 	/* ---- T6: code page without EXECUTABLE ------------------------------------------------------- */
 	Q q02 = mkq(4, 0, 2), q03 = mkq(5, 0, 3);
-	if (!shaderHang && t3Vmid8) {
+	if (!late && !shaderHang && t3Vmid8) {
 		trail("vmidtest: T6 no-exec code");
 		ctxOn(8);
 		fillVadd();
@@ -774,12 +856,14 @@ void RDNA4Compute::vmIdTest() {
 		gcFaultClear();
 		scrubFaultPage();
 	} else {
-		VLOG("T6 skipped: %s", shaderHang ? "a shader probe already hung" : "T3 did not pass");
-		note("T6", 'S');
+		if (!late) {
+			VLOG("T6 skipped: %s", shaderHang ? "a shader probe already hung" : "T3 did not pass");
+			note("T6", 'S');
+		}
 	}
 
 	/* ---- T7: negative control: the IB packet names a VMID whose context is off ------------------ */
-	if (!shaderHang && t3Vmid8) {
+	if (!late && !shaderHang && t3Vmid8) {
 		trail("vmidtest: T7 wrong VMID");
 		ctxOff(9);
 		const bool up = kqStart(q03);
@@ -804,8 +888,10 @@ void RDNA4Compute::vmIdTest() {
 		gcFaultClear();
 		scrubFaultPage();
 	} else {
-		VLOG("T7 skipped: %s", shaderHang ? "a shader probe already hung" : "T3 did not pass");
-		note("T7", 'S');
+		if (!late) {
+			VLOG("T7 skipped: %s", shaderHang ? "a shader probe already hung" : "T3 did not pass");
+			note("T7", 'S');
+		}
 	}
 
 	/* ---- clean up: nothing of the test stays programmed ------------------------------------------ */
@@ -827,9 +913,11 @@ void RDNA4Compute::vmIdTest() {
 	devHeap.free(table);
 	gcFaultClear();
 	scrubFaultPage();
-	vmIdSurvey("vmidtest end");
-	gfxPmSurvey("vmidtest end");
+	vmIdSurvey(late ? "vmidtest late end" : "vmidtest end");
+	gfxPmSurvey(late ? "vmidtest late end" : "vmidtest end");
+	if (shaderHang)
+		vmIdShaderHung = true;
 	VLOG("summary: %s (P pass, F fail, H shader hang, S skipped, D readback differs)", summary);
-	publishResult("vmidtest", summary);
+	publishResult(resultKey, summary);
 	trail("vmidtest: done");
 }

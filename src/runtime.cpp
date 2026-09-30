@@ -1483,6 +1483,16 @@ void RDNA4Compute::scrubFaultPage() {
 }
 
 IOReturn RDNA4Compute::rtOpen(const void *owner) {
+	const IOReturn r = rtOpenInner(owner);
+	if (r != kIOReturnSuccess) {
+		char why[48];
+		snprintf(why, sizeof(why), "open FAILED 0x%x", r);
+		vmOpTrace(why, 0, 0, 0);
+	}
+	return r;
+}
+
+IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 	Locked g(rtLock);
 	if (!rtReady)
 		return kIOReturnNotReady;
@@ -2322,8 +2332,10 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	if (state != kIOReturnSuccess)
 		return state;
 	RtClient *c = vmClientFor(owner);
-	if (rtWedged && !(c && c->shared))
+	if (rtWedged && !(c && c->shared)) {
+		vmOpTrace("dispatch REFUSED: rtWedged", c ? c->vmid : 0, c ? c->pipe : 0, c ? c->queue : 0);
 		return kIOReturnNotResponding;
+	}
 	if (vmEnabled && !c)
 		return kIOReturnNoResources;
 	if (c)
@@ -2396,8 +2408,10 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 		/* rdna4-vmshared: the job runs on the client's shared VMID-0 queue as INDIRECT_BUFFER(vmid) + a ring-level fence to the client's
 		 * fence word (an MC address). The packets are written into the client's IB page. */
 		SharedQueue &sq = sharedQ[c->sq];
-		if (sq.wedged || !sq.up)
+		if (sq.wedged || !sq.up) {
+			vmOpTrace("dispatch REFUSED: shared queue wedged/down", c->vmid, sq.pipe, sq.queue);
 			return kIOReturnNotResponding;
+		}
 		l.queue = &sq.pm;
 		l.pipe = sq.pipe;
 		l.queueId = sq.queue;
@@ -2431,6 +2445,7 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 			rtWedged = false;
 			RLOG("dispatch timed out after %u ms; queue recovered without a GPU reset", l.timeoutUs / 1000);
 		} else {
+			vmOpTrace("rtWedged SET by a dispatch timeout (recovery failed)", l.vmid, l.pipe, l.queueId);
 			rtWedged = true;
 			RLOG("dispatch timed out after %u ms: queue recovery failed; runtime stays wedged",
 			     l.timeoutUs / 1000);
@@ -2456,10 +2471,14 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	RtClient *c = vmClientFor(owner);
 	if (!c)
 		return kIOReturnNoResources;
-	if (rtWedged && !c->shared)
+	if (rtWedged && !c->shared) {
+		vmOpTrace("submitib REFUSED: rtWedged", c->vmid, c->pipe, c->queue);
 		return kIOReturnNotResponding;
-	if (c->shared && (sharedQ[c->sq].wedged || !sharedQ[c->sq].up))
+	}
+	if (c->shared && (sharedQ[c->sq].wedged || !sharedQ[c->sq].up)) {
+		vmOpTrace("submitib REFUSED: shared queue wedged/down", c->vmid, c->pipe, c->queue);
 		return kIOReturnNotResponding;
+	}
 	if (!ibVa || (ibVa & 3) || !dwords || dwords > (1u << 20) || flags)
 		return kIOReturnBadArgument;
 	const uint64_t ibBytes = dwords * 4;
@@ -2523,8 +2542,10 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 	RtClient *c = vmClientFor(owner);
 	if (!c)
 		return kIOReturnNoResources;
-	if (rtWedged && !c->shared)
+	if (rtWedged && !c->shared) {
+		vmOpTrace("waitfence REFUSED: rtWedged", c->vmid, c->pipe, c->queue);
 		return kIOReturnNotResponding;
+	}
 	if (timeoutMs > RDNA4_MAX_TIMEOUT_MS ||
 	    static_cast<int32_t>(fence - c->fence) > 0)
 		return kIOReturnBadArgument;
@@ -2589,6 +2610,7 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 		RLOG("IB fence %u timed out after %u ms; queue recovered without a GPU reset",
 		     fence, waitMs);
 	} else {
+		vmOpTrace("rtWedged SET by an IB wait timeout (recovery failed)", c->vmid, c->pipe, c->queue);
 		rtWedged = true;
 		RLOG("IB fence %u timed out after %u ms; queue recovery failed; runtime stays wedged",
 		     fence, waitMs);

@@ -778,13 +778,13 @@ void RDNA4Compute::runStages() {
 		vmEnabled = false;
 		CLOG("vm: boot self-test failed; per-client GPU VM disabled");
 		}
-		vmSurvey("after vmBootSelfTest");
+		vmSurvey("after vmBootSelfTest", 300);
 	}
 	// W13 S1: the VMID/queue diagnostic, only with rdna4-vmid-test=1. It needs the runtime heap and DMA (initRuntimeHeap), not a
 	// passing VM self-test: a failing one is when it is most useful.
 	if (done >= StageKernel && requestedVmIdTest() && featureAllowed("vmidtest")) {
 		if (!bringupStepAllowed("vmid test")) return;
-		vmIdTest();
+		vmIdTest(false);
 	}
 	// W3: the gfx ring, when asked for. A failure only turns it off again.
 	bool gfxOk = false;
@@ -838,7 +838,12 @@ void RDNA4Compute::runStages() {
 	if (done >= (gfxCgIsDefault() ? StageKernel : StageGfx) && featureAllowed("pm") && requestedGfxCg(cgMask)) {
 		if (!bringupStepAllowed("clock gating")) return;
 		gfxCgApply(cgMask);
-		vmSurvey("after clock gating");
+		vmSurvey("after clock gating", 1000);
+	}
+	// W13 S1 late probes (mask bit 8): the client-style queue probes again after clock gating, bounded, on the same spare slots.
+	if (done >= StageKernel && (vmIdTestMask() & 8) && featureAllowed("vmidtest")) {
+		if (!bringupStepAllowed("vmid test (late)")) return;
+		vmIdTest(true);
 	}
 	if (done >= StageGfx && featureAllowed("pm") && (requestedGfxOff() || gfxOffHook())) {
 		if (!bringupStepAllowed("gfxoff")) return;
@@ -3240,6 +3245,11 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 			vmInvalidate(l.vmid, "dispatch fault clear");
 			scrubFaultPage();
 		}
+	}
+	// W13 S1: one engine survey after the first client dispatch, whichever way it ended (Anvil hub-task-323 G4).
+	if (vm && vmSurveyOn && !vmSurveyDispatchDone && tag && !strcmp(tag, "runtime")) {
+		vmSurveyDispatchDone = true;
+		vmSurvey(done ? "after the first client dispatch (done)" : "after the first client dispatch (TIMEOUT)");
 	}
 	return done;
 }

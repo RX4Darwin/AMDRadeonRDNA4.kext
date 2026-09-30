@@ -793,22 +793,34 @@ private:
 	static bool requestedVmShared();
 	bool vmSharedEnsure();
 	IOReturn rtOpenShared(const void *owner, uint32_t slot, RtClient *c);
+	IOReturn rtOpenInner(const void *owner);
 	bool sharedStart(uint32_t k);
 	void sharedStopAll(const char *why);
 	bool recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const char *tag);
 	// The VMID a client's submissions run in. One place, so the VMID pool (docs/w13-vmid.md s.5.6) can substitute its grab later; W12k's
 	// gfx submit takes the IB's VMID from here too.
 	uint32_t vmidForSubmit(const RtClient &c) const { return c.vmid; }
-	void vmIdTest();                          // W13 S1 (vmtest.cpp): rdna4-vmid-test=1, the VMID/queue diagnostic
 	static bool requestedVmIdTest();
 	static uint32_t vmIdTestMask();          // rdna4-vmid-test: 1 probes, 2 flow-point surveys, 4 client-op trace
-	void vmIdSurvey(const char *tag);
+	void vmIdSurvey(const char *tag, uint32_t settleMs = 0);
 	void vmOpTrace(const char *op, uint32_t vmid, uint32_t pipe, uint32_t queue);
-	void vmSurvey(const char *tag) { if (vmSurveyOn) vmIdSurvey(tag); }
+	void vmSurvey(const char *tag, uint32_t settleMs = 0) { if (vmSurveyOn) vmIdSurvey(tag, settleMs); }
+	void vmIdTest(bool late);                 // late = the probes that repeat after clock gating (mask bit 8)
+	// Compact one-line entries for the registry (properties Compute,VMSurvey and Compute,VMOps), " ## " separated, bounded, like the gfx verdict:
+	// the dmesg window loses bring-up lines, the registry does not.
+	void vmRegistryAdd(const char *prop, char *buf, size_t cap, uint32_t &len, bool &full, const char *entry);
 	bool     vmSurveyOn { false };
 	bool     vmOpTraceOn { false };
 	uint32_t vmOpTraceLines { 0 };
 	bool     vmSurveyClientDone { false };
+	bool     vmSurveyDispatchDone { false };
+	bool     vmIdShaderHung { false };        // an early S1 shader probe hung: the late ones are skipped
+	char     vmSurveyBuf[3072] {};
+	uint32_t vmSurveyLen { 0 };
+	bool     vmSurveyFull { false };
+	char     vmOpsBuf[1536] {};
+	uint32_t vmOpsLen { 0 };
+	bool     vmOpsFull { false };
 	void vmDumpHubWindows(const char *tag);   // W17 E1, read-only
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);
