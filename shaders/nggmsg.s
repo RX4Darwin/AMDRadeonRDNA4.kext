@@ -18,7 +18,7 @@ nggmsg:
 skip_alloc:
 	s_and_b32          s8, s3, 0xff
 	s_bfm_b64          s[10:11], s8, 0
-	s_and_saveexec_b32 s15, s10
+	s_mov_b32          exec_lo, s10
 	s_cbranch_execz    skip_pos
 	v_cmp_eq_u32_e64   s20, 0, v3
 	v_cmp_eq_u32_e64   s21, 1, v3
@@ -30,13 +30,12 @@ skip_alloc:
 	v_mov_b32          v7, 1.0
 	export             pos0 v4, v5, v6, v7 done
 skip_pos:
-	s_mov_b32          exec_lo, s15
 
-	// primitive export LAST (gfx11+: no early primitive export; docs/linux-radv-triangle.md)
+	// primitive export after the positions, as ACO does (either order works: docs/linux-replay.md)
 	s_wait_expcnt      0x0
 	s_bfe_u32          s9, s3, 0x80008
 	s_bfm_b64          s[12:13], s9, 0
-	s_and_saveexec_b32 s14, s12
+	s_mov_b32          exec_lo, s12
 	s_cbranch_execz    done_vs
 	export             prim v0, off, off, off done
 done_vs:

@@ -6,6 +6,8 @@
 > primitive export is a choice, not a hardware rule. The reordered kext shaders are harmless (Mesa's order)
 > but do not fix the triangle. The "second tier" table is still open, and the next test is replaying the
 > kext's own stream through amdgpu on Linux.
+>
+> **Root cause found: `docs/linux-replay.md`** (NGG waves start with EXEC = lane 0 only; the kext ANDed it).
 
 Linux side of the handoff (`docs/HANDOFF-linux.md`, "what we need from Linux"), 2026-09-30, on the same PC
 (RX 9070 XT, Arch Linux 7.2.2, Mesa 26.2.2, linux-firmware 20260810). No root needed.

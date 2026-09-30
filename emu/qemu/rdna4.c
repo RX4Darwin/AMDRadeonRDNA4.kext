@@ -5216,7 +5216,11 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
     stages = reg_get(s, REG_GFX_VGT_SHADER_STAGES_EN);
     pgm = ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_ES) << 8) |
           ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_HI_ES) << 40);
-    ngg.exec = UINT32_MAX;
+    /* An NGG (merged ES/GS) wave starts with EXEC = lane 0 only, whatever merged_wave_info says: measured on the
+     * RX 9070 XT under Linux (tools/linux-replay, docs/linux-replay.md: exec_lo 0x00000001, exec_hi 0 with 3
+     * vertices / 1 primitive). The shader must set exec itself (ACO: s_bfe_u64 exec, -1, merged_wave_info);
+     * the all-ones this model used before hid the kext's s_and_saveexec bug for rounds 4-6. */
+    ngg.exec = 0x1;
     ngg.pc = pgm;
     ngg.s[0] = reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_GS);
     ngg.s[1] = reg_get(s, REG_GFX_SPI_SHADER_PGM_HI_GS);
