@@ -33,6 +33,7 @@
 #include "../src/flip.hpp"
 #include "../src/gpuvm.hpp"
 #include "../src/vmid.hpp"
+#include "../src/ptpages.hpp"
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
@@ -2342,6 +2343,124 @@ static int testVmidPool() {
 	return f;
 }
 
+// --- W13 S6: demand-allocated page tables (src/ptpages.cpp) ---------------------------------
+
+namespace {
+struct FakeChunks {
+	uint64_t next { 0x1000000 };
+	uint32_t live { 0 }, allocs { 0 }, frees { 0 };
+	uint32_t failAfter { 0xffffffffu };     // refuse the allocation after this many
+	uint64_t freed[256];
+};
+bool fakeAllocChunk(void *ctx, uint64_t &off) {
+	auto *f = static_cast<FakeChunks *>(ctx);
+	if (f->allocs >= f->failAfter)
+		return false;
+	off = f->next;
+	f->next += 0x10000;
+	f->allocs++;
+	f->live++;
+	return true;
+}
+void fakeFreeChunk(void *ctx, uint64_t off) {
+	auto *f = static_cast<FakeChunks *>(ctx);
+	if (f->frees < 256)
+		f->freed[f->frees] = off;
+	f->frees++;
+	f->live--;
+}
+} // namespace
+
+static int testPtPages() {
+	int f = 0;
+	FakeChunks chunks;
+	PtPages::Backend be { fakeAllocChunk, fakeFreeChunk, &chunks };
+	static PtPages::Table t;
+	t.init(PtPages::kMaxPages);
+	uint64_t off = 0, prev = 0;
+
+	// A client's first pages (root, PDB1, PDB0, one PT) live in ONE 64 KiB chunk, 4 KiB apart.
+	bool ok = true;
+	uint64_t first = 0;
+	for (uint32_t i = 0; i < 4; i++) {
+		ok &= t.page(i, be, off);
+		if (i == 0)
+			first = off;
+		ok &= off == first + 0x1000ull * i;
+	}
+	f += check(ok && t.pages() == 4 && t.chunksHeld() == 1 && chunks.allocs == 1, "ptpages: four pages share one chunk, packed 4 KiB apart");
+	f += check(t.page(2, be, off) && off == first + 0x2000 && t.pages() == 4, "ptpages: asking again returns the same page and allocates nothing");
+	f += check(t.offsetOf(3) == first + 0x3000 && t.offsetOf(9) == 0 && !t.has(9), "ptpages: offsetOf / has for backed and unbacked pages");
+
+	// Sparse: a far PT page costs one page, not the distance.
+	ok = t.page(900, be, off) && off == first + 0x4000 && t.pages() == 5 && t.chunksHeld() == 1;
+	f += check(ok, "ptpages: a far-away logical page takes the next free slot of the chunk (no 4 MiB image)");
+
+	// The 17th page opens a second chunk.
+	for (uint32_t i = 10; i < 21; i++)
+		t.page(i, be, off);
+	f += check(t.pages() == 16 && t.chunksHeld() == 1, "ptpages: 16 pages fill the first chunk exactly");
+	f += check(t.page(21, be, off) && t.chunksHeld() == 2 && chunks.allocs == 2, "ptpages: the 17th page opens a second chunk");
+
+	// Dropping: a slot is reused; an emptied chunk goes back to the allocator.
+	t.drop(21, be);
+	f += check(t.chunksHeld() == 1 && chunks.frees == 1, "ptpages: dropping the only page of a chunk frees that chunk");
+	t.drop(3, be);
+	f += check(t.page(700, be, off) && off == first + 0x3000, "ptpages: a dropped slot is reused first");
+
+	// Quota and allocator failure leave no half-made page.
+	PtPages::Table q;
+	FakeChunks c2;
+	PtPages::Backend b2 { fakeAllocChunk, fakeFreeChunk, &c2 };
+	q.init(3);
+	bool three = q.page(0, b2, off) && q.page(1, b2, off) && q.page(2, b2, off);
+	f += check(three && !q.page(3, b2, off) && q.pages() == 3 && !q.has(3), "ptpages: the quota refuses the 4th page and leaves no trace");
+	PtPages::Table r;
+	FakeChunks c3;
+	c3.failAfter = 1;
+	PtPages::Backend b3 { fakeAllocChunk, fakeFreeChunk, &c3 };
+	r.init(PtPages::kMaxPages);
+	bool filled = true;
+	for (uint32_t i = 0; i < 16; i++)
+		filled &= r.page(i, b3, off);
+	f += check(filled && !r.page(16, b3, off) && r.pages() == 16 && !r.has(16) && r.chunksHeld() == 1,
+	           "ptpages: an allocator that refuses the second chunk fails the page cleanly");
+
+	// Release gives every chunk back exactly once.
+	t.release(be);
+	f += check(t.pages() == 0 && t.chunksHeld() == 0 && chunks.live == 0, "ptpages: release returns every chunk (none left live)");
+	bool unique = true;
+	for (uint32_t i = 0; i < chunks.frees && i < 256; i++)
+		for (uint32_t j = i + 1; j < chunks.frees && j < 256; j++)
+			unique &= chunks.freed[i] != chunks.freed[j];
+	f += check(unique, "ptpages: no chunk was freed twice");
+
+	// Worst case: the whole 4 MiB image backed = 1024 pages = 64 chunks.
+	PtPages::Table w;
+	FakeChunks c4;
+	PtPages::Backend b4 { fakeAllocChunk, fakeFreeChunk, &c4 };
+	w.init(PtPages::kMaxPages);
+	bool all = true;
+	for (uint32_t i = 0; i < PtPages::kMaxPages; i++)
+		all &= w.page(i, b4, off);
+	f += check(all && w.pages() == 1024 && w.chunksHeld() == 64, "ptpages: a fully mapped 4 MiB image takes 64 chunks");
+	w.release(b4);
+	f += check(c4.live == 0, "ptpages: and gives them all back");
+
+	// Pool-slot layout: the old layout (26 MiB, 64 KiB stride) runs into the gfx region at 30 MiB with slot 64.
+	uint32_t area = 0;
+	const uint32_t base = 26u << 20, gfx = 30u << 20;
+	f += check(PtPages::areaFor(base, 0x10000, 0, gfx, area) && area == base, "layout: slot 0 at the base");
+	f += check(PtPages::areaFor(base, 0x10000, 63, gfx, area) && area + 0x10000 == gfx, "layout: slot 63 ends exactly at the gfx region");
+	f += check(!PtPages::areaFor(base, 0x10000, 64, gfx, area), "layout: slot 64 (which the old code would have placed on the gfx ring) is refused");
+	f += check(PtPages::areaFor(27u << 20, 0x3000, 255, gfx, area) && !PtPages::areaFor(27u << 20, 0x3000, 256, gfx, area),
+	           "layout: the compact 12 KiB client area fits 256 clients below the gfx region, 257 is refused");
+	f += check(PtPages::areaFor(0, 10, 1, 20, area) && !PtPages::areaFor(0, 10, 1, 19, area), "layout: an area that overruns the limit by one byte is refused");
+	f += check(!PtPages::areaFor(base, 0, 0, gfx, area) && !PtPages::areaFor(0xfffff000u, 0x10000, 1, 0xffffffffu, area),
+	           "layout: a zero stride and a 32-bit overflow are refused");
+	return f;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
@@ -2542,6 +2661,7 @@ int main(int argc, char **argv) {
 	failures += testGcInfo();
 	failures += testGpuVm();
 	failures += testVmidPool();
+	failures += testPtPages();
 	failures += testLinuxRefFormat();
 
 	if (failures) {
