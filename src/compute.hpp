@@ -389,6 +389,10 @@ private:
 	static constexpr uint32_t kGfxVsOffset    = kGfxOffset + 0x20000;
 	static constexpr uint32_t kGfxPsOffset    = kGfxOffset + 0x20400;
 	static constexpr uint32_t kGfxTargetOffset = kGfxOffset + 0x40000;   // 256 KiB
+	// G4 (rdna4-gfxcol=1, docs/g4-colour.md): its own code slots (256-byte aligned, 0x400 each like the G3 ones) so that nothing G3 or
+	// the ladder still needs is overwritten; it shares the target, the draw fence, the ring and the GE rings with G3.
+	static constexpr uint32_t kGfxColVsOffset = kGfxOffset + 0x28000;
+	static constexpr uint32_t kGfxColPsOffset = kGfxOffset + 0x28400;
 	static constexpr uint32_t kGfxDrawFenceOffset = kGfxTestOffset + 0x20;
 	static constexpr uint32_t kGfxMarkerOffset = kGfxTestOffset + 0x40;   // the PS-store diagnostic marker
 	static constexpr uint32_t kGfxProbeOffset  = kGfxRptrOffset + 0x200;  // CP-view readback, state before the draw (32 dwords); +0x100 is the PS marker (W33: they overlapped)
@@ -442,6 +446,17 @@ private:
 		uint32_t probeEqual, probeCounted;      // 'probe mid': registers equal to the stream / registers compared
 	};
 	bool gfxDrawRun(const char *label, uint32_t variant, const uint64_t *va, GfxDrawResult &r);
+	// G4: the colour triangle (vertex 0 red, 1 green, 2 blue through the attribute ring), after a passing G3 baseline, rdna4-gfxcol=1.
+	struct GfxColResult {
+		bool ok, ringDone;
+		uint32_t drawFence, covered, badAlpha, notDominant, maxChannelErr256, maxSumErr;   // the check of userspace/gfx12tricol.h
+		uint32_t minX, maxX, minY, maxY, near0, near1, near2, centroid;
+		uint32_t cInv, cPrim, ps;              // pipeline statistics deltas (probe boots)
+		uint64_t ns;
+	};
+	static uint32_t requestedGfxCol();       // rdna4-gfxcol=1 (default off): draw G4 after a passing G3 baseline
+	bool gfxColDrawRun(const char *label, const uint64_t *va, GfxColResult &r);
+	void gfxVerdictCol(const GfxColResult &r);
 	void gfxCountTarget(GfxDrawResult &r);
 	void gfxEvidence(const char *tag, bool state);
 	void gfxGoldenInit();

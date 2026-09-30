@@ -10,8 +10,10 @@
 #   0  known-good arguments (no new feature enabled): the way back
 #   1  the proven base + the real hardware pointer (W45, CM_BYPASS cleared by default): also the setting for daily use   rdna4-vbl=1 rdna4-cursor=1
 #   2  boot 1 + per-app GPU memory (W36 IS_PTE + EXECUTE)   rdna4-vm=1 rdna4-vm-diag=4065
-#   3  boot 2 + first triangle (sane clip state, SRM, CP-side probe); run AFTER boot 2, it is the one that can hang the GPU   ... rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11
-#   6  boot 3 with SRM only, no replay and no sane-clip block (amdgpu-exact; attributes the fix)   ... rdna4-gfxcsb=0 rdna4-gfxsane=0
+#   3  boot 2 + first triangle (sane clip state, SRM, CP-side probe); run AFTER boot 2, it is the one that can hang the GPU   ... rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11 rdna4-gfxcol=1
+#      rdna4-gfxcol=1 (default off elsewhere): after the G3 baseline PASSES, also draw the G4 colour triangle (vertex 0 red, 1 green, 2 blue through
+#      the attribute ring, docs/g4-colour.md); diagnostic row "gfx-col". G4 never runs when the baseline failed, so it cannot hide a G3 result.
+#   6  boot 3 with SRM only, no replay and no sane-clip block (amdgpu-exact; attributes the fix)   ... rdna4-gfxcsb=0 rdna4-gfxsane=0   (no gfxcol: a clean A/B control of the G3 fix)
 #   4  (retired: the real pointer is part of boot 1 since round 6)
 #   5  base + GFXOFF (optional, ALWAYS LAST, then power off)   rdna4-gfxpm=24 rdna4-gfxoff=1
 #   7  base + cursor self-test: magenta 64x64 square at (100,100), macOS pointer ignored   rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1 (CRC A/B: GOP state, after the CM_BYPASS clear)
@@ -24,7 +26,7 @@ case "${1:-}" in
 	0) EXTRA="" ;;
 	1) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=1" ;;
 	2) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1" ;;
-	3) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11" ;;
+	3) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11 rdna4-gfxcol=1" ;;
 	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfxpm=24 rdna4-gfxoff=1" ;;
 	7) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11 rdna4-gfxcsb=0 rdna4-gfxsane=0" ;;

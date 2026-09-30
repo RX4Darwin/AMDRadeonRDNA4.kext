@@ -39,6 +39,7 @@ IH_MODE="$(arg_value ih)"
 VM_MODE="$(arg_value vm)"
 FLIP_MODE="$(arg_value flip)"
 GFX_MODE="$(arg_value gfx)"
+GFXCOL_MODE="$(arg_value gfxcol)"
 HANG_MODE=0
 SLEEPTEST_MODE="$(arg_value sleeptest)"
 GFXPM_MODE="$(arg_value gfxpm)"
@@ -49,6 +50,7 @@ case "$IH_MODE" in ''|*[!0-9]*) IH_MODE=0;; esac
 case "$VM_MODE" in ''|*[!0-9]*) VM_MODE=0;; esac
 case "$FLIP_MODE" in ''|*[!0-9]*) FLIP_MODE=0;; esac
 case "$GFX_MODE" in ''|*[!0-9]*) GFX_MODE=0;; esac
+case "$GFXCOL_MODE" in ''|*[!0-9]*) GFXCOL_MODE=0;; esac
 case "$SLEEPTEST_MODE" in ''|*[!0-9]*) SLEEPTEST_MODE=0;; esac
 case "$GFXPM_MODE" in ''|*[!0-9]*) GFXPM_MODE=0;; esac
 
@@ -210,7 +212,7 @@ registry_value() {
 	found=""
 	for a in off cmap lutbypass 8bpc noedid nosleep modedump hwcursor \
 	         curmode curtest dmubping dmubhist dmubver dmubcursor smuping \
-	         ihdump pspdump vbl cursor pm trace compute ih vm flip gfx hang sleeptest; do
+	         ihdump pspdump vbl cursor pm trace compute ih vm flip gfx gfxcol hang sleeptest; do
 		value="$(arg_value "$a")"
 		[ -n "$value" ] && found="$found rdna4-$a=$value"
 	done
@@ -549,6 +551,25 @@ registry_value() {
 		record gfx FAIL "gfx command result and RDNA4FB,Results did not both pass"
 	else
 		record gfx SKIPPED "feature skipped before ring test"
+	fi
+
+	# G4, the colour triangle (rdna4-gfxcol=1, after a passing G3 baseline): docs/g4-colour.md. Registry key "gfx-col"; the PASS text carries the
+	# colour verdict and 8192 pixels. The per-draw details are in the gfx: dmesg lines ("col: ...") and the Compute,GFXVerdict / GFXColPixels properties.
+	if [ "$GFXCOL_MODE" -eq 0 ]; then
+		record gfx-col SKIPPED "rdna4-gfxcol not enabled"
+	elif printf '%s\n' "$(registry_value gfx-col)" |
+		grep -Eq '^PASS.*THE COLOUR TRIANGLE IS RIGHT.*8192'; then
+		record gfx-col PASS "$(registry_value gfx-col | sed 's/^PASS //')"
+	elif printf '%s\n' "$(registry_value gfx-col)" | grep -q '^SKIPPED'; then
+		record gfx-col SKIPPED "$(registry_value gfx-col | sed 's/^SKIPPED //')"
+	elif printf '%s\n' "$(registry_value gfx-col)" | grep -q '^PASS'; then
+		record gfx-col FAIL "colour draw passed but the image was not proven"
+	elif printf '%s\n' "$(registry_value gfx-col)" | grep -q '^FAIL'; then
+		record gfx-col FAIL "$(registry_value gfx-col | sed 's/^FAIL //')"
+	elif grep -Eq 'RDNA4FB: .*gfx: col:' "$KLOG"; then
+		record gfx-col FAIL "colour draw logged but RDNA4FB,Results has no result"
+	else
+		record gfx-col SKIPPED "G4 not reached (the gfx stage did not get to the draw)"
 	fi
 
 	if [ "$FLIP_MODE" -eq 0 ]; then

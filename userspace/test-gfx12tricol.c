@@ -92,7 +92,8 @@ int main(void) {
 	exact_image(img);
 	rdna4_tricol_result r;
 	EXPECT(rdna4_tricol_check(img, &r));
-	printf("exact image: covered %u, max channel error %.2f, max sum error %.0f, centroid 0x%08x\n", r.covered, r.maxChannelError, r.maxSumError, r.centroid);
+	printf("exact image: covered %u, max channel error %u/256 (%.2f), max sum error %u, bounds x %u..%u y %u..%u, centroid 0x%08x\n", r.covered,
+	       r.maxChannelErr256, r.maxChannelErr256 / 256.0, r.maxSumErr, r.minX, r.maxX, r.minY, r.maxY, r.centroid);
 	uint32_t bad[256 * 256];
 	memcpy(bad, img, sizeof(bad));
 	for (uint32_t k = 0; k < 256 * 256; k++)

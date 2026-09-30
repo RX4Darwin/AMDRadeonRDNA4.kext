@@ -301,8 +301,8 @@ int main() {
 		const int ok = rdna4_tricol_check(px, &cr);
 		printf("colour: %u covered pixels (want %u), %u with alpha != 0xFF, %u not dominated by the nearest vertex's colour\n", cr.covered,
 		       Gfx12DrawCol::kColCoveredPixels, cr.badAlpha, cr.notDominant);
-		printf("colour: max |channel - exact barycentric| %.2f, max |R+G+B - 255| %.0f (tolerance %u)\n", cr.maxChannelError, cr.maxSumError,
-		       Gfx12DrawCol::kColChannelTolerance);
+		printf("colour: max |channel - exact barycentric| %.2f, max |R+G+B - 255| %u (tolerance %u), bounds x %u..%u y %u..%u\n", cr.maxChannelErr256 / 256.0,
+		       cr.maxSumErr, Gfx12DrawCol::kColChannelTolerance, cr.minX, cr.maxX, cr.minY, cr.maxY);
 		printf("colour: near v0 (66,65) 0x%08x  near v1 (189,65) 0x%08x  near v2 (128,188) 0x%08x  centroid (128,106) 0x%08x (want ~85,85,85)\n",
 		       cr.near0, cr.near1, cr.near2, cr.centroid);
 		printf("colour: %s\n", ok ? "THE COLOUR TRIANGLE IS RIGHT" : "wrong colour image");

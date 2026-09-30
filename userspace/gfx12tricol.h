@@ -7,15 +7,18 @@
  * What the app provides is what gfx12tri.h asks for (code, target, rings 2 MiB aligned, fence, ib), plus: the NGG shader needs the
  * attribute ring's address in its buffer descriptor, so the shaders are placed with the ring VA (rdna4_tricol_place_shaders).
  * All VAs below 2^48.
+ *
+ * Freestanding (only <stdint.h>, integer arithmetic): included by tools/linux-replay, userspace/test-gfx12tricol.c and the kext
+ * (src/gfxring.cpp, the boot-arg rdna4-gfxcol=1 draw), so all three run the same shader words, descriptor and colour check.
  */
 #ifndef RDNA4_GFX12TRICOL_H
 #define RDNA4_GFX12TRICOL_H
 
 #include <stdint.h>
 
-#include "gfx12_draw_col.h"
-#include "nggcol_kernel.h"
-#include "pscol_kernel.h"
+#include "../src/gfx12_draw_col.h"   /* relative: the kext has no -Isrc / -Iuserspace in its flags */
+#include "../src/nggcol_kernel.h"
+#include "../src/pscol_kernel.h"
 
 #ifdef __cplusplus
 #define RDNA4_TRICOL(x) Gfx12DrawCol::x
@@ -39,19 +42,32 @@ typedef struct rdna4_tricol_va {
 static inline uint64_t rdna4_tricol_ring_bytes(void) { return RDNA4_TRICOL(kColRingBytes); }
 static inline uint32_t rdna4_tricol_ib_dwords(void) { return sizeof(RDNA4_TRICOL(kColStream)) / 4; }
 
-/* nggcol.s and pscol.s into the code buffer, each padded with s_code_end. nggcol.s builds its attribute ring buffer descriptor
- * from three literal dwords (shaders/nggcol.s): 0xc01a0001 = ring VA low, 0xc01a0002 = dword1 = VA[47:32] | swizzle_enable 3
- * (0xc0000000) | stride 16 << 16, 0xc01a0003 = ring size in bytes (ac_build_attr_ring_descriptor + radv_nir_lower_abi.c:109-118). */
+/* The dwords of the two shaders, each followed by s_code_end padding (RDNA4_TRICOL_SHADER_PAD dwords per slot), for callers whose code slots are
+ * not one buffer (the kext writes them through volatile pool pointers). nggcol.s builds its attribute ring buffer descriptor from three
+ * literal dwords (shaders/nggcol.s): 0xc01a0001 = ring VA low, 0xc01a0002 = dword1 = VA[47:32] | swizzle_enable 3 (0xc0000000) | stride
+ * 16 << 16, 0xc01a0003 = ring size in bytes (ac_build_attr_ring_descriptor + radv_nir_lower_abi.c:109-118). */
+static inline uint32_t rdna4_tricol_vs_dword(uint32_t i, uint64_t attrRingVa) {
+	if (i >= sizeof(kNggcolKernel) / 4)
+		return 0xbf9f0000u;
+	const uint32_t d = kNggcolKernel[i];
+	if (d == 0xc01a0001u)
+		return (uint32_t)attrRingVa;
+	if (d == 0xc01a0002u)
+		return (uint32_t)((attrRingVa >> 32) & 0xffffu) | 0xc0000000u | (16u << 16);
+	if (d == 0xc01a0003u)
+		return (uint32_t)RDNA4_TRICOL(kColRingBytes);
+	return d;
+}
+static inline uint32_t rdna4_tricol_ps_dword(uint32_t i) {
+	return i < sizeof(kPscolKernel) / 4 ? kPscolKernel[i] : 0xbf9f0000u;
+}
+
+/* nggcol.s and pscol.s into one code buffer (PS at +RDNA4_TRICOL_PS_OFFSET). */
 static inline void rdna4_tricol_place_shaders(void *code, uint64_t attrRingVa) {
 	uint32_t *vs = (uint32_t *)code, *ps = (uint32_t *)((char *)code + RDNA4_TRICOL_PS_OFFSET);
-	const uint32_t dword1 = (uint32_t)((attrRingVa >> 32) & 0xffffu) | 0xc0000000u | (16u << 16);
 	for (uint32_t i = 0; i < RDNA4_TRICOL_SHADER_PAD; i++) {
-		uint32_t d = i < sizeof(kNggcolKernel) / 4 ? kNggcolKernel[i] : 0xbf9f0000u;
-		if (d == 0xc01a0001u) d = (uint32_t)attrRingVa;
-		else if (d == 0xc01a0002u) d = dword1;
-		else if (d == 0xc01a0003u) d = (uint32_t)RDNA4_TRICOL(kColRingBytes);
-		vs[i] = d;
-		ps[i] = i < sizeof(kPscolKernel) / 4 ? kPscolKernel[i] : 0xbf9f0000u;
+		vs[i] = rdna4_tricol_vs_dword(i, attrRingVa);
+		ps[i] = rdna4_tricol_ps_dword(i);
 	}
 }
 
@@ -82,50 +98,56 @@ static inline uint32_t rdna4_tricol_record(uint32_t *ib, const rdna4_tricol_va *
 	return n;
 }
 
-/* The check of the colour triangle (docs/g4-colour.md, the same as tools/radv-triangle TRI_COLOR=1): the 256x256 target's covered
- * (non-zero) pixels must be the G3 triangle's 8192, each with alpha 0xFF and R, G, B within kColChannelTolerance of 255 * the
- * barycentric weights of (64,64) red, (192,64) green, (128,192) blue at the pixel centre (RADV on the card: max error 0.5, and
- * |R+G+B - 255| <= 1), each the nearest vertex's colour dominant. */
+/* The check of the colour triangle (docs/g4-colour.md, the same as tools/radv-triangle TRI_COLOR=1), in integer arithmetic. The 256x256 target's
+ * covered (non-zero) pixels must be the G3 triangle's 8192 (bounds x 64..191, y 64..190), each with alpha 0xFF and R, G, B within
+ * kColChannelTolerance of 255 * the barycentric weights of (64,64) red, (192,64) green, (128,192) blue at the pixel centre (RADV and the kext's own
+ * first run on the card: largest channel error 0.50, |R+G+B - 255| <= 1), each pixel's strongest channel the nearest vertex's (within the same
+ * tolerance), the pixels near the vertices dominated by that vertex's colour and the centroid pixel ~(85,85,85).
+ * Weights: with doubled coordinates v0 (128,128), v1 (384,128), v2 (256,384) and the pixel centre (2x+1, 2y+1) the barycentric numerators are
+ * n0 = -256 (cx - 256) - 128 (cy - 384), n1 = 256 (cx - 256) - 128 (cy - 384), n2 = 65536 - n0 - n1 over a denominator of 65536. */
 typedef struct rdna4_tricol_result {
-	uint32_t covered;        /* non-zero pixels */
-	uint32_t badAlpha;       /* covered pixels whose alpha is not 0xFF */
-	uint32_t notDominant;    /* covered pixels whose strongest channel is not the nearest vertex's */
-	double maxChannelError;  /* max |channel - exact barycentric colour| */
-	double maxSumError;      /* max |R + G + B - 255| */
+	uint32_t covered;          /* non-zero pixels */
+	uint32_t badAlpha;         /* covered pixels whose alpha is not 0xFF */
+	uint32_t notDominant;      /* covered pixels whose strongest channel is not (within tolerance) the nearest vertex's */
+	uint32_t maxChannelErr256; /* max |channel - exact barycentric colour|, in 1/256 channel units (0.50 = 128) */
+	uint32_t maxSumErr;        /* max |R + G + B - 255| */
+	uint32_t minX, maxX, minY, maxY;   /* bounds of the covered pixels */
 	uint32_t near0, near1, near2, centroid;   /* pixels (66,65), (189,65), (128,188), (128,106) */
 } rdna4_tricol_result;
 
-static inline double rdna4_tricol_abs(double x) { return x < 0 ? -x : x; }
+static inline uint32_t rdna4_tricol_absdiff(int32_t a, int32_t b) { return (uint32_t)(a > b ? a - b : b - a); }
 
 static inline int rdna4_tricol_check(const uint32_t *target, rdna4_tricol_result *res) {
-	const double x0 = 64, y0 = 64, x1 = 192, y1 = 64, x2 = 128, y2 = 192;
-	const double den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
-	rdna4_tricol_result r = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-	for (uint32_t y = 0; y < 256; y++)
-		for (uint32_t x = 0; x < 256; x++) {
+	rdna4_tricol_result r = { 0, 0, 0, 0, 0, 255, 0, 255, 0, 0, 0, 0, 0 };
+	const int32_t tol = (int32_t)RDNA4_TRICOL(kColChannelTolerance);
+	for (int32_t y = 0; y < 256; y++)
+		for (int32_t x = 0; x < 256; x++) {
 			const uint32_t v = target[y * 256 + x];
 			if (!v)
 				continue;
 			r.covered++;
-			const double cx = x + 0.5, cy = y + 0.5;
-			const double l0 = ((y1 - y2) * (cx - x2) + (x2 - x1) * (cy - y2)) / den;
-			const double l1 = ((y2 - y0) * (cx - x2) + (x0 - x2) * (cy - y2)) / den;
-			const double l2 = 1.0 - l0 - l1;
-			const double e[3] = { 255 * l0, 255 * l1, 255 * l2 };
-			const int c[3] = { (int)(v & 0xff), (int)((v >> 8) & 0xff), (int)((v >> 16) & 0xff) };
+			if ((uint32_t)x < r.minX) r.minX = (uint32_t)x;
+			if ((uint32_t)x > r.maxX) r.maxX = (uint32_t)x;
+			if ((uint32_t)y < r.minY) r.minY = (uint32_t)y;
+			if ((uint32_t)y > r.maxY) r.maxY = (uint32_t)y;
+			const int32_t cx = 2 * x + 1, cy = 2 * y + 1;
+			const int32_t n0 = -256 * (cx - 256) - 128 * (cy - 384);
+			const int32_t n1 = 256 * (cx - 256) - 128 * (cy - 384);
+			const int32_t n[3] = { n0, n1, 65536 - n0 - n1 };
+			const int32_t c[3] = { (int32_t)(v & 0xff), (int32_t)((v >> 8) & 0xff), (int32_t)((v >> 16) & 0xff) };
 			if ((v >> 24) != 0xff)
 				r.badAlpha++;
-			const double sum = rdna4_tricol_abs(c[0] + c[1] + c[2] - 255.0);
-			if (sum > r.maxSumError)
-				r.maxSumError = sum;
+			const uint32_t sum = rdna4_tricol_absdiff(c[0] + c[1] + c[2], 255);
+			if (sum > r.maxSumErr)
+				r.maxSumErr = sum;
 			for (int k = 0; k < 3; k++) {
-				const double d = rdna4_tricol_abs(c[k] - e[k]);
-				if (d > r.maxChannelError)
-					r.maxChannelError = d;
+				const uint32_t e = rdna4_tricol_absdiff(256 * c[k], (255 * n[k]) / 256);
+				if (e > r.maxChannelErr256)
+					r.maxChannelErr256 = e;
 			}
 			const int dom = c[0] >= c[1] && c[0] >= c[2] ? 0 : c[1] >= c[2] ? 1 : 2;
-			const int want = l0 >= l1 && l0 >= l2 ? 0 : l1 >= l2 ? 1 : 2;
-			if (dom != want)
+			const int32_t nmax = n[0] >= n[1] && n[0] >= n[2] ? n[0] : n[1] >= n[2] ? n[1] : n[2];
+			if (n[dom] < nmax - tol * 65536 / 255)   /* the chosen channel's weight must be the largest, within the tolerance */
 				r.notDominant++;
 		}
 	r.near0 = target[65 * 256 + 66];
@@ -134,14 +156,14 @@ static inline int rdna4_tricol_check(const uint32_t *target, rdna4_tricol_result
 	r.centroid = target[106 * 256 + 128];
 	if (res)
 		*res = r;
-	const double tol = (double)RDNA4_TRICOL(kColChannelTolerance);
 	int cenOk = 1;
 	for (int k = 0; k < 3; k++) {
-		const int c = (int)((r.centroid >> (8 * k)) & 0xff);
+		const int32_t c = (int32_t)((r.centroid >> (8 * k)) & 0xff);
 		cenOk = cenOk && c >= 79 && c <= 91;   /* ~85 +- 6 */
 	}
-	return r.covered == RDNA4_TRICOL(kColCoveredPixels) && !r.badAlpha && !r.notDominant && r.maxChannelError <= tol &&
-	       r.maxSumError <= tol && (r.near0 & 0xff) > 200 && ((r.near1 >> 8) & 0xff) > 200 && ((r.near2 >> 16) & 0xff) > 200 && cenOk;
+	return r.covered == RDNA4_TRICOL(kColCoveredPixels) && r.minX == 64 && r.maxX == 191 && r.minY == 64 && r.maxY == 190 &&
+	       !r.badAlpha && !r.notDominant && r.maxChannelErr256 <= (uint32_t)tol * 256 && r.maxSumErr <= (uint32_t)tol &&
+	       (r.near0 & 0xff) > 200 && ((r.near1 >> 8) & 0xff) > 200 && ((r.near2 >> 16) & 0xff) > 200 && cenOk;
 }
 
 #endif
