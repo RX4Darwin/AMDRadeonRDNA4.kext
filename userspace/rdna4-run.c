@@ -89,6 +89,8 @@ static int cmdInfo(rdna4_t *gpu) {
 	       : "the CPU through the BAR (no DMA)");
 	if (in.flags & RDNA4_FLAG_VM)
 		printf("GPUVM: VMID %llu, MEC1 pipe %llu queue %llu\n", in.vmid, in.pipe, in.queue);
+	if (in.flags & RDNA4_FLAG_GFX)
+		printf("GFX: client gfx IBs available (SubmitGfxIb: rdna4-run tri / tricol)\n");
 	return 0;
 }
 

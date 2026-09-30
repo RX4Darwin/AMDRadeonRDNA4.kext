@@ -2376,13 +2376,14 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	/* The same VMID-selected shader memory state as launch(): the user IB
 	 * supplies the program and resource registers, while this selector only
 	 * chains it and fences it. */
-	grbmSelect(0, c->pipe, c->queue, c->vmid);
+	const uint32_t ibVmid = vmidForSubmit(*c);
+	grbmSelect(0, c->pipe, c->queue, ibVmid);
 	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
 	wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 	const uint32_t value = nextFence(c->fence);
 	uint32_t pkt[8];
 	if (!c->pm4.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync)) ||
-	    !c->pm4.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), c->vmid)) ||
+	    !c->pm4.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), ibVmid)) ||
 	    !c->pm4.emit(pkt, Pm4::releaseMem(pkt, c->fenceVa, value,
 	                                      ihActive && c->pipe < 2)))
 		return kIOReturnNoResources;
@@ -2543,14 +2544,15 @@ IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords
 	if (c.gfxOutstanding >= kMaxIbOutstanding || gfxClientPending >= kMaxGfxOutstanding)
 		return kIOReturnBusy;
 	/* The VMID's shader memory state, as the compute path and gfx_v12_0_init_compute_vmid set it (boot already does it for VMIDs 8-15). */
-	grbmSelect(0, 0, 0, c.vmid);
+	const uint32_t ibVmid = vmidForSubmit(c);
+	grbmSelect(0, 0, 0, ibVmid);
 	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
 	wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 	grbmSelect(0, 0, 0, 0);
 	const uint32_t value = nextFence(c.gfxFence);
 	uint32_t pkt[8];
 	if (!gfxRing.emit(pkt, Pm4::contextControl(pkt, 0x80000000u, 0x80000000u)) ||
-	    !gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, ibVa, dwords, c.vmid)) ||
+	    !gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, ibVa, dwords, ibVmid)) ||
 	    !gfxRing.emit(pkt, Pm4::releaseMem(pkt, c.gfxFenceMc, value)))
 		return kIOReturnNoResources;
 	c.gfxFence = value;

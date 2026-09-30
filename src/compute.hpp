@@ -795,6 +795,9 @@ private:
 	void scrubFaultPage();
 	void releaseHost(RtBuffer &buffer);
 	void retireIbFences(RtClient &client);
+	// The VMID an IB submitted for `client` runs in (the INDIRECT_BUFFER packet's VMID field and the SH_MEM state selected for it), from this ONE
+	// function: the client's fixed VMID today. W13's VMID pool (docs/w13-vmid.md 5.6) substitutes its per-submission grab here.
+	uint32_t vmidForSubmit(const RtClient &client) const { return client.vmid; }
 	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
 	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
 	// so the two never use the ring at the same time. Everything below runs under rtLock.

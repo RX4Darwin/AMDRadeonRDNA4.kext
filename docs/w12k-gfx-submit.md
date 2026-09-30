@@ -136,3 +136,36 @@ forgot them would fault in its *own* VM (an unmapped address), not touch anyone 
 
 Everything above is built and unit-tested on Linux only. Not measured: the kext ring path on the card or in the emulator (first run is Kiln's loop or the next real-card boot), the CP's PRIV enforcement on this path (inferred from
 amdgpu/W12e), a real gfx hang and what the wedge leaves behind (halt + reboot is the conservative response, chosen without a hang to observe), the behaviour of a stuck wave for other queues, and the per-submission cost.
+
+### Dependency: every unmap must invalidate (W13 S0) — W12k must not be enabled or merged without it
+
+The "no ring-side VM flush" decision above rests on one invariant: **a VMID's translations are invalidated (over MMIO, `vmInvalidate`) whenever a mapping goes away**, so the CP/UTCL
+never walks a stale PTE of a freed buffer that has been reused. Forge found, and the lead verified, that `rtFree` does **not** do this for **device** buffers today (it calls `vmUnmap` and frees the heap
+range; `vmInvalidate` only runs for host buffers). For compute that hole already exists; for gfx it would let a client's stream reach freed-and-reallocated VRAM. The fix is W13 step S0 on
+`premetal/w13` (not made here, to avoid a conflict). **Do not enable W12k (boot 8, `rdna4-run tri/tricol` against a real card) or merge `premetal/w12k` without S0.** `rtRelease` is not affected: it clears the
+whole table and invalidates (`vmInvalidate(vmid, "client close")`) before the VMID is reused.
+
+### One place for the IB's VMID (W13 contract, docs/w13-vmid.md 5.6)
+
+The VMID an IB runs in comes from **one function**, `RDNA4Compute::vmidForSubmit(const RtClient &)` (`src/compute.hpp`), which returns the client's fixed `vmid` today. It supplies the VMID field of the gfx
+`INDIRECT_BUFFER` (`gfxClientEmit`), the compute `INDIRECT_BUFFER` (`rtSubmitIb`) and the `SH_MEM_CONFIG/BASES` selection made for it. W13's VMID pool replaces the body later (a per-submission grab);
+nothing else in the submit paths names `c.vmid` for this purpose. No behaviour change.
+
+### Boot 8: clients on a live ring (tools/set-boot.sh, tools/diagnostic-log.sh)
+
+Boot 3 (probe) halts PFP/ME after its draws (`gfxPark`), so applications cannot draw there. **Boot 8** = boot 2 (`rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1`) +
+`rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1`, **without** `rdna4-gfxprobe` / `rdna4-gfxdiag`, so the ring stays up after bring-up. Bring-up draws G3 and (after a passing baseline) G4, then runs the kernel's
+synthetic client-IB self-test (`gfx-client`); the ring is not parked. `diagnostic-log.sh`, when `rdna4-gfx` is set, it is not a probe boot, the runtime is up and `rdna4-vm=1`:
+1. `rdna4-run info` (already a step): must print the line `GFX: client gfx IBs available ...` (RDNA4_FLAG_GFX); if it does not, rows `gfx-app-tri` and `gfx-app-tricol` are **FAIL** ("no GFX flag");
+2. `rdna4-run tri`, behind `run_step` (the same 120 s hard bound as the other `rdna4-run` steps), row **`gfx-app-tri`**: PASS only when the command prints its own success line `  PASS  tri: ...` and exits 0;
+3. `rdna4-run tricol`, same bound, row **`gfx-app-tricol`**: PASS only on `  PASS  tricol: ...`; it runs only after `tri` passed (a client IB that hangs wedges the gfx ring until the next bring-up, so a
+   second submit after a failed first one would only add noise), else the row is SKIPPED ("tri did not pass").
+Otherwise both rows are SKIPPED with the reason (gfx not enabled / probe boot / runtime unavailable / needs rdna4-vm=1).
+
+**Which binary the stick needs:** the script uses `$HERE/rdna4-run`, i.e. a file named `rdna4-run` **next to `diagnostic-log.sh`** (the stick root, where the script lives), copies it to `/tmp/rdna4-run` and runs
+that. For boot 8 it must be the `build/rdna4-run` of a build that contains `tri`/`tricol` and the new selectors (this branch's `make`/`tools/build-osxcross.sh` output); an older `rdna4-run` has no `tri` command and
+would print its usage and exit non-zero (row FAIL). The kext on the stick must be built from the same tree (the selectors are new).
+
+**Expected on the emulator (Kiln's / the Windows dry run), boot 8:** `gfx` PASS (G3), `gfx-client` PASS (the self-test's WRITE_DATA IB in a client VMID is modelled by W12e), `gfx-app-info` implicit (the GFX line is
+printed), **`gfx-app-tri` PASS** (the same stream the replay proves; the emulator models it in a client VMID), **`gfx-app-tricol` FAIL** and `gfx-col` FAIL: the G4 attribute-ring path is not modelled there
+(`docs/g4-colour.md` section 7: the draw is refused, 0 px), so `rdna4-run tricol` reports `FAIL  tricol: 0 px ...`. That FAIL is expected on the emulator and is not a regression; on the real card both should PASS.
