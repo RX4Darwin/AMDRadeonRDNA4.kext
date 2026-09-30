@@ -39,7 +39,10 @@ bool RDNA4Compute::sharedStart(uint32_t k) {
 	SharedQueue &s = sharedQ[k];
 	s.pipe = k;
 	s.queue = 2;
-	s.doorbell = (0x0d + 8 + k) * 2;
+	/* Its own doorbell dwords: client slots use (0x0d + slot) * 2 (26-40) and the S1 probe queues (0x0d + 8 + area) * 2 (42 and up). Sharing 42 and 44
+	 * with the probe queues at (0,1)/(1,1) made the emulator send the shared queues' doorbells to a dequeued probe HQD (hub-task-347); on the card it
+	 * would make the routing depend on a dead queue's register state. */
+	s.doorbell = (0x0d + 24 + k) * 2;
 	s.area = kVmQueueBase + (8 + k) * kVmQueueStride;
 	s.wedged = false;
 	if (s.area + 0x7000 > pool.size)
