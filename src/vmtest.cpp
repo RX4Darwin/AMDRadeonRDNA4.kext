@@ -141,18 +141,23 @@ void RDNA4Compute::vmIdSurvey(const char *tag, uint32_t settleMs) {
 // A bounded trace of one client operation: the runtime's own view (wedged, client slot) and the HQD's (active, rptr/wptr,
 // doorbell HIT) plus the latched fault. At most 64 lines per boot.
 void RDNA4Compute::vmOpTrace(const char *op, uint32_t vmid, uint32_t pipe, uint32_t queue) {
-	if (!vmOpTraceOn || vmOpTraceLines >= 48)
+	/* Two budgets (hub-task-347): the S1 probes ran first and used all 48 lines, so the runtime clients that follow were never traced. */
+	uint32_t &lines = vmOpInProbe ? vmOpProbeLines : vmOpTraceLines;
+	if (!vmOpTraceOn || lines >= (vmOpInProbe ? 48u : 96u))
 		return;
-	vmOpTraceLines++;
+	lines++;
 	grbmSelect(1, pipe, queue, vmid);
 	const uint32_t act = rdGc(CpHqdActive), rp = rdGc(CpHqdPqRptr), wl = rdGc(CpHqdPqWptrLo), db = rdGc(CpHqdPqDoorbell);
 	grbmSelect(0, 0, 0, 0);
 	const uint32_t cpcb = rdGc(CpCpcBusyStat), flt = rdGc(GcL2FaultStatusLo);
-	VLOG("op %s: client VMID %u HQD %u/%u wedged %d: ACTIVE %u rptr %u wptr %u doorbell 0x%08x%s CPC_BUSY 0x%08x fault 0x%08x", op,
-	     vmid, pipe, queue, rtWedged, act & 1, rp, wl, db, (db >> 31) ? " HIT" : "", cpcb, flt);
+	VLOG("op %s%s: client VMID %u HQD %u/%u wedged %d: ACTIVE %u rptr %u wptr %u doorbell 0x%08x%s CPC_BUSY 0x%08x fault 0x%08x", op,
+	     vmOpInProbe ? " (probe)" : "", vmid, pipe, queue, rtWedged, act & 1, rp, wl, db, (db >> 31) ? " HIT" : "", cpcb, flt);
 	char entry[160];
 	snprintf(entry, sizeof(entry), "%s v%u %u/%u W%d a%u r%u w%u H%u C%x F%x", op, vmid, pipe, queue, rtWedged, act & 1, rp, wl, db >> 31, cpcb, flt);
-	vmRegistryAdd("Compute,VMOps", vmOpsBuf, sizeof(vmOpsBuf), vmOpsLen, vmOpsFull, entry);
+	if (vmOpInProbe)
+		vmRegistryAdd("Compute,VMProbeOps", vmProbeOpsBuf, sizeof(vmProbeOpsBuf), vmProbeOpsLen, vmProbeOpsFull, entry);
+	else
+		vmRegistryAdd("Compute,VMOps", vmOpsBuf, sizeof(vmOpsBuf), vmOpsLen, vmOpsFull, entry);
 }
 
 namespace {
@@ -222,6 +227,11 @@ uint32_t recordDispatch(uint32_t *ib, const CodeObj::Kernel &k, uint32_t groups)
 } // namespace
 
 void RDNA4Compute::vmIdTest(bool late) {
+	struct ProbeScope {
+		bool &flag;
+		explicit ProbeScope(bool &f) : flag(f) { flag = true; }
+		~ProbeScope() { flag = false; }
+	} probeScope(vmOpInProbe);
 	gVtPhase = late ? " late" : "";
 	const char *const resultKey = late ? "vmidtest-late" : "vmidtest";
 	VLOG("S1 diagnostic (docs/w13-vmid.md s.8.1)%s; one line per probe, a dump on failure", late ? ": the probes repeated after clock gating" : "");
