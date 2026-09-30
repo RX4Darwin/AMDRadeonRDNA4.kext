@@ -23,6 +23,7 @@ enum Op : uint32_t {
 	OpDispatchDirect = 0x15,
 	OpCopyData       = 0x40,
 	OpWriteData      = 0x37,
+	OpEventWrite     = 0x46,
 	OpReleaseMem     = 0x49,
 	OpAcquireMem     = 0x58,
 	OpIndirectBuffer = 0x3f,
@@ -68,6 +69,12 @@ uint32_t writeData(uint32_t *out, uint64_t addr, uint32_t value);
 uint32_t setContextReg(uint32_t *out, uint32_t offset, uint32_t value);
 // A NOP packet with one payload dword (header + 1).
 uint32_t nop(uint32_t *out);
+// EVENT_WRITE with no address (PIPELINESTAT_START): header C0004600-style, one payload dword = `eventDw`.
+uint32_t eventWrite(uint32_t *out, uint32_t eventDw);
+// EVENT_WRITE that writes to memory (SAMPLE_PIPELINESTAT: si_query.c:854-857): `eventDw` = event type | index << 8, then the address.
+uint32_t eventWriteAddr(uint32_t *out, uint32_t eventDw, uint64_t addr);
+// SET_CONTEXT_REG of `count` consecutive registers from context offset `offset` (reg - 0xa000).
+uint32_t setContextRegs(uint32_t *out, uint32_t offset, const uint32_t *values, uint32_t count);
 // gfx_v12_0_ring_emit_rreg (gfx_v12_0.c:4697-4706): COPY_DATA of one register (src_sel 0, the MMIO
 // dword offset the CP reads it at) to memory (dst_sel 5) with write confirm. The CP executes it in
 // order on the ring, so it reports the state the CP itself holds at that point of the stream.

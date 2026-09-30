@@ -393,11 +393,28 @@ private:
 	static constexpr uint32_t kGfxMarkerOffset = kGfxTestOffset + 0x40;   // the PS-store diagnostic marker
 	static constexpr uint32_t kGfxProbeOffset  = kGfxRptrOffset + 0x200;  // CP-view readback, state before the draw (32 dwords); +0x100 is the PS marker (W33: they overlapped)
 	static constexpr uint32_t kGfxProbePost    = kGfxRptrOffset + 0x280;  // ... and after it
+	// W37: pipeline statistics before/after the draw (SAMPLE_PIPELINESTAT: 14 x u64 = 0x70 bytes, 8-byte aligned), the
+	// NGG/VS marker variant's three dwords, and a private zeroed page to map at VMID0 VA 0 (rootcause-draw.md #2).
+	static constexpr uint32_t kGfxPstatPre     = kGfxRptrOffset + 0x300;
+	static constexpr uint32_t kGfxPstatPost    = kGfxRptrOffset + 0x400;
+	static constexpr uint32_t kGfxNggMarkOffset = kGfxRptrOffset + 0x500;
+	static constexpr uint32_t kGfxVa0Offset    = kGfxOffset + 0x80000;    // 4 KiB, page aligned
 	uint64_t   gfxRings { 0 };               // device-heap offset of the GE rings (0 = none)
 	bool stageGfxDraw();
+	// W37 (rootcause-draw.md #1-#4).
+	void gfxSrmEnable();                     // RLC_SRM_CNTL |= AUTO_INCR_ADDR | SRM_ENABLE after the CSB init, as amdgpu
+	void gfxEmitCsbReplay();                 // the clear-state extents as SET_CONTEXT_REG on the ring before the draw
+	void gfxContextDump(const char *tag);    // MMIO read of the clear-state registers and their neighbours
+	void gfxQueueEvidence(const char *tag);  // MQD / HQD / RS64 local-base registers the kext never programs
+	void gfxMapVa0();                        // VMID0 VA 0 -> a private zeroed page (rdna4-gfxprobe=1), flushes the GC TLB
+	void gfxDumpVa0(const char *tag);        // what the CP wrote at VA 0
+	void gfxPstatReport(const char *label);  // deltas of the two SAMPLE_PIPELINESTAT buffers
+	static bool requestedGfxSrm();           // rdna4-gfxsrm=0 turns SRM off (A/B control)
+	static bool requestedGfxCsbReplay();     // rdna4-gfxcsb=0 turns the replay off (A/B control)
 	struct GfxDrawResult {
 		bool ok, ringDone;
 		uint32_t drawFence, covered, other, firstNonZero, marker;
+		uint32_t nggMarker, nggS2, nggS3;      // W37: the NGG marker variant (bit 32)
 		uint32_t minX, maxX, minY, maxY, row64[2], row190[2];
 		uint64_t ns;
 		bool probeSeen;                         // rdna4-gfxprobe: the CP-side readback ran for this draw

@@ -510,6 +510,29 @@ constexpr Reg CpRbActive          { 0, 0x1f40 };
 constexpr Reg RlcCsibAddrLo       { 1, 0x0987 };
 constexpr Reg RlcCsibAddrHi       { 1, 0x0988 };
 constexpr Reg RlcCsibLength       { 1, 0x0989 };   // dwords
+// W37: RLC_SRM_CNTL (gc_12_0_0_offset.h, GC idx 1): SRM_ENABLE bit 0, AUTO_INCR_ADDR bit 1
+// (gfx_v12_0_rlc_enable_srm, gfx_v12_0.c:2005-2008).
+constexpr Reg RlcSrmCntl          { 1, 0x4c80 };
+constexpr uint32_t kRlcSrmEnable = 1u << 0, kRlcSrmAutoIncr = 1u << 1;
+// W37: the gfx queue descriptor registers amdgpu programs from an MQD (gfx_v12_0_gfx_mqd_init) and the kext
+// never touches (GC idx 0), plus RS64 LOCAL_BASE0 (GC idx 1): read-only evidence for rootcause-draw.md #2.
+constexpr Reg CpGfxHpdOspreFenceLo { 0, 0x1e74 };
+constexpr Reg CpGfxHpdOspreFenceHi { 0, 0x1e75 };
+constexpr Reg CpGfxMqdBaseLo      { 0, 0x1e7e };
+constexpr Reg CpGfxMqdBaseHi      { 0, 0x1e7f };
+constexpr Reg CpGfxHqdVmid        { 0, 0x1e81 };
+constexpr Reg CpGfxHqdBase        { 0, 0x1e86 };
+constexpr Reg CpGfxHqdBaseHi      { 0, 0x1e87 };
+constexpr Reg CpGfxHqdRptr        { 0, 0x1e88 };
+constexpr Reg CpGfxHqdRptrAddr    { 0, 0x1e89 };
+constexpr Reg CpGfxHqdRptrAddrHi  { 0, 0x1e8a };
+constexpr Reg CpGfxHqdCntl        { 0, 0x1e8f };
+constexpr Reg CpGfxHqdWptr        { 0, 0x1e91 };
+constexpr Reg CpGfxHqdWptrHi      { 0, 0x1e92 };
+constexpr Reg CpGfxHqdHqStatus0   { 0, 0x1e98 };
+constexpr Reg CpGfxHqdHqControl0  { 0, 0x1e99 };
+constexpr Reg CpGfxMqdControl     { 0, 0x1e9a };
+constexpr Reg CpGfxRs64LocalBase0Lo { 1, 0x2a0a };
 constexpr uint32_t kCpRbDoorbellEn        = 1u << 30;
 constexpr uint32_t kCpRbDoorbellRangeMask = 0x00000ffc;
 // AMDGPU_NAVI10_DOORBELL_GFX_RING0 (0x08B) in 64-bit doorbell dwords, as

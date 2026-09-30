@@ -23,6 +23,28 @@ uint32_t setContextReg(uint32_t *out, uint32_t offset, uint32_t value) {
 	return 3;
 }
 
+uint32_t eventWrite(uint32_t *out, uint32_t eventDw) {
+	out[0] = header(OpEventWrite, 0);
+	out[1] = eventDw;
+	return 2;
+}
+
+uint32_t eventWriteAddr(uint32_t *out, uint32_t eventDw, uint64_t addr) {
+	out[0] = header(OpEventWrite, 2);
+	out[1] = eventDw;
+	out[2] = static_cast<uint32_t>(addr) & ~7u;
+	out[3] = static_cast<uint32_t>(addr >> 32);
+	return 4;
+}
+
+uint32_t setContextRegs(uint32_t *out, uint32_t offset, const uint32_t *values, uint32_t count) {
+	out[0] = header(OpSetContextReg, count);
+	out[1] = offset;
+	for (uint32_t i = 0; i < count; i++)
+		out[2 + i] = values[i];
+	return 2 + count;
+}
+
 uint32_t nop(uint32_t *out) {
 	out[0] = header(OpNop, 0);
 	out[1] = 0;
