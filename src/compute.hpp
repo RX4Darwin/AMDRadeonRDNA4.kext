@@ -643,6 +643,9 @@ public:
 	IOReturn rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags,
 	                    uint64_t &fence);
 	IOReturn rtWaitFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns);
+	// W12k: a client's own gfx IB on the kernel's gfx ring (runtime.cpp, docs/w12k-gfx-submit.md)
+	IOReturn rtSubmitGfxIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags, uint64_t &fence);
+	IOReturn rtWaitGfxFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns);
 	IOReturn rtPresent(const void *owner, uint64_t handle, uint64_t offset,
 	                   uint64_t &geometry, uint64_t &pitch);
 	IOReturn rtPresentAsync(const void *owner, uint64_t handle, uint64_t offset,
@@ -706,6 +709,13 @@ private:
 		uint32_t fence { 0 }, doorbell { 0 };
 		uint32_t ibFences[kMaxIbOutstanding] {};
 		uint32_t ibOutstanding { 0 };
+		// W12k: this client's gfx fence: a dword of its own in the fence page (+0x40; the gfx ring writes it at the VMID0 MC
+		// address gfxFenceMc, the client can read it at fenceVa + 0x40), the last value handed out, and the ones not yet retired.
+		volatile uint32_t *gfxFenceCpu { nullptr };
+		uint64_t gfxFenceMc { 0 };
+		uint32_t gfxFence { 0 };
+		uint32_t gfxFences[kMaxIbOutstanding] {};
+		uint32_t gfxOutstanding { 0 };
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
 		bool active { false };
@@ -785,6 +795,26 @@ private:
 	void scrubFaultPage();
 	void releaseHost(RtBuffer &buffer);
 	void retireIbFences(RtClient &client);
+	// The VMID an IB submitted for `client` runs in (the INDIRECT_BUFFER packet's VMID field and the SH_MEM state selected for it), from this ONE
+	// function: the client's fixed VMID today. W13's VMID pool (docs/w13-vmid.md 5.6) substitutes its per-submission grab here.
+	uint32_t vmidForSubmit(const RtClient &client) const { return client.vmid; }
+	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
+	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
+	// so the two never use the ring at the same time. Everything below runs under rtLock.
+	static constexpr uint32_t kMaxGfxOutstanding = 16;     // submissions in the ring across all clients (15 dwords each: 240 of 4096)
+	static constexpr uint32_t kGfxFenceSlot = 0x40;        // bytes into the client's fence page
+	bool     gfxWedged { false };                          // a client gfx IB timed out: the gfx ring is given up until the next bring-up
+	bool     gfxParked { false };                          // gfxPark halted PFP/ME (probe boots)
+	uint32_t gfxClientPending { 0 };                       // client submissions not yet retired, all clients
+	IOReturn gfxClientReady() const;                       // kIOReturnSuccess when a client may use the ring now
+	void     gfxClientRetire(RtClient &client);
+	IOReturn gfxClientEmit(RtClient &client, uint64_t ibVa, uint32_t dwords, uint32_t &fence);
+	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why);
+	void     gfxClientWedge(const char *why);
+	void     gfxClientDrain(RtClient &client, const char *why);
+	void     gfxClientReset();                             // a fresh gfx ring: nothing is pending
+	bool     gfxClientSelfTest();                          // rdna4-gfxclient=1 (bring-up thread)
+	static bool requestedGfxClient();
 
 	// DMA between host memory and VRAM (runtime.cpp). One pinned, physically
 	// contiguous bounce buffer; the GC hub's AGP aperture maps system memory

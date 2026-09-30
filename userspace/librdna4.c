@@ -173,6 +173,31 @@ kern_return_t rdna4_wait_fence(rdna4_t *dev, uint64_t fence, uint32_t timeoutMs,
 	return kr;
 }
 
+kern_return_t rdna4_submit_gfx_ib(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offsetBytes,
+                                  uint32_t dwords, uint64_t *fence) {
+	if (!buf || offsetBytes > buf->bytes || offsetBytes > UINT64_MAX - buf->gpu)
+		return kIOReturnBadArgument;
+	const uint64_t in[3] = { buf->gpu + offsetBytes, dwords, 0 };
+	uint64_t out = 0;
+	uint32_t n = 1;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodSubmitGfxIb, in, 3, &out, &n);
+	if (kr == KERN_SUCCESS && fence)
+		*fence = out;
+	return kr;
+}
+
+kern_return_t rdna4_wait_gfx_fence(rdna4_t *dev, uint64_t fence, uint32_t timeoutMs, uint64_t *ns) {
+	if (fence > UINT32_MAX)
+		return kIOReturnBadArgument;
+	const uint64_t in[2] = { fence, timeoutMs };
+	uint64_t out = 0;
+	uint32_t n = 1;
+	kern_return_t kr = IOConnectCallScalarMethod(dev->conn, kRDNA4MethodWaitGfxFence, in, 2, &out, &n);
+	if (ns)
+		*ns = out;
+	return kr;
+}
+
 kern_return_t rdna4_unload(rdna4_t *dev, const rdna4_program_t *prog) {
 	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodUnload, &prog->handle, 1, NULL, NULL);
 }

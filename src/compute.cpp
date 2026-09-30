@@ -808,6 +808,8 @@ void RDNA4Compute::runStages() {
 	if (!bringupStepAllowed("gfx draw"))
 		return;
 	const bool drew = gfxOk && stageGfxDraw();
+	if (drew && requestedGfxClient())
+		(void)gfxClientSelfTest();   // W12k: a synthetic client gfx IB (rdna4-gfxclient=1), only after the G3 baseline passed
 	if (gfxOk)
 		gfxPark();   // W46: a probe boot leaves the gfx microengines halted, not polling
 	// W27: clock gating, then GFXOFF, are the last things bring-up does, after every

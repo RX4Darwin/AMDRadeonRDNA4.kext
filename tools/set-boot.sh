@@ -1,7 +1,7 @@
 #!/bin/bash
 # Set the boot-args for one boot of docs/real-card-plan.md on the OpenCore USB.
 #
-#   bash /Volumes/OPENCORE/set-boot.sh <0-7>
+#   bash /Volumes/OPENCORE/set-boot.sh <0-8>
 #
 #   Round 5 plan (D23): every test boot runs on the PROVEN base, rdna4-ih=2 rdna4-flip=1 rdna4-hang=1
 #   (interrupts, vblank + page flips, queue recovery; clock gating is on by default since W29).
@@ -16,6 +16,10 @@
 #   6  boot 3 with SRM only, no replay and no sane-clip block (amdgpu-exact; attributes the fix)   ... rdna4-gfxcsb=0 rdna4-gfxsane=0   (no gfxcol: a clean A/B control of the G3 fix)
 #   4  (retired: the real pointer is part of boot 1 since round 6)
 #   5  base + GFXOFF (optional, ALWAYS LAST, then power off)   rdna4-gfxpm=24 rdna4-gfxoff=1
+#   8  boot 2 + the gfx ring left UP for applications (W12k): rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1, WITHOUT rdna4-gfxprobe/gfxdiag (boot 3's probe parks PFP/ME after its
+#      draws, so no client could draw there). Bring-up draws G3 (+G4) and runs the kernel's synthetic client-IB self-test (gfx-client); diagnostic-log.sh then runs
+#      `rdna4-run info` (must show GFX), `rdna4-run tri` and `rdna4-run tricol` (rows gfx-app-tri / gfx-app-tricol). On the emulator: tri PASS, tricol FAIL (G4 is not modelled).
+#      Needs docs/w12k-gfx-submit.md's dependency (W13 S0: rtFree invalidates device buffers) before it is enabled on the real card.
 #   7  base + cursor self-test: magenta 64x64 square at (100,100), macOS pointer ignored   rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1 (CRC A/B: GOP state, after the CM_BYPASS clear)
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
@@ -30,7 +34,8 @@ case "${1:-}" in
 	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfxpm=24 rdna4-gfxoff=1" ;;
 	7) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1" ;;
 	6) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11 rdna4-gfxcsb=0 rdna4-gfxsane=0" ;;
-	*) echo "usage: bash $0 <0-7>   (see docs/real-card-plan.md)"; exit 1 ;;
+	8) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1" ;;
+	*) echo "usage: bash $0 <0-8>   (see docs/real-card-plan.md)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"

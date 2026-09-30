@@ -20,6 +20,7 @@ namespace Pm4 {
 
 enum Op : uint32_t {
 	OpNop            = 0x10,
+	OpContextControl = 0x28,
 	OpDispatchDirect = 0x15,
 	OpCopyData       = 0x40,
 	OpWriteData      = 0x37,
@@ -84,6 +85,9 @@ uint32_t releaseMem(uint32_t *out, uint64_t addr, uint32_t seq, bool interrupt =
 uint32_t setShReg(uint32_t *out, uint32_t reg, const uint32_t *values, uint32_t n);
 uint32_t dispatchDirect(uint32_t *out, uint32_t x, uint32_t y, uint32_t z, uint32_t initiator);
 uint32_t acquireMem(uint32_t *out, uint32_t gcrCntl);
+// CONTEXT_CONTROL (gfx_v12_0_ring_emit_cntxcntl): `load` / `shadow` are the two operand dwords. W12k emits 0x80000000, 0x80000000
+// (UPDATE_LOAD_ENABLES / UPDATE_SHADOW_ENABLES set, nothing loaded or shadowed): what gfx12_draw.h's phase 0 sets too.
+uint32_t contextControl(uint32_t *out, uint32_t load, uint32_t shadow);
 // A gfx-ring INDIRECT_BUFFER (gfx_v12_0_ring_emit_ib_gfx, no VALID bit; the
 // compute form sets it): `dwords` at `addr` (dword aligned) under `vmid`.
 uint32_t indirectBufferGfx(uint32_t *out, uint64_t addr, uint32_t dwords, uint32_t vmid);

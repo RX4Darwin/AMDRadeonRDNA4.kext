@@ -85,6 +85,13 @@ enum {
 	kRDNA4MethodWaitFence,
 	/* -> RDNA4SensorsEx: one SMU metrics sample with the power-management fields */
 	kRDNA4MethodSensorsEx,
+	/* W12k: IB GPU VA, dwords, flags -> fence value. Appends the client's own
+	 * unprivileged GRAPHICS IB (PM4 for the gfx command processor: state, draws,
+	 * end-of-pipe fences; in the client's VMID, from a buffer it owns) to the
+	 * kernel's gfx ring, followed by a per-client fence. Needs RDNA4_FLAG_GFX. */
+	kRDNA4MethodSubmitGfxIb,
+	/* gfx fence value, timeout milliseconds -> elapsed nanoseconds */
+	kRDNA4MethodWaitGfxFence,
 	kRDNA4MethodCount
 };
 
@@ -96,6 +103,9 @@ enum {
 #define RDNA4_FLAG_DMA     (1u << 2)   /* Write/Read by SDMA; buffers from all of VRAM */
 #define RDNA4_FLAG_VM      (1u << 3)   /* this client has a private GPU VM and queue */
 #define RDNA4_FLAG_RESUMED (1u << 4)   /* runtime was re-published after system sleep */
+#define RDNA4_FLAG_GFX     (1u << 5)   /* W12k: SubmitGfxIb can run now: the gfx ring is up, bring-up has finished with it,
+                                        * it is not parked (probe boots) and no client gfx IB has timed out. Additive: the ABI
+                                        * version stays 4 (new selectors at the end, this flag). */
 
 /* A compact view of the SMU 14.0.2/14.0.3 metrics table. */
 typedef struct {

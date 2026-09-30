@@ -1547,6 +1547,8 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	c->kernargCpu = poolDw(qoff + kVmKernarg);
 	c->queueCpu = poolDw(qoff + kVmPq);
 	c->fenceCpu = poolDw(qoff + kVmFence);
+	c->gfxFenceCpu = poolDw(qoff + kVmFence + kGfxFenceSlot);   // W12k: the client's gfx fence dword, in the same page (zeroed just above)
+	c->gfxFenceMc = poolMc(qoff + kVmFence + kGfxFenceSlot);
 	const uint64_t qva = c->nextVa; c->nextVa += 0x1000;
 	const uint64_t eva = c->nextVa; c->nextVa += 0x1000;
 	const uint64_t rva = c->nextVa; c->nextVa += 0x1000;
@@ -1853,6 +1855,8 @@ IOReturn RDNA4Compute::rtInfo(const void *owner, uint64_t out[9]) {
 		out[2] |= RDNA4_FLAG_VM;
 	if (resumed)
 		out[2] |= RDNA4_FLAG_RESUMED;
+	if (vmEnabled && c && gfxClientReady() == kIOReturnSuccess)
+		out[2] |= RDNA4_FLAG_GFX;
 	return kIOReturnSuccess;
 }
 
@@ -2090,6 +2094,8 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	if (presentActive && presentOwner == owner && presentHandle == handle)
 		restore = restorePresentationLocked("buffer free");
 	RtClient *c = vmClientFor(owner);
+	if (c && c->gfxOutstanding)
+		gfxClientDrain(*c, "buffer free");   // W12k: an outstanding gfx IB may still use it
 	const bool host = b->host;
 	if (c && b->va)
 		vmUnmap(*c, b->va, b->bytes);
@@ -2370,13 +2376,14 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	/* The same VMID-selected shader memory state as launch(): the user IB
 	 * supplies the program and resource registers, while this selector only
 	 * chains it and fences it. */
-	grbmSelect(0, c->pipe, c->queue, c->vmid);
+	const uint32_t ibVmid = vmidForSubmit(*c);
+	grbmSelect(0, c->pipe, c->queue, ibVmid);
 	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
 	wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 	const uint32_t value = nextFence(c->fence);
 	uint32_t pkt[8];
 	if (!c->pm4.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync)) ||
-	    !c->pm4.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), c->vmid)) ||
+	    !c->pm4.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), ibVmid)) ||
 	    !c->pm4.emit(pkt, Pm4::releaseMem(pkt, c->fenceVa, value,
 	                                      ihActive && c->pipe < 2)))
 		return kIOReturnNoResources;
@@ -2461,6 +2468,257 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 		     fence, waitMs);
 	}
 	return kIOReturnTimeout;
+}
+
+/* ---- W12k: a client's own graphics IB on the kernel's gfx ring --------------------------------------------------------------
+ * Design and the comparison with amdgpu's wrapping of a user gfx IB: docs/w12k-gfx-submit.md, "Decisions".  The short form:
+ *  - ring packets per submission: CONTEXT_CONTROL, INDIRECT_BUFFER (client's VMID, no VALID/PRIV/CHAIN), RELEASE_MEM to a per-client
+ *    fence dword (VMID0 MC address); 15 dwords.  No ring-side VM flush / pipeline sync / HDP flush / COND_EXEC: see the doc.
+ *  - the kernel's own gfx work (stageGfxRing/stageGfxDraw/gfxPark) runs on the bring-up thread without rtLock while bringupRunning is
+ *    set; client submissions hold rtLock and refuse while it is set, so the ring has one user at a time.
+ *  - a client IB that does not finish wedges the gfx ring (no per-queue reset without MES): PFP/ME are halted and gfx submissions are
+ *    refused until the next bring-up; compute queues, the display and the other runtime selectors are unaffected. */
+
+IOReturn RDNA4Compute::gfxClientReady() const {
+	if (!gfxMode)
+		return kIOReturnUnsupported;                 // rdna4-gfx=2 is not set, or the ring bring-up failed
+	if (bringupRunning || shutdownQuiesced || powerSleeping)
+		return kIOReturnNotReady;                    // the kernel still owns the ring (bring-up draws), or hardware is going away
+	if (gfxParked)
+		return kIOReturnNotReady;                    // probe boots halt PFP/ME after their draws
+	if (gfxWedged)
+		return kIOReturnNotResponding;
+	return kIOReturnSuccess;
+}
+
+void RDNA4Compute::gfxClientRetire(RtClient &c) {
+	if (!c.gfxFenceCpu || !c.gfxOutstanding)
+		return;
+	const uint32_t current = *c.gfxFenceCpu;
+	uint32_t retired = 0;
+	while (retired < c.gfxOutstanding && fenceReached(current, c.gfxFences[retired]))
+		retired++;
+	if (!retired)
+		return;
+	for (uint32_t i = retired; i < c.gfxOutstanding; i++)
+		c.gfxFences[i - retired] = c.gfxFences[i];
+	c.gfxOutstanding -= retired;
+	gfxClientPending = gfxClientPending >= retired ? gfxClientPending - retired : 0;
+}
+
+void RDNA4Compute::gfxClientReset() {
+	// Called from stageGfxRing on the bring-up thread (no rtLock held): take it, clients open and close concurrently.
+	if (rtLock)
+		IOLockLock(rtLock);
+	gfxWedged = false;
+	gfxParked = false;
+	gfxClientPending = 0;
+	for (RtClient &c : clients) {
+		c.gfxOutstanding = 0;
+		if (c.gfxFenceCpu)
+			*c.gfxFenceCpu = 0;
+		c.gfxFence = 0;
+	}
+	if (rtLock)
+		IOLockUnlock(rtLock);
+}
+
+void RDNA4Compute::gfxClientWedge(const char *why) {
+	gfxWedged = true;
+	RLOG("gfx: %s: a client gfx IB did not finish. The gfx ring has no per-queue reset here (amdgpu's goes through MES): PFP/ME are halted so "
+	     "the CP fetches nothing more, and gfx submissions are refused until the next bring-up; compute queues and the display are not affected "
+	     "(a wave that is stuck in a shader may keep the GC busy: power-cycle if it does)", why);
+	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
+	for (RtClient &c : clients)
+		c.gfxOutstanding = 0;
+	gfxClientPending = 0;
+}
+
+/* Append IB + fence for `c`: the caller has checked the state (gfxClientReady, or the bring-up self-test) and the IB's ownership/range.
+ * Packets: CONTEXT_CONTROL (amdgpu #10), INDIRECT_BUFFER in the client's VMID (#11), RELEASE_MEM to the client's fence dword (#12/#13). */
+IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords, uint32_t &fence) {
+	if (!c.gfxFenceCpu || !c.gfxFenceMc)
+		return kIOReturnNoResources;
+	for (RtClient &o : clients)
+		gfxClientRetire(o);
+	if (c.gfxOutstanding >= kMaxIbOutstanding || gfxClientPending >= kMaxGfxOutstanding)
+		return kIOReturnBusy;
+	/* The VMID's shader memory state, as the compute path and gfx_v12_0_init_compute_vmid set it (boot already does it for VMIDs 8-15). */
+	const uint32_t ibVmid = vmidForSubmit(c);
+	grbmSelect(0, 0, 0, ibVmid);
+	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
+	wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
+	grbmSelect(0, 0, 0, 0);
+	const uint32_t value = nextFence(c.gfxFence);
+	uint32_t pkt[8];
+	if (!gfxRing.emit(pkt, Pm4::contextControl(pkt, 0x80000000u, 0x80000000u)) ||
+	    !gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, ibVa, dwords, ibVmid)) ||
+	    !gfxRing.emit(pkt, Pm4::releaseMem(pkt, c.gfxFenceMc, value)))
+		return kIOReturnNoResources;
+	c.gfxFence = value;
+	flushHdp();                                      // CPU-written IB/data through the BAR are visible to the CP (amdgpu #9, done from the CPU side)
+	gfxKick(gfxRing.wptr());
+	c.gfxFences[c.gfxOutstanding++] = value;
+	gfxClientPending++;
+	fence = value;
+	RLOG("vmid %u: submitted unprivileged gfx IB VA 0x%llx, %u dwords, gfx fence %u", c.vmid, ibVa, dwords, value);
+	return kIOReturnSuccess;
+}
+
+/* Poll `c`'s gfx fence dword; on a timeout the ring is wedged (see above). rtLock is held for the wait, like rtWaitFence's. */
+bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why) {
+	const uint64_t t0 = mach_absolute_time();
+	uint64_t span = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000, &span);
+	bool done = false;
+	for (uint32_t polls = 0;; polls++) {
+		done = fenceReached(*c.gfxFenceCpu, fence);
+		if (done || mach_absolute_time() - t0 > span)
+			break;
+		if (polls < 200)
+			IODelay(10);
+		else
+			IOSleep(1);
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	if (done) {
+		gfxClientRetire(c);
+		return true;
+	}
+	RLOG("vmid %u: gfx fence %u not reached after %u ms (%s)", c.vmid, fence, timeoutMs, why);
+	gfxClientWedge(why);
+	return false;
+}
+
+/* Before a client's buffers go away (free, close) its outstanding gfx IBs must be done: they may still read or write them. */
+void RDNA4Compute::gfxClientDrain(RtClient &c, const char *why) {
+	gfxClientRetire(c);
+	if (!c.gfxOutstanding)
+		return;
+	uint64_t ns = 0;
+	(void)gfxClientWait(c, c.gfxFences[c.gfxOutstanding - 1], 2000, ns, why);
+}
+
+IOReturn RDNA4Compute::rtSubmitGfxIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags, uint64_t &fence) {
+	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;                 // a gfx IB needs the client's own VMID: no GPUVM, no client gfx
+	RtClient *c = vmClientFor(owner);
+	if (!c)
+		return kIOReturnNoResources;
+	const IOReturn ready = gfxClientReady();
+	if (ready != kIOReturnSuccess)
+		return ready;
+	/* IB_SIZE is 20 bits; flags are reserved. The IB must lie inside one buffer this client owns (the same rule as rtSubmitIb): what the IB
+	 * then touches is limited by the client's page tables (VMID) and the CP's unprivileged-IB rules, not by anything the kext parses. */
+	if (!ibVa || (ibVa & 3) || !dwords || dwords > 0xfffffu || flags)
+		return kIOReturnBadArgument;
+	const uint64_t ibBytes = dwords * 4;
+	RtBuffer *containing = nullptr;
+	for (RtBuffer &b : buffers) {
+		if (b.owner != owner || (!b.device && !b.host) || !b.va || ibVa < b.va)
+			continue;
+		const uint64_t offset = ibVa - b.va;
+		if (offset <= b.bytes && ibBytes <= b.bytes - offset) {
+			containing = &b;
+			break;
+		}
+	}
+	if (!containing)
+		return kIOReturnBadArgument;
+	gfxClientRetire(*c);
+	uint32_t value = 0;
+	const IOReturn r = gfxClientEmit(*c, ibVa, static_cast<uint32_t>(dwords), value);
+	if (r == kIOReturnSuccess)
+		fence = value;
+	return r;
+}
+
+IOReturn RDNA4Compute::rtWaitGfxFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns) {
+	Locked g(rtLock);
+	checkPresentationTimeoutLocked();
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;
+	RtClient *c = vmClientFor(owner);
+	if (!c || !c->gfxFenceCpu)
+		return kIOReturnNoResources;
+	if (!gfxMode)
+		return kIOReturnUnsupported;
+	if (timeoutMs > RDNA4_MAX_TIMEOUT_MS || static_cast<int32_t>(fence - c->gfxFence) > 0)
+		return kIOReturnBadArgument;
+	if (gfxWedged)
+		return kIOReturnNotResponding;
+	return gfxClientWait(*c, fence, timeoutMs ? timeoutMs : 1000, ns, "IB wait") ? kIOReturnSuccess : kIOReturnTimeout;
+}
+
+/* rdna4-gfxclient=1, on the bring-up thread after the G3 baseline passed: a synthetic client (internal owner token, its own VMID and page
+ * tables), a gfx IB built from two WRITE_DATA packets to a data page mapped in that VMID, two submissions with their per-client fences. It
+ * proves the ring path (CONTEXT_CONTROL + IB in a client VMID + fence) with memory the IB reaches only through the client's tables. The
+ * regular gates do not apply here: this IS the kernel using its ring, before gfxPark and before clients can submit. */
+bool RDNA4Compute::gfxClientSelfTest() {
+	static char token;
+	const void *owner = &token;
+	if (!vmEnabled || !gfxMode) {
+		RLOG("gfx client self-test skipped: needs rdna4-vm=1 and rdna4-gfx=2");
+		publishResult("gfx-client", "SKIPPED needs rdna4-vm=1 and rdna4-gfx=2");
+		return false;
+	}
+	if (rtOpen(owner) != kIOReturnSuccess) {
+		publishResult("gfx-client", "FAIL client open");
+		return false;
+	}
+	bool pass = false;
+	char result[128];
+	snprintf(result, sizeof(result), "FAIL setup");
+	{
+		Locked g(rtLock);
+		RtClient *c = clientFor(owner);
+		const uint32_t ibOff = kGfxOffset + 0x30000, dataOff = kGfxOffset + 0x31000;   // free pool pages between the G3 slots and the target
+		if (c && c->tableShadow && c->gfxFenceCpu) {
+			const uint64_t ibVa = c->nextVa, dataVa = c->nextVa + 0x1000;
+			c->nextVa += 0x2000;
+			if (vmMap(*c, ibVa, poolMc(ibOff), 0x1000, true) && vmMap(*c, dataVa, poolMc(dataOff), 0x1000, false)) {
+				uint32_t ib[16], n = 0;
+				n += Pm4::writeData(ib + n, dataVa, 0x600DF00Du);
+				n += Pm4::writeData(ib + n, dataVa + 4, 0x57EE1E57u);
+				for (uint32_t i = 0; i < n; i++)
+					*poolDw(ibOff + 4 * i) = ib[i];
+				*poolDw(dataOff) = 0;
+				*poolDw(dataOff + 4) = 0;
+				*c->gfxFenceCpu = 0;
+				c->gfxFence = 0;
+				flushHdp();
+				uint32_t f1 = 0, f2 = 0;
+				uint64_t ns1 = 0, ns2 = 0;
+				const IOReturn e1 = gfxClientEmit(*c, ibVa, n, f1);
+				const bool w1 = e1 == kIOReturnSuccess && gfxClientWait(*c, f1, 2000, ns1, "self-test");
+				const bool d1 = *poolDw(dataOff) == 0x600DF00Du && *poolDw(dataOff + 4) == 0x57EE1E57u;
+				*poolDw(dataOff) = 0;                                   // the second submission must write again: its own fence, its own effect
+				flushHdp();
+				const IOReturn e2 = w1 ? gfxClientEmit(*c, ibVa, n, f2) : kIOReturnNotReady;
+				const bool w2 = e2 == kIOReturnSuccess && gfxClientWait(*c, f2, 2000, ns2, "self-test");
+				const bool d2 = *poolDw(dataOff) == 0x600DF00Du;
+				pass = w1 && d1 && w2 && d2 && f2 == nextFence(f1) && !c->gfxOutstanding && !gfxClientPending;
+				RLOG("gfx client self-test: vmid %u, IB at VA 0x%llx (%u dwords), data at VA 0x%llx: submit %d fence %u %s data %s, "
+				     "submit %d fence %u %s data %s, pending %u/%u: %s", c->vmid, ibVa, n, dataVa, e1, f1, w1 ? "done" : "NOT done",
+				     d1 ? "ok" : "WRONG", e2, f2, w2 ? "done" : "NOT done", d2 ? "ok" : "WRONG", c->gfxOutstanding, gfxClientPending,
+				     pass ? "PASS" : "FAIL");
+				snprintf(result, sizeof(result), "%s client gfx IB in VMID %u: WRITE_DATA through the client's tables, two per-client fences (%llu / %llu us)",
+				         pass ? "PASS" : "FAIL", c->vmid, ns1 / 1000, ns2 / 1000);
+				logClientFault(*c, "gfx client self-test");
+			}
+		}
+	}
+	rtRelease(owner);
+	publishResult("gfx-client", result);
+	return pass;
 }
 
 IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t offset,
@@ -2635,6 +2893,8 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		if (slot.owner == owner)
 			slot = PresentSlot {};
 	RtClient *c = clientFor(owner);
+	if (c && c->gfxOutstanding)
+		gfxClientDrain(*c, "client close");   // W12k: before its buffers and page tables go away
 	uint32_t nb = 0, np = 0;
 	bool hostUnmapped = false;
 	for (RtBuffer &b : buffers) {
@@ -2807,6 +3067,9 @@ void RDNA4Compute::resetRuntimeForResume() {
 		c.tableOffset = c.rootMc = c.rootPhys = 0;
 		c.queueCpu = nullptr;
 		c.kernargCpu = c.fenceCpu = nullptr;
+		c.gfxFenceCpu = nullptr;                 // W12k: the ring is re-initialised by the wake's stageGfxRing; nothing of this client is pending
+		c.gfxFenceMc = 0;
+		c.gfxOutstanding = 0;
 	}
 	bzero(vmidUsed, sizeof(vmidUsed));
 	bzero(queueUsed, sizeof(queueUsed));
