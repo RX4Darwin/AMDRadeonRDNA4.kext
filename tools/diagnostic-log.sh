@@ -776,7 +776,7 @@ SURVEOF
 	if [ $((VMIDTEST_MODE & 4)) -eq 0 ]; then
 		record vm-trace SKIPPED "rdna4-vmid-test bit 4 (client-op trace) not set"
 	else
-		OPS="$(klines 'RDNA4FB: vmidtest: op ' || true)"
+		OPS="$(klines 'RDNA4FB: vmidtest( late)?: op ' || true)"   # the late probe pass logs "vmidtest late: op ..." (Kiln's dry run: the row missed them)
 		if [ -z "$OPS" ]; then
 			record vm-trace FAIL "no op-trace lines (no client opened, or the window lost them)"
 		else

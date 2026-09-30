@@ -1,7 +1,7 @@
 #!/bin/bash
 # Set the boot-args for one boot of docs/real-card-plan.md on the OpenCore USB.
 #
-#   bash /Volumes/OPENCORE/set-boot.sh <0-13>   (0-11 as below; 12 and 13 need the rdna4-vmshared code; `NOVMDIAG=1 bash set-boot.sh N` drops rdna4-vm-diag from any of them)
+#   bash /Volumes/OPENCORE/set-boot.sh <0-13|11s|9b>   (0-11 as below; 12 and 13 need the rdna4-vmshared code; `NOVMDIAG=1 bash set-boot.sh N` drops rdna4-vm-diag from any of them)
 #
 #   Round 5 plan (D23): every test boot runs on the PROVEN base, rdna4-ih=2 rdna4-flip=1 rdna4-hang=1
 #   (interrupts, vblank + page flips, queue recovery; clock gating is on by default since W29).
@@ -32,6 +32,8 @@
 #      round 6 boots DID carry rdna4-vm-diag=4065 (061829 line 17; the diagnostic script did not list that arg), whose bit 512 "F" points the GC hub's fault default page at a
 #      system page during the boot test, and the round 5 and 6 VM boots had it: "a clean VM boot pins the GPU at idle" is unproven. Run 9 first, then 9b.
 #   9b boot 9 + rdna4-vm-diag=4065: the exact round 6 VM configuration with the full instrumentation (run after 9: A/B on the confound).
+#  11s boot 11 + rdna4-sleeptest=1: FALLBACK if a real system sleep cannot be triggered in Recovery. diagnostic-log.sh then runs the DRIVER'S OWN SIMULATED sleep cycle by itself
+#      (`rdna4-run sleeptest`: powerWillSleep, 15 s, powerDidWake, row `sleep`). It is NOT a system sleep: the machine stays on and the card is not power-gated (docs/final-test-plan.md).
 #  12  boot 9 + rdna4-vmshared=1: the CANDIDATE FIX under the same diagnostics (client compute jobs run on two shared VMID-0 MEC queues as INDIRECT_BUFFER(vmid), the model amdgpu
 #      uses on gfx12 without MES, docs/w13-vmid.md design B; default off elsewhere). Same rows as boot 9 (vmidtest, vm-survey, vm-trace, idle-pin) plus the runtime/submitib rows, which are the
 #      real test: `rdna4-run selftest`/`bench` and the VM tests now go through the shared queues.
@@ -56,8 +58,9 @@ case "${1:-}" in
 	13) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1 rdna4-vmshared=1" ;;
 	10) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1 rdna4-gfxidle=1" ;;
 	11) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1 rdna4-pm=1 rdna4-gfxidle=1" ;;
+	11s) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1 rdna4-pm=1 rdna4-gfxidle=1 rdna4-sleeptest=1" ;;
 	8) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1 rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1" ;;
-	*) echo "usage: bash $0 <0-13> (see the header)   (see docs/real-card-plan.md)"; exit 1 ;;
+	*) echo "usage: bash $0 <0-13|9b|11s> (see the header)   (see docs/real-card-plan.md)"; exit 1 ;;
 esac
 DIR=$(cd "$(dirname "$0")" && pwd)
 CFG="$DIR/EFI/OC/config.plist"
