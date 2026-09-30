@@ -1,0 +1,131 @@
+# Extracts from the real-card diagnostic logs on the OPENCORE stick (read-only source), used by docs/power-gfx.md.
+# Format: <file>:<line>: <text, cut to 260 chars>; the first occurrence of each message (the diagnostic files repeat sections). Boot-args = the 'boot-args' line (19).
+
+=== rdna4fb-diag-20260930-052606.txt
+rdna4fb-diag-20260930-052606.txt:19: boot-args	rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1 rdna4-ih=2 rdna4-flip=1 rdna4-hang=1
+rdna4fb-diag-20260930-052606.txt:83:sensors-pm[1]: GFXCLK avg pre-DS 789 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 604 mV, socket 18 W, 
+rdna4fb-diag-20260930-052606.txt:85:sensors-pm[2]: GFXCLK avg pre-DS 789 post-DS 40 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 605 mV, socket 19 W, 
+rdna4fb-diag-20260930-052606.txt:148:sensors-pm[1]: GFXCLK avg pre-DS 790 post-DS 41 MHz GFX activity 3 %, UCLK activity 0 %, VDD_GFX 604 mV, socket 25 W, 
+rdna4fb-diag-20260930-052606.txt:150:sensors-pm[2]: GFXCLK avg pre-DS 789 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 604 mV, socket 19 W, 
+rdna4fb-diag-20260930-052606.txt:212:  |   "RDNA4FB,Results" = {"ih"="PASS ring up, 3823 interrupt wakeups","vblank"="PASS IRQ frames 32400","flip"="PASS pflip interrupts 64","runtime"="PASS service ready"}
+
+=== rdna4fb-diag-20260930-053042.txt
+rdna4fb-diag-20260930-053042.txt:19: boot-args	rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1 rdna4-ih=2 rdna4-flip=1 rdna4-hang=1
+rdna4fb-diag-20260930-053042.txt:325:[   22.497618]: RDNA4FB: compute: pm: survey cg before: GRBM 0x0000382c GRBM2 0x00000000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-053042.txt:326:[   22.497630]: RDNA4FB: compute: pm: survey cg before: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0x00000000 CPC_BUSY 0x00000000 CPF_STAT 0x00000000 CPF_BUSY 0x00000000
+rdna4fb-diag-20260930-053042.txt:329:[   22.497685]: RDNA4FB: compute: pm: survey cg before: active HQDs: MEC(pipe/queue) 1: 0/0; gfx(pipe/queue) 0: none; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-053042.txt:345:[   24.115005]: RDNA4FB: compute: pm: cg after (+1.3 s): avg GFXCLK pre-DS 795 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 605 mV, socket 19 W, 
+rdna4fb-diag-20260930-053042.txt:346:[   24.117092]: RDNA4FB: compute: pm: survey cg after: GRBM 0x0000382c GRBM2 0x00100000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-053042.txt:347:[   24.117125]: RDNA4FB: compute: pm: survey cg after: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0x00000000 CPC_BUSY 0x00000000 CPF_STAT 0x00000000 CPF_BUSY 0x00000000
+rdna4fb-diag-20260930-053042.txt:350:[   24.117265]: RDNA4FB: compute: pm: survey cg after: active HQDs: MEC(pipe/queue) 1: 0/0; gfx(pipe/queue) 0: none; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-053042.txt:590:sensors-pm[1]: GFXCLK avg pre-DS 790 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 605 mV, socket 19 W, 
+rdna4fb-diag-20260930-053042.txt:592:sensors-pm[2]: GFXCLK avg pre-DS 790 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 604 mV, socket 19 W, 
+rdna4fb-diag-20260930-053042.txt:655:sensors-pm[1]: GFXCLK avg pre-DS 792 post-DS 41 MHz GFX activity 3 %, UCLK activity 0 %, VDD_GFX 615 mV, socket 26 W, 
+rdna4fb-diag-20260930-053042.txt:657:sensors-pm[2]: GFXCLK avg pre-DS 792 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 615 mV, socket 19 W, 
+rdna4fb-diag-20260930-053042.txt:719:  |   "RDNA4FB,Results" = {"ih"="PASS ring up, 3824 interrupt wakeups","vblank"="PASS IRQ frames 60","flip"="PASS pflip interrupts 64","runtime"="PASS service ready"}
+
+=== rdna4fb-diag-20260930-053316.txt
+rdna4fb-diag-20260930-053316.txt:19: boot-args	rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1 rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065
+rdna4fb-diag-20260930-053316.txt:345:[   22.221049]: RDNA4FB: runtime: vm: boot queue test failed (fence 0x00000000, data 0x600df00d, fault status 0x00800880)
+rdna4fb-diag-20260930-053316.txt:361:so_gencnt: 567 so_state: 0x0002 process: timed:56 bytes in/out: 0/0 pkts in/out: 0/0 error: 0 so_error: 0 svc/tc: 0 flow: 0x9606c51dRDNA4FB: runtime: vm: boot HQD dequeue timed out (ACTIVE 0x00000001)
+rdna4fb-diag-20260930-053316.txt:366:[   22.606811]: RDNA4FB: runtime: vm: boot HQD dequeue timed out (ACTIVE 0x00000001)
+rdna4fb-diag-20260930-053316.txt:367:[   22.609324]: RDNA4FB: compute: vm: boot self-test failed; per-client GPU VM disabled
+rdna4fb-diag-20260930-053316.txt:388:[   22.637613]: RDNA4FB: compute: pm: survey cg before: GRBM 0xa800382c GRBM2 0x30008000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-053316.txt:389:[   22.637624]: RDNA4FB: compute: pm: survey cg before: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0xa0000001 CPC_BUSY 0x00000408 CPF_STAT 0xb8008001 CPF_BUSY 0x00020800
+rdna4fb-diag-20260930-053316.txt:392:[   22.637678]: RDNA4FB: compute: pm: survey cg before: active HQDs: MEC(pipe/queue) 2: 0/0 0/1; gfx(pipe/queue) 0: none; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-053316.txt:408:[   24.027004]: 3 duplicate reports for Sandbox: apsd(55) deny(1) user-preference-write com.apple.apsdSystem Policy: lsd(84) allow file-read-metadata /private/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/0/com.apple.LaunchServices.dv/com.apple.LaunchServi
+rdna4fb-diag-20260930-053316.txt:409:[   24.257274]: RDNA4FB: compute: pm: survey cg after: GRBM 0xa800382c GRBM2 0x34008000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-053316.txt:410:[   24.257286]: RDNA4FB: compute: pm: survey cg after: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0xa0000001 CPC_BUSY 0x00000408 CPF_STAT 0xb8008001 CPF_BUSY 0x00020800
+rdna4fb-diag-20260930-053316.txt:413:[   24.257338]: RDNA4FB: compute: pm: survey cg after: active HQDs: MEC(pipe/queue) 2: 0/0 0/1; gfx(pipe/queue) 0: none; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-053316.txt:662:sensors-pm[1]: GFXCLK avg pre-DS 3422 post-DS 3422 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1180 mV, socket 75 W, 
+rdna4fb-diag-20260930-053316.txt:664:sensors-pm[2]: GFXCLK avg pre-DS 3423 post-DS 3423 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1180 mV, socket 75 W, 
+rdna4fb-diag-20260930-053316.txt:694:sensors-pm[1]: GFXCLK avg pre-DS 3419 post-DS 3419 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1178 mV, socket 75 W, 
+rdna4fb-diag-20260930-053316.txt:696:sensors-pm[2]: GFXCLK avg pre-DS 3418 post-DS 3418 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1176 mV, socket 74 W, 
+rdna4fb-diag-20260930-053316.txt:751:  |   "RDNA4FB,Results" = {"ih"="PASS ring up, 27 interrupt wakeups","vblank"="PASS IRQ frames 60","flip"="PASS boot flip restored desktop","vm"="FAIL boot self-test","runtime"="PASS service ready"}
+
+=== rdna4fb-diag-20260930-053620.txt
+rdna4fb-diag-20260930-053620.txt:19: boot-args	rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1 rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11
+rdna4fb-diag-20260930-053620.txt:637:[   24.852458]: RDNA4FB: gfx: diag ladder: baseline 0 px; variants (bit:pixels) 32:0/ngg ran 64:0/primtype-idx 8:0/marker no 2:0 1:0
+rdna4fb-diag-20260930-053620.txt:642:[   24.854748]: RDNA4FB: compute: pm: survey cg before: GRBM 0x0000382c GRBM2 0x00000000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-053620.txt:643:[   24.854759]: RDNA4FB: compute: pm: survey cg before: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0x00000000 CPC_BUSY 0x00000000 CPF_STAT 0x00000000 CPF_BUSY 0x00000000
+rdna4fb-diag-20260930-053620.txt:646:[   24.854816]: RDNA4FB: compute: pm: survey cg before: active HQDs: MEC(pipe/queue) 1: 0/0; gfx(pipe/queue) 1: 0/0; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-053620.txt:661:[   26.472814]: RDNA4FB: compute: pm: cg after (+1.3 s): avg GFXCLK pre-DS 796 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 605 mV, socket 20 W, 
+rdna4fb-diag-20260930-053620.txt:662:[   26.475053]: RDNA4FB: compute: pm: survey cg after: GRBM 0x0000382c GRBM2 0x00100000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-053620.txt:663:[   26.475074]: RDNA4FB: compute: pm: survey cg after: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0x00000000 CPC_BUSY 0x00000000 CPF_STAT 0x00000000 CPF_BUSY 0x00000000
+rdna4fb-diag-20260930-053620.txt:666:[   26.475223]: RDNA4FB: compute: pm: survey cg after: active HQDs: MEC(pipe/queue) 1: 0/0; gfx(pipe/queue) 1: 0/0; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-053620.txt:924:sensors-pm[1]: GFXCLK avg pre-DS 791 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 604 mV, socket 18 W, 
+rdna4fb-diag-20260930-053620.txt:926:sensors-pm[2]: GFXCLK avg pre-DS 791 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 604 mV, socket 19 W, 
+rdna4fb-diag-20260930-053620.txt:989:sensors-pm[1]: GFXCLK avg pre-DS 800 post-DS 41 MHz GFX activity 3 %, UCLK activity 0 %, VDD_GFX 575 mV, socket 31 W, 
+rdna4fb-diag-20260930-053620.txt:991:sensors-pm[2]: GFXCLK avg pre-DS 800 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 575 mV, socket 20 W, 
+rdna4fb-diag-20260930-053620.txt:1053:  |   "RDNA4FB,Results" = {"ih"="PASS ring up, 3822 interrupt wakeups","vblank"="PASS IRQ frames 60","flip"="PASS pflip interrupts 64","runtime"="PASS service ready","gfx"="FAIL draw image, draw 0 px in 103 us"}
+
+=== rdna4fb-diag-20260930-053909.txt
+rdna4fb-diag-20260930-053909.txt:19: boot-args	rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1 rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11 rdna4-gfxcsb=0
+rdna4fb-diag-20260930-053909.txt:629:[   24.431350]: RDNA4FB: gfx: diag ladder: baseline 0 px; variants (bit:pixels) 32:0/ngg ran 64:0/primtype-idx 8:0/marker no 2:0 1:0
+rdna4fb-diag-20260930-053909.txt:634:[   24.433559]: RDNA4FB: compute: pm: survey cg before: GRBM 0x0000382c GRBM2 0x00000000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-053909.txt:635:[   24.433569]: RDNA4FB: compute: pm: survey cg before: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0x00000000 CPC_BUSY 0x00000000 CPF_STAT 0x00000000 CPF_BUSY 0x00000000
+rdna4fb-diag-20260930-053909.txt:638:[   24.433629]: RDNA4FB: compute: pm: survey cg before: active HQDs: MEC(pipe/queue) 1: 0/0; gfx(pipe/queue) 1: 0/0; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-053909.txt:653:[   26.053290]: RDNA4FB: compute: pm: cg after (+1.3 s): avg GFXCLK pre-DS 797 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 605 mV, socket 20 W, 
+rdna4fb-diag-20260930-053909.txt:654:[   26.055529]: RDNA4FB: compute: pm: survey cg after: GRBM 0x0000382c GRBM2 0x00100000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-053909.txt:655:[   26.055569]: RDNA4FB: compute: pm: survey cg after: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0x00000000 CPC_BUSY 0x00000000 CPF_STAT 0x00000000 CPF_BUSY 0x00000000
+rdna4fb-diag-20260930-053909.txt:658:[   26.055718]: RDNA4FB: compute: pm: survey cg after: active HQDs: MEC(pipe/queue) 1: 0/0; gfx(pipe/queue) 1: 0/0; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-053909.txt:916:sensors-pm[1]: GFXCLK avg pre-DS 791 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 604 mV, socket 19 W, 
+rdna4fb-diag-20260930-053909.txt:918:sensors-pm[2]: GFXCLK avg pre-DS 791 post-DS 40 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 604 mV, socket 19 W, 
+rdna4fb-diag-20260930-053909.txt:981:sensors-pm[1]: GFXCLK avg pre-DS 792 post-DS 41 MHz GFX activity 3 %, UCLK activity 0 %, VDD_GFX 615 mV, socket 27 W, 
+rdna4fb-diag-20260930-053909.txt:983:sensors-pm[2]: GFXCLK avg pre-DS 792 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 615 mV, socket 19 W, 
+rdna4fb-diag-20260930-053909.txt:1045:  |   "RDNA4FB,Results" = {"ih"="PASS ring up, 3824 interrupt wakeups","vblank"="PASS IRQ frames 60","flip"="PASS pflip interrupts 64","runtime"="PASS service ready","gfx"="FAIL draw image, draw 0 px in 94 us"}
+
+=== rdna4fb-diag-20260930-054800.txt
+rdna4fb-diag-20260930-054800.txt:19: boot-args	rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1 rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-gfxpm=24 rdna4-gfxoff=1
+rdna4fb-diag-20260930-054800.txt:369:[   22.626240]: RDNA4FB: compute: pm: survey cg before: GRBM 0x0000382c GRBM2 0x00000000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-054800.txt:370:[   22.626255]: RDNA4FB: compute: pm: survey cg before: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0x00000000 CPC_BUSY 0x00000000 CPF_STAT 0x00000000 CPF_BUSY 0x00000000
+rdna4fb-diag-20260930-054800.txt:373:[   22.626309]: RDNA4FB: compute: pm: survey cg before: active HQDs: MEC(pipe/queue) 1: 0/0; gfx(pipe/queue) 0: none; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-054800.txt:389:[   24.161326]: 3 duplicate reports for Sandbox: iconservicesd(51) deny(1) file-read-metadata /LibrarySystem Policy: lsd(85) allow file-read-metadata /private/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/0/com.apple.LaunchServices.dv/com.apple.LaunchServi
+rdna4fb-diag-20260930-054800.txt:390:[   24.249225]: RDNA4FB: compute: pm: survey cg after: GRBM 0x0000382c GRBM2 0x00100000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-054800.txt:391:[   24.249258]: RDNA4FB: compute: pm: survey cg after: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0x00000000 CPC_BUSY 0x00000000 CPF_STAT 0x00000000 CPF_BUSY 0x00000000
+rdna4fb-diag-20260930-054800.txt:394:[   24.249408]: RDNA4FB: compute: pm: survey cg after: active HQDs: MEC(pipe/queue) 1: 0/0; gfx(pipe/queue) 0: none; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-054800.txt:397:[   24.255517]: RDNA4FB: compute: gfxoff: AllowGfxOff -> 0x01
+rdna4fb-diag-20260930-054800.txt:732:sensors-pm[1]: GFXCLK avg pre-DS 0 post-DS 0 MHz GFX activity 0 %, UCLK activity 1 %, VDD_GFX 39 mV, socket 16 W, 
+rdna4fb-diag-20260930-054800.txt:734:sensors-pm[2]: GFXCLK avg pre-DS 0 post-DS 0 MHz GFX activity 0 %, UCLK activity 1 %, VDD_GFX 39 mV, socket 16 W, 
+rdna4fb-diag-20260930-054800.txt:797:sensors-pm[1]: GFXCLK avg pre-DS 3401 post-DS 3401 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1175 mV, socket 75 W, 
+rdna4fb-diag-20260930-054800.txt:799:sensors-pm[2]: GFXCLK avg pre-DS 3409 post-DS 3409 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1177 mV, socket 71 W, 
+rdna4fb-diag-20260930-054800.txt:861:  |   "RDNA4FB,Results" = {"ih"="PASS ring up, 3875 interrupt wakeups","vblank"="PASS IRQ frames 60","flip"="PASS pflip interrupts 64","runtime"="PASS service ready"}
+rdna4fb-diag-20260930-054800.txt:1039:[   41.146142]: RDNA4FB: compute: gfxoff: CP_RB_WPTR_POLL_CNTL changed across the power-down: 0x00400000 -> restored 0x00900100 (read back 0x00900100)
+rdna4fb-diag-20260930-054800.txt:1040:[   41.146185]: RDNA4FB: compute: gfxoff wake: HQD active 0x00000000 vmid 0x00000000 persistent 0x0be05501 PQ base 0x00000000:00000000 rptr 0x00000000 wptr 0x00000000:00000000 doorbell 0x00000000 PQ_CONTROL 0x00308509 dequeue 0x00000000
+rdna4fb-diag-20260930-054800.txt:1129:gfxoff       PASS     1.5 s after Allow: 14 MHz 0% 16 W; the guard woke GFX on a later GC access; boot HQD lost in the power-down and restored
+rdna4fb-diag-20260930-054800.txt:1130:gfxpm        PASS     baseline 3144 MHz 100% 245 W -> cg after (+1.3 s): 804 MHz 3% 19 W
+
+=== rdna4fb-diag-20260930-061510.txt
+rdna4fb-diag-20260930-061510.txt:19: boot-args	rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1 rdna4-ih=2 rdna4-flip=1 rdna4-hang=1
+rdna4fb-diag-20260930-061510.txt:323:[   22.654778]: RDNA4FB: compute: pm: survey cg before: GRBM 0x0000382c GRBM2 0x00000000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-061510.txt:324:[   22.654789]: RDNA4FB: compute: pm: survey cg before: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0x00000000 CPC_BUSY 0x00000000 CPF_STAT 0x00000000 CPF_BUSY 0x00000000
+rdna4fb-diag-20260930-061510.txt:327:[   22.654846]: RDNA4FB: compute: pm: survey cg before: active HQDs: MEC(pipe/queue) 1: 0/0; gfx(pipe/queue) 0: none; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-061510.txt:343:[   24.271949]: RDNA4FB: compute: pm: cg after (+1.3 s): avg GFXCLK pre-DS 805 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 605 mV, socket 19 W, 
+rdna4fb-diag-20260930-061510.txt:344:[   24.273998]: RDNA4FB: compute: pm: survey cg after: GRBM 0x0000382c GRBM2 0x00100000 SE0-3 0x00000007/0x00000007/0x00000007/0x00000007
+rdna4fb-diag-20260930-061510.txt:345:[   24.274018]: RDNA4FB: compute: pm: survey cg after: CP_STAT 0x00000000 CP_BUSY 0x00000000 CPC_STAT 0x00000000 CPC_BUSY 0x00000000 CPF_STAT 0x00000000 CPF_BUSY 0x00000000
+rdna4fb-diag-20260930-061510.txt:348:[   24.274165]: RDNA4FB: compute: pm: survey cg after: active HQDs: MEC(pipe/queue) 1: 0/0; gfx(pipe/queue) 0: none; 0 bank reads 0xffffffff (not implemented)
+rdna4fb-diag-20260930-061510.txt:588:sensors-pm[1]: GFXCLK avg pre-DS 810 post-DS 42 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 615 mV, socket 19 W, 
+rdna4fb-diag-20260930-061510.txt:590:sensors-pm[2]: GFXCLK avg pre-DS 810 post-DS 41 MHz GFX activity 3 %, UCLK activity 1 %, VDD_GFX 615 mV, socket 19 W, 
+rdna4fb-diag-20260930-061510.txt:653:sensors-pm[1]: GFXCLK avg pre-DS 810 post-DS 41 MHz GFX activity 3 %, UCLK activity 0 %, VDD_GFX 615 mV, socket 26 W, 
+rdna4fb-diag-20260930-061510.txt:717:  |   "RDNA4FB,Results" = {"ih"="PASS ring up, 3821 interrupt wakeups","vblank"="PASS IRQ frames 60","flip"="PASS pflip interrupts 64","runtime"="PASS service ready"}
+
+=== rdna4fb-diag-20260930-061829.txt
+rdna4fb-diag-20260930-061829.txt:19: boot-args	rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1 rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1
+rdna4fb-diag-20260930-061829.txt:207:sensors-pm[1]: GFXCLK avg pre-DS 3422 post-DS 3422 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1181 mV, socket 76 W, 
+rdna4fb-diag-20260930-061829.txt:209:sensors-pm[2]: GFXCLK avg pre-DS 3417 post-DS 3417 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1179 mV, socket 80 W, 
+rdna4fb-diag-20260930-061829.txt:249:sensors-pm[1]: GFXCLK avg pre-DS 3418 post-DS 3418 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1179 mV, socket 81 W, 
+rdna4fb-diag-20260930-061829.txt:251:sensors-pm[2]: GFXCLK avg pre-DS 3417 post-DS 3417 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1180 mV, socket 80 W, 
+rdna4fb-diag-20260930-061829.txt:306:  |   "RDNA4FB,Results" = {"ih"="PASS ring up, 342 interrupt wakeups","vblank"="PASS IRQ frames 10800","flip"="PASS boot flip restored desktop","vm"="PASS boot self-test","runtime"="PASS service ready"}
+rdna4fb-diag-20260930-061829.txt:425:[  224.394352]: RDNA4FB: runtime: vmid 8: queue MEC1 pipe 0 queue 1 dequeue timeout (ACTIVE 0x00000001)
+rdna4fb-diag-20260930-061829.txt:434:[  228.411972]: RDNA4FB: runtime: vmid 9: queue MEC1 pipe 0 queue 2 dequeue timeout (ACTIVE 0x00000001)
+rdna4fb-diag-20260930-061829.txt:460:[  230.353589]: Sandbox apply: bluetoothd[886] <bytes>RDNA4FB: runtime: vmid 8: queue MEC1 pipe 0 queue 1 dequeue timeout (ACTIVE 0x00000001)
+
+=== rdna4fb-diag-20260930-062351.txt
+rdna4fb-diag-20260930-062351.txt:19: (nvram boot-args unreadable)
+rdna4fb-diag-20260930-062351.txt:219:sensors-pm[1]: GFXCLK avg pre-DS 3417 post-DS 3417 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1180 mV, socket 80 W, 
+rdna4fb-diag-20260930-062351.txt:221:sensors-pm[2]: GFXCLK avg pre-DS 3418 post-DS 3418 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1179 mV, socket 81 W, 
+rdna4fb-diag-20260930-062351.txt:261:sensors-pm[1]: GFXCLK avg pre-DS 3417 post-DS 3417 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1179 mV, socket 82 W, 
+rdna4fb-diag-20260930-062351.txt:263:sensors-pm[2]: GFXCLK avg pre-DS 3417 post-DS 3417 MHz GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1179 mV, socket 81 W, 
+rdna4fb-diag-20260930-062351.txt:318:  |   "RDNA4FB,Results" = {"ih"="PASS ring up, 343 interrupt wakeups","vblank"="PASS IRQ frames 10800","flip"="PASS boot flip restored desktop","vm"="PASS boot self-test","runtime"="PASS service ready","gfx"="FAIL draw image, draw 0 px in 133 us"}
+rdna4fb-diag-20260930-062351.txt:440:[  232.283779]: RDNA4FB: runtime: vmid 8: queue MEC1 pipe 0 queue 1 dequeue timeout (ACTIVE 0x00000001)
+rdna4fb-diag-20260930-062351.txt:449:[  236.288489]: RDNA4FB: runtime: vmid 9: queue MEC1 pipe 0 queue 2 dequeue timeout (ACTIVE 0x00000001)
