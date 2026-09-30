@@ -32,6 +32,7 @@
 #include "../src/gpuheap.hpp"
 #include "../src/flip.hpp"
 #include "../src/gpuvm.hpp"
+#include "../src/vmid.hpp"
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
@@ -2161,6 +2162,186 @@ static int testGpuVm() {
 	return failures;
 }
 
+// --- W13: the VMID pool (src/vmid.cpp) -----------------------------------------
+
+namespace {
+struct FakeFences {
+	uint32_t now[Vmid::kMaxDomains] {};
+};
+bool fakeReached(void *context, uint32_t domain, uint32_t seq) {
+	// Wrap-aware "now >= seq", as the kext's fenceReached does.
+	return static_cast<int32_t>(static_cast<FakeFences *>(context)->now[domain] - seq) >= 0;
+}
+} // namespace
+
+static int testVmidPool() {
+	using namespace Vmid;
+	int f = 0;
+	FakeFences fences;
+	Pool pool;
+	Grant g;
+
+	// Reuse: the same owner and page directory keep their VMID; no rebind, no flush.
+	pool.init(fakeReached, &fences);
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.rebind && g.flush && !g.stolen &&
+	           g.vmid >= kFirst && g.vmid <= kLast, "vmid: first grab binds a fresh VMID");
+	const uint32_t v1 = g.vmid;
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid == v1 && !g.rebind && !g.flush,
+	           "vmid: same owner and PD reuse the VMID with no rebind and no flush");
+
+	// A flush is owed only when the client removed PTEs (its tlbSeq moved) since the last flush.
+	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.vmid == v1 && !g.rebind && g.flush,
+	           "vmid: tlbSeq advanced -> flush, still no rebind");
+	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && !g.flush, "vmid: the flush is owed once");
+	// Negative control: a pool that ignored tlbSeq would fail the two checks above.
+
+	// A flush does not need an idle VMID (an invalidation only drops cached translations).
+	pool.noteSubmit(v1, 0, 10);
+	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && g.vmid == v1 && g.flush && !g.rebind,
+	           "vmid: a busy VMID may be flushed");
+	fences.now[0] = 10;
+
+	// A changed page directory is not compatible: the client gets a rebind and the idle old slot is released.
+	f += check(pool.grab(1, 0x2000, 0, g) == Result::Ok && g.rebind && g.flush, "vmid: new PD -> rebind");
+	uint32_t owned = 0;
+	for (uint32_t v = kFirst; v <= kLast; v++)
+		owned += pool.ownerOf(v) == 1;
+	f += check(owned == 1, "vmid: the stale slot of the same owner is released (owns %u)", owned);
+
+	// Fifteen owners get fifteen distinct VMIDs.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	bool seen[kSlots] {};
+	bool distinct = true;
+	for (uintptr_t o = 1; o <= 15; o++) {
+		if (pool.grab(o, o * 0x1000, 0, g) != Result::Ok || seen[g.vmid] || g.stolen)
+			distinct = false;
+		seen[g.vmid] = true;
+	}
+	f += check(distinct && !seen[0], "vmid: 15 owners, 15 distinct VMIDs, VMID 0 never granted");
+
+	// Steal: all idle, the 16th takes the LEAST recently used. Owner 1 is older than 2..15; touch 1
+	// again and owner 2 becomes the victim.
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t v2 = [&] { for (uint32_t v = kFirst; v <= kLast; v++) if (pool.ownerOf(v) == 2) return v; return 0u; }();
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.rebind && g.stolen && g.vmid == v2,
+	           "vmid: steal takes the least recently used idle VMID (got %u want %u)", g.vmid, v2);
+	f += check(pool.ownerOf(v2) == 16, "vmid: the thief owns the stolen VMID");
+	f += check(pool.grab(2, 0x2000, 0, g) == Result::Ok && g.rebind && g.vmid != v2,
+	           "vmid: the victim comes back through a rebind on another VMID");
+
+	// Never steal a busy VMID; exhaustion returns the fence to wait on.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	for (uintptr_t o = 1; o <= 15; o++) {
+		pool.grab(o, o * 0x1000, 0, g);
+		pool.noteSubmit(g.vmid, 0, static_cast<uint32_t>(o));      // owner o: fence seq o on domain 0
+	}
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Busy && g.waitDomain == 0 && g.waitSeq == 1,
+	           "vmid: all busy -> Busy on the oldest job's fence (seq %u)", g.waitSeq);
+	bool untouched = true;
+	for (uintptr_t o = 1; o <= 15; o++) {
+		bool has = false;
+		for (uint32_t v = kFirst; v <= kLast; v++)
+			has |= pool.ownerOf(v) == o;
+		untouched &= has;
+	}
+	f += check(untouched, "vmid: a Busy grab takes nothing from anyone");
+
+	// Fairness: while that fence is pending a different newcomer waits too, but an owner that still
+	// has its VMID is served (the deliberate deviation from amdgpu).
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Busy && g.waitSeq == 1, "vmid: a second newcomer waits for the same fence");
+	f += check(pool.grab(5, 5 * 0x1000, 0, g) == Result::Ok && !g.rebind, "vmid: a bound owner is not starved by the wait");
+
+	// Fence 5 reached: owners 1..5 are idle; the thief takes the LRU among them (owner 1) and only them.
+	fences.now[0] = 5;
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.stolen, "vmid: fence reached -> the waiter gets a VMID");
+	f += check(pool.ownerOf(g.vmid) == 16, "vmid: the waiter owns it");
+	bool busyKept = true;
+	for (uintptr_t o = 6; o <= 15; o++) {
+		bool has = false;
+		for (uint32_t v = kFirst; v <= kLast; v++)
+			has |= pool.ownerOf(v) == o;
+		busyKept &= has;
+	}
+	f += check(busyKept, "vmid: owners with jobs in flight (seq 6..15) keep their VMIDs");
+	f += check(pool.ownerOf(g.vmid) == 16 && pool.grab(1, 0x1000, 0, g) == Result::Ok, "vmid: the victim is idle owner 1 (it rebinds)");
+
+	// Fairness across domains: the waiter is on domain 0; a VMID that frees up on domain 1 meanwhile
+	// must NOT go to a newcomer who arrived later (amdgpu's vmid_wait).
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	for (uintptr_t o = 1; o <= 14; o++) {
+		pool.grab(o, o * 0x1000, 0, g);
+		pool.noteSubmit(g.vmid, 0, static_cast<uint32_t>(o));
+	}
+	pool.grab(15, 15 * 0x1000, 0, g);
+	const uint32_t v15 = g.vmid;
+	pool.noteSubmit(v15, 1, 1);
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Busy && g.waitDomain == 0, "vmid: waiter parks on domain 0");
+	fences.now[1] = 1;                       // owner 15's job finished: a VMID is idle now
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Busy && g.waitDomain == 0,
+	           "vmid: an idle VMID is not handed to a newcomer while an earlier waiter is pending");
+	fences.now[0] = 1;                       // the waiter's fence
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok, "vmid: the waiter is served once its fence is reached");
+
+	// Several fence domains and sequence wrap.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t vm = g.vmid;
+	pool.noteSubmit(vm, 0, 0xfffffffeu);
+	pool.noteSubmit(vm, 1, 7);
+	fences.now[0] = 1;                       // wrapped past 0xfffffffe
+	f += check(!pool.idle(vm), "vmid: busy while domain 1 has not reached its seq");
+	fences.now[1] = 7;
+	f += check(pool.idle(vm), "vmid: idle once every domain reached its seq, wrap included");
+
+	// Exhaustion by pinning (static VMIDs, step S7).
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	bool pinsOk = true;
+	for (uintptr_t o = 1; o <= 15; o++)
+		pinsOk &= pool.pin(o, o * 0x1000, 0, g) == Result::Ok && pool.pinned(g.vmid);
+	f += check(pinsOk, "vmid: 15 pins succeed");
+	f += check(pool.pin(16, 0x16000, 0, g) == Result::Exhausted, "vmid: the 16th pin is Exhausted");
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Exhausted, "vmid: nothing can be stolen from pinned VMIDs");
+	f += check(pool.grab(3, 3 * 0x1000, 0, g) == Result::Ok && !g.rebind, "vmid: a pinned owner still reuses its VMID");
+	uint32_t released = 0;
+	f += check(pool.forget(3, false, released) && released != 0 && pool.ownerOf(released) == 0,
+	           "vmid: forget releases a pinned VMID and reports it");
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.vmid == released, "vmid: the released VMID is granted again");
+
+	// forget: refused while work is in flight, forced after a recovery.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	pool.grab(1, 0x1000, 0, g);
+	pool.noteSubmit(g.vmid, 0, 5);
+	f += check(!pool.forget(1, false, released) && pool.ownerOf(g.vmid) == 1, "vmid: forget is refused with a job in flight");
+	f += check(pool.forget(1, true, released) && released == g.vmid && pool.ownerOf(g.vmid) == 0 && pool.idle(g.vmid),
+	           "vmid: a forced forget releases it and clears the pending work");
+
+	// Reserved VMIDs are never granted.
+	pool.init(fakeReached, &fences, 1u << 8);
+	fences = FakeFences {};
+	bool reservedHit = false;
+	for (uintptr_t o = 1; o <= 14; o++)
+		reservedHit |= pool.grab(o, o * 0x1000, 0, g) != Result::Ok || g.vmid == 8;
+	f += check(!reservedHit, "vmid: 14 grants with VMID 8 reserved never return it");
+	f += check(pool.grab(15, 0x15000, 0, g) == Result::Ok && g.stolen && g.vmid != 8,
+	           "vmid: the 15th owner steals an idle VMID; the reserved one stays out");
+
+	// unbindAll (wake / GPU reset): nothing is bound any more, pins included.
+	pool.unbindAll();
+	bool none = true;
+	for (uint32_t v = kFirst; v <= kLast; v++)
+		none &= pool.ownerOf(v) == 0 && !pool.pinned(v);
+	f += check(none && pool.grab(1, 0x1000, 0, g) == Result::Ok && g.rebind, "vmid: after unbindAll the next grab rebinds");
+
+	f += check(pool.grab(0, 0x1000, 0, g) == Result::Exhausted, "vmid: owner 0 is invalid");
+	return f;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
@@ -2360,6 +2541,7 @@ int main(int argc, char **argv) {
 	failures += testFlipArithmetic();
 	failures += testGcInfo();
 	failures += testGpuVm();
+	failures += testVmidPool();
 	failures += testLinuxRefFormat();
 
 	if (failures) {

@@ -2099,8 +2099,13 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	const bool host = b->host;
 	if (c && b->va)
 		vmUnmap(*c, b->va, b->bytes);
-	if (host && c && !vmInvalidate(c->vmid, "host unmap"))
-		RLOG("vmid %u: host buffer unmap invalidation timed out", c->vmid);
+	/* Every unmap is followed by an invalidation before the memory goes back to its heap
+	 * (amdgpu sets tlb_seq on a cleared PTE and flushes before the VMID's next job,
+	 * amdgpu_vm.c:1272). Device buffers used to skip it: a cached translation could then
+	 * still reach VRAM that the heap hands to another client. Inferred from the code, not
+	 * measured on the card. Failure handling is the host path's: log and go on. */
+	if (c && (b->va || host) && !vmInvalidate(c->vmid, host ? "host unmap" : "device unmap"))
+		RLOG("vmid %u: %s buffer unmap invalidation timed out", c->vmid, host ? "host" : "device");
 	if (host) {
 		if (c) {
 			const uint64_t rounded = (b->bytes + GpuVm::kPageBytes - 1) &
@@ -2230,8 +2235,12 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 	RtProgram *p = programFor(owner, program);
 	if (!p)
 		return kIOReturnBadArgument;
-	if (RtClient *c = vmClientFor(owner))
+	if (RtClient *c = vmClientFor(owner)) {
 		vmUnmap(*c, p->va, heap.lengthOf(p->offset));
+		/* As rtFree: invalidate before the code pages return to the heap. */
+		if (!vmInvalidate(c->vmid, "program unmap"))
+			RLOG("vmid %u: program unmap invalidation timed out", c->vmid);
+	}
 	heap.free(p->offset);
 	p->owner = nullptr;
 	return kIOReturnSuccess;
