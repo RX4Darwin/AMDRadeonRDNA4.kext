@@ -2120,7 +2120,7 @@ static uint8_t *rdna4_phys_span(RDNA4State *s, uint64_t physical, uint64_t len)
 #define RDNA4_VM_PHYS_MASK   0x0000FFFFFFFFF000ull
 #define RDNA4_VM_PDE_PTE     (1ull << 63)
 
-static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va, bool mapping_err)
+static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va, int kind)
 {
     /* gc_12_0_0_sh_mask.h GCVM_L2_PROTECTION_FAULT_STATUS_LO32: MORE_FAULTS
      * [0], PERMISSION_FAULTS [7:4] (bit 4: the valid bit), VMID [23:20].
@@ -2135,7 +2135,11 @@ static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va, bool mappi
     /* A walk that ended on a non-PTE (mapping error) reads back like the card's first
      * VMID 8 fault, 0x00800b3b: MORE_FAULTS (the CP retries), WALKER_ERROR 5,
      * PERMISSION_FAULTS 3, MAPPING_ERROR, CID 5 (CPC), VMID (gc_12_0_0_sh_mask.h:9002-9025). */
-    if (mapping_err)
+    if (kind == 2)
+        /* Round 5, first VMID 8 access after the IS_PTE fix: 0x00800880 = WALKER_ERROR 0,
+         * PERMISSION_FAULTS 8 (execute), MAPPING_ERROR 0, CID 4 (CPF), read. */
+        reg_set(s, REG_GCVM_FAULT_STATUS, (8u << 4) | (4u << 9) | ((vmid & 0xfu) << 20));
+    else if (kind == 1)
         reg_set(s, REG_GCVM_FAULT_STATUS, 1u | (5u << 1) | (3u << 4) | (1u << 8) | (5u << 9) |
                                           ((vmid & 0xfu) << 20));
     else
@@ -2161,7 +2165,7 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
     uint32_t n = vmid - 1;
     uint32_t cntl = reg_get(s, REG_GCVM_CTX1_CNTL + n * 4);
     uint64_t base, start, end, table, entry;
-    bool mapping_err = false;
+    int fault_kind = 0;
     if (!(cntl & 1) || ((cntl >> 1) & 3) != 3 || va >= (1ull << 48))
         goto fault;
     start = reg_get(s, REG_GCVM_CTX1_START_LO + n * 8) |
@@ -2198,9 +2202,12 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
              * and faults with MAPPING_ERROR (umr access_vram_ai.c:1063-1069; amdgpu sets
              * bit 63 on every leaf, amdgpu_ttm.c:1477 + gmc_v12_0.c:794-796). */
             if (!(entry & RDNA4_VM_PDE_PTE)) {
-                mapping_err = true;
+                fault_kind = 1;
                 goto fault;
             }
+            if ((entry & RDNA4_VM_READABLE) && (!write || (entry & RDNA4_VM_WRITEABLE)) &&
+                execute && !(entry & RDNA4_VM_EXECUTABLE))
+                fault_kind = 2;
             if (!(entry & RDNA4_VM_READABLE) || (write && !(entry & RDNA4_VM_WRITEABLE)) ||
                 (execute && !(entry & RDNA4_VM_EXECUTABLE)))
                 goto fault;
@@ -2213,7 +2220,7 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
         table = entry & RDNA4_VM_PHYS_MASK;
     }
 fault:
-    rdna4_vm_fault(s, vmid, va, mapping_err);
+    rdna4_vm_fault(s, vmid, va, fault_kind);
     /* Retry is off: serve the configured dummy page so the queue can drain.
      * GCVM_L2_CNTL.ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY [11] (amdgpu sets it,
      * gfxhub_v12_0.c:248) makes it a system-memory page: modelled as one shared zeroed
@@ -2247,7 +2254,7 @@ static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
     uint32_t n = vmid - 1;
     uint32_t cntl = reg_get(s, REG_GCVM_CTX1_CNTL + n * 4);
     uint64_t base, start, end, table, entry;
-    bool mapping_err = false;
+    int fault_kind = 0;
 
     if (!(cntl & 1) || ((cntl >> 1) & 3) != 3 || va >= (1ull << 48) ||
         !len || len > 0x1000 - (va & 0xfff))
@@ -2283,9 +2290,12 @@ static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
         }
         if (level == 3) {
             if (!(entry & RDNA4_VM_PDE_PTE)) {   /* GFX12: no IS_PTE = a directory entry */
-                mapping_err = true;
+                fault_kind = 1;
                 goto fault;
             }
+            if ((entry & RDNA4_VM_READABLE) && (!write || (entry & RDNA4_VM_WRITEABLE)) &&
+                execute && !(entry & RDNA4_VM_EXECUTABLE))
+                fault_kind = 2;
             if (!(entry & RDNA4_VM_READABLE) || (write && !(entry & RDNA4_VM_WRITEABLE)) ||
                 (execute && !(entry & RDNA4_VM_EXECUTABLE)))
                 goto fault;
@@ -2298,7 +2308,7 @@ static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
         table = entry & RDNA4_VM_PHYS_MASK;
     }
 fault:
-    rdna4_vm_fault(s, vmid, va, mapping_err);
+    rdna4_vm_fault(s, vmid, va, fault_kind);
     return false;
 }
 
@@ -3977,13 +3987,13 @@ static void rdna4_mec_select_hqd(RDNA4State *s, uint32_t pipe, uint32_t queue)
 
 /* One CP access to queue memory in the given VMID; false when it faults
  * (the fault is recorded by the walk). */
-static bool rdna4_mec_queue_mem_ok(RDNA4State *s, uint64_t address, uint32_t vmid)
+static bool rdna4_mec_queue_mem_ok(RDNA4State *s, uint64_t address, uint32_t vmid, bool execute)
 {
     RDNA4VmTarget target;
 
     if (!vmid)      /* flat MC space; the existing VMID0 paths check their spans */
         return true;
-    return rdna4_vm_target(s, address, 4, vmid, true, false, &target);
+    return rdna4_vm_target(s, address, 4, vmid, true, execute, &target);
 }
 
 /* The selected HQD's MQD, as the CP reaches it when it takes up the queue. */
@@ -3995,7 +4005,7 @@ static bool rdna4_mec_mqd_ok(RDNA4State *s, uint32_t pipe, uint32_t queue)
 
     uint64_t *logged = &s->hqd[pipe][queue].mqd_stall_logged;
 
-    if (rdna4_mec_queue_mem_ok(s, mqd, vmid)) {
+    if (rdna4_mec_queue_mem_ok(s, mqd, vmid, false)) {
         *logged = 0;
         return true;
     }
@@ -4023,7 +4033,8 @@ static void rdna4_mec_eop_access(RDNA4State *s, uint32_t vmid)
     uint64_t eop = ((uint64_t)s->hqd[s->mec_work.pipe][s->mec_work.queue].q[lo] << 8) |
                    ((uint64_t)s->hqd[s->mec_work.pipe][s->mec_work.queue].q[hi] << 40);
 
-    if (!rdna4_mec_queue_mem_ok(s, eop, vmid))
+    /* The CP fetches the EOP buffer with READ|EXE (round 5 IV src_data[1] 0x50, VA of the EOP page). */
+    if (!rdna4_mec_queue_mem_ok(s, eop, vmid, true))
         fprintf(stderr, "rdna4: mec: EOP buffer 0x%" PRIx64 " faulted in VMID %u\n",
                 eop, vmid);
 }
