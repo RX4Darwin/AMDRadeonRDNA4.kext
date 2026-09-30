@@ -88,7 +88,8 @@ WHAT TO LOOK FOR (only so you know if something looks odd; do not judge)
      2. type:   pmset sleepnow
         The screen should go dark. Wait at least 10 seconds. Then wake the
         Mac with a short tap of the POWER BUTTON (a key may also work).
-        The Apple menu in Recovery has no Sleep entry: do not look for one.
+        (The Apple menu in Recovery is not believed to have a Sleep entry: use
+        the pmset line.)
      3. When the screen is back and Terminal is usable, type:
                 /tmp/rdna4-run tri               (expect PASS again)
   If "pmset sleepnow" prints an error, or nothing happens within 30 seconds:
