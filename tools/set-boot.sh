@@ -11,7 +11,7 @@
 #   1  the proven base: also the setting for daily use
 #   2  base + per-app GPU memory ladder   rdna4-vm=1 rdna4-vm-diag=4065 (F default page, E4, control, o, V, d/e/g/T)
 #   3  base + first triangle with the CP-side probe   rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11
-#   4  base + cursor self-test: magenta 64x64 square at (100,100)   rdna4-vbl=1 rdna4-cursor=2 (DLG mission mode)
+#   4  base + cursor self-test: magenta 64x64 square at (100,100)   rdna4-vbl=1 rdna4-cursor=2 rdna4-cursordscl=1 (CRC self-check, DSCL fix only if the GOP left bypass)
 #   5  base + GFXOFF (optional, ALWAYS LAST, then power off)   rdna4-gfxpm=24 rdna4-gfxoff=1
 #
 # The config lists boot-args under NVRAM Delete, so the value written here is
@@ -23,7 +23,7 @@ case "${1:-}" in
 	1) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1" ;;
 	2) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065" ;;
 	3) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11" ;;
-	4) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=2" ;;
+	4) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vbl=1 rdna4-cursor=2 rdna4-cursordscl=1" ;;
 	5) EXTRA="rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-gfxpm=24 rdna4-gfxoff=1" ;;
 	*) echo "usage: bash $0 <0-5>   (see docs/real-card-plan.md)"; exit 1 ;;
 esac

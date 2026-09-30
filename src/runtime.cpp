@@ -517,7 +517,12 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 		if (firstPt == ~0ull)
 			firstPt = ptOff;
 		lastPt = ptOff;
-		uint64_t flags = GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable;
+		/* amdgpu's composition for a VRAM BO on GC 12: VALID, READABLE, WRITEABLE, IS_PTE
+		 * (gart_pte_flags, amdgpu_ttm.c:1477; gmc_v12_0.c:794-796), EXECUTABLE when asked
+		 * (gmc_v12_0_get_vm_pte), MTYPE NC = 0, and no SNOOPED: amdgpu_ttm_tt_pde_flags adds it for
+		 * VRAM only when the BO is cached (amdgpu_ttm.c:1456-1458). */
+		uint64_t flags = GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable |
+		                 (vmIsPteOff ? 0 : GpuVm::kIsPte);
 		if (executable)
 			flags |= GpuVm::kExecutable;
 		flags = (flags | vmPteSet) & ~vmPteClear;   /* W22 diagnostics only, 0 otherwise */
@@ -570,7 +575,7 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 			firstPt = ptOff;
 		lastPt = ptOff;
 		uint64_t flags = GpuVm::kSystem | GpuVm::kSnooped | GpuVm::kValid |
-		                 GpuVm::kReadable | GpuVm::kWritable;
+		                 GpuVm::kReadable | GpuVm::kWritable | (vmIsPteOff ? 0 : GpuVm::kIsPte);
 		if (executable)
 			flags |= GpuVm::kExecutable;
 		/* Cached GTT on gfx12.0 uses MTYPE_NC, encoded as zero. */
@@ -734,6 +739,15 @@ bool RDNA4Compute::vmBootSelfTest() {
 	}
 	RtClient c {};
 	const uint32_t vmid = 8, pipe = 0, queue = 1, doorbell = 0x1a;
+	{
+		/* Negative control: rdna4-vm-ispte=0 leaves bit 63 off every leaf PTE (the round 2-4
+		 * encoding); the first VMID 8 access must then fault with MAPPING_ERROR (0x00800b3b). */
+		uint32_t isPte = 1;
+		vmIsPteOff = PE_parse_boot_argn("rdna4-vm-ispte", &isPte, sizeof(isPte)) && !isPte;
+		if (vmIsPteOff)
+			RLOG("vm: rdna4-vm-ispte=0: IS_PTE (bit 63) is NOT set on leaf PTEs (negative control, "
+			     "expect fault 0x00800b3b)");
+	}
 	const uint32_t qoff = kVmQueueBase;
 	/* The same client-VA layout as rtOpen: the EOP buffer, rptr report and
 	 * wptr poll are addresses in the queue's VMID, as KFD programs them
@@ -769,7 +783,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 		*poolDw(qoff + off) = 0;
 	c.kernargCpu = nullptr;
 	c.fenceCpu = poolDw(qoff + kVmFence);
-	const bool qMap = vmMap(c, qva, poolMc(qoff + kVmPq), kPqSize, false);
+	const bool qMap = vmMap(c, qva, poolMc(qoff + kVmPq), kPqSize, true);   /* the CP fetches the ring with EXE */
 	const bool eMap = qMap && vmMap(c, eva, poolMc(qoff + kVmEop), 0x1000, false);
 	const bool rMap = eMap && vmMap(c, rva, poolMc(qoff + kVmRptr), 0x1000, false);
 	const bool wMap = rMap && vmMap(c, wva, poolMc(qoff + kVmWptr), 0x1000, false);
@@ -905,13 +919,13 @@ bool RDNA4Compute::vmBootSelfTest() {
 		c.tableShadow[0] = GpuVm::encodePde(c.rootPhys + 0x1000, GpuVm::kValid, 2);
 		c.tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
 			GpuVm::encodePde(c.rootPhys + 0x2000, GpuVm::kValid, 1);
-		return vmMap(c, qva, poolMc(qoff + kVmPq), kPqSize, false) &&
+		return vmMap(c, qva, poolMc(qoff + kVmPq), kPqSize, true) &&
 		       vmMap(c, eva, poolMc(qoff + kVmEop), 0x1000, false) &&
 		       vmMap(c, rva, poolMc(qoff + kVmRptr), 0x1000, false) &&
 		       vmMap(c, wva, poolMc(qoff + kVmWptr), 0x1000, false) &&
 		       vmMap(c, dataVa, poolMc(dataOff), 0x1000, false) &&
 		       vmMap(c, fenceVa, poolMc(qoff + kVmFence), 0x1000, false) &&
-		       vmMap(c, ibVa, poolMc(ibOff), 0x1000, false);
+		       vmMap(c, ibVa, poolMc(ibOff), 0x1000, true);
 	};
 	auto hqdStop = [&]() {
 		grbmSelect(1, curPipe, curQueue, curVmid);
@@ -1117,7 +1131,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 				*poolDw(dataOff) = 0;
 				flushHdp();
 				Pm4::Queue eq;
-				const bool mapped = ibDw && vmMap(c, ibVa, poolMc(ibOff), 0x1000, false);
+				const bool mapped = ibDw && vmMap(c, ibVa, poolMc(ibOff), 0x1000, true);
 				const bool queueOk = mapped && eq.init(poolDw(q7 + kVmPq), poolMc(q7 + kVmPq), kPqSize);
 				gcFaultClear();
 				(void)vmInvalidate(vmid, "E4");
@@ -1179,8 +1193,8 @@ bool RDNA4Compute::vmBootSelfTest() {
 			static const char *const nameOf[kTests] = {
 				" control (no change, fresh pipe)", " variant a (TAP_*_PHYSICAL=1)",
 				" variant b (ctx0 covers tables)", " variant c (MC-form table pointers)",
-				" variant E2 (GC windows := MM)", " variant d (IS_PTE bit 63 on leaf PTEs)",
-				" variant e (no SNOOPED on VRAM PTEs)", " variant g (EXECUTABLE on leaf PTEs)",
+				" variant E2 (GC windows := MM)", " variant d (OLD encoding: NO IS_PTE on leaf PTEs)",
+				" variant e (SNOOPED on VRAM PTEs)", " variant g (EXECUTABLE on every leaf PTE)",
 				" variant T (tables built by the CPU in the pool)",
 				" variant o (context reprogrammed in amdgpu's order + L2 invalidate)",
 				" variant V (control on VMID 12)" };
@@ -1256,12 +1270,11 @@ bool RDNA4Compute::vmBootSelfTest() {
 					if (!buildTables() || !vmContextInit(c))
 						RLOG("vm: variant c: table rebuild failed");
 				} else if (v == kD || v == kE || v == kG) {
-					/* PTE flag variants, rebuilt through the normal table path.
-					 * d: KFD's own leaf PTEs carry IS_PTE on gfx12 (kfd_svm.c:1375);
-					 * e: amdgpu sets SNOOPED on VRAM only for cached BOs
-					 * (amdgpu_ttm.c:1457); g: KFD maps compute code EXECUTABLE. */
-					vmPteSet = v == kD ? GpuVm::kPdePte : v == kG ? GpuVm::kExecutable : 0;
-					vmPteClear = v == kE ? GpuVm::kSnooped : 0;
+					/* PTE flag variants against the default (amdgpu's) encoding, rebuilt
+					 * through the normal table path.  d: the round 2-4 encoding without
+					 * IS_PTE; e: SNOOPED added to VRAM PTEs; g: every leaf EXECUTABLE. */
+					vmPteSet = v == kE ? GpuVm::kSnooped : v == kG ? GpuVm::kExecutable : 0;
+					vmPteClear = v == kD ? GpuVm::kIsPte : 0;
 					if (!buildTables())
 						RLOG("vm: variant: table rebuild failed");
 				} else if (v == kO) {
@@ -1533,7 +1546,7 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	c->eopVa = eva;
 	c->rptrVa = rva;
 	c->wpollVa = wva;
-	if (!vmMap(*c, qva, poolMc(qoff + kVmPq), kPqSize, false) ||
+	if (!vmMap(*c, qva, poolMc(qoff + kVmPq), kPqSize, true) ||
 	    !vmMap(*c, eva, poolMc(qoff + kVmEop), 0x1000, false) ||
 	    !vmMap(*c, rva, poolMc(qoff + kVmRptr), 0x1000, false) ||
 	    !vmMap(*c, wva, poolMc(qoff + kVmWptr), 0x1000, false) ||
@@ -1921,7 +1934,7 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	if (c) {
 		b.va = (c->nextVa + 0xffff) & ~0xffffull;
 		c->nextVa = b.va + ((bytes + 0xffff) & ~0xffffull);
-		if (c->nextVa < b.va || !vmMap(*c, b.va, b.mc, bytes, false)) {
+		if (c->nextVa < b.va || !vmMap(*c, b.va, b.mc, bytes, true)) {   /* IBs live in user buffers: R|W|X like Mesa (ac_linux_drm.c:235) */
 			h.free(b.offset); b.owner = nullptr;
 			return kIOReturnNoMemory;
 		}

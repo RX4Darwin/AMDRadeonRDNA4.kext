@@ -625,6 +625,8 @@ struct RDNA4State {
     uint64_t pstat[14];      /* SAMPLE_PIPELINESTAT counters (si_query.c order: PS, C_PRIM, C_INV, VS, GS_INV, GS_PRIM, IA_PRIM, IA_VERT, ...) */
     bool     gop_dlg;        /* the GOP left the HUBP DLG/TTU registers programmed (DCN_SURF0_TTU_CNTL0 delivery non-zero) */
     bool     cursor_lock_stuck; /* the GOP left the MPC cursor lock (CUR_VUPDATE_LOCK_SET0) held */
+    uint32_t dscl_mode;     /* dscl-mode=N (1..7): the GOP left DSCL0_SCL_MODE.DSCL_MODE = N (0 = as gop-state) */
+    bool     desktop_churn; /* the pixels under the OTG CRC window change every frame (a scrolling verbose console) */
     bool     cursor_reject_logged;
     bool     cursor_ttu_hypothesis; /* reject the cursor plane while DCN_CUR0_TTU_CNTL0's delivery is 0 (cursor-ttu-hypothesis) */
     uint32_t gfx_break;      /* corrupt one G3 MUST register at draw time */
@@ -979,6 +981,18 @@ static void rdna4_init_earliest_inuse(RDNA4State *s)
     }
 }
 
+/* OTG CRC (regOTG0_OTG_CRC_CNTL 0x1b65 .. OTG_CRC0_DATA_B 0x1b6b): the model returns a checksum of the composited
+ * scanout (plane + the cursor when the plane is armed and passes rdna4_get_cursor) over the CRC window. It is NOT the
+ * hardware's CRC algorithm (unknown to the model): it can only say whether the pixels in the window differ between
+ * two reads, which is all the kext's cursor A/B check needs. It follows the display path; it cannot know what a real
+ * DCN drops between the plane and the OTG. */
+#define OTG_CRC_CNTL         0x1b65
+#define OTG_CRC0_WINDOWA_X   0x1b66
+#define OTG_CRC0_WINDOWA_Y   0x1b67
+#define OTG_CRC0_DATA_RG     0x1b6a
+#define OTG_CRC0_DATA_B      0x1b6b
+static void rdna4_crc_window(RDNA4State *s, int otg, uint32_t *rg, uint32_t *b);
+
 static uint32_t rdna4_otg_read(RDNA4State *s, int otg, uint32_t dw)
 {
     uint32_t val = rdna4_otg_reg(s, otg, dw);
@@ -987,6 +1001,12 @@ static uint32_t rdna4_otg_read(RDNA4State *s, int otg, uint32_t dw)
     const bool running = rdna4_otg_position(s, otg, &frame, &line, &horizontal);
 
     switch (dw) {
+    case OTG_CRC0_DATA_RG:
+    case OTG_CRC0_DATA_B: {
+        uint32_t rg, bb;
+        rdna4_crc_window(s, otg, &rg, &bb);
+        return dw == OTG_CRC0_DATA_RG ? rg : bb;
+    }
     case OTG_CONTROL:
         return (val & ~(1u << 16)) | ((val & 1) << 16);
     case OTG_MASTER_UPDATE_LOCK:
@@ -2099,7 +2119,7 @@ static uint8_t *rdna4_phys_span(RDNA4State *s, uint64_t physical, uint64_t len)
 #define RDNA4_VM_PHYS_MASK   0x0000FFFFFFFFF000ull
 #define RDNA4_VM_PDE_PTE     (1ull << 63)
 
-static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va)
+static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va, bool mapping_err)
 {
     /* gc_12_0_0_sh_mask.h GCVM_L2_PROTECTION_FAULT_STATUS_LO32: MORE_FAULTS
      * [0], PERMISSION_FAULTS [7:4] (bit 4: the valid bit), VMID [23:20].
@@ -2111,7 +2131,14 @@ static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va)
         reg_set(s, REG_GCVM_FAULT_STATUS, status | 1u);
         return;
     }
-    reg_set(s, REG_GCVM_FAULT_STATUS, (1u << 4) | ((vmid & 0xfu) << 20));
+    /* A walk that ended on a non-PTE (mapping error) reads back like the card's first
+     * VMID 8 fault, 0x00800b3b: MORE_FAULTS (the CP retries), WALKER_ERROR 5,
+     * PERMISSION_FAULTS 3, MAPPING_ERROR, CID 5 (CPC), VMID (gc_12_0_0_sh_mask.h:9002-9025). */
+    if (mapping_err)
+        reg_set(s, REG_GCVM_FAULT_STATUS, 1u | (5u << 1) | (3u << 4) | (1u << 8) | (5u << 9) |
+                                          ((vmid & 0xfu) << 20));
+    else
+        reg_set(s, REG_GCVM_FAULT_STATUS, (1u << 4) | ((vmid & 0xfu) << 20));
     reg_set(s, REG_GCVM_FAULT_ADDR_LO, (uint32_t)(va >> 12));
     reg_set(s, REG_GCVM_FAULT_ADDR_HI, (uint32_t)(va >> 44) & 0xfu);
 }
@@ -2133,6 +2160,7 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
     uint32_t n = vmid - 1;
     uint32_t cntl = reg_get(s, REG_GCVM_CTX1_CNTL + n * 4);
     uint64_t base, start, end, table, entry;
+    bool mapping_err = false;
     if (!(cntl & 1) || ((cntl >> 1) & 3) != 3 || va >= (1ull << 48))
         goto fault;
     start = reg_get(s, REG_GCVM_CTX1_START_LO + n * 8) |
@@ -2164,6 +2192,14 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
             return rdna4_vram_span(s, off, len);
         }
         if (level == 3) {
+            /* GFX12: a last-level entry without IS_PTE (bit 63) is a directory entry; the
+             * walker reads one more entry from the page it points at (a data page: zeros)
+             * and faults with MAPPING_ERROR (umr access_vram_ai.c:1063-1069; amdgpu sets
+             * bit 63 on every leaf, amdgpu_ttm.c:1477 + gmc_v12_0.c:794-796). */
+            if (!(entry & RDNA4_VM_PDE_PTE)) {
+                mapping_err = true;
+                goto fault;
+            }
             if (!(entry & RDNA4_VM_READABLE) || (write && !(entry & RDNA4_VM_WRITEABLE)) ||
                 (execute && !(entry & RDNA4_VM_EXECUTABLE)))
                 goto fault;
@@ -2176,7 +2212,7 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
         table = entry & RDNA4_VM_PHYS_MASK;
     }
 fault:
-    rdna4_vm_fault(s, vmid, va);
+    rdna4_vm_fault(s, vmid, va, mapping_err);
     /* Retry is off: serve the configured dummy page so the queue can drain.
      * GCVM_L2_CNTL.ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY [11] (amdgpu sets it,
      * gfxhub_v12_0.c:248) makes it a system-memory page: modelled as one shared zeroed
@@ -2210,6 +2246,7 @@ static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
     uint32_t n = vmid - 1;
     uint32_t cntl = reg_get(s, REG_GCVM_CTX1_CNTL + n * 4);
     uint64_t base, start, end, table, entry;
+    bool mapping_err = false;
 
     if (!(cntl & 1) || ((cntl >> 1) & 3) != 3 || va >= (1ull << 48) ||
         !len || len > 0x1000 - (va & 0xfff))
@@ -2244,6 +2281,10 @@ static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
             return true;
         }
         if (level == 3) {
+            if (!(entry & RDNA4_VM_PDE_PTE)) {   /* GFX12: no IS_PTE = a directory entry */
+                mapping_err = true;
+                goto fault;
+            }
             if (!(entry & RDNA4_VM_READABLE) || (write && !(entry & RDNA4_VM_WRITEABLE)) ||
                 (execute && !(entry & RDNA4_VM_EXECUTABLE)))
                 goto fault;
@@ -2256,7 +2297,7 @@ static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
         table = entry & RDNA4_VM_PHYS_MASK;
     }
 fault:
-    rdna4_vm_fault(s, vmid, va);
+    rdna4_vm_fault(s, vmid, va, mapping_err);
     return false;
 }
 
@@ -2292,13 +2333,13 @@ static bool rdna4_vm_access(RDNA4State *s, uint64_t va, uint8_t *data, uint64_t 
                     memcpy(data, dummy, chunk);
             } else if (target.system) {
                 if (!rdna4_bus_master_enabled(s)) {
-                    rdna4_vm_fault(s, vmid, va);
+                    rdna4_vm_fault(s, vmid, va, false);
                     return false;
                 }
                 MemTxResult result = write ? rdna4_dma_write(s, target.address, data, chunk)
                                            : rdna4_dma_read(s, target.address, data, chunk);
                 if (result != MEMTX_OK) {
-                    rdna4_vm_fault(s, vmid, va);
+                    rdna4_vm_fault(s, vmid, va, false);
                     return false;
                 }
             } else {
@@ -4096,7 +4137,7 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
         for (int i = 0; i < 16; i++) {
             uint8_t *p = rdna4_gc_span_vmid(s, s->mec_work.pq +
                                             4ull * ((s->mec_work.rptr + i) % s->mec_work.size),
-                                            4, s->mec_work.vmid, false, false);
+                                            4, s->mec_work.vmid, false, true);   /* the CP fetches the ring with EXE */
             if (!p) {
                 fprintf(stderr, "rdna4: mec: queue MC 0x%" PRIx64 " not mapped\n",
                         s->mec_work.pq);
@@ -4157,7 +4198,7 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
             const uint32_t ib_vmid = s->mec_work.priv ? (control >> 24) & 0xf : s->mec_work.vmid;
             if (!ib_dwords || !rdna4_gc_span_vmid(s, (uint64_t)dw[1] | ((uint64_t)dw[2] << 32),
                                     (uint64_t)ib_dwords * 4,
-                                    ib_vmid, false, false)) {
+                                    ib_vmid, false, true)) {   /* IB fetch requests EXE */
                 fprintf(stderr, "rdna4: mec: invalid indirect buffer; queue stopped\n");
                 s->mec_hung = true;
                 return false;
@@ -6414,9 +6455,13 @@ static void rdna4_get_scanout(RDNA4State *s, RDNA4Scanout *so)
         hp = hubp * HUBP_STRIDE;
         /* no scaler in the model: the fetched viewport and the scaler's
          * output rectangle have to be the raster's active size */
+        /* DSCL_MODE 6 is full bypass: the fetched pixels reach the MPC 1:1 and RECOUT is not applied, so its
+         * rectangle is not checked. The model cannot know whether a real DSCL in bypass still passes the
+         * cursor plane to the output (that is the question W38 asks the card): it composites it. */
+        const bool dscl_bypass = (reg_get(s, SEG2(0x0d08 + hubp * DPP_STRIDE)) & 7) == 6;
         if (reg_get(s, SEG2(HUBP_VIEWPORT_DIM + hp)) != ((so->width & 0x3fff) | (so->height << 16)) ||
-            reg_get(s, SEG2(DSCL_RECOUT_SIZE + hubp * DPP_STRIDE)) !=
-                ((so->width & 0x3fff) | (so->height << 16))) {
+            (!dscl_bypass && reg_get(s, SEG2(DSCL_RECOUT_SIZE + hubp * DPP_STRIDE)) !=
+                ((so->width & 0x3fff) | (so->height << 16)))) {
             so->nosignal = "rdna4: pipe misprogrammed (viewport/recout != timing)";
             return;
         }
@@ -6554,6 +6599,74 @@ static void rdna4_blend_cursor(RDNA4State *s, const RDNA4Scanout *so,
                    (b > 255 ? 255 : b);
         }
     }
+}
+
+static uint16_t rdna4_crc16(uint16_t crc, uint8_t byte)
+{
+    crc ^= (uint16_t)byte << 8;
+    for (int i = 0; i < 8; i++) {
+        crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    }
+    return crc;
+}
+
+static void rdna4_crc_window(RDNA4State *s, int otg, uint32_t *rg, uint32_t *b)
+{
+    RDNA4Scanout so;
+
+    *rg = *b = 0;
+    if (!(rdna4_otg_reg(s, otg, OTG_CRC_CNTL) & 1)) {
+        return;                                    /* CRC engine off */
+    }
+    rdna4_get_scanout(s, &so);
+    rdna4_get_cursor(s, &so, &so.cursor);
+    if (!so.active || so.blank || so.nosignal) {
+        return;
+    }
+    uint8_t *scan = rdna4_vram_span(s, so.offset, (uint64_t)so.stride * so.height);
+    uint8_t *sprite = so.cursor.valid ?
+        rdna4_vram_span(s, so.cursor.offset, (uint64_t)so.cursor.pitch * so.cursor.height * 4) : NULL;
+    if (!scan) {
+        return;
+    }
+    const uint32_t ax = rdna4_otg_reg(s, otg, OTG_CRC0_WINDOWA_X);
+    const uint32_t ay = rdna4_otg_reg(s, otg, OTG_CRC0_WINDOWA_Y);
+    const uint32_t x0 = ax & 0x7fff, x1 = (ax >> 16) & 0x7fff, y0 = ay & 0x7fff, y1 = (ay >> 16) & 0x7fff;
+    uint16_t cr = 0xffff, cg = 0xffff, cb = 0xffff;
+    if (s->desktop_churn) {
+        /* desktop-churn=on: one desktop pixel inside the window changes with the OTG frame number, as a scrolling
+         * console does. The write is idempotent within a frame, so two reads of the same frame agree. */
+        uint64_t frame;
+        uint32_t line, horizontal;
+        uint8_t *p = (x1 > x0 + 8 && y1 > y0 + 8 && x0 + 8 < so.width && y0 + 8 < so.height) ?
+            scan + (uint64_t)(y0 + 8) * so.stride + (uint64_t)(x0 + 8) * 4 : NULL;
+        if (p && rdna4_otg_position(s, otg, &frame, &line, &horizontal)) {
+            stl_le_p(p, (uint32_t)frame * 0x9e3779b1u);
+        }
+    }
+    for (uint32_t y = y0; y <= y1 && y < so.height; y++) {
+        for (uint32_t x = x0; x <= x1 && x < so.width; x++) {
+            uint32_t px = ldl_le_p(scan + (uint64_t)y * so.stride + (uint64_t)x * 4);
+            if (sprite) {
+                int32_t sx = (int32_t)x - so.cursor.x, sy = (int32_t)y - so.cursor.y;
+                if (sx >= 0 && sy >= 0 && (uint32_t)sx < so.cursor.width && (uint32_t)sy < so.cursor.height) {
+                    uint32_t src = ldl_le_p(sprite + ((uint64_t)sy * so.cursor.pitch + sx) * 4);
+                    uint32_t alpha = src >> 24, inv = 255 - alpha;
+                    if (alpha) {                   /* the same premultiplied blend as rdna4_blend_cursor */
+                        uint32_t r = ((src >> 16) & 0xff) + (((px >> 16) & 0xff) * inv + 127) / 255;
+                        uint32_t g = ((src >> 8) & 0xff) + (((px >> 8) & 0xff) * inv + 127) / 255;
+                        uint32_t bl = (src & 0xff) + ((px & 0xff) * inv + 127) / 255;
+                        px = (r > 255 ? 255 : r) << 16 | (g > 255 ? 255 : g) << 8 | (bl > 255 ? 255 : bl);
+                    }
+                }
+            }
+            cr = rdna4_crc16(cr, (px >> 16) & 0xff);
+            cg = rdna4_crc16(cg, (px >> 8) & 0xff);
+            cb = rdna4_crc16(cb, px & 0xff);
+        }
+    }
+    *rg = ((uint32_t)cg << 16) | cr;
+    *b = cb;
 }
 
 static void rdna4_gfx_update(void *opaque)
@@ -6851,6 +6964,16 @@ static void rdna4_reset(DeviceState *dev)
         rdna4_ctx_poison(s);
     if (s->cursor_lock_stuck)
         reg_set(s, SEG3(0x02c5), 1);
+    if (s->dscl_mode) {   /* DSCL0_SCL_MODE 0x0d08, RECOUT_SIZE 0x0d1f, MPC_SIZE 0x0d20 */
+        reg_set(s, SEG2(0x0d08), s->dscl_mode & 7);
+        if ((s->dscl_mode & 7) == 6) {              /* full bypass: the GOP never wrote the scaler's rectangles */
+            reg_set(s, SEG2(0x0d1f), 0);
+            reg_set(s, SEG2(0x0d20), 0);
+        } else {                                    /* a scaling setup: a rectangle that is not the timing */
+            reg_set(s, SEG2(0x0d1f), 0x02d00500u);
+            reg_set(s, SEG2(0x0d20), 0x02d00500u);
+        }
+    }
     if (s->gop_dlg)   /* regHUBPREQ0_DCN_SURF0_TTU_CNTL0 0x0623: a GOP that ran DML for its one surface */
         reg_set(s, SEG2(0x0623), 0x08005630u);
     if (dcn) {
@@ -7091,6 +7214,8 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("dcn-irq-storm", RDNA4State, dcn_irq_storm, false),
     DEFINE_PROP_BOOL("cursor", RDNA4State, cursor_enabled, false),
     DEFINE_PROP_BOOL("cursor-lock-stuck", RDNA4State, cursor_lock_stuck, false),
+    DEFINE_PROP_UINT32("dscl-mode", RDNA4State, dscl_mode, 0),
+    DEFINE_PROP_BOOL("desktop-churn", RDNA4State, desktop_churn, false),
     DEFINE_PROP_BOOL("gop-dlg", RDNA4State, gop_dlg, false),
     DEFINE_PROP_BOOL("ctx-garbage", RDNA4State, ctx_garbage, true),
     DEFINE_PROP_BOOL("cursor-ttu-hypothesis", RDNA4State, cursor_ttu_hypothesis, false),
