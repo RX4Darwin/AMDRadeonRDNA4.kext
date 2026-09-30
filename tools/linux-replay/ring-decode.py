@@ -21,38 +21,40 @@ for f in sorted(glob.glob(os.path.join(out, 'amdgpu_ring_gfx*.bin'))):
     hits = [i for i in range(n) if (ring[i] >> 8) & 0xff == 0x3f and ring[i] >> 30 == 3
             and (ring[(i + 1) % n] | ring[(i + 2) % n] << 32) & ~3 == ibva]
     print(f'== {os.path.basename(f)}: {n} dwords, rptr {rptr} wptr {wptr}; our IB at {hits}')
+    def plen(hdr):
+        # amdgpu pads rings with PACKET3(NOP, 0x3fff) = 0xffff1000, which the CP consumes as ONE dword
+        if hdr == 0xffff1000 or hdr >> 30 != 3:
+            return 1
+        return 2 + ((hdr >> 16) & 0x3fff)
+
+    def lands(j, h, limit=200):
+        """Parsing forward from j reaches exactly h."""
+        k = 0
+        while k < limit:
+            if (j + k) % n == h:
+                return True
+            k += plen(ring[(j + k) % n])
+        return False
+
     for h in hits:
-        # walk back up to 120 dwords to a packet boundary we can parse forward from
-        start = (h - 120) % n
-        i, lines = start, []
-        # resync: parse forward from start, discarding until we land exactly on h
-        for s0 in range(start, start + 120):
-            j = s0 % n
-            ok = False
-            k = j
-            for _ in range(60):
-                hdr = ring[k % n]
-                if hdr >> 30 != 3:
-                    k += 1
-                    continue
-                if k % n == h:
-                    ok = True
-                    break
-                k += 2 + ((hdr >> 16) & 0x3fff)
-                if (k - j) % n > (h - j) % n:
-                    break
-            if ok:
-                i = j
-                break
-        end = h + 60
+        # earliest start within 120 dwords before h whose forward parse lands exactly on our IB
+        i = next((h - back for back in range(120, 0, -1) if lands((h - back) % n, h)), h)
+        end = i + (h - i) % n + 60
         while i < end:
             hdr = ring[i % n]
+            if hdr == 0xffff1000:
+                run = 1
+                while run < end - i and ring[(i + run) % n] == 0xffff1000:
+                    run += 1
+                print(f'  {i % n:6d}: ffff1000  NOP (ring pad) x{run}')
+                i += run
+                continue
             if hdr >> 30 != 3:
-                print(f'  {i % n:6d}: {hdr:08x}  (type {hdr >> 30})')
+                print(f'  {i % n:6d}: {hdr:08x}  type {hdr >> 30}')
                 i += 1
                 continue
             op, cnt = (hdr >> 8) & 0xff, (hdr >> 16) & 0x3fff
             body = [ring[(i + 1 + k) % n] for k in range(cnt + 1)]
             mark = '  <== OUR IB' if i % n == h else ''
             print(f'  {i % n:6d}: {hdr:08x} {NAMES.get(op, hex(op)):22s} ' + ' '.join(f'{d:08x}' for d in body[:12]) + (' ...' if len(body) > 12 else '') + mark)
-            i += 2 + cnt
+            i += plen(hdr)
