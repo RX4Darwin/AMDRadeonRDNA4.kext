@@ -14,6 +14,12 @@ Kernel paths below are relative to `drivers/gpu/drm/amd/` (`amdgpu/…`, `amdkfd
 
 ## 0. Summary
 
+**Status after the lead's review (hub-task-307, 2026-09-30/10-01):** design B approved; two shared queues, C deferred, old fixed-VMID path kept
+behind a boot-arg until S9, root-only userclient unchanged for pre-Metal. Done on `premetal/w13`: **S0** (`3b8df07`, the `rtFree`/`rtUnload` invalidate),
+**S5** (`4386290`, `src/vmid.{hpp,cpp}` + 36 host checks, mutation-checked), **S4** (`2867f86` emulator E1-E6, `3fc6950` `tools/emu-qtest-vm.py`, 32 checks
+that run on the built emulator with no guest), and the compute replay for U1 (`446e48c`, written, **not run**). Not done: S1-S3, S6-S10. Section 6 has the
+per-step status, section 7 what the emulator now models, section 8.1 the final real-card boot plan.
+
 1. Today a client = one fixed VMID (8-15) + one dedicated MEC HQD + one 4 MiB page-table image, all taken at `rtOpen`.
    The effective cap is **7 clients** (7 usable HQDs), not 8. Nine other limits sit behind that one (section 1).
 2. amdgpu does not work this way for its own clients. It **virtualises** VMIDs: a VMID is granted per *submission*
@@ -40,6 +46,11 @@ Kernel paths below are relative to `drivers/gpu/drm/amd/` (`amdgpu/…`, `amdkfd
    VRAM without invalidating the client's TLB** (`src/runtime.cpp:2093-2111`; only host buffers invalidate). [READ]. Whether
    the stale translation can be used is [INFER] (no TLB in the emulator, never probed on the card). Fix is one line per path
    and is step S0.
+7. **New since the first version (memory note 2026-09-30, verified by the lead in `rdna4fb-diag-20260930-061829.txt`; excerpt in
+   `docs/hw-logs/2026-09-30-round6-client-paths-fail.txt`): on the real card every client path fails.** The boot self-test passes, but the first client
+   dispatch times out, every later call answers "device not responding", every client close logs `dequeue timeout (ACTIVE 0x00000001)`, and the SMU reports
+   GFX activity 100 % (3417 MHz, 80 W) at idle in every VM boot. So "how many clients" is moot until *one* works, and the dedicated-HQD machinery that design B
+   removes is itself suspect. Section 1.1 lists what differs between what passes and what fails; none of it is a diagnosis.
 
 ## 1. Current limits (what caps the number of clients)
 
@@ -72,12 +83,35 @@ Hardware limits behind the software ones:
 What is **not** a limit, and should not be fixed "while here": the page-table format, the PTE flags (W36 IS_PTE, W40 EXECUTABLE), the
 SDMA path that writes tables (`vmTableSync`, `runtime.cpp:635-664`). The design keeps all of them.
 
-What has been shown on the real card: one translated MEC queue, VMID 8, pipe 0 queue 1, doorbell 0x1a, in `vmBootSelfTest`
-(`runtime.cpp:742`) — round 6, "VM FIXED: rdna4-vm=1 boot self-test PASS" (project memory 2026-09-30). **No checked-in card log shows
-`rtOpen`'s path** (`client queue activated`: zero hits in `docs/hw-logs/`), a second VMID, a second translated queue, or VMIDs 1-7/9-15
-running anything. The two-client selftest in `userspace/rdna4-run.c:482-533` ("two VM clients dispatched concurrently") is part of real-card
-boot 2 (`docs/real-card-plan.md`), but I found no log showing it ran on the card; in the emulator the two "concurrent" clients are serialised by
-limit 9 anyway. [MEASURED absence of logs in the repo; I cannot rule out logs kept elsewhere]
+### 1.1 What the real card has shown about the current client path
+
+[MEASURED], from `rdna4fb-diag-20260930-061829.txt` (round 6, VM boot, kext = `premetal/int`; excerpt in `docs/hw-logs/2026-09-30-round6-client-paths-fail.txt`):
+
+- `RDNA4FB,Results`: `vm = PASS boot self-test`, `runtime = PASS service ready`. The boot self-test is **one** translated MEC queue (VMID 8, pipe 0 queue 1,
+  doorbell 0x1a, `vmBootSelfTest`, `runtime.cpp:742`): a ring `WRITE_DATA` and a `RELEASE_MEM` fence. It runs **no shader**.
+- `rdna4-run selftest`: `VM isolation dispatch: I/O Timeout`, then `device not responding` for peers, host-memory vadd, SubmitIb, three/ten IBs, sgemm, hgemm; the
+  runtime reports `WEDGED (a dispatch timed out; reboot)`. Every `rtOpen` logs `client queue activated MEC1 pipe 0 queue 1` (the same slot the boot test used) or
+  queue 2 for the second client, and every close logs `queue ... dequeue timeout (ACTIVE 0x00000001)`. No `GC hub fault status` line appears.
+- `sensors-idle`: GFX activity 100 %, 3417 MHz, 80 W, **before** the selftest; `SMU-REPORTS-GFX-BUSY`. The lead's note: never seen in non-VM boots.
+- Not present in the log: any client with VMID ≠ 8 ever completing work; `rdna4-hang=1` was not set (`w6 SKIPPED`).
+
+What differs between the passing boot test and the failing client path [READ, each a *difference*, not a cause]:
+
+| | boot self-test (passes) | client path (fails) |
+|---|---|---|
+| Work | ring `WRITE_DATA` + `RELEASE_MEM` | `SET_SH_REG` + `DISPATCH_DIRECT`: **a shader wave in VMID 8, never run on the card before** |
+| `SH_MEM_CONFIG/BASES` | written for VMIDs 8-15 once (`runtime.cpp:820-825`) | rewritten at every launch (`compute.cpp:3101-3104`) through `GRBM_GFX_CNTL` banking |
+| Code / kernarg | none | code pages mapped from the pool heap, kernarg page in the client VM |
+| HQD state | fresh slot | the same slot (0,1) reused right after the boot test's dequeue; `hqdInitFor` drains a leftover queue first (`compute.cpp:2783-2791`) |
+| Context | enabled, used, **disabled** at the end | enabled at open; `CNTL` zeroed at close only |
+
+**What this means for W13.** (1) Design B's first card steps must include a *dispatch* (a wave in a non-zero VMID) and not only `WRITE_DATA` (section 8.1). (2) A cheap,
+read-only way to see which engine is busy at idle exists (`rdna4-gfxpm=16`, the "pm: survey" lines the diagnostic script already points at); turning it on in the next
+VM boot costs nothing. (3) I do **not** claim design B fixes the failure: it removes the client-VM queue addresses (EOP/rptr/wptr in client VA) and the per-launch banked
+register writes, which are two of the differences above, but the wave-in-VMID-8 difference stays. (4) S7's "first client path on the card" is therefore a diagnosis step as
+much as a feature step.
+
+The two-client selftest in `userspace/rdna4-run.c:482-533` is what produced the `VM peer` lines above; in the emulator the two "concurrent" clients are serialised by limit 9 anyway.
 
 ## 2. How amdgpu does it (7.2.2, read)
 
@@ -362,12 +396,12 @@ Every step is behind a boot-arg until the last (`rdna4-vmid=1`); default behavio
 
 | Step | Change | Emu test | Card proof needed |
 |---|---|---|---|
-| **S0** | `rtFree` (device buffers) and `vmUnmap` users bump a per-client `tlbSeq`; invalidate before the next submit / at free (amdgpu's `flushed_updates < tlb_seq`). Bug fix, no new design. | needs the TLB model (S4a) to *fail before / pass after*; until then a host test of the sequencing | none (write-only invalidates are what `host unmap` already does on the card) |
-| **S1** | Make E4 a first-class, always-available boot check: queue (0,1) with **VMID 0** fetching an IB in VMID 8 (`rdna4-vm-diag` bit 0 today, only after the baseline fails, `runtime.cpp:834-838`). Add a variant for VMIDs 1 and 15. | emulator already models `PRIV_STATE` queues taking the IB's VMID (`rdna4.c:4205-4210`); both directions (priv and non-priv mismatch) as negative controls | **U1, U2: yes.** One boot of the current round, `rdna4-vmid-test=1`; 3 IBs, no gfx. Tiny blast radius (one HQD, the boot-test queue). |
+| **S0** — *done `3b8df07`* | `rtFree` (device buffers) and `vmUnmap` users bump a per-client `tlbSeq`; invalidate before the next submit / at free (amdgpu's `flushed_updates < tlb_seq`). Bug fix, no new design. | needs the TLB model (S4a) to *fail before / pass after*; until then a host test of the sequencing | none (write-only invalidates are what `host unmap` already does on the card) |
+| **S1** — *spec in 8.1, folded into the final boot* | Make E4 a first-class, always-available boot check: a queue with **VMID 0** fetching an IB in VMID n (`rdna4-vm-diag` bit 0 today, only after the baseline fails, `runtime.cpp:834-838`), for VMIDs 1, 8 and 15, **with a wave dispatch and not only `WRITE_DATA`** (the client path that fails on the card is the first shader wave in a non-zero VMID, section 1.1). | emulator already models `PRIV_STATE` queues taking the IB's VMID (`rdna4.c:4205-4210`); both directions (priv and non-priv mismatch) as negative controls | **U1, U2: yes.** One boot of the current round, `rdna4-vmid-test=1`; 3 IBs, no gfx. Tiny blast radius (one HQD, the boot-test queue). |
 | **S2** | `SH_MEM_CONFIG/BASES` for VMIDs 1-15 once at runtime init; remove from `launch`/`rtSubmitIb`. | SH_MEM banked by VMID in the emulator (S4c) and a read-back check | folded into S1's boot |
 | **S3** | Drop `rtLock` across fence waits and recovery (`rtDispatch`, `rtWaitFence`); per-client state under the lock, waits outside. Split `rtWedged` per queue (still one queue per client at this point). | `rdna4-run` selftest: a client blocked in `WaitFence` must not stall another client's dispatch, nor the present timer; hang injection on one client leaves the other running (`rdna4.c` already has `hang-sticky`) | none until S9 |
-| **S4** | **Emulator** fidelity (section 7): (a) TLB with explicit invalidation, (b) all 18 invalidation engines with ack latency, (c) `SH_MEM_*` banked by VMID, (d) `IH_VMID_LUT` + pasid in fault vectors, (e) ring-level flush for any VMID, (f) 15 VMIDs. Each with a negative control. | the new emulator tests themselves: every change must make a *wrong* kext fail (missing invalidate ⇒ stale read) before it is used as evidence | the card-backed claims in section 7 must be attached to each model item |
-| **S5** | `VmidPool` (`src/vmid.{hpp,cpp}`) + host tests: reuse, LRU order, steal, idle detection with two fence domains and wrap-around, fairness wait, `forget`, `unbindAll`, tlbSeq-triggered flush. No kext use yet. | host | none |
+| **S4** — *done `2867f86` + `3fc6950`; E3 not exercised* | **Emulator** fidelity (section 7): (a) TLB with explicit invalidation, (b) all 18 invalidation engines with ack latency, (c) `SH_MEM_*` banked by VMID, (d) `IH_VMID_LUT` + pasid in fault vectors, (e) ring-level flush for any VMID, (f) 15 VMIDs. Each with a negative control. | the new emulator tests themselves: every change must make a *wrong* kext fail (missing invalidate ⇒ stale read) before it is used as evidence | the card-backed claims in section 7 must be attached to each model item |
+| **S5** — *done `4386290`* | `VmidPool` (`src/vmid.{hpp,cpp}`) + host tests: reuse, LRU order, steal, idle detection with two fence domains and wrap-around, fairness wait, `forget`, `unbindAll`, tlbSeq-triggered flush. No kext use yet. | host | none |
 | **S6** | Clients as dynamic objects and on-demand page tables (5.1, 5.2), still with fixed VMID + own HQD (so ≤7 by hardware). `kMaxClients`, per-slot pool layout and the per-client 8 MiB go away; global `kMaxBuffers/kMaxPrograms` become per-client. | `rdna4-run` with 7 clients; allocation/free churn; VA beyond 2 GiB | none: same hardware behaviour as today |
 | **S7** | **B-Q with static VMIDs**: two kernel-owned shared compute queues (VMID 0); job = `[ACQUIRE_MEM] IB(vmid) RELEASE_MEM(queue fence)`; `rtDispatch` through the client kernel-IB page; per-queue fences and in-flight lists; clients lose their HQD and doorbell but **keep a VMID taken at open from 1-15 (through `VmidPool`, pinned)**. Cap becomes 15. | 15 clients, two shared queues, mixed dispatch/IB; a hung IB in one client (kill by VMID, the others finish); queue reset fails innocents with the defined status; host/queue isolation tests | **yes**: first time the client path runs on the card at all; 2-3 clients one after another, then two at once (U1 in anger, U3 not yet needed because nothing rebinds) |
 | **S8** | **B-V1 lazy binding**: clients no longer take a VMID at open; `grab` at submit, LRU steal/rebind of idle VMIDs, fault harvest before rebind, `IH_VMID_LUT`. Cap becomes memory. | 16, 32, 100 clients; steal/rebind under load; **TLB-stale negative controls** (skip the invalidate ⇒ wrong data observed, needs S4a); attribution after rebind; fairness wait when all 15 are busy | **yes** for U3: two clients alternately stealing one VMID, with another client's job in flight on a second VMID |
@@ -379,6 +413,18 @@ behaviour change on the card is S1 (a small test of U1/U2), then S7 (queue shari
 rebinding), then S8 (rebinding). S6 has no hardware effect. The two halves of B (queue sharing, VMID sharing) thus land on the card one at a time.
 
 ## 7. Emulator changes needed to model this faithfully (`emu/qemu/rdna4.c`)
+
+**Status (2026-10-01).** E1-E6 are implemented in `emu/qemu/rdna4.c` (`2867f86`) and compile clean against QEMU 10.0.13. `tools/emu-qtest-vm.py` (`3fc6950`) drives the
+built device over qtest with no guest and checks 32 things, each with its negative control: a stale translation survives a remap until an invalidation names the VMID
+(and not another VMID); L1-only, L2-only and PDE-level invalidations behave per their bits; a context-base rewrite does not flush; `inv-ack-reads=3` delays the effect
+until the third ACK read; engines 0, 5, 17 work and `inv-noack` never completes; `tlb-off` reproduces what the old emulator hid; `SH_MEM_*` are per VMID; `IH_VMID_LUT`
+stamps the PASID into a fault vector at write time. One mutation was tried (an invalidate that ignores the VMID mask fails a check). Properties: `tlb-off`,
+`tlb-evict-ppm=N` (stress: random eviction), `inv-ack-reads=N`, `inv-noack` (now all engines), `test-gfx-booted` (unit-test shortcut only).
+**Not exercised:** E3 (the ring-level write-register-and-wait flush needs the gfx ring's clear-state bring-up to run; it is reviewed and compiled, not run), E9 (prefetch past
+`PFP_SYNC_ME`, deliberately not modelled), and any macOS-guest run. Expect the first guest runs to print `STALE TRANSLATION used` wherever the kext skips an
+invalidation: each one is a finding, not noise. The E5 fault vector is new behaviour for every guest run (the emulator raised none before).
+Run: `QEMU=<qemu-system-x86_64 with the rdna4 device> tools/emu-qtest-vm.py` (builds are described in `tools/emu-build.sh`).
+
 
 The project's past mistake (W36 review: the emulator was bent until the kext passed, then the real card failed) applies directly: **a VMID-virtualisation design
 cannot be validated on an emulator that has no TLB.** Each item below says what the card does (with its evidence) and what the emulator does today.
@@ -423,16 +469,38 @@ was busy, on this card. *Test: S8 on the card with two clients in flight.* The f
 the emulator can only approximate (E5). (4) `rtFree` without invalidate (S0) means the current code may already expose stale translations on the card; it has not been
 probed.
 
-**Questions for the lead.**
+**Questions for the lead — answered (hub-task-307).** 1) root-only stays for pre-Metal; Metal will expose its own accelerator client with an access policy (see
+`docs/w13-client-access.md`); still design for many clients. 2) U1 first under Linux with a compute replay (written, `446e48c`, not run, awaiting the go-ahead); U2/U3 go into the
+user's final real-card test. 3) two shared queues, C deferred. 4) yes, old path behind a boot-arg until S9. 5) yes, S0 standalone (done).
 
-1. Is **root-only** (`userclient.cpp:47`) staying for the Metal phase? Many unprivileged processes need an entry point that grants a *client* (VM + submit) and not raw
-   kernel access; W13's unbounded clients are pointless behind `clientHasPrivilege`. I did not touch it; it is a separate workstream.
-2. OK to spend a real-card boot on S1 (VMID 0 queue + IB in VMIDs 1/8/15, no gfx)? Nothing else in this design can be shown on the emulator. If the lead prefers to prove U1
-   under Linux first: a compute-ring replay with `AMDGPU_HW_IP_COMPUTE` in `tools/linux-replay` (today it submits a gfx IB) would show a KCQ running an IB in a per-process VMID on
-   this very card — outside the currently allowed set, so it needs an explicit OK.
-3. Queue count N for B-Q (proposal 2) and whether C (pinned WindowServer HQD) is wanted up front.
-4. Should the current fixed-VMID path stay behind a boot-arg for one more round as a fallback? (My plan: yes, through S9.)
-5. S0 (the `rtFree` invalidate) is a bug fix independent of W13; want it split off and merged first?
+### 8.1 The final real-card boot: S1 folded in (spec; the kext code for it is not written yet)
+
+Purpose: turn U1 and U2 into measurements in the one boot the user will run, and attribute the "GFX busy at idle / client dispatch hangs" failure of section 1.1. It is a
+**spec**: the self-test code is step S1, after the lead's review of this round.
+
+**Boot arguments.** The VM boot of `docs/real-card-plan.md` (boot 2: `rdna4-compute=7 rdna4-trace=1 rdna4-ih=1 rdna4-vm=1 rdna4-hang=1`) plus
+`rdna4-vmid-test=1` (new: runs the checks below right after `vmBootSelfTest`, before the runtime service is published, like the boot test) and `rdna4-gfxpm=16` (existing: the read-only
+engine survey, so the 100 % activity can be attributed). Nothing else; no gfx ring in this boot.
+
+**What `rdna4-vmid-test=1` does** (all on one spare MEC slot, never a slot a client can have, with the same EOP/rptr discipline as the boot test):
+
+| # | Check | Pass | What a failure means |
+|---|---|---|---|
+| C0 | Read-only: `GRBM_STATUS`, `CP_STAT`, `CP_CPC_BUSY_STAT`, `SQ` busy bits, before and after `vmBootSelfTest` (the `pm:` survey) | logged | names the engine that is busy at idle |
+| C1 | A queue with `CP_HQD_VMID` = 0, `PRIV_STATE \| KMD_QUEUE`, PQ/EOP/rptr/wptr at MC addresses. Its ring holds `INDIRECT_BUFFER(vmid = n, VA of an IB page mapped ONLY in VMID n's tables, unprivileged)`, then a `RELEASE_MEM` fence at a VMID-0 address. The IB: `WRITE_DATA` of a known pattern to a second VA page of VMID n, then nothing else. Repeat for n = 1, 8, 15 (each with its own tables and `CONTEXTn` programming) | fence seen, pattern in the page, `GCVM_L2_PROTECTION_FAULT_STATUS` = 0 | **U1** if n = 8 fails; **U2** if only 1 or 15 fail |
+| C2 | Negative control of C1: the same ring with the IB packet's VMID = n+1 (context never enabled) | a fault whose VMID field is n+1 (the IB fetch), no pattern | if it instead *succeeds*, the IB ran in VMID 0 or in the queue's VMID: the packet's VMID field is not what decides, and U1 is false |
+| C3 | Same as C1 (n = 8) but the IB is the recorded vadd dispatch (`userspace/pm4build.h`, the kext's `kVaddCodeObject`, code page executable in VMID 8's tables, kernarg and data pages R/W), `SH_MEM_CONFIG/BASES` for VMIDs 1-15 programmed beforehand (S2) | `c[i] = a[i] + 3 b[i]` for 256 items | **the first shader wave in a non-zero VMID**: a failure here with C1 passing isolates the wave/SH_MEM/code-fetch part of the client-path failure |
+| C4 | C3 again with the wave's code page mapped without `EXECUTABLE` | a permission fault (status bit 7 set, `PERMISSION 8`), VMID field 8 | proves the wave's instruction fetch really goes through VMID 8's tables (the W40 lesson, now for a wave) |
+| C5 | Dequeue the test queue and check `CP_HQD_ACTIVE` returns to 0 | inactive | a timeout here with C1-C4 passing points at dequeue while waves ran, the client-close symptom |
+
+**Order and stop rules.** C0, C1(n=8), C2, then C1(n=1, 15), then C3, C4, C5. On the first hang the code writes the durable `RDNA4FB,Results` key (`vmid = FAIL Cn`), attempts the W6 queue recovery
+(needs `rdna4-hang=1`, set) and **does not continue**; the rest of the boot proceeds as a normal boot. Blast radius: one HQD slot, three VMIDs' contexts (all zeroed and invalidated afterwards),
+no display, no gfx ring, no power-state change.
+
+**Also in the user's final test, not in this boot**: U3 (two clients alternately stealing one VMID while another runs) belongs to step S8's boot; it cannot be a boot before S7/S8 code exists.
+
+**Expected on the emulator** (the dry run): C1, C3 pass; C2 faults with VMID n+1 (the emulator's rule is assumption U1, so this is only a check that the test itself is well formed); C4 faults
+with `0x00800880`-like status; with the new TLB model a missing `vmInvalidate` between the C1 contexts would print `STALE TRANSLATION used`.
 
 ## 9. Sources read
 
