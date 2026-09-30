@@ -1,0 +1,113 @@
+RDNA4FB real-card test, FINAL round - start here
+=================================================
+Kit @COMMIT@ (@BRANCH@), staged @DATE@.   Written for someone who does not
+read code: follow the numbers. If a step says STOP, stop and tell Claude.
+
+WHAT THIS ROUND IS
+  One long session of short test boots. Each boot changes a few boot
+  arguments, you run one script, it saves a log on this stick. The logs are
+  what matters: send ALL of them back. Most boots are expected to show some
+  FAIL lines: that is information, not a mistake.
+  The key question: why do programs (clients) fail on the GPU when the
+  driver's own boot test passes, and does the "shared queue" fix work.
+
+BEFORE YOU START
+  - The stick is set for BOOT 1 now (the safe base).
+  - Start from a FULL POWER-OFF: Shut Down, wait 10 seconds, power on.
+  - Nothing else needs to be open. Do not browse, do not sleep the Mac
+    (except in the very last boot, where the steps say to).
+
+HOW TO RUN ONE BOOT (the same loop every time)
+  A. Start the Mac, pick the stick, boot macOS Recovery, open Terminal
+     (menu Utilities > Terminal).
+  B. Type the set-boot line of the step you are on, for example:
+         bash /Volumes/OPENCORE/set-boot.sh 9
+     then RESTART (Apple menu > Restart) and pick the stick again.
+  C. In Recovery, open Terminal again and IMMEDIATELY type:
+         bash /Volumes/OPENCORE/diagnostic-log.sh
+     Wait (up to a few minutes) for the table of PASS / FAIL / SKIPPED lines.
+     The log is saved on the stick as rdna4fb-diag-<date>-<time>.txt.
+  D. Go to the next step. (You do not need to do anything between steps
+     except B and C.)
+
+THE ORDER
+@ORDER@
+
+  After boots 9, 9b and 12 it is worth telling Claude what the tables said
+  BEFORE you go on (the later boots may need one changed switch). If Claude
+  says "use NOVMDIAG", type the set-boot line with a prefix, for example:
+         NOVMDIAG=1 bash /Volumes/OPENCORE/set-boot.sh 3
+  If you cannot reach Claude, simply carry on in the order above.
+
+WHAT TO LOOK FOR (only so you know if something looks odd; do not judge)
+
+== BOOT 1 ==
+  The safe base. Everything here worked before: runtime, ih, vblank, flip,
+  anim all PASS, and the idle lines show a low GPU load (about 3-8 % and
+  about 45 W). If something that used to PASS now FAILS: STOP (that would
+  mean the new software broke the base).
+
+== BOOT 9 ==
+  The main diagnostic (plain). Many new lines: vmidtest, vmidtest-late,
+  vm-survey, vm-trace, idle-pin. FAIL lines here are expected and useful.
+
+== BOOT 9b ==
+  The same, plus one old diagnostic switch that was on in the last round.
+  Comparing 9 and 9b tells us whether that switch is what broke things.
+
+== BOOT 12 ==
+  The candidate fix (shared queues). The interesting lines are runtime,
+  submitib and fault: PASS here would mean the fix works.
+
+== BOOT 3 ==
+  The triangle boot (can hang the GPU, that is why it is not first).
+  Hoping for:  gfx PASS (THE TRIANGLE IS RIGHT), gfx-col PASS (THE COLOUR
+  TRIANGLE IS RIGHT). If the screen freezes or goes black: see IF SOMETHING
+  GOES WRONG, and do not continue with the drawing boots.
+
+== BOOT 8 ==
+  Programs draw through the GPU (old way). Rows gfx-app-tri and
+  gfx-app-tricol, plus gfx-client.
+
+== BOOT 13 ==
+  The same as boot 8 but with the shared queues. The draw rows should look
+  the same as in boot 8.
+
+== BOOT 10 ==
+  Idle test. Rows post-idle and gfx-idle-acct. post-idle FAIL means the GPU
+  stays busy after the programs closed (a measurement, not a disaster).
+
+== BOOT 11 ==
+  SLEEP / WAKE. NEVER TRIED ON THIS CARD BEFORE, so it is LAST.
+  Extra steps after the diagnostic-log.sh table (still in Recovery):
+     1. type:   /Volumes/OPENCORE/rdna4-run tri      (expect PASS)
+     2. Apple menu > Sleep. Wait at least 10 seconds. Wake the Mac (key or
+        mouse).
+     3. type:   /Volumes/OPENCORE/rdna4-run tri      again (expect PASS)
+  If the Mac does not come back or the screen stays black: hold the power
+  button, power off for 10 seconds, and tell Claude. Then POWER OFF after
+  this boot whatever happened.
+
+IF SOMETHING GOES WRONG (freeze, panic, black screen, reboot loop)
+  - Take a photo of the screen if there is anything on it.
+  - POWER OFF (hold the power button; do NOT restart), wait 10 seconds.
+  - Power on, pick the stick, boot Recovery, open Terminal and type:
+         bash /Volumes/OPENCORE/set-boot.sh 1
+    then Shut Down (not restart), wait 10 seconds, and tell Claude.
+  - After a hang, the driver skips the feature that hung, ONCE. So the same
+    boot again gives a different result: tell Claude before repeating it.
+
+HOW TO GO BACK
+  - Safe base (daily use):      bash /Volumes/OPENCORE/set-boot.sh 1
+  - Known-good, no new feature: bash /Volumes/OPENCORE/set-boot.sh 0
+    (then Shut Down; wait 10 s)
+  - Old driver (kext): this kit saved everything it replaced in the folder
+    @BACKUP@ on this stick. To go back to the previous driver, copy
+    @BACKUP@/RDNA4FB.kext over EFI/OC/Kexts/RDNA4FB.kext.
+  - Older copies: backup-prev-round7-kext.kext (round 7), backup-before-premetal.
+
+WHEN YOU ARE FINISHED
+  1. bash /Volumes/OPENCORE/set-boot.sh 1
+  2. Shut Down, wait 10 seconds.
+  3. Plug the stick into Linux or Windows and tell Claude. Send every
+     rdna4fb-diag-*.txt file.
