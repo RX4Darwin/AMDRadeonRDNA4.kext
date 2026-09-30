@@ -266,6 +266,14 @@ registry_value() {
 	# (DP) and the framebuffer's "ndrv: Control csc 11 -> 0x.." (the DPMS request macOS sent). klines falls back to the unified log when the kernel buffer wrapped.
 	klines 'RDNA4FB: (power:|.*ndrv: Control csc 11|.*display (un)?blanked|.*display sleep)' | sed 's/^/  /' || true
 	echo "(no line above = no display power event in the log window; after the optional idle step of START-HERE a blank AND an un-blank are expected)"
+	echo "--- registry copy (survives the kernel log wrapping): RDNA4FB,DisplayPower (last 16 events, oldest first)"
+	DPW_PROP="$(ioreg -l -w0 2>/dev/null | grep '"RDNA4FB,DisplayPower"' | sed -n -E 's/.*"RDNA4FB,DisplayPower" = "([^"]*)".*/\1/p' | head -1)"
+	if [ -n "$DPW_PROP" ]; then
+		echo "$DPW_PROP" | sed 's/ ## /\
+/g' | sed 's/^/  /'
+	else
+		echo "  (no RDNA4FB,DisplayPower property: no display power request reached the kext since boot, or the kext build predates it)"
+	fi
 
 	section "dmesg: idle accounting (rdna4-gfxidle=1) and the Compute,GFXIdle registry copy"
 	dmesg | grep -E 'RDNA4FB: idle:' || echo "(no idle: lines - rdna4-gfxidle not enabled, or no transition yet)"
