@@ -3,7 +3,7 @@
 # emulator on the Linux box: macOS Recovery (Tahoe) headless on the emulated
 # RX 9070 XT, our kext injected by OpenCore, the kernel log on a serial file.
 #
-#   tools/emu-linux.sh <0-7> [options]
+#   tools/emu-linux.sh <boot> [options]
 #
 #   --wait SECS     give up waiting after SECS (default 420); the run normally ends
 #                   GRACE_S (45) seconds after Recovery is up and the kext is done
@@ -22,7 +22,7 @@
 # see docs/emu-linux.md for how it is built): qemu-10.0.13/ (with the rdna4
 # device), OSX-KVM/ (stock OpenCore image + OVMF pair), images/BaseSystem.img
 # (Recovery, made from the USB's BaseSystem.dmg), kexts/Lilu.kext, local/ (mtools).
-# Env: EMU, KEXT (default build/RDNA4FB.kext of this checkout), RAM_MB (8192).
+# Env: TAG (suffix of the run dir, e.g. the emulator name), EMU, QEMU_BIN (the emulator binary; default the QEMU tree's build), KEXT (default build/RDNA4FB.kext of this checkout), RAM_MB (8192).
 #
 # Each run gets $EMU/runs/<time>-boot<N>/ with serial.log (kernel log),
 # rdna4fb.log (the RDNA4FB lines), qemu.out, screen-*.png (monitor screendumps)
@@ -36,6 +36,7 @@ export OSXKVM=${OSXKVM:-$EMU/OSX-KVM}
 KEXT=${KEXT:-$HERE/build/RDNA4FB.kext}
 LILU=${LILU:-$EMU/kexts/Lilu.kext}
 BASE_IMG=${BASE_IMG:-$EMU/images/BaseSystem.img}
+export QEMU_BIN=${QEMU_BIN:-$QEMU_SRC/build/qemu-system-x86_64}   # e.g. $EMU/bin/w13/qemu-system-x86_64
 export PATH="$QEMU_SRC/build:$EMU/local/bin:$PATH"   # qemu-img, mcopy/mdeltree
 
 WAIT=420 EXTRA="" ARGS="" DEV="" KEEP=0 BUILD=1 BOOT="" DIAG=0
@@ -49,14 +50,14 @@ while [ $# -gt 0 ]; do
 		--diag) DIAG=1 ;;
 		--no-build) BUILD=0 ;;
 		-h|--help) sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
-		[0-7]) BOOT=$1 ;;
+		[0-9]) BOOT=$1 ;;
 		*) echo "unknown argument: $1 (try -h)" >&2; exit 2 ;;
 	esac
 	shift
 done
-[ -n "$BOOT" ] || [ -n "$ARGS" ] || { echo "usage: $0 <0-7> [options] (try -h)" >&2; exit 2; }
+[ -n "$BOOT" ] || [ -n "$ARGS" ] || { echo "usage: $0 <0-9> [options] (try -h)" >&2; exit 2; }
 
-for f in "$QEMU_SRC/build/qemu-system-x86_64" "$HERE/build-emu/rdna4.rom" "$KEXT/Contents/MacOS/RDNA4FB" \
+for f in "$QEMU_BIN" "$HERE/build-emu/rdna4.rom" "$KEXT/Contents/MacOS/RDNA4FB" \
 	"$LILU/Contents/Info.plist" "$BASE_IMG" "$OSXKVM/OpenCore/OpenCore.qcow2" "$EMU/local/bin/mcopy"; do
 	[ -e "$f" ] || { echo "emu-linux: missing $f (docs/emu-linux.md says how to make it)" >&2; exit 1; }
 done
@@ -77,7 +78,7 @@ fi
 case " $ARGS " in *" serial="*) ;; *) ARGS="$ARGS serial=3" ;; esac
 [ -z "$EXTRA" ] || ARGS="$ARGS $EXTRA"
 
-RUN=$EMU/runs/$(date +%Y%m%d-%H%M%S)-boot${BOOT:-custom}
+RUN=$EMU/runs/$(date +%Y%m%d-%H%M%S)-boot${BOOT:-custom}${TAG:+-$TAG}
 mkdir -p "$RUN"
 SERIAL=$RUN/serial.log
 MON=$RUN/monitor.sock
@@ -91,7 +92,7 @@ if [ "$BUILD" = 1 ] || [ ! -f "$OSXKVM/OpenCore/$OCIMG" ]; then
 		> "$RUN/opencore.out" 2>&1 || { tail -20 "$RUN/opencore.out"; exit 1; }
 fi
 
-QPAT="^$QEMU_SRC/build/qemu-system-x86_64 "
+QPAT="^[^ ]*/qemu-system-x86_64 "
 pkill -f "$QPAT" 2>/dev/null || true   # never two VMs at once
 for i in $(seq 1 20); do pgrep -f "$QPAT" >/dev/null || break; sleep 0.5; done
 cp "$OSXKVM/OVMF_VARS-1920x1080.fd" "$RUN/vars.fd"
@@ -114,6 +115,12 @@ OC_IMAGE=$OCIMG RAM_MB=${RAM_MB:-8192} MONITOR=$MON SERIAL_LOG=$SERIAL BASE_IMG=
 	OVMF_CODE=$OSXKVM/OVMF_CODE_4M.fd OVMF_VARS=$RUN/vars.fd VNC_DISPLAY=${VNC_DISPLAY:-0} \
 	setsid nohup bash "$HERE/tools/emu-boot.sh" ${DEV:+"$DEV"} > "$RUN/qemu.out" 2>&1 < /dev/null &
 QPID=$!
+# Byte offsets of qemu.out and serial.log every 0.1 s: tools/emu-context.py uses them to
+# show which kext lines an emulator message came after.
+( while kill -0 "$QPID" 2>/dev/null; do
+	echo "$(stat -c %s "$RUN/qemu.out" 2>/dev/null || echo 0) $(stat -c %s "$SERIAL" 2>/dev/null || echo 0)"
+	sleep 0.1
+done > "$RUN/offsets.txt" ) 9>&- &
 cleanup() { [ "$KEEP" = 1 ] || { pkill -f "$QPAT.*$MON" 2>/dev/null || true; }; }
 trap cleanup EXIT
 
@@ -202,4 +209,8 @@ say "$(wc -l < "$RUN/rdna4fb.log") RDNA4FB lines -> $RUN/rdna4fb.log"
 	grep -aE "compute: bring-up finished|runtime: user-space runtime up|THE TRIANGLE IS RIGHT|gfx: draw: .*(EMPTY|wrong|empty)|gfx: col: (wrong|THE|target still)|ih: (self-test totals|page flip|vblank self-test passed)" "$RUN/rdna4fb.log" |
 		sed 's/^.*RDNA4FB: /RDNA4FB: /' | cut -c1-230 | awk '!seen[$0]++'
 } | tee -a "$RUN/summary.txt"
+# What the emulator itself said (stderr of QEMU, without the host-CPU feature noise).
+grep -av "host doesn't support requested feature" "$RUN/qemu.out" > "$RUN/emu-warnings.txt" || true
+python3 "$HERE/tools/emu-context.py" "$RUN" > "$RUN/emu-context.txt" 2>/dev/null || true
+say "emulator: $QEMU_BIN, $(wc -l < "$RUN/emu-warnings.txt") message lines -> emu-warnings.txt, emu-context.txt"
 echo "$RUN"

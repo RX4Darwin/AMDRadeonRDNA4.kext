@@ -15,13 +15,14 @@
 # sets them for the Linux dry run): OVMF_CODE, OVMF_VARS (writable copy, made from
 # OVMF_VARS_SRC if absent), BASE_IMG (Recovery disk), MACHDD (set to "none" to
 # leave the macOS disk out), MONITOR (QEMU monitor socket), SERIAL_LOG, VNC_DISPLAY
-# (default 0 = 127.0.0.1:5900), EXTRA_QEMU (more QEMU arguments, word-split).
+# (default 0 = 127.0.0.1:5900), EXTRA_QEMU (more QEMU arguments, word-split),
+# QEMU_BIN (another qemu-system-x86_64, e.g. an older build of the rdna4 device for A/B).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 OSXKVM=${OSXKVM:-$HOME/OSX-KVM}
 QEMU_SRC=${QEMU_SRC:-$HOME/qemu-10.0.13}
-QEMU=$QEMU_SRC/build/qemu-system-x86_64
+QEMU=${QEMU_BIN:-$QEMU_SRC/build/qemu-system-x86_64}
 OC_IMAGE=${OC_IMAGE:-OpenCore-emu.qcow2}
 ROM=$HERE/build-emu/rdna4.rom
 STATE=$HERE/emu/qemu/gop-state.txt
