@@ -460,13 +460,68 @@ def test_fault_is_not_stale():
     finally:
         sc.close()
 
+REG_HQD_DEQUEUE = GC0(0x1fc1)
+P_B_RING, P_B_RPTR, P_B_EOP, P_B_FENCE = 0x230000, 0x231000, 0x232000, 0x233000
+
+def test_doorbell_routes_to_active_queue():
+    """hub-task-347 item 3: rdna4-vmshared=1 + rdna4-vmid-test failed in the emulator because the shared queues' doorbell dwords (42, 44) equal
+    those of the S1 probe queues at (0,1)/(1,1). The device sent the doorbell to the FIRST queue ever used with that dword, although its HQD had been
+    dequeued: 'queue pipe 1 queue 1 ignored: HQD not active', the shared queue's job was silently not run. Hardware routes a doorbell only to an
+    ACTIVE HQD."""
+    sc = tlb_scenario("E6: a doorbell dword goes to the ACTIVE HQD that owns it, not to a dequeued one that once used the same dword")
+    try:
+        q = sc.q
+        q.wreg(REG_FB_BASE, MC_BASE >> 24); q.wreg(REG_FB_TOP, (MC_BASE >> 24) + 15)
+        for page in (P_PRIV_RING, P_PRIV_RPTR, P_PRIV_EOP, P_PRIV_FENCE, P_B_RING, P_B_RPTR, P_B_EOP, P_B_FENCE):
+            q.vram_w(page, bytes(0x1000))
+        DB = 0x32
+        def prog(pipe, queue, ring, rptr, eop):
+            q.wreg(REG_GRBM_GFX_CNTL, grbm(0, pipe=pipe, queue=queue, me=1))
+            q.wreg(H["VMID"], 0)
+            q.wreg(H["PQ_BASE"], (MC_BASE + ring) >> 8); q.wreg(H["PQ_BASE_HI"], (MC_BASE + ring) >> 40)
+            q.wreg(H["RPTR_REP"], (MC_BASE + rptr) & 0xffffffff); q.wreg(H["RPTR_REP_HI"], (MC_BASE + rptr) >> 32)
+            q.wreg(H["EOP"], (MC_BASE + eop) >> 8); q.wreg(H["EOP_HI"], (MC_BASE + eop) >> 40)
+            q.wreg(H["DOORBELL"], (DB << 2) | (1 << 30))
+            q.wreg(H["PQ_CNTL"], 9 | (1 << 30))
+            q.wreg(H["WPTR_LO"], 0); q.wreg(H["WPTR_HI"], 0); q.wreg(H["PQ_RPTR"], 0)
+            q.wreg(H["ACTIVE"], 1)
+            q.wreg(REG_GRBM_GFX_CNTL, grbm(0))
+        def dequeue(pipe, queue):
+            q.wreg(REG_GRBM_GFX_CNTL, grbm(0, pipe=pipe, queue=queue, me=1))
+            q.wreg(REG_HQD_DEQUEUE, 1)
+            act = q.reg(H["ACTIVE"])
+            q.wreg(REG_GRBM_GFX_CNTL, grbm(0))
+            return act & 1
+        wp = {}
+        def job(ring, fence, key, seq):
+            pk = release_mem(MC_BASE + fence, seq)
+            q.vram_w(ring + 4 * wp.get(key, 0), b"".join(struct.pack("<I", d) for d in pk))
+            wp[key] = wp.get(key, 0) + len(pk)
+            q.writeq(BAR2 + DB * 4, wp[key])
+            end = time.time() + 2.0
+            while time.time() < end:
+                if q.vram_r32(fence) == seq:
+                    return True
+                time.sleep(0.01)
+            return False
+        prog(0, 1, P_PRIV_RING, P_PRIV_RPTR, P_PRIV_EOP)                      # the S1 probe queue
+        check(job(P_PRIV_RING, P_PRIV_FENCE, "a", 0x11), "queue (0,1) on doorbell dword 0x32: its job runs")
+        check(dequeue(0, 1) == 0, "queue (0,1) dequeued (ACTIVE 0)")
+        prog(0, 2, P_B_RING, P_B_RPTR, P_B_EOP)                               # the shared queue: same doorbell dword, a queue that comes later
+        check(job(P_B_RING, P_B_FENCE, "b", 0x21), "queue (0,2), same doorbell dword: the doorbell reaches it (not the dequeued queue (0,1))")
+        q.vram_w32(P_PRIV_FENCE, 0)
+        job(P_PRIV_RING, P_PRIV_FENCE, "a", 0x12)                             # rings the dword again; only queue (0,2) may answer
+        check(q.vram_r32(P_PRIV_FENCE) == 0, "the dequeued queue (0,1) runs nothing once another queue owns the dword")
+    finally:
+        sc.close()
+
 def main():
     if not os.path.exists(QEMU):
         print("QEMU not found: %s (set QEMU=)" % QEMU)
         return 2
     for t in (test_stale_until_invalidated, test_level_bits, test_context_rebind_needs_flush, test_ack_latency,
               test_engines_and_noack, test_tlb_off_is_the_old_model, test_sh_mem_per_vmid, test_ih_lut_and_fault_vector,
-              test_u1_priv_queue_model, test_fault_is_not_stale):
+              test_u1_priv_queue_model, test_fault_is_not_stale, test_doorbell_routes_to_active_queue):
         try:
             t()
         except Exception as e:                                          # a scenario that cannot run is a failure, loudly
