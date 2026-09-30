@@ -4,9 +4,9 @@
 vertex 0 red, vertex 1 green, vertex 2 blue, smoothly interpolated by the PS. On gfx12 the NGG stage writes the attribute to the
 ATTRIBUTE RING in memory and the PS reads it back through LDS with `ds_param_load` + `v_interp_*`: a path the kext has never run.
 
-**Status.** Phase 1 (RADV ground truth) is measured on the card. Phase 2 (the kext's shaders, stream, builder, replay mode) is
-written and checked statically and on the host; **no G4 draw of our own stream has been run on the card** (stop gate: the reviewer
-enables the first run, `REPLAY_COL_OK=1`). The kext does not use G4 yet.
+**Status.** Phase 1 (RADV ground truth) is measured on the card. Phase 2 (the kext's shaders, stream, builder, replay mode) was written and
+checked statically and on the host, and then **run on the card once (section 6): the colour triangle is exactly right**, through amdgpu's gfx queue. The CPU
+readback of the attribute ring itself stayed at its pre-fill pattern (section 6). The kext does not use G4 yet.
 
 Citations: `RADV-G4` = `docs/hw-logs/2026-09-30-linux-radv-colour/radv-shaders-and-ibs.txt` (RADV_DEBUG=shaders,dumpibs of the colour
 triangle, system Mesa 26.2.2, same box as the G3 capture), `RADV-G3` = `docs/hw-logs/2026-09-30-linux-radv-triangle/radv-shaders-and-ibs.txt`.
@@ -126,27 +126,30 @@ No delta (already equal to RADV's G4): `SPI_PS_INPUT_ENA/ADDR` (PERSP_CENTER), `
 The attribute ring's VA must be the address the ring base registers point at (`SPI_ATTRIBUTE_RING_BASE = VA >> 16`): `rdna4_tricol_place_shaders` is given
 the same `rings.va` the stream's relocation uses.
 
-## 4. What is uncertain
+## 4. What was uncertain, and what the first run resolved
 
-1. **The descriptor's `size`/`stride` and the swizzle layout are copied from RADV, not measured for our ring.** The kext's rings are in VMID0 UC memory on
-   macOS and in one VRAM BO under Linux; the layout arithmetic is the hardware's, but the first run is the first test that the attribute lands where SPI reads it.
+The list below was written before the first run (section 6). Status after it:
+
+1. **The descriptor's `size`/`stride` and the swizzle layout are copied from RADV, not measured for our ring.** *Resolved functionally:* the PS read back per-vertex colours
+   that are exact to 0.50, so what nggcol.s stored and what SPI read agree on the layout. Not observed directly: *where* in the ring the data went (section 6).
 2. **`s5` really is gs_attr_offset under our configuration.** Mesa says so (radv_shader_args.c:797-798) for merged NGG on gfx11+, and RADV's dump works on this card
    with USER_SGPR 2. Probed on the card with the plain G3 stream (`shaders/nggsgpr.s`, `REPLAY_VS=file:<hex> REPLAY_DUMP_MARKER=1`, 10 runs, 8192 px each): the NGG wave's
    initial `s0 s1 s2 s3 s4 s5` = `0 0 0x00403000 0x10000103 <x> 0`, with `s5 = 0` in 10/10 runs and `s4` (tess_offchip_offset, unused) 0 in 6, 0x8 in 1 and 0x88888888 in 3 (so
    the unused system SGPRs are not reliably zeroed, which makes a constant `s5 = 0` more credible than stale). `s2`/`s3` reproduce the earlier measurement and `s0/s1 = 0` (nothing
    programs the GS pointer registers in the G3 stream). `(s5 & 0x7fff) << 9 = 0`: the first subgroup sits at the start of the attribute ring, well inside 0x580000. **Caveat:** G3
-   exports no parameter (`NO_PC_EXPORT = 1`), so the hardware may have no reason to allocate ring space; in G4 (`NUM_INTERP = 1`) `s5` can differ. The G4 replay lists the ring dwords that changed.
-3. **`SPI_INTERP_CONTROL_0`.** The kext's G3 stream writes 0x869 (radeonsi: FLAT_SHADE_ENA 1, point-sprite overrides); RADV never writes it. With
-   `SPI_PS_INPUT_CNTL_0.FLAT_SHADE = 0` the interpolation should be smooth either way, but RADV's effective value is unknown (needs umr + root). If the first image is flat-shaded,
-   this is the first suspect.
-4. **PrimMask in `s2`.** Follows from RSRC2_PS.USER_SGPR = 2 (radv_shader_args.c:901 puts `prim_mask` right after the user SGPRs), and matches the dump, but the kext's PS user SGPRs
-   carry a written 0, not RADV's table pointer.
-5. **wave32 NGG + wave32 PS** is the kext's (G3-proven) configuration; RADV runs wave64 for both. The interpolation and attribute-store sequences are the same
-   instructions; the wave32 thread-id shift (5 instead of 6, no `v_mbcnt_hi`) is what ACO emits for wave32.
-6. **`s_setprio 3`** and the `s_delay_alu` hints are not replicated (performance hints).
-7. The emulator cannot run G4 (no `ds_param_load`, `v_interp`, buffer stores); not in this task.
+   exports no parameter (`NO_PC_EXPORT = 1`), so the hardware may have no reason to allocate ring space; in G4 (`NUM_INTERP = 1`) `s5` can differ.
+   *Still open for a G4 draw:* the ring listing of the first run was empty, so it did **not** confirm `s5`'s value for G4; `s5 = 0` was measured only in G3. The correct image is indirect
+   evidence that the store offset and SPI's read offset agree (a wrong offset would make the PS read other data), not a measurement of the value.
+3. **`SPI_INTERP_CONTROL_0`** (kext 0x869, RADV unwritten). *Resolved:* the image is smoothly interpolated (every pixel within 0.50 of the barycentric colour), so 0x869 with
+   `SPI_PS_INPUT_CNTL_0.FLAT_SHADE = 0` does not flat-shade. RADV's effective value stays unknown, but it no longer matters for this stream.
+4. **PrimMask in `s2`** via RSRC2_PS.USER_SGPR = 2 with written zeros. *Resolved:* the LDS parameter loads returned the right colours.
+5. **wave32 NGG + wave32 PS** (RADV: wave64 both). *Resolved for this configuration:* it draws correctly, including the wave32 thread-id shift.
+6. **`s_setprio 3`** and the `s_delay_alu` hints are not replicated. No visible effect (performance hints).
+7. The emulator cannot run G4 (no `ds_param_load`, `v_interp`, buffer stores). *Open, not in scope so far.*
+8. **New, open: the attribute ring memory did not change as the CPU sees it** (section 6): where the data lives, and whether the same stream works on the kext's macOS path
+   (bare RB0, VMID0, UC memory), are untested.
 
-## 5. The first G4 replay run (NOT yet run)
+## 5. The first G4 replay run (the plan, as written before it was run; result in section 6)
 
 `REPLAY_DRAW=col REPLAY_COL_OK=1 tools/linux-replay/build/replay` (after `tools/linux-replay/run.sh` has built it; no other `REPLAY_*` variable is accepted with it):
 
@@ -161,3 +164,33 @@ What can go wrong: a wrong descriptor or `s5` makes the store fault or land else
 it did once today for an over-budget-VGPR probe), a wrong PrimMask / LDS read gives garbage colours but should not hang, an unwritten context register could do anything the G3 stream's
 register-by-register discipline was meant to prevent. Expected if right: 8192 px, colours as in section 1, ring dwords changed = the three vertices' vec4 at `gs_attr_offset * 512`
 (plus the padding lanes up to 8 vertices) and nothing else.
+
+## 6. First run on the card
+
+2026-09-30 16:21:55, run by the lead with the user's OK: tree `a1b5a1f`, `REPLAY_DRAW=col REPLAY_COL_OK=1 bash tools/linux-replay/run.sh`
+(`docs/hw-logs/2026-09-30-linux-g4-first-run.txt`; transcribed from the lead's report, the raw output was not saved).
+
+| | |
+|---|---|
+| colour check | **THE COLOUR TRIANGLE IS RIGHT**: 8192 covered px, 0 bad alpha, 0 not dominated by the nearest vertex's colour |
+| errors | max `|channel - exact barycentric|` 0.50, max `|R+G+B - 255|` 1 (the same as RADV's) |
+| spot pixels | near v0 `0xff0303f9`, near v1 `0xff03f903`, near v2 `0xfff80402`, centroid (128,106) `0xff555654`: **identical to RADV's colour triangle** |
+| fence / reset | fence 1, context reset state 0, exit 0 |
+| statistics | PS 8192, C_PRIM 4, C_INV 1, VS 3, IA 1/3 (as G3 and RADV) |
+| attribute ring (CPU) | **0 dwords changed from the 0xee pre-fill** |
+| kernel journal | no amdgpu message since the run: no VM fault, no ring timeout, no reset |
+
+**What this establishes.** The attribute path works end to end on this card with the kext's own shaders and stream: nggcol.s's `buffer_store_b128` with a descriptor built in SGPRs
+reached a place SPI could read, SPI put the parameters into LDS, and pscol.s got the per-vertex colours through `ds_param_load` + `v_interp_p10/p2` (PrimMask in `s2` from RSRC2_PS.USER_SGPR = 2) and
+exported them: the PS received vertex 0 red, 1 green, 2 blue, interpolated exactly. The register deltas of section 3 are sufficient, and the wave32 NGG/PS configuration is fine for attributes.
+
+**What it does not establish.** The replay's listing of the attribute ring, read by the CPU after the fence, shows the 0xee pattern untouched, although the colours demonstrably went through some
+ring-like path. So the run did not show *where* the store landed, and it **did not confirm `s5`'s value for a G4 draw**: `s5 = 0` (first subgroup at the ring base) was measured only in G3 (uncertainty 2).
+No fault in the journal means the store did not go out of range; it says nothing more about the address.
+
+**Leading hypothesis (UNVERIFIED, not a fact).** The attribute data stayed in the GPU's L2 (GL2) and was never written back to VRAM during the run, so the CPU, which reads VRAM through the BAR,
+still sees the pre-fill. The ring registers carry GL2 hints (`SPI_ATTRIBUTE_RING_SIZE.L1_POLICY = 1`; `GE_PRIM_RING_SIZE` with its `SCOPE`/`TEMPORAL`/`NOFILL` bits; the store is `scope:SCOPE_DEV`), and the
+attribute ring is transient by design (written by the NGG stage, consumed by SPI/PS of the same draw; nothing forces a write-back). Alternatives not excluded: the store went to a different address than the
+one the listing scans (the listing covers the first `kColAttrRingBytes` = 0x580000 of the ring block only), or the data travels through a path that never touches this BO. How to tell: a write-back of GL2 after the draw (the
+stream's own end-of-pipe RELEASE_MEM already writes back for the fence, so a stronger `ACQUIRE_MEM` / GL2 flush after it, then the CPU read), a listing of the whole 0xA80000 block, or a run of RADV's colour triangle with the same kind of read of its ring.
+Until one of these is done this stays a hypothesis.
