@@ -12,8 +12,8 @@
 // SAMPLE_PIPELINESTAT around the stream, then counts the target.
 //
 // Environment:
-//   REPLAY_VS=old|new|file:<hex>  old (default) = the ngg.s the card ran (prim export first),
-//                        new = premetal/radv-order (position export first)
+//   REPLAY_VS=new|old|file:<hex>  new (default) = the committed src/ngg_kernel.h,
+//                        old = the round-6 ngg.s (edc5f81, s_and_saveexec: 0 px on the card)
 //   REPLAY_VARIANT=<n>   the kext's register-only ladder patches (1, 2, 128, 256, 2048, 64)
 //
 // Build and run: tools/linux-replay/run.sh. Findings: docs/linux-replay.md
@@ -83,7 +83,7 @@ static int findStreamReg(const uint32_t *s, uint32_t n, uint32_t opcode, uint32_
 }
 
 int main() {
-	const char *vsSel = getenv("REPLAY_VS") ? getenv("REPLAY_VS") : "old";
+	const char *vsSel = getenv("REPLAY_VS") ? getenv("REPLAY_VS") : "new";
 	const uint32_t variant = getenv("REPLAY_VARIANT") ? strtoul(getenv("REPLAY_VARIANT"), nullptr, 0) : 0;
 
 	int fd = -1;
@@ -236,6 +236,7 @@ int main() {
 	req.number_of_ibs = 1;
 	req.ibs = &ibi;
 	CHECK(amdgpu_cs_submit(ctx, 0, &req, 1));
+	printf("IB VA 0x%llx, %u dwords, seq %llu\n", (unsigned long long)ibuf.va, w, (unsigned long long)req.seq_no);
 
 	amdgpu_cs_fence fence = {};
 	fence.context = ctx;
