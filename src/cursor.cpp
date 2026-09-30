@@ -782,6 +782,52 @@ void RDNA4Device::cursorDsclDump(const char *why) {
 	           regReadDmu(2, kHubpreqStatus2 + hubp));
 }
 
+// W40 (hub-task-273), read-only: every static register of the display pipe compared with what Linux amdgpu 7.2.2 leaves on
+// this card with a visible cursor (E:\linux\rdna4-groundtruth-vkcube-20260929-232026, identical to the idle capture apart
+// from addresses, positions and counters, which are not in the table). Only the differences are logged, as
+// NAME=got/want (both masked), so the whole comparison costs a few lines of the trail.
+struct LinuxRef { const char *name; uint8_t kind, seg; uint16_t off; uint32_t mask, want; };
+static const LinuxRef kLinuxRef[] = {
+#include "cursor_linux_ref.inc"
+};
+
+void RDNA4Device::cursorLinuxDiff(const char *why) {
+	const uint32_t hubp = hubpOff(), dpp = dppOff();
+	const uint32_t mpcc = pipe.hubp < Pipe::kMaxOtg ? pipe.hubp * kMpccStride : 0;
+	char line[250];
+	size_t n = 0;
+	uint32_t total = 0, diff = 0, shown = 0, dead = 0, part = 0;
+	line[0] = '\0';
+	for (const LinuxRef &r : kLinuxRef) {
+		total++;
+		const uint32_t delta = r.kind == 1 ? hubp : r.kind == 2 ? dpp : r.kind == 3 ? mpcc : 0;
+		const uint32_t v = regReadDmu(r.seg, r.off + delta);
+		if (v == 0xffffffffu) {
+			dead++;
+			continue;
+		}
+		if (!((v ^ r.want) & r.mask))
+			continue;
+		diff++;
+		if (shown >= 70)
+			continue;
+		char item[56];
+		const size_t m = static_cast<size_t>(snprintf(item, sizeof(item), " %s=%x/%x", r.name, v & r.mask, r.want));
+		if (n + m >= sizeof(line)) {
+			cursorNote("linuxdiff %s #%u:%s", why, ++part, line);
+			n = 0;
+			line[0] = '\0';
+		}
+		memcpy(line + n, item, m + 1);
+		n += m;
+		shown++;
+	}
+	if (n)
+		cursorNote("linuxdiff %s #%u:%s", why, ++part, line);
+	cursorNote("linuxdiff %s: %u of %u registers differ from the Linux capture (%u shown as NAME=got/want, %u unreadable)",
+	           why, diff, total, shown, dead);
+}
+
 // W40, read-only: the DPP colour-management block the GOP left (CM0_CM_CONTROL.CM_BYPASS is the candidate,
 // premetal/verify-cursor.md section 2) and the DLG/TTU registers 0x063b-0x0655 (HUBPREQ0_BLANK_OFFSET_0 ..
 // _DST_Y_DELTA_DRQ_LIMIT), nine per line to stay inside the 288-byte note.
@@ -1023,6 +1069,39 @@ bool RDNA4Device::cursorCmApply() {
 	return true;
 }
 
+// rdna4-cursormpcc=1 (with rdna4-cursor=2): the Linux capture has MPCC0_MPCC_CONTROL = 0xffff0422, the card's GOP leaves 0xffff0461:
+// MPCC_MODE 1 (TOP_LAYER_PASSTHROUGH, the state mpc1_remove_mpcc_from_tree leaves, dcn10_mpc.c:309) against 2 (TOP_LAYER_ONLY,
+// what mpc1_insert_plane programs for a plane with no bottom layer, dcn10_mpc.c:216), and MPCC_ALPHA_MULTIPLIED_MODE 1 against 0
+// (mpc1_update_blending writes it from blnd_cfg->pre_multiplied_alpha, dcn10_mpc.c:84-90). Only those two fields are written
+// (RMW), under the OTG update lock, and only if the MPCC has no bottom layer.
+bool RDNA4Device::cursorMpccApply() {
+	constexpr uint32_t kModeMask = 3u, kAlphaMult = 1u << 6;
+	const uint32_t mpcc = pipe.hubp < Pipe::kMaxOtg ? pipe.hubp * kMpccStride : 0;
+	const uint32_t ctl = regReadDmu(3, kMpccControl + mpcc), bot = regReadDmu(3, kMpccBotSel + mpcc) & 0xf;
+	if (ctl == 0xffffffffu) {
+		cursorNote("MPCC write: MPCC_CONTROL reads all ones: nothing written");
+		return false;
+	}
+	if (bot != 0xf) {
+		cursorNote("MPCC write: MPCC%u has a bottom layer (BOT_SEL %u): nothing written", pipe.hubp, bot);
+		return false;
+	}
+	if ((ctl & kModeMask) == 2 && !(ctl & kAlphaMult)) {
+		cursorNote("MPCC write: MPCC_CONTROL 0x%08x is already TOP_LAYER_ONLY, ALPHA_MULTIPLIED 0: nothing to write", ctl);
+		return false;
+	}
+	cursorNote("MPCC write: MPCC_CONTROL was 0x%08x (MODE %u, ALPHA_MULTIPLIED %u); setting MODE 2 (TOP_LAYER_ONLY), "
+	           "ALPHA_MULTIPLIED 0 as amdgpu does (Linux reads 0xffff0422)", ctl, ctl & kModeMask, (ctl >> 6) & 1);
+	if (!cursorOtgUpdateLock(true)) {
+		cursorNote("MPCC write: the OTG update lock was not held after 10 ms; nothing written");
+		return false;
+	}
+	regWriteDmu(3, kMpccControl + mpcc, (ctl & ~(kModeMask | kAlphaMult)) | 2u);
+	cursorOtgUpdateLock(false);
+	cursorNote("MPCC written; MPCC_CONTROL now 0x%08x", regReadDmu(3, kMpccControl + mpcc));
+	return true;
+}
+
 // Frames of the OTG (OTG_STATUS_FRAME_COUNT 0x1b4d [23:0]); bounded, 40 ms per frame.
 bool RDNA4Device::cursorWaitFrames(uint32_t n) {
 	const uint32_t reg = kOtgFrameCount + otgOff();
@@ -1134,6 +1213,7 @@ void RDNA4Device::cursorSelfTest() {
 	cursorDsclDump("selftest pre");   // W38: what the GOP left in the DSCL / HUBP request state, before any write
 	cursorCmDump("selftest pre");     // W40: CM0_CM_CONTROL.CM_BYPASS and the CM sub-blocks the GOP left
 	cursorDlgDump("selftest pre");    // W40: the DLG/TTU registers 0x063b-0x0655
+	cursorLinuxDiff("pre");           // W40: everything static in the pipe that differs from the Linux capture, before any write
 	cursorPipeFixes();                // W38: CRQ_EXPANSION_MODE, cursor memory power, USE_MALL_FOR_CURSOR per update
 	cursorDsclDecide();               // W38: DSCL_MODE / RECOUT / MPC_SIZE verdict (+ amdgpu's mode-0 set with rdna4-cursordscl=1)
 	cursorProgramMissionMode();   // W34: amdgpu's HUBPREQ_DEBUG_DB = 1 << 8, before the cursor is enabled
@@ -1153,12 +1233,14 @@ void RDNA4Device::cursorSelfTest() {
 	cursorDsclDump("selftest post");
 	// W38: does the square reach the OTG? decided by the OTG CRC with the cursor on/off/on/off
 	const char *before = cursorCrcCheck("GOP CM state");
+	const char *last = before;
 	uint32_t cm = 0;
 	if (PE_parse_boot_argn("rdna4-cursorcm", &cm, sizeof(cm)) && cm == 1) {
 		// W40: the same boot attributes the CM change: CRC before (above) and after
 		if (cursorCmApply()) {
 			const char *after = cursorCrcCheck("after CM enable");
 			cursorNote("CM bypass: before %s, after %s", before, after);
+			last = after;
 		} else {
 			cursorNote("CM bypass: before %s, after not run (CM state unchanged)", before);
 		}
@@ -1166,6 +1248,16 @@ void RDNA4Device::cursorSelfTest() {
 		cursorNote("CM bypass: not changed (rdna4-cursorcm=1 clears CM_BYPASS and sets the CM identity as amdgpu does); "
 		           "CRC %s", before);
 	}
+	uint32_t mp = 0;
+	if (PE_parse_boot_argn("rdna4-cursormpcc", &mp, sizeof(mp)) && mp == 1) {
+		if (cursorMpccApply()) {
+			const char *after = cursorCrcCheck("after MPCC mode");
+			cursorNote("MPCC mode: before %s, after %s", last, after);
+		} else {
+			cursorNote("MPCC mode: before %s, after not run (MPCC state unchanged)", last);
+		}
+	}
+	cursorLinuxDiff("end");   // W40: what still differs from the Linux capture after the writes above
 }
 
 // One line of everything that decides whether the plane shows: the HUBP

@@ -220,7 +220,7 @@ private:
 	uint32_t cursorVisChanges { 0 };
 	// Evidence that survives the kernel log wrapping: registry property
 	// RDNA4FB,Cursor (cursor.cpp cursorNote).
-	char cursorTrail[12288] { 0 };
+	char cursorTrail[16384] { 0 };   // W40: 16 KiB, the Linux diff and the CM/MPCC lines came on top of the 12 KiB trail
 	uint16_t cursorTrailLen { 0 };
 	bool cursorTrailFull { false };
 	void cursorNote(const char *fmt, ...) __printflike(2, 3);
@@ -252,6 +252,8 @@ private:
 	void cursorCmDump(const char *why);     // read-only: CM0_CM_CONTROL and the CM sub-blocks
 	void cursorDlgDump(const char *why);    // read-only: the DLG/TTU registers 0x063b-0x0655
 	bool cursorCmApply();                   // rdna4-cursorcm=1: CM_BYPASS = 0 + amdgpu's SDR identity CM state, OTG-locked
+	bool cursorMpccApply();                 // rdna4-cursormpcc=1: MPCC_MODE TOP_LAYER_ONLY, ALPHA_MULTIPLIED 0, as the Linux capture
+	void cursorLinuxDiff(const char *why);  // read-only: static pipe registers that differ from the Linux capture
 	bool cursorOtgUpdateLock(bool lock);    // the modeset OTG update-lock bracket, bounded
 	bool cursorPipeFixesOn { false };
 	uint32_t cursorProbeLogs { 0 };

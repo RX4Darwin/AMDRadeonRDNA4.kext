@@ -133,3 +133,40 @@ Then `CM_UPDATE_PENDING` (`CM_CONTROL` bit 8) is polled clear for at most 50 ms.
 
 Emulator: it has no CM (`rdna4_get_cursor` does not read `CM_CONTROL`), and nothing in amdgpu justifies a model of "CM_BYPASS drops the cursor" (it is a guess, [G] in verify-cursor.md section 2.4), so the emulator cannot show the effect.
 `cm-bypass=on` only leaves `CM0_CM_CONTROL = 1` in the register file, as the GOP does, to exercise the kext's decision/write/latch path: the two CRCs are equal there by construction.
+
+## 9. Linux ground truth (hub-task-273): what differs from the card
+
+Source: `E:\linux\rdna4-groundtruth-vkcube-20260929-232026\dcn-regs.txt` (Linux 7.2.2 amdgpu, same RX 9070 XT, 1080p60 HDMI, visible cursor); the idle capture is identical except for surface/cursor addresses, cursor position/DST offset and counters/status.
+Confirmed: `CM0_CM_CONTROL = 0` (CM_BYPASS off), so the GOP's `1` is the difference W40 clears. The Linux value of every register the kext writes matches what it writes:
+
+| Register | Linux | Kext writes | |
+|---|---|---|---|
+| `CURSOR0_0_CURSOR_CONTROL` | 0x03000205 | 0x03000205 | same |
+| `CURSOR_SIZE` / `HOT_SPOT` / `HUBPREQ0_CURSOR_SETTINGS` | 0x00400040 / 0 / 0x300 | same | same |
+| `CURSOR_DST_OFFSET` | 0x1ab at x=1269 (= 1269 * 50000 / 148511) | same formula | same |
+| `CM_CUR0_CURSOR0_CONTROL` | 0xa5 | 0xa5 | same |
+| `CURSOR0_FP_SCALE_BIAS_G_Y/RB` | 0x3c00 | 0x3c00 | same |
+| `CUR0_MATRIX_MODE`, `C11` | 0, 0x2000 (identity) | not written (reset) | same |
+| `DCN_CUR0_TTU_CNTL0/1` | 0 / 0 | left 0 | same |
+| `CM0_CM_CONTROL` | 0 | GOP 1 -> 0 (`rdna4-cursorcm=1`) | fixed |
+| `CM_POST_CSC_CONTROL`, bias x2, `GAMCOR_CONTROL`, `DEALPHA`, `MEM_PWR_CTRL`, `COEF_FORMAT` | 0 | 0 | same |
+| `CM_HDR_MULT_COEF` | 0x0001f000 | 0x0001f000 | same |
+| `DCHUBP_MALL_CONFIG` | 0x0a (USE_MALL_FOR_CURSOR 0) | bit 2 cleared | same |
+| `DCN_EXPANSION_MODE` | 0x56 (CRQ 1) | CRQ = 1 (`rdna4-cursorcrq=1`) | same |
+| `DSCL0_SCL_MODE`, `RECOUT_START/SIZE`, `MPC_SIZE` | 0, 0, 0x04380780, 0x04380780 | mode-0 set (case A only) | same |
+| `DSCL0_LB_MEMORY_CTRL` | 0x0a0a3f00 | 0x3f00 (bits 16-30 are the read-only LB_NUM_PARTITIONS) | same |
+| `MPCC0_MPCC_UPDATE_LOCK_SEL` | 0 (= OPP 0) | OPP (`rdna4-cursormpcsel=1`) | same; the GOP leaves 0xf |
+| **`MPCC0_MPCC_CONTROL`** | **0xffff0422** (MODE 2 TOP_LAYER_ONLY, ALPHA_MULTIPLIED 0) | GOP 0xffff0461 (MODE 1 PASSTHROUGH, ALPHA_MULTIPLIED 1); **new `rdna4-cursormpcc=1`** | was a difference |
+| `HUBPREQ0_DCSURF_FLIP_CONTROL` / `FLIP_CONTROL2` | 0x04100100 / 0x40 | written by flip.cpp only | compare on the card |
+
+Found, not changed (primary-plane side, not written by any cursor path; the card values are only in the `linuxdiff` line of the next boot):
+`CNVC_CFG0_FORMAT_CONTROL` Linux 0x24000101 (FORMAT_EXPANSION_MODE 1, ALPHA_EN 1: dpp401_dpp_setup keeps `alpha_en = 1` for ARGB8888, dcn401_dpp.c:65) against the GOP's 0x24000000; `HUBPREQ0` DLG values
+(BLANK_OFFSET_0/1 0x00290040/0x1188, DST_AFTER_SCALER 0x49, PREFETCH_SETTINGS 0x5e080000, PER_LINE_DELIVERY 0x286, REF_FREQ_TO_PIX_FREQ 0x2b18f, SURF0_TTU_CNTL0 0x08000ac6, QOS_WM 0x0b920000, GLOBAL_TTU_CNTL 0xe0000ed2,
+`HUBPREQ_DEBUG_DB` 0x100, `DCHUBP_CNTL` 0x000f0408) are the DML values for this mode; the kext writes none of them (only DEBUG_DB bit 8, and only when the GOP programmed the DLG).
+
+`cursorLinuxDiff` (always with `rdna4-cursor=2`) compares 145 static registers (`src/cursor_linux_ref.inc`, generated from the capture) at `pre` (the GOP state) and at `end` (after every write of the boot) and logs only the
+differences as `linuxdiff <when> #n: NAME=got/want ...` plus a count line. Masks exclude status and pending bits; addresses, positions and counters are not in the table. Read it as: what is in `pre` and gone in `end` was fixed by the boot; what remains
+in `end` is the next candidate list (in the VM almost everything differs because the emulated GOP registers are zero).
+
+`rdna4-cursormpcc=1` writes `MPCC_CONTROL.MPCC_MODE = 2` and `MPCC_ALPHA_MULTIPLIED_MODE = 0` (RMW, OTG update lock, only with no bottom layer; dcn10_mpc.c:216 and :84-90), after the CM step, then a third CRC A/B
+(`[after MPCC mode]`) and `MPCC mode: before X, after Y`. The trail buffer is 16 KiB now.
