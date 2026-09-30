@@ -133,6 +133,7 @@ public:
 	// Returns the last stage completed inline.
 	uint32_t start(const Env &env, uint32_t stage);
 	void powerWillSleep();
+	void powerSleepRequest();   // P7: setPowerState(0) / the debug sleep selector call this first, without rtLock (src/pmidle.cpp)
 	void powerDidWake();
 
 	// Snapshot of the engines, as read by the survey.
@@ -648,6 +649,9 @@ public:
 	IOReturn rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags,
 	                    uint64_t &fence);
 	IOReturn rtWaitFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns);
+	// W12k: a client's own gfx IB on the kernel's gfx ring (runtime.cpp, docs/w12k-gfx-submit.md)
+	IOReturn rtSubmitGfxIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags, uint64_t &fence);
+	IOReturn rtWaitGfxFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns);
 	IOReturn rtPresent(const void *owner, uint64_t handle, uint64_t offset,
 	                   uint64_t &geometry, uint64_t &pitch);
 	IOReturn rtPresentAsync(const void *owner, uint64_t handle, uint64_t offset,
@@ -716,6 +720,13 @@ private:
 		uint64_t ibVa { 0 };              // shared mode: the kernel-written IB page, mapped executable in the client's VM
 		uint32_t ibFences[kMaxIbOutstanding] {};
 		uint32_t ibOutstanding { 0 };
+		// W12k: this client's gfx fence: a dword of its own in the fence page (+0x40; the gfx ring writes it at the VMID0 MC
+		// address gfxFenceMc, the client can read it at fenceVa + 0x40), the last value handed out, and the ones not yet retired.
+		volatile uint32_t *gfxFenceCpu { nullptr };
+		uint64_t gfxFenceMc { 0 };
+		uint32_t gfxFence { 0 };
+		uint32_t gfxFences[kMaxIbOutstanding] {};
+		uint32_t gfxOutstanding { 0 };
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
 		bool active { false };
@@ -767,6 +778,42 @@ private:
 	void     schedulePresentationTimer();
 	void     schedulePresentationRetry();
 	void     presentTimerTick();
+	// P2 idle accounting (rdna4-gfxidle=1) and P7 sleep/wake hardening (docs/power-gfx.md): src/pmidle.cpp.
+	// Idle accounting is software only: it counts synchronous client operations (IdleUse, under rtLock) and looks at fences that are still
+	// outstanding; it sends no SMU message and touches no GC register. Its state is a log line per transition and the property Compute,GFXIdle.
+	struct IdleUse {
+		RDNA4Compute *c;
+		IdleUse(RDNA4Compute *self, const char *what) : c(self) { c->idleBegin(what); }
+		~IdleUse() { c->idleEnd(); }
+	};
+	static bool requestedGfxIdle();            // rdna4-gfxidle=1
+	static bool requestedSleepAbort();         // default ON; rdna4-sleepabort=0 restores waits that hold rtLock until their timeout
+	static bool requestedResumeTests();        // rdna4-resume-tests=1: the wake re-runs the G3/G4 draws, the gfx client self-test and the flip test
+	void     idleStart();                      // bring-up finished: create the poll timer, start counting (idempotent)
+	void     idleStop();                       // shutdown / sleep: cancel the timer
+	void     idleBegin(const char *what);      // rtLock held
+	void     idleEnd();                        // rtLock held
+	void     idleTouchLocked(const char *what);
+	void     idleEvaluateLocked();             // retire fences, then busy -> idle if nothing has used the GPU for 100 ms
+	void     idleTick();                       // the timer's body: TryLock rtLock, evaluate, re-arm while busy
+	void     idleReport(const char *why);      // registry property Compute,GFXIdle
+	static void idleTimerAction(OSObject *owner, IOTimerEventSource *timer);
+	bool     idleOn { false };
+	bool     idleBusy { true };                // the accounting state: bring-up counts as busy
+	uint32_t idleSync { 0 };                   // synchronous client operations in progress
+	uint64_t idleLastUseAbs { 0 }, idleStateAbs { 0 }, idleBusyNs { 0 }, idleIdleNs { 0 };
+	uint32_t idleTransitions { 0 };
+	char     idleLastWhat[24] {};
+	IOTimerEventSource *idleTimer { nullptr };
+	IOWorkLoop         *idleWorkLoop { nullptr };
+	OSObject           *idleContext { nullptr };
+	// P7: set by the power callback BEFORE it takes rtLock; waits that hold rtLock poll it and return kIOReturnAborted.
+	volatile uint32_t sleepRequested { 0 };
+	bool     sleepAbortOn { true };
+	bool     waitAborted { false };            // the last wait ended because of sleepRequested (rtLock held by the waiter)
+	bool     sleepAbortWanted() const { return sleepAbortOn && __atomic_load_n(&sleepRequested, __ATOMIC_ACQUIRE) != 0; }
+	void     powerSleepClear();                // the wake finished (or was cancelled)
+	void     gfxSleepDrain();                  // powerWillSleep, rtLock held: wait <= 100 ms for client gfx IBs, then drop them (no wedge)
 	PresentSlot *presentSlot(uint64_t id, const void *owner);
 	void     completePresentLocked(PresentSlot &slot, IOReturn result, uint64_t frame);
 	void     dropPendingPresentsLocked(IOReturn result);
@@ -838,6 +885,23 @@ private:
 	void scrubFaultPage();
 	void releaseHost(RtBuffer &buffer);
 	void retireIbFences(RtClient &client);
+	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
+	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
+	// so the two never use the ring at the same time. Everything below runs under rtLock.
+	static constexpr uint32_t kMaxGfxOutstanding = 16;     // submissions in the ring across all clients (15 dwords each: 240 of 4096)
+	static constexpr uint32_t kGfxFenceSlot = 0x40;        // bytes into the client's fence page
+	bool     gfxWedged { false };                          // a client gfx IB timed out: the gfx ring is given up until the next bring-up
+	bool     gfxParked { false };                          // gfxPark halted PFP/ME (probe boots)
+	uint32_t gfxClientPending { 0 };                       // client submissions not yet retired, all clients
+	IOReturn gfxClientReady() const;                       // kIOReturnSuccess when a client may use the ring now
+	void     gfxClientRetire(RtClient &client);
+	IOReturn gfxClientEmit(RtClient &client, uint64_t ibVa, uint32_t dwords, uint32_t &fence);
+	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why);
+	void     gfxClientWedge(const char *why);
+	void     gfxClientDrain(RtClient &client, const char *why);
+	void     gfxClientReset();                             // a fresh gfx ring: nothing is pending
+	bool     gfxClientSelfTest();                          // rdna4-gfxclient=1 (bring-up thread)
+	static bool requestedGfxClient();
 
 	// DMA between host memory and VRAM (runtime.cpp). One pinned, physically
 	// contiguous bounce buffer; the GC hub's AGP aperture maps system memory
