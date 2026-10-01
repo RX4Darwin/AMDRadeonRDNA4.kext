@@ -133,6 +133,7 @@ private:
 	uint64_t mTestExpect { 0 };
 	IOWorkLoop *mTestLoop { nullptr };
 	IOInterruptEventSource *mTestSource { nullptr };
+	OSObject *mTestOwner { nullptr };   // IOEventSource does not retain its owner
 public:
 	volatile uint32_t mTestIrqSeen { 0 };
 	void testCheck(bool ok, const char *what);
@@ -310,7 +311,9 @@ void RDNA4PvHost::selfTest() {
 			break;
 		}
 		volatile uint32_t *c = reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(mTestBar->getVirtualAddress()) + kCtrl);
-		testCheck(c != n->ctrl() && (c[kRegNumDisplays / 4] == n->ctrl()[kRegNumDisplays / 4]), "driver's mapping aliases the host's RAM");
+		c[0x200 / 4] = 0x600dc0de;   // a marker written through the driver's mapping must be visible through the host's
+		testCheck(n->ctrl()[0x200 / 4] == 0x600dc0de, "driver's mapping and the host's pointer are the same RAM");
+		c[0x200 / 4] = 0;
 
 		// 2. setupVersion: write 6, read back; the host (here: plain RAM) accepts what was written
 		c[kRegVersion / 4] = 6;
@@ -356,16 +359,15 @@ void RDNA4PvHost::selfTest() {
 		testCheck(mPackets >= 1, "host logged at least one packet");
 
 		// 5. setupInterrupts: an IOInterruptEventSource with a block handler on the provider, index 0, as Apple's driver builds it
-		auto *owner = RDNA4PvTestOwner::create(this);
+		mTestOwner = RDNA4PvTestOwner::create(this);
 		mTestLoop = IOWorkLoop::workLoop();
-		if (owner && mTestLoop) {
-			mTestSource = IOInterruptEventSource::interruptEventSource(owner, RDNA4PvTestOwner::action, mNub, 0);
+		if (mTestOwner && mTestLoop) {
+			mTestSource = IOInterruptEventSource::interruptEventSource(mTestOwner, RDNA4PvTestOwner::action, mNub, 0);
 			if (mTestSource && mTestLoop->addEventSource(mTestSource) == kIOReturnSuccess)
 				mTestSource->enable();
 			else
 				OSSafeReleaseNULL(mTestSource);
 		}
-		OSSafeReleaseNULL(owner);   // the event source holds its owner
 		testCheck(mTestSource != nullptr, "IOInterruptEventSource on the nub (index 0)");
 		mTestIrqSeen = 0;
 		testCheck(mTestSource && mNub->raiseInterrupt(0), "raiseInterrupt(0): handler registered and enabled");
@@ -384,6 +386,7 @@ void RDNA4PvHost::selfTest() {
 			OSSafeReleaseNULL(mTestSource);
 		}
 		OSSafeReleaseNULL(mTestLoop);
+		OSSafeReleaseNULL(mTestOwner);
 		volatile uint32_t *c = reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(mTestBar->getVirtualAddress()) + kCtrl);
 		c[kRegControlFifo / 4] = 0;
 		c[kRegFifoBasePage / 4] = 0;
@@ -396,10 +399,12 @@ void RDNA4PvHost::selfTest() {
 		break;
 	}
 	case kStepDone: {
-		if (mTestFifo && nowMs() >= mStepDeadline) {
-			testCheck(mFifoMap == nullptr, "host dropped its FIFO mapping when the guest cleared it");
-			mTestFifo->complete();
-			OSSafeReleaseNULL(mTestFifo);
+		if (nowMs() >= mStepDeadline) {
+			if (mTestFifo) {
+				testCheck(mFifoMap == nullptr, "host dropped its FIFO mapping when the guest cleared it");
+				mTestFifo->complete();
+				OSSafeReleaseNULL(mTestFifo);
+			}
 			OSSafeReleaseNULL(mTestBar);
 			pvlog("selftest: %s", mTestOk ? "PASS" : "FAIL");
 			mLevel = 1;   // done: keep polling, stop testing
@@ -433,15 +438,20 @@ bool RDNA4PvNub::build() {
 	put32(0x3c, 0x000001ff);          // interrupt pin A
 	put32(0x50, 0x00800005);          // MSI capability, 64-bit capable, no next
 
-	setProperty("vendor-id", OSData::withBytes("\x6b\x10\x00\x00", 4));
-	setProperty("device-id", OSData::withBytes("\xee\xee\x00\x00", 4));
-	setProperty("revision-id", OSData::withBytes("\x01\x00\x00\x00", 4));
-	setProperty("subsystem-vendor-id", OSData::withBytes("\x6b\x10\x00\x00", 4));
-	setProperty("subsystem-id", OSData::withBytes("\x00\x00\x00\x00", 4));
-	setProperty("class-code", OSData::withBytes("\x00\x00\x03\x00", 4));
+	auto data = [this](const char *key, const void *bytes, unsigned len) {
+		if (auto *d = OSData::withBytes(bytes, len)) {
+			setProperty(key, d);
+			d->release();
+		}
+	};
+	data("vendor-id", "\x6b\x10\x00\x00", 4);
+	data("device-id", "\xee\xee\x00\x00", 4);
+	data("revision-id", "\x01\x00\x00\x00", 4);
+	data("subsystem-vendor-id", "\x6b\x10\x00\x00", 4);
+	data("subsystem-id", "\x00\x00\x00\x00", 4);
+	data("class-code", "\x00\x00\x03\x00", 4);
 	static const char kCompatible[] = "pci106b,eeee\0pciclass,030000\0pciclass,0300";
-	setProperty("compatible", OSData::withBytes(kCompatible, sizeof(kCompatible)));
-	setProperty("name", OSData::withBytes("PVGPU", 6));
+	data("compatible", kCompatible, sizeof(kCompatible));
 	setProperty("RDNA4PvGpu", "fake Apple paravirtual GPU (106b:eeee), BAR0 in RAM, M0 of docs/metal-phase-plan.md");
 	setName("PVGPU");
 	return true;
@@ -472,7 +482,9 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 		return false;
 	// The nub appends data members to IOPCIDevice's layout as MacKernelSDK's header knows it. If Tahoe's real class is bigger, those would overlap its
 	// own members: refuse.
-	const OSMetaClass *real = OSMetaClass::getMetaClassWithName(OSSymbol::withCStringNoCopy("IOPCIDevice"));
+	const OSSymbol *realName = OSSymbol::withCStringNoCopy("IOPCIDevice");
+	const OSMetaClass *real = realName ? OSMetaClass::getMetaClassWithName(realName) : nullptr;
+	OSSafeReleaseNULL(realName);
 	const size_t realSize = real ? real->getClassSize() : 0;
 	if (!real || realSize > sizeof(IOPCIDevice)) {
 		pvlog("refused: IOPCIDevice is %zu bytes in this macOS, MacKernelSDK's header says %zu", realSize, sizeof(IOPCIDevice));
