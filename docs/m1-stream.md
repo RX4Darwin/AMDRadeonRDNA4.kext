@@ -124,7 +124,8 @@ Not found as simple immediates (variable, built by helpers): render/compute **pi
 
 - `src/pvstream.{hpp,cpp}` + generated `src/pvopcodes.inc`: names/lengths of the three layers (binary-searched), `fifoHeader`/`describeFifo` (FIFO framing validation and per-command description), `streamHeader`/`walkCommands` (stream and operation framing), `segmentTypeName`. Host test `tools/pvstream-test.cpp` (in `make test`): framing across a ring wrap, barriers, malformed headers, unknown ids, truncation, table spot checks against the values read above.
 - `src/pvgpu.cpp` polling host: every new FIFO span is walked as commands and logged as `host: fifo @0x...: cmd 0x3a GetDeviceInfo, 24 bytes (12 payload), 0 barrier(s), signal 0x7: reply buffer page 0x1234, 4096 bytes`; a span that does not start with a command header is hex-dumped (12 times) and abandoned; everything is acknowledged (`FIFO_READ = FIFO_WRITTEN`). The self-test sends two valid commands, one across the ring wrap. Still log-and-consume, default off.
-- Not implemented: child-ring polling (the channel records of s.1), resource/page-table walking, stream decoding of real guest memory, any reply.
+- Child channels (`DefineChannel` -> record in the root page -> page-list ring, polled every tick, commands decoded and answered, per-channel stamp and interrupt bit): implemented in the M0 host and self-tested (`docs/m0-pvgpu.md`, hub-task-447). The page list has no length field: the host takes the entries up to the first zero (the driver zeroes the page first).
+- Replies implemented: `GetDeviceInfo` (0x3a) and `DisplaySetupSharedState` (0x01). Not implemented: resource/page-table walking, stream decoding of real guest memory, every other reply.
 
 ## 7. Unknowns and the next measurements
 
