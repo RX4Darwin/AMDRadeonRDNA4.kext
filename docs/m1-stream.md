@@ -29,11 +29,12 @@ The host sees FIFO commands directly in guest RAM; to see operations and the str
 
 | id | name | caller | payload read in the driver |
 |---|---|---|---|
-| 0x01 | DisplaySetupSharedState | `AppleParavirtDisplayPipe::setupSharedState` | |
-| 0x02 | DisplayProcessOnline | `DisplayPipe::process_online` | |
-| 0x04 / 0x05 | DisplayUpdateCursorGlyph / State | `updateCursorGlyph` / `updateCursorState` | |
-| 0x06 / 0x07 | DisplaySubmitTransaction(2) | `DisplayPipe::submitTransaction` | |
-| 0x1e | DisplayFlushChannelEvent | `flushChannelEvent` | |
+| 0x01 | DisplaySetupSharedState | `AppleParavirtDisplayPipe::setupSharedState` | `{u32 port, u32 shared-state page}` (8 bytes); the driver **waits** for the host (s.1b) |
+| 0x02 | DisplayProcessOnline | `DisplayPipe::process_online` | `{u32 port, u32 shared+0x200}` (8): the guest's acknowledgement of an online event, no wait |
+| 0x04 | DisplayUpdateCursorGlyph | `updateCursorGlyph` | 44 bytes: `{u32 port, u32 task, u64 mapping, u64 ?, u64 pitch, u16 x4 (processCursorImage results), u32 sum}` (s.1b) |
+| 0x05 | DisplayUpdateCursorState | `updateCursorState` | `{u32 port, u8 visible}` (8 with padding); **only sent when the cursor is not in the shared state** (s.1b) |
+| 0x06 / 0x07 | DisplaySubmitTransaction(2) | `DisplayPipe::submitTransaction` | 0x06: `{u32 port, u32 surface id, u32 task}` (12); 0x07: 36 bytes with the gamma table (s.1b); which one is chosen by the host (shared+0x1c) |
+| 0x1e | DisplayFlushChannelEvent | `flushChannelEvent` | **no payload**; sent only on the error paths of `submitTransaction` |
 | 0x20 | FreeTask | `AppleParavirtTask::free` | |
 | 0x22 | ReleaseFromGPUPageTable | `AppleParavirtMemoryMap::releaseFromGPUPageTable` | |
 | 0x25 | DeleteHostResourceID | `AppleParavirtResource::deleteHostResourceID` | |
@@ -54,6 +55,46 @@ The host sees FIFO commands directly in guest RAM; to see operations and the str
 
 The first of these a driver sends is `GetDeviceInfo` (`setupDeviceInfo` is the last step of `Accelerator::start`); it **waits for the host's reply** (the blob that `parseDeviceInfo` parses into `APVDeviceInfoStruct`: MSAA samples, max threadgroup sizes, feature flags, deserializer version, FP configs, ... the ivars of `AppleParavirtDevice._deviceInfo`, `docs` class dump), so it is the first host answer M1 must produce. `defineHostTask`'s address-space size and root page are what lets the host walk the guest's GPU page table (`AppleParavirtPageTable` interior/leaf nodes); `ExecIndirect` is the bridge to the stream layer.
 Per-command log lines for all of these come from `pvstream::describeFifo` (`DefineChannel`, `DefineHostTask`, `CommitIntoGPUPageTable`, `GetDeviceInfo`, `ExecIndirect` are decoded, the rest by name and size).
+
+## 1b. The display pipe: shared state, events, transactions, cursor [measured unless marked; hub-task-451]
+
+Read with `tools/m0/pvdis.py dis AppleParavirtDisplayPipe::...` (26.6.2). Classes: `AppleParavirtDisplayMachine` (one per accelerator; `signalDisplays`), `AppleParavirtDisplayPipe` (one per display, **port < 8**, name `Display<port>`; `init` refuses port >= 8), `AppleParavirtFramebuffer` (the IOFramebuffer; `connectionChange`). The number of displays is `ctrl+0x22c` (`kRegNumDisplays`).
+
+**The pipe's channel.** `DisplayPipe::init` creates its own `AppleParavirtVirtualChannel`: `init(accel, port + 5, 8, 0x90, 0x480, "Display<port>", ring 0x1000, port + 5)`, i.e. **channel number `port + 5`** (5..12) with a **one-page ring**; the root channel is `ROOT` with `(0, 0x80, 0x90, 0x4800)`. The record's `kind` (the stamp index) is the channel object's u16 at +0x20, which the base class sets from the first int [INFER: = the channel id, 0 for ROOT, 1..4 for the standard four, port + 5 for a display; the host takes it from the record anyway]. Everything the pipe sends (0x01 setup, 0x02, 0x04-0x07, 0x1e) goes **on that channel**, not on the root FIFO.
+
+**The shared-state page** (`setupSharedState`: a 4 KiB `IOBufferMemoryDescriptor`, options 0x800, zeroed; sends 0x01 `{port, page}` and **waits**; then asserts `u16 shared+0x12 == port` and reads `u32 shared+0x1c` into `pipe+0x384`). The guest writes the cursor and enable fields, the host everything else:
+
+| offset | size | who | meaning |
+|---|---|---|---|
+| +0x00 | u32 | host | first argument of `connectionChange` (also of the offline path) [INFER: a display id / EDID product code] |
+| +0x04 | char[14] | host | display name, NUL-terminated: passed as the `const char*` of `connectionChange`, ends up in the synthesised EDID (`edidInit`) |
+| +0x12 | u16 | host | **the port** (a mismatch panics the guest: `fSharedState->port == fPort`) |
+| +0x14 / +0x16 | u16 / u16 | host | width / height of the display |
+| +0x18 / +0x1a | u16 / u16 | host | cursor glyph width / height; `w * h * 4 == 0` makes `updateCursorGlyph` fail with 0xe00002bc |
+| +0x1c | u32 | host | copied to `pipe+0x384` after the wait: **0 = transactions use FIFO 0x06, non-zero = 0x07** (the one with the gamma table) |
+| +0x20 | u32 | host | read by `process_online` into `pipe+0x3ac` (low byte used); bit 0 = tell the host when the cursor's visibility changes, bit 1 = when its position changes (`ctrl+0x220` kick, below) |
+| +0x2c .. +0x48 | f32 x 8 | guest default, host may override | colour chromaticities passed to `edidInit` (`edidColorCorrection_t`); `setupSharedState` pre-fills 0.64, 0.33, 0.30, 0.60, 0.15, 0.06, 0.3127, 0.329 (Rec.709 primaries, D65) |
+| +0x4c / +0x4e | u16 / u16 | host (guest default 0xffff) | `originX` / `originY` of the display in the global space (0xffff = not set); go into the registry property `ParavirtDisplayPrefs` |
+| +0x50 | u8 | host | `scaleFactor` (same property) |
+| **+0x100** | u32 | host sets, guest clears | **pending event bits**: bit 0 VBL, bit 2 *online*, bit 3 *offline* |
+| **+0x104** | u32 | guest | **enabled mask**: `enable()` stores 0xc, `disable()` stores 0, `enableVBLInterrupt` ORs 1, `disableVBLInterrupt` clears bit 0 |
+| +0x200 | u32 | host | echoed in the 0x02 acknowledgement `{port, +0x200}` [INFER: a cookie/serial of the online event] |
+| +0x208 | u16 | host | number of display modes |
+| +0x210 + 16 i | 16 bytes | host | mode i: `{u16 width, u16 height, u32 x, ...}` (the callback block reads +0x00, +0x02, +0x04; `x` is the third field of `mymodelist` that `edidInit` takes [INFER: refresh rate]) |
+| +0xe00 | u32 | guest | cursor position `x | y << 16` (hotspot added), initial 0xffffffff |
+| +0xe04 | u8 | guest | cursor visible |
+
+**Events and `INTR_STATUS_DISP` (`ctrl+0x14`).** The interrupt handler (`AppleParavirtAccelerator::setupInterrupts` block) reads `ctrl+0x18` (stamps, `signalStamps`), `ctrl+0x14` (`DisplayMachine::signalDisplays(mask)`), `ctrl+0x2c` (faults), **and writes none of them**: the register is read-to-clear in the real device, in our RAM the host drops the bits itself a tick later. **Bit `i` of `ctrl+0x14` = display pipe with port `i`.** `signalDisplays` calls `DisplayPipe::signalDisplay` for each set bit; `signalDisplay` takes `old = shared+0x100` with an atomic compare-exchange that clears the bits **that are in the enabled mask** (`+0x104`), and acts on `old & enabled`: bit 0 -> a call into the `IOAccelDisplayPipe` base class (`signalVBL`-like: [INFER] the VBL notification of the accelerator's clients), bit 2 -> event source `process_online`, else bit 3 -> event source `process_offline` (**if both are pending in one call only the online one runs**: both bits were cleared). A pending bit that is not enabled stays pending. `enable()` calls `signalDisplay` itself right after storing 0xc, so **an online bit set before `enable()` is delivered then**. This corrects the first reading in hub-task-451 ("bits 2/3 = transaction events"): **bits 2/3 are display connect / disconnect, not transaction completion.**
+- `process_online`: reads the host's display info (+0x00, +0x04, +0x14/+0x16, +0x20 -> `pipe+0x3ac`, +0x2c.., +0x4c.., +0x208, the modes at +0x210), calls `AppleParavirtFramebuffer::connectionChange(...)` (builds the mode list, **synthesises an EDID** from name/size/chromaticities/modes with `edidInit`, sets `ParavirtDisplayPrefs`, notifies IOFramebuffer clients) and sends FIFO 0x02 `{port, +0x200}`.
+- `process_offline`: the same `connectionChange` call with **zero modes and no mode callback** (the display goes away); no FIFO command.
+- **VBL.** Two separate things: (1) the *framebuffer's own* `'vbl '` interrupt (what WindowServer waits on) is a **software timer in the guest** (`AppleParavirtFramebuffer::setVBLTimer`: period from the current mode's timing, `mach_absolute_time`, an `IOTimerEventSource`), it needs no host signal; (2) `DisplayPipe::enableVBLInterrupt` (sets +0x104 bit 0, called by `IOAccelDisplayPipe` for accelerator clients, e.g. Metal's display-link/present paths [INFER]) wants **the host to set +0x100 bit 0 and raise `INTR_STATUS_DISP` bit `port` once per frame**. Without it those clients never see a VBL.
+
+**Transactions (flip/present).** `submitTransaction(txn)`: takes the surface id of the transaction's framebuffer surface (`IOSurface::getSurfaceID`, or the id at +0x180 of an `IOAccelResource` of type 6), `prepareResourceHeap(task)`, then builds on the pipe's channel
+- **0x06** (when shared+0x1c was 0): `{u32 port, u32 surface id, u32 task}` (12 bytes; `task` = the u32 at +0x268 of the accelerator's root task object [INFER: root task id; the same value is at +4 of the cursor glyph command]);
+- **0x07** (shared+0x1c != 0): 36 bytes: `{u32 port, u32 task, u32 surface id, u64 a, u64 b, u32 n, u32 sum}`; `a`, `b` are zero unless the transaction carries a new gamma table (`prepareGammaTable` builds `3 n` u32 of R, G, B ramps in a kernel buffer, maps it into the task, stores `n` and the sum of all entries) [fields INFER: a = the mapping's id, b = its size/address].
+The command is attached to an `AppleParavirtDisplayPipeFence` (an `IOAccelEvent`) whose completion is **the stamp of the pipe's channel reaching the command's `signal`** (`isTransactionComplete` is the event machine's test; `Fence::notifyClient` tells the pipe): **completion needs no display-specific host signal, only the generic stamp store + `INTR_STATUS_GPU` bit of the channel** (s.1, `completeStamp` in the host) [INFER that the command carries a signal: the allocator's `addSignal` is called by the event machine, not visible in `submitTransaction`; the host log shows each command's `signal`]. On an error path (resource heap, bad transaction, gamma table failure) the driver sends **0x1e FlushChannelEvent** with no payload and returns 0xe00002bd / 0xe00002c2 / 0xe00002be.
+
+**Cursor.** The driver chooses by the negotiated version: `AppleParavirtAccelerator::setupVersion` writes **6 to `ctrl+0x34` and reads it back**; the byte flags it derives from the result (`accel+0xf4c..0xf6c`) are all zero if the host returns more than 6; flag `+0xf50` (1 for versions 4..6) becomes `pipe+0x3aa` = "hardware cursor". With version 6: **position and visibility live in the shared page** (+0xe00 / +0xe04) and the host is told by a kick: a store of the port number at **`ctrl+0x220`** (when the host's +0x20 flag bits ask for it; it can be the same value every time, so the host should poll the two shared fields rather than the register). Without hardware cursor, a visibility change sends FIFO **0x05** `{port, u8 visible}` instead. The glyph is always FIFO **0x04**: the driver copies the image into a kernel buffer, runs `processCursorImage` (crops/measures it: four u16 results), maps it into the task and sends `{u32 port, u32 task, u64 mapping id [INFER], u64 [INFER], u64 pitch = width * 4, u16 w, u16 h, u16 x, u16 y [INFER order], u32 pixel sum}` (44 bytes). `PGCursorAnatomy` / `PGCursorValidation` boot-args make the driver draw an outline / clamp the image for debugging.
 
 ## 2. The kernel commands between bundle and kernel [measured]
 
