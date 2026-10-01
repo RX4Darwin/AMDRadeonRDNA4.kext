@@ -233,6 +233,37 @@ PY
 	rm -f "$RUN/screen-$1.ppm"
 }
 
+# Open the Recovery Terminal (Cmd+Shift+T) and type a command into it. The key press or the typing is
+# sometimes lost when the host is busy (seen once with another VM running), so check the screen for the
+# Terminal window (its background is blue-grey, Recovery's is neutral grey) and the guest script's first marker.
+term_up() {
+	mon "screendump $RUN/term.ppm" >/dev/null 2>&1
+	python3 - "$RUN/term.ppm" <<'PY'
+import sys
+d = open(sys.argv[1], 'rb').read()
+parts = d.split(b'\n', 3)
+w, h = map(int, parts[1].split())
+px = parts[3]
+o = (300 * w + 400) * 3
+print("yes" if px[o + 2] > px[o] + 10 else "no")
+PY
+	rm -f "$RUN/term.ppm"
+}
+run_in_terminal() {   # run_in_terminal <command to type, \n = Enter> <marker the guest script prints first>
+	local try k i
+	for try in 1 2 3 4 5; do
+		for k in 1 2 3; do
+			mon "sendkey meta_l-shift-t"
+			sleep 6
+			[ "$(term_up)" = yes ] && break
+		done
+		shot terminal
+		python3 "$HERE/tools/emu-type.py" "$MON" "$1"
+		for i in $(seq 1 15); do grep -aq "$2" "$SERIAL" && return 0; sleep 2; done
+		say "the guest script did not start (try $try), trying again"
+	done
+	return 1
+}
 for i in $(seq 1 30); do [ -S "$MON" ] && break; sleep 1; done
 [ -S "$MON" ] && sleep 1 && kill -0 "$QPID" 2>/dev/null || { grep -v pcid "$RUN/qemu.out" | tail -5; say "QEMU did not start"; exit 1; }
 START=$(date +%s)
@@ -286,10 +317,7 @@ while [ $(( $(date +%s) - START )) -lt "$WAIT" ]; do
 done
 [ "$REC" = 1 ] || say "Recovery NOT reached"
 if [ "$DIAG" = 1 ] && [ "$REC" = 1 ]; then
-	mon "sendkey meta_l-shift-t"
-	sleep 5
-	shot terminal
-	python3 "$HERE/tools/emu-type.py" "$MON" 'bash /Volumes/QEMU*/run-diag.sh\n'
+	run_in_terminal 'bash /Volumes/QEMU*/run-diag.sh\n' RDNA4DIAG-RUNNING || say "the Terminal could not be driven (see screen-terminal.png)"
 	D0=$(date +%s)
 	while [ $(( $(date +%s) - D0 )) -lt "${DIAG_WAIT:-900}" ]; do
 		sleep 3
@@ -308,10 +336,7 @@ if [ "$DIAG" = 1 ] && [ "$REC" = 1 ]; then
 	fi
 fi
 if [ "$CENSUS" = 1 ] && [ "$REC" = 1 ]; then
-	mon "sendkey meta_l-shift-t"
-	sleep 5
-	shot terminal
-	python3 "$HERE/tools/emu-type.py" "$MON" 'bash /Volumes/QEMU*/run-census.sh\n'
+	run_in_terminal 'bash /Volumes/QEMU*/run-census.sh\n' RDNA4CENSUS-RUNNING || say "the Terminal could not be driven (see screen-terminal.png)"
 	D0=$(date +%s)
 	while [ $(( $(date +%s) - D0 )) -lt "${CENSUS_WAIT:-300}" ]; do
 		sleep 3
