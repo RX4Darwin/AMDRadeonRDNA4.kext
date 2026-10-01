@@ -51,21 +51,35 @@ Fallbacks if the catalogue does not offer the personality (checked from the `mat
 `KEXT=~/work/rx4darwin/RDNA4FB-m0/build/RDNA4FB.kext tools/emu-linux.sh 1 --extra 'rdna4-pvgpu=2'`, then read `rdna4fb.log`. Expected lines (all prefixed `RDNA4FB: pvgpu:`):
 
 ```
-fake Apple paravirtual GPU published under <GPU name>: PCI 106b:eeee, BAR0 16384 bytes of RAM (control block at +0x1000), level 2; IOPCIDevice is N bytes here (header M)
+fake Apple paravirtual GPU published under <GPU name>: PCI 106b:eeee, BAR0 16384 bytes of RAM (control block at +0x1000), level 2; IOPCIDevice is 184 bytes here (header 184)
+match offered: <bundle> <class> (IOPCIMatch ...) -> no            (up to 40 lines: what IOKit offered the nub; Recovery has no Apple paravirt personality)
 selftest: start
 selftest: config space, capabilities, personality matching        ok
 selftest: mapDeviceMemoryWithRegister(0x10)                        ok
 selftest: driver's mapping and the host's pointer are the same RAM  ok
 selftest: version handshake: 6 written, 6 read back                ok
 selftest: FIFO buffer (0x10000 bytes, options 0x890) allocated and wired   ok
-host: FIFO announced: page 0x..., length 0x10000, ring start 0x1000, root page 0x0, version 6
-host: fifo @0xeff8: cmd 0x3a GetDeviceInfo, 24 bytes (12 payload), 0 barrier(s), signal 0x7: reply buffer page 0x1234, 4096 bytes   (written across the ring's wrap)
-host: fifo @0xf010: cmd 0x30 DefineChannel, 16 bytes (4 payload), 0 barrier(s), signal 0x0: channel 3
-selftest: host consumed the FIFO (FIFO_READ caught up with FIFO_WRITTEN)   ok
-selftest: host mapped the announced FIFO page                      ok
-selftest: host logged at least one packet                          ok
 interrupt 0 registered
 selftest: IOInterruptEventSource on the nub (index 0)              ok
+selftest: GetDeviceInfo reply buffer (4 KiB) allocated and wired   ok
+selftest: display shared state page (4 KiB) allocated and wired    ok
+host: FIFO announced: page 0x..., length 0x10000, ring start 0x1000, root page 0x0, version 6
+host: fifo @0xeff8: cmd 0x30 DefineChannel, 16 bytes (4 payload), 0 barrier(s), signal 0x0: channel 3          (written across the ring's wrap)
+host: fifo @0x8: cmd 0x3a GetDeviceInfo, 24 bytes (12 payload), 0 barrier(s), signal 0x1: reply buffer page 0x..., 4096 bytes
+host: GetDeviceInfo answered: reply buffer page 0x... (4096 bytes, 512 pair slots), 31 pairs written, GpuCoreCount 64
+host: fifo @0x20: cmd 0x01 DisplaySetupSharedState, 20 bytes (8 payload), 0 barrier(s), signal 0x2: pipe port 2, shared state page 0x...
+host: display shared state page 0x...: port 2 written at +0x12
+host: stamp[0] = 2 written (FIFO page offset 0), INTR_STATUS_GPU bit 0 set, interrupt 0 raised
+selftest: host consumed the FIFO (FIFO_READ caught up with FIFO_WRITTEN)   ok
+selftest: host mapped the announced FIFO page                      ok
+selftest: host decoded the three FIFO commands                     ok
+selftest: host answered GetDeviceInfo once                         ok
+selftest: GetDeviceInfo reply buffer holds the documented key/value pairs   ok
+selftest: parseDeviceInfo (mirror): MSAASamples 4, GpuCoreCount 64, DeserializerVersion undefined, shader version defaulted to 2.2   ok
+selftest: stamp[0] == 2 in the FIFO page (the last signal of the batch: GetDeviceInfo 1, display 2)   ok
+selftest: display shared state page: port 2 written at +0x12 (what AppleParavirtDisplayPipe asserts)   ok
+selftest: host raised interrupt 0 for the stamp and the registered handler ran once   ok
+selftest: INTR_STATUS_GPU bit 0 dropped again by the host          ok
 selftest: raiseInterrupt(0): handler registered and enabled        ok
 selftest: interrupt delivered once to the event source's action    ok
 interrupt 0 unregistered
@@ -77,8 +91,8 @@ Between them `host: ctrl+0x... a -> b` lines show the register writes the host s
 **B. Apple's kext, in a full-install VM** (`rdna4-pvgpu=1`; coordinate with Anvil, hub-task-427; `tools/m0/vm-check.sh` collects items 2-4 over ssh. Anvil's VM, measured status 2026-10-01: being installed, `tools/emu-full.sh oc --kext <kext> --args "... rdna4-pvgpu=1"`, serial log like Kiln's, **no emulated RDNA4 device yet**, so the nub is published by the fallback: `RDNA4PvNub::publishLater` publishes it under the platform expert 25 s after plugin start when the GPU path never ran): the checks, in order:
 1. Our log: `pvgpu: fake Apple paravirtual GPU published ...`, and a `match offered: com.apple.driver.AppleParavirtGPU AppleParavirtGPUControl (IOPCIMatch 0xEEEE106B) -> MATCH` line. No such line = the catalogue never offered Apple's personality (fallback (a) above).
 2. `ioreg -l -w0 -n PVGPU` shows the nub with `compatible pci106b,eeee`; `ioreg -c AppleParavirtGPUControl` shows Apple's class attached; `kextstat | grep Paravirt` (or `kmutil showloaded`) lists `com.apple.driver.AppleParavirtGPU`.
-3. Our log: `host: ctrl+0x034 0x00000000 -> 0x00000006` (version handshake), `host: FIFO announced: ...` (setupFIFO), `host: fifo +N bytes ...` (first commands). Which of these appear is the M0 result.
-4. `ioreg -c IOAccelerator` showing an Apple paravirt accelerator with `MetalPluginName AppleParavirtGPUMetal` means `setupDeviceInfo` completed, i.e. the host answered, which M0 does not do.
+3. Our log: `host: ctrl+0x034 0x00000000 -> 0x00000006` (version handshake), `host: FIFO announced: ...` (setupFIFO), `host: fifo @0x...: cmd 0x.. <name>, N bytes ...` (the commands by name). Which of these appear is the M0 result.
+4. `host: GetDeviceInfo answered` in our log and `ioreg -c AppleParavirtAccelerator` / `ioreg -c IOAccelerator` showing the accelerator with `MetalPluginName AppleParavirtGPUMetal`: `setupDeviceInfo` completed; what to expect after that is under "What the kext does next".
 
 ## The GetDeviceInfo reply (hub-task-446) [measured in the kext and the bundle unless marked]
 
@@ -144,7 +158,7 @@ How the consumers use some of them [measured in the bundle]: `supportsSampleCoun
 
 In the order they should happen after the reply (`rdna4-pvgpu=1` in Anvil's full-install VM; expected host log lines first):
 
-1. **Our log:** `host: fifo @0x...: cmd 0x3a GetDeviceInfo, 24 bytes ... reply buffer page 0x..., 4096 bytes` then `host: GetDeviceInfo answered: ... 30 pairs written, GpuCoreCount 64` then `host: stamp[0] = N written ... interrupt 0 raised`. Not seen: the driver did not get that far (look at the earlier steps in Tests B).
+1. **Our log:** `host: fifo @0x...: cmd 0x3a GetDeviceInfo, 24 bytes ... reply buffer page 0x..., 4096 bytes` then `host: GetDeviceInfo answered: ... 31 pairs written, GpuCoreCount 64` then `host: stamp[0] = N written ... interrupt 0 raised`. Not seen: the driver did not get that far (look at the earlier steps in Tests B).
 2. **`Accelerator::start` returns true and `registerService()` publishes the accelerator**: `ioreg -c AppleParavirtAccelerator` shows it with `MetalPluginName AppleParavirtGPUMetal` and `MetalPluginClassName AppleParavirtDevice`; `IOAccelerator` matching now finds it. Nothing in `Accelerator::start` waits after this.
 3. **The display side starts: the next stall.** `AppleParavirtGPUControl` is an `IOFramebuffer` (display count register +0x22c = 0 is taken as one pipe). When its display pipe is created, `AppleParavirtDisplayPipe::init` creates its **own virtual channel named "Display"**, which shows in our log as a root-FIFO `cmd 0x30 DefineChannel ... channel 5` (or the next free id), and `setupSharedState` submits `0x01 DisplaySetupSharedState {u32 port, u32 page}` **on that channel's ring**, then **waits for that channel's stamp** (index = the channel id). **The M0 host does not poll child rings**, so nothing answers it: expect Apple's `timed out waiting for stamp` messages once per ~2 s and the display pipe never finishing its setup (the framebuffer attach is held; no kernel panic yet). The answer, once child rings are polled (M1), is: copy the command out of the ring, write the **port number as a u16 at +0x12 of the shared-state page** (the driver asserts `fSharedState->port == fPort` right after the wait and **panics the kernel if it is wrong**; the host code for this exists and is covered by the self-test, but only runs when the command is seen in the root FIFO), write `stamp[channel]`, signal. The channel definition itself (`DefineChannel`) needs the host to read the channel's state record in the root page and its ring through the page list (`docs/m1-stream.md` s.1).
 4. **User space, if Metal runs in the VM:** `-[AppleParavirtDevice initWithAcceleratorPort:]` runs the generic `MTLIOAccelDevice` init (E1c: type 5/6 selectors, served by Apple's own kernel classes now), then `setupDeviceInfo` (selector 0x105: our values + the feature flags), `setupCompiler` (`libAppleParavirtCompilerPlugin`), `setupResourcePools`; the first `newCommandQueue` and the first command buffer produce Exec-ring traffic (`0x37 ExecIndirect`) that the host cannot see yet either.
