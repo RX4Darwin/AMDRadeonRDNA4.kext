@@ -39,6 +39,9 @@ constexpr uint32_t kRegFifoWritten = 0x008;  // guest write counter (bytes, mono
 constexpr uint32_t kRegFifoRead = 0x00c;     // host read counter: writeFifo spins until (read + ring - written) >= command length
 constexpr uint32_t kRegFifoStart = 0x010;    // ring start offset inside the FIFO buffer (0x1000); the first 4 KiB are the root header
 constexpr uint32_t kRegRootPage = 0x01c;     // physical page number of the 4 KiB root page
+constexpr uint32_t kRegIntrStatusDisp = 0x014;  // display interrupt status (the handler passes it to the display machine)
+constexpr uint32_t kRegIntrStatusGpu = 0x018;   // GPU interrupt status: bit i = stamp i advanced (AppleParavirtEventMachine::signalStamps)
+constexpr uint32_t kRegIntrFault = 0x02c;       // fault status (handleFaultInterrupt)
 constexpr uint32_t kRegFifoBasePage = 0x030; // physical page number of the 64 KiB FIFO buffer
 constexpr uint32_t kRegVersion = 0x034;      // driver writes 6 and reads back; the host chooses the version by what it returns
 constexpr uint32_t kRegNumDisplays = 0x22c;  // read once by AppleParavirtGPUControl::start; 0 means one, more than 8 is clamped

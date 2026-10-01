@@ -113,6 +113,10 @@ void describeFifo(const uint8_t *p, const FifoCommand &c, char *out, size_t cap)
 		if (plen >= 12 && rd32(pl) == 0x2d)
 			snprintf(w, room, ": reply buffer page 0x%x, %u bytes", rd32(pl + 8), rd32(pl + 4) * 8);
 		break;
+	case 0x01: // DisplaySetupSharedState: {u32 port, u32 shared-state page}
+		if (plen >= 8)
+			snprintf(w, room, ": pipe port %u, shared state page 0x%x", rd32(pl), rd32(pl + 4));
+		break;
 	case 0x37: // ExecIndirect: chunks of {u32 resource id, u32 length}
 		if (plen >= 8)
 			snprintf(w, room, ": %u chunk(s), first resource %u length %u", plen / 8, rd32(pl), rd32(pl + 4));

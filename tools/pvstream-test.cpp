@@ -59,6 +59,13 @@ int main() {
 	CHECK(!fifoHeader(junk, sizeof(junk), &c));
 	CHECK(!fifoHeader(f.data(), 8, &c));                                // truncated header
 
+	// DisplaySetupSharedState is described
+	std::vector<uint8_t> d;
+	put16(d, 0x01); put16(d, 0); put32(d, 20); put32(d, 2); put32(d, 3); put32(d, 0x4567);
+	CHECK(fifoHeader(d.data(), d.size(), &c) && c.id == 0x01 && c.signal == 2);
+	describeFifo(d.data(), c, line, sizeof(line));
+	CHECK(std::strstr(line, "DisplaySetupSharedState") && std::strstr(line, "port 3") && std::strstr(line, "page 0x4567"));
+
 	// stream: fillBuffer (24-byte payload) + dispatch (48) + an unknown id, then trailing garbage that must stop the walk
 	std::vector<uint8_t> s;
 	put32(s, 0x132); put32(s, 8 + 24); for (int i = 0; i < 6; i++) put32(s, i);

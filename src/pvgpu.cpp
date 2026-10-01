@@ -29,6 +29,9 @@ using namespace pvgpu;
 namespace {
 
 constexpr uint32_t kMaxLogLines = 400;
+// Compute units of the card behind GpuCoreCount: RX 9070 XT (Navi 48) has 64. From the product specification, not read from the card (the kext's IP discovery
+// exposes shader-engine and render-backend counts only).
+constexpr uint32_t kGpuCoreCount = 64;
 uint32_t gLogLines { 0 };
 RDNA4PvNub *gNub { nullptr };
 
@@ -109,6 +112,9 @@ private:
 	friend class RDNA4PvTestOwner;
 	void pollRegisters();
 	void pollFifo();
+	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
+	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd);
+	void completeStamp(uint32_t value);
 	void unmapFifo();
 	void selfTest();
 
@@ -123,17 +129,20 @@ private:
 	uint32_t mFifoPfn { 0 };
 	uint32_t mFifoLen { 0 };
 	uint64_t mConsumed { 0 };
-	uint32_t mPackets { 0 };
+	uint32_t mIrqBits { 0 };           // INTR_STATUS_GPU bits we raised and have not cleared yet
+	uint32_t mReplies { 0 };           // GetDeviceInfo replies sent
 	uint64_t mTicks { 0 };
 	uint32_t mCmds { 0 };               // FIFO commands decoded so far
 	uint32_t mBadHeaders { 0 };
 	uint8_t mWin[1024] {};              // one FIFO command copied out of the ring for decoding
 
 	// self-test state machine (level 2)
-	enum Step { kStepIdle, kStepWaitFifo, kStepWaitInterrupt, kStepDone } mStep { kStepIdle };
+	enum Step { kStepIdle, kStepWaitFifo, kStepWaitHostIrq, kStepWaitInterrupt, kStepDone } mStep { kStepIdle };
 	uint64_t mStepDeadline { 0 };
 	bool mTestOk { true };
 	IOBufferMemoryDescriptor *mTestFifo { nullptr };
+	IOBufferMemoryDescriptor *mTestReply { nullptr };
+	IOBufferMemoryDescriptor *mTestShared { nullptr };  // the display shared state page of the self-test's DisplaySetupSharedState   // the GetDeviceInfo reply buffer the test driver announces
 	IOMemoryMap *mTestBar { nullptr };
 	uint64_t mTestExpect { 0 };
 	IOWorkLoop *mTestLoop { nullptr };
@@ -182,6 +191,13 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 
 void RDNA4PvHost::tick() {
 	mTicks++;
+	if (mIrqBits) {
+		// The real register clears on read; RAM cannot, so the bits we raised are dropped a tick later (the handler has had its chance: the driver also
+		// re-reads the stamp after every timed wait, so a missed wake-up costs at most the 1 s wait of IOAccelEventMachine2::waitForStamp).
+		if (volatile uint32_t *c = mNub->ctrl())
+			c[kRegIntrStatusGpu / 4] &= ~mIrqBits;
+		mIrqBits = 0;
+	}
 	pollRegisters();
 	pollFifo();
 	if (mLevel >= 2)
@@ -196,7 +212,7 @@ void RDNA4PvHost::pollRegisters() {
 		return;
 	for (unsigned i = 0; i < 24; i++) {
 		// FIFO_WRITTEN / FIFO_READ move with every command: they are reported through the packet log, not as register changes.
-		if (i == kRegFifoWritten / 4 || i == kRegFifoRead / 4)
+		if (i == kRegFifoWritten / 4 || i == kRegFifoRead / 4 || i == kRegIntrStatusGpu / 4)
 			continue;
 		const uint32_t v = c[i];
 		if (v != mPrev[i]) {
@@ -259,7 +275,8 @@ void RDNA4PvHost::pollFifo() {
 		return;
 	}
 	// Decode what the guest wrote as FIFO commands ({u16 id, u16 barriers, u32 length, u32 signal, ...}, pvstream.hpp), log each by name and size.
-	uint32_t at = 0;
+	uint32_t at = 0, lastSignal = 0;
+	bool haveSignal = false;
 	while (at < n) {
 		auto copy = [&](uint32_t from, uint8_t *dst, uint32_t count) {
 			for (uint32_t i = 0; i < count; i++)
@@ -297,10 +314,108 @@ void RDNA4PvHost::pollFifo() {
 			}
 			pvlog("host: fifo @0x%x: %s", (read + at) % ringLen, line);
 		}
+		if (c.id == 0x3a && c.length <= sizeof(mWin)) {
+			if (mCmds > 150)
+				copy(at, mWin, c.length);   // logged commands already sit in mWin
+			answerDeviceInfo(c, mWin);
+		}
+		if (c.id == 0x01 && c.length <= sizeof(mWin)) {
+			if (mCmds > 150)
+				copy(at, mWin, c.length);
+			answerDisplaySharedState(c, mWin);
+		}
+		if (c.signal) {
+			// the command asks for a stamp when it completes (AppleParavirtCommandAllocator::addSignal): remember the last value of this batch
+			lastSignal = c.signal;
+			haveSignal = true;
+		}
 		at += c.length;
 	}
+	if (haveSignal)
+		completeStamp(lastSignal);
 	mConsumed += n;
 	c[kRegFifoRead / 4] = written;   // acknowledge everything: AppleParavirtAccelerator::writeFifo spins until the host has read enough
+}
+
+// GetDeviceInfo (FIFO 0x3a): the record 0x2d names the 4 KiB buffer the host fills; the layout and the values are docs/m0-pvgpu.md "The GetDeviceInfo reply".
+void RDNA4PvHost::answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd) {
+	const uint8_t *pl = cmd + c.payloadOffset;
+	const uint32_t plen = c.length - c.payloadOffset;
+	uint32_t rec[3] = {};
+	if (plen >= sizeof(rec))
+		memcpy(rec, pl, sizeof(rec));
+	if (plen < sizeof(rec) || rec[0] != pvstream::kDeviceInfoRecord) {
+		pvlog("host: GetDeviceInfo without a 0x2d record (%u payload bytes): not answered", plen);
+		return;
+	}
+	const uint32_t bytes = rec[1] * 8, page = rec[2];
+	if (bytes < 8 || bytes > 0x10000 || !page) {
+		pvlog("host: GetDeviceInfo reply buffer refused: page 0x%x, %u bytes", page, bytes);
+		return;
+	}
+	IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(static_cast<IOPhysicalAddress>(page) << 12, bytes, kIODirectionInOut);
+	IOMemoryMap *map = desc ? desc->createMappingInTask(kernel_task, 0, kIOMapAnywhere) : nullptr;
+	if (!map) {
+		pvlog("host: cannot map the GetDeviceInfo reply buffer (page 0x%x, %u bytes)", page, bytes);
+		OSSafeReleaseNULL(desc);
+		return;
+	}
+	const size_t pairs = pvstream::buildDeviceInfoReply(reinterpret_cast<uint8_t *>(map->getVirtualAddress()), bytes, kGpuCoreCount);
+	__sync_synchronize();
+	map->release();
+	desc->release();
+	mReplies++;
+	pvlog("host: GetDeviceInfo answered: reply buffer page 0x%x (%u bytes, %u pair slots), %u pairs written, GpuCoreCount %u", page, bytes, bytes / 8,
+	      static_cast<unsigned>(pairs), kGpuCoreCount);
+}
+
+// DisplaySetupSharedState (FIFO 0x01, AppleParavirtDisplayPipe::setupSharedState): {u32 port, u32 page}. After its wait the driver asserts that the host wrote the
+// pipe's port number into the shared state page as a u16 at +0x12 (a mismatch panics the guest kernel: "fSharedState->port == fPort"), and copies the u32 at
+// +0x1c into the pipe (meaning unknown [INFER: a host-side id]; 0 here).
+void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd) {
+	const uint8_t *pl = cmd + c.payloadOffset;
+	if (c.length - c.payloadOffset < 8)
+		return;
+	uint32_t port, page;
+	memcpy(&port, pl, 4);
+	memcpy(&page, pl + 4, 4);
+	if (!page)
+		return;
+	IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(static_cast<IOPhysicalAddress>(page) << 12, 0x1000, kIODirectionInOut);
+	IOMemoryMap *map = desc ? desc->createMappingInTask(kernel_task, 0, kIOMapAnywhere) : nullptr;
+	if (!map) {
+		pvlog("host: cannot map the display shared state page 0x%x", page);
+		OSSafeReleaseNULL(desc);
+		return;
+	}
+	uint8_t *va = reinterpret_cast<uint8_t *>(map->getVirtualAddress());
+	const uint16_t port16 = static_cast<uint16_t>(port);
+	const uint32_t zero = 0;
+	memcpy(va + 0x12, &port16, 2);
+	memcpy(va + 0x1c, &zero, 4);
+	__sync_synchronize();
+	map->release();
+	desc->release();
+	pvlog("host: display shared state page 0x%x: port %u written at +0x12", page, port);
+}
+
+// Completion of a command that asked for a stamp: the driver's event machine tests `*stampPtr[index] >= value` with stampPtr[index] = (FIFO buffer page)+4*index
+// (IOAccelEventMachine2::getStampOffset); the root channel is index 0. Then INTR_STATUS_GPU bit `index` and the MSI wake the waiter (signalStamps); without
+// the interrupt the waiter finds the stamp after its next timed wake-up.
+void RDNA4PvHost::completeStamp(uint32_t value) {
+	if (!mFifoMap)
+		return;
+	volatile uint32_t *stamps = reinterpret_cast<volatile uint32_t *>(mFifoMap->getVirtualAddress());
+	if (static_cast<int32_t>(value - stamps[0]) > 0)
+		stamps[0] = value;
+	__sync_synchronize();
+	if (volatile uint32_t *c = mNub->ctrl()) {
+		c[kRegIntrStatusGpu / 4] |= 1;
+		mIrqBits |= 1;
+	}
+	const bool delivered = mNub->raiseInterrupt(0);
+	if (mReplies <= 4 || !delivered)
+		pvlog("host: stamp[0] = %u written (FIFO page offset 0), INTR_STATUS_GPU bit 0 set, interrupt 0 %s", value, delivered ? "raised" : "not raised (no handler registered yet)");
 }
 
 // ---- self-test: plays the guest driver against the nub (the register sequence of AppleParavirtAccelerator, s.6.1) ----
@@ -370,33 +485,7 @@ void RDNA4PvHost::selfTest() {
 		c[kRegFifoStart / 4] = 0x1000;
 		c[kRegControlFifo / 4] = 1;
 
-		// 4. writeFifo: two commands, one of them wrapping the ring; then FIFO_WRITTEN
-		const uint32_t ringLen = 0x10000 - 0x1000;
-		uint32_t written = ringLen - 8;    // start 8 bytes before the end of the ring so the first command wraps
-		c[kRegFifoRead / 4] = written;     // (the host's view of where it stands; the poller resynchronises to it on the first announcement)
-		mConsumed = written;
-		// GetDeviceInfo with its 0x2d record (24 bytes), crossing the ring's end, then DefineChannel 3 (16 bytes): FIFO commands as the driver builds them
-		static const uint8_t cmd1[40] = { 0x3a, 0, 0, 0, 24, 0, 0, 0, 7, 0, 0, 0,   0x2d, 0, 0, 0, 0x00, 0x02, 0, 0, 0x34, 0x12, 0, 0,
-		                                  0x30, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0,   3, 0, 0, 0 };
-		for (uint32_t i = 0; i < sizeof(cmd1); i++)
-			fifo[0x1000 + (written + i) % ringLen] = cmd1[i];
-		written += sizeof(cmd1);
-		c[kRegFifoWritten / 4] = written;
-		mTestExpect = written;
-		mStep = kStepWaitFifo;
-		mStepDeadline = nowMs() + 300;
-		break;
-	}
-	case kStepWaitFifo: {
-		volatile uint32_t *c = reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(mTestBar->getVirtualAddress()) + kCtrl);
-		const bool consumed = c[kRegFifoRead / 4] == c[kRegFifoWritten / 4];
-		if (!consumed && nowMs() < mStepDeadline)
-			return;
-		testCheck(consumed, "host consumed the FIFO (FIFO_READ caught up with FIFO_WRITTEN)");
-		testCheck(mFifoMap != nullptr && mFifoPfn == c[kRegFifoBasePage / 4], "host mapped the announced FIFO page");
-		testCheck(mPackets >= 1, "host logged at least one packet");
-
-		// 5. setupInterrupts: an IOInterruptEventSource with a block handler on the provider, index 0, as Apple's driver builds it
+		// 4. setupInterrupts first (the driver registers its handler before it submits anything): an IOInterruptEventSource on the provider, index 0
 		mTestOwner = RDNA4PvTestOwner::create(this);
 		mTestLoop = IOWorkLoop::workLoop();
 		if (mTestOwner && mTestLoop) {
@@ -407,6 +496,84 @@ void RDNA4PvHost::selfTest() {
 				OSSafeReleaseNULL(mTestSource);
 		}
 		testCheck(mTestSource != nullptr, "IOInterruptEventSource on the nub (index 0)");
+		mTestIrqSeen = 0;
+
+		// 5. setupDeviceInfo: the 4 KiB reply buffer, then writeFifo of two FIFO commands as the driver builds them, the first crossing the ring's end:
+		//    DefineChannel 3 (16 bytes), GetDeviceInfo with its 0x2d record and signal 1 (24 bytes)
+		mTestReply = IOBufferMemoryDescriptor::withOptions(0x890, 0x1000, 1);
+		testCheck(mTestReply && mTestReply->prepare() == kIOReturnSuccess, "GetDeviceInfo reply buffer (4 KiB) allocated and wired");
+		if (!mTestReply) {
+			mStep = kStepDone;
+			break;
+		}
+		bzero(mTestReply->getBytesNoCopy(), 0x1000);
+		const uint32_t replyPage = static_cast<uint32_t>(mTestReply->getPhysicalAddress() >> 12);
+		const uint32_t ringLen = 0x10000 - 0x1000;
+		uint32_t written = ringLen - 8;
+		c[kRegFifoRead / 4] = written;     // (the host's view of where it stands; the poller resynchronises to it on the first announcement)
+		mConsumed = written;
+		mTestShared = IOBufferMemoryDescriptor::withOptions(0x890, 0x1000, 1);
+		testCheck(mTestShared && mTestShared->prepare() == kIOReturnSuccess, "display shared state page (4 KiB) allocated and wired");
+		if (!mTestShared) {
+			mStep = kStepDone;
+			break;
+		}
+		bzero(mTestShared->getBytesNoCopy(), 0x1000);
+		const uint32_t sharedPage = static_cast<uint32_t>(mTestShared->getPhysicalAddress() >> 12);
+		const uint32_t cmds[15] = {
+			0x00000030, 16, 0, 3,                                          // {u16 id 0x30, u16 0}, length 16, signal 0, channel 3
+			0x0000003a, 24, 1, pvstream::kDeviceInfoRecord, 0x200, replyPage, // {u16 id 0x3a, u16 0}, length 24, signal 1, record {0x2d, 4096/8, page}
+			0x00000001, 20, 2, 2, sharedPage                                 // DisplaySetupSharedState: length 20, signal 2, {port 2, page}
+		};
+		const uint32_t cmdBytes = sizeof(cmds);
+		for (uint32_t i = 0; i < cmdBytes; i++)
+			fifo[0x1000 + (written + i) % ringLen] = reinterpret_cast<const uint8_t *>(cmds)[i];
+		written += cmdBytes;
+		c[kRegFifoWritten / 4] = written;
+		mTestExpect = written;
+		mStep = kStepWaitFifo;
+		mStepDeadline = nowMs() + 300;
+		break;
+	}
+	case kStepWaitFifo: {
+		volatile uint32_t *c = reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(mTestBar->getVirtualAddress()) + kCtrl);
+		const uint8_t *fifo = static_cast<const uint8_t *>(mTestFifo->getBytesNoCopy());
+		const bool consumed = c[kRegFifoRead / 4] == c[kRegFifoWritten / 4];
+		if (!(consumed && mReplies >= 1 && *reinterpret_cast<const volatile uint32_t *>(fifo) == 2) && nowMs() < mStepDeadline)
+			return;
+		testCheck(consumed, "host consumed the FIFO (FIFO_READ caught up with FIFO_WRITTEN)");
+		testCheck(mFifoMap != nullptr && mFifoPfn == c[kRegFifoBasePage / 4], "host mapped the announced FIFO page");
+		testCheck(mCmds >= 3, "host decoded the three FIFO commands");
+		testCheck(mReplies == 1, "host answered GetDeviceInfo once");
+		// the reply: exactly what buildDeviceInfoReply gives, and Apple's parser (mirror) reads it into the struct the Metal bundle will see
+		uint8_t expect[0x1000];
+		pvstream::buildDeviceInfoReply(expect, sizeof(expect), kGpuCoreCount);
+		const uint8_t *reply = static_cast<const uint8_t *>(mTestReply->getBytesNoCopy());
+		testCheck(memcmp(reply, expect, sizeof(expect)) == 0, "GetDeviceInfo reply buffer holds the documented key/value pairs");
+		uint8_t info[pvstream::kDeviceInfoBytes] = {};
+		pvstream::parseDeviceInfoReference(reply, 0x1000 / 8, info);
+		uint32_t msaa, gpuCores, shaderVersion;
+		memcpy(&msaa, info + 0x00, 4);
+		memcpy(&gpuCores, info + 0x84, 4);
+		memcpy(&shaderVersion, info + 0x44, 4);
+		testCheck(msaa == 4 && info[0xac] == 1 && gpuCores == kGpuCoreCount && info[0xcd] == 1 && info[0xb5] == 0 && shaderVersion == 0x20002,
+		          "parseDeviceInfo (mirror): MSAASamples 4, GpuCoreCount 64, DeserializerVersion undefined, shader version defaulted to 2.2");
+		// the completion: stamp 0 = the command's signal, the way IOAccelEventMachine2 tests it
+		testCheck(*reinterpret_cast<const volatile uint32_t *>(fifo) == 2, "stamp[0] == 2 in the FIFO page (the last signal of the batch: GetDeviceInfo 1, display 2)");
+		uint16_t port16;
+		memcpy(&port16, static_cast<const uint8_t *>(mTestShared->getBytesNoCopy()) + 0x12, 2);
+		testCheck(port16 == 2, "display shared state page: port 2 written at +0x12 (what AppleParavirtDisplayPipe asserts)");
+		mStep = kStepWaitHostIrq;
+		mStepDeadline = nowMs() + 300;
+		break;
+	}
+	case kStepWaitHostIrq: {
+		volatile uint32_t *c = reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(mTestBar->getVirtualAddress()) + kCtrl);
+		if (!mTestIrqSeen && nowMs() < mStepDeadline)
+			return;
+		testCheck(mTestIrqSeen == 1, "host raised interrupt 0 for the stamp and the registered handler ran once");
+		testCheck((c[kRegIntrStatusGpu / 4] & 1) == 0, "INTR_STATUS_GPU bit 0 dropped again by the host");
+		// and an explicit interrupt, as before
 		mTestIrqSeen = 0;
 		testCheck(mTestSource && mNub->raiseInterrupt(0), "raiseInterrupt(0): handler registered and enabled");
 		mStep = kStepWaitInterrupt;
@@ -442,6 +609,14 @@ void RDNA4PvHost::selfTest() {
 				testCheck(mFifoMap == nullptr, "host dropped its FIFO mapping when the guest cleared it");
 				mTestFifo->complete();
 				OSSafeReleaseNULL(mTestFifo);
+			}
+			if (mTestReply) {
+				mTestReply->complete();
+				OSSafeReleaseNULL(mTestReply);
+			}
+			if (mTestShared) {
+				mTestShared->complete();
+				OSSafeReleaseNULL(mTestShared);
 			}
 			OSSafeReleaseNULL(mTestBar);
 			pvlog("selftest: %s", mTestOk ? "PASS" : "FAIL");
