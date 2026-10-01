@@ -66,6 +66,83 @@ int main() {
 	describeFifo(d.data(), c, line, sizeof(line));
 	CHECK(std::strstr(line, "DisplaySetupSharedState") && std::strstr(line, "port 3") && std::strstr(line, "page 0x4567"));
 
+	// The other display commands (docs/m1-stream.md s.1b): ProcessOnline, cursor glyph/state, SubmitTransaction 0x06/0x07, FlushChannelEvent
+	{
+		auto fifoLine = [&](std::vector<uint8_t> &v, uint16_t id, uint32_t signal) {
+			std::vector<uint8_t> hdr;
+			put16(hdr, id); put16(hdr, 0); put32(hdr, static_cast<uint32_t>(12 + v.size())); put32(hdr, signal);
+			hdr.insert(hdr.end(), v.begin(), v.end());
+			FifoCommand k;
+			CHECK(fifoHeader(hdr.data(), hdr.size(), &k) && k.id == id && k.signal == signal && k.length == hdr.size());
+			describeFifo(hdr.data(), k, line, sizeof(line));
+		};
+		std::vector<uint8_t> v;
+		put32(v, 5); put32(v, 0xabcd);
+		fifoLine(v, 0x02, 9);
+		CHECK(std::strstr(line, "DisplayProcessOnline") && std::strstr(line, "port 5") && std::strstr(line, "cookie 0xabcd") && std::strstr(line, "signal 0x9"));
+		v.clear(); put32(v, 5); put32(v, 1);
+		fifoLine(v, 0x05, 1);
+		CHECK(std::strstr(line, "DisplayUpdateCursorState") && std::strstr(line, "cursor visible"));
+		v.clear(); put32(v, 5); put32(v, 0);
+		fifoLine(v, 0x05, 1);
+		CHECK(std::strstr(line, "cursor hidden"));
+		v.clear(); put32(v, 2); put32(v, 77); put32(v, 3);   // port 2, surface 77, task 3
+		fifoLine(v, 0x06, 4);
+		CHECK(std::strstr(line, "DisplaySubmitTransaction,") && std::strstr(line, "port 2") && std::strstr(line, "surface 77") && std::strstr(line, "task 3"));
+		v.clear(); put32(v, 2); put32(v, 3); put32(v, 77);   // port, task, surface
+		put32(v, 0x1000); put32(v, 0); put32(v, 0x2000); put32(v, 0); put32(v, 256); put32(v, 0xfeed);
+		fifoLine(v, 0x07, 4);
+		CHECK(std::strstr(line, "DisplaySubmitTransaction2") && std::strstr(line, "task 3, surface 77") && std::strstr(line, "gamma 256 entries") &&
+		      std::strstr(line, "a 0x1000") && std::strstr(line, "b 0x2000") && std::strstr(line, "sum 0xfeed"));
+		v.clear(); put32(v, 2); put32(v, 3); put32(v, 0x7000); put32(v, 0); put32(v, 0x8000); put32(v, 0); put32(v, 256);
+		put32(v, 64 | (64u << 16)); put32(v, 4); put32(v, 0x99);
+		put32(v, 0);
+		v.resize(44);
+		{
+			uint16_t g[4] = { 64, 48, 3, 5 };
+			std::memcpy(v.data() + 32, g, sizeof(g));
+		}
+		fifoLine(v, 0x04, 6);
+		CHECK(std::strstr(line, "DisplayUpdateCursorGlyph") && std::strstr(line, "image 64x48 (3, 5)"));
+		v.clear();
+		fifoLine(v, 0x1e, 0);
+		CHECK(std::strstr(line, "DisplayFlushChannelEvent") && std::strstr(line, "0 payload"));
+	}
+
+	// the display shared-state page: the host's fill and the guest's read agree, the guest's words are not touched
+	{
+		uint8_t page[4096];
+		std::memset(page, 0xa5, sizeof(page));
+		const uint32_t enabled = 0x12345678, pending = 0x9abcdef0;
+		std::memcpy(page + disp::kEnabled, &enabled, 4);
+		std::memcpy(page + disp::kPending, &pending, 4);
+		const uint8_t origin0 = page[disp::kOriginX], chroma0 = page[0x2c], cursor0 = page[disp::kCursorPos];
+		disp::Info info;
+		info.id = 0x1234;
+		info.txnProtocol = 1;
+		info.flags = disp::kFlagCursorVisibleKick | disp::kFlagCursorMoveKick;
+		info.modeCount = 2;
+		info.modes[1] = { 1280, 720, 30u << 16 };
+		disp::fillInfo(page, 3, info);
+		disp::InfoRead r;
+		disp::readInfo(page, &r);
+		CHECK(r.id == 0x1234 && r.port == 3 && r.width == 1920 && r.height == 1080 && r.cursorWidth == 64 && r.cursorHeight == 64);
+		CHECK(r.txnProtocol == 1 && r.flags == 3 && r.cookie == 1 && r.count == 2);
+		CHECK(std::strcmp(r.name, "RDNA4FB PV") == 0);
+		CHECK(r.modes[0].width == 1920 && r.modes[0].height == 1080 && r.modes[0].refresh == (60u << 16));
+		CHECK(r.modes[1].width == 1280 && r.modes[1].height == 720 && r.modes[1].refresh == (30u << 16));
+		uint32_t e, pd;
+		std::memcpy(&e, page + disp::kEnabled, 4);
+		std::memcpy(&pd, page + disp::kPending, 4);
+		CHECK(e == enabled && pd == pending);                                            // the event words are not the fill's business
+		CHECK(page[disp::kOriginX] == origin0 && page[0x2c] == chroma0 && page[disp::kCursorPos] == cursor0 && page[disp::kScale] == 1);
+		CHECK(page[disp::kModes + 8] == 0 && page[disp::kModes + 15] == 0);              // the unused half of a mode record is zeroed
+		info.modeCount = 99;                                                             // clamped
+		disp::fillInfo(page, 0, info);
+		disp::readInfo(page, &r);
+		CHECK(r.count == disp::kMaxModes && r.port == 0);
+	}
+
 	// stream: fillBuffer (24-byte payload) + dispatch (48) + an unknown id, then trailing garbage that must stop the walk
 	std::vector<uint8_t> s;
 	put32(s, 0x132); put32(s, 8 + 24); for (int i = 0; i < 6; i++) put32(s, i);

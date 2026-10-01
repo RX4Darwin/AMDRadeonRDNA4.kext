@@ -121,6 +121,31 @@ void describeFifo(const uint8_t *p, const FifoCommand &c, char *out, size_t cap)
 		if (plen >= 8)
 			snprintf(w, room, ": %u chunk(s), first resource %u length %u", plen / 8, rd32(pl), rd32(pl + 4));
 		break;
+	case 0x02: // DisplayProcessOnline: {u32 port, u32 shared+0x200}
+		if (plen >= 8)
+			snprintf(w, room, ": pipe port %u, cookie 0x%x", rd32(pl), rd32(pl + 4));
+		break;
+	case 0x04: // DisplayUpdateCursorGlyph: {u32 port, u32 task, u64 mapping, u64 ?, u64 pitch, u16 x4, u32 pixel sum}
+		if (plen >= 44) {
+			uint16_t g[4];
+			memcpy(g, pl + 32, sizeof(g));
+			snprintf(w, room, ": pipe port %u, task %u, mapping 0x%llx, pitch %llu, image %ux%u (%u, %u), pixel sum 0x%x", rd32(pl), rd32(pl + 4),
+			         static_cast<unsigned long long>(rd64(pl + 8)), static_cast<unsigned long long>(rd64(pl + 24)), g[0], g[1], g[2], g[3], rd32(pl + 40));
+		}
+		break;
+	case 0x05: // DisplayUpdateCursorState: {u32 port, u8 visible}
+		if (plen >= 5)
+			snprintf(w, room, ": pipe port %u, cursor %s", rd32(pl), pl[4] ? "visible" : "hidden");
+		break;
+	case 0x06: // DisplaySubmitTransaction: {u32 port, u32 surface id, u32 task}
+		if (plen >= 12)
+			snprintf(w, room, ": pipe port %u, surface %u, task %u", rd32(pl), rd32(pl + 4), rd32(pl + 8));
+		break;
+	case 0x07: // DisplaySubmitTransaction2: {u32 port, u32 task, u32 surface id, u64 a, u64 b, u32 gamma entries, u32 gamma sum}
+		if (plen >= 36)
+			snprintf(w, room, ": pipe port %u, task %u, surface %u, gamma %u entries (a 0x%llx, b 0x%llx, sum 0x%x)", rd32(pl), rd32(pl + 4), rd32(pl + 8), rd32(pl + 28),
+			         static_cast<unsigned long long>(rd64(pl + 12)), static_cast<unsigned long long>(rd64(pl + 20)), rd32(pl + 32));
+		break;
 	default:
 		break;
 	}
@@ -270,5 +295,60 @@ void parseDeviceInfoReference(const uint8_t *buf, uint32_t pairs, uint8_t out[kD
 	memcpy(out + 0xd8, &major, 4);
 	memcpy(out + 0xdc, &minor, 4);
 }
+
+namespace disp {
+
+void fillInfo(uint8_t *page, uint32_t port, const Info &info) {
+	auto put32 = [&](uint32_t off, uint32_t v) { memcpy(page + off, &v, 4); };
+	auto put16 = [&](uint32_t off, uint16_t v) { memcpy(page + off, &v, 2); };
+	put32(kId, info.id);
+	memset(page + kName, 0, kNameBytes);
+	for (uint32_t i = 0; i + 1 < kNameBytes && info.name[i]; i++)
+		page[kName + i] = static_cast<uint8_t>(info.name[i]);
+	put16(kPort, static_cast<uint16_t>(port));
+	put16(kWidth, info.width);
+	put16(kHeight, info.height);
+	put16(kCursorWidth, info.cursorWidth);
+	put16(kCursorHeight, info.cursorHeight);
+	put32(kTxnProtocol, info.txnProtocol);
+	put32(kFlags, info.flags);
+	page[kScale] = info.scale;
+	put32(kCookie, info.cookie);
+	const uint32_t count = info.modeCount < kMaxModes ? info.modeCount : kMaxModes;
+	put16(kModeCount, static_cast<uint16_t>(count));
+	for (uint32_t i = 0; i < count; i++) {
+		const uint32_t at = kModes + i * kModeStride;
+		memset(page + at, 0, kModeStride);
+		put16(at, info.modes[i].width);
+		put16(at + 2, info.modes[i].height);
+		put32(at + 4, info.modes[i].refresh);
+	}
+}
+
+void readInfo(const uint8_t *page, InfoRead *out) {
+	memset(out, 0, sizeof(*out));
+	out->id = rd32(page + kId);
+	memcpy(out->name, page + kName, kNameBytes);
+	out->name[kNameBytes] = 0;
+	memcpy(&out->port, page + kPort, 2);
+	memcpy(&out->width, page + kWidth, 2);
+	memcpy(&out->height, page + kHeight, 2);
+	memcpy(&out->cursorWidth, page + kCursorWidth, 2);
+	memcpy(&out->cursorHeight, page + kCursorHeight, 2);
+	out->txnProtocol = rd32(page + kTxnProtocol);
+	out->flags = rd32(page + kFlags);
+	out->cookie = rd32(page + kCookie);
+	uint16_t count;
+	memcpy(&count, page + kModeCount, 2);
+	out->count = count;
+	for (uint32_t i = 0; i < count && i < kMaxModes; i++) {
+		const uint32_t at = kModes + i * kModeStride;
+		memcpy(&out->modes[i].width, page + at, 2);
+		memcpy(&out->modes[i].height, page + at + 2, 2);
+		out->modes[i].refresh = rd32(page + at + 4);
+	}
+}
+
+} // namespace disp
 
 } // namespace pvstream
