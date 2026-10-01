@@ -83,7 +83,36 @@ def case_reduce_sum(build, work):
     return True
 
 
-CASES = {"group_uniform_add_float": case_group_uniform_add_float, "ReduceSumKernel_uint": case_reduce_sum}
+def case_grid3d(build, work):
+    # Hand-written AIR-shaped kernel (tools/air/samples/grid3d.ll): each in-grid thread writes its thread_position_in_grid, threadgroup_position_in_grid
+    # and thread_position_in_threadgroup (uint3 each). Tests the Y/Z work-group ids (ttmp7), the packed local ids (v0) and the out-of-grid guard in 3D:
+    # the grid (30,10,5) is not a multiple of the work-group (8,4,2).
+    grid, tg = (30, 10, 5), (8, 4, 2)
+    groups = tuple((g + t - 1) // t for g, t in zip(grid, tg))
+    n = grid[0] * grid[1] * grid[2]
+    sentinel = 0xdeadbeef
+    init = struct.pack("<%dI" % (n * 9 + 64), *([sentinel] * (n * 9 + 64)))
+    args = [("buf", init), ("u32", grid[0]), ("u32", grid[1]), ("u32", grid[2])]
+    res = run(build, "grid3d", "grid3d", tg, groups, args, work)
+    if res is None:
+        return False
+    got = struct.unpack("<%dI" % (n * 9 + 64), res[0][:4 * (n * 9 + 64)])
+    want = [sentinel] * (n * 9 + 64)
+    for z in range(grid[2]):
+        for y in range(grid[1]):
+            for x in range(grid[0]):
+                idx = (z * grid[1] + y) * grid[0] + x
+                want[idx * 9:idx * 9 + 9] = [x, y, z, x // tg[0], y // tg[1], z // tg[2], x % tg[0], y % tg[1], z % tg[2]]
+    bad = [i for i in range(len(want)) if got[i] != want[i]]
+    if bad:
+        i = bad[0]
+        print("    FAIL: %d of %d words wrong; first at word %d (thread %d, field %d): got %#x want %#x" % (len(bad), len(want), i, i // 9, i % 9, got[i], want[i]))
+        return False
+    print("    PASS: %d threads in a %s grid, work-group %s, %s groups; the 64-word tail stayed untouched" % (n, grid, tg, groups))
+    return True
+
+
+CASES = {"group_uniform_add_float": case_group_uniform_add_float, "ReduceSumKernel_uint": case_reduce_sum, "grid3d": case_grid3d}
 
 
 def main():
