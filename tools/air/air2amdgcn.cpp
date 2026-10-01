@@ -10,6 +10,8 @@
 //   * every !air.buffer argument -> one 8-byte kernarg pointer, in AIR order: AIR address space 1 (device) -> addrspace(1) (global),
 //     AIR address space 2 (constant) -> addrspace(4) (constant), everywhere in the module; texture/sampler/argument-buffer/imageblock arguments are refused;
 //   * then three hidden u32 kernargs: the grid size in THREADS (x, y, z) (dispatchThreads semantic; dispatchThreadgroups = groups * tg);
+//   * then one hidden u32 per threadgroup-memory argument (AIR buffer in address space 3): its byte offset into the dynamic LDS (the runtime sums the
+//     setThreadgroupMemoryLength sizes, 16-byte aligned); the kernel's dynamic LDS starts after its static LDS (group_segment_fixed_size);
 //   * threadgroup size is a compile-time constant (--tg), as in a Metal pipeline (maxTotalThreadsPerThreadgroup / dispatch size are known at
 //     pipeline creation); the launch must use groups = ceil(grid / tg) per dimension; threads outside the grid return at once (Metal has no such
 //     threads: non-uniform threadgroups), which is safe before barriers because the hardware counts waves, not lanes;
@@ -23,6 +25,7 @@
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/LLVMContext.h"
@@ -42,6 +45,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <functional>
 #include <map>
@@ -88,7 +92,10 @@ Value *elementwise(IRBuilder<> &B, Type *RT, ArrayRef<Value *> args, const Scala
 		SmallVector<Value *, 4> e;
 		for (Value *a : args)
 			e.push_back(a->getType()->isVectorTy() ? B.CreateExtractElement(a, i) : a);
-		res = B.CreateInsertElement(res, fn(B, e), i);
+		Value *r = fn(B, e);
+		if (!r)
+			return nullptr;   // no rule for this element type
+		res = B.CreateInsertElement(res, r, i);
 	}
 	return res;
 }
@@ -213,6 +220,100 @@ Value *lowerCall(IRBuilder<> &B, CallInst *CI, StringRef name, std::string *why)
 		return fm(un(Intrinsic::sin));
 	if (op == "cos")
 		return fm(un(Intrinsic::cos));
+	if (op == "fmax3" || op == "fmin3") {
+		const Intrinsic::ID id = op == "fmax3" ? Intrinsic::maxnum : Intrinsic::minnum;
+		return B.CreateBinaryIntrinsic(id, B.CreateBinaryIntrinsic(id, A[0], A[1]), A[2]);
+	}
+	if (fam == "air.unpack.unorm4x8") {   // u32 -> float4 (or half4): byte / 255
+		Value *bytes = B.CreateBitCast(A[0], FixedVectorType::get(B.getInt8Ty(), 4));
+		return B.CreateFMul(B.CreateUIToFP(bytes, RT), fconst(B, RT, 1.0 / 255.0));
+	}
+	if (fam.rfind("air.atomic.", 0) == 0) {
+		// air.atomic.<global|local>.<op>[.s|.u].<type>(ptr, [value,] i32 order, i32 scope, i1 volatile); order 0 (relaxed) is the only value in the corpus; scope 1 =
+		// threadgroup, 2 = device [INFER from the values seen: local atomics carry 1, global ones 2]
+		const std::string aop = tok.size() > 3 ? tok[3].str() : "";
+		const bool isLoad = aop == "load", isStore = aop == "store";
+		auto *scopeC = dyn_cast<ConstantInt>(A[A.size() - 2]);
+		auto *orderC = dyn_cast<ConstantInt>(A[A.size() - 3]);
+		if (!scopeC || !orderC || orderC->getZExtValue() != 0) {
+			*why = "atomic with a non-relaxed or non-constant ordering";
+			return nullptr;
+		}
+		SyncScope::ID ss = C.getOrInsertSyncScopeID(scopeC->getZExtValue() == 1 ? "workgroup" : scopeC->getZExtValue() == 2 ? "agent" : "wavefront");
+		const bool sgn = signOf(tok) == 's';
+		if (isLoad) {
+			auto *L = B.CreateAlignedLoad(RT, A[0], Align(RT->getPrimitiveSizeInBits() / 8));
+			L->setAtomic(AtomicOrdering::Monotonic, ss);
+			return L;
+		}
+		if (isStore) {
+			auto *St = B.CreateAlignedStore(A[1], A[0], Align(A[1]->getType()->getPrimitiveSizeInBits() / 8));
+			St->setAtomic(AtomicOrdering::Monotonic, ss);
+			return CI;
+		}
+		AtomicRMWInst::BinOp bop;
+		if (aop == "add") bop = AtomicRMWInst::Add;
+		else if (aop == "sub") bop = AtomicRMWInst::Sub;
+		else if (aop == "and") bop = AtomicRMWInst::And;
+		else if (aop == "or") bop = AtomicRMWInst::Or;
+		else if (aop == "xor") bop = AtomicRMWInst::Xor;
+		else if (aop == "min") bop = sgn ? AtomicRMWInst::Min : AtomicRMWInst::UMin;
+		else if (aop == "max") bop = sgn ? AtomicRMWInst::Max : AtomicRMWInst::UMax;
+		else if (aop == "exchange") bop = AtomicRMWInst::Xchg;
+		else {
+			*why = "atomic op without a rule (" + aop + ")";
+			return nullptr;
+		}
+		return B.CreateAtomicRMW(bop, A[0], A[1], MaybeAlign(), AtomicOrdering::Monotonic, ss);
+	}
+	if (op == "is_uniform") {   // all active lanes hold the same value
+		Value *x = A[0]->getType()->isIntegerTy(32) ? A[0] : B.CreateZExtOrTrunc(A[0], B.getInt32Ty());
+		Value *first = B.CreateIntrinsic(Intrinsic::amdgcn_readfirstlane, {B.getInt32Ty()}, {x});
+		Value *differs = B.CreateICmpNE(x, first);
+		Value *mask = B.CreateIntrinsic(Intrinsic::amdgcn_ballot, {B.getInt32Ty()}, {differs});
+		return B.CreateICmpEQ(mask, B.getInt32(0));
+	}
+	if (op == "tanh") {   // (e - 1) / (e + 1), e = exp(2x), |x| clamped so that e stays finite
+		Value *x = B.CreateBinaryIntrinsic(Intrinsic::minnum, B.CreateBinaryIntrinsic(Intrinsic::maxnum, A[0], fconst(B, RT, -9.0)), fconst(B, RT, 9.0));
+		Value *e = B.CreateUnaryIntrinsic(Intrinsic::exp, B.CreateFMul(x, fconst(B, RT, 2.0)));
+		return B.CreateFDiv(B.CreateFSub(e, fconst(B, RT, 1.0)), B.CreateFAdd(e, fconst(B, RT, 1.0)));
+	}
+	if (op == "popcount")
+		return B.CreateUnaryIntrinsic(Intrinsic::ctpop, A[0]);
+	if (op == "fmod")
+		return B.CreateFRem(A[0], A[1]);
+	if (op == "simd_max" || op == "simd_min") {
+		const bool mx = op == "simd_max";
+		return elementwise(B, RT, A, [&](IRBuilder<> &b, ArrayRef<Value *> e) -> Value * {
+			Type *T = e[0]->getType();
+			if (T->isFloatTy())
+				return b.CreateIntrinsic(mx ? Intrinsic::amdgcn_wave_reduce_fmax : Intrinsic::amdgcn_wave_reduce_fmin, {T}, {e[0], b.getInt32(0)});
+			if (T->isIntegerTy(32)) {
+				const bool sg = signOf(tok) == 's';
+				return b.CreateIntrinsic(mx ? (sg ? Intrinsic::amdgcn_wave_reduce_max : Intrinsic::amdgcn_wave_reduce_umax)
+				                            : (sg ? Intrinsic::amdgcn_wave_reduce_min : Intrinsic::amdgcn_wave_reduce_umin), {T}, {e[0], b.getInt32(0)});
+			}
+			return nullptr;
+		});
+	}
+	if (op == "simd_shuffle" || op == "simd_shuffle_down" || op == "simd_shuffle_up" || op == "simd_shuffle_xor") {
+		// ds_bpermute: lane l reads the value of lane idx (byte address idx*4); out-of-range deltas read a wrapped lane (Metal: undefined)
+		return elementwise(B, RT, A, [&](IRBuilder<> &b, ArrayRef<Value *> e) -> Value * {
+			Type *T = e[0]->getType();
+			if (!T->isFloatTy() && !T->isIntegerTy(32) && !T->isIntegerTy(16) && !T->isHalfTy())
+				return nullptr;
+			Value *lane = b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_hi, ArrayRef<Value *>{b.getInt32(-1), b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, ArrayRef<Value *>{b.getInt32(-1), b.getInt32(0)})});
+			Value *d = b.CreateZExtOrTrunc(e[1], b.getInt32Ty());
+			Value *src = op == "simd_shuffle" ? d : op == "simd_shuffle_down" ? b.CreateAdd(lane, d) : op == "simd_shuffle_up" ? b.CreateSub(lane, d) : b.CreateXor(lane, d);
+			src = b.CreateAnd(src, b.getInt32(31));
+			Value *as32 = T->isFloatTy() ? b.CreateBitCast(e[0], b.getInt32Ty()) : T->isIntegerTy(32) ? e[0] : b.CreateZExt(T->isHalfTy() ? b.CreateBitCast(e[0], b.getInt16Ty()) : e[0], b.getInt32Ty());
+			Value *r = b.CreateIntrinsic(Intrinsic::amdgcn_ds_bpermute, ArrayRef<Value *>{b.CreateShl(src, 2), as32});
+			if (T->isFloatTy()) return b.CreateBitCast(r, T);
+			if (T->isIntegerTy(32)) return r;
+			Value *t16 = b.CreateTrunc(r, b.getInt16Ty());
+			return T->isHalfTy() ? b.CreateBitCast(t16, T) : t16;
+		});
+	}
 	if (op == "all")
 		return B.CreateAndReduce(A[0]);
 	if (op == "any")
@@ -252,6 +353,12 @@ Value *lowerCall(IRBuilder<> &B, CallInst *CI, StringRef name, std::string *why)
 		B.CreateFence(wg ? AtomicOrdering::Acquire : AtomicOrdering::AcquireRelease, ss);
 		return CI;   // void: sentinel
 	}
+	if (op == "simd_sum" && A[0]->getType()->isVectorTy())
+		return elementwise(B, RT, A, [&](IRBuilder<> &b, ArrayRef<Value *> e) -> Value * {
+			if (!e[0]->getType()->isFloatTy())   // wave.reduce.fadd.f16 cannot be selected on gfx1201 (LLVM 22)
+				return nullptr;
+			return b.CreateIntrinsic(Intrinsic::amdgcn_wave_reduce_fadd, {e[0]->getType()}, {e[0], b.getInt32(0)});
+		});
 	if (op == "simd_sum") {
 		Type *T = A[0]->getType();
 		if (T->isIntegerTy(32))
@@ -285,6 +392,8 @@ void lowerFunction(Function &F, Stats &st) {
 		IRBuilder<> B(CI);
 		std::string why;
 		Value *v = lowerCall(B, CI, name, &why);
+		if (!v && why.empty())
+			why = "no rule";
 		if (!v) {
 			st.unsupported[name.str() + (why == "no rule" ? "" : "  [" + why + "]")]++;
 			continue;
@@ -387,8 +496,11 @@ bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::s
 	// 2. new signature: buffers, then the hidden grid size
 	Type *i32 = Type::getInt32Ty(C);
 	std::vector<Type *> params;
+	std::vector<size_t> tgArgs;   // threadgroup-memory arguments: a byte offset into the dynamic LDS, passed after the grid size
 	for (size_t i = 0; i < infos.size(); i++) {
-		if (infos[i].kind == "air.buffer") {
+		if (infos[i].kind == "air.buffer" && infos[i].aspace == kAirThreadgroup) {
+			tgArgs.push_back(i);
+		} else if (infos[i].kind == "air.buffer") {
 			if (infos[i].aspace != kAirDevice && infos[i].aspace != kAirConstant) {
 				err = "buffer argument " + infos[i].name + " in AIR address space " + std::to_string(infos[i].aspace);
 				return false;
@@ -399,6 +511,8 @@ bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::s
 	const size_t nBuf = params.size();
 	for (int d = 0; d < 3; d++)
 		params.push_back(i32);
+	for (size_t i = 0; i < tgArgs.size(); i++)
+		params.push_back(i32);
 	auto *NFT = FunctionType::get(Type::getVoidTy(C), params, false);
 	Function *NF = Function::Create(NFT, GlobalValue::ExternalLinkage, "", M);
 	NF->setCallingConv(CallingConv::AMDGPU_KERNEL);
@@ -406,10 +520,12 @@ bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::s
 	{
 		size_t bi = 0;
 		for (size_t i = 0; i < infos.size(); i++)
-			if (infos[i].kind == "air.buffer")
+			if (infos[i].kind == "air.buffer" && infos[i].aspace != kAirThreadgroup)
 				NF->getArg(bi++)->setName(infos[i].name.empty() ? "buf" + std::to_string(i) : infos[i].name);
 		for (int d = 0; d < 3; d++)
 			NF->getArg(nBuf + d)->setName(std::string("air.grid.") + dimName[d]);
+		for (size_t t = 0; t < tgArgs.size(); t++)
+			NF->getArg(nBuf + 3 + t)->setName("air.tg." + infos[tgArgs[t]].name + ".offset");
 	}
 	// 3. prologue block: ids, builtins, out-of-grid exit
 	BasicBlock *pro = BasicBlock::Create(C, "air.prologue", NF);
@@ -448,7 +564,16 @@ bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::s
 		const ArgInfo &a = infos[i];
 		Argument *old = F->getArg(i);
 		Value *nv = nullptr;
-		if (a.kind == "air.buffer") {
+		if (a.kind == "air.buffer" && a.aspace == kAirThreadgroup) {
+			size_t t = std::find(tgArgs.begin(), tgArgs.end(), i) - tgArgs.begin();
+			GlobalVariable *dyn = M.getGlobalVariable("air.dynamic_lds");
+			if (!dyn) {
+				dyn = new GlobalVariable(M, ArrayType::get(Type::getInt8Ty(C), 0), false, GlobalValue::ExternalLinkage, nullptr, "air.dynamic_lds", nullptr,
+				                         GlobalValue::NotThreadLocal, kAmdLocal);
+				dyn->setAlignment(Align(16));
+			}
+			nv = B.CreateGEP(Type::getInt8Ty(C), dyn, {NF->getArg(nBuf + 3 + t)});
+		} else if (a.kind == "air.buffer") {
 			nv = NF->getArg(bi++);
 		} else if (a.kind == "air.thread_position_in_grid") {
 			nv = build3(gid, old->getType());
@@ -466,6 +591,10 @@ bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::s
 			nv = B.CreateZExtOrTrunc(flat, old->getType());
 		} else if (a.kind == "air.thread_index_in_simdgroup") {
 			nv = B.CreateZExtOrTrunc(lane, old->getType());
+		} else if (a.kind == "air.threads_per_simdgroup") {
+			nv = ConstantInt::get(old->getType(), 32);
+		} else if (a.kind == "air.simdgroups_per_threadgroup") {
+			nv = ConstantInt::get(old->getType(), (tg[0] * tg[1] * tg[2] + 31) / 32);
 		} else if (a.kind == "air.simdgroup_index_in_threadgroup") {
 			nv = B.CreateZExtOrTrunc(B.CreateLShr(flat, 5), old->getType());
 		} else {
@@ -522,9 +651,40 @@ std::unique_ptr<TargetMachine> makeTM(const std::string &cpu) {
 	return std::unique_ptr<TargetMachine>(T->createTargetMachine(Triple("amdgcn-amd-amdhsa"), cpu, "", opt, Reloc::PIC_, std::nullopt, CodeGenOptLevel::Default));
 }
 
+// AIR "thread" memory is alloca in address space 0; the AMDGPU data layout puts allocas in the private space (5). Re-create each alloca there and cast
+// the result back to a flat pointer, the way clang does for OpenCL/HIP; the back end's address-space inference removes most casts.
+void fixAllocas(Module &M) {
+	for (Function &F : M) {
+		SmallVector<AllocaInst *, 8> as;
+		for (Instruction &I : instructions(F))
+			if (auto *A = dyn_cast<AllocaInst>(&I))
+				if (A->getAddressSpace() != 5)
+					as.push_back(A);
+		for (AllocaInst *A : as) {
+			// lifetime markers must name the alloca itself, not a cast of it: drop them (they only inform optimisation)
+			SmallVector<Instruction *, 4> markers;
+			for (User *U : A->users())
+				if (auto *II = dyn_cast<IntrinsicInst>(U))
+					if (II->isLifetimeStartOrEnd())
+						markers.push_back(II);
+			for (Instruction *m : markers)
+				m->eraseFromParent();
+			auto *N = new AllocaInst(A->getAllocatedType(), 5, A->getArraySize(), A->getAlign(), A->getName(), A->getIterator());
+			auto *C = new AddrSpaceCastInst(N, A->getType(), "", A->getIterator());
+			A->replaceAllUsesWith(C);
+			A->eraseFromParent();
+		}
+	}
+}
+
 void retarget(Module &M, TargetMachine &TM) {
 	M.setTargetTriple(Triple("amdgcn-amd-amdhsa"));
 	M.setDataLayout(TM.createDataLayout());
+	fixAllocas(M);
+	// threadgroup (LDS) globals: AMDGPU accepts only undef/poison initializers; Metal threadgroup memory is uninitialised anyway
+	for (GlobalVariable &G : M.globals())
+		if (G.getAddressSpace() == kAmdLocal && G.hasInitializer() && !isa<UndefValue>(G.getInitializer()))
+			G.setInitializer(PoisonValue::get(G.getValueType()));
 	SmallVector<NamedMDNode *, 8> dead;
 	for (NamedMDNode &n : M.named_metadata())
 		if (n.getName().starts_with("air."))
@@ -684,8 +844,7 @@ int main(int argc, char **argv) {
 				retarget(*M, *TM);
 				for (Function &F : *M)
 					if (!F.isDeclaration()) {
-						F.setCallingConv(CallingConv::AMDGPU_Gfx);
-						F.removeFnAttr("frame-pointer");
+						F.removeFnAttr("frame-pointer");   // callable C-convention functions: amdgpu_gfx/amdgpu_ps are refused under the HSA OS
 					}
 				SmallVector<char, 0> buf;
 				raw_svector_ostream bos(buf);
