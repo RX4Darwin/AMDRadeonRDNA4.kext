@@ -1495,11 +1495,37 @@ void RDNA4Device::dmubPing() {
 		FBLOG("dmub: ping NOT consumed");
 }
 
+void RDNA4Device::displayPowerNote(bool on, const char *path, const char *result) {
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	const uint32_t n = displayPowerEvents++;
+	snprintf(displayPowerHist[n % 16], sizeof(displayPowerHist[0]), "#%u t%llums %s %s: %s", n + 1,
+	         static_cast<unsigned long long>(ns / 1000000ull), on ? "ON" : "OFF", path, result);
+	if (!owner)
+		return;
+	char all[16 * 76 + 8];
+	size_t len = 0;
+	const uint32_t count = displayPowerEvents < 16 ? displayPowerEvents : 16;
+	for (uint32_t i = 0; i < count; i++) {          // oldest first
+		const uint32_t idx = (displayPowerEvents - count + i) % 16;
+		len += snprintf(all + len, sizeof(all) - len, "%s%s", i ? " ## " : "", displayPowerHist[idx]);
+		if (len >= sizeof(all))
+			break;
+	}
+	owner->setProperty("RDNA4FB,DisplayPower", all);
+}
+
 void RDNA4Device::setDisplayPower(bool on) {
-	if (!displaySleepEnabled || on == displayPowerOn)
+	if (!displaySleepEnabled) {
+		displayPowerNote(on, "request", "ignored: rdna4-nosleep=1");
 		return;
-	if (!ipDiscovery.isValid() || !rmmio)
+	}
+	if (on == displayPowerOn)
 		return;
+	if (!ipDiscovery.isValid() || !rmmio) {
+		displayPowerNote(on, "request", "ignored: no discovery/MMIO");
+		return;
+	}
 
 	// HDMI/DVI boot pipe: there is no DP stream or DPCD to toggle. Blank to
 	// solid black with the OPP's display pattern generator, the way
@@ -1529,6 +1555,11 @@ void RDNA4Device::setDisplayPower(bool on) {
 		}
 		FBLOG("power: HDMI display %s via DPG on OPP%u (ctl 0x%08x)",
 		      on ? "unblanked" : "blanked", pipe.opp, regReadDmu(2, kDpgControl + o));
+		{
+			char res[40];
+			snprintf(res, sizeof(res), "DPG ctl 0x%08x", regReadDmu(2, kDpgControl + o));
+			displayPowerNote(on, "HDMI DPG", res);
+		}
 		displayPowerOn = on;
 		return;
 	}
@@ -1559,6 +1590,7 @@ void RDNA4Device::setDisplayPower(bool on) {
 	uint32_t v = regReadDmu(2, kDpVidStreamCntl);
 	if (v == 0xFFFFFFFF) {
 		FBLOG("power: stream register unreadable, leaving display alone");
+		displayPowerNote(on, "DP", "stream register unreadable, display left alone");
 		return;
 	}
 
@@ -1568,6 +1600,11 @@ void RDNA4Device::setDisplayPower(bool on) {
 		regWriteDmu(2, kDpVidStreamCntl, v | kVidStreamEnable);
 		FBLOG("power: display on (sink D0 %s, stream 0x%08x -> 0x%08x)",
 		      acked ? "acked" : "no ack", v, regReadDmu(2, kDpVidStreamCntl));
+		{
+			char res[56];
+			snprintf(res, sizeof(res), "sink D0 %s, stream 0x%08x", acked ? "acked" : "no ack", regReadDmu(2, kDpVidStreamCntl));
+			displayPowerNote(true, "DP stream", res);
+		}
 	} else {
 		// Blank the stream, then let the sink drop to D3. The timing
 		// generator keeps running; only the video stream enable is touched.
@@ -1575,6 +1612,11 @@ void RDNA4Device::setDisplayPower(bool on) {
 		bool acked = sinkPower(0x2);
 		FBLOG("power: display off (stream 0x%08x -> 0x%08x, sink D3 %s)",
 		      v, regReadDmu(2, kDpVidStreamCntl), acked ? "acked" : "no ack");
+		{
+			char res[56];
+			snprintf(res, sizeof(res), "sink D3 %s, stream 0x%08x", acked ? "acked" : "no ack", regReadDmu(2, kDpVidStreamCntl));
+			displayPowerNote(false, "DP stream", res);
+		}
 	}
 	displayPowerOn = on;
 }

@@ -30,8 +30,10 @@ IOReturn RDNA4ComputeService::setPowerState(unsigned long powerStateOrdinal,
 	      powerStateOrdinal, nowNs);
 	if (!compute)
 		return kIOPMAckImplied;
-	if (powerStateOrdinal == 0)
+	if (powerStateOrdinal == 0) {
+		compute->powerSleepRequest();    // P7: before powerWillSleep takes rtLock, so a client wait holding it ends with Aborted
 		compute->powerWillSleep();
+	}
 	else if (powerStateOrdinal == 1)
 		compute->powerDidWake();
 	return kIOPMAckImplied;
@@ -99,7 +101,10 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sSubmitIb,   3,          0,                          1,           0 },
 	{ sWaitFence,  2,          0,                          1,           0 },
 	{ sSensorsEx,  0,          0,                          0,           sizeof(RDNA4SensorsEx) },
+	{ sSubmitGfxIb, 3,         0,                          1,           0 },
+	{ sWaitGfxFence, 2,        0,                          1,           0 },
 };
+static_assert(kRDNA4MethodCount == 22, "kMethods has one entry per selector");
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                                             IOExternalMethodDispatch *, OSObject *, void *) {
@@ -222,4 +227,15 @@ IOReturn RDNA4ComputeClient::sWaitFence(OSObject *t, void *, IOExternalMethodArg
 	return self(t)->compute->rtWaitFence(t, static_cast<uint32_t>(a->scalarInput[0]),
 	                                     static_cast<uint32_t>(a->scalarInput[1]),
 	                                     a->scalarOutput[0]);
+}
+
+IOReturn RDNA4ComputeClient::sSubmitGfxIb(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtSubmitGfxIb(t, a->scalarInput[0], a->scalarInput[1],
+	                                       a->scalarInput[2], a->scalarOutput[0]);
+}
+
+IOReturn RDNA4ComputeClient::sWaitGfxFence(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtWaitGfxFence(t, static_cast<uint32_t>(a->scalarInput[0]),
+	                                        static_cast<uint32_t>(a->scalarInput[1]),
+	                                        a->scalarOutput[0]);
 }
