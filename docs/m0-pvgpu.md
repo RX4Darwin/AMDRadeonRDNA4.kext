@@ -1,6 +1,6 @@
 # M0, kext side: the fake Apple paravirtual GPU (hub-task-427)
 
-Branch `premetal/m0` (from `premetal/metal-spike`). Code: `src/pvgpu.{hpp,cpp}`, boot-arg `rdna4-pvgpu=1|2` (default off). Helpers: `tools/m0/pvdis.py` (read Apple's kext), `tools/m0/check-vtable.py` (is our `IOPCIDevice` the one Tahoe has).
+Branch `premetal/m0` (from `premetal/metal-spike`). Code: `src/pvgpu.{hpp,cpp}`, boot-arg `rdna4-pvgpu=1|2` (default off); display side (hub-task-451): `rdna4-pvgpu-disp=<bits>` (bit 0 = report the display *online*, bit 1 = ~60 Hz VBL events for pipes whose guest enabled VBL; default 2, level 2 forces 3) and `rdna4-pvgpu-width=` / `rdna4-pvgpu-height=` (the display's mode, default 1920x1080). Helpers: `tools/m0/pvdis.py` (read Apple's kext), `tools/m0/check-vtable.py` (is our `IOPCIDevice` the one Tahoe has).
 Status words as in `docs/metal-readiness.md`: **measured** = read from Apple's binaries or a run; **inferred** = reasoned, not shown; **code** = written and compiled, not run.
 
 ## What it is, in one paragraph
@@ -54,6 +54,7 @@ Fallbacks if the catalogue does not offer the personality (checked from the `mat
 
 ```
 fake Apple paravirtual GPU published under <GPU name>: PCI 106b:eeee, BAR0 16384 bytes of RAM (control block at +0x1000), level 2; IOPCIDevice is 184 bytes here (header 184)
+host: display side: online event on, VBL events on, mode 1920x1080
 match offered: <bundle> <class> (IOPCIMatch ...) -> no            (up to 40 lines: what IOKit offered the nub; Recovery has no Apple paravirt personality)
 selftest: start
 selftest: config space, capabilities, personality matching        ok
@@ -74,10 +75,10 @@ host: GetDeviceInfo answered: reply buffer page 0x... (4096 bytes, 512 pair slot
 host: root page 0x... mapped (channel state records at +0x400)
 host: channel 3 defined: stamp index 3, ring of 2 pages (8192 bytes) from page list 0x..., counters write 8204 read 8184
 host: fifo @0x20: cmd 0x01 DisplaySetupSharedState, 20 bytes (8 payload), 0 barrier(s), signal 0x2: pipe port 2, shared state page 0x...
-host: display shared state page 0x...: port 2 written at +0x12
+host: display shared state page 0x...: port 2 written at +0x12; display info filled (1920x1080, 1 mode(s), name "RDNA4FB PV", transactions via FIFO 0x06), online event pending (+0x100 bit 2)
 host: stamp[0] = 2 written (FIFO page offset 0x0), INTR_STATUS_GPU bit 0 set, interrupt 0 raised
 host: ch3 @0x1ff8: cmd 0x01 DisplaySetupSharedState, 20 bytes (8 payload), 0 barrier(s), signal 0x7: pipe port 5, shared state page 0x...   (across the child ring's wrap)
-host: display shared state page 0x...: port 5 written at +0x12
+host: display shared state page 0x...: port 5 written at +0x12; display info filled (1920x1080, 1 mode(s), name "RDNA4FB PV", transactions via FIFO 0x06), online event pending (+0x100 bit 2)
 host: stamp[3] = 7 written (FIFO page offset 0xc), INTR_STATUS_GPU bit 3 set, interrupt 0 raised
 selftest: host consumed the FIFO (FIFO_READ caught up with FIFO_WRITTEN)   ok
 selftest: host mapped the announced FIFO page                      ok
@@ -95,11 +96,41 @@ selftest: host raised interrupt 0 for both stamps (root 0, child 3) and the regi
 selftest: INTR_STATUS_GPU bits 0 and 3 dropped again by the host   ok
 selftest: raiseInterrupt(0): handler registered and enabled        ok
 selftest: interrupt delivered once to the event source's action    ok
+selftest: display info in the shared state page: port, 1920x1080 @ 60, cursor 64x64, FIFO 0x06, one mode   ok
+selftest: online event (+0x100 bit 2) pending on both pipes        ok
+selftest: INTR_STATUS_DISP quiet while no pipe is enabled          ok
+host: display pipe 2: enabled mask 0x0 -> 0xc (enable())
+selftest: INTR_STATUS_DISP bit 2 (pipe port 2) set once the pipe is enabled   ok
+selftest: ... and only that bit (pipe 5 is not enabled)            ok
+selftest: signalDisplay finds the online event and clears it       ok
+selftest: INTR_STATUS_DISP bit 2 dropped once the event was taken  ok
+selftest: the interrupt was raised for it                          ok
+host: display pipe 5: enabled mask 0x0 -> 0x1
+host: VBL event 1 on display pipe 5 (+0x100 bit 0)                 (events 1, 2, 3 are logged, then every 600th)
+selftest: VBL: 5..20 events in 250 ms on the pipe that enabled VBL (60 Hz = 15)   ok
+selftest: ... each raised INTR_STATUS_DISP bit 5                   ok
+selftest: no VBL event on the pipe whose guest did not enable it   ok
+selftest: <n> VBL events in 250 ms                                 (n about 15)
+host: display pipe 5: enabled mask 0x1 -> 0x0
+selftest: INTR_STATUS_DISP quiet again after VBL was disabled      ok
+host: ch3 @0x...: cmd 0x02 DisplayProcessOnline, 20 bytes (8 payload), ...: pipe port 5, cookie 0x1
+host: display pipe 5 acknowledged the online event (cookie 0x1, as filled)
+host: ch3 @0x...: cmd 0x05 DisplayUpdateCursorState, ...: pipe port 5, cursor visible
+host: ch3 @0x...: cmd 0x04 DisplayUpdateCursorGlyph, 56 bytes (44 payload), ..., signal 0x0: pipe port 5, task 3, mapping 0x7000, pitch 256, image 64x48 (3, 5), pixel sum 0x99
+host: ch3 @0x...: cmd 0x06 DisplaySubmitTransaction, 24 bytes (12 payload), ..., signal 0x15: pipe port 5, surface 77, task 3
+host: ch3 @0x...: cmd 0x07 DisplaySubmitTransaction2, 48 bytes (36 payload), ..., signal 0x16: pipe port 5, task 3, surface 77, gamma 0 entries (a 0x0, b 0x0, sum 0x0)
+host: ch3 @0x...: cmd 0x1e DisplayFlushChannelEvent, 12 bytes (0 payload), ..., signal 0x17
+host: stamp[3] = 23 written (FIFO page offset 0xc), INTR_STATUS_GPU bit 3 set, interrupt 0 raised
+selftest: the pipe's commands were consumed from its channel ring   ok
+selftest: stamp[3] == 23: the last signal of the batch (SubmitTransaction 21, SubmitTransaction2 22, FlushChannelEvent 23)   ok
+selftest: host counted 2 transactions, 2 cursor commands, 1 flush and the online acknowledgement   ok
+host: display pipe 5 cursor: position (10, 20), visible
+selftest: host noticed the cursor position and visibility in the shared state   ok
 interrupt 0 unregistered
-selftest: host dropped its FIFO, root page and channel mappings when the guest cleared the registers   ok
+selftest: host dropped its FIFO, root page, channel and display pipe mappings when the guest cleared the registers   ok
 selftest: PASS
 ```
-Between them `host: ctrl+0x... a -> b` lines show the register writes the host saw (0x034, 0x004, 0x010, 0x000, 0x030). Any `FAIL` line names the check. A guest panic is data: send the serial tail. [measured: PASS in run 2]
+Between them `host: ctrl+0x... a -> b` lines show the register writes the host saw (0x034, 0x004, 0x010, 0x000, 0x030). Any `FAIL` line names the check. A guest panic is data: send the serial tail. [measured: PASS in runs 2 and 3; the display lines are **code**, not yet run: hub-task-451 commit d4d053b]
 
 **B. Apple's kext, in a full-install VM** (`rdna4-pvgpu=1`; coordinate with Anvil, hub-task-427; `tools/m0/vm-check.sh` collects items 2-4 over ssh. Anvil's VM, measured status 2026-10-01: being installed, `tools/emu-full.sh oc --kext <kext> --args "... rdna4-pvgpu=1"`, serial log like Kiln's, **no emulated RDNA4 device yet**, so the nub is published by the fallback: `RDNA4PvNub::publishLater` publishes it under the platform expert 25 s after plugin start when the GPU path never ran): the checks, in order:
 1. Our log: `pvgpu: fake Apple paravirtual GPU published ...`, and a `match offered: com.apple.driver.AppleParavirtGPU AppleParavirtGPUControl (IOPCIMatch 0xEEEE106B) -> MATCH` line. No such line = the catalogue never offered Apple's personality (fallback (a) above).
@@ -173,11 +204,11 @@ In the order they should happen after the reply (`rdna4-pvgpu=1` in Anvil's full
 
 1. **Our log:** `host: fifo @0x...: cmd 0x3a GetDeviceInfo, 24 bytes ... reply buffer page 0x..., 4096 bytes` then `host: GetDeviceInfo answered: ... 31 pairs written, GpuCoreCount 64` then `host: stamp[0] = N written ... interrupt 0 raised`. Not seen: the driver did not get that far (look at the earlier steps in Tests B).
 2. **`Accelerator::start` returns true and `registerService()` publishes the accelerator**: `ioreg -c AppleParavirtAccelerator` shows it with `MetalPluginName AppleParavirtGPUMetal` and `MetalPluginClassName AppleParavirtDevice`; `IOAccelerator` matching now finds it. Nothing in `Accelerator::start` waits after this.
-3. **The display pipe sets itself up (child-ring polling, hub-task-447).** `AppleParavirtGPUControl` is an `IOFramebuffer` (display count register +0x22c = 0 is taken as one pipe). `AppleParavirtDisplayPipe::init` creates its **own virtual channel named "Display"**: our log shows the channel record being read and the channel defined, `host: root page 0x... mapped`, `host: fifo @...: cmd 0x30 DefineChannel ... channel N` and `host: channel N defined: stamp index K, ring of 16 pages ...`; then `setupSharedState` sends `0x01 DisplaySetupSharedState {u32 port, u32 page}` on that ring and waits for its stamp: `host: chN @...: cmd 0x01 DisplaySetupSharedState ... pipe port P`, `host: display shared state page 0x...: port P written at +0x12`, `host: stamp[K] = V written ..., INTR_STATUS_GPU bit K set`. The driver then asserts `fSharedState->port == fPort` (u16 at +0x12; a mismatch would panic the kernel) and the pipe is set up. **If the log shows the `DefineChannel` but no `channel N defined` line, the record or the page list was not what the host expects** (the host logs the record words when the page list is missing); if it shows the channel defined but no command, the guest did not ring the doorbell or the ring is empty; if Apple logs `timed out waiting for stamp` the stamp index is not the record's `kind` as assumed [INFER: `kind` = the channel index the event machine uses].
-   **The next stall (INFER).** Only `setupSharedState` waits for the host inside the display pipe (`finishEvent`; `process_online`, `flushChannelEvent`, `submitTransaction` and the cursor updates submit without waiting). After setup the pipe keeps submitting on the Display ring: `0x02 DisplayProcessOnline`, `0x1e DisplayFlushChannelEvent`, `0x06/0x07 DisplaySubmitTransaction`, `0x04/0x05` cursor updates; **the host logs and consumes them but completes nothing**. What WindowServer then needs is the **display's vertical blank and transaction completion**: the driver's interrupt handler passes `INTR_STATUS_DISP` (ctrl+0x14) to the display machine, and `AppleParavirtDisplayPipe::signalDisplay` reads/clears pending bits at **shared-state page +0x100** against the enabled mask at **+0x104** (`enable()` sets it to 0xc; bit 0 -> `signalVBLInterrupt`, bits 2/3 -> the transaction events at members 0x358/0x360). So **with the Display pipe up but no display interrupts, WindowServer's vsync and flip transactions never complete**: the framebuffer is attached but unusable. That (VBL generation and transaction completion from the host) is the next work item on the display side; the Metal side (item 4) is independent of it.
+3. **The display pipe sets itself up (child-ring polling, hub-task-447; display side, hub-task-451, details in `docs/m1-stream.md` s.1b).** `AppleParavirtGPUControl` is an `IOFramebuffer` (display count register +0x22c = 0 is taken as one pipe). `AppleParavirtDisplayPipe::init` creates its **own virtual channel**, number `port + 5` (5 for port 0), with a **one-page ring** [measured: `VirtualChannel::init(accel, port + 5, 8, 0x90, 0x480, "Display<port>", 0x1000, port + 5)`]: our log shows `host: root page 0x... mapped`, `host: fifo @...: cmd 0x30 DefineChannel ... channel 5` and `host: channel 5 defined: stamp index K, ring of 1 pages (4096 bytes) from page list 0x...` (K = 5 if the record's `kind` is the channel number [INFER]); then `setupSharedState` sends `0x01 DisplaySetupSharedState {u32 port, u32 page}` on that ring and waits for its stamp: `host: ch5 @...: cmd 0x01 DisplaySetupSharedState ... pipe port 0`, `host: display shared state page 0x...: port 0 written at +0x12`, `host: stamp[K] = V written ..., INTR_STATUS_GPU bit K set`. The driver then asserts `fSharedState->port == fPort` (u16 at +0x12; a mismatch would panic the kernel) and reads the u32 at +0x1c (0: transactions are FIFO 0x06). **If the log shows the `DefineChannel` but no `channel N defined` line, the record or the page list was not what the host expects** (the host logs the record words when the page list is missing); if it shows the channel defined but no command, the guest did not ring the doorbell or the ring is empty; if Apple logs `timed out waiting for stamp` the stamp index is not the record's `kind` as assumed.
+   **The display side after setup [measured in the kext, hub-task-451].** Only `setupSharedState` waits. What follows needs the host in two ways, and the first brief had one of them wrong: **(a) bits 2 and 3 of the pending word (+0x100) are display *online/offline*, not transaction events.** Without an online event the pipe never calls `connectionChange`: **no display is ever reported to IOFramebuffer** (no connection, no EDID, no mode): this is the real next stall, and `rdna4-pvgpu-disp=1` (or 3) removes it: after the answer to 0x01 the host fills the display info (name, 1920x1080, one mode at 60 Hz, cursor 64x64, FIFO 0x06) and sets +0x100 bit 2; the guest's `enable()` stores the enabled mask 0xc and signals its own pending bits, so `process_online` runs, builds the mode list and an EDID, sets `ParavirtDisplayPrefs`, and sends **0x02 DisplayProcessOnline {port, cookie}** (our log: `display pipe N acknowledged the online event`). Log lines to expect in order: `host: display pipe N: enabled mask 0x0 -> 0xc (enable())`, `host: chK @...: cmd 0x02 DisplayProcessOnline`, `host: display pipe N acknowledged the online event (cookie 0x1, as filled)`. **(b) VBL for the accelerator side** (`enableVBLInterrupt`, +0x104 bit 0): the host sets +0x100 bit 0 once per ~16.7 ms and asserts `INTR_STATUS_DISP` bit `port` (level-triggered until the guest's `signalDisplay` takes the pending word): `host: display pipe N: enabled mask 0xc -> 0xd`, `host: VBL event 1 on display pipe N (+0x100 bit 0)`. The framebuffer's *own* `'vbl '` interrupt (what WindowServer paces on) is a guest-side timer and needs none of this. **Transaction completion needs no display-specific signal**: `SubmitTransaction` (0x06 `{port, surface, task}` or, when the host sets +0x1c, 0x07 with the gamma table) is attached to a fence that completes when the pipe channel's stamp reaches the command's `signal`: the generic stamp store the host already does after every batch (`stamp[K] = signal`, `INTR_STATUS_GPU` bit K). The commands are logged with their fields (`cmd 0x06 DisplaySubmitTransaction ... surface S, task T`); `host: ctrl+0x220 (cursor kick)` and `display pipe N cursor: position (x, y), visible` show the hardware-cursor path (the driver negotiates version 6, which selects it).
 4. **User space, if Metal runs in the VM:** `-[AppleParavirtDevice initWithAcceleratorPort:]` runs the generic `MTLIOAccelDevice` init (E1c: type 5/6 selectors, served by Apple's own kernel classes now), then `setupDeviceInfo` (selector 0x105: our values + the feature flags), `setupCompiler` (`libAppleParavirtCompilerPlugin`), `setupResourcePools`; the first `newCommandQueue` and the first command buffer produce Exec-ring traffic (`0x37 ExecIndirect`) that the host cannot see yet either.
 
-So **"M0 passed" = the log shows `GetDeviceInfo answered`, `ioreg` shows the accelerator, the Display channel is defined and its `DisplaySetupSharedState` answered (`stamp[K]` line), and nothing waits any more inside the driver**; what is still missing after that is the display interrupts (item 3, next stall) and everything user-space (item 4). A panic instead means one of: an assertion on a reply (items 3/4), a BAR/config access the nub does not model, or the interrupt path (`registerInterrupt` for index 0 must have been logged before the first stamp).
+So **"M0 passed" = the log shows `GetDeviceInfo answered`, `ioreg` shows the accelerator, the Display channel is defined and its `DisplaySetupSharedState` answered (`stamp[K]` line), and nothing waits any more inside the driver**; the **display side** is a second run of the same kind with `rdna4-pvgpu-disp=3` (the `acknowledged the online event` line, `ioreg -c AppleParavirtFramebuffer` / `IODisplayConnect` showing a connection with the 1920x1080 mode and the registry property `ParavirtDisplayPrefs`; VBL lines when something enables VBL; transactions logged and completed by stamps once WindowServer attaches); what is still missing after that is everything user-space (item 4). A panic instead means one of: an assertion on a reply (items 3/4), a BAR/config access the nub does not model, or the interrupt path (`registerInterrupt` for index 0 must have been logged before the first stamp).
 
 ## Open items / unknowns
 
