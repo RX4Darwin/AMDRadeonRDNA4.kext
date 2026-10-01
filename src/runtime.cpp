@@ -1827,6 +1827,10 @@ IOReturn RDNA4Compute::rtOpenPooled(const void *owner, uint32_t slot, RtClient *
 	flushHdp();
 	c->kernargCpu = poolDw(c->poolOff + kVmKernarg);
 	c->fenceCpu = poolDw(c->poolOff + kVmFence);
+	/* W12k: the client's gfx fence dword (same page, zeroed above), as rtOpenInner and rtOpenShared set it: without it SubmitGfxIb answers
+	 * 'resource shortage' and the gfx client self-test fails 'setup' (Kiln's boot 13 + rdna4-vmshared=2 dry run). */
+	c->gfxFenceCpu = poolDw(c->poolOff + kVmFence + kGfxFenceSlot);
+	c->gfxFenceMc = poolMc(c->poolOff + kVmFence + kGfxFenceSlot);
 	c->nextVa += 4 * 0x1000;
 	c->fenceVa = c->nextVa; c->nextVa += 0x1000;
 	c->kernargVa = c->nextVa; c->nextVa += 0x1000;
