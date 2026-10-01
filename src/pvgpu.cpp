@@ -6,6 +6,7 @@
 //
 
 #include "pvgpu.hpp"
+#include "pvstream.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOInterruptEventSource.h>
@@ -124,6 +125,9 @@ private:
 	uint64_t mConsumed { 0 };
 	uint32_t mPackets { 0 };
 	uint64_t mTicks { 0 };
+	uint32_t mCmds { 0 };               // FIFO commands decoded so far
+	uint32_t mBadHeaders { 0 };
+	uint8_t mWin[1024] {};              // one FIFO command copied out of the ring for decoding
 
 	// self-test state machine (level 2)
 	enum Step { kStepIdle, kStepWaitFifo, kStepWaitInterrupt, kStepDone } mStep { kStepIdle };
@@ -254,15 +258,46 @@ void RDNA4PvHost::pollFifo() {
 		c[kRegFifoRead / 4] = written;
 		return;
 	}
-	if (mPackets++ < 80) {
-		uint8_t buf[64];
-		const uint32_t take = n < sizeof(buf) ? n : static_cast<uint32_t>(sizeof(buf));
-		for (uint32_t i = 0; i < take; i++)
-			buf[i] = ring[(read + i) % ringLen];
-		char hex[sizeof(buf) * 2 + 1];
-		for (uint32_t i = 0; i < take; i++)
-			snprintf(hex + i * 2, 3, "%02x", buf[i]);
-		pvlog("host: fifo +%u bytes at ring offset 0x%x: %s%s", n, read % ringLen, hex, n > take ? "..." : "");
+	// Decode what the guest wrote as FIFO commands ({u16 id, u16 barriers, u32 length, u32 signal, ...}, pvstream.hpp), log each by name and size.
+	uint32_t at = 0;
+	while (at < n) {
+		auto copy = [&](uint32_t from, uint8_t *dst, uint32_t count) {
+			for (uint32_t i = 0; i < count; i++)
+				dst[i] = ring[(read + from + i) % ringLen];
+		};
+		const uint32_t left = n - at;
+		pvstream::FifoCommand c;
+		uint8_t head[pvstream::kFifoHeaderBytes];
+		bool ok = left >= pvstream::kFifoHeaderBytes;
+		if (ok) {
+			copy(at, head, sizeof(head));
+			ok = pvstream::fifoHeader(head, sizeof(head), &c, ringLen) && c.length <= left;
+		}
+		if (!ok) {
+			// Not a command boundary (or a command split across guest writes): show the bytes once and give up on this batch.
+			if (mBadHeaders++ < 12) {
+				uint8_t raw[32];
+				const uint32_t take = left < sizeof(raw) ? left : static_cast<uint32_t>(sizeof(raw));
+				copy(at, raw, take);
+				char hex[sizeof(raw) * 2 + 1];
+				for (uint32_t i = 0; i < take; i++)
+					snprintf(hex + i * 2, 3, "%02x", raw[i]);
+				pvlog("host: fifo +%u bytes at ring offset 0x%x do not start with a command header: %s%s", left, (read + at) % ringLen, hex, left > take ? "..." : "");
+			}
+			break;
+		}
+		mCmds++;
+		if (mCmds <= 150) {
+			char line[200];
+			if (c.length <= sizeof(mWin)) {
+				copy(at, mWin, c.length);
+				pvstream::describeFifo(mWin, c, line, sizeof(line));
+			} else {
+				snprintf(line, sizeof(line), "cmd 0x%02x %s, %u bytes (too large to decode here)", c.id, pvstream::fifoName(c.id) ? pvstream::fifoName(c.id) : "?", c.length);
+			}
+			pvlog("host: fifo @0x%x: %s", (read + at) % ringLen, line);
+		}
+		at += c.length;
 	}
 	mConsumed += n;
 	c[kRegFifoRead / 4] = written;   // acknowledge everything: AppleParavirtAccelerator::writeFifo spins until the host has read enough
@@ -337,10 +372,12 @@ void RDNA4PvHost::selfTest() {
 
 		// 4. writeFifo: two commands, one of them wrapping the ring; then FIFO_WRITTEN
 		const uint32_t ringLen = 0x10000 - 0x1000;
-		uint32_t written = ringLen - 8;    // start 8 bytes before the end of the ring so the second command wraps
+		uint32_t written = ringLen - 8;    // start 8 bytes before the end of the ring so the first command wraps
 		c[kRegFifoRead / 4] = written;     // (the host's view of where it stands; the poller resynchronises to it on the first announcement)
 		mConsumed = written;
-		static const uint8_t cmd1[16] = { 0x10, 0, 0, 0, 0xde, 0xc0, 0xad, 0xde, 1, 2, 3, 4, 5, 6, 7, 8 };
+		// GetDeviceInfo with its 0x2d record (24 bytes), crossing the ring's end, then DefineChannel 3 (16 bytes): FIFO commands as the driver builds them
+		static const uint8_t cmd1[40] = { 0x3a, 0, 0, 0, 24, 0, 0, 0, 7, 0, 0, 0,   0x2d, 0, 0, 0, 0x00, 0x02, 0, 0, 0x34, 0x12, 0, 0,
+		                                  0x30, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0,   3, 0, 0, 0 };
 		for (uint32_t i = 0; i < sizeof(cmd1); i++)
 			fifo[0x1000 + (written + i) % ringLen] = cmd1[i];
 		written += sizeof(cmd1);

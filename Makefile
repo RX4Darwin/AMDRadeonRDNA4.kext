@@ -73,6 +73,7 @@ CXX_SRCS := \
 	src/userclient.cpp \
 	src/accelcensus.cpp \
 	src/pvgpu.cpp \
+	src/pvstream.cpp \
 	$(LILU)/Library/plugin_start.cpp \
 	src/atombios.cpp \
 	src/ipdiscovery.cpp \
@@ -212,8 +213,14 @@ atomdump: $(ATOMDUMP)
 
 # Runs the kext's AtomBIOS parser (compiled for the host) against the real
 # ROM dump — verifies parsing logic without GPU hardware.
-test: $(ATOMDUMP)
+PVSTREAM_TEST := $(BUILD)/pvstream-test
+$(PVSTREAM_TEST): tools/pvstream-test.cpp src/pvstream.cpp src/pvstream.hpp src/pvopcodes.inc
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 -Wall -O1 -o $@ tools/pvstream-test.cpp src/pvstream.cpp
+
+test: $(ATOMDUMP) $(PVSTREAM_TEST)
 	$(ATOMDUMP) $(FIRMWARE)
+	$(PVSTREAM_TEST)
 	bash tools/check-isa.sh
 
 $(LILU_STAMP): $(LILU)/../hde/hde32.h $(LILU)/../hde/hde64.h
