@@ -20,6 +20,8 @@
 #                   Not combinable with --diag.
 #   --sleep-reset   with boot 11s: trigger the emulator's compute power reset (device property sleep-reset)
 #                   in the sleep window, right after "power: quiesce complete": the power-loss case
+#   --pre "CMD"     with --diag: a shell command the guest runs first, before diagnostic-log.sh
+#                   (e.g. "pmset displaysleepnow; sleep 8"), in the same Terminal session
 #   --keep          leave the VM running afterwards (monitor socket in the run dir)
 #   --no-build      reuse the OpenCore image of the previous run of this boot
 #   -h              this text
@@ -45,7 +47,7 @@ BASE_IMG=${BASE_IMG:-$EMU/images/BaseSystem.img}
 export QEMU_BIN=${QEMU_BIN:-$QEMU_SRC/build/qemu-system-x86_64}   # e.g. $EMU/bin/w13/qemu-system-x86_64
 export PATH="$QEMU_SRC/build:$EMU/local/bin:$PATH"   # qemu-img, mcopy/mdeltree
 
-WAIT=420 EXTRA="" ARGS="" DEV="" KEEP=0 BUILD=1 BOOT="" DIAG=0 CENSUS=0 SLEEPRESET=0
+WAIT=420 EXTRA="" ARGS="" DEV="" KEEP=0 BUILD=1 BOOT="" DIAG=0 CENSUS=0 SLEEPRESET=0 PRE=""
 while [ $# -gt 0 ]; do
 	case $1 in
 		--wait) WAIT=$2; shift ;;
@@ -56,6 +58,7 @@ while [ $# -gt 0 ]; do
 		--diag) DIAG=1 ;;
 		--census) CENSUS=1 ;;
 		--sleep-reset) SLEEPRESET=1 ;;
+		--pre) PRE=$2; shift ;;
 		--no-build) BUILD=0 ;;
 		-h|--help) sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
 		[0-9]*) BOOT=$1 ;;   # a boot of set-boot.sh: 0-13, 9b ...
@@ -113,6 +116,7 @@ if [ "$DIAG" = 1 ]; then
 	cat > "$RUN/share/run-diag.sh" <<'GUEST'
 cp /Volumes/QEMU*/diagnostic-log.sh /Volumes/QEMU*/rdna4-run /tmp/ && cd /tmp || exit 1
 echo RDNA4DIAG-RUNNING > /dev/console
+#PRE
 bash ./diagnostic-log.sh > /tmp/diag.out 2>&1
 (echo RDNA4DIAG-BEGIN; cat /tmp/diag.out; echo RDNA4DIAG-FULL; cat /tmp/rdna4fb-diag-*.txt; echo RDNA4DIAG-END) |
 	sed 's/^/RDNA4DIAG|/' > /dev/console
