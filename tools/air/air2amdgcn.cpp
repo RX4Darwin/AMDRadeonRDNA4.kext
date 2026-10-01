@@ -8,7 +8,7 @@
 //
 // Kernel ABI produced (the contract between this compiler and the runtime that launches the kernel; "docs/m3-air-spike.md" section 4):
 //   * every !air.buffer argument -> one 8-byte kernarg pointer, in AIR order: AIR address space 1 (device) -> addrspace(1) (global),
-//     AIR address space 2 (constant) -> addrspace(4) (constant); texture/sampler/argument-buffer/imageblock arguments are refused;
+//     AIR address space 2 (constant) -> addrspace(4) (constant), everywhere in the module; texture/sampler/argument-buffer/imageblock arguments are refused;
 //   * then three hidden u32 kernargs: the grid size in THREADS (x, y, z) (dispatchThreads semantic; dispatchThreadgroups = groups * tg);
 //   * threadgroup size is a compile-time constant (--tg), as in a Metal pipeline (maxTotalThreadsPerThreadgroup / dispatch size are known at
 //     pipeline creation); the launch must use groups = ceil(grid / tg) per dimension; threads outside the grid return at once (Metal has no such
@@ -18,6 +18,7 @@
 //     computed in a prologue from workgroup id, workitem id and the hidden grid size; a simdgroup is one wave32;
 //   * threadgroup memory = the module's addrspace(3) globals (static LDS), unchanged.
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticPrinter.h"
@@ -325,14 +326,28 @@ ArgInfo parseArg(const MDNode *n) {
 	return a;
 }
 
-struct AirTypeMapper : ValueMapTypeRemapper {
-	Type *remapType(Type *T) override {
-		if (auto *PT = dyn_cast<PointerType>(T))
-			if (PT->getAddressSpace() == kAirConstant)
-				return PointerType::get(T->getContext(), kAmdConstant);
-		return T;
-	}
-};
+// AIR address spaces: 1 device = AMDGPU global (1), 3 threadgroup = AMDGPU local (3), 2 constant = AMDGPU constant (4) (AMDGPU's own 2 is the region/GDS space).
+// Only the constant space changes number. LLVM cannot change a pointer's address space in place, so the module is printed, "addrspace(2)" and the
+// ".p2" in intrinsic names are rewritten, and it is parsed again: every pointer, GEP, load, global, argument and declaration changes consistently.
+static void replaceAll(std::string &s, const std::string &from, const std::string &to) {
+	for (size_t p = 0; (p = s.find(from, p)) != std::string::npos; p += to.size())
+		s.replace(p, from.size(), to);
+}
+
+std::unique_ptr<Module> remapConstantSpace(std::unique_ptr<Module> M, LLVMContext &C, std::string &err) {
+	std::string text;
+	raw_string_ostream os(text);
+	M->print(os, nullptr);
+	os.flush();
+	replaceAll(text, "addrspace(2)", "addrspace(4)");
+	replaceAll(text, ".p2.", ".p4.");
+	replaceAll(text, ".p2(", ".p4(");
+	SMDiagnostic d;
+	auto R = parseAssemblyString(text, d, C);
+	if (!R)
+		err = "re-parse after the address-space rewrite failed: " + d.getMessage().str();
+	return R;
+}
 
 bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::string &err, Stats &st) {
 	LLVMContext &C = M.getContext();
@@ -463,10 +478,9 @@ bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::s
 	Value *oob = B.getFalse();
 	for (int d = 0; d < 3; d++)
 		oob = B.CreateOr(oob, B.CreateICmpUGE(gid[d], grid[d]));
-	// 4. clone the body with the AIR constant address space (2) mapped to AMDGPU's constant (4)
+	// 4. clone the body into the new signature (the constant address space is already rewritten, see remapConstantSpace)
 	SmallVector<ReturnInst *, 8> rets;
-	AirTypeMapper tm;
-	CloneFunctionInto(NF, F, VMap, CloneFunctionChangeType::GlobalChanges, rets, "", nullptr, &tm);
+	CloneFunctionInto(NF, F, VMap, CloneFunctionChangeType::GlobalChanges, rets, "", nullptr, nullptr);
 	BasicBlock *body = cast<BasicBlock>(VMap[&F->getEntryBlock()]);
 	BasicBlock *exitBB = BasicBlock::Create(C, "air.exit", NF);
 	ReturnInst::Create(C, exitBB);
@@ -602,7 +616,8 @@ int main(int argc, char **argv) {
 		}
 		Stats st;
 		std::string err;
-		if (!lowerKernel(*M, entry, tg, err, st)) {
+		M = remapConstantSpace(std::move(M), ctx, err);
+		if (!M || !lowerKernel(*M, entry, tg, err, st)) {
 			fprintf(stderr, "air2amdgcn: %s: %s\n", inputs[0].c_str(), err.c_str());
 			for (auto &u : st.unsupported)
 				fprintf(stderr, "  unsupported: %s (x%u)\n", u.first.c_str(), u.second);
@@ -643,6 +658,12 @@ int main(int argc, char **argv) {
 				continue;
 			}
 			Stats st;
+			std::string rerr;
+			M = remapConstantSpace(std::move(M), ctx, rerr);
+			if (!M) {
+				printf("{\"file\":\"%s\",\"parse\":false,\"error\":\"%s\"}\n", jsonEscape(in).c_str(), jsonEscape(rerr).substr(0, 200).c_str());
+				continue;
+			}
 			for (Function &F : *M)
 				if (!F.isDeclaration())
 					lowerFunction(F, st);
