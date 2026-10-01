@@ -44,6 +44,7 @@ constexpr uint32_t kRegIntrStatusGpu = 0x018;   // GPU interrupt status: bit i =
 constexpr uint32_t kRegIntrFault = 0x02c;       // fault status (handleFaultInterrupt)
 constexpr uint32_t kRegFifoBasePage = 0x030; // physical page number of the 64 KiB FIFO buffer
 constexpr uint32_t kRegVersion = 0x034;      // driver writes 6 and reads back; the host chooses the version by what it returns
+constexpr uint32_t kRegCursorKick = 0x220;  // written with the port number by DisplayPipe::updateCursorState (hardware-cursor mode, docs/m1-stream.md s.1b); the host polls the shared state instead
 constexpr uint32_t kRegNumDisplays = 0x22c;  // read once by AppleParavirtGPUControl::start; 0 means one, more than 8 is clamped
 } // namespace pvgpu
 

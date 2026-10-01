@@ -21,6 +21,7 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
 #include <libkern/libkern.h>
+#include <pexpert/pexpert.h>
 
 OSDefineMetaClassAndStructors(RDNA4PvNub, IOPCIDevice)
 
@@ -123,7 +124,11 @@ private:
 	void consume(const CmdSource &src, uint32_t read, uint32_t n);
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd);
+	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void completeStamp(uint32_t index, uint32_t value);
+	// display pipes (docs/m1-stream.md s.1b): the shared-state pages the guest announced, the events the host puts into them
+	void dropPipes();
+	void pollDisplay();
 	void unmapFifo();
 	// child channels (docs/m1-stream.md s.1): DefineChannel -> state record in the root page -> page-list ring
 	void mapRoot();
@@ -151,6 +156,32 @@ private:
 	uint32_t mBadHeaders { 0 };
 	uint8_t mWin[1024] {};              // one FIFO command copied out of the ring for decoding
 
+	// Display side. rdna4-pvgpu-disp: bit 0 = report the display online (fill the pipe's info, set the online event), bit 1 = ~60 Hz VBL events for pipes whose
+	// guest enabled VBL; default 2, the self-test runs with 3. rdna4-pvgpu-width / -height set the mode (default 1920x1080).
+	static constexpr uint32_t kDispOnline = 1, kDispVbl = 2;
+	static constexpr uint64_t kVblPeriodNs = 16666667;
+	struct Pipe {
+		bool live { false };
+		IOMemoryDescriptor *desc { nullptr };
+		IOMemoryMap *map { nullptr };
+		uint32_t page { 0 };
+		uint32_t lastEnabled { 0 };
+		uint32_t cursorPos { 0xffffffff };
+		uint8_t cursorVisible { 0 };
+		uint32_t cursorLines { 0 };
+	};
+	Pipe mPipe[pvstream::disp::kMaxPorts];
+	uint32_t mDisp { kDispVbl };
+	pvstream::disp::Info mDispInfo;
+	uint32_t mDispBits { 0 };           // INTR_STATUS_DISP bits asserted: level-triggered, dropped once the guest took the pending event
+	uint64_t mNextVblNs { 0 };
+	uint64_t mLastDispIrqNs { 0 };
+	uint32_t mVblFrames { 0 };          // VBL events set (frames due while some pipe had VBL enabled)
+	uint32_t mOnlineEvents { 0 }, mOnlineAcks { 0 };
+	uint32_t mTransactions { 0 }, mCursorCmds { 0 }, mFlushes { 0 };
+	uint32_t mDispCmdLines { 0 };
+	uint32_t mKickPrev { 0 };
+
 	// Guest-supplied sizes are validated before anything is mapped: at most kMaxChannels channels, rings of at most kMaxRingPages pages.
 	static constexpr uint32_t kMaxChannels = 16;
 	static constexpr uint32_t kMaxRingPages = 256;
@@ -170,7 +201,12 @@ private:
 	uint32_t mChannelPolls { 0 };
 
 	// self-test state machine (level 2)
-	enum Step { kStepIdle, kStepWaitFifo, kStepWaitHostIrq, kStepWaitInterrupt, kStepDone } mStep { kStepIdle };
+	enum Step { kStepIdle, kStepWaitFifo, kStepWaitHostIrq, kStepWaitInterrupt, kStepDisplay, kStepTeardown, kStepDone } mStep { kStepIdle };
+	uint32_t mDispPhase { 0 };
+	uint64_t mDispT0 { 0 };
+	uint32_t mTestVbls { 0 };
+	uint32_t mTestSawBit { 0 };
+	uint32_t mTestExpectTransactions { 0 };
 	uint64_t mStepDeadline { 0 };
 	bool mTestOk { true };
 	IOBufferMemoryDescriptor *mTestFifo { nullptr };
@@ -197,11 +233,12 @@ void hostTick(OSObject *owner, IOTimerEventSource *) {
 	if (auto *h = OSDynamicCast(RDNA4PvHost, owner))
 		h->tick();
 }
-uint64_t nowMs() {
+uint64_t nowNs() {
 	uint64_t abs = mach_absolute_time(), ns = 0;
 	absolutetime_to_nanoseconds(abs, &ns);
-	return ns / 1000000ull;
+	return ns;
 }
+uint64_t nowMs() { return nowNs() / 1000000ull; }
 } // namespace
 
 RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
@@ -212,6 +249,24 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	}
 	h->mNub = nub;
 	h->mLevel = level;
+	uint32_t disp = 0;
+	if (PE_parse_boot_argn("rdna4-pvgpu-disp", &disp, sizeof(disp)))
+		h->mDisp = disp & 3;
+	if (level >= 2)
+		h->mDisp = 3;   // the self-test plays the guest's side of the display events
+	uint32_t w = 0, ht = 0;
+	PE_parse_boot_argn("rdna4-pvgpu-width", &w, sizeof(w));
+	PE_parse_boot_argn("rdna4-pvgpu-height", &ht, sizeof(ht));
+	if (w || ht) {
+		if (w >= 64 && w <= 8192 && ht >= 64 && ht <= 8192) {
+			h->mDispInfo.width = h->mDispInfo.modes[0].width = static_cast<uint16_t>(w);
+			h->mDispInfo.height = h->mDispInfo.modes[0].height = static_cast<uint16_t>(ht);
+		} else {
+			pvlog("host: rdna4-pvgpu-width/-height %u x %u ignored (64..8192 each)", w, ht);
+		}
+	}
+	pvlog("host: display side: online event %s, VBL events %s, mode %ux%u", h->mDisp & kDispOnline ? "on" : "off", h->mDisp & kDispVbl ? "on" : "off",
+	      h->mDispInfo.modes[0].width, h->mDispInfo.modes[0].height);
 	h->mLoop = IOWorkLoop::workLoop();
 	h->mTimer = h->mLoop ? IOTimerEventSource::timerEventSource(h, hostTick) : nullptr;
 	if (!h->mTimer || h->mLoop->addEventSource(h->mTimer) != kIOReturnSuccess) {
@@ -238,6 +293,7 @@ void RDNA4PvHost::tick() {
 	mapRoot();
 	pollFifo();
 	pollChannels();
+	pollDisplay();
 	if (mLevel >= 2)
 		selfTest();
 	if (mTimer)
@@ -250,7 +306,7 @@ void RDNA4PvHost::pollRegisters() {
 		return;
 	for (unsigned i = 0; i < 24; i++) {
 		// FIFO_WRITTEN / FIFO_READ move with every command: they are reported through the packet log, not as register changes.
-		if (i == kRegFifoWritten / 4 || i == kRegFifoRead / 4 || i == kRegIntrStatusGpu / 4)
+		if (i == kRegFifoWritten / 4 || i == kRegFifoRead / 4 || i == kRegIntrStatusGpu / 4 || i == kRegIntrStatusDisp / 4)
 			continue;
 		const uint32_t v = c[i];
 		if (v != mPrev[i]) {
@@ -350,7 +406,8 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			break;
 		}
 		mCmds++;
-		if (mCmds <= 150) {
+		const bool display = c.id == 0x02 || (c.id >= 0x04 && c.id <= 0x07) || c.id == 0x1e;   // the display pipe's commands keep being shown
+		if (mCmds <= 150 || (display && mDispCmdLines++ < 60)) {
 			char line[200];
 			if (c.length <= sizeof(mWin)) {
 				copy(at, mWin, c.length);
@@ -380,6 +437,16 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 				copy(at, mWin, c.length);
 			answerDisplaySharedState(c, mWin);
 		}
+		if (c.id == 0x02 && c.length <= sizeof(mWin)) {
+			copy(at, mWin, c.length);
+			answerDisplayOnline(c, mWin);
+		}
+		if (c.id == 0x06 || c.id == 0x07)
+			mTransactions++;   // completion is the generic stamp below: the pipe's fence waits for the command's signal (docs/m1-stream.md s.1b)
+		else if (c.id == 0x04 || c.id == 0x05)
+			mCursorCmds++;
+		else if (c.id == 0x1e)
+			mFlushes++;
 		if (c.signal) {
 			// the command asks for a stamp when it completes (AppleParavirtCommandAllocator::addSignal): remember the last value of this batch
 			lastSignal = c.signal;
@@ -424,8 +491,10 @@ void RDNA4PvHost::answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t
 }
 
 // DisplaySetupSharedState (FIFO 0x01, AppleParavirtDisplayPipe::setupSharedState): {u32 port, u32 page}. After its wait the driver asserts that the host wrote the
-// pipe's port number into the shared state page as a u16 at +0x12 (a mismatch panics the guest kernel: "fSharedState->port == fPort"), and copies the u32 at
-// +0x1c into the pipe (meaning unknown [INFER: a host-side id]; 0 here).
+// pipe's port number into the shared state page as a u16 at +0x12 (a mismatch panics the guest kernel: "fSharedState->port == fPort") and copies the u32 at +0x1c
+// into the pipe (0 = SubmitTransaction is FIFO 0x06). The page stays mapped: it is where the host's display events go (docs/m1-stream.md s.1b). With the
+// online event on, the host also fills the display's info and sets the *online* pending bit: process_online runs when the guest enables the pipe (enable()
+// signals its own pending bits) or when the interrupt arrives afterwards.
 void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd) {
 	const uint8_t *pl = cmd + c.payloadOffset;
 	if (c.length - c.payloadOffset < 8)
@@ -433,24 +502,137 @@ void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const
 	uint32_t port, page;
 	memcpy(&port, pl, 4);
 	memcpy(&page, pl + 4, 4);
-	if (!page)
-		return;
-	IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(static_cast<IOPhysicalAddress>(page) << 12, 0x1000, kIODirectionInOut);
-	IOMemoryMap *map = desc ? desc->createMappingInTask(kernel_task, 0, kIOMapAnywhere) : nullptr;
-	if (!map) {
-		pvlog("host: cannot map the display shared state page 0x%x", page);
-		OSSafeReleaseNULL(desc);
+	if (!page || port >= pvstream::disp::kMaxPorts) {
+		pvlog("host: DisplaySetupSharedState refused: port %u, page 0x%x (ports 0..%u)", port, page, pvstream::disp::kMaxPorts - 1);
 		return;
 	}
-	uint8_t *va = reinterpret_cast<uint8_t *>(map->getVirtualAddress());
-	const uint16_t port16 = static_cast<uint16_t>(port);
-	const uint32_t zero = 0;
-	memcpy(va + 0x12, &port16, 2);
-	memcpy(va + 0x1c, &zero, 4);
-	__sync_synchronize();
-	map->release();
-	desc->release();
-	pvlog("host: display shared state page 0x%x: port %u written at +0x12", page, port);
+	Pipe &p = mPipe[port];
+	if (p.live) {
+		OSSafeReleaseNULL(p.map);
+		OSSafeReleaseNULL(p.desc);
+		p = Pipe();
+	}
+	p.desc = IOMemoryDescriptor::withPhysicalAddress(static_cast<IOPhysicalAddress>(page) << 12, 0x1000, kIODirectionInOut);
+	p.map = p.desc ? p.desc->createMappingInTask(kernel_task, 0, kIOMapAnywhere) : nullptr;
+	if (!p.map) {
+		pvlog("host: cannot map the display shared state page 0x%x", page);
+		OSSafeReleaseNULL(p.desc);
+		p = Pipe();
+		return;
+	}
+	uint8_t *va = reinterpret_cast<uint8_t *>(p.map->getVirtualAddress());
+	p.page = page;
+	if (mDisp & kDispOnline) {
+		pvstream::disp::Info info = mDispInfo;
+		info.id = port + 1;
+		pvstream::disp::fillInfo(va, port, info);
+		__sync_synchronize();
+		__atomic_fetch_or(reinterpret_cast<uint32_t *>(va + pvstream::disp::kPending), pvstream::disp::kEventOnline, __ATOMIC_SEQ_CST);
+		mOnlineEvents++;
+		pvlog("host: display shared state page 0x%x: port %u written at +0x12; display info filled (%ux%u, %u mode(s), name \"%s\", transactions via FIFO 0x%02x), "
+		      "online event pending (+0x100 bit 2)",
+		      page, port, info.width, info.height, info.modeCount, info.name, info.txnProtocol ? 0x07 : 0x06);
+	} else {
+		const uint16_t port16 = static_cast<uint16_t>(port);
+		const uint32_t zero = 0;
+		memcpy(va + pvstream::disp::kPort, &port16, 2);
+		memcpy(va + pvstream::disp::kTxnProtocol, &zero, 4);
+		__sync_synchronize();
+		pvlog("host: display shared state page 0x%x: port %u written at +0x12", page, port);
+	}
+	p.live = true;
+	p.lastEnabled = *reinterpret_cast<volatile uint32_t *>(va + pvstream::disp::kEnabled);
+	memcpy(&p.cursorPos, va + pvstream::disp::kCursorPos, 4);      // what the guest left there is the baseline for the change log
+	p.cursorVisible = va[pvstream::disp::kCursorVisible];
+}
+
+// DisplayProcessOnline (FIFO 0x02): the guest ran process_online (connectionChange done) and acknowledges with {port, shared+0x200}.
+void RDNA4PvHost::answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd) {
+	const uint8_t *pl = cmd + c.payloadOffset;
+	if (c.length - c.payloadOffset < 8)
+		return;
+	uint32_t port, cookie;
+	memcpy(&port, pl, 4);
+	memcpy(&cookie, pl + 4, 4);
+	mOnlineAcks++;
+	pvlog("host: display pipe %u acknowledged the online event (cookie 0x%x, %s)", port, cookie, cookie == mDispInfo.cookie ? "as filled" : "NOT the filled value");
+}
+
+void RDNA4PvHost::dropPipes() {
+	for (Pipe &p : mPipe) {
+		OSSafeReleaseNULL(p.map);
+		OSSafeReleaseNULL(p.desc);
+		p = Pipe();
+	}
+	if (volatile uint32_t *c = mNub->ctrl())
+		c[kRegIntrStatusDisp / 4] &= ~mDispBits;
+	mDispBits = 0;
+}
+
+// Each tick, for every live pipe: log what the guest enabled and what the cursor does, add a VBL event when a frame is due and the guest enabled VBL, and keep
+// INTR_STATUS_DISP bit `port` asserted for as long as an enabled event is pending (the guest's signalDisplay takes the pending bits atomically, which is what
+// drops it again). Level-triggered on purpose: the handler reads the register when its work-loop thread gets to it, which can be later than our next tick, and a
+// missed *online* event would stall the display for good (a missed stamp costs a timed wait, a missed VBL costs a frame). The interrupt itself is re-raised when
+// a bit is new and otherwise at most every 10 ms.
+void RDNA4PvHost::pollDisplay() {
+	volatile uint32_t *c = mNub->ctrl();
+	if (!c)
+		return;
+	{   // the cursor kick (hardware-cursor mode): informational only, the shared-state fields below carry the data
+		const uint32_t kick = c[kRegCursorKick / 4];
+		if (kick != mKickPrev) {
+			pvlog("host: ctrl+0x%03x (cursor kick) 0x%08x -> 0x%08x", kRegCursorKick, mKickPrev, kick);
+			mKickPrev = kick;
+		}
+	}
+	const uint64_t now = nowNs();
+	bool frame = false;
+	if (mDisp & kDispVbl) {
+		if (!mNextVblNs)
+			mNextVblNs = now + kVblPeriodNs;
+		if (now >= mNextVblNs) {
+			frame = true;
+			// the next frame is one period after the last due time; after a long stall start over instead of firing a burst
+			mNextVblNs = now - mNextVblNs > 4 * kVblPeriodNs ? now + kVblPeriodNs : mNextVblNs + kVblPeriodNs;
+		}
+	}
+	uint32_t want = 0;
+	for (uint32_t port = 0; port < pvstream::disp::kMaxPorts; port++) {
+		Pipe &p = mPipe[port];
+		if (!p.live)
+			continue;
+		uint8_t *va = reinterpret_cast<uint8_t *>(p.map->getVirtualAddress());
+		uint32_t *pending = reinterpret_cast<uint32_t *>(va + pvstream::disp::kPending);
+		const uint32_t enabled = *reinterpret_cast<volatile uint32_t *>(va + pvstream::disp::kEnabled);
+		if (enabled != p.lastEnabled) {
+			pvlog("host: display pipe %u: enabled mask 0x%x -> 0x%x%s", port, p.lastEnabled, enabled,
+			      (enabled & pvstream::disp::kEventOnline) && !(p.lastEnabled & pvstream::disp::kEventOnline) ? " (enable())" : "");
+			p.lastEnabled = enabled;
+		}
+		if (frame && (enabled & pvstream::disp::kEventVbl)) {
+			__atomic_fetch_or(pending, pvstream::disp::kEventVbl, __ATOMIC_SEQ_CST);
+			if (mVblFrames++ < 3 || mVblFrames % 600 == 0)
+				pvlog("host: VBL event %u on display pipe %u (+0x100 bit 0)", mVblFrames, port);
+		}
+		if (__atomic_load_n(pending, __ATOMIC_SEQ_CST) & enabled)
+			want |= 1u << port;
+		// the cursor state the guest keeps in the page (hardware-cursor mode): log changes
+		uint32_t pos;
+		memcpy(&pos, va + pvstream::disp::kCursorPos, 4);
+		const uint8_t visible = va[pvstream::disp::kCursorVisible];
+		if ((pos != p.cursorPos || visible != p.cursorVisible) && p.cursorLines++ < 12)
+			pvlog("host: display pipe %u cursor: position (%u, %u)%s, %s", port, pos & 0xffff, pos >> 16, pos == 0xffffffff ? " [unset]" : "", visible ? "visible" : "hidden");
+		p.cursorPos = pos;
+		p.cursorVisible = visible;
+	}
+	const uint32_t fresh = want & ~mDispBits;
+	if (want != mDispBits)
+		c[kRegIntrStatusDisp / 4] = (c[kRegIntrStatusDisp / 4] & ~mDispBits) | want;
+	mDispBits = want;
+	if (want && (fresh || now - mLastDispIrqNs >= 10000000ull)) {
+		mLastDispIrqNs = now;
+		mNub->raiseInterrupt(0);
+	}
 }
 
 // Completion of a command that asked for a stamp: the driver's event machine tests `*stampPtr[index] >= value` with stampPtr[index] = (FIFO buffer page)+4*index
@@ -516,6 +698,7 @@ void RDNA4PvHost::mapRoot() {
 }
 
 void RDNA4PvHost::dropChannels() {
+	dropPipes();
 	for (Channel &ch : mCh) {
 		OSSafeReleaseNULL(ch.map);
 		OSSafeReleaseNULL(ch.desc);
@@ -829,6 +1012,149 @@ void RDNA4PvHost::selfTest() {
 		if (!mTestIrqSeen && nowMs() < mStepDeadline)
 			return;
 		testCheck(mTestIrqSeen == 1, "interrupt delivered once to the event source's action");
+		mStep = kStepDisplay;
+		mDispPhase = 0;
+		break;
+	}
+	case kStepDisplay: {
+		// The display side, with the test playing the guest's half of AppleParavirtDisplayPipe: enable(), signalDisplay's atomic take of the pending bits,
+		// enableVBLInterrupt, then the pipe's commands on its channel and the cursor fields. Pipe port 2 is the root-FIFO one (page mTestShared), port 5 the
+		// child channel's (page mTestShared2, channel 3, stamp 3).
+		using namespace pvstream::disp;
+		volatile uint32_t *c = reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(mTestBar->getVirtualAddress()) + kCtrl);
+		uint8_t *page1 = static_cast<uint8_t *>(mTestShared->getBytesNoCopy());
+		uint8_t *page2 = static_cast<uint8_t *>(mTestShared2->getBytesNoCopy());
+		auto pending = [](uint8_t *pg) { return reinterpret_cast<uint32_t *>(pg + kPending); };
+		auto enabled = [](uint8_t *pg) { return reinterpret_cast<uint32_t *>(pg + kEnabled); };
+		auto take = [&](uint8_t *pg) {   // DisplayPipe::signalDisplay: clear the enabled bits of the pending word with a compare-exchange, act on those
+			const uint32_t en = __atomic_load_n(enabled(pg), __ATOMIC_SEQ_CST);
+			uint32_t old = __atomic_load_n(pending(pg), __ATOMIC_SEQ_CST);
+			while (!__atomic_compare_exchange_n(pending(pg), &old, old & ~en, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
+			return old & en;
+		};
+		switch (mDispPhase) {
+		case 0: {
+			InfoRead r;
+			readInfo(page1, &r);
+			testCheck(r.port == 2 && r.id == 3 && r.width == 1920 && r.height == 1080 && r.cursorWidth == 64 && r.cursorHeight == 64 && r.txnProtocol == 0 &&
+			              r.count == 1 && r.modes[0].width == 1920 && r.modes[0].height == 1080 && r.modes[0].refresh == (60u << 16) && r.cookie == 1 &&
+			              !strcmp(r.name, "RDNA4FB PV"),
+			          "display info in the shared state page: port, 1920x1080 @ 60, cursor 64x64, FIFO 0x06, one mode");
+			testCheck(__atomic_load_n(pending(page1), __ATOMIC_SEQ_CST) == kEventOnline && __atomic_load_n(pending(page2), __ATOMIC_SEQ_CST) == kEventOnline &&
+			              mOnlineEvents == 2,
+			          "online event (+0x100 bit 2) pending on both pipes");
+			testCheck((c[kRegIntrStatusDisp / 4] & 0xff) == 0, "INTR_STATUS_DISP quiet while no pipe is enabled");
+			mTestIrqSeen = 0;
+			__atomic_store_n(enabled(page1), 0xc, __ATOMIC_SEQ_CST);   // DisplayPipe::enable()
+			mDispT0 = nowMs();
+			mDispPhase = 1;
+			return;
+		}
+		case 1: {
+			if (!(c[kRegIntrStatusDisp / 4] & (1u << 2)) && nowMs() < mDispT0 + 300)
+				return;
+			testCheck(c[kRegIntrStatusDisp / 4] & (1u << 2), "INTR_STATUS_DISP bit 2 (pipe port 2) set once the pipe is enabled");
+			testCheck(c[kRegIntrStatusDisp / 4] == (1u << 2), "... and only that bit (pipe 5 is not enabled)");
+			testCheck(take(page1) == kEventOnline, "signalDisplay finds the online event and clears it");
+			mDispT0 = nowMs();
+			mDispPhase = 2;
+			return;
+		}
+		case 2: {
+			if ((c[kRegIntrStatusDisp / 4] & (1u << 2)) && nowMs() < mDispT0 + 300)
+				return;
+			testCheck(!(c[kRegIntrStatusDisp / 4] & (1u << 2)), "INTR_STATUS_DISP bit 2 dropped once the event was taken");
+			testCheck(mTestIrqSeen >= 1, "the interrupt was raised for it");
+			// enableVBLInterrupt on the child channel's pipe: ~60 Hz for 250 ms
+			__atomic_store_n(enabled(page2), kEventVbl, __ATOMIC_SEQ_CST);
+			mTestVbls = 0;
+			mTestSawBit = 0;
+			mDispT0 = nowMs();
+			mDispPhase = 3;
+			return;
+		}
+		case 3: {
+			if (c[kRegIntrStatusDisp / 4] & (1u << 5))
+				mTestSawBit = 1;
+			if (take(page2) & kEventVbl)
+				mTestVbls++;
+			if (nowMs() < mDispT0 + 250)
+				return;
+			testCheck(mTestVbls >= 5 && mTestVbls <= 20, "VBL: 5..20 events in 250 ms on the pipe that enabled VBL (60 Hz = 15)");
+			testCheck(mTestSawBit, "... each raised INTR_STATUS_DISP bit 5");
+			testCheck(!(__atomic_load_n(pending(page1), __ATOMIC_SEQ_CST) & kEventVbl), "no VBL event on the pipe whose guest did not enable it");
+			pvlog("selftest: %u VBL events in 250 ms", mTestVbls);
+			__atomic_store_n(enabled(page2), 0, __ATOMIC_SEQ_CST);     // disableVBLInterrupt / disable()
+			mDispT0 = nowMs();
+			mDispPhase = 4;
+			return;
+		}
+		case 4: {
+			if (nowMs() < mDispT0 + 20)   // let the host see the mask and drop bit 5
+				return;
+			testCheck((c[kRegIntrStatusDisp / 4] & 0xff) == 0, "INTR_STATUS_DISP quiet again after VBL was disabled");
+			// the pipe's other commands on its channel (child channel 3, ring after the DisplaySetupSharedState written earlier): ProcessOnline ack, cursor state and
+			// glyph, SubmitTransaction 0x06 and 0x07, FlushChannelEvent; the last three carry signals 21, 22, 23
+			const uint32_t chanRing = 0x2000;
+			uint8_t *rootPage = static_cast<uint8_t *>(mTestRoot->getBytesNoCopy());
+			uint8_t *chanMem = static_cast<uint8_t *>(mTestChan->getBytesNoCopy());
+			uint32_t *record = reinterpret_cast<uint32_t *>(rootPage + 0x400 + (3 - 1) * 20);
+			uint32_t words[80];
+			uint32_t n = 0;
+			auto cmd = [&](uint16_t id, uint32_t signal, const uint32_t *payload, uint32_t count) {
+				words[n++] = id;                                    // {u16 id, u16 0}
+				words[n++] = 12 + count * 4;
+				words[n++] = signal;
+				for (uint32_t i = 0; i < count; i++)
+					words[n++] = payload[i];
+			};
+			const uint32_t ack[] = { 5, 1 };                                                                     // ProcessOnline acknowledgement {port, cookie}
+			const uint32_t cursorState[] = { 5, 1 };                                                              // {port, visible}
+			const uint32_t glyph[] = { 5, 3, 0x7000, 0, 0x8000, 0, 256, 0, 64 | (48u << 16), 3 | (5u << 16), 0x99 };   // cursor glyph, 44 bytes
+			const uint32_t txn6[] = { 5, 77, 3 };                                                                  // SubmitTransaction {port, surface, task}
+			const uint32_t txn7[] = { 5, 3, 77, 0, 0, 0, 0, 0, 0 };                                                // SubmitTransaction2: 36 bytes, no gamma table
+			cmd(0x02, 0, ack, 2);
+			cmd(0x05, 0, cursorState, 2);
+			cmd(0x04, 0, glyph, 11);
+			cmd(0x06, 21, txn6, 3);
+			cmd(0x07, 22, txn7, 9);
+			cmd(0x1e, 23, nullptr, 0);                                                                             // FlushChannelEvent: no payload
+			for (uint32_t i = 0; i < n * 4; i++)
+				chanMem[0x1000 + (record[0] + i) % chanRing] = reinterpret_cast<const uint8_t *>(words)[i];
+			__sync_synchronize();
+			record[0] += n * 4;
+			mTestExpectTransactions = mTransactions + 2;
+			mDispT0 = nowMs();
+			mDispPhase = 5;
+			return;
+		}
+		case 5: {
+			const uint32_t *rec = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(mTestRoot->getBytesNoCopy()) + 0x400 + 2 * 20);
+			const volatile uint32_t *stamps = reinterpret_cast<const volatile uint32_t *>(mTestFifo->getBytesNoCopy());
+			if (!(rec[0] == rec[1] && stamps[3] == 23) && nowMs() < mDispT0 + 300)
+				return;
+			testCheck(rec[0] == rec[1], "the pipe's commands were consumed from its channel ring");
+			testCheck(stamps[3] == 23, "stamp[3] == 23: the last signal of the batch (SubmitTransaction 21, SubmitTransaction2 22, FlushChannelEvent 23)");
+			testCheck(mTransactions == mTestExpectTransactions && mCursorCmds == 2 && mFlushes == 1 && mOnlineAcks == 1,
+			          "host counted 2 transactions, 2 cursor commands, 1 flush and the online acknowledgement");
+			// the cursor fields the guest keeps in the shared state (hardware-cursor mode)
+			const uint32_t pos = 10 | (20u << 16);
+			memcpy(page2 + kCursorPos, &pos, 4);
+			page2[kCursorVisible] = 1;
+			mDispT0 = nowMs();
+			mDispPhase = 6;
+			return;
+		}
+		default: {
+			if (nowMs() < mDispT0 + 20)
+				return;
+			testCheck(mPipe[5].cursorPos == (10u | (20u << 16)) && mPipe[5].cursorVisible == 1, "host noticed the cursor position and visibility in the shared state");
+			mStep = kStepTeardown;
+			return;
+		}
+		}
+	}
+	case kStepTeardown: {
 		// teardown, in the order Apple's driver would: interrupts, FIFO registers, buffers
 		if (mTestSource) {
 			mTestSource->disable();
@@ -852,7 +1178,8 @@ void RDNA4PvHost::selfTest() {
 	case kStepDone: {
 		if (nowMs() >= mStepDeadline) {
 			if (mTestFifo) {
-				testCheck(mFifoMap == nullptr && mRootMap == nullptr && !mCh[3].live, "host dropped its FIFO, root page and channel mappings when the guest cleared the registers");
+				testCheck(mFifoMap == nullptr && mRootMap == nullptr && !mCh[3].live && !mPipe[2].live && !mPipe[5].live && mDispBits == 0,
+				          "host dropped its FIFO, root page, channel and display pipe mappings when the guest cleared the registers");
 				mTestFifo->complete();
 				OSSafeReleaseNULL(mTestFifo);
 			}
