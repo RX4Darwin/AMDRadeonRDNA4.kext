@@ -72,6 +72,7 @@ CXX_SRCS := \
 	src/vmshared.cpp \
 	src/userclient.cpp \
 	src/accelcensus.cpp \
+	src/pvgpu.cpp \
 	$(LILU)/Library/plugin_start.cpp \
 	src/atombios.cpp \
 	src/ipdiscovery.cpp \
