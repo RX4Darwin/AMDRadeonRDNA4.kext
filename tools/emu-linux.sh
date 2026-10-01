@@ -121,6 +121,14 @@ bash ./diagnostic-log.sh > /tmp/diag.out 2>&1
 (echo RDNA4DIAG-BEGIN; cat /tmp/diag.out; echo RDNA4DIAG-FULL; cat /tmp/rdna4fb-diag-*.txt; echo RDNA4DIAG-END) |
 	sed 's/^/RDNA4DIAG|/' > /dev/console
 GUEST
+	if [ -n "$PRE" ]; then
+		python3 - "$RUN/share/run-diag.sh" "$PRE" <<'PY'
+import sys
+p, pre = sys.argv[1], sys.argv[2]
+s = open(p).read().replace("#PRE\n", pre + "\necho RDNA4DIAG-PRE-DONE > /dev/console\n", 1)
+open(p, "w").write(s)
+PY
+	fi
 	export EXTRA_QEMU="${EXTRA_QEMU:-} -drive id=share,if=none,format=raw,readonly=on,file=fat:ro:$RUN/share -device usb-storage,bus=xhci.0,drive=share"
 fi
 if [ "$CENSUS" = 1 ]; then
