@@ -4,10 +4,20 @@
 Clean-room parser written from the bytes of the macOS 26.6.2 metallibs (docs/m3-air-spike.md) and the public
 write-ups (worthdoingbadly.com/metalbitcode, YuAo/MetalLibraryArchive layout notes). No Apple code is used.
 
-Layout as observed (all little endian):
+Three container kinds occur in the macOS 26.6.2 install:
+  MTLB     the metallib proper (below).
+  FAT      a big-endian Mach-O-style fat archive (0xcafebabe): slice 0 is an MTLB (AIR), the others are Mach-O images of
+           precompiled native Apple-GPU code (cputype 0x01000013), one per AGX generation. QuartzCore/CoreImage/RenderBox
+           "default.metallib" and "*_archive_bin.metallib" are like this. Only the MTLB slice is AIR.
+  BUILTIN  AGX's internal builtin library (AGXMetal*/Resources/*_rt.metallib, tensor.metallib, ...): u32 count, then
+           count x (NUL-terminated name, u32 offset); at each offset a u32 size and that many bytes of wrapped bitcode.
+
+MTLB layout as observed (all little endian; the meaning of the first fields follows the `file(1)` magic file that ships with macOS,
+usr/share/file/magic/metallib):
   0x00  "MTLB"
-  0x04  u16 target (0x8001 on every macOS file seen), u16 file version major, u16 minor,
-        u16 os-type word (0x8100), u16 os major, u16 os minor           [field meanings: INFER]
+  0x04  u16 (0x8000 | container version major; 0x8001 = macOS), u16 minor, u16 patch   (here 1.2.9)
+  0x0a  u8 file type (0 executable, 1 core image library, 2 dynlib, 3 companion; 0x80 bit = stub), u8 platform (0x81 = macOS)
+  0x0c  u16 os major, u16 os minor
   0x10  u64 file size
   0x18  u64 function-list offset, size          (offset 0x58: u32 count, then count entries)
   0x28  u64 public-metadata offset, size
@@ -54,12 +64,13 @@ class Function:
     off_private: int = 0
     off_bitcode: int = 0
     module_size: int = 0
+    abs_off: int = 0          # offset of the (wrapped) module in the file
     air_version: tuple = ()
     tags: dict = field(default_factory=dict)  # tags this parser does not interpret, raw bytes
 
     @property
     def type_name(self):
-        return FUNC_TYPES.get(self.type, "type%d" % self.type)
+        return FUNC_TYPES.get(self.type, "type%d" % self.type) if self.type >= 0 else "builtin"
 
 
 @dataclass
@@ -72,10 +83,15 @@ class Metallib:
     os_version: tuple
     sections: dict
     functions: list
+    kind: str = "MTLB"
+    slice_off: int = 0      # offset of this container inside the file (FAT slice)
+    native_slices: int = 0  # FAT: number of non-AIR (native GPU Mach-O) slices next to it
 
 
-def parse(data, path="?"):
-    """data: bytes-like (mmap ok). Raises FormatError when the container does not look like MTLB."""
+def parse_mtlb(whole, path="?", base=0, size=None):
+    """The MTLB container that starts at whole[base:base+size]. Raises FormatError when it does not look like one."""
+    size = len(whole) - base if size is None else size
+    data = memoryview(whole)[base:base + size]
     if len(data) < 0x58 or bytes(data[:4]) != b"MTLB":
         raise FormatError("not an MTLB container")
     target, vmaj, vmin, osw, osmaj, osmin = struct.unpack_from("<6H", data, 4)
@@ -121,30 +137,79 @@ def parse(data, path="?"):
                 fn.tags[tag.decode()] = v
         if o != end:
             raise FormatError("function %d: entry size says 0x%x, tags end at 0x%x" % (i, end, o))
+        fn.abs_off = base + bo + fn.off_bitcode
         funcs.append(fn)
         pos = end
-    return Metallib(path, len(data), target, (vmaj, vmin), osw, (osmaj, osmin), sections, funcs)
+    return Metallib(path, len(data), target, (vmaj, vmin), osw, (osmaj, osmin), sections, funcs, "MTLB", base)
 
 
-def module_bytes(data, lib, fn, wrapped=False):
+def parse_fat(whole, path="?"):
+    """FAT archive -> the MTLB libs among its slices (normally one), each with native_slices filled in."""
+    magic, n = struct.unpack_from(">II", whole, 0)
+    if magic != 0xCAFEBABE or n == 0 or n > 64:
+        raise FormatError("not a fat archive")
+    libs, native = [], 0
+    for i in range(n):
+        _ct, _cs, off, sz, _al = struct.unpack_from(">iIIII", whole, 8 + 20 * i)
+        if bytes(whole[off:off + 4]) == b"MTLB":
+            libs.append(parse_mtlb(whole, path, off, sz))
+        else:
+            native += 1
+    if not libs:
+        raise FormatError("fat archive without an MTLB slice")
+    for lb in libs:
+        lb.kind, lb.native_slices = "FAT", native
+    return libs
+
+
+def parse_builtin(whole, path="?"):
+    """AGX builtin library: u32 count, count x (NUL-terminated name, u32 offset); at the offset u32 size + wrapped bitcode."""
+    if len(whole) < 8:
+        raise FormatError("too small")
+    count = struct.unpack_from("<I", whole, 0)[0]
+    if count == 0 or count > 100000:
+        raise FormatError("not a builtin table")
+    pos, funcs = 4, []
+    for i in range(count):
+        e = bytes(whole[pos:pos + 256]).find(b"\0")
+        if e <= 0:
+            raise FormatError("builtin %d: no name" % i)
+        name = bytes(whole[pos:pos + e]).decode("ascii", "replace")
+        off = struct.unpack_from("<I", whole, pos + e + 1)[0]
+        pos += e + 5
+        if off + 8 > len(whole):
+            raise FormatError("builtin %d: offset outside the file" % i)
+        sz = struct.unpack_from("<I", whole, off)[0]
+        if struct.unpack_from("<I", whole, off + 4)[0] != WRAPPER_MAGIC or off + 4 + sz > len(whole):
+            raise FormatError("builtin %d (%s): no wrapped bitcode at 0x%x" % (i, name, off))
+        funcs.append(Function(index=i, name=name, module_size=sz, abs_off=off + 4))
+    return Metallib(path, len(whole), 0, (0, 0), 0, (0, 0), {}, funcs, "BUILTIN")
+
+
+def module_bytes(data, fn, wrapped=False):
     """The function's bitcode (raw "BC C0DE" by default; the wrapper too when wrapped)."""
-    a = lib.sections["bitcode"][0] + fn.off_bitcode
+    a = fn.abs_off
     if fn.module_size == 0 or a + fn.module_size > len(data):
         raise FormatError("%s: module 0x%x+0x%x outside the file" % (fn.name, a, fn.module_size))
     m = bytes(data[a:a + fn.module_size])
     if struct.unpack_from("<I", m, 0)[0] == WRAPPER_MAGIC:
         _, _, off, size, _ = struct.unpack_from("<5I", m, 0)
-        raw = m[off:off + size]
-        return m if wrapped else raw
+        return m if wrapped else m[off:off + size]
     if m[:4] == RAW_MAGIC:
         return m
     raise FormatError("%s: neither a bitcode wrapper nor raw bitcode (first bytes %s)" % (fn.name, m[:8].hex()))
 
 
-def open_lib(path):
+def open_file(path):
+    """(mmap, [Metallib]) for any of the three container kinds. Raises FormatError for a file that is none of them."""
     f = open(path, "rb")
     data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    return data, parse(data, path)
+    head = bytes(data[:4])
+    if head == b"MTLB":
+        return data, [parse_mtlb(data, path)]
+    if head == b"\xca\xfe\xba\xbe":
+        return data, parse_fat(data, path)
+    return data, [parse_builtin(data, path)]
 
 
 def safe(name):
@@ -163,29 +228,34 @@ def main():
     pe.add_argument("--name", help="only functions whose name matches this regex")
     pe.add_argument("--wrapped", action="store_true", help="keep the 0x0b17c0de wrapper")
     a = ap.parse_args()
-    data, lib = open_lib(a.file)
+    data, libs = open_file(a.file)
     if a.cmd == "list":
         if a.json:
-            json.dump({"path": lib.path, "size": lib.size, "target": lib.target, "file_version": lib.file_version,
-                       "os_version": lib.os_version, "functions": [{"name": f.name, "type": f.type_name, "module_size": f.module_size,
-                       "air_version": f.air_version, "hash": f.hash.hex(), "tags": {k: v.hex() for k, v in f.tags.items()}} for f in lib.functions]},
-                      sys.stdout, indent=1)
+            json.dump([{"path": lib.path, "kind": lib.kind, "size": lib.size, "target": lib.target, "file_version": lib.file_version,
+                        "os_version": lib.os_version, "native_slices": lib.native_slices,
+                        "functions": [{"name": f.name, "type": f.type_name, "module_size": f.module_size, "air_version": f.air_version,
+                                       "hash": f.hash.hex(), "tags": {k: v.hex() for k, v in f.tags.items()}} for f in lib.functions]}
+                       for lib in libs], sys.stdout, indent=1)
             print()
             return
-        print("%s: MTLB target=0x%04x file v%d.%d os %d.%d, %d bytes, %d functions" % (lib.path, lib.target, *lib.file_version, *lib.os_version, lib.size, len(lib.functions)))
-        for f in lib.functions:
-            print("%4d %-12s %9d  air %s  %s" % (f.index, f.type_name, f.module_size, ".".join(map(str, f.air_version[:2])), f.name))
+        for lib in libs:
+            print("%s: %s target=0x%04x container v%d.%d os %d.%d, %d bytes, %d functions%s" % (
+                lib.path, lib.kind, lib.target, *lib.file_version, *lib.os_version, lib.size, len(lib.functions),
+                ", %d native-GPU slices not listed" % lib.native_slices if lib.native_slices else ""))
+            for f in lib.functions:
+                print("%4d %-12s %9d  air %s  %s" % (f.index, f.type_name, f.module_size, ".".join(map(str, f.air_version[:2])), f.name))
         return
     os.makedirs(a.outdir, exist_ok=True)
     rx = re.compile(a.name) if a.name else None
     n = 0
-    for f in lib.functions:
-        if rx and not rx.search(f.name):
-            continue
-        out = os.path.join(a.outdir, "%04d_%s.bc" % (f.index, safe(f.name)))
-        with open(out, "wb") as fh:
-            fh.write(module_bytes(data, lib, f, a.wrapped))
-        n += 1
+    for lib in libs:
+        for f in lib.functions:
+            if rx and not rx.search(f.name):
+                continue
+            out = os.path.join(a.outdir, "%04d_%s.bc" % (f.index, safe(f.name)))
+            with open(out, "wb") as fh:
+                fh.write(module_bytes(data, f, a.wrapped))
+            n += 1
     print("wrote %d module(s) to %s" % (n, a.outdir))
 
 
