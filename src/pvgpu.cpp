@@ -458,12 +458,12 @@ bool RDNA4PvNub::build() {
 	return true;
 }
 
-void RDNA4PvNub::patchVtable() {
+void **RDNA4PvNub::patchVtable() {
 	void **orig = *reinterpret_cast<void ***>(this);
 	void **copy = static_cast<void **>(IOMalloc(kVtableSlots * sizeof(void *)));
 	if (!copy) {
 		pvlog("vtable copy failed: the Tahoe-only IOPCIDevice slots keep their real (bridge-dependent) implementations");
-		return;
+		return nullptr;
 	}
 	memcpy(copy, orig, kVtableSlots * sizeof(void *));
 	copy[kSlotConfigRead32] = reinterpret_cast<void *>(&tRead32);
@@ -475,14 +475,21 @@ void RDNA4PvNub::patchVtable() {
 	copy[kSlotConfigureInterrupts] = reinterpret_cast<void *>(&tConfigureInterrupts);
 	copy[kSlotDeviceMemoryRead] = reinterpret_cast<void *>(&tDevRead);
 	copy[kSlotDeviceMemoryWrite] = reinterpret_cast<void *>(&tDevWrite);
-	*reinterpret_cast<void ***>(this) = copy;   // the nub is never released, so the copy is never orphaned
+	*reinterpret_cast<void ***>(this) = copy;   // a published nub is never released, so the copy is never orphaned; publish() frees it if attach fails
+	return copy;
 }
 
 bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
-	if (gNub || !parent || !level)
+	if (!parent || !level)
+		return false;
+	// publish() is reached from two threads (the GPU path in attach() and RDNA4PvLate's work loop): claim the single slot atomically before building
+	// anything, give it back on the paths that can be retried.
+	static bool claimed = false;
+	bool expected = false;
+	if (!__atomic_compare_exchange_n(&claimed, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 		return false;
 	// The nub appends data members to IOPCIDevice's layout as MacKernelSDK's header knows it. If Tahoe's real class is bigger, those would overlap its
-	// own members: refuse.
+	// own members: refuse (for good: the claim stays).
 	const OSSymbol *realName = OSSymbol::withCStringNoCopy("IOPCIDevice");
 	const OSMetaClass *real = realName ? OSMetaClass::getMetaClassWithName(realName) : nullptr;
 	OSSafeReleaseNULL(realName);
@@ -492,17 +499,23 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 		return false;
 	}
 	auto *nub = OSTypeAlloc(RDNA4PvNub);
-	if (!nub)
+	if (!nub) {
+		__atomic_store_n(&claimed, false, __ATOMIC_RELEASE);
 		return false;
+	}
 	if (!nub->init(static_cast<OSDictionary *>(nullptr)) || !nub->build()) {
 		pvlog("could not build the nub");
 		nub->release();
+		__atomic_store_n(&claimed, false, __ATOMIC_RELEASE);
 		return false;
 	}
-	nub->patchVtable();
+	void **vtableCopy = nub->patchVtable();
 	if (!nub->attach(parent)) {
 		pvlog("attach to %s failed", parent->getName());
-		nub->release();
+		nub->release();   // its free() runs through the patched vtable, whose dtor/free slots are the original ones
+		if (vtableCopy)
+			IOFree(vtableCopy, kVtableSlots * sizeof(void *));
+		__atomic_store_n(&claimed, false, __ATOMIC_RELEASE);
 		return false;
 	}
 	gNub = nub;   // keeps the creation reference: never released

@@ -143,7 +143,7 @@ public:
 
 private:
 	bool build();
-	void patchVtable();
+	void **patchVtable();   // returns the vtable copy now in use (nullptr: not patched)
 
 	static constexpr int kMaxInterrupts = 4;
 	struct Interrupt {
