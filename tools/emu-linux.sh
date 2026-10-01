@@ -107,7 +107,7 @@ if [ "$BUILD" = 1 ] || [ ! -f "$OSXKVM/OpenCore/$OCIMG" ]; then
 		> "$RUN/opencore.out" 2>&1 || { tail -20 "$RUN/opencore.out"; exit 1; }
 fi
 
-QPAT="^$EMU/.*/qemu-system-x86_64 "   # only our own QEMU builds: never another QEMU on the box (e.g. the Android emulator)
+QPAT="^$EMU/.*/qemu-system-x86_64 .*$EMU/runs/"   # only QEMUs started by this script (their monitor socket lives in $EMU/runs/): never another QEMU on the box (Android emulator, other agents' VMs)
 pkill -f "$QPAT" 2>/dev/null || true   # never two VMs at once
 for i in $(seq 1 20); do pgrep -f "$QPAT" >/dev/null || break; sleep 0.5; done
 cp "$OSXKVM/OVMF_VARS-1920x1080.fd" "$RUN/vars.fd"
