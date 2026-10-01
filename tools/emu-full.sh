@@ -18,6 +18,7 @@
 #   stop             quit the VM this script started (its own pid file; never a name pattern)
 #   status           pid, ports, last serial lines
 #   mon "cmd"...     QEMU monitor commands          shot [name]   screendump -> $FULL/shots/<name>.png
+#   click X Y [d]    pointer click at screen pixel X,Y (d = double) through the VNC server (the installer GUI needs it)
 #   key <qemu key>...  e.g. key ret meta_l-shift-t   type "text\n"   type through the monitor (US layout)
 #   wait "regex" [SECS]   wait for a line in the serial log
 #   con "shell cmd"  Recovery/installer Terminal: type the command so that its output goes to /dev/console (= the serial log) and wait for it to end
@@ -28,7 +29,7 @@
 # Everything big lives outside the repo: $FULL (default ~/work/tools/emu/full: qcow2 disks, serve/, shots/, logs/), the QEMU binary is a COPY at
 # ~/work/tools/emu-full/bin/qemu-system-x86_64 so that tools/emu-linux.sh's "one VM at a time" kill pattern (^$EMU/.../qemu-system-x86_64 ) can never match
 # this VM. ONE VM at a time with Kiln's emulator runs: ask it for the slot. Ports: monitor unix socket, VNC :9 (5909), ssh 127.0.0.1:10122, http 8088.
-# Env: EMU, FULL, QEMU_BIN, RAM_MB (8192), SMP (8), VNC_DISPLAY (9), SSH_PORT (10122), HTTP_PORT (8088), DISKS, OC_IMG (OpenCore-full.qcow2).
+# Env: EMU, FULL, QEMU_BIN, RAM_MB (6144), SMP (4), NICE (10), VNC_DISPLAY (9), SSH_PORT (10122), HTTP_PORT (8088), DISKS, OC_IMG (OpenCore-full.qcow2).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -39,7 +40,7 @@ PCBIOS=${PCBIOS:-$EMU/qemu-10.0.13/pc-bios}
 OSXKVM=${OSXKVM:-$EMU/OSX-KVM}
 LILU=${LILU:-$EMU/kexts/Lilu.kext}
 OC_IMG=${OC_IMG:-OpenCore-full.qcow2}
-BASE_IMG=${BASE_IMG:-$EMU/images/BaseSystem.img}
+BASE_IMG=${BASE_IMG:-$FULL/BaseSystem.img}   # OUR copy of the Recovery disk (Kiln's VMs hold a write lock on images/BaseSystem.img)
 D_TARGET=${D_TARGET:-$FULL/macos-26.6.2.qcow2}
 D_STAGE=${D_STAGE:-$FULL/stage.qcow2}
 D_MEDIA=${D_MEDIA:-$FULL/install-media.qcow2}
@@ -123,9 +124,8 @@ cmd_start() {
 		shift
 	done
 	vm_pid >/dev/null && die "a VM of ours is already running (pid $(vm_pid)): emu-full.sh stop"
-	if pgrep -f "^$EMU/.*/qemu-system-x86_64 " >/dev/null 2>&1; then
-		die "Kiln's emulator VM is running: ask Kiln for the slot (one VM at a time; this script never kills it)"
-	fi
+	# Kiln's emulator VMs may run at the same time (lead, hub-task-432: isolated: own binary copy, ports, disks); only a note.
+	pgrep -f "^$EMU/.*/qemu-system-x86_64 " >/dev/null 2>&1 && echo "emu-full: note: Kiln's emulator VM is running too (isolated; this script never touches it)"
 	[ -w /dev/kvm ] || die "/dev/kvm is not writable"
 	for f in "$QEMU_BIN" "$OSXKVM/OpenCore/$OC_IMG" "$OSXKVM/OVMF_CODE_4M.fd"; do [ -e "$f" ] || die "missing $f (docs/emu-full.md)"; done
 	[ -f "$VARS" ] || cp "$OSXKVM/OVMF_VARS-1920x1080.fd" "$VARS"
@@ -153,10 +153,10 @@ cmd_start() {
 	rm -f "$MON"
 	: > "$SERIAL"
 	local args=(
-		-L "$PCBIOS" -enable-kvm -m "${RAM_MB:-8192}"
+		-L "$PCBIOS" -enable-kvm -m "${RAM_MB:-6144}"
 		-cpu "Skylake-Client,-hle,-rtm,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt,check"
 		-machine q35 -global ICH9-LPC.disable_s3=0
-		-smp "${SMP:-8},cores=4,sockets=1"
+		-smp "${SMP:-4},cores=4,sockets=1"
 		-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 -device usb-ehci,id=ehci
 		-device "isa-applesmc,osk=ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc"
 		-drive "if=pflash,format=raw,readonly=on,file=$OSXKVM/OVMF_CODE_4M.fd" -drive "if=pflash,format=raw,file=$VARS"
@@ -168,9 +168,9 @@ cmd_start() {
 	)
 	# shellcheck disable=SC2206
 	args+=($extra)
-	echo "emu-full: $mode: disks $disks; RAM ${RAM_MB:-8192} MB; monitor $MON; VNC 127.0.0.1:${VNC_DISPLAY:-9}; ssh 127.0.0.1:$SSH_PORT; serial $SERIAL" | tee "$FULL/logs/last-start.txt"
+	echo "emu-full: $mode: disks $disks; RAM ${RAM_MB:-6144} MB; monitor $MON; VNC 127.0.0.1:${VNC_DISPLAY:-9}; ssh 127.0.0.1:$SSH_PORT; serial $SERIAL" | tee "$FULL/logs/last-start.txt"
 	echo "$QEMU_BIN ${args[*]}" >> "$FULL/logs/last-start.txt"
-	setsid nohup "$QEMU_BIN" "${args[@]}" > "$FULL/logs/qemu.out" 2>&1 < /dev/null &
+	setsid nohup nice -n "${NICE:-10}" "$QEMU_BIN" "${args[@]}" > "$FULL/logs/qemu.out" 2>&1 < /dev/null &
 	local i
 	for i in $(seq 1 30); do [ -S "$MON" ] && break; sleep 1; done
 	[ -S "$MON" ] || { tail -5 "$FULL/logs/qemu.out"; die "QEMU did not start"; }
@@ -208,16 +208,40 @@ cmd_wait() {   # wait "regex" [SECS]
 	echo "emu-full: timeout waiting for /$pat/"; return 1
 }
 
+cmd_click() {   # click X Y [d]: pointer click at screen pixel X,Y (d = double click)
+	# The usb-tablet is ignored by macOS in Recovery/the installer (pointer stuck at 0,0), so a relative usb-mouse is hot-plugged on first use and
+	# driven through the monitor: park in the corner (big negative move), then step to the target in <=100 unit moves (macOS pointer acceleration: measured
+	# ~1.12 x / ~1.06 y pointer pixels per mouse unit at this step size, so the defaults CLICK_SCALE_X/_Y compensate; icons and buttons are big enough).
+	local x=$1 y=$2 scx=${CLICK_SCALE_X:-0.895} scy=${CLICK_SCALE_Y:-0.942} i dx dy cmds=()
+	mon "info usb" 2>/dev/null | grep -q rmouse || mon "device_add usb-mouse,bus=xhci.0,id=rmouse" >/dev/null 2>&1 || true
+	sleep 1
+	cmds+=("mouse_move -4000 -4000")
+	dx=$(python3 -c "print(int($x*$scx))"); dy=$(python3 -c "print(int($y*$scy))")
+	while [ "$dx" -gt 0 ] || [ "$dy" -gt 0 ]; do
+		local sx=$(( dx > 100 ? 100 : dx )) sy=$(( dy > 100 ? 100 : dy ))
+		cmds+=("mouse_move $sx $sy"); dx=$((dx - sx)); dy=$((dy - sy))
+	done
+	if [ -z "${MOVE_ONLY:-}" ]; then
+		cmds+=("mouse_button 1" "mouse_button 0")
+		[ -n "${3:-}" ] && cmds+=("mouse_button 1" "mouse_button 0")
+	fi
+	mon "${cmds[@]}" >/dev/null
+}
 cmd_type() { python3 "$HERE/tools/emu-type.py" "$MON" "$1"; }
 cmd_key() { local k; for k in "$@"; do mon "sendkey $k" >/dev/null; done; }
 
 cmd_con() {   # con "shell cmd" [SECS]: run in the guest Terminal (Recovery/installer), output to the serial log
+	# The command text is NOT typed (a busy guest drops key events): it is written to $FULL/serve/cmd/<tag>.sh and the guest types one short line
+	# that fetches and runs it from the HTTP server (cmd_serve start). Output comes back through /dev/console (the serial log).
 	local c=$1 secs=${2:-600} tag n
+	cmd_serve status | grep -q "running" || cmd_serve start >/dev/null
 	tag=EFULL-$(date +%s)-$RANDOM
+	mkdir -p "$FULL/serve/cmd"
+	printf '( %s ) 2>&1 | awk '"'"'{print "EFULLOUT|" $0}'"'"' > /dev/console\necho %s-DONE > /dev/console\n' "$c" "$tag" > "$FULL/serve/cmd/$tag.sh"
 	n=$(wc -c < "$SERIAL")
-	cmd_type "( $c ) > /tmp/efull.out 2>&1; cat /tmp/efull.out | sed 's/^/EFULLOUT|/' > /dev/console; echo $tag-DONE > /dev/console\n"
+	cmd_type "curl -so /tmp/c.sh http://10.0.2.2:$HTTP_PORT/cmd/$tag.sh; bash /tmp/c.sh\n"
 	cmd_wait "$tag-DONE" "$secs" >/dev/null || { echo "emu-full: con: command did not finish in ${secs}s" >&2; return 1; }
-	tail -c +"$((n + 1))" "$SERIAL" | grep -a "EFULLOUT|" | sed 's/^.*EFULLOUT|//' | tr -d '\r'
+	tail -c +"$((n + 1))" "$SERIAL" | grep -a "EFULLOUT|" | sed 's/.*EFULLOUT|//' | tr -d '\r' || true
 }
 
 cmd_ssh() {
@@ -236,6 +260,7 @@ case $c in
 	mon) mon "$@" ;;
 	shot) shot "$@" ;;
 	key) cmd_key "$@" ;;
+	click) cmd_click "$@" ;;
 	type) cmd_type "$1" ;;
 	wait) cmd_wait "$@" ;;
 	con) cmd_con "$@" ;;
