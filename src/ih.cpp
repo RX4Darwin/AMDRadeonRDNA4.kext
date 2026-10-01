@@ -807,8 +807,9 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	if (entry.clientId == kIhClientUtcl2) {
 		ihFaultCount++;
 		if (ihFaultCount == 1 || ihFaultCount == 4 || (ihFaultCount & 0x3f) == 0) {
-			HLOG("GC UTCL2 protection fault: source %u status 0x%08x address 0x%08x%08x",
-			     entry.srcId, entry.srcData[0], entry.srcData[2], entry.srcData[1]);
+			HLOG("GC UTCL2 protection fault: source %u status 0x%08x address 0x%08x%08x (VMID %u, PASID %u = client slot %d)",
+			     entry.srcId, entry.srcData[0], entry.srcData[2], entry.srcData[1], entry.vmid, entry.pasid,
+			     vmClientSlotByPasid(entry.pasid));
 			logGcFault("IH");
 		}
 		return;
@@ -821,8 +822,8 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 		ihFaultCount++;
 		if (ihFaultCount == 1 || ihFaultCount == 4 || (ihFaultCount & 0x3f) == 0) {
 			const uint32_t access = entry.srcData[1] & 0xf0;
-			HLOG("GC VM page fault (client GFX, UTCL2_1_0__SRCID__FAULT): VMID %u, PASID %u, %s%s%s%s at VA 0x%llx "
-			     "(src_data 0x%08x 0x%08x 0x%08x 0x%08x, %u so far)", entry.vmid, entry.pasid,
+			HLOG("GC VM page fault (client GFX, UTCL2_1_0__SRCID__FAULT): VMID %u, PASID %u = client slot %d, %s%s%s%s at VA 0x%llx "
+			     "(src_data 0x%08x 0x%08x 0x%08x 0x%08x, %u so far)", entry.vmid, entry.pasid, vmClientSlotByPasid(entry.pasid),
 			     (access & 0x40) ? "read " : "", (access & 0x20) ? "write " : "", (access & 0x10) ? "execute " : "",
 			     (access & 0x80) ? "(retry) " : "",
 			     (static_cast<unsigned long long>(entry.srcData[0]) << 12) |
