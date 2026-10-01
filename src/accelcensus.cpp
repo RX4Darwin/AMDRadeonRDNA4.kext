@@ -21,7 +21,6 @@ int proc_selfpid(void);
 void proc_selfname(char *buf, int size);
 }
 
-OSDefineMetaClassAndStructors(RDNA4AccelCensus, IOAccelerator)
 OSDefineMetaClassAndStructors(RDNA4AccelCensusClient, IOUserClient)
 
 namespace {
@@ -94,6 +93,14 @@ void hexBytes(char *out, size_t cap, const void *p, size_t n) {
 
 } // namespace
 
+namespace {
+const OSMetaClass *gClaimedMeta { nullptr };    // IOAccelerator's metaclass, found by name when the service is published
+}
+
+RDNA4AccelCensus::RDNA4AccelCensus() : IOService(gClaimedMeta) { }
+RDNA4AccelCensus::~RDNA4AccelCensus() { }
+const OSMetaClass *RDNA4AccelCensus::getMetaClass() const { return gClaimedMeta; }
+
 uint32_t RDNA4AccelCensus::level() { return gLevel; }
 
 // The properties Apple's AMD accelerators publish (docs/metal-spike.md s.1.4: a live Navi14 registry dump). The plug-in names are deliberately ones
@@ -101,14 +108,22 @@ uint32_t RDNA4AccelCensus::level() { return gLevel; }
 bool RDNA4AccelCensus::publish(IOService *provider, uint32_t level) {
 	if (gService || !provider || !level)
 		return false;
+	const OSSymbol *name = OSSymbol::withCString("IOAccelerator");
+	gClaimedMeta = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
+	OSSafeReleaseNULL(name);
+	if (!gClaimedMeta) {
+		IOLog("RDNA4FB: accelcensus: IOAccelerator is not a registered class (IOGraphicsFamily not loaded?); no census\n");
+		return false;
+	}
 	gLevel = level;
 	gLock = IOLockAlloc();
-	auto *svc = OSTypeAlloc(RDNA4AccelCensus);
+	auto *svc = new RDNA4AccelCensus;
 	if (!svc || !svc->init()) {
 		OSSafeReleaseNULL(svc);
 		IOLog("RDNA4FB: accelcensus: could not create the service\n");
 		return false;
 	}
+	svc->setName("RDNA4AccelCensus");
 	svc->setProperty("IOUserClientClass", "RDNA4AccelCensusClient");
 	svc->setProperty("IOMatchCategory", "IOAccelerator");
 	svc->setProperty("MetalPluginName", "RDNA4CensusMTLDriver");
@@ -154,18 +169,18 @@ IOReturn RDNA4AccelCensus::newUserClient(task_t owningTask, void *securityID, UI
 		OSSafeReleaseNULL(it);
 		census(true, "  open properties: %s", list);
 	}
-	return IOAccelerator::newUserClient(owningTask, securityID, type, properties, handler);
+	return IOService::newUserClient(owningTask, securityID, type, properties, handler);
 }
 
 OSObject *RDNA4AccelCensus::copyProperty(const OSSymbol *aKey) const {
-	OSObject *o = IOAccelerator::copyProperty(aKey);
+	OSObject *o = IOService::copyProperty(aKey);
 	if (fromUser() && aKey && strcmp(aKey->getCStringNoCopy(), "CensusLog") != 0)
 		census(false, "read property %s -> %s", aKey->getCStringNoCopy(), o ? "present" : "ABSENT");
 	return o;
 }
 
 OSObject *RDNA4AccelCensus::getProperty(const OSSymbol *aKey) const {
-	OSObject *o = IOAccelerator::getProperty(aKey);
+	OSObject *o = IOService::getProperty(aKey);
 	if (fromUser() && aKey && strcmp(aKey->getCStringNoCopy(), "CensusLog") != 0)
 		census(false, "get property %s -> %s", aKey->getCStringNoCopy(), o ? "present" : "ABSENT");
 	return o;
@@ -174,7 +189,7 @@ OSObject *RDNA4AccelCensus::getProperty(const OSSymbol *aKey) const {
 bool RDNA4AccelCensus::serializeProperties(OSSerialize *s) const {
 	if (fromUser())
 		census(false, "whole property dictionary read");
-	return IOAccelerator::serializeProperties(s);
+	return IOService::serializeProperties(s);
 }
 
 bool RDNA4AccelCensus::matchPropertyTable(OSDictionary *table, SInt32 *score) {
@@ -192,12 +207,12 @@ bool RDNA4AccelCensus::matchPropertyTable(OSDictionary *table, SInt32 *score) {
 		OSSafeReleaseNULL(it);
 		census(false, "matching dictionary keys: %s", list);
 	}
-	return IOAccelerator::matchPropertyTable(table, score);
+	return IOService::matchPropertyTable(table, score);
 }
 
 IOReturn RDNA4AccelCensus::message(UInt32 type, IOService *provider, void *argument) {
 	census(true, "message type 0x%x from %s", static_cast<unsigned>(type), provider ? provider->getName() : "?");
-	return IOAccelerator::message(type, provider, argument);
+	return IOService::message(type, provider, argument);
 }
 
 // ---- the user client --------------------------------------------------------------------------------------------------------------------

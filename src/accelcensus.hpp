@@ -19,15 +19,22 @@
 
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
-#include <IOKit/graphics/IOAccelerator.h>
 
-class RDNA4AccelCensus : public IOAccelerator {
-	OSDeclareDefaultStructors(RDNA4AccelCensus)
+// Why this is not a subclass of IOAccelerator: OpenCore injects our kext into the BOOT kernel collection, and IOGraphicsFamily (which defines
+// IOAccelerator) is not in it (in Recovery it is in BaseSystemKernelExtensions.kc, on a full system in SystemKernelExtensions.kc), so a kext that
+// links against it is never loaded (hub-task-356, measured: with that one dependency line added to a kext that otherwise loads, the serial log has 0 "RDNA4FB" lines). The
+// public header shows IOAccelerator adding no data members and no virtuals of its own to IOService [INFER for the real class], so the census object is an IOService whose getMetaClass() answers with the
+// metaclass of the REAL IOAccelerator, looked up by name at run time: IOServiceMatching("IOAccelerator"), OSDynamicCast and metaCast all walk
+// the metaclass chain and accept it. The registry shows the class name "IOAccelerator"; the registry NAME is "RDNA4AccelCensus". Census only:
+// route B needs a real subclass and will need a different way to be loaded.
+class RDNA4AccelCensus : public IOService {
 public:
+	RDNA4AccelCensus();
 	// Publish the service under `provider` (the GPU's IOPCIDevice). `level`: 1 = refuse every call, 2 = succeed with zeroed outputs. Once per boot.
 	static bool publish(IOService *provider, uint32_t level);
 	static uint32_t level();
 
+	const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;
 	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
 	                       IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 	OSObject *copyProperty(const OSSymbol *aKey) const APPLE_KEXT_OVERRIDE;
@@ -35,10 +42,12 @@ public:
 	bool serializeProperties(OSSerialize *s) const APPLE_KEXT_OVERRIDE;
 	bool matchPropertyTable(OSDictionary *table, SInt32 *score) APPLE_KEXT_OVERRIDE;
 	IOReturn message(UInt32 type, IOService *provider, void *argument) APPLE_KEXT_OVERRIDE;
-	using IOAccelerator::newUserClient;
-	using IOAccelerator::copyProperty;
-	using IOAccelerator::getProperty;
-	using IOAccelerator::matchPropertyTable;
+	using IOService::newUserClient;
+	using IOService::copyProperty;
+	using IOService::getProperty;
+	using IOService::matchPropertyTable;
+protected:
+	~RDNA4AccelCensus() APPLE_KEXT_OVERRIDE;
 };
 
 class RDNA4AccelCensusClient : public IOUserClient {
