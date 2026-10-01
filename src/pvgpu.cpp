@@ -700,13 +700,10 @@ IODeviceMemory *RDNA4PvNub::getDeviceMemoryWithIndex(unsigned int) { return null
 
 // ---- matching: only a personality that names this device by IOPCIMatch / IOPCIPrimaryMatch matches; everything else is offered and refused ----
 
-bool RDNA4PvNub::matchPropertyTable(OSDictionary *table) {
-	SInt32 score = 0;
-	return matchPropertyTable(table, &score);
-}
-
-bool RDNA4PvNub::matchPropertyTable(OSDictionary *table, SInt32 *score) {
-	if (!table || !IOService::matchPropertyTable(table, score))
+// IOService::matchPropertyTable(table, score) calls the virtual one-argument version, which this class overrides: the PCI logic therefore lives in a helper
+// that calls neither (the first run of this code in the emulator overflowed the kernel stack between the two overloads, hub-task-427).
+bool RDNA4PvNub::matchPci(OSDictionary *table) {
+	if (!table)
 		return false;
 	const uint32_t ids = (static_cast<uint32_t>(kDevice) << 16) | kVendor;
 	const uint32_t sub = (0x0000u << 16) | kVendor;
@@ -721,12 +718,16 @@ bool RDNA4PvNub::matchPropertyTable(OSDictionary *table, SInt32 *score) {
 	if (ok && klass && !matchIds(klass, 0x03000000))
 		ok = false;
 	static uint32_t offered = 0;
-	if (offered++ < 40) {
+	if (__atomic_fetch_add(&offered, 1u, __ATOMIC_RELAXED) < 40) {
 		const char *cls = stringKey(table, "IOClass"), *bundle = stringKey(table, "CFBundleIdentifier");
 		pvlog("match offered: %s %s (IOPCIMatch %s) -> %s", bundle ? bundle : "?", cls ? cls : "?", primary ? primary : "-", ok ? "MATCH" : "no");
 	}
 	return ok;
 }
+
+bool RDNA4PvNub::matchPropertyTable(OSDictionary *table) { return matchPci(table) && IOService::matchPropertyTable(table); }
+
+bool RDNA4PvNub::matchPropertyTable(OSDictionary *table, SInt32 *score) { return matchPci(table) && IOService::matchPropertyTable(table, score); }
 
 // ---- config space ----
 

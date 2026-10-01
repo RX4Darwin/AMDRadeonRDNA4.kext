@@ -143,6 +143,7 @@ public:
 
 private:
 	bool build();
+	bool matchPci(OSDictionary *table);   // only Apple's IOPCIMatch 0xEEEE106B personality matches (no IOService calls: see pvgpu.cpp)
 	void **patchVtable();   // returns the vtable copy now in use (nullptr: not patched)
 
 	static constexpr int kMaxInterrupts = 4;
