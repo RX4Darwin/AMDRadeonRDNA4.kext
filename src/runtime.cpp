@@ -2624,7 +2624,7 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 		l.fenceAddress = poolMc(c->poolOff + kVmFence);
 		l.ibCpu = poolDw(c->poolOff + kVmIb);
 		l.ibVa = c->ibVa;
-		l.ibVmid = vmidForSubmit(*c);
+		l.ibVmid = c->vmid;          // after vmAcquire above (mode 2) or the fixed one
 		l.queueCpu = nullptr;
 		if (qseq) {
 			l.queueFenceAddr = sq.fenceMc;
@@ -2946,8 +2946,12 @@ IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords
 		gfxClientRetire(o);
 	if (c.gfxOutstanding >= kMaxIbOutstanding || gfxClientPending >= kMaxGfxOutstanding)
 		return kIOReturnBusy;
-	/* The VMID's shader memory state, as the compute path and gfx_v12_0_init_compute_vmid set it (boot already does it for VMIDs 8-15). */
+	/* The VMID's shader memory state, as the compute path and gfx_v12_0_init_compute_vmid set it (boot already does it for VMIDs 8-15).
+	 * rdna4-vmshared=2: the VMID comes from the pool, bound to this client's tables for this job. */
 	const uint32_t ibVmid = vmidForSubmit(c);
+	if (!ibVmid)
+		return kIOReturnBusy;
+	const bool pooled = c.shared && vmShared == 2;
 	grbmSelect(0, 0, 0, ibVmid);
 	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
 	wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
@@ -2958,13 +2962,21 @@ IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords
 	    !gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, ibVa, dwords, ibVmid)) ||
 	    !gfxRing.emit(pkt, Pm4::releaseMem(pkt, c.gfxFenceMc, value)))
 		return kIOReturnNoResources;
+	if (pooled) {
+		/* The pool must know this VMID has work in flight on the gfx ring: a ring-level fence (the ring's own, kGfxFenceOffset, in order) after
+		 * the client's: the VMID is not rebound for another client until it is reached. */
+		const uint32_t domainSeq = ++gfxFence;
+		if (!gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), domainSeq)))
+			return kIOReturnNoResources;
+		vmPool.noteSubmit(ibVmid, kGfxDomain, domainSeq);
+	}
 	c.gfxFence = value;
 	flushHdp();                                      // CPU-written IB/data through the BAR are visible to the CP (amdgpu #9, done from the CPU side)
 	gfxKick(gfxRing.wptr());
 	c.gfxFences[c.gfxOutstanding++] = value;
 	gfxClientPending++;
 	fence = value;
-	RLOG("vmid %u: submitted unprivileged gfx IB VA 0x%llx, %u dwords, gfx fence %u", c.vmid, ibVa, dwords, value);
+	RLOG("vmid %u: submitted unprivileged gfx IB VA 0x%llx, %u dwords, gfx fence %u", ibVmid, ibVa, dwords, value);
 	return kIOReturnSuccess;
 }
 

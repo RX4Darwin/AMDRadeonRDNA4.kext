@@ -910,9 +910,12 @@ private:
 	bool sharedStart(uint32_t k);
 	void sharedStopAll(const char *why);
 	bool recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const char *tag);
-	// The VMID a client's submissions run in. One place, so the VMID pool (docs/w13-vmid.md s.5.6) can substitute its grab later; W12k's
-	// gfx submit takes the IB's VMID from here too.
-	uint32_t vmidForSubmit(const RtClient &c) const { return c.vmid; }
+	// The VMID a client's next submission runs in. One place: the client's fixed VMID (modes 0 and 1), or, with rdna4-vmshared=2, a VMID the
+	// pool binds to the client's tables for this job (vmAcquire: reused, or an idle one rebound over MMIO). 0 = none available (the caller
+	// answers Busy). W12k's gfx submit takes the IB's VMID from here; the compute paths acquire explicitly (they reserve ring space first) and
+	// read c.vmid afterwards.
+	uint32_t vmidForSubmit(RtClient &c) { return c.shared && vmShared == 2 ? vmAcquire(c) : c.vmid; }
+	static constexpr uint32_t kGfxDomain = 2;   // the VMID pool's fence domain for the gfx ring (0 and 1 are the shared compute queues)
 	static bool requestedVmIdTest();
 	static uint32_t vmIdTestMask();          // rdna4-vmid-test: 1 probes, 2 flow-point surveys, 4 client-op trace
 	void vmIdSurvey(const char *tag, uint32_t settleMs = 0);
@@ -960,7 +963,7 @@ private:
 	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
 	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
 	// so the two never use the ring at the same time. Everything below runs under rtLock.
-	static constexpr uint32_t kMaxGfxOutstanding = 16;     // submissions in the ring across all clients (15 dwords each: 240 of 4096)
+	static constexpr uint32_t kMaxGfxOutstanding = 16;     // submissions in the ring across all clients (15 dwords each, 22 with the pool's ring fence: 352 of 4096)
 	static constexpr uint32_t kGfxFenceSlot = 0x40;        // bytes into the client's fence page
 	bool     gfxWedged { false };                          // a client gfx IB timed out: the gfx ring is given up until the next bring-up
 	bool     gfxParked { false };                          // gfxPark halted PFP/ME (probe boots)

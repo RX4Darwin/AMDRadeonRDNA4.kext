@@ -30,7 +30,10 @@ static bool fenceAtLeast(uint32_t current, uint32_t wanted) {
 
 // The pool asks whether a fence domain (a shared queue) has reached a sequence number.
 bool RDNA4Compute::poolFenceReached(void *context, uint32_t domain, uint32_t seq) {
-	return static_cast<RDNA4Compute *>(context)->sharedFenceReached(domain, seq);
+	RDNA4Compute *self = static_cast<RDNA4Compute *>(context);
+	if (domain == kGfxDomain)
+		return !self->poolCpu || fenceAtLeast(*self->poolDw(kGfxFenceOffset), seq);   // the gfx ring's own fence dword (in order)
+	return self->sharedFenceReached(domain, seq);
 }
 
 // The two shared queues' homes: one per MEC pipe, queue 2 (queue 0 of pipe 0 is the boot queue, (0,1) is the boot self-test's slot). They use the
