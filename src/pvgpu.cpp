@@ -13,6 +13,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOPlatformExpert.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
@@ -513,6 +514,52 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 		pvlog("polling host did not start (the nub stays published)");
 	return true;
 }
+
+class RDNA4PvLate : public OSObject {
+	OSDeclareDefaultStructors(RDNA4PvLate)
+public:
+	static void schedule(uint32_t level, uint32_t delayMs) {
+		auto *l = OSTypeAlloc(RDNA4PvLate);
+		if (!l || !l->init()) {
+			OSSafeReleaseNULL(l);
+			return;
+		}
+		l->mLevel = level;
+		l->mDeadline = nowMs() + delayMs;
+		l->mLoop = IOWorkLoop::workLoop();
+		l->mTimer = l->mLoop ? IOTimerEventSource::timerEventSource(l, tickAction) : nullptr;
+		if (!l->mTimer || l->mLoop->addEventSource(l->mTimer) != kIOReturnSuccess) {
+			OSSafeReleaseNULL(l->mTimer);
+			OSSafeReleaseNULL(l->mLoop);
+			l->release();
+			return;
+		}
+		l->mTimer->setTimeoutMS(500);   // kept alive by the creation reference: one per boot, never released
+	}
+private:
+	static void tickAction(OSObject *owner, IOTimerEventSource *) {
+		if (auto *l = OSDynamicCast(RDNA4PvLate, owner))
+			l->tick();
+	}
+	void tick() {
+		if (gNub)
+			return;   // the GPU path got there first
+		IOService *platform = nowMs() >= mDeadline ? IOService::getPlatform() : nullptr;
+		if (platform) {
+			pvlog("no GPU-side publish after the delay: publishing under the platform expert (%s)", platform->getName());
+			RDNA4PvNub::publish(platform, mLevel);
+			return;
+		}
+		mTimer->setTimeoutMS(500);
+	}
+	uint32_t mLevel { 0 };
+	uint64_t mDeadline { 0 };
+	IOWorkLoop *mLoop { nullptr };
+	IOTimerEventSource *mTimer { nullptr };
+};
+OSDefineMetaClassAndStructors(RDNA4PvLate, OSObject)
+
+void RDNA4PvNub::publishLater(uint32_t level, uint32_t delayMs) { RDNA4PvLate::schedule(level, delayMs); }
 
 bool RDNA4PvNub::raiseInterrupt(int source) {
 	if (source < 0 || source >= kMaxInterrupts)

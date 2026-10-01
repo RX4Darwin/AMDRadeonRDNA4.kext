@@ -50,6 +50,9 @@ public:
 	// Publish the nub under `parent` (any registered service; the GPU's IOPCIDevice) and start the polling host. level: 1 = nub + host, 2 = + self-test.
 	// Once per boot; returns false (and logs) when it could not be built.
 	static bool publish(IOService *parent, uint32_t level);
+	// For machines where the GPU path never runs (a VM without the emulated RDNA4 device): if nothing published the nub within `delayMs`, publish it under
+	// the platform expert. Starts a work loop and a timer; call once from plugin start.
+	static void publishLater(uint32_t level, uint32_t delayMs);
 
 	// Host side: the control block of BAR0 as dwords, valid while the nub lives (the nub is never released once published).
 	volatile uint32_t *ctrl() const { return mBar0 ? reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(mBar0) + pvgpu::kCtrl) : nullptr; }
