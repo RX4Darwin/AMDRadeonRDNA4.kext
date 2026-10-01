@@ -2729,7 +2729,7 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	/* The same VMID-selected shader memory state as launch(): the user IB
 	 * supplies the program and resource registers, while this selector only
 	 * chains it and fences it. (Shared mode: SH_MEM was written for every VMID at the queues' start.) */
-	const uint32_t ibVmid = vmidForSubmit(*c);
+	uint32_t ibVmid = c->vmid;
 	if (!c->shared) {
 		grbmSelect(0, c->pipe, c->queue, ibVmid);
 		wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
@@ -2743,6 +2743,7 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 			return kIOReturnBusy;
 		}
 		qseq = ++sharedQ[c->sq].seq;
+		ibVmid = c->vmid;    // the one the pool just granted: it was read before the grab, which handed a stale VMID to the IB packet when the pool had moved the client
 	}
 	const uint32_t value = nextFence(c->fence);
 	uint32_t pkt[8];
