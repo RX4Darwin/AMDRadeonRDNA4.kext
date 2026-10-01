@@ -3111,7 +3111,7 @@ bool RDNA4Compute::gfxClientSelfTest() {
 		Locked g(rtLock);
 		RtClient *c = clientFor(owner);
 		const uint32_t ibOff = kGfxOffset + 0x30000, dataOff = kGfxOffset + 0x31000;   // free pool pages between the G3 slots and the target
-		if (c && c->tableShadow && c->gfxFenceCpu) {
+		if (c && hasTables(*c) && c->gfxFenceCpu) {
 			const uint64_t ibVa = c->nextVa, dataVa = c->nextVa + 0x1000;
 			c->nextVa += 0x2000;
 			if (vmMap(*c, ibVa, poolMc(ibOff), 0x1000, true) && vmMap(*c, dataVa, poolMc(dataOff), 0x1000, false)) {
