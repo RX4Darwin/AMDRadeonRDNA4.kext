@@ -448,6 +448,12 @@ std::unique_ptr<Module> remapConstantSpace(std::unique_ptr<Module> M, LLVMContex
 	raw_string_ostream os(text);
 	M->print(os, nullptr);
 	os.flush();
+	// AIR spaces 4 (imageblock/tile memory, as returned by air.imageblock_data), 5, 6, 7 have no lowering and would collide with AMDGPU's numbering
+	for (const char *sp : {"addrspace(4)", "addrspace(5)", "addrspace(6)", "addrspace(7)"})
+		if (text.find(sp) != std::string::npos) {
+			err = std::string("AIR ") + sp + " (imageblock / tile memory or unknown) is not lowered";
+			return nullptr;
+		}
 	replaceAll(text, "addrspace(2)", "addrspace(4)");
 	replaceAll(text, ".p2.", ".p4.");
 	replaceAll(text, ".p2(", ".p4(");
