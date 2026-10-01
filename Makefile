@@ -214,7 +214,7 @@ atomdump: $(ATOMDUMP)
 # Runs the kext's AtomBIOS parser (compiled for the host) against the real
 # ROM dump — verifies parsing logic without GPU hardware.
 PVSTREAM_TEST := $(BUILD)/pvstream-test
-$(PVSTREAM_TEST): tools/pvstream-test.cpp src/pvstream.cpp src/pvstream.hpp src/pvopcodes.inc
+$(PVSTREAM_TEST): tools/pvstream-test.cpp src/pvstream.cpp src/pvstream.hpp src/pvopcodes.inc src/pvdevinfo.inc
 	@mkdir -p $(BUILD)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ tools/pvstream-test.cpp src/pvstream.cpp
 

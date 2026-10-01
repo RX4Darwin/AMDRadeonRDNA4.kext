@@ -66,6 +66,28 @@ size_t walkCommands(const uint8_t *p, size_t n, bool operations, StreamSink sink
 // beginSegment:: render 0, compute 1, blit 2, info 4; 5 is the protection-options envelope (a raw u64 follows).
 const char *segmentTypeName(uint8_t type);
 
+// ---- GetDeviceInfo (FIFO 0x3a) reply, docs/m0-pvgpu.md "The GetDeviceInfo reply" ----
+// The guest announces a reply buffer in record 0x2d {u32 0x2d, u32 bytes/8, u32 page}; AppleParavirtAccelerator::setupDeviceInfo then waits for the command's stamp
+// and parses `bytes/8` pairs {u32 key, u32 value} into a 224-byte APVDeviceInfoStruct (parseDeviceInfo). Keys 0 and 0x2b and anything above 0x2c are ignored.
+constexpr uint32_t kDeviceInfoBytes = 224;
+constexpr uint32_t kDeviceInfoRecord = 0x2d;
+struct DeviceInfoKey {
+	uint8_t key;
+	uint8_t value;      // offset of the u32 value in the struct
+	uint8_t defined;    // offset of the "defined" byte the parser sets
+	const char *name;
+};
+const DeviceInfoKey *deviceInfoKeys(size_t *count);
+// Fill `buf` (bytes long, a multiple of 8) with the reply: the pairs of kReplyValues (gpuCores = the card's compute-unit count for GpuCoreCount), the rest zero
+// (key 0: ignored by the parser). Returns the number of pairs that carry a value.
+size_t buildDeviceInfoReply(uint8_t *buf, size_t bytes, uint32_t gpuCores);
+// Mirror of Apple's parseDeviceInfo for host tests and the self-test: `pairs` pairs from buf into out[kDeviceInfoBytes] (which the caller zeroed), including the
+// post-processing of MaxMetalShaderVersion (default 0x20002, clamp to 0x20007, split into major/minor at +0xd8/+0xdc).
+void parseDeviceInfoReference(const uint8_t *buf, uint32_t pairs, uint8_t out[kDeviceInfoBytes]);
+// Describe the values we answer with: calls fn(key, name, value, why) for each.
+typedef void (*ReplyValueSink)(void *user, uint8_t key, const char *name, uint32_t value, const char *why);
+void forEachReplyValue(ReplyValueSink fn, void *user, uint32_t gpuCores);
+
 } // namespace pvstream
 
 #endif /* RDNA4PvStream_hpp */

@@ -121,7 +121,7 @@ def parse_class(img, c):
         for i in range(n):
             e = ivl + 8 + 32 * i
             offp = img.ptr(e)
-            k['ivars'].append((img.u(offp, 4), img.cstr(img.ptr(e + 8)), img.cstr(img.ptr(e + 16)), img.u(e + 28, 4)))
+            k['ivars'].append((img.u(offp, 4), img.cstr(img.ptr(e + 8)), img.cstr(img.ptr(e + 16), 6000), img.u(e + 28, 4)))
     return k
 
 
