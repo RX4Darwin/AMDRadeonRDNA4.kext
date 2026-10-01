@@ -9,7 +9,7 @@
 #   serve start|stop|status
 #                    the HTTP server (127.0.0.1:8088, reachable from the guest as http://10.0.2.2:8088/) that hands app.tar and the
 #                    18 GB SharedSupport.dmg to the Recovery VM: the installer is NOT downloaded again from Apple
-#   start <mode> [--wait SECS] [--extra "QEMU args"]
+#   start <mode> [--wait SECS] [--extra "QEMU args"] [--rdna4 ["dev opts"]]   (--rdna4: the emulated RX 9070 XT instead of vmware-svga)
 #                    boot the VM headless, in the background. mode = which disks are attached:
 #                      recovery   OpenCore + Recovery (BaseSystem) + target + stage + media   (prepare the installer media)
 #                      installer  OpenCore + media + target                                   (boot the installer, install)
@@ -118,9 +118,13 @@ cmd_serve() {
 
 cmd_start() {
 	local mode=${1:-run}; shift || true
-	local wait=0 extra=""
+	local wait=0 extra="" rdna4=0 rdna4_opts=""
 	while [ $# -gt 0 ]; do
-		case $1 in --wait) wait=$2; shift ;; --extra) extra=$2; shift ;; *) die "start: unknown $1" ;; esac
+		case $1 in
+			--wait) wait=$2; shift ;; --extra) extra=$2; shift ;;
+			--rdna4) rdna4=1; case ${2:-} in ""|--*) ;; *) rdna4_opts=$2; shift ;; esac ;;   # the emulated RX 9070 XT instead of vmware-svga (options e.g. trace=on)
+			*) die "start: unknown $1" ;;
+		esac
 		shift
 	done
 	vm_pid >/dev/null && die "a VM of ours is already running (pid $(vm_pid)): emu-full.sh stop"
@@ -164,11 +168,25 @@ cmd_start() {
 		-device ich9-ahci,id=sata "${dargs[@]}"
 		-netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" -device virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:c9:18:28
 		-monitor "unix:$MON,server,nowait" -serial "file:$SERIAL" -pidfile "$PIDF"
-		-device vmware-svga -display none -vnc "127.0.0.1:${VNC_DISPLAY:-9}"
+		-display none -vnc "127.0.0.1:${VNC_DISPLAY:-9}"
 	)
+	if [ "$rdna4" = 1 ]; then
+		# Same device line as tools/emu-boot.sh: alone on the root bus, -vga none (no stdvga for OVMF to pick as the boot display).
+		local rom state flash r
+		for r in "$HERE" "$HOME/work/rx4darwin/RDNA4FB-emu" "$HOME/work/rx4darwin/RDNA4FB"; do
+			[ -z "${rom:-}" ] && [ -f "$r/build-emu/rdna4.rom" ] && rom=$r/build-emu/rdna4.rom
+			[ -z "${state:-}" ] && [ -f "$r/emu/qemu/gop-state.txt" ] && state=$r/emu/qemu/gop-state.txt
+			[ -z "${flash:-}" ] && [ -f "$r/firmware/Sapphire.RX9070XT.16384.241213.rom" ] && flash=$r/firmware/Sapphire.RX9070XT.16384.241213.rom
+		done
+		rom=${RDNA4_ROM:-${rom:-}}; state=${RDNA4_STATE:-${state:-}}; flash=${RDNA4_FLASH:-${flash:-}}
+		for r in "$rom" "$state" "$flash"; do [ -f "${r:-/nonexistent}" ] || die "--rdna4: missing rom/state/flash ($rom $state $flash; env RDNA4_ROM/RDNA4_STATE/RDNA4_FLASH)"; done
+		args+=(-vga none -device "rdna4,id=rdna4,bus=pcie.0,addr=0x10,romfile=$rom,state=$state,flash=$flash${rdna4_opts:+,$rdna4_opts}")
+	else
+		args+=(-device vmware-svga)
+	fi
 	# shellcheck disable=SC2206
 	args+=($extra)
-	echo "emu-full: $mode: disks $disks; RAM ${RAM_MB:-6144} MB; monitor $MON; VNC 127.0.0.1:${VNC_DISPLAY:-9}; ssh 127.0.0.1:$SSH_PORT; serial $SERIAL" | tee "$FULL/logs/last-start.txt"
+	echo "emu-full: $mode: disks $disks; display $([ "$rdna4" = 1 ] && echo "rdna4 device" || echo vmware-svga); RAM ${RAM_MB:-6144} MB; monitor $MON; VNC 127.0.0.1:${VNC_DISPLAY:-9}; ssh 127.0.0.1:$SSH_PORT; serial $SERIAL" | tee "$FULL/logs/last-start.txt"
 	echo "$QEMU_BIN ${args[*]}" >> "$FULL/logs/last-start.txt"
 	setsid nohup nice -n "${NICE:-10}" "$QEMU_BIN" "${args[@]}" > "$FULL/logs/qemu.out" 2>&1 < /dev/null &
 	local i
@@ -244,6 +262,23 @@ cmd_con() {   # con "shell cmd" [SECS]: run in the guest Terminal (Recovery/inst
 	tail -c +"$((n + 1))" "$SERIAL" | grep -a "EFULLOUT|" | sed 's/.*EFULLOUT|//' | tr -d '\r' || true
 }
 
+cmd_provision() {   # provision: in Recovery (target installed, DISKS has target), create user/Remote Login/key/skip Setup Assistant
+	local user=${SSH_USER} pass=${SSH_PASS:-dev}
+	mkdir -p "$FULL/ssh" "$FULL/serve"
+	[ -f "$SSH_KEY" ] || ssh-keygen -q -t ed25519 -N "" -C "emu-full" -f "$SSH_KEY"
+	cp "$HERE/tools/emu-full-guest.sh" "$FULL/serve/emu-full-guest.sh"
+	cmd_con "curl -so /tmp/g.sh http://10.0.2.2:$HTTP_PORT/emu-full-guest.sh && bash /tmp/g.sh provision '$user' '$pass' '$(cat "$SSH_KEY.pub")'" "${1:-120}"
+}
+
+cmd_verify() {   # verify: the facts M0 needs, read from the installed volume (Recovery, via con) or over SSH (installed macOS running)
+	if [ -f "$SSH_KEY" ] && ( cmd_ssh true ) >/dev/null 2>&1; then
+		cmd_ssh 'sw_vers; echo "--- AppleParavirtGPU"; ls -d /System/Library/Extensions/*Paravirt* 2>&1; kmutil showloaded 2>/dev/null | grep -i -E "paravirt|RDNA4" || echo "(no paravirt/RDNA4 kext loaded)"; echo "--- kernel"; uname -a; sysctl kern.bootargs machdep.cpu.brand_string kern.hv_vmm_present 2>&1; echo "--- SIP/AMFI"; csrutil status 2>&1; nvram boot-args 2>&1'
+	else
+		cp "$HERE/tools/emu-full-guest.sh" "$FULL/serve/emu-full-guest.sh"
+		cmd_con "curl -so /tmp/g.sh http://10.0.2.2:$HTTP_PORT/emu-full-guest.sh && bash /tmp/g.sh verify" "${1:-120}"
+	fi
+}
+
 cmd_ssh() {
 	[ -f "$SSH_KEY" ] || die "no SSH key at $SSH_KEY (run provision from Recovery first)"
 	exec ssh -i "$SSH_KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile="$FULL/ssh/known_hosts" -o BatchMode=yes -o ConnectTimeout=10 "$SSH_USER@127.0.0.1" "$@"
@@ -265,6 +300,8 @@ case $c in
 	wait) cmd_wait "$@" ;;
 	con) cmd_con "$@" ;;
 	ssh) cmd_ssh "$@" ;;
+	provision) cmd_provision "$@" ;;
+	verify) cmd_verify "$@" ;;
 	-h|--help|help) sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//' ;;
 	*) die "unknown command $c (try: help)" ;;
 esac
