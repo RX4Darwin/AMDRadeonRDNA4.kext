@@ -160,7 +160,7 @@ USER_FLAGS := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK
               -mmacosx-version-min=$(DEPLOY) -std=c11 -O2 -Wall -Iinclude -Isrc
 
 # --- rules -------------------------------------------------------------------
-.PHONY: all clean test userspace check-isa census-tool
+.PHONY: all clean test userspace check-isa census-tool census-stub census-pathlog
 all: $(KEXT) $(RUN_TOOL)
 
 $(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp src/amdfw.cpp src/amdfw.hpp src/psp.cpp src/psp.hpp src/sdma.cpp src/sdma.hpp src/pm4.cpp src/pm4.hpp src/codeobj.cpp src/codeobj.hpp src/vadd_codeobj.h src/bench_codeobj.h src/gfxregs.hpp src/linuxref.hpp src/gpuheap.cpp src/gpuheap.hpp src/flip.hpp include/rdna4compute.h src/ihdecode.cpp src/ih.hpp src/gpuvm.cpp src/gpuvm.hpp src/vmid.cpp src/vmid.hpp src/ptpages.cpp src/ptpages.hpp src/gpuvmtable.cpp src/gpuvmtable.hpp
@@ -183,6 +183,26 @@ $(CENSUS_TOOL): tools/accelcensus/census.m
 		-mmacosx-version-min=$(DEPLOY) -std=gnu11 -O1 -Wall $< -framework Foundation -framework Metal -framework IOKit -o $@
 
 census-tool: $(CENSUS_TOOL)
+
+# E1c stub bundle (docs/metal-spike.md s.11.4): a Metal device bundle that only logs. MTLIOAccelDevice is private (exported by Metal), hence
+# dynamic_lookup for the superclass reference.
+CENSUS_STUB := $(BUILD)/RDNA4CensusMTLDriver.bundle
+$(CENSUS_STUB): tools/accelcensus/stub/RDNA4CensusMTLDriver.m tools/accelcensus/stub/Info.plist
+	@mkdir -p $@/Contents/MacOS
+	$(CXX) -x objective-c -fno-objc-arc -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
+		-mmacosx-version-min=$(DEPLOY) -std=gnu11 -O1 -Wall -bundle -undefined dynamic_lookup \
+		tools/accelcensus/stub/RDNA4CensusMTLDriver.m -framework Foundation -o $@/Contents/MacOS/RDNA4CensusMTLDriver
+	cp tools/accelcensus/stub/Info.plist $@/Contents/Info.plist
+
+census-stub: $(CENSUS_STUB)
+
+CENSUS_PATHLOG := $(BUILD)/libpathlog.dylib
+$(CENSUS_PATHLOG): tools/accelcensus/pathlog.c
+	@mkdir -p $(BUILD)
+	$(CXX) -x c -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) -mmacosx-version-min=$(DEPLOY) -std=gnu11 -O1 -Wall \
+		-dynamiclib $< -o $@
+
+census-pathlog: $(CENSUS_PATHLOG)
 
 check-isa:
 	bash tools/check-isa.sh

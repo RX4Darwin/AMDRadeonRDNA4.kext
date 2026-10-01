@@ -29,7 +29,8 @@ uint32_t gLevel { 0 };
 RDNA4AccelCensus *gService { nullptr };
 uint32_t gLines { 0 };
 uint32_t gClients { 0 };
-constexpr uint32_t kMaxLines = 600;              // kernel log lines per boot
+constexpr uint32_t kMaxLines = 2500;             // kernel log lines per boot
+uint32_t gNoise { 0 };                           // generic registry-walk reads that are not logged (E1: 132 'exclave-assigned' alone)
 char gRegistry[6144] {};                          // the same entries, compact, in the registry property CensusLog
 uint32_t gRegistryLen { 0 };
 bool gRegistryFull { false };
@@ -82,6 +83,12 @@ void census(bool flush, const char *fmt, ...) {
 }
 
 bool fromUser() { return proc_selfpid() != 0; }
+
+// Property reads that every registry walk does to every node (E1 level 1: exclave-assigned x132, IOUserServiceProperties, BSD Name,
+// IOPlatform*Action). They never carry information about the accelerator and ate a fifth of the line budget; they are only counted.
+bool noisyKey(const char *k) {
+	return !strcmp(k, "exclave-assigned") || !strcmp(k, "IOUserServiceProperties") || !strcmp(k, "BSD Name") || !strncmp(k, "IOPlatform", 10);
+}
 
 void hexBytes(char *out, size_t cap, const void *p, size_t n) {
 	out[0] = '\0';
@@ -174,15 +181,23 @@ IOReturn RDNA4AccelCensus::newUserClient(task_t owningTask, void *securityID, UI
 
 OSObject *RDNA4AccelCensus::copyProperty(const OSSymbol *aKey) const {
 	OSObject *o = IOService::copyProperty(aKey);
-	if (fromUser() && aKey && strcmp(aKey->getCStringNoCopy(), "CensusLog") != 0)
-		census(false, "read property %s -> %s", aKey->getCStringNoCopy(), o ? "present" : "ABSENT");
+	if (fromUser() && aKey && strcmp(aKey->getCStringNoCopy(), "CensusLog") != 0) {
+		if (noisyKey(aKey->getCStringNoCopy()))
+			__atomic_fetch_add(&gNoise, 1u, __ATOMIC_RELAXED);
+		else
+			census(false, "read property %s -> %s", aKey->getCStringNoCopy(), o ? "present" : "ABSENT");
+	}
 	return o;
 }
 
 OSObject *RDNA4AccelCensus::getProperty(const OSSymbol *aKey) const {
 	OSObject *o = IOService::getProperty(aKey);
-	if (fromUser() && aKey && strcmp(aKey->getCStringNoCopy(), "CensusLog") != 0)
-		census(false, "get property %s -> %s", aKey->getCStringNoCopy(), o ? "present" : "ABSENT");
+	if (fromUser() && aKey && strcmp(aKey->getCStringNoCopy(), "CensusLog") != 0) {
+		if (noisyKey(aKey->getCStringNoCopy()))
+			__atomic_fetch_add(&gNoise, 1u, __ATOMIC_RELAXED);
+		else
+			census(false, "get property %s -> %s", aKey->getCStringNoCopy(), o ? "present" : "ABSENT");
+	}
 	return o;
 }
 
@@ -223,7 +238,8 @@ bool RDNA4AccelCensusClient::initWithTask(task_t owningTask, void *securityToken
 	mType = type;
 	mPid = proc_selfpid();
 	mId = ++gClients;
-	census(true, "client #%u opened, type %u", mId, static_cast<unsigned>(type));
+	census(true, "client #%u opened, type %u (%u generic property reads not logged so far)", mId, static_cast<unsigned>(type),
+	       __atomic_load_n(&gNoise, __ATOMIC_RELAXED));
 	return true;
 }
 
