@@ -59,7 +59,7 @@ selftest: driver's mapping and the host's pointer are the same RAM  ok
 selftest: version handshake: 6 written, 6 read back                ok
 selftest: FIFO buffer (0x10000 bytes, options 0x890) allocated and wired   ok
 host: FIFO announced: page 0x..., length 0x10000, ring start 0x1000, root page 0x0, version 6
-host: fifo @0xeff8: cmd 0x3a GetDeviceInfo, 24 bytes (12 payload), 0 barrier(s), signal 0x7: reply buffer page 0x1234, 512 bytes   (written across the ring's wrap)
+host: fifo @0xeff8: cmd 0x3a GetDeviceInfo, 24 bytes (12 payload), 0 barrier(s), signal 0x7: reply buffer page 0x1234, 4096 bytes   (written across the ring's wrap)
 host: fifo @0xf010: cmd 0x30 DefineChannel, 16 bytes (4 payload), 0 barrier(s), signal 0x0: channel 3
 selftest: host consumed the FIFO (FIFO_READ caught up with FIFO_WRITTEN)   ok
 selftest: host mapped the announced FIFO page                      ok
