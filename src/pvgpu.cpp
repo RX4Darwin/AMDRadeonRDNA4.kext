@@ -112,10 +112,25 @@ private:
 	friend class RDNA4PvTestOwner;
 	void pollRegisters();
 	void pollFifo();
+	// A source of FIFO commands: the root FIFO ring (channel 0, stamp 0) or the ring of a child channel.
+	struct CmdSource {
+		const char *tag;
+		const uint8_t *ring;      // contiguous mapping of the ring
+		uint32_t ringLen;
+		uint32_t stampIndex;      // stamp slot the completions of this source go to
+		uint32_t channel;         // 0 = root FIFO
+	};
+	void consume(const CmdSource &src, uint32_t read, uint32_t n);
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd);
-	void completeStamp(uint32_t value);
+	void completeStamp(uint32_t index, uint32_t value);
 	void unmapFifo();
+	// child channels (docs/m1-stream.md s.1): DefineChannel -> state record in the root page -> page-list ring
+	void mapRoot();
+	void defineChannel(uint32_t n);
+	void freeChannel(uint32_t n);
+	void dropChannels();
+	void pollChannels();
 	void selfTest();
 
 	RDNA4PvNub *mNub { nullptr };
@@ -136,13 +151,34 @@ private:
 	uint32_t mBadHeaders { 0 };
 	uint8_t mWin[1024] {};              // one FIFO command copied out of the ring for decoding
 
+	// Guest-supplied sizes are validated before anything is mapped: at most kMaxChannels channels, rings of at most kMaxRingPages pages.
+	static constexpr uint32_t kMaxChannels = 16;
+	static constexpr uint32_t kMaxRingPages = 256;
+	static constexpr uint32_t kRecordOffset = 0x400, kRecordBytes = 20;   // channel n's state record: root page + 0x400 + (n - 1) * 20
+	struct Channel {
+		bool live { false };
+		uint32_t kind { 0 };               // the record's u16 at +0xc: the channel's stamp index
+		uint32_t ringBytes { 0 };
+		IOMemoryDescriptor *desc { nullptr };
+		IOMemoryMap *map { nullptr };
+	};
+	Channel mCh[kMaxChannels + 1];
+	IOMemoryDescriptor *mRootDesc { nullptr };
+	IOMemoryMap *mRootMap { nullptr };
+	uint32_t mRootPfn { 0 };
+	uint32_t mPendingDefine { 0 };      // channels defined before the root page was announced
+	uint32_t mChannelPolls { 0 };
+
 	// self-test state machine (level 2)
 	enum Step { kStepIdle, kStepWaitFifo, kStepWaitHostIrq, kStepWaitInterrupt, kStepDone } mStep { kStepIdle };
 	uint64_t mStepDeadline { 0 };
 	bool mTestOk { true };
 	IOBufferMemoryDescriptor *mTestFifo { nullptr };
 	IOBufferMemoryDescriptor *mTestReply { nullptr };
-	IOBufferMemoryDescriptor *mTestShared { nullptr };  // the display shared state page of the self-test's DisplaySetupSharedState   // the GetDeviceInfo reply buffer the test driver announces
+	IOBufferMemoryDescriptor *mTestShared { nullptr };  // the display shared state page of the self-test's DisplaySetupSharedState on the root FIFO
+	IOBufferMemoryDescriptor *mTestShared2 { nullptr }; // ... and of the one on the child channel
+	IOBufferMemoryDescriptor *mTestRoot { nullptr };    // the root page (channel state records)
+	IOBufferMemoryDescriptor *mTestChan { nullptr };    // a child channel's page list (page 0) and ring (pages 1..2)
 	IOMemoryMap *mTestBar { nullptr };
 	uint64_t mTestExpect { 0 };
 	IOWorkLoop *mTestLoop { nullptr };
@@ -199,7 +235,9 @@ void RDNA4PvHost::tick() {
 		mIrqBits = 0;
 	}
 	pollRegisters();
+	mapRoot();
 	pollFifo();
+	pollChannels();
 	if (mLevel >= 2)
 		selfTest();
 	if (mTimer)
@@ -236,8 +274,10 @@ void RDNA4PvHost::pollFifo() {
 		return;
 	const uint32_t pfn = c[kRegFifoBasePage / 4], len = c[kRegFifoLength / 4], enabled = c[kRegControlFifo / 4];
 	if (!pfn || !len || !enabled) {
-		if (mFifoMap)
+		if (mFifoMap) {
+			dropChannels();
 			unmapFifo();
+		}
 		return;
 	}
 	if (pfn != mFifoPfn || len != mFifoLen) {
@@ -274,13 +314,19 @@ void RDNA4PvHost::pollFifo() {
 		c[kRegFifoRead / 4] = written;
 		return;
 	}
+	consume(CmdSource { "fifo", ring, ringLen, 0, 0 }, read, n);
+	mConsumed += n;
+	c[kRegFifoRead / 4] = written;   // acknowledge everything: AppleParavirtAccelerator::writeFifo spins until the host has read enough
+}
+
+void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 	// Decode what the guest wrote as FIFO commands ({u16 id, u16 barriers, u32 length, u32 signal, ...}, pvstream.hpp), log each by name and size.
 	uint32_t at = 0, lastSignal = 0;
 	bool haveSignal = false;
 	while (at < n) {
 		auto copy = [&](uint32_t from, uint8_t *dst, uint32_t count) {
 			for (uint32_t i = 0; i < count; i++)
-				dst[i] = ring[(read + from + i) % ringLen];
+				dst[i] = src.ring[(read + from + i) % src.ringLen];
 		};
 		const uint32_t left = n - at;
 		pvstream::FifoCommand c;
@@ -288,7 +334,7 @@ void RDNA4PvHost::pollFifo() {
 		bool ok = left >= pvstream::kFifoHeaderBytes;
 		if (ok) {
 			copy(at, head, sizeof(head));
-			ok = pvstream::fifoHeader(head, sizeof(head), &c, ringLen) && c.length <= left;
+			ok = pvstream::fifoHeader(head, sizeof(head), &c, src.ringLen) && c.length <= left;
 		}
 		if (!ok) {
 			// Not a command boundary (or a command split across guest writes): show the bytes once and give up on this batch.
@@ -299,7 +345,7 @@ void RDNA4PvHost::pollFifo() {
 				char hex[sizeof(raw) * 2 + 1];
 				for (uint32_t i = 0; i < take; i++)
 					snprintf(hex + i * 2, 3, "%02x", raw[i]);
-				pvlog("host: fifo +%u bytes at ring offset 0x%x do not start with a command header: %s%s", left, (read + at) % ringLen, hex, left > take ? "..." : "");
+				pvlog("host: %s +%u bytes at ring offset 0x%x do not start with a command header: %s%s", src.tag, left, (read + at) % src.ringLen, hex, left > take ? "..." : "");
 			}
 			break;
 		}
@@ -312,7 +358,17 @@ void RDNA4PvHost::pollFifo() {
 			} else {
 				snprintf(line, sizeof(line), "cmd 0x%02x %s, %u bytes (too large to decode here)", c.id, pvstream::fifoName(c.id) ? pvstream::fifoName(c.id) : "?", c.length);
 			}
-			pvlog("host: fifo @0x%x: %s", (read + at) % ringLen, line);
+			pvlog("host: %s @0x%x: %s", src.tag, (read + at) % src.ringLen, line);
+		}
+		if ((c.id == 0x30 || c.id == 0x31) && src.channel == 0 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4) {
+			if (mCmds > 150)
+				copy(at, mWin, c.length);
+			uint32_t n32;
+			memcpy(&n32, mWin + c.payloadOffset, 4);
+			if (c.id == 0x30)
+				defineChannel(n32);
+			else
+				freeChannel(n32);
 		}
 		if (c.id == 0x3a && c.length <= sizeof(mWin)) {
 			if (mCmds > 150)
@@ -332,9 +388,7 @@ void RDNA4PvHost::pollFifo() {
 		at += c.length;
 	}
 	if (haveSignal)
-		completeStamp(lastSignal);
-	mConsumed += n;
-	c[kRegFifoRead / 4] = written;   // acknowledge everything: AppleParavirtAccelerator::writeFifo spins until the host has read enough
+		completeStamp(src.stampIndex, lastSignal);
 }
 
 // GetDeviceInfo (FIFO 0x3a): the record 0x2d names the 4 KiB buffer the host fills; the layout and the values are docs/m0-pvgpu.md "The GetDeviceInfo reply".
@@ -400,22 +454,166 @@ void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const
 }
 
 // Completion of a command that asked for a stamp: the driver's event machine tests `*stampPtr[index] >= value` with stampPtr[index] = (FIFO buffer page)+4*index
-// (IOAccelEventMachine2::getStampOffset); the root channel is index 0. Then INTR_STATUS_GPU bit `index` and the MSI wake the waiter (signalStamps); without
-// the interrupt the waiter finds the stamp after its next timed wake-up.
-void RDNA4PvHost::completeStamp(uint32_t value) {
-	if (!mFifoMap)
+// (IOAccelEventMachine2::getStampOffset); the root channel is index 0, a child channel's index is the `kind` of its state record. Then INTR_STATUS_GPU bit
+// `index` and the MSI wake the waiter (signalStamps); without the interrupt the waiter finds the stamp after its next timed wake-up.
+void RDNA4PvHost::completeStamp(uint32_t index, uint32_t value) {
+	if (!mFifoMap || index >= 0x1000 / 4)
 		return;
 	volatile uint32_t *stamps = reinterpret_cast<volatile uint32_t *>(mFifoMap->getVirtualAddress());
-	if (static_cast<int32_t>(value - stamps[0]) > 0)
-		stamps[0] = value;
+	if (static_cast<int32_t>(value - stamps[index]) > 0)
+		stamps[index] = value;
 	__sync_synchronize();
 	if (volatile uint32_t *c = mNub->ctrl()) {
-		c[kRegIntrStatusGpu / 4] |= 1;
-		mIrqBits |= 1;
+		if (index < 32) {
+			c[kRegIntrStatusGpu / 4] |= 1u << index;
+			mIrqBits |= 1u << index;
+		}
 	}
 	const bool delivered = mNub->raiseInterrupt(0);
-	if (mReplies <= 4 || !delivered)
-		pvlog("host: stamp[0] = %u written (FIFO page offset 0), INTR_STATUS_GPU bit 0 set, interrupt 0 %s", value, delivered ? "raised" : "not raised (no handler registered yet)");
+	static uint32_t logged = 0;
+	if (logged++ < 12 || !delivered)
+		pvlog("host: stamp[%u] = %u written (FIFO page offset 0x%x), INTR_STATUS_GPU bit %u set, interrupt 0 %s", index, value, index * 4, index,
+		      delivered ? "raised" : "not raised (no handler registered yet)");
+}
+
+// ---- child channels ----
+//
+// The driver defines a channel in two steps (AppleParavirtVirtualChannel::init): it fills the channel's 20-byte state record in the ROOT page at
+// +0x400 + (n - 1) * 20 = {u32 write, u32 read, u32 0, u16 kind (the stamp index), u16 0, u32 page-list page}, then sends FIFO command 0x30 {n}. The ring is the
+// pages listed in the page-list page (one u32 page number per 4 KiB of ring, zero-terminated since the page was zeroed). Commands are appended to the ring
+// with the root FIFO's framing; write/read are monotonic byte counters (position = counter % ring size); the guest rings ctrl+0x20 with the channel number
+// only when the ring was empty, so the host polls every defined channel.
+
+void RDNA4PvHost::mapRoot() {
+	volatile uint32_t *c = mNub->ctrl();
+	if (!c)
+		return;
+	const uint32_t pfn = c[kRegRootPage / 4];
+	if (pfn == mRootPfn)
+		return;
+	dropChannels();
+	OSSafeReleaseNULL(mRootMap);
+	OSSafeReleaseNULL(mRootDesc);
+	mRootPfn = 0;
+	if (!pfn)
+		return;
+	mRootDesc = IOMemoryDescriptor::withPhysicalAddress(static_cast<IOPhysicalAddress>(pfn) << 12, 0x1000, kIODirectionInOut);
+	mRootMap = mRootDesc ? mRootDesc->createMappingInTask(kernel_task, 0, kIOMapAnywhere) : nullptr;
+	if (!mRootMap) {
+		static uint32_t fails = 0;
+		if (fails++ < 4)
+			pvlog("host: cannot map the root page 0x%x", pfn);
+		OSSafeReleaseNULL(mRootDesc);
+		return;
+	}
+	mRootPfn = pfn;
+	pvlog("host: root page 0x%x mapped (channel state records at +0x%x)", pfn, kRecordOffset);
+	for (uint32_t n = 1; n <= kMaxChannels; n++)
+		if (mPendingDefine & (1u << n)) {
+			mPendingDefine &= ~(1u << n);
+			defineChannel(n);
+		}
+}
+
+void RDNA4PvHost::dropChannels() {
+	for (Channel &ch : mCh) {
+		OSSafeReleaseNULL(ch.map);
+		OSSafeReleaseNULL(ch.desc);
+		ch = Channel();
+	}
+	mPendingDefine = 0;
+}
+
+void RDNA4PvHost::freeChannel(uint32_t n) {
+	if (n < 1 || n > kMaxChannels || !mCh[n].live)
+		return;
+	OSSafeReleaseNULL(mCh[n].map);
+	OSSafeReleaseNULL(mCh[n].desc);
+	mCh[n] = Channel();
+	pvlog("host: channel %u freed", n);
+}
+
+void RDNA4PvHost::defineChannel(uint32_t n) {
+	if (n < 1 || n > kMaxChannels) {
+		pvlog("host: DefineChannel %u refused (channels 1..%u are supported)", n, kMaxChannels);
+		return;
+	}
+	if (!mRootMap) {
+		mPendingDefine |= 1u << n;
+		pvlog("host: DefineChannel %u before the root page was announced: kept for later", n);
+		return;
+	}
+	freeChannel(n);
+	const uint8_t *root = reinterpret_cast<const uint8_t *>(mRootMap->getVirtualAddress());
+	const uint32_t off = kRecordOffset + (n - 1) * kRecordBytes;       // < 0x1000 for every n <= kMaxChannels
+	uint32_t rec[kRecordBytes / 4];
+	memcpy(rec, root + off, sizeof(rec));
+	const uint32_t listPfn = rec[4];
+	const uint32_t kind = rec[3] & 0xffff;
+	if (!listPfn) {
+		pvlog("host: channel %u: state record has no page list (record %08x %08x %08x %08x %08x)", n, rec[0], rec[1], rec[2], rec[3], rec[4]);
+		return;
+	}
+	IOMemoryDescriptor *listDesc = IOMemoryDescriptor::withPhysicalAddress(static_cast<IOPhysicalAddress>(listPfn) << 12, 0x1000, kIODirectionIn);
+	IOMemoryMap *listMap = listDesc ? listDesc->createMappingInTask(kernel_task, 0, kIOMapAnywhere) : nullptr;
+	if (!listMap) {
+		pvlog("host: channel %u: cannot map the page list 0x%x", n, listPfn);
+		OSSafeReleaseNULL(listDesc);
+		return;
+	}
+	uint32_t pages = 0;
+	const uint32_t *list = reinterpret_cast<const uint32_t *>(listMap->getVirtualAddress());
+	while (pages < kMaxRingPages && pages < 0x1000 / 4 && list[pages])
+		pages++;
+	IOAddressRange *ranges = pages ? static_cast<IOAddressRange *>(IOMalloc(pages * sizeof(IOAddressRange))) : nullptr;
+	if (ranges) {
+		for (uint32_t i = 0; i < pages; i++) {
+			ranges[i].address = static_cast<mach_vm_address_t>(list[i]) << 12;
+			ranges[i].length = 0x1000;
+		}
+		mCh[n].desc = IOMemoryDescriptor::withAddressRanges(ranges, pages, kIODirectionInOut | kIOMemoryTypePhysical64, nullptr);
+		IOFree(ranges, pages * sizeof(IOAddressRange));
+	}
+	listMap->release();
+	listDesc->release();
+	mCh[n].map = mCh[n].desc ? mCh[n].desc->createMappingInTask(kernel_task, 0, kIOMapAnywhere) : nullptr;
+	if (!mCh[n].map) {
+		pvlog("host: channel %u: cannot map its ring (%u pages listed in page 0x%x)", n, pages, listPfn);
+		OSSafeReleaseNULL(mCh[n].desc);
+		mCh[n] = Channel();
+		return;
+	}
+	mCh[n].live = true;
+	mCh[n].kind = kind;
+	mCh[n].ringBytes = pages * 0x1000;
+	pvlog("host: channel %u defined: stamp index %u, ring of %u pages (%u bytes) from page list 0x%x, counters write %u read %u", n, kind, pages, pages * 0x1000, listPfn,
+	      rec[0], rec[1]);
+}
+
+void RDNA4PvHost::pollChannels() {
+	if (!mRootMap)
+		return;
+	uint8_t *root = reinterpret_cast<uint8_t *>(mRootMap->getVirtualAddress());
+	for (uint32_t n = 1; n <= kMaxChannels; n++) {
+		Channel &ch = mCh[n];
+		if (!ch.live)
+			continue;
+		volatile uint32_t *rec = reinterpret_cast<volatile uint32_t *>(root + kRecordOffset + (n - 1) * kRecordBytes);
+		const uint32_t written = rec[0], read = rec[1];
+		if (written == read)
+			continue;
+		const uint32_t pending = written - read;
+		if (pending > ch.ringBytes) {
+			pvlog("host: channel %u claims %u bytes pending in a %u byte ring (read %u, written %u): resynchronising", n, pending, ch.ringBytes, read, written);
+			rec[1] = written;
+			continue;
+		}
+		char tag[12];
+		snprintf(tag, sizeof(tag), "ch%u", n);
+		mChannelPolls++;
+		consume(CmdSource { tag, reinterpret_cast<const uint8_t *>(ch.map->getVirtualAddress()), ch.ringBytes, ch.kind, n }, read, pending);
+		rec[1] = written;   // the guest compares it with the write counter to see that the ring is empty and how much room is left
+	}
 }
 
 // ---- self-test: plays the guest driver against the nub (the register sequence of AppleParavirtAccelerator, s.6.1) ----
@@ -423,9 +621,10 @@ void RDNA4PvHost::completeStamp(uint32_t value) {
 class RDNA4PvTestOwner : public OSObject {
 	OSDeclareDefaultStructors(RDNA4PvTestOwner)
 public:
-	static void action(OSObject *owner, IOInterruptEventSource *, int) {
+	static void action(OSObject *owner, IOInterruptEventSource *, int count) {
+		// `count`: how many interrupts were coalesced into this call of the work loop
 		if (auto *o = OSDynamicCast(RDNA4PvTestOwner, owner))
-			__atomic_add_fetch(&o->host->mTestIrqSeen, 1u, __ATOMIC_RELAXED);
+			__atomic_add_fetch(&o->host->mTestIrqSeen, count > 0 ? static_cast<uint32_t>(count) : 1u, __ATOMIC_RELAXED);
 	}
 	static RDNA4PvTestOwner *create(RDNA4PvHost *host) {
 		auto *o = OSTypeAlloc(RDNA4PvTestOwner);
@@ -480,6 +679,31 @@ void RDNA4PvHost::selfTest() {
 		uint8_t *fifo = static_cast<uint8_t *>(mTestFifo->getBytesNoCopy());
 		bzero(fifo, 0x1000);
 		const uint64_t phys = mTestFifo->getPhysicalAddress();
+		// setupRoot: the 4 KiB root page, announced before the FIFO; and one child channel the way VirtualChannel::init builds it: a 12 KiB buffer whose first
+		// page is the page list, pages 1 and 2 the ring (8 KiB), the channel's state record in the root page, then (below) FIFO command DefineChannel
+		mTestRoot = IOBufferMemoryDescriptor::withOptions(0x890, 0x1000, 1);
+		mTestChan = IOBufferMemoryDescriptor::withOptions(0x890, 0x3000, 1);
+		testCheck(mTestRoot && mTestChan && mTestRoot->prepare() == kIOReturnSuccess && mTestChan->prepare() == kIOReturnSuccess,
+		          "root page and a child channel (page list + 2 ring pages) allocated and wired");
+		if (!mTestRoot || !mTestChan) {
+			mStep = kStepDone;
+			break;
+		}
+		uint8_t *rootPage = static_cast<uint8_t *>(mTestRoot->getBytesNoCopy());
+		uint8_t *chanMem = static_cast<uint8_t *>(mTestChan->getBytesNoCopy());
+		bzero(rootPage, 0x1000);
+		bzero(chanMem, 0x3000);
+		const uint32_t chanPfn = static_cast<uint32_t>(mTestChan->getPhysicalAddress() >> 12);
+		const uint32_t chanRing = 0x2000, chanNumber = 3, chanKind = 3;
+		reinterpret_cast<uint32_t *>(chanMem)[0] = chanPfn + 1;     // page list: the ring's pages
+		reinterpret_cast<uint32_t *>(chanMem)[1] = chanPfn + 2;
+		uint32_t *record = reinterpret_cast<uint32_t *>(rootPage + 0x400 + (chanNumber - 1) * 20);
+		record[0] = chanRing - 8;     // write counter: start 8 bytes before the end of the ring so the first command wraps
+		record[1] = chanRing - 8;     // read counter
+		record[2] = 0;
+		record[3] = chanKind;         // u16 kind (stamp index), u16 0
+		record[4] = chanPfn;          // page-list page
+		c[kRegRootPage / 4] = static_cast<uint32_t>(mTestRoot->getPhysicalAddress() >> 12);
 		c[kRegFifoBasePage / 4] = static_cast<uint32_t>(phys >> 12);
 		c[kRegFifoLength / 4] = static_cast<uint32_t>(mTestFifo->getLength());
 		c[kRegFifoStart / 4] = 0x1000;
@@ -520,6 +744,19 @@ void RDNA4PvHost::selfTest() {
 		}
 		bzero(mTestShared->getBytesNoCopy(), 0x1000);
 		const uint32_t sharedPage = static_cast<uint32_t>(mTestShared->getPhysicalAddress() >> 12);
+		mTestShared2 = IOBufferMemoryDescriptor::withOptions(0x890, 0x1000, 1);
+		testCheck(mTestShared2 && mTestShared2->prepare() == kIOReturnSuccess, "second display shared state page (for the child channel) allocated and wired");
+		if (!mTestShared2) {
+			mStep = kStepDone;
+			break;
+		}
+		bzero(mTestShared2->getBytesNoCopy(), 0x1000);
+		// the Display pipe's command on the child channel: DisplaySetupSharedState {port 5, page}, signal 7, 20 bytes across the ring's wrap; then the write counter
+		const uint32_t childCmd[5] = { 0x00000001, 20, 7, 5, static_cast<uint32_t>(mTestShared2->getPhysicalAddress() >> 12) };
+		for (uint32_t i = 0; i < sizeof(childCmd); i++)
+			chanMem[0x1000 + (record[0] + i) % chanRing] = reinterpret_cast<const uint8_t *>(childCmd)[i];
+		__sync_synchronize();
+		record[0] += sizeof(childCmd);
 		const uint32_t cmds[15] = {
 			0x00000030, 16, 0, 3,                                          // {u16 id 0x30, u16 0}, length 16, signal 0, channel 3
 			0x0000003a, 24, 1, pvstream::kDeviceInfoRecord, 0x200, replyPage, // {u16 id 0x3a, u16 0}, length 24, signal 1, record {0x2d, 4096/8, page}
@@ -539,11 +776,12 @@ void RDNA4PvHost::selfTest() {
 		volatile uint32_t *c = reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(mTestBar->getVirtualAddress()) + kCtrl);
 		const uint8_t *fifo = static_cast<const uint8_t *>(mTestFifo->getBytesNoCopy());
 		const bool consumed = c[kRegFifoRead / 4] == c[kRegFifoWritten / 4];
-		if (!(consumed && mReplies >= 1 && *reinterpret_cast<const volatile uint32_t *>(fifo) == 2) && nowMs() < mStepDeadline)
+		const volatile uint32_t *stamps = reinterpret_cast<const volatile uint32_t *>(fifo);
+		if (!(consumed && mReplies >= 1 && stamps[0] == 2 && stamps[3] == 7) && nowMs() < mStepDeadline)
 			return;
 		testCheck(consumed, "host consumed the FIFO (FIFO_READ caught up with FIFO_WRITTEN)");
 		testCheck(mFifoMap != nullptr && mFifoPfn == c[kRegFifoBasePage / 4], "host mapped the announced FIFO page");
-		testCheck(mCmds >= 3, "host decoded the three FIFO commands");
+		testCheck(mCmds >= 4, "host decoded the four FIFO commands (three on the root FIFO, one on the child channel)");
 		testCheck(mReplies == 1, "host answered GetDeviceInfo once");
 		// the reply: exactly what buildDeviceInfoReply gives, and Apple's parser (mirror) reads it into the struct the Metal bundle will see
 		uint8_t expect[0x1000];
@@ -563,16 +801,23 @@ void RDNA4PvHost::selfTest() {
 		uint16_t port16;
 		memcpy(&port16, static_cast<const uint8_t *>(mTestShared->getBytesNoCopy()) + 0x12, 2);
 		testCheck(port16 == 2, "display shared state page: port 2 written at +0x12 (what AppleParavirtDisplayPipe asserts)");
+		// the child channel: defined from its state record, its ring read through the page list, the command on it answered, its stamp and its record updated
+		testCheck(mCh[3].live && mCh[3].kind == 3 && mCh[3].ringBytes == 0x2000, "child channel 3 defined from the root page record (stamp index 3, ring of 2 pages)");
+		testCheck(stamps[3] == 7, "stamp[3] == 7 in the FIFO page (the child command's signal)");
+		memcpy(&port16, static_cast<const uint8_t *>(mTestShared2->getBytesNoCopy()) + 0x12, 2);
+		testCheck(port16 == 5, "child channel: DisplaySetupSharedState answered: port 5 written at +0x12");
+		const uint32_t *rec = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(mTestRoot->getBytesNoCopy()) + 0x400 + 2 * 20);
+		testCheck(rec[1] == rec[0] && rec[0] == 0x1ff8 + 20, "child channel record: read counter caught up with write counter (0x200c)");
 		mStep = kStepWaitHostIrq;
 		mStepDeadline = nowMs() + 300;
 		break;
 	}
 	case kStepWaitHostIrq: {
 		volatile uint32_t *c = reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(mTestBar->getVirtualAddress()) + kCtrl);
-		if (!mTestIrqSeen && nowMs() < mStepDeadline)
+		if (mTestIrqSeen < 2 && nowMs() < mStepDeadline)
 			return;
-		testCheck(mTestIrqSeen == 1, "host raised interrupt 0 for the stamp and the registered handler ran once");
-		testCheck((c[kRegIntrStatusGpu / 4] & 1) == 0, "INTR_STATUS_GPU bit 0 dropped again by the host");
+		testCheck(mTestIrqSeen == 2, "host raised interrupt 0 for both stamps (root 0, child 3) and the registered handler saw two");
+		testCheck((c[kRegIntrStatusGpu / 4] & 9) == 0, "INTR_STATUS_GPU bits 0 and 3 dropped again by the host");
 		// and an explicit interrupt, as before
 		mTestIrqSeen = 0;
 		testCheck(mTestSource && mNub->raiseInterrupt(0), "raiseInterrupt(0): handler registered and enabled");
@@ -594,6 +839,7 @@ void RDNA4PvHost::selfTest() {
 		OSSafeReleaseNULL(mTestOwner);
 		volatile uint32_t *c = reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uint8_t *>(mTestBar->getVirtualAddress()) + kCtrl);
 		c[kRegControlFifo / 4] = 0;
+		c[kRegRootPage / 4] = 0;
 		c[kRegFifoBasePage / 4] = 0;
 		c[kRegFifoLength / 4] = 0;
 		c[kRegFifoWritten / 4] = 0;
@@ -606,7 +852,7 @@ void RDNA4PvHost::selfTest() {
 	case kStepDone: {
 		if (nowMs() >= mStepDeadline) {
 			if (mTestFifo) {
-				testCheck(mFifoMap == nullptr, "host dropped its FIFO mapping when the guest cleared it");
+				testCheck(mFifoMap == nullptr && mRootMap == nullptr && !mCh[3].live, "host dropped its FIFO, root page and channel mappings when the guest cleared the registers");
 				mTestFifo->complete();
 				OSSafeReleaseNULL(mTestFifo);
 			}
@@ -617,6 +863,18 @@ void RDNA4PvHost::selfTest() {
 			if (mTestShared) {
 				mTestShared->complete();
 				OSSafeReleaseNULL(mTestShared);
+			}
+			if (mTestShared2) {
+				mTestShared2->complete();
+				OSSafeReleaseNULL(mTestShared2);
+			}
+			if (mTestChan) {
+				mTestChan->complete();
+				OSSafeReleaseNULL(mTestChan);
+			}
+			if (mTestRoot) {
+				mTestRoot->complete();
+				OSSafeReleaseNULL(mTestRoot);
 			}
 			OSSafeReleaseNULL(mTestBar);
 			pvlog("selftest: %s", mTestOk ? "PASS" : "FAIL");
