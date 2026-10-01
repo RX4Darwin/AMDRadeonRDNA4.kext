@@ -47,7 +47,7 @@ Fallbacks if the catalogue does not offer the personality (checked from the `mat
 
 ## Tests
 
-**A. Self-test, no Apple kext, in Kiln's emulated Recovery** (level 2: the kext plays the guest driver against the nub):
+**A. Self-test, no Apple kext, in Kiln's emulated Recovery** (level 2: the kext plays the guest driver against the nub). **Measured so far:** the first run (`...-191810-boot1-m0`, tip 2118816) published the nub (the size check passed: `IOPCIDevice is 184 bytes here (header 184)`) and then **panicked with a kernel stack overflow**: `IOService::matchPropertyTable(table, score)` calls the virtual one-argument version, and the nub's overloads called each other; fixed in 1f9a905 (the PCI logic is in a helper that calls neither). The re-run is queued with Kiln.
 `KEXT=~/work/rx4darwin/RDNA4FB-m0/build/RDNA4FB.kext tools/emu-linux.sh 1 --extra 'rdna4-pvgpu=2'`, then read `rdna4fb.log`. Expected lines (all prefixed `RDNA4FB: pvgpu:`):
 
 ```
@@ -59,7 +59,8 @@ selftest: driver's mapping and the host's pointer are the same RAM  ok
 selftest: version handshake: 6 written, 6 read back                ok
 selftest: FIFO buffer (0x10000 bytes, options 0x890) allocated and wired   ok
 host: FIFO announced: page 0x..., length 0x10000, ring start 0x1000, root page 0x0, version 6
-host: fifo +16 bytes at ring offset 0x...: 10000000dec0adde0102030405060708     (the command written across the ring's wrap)
+host: fifo @0xeff8: cmd 0x3a GetDeviceInfo, 24 bytes (12 payload), 0 barrier(s), signal 0x7: reply buffer page 0x1234, 512 bytes   (written across the ring's wrap)
+host: fifo @0xf010: cmd 0x30 DefineChannel, 16 bytes (4 payload), 0 barrier(s), signal 0x0: channel 3
 selftest: host consumed the FIFO (FIFO_READ caught up with FIFO_WRITTEN)   ok
 selftest: host mapped the announced FIFO page                      ok
 selftest: host logged at least one packet                          ok
