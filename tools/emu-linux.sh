@@ -9,6 +9,8 @@
 #                   GRACE_S (45) seconds after Recovery is up and the kext is done
 #   --extra "ARGS"  more boot-args after the table's (e.g. "rdna4-gfxcol=0")
 #   --args "ARGS"   replace the table: use exactly these boot-args
+#   --post FILE     with --diag: a shell script run in the guest after the diagnostic (cwd /tmp,
+#                   rdna4-run is /tmp/rdna4-run); its output comes back as post.txt
 #   --dev OPTS      rdna4 device options, e.g. trace=on or ih-dead=on
 #   --diag          after the kext is done, open the Recovery Terminal (Cmd+Shift+T) and
 #                   run tools/diagnostic-log.sh with build/rdna4-run from a read-only
@@ -47,7 +49,7 @@ BASE_IMG=${BASE_IMG:-$EMU/images/BaseSystem.img}
 export QEMU_BIN=${QEMU_BIN:-$QEMU_SRC/build/qemu-system-x86_64}   # e.g. $EMU/bin/w13/qemu-system-x86_64
 export PATH="$QEMU_SRC/build:$EMU/local/bin:$PATH"   # qemu-img, mcopy/mdeltree
 
-WAIT=420 EXTRA="" ARGS="" DEV="" KEEP=0 BUILD=1 BOOT="" DIAG=0 CENSUS=0 SLEEPRESET=0 PRE=""
+WAIT=420 EXTRA="" ARGS="" DEV="" KEEP=0 BUILD=1 BOOT="" DIAG=0 CENSUS=0 SLEEPRESET=0 PRE="" POST=""
 while [ $# -gt 0 ]; do
 	case $1 in
 		--wait) WAIT=$2; shift ;;
@@ -59,6 +61,7 @@ while [ $# -gt 0 ]; do
 		--census) CENSUS=1 ;;
 		--sleep-reset) SLEEPRESET=1 ;;
 		--pre) PRE=$2; shift ;;
+		--post) POST=$(realpath "$2"); shift ;;
 		--no-build) BUILD=0 ;;
 		-h|--help) sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
 		[0-9]*) BOOT=$1 ;;   # a boot of set-boot.sh: 0-13, 9b ...
@@ -128,6 +131,13 @@ p, pre = sys.argv[1], sys.argv[2]
 s = open(p).read().replace("#PRE\n", pre + "\necho RDNA4DIAG-PRE-DONE > /dev/console\n", 1)
 open(p, "w").write(s)
 PY
+	fi
+	if [ -n "$POST" ]; then
+		cp "$POST" "$RUN/share/post.sh"
+		cat >> "$RUN/share/run-diag.sh" <<'GUEST'
+cp /Volumes/QEMU*/post.sh /tmp/post.sh
+(echo RDNA4POST-BEGIN; cd /tmp; bash /tmp/post.sh 2>&1; echo RDNA4POST-END) | sed 's/^/RDNA4POST|/' > /dev/console
+GUEST
 	fi
 	export EXTRA_QEMU="${EXTRA_QEMU:-} -drive id=share,if=none,format=raw,readonly=on,file=fat:ro:$RUN/share -device usb-storage,bus=xhci.0,drive=share"
 fi
@@ -254,11 +264,13 @@ if [ "$DIAG" = 1 ] && [ "$REC" = 1 ]; then
 	D0=$(date +%s)
 	while [ $(( $(date +%s) - D0 )) -lt "${DIAG_WAIT:-900}" ]; do
 		sleep 3
-		grep -aq "RDNA4DIAG|RDNA4DIAG-END" "$SERIAL" && break
+		if [ -n "$POST" ]; then grep -aq "RDNA4POST|RDNA4POST-END" "$SERIAL" && break
+		else grep -aq "RDNA4DIAG|RDNA4DIAG-END" "$SERIAL" && break; fi
 		grep -aqiE 'panic\(cpu' "$SERIAL" && { say "GUEST PANIC during the diagnostic"; break; }
 	done
 	sleep 2
 	shot diag
+	[ -z "$POST" ] || sed -n 's/^.*RDNA4POST|//p' "$SERIAL" | tr -d '\r' > "$RUN/post.txt"
 	if grep -aq "RDNA4DIAG|RDNA4DIAG-END" "$SERIAL"; then
 		say "diagnostic finished after $(( $(date +%s) - D0 )) s"
 		sed -n 's/^.*RDNA4DIAG|//p' "$SERIAL" | tr -d '\r' > "$RUN/diag.txt"
@@ -294,7 +306,7 @@ fi
 LAST=$(stat -c %s "$SERIAL")
 say "kernel log ${LAST} bytes after $(( $(date +%s) - START )) s"
 shot final
-grep -a "RDNA4FB" "$SERIAL" | grep -av "RDNA4DIAG|" > "$RUN/rdna4fb.log" || true
+grep -a "RDNA4FB" "$SERIAL" | grep -av "RDNA4DIAG|\|RDNA4POST|" > "$RUN/rdna4fb.log" || true
 say "$(wc -l < "$RUN/rdna4fb.log") RDNA4FB lines -> $RUN/rdna4fb.log"
 # The headline results the kext itself prints (user-space rows such as "vm PASS"
 # come from diagnostic-log.sh, not from the kernel log).
