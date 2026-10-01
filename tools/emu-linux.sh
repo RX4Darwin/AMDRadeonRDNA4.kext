@@ -138,16 +138,12 @@ if [ "$CENSUS" = 1 ]; then
 	cat > "$RUN/share/run-census.sh" <<'GUEST'
 cp /Volumes/QEMU*/rdna4-census /tmp/ && cd /tmp || exit 1
 echo RDNA4CENSUS-RUNNING > /dev/console
-(fs_usage -w -f pathname > /tmp/census.fs 2>&1 &)
-sleep 3
-./rdna4-census all > /tmp/census.out 2>&1
-sleep 2
-pkill -x fs_usage 2>/dev/null
+DYLD_PRINT_LIBRARIES=1 DYLD_PRINT_APIS=1 ./rdna4-census all > /tmp/census.out 2>&1
 (log show --last 10m --style compact > /tmp/census.log 2>&1 &)
 sleep 3
 pkill -x log 2>/dev/null
 ioreg -l -w0 -c IOAccelerator > /tmp/census.ioreg 2>&1
-(echo RDNA4CENSUS-BEGIN; cat /tmp/census.out; echo RDNA4CENSUS-IOREG; cat /tmp/census.ioreg; echo RDNA4CENSUS-LOG; head -400 /tmp/census.log; echo RDNA4CENSUS-FS; grep -aiE 'RDNA4|Census|MTL|Metal|IOAccel|GPUCompiler|AGX|AMDMTL' /tmp/census.fs | head -400; echo RDNA4CENSUS-END) |
+(echo RDNA4CENSUS-BEGIN; cat /tmp/census.out; echo RDNA4CENSUS-IOREG; cat /tmp/census.ioreg; echo RDNA4CENSUS-LOG; head -400 /tmp/census.log;  echo RDNA4CENSUS-END) |
 	sed 's/^/RDNA4CENSUS|/' > /dev/console
 GUEST
 	export EXTRA_QEMU="${EXTRA_QEMU:-} -drive id=share,if=none,format=raw,readonly=on,file=fat:ro:$RUN/share -device usb-storage,bus=xhci.0,drive=share"
