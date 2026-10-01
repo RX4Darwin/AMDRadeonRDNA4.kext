@@ -73,7 +73,7 @@ selftest: PASS
 ```
 Between them `host: ctrl+0x... a -> b` lines show the register writes the host saw (0x034, 0x004, 0x010, 0x000, 0x030). Any `FAIL` line names the check. A guest panic is data: send the serial tail. [code, not yet run]
 
-**B. Apple's kext, in a full-install VM** (`rdna4-pvgpu=1`; coordinate with Anvil, hub-task-427): the checks, in order:
+**B. Apple's kext, in a full-install VM** (`rdna4-pvgpu=1`; coordinate with Anvil, hub-task-427; `tools/m0/vm-check.sh` collects items 2-4 over ssh. Anvil's VM, measured status 2026-10-01: being installed, `tools/emu-full.sh oc --kext <kext> --args "... rdna4-pvgpu=1"`, serial log like Kiln's, **no emulated RDNA4 device yet**, so the nub is published by the fallback: `RDNA4PvNub::publishLater` publishes it under the platform expert 25 s after plugin start when the GPU path never ran): the checks, in order:
 1. Our log: `pvgpu: fake Apple paravirtual GPU published ...`, and a `match offered: com.apple.driver.AppleParavirtGPU AppleParavirtGPUControl (IOPCIMatch 0xEEEE106B) -> MATCH` line. No such line = the catalogue never offered Apple's personality (fallback (a) above).
 2. `ioreg -l -w0 -n PVGPU` shows the nub with `compatible pci106b,eeee`; `ioreg -c AppleParavirtGPUControl` shows Apple's class attached; `kextstat | grep Paravirt` (or `kmutil showloaded`) lists `com.apple.driver.AppleParavirtGPU`.
 3. Our log: `host: ctrl+0x034 0x00000000 -> 0x00000006` (version handshake), `host: FIFO announced: ...` (setupFIFO), `host: fifo +N bytes ...` (first commands). Which of these appear is the M0 result.
