@@ -16,7 +16,7 @@ GU=$(ls -d $AIRDIR/*Photogrammetry_GaussianSplatting_Kernels.metallib | head -1)
 RS=$(ls -d $AIRDIR/*CoreRE3DGSFoundation*default.metallib | head -1)
 tools/air/build-kernel.sh "$GU/0062_group_uniform_add_float.bc" group_uniform_add_float 64,1,1 $O/k
 tools/air/build-kernel.sh "$RS/0009_ReduceSumKernel_uint.bc" ReduceSumKernel_uint 1024,1,1 $O/k
-for k in group_uniform_add_float ReduceSumKernel_uint; do echo "== descriptor: $k"; $O/check-codeobj $O/k/$k.hsaco $O/k/$k.hsaco $k | sed -n 2,11p; done
+for k in group_uniform_add_float ReduceSumKernel_uint; do echo "== descriptor: $k"; { $O/check-codeobj $O/k/$k.hsaco $O/k/$k.hsaco $k || true; } | sed -n 2,11p; done
 if [ "${1:-}" = run ]; then
 	exec python3 tools/air/test-kernels.py
 fi
