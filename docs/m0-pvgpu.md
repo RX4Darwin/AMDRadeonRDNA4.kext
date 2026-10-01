@@ -47,7 +47,7 @@ Fallbacks if the catalogue does not offer the personality (checked from the `mat
 
 ## Tests
 
-**A. Self-test, no Apple kext, in Kiln's emulated Recovery** (level 2: the kext plays the guest driver against the nub). **Measured so far:** the first run (`...-191810-boot1-m0`, tip 2118816) published the nub (the size check passed: `IOPCIDevice is 184 bytes here (header 184)`) and then **panicked with a kernel stack overflow**: `IOService::matchPropertyTable(table, score)` calls the virtual one-argument version, and the nub's overloads called each other; fixed in 1f9a905 (the PCI logic is in a helper that calls neither). The re-run is queued with Kiln.
+**A. Self-test, no Apple kext, in Kiln's emulated Recovery** (level 2: the kext plays the guest driver against the nub). **Measured so far:** the first run (`...-191810-boot1-m0`, tip 2118816) published the nub (the size check passed: `IOPCIDevice is 184 bytes here (header 184)`) and then **panicked with a kernel stack overflow**: `IOService::matchPropertyTable(table, score)` calls the virtual one-argument version, and the nub's overloads called each other; fixed in 1f9a905 (the PCI logic is in a helper that calls neither). **Second run** (`...-193513-boot1-m0b`, kext with the GetDeviceInfo and display answers, 91ed891): **no panic, `selftest: PASS`**: IOKit offered the nub 40 PCI personalities (Intel/AMD framebuffers, XHCI, AHCI, NVMe, ...) and all were refused, then every check above passed in the emulated Recovery (version handshake, FIFO announce, three decoded commands across the ring wrap, the 31-pair reply, stamp 2, port 2 at +0x12, interrupt delivered, status bit dropped, mapping released).
 `KEXT=~/work/rx4darwin/RDNA4FB-m0/build/RDNA4FB.kext tools/emu-linux.sh 1 --extra 'rdna4-pvgpu=2'`, then read `rdna4fb.log`. Expected lines (all prefixed `RDNA4FB: pvgpu:`):
 
 ```
@@ -86,7 +86,7 @@ interrupt 0 unregistered
 selftest: host dropped its FIFO mapping when the guest cleared it  ok
 selftest: PASS
 ```
-Between them `host: ctrl+0x... a -> b` lines show the register writes the host saw (0x034, 0x004, 0x010, 0x000, 0x030). Any `FAIL` line names the check. A guest panic is data: send the serial tail. [code, not yet run]
+Between them `host: ctrl+0x... a -> b` lines show the register writes the host saw (0x034, 0x004, 0x010, 0x000, 0x030). Any `FAIL` line names the check. A guest panic is data: send the serial tail. [measured: PASS in run 2]
 
 **B. Apple's kext, in a full-install VM** (`rdna4-pvgpu=1`; coordinate with Anvil, hub-task-427; `tools/m0/vm-check.sh` collects items 2-4 over ssh. Anvil's VM, measured status 2026-10-01: being installed, `tools/emu-full.sh oc --kext <kext> --args "... rdna4-pvgpu=1"`, serial log like Kiln's, **no emulated RDNA4 device yet**, so the nub is published by the fallback: `RDNA4PvNub::publishLater` publishes it under the platform expert 25 s after plugin start when the GPU path never ran): the checks, in order:
 1. Our log: `pvgpu: fake Apple paravirtual GPU published ...`, and a `match offered: com.apple.driver.AppleParavirtGPU AppleParavirtGPUControl (IOPCIMatch 0xEEEE106B) -> MATCH` line. No such line = the catalogue never offered Apple's personality (fallback (a) above).
