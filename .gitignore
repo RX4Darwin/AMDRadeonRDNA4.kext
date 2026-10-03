@@ -74,6 +74,6 @@ Testing/
 firmware/amd-ucode/*
 firmware/amdgpu/*
 
-# Python
+# Python bytecode
 __pycache__/
 *.pyc
