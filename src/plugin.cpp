@@ -30,6 +30,7 @@
 #include <pexpert/pexpert.h>
 
 #include "accelcensus.hpp"
+#include "pvgpu.hpp"
 #include "compute.hpp"
 #include "device.hpp"
 #include "ndrv.hpp"
@@ -150,6 +151,7 @@ mach_vm_address_t orgVslPrepareCursor { 0 };
 bool traceEnabled { false };
 uint32_t traceBudget { 400 };   // bounded: gamma/CLUT calls can be frequent
 uint32_t computeStage { 0 };    // rdna4-compute=<stage>, see compute.hpp
+uint32_t pvGpu { 0 };           // rdna4-pvgpu=1|2: M0 of docs/metal-phase-plan.md, the fake Apple paravirtual GPU nub (pvgpu.hpp); VM/emulator only
 uint32_t accelCensus { 0 };     // rdna4-accelcensus=1|2: the E1 impostor-IOAccelerator census (accelcensus.hpp), emulator only
 
 // What we keep for one of our framebuffers.
@@ -341,6 +343,9 @@ void attach(FbEntry &e) {
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
 	if (accelCensus && dev.isAmd)
 		RDNA4AccelCensus::publish(pci, accelCensus);
+	// M0: the fake paravirtual GPU, independent of everything else here.
+	if (pvGpu && dev.isAmd)
+		RDNA4PvNub::publish(pci, pvGpu);
 
 	// Compute bring-up runs after the display is answered for, and only
 	// when asked for: it must never be the reason the desktop is missing.
@@ -521,9 +526,13 @@ void pluginStart() {
 	computeStage = RDNA4Compute::requestedStage();
 	if (!PE_parse_boot_argn("rdna4-accelcensus", &accelCensus, sizeof(accelCensus)) || accelCensus > 2)
 		accelCensus = 0;
+	if (!PE_parse_boot_argn("rdna4-pvgpu", &pvGpu, sizeof(pvGpu)) || pvGpu > 2)
+		pvGpu = 0;
+	if (pvGpu)
+		RDNA4PvNub::publishLater(pvGpu, 25000);   // a VM without the emulated RDNA4 device never reaches attach()
 	Ndrv::vslInit();
-	FBLOG("Lilu plugin started (trace %s, compute stage %u%s)", traceEnabled ? "on" : "off",
-	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "");
+	FBLOG("Lilu plugin started (trace %s, compute stage %u%s%s)", traceEnabled ? "on" : "off",
+	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "", pvGpu ? ", FAKE PARAVIRT GPU (VM only)" : "");
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
 }
 
