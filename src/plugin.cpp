@@ -320,6 +320,7 @@ struct Head2 {
 	Ndrv::Surface    surface {};
 	Modes::Mode      table[Modes::MaxModes] {};
 	uint8_t          edid[128] {};
+	uint32_t         traceBudget { 400 };   // its own: head 0 must not use up the lines
 };
 Head2 *head2 { nullptr };
 
@@ -509,7 +510,10 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 		uint16_t code = 0;
 		const IOReturn ret = head2DriverIO(contents, commandCode, code);
 		const bool lifecycle = commandCode != kIONDRVControlCommand && commandCode != kIONDRVStatusCommand;
-		if (lifecycle || (traceEnabled && traceBudget && traceBudget--))
+		const bool traced = !lifecycle && traceEnabled && head2->traceBudget;
+		if (traced)
+			head2->traceBudget--;
+		if (lifecycle || traced)
 			FBLOG("head2: %s csc %u -> 0x%x", commandName(commandCode), code, ret);
 		return ret;
 	}
