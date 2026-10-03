@@ -1,0 +1,133 @@
+registry: child exited 0
+metal: calling MTLCopyAllDevices()
+RDNA4PATH|186 stat /Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|186 lstat /System/Volumes/Data/Library/GPUBundles -> 0
+RDNA4PATH|186 lstat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|186 stat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|186 access /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|186 opendir /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|186 opendir /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents -> 0
+RDNA4PATH|186 open /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/Info.plist -> 3
+RDNA4PATH|186 stat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> 0
+RDNA4PATH|186 dlopen /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> -1 errno 0
+RDNA4PATH|186 stat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> 0
+RDNA4PATH|186 open /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> 3
+RDNA4STUB|186 +load (class registered): image /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver, process rdna4-census
+RDNA4STUB|186 hooked 762 selectors (1 skipped: struct return), superclass MTLIOAccelDevice
+RDNA4STUB|186 constructor (bundle image mapped): image /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver, process rdna4-census
+RDNA4PATH|186 dlopen /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> 0
+RDNA4PATH|186 lstat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents -> 0
+RDNA4PATH|186 lstat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS -> 0
+RDNA4PATH|186 lstat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> 0
+RDNA4PATH|186 stat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|186 access /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|186 stat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|186 access /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4STUB|186 -[initWithAcceleratorPort:] 0x2003 (call 1)
+RDNA4STUB|186 -[updateGPUSelectionProperties] (call 1)
+RDNA4STUB|186 -[isRemovable] (call 1)
+RDNA4STUB|186   -> 0
+RDNA4STUB|186 -[isSlotted] (call 1)
+RDNA4STUB|186   -> 0
+RDNA4STUB|186 -[isBuiltIn] (call 1)
+RDNA4STUB|186   -> 1
+RDNA4STUB|186 -[getBuiltInGPUProperties:transferRate:] 0x7ff7baef7318 0x7ff7baef7320 (call 1)
+RDNA4STUB|186 -[isLowPower] (call 1)
+RDNA4STUB|186   -> 0
+RDNA4STUB|186 -[supportLazyInitialization] (call 1)
+RDNA4STUB|186   -> 0
+RDNA4STUB|186 -[lazyInitialize] (call 1)
+metal: child killed by signal 11
+open: IOServiceOpen(type 0) = 0x0
+open:   type 0 selector 0 scalar call = 0x0
+open:   type 0 selector 1 scalar call = 0x0
+open:   type 0 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 1) = 0x0
+open:   type 1 selector 0 scalar call = 0x0
+open:   type 1 selector 1 scalar call = 0x0
+open:   type 1 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 2) = 0x0
+open:   type 2 selector 0 scalar call = 0x0
+open:   type 2 selector 1 scalar call = 0x0
+open:   type 2 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 4) = 0x0
+open:   type 4 selector 0 scalar call = 0x0
+open:   type 4 selector 1 scalar call = 0x0
+open:   type 4 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 5) = 0x0
+open:   type 5 selector 0 scalar call = 0x0
+open:   type 5 selector 1 scalar call = 0x0
+open:   type 5 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 6) = 0x0
+open:   type 6 selector 0 scalar call = 0x0
+open:   type 6 selector 1 scalar call = 0x0
+open:   type 6 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 7) = 0x0
+open:   type 7 selector 0 scalar call = 0x0
+open:   type 7 selector 1 scalar call = 0x0
+open:   type 7 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 8) = 0x0
+open:   type 8 selector 0 scalar call = 0x0
+open:   type 8 selector 1 scalar call = 0x0
+open:   type 8 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 9) = 0x0
+open:   type 9 selector 0 scalar call = 0x0
+open:   type 9 selector 1 scalar call = 0x0
+open:   type 9 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 256) = 0x0
+open:   type 256 selector 0 scalar call = 0x0
+open:   type 256 selector 1 scalar call = 0x0
+open:   type 256 selector 2 scalar call = 0x0
+open: child exited 0
+== round 1
+metal: calling MTLCopyAllDevices()
+RDNA4PATH|189 stat /Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|189 lstat /System/Volumes/Data/Library/GPUBundles -> 0
+RDNA4PATH|189 lstat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|189 stat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|189 access /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|189 opendir /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|189 opendir /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents -> 0
+RDNA4PATH|189 open /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/Info.plist -> 3
+RDNA4PATH|189 stat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> 0
+RDNA4PATH|189 dlopen /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> -1 errno 0
+RDNA4PATH|189 stat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> 0
+RDNA4PATH|189 open /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> 3
+RDNA4STUB|189 +load (class registered): image /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver, process rdna4-census
+RDNA4STUB|189 hooked 762 selectors (1 skipped: struct return), superclass MTLIOAccelDevice
+RDNA4STUB|189 constructor (bundle image mapped): image /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver, process rdna4-census
+RDNA4PATH|189 dlopen /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> 0
+RDNA4PATH|189 lstat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents -> 0
+RDNA4PATH|189 lstat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS -> 0
+RDNA4PATH|189 lstat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver -> 0
+RDNA4PATH|189 stat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|189 access /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|189 stat /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4PATH|189 access /System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> 0
+RDNA4STUB|189 -[initWithAcceleratorPort:] 0x2003 (call 1)
+RDNA4STUB|189 -[updateGPUSelectionProperties] (call 1)
+RDNA4STUB|189 -[isRemovable] (call 1)
+RDNA4STUB|189   -> 0
+RDNA4STUB|189 -[isSlotted] (call 1)
+RDNA4STUB|189   -> 0
+RDNA4STUB|189 -[isBuiltIn] (call 1)
+RDNA4STUB|189   -> 1
+RDNA4STUB|189 -[getBuiltInGPUProperties:transferRate:] 0x7ff7baebc338 0x7ff7baebc340 (call 1)
+RDNA4STUB|189 -[isLowPower] (call 1)
+RDNA4STUB|189   -> 0
+RDNA4STUB|189 -[supportLazyInitialization] (call 1)
+RDNA4STUB|189   -> 0
+RDNA4STUB|189 -[lazyInitialize] (call 1)
+round 1: loaded image '/System/Volumes/Data/Library/GPUBundles/RDNA4CensusMTLDriver.bundle/Contents/MacOS/RDNA4CensusMTLDriver'
+== round 2
+metal: calling MTLCopyAllDevices()
+RDNA4PATH|196 stat /Library/GPUBundles/RDNA4CensusMTLDriver.bundle -> -1 errno 2
+RDNA4PATH|196 stat /System/Library/Extensions/RDNA4CensusMTLDriver.bundle -> -1 errno 2
+metal: MTLCopyAllDevices() returned 0 device(s)
+metal: calling MTLCreateSystemDefaultDevice()
+metal: MTLCreateSystemDefaultDevice() = nil
+round 2: loaded image ''
+    | |   | |   "driver-child-bundle" = "com.apple.driver.usb.AppleUSBXHCIPCI"
+    | |   | |   "driver-child-bundle" = "com.apple.driver.usb.AppleUSBEHCIPCI"
+    | |   | |   "driver-child-bundle" = "com.apple.driver.AppleAHCIPort"
+    | |   | |   "driver-child-bundle" = "com.apple.driver.AppleAHCIPort"

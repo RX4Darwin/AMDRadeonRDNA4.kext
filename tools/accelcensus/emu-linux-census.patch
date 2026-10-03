@@ -1,0 +1,101 @@
+--- tools/emu-linux.sh	2026-09-30 18:45:41.974123871 -0300
++++ tools/emu-linux.sh	2026-09-30 18:45:41.983403674 -0300
+@@ -14,6 +14,10 @@
+ #                   run tools/diagnostic-log.sh with build/rdna4-run from a read-only
+ #                   FAT disk, as the user does on the stick; its feature table and full
+ #                   log come back over the serial console (diag-summary.txt, diag.txt)
++#   --census        E1 of docs/metal-spike.md (kext boot-arg rdna4-accelcensus=1|2, pass it with --extra): after the kext is up run build/rdna4-census
++#                   (tools/accelcensus/census.m: registry, MTLCopyAllDevices, IOServiceOpen) in the Recovery Terminal; its output and the
++#                   unified-log lines about Metal come back over the serial console (census.txt), the kext's census lines in census-kernel.log.
++#                   Not combinable with --diag.
+ #   --keep          leave the VM running afterwards (monitor socket in the run dir)
+ #   --no-build      reuse the OpenCore image of the previous run of this boot
+ #   -h              this text
+@@ -39,7 +43,7 @@
+ export QEMU_BIN=${QEMU_BIN:-$QEMU_SRC/build/qemu-system-x86_64}   # e.g. $EMU/bin/w13/qemu-system-x86_64
+ export PATH="$QEMU_SRC/build:$EMU/local/bin:$PATH"   # qemu-img, mcopy/mdeltree
+ 
+-WAIT=420 EXTRA="" ARGS="" DEV="" KEEP=0 BUILD=1 BOOT="" DIAG=0
++WAIT=420 EXTRA="" ARGS="" DEV="" KEEP=0 BUILD=1 BOOT="" DIAG=0 CENSUS=0
+ while [ $# -gt 0 ]; do
+ 	case $1 in
+ 		--wait) WAIT=$2; shift ;;
+@@ -48,6 +52,7 @@
+ 		--dev) DEV=$2; shift ;;
+ 		--keep) KEEP=1 ;;
+ 		--diag) DIAG=1 ;;
++		--census) CENSUS=1 ;;
+ 		--no-build) BUILD=0 ;;
+ 		-h|--help) sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit 0 ;;
+ 		[0-9]*) BOOT=$1 ;;   # a boot of set-boot.sh: 0-13, 9b ...
+@@ -55,6 +60,7 @@
+ 	esac
+ 	shift
+ done
++[ "$DIAG$CENSUS" != 11 ] || { echo "--diag and --census cannot be combined" >&2; exit 2; }
+ [ -n "$BOOT" ] || [ -n "$ARGS" ] || { echo "usage: $0 <boot> [options] (try -h)" >&2; exit 2; }
+ 
+ for f in "$QEMU_BIN" "$HERE/build-emu/rdna4.rom" "$KEXT/Contents/MacOS/RDNA4FB" \
+@@ -110,6 +116,23 @@
+ GUEST
+ 	export EXTRA_QEMU="${EXTRA_QEMU:-} -drive id=share,if=none,format=raw,readonly=on,file=fat:ro:$RUN/share -device usb-storage,bus=xhci.0,drive=share"
+ fi
++if [ "$CENSUS" = 1 ]; then
++	[ -f "$HERE/build/rdna4-census" ] || { echo "emu-linux: --census needs build/rdna4-census (tools/build-osxcross.sh build/rdna4-census)" >&2; exit 1; }
++	mkdir -p "$RUN/share"
++	cp "$HERE/build/rdna4-census" "$RUN/share/"
++	cat > "$RUN/share/run-census.sh" <<'GUEST'
++cp /Volumes/QEMU*/rdna4-census /tmp/ && cd /tmp || exit 1
++echo RDNA4CENSUS-RUNNING > /dev/console
++./rdna4-census all > /tmp/census.out 2>&1
++(log show --last 10m --style compact --predicate 'process == "rdna4-census" OR eventMessage CONTAINS[c] "MTL" OR eventMessage CONTAINS[c] "IOAccel" OR eventMessage CONTAINS[c] "plugin"' > /tmp/census.log 2>&1 &)
++for i in $(seq 1 60); do sleep 1; pgrep -x log >/dev/null || break; done
++pkill -x log 2>/dev/null
++ioreg -l -w0 -c IOAccelerator > /tmp/census.ioreg 2>&1
++(echo RDNA4CENSUS-BEGIN; cat /tmp/census.out; echo RDNA4CENSUS-IOREG; cat /tmp/census.ioreg; echo RDNA4CENSUS-LOG; head -400 /tmp/census.log; echo RDNA4CENSUS-END) |
++	sed 's/^/RDNA4CENSUS|/' > /dev/console
++GUEST
++	export EXTRA_QEMU="${EXTRA_QEMU:-} -drive id=share,if=none,format=raw,readonly=on,file=fat:ro:$RUN/share -device usb-storage,bus=xhci.0,drive=share"
++fi
+ : > "$SERIAL"
+ OC_IMAGE=$OCIMG RAM_MB=${RAM_MB:-8192} MONITOR=$MON SERIAL_LOG=$SERIAL BASE_IMG=$BASE_IMG MACHDD=none \
+ 	OVMF_CODE=$OSXKVM/OVMF_CODE_4M.fd OVMF_VARS=$RUN/vars.fd VNC_DISPLAY=${VNC_DISPLAY:-0} \
+@@ -169,7 +192,7 @@
+ 		REC=1; say "Recovery userland up after $(( $(date +%s) - START )) s"; shot recovery
+ 	fi
+ 	if [ -z "$DONE_AT" ] && [ "$REC" = 1 ] &&
+-		grep -aqE "RDNA4FB: compute: (bring-up finished|.*failed; stopping)" "$SERIAL"; then
++		grep -aqE "RDNA4FB: (compute: (bring-up finished|.*failed; stopping)|accelcensus: IOAccelerator service published)" "$SERIAL"; then
+ 		DONE_AT=$(date +%s)
+ 	fi
+ 	[ -n "$DONE_AT" ] && [ $(( $(date +%s) - DONE_AT )) -ge "${GRACE_S:-45}" ] && break
+@@ -197,6 +220,29 @@
+ 		say "the diagnostic did not finish in ${DIAG_WAIT:-900} s (see screen-diag.png)"
+ 	fi
+ fi
++if [ "$CENSUS" = 1 ] && [ "$REC" = 1 ]; then
++	mon "sendkey meta_l-shift-t"
++	sleep 5
++	shot terminal
++	python3 "$HERE/tools/emu-type.py" "$MON" 'bash /Volumes/QEMU*/run-census.sh\n'
++	D0=$(date +%s)
++	while [ $(( $(date +%s) - D0 )) -lt "${CENSUS_WAIT:-300}" ]; do
++		sleep 3
++		grep -aq "RDNA4CENSUS|RDNA4CENSUS-END" "$SERIAL" && break
++		grep -aqiE 'panic\(cpu' "$SERIAL" && { say "GUEST PANIC during the census"; break; }
++	done
++	sleep 2
++	shot census
++	if grep -aq "RDNA4CENSUS|RDNA4CENSUS-END" "$SERIAL"; then
++		say "census finished after $(( $(date +%s) - D0 )) s"
++		sed -n 's/^.*RDNA4CENSUS|//p' "$SERIAL" | tr -d '\r' > "$RUN/census.txt"
++	else
++		say "the census tool did not finish in ${CENSUS_WAIT:-300} s (see screen-census.png); partial output in census.txt"
++		sed -n 's/^.*RDNA4CENSUS|//p' "$SERIAL" | tr -d '\r' > "$RUN/census.txt" || true
++	fi
++	grep -a "accelcensus" "$SERIAL" | sed 's/^.*RDNA4FB: //' | tr -d '\r' > "$RUN/census-kernel.log" || true
++	say "$(wc -l < "$RUN/census-kernel.log") kernel census lines -> census-kernel.log"
++fi
+ LAST=$(stat -c %s "$SERIAL")
+ say "kernel log ${LAST} bytes after $(( $(date +%s) - START )) s"
+ shot final
