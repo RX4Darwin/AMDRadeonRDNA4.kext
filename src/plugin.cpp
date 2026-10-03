@@ -22,6 +22,7 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLib.h>
+#include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>   // header-only types for IOMacOSVideo.h
 #include <IOKit/ndrvsupport/IOMacOSTypes.h>
@@ -98,6 +99,7 @@ static_assert(Ndrv::cscGetCurMode == ::cscGetCurMode && Ndrv::cscGetSync == ::cs
               Ndrv::cscSupportsHardwareCursor == ::cscSupportsHardwareCursor &&
               Ndrv::cscGetHardwareCursorDrawState == ::cscGetHardwareCursorDrawState &&
               Ndrv::cscSwitchMode == ::cscSwitchMode && Ndrv::cscSetSync == ::cscSetSync &&
+              Ndrv::cscSetEntries == ::cscSetEntries && Ndrv::cscSetGamma == ::cscSetGamma &&
               Ndrv::cscSetHardwareCursor == ::cscSetHardwareCursor &&
               Ndrv::cscDrawHardwareCursor == ::cscDrawHardwareCursor,
               "csc selectors");
@@ -301,6 +303,131 @@ int32_t vbeSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 }
 #endif
 
+// --- rdna4-head2=1: a phantom second head (docs/second-head-ndrv.md s.7) ------
+//
+// A second IONDRVFramebuffer, on an IONDRVDevice nub the plugin creates. It
+// has no IOBootNDRV behind it (IOBootNDRV only takes the console), so
+// wrapDoDriverIO answers its Initialize/Open and every csc request. It serves
+// one mode of the second sink's EDID on a spare VRAM surface behind the
+// console. No display register is written and no pipe scans the surface out:
+// this only shows whether macOS takes a second head.
+// The nub carries no IOFBDependentID, so the head gets a controller of its
+// own: head 0 has no ID either, and a lone index-1 dependent would leave slot
+// 0 of its controller empty.
+struct Head2 {
+	IOService       *nub { nullptr };
+	Ndrv::Translator ndrv;
+	Ndrv::Surface    surface {};
+	Modes::Mode      table[Modes::MaxModes] {};
+	uint8_t          edid[128] {};
+};
+Head2 *head2 { nullptr };
+
+bool isHead2(void *fb) {
+	return head2 && static_cast<IOService *>(fb)->getProvider() == head2->nub;
+}
+
+bool head2SurfaceFor(void *ctx, const Modes::Mode &, bool, Ndrv::Surface &out) {
+	out = static_cast<Head2 *>(ctx)->surface;
+	return true;
+}
+
+// The stand-in for IOBootNDRV::doDriverIO.
+IOReturn head2DriverIO(void *contents, UInt32 commandCode, uint16_t &code) {
+	if (commandCode == kIONDRVInitializeCommand || commandCode == kIONDRVOpenCommand)
+		return kIOReturnSuccess;
+	const bool isStatus = commandCode == kIONDRVStatusCommand;
+	if ((!isStatus && commandCode != kIONDRVControlCommand) || !contents)
+		return kIOReturnUnsupported;
+	auto *pb = static_cast<NdrvControlParameters *>(contents);
+	code = pb->code;
+	int32_t r = 0;
+	if (isStatus ? head2->ndrv.status(code, pb->params, r) : head2->ndrv.control(code, pb->params, r))
+		return static_cast<IOReturn>(r);
+	return static_cast<IOReturn>(Ndrv::bootReply(isStatus, code));
+}
+
+// Called once head 0 is answered for: `dev` is its device.
+void publishHead2(IOPCIDevice *pci, const RDNA4Device &dev) {
+	uint32_t on = 0;
+	if (head2 || !PE_parse_boot_argn("rdna4-head2", &on, sizeof(on)) || !on)
+		return;
+	if (computeStage) {   // the compute pool takes the VRAM behind the console
+		FBLOG("head2: not created: rdna4-compute is set");
+		return;
+	}
+	if (!dev.edid2Len && dev.edidLen < 128) {
+		FBLOG("head2: not created: no EDID to serve");
+		return;
+	}
+	// The device memory range that holds the console (BAR0 on the card).
+	uint64_t rangeBase = 0, rangeLen = 0;
+	for (UInt32 i = 0; i < pci->getDeviceMemoryCount(); i++) {
+		IODeviceMemory *mem = pci->getDeviceMemoryWithIndex(i);
+		if (!mem)
+			continue;
+		const uint64_t base = mem->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+		if (dev.fbPhysBase >= base && dev.fbPhysBase - base < mem->getLength()) {
+			rangeBase = base;
+			rangeLen = mem->getLength();
+			break;
+		}
+	}
+	auto *h = new Head2;
+	if (!h)
+		return;
+	// The second sink if one answered, else a copy of the boot display's.
+	memcpy(h->edid, dev.edid2Len ? dev.edid2Data : dev.edidData, sizeof(h->edid));
+	// The first mode, in table order (native first), whose surface fits.
+	const size_t n = Modes::build(h->edid, sizeof(h->edid), Modes::Limits {}, h->table, Modes::MaxModes);
+	const Modes::Mode *mode = nullptr;
+	for (size_t i = 0; i < n && !mode; i++)
+		if (Ndrv::spareSurface(dev.fbPhysBase, dev.fbLength, rangeBase, rangeLen,
+		                       h->table[i].t.hActive, h->table[i].t.vActive, h->surface))
+			mode = &h->table[i];
+	// IONDRVDevice is private to IONDRVSupport: made by name, driven as an IOService.
+	IOService *nub = mode ? OSDynamicCast(IOService, OSMetaClass::allocClassWithName("IONDRVDevice"))
+	                      : nullptr;
+	if (!nub || !nub->init()) {
+		FBLOG("head2: not created: %s", mode ? "IONDRVSupport gave no IONDRVDevice"
+		                                     : "no mode of the sink fits behind the console");
+		OSSafeReleaseNULL(nub);
+		delete h;
+		return;
+	}
+	Ndrv::Backend be {};
+	be.ctx = h;
+	be.surfaceFor = head2SurfaceFor;
+	h->ndrv.init(mode, 1, mode->id, h->edid, sizeof(h->edid), be);
+
+	// A device-tree style "display" node: what personality 2 of IONDRVSupport
+	// matches and IONDRVFramebuffer::start accepts.
+	static const char kDisplay[] = "display";
+	nub->setName(kDisplay);
+	nub->setProperty("name", const_cast<char *>(kDisplay), sizeof(kDisplay));
+	nub->setProperty("device_type", const_cast<char *>(kDisplay), sizeof(kDisplay));
+	nub->setLocation("1");
+	if (OSArray *memory = pci->getDeviceMemory())
+		nub->setDeviceMemory(memory);   // getApertureRange maps the surface out of these
+	// IONDRVFramebuffer takes its device, and IONDRVDevice its power parent,
+	// from the device-tree plane.
+	nub->attachToParent(pci, gIODTPlane);
+	h->nub = nub;
+	head2 = h;   // before registerService: the framebuffer may start at once
+	if (!nub->attach(pci)) {
+		FBLOG("head2: not created: the nub did not attach");
+		head2 = nullptr;
+		nub->detachFromParent(pci, gIODTPlane);
+		nub->release();
+		delete h;
+		return;
+	}
+	nub->registerService();
+	FBLOG("head2: nub registered: %ux%u@%u.%03u on surface 0x%llx, EDID of %s", mode->t.hActive,
+	      mode->t.vActive, mode->refreshMilliHz / 1000, mode->refreshMilliHz % 1000,
+	      h->surface.physBase, dev.edid2Len ? "the second sink" : "the boot display (no second sink)");
+}
+
 // Create the state for one of our framebuffers, once. Runs after the
 // original handled Open (or, if the route arrived later, before the first
 // Control/Status), so IOBootNDRV already owns the console framebuffer.
@@ -339,6 +466,7 @@ void attach(FbEntry &e) {
 	e.state = st;
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
+	publishHead2(pci, dev);
 
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
 	if (accelCensus && dev.isAmd)
@@ -375,6 +503,16 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 	FbEntry *e = fbEntry(fb);
 	if (!e || !e->ours)
 		return org(fb, commandID, contents, commandCode, commandKind);
+
+	// The phantom head has no NDRV: the original would refuse every command.
+	if (isHead2(fb)) {
+		uint16_t code = 0;
+		const IOReturn ret = head2DriverIO(contents, commandCode, code);
+		const bool lifecycle = commandCode != kIONDRVControlCommand && commandCode != kIONDRVStatusCommand;
+		if (lifecycle || (traceEnabled && traceBudget && traceBudget--))
+			FBLOG("head2: %s csc %u -> 0x%x", commandName(commandCode), code, ret);
+		return ret;
+	}
 
 	const bool isStatus = commandCode == kIONDRVStatusCommand;
 	const bool csc = (isStatus || commandCode == kIONDRVControlCommand) && contents;

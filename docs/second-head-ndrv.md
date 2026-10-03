@@ -123,14 +123,31 @@ surface).
 
 ## 7. The experiment that answers section 6: a phantom head
 
-No display register is written. Behind a boot-arg, the plugin creates the head-1 nub (route B), serves the second
-sink's EDID (already read by `probeEDID` for every connector) and one 1920x1080 mode, and points `csBaseAddr` at a
-spare VRAM surface after the GOP framebuffer.
+Implemented as `rdna4-head2=1` (`publishHead2` / `head2DriverIO` in `src/plugin.cpp`). Built and host-tested, not
+booted yet. No display register is written. Once head 0 is answered for, the plugin:
 
-- Pass: `ioreg` shows a second `IONDRVFramebuffer` that is online, System Settings shows the second display, the
-  desktop extends onto it (nothing appears on the monitor: its pipe is still dark).
-- It also shows which controller each head lands in (unknown 1).
-- First run in the VM (`tools/vm-test.sh`), then on the card. Escape: `rdna4-off=1`.
+- makes an `IONDRVDevice` by class name, as a `display` node under the PCI device with the PCI device's memory
+  ranges, and registers it (route B). If the class does not exist it logs `head2: not created: IONDRVSupport gave no
+  IONDRVDevice`, which settles unknown 3;
+- gives the nub **no `IOFBDependentID`**. Head 0 has none either, so a lone index-1 dependent would be a controller
+  with an empty slot 0. Both heads therefore have controllers of their own, which is the case unknown 1 asks about;
+- answers Initialize/Open and every csc request for the framebuffer on that nub: a `Translator` with one mode, then
+  IOBootNDRV's fallback (`Ndrv::bootReply`);
+- serves the EDID base block of the second sink that answered (`edid2Data`), or a copy of the boot display's when
+  there is none (the VM), and the first mode of that EDID, native first, whose surface fits;
+- puts the surface 1 MiB aligned and at least 1 MiB behind the console, inside the device memory range that holds the
+  console (`Ndrv::spareSurface`, host-tested in `tools/atomdump.cpp`). In the VM's 16 MiB range behind a 1080p console
+  that selects a smaller mode than 1080p.
+
+It refuses to run with `rdna4-compute` (the compute pool takes the VRAM behind the console).
+
+- Pass: the log shows `head2: nub registered`, then `head2: Initialize` and `head2: Open` answered with 0x0; `ioreg`
+  shows a second `IONDRVFramebuffer` that is online; System Settings shows the second display and the desktop extends
+  onto it (nothing appears on the monitor: its pipe is still dark).
+- With `rdna4-trace=1` every csc request to head 2 is logged with its reply, which shows what macOS asks of a head
+  that the Translator does not answer.
+- First run in the VM (`make VMTEST=1`, `tools/vm-test.sh`), then on the card. Escape: remove the boot-arg, or
+  `rdna4-off=1`.
 
 Lighting the pipe is the separate hardware half: `src/modeset.cpp` only re-times a pipe the GOP already lit, and it
 has not run on the card yet.

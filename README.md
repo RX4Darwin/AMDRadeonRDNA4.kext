@@ -94,6 +94,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-off=1` | Kill switch: the plugin does not hook anything and macOS runs its stock fallback framebuffer. Lilu's `-liluoff` disables all plugins. |
 | `rdna4-trace=1` | Log every NDRV request for our framebuffer and who answered it (`rdna4` or `boot`), up to 400 lines. On by default in `VMTEST` builds. Mode switches are always logged. |
 | `rdna4-modeset=1` | Offer the sink's EDID modes (DTDs, CTA DTDs/VICs, standard and established timings; ≤ boot framebuffer size, TMDS ≤ 340 MHz, ≤ 1.25 × boot pixel clock) instead of the boot mode alone. Until the HDMI mode-set engine lands, choosing a non-boot mode on the card is refused and the pipe is left untouched. |
+| `rdna4-head2=1` | Experiment: a phantom second head. The plugin creates an `IONDRVDevice` nub so a second `IONDRVFramebuffer` starts, stands in for the boot NDRV it cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Not with `rdna4-compute`. Built and host-tested, not booted yet; see `docs/second-head-ndrv.md`. |
 | `rdna4-nosleep=1` | Make display sleep a no-op (the screen stays on). Escape hatch if blank/unblank misbehaves. |
 | `rdna4-noedid=1` | Skip the EDID probe over AUX/DDC. Use if a sink misbehaves on DDC. |
 | `rdna4-lutbypass=1` | Force the MPC MCM stages (shaper/3D LUT/1D LUT) to bypass on all pipes. |

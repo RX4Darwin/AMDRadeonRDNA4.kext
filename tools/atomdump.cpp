@@ -1344,6 +1344,37 @@ static int testNdrv() {
 	                  none.status(Ndrv::cscGetDDCBlock, &ddcRec, ret),
 	                  "ndrv: empty mode table not passed through");
 
+	// A head with no IOBootNDRV behind it: the fallback replies and where its
+	// surface goes.
+	failures += check(Ndrv::bootReply(false, Ndrv::cscSetEntries) == Ndrv::kSuccess &&
+	                  Ndrv::bootReply(false, Ndrv::cscSetGamma) == Ndrv::kSuccess &&
+	                  Ndrv::bootReply(true, Ndrv::cscSetGamma) == Ndrv::kUnsupported &&
+	                  Ndrv::bootReply(false, Ndrv::cscSetSync) == Ndrv::kUnsupported,
+	                  "ndrv: boot fallback replies");
+	const uint64_t kBar = 0x840000000ull, kMiB = 1ull << 20;
+	const uint64_t k4k = 3840ull * 2160 * 4, k1080 = 1920ull * 1080 * 4, k720 = 1280ull * 720 * 4;
+	Ndrv::Surface spare {};
+	// A 4K console ends inside MiB 31; one clear MiB after it puts the surface at MiB 33.
+	failures += check(Ndrv::spareSurface(kBar, k4k, kBar, 256 * kMiB, 1920, 1080, spare) &&
+	                  spare.physBase == kBar + 33 * kMiB && spare.rowBytes == 7680 &&
+	                  spare.width == 1920 && spare.height == 1080,
+	                  "ndrv: spare surface behind a 4K console at 0x%llx",
+	                  static_cast<unsigned long long>(spare.physBase));
+	// A 16 MiB range (the VM): 1080p console, surface at MiB 9; 1080p does not fit, 720p does.
+	failures += check(!Ndrv::spareSurface(kBar, k1080, kBar, 16 * kMiB, 1920, 1080, spare) &&
+	                  Ndrv::spareSurface(kBar, k1080, kBar, 16 * kMiB, 1280, 720, spare) &&
+	                  spare.physBase == kBar + 9 * kMiB,
+	                  "ndrv: spare surface in a 16 MiB range");
+	// The last byte counts (the surface plus the 128 bytes getApertureRange adds).
+	failures += check(Ndrv::spareSurface(kBar, k1080, kBar, 9 * kMiB + k720 + 128, 1280, 720, spare) &&
+	                  !Ndrv::spareSurface(kBar, k1080, kBar, 9 * kMiB + k720 + 127, 1280, 720, spare),
+	                  "ndrv: spare surface exact fit");
+	// A console outside the range, or larger than it, gives no surface.
+	failures += check(!Ndrv::spareSurface(kBar - kMiB, k1080, kBar, 256 * kMiB, 1280, 720, spare) &&
+	                  !Ndrv::spareSurface(kBar + 250 * kMiB, k1080, kBar, 256 * kMiB, 1280, 720, spare) &&
+	                  !Ndrv::spareSurface(kBar, k1080, kBar, 256 * kMiB, 0, 720, spare),
+	                  "ndrv: spare surface refuses a console outside the range");
+
 	printf("\nndrv: %zu modes (boot = 100 = %ux%u, other e.g. %d = %ux%u), EDID/DPMS %s\n", n,
 	       table[bootIdx].t.hActive, table[bootIdx].t.vActive, otherId, other->t.hActive,
 	       other->t.vActive, failures ? "MISMATCH" : "ok");

@@ -437,4 +437,25 @@ int32_t Translator::setSync(const VDSyncInfoRec &r) {
 	return kSuccess;
 }
 
+// --- a head with no IOBootNDRV behind it -------------------------------------
+
+int32_t bootReply(bool isStatus, uint16_t code) {
+	return !isStatus && (code == cscSetEntries || code == cscSetGamma) ? kSuccess : kUnsupported;
+}
+
+bool spareSurface(uint64_t fbBase, uint64_t fbLen, uint64_t rangeBase, uint64_t rangeLen,
+                  uint32_t width, uint32_t height, Surface &out) {
+	constexpr uint64_t kMiB = 1ull << 20;
+	if (!width || !height || !fbLen || fbBase < rangeBase || fbLen > rangeLen ||
+	    fbBase - rangeBase > rangeLen - fbLen)
+		return false;
+	const uint64_t start = (fbBase + fbLen + 2 * kMiB - 1) & ~(kMiB - 1);
+	const uint64_t bytes = static_cast<uint64_t>(width) * 4 * height + 128;
+	const uint64_t end = rangeBase + rangeLen;
+	if (start > end || bytes > end - start)
+		return false;
+	out = { start, width * 4, width, height };
+	return true;
+}
+
 } // namespace Ndrv

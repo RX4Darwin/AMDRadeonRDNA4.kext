@@ -729,6 +729,9 @@ void RDNA4Device::probeEDID() {
 				FBLOG("edid: connector %zu (%s%u): read extension block "
 				      "(tag 0x%02x)", i, bus, inst, edidData[128]);
 			}
+		} else if (edid2Len == 0) {
+			memcpy(edid2Data, edid, sizeof(edid2Data));
+			edid2Len = sizeof(edid2Data);
 		}
 	}
 	if (!any)
