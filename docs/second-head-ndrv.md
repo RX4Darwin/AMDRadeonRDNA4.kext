@@ -123,31 +123,51 @@ surface).
 
 ## 7. The experiment that answers section 6: a phantom head
 
-Implemented as `rdna4-head2=1` (`publishHead2` / `head2DriverIO` in `src/plugin.cpp`). Built and host-tested, not
-booted yet. No display register is written. Once head 0 is answered for, the plugin:
+Implemented as `rdna4-head2=1` (`createHead2` / `fillHead2` / `head2DriverIO` in `src/plugin.cpp`). No display
+register is written.
 
-- makes an `IONDRVDevice` by class name, as a `display` node under the PCI device with the PCI device's memory
-  ranges, and registers it (route B). If the class does not exist it logs `head2: not created: IONDRVSupport gave no
-  IONDRVDevice`, which settles unknown 3;
-- gives the nub **no `IOFBDependentID`**. Head 0 has none either, so a lone index-1 dependent would be a controller
-  with an empty slot 0. Both heads therefore have controllers of their own, which is the case unknown 1 asks about;
-- answers Initialize/Open and every csc request for the framebuffer on that nub: a `Translator` with one mode, then
-  IOBootNDRV's fallback (`Ndrv::bootReply`);
-- serves the EDID base block of the second sink that answered (`edid2Data`), or a copy of the boot display's when
-  there is none (the VM), and the first mode of that EDID, native first, whose surface fits;
-- puts the surface 1 MiB aligned and at least 1 MiB behind the console, inside the device memory range that holds the
-  console (`Ndrv::spareSurface`, host-tested in `tools/atomdump.cpp`). In the VM's 16 MiB range behind a 1080p console
-  that selects a smaller mode than 1080p.
+**First card boot (2026-10-03, Big Sur 11.6.6, 4K DP boot display plus a 1080p HDMI sink; first version of the code).**
+That version created the nub when head 0 was attached, with no `IOFBDependentID`. Result: `head2: nub registered:
+1920x1080@60.000 on surface 0x842100000, EDID of the second sink`, so `IONDRVDevice` exists in 11.6.6 (unknown 3,
+for Big Sur) and the surface and EDID were as planned. But no second framebuffer ever called `doDriverIO`: the nub was
+registered at 40.2 s, inside WindowServer's open of head 0, and a framebuffer is only opened by a WindowServer connect
+(`FB.cpp:4012-4021`) or as the dependent of one being opened (`FB.cpp:9340-9347`) [F]. A framebuffer that appears
+after WindowServer listed them is not picked up [I]. The log could not show whether the second `IONDRVFramebuffer`
+had started.
+
+**Current version.**
+
+- `IONDRVFramebuffer::start` is routed as well (only with the boot-arg). When it is called for the PCI device, before
+  the original runs, the plugin makes an `IONDRVDevice` by class name as a `display` node under the PCI device, with
+  the PCI device's memory ranges, and registers it (route B, but early). The log line is `head2: nub registered,
+  dependent 1 of 0x...`.
+- Both heads become dependents of one controller: `IOFBDependentID` (the PCI device's registry entry ID) with
+  `IOFBDependentIndex` 0 on the PCI device, which head 0 copies when it starts a moment later, and index 1 on the nub.
+  This is what IONDRVSupport's own expander sets (section 1). `IOFramebuffer::open` of either head then opens the
+  other in the kernel, and head 0's `IOBootNDRV` still accepts index 0.
+- What head 2 serves is filled in when head 0's device exists (`fillHead2`, from `attach`): the EDID base block of
+  the second sink that answered (`edid2Data`), or a copy of the boot display's when there is none (the VM), and the
+  first mode of that EDID, native first, whose surface fits. If macOS opens head 2 first, `head2DriverIO` attaches
+  head 0 on the spot.
+- The surface is 1 MiB aligned and at least 1 MiB behind the console, inside the device memory range that holds the
+  console (`Ndrv::spareSurface`, host-tested in `tools/atomdump.cpp`).
+- `head2DriverIO` answers Initialize/Open and every csc request for the framebuffer on the nub: a `Translator` with
+  one mode, then IOBootNDRV's fallback (`Ndrv::bootReply`).
 
 It refuses to run with `rdna4-compute` (the compute pool takes the VRAM behind the console).
 
-- Pass: the log shows `head2: nub registered`, then `head2: Initialize` and `head2: Open` answered with 0x0; `ioreg`
-  shows a second `IONDRVFramebuffer` that is online; System Settings shows the second display and the desktop extends
-  onto it (nothing appears on the monitor: its pipe is still dark).
-- With `rdna4-trace=1` every csc request to head 2 is logged with its reply, which shows what macOS asks of a head
-  that the Translator does not answer.
-- First run in the VM (`make VMTEST=1`, `tools/vm-test.sh`), then on the card. Escape: remove the boot-arg, or
-  `rdna4-off=1`.
+Risk of the dependent link [F]: the controller holds back connection-change messages while any of its heads still
+waits for WindowServer (`fWsWait`, `FB.cpp:1884`, set per head at open, cleared by `kIOFBWSStartAttribute`). If
+WindowServer never connects to head 2, head 0's display configuration changes would stall too.
+
+- Pass: `head2: routed IONDRVFramebuffer::start`, `head2: nub registered, dependent 1 of ...`, `head2: framebuffer on
+  the nub: <name>`, `head2: serving ...`, then `head2: Initialize` and `head2: Open` answered with 0x0; System
+  Settings shows the second display and the desktop extends onto it (nothing appears on the monitor: its pipe is
+  still dark).
+- `head2: framebuffer on the nub: none started` means IONDRVSupport never started a framebuffer on the nub (matching
+  failed); no `nub registered` line after the `routed` line means head 0 had started before the route was in place.
+- With `rdna4-trace=1` every csc request to head 2 is logged with its reply.
+- Escape: remove the boot-arg, or `rdna4-off=1`.
 
 Lighting the pipe is the separate hardware half: `src/modeset.cpp` only re-times a pipe the GOP already lit, and it
 has not run on the card yet.
