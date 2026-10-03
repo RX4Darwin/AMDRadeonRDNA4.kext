@@ -782,7 +782,7 @@ static int testPipeDiscovery() {
 	dcn.set(2, Reg::kDigFeEnCntl + d, 0x1);
 	dcn.set(2, Reg::kDigFeClkCntl + d, 0x13);              // FE mode HDMI, clk en
 	dcn.set(2, Reg::kStreamMapper + 2, 0x2);               // DIG2 -> link 2
-	dcn.set(2, Reg::kDigBeCntl + d, (1u << (8 + 2)) | (3u << 28));
+	dcn.set(2, Reg::kDigBeCntl + d, (1u << (8 + 2)) | (2u << 28));   // DIG_HPD_SELECT 2 = HPD3
 	dcn.set(2, Reg::kDigBeClkCntl + d, 0x13);              // BE mode HDMI
 	dcn.set(2, Reg::kOptcDataSource + 1 * Reg::kOdmStride, 1u << 16);   // seg0 <- OPP1
 	for (uint32_t m = 0; m < 4; m++)
@@ -1040,7 +1040,7 @@ static int testModeSet() {
 	regs.set(2, Pipe::Reg::kDigFeEnCntl + d2, 1);
 	regs.set(2, Pipe::Reg::kDigFeClkCntl + d2, 0x13);
 	regs.set(2, Pipe::Reg::kStreamMapper + 2, 2);
-	regs.set(2, Pipe::Reg::kDigBeCntl + d2, (1u << 10) | (3u << 28));
+	regs.set(2, Pipe::Reg::kDigBeCntl + d2, (1u << 10) | (2u << 28));   // DIG_HPD_SELECT 2 = HPD3
 	regs.set(2, Pipe::Reg::kDigBeClkCntl + d2, 0x13);
 	for (uint32_t m = 0; m < 4; m++)
 		regs.set(3, Pipe::Reg::kMpccOppId + m * Pipe::Reg::kMpccStride, m == 0 ? 0 : 0xf);

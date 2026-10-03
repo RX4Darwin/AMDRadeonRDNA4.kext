@@ -1973,7 +1973,7 @@ const Modes::Mode *RDNA4Device::findMode(uint32_t id) const {
 }
 
 // The VBIOS display path wired to the lit pipe: the one whose HPD pin is
-// the back-end's DIG_HPD_SELECT.
+// the pipe's (both count from 1).
 bool RDNA4Device::pathForPipe(AtomBios::DisplayPath &out) {
 	AtomBios::DisplayPath paths[AtomBios::MaxDisplayPaths];
 	size_t n = atomBios.getDisplayPaths(paths, AtomBios::MaxDisplayPaths);
