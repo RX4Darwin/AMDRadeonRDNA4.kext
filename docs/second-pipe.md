@@ -1,7 +1,7 @@
 # Lighting a second pipe
 
-Status 2026-10-04: the survey and the stream have run on the card (section 7): the second monitor lights and shows
-the test colour next to an undisturbed boot display. **The plane has not run yet.** The macOS half of a second display works
+Status 2026-10-04: **works on the card** (section 7): with `rdna4-head2=4` the second monitor shows the second
+desktop next to an undisturbed boot display. The macOS half of a second display works
 (`docs/second-head-ndrv.md`): macOS draws into a spare VRAM surface that no pipe scans out. This is the hardware half:
 light a pipe the firmware left dark and point it at that surface.
 
@@ -156,3 +156,9 @@ with a 0x0 output rectangle. The generator had compiled Linux without `CONFIG_DR
 of amdgpu has; without it `resource_build_scaling_params` skips the scaler library (SPL) that DCN 4.01's DPP takes
 its rectangle from. The level-3 survey already showed both registers staying 0. With the option the table differs in
 exactly those two entries (1920x1080), and `testPipe2` checks them.
+
+**Plane again, 2026-10-04 21:50 (`rdna4-head2=4`, regenerated table): both displays work.** `stream and plane: 399
+steps, 4 DMUB commands`, `OTG1 measured 60.000 Hz`, `HUBP1_DCHUBP_CNTL` 0x000f0012, no underflow flag, no step timed
+out. The Lenovo shows the second desktop and the Samsung is undisturbed. So the unknowns of section 4 came out well on
+this card: the firmware's display clocks and watermarks for one 4K display also carry a 1080p plane next to it, and
+3 + 4 DET segments are enough.
