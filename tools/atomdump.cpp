@@ -1317,7 +1317,7 @@ static int testPipe2() {
 		{ 1, 0x006f, 1u << (5 * c.pipe), 0, "OTG_PIXEL_RATE_DIV" },
 		{ 1, 0x0064, 0, 0x00080000, "DENTIST_DISPCLK_CNTL" },
 		{ 1, 0x00a8, 1u << (3 * c.pipe), 0, "DPPCLK_CTRL" },
-		{ 2, 0x00a0, 1, 0, "DC_IP_REQUEST_CNTL" },
+		{ 2, 0x00a0, 0, 1, "DC_IP_REQUEST_CNTL" },             // only required to be open
 		{ 2, 0x04fe, 0, 0, "DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A" },
 		{ 3, 0x030a, 1u << c.pipe, 0, "MPC_OUT_CSC_COEF_FORMAT" },
 	};
@@ -1384,7 +1384,7 @@ static int testPipe2() {
 			                  s.arg, s.dword);
 		}
 	}
-	failures += check(requires == 4, "pipe2: %zu requirements, expected 4", requires);
+	failures += check(requires == 5, "pipe2: %zu requirements, expected 5", requires);
 
 	// A sink with SCDC is told the link is not scrambled (148.5 MHz), before
 	// the transmitter is enabled; one without is left alone (above).

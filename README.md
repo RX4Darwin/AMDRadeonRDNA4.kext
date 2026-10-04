@@ -15,8 +15,10 @@ unchanged from the earlier standalone build) was verified on Big Sur 11.7.10:
 BAR5 register MMIO. The plugin build runs on the card under Big Sur 11.6.6
 (2026-10-03/04): desktop on a DP or an HDMI boot display, a resolution change
 on an HDMI boot display, and a second display on the macOS side. Only the
-boot display lights up so far: the code that lights a second pipe is written
-and host-tested but has not run on the card (`docs/second-pipe.md`).
+boot display shows a desktop so far. A second monitor lights (`rdna4-head2=3`,
+2026-10-04: it shows a test colour next to the undisturbed boot display);
+putting the second desktop on it is the remaining step
+(`docs/second-pipe.md`).
 
 > **Why a Lilu plugin?** The earlier build was a standalone `IOFramebuffer`
 > subclass. That links against `com.apple.iokit.IOGraphicsFamily`, whose code
@@ -101,7 +103,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-off=1` | Kill switch: the plugin does not hook anything and macOS runs its stock fallback framebuffer. Lilu's `-liluoff` disables all plugins. |
 | `rdna4-trace=1` | Log every NDRV request for our framebuffer and who answered it (`rdna4` or `boot`), up to 400 lines. On by default in `VMTEST` builds. Mode switches are always logged. |
 | `rdna4-modeset=1` | Offer the sink's EDID modes (DTDs, CTA DTDs/VICs, standard and established timings; ≤ boot framebuffer size, TMDS ≤ 340 MHz or, for a sink whose EDID announces SCDC and a higher rate, ≤ 600 MHz, and ≤ 1.25 × boot pixel clock) instead of the boot mode alone. On an HDMI/DVI boot display a switch runs the mode-set engine (verified on the card 2026-10-04: 1920x1080 to 1600x900 on a 1080p HDMI sink, picture confirmed; the log line `modes: now ..., measured ... Hz` gives the refresh the OTG really runs at). On a DP boot display a switch retimes the stream and leaves the link as the firmware trained it, so only modes at or below the boot pixel clock are offered; **not yet run on the card** (the log shows `modes: DisplayPort, link untouched: DTO ...` and the measured refresh). From 340 MHz up the link is HDMI 2.0 scrambled: the encoder's scrambler is switched with the mode and the monitor is told over SCDC, in both directions, so a monitor the GOP lit at 4K60 (533 MHz, scrambled) can be switched down as well. **The scrambled path has not run on the card**; if a switch from a 4K GOP mode leaves the monitor dark, set OpenCore's `UEFI/Output/Resolution` to `1920x1080`, which is the verified case. |
-| `rdna4-head2=1` | Experiment: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Not with `rdna4-compute`. Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. **Higher values also light the pipe (not yet run on the card, `docs/second-pipe.md`):** `2` writes nothing and publishes what every step of the plan would do to the dormant pipe's registers (`RDNA4FB,Pipe2`, shown by `tools/diagnostic-log.sh`); `3` lights the stream alone, so the second monitor shows a solid teal-blue; `4` also lights the plane, so it shows the second desktop. The plan is for one configuration: an HDMI monitor on HPD3 / link 2 at 1920x1080@60 next to a boot display on another connector. |
+| `rdna4-head2=1` | Experiment: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Not with `rdna4-compute`. Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. **Higher values also light the pipe (`docs/second-pipe.md`; 2 and 3 verified on the card 2026-10-04, 4 not yet run):** `2` writes nothing and publishes what every step of the plan would do to the dormant pipe's registers (`RDNA4FB,Pipe2`, shown by `tools/diagnostic-log.sh`); `3` lights the stream alone, so the second monitor shows a solid teal-blue; `4` also lights the plane, so it shows the second desktop. The plan is for one configuration: an HDMI monitor on HPD3 / link 2 at 1920x1080@60 next to a boot display on another connector. |
 | `rdna4-nosleep=1` | Make display sleep a no-op (the screen stays on). Escape hatch if blank/unblank misbehaves. |
 | `rdna4-noedid=1` | Skip the EDID probe over AUX/DDC. Use if a sink misbehaves on DDC. |
 | `rdna4-lutbypass=1` | Force the MPC MCM stages (shaper/3D LUT/1D LUT) to bypass on all pipes. |
@@ -479,7 +481,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
 - [ ] Lighting a second pipe (a visible second display). Written and
       host-tested (`rdna4-head2=2..4`, `src/pipe2.cpp`): the register
       sequence is generated from Linux's own DCN 4.01 code by
-      `tools/pipegen`. Not yet run on the card.
+      `tools/pipegen`. On the card (2026-10-04) the stream lights: the
+      second monitor shows the test colour, the boot display is undisturbed.
+      The plane (the second desktop, `rdna4-head2=4`) has not run yet.
 - [ ] DP mode switching. Written and host-tested (`rdna4-modeset=1` on a
       DP boot display): the plan's register writes are compared with what
       Linux's own functions write for the same retime

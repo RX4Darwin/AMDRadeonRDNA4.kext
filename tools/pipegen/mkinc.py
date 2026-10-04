@@ -39,7 +39,6 @@ OWN += [f'{b}{dig}_' for b in ('DIG', 'VPG', 'AFMT', 'DME')] + [f'DIG{link}_']
 SHARED = {
     'OTG_PIXEL_RATE_DIV': 1 << (5 * pipe),             # OTGn_TMDS_PIXEL_RATE_DIV
     'DPPCLK_CTRL': 1 << (3 * pipe),                    # DPPCLKn_EN
-    'DC_IP_REQUEST_CNTL': 1,                           # IP_REQUEST_EN, opened and closed around the power-up
     'MPC_OUT_CSC_COEF_FORMAT': 1 << pipe,              # MPC_OCSCn_COEF_FORMAT (Linux clears all four)
     'DENTIST_DISPCLK_CNTL': 0,                         # written back as read; Linux's FIFO-error workaround
     'DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A': 0,        # written back as read, to reach the new pipe
@@ -71,6 +70,7 @@ require(f'DIG{dig}_DIG_FE_EN_CNTL', 1, 0, 'the stream encoder is off')
 require(f'DIG{link}_DIG_BE_EN_CNTL', 1, 0, 'the link encoder is off')
 
 PLACEHOLDER_HI, PLACEHOLDER_LO = 0x0000c3e1, 0x5a3c1e00
+requires_late = []      # requirements the trace states further down: they still go before the first write
 part = None
 for p in lines[1:]:
     k = p[0]
@@ -78,6 +78,10 @@ for p in lines[1:]:
         what, arg = p[1], int(p[2], 0)
         if what == 'require:mpcc_opp_id_none':
             emit('R', (arg >> 24) - 1, arg & 0xffffff, 0xf, 0xf, 0, f'{names[((arg >> 24) - 1, arg & 0xffffff)][0]}: the blender feeds no OPP')
+        elif what == 'require:ip_request_open':
+            seg, dword = (arg >> 24) - 1, arg & 0xffffff
+            assert names[(seg, dword)] == ['DC_IP_REQUEST_CNTL']
+            requires_late.append(('R', seg, dword, 1, 1, 0, 'DC_IP_REQUEST_CNTL: the IP request window is open'))
         elif what.startswith('begin:'):
             part = what[6:]
             emit({'init': '1', 'stream': '2', 'plane': '3'}[part], what=part)
@@ -132,6 +136,8 @@ for p in lines[1:]:
     else:
         emit(k, seg, dword, mask, value, arg, what)
 
+first = next(i for i, o in enumerate(out) if o[0] != 'R')
+out[first:first] = requires_late
 kinds = collections.Counter(o[0] for o in out)
 assert kinds['P'] == 1 and kinds['X'] == 1 and kinds['E'] == 2 and kinds['H'] == 1 and kinds['L'] == 1 and kinds['K'] == 3, kinds
 

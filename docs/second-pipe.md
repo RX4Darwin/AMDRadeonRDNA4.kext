@@ -1,6 +1,7 @@
 # Lighting a second pipe
 
-Status 2026-10-04: written and host-tested, **never run on the card**. The macOS half of a second display works
+Status 2026-10-04: the survey and the stream have run on the card (section 7): the second monitor lights and shows
+the test colour next to an undisturbed boot display. **The plane has not run yet.** The macOS half of a second display works
 (`docs/second-head-ndrv.md`): macOS draws into a spare VRAM surface that no pipe scans out. This is the hardware half:
 light a pipe the firmware left dark and point it at that surface.
 
@@ -18,7 +19,7 @@ The levels are a ladder, so that each boot answers one question:
 |---|---|---|
 | 1 | Phantom head only, as before. | macOS takes a second display. |
 | 2 | The plan is built and every step is published with the register's value now and after (`RDNA4FB,Pipe2` in the registry, and in `tools/diagnostic-log.sh`). **Nothing is written.** | What the firmware left in the dormant pipe; whether the requirements hold. |
-| 3 | The stream only: clock, timing generator, encoder, PHY. No plane. | The monitor wakes and shows a solid teal-blue. The DMUB commands work for a pipe the firmware never lit. |
+| 3 | The stream only: clock, timing generator, encoder, PHY. No plane. Afterwards the survey of what the plane would still change is published. | The monitor wakes and shows a solid teal-blue. The DMUB commands work for a pipe the firmware never lit. |
 | 4 | Stream and plane. | The monitor shows the second desktop. |
 
 At 2 and above the phantom head only serves the one mode the plan is for; a sink without it stays unserved.
@@ -44,7 +45,7 @@ pixel clock for OTG1 on PLL 2, stream setup for DIG2 twice as Linux sends it, tr
 surface address, and the lit pipe's VM aperture.
 
 Regenerate with `tools/pipegen/run.sh <linux tree>`; the script says which sparse checkout is enough. The checked-in
-table is from Linux `6addb4f38557` and has 403 entries.
+table is from Linux `6addb4f38557` and has 402 entries.
 
 ## 3. What keeps it off the lit pipe
 
@@ -55,16 +56,17 @@ table is from Linux `6addb4f38557` and has 403 entries.
   read steered the code; each of those is settled by hand in `pipegen.c` with the reason (five of them, section 4).
 - **Names.** `mkinc.py` refuses a table in which any register is not one of pipe 1's, DIG2's or link 2's by its Linux
   name, or one of six shared registers, and then only the listed bits. Where Linux writes a shared register whole
-  (`MPC_OUT_CSC_COEF_FORMAT`, `DC_IP_REQUEST_CNTL`), the step is narrowed to this pipe's bit.
+  (`MPC_OUT_CSC_COEF_FORMAT`), the step is narrowed to this pipe's bit.
 - **Layout.** `testPipe2` in `tools/atomdump.cpp` checks the built plan again, by block address and stride instead of
   by name. Planting a write to OPP0's output mux or a whole write of `DENTIST_DISPCLK_CNTL` fails it.
 - **Requirements.** Before the first write the plan checks that OTG1 is not running, DIG2's front-end and back-end are
-  off, and MPCC1 feeds no OPP. If the firmware lit this pipe after all, nothing is written.
+  off, MPCC1 feeds no OPP, and the IP request window is open. If the firmware lit this pipe after all, nothing is
+  written.
 - `RDNA4Device::lightSecondPipe` refuses if the lit pipe uses any of the plan's blocks, if the VBIOS has no connector
   on HPD3 and link 2, or (for the plane) if the DET buffer has no 4 free segments.
 
 The shared registers the plan touches: `OTG_PIXEL_RATE_DIV` (OTG1's TMDS divider bit), `DPPCLK_CTRL` (DPPCLK1 enable),
-`DC_IP_REQUEST_CNTL` (opened and closed around the HUBP power-up), `MPC_OUT_CSC_COEF_FORMAT` (OPP1's bit), and
+`MPC_OUT_CSC_COEF_FORMAT` (OPP1's bit), and
 `DENTIST_DISPCLK_CNTL` and `DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A`, both written back as read.
 
 ## 4. Where it departs from Linux, and what is assumed
@@ -72,7 +74,8 @@ The shared registers the plan touches: `OTG_PIXEL_RATE_DIV` (OTG1's TMDS divider
 Settled reads (the state the plan assumes; all visible in the level-2 survey):
 
 1. `OTG_PIXEL_RATE_DIV`: Linux skips the divider write if it already holds /4. The plan always writes it.
-2. `DC_IP_REQUEST_CNTL`: assumed closed, as amdgpu leaves it. If the firmware left it open, the plan closes it [U].
+2. `DC_IP_REQUEST_CNTL`: open, as the firmware leaves it on the card (section 7). Linux then does not touch it. It is
+   a requirement: the HUBP power-up write is ignored through a closed window.
 3. DIG2's symbol clock is running when the FIFO is reset (the step before enabled it).
 4. The info-packet memory is asleep: the plan always wakes it.
 5. MPCC1's LUTs are off, and MPCC1 feeds no OPP (this one is also a requirement).
@@ -104,7 +107,7 @@ Boot `rdna4-head2=2` first. In `tools/diagnostic-log.sh` output, under "second h
 
 - `pipe2: DET segments a b c d of 21: 4 for the plane fit` — the DET budget.
 - `pipe2: N require ...` lines — each requirement with the register's value; `(not so now)` means level 3 would refuse.
-- `pipe2: survey of 399 steps ...: N would change a register` and the registry copy, one line per step:
+- `pipe2: survey of 398 steps ...: N would change a register` and the registry copy, one line per step:
   step, `segment:dword`, value now, `->` or `==`, value after, Linux function and register.
 
 At level 3 or 4:
@@ -125,3 +128,23 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
   340 MHz needs the table regenerated for it (the generator then turns the scrambler on by itself).
 - The boot display must not be on the plan's blocks: with the Lenovo alone, the firmware puts it on DIG2 and link 2.
 - Display sleep and wake do not know about the second pipe.
+
+## 7. Card boots (Big Sur 11.6.6, Samsung 4K on DisplayPort, Lenovo on HDMI)
+
+**Survey, 2026-10-04 07:10 (`rdna4-head2=2`).** The requirements held: `OTG1_OTG_CONTROL` 0x200, DIG2's front-end and
+back-end off, `MPCC1_MPCC_OPP_ID` 0xf. `DET segments 3 3 3 3 of 21`. The dormant blocks read as reset state.
+`OTG_PIXEL_RATE_DIV` 0x8421: every TMDS divider is already /4. The Samsung was on link 1 (DIG1, HPD2) this time, which
+the plan does not use either. That build surveyed only the stream half (a bug, fixed since).
+
+**Stream, 2026-10-04 20:37 (`rdna4-head2=3`).** `pipe2: lighting pipe 1 DIG2 link 2 HPD3 ... stream only: 206 steps,
+4 DMUB commands`, then `scdc: DDC2: sink version 1, TMDS_CONFIG = 0 written` and `pipe2: plan ran; OTG1 measured
+60.001 Hz`. **The Lenovo showed the test colour and the Samsung was undisturbed.** So the firmware the GOP leaves
+running takes the pixel-clock, encoder and transmitter commands for a PHY and timing generator it never lit, and
+writing the monitor's SCDC register over DDC works.
+
+The plane survey from the same boot (what level 4 would change, with the stream lit) found one thing to change in
+the plan: `DC_IP_REQUEST_CNTL` reads 1, so the firmware leaves the IP request window open, and the plan as generated
+would have closed it. It is regenerated for an open window and now requires one (section 4). Otherwise: HUBP1's power
+domain is already on (`DOMAIN1_PG_CONFIG` 0, status on); the VM aperture registers are 0 on the lit HUBP too, so the
+copies change nothing; `CM1_CM_CONTROL` has the bypass bit set, which the plan clears; `HUBP1_DCHUBP_CNTL` reads 0x000f001a before the plane is enabled, the value to compare the
+level-4 line against.

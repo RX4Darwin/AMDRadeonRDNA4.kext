@@ -3,7 +3,7 @@
 // to light this stream and plane; the text of each step is the Linux function and the register.
 //
 // Pipe 1 (OTG1, OPP1, HUBP1, DPP1, MPCC1), stream encoder DIG2, link 2 (PHY PLL 2), HPD3,
-// 1920x1080 at 148500 kHz, 8 bpc RGB over HDMI. 403 entries.
+// 1920x1080 at 148500 kHz, 8 bpc RGB over HDMI. 402 entries.
 
 static constexpr Config kConfig = {
 	1, 2, 2, 3,
@@ -17,6 +17,7 @@ static const Gen kGen[] = {
 	{ 'R', 2, 0x22dd, 0x00000001, 0x00000000, 0, "DIG2_DIG_FE_EN_CNTL: the stream encoder is off" },
 	{ 'R', 2, 0x2305, 0x00000001, 0x00000000, 0, "DIG2_DIG_BE_EN_CNTL: the link encoder is off" },
 	{ 'R', 3, 0x0017, 0x0000000f, 0x0000000f, 0, "MPCC1_MPCC_OPP_ID: the blender feeds no OPP" },
+	{ 'R', 2, 0x00a0, 0x00000001, 0x00000001, 0, "DC_IP_REQUEST_CNTL: the IP request window is open" },
 	{ '1', 0, 0x0000, 0x00000000, 0x00000000, 0, "init" },
 	{ 'W', 3, 0x0015, 0xffffffff, 0x0000000f, 0, "mpc1_mpc_init_single_inst MPCC1_MPCC_TOP_SEL" },
 	{ 'W', 3, 0x0016, 0xffffffff, 0x0000000f, 0, "mpc1_mpc_init_single_inst MPCC1_MPCC_BOT_SEL" },
@@ -244,10 +245,8 @@ static const Gen kGen[] = {
 	{ 'W', 2, 0x1ae1, 0xffffffff, 0x00000000, 0, "optc401_set_odm_bypass ODM1_OPTC_MEMORY_CONFIG" },
 	{ 'U', 2, 0x18e6, 0x00000001, 0x00000001, 0, "opp1_pipe_clock_control OPP_PIPE1_OPP_PIPE_CONTROL" },
 	{ 'U', 2, 0x18a3, 0x00000001, 0x00000000, 0, "opp2_program_left_edge_extra_pixel FMT1_FMT_422_CONTROL" },
-	{ 'U', 2, 0x00a0, 0x00000001, 0x00000001, 0, "dcn20_power_on_plane_resources DC_IP_REQUEST_CNTL" },
 	{ 'W', 2, 0x0082, 0xffffffff, 0x00000000, 0, "dcn32_hubp_pg_control DOMAIN1_PG_CONFIG" },
 	{ 'T', 2, 0x0083, 0xc0000000, 0x00000000, 1000, "dcn32_hubp_pg_control DOMAIN1_PG_STATUS" },
-	{ 'U', 2, 0x00a0, 0x00000001, 0x00000000, 0, "dcn20_power_on_plane_resources DC_IP_REQUEST_CNTL" },
 	{ 'U', 2, 0x06d1, 0x00000001, 0x00000001, 0, "hubp2_clk_cntl HUBP1_HUBP_CLK_CNTL" },
 	{ 'U', 2, 0x18e6, 0x00000001, 0x00000001, 0, "opp1_pipe_clock_control OPP_PIPE1_OPP_PIPE_CONTROL" },
 	{ 'U', 2, 0x04fe, 0x00000000, 0x00000000, 0, "hubbub32_force_wm_propagate_to_pipes DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A" },

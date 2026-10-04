@@ -357,8 +357,11 @@ static void sequence(const struct cfg *c)
 	 * called whole: it also locks and reprograms every other lit pipe, and this plan leaves those alone. */
 	dc->hwss.detect_pipe_changes(g_old, g_new, &g_old->res_ctx.pipe_ctx[c->pipe], pipe);
 	/* dcn20_power_on_plane_resources opens the IP request window only when it finds it closed, and closes it
-	 * again. Assume closed, as amdgpu leaves it. */
-	rec_poke_field(hwseq_reg.DC_IP_REQUEST_CNTL, DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK, 0);
+	 * again. The firmware leaves it open (card survey, 2026-10-04), and then Linux does not touch it; the
+	 * plan requires it open, since the power-up write is ignored through a closed window. */
+	rec_poke_field(hwseq_reg.DC_IP_REQUEST_CNTL, DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK,
+		       DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK);
+	rec_mark("require:ip_request_open", hwseq_reg.DC_IP_REQUEST_CNTL);
 	rec_mark("begin:plane", 0);
 	dc->hwss.pipe_control_lock(dc, pipe, true);
 	dcn401_program_pipe(dc, pipe, g_new);
