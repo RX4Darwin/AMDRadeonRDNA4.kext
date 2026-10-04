@@ -325,12 +325,14 @@ struct Head2 {
 	bool             ready { false };       // fillHead2 set the mode, surface and EDID
 	Ndrv::Translator ndrv;
 	Ndrv::Surface    surface {};
+	IODeviceMemory  *vram { nullptr };      // the surface, for getVRAMRange (wrapGetVRAMRange)
 	Modes::Mode      table[Modes::MaxModes] {};
 	uint8_t          edid[128] {};
 	uint32_t         traceBudget { 400 };   // its own: head 0 must not use up the lines
 };
 Head2 *head2 { nullptr };
 mach_vm_address_t orgStart { 0 };
+mach_vm_address_t orgGetVRAMRange { 0 };
 
 void attach(FbEntry &e);
 
@@ -404,12 +406,14 @@ void fillHead2(const RDNA4Device &dev) {
 	}
 	// The device memory range that holds the console (BAR0 on the card).
 	uint64_t rangeBase = 0, rangeLen = 0;
+	IODeviceMemory *range = nullptr;
 	for (UInt32 i = 0; i < h->pci->getDeviceMemoryCount(); i++) {
 		IODeviceMemory *mem = h->pci->getDeviceMemoryWithIndex(i);
 		if (!mem)
 			continue;
 		const uint64_t base = mem->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
 		if (dev.fbPhysBase >= base && dev.fbPhysBase - base < mem->getLength()) {
+			range = mem;
 			rangeBase = base;
 			rangeLen = mem->getLength();
 			break;
@@ -432,6 +436,13 @@ void fillHead2(const RDNA4Device &dev) {
 	be.ctx = h;
 	be.surfaceFor = head2SurfaceFor;
 	h->ndrv.init(mode, 1, mode->id, h->edid, sizeof(h->edid), be);
+	// WindowServer maps a framebuffer through getVRAMRange, which IONDRVFramebuffer
+	// only has for an IOBootNDRV: without this it gives up on the head with
+	// "Failed to map VRAM" (card boot of 2026-10-03, 19:46).
+	h->vram = IODeviceMemory::withSubRange(range, h->surface.physBase - rangeBase,
+	                                       static_cast<uint64_t>(h->surface.rowBytes) * h->surface.height);
+	if (!h->vram)
+		FBLOG("head2: no VRAM range for the surface: WindowServer will not map it");
 	h->ready = true;
 	FBLOG("head2: serving %ux%u@%u.%03u on surface 0x%llx, EDID of %s", mode->t.hActive,
 	      mode->t.vActive, mode->refreshMilliHz / 1000, mode->refreshMilliHz % 1000,
@@ -469,6 +480,17 @@ IOReturn head2DriverIO(void *contents, UInt32 commandCode, uint16_t &code) {
 	if (isStatus ? head2->ndrv.status(code, pb->params, r) : head2->ndrv.control(code, pb->params, r))
 		return static_cast<IOReturn>(r);
 	return static_cast<IOReturn>(Ndrv::bootReply(isStatus, code));
+}
+
+// IONDRVFramebuffer::getVRAMRange returns IOBootNDRV's console range, so
+// nothing for head 2: hand out its surface instead (retained, as the original
+// does).
+IODeviceMemory *wrapGetVRAMRange(void *fb) {
+	if (isHead2(fb) && head2->vram) {
+		head2->vram->retain();
+		return head2->vram;
+	}
+	return FunctionCast(wrapGetVRAMRange, orgGetVRAMRange)(fb);
 }
 
 bool wrapStart(void *fb, IOService *provider) {
@@ -666,6 +688,15 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		else
 			FBLOG("head2: not available: no IONDRVFramebuffer::start route (error %d)",
 			      patcher.getError());
+		patcher.clearError();
+		KernelPatcher::RouteRequest vram {
+			"__ZN17IONDRVFramebuffer12getVRAMRangeEv", wrapGetVRAMRange, orgGetVRAMRange,
+		};
+		if (patcher.routeMultiple(index, &vram, 1, address, size))
+			FBLOG("head2: routed IONDRVFramebuffer::getVRAMRange");
+		else
+			FBLOG("head2: no IONDRVFramebuffer::getVRAMRange route (error %d): WindowServer "
+			      "will not map the second head", patcher.getError());
 		patcher.clearError();
 	}
 	uint32_t vbl = 0, cursor = 0;

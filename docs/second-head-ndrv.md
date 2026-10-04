@@ -78,7 +78,7 @@ the same as in the source [F].
 | Use | With no `IOBootNDRV` | Consequence |
 |---|---|---|
 | `doDriverIO` (`NDRV.cpp:1123-1143`) | returns unsupported | section 3: the plugin answers instead |
-| `findVRAM` (`:2042-2055`) | returns NULL, so `getVRAMRange` is NULL | both `IOFramebuffer` callers check for NULL (`FB.cpp:6378-6384`, `:10771-10783`); `IOFBMemorySize` is not published |
+| `findVRAM` (`:2042-2055`) | returns NULL, so `getVRAMRange` is NULL | both `IOFramebuffer` callers check for NULL (`FB.cpp:6378-6384`, `:10771-10783`) and `IOFBMemorySize` is not published, **but WindowServer needs it**: it maps the framebuffer through the user client's `kIOFBVRAMMemory`, which is `getVRAMRange()` and gives `kIOReturnBadArgument` for NULL (`IOFramebufferUserClient.cpp`, `clientMemoryForType`). Measured on the card, section 7. The plugin routes `getVRAMRange` for head 2 |
 | `initForPM` (`:3977`) | `dozeOnly` then depends on `cscGetPowerState` | unsupported there also gives doze-only (`:3970-3979`): same as head 0 |
 
 The framebuffer memory does not come from the NDRV object [F]: `getCurrentConfiguration` takes `csBaseAddr` from
@@ -135,6 +135,16 @@ registered at 40.2 s, inside WindowServer's open of head 0, and a framebuffer is
 after WindowServer listed them is not picked up [I]. The log could not show whether the second `IONDRVFramebuffer`
 had started.
 
+**Second card boot (2026-10-03 19:46, the early, linked version).** The kernel half works [M]: `head2: nub
+registered, dependent 1 of 0x10000026b` at 29.3 s (WindowServer starts at about 40 s), `head2: framebuffer on the nub:
+IONDRVFramebuffer`, `head2: serving 1920x1080@60.000 on surface 0x842100000, EDID of the second sink`, then
+`head2: Initialize` and `head2: Open` answered with 0x0 right after head 0's Open (the dependent open), 99 requests
+answered in the same pattern as head 0, a mode set accepted, a second `AppleDisplay` with the sink's EDID and its own
+display preferences. `IOFBDependentID` / `IOFBDependentIndex` 0 and 1 are on the two framebuffers.
+WindowServer saw both and gave up on the second [M] (CoreDisplay log): `Creating FB 2 of 2`, `MemoryMapFramebuffer:
+Can't map framebuffer error(0xe00002c2)`, `Failed to create FB 2 of 2 (Failed to map VRAM)`, `GPU: FB: 1 of 2
+opened`. Displays showed one display. Cause: `getVRAMRange` is NULL without an `IOBootNDRV` (section 4).
+
 **Current version.**
 
 - `IONDRVFramebuffer::start` is routed as well (only with the boot-arg). When it is called for the PCI device, before
@@ -153,6 +163,8 @@ had started.
   console (`Ndrv::spareSurface`, host-tested in `tools/atomdump.cpp`).
 - `head2DriverIO` answers Initialize/Open and every csc request for the framebuffer on the nub: a `Translator` with
   one mode, then IOBootNDRV's fallback (`Ndrv::bootReply`).
+- `IONDRVFramebuffer::getVRAMRange` is routed too and returns the surface for head 2 (added after the second boot;
+  not booted yet).
 
 It refuses to run with `rdna4-compute` (the compute pool takes the VRAM behind the console).
 
