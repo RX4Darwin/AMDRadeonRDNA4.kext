@@ -56,9 +56,9 @@ public:
 	// present. 0 length = no DDC sink found.
 	uint8_t edidData[256] {};
 	size_t  edidLen { 0 };
-	// Base block of the next sink that answered on another connector, for the
-	// phantom second head (rdna4-head2, plugin.cpp). 0 length = none.
-	uint8_t edid2Data[128] {};
+	// The next sink that answered on another connector, for the second head
+	// (rdna4-head2, plugin.cpp): base block plus one extension. 0 length = none.
+	uint8_t edid2Data[256] {};
 	size_t  edid2Len { 0 };
 
 	// Display mode table (modes.hpp). By default it holds only the boot mode;
@@ -158,6 +158,8 @@ private:
 	                   uint8_t *reply, uint8_t replyCap, uint8_t *replyBytes);
 	bool readEDID(uint8_t inst, uint8_t *edid, size_t count, uint8_t start);
 	bool readEDIDI2C(uint8_t line, uint8_t *edid, size_t count, uint8_t start);
+	bool i2cTransfer(uint8_t line, uint8_t addr, const uint8_t *wr, size_t wlen, uint8_t *rd, size_t rlen);
+	void scdcConfigure(uint8_t line, uint8_t tmdsConfig);
 	void probeEDID();
 	// AUX engine of the sink whose EDID we cached — the target for DPCD
 	// power writes.
@@ -213,8 +215,7 @@ private:
 	Edid::DetailedTiming liveTiming {};
 	bool liveTimingValid { false };
 	ModeSet::Plan modePlan {};
-	bool pathForPipe(AtomBios::DisplayPath &out) { return pathForHpd(pipe.hpd, out); }
-	bool pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out);
+	bool pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out, uint8_t *ddcLine = nullptr);
 	bool runPlan(const ModeSet::Plan &plan) {
 		return runSteps(plan.steps, plan.count, plan.cmds, plan.ncmds, "modeset");
 	}

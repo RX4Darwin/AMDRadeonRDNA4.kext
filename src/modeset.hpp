@@ -15,6 +15,13 @@
 //    -> TRANSMITTER_CONTROL enable -> viewport / recout / MPC size under the
 //    OTG update lock -> unblank (DPG video mode) -> AVMUTE off.
 //
+//  From 340 MHz up the link runs HDMI 2.0 scrambled with the clock channel at
+//  a quarter of the character rate: the stream encoder's scrambler is turned
+//  on and the sink is told through its SCDC register before the transmitter
+//  comes up (enc401_stream_encoder_hdmi_set_stream_attribute,
+//  write_scdc_data). Below it both are turned off again, which matters when
+//  the firmware lit the sink scrambled.
+//
 //  Not programmed (kept as the GOP left them): DCHUBBUB watermarks and the
 //  HUBP DLG/TTU/RQ request parameters, which amdgpu takes from DML; the
 //  AVI infoframe; FAMS2 (DMUB-managed MCLK switching). VSTARTUP is placed
@@ -47,6 +54,7 @@ enum class Op : uint8_t {
 	Delay,        // arg microseconds
 	Copy,         // reg = the register at dword `arg` of the same segment
 	Require,      // (reg & mask) must equal value, or the plan is not run
+	Scdc,         // write `value` to the sink's SCDC TMDS_CONFIG over DDC line `arg`
 };
 
 struct Step {
@@ -77,7 +85,16 @@ struct Target {
 	uint16_t encoderObjId;    // e.g. 0x2120 (UNIPHY1 enum 1 = UNIPHYC)
 	uint16_t connectorObjId;  // e.g. 0x330c (HDMI type A)
 	Edid::DetailedTiming from, to;
+	bool     sinkScdc;        // the sink's EDID announces SCDC (Edid::hdmi2Caps)
+	uint8_t  ddcLine;         // the connector's DDC line, for the SCDC write
 };
+
+// HDMI 2.0 over TMDS. The scrambler goes on from kScrambleFromKHz
+// (HDMI_CLOCK_CHANNEL_RATE_MORE_340M); the sink's TMDS_CONFIG says 3
+// (scrambling on, clock at a quarter rate) above it, as write_scdc_data has it.
+constexpr uint32_t kMaxTmdsKHz      = 600000;
+constexpr uint32_t kScrambleFromKHz = 340000;
+constexpr uint32_t scdcTmdsConfig(uint32_t pixelClockKHz) { return pixelClockKHz > kScrambleFromKHz ? 3 : 0; }
 
 // Build the plan for `t`. Returns false (and `why`) if the target or the
 // timings cannot be expressed.

@@ -16,7 +16,7 @@ namespace {
 //   R require (reg & mask) == value before anything is written,
 //   1 2 3 start of the init / stream / plane part,
 //   P E X DMUB set pixel clock / encoder stream setup / transmitter enable,
-//   S the sink's SCDC TMDS_CONFIG = arg,
+//   S the sink's SCDC TMDS_CONFIG = arg (if the sink has SCDC),
 //   K pattern generator colour arg (0 R, 1 G, 2 B),
 //   C copy from the lit pipe's register, arg dwords per HUBP instance below,
 //   H L surface address high / low.
@@ -91,8 +91,8 @@ bool build(const Target &t, Plan &out, const char **why) {
 		case 'H': ok = step(ModeSet::Op::Write, g, 0, static_cast<uint32_t>(t.surface >> 32), 0); break;
 		case 'L': ok = step(ModeSet::Op::Write, g, 0, static_cast<uint32_t>(t.surface), 0); break;
 		case 'S':
-			// ponytail: the sink's TMDS_CONFIG is not written. Fine for a sink that was never
-			// sent a scrambled signal; one left scrambling by an earlier 4K mode needs it.
+			if (t.sinkScdc)
+				ok = step(ModeSet::Op::Scdc, g, 0, g.arg, t.ddcLine, true);
 			break;
 		case 'P': case 'E': case 'X': {
 			Dmub::Cmd *cmd = dmub(g);

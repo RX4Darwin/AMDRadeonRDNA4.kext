@@ -61,6 +61,8 @@ struct Target {
 	uint16_t encoderObjId;     // VBIOS path of the connector on Config::hpd
 	uint64_t surface;          // scanout address, as the lit HUBP's address register counts
 	Depth    depth;
+	bool     sinkScdc;         // the sink's EDID announces SCDC (Edid::hdmi2Caps)
+	uint8_t  ddcLine;          // the connector's DDC line, for the SCDC write
 };
 
 constexpr size_t kMaxSteps = 448;

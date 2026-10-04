@@ -70,6 +70,7 @@ constexpr uint32_t kDigFeClkCntl  = 0x2094;      // FE_MODE [2:0], FE_CLK_EN [4]
 constexpr uint32_t kDigFeEnCntl   = 0x2095;      // FE_ENABLE [0]
 constexpr uint32_t kDigFifoCtrl0  = 0x209b;      // ENABLE [0], RESET [1], READ_START_LEVEL [6:2],
                                                  // OUTPUT_PIXEL_PER_CYCLE [9:8], RESET_DONE [20]
+constexpr uint32_t kHdmiControl   = 0x209e;      // DATA_SCRAMBLE_EN [1], CLOCK_CHANNEL_RATE [2]
 constexpr uint32_t kHdmiGc        = 0x20a8;      // AVMUTE [0]
 constexpr uint32_t kDigBeClkCntl  = 0x20bb;      // BE_MODE [2:0], BE_CLK_EN [4]
 constexpr uint32_t kDigBeCntl     = 0x20bc;      // FE_SOURCE_SELECT [14:8]
@@ -144,8 +145,12 @@ bool build(const Target &t, Plan &out, const char **why) {
 		err = "target timing not programmable";
 		return false;
 	}
-	if (t.to.pixelClockKHz == 0 || t.to.pixelClockKHz > 340000) {
-		err = "pixel clock outside single-link TMDS (<= 340 MHz, no scrambling)";
+	if (t.to.pixelClockKHz == 0 || t.to.pixelClockKHz > kMaxTmdsKHz) {
+		err = "pixel clock outside HDMI TMDS (<= 600 MHz)";
+		return false;
+	}
+	if (t.to.pixelClockKHz > kScrambleFromKHz && !t.sinkScdc) {
+		err = "above 340 MHz needs a sink with SCDC";
 		return false;
 	}
 
@@ -267,6 +272,11 @@ bool build(const Target &t, Plan &out, const char **why) {
 		es.pclk10kHz = symclk10kHz;
 		Dmub::buildDigEncoderStreamSetup(*c, es);
 	}
+	b.update(kHdmiControl + dig, 0x6, t.to.pixelClockKHz >= kScrambleFromKHz ? 0x6 : 0, "hdmi scrambler");
+
+	// --- write_scdc_data: the sink's side of the scrambling, before the link is enabled ---
+	if (t.sinkScdc)
+		b.add(Op::Scdc, 0, 0, scdcTmdsConfig(t.to.pixelClockKHz), t.ddcLine, "scdc tmds config", true);
 
 	// --- setup_dio_stream_encoder: connect, enable, map, FIFO reset ---
 	b.update(kDigBeCntl + t.link * kDigStride, 1u << (8 + t.dig), 1u << (8 + t.dig), "dig be source fe");

@@ -730,8 +730,12 @@ void RDNA4Device::probeEDID() {
 				      "(tag 0x%02x)", i, bus, inst, edidData[128]);
 			}
 		} else if (edid2Len == 0) {
-			memcpy(edid2Data, edid, sizeof(edid2Data));
-			edid2Len = sizeof(edid2Data);
+			memcpy(edid2Data, edid, 128);
+			edid2Len = 128;
+			// The extension says whether the sink has SCDC (Edid::hdmi2Caps).
+			if (edid[126] > 0 && (viaAux ? readEDID(inst, edid2Data + 128, 128, 128)
+			                             : readEDIDI2C(inst, edid2Data + 128, 128, 128)))
+				edid2Len = 256;
 		}
 	}
 	if (!any)
@@ -796,7 +800,15 @@ constexpr uint32_t kMicrosecondTimeBaseDiv = 0x007b;
 
 bool RDNA4Device::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
                              uint8_t start) {
-	if (!ipDiscovery.isValid() || !rmmio || count == 0 || count > 256)
+	return count != 0 && i2cTransfer(line, kDdcSlave << 1, &start, 1, edid, count);
+}
+
+// One DDC exchange on the DC_I2C hardware engine: write `wlen` bytes to the
+// device at 8-bit address `addr`, then (with `rlen`) read `rlen` bytes back
+// after a repeated start.
+bool RDNA4Device::i2cTransfer(uint8_t line, uint8_t addr, const uint8_t *wr, size_t wlen,
+                              uint8_t *rd, size_t rlen) {
+	if (!ipDiscovery.isValid() || !rmmio || wlen == 0 || wlen > 8 || rlen > 256)
 		return false;
 
 	const uint32_t rSetup = kI2cSetupBase + 2u * line;
@@ -859,20 +871,25 @@ bool RDNA4Device::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
 		regWriteDmu(2, rSpeed, (prescale << 16) | (2u << 8) | 2u);
 	}
 
-	// --- queue both transactions, then a single GO (process_transaction /
-	// execute_transaction): [START 0xA0 <start>] [START 0xA1 read*count STOP]
+	// --- queue the transactions, then a single GO (process_transaction /
+	// execute_transaction): [START addr <wr>] [START addr|1 read*rlen STOP],
+	// or the write alone with its own STOP.
 	regWriteDmu(2, kI2cTxn0,
-	            kTxnStopOnNack | kTxnStart | (1u << kTxnCountShift));
-	regWriteDmu(2, kI2cTxn0 + 1,
-	            kTxnStopOnNack | kTxnStart | kTxnRead | kTxnStop |
-	            (static_cast<uint32_t>(count) << kTxnCountShift));
+	            kTxnStopOnNack | kTxnStart | (rlen ? 0 : kTxnStop) |
+	            (static_cast<uint32_t>(wlen) << kTxnCountShift));
+	if (rlen)
+		regWriteDmu(2, kI2cTxn0 + 1,
+		            kTxnStopOnNack | kTxnStart | kTxnRead | kTxnStop |
+		            (static_cast<uint32_t>(rlen) << kTxnCountShift));
 	// Data FIFO: address bytes carry the R/W bit in bit 0.
-	regWriteDmu(2, kI2cDataReg, kI2cIndexWrite | (0xA0u << kI2cDataShiftI2C));
-	regWriteDmu(2, kI2cDataReg, static_cast<uint32_t>(start) << kI2cDataShiftI2C);
-	regWriteDmu(2, kI2cDataReg, 0xA1u << kI2cDataShiftI2C);
+	regWriteDmu(2, kI2cDataReg, kI2cIndexWrite | (static_cast<uint32_t>(addr) << kI2cDataShiftI2C));
+	for (size_t i = 0; i < wlen; i++)
+		regWriteDmu(2, kI2cDataReg, static_cast<uint32_t>(wr[i]) << kI2cDataShiftI2C);
+	if (rlen)
+		regWriteDmu(2, kI2cDataReg, (addr | 1u) << kI2cDataShiftI2C);
 
 	uint32_t ctl = (static_cast<uint32_t>(line) << kI2cDdcSelectShift) |
-	               (1u << kI2cTxnCountShift);  // TRANSACTION_COUNT = 2-1
+	               ((rlen ? 1u : 0u) << kI2cTxnCountShift);  // TRANSACTION_COUNT = transactions - 1
 	regWriteDmu(2, kI2cControl, ctl);
 	regWriteDmu(2, kI2cControl, ctl | kI2cGo);
 
@@ -894,15 +911,33 @@ bool RDNA4Device::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
 	}
 
 	// --- read the reply FIFO (process_channel_reply): the read data starts
-	// after the 3 bytes we wrote (0xA0, start, 0xA1).
-	regWriteDmu(2, kI2cDataReg,
-	            kI2cIndexWrite | kI2cDataRead | (3u << kI2cIndexShift));
-	for (size_t i = 0; i < count; i++)
-		edid[i] = static_cast<uint8_t>(
-		    (regReadDmu(2, kI2cDataReg) >> kI2cDataShiftI2C) & 0xff);
+	// after the bytes we wrote (address, data, address again).
+	if (rlen) {
+		regWriteDmu(2, kI2cDataReg,
+		            kI2cIndexWrite | kI2cDataRead | (static_cast<uint32_t>(wlen + 2) << kI2cIndexShift));
+		for (size_t i = 0; i < rlen; i++)
+			rd[i] = static_cast<uint8_t>(
+			    (regReadDmu(2, kI2cDataReg) >> kI2cDataShiftI2C) & 0xff);
+	}
 
 	release();
 	return true;
+}
+
+// What amdgpu's write_scdc_data does for a sink that has SCDC: answer its
+// version, then say whether the link is scrambled (TMDS_CONFIG).
+void RDNA4Device::scdcConfigure(uint8_t line, uint8_t tmdsConfig) {
+	constexpr uint8_t kScdc = 0x54 << 1;                       // HDMI_SCDC_ADDRESS
+	constexpr uint8_t kSinkVersion = 0x01, kSourceVersion = 0x02, kTmdsConfig = 0x20;
+	uint8_t version = 0;
+	if (i2cTransfer(line, kScdc, &kSinkVersion, 1, &version, 1) && version == 1) {
+		const uint8_t source[2] = { kSourceVersion, 1 };
+		i2cTransfer(line, kScdc, source, sizeof(source), nullptr, 0);
+	}
+	const uint8_t config[2] = { kTmdsConfig, tmdsConfig };
+	const bool ok = i2cTransfer(line, kScdc, config, sizeof(config), nullptr, 0);
+	FBLOG("scdc: DDC%u: sink version %u, TMDS_CONFIG = %u %s", line, version, tmdsConfig,
+	      ok ? "written" : "NOT written");
 }
 
 void RDNA4Device::dumpModeState() {
@@ -1933,14 +1968,18 @@ void RDNA4Device::buildModeTable() {
 #endif
 
 	// Modes reuse the GOP framebuffer's memory and pitch, so none may be
-	// larger than it. TMDS stays below 340 MHz (no HDMI 2.0 scrambling yet)
-	// and within 25 % of the boot pixel clock, which the GOP's DISPCLK is
-	// known to carry, until DISPCLK is read and raised explicitly.
+	// larger than it. TMDS stays at 340 MHz or less unless the sink takes
+	// HDMI 2.0 scrambling (SCDC and a higher character rate in its EDID), and
+	// within 25 % of the boot pixel clock, which the GOP's DISPCLK is known to
+	// carry, until DISPCLK is read and raised explicitly.
 	Modes::Limits lim {};
 	lim.maxHActive = fbWidth;
 	lim.maxVActive = fbHeight;
-	lim.maxPixelClockKHz = 340000;
-	if (bootTimingValid && bootTiming.pixelClockKHz && bootTiming.pixelClockKHz * 5 / 4 < 340000)
+	const Edid::Hdmi2Caps hdmi2 = Edid::hdmi2Caps(edidData, edidLen);
+	lim.maxPixelClockKHz = ModeSet::kScrambleFromKHz;
+	if (hdmi2.scdc && hdmi2.maxTmdsKHz > lim.maxPixelClockKHz)
+		lim.maxPixelClockKHz = hdmi2.maxTmdsKHz < ModeSet::kMaxTmdsKHz ? hdmi2.maxTmdsKHz : ModeSet::kMaxTmdsKHz;
+	if (bootTimingValid && bootTiming.pixelClockKHz && bootTiming.pixelClockKHz * 5 / 4 < lim.maxPixelClockKHz)
 		lim.maxPixelClockKHz = bootTiming.pixelClockKHz * 5 / 4;
 
 	if (modesetRequested && edidLen)
@@ -2005,13 +2044,15 @@ const Modes::Mode *RDNA4Device::findMode(uint32_t id) const {
 
 // The VBIOS display path wired to an HPD pin (counted from 1, as the lit
 // pipe's is).
-bool RDNA4Device::pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out) {
+bool RDNA4Device::pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out, uint8_t *ddcLine) {
 	AtomBios::DisplayPath paths[AtomBios::MaxDisplayPaths];
 	size_t n = atomBios.getDisplayPaths(paths, AtomBios::MaxDisplayPaths);
 	for (size_t i = 0; i < n; i++) {
 		AtomBios::PathRecords rec;
 		if (atomBios.getPathRecords(paths[i], rec) && rec.hasHpd && rec.hpdPin == hpdPin) {
 			out = paths[i];
+			if (ddcLine)
+				*ddcLine = rec.ddcLine;
 			return true;
 		}
 	}
@@ -2051,6 +2092,10 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 			break;
 		case ModeSet::Op::Delay:
 			IODelay(s.arg);
+			break;
+		case ModeSet::Op::Scdc:
+			// Like amdgpu, carry on if the sink does not answer.
+			scdcConfigure(static_cast<uint8_t>(s.arg), static_cast<uint8_t>(s.value));
 			break;
 		case ModeSet::Op::Require: {
 			const uint32_t v = regReadDmu(s.seg, s.dword);
@@ -2108,12 +2153,15 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		return kIOReturnUnsupported;
 	}
 	AtomBios::DisplayPath path {};
-	if (!pathForPipe(path)) {
+	uint8_t ddcLine = 0;
+	if (!pathForHpd(pipe.hpd, path, &ddcLine)) {
 		FBLOG("modes: switch to id %u refused: no VBIOS path for HPD%u", m.id, pipe.hpd);
 		return kIOReturnUnsupported;
 	}
 
 	ModeSet::Target t {};
+	t.sinkScdc = Edid::hdmi2Caps(edidData, edidLen).scdc;
+	t.ddcLine = ddcLine;
 	t.otg = pipe.otg;
 	t.dig = pipe.dig;
 	t.link = pipe.link;
@@ -2200,6 +2248,10 @@ void RDNA4Device::surveySteps(const ModeSet::Step *steps, size_t count, const Dm
 			snprintf(line, sizeof(line), "%lu dmub %08x %08x %08x %08x %s", static_cast<unsigned long>(i),
 			         cmds[s.arg][0], cmds[s.arg][1], cmds[s.arg][2], cmds[s.arg][3], s.what);
 			break;
+		case ModeSet::Op::Scdc:
+			snprintf(line, sizeof(line), "%lu scdc DDC%u TMDS_CONFIG=%u %s", static_cast<unsigned long>(i),
+			         s.arg, s.value, s.what);
+			break;
 		default:
 			snprintf(line, sizeof(line), "%lu delay %u us %s", static_cast<unsigned long>(i), s.arg, s.what);
 		}
@@ -2227,7 +2279,8 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		return false;
 	}
 	AtomBios::DisplayPath path {};
-	if (!pathForHpd(c.hpd, path) || Pipe2::linkOfEncoder(path.encoderObjId) != c.link) {
+	uint8_t ddcLine = 0;
+	if (!pathForHpd(c.hpd, path, &ddcLine) || Pipe2::linkOfEncoder(path.encoderObjId) != c.link) {
 		FBLOG("pipe2: not lit: the plan is for a connector on HPD%u and link %u, which this board's VBIOS "
 		      "does not have", c.hpd, c.link);
 		return false;
@@ -2237,6 +2290,8 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 	t.litHubp = pipe.hubp;
 	t.encoderObjId = path.encoderObjId;
 	t.depth = level >= 4 ? Pipe2::Depth::Plane : Pipe2::Depth::Stream;
+	t.sinkScdc = Edid::hdmi2Caps(edid2Data, edid2Len).scdc;
+	t.ddcLine = ddcLine;
 	// The lit pipe scans the console from the address in its HUBP; the second
 	// surface lies in the same memory, so the same distance further on.
 	constexpr uint32_t kSurfaceLo = 0x060a, kSurfaceHi = 0x060b;   // HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS(_HIGH)

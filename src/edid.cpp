@@ -387,6 +387,12 @@ bool parseCtaBlock(const uint8_t ext[128], CtaCaps &out) {
 				out.hasHdmiVsdb = true;
 				if (len >= 7 && p[6])
 					out.maxTmdsKHz = static_cast<uint32_t>(p[6]) * 5000;
+			} else if (tag == 3 && len >= 6 &&  // vendor block, HDMI Forum OUI
+			           p[0] == 0xd8 && p[1] == 0x5d && p[2] == 0xc4) {
+				// HDMI 2.0 table 10-6: version, Max_TMDS_Character_Rate / 5 MHz,
+				// then SCDC_Present in bit 7.
+				out.hfMaxTmdsKHz = static_cast<uint32_t>(p[4]) * 5000;
+				out.scdcPresent = (p[5] & 0x80) != 0;
 			}
 			pos += 1u + len;
 		}
@@ -408,6 +414,19 @@ bool parseCtaBlock(const uint8_t ext[128], CtaCaps &out) {
 		}
 	}
 	return true;
+}
+
+Hdmi2Caps hdmi2Caps(const uint8_t *edid, size_t len) {
+	Hdmi2Caps caps { false, 0 };
+	for (size_t off = BlockSize; edid && off + BlockSize <= len; off += BlockSize) {
+		CtaCaps cta {};
+		if (!blockChecksumOk(edid + off) || !parseCtaBlock(edid + off, cta))
+			continue;
+		caps.scdc = caps.scdc || cta.scdcPresent;
+		if (cta.hfMaxTmdsKHz > caps.maxTmdsKHz)
+			caps.maxTmdsKHz = cta.hfMaxTmdsKHz;
+	}
+	return caps;
 }
 
 } // namespace Edid

@@ -92,7 +92,8 @@ Departures:
   instance is board wiring.
 - **VM aperture.** amdgpu does not program a system aperture on a discrete card. The plan copies the three registers
   from the lit HUBP, so that the surface address means the same on both.
-- **SCDC.** Linux writes the sink's `TMDS_CONFIG` before enabling the link. The plan does not yet.
+- **SCDC.** Where Linux calls `write_scdc_data`, the plan writes the sink's `TMDS_CONFIG` (0 at this clock) if the
+  sink's EDID announces SCDC. Linux also reads the scrambler status back afterwards, only to log it; the plan does not.
 - **No audio, no HDCP, no hot-plug.** The AVI infoframe is Linux's (VIC 16, RGB, full range).
 - DML ran with the static bounding box, not the SMU's clock table, and with GPU VM off (the surface is in the frame
   buffer aperture).
@@ -120,6 +121,7 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
 
 - One configuration: pipe 1, DIG2, link 2, HPD3, 1920x1080@60 at 148.5 MHz. Another board or mode needs
   `tools/pipegen/run.sh` run with other arguments.
-- The second display must be HDMI or DVI (TMDS) at 340 MHz or less. A second DisplayPort display needs link training.
+- The second display must be HDMI or DVI (TMDS). A second DisplayPort display needs link training. A mode above
+  340 MHz needs the table regenerated for it (the generator then turns the scrambler on by itself).
 - The boot display must not be on the plan's blocks: with the Lenovo alone, the firmware puts it on DIG2 and link 2.
 - Display sleep and wake do not know about the second pipe.

@@ -546,6 +546,37 @@ static int testModes() {
 	                  yc.vics[0] == 16 && yc.vicNative[0] && yc.vics[1] == 4 && !yc.vicNative[1] &&
 	                  yc.vics[2] == 31 && yc.vics[3] == 2 && yc.hasHdmiVsdb && yc.maxTmdsKHz == 0 &&
 	                  yc.dtdCount == 1, "synthetic CTA block fields");
+	// HDMI 2.0: without an HDMI Forum block the sink has no SCDC; with one
+	// (version 1, 600 MHz, SCDC_Present) it does, and the mode table's TMDS
+	// limit follows it past the HDMI 1.4 block's.
+	const Edid::Hdmi2Caps none = Edid::hdmi2Caps(syn, sizeof(syn));
+	uint8_t hf[256];
+	memcpy(hf, syn, sizeof(hf));
+	static const uint8_t hfCta[] = {
+		0x02, 0x03, 0x18, 0x71,                               // data blocks up to offset 24
+		0x41, 0x61,                                           // video: VIC 97 (3840x2160@60, 594 MHz)
+		0x67, 0x03, 0x0c, 0x00, 0x10, 0x00, 0x00, 0x3c,       // HDMI 1.4 block, 300 MHz
+		0x67, 0xd8, 0x5d, 0xc4, 0x01, 0x78, 0x80, 0x00,       // HDMI Forum block, 600 MHz, SCDC
+	};
+	memset(hf + 128, 0, 128);
+	memcpy(hf + 128, hfCta, sizeof(hfCta));
+	fixChecksum(hf + 128);
+	hf[99] = 60;                                              // range limits: 600 MHz, not 180
+	fixChecksum(hf);
+	Edid::CtaCaps hc {};
+	const Edid::Hdmi2Caps two = Edid::hdmi2Caps(hf, sizeof(hf));
+	failures += check(!none.scdc && none.maxTmdsKHz == 0 && Edid::parseCtaBlock(hf + 128, hc) &&
+	                  hc.maxTmdsKHz == 300000 && hc.hfMaxTmdsKHz == 600000 && hc.scdcPresent &&
+	                  two.scdc && two.maxTmdsKHz == 600000,
+	                  "HDMI Forum block: scdc %d/%d max %u/%u kHz", none.scdc, two.scdc, none.maxTmdsKHz,
+	                  two.maxTmdsKHz);
+	static Mode hfModes[Modes::MaxModes];
+	const Limits hdmi2 { 0, 0, 600000 };
+	size_t hn = Modes::build(hf, sizeof(hf), hdmi2, hfModes, Modes::MaxModes);
+	bool has594 = false;
+	for (size_t i = 0; i < hn; i++)
+		has594 = has594 || hfModes[i].t.pixelClockKHz == 594000;
+	failures += check(has594, "HDMI Forum block: the 594 MHz mode is not offered (%zu modes)", hn);
 
 	// The 75 Hz DTD is `cvt -r 1920 1080 75`: 1080/3/5/31, i.e. 74.97 Hz.
 	const Edid::DetailedTiming &t75 = yb.dtds[1];
@@ -1072,13 +1103,61 @@ static int testModeSet() {
 
 	const size_t steps = plan.count, cmds = plan.ncmds;
 
-	// Refusals: interlaced targets and clocks beyond single-link TMDS.
+	// Below 340 MHz the scrambler is turned off, and a sink without SCDC gets
+	// no SCDC write.
+	auto scdcStep = [&](const ModeSet::Plan &p, size_t *at) -> const ModeSet::Step * {
+		for (size_t i = 0; i < p.count; i++)
+			if (p.steps[i].op == ModeSet::Op::Scdc) {
+				*at = i;
+				return &p.steps[i];
+			}
+		return nullptr;
+	};
+	size_t at = 0;
+	failures += check((regs.get(2, 0x209e + d2) & 0x6) == 0 && !scdcStep(plan, &at),
+	                  "modeset: 720p without SCDC: HDMI_CONTROL 0x%x, SCDC step %d",
+	                  regs.get(2, 0x209e + d2), scdcStep(plan, &at) != nullptr);
+
+	// HDMI 2.0: 3840x2160@60 (VIC 97, 594 MHz) on a sink with SCDC. The
+	// scrambler and the quarter-rate clock go on, and the sink is told (3)
+	// before the transmitter is enabled; back at 720p it is told 0.
+	static ModeSet::Plan plan2;
+	ModeSet::Target hdmi2 = t;
+	hdmi2.sinkScdc = true;
+	hdmi2.ddcLine = 2;
+	failures += check(Edid::vicTiming(97, hdmi2.to) && hdmi2.to.pixelClockKHz == 594000, "VIC 97 is not 594 MHz");
+	if (!ModeSet::build(hdmi2, plan2, &why)) {
+		failures += check(false, "modeset: 594 MHz plan refused on an SCDC sink: %s", why);
+	} else {
+		PlanRegs r2;
+		r2.run(plan2);
+		const ModeSet::Step *sc = scdcStep(plan2, &at);
+		size_t txOn = 0;
+		for (size_t i = 0; i < plan2.count; i++)
+			if (plan2.steps[i].op == ModeSet::Op::Dmub && plan2.steps[i].arg == 3)
+				txOn = i;
+		failures += check((r2.get(2, 0x209e + d2) & 0x6) == 0x6 && sc && sc->value == 3 && sc->arg == 2 &&
+		                  at < txOn && plan2.cmds[1][1] == 5940000 && plan2.cmds[3][2] == 59400,
+		                  "modeset: 594 MHz: HDMI_CONTROL 0x%x, SCDC %u on DDC%u at step %zu (transmitter on at "
+		                  "%zu), pixel clock %u, symclk %u", r2.get(2, 0x209e + d2), sc ? sc->value : 99,
+		                  sc ? sc->arg : 99, at, txOn, plan2.cmds[1][1], plan2.cmds[3][2]);
+		hdmi2.from = hdmi2.to;
+		hdmi2.to = t720;
+		failures += check(ModeSet::build(hdmi2, plan2, &why) && (sc = scdcStep(plan2, &at)) && sc->value == 0,
+		                  "modeset: back to 720p on an SCDC sink does not clear TMDS_CONFIG");
+	}
+
+	// Refusals: interlaced targets, more than 340 MHz without SCDC, more than
+	// HDMI 2.0 TMDS carries.
 	ModeSet::Target bad = t;
 	bad.to.interlaced = true;
 	failures += check(!ModeSet::build(bad, plan, &why), "modeset: interlaced target accepted");
 	bad = t;
 	bad.to.pixelClockKHz = 594000;
-	failures += check(!ModeSet::build(bad, plan, &why), "modeset: 594 MHz target accepted");
+	failures += check(!ModeSet::build(bad, plan, &why), "modeset: 594 MHz accepted for a sink without SCDC");
+	bad.sinkScdc = true;
+	bad.to.pixelClockKHz = 600001;
+	failures += check(!ModeSet::build(bad, plan, &why), "modeset: 600.001 MHz target accepted");
 
 	printf("\nmodeset: 1080p60 -> 720p60 on OTG0/DIG2/UNIPHYC: %zu steps, %zu DMUB commands, "
 	       "vstartup %u %s\n", steps, cmds, vstartup, failures ? "MISMATCH" : "ok");
@@ -1142,7 +1221,7 @@ static int testPipe2() {
 	bool wrote = false;
 	for (size_t i = 0; i < plan.count; i++) {
 		const ModeSet::Step &s = plan.steps[i];
-		if (s.op == ModeSet::Op::Dmub || s.op == ModeSet::Op::Delay)
+		if (s.op == ModeSet::Op::Dmub || s.op == ModeSet::Op::Delay || s.op == ModeSet::Op::Scdc)
 			continue;
 		if (s.op == ModeSet::Op::Require) {
 			requires++;
@@ -1181,6 +1260,22 @@ static int testPipe2() {
 		}
 	}
 	failures += check(requires == 4, "pipe2: %zu requirements, expected 4", requires);
+
+	// A sink with SCDC is told the link is not scrambled (148.5 MHz), before
+	// the transmitter is enabled; one without is left alone (above).
+	Pipe2::Target scdc = t;
+	scdc.sinkScdc = true;
+	scdc.ddcLine = 2;
+	bool told = false, before = false;
+	if (Pipe2::build(scdc, stream, &why))
+		for (size_t i = 0; i < stream.count; i++) {
+			const ModeSet::Step &s = stream.steps[i];
+			if (s.op == ModeSet::Op::Scdc)
+				told = s.value == 0 && s.arg == 2 && !before;
+			before = before || (s.op == ModeSet::Op::Dmub && s.arg == 2);
+		}
+	failures += check(told && stream.count == plan.count + 1, "pipe2: SCDC step for a sink with SCDC: %d, %zu steps",
+	                  told, stream.count);
 
 	// The three kinds of DMUB command, as amdgpu sends them for OTG1 on PLL 2.
 	failures += check(plan.ncmds == 4, "pipe2: %zu DMUB commands, expected 4", plan.ncmds);
