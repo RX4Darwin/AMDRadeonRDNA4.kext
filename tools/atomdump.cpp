@@ -22,6 +22,7 @@
 #include "../src/pipe.hpp"
 #include "../src/ndrv.hpp"
 #include "../src/modeset.hpp"
+#include "../src/pipe2.hpp"
 #include "../src/amdfw.hpp"
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
@@ -1081,6 +1082,178 @@ static int testModeSet() {
 
 	printf("\nmodeset: 1080p60 -> 720p60 on OTG0/DIG2/UNIPHYC: %zu steps, %zu DMUB commands, "
 	       "vstartup %u %s\n", steps, cmds, vstartup, failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
+// The second-pipe plan (pipe2.hpp) lights pipe 1 next to a lit pipe 0. What the
+// generated table may address is checked here against the block layout, not
+// against the register names tools/pipegen/mkinc.py went by: every per-instance
+// block is `stride` dwords per instance from `first`, and a step inside a
+// family has to be in the instance the plan is for. Outside the families only
+// the listed shared registers, and only the listed bits.
+static int testPipe2() {
+	int failures = 0;
+	const Pipe2::Config &c = Pipe2::config();
+	enum Who { ThePipe, TheDig, TheLink };
+	struct Family { uint8_t seg; uint32_t first, stride; Who who; const char *name; };
+	static const Family families[] = {
+		{ 2, 0x05e5, 0xdc,  ThePipe, "HUBP" },        { 2, 0x0cc5, 0x16b, ThePipe, "DPP" },
+		{ 2, 0x183c, 0x5a,  ThePipe, "OPP" },         { 2, 0x1aca, 0x10,  ThePipe, "ODM" },
+		{ 2, 0x1b2a, 0x80,  ThePipe, "OTG" },         { 1, 0x0080, 0x04,  ThePipe, "OTG pixel rate" },
+		{ 2, 0x0530, 0x01,  ThePipe, "VTG" },         { 2, 0x2068, 0x124, TheDig,  "DIO" },
+		{ 2, 0x1f0d, 0x01,  TheDig,  "stream mapper" }, { 3, 0x0000, 0x15, ThePipe, "MPCC" },
+		{ 3, 0x007e, 0x5e,  ThePipe, "MPCC OGAM" },   { 3, 0x0453, 0xb0,  ThePipe, "MPCC MCM" },
+		{ 3, 0x02f2, 0x04,  ThePipe, "MPC out mux" }, { 3, 0x030b, 0x0d,  ThePipe, "MPC out CSC" },
+		{ 2, 0x0080, 0x02,  ThePipe, "PG domain" },   { 2, 0x04bb, 0x01,  ThePipe, "DET" },
+		{ 1, 0x0099, 0x01,  ThePipe, "DPPCLK DTO" },  { 1, 0x0040, 0x01,  TheLink, "PHY PLL resync" },
+		{ 3, 0x02d5, 0x02,  ThePipe, "HUBP 3D LUT" },
+	};
+	struct Shared { uint8_t seg; uint32_t dword, mask, waitMask; const char *name; };
+	static const Shared shared[] = {
+		{ 1, 0x006f, 1u << (5 * c.pipe), 0, "OTG_PIXEL_RATE_DIV" },
+		{ 1, 0x0064, 0, 0x00080000, "DENTIST_DISPCLK_CNTL" },
+		{ 1, 0x00a8, 1u << (3 * c.pipe), 0, "DPPCLK_CTRL" },
+		{ 2, 0x00a0, 1, 0, "DC_IP_REQUEST_CNTL" },
+		{ 2, 0x04fe, 0, 0, "DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A" },
+		{ 3, 0x030a, 1u << c.pipe, 0, "MPC_OUT_CSC_COEF_FORMAT" },
+	};
+	// The instance of a family a register is in, or -1; -2 if in no family.
+	auto instanceOf = [&](uint8_t seg, uint32_t dw, const Family **fam) -> int {
+		for (const Family &f : families)
+			if (seg == f.seg && dw >= f.first && dw < f.first + 4 * f.stride) {
+				*fam = &f;
+				return static_cast<int>((dw - f.first) / f.stride);
+			}
+		return -2;
+	};
+	auto own = [&](const Family &f) -> int { return f.who == ThePipe ? c.pipe : f.who == TheDig ? c.dig : c.link; };
+
+	Pipe2::Target t {};
+	t.litHubp = 0;
+	t.encoderObjId = 0x2120;
+	t.surface = 0x8002100000ull;
+	t.depth = Pipe2::Depth::Plane;
+	static Pipe2::Plan plan, stream;
+	const char *why = "";
+	if (!Pipe2::build(t, plan, &why))
+		return check(false, "pipe2: plan refused: %s", why);
+
+	size_t requires = 0, writes = 0, outside = 0;
+	bool wrote = false;
+	for (size_t i = 0; i < plan.count; i++) {
+		const ModeSet::Step &s = plan.steps[i];
+		if (s.op == ModeSet::Op::Dmub || s.op == ModeSet::Op::Delay)
+			continue;
+		if (s.op == ModeSet::Op::Require) {
+			requires++;
+			failures += check(!wrote, "pipe2: step %zu: a requirement after the first write", i);
+		} else if (s.op != ModeSet::Op::WaitValue) {
+			wrote = true;
+			writes++;
+		}
+		const bool reads = s.op == ModeSet::Op::Require || s.op == ModeSet::Op::WaitValue;
+		const Family *fam = nullptr;
+		const int inst = instanceOf(s.seg, s.dword, &fam);
+		if (inst >= 0) {
+			if (inst != own(*fam)) {
+				outside++;
+				failures += check(false, "pipe2: step %zu (%s) is in %s instance %d, the plan's is %d", i,
+				                  s.what, fam->name, inst, own(*fam));
+			}
+		} else {
+			const Shared *sh = nullptr;
+			for (const Shared &x : shared)
+				if (x.seg == s.seg && x.dword == s.dword)
+					sh = &x;
+			const uint32_t mask = s.op == ModeSet::Op::Write || s.op == ModeSet::Op::Copy ? 0xffffffffu : s.mask;
+			if (!sh || (mask & ~(reads ? sh->waitMask : sh->mask))) {
+				outside++;
+				failures += check(false, "pipe2: step %zu (%s) touches %u:0x%04x mask 0x%08x: not the pipe's "
+				                  "and not an allowed shared bit", i, s.what, s.seg, s.dword, mask);
+			}
+		}
+		if (s.op == ModeSet::Op::Copy) {
+			const Family *src = nullptr;
+			failures += check(instanceOf(s.seg, s.arg, &src) == t.litHubp && src == &families[0] &&
+			                  s.arg + (c.pipe - t.litHubp) * 0xdc == s.dword,
+			                  "pipe2: step %zu copies from 0x%04x, not the lit HUBP's twin of 0x%04x", i,
+			                  s.arg, s.dword);
+		}
+	}
+	failures += check(requires == 4, "pipe2: %zu requirements, expected 4", requires);
+
+	// The three kinds of DMUB command, as amdgpu sends them for OTG1 on PLL 2.
+	failures += check(plan.ncmds == 4, "pipe2: %zu DMUB commands, expected 4", plan.ncmds);
+	if (plan.ncmds == 4) {
+		const Dmub::Cmd &pll = plan.cmds[0], &enc = plan.cmds[1], &on = plan.cmds[2], &enc2 = plan.cmds[3];
+		failures += check(pll[0] == 0x10000280 && pll[1] == 1485000 && pll[2] == 0x00032016 &&
+		                  (pll[3] & 0xffff) == c.pipe,
+		                  "pipe2: set pixel clock %08x %08x %08x %08x", pll[0], pll[1], pll[2], pll[3]);
+		failures += check(enc[0] == 0x0c000080 && enc[1] == 0x04030f02 && enc[2] == 14850 &&
+		                  memcmp(enc, enc2, sizeof(Dmub::Cmd)) == 0,
+		                  "pipe2: stream setup %08x %08x %08x", enc[0], enc[1], enc[2]);
+		failures += check(on[0] == 0x3c000180 && on[1] == 0x04030102 && on[2] == 14850 && (on[3] & 0xff) == 3,
+		                  "pipe2: transmitter enable %08x %08x %08x %08x", on[0], on[1], on[2], on[3]);
+	}
+
+	// What the registers hold afterwards: timing of VIC 16, the surface, the
+	// blender feeding OPP1 from DPP1, the OTG enabled and the lock released.
+	PlanRegs regs;
+	for (size_t i = 0; i < plan.count; i++) {
+		const ModeSet::Step &s = plan.steps[i];
+		if (s.op == ModeSet::Op::Write)
+			regs.set(s.seg, s.dword, s.value);
+		else if (s.op == ModeSet::Op::Update)
+			regs.set(s.seg, s.dword, (regs.get(s.seg, s.dword) & ~s.mask) | s.value);
+	}
+	struct { uint8_t seg; uint32_t dw, mask, want; const char *name; } after[] = {
+		{ 2, 0x1baa, 0xffffffff, 2199, "OTG1 h total" },         { 2, 0x1baf, 0xffffffff, 1124, "OTG1 v total" },
+		{ 2, 0x1bab, 0x7fff7fff, 0x00c00840, "OTG1 h blank" },   { 2, 0x1bb8, 0x7fff7fff, 0x00290461, "OTG1 v blank" },
+		{ 2, 0x1c05, 0x3ff, c.vstartup, "OTG1 vstartup" },       { 2, 0x1bc3, 0x1, 0x1, "OTG1 master enable" },
+		{ 2, 0x1c09, 0x1, 0x0, "OTG1 update lock released" },    { 2, 0x1adb, 0xf0000, 0x10000, "ODM1 source OPP1" },
+		{ 2, 0x06e6, 0xffffffff, 0x02100000, "surface low" },    { 2, 0x06e7, 0xffffffff, 0x80, "surface high" },
+		{ 2, 0x06e3, 0xffff, 1919, "pitch" },                    { 2, 0x06c7, 0xffffffff, 0x04380780, "viewport" },
+		{ 3, 0x0015, 0xf, 1, "MPCC1 top = DPP1" },               { 3, 0x0017, 0xf, 1, "MPCC1 OPP id" },
+		{ 3, 0x02f6, 0xf, 1, "OPP1 out mux = MPCC1" },           { 2, 0x18ae, 0x1, 0, "DPG1 off (video)" },
+		{ 2, 0x22dd, 0x1, 1, "DIG2 front-end enabled" },         { 2, 0x2305, 0x1, 1, "DIG2 back-end enabled" },
+		{ 2, 0x1f0f, 0x7, 2, "DIG2 mapped to link 2" },          { 2, 0x22db, 0x7, 1, "DIG2 sourced by OTG1" },
+		{ 2, 0x04bc, 0x1f, c.detSegments, "DET1 segments" },     { 1, 0x006f, 0x20, 0x20, "OTG1 TMDS divider /4" },
+	};
+	for (const auto &e : after)
+		failures += check((regs.get(e.seg, e.dw) & e.mask) == e.want, "pipe2: %s: %u:0x%04x = 0x%08x, want 0x%08x "
+		                  "under 0x%08x", e.name, e.seg, e.dw, regs.get(e.seg, e.dw), e.want, e.mask);
+
+	// Stream only: stops before the plane, shows the pattern colour, and never
+	// reaches the HUBP.
+	t.depth = Pipe2::Depth::Stream;
+	t.surface = 0;
+	bool ok = Pipe2::build(t, stream, &why);
+	failures += check(ok && stream.count < plan.count && stream.ncmds == 4, "pipe2: stream-only plan: %s, %zu steps",
+	                  ok ? "built" : why, stream.count);
+	bool hubp = false, colour = false;
+	for (size_t i = 0; ok && i < stream.count; i++) {
+		const ModeSet::Step &s = stream.steps[i];
+		const Family *fam = nullptr;
+		if (s.op != ModeSet::Op::Dmub && s.op != ModeSet::Op::Delay && instanceOf(s.seg, s.dword, &fam) >= 0 &&
+		    fam == &families[0])
+			hubp = true;
+		if (s.op == ModeSet::Op::Write && s.dword == 0x18b2)      // DPG1_DPG_COLOUR_G_Y
+			colour = s.value == ((static_cast<uint32_t>(Pipe2::kPatternColour[1]) << 16) | Pipe2::kPatternColour[1]);
+	}
+	failures += check(!hubp && colour, "pipe2: stream-only plan: HUBP touched %d, pattern colour %d", hubp, colour);
+
+	// Refusals: the lit pipe on the plan's HUBP, no surface for a plane.
+	Pipe2::Target bad = t;
+	bad.litHubp = c.pipe;
+	failures += check(!Pipe2::build(bad, stream, &why), "pipe2: lit pipe on the plan's HUBP accepted");
+	bad = t;
+	bad.depth = Pipe2::Depth::Plane;
+	failures += check(!Pipe2::build(bad, stream, &why), "pipe2: plane without a surface accepted");
+
+	printf("\npipe2: pipe %u DIG%u link %u HPD%u %ux%u at %u kHz: %zu steps (%zu register writes, %zu "
+	       "requirements), %zu DMUB commands, %zu outside the pipe %s\n", c.pipe, c.dig, c.link, c.hpd,
+	       c.timing.hActive, c.timing.vActive, c.timing.pixelClockKHz, plan.count, writes, requires, plan.ncmds,
+	       outside, failures ? "MISMATCH" : "ok");
 	return failures;
 }
 
@@ -3247,6 +3420,7 @@ int main(int argc, char **argv) {
 	failures += testDmubPayloads();
 	failures += testNdrv();
 	failures += testModeSet();
+	failures += testPipe2();
 	failures += testPsp();
 	failures += testGfxImages();
 	failures += testSdmaPackets();

@@ -189,5 +189,4 @@ WindowServer never connects to head 2, head 0's display configuration changes wo
 - With `rdna4-trace=1` every csc request to head 2 is logged with its reply.
 - Escape: remove the boot-arg, or `rdna4-off=1`.
 
-Lighting the pipe is the separate hardware half: `src/modeset.cpp` only re-times a pipe the GOP already lit, and it
-has not run on the card yet.
+Lighting the pipe is the separate hardware half: `docs/second-pipe.md` (`rdna4-head2=2..4`).

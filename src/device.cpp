@@ -992,11 +992,11 @@ uint64_t RDNA4Device::liveFramePeriodNs() const {
 // only way to learn the exact rate the GOP chose. Edges are detected by
 // polling every 10 us, so 10 frames give ~0.01 % precision. Returns 0 if the
 // counter does not move (OTG stopped / unreadable).
-uint64_t RDNA4Device::measureFramePeriodNs() {
+uint64_t RDNA4Device::measureFramePeriodNs(uint32_t otgOffset) {
 	if (!pipe.valid())
 		return 0;
 	constexpr uint32_t kFrames = 10;
-	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otgOff();
+	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otgOffset;
 
 	auto count = [&]() { return regReadDmu(2, reg) & 0xffffff; };
 	auto nowNs = [&]() {
@@ -2003,14 +2003,14 @@ const Modes::Mode *RDNA4Device::findMode(uint32_t id) const {
 	return nullptr;
 }
 
-// The VBIOS display path wired to the lit pipe: the one whose HPD pin is
-// the pipe's (both count from 1).
-bool RDNA4Device::pathForPipe(AtomBios::DisplayPath &out) {
+// The VBIOS display path wired to an HPD pin (counted from 1, as the lit
+// pipe's is).
+bool RDNA4Device::pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out) {
 	AtomBios::DisplayPath paths[AtomBios::MaxDisplayPaths];
 	size_t n = atomBios.getDisplayPaths(paths, AtomBios::MaxDisplayPaths);
 	for (size_t i = 0; i < n; i++) {
 		AtomBios::PathRecords rec;
-		if (atomBios.getPathRecords(paths[i], rec) && rec.hasHpd && rec.hpdPin == pipe.hpd) {
+		if (atomBios.getPathRecords(paths[i], rec) && rec.hasHpd && rec.hpdPin == hpdPin) {
 			out = paths[i];
 			return true;
 		}
@@ -2035,9 +2035,10 @@ bool RDNA4Device::waitFrames(uint32_t frames) {
 	return true;
 }
 
-bool RDNA4Device::runPlan(const ModeSet::Plan &plan) {
-	for (size_t i = 0; i < plan.count; i++) {
-		const ModeSet::Step &s = plan.steps[i];
+bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds,
+                           size_t ncmds, const char *tag) {
+	for (size_t i = 0; i < count; i++) {
+		const ModeSet::Step &s = steps[i];
 		switch (s.op) {
 		case ModeSet::Op::Write:
 			regWriteDmu(s.seg, s.dword, s.value);
@@ -2045,12 +2046,28 @@ bool RDNA4Device::runPlan(const ModeSet::Plan &plan) {
 		case ModeSet::Op::Update:
 			regWriteDmu(s.seg, s.dword, (regReadDmu(s.seg, s.dword) & ~s.mask) | s.value);
 			break;
+		case ModeSet::Op::Copy:
+			regWriteDmu(s.seg, s.dword, regReadDmu(s.seg, s.arg));
+			break;
+		case ModeSet::Op::Delay:
+			IODelay(s.arg);
+			break;
+		case ModeSet::Op::Require: {
+			const uint32_t v = regReadDmu(s.seg, s.dword);
+			if (v == 0xFFFFFFFF || (v & s.mask) != s.value) {
+				FBLOG("%s: step %lu not met (%s): 0x%08x", tag, static_cast<unsigned long>(i), s.what, v);
+				return false;
+			}
+			break;
+		}
 		case ModeSet::Op::WaitSet:
-		case ModeSet::Op::WaitClear: {
+		case ModeSet::Op::WaitClear:
+		case ModeSet::Op::WaitValue: {
+			const uint32_t want = s.op == ModeSet::Op::WaitSet ? s.mask
+			                    : s.op == ModeSet::Op::WaitClear ? 0 : s.value;
 			bool ok = false;
 			for (uint32_t us = 0;; us += 10) {
-				uint32_t v = regReadDmu(s.seg, s.dword) & s.mask;
-				if (s.op == ModeSet::Op::WaitSet ? v == s.mask : v == 0) {
+				if ((regReadDmu(s.seg, s.dword) & s.mask) == want) {
 					ok = true;
 					break;
 				}
@@ -2059,7 +2076,7 @@ bool RDNA4Device::runPlan(const ModeSet::Plan &plan) {
 				IODelay(10);
 			}
 			if (!ok) {
-				FBLOG("modeset: step %lu (%s) timed out%s", static_cast<unsigned long>(i),
+				FBLOG("%s: step %lu (%s) timed out%s", tag, static_cast<unsigned long>(i),
 				      s.what, s.optional ? ", continuing" : "");
 				if (!s.optional)
 					return false;
@@ -2067,15 +2084,15 @@ bool RDNA4Device::runPlan(const ModeSet::Plan &plan) {
 			break;
 		}
 		case ModeSet::Op::Dmub:
-			if (s.arg >= plan.ncmds || !dmubSubmit(&plan.cmds[s.arg], 1, "modeset")) {
-				FBLOG("modeset: step %lu (%s): DMUB did not take the command",
+			if (s.arg >= ncmds || !dmubSubmit(&cmds[s.arg], 1, tag)) {
+				FBLOG("%s: step %lu (%s): DMUB did not take the command", tag,
 				      static_cast<unsigned long>(i), s.what);
 				return false;
 			}
 			break;
 		case ModeSet::Op::WaitFrames:
 			if (!waitFrames(s.arg)) {
-				FBLOG("modeset: step %lu (%s): the OTG is not counting frames",
+				FBLOG("%s: step %lu (%s): the OTG is not counting frames", tag,
 				      static_cast<unsigned long>(i), s.what);
 				return false;
 			}
@@ -2137,3 +2154,147 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	return kIOReturnIOError;
 }
 
+
+// ---------------------------------------------------------------------------
+// The second pipe
+// ---------------------------------------------------------------------------
+
+// What each step of a plan would do, with the register as it is now, as the
+// registry property RDNA4FB,Pipe2 (lines joined with " ## ", like
+// RDNA4FB,Cursor): several hundred lines do not survive the kernel log.
+void RDNA4Device::surveySteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds) {
+	constexpr size_t kCap = 96 * 1024;
+	char *text = static_cast<char *>(IOMalloc(kCap));
+	if (!text)
+		return;
+	size_t len = 0, differ = 0, unmet = 0;
+	text[0] = '\0';
+	for (size_t i = 0; i < count && len + 256 < kCap; i++) {
+		const ModeSet::Step &s = steps[i];
+		const uint32_t cur = regReadDmu(s.seg, s.dword);
+		char line[224];
+		switch (s.op) {
+		case ModeSet::Op::Write:
+		case ModeSet::Op::Update:
+		case ModeSet::Op::Copy: {
+			const uint32_t next = s.op == ModeSet::Op::Write ? s.value
+			                    : s.op == ModeSet::Op::Copy ? regReadDmu(s.seg, s.arg)
+			                    : (cur & ~s.mask) | s.value;
+			differ += next != cur;
+			snprintf(line, sizeof(line), "%lu %u:%04x %08x %s %08x %s", static_cast<unsigned long>(i),
+			         s.seg, s.dword, cur, next == cur ? "==" : "->", next, s.what);
+			break;
+		}
+		case ModeSet::Op::Require:
+		case ModeSet::Op::WaitValue: {
+			const bool met = cur != 0xFFFFFFFF && (cur & s.mask) == s.value;
+			unmet += s.op == ModeSet::Op::Require && !met;
+			snprintf(line, sizeof(line), "%lu %u:%04x %08x %s &%08x=%08x %s%s", static_cast<unsigned long>(i),
+			         s.seg, s.dword, cur, s.op == ModeSet::Op::Require ? "require" : "wait", s.mask, s.value,
+			         s.what, met ? "" : " (not so now)");
+			if (s.op == ModeSet::Op::Require)
+				FBLOG("pipe2: %s", line);
+			break;
+		}
+		case ModeSet::Op::Dmub:
+			snprintf(line, sizeof(line), "%lu dmub %08x %08x %08x %08x %s", static_cast<unsigned long>(i),
+			         cmds[s.arg][0], cmds[s.arg][1], cmds[s.arg][2], cmds[s.arg][3], s.what);
+			break;
+		default:
+			snprintf(line, sizeof(line), "%lu delay %u us %s", static_cast<unsigned long>(i), s.arg, s.what);
+		}
+		len += snprintf(text + len, kCap - len, "%s ## ", line);
+	}
+	if (owner)
+		owner->setProperty("RDNA4FB,Pipe2", text);
+	FBLOG("pipe2: survey of %lu steps in the registry (RDNA4FB,Pipe2): %lu would change a register, "
+	      "%lu requirement(s) not met; nothing written", static_cast<unsigned long>(count),
+	      static_cast<unsigned long>(differ), static_cast<unsigned long>(unmet));
+	IOFree(text, kCap);
+}
+
+bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhys) {
+	const Pipe2::Config &c = Pipe2::config();
+	if (!pipe.valid() || !rmmio || !ipDiscovery.isValid()) {
+		FBLOG("pipe2: not lit: no lit pipe to stand next to");
+		return false;
+	}
+	if (pipe.otg == c.pipe || pipe.opp == c.pipe || pipe.hubp == c.pipe || pipe.dig == c.dig ||
+	    pipe.link == c.link) {
+		FBLOG("pipe2: not lit: the firmware's pipe (OTG%u OPP%u HUBP%u DIG%u link %u) uses a block of the "
+		      "plan's (pipe %u, DIG%u, link %u)", pipe.otg, pipe.opp, pipe.hubp, pipe.dig, pipe.link,
+		      c.pipe, c.dig, c.link);
+		return false;
+	}
+	AtomBios::DisplayPath path {};
+	if (!pathForHpd(c.hpd, path) || Pipe2::linkOfEncoder(path.encoderObjId) != c.link) {
+		FBLOG("pipe2: not lit: the plan is for a connector on HPD%u and link %u, which this board's VBIOS "
+		      "does not have", c.hpd, c.link);
+		return false;
+	}
+
+	Pipe2::Target t {};
+	t.litHubp = pipe.hubp;
+	t.encoderObjId = path.encoderObjId;
+	t.depth = level >= 4 ? Pipe2::Depth::Plane : Pipe2::Depth::Stream;
+	// The lit pipe scans the console from the address in its HUBP; the second
+	// surface lies in the same memory, so the same distance further on.
+	constexpr uint32_t kSurfaceLo = 0x060a, kSurfaceHi = 0x060b;   // HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS(_HIGH)
+	const uint64_t lit = regReadDmu(2, kSurfaceLo + hubpOff()) |
+	                     (static_cast<uint64_t>(regReadDmu(2, kSurfaceHi + hubpOff()) & 0xffff) << 32);
+	if (surfacePhys <= fbPhysBase || lit == 0) {
+		FBLOG("pipe2: not lit: no scanout address (console 0x%llx at 0x%llx, surface 0x%llx)", fbPhysBase,
+		      lit, surfacePhys);
+		return false;
+	}
+	t.surface = lit + (surfacePhys - fbPhysBase);
+
+	// The plane needs its share of the DET buffer; what the others hold is
+	// theirs (taking it back means reprogramming the lit pipe).
+	uint32_t det[4] {}, others = 0;
+	for (uint32_t i = 0; i < 4; i++) {
+		det[i] = regReadDmu(c.detSeg, c.detCtrl[i]) & 0x1f;
+		if (i != c.pipe)
+			others += det[i];
+	}
+	const bool detFits = others + c.detSegments <= Pipe2::kDetSegmentsTotal;
+	FBLOG("pipe2: DET segments %u %u %u %u of %u: %u for the plane %s", det[0], det[1], det[2], det[3],
+	      Pipe2::kDetSegmentsTotal, c.detSegments, detFits ? "fit" : "do NOT fit");
+
+	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
+	if (!plan)
+		return false;
+	const char *why = "";
+	bool ok = Pipe2::build(t, *plan, &why);
+	if (!ok) {
+		FBLOG("pipe2: not lit: %s", why);
+	} else if (level <= 2) {
+		FBLOG("pipe2: pipe %u DIG%u link %u HPD%u, %ux%u at %u kHz, surface at 0x%llx: %lu steps, "
+		      "%lu DMUB commands", c.pipe, c.dig, c.link, c.hpd, c.timing.hActive, c.timing.vActive,
+		      c.timing.pixelClockKHz, t.surface, static_cast<unsigned long>(plan->count),
+		      static_cast<unsigned long>(plan->ncmds));
+		surveySteps(plan->steps, plan->count, plan->cmds);
+	} else if (t.depth == Pipe2::Depth::Plane && !detFits) {
+		FBLOG("pipe2: not lit: the lit pipe holds the DET buffer; rdna4-head2=3 lights the stream alone");
+		ok = false;
+	} else {
+		FBLOG("pipe2: lighting pipe %u DIG%u link %u HPD%u, %ux%u at %u kHz, %s: %lu steps, %lu DMUB "
+		      "commands", c.pipe, c.dig, c.link, c.hpd, c.timing.hActive, c.timing.vActive,
+		      c.timing.pixelClockKHz, t.depth == Pipe2::Depth::Plane ? "stream and plane" : "stream only",
+		      static_cast<unsigned long>(plan->count), static_cast<unsigned long>(plan->ncmds));
+		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2");
+		// Whether it runs: the frame rate of its timing generator, and the
+		// underflow flags of the plane and the OPTC (HUBPn_DCHUBP_CNTL,
+		// ODMn_OPTC_INPUT_GLOBAL_CONTROL), raw.
+		const uint64_t periodNs = measureFramePeriodNs(c.pipe * Pipe::Reg::kOtgStride);
+		const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
+		const uint32_t want = c.timing.refreshMilliHz();
+		FBLOG("pipe2: %s; OTG%u measured %u.%03u Hz (the mode is %u.%03u); HUBP%u_DCHUBP_CNTL=0x%08x "
+		      "ODM%u_OPTC_INPUT_GLOBAL_CONTROL=0x%08x", ok ? "plan ran" : "plan STOPPED", c.pipe,
+		      mHz / 1000, mHz % 1000, want / 1000, want % 1000, c.pipe,
+		      regReadDmu(2, 0x05f4 + c.pipe * Pipe::Reg::kHubpStride), c.pipe,
+		      regReadDmu(2, 0x1aca + c.pipe * Pipe::Reg::kOdmStride));
+	}
+	IOFree(plan, sizeof(Pipe2::Plan));
+	return ok;
+}

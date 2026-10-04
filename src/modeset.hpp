@@ -42,6 +42,11 @@ enum class Op : uint8_t {
 	WaitClear,    // poll until (reg & mask) == 0, up to arg microseconds
 	Dmub,         // submit cmds[arg] and wait for the firmware to consume it
 	WaitFrames,   // let arg frames of the OTG pass (frame counter)
+	// Used by the second-pipe plan (pipe2.hpp):
+	WaitValue,    // poll until (reg & mask) == value, up to arg microseconds
+	Delay,        // arg microseconds
+	Copy,         // reg = the register at dword `arg` of the same segment
+	Require,      // (reg & mask) must equal value, or the plan is not run
 };
 
 struct Step {

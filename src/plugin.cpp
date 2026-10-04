@@ -331,6 +331,7 @@ struct Head2 {
 	uint32_t         traceBudget { 400 };   // its own: head 0 must not use up the lines
 };
 Head2 *head2 { nullptr };
+uint32_t head2Level { 0 };              // rdna4-head2: 1 phantom, 2..4 see RDNA4Device::lightSecondPipe
 mach_vm_address_t orgStart { 0 };
 mach_vm_address_t orgGetVRAMRange { 0 };
 
@@ -394,7 +395,7 @@ void createHead2(IOPCIDevice *pci) {
 }
 
 // Once head 0's device exists: what head 2 serves.
-void fillHead2(const RDNA4Device &dev) {
+void fillHead2(RDNA4Device &dev) {
 	Head2 *h = head2;
 	if (!h || h->ready)
 		return;
@@ -421,15 +422,34 @@ void fillHead2(const RDNA4Device &dev) {
 	}
 	// The second sink if one answered, else a copy of the boot display's.
 	memcpy(h->edid, dev.edid2Len ? dev.edid2Data : dev.edidData, sizeof(h->edid));
-	// The first mode, in table order (native first), whose surface fits.
+	// The first mode, in table order (native first), whose surface fits. With
+	// the pipe to be lit (rdna4-head2 >= 2) it has to be the one mode the
+	// second-pipe plan was generated for.
 	const size_t n = Modes::build(h->edid, sizeof(h->edid), Modes::Limits {}, h->table, Modes::MaxModes);
+	const Edid::DetailedTiming &lit = Pipe2::config().timing;
+	auto isPlanMode = [&](const Edid::DetailedTiming &t) {
+		return t.pixelClockKHz == lit.pixelClockKHz && !t.interlaced &&
+		       t.hActive == lit.hActive && t.hBlank == lit.hBlank &&
+		       t.hSyncOffset == lit.hSyncOffset && t.hSyncWidth == lit.hSyncWidth &&
+		       t.vActive == lit.vActive && t.vBlank == lit.vBlank &&
+		       t.vSyncOffset == lit.vSyncOffset && t.vSyncWidth == lit.vSyncWidth;
+	};
 	const Modes::Mode *mode = nullptr;
-	for (size_t i = 0; i < n && !mode; i++)
-		if (Ndrv::spareSurface(dev.fbPhysBase, dev.fbLength, rangeBase, rangeLen,
-		                       h->table[i].t.hActive, h->table[i].t.vActive, h->surface))
+	for (size_t i = 0; i < n && !mode; i++) {
+		const Edid::DetailedTiming &t = h->table[i].t;
+		if (head2Level >= 2 && !isPlanMode(t))
+			continue;
+		if (Ndrv::spareSurface(dev.fbPhysBase, dev.fbLength, rangeBase, rangeLen, t.hActive, t.vActive,
+		                       h->surface))
 			mode = &h->table[i];
+	}
 	if (!mode) {
-		FBLOG("head2: nothing to serve: no mode of the sink fits behind the console");
+		if (head2Level >= 2)
+			FBLOG("head2: nothing to serve: the sink has no %ux%u mode at %u kHz, the one the "
+			      "second-pipe plan is for, or it does not fit behind the console", lit.hActive,
+			      lit.vActive, lit.pixelClockKHz);
+		else
+			FBLOG("head2: nothing to serve: no mode of the sink fits behind the console");
 		return;
 	}
 	Ndrv::Backend be {};
@@ -447,6 +467,12 @@ void fillHead2(const RDNA4Device &dev) {
 	FBLOG("head2: serving %ux%u@%u.%03u on surface 0x%llx, EDID of %s", mode->t.hActive,
 	      mode->t.vActive, mode->refreshMilliHz / 1000, mode->refreshMilliHz % 1000,
 	      h->surface.physBase, dev.edid2Len ? "the second sink" : "the boot display (no second sink)");
+	if (head2Level >= 2) {
+		if (dev.edid2Len && dev.isAmd)
+			dev.lightSecondPipe(head2Level, h->surface.physBase);
+		else
+			FBLOG("head2: pipe not lit: no second sink answered on DDC");
+	}
 }
 
 // The stand-in for IOBootNDRV::doDriverIO.
@@ -680,6 +706,7 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	patcher.clearError();
 	uint32_t second = 0;
 	if (PE_parse_boot_argn("rdna4-head2", &second, sizeof(second)) && second) {
+		head2Level = second;
 		KernelPatcher::RouteRequest start {
 			"__ZN17IONDRVFramebuffer5startEP9IOService", wrapStart, orgStart,
 		};

@@ -28,6 +28,7 @@
 #include "modeset.hpp"
 #include "ndrv.hpp"
 #include "pipe.hpp"
+#include "pipe2.hpp"
 
 class IOMemoryMap;
 
@@ -77,6 +78,12 @@ public:
 	// Program mode `m` on the lit HDMI pipe (modeset.hpp). On failure the
 	// previous timing is programmed back and an error returned.
 	IOReturn applyMode(const Modes::Mode &m);
+
+	// The second pipe (pipe2.hpp), for a head whose surface is at CPU
+	// address `surfacePhys` in the console's memory range. `level` is
+	// rdna4-head2: 2 writes nothing and publishes what every step would do,
+	// 3 lights the stream with a solid colour, 4 also the plane.
+	bool lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhys);
 
 	// Display power (DPMS). Off = disable the DP video stream and put the
 	// sink in D3 via DPCD SET_POWER, or on an HDMI pipe blank to black via
@@ -184,7 +191,8 @@ private:
 	Edid::DetailedTiming bootTiming {};
 	bool bootTimingValid { false };
 	void discoverPipe();
-	uint64_t measureFramePeriodNs();
+	uint64_t measureFramePeriodNs() { return measureFramePeriodNs(otgOff()); }
+	uint64_t measureFramePeriodNs(uint32_t otgOffset);
 	static uint32_t pipeRead(void *ctx, uint8_t baseIdx, uint32_t dword);
 	uint32_t otgOff()  const { return pipe.otg  < Pipe::kMaxOtg ? pipe.otg  * Pipe::Reg::kOtgStride  : 0; }
 	uint32_t hubpOff() const { return pipe.hubp < Pipe::kMaxOtg ? pipe.hubp * Pipe::Reg::kHubpStride : 0; }
@@ -205,8 +213,14 @@ private:
 	Edid::DetailedTiming liveTiming {};
 	bool liveTimingValid { false };
 	ModeSet::Plan modePlan {};
-	bool pathForPipe(AtomBios::DisplayPath &out);
-	bool runPlan(const ModeSet::Plan &plan);
+	bool pathForPipe(AtomBios::DisplayPath &out) { return pathForHpd(pipe.hpd, out); }
+	bool pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out);
+	bool runPlan(const ModeSet::Plan &plan) {
+		return runSteps(plan.steps, plan.count, plan.cmds, plan.ncmds, "modeset");
+	}
+	bool runSteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds, size_t ncmds,
+	              const char *tag);
+	void surveySteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds);
 	bool waitFrames(uint32_t frames);
 
 	bool initHardwareCursor();
