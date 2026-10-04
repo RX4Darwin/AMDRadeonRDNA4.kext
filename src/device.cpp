@@ -1402,6 +1402,7 @@ void RDNA4Device::dmubHistory() {
 // boot state in the DMCUB_SCRATCH bank (SCRATCH0 = boot status; higher
 // slots carry version/build markers on most builds). Pure register reads —
 // no ring traffic, no state change, safe alongside the live DP0 console.
+// rdna4-dmubver=2 adds one write: the GPINT version query below.
 void RDNA4Device::dumpDmubVersion() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-dmubver", &on, sizeof(on)) || on == 0)
@@ -1425,6 +1426,36 @@ void RDNA4Device::dumpDmubVersion() {
 	    (static_cast<uint64_t>(regReadDmu(2, kDmcubRegion4OffsetHigh)) << 32);
 	FBLOG("dmubver: cntl=0x%08x cntl2=0x%08x region4 mc=0x%llx",
 	      regReadDmu(2, 0x01f6), regReadDmu(2, 0x0200), region4Mc);
+
+	// rdna4-dmubver=2: ask the firmware itself (DMUB_GPINT__GET_FW_VERSION).
+	// This is the one write here: DMCUB_GPINT_DATAIN1, which interrupts the
+	// firmware. Level 1 stays read-only. Only sent to an enabled DMCUB whose
+	// boot status says the mailbox is ready.
+	if (on >= 2) {
+		constexpr uint32_t kGpintDataIn1 = 0x01f8, kScratch7 = kScratch0 + 7;
+		const uint32_t cntl = regReadDmu(2, 0x01f6), boot = regReadDmu(2, kScratch0);
+		const uint32_t word = Dmub::gpintWord(Dmub::GpintGetFwVersion, 0);
+		if (cntl == 0xFFFFFFFF || !(cntl & (1u << 16)) || !(boot & 0x2)) {   // DMCUB_ENABLE, mailbox_rdy
+			FBLOG("dmubver: GPINT not sent: DMCUB not enabled or its mailbox not ready");
+		} else {
+			const uint32_t before = regReadDmu(2, kScratch7);
+			regWriteDmu(2, kGpintDataIn1, word);
+			const uint32_t acked = Dmub::gpintAcked(word);
+			uint32_t seen = regReadDmu(2, kGpintDataIn1), us = 0;
+			while (seen != acked && us < 100000) {
+				IODelay(10);
+				us += 10;
+				seen = regReadDmu(2, kGpintDataIn1);
+			}
+			if (seen == acked)
+				FBLOG("dmubver: GPINT GET_FW_VERSION acknowledged after %u us: fw_version=0x%08x "
+				      "(SCRATCH7 was 0x%08x); amdgpu's own DMUB on Debian reports 0x00010300",
+				      us, regReadDmu(2, kScratch7), before);
+			else
+				FBLOG("dmubver: GPINT GET_FW_VERSION not acknowledged in 100 ms (DATAIN1 reads "
+				      "0x%08x): this firmware does not serve GPINT", seen);
+		}
+	}
 
 	// The scratch bank carries boot status, not the firmware version, so it
 	// can't answer the dialect question on its own. Escalate: dmub_fw_meta_info

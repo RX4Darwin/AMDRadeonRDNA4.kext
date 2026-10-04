@@ -66,6 +66,18 @@ inline const char *cmdLabel(uint8_t type, uint8_t subType) {
 	}
 }
 
+// GPINT, the register command channel (dmub_srv_send_gpint_command): the host
+// writes DMCUB_GPINT_DATAIN1 = status 1 [31:28] | command [27:16] | param
+// [15:0]; the firmware clears the status nibble once it has taken the
+// command and leaves a reply in DMCUB_SCRATCH7.
+constexpr uint32_t GpintGetFwVersion = 1;   // DMUB_GPINT__GET_FW_VERSION
+constexpr uint32_t gpintWord(uint32_t command, uint16_t param) {
+	return (1u << 28) | ((command & 0xfff) << 16) | param;
+}
+constexpr uint32_t gpintAcked(uint32_t word) { return word & 0x0fffffff; }
+static_assert(gpintWord(GpintGetFwVersion, 0) == 0x10010000 &&
+              gpintAcked(0x10010000) == 0x00010000, "GPINT encoding");
+
 // struct dmub_cmd_header, encoded manually to avoid bitfield ABI surprises:
 //   type[7:0] | sub_type[15:8] | ret_status[16] | multi_cmd_pending[17] |
 //   is_reg_based[18] | reserved[23:19] | payload_bytes[29:24] | rsvd[31:30]
