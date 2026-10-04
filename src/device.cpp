@@ -2118,8 +2118,13 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	      static_cast<unsigned long>(modePlan.count), static_cast<unsigned long>(modePlan.ncmds));
 	if (runPlan(modePlan)) {
 		liveTiming = m.t;
-		FBLOG("modes: now %ux%u@%u.%03u", m.t.hActive, m.t.vActive,
-		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000);
+		// The firmware taking SET_PIXEL_CLOCK does not show the PLL runs at
+		// the new rate: time the OTG's frames. An unchanged clock would give
+		// the old pixel clock over the new totals, not this refresh.
+		const uint64_t periodNs = measureFramePeriodNs();
+		const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
+		FBLOG("modes: now %ux%u@%u.%03u, measured %u.%03u Hz", m.t.hActive, m.t.vActive,
+		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, mHz / 1000, mHz % 1000);
 		return kIOReturnSuccess;
 	}
 
