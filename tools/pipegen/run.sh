@@ -85,3 +85,10 @@ done
 python3 "$here/mkinc.py" "$HDR" "$B/trace.txt" "$(git -C "$L" rev-parse HEAD)" > "$B/pipe2_linux.inc"
 cp -f "$B/pipe2_linux.inc" "$repo/src/pipe2_linux.inc"
 echo "wrote src/pipe2_linux.inc ($(grep -c "^	{ '" "$repo/src/pipe2_linux.inc") entries)"
+
+# The reference for the host test of the DisplayPort mode switch (src/modeset.cpp): the same Linux code
+# retiming a lit DP stream on pipe 0 to 2560x1440@60 (CVT reduced blanking).
+"$B/pipegen" dp 0 0 0 1  2560 48 32 80  1440 3 5 33  241500 1 0 0 > "$B/dp-trace.txt"
+python3 "$here/mkgolden.py" "$B/dp-trace.txt" "$(git -C "$L" rev-parse HEAD)" > "$B/dp_retime_linux.inc"
+cp -f "$B/dp_retime_linux.inc" "$repo/tools/dp_retime_linux.inc"
+echo "wrote tools/dp_retime_linux.inc"

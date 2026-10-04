@@ -2,8 +2,8 @@
 //  modeset.hpp
 //  RDNA4FB
 //
-//  HDMI (TMDS) mode change on the lit pipe, as an ordered list of register
-//  writes, polls and DMUB commands. The sequence is amdgpu DC's full
+//  Mode change on the lit pipe, as an ordered list of register writes, polls
+//  and DMUB commands. For HDMI (TMDS) the sequence is amdgpu DC's full
 //  modeset for DCN 4.0.1 (dc_commit_state_no_check on a stream whose timing
 //  changes), reduced to what a single pipe with an unchanged surface needs:
 //
@@ -21,6 +21,21 @@
 //  comes up (enc401_stream_encoder_hdmi_set_stream_attribute,
 //  write_scdc_data). Below it both are turned off again, which matters when
 //  the firmware lit the sink scrambled.
+//
+//  DisplayPort keeps its link: amdgpu takes the link down for a new timing
+//  and trains it again, which needs the AUX channel protocol; the stream on
+//  a trained link can be retimed without that, as long as it needs no more
+//  of the link than before. Between the same blank and unblank:
+//
+//    DP video stream off at the vertical blank, 60 ms of idle pattern ->
+//    optc401_disable_crtc -> the pixel-rate DTO (dccg401_set_dp_dto) ->
+//    timing -> optc401_enable_crtc -> the MSA
+//    (enc401_stream_encoder_dp_set_stream_attribute) -> FIFO reset ->
+//    enc401_stream_encoder_dp_unblank.
+//
+//  The link encoder, the PHY and DMUB are not touched. tools/pipegen's "dp"
+//  scenario runs those Linux functions; tools/atomdump.cpp holds this plan
+//  against its output.
 //
 //  Not programmed (kept as the GOP left them): DCHUBBUB watermarks and the
 //  HUBP DLG/TTU/RQ request parameters, which amdgpu takes from DML; the
@@ -78,6 +93,10 @@ struct Plan {
 	size_t    ncmds;
 };
 
+struct DpDto {
+	uint32_t integer, phase, modulo;   // DPDTOn_INT, DP_DTOn_PHASE, DP_DTOn_MODULO
+};
+
 // The pipe (from Pipe::discover) and board wiring (from the VBIOS path whose
 // HPD pin matches the pipe's).
 struct Target {
@@ -87,7 +106,21 @@ struct Target {
 	Edid::DetailedTiming from, to;
 	bool     sinkScdc;        // the sink's EDID announces SCDC (Edid::hdmi2Caps)
 	uint8_t  ddcLine;         // the connector's DDC line, for the SCDC write
+	// DisplayPort instead of TMDS: the pixel-rate DTO for `to` (scaleDpDto)
+	// and the first DP_VID_M, before the hardware measures it.
+	bool     dp;
+	uint32_t dpMaxKHz;        // the pixel clock the link was trained for
+	DpDto    dto;
+	uint32_t vidM;
 };
+
+// The DP pixel-rate DTO for a new pixel clock, from the one running now. The
+// DTO makes its reference clock times (integer + phase / modulo). amdgpu
+// programs it in Hz (modulo = the reference in Hz, so integer x modulo +
+// phase is the pixel clock in Hz); if the running one reads that way the new
+// one is exact, otherwise it is scaled by the ratio of the two clocks.
+// False if there is no running DTO or the result does not fit.
+bool scaleDpDto(const DpDto &now, uint32_t fromKHz, uint32_t toKHz, DpDto &out);
 
 // HDMI 2.0 over TMDS. The scrambler goes on from kScrambleFromKHz
 // (HDMI_CLOCK_CHANNEL_RATE_MORE_340M); the sink's TMDS_CONFIG says 3

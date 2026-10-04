@@ -1981,6 +1981,10 @@ void RDNA4Device::buildModeTable() {
 		lim.maxPixelClockKHz = hdmi2.maxTmdsKHz < ModeSet::kMaxTmdsKHz ? hdmi2.maxTmdsKHz : ModeSet::kMaxTmdsKHz;
 	if (bootTimingValid && bootTiming.pixelClockKHz && bootTiming.pixelClockKHz * 5 / 4 < lim.maxPixelClockKHz)
 		lim.maxPixelClockKHz = bootTiming.pixelClockKHz * 5 / 4;
+	// DisplayPort has no TMDS limit, but its link is not retrained: nothing
+	// above the pixel clock it was brought up for (ModeSet::build).
+	if (pipe.valid() && pipe.signal == Pipe::Signal::DpSst && bootTimingValid && bootTiming.pixelClockKHz)
+		lim.maxPixelClockKHz = bootTiming.pixelClockKHz;
 
 	if (modesetRequested && edidLen)
 		modeCount = Modes::build(edidData, edidLen, lim, modeTable, Modes::MaxModes);
@@ -2148,8 +2152,9 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 }
 
 IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
-	if (!pipe.valid() || !pipe.isTmds() || !liveTimingValid || !rmmio || !ipDiscovery.isValid()) {
-		FBLOG("modes: switch to id %u refused: no programmable HDMI pipe", m.id);
+	const bool dp = pipe.signal == Pipe::Signal::DpSst;
+	if (!pipe.valid() || !(pipe.isTmds() || dp) || !liveTimingValid || !rmmio || !ipDiscovery.isValid()) {
+		FBLOG("modes: switch to id %u refused: no programmable HDMI or DisplayPort pipe", m.id);
 		return kIOReturnUnsupported;
 	}
 	AtomBios::DisplayPath path {};
@@ -2170,8 +2175,43 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	t.hubp = pipe.hubp;
 	t.encoderObjId = path.encoderObjId;
 	t.connectorObjId = path.connectorObjId;
-	t.from = liveTiming;
-	t.to = m.t;
+
+	// DisplayPort: the link stays as the firmware trained it and only the
+	// stream is retimed, so the pixel clock comes from the DTO running now,
+	// scaled. Both it and DP_VID_M are read once, before anything changes.
+	ModeSet::DpDto dtoNow {};
+	uint32_t vidMNow = 0;
+	const uint32_t dtoFromKHz = liveTiming.pixelClockKHz;
+	if (dp) {
+		constexpr uint32_t kOtgPixelRateCntl = 0x0080, kDpDtoPhase = 0x0081, kDpDtoModulo = 0x0082;   // + 4 per OTG, base_idx 1
+		constexpr uint32_t kOtgPixelRateDiv = 0x006f, kDpVidM = 0x2128;
+		const uint32_t cntl = regReadDmu(1, kOtgPixelRateCntl + 4 * pipe.otg);
+		// DP_DTO_ENABLE and PIPE_DTO_SRC_SEL, as dccg401_set_dp_dto leaves them
+		if (cntl == 0xFFFFFFFF || (cntl & 0x1010) != 0x1010) {
+			FBLOG("modes: switch to id %u refused: OTG%u's pixel clock is not the DP DTO (0x%08x)", m.id,
+			      pipe.otg, cntl);
+			return kIOReturnUnsupported;
+		}
+		dtoNow.phase = regReadDmu(1, kDpDtoPhase + 4 * pipe.otg);
+		dtoNow.modulo = regReadDmu(1, kDpDtoModulo + 4 * pipe.otg);
+		dtoNow.integer = (regReadDmu(1, kOtgPixelRateDiv) >> (1 + 5 * pipe.otg)) & 0xf;
+		vidMNow = regReadDmu(2, kDpVidM + digOff()) & 0xffffff;
+		t.dp = true;
+		t.dpMaxKHz = bootTiming.pixelClockKHz;
+	}
+	auto aim = [&](const Edid::DetailedTiming &from, const Edid::DetailedTiming &to) {
+		t.from = from;
+		t.to = to;
+		if (!dp)
+			return;
+		if (!ModeSet::scaleDpDto(dtoNow, dtoFromKHz, to.pixelClockKHz, t.dto))
+			t.dto = {};
+		// M / 0x8000 = pixel clock / link clock; the hardware measures it once the
+		// stream runs. Seed it from the running value, or as on four HBR3 lanes.
+		t.vidM = vidMNow ? static_cast<uint32_t>(static_cast<uint64_t>(vidMNow) * to.pixelClockKHz / dtoFromKHz)
+		                 : static_cast<uint32_t>(0x8000ull * to.pixelClockKHz / 810000);
+	};
+	aim(liveTiming, m.t);
 	const char *why = "";
 	if (!ModeSet::build(t, modePlan, &why)) {
 		FBLOG("modes: switch to id %u refused: %s", m.id, why);
@@ -2181,6 +2221,10 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	      "%lu DMUB commands", m.id, m.t.hActive, m.t.vActive, m.refreshMilliHz / 1000,
 	      m.refreshMilliHz % 1000, m.t.pixelClockKHz, ModeSet::vstartupLines(m.t),
 	      static_cast<unsigned long>(modePlan.count), static_cast<unsigned long>(modePlan.ncmds));
+	if (dp)
+		FBLOG("modes: DisplayPort, link untouched: DTO %u + %u / %u -> %u + %u / %u, DP_VID_M 0x%x -> 0x%x",
+		      dtoNow.integer, dtoNow.phase, dtoNow.modulo, t.dto.integer, t.dto.phase, t.dto.modulo,
+		      vidMNow, t.vidM);
 	if (runPlan(modePlan)) {
 		liveTiming = m.t;
 		// The firmware taking SET_PIXEL_CLOCK does not show the PLL runs at
@@ -2194,8 +2238,7 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	}
 
 	// Put the previous timing back so the display is not left dark.
-	t.from = m.t;
-	t.to = liveTiming;
+	aim(m.t, liveTiming);
 	bool restored = ModeSet::build(t, modePlan, &why) && runPlan(modePlan);
 	FBLOG("modes: switch to id %u failed, previous mode %s", m.id,
 	      restored ? "restored" : "NOT restored");

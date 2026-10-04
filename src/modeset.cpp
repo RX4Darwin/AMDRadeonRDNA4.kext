@@ -76,6 +76,17 @@ constexpr uint32_t kDigBeClkCntl  = 0x20bb;      // BE_MODE [2:0], BE_CLK_EN [4]
 constexpr uint32_t kDigBeCntl     = 0x20bc;      // FE_SOURCE_SELECT [14:8]
 constexpr uint32_t kDigBeEnCntl   = 0x20bd;      // BE_ENABLE [0]
 constexpr uint32_t kStreamMapper  = 0x1f0d;      // + dig: LINK_TARGET [2:0]
+// DP stream encoder (same instance stride as the DIG)
+constexpr uint32_t kDpVidStreamCntl = 0x2122;    // ENABLE [0], DIS_DEFER [9:8], STATUS [16]
+constexpr uint32_t kDpSteerFifo     = 0x2123;    // ENABLE [0], RESET [1]
+constexpr uint32_t kDpVidTiming     = 0x2126;    // M_N_GEN_EN [8]
+constexpr uint32_t kDpVidN          = 0x2127;
+constexpr uint32_t kDpVidM          = 0x2128;
+constexpr uint32_t kDpMsaParam1     = 0x2162;    // HTOTAL [31:16], VTOTAL [15:0]; PARAM2..4 follow
+// DCCG (base_idx 1)
+constexpr uint32_t kOtgPixelRateDiv = 0x006f;    // DPDTOn_INT [4:1] + 5 per OTG
+constexpr uint32_t kDpDtoPhase      = 0x0081;    // + 4 per OTG
+constexpr uint32_t kDpDtoModulo     = 0x0082;
 
 constexpr uint32_t kModeHdmi      = 3;           // DIG_FE/BE_MODE, atom digmode
 constexpr uint32_t kDpgModeBars   = 4;           // TEST_PATTERN_MODE_HORIZONTALBARS (solid colour)
@@ -84,6 +95,7 @@ constexpr uint32_t kMs            = 1000;        // wait budgets are in microsec
 struct Builder {
 	Plan &p;
 	bool full { false };
+	uint8_t seg { 2 };   // the DMU segment of the steps being added
 
 	void add(Op op, uint32_t dword, uint32_t mask, uint32_t value, uint32_t arg,
 	         const char *what, bool optional = false) {
@@ -91,8 +103,9 @@ struct Builder {
 			full = true;
 			return;
 		}
-		p.steps[p.count++] = Step { op, 2, optional, dword, mask, value, arg, what };
+		p.steps[p.count++] = Step { op, seg, optional, dword, mask, value, arg, what };
 	}
+	void delay(uint32_t us, const char *what) { add(Op::Delay, 0, 0, 0, us, what); }
 	void write(uint32_t dw, uint32_t v, const char *what) { add(Op::Write, dw, 0, v, 0, what); }
 	void update(uint32_t dw, uint32_t mask, uint32_t v, const char *what) {
 		add(Op::Update, dw, mask, v & mask, 0, what);
@@ -123,6 +136,21 @@ constexpr uint32_t dpgDims(uint32_t w, uint32_t h) {         // WIDTH [29:16], H
 
 } // namespace
 
+bool scaleDpDto(const DpDto &now, uint32_t fromKHz, uint32_t toKHz, DpDto &out) {
+	if (!now.modulo || !fromKHz || !toKHz)
+		return false;
+	const uint64_t total = static_cast<uint64_t>(now.integer) * now.modulo + now.phase;
+	const uint64_t fromHz = static_cast<uint64_t>(fromKHz) * 1000;
+	const uint64_t off = total > fromHz ? total - fromHz : fromHz - total;
+	// Within half a percent of the pixel clock in Hz: programmed the way amdgpu does.
+	const uint64_t next = off * 200 <= fromHz ? static_cast<uint64_t>(toKHz) * 1000
+	                                          : (total * toKHz + fromKHz / 2) / fromKHz;
+	out.modulo = now.modulo;
+	out.integer = static_cast<uint32_t>(next / now.modulo);
+	out.phase = static_cast<uint32_t>(next % now.modulo);
+	return out.integer <= 0xf;
+}
+
 uint32_t vstartupLines(const Edid::DetailedTiming &to) {
 	// amdgpu places VSTARTUP from DML (prefetch time); without DML keep it
 	// just inside the vertical blank, 2 lines clear of its start.
@@ -145,11 +173,20 @@ bool build(const Target &t, Plan &out, const char **why) {
 		err = "target timing not programmable";
 		return false;
 	}
-	if (t.to.pixelClockKHz == 0 || t.to.pixelClockKHz > kMaxTmdsKHz) {
+	if (t.dp) {
+		// More pixels per second than the link was trained for may not fit it.
+		if (t.to.pixelClockKHz == 0 || t.to.pixelClockKHz > t.dpMaxKHz) {
+			err = "DisplayPort: pixel clock above the one the link was brought up for";
+			return false;
+		}
+		if (!t.dto.modulo || t.dto.integer > 0xf) {
+			err = "DisplayPort: no pixel-rate DTO for the target";
+			return false;
+		}
+	} else if (t.to.pixelClockKHz == 0 || t.to.pixelClockKHz > kMaxTmdsKHz) {
 		err = "pixel clock outside HDMI TMDS (<= 600 MHz)";
 		return false;
-	}
-	if (t.to.pixelClockKHz > kScrambleFromKHz && !t.sinkScdc) {
+	} else if (t.to.pixelClockKHz > kScrambleFromKHz && !t.sinkScdc) {
 		err = "above 340 MHz needs a sink with SCDC";
 		return false;
 	}
@@ -172,15 +209,24 @@ bool build(const Target &t, Plan &out, const char **why) {
 	b.write(kDpgOffsetSegment + opp, 0, "dpg offset segment");
 	b.update(kDpgControl + opp, 0x71, (kDpgModeBars << 4) | 1, "dpg blank");
 
-	// --- dcn30_set_avmute(true), then let the sink see it for 3 frames ---
-	b.update(kHdmiGc + dig, 0x1, 0x1, "hdmi avmute on");
-	b.frames(3, "avmute settle");
+	if (t.dp) {
+		// --- dce110_blank_stream: enc1_stream_encoder_dp_blank, then idle pattern for the sink ---
+		b.update(kDpVidStreamCntl + dig, 0x300, 0x200, "dp stream off at the next vblank");
+		b.update(kDpVidStreamCntl + dig, 0x1, 0, "dp video stream off");
+		b.waitClear(kDpVidStreamCntl + dig, 1u << 16, 100200, "dp stream idle", true);
+		b.update(kDpSteerFifo + dig, 0x2, 0x2, "dp steer fifo reset");
+		b.delay(60 * kMs, "idle pattern");
+	} else {
+		// --- dcn30_set_avmute(true), then let the sink see it for 3 frames ---
+		b.update(kHdmiGc + dig, 0x1, 0x1, "hdmi avmute on");
+		b.frames(3, "avmute settle");
 
-	// --- dce110_disable_stream: stream encoder off ---
-	b.update(kDigFifoCtrl0 + dig, 0x1, 0, "dig fifo disable");
-	b.write(kDigFeEnCntl + dig, 0, "dig fe disable");
-	b.update(kDigFeClkCntl + dig, 0x10, 0, "dig fe clock off");
-	b.update(kDigBeCntl + t.link * kDigStride, 1u << (8 + t.dig), 0, "dig be disconnect fe");
+		// --- dce110_disable_stream: stream encoder off ---
+		b.update(kDigFifoCtrl0 + dig, 0x1, 0, "dig fifo disable");
+		b.write(kDigFeEnCntl + dig, 0, "dig fe disable");
+		b.update(kDigFeClkCntl + dig, 0x10, 0, "dig fe clock off");
+		b.update(kDigBeCntl + t.link * kDigStride, 1u << (8 + t.dig), 0, "dig be disconnect fe");
+	}
 
 	// --- optc401_disable_crtc ---
 	b.write(kOptcDataSource + odm, 0xffff0000, "optc data source none");
@@ -193,8 +239,19 @@ bool build(const Target &t, Plan &out, const char **why) {
 	b.update(kOtgClockControl + otg, 0x3, 0, "otg clock off");
 	b.update(kOptcInputClock + odm, 0x3, 0, "optc input clock off");
 
+	if (t.dp) {
+		// --- dcn401_program_pix_clk: dccg401_set_dp_dto, the DTO already selected and enabled ---
+		b.seg = 1;
+		b.write(kDpDtoPhase + 4 * t.otg, t.dto.phase, "dp dto phase");
+		b.write(kDpDtoModulo + 4 * t.otg, t.dto.modulo, "dp dto modulo");
+		b.update(kOtgPixelRateDiv, 0xfu << (1 + 5 * t.otg), t.dto.integer << (1 + 5 * t.otg), "dp dto integer");
+		b.seg = 2;
+	}
+
 	// --- dcn10_link_encoder_disable_output: transmitter off ---
-	if (Dmub::Cmd *c = b.dmub("transmitter disable")) {
+	if (t.dp) {
+		// the link stays up
+	} else if (Dmub::Cmd *c = b.dmub("transmitter disable")) {
 		Dmub::TransmitterControl tx {};
 		tx.phyId = t.link;
 		tx.action = Dmub::TransmitterActionDisable;
@@ -205,7 +262,9 @@ bool build(const Target &t, Plan &out, const char **why) {
 	}
 
 	// --- dcn401_program_pix_clk: PHY PLL at the new pixel clock ---
-	if (Dmub::Cmd *c = b.dmub("set pixel clock")) {
+	if (t.dp) {
+		// the PHY PLL carries the link clock, not the pixel clock
+	} else if (Dmub::Cmd *c = b.dmub("set pixel clock")) {
 		Dmub::SetPixelClock pc {};
 		pc.pixclk100Hz = t.to.pixelClockKHz * 10;
 		// Each combo PHY has its own PLL and amdgpu takes the one of the
@@ -258,48 +317,90 @@ bool build(const Target &t, Plan &out, const char **why) {
 	b.waitClear(kDpgStatus + opp, 0x1, 100 * kMs, "dpg latched", true);
 	b.update(kDigFeCntl + dig, 0x7, t.otg, "dig source otg");
 
-	// --- dcn401_link_encoder_setup: back-end in HDMI mode ---
-	b.update(kDigBeClkCntl + t.link * kDigStride, 0x17, 0x10 | kModeHdmi, "dig be hdmi + clock");
-	b.update(kDigBeEnCntl + t.link * kDigStride, 0x1, 0x1, "dig be enable");
+	if (t.dp) {
+		// --- enc401_stream_encoder_dp_set_stream_attribute: the MSA. The MSA counts from the
+		// leading edge of sync: start = sync width + back porch.
+		const uint32_t msa = kDpMsaParam1 + dig;
+		const uint32_t hStart = t.to.hBlank - t.to.hSyncOffset, vStart = t.to.vBlank - t.to.vSyncOffset;
+		b.write(msa, (t.to.hTotal() << 16) | t.to.vTotal(), "msa totals");
+		b.write(msa + 1, (hStart << 16) | vStart, "msa active start");
+		b.write(msa + 2, (static_cast<uint32_t>(!t.to.hSyncPositive) << 31) | (static_cast<uint32_t>(t.to.hSyncWidth) << 16) |
+		                 (static_cast<uint32_t>(!t.to.vSyncPositive) << 15) | t.to.vSyncWidth, "msa sync");
+		b.write(msa + 3, (w << 16) | h, "msa active size");
 
-	// --- enc401_stream_encoder_hdmi_set_stream_attribute: STREAM_SETUP ---
-	if (Dmub::Cmd *c = b.dmub("encoder stream setup")) {
-		Dmub::DigEncoderStreamSetup es {};
-		es.digId = t.dig;
-		es.action = Dmub::EncoderActionStreamSetup;
-		es.digMode = Dmub::EncoderModeHdmi;
-		es.laneNum = 4;
-		es.pclk10kHz = symclk10kHz;
-		Dmub::buildDigEncoderStreamSetup(*c, es);
-	}
-	b.update(kHdmiControl + dig, 0x6, t.to.pixelClockKHz >= kScrambleFromKHz ? 0x6 : 0, "hdmi scrambler");
+		// --- setup_dio_stream_encoder: enc35_enable_fifo ---
+		b.update(kDigFifoCtrl0 + dig, 0x1fu << 2, 7u << 2, "dig fifo start level 7");
+		b.update(kDigFifoCtrl0 + dig, 0x2, 0x2, "dig fifo reset");
+		b.delay(10, "dig fifo reset");
+		b.update(kDigFifoCtrl0 + dig, 0x2, 0, "dig fifo reset release");
+		b.delay(10, "dig fifo reset release");
+		b.update(kDigFifoCtrl0 + dig, 0x1, 0x1, "dig fifo enable");
 
-	// --- write_scdc_data: the sink's side of the scrambling, before the link is enabled ---
-	if (t.sinkScdc)
-		b.add(Op::Scdc, 0, 0, scdcTmdsConfig(t.to.pixelClockKHz), t.ddcLine, "scdc tmds config", true);
+		// --- enc401_stream_encoder_dp_unblank ---
+		b.update(kDpVidTiming + dig, 1u << 8, 0, "dp m/n measurement off");
+		b.update(kDpVidN + dig, 0xffffff, 0x8000, "dp vid n");
+		b.update(kDpVidM + dig, 0xffffff, t.vidM & 0xffffff, "dp vid m (first value)");
+		b.update(kDpVidTiming + dig, 1u << 8, 1u << 8, "dp m/n measurement on");
+		b.update(kDpVidStreamCntl + dig, 0x1, 0, "dp video stream off");
+		b.waitClear(kDpVidStreamCntl + dig, 1u << 16, 50 * kMs, "dp stream idle", true);
+		b.update(kDpSteerFifo + dig, 0x2, 0x2, "dp steer fifo reset");
+		b.delay(10, "dp steer fifo reset");
+		b.update(kDpSteerFifo + dig, 0x2, 0, "dp steer fifo reset release");
+		b.update(kDpSteerFifo + dig, 0x1, 0x1, "dp steer fifo enable");
+		b.update(kDpVidStreamCntl + dig, 0x301, 0x201, "dp video stream on");
+		b.delay(200, "dp video stream on");
+		b.update(kDigFifoCtrl0 + dig, 0x1fu << 2, 7u << 2, "dig fifo start level 7");
+		b.update(kDigFifoCtrl0 + dig, 0x2, 0x2, "dig fifo reset");
+		b.waitSet(kDigFifoCtrl0 + dig, 1u << 20, 50 * kMs, "dig fifo reset done", true);
+		b.update(kDigFifoCtrl0 + dig, 0x2, 0, "dig fifo reset release");
+		b.waitClear(kDigFifoCtrl0 + dig, 1u << 20, 50 * kMs, "dig fifo reset done clear", true);
+		b.update(kDigFifoCtrl0 + dig, 0x1, 0x1, "dig fifo enable");
+		b.delay(100, "dp encoder primes");
+		b.update(kDpVidStreamCntl + dig, 0x1, 0x1, "dp video stream on");
+	} else {
+		// --- dcn401_link_encoder_setup: back-end in HDMI mode ---
+		b.update(kDigBeClkCntl + t.link * kDigStride, 0x17, 0x10 | kModeHdmi, "dig be hdmi + clock");
+		b.update(kDigBeEnCntl + t.link * kDigStride, 0x1, 0x1, "dig be enable");
 
-	// --- setup_dio_stream_encoder: connect, enable, map, FIFO reset ---
-	b.update(kDigBeCntl + t.link * kDigStride, 1u << (8 + t.dig), 1u << (8 + t.dig), "dig be source fe");
-	b.update(kDigFeClkCntl + dig, 0x17, 0x10 | kModeHdmi, "dig fe hdmi + clock");
-	b.write(kDigFeEnCntl + dig, 1, "dig fe enable");
-	b.update(kStreamMapper + t.dig, 0x7, t.link, "stream mapper link");
-	b.update(kDigFifoCtrl0 + dig, (0x1fu << 2) | (0x3u << 8), 7u << 2, "dig fifo 1 px/clk, start level 7");
-	b.update(kDigFifoCtrl0 + dig, 0x2, 0x2, "dig fifo reset");
-	b.waitSet(kDigFifoCtrl0 + dig, 1u << 20, 1 * kMs, "dig fifo reset done", true);
-	b.update(kDigFifoCtrl0 + dig, 0x2, 0, "dig fifo reset release");
-	b.waitClear(kDigFifoCtrl0 + dig, 1u << 20, 1 * kMs, "dig fifo reset done clear", true);
-	b.update(kDigFifoCtrl0 + dig, 0x1, 0x1, "dig fifo enable");
+		// --- enc401_stream_encoder_hdmi_set_stream_attribute: STREAM_SETUP ---
+		if (Dmub::Cmd *c = b.dmub("encoder stream setup")) {
+			Dmub::DigEncoderStreamSetup es {};
+			es.digId = t.dig;
+			es.action = Dmub::EncoderActionStreamSetup;
+			es.digMode = Dmub::EncoderModeHdmi;
+			es.laneNum = 4;
+			es.pclk10kHz = symclk10kHz;
+			Dmub::buildDigEncoderStreamSetup(*c, es);
+		}
+		b.update(kHdmiControl + dig, 0x6, t.to.pixelClockKHz >= kScrambleFromKHz ? 0x6 : 0, "hdmi scrambler");
 
-	// --- dcn10_link_encoder_enable_tmds_output: transmitter on ---
-	if (Dmub::Cmd *c = b.dmub("transmitter enable")) {
-		Dmub::TransmitterControl tx {};
-		tx.phyId = t.link;
-		tx.action = Dmub::TransmitterActionEnable;
-		tx.digMode = Dmub::EncoderModeHdmi;
-		tx.laneNum = 4;
-		tx.symclk10kHz = symclk10kHz;
-		tx.hpdSel = t.hpd;
-		Dmub::buildTransmitterControl(*c, tx);
+		// --- write_scdc_data: the sink's side of the scrambling, before the link is enabled ---
+		if (t.sinkScdc)
+			b.add(Op::Scdc, 0, 0, scdcTmdsConfig(t.to.pixelClockKHz), t.ddcLine, "scdc tmds config", true);
+
+		// --- setup_dio_stream_encoder: connect, enable, map, FIFO reset ---
+		b.update(kDigBeCntl + t.link * kDigStride, 1u << (8 + t.dig), 1u << (8 + t.dig), "dig be source fe");
+		b.update(kDigFeClkCntl + dig, 0x17, 0x10 | kModeHdmi, "dig fe hdmi + clock");
+		b.write(kDigFeEnCntl + dig, 1, "dig fe enable");
+		b.update(kStreamMapper + t.dig, 0x7, t.link, "stream mapper link");
+		b.update(kDigFifoCtrl0 + dig, (0x1fu << 2) | (0x3u << 8), 7u << 2, "dig fifo 1 px/clk, start level 7");
+		b.update(kDigFifoCtrl0 + dig, 0x2, 0x2, "dig fifo reset");
+		b.waitSet(kDigFifoCtrl0 + dig, 1u << 20, 1 * kMs, "dig fifo reset done", true);
+		b.update(kDigFifoCtrl0 + dig, 0x2, 0, "dig fifo reset release");
+		b.waitClear(kDigFifoCtrl0 + dig, 1u << 20, 1 * kMs, "dig fifo reset done clear", true);
+		b.update(kDigFifoCtrl0 + dig, 0x1, 0x1, "dig fifo enable");
+
+		// --- dcn10_link_encoder_enable_tmds_output: transmitter on ---
+		if (Dmub::Cmd *c = b.dmub("transmitter enable")) {
+			Dmub::TransmitterControl tx {};
+			tx.phyId = t.link;
+			tx.action = Dmub::TransmitterActionEnable;
+			tx.digMode = Dmub::EncoderModeHdmi;
+			tx.laneNum = 4;
+			tx.symclk10kHz = symclk10kHz;
+			tx.hpdSel = t.hpd;
+			Dmub::buildTransmitterControl(*c, tx);
+		}
 	}
 
 	// --- dcn401_program_pipe under the OTG update lock ---
@@ -316,7 +417,8 @@ bool build(const Target &t, Plan &out, const char **why) {
 	// --- blank_pixel_data(false): DPG video mode; set_avmute(false) ---
 	b.update(kDpgControl + opp, 0x71, 0, "dpg video mode");
 	b.write(kDpgRamp + opp, 0, "dpg ramp");
-	b.update(kHdmiGc + dig, 0x1, 0, "hdmi avmute off");
+	if (!t.dp)
+		b.update(kHdmiGc + dig, 0x1, 0, "hdmi avmute off");
 
 	if (b.full) {
 		err = "plan too long";

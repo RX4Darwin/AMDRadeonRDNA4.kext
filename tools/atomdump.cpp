@@ -1164,6 +1164,131 @@ static int testModeSet() {
 	return failures;
 }
 
+// A DisplayPort mode switch retimes the stream on a link that stays trained.
+// The reference is what Linux's own functions write for the same job
+// (tools/pipegen's "dp" scenario): 3840x2160@60 down to 2560x1440@60 on pipe 0,
+// DIG0. Every bit both write has to end up the same.
+static int testDpRetime() {
+	int failures = 0;
+	static const struct { uint8_t seg; uint32_t dw, mask, value; } linux[] = {
+#include "dp_retime_linux.inc"
+	};
+	Edid::DetailedTiming t4k {}, t1440 {};
+	t4k.pixelClockKHz = 533250;                 // the GOP's 4K raster (CVT reduced blanking)
+	t4k.hActive = 3840; t4k.hBlank = 160; t4k.hSyncOffset = 48; t4k.hSyncWidth = 32;
+	t4k.vActive = 2160; t4k.vBlank = 62; t4k.vSyncOffset = 3; t4k.vSyncWidth = 5;
+	t4k.hSyncPositive = true;
+	t1440.pixelClockKHz = 241500;
+	t1440.hActive = 2560; t1440.hBlank = 160; t1440.hSyncOffset = 48; t1440.hSyncWidth = 32;
+	t1440.vActive = 1440; t1440.vBlank = 41; t1440.vSyncOffset = 3; t1440.vSyncWidth = 5;
+	t1440.hSyncPositive = true;
+
+	// The DTO, from one programmed amdgpu's way for the 4K mode on a 720 MHz
+	// reference: exact. From one that counts in other units: by ratio.
+	ModeSet::DpDto now { 0, 533250000, 720000000 }, dto {};
+	failures += check(ModeSet::scaleDpDto(now, 533250, 241500, dto) && dto.integer == 0 &&
+	                  dto.phase == 241500000 && dto.modulo == 720000000,
+	                  "dp: DTO in Hz: %u + %u / %u", dto.integer, dto.phase, dto.modulo);
+	ModeSet::DpDto ratio { 1, 0x400000, 0x1000000 }, scaled {};     // 1.25 x the reference
+	failures += check(ModeSet::scaleDpDto(ratio, 500000, 300000, scaled) && scaled.integer == 0 &&
+	                  scaled.phase == 0xc00000 && scaled.modulo == 0x1000000,   // 0.75 x
+	                  "dp: DTO by ratio: %u + 0x%x / 0x%x", scaled.integer, scaled.phase, scaled.modulo);
+	failures += check(!ModeSet::scaleDpDto(ModeSet::DpDto { 0, 1, 0 }, 533250, 241500, scaled) &&
+	                  !ModeSet::scaleDpDto(ratio, 500000, 8000000, scaled),
+	                  "dp: a DTO with no modulo or an integer past 15 accepted");
+
+	ModeSet::Target t {};
+	t.otg = 0; t.dig = 0; t.link = 0; t.hpd = 1; t.opp = 0; t.hubp = 0;
+	t.from = t4k; t.to = t1440;
+	t.dp = true;
+	t.dpMaxKHz = 533250;
+	t.dto = dto;
+	t.vidM = static_cast<uint32_t>(0x8000ull * 241500 / 810000);   // four lanes of HBR3: 810 MHz
+	static ModeSet::Plan plan;
+	const char *why = "";
+	if (!ModeSet::build(t, plan, &why))
+		return failures + check(false, "dp: 4K -> 1440p plan refused: %s", why);
+	failures += check(plan.ncmds == 0, "dp: %zu DMUB commands: the link is not to be touched", plan.ncmds);
+
+	// What each side wrote, and with which bits.
+	struct Written { uint8_t seg; uint32_t dw, mask, value; };
+	auto apply = [](std::vector<Written> &regs, uint8_t seg, uint32_t dw, uint32_t mask, uint32_t value) {
+		for (Written &r : regs)
+			if (r.seg == seg && r.dw == dw) {
+				r.value = (r.value & ~mask) | (value & mask);
+				r.mask |= mask;
+				return;
+			}
+		regs.push_back({ seg, dw, mask, value & mask });
+	};
+	std::vector<Written> ours, theirs;
+	for (size_t i = 0; i < plan.count; i++) {
+		const ModeSet::Step &s = plan.steps[i];
+		if (s.op == ModeSet::Op::Write)
+			apply(ours, s.seg, s.dword, 0xffffffffu, s.value);
+		else if (s.op == ModeSet::Op::Update)
+			apply(ours, s.seg, s.dword, s.mask, s.value);
+	}
+	for (const auto &l : linux)
+		apply(theirs, l.seg, l.dw, l.mask, l.value);
+
+	// Where the plan knowingly differs from that run of Linux:
+	auto differs = [](uint8_t seg, uint32_t dw) -> uint32_t {
+		if (seg == 2 && dw >= 0x1b85 && dw <= 0x1b87)
+			return 0xffffffffu;      // VSTARTUP, VUPDATE, VREADY: by rule here, from DML there
+		if (seg == 2 && dw == 0x0530)
+			return 0x00007fffu;      // VTG FP2 follows VSTARTUP
+		if (seg == 2 && (dw == 0x1b30 || dw == 0x1b31))
+			return 0xffffffffu;      // V_TOTAL_MIN/MAX: unused with V_TOTAL_CONTROL 0; the plan keeps them at v total
+		if (seg == 2 && dw >= 0x1854 && dw <= 0x185a)
+			return 0xffffffffu;      // the pattern generator: the plan ends unblanked, Linux's stream part blanked
+		return 0;
+	};
+	size_t compared = 0;
+	for (const Written &o : ours)
+		for (const Written &l : theirs) {
+			if (o.seg != l.seg || o.dw != l.dw)
+				continue;
+			const uint32_t both = o.mask & l.mask & ~differs(o.seg, o.dw);
+			compared += both != 0;
+			failures += check(((o.value ^ l.value) & both) == 0, "dp: %u:0x%04x: plan 0x%08x, Linux 0x%08x "
+			                  "(bits both write: 0x%08x)", o.seg, o.dw, o.value & both, l.value & both, both);
+		}
+	// The registers a retime is about must be among those compared.
+	static const struct { uint8_t seg; uint32_t dw; const char *name; } must[] = {
+		{ 1, 0x0081, "DP_DTO0_PHASE" }, { 1, 0x0082, "DP_DTO0_MODULO" }, { 1, 0x006f, "OTG_PIXEL_RATE_DIV" },
+		{ 2, 0x1b2a, "OTG0 h total" }, { 2, 0x1b2f, "OTG0 v total" }, { 2, 0x1b2b, "OTG0 h blank" },
+		{ 2, 0x1b38, "OTG0 v blank" }, { 2, 0x1b43, "OTG0 control" },
+		{ 2, 0x2162, "MSA 1" }, { 2, 0x2163, "MSA 2" }, { 2, 0x2164, "MSA 3" }, { 2, 0x2165, "MSA 4" },
+		{ 2, 0x2122, "DP_VID_STREAM_CNTL" }, { 2, 0x2123, "DP_STEER_FIFO" }, { 2, 0x2126, "DP_VID_TIMING" },
+		{ 2, 0x2127, "DP_VID_N" }, { 2, 0x2128, "DP_VID_M" }, { 2, 0x209b, "DIG_FIFO_CTRL0" },
+	};
+	for (const auto &m : must) {
+		bool inOurs = false, inTheirs = false;
+		for (const Written &o : ours)
+			inOurs = inOurs || (o.seg == m.seg && o.dw == m.dw);
+		for (const Written &l : theirs)
+			inTheirs = inTheirs || (l.seg == m.seg && l.dw == m.dw);
+		failures += check(inOurs && inTheirs, "dp: %s is written by the plan %d, by Linux %d", m.name, inOurs, inTheirs);
+	}
+	// The link encoder and the PHY side of the DIG stay as they are.
+	for (const Written &o : ours)
+		failures += check(!(o.seg == 2 && o.dw >= 0x20bb && o.dw <= 0x20bd),
+		                  "dp: the plan writes the link encoder (0x%04x)", o.dw);
+
+	// Refusals: more than the link was trained for; no DTO.
+	ModeSet::Target bad = t;
+	bad.to.pixelClockKHz = 533251;
+	failures += check(!ModeSet::build(bad, plan, &why), "dp: a pixel clock above the trained one accepted");
+	bad = t;
+	bad.dto = {};
+	failures += check(!ModeSet::build(bad, plan, &why), "dp: a target without a DTO accepted");
+
+	printf("\ndp: 3840x2160@60 -> 2560x1440@60 on OTG0/DIG0: %zu registers written, %zu also by Linux and "
+	       "equal %s\n", ours.size(), compared, failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
 // The second-pipe plan (pipe2.hpp) lights pipe 1 next to a lit pipe 0. What the
 // generated table may address is checked here against the block layout, not
 // against the register names tools/pipegen/mkinc.py went by: every per-instance
@@ -3515,6 +3640,7 @@ int main(int argc, char **argv) {
 	failures += testDmubPayloads();
 	failures += testNdrv();
 	failures += testModeSet();
+	failures += testDpRetime();
 	failures += testPipe2();
 	failures += testPsp();
 	failures += testGfxImages();

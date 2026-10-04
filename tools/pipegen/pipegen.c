@@ -10,6 +10,7 @@ static uint32_t dcn_bases[8]  = { 1u << 24, 2u << 24, 3u << 24, 4u << 24, 5u << 
 static uint32_t nbio_bases[8] = { 0x11u << 24, 0x12u << 24, 0x13u << 24, 0x14u << 24, 0x15u << 24, 0x16u << 24, 0x17u << 24, 0x18u << 24 };
 
 static struct dc g_dc;
+static struct clk_mgr g_clk_mgr;
 static struct dc_context g_ctx;
 static struct dc_bios g_bios;
 static struct resource_pool g_pool;
@@ -51,6 +52,7 @@ struct cfg {
 	int dig;       /* DIG front-end (stream encoder) */
 	int link;      /* DIG back-end / PHY / PLL */
 	int hpd;       /* 0-based HPD source */
+	bool dp;       /* the "dp" scenario: retime a DisplayPort stream that is already lit (sequence_dp) */
 	struct dc_crtc_timing t;      /* the new stream */
 	struct dc_crtc_timing lit;    /* the stream the firmware lit */
 	int vstartup, vupdate_offset, vupdate_width, vready_offset, pstate_keepout;   /* from DML */
@@ -208,23 +210,29 @@ static void make_state(const struct cfg *c)
 	eid.encoder.id = ENCODER_ID_INTERNAL_UNIPHY + c->link / 2;   /* UNIPHY, UNIPHY1, ...: two links each */
 	eid.encoder.enum_id = ENUM_ID_1 + (c->link & 1);
 	eid.connector.type = OBJECT_TYPE_CONNECTOR;
-	eid.connector.id = CONNECTOR_ID_HDMI_TYPE_A;
+	eid.connector.id = c->dp ? CONNECTOR_ID_DISPLAY_PORT : CONNECTOR_ID_HDMI_TYPE_A;
 	eid.connector.enum_id = ENUM_ID_1;
 	eid.ctx = &g_ctx;
 
 	dc->current_state = old;
 	dc->link_srv = &g_link_srv;
 	dc->links[0] = link; dc->link_count = 1;
-	link->dc = dc; link->ctx = &g_ctx; link->connector_signal = SIGNAL_TYPE_HDMI_TYPE_A;
+	const enum signal_type signal = c->dp ? SIGNAL_TYPE_DISPLAY_PORT : SIGNAL_TYPE_HDMI_TYPE_A;
+	link->dc = dc; link->ctx = &g_ctx; link->connector_signal = signal;
+	if (c->dp) {            /* a trained link: four lanes at HBR3, as the firmware brings a 4K sink up */
+		link->cur_link_settings.lane_count = LANE_COUNT_FOUR;
+		link->cur_link_settings.link_rate = LINK_RATE_HIGH3;
+		link->link_status.link_active = true;
+	}
 	link->link_enc = dcn401_link_encoder_create(&g_ctx, &eid);
 	link->link_enc->preferred_engine = ENGINE_ID_DIGA + c->dig;
 	link->link_id = eid.connector;
 	link->ddc_hw_inst = c->link;
 	link->local_sink = sink; link->type = dc_connection_single;
-	sink->link = link; sink->ctx = &g_ctx; sink->sink_signal = SIGNAL_TYPE_HDMI_TYPE_A;
+	sink->link = link; sink->ctx = &g_ctx; sink->sink_signal = signal;
 	sink->edid_caps.scdc_present = true;
 
-	stream->ctx = &g_ctx; stream->link = link; stream->sink = sink; stream->signal = SIGNAL_TYPE_HDMI_TYPE_A;
+	stream->ctx = &g_ctx; stream->link = link; stream->sink = sink; stream->signal = signal;
 	stream->timing = c->t;
 	stream->phy_pix_clk = c->t.pix_clk_100hz / 10;
 	stream->src = (struct rect){ 0, 0, w, h }; stream->dst = stream->src;
@@ -269,7 +277,7 @@ static void make_state(const struct cfg *c)
 							&clk_src_regs[c->link], false);
 	pipe->stream_res.pix_clk_params.requested_pix_clk_100hz = c->t.pix_clk_100hz;
 	pipe->stream_res.pix_clk_params.encoder_object_id = eid.encoder;
-	pipe->stream_res.pix_clk_params.signal_type = SIGNAL_TYPE_HDMI_TYPE_A;
+	pipe->stream_res.pix_clk_params.signal_type = signal;
 	pipe->stream_res.pix_clk_params.controller_id = CONTROLLER_ID_D0 + c->pipe;
 	pipe->stream_res.pix_clk_params.color_depth = COLOR_DEPTH_888;
 	pipe->stream_res.pix_clk_params.pixel_encoding = PIXEL_ENCODING_RGB;
@@ -360,6 +368,42 @@ static void sequence(const struct cfg *c)
 	rec_mark("end", 0);
 }
 
+/* ---- the "dp" scenario: a new timing on a DisplayPort stream whose link stays trained ----
+ *
+ * Linux has no such sequence: for a timing change it takes the link down and trains it again. These are the
+ * functions it runs on the stream between those two points, in its order (dce110_blank_stream, the timing
+ * generator off, dcn401_enable_stream_timing, the MSA, dcn401_enable_stream, dcn401_unblank_stream). The
+ * output is a reference for tools/atomdump.cpp to hold src/modeset.cpp's DisplayPort plan against. */
+static void sequence_dp(const struct cfg *c)
+{
+	struct dc *dc = &g_dc;
+	struct pipe_ctx *pipe = g_pipe;
+	struct dcn10_stream_encoder *se = DCN10STRENC_FROM_STRENC(pipe->stream_res.stream_enc);
+	struct dcn20_opp *opp = TO_DCN20_OPP(pipe->stream_res.opp);
+
+	/* the stream is running (dp_blank returns at once otherwise) and the front-end clock is on */
+	rec_poke_field(se->regs->DP_VID_STREAM_CNTL, DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK,
+		       DP0_DP_VID_STREAM_CNTL__DP_VID_STREAM_ENABLE_MASK);
+	rec_poke_field(se->regs->DIG_FE_CLK_CNTL, DIG0_DIG_FE_CLK_CNTL__DIG_FE_SYMCLK_FE_G_CLOCK_ON_MASK,
+		       DIG0_DIG_FE_CLK_CNTL__DIG_FE_SYMCLK_FE_G_CLOCK_ON_MASK);
+	rec_poll("opp2_dpg_is_pending", opp->regs->DPG_STATUS, DPG0_DPG_STATUS__DPG_DOUBLE_BUFFER_PENDING_MASK, 0, 100000);
+	/* no secondary packets are being sent (the firmware's DP_SEC_CNTL reads 0 on the card): the info-packet
+	 * update then leaves the secondary stream off */
+	rec_poke(se->regs->DP_SEC_CNTL, 0);
+	rec_poke(se->regs->DP_SEC_METADATA_TRANSMISSION, 0);
+
+	rec_mark("begin:blank", 0);
+	dc->hwss.blank_stream(pipe);
+	pipe->stream_res.tg->funcs->disable_crtc(pipe->stream_res.tg);
+	rec_mark("begin:timing", 0);
+	if (dcn401_enable_stream_timing(pipe, g_new, dc) != DC_OK) { fprintf(stderr, "stream timing failed\n"); exit(1); }
+	rec_mark("begin:stream", 0);
+	resource_build_info_frame(pipe);
+	dc->hwss.enable_stream(pipe);
+	dc->hwss.unblank_stream(pipe, &pipe->stream->link->cur_link_settings);
+	rec_mark("end", 0);
+}
+
 /* Two runs, unknown registers reading all-zeros then all-ones: a full write whose value differs between the runs
  * carries bits read back from the register, so it becomes an update that leaves those bits alone. A different
  * sequence of events means a read steered the code; that has to be settled with rec_poke(), not guessed. */
@@ -405,6 +449,8 @@ static void setup(void)
 	g_bios.funcs = &bios_funcs; g_bios.ctx = &g_ctx; g_bios.fw_info_valid = true;
 	g_dc.ctx = &g_ctx; g_dc.debug = debug_defaults_drv; g_dc.res_pool = &g_pool;
 	g_dc.caps.max_v_total = (1 << 15) - 1;
+	g_dc.clk_mgr = &g_clk_mgr; g_clk_mgr.ctx = ctx;
+	g_clk_mgr.dprefclk_khz = 720000;        /* the DCN 4.01 bounding box's dprefclk_mhz */
 #undef REG_STRUCT
 #define REG_STRUCT dccg_regs
 	dccg_regs_init();
@@ -438,11 +484,14 @@ int main(int argc, char **argv)
 {
 	struct cfg c = { 0 };
 	unsigned v[16];
-	bool verbose = argc > 17;
+	bool verbose;
 
+	if (argc > 1 && !strcmp(argv[1], "dp")) { c.dp = true; argv++; argc--; }
+	verbose = argc > 17;
 	if (argc < 17) {
-		fprintf(stderr, "usage: pipegen pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync vback  "
-				"khz hpositive vpositive vic [verbose]\n  hpd counts from 1, as the VBIOS path records do\n");
+		fprintf(stderr, "usage: pipegen [dp] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync vback  "
+				"khz hpositive vpositive vic [verbose]\n  hpd counts from 1, as the VBIOS path records do\n"
+				"  dp: the reference for retiming a lit DisplayPort stream instead of the second-pipe plan\n");
 		return 2;
 	}
 	for (int i = 0; i < 16; i++) v[i] = (unsigned)strtoul(argv[i + 1], NULL, 0);
@@ -454,7 +503,7 @@ int main(int argc, char **argv)
 	c.t.vic = v[15];
 	c.t.aspect_ratio = v[4] * 9 == v[8] * 16 ? ASPECT_RATIO_16_9 : v[4] * 3 == v[8] * 4 ? ASPECT_RATIO_4_3 : ASPECT_RATIO_NO_DATA;
 	c.t.pixel_encoding = PIXEL_ENCODING_RGB; c.t.display_color_depth = COLOR_DEPTH_888;
-	if (c.pipe < 1 || c.pipe > 3 || c.dig > 3 || c.link > 3 || c.hpd > 5 || !v[12]) { fprintf(stderr, "bad configuration\n"); return 2; }
+	if (c.pipe < (c.dp ? 0 : 1) || c.pipe > 3 || c.dig > 3 || c.link > 3 || c.hpd > 5 || !v[12]) { fprintf(stderr, "bad configuration\n"); return 2; }
 
 	/* The display the firmware lit: the 3840x2160@60 CVT-RB raster the GOP uses on a 4K sink, the heaviest
 	 * companion this card's firmware sets up. It only enters DML's shared-clock and bandwidth terms. */
@@ -468,7 +517,7 @@ int main(int argc, char **argv)
 		rec_log_reads = verbose && run == 0;
 		setup();
 		make_state(&c);
-		sequence(&c);
+		if (c.dp) sequence_dp(&c); else sequence(&c);
 		if (run == 0) { memcpy(run0, evs, sizeof(struct ev) * nev); n0 = nev; }
 	}
 	printf("CONFIG %d %d %d %d  %u %u %u %u  %u %u %u %u  %u %d %d  %d %u\n", c.pipe, c.dig, c.link, c.hpd + 1,
