@@ -12,9 +12,10 @@ monitor by name with its EDID resolutions; switching between them resizes the
 VM display. On real hardware, the hardware side of this code (carried over
 unchanged from the earlier standalone build) was verified on Big Sur 11.7.10:
 4K desktop with correct colors, EDID over DP AUX and HDMI DDC, display sleep,
-BAR5 register MMIO. **The plugin build is not yet verified on hardware**, and
-only the boot display lights up: native mode setting (changing resolution on
-the card, more connectors) is in progress.
+BAR5 register MMIO. The plugin build runs on the card under Big Sur 11.6.6
+(2026-10-03/04): desktop on a DP or an HDMI boot display, a resolution change
+on an HDMI boot display, and a second display on the macOS side. Only the
+boot display lights up: lighting a second pipe is in progress.
 
 > **Why a Lilu plugin?** The earlier build was a standalone `IOFramebuffer`
 > subclass. That links against `com.apple.iokit.IOGraphicsFamily`, whose code
@@ -76,9 +77,12 @@ each `csc` Control/Status call — goes through `IONDRVFramebuffer::doDriverIO`.
    caching, pixel formats, aperture mapping, console, power management.
 4. **Mode switches** go to a backend. Every mode keeps the boot surface's
    memory and pitch and is no larger than it, so a switch only moves the
-   timing and viewport. On the card the mode-set engine is not written yet,
-   so switches are refused and the pipe is left untouched; in `VMTEST`
-   builds QEMU's display is resized through its Bochs VBE interface.
+   timing and viewport. On the card an HDMI (TMDS) boot display is switched
+   by the mode-set engine (`src/modeset.cpp`: pixel clock and transmitter
+   through DMUB, then OTG timing and viewport), verified 2026-10-04; a DP
+   boot display has no engine yet, so its switches are refused and the pipe
+   is left untouched. In `VMTEST` builds QEMU's display is resized through
+   its Bochs VBE interface.
 
 The kext also publishes what each bring-up layer found as registry properties
 on the framebuffer (`AtomBIOS,*`, `Discovery,*`, `Console,*`, `Pipe,*`,
@@ -93,7 +97,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 |----------|--------|
 | `rdna4-off=1` | Kill switch: the plugin does not hook anything and macOS runs its stock fallback framebuffer. Lilu's `-liluoff` disables all plugins. |
 | `rdna4-trace=1` | Log every NDRV request for our framebuffer and who answered it (`rdna4` or `boot`), up to 400 lines. On by default in `VMTEST` builds. Mode switches are always logged. |
-| `rdna4-modeset=1` | Offer the sink's EDID modes (DTDs, CTA DTDs/VICs, standard and established timings; ≤ boot framebuffer size, TMDS ≤ 340 MHz, ≤ 1.25 × boot pixel clock) instead of the boot mode alone. Until the HDMI mode-set engine lands, choosing a non-boot mode on the card is refused and the pipe is left untouched. |
+| `rdna4-modeset=1` | Offer the sink's EDID modes (DTDs, CTA DTDs/VICs, standard and established timings; ≤ boot framebuffer size, TMDS ≤ 340 MHz, ≤ 1.25 × boot pixel clock) instead of the boot mode alone. On an HDMI/DVI boot display a switch runs the mode-set engine (verified on the card 2026-10-04: 1920x1080 to 1600x900 on a 1080p HDMI sink, picture confirmed; the log line `modes: now ..., measured ... Hz` gives the refresh the OTG really runs at). On a DP boot display a switch is refused and the pipe is left untouched. The GOP must have lit the sink at 340 MHz or less: if it boots a 4K mode over HDMI, set OpenCore's `UEFI/Output/Resolution` to `1920x1080`. |
 | `rdna4-head2=1` | Experiment: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Not with `rdna4-compute`. Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. |
 | `rdna4-nosleep=1` | Make display sleep a no-op (the screen stays on). Escape hatch if blank/unblank misbehaves. |
 | `rdna4-noedid=1` | Skip the EDID probe over AUX/DDC. Use if a sink misbehaves on DDC. |
@@ -390,7 +394,12 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    `setpixelclock`/`dig1transmittercontrol` are absent because DCN 3.1+ moved
    that work to DMUB firmware mailbox commands. The DMUB payloads are built
    and host-tested (`src/dmub.hpp`); `tools/linux-capture.sh` records what
-   amdgpu programs on the same card as ground truth.
+   amdgpu programs on the same card as ground truth. **First run on the
+   card 2026-10-04** (HDMI boot display, 1920x1080 to 1600x900): the GOP's
+   DMUB firmware (version 0x0000e840, read over GPINT) takes the mainline
+   transmitter, pixel-clock and encoder commands although the GOP itself
+   never sends them. Open: DP mode switching, HDMI above 340 MHz
+   (scrambling), and lighting a pipe the GOP did not set up.
 5. **Display power management** — display sleep was verified on hardware
    with the standalone build (DP: video stream off + sink D3 over native-AUX
    DPCD `SET_POWER`; HDMI: OPP pattern generator blank). It now runs from
@@ -454,6 +463,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       `IONDRVFramebuffer` on a plugin-made nub, accepted by WindowServer and
       listed as a display (verified on hardware, Big Sur 11.6.6). Its pipe is
       not lit yet, so the monitor stays dark
-- [ ] Native mode setting (DCN 4.1.0) / multiple displays
+- [x] HDMI mode switching on the lit pipe through DMUB (verified on
+      hardware 2026-10-04, Big Sur 11.6.6: 1920x1080 to 1600x900, picture
+      confirmed; `rdna4-modeset=1`)
+- [ ] Lighting a second pipe (a visible second display); DP mode switching
 - [ ] Hardware cursor through the NDRV cursor path
 - [ ] Acceleration / Metal
