@@ -969,7 +969,7 @@ static int testModeSet() {
 	// HUBP0, DIG2 -> link 2 (UNIPHYC), HPD3, VBIOS path 0x330c / 0x2120.
 	ModeSet::Target t {};
 	t.otg = 0; t.dig = 2; t.link = 2; t.hpd = 3; t.opp = 0; t.hubp = 0;
-	t.encoderObjId = 0x2120; t.connectorObjId = 0x330c; t.pllId = 0x14;
+	t.encoderObjId = 0x2120; t.connectorObjId = 0x330c;
 	t.from = t1080; t.to = t720;
 
 	static ModeSet::Plan plan;
@@ -984,7 +984,7 @@ static int testModeSet() {
 	failures += check(off[0] == 0x3c000180 && off[1] == 0x00030002 && (off[3] & 0xffff) == 0x0003 &&
 	                  ((off[3] >> 16) & 0xff) == 0x0c,
 	                  "modeset: transmitter disable %08x %08x %08x %08x", off[0], off[1], off[2], off[3]);
-	failures += check(pll[0] == 0x10000280 && pll[1] == 742500 && pll[2] == 0x00032014 &&
+	failures += check(pll[0] == 0x10000280 && pll[1] == 742500 && pll[2] == 0x00032016 &&
 	                  (pll[3] & 0xff) == 0,
 	                  "modeset: set pixel clock %08x %08x %08x %08x", pll[0], pll[1], pll[2], pll[3]);
 	failures += check(enc[0] == 0x0c000080 && enc[1] == 0x04030f02 && enc[2] == 7425,

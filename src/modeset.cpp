@@ -203,7 +203,11 @@ bool build(const Target &t, Plan &out, const char **why) {
 	if (Dmub::Cmd *c = b.dmub("set pixel clock")) {
 		Dmub::SetPixelClock pc {};
 		pc.pixclk100Hz = t.to.pixelClockKHz * 10;
-		pc.pllId = t.pllId;
+		// Each combo PHY has its own PLL and amdgpu takes the one of the
+		// link's transmitter (find_matching_pll): ATOM_COMBOPHY_PLL0 (0x14)
+		// + the link. Captured from amdgpu on this card: pll_id 0x16 with
+		// phyid 2 (the HDMI sink on UNIPHY C, 2026-07-17).
+		pc.pllId = static_cast<uint8_t>(0x14 + t.link);
 		pc.encoderObjId = static_cast<uint8_t>(t.encoderObjId & 0xff);
 		pc.encoderMode = Dmub::EncoderModeHdmi;
 		pc.crtcId = t.otg;

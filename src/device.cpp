@@ -2074,7 +2074,6 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	t.hubp = pipe.hubp;
 	t.encoderObjId = path.encoderObjId;
 	t.connectorObjId = path.connectorObjId;
-	t.pllId = 0x14;                  // ATOM_COMBOPHY_PLL0, amdgpu's first free PLL
 	t.from = liveTiming;
 	t.to = m.t;
 	const char *why = "";

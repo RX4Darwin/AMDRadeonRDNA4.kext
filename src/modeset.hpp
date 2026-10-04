@@ -71,7 +71,6 @@ struct Target {
 	uint8_t  otg, dig, link, hpd, opp, hubp;
 	uint16_t encoderObjId;    // e.g. 0x2120 (UNIPHY1 enum 1 = UNIPHYC)
 	uint16_t connectorObjId;  // e.g. 0x330c (HDMI type A)
-	uint8_t  pllId;           // ATOM_COMBOPHY_PLL0..5 = 0x14..0x19
 	Edid::DetailedTiming from, to;
 };
 
