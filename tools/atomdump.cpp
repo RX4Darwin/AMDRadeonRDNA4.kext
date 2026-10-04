@@ -1433,6 +1433,10 @@ static int testPipe2() {
 		{ 2, 0x1c09, 0x1, 0x0, "OTG1 update lock released" },    { 2, 0x1adb, 0xf0000, 0x10000, "ODM1 source OPP1" },
 		{ 2, 0x06e6, 0xffffffff, 0x02100000, "surface low" },    { 2, 0x06e7, 0xffffffff, 0x80, "surface high" },
 		{ 2, 0x06e3, 0xffff, 1919, "pitch" },                    { 2, 0x06c7, 0xffffffff, 0x04380780, "viewport" },
+		// The scaler's output rectangle and the blender's size: 0x0 (a table generated
+		// without Linux's scaler library) lights the plane and shows black, as on the
+		// card on 2026-10-04.
+		{ 2, 0x0e8a, 0xffffffff, 0x04380780, "DSCL1 recout size" }, { 2, 0x0e8b, 0xffffffff, 0x04380780, "DSCL1 MPC size" },
 		{ 3, 0x0015, 0xf, 1, "MPCC1 top = DPP1" },               { 3, 0x0017, 0xf, 1, "MPCC1 OPP id" },
 		{ 3, 0x02f6, 0xf, 1, "OPP1 out mux = MPCC1" },           { 2, 0x18ae, 0x1, 0, "DPG1 off (video)" },
 		{ 2, 0x22dd, 0x1, 1, "DIG2 front-end enabled" },         { 2, 0x2305, 0x1, 1, "DIG2 back-end enabled" },

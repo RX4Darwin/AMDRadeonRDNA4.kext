@@ -3,3 +3,4 @@ vm_helper_mark_vmid_used
 dp_is_128b_132b_signal
 dp_get_panel_mode
 should_use_dmub_inbox1_lock
+dm_helpers_is_hdr_on

@@ -47,8 +47,11 @@ B=${PIPEGEN_BUILD:-${TMPDIR:-/tmp}/pipegen-build}
 mkdir -p "$B/obj"
 
 # -O0 and no inlining: rec.c names each step after the Linux function that made it (dladdr on the caller).
+# CONFIG_DRM_AMD_DC_FP is what every DCN build of amdgpu has: without it DC leaves out, among other things,
+# the scaler library that DCN 4.01's DPP takes its output rectangle from (the first table was built without,
+# and lit a plane with a 0x0 rectangle: black).
 CF="-std=gnu11 -O0 -g -w -fno-omit-frame-pointer -fno-inline -fno-strict-aliasing -fwrapv
-    -Wno-error=implicit-function-declaration -include limits.h -Dnoinline_for_stack="
+    -Wno-error=implicit-function-declaration -include limits.h -Dnoinline_for_stack= -DCONFIG_DRM_AMD_DC_FP=1"
 INC="-I$here/shim/include -I$here"
 for d in dc/inc dc/inc/hw dc/clk_mgr dc/hwss dc/resource dc/dsc dc/optc dc/dpp dc/hubbub dc/dccg dc/hubp dc/dio \
          dc/dwb dc/hpo dc/mmhubbub dc/mpc dc/opp dc/pg dc/soc_and_ip_translator modules/inc dmub/inc . include dc \

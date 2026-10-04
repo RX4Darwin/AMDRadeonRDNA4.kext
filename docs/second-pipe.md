@@ -148,3 +148,11 @@ would have closed it. It is regenerated for an open window and now requires one 
 domain is already on (`DOMAIN1_PG_CONFIG` 0, status on); the VM aperture registers are 0 on the lit HUBP too, so the
 copies change nothing; `CM1_CM_CONTROL` has the bypass bit set, which the plan clears; `HUBP1_DCHUBP_CNTL` reads 0x000f001a before the plane is enabled, the value to compare the
 level-4 line against.
+
+**Plane, 2026-10-04 21:37 (`rdna4-head2=4`): black.** The plan ran (`stream and plane: 399 steps`, OTG1 at 60.002 Hz,
+`HUBP1_DCHUBP_CNTL` 0x000f0012: the HUBP left its blanked state, no underflow flag), macOS listed the monitor, and the
+monitor showed black. The table itself was wrong: it wrote `DSCL1_RECOUT_SIZE` and `DSCL1_MPC_SIZE` as 0, a plane
+with a 0x0 output rectangle. The generator had compiled Linux without `CONFIG_DRM_AMD_DC_FP`, which every DCN build
+of amdgpu has; without it `resource_build_scaling_params` skips the scaler library (SPL) that DCN 4.01's DPP takes
+its rectangle from. The level-3 survey already showed both registers staying 0. With the option the table differs in
+exactly those two entries (1920x1080), and `testPipe2` checks them.
