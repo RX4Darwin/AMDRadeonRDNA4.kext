@@ -82,7 +82,8 @@ public:
 	// The second pipe (pipe2.hpp), for a head whose surface is at CPU
 	// address `surfacePhys` in the console's memory range. `level` is
 	// rdna4-head2: 2 writes nothing and publishes what every step would do,
-	// 3 lights the stream with a solid colour, 4 also the plane.
+	// 3 lights the stream with a solid colour (and publishes what the plane
+	// would then do), 4 also the plane.
 	bool lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhys);
 
 	// Display power (DPMS). Off = disable the DP video stream and put the

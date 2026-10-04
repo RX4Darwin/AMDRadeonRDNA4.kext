@@ -2332,7 +2332,8 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 	Pipe2::Target t {};
 	t.litHubp = pipe.hubp;
 	t.encoderObjId = path.encoderObjId;
-	t.depth = level >= 4 ? Pipe2::Depth::Plane : Pipe2::Depth::Stream;
+	// Only level 3 stops at the stream; the survey (2) covers the whole plan.
+	t.depth = level == 3 ? Pipe2::Depth::Stream : Pipe2::Depth::Plane;
 	t.sinkScdc = Edid::hdmi2Caps(edid2Data, edid2Len).scdc;
 	t.ddcLine = ddcLine;
 	// The lit pipe scans the console from the address in its HUBP; the second
@@ -2392,6 +2393,10 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		      mHz / 1000, mHz % 1000, want / 1000, want % 1000, c.pipe,
 		      regReadDmu(2, 0x05f4 + c.pipe * Pipe::Reg::kHubpStride), c.pipe,
 		      regReadDmu(2, 0x1aca + c.pipe * Pipe::Reg::kOdmStride));
+		// With the stream lit, what the plane would still change.
+		t.depth = Pipe2::Depth::Plane;
+		if (ok && level == 3 && Pipe2::build(t, *plan, &why))
+			surveySteps(plan->steps, plan->count, plan->cmds);
 	}
 	IOFree(plan, sizeof(Pipe2::Plan));
 	return ok;
