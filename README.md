@@ -94,7 +94,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-off=1` | Kill switch: the plugin does not hook anything and macOS runs its stock fallback framebuffer. Lilu's `-liluoff` disables all plugins. |
 | `rdna4-trace=1` | Log every NDRV request for our framebuffer and who answered it (`rdna4` or `boot`), up to 400 lines. On by default in `VMTEST` builds. Mode switches are always logged. |
 | `rdna4-modeset=1` | Offer the sink's EDID modes (DTDs, CTA DTDs/VICs, standard and established timings; ≤ boot framebuffer size, TMDS ≤ 340 MHz, ≤ 1.25 × boot pixel clock) instead of the boot mode alone. Until the HDMI mode-set engine lands, choosing a non-boot mode on the card is refused and the pipe is left untouched. |
-| `rdna4-head2=1` | Experiment: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Not with `rdna4-compute`. First card boot (nub created late): macOS never opened the second head; the early, linked version has not been booted yet. See `docs/second-head-ndrv.md`. |
+| `rdna4-head2=1` | Experiment: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Not with `rdna4-compute`. Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. |
 | `rdna4-nosleep=1` | Make display sleep a no-op (the screen stays on). Escape hatch if blank/unblank misbehaves. |
 | `rdna4-noedid=1` | Skip the EDID probe over AUX/DDC. Use if a sink misbehaves on DDC. |
 | `rdna4-lutbypass=1` | Force the MPC MCM stages (shaper/3D LUT/1D LUT) to bypass on all pipes. |
@@ -450,6 +450,10 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       GB/s, end-to-end host->GPU 4.8 GB/s and GPU->host 3.8 GB/s (from
       0.33 and 0.005), 7896 MiB of buffers; SGEMM n=4096 11.2 TFLOPS (27x
       Accelerate), n=8192 10.4 TFLOPS in 105 ms (22x), all exact
+- [x] A second display on the macOS side (`rdna4-head2=1`): a second
+      `IONDRVFramebuffer` on a plugin-made nub, accepted by WindowServer and
+      listed as a display (verified on hardware, Big Sur 11.6.6). Its pipe is
+      not lit yet, so the monitor stays dark
 - [ ] Native mode setting (DCN 4.1.0) / multiple displays
 - [ ] Hardware cursor through the NDRV cursor path
 - [ ] Acceleration / Metal

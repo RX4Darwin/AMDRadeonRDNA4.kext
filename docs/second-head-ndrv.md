@@ -109,6 +109,8 @@ surface).
 
 ## 6. Not known yet
 
+State after the card boots of section 7: 1 and 3 are answered for Big Sur 11.6.6, 2 for Big Sur; Tahoe is untested.
+
 1. **Head 0's controller.** With route B, head 0 has no `IOFBDependentID` unless the property is on the PCI device
    before head 0's `IOFramebuffer::start` runs (`FB.cpp:4813`). The plugin may be routed too late for that (see the
    comment on `attach` in `src/plugin.cpp`). Without it the two heads get separate controllers [F] and are not linked
@@ -145,6 +147,13 @@ WindowServer saw both and gave up on the second [M] (CoreDisplay log): `Creating
 Can't map framebuffer error(0xe00002c2)`, `Failed to create FB 2 of 2 (Failed to map VRAM)`, `GPU: FB: 1 of 2
 opened`. Displays showed one display. Cause: `getVRAMRange` is NULL without an `IOBootNDRV` (section 4).
 
+**Third card boot (2026-10-04 00:36, with the `getVRAMRange` route, commit 0f03c8b): macOS takes the second head [M].**
+WindowServer: `Created FB 2 of 2`, `GPU: FB: 2 of 2 opened`, `IOFramebufferUserClient = 2`. `system_profiler` lists
+two displays on the card, the boot display (main) and `LEN G25-10`, 1920 x 1080, online. In the registry head 2 has
+`IOFBMemorySize` 8294400 and WindowServer's `IOFramebufferUserClient`. So on Big Sur 11.6.6: a plugin-made
+`IONDRVDevice` nub works, linking the heads as dependents works with head 0 still on the PCI device, and WindowServer
+accepts a second unaccelerated head. The monitor stays dark: no pipe scans the surface out.
+
 **Current version.**
 
 - `IONDRVFramebuffer::start` is routed as well (only with the boot-arg). When it is called for the PCI device, before
@@ -163,8 +172,7 @@ opened`. Displays showed one display. Cause: `getVRAMRange` is NULL without an `
   console (`Ndrv::spareSurface`, host-tested in `tools/atomdump.cpp`).
 - `head2DriverIO` answers Initialize/Open and every csc request for the framebuffer on the nub: a `Translator` with
   one mode, then IOBootNDRV's fallback (`Ndrv::bootReply`).
-- `IONDRVFramebuffer::getVRAMRange` is routed too and returns the surface for head 2 (added after the second boot;
-  not booted yet).
+- `IONDRVFramebuffer::getVRAMRange` is routed too and returns the surface for head 2 (added after the second boot).
 
 It refuses to run with `rdna4-compute` (the compute pool takes the VRAM behind the console).
 
