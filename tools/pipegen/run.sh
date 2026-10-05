@@ -31,7 +31,9 @@
 # nothing on this path reaches are stubbed to abort if called; the few listed
 # in linux-noops.txt return 0 (each is a query that is false on this path).
 # mkinc.py names every register from Linux's header and refuses a table that
-# leaves the blocks of the pipe being lit.
+# leaves the blocks of the pipe being lit. For mode switching on the lit pipe
+# the same is run once per mode of modes.txt, and the table gets the values
+# of the registers that change with the mode.
 #
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
@@ -86,7 +88,26 @@ for pass in 1 2; do
 done
 
 "$B/pipegen" "$@" > "$B/trace.txt"
-python3 "$here/mkinc.py" "$HDR" "$B/trace.txt" "$(git -C "$L" rev-parse HEAD)" > "$B/pipe2_linux.inc"
+
+# The same pipe in each mode of modes.txt, with the plane on the surface of the lit mode (as after a mode
+# switch): mkinc.py keeps the registers that differ from mode to mode. The lit mode itself comes first.
+mkdir -p "$B/modes"
+command rm -f "$B"/modes/*.txt
+"$B/pipegen" on "$5" "$9" "$@" > "$B/modes/00.txt"
+n=0
+while read -r line; do
+	mode=${line%%#*}
+	[ -n "${mode// /}" ] || continue
+	n=$((n + 1)); f=$B/modes/$(printf %02d $n).txt
+	# shellcheck disable=SC2086
+	if ! "$B/pipegen" on "$5" "$9" "${@:1:4}" $mode > "$f" 2> "$B/mode.err"; then
+		command rm -f "$f"
+		grep -q 'DML: mode not supported' "$B/mode.err" || { cat "$B/mode.err" >&2; exit 1; }
+		echo "modes.txt: DML does not support${line##*#}: it stays on the 25 % rule"
+	fi
+done < "$here/modes.txt"
+
+python3 "$here/mkinc.py" "$HDR" "$B/trace.txt" "$(git -C "$L" rev-parse HEAD)" "$B"/modes/*.txt > "$B/pipe2_linux.inc"
 cp -f "$B/pipe2_linux.inc" "$repo/src/pipe2_linux.inc"
 echo "wrote src/pipe2_linux.inc ($(grep -c "^	{ '" "$repo/src/pipe2_linux.inc") entries)"
 

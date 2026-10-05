@@ -94,6 +94,29 @@ struct Plan {
 // (they are for the pipe Part::Light lit).
 bool build(const Target &t, Plan &out, const char **why);
 
+// What changes with the mode on the lit pipe besides the timing itself: the
+// HUBP's request timing (DLG, TTU), the DET size and the timing generator's
+// global sync, all of which Linux takes from DML. tools/pipegen ran it for
+// the timings of tools/pipegen/modes.txt with the plane on the plan's
+// surface, and the table holds what differs.
+//
+// modeSteps gives the updates for a switch to `to`, for the OTG update lock
+// after the mode-set engine's own steps (ModeSet::Target::extra). For a
+// timing of the table they are Linux's values for it. For any other they are
+// the plan mode's values of the registers the engine leaves alone, that is
+// the state the pipe was lit in; such a mode should stay near the plan's
+// pixel clock.
+constexpr size_t kMaxModeSteps = 48;
+enum class ModeRegs : uint8_t {
+	Apply,   // what the switch writes
+	All,     // every register that changes with the mode, as Linux leaves it: only for a timing of the table
+};
+bool modeKnown(const Edid::DetailedTiming &t);
+const Edid::DetailedTiming *knownModes(size_t &count);   // the table's timings, the plan's first
+size_t modeSteps(const Edid::DetailedTiming &to, ModeSet::Step *out, size_t cap, ModeRegs which = ModeRegs::Apply);
+// The DET segments the pipe holds after a switch to `to`.
+uint32_t modeDetSegments(const Edid::DetailedTiming &to);
+
 // The link (0 = UNIPHY A) a VBIOS encoder object drives, or -1: object ids
 // 0x1e, 0x20, 0x21 are UNIPHY, UNIPHY1, UNIPHY2 with two links each, picked
 // by the enum id in bits 11:8. 0x2120 is link 2.

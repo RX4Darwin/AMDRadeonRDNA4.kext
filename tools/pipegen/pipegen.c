@@ -54,6 +54,8 @@ struct cfg {
 	int hpd;       /* 0-based HPD source */
 	bool dp;       /* the "dp" scenario: retime a DisplayPort stream that is already lit (sequence_dp) */
 	struct dc_crtc_timing t;      /* the new stream */
+	unsigned surf_w, surf_h;      /* "on W H": the plane shows the top-left of a surface this size (a mode switch
+	                               * on a pipe lit for a larger mode); 0 = a surface of the mode's own size */
 	struct dc_crtc_timing lit;    /* the stream the firmware lit */
 	int vstartup, vupdate_offset, vupdate_width, vready_offset, pstate_keepout;   /* from DML */
 };
@@ -66,7 +68,8 @@ struct cfg {
 
 static struct dml2_display_cfg_programming *g_prog;
 
-static void dml_stream(struct dml2_display_cfg *d, int i, const struct dc_crtc_timing *t, bool hdmi)
+static void dml_stream(struct dml2_display_cfg *d, int i, const struct dc_crtc_timing *t, bool hdmi,
+		       unsigned surf_w, unsigned surf_h)
 {
 	struct dml2_stream_parameters *s = &d->stream_descriptors[i];
 	struct dml2_plane_parameters *p = &d->plane_descriptors[i];
@@ -95,7 +98,8 @@ static void dml_stream(struct dml2_display_cfg *d, int i, const struct dc_crtc_t
 	s->overrides.hw.twait_budgeting.stutter_enter_exit = dml2_twait_budgeting_setting_if_needed;
 
 	p->stream_index = i;
-	p->surface.plane0.width = w; p->surface.plane0.height = h; p->surface.plane0.pitch = w;
+	p->surface.plane0.width = surf_w ? surf_w : w; p->surface.plane0.height = surf_h ? surf_h : h;
+	p->surface.plane0.pitch = p->surface.plane0.width;
 	p->surface.dcc.informative.dcc_rate_plane0 = 2.0;
 	p->surface.dcc.informative.dcc_rate_plane1 = 2.0;
 	p->surface.tiling = dml2_sw_linear;
@@ -143,8 +147,8 @@ static void run_dml(struct cfg *c)
 	d->minimize_det_reallocation = true;
 	d->overrides.enable_subvp_implicit_pmo = true;
 	d->num_streams = 2; d->num_planes = 2;
-	dml_stream(d, 0, &c->lit, false);
-	dml_stream(d, 1, &c->t, true);
+	dml_stream(d, 0, &c->lit, false, 0, 0);
+	dml_stream(d, 1, &c->t, true, c->surf_w, c->surf_h);
 	bmp.dml2_instance = inst; bmp.display_config = d; bmp.programming = g_prog;
 	if (!dml2_build_mode_programming(&bmp)) { fprintf(stderr, "DML: mode not supported\n"); exit(1); }
 
@@ -248,8 +252,8 @@ static void make_state(const struct cfg *c)
 	plane->format = SURFACE_PIXEL_FORMAT_GRPH_ARGB8888;
 	plane->address.type = PLN_ADDR_TYPE_GRAPHICS;
 	plane->address.grph.addr.quad_part = SURFACE_PLACEHOLDER;
-	plane->plane_size.surface_size = (struct rect){ 0, 0, w, h };
-	plane->plane_size.surface_pitch = w;
+	plane->plane_size.surface_size = (struct rect){ 0, 0, c->surf_w ? c->surf_w : w, c->surf_h ? c->surf_h : h };
+	plane->plane_size.surface_pitch = plane->plane_size.surface_size.width;
 	plane->tiling_info.gfxversion = DcGfxAddr3;
 	plane->tiling_info.gfx_addr3.swizzle = DC_ADDR3_SW_LINEAR;
 	plane->rotation = ROTATION_ANGLE_0;
@@ -499,11 +503,16 @@ int main(int argc, char **argv)
 	bool verbose;
 
 	if (argc > 1 && !strcmp(argv[1], "dp")) { c.dp = true; argv++; argc--; }
+	if (argc > 3 && !strcmp(argv[1], "on")) {
+		c.surf_w = (unsigned)strtoul(argv[2], NULL, 0); c.surf_h = (unsigned)strtoul(argv[3], NULL, 0);
+		argv += 3; argc -= 3;
+	}
 	verbose = argc > 17;
 	if (argc < 17) {
-		fprintf(stderr, "usage: pipegen [dp] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync vback  "
-				"khz hpositive vpositive vic [verbose]\n  hpd counts from 1, as the VBIOS path records do\n"
-				"  dp: the reference for retiming a lit DisplayPort stream instead of the second-pipe plan\n");
+		fprintf(stderr, "usage: pipegen [dp] [on W H] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync "
+				"vback  khz hpositive vpositive vic [verbose]\n  hpd counts from 1, as the VBIOS path records do\n"
+				"  dp: the reference for retiming a lit DisplayPort stream instead of the second-pipe plan\n"
+				"  on W H: the plane shows the top-left of a W x H surface, as after a mode switch\n");
 		return 2;
 	}
 	for (int i = 0; i < 16; i++) v[i] = (unsigned)strtoul(argv[i + 1], NULL, 0);

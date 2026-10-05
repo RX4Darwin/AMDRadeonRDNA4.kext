@@ -1485,6 +1485,7 @@ static int testPipe2() {
 	                  "pipe2: wake plan: %s, %zu DMUB commands", woke ? "built" : why, dpms.ncmds);
 	inBlocks(dpms);
 	apply(dpms);
+	const size_t wakeSteps = dpms.count;
 	for (const PlanRegs::R &r : lit.regs)
 		failures += check(regs.get(r.seg, r.dw) == r.v, "pipe2: after sleep and wake %u:0x%04x = 0x%08x, lit it "
 		                  "was 0x%08x", r.seg, r.dw, regs.get(r.seg, r.dw), r.v);
@@ -1506,6 +1507,8 @@ static int testPipe2() {
 		{ { 74250, 1280, 370, 110, 40, 720, 30, 5, 5, true, true, false },    { 0x88281e33, 0x04, 0x2ef, 0x673 } },
 		{ { 108000, 1280, 408, 48, 112, 1024, 42, 1, 3, true, true, false },  { 0x88081ef3, 0x00, 0x42b, 0x699 } },
 		{ { 148500, 1920, 720, 528, 44, 1080, 45, 4, 5, true, true, false },  { 0x88281ebd, 0x1f, 0x466, 0xa51 } },
+		{ { 333070, 1920, 136, 24, 32, 1080, 45, 3, 5, true, false, false },  { 0x88281e26, 0x00, 0x466, 0x809 } },
+		{ { 25175, 640, 160, 16, 96, 480, 45, 10, 2, false, false, false },   { 0x88181e7c, 0x01, 0x20e, 0x321 } },
 	};
 	uint32_t w[9] {};
 	failures += check(aviWords(plan, w) == 18 && w[0] == 0x000d0282 && memcmp(w + 1, avi[0].w, sizeof(avi[0].w)) == 0,
@@ -1531,9 +1534,13 @@ static int testPipe2() {
 	                  dpms.cmds[1][2] == 10800, "pipe2: wake at 108 MHz: encoder %u, transmitter %u x 10 kHz",
 	                  dpms.cmds[0][2], dpms.cmds[1][2]);
 	// The switch itself is the boot display's mode-set engine pointed at this
-	// pipe: it must not leave the pipe's blocks either, and it ends on the new
-	// timing with the stream back on.
+	// pipe, with the registers of the mode table added inside its update lock.
+	// For every mode Linux was asked about: the plan stays in the pipe's
+	// blocks, and afterwards every register that changes with the mode holds
+	// what Linux leaves in it when it lights the pipe in that mode. That also
+	// holds the engine's own timing arithmetic against Linux, mode by mode.
 	static ModeSet::Plan ms;
+	static ModeSet::Step extra[Pipe2::kMaxModeSteps], want[Pipe2::kMaxModeSteps];
 	ModeSet::Target mt {};
 	mt.otg = mt.opp = mt.hubp = c.pipe;
 	mt.dig = c.dig;
@@ -1541,26 +1548,58 @@ static int testPipe2() {
 	mt.hpd = c.hpd;
 	mt.encoderObjId = 0x2120;
 	mt.connectorObjId = 0x330c;
-	mt.from = c.timing;
-	mt.to = avi[1].t;
+	mt.extra = extra;
+	size_t nmodes = 0, modeMismatch = 0;
+	const Edid::DetailedTiming *known = Pipe2::knownModes(nmodes);
 	const size_t outsideBefore = outside;
-	const bool switched = ModeSet::build(mt, ms, &why);
-	stepsInBlocks(ms.steps, ms.count);
-	for (size_t i = 0; switched && i < ms.count; i++) {
-		const ModeSet::Step &st = ms.steps[i];
-		if (st.op == ModeSet::Op::Write)
-			regs.set(st.seg, st.dword, st.value);
-		else if (st.op == ModeSet::Op::Update)
-			regs.set(st.seg, st.dword, (regs.get(st.seg, st.dword) & ~st.mask) | st.value);
+	// From `from` (the registers in `r`) to `to`; the number of registers that do not end as Linux has them.
+	auto switchTo = [&](PlanRegs &r, const Edid::DetailedTiming &from, const Edid::DetailedTiming &to) -> size_t {
+		mt.from = from;
+		mt.to = to;
+		mt.nextra = Pipe2::modeSteps(to, extra, Pipe2::kMaxModeSteps);
+		if (!ModeSet::build(mt, ms, &why))
+			return check(false, "pipe2: mode switch to %ux%u at %u kHz refused: %s", to.hActive, to.vActive,
+			             to.pixelClockKHz, why);
+		stepsInBlocks(ms.steps, ms.count);
+		r.run(ms);
+		size_t wrong = 0;
+		const size_t n = Pipe2::modeSteps(to, want, Pipe2::kMaxModeSteps, Pipe2::ModeRegs::All);
+		for (size_t i = 0; i < n; i++)
+			wrong += check((r.get(want[i].seg, want[i].dword) & want[i].mask) == want[i].value,
+			               "pipe2: after a switch to %ux%u at %u kHz %s = 0x%08x, Linux has 0x%08x under 0x%08x",
+			               to.hActive, to.vActive, to.pixelClockKHz, want[i].what, r.get(want[i].seg, want[i].dword),
+			               want[i].value, want[i].mask);
+		return wrong;
+	};
+	failures += check(nmodes >= 2 && Edid::sameTiming(known[0], c.timing), "pipe2: the mode table has %zu modes",
+	                  nmodes);
+	PlanRegs chain = lit;                              // one mode after the other: nothing is left over from the last
+	for (size_t i = 0; i < nmodes; i++) {
+		PlanRegs direct = lit;                         // straight from the lit state
+		modeMismatch += switchTo(direct, c.timing, known[i]);
+		modeMismatch += switchTo(chain, i ? known[i - 1] : c.timing, known[i]);
+		failures += check((direct.get(2, 0x22dd) & 1) == 1 && (direct.get(2, 0x1bc3) & 1) == 1 &&
+		                  direct.get(2, 0x06e6) == lit.get(2, 0x06e6) && direct.get(2, 0x06e3) == lit.get(2, 0x06e3),
+		                  "pipe2: after a switch to mode %zu the stream is off or the surface moved", i);
 	}
-	failures += check(switched && outside == outsideBefore && regs.get(2, 0x1baa) == 1799 && regs.get(2, 0x1baf) == 999 &&
-	                  regs.get(2, 0x06c7) == 0x03840640 && regs.get(2, 0x0e8a) == 0x03840640 &&
-	                  regs.get(2, 0x0e8b) == 0x03840640 && (regs.get(2, 0x22dd) & 1) == 1 &&
-	                  (regs.get(2, 0x1bc3) & 1) == 1 && regs.get(2, 0x06e6) == lit.get(2, 0x06e6) &&
-	                  regs.get(2, 0x06e3) == lit.get(2, 0x06e3),
-	                  "pipe2: mode switch to 1600x900: %s, %zu outside; h total %u, viewport %08x, recout %08x",
-	                  switched ? "built" : why, outside - outsideBefore, regs.get(2, 0x1baa), regs.get(2, 0x06c7),
-	                  regs.get(2, 0x0e8a));
+	modeMismatch += switchTo(chain, known[nmodes - 1], c.timing);       // and back to the lit mode
+	failures += static_cast<int>(modeMismatch);
+	// A timing Linux was not asked about keeps the lit mode's request timing
+	// and gets the engine's rule for the rest.
+	Edid::DetailedTiming other = c.timing;
+	other.hSyncOffset += 8;
+	const size_t nOther = Pipe2::modeSteps(other, extra, Pipe2::kMaxModeSteps);
+	const size_t nKnown = Pipe2::modeSteps(known[1], want, Pipe2::kMaxModeSteps);
+	bool otherIsLit = !Pipe2::modeKnown(other) && nOther > 0 && nOther < nKnown &&
+	                  Pipe2::modeSteps(other, want, Pipe2::kMaxModeSteps, Pipe2::ModeRegs::All) == 0;
+	for (size_t i = 0; i < nOther; i++)
+		otherIsLit = otherIsLit && (lit.get(extra[i].seg, extra[i].dword) & extra[i].mask) == extra[i].value;
+	failures += check(otherIsLit, "pipe2: a mode outside the table: %zu steps (a known one %zu)", nOther, nKnown);
+	failures += check(outside == outsideBefore, "pipe2: a mode switch leaves the pipe's blocks");
+	// DML gives the 144 Hz mode more of the DET buffer than the lit one.
+	failures += check(Pipe2::modeDetSegments(c.timing) == c.detSegments && Pipe2::modeDetSegments(other) == c.detSegments &&
+	                  Pipe2::modeDetSegments(known[1]) == 7, "pipe2: DET segments: lit %u, 1080p144 %u",
+	                  Pipe2::modeDetSegments(c.timing), Pipe2::modeDetSegments(known[1]));
 
 	// Stream only: stops before the plane, shows the pattern colour, and never
 	// reaches the HUBP.
@@ -1590,9 +1629,10 @@ static int testPipe2() {
 	failures += check(!Pipe2::build(bad, stream, &why), "pipe2: plane without a surface accepted");
 
 	printf("\npipe2: pipe %u DIG%u link %u HPD%u %ux%u at %u kHz: %zu steps (%zu register writes, %zu "
-	       "requirements), %zu DMUB commands; sleep %zu steps, wake %zu; %zu outside the pipe %s\n", c.pipe,
-	       c.dig, c.link, c.hpd, c.timing.hActive, c.timing.vActive, c.timing.pixelClockKHz, plan.count,
-	       lightWrites, requires, plan.ncmds, sleepSteps, dpms.count, outside, failures ? "MISMATCH" : "ok");
+	       "requirements), %zu DMUB commands; sleep %zu steps, wake %zu; %zu modes to switch to, %zu registers "
+	       "not as Linux has them; %zu outside the pipe %s\n", c.pipe, c.dig, c.link, c.hpd, c.timing.hActive,
+	       c.timing.vActive, c.timing.pixelClockKHz, plan.count, lightWrites, requires, plan.ncmds, sleepSteps,
+	       wakeSteps, nmodes, modeMismatch, outside, failures ? "MISMATCH" : "ok");
 	return failures;
 }
 

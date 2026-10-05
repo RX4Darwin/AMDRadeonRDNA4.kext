@@ -307,10 +307,7 @@ uint8_t vicOf(const DetailedTiming &t) {
 	for (const FixedTiming &f : kCea) {
 		DetailedTiming c {};
 		toDetailed(f, c);
-		if (c.pixelClockKHz == t.pixelClockKHz && c.hActive == t.hActive && c.hBlank == t.hBlank &&
-		    c.hSyncOffset == t.hSyncOffset && c.hSyncWidth == t.hSyncWidth && c.vActive == t.vActive &&
-		    c.vBlank == t.vBlank && c.vSyncOffset == t.vSyncOffset && c.vSyncWidth == t.vSyncWidth &&
-		    c.hSyncPositive == t.hSyncPositive && c.vSyncPositive == t.vSyncPositive && !t.interlaced)
+		if (sameTiming(c, t))
 			return f.id;
 	}
 	return 0;

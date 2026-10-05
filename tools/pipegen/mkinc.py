@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mkinc.py <dcn_4_1_0_offset.h> <pipegen trace> <linux commit> > src/pipe2_linux.inc
+"""mkinc.py <dcn_4_1_0_offset.h> <pipegen trace> <linux commit> <trace of each mode> ... > src/pipe2_linux.inc
 
 Turns pipegen's trace into the table src/pipe2.cpp builds its plan from, and refuses to if a step leaves
 the blocks of the pipe being lit:
@@ -11,6 +11,7 @@ the blocks of the pipe being lit:
 import collections, re, sys
 
 hdr, trace, commit = sys.argv[1:4]
+mode_traces = sys.argv[4:]      # the lit mode first
 
 base, off = {}, {}
 for line in open(hdr):
@@ -187,3 +188,55 @@ for kind, seg, dword, mask, value, arg, what in out:
     print(f"\t{{ '{kind}', {seg}, 0x{dword:04x}, 0x{mask:08x}, 0x{value:08x}, {arg}, \"{what}\" }},")
 print('};')
 sys.stderr.write(f'mkinc: {len(out)} entries, ' + ', '.join(f'{k}:{v}' for k, v in sorted(kinds.items())) + '\n')
+
+# ---- what changes with the mode: the bits Linux leaves in each register after lighting, mode by mode ----
+def lit_state(path):
+    """CONFIG words and {(seg, dword): (mask, value)} of a trace's lighting part."""
+    state, config = {}, None
+    for p in (l.split() for l in open(path) if l.strip()):
+        if p[0] == 'CONFIG':
+            config = p[1:]
+        elif p[0] == 'MARK' and p[1] == 'begin:sleep':
+            break
+        elif p[0] in ('W', 'U'):
+            key, m, v = (int(p[1]), int(p[2], 0)), int(p[3], 16), int(p[4], 16)
+            m0, v0 = state.get(key, (0, 0))
+            state[key] = (0xffffffff, v) if p[0] == 'W' else (m0 | m, (v0 & ~m) | v)
+    return config, state
+
+# Who has the register in a mode switch (src/modeset.cpp runs first, then src/pipe2.cpp's modeSteps):
+#   M  the mode-set engine programs it, to the value Linux does (tools/atomdump.cpp checks that),
+#   S  the engine programs it by rule; Linux's value from DML replaces it for a mode of this table,
+#   D  only this table has it.
+ENGINE = [f'OTG{pipe}_OTG_{r}' for r in ('H_TOTAL', 'H_SYNC_A', 'H_SYNC_A_CNTL', 'H_BLANK_START_END', 'V_TOTAL',
+                                         'V_SYNC_A', 'V_SYNC_A_CNTL', 'V_BLANK_START_END')]
+ENGINE += [f'DPG{pipe}_DPG_DIMENSIONS', f'HUBP{pipe}_DCSURF_PRI_VIEWPORT_DIMENSION', f'DSCL{pipe}_RECOUT_SIZE',
+           f'DSCL{pipe}_MPC_SIZE']
+BY_RULE = [f'VTG{pipe}_CONTROL', f'OTG{pipe}_OTG_VSTARTUP_PARAM', f'OTG{pipe}_OTG_VUPDATE_PARAM']
+
+modes = [lit_state(t) for t in mode_traces]
+assert modes and modes[0][0][:15] == cfg[1:16], 'the first mode trace must be the lit mode'
+assert all(set(m[1]) == set(modes[0][1]) for m in modes), 'a mode writes a register another does not'
+keys = [k for k in modes[0][1] if any(m[1][k] != modes[0][1][k] for m in modes)]
+print(f'''
+// What Linux leaves different from mode to mode in this pipe's registers, the plane showing the top-left of the
+// {ha}x{va} surface (tools/pipegen/modes.txt): one row of values per mode, in the order of kModeRegs. Row 0 is
+// the mode the plan lights.
+static const ModeReg kModeRegs[] = {{''')
+for k in keys:
+    name, allowed = classify(*k)
+    assert allowed is None, f'{name} is shared between pipes'
+    masks = {m[1][k][0] for m in modes}
+    assert len(masks) == 1, f'{name}: the bits written depend on the mode'
+    who = 'M' if name in ENGINE else 'S' if name in BY_RULE else 'D'
+    print(f"\t{{ '{who}', {k[0]}, 0x{k[1]:04x}, 0x{masks.pop():08x}, \"{name}\" }},")
+print('};\n\nstatic const Edid::DetailedTiming kModeTimings[] = {')
+for c, _ in modes:
+    mha, mhfp, mhsw, mhbp, mva, mvfp, mvsw, mvbp, mkhz, mhpos, mvpos = map(int, c[4:15])
+    print(f"\t{{ {mkhz}, {mha}, {mhfp + mhsw + mhbp}, {mhfp}, {mhsw}, {mva}, {mvfp + mvsw + mvbp}, {mvfp}, {mvsw}, "
+          f"{'true' if mhpos else 'false'}, {'true' if mvpos else 'false'}, false }},")
+print(f'}};\n\nstatic const uint32_t kModeValues[][{len(keys)}] = {{')
+for c, state in modes:
+    print('\t{ ' + ', '.join(f'0x{state[k][1]:08x}' for k in keys) + ' },')
+print('};')
+sys.stderr.write(f'mkinc: {len(modes)} modes, {len(keys)} registers change with the mode\n')

@@ -412,6 +412,11 @@ bool build(const Target &t, Plan &out, const char **why) {
 	b.write(kDsclRecoutStart + dpp, 0, "recout start");
 	b.write(kDsclRecoutSize + dpp, sizeWH(w, h), "recout size");
 	b.write(kDsclMpcSize + dpp, sizeWH(w, h), "mpc size");
+	for (size_t i = 0; i < t.nextra; i++) {
+		b.seg = t.extra[i].seg;
+		b.add(t.extra[i].op, t.extra[i].dword, t.extra[i].mask, t.extra[i].value, t.extra[i].arg, t.extra[i].what);
+	}
+	b.seg = 2;
 	b.update(kOtgUpdateLock + otg, 0x1, 0, "update unlock");
 
 	// --- blank_pixel_data(false): DPG video mode; set_avmute(false) ---

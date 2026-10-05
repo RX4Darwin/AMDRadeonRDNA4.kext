@@ -492,9 +492,14 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       at 1280x720, picture confirmed): the mode-set engine pointed at the
       second pipe, for modes up to the lit one's size and within 25 % of
       its pixel clock.
-- [ ] Second display beyond that configuration: other connectors, high
-      refresh rates (need DML's request timing per mode), a second
-      DisplayPort display (needs link training), hot-plug.
+- [ ] High refresh rates on the second display (1920x1080 at 120 and
+      144 Hz next to the 4K boot display): each switch also programs
+      what Linux's DML computes for the mode (request timing, DET size,
+      global sync), generated per mode by `tools/pipegen`
+      (`tools/pipegen/modes.txt`). Written and host-tested, not yet run
+      on the card.
+- [ ] Second display beyond that configuration: other connectors, a
+      second DisplayPort display (needs link training), hot-plug.
 - [x] DP mode switching on the trained link (verified on hardware
       2026-10-04, Big Sur 11.6.6: 3840x2160 to 2560x1440, picture
       confirmed; `rdna4-modeset=1`). The plan's register writes are held

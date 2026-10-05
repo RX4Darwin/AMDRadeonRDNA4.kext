@@ -449,20 +449,20 @@ void fillHead2(RDNA4Device &dev) {
 	// the pipe to be lit (rdna4-head2 >= 2) it has to be the one mode the
 	// second-pipe plan was generated for; the table then only holds what that
 	// pipe can be switched to.
-	const size_t n = Modes::build(h->edid, h->edidLen, head2Level >= 2 ? dev.secondPipeModeLimits() : Modes::Limits {},
-	                              h->table, Modes::MaxModes);
+	size_t n = Modes::build(h->edid, h->edidLen, head2Level >= 2 ? dev.secondPipeModeLimits() : Modes::Limits {},
+	                        h->table, Modes::MaxModes);
 	const Edid::DetailedTiming &lit = Pipe2::config().timing;
-	auto isPlanMode = [&](const Edid::DetailedTiming &t) {
-		return t.pixelClockKHz == lit.pixelClockKHz && !t.interlaced &&
-		       t.hActive == lit.hActive && t.hBlank == lit.hBlank &&
-		       t.hSyncOffset == lit.hSyncOffset && t.hSyncWidth == lit.hSyncWidth &&
-		       t.vActive == lit.vActive && t.vBlank == lit.vBlank &&
-		       t.vSyncOffset == lit.vSyncOffset && t.vSyncWidth == lit.vSyncWidth;
-	};
+	if (head2Level >= 2) {
+		size_t kept = 0;
+		for (size_t i = 0; i < n; i++)
+			if (dev.secondPipeModeOk(h->table[i].t))
+				h->table[kept++] = h->table[i];
+		n = kept;
+	}
 	const Modes::Mode *mode = nullptr;
 	for (size_t i = 0; i < n && !mode; i++) {
 		const Edid::DetailedTiming &t = h->table[i].t;
-		if (head2Level >= 2 && !isPlanMode(t))
+		if (head2Level >= 2 && !Edid::sameTiming(t, lit))
 			continue;
 		if (Ndrv::spareSurface(dev.fbPhysBase, dev.fbLength, rangeBase, rangeLen, t.hActive, t.vActive,
 		                       h->surface))
@@ -506,8 +506,9 @@ void fillHead2(RDNA4Device &dev) {
 	      h->surface.physBase, dev.edid2Len ? "the second sink" : "the boot display (no second sink)");
 	for (size_t i = 0; switching && i < n; i++) {
 		const Modes::Mode &m = h->table[i];
-		FBLOG("head2: mode id %u %ux%u@%u.%03u %u kHz%s", m.id, m.t.hActive, m.t.vActive,
-		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, m.t.pixelClockKHz, &m == mode ? " (lit)" : "");
+		FBLOG("head2: mode id %u %ux%u@%u.%03u %u kHz%s%s", m.id, m.t.hActive, m.t.vActive,
+		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, m.t.pixelClockKHz, &m == mode ? " (lit)" : "",
+		      Pipe2::modeKnown(m.t) ? "" : " (on the lit mode's request timing)");
 	}
 }
 

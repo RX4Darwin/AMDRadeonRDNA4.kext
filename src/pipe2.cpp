@@ -29,7 +29,31 @@ struct Gen {
 	const char *what;
 };
 
+// A register that changes with the mode. who: M the mode-set engine programs
+// it to the same value, S the engine programs it by rule and Linux's value
+// replaces that, D only the table has it.
+struct ModeReg {
+	char        who;
+	uint8_t     seg;
+	uint16_t    dword;
+	uint32_t    mask;
+	const char *name;
+};
+
 #include "pipe2_linux.inc"
+
+constexpr size_t kModeRegCount = sizeof(kModeRegs) / sizeof(kModeRegs[0]);
+constexpr size_t kModeCount = sizeof(kModeTimings) / sizeof(kModeTimings[0]);
+static_assert(kModeRegCount <= kMaxModeSteps && kModeCount == sizeof(kModeValues) / sizeof(kModeValues[0]),
+              "the mode table");
+
+// Row of a timing in the mode table, or -1.
+int modeRow(const Edid::DetailedTiming &t) {
+	for (size_t i = 0; i < kModeCount; i++)
+		if (Edid::sameTiming(kModeTimings[i], t))
+			return static_cast<int>(i);
+	return -1;
+}
 
 // The words of the AVI infoframe (version 2, 13 bytes) that depend on the
 // timing, as amdgpu's set_avi_info_frame fills them for 8 bpc full-range RGB:
@@ -50,6 +74,36 @@ uint32_t aviWord(const Edid::DetailedTiming &t, uint32_t word) {
 } // namespace
 
 const Config &config() { return kConfig; }
+
+bool modeKnown(const Edid::DetailedTiming &t) { return modeRow(t) >= 0; }
+
+const Edid::DetailedTiming *knownModes(size_t &count) {
+	count = kModeCount;
+	return kModeTimings;
+}
+
+uint32_t modeDetSegments(const Edid::DetailedTiming &to) {
+	const int row = modeRow(to);
+	for (size_t i = 0; i < kModeRegCount; i++)
+		if (kModeRegs[i].seg == kConfig.detSeg && kModeRegs[i].dword == kConfig.detCtrl[kConfig.pipe])
+			return kModeValues[row < 0 ? 0 : row][i] & 0x1f;
+	return kConfig.detSegments;   // the same in every mode
+}
+
+size_t modeSteps(const Edid::DetailedTiming &to, ModeSet::Step *out, size_t cap, ModeRegs which) {
+	const int row = modeRow(to);
+	if (row < 0 && which == ModeRegs::All)
+		return 0;
+	size_t n = 0;
+	for (size_t i = 0; i < kModeRegCount && n < cap; i++) {
+		const ModeReg &r = kModeRegs[i];
+		// Row 0 is the mode the pipe was lit in.
+		if (which == ModeRegs::All || r.who == 'D' || (r.who == 'S' && row >= 0))
+			out[n++] = ModeSet::Step { ModeSet::Op::Update, r.seg, false, r.dword, r.mask,
+			                           kModeValues[row < 0 ? 0 : row][i], 0, r.name };
+	}
+	return n;
+}
 
 bool build(const Target &t, Plan &out, const char **why) {
 	const char *dummy;

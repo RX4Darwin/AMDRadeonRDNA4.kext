@@ -51,6 +51,14 @@ struct DetailedTiming {
 	}
 };
 
+// The same raster and sync polarities.
+inline bool sameTiming(const DetailedTiming &a, const DetailedTiming &b) {
+	return a.pixelClockKHz == b.pixelClockKHz && a.hActive == b.hActive && a.hBlank == b.hBlank &&
+	       a.hSyncOffset == b.hSyncOffset && a.hSyncWidth == b.hSyncWidth && a.vActive == b.vActive &&
+	       a.vBlank == b.vBlank && a.vSyncOffset == b.vSyncOffset && a.vSyncWidth == b.vSyncWidth &&
+	       a.hSyncPositive == b.hSyncPositive && a.vSyncPositive == b.vSyncPositive && a.interlaced == b.interlaced;
+}
+
 // Parse one 18-byte descriptor. Returns false if it is not a detailed timing
 // (pixel clock 0 marks display/monitor descriptors) or is malformed.
 bool parseDetailedTiming(const uint8_t d[18], DetailedTiming &out);

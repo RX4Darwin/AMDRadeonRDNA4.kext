@@ -143,16 +143,29 @@ rectangle, unblank. Then the AVI infoframe is sent again for the new timing (VIC
 checksum; `testPipe2` holds the words against what Linux sends for five modes). Display sleep and wake follow the
 running mode's pixel clock and infoframe.
 
-Two limits, both from what is not reprogrammed:
+What else changes with the mode comes from Linux too (written 2026-10-05 after the first card run, host-tested, not
+yet run on the card). `tools/pipegen/run.sh` runs the generator once for each timing in `tools/pipegen/modes.txt`,
+with the plane on the lit mode's surface, and `mkinc.py` keeps the registers Linux leaves different from mode to
+mode: 34 of them for the 15 modes of the test rig's Lenovo. They are the HUBP's request timing from DML (DLG, TTU,
+`REF_FREQ_TO_PIX_FREQ`), the DET size (2 to 7 segments), `VSTARTUP`, `VUPDATE`, `VREADY` and the timing itself. The
+engine adds them inside its update lock (`Pipe2::modeSteps`, `ModeSet::Target::extra`). `testPipe2` switches to each
+mode, from the lit state and from the mode before it, and requires every one of the 34 registers to end as Linux
+has it; that also holds the engine's own timing arithmetic against Linux for 15 modes.
+
+That is what lets the pipe run its 120 and 144 Hz modes (285 and 333 MHz), which the lit mode's request timing does
+not carry. Limits:
 
 - The surface stays, so no mode is larger than the plan's 1920x1080.
-- The HUBP's request timing (DLG, TTU, the values DML computed for 1920x1080@60) stays, so the pixel clock stays
-  within 25 % of the plan's 148.5 MHz. That is the margin the boot display switches with on the firmware's values.
-  For the Lenovo it leaves 13 modes from 640x480 to 1920x1080 at 50 and 60 Hz, and leaves out its 120 and 144 Hz
-  modes (285 and 333 MHz): those need the request timing from DML for each mode, which the generator can produce.
+- The link stays unscrambled: nothing above 340 MHz.
+- A timing that is not in `modes.txt` keeps the lit mode's request timing, and is only offered within 25 % of the
+  lit mode's pixel clock (the margin the boot display switches with on the firmware's values).
+- A mode is only offered if the DET buffer has its segments next to what the other pipes hold.
+- The shared display clocks and watermarks are still the firmware's (section 4): 4K60 next to 1080p144 is more
+  than they were set up for, and an underflow there would show in the flags the log line prints.
 
-Log lines: `head2: mode id N ...` (the table), `pipe2: switching to id N ...`, then
-`pipe2: now 1600x900 at 108000 kHz, OTG1 measured 60.000 Hz; HUBP1_DCHUBP_CNTL=...`.
+Log lines: `head2: mode id N ...` (the table), `pipe2: switching to id N ..., request timing from Linux for this
+mode`, then `pipe2: now 1920x1080 at 333070 kHz, OTG1 measured 143.999 Hz; HUBP1_DCHUBP_CNTL=...
+ODM1_OPTC_INPUT_GLOBAL_CONTROL=... DET 7`.
 
 ### Display sleep
 

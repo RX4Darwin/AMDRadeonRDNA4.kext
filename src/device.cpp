@@ -2494,18 +2494,39 @@ void RDNA4Device::setSecondPipePower(bool on) {
 	pipe2On = on;   // also after a plan that stopped: the next request runs the other one
 }
 
-// The modes the second pipe can be switched to. They scan the surface it was
-// lit on, so none is larger than the plan's; and the HUBP's request timing
-// (DLG, TTU) stays as DML made it for the plan's mode, so the pixel clock
-// stays within 25 % of that one, the margin the boot display's switching runs
-// with (buildModeTable).
+// The modes the second pipe can be switched to scan the surface it was lit
+// on, so none is larger than the plan's; and the sleep and wake parts of the
+// table are for an unscrambled link.
 Modes::Limits RDNA4Device::secondPipeModeLimits() const {
 	const Edid::DetailedTiming &plan = Pipe2::config().timing;
 	Modes::Limits lim {};
 	lim.maxHActive = plan.hActive;
 	lim.maxVActive = plan.vActive;
-	lim.maxPixelClockKHz = plan.pixelClockKHz * 5 / 4;
+	lim.maxPixelClockKHz = ModeSet::kScrambleFromKHz;
 	return lim;
+}
+
+bool RDNA4Device::secondPipeModeOk(const Edid::DetailedTiming &t, const char **why) {
+	const Pipe2::Config &c = Pipe2::config();
+	const char *dummy;
+	const char *&err = why ? *why : dummy;
+	// Without Linux's request timing for the mode the pipe keeps the lit
+	// mode's, which carries a pixel clock up to a quarter above its own: the
+	// margin the boot display's switching runs with (buildModeTable).
+	if (!Pipe2::modeKnown(t) && t.pixelClockKHz > c.timing.pixelClockKHz * 5 / 4) {
+		err = "no request timing for a pixel clock this far above the lit mode's";
+		return false;
+	}
+	// The DET segments the mode needs, next to what the other pipes hold.
+	uint32_t segments = Pipe2::modeDetSegments(t);
+	for (uint32_t i = 0; i < 4; i++)
+		if (i != c.pipe)
+			segments += regReadDmu(c.detSeg, c.detCtrl[i]) & 0x1f;
+	if (segments > Pipe2::kDetSegmentsTotal) {
+		err = "the DET buffer is too small for it next to the other pipes";
+		return false;
+	}
+	return true;
 }
 
 IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
@@ -2513,10 +2534,21 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 		return kIOReturnUnsupported;
 	const Pipe2::Config &c = Pipe2::config();
 	const uint32_t otgOffset = c.pipe * Pipe::Reg::kOtgStride;
-	auto *plan = static_cast<ModeSet::Plan *>(IOMalloc(sizeof(ModeSet::Plan)));
-	if (!plan)
+	const char *why = "";
+	if (!secondPipeModeOk(m.t, &why)) {
+		FBLOG("pipe2: switch to id %u refused: %s", m.id, why);
+		return kIOReturnUnsupported;
+	}
+	struct Work {
+		ModeSet::Plan plan;
+		ModeSet::Step extra[Pipe2::kMaxModeSteps];
+	};
+	auto *work = static_cast<Work *>(IOMalloc(sizeof(Work)));
+	if (!work)
 		return kIOReturnNoMemory;
+	ModeSet::Plan *plan = &work->plan;
 	ModeSet::Target t {};
+	t.extra = work->extra;
 	t.otg = t.opp = t.hubp = c.pipe;
 	t.dig = c.dig;
 	t.link = c.link;
@@ -2527,10 +2559,10 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 	t.ddcLine = pipe2Target.ddcLine;
 	// From the timing the pipe runs to `to`, then the infoframe for it.
 	bool touched = false;   // a refused plan changes nothing; one that stops half-way does
-	const char *why = "";
 	auto retime = [&](const Edid::DetailedTiming &to) {
 		t.from = pipe2Target.now;
 		t.to = to;
+		t.nextra = Pipe2::modeSteps(to, work->extra, Pipe2::kMaxModeSteps);
 		if (!ModeSet::build(t, *plan, &why))
 			return false;
 		why = "a step failed";
@@ -2541,8 +2573,9 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 		return runSecondPipePart(Pipe2::Part::Avi);
 	};
 	const Edid::DetailedTiming was = pipe2Target.now;
-	FBLOG("pipe2: switching to id %u %ux%u@%u.%03u (%u kHz)", m.id, m.t.hActive, m.t.vActive,
-	      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, m.t.pixelClockKHz);
+	FBLOG("pipe2: switching to id %u %ux%u@%u.%03u (%u kHz), request timing %s", m.id, m.t.hActive, m.t.vActive,
+	      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, m.t.pixelClockKHz,
+	      Pipe2::modeKnown(m.t) ? "from Linux for this mode" : "of the lit mode");
 	const bool ok = retime(m.t);
 	if (!ok) {
 		FBLOG("pipe2: switch to id %u failed: %s", m.id, why);
@@ -2551,9 +2584,11 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 	}
 	const uint64_t periodNs = measureFramePeriodNs(otgOffset);
 	const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
-	FBLOG("pipe2: now %ux%u at %u kHz, OTG%u measured %u.%03u Hz; HUBP%u_DCHUBP_CNTL=0x%08x", pipe2Target.now.hActive,
-	      pipe2Target.now.vActive, pipe2Target.now.pixelClockKHz, c.pipe, mHz / 1000, mHz % 1000, c.pipe,
-	      regReadDmu(2, 0x05f4 + c.pipe * Pipe::Reg::kHubpStride));
-	IOFree(plan, sizeof(ModeSet::Plan));
+	FBLOG("pipe2: now %ux%u at %u kHz, OTG%u measured %u.%03u Hz; HUBP%u_DCHUBP_CNTL=0x%08x "
+	      "ODM%u_OPTC_INPUT_GLOBAL_CONTROL=0x%08x DET %u", pipe2Target.now.hActive, pipe2Target.now.vActive,
+	      pipe2Target.now.pixelClockKHz, c.pipe, mHz / 1000, mHz % 1000, c.pipe,
+	      regReadDmu(2, 0x05f4 + c.pipe * Pipe::Reg::kHubpStride), c.pipe,
+	      regReadDmu(2, 0x1aca + c.pipe * Pipe::Reg::kOdmStride), regReadDmu(c.detSeg, c.detCtrl[c.pipe]) & 0x1f);
+	IOFree(work, sizeof(Work));
 	return ok ? kIOReturnSuccess : kIOReturnIOError;
 }

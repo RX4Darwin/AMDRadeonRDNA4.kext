@@ -83,7 +83,7 @@ struct Step {
 	const char *what;         // for the log
 };
 
-constexpr size_t kMaxSteps = 96;
+constexpr size_t kMaxSteps = 128;
 constexpr size_t kMaxCmds  = 4;
 
 struct Plan {
@@ -112,6 +112,10 @@ struct Target {
 	uint32_t dpMaxKHz;        // the pixel clock the link was trained for
 	DpDto    dto;
 	uint32_t vidM;
+	// More steps for the OTG update lock, after the plan's own: what else
+	// has to change with the timing on this pipe (Pipe2::modeSteps).
+	const Step *extra;
+	size_t      nextra;
 };
 
 // The DP pixel-rate DTO for a new pixel clock, from the one running now. The

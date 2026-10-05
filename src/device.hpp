@@ -93,10 +93,15 @@ public:
 	// signal and sleeps; the timing generator and the plane keep running.
 	void setSecondPipePower(bool on);
 	// A mode switch on that pipe: the mode-set engine (modeset.hpp) pointed at
-	// its blocks, then the AVI infoframe for the new timing. The surface and
-	// its pitch stay; modes are held to secondPipeModeLimits().
+	// its blocks, with what else changes with the mode (Pipe2::modeSteps),
+	// then the AVI infoframe for the new timing. The surface and its pitch
+	// stay; modes are held to secondPipeModeLimits() and secondPipeModeOk().
 	IOReturn applySecondPipeMode(const Modes::Mode &m);
 	Modes::Limits secondPipeModeLimits() const;
+	// Whether the pipe can be switched to `t` (Pipe2::modeSteps): Linux's
+	// values for it are in the table or it is near the lit mode's pixel
+	// clock, and the DET buffer has the segments it needs.
+	bool secondPipeModeOk(const Edid::DetailedTiming &t, const char **why = nullptr);
 	Pipe2::Target pipe2Target {};          // .now: the timing the pipe runs
 	uint16_t pipe2ConnectorObjId { 0 };
 	bool pipe2Lit { false }, pipe2On { false };
