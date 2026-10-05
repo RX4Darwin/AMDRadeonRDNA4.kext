@@ -134,14 +134,17 @@ python3 "$here/mkgolden.py" "$B/dp-trace.txt" "$(git -C "$L" rev-parse HEAD)" > 
 cp -f "$B/dp_retime_linux.inc" "$repo/tools/dp_retime_linux.inc"
 echo "wrote tools/dp_retime_linux.inc"
 
-# The reference for the host test of DisplayPort link training (src/dptrain.cpp): Linux lighting a DisplayPort
-# stream on pipe 1 through DIG0 and link 0, four lanes at HBR2, against simulated sinks ("kind:swing:pre",
-# see pipegen.c) that ask for different lane drive. The last one never equalises: Linux's four attempts.
+# The reference for the host test of DisplayPort link training (src/dptrain.cpp, src/dpphy.cpp): Linux lighting
+# a DisplayPort stream on pipe 1, four lanes at HBR2, against simulated sinks ("kind:swing:pre", see pipegen.c)
+# that ask for different lane drive, through DIG0 on link 0 (HPD1); a:1:3 never equalises: Linux's four
+# attempts. The last run is through DIG1 on link 1 (HPD2), for the link encoder's register addresses.
 runs=""
-for sink in a:0:0 a:1:0 a:2:1 a:0:2 a:3:0 a:1:3 b:0:0 b:1:1 c:0:0 c:2:0; do
-	IFS=: read -r kind swing pre <<< "$sink"
-	"$B/pipegen" dplink "$kind" "$swing" "$pre"  1 0 0 1  2560 48 32 80  1440 3 5 33  241500 1 0 0 > "$B/train-$kind-$swing-$pre.txt"
-	runs="$runs $sink:$B/train-$kind-$swing-$pre.txt"
+for sink in a:0:0 a:1:0 a:2:1 a:0:2 a:3:0 a:1:3 b:0:0 b:1:1 c:0:0 c:2:0 a:1:0:1; do
+	IFS=: read -r kind swing pre link <<< "$sink"
+	link=${link:-0}
+	"$B/pipegen" dplink "$kind" "$swing" "$pre"  1 "$link" "$link" $((link + 1))  2560 48 32 80  1440 3 5 33  241500 1 0 0 \
+		> "$B/train-$kind-$swing-$pre-$link.txt"
+	runs="$runs $kind:$swing:$pre:$B/train-$kind-$swing-$pre-$link.txt"
 done
 # shellcheck disable=SC2086
 python3 "$here/mktrain.py" "$(git -C "$L" rev-parse HEAD)" $runs > "$B/dp_train_linux.inc"

@@ -7,8 +7,28 @@
 // { kind, a, b, data }: X transmitter on (lanes, symbol clock kHz), O transmitter off, P training pattern on
 // the link (0 video, else the DPCD pattern number), V a lane's drive (lane, swing | pre-emphasis << 3),
 // W R a DPCD write / read (address, length, bytes), D delay (microseconds).
+// kTrainRegs_*: the registers of the link encoder (the run's link) written on the way,
+// { segment, dword, mask, value }.
 
-static const TrainEvent kTrain_a_0_0[] = {
+static const TrainReg kTrainRegs_a_0_0_link0[] = {
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000003 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2129, 0x1103ffff, 0x10002000 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x2134, 0x0003ff00, 0x0001ff00 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x211e, 0x00000010, 0x00000010 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+};
+static const TrainEvent kTrain_a_0_0_link0[] = {
 	{ 'X', 0x4, 540000, { 0 } },
 	{ 'W', 0x600, 1, { 0x01 } },
 	{ 'R', 0xe, 1, { 0x00 } },
@@ -39,7 +59,25 @@ static const TrainEvent kTrain_a_0_0[] = {
 	{ 'D', 0x1388, 0, { 0 } },
 	{ 'R', 0x200, 6, { 0x00, 0x00, 0x77, 0x77, 0x01, 0x00 } },
 };
-static const TrainEvent kTrain_a_1_0[] = {
+static const TrainReg kTrainRegs_a_1_0_link0[] = {
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000003 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2129, 0x1103ffff, 0x10002000 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x2134, 0x0003ff00, 0x0001ff00 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x211e, 0x00000010, 0x00000010 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+};
+static const TrainEvent kTrain_a_1_0_link0[] = {
 	{ 'X', 0x4, 540000, { 0 } },
 	{ 'W', 0x600, 1, { 0x01 } },
 	{ 'R', 0xe, 1, { 0x00 } },
@@ -77,7 +115,25 @@ static const TrainEvent kTrain_a_1_0[] = {
 	{ 'D', 0x1388, 0, { 0 } },
 	{ 'R', 0x200, 6, { 0x00, 0x00, 0x77, 0x77, 0x01, 0x00 } },
 };
-static const TrainEvent kTrain_a_2_1[] = {
+static const TrainReg kTrainRegs_a_2_1_link0[] = {
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000003 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2129, 0x1103ffff, 0x10002000 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x2134, 0x0003ff00, 0x0001ff00 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x211e, 0x00000010, 0x00000010 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+};
+static const TrainEvent kTrain_a_2_1_link0[] = {
 	{ 'X', 0x4, 540000, { 0 } },
 	{ 'W', 0x600, 1, { 0x01 } },
 	{ 'R', 0xe, 1, { 0x00 } },
@@ -122,7 +178,25 @@ static const TrainEvent kTrain_a_2_1[] = {
 	{ 'D', 0x1388, 0, { 0 } },
 	{ 'R', 0x200, 6, { 0x00, 0x00, 0x77, 0x77, 0x01, 0x00 } },
 };
-static const TrainEvent kTrain_a_0_2[] = {
+static const TrainReg kTrainRegs_a_0_2_link0[] = {
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000003 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2129, 0x1103ffff, 0x10002000 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x2134, 0x0003ff00, 0x0001ff00 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x211e, 0x00000010, 0x00000010 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+};
+static const TrainEvent kTrain_a_0_2_link0[] = {
 	{ 'X', 0x4, 540000, { 0 } },
 	{ 'W', 0x600, 1, { 0x01 } },
 	{ 'R', 0xe, 1, { 0x00 } },
@@ -160,7 +234,25 @@ static const TrainEvent kTrain_a_0_2[] = {
 	{ 'D', 0x1388, 0, { 0 } },
 	{ 'R', 0x200, 6, { 0x00, 0x00, 0x77, 0x77, 0x01, 0x00 } },
 };
-static const TrainEvent kTrain_a_3_0[] = {
+static const TrainReg kTrainRegs_a_3_0_link0[] = {
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000003 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2129, 0x1103ffff, 0x10002000 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x2134, 0x0003ff00, 0x0001ff00 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x211e, 0x00000010, 0x00000010 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+};
+static const TrainEvent kTrain_a_3_0_link0[] = {
 	{ 'X', 0x4, 540000, { 0 } },
 	{ 'W', 0x600, 1, { 0x01 } },
 	{ 'R', 0xe, 1, { 0x00 } },
@@ -198,7 +290,58 @@ static const TrainEvent kTrain_a_3_0[] = {
 	{ 'D', 0x1388, 0, { 0 } },
 	{ 'R', 0x200, 6, { 0x00, 0x00, 0x77, 0x77, 0x01, 0x00 } },
 };
-static const TrainEvent kTrain_a_1_3[] = {
+static const TrainReg kTrainRegs_a_1_3_link0[] = {
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000003 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // link_encoder_disable
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // link_encoder_disable
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000003 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // link_encoder_disable
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // link_encoder_disable
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000003 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // link_encoder_disable
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // link_encoder_disable
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000003 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+};
+static const TrainEvent kTrain_a_1_3_link0[] = {
 	{ 'X', 0x4, 540000, { 0 } },
 	{ 'W', 0x600, 1, { 0x01 } },
 	{ 'R', 0xe, 1, { 0x00 } },
@@ -481,7 +624,25 @@ static const TrainEvent kTrain_a_1_3[] = {
 	{ 'R', 0x202, 6, { 0x11, 0x11, 0x00, 0x00, 0xdd, 0xdd } },
 	{ 'W', 0x102, 1, { 0x00 } },
 };
-static const TrainEvent kTrain_b_0_0[] = {
+static const TrainReg kTrainRegs_b_0_0_link0[] = {
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000002 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2129, 0x1103ffff, 0x10002000 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x2134, 0x0003ff00, 0x0001ff00 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x211e, 0x00000010, 0x00000010 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+};
+static const TrainEvent kTrain_b_0_0_link0[] = {
 	{ 'X', 0x4, 540000, { 0 } },
 	{ 'W', 0x600, 1, { 0x01 } },
 	{ 'R', 0xe, 1, { 0x01 } },
@@ -512,7 +673,25 @@ static const TrainEvent kTrain_b_0_0[] = {
 	{ 'D', 0x1388, 0, { 0 } },
 	{ 'R', 0x200, 6, { 0x00, 0x00, 0x77, 0x77, 0x01, 0x00 } },
 };
-static const TrainEvent kTrain_b_1_1[] = {
+static const TrainReg kTrainRegs_b_1_1_link0[] = {
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000002 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2129, 0x1103ffff, 0x10002000 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x2134, 0x0003ff00, 0x0001ff00 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x211e, 0x00000010, 0x00000010 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+};
+static const TrainEvent kTrain_b_1_1_link0[] = {
 	{ 'X', 0x4, 540000, { 0 } },
 	{ 'W', 0x600, 1, { 0x01 } },
 	{ 'R', 0xe, 1, { 0x01 } },
@@ -557,7 +736,25 @@ static const TrainEvent kTrain_b_1_1[] = {
 	{ 'D', 0x1388, 0, { 0 } },
 	{ 'R', 0x200, 6, { 0x00, 0x00, 0x77, 0x77, 0x01, 0x00 } },
 };
-static const TrainEvent kTrain_c_0_0[] = {
+static const TrainReg kTrainRegs_c_0_0_link0[] = {
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000001 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2129, 0x1103ffff, 0x10002000 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x2134, 0x0003ff00, 0x0001ff00 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x211e, 0x00000010, 0x00000010 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+};
+static const TrainEvent kTrain_c_0_0_link0[] = {
 	{ 'X', 0x4, 540000, { 0 } },
 	{ 'W', 0x600, 1, { 0x01 } },
 	{ 'R', 0xe, 1, { 0x00 } },
@@ -588,7 +785,25 @@ static const TrainEvent kTrain_c_0_0[] = {
 	{ 'D', 0x1388, 0, { 0 } },
 	{ 'R', 0x200, 6, { 0x00, 0x00, 0x77, 0x77, 0x01, 0x00 } },
 };
-static const TrainEvent kTrain_c_2_0[] = {
+static const TrainReg kTrainRegs_c_2_0_link0[] = {
+	{ 2, 0x2121, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2134, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x212e, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x212e, 0xffffffff, 0x00000001 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x211e, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x2125, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x2129, 0x1103ffff, 0x10002000 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x2134, 0x0003ff00, 0x0001ff00 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x211e, 0x00000010, 0x00000010 },   // set_link_training_complete
+	{ 2, 0x212d, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2133, 0x00000001, 0x00000000 },   // disable_prbs_mode
+};
+static const TrainEvent kTrain_c_2_0_link0[] = {
 	{ 'X', 0x4, 540000, { 0 } },
 	{ 'W', 0x600, 1, { 0x01 } },
 	{ 'R', 0xe, 1, { 0x00 } },
@@ -626,16 +841,73 @@ static const TrainEvent kTrain_c_2_0[] = {
 	{ 'D', 0x1388, 0, { 0 } },
 	{ 'R', 0x200, 6, { 0x00, 0x00, 0x77, 0x77, 0x01, 0x00 } },
 };
+static const TrainReg kTrainRegs_a_1_0_link1[] = {
+	{ 2, 0x2245, 0xffffffff, 0x00000003 },   // enc1_configure_encoder
+	{ 2, 0x2258, 0x00000010, 0x00000010 },   // enc1_configure_encoder
+	{ 2, 0x2252, 0xffffffff, 0x00000000 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x2242, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x2251, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2257, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x2252, 0xffffffff, 0x00000003 },   // dcn10_link_encoder_set_dp_phy_pattern_training_pattern
+	{ 2, 0x2242, 0x00000010, 0x00000000 },   // set_link_training_complete
+	{ 2, 0x2251, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2257, 0x00000001, 0x00000000 },   // disable_prbs_mode
+	{ 2, 0x2249, 0xffffffff, 0x00000000 },   // setup_panel_mode
+	{ 2, 0x224d, 0x1103ffff, 0x10002000 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x2258, 0x0003ff00, 0x0001ff00 },   // set_dp_phy_pattern_passthrough_mode
+	{ 2, 0x2242, 0x00000010, 0x00000010 },   // set_link_training_complete
+	{ 2, 0x2251, 0x00010000, 0x00000000 },   // enable_phy_bypass_mode
+	{ 2, 0x2257, 0x00000001, 0x00000000 },   // disable_prbs_mode
+};
+static const TrainEvent kTrain_a_1_0_link1[] = {
+	{ 'X', 0x4, 540000, { 0 } },
+	{ 'W', 0x600, 1, { 0x01 } },
+	{ 'R', 0xe, 1, { 0x00 } },
+	{ 'R', 0xe, 1, { 0x00 } },
+	{ 'W', 0x102, 1, { 0x00 } },
+	{ 'W', 0x108, 1, { 0x01 } },
+	{ 'W', 0x107, 1, { 0x10 } },
+	{ 'W', 0x101, 1, { 0x84 } },
+	{ 'W', 0x100, 1, { 0x14 } },
+	{ 'P', 0x1, 0, { 0 } },
+	{ 'V', 0x0, 0, { 0 } },
+	{ 'V', 0x1, 0, { 0 } },
+	{ 'V', 0x2, 0, { 0 } },
+	{ 'V', 0x3, 0, { 0 } },
+	{ 'W', 0x102, 5, { 0x21, 0x00, 0x00, 0x00, 0x00 } },
+	{ 'D', 0x64, 0, { 0 } },
+	{ 'R', 0x202, 6, { 0x00, 0x00, 0x00, 0x00, 0x11, 0x11 } },
+	{ 'V', 0x0, 1, { 0 } },
+	{ 'V', 0x1, 1, { 0 } },
+	{ 'V', 0x2, 1, { 0 } },
+	{ 'V', 0x3, 1, { 0 } },
+	{ 'W', 0x103, 4, { 0x01, 0x01, 0x01, 0x01 } },
+	{ 'D', 0x64, 0, { 0 } },
+	{ 'R', 0x202, 6, { 0x11, 0x11, 0x00, 0x00, 0x11, 0x11 } },
+	{ 'P', 0x7, 0, { 0 } },
+	{ 'V', 0x0, 1, { 0 } },
+	{ 'V', 0x1, 1, { 0 } },
+	{ 'V', 0x2, 1, { 0 } },
+	{ 'V', 0x3, 1, { 0 } },
+	{ 'W', 0x102, 5, { 0x07, 0x01, 0x01, 0x01, 0x01 } },
+	{ 'D', 0x190, 0, { 0 } },
+	{ 'R', 0x202, 6, { 0x77, 0x77, 0x01, 0x00, 0x11, 0x11 } },
+	{ 'W', 0x102, 1, { 0x00 } },
+	{ 'P', 0x0, 0, { 0 } },
+	{ 'D', 0x1388, 0, { 0 } },
+	{ 'R', 0x200, 6, { 0x00, 0x00, 0x77, 0x77, 0x01, 0x00 } },
+};
 
 static const TrainRun kTrainRuns[] = {
-	{ 'a', 0, 0, kTrain_a_0_0, 29 },
-	{ 'a', 1, 0, kTrain_a_1_0, 36 },
-	{ 'a', 2, 1, kTrain_a_2_1, 43 },
-	{ 'a', 0, 2, kTrain_a_0_2, 36 },
-	{ 'a', 3, 0, kTrain_a_3_0, 36 },
-	{ 'a', 1, 3, kTrain_a_1_3, 281 },
-	{ 'b', 0, 0, kTrain_b_0_0, 29 },
-	{ 'b', 1, 1, kTrain_b_1_1, 43 },
-	{ 'c', 0, 0, kTrain_c_0_0, 29 },
-	{ 'c', 2, 0, kTrain_c_2_0, 36 },
+	{ 'a', 0, 0, 0, kTrain_a_0_0_link0, 29, kTrainRegs_a_0_0_link0, 16 },
+	{ 'a', 1, 0, 0, kTrain_a_1_0_link0, 36, kTrainRegs_a_1_0_link0, 16 },
+	{ 'a', 2, 1, 0, kTrain_a_2_1_link0, 43, kTrainRegs_a_2_1_link0, 16 },
+	{ 'a', 0, 2, 0, kTrain_a_0_2_link0, 36, kTrainRegs_a_0_2_link0, 16 },
+	{ 'a', 3, 0, 0, kTrain_a_3_0_link0, 36, kTrainRegs_a_3_0_link0, 16 },
+	{ 'a', 1, 3, 0, kTrain_a_1_3_link0, 281, kTrainRegs_a_1_3_link0, 49 },
+	{ 'b', 0, 0, 0, kTrain_b_0_0_link0, 29, kTrainRegs_b_0_0_link0, 16 },
+	{ 'b', 1, 1, 0, kTrain_b_1_1_link0, 43, kTrainRegs_b_1_1_link0, 16 },
+	{ 'c', 0, 0, 0, kTrain_c_0_0_link0, 29, kTrainRegs_c_0_0_link0, 16 },
+	{ 'c', 2, 0, 0, kTrain_c_2_0_link0, 36, kTrainRegs_c_2_0_link0, 16 },
+	{ 'a', 1, 0, 1, kTrain_a_1_0_link1, 36, kTrainRegs_a_1_0_link1, 16 },
 };
