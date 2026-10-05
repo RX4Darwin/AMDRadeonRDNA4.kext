@@ -57,6 +57,14 @@ if dp:
     SHARED['DCCG_GATE_DISABLE_CNTL5'] = 1 << pipe              # DTBCLK_Pn_GATE_DISABLE
     SHARED['DCCG_GATE_DISABLE_CNTL3'] = 0x3 << (8 + 2 * pipe) | 0x3 << (20 + 2 * pipe)   # SYMCLK32_SEn, _LEn gates
 SOURCE_OUI = bytes([0x00, 0x00, 0x1a])
+# Two things in a DisplayPort trace are not the same on every link or in every mode, and the plan works them
+# out when it runs (src/pipe2.cpp): the first DP_VID_M, 0x8000 x pixel clock / the link's symbol clock, before
+# the hardware measures it ('m'), and the four MSA words of the timing ('M'), which wake sends again.
+symclk = next((int(re.search(r':symclk=(\d+):', p[1]).group(1)) for p in lines
+               if p[0] == 'MARK' and p[1].startswith('dmub:transmitter_control:action=1:')), 0)
+def first_vid_m(pixel_khz):
+    return 0x8000 * pixel_khz // symclk
+MSA = [f'DP{dig}_DP_MSA_TIMING_PARAM{i}' for i in range(1, 5)]
 # Link training: from the lane count going to the encoder to the look at the link status afterwards. The plan
 # has one entry for it; src/dptrain.cpp does it when the plan runs. These are the functions Linux writes
 # registers in on the way (src/dpphy.cpp has them).
@@ -158,6 +166,14 @@ for p in lines[1:]:
     seg, dword, mask, value, arg = int(p[1]), int(p[2], 0), int(p[3], 16), int(p[4], 16), int(p[5])
     name, allowed = classify(seg, dword)
     what = f'{func} {name}'
+    if dp and name == f'DP{dig}_DP_VID_M':
+        assert k == 'U' and value == first_vid_m(khz), f'{what}: {value:#x} is not the first Mvid of this link'
+        emit('m', seg, dword, mask, 0, 0, what)
+        continue
+    if dp and name in MSA:
+        assert k == 'W'
+        emit('M', seg, dword, mask, value, MSA.index(name), what)
+        continue
     if func == 'vpg3_update_generic_info_packet':
         if k == 'WAIT':             # Linux sends it twice while enabling a stream: the last one is repeated
             avi_from = len(out)
@@ -212,6 +228,7 @@ kinds = collections.Counter(o[0] for o in out)
 assert kinds['H'] == 1 and kinds['L'] == 1 and kinds['K'] == 3, kinds
 if dp:      # lit and woken by training the link, put to sleep by the transmitter going off; no VBIOS-style setup
     assert kinds['t'] == 2 and kinds['O'] == 1 and not any(kinds[k] for k in 'PXEAS6'), kinds
+    assert kinds['m'] == 2 and kinds['M'] >= 8 and kinds['M'] % 4 == 0, kinds
 else:
     assert kinds['P'] == 2 and kinds['X'] == 2 and kinds['E'] == 4 and kinds['A'] == 20 and kinds['6'] == 1, kinds
 
@@ -267,12 +284,18 @@ ENGINE = [f'OTG{pipe}_OTG_{r}' for r in ('H_TOTAL', 'H_SYNC_A', 'H_SYNC_A_CNTL',
                                          'V_SYNC_A', 'V_SYNC_A_CNTL', 'V_BLANK_START_END')]
 ENGINE += [f'DPG{pipe}_DPG_DIMENSIONS', f'HUBP{pipe}_DCSURF_PRI_VIEWPORT_DIMENSION', f'DSCL{pipe}_RECOUT_SIZE',
            f'DSCL{pipe}_MPC_SIZE']
+if dp:      # the engine's DisplayPort half: the pixel-rate DTO (as the clock it makes: see the host test) and the MSA
+    ENGINE += [f'DP_DTO{pipe}_PHASE', f'DP_DTO{pipe}_MODULO'] + MSA
 BY_RULE = [f'VTG{pipe}_CONTROL', f'OTG{pipe}_OTG_VSTARTUP_PARAM', f'OTG{pipe}_OTG_VUPDATE_PARAM']
 
 modes = [lit_state(t) for t in mode_traces]
 assert modes and modes[0][0][:15] == cfg[1:16], 'the first mode trace must be the lit mode'
 assert all(set(m[1]) == set(modes[0][1]) for m in modes), 'a mode writes a register another does not'
 keys = [k for k in modes[0][1] if any(m[1][k] != modes[0][1][k] for m in modes)]
+if dp:      # the first Mvid follows the link as well as the mode: not in the table, and the rule holds in every mode
+    vid_m = addr(f'DP{dig}_DP_VID_M')
+    assert all(m[1][vid_m][1] == first_vid_m(int(m[0][12])) for m in modes), 'DP_VID_M is not the first Mvid in a mode'
+    keys.remove(vid_m)
 print(f'''
 // What Linux leaves different from mode to mode in this pipe's registers, the plane showing the top-left of the
 // {ha}x{va} surface (tools/pipegen/modes.txt): one row of values per mode, in the order of kModeRegs. Row 0 is

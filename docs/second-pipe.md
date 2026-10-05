@@ -135,8 +135,8 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
   host-tested like the first and not yet run on the card. The plan is picked by the connector the second display
   answers on (`Pipe2::use`). Another board, or another mode to start in, needs `tools/pipegen/run.sh` run with other
   arguments. Once lit the pipe can change mode (below), and stays with its connector.
-- A second DisplayPort display stays at 1920x1080@60: no mode switching on it yet (below). An HDMI mode above
-  340 MHz needs the table regenerated for it (the generator then turns the scrambler on by itself).
+- An HDMI mode above 340 MHz needs the table regenerated for it (the generator then turns the scrambler on by
+  itself).
 - The boot display must not be on the plan's blocks: with the Lenovo alone, the firmware puts it on DIG2 and link 2.
 - System sleep is not handled (it stays vetoed for the whole driver).
 
@@ -229,29 +229,45 @@ never sets it again: the firmware does, on the encoder command (section 7). The 
 The DisplayPort tables come from the same generator run with a DisplayPort stream and its `dplink` sink, so Linux
 trains a link on the way and the trace has the stream side around it: the DP DTO for the pixel clock (148.5 MHz
 against the 720 MHz reference), the DP stream encoder, the MSA and the DP pixel-rate dividers instead of the HDMI
-PLL command and infoframes. Three kinds of step exist only there:
+PLL command and infoframes. Five kinds of step exist only there:
 
 - `a`: a DPCD write the sink is sent outside training (the source OUI and device ID, and D3 on the way to sleep),
   carried in the table's `kAux`. As in amdgpu, a sink that does not take one does not stop the plan.
 - `t`: where Linux trained the link. The table does not carry Linux's training against a simulated sink: the kext
-  runs `DpTrain::bringUp` (`src/dptrain.cpp`) there against the real one. The table is the same for any lane count
-  and rate (checked for 4 lanes HBR3, 2 lanes HBR2 and 1 lane RBR), so they are chosen on the card.
+  runs `DpTrain::bringUp` (`src/dptrain.cpp`) there against the real one, at the lane count and rate chosen on the
+  card. The lane count Linux writes to the encoder is part of training.
 - `O`: the DMUB transmitter disable of sleep.
+- `m`: the first `DP_VID_M`, which Linux writes before the hardware measures it: 0x8000 x pixel clock / the link's
+  symbol clock. It is the one register outside training that follows the link's rate (the generator's own run is at
+  HBR2), so the plan works it out for the rate it trains at; `testPipe2` holds it against what Linux writes at RBR,
+  HBR, HBR2 and HBR3.
+- `M`: a word of the MSA. Wake sends the MSA again, and after a mode switch it has to be the running mode's, so the
+  plan works it out from the timing (`ModeSet::dpMsa`, the arithmetic the boot display's retime uses).
 
-Before lighting, the kext reads the sink's receiver capability over the connector's AUX channel and picks the
-smallest link that carries the mode at 8 bpc, in amdgpu's order (`DpTrain::pickLink`, the lowest rate first and at
-each rate the fewest lanes): for 1920x1080@60 that is 4 lanes at RBR on a four-lane monitor, 2 lanes at HBR on a
-two-lane one. Sleep is D3 and the transmitter off;
-wake reads the capability again (after a replug it may be another monitor) and trains again.
+The sink's receiver capability is read over the connector's AUX channel where its EDID is read. Before each
+training the kext picks the smallest link that carries the mode the pipe runs at 8 bpc, in amdgpu's order
+(`DpTrain::pickLink`, the lowest rate first and at each rate the fewest lanes): for 1920x1080@60 that is 4 lanes
+at RBR on a four-lane monitor, 2 lanes at HBR on a two-lane one. Sleep is D3 and the transmitter off; wake trains
+again.
 
-Log lines: `pipe2: DisplayPort sink on AUX0: DPCD 1.4, up to 4 lane(s) at rate 0x1e, TPS3, TPS4; 4 lane(s) at
-rate 0x06 for 148500 kHz`, then inside the plan `pipe2: link 0, 4 lane(s) at rate 0x06: trained after 1
-attempt(s): swing 0, pre-emphasis 0, lanes 77 77, aligned 1`. A plan that stops at the training step says
-`pipe2: step N (...): the link did not train`.
+Mode switching (`rdna4-modeset=1`) is the boot display's DisplayPort retime pointed at this pipe: the stream is
+blanked, the timing generator, the pixel-rate DTO, the MSA and the first Mvid are set for the new mode, and the
+link stays up. `testPipe2` runs it for all 15 modes of the table, directly and one after the other, and every
+register that changes with the mode ends as Linux leaves it when it lights the pipe in that mode. One difference
+is allowed there: Linux programs the video rates a hair under their nominal clock (25.175 MHz is one) as an exact
+1000/1001 of that clock, the engine programs the timing's own clock, within 10 ppm. A mode that needs more than
+the link carries (1920x1080@144 on a link trained for 60 Hz) first takes the link down and brings it up larger,
+with the sleep and wake parts, and then retimes; if the larger link does not train, the old one is brought back
+and the switch is refused. A link that is large enough is left alone, so going down keeps it until the next sleep.
+The modes offered are those the monitor's largest link carries, within the limits above.
 
-Not there: mode switching (the head offers the lit mode alone; another pixel clock may need another link), a
-fallback to a lower rate or fewer lanes when training fails four times, and the short HPD pulse a DisplayPort
-monitor sends when it loses the link while lit.
+Log lines: `pipe2: DisplayPort sink on AUX0: DPCD 1.4, up to 4 lane(s) at rate 0x1e, TPS3, TPS4`,
+`pipe2: 4 lane(s) at rate 0x06 for 148500 kHz`, then inside the plan `pipe2: link 0, 4 lane(s) at rate 0x06:
+trained after 1 attempt(s): swing 0, pre-emphasis 0, lanes 77 77, aligned 1`. A plan that stops at the training
+step says `pipe2: step N (...): the link did not train`.
+
+Not there: a fallback to another rate or lane count when training fails four times, and the short HPD pulse a
+DisplayPort monitor sends when it loses the link while lit.
 
 ## 7. Card boots (Big Sur 11.6.6, Samsung 4K on DisplayPort, Lenovo on HDMI)
 

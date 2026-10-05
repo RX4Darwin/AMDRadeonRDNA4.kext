@@ -86,9 +86,11 @@ struct Target {
 	uint8_t  ddcLine;          // the connector's DDC line, for the SCDC write
 	Part     part;             // only Light needs litHubp and surface
 	uint8_t  connectorObjId;   // DisplayPort: the VBIOS connector object, for the transmitter disable
+	uint8_t  linkRate;         // DisplayPort: the rate the link is trained at (DpTrain::kRbr ..), for the first Mvid
 	// The timing the pipe runs, once a mode switch (ModeSet) took it off the
 	// plan's; pixelClockKHz 0 = the plan's. Sleep, Wake and Avi follow it: the
-	// pixel clock in the DMUB commands and the infoframe's VIC and bars.
+	// pixel clock in the DMUB commands, the infoframe's VIC and bars, and for
+	// DisplayPort the MSA and the first Mvid.
 	Edid::DetailedTiming now;
 };
 
