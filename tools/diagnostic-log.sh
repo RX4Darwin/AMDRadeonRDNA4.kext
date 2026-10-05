@@ -216,6 +216,7 @@ registry_value() {
 	sw_vers
 	sysctl -n machdep.cpu.brand_string
 	date
+	uptime    # kernel log timestamps count from boot: how long after the last RDNA4FB line this ran
 
 	section "active RDNA4FB boot-args"
 	found=""
