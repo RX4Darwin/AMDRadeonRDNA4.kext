@@ -60,6 +60,7 @@ public:
 	// (rdna4-head2, plugin.cpp): base block plus one extension. 0 length = none.
 	uint8_t edid2Data[256] {};
 	size_t  edid2Len { 0 };
+	uint8_t edid2Hpd { 0 };   // the HPD pin of the connector it is on
 
 	// Display mode table (modes.hpp). By default it holds only the boot mode;
 	// with boot-arg "rdna4-modeset=1" it also carries the sink's EDID modes.
@@ -88,10 +89,12 @@ public:
 	// Read-only: the colour-path registers of the pipe the plan lit next to
 	// the firmware's pipe, where they differ ("pipe2: colour:" lines).
 	void comparePipeColour(const Pipe2::Plan &plan);
-	// Hot-plug of the second pipe's connector (plugin.cpp polls): whether its
-	// HPD pin is high, and the EDID of what is on it, read again into edid2Data.
-	bool secondSinkPresent();
-	bool readSecondEdid();
+	// Hot-plug (plugin.cpp polls). secondSinkHpd: the HPD pin of the lit second
+	// pipe's connector if it is high; before the pipe is lit, of the first
+	// connector a plan exists for that is high and not the boot display's; else
+	// 0. readSecondEdid: the EDID of what is on that connector, into edid2Data.
+	uint8_t secondSinkHpd();
+	bool readSecondEdid(uint8_t hpd);
 	// Display sleep and wake of the pipe lightSecondPipe lit, as amdgpu does
 	// DPMS off and on for an HDMI stream (Pipe2::Part): the sink loses the
 	// signal and sleeps; the timing generator and the plane keep running.

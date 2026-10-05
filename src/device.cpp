@@ -713,9 +713,11 @@ void RDNA4Device::probeEDID() {
 		snprintf(key, sizeof(key), "EDID,%s%u-Vendor", bus, inst);
 		owner->setProperty(key, mfg);
 
-		// Cache the first sink's EDID for hasDDCConnect()/getDDCBlock(). Only
-		// the boot display is scanned out, and that is AUX0/DP0 on this board.
-		if (edidLen == 0) {
+		// Cache the boot display's EDID for hasDDCConnect()/getDDCBlock(): the
+		// sink on the lit pipe's connector, or the first that answers if the
+		// pipe is not known. Another sink is the second display's.
+		const bool boot = pipe.valid() && pipe.hpd ? rec.hasHpd && rec.hpdPin == pipe.hpd : edidLen == 0;
+		if (boot && edidLen == 0) {
 			memcpy(edidData, edid, 128);
 			edidLen = 128;
 			if (viaAux) {   // DPCD power writes only exist on AUX sinks
@@ -732,9 +734,10 @@ void RDNA4Device::probeEDID() {
 				FBLOG("edid: connector %zu (%s%u): read extension block "
 				      "(tag 0x%02x)", i, bus, inst, edidData[128]);
 			}
-		} else if (edid2Len == 0) {
+		} else if (!boot && edid2Len == 0) {
 			memcpy(edid2Data, edid, 128);
 			edid2Len = 128;
+			edid2Hpd = rec.hasHpd ? rec.hpdPin : 0;
 			// The extension says whether the sink has SCDC (Edid::hdmi2Caps).
 			if (edid[126] > 0 && (viaAux ? readEDID(inst, edid2Data + 128, 128, 128)
 			                             : readEDIDI2C(inst, edid2Data + 128, 128, 128)))
@@ -743,6 +746,17 @@ void RDNA4Device::probeEDID() {
 	}
 	if (!any)
 		FBLOG("edid: no sink EDID read on any connector");
+	// The lit pipe's connector gave nothing but another did: the pipe's HPD
+	// pin was read wrong, or its sink does not answer. As before the pipe was
+	// consulted, the sink that answered is taken for the boot display.
+	if (edidLen == 0 && edid2Len != 0) {
+		FBLOG("edid: no EDID on the lit pipe's connector (HPD%u): taking the sink on HPD%u for the boot display",
+		      pipe.hpd, edid2Hpd);
+		memcpy(edidData, edid2Data, sizeof(edidData));
+		edidLen = edid2Len;
+		edid2Len = 0;
+		edid2Hpd = 0;
+	}
 }
 
 namespace {
@@ -2354,11 +2368,16 @@ void RDNA4Device::surveySteps(const ModeSet::Step *steps, size_t count, const Dm
 }
 
 bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhys) {
-	const Pipe2::Config &c = Pipe2::config();
 	if (!pipe.valid() || !rmmio || !ipDiscovery.isValid()) {
 		FBLOG("pipe2: not lit: no lit pipe to stand next to");
 		return false;
 	}
+	// The plan for the connector the second display is on.
+	if (!Pipe2::use(edid2Hpd)) {
+		FBLOG("pipe2: not lit: the second display is on HPD%u, a connector there is no plan for", edid2Hpd);
+		return false;
+	}
+	const Pipe2::Config &c = Pipe2::config();
 	if (pipe.otg == c.pipe || pipe.opp == c.pipe || pipe.hubp == c.pipe || pipe.dig == c.dig ||
 	    pipe.link == c.link) {
 		FBLOG("pipe2: not lit: the firmware's pipe (OTG%u OPP%u HUBP%u DIG%u link %u) uses a block of the "
@@ -2496,23 +2515,34 @@ void RDNA4Device::comparePipeColour(const Pipe2::Plan &plan) {
 	      compared, c.pipe, pipe.hubp, pipe.opp, differ);
 }
 
-bool RDNA4Device::secondSinkPresent() {
+uint8_t RDNA4Device::secondSinkHpd() {
 	// DC_GPIO_HPD_Y: one byte per pin, HPD1 lowest (probeEDID).
 	const uint32_t hpdY = regReadDmu(2, 0x28f7);
-	return hpdY != 0xFFFFFFFF && ((hpdY >> (8 * (Pipe2::config().hpd - 1))) & 1);
+	if (hpdY == 0xFFFFFFFF)
+		return 0;
+	auto high = [&](uint8_t hpd) { return hpd && ((hpdY >> (8 * (hpd - 1))) & 1); };
+	if (pipe2Lit)   // the pipe stays with the connector it was lit for
+		return high(Pipe2::config().hpd) ? Pipe2::config().hpd : 0;
+	for (size_t i = 0; i < Pipe2::configCount(); i++) {
+		const uint8_t hpd = Pipe2::configAt(i).hpd;
+		if (hpd != pipe.hpd && high(hpd))
+			return hpd;
+	}
+	return 0;
 }
 
-bool RDNA4Device::readSecondEdid() {
+bool RDNA4Device::readSecondEdid(uint8_t hpd) {
 	AtomBios::DisplayPath path {};
 	uint8_t ddcLine = 0;
 	uint8_t edid[256] {};
 	static const uint8_t sig[8] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
-	if (!pathForHpd(Pipe2::config().hpd, path, &ddcLine) || !readEDIDI2C(ddcLine, edid, 128, 0) ||
+	if (!pathForHpd(hpd, path, &ddcLine) || !readEDIDI2C(ddcLine, edid, 128, 0) ||
 	    memcmp(edid, sig, sizeof(sig)) != 0)
 		return false;
 	// The extension says whether the sink has SCDC and carries more modes.
 	const bool ext = edid[126] > 0 && readEDIDI2C(ddcLine, edid + 128, 128, 128);
 	edid2Len = ext ? 256 : 128;
+	edid2Hpd = hpd;
 	memcpy(edid2Data, edid, sizeof(edid));
 	pipe2Target.sinkScdc = Edid::hdmi2Caps(edid2Data, edid2Len).scdc;   // it may be another monitor
 	return true;

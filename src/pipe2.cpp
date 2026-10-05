@@ -40,17 +40,45 @@ struct ModeReg {
 	const char *name;
 };
 
+// One generated table per connector a second display can be on (the HDMI
+// connectors of this project's card; tools/pipegen/run.sh).
+namespace Hpd3 {
 #include "pipe2_linux.inc"
+}
+namespace Hpd4 {
+#include "pipe2_linux_hpd4.inc"
+}
 
-constexpr size_t kModeRegCount = sizeof(kModeRegs) / sizeof(kModeRegs[0]);
-constexpr size_t kModeCount = sizeof(kModeTimings) / sizeof(kModeTimings[0]);
-static_assert(kModeRegCount <= kMaxModeSteps && kModeCount == sizeof(kModeValues) / sizeof(kModeValues[0]),
-              "the mode table");
+struct Table {
+	const Config               &config;
+	const Gen                  *gen;        // the plan
+	size_t                      ngen;
+	const ModeReg              *regs;       // what changes with the mode ...
+	size_t                      nregs;
+	const Edid::DetailedTiming *timings;    // ... for these modes, the plan's first ...
+	size_t                      nmodes;
+	const uint32_t             *values;     // ... one row of nregs values per mode
+};
+
+template <size_t G, size_t R, size_t M>
+constexpr Table table(const Config &config, const Gen (&gen)[G], const ModeReg (&regs)[R],
+                      const Edid::DetailedTiming (&timings)[M], const uint32_t (&values)[M][R]) {
+	static_assert(R <= kMaxModeSteps, "the mode table");
+	return { config, gen, G, regs, R, timings, M, &values[0][0] };
+}
+
+constexpr Table kTables[] = {
+	table(Hpd3::kConfig, Hpd3::kGen, Hpd3::kModeRegs, Hpd3::kModeTimings, Hpd3::kModeValues),
+	table(Hpd4::kConfig, Hpd4::kGen, Hpd4::kModeRegs, Hpd4::kModeTimings, Hpd4::kModeValues),
+};
+constexpr size_t kTableCount = sizeof(kTables) / sizeof(kTables[0]);
+
+const Table *cur = &kTables[0];   // the table in use (use())
 
 // Row of a timing in the mode table, or -1.
 int modeRow(const Edid::DetailedTiming &t) {
-	for (size_t i = 0; i < kModeCount; i++)
-		if (Edid::sameTiming(kModeTimings[i], t))
+	for (size_t i = 0; i < cur->nmodes; i++)
+		if (Edid::sameTiming(cur->timings[i], t))
 			return static_cast<int>(i);
 	return -1;
 }
@@ -73,21 +101,33 @@ uint32_t aviWord(const Edid::DetailedTiming &t, uint32_t word) {
 
 } // namespace
 
-const Config &config() { return kConfig; }
+const Config &config() { return cur->config; }
+size_t configCount() { return kTableCount; }
+const Config &configAt(size_t i) { return kTables[i].config; }
+
+bool use(uint8_t hpd) {
+	for (const Table &t : kTables)
+		if (t.config.hpd == hpd) {
+			cur = &t;
+			return true;
+		}
+	return false;
+}
 
 bool modeKnown(const Edid::DetailedTiming &t) { return modeRow(t) >= 0; }
 
 const Edid::DetailedTiming *knownModes(size_t &count) {
-	count = kModeCount;
-	return kModeTimings;
+	count = cur->nmodes;
+	return cur->timings;
 }
 
 uint32_t modeDetSegments(const Edid::DetailedTiming &to) {
+	const Config &c = cur->config;
 	const int row = modeRow(to);
-	for (size_t i = 0; i < kModeRegCount; i++)
-		if (kModeRegs[i].seg == kConfig.detSeg && kModeRegs[i].dword == kConfig.detCtrl[kConfig.pipe])
-			return kModeValues[row < 0 ? 0 : row][i] & 0x1f;
-	return kConfig.detSegments;   // the same in every mode
+	for (size_t i = 0; i < cur->nregs; i++)
+		if (cur->regs[i].seg == c.detSeg && cur->regs[i].dword == c.detCtrl[c.pipe])
+			return cur->values[(row < 0 ? 0 : row) * cur->nregs + i] & 0x1f;
+	return c.detSegments;   // the same in every mode
 }
 
 size_t modeSteps(const Edid::DetailedTiming &to, ModeSet::Step *out, size_t cap, ModeRegs which) {
@@ -95,12 +135,12 @@ size_t modeSteps(const Edid::DetailedTiming &to, ModeSet::Step *out, size_t cap,
 	if (row < 0 && which == ModeRegs::All)
 		return 0;
 	size_t n = 0;
-	for (size_t i = 0; i < kModeRegCount && n < cap; i++) {
-		const ModeReg &r = kModeRegs[i];
+	for (size_t i = 0; i < cur->nregs && n < cap; i++) {
+		const ModeReg &r = cur->regs[i];
 		// Row 0 is the mode the pipe was lit in.
 		if (which == ModeRegs::All || r.who == 'D' || (r.who == 'S' && row >= 0))
 			out[n++] = ModeSet::Step { ModeSet::Op::Update, r.seg, false, r.dword, r.mask,
-			                           kModeValues[row < 0 ? 0 : row][i], 0, r.name };
+			                           cur->values[(row < 0 ? 0 : row) * cur->nregs + i], 0, r.name };
 	}
 	return n;
 }
@@ -108,7 +148,7 @@ size_t modeSteps(const Edid::DetailedTiming &to, ModeSet::Step *out, size_t cap,
 bool build(const Target &t, Plan &out, const char **why) {
 	const char *dummy;
 	const char *&err = why ? *why : dummy;
-	const Config &c = kConfig;
+	const Config &c = cur->config;
 	out.count = 0;
 	out.ncmds = 0;
 
@@ -145,7 +185,8 @@ bool build(const Target &t, Plan &out, const char **why) {
 	};
 
 	Part part = Part::Light;   // of the entry: the requirements at the top belong to lighting
-	for (const Gen &g : kGen) {
+	for (size_t i = 0; i < cur->ngen; i++) {
+		const Gen &g = cur->gen[i];
 		if (g.kind >= '4' && g.kind <= '6')
 			part = static_cast<Part>(g.kind - '3');
 		if (part != t.part)
