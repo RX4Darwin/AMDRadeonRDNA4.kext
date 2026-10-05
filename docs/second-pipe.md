@@ -143,8 +143,7 @@ rectangle, unblank. Then the AVI infoframe is sent again for the new timing (VIC
 checksum; `testPipe2` holds the words against what Linux sends for five modes). Display sleep and wake follow the
 running mode's pixel clock and infoframe.
 
-What else changes with the mode comes from Linux too (written 2026-10-05 after the first card run, host-tested, not
-yet run on the card). `tools/pipegen/run.sh` runs the generator once for each timing in `tools/pipegen/modes.txt`,
+What else changes with the mode comes from Linux too (verified on the card 2026-10-05, section 7). `tools/pipegen/run.sh` runs the generator once for each timing in `tools/pipegen/modes.txt`,
 with the plane on the lit mode's surface, and `mkinc.py` keeps the registers Linux leaves different from mode to
 mode: 34 of them for the 15 modes of the test rig's Lenovo. They are the HUBP's request timing from DML (DLG, TTU,
 `REF_FREQ_TO_PIX_FREQ`), the DET size (2 to 7 segments), `VSTARTUP`, `VUPDATE`, `VREADY` and the timing itself. The
@@ -246,4 +245,18 @@ caught in that mode's longer vertical blank.
 
 Reading the log: kernel lines from other senders (ALF, Sandbox) can lack a newline, and an RDNA4FB line glued to one
 carries that line's older timestamp.
+
+**120 and 144 Hz, 2026-10-05 16:01 (`rdna4-head2=4 rdna4-modeset=1`): work.** The second head offered 15 modes.
+Every switch logged `request timing from Linux for this mode`: 1920x1080 at 50 Hz (measured 50.002, DET 4), 60, 120
+(119.971, DET 6), 144 (144.012, DET 7), then 1280x720 (DET 2), 1600x900 (DET 3) and back to 1920x1080@60 (DET 4).
+No underflow flag in `HUBP1_DCHUBP_CNTL` or `ODM1_OPTC_INPUT_GLOBAL_CONTROL` after any of them. The Lenovo showed a
+correct, stable picture at 120 and 144 Hz and the Samsung was undisturbed, so the firmware's shared clocks and
+watermarks carry 4K60 next to 1080p144, and the DET buffer can be resized on the running pipe inside the blanked
+switch. One optional wait timed out once, `step 47 (dpg latched) timed out, continuing`, on the switch from 144 Hz
+to 1280x720; everything after it ran and the picture was normal.
+
+Display sleep and wake at 144 Hz ran later in the same boot (16:07): `pipe2: now 1920x1080 at 333070 kHz, OTG1
+measured 144.001 Hz`, then `power: pipe2 display off: 39 steps ran` and, 0.9 s later, `power: pipe2 display on: 128
+steps ran; DIG2_DIG_FE_EN_CNTL=0x00000001 SYMCLKC_CLOCK_ENABLE=0x00000211`, with macOS still at 144 Hz afterwards.
+The sleep and wake parts carried the running mode's pixel clock (333.07 MHz) and infoframe.
 

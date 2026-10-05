@@ -492,12 +492,14 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       at 1280x720, picture confirmed): the mode-set engine pointed at the
       second pipe, for modes up to the lit one's size and within 25 % of
       its pixel clock.
-- [ ] High refresh rates on the second display (1920x1080 at 120 and
-      144 Hz next to the 4K boot display): each switch also programs
-      what Linux's DML computes for the mode (request timing, DET size,
-      global sync), generated per mode by `tools/pipegen`
-      (`tools/pipegen/modes.txt`). Written and host-tested, not yet run
-      on the card.
+- [x] High refresh rates on the second display (verified on hardware
+      2026-10-05, Big Sur 11.6.6: 1920x1080 at 120 and 144 Hz next to
+      the 4K boot display, picture confirmed, measured 119.971 and
+      144.012 Hz): each switch also programs what Linux's DML computes
+      for the mode (request timing, DET size, global sync), generated
+      per mode by `tools/pipegen` (`tools/pipegen/modes.txt`). Display
+      sleep and wake ran at 144 Hz too (the log; the picture after the
+      wake is not yet confirmed).
 - [ ] Second display beyond that configuration: other connectors, a
       second DisplayPort display (needs link training), hot-plug.
 - [x] DP mode switching on the trained link (verified on hardware
