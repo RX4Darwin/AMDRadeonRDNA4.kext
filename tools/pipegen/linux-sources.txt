@@ -104,3 +104,10 @@ dc/sspl/dc_spl_scl_easf_filters.c
 dc/sspl/dc_spl_scl_filters.c
 dc/sspl/spl_custom_float.c
 dc/sspl/spl_fixpt31_32.c
+dc/link/link_factory.c
+dc/link/accessories/link_dp_trace.c
+dc/link/protocols/link_dp_capability.c
+dc/link/protocols/link_dp_phy.c
+dc/link/protocols/link_dp_training.c
+dc/link/protocols/link_dp_training_8b_10b.c
+dc/link/protocols/link_dpcd.c

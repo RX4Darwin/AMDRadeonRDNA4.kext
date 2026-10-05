@@ -5,3 +5,5 @@ dp_get_panel_mode
 should_use_dmub_inbox1_lock
 dm_helpers_is_hdr_on
 edp_set_panel_assr
+dp_set_panel_mode
+dm_helpers_dp_write_hblank_reduction
