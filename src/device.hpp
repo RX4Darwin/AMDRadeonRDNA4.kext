@@ -29,6 +29,7 @@
 #include "ndrv.hpp"
 #include "pipe.hpp"
 #include "pipe2.hpp"
+#include "dptrain.hpp"
 
 class IOMemoryMap;
 
@@ -114,6 +115,20 @@ public:
 	bool pipe2Lit { false }, pipe2On { false };
 	bool runSecondPipePart(Pipe2::Part part, size_t *steps = nullptr);
 
+	// DisplayPort link training on the boot display (rdna4-dptrain). The
+	// firmware trained the link; noteBootDpLink reads from the sink, while it
+	// is up, what it can do and what it was told, and retrainBootLink brings
+	// the same link up again after the display was unplugged or switched off:
+	// stream blanked, transmitter off, DpTrain::bringUp, stream on. The stream
+	// and its timing are not touched.
+	void noteBootDpLink();
+	DpTrain::Result retrainBootLink(const char *why);
+	bool bootSinkPresent();              // the boot display's HPD pin
+	DpTrain::Sink bootDpSink {};
+	DpTrain::Link bootDpLink {};
+	bool bootDpLinkKnown { false };
+	uint32_t dpTrainLevel { 0 };         // rdna4-dptrain: 1 retrain when the display comes back, 2 also once by itself
+
 	// Display power (DPMS). Off = disable the DP video stream and put the
 	// sink in D3 via DPCD SET_POWER, or on an HDMI pipe blank to black via
 	// the display pattern generator; on reverses it. "rdna4-nosleep=1"
@@ -187,6 +202,9 @@ private:
 	                   uint8_t *reply, uint8_t replyCap, uint8_t *replyBytes);
 	bool readEDID(uint8_t inst, uint8_t *edid, size_t count, uint8_t start);
 	bool readEDIDI2C(uint8_t line, uint8_t *edid, size_t count, uint8_t start);
+	// The sink's DPCD over native AUX, any length (16 bytes a transfer).
+	bool dpcdRead(uint8_t aux, uint32_t address, uint8_t *data, size_t len);
+	bool dpcdWrite(uint8_t aux, uint32_t address, const uint8_t *data, size_t len);
 	bool i2cTransfer(uint8_t line, uint8_t addr, const uint8_t *wr, size_t wlen, uint8_t *rd, size_t rlen);
 	void scdcConfigure(uint8_t line, uint8_t tmdsConfig);
 	void probeEDID();

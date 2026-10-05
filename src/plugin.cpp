@@ -672,25 +672,66 @@ void hotplugPoll(OSObject *, IOTimerEventSource *timer) {
 	timer->setTimeoutMS(kHpdPollMs);
 }
 
-// IOFramebuffer registers its connect interrupt handler when it opens. There
-// is no interrupt service behind an IOBootNDRV, so the registration fails as
-// before; the handler is kept for the poll above to call.
-IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSObject *, void *),
-                                      OSObject *target, void *ref, void **interruptRef) {
-	const IOReturn ret = FunctionCast(wrapRegisterForInterruptType, orgRegisterForInterruptType)(
-		fb, type, proc, target, ref, interruptRef);
+// --- the boot display on DisplayPort (rdna4-dptrain) --------------------------
+// A DisplayPort link does not survive its monitor being unplugged or switched
+// off: when the HPD pin comes back the link the firmware trained is trained
+// again (RDNA4Device::retrainBootLink). macOS is not told anything: the
+// framebuffer stayed online, and the stream kept running into a dead link.
+struct BootDp {
+	RDNA4Device        *dev { nullptr };
+	IOTimerEventSource *timer { nullptr };
+	bool                seen { false };   // the pin at the last poll
+	bool                gone { false };   // it was low for a second since the link was last good
+	uint32_t            same { 0 };       // polls it has read that way
+	uint32_t            polls { 0 };
+} bootDp;
+
+void bootDpPoll(OSObject *, IOTimerEventSource *timer) {
+	RDNA4Device &dev = *bootDp.dev;
+	const bool present = dev.bootSinkPresent();
+	if (present != bootDp.seen) {
+		FBLOG("dptrain: the boot display's HPD pin went %s", present ? "high" : "low");
+		bootDp.seen = present;
+		bootDp.same = 0;
+	} else {
+		bootDp.same++;
+	}
+	if (!present && bootDp.same == 2)
+		bootDp.gone = true;
+	if (present && bootDp.gone && bootDp.same == 2) {
+		bootDp.gone = false;
+		dev.retrainBootLink("the display is back");
+	}
+	// rdna4-dptrain=2: once, 15 s after the framebuffer opened, with the
+	// cable left alone, to try the training by itself.
+	if (dev.dpTrainLevel >= 2 && ++bootDp.polls == 15000 / kHpdPollMs)
+		dev.retrainBootLink("self-test");
+	timer->setTimeoutMS(kHpdPollMs);
+}
+
+void startBootDpPoll(IOService *fb, RDNA4Device &dev) {
+	IOWorkLoop *loop = fb->getWorkLoop();
+	bootDp.timer = loop ? IOTimerEventSource::timerEventSource(fb, bootDpPoll) : nullptr;
+	if (!bootDp.timer || loop->addEventSource(bootDp.timer) != kIOReturnSuccess) {
+		FBLOG("dptrain: no timer on the boot display's work loop: off");
+		OSSafeReleaseNULL(bootDp.timer);
+		return;
+	}
+	bootDp.dev = &dev;
+	bootDp.seen = dev.bootSinkPresent();
+	FBLOG("dptrain: watching the boot display's HPD pin (now %s)%s", bootDp.seen ? "high" : "low",
+	      dev.dpTrainLevel >= 2 ? "; self-test in 15 s" : "");
+	bootDp.timer->setTimeoutMS(kHpdPollMs);
+}
+
+void startHead2Hotplug(IOService *fb, void (*proc)(OSObject *, void *), OSObject *target, void *ref) {
 	Head2 *h = head2;
-	if (type != kIOFBConnectInterruptType || !isHead2(fb) || !h->ready || !h->dev || h->hpdTimer)
-		return ret;
-	if (head2Level < 2 || !h->dev->isAmd)
-		return ret;
-	auto *service = static_cast<IOService *>(fb);
-	IOWorkLoop *loop = service->getWorkLoop();
-	h->hpdTimer = loop ? IOTimerEventSource::timerEventSource(service, hotplugPoll) : nullptr;
+	IOWorkLoop *loop = fb->getWorkLoop();
+	h->hpdTimer = loop ? IOTimerEventSource::timerEventSource(fb, hotplugPoll) : nullptr;
 	if (!h->hpdTimer || loop->addEventSource(h->hpdTimer) != kIOReturnSuccess) {
 		FBLOG("hotplug: no timer on head 2's work loop: off");
 		OSSafeReleaseNULL(h->hpdTimer);
-		return ret;
+		return;
 	}
 	h->connectProc = proc;
 	h->connectTarget = target;
@@ -703,6 +744,28 @@ IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSOb
 	      hotplugLevel >= 2 ? "acting on it" : "logging only (rdna4-hotplug=2 acts)",
 	      h->connected ? "connected" : "offline");
 	h->hpdTimer->setTimeoutMS(kHpdPollMs);
+}
+
+// IOFramebuffer registers its connect interrupt handler when it opens: by
+// then it has its work loop, which is where the polls above run. There is no
+// interrupt service behind an IOBootNDRV, so the registration fails as
+// before; head 2's handler is kept for its poll to call.
+IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSObject *, void *),
+                                      OSObject *target, void *ref, void **interruptRef) {
+	const IOReturn ret = FunctionCast(wrapRegisterForInterruptType, orgRegisterForInterruptType)(
+		fb, type, proc, target, ref, interruptRef);
+	if (type != kIOFBConnectInterruptType)
+		return ret;
+	auto *service = static_cast<IOService *>(fb);
+	if (isHead2(fb)) {
+		Head2 *h = head2;
+		if (hotplugLevel && h->ready && h->dev && !h->hpdTimer && head2Level >= 2 && h->dev->isAmd)
+			startHead2Hotplug(service, proc, target, ref);
+		return ret;
+	}
+	FbEntry *e = fbEntry(fb);
+	if (e && e->ours && e->state && e->state->dev.bootDpLinkKnown && !bootDp.timer)
+		startBootDpPoll(service, e->state->dev);
 	return ret;
 }
 
@@ -947,21 +1010,6 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 			FBLOG("head2: not available: no IONDRVFramebuffer::start route (error %d)",
 			      patcher.getError());
 		patcher.clearError();
-		uint32_t hotplug = 0;
-		if (second >= 2 && PE_parse_boot_argn("rdna4-hotplug", &hotplug, sizeof(hotplug)) && hotplug) {
-			KernelPatcher::RouteRequest connect {
-				"__ZN17IONDRVFramebuffer24registerForInterruptTypeEjPFvP8OSObjectPvES1_S2_PS2_",
-				wrapRegisterForInterruptType, orgRegisterForInterruptType,
-			};
-			if (patcher.routeMultiple(index, &connect, 1, address, size)) {
-				hotplugLevel = hotplug;
-				FBLOG("hotplug: routed IONDRVFramebuffer::registerForInterruptType (rdna4-hotplug=%u)", hotplug);
-			} else {
-				FBLOG("hotplug: not available: no IONDRVFramebuffer::registerForInterruptType route (error %d)",
-				      patcher.getError());
-			}
-			patcher.clearError();
-		}
 		KernelPatcher::RouteRequest vram {
 			"__ZN17IONDRVFramebuffer12getVRAMRangeEv", wrapGetVRAMRange, orgGetVRAMRange,
 		};
@@ -970,6 +1018,26 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		else
 			FBLOG("head2: no IONDRVFramebuffer::getVRAMRange route (error %d): WindowServer "
 			      "will not map the second head", patcher.getError());
+		patcher.clearError();
+	}
+	// Both kinds of hot-plug start their HPD poll when IOFramebuffer opens.
+	uint32_t hotplug = 0, dptrain = 0;
+	if (second < 2 || !PE_parse_boot_argn("rdna4-hotplug", &hotplug, sizeof(hotplug)))
+		hotplug = 0;
+	PE_parse_boot_argn("rdna4-dptrain", &dptrain, sizeof(dptrain));
+	if (hotplug || dptrain) {
+		KernelPatcher::RouteRequest connect {
+			"__ZN17IONDRVFramebuffer24registerForInterruptTypeEjPFvP8OSObjectPvES1_S2_PS2_",
+			wrapRegisterForInterruptType, orgRegisterForInterruptType,
+		};
+		if (patcher.routeMultiple(index, &connect, 1, address, size)) {
+			hotplugLevel = hotplug;
+			FBLOG("hotplug: routed IONDRVFramebuffer::registerForInterruptType (rdna4-hotplug=%u, "
+			      "rdna4-dptrain=%u)", hotplug, dptrain);
+		} else {
+			FBLOG("hotplug: not available: no IONDRVFramebuffer::registerForInterruptType route (error %d)",
+			      patcher.getError());
+		}
 		patcher.clearError();
 	}
 	uint32_t vbl = 0, cursor = 0;

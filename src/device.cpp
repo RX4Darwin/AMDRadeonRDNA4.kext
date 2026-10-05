@@ -8,6 +8,7 @@
 //
 
 #include "device.hpp"
+#include "dpphy.hpp"
 #include "edid.hpp"
 #include "dmub.hpp"
 #include <IOKit/IOLib.h>
@@ -462,6 +463,7 @@ constexpr uint8_t kActI2CWriteMot = 0x40;
 constexpr uint8_t kActI2CReadMot  = 0x50;
 constexpr uint8_t kActI2CRead     = 0x10;
 constexpr uint8_t kActDpWrite     = 0x80;  // native AUX (DPCD) write
+constexpr uint8_t kActDpRead      = 0x90;  // native AUX (DPCD) read
 
 // AUX_REG_RW_CNTL_STATUS grant codes.
 constexpr uint32_t kSwCanAccess   = 1;
@@ -626,6 +628,42 @@ bool RDNA4Device::readEDID(uint8_t inst, uint8_t *edid, size_t count,
 		}
 		if (!got || rb == 0) return false;
 		pos += rb;  // advance by what the sink actually returned
+	}
+	return true;
+}
+
+// Native AUX: up to 16 bytes a transfer, a deferred one asked again.
+bool RDNA4Device::dpcdRead(uint8_t aux, uint32_t address, uint8_t *data, size_t len) {
+	for (size_t pos = 0; pos < len; ) {
+		const uint8_t chunk = len - pos > 16 ? 16 : static_cast<uint8_t>(len - pos);
+		uint8_t got = 0;
+		int rc = kReplyAuxDefer;
+		for (uint8_t t = 0; t < kAuxRetry && rc == kReplyAuxDefer; t++) {
+			rc = auxTransaction(aux, kActDpRead, address + static_cast<uint32_t>(pos), nullptr, chunk,
+			                    data + pos, chunk, &got);
+			if (rc == kReplyAuxDefer)
+				IODelay(500);
+		}
+		if (rc != kReplyAck || got == 0)
+			return false;
+		pos += got;   // a sink may answer with fewer bytes than asked
+	}
+	return true;
+}
+
+bool RDNA4Device::dpcdWrite(uint8_t aux, uint32_t address, const uint8_t *data, size_t len) {
+	for (size_t pos = 0; pos < len; ) {
+		const uint8_t chunk = len - pos > 16 ? 16 : static_cast<uint8_t>(len - pos);
+		int rc = kReplyAuxDefer;
+		for (uint8_t t = 0; t < kAuxRetry && rc == kReplyAuxDefer; t++) {
+			rc = auxTransaction(aux, kActDpWrite, address + static_cast<uint32_t>(pos), data + pos, chunk,
+			                    nullptr, 0, nullptr);
+			if (rc == kReplyAuxDefer)
+				IODelay(500);
+		}
+		if (rc != kReplyAck)
+			return false;
+		pos += chunk;
 	}
 	return true;
 }
@@ -1958,6 +1996,10 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 		}
 	}
 
+	// Needs the lit pipe (discoverPipe) and the sink's AUX channel (probeEDID).
+	if (PE_parse_boot_argn("rdna4-dptrain", &dpTrainLevel, sizeof(dpTrainLevel)) && dpTrainLevel)
+		noteBootDpLink();
+
 	// Needs the boot timing (discoverPipe) and the sink's EDID (probeEDID).
 	buildModeTable();
 	FBLOG("init: device ready (%ux%u console, %lu mode(s))", fbWidth, fbHeight,
@@ -2203,6 +2245,116 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 		}
 	}
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// DisplayPort link training on the boot display
+// ---------------------------------------------------------------------------
+
+bool RDNA4Device::bootSinkPresent() {
+	const uint32_t hpdY = regReadDmu(2, 0x28f7);   // DC_GPIO_HPD_Y: one byte per pin, HPD1 lowest
+	return hpdY != 0xFFFFFFFF && pipe.hpd >= 1 && pipe.hpd <= 4 && ((hpdY >> (8 * (pipe.hpd - 1))) & 1);
+}
+
+void RDNA4Device::noteBootDpLink() {
+	bootDpLinkKnown = false;
+	if (!pipe.valid() || pipe.signal != Pipe::Signal::DpSst || !sinkAuxValid) {
+		FBLOG("dptrain: the boot display is not on DisplayPort: nothing to retrain");
+		return;
+	}
+	// Receiver capability, then what the firmware told the sink: LINK_BW_SET,
+	// LANE_COUNT_SET, and from 0x202 on how the lanes are doing.
+	uint8_t caps[16] {}, set[2] {}, status[6] {};
+	if (!dpcdRead(sinkAuxInst, 0x000, caps, sizeof(caps)) || !dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) ||
+	    !dpcdRead(sinkAuxInst, 0x202, status, sizeof(status))) {
+		FBLOG("dptrain: the sink's DPCD did not answer on AUX%u", sinkAuxInst);
+		return;
+	}
+	const bool sink = DpTrain::parseCaps(caps, sizeof(caps), bootDpSink);
+	bootDpLink = DpTrain::Link { static_cast<uint8_t>(set[1] & 0x1f), set[0] };
+	FBLOG("dptrain: sink DPCD %u.%u, up to %u lane(s) at rate 0x%02x%s%s, reading interval 0x%02x; the firmware's "
+	      "link: %u lane(s) at rate 0x%02x (LANE_COUNT_SET 0x%02x); lanes %02x %02x, aligned %u", caps[0] >> 4,
+	      caps[0] & 0xf, bootDpSink.maxLanes, bootDpSink.maxRate, bootDpSink.tps3 ? ", TPS3" : "",
+	      bootDpSink.tps4 ? ", TPS4" : "", caps[0x0e], bootDpLink.lanes, bootDpLink.rate, set[1], status[0],
+	      status[1], status[2] & 1);
+	const bool lanes = bootDpLink.lanes == 1 || bootDpLink.lanes == 2 || bootDpLink.lanes == 4;
+	bootDpLinkKnown = sink && lanes && bootDpLink.lanes <= bootDpSink.maxLanes && bootDpLink.rate >= DpTrain::kRbr &&
+	                  bootDpLink.rate <= bootDpSink.maxRate;
+	if (!bootDpLinkKnown)
+		FBLOG("dptrain: that is not a link this sink says it has: it will not be retrained");
+}
+
+DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
+	AtomBios::DisplayPath path {};
+	if (!bootDpLinkKnown || !pathForHpd(pipe.hpd, path)) {
+		FBLOG("dptrain: %s: not retrained: the firmware's link is not known", why);
+		return DpTrain::Result::BadLink;
+	}
+	// What DpTrain asks of the hardware: the sink's DPCD over its AUX channel,
+	// and DpPhy's register steps and DMUB commands for this link.
+	struct Ctx {
+		RDNA4Device *dev;
+		uint8_t      conn;
+		bool steps(const ModeSet::Step *s, size_t n) { return dev->runSteps(s, n, nullptr, 0, "dptrain", dev->otgOff()); }
+		bool dmub(const Dmub::Cmd &cmd) { return dev->dmubSubmit(&cmd, 1, "dptrain"); }
+	} ctx { this, static_cast<uint8_t>(path.connectorObjId & 0xff) };
+	DpTrain::Io io {};
+	io.ctx = &ctx;
+	io.read = [](void *c, uint32_t address, uint8_t *data, size_t len) {
+		RDNA4Device *dev = static_cast<Ctx *>(c)->dev;
+		return dev->dpcdRead(dev->sinkAuxInst, address, data, len);
+	};
+	io.write = [](void *c, uint32_t address, const uint8_t *data, size_t len) {
+		RDNA4Device *dev = static_cast<Ctx *>(c)->dev;
+		return dev->dpcdWrite(dev->sinkAuxInst, address, data, len);
+	};
+	io.phyOn = [](void *c, const DpTrain::Link &l) {
+		auto *x = static_cast<Ctx *>(c);
+		ModeSet::Step s[DpPhy::kMaxSteps];
+		Dmub::Cmd cmd;
+		DpPhy::buildEnable(cmd, x->dev->pipe.link, x->dev->pipe.hpd, l);
+		return x->steps(s, DpPhy::configureSteps(x->dev->pipe.link, l.lanes, s)) && x->dmub(cmd);
+	};
+	io.phyOff = [](void *c) {
+		auto *x = static_cast<Ctx *>(c);
+		ModeSet::Step s[DpPhy::kMaxSteps];
+		Dmub::Cmd cmd;
+		DpPhy::buildDisable(cmd, x->dev->pipe.link, x->dev->pipe.hpd, x->conn);
+		return x->dmub(cmd) && x->steps(s, DpPhy::offSteps(x->dev->pipe.link, s));
+	};
+	io.pattern = [](void *c, DpTrain::Pattern p) {
+		auto *x = static_cast<Ctx *>(c);
+		ModeSet::Step s[DpPhy::kMaxSteps];
+		return x->steps(s, DpPhy::patternSteps(x->dev->pipe.link, p, s));
+	};
+	io.drive = [](void *c, uint8_t, uint8_t swing, uint8_t preEmphasis) {
+		auto *x = static_cast<Ctx *>(c);
+		Dmub::Cmd cmd;
+		DpPhy::buildDrive(cmd, x->dev->pipe.link, x->dev->pipe.hpd, x->conn, x->dev->bootDpLink, swing, preEmphasis);
+		return x->dmub(cmd);
+	};
+	io.delayUs = [](void *, uint32_t us) {
+		if (us >= 10000)
+			IOSleep(us / 1000);
+		else
+			IODelay(us);
+	};
+
+	// The stream stops feeding the link while it is down, as for display
+	// sleep, and the transmitter goes off before it is brought up again.
+	const uint32_t kDpVidStreamCntl = 0x2122 + digOff();
+	const uint32_t stream = regReadDmu(2, kDpVidStreamCntl);
+	FBLOG("dptrain: %s: retraining %u lane(s) at rate 0x%02x on link %u (AUX%u, HPD%u), stream 0x%08x", why,
+	      bootDpLink.lanes, bootDpLink.rate, pipe.link, sinkAuxInst, pipe.hpd, stream);
+	regWriteDmu(2, kDpVidStreamCntl, stream & ~1u);
+	DpTrain::Report rep {};
+	DpTrain::Result r = io.phyOff(&ctx) ? DpTrain::bringUp(io, bootDpSink, bootDpLink, &rep) : DpTrain::Result::Io;
+	if (r == DpTrain::Result::Ok)
+		regWriteDmu(2, kDpVidStreamCntl, stream);   // on again, unless display sleep had it off
+	FBLOG("dptrain: %s after %u attempt(s): swing %u, pre-emphasis %u, lanes %02x %02x, aligned %u; stream 0x%08x",
+	      DpTrain::resultName(r), rep.attempts, rep.swing, rep.preEmphasis, rep.status[0], rep.status[1],
+	      rep.status[2] & 1, regReadDmu(2, kDpVidStreamCntl));
+	return r;
 }
 
 bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {

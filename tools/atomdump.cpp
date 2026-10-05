@@ -24,6 +24,7 @@
 #include "../src/modeset.hpp"
 #include "../src/pipe2.hpp"
 #include "../src/dptrain.hpp"
+#include "../src/dpphy.hpp"
 #include "../src/amdfw.hpp"
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
@@ -1301,7 +1302,12 @@ static int testDpRetime() {
 // transfer with its bytes, every pattern, lane drive, delay and transmitter
 // command, in order.
 struct TrainEvent { char kind; uint32_t a, b; uint8_t data[6]; };
-struct TrainRun { char kind; uint8_t swing, pre; const TrainEvent *events; size_t count; };
+struct TrainReg { uint8_t seg; uint32_t dword, mask, value; };
+struct TrainRun {
+	char kind; uint8_t swing, pre, link;
+	const TrainEvent *events; size_t count;
+	const TrainReg *regs; size_t nregs;
+};
 #include "dp_train_linux.inc"
 
 // The sink of tools/pipegen/pipegen.c (sink_reset, sink_settle), four HBR3
@@ -1383,7 +1389,7 @@ struct TrainRig {
 static int testDpTrain() {
 	int failures = 0;
 	const DpTrain::Link hbr2x4 { 4, DpTrain::kHbr2 };
-	size_t events = 0;
+	size_t events = 0, regWrites = 0;
 	for (const TrainRun &run : kTrainRuns) {
 		TrainRig rig(run.kind, run.swing, run.pre);
 		DpTrain::Sink sink {};
@@ -1414,6 +1420,44 @@ static int testDpTrain() {
 			                  "dptrain: sink %u/%u: the lanes ended at swing %u, pre-emphasis %u", run.swing, run.pre,
 			                  rep.swing, rep.preEmphasis);
 		events += run.count;
+
+		// The link encoder registers behind the transmitter and pattern
+		// events (DpPhy), against the ones Linux wrote on the way.
+		std::vector<TrainReg> wrote;
+		for (const TrainEvent &e : rig.ev) {
+			ModeSet::Step steps[DpPhy::kMaxSteps];
+			const size_t ns = e.kind == 'X' ? DpPhy::configureSteps(run.link, static_cast<uint8_t>(e.a), steps)
+			                : e.kind == 'P' ? DpPhy::patternSteps(run.link, static_cast<DpTrain::Pattern>(e.a), steps)
+			                : e.kind == 'O' ? DpPhy::offSteps(run.link, steps) : 0;
+			for (size_t i = 0; i < ns; i++)
+				wrote.push_back({ steps[i].seg, steps[i].dword,
+				                 steps[i].op == ModeSet::Op::Write ? 0xffffffffu : steps[i].mask, steps[i].value });
+		}
+		size_t r0 = 0;
+		while (r0 < wrote.size() && r0 < run.nregs && wrote[r0].seg == run.regs[r0].seg &&
+		       wrote[r0].dword == run.regs[r0].dword && wrote[r0].mask == run.regs[r0].mask &&
+		       wrote[r0].value == run.regs[r0].value)
+			r0++;
+		failures += check(r0 == run.nregs && wrote.size() == run.nregs, "dpphy: sink %c %u/%u on link %u: register "
+		                  "write %zu of %zu (Linux has %zu) differs", run.kind, run.swing, run.pre, run.link, r0,
+		                  wrote.size(), run.nregs);
+		regWrites += run.nregs;
+	}
+
+	// The transmitter commands, as transmitter_control_v1_7 fills them: phy,
+	// action, mode (or the drive), lanes; the symbol clock in 10 kHz; the HPD
+	// pin and, where amdgpu gives it, the connector.
+	{
+		Dmub::Cmd on, drive, off;
+		DpPhy::buildEnable(on, 1, 2, hbr2x4);
+		DpPhy::buildDrive(drive, 1, 2, 0x13, hbr2x4, 2, 1);
+		DpPhy::buildDisable(off, 1, 2, 0x13);
+		failures += check(on[0] == 0x3c000180 && on[1] == 0x04000101 && on[2] == 54000 && on[3] == 0x00000002,
+		                  "dpphy: transmitter enable %08x %08x %08x %08x", on[0], on[1], on[2], on[3]);
+		failures += check(drive[0] == 0x3c000180 && drive[1] == 0x040a0b01 && drive[2] == 54000 && drive[3] == 0x00130002,
+		                  "dpphy: lane drive %08x %08x %08x %08x", drive[0], drive[1], drive[2], drive[3]);
+		failures += check(off[0] == 0x3c000180 && off[1] == 0x00000001 && off[2] == 0 && off[3] == 0x00130002,
+		                  "dpphy: transmitter disable %08x %08x %08x %08x", off[0], off[1], off[2], off[3]);
 	}
 
 	// What Linux's runs do not cover. A sink that never recovers the clock:
@@ -1480,8 +1524,8 @@ static int testDpTrain() {
 		                  !DpTrain::pickLink(sink, 1066500, 30, l), "dptrain: smallest and too-large links");
 	}
 
-	printf("\ndptrain: %zu sinks, %zu events as Linux has them %s\n", sizeof(kTrainRuns) / sizeof(kTrainRuns[0]),
-	       events, failures ? "MISMATCH" : "ok");
+	printf("\ndptrain: %zu runs, %zu events and %zu register writes as Linux has them %s\n",
+	       sizeof(kTrainRuns) / sizeof(kTrainRuns[0]), events, regWrites, failures ? "MISMATCH" : "ok");
 	return failures;
 }
 
