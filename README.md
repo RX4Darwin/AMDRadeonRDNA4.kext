@@ -178,7 +178,8 @@ monitor really sleeps, and wakes it with a mode set to the running timing
 | `tools/atomdump.cpp` | Host test harness: parsers against the real ROM and captured EDID fixtures, pipe discovery, DMUB payloads, the NDRV translator (`make test`). |
 | `tools/vm-opencore.sh`, `tools/vm-ocplist.py` | Build a development OpenCore disk for an OSX-KVM VM with RDNA4FB injected after Lilu. |
 | `tools/logs-ssh.sh` | Pull the RDNA4FB kernel log and registry properties from a macOS machine over SSH. |
-| `tools/pipegen/` | Runs Linux's own DCN 4.01 display code on the host against a recorder: generates `src/pipe2_linux*.inc` and the DisplayPort reference `tools/dp_retime_linux.inc` (`run.sh <linux tree>`). |
+| `src/dptrain.{hpp,cpp}` | DisplayPort link training (clock recovery, channel equalisation, retries), as amdgpu does it; everything the hardware and the monitor do comes through callbacks. Host-tested against `tools/dp_train_linux.inc`; not yet used by the kext. |
+| `tools/pipegen/` | Runs Linux's own DCN 4.01 display code on the host against a recorder: generates `src/pipe2_linux*.inc` and the DisplayPort references `tools/dp_retime_linux.inc` (a mode switch) and `tools/dp_train_linux.inc` (link training against simulated monitors) (`run.sh <linux tree>`). |
 | `tools/linux-capture.sh` | Ground-truth capture of amdgpu's display programming on Linux, for the mode-set engine. |
 | `Info.plist` | Lilu plugin personality (`IOResources`), OSBundleLibraries (Lilu, IOPCIFamily, KPIs). |
 | `Makefile` | Cross-compiles x86_64 on any host, assembles the `.kext`. |
@@ -517,8 +518,13 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       link 3): a second generated table, picked by the connector the
       display answers on. Written and host-tested, not yet run on the
       card.
-- [ ] Second display beyond that: a second DisplayPort display (needs
-      link training).
+- [ ] DisplayPort link training, for a second DisplayPort display and
+      for a boot display that was unplugged. First part done on the
+      host: `src/dptrain.cpp` trains a link through callbacks and
+      `make test` holds its DPCD transfers, patterns, lane drive and
+      delays against Linux's own code run on ten simulated monitors
+      (`tools/pipegen`'s `dplink` scenario). Not yet wired to the card's
+      AUX channel, transmitter commands and pattern registers.
 - [x] DP mode switching on the trained link (verified on hardware
       2026-10-04, Big Sur 11.6.6: 3840x2160 to 2560x1440, picture
       confirmed; `rdna4-modeset=1`). The plan's register writes are held

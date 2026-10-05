@@ -23,6 +23,7 @@
 #include "../src/ndrv.hpp"
 #include "../src/modeset.hpp"
 #include "../src/pipe2.hpp"
+#include "../src/dptrain.hpp"
 #include "../src/amdfw.hpp"
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
@@ -1295,6 +1296,195 @@ static int testDpRetime() {
 // block is `stride` dwords per instance from `first`, and a step inside a
 // family has to be in the instance the plan is for. Outside the families only
 // the listed shared registers, and only the listed bits.
+// DisplayPort link training against simulated sinks, held against what Linux
+// does with the same sinks (tools/pipegen's "dplink" scenario): every DPCD
+// transfer with its bytes, every pattern, lane drive, delay and transmitter
+// command, in order.
+struct TrainEvent { char kind; uint32_t a, b; uint8_t data[6]; };
+struct TrainRun { char kind; uint8_t swing, pre; const TrainEvent *events; size_t count; };
+#include "dp_train_linux.inc"
+
+// The sink of tools/pipegen/pipegen.c (sink_reset, sink_settle), four HBR3
+// lanes: it reports clock recovery on a lane once a pattern is on and the
+// lane's swing is what it wants, equalisation, symbol lock and alignment once
+// the pattern is TPS2 or later and the pre-emphasis is, and asks for those
+// levels until then. Kinds: a DPCD 1.4 with TPS4, b DPCD 1.2 with TPS3 and a
+// 4 ms reading interval, c DPCD 1.2 with TPS2 only. `fails`: transfers left
+// before the AUX channel stops answering (-1 = never).
+struct TrainRig {
+	uint8_t dpcd[0x800] {};
+	int swing, pre, fails;
+	std::vector<TrainEvent> ev;
+
+	TrainRig(char kind, int wantSwing, int wantPre, int failAfter = -1)
+		: swing(wantSwing), pre(wantPre), fails(failAfter) {
+		dpcd[0x000] = kind == 'a' ? 0x14 : 0x12;
+		dpcd[0x001] = 0x1e;
+		dpcd[0x002] = kind == 'c' ? 0x84 : 0xc4;
+		dpcd[0x003] = kind == 'a' ? 0x81 : 0x01;
+		dpcd[0x00e] = kind == 'b' ? 0x01 : 0x00;
+	}
+	void settle() {
+		const int pattern = dpcd[0x102] & 0x0f, lanes = dpcd[0x101] & 0x1f;
+		if (!pattern)
+			return;
+		bool aligned = lanes > 0;
+		memset(&dpcd[0x202], 0, 6);
+		for (int l = 0; l < lanes; l++) {
+			const int s = dpcd[0x103 + l] & 3, p = (dpcd[0x103 + l] >> 3) & 3;
+			const int cr = pattern && s >= swing, eq = cr && pattern >= 2 && p >= pre;
+			dpcd[0x202 + l / 2] |= (cr | eq << 1 | eq << 2) << (4 * (l & 1));
+			dpcd[0x206 + l / 2] |= (swing | (pattern >= 2 ? pre : 0) << 2) << (4 * (l & 1));
+			aligned = aligned && eq;
+		}
+		dpcd[0x204] = aligned;
+	}
+	void add(char kind, uint32_t a, uint32_t b, const uint8_t *data = nullptr, size_t len = 0) {
+		TrainEvent e { kind, a, b, {} };
+		for (size_t i = 0; i < len && i < sizeof(e.data); i++)
+			e.data[i] = data[i];
+		ev.push_back(e);
+	}
+	bool alive() { return fails < 0 || fails-- > 0; }
+
+	static bool read(void *ctx, uint32_t address, uint8_t *data, size_t len) {
+		auto *r = static_cast<TrainRig *>(ctx);
+		if (!r->alive())
+			return false;
+		r->settle();
+		memcpy(data, &r->dpcd[address], len);
+		r->add('R', address, static_cast<uint32_t>(len), data, len);
+		return true;
+	}
+	static bool write(void *ctx, uint32_t address, const uint8_t *data, size_t len) {
+		auto *r = static_cast<TrainRig *>(ctx);
+		if (!r->alive())
+			return false;
+		r->add('W', address, static_cast<uint32_t>(len), data, len);
+		memcpy(&r->dpcd[address], data, len);
+		if (address <= 0x101 && address + len > 0x100)
+			memset(&r->dpcd[0x202], 0, 6);
+		return true;
+	}
+	static bool phyOn(void *ctx, const DpTrain::Link &l) {
+		static_cast<TrainRig *>(ctx)->add('X', l.lanes, DpTrain::symbolClockKHz(l.rate));
+		return true;
+	}
+	static bool phyOff(void *ctx) { static_cast<TrainRig *>(ctx)->add('O', 0, 0); return true; }
+	static bool pattern(void *ctx, DpTrain::Pattern p) { static_cast<TrainRig *>(ctx)->add('P', p, 0); return true; }
+	static bool drive(void *ctx, uint8_t lane, uint8_t s, uint8_t p) {
+		static_cast<TrainRig *>(ctx)->add('V', lane, s | (p << 3));
+		return true;
+	}
+	static void delayUs(void *ctx, uint32_t us) { static_cast<TrainRig *>(ctx)->add('D', us, 0); }
+	DpTrain::Io io() { return { this, read, write, phyOn, phyOff, pattern, drive, delayUs }; }
+};
+
+static int testDpTrain() {
+	int failures = 0;
+	const DpTrain::Link hbr2x4 { 4, DpTrain::kHbr2 };
+	size_t events = 0;
+	for (const TrainRun &run : kTrainRuns) {
+		TrainRig rig(run.kind, run.swing, run.pre);
+		DpTrain::Sink sink {};
+		DpTrain::Report rep {};
+		const bool caps = DpTrain::parseCaps(rig.dpcd, 16, sink);
+		const DpTrain::Result r = DpTrain::bringUp(rig.io(), sink, hbr2x4, &rep);
+		// Past swing 1 the sink of this run asks for more pre-emphasis than its
+		// swing allows, so it never equalises: the one run that fails.
+		const bool trains = run.pre <= 3 - run.swing;
+		failures += check(caps && r == (trains ? DpTrain::Result::Ok : DpTrain::Result::Equalisation) &&
+		                  rep.attempts == (trains ? 1 : DpTrain::kAttempts),
+		                  "dptrain: sink %c wanting swing %u, pre-emphasis %u: %s after %u attempt(s)", run.kind, run.swing,
+		                  run.pre, DpTrain::resultName(r), rep.attempts);
+		size_t at = 0;
+		const size_t n = rig.ev.size() < run.count ? rig.ev.size() : run.count;
+		while (at < n && rig.ev[at].kind == run.events[at].kind && rig.ev[at].a == run.events[at].a &&
+		       rig.ev[at].b == run.events[at].b && memcmp(rig.ev[at].data, run.events[at].data, 6) == 0)
+			at++;
+		const bool same = at == run.count && rig.ev.size() == run.count;
+		const TrainEvent none { '-', 0, 0, {} };
+		const TrainEvent &ours = at < rig.ev.size() ? rig.ev[at] : none, &theirs = at < run.count ? run.events[at] : none;
+		failures += check(same, "dptrain: sink %c %u/%u: event %zu of %zu (Linux has %zu) is %c 0x%x %u [%02x %02x], "
+		                  "Linux's is %c 0x%x %u [%02x %02x]", run.kind, run.swing, run.pre, at, rig.ev.size(), run.count,
+		                  ours.kind, ours.a, ours.b, ours.data[0], ours.data[1], theirs.kind, theirs.a, theirs.b,
+		                  theirs.data[0], theirs.data[1]);
+		if (trains)
+			failures += check(rep.swing == run.swing && rep.preEmphasis == run.pre,
+			                  "dptrain: sink %u/%u: the lanes ended at swing %u, pre-emphasis %u", run.swing, run.pre,
+			                  rep.swing, rep.preEmphasis);
+		events += run.count;
+	}
+
+	// What Linux's runs do not cover. A sink that never recovers the clock:
+	// the swing goes to its maximum and that attempt ends there.
+	{
+		TrainRig rig('a', 4, 0);
+		DpTrain::Sink sink {};
+		DpTrain::parseCaps(rig.dpcd, 16, sink);
+		DpTrain::Report rep {};
+		rig.swing = 3;                         // it asks for the maximum ...
+		const DpTrain::Io io = rig.io();
+		struct Never { static bool read(void *ctx, uint32_t a, uint8_t *d, size_t n) {
+			const bool ok = TrainRig::read(ctx, a, d, n);
+			if (a == 0x202)                    // ... and reports no lock on any lane even there
+				d[0] = d[1] = d[2] = 0;
+			return ok;
+		} };
+		DpTrain::Io never = io;
+		never.read = Never::read;
+		const DpTrain::Result r = DpTrain::bringUp(never, sink, hbr2x4, &rep);
+		size_t rounds = 0, offs = 0;
+		for (const TrainEvent &e : rig.ev) {
+			rounds += e.kind == 'R' && e.a == 0x202;
+			offs += e.kind == 'O';
+		}
+		failures += check(r == DpTrain::Result::ClockRecovery && rep.attempts == DpTrain::kAttempts && rep.swing == 3 &&
+		                  rounds == 2 * DpTrain::kAttempts && offs == DpTrain::kAttempts - 1u,
+		                  "dptrain: no clock recovery: %s, %u attempts, %zu status reads, %zu transmitter-offs",
+		                  DpTrain::resultName(r), rep.attempts, rounds, offs);
+	}
+	// A sink that stops answering: no second attempt.
+	{
+		TrainRig rig('a', 0, 0, 9);
+		DpTrain::Sink sink {};
+		DpTrain::parseCaps(rig.dpcd, 16, sink);
+		DpTrain::Report rep {};
+		const DpTrain::Result r = DpTrain::bringUp(rig.io(), sink, hbr2x4, &rep);
+		failures += check(r == DpTrain::Result::Io && rep.attempts == 1, "dptrain: AUX failure: %s after %u attempt(s)",
+		                  DpTrain::resultName(r), rep.attempts);
+	}
+	// A link the sink does not have, and the capability field of something that is no sink.
+	{
+		TrainRig rig('a', 0, 0);
+		DpTrain::Sink sink {}, bad {};
+		DpTrain::parseCaps(rig.dpcd, 16, sink);
+		sink.maxRate = DpTrain::kHbr;
+		const uint8_t zeros[16] {};
+		failures += check(DpTrain::bringUp(rig.io(), sink, hbr2x4) == DpTrain::Result::BadLink && rig.ev.empty() &&
+		                  DpTrain::bringUp(rig.io(), sink, DpTrain::Link { 3, DpTrain::kHbr }) == DpTrain::Result::BadLink &&
+		                  !DpTrain::parseCaps(zeros, 16, bad) && !DpTrain::parseCaps(rig.dpcd, 3, bad),
+		                  "dptrain: a link beyond the sink, or no sink, was accepted");
+	}
+	// The link for a stream: the smallest that carries it, lanes before rate.
+	// The firmware trains this card's 4K monitor at four HBR2 lanes for
+	// 3840x2160@60 at 10 bpc, which is what this gives.
+	{
+		const DpTrain::Sink sink { 0x14, DpTrain::kHbr3, 4, true, true };
+		DpTrain::Link l {};
+		failures += check(DpTrain::pickLink(sink, 533250, 30, l) && l.lanes == 4 && l.rate == DpTrain::kHbr2,
+		                  "dptrain: link for 4K60 at 10 bpc: %u lanes, rate 0x%02x", l.lanes, l.rate);
+		failures += check(DpTrain::pickLink(sink, 148500, 24, l) && l.lanes == 4 && l.rate == DpTrain::kRbr,
+		                  "dptrain: link for 1080p60 at 8 bpc: %u lanes, rate 0x%02x", l.lanes, l.rate);
+		failures += check(DpTrain::pickLink(sink, 25175, 24, l) && l.lanes == 1 && l.rate == DpTrain::kRbr &&
+		                  !DpTrain::pickLink(sink, 1066500, 30, l), "dptrain: smallest and too-large links");
+	}
+
+	printf("\ndptrain: %zu sinks, %zu events as Linux has them %s\n", sizeof(kTrainRuns) / sizeof(kTrainRuns[0]),
+	       events, failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
 // One generated table: the one in use (Pipe2::use).
 static int testPipe2Table() {
 	int failures = 0;
@@ -3888,6 +4078,7 @@ int main(int argc, char **argv) {
 	failures += testModeSet();
 	failures += testDpRetime();
 	failures += testPipe2();
+	failures += testDpTrain();
 	failures += testPsp();
 	failures += testGfxImages();
 	failures += testSdmaPackets();

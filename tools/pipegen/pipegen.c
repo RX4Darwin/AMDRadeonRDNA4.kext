@@ -1,5 +1,7 @@
 /* pipegen: run Linux DC's own DCN 4.01 code for lighting one new HDMI stream and plane against a recorder
- * (rec.c) and print the register sequence. Built and run by run.sh, which explains the rest. */
+ * (rec.c) and print the register sequence. Built and run by run.sh, which explains the rest. Two more
+ * scenarios give references for the driver's DisplayPort code: "dp" (a new timing on a trained link) and
+ * "dplink" (a stream lit on a link that is trained against a simulated sink, with the AUX transfers). */
 #include "resource/dcn401/dcn401_resource.c"   /* its static creators and register tables */
 #include "dcn401/dcn401_dccg.h"
 #include "dce/dce_clock_source.h"
@@ -11,9 +13,12 @@ static uint32_t nbio_bases[8] = { 0x11u << 24, 0x12u << 24, 0x13u << 24, 0x14u <
 
 static struct dc g_dc;
 static struct clk_mgr g_clk_mgr;
+static struct clk_mgr_funcs no_clk_funcs;
 static struct dc_context g_ctx;
 static struct dc_bios g_bios;
 static struct resource_pool g_pool;
+
+static bool g_link_detail;     /* the "dplink" scenario */
 
 /* ---- the BIOS command callbacks: on DCN 4.01 these become DMUB commands; record what was asked ---- */
 static enum bp_result bios_encoder_control(struct dc_bios *bp, struct bp_encoder_control *c)
@@ -30,6 +35,13 @@ static enum bp_result bios_transmitter_control(struct dc_bios *bp, struct bp_tra
 		fprintf(stderr, "DMUB  transmitter_control action=%d engine=%d transmitter=%d lanes=%d pixclk=%u pll=%d signal=%d hpd=%d depth=%d coherent=%d\n",
 		c->action, c->engine_id, c->transmitter, c->lanes_number, c->pixel_clock, c->pll_id, c->signal, c->hpd_sel,
 		c->color_depth, c->coherent);
+	if (g_link_detail) {    /* a DisplayPort link is brought up in several of these: say which */
+		char what[112];
+		snprintf(what, sizeof(what), "dmub:transmitter_control:action=%d:lanes=%d:symclk=%u:lane=%d:drive=0x%02x",
+			 c->action, c->lanes_number, c->pixel_clock, c->lane_select, c->lane_settings);
+		rec_mark(what, c->action);
+		return BP_RESULT_OK;
+	}
 	rec_mark("dmub:transmitter_control", c->action);
 	return BP_RESULT_OK;
 }
@@ -53,6 +65,9 @@ struct cfg {
 	int link;      /* DIG back-end / PHY / PLL */
 	int hpd;       /* 0-based HPD source */
 	bool dp;       /* the "dp" scenario: retime a DisplayPort stream that is already lit (sequence_dp) */
+	bool train;    /* the "dplink" scenario: light a DisplayPort stream on a dark pipe, training its link */
+	int sink_swing, sink_pre;     /* the drive the simulated sink asks for before it reports lock */
+	char sink_kind;               /* its capabilities: sink_reset() */
 	struct dc_crtc_timing t;      /* the new stream */
 	unsigned surf_w, surf_h;      /* "on W H": the plane shows the top-left of a surface this size (a mode switch
 	                               * on a pipe lit for a larger mode); 0 = a surface of the mode's own size */
@@ -165,6 +180,7 @@ static void run_dml(struct cfg *c)
 /* ---- the boundary to things that are not register writes ---- */
 #include "link_service.h"
 #include "link/link_dpms.h"
+#include "link/link_factory.h"
 #include "link/protocols/link_ddc.h"
 #include "dcn10/dcn10_mpc.h"
 #include "dcn20/dcn20_opp.h"
@@ -172,6 +188,81 @@ static void run_dml(struct cfg *c)
 #include "dcn31/dcn31_vpg.h"
 #include "dcn401/dcn401_mpc.h"
 #include "dcn10/dcn10_stream_encoder.h"
+
+/* ---- "dplink": the monitor at the other end of the AUX channel ----
+ *
+ * Linux reads and writes the sink's DPCD through dm_helpers_dp_*_dpcd. Here that is a sink of four HBR3 lanes
+ * that does what link training asks of it: it reports clock recovery on a lane once a training pattern is on
+ * and the lane's voltage swing is what it wants, and equalisation, symbol lock and alignment once the pattern
+ * is TPS2 or later and the pre-emphasis is what it wants. Until then it asks for those levels. Three kinds:
+ *   a  DPCD 1.4 with TPS3 and TPS4, read at once (TRAINING_AUX_RD_INTERVAL 0)
+ *   b  DPCD 1.2 with TPS3, read 4 ms after a change
+ *   c  DPCD 1.2 with TPS2 only
+ * Every transfer is recorded: "aux:w:<address>:<bytes>" and "aux:r:<address>:<bytes>". */
+static uint8_t g_dpcd[0x800];
+static int g_sink_swing, g_sink_pre;
+
+static void sink_reset(const struct cfg *c)
+{
+	memset(g_dpcd, 0, sizeof(g_dpcd));
+	g_dpcd[0x000] = c->sink_kind == 'a' ? 0x14 : 0x12;        /* DPCD_REV */
+	g_dpcd[0x001] = 0x1e;                                     /* MAX_LINK_RATE HBR3 */
+	g_dpcd[0x002] = c->sink_kind == 'c' ? 0x84 : 0xc4;        /* enhanced framing, TPS3, four lanes */
+	g_dpcd[0x003] = c->sink_kind == 'a' ? 0x81 : 0x01;        /* TPS4, 0.5 % down-spread */
+	g_dpcd[0x00e] = c->sink_kind == 'b' ? 0x01 : 0x00;        /* TRAINING_AUX_RD_INTERVAL */
+	g_sink_swing = c->sink_swing; g_sink_pre = c->sink_pre;
+}
+
+static void sink_settle(void)
+{
+	int pattern = g_dpcd[0x102] & 0x0f, lanes = g_dpcd[0x101] & 0x1f, aligned = lanes > 0;
+
+	if (!pattern)           /* out of training: the lanes stay as they were trained */
+		return;
+	memset(&g_dpcd[0x202], 0, 6);
+	for (int l = 0; l < lanes; l++) {
+		int swing = g_dpcd[0x103 + l] & 3, pre = (g_dpcd[0x103 + l] >> 3) & 3;
+		int cr = pattern && swing >= g_sink_swing, eq = cr && pattern >= 2 && pre >= g_sink_pre;
+
+		g_dpcd[0x202 + l / 2] |= (cr | eq << 1 | eq << 2) << (4 * (l & 1));
+		g_dpcd[0x206 + l / 2] |= (g_sink_swing | (pattern >= 2 ? g_sink_pre : 0) << 2) << (4 * (l & 1));
+		aligned = aligned && eq;
+	}
+	g_dpcd[0x204] = aligned;                  /* INTERLANE_ALIGN_DONE */
+}
+
+static void aux_mark(char dir, uint32_t address, const uint8_t *data, uint32_t size)
+{
+	char what[160];
+	int n = snprintf(what, sizeof(what), "aux:%c:%03x:", dir, address);
+
+	for (uint32_t i = 0; i < size && n < (int)sizeof(what) - 3; i++)
+		n += snprintf(what + n, sizeof(what) - n, "%02x", data[i]);
+	if (rec_log_reads)
+		fprintf(stderr, "AUX   %s\n", what);
+	rec_mark(what, size);
+}
+
+bool dm_helpers_dp_read_dpcd(struct dc_context *ctx, const struct dc_link *link, uint32_t address, uint8_t *data,
+			     uint32_t size)
+{
+	if (address + size > sizeof(g_dpcd)) { memset(data, 0, size); aux_mark('r', address, data, size); return true; }
+	sink_settle();
+	memcpy(data, &g_dpcd[address], size);
+	aux_mark('r', address, data, size);
+	return true;
+}
+
+bool dm_helpers_dp_write_dpcd(struct dc_context *ctx, const struct dc_link *link, uint32_t address,
+			      const uint8_t *data, uint32_t size)
+{
+	aux_mark('w', address, data, size);
+	if (address + size <= sizeof(g_dpcd))
+		memcpy(&g_dpcd[address], data, size);
+	if (address <= 0x101 && address + size > 0x100)     /* a new rate or lane count: the lock is gone */
+		memset(&g_dpcd[0x202], 0, 6);
+	return true;
+}
 
 void write_scdc_data(struct ddc_service *ddc, uint32_t pix_clk, bool lte_340_scramble)
 {
@@ -223,7 +314,18 @@ static void make_state(const struct cfg *c)
 	dc->links[0] = link; dc->link_count = 1;
 	const enum signal_type signal = c->dp ? SIGNAL_TYPE_DISPLAY_PORT : SIGNAL_TYPE_HDMI_TYPE_A;
 	link->dc = dc; link->ctx = &g_ctx; link->connector_signal = signal;
-	if (c->dp) {            /* a trained link: four lanes at HBR3, as the firmware brings a 4K sink up */
+	if (c->train) {         /* a link to train: the sink of sink_reset(), as detection would have read it */
+		const struct dc_link_settings want = { LANE_COUNT_FOUR, LINK_RATE_HIGH2, LINK_SPREAD_DISABLED };
+
+		sink_reset(c);
+		dc->link_srv = link_create_link_service();
+		link->dpcd_caps.dpcd_rev.raw = g_dpcd[0x000];
+		link->dpcd_caps.max_ln_count.raw = g_dpcd[0x002];
+		link->dpcd_caps.max_down_spread.raw = g_dpcd[0x003];
+		link->reported_link_cap = link->verified_link_cap = (struct dc_link_settings){
+			LANE_COUNT_FOUR, LINK_RATE_HIGH3, LINK_SPREAD_05_DOWNSPREAD_30KHZ };
+		pipe->link_config.dp_link_settings = want;
+	} else if (c->dp) {     /* a trained link: four lanes at HBR3, as the firmware brings a 4K sink up */
 		link->cur_link_settings.lane_count = LANE_COUNT_FOUR;
 		link->cur_link_settings.link_rate = LINK_RATE_HIGH3;
 		link->link_status.link_active = true;
@@ -279,6 +381,9 @@ static void make_state(const struct cfg *c)
 	pipe->plane_res.mpcc_inst = c->pipe;
 	pipe->clock_source = dcn401_clock_source_create(&g_ctx, &g_bios, CLOCK_SOURCE_ID_PLL0 + c->link,
 							&clk_src_regs[c->link], false);
+	if (c->train)           /* a DisplayPort stream's pixel clock is the DTO, as resource assignment has it */
+		pipe->clock_source = g_pool.dp_clock_source =
+			dcn401_clock_source_create(&g_ctx, &g_bios, CLOCK_SOURCE_ID_DP_DTO, &clk_src_regs[0], true);
 	pipe->stream_res.pix_clk_params.requested_pix_clk_100hz = c->t.pix_clk_100hz;
 	pipe->stream_res.pix_clk_params.encoder_object_id = eid.encoder;
 	pipe->stream_res.pix_clk_params.signal_type = signal;
@@ -332,6 +437,12 @@ static void sequence(const struct cfg *c)
 		 * step before enabled it */
 		rec_poke_field(se->regs->DIG_FE_CLK_CNTL, DIG0_DIG_FE_CLK_CNTL__DIG_FE_SYMCLK_FE_G_CLOCK_ON_MASK,
 			       DIG0_DIG_FE_CLK_CNTL__DIG_FE_SYMCLK_FE_G_CLOCK_ON_MASK);
+		if (c->train) {
+			/* the encoder was never used: it sends no secondary packets, so the info-packet update
+			 * leaves the secondary stream off (as in the "dp" scenario) */
+			rec_poke(se->regs->DP_SEC_CNTL, 0);
+			rec_poke(se->regs->DP_SEC_METADATA_TRANSMISSION, 0);
+		}
 		/* vpg31_poweron returns early when the packet memory is already awake; take the wake-up path */
 		rec_poke_field(vpg->regs->VPG_MEM_PWR, VPG0_VPG_MEM_PWR__VPG_GSP_MEM_PWR_STATE_MASK,
 			       VPG0_VPG_MEM_PWR__VPG_GSP_MEM_PWR_STATE_MASK);
@@ -466,6 +577,7 @@ static void setup(void)
 	g_dc.ctx = &g_ctx; g_dc.debug = debug_defaults_drv; g_dc.res_pool = &g_pool;
 	g_dc.caps.max_v_total = (1 << 15) - 1;
 	g_dc.clk_mgr = &g_clk_mgr; g_clk_mgr.ctx = ctx;
+	g_clk_mgr.funcs = &no_clk_funcs;        /* the clocks stay the firmware's: nothing is asked of the manager */
 	g_clk_mgr.dprefclk_khz = 720000;        /* the DCN 4.01 bounding box's dprefclk_mhz */
 #undef REG_STRUCT
 #define REG_STRUCT dccg_regs
@@ -503,15 +615,22 @@ int main(int argc, char **argv)
 	bool verbose;
 
 	if (argc > 1 && !strcmp(argv[1], "dp")) { c.dp = true; argv++; argc--; }
+	if (argc > 4 && !strcmp(argv[1], "dplink")) {
+		c.dp = c.train = g_link_detail = true;
+		c.sink_kind = argv[2][0]; c.sink_swing = atoi(argv[3]); c.sink_pre = atoi(argv[4]);
+		argv += 4; argc -= 4;
+	}
 	if (argc > 3 && !strcmp(argv[1], "on")) {
 		c.surf_w = (unsigned)strtoul(argv[2], NULL, 0); c.surf_h = (unsigned)strtoul(argv[3], NULL, 0);
 		argv += 3; argc -= 3;
 	}
 	verbose = argc > 17;
 	if (argc < 17) {
-		fprintf(stderr, "usage: pipegen [dp] [on W H] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync "
+		fprintf(stderr, "usage: pipegen [dp | dplink K S P] [on W H] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync "
 				"vback  khz hpositive vpositive vic [verbose]\n  hpd counts from 1, as the VBIOS path records do\n"
 				"  dp: the reference for retiming a lit DisplayPort stream instead of the second-pipe plan\n"
+				"  dplink K S P: light a DisplayPort stream, training its link against a simulated sink of kind\n"
+				"                K (a, b, c) that wants voltage swing S and pre-emphasis P\n"
 				"  on W H: the plane shows the top-left of a W x H surface, as after a mode switch\n");
 		return 2;
 	}
@@ -538,7 +657,7 @@ int main(int argc, char **argv)
 		rec_log_reads = verbose && run == 0;
 		setup();
 		make_state(&c);
-		if (c.dp) sequence_dp(&c); else sequence(&c);
+		if (c.dp && !c.train) sequence_dp(&c); else sequence(&c);
 		if (run == 0) { memcpy(run0, evs, sizeof(struct ev) * nev); n0 = nev; }
 	}
 	printf("CONFIG %d %d %d %d  %u %u %u %u  %u %u %u %u  %u %d %d  %d %u\n", c.pipe, c.dig, c.link, c.hpd + 1,
