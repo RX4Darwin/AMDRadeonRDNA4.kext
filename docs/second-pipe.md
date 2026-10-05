@@ -212,3 +212,13 @@ three seconds later `power: pipe2 display on: 128 steps ran; DIG2_DIG_FE_EN_CNTL
 SYMCLKC_CLOCK_ENABLE=0x00000211` (under 2 ms). No step timed out. So on this firmware a repeated `SET_PIXEL_CLOCK`
 does take the HDMI output down far enough for the monitor to sleep, and the encoder command on wake sets the stream
 encoder's symbol-clock gate again (0x1 to 0x211: enable and source link 2), which is why Linux can leave it alone.
+
+**Colour comparison, 2026-10-05 15:25 (`rdna4-head2=4`), because the Samsung looks dimmer than the Lenovo.** 90
+colour-path registers compared, 24 differ, and none of them dims the firmware's pipe. Sizes and instance numbers
+aside: the firmware bypasses the DPP colour block (`CM0_CM_CONTROL` 1) and the output CSC (`MPC_OUT0_CSC_MODE` 0)
+where Linux enables both with nothing in them (identity matrix, no gamma); the blender passes the top layer through
+(`MPCC_CONTROL` mode 1) where Linux blends it alone at full alpha and gain (mode 2); the firmware leaves 8-bit
+pixels zero-extended (`FORMAT_EXPANSION_MODE` 0, `FMT_DYNAMIC_EXP_CNTL` 0: white is 0.3 % under full scale) where
+Linux replicates the top bits; and the formatters differ as 10-bit DisplayPort and 8-bit HDMI do. The gains, the HDR
+multiplier, degamma and output gamma are the same on both. So the difference in brightness is the monitors' own.
+
