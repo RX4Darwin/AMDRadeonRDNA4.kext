@@ -6,6 +6,7 @@
 //
 
 #include "pipe2.hpp"
+#include "dpphy.hpp"
 
 namespace Pipe2 {
 
@@ -18,6 +19,8 @@ namespace {
 //   P E X DMUB set pixel clock / encoder stream setup / transmitter enable,
 //   S the sink's SCDC TMDS_CONFIG = arg (if the sink has SCDC),
 //   A word arg of the AVI infoframe, for the timing the pipe runs (aviWord),
+//   a t O DisplayPort: write the table's AUX entry arg to the sink / train
+//   the link / DMUB transmitter disable,
 //   K pattern generator colour arg (0 R, 1 G, 2 B),
 //   C copy from the lit pipe's register, arg dwords per HUBP instance below,
 //   H L surface address high / low.
@@ -48,6 +51,13 @@ namespace Hpd3 {
 namespace Hpd4 {
 #include "pipe2_linux_hpd4.inc"
 }
+// ... and the DisplayPort connectors.
+namespace Hpd1 {
+#include "pipe2_linux_dp1.inc"
+}
+namespace Hpd2 {
+#include "pipe2_linux_dp2.inc"
+}
 
 struct Table {
 	const Config               &config;
@@ -58,18 +68,26 @@ struct Table {
 	const Edid::DetailedTiming *timings;    // ... for these modes, the plan's first ...
 	size_t                      nmodes;
 	const uint32_t             *values;     // ... one row of nregs values per mode
+	const AuxWrite             *aux;        // DisplayPort: what 'a' entries write
+	size_t                      naux;
 };
 
 template <size_t G, size_t R, size_t M>
 constexpr Table table(const Config &config, const Gen (&gen)[G], const ModeReg (&regs)[R],
-                      const Edid::DetailedTiming (&timings)[M], const uint32_t (&values)[M][R]) {
+                      const Edid::DetailedTiming (&timings)[M], const uint32_t (&values)[M][R],
+                      const AuxWrite *aux = nullptr, size_t naux = 0) {
 	static_assert(R <= kMaxModeSteps, "the mode table");
-	return { config, gen, G, regs, R, timings, M, &values[0][0] };
+	return { config, gen, G, regs, R, timings, M, &values[0][0], aux, naux };
 }
+template <size_t N> constexpr size_t countOf(const AuxWrite (&)[N]) { return N; }
 
 constexpr Table kTables[] = {
 	table(Hpd3::kConfig, Hpd3::kGen, Hpd3::kModeRegs, Hpd3::kModeTimings, Hpd3::kModeValues),
 	table(Hpd4::kConfig, Hpd4::kGen, Hpd4::kModeRegs, Hpd4::kModeTimings, Hpd4::kModeValues),
+	table(Hpd1::kConfig, Hpd1::kGen, Hpd1::kModeRegs, Hpd1::kModeTimings, Hpd1::kModeValues, Hpd1::kAux,
+	      countOf(Hpd1::kAux)),
+	table(Hpd2::kConfig, Hpd2::kGen, Hpd2::kModeRegs, Hpd2::kModeTimings, Hpd2::kModeValues, Hpd2::kAux,
+	      countOf(Hpd2::kAux)),
 };
 constexpr size_t kTableCount = sizeof(kTables) / sizeof(kTables[0]);
 
@@ -151,6 +169,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 	const Config &c = cur->config;
 	out.count = 0;
 	out.ncmds = 0;
+	out.naux = 0;
 
 	if (t.part == Part::Light) {
 		if (t.litHubp >= 4 || t.litHubp == c.pipe) {
@@ -220,6 +239,19 @@ bool build(const Target &t, Plan &out, const char **why) {
 		case 'S':
 			if (t.sinkScdc)
 				ok = step(ModeSet::Op::Scdc, g, 0, g.arg, t.ddcLine, true);
+			break;
+		case 'a':
+			ok = g.arg < cur->naux && out.naux < kMaxAux &&
+			     step(ModeSet::Op::Aux, g, 0, 0, static_cast<uint32_t>(out.naux));
+			if (ok)
+				out.aux[out.naux++] = cur->aux[g.arg];
+			break;
+		case 't': ok = step(ModeSet::Op::Train, g, 0, 0, 0); break;
+		case 'O':
+			if (Dmub::Cmd *cmd = dmub(g))
+				DpPhy::buildDisable(*cmd, c.link, c.hpd, t.connectorObjId);
+			else
+				ok = false;
 			break;
 		case 'P': case 'E': case 'X': {
 			Dmub::Cmd *cmd = dmub(g);

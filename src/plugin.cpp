@@ -466,7 +466,8 @@ void head2Init(Head2 *h, RDNA4Device &dev, const Modes::Mode *mode, size_t n) {
 	if (dev.pipe2Lit)
 		be.setPower = head2SetPower;
 	// Like the boot display, the other modes are offered with rdna4-modeset=1.
-	const bool switching = dev.pipe2Lit && dev.modesetRequested;
+	// Not yet on DisplayPort, where a switch would have to mind the link.
+	const bool switching = dev.pipe2Lit && dev.modesetRequested && !Pipe2::config().dp;
 	if (switching)
 		be.switchTo = head2SwitchTo;
 	h->ndrv.init(switching ? h->table : mode, switching ? n : 1, mode->id, h->edid, h->edidLen, be);

@@ -270,8 +270,18 @@ private:
 		return runSteps(plan.steps, plan.count, plan.cmds, plan.ncmds, "modeset", otgOff());
 	}
 	// `otgOffset`: the timing generator whose frames an Op::WaitFrames counts.
+	// `aux`: what the Op::Aux steps of a DisplayPort plan write.
 	bool runSteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds, size_t ncmds,
-	              const char *tag, uint32_t otgOffset);
+	              const char *tag, uint32_t otgOffset, const Pipe2::AuxWrite *aux = nullptr);
+	DpTrain::Result trainLink(uint8_t aux, uint8_t link, uint8_t hpd, uint8_t conn, const DpTrain::Sink &sink,
+	                          const DpTrain::Link &settings, bool offFirst, DpTrain::Report &rep);
+	// The second pipe on DisplayPort: its sink's AUX channel and capabilities,
+	// and the link picked for the plan's mode.
+	bool noteSecondDpSink(uint8_t aux);
+	bool trainSecondLink();
+	uint8_t       pipe2Aux { 0 };
+	DpTrain::Sink pipe2Sink {};
+	DpTrain::Link pipe2Link {};
 	void surveySteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds);
 	bool waitFrames(uint32_t frames, uint32_t otgOffset);
 

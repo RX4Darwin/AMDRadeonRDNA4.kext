@@ -70,6 +70,9 @@ enum class Op : uint8_t {
 	Copy,         // reg = the register at dword `arg` of the same segment
 	Require,      // (reg & mask) must equal value, or the plan is not run
 	Scdc,         // write `value` to the sink's SCDC TMDS_CONFIG over DDC line `arg`
+	// A DisplayPort second pipe:
+	Aux,          // write the plan's AUX entry `arg` to the sink's DPCD
+	Train,        // bring the link up (dptrain.hpp)
 };
 
 struct Step {

@@ -47,6 +47,25 @@ SHARED = {
 }
 WAITABLE = {'DENTIST_DISPCLK_CNTL': 0x00080000}        # DENTIST_DISPCLK_CHG_DONE
 
+# A DisplayPort stream (pipegen's "dplink" scenario, told by its AUX transfers): the DP halves of the stream and
+# link encoder, the pipe's pixel-rate DTO and its bits in the DTO's shared registers.
+dp = any(p[0] == 'MARK' and p[1].startswith('aux:') for p in lines)
+if dp:
+    OWN += [f'DP{dig}_', f'DP{link}_', f'DP_DTO{pipe}_']
+    SHARED['OTG_PIXEL_RATE_DIV'] |= 0xf << (1 + 5 * pipe)      # DPDTOn_INT
+    SHARED['DTBCLK_P_CNTL'] = 0x7 << (3 * pipe)                # DTBCLK_Pn_SRC_SEL, _EN
+    SHARED['DCCG_GATE_DISABLE_CNTL5'] = 1 << pipe              # DTBCLK_Pn_GATE_DISABLE
+    SHARED['DCCG_GATE_DISABLE_CNTL3'] = 0x3 << (8 + 2 * pipe) | 0x3 << (20 + 2 * pipe)   # SYMCLK32_SEn, _LEn gates
+SOURCE_OUI = bytes([0x00, 0x00, 0x1a])
+# Link training: from the lane count going to the encoder to the look at the link status afterwards. The plan
+# has one entry for it; src/dptrain.cpp does it when the plan runs. These are the functions Linux writes
+# registers in on the way (src/dpphy.cpp has them).
+TRAINING = ('enc1_configure_encoder', 'dcn10_link_encoder_set_dp_phy_pattern_training_pattern',
+            'set_link_training_complete', 'enable_phy_bypass_mode', 'disable_prbs_mode', 'setup_panel_mode',
+            'set_dp_phy_pattern_passthrough_mode', 'dp_wait_for_training_aux_rd_interval',
+            'dp_transition_to_video_idle')
+aux, training = [], False
+
 def classify(seg, dword):
     ns = names.get((seg, dword))
     if not ns:
@@ -91,6 +110,23 @@ for p in lines[1:]:
         elif what.startswith('begin:'):
             part = what[6:]
             emit({'init': '1', 'stream': '2', 'plane': '3', 'sleep': '4', 'wake': '5'}[part], what=part)
+        elif training:
+            assert what.startswith(('aux:', 'dmub:transmitter_control:action=1:', 'dmub:transmitter_control:action=11:')), what
+            training = not what.startswith('aux:r:200:')
+        elif what.startswith('aux:r:300:'):
+            # dpcd_set_source_specific_data writes the source's OUI if the sink does not have it: the plan
+            # writes it without asking
+            aux.append((0x300, SOURCE_OUI))
+            emit('a', arg=len(aux) - 1, what='DPCD source OUI')
+        elif what.startswith('aux:r:107:'):
+            pass                                        # read to see whether MSA_TIMING_PAR_IGNORE has to change: no
+        elif what.startswith('aux:w:'):
+            address, data = int(what.split(':')[2], 16), bytes.fromhex(what.split(':')[3])
+            if (address, data) != (0x300, SOURCE_OUI):
+                aux.append((address, data))
+                emit('a', arg=len(aux) - 1, what=f'DPCD 0x{address:03x}')
+        elif what.startswith('dmub:transmitter_control:action=0:'):
+            emit('O', what='DIG1_TRANSMITTER_CONTROL disable')
         elif what == 'dmub:set_pixel_clock':
             emit('P', what='SET_PIXEL_CLOCK')
         elif what == 'dmub:encoder_control':
@@ -109,10 +145,17 @@ for p in lines[1:]:
         elif what != 'end':
             sys.exit(f'refused: unknown mark {what}')
         continue
+    func = p[-1]
+    if func == 'enc1_configure_encoder' and not training:
+        training = True
+        emit('t', what='link training')
+    if training:
+        assert func in TRAINING, f'a register write of {func} inside link training'
+        continue
     if k == 'DELAY':
         emit('D', arg=int(p[1]), what=p[3])
         continue
-    seg, dword, mask, value, arg, func = int(p[1]), int(p[2], 0), int(p[3], 16), int(p[4], 16), int(p[5]), p[7]
+    seg, dword, mask, value, arg = int(p[1]), int(p[2], 0), int(p[3], 16), int(p[4], 16), int(p[5])
     name, allowed = classify(seg, dword)
     what = f'{func} {name}'
     if func == 'vpg3_update_generic_info_packet':
@@ -156,15 +199,21 @@ for p in lines[1:]:
     else:
         emit(k, seg, dword, mask, value, arg, what)
 
-# wait, lock, index, nine words, update
-avi = out[avi_from:avi_from + 13] if avi_from is not None else []
-assert part == 'wake' and ''.join(o[0] for o in avi) == 'TUUWAAAAWWWWU', 'no AVI infoframe update in the wake part'
-out += [('6', 0, 0, 0, 0, 0, 'avi')] + avi
+assert part == 'wake' and not training
+if not dp:
+    # wait, lock, index, nine words, update
+    avi = out[avi_from:avi_from + 13] if avi_from is not None else []
+    assert ''.join(o[0] for o in avi) == 'TUUWAAAAWWWWU', 'no AVI infoframe update in the wake part'
+    out += [('6', 0, 0, 0, 0, 0, 'avi')] + avi
 
 first = next(i for i, o in enumerate(out) if o[0] != 'R')
 out[first:first] = requires_late
 kinds = collections.Counter(o[0] for o in out)
-assert kinds['P'] == 2 and kinds['X'] == 2 and kinds['E'] == 4 and kinds['A'] == 20 and kinds['6'] == 1 and kinds['H'] == 1 and kinds['L'] == 1 and kinds['K'] == 3, kinds
+assert kinds['H'] == 1 and kinds['L'] == 1 and kinds['K'] == 3, kinds
+if dp:      # lit and woken by training the link, put to sleep by the transmitter going off; no VBIOS-style setup
+    assert kinds['t'] == 2 and kinds['O'] == 1 and not any(kinds[k] for k in 'PXEAS6'), kinds
+else:
+    assert kinds['P'] == 2 and kinds['X'] == 2 and kinds['E'] == 4 and kinds['A'] == 20 and kinds['6'] == 1, kinds
 
 det_regs = [addr(f'DCHUBBUB_DET{i}_CTRL') for i in range(4)]
 assert all(s == det_regs[0][0] for s, _ in det_regs)
@@ -174,16 +223,22 @@ print(f'''// GENERATED by tools/pipegen from Linux {commit[:12]} (drivers/gpu/dr
 // to light this stream and plane; the text of each step is the Linux function and the register.
 //
 // Pipe {pipe} (OTG{pipe}, OPP{pipe}, HUBP{pipe}, DPP{pipe}, MPCC{pipe}), stream encoder DIG{dig}, link {link} (PHY PLL {link}), HPD{hpd},
-// {ha}x{va} at {khz} kHz, 8 bpc RGB over HDMI. {len(out)} entries.
+// {ha}x{va} at {khz} kHz, 8 bpc RGB over {'DisplayPort (the link is trained when the plan runs)' if dp else 'HDMI'}. {len(out)} entries.
 
 static constexpr Config kConfig = {{
 	{pipe}, {dig}, {link}, {hpd},
 	{{ {khz}, {ha}, {hblank}, {hfp}, {hsw}, {va}, {vblank}, {vfp}, {vsw}, {'true' if hpos else 'false'}, {'true' if vpos else 'false'}, false }},
 	{vstartup}, {det},
-	{det_regs[0][0]}, {{ {', '.join(f'0x{d:04x}' for _, d in det_regs)} }},
+	{det_regs[0][0]}, {{ {', '.join(f'0x{d:04x}' for _, d in det_regs)} }},{' true,' if dp else ''}
 }};
-
-static const Gen kGen[] = {{''')
+''')
+if dp:
+    print('// What the plan writes to the sink over AUX, in the order its \'a\' entries name them.')
+    print('static const AuxWrite kAux[] = {')
+    for address, data in aux:
+        print(f"\t{{ 0x{address:03x}, {len(data)}, {{ {', '.join(f'0x{b:02x}' for b in data)} }} }},")
+    print('};\n')
+print('static const Gen kGen[] = {')
 for kind, seg, dword, mask, value, arg, what in out:
     print(f"\t{{ '{kind}', {seg}, 0x{dword:04x}, 0x{mask:08x}, 0x{value:08x}, {arg}, \"{what}\" }},")
 print('};')
