@@ -22,7 +22,8 @@ The levels are a ladder, so that each boot answers one question:
 | 3 | The stream only: clock, timing generator, encoder, PHY. No plane. Afterwards the survey of what the plane would still change is published. | The monitor wakes and shows a solid teal-blue. The DMUB commands work for a pipe the firmware never lit. |
 | 4 | Stream and plane. | The monitor shows the second desktop. |
 
-At 2 and above the phantom head only serves the one mode the plan is for; a sink without it stays unserved.
+At 2 and above the phantom head only serves the one mode the plan is for; a sink without it stays unserved. With no
+second monitor answering on DDC there is no second head at all (an invisible display is level 1, asked for by name).
 
 ## 2. Where the sequence comes from
 

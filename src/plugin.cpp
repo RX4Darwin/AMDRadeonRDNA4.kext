@@ -410,6 +410,13 @@ void fillHead2(RDNA4Device &dev) {
 		FBLOG("head2: nothing to serve: no EDID");
 		return;
 	}
+	// A pipe to light needs a second monitor. Without one there would only be
+	// the phantom head, an invisible display for windows to get lost on: that
+	// is rdna4-head2=1, asked for by name.
+	if (head2Level >= 2 && !dev.edid2Len) {
+		FBLOG("head2: nothing to serve: no second sink answered on DDC (rdna4-head2=1 makes a phantom head)");
+		return;
+	}
 	// The device memory range that holds the console (BAR0 on the card).
 	uint64_t rangeBase = 0, rangeLen = 0;
 	IODeviceMemory *range = nullptr;
@@ -457,12 +464,8 @@ void fillHead2(RDNA4Device &dev) {
 			FBLOG("head2: nothing to serve: no mode of the sink fits behind the console");
 		return;
 	}
-	if (head2Level >= 2) {
-		if (dev.edid2Len && dev.isAmd)
-			dev.lightSecondPipe(head2Level, h->surface.physBase);
-		else
-			FBLOG("head2: pipe not lit: no second sink answered on DDC");
-	}
+	if (head2Level >= 2 && dev.isAmd)
+		dev.lightSecondPipe(head2Level, h->surface.physBase);
 	Ndrv::Backend be {};
 	be.ctx = h;
 	be.surfaceFor = head2SurfaceFor;

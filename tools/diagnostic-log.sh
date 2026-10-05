@@ -996,6 +996,29 @@ SURVEOF
 	section "ioreg: what the OS sees (display identity)"
 	ioreg -lw0 | grep -E 'IODisplayEDID|DisplayProductID|DisplayVendorID' || true
 
+	# Every mode macOS offers per display (what Displays preferences chooses from), current one starred. A second
+	# display with one 60 Hz mode and the boot display's identity is the phantom head of rdna4-head2=1.
+	section "CoreGraphics: displays and their modes"
+	CGMODES='
+from __future__ import print_function
+import Quartz as Q
+err, ids, n = Q.CGGetOnlineDisplayList(16, None, None)
+for d in ids or []:
+    cur = Q.CGDisplayCopyDisplayMode(d)
+    key = lambda m: (Q.CGDisplayModeGetIODisplayModeID(m), Q.CGDisplayModeGetWidth(m), Q.CGDisplayModeGetPixelWidth(m))
+    b = Q.CGDisplayBounds(d)
+    print("display 0x%x vendor %d model %d at %d,%d%s%s" % (d, Q.CGDisplayVendorNumber(d), Q.CGDisplayModelNumber(d),
+          b.origin.x, b.origin.y, " main" if Q.CGDisplayIsMain(d) else "", " mirrored" if Q.CGDisplayIsInMirrorSet(d) else ""))
+    for m in Q.CGDisplayCopyAllDisplayModes(d, {Q.kCGDisplayShowDuplicateLowResolutionModes: True}) or []:
+        print(" %s id %d %dx%d (%dx%d pixels) %.3f Hz ioflags 0x%x%s" % ("*" if cur and key(m) == key(cur) else " ",
+              Q.CGDisplayModeGetIODisplayModeID(m), Q.CGDisplayModeGetWidth(m), Q.CGDisplayModeGetHeight(m),
+              Q.CGDisplayModeGetPixelWidth(m), Q.CGDisplayModeGetPixelHeight(m), Q.CGDisplayModeGetRefreshRate(m),
+              Q.CGDisplayModeGetIOFlags(m), "" if Q.CGDisplayModeIsUsableForDesktopGUI(m) else " not for the desktop"))
+'
+	# /usr/bin/python has the Quartz module up to macOS 12.2; a failure shows as its traceback.
+	CGPY=/usr/bin/python; [ -x "$CGPY" ] || CGPY=python3
+	"$CGPY" -c "$CGMODES" 2>&1 | tail -200 || true
+
 	section "WindowServer attached?"
 	ioreg -l -w0 | grep -c IOFramebufferUserClient | \
 		xargs -I{} echo "{} IOFramebufferUserClient instance(s)"
