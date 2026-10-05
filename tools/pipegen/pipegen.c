@@ -368,6 +368,15 @@ static void sequence(const struct cfg *c)
 	dc->hwss.pipe_control_lock(dc, pipe, false);
 	/* dcn401_post_unlock_program_front_end: let the enable latch before anyone flips */
 	rec_mark("wait:flip", TO_DCN20_HUBP(hubp)->hubp_regs->DCSURF_FLIP_CONTROL);
+
+	/* Display sleep and wake of the stream just lit: what dc does for DPMS off and on, with the timing
+	 * generator left running. By then the committed state is the current one, which is where
+	 * dcn401_disable_link_output looks for the pipe whose PHY clock it reprograms. */
+	dc->current_state = g_new;
+	rec_mark("begin:sleep", 0);
+	link_set_dpms_off(pipe);
+	rec_mark("begin:wake", 0);
+	if (link_set_dpms_on(g_new, pipe) != DC_DPMS_SUCCESS) { fprintf(stderr, "wake failed\n"); exit(1); }
 	rec_mark("end", 0);
 }
 

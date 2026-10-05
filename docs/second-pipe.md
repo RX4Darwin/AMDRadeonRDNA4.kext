@@ -127,7 +127,23 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
 - The second display must be HDMI or DVI (TMDS). A second DisplayPort display needs link training. A mode above
   340 MHz needs the table regenerated for it (the generator then turns the scrambler on by itself).
 - The boot display must not be on the plan's blocks: with the Lenovo alone, the firmware puts it on DIG2 and link 2.
-- Display sleep and wake do not know about the second pipe.
+- Display sleep and wake of the second pipe (below) have not run on the card yet.
+
+### Display sleep
+
+A lit second pipe answers macOS's sync requests (`cscGetSync` / `cscSetSync`), so the head gets display sleep like
+the boot display. Sleep and wake are Linux's too: the generator calls `link_set_dpms_off` and then `link_set_dpms_on`
+on the stream it just lit, and the table carries them as two more parts (38 and 127 steps). Sleep sets AVMUTE, waits
+out a few frames, stops the infoframes, turns the stream encoder off, disconnects it from the link encoder and sends
+`SET_PIXEL_CLOCK` again, which is how amdgpu takes a TMDS transmitter down while the PLL keeps clocking the timing
+generator. The timing generator, the plane and the surface stay as they are. Wake is the link half of lighting:
+encoder setup, infoframes, the transmitter enable. `testPipe2` checks that after sleep and wake every register that
+lighting set holds the same value again.
+
+One thing to watch: sleep clears the stream encoder's half of `SYMCLKC_CLOCK_ENABLE` (`dccg401_disable_symclk_se`),
+and for HDMI Linux never sets it again. The log line shows it:
+`power: pipe2 display off: 38 steps ran; DIG2_DIG_FE_EN_CNTL=... SYMCLKC_CLOCK_ENABLE=...`, and the same for `on`
+(also in the `RDNA4FB,DisplayPower` registry history). `rdna4-nosleep=1` turns it off.
 
 ## 7. Card boots (Big Sur 11.6.6, Samsung 4K on DisplayPort, Lenovo on HDMI)
 
@@ -161,4 +177,5 @@ exactly those two entries (1920x1080), and `testPipe2` checks them.
 steps, 4 DMUB commands`, `OTG1 measured 60.000 Hz`, `HUBP1_DCHUBP_CNTL` 0x000f0012, no underflow flag, no step timed
 out. The Lenovo shows the second desktop and the Samsung is undisturbed. So the unknowns of section 4 came out well on
 this card: the firmware's display clocks and watermarks for one 4K display also carry a 1080p plane next to it, and
-3 + 4 DET segments are enough.
+3 + 4 DET segments are enough. The pointer shows on the second display (macOS draws it into the surface: the head
+has no hardware cursor).

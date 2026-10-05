@@ -264,7 +264,7 @@ registry_value() {
 	section "dmesg: display power (sleep/wake; the DPG blank/un-blank of macOS display sleep, DPMS csc 11)"
 	# bd442a0: the blank/un-blank path has never run on the card; these are its lines: "power: HDMI display blanked/unblanked via DPG", "power: display on/off (... sink D0/D3 ...)"
 	# (DP) and the framebuffer's "ndrv: Control csc 11 -> 0x.." (the DPMS request macOS sent). klines falls back to the unified log when the kernel buffer wrapped.
-	klines 'RDNA4FB: (power:|.*ndrv: Control csc 11|.*display (un)?blanked|.*display sleep)' | sed 's/^/  /' || true
+	klines 'RDNA4FB: (power:|.*(ndrv|head2): Control csc 11|.*display (un)?blanked|.*display sleep)' | sed 's/^/  /' || true
 	echo "(no line above = no display power event in the log window; after the optional idle step of START-HERE a blank AND an un-blank are expected)"
 	echo "--- registry copy (survives the kernel log wrapping): RDNA4FB,DisplayPower (last 16 events, oldest first)"
 	DPW_PROP="$(ioreg -l -w0 2>/dev/null | grep '"RDNA4FB,DisplayPower"' | sed -n -E 's/.*"RDNA4FB,DisplayPower" = "([^"]*)".*/\1/p' | head -1)"

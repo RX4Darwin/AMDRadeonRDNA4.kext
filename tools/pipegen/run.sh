@@ -25,7 +25,8 @@
 # How it works: pipegen.c includes dcn401_resource.c for Linux's own register
 # tables and block constructors, builds one fake pipe (stream, plane, link),
 # and calls Linux's dce110_apply_single_controller_ctx_to_hw, link_set_dpms_on
-# and dcn401_program_pipe on it, with the HUBP values from Linux's DML 2.1.
+# and dcn401_program_pipe on it, with the HUBP values from Linux's DML 2.1,
+# then link_set_dpms_off and link_set_dpms_on again for display sleep and wake.
 # rec.c stands in for the register helpers and records. Linux functions that
 # nothing on this path reaches are stubbed to abort if called; the few listed
 # in linux-noops.txt return 0 (each is a query that is false on this path).

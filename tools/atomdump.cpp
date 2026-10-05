@@ -1319,6 +1319,7 @@ static int testPipe2() {
 		{ 1, 0x00a8, 1u << (3 * c.pipe), 0, "DPPCLK_CTRL" },
 		{ 2, 0x00a0, 0, 1, "DC_IP_REQUEST_CNTL" },             // only required to be open
 		{ 2, 0x04fe, 0, 0, "DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A" },
+		{ 1, 0x00a0u + c.dig, 0x710, 0, "SYMCLKn_CLOCK_ENABLE, the stream encoder's half" },
 		{ 3, 0x030a, 1u << c.pipe, 0, "MPC_OUT_CSC_COEF_FORMAT" },
 	};
 	// The instance of a family a register is in, or -1; -2 if in no family.
@@ -1344,6 +1345,8 @@ static int testPipe2() {
 
 	size_t requires = 0, writes = 0, outside = 0;
 	bool wrote = false;
+	// Every register step of a plan stays in the pipe's blocks.
+	auto inBlocks = [&](const Pipe2::Plan &plan) {
 	for (size_t i = 0; i < plan.count; i++) {
 		const ModeSet::Step &s = plan.steps[i];
 		if (s.op == ModeSet::Op::Dmub || s.op == ModeSet::Op::Delay || s.op == ModeSet::Op::Scdc)
@@ -1384,6 +1387,9 @@ static int testPipe2() {
 			                  s.arg, s.dword);
 		}
 	}
+	};
+	inBlocks(plan);
+	const size_t lightWrites = writes;
 	failures += check(requires == 5, "pipe2: %zu requirements, expected 5", requires);
 
 	// A sink with SCDC is told the link is not scrambled (148.5 MHz), before
@@ -1419,13 +1425,16 @@ static int testPipe2() {
 	// What the registers hold afterwards: timing of VIC 16, the surface, the
 	// blender feeding OPP1 from DPP1, the OTG enabled and the lock released.
 	PlanRegs regs;
-	for (size_t i = 0; i < plan.count; i++) {
-		const ModeSet::Step &s = plan.steps[i];
-		if (s.op == ModeSet::Op::Write)
-			regs.set(s.seg, s.dword, s.value);
-		else if (s.op == ModeSet::Op::Update)
-			regs.set(s.seg, s.dword, (regs.get(s.seg, s.dword) & ~s.mask) | s.value);
-	}
+	auto apply = [&](const Pipe2::Plan &p) {
+		for (size_t i = 0; i < p.count; i++) {
+			const ModeSet::Step &s = p.steps[i];
+			if (s.op == ModeSet::Op::Write)
+				regs.set(s.seg, s.dword, s.value);
+			else if (s.op == ModeSet::Op::Update)
+				regs.set(s.seg, s.dword, (regs.get(s.seg, s.dword) & ~s.mask) | s.value);
+		}
+	};
+	apply(plan);
 	struct { uint8_t seg; uint32_t dw, mask, want; const char *name; } after[] = {
 		{ 2, 0x1baa, 0xffffffff, 2199, "OTG1 h total" },         { 2, 0x1baf, 0xffffffff, 1124, "OTG1 v total" },
 		{ 2, 0x1bab, 0x7fff7fff, 0x00c00840, "OTG1 h blank" },   { 2, 0x1bb8, 0x7fff7fff, 0x00290461, "OTG1 v blank" },
@@ -1446,6 +1455,38 @@ static int testPipe2() {
 	for (const auto &e : after)
 		failures += check((regs.get(e.seg, e.dw) & e.mask) == e.want, "pipe2: %s: %u:0x%04x = 0x%08x, want 0x%08x "
 		                  "under 0x%08x", e.name, e.seg, e.dw, regs.get(e.seg, e.dw), e.want, e.mask);
+
+	// Display sleep, then wake, of the lit pipe: no requirements, nothing
+	// outside the pipe's blocks. Sleep takes the stream encoder away and leaves
+	// the timing generator and the plane running; wake sends the encoder and
+	// transmitter commands of lighting again, and afterwards every register
+	// lighting set holds the same again.
+	const PlanRegs lit = regs;
+	static Pipe2::Plan dpms;
+	Pipe2::Target power {};
+	power.encoderObjId = t.encoderObjId;
+	power.part = Pipe2::Part::Sleep;
+	bool slept = Pipe2::build(power, dpms, &why);
+	failures += check(slept && dpms.ncmds == 1 && memcmp(dpms.cmds[0], plan.cmds[0], sizeof(Dmub::Cmd)) == 0,
+	                  "pipe2: sleep plan: %s, %zu DMUB commands", slept ? "built" : why, dpms.ncmds);
+	inBlocks(dpms);
+	apply(dpms);
+	const size_t sleepSteps = dpms.count;
+	failures += check((regs.get(2, 0x22dd) & 1) == 0 && (regs.get(2, 0x2304) & 0x400) == 0 &&
+	                  (regs.get(2, 0x22f0) & 1) == 1 && (regs.get(2, 0x1bc3) & 1) == 1 &&
+	                  regs.get(2, 0x06e6) == lit.get(2, 0x06e6),
+	                  "pipe2: asleep: DIG2 FE %08x, BE %08x, HDMI_GC %08x, OTG1 %08x", regs.get(2, 0x22dd),
+	                  regs.get(2, 0x2304), regs.get(2, 0x22f0), regs.get(2, 0x1bc3));
+	power.part = Pipe2::Part::Wake;
+	bool woke = Pipe2::build(power, dpms, &why);
+	failures += check(woke && dpms.ncmds == 3 && memcmp(dpms.cmds, plan.cmds + 1, 3 * sizeof(Dmub::Cmd)) == 0,
+	                  "pipe2: wake plan: %s, %zu DMUB commands", woke ? "built" : why, dpms.ncmds);
+	inBlocks(dpms);
+	apply(dpms);
+	for (const PlanRegs::R &r : lit.regs)
+		failures += check(regs.get(r.seg, r.dw) == r.v, "pipe2: after sleep and wake %u:0x%04x = 0x%08x, lit it "
+		                  "was 0x%08x", r.seg, r.dw, regs.get(r.seg, r.dw), r.v);
+	failures += check(requires == 5, "pipe2: a sleep or wake plan has a requirement");
 
 	// Stream only: stops before the plane, shows the pattern colour, and never
 	// reaches the HUBP.
@@ -1475,9 +1516,9 @@ static int testPipe2() {
 	failures += check(!Pipe2::build(bad, stream, &why), "pipe2: plane without a surface accepted");
 
 	printf("\npipe2: pipe %u DIG%u link %u HPD%u %ux%u at %u kHz: %zu steps (%zu register writes, %zu "
-	       "requirements), %zu DMUB commands, %zu outside the pipe %s\n", c.pipe, c.dig, c.link, c.hpd,
-	       c.timing.hActive, c.timing.vActive, c.timing.pixelClockKHz, plan.count, writes, requires, plan.ncmds,
-	       outside, failures ? "MISMATCH" : "ok");
+	       "requirements), %zu DMUB commands; sleep %zu steps, wake %zu; %zu outside the pipe %s\n", c.pipe,
+	       c.dig, c.link, c.hpd, c.timing.hActive, c.timing.vActive, c.timing.pixelClockKHz, plan.count,
+	       lightWrites, requires, plan.ncmds, sleepSteps, dpms.count, outside, failures ? "MISMATCH" : "ok");
 	return failures;
 }
 

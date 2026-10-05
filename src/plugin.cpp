@@ -322,6 +322,7 @@ int32_t vbeSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 struct Head2 {
 	IOPCIDevice     *pci { nullptr };
 	IOService       *nub { nullptr };
+	RDNA4Device     *dev { nullptr };       // once the second pipe is lit: display power goes to it
 	bool             ready { false };       // fillHead2 set the mode, surface and EDID
 	Ndrv::Translator ndrv;
 	Ndrv::Surface    surface {};
@@ -344,6 +345,10 @@ bool isHead2(void *fb) {
 bool head2SurfaceFor(void *ctx, const Modes::Mode &, bool, Ndrv::Surface &out) {
 	out = static_cast<Head2 *>(ctx)->surface;
 	return true;
+}
+
+void head2SetPower(void *ctx, bool on) {
+	static_cast<Head2 *>(ctx)->dev->setSecondPipePower(on);
 }
 
 // From wrapStart, before IONDRVFramebuffer starts on the PCI device.
@@ -452,9 +457,21 @@ void fillHead2(RDNA4Device &dev) {
 			FBLOG("head2: nothing to serve: no mode of the sink fits behind the console");
 		return;
 	}
+	if (head2Level >= 2) {
+		if (dev.edid2Len && dev.isAmd)
+			dev.lightSecondPipe(head2Level, h->surface.physBase);
+		else
+			FBLOG("head2: pipe not lit: no second sink answered on DDC");
+	}
 	Ndrv::Backend be {};
 	be.ctx = h;
 	be.surfaceFor = head2SurfaceFor;
+	// Only a lit pipe answers cscGetSync, so only then does macOS send this
+	// head display sleep (a phantom head has nothing to put to sleep).
+	if (dev.pipe2Lit) {
+		h->dev = &dev;
+		be.setPower = head2SetPower;
+	}
 	h->ndrv.init(mode, 1, mode->id, h->edid, sizeof(h->edid), be);
 	// WindowServer maps a framebuffer through getVRAMRange, which IONDRVFramebuffer
 	// only has for an IOBootNDRV: without this it gives up on the head with
@@ -467,12 +484,6 @@ void fillHead2(RDNA4Device &dev) {
 	FBLOG("head2: serving %ux%u@%u.%03u on surface 0x%llx, EDID of %s", mode->t.hActive,
 	      mode->t.vActive, mode->refreshMilliHz / 1000, mode->refreshMilliHz % 1000,
 	      h->surface.physBase, dev.edid2Len ? "the second sink" : "the boot display (no second sink)");
-	if (head2Level >= 2) {
-		if (dev.edid2Len && dev.isAmd)
-			dev.lightSecondPipe(head2Level, h->surface.physBase);
-		else
-			FBLOG("head2: pipe not lit: no second sink answered on DDC");
-	}
 }
 
 // The stand-in for IOBootNDRV::doDriverIO.

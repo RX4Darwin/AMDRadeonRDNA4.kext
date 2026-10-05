@@ -12,7 +12,8 @@
 //  values from DML 2.1) against a recorder and writes the result to
 //  pipe2_linux.inc, for one pipe, encoder, link and timing. build() adds what
 //  only exists at run time: the three DMUB commands, the surface address and
-//  the lit pipe's VM aperture.
+//  the lit pipe's VM aperture. Display sleep and wake of the pipe come from
+//  the same run (link_set_dpms_off, then link_set_dpms_on again).
 //
 //  Freestanding; shared by the kext and tools/atomdump.cpp.
 //
@@ -52,6 +53,12 @@ enum class Depth : uint8_t {
 	Plane,    // and the plane: the sink shows the surface
 };
 
+// Which part of the table: lighting the dark pipe, or display sleep and wake
+// of the lit one. Sleep leaves the timing generator and the plane running and
+// takes the stream encoder and the transmitter away, as amdgpu does for DPMS
+// off; wake is the link half of lighting again.
+enum class Part : uint8_t { Light, Sleep, Wake };
+
 // 16-bit R, G, B of the solid colour the pattern generator shows at
 // Depth::Stream. Not black, so that a lit pipe can be told from a dead one.
 constexpr uint16_t kPatternColour[3] = { 0x1000, 0x6000, 0x9000 };
@@ -63,6 +70,7 @@ struct Target {
 	Depth    depth;
 	bool     sinkScdc;         // the sink's EDID announces SCDC (Edid::hdmi2Caps)
 	uint8_t  ddcLine;          // the connector's DDC line, for the SCDC write
+	Part     part;             // Sleep and Wake need neither litHubp nor surface
 };
 
 constexpr size_t kMaxSteps = 448;
@@ -76,7 +84,8 @@ struct Plan {
 };
 
 // Returns false (and `why`) if the target cannot be expressed. Every
-// Op::Require step comes before the first write.
+// Op::Require step comes before the first write; Sleep and Wake have none
+// (they are for the pipe Part::Light lit).
 bool build(const Target &t, Plan &out, const char **why);
 
 // The link (0 = UNIPHY A) a VBIOS encoder object drives, or -1: object ids

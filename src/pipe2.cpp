@@ -14,7 +14,7 @@ namespace {
 // One entry of the generated table. kind:
 //   W write, U update, T wait for (reg & mask) == value, D delay arg us,
 //   R require (reg & mask) == value before anything is written,
-//   1 2 3 start of the init / stream / plane part,
+//   1 2 3 start of the init / stream / plane part of lighting, 4 5 of sleep / wake,
 //   P E X DMUB set pixel clock / encoder stream setup / transmitter enable,
 //   S the sink's SCDC TMDS_CONFIG = arg (if the sink has SCDC),
 //   K pattern generator colour arg (0 R, 1 G, 2 B),
@@ -41,13 +41,15 @@ bool build(const Target &t, Plan &out, const char **why) {
 	out.count = 0;
 	out.ncmds = 0;
 
-	if (t.litHubp >= 4 || t.litHubp == c.pipe) {
-		err = "the lit pipe uses the HUBP this plan lights";
-		return false;
-	}
-	if (t.depth == Depth::Plane && (t.surface == 0 || (t.surface >> 48) != 0)) {
-		err = "no scanout address";
-		return false;
+	if (t.part == Part::Light) {
+		if (t.litHubp >= 4 || t.litHubp == c.pipe) {
+			err = "the lit pipe uses the HUBP this plan lights";
+			return false;
+		}
+		if (t.depth == Depth::Plane && (t.surface == 0 || (t.surface >> 48) != 0)) {
+			err = "no scanout address";
+			return false;
+		}
 	}
 	const uint32_t khz = c.timing.pixelClockKHz;
 
@@ -64,10 +66,15 @@ bool build(const Target &t, Plan &out, const char **why) {
 		return &out.cmds[out.ncmds++];
 	};
 
+	Part part = Part::Light;   // of the entry: the requirements at the top belong to lighting
 	for (const Gen &g : kGen) {
+		if (g.kind == '4' || g.kind == '5')
+			part = g.kind == '4' ? Part::Sleep : Part::Wake;
+		if (part != t.part)
+			continue;
 		bool ok = true;
 		switch (g.kind) {
-		case '1': case '2':
+		case '1': case '2': case '4': case '5':
 			break;
 		case '3':
 			if (t.depth == Depth::Stream)

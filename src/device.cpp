@@ -2382,6 +2382,8 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		      c.timing.pixelClockKHz, t.depth == Pipe2::Depth::Plane ? "stream and plane" : "stream only",
 		      static_cast<unsigned long>(plan->count), static_cast<unsigned long>(plan->ncmds));
 		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2");
+		pipe2Target = t;
+		pipe2Lit = pipe2On = ok;
 		// Whether it runs: the frame rate of its timing generator, and the
 		// underflow flags of the plane and the OPTC (HUBPn_DCHUBP_CNTL,
 		// ODMn_OPTC_INPUT_GLOBAL_CONTROL), raw.
@@ -2400,4 +2402,34 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 	}
 	IOFree(plan, sizeof(Pipe2::Plan));
 	return ok;
+}
+
+void RDNA4Device::setSecondPipePower(bool on) {
+	if (!pipe2Lit || on == pipe2On)
+		return;
+	if (!displaySleepEnabled) {
+		displayPowerNote(on, "pipe2", "ignored: rdna4-nosleep=1");
+		return;
+	}
+	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
+	if (!plan)
+		return;
+	const Pipe2::Config &c = Pipe2::config();
+	Pipe2::Target t = pipe2Target;
+	t.part = on ? Pipe2::Part::Wake : Pipe2::Part::Sleep;
+	const char *why = "";
+	const bool ok = Pipe2::build(t, *plan, &why) &&
+	                runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2");
+	// The stream encoder's enable, and its symbol clock gate: amdgpu clears
+	// the gate going to sleep and, for HDMI, never sets it again.
+	const uint32_t fe = regReadDmu(2, Pipe::Reg::kDigFeEnCntl + c.dig * Pipe::Reg::kDigStride);
+	const uint32_t symclk = regReadDmu(1, 0x00a0 + c.dig);                       // SYMCLKn_CLOCK_ENABLE
+	FBLOG("power: pipe2 display %s: %lu steps %s; DIG%u_DIG_FE_EN_CNTL=0x%08x SYMCLK%c_CLOCK_ENABLE=0x%08x",
+	      on ? "on" : "off", static_cast<unsigned long>(plan->count), ok ? "ran" : "STOPPED", c.dig, fe,
+	      'A' + c.dig, symclk);
+	char res[48];
+	snprintf(res, sizeof(res), "%s, FE %08x SYMCLK %08x", ok ? "ran" : "STOPPED", fe, symclk);
+	displayPowerNote(on, "pipe2", res);
+	IOFree(plan, sizeof(Pipe2::Plan));
+	pipe2On = on;   // also after a plan that stopped: the next request runs the other one
 }

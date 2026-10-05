@@ -42,6 +42,7 @@ SHARED = {
     'MPC_OUT_CSC_COEF_FORMAT': 1 << pipe,              # MPC_OCSCn_COEF_FORMAT (Linux clears all four)
     'DENTIST_DISPCLK_CNTL': 0,                         # written back as read; Linux's FIFO-error workaround
     'DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A': 0,        # written back as read, to reach the new pipe
+    f'SYMCLK{"ABCD"[dig]}_CLOCK_ENABLE': 0x710,         # SYMCLKn_FE_EN, _FE_SRC_SEL: the stream encoder's half
 }
 WAITABLE = {'DENTIST_DISPCLK_CNTL': 0x00080000}        # DENTIST_DISPCLK_CHG_DONE
 
@@ -84,7 +85,7 @@ for p in lines[1:]:
             requires_late.append(('R', seg, dword, 1, 1, 0, 'DC_IP_REQUEST_CNTL: the IP request window is open'))
         elif what.startswith('begin:'):
             part = what[6:]
-            emit({'init': '1', 'stream': '2', 'plane': '3'}[part], what=part)
+            emit({'init': '1', 'stream': '2', 'plane': '3', 'sleep': '4', 'wake': '5'}[part], what=part)
         elif what == 'dmub:set_pixel_clock':
             emit('P', what='SET_PIXEL_CLOCK')
         elif what == 'dmub:encoder_control':
@@ -139,7 +140,7 @@ for p in lines[1:]:
 first = next(i for i, o in enumerate(out) if o[0] != 'R')
 out[first:first] = requires_late
 kinds = collections.Counter(o[0] for o in out)
-assert kinds['P'] == 1 and kinds['X'] == 1 and kinds['E'] == 2 and kinds['H'] == 1 and kinds['L'] == 1 and kinds['K'] == 3, kinds
+assert kinds['P'] == 2 and kinds['X'] == 2 and kinds['E'] == 4 and kinds['H'] == 1 and kinds['L'] == 1 and kinds['K'] == 3, kinds
 
 det_regs = [addr(f'DCHUBBUB_DET{i}_CTRL') for i in range(4)]
 assert all(s == det_regs[0][0] for s, _ in det_regs)

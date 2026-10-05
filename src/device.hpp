@@ -85,6 +85,12 @@ public:
 	// 3 lights the stream with a solid colour (and publishes what the plane
 	// would then do), 4 also the plane.
 	bool lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhys);
+	// Display sleep and wake of the pipe lightSecondPipe lit, as amdgpu does
+	// DPMS off and on for an HDMI stream (Pipe2::Part): the sink loses the
+	// signal and sleeps; the timing generator and the plane keep running.
+	void setSecondPipePower(bool on);
+	Pipe2::Target pipe2Target {};
+	bool pipe2Lit { false }, pipe2On { false };
 
 	// Display power (DPMS). Off = disable the DP video stream and put the
 	// sink in D3 via DPCD SET_POWER, or on an HDMI pipe blank to black via
