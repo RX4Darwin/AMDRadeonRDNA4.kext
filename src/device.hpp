@@ -92,8 +92,15 @@ public:
 	// DPMS off and on for an HDMI stream (Pipe2::Part): the sink loses the
 	// signal and sleeps; the timing generator and the plane keep running.
 	void setSecondPipePower(bool on);
-	Pipe2::Target pipe2Target {};
+	// A mode switch on that pipe: the mode-set engine (modeset.hpp) pointed at
+	// its blocks, then the AVI infoframe for the new timing. The surface and
+	// its pitch stay; modes are held to secondPipeModeLimits().
+	IOReturn applySecondPipeMode(const Modes::Mode &m);
+	Modes::Limits secondPipeModeLimits() const;
+	Pipe2::Target pipe2Target {};          // .now: the timing the pipe runs
+	uint16_t pipe2ConnectorObjId { 0 };
 	bool pipe2Lit { false }, pipe2On { false };
+	bool runSecondPipePart(Pipe2::Part part, size_t *steps = nullptr);
 
 	// Display power (DPMS). Off = disable the DP video stream and put the
 	// sink in D3 via DPCD SET_POWER, or on an HDMI pipe blank to black via
@@ -227,12 +234,13 @@ private:
 	ModeSet::Plan modePlan {};
 	bool pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out, uint8_t *ddcLine = nullptr);
 	bool runPlan(const ModeSet::Plan &plan) {
-		return runSteps(plan.steps, plan.count, plan.cmds, plan.ncmds, "modeset");
+		return runSteps(plan.steps, plan.count, plan.cmds, plan.ncmds, "modeset", otgOff());
 	}
+	// `otgOffset`: the timing generator whose frames an Op::WaitFrames counts.
 	bool runSteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds, size_t ncmds,
-	              const char *tag);
+	              const char *tag, uint32_t otgOffset);
 	void surveySteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds);
-	bool waitFrames(uint32_t frames);
+	bool waitFrames(uint32_t frames, uint32_t otgOffset);
 
 	bool initHardwareCursor();
 	void freeHardwareCursor();

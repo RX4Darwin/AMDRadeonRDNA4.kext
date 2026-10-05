@@ -1346,10 +1346,11 @@ static int testPipe2() {
 	size_t requires = 0, writes = 0, outside = 0;
 	bool wrote = false;
 	// Every register step of a plan stays in the pipe's blocks.
-	auto inBlocks = [&](const Pipe2::Plan &plan) {
-	for (size_t i = 0; i < plan.count; i++) {
-		const ModeSet::Step &s = plan.steps[i];
-		if (s.op == ModeSet::Op::Dmub || s.op == ModeSet::Op::Delay || s.op == ModeSet::Op::Scdc)
+	auto stepsInBlocks = [&](const ModeSet::Step *steps, size_t count) {
+	for (size_t i = 0; i < count; i++) {
+		const ModeSet::Step &s = steps[i];
+		if (s.op == ModeSet::Op::Dmub || s.op == ModeSet::Op::Delay || s.op == ModeSet::Op::Scdc ||
+		    s.op == ModeSet::Op::WaitFrames)
 			continue;
 		if (s.op == ModeSet::Op::Require) {
 			requires++;
@@ -1388,6 +1389,7 @@ static int testPipe2() {
 		}
 	}
 	};
+	auto inBlocks = [&](const Pipe2::Plan &p) { stepsInBlocks(p.steps, p.count); };
 	inBlocks(plan);
 	const size_t lightWrites = writes;
 	failures += check(requires == 5, "pipe2: %zu requirements, expected 5", requires);
@@ -1487,6 +1489,78 @@ static int testPipe2() {
 		failures += check(regs.get(r.seg, r.dw) == r.v, "pipe2: after sleep and wake %u:0x%04x = 0x%08x, lit it "
 		                  "was 0x%08x", r.seg, r.dw, regs.get(r.seg, r.dw), r.v);
 	failures += check(requires == 5, "pipe2: a sleep or wake plan has a requirement");
+
+	// A mode switch on the lit pipe. The AVI infoframe follows the timing: the
+	// words are what Linux sends (tools/pipegen run for each of these modes),
+	// for the plan's mode in the lighting plan itself.
+	const auto aviWords = [&](const Pipe2::Plan &p, uint32_t *w) {
+		size_t n = 0;
+		for (size_t i = 0; i < p.count; i++)
+			if (p.steps[i].op == ModeSet::Op::Write && p.steps[i].seg == 2 && p.steps[i].dword == 0x22b1)
+				w[n++ % 9] = p.steps[i].value;     // the last infoframe of the plan
+		return n;
+	};
+	struct { Edid::DetailedTiming t; uint32_t w[4]; } avi[] = {
+		{ c.timing,                                                           { 0x88281e86, 0x10, 0x466, 0x899 } },
+		{ { 108000, 1600, 200, 24, 80, 900, 100, 1, 3, true, true, false },   { 0x88281ea5, 0x00, 0x3e9, 0x709 } },
+		{ { 74250, 1280, 370, 110, 40, 720, 30, 5, 5, true, true, false },    { 0x88281e33, 0x04, 0x2ef, 0x673 } },
+		{ { 108000, 1280, 408, 48, 112, 1024, 42, 1, 3, true, true, false },  { 0x88081ef3, 0x00, 0x42b, 0x699 } },
+		{ { 148500, 1920, 720, 528, 44, 1080, 45, 4, 5, true, true, false },  { 0x88281ebd, 0x1f, 0x466, 0xa51 } },
+	};
+	uint32_t w[9] {};
+	failures += check(aviWords(plan, w) == 18 && w[0] == 0x000d0282 && memcmp(w + 1, avi[0].w, sizeof(avi[0].w)) == 0,
+	                  "pipe2: the lighting plan's AVI infoframe is %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3], w[4]);
+	for (const auto &a : avi) {
+		power.part = Pipe2::Part::Avi;
+		power.now = a.t;
+		const bool built = Pipe2::build(power, dpms, &why);
+		const size_t before = outside;
+		inBlocks(dpms);
+		failures += check(built && dpms.count == 13 && dpms.ncmds == 0 && outside == before && aviWords(dpms, w) == 9 &&
+		                  w[0] == 0x000d0282 && memcmp(w + 1, a.w, sizeof(a.w)) == 0 && w[5] == 0,
+		                  "pipe2: AVI infoframe for %ux%u at %u kHz: %08x %08x %08x %08x, Linux sends %08x %08x %08x %08x",
+		                  a.t.hActive, a.t.vActive, a.t.pixelClockKHz, w[1], w[2], w[3], w[4], a.w[0], a.w[1], a.w[2], a.w[3]);
+	}
+	// Sleep and wake after a switch carry the running pixel clock, not the plan's.
+	power.now = avi[1].t;
+	power.part = Pipe2::Part::Sleep;
+	failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 1 && dpms.cmds[0][1] == 1080000,
+	                  "pipe2: sleep at 108 MHz sets the pixel clock to %u x 100 Hz", dpms.cmds[0][1]);
+	power.part = Pipe2::Part::Wake;
+	failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 3 && dpms.cmds[0][2] == 10800 &&
+	                  dpms.cmds[1][2] == 10800, "pipe2: wake at 108 MHz: encoder %u, transmitter %u x 10 kHz",
+	                  dpms.cmds[0][2], dpms.cmds[1][2]);
+	// The switch itself is the boot display's mode-set engine pointed at this
+	// pipe: it must not leave the pipe's blocks either, and it ends on the new
+	// timing with the stream back on.
+	static ModeSet::Plan ms;
+	ModeSet::Target mt {};
+	mt.otg = mt.opp = mt.hubp = c.pipe;
+	mt.dig = c.dig;
+	mt.link = c.link;
+	mt.hpd = c.hpd;
+	mt.encoderObjId = 0x2120;
+	mt.connectorObjId = 0x330c;
+	mt.from = c.timing;
+	mt.to = avi[1].t;
+	const size_t outsideBefore = outside;
+	const bool switched = ModeSet::build(mt, ms, &why);
+	stepsInBlocks(ms.steps, ms.count);
+	for (size_t i = 0; switched && i < ms.count; i++) {
+		const ModeSet::Step &st = ms.steps[i];
+		if (st.op == ModeSet::Op::Write)
+			regs.set(st.seg, st.dword, st.value);
+		else if (st.op == ModeSet::Op::Update)
+			regs.set(st.seg, st.dword, (regs.get(st.seg, st.dword) & ~st.mask) | st.value);
+	}
+	failures += check(switched && outside == outsideBefore && regs.get(2, 0x1baa) == 1799 && regs.get(2, 0x1baf) == 999 &&
+	                  regs.get(2, 0x06c7) == 0x03840640 && regs.get(2, 0x0e8a) == 0x03840640 &&
+	                  regs.get(2, 0x0e8b) == 0x03840640 && (regs.get(2, 0x22dd) & 1) == 1 &&
+	                  (regs.get(2, 0x1bc3) & 1) == 1 && regs.get(2, 0x06e6) == lit.get(2, 0x06e6) &&
+	                  regs.get(2, 0x06e3) == lit.get(2, 0x06e3),
+	                  "pipe2: mode switch to 1600x900: %s, %zu outside; h total %u, viewport %08x, recout %08x",
+	                  switched ? "built" : why, outside - outsideBefore, regs.get(2, 0x1baa), regs.get(2, 0x06c7),
+	                  regs.get(2, 0x0e8a));
 
 	// Stream only: stops before the plane, shows the pattern colour, and never
 	// reaches the HUBP.

@@ -127,12 +127,32 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
 
 ## 6. Limits
 
-- One configuration: pipe 1, DIG2, link 2, HPD3, 1920x1080@60 at 148.5 MHz. Another board or mode needs
-  `tools/pipegen/run.sh` run with other arguments.
+- One configuration to light: pipe 1, DIG2, link 2, HPD3, 1920x1080@60 at 148.5 MHz. Another board, or another mode
+  to start in, needs `tools/pipegen/run.sh` run with other arguments. Once lit the pipe can change mode (below).
 - The second display must be HDMI or DVI (TMDS). A second DisplayPort display needs link training. A mode above
   340 MHz needs the table regenerated for it (the generator then turns the scrambler on by itself).
 - The boot display must not be on the plan's blocks: with the Lenovo alone, the firmware puts it on DIG2 and link 2.
 - System sleep is not handled (it stays vetoed for the whole driver).
+
+### Mode switching
+
+Written 2026-10-05, host-tested, not yet run on the card. With `rdna4-modeset=1` the second head offers the sink's
+other modes, and a switch runs the boot display's mode-set engine (`src/modeset.cpp`) pointed at pipe 1, DIG2 and
+link 2: blank, stream and timing generator off, `SET_PIXEL_CLOCK`, new timing, stream on, viewport and output
+rectangle, unblank. Then the AVI infoframe is sent again for the new timing (VIC, picture aspect, bar ends and
+checksum; `testPipe2` holds the words against what Linux sends for five modes). Display sleep and wake follow the
+running mode's pixel clock and infoframe.
+
+Two limits, both from what is not reprogrammed:
+
+- The surface stays, so no mode is larger than the plan's 1920x1080.
+- The HUBP's request timing (DLG, TTU, the values DML computed for 1920x1080@60) stays, so the pixel clock stays
+  within 25 % of the plan's 148.5 MHz. That is the margin the boot display switches with on the firmware's values.
+  For the Lenovo it leaves 13 modes from 640x480 to 1920x1080 at 50 and 60 Hz, and leaves out its 120 and 144 Hz
+  modes (285 and 333 MHz): those need the request timing from DML for each mode, which the generator can produce.
+
+Log lines: `head2: mode id N ...` (the table), `pipe2: switching to id N ...`, then
+`pipe2: now 1600x900 at 108000 kHz, OTG1 measured 60.000 Hz; HUBP1_DCHUBP_CNTL=...`.
 
 ### Display sleep
 

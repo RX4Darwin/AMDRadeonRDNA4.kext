@@ -57,7 +57,9 @@ enum class Depth : uint8_t {
 // of the lit one. Sleep leaves the timing generator and the plane running and
 // takes the stream encoder and the transmitter away, as amdgpu does for DPMS
 // off; wake is the link half of lighting again.
-enum class Part : uint8_t { Light, Sleep, Wake };
+// Avi sends the AVI infoframe alone, for after a mode switch (the order is the
+// table's: parts '4', '5', '6' follow lighting).
+enum class Part : uint8_t { Light, Sleep, Wake, Avi };
 
 // 16-bit R, G, B of the solid colour the pattern generator shows at
 // Depth::Stream. Not black, so that a lit pipe can be told from a dead one.
@@ -70,7 +72,11 @@ struct Target {
 	Depth    depth;
 	bool     sinkScdc;         // the sink's EDID announces SCDC (Edid::hdmi2Caps)
 	uint8_t  ddcLine;          // the connector's DDC line, for the SCDC write
-	Part     part;             // Sleep and Wake need neither litHubp nor surface
+	Part     part;             // only Light needs litHubp and surface
+	// The timing the pipe runs, once a mode switch (ModeSet) took it off the
+	// plan's; pixelClockKHz 0 = the plan's. Sleep, Wake and Avi follow it: the
+	// pixel clock in the DMUB commands and the infoframe's VIC and bars.
+	Edid::DetailedTiming now;
 };
 
 constexpr size_t kMaxSteps = 448;

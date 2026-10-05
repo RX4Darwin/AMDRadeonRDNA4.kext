@@ -134,6 +134,8 @@ bool dmtTiming(uint16_t hActive, uint16_t vActive, uint16_t hz,
 
 // CEA-861 VIC -> timing. False for unknown and for interlaced VICs.
 bool vicTiming(uint8_t vic, DetailedTiming &out);
+// The (first) VIC whose timing is exactly `t`, or 0.
+uint8_t vicOf(const DetailedTiming &t);
 
 // --- CTA-861 extension block ------------------------------------------------
 // Sink capabilities needed to pick a legal signal for mode setting: pixel

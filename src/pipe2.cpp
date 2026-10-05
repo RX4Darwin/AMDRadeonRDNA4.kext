@@ -14,9 +14,10 @@ namespace {
 // One entry of the generated table. kind:
 //   W write, U update, T wait for (reg & mask) == value, D delay arg us,
 //   R require (reg & mask) == value before anything is written,
-//   1 2 3 start of the init / stream / plane part of lighting, 4 5 of sleep / wake,
+//   1 2 3 start of the init / stream / plane part of lighting, 4 5 6 of sleep / wake / avi,
 //   P E X DMUB set pixel clock / encoder stream setup / transmitter enable,
 //   S the sink's SCDC TMDS_CONFIG = arg (if the sink has SCDC),
+//   A word arg of the AVI infoframe, for the timing the pipe runs (aviWord),
 //   K pattern generator colour arg (0 R, 1 G, 2 B),
 //   C copy from the lit pipe's register, arg dwords per HUBP instance below,
 //   H L surface address high / low.
@@ -29,6 +30,22 @@ struct Gen {
 };
 
 #include "pipe2_linux.inc"
+
+// The words of the AVI infoframe (version 2, 13 bytes) that depend on the
+// timing, as amdgpu's set_avi_info_frame fills them for 8 bpc full-range RGB:
+// word 1 is the checksum and PB1..3 (PB2 holds the picture aspect), 2 the VIC,
+// 3 and 4 the bottom and right bar ends (v total + 1, h total + 1).
+uint32_t aviWord(const Edid::DetailedTiming &t, uint32_t word) {
+	const uint32_t aspect = t.hActive * 9 == t.vActive * 16 ? 2 : t.hActive * 3 == t.vActive * 4 ? 1 : 0;
+	const uint32_t pb[4] = { 0x1e | (((aspect << 4) | 8) << 8) | (0x88u << 16), Edid::vicOf(t),
+	                         t.vTotal() + 1, t.hTotal() + 1 };
+	if (word != 1)
+		return pb[word - 1];
+	uint32_t sum = 0x82 + 0x02 + 0x0d;   // the header: type, version, length
+	for (uint32_t v : pb)
+		sum += (v & 0xff) + ((v >> 8) & 0xff) + ((v >> 16) & 0xff);
+	return ((0x100 - (sum & 0xff)) & 0xff) | (pb[0] << 8);
+}
 
 } // namespace
 
@@ -51,7 +68,14 @@ bool build(const Target &t, Plan &out, const char **why) {
 			return false;
 		}
 	}
-	const uint32_t khz = c.timing.pixelClockKHz;
+	const bool moved = t.part != Part::Light && t.now.pixelClockKHz;
+	const Edid::DetailedTiming &timing = moved ? t.now : c.timing;
+	const uint32_t khz = timing.pixelClockKHz;
+	// The scrambler setting in these parts is the plan's.
+	if ((khz > ModeSet::kScrambleFromKHz) != (c.timing.pixelClockKHz > ModeSet::kScrambleFromKHz)) {
+		err = "sleep and wake are generated for the plan's side of 340 MHz";
+		return false;
+	}
 
 	auto step = [&](ModeSet::Op op, const Gen &g, uint32_t mask, uint32_t value, uint32_t arg,
 	                bool optional = false) {
@@ -68,13 +92,13 @@ bool build(const Target &t, Plan &out, const char **why) {
 
 	Part part = Part::Light;   // of the entry: the requirements at the top belong to lighting
 	for (const Gen &g : kGen) {
-		if (g.kind == '4' || g.kind == '5')
-			part = g.kind == '4' ? Part::Sleep : Part::Wake;
+		if (g.kind >= '4' && g.kind <= '6')
+			part = static_cast<Part>(g.kind - '3');
 		if (part != t.part)
 			continue;
 		bool ok = true;
 		switch (g.kind) {
-		case '1': case '2': case '4': case '5':
+		case '1': case '2': case '4': case '5': case '6':
 			break;
 		case '3':
 			if (t.depth == Depth::Stream)
@@ -86,6 +110,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 		// Linux carries on past a wait that times out, with a warning.
 		case 'T': ok = step(ModeSet::Op::WaitValue, g, g.mask, g.value, g.arg, true); break;
 		case 'D': ok = step(ModeSet::Op::Delay, g, 0, 0, g.arg); break;
+		case 'A': ok = step(ModeSet::Op::Write, g, 0, aviWord(timing, g.arg), 0); break;
 		case 'K': {
 			// The register holds the 16-bit colour twice (DPG_COLOUR0 and 1).
 			const uint32_t v = t.depth == Depth::Stream ? kPatternColour[g.arg] * 0x10001u : g.value;

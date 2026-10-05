@@ -2063,9 +2063,9 @@ bool RDNA4Device::pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out, uint8_t
 	return false;
 }
 
-// Let `frames` frames of the lit OTG pass, by its frame counter.
-bool RDNA4Device::waitFrames(uint32_t frames) {
-	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otgOff();
+// Let `frames` frames of an OTG pass, by its frame counter.
+bool RDNA4Device::waitFrames(uint32_t frames, uint32_t otgOffset) {
+	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otgOffset;
 	uint32_t last = regReadDmu(2, reg) & 0xffffff;
 	for (uint32_t seen = 0, us = 0; seen < frames; us += 100) {
 		if (us > frames * 100000u)                // 100 ms per frame is 10 Hz
@@ -2081,7 +2081,7 @@ bool RDNA4Device::waitFrames(uint32_t frames) {
 }
 
 bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds,
-                           size_t ncmds, const char *tag) {
+                           size_t ncmds, const char *tag, uint32_t otgOffset) {
 	for (size_t i = 0; i < count; i++) {
 		const ModeSet::Step &s = steps[i];
 		switch (s.op) {
@@ -2140,7 +2140,7 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 			}
 			break;
 		case ModeSet::Op::WaitFrames:
-			if (!waitFrames(s.arg)) {
+			if (!waitFrames(s.arg, otgOffset)) {
 				FBLOG("%s: step %lu (%s): the OTG is not counting frames", tag,
 				      static_cast<unsigned long>(i), s.what);
 				return false;
@@ -2381,8 +2381,10 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		      "commands", c.pipe, c.dig, c.link, c.hpd, c.timing.hActive, c.timing.vActive,
 		      c.timing.pixelClockKHz, t.depth == Pipe2::Depth::Plane ? "stream and plane" : "stream only",
 		      static_cast<unsigned long>(plan->count), static_cast<unsigned long>(plan->ncmds));
-		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2");
+		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", c.pipe * Pipe::Reg::kOtgStride);
 		pipe2Target = t;
+		pipe2Target.now = c.timing;
+		pipe2ConnectorObjId = path.connectorObjId;
 		pipe2Lit = pipe2On = ok;
 		// Whether it runs: the frame rate of its timing generator, and the
 		// underflow flags of the plane and the OPTC (HUBPn_DCHUBP_CNTL,
@@ -2449,6 +2451,26 @@ void RDNA4Device::comparePipeColour(const Pipe2::Plan &plan) {
 	      compared, c.pipe, pipe.hubp, pipe.opp, differ);
 }
 
+// One part of the generated table for the timing the pipe runs now.
+bool RDNA4Device::runSecondPipePart(Pipe2::Part part, size_t *steps) {
+	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
+	if (!plan)
+		return false;
+	Pipe2::Target t = pipe2Target;
+	t.part = part;
+	const char *why = "";
+	bool ok = Pipe2::build(t, *plan, &why);
+	if (!ok)
+		FBLOG("pipe2: no plan: %s", why);
+	else
+		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2",
+		              Pipe2::config().pipe * Pipe::Reg::kOtgStride);
+	if (steps)
+		*steps = plan->count;
+	IOFree(plan, sizeof(Pipe2::Plan));
+	return ok;
+}
+
 void RDNA4Device::setSecondPipePower(bool on) {
 	if (!pipe2Lit || on == pipe2On)
 		return;
@@ -2456,25 +2478,82 @@ void RDNA4Device::setSecondPipePower(bool on) {
 		displayPowerNote(on, "pipe2", "ignored: rdna4-nosleep=1");
 		return;
 	}
-	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
-	if (!plan)
-		return;
 	const Pipe2::Config &c = Pipe2::config();
-	Pipe2::Target t = pipe2Target;
-	t.part = on ? Pipe2::Part::Wake : Pipe2::Part::Sleep;
-	const char *why = "";
-	const bool ok = Pipe2::build(t, *plan, &why) &&
-	                runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2");
+	size_t steps = 0;
+	const bool ok = runSecondPipePart(on ? Pipe2::Part::Wake : Pipe2::Part::Sleep, &steps);
 	// The stream encoder's enable, and its symbol clock gate: amdgpu clears
 	// the gate going to sleep and, for HDMI, never sets it again.
 	const uint32_t fe = regReadDmu(2, Pipe::Reg::kDigFeEnCntl + c.dig * Pipe::Reg::kDigStride);
 	const uint32_t symclk = regReadDmu(1, 0x00a0 + c.dig);                       // SYMCLKn_CLOCK_ENABLE
 	FBLOG("power: pipe2 display %s: %lu steps %s; DIG%u_DIG_FE_EN_CNTL=0x%08x SYMCLK%c_CLOCK_ENABLE=0x%08x",
-	      on ? "on" : "off", static_cast<unsigned long>(plan->count), ok ? "ran" : "STOPPED", c.dig, fe,
+	      on ? "on" : "off", static_cast<unsigned long>(steps), ok ? "ran" : "STOPPED", c.dig, fe,
 	      'A' + c.dig, symclk);
 	char res[48];
 	snprintf(res, sizeof(res), "%s, FE %08x SYMCLK %08x", ok ? "ran" : "STOPPED", fe, symclk);
 	displayPowerNote(on, "pipe2", res);
-	IOFree(plan, sizeof(Pipe2::Plan));
 	pipe2On = on;   // also after a plan that stopped: the next request runs the other one
+}
+
+// The modes the second pipe can be switched to. They scan the surface it was
+// lit on, so none is larger than the plan's; and the HUBP's request timing
+// (DLG, TTU) stays as DML made it for the plan's mode, so the pixel clock
+// stays within 25 % of that one, the margin the boot display's switching runs
+// with (buildModeTable).
+Modes::Limits RDNA4Device::secondPipeModeLimits() const {
+	const Edid::DetailedTiming &plan = Pipe2::config().timing;
+	Modes::Limits lim {};
+	lim.maxHActive = plan.hActive;
+	lim.maxVActive = plan.vActive;
+	lim.maxPixelClockKHz = plan.pixelClockKHz * 5 / 4;
+	return lim;
+}
+
+IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
+	if (!pipe2Lit)
+		return kIOReturnUnsupported;
+	const Pipe2::Config &c = Pipe2::config();
+	const uint32_t otgOffset = c.pipe * Pipe::Reg::kOtgStride;
+	auto *plan = static_cast<ModeSet::Plan *>(IOMalloc(sizeof(ModeSet::Plan)));
+	if (!plan)
+		return kIOReturnNoMemory;
+	ModeSet::Target t {};
+	t.otg = t.opp = t.hubp = c.pipe;
+	t.dig = c.dig;
+	t.link = c.link;
+	t.hpd = c.hpd;
+	t.encoderObjId = pipe2Target.encoderObjId;
+	t.connectorObjId = pipe2ConnectorObjId;
+	t.sinkScdc = pipe2Target.sinkScdc;
+	t.ddcLine = pipe2Target.ddcLine;
+	// From the timing the pipe runs to `to`, then the infoframe for it.
+	bool touched = false;   // a refused plan changes nothing; one that stops half-way does
+	const char *why = "";
+	auto retime = [&](const Edid::DetailedTiming &to) {
+		t.from = pipe2Target.now;
+		t.to = to;
+		if (!ModeSet::build(t, *plan, &why))
+			return false;
+		why = "a step failed";
+		touched = true;
+		if (!runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", otgOffset))
+			return false;
+		pipe2Target.now = to;
+		return runSecondPipePart(Pipe2::Part::Avi);
+	};
+	const Edid::DetailedTiming was = pipe2Target.now;
+	FBLOG("pipe2: switching to id %u %ux%u@%u.%03u (%u kHz)", m.id, m.t.hActive, m.t.vActive,
+	      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, m.t.pixelClockKHz);
+	const bool ok = retime(m.t);
+	if (!ok) {
+		FBLOG("pipe2: switch to id %u failed: %s", m.id, why);
+		if (touched && !retime(was))
+			FBLOG("pipe2: the previous mode is NOT restored: %s", why);
+	}
+	const uint64_t periodNs = measureFramePeriodNs(otgOffset);
+	const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
+	FBLOG("pipe2: now %ux%u at %u kHz, OTG%u measured %u.%03u Hz; HUBP%u_DCHUBP_CNTL=0x%08x", pipe2Target.now.hActive,
+	      pipe2Target.now.vActive, pipe2Target.now.pixelClockKHz, c.pipe, mHz / 1000, mHz % 1000, c.pipe,
+	      regReadDmu(2, 0x05f4 + c.pipe * Pipe::Reg::kHubpStride));
+	IOFree(plan, sizeof(ModeSet::Plan));
+	return ok ? kIOReturnSuccess : kIOReturnIOError;
 }

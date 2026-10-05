@@ -71,6 +71,10 @@ require(f'DIG{dig}_DIG_FE_EN_CNTL', 1, 0, 'the stream encoder is off')
 require(f'DIG{link}_DIG_BE_EN_CNTL', 1, 0, 'the link encoder is off')
 
 PLACEHOLDER_HI, PLACEHOLDER_LO = 0x0000c3e1, 0x5a3c1e00
+# The AVI infoframe (generic packet 0, nine data words): words 1 to 4 depend on the timing and become 'A'
+# entries, which src/pipe2.cpp computes for the timing the pipe runs. The steps of the last update are repeated
+# as a part of their own, for after a mode switch.
+avi_word, avi_from = 0, None
 requires_late = []      # requirements the trace states further down: they still go before the first write
 part = None
 for p in lines[1:]:
@@ -110,6 +114,20 @@ for p in lines[1:]:
     seg, dword, mask, value, arg, func = int(p[1]), int(p[2], 0), int(p[3], 16), int(p[4], 16), int(p[5]), p[7]
     name, allowed = classify(seg, dword)
     what = f'{func} {name}'
+    if func == 'vpg3_update_generic_info_packet':
+        if k == 'WAIT':             # Linux sends it twice while enabling a stream: the last one is repeated
+            avi_from = len(out)
+        if name == f'VPG{dig}_VPG_GENERIC_PACKET_ACCESS_CTRL':
+            assert k == 'U' and value == 0, 'generic packet 0 expected'
+            avi_word = 0
+        elif name == f'VPG{dig}_VPG_GENERIC_PACKET_DATA':
+            assert k == 'W'
+            if 1 <= avi_word <= 4:
+                emit('A', seg, dword, mask, value, avi_word, what)
+                avi_word += 1
+                continue
+            assert value == (0x000d0282 if avi_word == 0 else 0), 'AVI infoframe header or tail changed'
+            avi_word += 1
     if k == 'WAIT':
         if allowed is not None and mask & ~WAITABLE.get(name, 0):
             sys.exit(f'refused: wait on {name} mask {mask:08x}')
@@ -137,10 +155,15 @@ for p in lines[1:]:
     else:
         emit(k, seg, dword, mask, value, arg, what)
 
+# wait, lock, index, nine words, update
+avi = out[avi_from:avi_from + 13] if avi_from is not None else []
+assert part == 'wake' and ''.join(o[0] for o in avi) == 'TUUWAAAAWWWWU', 'no AVI infoframe update in the wake part'
+out += [('6', 0, 0, 0, 0, 0, 'avi')] + avi
+
 first = next(i for i, o in enumerate(out) if o[0] != 'R')
 out[first:first] = requires_late
 kinds = collections.Counter(o[0] for o in out)
-assert kinds['P'] == 2 and kinds['X'] == 2 and kinds['E'] == 4 and kinds['H'] == 1 and kinds['L'] == 1 and kinds['K'] == 3, kinds
+assert kinds['P'] == 2 and kinds['X'] == 2 and kinds['E'] == 4 and kinds['A'] == 20 and kinds['6'] == 1 and kinds['H'] == 1 and kinds['L'] == 1 and kinds['K'] == 3, kinds
 
 det_regs = [addr(f'DCHUBBUB_DET{i}_CTRL') for i in range(4)]
 assert all(s == det_regs[0][0] for s, _ in det_regs)

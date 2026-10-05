@@ -328,7 +328,8 @@ struct Head2 {
 	Ndrv::Surface    surface {};
 	IODeviceMemory  *vram { nullptr };      // the surface, for getVRAMRange (wrapGetVRAMRange)
 	Modes::Mode      table[Modes::MaxModes] {};
-	uint8_t          edid[128] {};
+	uint8_t          edid[256] {};          // base block and one extension
+	size_t           edidLen { 0 };
 	uint32_t         traceBudget { 400 };   // its own: head 0 must not use up the lines
 };
 Head2 *head2 { nullptr };
@@ -342,9 +343,17 @@ bool isHead2(void *fb) {
 	return head2 && static_cast<IOService *>(fb)->getProvider() == head2->nub;
 }
 
-bool head2SurfaceFor(void *ctx, const Modes::Mode &, bool, Ndrv::Surface &out) {
-	out = static_cast<Head2 *>(ctx)->surface;
+// Every mode scans the one surface, from its first pixel and with its pitch.
+bool head2SurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) {
+	const Ndrv::Surface &s = static_cast<Head2 *>(ctx)->surface;
+	if (m.t.hActive > s.width || m.t.vActive > s.height)
+		return false;
+	out = { s.physBase, s.rowBytes, m.t.hActive, m.t.vActive };
 	return true;
+}
+
+int32_t head2SwitchTo(void *ctx, const Modes::Mode &m, bool) {
+	return static_cast<Head2 *>(ctx)->dev->applySecondPipeMode(m);
 }
 
 void head2SetPower(void *ctx, bool on) {
@@ -406,10 +415,14 @@ void fillHead2(RDNA4Device &dev) {
 		return;
 	IOService *client = h->nub->getClient();
 	FBLOG("head2: framebuffer on the nub: %s", client ? client->getName() : "none started");
-	if (!dev.edid2Len && dev.edidLen < 128) {
+	// The second sink if one answered, else a copy of the boot display's.
+	const uint8_t *edid = dev.edid2Len ? dev.edid2Data : dev.edidData;
+	h->edidLen = min(static_cast<size_t>(dev.edid2Len ? dev.edid2Len : dev.edidLen), sizeof(h->edid));
+	if (h->edidLen < 128) {
 		FBLOG("head2: nothing to serve: no EDID");
 		return;
 	}
+	memcpy(h->edid, edid, h->edidLen);
 	// A pipe to light needs a second monitor. Without one there would only be
 	// the phantom head, an invisible display for windows to get lost on: that
 	// is rdna4-head2=1, asked for by name.
@@ -432,12 +445,12 @@ void fillHead2(RDNA4Device &dev) {
 			break;
 		}
 	}
-	// The second sink if one answered, else a copy of the boot display's.
-	memcpy(h->edid, dev.edid2Len ? dev.edid2Data : dev.edidData, sizeof(h->edid));
 	// The first mode, in table order (native first), whose surface fits. With
 	// the pipe to be lit (rdna4-head2 >= 2) it has to be the one mode the
-	// second-pipe plan was generated for.
-	const size_t n = Modes::build(h->edid, sizeof(h->edid), Modes::Limits {}, h->table, Modes::MaxModes);
+	// second-pipe plan was generated for; the table then only holds what that
+	// pipe can be switched to.
+	const size_t n = Modes::build(h->edid, h->edidLen, head2Level >= 2 ? dev.secondPipeModeLimits() : Modes::Limits {},
+	                              h->table, Modes::MaxModes);
 	const Edid::DetailedTiming &lit = Pipe2::config().timing;
 	auto isPlanMode = [&](const Edid::DetailedTiming &t) {
 		return t.pixelClockKHz == lit.pixelClockKHz && !t.interlaced &&
@@ -475,7 +488,11 @@ void fillHead2(RDNA4Device &dev) {
 		h->dev = &dev;
 		be.setPower = head2SetPower;
 	}
-	h->ndrv.init(mode, 1, mode->id, h->edid, sizeof(h->edid), be);
+	// Like the boot display, the other modes are offered with rdna4-modeset=1.
+	const bool switching = dev.pipe2Lit && dev.modesetRequested;
+	if (switching)
+		be.switchTo = head2SwitchTo;
+	h->ndrv.init(switching ? h->table : mode, switching ? n : 1, mode->id, h->edid, h->edidLen, be);
 	// WindowServer maps a framebuffer through getVRAMRange, which IONDRVFramebuffer
 	// only has for an IOBootNDRV: without this it gives up on the head with
 	// "Failed to map VRAM" (card boot of 2026-10-03, 19:46).
@@ -487,6 +504,11 @@ void fillHead2(RDNA4Device &dev) {
 	FBLOG("head2: serving %ux%u@%u.%03u on surface 0x%llx, EDID of %s", mode->t.hActive,
 	      mode->t.vActive, mode->refreshMilliHz / 1000, mode->refreshMilliHz % 1000,
 	      h->surface.physBase, dev.edid2Len ? "the second sink" : "the boot display (no second sink)");
+	for (size_t i = 0; switching && i < n; i++) {
+		const Modes::Mode &m = h->table[i];
+		FBLOG("head2: mode id %u %ux%u@%u.%03u %u kHz%s", m.id, m.t.hActive, m.t.vActive,
+		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, m.t.pixelClockKHz, &m == mode ? " (lit)" : "");
+	}
 }
 
 // The stand-in for IOBootNDRV::doDriverIO.
