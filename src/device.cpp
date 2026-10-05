@@ -379,13 +379,16 @@ void RDNA4Device::dumpDCN() {
 	// MSA reads consistent (RGB 10bpc, MISC0=0x40 in COLORIMETRY[31:24]).
 	// Remaining GPU-side suspect: secondary data packets (VSC/GSP) that DP1.3+
 	// sinks may honor over the MSA. Dump the SDP enables and stream control.
-	FBLOG("dcn:   DP0_DP_MSA_MISC = 0x%08x (MISC1..4)", regReadDmu(2, 0x2124));
-	FBLOG("dcn:   DP0_DP_VID_STREAM_CNTL = 0x%08x", regReadDmu(2, 0x2122));
-	FBLOG("dcn:   DP0_DP_SEC_CNTL  = 0x%08x (GSP/VSC/ASP enables)", regReadDmu(2, 0x2141));
-	FBLOG("dcn:   DP0_DP_SEC_CNTL1 = 0x%08x", regReadDmu(2, 0x2142));
-	FBLOG("dcn:   DP0_DP_SEC_CNTL2 = 0x%08x", regReadDmu(2, 0x2169));
-	FBLOG("dcn:   DP0_DP_SEC_CNTL7 = 0x%08x", regReadDmu(2, 0x216e));
-	FBLOG("dcn:   DP0_DP_MSA_VBID_MISC = 0x%08x", regReadDmu(2, 0x2170));
+	// Of the lit pipe's stream encoder (DP0 if no pipe was found).
+	const uint32_t dig = digOff();
+	const unsigned enc = dig / Pipe::Reg::kDigStride;
+	FBLOG("dcn:   DP%u_DP_MSA_MISC = 0x%08x (MISC1..4)", enc, regReadDmu(2, 0x2124 + dig));
+	FBLOG("dcn:   DP%u_DP_VID_STREAM_CNTL = 0x%08x", enc, regReadDmu(2, 0x2122 + dig));
+	FBLOG("dcn:   DP%u_DP_SEC_CNTL  = 0x%08x (GSP/VSC/ASP enables)", enc, regReadDmu(2, 0x2141 + dig));
+	FBLOG("dcn:   DP%u_DP_SEC_CNTL1 = 0x%08x", enc, regReadDmu(2, 0x2142 + dig));
+	FBLOG("dcn:   DP%u_DP_SEC_CNTL2 = 0x%08x", enc, regReadDmu(2, 0x2169 + dig));
+	FBLOG("dcn:   DP%u_DP_SEC_CNTL7 = 0x%08x", enc, regReadDmu(2, 0x216e + dig));
+	FBLOG("dcn:   DP%u_DP_MSA_VBID_MISC = 0x%08x", enc, regReadDmu(2, 0x2170 + dig));
 
 	// MPC MCM blocks (shaper -> 3DLUT -> 1DLUT), the post-CSC colour stages
 	// not covered by earlier dumps. An enabled 3DLUT with unloaded RAM would
@@ -1804,9 +1807,14 @@ void RDNA4Device::tryForce8bpc() {
 	if (!PE_parse_boot_argn("rdna4-8bpc", &v, sizeof(v)) || v == 0)
 		return;
 
-	// DP0 stream encoder (the active one on this machine).
-	constexpr uint32_t kDpPixelFormat   = 0x211f; // base 2
-	constexpr uint32_t kDpMsaColorimetry= 0x2120; // base 2
+	// The firmware does not always light the DP display on DIG0.
+	if (!pipe.valid() || pipe.signal != Pipe::Signal::DpSst) {
+		FBLOG("8bpc: the lit pipe is not DisplayPort: nothing done");
+		return;
+	}
+	// The lit pipe's DP stream encoder (DP0's registers, base 2, DIG stride).
+	const uint32_t kDpPixelFormat    = 0x211f + digOff();
+	const uint32_t kDpMsaColorimetry = 0x2120 + digOff();
 	constexpr uint32_t kDepthMask       = 0x00000700; // UNCOMPRESSED_COMPONENT_DEPTH
 	constexpr uint32_t kDepth8bpc       = 1u << 8;
 	constexpr uint32_t kMisc0Mask       = 0xFF000000; // MISC0 in [31:24]
@@ -1821,8 +1829,8 @@ void RDNA4Device::tryForce8bpc() {
 
 	uint32_t pfNew  = (pf  & ~kDepthMask) | kDepth8bpc;
 	uint32_t colNew = (col & ~kMisc0Mask) | kMisc0Rgb8bpc;
-	FBLOG("8bpc: DP_PIXEL_FORMAT 0x%08x -> 0x%08x, MSA_COLORIMETRY 0x%08x -> 0x%08x",
-	      pf, pfNew, col, colNew);
+	FBLOG("8bpc: DP%u: DP_PIXEL_FORMAT 0x%08x -> 0x%08x, MSA_COLORIMETRY 0x%08x -> 0x%08x",
+	      pipe.dig, pf, pfNew, col, colNew);
 	regWriteDmu(2, kDpPixelFormat, pfNew);
 	regWriteDmu(2, kDpMsaColorimetry, colNew);
 	FBLOG("8bpc: readback DP_PIXEL_FORMAT=0x%08x MSA_COLORIMETRY=0x%08x",
@@ -1924,9 +1932,7 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 				initHardwareCursor();
 			probeMemSize();
 			dumpDCN();
-			// DP-stream experiment; meaningless (and aimed at DP0) on HDMI.
-			if (!pipe.isTmds())
-				tryForce8bpc();
+			tryForce8bpc();   // DP-stream experiment (rdna4-8bpc=1)
 			probeEDID();
 			dumpModeState();
 			dmubHistory();
