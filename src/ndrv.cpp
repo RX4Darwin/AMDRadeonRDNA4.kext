@@ -180,7 +180,7 @@ bool Translator::status(uint16_t code, void *params, int32_t &ret) {
 		ret = getConnection(*static_cast<VDDisplayConnectInfoRec *>(params));
 		return true;
 	case cscGetDDCBlock:
-		if (!edidLen)
+		if (!edidLen || !connected)
 			return false;
 		ret = getDDCBlock(*static_cast<VDDDCBlockRec *>(params));
 		return true;
@@ -370,7 +370,9 @@ int32_t Translator::getConnection(VDDisplayConnectInfoRec &r) const {
 	r.csConnectTaggedData = 0;
 	// IONDRVFramebuffer::hasDDCConnect needs both DDC bits.
 	r.csConnectFlags      = kReportsDDCConnection;
-	if (edidLen)
+	if (!connected)
+		r.csConnectFlags |= kConnectionInactive;
+	else if (edidLen)
 		r.csConnectFlags |= kHasDDCConnection | kHasDirectConnection;
 	r.csDisplayComponent  = 0;
 	r.csConnectReserved   = 0;

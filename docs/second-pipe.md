@@ -98,7 +98,8 @@ Departures:
   from the lit HUBP, so that the surface address means the same on both.
 - **SCDC.** Where Linux calls `write_scdc_data`, the plan writes the sink's `TMDS_CONFIG` (0 at this clock) if the
   sink's EDID announces SCDC. Linux also reads the scrambler status back afterwards, only to log it; the plan does not.
-- **No audio, no HDCP, no hot-plug.** The AVI infoframe is Linux's (VIC 16, RGB, full range).
+- **No audio, no HDCP.** The AVI infoframe is Linux's (VIC 16, RGB, full range). Hot-plug is the driver's own
+  (section 6).
 - DML ran with the static bounding box, not the SMU's clock table, and with GPU VM off (the surface is in the frame
   buffer aperture).
 
@@ -165,6 +166,40 @@ not carry. Limits:
 Log lines: `head2: mode id N ...` (the table), `pipe2: switching to id N ..., request timing from Linux for this
 mode`, then `pipe2: now 1920x1080 at 333070 kHz, OTG1 measured 143.999 Hz; HUBP1_DCHUBP_CNTL=...
 ODM1_OPTC_INPUT_GLOBAL_CONTROL=... DET 7`.
+
+### Hot-plug
+
+Verified on the card 2026-10-05 (section 7), except display sleep with it active. Behind `rdna4-hotplug`, with
+`rdna4-head2` at 2 or more:
+
+- **1** only logs what the connector's HPD pin does (`hotplug: HPD3 went low`), to see how a monitor behaves when it
+  sleeps or is switched off. It needs a monitor at boot.
+- **2** acts on it, and makes the second head exist without a monitor too: it then reports its connection as
+  inactive (`kConnectionInactive` in `cscGetConnection`), which is how an NDRV says "nothing plugged in", and
+  IONDRVFramebuffer keeps the framebuffer offline, so macOS shows no display.
+
+The pin (`DC_GPIO_HPD_Y`) is polled twice a second from a timer on the framebuffer's work loop; no interrupt from
+the card is involved. A second of high is a plug, and three seconds of low **while the link is up** an unplug: a
+monitor that macOS put to sleep may drop the pin and take a while to raise it again.
+
+- **Unplug:** the link goes down the way display sleep takes it down, the head turns inactive, macOS is told.
+- **Plug, the display that was there:** (same EDID) the link comes back in the mode it was in and the head turns
+  active again; modes and their IDs are as macOS left them.
+- **Plug, another display, or the first one after a boot without:** the EDID is read over DDC and the mode table
+  rebuilt. The display must have the mode the plan lights (1920x1080@60); the pipe is lit if it never was, or woken
+  and switched back to that mode, and the table starts there.
+
+macOS is told through IOFramebuffer's own connect interrupt handler. IOFramebuffer registers it with
+`registerForInterruptType(kIOFBConnectInterruptType)` when it opens; behind an IOBootNDRV that registration finds no
+interrupt service and fails, so the plugin routes the call and keeps the handler. Calling it is what a real driver's
+hot-plug interrupt does: IOFramebuffer counts a connect change, WindowServer acknowledges, and each framebuffer of
+the controller is asked `cscGetConnection` again, then for its EDID and modes.
+
+Only the second pipe's connector is handled. The boot display on DisplayPort would need link training to come back.
+
+Log lines: `hotplug: polling HPD3 (now high), acting on it; head 2 is connected`, `hotplug: HPD3 went low`,
+`hotplug: display gone from HPD3: link off`, `hotplug: the same display is back on HPD3`,
+`hotplug: display connected on HPD3: 15 mode(s), EDID 256 bytes`.
 
 ### Display sleep
 
@@ -259,4 +294,24 @@ Display sleep and wake at 144 Hz ran later in the same boot (16:07): `pipe2: now
 measured 144.001 Hz`, then `power: pipe2 display off: 39 steps ran` and, 0.9 s later, `power: pipe2 display on: 128
 steps ran; DIG2_DIG_FE_EN_CNTL=0x00000001 SYMCLKC_CLOCK_ENABLE=0x00000211`, with macOS still at 144 Hz afterwards.
 The sleep and wake parts carried the running mode's pixel clock (333.07 MHz) and infoframe.
+
+**Hot-plug, 2026-10-05 16:26 and 16:29 (`rdna4-head2=4 rdna4-modeset=1 rdna4-hotplug=2`): works.**
+
+*Lenovo there at boot, at 144 Hz.* `hotplug: polling HPD3 (now high), acting on it; head 2 is connected`. Cable out:
+`hotplug: HPD3 went low`, 2.5 s later `power: pipe2 display off: 39 steps ran` (its SCDC write is not acknowledged:
+no monitor) and `hotplug: display gone from HPD3: link off`. macOS dropped the display and moved its windows to the
+Samsung. Cable in: `hotplug: HPD3 went high`, a second later the wake part (128 steps, at 333 MHz) and
+`hotplug: the same display is back on HPD3`; the Lenovo came back with a correct picture, still at 144 Hz.
+
+*Booted without the Lenovo.* `head2: serving 1920x1080@60.000 ..., offline until a display is plugged in` and
+`hotplug: polling HPD3 (now low), acting on it; head 2 is offline`. While offline the head got two status calls and
+no gamma writes, so WindowServer was not driving it; whether macOS showed any trace of a second display was not
+checked by eye. Cable in: the pipe was lit from the timer, after boot (`pipe2: plan ran; OTG1 measured 60.002 Hz`:
+the plan's requirements still held), `hotplug: display connected on HPD3: 15 mode(s), EDID 256 bytes`, macOS probed
+the head and at once switched it to the 144 Hz mode it remembered for this monitor (measured 144.010 Hz). Correct
+desktop on the Lenovo.
+
+The Samsung was undisturbed throughout. So the handler IOFramebuffer registers for connect interrupts can be called
+from outside an interrupt service, `kConnectionInactive` takes an IONDRV framebuffer offline and back, and a pipe
+can be lit long after boot. Not yet tried: display sleep with hot-plug active (what the monitor's HPD does asleep).
 

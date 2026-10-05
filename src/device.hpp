@@ -88,6 +88,10 @@ public:
 	// Read-only: the colour-path registers of the pipe the plan lit next to
 	// the firmware's pipe, where they differ ("pipe2: colour:" lines).
 	void comparePipeColour(const Pipe2::Plan &plan);
+	// Hot-plug of the second pipe's connector (plugin.cpp polls): whether its
+	// HPD pin is high, and the EDID of what is on it, read again into edid2Data.
+	bool secondSinkPresent();
+	bool readSecondEdid();
 	// Display sleep and wake of the pipe lightSecondPipe lit, as amdgpu does
 	// DPMS off and on for an HDMI stream (Pipe2::Part): the sink loses the
 	// signal and sleeps; the timing generator and the plane keep running.

@@ -2451,6 +2451,28 @@ void RDNA4Device::comparePipeColour(const Pipe2::Plan &plan) {
 	      compared, c.pipe, pipe.hubp, pipe.opp, differ);
 }
 
+bool RDNA4Device::secondSinkPresent() {
+	// DC_GPIO_HPD_Y: one byte per pin, HPD1 lowest (probeEDID).
+	const uint32_t hpdY = regReadDmu(2, 0x28f7);
+	return hpdY != 0xFFFFFFFF && ((hpdY >> (8 * (Pipe2::config().hpd - 1))) & 1);
+}
+
+bool RDNA4Device::readSecondEdid() {
+	AtomBios::DisplayPath path {};
+	uint8_t ddcLine = 0;
+	uint8_t edid[256] {};
+	static const uint8_t sig[8] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
+	if (!pathForHpd(Pipe2::config().hpd, path, &ddcLine) || !readEDIDI2C(ddcLine, edid, 128, 0) ||
+	    memcmp(edid, sig, sizeof(sig)) != 0)
+		return false;
+	// The extension says whether the sink has SCDC and carries more modes.
+	const bool ext = edid[126] > 0 && readEDIDI2C(ddcLine, edid + 128, 128, 128);
+	edid2Len = ext ? 256 : 128;
+	memcpy(edid2Data, edid, sizeof(edid));
+	pipe2Target.sinkScdc = Edid::hdmi2Caps(edid2Data, edid2Len).scdc;   // it may be another monitor
+	return true;
+}
+
 // One part of the generated table for the timing the pipe runs now.
 bool RDNA4Device::runSecondPipePart(Pipe2::Part part, size_t *steps) {
 	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));

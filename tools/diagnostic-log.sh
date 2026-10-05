@@ -222,7 +222,7 @@ registry_value() {
 	found=""
 	for a in off cmap lutbypass 8bpc noedid nosleep modedump hwcursor \
 	         curmode curtest dmubping dmubhist dmubver dmubcursor smuping \
-	         ihdump pspdump vbl cursor pm trace modeset head2 compute ih vm vm-diag vm-exec vm-ispte vm-force-fail vmid-test vmshared flip gfx gfxcol gfxclient \
+	         ihdump pspdump vbl cursor pm trace modeset head2 hotplug compute ih vm vm-diag vm-exec vm-ispte vm-force-fail vmid-test vmshared flip gfx gfxcol gfxclient \
 	         gfxidle sleepabort resume-tests gfxpm gfxcg gfxoff gfxcap hang sleeptest; do
 		value="$(arg_value "$a")"
 		[ -n "$value" ] && found="$found rdna4-$a=$value"
@@ -321,7 +321,7 @@ registry_value() {
 	gated "mode-setting survey" 'RDNA4FB: mode:' modedump
 
 	section "second head and second pipe (rdna4-head2)"
-	klines 'RDNA4FB: (head2|pipe2):' | grep . || echo "(no head2/pipe2 lines: add rdna4-head2=1..4 to boot-args)"
+	klines 'RDNA4FB: (head2|pipe2|hotplug):' | grep . || echo "(no head2/pipe2 lines: add rdna4-head2=1..4 to boot-args)"
 	echo '--- registry copy of the second-pipe survey: RDNA4FB,Pipe2 (step, segment:dword, value now, value after, Linux function and register)'
 	P2_PROP="$(ioreg -l -w0 2>/dev/null | grep '"RDNA4FB,Pipe2"' | sed -n -E 's/.*"RDNA4FB,Pipe2" = "(.*)"[^"]*$/\1/p' | head -1)"
 	if [ -n "$P2_PROP" ]; then

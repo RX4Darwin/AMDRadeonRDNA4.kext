@@ -1817,6 +1817,19 @@ static int testNdrv() {
 	failures += check(tr.status(Ndrv::cscGetConnection, &ci, ret) && ret == Ndrv::kSuccess &&
 	                  (ci.csConnectFlags & ddc) == ddc, "ndrv: connection flags 0x%x",
 	                  ci.csConnectFlags);
+	// Nothing on the connector: the connection is inactive and has no DDC
+	// block, which is what takes IONDRVFramebuffer offline; and back.
+	Ndrv::VDDDCBlockRec gone {};
+	gone.ddcBlockNumber = 1;
+	tr.setConnected(false);
+	failures += check(tr.status(Ndrv::cscGetConnection, &ci, ret) && ret == Ndrv::kSuccess &&
+	                  (ci.csConnectFlags & (Ndrv::kConnectionInactive | Ndrv::kHasDDCConnection)) ==
+	                  Ndrv::kConnectionInactive && !tr.status(Ndrv::cscGetDDCBlock, &gone, ret),
+	                  "ndrv: disconnected: connection flags 0x%x", ci.csConnectFlags);
+	tr.setConnected(true);
+	failures += check(tr.status(Ndrv::cscGetConnection, &ci, ret) && (ci.csConnectFlags & ddc) == ddc &&
+	                  !(ci.csConnectFlags & Ndrv::kConnectionInactive), "ndrv: reconnected: flags 0x%x",
+	                  ci.csConnectFlags);
 	// The Lenovo base block announces a CTA extension the fixture (like the
 	// VM build's fake EDID) does not carry: the count is trimmed to what is
 	// cached, with a fixed checksum, and the rest is served unchanged.

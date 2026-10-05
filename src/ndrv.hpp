@@ -79,6 +79,7 @@ constexpr uint16_t kGenericLCD                = 20;
 constexpr uint32_t kHasDirectConnection       = 1u << 3;
 constexpr uint32_t kReportsDDCConnection      = 1u << 7;
 constexpr uint32_t kHasDDCConnection          = 1u << 8;
+constexpr uint32_t kConnectionInactive        = 1u << 9;    // nothing connected: IONDRVFramebuffer goes offline
 constexpr uint32_t kDDCBlockTypeEDID          = 0;
 constexpr uint32_t kSyncPositivePolarityMask  = 1;
 constexpr uint32_t kDMSModeReady              = 0;
@@ -273,6 +274,11 @@ public:
 	bool control(uint16_t code, void *params, int32_t &ret);
 
 	int32_t currentModeId() const { return current; }
+
+	// Whether a display is on the connector. Without one cscGetConnection
+	// says so and there is no DDC block: macOS takes the framebuffer offline
+	// until a connect interrupt makes it ask again.
+	void setConnected(bool on) { connected = on; }
 	size_t  modeCount() const { return count; }
 	// NDRV mode ID of table entry `m`.
 	int32_t idFor(const Modes::Mode &m) const;
@@ -286,6 +292,7 @@ private:
 	Backend  be {};
 	int32_t  current { kBootModeId };
 	uint8_t  syncState { kDPMSSyncOn };
+	bool     connected { true };
 
 	const Modes::Mode *modeFor(int32_t id) const;
 	bool surface(const Modes::Mode &m, Surface &out) const;
