@@ -1601,6 +1601,52 @@ static int testPipe2() {
 	                  Pipe2::modeDetSegments(known[1]) == 7, "pipe2: DET segments: lit %u, 1080p144 %u",
 	                  Pipe2::modeDetSegments(c.timing), Pipe2::modeDetSegments(known[1]));
 
+	// The boot display's own sleep (ModeSet::buildSleep) is that sleep part
+	// shortened: on this pipe it sends the same SET_PIXEL_CLOCK and leaves every
+	// register it touches as Linux's does, and the mode set to the running
+	// timing brings the stream back.
+	{
+		static ModeSet::Plan sl;
+		static Pipe2::Plan linuxSleep;
+		ModeSet::Target st = mt;
+		st.extra = nullptr;
+		st.nextra = 0;
+		st.from = st.to = c.timing;
+		power.part = Pipe2::Part::Sleep;
+		power.now = c.timing;
+		PlanRegs ours = lit, theirs = lit;
+		const size_t before = outside;
+		const bool ok = ModeSet::buildSleep(st, sl, &why) && Pipe2::build(power, linuxSleep, &why);
+		stepsInBlocks(sl.steps, sl.count);
+		ours.run(sl);
+		for (size_t i = 0; i < linuxSleep.count; i++) {
+			const ModeSet::Step &x = linuxSleep.steps[i];
+			if (x.op == ModeSet::Op::Write)
+				theirs.set(x.seg, x.dword, x.value);
+			else if (x.op == ModeSet::Op::Update)
+				theirs.set(x.seg, x.dword, (theirs.get(x.seg, x.dword) & ~x.mask) | x.value);
+		}
+		size_t differ = 0;
+		for (size_t i = 0; ok && i < sl.count; i++)
+			if (sl.steps[i].op == ModeSet::Op::Write || sl.steps[i].op == ModeSet::Op::Update)
+				differ += ours.get(sl.steps[i].seg, sl.steps[i].dword) != theirs.get(sl.steps[i].seg, sl.steps[i].dword);
+		failures += check(ok && sl.ncmds == 1 && linuxSleep.ncmds == 1 &&
+		                  memcmp(sl.cmds[0], linuxSleep.cmds[0], sizeof(Dmub::Cmd)) == 0 && differ == 0 &&
+		                  outside == before && (ours.get(2, 0x22dd) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
+		                  "modeset: HDMI sleep: %s, %zu registers not as Linux's sleep leaves them", ok ? "built" : why,
+		                  differ);
+		const bool back = ModeSet::build(st, ms, &why);
+		ours.run(ms);
+		failures += check(back && (ours.get(2, 0x22dd) & 1) == 1 && (ours.get(2, 0x2304) & 0x400) == 0x400 &&
+		                  (ours.get(2, 0x22f0) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
+		                  "modeset: HDMI wake by mode set: FE %08x BE %08x GC %08x", ours.get(2, 0x22dd),
+		                  ours.get(2, 0x2304), ours.get(2, 0x22f0));
+		Edid::DetailedTiming none = c.timing;
+		none.pixelClockKHz = 0;
+		st.to = none;
+		failures += check(!ModeSet::buildSleep(st, sl, &why), "modeset: HDMI sleep without a pixel clock accepted");
+	}
+
 	// Stream only: stops before the plane, shows the pattern colour, and never
 	// reaches the HUBP.
 	t.depth = Pipe2::Depth::Stream;

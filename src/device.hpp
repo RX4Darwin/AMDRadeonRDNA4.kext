@@ -242,6 +242,9 @@ private:
 	bool liveTimingValid { false };
 	ModeSet::Plan modePlan {};
 	bool pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out, uint8_t *ddcLine = nullptr);
+	// The lit pipe and its connector's wiring as a mode-set target (timings not filled in).
+	bool bootPipeTarget(ModeSet::Target &t);
+	bool hdmiLinkOff { false };   // display sleep took the HDMI boot display's link down (setDisplayPower)
 	bool runPlan(const ModeSet::Plan &plan) {
 		return runSteps(plan.steps, plan.count, plan.cmds, plan.ncmds, "modeset", otgOff());
 	}

@@ -1596,8 +1596,42 @@ void RDNA4Device::setDisplayPower(bool on) {
 		return;
 	}
 
-	// HDMI/DVI boot pipe: there is no DP stream or DPCD to toggle. Blank to
-	// solid black with the OPP's display pattern generator, the way
+	// HDMI/DVI boot pipe, with the mode-set engine asked for (rdna4-modeset=1):
+	// the link goes down, so the monitor loses the signal and sleeps, and the
+	// way back is the mode set to the running timing (ModeSet::buildSleep).
+	if (pipe.valid() && pipe.isTmds() && (on ? hdmiLinkOff : modesetRequested && liveTimingValid)) {
+		ModeSet::Target t {};
+		const char *why = "";
+		char res[48];
+		if (on) {
+			const IOReturn ret = applyMode(Modes::Mode { currentModeId, liveTiming, liveTiming.refreshMilliHz(),
+			                                             false, Modes::SourceBoot });
+			hdmiLinkOff = false;
+			FBLOG("power: HDMI display on: mode set to the running timing %s (0x%x)",
+			      ret == kIOReturnSuccess ? "done" : "FAILED", ret);
+			snprintf(res, sizeof(res), "mode set 0x%x", ret);
+			displayPowerNote(true, "HDMI link", res);
+			displayPowerOn = true;
+			return;
+		}
+		t.to = liveTiming;
+		if (bootPipeTarget(t) && ModeSet::buildSleep(t, modePlan, &why)) {
+			const bool ran = runPlan(modePlan);
+			hdmiLinkOff = true;   // also after a plan that stopped: waking is a full mode set either way
+			const uint32_t fe = regReadDmu(2, Pipe::Reg::kDigFeEnCntl + digOff());
+			FBLOG("power: HDMI display off: stream encoder and transmitter down, %lu steps %s; "
+			      "DIG%u_DIG_FE_EN_CNTL=0x%08x", static_cast<unsigned long>(modePlan.count),
+			      ran ? "ran" : "STOPPED", pipe.dig, fe);
+			snprintf(res, sizeof(res), "%s, FE %08x", ran ? "ran" : "STOPPED", fe);
+			displayPowerNote(false, "HDMI link", res);
+			displayPowerOn = false;
+			return;
+		}
+		FBLOG("power: HDMI link stays up (%s): blanking instead", why[0] ? why : "no VBIOS path");
+	}
+
+	// Otherwise an HDMI/DVI boot pipe is blanked: there is no DP stream or
+	// DPCD to toggle. Solid black with the OPP's display pattern generator, the way
 	// opp2_set_disp_pattern_generator does for SOLID_COLOR (DPG colours 0,
 	// DPG_MODE = TEST_PATTERN_MODE_HORIZONTALBARS, DPG_EN).
 	if (pipe.valid() && pipe.isTmds()) {
@@ -2151,20 +2185,11 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 	return true;
 }
 
-IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
-	const bool dp = pipe.signal == Pipe::Signal::DpSst;
-	if (!pipe.valid() || !(pipe.isTmds() || dp) || !liveTimingValid || !rmmio || !ipDiscovery.isValid()) {
-		FBLOG("modes: switch to id %u refused: no programmable HDMI or DisplayPort pipe", m.id);
-		return kIOReturnUnsupported;
-	}
+bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
 	AtomBios::DisplayPath path {};
 	uint8_t ddcLine = 0;
-	if (!pathForHpd(pipe.hpd, path, &ddcLine)) {
-		FBLOG("modes: switch to id %u refused: no VBIOS path for HPD%u", m.id, pipe.hpd);
-		return kIOReturnUnsupported;
-	}
-
-	ModeSet::Target t {};
+	if (!pathForHpd(pipe.hpd, path, &ddcLine))
+		return false;
 	t.sinkScdc = Edid::hdmi2Caps(edidData, edidLen).scdc;
 	t.ddcLine = ddcLine;
 	t.otg = pipe.otg;
@@ -2175,6 +2200,20 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	t.hubp = pipe.hubp;
 	t.encoderObjId = path.encoderObjId;
 	t.connectorObjId = path.connectorObjId;
+	return true;
+}
+
+IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
+	const bool dp = pipe.signal == Pipe::Signal::DpSst;
+	if (!pipe.valid() || !(pipe.isTmds() || dp) || !liveTimingValid || !rmmio || !ipDiscovery.isValid()) {
+		FBLOG("modes: switch to id %u refused: no programmable HDMI or DisplayPort pipe", m.id);
+		return kIOReturnUnsupported;
+	}
+	ModeSet::Target t {};
+	if (!bootPipeTarget(t)) {
+		FBLOG("modes: switch to id %u refused: no VBIOS path for HPD%u", m.id, pipe.hpd);
+		return kIOReturnUnsupported;
+	}
 
 	// DisplayPort: the link stays as the firmware trained it and only the
 	// stream is retimed, so the pixel clock comes from the DTO running now,

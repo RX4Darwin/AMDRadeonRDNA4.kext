@@ -134,9 +134,11 @@ TMDS). The boot timing is read back from the OTG images; its pixel clock —
 which for TMDS lives in the PHY PLL, not in any register — is measured from
 the OTG frame counter and snapped to the matching EDID timing. Published as
 `Pipe,*` (`Pipe,Signal`, `Pipe,BootMode`, `Pipe,MeasuredPixelClockKHz`, …).
-Display power and the diagnostics use this pipe; on an HDMI boot display,
+Display power and the diagnostics use this pipe. On an HDMI boot display,
 display sleep blanks through the OPP's pattern generator (solid black) instead
-of toggling a DP stream.
+of toggling a DP stream; with `rdna4-modeset=1` it takes the link down so the
+monitor really sleeps, and wakes it with a mode set to the running timing
+(written 2026-10-06, not yet run on the card).
 
 ## Files
 
@@ -418,6 +420,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    `cscSetSync` (DPMS), verified on hardware 2026-10-05 for the DP boot
    display and for the HDMI second pipe, which sleeps the way amdgpu does
    DPMS off (stream encoder and transmitter down, `docs/second-pipe.md`).
+   An HDMI boot display does the same with `rdna4-modeset=1`
+   (`ModeSet::buildSleep`, then a mode set to the running timing to wake;
+   not yet run on the card) and is blanked without it.
    System sleep stays vetoed (as `IOBootNDRV` does): after GPU power loss the
    display pipe cannot be reprogrammed until native mode setting exists.
 6. **Power / clocks** — SMU firmware handshake so the card is stable, not
