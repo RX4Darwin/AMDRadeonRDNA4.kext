@@ -486,10 +486,12 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       own DCN 4.01 code by `tools/pipegen` (`src/pipe2.cpp`). One
       configuration: HDMI on HPD3 / link 2 at 1920x1080@60. Display
       sleep and wake reach it too (verified on hardware 2026-10-05).
-- [ ] Mode switching on the second display (`rdna4-modeset=1` with
-      `rdna4-head2=4`): the mode-set engine pointed at the second pipe,
-      for modes up to the lit one's size and within 25 % of its pixel
-      clock. Written and host-tested, not yet run on the card.
+- [x] Mode switching on the second display (`rdna4-modeset=1` with
+      `rdna4-head2=4`; verified on hardware 2026-10-05, Big Sur 11.6.6:
+      1920x1080 to 1600x900 to 1280x720 and back, display sleep and wake
+      at 1280x720, picture confirmed): the mode-set engine pointed at the
+      second pipe, for modes up to the lit one's size and within 25 % of
+      its pixel clock.
 - [ ] Second display beyond that configuration: other connectors, high
       refresh rates (need DML's request timing per mode), a second
       DisplayPort display (needs link training), hot-plug.

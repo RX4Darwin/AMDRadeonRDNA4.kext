@@ -136,7 +136,7 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
 
 ### Mode switching
 
-Written 2026-10-05, host-tested, not yet run on the card. With `rdna4-modeset=1` the second head offers the sink's
+Verified on the card 2026-10-05 (section 7). With `rdna4-modeset=1` the second head offers the sink's
 other modes, and a switch runs the boot display's mode-set engine (`src/modeset.cpp`) pointed at pipe 1, DIG2 and
 link 2: blank, stream and timing generator off, `SET_PIXEL_CLOCK`, new timing, stream on, viewport and output
 rectangle, unblank. Then the AVI infoframe is sent again for the new timing (VIC, picture aspect, bar ends and
@@ -221,4 +221,16 @@ where Linux enables both with nothing in them (identity matrix, no gamma); the b
 pixels zero-extended (`FORMAT_EXPANSION_MODE` 0, `FMT_DYNAMIC_EXP_CNTL` 0: white is 0.3 % under full scale) where
 Linux replicates the top bits; and the formatters differ as 10-bit DisplayPort and 8-bit HDMI do. The gains, the HDR
 multiplier, degamma and output gamma are the same on both. So the difference in brightness is the monitors' own.
+
+**Mode switching, 2026-10-05 15:38 (`rdna4-head2=4 rdna4-modeset=1`): works.** The second head offered 13 modes and
+macOS listed the same 13. `pipe2: switching to id 4 1600x900@60.000 (108000 kHz)`, `now 1600x900 at 108000 kHz, OTG1
+measured 60.001 Hz`; then 1280x720 (59.999 Hz); display sleep (39 steps) and wake (128 steps) at 1280x720; back to
+1920x1080 (60.001 Hz). No step timed out and no underflow flag was set. The Lenovo showed a correct, stable desktop
+in each mode and after the wake, and the Samsung was undisturbed. So the HUBP request timing DML made for 1920x1080@60
+also carries the slower modes, as the firmware's does on the boot display. `HUBP1_DCHUBP_CNTL` read 0x000f001a once,
+after the 1600x900 switch (0x000f0012 after the others): bit 3 is `HUBP_IN_BLANK`, a live status, there most likely
+caught in that mode's longer vertical blank.
+
+Reading the log: kernel lines from other senders (ALF, Sandbox) can lack a newline, and an RDNA4FB line glued to one
+carries that line's older timestamp.
 
