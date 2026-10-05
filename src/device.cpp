@@ -2395,6 +2395,8 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		      mHz / 1000, mHz % 1000, want / 1000, want % 1000, c.pipe,
 		      regReadDmu(2, 0x05f4 + c.pipe * Pipe::Reg::kHubpStride), c.pipe,
 		      regReadDmu(2, 0x1aca + c.pipe * Pipe::Reg::kOdmStride));
+		if (ok && level >= 4)
+			comparePipeColour(*plan);
 		// With the stream lit, what the plane would still change.
 		t.depth = Pipe2::Depth::Plane;
 		if (ok && level == 3 && Pipe2::build(t, *plan, &why))
@@ -2402,6 +2404,49 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 	}
 	IOFree(plan, sizeof(Pipe2::Plan));
 	return ok;
+}
+
+// One pipe was programmed by the firmware and one by Linux's code: where the
+// two colour paths differ is where a difference in the picture can come from.
+// Geometry and instance numbers differ by nature (DSCL sizes, TOP_SEL, DPG
+// dimensions).
+void RDNA4Device::comparePipeColour(const Pipe2::Plan &plan) {
+	const Pipe2::Config &c = Pipe2::config();
+	uint32_t compared = 0, differ = 0;
+	auto planStep = [&](uint8_t seg, uint32_t dword, size_t before) -> const ModeSet::Step * {
+		for (size_t i = 0; i < before; i++) {
+			const ModeSet::Step &s = plan.steps[i];
+			if ((s.op == ModeSet::Op::Write || s.op == ModeSet::Op::Update) && s.seg == seg && s.dword == dword)
+				return &s;
+		}
+		return nullptr;
+	};
+	auto compare = [&](uint8_t seg, uint32_t dword, const char *what) {
+		const int twin = Pipe2::colourTwin(seg, dword, c.pipe, pipe.hubp, pipe.opp);
+		if (twin < 0)
+			return;
+		compared++;
+		const uint32_t mine = regReadDmu(seg, dword), lit = regReadDmu(seg, static_cast<uint32_t>(twin));
+		if (mine == lit)
+			return;
+		differ++;
+		FBLOG("pipe2: colour: %u:%04x %08x, lit pipe %u:%04x %08x  %s", seg, dword, mine, seg, twin, lit, what);
+	};
+	// What the plan set on its pipe, each register once ...
+	for (size_t i = 0; i < plan.count; i++) {
+		const ModeSet::Step &s = plan.steps[i];
+		if ((s.op == ModeSet::Op::Write || s.op == ModeSet::Op::Update) && !planStep(s.seg, s.dword, i))
+			compare(s.seg, s.dword, s.what);
+	}
+	// ... and what it left at reset there, in the blocks that can be read whole.
+	for (const Pipe2::ColourBlock &b : Pipe2::kColourBlocks) {
+		const uint32_t first = b.first + c.pipe * b.stride;
+		for (uint32_t dword = first; b.whole && dword < first + b.stride; dword++)
+			if (!planStep(b.seg, dword, plan.count))
+				compare(b.seg, dword, "(not set by the plan)");
+	}
+	FBLOG("pipe2: colour: %u registers of pipe %u compared with the lit pipe's (HUBP%u, OPP%u): %u differ",
+	      compared, c.pipe, pipe.hubp, pipe.opp, differ);
 }
 
 void RDNA4Device::setSecondPipePower(bool on) {

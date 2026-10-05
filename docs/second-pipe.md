@@ -118,6 +118,10 @@ At level 3 or 4:
   — the timing generator's real frame rate (0.000 means OTG1 is not counting: no pixel clock), and the raw registers
   that hold the plane's and the OPTC's underflow flags.
 
+- `pipe2: colour: 2:0ed2 <value>, lit pipe 2:0d67 <value>  <Linux function and register>` (level 4) — read-only:
+  each colour-path register (DPP, blender, output CSC, formatter) where the pipe Linux's code programmed and the
+  pipe the firmware programmed differ, then a count. Sizes, positions and instance numbers differ by nature.
+
 Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmware's state.
 
 ## 6. Limits

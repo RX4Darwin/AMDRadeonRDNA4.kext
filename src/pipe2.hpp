@@ -99,6 +99,33 @@ constexpr int linkOfEncoder(uint16_t objId) {
 static_assert(linkOfEncoder(0x2120) == 2 && linkOfEncoder(0x211e) == 0 && linkOfEncoder(0x2220) == 3 &&
               linkOfEncoder(0x2114) == -1, "encoder object to link");
 
+// The colour path, one block instance per pipe: the DPP and the blender follow
+// the HUBP, the formatter and the output CSC the OPP. `whole` blocks are small
+// and have no LUT data port, so every register of them can be read.
+struct ColourBlock { uint8_t seg; uint16_t first, stride; bool perOpp, whole; };
+constexpr ColourBlock kColourBlocks[] = {
+	{ 2, 0x0cc5, 0x16b, false, false },   // DPP: CNVC, DSCL, CM
+	{ 2, 0x183c, 0x05a, true,  false },   // OPP: FMT, DPG, OPP_PIPE
+	{ 3, 0x0000, 0x015, false, true  },   // MPCC
+	{ 3, 0x007e, 0x05e, false, false },   // MPCC OGAM
+	{ 3, 0x0453, 0x0b0, false, false },   // MPCC MCM
+	{ 3, 0x02f2, 0x004, true,  true  },   // MPC out mux, denormalisation and clamp
+	{ 3, 0x030b, 0x00d, true,  true  },   // MPC out CSC
+};
+
+// A colour-path register of pipe `pipe`, in the instance another pipe uses
+// (its HUBP and OPP numbers); -1 if `dword` is not one.
+constexpr int colourTwin(uint8_t seg, uint32_t dword, uint8_t pipe, uint8_t hubp, uint8_t opp) {
+	for (const ColourBlock &b : kColourBlocks)
+		if (seg == b.seg && dword >= b.first + pipe * b.stride && dword < b.first + (pipe + 1u) * b.stride)
+			return static_cast<int>(dword) - (pipe - (b.perOpp ? opp : hubp)) * b.stride;
+	return -1;
+}
+// CM1_CM_CONTROL, FMT1_FMT_CONTROL, MPC_OUT1_CSC_MODE, MPCC1_MPCC_TOP_SEL; HUBPREQ1 is not colour
+static_assert(colourTwin(2, 0x0ed2, 1, 0, 0) == 0x0d67 && colourTwin(2, 0x189a, 1, 0, 0) == 0x1840 &&
+              colourTwin(3, 0x0318, 1, 0, 0) == 0x030b && colourTwin(3, 0x0015, 1, 0, 0) == 0 &&
+              colourTwin(3, 0x0015, 1, 2, 0) == 0x002a && colourTwin(2, 0x06e6, 1, 0, 0) == -1, "colour twins");
+
 } // namespace Pipe2
 
 #endif /* Pipe2_hpp */

@@ -85,6 +85,9 @@ public:
 	// 3 lights the stream with a solid colour (and publishes what the plane
 	// would then do), 4 also the plane.
 	bool lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhys);
+	// Read-only: the colour-path registers of the pipe the plan lit next to
+	// the firmware's pipe, where they differ ("pipe2: colour:" lines).
+	void comparePipeColour(const Pipe2::Plan &plan);
 	// Display sleep and wake of the pipe lightSecondPipe lit, as amdgpu does
 	// DPMS off and on for an HDMI stream (Pipe2::Part): the sink loses the
 	// signal and sleeps; the timing generator and the plane keep running.
