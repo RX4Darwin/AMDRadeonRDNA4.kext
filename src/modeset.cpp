@@ -134,6 +134,36 @@ constexpr uint32_t dpgDims(uint32_t w, uint32_t h) {         // WIDTH [29:16], H
 	return ((w & 0x3fff) << 16) | (h & 0x3fff);
 }
 
+// dcn30_set_avmute(true), three frames for the sink to see it, then
+// dce110_disable_stream: the stream encoder off and cut from the link encoder.
+void hdmiStreamOff(Builder &b, const Target &t) {
+	const uint32_t dig = t.dig * kDigStride;
+	b.update(kHdmiGc + dig, 0x1, 0x1, "hdmi avmute on");
+	b.frames(3, "avmute settle");
+	b.update(kDigFifoCtrl0 + dig, 0x1, 0, "dig fifo disable");
+	b.write(kDigFeEnCntl + dig, 0, "dig fe disable");
+	b.update(kDigFeClkCntl + dig, 0x10, 0, "dig fe clock off");
+	b.update(kDigBeCntl + t.link * kDigStride, 1u << (8 + t.dig), 0, "dig be disconnect fe");
+}
+
+// dcn401_program_pix_clk: the PHY PLL at the pixel clock of `t.to`.
+void hdmiPixelClock(Builder &b, const Target &t) {
+	Dmub::Cmd *c = b.dmub("set pixel clock");
+	if (!c)
+		return;
+	Dmub::SetPixelClock pc {};
+	pc.pixclk100Hz = t.to.pixelClockKHz * 10;
+	// Each combo PHY has its own PLL and amdgpu takes the one of the
+	// link's transmitter (find_matching_pll): ATOM_COMBOPHY_PLL0 (0x14)
+	// + the link. Captured from amdgpu on this card: pll_id 0x16 with
+	// phyid 2 (the HDMI sink on UNIPHY C, 2026-07-17).
+	pc.pllId = static_cast<uint8_t>(0x14 + t.link);
+	pc.encoderObjId = static_cast<uint8_t>(t.encoderObjId & 0xff);
+	pc.encoderMode = Dmub::EncoderModeHdmi;
+	pc.crtcId = t.otg;
+	Dmub::buildSetPixelClock(*c, pc);
+}
+
 } // namespace
 
 bool scaleDpDto(const DpDto &now, uint32_t fromKHz, uint32_t toKHz, DpDto &out) {
@@ -217,15 +247,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 		b.update(kDpSteerFifo + dig, 0x2, 0x2, "dp steer fifo reset");
 		b.delay(60 * kMs, "idle pattern");
 	} else {
-		// --- dcn30_set_avmute(true), then let the sink see it for 3 frames ---
-		b.update(kHdmiGc + dig, 0x1, 0x1, "hdmi avmute on");
-		b.frames(3, "avmute settle");
-
-		// --- dce110_disable_stream: stream encoder off ---
-		b.update(kDigFifoCtrl0 + dig, 0x1, 0, "dig fifo disable");
-		b.write(kDigFeEnCntl + dig, 0, "dig fe disable");
-		b.update(kDigFeClkCntl + dig, 0x10, 0, "dig fe clock off");
-		b.update(kDigBeCntl + t.link * kDigStride, 1u << (8 + t.dig), 0, "dig be disconnect fe");
+		hdmiStreamOff(b, t);
 	}
 
 	// --- optc401_disable_crtc ---
@@ -262,21 +284,9 @@ bool build(const Target &t, Plan &out, const char **why) {
 	}
 
 	// --- dcn401_program_pix_clk: PHY PLL at the new pixel clock ---
-	if (t.dp) {
-		// the PHY PLL carries the link clock, not the pixel clock
-	} else if (Dmub::Cmd *c = b.dmub("set pixel clock")) {
-		Dmub::SetPixelClock pc {};
-		pc.pixclk100Hz = t.to.pixelClockKHz * 10;
-		// Each combo PHY has its own PLL and amdgpu takes the one of the
-		// link's transmitter (find_matching_pll): ATOM_COMBOPHY_PLL0 (0x14)
-		// + the link. Captured from amdgpu on this card: pll_id 0x16 with
-		// phyid 2 (the HDMI sink on UNIPHY C, 2026-07-17).
-		pc.pllId = static_cast<uint8_t>(0x14 + t.link);
-		pc.encoderObjId = static_cast<uint8_t>(t.encoderObjId & 0xff);
-		pc.encoderMode = Dmub::EncoderModeHdmi;
-		pc.crtcId = t.otg;
-		Dmub::buildSetPixelClock(*c, pc);
-	}
+	// (on DisplayPort the PHY PLL carries the link clock, not the pixel clock)
+	if (!t.dp)
+		hdmiPixelClock(b, t);
 
 	// --- optc1_enable_optc_clock(true) ---
 	b.update(kOptcInputClock + odm, 0x3, 0x3, "optc input clock on");
@@ -429,6 +439,25 @@ bool build(const Target &t, Plan &out, const char **why) {
 		err = "plan too long";
 		return false;
 	}
+	return true;
+}
+
+bool buildSleep(const Target &t, Plan &out, const char **why) {
+	const char *dummy;
+	const char *&err = why ? *why : dummy;
+	out.count = 0;
+	out.ncmds = 0;
+	if (t.dp || t.otg >= 4 || t.dig >= 4 || t.link >= 6 || t.to.pixelClockKHz == 0 ||
+	    t.to.pixelClockKHz > kMaxTmdsKHz) {
+		err = "not an HDMI pipe with a known pixel clock";
+		return false;
+	}
+	Builder b { out };
+	hdmiStreamOff(b, t);
+	// dcn401_disable_link_output with the timing generator running: the PHY's
+	// clock is programmed again, which takes the transmitter down and leaves
+	// the PLL clocking the OTG (disable_link_output_symclk_on_tx_off).
+	hdmiPixelClock(b, t);
 	return true;
 }
 

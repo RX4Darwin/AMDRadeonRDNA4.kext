@@ -137,6 +137,15 @@ constexpr uint32_t scdcTmdsConfig(uint32_t pixelClockKHz) { return pixelClockKHz
 // timings cannot be expressed.
 bool build(const Target &t, Plan &out, const char **why);
 
+// Display sleep of an HDMI pipe running `t.to`: what amdgpu's DPMS off comes
+// down to for the sink. AVMUTE, the stream encoder off, and the PHY's clock
+// programmed again, which takes the transmitter down while the PLL keeps
+// clocking the timing generator; the sink loses the signal and sleeps. Not
+// done, unlike amdgpu: stopping the infoframes and the audio and resetting
+// the HDMI stream attributes. So the way back is build() with from = to,
+// the full mode set to the running timing.
+bool buildSleep(const Target &t, Plan &out, const char **why);
+
 // VSTARTUP line count the plan uses for timing `to`.
 uint32_t vstartupLines(const Edid::DetailedTiming &to);
 
