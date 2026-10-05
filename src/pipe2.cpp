@@ -21,6 +21,8 @@ namespace {
 //   A word arg of the AVI infoframe, for the timing the pipe runs (aviWord),
 //   a t O DisplayPort: write the table's AUX entry arg to the sink / train
 //   the link / DMUB transmitter disable,
+//   M m DisplayPort: MSA word arg of the timing the pipe runs / the first
+//   Mvid of that timing on the link's rate (ModeSet::dpMsa, dpVidM),
 //   K pattern generator colour arg (0 R, 1 G, 2 B),
 //   C copy from the lit pipe's register, arg dwords per HUBP instance below,
 //   H L surface address high / low.
@@ -185,10 +187,16 @@ bool build(const Target &t, Plan &out, const char **why) {
 	const Edid::DetailedTiming &timing = moved ? t.now : c.timing;
 	const uint32_t khz = timing.pixelClockKHz;
 	// The scrambler setting in these parts is the plan's.
-	if ((khz > ModeSet::kScrambleFromKHz) != (c.timing.pixelClockKHz > ModeSet::kScrambleFromKHz)) {
+	if (!c.dp && (khz > ModeSet::kScrambleFromKHz) != (c.timing.pixelClockKHz > ModeSet::kScrambleFromKHz)) {
 		err = "sleep and wake are generated for the plan's side of 340 MHz";
 		return false;
 	}
+	if (c.dp && t.part != Part::Sleep && !t.linkRate) {
+		err = "DisplayPort: no link chosen";
+		return false;
+	}
+	uint32_t msa[4];
+	ModeSet::dpMsa(timing, msa);
 
 	auto step = [&](ModeSet::Op op, const Gen &g, uint32_t mask, uint32_t value, uint32_t arg,
 	                bool optional = false) {
@@ -247,6 +255,10 @@ bool build(const Target &t, Plan &out, const char **why) {
 				out.aux[out.naux++] = cur->aux[g.arg];
 			break;
 		case 't': ok = step(ModeSet::Op::Train, g, 0, 0, 0); break;
+		case 'M': ok = step(ModeSet::Op::Write, g, 0, msa[g.arg & 3], 0); break;
+		case 'm':
+			ok = step(ModeSet::Op::Update, g, g.mask, ModeSet::dpVidM(khz, DpTrain::symbolClockKHz(t.linkRate)), 0);
+			break;
 		case 'O':
 			if (Dmub::Cmd *cmd = dmub(g))
 				DpPhy::buildDisable(*cmd, c.link, c.hpd, t.connectorObjId);

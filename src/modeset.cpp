@@ -181,6 +181,16 @@ bool scaleDpDto(const DpDto &now, uint32_t fromKHz, uint32_t toKHz, DpDto &out) 
 	return out.integer <= 0xf;
 }
 
+// The MSA counts from the leading edge of sync: start = sync width + back porch.
+void dpMsa(const Edid::DetailedTiming &t, uint32_t out[4]) {
+	const uint32_t hStart = t.hBlank - t.hSyncOffset, vStart = t.vBlank - t.vSyncOffset;
+	out[0] = (t.hTotal() << 16) | t.vTotal();
+	out[1] = (hStart << 16) | vStart;
+	out[2] = (static_cast<uint32_t>(!t.hSyncPositive) << 31) | (static_cast<uint32_t>(t.hSyncWidth) << 16) |
+	         (static_cast<uint32_t>(!t.vSyncPositive) << 15) | t.vSyncWidth;
+	out[3] = (static_cast<uint32_t>(t.hActive) << 16) | t.vActive;
+}
+
 uint32_t vstartupLines(const Edid::DetailedTiming &to) {
 	// amdgpu places VSTARTUP from DML (prefetch time); without DML keep it
 	// just inside the vertical blank, 2 lines clear of its start.
@@ -328,15 +338,12 @@ bool build(const Target &t, Plan &out, const char **why) {
 	b.update(kDigFeCntl + dig, 0x7, t.otg, "dig source otg");
 
 	if (t.dp) {
-		// --- enc401_stream_encoder_dp_set_stream_attribute: the MSA. The MSA counts from the
-		// leading edge of sync: start = sync width + back porch.
-		const uint32_t msa = kDpMsaParam1 + dig;
-		const uint32_t hStart = t.to.hBlank - t.to.hSyncOffset, vStart = t.to.vBlank - t.to.vSyncOffset;
-		b.write(msa, (t.to.hTotal() << 16) | t.to.vTotal(), "msa totals");
-		b.write(msa + 1, (hStart << 16) | vStart, "msa active start");
-		b.write(msa + 2, (static_cast<uint32_t>(!t.to.hSyncPositive) << 31) | (static_cast<uint32_t>(t.to.hSyncWidth) << 16) |
-		                 (static_cast<uint32_t>(!t.to.vSyncPositive) << 15) | t.to.vSyncWidth, "msa sync");
-		b.write(msa + 3, (w << 16) | h, "msa active size");
+		// --- enc401_stream_encoder_dp_set_stream_attribute: the MSA ---
+		static const char *const msaWhat[4] = { "msa totals", "msa active start", "msa sync", "msa active size" };
+		uint32_t msa[4];
+		dpMsa(t.to, msa);
+		for (uint32_t i = 0; i < 4; i++)
+			b.write(kDpMsaParam1 + dig + i, msa[i], msaWhat[i]);
 
 		// --- setup_dio_stream_encoder: enc35_enable_fifo ---
 		b.update(kDigFifoCtrl0 + dig, 0x1fu << 2, 7u << 2, "dig fifo start level 7");

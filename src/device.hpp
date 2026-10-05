@@ -275,10 +275,14 @@ private:
 	              const char *tag, uint32_t otgOffset, const Pipe2::AuxWrite *aux = nullptr);
 	DpTrain::Result trainLink(uint8_t aux, uint8_t link, uint8_t hpd, uint8_t conn, const DpTrain::Sink &sink,
 	                          const DpTrain::Link &settings, bool offFirst, DpTrain::Report &rep);
-	// The second pipe on DisplayPort: its sink's AUX channel and capabilities,
-	// and the link picked for the plan's mode.
-	bool noteSecondDpSink(uint8_t aux);
+	// The second pipe on DisplayPort: its sink's AUX channel and capabilities
+	// (read with its EDID), and the link picked for the mode it is to carry.
+	bool readSecondDpSink(uint8_t aux);
+	bool pickSecondLink(uint32_t pixelClockKHz);
+	bool relinkSecondPipe(uint32_t pixelClockKHz);
 	bool trainSecondLink();
+	// The pixel-rate DTO an OTG runs on; false if its pixel clock is not that DTO.
+	bool readDpDto(uint8_t otg, ModeSet::DpDto &out, uint32_t *cntl = nullptr);
 	uint8_t       pipe2Aux { 0 };
 	DpTrain::Sink pipe2Sink {};
 	DpTrain::Link pipe2Link {};

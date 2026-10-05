@@ -534,8 +534,10 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       a second DisplayPort display (`rdna4-head2=4`), lit from tables
       generated like the HDMI ones (`src/pipe2_linux_dp1.inc`,
       `_dp2.inc`) whose training step runs `src/dptrain.cpp` on the
-      smallest link of the monitor's that carries 1920x1080@60. It
-      stays at that mode: no mode switching on it yet.
+      smallest link of the monitor's that carries the mode. With
+      `rdna4-modeset=1` it switches modes like the HDMI one: the
+      stream is retimed, after the link was trained larger if the
+      mode needs that (`make test` holds 15 modes against Linux).
 - [x] DP mode switching on the trained link (verified on hardware
       2026-10-04, Big Sur 11.6.6: 3840x2160 to 2560x1440, picture
       confirmed; `rdna4-modeset=1`). The plan's register writes are held

@@ -121,6 +121,15 @@ struct Target {
 	size_t      nextra;
 };
 
+// The first DP_VID_M (against a DP_VID_N of 0x8000) of a stream on a link with
+// this symbol clock, before the hardware measures it, and the four
+// DP_MSA_TIMING_PARAM words of a timing (enc401_stream_encoder_dp_unblank,
+// enc401_stream_encoder_dp_set_stream_attribute).
+constexpr uint32_t dpVidM(uint32_t pixelClockKHz, uint32_t symbolClockKHz) {
+	return static_cast<uint32_t>(0x8000ull * pixelClockKHz / symbolClockKHz);
+}
+void dpMsa(const Edid::DetailedTiming &t, uint32_t out[4]);
+
 // The DP pixel-rate DTO for a new pixel clock, from the one running now. The
 // DTO makes its reference clock times (integer + phase / modulo). amdgpu
 // programs it in Hz (modulo = the reference in Hz, so integer x modulo +
