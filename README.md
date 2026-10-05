@@ -414,7 +414,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
 5. **Display power management** — display sleep was verified on hardware
    with the standalone build (DP: video stream off + sink D3 over native-AUX
    DPCD `SET_POWER`; HDMI: OPP pattern generator blank). It now runs from
-   `cscSetSync` (DPMS); hardware verification of that path is pending.
+   `cscSetSync` (DPMS), verified on hardware 2026-10-05 for the DP boot
+   display and for the HDMI second pipe, which sleeps the way amdgpu does
+   DPMS off (stream encoder and transmitter down, `docs/second-pipe.md`).
    System sleep stays vetoed (as `IOBootNDRV` does): after GPU power loss the
    display pipe cannot be reprogrammed until native mode setting exists.
 6. **Power / clocks** — SMU firmware handshake so the card is stable, not
@@ -482,10 +484,10 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       HDMI monitor next to the DisplayPort boot display and macOS extends
       the desktop onto it. The register sequence is generated from Linux's
       own DCN 4.01 code by `tools/pipegen` (`src/pipe2.cpp`). One
-      configuration: HDMI on HPD3 / link 2 at 1920x1080@60.
+      configuration: HDMI on HPD3 / link 2 at 1920x1080@60. Display
+      sleep and wake reach it too (verified on hardware 2026-10-05).
 - [ ] Second display beyond that configuration: other connectors and
-      modes, a second DisplayPort display (needs link training), hot-plug,
-      display sleep and wake for the second pipe.
+      modes, a second DisplayPort display (needs link training), hot-plug.
 - [x] DP mode switching on the trained link (verified on hardware
       2026-10-04, Big Sur 11.6.6: 3840x2160 to 2560x1440, picture
       confirmed; `rdna4-modeset=1`). The plan's register writes are held

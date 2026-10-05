@@ -127,7 +127,7 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
 - The second display must be HDMI or DVI (TMDS). A second DisplayPort display needs link training. A mode above
   340 MHz needs the table regenerated for it (the generator then turns the scrambler on by itself).
 - The boot display must not be on the plan's blocks: with the Lenovo alone, the firmware puts it on DIG2 and link 2.
-- Display sleep and wake of the second pipe (below) have not run on the card yet.
+- System sleep is not handled (it stays vetoed for the whole driver).
 
 ### Display sleep
 
@@ -140,9 +140,9 @@ generator. The timing generator, the plane and the surface stay as they are. Wak
 encoder setup, infoframes, the transmitter enable. `testPipe2` checks that after sleep and wake every register that
 lighting set holds the same value again.
 
-One thing to watch: sleep clears the stream encoder's half of `SYMCLKC_CLOCK_ENABLE` (`dccg401_disable_symclk_se`),
-and for HDMI Linux never sets it again. The log line shows it:
-`power: pipe2 display off: 38 steps ran; DIG2_DIG_FE_EN_CNTL=... SYMCLKC_CLOCK_ENABLE=...`, and the same for `on`
+Sleep clears the stream encoder's half of `SYMCLKC_CLOCK_ENABLE` (`dccg401_disable_symclk_se`), and for HDMI Linux
+never sets it again: the firmware does, on the encoder command (section 7). The log line shows it:
+`power: pipe2 display off: 39 steps ran; DIG2_DIG_FE_EN_CNTL=... SYMCLKC_CLOCK_ENABLE=...`, and the same for `on`
 (also in the `RDNA4FB,DisplayPower` registry history). `rdna4-nosleep=1` turns it off.
 
 ## 7. Card boots (Big Sur 11.6.6, Samsung 4K on DisplayPort, Lenovo on HDMI)
@@ -179,3 +179,11 @@ out. The Lenovo shows the second desktop and the Samsung is undisturbed. So the 
 this card: the firmware's display clocks and watermarks for one 4K display also carry a 1080p plane next to it, and
 3 + 4 DET segments are enough. The pointer shows on the second display (macOS draws it into the surface: the head
 has no hardware cursor).
+
+**Display sleep, 2026-10-05 14:51 (`rdna4-head2=4`): both displays sleep and wake.** Head 2 now answers `Status csc
+11`, and macOS sends it `Control csc 11` 140 ms after the boot display's. `power: pipe2 display off: 39 steps ran;
+DIG2_DIG_FE_EN_CNTL=0x00000000 SYMCLKC_CLOCK_ENABLE=0x00000001` (55 ms, most of it the frames AVMUTE waits for), and
+three seconds later `power: pipe2 display on: 128 steps ran; DIG2_DIG_FE_EN_CNTL=0x00000001
+SYMCLKC_CLOCK_ENABLE=0x00000211` (under 2 ms). No step timed out. So on this firmware a repeated `SET_PIXEL_CLOCK`
+does take the HDMI output down far enough for the monitor to sleep, and the encoder command on wake sets the stream
+encoder's symbol-clock gate again (0x1 to 0x211: enable and source link 2), which is why Linux can leave it alone.
