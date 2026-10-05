@@ -1295,9 +1295,22 @@ static int testDpRetime() {
 // block is `stride` dwords per instance from `first`, and a step inside a
 // family has to be in the instance the plan is for. Outside the families only
 // the listed shared registers, and only the listed bits.
-static int testPipe2() {
+// One generated table: the one in use (Pipe2::use).
+static int testPipe2Table() {
 	int failures = 0;
 	const Pipe2::Config &c = Pipe2::config();
+	// The plan's stream encoder and link encoder registers (DIG0's, by
+	// instance), its connector's DDC line and its VBIOS encoder object:
+	// UNIPHY, UNIPHY1, UNIPHY2 with two links each.
+	const uint32_t kFeCntl = 0x2093 + c.dig * 0x124u, kFeEn = 0x2095 + c.dig * 0x124u;
+	const uint32_t kHdmiGc = 0x20a8 + c.dig * 0x124u, kVpgData = 0x2069 + c.dig * 0x124u;
+	const uint32_t kBeCntl = 0x20bc + c.link * 0x124u, kBeEn = 0x20bd + c.link * 0x124u;
+	const uint32_t kBeFromFe = 1u << (8 + c.dig), kMapper = 0x1f0du + c.dig;
+	const uint8_t  kDdcLine = static_cast<uint8_t>(c.hpd - 1);
+	static const uint8_t uniphy[3] = { 0x1e, 0x20, 0x21 };
+	const uint16_t kEncoderObj = static_cast<uint16_t>(0x2000 | (((c.link & 1) + 1) << 8) | uniphy[c.link / 2]);
+	failures += check(Pipe2::linkOfEncoder(kEncoderObj) == c.link, "pipe2: encoder object 0x%04x is not link %u",
+	                  kEncoderObj, c.link);
 	enum Who { ThePipe, TheDig, TheLink };
 	struct Family { uint8_t seg; uint32_t first, stride; Who who; const char *name; };
 	static const Family families[] = {
@@ -1313,7 +1326,7 @@ static int testPipe2() {
 		{ 3, 0x02d5, 0x02,  ThePipe, "HUBP 3D LUT" },
 	};
 	struct Shared { uint8_t seg; uint32_t dword, mask, waitMask; const char *name; };
-	static const Shared shared[] = {
+	const Shared shared[] = {
 		{ 1, 0x006f, 1u << (5 * c.pipe), 0, "OTG_PIXEL_RATE_DIV" },
 		{ 1, 0x0064, 0, 0x00080000, "DENTIST_DISPCLK_CNTL" },
 		{ 1, 0x00a8, 1u << (3 * c.pipe), 0, "DPPCLK_CTRL" },
@@ -1335,7 +1348,7 @@ static int testPipe2() {
 
 	Pipe2::Target t {};
 	t.litHubp = 0;
-	t.encoderObjId = 0x2120;
+	t.encoderObjId = kEncoderObj;
 	t.surface = 0x8002100000ull;
 	t.depth = Pipe2::Depth::Plane;
 	static Pipe2::Plan plan, stream;
@@ -1398,13 +1411,13 @@ static int testPipe2() {
 	// the transmitter is enabled; one without is left alone (above).
 	Pipe2::Target scdc = t;
 	scdc.sinkScdc = true;
-	scdc.ddcLine = 2;
+	scdc.ddcLine = kDdcLine;
 	bool told = false, before = false;
 	if (Pipe2::build(scdc, stream, &why))
 		for (size_t i = 0; i < stream.count; i++) {
 			const ModeSet::Step &s = stream.steps[i];
 			if (s.op == ModeSet::Op::Scdc)
-				told = s.value == 0 && s.arg == 2 && !before;
+				told = s.value == 0 && s.arg == kDdcLine && !before;
 			before = before || (s.op == ModeSet::Op::Dmub && s.arg == 2);
 		}
 	failures += check(told && stream.count == plan.count + 1, "pipe2: SCDC step for a sink with SCDC: %d, %zu steps",
@@ -1414,13 +1427,13 @@ static int testPipe2() {
 	failures += check(plan.ncmds == 4, "pipe2: %zu DMUB commands, expected 4", plan.ncmds);
 	if (plan.ncmds == 4) {
 		const Dmub::Cmd &pll = plan.cmds[0], &enc = plan.cmds[1], &on = plan.cmds[2], &enc2 = plan.cmds[3];
-		failures += check(pll[0] == 0x10000280 && pll[1] == 1485000 && pll[2] == 0x00032016 &&
+		failures += check(pll[0] == 0x10000280 && pll[1] == 1485000 && pll[2] == (0x00032014u + c.link) &&
 		                  (pll[3] & 0xffff) == c.pipe,
 		                  "pipe2: set pixel clock %08x %08x %08x %08x", pll[0], pll[1], pll[2], pll[3]);
-		failures += check(enc[0] == 0x0c000080 && enc[1] == 0x04030f02 && enc[2] == 14850 &&
+		failures += check(enc[0] == 0x0c000080 && enc[1] == (0x04030f00u | c.dig) && enc[2] == 14850 &&
 		                  memcmp(enc, enc2, sizeof(Dmub::Cmd)) == 0,
 		                  "pipe2: stream setup %08x %08x %08x", enc[0], enc[1], enc[2]);
-		failures += check(on[0] == 0x3c000180 && on[1] == 0x04030102 && on[2] == 14850 && (on[3] & 0xff) == 3,
+		failures += check(on[0] == 0x3c000180 && on[1] == (0x04030100u | c.link) && on[2] == 14850 && (on[3] & 0xff) == c.hpd,
 		                  "pipe2: transmitter enable %08x %08x %08x %08x", on[0], on[1], on[2], on[3]);
 	}
 
@@ -1450,8 +1463,8 @@ static int testPipe2() {
 		{ 2, 0x0e8a, 0xffffffff, 0x04380780, "DSCL1 recout size" }, { 2, 0x0e8b, 0xffffffff, 0x04380780, "DSCL1 MPC size" },
 		{ 3, 0x0015, 0xf, 1, "MPCC1 top = DPP1" },               { 3, 0x0017, 0xf, 1, "MPCC1 OPP id" },
 		{ 3, 0x02f6, 0xf, 1, "OPP1 out mux = MPCC1" },           { 2, 0x18ae, 0x1, 0, "DPG1 off (video)" },
-		{ 2, 0x22dd, 0x1, 1, "DIG2 front-end enabled" },         { 2, 0x2305, 0x1, 1, "DIG2 back-end enabled" },
-		{ 2, 0x1f0f, 0x7, 2, "DIG2 mapped to link 2" },          { 2, 0x22db, 0x7, 1, "DIG2 sourced by OTG1" },
+		{ 2, kFeEn, 0x1, 1, "DIG front-end enabled" },           { 2, kBeEn, 0x1, 1, "DIG back-end enabled" },
+		{ 2, kMapper, 0x7, c.link, "DIG mapped to its link" },   { 2, kFeCntl, 0x7, c.pipe, "DIG sourced by the OTG" },
 		{ 2, 0x04bc, 0x1f, c.detSegments, "DET1 segments" },     { 1, 0x006f, 0x20, 0x20, "OTG1 TMDS divider /4" },
 	};
 	for (const auto &e : after)
@@ -1474,11 +1487,11 @@ static int testPipe2() {
 	inBlocks(dpms);
 	apply(dpms);
 	const size_t sleepSteps = dpms.count;
-	failures += check((regs.get(2, 0x22dd) & 1) == 0 && (regs.get(2, 0x2304) & 0x400) == 0 &&
-	                  (regs.get(2, 0x22f0) & 1) == 1 && (regs.get(2, 0x1bc3) & 1) == 1 &&
+	failures += check((regs.get(2, kFeEn) & 1) == 0 && (regs.get(2, kBeCntl) & kBeFromFe) == 0 &&
+	                  (regs.get(2, kHdmiGc) & 1) == 1 && (regs.get(2, 0x1bc3) & 1) == 1 &&
 	                  regs.get(2, 0x06e6) == lit.get(2, 0x06e6),
-	                  "pipe2: asleep: DIG2 FE %08x, BE %08x, HDMI_GC %08x, OTG1 %08x", regs.get(2, 0x22dd),
-	                  regs.get(2, 0x2304), regs.get(2, 0x22f0), regs.get(2, 0x1bc3));
+	                  "pipe2: asleep: DIG FE %08x, BE %08x, HDMI_GC %08x, OTG1 %08x", regs.get(2, kFeEn),
+	                  regs.get(2, kBeCntl), regs.get(2, kHdmiGc), regs.get(2, 0x1bc3));
 	power.part = Pipe2::Part::Wake;
 	bool woke = Pipe2::build(power, dpms, &why);
 	failures += check(woke && dpms.ncmds == 3 && memcmp(dpms.cmds, plan.cmds + 1, 3 * sizeof(Dmub::Cmd)) == 0,
@@ -1497,7 +1510,7 @@ static int testPipe2() {
 	const auto aviWords = [&](const Pipe2::Plan &p, uint32_t *w) {
 		size_t n = 0;
 		for (size_t i = 0; i < p.count; i++)
-			if (p.steps[i].op == ModeSet::Op::Write && p.steps[i].seg == 2 && p.steps[i].dword == 0x22b1)
+			if (p.steps[i].op == ModeSet::Op::Write && p.steps[i].seg == 2 && p.steps[i].dword == kVpgData)
 				w[n++ % 9] = p.steps[i].value;     // the last infoframe of the plan
 		return n;
 	};
@@ -1546,7 +1559,7 @@ static int testPipe2() {
 	mt.dig = c.dig;
 	mt.link = c.link;
 	mt.hpd = c.hpd;
-	mt.encoderObjId = 0x2120;
+	mt.encoderObjId = kEncoderObj;
 	mt.connectorObjId = 0x330c;
 	mt.extra = extra;
 	size_t nmodes = 0, modeMismatch = 0;
@@ -1578,7 +1591,7 @@ static int testPipe2() {
 		PlanRegs direct = lit;                         // straight from the lit state
 		modeMismatch += switchTo(direct, c.timing, known[i]);
 		modeMismatch += switchTo(chain, i ? known[i - 1] : c.timing, known[i]);
-		failures += check((direct.get(2, 0x22dd) & 1) == 1 && (direct.get(2, 0x1bc3) & 1) == 1 &&
+		failures += check((direct.get(2, kFeEn) & 1) == 1 && (direct.get(2, 0x1bc3) & 1) == 1 &&
 		                  direct.get(2, 0x06e6) == lit.get(2, 0x06e6) && direct.get(2, 0x06e3) == lit.get(2, 0x06e3),
 		                  "pipe2: after a switch to mode %zu the stream is off or the surface moved", i);
 	}
@@ -1632,15 +1645,15 @@ static int testPipe2() {
 				differ += ours.get(sl.steps[i].seg, sl.steps[i].dword) != theirs.get(sl.steps[i].seg, sl.steps[i].dword);
 		failures += check(ok && sl.ncmds == 1 && linuxSleep.ncmds == 1 &&
 		                  memcmp(sl.cmds[0], linuxSleep.cmds[0], sizeof(Dmub::Cmd)) == 0 && differ == 0 &&
-		                  outside == before && (ours.get(2, 0x22dd) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
+		                  outside == before && (ours.get(2, kFeEn) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
 		                  "modeset: HDMI sleep: %s, %zu registers not as Linux's sleep leaves them", ok ? "built" : why,
 		                  differ);
 		const bool back = ModeSet::build(st, ms, &why);
 		ours.run(ms);
-		failures += check(back && (ours.get(2, 0x22dd) & 1) == 1 && (ours.get(2, 0x2304) & 0x400) == 0x400 &&
-		                  (ours.get(2, 0x22f0) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
-		                  "modeset: HDMI wake by mode set: FE %08x BE %08x GC %08x", ours.get(2, 0x22dd),
-		                  ours.get(2, 0x2304), ours.get(2, 0x22f0));
+		failures += check(back && (ours.get(2, kFeEn) & 1) == 1 && (ours.get(2, kBeCntl) & kBeFromFe) == kBeFromFe &&
+		                  (ours.get(2, kHdmiGc) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
+		                  "modeset: HDMI wake by mode set: FE %08x BE %08x GC %08x", ours.get(2, kFeEn),
+		                  ours.get(2, kBeCntl), ours.get(2, kHdmiGc));
 		Edid::DetailedTiming none = c.timing;
 		none.pixelClockKHz = 0;
 		st.to = none;
@@ -1679,6 +1692,21 @@ static int testPipe2() {
 	       "not as Linux has them; %zu outside the pipe %s\n", c.pipe, c.dig, c.link, c.hpd, c.timing.hActive,
 	       c.timing.vActive, c.timing.pixelClockKHz, plan.count, lightWrites, requires, plan.ncmds, sleepSteps,
 	       wakeSteps, nmodes, modeMismatch, outside, failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
+// Every table, in turn the one in use; the first is in use again afterwards.
+static int testPipe2() {
+	int failures = 0;
+	const uint8_t first = Pipe2::config().hpd;
+	failures += check(Pipe2::configCount() == 2 && !Pipe2::use(1) && Pipe2::config().hpd == first,
+	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
+	for (size_t i = 0; i < Pipe2::configCount(); i++) {
+		const uint8_t hpd = Pipe2::configAt(i).hpd;
+		failures += check(Pipe2::use(hpd) && Pipe2::config().hpd == hpd, "pipe2: no table for HPD%u", hpd);
+		failures += testPipe2Table();
+	}
+	Pipe2::use(first);
 	return failures;
 }
 

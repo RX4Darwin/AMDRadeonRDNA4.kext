@@ -30,7 +30,7 @@
 
 namespace Pipe2 {
 
-// What pipe2_linux.inc was generated for.
+// What a table (pipe2_linux*.inc) was generated for.
 struct Config {
 	uint8_t  pipe;            // OTG = OPP = HUBP = DPP = MPCC instance
 	uint8_t  dig;             // stream encoder (DIG front-end)
@@ -42,7 +42,13 @@ struct Config {
 	uint8_t  detSeg;          // DCHUBBUB_DET0..3_CTRL: segment and dwords
 	uint16_t detCtrl[4];
 };
-const Config &config();
+// There is one table per connector a second display can be on. use() picks
+// the one for a display on that HPD pin, for everything below (false, and no
+// change, if there is none); until then it is the first.
+size_t configCount();
+const Config &configAt(size_t i);
+bool use(uint8_t hpd);
+const Config &config();   // of the table in use
 
 // The DET buffer is 1344 KiB in 64 KiB segments, shared by all planes
 // (DCN4_01_CRB_SIZE_KB / DCN4_01_CRB_SEGMENT_SIZE_KB).

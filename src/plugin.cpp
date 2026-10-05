@@ -342,6 +342,7 @@ struct Head2 {
 	void            *connectRef { nullptr };
 	IOTimerEventSource *hpdTimer { nullptr };
 	bool             hpdSeen { false };     // the pin at the last poll
+	uint8_t          hpdPin { 0 };          // the pin that was last seen high
 	uint32_t         hpdSame { 0 };         // polls it has read that way
 	uint32_t         hpdGone { 0 };         // polls it has been low with the link up
 };
@@ -499,7 +500,10 @@ void fillHead2(RDNA4Device &dev) {
 	const Edid::DetailedTiming &lit = Pipe2::config().timing;
 	// A pipe to light needs a second monitor. Until one is plugged in the
 	// head is there but offline (rdna4-hotplug=2): macOS shows no display.
-	const bool offline = head2Level >= 2 && !dev.edid2Len && hotplugLevel >= 2;
+	// For a pipe to light, a second display counts if it is on a connector
+	// there is a plan for.
+	const bool sink = dev.edid2Len && (head2Level < 2 || Pipe2::use(dev.edid2Hpd));
+	const bool offline = head2Level >= 2 && !sink && hotplugLevel >= 2;
 	const Modes::Mode *mode = nullptr;
 	size_t n = 0;
 	if (offline) {
@@ -521,9 +525,13 @@ void fillHead2(RDNA4Device &dev) {
 		// Without hot-plug a head with no monitor would be the phantom, an
 		// invisible display for windows to get lost on: that is rdna4-head2=1,
 		// asked for by name.
-		if (head2Level >= 2 && !dev.edid2Len) {
-			FBLOG("head2: nothing to serve: no second sink answered on DDC (rdna4-hotplug=2 waits for one, "
-			      "rdna4-head2=1 makes a phantom head)");
+		if (head2Level >= 2 && !sink) {
+			if (dev.edid2Len)
+				FBLOG("head2: nothing to serve: the second display is on HPD%u, a connector there is no "
+				      "second-pipe plan for", dev.edid2Hpd);
+			else
+				FBLOG("head2: nothing to serve: no second sink answered on DDC (rdna4-hotplug=2 waits for "
+				      "one, rdna4-head2=1 makes a phantom head)");
 			return;
 		}
 		mode = head2BuildTable(h, dev, n);
@@ -573,13 +581,16 @@ void head2ConnectChanged(Head2 *h) {
 // another display than before the pipe goes to the mode it is lit in (and is
 // lit, if this is the first display it sees), which is where a new mode table
 // starts.
-void head2Plugged(Head2 *h) {
+void head2Plugged(Head2 *h, uint8_t hpd) {
 	RDNA4Device &dev = *h->dev;
-	const Edid::DetailedTiming &lit = Pipe2::config().timing;
-	if (!dev.readSecondEdid()) {
-		FBLOG("hotplug: HPD%u is high but there is no EDID on DDC (yet)", Pipe2::config().hpd);
+	if (!dev.readSecondEdid(hpd)) {
+		FBLOG("hotplug: HPD%u is high but there is no EDID on DDC (yet)", hpd);
 		return;
 	}
+	// A pipe that is not lit yet takes the plan for this connector.
+	if (!dev.pipe2Lit)
+		Pipe2::use(hpd);
+	const Edid::DetailedTiming &lit = Pipe2::config().timing;
 	const size_t len = min(static_cast<size_t>(dev.edid2Len), sizeof(h->edid));
 	// The display that was there before: the link comes back in the mode it
 	// was in, and macOS finds the head, its modes and their IDs as it left them.
@@ -636,9 +647,12 @@ constexpr uint32_t kHpdPollMs = 500;
 void hotplugPoll(OSObject *, IOTimerEventSource *timer) {
 	Head2 *h = head2;
 	RDNA4Device &dev = *h->dev;
-	const bool present = dev.secondSinkPresent();
+	const uint8_t hpd = dev.secondSinkHpd();
+	const bool present = hpd != 0;
 	if (present != h->hpdSeen) {
-		FBLOG("hotplug: HPD%u went %s", Pipe2::config().hpd, present ? "high" : "low");
+		if (present)
+			h->hpdPin = hpd;
+		FBLOG("hotplug: HPD%u went %s", h->hpdPin, present ? "high" : "low");
 		h->hpdSeen = present;
 		h->hpdSame = 0;
 	} else {
@@ -651,7 +665,7 @@ void hotplugPoll(OSObject *, IOTimerEventSource *timer) {
 		// A second of high, and again after 3 and 7 s if the display's EDID
 		// was not there yet; three seconds of low.
 		if (!h->connected && present && (h->hpdSame == 2 || h->hpdSame == 6 || h->hpdSame == 14))
-			head2Plugged(h);
+			head2Plugged(h, hpd);
 		else if (h->connected && h->hpdGone >= 6)
 			head2Unplugged(h);
 	}
@@ -681,8 +695,11 @@ IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSOb
 	h->connectProc = proc;
 	h->connectTarget = target;
 	h->connectRef = ref;
-	h->hpdSeen = h->dev->secondSinkPresent();
-	FBLOG("hotplug: polling HPD%u (now %s), %s; head 2 is %s", Pipe2::config().hpd, h->hpdSeen ? "high" : "low",
+	h->hpdPin = h->dev->secondSinkHpd();
+	h->hpdSeen = h->hpdPin != 0;
+	if (!h->hpdSeen)
+		h->hpdPin = Pipe2::config().hpd;
+	FBLOG("hotplug: polling HPD%u (now %s), %s; head 2 is %s", h->hpdPin, h->hpdSeen ? "high" : "low",
 	      hotplugLevel >= 2 ? "acting on it" : "logging only (rdna4-hotplug=2 acts)",
 	      h->connected ? "connected" : "offline");
 	h->hpdTimer->setTimeoutMS(kHpdPollMs);

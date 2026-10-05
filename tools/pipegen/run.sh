@@ -7,8 +7,10 @@
 #   tools/pipegen/run.sh <linux tree> [pipe dig link hpd  hactive hfront hsync hback
 #                                      vactive vfront vsync vback  khz hpositive vpositive vic]
 #
-# The default configuration is this project's test rig: pipe 1, DIG2 on link 2
-# (UNIPHY C), HPD3, CEA 1920x1080@60 (VIC 16).
+# Without a configuration it writes the tables for this project's card: pipe 1
+# at CEA 1920x1080@60 (VIC 16) through DIG2 on link 2 (UNIPHY C, HPD3) into
+# src/pipe2_linux.inc, and through DIG3 on link 3 (HPD4), the other HDMI
+# connector, into src/pipe2_linux_hpd4.inc. With one it writes only the first.
 #
 # The Linux tree only needs the display driver and its headers. A sparse
 # checkout is enough (the commit the checked-in table was made from is in its
@@ -40,7 +42,6 @@ here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 L=${1:?usage: run.sh <linux tree> [configuration]}
 shift
-[ $# -eq 0 ] && set -- 1 2 2 3  1920 88 44 148  1080 4 5 36  148500 1 1 16
 AMD=$L/drivers/gpu/drm/amd
 D=$AMD/display
 M=$D/dc/dml2_0/dml21
@@ -87,29 +88,42 @@ for pass in 1 2; do
 		done < "$B/undef.txt"; } > "$B/stubs.c"
 done
 
-"$B/pipegen" "$@" > "$B/trace.txt"
+# table <file under src> <configuration>: one table.
+table() {
+	out=$1; shift
+	"$B/pipegen" "$@" > "$B/trace.txt"
 
-# The same pipe in each mode of modes.txt, with the plane on the surface of the lit mode (as after a mode
-# switch): mkinc.py keeps the registers that differ from mode to mode. The lit mode itself comes first.
-mkdir -p "$B/modes"
-command rm -f "$B"/modes/*.txt
-"$B/pipegen" on "$5" "$9" "$@" > "$B/modes/00.txt"
-n=0
-while read -r line; do
-	mode=${line%%#*}
-	[ -n "${mode// /}" ] || continue
-	n=$((n + 1)); f=$B/modes/$(printf %02d $n).txt
-	# shellcheck disable=SC2086
-	if ! "$B/pipegen" on "$5" "$9" "${@:1:4}" $mode > "$f" 2> "$B/mode.err"; then
-		command rm -f "$f"
-		grep -q 'DML: mode not supported' "$B/mode.err" || { cat "$B/mode.err" >&2; exit 1; }
-		echo "modes.txt: DML does not support${line##*#}: it stays on the 25 % rule"
-	fi
-done < "$here/modes.txt"
+	# The same pipe in each mode of modes.txt, with the plane on the surface of the lit mode (as after a mode
+	# switch): mkinc.py keeps the registers that differ from mode to mode. The lit mode itself comes first.
+	mkdir -p "$B/modes"
+	command rm -f "$B"/modes/*.txt
+	"$B/pipegen" on "$5" "$9" "$@" > "$B/modes/00.txt"
+	n=0
+	while read -r line; do
+		mode=${line%%#*}
+		[ -n "${mode// /}" ] || continue
+		n=$((n + 1)); f=$B/modes/$(printf %02d $n).txt
+		# shellcheck disable=SC2086
+		if ! "$B/pipegen" on "$5" "$9" "${@:1:4}" $mode > "$f" 2> "$B/mode.err"; then
+			command rm -f "$f"
+			grep -q 'DML: mode not supported' "$B/mode.err" || { cat "$B/mode.err" >&2; exit 1; }
+			echo "modes.txt: DML does not support${line##*#}: it stays on the 25 % rule"
+		fi
+	done < "$here/modes.txt"
 
-python3 "$here/mkinc.py" "$HDR" "$B/trace.txt" "$(git -C "$L" rev-parse HEAD)" "$B"/modes/*.txt > "$B/pipe2_linux.inc"
-cp -f "$B/pipe2_linux.inc" "$repo/src/pipe2_linux.inc"
-echo "wrote src/pipe2_linux.inc ($(grep -c "^	{ '" "$repo/src/pipe2_linux.inc") entries)"
+	python3 "$here/mkinc.py" "$HDR" "$B/trace.txt" "$(git -C "$L" rev-parse HEAD)" "$B"/modes/*.txt > "$B/$out"
+	cp -f "$B/$out" "$repo/src/$out"
+	echo "wrote src/$out ($(grep -c "^	{ '" "$repo/src/$out") entries)"
+}
+
+# Without a configuration: one table for each HDMI connector of this project's card, both for pipe 1 at
+# CEA 1920x1080@60. src/pipe2.cpp picks the one for the connector the second display is on.
+if [ $# -eq 0 ]; then
+	table pipe2_linux.inc       1 2 2 3  1920 88 44 148  1080 4 5 36  148500 1 1 16
+	table pipe2_linux_hpd4.inc  1 3 3 4  1920 88 44 148  1080 4 5 36  148500 1 1 16
+else
+	table pipe2_linux.inc "$@"
+fi
 
 # The reference for the host test of the DisplayPort mode switch (src/modeset.cpp): the same Linux code
 # retiming a lit DP stream on pipe 0 to 2560x1440@60 (CVT reduced blanking).

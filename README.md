@@ -170,7 +170,7 @@ monitor really sleeps, and wakes it with a mode set to the running timing
 | `src/modes.{hpp,cpp}` | EDID → deduplicated, filtered, deterministically ordered display-mode table with stable IDs. |
 | `src/pipe.{hpp,cpp}` | Lit-pipe discovery (OTG/DIG/link/OPP/HUBP, DP vs HDMI) and OTG-image → timing inversion. |
 | `src/modeset.{hpp,cpp}` | The mode-switch plan for the lit pipe: HDMI (PLL and transmitter through DMUB, scrambling above 340 MHz) and DisplayPort (stream retimed on the trained link). |
-| `src/pipe2.{hpp,cpp}`, `src/pipe2_linux.inc` | The plan that lights a second pipe for the second head; the register table is generated (`docs/second-pipe.md`). |
+| `src/pipe2.{hpp,cpp}`, `src/pipe2_linux.inc`, `src/pipe2_linux_hpd4.inc` | The plan that lights a second pipe for the second head; the register tables are generated, one per HDMI connector (`docs/second-pipe.md`). |
 | `src/dmub.hpp` | DMUB ring command ABI and builders for the VBIOS-family commands (transmitter control v1.7, set pixel clock v1.7, DIG encoder stream setup v1.5). |
 | `src/otgtiming.{hpp,cpp}` | EDID timing → DCN OTG register images, per amdgpu's `optc1_program_timing` (mode-set groundwork). |
 | `src/kmod_info.c` | kmod glue pointing at Lilu's plugin start/stop. |
@@ -178,7 +178,7 @@ monitor really sleeps, and wakes it with a mode set to the running timing
 | `tools/atomdump.cpp` | Host test harness: parsers against the real ROM and captured EDID fixtures, pipe discovery, DMUB payloads, the NDRV translator (`make test`). |
 | `tools/vm-opencore.sh`, `tools/vm-ocplist.py` | Build a development OpenCore disk for an OSX-KVM VM with RDNA4FB injected after Lilu. |
 | `tools/logs-ssh.sh` | Pull the RDNA4FB kernel log and registry properties from a macOS machine over SSH. |
-| `tools/pipegen/` | Runs Linux's own DCN 4.01 display code on the host against a recorder: generates `src/pipe2_linux.inc` and the DisplayPort reference `tools/dp_retime_linux.inc` (`run.sh <linux tree>`). |
+| `tools/pipegen/` | Runs Linux's own DCN 4.01 display code on the host against a recorder: generates `src/pipe2_linux*.inc` and the DisplayPort reference `tools/dp_retime_linux.inc` (`run.sh <linux tree>`). |
 | `tools/linux-capture.sh` | Ground-truth capture of amdgpu's display programming on Linux, for the mode-set engine. |
 | `Info.plist` | Lilu plugin personality (`IOResources`), OSBundleLibraries (Lilu, IOPCIFamily, KPIs). |
 | `Makefile` | Cross-compiles x86_64 on any host, assembles the `.kext`. |
@@ -513,8 +513,12 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       head offline in macOS, a plugged one is read, lit and found.
       `rdna4-hotplug=1` only logs the pin. A long display sleep with
       hot-plug active is not yet tried.
-- [ ] Second display beyond that configuration: other connectors, a
-      second DisplayPort display (needs link training).
+- [ ] The second display on the card's other HDMI connector (HPD4 /
+      link 3): a second generated table, picked by the connector the
+      display answers on. Written and host-tested, not yet run on the
+      card.
+- [ ] Second display beyond that: a second DisplayPort display (needs
+      link training).
 - [x] DP mode switching on the trained link (verified on hardware
       2026-10-04, Big Sur 11.6.6: 3840x2160 to 2560x1440, picture
       confirmed; `rdna4-modeset=1`). The plan's register writes are held

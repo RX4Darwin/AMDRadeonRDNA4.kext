@@ -128,8 +128,12 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
 
 ## 6. Limits
 
-- One configuration to light: pipe 1, DIG2, link 2, HPD3, 1920x1080@60 at 148.5 MHz. Another board, or another mode
-  to start in, needs `tools/pipegen/run.sh` run with other arguments. Once lit the pipe can change mode (below).
+- Two configurations to light, one per HDMI connector of this card, both pipe 1 at 1920x1080@60 (148.5 MHz): DIG2
+  and link 2 for HPD3 (`src/pipe2_linux.inc`, the one every card boot so far used) and DIG3 and link 3 for HPD4
+  (`src/pipe2_linux_hpd4.inc`, written 2026-10-06, host-tested like the first, not yet run on the card). The plan
+  is picked by the connector the second display answers on (`Pipe2::use`); a second display on any other connector
+  is not served. Another board, or another mode to start in, needs `tools/pipegen/run.sh` run with other
+  arguments. Once lit the pipe can change mode (below), and stays with its connector.
 - The second display must be HDMI or DVI (TMDS). A second DisplayPort display needs link training. A mode above
   340 MHz needs the table regenerated for it (the generator then turns the scrambler on by itself).
 - The boot display must not be on the plan's blocks: with the Lenovo alone, the firmware puts it on DIG2 and link 2.
@@ -195,7 +199,9 @@ interrupt service and fails, so the plugin routes the call and keeps the handler
 hot-plug interrupt does: IOFramebuffer counts a connect change, WindowServer acknowledges, and each framebuffer of
 the controller is asked `cscGetConnection` again, then for its EDID and modes.
 
-Only the second pipe's connector is handled. The boot display on DisplayPort would need link training to come back.
+Until the pipe is lit, the pins of both HDMI connectors are watched (not the boot display's), and the first display
+to appear decides which plan lights it. After that only that connector is handled. The boot display on DisplayPort
+would need link training to come back.
 
 Log lines: `hotplug: polling HPD3 (now high), acting on it; head 2 is connected`, `hotplug: HPD3 went low`,
 `hotplug: display gone from HPD3: link off`, `hotplug: the same display is back on HPD3`,
