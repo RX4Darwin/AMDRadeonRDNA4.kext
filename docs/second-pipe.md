@@ -305,13 +305,22 @@ Samsung. Cable in: `hotplug: HPD3 went high`, a second later the wake part (128 
 
 *Booted without the Lenovo.* `head2: serving 1920x1080@60.000 ..., offline until a display is plugged in` and
 `hotplug: polling HPD3 (now low), acting on it; head 2 is offline`. While offline the head got two status calls and
-no gamma writes, so WindowServer was not driving it; whether macOS showed any trace of a second display was not
-checked by eye. Cable in: the pipe was lit from the timer, after boot (`pipe2: plan ran; OTG1 measured 60.002 Hz`:
+no gamma writes, so WindowServer was not driving it, and a later log taken with the cable out (16:34) has one
+display in its CoreGraphics list: no phantom. Cable in: the pipe was lit from the timer, after boot (`pipe2: plan ran; OTG1 measured 60.002 Hz`:
 the plan's requirements still held), `hotplug: display connected on HPD3: 15 mode(s), EDID 256 bytes`, macOS probed
 the head and at once switched it to the 144 Hz mode it remembered for this monitor (measured 144.010 Hz). Correct
 desktop on the Lenovo.
 
 The Samsung was undisturbed throughout. So the handler IOFramebuffer registers for connect interrupts can be called
 from outside an interrupt service, `kConnectionInactive` takes an IONDRV framebuffer offline and back, and a pipe
-can be lit long after boot. Not yet tried: display sleep with hot-plug active (what the monitor's HPD does asleep).
+can be lit long after boot. Display sleep with hot-plug active has only run as a blink so far (16:34: off and on
+within milliseconds, the Lenovo kept); a long sleep, where the monitor might drop its HPD pin, is not yet tried.
+
+One thing that looks like a fault and is not the driver's: with the Lenovo unplugged the Samsung goes from
+"1920x1080" to "3840x2160", and back when it is plugged in again. Both are the same driver mode (id 100, 3840x2160
+pixels; the log shows no mode switch on the boot display, only `ndrv: switch to mode 100`): macOS draws it at 2x in
+one case and 1x in the other. WindowServer keeps display settings per set of connected displays, and the 2x variant
+still carries the default flag in the CoreGraphics list while 1x is selected, so the setting for "Samsung alone" is
+one that was chosen at some point, not a default. Choosing 1920x1080 for the Samsung once while the Lenovo is
+unplugged should make it stay.
 
