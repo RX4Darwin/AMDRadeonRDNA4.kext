@@ -101,7 +101,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-off=1` | Kill switch: the plugin does not hook anything and macOS runs its stock fallback framebuffer. Lilu's `-liluoff` disables all plugins. |
 | `rdna4-trace=1` | Log every NDRV request for our framebuffer and who answered it (`rdna4` or `boot`), up to 400 lines. On by default in `VMTEST` builds. Mode switches are always logged. |
 | `rdna4-modeset=1` | Offer the sink's EDID modes (DTDs, CTA DTDs/VICs, standard and established timings; ≤ boot framebuffer size, TMDS ≤ 340 MHz or, for a sink whose EDID announces SCDC and a higher rate, ≤ 600 MHz, and ≤ 1.25 × boot pixel clock) instead of the boot mode alone. On an HDMI/DVI boot display a switch runs the mode-set engine (verified on the card 2026-10-04: 1920x1080 to 1600x900 on a 1080p HDMI sink, picture confirmed; the log line `modes: now ..., measured ... Hz` gives the refresh the OTG really runs at). On a DP boot display a switch retimes the stream and leaves the link as the firmware trained it, so only modes at or below the boot pixel clock are offered (verified on the card 2026-10-04: 3840x2160 to 2560x1440 on a 4K DP monitor over four HBR2 lanes, picture confirmed; the log shows `modes: DisplayPort, link untouched: DTO ...` and the measured refresh). From 340 MHz up the link is HDMI 2.0 scrambled: the encoder's scrambler is switched with the mode and the monitor is told over SCDC, in both directions, so a monitor the GOP lit at 4K60 (533 MHz, scrambled) can be switched down as well. The scrambled path ran on the card 2026-10-05: a monitor the GOP lit at 3840x2160 (533 MHz) switched to 1920x1080@60, to 1920x1080@144 (333 MHz, measured 143.996 Hz) and back to 3840x2160 (`scdc: ... TMDS_CONFIG = 3 written`, measured 59.996 Hz), and showed the desktop again at 3840x2160. |
-| `rdna4-head2=1` | Experiment: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Not with `rdna4-compute`. Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. **Higher values also light the pipe (`docs/second-pipe.md`; all verified on the card 2026-10-04):** `2` writes nothing and publishes what every step of the plan would do to the dormant pipe's registers (`RDNA4FB,Pipe2`, shown by `tools/diagnostic-log.sh`); `3` lights the stream alone, so the second monitor shows a solid teal-blue; `4` also lights the plane, so it shows the second desktop. The plan is for one configuration: an HDMI monitor on HPD3 / link 2 at 1920x1080@60 next to a boot display on another connector. |
+| `rdna4-head2=1` | Experiment: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Not with `rdna4-compute`. Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. **Higher values also light the pipe (`docs/second-pipe.md`; all verified on the card 2026-10-04):** `2` writes nothing and publishes what every step of the plan would do to the dormant pipe's registers (`RDNA4FB,Pipe2`, shown by `tools/diagnostic-log.sh`); `3` lights the stream alone, so the second monitor shows a solid teal-blue; `4` also lights the plane, so it shows the second desktop. There is a plan per connector of the card, all at 1920x1080@60 next to a boot display on another connector: HDMI on HPD3 / link 2 (the one verified), HDMI on HPD4 / link 3, and DisplayPort on HPD1 / link 0 or HPD2 / link 1, whose link the kext trains itself (the last three host-tested, not yet run on the card). |
 | `rdna4-hotplug=2` | With `rdna4-head2=2` or more: hot-plug of the second display. The connector's HPD pin is polled; unplugging takes the head offline in macOS, plugging reads the display, lights or wakes the pipe and brings the head back, and the head exists (offline) when no monitor was there at boot. `1` only logs what the pin does. Verified on the card 2026-10-05 (`docs/second-pipe.md`); a long display sleep with it active is not yet tried. |
 | `rdna4-dptrain=1` | DisplayPort boot display: read what the monitor can do and which link the firmware trained (logged), watch its HPD pin, and train that link again when the monitor comes back after being unplugged or switched off (`src/dptrain.cpp`, as amdgpu trains). `2` also retrains once by itself 15 s after the desktop is up, to try the training without touching the cable. If training fails the display stays dark until reboot. Not yet run on the card. |
 | `rdna4-nosleep=1` | Make display sleep a no-op (the screen stays on). Escape hatch if blank/unblank misbehaves. |
@@ -171,7 +171,7 @@ monitor really sleeps, and wakes it with a mode set to the running timing
 | `src/modes.{hpp,cpp}` | EDID → deduplicated, filtered, deterministically ordered display-mode table with stable IDs. |
 | `src/pipe.{hpp,cpp}` | Lit-pipe discovery (OTG/DIG/link/OPP/HUBP, DP vs HDMI) and OTG-image → timing inversion. |
 | `src/modeset.{hpp,cpp}` | The mode-switch plan for the lit pipe: HDMI (PLL and transmitter through DMUB, scrambling above 340 MHz) and DisplayPort (stream retimed on the trained link). |
-| `src/pipe2.{hpp,cpp}`, `src/pipe2_linux.inc`, `src/pipe2_linux_hpd4.inc` | The plan that lights a second pipe for the second head; the register tables are generated, one per HDMI connector (`docs/second-pipe.md`). |
+| `src/pipe2.{hpp,cpp}`, `src/pipe2_linux*.inc` | The plan that lights a second pipe for the second head; the register tables are generated, one per connector: two HDMI, two DisplayPort (`docs/second-pipe.md`). |
 | `src/dmub.hpp` | DMUB ring command ABI and builders for the VBIOS-family commands (transmitter control v1.7, set pixel clock v1.7, DIG encoder stream setup v1.5). |
 | `src/otgtiming.{hpp,cpp}` | EDID timing → DCN OTG register images, per amdgpu's `optc1_program_timing` (mode-set groundwork). |
 | `src/kmod_info.c` | kmod glue pointing at Lilu's plugin start/stop. |
@@ -415,8 +415,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    again (533 MHz). DP mode switching retimes the stream on the trained link
    (verified 2026-10-04). A pipe the GOP did not set up is lit from a
    register sequence generated from Linux's own code (verified 2026-10-04
-   for one configuration, `docs/second-pipe.md`). Open: DP link training, which modes above the
-   boot pixel clock and a second DP display need.
+   for one configuration, `docs/second-pipe.md`). DP link training is written and
+   host-tested against Linux, not yet run on the card; modes above the boot pixel
+   clock on a DP boot display still need it wired into the mode switch.
 5. **Display power management** — display sleep was verified on hardware
    with the standalone build (DP: video stream off + sink D3 over native-AUX
    DPCD `SET_POWER`; HDMI: OPP pattern generator blank). It now runs from
@@ -529,8 +530,12 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       registers and transmitter commands against what Linux writes on
       the way. Second part written, not yet run on the card:
       `rdna4-dptrain=1` trains the boot display's link again when the
-      monitor comes back. Still to do: lighting a second DisplayPort
-      display, which needs the stream side generated as for HDMI.
+      monitor comes back. Third part written, not yet run on the card:
+      a second DisplayPort display (`rdna4-head2=4`), lit from tables
+      generated like the HDMI ones (`src/pipe2_linux_dp1.inc`,
+      `_dp2.inc`) whose training step runs `src/dptrain.cpp` on the
+      smallest link of the monitor's that carries 1920x1080@60. It
+      stays at that mode: no mode switching on it yet.
 - [x] DP mode switching on the trained link (verified on hardware
       2026-10-04, Big Sur 11.6.6: 3840x2160 to 2560x1440, picture
       confirmed; `rdna4-modeset=1`). The plan's register writes are held

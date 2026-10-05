@@ -2177,7 +2177,7 @@ bool RDNA4Device::waitFrames(uint32_t frames, uint32_t otgOffset) {
 }
 
 bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds,
-                           size_t ncmds, const char *tag, uint32_t otgOffset) {
+                           size_t ncmds, const char *tag, uint32_t otgOffset, const Pipe2::AuxWrite *aux) {
 	for (size_t i = 0; i < count; i++) {
 		const ModeSet::Step &s = steps[i];
 		switch (s.op) {
@@ -2235,6 +2235,18 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 				return false;
 			}
 			break;
+		case ModeSet::Op::Aux:
+			// Like amdgpu, carry on if the sink does not take it.
+			if (!aux || !dpcdWrite(pipe2Aux, aux[s.arg].address, aux[s.arg].data, aux[s.arg].len))
+				FBLOG("%s: step %lu (%s): the sink did not take the AUX write, continuing", tag,
+				      static_cast<unsigned long>(i), s.what);
+			break;
+		case ModeSet::Op::Train:
+			if (!trainSecondLink()) {
+				FBLOG("%s: step %lu (%s): the link did not train", tag, static_cast<unsigned long>(i), s.what);
+				return false;
+			}
+			break;
 		case ModeSet::Op::WaitFrames:
 			if (!waitFrames(s.arg, otgOffset)) {
 				FBLOG("%s: step %lu (%s): the OTG is not counting frames", tag,
@@ -2284,53 +2296,51 @@ void RDNA4Device::noteBootDpLink() {
 		FBLOG("dptrain: that is not a link this sink says it has: it will not be retrained");
 }
 
-DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
-	AtomBios::DisplayPath path {};
-	if (!bootDpLinkKnown || !pathForHpd(pipe.hpd, path)) {
-		FBLOG("dptrain: %s: not retrained: the firmware's link is not known", why);
-		return DpTrain::Result::BadLink;
-	}
-	// What DpTrain asks of the hardware: the sink's DPCD over its AUX channel,
-	// and DpPhy's register steps and DMUB commands for this link.
+// DpTrain on one link of this card: the sink's DPCD over AUX channel `aux`,
+// and DpPhy's register steps and DMUB commands for link encoder `link`, whose
+// connector has hot-plug pin `hpd` and VBIOS object `conn`.
+DpTrain::Result RDNA4Device::trainLink(uint8_t aux, uint8_t link, uint8_t hpd, uint8_t conn, const DpTrain::Sink &sink,
+                                       const DpTrain::Link &settings, bool offFirst, DpTrain::Report &rep) {
 	struct Ctx {
-		RDNA4Device *dev;
-		uint8_t      conn;
+		RDNA4Device  *dev;
+		uint8_t       aux, link, hpd, conn;
+		DpTrain::Link settings;
 		bool steps(const ModeSet::Step *s, size_t n) { return dev->runSteps(s, n, nullptr, 0, "dptrain", dev->otgOff()); }
 		bool dmub(const Dmub::Cmd &cmd) { return dev->dmubSubmit(&cmd, 1, "dptrain"); }
-	} ctx { this, static_cast<uint8_t>(path.connectorObjId & 0xff) };
+	} ctx { this, aux, link, hpd, conn, settings };
 	DpTrain::Io io {};
 	io.ctx = &ctx;
 	io.read = [](void *c, uint32_t address, uint8_t *data, size_t len) {
-		RDNA4Device *dev = static_cast<Ctx *>(c)->dev;
-		return dev->dpcdRead(dev->sinkAuxInst, address, data, len);
+		auto *x = static_cast<Ctx *>(c);
+		return x->dev->dpcdRead(x->aux, address, data, len);
 	};
 	io.write = [](void *c, uint32_t address, const uint8_t *data, size_t len) {
-		RDNA4Device *dev = static_cast<Ctx *>(c)->dev;
-		return dev->dpcdWrite(dev->sinkAuxInst, address, data, len);
+		auto *x = static_cast<Ctx *>(c);
+		return x->dev->dpcdWrite(x->aux, address, data, len);
 	};
 	io.phyOn = [](void *c, const DpTrain::Link &l) {
 		auto *x = static_cast<Ctx *>(c);
 		ModeSet::Step s[DpPhy::kMaxSteps];
 		Dmub::Cmd cmd;
-		DpPhy::buildEnable(cmd, x->dev->pipe.link, x->dev->pipe.hpd, l);
-		return x->steps(s, DpPhy::configureSteps(x->dev->pipe.link, l.lanes, s)) && x->dmub(cmd);
+		DpPhy::buildEnable(cmd, x->link, x->hpd, l);
+		return x->steps(s, DpPhy::configureSteps(x->link, l.lanes, s)) && x->dmub(cmd);
 	};
 	io.phyOff = [](void *c) {
 		auto *x = static_cast<Ctx *>(c);
 		ModeSet::Step s[DpPhy::kMaxSteps];
 		Dmub::Cmd cmd;
-		DpPhy::buildDisable(cmd, x->dev->pipe.link, x->dev->pipe.hpd, x->conn);
-		return x->dmub(cmd) && x->steps(s, DpPhy::offSteps(x->dev->pipe.link, s));
+		DpPhy::buildDisable(cmd, x->link, x->hpd, x->conn);
+		return x->dmub(cmd) && x->steps(s, DpPhy::offSteps(x->link, s));
 	};
 	io.pattern = [](void *c, DpTrain::Pattern p) {
 		auto *x = static_cast<Ctx *>(c);
 		ModeSet::Step s[DpPhy::kMaxSteps];
-		return x->steps(s, DpPhy::patternSteps(x->dev->pipe.link, p, s));
+		return x->steps(s, DpPhy::patternSteps(x->link, p, s));
 	};
 	io.drive = [](void *c, uint8_t, uint8_t swing, uint8_t preEmphasis) {
 		auto *x = static_cast<Ctx *>(c);
 		Dmub::Cmd cmd;
-		DpPhy::buildDrive(cmd, x->dev->pipe.link, x->dev->pipe.hpd, x->conn, x->dev->bootDpLink, swing, preEmphasis);
+		DpPhy::buildDrive(cmd, x->link, x->hpd, x->conn, x->settings, swing, preEmphasis);
 		return x->dmub(cmd);
 	};
 	io.delayUs = [](void *, uint32_t us) {
@@ -2339,7 +2349,17 @@ DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 		else
 			IODelay(us);
 	};
+	if (offFirst && !io.phyOff(&ctx))
+		return rep.result = DpTrain::Result::Io;
+	return DpTrain::bringUp(io, sink, settings, &rep);
+}
 
+DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
+	AtomBios::DisplayPath path {};
+	if (!bootDpLinkKnown || !pathForHpd(pipe.hpd, path)) {
+		FBLOG("dptrain: %s: not retrained: the firmware's link is not known", why);
+		return DpTrain::Result::BadLink;
+	}
 	// The stream stops feeding the link while it is down, as for display
 	// sleep, and the transmitter goes off before it is brought up again.
 	const uint32_t kDpVidStreamCntl = 0x2122 + digOff();
@@ -2348,7 +2368,8 @@ DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 	      bootDpLink.lanes, bootDpLink.rate, pipe.link, sinkAuxInst, pipe.hpd, stream);
 	regWriteDmu(2, kDpVidStreamCntl, stream & ~1u);
 	DpTrain::Report rep {};
-	DpTrain::Result r = io.phyOff(&ctx) ? DpTrain::bringUp(io, bootDpSink, bootDpLink, &rep) : DpTrain::Result::Io;
+	const DpTrain::Result r = trainLink(sinkAuxInst, pipe.link, pipe.hpd, static_cast<uint8_t>(path.connectorObjId & 0xff),
+	                                    bootDpSink, bootDpLink, true, rep);
 	if (r == DpTrain::Result::Ok)
 		regWriteDmu(2, kDpVidStreamCntl, stream);   // on again, unless display sleep had it off
 	FBLOG("dptrain: %s after %u attempt(s): swing %u, pre-emphasis %u, lanes %02x %02x, aligned %u; stream 0x%08x",
@@ -2506,6 +2527,11 @@ void RDNA4Device::surveySteps(const ModeSet::Step *steps, size_t count, const Dm
 			snprintf(line, sizeof(line), "%lu scdc DDC%u TMDS_CONFIG=%u %s", static_cast<unsigned long>(i),
 			         s.arg, s.value, s.what);
 			break;
+		case ModeSet::Op::Aux:
+		case ModeSet::Op::Train:
+			snprintf(line, sizeof(line), "%lu %s %s", static_cast<unsigned long>(i),
+			         s.op == ModeSet::Op::Train ? "train the link:" : "aux write:", s.what);
+			break;
 		default:
 			snprintf(line, sizeof(line), "%lu delay %u us %s", static_cast<unsigned long>(i), s.arg, s.what);
 		}
@@ -2545,9 +2571,15 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		return false;
 	}
 
+	if (c.dp && !noteSecondDpSink(ddcLine)) {
+		FBLOG("pipe2: not lit: no DisplayPort sink with a link for %u kHz on AUX%u", c.timing.pixelClockKHz, ddcLine);
+		return false;
+	}
+
 	Pipe2::Target t {};
 	t.litHubp = pipe.hubp;
 	t.encoderObjId = path.encoderObjId;
+	t.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
 	// Only level 3 stops at the stream; the survey (2) covers the whole plan.
 	t.depth = level == 3 ? Pipe2::Depth::Stream : Pipe2::Depth::Plane;
 	t.sinkScdc = Edid::hdmi2Caps(edid2Data, edid2Len).scdc;
@@ -2597,10 +2629,12 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		      "commands", c.pipe, c.dig, c.link, c.hpd, c.timing.hActive, c.timing.vActive,
 		      c.timing.pixelClockKHz, t.depth == Pipe2::Depth::Plane ? "stream and plane" : "stream only",
 		      static_cast<unsigned long>(plan->count), static_cast<unsigned long>(plan->ncmds));
-		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", c.pipe * Pipe::Reg::kOtgStride);
+		// Before the plan runs: its training step reads the connector from here.
 		pipe2Target = t;
 		pipe2Target.now = c.timing;
 		pipe2ConnectorObjId = path.connectorObjId;
+		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", c.pipe * Pipe::Reg::kOtgStride,
+		              plan->aux);
 		pipe2Lit = pipe2On = ok;
 		// Whether it runs: the frame rate of its timing generator, and the
 		// underflow flags of the plane and the OPTC (HUBPn_DCHUBP_CNTL,
@@ -2667,6 +2701,35 @@ void RDNA4Device::comparePipeColour(const Pipe2::Plan &plan) {
 	      compared, c.pipe, pipe.hubp, pipe.opp, differ);
 }
 
+// What a DisplayPort plan needs of its sink before it can train: the
+// receiver capability, and from it the smallest link that carries the plan's
+// mode at 8 bpc.
+bool RDNA4Device::noteSecondDpSink(uint8_t aux) {
+	const Edid::DetailedTiming &mode = Pipe2::config().timing;
+	uint8_t caps[16] {};
+	pipe2Aux = aux;
+	if (!dpcdRead(aux, 0x000, caps, sizeof(caps)) || !DpTrain::parseCaps(caps, sizeof(caps), pipe2Sink) ||
+	    !DpTrain::pickLink(pipe2Sink, mode.pixelClockKHz, 24, pipe2Link))
+		return false;
+	FBLOG("pipe2: DisplayPort sink on AUX%u: DPCD %u.%u, up to %u lane(s) at rate 0x%02x%s%s; %u lane(s) at rate "
+	      "0x%02x for %u kHz", aux, caps[0] >> 4, caps[0] & 0xf, pipe2Sink.maxLanes, pipe2Sink.maxRate,
+	      pipe2Sink.tps3 ? ", TPS3" : "", pipe2Sink.tps4 ? ", TPS4" : "", pipe2Link.lanes, pipe2Link.rate,
+	      mode.pixelClockKHz);
+	return true;
+}
+
+// The Op::Train step of a DisplayPort plan.
+bool RDNA4Device::trainSecondLink() {
+	const Pipe2::Config &c = Pipe2::config();
+	DpTrain::Report rep {};
+	const DpTrain::Result r = trainLink(pipe2Aux, c.link, c.hpd, pipe2Target.connectorObjId, pipe2Sink, pipe2Link,
+	                                    false, rep);
+	FBLOG("pipe2: link %u, %u lane(s) at rate 0x%02x: %s after %u attempt(s): swing %u, pre-emphasis %u, lanes %02x "
+	      "%02x, aligned %u", c.link, pipe2Link.lanes, pipe2Link.rate, DpTrain::resultName(r), rep.attempts, rep.swing,
+	      rep.preEmphasis, rep.status[0], rep.status[1], rep.status[2] & 1);
+	return r == DpTrain::Result::Ok;
+}
+
 uint8_t RDNA4Device::secondSinkHpd() {
 	// DC_GPIO_HPD_Y: one byte per pin, HPD1 lowest (probeEDID).
 	const uint32_t hpdY = regReadDmu(2, 0x28f7);
@@ -2688,11 +2751,18 @@ bool RDNA4Device::readSecondEdid(uint8_t hpd) {
 	uint8_t ddcLine = 0;
 	uint8_t edid[256] {};
 	static const uint8_t sig[8] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
-	if (!pathForHpd(hpd, path, &ddcLine) || !readEDIDI2C(ddcLine, edid, 128, 0) ||
-	    memcmp(edid, sig, sizeof(sig)) != 0)
+	if (!pathForHpd(hpd, path, &ddcLine))
+		return false;
+	// A DisplayPort sink's EDID comes over its AUX channel.
+	const AtomBios::ConnectorType type = AtomBios::connectorType(path.connectorObjId);
+	const bool viaAux = type == AtomBios::ConnectorDP || type == AtomBios::ConnectorUSBC;
+	auto read = [&](uint8_t *to, uint8_t start) {
+		return viaAux ? readEDID(ddcLine, to, 128, start) : readEDIDI2C(ddcLine, to, 128, start);
+	};
+	if (!read(edid, 0) || memcmp(edid, sig, sizeof(sig)) != 0)
 		return false;
 	// The extension says whether the sink has SCDC and carries more modes.
-	const bool ext = edid[126] > 0 && readEDIDI2C(ddcLine, edid + 128, 128, 128);
+	const bool ext = edid[126] > 0 && read(edid + 128, 128);
 	edid2Len = ext ? 256 : 128;
 	edid2Hpd = hpd;
 	memcpy(edid2Data, edid, sizeof(edid));
@@ -2713,7 +2783,7 @@ bool RDNA4Device::runSecondPipePart(Pipe2::Part part, size_t *steps) {
 		FBLOG("pipe2: no plan: %s", why);
 	else
 		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2",
-		              Pipe2::config().pipe * Pipe::Reg::kOtgStride);
+		              Pipe2::config().pipe * Pipe::Reg::kOtgStride, plan->aux);
 	if (steps)
 		*steps = plan->count;
 	IOFree(plan, sizeof(Pipe2::Plan));
@@ -2728,6 +2798,12 @@ void RDNA4Device::setSecondPipePower(bool on) {
 		return;
 	}
 	const Pipe2::Config &c = Pipe2::config();
+	// The wake part trains the link, for the sink that is there now: after a
+	// replug it may be another monitor.
+	if (on && c.dp && !noteSecondDpSink(pipe2Aux)) {
+		displayPowerNote(on, "pipe2", "no DisplayPort sink with a link for the mode");
+		return;
+	}
 	size_t steps = 0;
 	const bool ok = runSecondPipePart(on ? Pipe2::Part::Wake : Pipe2::Part::Sleep, &steps);
 	// The stream encoder's enable, and its symbol clock gate: amdgpu clears

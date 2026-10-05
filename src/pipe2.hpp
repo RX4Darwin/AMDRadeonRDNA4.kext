@@ -15,6 +15,11 @@
 //  the lit pipe's VM aperture. Display sleep and wake of the pipe come from
 //  the same run (link_set_dpms_off, then link_set_dpms_on again).
 //
+//  A DisplayPort table (pipe2_linux_dp*.inc) has, where Linux trains the
+//  link, one step for that (ModeSet::Op::Train, done by dptrain.hpp when the
+//  plan runs), and the plan's writes to the sink's DPCD as Op::Aux steps.
+//  Nothing else in it depends on the link's rate or lane count.
+//
 //  Freestanding; shared by the kext and tools/atomdump.cpp.
 //
 
@@ -41,6 +46,7 @@ struct Config {
 	uint16_t detSegments;     // DET buffer segments DML gives the plane
 	uint8_t  detSeg;          // DCHUBBUB_DET0..3_CTRL: segment and dwords
 	uint16_t detCtrl[4];
+	bool     dp;              // DisplayPort: the plan trains the link (Op::Train) and talks to the sink over AUX
 };
 // There is one table per connector a second display can be on. use() picks
 // the one for a display on that HPD pin, for everything below (false, and no
@@ -79,6 +85,7 @@ struct Target {
 	bool     sinkScdc;         // the sink's EDID announces SCDC (Edid::hdmi2Caps)
 	uint8_t  ddcLine;          // the connector's DDC line, for the SCDC write
 	Part     part;             // only Light needs litHubp and surface
+	uint8_t  connectorObjId;   // DisplayPort: the VBIOS connector object, for the transmitter disable
 	// The timing the pipe runs, once a mode switch (ModeSet) took it off the
 	// plan's; pixelClockKHz 0 = the plan's. Sleep, Wake and Avi follow it: the
 	// pixel clock in the DMUB commands and the infoframe's VIC and bars.
@@ -87,12 +94,22 @@ struct Target {
 
 constexpr size_t kMaxSteps = 448;
 constexpr size_t kMaxCmds  = 4;
+constexpr size_t kMaxAux   = 4;
+
+// Bytes for the sink's DPCD (an Op::Aux step names one).
+struct AuxWrite {
+	uint32_t address;
+	uint8_t  len;
+	uint8_t  data[9];
+};
 
 struct Plan {
 	ModeSet::Step steps[kMaxSteps];
 	size_t        count;
 	Dmub::Cmd     cmds[kMaxCmds];
 	size_t        ncmds;
+	AuxWrite      aux[kMaxAux];
+	size_t        naux;
 };
 
 // Returns false (and `why`) if the target cannot be expressed. Every

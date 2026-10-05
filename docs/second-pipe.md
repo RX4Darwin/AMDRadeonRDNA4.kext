@@ -128,13 +128,14 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
 
 ## 6. Limits
 
-- Two configurations to light, one per HDMI connector of this card, both pipe 1 at 1920x1080@60 (148.5 MHz): DIG2
-  and link 2 for HPD3 (`src/pipe2_linux.inc`, the one every card boot so far used) and DIG3 and link 3 for HPD4
-  (`src/pipe2_linux_hpd4.inc`, written 2026-10-06, host-tested like the first, not yet run on the card). The plan
-  is picked by the connector the second display answers on (`Pipe2::use`); a second display on any other connector
-  is not served. Another board, or another mode to start in, needs `tools/pipegen/run.sh` run with other
+- Four configurations to light, one per connector of this card, all pipe 1 at 1920x1080@60 (148.5 MHz): DIG2
+  and link 2 for HPD3 (`src/pipe2_linux.inc`, the one every card boot so far used), DIG3 and link 3 for HPD4
+  (`src/pipe2_linux_hpd4.inc`, written 2026-10-06), and for DisplayPort DIG0 and link 0 for HPD1
+  (`src/pipe2_linux_dp1.inc`) and DIG1 and link 1 for HPD2 (`src/pipe2_linux_dp2.inc`). The last three are
+  host-tested like the first and not yet run on the card. The plan is picked by the connector the second display
+  answers on (`Pipe2::use`). Another board, or another mode to start in, needs `tools/pipegen/run.sh` run with other
   arguments. Once lit the pipe can change mode (below), and stays with its connector.
-- The second display must be HDMI or DVI (TMDS). A second DisplayPort display needs link training. A mode above
+- A second DisplayPort display stays at 1920x1080@60: no mode switching on it yet (below). An HDMI mode above
   340 MHz needs the table regenerated for it (the generator then turns the scrambler on by itself).
 - The boot display must not be on the plan's blocks: with the Lenovo alone, the firmware puts it on DIG2 and link 2.
 - System sleep is not handled (it stays vetoed for the whole driver).
@@ -199,9 +200,9 @@ interrupt service and fails, so the plugin routes the call and keeps the handler
 hot-plug interrupt does: IOFramebuffer counts a connect change, WindowServer acknowledges, and each framebuffer of
 the controller is asked `cscGetConnection` again, then for its EDID and modes.
 
-Until the pipe is lit, the pins of both HDMI connectors are watched (not the boot display's), and the first display
-to appear decides which plan lights it. After that only that connector is handled. The boot display on DisplayPort
-would need link training to come back.
+Until the pipe is lit, the pins of all connectors but the boot display's are watched, and the first display to
+appear decides which plan lights it. After that only that connector is handled. A DisplayPort boot display that
+was unplugged needs its link trained again to come back: `rdna4-dptrain=1`.
 
 Log lines: `hotplug: polling HPD3 (now high), acting on it; head 2 is connected`, `hotplug: HPD3 went low`,
 `hotplug: display gone from HPD3: link off`, `hotplug: the same display is back on HPD3`,
@@ -222,6 +223,35 @@ Sleep clears the stream encoder's half of `SYMCLKC_CLOCK_ENABLE` (`dccg401_disab
 never sets it again: the firmware does, on the encoder command (section 7). The log line shows it:
 `power: pipe2 display off: 39 steps ran; DIG2_DIG_FE_EN_CNTL=... SYMCLKC_CLOCK_ENABLE=...`, and the same for `on`
 (also in the `RDNA4FB,DisplayPower` registry history). `rdna4-nosleep=1` turns it off.
+
+### DisplayPort (host-tested, not yet run on the card)
+
+The DisplayPort tables come from the same generator run with a DisplayPort stream and its `dplink` sink, so Linux
+trains a link on the way and the trace has the stream side around it: the DP DTO for the pixel clock (148.5 MHz
+against the 720 MHz reference), the DP stream encoder, the MSA and the DP pixel-rate dividers instead of the HDMI
+PLL command and infoframes. Three kinds of step exist only there:
+
+- `a`: a DPCD write the sink is sent outside training (the source OUI and device ID, and D3 on the way to sleep),
+  carried in the table's `kAux`. As in amdgpu, a sink that does not take one does not stop the plan.
+- `t`: where Linux trained the link. The table does not carry Linux's training against a simulated sink: the kext
+  runs `DpTrain::bringUp` (`src/dptrain.cpp`) there against the real one. The table is the same for any lane count
+  and rate (checked for 4 lanes HBR3, 2 lanes HBR2 and 1 lane RBR), so they are chosen on the card.
+- `O`: the DMUB transmitter disable of sleep.
+
+Before lighting, the kext reads the sink's receiver capability over the connector's AUX channel and picks the
+smallest link that carries the mode at 8 bpc, in amdgpu's order (`DpTrain::pickLink`, the lowest rate first and at
+each rate the fewest lanes): for 1920x1080@60 that is 4 lanes at RBR on a four-lane monitor, 2 lanes at HBR on a
+two-lane one. Sleep is D3 and the transmitter off;
+wake reads the capability again (after a replug it may be another monitor) and trains again.
+
+Log lines: `pipe2: DisplayPort sink on AUX0: DPCD 1.4, up to 4 lane(s) at rate 0x1e, TPS3, TPS4; 4 lane(s) at
+rate 0x06 for 148500 kHz`, then inside the plan `pipe2: link 0, 4 lane(s) at rate 0x06: trained after 1
+attempt(s): swing 0, pre-emphasis 0, lanes 77 77, aligned 1`. A plan that stops at the training step says
+`pipe2: step N (...): the link did not train`.
+
+Not there: mode switching (the head offers the lit mode alone; another pixel clock may need another link), a
+fallback to a lower rate or fewer lanes when training fails four times, and the short HPD pulse a DisplayPort
+monitor sends when it loses the link while lit.
 
 ## 7. Card boots (Big Sur 11.6.6, Samsung 4K on DisplayPort, Lenovo on HDMI)
 

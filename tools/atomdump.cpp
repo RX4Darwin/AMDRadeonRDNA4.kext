@@ -1567,6 +1567,11 @@ static int testPipe2Table() {
 		{ 2, 0x00a0, 0, 1, "DC_IP_REQUEST_CNTL" },             // only required to be open
 		{ 2, 0x04fe, 0, 0, "DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A" },
 		{ 1, 0x00a0u + c.dig, 0x710, 0, "SYMCLKn_CLOCK_ENABLE, the stream encoder's half" },
+		// A DisplayPort stream's pixel-rate DTO: its integer part, clock source and gates
+		{ 1, 0x006f, c.dp ? 0xfu << (1 + 5 * c.pipe) : 0, 0, "OTG_PIXEL_RATE_DIV, DPDTOn_INT" },
+		{ 1, 0x0068, c.dp ? 0x7u << (3 * c.pipe) : 0, 0, "DTBCLK_P_CNTL" },
+		{ 1, 0x0069, c.dp ? 1u << c.pipe : 0, 0, "DCCG_GATE_DISABLE_CNTL5" },
+		{ 2, 0x005a, c.dp ? (0x3u << (8 + 2 * c.pipe)) | (0x3u << (20 + 2 * c.pipe)) : 0, 0, "DCCG_GATE_DISABLE_CNTL3" },
 		{ 3, 0x030a, 1u << c.pipe, 0, "MPC_OUT_CSC_COEF_FORMAT" },
 	};
 	// The instance of a family a register is in, or -1; -2 if in no family.
@@ -1597,7 +1602,7 @@ static int testPipe2Table() {
 	for (size_t i = 0; i < count; i++) {
 		const ModeSet::Step &s = steps[i];
 		if (s.op == ModeSet::Op::Dmub || s.op == ModeSet::Op::Delay || s.op == ModeSet::Op::Scdc ||
-		    s.op == ModeSet::Op::WaitFrames)
+		    s.op == ModeSet::Op::WaitFrames || s.op == ModeSet::Op::Aux || s.op == ModeSet::Op::Train)
 			continue;
 		if (s.op == ModeSet::Op::Require) {
 			requires++;
@@ -1616,12 +1621,15 @@ static int testPipe2Table() {
 				                  s.what, fam->name, inst, own(*fam));
 			}
 		} else {
-			const Shared *sh = nullptr;
+			bool known = false;
+			uint32_t allowed = 0;
 			for (const Shared &x : shared)
-				if (x.seg == s.seg && x.dword == s.dword)
-					sh = &x;
+				if (x.seg == s.seg && x.dword == s.dword) {
+					known = true;
+					allowed |= reads ? x.waitMask : x.mask;
+				}
 			const uint32_t mask = s.op == ModeSet::Op::Write || s.op == ModeSet::Op::Copy ? 0xffffffffu : s.mask;
-			if (!sh || (mask & ~(reads ? sh->waitMask : sh->mask))) {
+			if (!known || (mask & ~allowed)) {
 				outside++;
 				failures += check(false, "pipe2: step %zu (%s) touches %u:0x%04x mask 0x%08x: not the pipe's "
 				                  "and not an allowed shared bit", i, s.what, s.seg, s.dword, mask);
@@ -1641,6 +1649,7 @@ static int testPipe2Table() {
 	const size_t lightWrites = writes;
 	failures += check(requires == 5, "pipe2: %zu requirements, expected 5", requires);
 
+	if (!c.dp) {
 	// A sink with SCDC is told the link is not scrambled (148.5 MHz), before
 	// the transmitter is enabled; one without is left alone (above).
 	Pipe2::Target scdc = t;
@@ -1669,6 +1678,7 @@ static int testPipe2Table() {
 		                  "pipe2: stream setup %08x %08x %08x", enc[0], enc[1], enc[2]);
 		failures += check(on[0] == 0x3c000180 && on[1] == (0x04030100u | c.link) && on[2] == 14850 && (on[3] & 0xff) == c.hpd,
 		                  "pipe2: transmitter enable %08x %08x %08x %08x", on[0], on[1], on[2], on[3]);
+	}
 	}
 
 	// What the registers hold afterwards: timing of VIC 16, the surface, the
@@ -1699,11 +1709,81 @@ static int testPipe2Table() {
 		{ 3, 0x02f6, 0xf, 1, "OPP1 out mux = MPCC1" },           { 2, 0x18ae, 0x1, 0, "DPG1 off (video)" },
 		{ 2, kFeEn, 0x1, 1, "DIG front-end enabled" },           { 2, kBeEn, 0x1, 1, "DIG back-end enabled" },
 		{ 2, kMapper, 0x7, c.link, "DIG mapped to its link" },   { 2, kFeCntl, 0x7, c.pipe, "DIG sourced by the OTG" },
-		{ 2, 0x04bc, 0x1f, c.detSegments, "DET1 segments" },     { 1, 0x006f, 0x20, 0x20, "OTG1 TMDS divider /4" },
+		{ 2, 0x04bc, 0x1f, c.detSegments, "DET1 segments" },
+		// HDMI: the PHY's clock / 4. DisplayPort: the pixel-rate DTO, in Hz against the 720 MHz reference
+		// (how the firmware programs the boot display's), with no integer part.
+		{ 1, 0x006f, c.dp ? 0x3c0u : 0x20u, c.dp ? 0 : 0x20u, "OTG1 pixel rate divider" },
+		{ 1, 0x0085, c.dp ? 0xffffffffu : 0, c.dp ? 148500000u : 0, "DP_DTO1 phase" },
+		{ 1, 0x0086, c.dp ? 0xffffffffu : 0, c.dp ? 720000000u : 0, "DP_DTO1 modulo" },
 	};
 	for (const auto &e : after)
 		failures += check((regs.get(e.seg, e.dw) & e.mask) == e.want, "pipe2: %s: %u:0x%04x = 0x%08x, want 0x%08x "
 		                  "under 0x%08x", e.name, e.seg, e.dw, regs.get(e.seg, e.dw), e.want, e.mask);
+
+	// DisplayPort: where Linux trains the link the plan has one step, after
+	// the source's OUI went to the sink, and no VBIOS-style command. Sleep
+	// sends the sink to D3 and turns the transmitter off; wake trains again;
+	// afterwards every register lighting set holds the same.
+	if (c.dp) {
+		static const uint8_t oui[3] = { 0x00, 0x00, 0x1a };
+		auto count = [](const Pipe2::Plan &p, ModeSet::Op op) {
+			size_t n = 0;
+			for (size_t i = 0; i < p.count; i++)
+				n += p.steps[i].op == op;
+			return n;
+		};
+		size_t trainAt = 0, auxAt = 0;
+		for (size_t i = 0; i < plan.count; i++) {
+			if (plan.steps[i].op == ModeSet::Op::Train)
+				trainAt = i;
+			if (plan.steps[i].op == ModeSet::Op::Aux && plan.steps[i].arg == 0)
+				auxAt = i;
+		}
+		failures += check(count(plan, ModeSet::Op::Train) == 1 && plan.ncmds == 0 && plan.naux == 2 && auxAt < trainAt &&
+		                  plan.aux[0].address == 0x300 && plan.aux[0].len == 3 && memcmp(plan.aux[0].data, oui, 3) == 0 &&
+		                  plan.aux[1].address == 0x303 && plan.aux[1].len == 9,
+		                  "pipe2: DisplayPort lighting: %zu training step(s), %zu DMUB commands, %zu AUX writes",
+		                  count(plan, ModeSet::Op::Train), plan.ncmds, plan.naux);
+		const PlanRegs lit = regs;
+		static Pipe2::Plan dpms;
+		Pipe2::Target power {};
+		power.connectorObjId = 0x13;
+		power.part = Pipe2::Part::Sleep;
+		Dmub::Cmd off;
+		DpPhy::buildDisable(off, c.link, c.hpd, 0x13);
+		const bool slept = Pipe2::build(power, dpms, &why);
+		inBlocks(dpms);
+		apply(dpms);
+		const size_t sleepSteps = dpms.count;
+		failures += check(slept && dpms.naux == 1 && dpms.aux[0].address == 0x600 && dpms.aux[0].len == 1 &&
+		                  dpms.aux[0].data[0] == 0x02 && dpms.ncmds == 1 && memcmp(dpms.cmds[0], off, sizeof(off)) == 0 &&
+		                  count(dpms, ModeSet::Op::Train) == 0 && (regs.get(2, kFeEn) & 1) == 0 &&
+		                  (regs.get(2, 0x1bc3) & 1) == 1 && regs.get(2, 0x06e6) == lit.get(2, 0x06e6),
+		                  "pipe2: DisplayPort sleep: %s, %zu AUX writes, %zu DMUB commands, DIG FE %08x",
+		                  slept ? "built" : why, dpms.naux, dpms.ncmds, regs.get(2, kFeEn));
+		power.part = Pipe2::Part::Wake;
+		const bool woke = Pipe2::build(power, dpms, &why);
+		inBlocks(dpms);
+		apply(dpms);
+		failures += check(woke && count(dpms, ModeSet::Op::Train) == 1 && dpms.ncmds == 0 && dpms.naux == 2 &&
+		                  dpms.aux[0].address == 0x300, "pipe2: DisplayPort wake: %s, %zu training step(s), %zu AUX "
+		                  "writes", woke ? "built" : why, count(dpms, ModeSet::Op::Train), dpms.naux);
+		for (const PlanRegs::R &r : lit.regs)
+			failures += check(regs.get(r.seg, r.dw) == r.v, "pipe2: after sleep and wake %u:0x%04x = 0x%08x, lit it "
+			                  "was 0x%08x", r.seg, r.dw, regs.get(r.seg, r.dw), r.v);
+		failures += check(requires == 5, "pipe2: a sleep or wake plan has a requirement");
+		// Stream only: stops before the plane, with the link trained.
+		t.depth = Pipe2::Depth::Stream;
+		t.surface = 0;
+		const bool ok = Pipe2::build(t, stream, &why);
+		failures += check(ok && stream.count < plan.count && count(stream, ModeSet::Op::Train) == 1,
+		                  "pipe2: DisplayPort stream-only plan: %s, %zu steps", ok ? "built" : why, stream.count);
+		printf("\npipe2: pipe %u DIG%u link %u HPD%u %ux%u at %u kHz, DisplayPort: %zu steps (%zu register writes, "
+		       "%zu requirements), the link trained in one; sleep %zu steps, wake %zu; %zu outside the pipe %s\n",
+		       c.pipe, c.dig, c.link, c.hpd, c.timing.hActive, c.timing.vActive, c.timing.pixelClockKHz, plan.count,
+		       lightWrites, requires, sleepSteps, dpms.count, outside, failures ? "MISMATCH" : "ok");
+		return failures;
+	}
 
 	// Display sleep, then wake, of the lit pipe: no requirements, nothing
 	// outside the pipe's blocks. Sleep takes the stream encoder away and leaves
@@ -1933,7 +2013,7 @@ static int testPipe2Table() {
 static int testPipe2() {
 	int failures = 0;
 	const uint8_t first = Pipe2::config().hpd;
-	failures += check(Pipe2::configCount() == 2 && !Pipe2::use(1) && Pipe2::config().hpd == first,
+	failures += check(Pipe2::configCount() == 4 && !Pipe2::use(5) && Pipe2::config().hpd == first,
 	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
 		const uint8_t hpd = Pipe2::configAt(i).hpd;

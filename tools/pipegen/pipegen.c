@@ -315,7 +315,13 @@ static void make_state(const struct cfg *c)
 	const enum signal_type signal = c->dp ? SIGNAL_TYPE_DISPLAY_PORT : SIGNAL_TYPE_HDMI_TYPE_A;
 	link->dc = dc; link->ctx = &g_ctx; link->connector_signal = signal;
 	if (c->train) {         /* a link to train: the sink of sink_reset(), as detection would have read it */
-		const struct dc_link_settings want = { LANE_COUNT_FOUR, LINK_RATE_HIGH2, LINK_SPREAD_DISABLED };
+		struct dc_link_settings want = { LANE_COUNT_FOUR, LINK_RATE_HIGH2, LINK_SPREAD_DISABLED };
+		const char *other = getenv("PIPEGEN_DP_LINK");          /* "lanes rate", rate as LINK_BW_SET has it */
+		int lanes, rate;
+
+		if (other && sscanf(other, "%d %d", &lanes, &rate) == 2) {
+			want.lane_count = lanes; want.link_rate = rate;
+		}
 
 		sink_reset(c);
 		dc->link_srv = link_create_link_service();
