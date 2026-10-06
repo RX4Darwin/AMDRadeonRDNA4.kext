@@ -2406,6 +2406,13 @@ void RDNA4Device::logBootLink(const char *when) {
 	      sink ? "answers:" : "does not answer:", set[0], set[1], status[0], status[1], status[2],
 	      regReadDmu(2, 0x2122 + digOff()), regReadDmu(2, 0x211e + dp), regReadDmu(2, 0x2121 + dp),
 	      regReadDmu(2, 0x212e + dp), arb);
+	// What ties the stream encoder to the link, and what a reset of it would lose.
+	FBLOG("dptrain: %s: SYMCLK 0x%08x BE_CLK 0x%08x BE_EN 0x%08x BE_CNTL 0x%08x FE_CLK 0x%08x FE_EN 0x%08x FIFO 0x%08x "
+	      "mapper 0x%08x; DP_PIXEL_FORMAT 0x%08x MSA_MISC 0x%08x DP_VID_TIMING 0x%08x DP_STEER_FIFO 0x%08x", when,
+	      regReadDmu(1, 0x00a0 + pipe.dig), regReadDmu(2, 0x20bb + dp), regReadDmu(2, 0x20bd + dp),
+	      regReadDmu(2, 0x20bc + dp), regReadDmu(2, 0x2094 + digOff()), regReadDmu(2, 0x2095 + digOff()),
+	      regReadDmu(2, 0x209b + digOff()), regReadDmu(2, 0x1f0d + pipe.dig), regReadDmu(2, 0x211f + digOff()),
+	      regReadDmu(2, 0x2124 + digOff()), regReadDmu(2, 0x2126 + digOff()), regReadDmu(2, 0x2123 + digOff()));
 }
 
 DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
@@ -2429,10 +2436,16 @@ DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 	// is not enough once the transmitter has been off: the link trained and the
 	// screen stayed black, DP_VID_STREAM_STATUS 0 (card, 2026-10-06). The stream
 	// is started the way a mode switch starts it, on the timing it runs.
-	if (r == DpTrain::Result::Ok && (stream & 1) &&
-	    applyMode(Modes::Mode { currentModeId, liveTiming, liveTiming.refreshMilliHz(), false, Modes::SourceBoot }) !=
-	        kIOReturnSuccess)
-		regWriteDmu(2, kDpVidStreamCntl, stream);
+	// That alone left the stream encoder's FIFO without its reset and the
+	// stream stopped (the same day), so first what amdgpu does between
+	// training and unblank: the stream encoder tied to the link again.
+	if (r == DpTrain::Result::Ok && (stream & 1)) {
+		ModeSet::Step s[DpPhy::kMaxSteps];
+		runSteps(s, DpPhy::streamSteps(pipe.dig, pipe.link, s), nullptr, 0, "dptrain", otgOff());
+		if (applyMode(Modes::Mode { currentModeId, liveTiming, liveTiming.refreshMilliHz(), false, Modes::SourceBoot }) !=
+		    kIOReturnSuccess)
+			regWriteDmu(2, kDpVidStreamCntl, stream);
+	}
 	FBLOG("dptrain: %s after %u attempt(s): swing %u, pre-emphasis %u, lanes %02x %02x, aligned %u; stream 0x%08x",
 	      DpTrain::resultName(r), rep.attempts, rep.swing, rep.preEmphasis, rep.status[0], rep.status[1],
 	      rep.status[2] & 1, regReadDmu(2, kDpVidStreamCntl));

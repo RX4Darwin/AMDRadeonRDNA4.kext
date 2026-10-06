@@ -1905,6 +1905,32 @@ static int testPipe2Table() {
 			                  "was 0x%08x", r.seg, r.dw, regs.get(r.seg, r.dw), r.v);
 		failures += check(requires == 5, "pipe2: a sleep or wake plan has a requirement");
 
+		// What ties the stream encoder to the trained link (DpPhy::streamSteps,
+		// for a retrain outside these tables): each step is one Linux makes
+		// in the wake part, after the training step.
+		{
+			ModeSet::Step tie[DpPhy::kMaxSteps];
+			const size_t ntie = DpPhy::streamSteps(c.dig, c.link, tie);
+			size_t trained = 0, found = 0;
+			for (size_t i = 0; i < dpms.count; i++)
+				if (dpms.steps[i].op == ModeSet::Op::Train)
+					trained = i;
+			for (size_t k = 0; k < ntie; k++) {
+				bool there = false;
+				for (size_t i = trained; i < dpms.count && !there; i++) {
+					const ModeSet::Step &x = dpms.steps[i];
+					// Linux clears a field and sets a bit of one register in two updates where streamSteps has one.
+					there = x.op == ModeSet::Op::Update && x.seg == tie[k].seg && x.dword == tie[k].dword &&
+					        (x.mask & tie[k].mask) == x.mask && (tie[k].value & x.mask) == x.value;
+				}
+				found += there;
+				failures += check(there, "dpphy: stream step %zu (%s, %u:0x%04x mask 0x%x = 0x%x) is not in Linux's wake",
+				                  k, tie[k].what, tie[k].seg, tie[k].dword, tie[k].mask, tie[k].value);
+			}
+			failures += check(ntie == 8 && found == ntie && trained > 0, "dpphy: %zu of %zu stream steps in Linux's wake",
+			                  found, ntie);
+		}
+
 		// The first Mvid follows the rate the link is trained at: what Linux
 		// writes when its link is at that rate (pipegen with PIPEGEN_DP_LINK).
 		const uint32_t kVidM = 0x2128 + c.dig * 0x124u;
