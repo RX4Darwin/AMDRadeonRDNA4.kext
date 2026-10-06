@@ -133,22 +133,13 @@ Only if test 1 passed. Boot with the second monitor's DisplayPort cable unplugge
 Lines to find: `head2: ... offline until a display is plugged in`, `hotplug: HPDn went high`,
 `pipe2: DisplayPort sink on AUXn: ...`, `pipe2: lighting ...`, `hotplug: display connected on HPDn: N mode(s)`.
 
-## Test 3b: the HDMI display moved to the other HDMI port (no extra hardware)
+## Done: the HDMI display moved to the other HDMI port
 
-Written 2026-10-06, host-tested, not yet run on the card (kext UUID `992B8D5C-...` or later). No boot-args needed;
-`rdna4-trace=1` for the log. Samsung on DisplayPort, Lenovo on one HDMI port.
-
-1. After the desktop is up, unplug the Lenovo, wait 5 s, plug it into the **other** HDMI port. Does it come back
-   with the desktop it had?
-2. Set it to 144 Hz, then move it back to the first port the same way. Does it come back at 144 Hz?
-3. Let both displays sleep and wake them. Do both come back?
-4. Unplug and replug it on the port it is on now. Does it come back?
-
-Lines to find: `hotplug: display gone from HPDa: link off`, `hotplug: HPDb went high`, `pipe2: moving from HPDa
-(DIGx, link x) to HPDb (DIGy, link y) at 1920x1080, K kHz`, `pipe2: switching to id 0 ...`, `pipe2: now ...`,
-`pipe2: now on HPDb; DIGy_DIG_FE_EN_CNTL=0x00000001 SYMCLK?_CLOCK_ENABLE=0x00000311`, `hotplug: the same display
-is back on HPDb`. A failure says `pipe2: the move to HPDb did not complete` or `pipe2: not moved ...`; the Lenovo
-then comes back on the port it was on before.
+Confirmed on the card 2026-10-06 (kext `992B8D5C-...`): the Lenovo unplugged from one HDMI port and plugged into
+the other came back with its desktop, in both directions, the second time at 144 Hz; display sleep and a
+same-port replug afterwards worked. Log: `pipe2: moving from HPD4 (DIG3, link 3) to HPD3 (DIG2, link 2) at
+1920x1080, 148500 kHz`, `pipe2: now on HPD3; DIG2_DIG_FE_EN_CNTL=0x00000001 SYMCLKC_CLOCK_ENABLE=0x00000211`,
+`hotplug: the same display is back on HPD3`.
 
 ## Test 4: the stretched console (no extra hardware)
 
