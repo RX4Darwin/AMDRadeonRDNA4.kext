@@ -2033,6 +2033,9 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 		}
 	}
 
+	uint32_t head2dp = 0;
+	pipe2DpAllowed = PE_parse_boot_argn("rdna4-head2dp", &head2dp, sizeof(head2dp)) && head2dp != 0;
+
 	// Needs the lit pipe (discoverPipe) and the sink's AUX channel (probeEDID).
 	if (PE_parse_boot_argn("rdna4-dptrain", &dpTrainLevel, sizeof(dpTrainLevel)) && dpTrainLevel)
 		noteBootDpLink();
@@ -2081,12 +2084,11 @@ static const uint8_t kVmFixtureEdid[128] = {
 
 void RDNA4Device::buildModeTable() {
 	modeCount = 0;
+	// The sink's other modes are offered unless rdna4-modeset=0: switching
+	// ran on the card for HDMI and DisplayPort boot displays (2026-10-04/06).
+	uint32_t ms = 1;
 #ifdef RDNA4FB_VM_TEST
-	// VM test builds exercise the mode table by default (OpenCore images
-	// often pin boot-args, so opt-out rather than opt-in); "=0" disables.
-	uint32_t ms = 1, fake = 1;
-#else
-	uint32_t ms = 0;
+	uint32_t fake = 1;   // the fixture EDID, unless rdna4-fakeedid=0
 #endif
 	PE_parse_boot_argn("rdna4-modeset", &ms, sizeof(ms));
 	modesetRequested = ms != 0;
@@ -2172,7 +2174,7 @@ void RDNA4Device::buildModeTable() {
 		      m.native ? " native" : "", m.id == currentModeId ? " (live)" : "");
 	}
 	FBLOG("modes: %lu mode(s), switching %s", static_cast<unsigned long>(modeCount),
-	      modesetRequested ? "requested (rdna4-modeset=1)" : "off (boot mode only)");
+	      modesetRequested ? "on (rdna4-modeset=0 turns it off)" : "off (rdna4-modeset=0: boot mode only)");
 	// The plane's blank-end register as the firmware has it for its own mode,
 	// next to what the mode switch would write there for that mode.
 	if (bootTimingValid && bootTiming.pixelClockKHz)
@@ -2637,8 +2639,9 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		return false;
 	}
 	// The plan for the connector the second display is on.
-	if (!Pipe2::use(edid2Hpd)) {
-		FBLOG("pipe2: not lit: the second display is on HPD%u, a connector there is no plan for", edid2Hpd);
+	if (!usePlanFor(edid2Hpd)) {
+		FBLOG("pipe2: not lit: the second display is on HPD%u, a connector there is no plan for (a DisplayPort "
+		      "one needs rdna4-head2dp=1)", edid2Hpd);
 		return false;
 	}
 	const Pipe2::Config &c = Pipe2::config();
@@ -2843,6 +2846,17 @@ bool RDNA4Device::trainSecondLink() {
 	return r == DpTrain::Result::Ok;
 }
 
+bool RDNA4Device::usePlanFor(uint8_t hpd) {
+	const uint8_t was = Pipe2::config().hpd;
+	if (!Pipe2::use(hpd))
+		return false;
+	if (Pipe2::config().dp && !pipe2DpAllowed) {
+		Pipe2::use(was);
+		return false;
+	}
+	return true;
+}
+
 uint8_t RDNA4Device::secondSinkHpd() {
 	// DC_GPIO_HPD_Y: one byte per pin, HPD1 lowest (probeEDID).
 	const uint32_t hpdY = regReadDmu(2, 0x28f7);
@@ -2853,7 +2867,7 @@ uint8_t RDNA4Device::secondSinkHpd() {
 		return high(Pipe2::config().hpd) ? Pipe2::config().hpd : 0;
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
 		const uint8_t hpd = Pipe2::configAt(i).hpd;
-		if (hpd != pipe.hpd && high(hpd))
+		if (hpd != pipe.hpd && high(hpd) && (!Pipe2::configAt(i).dp || pipe2DpAllowed))
 			return hpd;
 	}
 	return 0;

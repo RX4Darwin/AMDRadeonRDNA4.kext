@@ -347,9 +347,12 @@ struct Head2 {
 	uint32_t         hpdGone { 0 };         // polls it has been low with the link up
 };
 Head2 *head2 { nullptr };
-uint32_t head2Level { 0 };              // rdna4-head2: 1 phantom, 2..4 see RDNA4Device::lightSecondPipe
-// rdna4-hotplug, with rdna4-head2 >= 2: 1 logs what the connector's HPD pin
-// does, 2 acts on it. With 2 the head exists without a monitor too, offline.
+// rdna4-head2: 0 none, 1 phantom, 2..4 see RDNA4Device::lightSecondPipe. 4 unless
+// the boot-arg says otherwise: a second display on HDMI ran on the card.
+uint32_t head2Level { 0 };
+// rdna4-hotplug, with rdna4-head2 >= 2: 0 off, 1 logs what the connector's HPD
+// pin does, 2 (unless the boot-arg says otherwise) acts on it. With 2 the head
+// exists without a monitor too, offline.
 uint32_t hotplugLevel { 0 };
 mach_vm_address_t orgStart { 0 };
 mach_vm_address_t orgGetVRAMRange { 0 };
@@ -502,11 +505,14 @@ void fillHead2(RDNA4Device &dev) {
 	// head is there but offline (rdna4-hotplug=2): macOS shows no display.
 	// For a pipe to light, a second display counts if it is on a connector
 	// there is a plan for.
-	const bool sink = dev.edid2Len && (head2Level < 2 || Pipe2::use(dev.edid2Hpd));
+	const bool sink = dev.edid2Len && (head2Level < 2 || dev.usePlanFor(dev.edid2Hpd));
 	const bool offline = head2Level >= 2 && !sink && hotplugLevel >= 2;
 	const Modes::Mode *mode = nullptr;
 	size_t n = 0;
 	if (offline) {
+		if (dev.edid2Len)
+			FBLOG("head2: the display on HPD%u is not served: no second-pipe plan for that connector (a "
+			      "DisplayPort one needs rdna4-head2dp=1); the head waits offline", dev.edid2Hpd);
 		// The one mode the pipe will be lit in, on its surface; no EDID.
 		h->table[0] = Modes::Mode { 1, lit, lit.refreshMilliHz(), true, Modes::SourceBoot };
 		n = 1;
@@ -528,10 +534,10 @@ void fillHead2(RDNA4Device &dev) {
 		if (head2Level >= 2 && !sink) {
 			if (dev.edid2Len)
 				FBLOG("head2: nothing to serve: the second display is on HPD%u, a connector there is no "
-				      "second-pipe plan for", dev.edid2Hpd);
+				      "second-pipe plan for (a DisplayPort one needs rdna4-head2dp=1)", dev.edid2Hpd);
 			else
-				FBLOG("head2: nothing to serve: no second sink answered on DDC (rdna4-hotplug=2 waits for "
-				      "one, rdna4-head2=1 makes a phantom head)");
+				FBLOG("head2: nothing to serve: no second sink answered on DDC (hot-plug is off: rdna4-hotplug=2 "
+				      "waits for one, rdna4-head2=1 makes a phantom head)");
 			return;
 		}
 		mode = head2BuildTable(h, dev, n);
@@ -588,8 +594,10 @@ void head2Plugged(Head2 *h, uint8_t hpd) {
 		return;
 	}
 	// A pipe that is not lit yet takes the plan for this connector.
-	if (!dev.pipe2Lit)
-		Pipe2::use(hpd);
+	if (!dev.pipe2Lit && !dev.usePlanFor(hpd)) {
+		FBLOG("hotplug: no second-pipe plan for HPD%u", hpd);
+		return;
+	}
 	const Edid::DetailedTiming &lit = Pipe2::config().timing;
 	const size_t len = min(static_cast<size_t>(dev.edid2Len), sizeof(h->edid));
 	// The display that was there before: the link comes back in the mode it
@@ -1003,8 +1011,17 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d)",
 		      patcher.getError());
 	patcher.clearError();
+	// The second display and its hot-plug are on unless turned off: lit at
+	// boot, mode switching, display sleep and hot-plug ran on the card for an
+	// HDMI monitor on either connector (2026-10-04..06). Not in VM test
+	// builds, which have no second pipe to light, and not with rdna4-compute.
+#ifdef RDNA4FB_VM_TEST
 	uint32_t second = 0;
-	if (PE_parse_boot_argn("rdna4-head2", &second, sizeof(second)) && second) {
+#else
+	uint32_t second = 4;
+#endif
+	PE_parse_boot_argn("rdna4-head2", &second, sizeof(second));
+	if (second) {
 		head2Level = second;
 		KernelPatcher::RouteRequest start {
 			"__ZN17IONDRVFramebuffer5startEP9IOService", wrapStart, orgStart,
@@ -1026,9 +1043,9 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		patcher.clearError();
 	}
 	// Both kinds of hot-plug start their HPD poll when IOFramebuffer opens.
-	uint32_t hotplug = 0, dptrain = 0;
-	if (second < 2 || !PE_parse_boot_argn("rdna4-hotplug", &hotplug, sizeof(hotplug)))
-		hotplug = 0;
+	uint32_t hotplug = second >= 2 ? 2 : 0, dptrain = 0;
+	if (second >= 2)
+		PE_parse_boot_argn("rdna4-hotplug", &hotplug, sizeof(hotplug));
 	PE_parse_boot_argn("rdna4-dptrain", &dptrain, sizeof(dptrain));
 	if (hotplug || dptrain) {
 		KernelPatcher::RouteRequest connect {
