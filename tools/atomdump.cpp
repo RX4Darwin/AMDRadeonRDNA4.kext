@@ -38,6 +38,9 @@
 #include "../src/vmid.hpp"
 #include "../src/ptpages.hpp"
 #include "../src/gpuvmtable.hpp"
+#include "../src/vmtree.hpp"
+#include "../src/n48n.hpp"
+#include "n48n-host/hostbackend.hpp"
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
@@ -2223,6 +2226,159 @@ static int testPipe2Move(uint8_t from, uint8_t to) {
 	}
 	printf("pipe2: moved from HPD%u to HPD%u: %zu of %zu registers differ from lighting there %s\n", from, to, differ,
 	       lit.regs.size(), failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
+// The kernel half of the Vulkan interface (src/n48n.cpp) and its page table (src/vmtree.cpp), over
+// ordinary memory: what each call accepts and refuses, and what a mapping leaves in the table, read
+// back with the walk the runtime's own tests use.
+static int testN48N() {
+	int failures = 0;
+	HostBackend host;
+	static N48N::Client c;
+	failures += check(c.open(host.backend(), 8, 1, (12u << 16) | 1) && host.tablePages == 1, "n48n: open");
+	uint64_t out[4] {};
+	uint32_t n = 4;
+	auto call = [&](uint32_t sel, const uint64_t *in, uint32_t nIn, const void *sin, size_t sinSize, uint32_t nOut,
+	                void *sout, size_t soutSize) {
+		n = nOut;
+		size_t size = soutSize;
+		return c.call(sel, in, nIn, sin, sinSize, nOut ? out : nullptr, nOut ? &n : nullptr, sout, soutSize ? &size : nullptr);
+	};
+	n48n_info info {};
+	const uint64_t hello[2] = { N48N_ABI_VERSION, N48N_HELLO_F_MINOR }, old[2] = { 2, 0 };
+	failures += check(call(N48N_SEL_QUERYINFO, nullptr, 0, nullptr, 0, 0, &info, sizeof(info)) == N48N::kNotReady,
+	                  "n48n: a call before Hello accepted");
+	failures += check(call(N48N_SEL_HELLO, hello, 2, nullptr, 0, 3, nullptr, 0) == N48N::kBadArgument &&
+	                  call(N48N_SEL_HELLO, old, 2, nullptr, 0, 4, nullptr, 0) == N48N::kUnsupported,
+	                  "n48n: Hello with the wrong shape or version accepted");
+	failures += check(call(N48N_SEL_HELLO, hello, 2, nullptr, 0, 4, nullptr, 0) == N48N::kSuccess &&
+	                  out[0] == (N48N_ABI_VERSION | (static_cast<uint64_t>(N48N_ABI_MINOR) << 16)) && out[3] == 8,
+	                  "n48n: Hello -> %llx, vmid %llu", (unsigned long long)out[0], (unsigned long long)out[3]);
+	failures += check(call(N48N_SEL_QUERYINFO, nullptr, 0, nullptr, 0, 0, &info, sizeof(info)) == N48N::kSuccess &&
+	                  info.vmid == 8 && info.vram_vis_total == HostBackend::kVisible && info.gb_addr_config == 0x08200545 &&
+	                  info.va_low_first == 0x10000 && info.va_high_last == ~0ull && info.max_bos == N48N_MAX_BOS &&
+	                  info.reserved[2] == N48N_ABI_MINOR, "n48n: QueryInfo");
+	uint32_t regs[4] {};
+	const uint64_t reg[3] = { 0x263e, 1, 0xffffffff }, other[3] = { 0x1000, 1, 0xffffffff };
+	failures += check(call(N48N_SEL_READREGS, reg, 3, nullptr, 0, 0, regs, 4) == N48N::kSuccess && regs[0] == 0x08200545 &&
+	                  call(N48N_SEL_READREGS, other, 3, nullptr, 0, 0, regs, 4) == N48N::kBadArgument,
+	                  "n48n: ReadRegs reads GB_ADDR_CONFIG and nothing else");
+
+	// Buffers: VRAM the CPU can reach, then the pool it cannot once that is full, system memory within its caps.
+	auto create = [&](uint64_t bytes, uint64_t align, uint64_t domains, uint64_t flags) {
+		const n48n_gem_create_in in { bytes, align, domains, flags };
+		return call(N48N_SEL_BOCREATE, nullptr, 0, &in, sizeof(in), 4, nullptr, 0);
+	};
+	failures += check(create(0x2345, 0, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kSuccess && out[0] == 1 && out[1] == 0x3000 &&
+	                  out[2] == N48N_GEM_DOMAIN_VRAM && out[3] == (N48N_PLACED_CPU_MAPPABLE | N48N_PLACED_ZEROED),
+	                  "n48n: a VRAM buffer: handle %llu, %llu bytes, bits %llx", (unsigned long long)out[0],
+	                  (unsigned long long)out[1], (unsigned long long)out[3]);
+	const uint32_t vram = 1;
+	failures += check(create(0x4000, 0, N48N_GEM_DOMAIN_GTT, N48N_GEM_UNCACHED) == N48N::kSuccess && out[0] == 2 &&
+	                  out[2] == N48N_GEM_DOMAIN_GTT && out[3] == N48N_PLACED_ZEROED, "n48n: a system-memory buffer");
+	const uint32_t sys = 2;
+	failures += check(create(HostBackend::kVisible, 0, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kNoMemory &&
+	                  create(HostBackend::kVisible, 0, N48N_GEM_DOMAIN_VRAM, N48N_GEM_NO_CPU_ACCESS) == N48N::kSuccess &&
+	                  out[3] == N48N_PLACED_HI_POOL && !c.buffer(3)->memory.cpuVisible,
+	                  "n48n: a buffer too large for the visible pool goes to the other only if the CPU need not reach it");
+	failures += check(create(0, 0, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kBadArgument &&
+	                  create(4096, 3000, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kBadArgument &&
+	                  create(4096, 0, N48N_GEM_DOMAIN_CPU, 0) == N48N::kUnsupported &&
+	                  create(4096, 0, N48N_GEM_DOMAIN_VRAM, N48N_GEM_ENCRYPTED) == N48N::kUnsupported &&
+	                  create(N48N::kSystemMaxBuffer + 4096, 0, N48N_GEM_DOMAIN_GTT, 0) == N48N::kNoMemory,
+	                  "n48n: a malformed or unsupported buffer request accepted");
+
+	// Mappings, where the caller says: read back through the table.
+	auto mapping = [&](uint32_t op, uint32_t handle, uint64_t va, uint64_t offset, uint64_t bytes, uint32_t flags) {
+		n48n_gem_va v {};
+		v.handle = handle; v.operation = op; v.flags = flags; v.va_address = va; v.offset_in_bo = offset; v.map_size = bytes;
+		return call(N48N_SEL_GEMVA, nullptr, 0, &v, sizeof(v), 0, nullptr, 0);
+	};
+	auto readEntry = [](void *ctx, uint64_t address, uint64_t &entry) {
+		auto *h = static_cast<HostBackend *>(ctx);
+		const uint64_t page = address & ~4095ull;
+		if (!h->memory.count(page))
+			return false;
+		entry = static_cast<uint64_t *>(h->memory[page])[(address & 4095) / 8];
+		return true;
+	};
+	auto walk = [&](uint64_t va, uint64_t &physical, uint64_t &flags) {
+		return GpuVm::walk(c.root(), va, readEntry, &host, physical, flags);
+	};
+	const uint32_t rw = N48N_VM_PAGE_READABLE | N48N_VM_PAGE_WRITEABLE, rx = N48N_VM_PAGE_READABLE | N48N_VM_PAGE_EXECUTABLE;
+	const uint64_t low = 0x7fff00000000ull - 0x1000, high = 0xffff800000200000ull, flushesBefore = host.flushes;
+	uint64_t phys = 0, flags = 0;
+	failures += check(mapping(N48N_VA_OP_MAP, vram, low, 0x1000, 0x2000, rw) == N48N::kSuccess && host.flushes == flushesBefore + 1 &&
+	                  walk(low + 0x1004, phys, flags) && phys == c.buffer(vram)->memory.physical + 0x2004 &&
+	                  (flags & ~GpuVm::kPhysicalMask) == (GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable | GpuVm::kIsPte) &&
+	                  !walk(low + 0x2000, phys, flags) && !walk(low - 0x1000, phys, flags),
+	                  "n48n: a VRAM mapping at 0x%llx: physical 0x%llx flags 0x%llx", (unsigned long long)low,
+	                  (unsigned long long)phys, (unsigned long long)flags);
+	// The upper half of the address space, system memory (each page on its own), uncached from the buffer.
+	failures += check(mapping(N48N_VA_OP_MAP, sys, high, 0, 0x4000, rx) == N48N::kSuccess &&
+	                  walk((high & 0xffffffffffffull) + 0x3000, phys, flags) && phys == c.buffer(sys)->memory.token + 0x3000 &&
+	                  (flags & ~GpuVm::kPhysicalMask) == (GpuVm::kValid | GpuVm::kReadable | GpuVm::kExecutable | GpuVm::kSystem |
+	                                                      GpuVm::kSnooped | (2ull << 54) | GpuVm::kIsPte),
+	                  "n48n: a system-memory mapping in the upper half: physical 0x%llx flags 0x%llx",
+	                  (unsigned long long)phys, (unsigned long long)flags);
+	failures += check(mapping(N48N_VA_OP_MAP, vram, low + 0x1000, 0, 0x1000, rw) == N48N::kBadArgument &&      // over a mapping
+	                  mapping(N48N_VA_OP_MAP, vram, 0x8000, 0, 0x1000, rw) == N48N::kBadArgument &&            // below the first address
+	                  mapping(N48N_VA_OP_MAP, vram, 0x0000900000000000ull, 0, 0x1000, rw) == N48N::kBadArgument &&   // not canonical
+	                  mapping(N48N_VA_OP_MAP, vram, 0x7ffffffff000ull, 0, 0x2000, rw) == N48N::kBadArgument &&    // across the seam
+	                  mapping(N48N_VA_OP_MAP, vram, 0x200000, 0x2000, 0x2000, rw) == N48N::kBadArgument &&        // past the buffer's end
+	                  mapping(N48N_VA_OP_MAP, vram, 0x200800, 0, 0x1000, rw) == N48N::kBadArgument &&             // not page aligned
+	                  mapping(N48N_VA_OP_MAP, 77, 0x200000, 0, 0x1000, rw) == N48N::kNotFound &&
+	                  mapping(N48N_VA_OP_MAP, vram, 0x200000, 0, 0x1000, N48N_VM_PAGE_PRT) == N48N::kUnsupported &&
+	                  mapping(N48N_VA_OP_CLEAR, vram, 0x200000, 0, 0x1000, 0) == N48N::kUnsupported &&
+	                  mapping(N48N_VA_OP_UNMAP, vram, low, 0x1000, 0x1000, 0) == N48N::kBadArgument,              // not the mapping that is there
+	                  "n48n: a mapping request that must be refused was accepted");
+	failures += check(mapping(N48N_VA_OP_UNMAP, vram, low, 0x1000, 0x2000, 0) == N48N::kSuccess && !walk(low, phys, flags) &&
+	                  mapping(N48N_VA_OP_MAP, vram, low, 0, 0x3000, rw) == N48N::kSuccess && walk(low + 0x2000, phys, flags),
+	                  "n48n: unmap, then the range mapped again");
+	// Freeing a buffer takes its mappings with it, and the GPU is told before the memory is reused.
+	const uint64_t flushes = host.flushes;
+	const uint64_t free1[1] = { vram }, free9[1] = { 9 };
+	failures += check(call(N48N_SEL_BOFREE, free1, 1, nullptr, 0, 0, nullptr, 0) == N48N::kSuccess && !walk(low, phys, flags) &&
+	                  host.flushes == flushes + 1 && !c.buffer(vram) &&
+	                  call(N48N_SEL_BOFREE, free9, 1, nullptr, 0, 0, nullptr, 0) == N48N::kNotFound &&
+	                  mapping(N48N_VA_OP_MAP, vram, low, 0, 0x1000, rw) == N48N::kNotFound, "n48n: BoFree");
+
+	// Contexts: 64 of them, numbered from 1.
+	n48n_ctx ctx { N48N_CTX_OP_ALLOC, 0, 0, 0 }, reply {};
+	uint32_t last = 0, allocated = 0;
+	while (call(N48N_SEL_CTX, nullptr, 0, &ctx, sizeof(ctx), 0, &reply, sizeof(reply)) == N48N::kSuccess && allocated < 100) {
+		last = reply.op;
+		allocated++;
+	}
+	const n48n_ctx drop { N48N_CTX_OP_FREE, 0, 5, 0 }, query { N48N_CTX_OP_QUERY_STATE2, 0, 1, 0 }, bad { 9, 0, 1, 0 };
+	failures += check(allocated == N48N_MAX_CTX && last == N48N_MAX_CTX &&
+	                  call(N48N_SEL_CTX, nullptr, 0, &drop, sizeof(drop), 0, &reply, sizeof(reply)) == N48N::kSuccess &&
+	                  call(N48N_SEL_CTX, nullptr, 0, &drop, sizeof(drop), 0, &reply, sizeof(reply)) == N48N::kNotFound &&
+	                  call(N48N_SEL_CTX, nullptr, 0, &ctx, sizeof(ctx), 0, &reply, sizeof(reply)) == N48N::kSuccess && reply.op == 5 &&
+	                  call(N48N_SEL_CTX, nullptr, 0, &query, sizeof(query), 0, &reply, sizeof(reply)) == N48N::kSuccess &&
+	                  call(N48N_SEL_CTX, nullptr, 0, &bad, sizeof(bad), 0, &reply, sizeof(reply)) == N48N::kBadArgument,
+	                  "n48n: contexts: %u allocated, last id %u", allocated, last);
+	failures += check(call(N48N_SEL_SUBMIT, nullptr, 0, &ctx, 64, 1, nullptr, 0) == N48N::kUnsupported,
+	                  "n48n: Submit is not there yet and must say so");
+
+	// Closing gives everything back: buffers, every table page, the root.
+	c.close();
+	failures += check(host.memory.empty() && host.tablePages == 0 && host.visibleUsed == 0 && host.highUsed == 0,
+	                  "n48n: close left %zu allocation(s), %llu table page(s)", host.memory.size(),
+	                  (unsigned long long)host.tablePages);
+
+	// The table by itself: three pages across a 2 MiB boundary need two last-level tables.
+	uint64_t root = 0;
+	const VmTree::Pages pages = host.backend().tables;
+	bool ok = pages.alloc(pages.context, root) && VmTree::map(pages, root, 0x1ff000, 0xabc000, 3, GpuVm::kValid);
+	uint64_t entry = 0;
+	ok = ok && host.tablePages == 5 && GpuVm::walk(root, 0x201000, readEntry, &host, phys, entry) && phys == 0xabe000;
+	VmTree::unmap(pages, root, 0x200000, 1);
+	ok = ok && !GpuVm::walk(root, 0x200000, readEntry, &host, phys, entry) && GpuVm::walk(root, 0x1ff000, readEntry, &host, phys, entry);
+	VmTree::destroy(pages, root);
+	failures += check(ok && host.tablePages == 0 && host.memory.empty(), "vmtree: map, unmap and destroy across a table boundary");
+	printf("n48n: the Vulkan interface's memory half and its page table %s\n", failures ? "MISMATCH" : "ok");
 	return failures;
 }
 
@@ -4422,6 +4578,7 @@ int main(int argc, char **argv) {
 	failures += testDpRetime();
 	failures += testPipe2();
 	failures += testDpTrain();
+	failures += testN48N();
 	failures += testPsp();
 	failures += testGfxImages();
 	failures += testSdmaPackets();

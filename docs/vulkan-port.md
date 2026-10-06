@@ -68,9 +68,10 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
 
 0. **Build the patched Mesa on a Mac and run its own tests.** Done 2026-10-06, section 6.
 1. **The interface in this kext, memory half**: connection, buffers, mapping into the process, the 4-level table
-   with caller-chosen addresses, contexts. The table code can be host-tested like `gpuvmtable.cpp` is. Shows on
-   the card: Mesa's device creation succeeds and a buffer written by the CPU reads back through the GPU's copy
-   engine at the address the process chose.
+   with caller-chosen addresses, contexts. In two parts. The engine, which needs no card: done 2026-10-06,
+   section 7. Its connection to the kext (a user client, VRAM and system memory behind the buffers, the address
+   space's registers and translation-cache flush): not started. Shows on the card: Mesa's device creation succeeds
+   and a buffer written by the CPU reads back through the GPU's copy engine at the address the process chose.
 2. **Submit and wait** on the graphics queue in the client's address space, wrapped as Linux wraps it. Shows on the
    card: a Vulkan program that renders offscreen and reads back the right pixels. This is the step that meets the
    open blocker.
@@ -135,3 +136,35 @@ Plus a CPU mapping of buffers (`IOConnectMapMemory64`), which the trace does not
 calls, no host-memory import. So steps 1 and 2 of section 4 need exactly selectors 0 to 8 and the mapping. The
 stand-in (`src/amd/common/darwin/ac_darwin_mock.c` in the patched tree, about 800 lines) states the rules each
 call has to enforce, argument by argument; it is the closest thing to a specification of the kernel half.
+
+
+## 7. Step 1, first part: the engine, with the real driver on top of it (2026-10-06)
+
+- `src/vmtree.{hpp,cpp}`: a process's page table, four levels and 48 bits, pages mapped wherever the caller asks,
+  directory and table pages taken one at a time from whoever owns the memory. It uses the entry encoding the
+  runtime's own table uses (`src/gpuvm.cpp`).
+- `src/n48n.{hpp,cpp}`: one client's side of the interface, selectors 0 to 6 (`Hello`, `QueryInfo`, `ReadRegs`,
+  `BoCreate`, `BoFree`, `GemVa`, `Ctx`): the buffer table, the mappings, the contexts, and the rules each call
+  enforces. The rules are the ones Mesa's stand-in for the kext states; Navi48-MacOS's kernel code was read as a
+  reference, none of it is copied. `Submit` and `WaitSeq` answer "unsupported" until step 2. Memory and registers
+  come through a small backend interface, so the same code runs in the kext, in the host test and under the
+  driver. Both files are compiled into the kext already; nothing there calls them yet.
+- `make test` (`testN48N` in `tools/atomdump.cpp`): what each call accepts and refuses (wrong sizes, a call before
+  `Hello`, buffers that are malformed or too large, mappings below the first address, across the seam of the
+  address space, not canonical, over another mapping, past a buffer's end), buffer placement (the pool the CPU can
+  reach, the other one only for a buffer the CPU need not touch, system memory within its caps), and what a
+  mapping leaves in the table, read back with the walk the runtime's tests use: the right physical page, the
+  permissions asked for, system memory marked as such, uncached when the buffer says so. Freeing a buffer takes
+  its mappings out of the table and flushes before the memory is given back; closing leaves nothing behind. Three
+  planted faults were caught.
+- **The real driver on this engine**: `tools/n48n-host/run.sh <build directory>` inserts a small library into
+  `vulkan/vkprobe.c` that answers the driver's IOKit calls (find the service, open it, call a method, map a
+  buffer) with the engine over ordinary memory. RADV's device creation, its ten buffers, eleven mappings, nine
+  context calls and the CPU mapping of the program's buffer all go through `src/n48n.cpp` and succeed; the first
+  connection closes with nothing left behind; `vkQueueSubmit` is refused at selector 7, as it must be for now.
+
+What the kext still has to supply for this half, each a function of the backend interface (`N48N::Backend`):
+VRAM from the pool the CPU can reach and from the one it cannot, system memory with the physical address of each
+page, 4 KiB pages for the table with a CPU pointer to each, the registers of the client's address space pointed
+at the table's root, a translation-cache flush, the four `GB_ADDR_CONFIG` registers, and a user client that
+carries the calls and maps a buffer into the process. One connection at a time.
