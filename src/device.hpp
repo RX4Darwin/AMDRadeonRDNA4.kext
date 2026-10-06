@@ -123,7 +123,6 @@ public:
 	// and its timing are not touched.
 	void noteBootDpLink();
 	DpTrain::Result retrainBootLink(const char *why);
-	void bootDisplayBack();
 	void logBootLink(const char *when);
 	const char *auxWhy { "" };   // why the last AUX transaction gave no reply, and the status it ended with
 	uint32_t    auxSts { 0 };
