@@ -2425,8 +2425,14 @@ DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 	DpTrain::Report rep {};
 	const DpTrain::Result r = trainLink(sinkAuxInst, pipe.link, pipe.hpd, static_cast<uint8_t>(path.connectorObjId & 0xff),
 	                                    bootDpSink, bootDpLink, true, rep);
-	if (r == DpTrain::Result::Ok)
-		regWriteDmu(2, kDpVidStreamCntl, stream);   // on again, unless display sleep had it off
+	// The video back, unless display sleep had it off. Setting the enable again
+	// is not enough once the transmitter has been off: the link trained and the
+	// screen stayed black, DP_VID_STREAM_STATUS 0 (card, 2026-10-06). The stream
+	// is started the way a mode switch starts it, on the timing it runs.
+	if (r == DpTrain::Result::Ok && (stream & 1) &&
+	    applyMode(Modes::Mode { currentModeId, liveTiming, liveTiming.refreshMilliHz(), false, Modes::SourceBoot }) !=
+	        kIOReturnSuccess)
+		regWriteDmu(2, kDpVidStreamCntl, stream);
 	FBLOG("dptrain: %s after %u attempt(s): swing %u, pre-emphasis %u, lanes %02x %02x, aligned %u; stream 0x%08x",
 	      DpTrain::resultName(r), rep.attempts, rep.swing, rep.preEmphasis, rep.status[0], rep.status[1],
 	      rep.status[2] & 1, regReadDmu(2, kDpVidStreamCntl));
