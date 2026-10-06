@@ -283,7 +283,7 @@ def lit_state(path):
 ENGINE = [f'OTG{pipe}_OTG_{r}' for r in ('H_TOTAL', 'H_SYNC_A', 'H_SYNC_A_CNTL', 'H_BLANK_START_END', 'V_TOTAL',
                                          'V_SYNC_A', 'V_SYNC_A_CNTL', 'V_BLANK_START_END')]
 ENGINE += [f'DPG{pipe}_DPG_DIMENSIONS', f'HUBP{pipe}_DCSURF_PRI_VIEWPORT_DIMENSION', f'DSCL{pipe}_RECOUT_SIZE',
-           f'DSCL{pipe}_MPC_SIZE']
+           f'DSCL{pipe}_MPC_SIZE', f'HUBPREQ{pipe}_BLANK_OFFSET_0']
 if dp:      # the engine's DisplayPort half: the pixel-rate DTO (as the clock it makes: see the host test) and the MSA
     ENGINE += [f'DP_DTO{pipe}_PHASE', f'DP_DTO{pipe}_MODULO'] + MSA
 BY_RULE = [f'VTG{pipe}_CONTROL', f'OTG{pipe}_OTG_VSTARTUP_PARAM', f'OTG{pipe}_OTG_VUPDATE_PARAM']

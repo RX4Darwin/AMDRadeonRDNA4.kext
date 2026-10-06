@@ -61,6 +61,7 @@ constexpr uint32_t kDpgStatus        = 0x185b;   // DOUBLE_BUFFER_PENDING [0]
 // HUBP / DPP
 constexpr uint32_t kHubpViewportStart = 0x05e9;
 constexpr uint32_t kHubpViewportDim   = 0x05eb;  // WIDTH [13:0], HEIGHT [29:16]
+constexpr uint32_t kHubpreqBlankOffset0 = 0x063b; // REFCYC_H_BLANK_END [12:0], DLG_V_BLANK_END [30:16]
 constexpr uint32_t kDsclSclMode       = 0x0d08;  // DSCL_MODE [2:0], 0 = bypass
 constexpr uint32_t kDsclControl       = 0x0d0a;  // SCL_BOUNDARY_MODE [0]
 constexpr uint32_t kDsclAutocal       = 0x0d19;  // AUTOCAL_MODE [1:0], 1 = the scaler works out its own ratio
@@ -429,6 +430,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 	b.waitSet(kOtgUpdateLock + otg, 1u << 8, 10 * kMs, "update lock held", true);
 	b.write(kHubpViewportStart + hubp, 0, "viewport start");
 	b.write(kHubpViewportDim + hubp, sizeWH(w, h), "viewport size");
+	b.write(kHubpreqBlankOffset0 + hubp, dlgBlankEnd(t.to), "plane: where the blank ends");
 	// A console the firmware stretches (Target::scalerOff) would go on being
 	// scaled from the old ratio's settings: the scaler off, as
 	// dpp401_dscl_set_scaler_manual_scale does for a plane shown 1:1.

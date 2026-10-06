@@ -171,31 +171,26 @@ acceleration; 2560x1440 is the workable setting until then.
 
 ### Test 5b: the top of the picture in the Samsung's smaller modes
 
-At 2560x1440 the menu bar is cut off at the top of the screen: only its bottom edge shows. At 1920x1080 (the real
-mode, not HiDPI) it is cut off too, a little less.
+Seen 2026-10-06: at 2560x1440 only the bottom edge of the menu bar showed, at the real 1920x1080 a little more,
+at 1600x900 all of it, and at 1280x720 the screen was black. Not the scaler: with it left as the firmware has it
+the rectangles in the log were right and the top was still cut off.
 
-Ruled out on the card 2026-10-06 (kext `42047888-...`): the scaler. With the scaler left exactly as the firmware
-has it, the top was still cut off, and the log line after the switch shows the rectangles right
-(`modes: scaler mode 0x00000001 autocal 0x00000000; viewport 0x05a00a00 at 0x00000000, recout 0x05a00a00 at
-0x00000000, mpc 0x05a00a00`).
+Cause: the plane's `HUBPREQ BLANK_OFFSET_0` holds the line the vertical blank ends on, and the mode switch left
+it at the firmware's value for 3840x2160 (line 59). 2560x1440 ends its blank on line 38, 1920x1080 on 41,
+1600x900 on 99, 1280x720 on 25: the plane was 21 and 18 lines late for the first two, early enough for the third,
+34 lines late for the last. The switch now writes the register for the new timing. The rule is Linux's:
+`make test` holds it against all 15 generated modes of all four tables, and the firmware's own value for
+3840x2160 is what the rule gives (kext UUID `078A0318-...` or later).
 
-What fits, not yet confirmed: on the boot display a mode switch keeps the firmware's request timing for the plane,
-which was worked out for 3840x2160 with its 62 lines of vertical blanking. 2560x1440 has 41 and 1920x1080 has 45,
-so the plane gets 21 and 17 lines less lead than that timing expects, and a menu bar is 24 lines high: its bottom
-3 lines would be left at 2560x1440, about 7 at 1920x1080. That is what was seen.
+To confirm, usual boot-args; `tools/cgmode.py` reaches the modes Displays does not list:
 
-The check, no reboot, usual boot-args. Displays preferences offers only a few of the Samsung's modes (it lists
-3840x2160, 2560x1440 low resolution, 1920x1080, 1280x720 and 1080p), so the modes are set with
-`tools/cgmode.py`, which reaches all of them. The change lasts until logout; `/usr/bin/python tools/cgmode.py`
-alone lists the displays and modes.
+1. `/usr/bin/python tools/cgmode.py 2560x1440`: is the whole menu bar there?
+2. `/usr/bin/python tools/cgmode.py 1920x1080`: and here?
+3. `/usr/bin/python tools/cgmode.py 1280x720`: is there a picture at all, and is it whole?
+4. `/usr/bin/python tools/cgmode.py 3840x2160` to go back.
 
-1. `/usr/bin/python tools/cgmode.py 1600x900` (100 lines of blanking, more than the firmware's mode). Is the
-   menu bar whole?
-2. `/usr/bin/python tools/cgmode.py 1280x720` (30 lines). Is the menu bar gone completely?
-3. `/usr/bin/python tools/cgmode.py 3840x2160` to go back.
-
-Yes to both confirms it. The fix is then what the second display already has: the plane's request timing from
-Linux for each mode (`tools/pipegen`), generated for the boot display's pipe and its 3840x2160 surface.
+Lines to find: at boot `modes: plane blank end: the firmware has 0x003b000a, the rule gives 0x003b000a for the
+boot timing`; after each switch `modes: scaler mode ...; plane blank end 0x........`.
 
 ## After the tests
 

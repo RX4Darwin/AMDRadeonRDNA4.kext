@@ -532,7 +532,7 @@ static const ModeReg kModeRegs[] = {
 	{ 'M', 2, 0x2165, 0xffffffff, "DP0_DP_MSA_TIMING_PARAM4" },
 	{ 'D', 2, 0x04bc, 0x0000001f, "DCHUBBUB_DET1_CTRL" },
 	{ 'D', 2, 0x06d0, 0x000015f1, "HUBP1_DCHUBP_CNTL" },
-	{ 'D', 2, 0x0717, 0xffffffff, "HUBPREQ1_BLANK_OFFSET_0" },
+	{ 'M', 2, 0x0717, 0xffffffff, "HUBPREQ1_BLANK_OFFSET_0" },
 	{ 'D', 2, 0x0718, 0xffffffff, "HUBPREQ1_BLANK_OFFSET_1" },
 	{ 'D', 2, 0x0719, 0xffffffff, "HUBPREQ1_DST_DIMENSIONS" },
 	{ 'D', 2, 0x071a, 0xffffffff, "HUBPREQ1_DST_AFTER_SCALER" },

@@ -135,6 +135,18 @@ constexpr uint32_t dpVidM(uint32_t pixelClockKHz, uint32_t symbolClockKHz) {
 }
 void dpMsa(const Edid::DetailedTiming &t, uint32_t out[4]);
 
+// HUBPREQ BLANK_OFFSET_0 of a timing: the line the vertical blank ends on
+// (DLG_V_BLANK_END, sync width + back porch) and where the horizontal blank
+// ends in DCHUB reference clock cycles (REFCYC_H_BLANK_END; the reference is
+// 50 MHz). The plane fetches each frame for that line: left at a larger
+// mode's value, the top of the picture is lost by the difference, or all of
+// it (card, 2026-10-06). The firmware's own value for its mode is this too.
+constexpr uint32_t kDchubRefKHz = 50000;
+constexpr uint32_t dlgBlankEnd(const Edid::DetailedTiming &t) {
+	return (static_cast<uint32_t>(t.vBlank - t.vSyncOffset) << 16) |
+	       ((static_cast<uint32_t>(t.hBlank - t.hSyncOffset) * kDchubRefKHz / t.pixelClockKHz) & 0x1fff);
+}
+
 // The DP pixel-rate DTO for a new pixel clock, from the one running now. The
 // DTO makes its reference clock times (integer + phase / modulo). amdgpu
 // programs it in Hz (modulo = the reference in Hz, so integer x modulo +

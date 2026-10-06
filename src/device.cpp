@@ -2173,6 +2173,11 @@ void RDNA4Device::buildModeTable() {
 	}
 	FBLOG("modes: %lu mode(s), switching %s", static_cast<unsigned long>(modeCount),
 	      modesetRequested ? "requested (rdna4-modeset=1)" : "off (boot mode only)");
+	// The plane's blank-end register as the firmware has it for its own mode,
+	// next to what the mode switch would write there for that mode.
+	if (bootTimingValid && bootTiming.pixelClockKHz)
+		FBLOG("modes: plane blank end: the firmware has 0x%08x, the rule gives 0x%08x for the boot timing",
+		      regReadDmu(2, 0x063b + hubpOff()), ModeSet::dlgBlankEnd(bootTiming));
 	owner->setProperty("Modes,Count", static_cast<uint64_t>(modeCount), 32);
 }
 
@@ -2542,10 +2547,11 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		// Where the picture sits: the scaler's mode and the rectangles around it,
 		// and the plane's underflow flags (a picture cut off at the top, 2026-10-06).
 		FBLOG("modes: scaler mode 0x%08x autocal 0x%08x%s; viewport 0x%08x at 0x%08x, recout 0x%08x at 0x%08x, mpc "
-		      "0x%08x; HUBP%u_DCHUBP_CNTL 0x%08x", regReadDmu(2, 0x0d08 + dppOff()), regReadDmu(2, 0x0d19 + dppOff()),
-		      t.scalerOff ? " (turned off: stretched console)" : "", regReadDmu(2, 0x05eb + hubpOff()),
-		      regReadDmu(2, 0x05e9 + hubpOff()), regReadDmu(2, 0x0d1f + dppOff()), regReadDmu(2, 0x0d1e + dppOff()),
-		      regReadDmu(2, 0x0d20 + dppOff()), pipe.hubp, regReadDmu(2, 0x05f4 + hubpOff()));
+		      "0x%08x; plane blank end 0x%08x; HUBP%u_DCHUBP_CNTL 0x%08x", regReadDmu(2, 0x0d08 + dppOff()),
+		      regReadDmu(2, 0x0d19 + dppOff()), t.scalerOff ? " (turned off: stretched console)" : "",
+		      regReadDmu(2, 0x05eb + hubpOff()), regReadDmu(2, 0x05e9 + hubpOff()), regReadDmu(2, 0x0d1f + dppOff()),
+		      regReadDmu(2, 0x0d1e + dppOff()), regReadDmu(2, 0x0d20 + dppOff()), regReadDmu(2, 0x063b + hubpOff()),
+		      pipe.hubp, regReadDmu(2, 0x05f4 + hubpOff()));
 		return kIOReturnSuccess;
 	}
 
