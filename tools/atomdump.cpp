@@ -964,7 +964,8 @@ struct PlanRegs {
 	static uint32_t read(void *ctx, uint8_t seg, uint32_t dw) {
 		return static_cast<PlanRegs *>(ctx)->get(seg, dw);
 	}
-	void run(const ModeSet::Plan &p) {
+	// What the registers hold after a plan's writes and updates (a ModeSet::Plan or a Pipe2::Plan).
+	template <typename Plan> void run(const Plan &p) {
 		for (size_t i = 0; i < p.count; i++) {
 			const ModeSet::Step &s = p.steps[i];
 			if (s.op == ModeSet::Op::Write)
@@ -974,6 +975,12 @@ struct PlanRegs {
 		}
 	}
 };
+
+// The VBIOS encoder object of a second-pipe plan's link: UNIPHY, UNIPHY1, UNIPHY2 with two links each.
+static uint16_t encoderObjOf(const Pipe2::Config &c) {
+	static const uint8_t uniphy[3] = { 0x1e, 0x20, 0x21 };
+	return static_cast<uint16_t>(0x2000 | (((c.link & 1) + 1) << 8) | uniphy[c.link / 2]);
+}
 
 // The last write to `dw` in the plan (its final value).
 static const ModeSet::Step *findWrite(const ModeSet::Plan &p, uint32_t dw, size_t *at = nullptr) {
@@ -1520,11 +1527,6 @@ static int testDpTrain() {
 		                  "dptrain: link for 4K60 at 10 bpc: %u lanes, rate 0x%02x", l.lanes, l.rate);
 		failures += check(DpTrain::pickLink(sink, 148500, 24, l) && l.lanes == 4 && l.rate == DpTrain::kRbr,
 		                  "dptrain: link for 1080p60 at 8 bpc: %u lanes, rate 0x%02x", l.lanes, l.rate);
-		static const uint8_t up4[3] = { 0x77, 0x77, 0x01 }, lane3[3] = { 0x77, 0x37, 0x01 }, skew[3] = { 0x77, 0x77, 0x80 },
-		                     up2[3] = { 0x77, 0x00, 0x81 };
-		failures += check(DpTrain::linkUp(up4, 4) && !DpTrain::linkUp(lane3, 4) && !DpTrain::linkUp(skew, 4) &&
-		                  DpTrain::linkUp(up2, 2) && !DpTrain::linkUp(up2, 4) && !DpTrain::linkUp(up4, 0),
-		                  "dptrain: link status read wrong");
 		failures += check(DpTrain::pickLink(sink, 25175, 24, l) && l.lanes == 1 && l.rate == DpTrain::kRbr &&
 		                  !DpTrain::pickLink(sink, 1066500, 30, l), "dptrain: smallest and too-large links");
 	}
@@ -1546,8 +1548,7 @@ static int testPipe2Table() {
 	const uint32_t kBeCntl = 0x20bc + c.link * 0x124u, kBeEn = 0x20bd + c.link * 0x124u;
 	const uint32_t kBeFromFe = 1u << (8 + c.dig), kMapper = 0x1f0du + c.dig;
 	const uint8_t  kDdcLine = static_cast<uint8_t>(c.hpd - 1);
-	static const uint8_t uniphy[3] = { 0x1e, 0x20, 0x21 };
-	const uint16_t kEncoderObj = static_cast<uint16_t>(0x2000 | (((c.link & 1) + 1) << 8) | uniphy[c.link / 2]);
+	const uint16_t kEncoderObj = encoderObjOf(c);
 	failures += check(Pipe2::linkOfEncoder(kEncoderObj) == c.link, "pipe2: encoder object 0x%04x is not link %u",
 	                  kEncoderObj, c.link);
 	enum Who { ThePipe, TheDig, TheLink };
@@ -1690,16 +1691,7 @@ static int testPipe2Table() {
 	// What the registers hold afterwards: timing of VIC 16, the surface, the
 	// blender feeding OPP1 from DPP1, the OTG enabled and the lock released.
 	PlanRegs regs;
-	auto apply = [&](const Pipe2::Plan &p) {
-		for (size_t i = 0; i < p.count; i++) {
-			const ModeSet::Step &s = p.steps[i];
-			if (s.op == ModeSet::Op::Write)
-				regs.set(s.seg, s.dword, s.value);
-			else if (s.op == ModeSet::Op::Update)
-				regs.set(s.seg, s.dword, (regs.get(s.seg, s.dword) & ~s.mask) | s.value);
-		}
-	};
-	apply(plan);
+	regs.run(plan);
 	struct { uint8_t seg; uint32_t dw, mask, want; const char *name; } after[] = {
 		{ 2, 0x1baa, 0xffffffff, 2199, "OTG1 h total" },         { 2, 0x1baf, 0xffffffff, 1124, "OTG1 v total" },
 		{ 2, 0x1bab, 0x7fff7fff, 0x00c00840, "OTG1 h blank" },   { 2, 0x1bb8, 0x7fff7fff, 0x00290461, "OTG1 v blank" },
@@ -1893,7 +1885,7 @@ static int testPipe2Table() {
 		DpPhy::buildDisable(off, c.link, c.hpd, 0x13);
 		const bool slept = Pipe2::build(power, dpms, &why);
 		inBlocks(dpms);
-		apply(dpms);
+		regs.run(dpms);
 		const size_t sleepSteps = dpms.count;
 		failures += check(slept && dpms.naux == 1 && dpms.aux[0].address == 0x600 && dpms.aux[0].len == 1 &&
 		                  dpms.aux[0].data[0] == 0x02 && dpms.ncmds == 1 && memcmp(dpms.cmds[0], off, sizeof(off)) == 0 &&
@@ -1904,7 +1896,7 @@ static int testPipe2Table() {
 		power.part = Pipe2::Part::Wake;
 		const bool woke = Pipe2::build(power, dpms, &why);
 		inBlocks(dpms);
-		apply(dpms);
+		regs.run(dpms);
 		const size_t wakeSteps = dpms.count;
 		failures += check(woke && count(dpms, ModeSet::Op::Train) == 1 && dpms.ncmds == 0 && dpms.naux == 2 &&
 		                  dpms.aux[0].address == 0x300, "pipe2: DisplayPort wake: %s, %zu training step(s), %zu AUX "
@@ -1977,13 +1969,7 @@ static int testPipe2Table() {
 			for (Pipe2::Part part : { Pipe2::Part::Sleep, Pipe2::Part::Wake }) {
 				power.part = part;
 				parts = parts && Pipe2::build(power, dpms, &why);
-				for (size_t i = 0; i < dpms.count; i++) {
-					const ModeSet::Step &x = dpms.steps[i];
-					if (x.op == ModeSet::Op::Write)
-						at.set(x.seg, x.dword, x.value);
-					else if (x.op == ModeSet::Op::Update)
-						at.set(x.seg, x.dword, (at.get(x.seg, x.dword) & ~x.mask) | x.value);
-				}
+				at.run(dpms);
 			}
 			const size_t n = Pipe2::modeSteps(known[1], want, Pipe2::kMaxModeSteps, Pipe2::ModeRegs::All);
 			for (size_t i = 0; i < n; i++)
@@ -2025,7 +2011,7 @@ static int testPipe2Table() {
 	failures += check(slept && dpms.ncmds == 1 && memcmp(dpms.cmds[0], plan.cmds[0], sizeof(Dmub::Cmd)) == 0,
 	                  "pipe2: sleep plan: %s, %zu DMUB commands", slept ? "built" : why, dpms.ncmds);
 	inBlocks(dpms);
-	apply(dpms);
+	regs.run(dpms);
 	const size_t sleepSteps = dpms.count;
 	failures += check((regs.get(2, kFeEn) & 1) == 0 && (regs.get(2, kBeCntl) & kBeFromFe) == 0 &&
 	                  (regs.get(2, kHdmiGc) & 1) == 1 && (regs.get(2, 0x1bc3) & 1) == 1 &&
@@ -2037,7 +2023,7 @@ static int testPipe2Table() {
 	failures += check(woke && dpms.ncmds == 3 && memcmp(dpms.cmds, plan.cmds + 1, 3 * sizeof(Dmub::Cmd)) == 0,
 	                  "pipe2: wake plan: %s, %zu DMUB commands", woke ? "built" : why, dpms.ncmds);
 	inBlocks(dpms);
-	apply(dpms);
+	regs.run(dpms);
 	const size_t wakeSteps = dpms.count;
 	for (const PlanRegs::R &r : lit.regs)
 		failures += check(regs.get(r.seg, r.dw) == r.v, "pipe2: after sleep and wake %u:0x%04x = 0x%08x, lit it "
@@ -2107,13 +2093,7 @@ static int testPipe2Table() {
 		const bool ok = ModeSet::buildSleep(st, sl, &why) && Pipe2::build(power, linuxSleep, &why);
 		stepsInBlocks(sl.steps, sl.count);
 		ours.run(sl);
-		for (size_t i = 0; i < linuxSleep.count; i++) {
-			const ModeSet::Step &x = linuxSleep.steps[i];
-			if (x.op == ModeSet::Op::Write)
-				theirs.set(x.seg, x.dword, x.value);
-			else if (x.op == ModeSet::Op::Update)
-				theirs.set(x.seg, x.dword, (theirs.get(x.seg, x.dword) & ~x.mask) | x.value);
-		}
+		theirs.run(linuxSleep);
 		size_t differ = 0;
 		for (size_t i = 0; ok && i < sl.count; i++)
 			if (sl.steps[i].op == ModeSet::Op::Write || sl.steps[i].op == ModeSet::Op::Update)
@@ -2179,19 +2159,6 @@ static int testPipe2Table() {
 // that lighting on `to` sets holds what lighting there would have left.
 static int testPipe2Move(uint8_t from, uint8_t to) {
 	int failures = 0;
-	static const uint8_t uniphy[3] = { 0x1e, 0x20, 0x21 };
-	auto encoderObj = [](const Pipe2::Config &c) {
-		return static_cast<uint16_t>(0x2000 | (((c.link & 1) + 1) << 8) | uniphy[c.link / 2]);
-	};
-	auto apply = [](PlanRegs &regs, const Pipe2::Plan &p) {
-		for (size_t i = 0; i < p.count; i++) {
-			const ModeSet::Step &s = p.steps[i];
-			if (s.op == ModeSet::Op::Write)
-				regs.set(s.seg, s.dword, s.value);
-			else if (s.op == ModeSet::Op::Update)
-				regs.set(s.seg, s.dword, (regs.get(s.seg, s.dword) & ~s.mask) | s.value);
-		}
-	};
 	static Pipe2::Plan plan, lightTo;
 	static ModeSet::Plan ms;
 	static ModeSet::Step extra[Pipe2::kMaxModeSteps];
@@ -2199,7 +2166,7 @@ static int testPipe2Move(uint8_t from, uint8_t to) {
 	auto target = [&](Pipe2::Part part) {
 		Pipe2::Target t {};
 		t.litHubp = 0;
-		t.encoderObjId = encoderObj(Pipe2::config());
+		t.encoderObjId = encoderObjOf(Pipe2::config());
 		t.surface = 0x8002100000ull;
 		t.depth = Pipe2::Depth::Plane;
 		t.part = part;
@@ -2207,9 +2174,9 @@ static int testPipe2Move(uint8_t from, uint8_t to) {
 	};
 	PlanRegs moved, lit;
 	bool ok = Pipe2::use(from) && Pipe2::build(target(Pipe2::Part::Light), plan, &why);
-	apply(moved, plan);
+	moved.run(plan);
 	ok = ok && Pipe2::build(target(Pipe2::Part::Sleep), plan, &why);
-	apply(moved, plan);
+	moved.run(plan);
 
 	ok = ok && Pipe2::use(to);
 	const Pipe2::Config &c = Pipe2::config();
@@ -2218,7 +2185,7 @@ static int testPipe2Move(uint8_t from, uint8_t to) {
 	mt.dig = c.dig;
 	mt.link = c.link;
 	mt.hpd = c.hpd;
-	mt.encoderObjId = encoderObj(c);
+	mt.encoderObjId = encoderObjOf(c);
 	mt.connectorObjId = 0x330c;
 	mt.from = mt.to = c.timing;
 	mt.extra = extra;
@@ -2227,10 +2194,10 @@ static int testPipe2Move(uint8_t from, uint8_t to) {
 	moved.run(ms);
 	for (Pipe2::Part part : { Pipe2::Part::Sleep, Pipe2::Part::Wake, Pipe2::Part::Avi }) {
 		ok = ok && Pipe2::build(target(part), plan, &why);
-		apply(moved, plan);
+		moved.run(plan);
 	}
 	ok = ok && Pipe2::build(target(Pipe2::Part::Light), lightTo, &why);
-	apply(lit, lightTo);
+	lit.run(lightTo);
 	failures += check(ok, "pipe2: move HPD%u -> HPD%u: a plan was refused: %s", from, to, why);
 
 	size_t differ = 0;

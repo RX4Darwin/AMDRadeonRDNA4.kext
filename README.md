@@ -106,7 +106,8 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-head2=0` | **A second display is on by default (level 4, below); `0` turns it off.** `1` is the experiment it grew from: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Not with `rdna4-compute`. Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. **Higher values also light the pipe (`docs/second-pipe.md`; all verified on the card 2026-10-04):** `2` writes nothing and publishes what every step of the plan would do to the dormant pipe's registers (`RDNA4FB,Pipe2`, shown by `tools/diagnostic-log.sh`); `3` lights the stream alone, so the second monitor shows a solid teal-blue; `4` also lights the plane, so it shows the second desktop. There is a plan per connector of the card, all at 1920x1080@60 next to a boot display on another connector: HDMI on HPD3 / link 2 (the one verified), HDMI on HPD4 / link 3 (verified 2026-10-06), and DisplayPort on HPD1 / link 0 or HPD2 / link 1, whose link the kext trains itself (those two host-tested, not yet run on the card, and only used with `rdna4-head2dp=1`). Not in `VMTEST` builds and not with `rdna4-compute`. |
 | `rdna4-head2dp=1` | Also serve a second display on a DisplayPort connector (lighting it, sleep, hot-plug and mode switching as on HDMI). Off by default because it has not run on the card yet: `docs/todo-dptest.md` has the tests. |
 | `rdna4-hotplug=0` | **Hot-plug of the second display is on by default (level 2); `0` turns it off, `1` only logs what the pin does.** On: The connector's HPD pin is polled; unplugging takes the head offline in macOS, plugging reads the display, lights or wakes the pipe and brings the head back, and the head exists (offline) when no monitor was there at boot. `1` only logs what the pin does. Verified on the card 2026-10-05 (`docs/second-pipe.md`), and on 2026-10-06 on the other HDMI connector and through a 10-minute display sleep. A display unplugged from one HDMI connector and plugged into the other gets the pipe moved to it (verified on the card 2026-10-06, in both directions, at 60 and at 144 Hz). |
-| `rdna4-dptrain=1` | DisplayPort boot display, diagnostics: read what the monitor can do and which link the firmware trained, watch its HPD pin, and log the link's state when the monitor comes back. The kext does not retrain that link: the firmware keeps it itself (card, 2026-10-06: with the link taken down under it, the firmware had trained it again within two seconds, and the monitor returns after a cable pull or a power cycle with the kext doing nothing). `2` retrains the link once by itself 15 s after the desktop is up, to try the kext's own training (`src/dptrain.cpp`, as amdgpu trains). **That training completed on the card 2026-10-06:** 4 lanes at HBR2 against the test monitor, locked on the second attempt at the lowest drive, with the firmware accepting the DisplayPort transmitter commands. After it the stream encoder is tied to the link again, as amdgpu does, and the video is restarted with a mode set to the running timing: in the last run that day the link was down, trained and carrying a running stream again 0.57 s later, with the monitor reporting all lanes locked 10 s on and the screen dark for no more than a blink. |
+| `rdna4-dptrain=1` | Diagnostic for a DisplayPort boot display: log what the monitor can do and which link the firmware trained, watch its HPD pin, and log the link's state when the monitor comes back. The kext does not retrain that link, because the firmware keeps it itself (card, 2026-10-06: it retrains within two seconds of the pin returning). `2` also runs the kext's own training on that link once, 15 s after the desktop is up (`src/dptrain.cpp`, as amdgpu trains): on the card that day, 4 lanes at HBR2 trained and the video was back 0.57 s after the link was taken down. |
+| `rdna4-cursor=1` | Hardware cursor on the boot display through the NDRV cursor calls (`src/cursor.cpp`, `docs/cursor-audit.md`, `docs/HANDOFF-linux.md`); used with `rdna4-vbl=1`. Off by default. Ran on the test rig 2026-10-06 on the 4K DisplayPort boot display next to the second display, through mode switches, without a fault in the log; it made no noticeable difference to how responsive the unaccelerated desktop feels. |
 | `rdna4-nosleep=1` | Make display sleep a no-op (the screen stays on). Escape hatch if blank/unblank misbehaves. |
 | `rdna4-noedid=1` | Skip the EDID probe over AUX/DDC. Use if a sink misbehaves on DDC. |
 | `rdna4-lutbypass=1` | Force the MPC MCM stages (shaper/3D LUT/1D LUT) to bypass on all pipes. |
@@ -123,10 +124,10 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-fakeedid=0` | `VMTEST=1` builds only: they serve the Lenovo fixture EDID and enable `rdna4-modeset` by default (so the mode list can be checked in a VM whose OpenCore pins boot-args); `=0` turns either off. |
 | `-rdna4dbg` | Lilu debug logging for the plugin (Lilu DEBUG builds). |
 
-The standalone build's hardware cursor (`rdna4-hwcursor`, `rdna4-curmode`,
-`rdna4-curtest`, `rdna4-dmubcursor`), emulated VBL (`rdna4-vbl`) and
-`rdna4-cmap` belonged to its IOFramebuffer glue and are gone for now; the
-cursor code is parked in `src/cursor.cpp` until the NDRV cursor path is wired.
+The standalone build's `rdna4-hwcursor`, `rdna4-curmode`, `rdna4-curtest`,
+`rdna4-dmubcursor` and `rdna4-cmap` belonged to its IOFramebuffer glue and are
+gone; the hardware cursor now goes through the NDRV cursor calls
+(`rdna4-cursor=1`, above).
 
 ### The lit pipe
 
@@ -168,7 +169,7 @@ monitor really sleeps, and wakes it with a mode set to the running timing
 | `shaders/probe.s`, `src/probe_kernel.h` | The stage-6 test kernel (gfx1201 assembly) and its machine code, generated by `tools/build-shaders.sh` with upstream LLVM. |
 | `src/ndrv.{hpp,cpp}` | Freestanding NDRV `csc` translator: mode list, video parameters, timings, current mode, connection, EDID blocks, DPMS, mode switch. Host-tested. |
 | `src/bochsvbe.{hpp,cpp}` | `VMTEST` only: mode switches on QEMU's `vmware-svga` through the Bochs VBE interface (the one OVMF's GOP uses on that card). |
-| `src/cursor.cpp` | Parked (not built): the DCN hardware-cursor code from the standalone build. |
+| `src/cursor.cpp` | The DCN hardware cursor behind the NDRV cursor calls (`rdna4-cursor=1`). |
 | `src/atombios.{hpp,cpp}` | Freestanding, bounds-checked AtomBIOS parser: data tables (connectors, GPIO LUT, firmwareinfo) + command-function directory. |
 | `src/ipdiscovery.{hpp,cpp}` | Parser for AMD's IP discovery binary — per-card IP versions and register segment bases (what amdgpu uses instead of hardcoded offsets; the key to ASIC portability). |
 | `src/edid.{hpp,cpp}` | EDID parsers: base block (all descriptors, range limits, established/standard timings via a DMT table, physical size) and CTA-861 extension (DTDs, VICs via a CEA-861 table, HDMI VSDB). |
@@ -570,5 +571,6 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       confirmed; `rdna4-modeset=1`). The plan's register writes are held
       against what Linux's own functions write for the same retime
       (`tools/dp_retime_linux.inc`).
-- [ ] Hardware cursor through the NDRV cursor path
+- [x] Hardware cursor through the NDRV cursor path (`rdna4-cursor=1`,
+      off by default; `docs/HANDOFF-linux.md`)
 - [ ] Acceleration / Metal

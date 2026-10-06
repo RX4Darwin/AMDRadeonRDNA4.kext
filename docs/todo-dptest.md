@@ -133,14 +133,6 @@ Only if test 1 passed. Boot with the second monitor's DisplayPort cable unplugge
 Lines to find: `head2: ... offline until a display is plugged in`, `hotplug: HPDn went high`,
 `pipe2: DisplayPort sink on AUXn: ...`, `pipe2: lighting ...`, `hotplug: display connected on HPDn: N mode(s)`.
 
-## Done: the HDMI display moved to the other HDMI port
-
-Confirmed on the card 2026-10-06 (kext `992B8D5C-...`): the Lenovo unplugged from one HDMI port and plugged into
-the other came back with its desktop, in both directions, the second time at 144 Hz; display sleep and a
-same-port replug afterwards worked. Log: `pipe2: moving from HPD4 (DIG3, link 3) to HPD3 (DIG2, link 2) at
-1920x1080, 148500 kHz`, `pipe2: now on HPD3; DIG2_DIG_FE_EN_CNTL=0x00000001 SYMCLKC_CLOCK_ENABLE=0x00000211`,
-`hotplug: the same display is back on HPD3`.
-
 ## Test 4: the stretched console (no extra hardware)
 
 This checks the fix for the zoomed picture of 2026-10-06, which could not be tried then because the console went
@@ -159,41 +151,22 @@ it onto its 3840x2160 timing`, then `modes: switching to id N ...` and `modes: n
 In this state the Samsung has no 3840x2160 mode: the kext offers nothing larger than the console. That is a
 known limit, not part of this test.
 
-## Test 5: pointer and input lag on the 4K display (no extra hardware)
-
-Observed 2026-10-06: in applications like Google Chrome the pointer and typing lag on the Samsung (DisplayPort)
-and behave almost normally on the Lenovo (HDMI). At that time the Samsung ran 1920x1080 HiDPI, which is a
-3840x2160 surface, and the Lenovo a plain 1920x1080 one. There is no graphics acceleration yet, so macOS draws
-every pixel of both on the CPU, and the pointer is drawn the same way (a software cursor).
-
-Two things differed between the screens then, and either could explain it without DisplayPort being at fault:
-the Samsung had four times as many pixels, and the Lenovo ran at 144 Hz against the Samsung's 60 Hz.
-
-Tried the same day with `rdna4-cursor=1 rdna4-vbl=1` (a hardware cursor on the boot display): the kext ran it on
-the 4K DisplayPort pipe next to `rdna4-head2=4` without an error in the log, through a switch to 2560x1440 and
-back, and the Samsung was still reported less responsive. So the pointer being drawn by macOS is not the whole
-cause. The log has nothing that measures responsiveness.
-
-Result, the same day: with the Samsung at 2560x1440 (the low-resolution mode Displays offers there) Chrome was
-equally responsive on both screens. So it is the number of pixels macOS has to draw on the CPU, not DisplayPort
-and not that pipe. 1920x1080 HiDPI on a 4K panel will stay sluggish in heavy applications until there is
-acceleration; 2560x1440 is the workable setting until then.
-
-### Done: the top of the picture in the Samsung's smaller modes
-
-Seen 2026-10-06: at 2560x1440 only the bottom edge of the menu bar showed, at the real 1920x1080 a little more,
-at 1600x900 all of it, and at 1280x720 the screen was black. Cause: the plane's `HUBPREQ BLANK_OFFSET_0` holds
-the line the vertical blank ends on, and the mode switch left it at the firmware's value for 3840x2160 (line 59;
-2560x1440 ends its blank on line 38, 1920x1080 on 41, 1600x900 on 99, 1280x720 on 25). The switch now writes it
-for the new timing, by the rule Linux uses. Confirmed on the card the same day with kext `078A0318-...`:
-2560x1440, 1920x1080 and 1280x720 all show the whole desktop; the log has `modes: plane blank end: the firmware
-has 0x003b000a, the rule gives 0x003b000a for the boot timing` and `plane blank end 0x00260017` after the switch
-to 2560x1440.
-
-`tools/cgmode.py` reaches the modes Displays does not list: `/usr/bin/python tools/cgmode.py` shows them,
-`/usr/bin/python tools/cgmode.py 2560x1440` switches for the login session.
-
 ## After the tests
 
 For each test that passes, the README's status list and `docs/second-pipe.md` get the date and what ran, as for
 the earlier ones, and `rdna4-head2dp=1` becomes the default like the rest.
+
+## Settled on 2026-10-06
+
+Kept here because they explain what the tests above no longer need to cover; the details are in the README and
+`docs/second-pipe.md`.
+
+- **Lag in heavy applications on the 4K display** is the number of pixels macOS draws on the CPU (1920x1080 HiDPI
+  is a 3840x2160 surface), not DisplayPort: with the Samsung at 2560x1440 Chrome is as responsive as on the
+  1080p display. A hardware cursor (`rdna4-cursor=1 rdna4-vbl=1`) made no noticeable difference. Until there is
+  acceleration, 2560x1440 is the workable setting.
+- **The top of the picture cut off in the boot display's smaller modes**: fixed (the plane's blank-end register
+  is written with the mode switch); 2560x1440, 1920x1080 and 1280x720 confirmed whole.
+- **The HDMI display moved to the other HDMI port**: works in both directions, also at 144 Hz.
+- `tools/cgmode.py` reaches the modes Displays preferences does not list: `/usr/bin/python tools/cgmode.py`
+  shows them, `/usr/bin/python tools/cgmode.py 2560x1440` switches for the login session.

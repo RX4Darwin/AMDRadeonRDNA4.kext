@@ -2439,13 +2439,11 @@ DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 	DpTrain::Report rep {};
 	const DpTrain::Result r = trainLink(sinkAuxInst, pipe.link, pipe.hpd, static_cast<uint8_t>(path.connectorObjId & 0xff),
 	                                    bootDpSink, bootDpLink, true, rep);
-	// The video back, unless display sleep had it off. Setting the enable again
-	// is not enough once the transmitter has been off: the link trained and the
-	// screen stayed black, DP_VID_STREAM_STATUS 0 (card, 2026-10-06). The stream
-	// is started the way a mode switch starts it, on the timing it runs.
-	// That alone left the stream encoder's FIFO without its reset and the
-	// stream stopped (the same day), so first what amdgpu does between
-	// training and unblank: the stream encoder tied to the link again.
+	// The video back, unless display sleep had it off. With the transmitter
+	// having been off, the stream only starts again if the stream encoder is
+	// first tied to the link, as amdgpu does between training and unblank, and
+	// then started the way a mode switch starts it (card, 2026-10-06: without
+	// either the link trained and the screen stayed black).
 	if (r == DpTrain::Result::Ok && (stream & 1)) {
 		ModeSet::Step s[DpPhy::kMaxSteps];
 		runSteps(s, DpPhy::streamSteps(pipe.dig, pipe.link, s), nullptr, 0, "dptrain", otgOff());
