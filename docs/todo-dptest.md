@@ -132,9 +132,7 @@ Lines to find: `head2: ... offline until a display is plugged in`, `hotplug: HPD
 ## Test 4: the stretched console (no extra hardware)
 
 This checks the fix for the zoomed picture of 2026-10-06, which could not be tried then because the console went
-back to 4K first. Samsung on DisplayPort; the Lenovo may stay on HDMI. Run it after test 5b: if the scaler in
-bypass cuts the top of the picture off on a normal boot, it may do the same here, and then the answer to step 2
-is "the whole width, but the top is cut off".
+back to 4K first. Samsung on DisplayPort; the Lenovo may stay on HDMI.
 
 1. In OpenCore's `config.plist` set `UEFI -> Output -> Resolution` to `1920x1080`. Boot with
    `rdna4-head2=4 rdna4-modeset=1 rdna4-hotplug=2 rdna4-trace=1`.
@@ -169,28 +167,19 @@ equally responsive on both screens. So it is the number of pixels macOS has to d
 and not that pipe. 1920x1080 HiDPI on a 4K panel will stay sluggish in heavy applications until there is
 acceleration; 2560x1440 is the workable setting until then.
 
-### Test 5b: the top of the picture in the Samsung's smaller modes
+### Done: the top of the picture in the Samsung's smaller modes
 
 Seen 2026-10-06: at 2560x1440 only the bottom edge of the menu bar showed, at the real 1920x1080 a little more,
-at 1600x900 all of it, and at 1280x720 the screen was black. Not the scaler: with it left as the firmware has it
-the rectangles in the log were right and the top was still cut off.
+at 1600x900 all of it, and at 1280x720 the screen was black. Cause: the plane's `HUBPREQ BLANK_OFFSET_0` holds
+the line the vertical blank ends on, and the mode switch left it at the firmware's value for 3840x2160 (line 59;
+2560x1440 ends its blank on line 38, 1920x1080 on 41, 1600x900 on 99, 1280x720 on 25). The switch now writes it
+for the new timing, by the rule Linux uses. Confirmed on the card the same day with kext `078A0318-...`:
+2560x1440, 1920x1080 and 1280x720 all show the whole desktop; the log has `modes: plane blank end: the firmware
+has 0x003b000a, the rule gives 0x003b000a for the boot timing` and `plane blank end 0x00260017` after the switch
+to 2560x1440.
 
-Cause: the plane's `HUBPREQ BLANK_OFFSET_0` holds the line the vertical blank ends on, and the mode switch left
-it at the firmware's value for 3840x2160 (line 59). 2560x1440 ends its blank on line 38, 1920x1080 on 41,
-1600x900 on 99, 1280x720 on 25: the plane was 21 and 18 lines late for the first two, early enough for the third,
-34 lines late for the last. The switch now writes the register for the new timing. The rule is Linux's:
-`make test` holds it against all 15 generated modes of all four tables, and the firmware's own value for
-3840x2160 is what the rule gives (kext UUID `078A0318-...` or later).
-
-To confirm, usual boot-args; `tools/cgmode.py` reaches the modes Displays does not list:
-
-1. `/usr/bin/python tools/cgmode.py 2560x1440`: is the whole menu bar there?
-2. `/usr/bin/python tools/cgmode.py 1920x1080`: and here?
-3. `/usr/bin/python tools/cgmode.py 1280x720`: is there a picture at all, and is it whole?
-4. `/usr/bin/python tools/cgmode.py 3840x2160` to go back.
-
-Lines to find: at boot `modes: plane blank end: the firmware has 0x003b000a, the rule gives 0x003b000a for the
-boot timing`; after each switch `modes: scaler mode ...; plane blank end 0x........`.
+`tools/cgmode.py` reaches the modes Displays does not list: `/usr/bin/python tools/cgmode.py` shows them,
+`/usr/bin/python tools/cgmode.py 2560x1440` switches for the login session.
 
 ## After the tests
 
