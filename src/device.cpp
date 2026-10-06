@@ -2468,6 +2468,9 @@ bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
 	t.hubp = pipe.hubp;
 	t.encoderObjId = path.encoderObjId;
 	t.connectorObjId = path.connectorObjId;
+	// DSCL_AUTOCAL.AUTOCAL_MODE: the firmware stretching a smaller console.
+	const uint32_t autocal = regReadDmu(2, 0x0d19 + dppOff());
+	t.scalerOff = autocal != 0xFFFFFFFF && (autocal & 0x3) != 0;
 	return true;
 }
 
@@ -2536,6 +2539,13 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
 		FBLOG("modes: now %ux%u@%u.%03u, measured %u.%03u Hz", m.t.hActive, m.t.vActive,
 		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, mHz / 1000, mHz % 1000);
+		// Where the picture sits: the scaler's mode and the rectangles around it,
+		// and the plane's underflow flags (a picture cut off at the top, 2026-10-06).
+		FBLOG("modes: scaler mode 0x%08x autocal 0x%08x%s; viewport 0x%08x at 0x%08x, recout 0x%08x at 0x%08x, mpc "
+		      "0x%08x; HUBP%u_DCHUBP_CNTL 0x%08x", regReadDmu(2, 0x0d08 + dppOff()), regReadDmu(2, 0x0d19 + dppOff()),
+		      t.scalerOff ? " (turned off: stretched console)" : "", regReadDmu(2, 0x05eb + hubpOff()),
+		      regReadDmu(2, 0x05e9 + hubpOff()), regReadDmu(2, 0x0d1f + dppOff()), regReadDmu(2, 0x0d1e + dppOff()),
+		      regReadDmu(2, 0x0d20 + dppOff()), pipe.hubp, regReadDmu(2, 0x05f4 + hubpOff()));
 		return kIOReturnSuccess;
 	}
 

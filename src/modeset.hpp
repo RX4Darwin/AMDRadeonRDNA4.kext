@@ -119,6 +119,11 @@ struct Target {
 	// has to change with the timing on this pipe (Pipe2::modeSteps).
 	const Step *extra;
 	size_t      nextra;
+	// The firmware is stretching a smaller console onto the timing (its
+	// scaler in AUTOCAL mode): turn the scaler off with the switch. Not
+	// otherwise: at the monitor's native size the firmware runs the scaler
+	// 1:1 (DSCL_MODE 1), and its request timing goes with that.
+	bool        scalerOff;
 };
 
 // The first DP_VID_M (against a DP_VID_N of 0x8000) of a stream on a link with
