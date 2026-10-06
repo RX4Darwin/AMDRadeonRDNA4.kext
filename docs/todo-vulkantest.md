@@ -1,8 +1,8 @@
 # Card tests for the Vulkan interface
 
 Written 2026-10-06. **All four boots passed on the card the same day** (below): the memory half, the driver's
-first work, a rendered triangle read back, and a picture on the display. Nothing of this guide is left to run; it
-stays as the record and as the way to repeat the tests.
+first work, a rendered triangle read back, and a picture on the display. Left to run: two more runs of boot 4 at other display settings, near the end. Otherwise this is the record and
+the way to repeat the tests.
 
 Rig as before: RX 9070 XT (revision 0xC0), Big Sur 11.6.6. Both displays come up next to the compute bring-up
 (verified in boot 1). Do not let the machine sleep during these boots: the compute runtime does not survive sleep
@@ -333,6 +333,18 @@ What failure looks like, and what to do:
 - **The desktop does not come back** though the program has ended. The log's `vulkan: display given back` line
   says whether the kext believes it did. A reboot restores it (a resolution switch does not: it leaves the
   plane's address alone). Take the log first, from the Lenovo or over SSH.
+
+## Two more runs of boot 4, no new code
+
+What boot 4 did not cover, each one run of the same command with the Samsung set differently first:
+
+- **3840x2160** (the "1920x1080" HiDPI setting): each frame is then a 33 MiB copy. Does `show:` still say 60 a
+  second, and is the motion smooth?
+- **2560x1440 at 120 Hz** (`/usr/bin/python tools/cgmode.py` lists the modes): does `show:` say 120 a second?
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib show 2>&1 | tee vkprobe.txt
+```
 
 ## After the tests
 
