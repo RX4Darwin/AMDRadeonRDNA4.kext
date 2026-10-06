@@ -30,6 +30,12 @@ struct HostBackend {
 	uint32_t finishedSequence = 0, lastSequence = 0, lastCount = 0, busyReplies = 0, submitReply = N48N::kSuccess;
 	N48N::Ib lastIbs[N48N_MAX_IBS] {};
 
+	// The display: 2560x1440 showing the console; a buffer shown appears one frame later.
+	static constexpr uint64_t kConsole = 0x8000000000ull;
+	uint64_t shown = kConsole, frame = 100;
+	uint32_t planeWidth = 2560, planeHeight = 1440, showReply = N48N::kSuccess;
+	bool     displayTaken = false, displayElsewhere = false;
+
 	void *bytesOf(const N48N::Memory &m) { return memory.count(m.token) ? memory[m.token] : nullptr; }
 
 	N48N::Backend backend() {
@@ -41,7 +47,7 @@ struct HostBackend {
 			if (!visible && (!highAllowed || h->highUsed + bytes > kHigh))
 				return false;
 			(visible ? h->visibleUsed : h->highUsed) += bytes;
-			out = N48N::Memory { h->nextPhysical, h->nextPhysical, false, visible, !visible };
+			out = N48N::Memory { h->nextPhysical, h->nextPhysical, false, visible, !visible, 0x9000000000ull + h->nextPhysical };
 			h->nextPhysical += bytes;
 			h->memory[out.token] = calloc(1, bytes);
 			return true;
@@ -118,6 +124,40 @@ struct HostBackend {
 		};
 		b.store = [](void *c, const N48N::Memory &m, uint64_t offset, uint64_t value) {
 			memcpy(static_cast<uint8_t *>(static_cast<HostBackend *>(c)->bytesOf(m)) + offset, &value, sizeof(value));
+		};
+		b.scanQuery = [](void *c, n48n_scan_query &q) {
+			auto *h = static_cast<HostBackend *>(c);
+			q = n48n_scan_query {};
+			q.h_active = q.plane_w = q.pitch_px = h->planeWidth;
+			q.v_active = q.plane_h = h->planeHeight;
+			q.h_total = 2720; q.v_total = 1481; q.refresh_mhz = 60000; q.pix_clk_khz = 241700;
+			q.hubp_format = N48N_SCAN_FMT_ARGB8888;
+			q.flags = N48N_SCANQ_LIT | N48N_SCANQ_GEOM_OK;
+			q.frame_count = h->frame;
+			q.console_mc = kConsole;
+			q.plane_mc = q.earliest_mc = h->shown;
+			return true;
+		};
+		b.scanAcquire = [](void *c) -> uint32_t {
+			auto *h = static_cast<HostBackend *>(c);
+			if (h->displayElsewhere)
+				return N48N::kBusy;
+			h->displayTaken = true;
+			return N48N::kSuccess;
+		};
+		b.scanShow = [](void *c, uint64_t address, uint32_t width, uint32_t height, uint32_t pitchBytes, uint64_t &frame) -> uint32_t {
+			auto *h = static_cast<HostBackend *>(c);
+			if (h->showReply != N48N::kSuccess || width != h->planeWidth || height != h->planeHeight || pitchBytes != width * 4)
+				return h->showReply != N48N::kSuccess ? h->showReply : N48N::kNotReady;
+			h->shown = address;
+			frame = ++h->frame;
+			return N48N::kSuccess;
+		};
+		b.scanRelease = [](void *c) {
+			auto *h = static_cast<HostBackend *>(c);
+			h->shown = kConsole;
+			h->displayTaken = false;
+			return true;
 		};
 		return b;
 	}

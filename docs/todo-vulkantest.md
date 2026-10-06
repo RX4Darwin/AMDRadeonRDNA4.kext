@@ -1,8 +1,7 @@
 # Card tests for the Vulkan interface
 
-Written 2026-10-06. **All three boots passed on the card the same day** (below): the memory half, the driver's
-first work, and a rendered triangle read back. Nothing of this guide is left to run; it stays as the record and as
-the way to repeat the tests.
+Written 2026-10-06. **Boots 1 to 3 passed on the card the same day** (below): the memory half, the driver's
+first work, and a rendered triangle read back. Still to run: boot 4, a picture on the display.
 
 Rig as before: RX 9070 XT (revision 0xC0), Big Sur 11.6.6. Both displays come up next to the compute bring-up
 (verified in boot 1). Do not let the machine sleep during these boots: the compute runtime does not survive sleep
@@ -273,6 +272,52 @@ What failure looks like:
 - `triangle: ... NOT AS DRAWN`: the counts say which part is wrong. All pixels `0x11111111`: the copy back did
   not happen. All blue: the clear ran and the triangle did not appear. Other colours: the picture or the copy is
   garbled; the two sample pixels help tell which.
+
+## Boot 4: a picture on the display
+
+`vkprobe` has a `show` mode: after its usual checks it takes the boot display, shows a red triangle sliding over a
+dark blue ground for five seconds, and gives the desktop back. Each frame is drawn into an image of the display's
+size, copied into one of two buffers and shown at a vertical blank (`docs/vulkan-port.md` section 10).
+
+A new kext is needed for this one (the display calls are new), with the firmware in it as before, and the new
+`build/vkprobe`; the library is unchanged. Same boot-args. Start it from a terminal **on the Lenovo, or over
+SSH**: the Samsung shows the program's picture while it runs, and if the desktop should not come back you still
+have a screen to work from. In the first two or three minutes after login:
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib show 2>&1 | tee vkprobe.txt
+```
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+Report:
+
+1. Did the Samsung show a dark blue screen with a red triangle moving steadily to the right? Smooth, or
+   stuttering or tearing?
+2. Did the desktop come back by itself after about five seconds, looking as before?
+3. Was the mouse pointer visible over the picture? (Expected with `rdna4-cursor=1`.)
+4. `vkprobe.txt` and the log.
+
+The new lines read `display: 3840x2160, pitch 3840 pixels, pipe 0, showing 0x...` and `show: N frames in 5.00 s
+(F a second), the display counted M; the desktop (0x...) given back: yes: ok`. `F` near the display's refresh
+rate means every frame made its vertical blank; half of it, that a frame takes longer than one refresh.
+
+Lines to find in the log: `vulkan: display taken: OTG0 HUBP0, 3840x2160 pitch 3840, the desktop at 0x...` and
+`vulkan: display given back: the plane shows 0x...`, and no `flip: failure:` line between them.
+
+What failure looks like, and what to do:
+
+- The program stops with `scanAcquire ... -> -N` or `scanRegister ... -> -N`: the display was not taken or a
+  buffer was refused; nothing changed on the screen.
+- `scanPresent ... -> -N` and `flip: failure: vulkan present ...` in the log: the flip did not confirm. The
+  program gives the display back and ends; the `flip:` line says which step.
+- The picture is wrong (colours, a shifted or torn image, garbage): describe it, or photograph it; the readback
+  test just before it passed in the same run, so the difference is in the copy or the display's read of it.
+- **The desktop does not come back** though the program has ended. The log's `vulkan: display given back` line
+  says whether the kext believes it did. A reboot restores it (a resolution switch does not: it leaves the
+  plane's address alone). Take the log first, from the Lenovo or over SSH.
 
 ## After the tests
 

@@ -58,6 +58,7 @@ void Client::close() {
 	if (!opened)
 		return;
 	(void)quiesce();
+	(void)scanGiveBack();
 	for (uint32_t h = 1; h < N48N_MAX_BOS; h++)
 		if (buffers[h].bytes)
 			be.free(be.context, buffers[h].memory, buffers[h].bytes);
@@ -122,6 +123,12 @@ uint32_t Client::release(uint32_t handle) {
 	// ponytail: work on the queue may use any buffer, so all of it is waited for; a list of each submission's
 	// buffers if freeing while the queue is busy turns out to matter.
 	(void)quiesce();
+	// A buffer registered for the display may be the one shown: the display goes back first, all of it.
+	for (const Slot &slot : slots)
+		if (slot.used && slot.handle == handle) {
+			(void)scanGiveBack();
+			break;
+		}
 	// Its mappings go first, and the GPU must have forgotten them before the memory is anyone else's.
 	bool mapped = false;
 	for (Map &m : maps)
@@ -383,6 +390,134 @@ uint32_t Client::submit(const void *structIn, size_t structInSize, uint64_t *out
 	return kSuccess;
 }
 
+// The plane back to what it showed before the client took it, and every registration dropped. True if there was
+// nothing to give back or the display confirms it.
+bool Client::scanGiveBack() {
+	const bool was = scanAcquired;
+	scanAcquired = false;
+	scanFront = N48N_SCAN_NO_SLOT;
+	for (Slot &slot : slots)
+		slot = Slot {};
+	return !was || be.scanRelease(be.context);
+}
+
+// Selectors 9 to 14, their shapes already checked. A buffer is shown by the display's own address for it, not
+// through the client's page table: it has to be VRAM, and of exactly the shape the plane had when it was taken.
+uint32_t Client::scan(uint32_t selector, const uint64_t *in, const void *structIn, uint64_t *out, void *structOut) {
+	n48n_scan_query q {};
+	const bool live = be.scanQuery(be.context, q);
+	switch (selector) {
+	case N48N_SEL_SCAN_QUERY:
+		if (!live)
+			return kNotReady;
+		q.acquired = scanAcquired;
+		q.flags |= scanAcquired ? N48N_SCANQ_ACQUIRED : 0;
+		if (scanAcquired)
+			q.console_mc = scanConsole;
+		__builtin_memcpy(structOut, &q, sizeof(q));
+		return kSuccess;
+	case N48N_SEL_SCAN_ACQUIRE: {
+		if (in[0] != 0)
+			return kBadArgument;
+		if (scanAcquired)
+			return kBusy;
+		if (!live || !(q.flags & N48N_SCANQ_LIT) || !(q.flags & N48N_SCANQ_GEOM_OK))
+			return kNotReady;
+		const uint32_t r = be.scanAcquire(be.context);
+		if (r != kSuccess)
+			return r;
+		scanAcquired = true;
+		scanWidth = q.plane_w;
+		scanHeight = q.plane_h;
+		scanPitchBytes = q.pitch_px * 4;
+		scanConsole = q.plane_mc;
+		out[0] = scanConsole;
+		out[1] = q.frame_count;
+		return kSuccess;
+	}
+	case N48N_SEL_SCAN_REGISTER: {
+		if (!scanAcquired)
+			return kNotReady;
+		const n48n_scan_reg r = read<n48n_scan_reg>(structIn);
+		if (r.reserved0 || r.format != N48N_SCAN_FMT_ARGB8888 || r.width != scanWidth || r.height != scanHeight ||
+		    r.pitch_bytes != scanPitchBytes)
+			return kBadArgument;
+		const Buffer *b = buffer(r.handle);
+		if (!b)
+			return kNotFound;
+		const uint64_t bytes = static_cast<uint64_t>(r.pitch_bytes) * r.height;
+		if (!b->memory.scanout || r.offset > b->bytes || bytes > b->bytes - r.offset)
+			return kBadArgument;
+		const uint64_t address = b->memory.scanout + r.offset;
+		if (address & (kPage - 1))
+			return kBadArgument;
+		Slot *slot = nullptr;
+		for (Slot &s : slots) {
+			if (s.used && s.address == address)
+				return kBadArgument;
+			if (!s.used && !slot)
+				slot = &s;
+		}
+		if (!slot)
+			return kNoResources;
+		*slot = Slot { address, 0, r.handle, 0, true };
+		out[0] = static_cast<uint64_t>(slot - slots);
+		out[1] = address;
+		return kSuccess;
+	}
+	case N48N_SEL_SCAN_PRESENT: {
+		if (!scanAcquired)
+			return kNotReady;
+		if (in[1] != 0 || in[0] >= N48N_SCAN_MAX_SLOTS || !slots[in[0]].used) {
+			scanRefused++;
+			return kBadArgument;
+		}
+		Slot &slot = slots[in[0]];
+		uint64_t frame = 0;
+		const uint32_t r = be.scanShow(be.context, slot.address, scanWidth, scanHeight, scanPitchBytes, frame);
+		if (r != kSuccess) {
+			scanRefused++;
+			return r;
+		}
+		scanFront = static_cast<uint32_t>(in[0]);
+		slot.presents++;
+		slot.latchedFrame = frame;
+		out[0] = ++scanPresents;
+		out[1] = frame;
+		out[2] = 0;       // no count of vertical-blank interrupts is kept: the call returns when the picture is up
+		return kSuccess;
+	}
+	case N48N_SEL_SCAN_STATUS: {
+		n48n_scan_status st {};
+		st.acquired = scanAcquired;
+		st.front_slot = scanFront;
+		st.pending_slot = N48N_SCAN_NO_SLOT;      // a present is on the display when its call returns
+		st.frame_count = q.frame_count;
+		st.console_mc = scanAcquired ? scanConsole : q.plane_mc;
+		st.plane_mc = q.plane_mc;
+		st.earliest_mc = q.earliest_mc;
+		st.presents = st.latched = st.latch_poll = scanPresents;
+		st.refused = scanRefused;
+		for (uint32_t i = 0; i < N48N_SCAN_MAX_SLOTS; i++) {
+			const Slot &slot = slots[i];
+			st.slot[i].mc = slot.address;
+			st.slot[i].latched_frame = slot.latchedFrame;
+			st.slot[i].used = slot.used;
+			st.slot[i].flags = !slot.used ? 0 : i == scanFront ? N48N_SCANSLOT_INUSE : N48N_SCANSLOT_REUSABLE;
+			st.slot[i].presents = st.slot[i].latches = slot.presents;
+		}
+		__builtin_memcpy(structOut, &st, sizeof(st));
+		return kSuccess;
+	}
+	default: {   // N48N_SEL_SCAN_RELEASE: also when nothing is held
+		out[0] = scanGiveBack();
+		n48n_scan_query after {};
+		out[1] = be.scanQuery(be.context, after) ? after.plane_mc : 0;
+		return kSuccess;
+	}
+	}
+}
+
 uint32_t Client::call(uint32_t selector, const uint64_t *in, uint32_t nIn, const void *structIn, size_t structInSize,
                       uint64_t *out, uint32_t *nOut, void *structOut, size_t *structOutSize) {
 	const uint32_t outRoom = nOut ? *nOut : 0;
@@ -453,8 +588,20 @@ uint32_t Client::call(uint32_t selector, const uint64_t *in, uint32_t nIn, const
 		out[2] = emitted;
 		return kSuccess;
 	}
+	case N48N_SEL_SCAN_QUERY:
+		return shape(0, 0, 0, sizeof(n48n_scan_query)) ? scan(selector, in, structIn, out, structOut) : kBadArgument;
+	case N48N_SEL_SCAN_ACQUIRE:
+		return shape(1, 2, 0, 0) ? scan(selector, in, structIn, out, structOut) : kBadArgument;
+	case N48N_SEL_SCAN_REGISTER:
+		return shape(0, 2, sizeof(n48n_scan_reg), 0) ? scan(selector, in, structIn, out, structOut) : kBadArgument;
+	case N48N_SEL_SCAN_PRESENT:
+		return shape(2, 3, 0, 0) ? scan(selector, in, structIn, out, structOut) : kBadArgument;
+	case N48N_SEL_SCAN_STATUS:
+		return shape(0, 0, 0, sizeof(n48n_scan_status)) ? scan(selector, in, structIn, out, structOut) : kBadArgument;
+	case N48N_SEL_SCAN_RELEASE:
+		return shape(0, 2, 0, 0) ? scan(selector, in, structIn, out, structOut) : kBadArgument;
 	default:
-		// The rest of the interface (showing a picture, importing memory) is not here.
+		// The rest of the interface (clock and mode experiments, importing memory) is not here.
 		return kUnsupported;
 	}
 }

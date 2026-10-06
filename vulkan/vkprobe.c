@@ -4,7 +4,8 @@
 //
 //  Drives the RADV Darwin build directly through its ICD entry point (no Vulkan loader needed): instance, the
 //  one device, a buffer with memory, two fills of it by the GPU and a triangle drawn into an image and copied back,
-//  each submitted, waited for and checked.
+//  each submitted, waited for and checked. With "show [seconds]" after the library's path it then puts a moving
+//  triangle on the boot display for that long (5 s) and gives the desktop back.
 //
 //    make mesa        (the driver and this program, into build/), or by hand:
 //    clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -I <work>/mesa/include vulkan/vkprobe.c -o vkprobe
@@ -20,9 +21,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
+#include "navi48_native_abi.h"
 #include "shaders/vkprobe_frag.h"   /* shaders/vkprobe.frag and .vert through glslangValidator -V --vn */
 #include "shaders/vkprobe_vert.h"
 
@@ -207,6 +210,131 @@ int main(int argc, char **argv) {
 	printf("triangle: %u red, %u blue, %u other of %u pixels; (8,8) 0x%08x, (56,56) 0x%08x: %s\n", red, blue, other, kSide * kSide,
 	       px[8 * kSide + 8], px[56 * kSide + 56], drawn ? "ok" : "NOT AS DRAWN");
 	wrong += !drawn;
+
+	/* "show [seconds]" after the library's path: a picture on the boot display. The display's plane is taken
+	 * through the functions the driver exports for that (radv_darwin_scanout_*), a triangle slides over a dark
+	 * blue ground, each frame drawn into an image of the display's size, copied into one of two buffers the
+	 * display can read and shown at a vertical blank, and the desktop is given back at the end. */
+	if (argc > 2 && !strcmp(argv[2], "show")) {
+		const double seconds = argc > 3 ? atof(argv[3]) : 5;
+		int (*scanQuery)(VkDevice, struct n48n_scan_query *) = dlsym(lib, "radv_darwin_scanout_query");
+		int (*scanAcquire)(VkDevice, uint64_t *, uint64_t *) = dlsym(lib, "radv_darwin_scanout_acquire");
+		int (*scanRegister)(VkDevice, VkDeviceMemory, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t *, uint64_t *) =
+			dlsym(lib, "radv_darwin_scanout_register");
+		int (*scanPresent)(VkDevice, uint32_t, uint64_t *) = dlsym(lib, "radv_darwin_scanout_present");
+		int (*scanRelease)(VkDevice, uint64_t *) = dlsym(lib, "radv_darwin_scanout_release");
+		int bad = !scanQuery || !scanAcquire || !scanRegister || !scanPresent || !scanRelease, taken = 0;
+#define Q(call) do { if (!bad) { int r_ = (int)(call); if (r_ < 0) { printf("%s -> %d\n", #call, r_); bad = 1; } } } while (0)
+		struct n48n_scan_query sq;
+		memset(&sq, 0, sizeof(sq));
+		Q(scanQuery(dev, &sq));
+		const uint32_t w = sq.plane_w, h = sq.plane_h;
+		const VkDeviceSize bytes = (VkDeviceSize)sq.pitch_px * 4 * h;
+		printf("display: %ux%u, pitch %u pixels, pipe %u, showing 0x%llx\n", w, h, sq.pitch_px, sq.otg, (unsigned long long)sq.plane_mc);
+		bad |= !w || !h || !(sq.flags & N48N_SCANQ_GEOM_OK);
+
+		/* The display's bytes are B, G, R, A. */
+		const VkFormat shown = VK_FORMAT_B8G8R8A8_UNORM;
+		VkImage simage = VK_NULL_HANDLE; VkDeviceMemory smem = VK_NULL_HANDLE, bmem[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+		VkImageView sview = VK_NULL_HANDLE; VkPipeline spipeline = VK_NULL_HANDLE; VkBuffer sbuf[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+		VkCommandPool spool = VK_NULL_HANDLE; VkCommandBuffer scb = VK_NULL_HANDLE;
+		imi.format = shown; imi.extent.width = w; imi.extent.height = h;
+		Q(vkCreateImage(dev, &imi, 0, &simage));
+		if (!bad) {
+			vkGetImageMemoryRequirements(dev, simage, &imr);
+			VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, imr.size, itype };
+			Q(vkAllocateMemory(dev, &ai, 0, &smem));
+			Q(vkBindImageMemory(dev, simage, smem, 0));
+			ivi.image = simage; ivi.format = shown;
+			Q(vkCreateImageView(dev, &ivi, 0, &sview));
+		}
+		VkPipelineRenderingCreateInfo starget = target;
+		starget.pColorAttachmentFormats = &shown;
+		VkGraphicsPipelineCreateInfo sgpi = gpi;
+		sgpi.pNext = &starget;
+		Q(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &sgpi, 0, &spipeline));
+		/* Two buffers to show in turn: VRAM, which need not be within the CPU's reach. */
+		uint32_t slot[2] = { 0, 0 };
+		for (int i = 0; i < 2 && !bad; i++) {
+			VkBufferCreateInfo sbi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+			Q(vkCreateBuffer(dev, &sbi, 0, &sbuf[i]));
+			if (bad)
+				break;
+			VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev, sbuf[i], &br);
+			uint32_t btype = 0;
+			for (uint32_t t = 0; t < mp.memoryTypeCount; t++)
+				if ((br.memoryTypeBits >> t & 1) && (mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { btype = t; break; }
+			VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, br.size, btype };
+			Q(vkAllocateMemory(dev, &ai, 0, &bmem[i]));
+			Q(vkBindBufferMemory(dev, sbuf[i], bmem[i], 0));
+		}
+		VkCommandPoolCreateInfo spi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, 0, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, fam };
+		Q(vkCreateCommandPool(dev, &spi, 0, &spool));
+		VkCommandBufferAllocateInfo sai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, spool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
+		Q(vkAllocateCommandBuffers(dev, &sai, &scb));
+
+		uint64_t desktop = 0, frame0 = 0, where = 0, out3[3] = { 0, 0, 0 }, firstFrame = 0;
+		Q(scanAcquire(dev, &desktop, &frame0));
+		taken = !bad;
+		for (int i = 0; i < 2; i++)
+			Q(scanRegister(dev, bmem[i], 0, sq.pitch_px * 4, w, h, &slot[i], &where));
+		struct timespec t0, t1;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		t1 = t0;
+		uint32_t frames = 0;
+		const uint32_t side = h / 2;
+		while (!bad && (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9 < seconds) {
+			const uint32_t i = frames & 1;
+			VkCommandBufferBeginInfo sbegin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+			Q(vkBeginCommandBuffer(scb, &sbegin));
+			if (bad)
+				break;
+			VkImageMemoryBarrier in = toTarget, back = toSource;
+			in.image = back.image = simage;
+			vkCmdPipelineBarrier(scb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, 0, 0, 0, 1, &in);
+			const VkRenderingAttachmentInfo ground = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = sview,
+				.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+				.storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .color = { .float32 = { 0, 0, 0.25f, 1 } } } };
+			const VkRenderingInfo whole_ = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { w, h } }, .layerCount = 1,
+				.colorAttachmentCount = 1, .pColorAttachments = &ground };
+			vkCmdBeginRendering(scb, &whole_);
+			vkCmdBindPipeline(scb, VK_PIPELINE_BIND_POINT_GRAPHICS, spipeline);
+			const VkViewport sliding = { (float)((frames * 8) % (w - side)), (float)(h / 4), (float)side, (float)side, 0, 1 };
+			vkCmdSetViewport(scb, 0, 1, &sliding);
+			vkCmdSetScissor(scb, 0, 1, &whole_.renderArea);
+			vkCmdDraw(scb, 3, 1, 0, 0);
+			vkCmdEndRendering(scb);
+			vkCmdPipelineBarrier(scb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, &back);
+			const VkBufferImageCopy rows = { .bufferRowLength = sq.pitch_px, .bufferImageHeight = h,
+				.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { w, h, 1 } };
+			vkCmdCopyImageToBuffer(scb, simage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sbuf[i], 1, &rows);
+			Q(vkEndCommandBuffer(scb));
+			VkSubmitInfo ssi = { VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &scb };
+			Q(vkQueueSubmit(q, 1, &ssi, fence));
+			Q(vkWaitForFences(dev, 1, &fence, VK_TRUE, 3000000000ull));
+			Q(vkResetFences(dev, 1, &fence));
+			Q(scanPresent(dev, slot[i], out3));
+			if (!bad && !frames++)
+				firstFrame = out3[1];
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+		}
+		uint64_t given[2] = { 0, 0 };
+		if (taken && scanRelease)
+			(void)scanRelease(dev, given);
+		const double took = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+		const int showed = !bad && frames > 1 && given[0] == 1 && given[1] == desktop;
+		printf("show: %u frames in %.2f s (%.1f a second), the display counted %llu; the desktop (0x%llx) given back: %s: %s\n", frames,
+		       took, took > 0 ? frames / took : 0, (unsigned long long)((out3[1] - firstFrame) & 0xffffff), (unsigned long long)desktop,
+		       given[0] == 1 && given[1] == desktop ? "yes" : "NO", showed ? "ok" : "FAILED");
+		wrong += !showed;
+		OK(vkDeviceWaitIdle(dev));
+		vkDestroyCommandPool(dev, spool, 0); vkDestroyPipeline(dev, spipeline, 0); vkDestroyImageView(dev, sview, 0);
+		vkDestroyImage(dev, simage, 0); vkFreeMemory(dev, smem, 0);
+		for (int i = 0; i < 2; i++) { vkDestroyBuffer(dev, sbuf[i], 0); vkFreeMemory(dev, bmem[i], 0); }
+#undef Q
+	} else {
+		printf("the display was not asked for: add \"show\" after the library's path to put a picture on it\n");
+	}
 
 	OK(vkDeviceWaitIdle(dev));
 	vkDestroyPipeline(dev, pipeline, 0); vkDestroyPipelineLayout(dev, layout, 0); vkDestroyShaderModule(dev, vs, 0);

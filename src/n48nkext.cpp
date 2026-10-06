@@ -22,6 +22,10 @@
 //                             packet names the client's, and a last packet
 //                             reports the submission's sequence
 //
+//    a display                the boot display's plane, flipped to one of
+//                             the client's buffers with the runtime's flip
+//                             and given back at the release or the close
+//
 //  One client at a time, root only, and not together with rdna4-vm, whose
 //  clients use the same address-space numbers. What shows that the address
 //  space works before anything is drawn in it is the copy test at the end
@@ -31,7 +35,9 @@
 //
 
 #include "compute.hpp"
+#include "flip.hpp"
 #include "n48n.hpp"
+#include "pipe.hpp"
 #include "rdna4vulkan.h"
 #include "userclient.hpp"
 
@@ -52,6 +58,8 @@ constexpr uint32_t kBuild = 1;             // what Hello and QueryInfo report as
 constexpr uint64_t kPage = GpuVm::kPageBytes;
 constexpr uint32_t kBad = 0xffffffff;        // what RDNA4Compute::rd gives for a register it could not read
 // The copy test's command page sits below every address a client may map at (N48N::kVaFirst).
+// HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS and _HIGH (DMU segment 2), as src/flip.cpp has them.
+constexpr uint32_t kHubpSurfaceAddress = 0x060a, kHubpSurfaceAddressHigh = 0x060b;
 constexpr uint64_t kCopyTestVa = 0x1000;
 static_assert(kCopyTestVa + kPage <= N48N::kVaFirst, "the copy test's page is outside the client's range");
 
@@ -110,6 +118,8 @@ struct RDNA4Compute::N48nState {
 	uint64_t     fencePage;      // pool offset of the dword the graphics queue reports finished work in
 	uint32_t     ringDwords;     // what this client has put on the graphics ring since the ring last ran dry
 	uint32_t     ringSequence;   // the last sequence it put there
+	bool         scanTaken;      // the client has the display's plane; scanSurface is what it showed before
+	Flip::Surface scanSurface;
 	N48N::Client client;         // a few hundred KiB
 };
 
@@ -143,7 +153,7 @@ struct N48nBackend {
 		// The pool the CPU reaches is small: a buffer that does not need it goes past the BAR when it can.
 		if (highAllowed && c.devHeap.size() && c.devHeap.alloc(bytes, offset)) {
 			if (c.gpuPhysical(c.vramMc(offset), physical)) {
-				out = N48N::Memory { offset, physical, false, false, true };
+				out = N48N::Memory { offset, physical, false, false, true, c.vramMc(offset) };
 				return true;
 			}
 			c.devHeap.free(offset);
@@ -151,7 +161,7 @@ struct N48nBackend {
 		if (!c.heap.alloc(bytes, offset))
 			return false;
 		zero(c, offset, bytes);
-		out = N48N::Memory { offset, poolPhysical(c, offset), false, true, false };
+		out = N48N::Memory { offset, poolPhysical(c, offset), false, true, false, c.pool.mcAddress + offset };
 		return true;
 	}
 
@@ -167,7 +177,7 @@ struct N48nBackend {
 			return false;
 		}
 		bzero(s->memory->getBytesNoCopy(), bytes);   // it goes to a process: nothing of the kernel's in it
-		out = N48N::Memory { reinterpret_cast<uint64_t>(s), 0, true, true, false };
+		out = N48N::Memory { reinterpret_cast<uint64_t>(s), 0, true, true, false, 0 };
 		return true;
 	}
 
@@ -285,6 +295,89 @@ struct N48nBackend {
 		}
 	}
 
+	// The display a client may take: the lowest-numbered pipe that is running, which is the boot display. Its
+	// plane is flipped with the runtime's own flip (src/flip.cpp): the address written under the pipe's update
+	// lock, the latch and the next frame waited for. macOS goes on drawing its desktop into the console's
+	// memory, unseen, and gets the plane back at the release.
+	static uint32_t otgReg(const RDNA4Compute &c, const Flip::Surface &s, uint32_t dword) {
+		return c.rd(IpDiscovery::HwDmu, Reg { 2, dword + s.otg * Pipe::Reg::kOtgStride });
+	}
+	static bool scanQuery(void *context, n48n_scan_query &q) {
+		RDNA4Compute &c = of(context);
+		Flip::Surface s {};
+		if (!Flip::findPipe(c, s, false))
+			return false;
+		const uint32_t hTotal = otgReg(c, s, Pipe::Reg::kOtgHTotal), vTotal = otgReg(c, s, Pipe::Reg::kOtgVTotal);
+		const uint32_t hBlank = otgReg(c, s, Pipe::Reg::kOtgHBlank), vBlank = otgReg(c, s, Pipe::Reg::kOtgVBlank);
+		q = n48n_scan_query {};
+		q.h_total = hTotal == kBad ? 0 : (hTotal & 0x7fff) + 1;
+		q.v_total = vTotal == kBad ? 0 : (vTotal & 0x7fff) + 1;
+		// Blank START [14:0] is where the active picture ends, END [30:16] where it begins.
+		q.h_active = hBlank == kBad ? s.width : (hBlank & 0x7fff) - ((hBlank >> 16) & 0x7fff);
+		q.v_active = vBlank == kBad ? s.height : (vBlank & 0x7fff) - ((vBlank >> 16) & 0x7fff);
+		q.pitch_px = s.pitch;
+		// The format is not read: every plane the plugin or the firmware sets up is linear 8:8:8:8 without DCC.
+		q.hubp_format = N48N_SCAN_FMT_ARGB8888;
+		q.otg = s.otg;
+		q.flags = N48N_SCANQ_LIT | N48N_SCANQ_GEOM_OK;    // the refresh rate is left 0: not derived here
+		q.frame_count = otgReg(c, s, Pipe::Reg::kOtgFrameCount) & 0xffffff;
+		q.console_mc = c.n48n && c.n48n->scanTaken ? c.n48n->scanSurface.desktop : s.desktop;
+		q.plane_mc = q.earliest_mc = s.desktop;           // a flip is waited for, so the two are the same between calls
+		q.plane_w = s.width;
+		q.plane_h = s.height;
+		return true;
+	}
+	static uint32_t scanAcquire(void *context) {
+		RDNA4Compute &c = of(context);
+		RDNA4Compute::N48nState &n = *c.n48n;
+		if (c.presentActive)                              // the runtime's own Present has the plane
+			return N48N::kBusy;
+		if (!Flip::findPipe(c, n.scanSurface))
+			return N48N::kNotReady;
+		n.scanTaken = true;
+		VLOG("display taken: OTG%u HUBP%u, %ux%u pitch %u, the desktop at 0x%llx", n.scanSurface.otg, n.scanSurface.hubp,
+		     n.scanSurface.width, n.scanSurface.height, n.scanSurface.pitch, n.scanSurface.desktop);
+		return N48N::kSuccess;
+	}
+	static uint32_t scanShow(void *context, uint64_t address, uint32_t width, uint32_t height, uint32_t pitchBytes,
+	                         uint64_t &frame) {
+		RDNA4Compute &c = of(context);
+		const RDNA4Compute::N48nState &n = *c.n48n;
+		Flip::Surface s {};
+		// The plane has to be what it was when the client took it: macOS may have changed the mode since.
+		if (!n.scanTaken || !Flip::findPipe(c, s, false) || s.otg != n.scanSurface.otg || s.hubp != n.scanSurface.hubp ||
+		    s.width != width || s.height != height || s.pitch * 4 != pitchBytes)
+			return N48N::kNotReady;
+		if (!Flip::flipTo(c, s, address, "vulkan present", nullptr, true))
+			return N48N::kNotResponding;
+		frame = otgReg(c, s, Pipe::Reg::kOtgFrameCount) & 0xffffff;
+		return N48N::kSuccess;
+	}
+	static bool scanRelease(void *context) {
+		RDNA4Compute &c = of(context);
+		RDNA4Compute::N48nState &n = *c.n48n;
+		if (!n.scanTaken)
+			return true;
+		n.scanTaken = false;
+		Flip::Surface s {};
+		if (!Flip::findPipe(c, s, false))
+			return false;
+		// The plane goes back to the desktop's memory (it is there already if nothing was ever shown).
+		bool back = s.desktop == n.scanSurface.desktop || Flip::flipTo(c, s, n.scanSurface.desktop, "vulkan release");
+		if (!back) {
+			// The desktop must not stay hidden behind a flip that would not confirm: the address alone, without
+			// the lock and the checks, which the pipe takes at its next frame unless something holds its lock.
+			const uint32_t hubp = s.hubp * Pipe::Reg::kHubpStride;
+			c.wr(IpDiscovery::HwDmu, Reg { 2, kHubpSurfaceAddressHigh + hubp }, static_cast<uint32_t>(n.scanSurface.desktop >> 32));
+			c.wr(IpDiscovery::HwDmu, Reg { 2, kHubpSurfaceAddress + hubp }, static_cast<uint32_t>(n.scanSurface.desktop));
+			IOSleep(50);
+			Flip::Surface now {};
+			back = Flip::findPipe(c, now, false) && now.desktop == n.scanSurface.desktop;
+		}
+		VLOG("display given back: the plane shows 0x%llx%s", n.scanSurface.desktop, back ? "" : " NOT: the register did not take it");
+		return back;
+	}
+
 	static N48N::Backend make(RDNA4Compute *c) {
 		N48N::Backend b {};
 		b.context = c;
@@ -302,6 +395,10 @@ struct N48nBackend {
 		b.now = now;
 		b.pause = pause;
 		b.store = store;
+		b.scanQuery = scanQuery;
+		b.scanAcquire = scanAcquire;
+		b.scanShow = scanShow;
+		b.scanRelease = scanRelease;
 		return b;
 	}
 

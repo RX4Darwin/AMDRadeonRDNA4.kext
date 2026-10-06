@@ -51,7 +51,7 @@ constexpr uint32_t kMaxAddressBytes = 0xffffffffu;
 
 } // namespace
 
-bool findPipe(RDNA4Compute &compute, Surface &out) {
+bool findPipe(RDNA4Compute &compute, Surface &out, bool log) {
 	auto dmuRead = [&](uint8_t segment, uint32_t dword) {
 		return compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { segment, dword });
 	};
@@ -114,8 +114,9 @@ bool findPipe(RDNA4Compute &compute, Surface &out) {
 	}
 
 	out = found;
-	FLOG("pipe OTG%u OPP%u HUBP%u surface 0x%llx, %ux%u pitch %u (%llu bytes)",
-	     found.otg, opp, found.hubp, found.desktop, found.width, found.height, found.pitch, bytes);
+	if (log)
+		FLOG("pipe OTG%u OPP%u HUBP%u surface 0x%llx, %ux%u pitch %u (%llu bytes)",
+		     found.otg, opp, found.hubp, found.desktop, found.width, found.height, found.pitch, bytes);
 	return true;
 }
 

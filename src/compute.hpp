@@ -185,7 +185,7 @@ public:
 
 private:
 	friend bool Flip::run(RDNA4Compute &compute);
-	friend bool Flip::findPipe(RDNA4Compute &compute, Flip::Surface &out);
+	friend bool Flip::findPipe(RDNA4Compute &compute, Flip::Surface &out, bool log);
 	friend bool Flip::waitNextVblank(RDNA4Compute &compute, uint8_t otg, uint32_t timeoutMs,
 	                                uint64_t &frame);
 	friend bool Flip::flipTo(RDNA4Compute &compute, const Flip::Surface &surface,

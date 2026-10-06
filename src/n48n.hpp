@@ -4,10 +4,11 @@
 //
 //  The kernel half of the interface the RADV Darwin port speaks
 //  (vulkan/navi48_native_abi.h, "N48N"; docs/vulkan-port.md): one client's
-//  buffers, its GPU address space, its contexts and its work, behind the
-//  calls IOConnectCallMethod carries: selectors 0 to 8. What a command buffer
-//  may be and when work counts as lost is decided here; putting it on the
-//  graphics queue is the backend's.
+//  buffers, its GPU address space, its contexts, its work and the display it
+//  may show pictures on, behind the calls IOConnectCallMethod carries:
+//  selectors 0 to 14. What a command buffer may be, when work counts as
+//  lost and which buffer may be shown is decided here; the graphics queue
+//  and the display's registers are the backend's.
 //
 //  The rules each call enforces are the ones Mesa's own stand-in for the
 //  kext states (src/amd/common/darwin/ac_darwin_mock.c in the patched tree)
@@ -34,7 +35,7 @@ namespace N48N {
 // IOReturn values, as the interface's contract names them.
 constexpr uint32_t kSuccess = 0, kNoMemory = 0xe00002bd, kNoResources = 0xe00002be, kBadArgument = 0xe00002c2,
                    kUnsupported = 0xe00002c7, kBusy = 0xe00002d5, kTimeout = 0xe00002d6, kNotReady = 0xe00002d8,
-                   kAborted = 0xe00002eb, kNotFound = 0xe00002f0;
+                   kAborted = 0xe00002eb, kNotResponding = 0xe00002ed, kNotFound = 0xe00002f0;
 
 // Per-client limits, the ones their kext and Mesa's stand-in use.
 constexpr uint64_t kSystemCap = 512ull << 20, kSystemMaxBuffer = 64ull << 20;
@@ -51,6 +52,7 @@ struct Memory {
 	bool     system;       // system memory: its pages are wherever Backend::systemPage says
 	bool     cpuVisible;   // the CPU can map it
 	bool     high;         // VRAM from the pool the CPU cannot reach
+	uint64_t scanout;      // the address a display reads it by; 0 = it cannot be shown
 };
 
 struct Pools { uint64_t visibleTotal, visibleFree, highTotal, highFree; };
@@ -80,6 +82,17 @@ struct Backend {
 	void     (*pause)(void *context);        // a short sleep between two looks at `finished`
 	// Eight bytes into a buffer the CPU reaches (the fence a submission asked for).
 	void     (*store)(void *context, const Memory &m, uint64_t offset, uint64_t value);
+
+	// One display for the client's pictures. scanQuery: what it shows now, as the interface has it (the
+	// "acquired" fields are the caller's). scanAcquire: its plane is the client's from here on, kBusy if it is not
+	// to be had. scanShow: the buffer at `address`, of this shape, shown from the next vertical blank, which is
+	// waited for; the frame it appeared in. scanRelease: what the plane showed before is shown again (true if
+	// the display confirms it).
+	bool     (*scanQuery)(void *context, n48n_scan_query &q);
+	uint32_t (*scanAcquire)(void *context);
+	uint32_t (*scanShow)(void *context, uint64_t address, uint32_t width, uint32_t height, uint32_t pitchBytes,
+	                     uint64_t &frame);
+	bool     (*scanRelease)(void *context);
 };
 
 struct Buffer {
@@ -123,6 +136,12 @@ private:
 	bool     lost { false };
 	Job      jobs[N48N_FENCE_SLOTS] {};
 	uint32_t jobCount { 0 };
+	// The display: taken or not, the plane's shape when it was taken, and the buffers registered to be shown.
+	struct Slot { uint64_t address, latchedFrame; uint32_t handle, presents; bool used; };
+	bool     scanAcquired { false };
+	uint32_t scanWidth { 0 }, scanHeight { 0 }, scanPitchBytes { 0 }, scanFront { N48N_SCAN_NO_SLOT };
+	uint64_t scanConsole { 0 }, scanPresents { 0 }, scanRefused { 0 };
+	Slot     slots[N48N_SCAN_MAX_SLOTS] {};
 
 	uint32_t create(const n48n_gem_create_in &in, uint64_t *out);
 	uint32_t release(uint32_t handle);
@@ -133,6 +152,8 @@ private:
 	bool     covered(uint64_t va, uint64_t bytes) const;
 	void     retire();
 	uint32_t waitFor(uint64_t sequence, uint64_t timeoutNs);
+	uint32_t scan(uint32_t selector, const uint64_t *in, const void *structIn, uint64_t *out, void *structOut);
+	bool     scanGiveBack();
 	void     unmapTable(const Map &m);
 	void     reset();
 };

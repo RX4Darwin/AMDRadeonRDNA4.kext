@@ -15,7 +15,7 @@ This repository's own:
 | `mesa-patches/0007-*.patch` | The driver looks for this kext's service, `RDNA4ComputeService`, before `Navi48Bringup` (MIT, as Mesa) |
 | `n48nprobe.c` | The card test of the interface's memory half, without Mesa (`make n48nprobe`; `docs/vulkan-port.md` section 8) |
 | `build-mesa.sh` | Fetches Mesa at the right commit, applies the patches, builds the driver. `make mesa` runs it in `build/radv-build` and puts the library and `vkprobe` into `build/` |
-| `vkprobe.c` | A small Vulkan program that drives the built driver without a Vulkan loader: two fills by the GPU and a triangle drawn into an image, each submitted, waited for and checked |
+| `vkprobe.c` | A small Vulkan program that drives the built driver without a Vulkan loader: two fills by the GPU and a triangle drawn into an image, each submitted, waited for and checked; with `show`, a moving triangle on the boot display for five seconds |
 | `shaders/` | The triangle's vertex and fragment shader (`vkprobe.vert`, `vkprobe.frag`) and each compiled to SPIR-V as a header (`glslangValidator -V --vn`) |
 
 The first five patches (about 9,800 lines) add a macOS backend to RADV, Mesa's Vulkan driver for AMD cards. They
@@ -27,7 +27,7 @@ fences) plus calls to present to the screen.
 **Status: the driver runs against this kext on the card, offscreen.** On 2026-10-06 (Big Sur 11.6.6) it found
 the interface, created its device, ran two fills of a buffer (one by the command processor, one by a compute
 shader it compiled) and rendered a triangle into an image with a vertex and a fragment shader; all read back
-right. The kext's memory half is verified by `n48nprobe.c`. Showing a picture on a display has not been written.
+right. The kext's memory half is verified by `n48nprobe.c`. Showing a picture on the display is written (`vkprobe ... show`) and has not run there.
 `docs/vulkan-port.md` has what the port needs from the kext, the order of work and what each step showed;
 `docs/todo-vulkantest.md` is the record of the card tests and the way to repeat them.
 

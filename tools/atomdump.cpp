@@ -2435,6 +2435,79 @@ static int testN48N() {
 	                  host.finishedSequence == N48N_FENCE_SLOTS + 4 && !c.buffer(fenceBo),
 	                  "n48n: a buffer freed before the work on the queue had finished");
 
+	// The display. Handle 3 is 168 MiB of VRAM past the BAR: room for three pictures of 2560x1440.
+	const uint64_t picture = 2560ull * 1440 * 4, zero1[1] = { 0 }, one1[1] = { 1 };
+	n48n_scan_query sq {};
+	n48n_scan_status ss {};
+	auto show = [&](uint32_t handle, uint64_t offset, uint32_t width = 2560, uint32_t format = N48N_SCAN_FMT_ARGB8888) {
+		const n48n_scan_reg r { handle, 0, offset, width * 4, 1440, width, format };
+		return call(N48N_SEL_SCAN_REGISTER, nullptr, 0, &r, sizeof(r), 2, nullptr, 0);
+	};
+	auto present = [&](uint64_t slot, uint64_t flags = 0) {
+		const uint64_t in[2] = { slot, flags };
+		return call(N48N_SEL_SCAN_PRESENT, in, 2, nullptr, 0, 3, nullptr, 0);
+	};
+	auto scanRelease = [&] { return call(N48N_SEL_SCAN_RELEASE, nullptr, 0, nullptr, 0, 2, nullptr, 0); };
+	failures += check(call(N48N_SEL_SCAN_QUERY, nullptr, 0, nullptr, 0, 0, &sq, sizeof(sq)) == N48N::kSuccess && !sq.acquired &&
+	                  sq.plane_w == 2560 && sq.plane_mc == HostBackend::kConsole && show(3, 0) == N48N::kNotReady &&
+	                  present(0) == N48N::kNotReady && scanRelease() == N48N::kSuccess && out[0] == 1 &&
+	                  out[1] == HostBackend::kConsole && !host.displayTaken, "n48n: the display before it is taken");
+	host.displayElsewhere = true;
+	const uint32_t elsewhere = call(N48N_SEL_SCAN_ACQUIRE, zero1, 1, nullptr, 0, 2, nullptr, 0);
+	host.displayElsewhere = false;
+	failures += check(elsewhere == N48N::kBusy && call(N48N_SEL_SCAN_ACQUIRE, one1, 1, nullptr, 0, 2, nullptr, 0) == N48N::kBadArgument &&
+	                  call(N48N_SEL_SCAN_ACQUIRE, zero1, 1, nullptr, 0, 2, nullptr, 0) == N48N::kSuccess &&
+	                  out[0] == HostBackend::kConsole && out[1] == 100 && host.displayTaken &&
+	                  call(N48N_SEL_SCAN_ACQUIRE, zero1, 1, nullptr, 0, 2, nullptr, 0) == N48N::kBusy, "n48n: taking the display");
+	// Each rule by itself: one field off at a time, and a system buffer that is large enough.
+	auto showRaw = [&](void (*change)(n48n_scan_reg &)) {
+		n48n_scan_reg r { 3, 0, 0, 2560 * 4, 1440, 2560, N48N_SCAN_FMT_ARGB8888 };
+		change(r);
+		return call(N48N_SEL_SCAN_REGISTER, nullptr, 0, &r, sizeof(r), 2, nullptr, 0);
+	};
+	failures += check(create(picture, 0, N48N_GEM_DOMAIN_GTT, 0) == N48N::kSuccess && out[0] == 4 &&
+	                  show(4, 0) == N48N::kBadArgument &&                                         // system memory cannot be shown
+	                  showRaw([](n48n_scan_reg &r) { r.width = 1920; }) == N48N::kBadArgument &&
+	                  showRaw([](n48n_scan_reg &r) { r.height = 1080; }) == N48N::kBadArgument &&
+	                  showRaw([](n48n_scan_reg &r) { r.pitch_bytes = 2568 * 4; }) == N48N::kBadArgument &&
+	                  showRaw([](n48n_scan_reg &r) { r.reserved0 = 1; }) == N48N::kBadArgument,
+	                  "n48n: system memory, or a buffer of another shape than the plane, registered");
+	failures += check(show(3, 0, 2560, 10) == N48N::kBadArgument && show(9, 0) == N48N::kNotFound &&
+	                  show(1, 0) == N48N::kBadArgument &&                                        // too small
+	                  show(3, 0x100) == N48N::kBadArgument &&                                    // not on a page
+	                  show(3, HostBackend::kVisible - picture + 4096) == N48N::kBadArgument,     // runs off the buffer
+	                  "n48n: a buffer that cannot be shown registered");
+	const uint64_t base3 = c.buffer(3)->memory.scanout;
+	failures += check(show(3, 0) == N48N::kSuccess && out[0] == 0 && out[1] == base3 && show(3, 0) == N48N::kBadArgument &&
+	                  show(3, 16ull << 20) == N48N::kSuccess && out[0] == 1 && show(3, 32ull << 20) == N48N::kSuccess &&
+	                  out[0] == 2 && show(3, 48ull << 20) == N48N::kNoResources, "n48n: three buffers registered, no fourth");
+	failures += check(present(5) == N48N::kBadArgument && present(0, 1) == N48N::kBadArgument && host.shown == HostBackend::kConsole &&
+	                  present(1) == N48N::kSuccess && out[0] == 1 && out[1] == 101 && host.shown == base3 + (16ull << 20),
+	                  "n48n: Present -> id %llu in frame %llu", (unsigned long long)out[0], (unsigned long long)out[1]);
+	host.planeWidth = 1920;                    // the mode changed under the client
+	const uint32_t stale = present(2);
+	host.planeWidth = 2560;
+	failures += check(stale == N48N::kNotReady && host.shown == base3 + (16ull << 20) &&
+	                  call(N48N_SEL_SCAN_STATUS, nullptr, 0, nullptr, 0, 0, &ss, sizeof(ss)) == N48N::kSuccess && ss.acquired &&
+	                  ss.front_slot == 1 && ss.pending_slot == N48N_SCAN_NO_SLOT && ss.presents == 1 && ss.refused == 3 &&
+	                  ss.console_mc == HostBackend::kConsole && ss.plane_mc == base3 + (16ull << 20) &&
+	                  ss.slot[1].flags == N48N_SCANSLOT_INUSE && ss.slot[1].latched_frame == 101 &&
+	                  ss.slot[0].flags == N48N_SCANSLOT_REUSABLE && ss.slot[2].used,
+	                  "n48n: a present after the plane changed shape is refused; status: front %u, %llu refused", ss.front_slot,
+	                  (unsigned long long)ss.refused);
+	// Freeing the buffer on the display gives the display back first; so does a release, and so does the close.
+	const uint64_t free3[1] = { 3 };
+	failures += check(call(N48N_SEL_BOFREE, free3, 1, nullptr, 0, 0, nullptr, 0) == N48N::kSuccess &&
+	                  host.shown == HostBackend::kConsole && !host.displayTaken && present(1) == N48N::kNotReady &&
+	                  call(N48N_SEL_SCAN_STATUS, nullptr, 0, nullptr, 0, 0, &ss, sizeof(ss)) == N48N::kSuccess && !ss.acquired &&
+	                  !ss.slot[1].used && ss.front_slot == N48N_SCAN_NO_SLOT, "n48n: the shown buffer freed: the display goes back");
+	failures += check(create(picture, 0, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kSuccess && out[0] == 3 &&
+	                  call(N48N_SEL_SCAN_ACQUIRE, zero1, 1, nullptr, 0, 2, nullptr, 0) == N48N::kSuccess && show(3, 0) == N48N::kSuccess &&
+	                  present(0) == N48N::kSuccess && host.shown == c.buffer(3)->memory.scanout &&
+	                  scanRelease() == N48N::kSuccess && out[0] == 1 && out[1] == HostBackend::kConsole && !host.displayTaken &&
+	                  call(N48N_SEL_SCAN_ACQUIRE, zero1, 1, nullptr, 0, 2, nullptr, 0) == N48N::kSuccess && show(3, 0) == N48N::kSuccess &&
+	                  present(0) == N48N::kSuccess && host.displayTaken, "n48n: release, and the display taken again for the close");
+
 	// Work that never finishes: ten seconds without progress and it is lost, for good.
 	Cs plainCs = good;
 	plainCs.h.flags = plainCs.h.fence_handle = plainCs.h.fence_offset = 0;
@@ -2455,9 +2528,10 @@ static int testN48N() {
 
 	// Closing gives everything back: buffers, every table page, the root.
 	c.close();
-	failures += check(host.memory.empty() && host.tablePages == 0 && host.visibleUsed == 0 && host.highUsed == 0,
-	                  "n48n: close left %zu allocation(s), %llu table page(s)", host.memory.size(),
-	                  (unsigned long long)host.tablePages);
+	failures += check(host.memory.empty() && host.tablePages == 0 && host.visibleUsed == 0 && host.highUsed == 0 &&
+	                  host.shown == HostBackend::kConsole && !host.displayTaken,
+	                  "n48n: close left %zu allocation(s), %llu table page(s), the display %s", host.memory.size(),
+	                  (unsigned long long)host.tablePages, host.displayTaken ? "taken" : "given back");
 
 	// The table by itself: three pages across a 2 MiB boundary need two last-level tables.
 	uint64_t root = 0;
@@ -2469,7 +2543,7 @@ static int testN48N() {
 	ok = ok && !GpuVm::walk(root, 0x200000, readEntry, &host, phys, entry) && GpuVm::walk(root, 0x1ff000, readEntry, &host, phys, entry);
 	VmTree::destroy(pages, root);
 	failures += check(ok && host.tablePages == 0 && host.memory.empty(), "vmtree: map, unmap and destroy across a table boundary");
-	printf("n48n: the Vulkan interface (memory, work) and its page table %s\n", failures ? "MISMATCH" : "ok");
+	printf("n48n: the Vulkan interface (memory, work, display) and its page table %s\n", failures ? "MISMATCH" : "ok");
 	return failures;
 }
 

@@ -1,9 +1,9 @@
 # Vulkan on this kext: taking the RADV Darwin port
 
-Written 2026-10-06. Sections 1 to 5 are from reading source and notes; sections 6 to 9 report what was built and
+Written 2026-10-06. Sections 1 to 5 are from reading source and notes; sections 6 to 10 report what was built and
 run since. On the card so far (2026-10-06): the memory half and its copy test (section 8), and the driver's work
 through submit and wait, two fills and a rendered triangle read back (section 9). Showing a picture on a display
-is next. The other project's claims are its own and unverified.
+(section 10) is written and has not run there. The other project's claims are its own and unverified.
 
 ## 1. The decision
 
@@ -77,7 +77,9 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
    2026-10-06: `vkprobe` said "done: all ok"** for a fill by the command processor, one by a compute shader, and
    a triangle rendered into an image and read back with exactly the right pixels (`docs/todo-vulkantest.md`).
    This was the step that met the open blocker.
-3. **Present** through the flip path. Shows: a Vulkan program's picture on a display.
+3. **Present** through the flip path. Written 2026-10-06 and checked on a host, **not run on the card**,
+   section 10. Shows on the card: `vkprobe ... show` puts a moving triangle on the boot display for five seconds
+   and the desktop comes back.
 4. Then the Metal side of `docs/metal-phase-plan.md`, with Vulkan as the executor.
 
 ## 5. Open questions
@@ -304,4 +306,54 @@ The copy test of section 8 is there to tell a broken address space from a broken
    from `vulkan/build-mesa.sh` copied over. `docs/real-card-plan.md` ran its graphics-ring boots with
    `rdna4-ih=2 rdna4-hang=1` as well.
 
-The guide for both boots, with what to look for and what failure looks like: `docs/todo-vulkantest.md`.
+The guide for the card tests, with what to look for and what failure looks like: `docs/todo-vulkantest.md`.
+
+## 10. Step 3: a picture on a display (2026-10-06, not run on the card)
+
+The interface's way of showing a picture is not a Vulkan swapchain. The driver exports six functions
+(`radv_darwin_scanout_*`, selectors 9 to 14): ask what the display shows, take its plane, register up to three
+buffers of exactly the plane's shape, show one of them at a vertical blank, ask how that went, give the plane
+back. A program renders into an image, copies it into a registered buffer and presents that.
+
+**The engine** (`src/n48n.cpp`) keeps the rules: a buffer can only be registered once the display is taken; it
+must be VRAM (the display reads it by its own address, not through the client's page table), page aligned, and
+hold a whole picture of the width, height and pitch the plane had when it was taken, 8:8:8:8. Freeing a
+registered buffer, a release and the close all give the display back first. Two things differ from the reference
+kext, both on purpose:
+
+- **VRAM past the BAR may be shown**, not only the pool the CPU reaches. That pool is 96 MiB here and a 4K
+  picture is 33 MiB; nothing about scan-out needs the CPU to reach the buffer.
+- **A present returns when the picture is on the display.** There is no pending state and no count of
+  vertical-blank interrupts; the frame it appeared in comes back with the call.
+
+**On the card** (`src/n48nkext.cpp`) the display is the lowest-numbered pipe that is running, which is the boot
+display, and the flip is the runtime's own (`Flip::findPipe`, `Flip::flipTo` in `src/flip.cpp`, which ran on the
+card in September): the new address written under the pipe's update lock, the latch and the next frame waited
+for. Before every present the plane is looked at again, and a present is refused if its shape is no longer what
+the client registered for (macOS changed the mode). macOS goes on drawing its desktop into the console's memory,
+unseen; a hardware cursor stays on top. Giving the display back flips to the address the plane had when it was
+taken; if that flip does not confirm, the address is written without the lock and the checks, so the desktop does
+not stay hidden. It refuses to take the display while the runtime's own `Present` has it.
+
+**Checked on a host.** `make test`: the calls before the display is taken, taking it (and not twice, and not
+when it is not to be had), seven kinds of buffer that cannot be shown (system memory, another width, height or
+pitch, off a page, too small, off the buffer's end), three buffers and no fourth, a present and the status after
+it, a present refused after the plane changed shape, and the display given back by freeing the shown buffer, by a
+release and by the close. Five planted faults were caught, two of them only after the test's cases were made to
+check one rule each. `vulkan/vkprobe.c` has a `show` mode (a triangle sliding over a dark blue ground, an image of
+the display's size, two buffers shown in turn); with it the real driver ran 350,000 frames in a second against
+the engine's stand-in display, none refused, the display given back, nothing left behind.
+
+**Not known until it runs on the card**
+
+- Whether the flip works on a pipe the plugin's mode-set engine has programmed; in September it ran on the pipe
+  as the firmware left it.
+- Whether a frame at 3840x2160 (the draw, and a 33 MiB copy by a compute shader) fits into one refresh.
+- The plugin's cursor code and the flip do not share a lock. The cursor path does not take the pipe's update
+  lock, so no clash is expected; it has not been tried.
+
+**Limits.** One display, the boot display; the second is not offered. The refresh rate is reported as unknown.
+A mode switch by macOS while a program holds the display leaves the program's last picture up, at the new mode's
+shape, until the program releases or exits. The reference's status counters for interrupts, repeats and
+watchdogs stay zero.
+
