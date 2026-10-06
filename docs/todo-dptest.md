@@ -169,22 +169,33 @@ equally responsive on both screens. So it is the number of pixels macOS has to d
 and not that pipe. 1920x1080 HiDPI on a 4K panel will stay sluggish in heavy applications until there is
 acceleration; 2560x1440 is the workable setting until then.
 
-### Test 5b: 2560x1440 on the Samsung, top of the picture
+### Test 5b: the top of the picture in the Samsung's smaller modes
 
-At that 2560x1440 the menu bar was cut off at the top of the screen. The mode had been confirmed good on
-2026-10-04. What changed in between: since the scaler fix of 2026-10-06 every mode switch on the boot display put
-the scaler into bypass, also on a normal boot, where the firmware runs it 1:1 and its request timing goes with
-that. The switch now leaves the scaler alone unless the firmware was stretching the console (kext UUID
-`42047888-...` or later). That this was the cause is not confirmed; this test confirms or refutes it. After every
-switch of the boot display the log now has a line `modes: scaler mode ... viewport ... recout ...`.
+At 2560x1440 the menu bar is cut off at the top of the screen: only its bottom edge shows. At 1920x1080 (the real
+mode, not HiDPI) it is cut off too, a little less.
 
-Usual boot-args, Samsung on DisplayPort:
+Ruled out on the card 2026-10-06 (kext `42047888-...`): the scaler. With the scaler left exactly as the firmware
+has it, the top was still cut off, and the log line after the switch shows the rectangles right
+(`modes: scaler mode 0x00000001 autocal 0x00000000; viewport 0x05a00a00 at 0x00000000, recout 0x05a00a00 at
+0x00000000, mpc 0x05a00a00`).
 
-1. Switch the Samsung to 2560x1440. Is the whole desktop on the screen, menu bar included?
-2. Switch to 1920x1080 (low resolution, if offered) or 1600x900, and back to the default. Whole desktop each time?
+What fits, not yet confirmed: on the boot display a mode switch keeps the firmware's request timing for the plane,
+which was worked out for 3840x2160 with its 62 lines of vertical blanking. 2560x1440 has 41 and 1920x1080 has 45,
+so the plane gets 21 and 17 lines less lead than that timing expects, and a menu bar is 24 lines high: its bottom
+3 lines would be left at 2560x1440, about 7 at 1920x1080. That is what was seen.
 
-If the top is still cut off, send the log with the Samsung left in that mode, and say roughly how much is
-missing (a menu bar's height, more, less).
+The check, no reboot, usual boot-args. Displays preferences offers only a few of the Samsung's modes (it lists
+3840x2160, 2560x1440 low resolution, 1920x1080, 1280x720 and 1080p), so the modes are set with
+`tools/cgmode.py`, which reaches all of them. The change lasts until logout; `/usr/bin/python tools/cgmode.py`
+alone lists the displays and modes.
+
+1. `/usr/bin/python tools/cgmode.py 1600x900` (100 lines of blanking, more than the firmware's mode). Is the
+   menu bar whole?
+2. `/usr/bin/python tools/cgmode.py 1280x720` (30 lines). Is the menu bar gone completely?
+3. `/usr/bin/python tools/cgmode.py 3840x2160` to go back.
+
+Yes to both confirms it. The fix is then what the second display already has: the plane's request timing from
+Linux for each mode (`tools/pipegen`), generated for the boot display's pipe and its 3840x2160 surface.
 
 ## After the tests
 
