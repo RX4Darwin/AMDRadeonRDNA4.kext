@@ -66,9 +66,7 @@ card.
 
 Each step has something that shows it is done. Steps 0 and 1 need no card.
 
-0. **Build the patched Mesa on a Mac and run its own tests.** The patches include an in-process stand-in for the
-   kext (`RADV_DARWIN_MOCK=1`) and a test program for the interface. Shows: the port builds from a clean Mesa
-   checkout plus the five patches, and what the driver asks of a kext, call by call. Needs Mesa downloaded.
+0. **Build the patched Mesa on a Mac and run its own tests.** Done 2026-10-06, section 6.
 1. **The interface in this kext, memory half**: connection, buffers, mapping into the process, the 4-level table
    with caller-chosen addresses, contexts. The table code can be host-tested like `gpuvmtable.cpp` is. Shows on
    the card: Mesa's device creation succeeds and a buffer written by the CPU reads back through the GPU's copy
@@ -92,3 +90,48 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
 - **What a client may reach.** The kernel queue runs in address space 0 and can address all of VRAM. A client's
   command buffers have to be submitted unprivileged and in the client's own address space, as Linux submits them
   (`docs/w12k-gfx-submit.md`), or the interface gives a process the whole card's memory.
+
+## 6. Step 0: the port builds and runs against its stand-in kext (2026-10-06)
+
+On an Apple-silicon Mac (macOS 26.5). `vulkan/build-mesa.sh <directory>` does all of it from an empty directory;
+that script was run end to end.
+
+- Mesa at `f5cb8ee0` fetched; the five patches applied with `git am` without a conflict.
+- The AMD Vulkan driver alone builds, for arm64 and cross-built for x86_64, the card's machines.
+- **Two things in the build were tied to newer macOS, and neither is needed.** The port's own code opened its
+  IOKit connection with a symbol that only exists from macOS 12 on: a driver built for macOS 11 would have read
+  through a null address there. `vulkan/mesa-patches/0006` replaces it (one line). And Mesa's window-system layer
+  for macOS brings in Apple's Metal and two more macOS 12 symbols: the driver builds without that layer
+  (`-Dplatforms=`), and the port presents through its own calls anyway.
+- The result, as the script builds it: `libvulkan_radeon.dylib`, x86_64, minimum macOS 11.0, no availability
+  warning in the build, linked against IOKit, libSystem, libz and libc++ and nothing else. It was run on macOS
+  26.5 under Rosetta only; **macOS 11 itself has not run it.**
+- The patches' own test of the driver-to-kext marshalling (`acd_kext_test.c`): 95 checks, 0 failures.
+- One defect left alone: with Mesa's tests switched on, two of its AMD tests fail to link, because the patches
+  make `libamd_common` need IOKit and those tests do not ask for it. The driver is not affected; the script
+  leaves the tests off.
+- `vulkan/vkprobe.c`, a small program that drives the driver through its entry point with no Vulkan loader, ran
+  with `RADV_DARWIN_FAKE=1 RADV_DARWIN_MOCK=1` (Mesa's in-process stand-in for the kext, which checks arguments
+  the way their kext does but runs nothing): the driver offers `AMD Radeon RX 9070 XT (RADV GFX1201)`, Vulkan
+  1.4.363, heaps of 15448, 512 and 168 MiB (the stand-in's figures); device creation, a buffer with mapped
+  memory, a command buffer, a submit and a fence wait all succeed. The fill it submits is not seen, as expected
+  without a GPU.
+
+What that run asked of the kext interface (`RADV_DARWIN_TRACE=1`), which is the whole list a first Vulkan program
+needs:
+
+| Call | Times | When |
+|---|---|---|
+| `Hello` (0) | 2 | once per connection: the driver opens one to look at the device and one for the device it creates |
+| `QueryInfo` (1) | 3 | memory sizes, address ranges, limits |
+| `ReadRegs` (2) | 2 | one register, `GB_ADDR_CONFIG` |
+| `Ctx` (6) | 10 | contexts allocated and freed |
+| `BoCreate` (3) / `BoFree` (4) | 10 / 10 | the driver's own buffers and the program's one |
+| `GemVa` (5) | 20 | each buffer mapped at an address the driver chose, and unmapped |
+| `Submit` (7) | 1 | two command buffers in one call, with a fence |
+| `WaitSeq` (8) | 1 | |
+
+Plus a CPU mapping of buffers (`IOConnectMapMemory64`), which the trace does not list. Nothing else: no present
+calls, no host-memory import. So steps 1 and 2 of section 4 need exactly selectors 0 to 8 and the mapping. The
+stand-in (`src/amd/common/darwin/ac_darwin_mock.c` in the patched tree, about 800 lines) states the rules each
+call has to enforce, argument by argument; it is the closest thing to a specification of the kernel half.

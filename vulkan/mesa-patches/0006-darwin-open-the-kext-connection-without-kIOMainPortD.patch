@@ -1,0 +1,29 @@
+From 50ae8958e074632591cb8dcd76fe95b917d5e4dc Mon Sep 17 00:00:00 2001
+From: "Sunneva N. Mariu" <sunnevanattsol@gmail.com>
+Date: Tue, 6 Oct 2026 18:01:51 +0000
+Subject: [PATCH] darwin: open the kext connection without kIOMainPortDefault
+
+kIOMainPortDefault exists from macOS 12 on. A driver built for macOS 11
+referenced it weakly and would read through a null address there.
+IOKit takes MACH_PORT_NULL for the default main port on every release.
+---
+ src/amd/common/darwin/ac_darwin_iokit.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/common/darwin/ac_darwin_iokit.c b/src/amd/common/darwin/ac_darwin_iokit.c
+index 7e81081..210e757 100644
+--- a/src/amd/common/darwin/ac_darwin_iokit.c
++++ b/src/amd/common/darwin/ac_darwin_iokit.c
+@@ -67,7 +67,8 @@ iokit_close(void *ctx)
+ int
+ acd_kext_open_iokit(struct acd_kext **out)
+ {
+-   io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("Navi48Bringup"));
++   /* MACH_PORT_NULL is the default main port on every macOS; kIOMainPortDefault only exists from 12 on. */
++   io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("Navi48Bringup"));
+    if (!svc) {
+       fprintf(stderr, "radv-darwin: IOServiceGetMatchingService(Navi48Bringup) found nothing: the Navi48 kext is "
+                       "not loaded (native backend unavailable)\n");
+-- 
+2.55.0
+
