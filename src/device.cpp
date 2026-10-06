@@ -1691,7 +1691,8 @@ void RDNA4Device::setDisplayPower(bool on) {
 	// HDMI/DVI boot pipe, with the mode-set engine asked for (rdna4-modeset=1):
 	// the link goes down, so the monitor loses the signal and sleeps, and the
 	// way back is the mode set to the running timing (ModeSet::buildSleep).
-	if (pipe.valid() && pipe.isTmds() && (on ? hdmiLinkOff : modesetRequested && liveTimingValid)) {
+	if (pipe.valid() && pipe.isTmds() && (on ? hdmiLinkOff : modesetRequested && liveTimingValid && liveTiming.hActive <= fbWidth &&
+	                                              liveTiming.vActive <= fbHeight)) {
 		ModeSet::Target t {};
 		const char *why = "";
 		char res[48];
@@ -2347,6 +2348,17 @@ void RDNA4Device::noteBootDpLink() {
 // DpTrain on one link of this card: the sink's DPCD over AUX channel `aux`,
 // and DpPhy's register steps and DMUB commands for link encoder `link`, whose
 // connector has hot-plug pin `hpd` and VBIOS object `conn`.
+// "no clock recovery, trained": what each attempt of a training ended in.
+static const char *triesText(const DpTrain::Report &rep, char *out, size_t cap) {
+	out[0] = 0;
+	for (uint8_t i = 0; i < rep.attempts && i < DpTrain::kAttempts; i++) {
+		if (i)
+			strlcat(out, ", ", cap);
+		strlcat(out, DpTrain::resultName(rep.tries[i]), cap);
+	}
+	return out;
+}
+
 DpTrain::Result RDNA4Device::trainLink(uint8_t aux, uint8_t link, uint8_t hpd, uint8_t conn, const DpTrain::Sink &sink,
                                        const DpTrain::Link &settings, bool offFirst, DpTrain::Report &rep) {
 	struct Ctx {
@@ -2451,9 +2463,10 @@ DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 		    kIOReturnSuccess)
 			regWriteDmu(2, kDpVidStreamCntl, stream);
 	}
-	FBLOG("dptrain: %s after %u attempt(s): swing %u, pre-emphasis %u, lanes %02x %02x, aligned %u; stream 0x%08x",
-	      DpTrain::resultName(r), rep.attempts, rep.swing, rep.preEmphasis, rep.status[0], rep.status[1],
-	      rep.status[2] & 1, regReadDmu(2, kDpVidStreamCntl));
+	char tries[160];
+	FBLOG("dptrain: %s after %u attempt(s) (%s): swing %u, pre-emphasis %u, lanes %02x %02x, aligned %u; stream 0x%08x",
+	      DpTrain::resultName(r), rep.attempts, triesText(rep, tries, sizeof(tries)), rep.swing, rep.preEmphasis,
+	      rep.status[0], rep.status[1], rep.status[2] & 1, regReadDmu(2, kDpVidStreamCntl));
 	logBootLink("after");
 	return r;
 }
@@ -2483,6 +2496,13 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	const bool dp = pipe.signal == Pipe::Signal::DpSst;
 	if (!pipe.valid() || !(pipe.isTmds() || dp) || !liveTimingValid || !rmmio || !ipDiscovery.isValid()) {
 		FBLOG("modes: switch to id %u refused: no programmable HDMI or DisplayPort pipe", m.id);
+		return kIOReturnUnsupported;
+	}
+	// The plane scans the console's memory: a mode larger than that (the
+	// firmware's own timing over a console it stretches) would scan past it.
+	if (m.t.hActive > fbWidth || m.t.vActive > fbHeight) {
+		FBLOG("modes: switch to id %u refused: %ux%u does not fit the %ux%u console", m.id, m.t.hActive, m.t.vActive,
+		      fbWidth, fbHeight);
 		return kIOReturnUnsupported;
 	}
 	ModeSet::Target t {};
@@ -2838,9 +2858,11 @@ bool RDNA4Device::trainSecondLink() {
 	DpTrain::Report rep {};
 	const DpTrain::Result r = trainLink(pipe2Aux, c.link, c.hpd, pipe2Target.connectorObjId, pipe2Sink, pipe2Link,
 	                                    false, rep);
-	FBLOG("pipe2: link %u, %u lane(s) at rate 0x%02x: %s after %u attempt(s): swing %u, pre-emphasis %u, lanes %02x "
-	      "%02x, aligned %u", c.link, pipe2Link.lanes, pipe2Link.rate, DpTrain::resultName(r), rep.attempts, rep.swing,
-	      rep.preEmphasis, rep.status[0], rep.status[1], rep.status[2] & 1);
+	char tries[160];
+	FBLOG("pipe2: link %u, %u lane(s) at rate 0x%02x: %s after %u attempt(s) (%s): swing %u, pre-emphasis %u, lanes "
+	      "%02x %02x, aligned %u", c.link, pipe2Link.lanes, pipe2Link.rate, DpTrain::resultName(r), rep.attempts,
+	      triesText(rep, tries, sizeof(tries)), rep.swing, rep.preEmphasis, rep.status[0], rep.status[1],
+	      rep.status[2] & 1);
 	return r == DpTrain::Result::Ok;
 }
 
@@ -2853,6 +2875,23 @@ bool RDNA4Device::usePlanFor(uint8_t hpd) {
 		return false;
 	}
 	return true;
+}
+
+void RDNA4Device::secondLinkBack() {
+	if (!pipe2Lit || !pipe2On || !Pipe2::config().dp)
+		return;
+	uint8_t status[3] {};
+	if (!dpcdRead(pipe2Aux, 0x202, status, sizeof(status))) {
+		FBLOG("pipe2: the display's pin is back but its DPCD does not answer on AUX%u: link left alone", pipe2Aux);
+	} else if (DpTrain::linkUp(status, pipe2Link.lanes)) {
+		FBLOG("pipe2: the display's pin is back and its link is up (lanes %02x %02x, aligned %u)", status[0],
+		      status[1], status[2] & 1);
+	} else {
+		FBLOG("pipe2: the display's pin is back and its link is down (lanes %02x %02x, aligned %u): training it "
+		      "again", status[0], status[1], status[2] & 1);
+		runSecondPipePart(Pipe2::Part::Sleep);
+		pipe2On = pickSecondLink(pipe2Target.now.pixelClockKHz) && runSecondPipePart(Pipe2::Part::Wake);
+	}
 }
 
 uint8_t RDNA4Device::secondSinkHpd(bool orAnother) {
@@ -2879,51 +2918,52 @@ bool RDNA4Device::secondPipeTo(uint8_t hpd) {
 	if (!pipe2Lit)
 		return false;
 	const Pipe2::Config was = Pipe2::config();
-	if (hpd == was.hpd) {
+	if (hpd != was.hpd) {
+		AtomBios::DisplayPath path {};
+		uint8_t ddcLine = 0;
+		bool ok = !was.dp && usePlanFor(hpd);
+		const Pipe2::Config &to = Pipe2::config();
+		ok = ok && !to.dp && pipe.dig != to.dig && pipe.link != to.link && pathForHpd(hpd, path, &ddcLine) &&
+		     Pipe2::linkOfEncoder(path.encoderObjId) == to.link;
+		if (!ok) {
+			FBLOG("pipe2: not moved from HPD%u to HPD%u: only between HDMI connectors the boot display does not "
+			      "use", was.hpd, hpd);
+			Pipe2::use(was.hpd);
+			return false;
+		}
+		FBLOG("pipe2: moving from HPD%u (DIG%u, link %u) to HPD%u (DIG%u, link %u) at %ux%u, %u kHz", was.hpd,
+		      was.dig, was.link, to.hpd, to.dig, to.link, pipe2Target.now.hActive, pipe2Target.now.vActive,
+		      pipe2Target.now.pixelClockKHz);
+		if (pipe2On) {   // the old link down first, by its own table
+			Pipe2::use(was.hpd);
+			runSecondPipePart(Pipe2::Part::Sleep);
+			Pipe2::use(hpd);
+			pipe2On = false;
+		}
+		pipe2Target.encoderObjId = path.encoderObjId;
+		pipe2Target.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
+		pipe2Target.ddcLine = ddcLine;
+		pipe2ConnectorObjId = path.connectorObjId;
+		pipe2MoveOwed = true;
+	}
+	if (!pipe2MoveOwed) {
 		setSecondPipePower(true);
 		return pipe2On;
 	}
-	AtomBios::DisplayPath path {};
-	uint8_t ddcLine = 0;
-	const Pipe2::Target target = pipe2Target;
-	const uint16_t connector = pipe2ConnectorObjId;
-	bool ok = !was.dp && usePlanFor(hpd);
-	const Pipe2::Config &c = Pipe2::config();
-	ok = ok && !c.dp && pipe.dig != c.dig && pipe.link != c.link && pathForHpd(hpd, path, &ddcLine) &&
-	     Pipe2::linkOfEncoder(path.encoderObjId) == c.link;
-	if (!ok) {
-		FBLOG("pipe2: not moved from HPD%u to HPD%u: only between HDMI connectors the boot display does not use",
-		      was.hpd, hpd);
-		Pipe2::use(was.hpd);
-		return false;
-	}
-	FBLOG("pipe2: moving from HPD%u (DIG%u, link %u) to HPD%u (DIG%u, link %u) at %ux%u, %u kHz", was.hpd, was.dig,
-	      was.link, c.hpd, c.dig, c.link, pipe2Target.now.hActive, pipe2Target.now.vActive,
-	      pipe2Target.now.pixelClockKHz);
-	if (pipe2On) {   // the old link down first, by its own table
-		Pipe2::use(was.hpd);
-		runSecondPipePart(Pipe2::Part::Sleep);
-		Pipe2::use(hpd);
-		pipe2On = false;
-	}
-	pipe2Target.encoderObjId = path.encoderObjId;
-	pipe2Target.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
-	pipe2Target.ddcLine = ddcLine;
-	pipe2ConnectorObjId = path.connectorObjId;
-	// The mode set to the running timing: the pipe's clock from the new
-	// connector's PLL, its encoder and transmitter. Then that connector's sleep
-	// and wake, which leave its encoder and link as lighting there would
+	// The pipe belongs to this connector now, whatever happens next: a move
+	// that stops part-way is done again from here at the next plug.
+	// The mode set to the running timing: the pipe's clock from this
+	// connector's PLL, its encoder and transmitter. Then this connector's sleep
+	// and wake, which leave its encoder and link as lighting here would
 	// (tools/atomdump.cpp, testPipe2Move).
+	const Pipe2::Config &c = Pipe2::config();
 	const Modes::Mode same { 0, pipe2Target.now, pipe2Target.now.refreshMilliHz(), false, Modes::SourceBoot };
-	ok = applySecondPipeMode(same) == kIOReturnSuccess && runSecondPipePart(Pipe2::Part::Sleep) &&
-	     runSecondPipePart(Pipe2::Part::Wake);
-	if (!ok) {
-		FBLOG("pipe2: the move to HPD%u did not complete: the pipe stays with HPD%u, off", hpd, was.hpd);
-		Pipe2::use(was.hpd);
-		pipe2Target = target;
-		pipe2ConnectorObjId = connector;
+	if (applySecondPipeMode(same) != kIOReturnSuccess || !runSecondPipePart(Pipe2::Part::Sleep) ||
+	    !runSecondPipePart(Pipe2::Part::Wake)) {
+		FBLOG("pipe2: the move to HPD%u did not complete: the display stays off until it is plugged in again", hpd);
 		return false;
 	}
+	pipe2MoveOwed = false;
 	pipe2On = true;
 	FBLOG("pipe2: now on HPD%u; DIG%u_DIG_FE_EN_CNTL=0x%08x SYMCLK%c_CLOCK_ENABLE=0x%08x", c.hpd, c.dig,
 	      regReadDmu(2, Pipe::Reg::kDigFeEnCntl + c.dig * Pipe::Reg::kDigStride), 'A' + c.dig,
@@ -3003,7 +3043,9 @@ void RDNA4Device::setSecondPipePower(bool on) {
 	char res[48];
 	snprintf(res, sizeof(res), "%s, FE %08x SYMCLK %08x", ok ? "ran" : "STOPPED", fe, symclk);
 	displayPowerNote(on, "pipe2", res);
-	pipe2On = on;   // also after a plan that stopped: the next request runs the other one
+	// A wake that stopped did not bring the display up: the next request to
+	// turn it on, or the next plug, runs the wake again.
+	pipe2On = on && ok;
 }
 
 // The modes the second pipe can be switched to scan the surface it was lit

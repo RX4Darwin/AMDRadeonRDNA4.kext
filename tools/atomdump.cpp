@@ -1491,6 +1491,7 @@ static int testDpTrain() {
 			offs += e.kind == 'O';
 		}
 		failures += check(r == DpTrain::Result::ClockRecovery && rep.attempts == DpTrain::kAttempts && rep.swing == 3 &&
+		                  rep.tries[0] == r && rep.tries[DpTrain::kAttempts - 1] == r &&
 		                  rounds == 2 * DpTrain::kAttempts && offs == DpTrain::kAttempts - 1u,
 		                  "dptrain: no clock recovery: %s, %u attempts, %zu status reads, %zu transmitter-offs",
 		                  DpTrain::resultName(r), rep.attempts, rounds, offs);
@@ -1527,6 +1528,11 @@ static int testDpTrain() {
 		                  "dptrain: link for 4K60 at 10 bpc: %u lanes, rate 0x%02x", l.lanes, l.rate);
 		failures += check(DpTrain::pickLink(sink, 148500, 24, l) && l.lanes == 4 && l.rate == DpTrain::kRbr,
 		                  "dptrain: link for 1080p60 at 8 bpc: %u lanes, rate 0x%02x", l.lanes, l.rate);
+		static const uint8_t up4[3] = { 0x77, 0x77, 0x01 }, lane3[3] = { 0x77, 0x37, 0x01 }, skew[3] = { 0x77, 0x77, 0x80 },
+		                     up2[3] = { 0x77, 0x00, 0x81 };
+		failures += check(DpTrain::linkUp(up4, 4) && !DpTrain::linkUp(lane3, 4) && !DpTrain::linkUp(skew, 4) &&
+		                  DpTrain::linkUp(up2, 2) && !DpTrain::linkUp(up2, 4) && !DpTrain::linkUp(up4, 0),
+		                  "dptrain: link status read wrong");
 		failures += check(DpTrain::pickLink(sink, 25175, 24, l) && l.lanes == 1 && l.rate == DpTrain::kRbr &&
 		                  !DpTrain::pickLink(sink, 1066500, 30, l), "dptrain: smallest and too-large links");
 	}

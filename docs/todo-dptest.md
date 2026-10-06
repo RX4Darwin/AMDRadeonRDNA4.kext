@@ -63,20 +63,29 @@ rdna4-head2dp=1 rdna4-dmubhist=1 rdna4-trace=1
 2. Does the other monitor show the second desktop, sharp and stable?
 3. Leave it for two minutes. Does the second monitor keep its picture, without blinking or going dark? (This is
    where the firmware would show if it meddles with a link the kext trained.)
-4. Let both displays sleep for a few minutes, then wake them. Do both come back?
-5. Pull the second monitor's cable, wait 5 s, plug it back into the same connector. Does macOS drop the display
-   and bring it back?
-6. Switch the second monitor off at its power button, wait 5 s, switch it on. Does it come back?
+4. Let both displays sleep for a few minutes, then wake them. Do both come back, and does the second one stay
+   on for the next 20 s?
+5. Pull the second monitor's cable, wait **10 s**, plug it back into the same connector. Does macOS drop the
+   display and bring it back? (On DisplayPort a pin has to be low for six seconds to count as unplugged.)
+6. Pull the cable again and plug it back within **3 s**. Does the picture come back within a few seconds?
+   (Too short to count as unplugged; the kext then asks the monitor whether its link is still up and trains it
+   again if not.)
+7. Switch the second monitor off at its power button, wait 10 s, switch it on. Does it come back?
 
 Lines to find, in order:
 
 - `pipe2: DisplayPort sink on AUXn: ...` and `pipe2: N lane(s) at rate 0x.. for 148500 kHz`
 - `pipe2: lighting pipe 1 DIGn link n HPDn, 1920x1080 at 148500 kHz, stream and plane: N steps`
-- `pipe2: link n, N lane(s) at rate 0x..: trained after N attempt(s): swing s, pre-emphasis p, lanes 77 77, aligned 1`
+- `pipe2: link n, N lane(s) at rate 0x..: trained after N attempt(s) (what each attempt ended in): swing s,
+  pre-emphasis p, lanes 77 77, aligned 1`. On the boot display's self-test the first attempt always failed and the
+  second trained; the text in brackets now says why.
 - `pipe2: plan ran; OTG1 measured 59.99x Hz`
 - for step 4: `power: pipe2 display off: N steps ran` and `power: pipe2 display on: N steps ran`, with another
   `pipe2: link n ...: trained after ...` before the second
 - for step 5: `hotplug: display gone from HPDn: link off`, then `hotplug: the same display is back on HPDn`
+- for step 6 (and after step 4, if the monitor drops its pin on waking as the Samsung does):
+  `pipe2: the display's pin is back and its link is up ...`, or `... its link is down ...: training it again`
+  followed by another `pipe2: link n ...: trained after ...`
 
 What failure looks like:
 
@@ -90,8 +99,8 @@ What failure looks like:
   timing the plan lights in.
 
 Known gaps, so they are not surprises: if training fails four times there is no retry at another rate or lane
-count, and a monitor that loses its link while lit and only signals that with a short pulse on the hot-plug pin
-is not noticed.
+count, and a monitor that loses its link while lit and signals that with a pulse on the hot-plug pin shorter
+than a second is not noticed.
 
 ## Test 2: mode switching on the DisplayPort second display
 

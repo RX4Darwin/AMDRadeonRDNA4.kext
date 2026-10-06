@@ -274,8 +274,13 @@ Log lines: `pipe2: DisplayPort sink on AUX0: DPCD 1.4, up to 4 lane(s) at rate 0
 trained after 1 attempt(s): swing 0, pre-emphasis 0, lanes 77 77, aligned 1`. A plan that stops at the training
 step says `pipe2: step N (...): the link did not train`.
 
-Not there: a fallback to another rate or lane count when training fails four times, and the short HPD pulse a
-DisplayPort monitor sends when it loses the link while lit.
+Nothing but the kext maintains this link (the firmware only retrains links it lit itself), so the hot-plug poll
+does two things differently on DisplayPort: the pin has to be low for six seconds to count as an unplug (the test
+monitor drops it for up to 3.7 s on waking), and when it comes back from a shorter drop the sink is asked for its
+lane status and the link is trained again if it is down (`RDNA4Device::secondLinkBack`).
+
+Not there: a fallback to another rate or lane count when training fails four times, and a pulse on the HPD pin
+shorter than a second (a DisplayPort monitor's way of saying it lost the link while lit).
 
 ## 7. Card boots (Big Sur 11.6.6, Samsung 4K on DisplayPort, Lenovo on HDMI)
 

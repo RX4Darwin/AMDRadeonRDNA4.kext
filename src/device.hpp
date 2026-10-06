@@ -125,6 +125,11 @@ public:
 	Pipe2::Target pipe2Target {};          // .now: the timing the pipe runs
 	uint16_t pipe2ConnectorObjId { 0 };
 	bool pipe2Lit { false }, pipe2On { false };
+	// A DisplayPort second display whose HPD pin dropped and came back without
+	// counting as unplugged: its link is trained again if the sink says it is
+	// down. Nothing else maintains a link the kext trained.
+	void secondLinkBack();
+	bool pipe2MoveOwed { false };   // secondPipeTo: the move to the connector in use has not completed
 	bool runSecondPipePart(Pipe2::Part part, size_t *steps = nullptr);
 
 	// The boot display's DisplayPort link (rdna4-dptrain, a diagnostic). The
