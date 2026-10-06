@@ -70,6 +70,7 @@ CXX_SRCS := \
 	src/gpuvm.cpp \
 	src/vmtree.cpp \
 	src/n48n.cpp \
+	src/n48nkext.cpp \
 	src/vmid.cpp \
 	src/ptpages.cpp \
 	src/gpuvmtable.cpp \
@@ -168,7 +169,7 @@ USER_FLAGS := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK
               -mmacosx-version-min=$(DEPLOY) -std=c11 -O2 -Wall -Iinclude -Isrc
 
 # --- rules -------------------------------------------------------------------
-.PHONY: all clean test userspace check-isa census-tool census-stub census-pathlog
+.PHONY: all clean test userspace n48nprobe check-isa census-tool census-stub census-pathlog
 all: $(KEXT) $(RUN_TOOL)
 
 $(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp src/pipe2.cpp src/pipe2.hpp src/pipe2_linux.inc src/pipe2_linux_hpd4.inc src/pipe2_linux_dp1.inc src/pipe2_linux_dp2.inc tools/dp_retime_linux.inc src/dptrain.cpp src/dptrain.hpp src/dpphy.cpp src/dpphy.hpp tools/dp_train_linux.inc src/amdfw.cpp src/amdfw.hpp src/psp.cpp src/psp.hpp src/sdma.cpp src/sdma.hpp src/pm4.cpp src/pm4.hpp src/codeobj.cpp src/codeobj.hpp src/vadd_codeobj.h src/bench_codeobj.h src/gfxregs.hpp src/linuxref.hpp src/gpuheap.cpp src/gpuheap.hpp src/flip.hpp include/rdna4compute.h src/ihdecode.cpp src/ih.hpp src/gpuvm.cpp src/vmtree.cpp src/vmtree.hpp src/n48n.cpp src/n48n.hpp tools/n48n-host/hostbackend.hpp vulkan/navi48_native_abi.h src/gpuvm.hpp src/vmid.cpp src/vmid.hpp src/ptpages.cpp src/ptpages.hpp src/gpuvmtable.cpp src/gpuvmtable.hpp
@@ -182,6 +183,14 @@ $(RUN_TOOL): userspace/rdna4-run.c userspace/librdna4.c userspace/librdna4.h use
 		-framework IOKit -framework CoreFoundation -weak_framework Accelerate -o $@
 
 userspace: $(RUN_TOOL)
+
+# The card test of the Vulkan interface's memory half (docs/vulkan-port.md): runs on the test machine, as root.
+N48N_PROBE := $(BUILD)/n48nprobe
+$(N48N_PROBE): vulkan/n48nprobe.c vulkan/navi48_native_abi.h include/rdna4vulkan.h
+	@mkdir -p $(BUILD)
+	$(CXX) -x c $(USER_FLAGS) -Ivulkan vulkan/n48nprobe.c -framework IOKit -framework CoreFoundation -o $@
+
+n48nprobe: $(N48N_PROBE)
 
 # E1 trigger (docs/metal-spike.md): Objective-C, runs in Recovery next to rdna4-run.
 CENSUS_TOOL := $(BUILD)/rdna4-census

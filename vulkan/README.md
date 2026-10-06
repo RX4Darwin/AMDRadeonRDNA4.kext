@@ -12,6 +12,8 @@ This repository's own:
 | File | What |
 |---|---|
 | `mesa-patches/0006-*.patch` | One line: the IOKit connection opened without a symbol that only exists from macOS 12 on (MIT, as Mesa) |
+| `mesa-patches/0007-*.patch` | The driver looks for this kext's service, `RDNA4ComputeService`, before `Navi48Bringup` (MIT, as Mesa) |
+| `n48nprobe.c` | The card test of the interface's memory half, without Mesa (`make n48nprobe`; `docs/vulkan-port.md` section 8) |
 | `build-mesa.sh` | Fetches Mesa at the right commit, applies the patches, builds the driver |
 | `vkprobe.c` | A small Vulkan program that drives the built driver without a Vulkan loader |
 
@@ -21,10 +23,11 @@ driver talks to a kernel extension through an IOKit user client. The header is t
 the part of Linux's amdgpu ioctls RADV uses (buffers, address-space mapping, contexts, command submission,
 fences) plus calls to present to the screen.
 
-**Status: builds and runs against its own stand-in for the kext; never run against a kext or a card.** No kext
-in this repository provides the interface yet, so on a real machine the driver finds no device.
-`docs/vulkan-port.md` has what the port needs from the kext, what this repository already has, the order of work,
-and what the build showed.
+**Status: builds, and runs on a Mac against its own stand-in for the kext and against this kext's engine
+(`tools/n48n-host/`); never run against a kext or a card.** The kext has the memory half of the interface
+(`src/n48nkext.cpp`, not run on the card) and no way to submit work yet, so the driver creates its device and
+fails at the first submit. `docs/vulkan-port.md` has what the port needs from the kext, what this repository
+already has, the order of work, and what each step showed.
 
 Not taken from that project, on purpose: its Metal bundle, its helper accelerator kext and its hooks into Apple's
 Radeon driver. They are built against the internals of one macOS build; the Vulkan driver and its kernel interface

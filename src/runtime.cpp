@@ -3547,6 +3547,7 @@ void RDNA4Compute::resetRuntimeForResume() {
 		q.up = q.wedged = false;
 	sharedInit = false;
 	vmPool.unbindAll();         // every context is gone: the next job of each client rebinds
+	n48nDiscard();              // the Vulkan client's buffers and table went the same way
 	if (devHeapMap) {
 		IOFree(devHeapMap, devHeapMapBytes);
 		devHeapMap = nullptr;

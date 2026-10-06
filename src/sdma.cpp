@@ -53,6 +53,16 @@ uint32_t copyLinear(uint32_t *out, uint64_t src, uint64_t dst, uint32_t bytes) {
 	return kCopyDwords;
 }
 
+uint32_t indirect(uint32_t *out, uint64_t buffer, uint32_t dwords, uint32_t vmid) {
+	out[0] = header(OpIndirect) | ((vmid & 0xf) << 16);
+	out[1] = static_cast<uint32_t>(buffer) & ~0x1fu;
+	out[2] = static_cast<uint32_t>(buffer >> 32);
+	out[3] = dwords;
+	out[4] = 0;                          // no context-save area
+	out[5] = 0;
+	return kIndirectDwords;
+}
+
 bool Ring::init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes, uint64_t startWptr) {
 	if (!cpu || sizeBytes < 256 || (sizeBytes & (sizeBytes - 1)) || (mc & 0xff))
 		return false;

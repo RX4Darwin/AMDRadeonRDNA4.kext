@@ -1,7 +1,8 @@
 # Vulkan on this kext: taking the RADV Darwin port
 
-Written 2026-10-06. **Everything here is from reading source and notes. Nothing was built or run**, here or on
-the card; the other project's claims are its own and unverified.
+Written 2026-10-06. Sections 1 to 5 are from reading source and notes; sections 6 to 8 report what was built and
+run since, all of it on a Mac. **Nothing here has run on the card**, and the other project's claims are its own
+and unverified.
 
 ## 1. The decision
 
@@ -68,10 +69,10 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
 
 0. **Build the patched Mesa on a Mac and run its own tests.** Done 2026-10-06, section 6.
 1. **The interface in this kext, memory half**: connection, buffers, mapping into the process, the 4-level table
-   with caller-chosen addresses, contexts. In two parts. The engine, which needs no card: done 2026-10-06,
-   section 7. Its connection to the kext (a user client, VRAM and system memory behind the buffers, the address
-   space's registers and translation-cache flush): not started. Shows on the card: Mesa's device creation succeeds
-   and a buffer written by the CPU reads back through the GPU's copy engine at the address the process chose.
+   with caller-chosen addresses, contexts. The engine, which needs no card: done 2026-10-06, section 7. Its
+   connection to the kext: written 2026-10-06 and checked on a host, **not run on the card**, section 8. Shows on
+   the card: `build/n48nprobe` says "all ok", which includes a pattern the GPU's copy engine carried between
+   three buffers at addresses the process chose.
 2. **Submit and wait** on the graphics queue in the client's address space, wrapped as Linux wraps it. Shows on the
    card: a Vulkan program that renders offscreen and reads back the right pixels. This is the step that meets the
    open blocker.
@@ -82,8 +83,8 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
 
 - **One graphics stack, not two.** Their kext and this one both bring the card's graphics engines up; they cannot
   both run. Taking their approach as a reference means writing the interface here, on this repository's bring-up.
-- **The service name.** The patches look for `Navi48Bringup`. Either this kext answers to that name and type, which
-  keeps the patches unchanged and easy to update, or a sixth patch renames it.
+- **The service name.** Settled: the interface is a user client of type `'N48N'` on this kext's own service,
+  `RDNA4ComputeService`, and a seventh patch makes Mesa look for that name before `Navi48Bringup`.
 - **One client or many.** Their interface serves one process at a time, which is enough for a Vulkan test and for a
   single host process on top. Many clients is this repository's design; it can come later.
 - **Whose work this touches.** The compute and graphics bring-up, the runtime and the address-space code are
@@ -168,3 +169,60 @@ VRAM from the pool the CPU can reach and from the one it cannot, system memory w
 page, 4 KiB pages for the table with a CPU pointer to each, the registers of the client's address space pointed
 at the table's root, a translation-cache flush, the four `GB_ADDR_CONFIG` registers, and a user client that
 carries the calls and maps a buffer into the process. One connection at a time.
+
+## 8. Step 1, second part: the engine connected to the kext (2026-10-06, not run on the card)
+
+`src/n48nkext.cpp` is all of it; the runtime's own files change by a few lines (declarations in
+`src/compute.hpp` and `src/userclient.hpp`, one call in the wake's cleanup in `src/runtime.cpp`, one packet in
+`src/sdma.{hpp,cpp}`).
+
+| What the engine asks for | What stands behind it |
+|---|---|
+| The connection | `RDNA4ComputeService::newUserClient`: type `'N48N'` gets an `RDNA4VulkanClient`, any other type the compute client as before. Root only. One at a time: a second open answers "exclusive access", which Mesa waits out |
+| VRAM the CPU reaches | the runtime's pool heap behind BAR0 (about 96 MiB), zeroed by the CPU |
+| VRAM it does not | the device heap past the BAR; a buffer that allows it goes there first, because the other pool is small |
+| System memory | wired pages, zeroed, with the address the card reaches each page by (as the runtime's host buffers) |
+| The page table | 4 KiB pages of the pool heap, read and written by the CPU through the BAR |
+| The address space | number 8: the table's root, the range and the enable in that context's registers (`vmContextInit`), and after every change of the table an HDP flush and a flush of that address space's translation caches (`vmInvalidate`) |
+| A buffer in the process | `clientMemoryForType`: the system pages, or that part of BAR0 |
+| `GB_ADDR_CONFIG` | read from the card |
+
+It needs the compute bring-up (`rdna4-compute=6` or `7`) with its copy engine and DMA working, and refuses to open
+with `rdna4-vm=1`, whose clients use the same address-space numbers.
+
+**The proof on the card** is a call of this kext's own, outside the Vulkan interface
+(`include/rdna4vulkan.h`): the kernel's copy queue, which stays in address space 0, is given a command buffer to
+run **in the client's address space** and copies between two ranges the client mapped. That is how Linux runs a
+process's copy work, and it is the same idea step 2 needs on the graphics queue, tried first where a failure is
+easy to read. The kext looks both ranges up in the client's table before it lets the card try.
+`vulkan/n48nprobe.c` (`make n48nprobe`) uses it: a buffer of each kind, mapped at 4 GiB, at the top of the lower
+half and in the upper half of the address space; a pattern written by the CPU, copied by the GPU from the first to
+the second to the third and back, and compared.
+
+Checked on a host: `make test` has the new packet against Linux's encoding; `tools/n48n-host/run.sh` runs
+`n48nprobe` on the engine with the CPU standing in for the copy engine (all ok; a planted fault in the copy is
+caught) and then the real driver with the seventh patch, as before.
+
+**What stands between this and a card test**
+
+- **Firmware in the build.** The compute bring-up loads AMD's firmware, which the build embeds from
+  `firmware/amdgpu/` (`tools/fetch-firmware.sh`, about 13 files from linux-firmware). A kext built without it
+  stops at stage 1 and says so. Every kext built on the development Mac so far was built without it.
+- **The bring-up has not run in any boot of the display work.** The logs that show it passing are the ones in
+  `docs/hw-logs/`, of late September and taken in macOS Recovery; no boot since 2026-10-03 had `rdna4-compute`.
+  The first boot with `rdna4-compute=7` under Big Sur is a test of the bring-up before it is a test of anything
+  here.
+- **One display.** With `rdna4-compute` the plugin does not create the second display (the compute pool takes the
+  VRAM its surface uses).
+
+**Known limits**
+
+- A process keeps its CPU mapping of a buffer after freeing it, and the table's pages come from the same pool. For
+  root that is nothing new; it has to be closed before anyone else may open the interface.
+- Sleep: with `rdna4-pm=1` the wake's cleanup drops the client and its calls answer "not ready"; without it the
+  runtime does not survive sleep at all, as before.
+- A copy the card cannot finish leaves the copy engine stopped until the next boot (the runtime has no reset for
+  it). The display does not depend on it.
+- The table is read and written in place through the uncached BAR; mapping a large buffer costs tens of
+  milliseconds. VRAM past the BAR is not zeroed.
+

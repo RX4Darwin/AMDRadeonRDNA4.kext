@@ -64,6 +64,8 @@
 #include "rdna4compute.h"
 #include "sdma.hpp"
 
+struct IOExternalMethodArguments;
+
 class IOBufferMemoryDescriptor;
 class IODMACommand;
 class RDNA4Compute;
@@ -667,7 +669,19 @@ public:
 	IOReturn rtRestore(const void *owner);
 	void     rtRelease(const void *owner);
 
+	// The Vulkan interface (src/n48nkext.cpp, docs/vulkan-port.md): one client at a time, in an address space of
+	// its own. `owner` is its user client.
+	IOReturn n48nOpen(const void *owner);
+	void     n48nClose(const void *owner);
+	IOReturn n48nCall(const void *owner, uint32_t selector, IOExternalMethodArguments *args);
+	IOReturn n48nMemory(const void *owner, uint32_t handle, IOMemoryDescriptor **memory);
+
 private:
+	friend struct N48nBackend;
+	struct N48nState;
+	N48nState *n48n { nullptr };
+	void     n48nDiscard();        // the card lost its memory under the client (sleep): forget it, write nothing
+	IOReturn n48nCopyTest(uint64_t source, uint64_t destination, uint64_t bytes);
 	// The pool past kHeapOffset is the CPU-visible heap (code, and buffers
 	// when there is no DMA). With DMA, buffers come from the device heap:
 	// VRAM past the BAR, which the CPU never touches.

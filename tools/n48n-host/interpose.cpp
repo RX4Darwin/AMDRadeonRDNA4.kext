@@ -9,13 +9,15 @@
 //  memory (hostbackend.hpp). What the driver asks for is then checked by the
 //  same code the kext runs. Nothing executes, so submitting work is refused.
 //
-//  tools/n48n-host/run.sh builds it and runs vulkan/vkprobe.c on it.
+//  tools/n48n-host/run.sh builds it and runs vulkan/vkprobe.c and vulkan/n48nprobe.c on it.
 //
 
 #include <IOKit/IOKitLib.h>
 #include <stdio.h>
 
 #include "hostbackend.hpp"
+#include "../../include/rdna4vulkan.h"
+#include "../../src/gpuvm.hpp"
 
 namespace {
 
@@ -63,11 +65,46 @@ kern_return_t serviceClose(io_connect_t connection) {
 
 kern_return_t objectRelease(io_object_t) { return kIOReturnSuccess; }
 
+// The bytes behind one page of the client's GPU address space, found through its page table as the card would;
+// null if the page is not mapped with `need`.
+uint8_t *pageAt(uint64_t va, uint64_t need) {
+	const auto read = [](void *, uint64_t address, uint64_t &entry) {
+		const auto table = host.memory.find(address & ~0xfffull);
+		if (table == host.memory.end())
+			return false;
+		entry = static_cast<const uint64_t *>(table->second)[(address & 0xfff) / 8];
+		return true;
+	};
+	uint64_t physical = 0, flags = 0;
+	if (!GpuVm::walk(client->root(), va & ((1ull << N48N::kVaBits) - 1), read, nullptr, physical, flags) || !(flags & need))
+		return nullptr;
+	auto buffer = host.memory.upper_bound(physical);
+	if (buffer == host.memory.begin())
+		return nullptr;
+	--buffer;
+	return static_cast<uint8_t *>(buffer->second) + (physical - buffer->first);
+}
+
+// RDNA4_VULKAN_SEL_COPY_TEST with the kext's checks (src/n48nkext.cpp) and the CPU in place of the GPU's copy
+// engine, so that vulkan/n48nprobe.c can be run before it is run on the card.
+uint32_t copyTest(const uint64_t *in, uint32_t nIn) {
+	if (nIn != 3 || !in[2] || in[2] > RDNA4_VULKAN_COPY_TEST_MAX || ((in[0] | in[1] | in[2]) & 0xfff))
+		return N48N::kBadArgument;
+	for (uint64_t at = 0; at < in[2]; at += 4096)
+		if (!pageAt(in[0] + at, GpuVm::kReadable) || !pageAt(in[1] + at, GpuVm::kWritable))
+			return N48N::kBadArgument;
+	for (uint64_t at = 0; at < in[2]; at += 4096)
+		memcpy(pageAt(in[1] + at, GpuVm::kWritable), pageAt(in[0] + at, GpuVm::kReadable), 4096);
+	return N48N::kSuccess;
+}
+
 kern_return_t callMethod(mach_port_t connection, uint32_t selector, const uint64_t *in, uint32_t nIn, const void *structIn,
                          size_t structInSize, uint64_t *out, uint32_t *nOut, void *structOut, size_t *structOutSize) {
 	if (connection != kConnection || !open)
 		return kIOReturnBadArgument;
-	const uint32_t r = client->call(selector, in, nIn, structIn, structInSize, out, nOut, structOut, structOutSize);
+	const uint32_t r = selector == RDNA4_VULKAN_SEL_COPY_TEST
+		? copyTest(in, nIn)
+		: client->call(selector, in, nIn, structIn, structInSize, out, nOut, structOut, structOutSize);
 	if (selector < 32)
 		calls[selector]++;
 	refused += r != N48N::kSuccess;

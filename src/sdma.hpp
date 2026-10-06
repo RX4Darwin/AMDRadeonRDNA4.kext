@@ -22,6 +22,7 @@ enum Op : uint32_t {
 	OpNop       = 0,
 	OpCopy      = 1,
 	OpWrite     = 2,
+	OpIndirect  = 4,
 	OpFence     = 5,
 	OpTrap      = 6,
 	OpConstFill = 11,
@@ -41,6 +42,7 @@ constexpr uint32_t kFenceDwords = 4;   // header, addr lo/hi, value
 constexpr uint32_t kTrapDwords  = 2;   // header, interrupt context
 constexpr uint32_t kFillDwords  = 5;   // header, addr lo/hi, pattern, bytes - 1
 constexpr uint32_t kCopyDwords  = 8;   // header, count, param, src lo/hi, dst lo/hi, DCC
+constexpr uint32_t kIndirectDwords = 6;   // header, buffer lo/hi, its dwords, context-save area lo/hi
 
 // Build into `out`; return the dwords written.
 uint32_t writeDword(uint32_t *out, uint64_t addr, uint32_t value);
@@ -48,6 +50,12 @@ uint32_t fence(uint32_t *out, uint64_t addr, uint32_t value);
 uint32_t trap(uint32_t *out);
 uint32_t constFill(uint32_t *out, uint64_t addr, uint32_t pattern, uint32_t bytes);
 uint32_t copyLinear(uint32_t *out, uint64_t src, uint64_t dst, uint32_t bytes);
+// Run `dwords` of packets at `buffer` (32-byte aligned, a multiple of 8 dwords long), with every address in them
+// and `buffer` itself read in address space `vmid` (sdma_v7_0_ring_emit_ib).
+uint32_t indirect(uint32_t *out, uint64_t buffer, uint32_t dwords, uint32_t vmid);
+// The packet has to end on an 8-dword boundary of the ring: the NOPs (zero dwords) to put before it when the
+// ring's write pointer is at `wptrBytes`.
+constexpr uint32_t indirectPad(uint64_t wptrBytes) { return (2 - static_cast<uint32_t>(wptrBytes / 4)) & 7; }
 
 // A ring of `sizeBytes` (power of two) at `cpu` (the GPU sees it at `mc`).
 // The write pointer counts bytes and never wraps: SDMA 7 pointers are 64-bit

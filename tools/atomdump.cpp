@@ -2993,6 +2993,15 @@ static int testSdmaPackets() {
 	                  "sdma: COPY_LINEAR %08x %08x", p[0], p[1]);
 	failures += check(Sdma::trap(p) == Sdma::kTrapDwords && p[0] == 0x00000006 && p[1] == 0,
 	                  "sdma: TRAP %08x %08x", p[0], p[1]);
+	// A command buffer run in another address space (SDMA_OP_INDIRECT 4, the VMID at bit 16, the buffer 32-byte
+	// aligned), and the padding that makes the packet end on an 8-dword boundary of the ring.
+	bool padded = true;
+	for (uint32_t dw = 0; dw < 64; dw++)
+		padded &= Sdma::indirectPad(dw * 4) < 8 && (dw + Sdma::indirectPad(dw * 4) + Sdma::kIndirectDwords) % 8 == 0;
+	failures += check(Sdma::indirect(p, 0xffff80000000101full, 8, 8) == 6 && p[0] == 0x00080004 && p[1] == 0x00001000 &&
+	                  p[2] == 0xffff8000 && p[3] == 8 && p[4] == 0 && p[5] == 0 && padded,
+	                  "sdma: INDIRECT %08x %08x %08x %08x, ends on an 8-dword boundary from any write pointer", p[0], p[1],
+	                  p[2], p[3]);
 
 	// Ring: 256-byte ring; packets wrap in memory, the wptr never does
 	// (SDMA 7's 64-bit pointers: a wptr back at the start stalls the card).
@@ -3019,7 +3028,7 @@ static int testSdmaPackets() {
 		failures += check(rr.init(rm, 0x8008800000ull, sizeof(rm), 0x17607) && rr.wptr() == 0x17604, "sdma: a resume pointer is dword aligned");
 	}
 
-	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR encodings and ring wrap %s\n",
+	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR/INDIRECT encodings and ring wrap %s\n",
 	       failures ? "FAILED" : "ok");
 	return failures;
 }
