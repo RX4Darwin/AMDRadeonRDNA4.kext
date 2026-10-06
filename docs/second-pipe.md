@@ -203,7 +203,8 @@ the controller is asked `cscGetConnection` again, then for its EDID and modes.
 Until the pipe is lit, the pins of all connectors but the boot display's are watched, and the first display to
 appear decides which plan lights it. After that the pipe's own connector is watched; once its display is gone,
 the other HDMI connector is watched too, and a display plugged in there gets the pipe moved to it
-(`RDNA4Device::secondPipeTo`, written 2026-10-06, host-tested, not yet run on the card): the old link is already
+(`RDNA4Device::secondPipeTo`; ran on the card 2026-10-06: HPD4 to HPD3 at 60 Hz in 0.3 s, HPD3 to HPD4 at 144 Hz
+in 0.14 s, then display sleep and a same-port replug, the picture back each time): the old link is already
 down by its sleep part; the mode-set engine runs to the running timing with the new connector's encoder and link,
 which clocks the pipe from that PHY's PLL; then the new connector's own sleep and wake parts. `testPipe2Move` runs
 that in both directions and every register that lighting on the new connector sets ends as lighting there would
