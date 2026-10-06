@@ -1,8 +1,9 @@
 # Vulkan on this kext: taking the RADV Darwin port
 
 Written 2026-10-06. Sections 1 to 5 are from reading source and notes; sections 6 to 9 report what was built and
-run since. On the card so far (2026-10-06): the memory half and its copy test (section 8), and the driver's first
-work, two fills, through submit and wait (section 9). Rendering has not run there. The other project's claims are its own and unverified.
+run since. On the card so far (2026-10-06): the memory half and its copy test (section 8), and the driver's work
+through submit and wait, two fills and a rendered triangle read back (section 9). Showing a picture on a display
+is next. The other project's claims are its own and unverified.
 
 ## 1. The decision
 
@@ -72,10 +73,10 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
    with caller-chosen addresses, contexts. The engine, which needs no card: done 2026-10-06, section 7. Its
    connection to the kext: section 8, **verified on the card 2026-10-06**: `build/n48nprobe` says "all ok", which
    includes a pattern the GPU's copy engine carried between three buffers at addresses the process chose.
-2. **Submit and wait** on the graphics queue in the client's address space, section 9. **On the card 2026-10-06:
-   `vkprobe` said "done: all ok"** for a fill by the command processor and one by a compute shader, each read
-   back. Still to run there: `vkprobe`'s triangle, rendered into an image and read back
-   (`docs/todo-vulkantest.md`). This was the step that met the open blocker.
+2. **Submit and wait** on the graphics queue in the client's address space, section 9. **Done on the card
+   2026-10-06: `vkprobe` said "done: all ok"** for a fill by the command processor, one by a compute shader, and
+   a triangle rendered into an image and read back with exactly the right pixels (`docs/todo-vulkantest.md`).
+   This was the step that met the open blocker.
 3. **Present** through the flip path. Shows: a Vulkan program's picture on a display.
 4. Then the Metal side of `docs/metal-phase-plan.md`, with Vulkan as the executor.
 
@@ -224,7 +225,7 @@ the firmware (`docs/todo-vulkantest.md`).
 - The table is read and written in place through the uncached BAR; mapping a large buffer costs tens of
   milliseconds. VRAM past the BAR is not zeroed.
 
-## 9. Step 2: submitting work and waiting for it (2026-10-06, fills verified on the card)
+## 9. Step 2: submitting work and waiting for it (2026-10-06, verified on the card)
 
 **The engine** (`src/n48n.cpp`, selectors 7 and 8) decides what a submission may be, with the rules of Mesa's
 stand-in: 1 to 64 command buffers for the graphics queue, each dword-aligned, at most 20 bits of dwords long, and
@@ -266,6 +267,12 @@ in another address space, a shader the driver compiled included. That is what `d
 names as the open blocker, met by another route than the one that failed there: the kernel's own ring with the
 address space in the packet, not a queue per client.
 
+A later boot the same day (kext `D86B7F8C`, `vkprobe-2.txt`, log `rdna4fb-diag-20261006-214537`) added rendering:
+a 64x64 image cleared to blue and a red triangle over half of it, drawn with a vertex and a fragment shader the
+driver compiled, copied back through a buffer: 2016 red and 2080 blue pixels, which is what the rasterisation
+rules give, and none of any other colour. The whole run, from the driver's first call to its close, took 68 ms by
+the kernel log, with no lost work and no new fault.
+
 **What it had not met when written, and what the comparison showed.** Whether the ring runs RADV's command
 buffers in another address space could only be answered on the card (it does, above). Three facts framed that,
 found by comparing with Navi48-MacOS's native
@@ -278,8 +285,8 @@ path (`amd/native_s1b.cpp`, `amd/native_s1c_pure.h`, `amd/amdgpu_init.cpp`) and 
   depth 3, block size 0, no retry on faults, the whole 48-bit range, over MMIO.
 - **Their graphics queue is mapped by the firmware scheduler (MES), as Linux's is; this kext's is not.** They ask
   the scheduler to map the queue (`ADD_QUEUE` with `map_legacy_kq`) and keep address space 8 outside the
-  scheduler's own range. This kext programs the ring directly and starts no scheduler. For the two fills it did
-  not matter; rendering has not been tried.
+  scheduler's own range. This kext programs the ring directly and starts no scheduler. For the two fills and
+  the triangle it did not matter.
 - **This kext's graphics ring has run on a card, in address space 0 only.** `docs/HANDOFF-linux.md` records its
   ring test and a draw whose shader ran (the picture was wrong for a reason found later under Linux); on
   2026-10-06 the ring came up on this rig and the kext's own triangle was right. No card log

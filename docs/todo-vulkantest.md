@@ -1,7 +1,8 @@
 # Card tests for the Vulkan interface
 
-Written 2026-10-06. **Boots 1 and 2 passed on the card the same day** (below). What is still to run is the
-last part of this guide: a triangle the driver renders into an image and reads back.
+Written 2026-10-06. **All three boots passed on the card the same day** (below): the memory half, the driver's
+first work, and a rendered triangle read back. Nothing of this guide is left to run; it stays as the record and as
+the way to repeat the tests.
 
 Rig as before: RX 9070 XT (revision 0xC0), Big Sur 11.6.6. Both displays come up next to the compute bring-up
 (verified in boot 1). Do not let the machine sleep during these boots: the compute runtime does not survive sleep
@@ -11,6 +12,19 @@ without `rdna4-pm=1`, which is not part of this.
 `rdna4-trace=1`, and the kernel log then loses the bring-up's lines within minutes (first try, below). Either take
 them out for these boots, or run the programs and the diagnostic script in the first two or three minutes after
 login, as in the second try.
+
+## Boot 3, 2026-10-06: passed
+
+Kext `D86B7F8C-...`, the same boot-args, both displays lit; `vkprobe-2.txt` and log
+`rdna4fb-diag-20261006-214537`.
+
+- Both fills right again, then **`triangle: 2016 red, 2080 blue, 0 other of 4096 pixels; (8,8) 0xff0000ff,
+  (56,56) 0xffff0000: ok`**: exactly the pixel counts the rasterisation rules give for that triangle. A vertex and
+  a fragment shader the driver compiled, a render target cleared and drawn into, and the picture copied back
+  through a buffer. `done: all ok`.
+- The kernel log has the driver's two connections (one to look at the card, one for the device), the second open
+  for 68 ms from first call to close, no `vulkan: work on the graphics queue did not finish`, and no fault beyond
+  the known one from the ring's own bring-up.
 
 ## Boot 2, 2026-10-06: passed
 
