@@ -94,7 +94,9 @@ public:
 	// pipe's connector if it is high; before the pipe is lit, of the first
 	// connector a plan exists for that is high and not the boot display's; else
 	// 0. readSecondEdid: the EDID of what is on that connector, into edid2Data.
-	uint8_t secondSinkHpd();
+	// `orAnother`, for a lit pipe whose display is gone: if its own connector is
+	// empty, another connector the pipe can be moved to (secondPipeTo).
+	uint8_t secondSinkHpd(bool orAnother = false);
 	// Take the second-pipe plan for a connector. A DisplayPort one only with
 	// rdna4-head2dp=1: lighting a second display over DisplayPort has not run
 	// on the card yet (docs/todo-dptest.md), the HDMI plans have.
@@ -105,6 +107,11 @@ public:
 	// DPMS off and on for an HDMI stream (Pipe2::Part): the sink loses the
 	// signal and sleeps; the timing generator and the plane keep running.
 	void setSecondPipePower(bool on);
+	// The lit pipe's display is back, on connector `hpd`: wake the link there.
+	// On another HDMI connector than before the pipe is moved to it: the
+	// mode-set engine clocks the pipe from that connector's PLL and brings its
+	// encoder up, then that connector's own sleep and wake.
+	bool secondPipeTo(uint8_t hpd);
 	// A mode switch on that pipe: the mode-set engine (modeset.hpp) pointed at
 	// its blocks, with what else changes with the mode (Pipe2::modeSteps),
 	// then the AVI infoframe for the new timing. The surface and its pitch

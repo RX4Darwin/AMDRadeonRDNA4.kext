@@ -2170,6 +2170,89 @@ static int testPipe2Table() {
 	return failures;
 }
 
+// The second display moved to another connector while its pipe runs (hot-plug:
+// unplugged from one HDMI port, plugged into the other). The pipe was lit by
+// table `from`; the old link went down with its sleep part. Then, with table
+// `to` in use: the mode-set engine to the running timing on the new
+// connector's encoder and link (the pipe's clock from that PHY's PLL), and
+// that table's sleep, wake and infoframe parts. Afterwards every register
+// that lighting on `to` sets holds what lighting there would have left.
+static int testPipe2Move(uint8_t from, uint8_t to) {
+	int failures = 0;
+	static const uint8_t uniphy[3] = { 0x1e, 0x20, 0x21 };
+	auto encoderObj = [](const Pipe2::Config &c) {
+		return static_cast<uint16_t>(0x2000 | (((c.link & 1) + 1) << 8) | uniphy[c.link / 2]);
+	};
+	auto apply = [](PlanRegs &regs, const Pipe2::Plan &p) {
+		for (size_t i = 0; i < p.count; i++) {
+			const ModeSet::Step &s = p.steps[i];
+			if (s.op == ModeSet::Op::Write)
+				regs.set(s.seg, s.dword, s.value);
+			else if (s.op == ModeSet::Op::Update)
+				regs.set(s.seg, s.dword, (regs.get(s.seg, s.dword) & ~s.mask) | s.value);
+		}
+	};
+	static Pipe2::Plan plan, lightTo;
+	static ModeSet::Plan ms;
+	static ModeSet::Step extra[Pipe2::kMaxModeSteps];
+	const char *why = "";
+	auto target = [&](Pipe2::Part part) {
+		Pipe2::Target t {};
+		t.litHubp = 0;
+		t.encoderObjId = encoderObj(Pipe2::config());
+		t.surface = 0x8002100000ull;
+		t.depth = Pipe2::Depth::Plane;
+		t.part = part;
+		return t;
+	};
+	PlanRegs moved, lit;
+	bool ok = Pipe2::use(from) && Pipe2::build(target(Pipe2::Part::Light), plan, &why);
+	apply(moved, plan);
+	ok = ok && Pipe2::build(target(Pipe2::Part::Sleep), plan, &why);
+	apply(moved, plan);
+
+	ok = ok && Pipe2::use(to);
+	const Pipe2::Config &c = Pipe2::config();
+	ModeSet::Target mt {};
+	mt.otg = mt.opp = mt.hubp = c.pipe;
+	mt.dig = c.dig;
+	mt.link = c.link;
+	mt.hpd = c.hpd;
+	mt.encoderObjId = encoderObj(c);
+	mt.connectorObjId = 0x330c;
+	mt.from = mt.to = c.timing;
+	mt.extra = extra;
+	mt.nextra = Pipe2::modeSteps(c.timing, extra, Pipe2::kMaxModeSteps);
+	ok = ok && ModeSet::build(mt, ms, &why);
+	moved.run(ms);
+	for (Pipe2::Part part : { Pipe2::Part::Sleep, Pipe2::Part::Wake, Pipe2::Part::Avi }) {
+		ok = ok && Pipe2::build(target(part), plan, &why);
+		apply(moved, plan);
+	}
+	ok = ok && Pipe2::build(target(Pipe2::Part::Light), lightTo, &why);
+	apply(lit, lightTo);
+	failures += check(ok, "pipe2: move HPD%u -> HPD%u: a plan was refused: %s", from, to, why);
+
+	size_t differ = 0;
+	for (const PlanRegs::R &r : lit.regs) {
+		// OTG_V_TOTAL_MIN and _MAX: the engine sets them to the frame length on every
+		// mode switch, lighting leaves 0; without variable refresh they are not used.
+		const bool vTotalRange = r.seg == 2 && (r.dw == 0x1b30 + c.pipe * 0x80u || r.dw == 0x1b31 + c.pipe * 0x80u);
+		if (moved.get(r.seg, r.dw) == r.v || vTotalRange)
+			continue;
+		const char *what = "?";
+		for (size_t i = 0; i < lightTo.count; i++)
+			if (lightTo.steps[i].seg == r.seg && lightTo.steps[i].dword == r.dw)
+				what = lightTo.steps[i].what;
+		differ++;
+		failures += check(false, "pipe2: moved HPD%u -> HPD%u: %u:0x%04x = 0x%08x, lit there it is 0x%08x (%s)", from, to,
+		                  r.seg, r.dw, moved.get(r.seg, r.dw), r.v, what);
+	}
+	printf("pipe2: moved from HPD%u to HPD%u: %zu of %zu registers differ from lighting there %s\n", from, to, differ,
+	       lit.regs.size(), failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
 // Every table, in turn the one in use; the first is in use again afterwards.
 static int testPipe2() {
 	int failures = 0;
@@ -2181,6 +2264,8 @@ static int testPipe2() {
 		failures += check(Pipe2::use(hpd) && Pipe2::config().hpd == hpd, "pipe2: no table for HPD%u", hpd);
 		failures += testPipe2Table();
 	}
+	failures += testPipe2Move(3, 4);
+	failures += testPipe2Move(4, 3);
 	Pipe2::use(first);
 	return failures;
 }

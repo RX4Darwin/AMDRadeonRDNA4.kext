@@ -127,11 +127,28 @@ What failure looks like:
 Only if test 1 passed. Boot with the second monitor's DisplayPort cable unplugged, boot-args as in test 1.
 
 1. After the desktop is up, plug the second monitor in. Does it show the second desktop within about 10 s?
-2. Unplug it again, wait 5 s, and plug it into the card's **other** free connector if there is one (HDMI with
-   an HDMI cable counts). Does it stay dark? (Expected: once lit, the pipe stays with the connector it was lit on.)
+2. Unplug it again, wait 5 s, and plug it into an HDMI connector with an HDMI cable. Does it stay dark?
+   (Expected: a lit pipe moves between the two HDMI connectors, not between DisplayPort and HDMI.)
 
 Lines to find: `head2: ... offline until a display is plugged in`, `hotplug: HPDn went high`,
 `pipe2: DisplayPort sink on AUXn: ...`, `pipe2: lighting ...`, `hotplug: display connected on HPDn: N mode(s)`.
+
+## Test 3b: the HDMI display moved to the other HDMI port (no extra hardware)
+
+Written 2026-10-06, host-tested, not yet run on the card (kext UUID `992B8D5C-...` or later). No boot-args needed;
+`rdna4-trace=1` for the log. Samsung on DisplayPort, Lenovo on one HDMI port.
+
+1. After the desktop is up, unplug the Lenovo, wait 5 s, plug it into the **other** HDMI port. Does it come back
+   with the desktop it had?
+2. Set it to 144 Hz, then move it back to the first port the same way. Does it come back at 144 Hz?
+3. Let both displays sleep and wake them. Do both come back?
+4. Unplug and replug it on the port it is on now. Does it come back?
+
+Lines to find: `hotplug: display gone from HPDa: link off`, `hotplug: HPDb went high`, `pipe2: moving from HPDa
+(DIGx, link x) to HPDb (DIGy, link y) at 1920x1080, K kHz`, `pipe2: switching to id 0 ...`, `pipe2: now ...`,
+`pipe2: now on HPDb; DIGy_DIG_FE_EN_CNTL=0x00000001 SYMCLK?_CLOCK_ENABLE=0x00000311`, `hotplug: the same display
+is back on HPDb`. A failure says `pipe2: the move to HPDb did not complete` or `pipe2: not moved ...`; the Lenovo
+then comes back on the port it was on before.
 
 ## Test 4: the stretched console (no extra hardware)
 
