@@ -477,6 +477,9 @@ constexpr int kAuxNoReply    = -2;   // the transaction ran and the sink did not
 
 constexpr uint8_t kDdcSlave  = 0x50; // VESA DDC/EDID I2C address
 constexpr uint8_t kAuxRetry  = 7;    // per-transaction defer retries
+// A DPCD transfer waits out a deferring sink for about 50 ms in all, amdgpu's
+// AUX_MAX_DEFER_TIMEOUT_MS: seven tries 500 us apart, the rest 1 ms apart.
+constexpr uint8_t kDpcdDeferTries = 54;
 } // namespace
 
 uint32_t RDNA4Device::auxDword(uint8_t inst, uint32_t reg) const {
@@ -648,13 +651,17 @@ bool RDNA4Device::dpcdRead(uint8_t aux, uint32_t address, uint8_t *data, size_t 
 		uint8_t got = 0;
 		int rc = kReplyAuxDefer;
 		uint8_t timeouts = 0;
-		for (uint8_t t = 0; t < kAuxRetry && rc == kReplyAuxDefer; t++) {
+		for (uint8_t t = 0; t < kDpcdDeferTries && rc == kReplyAuxDefer; t++) {
 			rc = auxTransaction(aux, kActDpRead, address + static_cast<uint32_t>(pos), nullptr, chunk,
 			                    data + pos, chunk, &got);
 			if (rc == kAuxNoReply && timeouts++ < 3)
 				rc = kReplyAuxDefer;                // dce_aux_transfer_with_retries: AUX_MAX_TIMEOUT_RETRIES
+			// The Samsung answers a native transfer with the I2C defer code for a
+			// while after its link dropped (card, 2026-10-06); amdgpu waits out both.
+			if (rc == kReplyI2CDefer)
+				rc = kReplyAuxDefer;
 			if (rc == kReplyAuxDefer)
-				IODelay(500);
+				IODelay(t < kAuxRetry ? 500 : 1000);
 		}
 		if (rc != kReplyAck || got == 0) {
 			FBLOG("aux: AUX%u DPCD read 0x%03x (%u byte(s)) failed: %s (reply %d, status 0x%08x)", aux,
@@ -672,13 +679,17 @@ bool RDNA4Device::dpcdWrite(uint8_t aux, uint32_t address, const uint8_t *data, 
 		const uint8_t chunk = len - pos > 16 ? 16 : static_cast<uint8_t>(len - pos);
 		int rc = kReplyAuxDefer;
 		uint8_t timeouts = 0;
-		for (uint8_t t = 0; t < kAuxRetry && rc == kReplyAuxDefer; t++) {
+		for (uint8_t t = 0; t < kDpcdDeferTries && rc == kReplyAuxDefer; t++) {
 			rc = auxTransaction(aux, kActDpWrite, address + static_cast<uint32_t>(pos), data + pos, chunk,
 			                    nullptr, 0, nullptr);
 			if (rc == kAuxNoReply && timeouts++ < 3)
 				rc = kReplyAuxDefer;                // dce_aux_transfer_with_retries: AUX_MAX_TIMEOUT_RETRIES
+			// The Samsung answers a native transfer with the I2C defer code for a
+			// while after its link dropped (card, 2026-10-06); amdgpu waits out both.
+			if (rc == kReplyI2CDefer)
+				rc = kReplyAuxDefer;
 			if (rc == kReplyAuxDefer)
-				IODelay(500);
+				IODelay(t < kAuxRetry ? 500 : 1000);
 		}
 		if (rc != kReplyAck) {
 			FBLOG("aux: AUX%u DPCD write 0x%03x (%u byte(s)) failed: %s (reply %d, status 0x%08x)", aux,
@@ -2382,27 +2393,6 @@ DpTrain::Result RDNA4Device::trainLink(uint8_t aux, uint8_t link, uint8_t hpd, u
 	if (offFirst && !io.phyOff(&ctx))
 		return rep.result = DpTrain::Result::Io;
 	return DpTrain::bringUp(io, sink, settings, &rep);
-}
-
-// The boot display's HPD pin is back after a second or more of low. That
-// alone does not mean the link is down: the Samsung drops the pin for a few
-// seconds on waking from display sleep, and came back by itself after its
-// cable was pulled (card, 2026-10-06). As amdgpu does for a link it suspects,
-// the sink is asked first, and a link that is up is left alone.
-void RDNA4Device::bootDisplayBack() {
-	uint8_t status[3] {};
-	if (!bootDpLinkKnown) {
-		FBLOG("dptrain: the display is back: the firmware's link is not known, nothing done");
-	} else if (!dpcdRead(sinkAuxInst, 0x202, status, sizeof(status))) {
-		FBLOG("dptrain: the display is back but its DPCD does not answer on AUX%u: link left alone", sinkAuxInst);
-	} else if (DpTrain::linkUp(status, bootDpLink.lanes)) {
-		FBLOG("dptrain: the display is back and its link is up (lanes %02x %02x, aligned %u): not retrained",
-		      status[0], status[1], status[2] & 1);
-	} else {
-		FBLOG("dptrain: the display is back and its link is down (lanes %02x %02x, aligned %u)", status[0],
-		      status[1], status[2] & 1);
-		retrainBootLink("the display is back");
-	}
 }
 
 // The boot display's link as the sink and the link encoder have it, in one

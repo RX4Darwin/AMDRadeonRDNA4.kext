@@ -673,11 +673,12 @@ void hotplugPoll(OSObject *, IOTimerEventSource *timer) {
 }
 
 // --- the boot display on DisplayPort (rdna4-dptrain) --------------------------
-// A DisplayPort link may not survive its monitor being unplugged or switched
-// off: when the HPD pin comes back the sink is asked, and if the link the
-// firmware trained is down it is trained again (RDNA4Device::bootDisplayBack).
-// macOS is not told anything: the framebuffer stayed online, and the stream
-// kept running.
+// The firmware keeps the boot display's link itself: with the link taken down
+// under it, it had trained it again within two seconds (card, 2026-10-06),
+// and the monitor comes back after a cable pull with the kext doing nothing.
+// So the pin is only watched and the link's state logged when it returns; a
+// second trainer on the same link would be in the firmware's way.
+// rdna4-dptrain=2 still retrains once, to try the kext's own training.
 struct BootDp {
 	RDNA4Device        *dev { nullptr };
 	IOTimerEventSource *timer { nullptr };
@@ -701,7 +702,7 @@ void bootDpPoll(OSObject *, IOTimerEventSource *timer) {
 		bootDp.gone = true;
 	if (present && bootDp.gone && bootDp.same == 2) {
 		bootDp.gone = false;
-		dev.bootDisplayBack();
+		dev.logBootLink("the display is back");
 	}
 	// rdna4-dptrain=2: once, 15 s after the framebuffer opened, with the
 	// cable left alone, to try the training by itself.
