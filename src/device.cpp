@@ -2074,6 +2074,10 @@ void RDNA4Device::buildModeTable() {
 	Modes::Limits lim {};
 	lim.maxHActive = fbWidth;
 	lim.maxVActive = fbHeight;
+	if (bootTimingValid && (bootTiming.hActive > fbWidth || bootTiming.vActive > fbHeight))
+		FBLOG("modes: the console is %ux%u and the firmware stretches it onto its %ux%u timing: nothing larger "
+		      "than the console is offered (the bootloader's console resolution decides this)", fbWidth, fbHeight,
+		      bootTiming.hActive, bootTiming.vActive);
 	const Edid::Hdmi2Caps hdmi2 = Edid::hdmi2Caps(edidData, edidLen);
 	lim.maxPixelClockKHz = ModeSet::kScrambleFromKHz;
 	if (hdmi2.scdc && hdmi2.maxTmdsKHz > lim.maxPixelClockKHz)

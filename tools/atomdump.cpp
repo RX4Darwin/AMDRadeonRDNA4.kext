@@ -1829,6 +1829,19 @@ static int testPipe2Table() {
 	failures += check(Pipe2::modeDetSegments(c.timing) == c.detSegments && Pipe2::modeDetSegments(other) == c.detSegments &&
 	                  Pipe2::modeDetSegments(known[1]) == 7, "pipe2: DET segments: lit %u, 1080p144 %u",
 	                  Pipe2::modeDetSegments(c.timing), Pipe2::modeDetSegments(known[1]));
+	// A console the firmware stretches onto a larger timing (seen on the card
+	// 2026-10-06: 1920x1080 on the 4K timing) has the scaler on, working out its
+	// own ratio. A switch leaves the scaler as Linux does for a 1:1 plane.
+	{
+		const uint32_t dscl[3] = { 0x0d08 + c.pipe * 0x16bu, 0x0d0a + c.pipe * 0x16bu, 0x0d19 + c.pipe * 0x16bu };
+		PlanRegs stretched = lit;
+		for (uint32_t r : dscl)
+			stretched.set(2, r, 1);
+		modeMismatch += switchTo(stretched, c.timing, known[1]);
+		for (uint32_t r : dscl)
+			modeMismatch += check(stretched.get(2, r) == lit.get(2, r), "pipe2: after a switch from a stretched console "
+			                      "2:0x%04x = 0x%08x, Linux leaves 0x%08x", r, stretched.get(2, r), lit.get(2, r));
+	}
 	return modeMismatch;
 	};
 
