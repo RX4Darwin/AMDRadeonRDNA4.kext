@@ -530,7 +530,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       144 Hz, picture confirmed): a second generated table, picked by
       the connector the display answers on. Hot-plug on that
       connector ran the same day (unplug and replug twice, at 144 Hz).
-- [x] The verified display features are the default (2026-10-06): a
+- [x] The verified display features are the default (2026-10-06;
+      booted on the card that day without `rdna4-head2` and
+      `rdna4-hotplug`: both displays up, hot-plug acting): a
       second display on either HDMI connector, mode switching on both
       displays, hot-plug of the second. `rdna4-head2=0`,
       `rdna4-modeset=0` and `rdna4-hotplug=0` turn them off. A second
