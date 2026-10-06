@@ -1,7 +1,7 @@
 # Card tests for the Vulkan interface
 
-Written 2026-10-06. **Boot 1 passed on the card the same day** (below). Boot 2, work on the graphics ring, is the
-one still to run; it has not run on the card.
+Written 2026-10-06. **Boots 1 and 2 passed on the card the same day** (below). What is still to run is the
+last part of this guide: a triangle the driver renders into an image and reads back.
 
 Rig as before: RX 9070 XT (revision 0xC0), Big Sur 11.6.6. Both displays come up next to the compute bring-up
 (verified in boot 1). Do not let the machine sleep during these boots: the compute runtime does not survive sleep
@@ -11,6 +11,18 @@ without `rdna4-pm=1`, which is not part of this.
 `rdna4-trace=1`, and the kernel log then loses the bring-up's lines within minutes (first try, below). Either take
 them out for these boots, or run the programs and the diagnostic script in the first two or three minutes after
 login, as in the second try.
+
+## Boot 2, 2026-10-06: passed
+
+The same boot as boot 1's second try (kext `F8A4B018-...`, `rdna4-compute=7 rdna4-gfx=2`), `vkprobe` with the
+driver built on the development Mac; `vkprobe.txt`, no diagnostic log was taken after it.
+
+- The driver found the kext's interface (`ABI 1.9, build 1, VMID 8`, 96 MiB of VRAM behind the BAR and 7896 MiB
+  past it), offered `AMD Radeon RX 9070 XT (RADV GFX1201)`, Vulkan 1.4.363, and created its device.
+- **Both fills came out right**: 1024 bytes by the command processor's own copy, 61440 bytes by a compute
+  shader the driver compiled, the bytes between them untouched. Each was a submission through this kext onto the
+  graphics ring, in address space 8, waited for through `WaitSeq`. `done: all ok`.
+- First run of the driver and of `vkprobe` under macOS 11.
 
 ## Boot 1, 2026-10-06: passed (second try)
 
@@ -149,22 +161,15 @@ What failure looks like, from the bottom layer up:
 
 Only if boot 1 ended in `all ok`.
 
-The driver and its test program are in `build/` on the development Mac already (`build/vkprobe`,
-`build/libvulkan_radeon.dylib`, built 2026-10-06 for macOS 11; `make clean` removes them). To build them anew
-(the first command downloads Mesa, about 150 MB, into the directory you name, and needs clang, ninja, bison, flex,
-pkg-config and glslangValidator):
+The driver and its test program, on the development Mac (the first time this downloads Mesa, about 150 MB, into
+`build/radv-build`, and needs clang, ninja, bison, flex, pkg-config and glslangValidator; `make clean` removes all
+of it again):
 
 ```bash
-vulkan/build-mesa.sh ~/radv-build
+make mesa
 ```
 
-```bash
-clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -I ~/radv-build/mesa/include vulkan/vkprobe.c -o build/vkprobe
-```
-
-To the rig, next to the other files: `build/vkprobe` and
-`~/radv-build/build/src/amd/vulkan/libvulkan_radeon.dylib` (27 MB). Neither has run under macOS 11 yet; if either
-does not start, the message it prints is the result.
+To the rig, next to the other files: `build/vkprobe` and `build/libvulkan_radeon.dylib` (27 MB).
 
 ```
 rdna4-compute=7 rdna4-gfx=2 rdna4-trace=1
@@ -221,7 +226,41 @@ What failure looks like:
 - `fill by ...: NOT FILLED`, with the first wrong dword: the work was reported finished and did not do what it
   should.
 
+## Boot 3: a picture rendered and read back
+
+`vkprobe` now also draws: a 64x64 image cleared to blue, a red triangle over its upper-left half, drawn with a
+vertex and a fragment shader the driver compiles, then copied into the buffer and counted. This is the first use
+of the graphics pipeline proper: the geometry stage, the rasteriser, a render target. On a Mac it gets as far as
+it can without a GPU (every call succeeds, the submission is accepted by the engine).
+
+Same boot-args as boots 1 and 2. To the rig, from the development Mac: the new `build/vkprobe` (the library is
+unchanged). In the first two or three minutes after login:
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib 2>&1 | tee vkprobe.txt
+```
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+Report `vkprobe.txt` and the log.
+
+The new line reads `triangle: 2016 red, 2080 blue, 0 other of 4096 pixels; (8,8) 0xff0000ff, (56,56) 0xffff0000:
+ok` when it is right (the red count may differ by the diagonal's pixels), and the run ends in `done: all ok`.
+
+What failure looks like:
+
+- The two fills fail where they passed before: something else changed; send the log.
+- `vkCreateGraphicsPipelines ... -> -N`: the driver could not build the pipeline; nothing reached the card.
+- `vkWaitForFences` takes about ten seconds and the log has `vulkan: work on the graphics queue did not finish
+  in 10 s`: the ring did not get through the draw. **The ring is halted until the next boot.** The `gfx:` and
+  fault lines of the log say what the card recorded.
+- `triangle: ... NOT AS DRAWN`: the counts say which part is wrong. All pixels `0x11111111`: the copy back did
+  not happen. All blue: the clear ran and the triangle did not appear. Other colours: the picture or the copy is
+  garbled; the two sample pixels help tell which.
+
 ## After the tests
 
 For what passes, the README's file table, `docs/vulkan-port.md` and `vulkan/README.md` get the date and what ran.
-Then step 3, showing a picture, has something to stand on.
+With the triangle right, step 3, showing a picture, has something to stand on.
