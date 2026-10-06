@@ -22,6 +22,8 @@ Apple already ships, for x86, a virtual GPU stack: `AppleParavirtGPU.kext` (bind
 
 If the card's client-VM failure is not root-caused, **M2 and later are blocked whatever the route** (B has the same dependency). M0 and M1 do not touch the card.
 
+**Update 2026-10-06 (Sunneva).** Two rows above have moved: a process's GPU work in its own VMID runs on the card through the Vulkan interface (graphics ring and copy engine, `docs/vulkan-port.md`, `docs/metal-readiness.md` section 4), and M3's track (a) has its compiler running on macOS (Mesa's ACO compiled the shaders of those runs under Big Sur). The runtime's own client path is reworked onto the same route and not yet run (`docs/todo-vmtest.md`).
+
 ## Milestones
 
 ### M0 (E4a): does Apple's kext accept our fake device? (go/no-go for B')

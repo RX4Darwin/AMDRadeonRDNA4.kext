@@ -2721,54 +2721,60 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	}
 	if (!containing)
 		return kIOReturnBadArgument;
-	retireIbFences(*c);
+	return submitIbLocked(*c, ibVa, dwords, fence);
+}
+
+/* Put one command buffer of `c`'s on its queue (its own, or the shared one it is pinned to) with the client's fence after it. The caller holds
+ * rtLock and has checked that the buffer is the client's to run. Also what the shared mode's boot test submits with (vmshared.cpp). */
+IOReturn RDNA4Compute::submitIbLocked(RtClient &c, uint64_t ibVa, uint64_t dwords, uint64_t &fence) {
+	retireIbFences(c);
 	/* A shared queue's ring (4 KiB) carries the jobs of up to four clients: 8 outstanding jobs of 20 dwords each keep it far from full. */
-	if (c->ibOutstanding >= (c->shared ? 8u : kMaxIbOutstanding))
+	if (c.ibOutstanding >= (c.shared ? 8u : kMaxIbOutstanding))
 		return kIOReturnBusy;
 
 	/* The same VMID-selected shader memory state as launch(): the user IB
 	 * supplies the program and resource registers, while this selector only
 	 * chains it and fences it. (Shared mode: SH_MEM was written for every VMID at the queues' start.) */
-	uint32_t ibVmid = c->vmid;
-	if (!c->shared) {
-		grbmSelect(0, c->pipe, c->queue, ibVmid);
+	uint32_t ibVmid = c.vmid;
+	if (!c.shared) {
+		grbmSelect(0, c.pipe, c.queue, ibVmid);
 		wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
 		wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 	}
 	uint32_t qseq = 0;
-	if (c->shared && vmShared == 2) {
+	if (c.shared && vmShared == 2) {
 		/* rdna4-vmshared=2: ring space first, then a VMID bound to this client's tables; the job also writes the queue's own fence. */
-		if (!sharedReserve(c->sq, 40) || !vmAcquire(*c)) {
-			vmOpTrace("submitib REFUSED: no ring space or no VMID", c->vmid, c->pipe, c->queue);
+		if (!sharedReserve(c.sq, 40) || !vmAcquire(c)) {
+			vmOpTrace("submitib REFUSED: no ring space or no VMID", c.vmid, c.pipe, c.queue);
 			return kIOReturnBusy;
 		}
-		qseq = ++sharedQ[c->sq].seq;
-		ibVmid = c->vmid;    // the one the pool just granted: it was read before the grab, which handed a stale VMID to the IB packet when the pool had moved the client
+		qseq = ++sharedQ[c.sq].seq;
+		ibVmid = c.vmid;    // the one the pool just granted: it was read before the grab, which handed a stale VMID to the IB packet when the pool had moved the client
 	}
-	const uint32_t value = nextFence(c->fence);
+	const uint32_t value = nextFence(c.fence);
 	uint32_t pkt[8];
-	Pm4::Queue &ring = c->shared ? sharedQ[c->sq].pm : c->pm4;
+	Pm4::Queue &ring = c.shared ? sharedQ[c.sq].pm : c.pm4;
 	const uint64_t ringBefore = ring.wptr();
 	/* Shared: the fence is a ring-level write to the client's fence word (MC address); else a write through the client's VM. */
-	const uint64_t fenceAt = c->shared ? poolMc(c->poolOff + kVmFence) : c->fenceVa;
+	const uint64_t fenceAt = c.shared ? poolMc(c.poolOff + kVmFence) : c.fenceVa;
 	if (!ring.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync)) ||
 	    !ring.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), ibVmid)) ||
 	    !ring.emit(pkt, Pm4::releaseMem(pkt, fenceAt, value,
-	                                    ihActive && c->pipe < 2)) ||
-	    (qseq && !ring.emit(pkt, Pm4::releaseMem(pkt, sharedQ[c->sq].fenceMc, qseq, false))))
+	                                    ihActive && c.pipe < 2)) ||
+	    (qseq && !ring.emit(pkt, Pm4::releaseMem(pkt, sharedQ[c.sq].fenceMc, qseq, false))))
 		return kIOReturnNoResources;
-	c->fence = value;
+	c.fence = value;
 	flushHdp();
-	pm4Kick(ring, c->doorbell, ring.wptr());
+	pm4Kick(ring, c.doorbell, ring.wptr());
 	if (qseq) {
-		vmPool.noteSubmit(c->vmid, c->sq, qseq);
-		sharedCommit(c->sq, qseq, static_cast<uint32_t>(ring.wptr() - ringBefore));
+		vmPool.noteSubmit(c.vmid, c.sq, qseq);
+		sharedCommit(c.sq, qseq, static_cast<uint32_t>(ring.wptr() - ringBefore));
 	}
-	vmOpTrace("submitib kicked", c->vmid, c->pipe, c->queue);
-	c->ibFences[c->ibOutstanding++] = value;
+	vmOpTrace("submitib kicked", c.vmid, c.pipe, c.queue);
+	c.ibFences[c.ibOutstanding++] = value;
 	fence = value;
 	RLOG("vmid %u: submitted unprivileged compute IB VA 0x%llx, %u dwords, fence %u",
-	     c->vmid, ibVa, static_cast<uint32_t>(dwords), value);
+	     c.vmid, ibVa, static_cast<uint32_t>(dwords), value);
 	return kIOReturnSuccess;
 }
 

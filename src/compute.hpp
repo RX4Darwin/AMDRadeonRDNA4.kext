@@ -869,6 +869,7 @@ private:
 	void publishRuntime(uint32_t stage);
 	bool initRuntimeHeap();
 	bool vmBootSelfTest();
+	bool vmSharedBootTest();           // the same proof without a queue inside a client address space (vmshared.cpp)
 	// Sparse page tables (rdna4-vmshared=2): a multi-level tree, pages backed on demand.
 	static constexpr uint32_t kSparseShadowMax = 8192;        // wired 4 KiB shadow pages over all clients (32 MiB)
 	uint32_t sparseShadowPages { 0 };
@@ -977,6 +978,7 @@ private:
 	void scrubFaultPage();
 	void releaseHost(RtBuffer &buffer);
 	void retireIbFences(RtClient &client);
+	IOReturn submitIbLocked(RtClient &client, uint64_t ibVa, uint64_t dwords, uint64_t &fence);
 	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
 	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
 	// so the two never use the ring at the same time. Everything below runs under rtLock.

@@ -61,7 +61,8 @@ case "$SLEEPTEST_MODE" in ''|*[!0-9]*) SLEEPTEST_MODE=0;; esac
 case "$GFXPM_MODE" in ''|*[!0-9]*) GFXPM_MODE=0;; esac
 case "$VMIDTEST_MODE" in ''|*[!0-9]*) VMIDTEST_MODE=0;; esac
 case "$GFXIDLE_MODE" in ''|*[!0-9]*) GFXIDLE_MODE=0;; esac
-case "$VMSHARED_MODE" in ''|*[!0-9]*) VMSHARED_MODE=0;; esac
+# Since 2026-10-06 the shared queues are the default with rdna4-vm=1; rdna4-vmshared=0 asks for the old path.
+case "$VMSHARED_MODE" in '') [ "$VM_MODE" -ne 0 ] && VMSHARED_MODE=1 || VMSHARED_MODE=0;; *[!0-9]*) VMSHARED_MODE=0;; esac
 
 # Queue recovery is an explicit last step. It is never part of an ordinary
 # collection, even when rdna4-hang=1 is present in the boot arguments.
@@ -738,9 +739,11 @@ registry_value() {
 	# Boot 9 rows (docs/vm-client-rootcause.md). vm-confound: the round 6 boots carried rdna4-vm-diag=4065 (bit 512 "F" = the GC hub's fault default
 	# page pointed at a system page while the boot test runs); the script's "active:" list did not show it, so the confound was invisible.
 	if [ "$VMSHARED_MODE" -ne 0 ]; then
-		record vmshared INFO "rdna4-vmshared=$VMSHARED_MODE: client compute jobs run on the shared VMID-0 queues (design B); runtime/submitib/fault rows test that path, vmidtest probes are the same"
+		record vmshared INFO "shared mode $VMSHARED_MODE (the default with rdna4-vm=1): client compute jobs run on the shared VMID-0 queues (design B) and the boot test goes through them; runtime/submitib/fault rows test that path"
+	elif [ "$VM_MODE" -ne 0 ]; then
+		record vmshared INFO "rdna4-vmshared=0: the old path, clients own an MEC queue each in their own address space (never serviced on the card)"
 	else
-		record vmshared SKIPPED "rdna4-vmshared not enabled (clients own an MEC queue each: the old path)"
+		record vmshared SKIPPED "rdna4-vm not enabled"
 	fi
 	if [ "$VM_MODE" -eq 0 ]; then
 		record vm-confound SKIPPED "rdna4-vm not enabled"

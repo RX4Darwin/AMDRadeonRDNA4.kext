@@ -187,3 +187,46 @@ Expected lines: `pm: survey <point>: GRBM ... CPC_STAT ... HQD 0/0..1/3 ...` at 
 
 ## 10. What I did not do
 No kext code, no GPU runs, no SSH to the card, no write to the stick, no sudo. I did not read all ~40 VM logs line by line: rounds 2-4 were classified by their results rows only (§1); the round 2 fault is in `vmfix2-findings.md`. I could not reconstruct §2.2's first client exactly ([U]).
+
+## 11. 2026-10-06: what the Vulkan work adds (Sunneva; card evidence from another rig, Big Sur 11.6.6)
+
+Not a root cause. New measurements that narrow where to look, and a change of default that follows from them.
+
+**Measured on the card** (`docs/vulkan-port.md` sections 8 to 10, `docs/todo-vulkantest.md`; logs
+`rdna4fb-diag-20261006-210519`, `-214537`, `-223154`), all in boots with `rdna4-compute=7 rdna4-gfx=2` and **no**
+`rdna4-vm`:
+
+- Idle after the bring-up and clock gating: 786 MHz, 3 %, 19 W (`gfxcg` row). No S-A.
+- VM context 8 programmed by `vmContextInit` exactly as for a client (CNTL, table base, range), tables written by the
+  CPU through the BAR in the pool, `flushHdp` and `vmInvalidate` after every change.
+- Work in address space 8 from queues that are themselves in address space 0: SDMA `INDIRECT` with VMID 8 (three
+  256 KiB copies, VRAM behind the BAR, VRAM past it and system memory, at VAs 0x100000000, 0x7ffe00000000 and
+  0xffff800000200000, patterns checked), and the graphics ring's `INDIRECT_BUFFER` with VMID 8 (RADV: a CP DMA fill, a
+  compute-shader fill, a draw with NGG vertex and pixel shaders read back exactly, 300 presented frames).
+- So on this card, without MES: the GC hub's context for a non-zero VMID, its walker, its TLB invalidation and shader
+  waves in a non-zero VMID (compute and graphics, dispatched from the graphics ring) all work. H5 (per-VMID shader
+  memory state) and the walker-side hypotheses are much weaker for it: `SH_MEM_CONFIG/BASES` for VMID 8 were written
+  once before each submission and that was enough.
+
+**What those boots never did**: build an HQD with a non-zero `CP_HQD_VMID`. Every failing boot did, at least once, in
+`vmBootSelfTest` (queue (0,1), VMID 8), before any client. That lines up with S-A appearing before any client in every
+`rdna4-vm=1` boot, round 5 (test failed) and round 6 (test passed and dequeued) alike, and with section 8's first branch
+("survey shows GRBM busy right after the boot test -> ... the (0,1) activation"). **H10**: an MMIO-loaded MEC queue with a
+non-zero VMID is itself what leaves the MEC pinned and later queues unserviced; nothing downstream (tables, SH_MEM,
+shader) is wrong. amdgpu has no such queue on gfx12 either (KFD's go through MES). Untested: nothing here ran a boot
+with such a queue on this rig, and nothing here ran a kernel **MEC** queue with a packet VMID (the copy engine and the
+graphics ring are other engines).
+
+**The change (`devel/address-space`)**: `rdna4-vm=1` now means the shared kernel queues (`rdna4-vmshared` defaults to 1;
+0 gives the old path), and in that mode the boot proof is `vmSharedBootTest` (`src/vmshared.cpp`): a client opened like
+any other, two command buffers in its address space submitted through the shared queue with the same code `SubmitIb`
+uses (`submitIbLocked`), each writing two words through its tables. No queue is built inside an address space anywhere
+on that path. This is W13's step S1 and the old boot 12, made the default. `vmBootSelfTest` and its diagnostics are
+unchanged and run only with `rdna4-vmshared=0`.
+
+**The card test that discriminates** (`docs/todo-vmtest.md`): boot A, `rdna4-vm=1` as it now is: if H10 holds, idle is
+not pinned, the boot test passes and `rdna4-run selftest` passes on the shared queues. Boot B, the same with
+`rdna4-vmshared=0`: the old path on the same rig and day; S-A and the client failures should reappear. A passes and B
+fails: H10 stands and the old path can go. Both fail: the kernel compute queue with a packet VMID (U1) is the next
+suspect, and the surveys of boot A say where it stops.
+

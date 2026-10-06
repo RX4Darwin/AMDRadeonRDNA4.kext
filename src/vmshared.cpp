@@ -285,3 +285,83 @@ int RDNA4Compute::vmClientSlotByPasid(uint32_t pasid) const {
 			return static_cast<int>(i);
 	return -1;
 }
+
+/* ---- the boot proof in shared mode ------------------------------------------------------------------------------ */
+
+// What vmBootSelfTest proves, by the route clients take in shared mode and without ever building a queue inside a client address space: a
+// client like any other (its tables, its address-space context, a place on a shared VMID-0 queue), and two command buffers in its address
+// space that each write two words through its tables, each followed by the client's fence. Runs on the bring-up thread before the runtime is
+// published, so it opens the client's slot itself. A job that does not finish gets the shared queue's own recovery (rdna4-hang=1), and the
+// address spaces stay off for the boot.
+//
+// Why not the old test in this mode: on the card every boot that built a queue in a non-zero address space, the old boot test included, left
+// the GPU at full clock before any client existed, and no client queue was ever serviced afterwards (docs/vm-client-rootcause.md, S-A to S-C).
+// Boots that never built one (2026-10-06, docs/vulkan-port.md) ran work in address space 8 from the graphics ring and the copy engine.
+bool RDNA4Compute::vmSharedBootTest() {
+	static char token;
+	const void *owner = &token;
+	if (!initRuntimeHeap()) {
+		publishResult("vm", "FAIL runtime heap");
+		return false;
+	}
+	char result[176];
+	snprintf(result, sizeof(result), "FAIL shared-queue client setup");
+	bool pass = false;
+	IOLockLock(rtLock);
+	uint32_t slot = 0;
+	while (slot < clientCap() && clients[slot].active)
+		slot++;
+	RtClient *c = slot < clientCap() ? &clients[slot] : nullptr;
+	const IOReturn opened = !c ? kIOReturnNoResources
+	                           : vmShared == 2 ? rtOpenPooled(owner, slot, c) : rtOpenShared(owner, slot, c);
+	if (opened != kIOReturnSuccess) {
+		SLOG("boot test: no client (0x%x)", opened);
+	} else if (c->ibVa && c->kernargCpu && c->fenceCpu) {
+		volatile uint32_t *ib = poolDw(c->poolOff + kVmIb);
+		const uint32_t first[2] = { 0x600DF00Du, 0x57EE1E57u }, second[2] = { 0x0DDBA11Du, 0x5EC0FFEEu };
+		uint64_t us[2] = { 0, 0 };
+		bool done[2] = { false, false }, data[2] = { false, false };
+		IOReturn sent[2] = { kIOReturnNotReady, kIOReturnNotReady };
+		uint32_t vmid = 0;
+		for (uint32_t job = 0; job < 2 && (job == 0 || (done[0] && data[0])); job++) {
+			const uint32_t *values = job ? second : first;
+			uint32_t pkt[16], n = 0;
+			n += Pm4::writeData(pkt + n, c->kernargVa, values[0]);
+			n += Pm4::writeData(pkt + n, c->kernargVa + 4, values[1]);
+			for (uint32_t i = 0; i < n; i++)
+				ib[i] = pkt[i];
+			c->kernargCpu[0] = c->kernargCpu[1] = 0;
+			flushHdp();
+			uint64_t fence = 0;
+			sent[job] = submitIbLocked(*c, c->ibVa, n, fence);
+			vmid = c->vmid;                      // mode 2 binds one at the submit
+			if (sent[job] != kIOReturnSuccess)
+				break;
+			const uint64_t t0 = mach_absolute_time();
+			for (uint32_t ms = 0; ms < 2000 && !(done[job] = fenceAtLeast(*c->fenceCpu, static_cast<uint32_t>(fence))); ms++)
+				IOSleep(1);
+			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &us[job]);
+			us[job] /= 1000;
+			data[job] = c->kernargCpu[0] == values[0] && c->kernargCpu[1] == values[1];
+			if (!done[job]) {
+				logComputeQueueState("vm shared boot test", sharedQ[c->sq].pipe, sharedQ[c->sq].queue, 0);
+				c->ibOutstanding = 0;
+				(void)recoverSharedQueue(c->sq, c->vmid, "boot test");
+			}
+		}
+		retireIbFences(*c);
+		logClientFault(*c, "vm shared boot test");
+		pass = done[0] && data[0] && done[1] && data[1];
+		SLOG("boot test: address space %u from shared queue %u (MEC1 pipe %u queue %u, VMID 0): job 1 submit 0x%x fence %s data %s (%llu us), "
+		     "job 2 submit 0x%x fence %s data %s (%llu us): %s", vmid, c->sq, sharedQ[c->sq].pipe, sharedQ[c->sq].queue, sent[0],
+		     done[0] ? "reached" : "NOT reached", data[0] ? "ok" : "WRONG", us[0], sent[1], done[1] ? "reached" : "NOT reached",
+		     data[1] ? "ok" : "WRONG", us[1], pass ? "PASS" : "FAIL");
+		snprintf(result, sizeof(result), "%s shared queue: two command buffers in address space %u from a VMID-0 kernel queue, "
+		         "written through the client's tables (%llu / %llu us)", pass ? "PASS" : "FAIL", vmid, us[0], us[1]);
+	}
+	IOLockUnlock(rtLock);
+	if (opened == kIOReturnSuccess)
+		rtRelease(owner);
+	publishResult("vm", result);
+	return pass;
+}

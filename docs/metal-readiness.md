@@ -64,6 +64,28 @@ These cost real-card rounds. Every one is measured unless marked.
 
 ## 4. The open blocker: applications' GPU work in their own VM
 
+**Update 2026-10-06 (Sunneva; card: Sunneva's RX 9070 XT under Big Sur 11.6.6, branches `devel/vulkan` and
+`devel/address-space`).** An application's GPU work in its own address space **runs on the card**, by another route than
+the one this section describes as failing:
+
+- **card**: the bring-up to stage 7, the graphics ring's own tests and the G3 triangle (`THE TRIANGLE IS RIGHT`, 8192 px)
+  under Big Sur with two displays lit; idle after clock gating 786 MHz / 3 % / 19 W, not pinned.
+- **card**: address space 8, its context registers set over MMIO (`vmContextInit`), a four-level table written by the CPU
+  through the BAR, and work in it from kernel queues that stay in address space 0, the address space named in the packet:
+  the copy engine (`INDIRECT` with VMID 8, three copies between VRAM and system memory) and the graphics ring
+  (`INDIRECT_BUFFER` with VMID 8). On the ring, Mesa's RADV ran fills, a compute shader, and a draw with a vertex and a
+  fragment shader, and showed frames through `Flip::flipTo`. `docs/vulkan-port.md` sections 8 to 10 have the logs.
+- In none of those boots was a queue ever built **inside** a non-zero address space; `rdna4-vm` was not set, so neither
+  the boot self-test nor a client queue ran. That is the one thing every failing boot of rounds 2 to 6 did and these did
+  not. It is a correlation, not a root cause: `docs/vm-client-rootcause.md` section 11.
+- **code, not run**: since `devel/address-space`, `rdna4-vm=1` uses the shared kernel compute queues by default (W13
+  S7-lite, `rdna4-vmshared=1`), and the boot self-test goes through them too (`vmSharedBootTest`, which is W13's step S1),
+  so that a `rdna4-vm=1` boot no longer builds such a queue at all. `rdna4-vmshared=0` gives the old path. Whether a
+  kernel **compute** queue honours the packet's address space on this card under this kext is the part still to be shown;
+  the card test is `docs/todo-vmtest.md`.
+
+The table in section 1 and the text below are as written on 2026-09-30.
+
 (Filled in when the final real-card round has run.) Summary so far: in every real-card VM boot every client job fails (the first
 dispatch times out, then "device not responding"; every client close logs a dequeue timeout; the GPU reads ~100 % busy before any
 client). Only the kernel's boot VM test passes, and it runs no shader. Candidates and the boots that decide them:

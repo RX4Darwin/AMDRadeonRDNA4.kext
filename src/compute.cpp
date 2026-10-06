@@ -114,10 +114,13 @@ uint32_t RDNA4Compute::requestedStage() {
 	return stage > StageKernel ? StageKernel : stage;
 }
 
+// Since 2026-10-06 a client's work runs on the shared kernel queues unless rdna4-vmshared=0 asks for the old
+// path, a queue of its own in its own address space. That path was never serviced on the card; a kernel queue
+// that takes the address space from the packet was shown to work there for the graphics ring and the copy engine
+// (docs/vulkan-port.md sections 8 and 9).
 uint32_t RDNA4Compute::requestedVmShared() {
-	uint32_t mode = 0;
-	if (!PE_parse_boot_argn("rdna4-vmshared", &mode, sizeof(mode)))
-		return 0;
+	uint32_t mode = 1;
+	(void)PE_parse_boot_argn("rdna4-vmshared", &mode, sizeof(mode));
 	return mode > 2 ? 2 : mode;
 }
 
@@ -782,7 +785,9 @@ void RDNA4Compute::runStages() {
 		if (!bringupStepAllowed("VM self-test"))
 			return;
 		vmSurvey("before vmBootSelfTest");
-		if (!featureAllowed("vm") || !vmBootSelfTest()) {
+		// The old test builds a queue inside address space 8, which is what the shared mode exists to avoid:
+		// with shared queues the proof goes through them.
+		if (!featureAllowed("vm") || !(vmShared ? vmSharedBootTest() : vmBootSelfTest())) {
 		vmEnabled = false;
 		CLOG("vm: boot self-test failed; per-client GPU VM disabled");
 		}
