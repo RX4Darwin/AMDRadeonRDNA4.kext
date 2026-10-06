@@ -28,7 +28,7 @@
 
 namespace DpPhy {
 
-constexpr size_t kMaxSteps = 6;
+constexpr size_t kMaxSteps = 8;
 
 // Each writes its steps (DMU segment 2 updates and writes) to `out`, which
 // has room for kMaxSteps, and returns how many. `link` is the link encoder
@@ -42,6 +42,15 @@ size_t configureSteps(uint8_t link, uint8_t lanes, ModeSet::Step *out);
 size_t patternSteps(uint8_t link, DpTrain::Pattern p, ModeSet::Step *out);
 // After the transmitter is disabled.
 size_t offSteps(uint8_t link, ModeSet::Step *out);
+
+// Once the link is trained and before the stream is unblanked: the link
+// encoder's back end in DisplayPort mode and on, stream encoder `dig` clocked
+// from this link's PHY, connected to the back end, on and mapped to the link
+// (what link_set_dpms_on does there: dcn401_link_encoder_setup,
+// dccg401_enable_symclk_se, connect_dig_be_to_fe, enc401_stream_encoder_enable
+// and _map_to_link). tools/atomdump.cpp finds each step in the generated
+// DisplayPort tables' wake part.
+size_t streamSteps(uint8_t dig, uint8_t link, ModeSet::Step *out);
 
 // The transmitter of `link`, whose connector's hot-plug pin is `hpd`
 // (counting from 1). The symbol clock goes in units of 10 kHz.

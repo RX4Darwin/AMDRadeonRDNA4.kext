@@ -86,6 +86,26 @@ size_t offSteps(uint8_t link, ModeSet::Step *out) {
 	return s.n;
 }
 
+size_t streamSteps(uint8_t dig, uint8_t link, ModeSet::Step *out) {
+	constexpr uint32_t kDigFeClkCntl = 0x2094, kDigFeEnCntl = 0x2095;                       // per stream encoder
+	constexpr uint32_t kDigBeClkCntl = 0x20bb, kDigBeCntl = 0x20bc, kDigBeEnCntl = 0x20bd;   // per link encoder
+	constexpr uint32_t kStreamMapper = 0x1f0d, kSymclkEnable = 0x00a0;                       // + dig; the second base_idx 1
+	const uint32_t fe = dig * kStride, be = link * kStride;
+	size_t n = 0;
+	auto update = [&](uint8_t seg, uint32_t reg, uint32_t mask, uint32_t value, const char *what) {
+		out[n++] = ModeSet::Step { ModeSet::Op::Update, seg, false, reg, mask, value, 0, what };
+	};
+	update(2, kDigBeClkCntl + be, 0x7, 0, "dig be dp mode");
+	update(2, kDigBeClkCntl + be, 0x10, 0x10, "dig be clock on");
+	update(2, kDigBeEnCntl + be, 0x1, 0x1, "dig be on");
+	update(1, kSymclkEnable + dig, 0x710, (static_cast<uint32_t>(link) << 8) | 0x10, "stream encoder symbol clock from the link");
+	update(2, kDigBeCntl + be, 0x100u << dig, 0x100u << dig, "dig be fed by the stream encoder");
+	update(2, kDigFeClkCntl + fe, 0x17, 0x10, "dig fe clock on");
+	update(2, kDigFeEnCntl + fe, 0x1, 0x1, "dig fe on");
+	update(2, kStreamMapper + dig, 0x7, link, "stream encoder mapped to the link");
+	return n;
+}
+
 // dcn10_link_encoder_enable_dp_output
 void buildEnable(Dmub::Cmd cmd, uint8_t link, uint8_t hpd, const DpTrain::Link &l) {
 	Dmub::TransmitterControl tx = transmitter(link, hpd, Dmub::TransmitterActionEnable);
