@@ -129,10 +129,10 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
 ## 6. Limits
 
 - Four configurations to light, one per connector of this card, all pipe 1 at 1920x1080@60 (148.5 MHz): DIG2
-  and link 2 for HPD3 (`src/pipe2_linux.inc`, the one every card boot so far used), DIG3 and link 3 for HPD4
-  (`src/pipe2_linux_hpd4.inc`, written 2026-10-06), and for DisplayPort DIG0 and link 0 for HPD1
-  (`src/pipe2_linux_dp1.inc`) and DIG1 and link 1 for HPD2 (`src/pipe2_linux_dp2.inc`). The last three are
-  host-tested like the first and not yet run on the card. The plan is picked by the connector the second display
+  and link 2 for HPD3 (`src/pipe2_linux.inc`), DIG3 and link 3 for HPD4 (`src/pipe2_linux_hpd4.inc`, run on the
+  card 2026-10-06: lit at boot, 144 Hz, display sleep and wake), and for DisplayPort DIG0 and link 0 for HPD1
+  (`src/pipe2_linux_dp1.inc`) and DIG1 and link 1 for HPD2 (`src/pipe2_linux_dp2.inc`). The two DisplayPort ones
+  are host-tested like the others and not yet run on the card. The plan is picked by the connector the second display
   answers on (`Pipe2::use`). Another board, or another mode to start in, needs `tools/pipegen/run.sh` run with other
   arguments. Once lit the pipe can change mode (below), and stays with its connector.
 - An HDMI mode above 340 MHz needs the table regenerated for it (the generator then turns the scrambler on by
