@@ -707,6 +707,9 @@ void bootDpPoll(OSObject *, IOTimerEventSource *timer) {
 	// cable left alone, to try the training by itself.
 	if (dev.dpTrainLevel >= 2 && ++bootDp.polls == 15000 / kHpdPollMs)
 		dev.retrainBootLink("self-test");
+	// ... and what the link is like once that has settled.
+	if (dev.dpTrainLevel >= 2 && (bootDp.polls == 17000 / kHpdPollMs || bootDp.polls == 25000 / kHpdPollMs))
+		dev.logBootLink(bootDp.polls == 17000 / kHpdPollMs ? "2 s later" : "10 s later");
 	timer->setTimeoutMS(kHpdPollMs);
 }
 

@@ -473,6 +473,7 @@ constexpr uint32_t kDmcuCanAccess = 2;
 constexpr int kReplyAck      = 0x0;  // AUX ACK + I2C ACK
 constexpr int kReplyAuxDefer = 0x2;
 constexpr int kReplyI2CDefer = 0x8;
+constexpr int kAuxNoReply    = -2;   // the transaction ran and the sink did not answer
 
 constexpr uint8_t kDdcSlave  = 0x50; // VESA DDC/EDID I2C address
 constexpr uint8_t kAuxRetry  = 7;    // per-transaction defer retries
@@ -487,6 +488,8 @@ int RDNA4Device::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
                                uint8_t *reply, uint8_t replyCap,
                                uint8_t *replyBytes) {
 	if (replyBytes) *replyBytes = 0;
+	auxWhy = "no register access";
+	auxSts = 0;
 	if (!ipDiscovery.isValid() || !rmmio)
 		return -1;
 
@@ -507,6 +510,8 @@ int RDNA4Device::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
 	uint32_t arb = regReadDmu(2, rArb);
 	if (arb == 0xFFFFFFFF)
 		return -1;
+	auxSts = arb;
+	auxWhy = "the firmware holds the AUX engine";
 	if (((arb & kAuxRwStatMask) >> kAuxRwStatShift) == kDmcuCanAccess)
 		return -1;  // the firmware microcontroller owns this engine
 	uint32_t ctl = regReadDmu(2, rCtl);
@@ -514,7 +519,9 @@ int RDNA4Device::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
 		regWriteDmu(2, rCtl, ctl | kAuxEn);
 	regWriteDmu(2, rArb, regReadDmu(2, rArb) | kAuxUseReq);
 	arb = regReadDmu(2, rArb);
+	auxSts = arb;
 	if (((arb & kAuxRwStatMask) >> kAuxRwStatShift) != kSwCanAccess) {
+		auxWhy = "the AUX engine was not granted";
 		release();
 		return -1;
 	}
@@ -565,13 +572,15 @@ int RDNA4Device::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
 		if (sts & kAuxSwDone) { done = true; break; }
 		IODelay(10);
 	}
+	auxSts = sts;
 	if (!done || (sts & kAuxHpdDiscon) ||
 	    (sts & kAuxRxTimeout) || (sts & kAuxRxTimeoutState)) {
+		auxWhy = !done ? "the engine did not finish" : (sts & kAuxHpdDiscon) ? "HPD low" : "no reply (timeout)";
 		release();
-		return -1;
+		return kAuxNoReply;
 	}
-
 	uint32_t nbytes = (sts & kAuxReplyCountMask) >> kAuxReplyCountShift;
+	auxWhy = nbytes ? "" : "empty reply";
 
 	// --- read the reply (read_channel_reply) ---
 	int replyCode = -1;
@@ -638,14 +647,21 @@ bool RDNA4Device::dpcdRead(uint8_t aux, uint32_t address, uint8_t *data, size_t 
 		const uint8_t chunk = len - pos > 16 ? 16 : static_cast<uint8_t>(len - pos);
 		uint8_t got = 0;
 		int rc = kReplyAuxDefer;
+		uint8_t timeouts = 0;
 		for (uint8_t t = 0; t < kAuxRetry && rc == kReplyAuxDefer; t++) {
 			rc = auxTransaction(aux, kActDpRead, address + static_cast<uint32_t>(pos), nullptr, chunk,
 			                    data + pos, chunk, &got);
+			if (rc == kAuxNoReply && timeouts++ < 3)
+				rc = kReplyAuxDefer;                // dce_aux_transfer_with_retries: AUX_MAX_TIMEOUT_RETRIES
 			if (rc == kReplyAuxDefer)
 				IODelay(500);
 		}
-		if (rc != kReplyAck || got == 0)
+		if (rc != kReplyAck || got == 0) {
+			FBLOG("aux: AUX%u DPCD read 0x%03x (%u byte(s)) failed: %s (reply %d, status 0x%08x)", aux,
+			      address + static_cast<uint32_t>(pos), chunk, rc == kAuxNoReply || rc == -1 ? auxWhy : "refused", rc,
+			      auxSts);
 			return false;
+		}
 		pos += got;   // a sink may answer with fewer bytes than asked
 	}
 	return true;
@@ -655,14 +671,21 @@ bool RDNA4Device::dpcdWrite(uint8_t aux, uint32_t address, const uint8_t *data, 
 	for (size_t pos = 0; pos < len; ) {
 		const uint8_t chunk = len - pos > 16 ? 16 : static_cast<uint8_t>(len - pos);
 		int rc = kReplyAuxDefer;
+		uint8_t timeouts = 0;
 		for (uint8_t t = 0; t < kAuxRetry && rc == kReplyAuxDefer; t++) {
 			rc = auxTransaction(aux, kActDpWrite, address + static_cast<uint32_t>(pos), data + pos, chunk,
 			                    nullptr, 0, nullptr);
+			if (rc == kAuxNoReply && timeouts++ < 3)
+				rc = kReplyAuxDefer;                // dce_aux_transfer_with_retries: AUX_MAX_TIMEOUT_RETRIES
 			if (rc == kReplyAuxDefer)
 				IODelay(500);
 		}
-		if (rc != kReplyAck)
+		if (rc != kReplyAck) {
+			FBLOG("aux: AUX%u DPCD write 0x%03x (%u byte(s)) failed: %s (reply %d, status 0x%08x)", aux,
+			      address + static_cast<uint32_t>(pos), chunk, rc == kAuxNoReply || rc == -1 ? auxWhy : "refused", rc,
+			      auxSts);
 			return false;
+		}
 		pos += chunk;
 	}
 	return true;
@@ -2382,6 +2405,19 @@ void RDNA4Device::bootDisplayBack() {
 	}
 }
 
+// The boot display's link as the sink and the link encoder have it, in one
+// line: to see what a retrain left and whether anything changed it afterwards.
+void RDNA4Device::logBootLink(const char *when) {
+	uint8_t set[2] {}, status[3] {};
+	const bool sink = dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) && dpcdRead(sinkAuxInst, 0x202, status, sizeof(status));
+	const uint32_t dp = pipe.link * 0x124u, arb = regReadDmu(2, auxDword(sinkAuxInst, kAuxArbControl));
+	FBLOG("dptrain: %s: sink %s rate 0x%02x lanes 0x%02x status %02x %02x %02x; DP_VID_STREAM_CNTL 0x%08x "
+	      "DP_LINK_CNTL 0x%08x DP_CONFIG 0x%08x pattern 0x%08x; AUX arbitration 0x%08x", when,
+	      sink ? "answers:" : "does not answer:", set[0], set[1], status[0], status[1], status[2],
+	      regReadDmu(2, 0x2122 + digOff()), regReadDmu(2, 0x211e + dp), regReadDmu(2, 0x2121 + dp),
+	      regReadDmu(2, 0x212e + dp), arb);
+}
+
 DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 	AtomBios::DisplayPath path {};
 	if (!bootDpLinkKnown || !pathForHpd(pipe.hpd, path)) {
@@ -2394,6 +2430,7 @@ DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 	const uint32_t stream = regReadDmu(2, kDpVidStreamCntl);
 	FBLOG("dptrain: %s: retraining %u lane(s) at rate 0x%02x on link %u (AUX%u, HPD%u), stream 0x%08x", why,
 	      bootDpLink.lanes, bootDpLink.rate, pipe.link, sinkAuxInst, pipe.hpd, stream);
+	logBootLink("before");
 	regWriteDmu(2, kDpVidStreamCntl, stream & ~1u);
 	DpTrain::Report rep {};
 	const DpTrain::Result r = trainLink(sinkAuxInst, pipe.link, pipe.hpd, static_cast<uint8_t>(path.connectorObjId & 0xff),
@@ -2403,6 +2440,7 @@ DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 	FBLOG("dptrain: %s after %u attempt(s): swing %u, pre-emphasis %u, lanes %02x %02x, aligned %u; stream 0x%08x",
 	      DpTrain::resultName(r), rep.attempts, rep.swing, rep.preEmphasis, rep.status[0], rep.status[1],
 	      rep.status[2] & 1, regReadDmu(2, kDpVidStreamCntl));
+	logBootLink("after");
 	return r;
 }
 

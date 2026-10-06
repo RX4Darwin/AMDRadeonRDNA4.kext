@@ -250,9 +250,11 @@ Result bringUp(const Io &io, const Sink &sink, const Link &link, Report *report)
 		// A sink that stopped answering will not start again by itself.
 		if (rep.result == Result::Ok || rep.result == Result::Io || rep.attempts == kAttempts)
 			return rep.result;
-		// dp_disable_link_phy: the sink to D3, the transmitter off.
+		// dp_disable_link_phy: the sink to D3 (amdgpu does not look at whether
+		// it took that), the transmitter off.
 		uint8_t d3 = 0x02;
-		if (!io.write(io.ctx, kSetPower, &d3, 1) || !io.phyOff(io.ctx))
+		io.write(io.ctx, kSetPower, &d3, 1);
+		if (!io.phyOff(io.ctx))
 			return rep.result = Result::Io;
 		pauseMs += 50;
 		io.delayUs(io.ctx, pauseMs * 1000);
