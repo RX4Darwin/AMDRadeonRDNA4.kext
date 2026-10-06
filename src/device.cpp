@@ -2857,20 +2857,80 @@ bool RDNA4Device::usePlanFor(uint8_t hpd) {
 	return true;
 }
 
-uint8_t RDNA4Device::secondSinkHpd() {
+uint8_t RDNA4Device::secondSinkHpd(bool orAnother) {
 	// DC_GPIO_HPD_Y: one byte per pin, HPD1 lowest (probeEDID).
 	const uint32_t hpdY = regReadDmu(2, 0x28f7);
 	if (hpdY == 0xFFFFFFFF)
 		return 0;
 	auto high = [&](uint8_t hpd) { return hpd && ((hpdY >> (8 * (hpd - 1))) & 1); };
-	if (pipe2Lit)   // the pipe stays with the connector it was lit for
-		return high(Pipe2::config().hpd) ? Pipe2::config().hpd : 0;
+	const Pipe2::Config &now = Pipe2::config();
+	if (pipe2Lit && (high(now.hpd) || !orAnother))   // its own connector first
+		return high(now.hpd) ? now.hpd : 0;
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
-		const uint8_t hpd = Pipe2::configAt(i).hpd;
-		if (hpd != pipe.hpd && high(hpd) && (!Pipe2::configAt(i).dp || pipe2DpAllowed))
-			return hpd;
+		const Pipe2::Config &c = Pipe2::configAt(i);
+		if (c.hpd == pipe.hpd || !high(c.hpd) || (c.dp && !pipe2DpAllowed))
+			continue;
+		// A lit pipe moves between HDMI connectors only (secondPipeTo).
+		if (!pipe2Lit || (!c.dp && !now.dp))
+			return c.hpd;
 	}
 	return 0;
+}
+
+bool RDNA4Device::secondPipeTo(uint8_t hpd) {
+	if (!pipe2Lit)
+		return false;
+	const Pipe2::Config was = Pipe2::config();
+	if (hpd == was.hpd) {
+		setSecondPipePower(true);
+		return pipe2On;
+	}
+	AtomBios::DisplayPath path {};
+	uint8_t ddcLine = 0;
+	const Pipe2::Target target = pipe2Target;
+	const uint16_t connector = pipe2ConnectorObjId;
+	bool ok = !was.dp && usePlanFor(hpd);
+	const Pipe2::Config &c = Pipe2::config();
+	ok = ok && !c.dp && pipe.dig != c.dig && pipe.link != c.link && pathForHpd(hpd, path, &ddcLine) &&
+	     Pipe2::linkOfEncoder(path.encoderObjId) == c.link;
+	if (!ok) {
+		FBLOG("pipe2: not moved from HPD%u to HPD%u: only between HDMI connectors the boot display does not use",
+		      was.hpd, hpd);
+		Pipe2::use(was.hpd);
+		return false;
+	}
+	FBLOG("pipe2: moving from HPD%u (DIG%u, link %u) to HPD%u (DIG%u, link %u) at %ux%u, %u kHz", was.hpd, was.dig,
+	      was.link, c.hpd, c.dig, c.link, pipe2Target.now.hActive, pipe2Target.now.vActive,
+	      pipe2Target.now.pixelClockKHz);
+	if (pipe2On) {   // the old link down first, by its own table
+		Pipe2::use(was.hpd);
+		runSecondPipePart(Pipe2::Part::Sleep);
+		Pipe2::use(hpd);
+		pipe2On = false;
+	}
+	pipe2Target.encoderObjId = path.encoderObjId;
+	pipe2Target.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
+	pipe2Target.ddcLine = ddcLine;
+	pipe2ConnectorObjId = path.connectorObjId;
+	// The mode set to the running timing: the pipe's clock from the new
+	// connector's PLL, its encoder and transmitter. Then that connector's sleep
+	// and wake, which leave its encoder and link as lighting there would
+	// (tools/atomdump.cpp, testPipe2Move).
+	const Modes::Mode same { 0, pipe2Target.now, pipe2Target.now.refreshMilliHz(), false, Modes::SourceBoot };
+	ok = applySecondPipeMode(same) == kIOReturnSuccess && runSecondPipePart(Pipe2::Part::Sleep) &&
+	     runSecondPipePart(Pipe2::Part::Wake);
+	if (!ok) {
+		FBLOG("pipe2: the move to HPD%u did not complete: the pipe stays with HPD%u, off", hpd, was.hpd);
+		Pipe2::use(was.hpd);
+		pipe2Target = target;
+		pipe2ConnectorObjId = connector;
+		return false;
+	}
+	pipe2On = true;
+	FBLOG("pipe2: now on HPD%u; DIG%u_DIG_FE_EN_CNTL=0x%08x SYMCLK%c_CLOCK_ENABLE=0x%08x", c.hpd, c.dig,
+	      regReadDmu(2, Pipe::Reg::kDigFeEnCntl + c.dig * Pipe::Reg::kDigStride), 'A' + c.dig,
+	      regReadDmu(1, 0x00a0 + c.dig));
+	return true;
 }
 
 bool RDNA4Device::readSecondEdid(uint8_t hpd) {

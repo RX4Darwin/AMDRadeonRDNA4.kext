@@ -134,7 +134,7 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
   (`src/pipe2_linux_dp1.inc`) and DIG1 and link 1 for HPD2 (`src/pipe2_linux_dp2.inc`). The two DisplayPort ones
   are host-tested like the others and not yet run on the card. The plan is picked by the connector the second display
   answers on (`Pipe2::use`). Another board, or another mode to start in, needs `tools/pipegen/run.sh` run with other
-  arguments. Once lit the pipe can change mode (below), and stays with its connector.
+  arguments. Once lit the pipe can change mode (below) and move between the two HDMI connectors (hot-plug, below).
 - An HDMI mode above 340 MHz needs the table regenerated for it (the generator then turns the scrambler on by
   itself).
 - The boot display must not be on the plan's blocks: with the Lenovo alone, the firmware puts it on DIG2 and link 2.
@@ -201,8 +201,15 @@ hot-plug interrupt does: IOFramebuffer counts a connect change, WindowServer ack
 the controller is asked `cscGetConnection` again, then for its EDID and modes.
 
 Until the pipe is lit, the pins of all connectors but the boot display's are watched, and the first display to
-appear decides which plan lights it. After that only that connector is handled. A DisplayPort boot display that
-was unplugged needs its link trained again to come back: `rdna4-dptrain=1`.
+appear decides which plan lights it. After that the pipe's own connector is watched; once its display is gone,
+the other HDMI connector is watched too, and a display plugged in there gets the pipe moved to it
+(`RDNA4Device::secondPipeTo`, written 2026-10-06, host-tested, not yet run on the card): the old link is already
+down by its sleep part; the mode-set engine runs to the running timing with the new connector's encoder and link,
+which clocks the pipe from that PHY's PLL; then the new connector's own sleep and wake parts. `testPipe2Move` runs
+that in both directions and every register that lighting on the new connector sets ends as lighting there would
+leave it. The old PHY's PLL is left running. Between HDMI and DisplayPort the pipe does not move (its clock source
+would have to change kind): such a display stays dark until reboot. A DisplayPort boot display that
+was unplugged comes back by itself: the firmware trains its link again (seen on the card 2026-10-06).
 
 Log lines: `hotplug: polling HPD3 (now high), acting on it; head 2 is connected`, `hotplug: HPD3 went low`,
 `hotplug: display gone from HPD3: link off`, `hotplug: the same display is back on HPD3`,

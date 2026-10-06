@@ -603,7 +603,7 @@ void head2Plugged(Head2 *h, uint8_t hpd) {
 	// The display that was there before: the link comes back in the mode it
 	// was in, and macOS finds the head, its modes and their IDs as it left them.
 	if (dev.pipe2Lit && len == h->edidLen && memcmp(h->edid, dev.edid2Data, len) == 0) {
-		dev.setSecondPipePower(true);
+		dev.secondPipeTo(hpd);
 		if (!dev.pipe2On) {
 			FBLOG("hotplug: the link did not come back: the display stays offline");
 			return;
@@ -626,8 +626,8 @@ void head2Plugged(Head2 *h, uint8_t hpd) {
 	if (!dev.pipe2Lit) {
 		dev.lightSecondPipe(head2Level, h->surface.physBase);
 	} else {
-		dev.setSecondPipePower(true);
-		if (!Edid::sameTiming(dev.pipe2Target.now, lit))
+		dev.secondPipeTo(hpd);
+		if (dev.pipe2On && !Edid::sameTiming(dev.pipe2Target.now, lit))
 			dev.applySecondPipeMode(*mode);
 	}
 	if (!dev.pipe2Lit || !dev.pipe2On) {
@@ -655,7 +655,8 @@ constexpr uint32_t kHpdPollMs = 500;
 void hotplugPoll(OSObject *, IOTimerEventSource *timer) {
 	Head2 *h = head2;
 	RDNA4Device &dev = *h->dev;
-	const uint8_t hpd = dev.secondSinkHpd();
+	// A display that is gone may come back on another connector.
+	const uint8_t hpd = dev.secondSinkHpd(!h->connected);
 	const bool present = hpd != 0;
 	if (present != h->hpdSeen) {
 		if (present)
