@@ -186,6 +186,7 @@ monitor really sleeps, and wakes it with a mode set to the running timing
 | `tools/logs-ssh.sh` | Pull the RDNA4FB kernel log and registry properties from a macOS machine over SSH. |
 | `src/dptrain.{hpp,cpp}` | DisplayPort link training (clock recovery, channel equalisation, retries), as amdgpu does it; everything the hardware and the monitor do comes through callbacks. Host-tested against `tools/dp_train_linux.inc`. |
 | `src/dpphy.{hpp,cpp}` | What training asks of DCN 4.01: the link encoder registers behind each training pattern and the DMUB transmitter commands (enable, lane drive, disable). Host-tested against the same reference. |
+| `vulkan/` | The RADV (Mesa Vulkan) port to macOS for this card, taken unchanged from Navi48-MacOS: five patches and the kernel interface they expect. Not built or run; nothing in the kext provides the interface yet (`docs/vulkan-port.md`). |
 | `tools/cgmode.py` | On the test machine: list a display's modes and switch to any of them for the login session (Displays preferences hides most modes of a monitor it takes for a television). |
 | `tools/pipegen/` | Runs Linux's own DCN 4.01 display code on the host against a recorder: generates `src/pipe2_linux*.inc` and the DisplayPort references `tools/dp_retime_linux.inc` (a mode switch) and `tools/dp_train_linux.inc` (link training against simulated monitors) (`run.sh <linux tree>`). |
 | `tools/linux-capture.sh` | Ground-truth capture of amdgpu's display programming on Linux, for the mode-set engine. |
