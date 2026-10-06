@@ -4,10 +4,25 @@ Written 2026-10-06. Everything here is built and passes its checks on a Mac, and
 (`docs/vulkan-port.md`, sections 8 and 9). Two boots, in order: the second only makes sense once the first has
 passed.
 
-Rig as before: RX 9070 XT, Big Sur 11.6.6. **One display is enough and all there will be:** with `rdna4-compute`
-the plugin does not create the second display, so the Lenovo stays as the firmware left it. Do not let the machine
-sleep during these boots: the compute runtime does not survive sleep without `rdna4-pm=1`, which is not part of
-this.
+Rig as before: RX 9070 XT, Big Sur 11.6.6. Both displays come up: since 2026-10-06 the second display is no
+longer switched off by `rdna4-compute` (its surface is kept below the compute pool). The two together have not run
+on the card; if the second display misbehaves in these boots, add `rdna4-head2=0` and say so. Do not let the
+machine sleep during these boots: the compute runtime does not survive sleep without `rdna4-pm=1`, which is not
+part of this.
+
+**Keep the kernel log small.** `rdna4-cursor=1` and `rdna4-vbl=1` write several lines per pointer movement with
+`rdna4-trace=1`, and the kernel log then loses the bring-up's lines within minutes (first try, below). For these
+boots take `rdna4-cursor`, `rdna4-vbl`, `rdna4-dmubhist` and `rdna4-dmubver` out of the boot-args, and run the
+programs and the diagnostic script in the first minutes after login.
+
+## First try, 2026-10-06: the kext had no firmware in it
+
+`n48nprobe` found no service. The kext that was loaded (UUID `0E80B175-...`) was the one built before the
+firmware was fetched: `firmware/amdgpu/` did not exist on the development Mac, the NVRAM trail said `stopped:
+stage 2 (psp) failed (no hang)` and `Compute,Stage` was 1. So the bring-up stopped where a kext without firmware
+must, and nothing of the Vulkan interface was reached. The kernel log began at 324 s, after the bring-up's own
+lines. A kext without firmware now also says so in the registry, and the diagnostic log prints it as a line
+starting with `FIRMWARE:`.
 
 What is new on each boot, so a failure can be placed:
 
@@ -52,6 +67,12 @@ If the machine does not get to the desktop at all, take `rdna4-compute` out of t
    nm build/RDNA4FB.kext/Contents/MacOS/RDNA4FB | grep -c rdna4_fw_
    ```
 
+   And note the kext's UUID, to compare with the `kext loaded?` line of the log after the boot:
+
+   ```bash
+   dwarfdump --uuid build/RDNA4FB.kext/Contents/MacOS/RDNA4FB
+   ```
+
 4. To the rig: `build/RDNA4FB.kext` (into the EFI as usual), and into one folder `build/n48nprobe`,
    `build/rdna4-run` and `tools/diagnostic-log.sh`. (With `rdna4-run` beside it the diagnostic script also runs the
    runtime's own self-test, a compute dispatch; that is m1guer's and useful to have in the same log.)
@@ -85,7 +106,8 @@ to the second to the third and back, in the client's address space.
 
 Lines to find in the log, in order:
 
-- `kext loaded?` and `active:` near the top: the UUID of the kext you built, and both boot-args.
+- `kext loaded?` and `active:` near the top: the UUID of the kext you built, and both boot-args. No line starting
+  with `FIRMWARE:` further down.
 - `compute: bring-up to stage 7 requested`, then `compute: bring-up finished at stage 7`.
 - `runtime: dma: on` and `runtime: dma: buffers from VRAM+0x...` (the copy engine and the VRAM past the BAR), then
   `runtime: user-space runtime up: RDNA4ComputeService, DMA transfers, ...`.
@@ -95,7 +117,8 @@ Lines to find in the log, in order:
 
 What failure looks like, from the bottom layer up:
 
-- `compute: psp: this build carries no firmware`: step 3 above was skipped or the old kext is still in the EFI.
+- `FIRMWARE: FAIL none in this kext`, or `compute: psp: this build carries no firmware`: step 2 or 3 above was
+  skipped, or the old kext is still in the EFI.
 - `compute: ... failed; stopping`, or no `bring-up finished at stage 7`: the bring-up itself did not get through.
   That is below everything of this work; the `compute:` lines and the NVRAM trail in the log say where.
 - `n48nprobe` prints `open: 0x...` with a reason: no service (the bring-up did not finish), needs root, or not

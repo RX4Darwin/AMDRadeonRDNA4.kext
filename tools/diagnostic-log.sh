@@ -321,7 +321,7 @@ registry_value() {
 	gated "mode-setting survey" 'RDNA4FB: mode:' modedump
 
 	section "second head and second pipe (rdna4-head2)"
-	klines 'RDNA4FB: (head2|pipe2|hotplug|dptrain):' | grep . || echo "(no head2/pipe2 lines: rdna4-head2=0, rdna4-compute, or a VM test build)"
+	klines 'RDNA4FB: (head2|pipe2|hotplug|dptrain):' | grep . || echo "(no head2/pipe2 lines: rdna4-head2=0, or a VM test build)"
 	echo '--- registry copy of the second-pipe survey: RDNA4FB,Pipe2 (step, segment:dword, value now, value after, Linux function and register)'
 	P2_PROP="$(ioreg -l -w0 2>/dev/null | grep '"RDNA4FB,Pipe2"' | sed -n -E 's/.*"RDNA4FB,Pipe2" = "(.*)"[^"]*$/\1/p' | head -1)"
 	if [ -n "$P2_PROP" ]; then
@@ -342,6 +342,9 @@ registry_value() {
 	# Capture durable evidence before any user-space command or display/GPU
 	# exercise. Refresh it after the steps below for the final registry values.
 	snapshot_logs
+	# A kext built without the AMD firmware stops at stage 2 and says so in the registry, where a wrapped kernel log cannot lose it.
+	FW_RESULT="$(registry_value firmware 2>/dev/null || true)"
+	[ -n "$FW_RESULT" ] && echo "FIRMWARE: $FW_RESULT" || true
 
 	RUNTIME_ACTIVE=0
 	RUNTIME_READY=0

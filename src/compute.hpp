@@ -173,6 +173,9 @@ public:
 
 	// The VRAM window the compute side may use: inside the CPU-visible
 	// aperture (BAR0), clear of the scanout. Offsets are from VRAM start.
+	// It never starts below kPoolFloor: the firmware's console lives at the
+	// bottom of VRAM, and the plugin keeps a second display's surface there too.
+	static constexpr uint64_t kPoolFloor = 128ull << 20;
 	struct Pool {
 		uint64_t offset;
 		uint64_t size;

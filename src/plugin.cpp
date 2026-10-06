@@ -386,10 +386,6 @@ void head2SetPower(void *ctx, bool on) {
 
 // From wrapStart, before IONDRVFramebuffer starts on the PCI device.
 void createHead2(IOPCIDevice *pci) {
-	if (computeStage) {   // the compute pool takes the VRAM behind the console
-		FBLOG("head2: not created: rdna4-compute is set");
-		return;
-	}
 	auto *h = new Head2;
 	// IONDRVDevice is private to IONDRVSupport: made by name, driven as an IOService.
 	IOService *nub = h ? OSDynamicCast(IOService, OSMetaClass::allocClassWithName("IONDRVDevice"))
@@ -498,6 +494,10 @@ void fillHead2(RDNA4Device &dev) {
 			h->range = mem;
 			h->rangeBase = base;
 			h->rangeLen = mem->getLength();
+			// With the compute bring-up the surface has to end below the compute pool, which never starts
+			// under RDNA4Compute::kPoolFloor.
+			if (computeStage && h->rangeLen > RDNA4Compute::kPoolFloor)
+				h->rangeLen = RDNA4Compute::kPoolFloor;
 			break;
 		}
 	}
@@ -1025,7 +1025,7 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	// The second display and its hot-plug are on unless turned off: lit at
 	// boot, mode switching, display sleep and hot-plug ran on the card for an
 	// HDMI monitor on either connector (2026-10-04..06). Not in VM test
-	// builds, which have no second pipe to light, and not with rdna4-compute.
+	// builds, which have no second pipe to light.
 #ifdef RDNA4FB_VM_TEST
 	uint32_t second = 0;
 #else

@@ -2780,6 +2780,13 @@ static int testNdrv() {
 	                  "ndrv: spare surface behind a 4K console at 0x%llx",
 	                  static_cast<unsigned long long>(spare.physBase));
 	// A 16 MiB range (the VM): 1080p console, surface at MiB 9; 1080p does not fit, 720p does.
+	// With the compute bring-up the range ends at the compute pool's floor (128 MiB): a 4K surface still fits
+	// behind a 4K console, and nothing may reach past the floor.
+	failures += check(Ndrv::spareSurface(kBar, k4k, kBar, 128 * kMiB, 3840, 2160, spare) &&
+	                  spare.physBase + k4k + 128 <= kBar + 128 * kMiB &&
+	                  !Ndrv::spareSurface(kBar, 96 * kMiB, kBar, 128 * kMiB, 3840, 2160, spare),
+	                  "ndrv: a second display's surface below the compute pool: ends at +0x%llx",
+	                  (unsigned long long)(spare.physBase + k4k + 128 - kBar));
 	failures += check(!Ndrv::spareSurface(kBar, k1080, kBar, 16 * kMiB, 1920, 1080, spare) &&
 	                  Ndrv::spareSurface(kBar, k1080, kBar, 16 * kMiB, 1280, 720, spare) &&
 	                  spare.physBase == kBar + 9 * kMiB,

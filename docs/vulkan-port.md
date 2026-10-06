@@ -213,8 +213,9 @@ caught) and then the real driver with the seventh patch, as before.
   `docs/hw-logs/`, of late September and taken in macOS Recovery; no boot since 2026-10-03 had `rdna4-compute`.
   The first boot with `rdna4-compute=7` under Big Sur is a test of the bring-up before it is a test of anything
   here.
-- **One display.** With `rdna4-compute` the plugin does not create the second display (the compute pool takes the
-  VRAM its surface uses).
+- **Two displays next to the bring-up have not run.** Until 2026-10-06 the plugin did not create the second
+  display with `rdna4-compute`; that guard is gone (the second display's surface is kept below 128 MiB of VRAM,
+  where the compute pool never starts), and the combination is untested on the card.
 
 **Known limits**
 

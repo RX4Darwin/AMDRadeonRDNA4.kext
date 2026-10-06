@@ -174,7 +174,7 @@ accepts a second unaccelerated head. The monitor stays dark: no pipe scans the s
   one mode, then IOBootNDRV's fallback (`Ndrv::bootReply`).
 - `IONDRVFramebuffer::getVRAMRange` is routed too and returns the surface for head 2 (added after the second boot).
 
-It refuses to run with `rdna4-compute` (the compute pool takes the VRAM behind the console).
+With `rdna4-compute` its surface has to end below 128 MiB of VRAM, where the compute pool never starts (until 2026-10-06 it refused to run with `rdna4-compute` at all; the two together have not run on the card).
 
 Risk of the dependent link [F]: the controller holds back connection-change messages while any of its heads still
 waits for WindowServer (`fWsWait`, `FB.cpp:1884`, set per head at open, cleared by `kIOFBWSStartAttribute`). If

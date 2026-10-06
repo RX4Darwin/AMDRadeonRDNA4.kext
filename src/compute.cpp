@@ -385,10 +385,9 @@ void RDNA4Compute::choosePool() {
 	// The bring-up needs 64 MiB (its layout ends below kHeapOffset); the rest
 	// of BAR0, up to 128 MiB in all, becomes the user-space heap.
 	constexpr uint64_t kAlign = 16 * kMiB, kNeed = 64 * kMiB, kMost = 128 * kMiB;
-	constexpr uint64_t kFloor = 128 * kMiB;
 	uint64_t start = (sv.scanoutOffset + env.scanoutLength + kAlign - 1) & ~(kAlign - 1);
-	if (start < kFloor)
-		start = kFloor;
+	if (start < kPoolFloor)
+		start = kPoolFloor;
 	if (start + kNeed > sv.bar0Size)
 		return;
 	const uint64_t room = (sv.bar0Size - start) & ~(kAlign - 1);
@@ -1911,6 +1910,7 @@ void RDNA4Compute::gfxPmExperiment(uint32_t mask) {
 bool RDNA4Compute::stagePsp() {
 #ifdef RDNA4FB_NO_FIRMWARE
 	CLOG("psp: this build carries no firmware (firmware/amdgpu/ was empty at build time)");
+	publishResult("firmware", "FAIL none in this kext: tools/fetch-firmware.sh, then make clean && make");
 	return false;
 #else
 	OSDictionary *d = OSDictionary::withCapacity(12);
