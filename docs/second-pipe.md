@@ -365,8 +365,12 @@ desktop on the Lenovo.
 
 The Samsung was undisturbed throughout. So the handler IOFramebuffer registers for connect interrupts can be called
 from outside an interrupt service, `kConnectionInactive` takes an IONDRV framebuffer offline and back, and a pipe
-can be lit long after boot. Display sleep with hot-plug active has only run as a blink so far (16:34: off and on
-within milliseconds, the Lenovo kept); a long sleep, where the monitor might drop its HPD pin, is not yet tried.
+can be lit long after boot.
+
+2026-10-06, the Lenovo on the other HDMI connector (HPD4) at 144 Hz, the Samsung on HPD1: two unplugs and replugs
+(`hotplug: display gone from HPD4: link off`, `hotplug: the same display is back on HPD4`, the head offline and
+back each time), then a display sleep of 9 min 45 s with hot-plug active. Both displays woke, and nothing was taken
+for an unplug while they slept.
 
 One thing that looks like a fault and is not the driver's: with the Lenovo unplugged the Samsung goes from
 "1920x1080" to "3840x2160", and back when it is plugged in again. Both are the same driver mode (id 100, 3840x2160

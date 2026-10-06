@@ -139,7 +139,7 @@ struct Trainer {
 			return Result::Io;
 		for (uint8_t i = 0; i < 4; i++)
 			st.b[i] = after[2 + i];                         // the same layout from LANE0_1_STATUS on
-		return st.all(link.lanes, 0x7) && st.aligned() ? Result::Ok : Result::LinkLost;
+		return linkUp(st.b, link.lanes) ? Result::Ok : Result::LinkLost;
 	}
 
 	// perform_8b_10b_clock_recovery_sequence
@@ -179,6 +179,13 @@ struct Trainer {
 };
 
 } // namespace
+
+bool linkUp(const uint8_t status[3], uint8_t lanes) {
+	Status st {};
+	for (size_t i = 0; i < 3; i++)
+		st.b[i] = status[i];
+	return lanes && st.all(lanes, 0x7) && st.aligned();
+}
 
 const char *resultName(Result r) {
 	switch (r) {

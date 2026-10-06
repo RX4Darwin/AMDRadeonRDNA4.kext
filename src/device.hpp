@@ -123,6 +123,7 @@ public:
 	// and its timing are not touched.
 	void noteBootDpLink();
 	DpTrain::Result retrainBootLink(const char *why);
+	void bootDisplayBack();
 	bool bootSinkPresent();              // the boot display's HPD pin
 	DpTrain::Sink bootDpSink {};
 	DpTrain::Link bootDpLink {};

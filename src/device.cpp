@@ -2361,6 +2361,27 @@ DpTrain::Result RDNA4Device::trainLink(uint8_t aux, uint8_t link, uint8_t hpd, u
 	return DpTrain::bringUp(io, sink, settings, &rep);
 }
 
+// The boot display's HPD pin is back after a second or more of low. That
+// alone does not mean the link is down: the Samsung drops the pin for a few
+// seconds on waking from display sleep, and came back by itself after its
+// cable was pulled (card, 2026-10-06). As amdgpu does for a link it suspects,
+// the sink is asked first, and a link that is up is left alone.
+void RDNA4Device::bootDisplayBack() {
+	uint8_t status[3] {};
+	if (!bootDpLinkKnown) {
+		FBLOG("dptrain: the display is back: the firmware's link is not known, nothing done");
+	} else if (!dpcdRead(sinkAuxInst, 0x202, status, sizeof(status))) {
+		FBLOG("dptrain: the display is back but its DPCD does not answer on AUX%u: link left alone", sinkAuxInst);
+	} else if (DpTrain::linkUp(status, bootDpLink.lanes)) {
+		FBLOG("dptrain: the display is back and its link is up (lanes %02x %02x, aligned %u): not retrained",
+		      status[0], status[1], status[2] & 1);
+	} else {
+		FBLOG("dptrain: the display is back and its link is down (lanes %02x %02x, aligned %u)", status[0],
+		      status[1], status[2] & 1);
+		retrainBootLink("the display is back");
+	}
+}
+
 DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 	AtomBios::DisplayPath path {};
 	if (!bootDpLinkKnown || !pathForHpd(pipe.hpd, path)) {

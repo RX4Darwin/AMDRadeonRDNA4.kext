@@ -62,6 +62,18 @@ struct Sink {
 // From DPCD 0x000 on (at least four bytes). False if they are not a sink's.
 bool parseCaps(const uint8_t *caps, size_t len, Sink &out);
 
+// Whether a link is up, from the sink's LANE0_1_STATUS, LANE2_3_STATUS and
+// LANE_ALIGN_STATUS_UPDATED (DPCD 0x202..0x204): clock recovery, equalisation
+// and symbol lock on every lane, and the lanes aligned
+// (dp_check_link_loss_status).
+bool linkUp(const uint8_t status[3], uint8_t lanes);
+
+// Whether a link is up, from the sink's LANE0_1_STATUS, LANE2_3_STATUS and
+// LANE_ALIGN_STATUS_UPDATED (DPCD 0x202..0x204): clock recovery, equalisation
+// and symbol lock on every lane, and the lanes aligned (what
+// dp_check_link_loss_status looks at).
+bool linkUp(const uint8_t status[3], uint8_t lanes);
+
 // The smallest link of the sink's that carries a stream: amdgpu's order
 // (decide_dp_link_settings), more lanes before a higher rate. False if even
 // the sink's largest is too small.
