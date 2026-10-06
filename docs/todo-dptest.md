@@ -152,17 +152,27 @@ known limit, not part of this test.
 Observed 2026-10-06: in applications like Google Chrome the pointer and typing lag on the Samsung (DisplayPort)
 and behave almost normally on the Lenovo (HDMI). At that time the Samsung ran 1920x1080 HiDPI, which is a
 3840x2160 surface, and the Lenovo a plain 1920x1080 one. There is no graphics acceleration yet, so macOS draws
-every pixel of both on the CPU, and the pointer is drawn the same way (a software cursor). The likely cause is the
-four times as many pixels, not DisplayPort. Two checks tell:
+every pixel of both on the CPU, and the pointer is drawn the same way (a software cursor).
 
-1. With the usual boot-args, hold Option while clicking "Scaled" in Displays and give the Samsung the
-   `1920x1080 (low resolution)` mode. The picture is softer. Is Chrome as responsive on it as on the Lenovo?
-   (Yes: it is the pixel count. No: it is something about that pipe, and the log is wanted.)
-2. Back at the HiDPI mode, add `rdna4-cursor=1 rdna4-vbl=1`: the pointer on the boot display becomes a hardware
-   cursor, which moves without waiting for macOS to redraw. This has run on a 1080p HDMI boot display only, never
-   on the 4K DisplayPort pipe and never together with `rdna4-head2`. Does the pointer show and move smoothly on
-   the Samsung, cross to the Lenovo and back, and survive a resolution change? If the pointer is missing or
-   stuck, remove the two boot-args.
+Two things differed between the screens then, and either could explain it without DisplayPort being at fault:
+the Samsung had four times as many pixels, and the Lenovo ran at 144 Hz against the Samsung's 60 Hz.
+
+Tried the same day with `rdna4-cursor=1 rdna4-vbl=1` (a hardware cursor on the boot display): the kext ran it on
+the 4K DisplayPort pipe next to `rdna4-head2=4` without an error in the log, through a switch to 2560x1440 and
+back, and the Samsung was still reported less responsive. So the pointer being drawn by macOS is not the whole
+cause. The log has nothing that measures responsiveness.
+
+The comparison that separates the causes, no reboot needed (usual boot-args):
+
+1. Set the Lenovo to 60 Hz. Hold Option while clicking "Scaled" in Displays and give the Samsung the
+   `1920x1080 (low resolution)` mode at 60 Hz. Both screens now have the same number of pixels at the same rate;
+   the Samsung's picture is softer. Is the same Chrome window equally responsive on both?
+   - Yes: it was the pixels, the refresh rate, or both. Step 2 says which.
+   - No: something about the boot display's pipe or head is slower, and that needs measuring in the kext.
+2. Put the Lenovo back to 144 Hz and leave the Samsung at low-resolution 1080p. If the Lenovo is clearly better
+   again, the refresh rate matters; try the Samsung's `1920x1080 (low resolution)` at 120 Hz if Displays offers it.
+3. With `rdna4-cursor=1 rdna4-vbl=1`: does the pointer itself glide on the Samsung while the window under it
+   lags, or does the pointer stutter too?
 
 Typing and scrolling lag at 3840x2160 will remain until there is acceleration.
 
