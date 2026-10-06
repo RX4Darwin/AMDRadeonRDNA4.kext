@@ -1,6 +1,6 @@
 # Vulkan on this kext: taking the RADV Darwin port
 
-Written 2026-10-06. Sections 1 to 5 are from reading source and notes; sections 6 to 8 report what was built and
+Written 2026-10-06. Sections 1 to 5 are from reading source and notes; sections 6 to 9 report what was built and
 run since, all of it on a Mac. **Nothing here has run on the card**, and the other project's claims are its own
 and unverified.
 
@@ -73,9 +73,10 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
    connection to the kext: written 2026-10-06 and checked on a host, **not run on the card**, section 8. Shows on
    the card: `build/n48nprobe` says "all ok", which includes a pattern the GPU's copy engine carried between
    three buffers at addresses the process chose.
-2. **Submit and wait** on the graphics queue in the client's address space, wrapped as Linux wraps it. Shows on the
-   card: a Vulkan program that renders offscreen and reads back the right pixels. This is the step that meets the
-   open blocker.
+2. **Submit and wait** on the graphics queue in the client's address space. Written 2026-10-06 and checked on a
+   host, **not run on the card**, section 9. Shows on the card: `vkprobe` says "done: all ok" (a fill by the
+   command processor and one by a compute shader, each read back); then a Vulkan program that renders offscreen
+   and reads back the right pixels. This is the step that meets the open blocker.
 3. **Present** through the flip path. Shows: a Vulkan program's picture on a display.
 4. Then the Metal side of `docs/metal-phase-plan.md`, with Vulkan as the executor.
 
@@ -225,4 +226,52 @@ caught) and then the real driver with the seventh patch, as before.
   it). The display does not depend on it.
 - The table is read and written in place through the uncached BAR; mapping a large buffer costs tens of
   milliseconds. VRAM past the BAR is not zeroed.
+
+## 9. Step 2: submitting work and waiting for it (2026-10-06, not run on the card)
+
+**The engine** (`src/n48n.cpp`, selectors 7 and 8) decides what a submission may be, with the rules of Mesa's
+stand-in: 1 to 64 command buffers for the graphics queue, each dword-aligned, at most 20 bits of dwords long, and
+lying end to end in mappings the client made executable (a command buffer the card cannot read would stop the queue
+for everyone); a context the client allocated; an optional fence, eight bytes in one of its buffers. Each accepted
+submission gets the next sequence number. `WaitSeq` waits for a sequence, at most 2 s at a time, and says whether
+it is still busy.
+
+- **The fence** is written by the CPU when the kext sees the sequence finished, not by the card. RADV does not
+  read it (it waits through `WaitSeq`), and it must therefore be in a buffer the CPU reaches. The stand-in accepts
+  any buffer; this is the one rule that is stricter here.
+- **Lost work.** Ten seconds without the card finishing anything (Linux gives its graphics queue the same) and
+  the work is lost: the call that notices answers "timeout", every later submit and wait "aborted", `QueryInfo`
+  carries the flag. Freeing and closing still work. Mesa turns both answers into a lost device.
+- **Freeing under work in flight.** `BoFree`, an unmap and the close first wait for everything on the queue. At
+  most 16 submissions are on the queue at a time; the 17th waits for the oldest.
+
+**On the card** (`src/n48nkext.cpp`) the work goes onto the kernel's graphics ring the way the runtime puts its
+own clients' there (`gfxClientEmit`, `docs/w12k-gfx-submit.md`): the ring stays in address space 0; a
+`CONTEXT_CONTROL`, one `INDIRECT_BUFFER` packet per command buffer naming address space 8, and a `RELEASE_MEM`
+that writes the sequence to a dword of the kext's. No page-table packets on the ring: the address space is fixed
+and set up over MMIO (section 8). It needs the graphics ring up, `rdna4-gfx=2`; without it a submit answers
+"unsupported". Lost work halts the ring's two microengines (`gfxClientWedge`) until the next boot. The compute
+queues and the display are not involved.
+
+**Checked on a host.** `make test`: nineteen malformed submissions refused and none of them reaching the queue; a
+good one across two mappings handed over as given; the fence appearing only when the work has finished; a wait
+that gives up after exactly its timeout; a full queue and a ring with no room waited out; a buffer freed under
+work in flight; lost work noticed after 10 s, in the fifth 2 s wait, and what follows it. Four planted faults
+were caught. `tools/n48n-host/run.sh`: the real driver now gets through `vkQueueSubmit`, `vkWaitForFences`,
+`vkDeviceWaitIdle` and its teardown on the engine (the stand-in queue reports everything finished at once), and
+closes with nothing left behind. `vulkan/vkprobe.c` checks two fills, which only a GPU can make true.
+
+**What this has not met.** Everything that matters about step 2 is on the card: whether the ring, brought up by
+this kext without the firmware scheduler Linux uses, runs RADV's command buffers in another address space. The
+runtime's own clients do this in the emulator only, and its first design failed on the card for a reason that was
+never found (`docs/metal-readiness.md` section 4). The copy test of section 8 is there to tell a broken address
+space from a broken graphics queue.
+
+**The card boots, in order** (each needs the firmware in the build, `tools/fetch-firmware.sh`):
+
+1. `rdna4-compute=7 rdna4-trace=1`: the bring-up's own results first (`compute:` lines, `runtime: PASS service
+   ready`), then `sudo build/n48nprobe`.
+2. The same plus `rdna4-gfx=2`: `sudo RADV_DARWIN_FAKE=1 ./vkprobe ./libvulkan_radeon.dylib`, with the library
+   from `vulkan/build-mesa.sh` copied over. `docs/real-card-plan.md` ran its graphics-ring boots with
+   `rdna4-ih=2 rdna4-hang=1` as well.
 

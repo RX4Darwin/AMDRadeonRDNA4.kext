@@ -24,6 +24,12 @@ struct HostBackend {
 	uint64_t flushes = 0, tablePages = 0;
 	std::map<uint64_t, void *> memory;   // by token: a buffer's bytes, or a table page
 
+	// The queue: nothing runs. Work is reported finished at once (`finishAt` 0), or once `pause` has been called
+	// `finishAt` times since the last submission, or never (~0). The clock moves a millisecond with every pause.
+	uint64_t finishAt = 0, pauses = 0, clockNs = 1, lostCalls = 0;
+	uint32_t finishedSequence = 0, lastSequence = 0, lastCount = 0, busyReplies = 0, submitReply = N48N::kSuccess;
+	N48N::Ib lastIbs[N48N_MAX_IBS] {};
+
 	void *bytesOf(const N48N::Memory &m) { return memory.count(m.token) ? memory[m.token] : nullptr; }
 
 	N48N::Backend backend() {
@@ -84,6 +90,34 @@ struct HostBackend {
 		b.pools = [](void *c, N48N::Pools &out) {
 			auto *h = static_cast<HostBackend *>(c);
 			out = N48N::Pools { kVisible, kVisible - h->visibleUsed, kHigh, kHigh - h->highUsed };
+		};
+		b.submit = [](void *c, const N48N::Ib *ibs, uint32_t count, uint32_t sequence) -> uint32_t {
+			auto *h = static_cast<HostBackend *>(c);
+			if (h->submitReply != N48N::kSuccess)
+				return h->submitReply;
+			if (h->busyReplies) {
+				h->busyReplies--;
+				return N48N::kBusy;
+			}
+			memcpy(h->lastIbs, ibs, count * sizeof(*ibs));
+			h->lastCount = count;
+			h->lastSequence = sequence;
+			h->pauses = 0;
+			if (!h->finishAt)
+				h->finishedSequence = sequence;
+			return N48N::kSuccess;
+		};
+		b.finished = [](void *c) { return static_cast<HostBackend *>(c)->finishedSequence; };
+		b.lost = [](void *c) { static_cast<HostBackend *>(c)->lostCalls++; };
+		b.now = [](void *c) { return static_cast<HostBackend *>(c)->clockNs; };
+		b.pause = [](void *c) {
+			auto *h = static_cast<HostBackend *>(c);
+			h->clockNs += 1000000;
+			if (++h->pauses == h->finishAt)
+				h->finishedSequence = h->lastSequence;
+		};
+		b.store = [](void *c, const N48N::Memory &m, uint64_t offset, uint64_t value) {
+			memcpy(static_cast<uint8_t *>(static_cast<HostBackend *>(c)->bytesOf(m)) + offset, &value, sizeof(value));
 		};
 		return b;
 	}

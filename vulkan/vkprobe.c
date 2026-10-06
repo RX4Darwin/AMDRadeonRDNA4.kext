@@ -3,17 +3,19 @@
 //  RDNA4FB
 //
 //  Drives the RADV Darwin build directly through its ICD entry point (no Vulkan loader needed): instance, the
-//  one device, a buffer with memory, a command buffer that fills it, a submit and a wait.
+//  one device, a buffer with memory, and two fills of it by the GPU, each submitted, waited for and checked.
 //
 //    clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -I <work>/mesa/include vulkan/vkprobe.c -o vkprobe
 //    RADV_DARWIN_FAKE=1 RADV_DARWIN_MOCK=1 ./vkprobe <work>/build/src/amd/vulkan/libvulkan_radeon.dylib
 //
 //  RADV_DARWIN_FAKE=1 makes the driver offer its device; RADV_DARWIN_MOCK=1 puts Mesa's in-process stand-in in
-//  place of the kext (nothing executes, so the fill is not seen); RADV_DARWIN_TRACE=1 logs every call the
-//  driver makes to the kext interface. Against a real kext, leave RADV_DARWIN_MOCK out.
+//  place of the kext; RADV_DARWIN_TRACE=1 logs every call the driver makes to the kext interface. Against a
+//  real kext, leave RADV_DARWIN_MOCK out, and run as root. With a stand-in nothing executes: VKPROBE_NOGPU=1
+//  then keeps the two fills from counting as failures.
 //
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -54,7 +56,7 @@ int main(int argc, char **argv) {
 #define D(name) PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(dev, #name); if (!name) { printf("no %s\n", #name); return 1; }
 	D(vkGetDeviceQueue) D(vkCreateBuffer) D(vkGetBufferMemoryRequirements) D(vkAllocateMemory) D(vkBindBufferMemory) D(vkMapMemory)
 	D(vkCreateCommandPool) D(vkAllocateCommandBuffers) D(vkBeginCommandBuffer) D(vkCmdFillBuffer) D(vkEndCommandBuffer)
-	D(vkCreateFence) D(vkQueueSubmit) D(vkWaitForFences) D(vkDeviceWaitIdle) D(vkDestroyFence) D(vkDestroyCommandPool)
+	D(vkCreateFence) D(vkQueueSubmit) D(vkWaitForFences) D(vkResetFences) D(vkDeviceWaitIdle) D(vkDestroyFence) D(vkDestroyCommandPool)
 	D(vkDestroyBuffer) D(vkFreeMemory) D(vkDestroyDevice)
 	VkQueue q; vkGetDeviceQueue(dev, fam, 0, &q);
 	VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, 1 << 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT };
@@ -67,24 +69,44 @@ int main(int argc, char **argv) {
 	VkDeviceMemory mem; OK(vkAllocateMemory(dev, &mai, 0, &mem));
 	OK(vkBindBufferMemory(dev, buf, mem, 0));
 	void *p = 0; OK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &p));
-	memset(p, 0x11, 64);
+	memset(p, 0x11, 1 << 16);
 	VkCommandPoolCreateInfo cpi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, 0, 0, fam };
 	VkCommandPool pool; OK(vkCreateCommandPool(dev, &cpi, 0, &pool));
-	VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
-	VkCommandBuffer cb; OK(vkAllocateCommandBuffers(dev, &cai, &cb));
-	VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-	OK(vkBeginCommandBuffer(cb, &bi));
-	vkCmdFillBuffer(cb, buf, 0, 1 << 16, 0xcafef00d);
-	OK(vkEndCommandBuffer(cb));
+	VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 2 };
+	VkCommandBuffer cb[2]; OK(vkAllocateCommandBuffers(dev, &cai, cb));
 	VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
 	VkFence fence; OK(vkCreateFence(dev, &fci, 0, &fence));
-	VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &cb };
-	OK(vkQueueSubmit(q, 1, &si, fence));
-	OK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 3000000000ull));
-	printf("first dword after the fill: 0x%08x (0xcafef00d only if a GPU ran it)\n", *(uint32_t *)p);
+	/* Two kinds of GPU work, the simpler first: RADV fills under 4 KiB with the command processor's own copy
+	 * (no shader), anything larger with a compute shader. */
+	const struct { VkDeviceSize offset, size; uint32_t value; const char *by; } fills[2] = {
+		{ 0, 1024, 0xcafef00d, "the command processor" }, { 4096, (1 << 16) - 4096, 0x0badf00d, "a compute shader" } };
+	int wrong = 0;
+	for (int f = 0; f < 2; f++) {
+		VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+		OK(vkBeginCommandBuffer(cb[f], &bi));
+		vkCmdFillBuffer(cb[f], buf, fills[f].offset, fills[f].size, fills[f].value);
+		OK(vkEndCommandBuffer(cb[f]));
+		VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &cb[f] };
+		OK(vkQueueSubmit(q, 1, &si, fence));
+		OK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 3000000000ull));
+		OK(vkResetFences(dev, 1, &fence));
+		const uint32_t *d = (const uint32_t *)((const char *)p + fills[f].offset);
+		VkDeviceSize i = 0;
+		while (i < fills[f].size / 4 && d[i] == fills[f].value)
+			i++;
+		const int filled = i == fills[f].size / 4;
+		printf("fill by %s, %llu bytes: %s", fills[f].by, (unsigned long long)fills[f].size, filled ? "ok\n" : "NOT FILLED");
+		if (!filled)
+			printf(" (dword %llu is 0x%08x, not 0x%08x)\n", (unsigned long long)i, d[i], fills[f].value);
+		wrong += !filled;
+	}
+	const int untouched = *(const uint32_t *)((const char *)p + 1024) == 0x11111111;
+	printf("the bytes between the two fills: %s\n", untouched ? "untouched, ok" : "CHANGED");
+	wrong += !untouched;
 	OK(vkDeviceWaitIdle(dev));
 	vkDestroyFence(dev, fence, 0); vkDestroyCommandPool(dev, pool, 0); vkDestroyBuffer(dev, buf, 0); vkFreeMemory(dev, mem, 0);
 	vkDestroyDevice(dev, 0);
-	printf("done\n");
-	return 0;
+	/* VKPROBE_NOGPU=1: nothing executes (a stand-in for the kext), so the fills are not expected to show. */
+	printf("%s\n", !wrong ? "done: all ok" : getenv("VKPROBE_NOGPU") ? "done (no GPU behind it: the fills were not expected)" : "FAILED");
+	return wrong && !getenv("VKPROBE_NOGPU");
 }

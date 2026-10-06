@@ -57,6 +57,7 @@ bool Client::open(const Backend &backend, uint32_t id, uint32_t kextBuild, uint3
 void Client::close() {
 	if (!opened)
 		return;
+	(void)quiesce();
 	for (uint32_t h = 1; h < N48N_MAX_BOS; h++)
 		if (buffers[h].bytes)
 			be.free(be.context, buffers[h].memory, buffers[h].bytes);
@@ -118,6 +119,9 @@ void Client::unmapTable(const Map &m) { VmTree::unmap(be.tables, rootPage, m.va,
 uint32_t Client::release(uint32_t handle) {
 	if (!buffer(handle))
 		return kNotFound;
+	// ponytail: work on the queue may use any buffer, so all of it is waited for; a list of each submission's
+	// buffers if freeing while the queue is busy turns out to matter.
+	(void)quiesce();
 	// Its mappings go first, and the GPU must have forgotten them before the memory is anyone else's.
 	bool mapped = false;
 	for (Map &m : maps)
@@ -161,6 +165,7 @@ uint32_t Client::mapping(const n48n_gem_va &v) {
 	if (v.operation == N48N_VA_OP_UNMAP) {
 		for (Map &m : maps)
 			if (m.bytes && m.handle == v.handle && m.va == va && m.bytes == v.map_size) {
+				(void)quiesce();
 				unmapTable(m);
 				m = Map {};
 				be.flush(be.context);
@@ -227,10 +232,14 @@ uint32_t Client::context(const n48n_ctx &in, n48n_ctx &out) {
 	return in.op == N48N_CTX_OP_QUERY_STATE2 ? kSuccess : kBadArgument;
 }
 
-void Client::info(n48n_info &out) const {
+void Client::info(n48n_info &out) {
 	Pools pools {};
 	be.pools(be.context, pools);
+	retire();
 	out = n48n_info {};
+	out.flags = lost ? N48N_INFO_HUNG : 0;
+	out.seq_emitted = emitted;
+	out.seq_retired = retired;
 	out.abi_version = N48N_ABI_VERSION;
 	out.kext_build = build;
 	out.reserved[2] = N48N_ABI_MINOR;
@@ -251,6 +260,127 @@ void Client::info(n48n_info &out) const {
 	out.va_high_last = ~0ull;
 	out.max_bos = N48N_MAX_BOS;
 	out.fence_slots = N48N_FENCE_SLOTS;
+}
+
+// Whether [va, va + bytes) lies in mappings the client made executable, end to end: a command buffer the card
+// could not read would stop the queue for everyone.
+bool Client::covered(uint64_t va, uint64_t bytes) const {
+	for (uint64_t at = va, end = va + bytes; at < end;) {
+		const Map *in = nullptr;
+		for (const Map &m : maps)
+			if (m.bytes && (m.flags & N48N_VM_PAGE_EXECUTABLE) && at >= m.va && at < m.va + m.bytes) {
+				in = &m;
+				break;
+			}
+		if (!in)
+			return false;
+		at = in->va + in->bytes;
+	}
+	return true;
+}
+
+// Take note of what the card has finished, and write the fences those submissions asked for.
+void Client::retire() {
+	if (retired == emitted)
+		return;
+	// The card reports 32 bits of a sequence; far fewer than 2^31 submissions are ever on the queue.
+	const uint64_t now = emitted - static_cast<uint32_t>(static_cast<uint32_t>(emitted) - be.finished(be.context));
+	if (now <= retired)
+		return;
+	retired = now;
+	progressAt = be.now(be.context);
+	uint32_t done = 0;
+	for (; done < jobCount && jobs[done].sequence <= retired; done++)
+		if (const Buffer *b = buffer(jobs[done].fenceHandle))
+			be.store(be.context, b->memory, jobs[done].fenceOffset, jobs[done].sequence);
+	for (uint32_t i = done; i < jobCount; i++)
+		jobs[i - done] = jobs[i];
+	jobCount -= done;
+}
+
+// Until the card has finished `sequence` or `timeoutNs` have passed: kSuccess either way, the caller compares.
+// kTimeout for the call that finds the work lost, kAborted after that.
+uint32_t Client::waitFor(uint64_t sequence, uint64_t timeoutNs) {
+	const uint64_t start = be.now(be.context);
+	for (;;) {
+		retire();
+		if (retired >= sequence)
+			return kSuccess;
+		if (lost)
+			return kAborted;
+		const uint64_t now = be.now(be.context);
+		if (now - progressAt >= kLostAfterNs) {
+			lost = true;
+			jobCount = 0;          // their fences are never written
+			be.lost(be.context);
+			return kTimeout;
+		}
+		if (now - start >= timeoutNs)
+			return kSuccess;
+		be.pause(be.context);
+	}
+}
+
+bool Client::quiesce() { return opened && waitFor(emitted, ~0ull) == kSuccess; }
+
+uint32_t Client::submit(const void *structIn, size_t structInSize, uint64_t *out) {
+	if (lost)
+		return kAborted;
+	if (structInSize < sizeof(n48n_cs_in))
+		return kBadArgument;
+	const n48n_cs_in h = read<n48n_cs_in>(structIn);
+	if (h.abi != N48N_ABI_VERSION || h.num_ibs < 1 || h.num_ibs > N48N_MAX_IBS ||
+	    structInSize != sizeof(h) + h.num_ibs * sizeof(n48n_cs_ib) || h.reserved || (h.flags & ~N48N_CS_HAS_FENCE))
+		return kBadArgument;
+	if (h.ctx_id == 0 || h.ctx_id > N48N_MAX_CTX || !contexts[h.ctx_id])
+		return kNotFound;
+
+	Ib ibs[N48N_MAX_IBS];
+	for (uint32_t i = 0; i < h.num_ibs; i++) {
+		const n48n_cs_ib ib =
+			read<n48n_cs_ib>(static_cast<const uint8_t *>(structIn) + sizeof(h) + i * sizeof(n48n_cs_ib));
+		if (ib._pad || ib.ip_type != N48N_HW_IP_GFX || ib.ip_instance || ib.ring)
+			return kBadArgument;
+		if (!ib.ib_bytes || (ib.ib_bytes & 3) || ib.ib_bytes > 0xfffffu * 4)   // the packet's length field is 20 bits of dwords
+			return kBadArgument;
+		if (!canonical(ib.va_start) || (ib.va_start & 3))
+			return kBadArgument;
+		if (ib.flags & (N48N_IB_FLAG_CE | N48N_IB_FLAG_RESET_GDS_MAX_WAVE_ID | N48N_IB_FLAG_SECURE | N48N_IB_FLAG_EMIT_MEM_SYNC))
+			return kUnsupported;
+		if (ib.flags & ~(N48N_IB_FLAG_PREAMBLE | N48N_IB_FLAG_PREEMPT | N48N_IB_FLAG_TC_WB_NOT_INVALIDATE))
+			return kBadArgument;
+		if (!covered(ib.va_start & kVaMask, ib.ib_bytes))
+			return kBadArgument;
+		ibs[i] = Ib { ib.va_start, ib.ib_bytes / 4 };
+	}
+
+	if (h.flags & N48N_CS_HAS_FENCE) {
+		const Buffer *b = buffer(h.fence_handle);
+		if (!b)
+			return kNotFound;
+		// The fence is written by the CPU when the card reports the work done (retire), so the CPU must reach it.
+		if ((h.fence_offset & 7) || h.fence_offset + 8ull > b->bytes || !b->memory.cpuVisible)
+			return kBadArgument;
+	} else if (h.fence_handle || h.fence_offset) {
+		return kBadArgument;
+	}
+
+	retire();
+	uint32_t r = jobCount == N48N_FENCE_SLOTS ? waitFor(jobs[0].sequence, ~0ull) : kSuccess;
+	if (r != kSuccess)
+		return r;
+	const uint32_t sequence = static_cast<uint32_t>(emitted + 1);
+	r = be.submit(be.context, ibs, h.num_ibs, sequence);
+	if (r == kBusy && (r = waitFor(emitted, ~0ull)) == kSuccess)
+		r = be.submit(be.context, ibs, h.num_ibs, sequence);
+	if (r != kSuccess)
+		return r;
+	if (retired == emitted)
+		progressAt = be.now(be.context);    // the clock for "lost" starts when work goes onto an idle queue
+	emitted++;
+	jobs[jobCount++] = Job { emitted, (h.flags & N48N_CS_HAS_FENCE) ? h.fence_handle : 0, h.fence_offset };
+	out[0] = emitted;
+	return kSuccess;
 }
 
 uint32_t Client::call(uint32_t selector, const uint64_t *in, uint32_t nIn, const void *structIn, size_t structInSize,
@@ -306,8 +436,25 @@ uint32_t Client::call(uint32_t selector, const uint64_t *in, uint32_t nIn, const
 			__builtin_memcpy(structOut, &reply, sizeof(reply));
 		return r;
 	}
+	case N48N_SEL_SUBMIT:
+		return nIn == 0 && outRoom == 1 && out && structRoom == 0 && structIn ? submit(structIn, structInSize, out)
+		                                                                    : kBadArgument;
+	case N48N_SEL_WAITSEQ: {
+		if (!shape(3, 3, 0, 0))
+			return kBadArgument;
+		const uint64_t target = in[0] == N48N_SEQ_LAST ? emitted : in[0];
+		if (target > emitted)
+			return kBadArgument;
+		const uint32_t r = waitFor(target, in[1] < N48N_WAIT_CAP_NS ? in[1] : N48N_WAIT_CAP_NS);
+		if (r != kSuccess)
+			return r;
+		out[0] = retired < target;   // still busy
+		out[1] = retired;
+		out[2] = emitted;
+		return kSuccess;
+	}
 	default:
-		// Submitting work and waiting for it are not here yet; the rest of the interface is not for Vulkan.
+		// The rest of the interface (showing a picture, importing memory) is not here.
 		return kUnsupported;
 	}
 }

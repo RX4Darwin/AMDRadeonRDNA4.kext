@@ -22,5 +22,5 @@ clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -I "$W/mesa/include" "$r
 clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -Wall -I "$repo/include" -I "$repo/vulkan" \
 	"$repo/vulkan/n48nprobe.c" -framework IOKit -framework CoreFoundation -o "$W/n48nprobe"
 DYLD_INSERT_LIBRARIES="$W/n48n-host.dylib" "$W/n48nprobe"
-# Then the driver. Until submitting work is in the interface, this one ends at vkQueueSubmit.
-RADV_DARWIN_FAKE=1 DYLD_INSERT_LIBRARIES="$W/n48n-host.dylib" "$W/vkprobe" "$lib"
+# Then the driver: its submissions are checked and accepted, and reported finished at once. Nothing executes.
+RADV_DARWIN_FAKE=1 VKPROBE_NOGPU=1 DYLD_INSERT_LIBRARIES="$W/n48n-host.dylib" "$W/vkprobe" "$lib"

@@ -17,9 +17,14 @@
 //                             context's registers, a flush of its translation
 //                             caches after every change of the table
 //
+//    its work                 the kernel's graphics ring (rdna4-gfx=2), which
+//                             stays in address space 0: each command-buffer
+//                             packet names the client's, and a last packet
+//                             reports the submission's sequence
+//
 //  One client at a time, root only, and not together with rdna4-vm, whose
-//  clients use the same address-space numbers. Submitting work is not here
-//  yet; what shows that the address space works is the copy test at the end
+//  clients use the same address-space numbers. What shows that the address
+//  space works before anything is drawn in it is the copy test at the end
 //  (include/rdna4vulkan.h).
 //
 //  Not run on the card.
@@ -102,6 +107,9 @@ bool mapForCard(SystemMemory *s) {
 struct RDNA4Compute::N48nState {
 	const void  *owner;
 	uint64_t     copyTestPage;   // pool offset of the copy test's command page; 0 until the first test
+	uint64_t     fencePage;      // pool offset of the dword the graphics queue reports finished work in
+	uint32_t     ringDwords;     // what this client has put on the graphics ring since the ring last ran dry
+	uint32_t     ringSequence;   // the last sequence it put there
 	N48N::Client client;         // a few hundred KiB
 };
 
@@ -216,6 +224,64 @@ struct N48nBackend {
 		out = N48N::Pools { c.heap.size(), c.heap.freeBytes(), c.devHeap.size(), c.devHeap.freeBytes() };
 	}
 
+	// Work on the kernel's graphics ring, as the runtime puts its own clients' there (gfxClientEmit;
+	// docs/w12k-gfx-submit.md has each packet against what Linux emits): the ring stays in address space 0, each
+	// command-buffer packet names the client's, and a last packet reports the sequence to the fence dword.
+	static uint32_t submit(void *context, const N48N::Ib *ibs, uint32_t count, uint32_t sequence) {
+		RDNA4Compute &c = of(context);
+		RDNA4Compute::N48nState &s = *c.n48n;
+		const IOReturn ready = c.gfxClientReady();
+		if (ready != kIOReturnSuccess)   // no graphics ring this boot (rdna4-gfx=2), not up yet, or halted after lost work
+			return ready == kIOReturnNotResponding ? N48N::kAborted : static_cast<uint32_t>(ready);
+		// ponytail: room on the ring is only counted back when all of this client's work has finished; per
+		// submission if a client ever keeps half the ring busy.
+		if (*c.poolDw(static_cast<uint32_t>(s.fencePage)) == s.ringSequence)
+			s.ringDwords = 0;
+		const uint32_t need = 3 + 4 * count + 8;
+		if (s.ringDwords + need > c.gfxRing.sizeDwords() / 2)
+			return N48N::kBusy;
+		c.grbmSelect(0, 0, 0, kVmid);      // the address space's shader memory setup, as gfx_v12_0_init_compute_vmid has it
+		c.wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
+		c.wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
+		c.grbmSelect(0, 0, 0, 0);
+		uint32_t pkt[8];
+		bool ok = c.gfxRing.emit(pkt, Pm4::contextControl(pkt, 0x80000000u, 0x80000000u));
+		for (uint32_t i = 0; i < count; i++)
+			ok = ok && c.gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, ibs[i].va, ibs[i].dwords, kVmid));
+		ok = ok && c.gfxRing.emit(pkt, Pm4::releaseMem(pkt, c.poolMc(static_cast<uint32_t>(s.fencePage)), sequence));
+		if (!ok)
+			return N48N::kNoResources;
+		c.flushHdp();                      // what the CPU wrote through the BAR, command buffers included
+		c.gfxKick(c.gfxRing.wptr());
+		s.ringDwords += need;
+		s.ringSequence = sequence;
+		return N48N::kSuccess;
+	}
+	static uint32_t finished(void *context) {
+		const RDNA4Compute &c = of(context);
+		return *c.poolDw(static_cast<uint32_t>(c.n48n->fencePage));
+	}
+	static void lost(void *context) {
+		VLOG("work on the graphics queue did not finish in %llu s", N48N::kLostAfterNs / 1000000000ull);
+		of(context).gfxClientWedge("vulkan client");
+	}
+	static uint64_t now(void *) {
+		uint64_t ns = 0;
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+		return ns;
+	}
+	// ponytail: rtLock stays held while a client waits, as in the runtime's own waits, so a second thread's call
+	// waits behind it (at most N48N_WAIT_CAP_NS at a time); drop the lock around the sleep if that shows.
+	static void pause(void *) { IOSleep(1); }
+	static void store(void *context, const N48N::Memory &m, uint64_t offset, uint64_t value) {
+		if (m.system) {
+			auto *s = reinterpret_cast<SystemMemory *>(m.token);
+			memcpy(static_cast<uint8_t *>(s->memory->getBytesNoCopy()) + offset, &value, sizeof(value));
+		} else if (m.cpuVisible) {
+			*reinterpret_cast<volatile uint64_t *>(of(context).poolCpu + m.token + offset) = value;
+		}
+	}
+
 	static N48N::Backend make(RDNA4Compute *c) {
 		N48N::Backend b {};
 		b.context = c;
@@ -227,6 +293,12 @@ struct N48nBackend {
 		b.flush = flush;
 		b.readRegs = readRegs;
 		b.pools = pools;
+		b.submit = submit;
+		b.finished = finished;
+		b.lost = lost;
+		b.now = now;
+		b.pause = pause;
+		b.store = store;
 		return b;
 	}
 
@@ -259,13 +331,16 @@ IOReturn RDNA4Compute::n48nOpen(const void *owner) {
 	RtClient context {};
 	context.vmid = kVmid;
 	const uint32_t gc = (static_cast<uint32_t>(sv.gcMajor) << 16) | (static_cast<uint32_t>(sv.gcMinor) << 8) | sv.gcRev;
-	if (!s->client.open(N48nBackend::make(this), kVmid, kBuild, gc) || !(context.rootPhys = s->client.root()) ||
-	    !vmContextInit(context)) {
+	if (!heap.alloc(kPage, s->fencePage) || !s->client.open(N48nBackend::make(this), kVmid, kBuild, gc) ||
+	    !(context.rootPhys = s->client.root()) || !vmContextInit(context)) {
 		VLOG("open failed: %s", s->client.root() ? "the address space's registers did not take" : "no page for the table");
 		s->client.close();
+		if (s->fencePage)
+			heap.free(s->fencePage);
 		IOFree(s, sizeof(*s));
 		return kIOReturnNoMemory;
 	}
+	N48nBackend::zero(*this, s->fencePage, kPage);
 	N48nBackend::flush(this);
 	n48n = s;
 	VLOG("client open: address space %u, table root at physical 0x%llx; %llu MiB of VRAM behind the BAR, %llu MiB past it",
@@ -283,10 +358,13 @@ void RDNA4Compute::n48nClose(const void *owner) {
 		n48nDiscard();     // the card is off: nothing to write to
 		return;
 	}
+	if (!n48n->client.quiesce())       // its work first: that still needs the address space
+		VLOG("client closes with work on the graphics queue that did not finish");
 	wr(IpDiscovery::HwGc, Reg { 0, static_cast<uint16_t>(GcCtx1Cntl.dword + kVmid - 1) }, 0);   // the context goes off before its table does
 	if (n48n->copyTestPage)
 		heap.free(n48n->copyTestPage);
 	n48n->client.close();
+	heap.free(n48n->fencePage);
 	IOFree(n48n, sizeof(N48nState));
 	n48n = nullptr;
 	VLOG("client closed: %llu MiB free behind the BAR, %llu MiB past it", heap.freeBytes() >> 20, devHeap.freeBytes() >> 20);

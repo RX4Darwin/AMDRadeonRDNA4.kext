@@ -2359,8 +2359,99 @@ static int testN48N() {
 	                  call(N48N_SEL_CTX, nullptr, 0, &query, sizeof(query), 0, &reply, sizeof(reply)) == N48N::kSuccess &&
 	                  call(N48N_SEL_CTX, nullptr, 0, &bad, sizeof(bad), 0, &reply, sizeof(reply)) == N48N::kBadArgument,
 	                  "n48n: contexts: %u allocated, last id %u", allocated, last);
-	failures += check(call(N48N_SEL_SUBMIT, nullptr, 0, &ctx, 64, 1, nullptr, 0) == N48N::kUnsupported,
-	                  "n48n: Submit is not there yet and must say so");
+	// Work. Two executable mappings side by side and one that is not; a fence in system memory.
+	const uint64_t code = 0x70000000, plain = 0x70100000;
+	failures += check(create(0x2000, 0, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kSuccess && out[0] == 1 &&
+	                  create(0x1000, 0, N48N_GEM_DOMAIN_GTT, 0) == N48N::kSuccess && out[0] == 4 &&
+	                  mapping(N48N_VA_OP_MAP, 1, code, 0, 0x1000, rw | N48N_VM_PAGE_EXECUTABLE) == N48N::kSuccess &&
+	                  mapping(N48N_VA_OP_MAP, 1, code + 0x1000, 0x1000, 0x1000, rw | N48N_VM_PAGE_EXECUTABLE) == N48N::kSuccess &&
+	                  mapping(N48N_VA_OP_MAP, 4, plain, 0, 0x1000, rw) == N48N::kSuccess, "n48n: buffers for the work checks");
+	const uint32_t fenceBo = 4;
+	struct Cs { n48n_cs_in h; n48n_cs_ib ib[2]; };
+	const Cs good { { N48N_ABI_VERSION, 1, 1, N48N_CS_HAS_FENCE, fenceBo, 16, 0 },
+	                { { 0, N48N_IB_FLAG_PREAMBLE, code + 0xff0, 0x40, N48N_HW_IP_GFX, 0, 0 }, {} } };
+	auto submit = [&](const Cs &cs) { return call(N48N_SEL_SUBMIT, nullptr, 0, &cs, 32 + 32 * cs.h.num_ibs, 1, nullptr, 0); };
+	auto changed = [&](void (*change)(Cs &)) {
+		Cs cs = good;
+		change(cs);
+		return submit(cs);
+	};
+	failures += check(changed([](Cs &c) { c.h.abi = 2; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.h.num_ibs = 0; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.h.flags = 2; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.h.ctx_id = 0; }) == N48N::kNotFound &&
+	                  call(N48N_SEL_SUBMIT, nullptr, 0, &good, 96, 1, nullptr, 0) == N48N::kBadArgument &&
+	                  call(N48N_SEL_SUBMIT, nullptr, 0, &good, 64, 0, nullptr, 0) == N48N::kBadArgument,
+	                  "n48n: a malformed submission accepted");
+	failures += check(changed([](Cs &c) { c.ib[0].ip_type = 1; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.ib[0].ib_bytes = 0x42; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.ib[0].va_start |= 1ull << 50; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.ib[0].flags = N48N_IB_FLAG_CE; }) == N48N::kUnsupported &&
+	                  changed([](Cs &c) { c.ib[0].flags = 1u << 9; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.ib[0].va_start = 0x70100000; }) == N48N::kBadArgument &&    // mapped, not executable
+	                  changed([](Cs &c) { c.ib[0].ib_bytes = 0x1014; }) == N48N::kBadArgument &&        // runs off the second mapping
+	                  changed([](Cs &c) { c.ib[0].va_start = 0x60000000; }) == N48N::kBadArgument,      // not mapped
+	                  "n48n: a command buffer the card could not run accepted");
+	failures += check(changed([](Cs &c) { c.h.fence_handle = 9; }) == N48N::kNotFound &&
+	                  changed([](Cs &c) { c.h.fence_offset = 12; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.h.fence_offset = 0xffc; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.h.fence_handle = 3; }) == N48N::kBadArgument &&             // VRAM the CPU cannot reach
+	                  changed([](Cs &c) { c.h.flags = 0; }) == N48N::kBadArgument && host.lastSequence == 0,
+	                  "n48n: a bad fence accepted, or a refused submission reached the queue");
+
+	// A good one: across the two mappings, the card slow to finish. The fence appears when it has.
+	host.finishAt = ~0ull;
+	uint64_t fence = 0;
+	auto fenceNow = [&] {
+		memcpy(&fence, static_cast<uint8_t *>(host.bytesOf(c.buffer(fenceBo)->memory)) + 16, 8);
+		return fence;
+	};
+	const uint64_t now1[3] = { 1, 0, 0 }, newest[3] = { N48N_SEQ_LAST, 5000000, 0 }, ahead[3] = { 2, 0, 0 };
+	failures += check(submit(good) == N48N::kSuccess && out[0] == 1 && host.lastSequence == 1 && host.lastCount == 1 &&
+	                  host.lastIbs[0].va == code + 0xff0 && host.lastIbs[0].dwords == 0x10,
+	                  "n48n: Submit -> sequence %llu, %u dwords at 0x%llx", (unsigned long long)out[0], host.lastIbs[0].dwords,
+	                  (unsigned long long)host.lastIbs[0].va);
+	failures += check(call(N48N_SEL_WAITSEQ, now1, 3, nullptr, 0, 3, nullptr, 0) == N48N::kSuccess && out[0] == 1 && out[1] == 0 &&
+	                  out[2] == 1 && fenceNow() == 0 && call(N48N_SEL_WAITSEQ, ahead, 3, nullptr, 0, 3, nullptr, 0) == N48N::kBadArgument,
+	                  "n48n: WaitSeq on unfinished work: busy %llu", (unsigned long long)out[0]);
+	const uint64_t before = host.clockNs;
+	failures += check(call(N48N_SEL_WAITSEQ, newest, 3, nullptr, 0, 3, nullptr, 0) == N48N::kSuccess && out[0] == 1 &&
+	                  host.clockNs - before == 5000000, "n48n: WaitSeq gives up after its timeout, still busy");
+	host.finishAt = host.pauses + 3;
+	failures += check(call(N48N_SEL_WAITSEQ, newest, 3, nullptr, 0, 3, nullptr, 0) == N48N::kSuccess && out[0] == 0 && out[1] == 1 &&
+	                  fenceNow() == 1, "n48n: WaitSeq sees the work finish; fence %llu", (unsigned long long)fence);
+
+	// More than the queue holds at once, a queue with no room, and freeing a buffer under work in flight: each waits.
+	host.finishAt = 4;
+	bool many = true;
+	for (uint32_t i = 0; i < N48N_FENCE_SLOTS + 2; i++)
+		many &= submit(good) == N48N::kSuccess;
+	host.busyReplies = 1;
+	const uint64_t free4[1] = { fenceBo };
+	failures += check(many && submit(good) == N48N::kSuccess && out[0] == N48N_FENCE_SLOTS + 4 && host.busyReplies == 0 &&
+	                  host.finishedSequence == N48N_FENCE_SLOTS + 3, "n48n: a full queue is waited out; sequence %llu",
+	                  (unsigned long long)out[0]);
+	failures += check(call(N48N_SEL_BOFREE, free4, 1, nullptr, 0, 0, nullptr, 0) == N48N::kSuccess &&
+	                  host.finishedSequence == N48N_FENCE_SLOTS + 4 && !c.buffer(fenceBo),
+	                  "n48n: a buffer freed before the work on the queue had finished");
+
+	// Work that never finishes: ten seconds without progress and it is lost, for good.
+	Cs plainCs = good;
+	plainCs.h.flags = plainCs.h.fence_handle = plainCs.h.fence_offset = 0;
+	host.finishAt = ~0ull;
+	const uint64_t two[3] = { N48N_SEQ_LAST, ~0ull, 0 };
+	uint32_t waits = 0, r = submit(plainCs);
+	const uint64_t lostFrom = host.clockNs;
+	while (r == N48N::kSuccess && waits++ < 10)
+		r = call(N48N_SEL_WAITSEQ, two, 3, nullptr, 0, 3, nullptr, 0);
+	failures += check(r == N48N::kTimeout && waits == 5 && host.clockNs - lostFrom == N48N::kLostAfterNs && host.lostCalls == 1,
+	                  "n48n: lost work noticed after %llu ms, in wait %u", (unsigned long long)((host.clockNs - lostFrom) / 1000000), waits);
+	const uint64_t free1b[1] = { 1 };
+	failures += check(submit(plainCs) == N48N::kAborted && call(N48N_SEL_WAITSEQ, two, 3, nullptr, 0, 3, nullptr, 0) == N48N::kAborted &&
+	                  call(N48N_SEL_QUERYINFO, nullptr, 0, nullptr, 0, 0, &info, sizeof(info)) == N48N::kSuccess &&
+	                  (info.flags & N48N_INFO_HUNG) && info.seq_emitted == info.seq_retired + 1 && host.lostCalls == 1 &&
+	                  call(N48N_SEL_BOFREE, free1b, 1, nullptr, 0, 0, nullptr, 0) == N48N::kSuccess,
+	                  "n48n: after lost work: submit and wait refused, freeing still works");
 
 	// Closing gives everything back: buffers, every table page, the root.
 	c.close();
@@ -2378,7 +2469,7 @@ static int testN48N() {
 	ok = ok && !GpuVm::walk(root, 0x200000, readEntry, &host, phys, entry) && GpuVm::walk(root, 0x1ff000, readEntry, &host, phys, entry);
 	VmTree::destroy(pages, root);
 	failures += check(ok && host.tablePages == 0 && host.memory.empty(), "vmtree: map, unmap and destroy across a table boundary");
-	printf("n48n: the Vulkan interface's memory half and its page table %s\n", failures ? "MISMATCH" : "ok");
+	printf("n48n: the Vulkan interface (memory, work) and its page table %s\n", failures ? "MISMATCH" : "ok");
 	return failures;
 }
 
