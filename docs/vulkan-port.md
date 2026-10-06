@@ -286,7 +286,8 @@ The copy test of section 8 is there to tell a broken address space from a broken
 
 1. `rdna4-compute=7 rdna4-trace=1`: the bring-up's own results first (`compute:` lines, `runtime: PASS service
    ready`), then `sudo build/n48nprobe`.
-2. The same plus `rdna4-gfx=2`: `sudo RADV_DARWIN_FAKE=1 ./vkprobe ./libvulkan_radeon.dylib`, with the library
+2. The same plus `rdna4-gfx=2`: `sudo ./vkprobe ./libvulkan_radeon.dylib`, with the library
    from `vulkan/build-mesa.sh` copied over. `docs/real-card-plan.md` ran its graphics-ring boots with
    `rdna4-ih=2 rdna4-hang=1` as well.
 
+The guide for both boots, with what to look for and what failure looks like: `docs/todo-vulkantest.md`.

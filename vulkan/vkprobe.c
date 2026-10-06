@@ -6,12 +6,11 @@
 //  one device, a buffer with memory, and two fills of it by the GPU, each submitted, waited for and checked.
 //
 //    clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -I <work>/mesa/include vulkan/vkprobe.c -o vkprobe
-//    RADV_DARWIN_FAKE=1 RADV_DARWIN_MOCK=1 ./vkprobe <work>/build/src/amd/vulkan/libvulkan_radeon.dylib
+//    RADV_DARWIN_MOCK=1 VKPROBE_NOGPU=1 ./vkprobe <work>/build/src/amd/vulkan/libvulkan_radeon.dylib
 //
-//  RADV_DARWIN_FAKE=1 makes the driver offer its device; RADV_DARWIN_MOCK=1 puts Mesa's in-process stand-in in
-//  place of the kext; RADV_DARWIN_TRACE=1 logs every call the driver makes to the kext interface. Against a
-//  real kext, leave RADV_DARWIN_MOCK out, and run as root. With a stand-in nothing executes: VKPROBE_NOGPU=1
-//  then keeps the two fills from counting as failures.
+//  RADV_DARWIN_MOCK=1 puts Mesa's in-process stand-in in place of the kext; RADV_DARWIN_TRACE=1 logs every call
+//  the driver makes to the kext interface. Against a real kext, leave RADV_DARWIN_MOCK out and run as root.
+//  With a stand-in nothing executes: VKPROBE_NOGPU=1 then keeps the two fills from counting as failures.
 //
 #include <dlfcn.h>
 #include <stdio.h>
