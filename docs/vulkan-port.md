@@ -1,8 +1,8 @@
 # Vulkan on this kext: taking the RADV Darwin port
 
 Written 2026-10-06. Sections 1 to 5 are from reading source and notes; sections 6 to 9 report what was built and
-run since, all of it on a Mac. **Nothing here has run on the card**, and the other project's claims are its own
-and unverified.
+run since. On the card so far (2026-10-06): the memory half and its copy test, section 8. Submitting work has not
+run there. The other project's claims are its own and unverified.
 
 ## 1. The decision
 
@@ -70,9 +70,8 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
 0. **Build the patched Mesa on a Mac and run its own tests.** Done 2026-10-06, section 6.
 1. **The interface in this kext, memory half**: connection, buffers, mapping into the process, the 4-level table
    with caller-chosen addresses, contexts. The engine, which needs no card: done 2026-10-06, section 7. Its
-   connection to the kext: written 2026-10-06 and checked on a host, **not run on the card**, section 8. Shows on
-   the card: `build/n48nprobe` says "all ok", which includes a pattern the GPU's copy engine carried between
-   three buffers at addresses the process chose.
+   connection to the kext: section 8, **verified on the card 2026-10-06**: `build/n48nprobe` says "all ok", which
+   includes a pattern the GPU's copy engine carried between three buffers at addresses the process chose.
 2. **Submit and wait** on the graphics queue in the client's address space. Written 2026-10-06 and checked on a
    host, **not run on the card**, section 9. Shows on the card: `vkprobe` says "done: all ok" (a fill by the
    command processor and one by a compute shader, each read back); then a Vulkan program that renders offscreen
@@ -171,7 +170,7 @@ page, 4 KiB pages for the table with a CPU pointer to each, the registers of the
 at the table's root, a translation-cache flush, the four `GB_ADDR_CONFIG` registers, and a user client that
 carries the calls and maps a buffer into the process. One connection at a time.
 
-## 8. Step 1, second part: the engine connected to the kext (2026-10-06, not run on the card)
+## 8. Step 1, second part: the engine connected to the kext (2026-10-06, verified on the card)
 
 `src/n48nkext.cpp` is all of it; the runtime's own files change by a few lines (declarations in
 `src/compute.hpp` and `src/userclient.hpp`, one call in the wake's cleanup in `src/runtime.cpp`, one packet in
@@ -204,18 +203,15 @@ Checked on a host: `make test` has the new packet against Linux's encoding; `too
 `n48nprobe` on the engine with the CPU standing in for the copy engine (all ok; a planted fault in the copy is
 caught) and then the real driver with the seventh patch, as before.
 
-**What stands between this and a card test**
-
-- **Firmware in the build.** The compute bring-up loads AMD's firmware, which the build embeds from
-  `firmware/amdgpu/` (`tools/fetch-firmware.sh`, about 13 files from linux-firmware). A kext built without it
-  stops at stage 1 and says so. Every kext built on the development Mac so far was built without it.
-- **The bring-up has not run in any boot of the display work.** The logs that show it passing are the ones in
-  `docs/hw-logs/`, of late September and taken in macOS Recovery; no boot since 2026-10-03 had `rdna4-compute`.
-  The first boot with `rdna4-compute=7` under Big Sur is a test of the bring-up before it is a test of anything
-  here.
-- **Two displays next to the bring-up have not run.** Until 2026-10-06 the plugin did not create the second
-  display with `rdna4-compute`; that guard is gone (the second display's surface is kept below 128 MiB of VRAM,
-  where the compute pool never starts), and the combination is untested on the card.
+**On the card, 2026-10-06** (Big Sur 11.6.6, kext `F8A4B018`, both displays lit, log
+`rdna4fb-diag-20261006-210519`): the bring-up finished at stage 7 with the firmware in the build, and `n48nprobe`
+ended in "all ok". Address space 8 with its table at physical 0xa001000; a buffer behind the BAR, one past it and
+one in system memory at 0x100000000, 0x7ffe00000000 and 0xffff800000200000; three copies of 256 KiB by the copy
+engine in that address space, each pattern checked by the CPU; everything given back at the close. So on this
+card, without the firmware scheduler: a four-level table written through the BAR, the context's registers set
+over MMIO, system pages reached through their table entries, and a kernel queue running a command buffer in
+another address space all work. A first try the same day reached none of this: its kext had been built without
+the firmware (`docs/todo-vulkantest.md`).
 
 **Known limits**
 
@@ -276,7 +272,8 @@ path (`amd/native_s1b.cpp`, `amd/native_s1c_pure.h`, `amd/amdgpu_init.cpp`) and 
   scheduler's own range. This kext programs the ring directly and starts no scheduler. Whether that matters for
   a command buffer in another address space is not known; it is the one structural difference left.
 - **This kext's graphics ring has run on a card, in address space 0 only.** `docs/HANDOFF-linux.md` records its
-  ring test and a draw whose shader ran (the picture was wrong for a reason found later under Linux). No card log
+  ring test and a draw whose shader ran (the picture was wrong for a reason found later under Linux); on
+  2026-10-06 the ring came up on this rig and the kext's own triangle was right. No card log
   has a command buffer in another address space on it: the runtime's clients do that in the emulator only, and
   its first design, a compute queue per client, failed on the card for a reason that was never found
   (`docs/metal-readiness.md` section 4).

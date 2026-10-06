@@ -23,10 +23,11 @@ driver talks to a kernel extension through an IOKit user client. The header is t
 the part of Linux's amdgpu ioctls RADV uses (buffers, address-space mapping, contexts, command submission,
 fences) plus calls to present to the screen.
 
-**Status: builds, and runs on a Mac against its own stand-in for the kext and against this kext's engine
-(`tools/n48n-host/`); never run against a kext or a card.** The kext has the interface up to submitting work and
-waiting for it (`src/n48nkext.cpp`), none of it run on the card. `docs/vulkan-port.md` has what the port needs
-from the kext, what this repository already has, the order of work, and what each step showed.
+**Status: the driver builds, and runs on a Mac against its own stand-in for the kext and against this kext's
+engine (`tools/n48n-host/`); it has not run against the kext on a card yet.** The kext's memory half of the
+interface is verified on the card (2026-10-06, `n48nprobe.c`: all ok); submitting work and waiting for it are
+written and not run there. `docs/vulkan-port.md` has what the port needs from the kext, the order of work and
+what each step showed; `docs/todo-vulkantest.md` is the guide for the card tests.
 
 Not taken from that project, on purpose: its Metal bundle, its helper accelerator kext and its hooks into Apple's
 Radeon driver. They are built against the internals of one macOS build; the Vulkan driver and its kernel interface

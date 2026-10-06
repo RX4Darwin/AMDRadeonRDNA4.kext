@@ -1,28 +1,41 @@
 # Card tests for the Vulkan interface
 
-Written 2026-10-06. Everything here is built and passes its checks on a Mac, and none of it has run on the card
-(`docs/vulkan-port.md`, sections 8 and 9). Two boots, in order: the second only makes sense once the first has
-passed.
+Written 2026-10-06. **Boot 1 passed on the card the same day** (below). Boot 2, work on the graphics ring, is the
+one still to run; it has not run on the card.
 
-Rig as before: RX 9070 XT, Big Sur 11.6.6. Both displays come up: since 2026-10-06 the second display is no
-longer switched off by `rdna4-compute` (its surface is kept below the compute pool). The two together have not run
-on the card; if the second display misbehaves in these boots, add `rdna4-head2=0` and say so. Do not let the
-machine sleep during these boots: the compute runtime does not survive sleep without `rdna4-pm=1`, which is not
-part of this.
+Rig as before: RX 9070 XT (revision 0xC0), Big Sur 11.6.6. Both displays come up next to the compute bring-up
+(verified in boot 1). Do not let the machine sleep during these boots: the compute runtime does not survive sleep
+without `rdna4-pm=1`, which is not part of this.
 
 **Keep the kernel log small.** `rdna4-cursor=1` and `rdna4-vbl=1` write several lines per pointer movement with
-`rdna4-trace=1`, and the kernel log then loses the bring-up's lines within minutes (first try, below). For these
-boots take `rdna4-cursor`, `rdna4-vbl`, `rdna4-dmubhist` and `rdna4-dmubver` out of the boot-args, and run the
-programs and the diagnostic script in the first minutes after login.
+`rdna4-trace=1`, and the kernel log then loses the bring-up's lines within minutes (first try, below). Either take
+them out for these boots, or run the programs and the diagnostic script in the first two or three minutes after
+login, as in the second try.
+
+## Boot 1, 2026-10-06: passed (second try)
+
+Kext `F8A4B018-...`, firmware in the build, boot-args `rdna4-compute=7 rdna4-gfx=2` next to the usual ones, both
+displays lit. Log `rdna4fb-diag-20261006-210519`.
+
+- The bring-up finished at stage 7 under Big Sur, 5 s after the second display was lit: firmware loaded through
+  the PSP, the copy engine up (`dma: on`, 13 GB/s both ways), 7896 MiB of VRAM past the BAR for buffers, default
+  clock gating applied (298 W to 19 W by the card's own sensors).
+- The graphics ring came up and **the kext's own test triangle was right** (`gfx PASS ring test, THE TRIANGLE IS
+  RIGHT, draw 8192 px`): until now that had only been shown under Linux.
+- `n48nprobe`: **all ok**. A buffer in VRAM behind the BAR, one past it and one in system memory, mapped at
+  0x100000000, 0x7ffe00000000 and 0xffff800000200000; the GPU's copy engine, working in address space 8, carried
+  the pattern through all three and back; the kernel log has the three `vulkan: copy test:` lines and the open
+  and close around them.
+- Not a failure, though the table says `runtime FAIL`: `rdna4-run` was not beside the diagnostic script, so the
+  runtime's own self-test did not run. The ring's bring-up logs a latched fault at address 0 after its ring test
+  (`GC hub fault status 0x00000d3d`); that one is known and older than this work (`docs/gfx-context-audit.md`).
 
 ## First try, 2026-10-06: the kext had no firmware in it
 
 `n48nprobe` found no service. The kext that was loaded (UUID `0E80B175-...`) was the one built before the
-firmware was fetched: `firmware/amdgpu/` did not exist on the development Mac, the NVRAM trail said `stopped:
-stage 2 (psp) failed (no hang)` and `Compute,Stage` was 1. So the bring-up stopped where a kext without firmware
-must, and nothing of the Vulkan interface was reached. The kernel log began at 324 s, after the bring-up's own
-lines. A kext without firmware now also says so in the registry, and the diagnostic log prints it as a line
-starting with `FIRMWARE:`.
+firmware was fetched: the NVRAM trail said `stopped: stage 2 (psp) failed (no hang)` and `Compute,Stage` was 1.
+The kernel log began at 324 s, after the bring-up's own lines. A kext without firmware now also says so in the
+registry, and the diagnostic log prints it as a line starting with `FIRMWARE:`.
 
 What is new on each boot, so a failure can be placed:
 
@@ -136,8 +149,10 @@ What failure looks like, from the bottom layer up:
 
 Only if boot 1 ended in `all ok`.
 
-On the development Mac first, the driver and its test program (the first command downloads Mesa, about 150 MB,
-into the directory you name, and needs clang, ninja, bison, flex, pkg-config and glslangValidator):
+The driver and its test program are in `build/` on the development Mac already (`build/vkprobe`,
+`build/libvulkan_radeon.dylib`, built 2026-10-06 for macOS 11; `make clean` removes them). To build them anew
+(the first command downloads Mesa, about 150 MB, into the directory you name, and needs clang, ninja, bison, flex,
+pkg-config and glslangValidator):
 
 ```bash
 vulkan/build-mesa.sh ~/radv-build
@@ -155,14 +170,15 @@ does not start, the message it prints is the result.
 rdna4-compute=7 rdna4-gfx=2 rdna4-trace=1
 ```
 
-A minute after login:
+Boot 1 already ran with these boot-args and the ring came up, so this is the same boot again. In the first two
+or three minutes after login:
 
 ```bash
 sudo ./n48nprobe
 ```
 
 ```bash
-sudo ./vkprobe ./libvulkan_radeon.dylib
+sudo ./vkprobe ./libvulkan_radeon.dylib 2>&1 | tee vkprobe.txt
 ```
 
 ```bash
