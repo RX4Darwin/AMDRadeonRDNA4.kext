@@ -147,6 +147,25 @@ it onto its 3840x2160 timing`, then `modes: switching to id N ...` and `modes: n
 In this state the Samsung has no 3840x2160 mode: the kext offers nothing larger than the console. That is a
 known limit, not part of this test.
 
+## Test 5: pointer and input lag on the 4K display (no extra hardware)
+
+Observed 2026-10-06: in applications like Google Chrome the pointer and typing lag on the Samsung (DisplayPort)
+and behave almost normally on the Lenovo (HDMI). At that time the Samsung ran 1920x1080 HiDPI, which is a
+3840x2160 surface, and the Lenovo a plain 1920x1080 one. There is no graphics acceleration yet, so macOS draws
+every pixel of both on the CPU, and the pointer is drawn the same way (a software cursor). The likely cause is the
+four times as many pixels, not DisplayPort. Two checks tell:
+
+1. With the usual boot-args, hold Option while clicking "Scaled" in Displays and give the Samsung the
+   `1920x1080 (low resolution)` mode. The picture is softer. Is Chrome as responsive on it as on the Lenovo?
+   (Yes: it is the pixel count. No: it is something about that pipe, and the log is wanted.)
+2. Back at the HiDPI mode, add `rdna4-cursor=1 rdna4-vbl=1`: the pointer on the boot display becomes a hardware
+   cursor, which moves without waiting for macOS to redraw. This has run on a 1080p HDMI boot display only, never
+   on the 4K DisplayPort pipe and never together with `rdna4-head2`. Does the pointer show and move smoothly on
+   the Samsung, cross to the Lenovo and back, and survive a resolution change? If the pointer is missing or
+   stuck, remove the two boot-args.
+
+Typing and scrolling lag at 3840x2160 will remain until there is acceleration.
+
 ## After the tests
 
 For each test that passes, the README's status list and `docs/second-pipe.md` get the date and what ran, as for
