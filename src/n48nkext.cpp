@@ -245,7 +245,10 @@ struct N48nBackend {
 		c.wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 		c.grbmSelect(0, 0, 0, 0);
 		uint32_t pkt[8];
-		bool ok = c.gfxRing.emit(pkt, Pm4::contextControl(pkt, 0x80000000u, 0x80000000u));
+		// Load enable alone and no shadow word: what Navi48-MacOS puts on its ring for this driver, and Linux's
+		// third dword (Linux adds load bits for a context switch, 0x81018003; the driver's own command buffers
+		// start with their own CONTEXT_CONTROL).
+		bool ok = c.gfxRing.emit(pkt, Pm4::contextControl(pkt, 0x80000000u, 0));
 		for (uint32_t i = 0; i < count; i++)
 			ok = ok && c.gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, ibs[i].va, ibs[i].dwords, kVmid));
 		ok = ok && c.gfxRing.emit(pkt, Pm4::releaseMem(pkt, c.poolMc(static_cast<uint32_t>(s.fencePage)), sequence));

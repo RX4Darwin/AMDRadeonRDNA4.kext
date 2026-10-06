@@ -261,11 +261,26 @@ were caught. `tools/n48n-host/run.sh`: the real driver now gets through `vkQueue
 `vkDeviceWaitIdle` and its teardown on the engine (the stand-in queue reports everything finished at once), and
 closes with nothing left behind. `vulkan/vkprobe.c` checks two fills, which only a GPU can make true.
 
-**What this has not met.** Everything that matters about step 2 is on the card: whether the ring, brought up by
-this kext without the firmware scheduler Linux uses, runs RADV's command buffers in another address space. The
-runtime's own clients do this in the emulator only, and its first design failed on the card for a reason that was
-never found (`docs/metal-readiness.md` section 4). The copy test of section 8 is there to tell a broken address
-space from a broken graphics queue.
+**What this has not met.** Everything that matters about step 2 is on the card: whether the ring runs RADV's
+command buffers in another address space. Three facts frame that, found by comparing with Navi48-MacOS's native
+path (`amd/native_s1b.cpp`, `amd/native_s1c_pure.h`, `amd/amdgpu_init.cpp`) and with this repository's own notes:
+
+- **The packets are the same.** Their submit is `CONTEXT_CONTROL`, one `INDIRECT_BUFFER` per command buffer with
+  the address space in bits 27:24 and no VALID bit, then `RELEASE_MEM`: what the runtime's `gfxClientEmit`
+  emits and what this backend emits. Their `CONTEXT_CONTROL` carries the load enable and a zero shadow word; the
+  backend now does the same (the runtime's own uses 0x80000000 for both). Their address space is set up as here:
+  depth 3, block size 0, no retry on faults, the whole 48-bit range, over MMIO.
+- **Their graphics queue is mapped by the firmware scheduler (MES), as Linux's is; this kext's is not.** They ask
+  the scheduler to map the queue (`ADD_QUEUE` with `map_legacy_kq`) and keep address space 8 outside the
+  scheduler's own range. This kext programs the ring directly and starts no scheduler. Whether that matters for
+  a command buffer in another address space is not known; it is the one structural difference left.
+- **This kext's graphics ring has run on a card, in address space 0 only.** `docs/HANDOFF-linux.md` records its
+  ring test and a draw whose shader ran (the picture was wrong for a reason found later under Linux). No card log
+  has a command buffer in another address space on it: the runtime's clients do that in the emulator only, and
+  its first design, a compute queue per client, failed on the card for a reason that was never found
+  (`docs/metal-readiness.md` section 4).
+
+The copy test of section 8 is there to tell a broken address space from a broken graphics queue.
 
 **The card boots, in order** (each needs the firmware in the build, `tools/fetch-firmware.sh`):
 
