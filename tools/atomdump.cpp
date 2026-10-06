@@ -1842,10 +1842,19 @@ static int testPipe2Table() {
 		PlanRegs stretched = lit;
 		for (uint32_t r : dscl)
 			stretched.set(2, r, 1);
+		mt.scalerOff = true;
 		modeMismatch += switchTo(stretched, c.timing, known[1]);
 		for (uint32_t r : dscl)
 			modeMismatch += check(stretched.get(2, r) == lit.get(2, r), "pipe2: after a switch from a stretched console "
 			                      "2:0x%04x = 0x%08x, Linux leaves 0x%08x", r, stretched.get(2, r), lit.get(2, r));
+		// Not otherwise: at its native size the firmware runs the scaler 1:1 (DSCL_MODE 1) and
+		// the switch leaves it so, as on every card run before 2026-10-06.
+		PlanRegs native = lit;
+		native.set(2, dscl[0], 1);
+		mt.scalerOff = false;
+		modeMismatch += switchTo(native, c.timing, known[1]);
+		modeMismatch += check(native.get(2, dscl[0]) == 1, "pipe2: a switch changed the scaler mode of a console that "
+		                      "was not stretched: 0x%08x", native.get(2, dscl[0]));
 	}
 	return modeMismatch;
 	};

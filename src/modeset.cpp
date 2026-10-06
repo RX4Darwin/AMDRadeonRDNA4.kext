@@ -429,16 +429,18 @@ bool build(const Target &t, Plan &out, const char **why) {
 	b.waitSet(kOtgUpdateLock + otg, 1u << 8, 10 * kMs, "update lock held", true);
 	b.write(kHubpViewportStart + hubp, 0, "viewport start");
 	b.write(kHubpViewportDim + hubp, sizeWH(w, h), "viewport size");
-	// dpp401_dscl_set_scaler_manual_scale for a plane shown 1:1: the scaler
-	// off. At the monitor's native size the firmware leaves it off too; a
-	// console smaller than the timing it stretches with AUTOCAL, which
-	// would go on scaling from the old ratio's settings.
-	b.write(kDsclAutocal + dpp, 0, "scaler autocal off");
-	b.write(kDsclControl + dpp, 0, "scaler boundary mode off");
+	// A console the firmware stretches (Target::scalerOff) would go on being
+	// scaled from the old ratio's settings: the scaler off, as
+	// dpp401_dscl_set_scaler_manual_scale does for a plane shown 1:1.
+	if (t.scalerOff) {
+		b.write(kDsclAutocal + dpp, 0, "scaler autocal off");
+		b.write(kDsclControl + dpp, 0, "scaler boundary mode off");
+	}
 	b.write(kDsclRecoutStart + dpp, 0, "recout start");
 	b.write(kDsclRecoutSize + dpp, sizeWH(w, h), "recout size");
 	b.write(kDsclMpcSize + dpp, sizeWH(w, h), "mpc size");
-	b.update(kDsclSclMode + dpp, 0x7, 0, "scaler bypass");
+	if (t.scalerOff)
+		b.update(kDsclSclMode + dpp, 0x7, 0, "scaler bypass");
 	for (size_t i = 0; i < t.nextra; i++) {
 		b.seg = t.extra[i].seg;
 		b.add(t.extra[i].op, t.extra[i].dword, t.extra[i].mask, t.extra[i].value, t.extra[i].arg, t.extra[i].what);

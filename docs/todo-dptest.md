@@ -132,7 +132,9 @@ Lines to find: `head2: ... offline until a display is plugged in`, `hotplug: HPD
 ## Test 4: the stretched console (no extra hardware)
 
 This checks the fix for the zoomed picture of 2026-10-06, which could not be tried then because the console went
-back to 4K first. Samsung on DisplayPort; the Lenovo may stay on HDMI.
+back to 4K first. Samsung on DisplayPort; the Lenovo may stay on HDMI. Run it after test 5b: if the scaler in
+bypass cuts the top of the picture off on a normal boot, it may do the same here, and then the answer to step 2
+is "the whole width, but the top is cut off".
 
 1. In OpenCore's `config.plist` set `UEFI -> Output -> Resolution` to `1920x1080`. Boot with
    `rdna4-head2=4 rdna4-modeset=1 rdna4-hotplug=2 rdna4-trace=1`.
@@ -162,19 +164,27 @@ the 4K DisplayPort pipe next to `rdna4-head2=4` without an error in the log, thr
 back, and the Samsung was still reported less responsive. So the pointer being drawn by macOS is not the whole
 cause. The log has nothing that measures responsiveness.
 
-The comparison that separates the causes, no reboot needed (usual boot-args):
+Result, the same day: with the Samsung at 2560x1440 (the low-resolution mode Displays offers there) Chrome was
+equally responsive on both screens. So it is the number of pixels macOS has to draw on the CPU, not DisplayPort
+and not that pipe. 1920x1080 HiDPI on a 4K panel will stay sluggish in heavy applications until there is
+acceleration; 2560x1440 is the workable setting until then.
 
-1. Set the Lenovo to 60 Hz. Hold Option while clicking "Scaled" in Displays and give the Samsung the
-   `1920x1080 (low resolution)` mode at 60 Hz. Both screens now have the same number of pixels at the same rate;
-   the Samsung's picture is softer. Is the same Chrome window equally responsive on both?
-   - Yes: it was the pixels, the refresh rate, or both. Step 2 says which.
-   - No: something about the boot display's pipe or head is slower, and that needs measuring in the kext.
-2. Put the Lenovo back to 144 Hz and leave the Samsung at low-resolution 1080p. If the Lenovo is clearly better
-   again, the refresh rate matters; try the Samsung's `1920x1080 (low resolution)` at 120 Hz if Displays offers it.
-3. With `rdna4-cursor=1 rdna4-vbl=1`: does the pointer itself glide on the Samsung while the window under it
-   lags, or does the pointer stutter too?
+### Test 5b: 2560x1440 on the Samsung, top of the picture
 
-Typing and scrolling lag at 3840x2160 will remain until there is acceleration.
+At that 2560x1440 the menu bar was cut off at the top of the screen. The mode had been confirmed good on
+2026-10-04. What changed in between: since the scaler fix of 2026-10-06 every mode switch on the boot display put
+the scaler into bypass, also on a normal boot, where the firmware runs it 1:1 and its request timing goes with
+that. The switch now leaves the scaler alone unless the firmware was stretching the console (kext UUID
+`42047888-...` or later). That this was the cause is not confirmed; this test confirms or refutes it. After every
+switch of the boot display the log now has a line `modes: scaler mode ... viewport ... recout ...`.
+
+Usual boot-args, Samsung on DisplayPort:
+
+1. Switch the Samsung to 2560x1440. Is the whole desktop on the screen, menu bar included?
+2. Switch to 1920x1080 (low resolution, if offered) or 1600x900, and back to the default. Whole desktop each time?
+
+If the top is still cut off, send the log with the Samsung left in that mode, and say roughly how much is
+missing (a menu bar's height, more, less).
 
 ## After the tests
 
