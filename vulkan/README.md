@@ -24,12 +24,13 @@ driver talks to a kernel extension through an IOKit user client. The header is t
 the part of Linux's amdgpu ioctls RADV uses (buffers, address-space mapping, contexts, command submission,
 fences) plus calls to present to the screen.
 
-**Status: the driver runs against this kext on the card, offscreen.** On 2026-10-06 (Big Sur 11.6.6) it found
-the interface, created its device, ran two fills of a buffer (one by the command processor, one by a compute
-shader it compiled) and rendered a triangle into an image with a vertex and a fragment shader; all read back
-right. The kext's memory half is verified by `n48nprobe.c`. Showing a picture on the display is written (`vkprobe ... show`) and has not run there.
-`docs/vulkan-port.md` has what the port needs from the kext, the order of work and what each step showed;
-`docs/todo-vulkantest.md` is the record of the card tests and the way to repeat them.
+**Status: the driver runs against this kext on the card and shows a picture.** On 2026-10-06 (Big Sur 11.6.6)
+it found the interface, created its device, ran two fills of a buffer (one by the command processor, one by a
+compute shader it compiled), rendered a triangle into an image and read it back right, and with `vkprobe ... show`
+put a moving triangle on the boot display for five seconds at 60 frames a second, the desktop back afterwards.
+There is no Vulkan window-system layer: a program presents through the six functions the driver exports
+(`radv_darwin_scanout_*`). `docs/vulkan-port.md` has what the port needs from the kext, the order of work and
+what each step showed; `docs/todo-vulkantest.md` is the record of the card tests and the way to repeat them.
 
 Not taken from that project, on purpose: its Metal bundle, its helper accelerator kext and its hooks into Apple's
 Radeon driver. They are built against the internals of one macOS build; the Vulkan driver and its kernel interface

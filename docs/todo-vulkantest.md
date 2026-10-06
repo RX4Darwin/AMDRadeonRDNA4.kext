@@ -1,7 +1,8 @@
 # Card tests for the Vulkan interface
 
-Written 2026-10-06. **Boots 1 to 3 passed on the card the same day** (below): the memory half, the driver's
-first work, and a rendered triangle read back. Still to run: boot 4, a picture on the display.
+Written 2026-10-06. **All four boots passed on the card the same day** (below): the memory half, the driver's
+first work, a rendered triangle read back, and a picture on the display. Nothing of this guide is left to run; it
+stays as the record and as the way to repeat the tests.
 
 Rig as before: RX 9070 XT (revision 0xC0), Big Sur 11.6.6. Both displays come up next to the compute bring-up
 (verified in boot 1). Do not let the machine sleep during these boots: the compute runtime does not survive sleep
@@ -11,6 +12,20 @@ without `rdna4-pm=1`, which is not part of this.
 `rdna4-trace=1`, and the kernel log then loses the bring-up's lines within minutes (first try, below). Either take
 them out for these boots, or run the programs and the diagnostic script in the first two or three minutes after
 login, as in the second try.
+
+## Boot 4, 2026-10-06: passed
+
+Kext `4AB6CFC5-...`, the same boot-args, both displays lit, the Samsung at 2560x1440; `vkprobe-4.txt`, log
+`rdna4fb-diag-20261006-223154`, and the triangle seen on the screen.
+
+- `display: 2560x1440, pitch 3840 pixels, pipe 0`, then **`show: 301 frames in 5.01 s (60.0 a second), the
+  display counted 300; the desktop (0x8000000000) given back: yes: ok`**. Every frame made its vertical blank.
+- The kernel log has the display taken (`OTG0 HUBP0, 2560x1440 pitch 3840`), no `flip: failure`, and the release:
+  the flip back to the desktop latched in 16.6 ms, one frame.
+- It ran on a pipe the plugin's own mode setting had programmed (2560x1440 is not the firmware's mode), with a
+  pitch wider than the picture: both were open questions.
+- Two earlier runs that day did the usual checks only: the `show` argument was missing. `vkprobe` now says so.
+- Not tried: 3840x2160, a refresh rate other than 60 Hz, a mode switch while the picture is up.
 
 ## Boot 3, 2026-10-06: passed
 

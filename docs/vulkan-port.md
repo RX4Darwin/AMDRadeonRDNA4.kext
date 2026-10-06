@@ -2,8 +2,8 @@
 
 Written 2026-10-06. Sections 1 to 5 are from reading source and notes; sections 6 to 10 report what was built and
 run since. On the card so far (2026-10-06): the memory half and its copy test (section 8), and the driver's work
-through submit and wait, two fills and a rendered triangle read back (section 9). Showing a picture on a display
-(section 10) is written and has not run there. The other project's claims are its own and unverified.
+through submit and wait, two fills and a rendered triangle read back (section 9), and a picture on the display
+(section 10). The other project's claims are its own and unverified.
 
 ## 1. The decision
 
@@ -77,9 +77,8 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
    2026-10-06: `vkprobe` said "done: all ok"** for a fill by the command processor, one by a compute shader, and
    a triangle rendered into an image and read back with exactly the right pixels (`docs/todo-vulkantest.md`).
    This was the step that met the open blocker.
-3. **Present** through the flip path. Written 2026-10-06 and checked on a host, **not run on the card**,
-   section 10. Shows on the card: `vkprobe ... show` puts a moving triangle on the boot display for five seconds
-   and the desktop comes back.
+3. **Present** through the flip path, section 10. **Done on the card 2026-10-06**: `vkprobe ... show` put a moving
+   triangle on the boot display for five seconds, 60 frames a second, and the desktop came back.
 4. Then the Metal side of `docs/metal-phase-plan.md`, with Vulkan as the executor.
 
 ## 5. Open questions
@@ -308,7 +307,7 @@ The copy test of section 8 is there to tell a broken address space from a broken
 
 The guide for the card tests, with what to look for and what failure looks like: `docs/todo-vulkantest.md`.
 
-## 10. Step 3: a picture on a display (2026-10-06, not run on the card)
+## 10. Step 3: a picture on a display (2026-10-06, verified on the card)
 
 The interface's way of showing a picture is not a Vulkan swapchain. The driver exports six functions
 (`radv_darwin_scanout_*`, selectors 9 to 14): ask what the display shows, take its plane, register up to three
@@ -344,13 +343,13 @@ check one rule each. `vulkan/vkprobe.c` has a `show` mode (a triangle sliding ov
 the display's size, two buffers shown in turn); with it the real driver ran 350,000 frames in a second against
 the engine's stand-in display, none refused, the display given back, nothing left behind.
 
-**Not known until it runs on the card**
-
-- Whether the flip works on a pipe the plugin's mode-set engine has programmed; in September it ran on the pipe
-  as the firmware left it.
-- Whether a frame at 3840x2160 (the draw, and a 33 MiB copy by a compute shader) fits into one refresh.
-- The plugin's cursor code and the flip do not share a lock. The cursor path does not take the pipe's update
-  lock, so no clash is expected; it has not been tried.
+**On the card, 2026-10-06** (kext `4AB6CFC5`, both displays lit, the Samsung at 2560x1440; `vkprobe-4.txt`, log
+`rdna4fb-diag-20261006-223154`, and the picture seen on the screen): 301 frames in 5.01 s, 60.0 a second, the
+display's own counter at 300; no failed flip; the desktop back by a flip that latched in one frame. The pipe had
+been programmed by the plugin's mode-set engine (2560x1440 is not the firmware's mode), and the plane's pitch was
+3840 pixels for a picture 2560 wide, so both the flip on such a pipe and a pitch wider than the picture are
+shown to work. Not tried: 3840x2160 (a 33 MiB copy a frame), another refresh rate, a mode switch while a program
+holds the display, and the fallback for a failed release.
 
 **Limits.** One display, the boot display; the second is not offered. The refresh rate is reported as unknown.
 A mode switch by macOS while a program holds the display leaves the program's last picture up, at the new mode's
