@@ -95,6 +95,11 @@ public:
 	// connector a plan exists for that is high and not the boot display's; else
 	// 0. readSecondEdid: the EDID of what is on that connector, into edid2Data.
 	uint8_t secondSinkHpd();
+	// Take the second-pipe plan for a connector. A DisplayPort one only with
+	// rdna4-head2dp=1: lighting a second display over DisplayPort has not run
+	// on the card yet (docs/todo-dptest.md), the HDMI plans have.
+	bool usePlanFor(uint8_t hpd);
+	bool pipe2DpAllowed { false };
 	bool readSecondEdid(uint8_t hpd);
 	// Display sleep and wake of the pipe lightSecondPipe lit, as amdgpu does
 	// DPMS off and on for an HDMI stream (Pipe2::Part): the sink loses the

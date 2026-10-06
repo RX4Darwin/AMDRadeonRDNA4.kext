@@ -6,6 +6,10 @@ extra.
 
 Rig as before: RX 9070 XT, Big Sur 11.6.6, Samsung Odyssey G70D (4K) and Lenovo G25-10 (1080p, 144 Hz).
 
+Since 2026-10-06 the second display, mode switching and hot-plug are on without boot-args (`rdna4-head2=4
+rdna4-modeset=1 rdna4-hotplug=2` are the defaults). A second display on **DisplayPort** is the exception: it needs
+`rdna4-head2dp=1` until these tests have passed.
+
 For every boot:
 
 - Run `sudo bash tools/diagnostic-log.sh` before rebooting, and check the `active:` line near the top of the log:
@@ -28,7 +32,7 @@ What is already known and matters here (`docs/second-pipe.md`, section "DisplayP
 Cabling: Samsung on one DisplayPort, Lenovo on the other, nothing on HDMI.
 
 ```
-rdna4-head2=2 rdna4-modeset=1 rdna4-dmubhist=1 rdna4-trace=1
+rdna4-head2=2 rdna4-head2dp=1 rdna4-dmubhist=1 rdna4-trace=1
 ```
 
 Level 2 writes no display register, so the second monitor stays dark. macOS still gets a second display that
@@ -52,7 +56,7 @@ If instead there is `pipe2: not lit: ...`, the text after it is the reason; send
 Same cabling.
 
 ```
-rdna4-head2=4 rdna4-modeset=1 rdna4-hotplug=2 rdna4-dmubhist=1 rdna4-trace=1
+rdna4-head2dp=1 rdna4-dmubhist=1 rdna4-trace=1
 ```
 
 1. Which monitor is the boot display?
@@ -135,7 +139,7 @@ This checks the fix for the zoomed picture of 2026-10-06, which could not be tri
 back to 4K first. Samsung on DisplayPort; the Lenovo may stay on HDMI.
 
 1. In OpenCore's `config.plist` set `UEFI -> Output -> Resolution` to `1920x1080`. Boot with
-   `rdna4-head2=4 rdna4-modeset=1 rdna4-hotplug=2 rdna4-trace=1`.
+   `rdna4-trace=1`.
 2. The Apple logo is larger than usual (expected). At the desktop, does the Samsung show the **whole** desktop,
    not one corner scaled up?
 3. Switch the Samsung to 1600x900 and back to 1920x1080 in Displays. Whole desktop each time?
@@ -184,4 +188,4 @@ to 2560x1440.
 ## After the tests
 
 For each test that passes, the README's status list and `docs/second-pipe.md` get the date and what ran, as for
-the earlier ones. Daily boot-args stay `rdna4-head2=4 rdna4-modeset=1 rdna4-hotplug=2`.
+the earlier ones, and `rdna4-head2dp=1` becomes the default like the rest.

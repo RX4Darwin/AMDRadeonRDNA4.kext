@@ -321,7 +321,7 @@ registry_value() {
 	gated "mode-setting survey" 'RDNA4FB: mode:' modedump
 
 	section "second head and second pipe (rdna4-head2)"
-	klines 'RDNA4FB: (head2|pipe2|hotplug|dptrain):' | grep . || echo "(no head2/pipe2 lines: add rdna4-head2=1..4 to boot-args)"
+	klines 'RDNA4FB: (head2|pipe2|hotplug|dptrain):' | grep . || echo "(no head2/pipe2 lines: rdna4-head2=0, rdna4-compute, or a VM test build)"
 	echo '--- registry copy of the second-pipe survey: RDNA4FB,Pipe2 (step, segment:dword, value now, value after, Linux function and register)'
 	P2_PROP="$(ioreg -l -w0 2>/dev/null | grep '"RDNA4FB,Pipe2"' | sed -n -E 's/.*"RDNA4FB,Pipe2" = "(.*)"[^"]*$/\1/p' | head -1)"
 	if [ -n "$P2_PROP" ]; then
