@@ -84,12 +84,16 @@ the one this section describes as failing:
 - **card, 2026-10-07** (`docs/vm-client-rootcause.md` section 12): with that default the boot test passes (a kernel MEC
   queue runs a command buffer in the address space its packet names), the graphics-ring client self-test passes, a
   compute kernel runs in a client's address space on the shared queue (`rdna4-run`'s zero-copy vadd), and the GPU is
-  not pinned at idle. **Still failing**: a job whose shader faults never finishes and its queue cannot be recovered, so
-  the two deliberate-fault tests of the self-test hang and take the rest with them. Nothing lets such a job finish on
-  the card (three attempts, `docs/vm-client-rootcause.md` sections 13 to 16); a fault ends the job, as under Linux.
-  The queue's recovery now uses amdgpu's MMIO reset for a compute queue (`SPI_COMPUTE_QUEUE_RESET`), which this
-  document's "no per-queue reset without MES" did not know of: **code, not run** (`docs/todo-vmtest.md`). amdgpu has
-  the same kind of reset for the graphics ring and the copy engine; neither is used here yet.
+  not pinned at idle.
+- **card, 2026-10-07, eighth run** (`docs/vm-client-rootcause.md` section 19, log `rdna4fb-diag-20261007-141737`):
+  **every row of the runtime passes with `rdna4-vm=1`**: `runtime`, `submitib`, `fault`, `vm` (isolation and two
+  clients at once), `gfx-client`, `gfx-app-tri`, `gfx-app-tricol`, and the GPU idles at 3 % and 18 W before and after.
+  A job whose shader faults is ended and reported to its client (`kIOReturnVMError`) within 3 ms, and its queue runs
+  the next job 1.1 ms later. Nothing lets such a job finish (sections 13 to 16); what brings the queue back is a
+  reset of the hung waves alone (`SPI_COMPUTE_QUEUE_RESET`) with the queue left as it is. amdgpu's full reset of a
+  compute queue does not work here: it needs the MES to map the queue again (sections 17 and 18). Needs
+  `rdna4-hang=1`. Not covered: a hang that is not a shader's (a command buffer that cannot be fetched), the same for
+  the graphics ring and the copy engine, and the control boot with `rdna4-vmshared=0`.
 
 The table in section 1 and the text below are as written on 2026-09-30.
 

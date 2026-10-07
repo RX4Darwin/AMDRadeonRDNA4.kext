@@ -495,3 +495,40 @@ safe mode, the queue selected) and sends the proof packet through the queue as i
 it was (...): it runs` or `it does not run`. Only if it does not run comes amdgpu's reset and the fresh queue as
 before, now with the doorbell enable read back at once and a millisecond later (`made again: doorbell control ...`),
 which says whether the write is ignored or undone.
+
+## 19. 2026-10-07, eighth run: H15 holds. The queue comes back, and the whole self-test passes
+
+Log `rdna4fb-diag-20261007-141737`, kext `8C8B6470`, boot C's arguments. [M]
+
+```
+runtime: recovering shared queue 1 (guilty VMID 9) without a GPU reset
+runtime: shared queue 1: waves reset, the queue left as it was (RLC safe mode acknowledged): it runs
+runtime: shared queue 1 recovered (WRITE_DATA proof landed)
+runtime: dispatch ended by a fault in address space 9 after 2806 us; shared queue 1 recovered without a GPU reset
+```
+
+The same on queue 0 for the freed-buffer fault (address space 8, 2955 us). From the start of recovery to the proof
+packet having run: 1.1 ms each time. The full reset behind it never ran.
+
+After it, every test has a result of its own and all are `ok`: isolation, two clients at once, zero-copy vadd, the
+freed-buffer fault, the three `SubmitIb` tests, the refusals, the benchmarks. The table: `runtime PASS`, `submitib
+PASS`, `fault PASS`, `vm PASS`, `gfx-client PASS`, `gfx-app-tri PASS` (8192 px), `gfx-app-tricol PASS` (the colour
+triangle through the runtime, its first pass on the card), `idle-pin PASS` and `post-idle PASS` at 3 % and 18 W.
+
+So, for a compute job whose shader touches an address that is not mapped, on this card without MES:
+
+1. the fault shows in `GCVM_L2_PROTECTION_FAULT_STATUS` with the job's VMID within 3 ms, and that ends the wait;
+2. the job cannot be made to finish (sections 13 to 16);
+3. `SPI_COMPUTE_QUEUE_RESET = 1` with the queue selected, in RLC safe mode, removes its waves, and the queue, which was
+   never stuck itself, carries on;
+4. the dequeue request amdgpu sends with that write must **not** be sent: it takes the queue down, and nothing here
+   can bring one up again afterwards (sections 17 and 18).
+
+**After the run** the full reset and the remade queue are removed from `recoverSharedQueue` (they did not run in this
+log and never recovered a queue in the two before). The kext that ran is `8C8B6470`; the one with that removal is
+`39B99DC7`, compile-checked.
+
+Not covered by any of this: a queue hung by something other than a shader's waves (a command buffer the CP cannot
+fetch), more than one job in the ring when the fault comes, the graphics ring and the copy engine, and the old path
+(`rdna4-vmshared=0`), whose control boot is still owed.
+

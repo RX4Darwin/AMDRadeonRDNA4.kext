@@ -1,11 +1,9 @@
 # Card tests for the runtime's client address spaces
 
-Written 2026-10-06 on `devel/address-space`. **First run on the card 2026-10-07** (below): clients now work in
-their own address spaces, and the two tests that fault on purpose hang their job. Three ways of letting such a job finish did
-nothing (second to fifth run). Since the sixth run a fault is caught and reported and both fault tests pass; what is
-left is getting the queue back afterwards (seventh run: a restart of the pipe does not). The next run is the same
-boot again. Background: `docs/vm-client-rootcause.md` sections 11 and 12 and
-`docs/metal-readiness.md` section 4.
+Written 2026-10-06 on `devel/address-space`. **Passed on the card 2026-10-07** (eighth run, below): with
+`rdna4-vm=1` every row of the runtime's self-test passes, the two fault tests included, and the GPU idles at 3 %.
+What it took is in the runs below and in `docs/vm-client-rootcause.md` sections 11 to 19. Still owed: boot B (the
+control with `rdna4-vmshared=0`).
 
 ## First run, 2026-10-07
 
@@ -62,24 +60,15 @@ nothing (`instruction pointer 0x5044 -> 0x5044`, `NOT recovered`), and is taken 
 trouble is: before the reset the queue is in order and only the shader's waves hang; the queue made afresh after the
 reset has its doorbell switched off and answers nothing (`docs/vm-client-rootcause.md` section 18).
 
-## Next run: boot C again, the waves reset first
+## Eighth run, 2026-10-07: passed
 
-The new kext first resets only the hung waves and leaves the queue as it is, and falls back to the full reset if
-that does not get a packet through. An experiment. Only the kext is new. Same arguments:
+Kext `8C8B6470`, log `rdna4fb-diag-20261007-141737`. After each fault: `waves reset, the queue left as it was (RLC
+safe mode acknowledged): it runs`, `recovered (WRITE_DATA proof landed)`, 1.1 ms after recovery began. Every test of
+the self-test `ok`; the table has `runtime`, `submitib`, `fault`, `vm`, `gfx-client`, `gfx-app-tri` and
+`gfx-app-tricol` at PASS, `idle-pin` and `post-idle` at 3 % and 18 W.
 
-```
-rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-hang=1 rdna4-trace=1
-```
-
-```bash
-sudo bash diagnostic-log.sh
-```
-
-What to look for in the kernel log after each fault: `waves reset, the queue left as it was (...): it runs`, then
-`recovered (WRITE_DATA proof landed)`. If it says `it does not run`, the full reset follows with `made again: doorbell
-control 0x... at once, 0x... a millisecond later` and `recovered` or `NOT recovered`. In the script's output: the two
-fault tests `ok` as before, and whether the tests after them (`VM peer`, the three `SubmitIb` lines) now have results
-of their own.
+The kext built after this run (`39B99DC7`) only drops the full reset that did not run here. If boot C is run again
+with it, the log should read the same.
 
 What changed: with `rdna4-vm=1` a client of the compute runtime (`RDNA4ComputeClient`, `rdna4-run`) gets its own
 GPU address space. Until now each such client also got a compute queue of its own inside that address space, and
