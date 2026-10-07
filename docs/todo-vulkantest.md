@@ -485,8 +485,22 @@ Logs `rdna4fb-diag-20261007-160112` (step 1) and `-160156` (step 2), `n48nprobe-
 - **Not exercised:** all four recoveries read `waves reset 1 time(s)`. The case the repeat was written for (one reset
   not enough, third and fourth run) did not come up, so the repeat itself has not run on the card.
 
-**Still worth doing:** step 2 a few more times in one boot (no reboot needed between them), until a line reads `waves
-reset 2 time(s) ...: it runs, its fences are through` with the table still all PASS.
+### Step 2 twice more in the same boot: the repeat ran, and worked
+
+Logs `rdna4fb-diag-20261007-160653` and `-160806`, `vkprobe2b.txt`, kext `DCD5BF79`. Both tables all PASS, 27 `ok` lines
+each, `vkprobe` 7062 of 7194 frames. In the second:
+
+```
+runtime: shared queue 0: waves reset 2 time(s), the queue left as it was (RLC safe mode acknowledged): it runs, its fences are through
+runtime: dispatch ended by a fault in address space 9 after 49 us; shared queue 0 recovered without a GPU reset
+```
+
+That is the case of the third and fourth run (one reset not enough, again the second fault, on queue 0), now caught
+inside the recovery: the second reset follows at once, and the `SubmitIb` tests behind it pass. Seen in 3 of 6 runs of
+step 2 so far, never in step 1.
+
+**Done.** With `rdna4-vm=1` the Vulkan interface and the runtime's clients work in one boot, one after the other and
+at the same time.
 
 ## After the tests
 

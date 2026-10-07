@@ -164,7 +164,8 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 	 * ran, but no fence came through any more (GRBM_STATUS still SPI busy), and the next job's wait ran out; the reset that wait's
 	 * recovery then did was enough. Why the first was not is not known (waves launched after it, perhaps). A fence (RELEASE_MEM) is
 	 * written when the pipeline reports it, so a fence of our own coming through is what says the waves are gone, and the reset is
-	 * repeated until one does. */
+	 * repeated until one does. VERIFIED on the card the same day: "waves reset 2 time(s) ...: it runs, its fences are through", and
+	 * every test after it passed. */
 	bool safe = true, proof = false, fences = false;
 	uint32_t resets = 0;
 	while (resets < 4 && !fences) {
