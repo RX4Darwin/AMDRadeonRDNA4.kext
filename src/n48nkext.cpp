@@ -119,6 +119,8 @@ struct RDNA4Compute::N48nState {
 	uint64_t     fencePage;      // pool offset of the dword the graphics queue reports finished work in
 	uint32_t     ringDwords;     // what this client has put on the graphics ring since the ring last ran dry
 	uint32_t     ringSequence;   // the last sequence it put there
+	uint32_t     faultLooks;     // looks in a row that found a new fault in the address space (N48nBackend::faulted)
+	uint64_t     faultAt;        // the address of the last one
 	bool         scanTaken;      // the client has the display's plane; scanSurface is what it showed before
 	Flip::Surface scanSurface;
 	N48N::Client client;         // a few hundred KiB
@@ -266,23 +268,95 @@ struct N48nBackend {
 		if (!ok)
 			return N48N::kNoResources;
 		c.flushHdp();                      // what the CPU wrote through the BAR, command buffers included
+		(void)c.vmJobFaulted(0);           // the last submission's stray entry would hide a fault of this one (runtime.cpp)
 		c.gfxKick(c.gfxRing.wptr());
 		s.ringDwords += need;
 		s.ringSequence = sequence;
+		s.faultLooks = 0;
 		return N48N::kSuccess;
 	}
 	static uint32_t finished(void *context) {
 		const RDNA4Compute &c = of(context);
 		return *c.poolDw(static_cast<uint32_t>(c.n48n->fencePage));
 	}
-	// Ten seconds without progress. What a hung ring looks like is not known yet (a shader's fault does not hang
-	// it: vkprobe's "fault"), so the state goes into the log before the ring is shut.
+	/* Is the client's unfinished work hanging on a fault? Card, 2026-10-07 (vkprobe's "fault"): a shader that touches an
+	 * address nothing is mapped at hangs its waves, and the work behind them, for good; the command processor's own
+	 * fill or copy doing the same is sent to the hub's spare page and finishes. A fault recorded for the address space
+	 * is therefore not enough. What tells the two apart is taken from the compute queues, where hung waves fault
+	 * again as soon as the hub's entry is cleared (vmshared.cpp): the entry is cleared at every look, and work counts
+	 * as hanging when three looks in a row, a millisecond apart, find a new one. Whether a hung graphics-ring wave
+	 * does fault again like that is not known; if it does not, the ten seconds apply as before.
+	 * vmJobFaulted also clears the entry the ring leaves with every submission, behind which the client's would not
+	 * be recorded. */
+	static bool faulted(void *context) {
+		RDNA4Compute &c = of(context);
+		RDNA4Compute::N48nState &s = *c.n48n;
+		if (!c.vmJobFaulted(s.vmid)) {
+			s.faultLooks = 0;
+			return false;
+		}
+		s.faultAt = c.gcFaultVa();
+		c.gcFaultClear();
+		return ++s.faultLooks >= 3;
+	}
+	/* The client's work is lost: a fault in its address space, or ten seconds without progress. The client is
+	 * finished either way (n48n.cpp). What is tried here is to keep the graphics ring for everybody else, as
+	 * recoverSharedQueue keeps a compute queue: remove what hangs, leave the queue alone, and count the ring as back
+	 * when the lost work's own fence comes through.
+	 * AN EXPERIMENT (2026-10-07), nothing here has run on the card. The hang it is for has: a compute shader of RADV's
+	 * writing to freed memory left GRBM_STATUS with SPI busy and the ring shut after ten seconds. What amdgpu does for a graphics queue
+	 * (mes_v12_0_reset_queue_mmio) is CP_VMID_RESET with the address space's bit and the queue's, which takes the queue
+	 * down for the MES to map again; there is no MES here, and a compute queue taken down did not come up again
+	 * (docs/vm-client-rootcause.md section 20). Tried in this order, each followed by 200 ms for the fence:
+	 *   1, 2  CP_VMID_RESET with the address space's bit and no queue (the header's SPI_RESET_DEBUG names a graphics
+	 *         reset per address space);
+	 *   3     SPI_COMPUTE_QUEUE_RESET with the graphics engine selected, in case the waves of a compute shader started
+	 *         from this ring answer to that.
+	 * If none brings the fence, the ring is shut as before. */
 	static void lost(void *context) {
 		RDNA4Compute &c = of(context);
-		VLOG("work on the graphics queue did not finish in %llu s (fence %u of %u): hub fault 0x%08x at 0x%llx, GRBM 0x%08x, CP_STAT 0x%08x, "
-		     "ring rptr 0x%x wptr 0x%x", N48N::kLostAfterNs / 1000000000ull, finished(context), c.n48n->ringSequence,
-		     c.rdGc(GcL2FaultStatusLo), c.gcFaultVa(), c.rdGc(GrbmStatus), c.rdGc(CpStat), c.rdGc(CpRb0Rptr), c.rdGc(CpRb0Wptr));
-		c.gfxClientWedge("vulkan client");
+		RDNA4Compute::N48nState &s = *c.n48n;
+		const uint32_t want = s.ringSequence;
+		auto through = [&]() {
+			for (uint32_t ms = 0; ms < 200 && finished(context) != want; ms++)
+				IOSleep(1);
+			return finished(context) == want;
+		};
+		VLOG("work lost in address space %u (fence %u of %u): %u look(s) in a row found a fault, the last at 0x%llx; hub fault 0x%08x, "
+		     "GRBM 0x%08x, CP_STAT 0x%08x", s.vmid, finished(context), want, s.faultLooks, s.faultAt, c.rdGc(GcL2FaultStatusLo),
+		     c.rdGc(GrbmStatus), c.rdGc(CpStat));
+		bool back = through();
+		for (uint32_t step = 1; step <= 3 && !back; step++) {
+			if (step < 3) {
+				const uint32_t index = c.rdGc(GrbmGfxIndex);
+				c.wr(IpDiscovery::HwGc, GrbmGfxIndex, 1u << 31);
+				c.wr(IpDiscovery::HwGc, CpVmidReset, 1u << s.vmid);
+				const uint32_t set = c.rdGc(CpVmidReset);
+				c.wr(IpDiscovery::HwGc, GrbmGfxIndex, index);
+				back = through();
+				// ponytail: written back to 0 in case the request is held while the bit is set; the two read-backs say which.
+				const uint32_t held = c.rdGc(CpVmidReset);
+				c.wr(IpDiscovery::HwGc, CpVmidReset, 0);
+				VLOG("step %u: CP_VMID_RESET 0x%08x written (GRBM_GFX_INDEX was 0x%08x), read back 0x%08x at once and 0x%08x after the wait: the fence %s",
+				     step, 1u << s.vmid, index, set, held, back ? "came through" : "did not come");
+			} else {
+				const bool safe = c.rlcSafeMode(true);
+				c.grbmSelect(0, 0, 0, 0);
+				c.wr(IpDiscovery::HwGc, SpiComputeQueueReset, 1);
+				c.rlcSafeMode(false);
+				back = through();
+				VLOG("step %u: SPI_COMPUTE_QUEUE_RESET with the graphics engine selected (RLC safe mode %s): the fence %s", step,
+				     safe ? "acknowledged" : "NOT acknowledged", back ? "came through" : "did not come");
+			}
+		}
+		VLOG("after the attempts: hub fault 0x%08x, GRBM 0x%08x, CP_STAT 0x%08x", c.rdGc(GcL2FaultStatusLo), c.rdGc(GrbmStatus),
+		     c.rdGc(CpStat));
+		if (((c.rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == s.vmid)
+			c.gcFaultClear();              // what hung faults again until it is gone; its entry would end the next client's work
+		if (back)
+			VLOG("the client's work is ended; the graphics ring is back and stays in service");
+		else
+			c.gfxClientWedge("vulkan client");
 	}
 	static uint64_t now(void *) {
 		uint64_t ns = 0;
@@ -398,6 +472,7 @@ struct N48nBackend {
 		b.submit = submit;
 		b.finished = finished;
 		b.lost = lost;
+		b.faulted = faulted;
 		b.now = now;
 		b.pause = pause;
 		b.store = store;

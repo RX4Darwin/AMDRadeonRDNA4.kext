@@ -6,7 +6,8 @@
 //  one device, a buffer with memory, two fills of it by the GPU and a triangle drawn into an image and copied back,
 //  each submitted, waited for and checked. With "show [seconds]" after the library's path it then puts a moving
 //  triangle on the boot display for that long (5 s) and gives the desktop back. With "fault" it instead fills
-//  and copies through memory that is not there, and says what became of that work.
+//  and copies through memory that is not there, with shaders or ("fault cp") with the command processor, and says
+//  what became of that work and of the work after it.
 //
 //    make mesa        (the driver and this program, into build/), or by hand:
 //    clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -I <work>/mesa/include vulkan/vkprobe.c -o vkprobe
@@ -127,11 +128,12 @@ int main(int argc, char **argv) {
 	/* "fault": work that touches memory which is not there, and what it does to the work after it. A second buffer
 	 * whose memory is freed between recording and submitting (not valid Vulkan, on purpose: it is what a wrong
 	 * program does); a fill into it, then a copy out of it into the good buffer. After each, fills of the good
-	 * buffer, a small one and a large one, which have to land.
-	 * What is known from the card (2026-10-07) is only about the command processor's own fill and copy, which the
-	 * first two versions of this used without meaning to: neither stops the device, and the run after one with the
-	 * copy found its first two fills not done. Now the fill and the copy are large enough to be shaders, and the
-	 * fills after them say whether later work is lost, and for how long. Ends here. */
+	 * buffer, one by the command processor and one by a shader, which have to land.
+	 * On the card (2026-10-07): done by a shader (the default here, 252 KiB) the fill hangs, and after ten seconds
+	 * the device is lost and the kext's graphics queue shut; the kext is to notice within milliseconds and keep its
+	 * queue, so the device is expected to be lost at once and the next program to run. Done by the command
+	 * processor ("fault cp", 60 KiB) both finish, but the program after one such run found its own fills not done:
+	 * the fills after each step are there to pin that down. Ends here. */
 	if (argc > 2 && !strcmp(argv[2], "fault")) {
 		D(vkCmdCopyBuffer)
 		VkBufferCreateInfo gci = bci;
@@ -142,15 +144,17 @@ int main(int argc, char **argv) {
 		/* The steps, all recorded before the memory goes. A probe: 1024 bytes at 0 (the command processor) and 128 KiB at 8192
 		 * (a compute shader), each step's own value. The fill and the copy through the freed buffer are large: shaders. */
 		enum { kFillGone, kCopyGone, kProbe };
+		const int byCp = argc > 3 && !strcmp(argv[3], "cp");
+		const char *const by = byCp ? "the command processor's" : "a shader's";
 		static const struct { int kind; long sleepMs; const char *what; } steps[] = {
-			{ kProbe, 0, "before anything" }, { kFillGone, 0, "a shader's fill into memory that is gone" }, { kProbe, 0, "right after it" },
-			{ kCopyGone, 0, "a shader's copy out of memory that is gone" }, { kProbe, 0, "right after it" }, { kProbe, 10, "10 ms later" },
+			{ kProbe, 0, "before anything" }, { kFillGone, 0, "fill into memory that is gone" }, { kProbe, 0, "right after it" },
+			{ kCopyGone, 0, "copy out of memory that is gone" }, { kProbe, 0, "right after it" }, { kProbe, 10, "10 ms later" },
 			{ kProbe, 100, "100 ms later" }, { kProbe, 1000, "1 s later" }, { kProbe, 3000, "3 s later" } };
 		enum { kSteps = sizeof(steps) / sizeof(steps[0]) };
 		VkCommandBufferAllocateInfo gai = cai;
 		gai.commandBufferCount = kSteps;
 		VkCommandBuffer gcb[kSteps]; OK(vkAllocateCommandBuffers(dev, &gai, gcb));
-		const VkBufferCopy region = { 4096, 4096, kBytes - 4096 };
+		const VkBufferCopy region = { 4096, 4096, byCp ? 61440 : kBytes - 4096 };
 		for (int i = 0; i < kSteps; i++) {
 			VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
 			if (vkBeginCommandBuffer(gcb[i], &bi) < 0) return 1;
@@ -180,10 +184,11 @@ int main(int argc, char **argv) {
 			clock_gettime(CLOCK_MONOTONIC, &t1);
 			const double seconds = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
 			if (waited != VK_SUCCESS) {
-				printf("fault: %s: submit -> %d, wait -> %d after %.3f s: %s\n", steps[i].what, submitted, waited, seconds,
-				       waited == VK_ERROR_DEVICE_LOST ? "THE DEVICE IS LOST" : "NOT FINISHED");
-				bad++;
-				break;
+				/* The call that finds the work lost gets -13 from this driver, every later one -4 (device lost). */
+				printf("fault: %s %s: submit -> %d, wait -> %d after %.3f s: the work did not finish and the device is lost%s\n", by,
+				       steps[i].what, submitted, waited, seconds, seconds < 1 ? ", noticed at once" : "; NOTICED LATE");
+				fflush(stdout);
+				_Exit(seconds < 1 ? 0 : 1);
 			}
 			vkResetFences(dev, 1, &fence);
 			if (steps[i].kind == kProbe) {
@@ -193,12 +198,12 @@ int main(int argc, char **argv) {
 				       small ? "ok" : "NOT DONE", large ? "ok" : "NOT DONE");
 				bad += !small + !large;
 			} else if (steps[i].kind == kCopyGone)
-				printf("fault: %s: finished in %.3f s; it brought back 0x%08x ... 0x%08x (the fill wrote 0xdeadbeef, the buffer held "
-				       "0x%08x there)\n", steps[i].what, seconds, d[1024], d[kBytes / 4 - 1], 0x0badf00d);
+				printf("fault: %s %s: finished in %.3f s; it brought back 0x%08x ... 0x%08x (the fill wrote 0xdeadbeef, the buffer "
+				       "held 0x%08x there)\n", by, steps[i].what, seconds, d[1024], d[(region.dstOffset + region.size) / 4 - 1], 0x0badf00d);
 			else
-				printf("fault: %s: finished in %.3f s\n", steps[i].what, seconds);
+				printf("fault: %s %s: finished in %.3f s\n", by, steps[i].what, seconds);
 		}
-		printf("fault: %s\n", bad ? "FAILED: work after the faults was not done" : "nothing after the faults was lost: ok");
+		printf("fault: every step finished; %s\n", bad ? "BUT FILLS OF GOOD MEMORY WERE NOT DONE" : "no fill of good memory was lost: ok");
 		fflush(stdout);
 		_Exit(bad ? 1 : 0);
 	}

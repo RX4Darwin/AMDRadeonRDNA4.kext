@@ -316,7 +316,7 @@ uint32_t Client::waitFor(uint64_t sequence, uint64_t timeoutNs) {
 		if (lost)
 			return kAborted;
 		const uint64_t now = be.now(be.context);
-		if (now - progressAt >= kLostAfterNs) {
+		if (now - progressAt >= kLostAfterNs || be.faulted(be.context)) {
 			lost = true;
 			jobCount = 0;          // their fences are never written
 			be.lost(be.context);
