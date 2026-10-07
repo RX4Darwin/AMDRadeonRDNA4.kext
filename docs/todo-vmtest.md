@@ -70,6 +70,22 @@ the self-test `ok`; the table has `runtime`, `submitib`, `fault`, `vm`, `gfx-cli
 The kext built after this run (`39B99DC7`) only drops the full reset that did not run here. It ran the same boot
 right after (log `rdna4fb-diag-20261007-142500`) and the log reads the same: both recoveries `it runs`, all rows PASS.
 
+## Optional: boot C without `rdna4-hang`
+
+The shared queues' recovery is now on by default (`rdna4-hang=0` switches it off); every run so far had
+`rdna4-hang=1` in the boot-args. To confirm the default, boot C with that argument taken out:
+
+```
+rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
+```
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+Expected: the same as the eighth run (`waves reset ...: it runs` twice, all rows PASS), and near the top of the
+kernel log `queue hang recovery disabled (rdna4-hang=0)`, which is about the other queues' recovery and is right.
+
 What changed: with `rdna4-vm=1` a client of the compute runtime (`RDNA4ComputeClient`, `rdna4-run`) gets its own
 GPU address space. Until now each such client also got a compute queue of its own inside that address space, and
 on the card no such queue was ever serviced. Now a client's work runs on two shared kernel queues that stay in
@@ -98,8 +114,8 @@ rdna4-compute=7 rdna4-vm=1 rdna4-hang=1 rdna4-vmid-test=6 rdna4-trace=1
 ```
 
 (`rdna4-vmid-test=6` adds register surveys at fixed points of the boot and a trace of each client operation; it
-does **not** run the queue probes, which would build queues inside address spaces. `rdna4-hang=1` lets a shared
-queue recover from a job that does not finish.)
+does **not** run the queue probes, which would build queues inside address spaces. `rdna4-hang=1` is no longer
+needed for a shared queue to recover from a faulted job; since 2026-10-07 that is on unless `rdna4-hang=0`.)
 
 ```bash
 sudo bash diagnostic-log.sh

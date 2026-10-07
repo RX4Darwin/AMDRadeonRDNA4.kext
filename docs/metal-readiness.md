@@ -91,8 +91,8 @@ the one this section describes as failing:
   A job whose shader faults is ended and reported to its client (`kIOReturnVMError`) within 3 ms, and its queue runs
   the next job 1.1 ms later. Nothing lets such a job finish (sections 13 to 16); what brings the queue back is a
   reset of the hung waves alone (`SPI_COMPUTE_QUEUE_RESET`) with the queue left as it is. amdgpu's full reset of a
-  compute queue does not work here: it needs the MES to map the queue again (sections 17 and 18). Needs
-  `rdna4-hang=1`. Not covered: a hang that is not a shader's (a command buffer that cannot be fetched), the same for
+  compute queue does not work here: it needs the MES to map the queue again (sections 17 and 18). This recovery is
+  on by default (`rdna4-hang=0` switches it off; the default itself is not yet run on the card). Not covered: a hang that is not a shader's (a command buffer that cannot be fetched), the same for
   the graphics ring and the copy engine, and the control boot with `rdna4-vmshared=0`.
 
 The table in section 1 and the text below are as written on 2026-09-30.

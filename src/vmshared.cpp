@@ -128,8 +128,11 @@ void RDNA4Compute::sharedStopAll(const char *why) {
 // behind the dead one are lost with the ring; their waits time out and recover in turn.
 bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const char *tag) {
 	SharedQueue &s = sharedQ[k];
-	if (!hangRecoveryEnabled) {
-		SLOG("%s: shared queue %u recovery disabled; rdna4-hang=1 is required: the queue stays wedged", tag, k);
+	// On unless rdna4-hang=0 says otherwise: this recovery is verified on the card. The other queues' (recoverComputeQueue) stays opt-in.
+	uint32_t hang = 1;
+	PE_parse_boot_argn("rdna4-hang", &hang, sizeof(hang));
+	if (!hang) {
+		SLOG("%s: shared queue %u recovery disabled (rdna4-hang=0): the queue stays wedged", tag, k);
 		s.wedged = true;
 		return false;
 	}
@@ -289,7 +292,7 @@ int RDNA4Compute::vmClientSlotByPasid(uint32_t pasid) const {
 // What vmBootSelfTest proves, by the route clients take in shared mode and without ever building a queue inside a client address space: a
 // client like any other (its tables, its address-space context, a place on a shared VMID-0 queue), and two command buffers in its address
 // space that each write two words through its tables, each followed by the client's fence. Runs on the bring-up thread before the runtime is
-// published, so it opens the client's slot itself. A job that does not finish gets the shared queue's own recovery (rdna4-hang=1), and the
+// published, so it opens the client's slot itself. A job that does not finish gets the shared queue's own recovery (unless rdna4-hang=0), and the
 // address spaces stay off for the boot.
 //
 // Why not the old test in this mode: on the card every boot that built a queue in a non-zero address space, the old boot test included, left
