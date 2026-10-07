@@ -9,9 +9,11 @@
 
 #include "codeobj.hpp"
 #include "compute.hpp"
+#include "flip.hpp"
 #include "pm4.hpp"
 #include "probe_kernel.h"
 #include "sdma.hpp"
+#include "smu_metrics.h"
 #include "vadd_codeobj.h"
 
 #include <kern/clock.h>
@@ -83,6 +85,28 @@ bool fbApertureSet(uint32_t base, uint32_t top, uint32_t vramMiB) {
 }
 } // namespace
 
+void RDNA4Compute::publishResult(const char *feature, const char *value) {
+	if (!feature || !value || !env.owner || !resultLock)
+		return;
+	IOLockLock(resultLock);
+	OSDictionary *next = resultDictionary
+		? OSDictionary::withDictionary(resultDictionary, 12)
+		: OSDictionary::withCapacity(12);
+	if (next) {
+		if (OSString *s = OSString::withCString(value)) {
+			next->setObject(feature, s);
+			s->release();
+			env.owner->setProperty("RDNA4FB,Results", next);
+			if (resultDictionary)
+				resultDictionary->release();
+			resultDictionary = next;
+		} else {
+			next->release();
+		}
+	}
+	IOLockUnlock(resultLock);
+}
+
 uint32_t RDNA4Compute::requestedStage() {
 	uint32_t stage = 0;
 	if (!PE_parse_boot_argn("rdna4-compute", &stage, sizeof(stage)))
@@ -90,11 +114,27 @@ uint32_t RDNA4Compute::requestedStage() {
 	return stage > StageKernel ? StageKernel : stage;
 }
 
+bool RDNA4Compute::requestedVm() {
+	uint32_t enabled = 0;
+	return PE_parse_boot_argn("rdna4-vm", &enabled, sizeof(enabled)) && enabled != 0;
+}
+
+bool RDNA4Compute::requestedPowerManagement() {
+	uint32_t enabled = 0;
+	return PE_parse_boot_argn("rdna4-pm", &enabled, sizeof(enabled)) && enabled != 0;
+}
+
 uint32_t RDNA4Compute::rd(uint16_t hwId, const Reg &r) const {
 	uint32_t off;
 	if (!env.mmio || !env.disc || !env.disc->regByteOffset(hwId, 0, r.seg, r.dword, off) ||
 	    off + 4 > env.mmioSize)
 		return kBad;
+	if (hwId == IpDiscovery::HwGc) {
+		GcAccess g(*this, (static_cast<uint32_t>(r.seg) << 16) | r.dword);   // W27: never touch a GC block that GFXOFF powered down
+		if (!g.ok)
+			return kBad;
+		return env.mmio[off / 4];
+	}
 	return env.mmio[off / 4];
 }
 
@@ -103,6 +143,12 @@ void RDNA4Compute::wr(uint16_t hwId, const Reg &r, uint32_t value) {
 	if (!env.mmio || !env.disc || !env.disc->regByteOffset(hwId, 0, r.seg, r.dword, off) ||
 	    off + 4 > env.mmioSize)
 		return;
+	if (hwId == IpDiscovery::HwGc) {
+		GcAccess g(*this, (static_cast<uint32_t>(r.seg) << 16) | r.dword);   // W27: see rd()
+		if (g.ok)
+			env.mmio[off / 4] = value;
+		return;
+	}
 	env.mmio[off / 4] = value;
 }
 
@@ -205,6 +251,11 @@ bool RDNA4Compute::survey() {
 void RDNA4Compute::logSurvey() const {
 	CLOG("GC %u.%u.%u, registers %s", sv.gcMajor, sv.gcMinor, sv.gcRev,
 	     sv.gcReadable ? "readable" : "NOT readable (GRBM_STATUS all-ones)");
+	uint32_t gcSe = 0, gcRb = 0, gcVer = 0;
+	if (env.disc && env.disc->gcInfo(gcSe, gcRb, &gcVer))
+		CLOG("IP discovery gc_info %u.%u: %u shader engines, %u RBs per SE", gcVer >> 16, gcVer & 0xffff, gcSe, gcRb);
+	else
+		CLOG("IP discovery gc_info: absent or not a GC table");
 	if (sv.gcReadable) {
 		CLOG("grbm status=0x%08x status2=0x%08x cp_stat=0x%08x cpc=0x%08x cpf=0x%08x",
 		     sv.grbmStatus, sv.grbmStatus2, sv.cpStat, sv.cpcStatus, sv.cpfStatus);
@@ -374,6 +425,10 @@ void RDNA4Compute::choosePool() {
 
 uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 	env = e;
+	uint32_t hang = 0;
+	hangRecoveryEnabled = PE_parse_boot_argn("rdna4-hang", &hang, sizeof(hang)) && hang != 0;
+	CLOG("queue hang recovery %s (rdna4-hang=%u)", hangRecoveryEnabled ? "enabled" : "disabled", hang);
+	vmEnabled = requestedVm();
 	if (stage == StageOff)
 		return StageOff;
 	if (!env.pci || !env.owner || !env.mmio || !env.disc || !env.disc->isValid()) {
@@ -383,12 +438,39 @@ uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 	CLOG("bring-up to stage %u requested", stage);
 	if (!rtLock)
 		rtLock = IOLockAlloc();
+	if (!smuLock)
+		smuLock = IOLockAlloc();
+	if (!gcLock)
+		gcLock = IOLockAlloc();
+        if (!resultLock)
+                resultLock = IOLockAlloc();
+        if (rtLock) {
+                IOLockLock(rtLock);
+                shutdownQuiesced = false;
+                bringupRunning = false;
+                IOLockUnlock(rtLock);
+        }
+        registerShutdownInterest();
+        publishResult("runtime", "SKIPPED bring-up in progress");
 
+	gfxOffPreflight(true);
+	if (gcState == kGcHold)
+		return StageOff;
 	if (!survey())
 		return StageOff;
+	// A warm restart can leave the GOP's engine state live. Survey first so a
+	// cold card's reset values never cause writes into engines still in reset.
+	defensiveStart();
 	choosePool();
 	logSurvey();
 	publishSurvey();
+	// S2: clock gating persists in the RLC across a warm restart; say what this start found.
+	{
+		const uint32_t cgcg = rdGc(RlcCgcgCglsCtrl), ovr = rdGc(RlcCgttMgcgOverride), ring0 = rdGc(CpIntCntlRing0);
+		CLOG("cg: state found at start (carry-over from an earlier boot when warm): RLC_CGCG_CGLS_CTRL 0x%08x "
+		     "(CGCG_EN %u, CGLS_EN %u), RLC_CGTT_MGCG_OVERRIDE 0x%08x, CP_INT_CNTL_RING0 0x%08x",
+		     cgcg, cgcg & 1, (cgcg >> 1) & 1, ovr, ring0);
+	}
 
 	if (stage >= StagePsp) {
 		target = stage;
@@ -468,13 +550,143 @@ void RDNA4Compute::threadMain(void *arg, wait_result_t) {
 	thread_terminate(current_thread());
 }
 
+void RDNA4Compute::resumeMain(void *arg, wait_result_t) {
+	auto *self = static_cast<RDNA4Compute *>(arg);
+	CLOG("power: wake received; re-bring-up scheduled on the bring-up thread");
+	if (!self->beginBringup()) {
+		CLOG("power: wake bring-up cancelled by shutdown");
+		thread_terminate(current_thread());
+		return;
+	}
+	const bool stopped = !self->bringupStepAllowed("resume reset");
+	if (!stopped)
+	self->resetRuntimeForResume();
+	if (!stopped)
+		self->runStages();
+	self->endBringup();
+	if (self->rtLock) {
+		IOLockLock(self->rtLock);
+		self->resumePending = false;
+		if (!self->rtReady)
+			self->powerSleeping = false;
+		IOLockUnlock(self->rtLock);
+	}
+	thread_terminate(current_thread());
+}
+
+void RDNA4Compute::powerDidWake() {
+	if (!rtLock)
+		return;
+	IOLockLock(rtLock);
+	if (!powerSleeping || resumePending) {
+		IOLockUnlock(rtLock);
+		return;
+	}
+	resumePending = true;
+	IOLockUnlock(rtLock);
+	thread_t th = nullptr;
+	if (kernel_thread_start(resumeMain, this, &th) == KERN_SUCCESS) {
+		thread_deallocate(th);
+	} else {
+		IOLockLock(rtLock);
+		resumePending = false;
+		IOLockUnlock(rtLock);
+		CLOG("power: could not start the wake bring-up thread; runtime stays not ready");
+	}
+}
+
+bool RDNA4Compute::beginBringup() {
+	if (!rtLock)
+		return false;
+	IOLockLock(rtLock);
+	const bool allowed = !shutdownQuiesced;
+	if (allowed)
+		bringupRunning = true;
+	IOLockUnlock(rtLock);
+	return allowed;
+}
+
+void RDNA4Compute::endBringup() {
+	if (!rtLock)
+		return;
+	IOLockLock(rtLock);
+	bringupRunning = false;
+	IOLockWakeup(rtLock, &bringupRunning, false);
+	IOLockUnlock(rtLock);
+}
+
+bool RDNA4Compute::bringupStepAllowed(const char *step) {
+	if (!rtLock)
+		return false;
+	IOLockLock(rtLock);
+	const bool allowed = !shutdownQuiesced;
+	IOLockUnlock(rtLock);
+        if (!allowed) {
+                CLOG("bring-up stopped before %s: shutdown is quiesced", step ? step : "next step");
+                trail("stopped: shutdown");
+        }
+        return allowed;
+}
+
 void RDNA4Compute::runStages() {
+	bool ownsBringup = false;
+	if (rtLock) {
+		IOLockLock(rtLock);
+		if (shutdownQuiesced) {
+			IOLockUnlock(rtLock);
+			CLOG("bring-up stopped before stages: shutdown is quiesced");
+			return;
+		}
+		if (!bringupRunning) {
+			bringupRunning = true;
+			ownsBringup = true;
+		}
+		IOLockUnlock(rtLock);
+	}
+	struct BringupGuard {
+		RDNA4Compute *self;
+		bool owns;
+		~BringupGuard() { if (owns) self->endBringup(); }
+	} guard { this, ownsBringup };
+	// W27: a bring-up (or a re-bring-up after sleep) starts with GFX powered. Nothing of an earlier
+	// bring-up is alive: forget its boot queue and register snapshot (S4).
+	bringupGen++;
+	bootQueueLive = false;
+	gcSnapValid = false;
+	gcWake(0xffffffffu);
+	gfxOffPreflight(false);
+	if (gcState == kGcHold) {
+		CLOG("gfxoff: bring-up skipped: GFXOFF could not be lifted");
+		return;
+	}
+	if (!bringupStepAllowed("stage start"))
+		return;
 	// Read before this boot writes its own. Not at attach: that is before
 	// the EFI NVRAM driver has published the stored variables.
 	char prev[96];
-	const bool hung = logPreviousTrail(prev, sizeof(prev));
+	bool hung = logPreviousTrail(prev, sizeof(prev));
 	uint32_t done = StageSurvey;
 	char note[96];
+	static const char *const kFeatures[] = { "gfx", "ih", "vm", "flip", "pm" };
+	for (size_t i = 0; hung && i < sizeof(kFeatures) / sizeof(kFeatures[0]); i++) {
+		const size_t n = strlen(kFeatures[i]);
+		if (!strncmp(prev, kFeatures[i], n) && prev[n] == ':') {
+			// A feature past the stages hung: the stages were fine, so only
+			// that feature is left out, once.
+			strlcpy(hungFeature, kFeatures[i], sizeof(hungFeature));
+			// A hang between the cap probe and its restore leaves the GFXCLK
+			// soft max at 1001 MHz in the SMU across a warm reboot.
+			pmCapPending = !strncmp(prev, "pm: cap", 7) || !strncmp(prev, "pm: gfxcap", 10);
+			CLOG("the previous boot died during \"%s\": %s is off this boot, everything else runs "
+			     "(the next boot tries it again)", prev, hungFeature);
+			if (!strcmp(hungFeature, "vm"))
+				CLOG("REMINDER: the previous boot died in a vm: step; if rdna4-vm-diag had bit 512 (vm: F) on, "
+				     "the GC hub may still send faulting accesses to a host dummy page that is no longer "
+				     "ours until the kext's gcHubInit runs: do a COLD power cycle before the next boot");
+			env.owner->setProperty("Compute,PreviousHang", prev);
+			hung = false;
+		}
+	}
 	if (hung) {
 		// Running the same steps again would most likely hang this boot too,
 		// before anyone can collect a log. Skip once; the trail this leaves
@@ -487,6 +699,19 @@ void RDNA4Compute::runStages() {
 		env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
 		return;
 	}
+	// W24: engine busy survey at each stage, only with rdna4-gfxpm bit 16.
+	// A GFXCLK soft max survives warm reboots in the SMU (rdna4-gfxcap, the pm
+	// cap probe): remind whenever a pm boot-arg is present.
+	uint32_t capArg = 0, cgArg = 0;
+	if (requestedGfxPm() || requestedGfxCap(capArg) || !gfxCgIsDefault() || requestedGfxOff())
+		CLOG("pm: reminder: a GFXCLK soft max set by an earlier boot (rdna4-gfxcap, or a cap probe that was not "
+		     "restored) and clock gating written by rdna4-gfxcg stay in force across warm reboots; "
+		     "rdna4-gfxcap=0 (boot 13 in set-boot.sh), rdna4-gfxcg=0 or a cold power cycle lifts them");
+	const bool pmSurveyOn = (requestedGfxPm() & kPmSurvey) && featureAllowed("pm");
+	auto survey = [&](const char *tag) {
+		if (pmSurveyOn && done >= StageGfx && bringupStepAllowed("pm survey"))
+			gfxPmSurvey(tag);
+	};
 	auto stop = [&](const char *what) {
 		CLOG("%s failed; stopping, the display is not affected", what);
 		snprintf(note, sizeof(note), "stopped: %s failed (no hang)", what);
@@ -494,41 +719,123 @@ void RDNA4Compute::runStages() {
 		env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
 	};
 	if (target >= StagePsp) {
+		if (!bringupStepAllowed("stage 2 (psp)")) return;
 		if (!stagePsp())
 			return stop("stage 2 (psp)");
 		done = StagePsp;
 	}
 	if (target >= StageGfx) {
+		if (!bringupStepAllowed("stage 3 (gfx)")) return;
 		if (!stageGfx())
 			return stop("stage 3 (gfx)");
 		done = StageGfx;
+		survey("after stage 3 (gfx up)");
 	}
 	if (target >= StageSdma) {
+		if (!bringupStepAllowed("stage 4 (sdma)")) return;
 		if (!stageSdma())
 			return stop("stage 4 (sdma)");
 		done = StageSdma;
+		survey("after stage 4 (sdma)");
 	}
 	if (target >= StageCompute) {
+		if (!bringupStepAllowed("stage 5 (compute)")) return;
 		if (!stageCompute())
 			return stop("stage 5 (compute)");
 		done = StageCompute;
+		survey("after stage 5 (compute queue)");
 	}
 	if (target >= StageDispatch) {
+		if (!bringupStepAllowed("stage 6 (dispatch)")) return;
 		if (!stageDispatch())
 			return stop("stage 6 (dispatch)");
 		done = StageDispatch;
+		survey("after stage 6 (dispatch)");
 	}
 	if (target >= StageKernel) {
+		if (!bringupStepAllowed("stage 7 (kernel)")) return;
 		if (!stageKernel())
 			return stop("stage 7 (kernel)");
 		done = StageKernel;
+		survey("after stage 7 (kernel)");
+	}
+	if (vmEnabled && done >= StageKernel) {
+		if (!bringupStepAllowed("VM self-test"))
+			return;
+		if (!featureAllowed("vm") || !vmBootSelfTest()) {
+		vmEnabled = false;
+		CLOG("vm: boot self-test failed; per-client GPU VM disabled");
+		}
+	}
+	// W3: the gfx ring, when asked for. A failure only turns it off again.
+	bool gfxOk = false;
+	const uint32_t gfxAsked = done >= StageKernel ? requestedGfx() : 0;
+	if (gfxAsked && featureAllowed("gfx")) {
+		if (!bringupStepAllowed("gfx ring")) return;
+		gfxMode = gfxAsked;
+		gfxOk = stageGfxRing();
+		survey("after the gfx ring");
+	}
+	// W19: the GFX power-management experiment, only when asked for. It runs
+	// while trails are still allowed and leaves its own "pm: ..." steps.
+	if (pmCapPending && done >= StageGfx)
+		gfxPmRecoverCap();
+	const uint32_t pmAsked = done >= StageGfx ? requestedGfxPm() : 0;
+	if ((pmAsked & 15) && featureAllowed("pm")) {
+		if (!bringupStepAllowed("pm experiment")) return;
+		gfxPmExperiment(pmAsked);
+	}
+	survey("end of bring-up");
+	uint32_t capMHz = 0;
+	if (done >= StageGfx && featureAllowed("pm") && requestedGfxCap(capMHz)) {
+		if (!bringupStepAllowed("gfxcap")) return;
+		gfxCapApply(capMHz);
 	}
 	env.owner->setProperty("Compute,Stage", static_cast<uint64_t>(done), 32);
-	snprintf(note, sizeof(note), "finished at stage %u", done);
-	trail(note);
 	CLOG("bring-up finished at stage %u", done);
+	// The runtime and what it starts leave their own "<feature>: ..." steps
+	// in the trail, so the trail's normal ending comes after them.
+	if (done >= StageDispatch)
+		if (!bringupStepAllowed("runtime publish")) return;
 	if (done >= StageDispatch)
 		publishRuntime(done);
+	// W5: the page-flip test, once the runtime's DMA and device heap exist.
+	if (done >= StageKernel && featureAllowed("flip"))
+		if (!bringupStepAllowed("flip")) return;
+	if (done >= StageKernel && featureAllowed("flip"))
+		Flip::run(*this);
+	// G3: the first draw, once the runtime's device heap holds its rings.
+	if (!bringupStepAllowed("gfx draw"))
+		return;
+	const bool drew = gfxOk && stageGfxDraw();
+	if (gfxOk)
+		gfxPark();   // W46: a probe boot leaves the gfx microengines halted, not polling
+	// W27: clock gating, then GFXOFF, are the last things bring-up does, after every
+	// self-test. Nothing after gfxOffProbe() may touch the GC domain except through
+	// GcAccess, which wakes GFX first.
+	uint32_t cgMask = 0;
+	if (done >= (gfxCgIsDefault() ? StageKernel : StageGfx) && featureAllowed("pm") && requestedGfxCg(cgMask)) {
+		if (!bringupStepAllowed("clock gating")) return;
+		gfxCgApply(cgMask);
+	}
+	if (done >= StageGfx && featureAllowed("pm") && (requestedGfxOff() || gfxOffHook())) {
+		if (!bringupStepAllowed("gfxoff")) return;
+		gfxOffProbe();
+	}
+	snprintf(note, sizeof(note), "finished at stage %u%s%s%s", done,
+	         !gfxAsked ? "" : drew ? ", gfx draw right" : gfxOk ? ", gfx ring up" : ", gfx ring off",
+	         hungFeature[0] ? ", skipped after a hang: " : "", hungFeature);
+	trail(note);
+}
+
+bool RDNA4Compute::featureAllowed(const char *name) const {
+	if (hungFeature[0] && !strcmp(hungFeature, name))
+		return false;
+	if (!strcmp(name, "flip")) {
+		uint32_t requested = 0;
+		return PE_parse_boot_argn("rdna4-flip", &requested, sizeof(requested)) && requested != 0;
+	}
+	return true;
 }
 
 // The pool, uncached: the PSP reads what we write there and writes fences
@@ -583,6 +890,8 @@ void RDNA4Compute::pspFlush(void *ctx) {
 }
 
 uint32_t RDNA4Compute::smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint32_t timeoutMs) {
+	if (smuLock)
+		IOLockLock(smuLock);           // one message in the mailbox at a time (W27 gcWake can run on any thread)
 	wr(IpDiscovery::HwMp1, SmuResp, 0);
 	wr(IpDiscovery::HwMp1, SmuArg, param);
 	wr(IpDiscovery::HwMp1, SmuMsg, msg);
@@ -594,7 +903,961 @@ uint32_t RDNA4Compute::smuSend(uint32_t msg, uint32_t param, uint32_t &ret, uint
 		IOSleep(1);
 	}
 	ret = rd(IpDiscovery::HwMp1, SmuArg);
+	if (smuLock)
+		IOLockUnlock(smuLock);
 	return resp == kBad ? 0 : resp;
+}
+
+bool RDNA4Compute::readSensors(RDNA4Sensors &out) {
+	if (!poolCpu || kSmuTableOffset + 0x1000 > pool.size)
+		return false;
+	uint32_t ret = 0;
+	// TABLE_SMU_METRICS is table 5 in smu14_driver_if_v14_0.h. Table 0 is
+	// PPTABLE and is not the telemetry transfer requested by this reader.
+	if (smuSend(kSmuMsgGetMetricsTable, 5, ret, 100) != kSmuRespOk)
+		return false;
+	/* smu14_driver_if_v14_0.h, SmuMetrics_t: CurrClock[11], the average
+	 * clocks, then MetricsCounter, voltage/current arrays, power, temperatures,
+	 * and fan tach. Keep this compact reader in sync with that public table
+	 * layout instead of copying the whole firmware ABI into our user ABI. */
+	const uint8_t *table = poolCpu + kSmuTableOffset;
+	auto u16 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint16_t *>(table + off);
+	};
+	constexpr uint32_t kAverageGfxPost = RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS;
+	constexpr uint32_t kAverageMemPost = RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS;
+	constexpr uint32_t kSocketPower = RDNA4_SMU_METRICS_AVG_SOCKET_POWER;
+	constexpr uint32_t kTemperatures = RDNA4_SMU_METRICS_AVG_TEMPERATURE;
+	constexpr uint32_t kFanRpm = RDNA4_SMU_METRICS_AVG_FAN_RPM;
+	out.edgeTempC = u16(kTemperatures + 0 * 2);
+	out.hotspotTempC = u16(kTemperatures + 1 * 2);
+	out.gfxClockMHz = u16(kAverageGfxPost);
+	out.memoryClockMHz = u16(kAverageMemPost);
+	out.socketPowerW = u16(kSocketPower);
+	out.fanRpm = u16(kFanRpm);
+	return true;
+}
+
+// The power-management view of the same table: instantaneous GFX clock, the
+// activity counters and the VDD_GFX rail, plus MetricsCounter to prove the
+// table is live. amdgpu invalidates the HDP read path after
+// TransferTableSmu2Dram (smu_cmn_update_table_read_arg, smu_cmn.c:1147-1150),
+// but hdp_v7_0_funcs (hdp_v7_0.c:128-132) has no invalidate_hdp and soc24 sets
+// none, so on this ASIC that call is a no-op. Our mapping is uncached
+// (kIOMapInhibitCache), which leaves only a stale table to rule out: poison
+// MetricsCounter first, so a table the SMU did not rewrite reads back as poison
+// instead of an old sample.
+bool RDNA4Compute::readSensorsEx(RDNA4SensorsEx &out) {
+	if (!poolCpu || kSmuTableOffset + 0x1000 > pool.size)
+		return false;
+	uint8_t *table = poolCpu + kSmuTableOffset;
+	constexpr uint32_t kPoison = 0xFFFFFFFFu;
+	*reinterpret_cast<volatile uint32_t *>(table + RDNA4_SMU_METRICS_COUNTER) = kPoison;
+	flushHdp();
+	uint32_t ret = 0;
+	if (smuSend(kSmuMsgGetMetricsTable, 5, ret, 100) != kSmuRespOk)
+		return false;
+	flushHdp();
+	auto u8 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint8_t *>(table + off);
+	};
+	auto u16 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint16_t *>(table + off);
+	};
+	auto u32 = [table](uint32_t off) -> uint32_t {
+		return *reinterpret_cast<const volatile uint32_t *>(table + off);
+	};
+	memset(&out, 0, sizeof(out));
+	out.metricsCounter = u32(RDNA4_SMU_METRICS_COUNTER);
+	if (out.metricsCounter != kPoison)
+		out.flags |= RDNA4_SENSORS_EX_LIVE;
+	out.currGfxclkMHz = u32(RDNA4_SMU_METRICS_CURR_CLOCK + RDNA4_SMU_METRICS_PPCLK_GFXCLK * 4);
+	out.avgGfxclkPreDsMHz = u16(RDNA4_SMU_METRICS_AVG_GFXCLK_PRE_DS);
+	out.avgGfxclkPostDsMHz = u16(RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS);
+	out.gfxActivity = u16(RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY);
+	out.uclkActivity = u16(RDNA4_SMU_METRICS_AVG_UCLK_ACTIVITY);
+	out.vddGfxMv = u16(RDNA4_SMU_METRICS_AVG_VOLTAGE + RDNA4_SMU_METRICS_SVI_VDD_GFX * 2);
+	out.vddGfxCurrentA = u16(RDNA4_SMU_METRICS_AVG_CURRENT + RDNA4_SMU_METRICS_SVI_VDD_GFX * 2);
+	out.socketPowerW = u16(RDNA4_SMU_METRICS_AVG_SOCKET_POWER);
+	out.hotspotTempC = u16(RDNA4_SMU_METRICS_AVG_TEMPERATURE + 1 * 2);
+	for (uint32_t i = 0; i < RDNA4_SMU_METRICS_THROTTLER_COUNT; i++) {
+		const uint32_t pct = u8(RDNA4_SMU_METRICS_THROTTLING_PCT + i);
+		out.throttlingPercent[i] = static_cast<uint8_t>(pct);
+		if (pct)
+			out.throttlingMask |= 1u << i;
+	}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// W19: GFX power-management experiment (rdna4-gfxpm), off unless asked for
+// ---------------------------------------------------------------------------
+//
+// r2-sensors-review.md: on the card, idle in Recovery, the SMU reports about
+// 300 W and 3.2 GHz on GFX. amdgpu sends these after
+// EnableAllSmuFeatures that this kext never does: SetWorkloadMask (the boot-up
+// default profile, smu_bump_power_profile_mode, amdgpu_smu.c:2394-2417 ->
+// smu_v14_0_2_set_power_profile_mode, smu_v14_0_2_ppt.c:1824-1876), and
+// AllowGfxOff. (amdgpu writes no soft limits at the AUTO level, because
+// dpm_level == level, amdgpu_smu.c:2462; bit 2 below is an experiment beyond
+// amdgpu that writes what its automatic branch would,
+// smu_v14_0_set_soft_freq_limited_range, smu_v14_0.c:1019-1050.) SetWorkloadMask
+// also skips amdgpu's smu_v14_0_deep_sleep_control(true), which is fine: the DS
+// features already run under the PMFW's own set. Each bit is followed by a
+// sampled readout so the real-card log shows which one moves
+// GFXCLK/activity/power. GFXOFF is deliberately not offered: with MMIO,
+// doorbell and queue access from this kext it would power GFX down under us.
+//
+//   rdna4-gfxpm=8   sample only: log the metrics, change nothing
+//   rdna4-gfxpm=1   + SetWorkloadMask(WORKLOAD_PPLIB_DEFAULT_BIT)
+//   rdna4-gfxpm=2   + SetSoftMax/MinByFreq(GFXCLK) back to automatic
+//   rdna4-gfxpm=4   + probe: cap GFXCLK soft max at 1000 MHz, sample, restore auto
+//
+// Every message has a bounded wait; an answer other than OK stops the
+// experiment, and the state it left is logged.
+uint32_t RDNA4Compute::requestedGfxPm() {
+	uint32_t mask = 0;
+	if (!PE_parse_boot_argn("rdna4-gfxpm", &mask, sizeof(mask)))
+		return 0;
+	return mask & (kPmSampleOnly | kPmWorkload | kPmSoftAuto | kPmCapProbe | kPmSurvey);
+}
+
+// rdna4-gfxcap=<MHz>: a user-selectable GFXCLK soft maximum through the
+// SetSoftMaxByFreq path the round-3 cap probe proved on the card (1000 MHz:
+// 46 W instead of 310 W). Off unless present. The SMU keeps the limit across
+// warm reboots, so dropping the boot-arg does not lift it: use
+// rdna4-gfxcap=0 (soft max back to automatic) or a cold power cycle.
+bool RDNA4Compute::requestedGfxCap(uint32_t &mhz) {
+	uint32_t v = 0;
+	if (!PE_parse_boot_argn("rdna4-gfxcap", &v, sizeof(v)))
+		return false;
+	mhz = v;
+	return true;
+}
+
+void RDNA4Compute::gfxCapApply(uint32_t mhz) {
+	if (!poolCpu)
+		return;
+	trail("pm: gfxcap");
+	if (mhz == 0) {
+		if (gfxPmRestoreAuto("gfxcap=0: GFXCLK soft max -> automatic"))
+			gfxPmSample("after gfxcap=0 (soft max automatic)");
+		return;
+	}
+	if (mhz < kGfxCapMinMHz || mhz > kGfxCapMaxMHz) {
+		CLOG("pm: rdna4-gfxcap=%u ignored (accepted: 0, or %u..%u MHz)", mhz, kGfxCapMinMHz, kGfxCapMaxMHz);
+		return;
+	}
+	// SMU_V14_SOFT_FREQ_ROUND(max) is max + 1 (smu_v14_0.h:54).
+	if (!gfxPmSoftLimits(mhz + 1, kPmNoMin, "gfxcap: GFXCLK soft max")) {
+		CLOG("pm: rdna4-gfxcap=%u refused by the SMU; no cap in force", mhz);
+		return;
+	}
+	CLOG("pm: rdna4-gfxcap=%u MHz in force (kept across warm reboots; rdna4-gfxcap=0 or a cold power cycle lifts it)", mhz);
+	gfxPmSample("with rdna4-gfxcap");
+}
+
+// ---------------------------------------------------------------------------
+// W27 (review B1): the guard must survive the kext's own lifetime
+// ---------------------------------------------------------------------------
+//
+// A new kext instance starts with gcState == On. If the previous boot left GFXOFF
+// allowed and the ASIC (which survives a warm restart: golden registers, the GFXCLK
+// cap and live engines all do) kept it, the stage-1 survey would read a powered-down
+// block. Two layers:
+//   1. the shutdown quiesce lifts GFXOFF before it touches GC (runtime.cpp), which
+//      also clears the flag below;
+//   2. a persistent NVRAM flag, written right before AllowGfxOff and cleared after a
+//      successful DisallowGfxOff, is read at the next start; when it is set the kext
+//      sends DisallowGfxOff before the first GC read (gfxOffPreflight). The SMU mailbox
+//      is on MP1 (SmuMsg/SmuArg/SmuResp = MP1 C2PMSG_66/82/90, gfxregs.hpp), not GC, so
+//      it is reachable while GC is powered down. If the SMU does not answer, kGcHold:
+//      every GC access of this boot is dropped and the bring-up is skipped.
+// Caveat, found by testing: the NVRAM entry may not be published yet when the kext
+// starts ("Not at attach: that is before the EFI NVRAM driver has published the stored
+// variables", runStages). gfxOffPreflight logs whether the flag was readable at
+// attach; runStages repeats the check once NVRAM is up (after the 5 s wait) so a late
+// flag still lifts GFXOFF before stage 2, but the stage-1 reads cannot be protected
+// then, and the log says so.
+static const char *kGfxOffKey = "4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-gfxoff";
+
+bool RDNA4Compute::gfxOffFlagGet() {
+	bool set = false;
+	IORegistryEntry *nvram = IORegistryEntry::fromPath("/options", gIODTPlane);
+	if (!nvram)
+		return false;
+	if (OSObject *v = nvram->copyProperty(kGfxOffKey)) {
+		if (auto *s = OSDynamicCast(OSString, v))
+			set = s->getLength() && s->getCStringNoCopy()[0] == '1';
+		else if (auto *d = OSDynamicCast(OSData, v))
+			set = d->getLength() && static_cast<const char *>(d->getBytesNoCopy())[0] == '1';
+		v->release();
+	}
+	nvram->release();
+	return set;
+}
+
+bool RDNA4Compute::gfxOffFlagSet(bool set) {
+	IORegistryEntry *nvram = IORegistryEntry::fromPath("/options", gIODTPlane);
+	if (!nvram)
+		return false;
+	const OSSymbol *key = OSSymbol::withCString(kGfxOffKey);
+	OSString *value = OSString::withCString(set ? "1" : "0");
+	OSDictionary *sync = OSDictionary::withCapacity(1);
+	OSString *yes = OSString::withCString("1");
+	if (key && value)
+		nvram->setProperty(key, value);
+	if (sync && yes && sync->setObject(kNvramForceSync, yes))
+		nvram->setProperties(sync);
+	OSSafeReleaseNULL(yes);
+	OSSafeReleaseNULL(sync);
+	OSSafeReleaseNULL(value);
+	OSSafeReleaseNULL(key);
+	nvram->release();
+	return gfxOffFlagGet() == set;              // read it back: a flag that did not stick protects nothing
+}
+
+// Called before the first GC read of a start (attach == true) and again once NVRAM is
+// published (attach == false, from runStages).
+void RDNA4Compute::gfxOffPreflight(bool attach) {
+	// Test hook (VM only): the guest NVRAM does not survive between vm-test runs, so
+	// rdna4-gfxoff=3 pretends the flag was found set; 2 leaves it set and reads it back.
+	const bool pretend = gfxOffHook() == 3;
+	const bool flag = gfxOffFlagGet() || pretend;
+	CLOG("gfxoff: %s: previous-boot GFXOFF flag %s%s%s", attach ? "attach" : "bring-up start",
+	     flag ? "SET" : "clear", pretend ? " (TEST HOOK rdna4-gfxoff=3 pretends it)" : "",
+	     attach ? " (NVRAM may not be published yet at attach)" : "");
+	if (!flag || gcState == kGcHold)
+		return;
+	CLOG("gfxoff: the previous boot may have left GFXOFF allowed: DisallowGfxOff before any GC access%s",
+	     attach ? "" : " (too late for the stage-1 survey reads, which were unguarded)");
+	uint32_t ret = 0, resp = 0;
+	for (int attempt = 0; attempt < 2 && resp != kSmuRespOk; attempt++)
+		resp = smuSend(kSmuMsgDisallowGfxOff, 0, ret, 100);
+	if (resp == kSmuRespOk) {
+		gfxOffFlagSet(false);
+		CLOG("gfxoff: DisallowGfxOff -> 0x%02x; flag cleared", resp);
+		return;
+	}
+	gcState = kGcHold;
+	CLOG("gfxoff: the SMU did not answer DisallowGfxOff (0x%02x): every GC register and doorbell access is "
+	     "dropped for the rest of this boot and the bring-up is skipped", resp);
+}
+
+// ---------------------------------------------------------------------------
+// W27: GFXOFF guard. Every access to the GC power domain goes through it.
+// ---------------------------------------------------------------------------
+//
+// Why this exists. With rdna4-gfxoff=1 the kext asks the SMU to allow GFXOFF once,
+// at the very end of bring-up (gfxOffAllow). The RLC/PMFW may then power the GC
+// block down whenever it likes. Any MMIO or doorbell access to a powered-off GC
+// block can hang the machine (amdgpu keeps GFXOFF disallowed around every direct
+// GC register access it does: amdgpu_gfx_off_ctrl(adev, false), e.g.
+// gfx_v12_0.c:5074,5247,5283, and only allows it again 100 ms after the last user,
+// amdgpu_gfx.c:925-985).
+//
+// The guarantee. There are exactly three ways this kext reaches the GC domain:
+//   1. rd()/wr() with hwId == HwGc (every GC, RLC, CP, SDMA, GCVM register; the
+//      IH, flip, sensors, PSP and SMU code use other hwIds and never touch GC);
+//   2. the four doorbell writes (compute, VM queue, SDMA, gfx ring);
+//   3. nothing else: env.mmio is dereferenced only in rd()/wr()/flushHdp() (HDP is
+//      NBIF), verified by grep.
+// Both 1 and 2 construct a GcAccess first. GcAccess implements a small protocol:
+//   - gcBusy counts GC accessors inside their access; gcState is On (GFX powered,
+//     the state of every boot until the Allow), Allowing, or Off (GFXOFF allowed).
+//   - An accessor increments gcBusy, then checks gcState. If it is not On it
+//     decrements, calls gcWake() (DisallowGfxOff through the SMU, which returns once
+//     GFX is powered, retried once) and retries. It proceeds only with gcState == On
+//     observed after its increment.
+//   - gfxOffAllow() sets gcState = Allowing, issues a full barrier, waits (bounded)
+//     for gcBusy == 0 and only then sends AllowGfxOff. Accessors that raced in
+//     after the state change see it and wait on gcLock; accessors that were already
+//     inside are waited for. If anything is still inside after the bound, Allow is
+//     not sent.
+//   - The wake is sticky: once any GC access happens, GFXOFF stays disallowed until
+//     the next boot (or the next bring-up after sleep, which begins with gcWake()).
+//     So GFXOFF only ever covers the idle window between the end of bring-up and
+//     the first GC access; the rdna4-run info/sensors path is SMU-only and does not
+//     end it, the selftest, bench, IH stop, quiesce, flip-with-GC and dispatch do.
+//   - smuSend is serialized with smuLock so that a wake from any thread cannot
+//     interleave with another SMU message.
+// Not covered on purpose: interrupt context (nothing there touches GC; IH uses
+// OSSSYS and DMU registers only) and a failed wake (logged; the next GC access
+// would still be attempted, which is the risk of the whole feature).
+RDNA4Compute::GcAccess::GcAccess(const RDNA4Compute &comp, uint32_t what) : c(comp) {
+	if (c.gcOwner == current_thread())
+		return;                     // the waker restoring GC state: it holds gcLock, GC is up
+	for (int tries = 0;; tries++) {
+		OSIncrementAtomic(&c.gcBusy);
+		if (c.gcState == kGcOn) {
+			counted = true;
+			return;
+		}
+		OSDecrementAtomic(&c.gcBusy);
+		// A failed wake leaves kGcHold: never proceed to a block that may be powered down.
+		if (c.gcState == kGcHold || tries >= 2) {
+			ok = false;
+			return;
+		}
+		c.gcWake(what);
+	}
+}
+
+RDNA4Compute::GcAccess::~GcAccess() {
+	if (counted)
+		OSDecrementAtomic(&c.gcBusy);
+}
+
+void RDNA4Compute::gcWake(uint32_t what) const {
+	RDNA4Compute *self = const_cast<RDNA4Compute *>(this);
+	if (!gcLock)
+		return;
+	if (gcOwner == current_thread()) {
+		CLOG("gfxoff: BUG: gcWake(0x%x) called by the thread that is restoring GC state; ignored (it would "
+		     "relock gcLock)", what);
+		return;
+	}
+	IOLockLock(gcLock);
+	if (gcState == kGcOff || gcState == kGcAllowing) {
+		uint32_t ret = 0, resp = 0;
+		for (int attempt = 0; attempt < 2 && resp != kSmuRespOk; attempt++)
+			resp = self->smuSend(kSmuMsgDisallowGfxOff, 0, ret, 100);
+		const char *who = what == 0xffffffffu ? "the start of a bring-up" : what == 0xfffffffeu ? "the shutdown quiesce" : what == 0xfffffff0u ? "a dispatch/queue test (before it emitted)" :
+		                  (what >> 24) == 0xdb ? "a doorbell write, dword" : "a GC register access, seg<<16|dword";
+		if (resp == kSmuRespOk) {
+			CLOG("gfxoff: GFXOFF ended by %s 0x%x (thread %p): DisallowGfxOff -> 0x%02x; GFXOFF stays "
+			     "disallowed until the next boot", who, what & 0xffffff, current_thread(), resp);
+			// GC state does not survive the power-down: wait for the RLC to finish restoring, then
+			// bring the boot HQD back, before any other thread can use GC (gcState is still not On).
+			gcOwner = current_thread();
+			self->gfxOffAfterWake(what);
+			gcOwner = nullptr;
+			gcState = kGcOn;
+			gfxOffFlagSet(false);
+		} else {
+			gcState = kGcHold;
+			CLOG("gfxoff: WAKE FAILED for %s 0x%x (DisallowGfxOff -> 0x%02x): every GC register and doorbell "
+			     "access is dropped for the rest of this boot", who, what & 0xffffff, resp);
+		}
+	}
+	IOLockUnlock(gcLock);
+}
+
+// GC registers this kext programs by MMIO (bring-up, the runtime, IH, clock gating). GFXOFF's
+// power-down may or may not keep them (the RLC save/restore list decides, not documented for
+// GC 12.0.1): snapshot them just before AllowGfxOff, and after the wake compare, log every
+// difference and write the saved value back (review W29 S6). Not covered, on purpose: the gfx ring
+// (AllowGfxOff is refused while rdna4-gfx is on), client queues (refused while a client is open),
+// SDMA and the GC hub (round 4: DMA and dispatch worked after a wake, so they survive).
+struct GcSnapReg { Reg reg; const char *name; bool cg; };
+static const GcSnapReg kGcSnap[] = {
+	{ CpMecDoorbellLower,  "CP_MEC_DOORBELL_RANGE_LOWER", false },
+	{ CpMecDoorbellUpper,  "CP_MEC_DOORBELL_RANGE_UPPER", false },
+	{ CpPqWptrPollCntl,    "CP_PQ_WPTR_POLL_CNTL",        false },
+	{ CpMe1Pipe0IntCntl,   "CP_ME1_PIPE0_INT_CNTL",       false },
+	{ CpMe1Pipe1IntCntl,   "CP_ME1_PIPE1_INT_CNTL",       false },
+	{ sdma(0, SdmaCntl),   "SDMA0_CNTL (TRAP_ENABLE)",    false },
+	{ CpIntCntl,           "CP_INT_CNTL",                 false },
+	{ CpIntCntlRing0,      "CP_INT_CNTL_RING0",           false },
+	{ RlcCgcgCglsCtrl,     "RLC_CGCG_CGLS_CTRL",          true  },
+	{ RlcCgcgCglsCtrl3d,   "RLC_CGCG_CGLS_CTRL_3D",       true  },
+	{ RlcCgttMgcgOverride, "RLC_CGTT_MGCG_OVERRIDE",      true  },
+	{ CpRbWptrPollCntl,    "CP_RB_WPTR_POLL_CNTL",        true  },
+	{ Sdma0RlcCgcgCtrl,    "SDMA0_RLC_CGCG_CTRL",         true  },
+	{ Sdma1RlcCgcgCtrl,    "SDMA1_RLC_CGCG_CTRL",         true  },
+};
+static constexpr uint32_t kGcSnapCount = sizeof(kGcSnap) / sizeof(kGcSnap[0]);
+static_assert(kGcSnapCount <= 16, "RDNA4Compute::kGcSnapMax");
+
+void RDNA4Compute::gfxOffSnapshot() {
+	for (uint32_t i = 0; i < kGcSnapCount; i++)
+		gcSnapVal[i] = rdGc(kGcSnap[i].reg);
+	gcSnapValid = true;
+}
+
+// After the wake, on the waking thread (gcOwner): compare and write back, clock-gating registers
+// inside RLC safe mode like amdgpu's update. Returns how many registers had to be restored.
+uint32_t RDNA4Compute::gfxOffRestoreRegs() {
+	if (!gcSnapValid)
+		return 0;
+	uint32_t lost = 0, stuck = 0, skipped = 0;
+	bool safe = false, safeTried = false;
+	for (uint32_t i = 0; i < kGcSnapCount; i++) {
+		const uint32_t now = rdGc(kGcSnap[i].reg);
+		if (now == gcSnapVal[i])
+			continue;
+		lost++;
+		if (kGcSnap[i].cg) {
+			// amdgpu never writes the gating registers outside RLC safe mode: no acknowledgement, no write.
+			if (!safeTried) {
+				safeTried = true;
+				if (rdGc(RlcCntl) & kRlcEnableF32)
+					safe = rlcSafeMode(true);
+				if (!safe)
+					CLOG("gfxoff: RLC safe mode not acknowledged after the wake: clock-gating registers left as found");
+			}
+			if (!safe) {
+				CLOG("gfxoff: %s changed across the power-down: 0x%08x (saved 0x%08x), NOT restored (no safe mode)",
+				     kGcSnap[i].name, now, gcSnapVal[i]);
+				skipped++;
+				continue;
+			}
+		}
+		wr(IpDiscovery::HwGc, kGcSnap[i].reg, gcSnapVal[i]);
+		const uint32_t back = rdGc(kGcSnap[i].reg);
+		CLOG("gfxoff: %s changed across the power-down: 0x%08x -> restored 0x%08x (read back 0x%08x%s)",
+		     kGcSnap[i].name, now, gcSnapVal[i], back, back == gcSnapVal[i] ? "" : ", DID NOT STICK");
+		if (back != gcSnapVal[i])
+			stuck++;
+	}
+	if (safeTried && (rdGc(RlcCntl) & kRlcEnableF32))
+		rlcSafeMode(false);                         // the exit is sent even after a missed acknowledgement, as amdgpu does
+	CLOG("gfxoff: register check after the wake: %u of %u registers differed, %u did not stick, %u left as found",
+	     lost, kGcSnapCount, stuck, skipped);
+	return lost;
+}
+
+// The wake is only safe for what we can restore: refuse the Allow while the gfx ring is up or a
+// runtime client (VM queue, VMID state) is open.
+bool RDNA4Compute::gfxOffAllowedNow(const char **why) {
+	if (gfxMode != 0) {
+		*why = "the gfx ring (rdna4-gfx) is up and its CP_RB0/doorbell registers are not restored after a wake";
+		return false;
+	}
+	bool client = false;
+	if (rtLock) {
+		IOLockLock(rtLock);
+		for (uint32_t i = 0; i < kMaxClients; i++)
+			if (clients[i].owner)
+				client = true;
+		IOLockUnlock(rtLock);
+	}
+	if (client) {
+		*why = "a runtime client is open (its HQD/SH_MEM/VMID state would not be restored after a wake)";
+		return false;
+	}
+	return true;
+}
+
+bool RDNA4Compute::gcEnsureAwake(uint32_t what) {
+	// The waking thread runs gfxOffAfterWake (HQD restore: queueWriteTest -> here) while it holds
+	// gcLock and gcState is still not On: waking again would relock gcLock on the same thread
+	// (self-deadlock, review W29 delta). GC is up for it, and its accesses bypass the guard.
+	if (gcOwner == current_thread())
+		return true;
+	if (gcState != kGcOn)
+		gcWake(what);
+	return gcState == kGcOn;                        // D1: kGcHold after a failed wake
+}
+
+// After DisallowGfxOff is acknowledged, GC has been powered back up but its state is not the state
+// we left. Round 4 on the card: the first dispatch after the wake timed out with CP_HQD_ACTIVE 0
+// and PQ base/doorbell/rptr/wptr all zero (the directly programmed MMIO HQD is lost across the
+// GFXOFF power-down: amdgpu's queues survive because the CP restores them from their MQD in
+// memory, which a plain-MMIO HQD does not have), and only the hang recovery brought it back.
+// amdgpu itself does not poll anything after the DisallowGfxOff answer (smu_v14_0_gfx_off_control
+// is synchronous, amdgpu_gfx.c:925-985; gfx_v12_0.c has no RLC_GPM_STAT poll); we additionally
+//   1. wait (bounded 200 ms) until RLC_GPM_STAT reports GFX powered and no save/restore or WGP
+//      power-up in progress, and log what it said;
+//   2. if the boot queue's HQD is no longer active, program it again (the same reinit
+//      recoverComputeQueue uses) and prove it with a fenced WRITE_DATA.
+// Runs on the waking thread with gcOwner set (its GC accesses bypass the guard).
+void RDNA4Compute::gfxOffAfterWake(uint32_t what) {
+	// Nothing to restore for a shutdown quiesce, and none at the start of a bring-up (S4): the GPU
+	// is not brought up yet, programming an HQD before stage 1 would write an uninitialised block.
+	if (what >= 0xfffffffeu)
+		return;
+	uint32_t stat = 0;
+	uint32_t us = 0;
+	const uint32_t busyMask = kGpmSavingRegs | kGpmRestoringRegs | kGpmGfx3dChanging | kGpmCmpChanging |
+	                          kGpmStaticWgpUp | kGpmDynWgpUp;
+	for (; us < 200000; us += 100) {
+		stat = rdGc(RlcGpmStat);
+		if (stat != kBad && (stat & kGpmGfxPowerStatus) && !(stat & busyMask))
+			break;
+		IODelay(100);
+	}
+	CLOG("gfxoff: after the wake RLC_GPM_STAT 0x%08x after %u us (%s)", stat, us,
+	     us >= 200000 ? "NOT settled within 200 ms, continuing" : "settled");
+	gfxOffRestoreRegs();
+	if (!bootQueueLive || bootQueueGen != bringupGen)
+		return;                                     // no boot queue in THIS bring-up
+	if (what == (0xdb000000u | kComputeDoorbellDword)) {
+		// The boot queue's own doorbell woke GFX: its packet is already in pm4Queue and its wptr is
+		// already computed, so re-initialising the queue here would discard the packet and then
+		// publish a stale wptr (S5). Every submitter calls gcEnsureAwake() first, so this should
+		// not happen; if it does, leave the HQD to the hang recovery. (A wake by the SDMA doorbell,
+		// which the selftest's first transfer rings, has no packet in the boot queue: restore.)
+		CLOG("gfxoff: woken by the boot queue's doorbell: the boot HQD is NOT restored here (a packet is in flight)");
+		return;
+	}
+	grbmSelect(1, 0, 0, 0);
+	const uint32_t active = rdGc(CpHqdActive);
+	grbmSelect(0, 0, 0, 0);
+	if (active != kBad && (active & 1)) {
+		CLOG("gfxoff: the boot HQD survived the power-down (CP_HQD_ACTIVE 0x%08x)", active);
+		return;
+	}
+	CLOG("gfxoff: the boot HQD was lost in the power-down (CP_HQD_ACTIVE 0x%08x): programming it again", active);
+	logComputeQueueState("gfxoff wake", 0, 0, 0);
+	if (pm4Queue.init(poolDw(kPqOffset), poolMc(kPqOffset), kPqSize) && hqdInit(hqdMode == 2) &&
+	    queueWriteTest("gfxoff wake"))
+		CLOG("gfxoff: the boot HQD is back (fenced WRITE_DATA landed)");
+	else
+		CLOG("gfxoff: the boot HQD could not be restored; the first dispatch will need the hang recovery");
+}
+
+bool RDNA4Compute::gfxOffAllow() {
+	if (!gcLock)
+		return false;
+	bool ok = false;
+	IOLockLock(gcLock);
+	gcState = kGcAllowing;
+	OSAddAtomic(0, &gcBusy);      // a locked instruction: full barrier on x86, state write before the busy read
+	uint32_t waited = 0;
+	while (gcBusy != 0 && waited < 50) {
+		IOSleep(1);
+		waited++;
+	}
+	if (gcBusy != 0) {
+		CLOG("gfxoff: %d GC accessors still inside after 50 ms; AllowGfxOff not sent", static_cast<int>(gcBusy));
+		gcState = kGcOn;
+	} else {
+		uint32_t ret = 0;
+		// Persist "GFXOFF may be allowed" BEFORE the message: the next boot reads it and
+		// sends DisallowGfxOff before it touches GC, even after a crash or a hard reset.
+		if (!gfxOffFlagSet(true)) {
+			// S5: without the flag the next boot cannot know; do not allow GFXOFF at all.
+			CLOG("gfxoff: the persistent flag could not be written (read-back is not 1); AllowGfxOff NOT sent");
+			gcState = kGcOn;
+			IOLockUnlock(gcLock);
+			return false;
+		}
+		const uint32_t resp = smuSend(kSmuMsgAllowGfxOff, 0, ret, 100);
+		CLOG("gfxoff: AllowGfxOff -> 0x%02x", resp);
+		if (resp == kSmuRespOk) {
+			gcState = kGcOff;
+			ok = true;
+		} else if (resp == 0) {
+			// S6: a timeout is ambiguous, the SMU may still have processed the message. Treat it as
+			// possibly allowed: keep the flag set and go through the guard as if allowed.
+			CLOG("gfxoff: AllowGfxOff timed out: treated as possibly allowed (flag kept, the guard stays armed)");
+			gcState = kGcOff;
+			ok = true;
+		} else {
+			gcState = kGcOn;
+			gfxOffFlagSet(false);
+		}
+	}
+	IOLockUnlock(gcLock);
+	return ok;
+}
+
+// The end-of-bring-up GFXOFF probe: allow, wait, sample the SMU table only (no GC
+// register read: that would wake it), and leave GFXOFF allowed. Trail steps are
+// written here because the bring-up thread is still running; the final "finished"
+// trail follows, so the trail never ends on "pm: gfxoff".
+void RDNA4Compute::gfxOffProbe() {
+	if (!poolCpu)
+		return;
+	const uint32_t hook = gfxOffHook();
+	if (hook == 3)
+		return;                                 // test hook: preflight only, nothing is allowed
+	if (hook == 2) {
+		// Test hook (rdna4-gfxoff=2, VM only): behave as if a boot had allowed GFXOFF and then died
+		// before waking it: the persistent flag stays set, nothing is allowed. The next start must
+		// send DisallowGfxOff before its first GC read.
+		gfxOffFlagSet(true);
+		CLOG("gfxoff: TEST HOOK rdna4-gfxoff=2: persistent flag left set (read back: %s), AllowGfxOff NOT sent",
+		     gfxOffFlagGet() ? "SET" : "clear");
+		return;
+	}
+	const char *why = "";
+	if (!gfxOffAllowedNow(&why)) {
+		CLOG("gfxoff: AllowGfxOff refused: %s", why);
+		return;
+	}
+	gfxOffSnapshot();
+	trail("pm: gfxoff allow");
+	if (!gfxOffAllow()) {
+		CLOG("gfxoff: not allowed; GFX stays powered");
+		return;
+	}
+	IOSleep(1500);
+	if (gcState != kGcOff)
+		CLOG("gfxoff: another thread's GC access already ended GFXOFF during the wait; the sample below is "
+		     "not a GFXOFF reading");
+	RDNA4SensorsEx s;
+	if (readSensorsEx(s))
+		CLOG("gfxoff: 1.5 s after AllowGfxOff (SMU only, no GC access): avg GFXCLK pre-DS %u post-DS %u MHz, "
+		     "GFX activity %u %%, VDD_GFX %u mV, socket %u W, hotspot %u C, MetricsCounter %u (%s); "
+		     "GFXOFF stays allowed until the first GC access", s.avgGfxclkPreDsMHz, s.avgGfxclkPostDsMHz,
+		     s.gfxActivity, s.vddGfxMv, s.socketPowerW, s.hotspotTempC, s.metricsCounter,
+		     (s.flags & RDNA4_SENSORS_EX_LIVE) ? "live" : "STALE");
+	else
+		CLOG("gfxoff: metrics query failed after AllowGfxOff");
+}
+
+bool RDNA4Compute::runsUnderHypervisor() {
+	uint32_t a = 1, b = 0, c = 0, d = 0;
+	__asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+	return (c >> 31) & 1;
+}
+
+// rdna4-gfxoff=2 and =3 are VM test hooks. On real hardware (no hypervisor) they are ignored
+// and logged, so a stray value can neither pretend a flag nor leave one behind.
+uint32_t RDNA4Compute::gfxOffHook() {
+	const uint32_t v = gfxOffMode();
+	if (v != 2 && v != 3)
+		return 0;
+	if (!runsUnderHypervisor()) {
+		CLOG("gfxoff: TEST HOOK rdna4-gfxoff=%u ignored: this is not an emulated device", v);
+		return 0;
+	}
+	return v;
+}
+
+uint32_t RDNA4Compute::gfxOffMode() {
+	uint32_t v = 0;
+	if (!PE_parse_boot_argn("rdna4-gfxoff", &v, sizeof(v)))
+		return 0;
+	return v;
+}
+
+// The real AllowGfxOff needs exactly rdna4-gfxoff=1; any other value (a typo, 10) is ignored.
+bool RDNA4Compute::requestedGfxOff() {
+	return gfxOffMode() == 1;
+}
+
+// ---------------------------------------------------------------------------
+// W27: clock gating (rdna4-gfxcg=<mask>), gfx_v12_0_update_gfx_clock_gating
+// ---------------------------------------------------------------------------
+//
+// amdgpu enables GFX clock gating at the end of device init
+// (amdgpu_device_ip_late_init -> amdgpu_device_set_cg_state(GATE),
+// amdgpu_device.c:2772 -> gfx_v12_0_set_clockgating_state, gfx_v12_0.c:4370-4384 ->
+// gfx_v12_0_update_gfx_clock_gating, gfx_v12_0.c:4342-4366). The cg_flags for
+// GC 12.0.1 are CGCG, CGLS, MGCG, 3D CGCG, 3D CGLS, REPEATER_FGCG, FGCG and PERF_CLK
+// (soc24.c:369-381), so every branch below is the enabled one. Steps, one bit each
+// in the boot-arg (rdna4-gfxcg=15 is all of them, the order amdgpu uses; 0 is
+// the enable=false mirror):
+//   1 coarse   gfx_v12_0_update_coarse_grain_clock_gating, gfx_v12_0.c:4151-4247
+//   2 medium   gfx_v12_0_update_medium_grain_clock_gating, gfx_v12_0.c:4268-4300
+//   4 fine     repeater FGCG :4302, SRAM FGCG :4323, perf clock :4055
+//   8 gui-idle gfx_v12_0_enable_gui_idle_interrupt, gfx_v12_0.c:1909-1935
+// The whole update runs inside RLC safe mode like amdgpu's
+// (amdgpu_gfx_rlc_enter_safe_mode, amdgpu_rlc.c:38-53; set/unset_safe_mode,
+// gfx_v12_0.c:4029-4047), each register is read-modify-write and written only if
+// the value changes (amdgpu's "def != data"), and every wait is bounded.
+
+// gfx_v12_0_set_safe_mode / unset_safe_mode: RLC_SAFE_MODE CMD | (1 << MESSAGE),
+// wait for CMD to clear. Returns false on timeout (the exit is still sent).
+bool RDNA4Compute::rlcSafeMode(bool enter) {
+	if (!enter) {
+		wr(IpDiscovery::HwGc, RlcSafeMode, kRlcSafeModeCmd);
+		return true;
+	}
+	wr(IpDiscovery::HwGc, RlcSafeMode, kRlcSafeModeCmd | (1u << kRlcSafeModeMsgShift));
+	for (uint32_t us = 0; us < 20000; us += 10) {
+		if (!(rdGc(RlcSafeMode) & kRlcSafeModeCmd))
+			return true;
+		IODelay(10);
+	}
+	return false;
+}
+
+// def = RREG32; data = (def & ~clear) | set; if (def != data) WREG32.
+void RDNA4Compute::gfxCgRmw(const GfxReg::Reg &r, const char *name, uint32_t clear, uint32_t set) {
+	const uint32_t def = rdGc(r);
+	const uint32_t data = (def & ~clear) | set;
+	if (def != data)
+		wr(IpDiscovery::HwGc, r, data);
+	CLOG("cg: %s 0x%08x -> 0x%08x%s", name, def, data, def == data ? " (unchanged)" : "");
+}
+
+void RDNA4Compute::gfxCgCoarse(bool enable) {
+	if (enable) {
+		trail("pm: cg coarse");
+		// unset the CGCG, CGLS and 3D override bits (:4166-4176)
+		gfxCgRmw(RlcCgttMgcgOverride, "RLC_CGTT_MGCG_OVERRIDE", kCgOvrCgcg | kCgOvrCgls | kCgOvr3d, 0);
+		// enable the CGCG FSM (0x0000363F, :4179-4193)
+		gfxCgRmw(RlcCgcgCglsCtrl, "RLC_CGCG_CGLS_CTRL", kCgIdleThresholdMask | kCgRepDelayMask,
+		         (0x36u << kCgIdleThresholdShift) | kCgEn | (0xFu << kCgRepDelayShift) | kCglsEn);
+		// RLC_CGCG_CGLS_CTRL_3D (:4198-4214)
+		gfxCgRmw(RlcCgcgCglsCtrl3d, "RLC_CGCG_CGLS_CTRL_3D", kCgIdleThresholdMask | kCgRepDelayMask,
+		         (0x36u << kCgIdleThresholdShift) | kCgEn | (0xFu << kCgRepDelayShift) | kCglsEn);
+		// IDLE_POLL_COUNT(0x00900100) (:4217-4226)
+		gfxCgRmw(CpRbWptrPollCntl, "CP_RB_WPTR_POLL_CNTL", 0xFFFFFFFFu, (0x0090u << 16) | 0x0100u);
+		// CP_INT_CNTL busy/empty/idle interrupts, written unconditionally (:4228-4233)
+		const uint32_t cpInt = rdGc(CpIntCntl) | kCpIntGuiIdleBits;
+		wr(IpDiscovery::HwGc, CpIntCntl, cpInt);
+		CLOG("cg: CP_INT_CNTL -> 0x%08x", cpInt);
+		// SDMAn_RLC_CGCG_CTRL.CGCG_INT_ENABLE (:4235-4247)
+		const uint32_t s0 = rdGc(Sdma0RlcCgcgCtrl) | kSdmaCgcgIntEnable;
+		wr(IpDiscovery::HwGc, Sdma0RlcCgcgCtrl, s0);
+		const uint32_t s1 = rdGc(Sdma1RlcCgcgCtrl) | kSdmaCgcgIntEnable;
+		wr(IpDiscovery::HwGc, Sdma1RlcCgcgCtrl, s1);
+		CLOG("cg: SDMA0/1_RLC_CGCG_CTRL -> 0x%08x/0x%08x", s0, s1);
+	} else {
+		// the enable=false branch (:4249-4265)
+		gfxCgRmw(RlcCgcgCglsCtrl, "RLC_CGCG_CGLS_CTRL", kCgEn | kCglsEn, 0);
+		gfxCgRmw(RlcCgcgCglsCtrl3d, "RLC_CGCG_CGLS_CTRL_3D", kCgEn | kCglsEn, 0);
+	}
+}
+
+void RDNA4Compute::gfxCgMedium(bool enable) {
+	trail("pm: cg medium");
+	const uint32_t mgcg = kCgOvrGrbmSclk | kCgOvrRlcSclk | kCgOvrMgcg;
+	// enable clears the three overrides (:4277-4287); disable sets them (:4290-4298)
+	gfxCgRmw(RlcCgttMgcgOverride, "RLC_CGTT_MGCG_OVERRIDE", enable ? mgcg : 0, enable ? 0 : mgcg);
+}
+
+void RDNA4Compute::gfxCgFine(bool enable) {
+	trail("pm: cg fine");
+	const uint32_t rep = kCgOvrRepeaterFgcg | kCgOvrRlcRepeaterFgcg;
+	gfxCgRmw(RlcCgttMgcgOverride, "RLC_CGTT_MGCG_OVERRIDE (repeater FGCG)", enable ? rep : 0, enable ? 0 : rep);
+	gfxCgRmw(RlcCgttMgcgOverride, "RLC_CGTT_MGCG_OVERRIDE (SRAM FGCG)", enable ? kCgOvrFgcg : 0,
+	         enable ? 0 : kCgOvrFgcg);
+	gfxCgRmw(RlcCgttMgcgOverride, "RLC_CGTT_MGCG_OVERRIDE (perf clock)", enable ? kCgOvrPerfmon : 0,
+	         enable ? 0 : kCgOvrPerfmon);
+}
+
+// gfx_v12_0_enable_gui_idle_interrupt for ME0 pipe 0 only (gfx_v12_0_get_cpg_int_cntl
+// returns CP_INT_CNTL_RING0 for pipe 0 and 0 otherwise, gfx.c:1874-1886).
+void RDNA4Compute::gfxCgGuiIdle(bool enable) {
+	trail("pm: cg gui idle");
+	const uint32_t v = enable ? (rdGc(CpIntCntlRing0) | kCpIntGuiIdleBits) : (rdGc(CpIntCntlRing0) & ~kCpIntGuiIdleBits);
+	wr(IpDiscovery::HwGc, CpIntCntlRing0, v);
+	CLOG("cg: CP_INT_CNTL_RING0 -> 0x%08x", v);
+}
+
+// Clock gating is on by default, as in amdgpu (late init, amdgpu_device.c:2772): the round-4 card
+// went from 2541 MHz / 100 % / 131 W to 803 MHz / 3 % / 20 W with it. rdna4-gfxcg=<mask> selects
+// steps, rdna4-gfxcg=0 writes amdgpu's disable branch.
+bool RDNA4Compute::gfxCgIsDefault() {
+	uint32_t v = 0;
+	return !PE_parse_boot_argn("rdna4-gfxcg", &v, sizeof(v));
+}
+
+bool RDNA4Compute::requestedGfxCg(uint32_t &mask) {
+	uint32_t v = 0;
+	if (!PE_parse_boot_argn("rdna4-gfxcg", &v, sizeof(v))) {
+		mask = kCgStepCoarse | kCgStepMedium | kCgStepFine | kCgStepGuiIdle;
+		return true;
+	}
+	mask = v & (kCgStepCoarse | kCgStepMedium | kCgStepFine | kCgStepGuiIdle);
+	return true;
+}
+
+// Applied at the end of bring-up (after the boot self-tests), bounded and logged
+// with a survey and SMU samples before and after. mask 0 = the disable mirror.
+void RDNA4Compute::gfxCgApply(uint32_t mask) {
+	const bool enable = mask != 0;
+	CLOG("cg: rdna4-gfxcg=0x%x%s: %s (%s%s%s%s); persists in the RLC across warm reboots, "
+	     "rdna4-gfxcg=0 undoes it", mask, gfxCgIsDefault() ? " (default)" : "",
+	     enable ? "enable clock gating" : "disable clock gating",
+	     (mask & kCgStepCoarse) ? "coarse " : "", (mask & kCgStepMedium) ? "medium " : "",
+	     (mask & kCgStepFine) ? "fine " : "", (mask & kCgStepGuiIdle) ? "gui-idle" : "");
+	if (!(rdGc(RlcCntl) & kRlcEnableF32)) {
+		CLOG("cg: RLC is not running (RLC_CNTL 0x%08x); clock gating skipped", rdGc(RlcCntl));
+		return;
+	}
+	gfxPmSurvey("cg before");
+	gfxPmSample("cg before");
+	trail("pm: cg enter safe mode");
+	const bool safe = rlcSafeMode(true);
+	if (!safe) {
+		CLOG("cg: RLC safe mode did not acknowledge (RLC_SAFE_MODE 0x%08x); nothing written", rdGc(RlcSafeMode));
+	} else {
+		if (enable) {
+			if (mask & kCgStepCoarse)
+				gfxCgCoarse(true);
+			if (mask & kCgStepMedium)
+				gfxCgMedium(true);
+			if (mask & kCgStepFine)
+				gfxCgFine(true);
+			if (mask & kCgStepGuiIdle)
+				gfxCgGuiIdle(true);
+		} else {
+			trail("pm: cg disable");
+			gfxCgCoarse(false);
+			gfxCgMedium(false);
+			gfxCgFine(false);
+			gfxCgGuiIdle(false);
+		}
+	}
+	trail("pm: cg exit safe mode");
+	rlcSafeMode(false);
+	gfxPmSample("cg after (+0.3 s)");
+	IOSleep(700);
+	gfxPmSample("cg after (+1.3 s)");
+	gfxPmSurvey("cg after");
+	CLOG("cg: finished");
+}
+
+// W24: which engine is busy? Read-only survey, logged at each bring-up stage.
+// Registers (gc_12_0_0_sh_mask.h): GRBM_STATUS bit 31 GUI_ACTIVE, 29 CP_BUSY,
+// 27 ANY_ACTIVE, 22 SPI_BUSY, 11-13 SC/DB/CB_CLEAN; GRBM_STATUS2 RLC/CPC/CPF/CPG/
+// SDMA/EA/UTCL2 busy; GRBM_STATUS_SE0..3 per shader engine; CP_STAT/CP_BUSY_STAT,
+// CP_CPC_STATUS/BUSY_STAT, CP_CPF_STATUS/BUSY_STAT; RLC_STAT/GPM_STAT/SAFE_MODE;
+// CP_MES_CNTL, CP_ME_CNTL, CP_MEC_RS64_CNTL (halt/active); CP_HQD_ACTIVE for every
+// MEC pipe/queue and CP_GFX_HQD_ACTIVE for the gfx queues (gfx_v12_0_kiq/kcq
+// setup); RLC_CGTT_MGCG_OVERRIDE / RLC_CGCG_CGLS_CTRL for the gating state
+// (gfx_v12_0_update_coarse_grain_clock_gating, gfx_v12_0.c:4151-4268). All reads.
+void RDNA4Compute::gfxPmSurvey(const char *tag) {
+	trail("pm: survey");
+	CLOG("pm: survey %s: GRBM 0x%08x GRBM2 0x%08x SE0-3 0x%08x/0x%08x/0x%08x/0x%08x", tag,
+	     rdGc(GrbmStatus), rdGc(GrbmStatus2), rdGc(GrbmStatusSe0), rdGc(GrbmStatusSe1),
+	     rdGc(GrbmStatusSe2), rdGc(GrbmStatusSe3));
+	CLOG("pm: survey %s: CP_STAT 0x%08x CP_BUSY 0x%08x CPC_STAT 0x%08x CPC_BUSY 0x%08x CPF_STAT 0x%08x "
+	     "CPF_BUSY 0x%08x", tag, rdGc(CpStat), rdGc(CpBusyStat), rdGc(CpCpcStatus), rdGc(CpCpcBusyStat),
+	     rdGc(CpCpfStatus), rdGc(CpCpfBusyStat));
+	CLOG("pm: survey %s: RLC_CNTL 0x%08x RLC_STAT 0x%08x RLC_GPM_STAT 0x%08x RLC_SAFE_MODE 0x%08x "
+	     "MES_CNTL 0x%08x ME_CNTL 0x%08x MEC_RS64_CNTL 0x%08x SDMA0 0x%08x SDMA1 0x%08x", tag,
+	     rdGc(RlcCntl), rdGc(RlcStat), rdGc(RlcGpmStat), rdGc(RlcSafeMode), rdGc(CpMesCntl),
+	     rdGc(CpMeCntl), rdGc(CpMecRs64Cntl), rdGc(sdma(0, SdmaStatusReg)), rdGc(sdma(1, SdmaStatusReg)));
+	CLOG("pm: survey %s: RLC_CGTT_MGCG_OVERRIDE 0x%08x RLC_CGCG_CGLS_CTRL 0x%08x (CGCG_EN bit0, CGLS_EN bit1; "
+	     "override bits set = gating held off)", tag, rdGc(RlcCgttMgcgOverride), rdGc(RlcCgcgCglsCtrl));
+	char mec[200], gfx[64];
+	size_t nm = 0, ng = 0;
+	uint32_t activeMec = 0, activeGfx = 0;
+	mec[0] = gfx[0] = 0;
+	// amdgpu's geometry for GC 12.0.0/12.0.1: one MEC with 2 pipes x 4 queues
+	// (gfx_v12_0_sw_init, gfx_v12_0.c:1416-1424), one ME with 1 pipe x 8 queues.
+	// A read of 0xffffffff means the bank is not implemented, never "active".
+	uint32_t notImplemented = 0;
+	for (uint32_t pipe = 0; pipe < 2; pipe++) {
+		for (uint32_t q = 0; q < 4; q++) {
+			grbmSelect(1, pipe, q, 0);
+			const uint32_t v = rdGc(CpHqdActive);
+			if (v == kBad)
+				notImplemented++;
+			else if (v & 1) {
+				activeMec++;
+				if (nm + 8 < sizeof(mec))
+					nm += snprintf(mec + nm, sizeof(mec) - nm, " %u/%u", pipe, q);
+			}
+		}
+	}
+	for (uint32_t pipe = 0; pipe < 1; pipe++) {
+		for (uint32_t q = 0; q < 8; q++) {
+			grbmSelect(0, pipe, q, 0);
+			const uint32_t v = rdGc(CpGfxHqdActive);
+			if (v == kBad)
+				notImplemented++;
+			else if (v & 1) {
+				activeGfx++;
+				if (ng + 8 < sizeof(gfx))
+					ng += snprintf(gfx + ng, sizeof(gfx) - ng, " %u/%u", pipe, q);
+			}
+		}
+	}
+	grbmSelect(0, 0, 0, 0);
+	CLOG("pm: survey %s: active HQDs: MEC(pipe/queue) %u:%s; gfx(pipe/queue) %u:%s; %u bank reads 0xffffffff "
+	     "(not implemented)", tag, activeMec, activeMec ? mec : " none", activeGfx, activeGfx ? gfx : " none",
+	     notImplemented);
+	RDNA4SensorsEx s;
+	if (poolCpu && readSensorsEx(s))
+		CLOG("pm: survey %s: SMU avg GFXCLK pre-DS %u post-DS %u MHz, GFX activity %u %%, socket %u W, "
+		     "hotspot %u C, MetricsCounter %u (%s)", tag, s.avgGfxclkPreDsMHz, s.avgGfxclkPostDsMHz,
+		     s.gfxActivity, s.socketPowerW, s.hotspotTempC, s.metricsCounter,
+		     (s.flags & RDNA4_SENSORS_EX_LIVE) ? "live" : "STALE");
+}
+
+// Let the PMFW average for a moment, then log what the metrics table says.
+void RDNA4Compute::gfxPmSample(const char *tag) {
+	IOSleep(300);
+	RDNA4SensorsEx s;
+	if (!readSensorsEx(s)) {
+		CLOG("pm: %s: metrics query failed", tag);
+		return;
+	}
+	CLOG("pm: %s: avg GFXCLK pre-DS %u post-DS %u MHz (CurrClock %u, AvgCurrent %u A: not trusted on IF 0x33), "
+	     "GFX activity %u %%, UCLK activity %u %%, VDD_GFX %u mV, socket %u W, hotspot %u C, "
+	     "MetricsCounter %u (%s), throttle mask 0x%x, GRBM 0x%08x CP_STAT 0x%08x",
+	     tag, s.avgGfxclkPreDsMHz, s.avgGfxclkPostDsMHz, s.currGfxclkMHz, s.vddGfxCurrentA, s.gfxActivity,
+	     s.uclkActivity, s.vddGfxMv, s.socketPowerW, s.hotspotTempC,
+	     s.metricsCounter, (s.flags & RDNA4_SENSORS_EX_LIVE) ? "live" : "STALE", s.throttlingMask,
+	     rdGc(GrbmStatus), rdGc(CpStat));
+}
+
+// smu_v14_0_set_soft_freq_limited_range: param = (PPCLK_GFXCLK << 16) | value.
+bool RDNA4Compute::gfxPmSoftLimits(uint32_t maxParam, uint32_t minParam, const char *what) {
+	uint32_t ret = 0;
+	const uint32_t rMax = smuSend(kSmuMsgSetSoftMaxByFreq, maxParam, ret, 100);
+	const uint32_t rMin = minParam == kPmNoMin ? kSmuRespOk : smuSend(kSmuMsgSetSoftMinByFreq, minParam, ret, 100);
+	CLOG("pm: %s: SetSoftMaxByFreq(0x%08x) -> 0x%02x, SetSoftMinByFreq(0x%08x) -> 0x%02x", what,
+	     maxParam, rMax, minParam == kPmNoMin ? 0 : minParam, rMin);
+	return rMax == kSmuRespOk && rMin == kSmuRespOk;
+}
+
+// The GFXCLK soft max back to automatic, once and then once more if refused.
+bool RDNA4Compute::gfxPmRestoreAuto(const char *why) {
+	for (int attempt = 1; attempt <= 2; attempt++) {
+		if (gfxPmSoftLimits(kPmSoftMaxAuto, kPmNoMin, why))
+			return true;
+		CLOG("pm: %s: restore attempt %d was refused", why, attempt);
+	}
+	return false;
+}
+
+// The previous boot died inside "pm: cap probe" or "pm: cap restore": the SMU
+// may still hold the 1001 MHz soft max (a warm reboot keeps it). Lift it once.
+void RDNA4Compute::gfxPmRecoverCap() {
+	trail("pm: cap recover");
+	if (gfxPmRestoreAuto("previous boot died in a cap step: GFXCLK soft max -> automatic"))
+		CLOG("pm: the GFXCLK soft max was lifted");
+	else
+		CLOG("pm: WARNING: the GFXCLK soft max could not be lifted; compute may stay limited to about "
+		     "1000 MHz until a cold power cycle");
+}
+
+void RDNA4Compute::gfxPmExperiment(uint32_t mask) {
+	CLOG("pm: rdna4-gfxpm=0x%x: %s%s%s%s", mask, (mask & kPmSampleOnly) ? "sample " : "",
+	     (mask & kPmWorkload) ? "workload " : "", (mask & kPmSoftAuto) ? "soft-limits-auto " : "",
+	     (mask & kPmCapProbe) ? "cap-probe" : "");
+	if (!poolCpu) {
+		CLOG("pm: no compute pool; experiment skipped");
+		return;
+	}
+	trail("pm: baseline sample");
+	gfxPmSample("baseline (nothing changed)");
+	if (mask & kPmSurvey)
+		gfxPmSurvey("pm baseline");
+	uint32_t ret = 0;
+	if (mask & kPmWorkload) {
+		trail("pm: SetWorkloadMask");
+		const uint32_t resp = smuSend(kSmuMsgSetWorkloadMask, 1u << kWorkloadPplibDefaultBit, ret, 100);
+		CLOG("pm: SetWorkloadMask(WORKLOAD_PPLIB_DEFAULT) -> 0x%02x", resp);
+		if (resp != kSmuRespOk) {
+			CLOG("pm: workload mask refused; experiment stopped");
+			return;
+		}
+		gfxPmSample("after SetWorkloadMask(DEFAULT)");
+	}
+	if (mask & kPmSoftAuto) {
+		trail("pm: soft limits auto");
+		if (!gfxPmSoftLimits(kPmSoftMaxAuto, 0, "GFXCLK soft limits -> automatic")) {
+			CLOG("pm: soft limits refused; experiment stopped");
+			return;
+		}
+		gfxPmSample("after GFXCLK soft limits automatic");
+	}
+	if (mask & kPmCapProbe) {
+		trail("pm: cap probe");
+		// SMU_V14_SOFT_FREQ_ROUND(max) is max + 1 (smu_v14_0.h:54).
+		const bool capped = gfxPmSoftLimits(kPmProbeMHz + 1, kPmNoMin, "probe: GFXCLK soft max 1000 MHz");
+		if (capped)
+			gfxPmSample("with GFXCLK soft max 1000 MHz");
+		trail("pm: cap restore");
+		if (gfxPmRestoreAuto("probe: GFXCLK soft max -> automatic"))
+			gfxPmSample("after the cap is lifted");
+		else
+			CLOG("pm: WARNING: the GFXCLK soft max could not be restored (2 attempts); compute stays limited "
+			     "to about 1000 MHz, possibly across warm reboots (the next boot retries once); "
+			     "a cold power cycle clears it");
+	}
+	CLOG("pm: experiment finished");
 }
 
 // ---------------------------------------------------------------------------
@@ -876,6 +2139,8 @@ bool RDNA4Compute::stageGfx() {
 	     "sys_low 0x%08x, l2 0x%08x, ctx0 0x%08x, l1 tlb 0x%08x", fbBase, fbTop,
 	     rdGc(GcFbOffset), rdGc(GcAgpBase), rdGc(GcAgpBot), rdGc(GcAgpTop),
 	     rdGc(GcSysApertureLow), rdGc(GcL2Cntl), rdGc(GcCtx0Cntl), rdGc(GcMxL1TlbCntl));
+	if (requestedVm())
+		vmDumpHubWindows(" after SMU enable");   // W17 E1, read-only, before gcHubInit
 	put("GCMC_FB_BASE", fbBase);
 	put("GCMC_FB_TOP", fbTop);
 	publish();
@@ -964,6 +2229,7 @@ bool RDNA4Compute::gcHubInit() {
 	}
 	const uint32_t fbOffset = sv.mmFbOffset & 0xffffff;
 	wr(IpDiscovery::HwGc, GcFbOffset, fbOffset);
+	sv.gcFbOffset = fbOffset;
 	// Page-table and default-page addresses are physical (VRAM offset plus
 	// FB_OFFSET), as gmc_v12_0_get_vm_pde makes them, not MC addresses.
 	const uint64_t phys = static_cast<uint64_t>(fbOffset) << 24;
@@ -1047,9 +2313,9 @@ bool RDNA4Compute::gcHubInit() {
 
 void RDNA4Compute::logGcFault(const char *tag) {
 	const uint32_t status = rdGc(GcL2FaultStatusLo);
-	const uint64_t addr = rdGc(GcL2FaultAddrLo) | (static_cast<uint64_t>(rdGc(GcL2FaultAddrHi)) << 32);
-	CLOG("%s: GC hub fault status 0x%08x%s, address 0x%llx", tag, status,
-	     status ? "" : " (no fault)", addr);
+	CLOG("%s: GC hub fault status 0x%08x%s (VMID %u, CID 0x%x, %s), VA 0x%llx", tag, status,
+	     status ? "" : " (no fault)", (status >> 20) & 0xf, (status >> 9) & 0x1ff,
+	     (status >> 18) & 1 ? "write" : "read", gcFaultVa());
 }
 
 // sdma_v7_0_start on bare metal: every MCU is unhalted before any queue
@@ -1216,7 +2482,7 @@ void RDNA4Compute::sdmaKick(uint64_t wptrBytes) {
 	*poolDw(kSdmaWptrOffset + 4) = static_cast<uint32_t>(wptrBytes >> 32);
 	flushHdp();
 	if (sdmaDoorbell && doorbells) {
-		doorbells[kSdmaDoorbellDword / 2] = wptrBytes;
+		{ GcAccess g(*this, 0xdb000000u | kSdmaDoorbellDword); if (g.ok) doorbells[kSdmaDoorbellDword / 2] = wptrBytes; }   // W27
 		return;
 	}
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptr), static_cast<uint32_t>(wptrBytes));
@@ -1434,26 +2700,41 @@ bool RDNA4Compute::doorbellMapBar() {
 // gfx_v12_0_compute_mqd_init + gfx_v12_0_kiq_init_register for ME1 pipe 0
 // queue 0, VMID0, doorbell dword kComputeDoorbellDword.
 bool RDNA4Compute::hqdInit(bool asKiq) {
-	for (uint32_t off = kMqdOffset; off < kPqOffset; off += 4)   // MQD + EOP
+	return hqdInitFor(asKiq, 0, 0, 0, poolMc(kMqdOffset), poolMc(kEopOffset) >> 8,
+	                  poolMc(kPqOffset) >> 8, poolMc(kPqRptrOffset), poolMc(kPqWptrOffset),
+	                  kComputeDoorbellDword);
+}
+
+bool RDNA4Compute::hqdInitFor(bool asKiq, uint32_t pipe, uint32_t queue, uint32_t vmid,
+	                            uint64_t mqd, uint64_t eop, uint64_t pq, uint64_t rptr,
+	                            uint64_t wpoll, uint32_t doorbell) {
+	if (pipe >= 2 || queue >= 4) {
+		// GC 12.0.x: one MEC, 2 pipes x 4 queues (gfx_v12_0.c:1415-1423); anything above aliases a real slot.
+		CLOG("hqd: pipe %u queue %u does not exist (2 pipes x 4 queues); refused", pipe, queue);
+		return false;
+	}
+	const uint32_t mqdOff = static_cast<uint32_t>(mqd - pool.mcAddress);
+	const bool rptrCpu = rptr >= pool.mcAddress && rptr < pool.mcAddress + pool.size;
+	const uint32_t rptrOff = rptrCpu ? static_cast<uint32_t>(rptr - pool.mcAddress) : 0;
+	for (uint32_t off = mqdOff; off < mqdOff + 0x2000; off += 4)   // MQD + EOP
 		*poolDw(off) = 0;
-	*poolDw(kPqRptrOffset) = 0;
-	*poolDw(kPqWptrOffset) = 0;
-	*poolDw(kPqWptrOffset + 4) = 0;
+	if (rptrCpu) {
+		*poolDw(rptrOff) = 0;
+		*poolDw(rptrOff + 0x40) = 0;
+		*poolDw(rptrOff + 0x44) = 0;
+	}
 	flushHdp();
 
-	const uint64_t eop = poolMc(kEopOffset) >> 8, pq = poolMc(kPqOffset) >> 8;
-	const uint64_t mqd = poolMc(kMqdOffset), rptr = poolMc(kPqRptrOffset), wpoll = poolMc(kPqWptrOffset);
 	const uint32_t eopSize = 8;                 // 2^(8+1) dwords = GFX12_MEC_HPD_SIZE
 	const uint32_t queueSize = 9;               // 2^(9+1) dwords = 4 KiB
 	uint32_t pqControl = (kHqdPqControlDefault & ~(kPqQueueSizeMask | kPqRptrBlockMask |
 	                                               kPqTunnelDispatch)) |
 	                     queueSize | (9u << 8) | kPqUnordDispatch | kPqPrivState | kPqKmdQueue;
-	uint32_t doorbell = (kComputeDoorbellDword << kDoorbellOffsetShift) | kDoorbellEn;
 
 	// The MQD in memory, as gfx_v12_0_compute_mqd_init fills it (v12_compute_mqd
 	// dword offsets): the CP reads it back (CU masks, save/restore), so it
 	// must describe the same queue the registers below do.
-	auto mqdDw = [this](uint32_t dw, uint32_t v) { *poolDw(kMqdOffset + 4 * dw) = v; };
+	auto mqdDw = [this, mqdOff](uint32_t dw, uint32_t v) { *poolDw(mqdOff + 4 * dw) = v; };
 	mqdDw(0, 0xC0310800);                             // header
 	mqdDw(11, 1);                                     // compute_pipelinestat_enable
 	mqdDw(23, 0xffffffff);                            // compute_static_thread_mgmt_se0
@@ -1464,7 +2745,7 @@ bool RDNA4Compute::hqdInit(bool asKiq) {
 	mqdDw(128, static_cast<uint32_t>(mqd) & ~3u);     // cp_mqd_base_addr_lo
 	mqdDw(129, static_cast<uint32_t>(mqd >> 32));
 	mqdDw(130, 1);                                    // cp_hqd_active
-	mqdDw(131, 0);                                    // cp_hqd_vmid
+	mqdDw(131, vmid);                                 // cp_hqd_vmid
 	mqdDw(132, kHqdPersistentDefault);                // cp_hqd_persistent_state
 	mqdDw(135, (1u << 0) | (1u << 4) | (1u << 8));    // cp_hqd_quantum: EN, SCALE 1, DURATION 1
 	mqdDw(136, static_cast<uint32_t>(pq));            // cp_hqd_pq_base_lo
@@ -1473,10 +2754,10 @@ bool RDNA4Compute::hqdInit(bool asKiq) {
 	mqdDw(140, static_cast<uint32_t>(rptr >> 32) & 0xffff);
 	mqdDw(141, static_cast<uint32_t>(wpoll) & ~3u);   // cp_hqd_pq_wptr_poll_addr_lo
 	mqdDw(142, static_cast<uint32_t>(wpoll >> 32) & 0xffff);
-	mqdDw(143, doorbell);                             // cp_hqd_pq_doorbell_control
+	mqdDw(143, (doorbell << kDoorbellOffsetShift) | kDoorbellEn); // cp_hqd_pq_doorbell_control
 	mqdDw(145, pqControl);                            // cp_hqd_pq_control
 	mqdDw(149, 0x00300000);                           // cp_hqd_ib_control: MIN_IB_AVAIL_SIZE 3
-	mqdDw(162, kMqdControlDefault & ~0xfu);           // cp_mqd_control: VMID 0
+	mqdDw(162, kMqdControlDefault & ~0xfu);           // cp_mqd_control: VMID 0, always
 	mqdDw(165, static_cast<uint32_t>(eop));           // cp_hqd_eop_base_addr_lo
 	mqdDw(166, static_cast<uint32_t>(eop >> 32));
 	mqdDw(167, (kHqdEopControlDefault & ~0x3fu) | eopSize);
@@ -1485,20 +2766,20 @@ bool RDNA4Compute::hqdInit(bool asKiq) {
 	// As the KIQ (gfx_v12_0_kiq_setting): the RLC names this queue (ME1,
 	// pipe 0, queue 0) in the low byte, bit 7 marks it valid. Otherwise
 	// it stays an ordinary MMIO-activated queue (kfd's hqd_load, gfx9-11).
-	const uint32_t sched = (rdGc(RlcCpSchedulers) & 0xffffff00u) | (1u << 5) | (0u << 3) | 0u;
-	if (asKiq) {
+	const uint32_t sched = (rdGc(RlcCpSchedulers) & 0xffffff00u) | (1u << 5) | (pipe << 3) | queue;
+	if (vmid == 0 && pipe == 0 && queue == 0 && asKiq) {
 		wr(IpDiscovery::HwGc, RlcCpSchedulers, sched);
 		wr(IpDiscovery::HwGc, RlcCpSchedulers, sched | 0x80);
-	} else {
+	} else if (vmid == 0 && pipe == 0 && queue == 0) {
 		wr(IpDiscovery::HwGc, RlcCpSchedulers, sched & 0xffffff00u);
 	}
 
-	grbmSelect(1, 0, 0, 0);
+	grbmSelect(1, pipe, queue, vmid);
 	wr(IpDiscovery::HwGc, CpPqWptrPollCntl, rdGc(CpPqWptrPollCntl) & ~kPqWptrPollEn);
 	wr(IpDiscovery::HwGc, CpHqdEopBase, static_cast<uint32_t>(eop));
 	wr(IpDiscovery::HwGc, CpHqdEopBaseHi, static_cast<uint32_t>(eop >> 32));
 	wr(IpDiscovery::HwGc, CpHqdEopControl, (kHqdEopControlDefault & ~0x3fu) | eopSize);
-	wr(IpDiscovery::HwGc, CpHqdPqDoorbell, doorbell);
+	wr(IpDiscovery::HwGc, CpHqdPqDoorbell, (doorbell << kDoorbellOffsetShift) | kDoorbellEn);
 	if (rdGc(CpHqdActive) & 1) {                // a queue left behind: drain it
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
 		for (uint32_t us = 0; us < 100000 && (rdGc(CpHqdActive) & 1); us += 10)
@@ -1508,8 +2789,16 @@ bool RDNA4Compute::hqdInit(bool asKiq) {
 		wr(IpDiscovery::HwGc, CpHqdPqWptrLo, 0);
 		wr(IpDiscovery::HwGc, CpHqdPqWptrHi, 0);
 	}
+	/* A dequeued VM queue retains its read pointer; every fresh HQD starts
+	 * consuming the newly initialized ring at dword zero. */
+	wr(IpDiscovery::HwGc, CpHqdPqRptr, 0);
 	wr(IpDiscovery::HwGc, CpMqdBaseAddr, static_cast<uint32_t>(mqd) & ~3u);
 	wr(IpDiscovery::HwGc, CpMqdBaseAddrHi, static_cast<uint32_t>(mqd >> 32));
+	/* The MQD is a kernel (VMID0 MC) address for every queue, whatever the
+	 * queue's own VMID: gfx_v12_0_compute_mqd_init ("set MQD vmid to 0") and
+	 * kfd_mqd_manager_v12 init_mqd (cp_mqd_control = PRIV_STATE only) keep
+	 * CP_MQD_CONTROL.VMID at 0. With the queue's VMID here the CP's MQD
+	 * accesses walked the client tables at an MC address and faulted (W16). */
 	wr(IpDiscovery::HwGc, CpMqdControl, kMqdControlDefault & ~0xfu);
 	wr(IpDiscovery::HwGc, CpHqdPqBase, static_cast<uint32_t>(pq));
 	wr(IpDiscovery::HwGc, CpHqdPqBaseHi, static_cast<uint32_t>(pq >> 32));
@@ -1520,18 +2809,18 @@ bool RDNA4Compute::hqdInit(bool asKiq) {
 	wr(IpDiscovery::HwGc, CpHqdPqWptrPollHi, static_cast<uint32_t>(wpoll >> 32) & 0xffff);
 	wr(IpDiscovery::HwGc, CpMecDoorbellLower, kMecDoorbellLowerBytes);
 	wr(IpDiscovery::HwGc, CpMecDoorbellUpper, kMecDoorbellUpperBytes);
-	wr(IpDiscovery::HwGc, CpHqdPqDoorbell, doorbell);
+	wr(IpDiscovery::HwGc, CpHqdPqDoorbell, (doorbell << kDoorbellOffsetShift) | kDoorbellEn);
 	wr(IpDiscovery::HwGc, CpHqdPqWptrLo, 0);
 	wr(IpDiscovery::HwGc, CpHqdPqWptrHi, 0);
-	wr(IpDiscovery::HwGc, CpHqdVmid, 0);
+	wr(IpDiscovery::HwGc, CpHqdVmid, vmid);
 	wr(IpDiscovery::HwGc, CpHqdPersistent, kHqdPersistentDefault);
 	wr(IpDiscovery::HwGc, CpHqdEopRptr, kEopInitFetcher);   // start the EOP fetcher (kfd hqd_load)
 	wr(IpDiscovery::HwGc, CpHqdActive, 1);
 	wr(IpDiscovery::HwGc, CpPqStatus, rdGc(CpPqStatus) | kPqStatusDoorbellEnable);
 	const uint32_t active = rdGc(CpHqdActive), pqc = rdGc(CpHqdPqControl);
 	grbmSelect(0, 0, 0, 0);
-	CLOG("mec: HQD ME1/pipe0/queue0: active %u, PQ_CONTROL 0x%08x, doorbell dword %u",
-	     active & 1, pqc, kComputeDoorbellDword);
+	CLOG("mec: HQD ME1/pipe%u/queue%u VMID%u: active %u, PQ_CONTROL 0x%08x, doorbell dword %u",
+	     pipe, queue, vmid, active & 1, pqc, doorbell);
 	return active & 1;
 }
 
@@ -1540,7 +2829,118 @@ void RDNA4Compute::pm4Kick(uint64_t wptrDwords) {
 	*poolDw(kPqWptrOffset) = static_cast<uint32_t>(wptrDwords);
 	*poolDw(kPqWptrOffset + 4) = static_cast<uint32_t>(wptrDwords >> 32);
 	flushHdp();
-	doorbells[kComputeDoorbellDword / 2] = wptrDwords;
+	{ GcAccess g(*this, 0xdb000000u | kComputeDoorbellDword); if (g.ok) doorbells[kComputeDoorbellDword / 2] = wptrDwords; }   // W27
+}
+
+void RDNA4Compute::logComputeQueueState(const char *tag, uint32_t pipe, uint32_t queue,
+                                        uint32_t vmid) {
+	grbmSelect(1, pipe, queue, vmid);
+	CLOG("%s: GRBM 0x%08x GRBM2 0x%08x CP_STAT 0x%08x CPC 0x%08x CPC_BUSY 0x%08x",
+	     tag, rdGc(GrbmStatus), rdGc(GrbmStatus2), rdGc(CpStat), rdGc(CpCpcStatus),
+	     rdGc(CpCpcBusyStat));
+	CLOG("%s: HQD active 0x%08x vmid 0x%08x persistent 0x%08x PQ base 0x%08x:%08x rptr 0x%08x "
+	     "wptr 0x%08x:%08x doorbell 0x%08x PQ_CONTROL 0x%08x dequeue 0x%08x",
+	     tag, rdGc(CpHqdActive), rdGc(CpHqdVmid), rdGc(CpHqdPersistent), rdGc(CpHqdPqBaseHi),
+	     rdGc(CpHqdPqBase), rdGc(CpHqdPqRptr), rdGc(CpHqdPqWptrHi), rdGc(CpHqdPqWptrLo),
+	     rdGc(CpHqdPqDoorbell), rdGc(CpHqdPqControl), rdGc(CpHqdDequeueReq));
+	CLOG("%s: HQ_STATUS0 0x%08x EOP 0x%08x:%08x EOP_RPTR 0x%08x SQ_CMD 0x%08x MEC pc 0x%x",
+	     tag, rdGc(CpHqdHqStatus0), rdGc(CpHqdEopBaseHi), rdGc(CpHqdEopBase), rdGc(CpHqdEopRptr),
+	     rdGc(SqCmd), rdGc(CpMecRs64InstrPntr));
+	grbmSelect(0, 0, 0, 0);
+	logGcFault(tag);
+}
+
+bool RDNA4Compute::queueWriteTest(const char *tag, const Launch *l) {
+	if (!gcEnsureAwake(0xfffffff0u)) {       // see launch(): wake before emitting, not at the doorbell
+		CLOG("%s: GFX could not be woken from GFXOFF; not submitting", tag);
+		return false;
+	}
+	const bool client = l && l->queue;
+	Pm4::Queue *queue = client ? l->queue : &pm4Queue;
+	const uint32_t doorbell = client ? l->doorbell : kComputeDoorbellDword;
+	const uint64_t address = client ? l->recoveryProofAddress : poolMc(kPm4TestOffset);
+	volatile uint32_t *cpu = client ? l->recoveryProofCpu : poolDw(kPm4TestOffset);
+	if (!queue || !cpu || !address)
+		return false;
+	*cpu = 0;
+	flushHdp();
+	uint32_t pkt[8];
+	if (!queue->emit(pkt, Pm4::writeData(pkt, address, 0x600DF00D)))
+		return false;
+	if (client)
+		pm4Kick(*queue, doorbell, queue->wptr());
+	else
+		pm4Kick(queue->wptr());
+	for (uint32_t ms = 0; ms < 200; ms++) {
+		if (*cpu == 0x600DF00D) {
+			CLOG("%s: recovered queue WRITE_DATA landed", tag);
+			return true;
+		}
+		IOSleep(1);
+	}
+	CLOG("%s: recovered queue WRITE_DATA did NOT land", tag);
+	return false;
+}
+
+bool RDNA4Compute::recoverComputeQueue(const char *tag, const Launch *l) {
+	if (!hangRecoveryEnabled) {
+		CLOG("%s: queue recovery disabled; rdna4-hang=1 is required", tag);
+		return false;
+	}
+	const bool client = l && l->queue;
+	const uint32_t pipe = client ? l->pipe : 0;
+	const uint32_t queueId = client ? l->queueId : 0;
+	const uint32_t vmid = client ? l->vmid : 0;
+	CLOG("%s: recovering compute queue without a GPU reset", tag);
+	// gfx_v12_0_reset_kcq is MES-backed upstream. This is our no-MES sequence:
+	// the documented HQD RESET_WAVES dequeue, gfx12 SQ_CMD wave kill, then the
+	// same queue's HQD register set and a fenced WRITE_DATA proof.
+	logComputeQueueState(tag, pipe, queueId, vmid);
+	grbmSelect(1, pipe, queueId, vmid);
+	wr(IpDiscovery::HwGc, CpHqdDequeueReq, 2); // RESET_WAVES (amdgpu enum value)
+	// amdgpu_amdkfd_gfx_v12 exposes SQ_CMD wave_control_execute. CMD=3 is
+	// kill, MODE=1 selects all waves, CHECK_VMID=1 limits it to this VMID.
+	const uint32_t sqCmd = 3u | (1u << 4) | (1u << 7) | ((vmid & 0xf) << 28);
+	wr(IpDiscovery::HwGc, SqCmd, sqCmd);
+	bool inactive = false;
+	for (uint32_t us = 0; us < 100000; us += 10) {
+		if (!(rdGc(CpHqdActive) & 1)) {
+			inactive = true;
+			break;
+		}
+		IODelay(10);
+	}
+	wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+	if (!inactive) {
+		grbmSelect(0, 0, 0, 0);
+		CLOG("%s: HQD dequeue/wave kill did not clear CP_HQD_ACTIVE", tag);
+		logGcFault(tag);
+		return false;
+	}
+	if (client) {
+		if (!l->queueCpu || !l->queueAddress ||
+		    !l->queue->init(l->queueCpu, l->queueAddress, kPqSize) ||
+		    !hqdInitFor(false, pipe, queueId, vmid, l->recoveryMqd, l->recoveryEop,
+	                   l->queueAddress >> 8, l->recoveryRptr, l->recoveryWpoll, l->doorbell) ||
+		    !queueWriteTest(tag, l)) {
+			CLOG("%s: client queue reinitialisation or fenced WRITE_DATA failed; staying wedged", tag);
+			logComputeQueueState(tag, pipe, queueId, vmid);
+			return false;
+		}
+	} else if (!pm4Queue.init(poolDw(kPqOffset), poolMc(kPqOffset), kPqSize) ||
+	           !hqdInit(hqdMode == 2) || !queueWriteTest(tag)) {
+		CLOG("%s: queue reinitialisation or fenced WRITE_DATA failed; staying wedged", tag);
+		logComputeQueueState(tag);
+		return false;
+	}
+	CLOG("%s: queue recovered; subsequent clients may dispatch", tag);
+	return true;
+}
+
+void RDNA4Compute::pm4Kick(Pm4::Queue &queue, uint32_t doorbell, uint64_t wptrDwords) {
+	/* The VM queue's wptr report is mapped in its client VA; the CP owns it. */
+	flushHdp();
+	{ GcAccess g(*this, 0xdb000000u | doorbell); if (g.ok) doorbells[doorbell / 2] = wptrDwords; }   // W27
 }
 
 bool RDNA4Compute::stageCompute() {
@@ -1616,6 +3016,11 @@ bool RDNA4Compute::stageCompute() {
 		          writeTest("KIQ");
 	}
 	put("QueueMode", running ? mode : 0);
+	if (running) {
+		hqdMode = mode;
+		bootQueueLive = true;
+		bootQueueGen = bringupGen;
+	}
 	if (!running) {
 		publish();
 		return false;
@@ -1677,12 +3082,26 @@ uint32_t RDNA4Compute::shAbs(const Reg &r) const {
 // ACQUIRE_MEM first (code and inputs were just written by the CPU) and its
 // RELEASE_MEM fence after (GL2 written back, so the CPU reads the results).
 bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
-	*poolDw(kPm4FenceOffset) = 0;
-	flushHdp();
+	// pm4Queue (and the client queues) are emitted into by one submitter at a time, under rtLock, and
+	// only after a GC access: a wake caused by the first access must finish (it may re-initialise the
+	// boot HQD and the ring bookkeeping) BEFORE this thread emits a packet, so wake explicitly (S5).
+	if (!gcEnsureAwake(0xfffffff0u)) {
+		CLOG("%s: GFX could not be woken from GFXOFF; dispatch not submitted", tag);
+		return false;
+	}
+	const bool vm = l.queue != nullptr;
+	volatile uint32_t *fenceCpu = vm ? l.fenceCpu : poolDw(kPm4FenceOffset);
+	const uint32_t fenceValue = vm ? l.fenceValue : (pm4Fence + 1);
+	if (!vm || !l.preserveFence) {
+		*fenceCpu = 0;
+		flushHdp();
+	}
 
-	// Shader memory model for VMID0 (gfx_v12_0_constants_init).
-	grbmSelect(0, 0, 0, 0);
+	// Shader memory model for the selected VMID (gfx_v12_0_constants_init).
+	grbmSelect(0, vm ? l.pipe : 0, vm ? l.queueId : 0, vm ? l.vmid : 0);
 	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
+	if (vm)
+		wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 
 	const uint32_t pgm[2] = { static_cast<uint32_t>(l.code >> 8), static_cast<uint32_t>(l.code >> 40) };
 	const uint32_t rsrc[2] = { l.rsrc1, (l.rsrc2 & ~kRsrc2LdsMask) | ldsSizeField(l.ldsBytes) };
@@ -1692,7 +3111,7 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	const uint32_t none4[4] = { 0, 0, 0, 0 };
 	const uint32_t start[3] = { 0, 0, 0 };
 
-	Pm4::Queue &q = pm4Queue;
+	Pm4::Queue &q = vm ? *l.queue : pm4Queue;
 	uint32_t pkt[24];
 	q.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync));
 	q.emit(pkt, Pm4::setShReg(pkt, shAbs(ComputePgmLo), pgm, 2));
@@ -1710,35 +3129,63 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	q.emit(pkt, Pm4::dispatchDirect(pkt, l.groups[0], l.groups[1], l.groups[2],
 	                                Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 |
 	                                (l.wave32 ? Pm4::kDispatchWave32 : 0)));
-	q.emit(pkt, Pm4::releaseMem(pkt, poolMc(kPm4FenceOffset), ++pm4Fence));
+	const uint64_t fenceAddress = vm ? l.fenceAddress : poolMc(kPm4FenceOffset);
+	const bool irq = l.useInterrupt && ihActive;
+	q.emit(pkt, Pm4::releaseMem(pkt, fenceAddress, fenceValue, irq));
 
-	// Spin for the first 2 ms (short kernels), then sleep between polls:
-	// user dispatches may run for seconds.
+	// The client's own queue (W2) or the kernel's; the end-of-pipe interrupt
+	// (W1) only wakes the wait, the fence decides. Without it: spin for the
+	// first 2 ms (short kernels), then sleep between polls, since user
+	// dispatches may run for seconds.
+	const uint32_t timeoutUs = l.timeoutUs ? l.timeoutUs : 1000000;
 	uint64_t t0 = mach_absolute_time(), span = 0;
-	nanoseconds_to_absolutetime(static_cast<uint64_t>(l.timeoutUs ? l.timeoutUs : 1000000) * 1000,
-	                            &span);
-	pm4Kick(q.wptr());
-	bool done = false;
-	for (uint32_t polls = 0;; polls++) {
-		done = *poolDw(kPm4FenceOffset) == pm4Fence;
-		if (done || mach_absolute_time() - t0 > span)
-			break;
-		if (polls < 200)
-			IODelay(10);
-		else
-			IOSleep(1);
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutUs) * 1000, &span);
+	if (vm)
+		pm4Kick(q, l.doorbell, q.wptr());
+	else {
+		pm4Fence = fenceValue;
+		pm4Kick(q.wptr());
 	}
-	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	bool done = false;
+	if (irq) {
+		done = ihWaitFence(fenceCpu, fenceValue, (timeoutUs + 999) / 1000, true, nullptr, ns);
+		// Time the whole dispatch, from before the kick (the emulator even
+		// runs it inside the kick), like the polling path below.
+		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	} else {
+		for (uint32_t polls = 0;; polls++) {
+			done = *fenceCpu == fenceValue;
+			if (done || mach_absolute_time() - t0 > span)
+				break;
+			if (polls < 200)
+				IODelay(10);
+			else
+				IOSleep(1);
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	}
 	if (!done) {
 		CLOG("%s: the kernel's fence never came (0x%08x, want 0x%08x)", tag,
-		     *poolDw(kPm4FenceOffset), pm4Fence);
-		grbmSelect(1, 0, 0, 0);
+		     *fenceCpu, fenceValue);
+		grbmSelect(1, vm ? l.pipe : 0, vm ? l.queueId : 0, vm ? l.vmid : 0);
 		CLOG("%s: GRBM 0x%08x CP_STAT 0x%08x CPC 0x%08x CPC_BUSY 0x%08x HQD rptr 0x%x wptr %llu "
 		     "HQ_STATUS0 0x%08x MEC pc 0x%x", tag, rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpCpcStatus),
 		     rdGc(CpCpcBusyStat), rdGc(CpHqdPqRptr), static_cast<unsigned long long>(q.wptr()),
 		     rdGc(CpHqdHqStatus0), rdGc(CpMecRs64InstrPntr));
 		grbmSelect(0, 0, 0, 0);
 		logGcFault(tag);
+		if (!vm)
+			logComputeQueueState(tag);
+	}
+	if (vm) {
+		const uint32_t status = rdGc(GcL2FaultStatusLo);
+		if (status) {
+			CLOG("vmid %u: %s: GC hub fault status 0x%08x (fault VMID %u) VA 0x%llx", l.vmid, tag,
+			     status, (status >> 20) & 0xf, gcFaultVa());
+			gcFaultClear();
+			vmInvalidate(l.vmid, "dispatch fault clear");
+			scrubFaultPage();
+		}
 	}
 	return done;
 }

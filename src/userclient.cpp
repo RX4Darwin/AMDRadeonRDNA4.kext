@@ -16,6 +16,33 @@
 OSDefineMetaClassAndStructors(RDNA4ComputeService, IOService)
 OSDefineMetaClassAndStructors(RDNA4ComputeClient, IOUserClient)
 
+static IOPMPowerState kComputePowerStates[2] = {
+	/* IOKit ordinals run from the lowest power state to the highest. */
+	{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+	{ 1, kIOPMDeviceUsable | kIOPMPowerOn, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+};
+
+IOReturn RDNA4ComputeService::setPowerState(unsigned long powerStateOrdinal,
+                                             IOService *) {
+	uint64_t nowNs = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
+	IOLog("RDNA4FB: power: setPowerState ordinal %lu at %llu ns\n",
+	      powerStateOrdinal, nowNs);
+	if (!compute)
+		return kIOPMAckImplied;
+	if (powerStateOrdinal == 0)
+		compute->powerWillSleep();
+	else if (powerStateOrdinal == 1)
+		compute->powerDidWake();
+	return kIOPMAckImplied;
+}
+
+bool RDNA4ComputeService::registerPowerManagement(IOService *provider) {
+	PMinit();
+	joinPMtree(provider);
+	return registerPowerDriver(this, kComputePowerStates, 2) == kIOReturnSuccess;
+}
+
 // A kernel runs in VMID0 and can reach all of VRAM: only root may open.
 bool RDNA4ComputeClient::initWithTask(task_t owningTask, void *securityToken, UInt32 type,
                                       OSDictionary *properties) {
@@ -32,7 +59,7 @@ bool RDNA4ComputeClient::start(IOService *provider) {
 	if (!svc || !svc->compute || !IOUserClient::start(provider))
 		return false;
 	compute = svc->compute;
-	return true;
+	return compute->rtOpen(this) == kIOReturnSuccess;
 }
 
 IOReturn RDNA4ComputeClient::clientClose() {
@@ -43,16 +70,35 @@ IOReturn RDNA4ComputeClient::clientClose() {
 	return kIOReturnSuccess;
 }
 
+IOReturn RDNA4ComputeClient::clientDied() {
+	if (compute)
+		compute->rtRelease(this);
+	compute = nullptr;
+	return IOUserClient::clientDied();
+}
+
 const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] = {
 	// function    scalars in  struct in                   scalars out  struct out
-	{ sInfo,       0,          0,                          6,           0 },
+	{ sInfo,       0,          0,                          9,           0 },
 	{ sAlloc,      1,          0,                          2,           0 },
 	{ sFree,       1,          0,                          0,           0 },
 	{ sWrite,      4,          0,                          0,           0 },
 	{ sRead,       4,          0,                          0,           0 },
-	{ sLoad,       2,          kIOUCVariableStructureSize, 8,           0 },
+	{ sLoad,       2,          kIOUCVariableStructureSize, 9,           0 },
 	{ sUnload,     1,          0,                          0,           0 },
 	{ sDispatch,   0,          sizeof(RDNA4Dispatch),      1,           0 },
+	{ sWaitVBlank, 1,          0,                          2,           0 },
+	{ sPresent,    2,          0,                          2,           0 },
+	{ sRestore,    0,          0,                          0,           0 },
+	{ sAllocHost,  2,          0,                          3,           0 },
+	{ sSensors,    0,          0,                          0,           sizeof(RDNA4Sensors) },
+	{ sSleepTest,  1,          0,                          0,           0 },
+	{ sQuiesce,    0,          0,                          0,           0 },
+	{ sPresentAsync, 2,        0,                          1,           0 },
+	{ sWaitPresent,  2,        0,                          1,           0 },
+	{ sSubmitIb,   3,          0,                          1,           0 },
+	{ sWaitFence,  2,          0,                          1,           0 },
+	{ sSensorsEx,  0,          0,                          0,           sizeof(RDNA4SensorsEx) },
 };
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -67,7 +113,27 @@ IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodA
 static RDNA4ComputeClient *self(OSObject *t) { return static_cast<RDNA4ComputeClient *>(t); }
 
 IOReturn RDNA4ComputeClient::sInfo(OSObject *t, void *, IOExternalMethodArguments *a) {
-	return self(t)->compute->rtInfo(a->scalarOutput);
+	return self(t)->compute->rtInfo(t, a->scalarOutput);
+}
+
+IOReturn RDNA4ComputeClient::sSensors(OSObject *t, void *, IOExternalMethodArguments *a) {
+	if (!a->structureOutput || a->structureOutputSize != sizeof(RDNA4Sensors))
+		return kIOReturnBadArgument;
+	return self(t)->compute->rtSensors(t, *static_cast<RDNA4Sensors *>(a->structureOutput));
+}
+
+IOReturn RDNA4ComputeClient::sSensorsEx(OSObject *t, void *, IOExternalMethodArguments *a) {
+	if (!a->structureOutput || a->structureOutputSize != sizeof(RDNA4SensorsEx))
+		return kIOReturnBadArgument;
+	return self(t)->compute->rtSensorsEx(t, *static_cast<RDNA4SensorsEx *>(a->structureOutput));
+}
+
+IOReturn RDNA4ComputeClient::sSleepTest(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtSleepTest(t, static_cast<uint32_t>(a->scalarInput[0]));
+}
+
+IOReturn RDNA4ComputeClient::sQuiesce(OSObject *t, void *, IOExternalMethodArguments *) {
+	return self(t)->compute->rtQuiesce(t);
 }
 
 IOReturn RDNA4ComputeClient::sAlloc(OSObject *t, void *, IOExternalMethodArguments *a) {
@@ -109,4 +175,51 @@ IOReturn RDNA4ComputeClient::sDispatch(OSObject *t, void *, IOExternalMethodArgu
 		return kIOReturnBadArgument;
 	return self(t)->compute->rtDispatch(t, *static_cast<const RDNA4Dispatch *>(a->structureInput),
 	                                    a->scalarOutput[0]);
+}
+
+IOReturn RDNA4ComputeClient::sWaitVBlank(OSObject *t, void *, IOExternalMethodArguments *a) {
+	uint64_t count = 0, timeNs = 0;
+	if (!self(t)->compute->ihWaitVblank(Pipe::kNone, static_cast<uint32_t>(a->scalarInput[0]), count,
+	                                    timeNs))
+		return kIOReturnTimeout;
+	a->scalarOutput[0] = count;
+	a->scalarOutput[1] = timeNs;
+	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4ComputeClient::sPresent(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtPresent(t, a->scalarInput[0], a->scalarInput[1],
+	                                   a->scalarOutput[0], a->scalarOutput[1]);
+}
+
+IOReturn RDNA4ComputeClient::sRestore(OSObject *t, void *, IOExternalMethodArguments *) {
+	return self(t)->compute->rtRestore(t);
+}
+
+IOReturn RDNA4ComputeClient::sAllocHost(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtAllocHost(t, self(t)->task, a->scalarInput[0],
+	                                     a->scalarInput[1], a->scalarOutput[0],
+	                                     a->scalarOutput[1], a->scalarOutput[2]);
+}
+
+IOReturn RDNA4ComputeClient::sPresentAsync(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtPresentAsync(t, a->scalarInput[0], a->scalarInput[1],
+	                                       a->scalarOutput[0]);
+}
+
+IOReturn RDNA4ComputeClient::sWaitPresent(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtWaitPresent(t, a->scalarInput[0],
+	                                      static_cast<uint32_t>(a->scalarInput[1]),
+	                                      a->scalarOutput[0]);
+}
+
+IOReturn RDNA4ComputeClient::sSubmitIb(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtSubmitIb(t, a->scalarInput[0], a->scalarInput[1],
+	                                    a->scalarInput[2], a->scalarOutput[0]);
+}
+
+IOReturn RDNA4ComputeClient::sWaitFence(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtWaitFence(t, static_cast<uint32_t>(a->scalarInput[0]),
+	                                     static_cast<uint32_t>(a->scalarInput[1]),
+	                                     a->scalarOutput[0]);
 }

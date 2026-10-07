@@ -1,0 +1,191 @@
+# W32/W34: cursor request scheduling and DLG mission mode — evidence and tests
+
+Source: `premetal/cursor-invisible-analysis.md` (rank 1) and `premetal/w32-review.md`. Round 4 showed the cursor plane enabled and latched (`LATCHED`, no lock held, all cursor
+registers as amdgpu writes them) yet neither the pointer (`rdna4-cursor=1`) nor the magenta square (`rdna4-cursor=2`) ever appeared.
+
+## 1. The correction (W32 review S1): amdgpu does not program a cursor rate on DCN 4.01
+
+DCN401 uses DML 2.1 (`using_dml21 = true`, `dcn401_resource.c:784`). Its pipe-register calculation (`dml2_core_dcn4_calcs.c:12796-12806`) fills the surface pairs only; there is no
+`cur0` value anywhere in `dml21`, and the per-pipe register set is zeroed first. `hubp401_program_deadline` therefore writes `DCN_CUR0_TTU_CNTL0/1 = 0`
+(`dcn401_hubp.c:406-409`, `:473-474`) and the Linux cursor works on this ASIC. So "the CUR0 pair is zero" (rank 1) cannot by itself be why the plane shows nothing.
+The formula W32 computed (`display_mode_core.c:3441-3448`, `dml_display_rq_dlg_calc.c:403-404,486-487,497,500`) belongs to the *legacy* DML2 (dml2_0 core, DCN3.x-style): an untested
+combination on this ASIC, so it is now a **secondary opt-in** (`rdna4-cursorttu=1`, default off).
+
+## 2. What amdgpu writes and the kext did not: HUBPREQ_DEBUG_DB = 1 << 8
+
+`hubp401_program_deadline` starts with `REG_WRITE(HUBPREQ_DEBUG_DB, 1 << 8)` ("put DLG in mission mode", `dcn401_hubp.c:329`); `HUBPREQ0_HUBPREQ_DEBUG_DB` is dword `0x05fc`
+(base idx 2, `+ hubpOff()`). The GOP-lit pipe never went through that function. Under `rdna4-cursor=2` the kext now (`cursorProgramMissionMode`, before the cursor lock bracket):
+
+- reads the register; if bit 8 is already set it says so and writes nothing;
+- **W35 (W34 review S1): bit 8 is not cursor-only.** amdgpu's own comments call it "disable dlg test mode" / "hack mode disable" (`dcn20_hubp.c:176`, `dcn10_hubp.c:129`): it takes the whole
+  HUBP request generator, the primary surface included, from the DLG test mode to the mode that follows the programmed DLG/TTU registers, and DC writes it in the same call that programs
+  them. So the kext writes it only when the GOP already programmed the DLG (`DCN_SURF0_TTU_CNTL0` delivery non-zero) and bit 8 is clear; otherwise it logs
+  `DLG registers not programmed by the GOP (SURF0_TTU_CNTL0 delivery 0, ...); mission mode NOT written` and skips. A black or corrupt primary after `rdna4-cursor=2` without `rdna4-cursordlg=0` would be caused by this write;
+- when it writes: the whole register (`0x100`, as DC's `REG_WRITE` does), logs `HUBPREQ_DEBUG_DB was 0x... (SURF0 delivery ...), wrote 0x100 ...; reads back ...`;
+- `rdna4-cursordlg=0` skips it (the control: same dumps).
+
+`rdna4-cursor=1` never writes it.
+
+## 3. Read-only evidence (unchanged, `rdna4-cursor` = 1 or 2)
+
+Two lines per probe in the `RDNA4FB,Cursor` trail and the kernel log, at `armed`, `selftest`, after every boot flip (compute-thread hook `Env::cursorProbe`), and at the first
+`cscSetHardwareCursor` / `cscDrawHardwareCursor` (max 10 probes):
+
+- `ttu: cur0 <CNTL0>/<CNTL1> surf0 <CNTL0>/<CNTL1> surf1 <CNTL0> global <GLOBAL_TTU_CNTL> qos_wm <QOS_WM> debug_db <HUBPREQ_DEBUG_DB>`
+- `gate: hubp clk <HUBP_CLK_CNTL> cursor mem pwr <CTRL>/<STATUS> stereo <STEREO_CONTROL> | mpcc<N> top/bot/opp <MPCC_TOP_SEL/BOT_SEL/OPP_ID> | sprite px first/mid/last <VRAM readback>`
+
+## 4. Reading the next round
+
+| Log | Meaning |
+|---|---|
+| `armed: ttu: ... debug_db 0x00000000` (bit 8 clear) and the square appears after `wrote 0x00000100` | DLG mission mode was the missing piece; make it part of the cursor bring-up (also for `rdna4-cursor=1`) |
+| `debug_db` already `0x00000100` at arming | mission mode was not it; look at `gate:` and the other DLG registers below |
+| the square does not appear either way | `gate:` next: `mpcc top/bot/opp` must select DPP0/OPP0, `hubp clk` clock-on bits, `cursor mem pwr status` (shutdown/light sleep), `sprite px ... (SELF-TEST DATA GONE)` (data), and `global`/`qos_wm`/`surf0` against a Linux dump of the same HUBP |
+| `cur0`/`gate:` differ between `armed` and `flip` / `first cscDrawHardwareCursor` | state clobbered after arming: re-program from the flip/first-draw path |
+| square only with `rdna4-cursorttu=1` | a legacy-DML value is sufficient; amdgpu proves 0 is sufficient in the presence of whatever else it programs (mission mode, DLG registers), so look at what else differs |
+
+The best single piece of evidence would be a Linux boot on the same card reading `DCN_CUR0_TTU_CNTL0/1`, `HUBPREQ_DEBUG_DB`, `DCN_GLOBAL_TTU_CNTL` and `DCN_TTU_QOS_WM` (umr / amdgpu_regs).
+
+## 5. The opt-in TTU write (`rdna4-cursorttu=1`, `rdna4-cursor=2` only)
+
+`cursorProgramTtu` writes `DCN_CUR0_TTU_CNTL0 = delivery | 8 << 24`, `CNTL1 = delivery` inside the MPC cursor lock bracket, with
+`delivery = 64 * refclk_kHz * 1024 / (pixel_clock_kHz * cursor_req_per_width)` (1080p60 + 50 MHz DCHUB ref: 22064). Not written when the stream clock is above 600 MHz (ODM combine would
+double the value) or no usable value exists. Whether the pair latches inside the cursor lock or under the OTG master update lock is not established; compare the write's readback
+with the next `ttu:` line.
+
+## 6. Emulator
+
+`cursor-ttu-hypothesis=on` (emulator option, formerly `cursor-ttu-strict`) rejects the plane while `CUR0_TTU_CNTL0` delivery is 0. Given section 1 it models something amdgpu
+contradicts; a VM pass with it says only that the kext writes the register (`rdna4-cursorttu=1`), never anything about the card. Default off.
+
+## 7. W38: DSCL / pipe state, per-update fields and the CRC self-check (`rdna4-cursor=2`)
+
+Source: premetal/rootcause-cursor.md (candidates #1 DSCL stage, #3 cursor-only state, #4 MPCC lock-set mapping). Everything logs into `RDNA4FB,Cursor`, every wait is bounded (<= 50 ms),
+only display registers are touched, the GPU is never reset.
+
+Order inside the self-test: `dscl:`/`pipe:` dump (`selftest pre`) -> per-update fields -> `DSCL decision:` -> mission mode (W34) -> arm -> `dscl:`/`pipe:` dump (`selftest post`) -> CRC check.
+
+| Boot-arg | Default | Effect |
+|---|---|---|
+| `rdna4-cursorpipe=0` | on | skips CRQ_EXPANSION_MODE=1 (`0x0620` [3:2], dcn401_hubp.c:293-305), CROB memory power un-force (`0x0681/0x0682`, only if STATUS says gated) and the per-update clear of USE_MALL_FOR_CURSOR (`0x05f7` bit 2, dcn32_hubp.c:133,165; 64x64 ARGB = 16384 B, not above the limit) |
+| `rdna4-cursormpcsel=1` | off | `MPCC_UPDATE_LOCK_SEL` = OPP number (dcn10_mpc.c:221-222); the GOP left 0xf. Changes when the MPCC latches, hence its own arg |
+| `rdna4-cursordscl=1` | off | only if the dump shows `DSCL_MODE == 6` (full bypass) or `RECOUT_SIZE`/`MPC_SIZE` != plane size: amdgpu's mode-0 set (section 4B of the root-cause doc; dcn401_dpp_dscl.c:1067-1161) under the OTG update lock (`0x1b89`, held-wait bit 8). GOP values are logged first |
+
+Register offsets verified in dcn_4_1_0_offset.h (DSCL0_SCL_MODE 0x0d08, RECOUT_START/SIZE 0x0d1e/0x0d1f, MPC_SIZE 0x0d20, LB_DATA_FORMAT/MEMORY_CTRL 0x0d21/0x0d22, DSCL_MEM_PWR_CTRL/STATUS
+0x0d24/0x0d25, OBUF_CONTROL 0x0d26, HUBP0_DCHUBP_MALL_CONFIG 0x05f7, HUBPREQ0_DCN_EXPANSION_MODE 0x0620, OTG0_OTG_CRC_CNTL 0x1b65 ... OTG_CRC0_DATA_B 0x1b6b).
+
+### Reading the verdict
+
+`DSCL decision: ... -> the #1 candidate is LIVE / eliminated` says whether the GOP's DSCL state matches what amdgpu programs. The CRC check is the one that answers the user's question:
+
+    CRC A/B window (104,104)..(160,160) R.G/B: on 1f80.9e16/... off f303.f303/... on ... off ... torn 0: cursor pixels reach the output: YES
+    cursor pixels reach the output: NO      (on == off: the OTG sees no square, so the loss is upstream of the OTG)
+    cursor pixels reach the output: INCONCLUSIVE (...)   (the two "on" reads differ, or one "off" read equals "on" and the other does not)
+
+The method is optc1_configure_crc / optc1_get_crc (dcn10_optc.c:1465-1576); the cursor is read on, off, on, off, back to back. The sprite is opaque, so an "on" CRC does not depend on the desktop; the verbose console scrolls under the window, so only the "off" reads may differ. **YES** = on0 == on2 and on0 differs from both off reads; **NO** = on0 equals both off reads. The window is the square shrunk by 4 px per side (104..160): END's inclusive/exclusive convention is not in the tree, and an edge text pixel must not enter an "on" read. Each sample is read twice and repeated until both agree (`torn` counts the samples that never did); `DATA_B` is masked to 16 bits. `CRC programmed:` prints `OTG_CRC_CNTL` and the four window registers as they read back, so a window that did not latch (`WINDOW_DB_EN`) is visible.
+`NO` with the pipe fixes applied means the cursor never leaves the HUBP/DPP side: continue with candidate #2 (`rdna4-cursordlg`, DLG), then #4 (`rdna4-cursormpcsel=1`).
+
+### Emulator
+
+`cursor=on` composites the plane; the model returns `OTG_CRC0_DATA_RG/B` as a CRC-16 over the composited scanout in the window of `OTG_CRC0_WINDOWA_X/Y` while `OTG_CRC_CNTL.EN` is set. This is
+NOT the silicon CRC algorithm or its values (unknown to the model), and it takes the window in active-area coordinates, which the silicon may not (blanking offset unverified). It
+can only demonstrate that the kext's CRC program/compare logic works and that a plane the model composites is detected; it says nothing about the card's DSCL or MPC dropping the cursor.
+
+Emulator options for the W38 review tests (`RDNA4_DEV=cursor=on,...`, boot-4 arguments plus `rdna4-cursordscl=1`; `tools/vm-test.sh`):
+
+| Option | Effect |
+|---|---|
+| `dscl-mode=N` | the GOP left `DSCL0_SCL_MODE.DSCL_MODE = N`; 6 also leaves RECOUT/MPC_SIZE 0 (bypass: the model then does not check RECOUT), 1-5 leave a 1280x720 RECOUT (a scaling setup; the model has no scaler and shows "no signal", so the CRC reads 0 and the verdict is INCONCLUSIVE, but the decision line is what the test asserts) |
+| `desktop-churn=on` | one desktop pixel inside the CRC window changes with the OTG frame number, like a scrolling console; only the "off" reads see it because the sprite is opaque |
+
+Expected log lines: `dscl-mode=6` -> `case A` + `programming amdgpu's mode-0 set` + `DSCL mode-0 set written`; `dscl-mode=3` -> `case C` + `not written`; default (mode 0, RECOUT = plane) -> `case D` + `not written`;
+with `desktop-churn=on` every run must still end in `cursor pixels reach the output: YES` (the previous strict rule reads INCONCLUSIVE there). The model cannot know whether a real DSCL in bypass drops the cursor plane: it composites it.
+
+## 8. W40: CM bypass (`rdna4-cursorcm=1`, `rdna4-cursor=2` only)
+
+Source: premetal/verify-cursor.md sections 2, 7.1 and 8. The card logs `latch domains: ... cm ctl=0x00000001` (hw-logs/rdna4fb-diag-20260929-082237.txt:245): the GOP left `CM0_CM_CONTROL.CM_BYPASS = 1`.
+amdgpu clears it whenever a plane is enabled (`dcn401_dpp.c:223` `.dpp_program_gamcor_lut = dpp3_program_gamcor_lut` -> `dpp3_enable_cm_block`, `dcn30_dpp_cm.c:43-54, 219-227`, `REG_UPDATE(CM_CONTROL, CM_BYPASS, 0)`;
+`debug.cm_in_bypass` is never set for DCN401), and on DCN4 the cursor unit (`CM_CUR0`) sits inside the CM block. Whether the bypass mux sits before or after the cursor blend is undocumented: the CRC A/B decides.
+
+Read-only, always with `rdna4-cursor=2` (`selftest pre`): the `cm:` line (`CM0_CM_CONTROL 0x0d67`, `POST_CSC_CONTROL 0x0d68`, `BIAS_CR_R/Y_G_CB_B 0x0d75/0x0d76`, `GAMCOR_CONTROL 0x0d77`, `HDR_MULT_COEF 0x0dc1`,
+`MEM_PWR_CTRL/STATUS 0x0dc2/0x0dc3`, `DEALPHA 0x0dc5`; offsets verified in dcn_4_1_0_offset.h, base idx 2, `+ dppOff()`) and three `dlg 0x063b/0x0644/0x064d:` lines (the DLG/TTU registers 0x063b-0x0655, `+ hubpOff()`, nine per line).
+
+With `rdna4-cursorcm=1`, in the same boot: CRC A/B `[GOP CM state]` -> CM write -> CRC A/B `[after CM enable]` -> `CM bypass: before NO/YES, after NO/YES`. The write happens under the OTG update lock
+(same bracket as modeset.cpp:292-300, held-wait <= 10 ms), each value as amdgpu leaves an SDR RGB plane without degamma:
+
+| Register | Value | amdgpu |
+|---|---|---|
+| `CM_POST_CSC_CONTROL` | 0 (bypass) | `dcn30_dpp.c:118-120` |
+| `CM_BIAS_CR_R`, `CM_BIAS_Y_G_CB_B` | 0 | `dcn30_dpp_cm.c:160-170` |
+| `CM_DEALPHA` | 0 | `dcn30_dpp_cm.c:149-158` |
+| `CM_GAMCOR_CONTROL` | 0 (whole-register REG_SET) | `dcn30_dpp_cm.c:229-230` |
+| `CM_HDR_MULT_COEF` | RMW [18:0] = 0x1f000 (1.0, s6e12) | `dcn30_dpp_cm.c:308-314`, `dcn10_hwseq.c:3247` |
+| `CM_CONTROL` | RMW bit 0 = 0, last | `dcn30_dpp_cm.c:43-54` |
+
+Then `CM_UPDATE_PENDING` (`CM_CONTROL` bit 8) is polled clear for at most 50 ms. If the CM is already amdgpu's identity nothing is written and the second CRC is not run. The GOP values are in the `selftest pre: cm:` line to restore by hand.
+
+| Log | Reading |
+|---|---|
+| `CM bypass: before NO, after YES` | CM_BYPASS was routing the pixel stream around the cursor blend: the fix |
+| `before NO, after NO` | not the CM (or not enough): continue with the DLG lines (`dlg`) and mission mode, then DSCL |
+| `before YES, after ...` | the cursor already reaches the OTG on this card; look downstream (the panel path) |
+| `after INCONCLUSIVE` | the picture changed under the window (a mode change from the CM write would show as a colour shift) |
+
+Emulator: it has no CM (`rdna4_get_cursor` does not read `CM_CONTROL`), and nothing in amdgpu justifies a model of "CM_BYPASS drops the cursor" (it is a guess, [G] in verify-cursor.md section 2.4), so the emulator cannot show the effect.
+`cm-bypass=on` only leaves `CM0_CM_CONTROL = 1` in the register file, as the GOP does, to exercise the kext's decision/write/latch path: the two CRCs are equal there by construction.
+
+## 9. Linux ground truth (hub-task-273): what differs from the card
+
+Source: `E:\linux\rdna4-groundtruth-vkcube-20260929-232026\dcn-regs.txt` (Linux 7.2.2 amdgpu, same RX 9070 XT, 1080p60 HDMI, visible cursor); the idle capture is identical except for surface/cursor addresses, cursor position/DST offset and counters/status.
+Confirmed: `CM0_CM_CONTROL = 0` (CM_BYPASS off), so the GOP's `1` is the difference W40 clears. The Linux value of every register the kext writes matches what it writes:
+
+| Register | Linux | Kext writes | |
+|---|---|---|---|
+| `CURSOR0_0_CURSOR_CONTROL` | 0x03000205 | 0x03000205 | same |
+| `CURSOR_SIZE` / `HOT_SPOT` / `HUBPREQ0_CURSOR_SETTINGS` | 0x00400040 / 0 / 0x300 | same | same |
+| `CURSOR_DST_OFFSET` | 0x1ab at x=1269 (= 1269 * 50000 / 148511) | same formula | same |
+| `CM_CUR0_CURSOR0_CONTROL` | 0xa5 | 0xa5 | same |
+| `CURSOR0_FP_SCALE_BIAS_G_Y/RB` | 0x3c00 | 0x3c00 | same |
+| `CUR0_MATRIX_MODE`, `C11` | 0, 0x2000 (identity) | not written (reset) | same |
+| `DCN_CUR0_TTU_CNTL0/1` | 0 / 0 | left 0 | same |
+| `CM0_CM_CONTROL` | 0 | GOP 1 -> 0 (`rdna4-cursorcm=1`) | fixed |
+| `CM_POST_CSC_CONTROL`, bias x2, `GAMCOR_CONTROL`, `DEALPHA`, `MEM_PWR_CTRL`, `COEF_FORMAT` | 0 | 0 | same |
+| `CM_HDR_MULT_COEF` | 0x0001f000 | 0x0001f000 | same |
+| `DCHUBP_MALL_CONFIG` | 0x0a (USE_MALL_FOR_CURSOR 0) | bit 2 cleared | same |
+| `DCN_EXPANSION_MODE` | 0x56 (CRQ 1) | CRQ = 1 (`rdna4-cursorcrq=1`) | same |
+| `DSCL0_SCL_MODE`, `RECOUT_START/SIZE`, `MPC_SIZE` | 0, 0, 0x04380780, 0x04380780 | mode-0 set (case A only) | same |
+| `DSCL0_LB_MEMORY_CTRL` | 0x0a0a3f00 | 0x3f00 (bits 16-30 are the read-only LB_NUM_PARTITIONS) | same |
+| `MPCC0_MPCC_UPDATE_LOCK_SEL` | 0 (= OPP 0) | OPP (`rdna4-cursormpcsel=1`) | same; the GOP leaves 0xf |
+| **`MPCC0_MPCC_CONTROL`** | **0xffff0422** (MODE 2 TOP_LAYER_ONLY, ALPHA_MULTIPLIED 0) | GOP 0xffff0461 (MODE 1 PASSTHROUGH, ALPHA_MULTIPLIED 1); **new `rdna4-cursormpcc=1`** | was a difference |
+| `HUBPREQ0_DCSURF_FLIP_CONTROL` / `FLIP_CONTROL2` | 0x04100100 / 0x40 | written by flip.cpp only | compare on the card |
+
+Found, not changed (primary-plane side, not written by any cursor path; the card values are only in the `linuxdiff` line of the next boot):
+`CNVC_CFG0_FORMAT_CONTROL` Linux 0x24000101 (FORMAT_EXPANSION_MODE 1, ALPHA_EN 1: dpp401_dpp_setup keeps `alpha_en = 1` for ARGB8888, dcn401_dpp.c:65) against the GOP's 0x24000000; `HUBPREQ0` DLG values
+(BLANK_OFFSET_0/1 0x00290040/0x1188, DST_AFTER_SCALER 0x49, PREFETCH_SETTINGS 0x5e080000, PER_LINE_DELIVERY 0x286, REF_FREQ_TO_PIX_FREQ 0x2b18f, SURF0_TTU_CNTL0 0x08000ac6, QOS_WM 0x0b920000, GLOBAL_TTU_CNTL 0xe0000ed2,
+`HUBPREQ_DEBUG_DB` 0x100, `DCHUBP_CNTL` 0x000f0408) are the DML values for this mode; the kext writes none of them (only DEBUG_DB bit 8, and only when the GOP programmed the DLG).
+
+`cursorLinuxDiff` (always with `rdna4-cursor=2`) compares 145 static registers (`src/cursor_linux_ref.inc`, generated from the capture) at `pre` (the GOP state) and at `end` (after every write of the boot) and logs only the
+differences as `linuxdiff <when> #n: NAME=got/want ...` plus a count line. Masks exclude status and pending bits; addresses, positions and counters are not in the table. Read it as: what is in `pre` and gone in `end` was fixed by the boot; what remains
+in `end` is the next candidate list (in the VM almost everything differs because the emulated GOP registers are zero).
+
+`rdna4-cursormpcc=1` writes `MPCC_CONTROL.MPCC_MODE = 2` and `MPCC_ALPHA_MULTIPLIED_MODE = 0` (RMW, OTG update lock, only with no bottom layer; dcn10_mpc.c:216 and :84-90), after the CM step, then a third CRC A/B
+(`[after MPCC mode]`) and `MPCC mode: before X, after Y`. The trail buffer is 16 KiB now.
+
+## 10. W45: the CM_BYPASS clear in the normal cursor mode (real-card result)
+
+Round 5 boot 4 on the real card (E:\rdna4fb-diag-20260930-054257.txt): `CRC A/B [GOP CM state] ... cursor pixels reach the output: NO` -> `CM write: CM_BYPASS was 1` -> `CRC A/B [after CM enable] ... YES`,
+`CM bypass: before NO, after YES`: the magenta square was visible. `MPCC mode: before YES, after YES`: the MPCC write was not needed (`rdna4-cursormpcc=1` stays opt-in). The GOP state on the card (`linuxdiff pre`):
+`CM_CONTROL=1`, `DSCL0_SCL_MODE=1` (mode 1, RECOUT equal to the plane: the DSCL candidate is eliminated), `CURSOR_CONTROL=0x01000000`, `MPCC_CONTROL=0xffff0461`, `MPCC_UPDATE_LOCK_SEL=0xf`.
+
+Problem: `rdna4-cursor=2` deliberately ignores macOS's `cscSetHardwareCursor`/`cscDrawHardwareCursor`. The fix is in the normal mode (`rdna4-cursor=1`):
+
+* `cursorCmAuto` runs at arming (end of `initHardwareCursor`): `armed pre: cm:` dump, `linuxdiff armed pre`, `cursorCmApply` (the same OTG-locked write with the same identity guard: nothing is written if the CM is already amdgpu's identity),
+  `linuxdiff armed end`. It is the default; `rdna4-cursorcm=0` is the escape (in both modes; in the self-test `rdna4-cursorcm` is now also on by default, boot 7 keeps the explicit `=1`).
+* The self-test (`rdna4-cursor=2`) still does the write itself between the two CRC A/B reads, so it is not applied twice.
+* The macOS path programs the same registers as the self-test: `setHardwareCursor` -> `cursorProgramPlane` (cursor address, `CURSOR_SIZE` 0x00400040 = the 64x64 buffer, `HOT_SPOT` 0, `CURSOR_SETTINGS` 0x300,
+  `CURSOR_CONTROL` = `cursorCtlBase` 0x03000204 | enable, FP scale/bias 0x3c00, matrix mode 0, `CM_CUR0_CURSOR0_CONTROL` 0xa4 | enable) and `drawHardwareCursor` -> `CURSOR_POSITION`, `HOT_SPOT` (excess only), `CURSOR_DST_OFFSET`
+  (`cursorDstXOffset`), and the two enables together on a visibility change, all inside the MPC cursor lock. The self-test writes the same set through `cursorProgramPlane` plus position/DST offset. Log to compare on the card:
+  `set: hubp ctl=0x03000204..05 ... size=0x00400040 ... set=0x00000300`, `shown: ... cm ctl=0x000000a5`, `move #n x= y=`.
+* Not carried over from the self-test (the card did not need them): DLG mission mode, CROB/MALL/CRQ pipe fixes, DSCL write, MPCC write.
+
+`tools/set-boot.sh`: boot 4 = base + `rdna4-vbl=1 rdna4-cursor=1` (the real pointer, CM clear by default); new boot 7 = base + `rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1` (the magenta self-test with the CRC A/B).

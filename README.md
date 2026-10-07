@@ -104,6 +104,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-dmubver=1` | Read-only fingerprint of the GOP-loaded DMUB firmware: the full `DMCUB_SCRATCH` bank + boot/enable state (`SCRATCH00` decodes as `dmub_fw_boot_status`), then a scan of VRAM below the region4/mailbox anchor for the fw-meta magic (`0x444D5542` "DMUB") to read the embedded `fw_version`. Compares it against Debian's `dmesg \| grep -i dmub` version (`0x00010300`): a match means the GOP runs the same blob and the mainline VBIOS subtypes 0/1/2 are safe to replay; otherwise the GOP has its own dialect (its DP bring-up used 6/10/12/16) and the amdgpu capture is reference-only. |
 | `rdna4-smuping=1` | Read-only SMU (power-management firmware) handshake: TestMessage + PMFW/interface version queries over the MP1 mailbox. No DPM changes. Publishes `SMU,FirmwareVersion` / `SMU,Verified`. Prerequisite check for future clock control. |
 | `rdna4-ihdump=1` | Read-only interrupt-delivery survey: OSSSYS IH ring state, per-OTG vertical-interrupt line config, PCI MSI/MSI-X capability words. Groundwork for real VBL interrupts. |
+| `rdna4-ih=1` | Enable the RDNA 4 IH v7 ring and PCI MSI completion path after the runtime's DMA setup. Runtime fences remain authoritative; a missing interrupt source falls back to bounded polling. Default off. |
 | `rdna4-pspdump=1` | Read-only PSP (security processor) survey: bootloader/sOS/GPCOM-ring status from the MPASP scratch registers. Publishes `PSP,Alive` / `PSP,SOSVersion`. Decides whether loading fresh firmware (e.g. a current DMUB) is viable. |
 | `rdna4-compute=<stage>` | Compute bring-up, written from scratch (`src/compute.cpp`), run after the display is answered for and never with a GPU reset. `1` = read-only survey: GFX (IMU/RLC/PFP/ME/MEC/MES), both SDMA engines, GC and MM hub apertures, PSP, HDP flush remap, and the VRAM window chosen for compute; published as the `Compute,Survey` dictionary. `2` = PSP bring-up on a background thread 5 s after the desktop: the secure-OS components through the PSP bootloader, the GPCOM command ring, `LOAD_TOC`, then the SMU firmware via `LOAD_IP_FW`, proven by the SMU answering its mailbox; published as `Compute,PSP` and `Compute,Stage`. `3` = the 19 GC firmware images through the PSP and the RLC autoload (`Compute,GFX`). `4` = GC hub for VMID0, SDMA0 queue, a WRITE and a 1 MiB fill checked by the CPU (`Compute,SDMA`). `5` = a MEC compute queue programmed directly (no MES), fed through its doorbell, running PM4: the scratch-register ring test, WRITE_DATA and a RELEASE_MEM fence (`Compute,MEC`). `6` = a real gfx1201 kernel (`shaders/probe.s`) dispatched on the compute units, all 256 results checked (`Compute,Dispatch`). `7` = a clang-built kernel (`shaders/vadd.cl`) launched from its AMDGPU code object: the loader (`src/codeobj.cpp`) finds the kernel and its descriptor, the dispatch uses the compiled RSRC1/2/3 and a kernarg buffer, and 4096 results of `c = a + 3b` are checked (`Compute,Kernel`). After stage 6 or 7 the runtime is published for user space (see *User-space compute*). Each step leaves a breadcrumb in NVRAM (`4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail`) so a hang names the step. Needs the linux-firmware blobs in `firmware/amdgpu/` at build time (`tools/fetch-firmware.sh`). |
 | `rdna4-fakeedid=0` | `VMTEST=1` builds only: they serve the Lenovo fixture EDID and enable `rdna4-modeset` by default (so the mode list can be checked in a VM whose OpenCore pins boot-args); `=0` turns either off. |
@@ -140,13 +141,14 @@ of toggling a DP stream.
 | `src/psp.{hpp,cpp}` | Freestanding PSP driver: bootloader component loading, GPCOM ring, command submission with fences, LOAD_TOC, LOAD_IP_FW. Host-tested against a simulated PSP. |
 | `src/fwblobs.S` | Embeds the PSP sOS, SMU, SDMA and GC 12.0.1 firmware from `firmware/amdgpu/` (linux-firmware, AMD redistributable license) into the kext. |
 | `src/sdma.{hpp,cpp}` | SDMA 7 packet builders (WRITE, FENCE, CONST_FILL, COPY) and ring writer. Host-tested. |
+| `src/ih.{hpp,cpp}`, `src/ihdecode.cpp` | IH v7 ring setup, PCI MSI filter/action, bounded fence waits, vector decode and source accounting. Host-tested decode and ring arithmetic. |
 | `src/pm4.{hpp,cpp}` | PM4 type-3 packet builders (SET_UCONFIG_REG, SET_SH_REG, WRITE_DATA, ACQUIRE/RELEASE_MEM, DISPATCH_DIRECT) and compute queue writer. Host-tested. |
 | `src/codeobj.{hpp,cpp}` | Freestanding AMDGPU code-object reader: a kernel's descriptor (RSRC1/2/3, kernarg size, SGPR requests) and the loadable image (PT_LOAD segments at their virtual addresses). Host-tested against clang's output. |
 | `src/runtime.cpp`, `src/gpuheap.{hpp,cpp}` | The user-space compute runtime: a 4 KiB-granule VRAM heap, buffers and programs per connection, synchronous dispatches on the MEC queue, hung-queue detection. The heap is host-tested. |
 | `src/userclient.{hpp,cpp}` | `RDNA4ComputeService` (published once stage 6/7 finished) and `RDNA4ComputeClient`, the IOUserClient that checks each call and hands it to the runtime. Root only. |
 | `include/rdna4compute.h` | The user-space ABI: selectors, scalar/struct shapes, the dispatch struct. Shared by the kext and user space. |
-| `shaders/bench.cl`, `src/bench_codeobj.h` | `lds_reverse` (LDS + barrier test), `copy` (VRAM bandwidth), a tiled `sgemm` (64x64 tiles through LDS), and the matrix units: `wmma16` (one WMMA, the register-layout check) and `hgemm`/`bf16gemm` (FP16/BF16 in, FP32 sums; 128x128 tiles, 8 waves of `v_wmma_f32_16x16x16_*`), one clang-built code object used by `rdna4-run`. |
-| `userspace/librdna4.{h,c}`, `userspace/rdna4-run.c` | C library over the user client, and `rdna4-run` (`info`, `selftest`, `load`). Built with the kext (`build/rdna4-run`). |
+| `shaders/bench.cl`, `src/bench_codeobj.h` | `lds_reverse` (LDS + barrier test), `copy` (VRAM bandwidth), a tiled `sgemm` (64x64 tiles through LDS), the matrix units (`wmma16`, `hgemm`, `bf16gemm`), and the affine/scaled `mandelbrot` and `mandelbrot_zoom` kernels, one clang-built code object used by `rdna4-run`. |
+| `userspace/librdna4.{h,c}`, `userspace/rdna4-run.c` | C library over the user client, including synchronous and queued Present/Restore display ownership, and `rdna4-run` (`info`, `selftest`, `bench`, `show`, `anim`, `load`). Built with the kext (`build/rdna4-run`). |
 | `shaders/probe.s`, `src/probe_kernel.h` | The stage-6 test kernel (gfx1201 assembly) and its machine code, generated by `tools/build-shaders.sh` with upstream LLVM. |
 | `src/ndrv.{hpp,cpp}` | Freestanding NDRV `csc` translator: mode list, video parameters, timings, current mode, connection, EDID blocks, DPMS, mode switch. Host-tested. |
 | `src/bochsvbe.{hpp,cpp}` | `VMTEST` only: mode switches on QEMU's `vmware-svga` through the Bochs VBE interface (the one OVMF's GOP uses on that card). |
@@ -183,8 +185,22 @@ sudo build/rdna4-run selftest [items]         # vadd and an LDS/barrier kernel, 
 sudo build/rdna4-run bench [small]            # host<->GPU MB/s, VRAM GB/s, SGEMM GFLOPS, each vs the
                                               # CPU (memcpy; Accelerate's cblas_sgemm, weak-linked),
                                               # then FP16/BF16 GEMM on the matrix units (WMMA)
+sudo build/rdna4-run show [seconds]           # render a Mandelbrot into a device buffer, present it,
+                                              # CPU-check 64 spread pixels, then restore the desktop;
+                                              # VM runs use scale 4 and real hardware uses scale 1
+sudo build/rdna4-run anim [seconds]          # double-buffered zoom with async presents and FPS stats
 sudo build/rdna4-run load k.hsaco my_kernel   # load a code object, describe a kernel
 ```
+
+`rdna4_display_query`, `rdna4_present`, `rdna4_present_async`,
+`rdna4_wait_present` and `rdna4_restore` expose the display surface through
+appended runtime selectors without changing ABI 4. Present accepts a
+256-byte-aligned offset into a device-heap ARGB8888 buffer. One connection owns
+the presentation at a time; two asynchronous presents may be pending, and
+`WaitPresent` reports the OTG frame that latched each one. An explicit Restore,
+client close, buffer free, or the 30-second idle timeout returns the recorded
+desktop surface. The flip hardware operations are serialized with the runtime
+lock and do not write boot trails after bring-up.
 
 From C, `userspace/librdna4.h`:
 
@@ -335,6 +351,9 @@ tools/emu-boot.sh         # the VM on the emulated card (VNC :0, serial ~/tahoe-
 ```
 
 `tools/emu-boot.sh trace=on` logs every BAR5 access to the QEMU log. The
+`ih-dead=on` device option leaves IH ring writebacks enabled while suppressing
+MSI delivery, which exercises the runtime's polling fallback. The same option
+can be passed to `tools/vm-test.sh` alongside `rdna4-ih=1`. The
 device sits on the root bus: behind a `pcie-root-port`, macOS's PCI
 configurator closed the port's windows at boot. The QEMU device is
 GPL-2.0-or-later (QEMU's license) and the GOP driver BSD-2-Clause-Patent

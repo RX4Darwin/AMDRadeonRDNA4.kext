@@ -36,6 +36,7 @@ typedef struct {
 typedef struct {
 	uint64_t abi, stage, flags;             /* flags: RDNA4_FLAG_* */
 	uint64_t heapBytes, heapFree, heapBase;
+	uint64_t vmid, pipe, queue;
 } rdna4_info_t;
 
 typedef struct {
@@ -46,6 +47,7 @@ typedef struct {
 
 typedef struct {
 	uint64_t handle;
+	uint64_t gpu;                           /* GPU VA of the kernel entry point */
 	uint64_t kernargBytes;                  /* the kernel's kernarg segment */
 	uint64_t imageBytes;
 	uint64_t rsrc1, rsrc2, rsrc3, properties;
@@ -55,8 +57,17 @@ typedef struct {
 kern_return_t rdna4_open(rdna4_t *dev);
 void          rdna4_close(rdna4_t *dev);
 kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out);
+kern_return_t rdna4_sensors(rdna4_t *dev, RDNA4Sensors *out);
+kern_return_t rdna4_sensors_ex(rdna4_t *dev, RDNA4SensorsEx *out);
+/* Debug-only simulated sleep: phase 1 quiesces, phase 2 re-brings up. */
+kern_return_t rdna4_sleep_test(rdna4_t *dev, uint32_t phase);
+/* Debug-only root quiesce through the system shutdown/restart path. */
+kern_return_t rdna4_quiesce(rdna4_t *dev);
 
 kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out);
+/* Allocate snooped system memory, mapped into the client's GPUVM and task. */
+kern_return_t rdna4_alloc_host(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out,
+                                void **cpu);
 kern_return_t rdna4_free(rdna4_t *dev, const rdna4_buffer_t *buf);
 kern_return_t rdna4_write(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
                           const void *src, uint64_t bytes);
@@ -77,6 +88,28 @@ kern_return_t rdna4_dispatch_lds(rdna4_t *dev, const rdna4_program_t *prog,
                                  const uint32_t groups[3], const uint32_t groupSize[3],
                                  const void *kernargs, uint32_t kernargBytes,
                                  uint32_t dynamicLdsBytes, uint32_t timeoutMs, uint64_t *micros);
+
+/* Record an unprivileged compute PM4 IB in `buf` and append it to this client's
+ * queue. `offsetBytes` is relative to the buffer and the returned fence is
+ * ordered with kernel-built Dispatch calls on the same queue. */
+kern_return_t rdna4_submit_ib(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offsetBytes,
+                              uint32_t dwords, uint64_t *fence);
+kern_return_t rdna4_wait_fence(rdna4_t *dev, uint64_t fence, uint32_t timeoutMs,
+                               uint64_t *ns);
+
+kern_return_t rdna4_wait_vblank(rdna4_t *dev, uint32_t timeoutMs, uint64_t *count,
+                                uint64_t *timeNs);
+/* Present a 256-byte-aligned ARGB8888 slice of a device buffer. The returned
+ * geometry is the active scanout width, height and pitch in pixels. */
+kern_return_t rdna4_present(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                            uint32_t *width, uint32_t *height, uint32_t *pitch);
+kern_return_t rdna4_present_async(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                                   uint64_t *presentId);
+kern_return_t rdna4_wait_present(rdna4_t *dev, uint64_t presentId, uint32_t timeoutMs,
+                                  uint64_t *frame);
+kern_return_t rdna4_display_query(rdna4_t *dev, uint32_t *width, uint32_t *height,
+                                  uint32_t *pitch);
+kern_return_t rdna4_restore(rdna4_t *dev);
 
 const char *rdna4_error(kern_return_t kr);
 

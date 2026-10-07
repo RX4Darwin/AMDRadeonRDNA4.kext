@@ -26,6 +26,12 @@ uint32_t fence(uint32_t *out, uint64_t addr, uint32_t value) {
 	return kFenceDwords;
 }
 
+uint32_t trap(uint32_t *out) {
+	out[0] = header(OpTrap);
+	out[1] = 0;                          // INT_CONTEXT(0)
+	return kTrapDwords;
+}
+
 uint32_t constFill(uint32_t *out, uint64_t addr, uint32_t pattern, uint32_t bytes) {
 	out[0] = header(OpConstFill) | kFillSizeDword;
 	out[1] = static_cast<uint32_t>(addr);

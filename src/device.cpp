@@ -979,6 +979,11 @@ uint32_t RDNA4Device::pipeRead(void *ctx, uint8_t baseIdx, uint32_t dword) {
 	return self->regReadDmu(baseIdx, dword);
 }
 
+uint64_t RDNA4Device::liveFramePeriodNs() const {
+	const uint32_t refresh = liveTimingValid ? liveTiming.refreshMilliHz() : 0;
+	return refresh ? 1000000000000ULL / refresh : 0;
+}
+
 // Time N frames of the live OTG's frame counter. The TMDS pixel clock sits in
 // the PHY PLL where no register exposes it, so frame period x totals is the
 // only way to learn the exact rate the GOP chose. Edges are detected by
@@ -1600,14 +1605,14 @@ void RDNA4Device::ensureUpdateLatch() {
 	// lock asserted, every double-buffered pipe write stays pending forever
 	// (writes read back fine, hardware never changes).
 	uint32_t lock = regReadDmu(2, kOtgMasterUpdateLock + o);
-	FBLOG("latch: OTG%u lock=0x%08x (status=%u) dbufctl=0x%08x dppctl=0x%08x",
+	latchNote("OTG%u lock=0x%08x (status=%u) dbufctl=0x%08x dppctl=0x%08x",
 	      pipe.otg < Pipe::kMaxOtg ? pipe.otg : 0, lock, (lock >> 8) & 1,
 	      regReadDmu(2, kOtgDoubleBufferCtl + o), regReadDmu(2, kDppTopControl + dppOff()));
 	if (lock == 0xFFFFFFFF)
 		return;
 	if (lock & 1) {
 		regWriteDmu(2, kOtgMasterUpdateLock + o, 0);
-		FBLOG("latch: released OTG master update lock (was 0x%08x, now 0x%08x)",
+		latchNote("released OTG master update lock (was 0x%08x, now 0x%08x)",
 		      lock, regReadDmu(2, kOtgMasterUpdateLock + o));
 	}
 
@@ -1616,7 +1621,7 @@ void RDNA4Device::ensureUpdateLatch() {
 	uint32_t vstartup = regReadDmu(2, kOtgVStartupParam + o);
 	uint32_t vupdate  = regReadDmu(2, kOtgVUpdateParam + o);
 	uint32_t sync     = regReadDmu(2, kOtgGlobalSyncStatus + o);
-	FBLOG("latch: global sync: vstartup=0x%08x vupdate=0x%08x vready=0x%08x "
+	latchNote("global sync: vstartup=0x%08x vupdate=0x%08x vready=0x%08x "
 	      "status=0x%08x (vupdate_occurred=%u)",
 	      vstartup, vupdate, regReadDmu(2, kOtgVReadyParam + o), sync,
 	      (sync >> 8) & 1);
@@ -1631,7 +1636,7 @@ void RDNA4Device::ensureUpdateLatch() {
 			regWriteDmu(2, kOtgVStartupParam + o, start);
 		}
 		regWriteDmu(2, kOtgVUpdateParam + o, (2u << 16));
-		FBLOG("latch: programmed VUPDATE pulse (vstartup=0x%08x vupdate=0x%08x)",
+		latchNote("programmed VUPDATE pulse (vstartup=0x%08x vupdate=0x%08x)",
 		      regReadDmu(2, kOtgVStartupParam + o), regReadDmu(2, kOtgVUpdateParam + o));
 	}
 	updateLatchReady = true;
@@ -1741,6 +1746,10 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 
 	uint32_t vd = pciDevice->configRead32(kIOPCIConfigVendorID);
 	isAmd = (vd & 0xffff) == 0x1002;
+	uint32_t cursor = 0;
+	hwCursorRequested = PE_parse_boot_argn("rdna4-cursor", &cursor, sizeof(cursor)) && cursor != 0;
+	if (hwCursorRequested)
+		FBLOG("cursor: hardware cursor requested by rdna4-cursor=1");
 	const char *model = (vd >> 16) == 0x7551 ? "AMD Radeon AI PRO R9700"
 	                                         : "AMD Radeon RX 9070 XT";
 	if (!isAmd)
@@ -1766,6 +1775,8 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 		if (haveMmio) {
 			// First: every per-pipe path below keys off the pipe the GOP lit.
 			discoverPipe();
+			if (hwCursorRequested)
+				initHardwareCursor();
 			probeMemSize();
 			dumpDCN();
 			// DP-stream experiment; meaningless (and aimed at DP0) on HDMI.
@@ -1790,6 +1801,11 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 }
 
 RDNA4Device::~RDNA4Device() {
+	freeHardwareCursor();
+	if (cursorTrailLock) {
+		IOLockFree(cursorTrailLock);
+		cursorTrailLock = nullptr;
+	}
 	if (onDieDisc) {
 		IOFree(onDieDisc, 10 << 10);
 		onDieDisc = nullptr;
