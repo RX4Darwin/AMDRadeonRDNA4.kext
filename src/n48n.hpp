@@ -41,8 +41,10 @@ constexpr uint32_t kSuccess = 0, kNoMemory = 0xe00002bd, kNoResources = 0xe00002
 constexpr uint64_t kSystemCap = 512ull << 20, kSystemMaxBuffer = 64ull << 20;
 constexpr uint32_t kMaxMaps = 4096;
 constexpr uint64_t kVaFirst = 0x10000, kVaBits = 48;
-// Work that makes no progress for this long is lost (amdgpu gives its graphics queue the same 10 s): the call
-// that notices answers "timeout", every later submit and wait "aborted".
+// Work that makes no progress for this long is lost (amdgpu gives its graphics queue the same 10 s), and so is
+// work with a fault in the client's address space, at once (a fault ends the job that caused it; nothing on
+// this card tries the access again): the call that notices answers "timeout", every later submit and wait
+// "aborted". The client is finished either way; whether the queue is, is the backend's (Backend::lost).
 constexpr uint64_t kLostAfterNs = 10000000000ull;
 
 // One buffer's storage, as the backend placed it.
@@ -77,7 +79,8 @@ struct Backend {
 	// the queue cannot take work at all.
 	uint32_t (*submit)(void *context, const Ib *ibs, uint32_t count, uint32_t sequence);
 	uint32_t (*finished)(void *context);     // the last sequence the card reported
-	void     (*lost)(void *context);         // work did not finish: the queue is to fetch nothing more
+	void     (*lost)(void *context);         // work did not finish: the backend gets the queue back, or shuts it
+	bool     (*faulted)(void *context);      // the card recorded a fault in this client's address space
 	uint64_t (*now)(void *context);          // nanoseconds, monotonic
 	void     (*pause)(void *context);        // a short sleep between two looks at `finished`
 	// Eight bytes into a buffer the CPU reaches (the fence a submission asked for).

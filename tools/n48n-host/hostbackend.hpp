@@ -27,6 +27,7 @@ struct HostBackend {
 	// The queue: nothing runs. Work is reported finished at once (`finishAt` 0), or once `pause` has been called
 	// `finishAt` times since the last submission, or never (~0). The clock moves a millisecond with every pause.
 	uint64_t finishAt = 0, pauses = 0, clockNs = 1, lostCalls = 0;
+	bool     fault = false;      // what `faulted` answers
 	uint32_t finishedSequence = 0, lastSequence = 0, lastCount = 0, busyReplies = 0, submitReply = N48N::kSuccess;
 	N48N::Ib lastIbs[N48N_MAX_IBS] {};
 
@@ -115,6 +116,7 @@ struct HostBackend {
 		};
 		b.finished = [](void *c) { return static_cast<HostBackend *>(c)->finishedSequence; };
 		b.lost = [](void *c) { static_cast<HostBackend *>(c)->lostCalls++; };
+		b.faulted = [](void *c) { return static_cast<HostBackend *>(c)->fault; };
 		b.now = [](void *c) { return static_cast<HostBackend *>(c)->clockNs; };
 		b.pause = [](void *c) {
 			auto *h = static_cast<HostBackend *>(c);

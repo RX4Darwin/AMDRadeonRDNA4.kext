@@ -5,7 +5,8 @@
 //  Drives the RADV Darwin build directly through its ICD entry point (no Vulkan loader needed): instance, the
 //  one device, a buffer with memory, two fills of it by the GPU and a triangle drawn into an image and copied back,
 //  each submitted, waited for and checked. With "show [seconds]" after the library's path it then puts a moving
-//  triangle on the boot display for that long (5 s) and gives the desktop back.
+//  triangle on the boot display for that long (5 s) and gives the desktop back. With "fault" it instead makes a
+//  compute shader write to memory that is not there, and says how the driver reported it.
 //
 //    make mesa        (the driver and this program, into build/), or by hand:
 //    clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -I <work>/mesa/include vulkan/vkprobe.c -o vkprobe
@@ -117,6 +118,35 @@ int main(int argc, char **argv) {
 	const int untouched = *(const uint32_t *)((const char *)p + 1024) == 0x11111111;
 	printf("the bytes between the two fills: %s\n", untouched ? "untouched, ok" : "CHANGED");
 	wrong += !untouched;
+
+	/* "fault": a shader that faults. The compute-shader fill again, into a second buffer whose memory is freed
+	 * between recording and submitting, so that the shader writes to addresses nothing is mapped at. Not valid
+	 * Vulkan, on purpose: it is what a wrong program does. The kext should end the work at once and say so (RADV
+	 * then reports the device lost), and keep its graphics queue for the next program: run vkprobe again after
+	 * this to see that. Ends here; the process's exit closes the connection. */
+	if (argc > 2 && !strcmp(argv[2], "fault")) {
+		VkBuffer fbuf; OK(vkCreateBuffer(dev, &bci, 0, &fbuf));
+		VkDeviceMemory fmem; OK(vkAllocateMemory(dev, &mai, 0, &fmem));
+		OK(vkBindBufferMemory(dev, fbuf, fmem, 0));
+		VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+		OK(vkBeginCommandBuffer(cb[2], &bi));
+		vkCmdFillBuffer(cb[2], fbuf, 4096, (1 << 16) - 4096, 0xdeadbeef);
+		OK(vkEndCommandBuffer(cb[2]));
+		vkFreeMemory(dev, fmem, 0);
+		VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &cb[2] };
+		struct timespec t0, t1;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		const VkResult submitted = vkQueueSubmit(q, 1, &si, fence);
+		const VkResult waited = submitted < 0 ? submitted : vkWaitForFences(dev, 1, &fence, VK_TRUE, 15000000000ull);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		const double seconds = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+		const int lost = submitted == VK_ERROR_DEVICE_LOST || waited == VK_ERROR_DEVICE_LOST;
+		printf("fault: submit -> %d, wait -> %d after %.3f s: %s\n", submitted, waited, seconds,
+		       lost ? (seconds < 1 ? "the device is reported lost at once: ok" : "the device is reported lost, but late")
+		            : waited == VK_SUCCESS ? "THE WORK FINISHED (no fault was produced?)" : "NOT REPORTED LOST");
+		fflush(stdout);
+		_Exit(lost && seconds < 1 ? 0 : 1);
+	}
 
 	/* A picture: a red triangle over the upper-left half of a 64x64 image cleared to blue, drawn with two
 	 * shaders the driver compiles, then copied into the buffer and looked at. */

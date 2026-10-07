@@ -502,6 +502,55 @@ step 2 so far, never in step 1.
 **Done.** With `rdna4-vm=1` the Vulkan interface and the runtime's clients work in one boot, one after the other and
 at the same time.
 
+## A shader that faults
+
+Written 2026-10-07. Until now a Vulkan program whose shader touched an address nothing is mapped at hung the
+graphics ring: ten seconds later its work counted as lost and the ring was shut for everybody until the next boot.
+Two changes, the second an **experiment**:
+
+- The fault is looked for while the work is waited for (the hub's entry naming the client's address space). The
+  client's work is then lost at once, and RADV reports the device lost. Host-tested.
+- Before the ring is shut, the kext tries to get it back, leaving the queue alone as the compute recovery does:
+  twice `CP_VMID_RESET` with the address space's bit and no queue, then `SPI_COMPUTE_QUEUE_RESET` with the graphics
+  engine selected, each followed by 200 ms for the lost work's own fence. Nothing of this is a sequence read
+  anywhere; amdgpu's own takes the queue down and has the MES map it again. If no step brings the fence, the ring
+  is shut as before.
+
+New kext (`make`) and the new `build/vkprobe` (it has a `fault` mode: a compute-shader fill into a buffer whose memory
+it frees before submitting). Same library. Boot as for the last tests:
+
+```
+rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
+```
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib fault > vkfault.txt 2>&1
+```
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
+```
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+Report the two text files and the log, and whether anything on screen looked wrong.
+
+What to look for:
+
+- `vkfault.txt`, last line: `fault: submit -> 0, wait -> -4 after 0.0NN s: the device is reported lost at once: ok`.
+  `THE WORK FINISHED` would mean the test did not produce a fault; `but late` or `NOT REPORTED LOST`, that the fault
+  was not seen.
+- Kernel log, `vulkan:` lines: `work lost in address space 8 (...)` with the state, then `step N: ...: the fence came
+  through` or `did not come`, then either `the graphics ring is back and stays in service` or the old `a client gfx
+  IB did not finish` message.
+- If the ring is back: the second `vkprobe` ends `done: all ok` with its moving triangle, and the script's table is
+  all PASS.
+- If it is not: the second `vkprobe` fails at its first submission, `gfx-app-tri` and `gfx-app-tricol` FAIL, the
+  compute rows still pass, and the GPU may stay busy (fans) until the reboot. The display is not affected. That
+  outcome is as before this change, and the step lines say what each attempt did.
+
 ## After the tests
 
 For what passes, the README's file table, `docs/vulkan-port.md` and `vulkan/README.md` get the date and what ran.
