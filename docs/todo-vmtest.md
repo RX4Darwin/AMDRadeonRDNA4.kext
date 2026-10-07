@@ -2,7 +2,8 @@
 
 Written 2026-10-06 on `devel/address-space`. **First run on the card 2026-10-07** (below): clients now work in
 their own address spaces, and the two tests that fault on purpose hang their job. Two fixes did not change that
-(second and third run); a third is built and not run: the next run is the same boot again. Background: `docs/vm-client-rootcause.md` sections 11 and 12 and
+(second and third run) and a third set a wrong bit (fourth run); corrected, it is built and not run: the next run is
+the same boot again. Background: `docs/vm-client-rootcause.md` sections 11 and 12 and
 `docs/metal-readiness.md` section 4.
 
 ## First run, 2026-10-07
@@ -31,6 +32,13 @@ tests hang exactly as before**. So that was not it.
 Kext `8CAB1DCC`, log `rdna4fb-diag-20261007-132834`. The kext saw each fault within 6 ms and mapped the dummy page
 at the address (`a shader touched 0x100030000, which is not mapped ...`), and the job still never finished: nothing
 tried the access again. As the address space was set up (the way Linux sets it up on this card), a fault is final.
+
+## Fourth run, 2026-10-07: a wrong bit
+
+Kext `2CA51B3E`, log `rdna4fb-diag-20261007-133727`. The bit that kext set was not the retry bit on this chip but
+part of the page-table block size, so the card could not read the client's tables at all: the boot test failed, the
+address spaces were switched off for the boot, and the GPU sat at 100 %. With them off, the runtime's own self-test
+and benchmarks passed. The bit is corrected; the run below is the one that was meant.
 
 ## Next run: boot C again, with faults made retryable
 

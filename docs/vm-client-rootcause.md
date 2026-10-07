@@ -330,14 +330,14 @@ more unmapped pages lay in the freed buffer. The job is not retrying: it is dead
 refuted for this configuration.
 
 That fits what the context register asks for. `vmContextInit` writes `GCVM_CONTEXTn_CNTL` as amdgpu has it on this card
-(0x03fffc07): `RETRY_PERMISSION_OR_INVALID_PAGE_FAULT` (bit 7) is 0, amdgpu's "Send no-retry XNACK on fault to suppress
+(0x03fffc07): `RETRY_PERMISSION_OR_INVALID_PAGE_FAULT` (bit 8 on GC 12; this section first said 7, see section 15) is 0, amdgpu's "Send no-retry XNACK on fault to suppress
 VM fault storm". A fault is then final. `amdgpu_vm_handle_fault` only ever sees faults the card reports as **retry**
 faults; the ones Linux prints are the final kind, and what follows them on Linux is a ring timeout and a queue reset
 through MES. This kext has neither MES nor a recovery that brings the queue back after such a fault (section 12).
 
 Two ways out, and they are different work:
 
-1. **Make the fault retryable** (bit 7 = 1) for the runtime's clients, so that the access waits for the page and
+1. **Make the fault retryable** (the retry bit = 1) for the runtime's clients, so that the access waits for the page and
    `vmRedirectFault` has something to answer. This is the model amdgpu uses where it does not set no-retry. **Done as an
    experiment**: `vmContextInit` sets the bit when `rdna4-vm` is on; `rdna4-vmretry=0` gives the old value. Not for the
    Vulkan interface's address space. Compile-checked.
@@ -345,6 +345,32 @@ Two ways out, and they are different work:
    dequeue with RESET_WAVES succeeds, the queue is initialised again, and the first packet on it does not run
    (`CPC_BUSY 0x00000810` / `0x00000481`, `GRBM2 0x34110000` / `0x30110000` at that point).
 
-**H13**: with bit 7 set, the faulting access is tried again after the redirect and both tests pass. If the job is dead
+**H13**: with the retry bit set, the faulting access is tried again after the redirect and both tests pass. If the job is dead
 all the same, way 2 is what is left.
+
+## 15. 2026-10-07, fourth run: the wrong bit (Sunneva's mistake in section 14's change), and what it showed
+
+Log `rdna4fb-diag-20261007-133727`, kext `2CA51B3E`. That kext set **bit 7** of `GCVM_CONTEXTn_CNTL`. On GC 12 that
+is not the retry bit: `gc_12_0_0_sh_mask.h` has `PAGE_TABLE_DEPTH` at [2:1], `PAGE_TABLE_BLOCK_SIZE` at **[7:4]**,
+`RETRY_PERMISSION_OR_INVALID_PAGE_FAULT` at **bit 8** and `RETRY_OTHER_FAULT` at bit 9 (read in the header, 2026-10-07).
+Bit 7 is the top of the block size, as on older hubs it was the retry bit. `vmContextInit`'s own `<< 4` for the block size
+and the sixteen fault-enable bits at 10..25 in Linux's 0x03fffc07 both said so; the change did not look. H13 was **not
+tested** by this run.
+
+What the run did, [M]: with a block size of 8 the walker failed on a page that is mapped.
+
+- `boot test: ... job 1 submit 0x0 fence NOT reached data WRONG (2057525 us) ...: FAIL`; fault status `0x008009b6`
+  = VMID 8, **CID 4 (CPF)**, read, VA 0x100006000, the client's own command page, 2 ms after the submit.
+- The queue: rptr 0, wptr 0x14, doorbell consumed; `recovering shared queue 0`, `NOT recovered: wedged`.
+- `vm: boot self-test failed; per-client GPU VM disabled`. The runtime then ran without address spaces and its whole
+  self-test and the benchmarks passed (`selftest: PASS`, `bench: PASS`: the first log of that from this rig).
+- **`idle-pin FAIL: PINNED: GFX activity 100 %, 66 W`**, from the failed boot test on.
+
+That last line is worth keeping: a command processor stalled on a fetch it cannot translate, in a non-zero address
+space, is enough to produce S-A, with no queue built inside an address space. It weakens H10 as the *only* way to S-A:
+the September boots may have been pinned by a stalled fetch (round 5's boot test failed on exactly that, section 2.1)
+as much as by the queue's existence. What stands from sections 12 to 14 is unchanged: in shared mode with correct
+tables there is no S-A and clients run.
+
+**The change**: the bit is 8 (`kVmCtxRetryFault`), kext rebuilt. H13 is now what the next run tests.
 

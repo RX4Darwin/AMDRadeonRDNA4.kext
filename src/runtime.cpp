@@ -783,7 +783,10 @@ bool RDNA4Compute::vmContextInit(RtClient &c) {
 	const uint32_t faultDefaults = ((1u << 16) - 1) << 10;
 	uint32_t cntl = kVmCtxEnable | (GpuVm::kDepth << 1) |
 		((GpuVm::kBlockSize - 9) << 4) | faultDefaults;
-	// RETRY_PERMISSION_OR_INVALID_PAGE_FAULT (bit 7). amdgpu leaves it 0 on this card, and so did this: a fault is
+	// RETRY_PERMISSION_OR_INVALID_PAGE_FAULT is bit 8 on GC 12 (gc_12_0_0_sh_mask.h: the block size is [7:4], the
+	// depth [2:1]; on older hubs the block size is [6:3] and this bit is 7, which is what a first version of this
+	// set: it made the block size 8, the walker then failed on every valid page, and the boot test hung with the
+	// GPU pinned, 2026-10-07, fourth run). amdgpu leaves the bit 0 on this card, and so did this: a fault is
 	// then final. On the card the faulting job was dead from that moment: with the dummy page mapped at the address
 	// 6 ms later, nothing tried the access again and nothing else faulted (2026-10-07, third run,
 	// docs/vm-client-rootcause.md section 14). Linux gets out of that with a queue reset through the firmware
@@ -792,8 +795,9 @@ bool RDNA4Compute::vmContextInit(RtClient &c) {
 	// gives the old value.
 	uint32_t retry = 1;
 	(void)PE_parse_boot_argn("rdna4-vmretry", &retry, sizeof(retry));
+	constexpr uint32_t kVmCtxRetryFault = 1u << 8;
 	if (vmEnabled && retry)
-		cntl |= 1u << 7;
+		cntl |= kVmCtxRetryFault;
 	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + n }, cntl);
 	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtBaseLo.dword + 2 * n },
 	   static_cast<uint32_t>(GpuVm::encodePde(c.rootPhys, GpuVm::kValid, 0)));
