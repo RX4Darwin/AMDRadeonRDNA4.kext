@@ -85,8 +85,9 @@ the one this section describes as failing:
   queue runs a command buffer in the address space its packet names), the graphics-ring client self-test passes, a
   compute kernel runs in a client's address space on the shared queue (`rdna4-run`'s zero-copy vadd), and the GPU is
   not pinned at idle. **Still failing**: a job whose shader faults never finishes and its queue cannot be recovered, so
-  the two deliberate-fault tests of the self-test hang and take the rest with them. A fix that sets the fault default
-  page up as Linux does is **code, not run** (`docs/todo-vmtest.md`).
+  the two deliberate-fault tests of the self-test hang and take the rest with them. Setting the fault default page up
+  as Linux does changed nothing (card, second run). Answering the fault as amdgpu does, by mapping a dummy page at the
+  faulting address, is **code, not run** (`docs/vm-client-rootcause.md` section 13, `docs/todo-vmtest.md`).
 
 The table in section 1 and the text below are as written on 2026-09-30.
 

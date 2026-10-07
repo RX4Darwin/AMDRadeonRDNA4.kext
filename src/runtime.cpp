@@ -1607,6 +1607,66 @@ void RDNA4Compute::scrubFaultPage() {
 		bzero(faultPage->getBytesNoCopy(), 0x1000);
 }
 
+// A shader that touches a page its address space does not map gets no error on this card: the access is tried
+// again until the page is there, and the job never ends (2026-10-07: both of rdna4-run's fault tests, with the
+// default page in VRAM and in system memory alike; docs/vm-client-rootcause.md section 13). amdgpu has the same
+// card behave: its fault handler maps its dummy page at the faulting address and the retry goes through
+// (amdgpu_vm_handle_fault: "Redirect the access to the dummy page"; without it, "Let the hw retry silently on the
+// PTE"). So does this, from the loops that wait for a client's job, which hold rtLock: if the hub has latched a
+// fault for a client's address space on a page with no translation, the fault page is mapped there, read and
+// write, and the address space's translation cache flushed. Not for the command processor's own fetches (clients
+// 4 to 6): a command stream read from the dummy page is not a stream. The pages are remembered and unmapped again
+// when the job is over (vmEndRedirects), and the dummy page is cleared then.
+//
+// ponytail: only the polled waits call this. With rdna4-ih the waits sleep in ihWaitFence, which cannot call it
+// (the table update runs the copy engine, whose wait takes the same lock); slice those waits if faults have to
+// be survived with interrupts on.
+bool RDNA4Compute::vmRedirectFault() {
+	if (!faultPageBus || !vmEnabled)
+		return false;
+	const uint32_t status = rdGc(GcL2FaultStatusLo);
+	const uint32_t vmid = (status >> 20) & 0xf, hubClient = (status >> 9) & 0x1ff;
+	constexpr uint32_t kMappingError = 1u << 8;
+	if (!status || status == 0xffffffffu || !vmid || !(status & kMappingError) || (hubClient >= 4 && hubClient <= 6))
+		return false;
+	RtClient *c = nullptr;
+	for (RtClient &k : clients)
+		if (k.active && !k.aborted && k.vmid == vmid && hasTables(k)) {
+			c = &k;
+			break;
+		}
+	if (!c)
+		return false;
+	const uint64_t va = gcFaultVa() & ~(GpuVm::kPageBytes - 1);
+	bool known = false;
+	for (uint32_t i = 0; i < c->faultCount; i++)
+		known |= c->faultVa[i] == va;
+	if (!known) {
+		if (c->faultCount >= kFaultRedirects || !vmMapHost(*c, va, &faultPageBus, GpuVm::kPageBytes, false))
+			return false;
+		c->faultVa[c->faultCount++] = va;
+		if (c->faultCount == 1)
+			RLOG("vmid %u: a shader touched 0x%llx, which is not mapped (fault status 0x%08x): the dummy page answers "
+			     "there until the job is over", vmid, va, status);
+	}
+	gcFaultClear();
+	(void)vmInvalidate(vmid, "fault redirect");
+	return true;
+}
+
+void RDNA4Compute::vmEndRedirects() {
+	for (RtClient &c : clients) {
+		if (!c.faultCount)
+			continue;
+		for (uint32_t i = 0; i < c.faultCount; i++)
+			vmUnmap(c, c.faultVa[i], GpuVm::kPageBytes);
+		RLOG("vmid %u: %u unmapped page(s) were answered from the dummy page during the job", c.vmid, c.faultCount);
+		c.faultCount = 0;
+		(void)vmInvalidateOwned(c, "fault redirect end");
+		scrubFaultPage();
+	}
+}
+
 // Where a faulting access goes. The hub's bring-up points the L2 fault default at a scratch page in VRAM, with
 // ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY off. amdgpu points it at a page of system memory with that bit on (its
 // dummy page: gfxhub_v12_0_init_system_aperture_regs, gfxhub_v12_0_init_cache_regs), and the kext's own comparison
@@ -2868,11 +2928,14 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 			}
 			if (polls < 200)
 				IODelay(10);
-			else
+			else {
+				(void)vmRedirectFault();
 				IOSleep(1);
+			}
 		}
 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	}
+	vmEndRedirects();
 	if (done) {
 		retireIbFences(*c);
 		logClientFault(*c, "IB wait");
@@ -3055,10 +3118,13 @@ bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs
 		}
 		if (polls < 200)
 			IODelay(10);
-		else
+		else {
+			(void)vmRedirectFault();
 			IOSleep(1);
+		}
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	vmEndRedirects();
 	if (done) {
 		gfxClientRetire(c);
 		return true;

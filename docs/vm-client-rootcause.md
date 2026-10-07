@@ -280,3 +280,36 @@ boot and for every address space, as amdgpu has it. `scrubFaultPage` clears it t
 page. Compile-checked; `docs/todo-vmtest.md` has the run that tells: the same boot again, and the two fault tests either
 pass or fail as before.
 
+## 13. 2026-10-07, second run: H11 is out; what Linux does with such a fault
+
+Log `rdna4fb-diag-20261007-131756`, kext `6F7D19C7`, the same boot-args. [M]:
+
+- `runtime: fault default page: a page of system memory at bus 0x686863000, GCVM_L2_CNTL 0x00080601 -> 0x00080e01`:
+  the hub's fault setup now equals Linux's.
+- Everything that passed in section 12 passes again (boot test, `gfx-client`, zero-copy vadd, idle 3 % / 18 W).
+- **The two fault tests hang exactly as before**: `0x0090113d` (VMID 9, read, VA 0x100030000), then `0x0084115d` (VMID 8,
+  write, VA 0x100112000). The recovery's lines are in the log this time: `recovering shared queue 1 (guilty VMID 9)`,
+  the queue initialised again, `shared queue 1 NOT recovered: wedged` 200 ms later.
+
+So where the default page lives is not what decides it. **H11 is refuted.**
+
+**What amdgpu does** (read in the kernel's source, `amdgpu_vm.c` and `gmc_v12_0.c`, 2026-10-07): a fault the card
+reports as a *retry* fault goes to `amdgpu_vm_handle_fault`, which **writes a page-table entry for the faulting
+address**. For a graphics context: "Redirect the access to the dummy page", readable, writable, executable. For a
+compute context: an invalid flag combination chosen "to force a no-retry-fault". And otherwise: "Let the hw retry
+silently on the PTE". The default page of the hub's registers plays no part in it. A wave that keeps retrying on a page
+with no translation is this card's normal behaviour, and it is the driver's page-table update that lets it finish. The
+emulator answers such an access from the default page and lets the job end, which is why the tests pass there.
+**H12**: that is all that is missing here.
+
+**The change**: `vmRedirectFault` / `vmEndRedirects` (`src/runtime.cpp`). The loops that wait for a client's job (the
+dispatch, `WaitFence`, the graphics wait) look at the hub's fault status once a millisecond after their first 2 ms. A
+latched fault for a client's address space, on a page with no translation, not from the command processor's own
+fetches: the fault page is mapped at that address in the client's table, the fault cleared, the address space's cache
+flushed; up to 96 pages a job. When the wait ends the pages are unmapped again and the fault page cleared. Compile-checked.
+Limits: only the polled waits do this (not with `rdna4-ih`, where the wait sleeps in a function that cannot update a
+table), and the Vulkan interface's clients do not have it yet.
+
+Not looked at further: why the recovery of a queue whose wave is stuck does not bring the queue back. If H12 holds the
+tests no longer need it; a shader that loops for ever still would.
+
