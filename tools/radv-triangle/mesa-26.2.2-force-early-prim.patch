@@ -1,0 +1,22 @@
+diff --git a/src/amd/vulkan/radv_shader_info.c b/src/amd/vulkan/radv_shader_info.c
+index d4d4fba..7749f8e 100644
+--- a/src/amd/vulkan/radv_shader_info.c
++++ b/src/amd/vulkan/radv_shader_info.c
+@@ -1,3 +1,4 @@
++#include <stdlib.h>
+ /*
+  * Copyright © 2017 Red Hat
+  *
+@@ -1362,8 +1363,11 @@ radv_determine_ngg_settings(const struct radv_compiler_info *compiler_info, stru
+ 
+    if (ngg_stage->stage != MESA_SHADER_GEOMETRY) {
+       nir_function_impl *impl = nir_shader_get_entrypoint(ngg_stage->nir);
++      /* RDNA4FB experiment: RADV_FORCE_EARLY_PRIM=1 exports the primitive before the positions
++       * (the order the kext used) to test whether gfx12 drops the primitive. */
+       ngg_stage->info.has_ngg_early_prim_export =
+-         compiler_info->ac->gfx_level < GFX11 && exec_list_is_singular(&impl->body);
++         getenv("RADV_FORCE_EARLY_PRIM") ? true
++                                         : compiler_info->ac->gfx_level < GFX11 && exec_list_is_singular(&impl->body);
+ 
+       /* NGG passthrough mode should be disabled when culling and when the vertex shader
+        * exports the primitive ID.

@@ -25,12 +25,17 @@
 #include "../src/amdfw.hpp"
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
+#include "../src/ih.hpp"
+#include "../src/smu_metrics.h"
 #include "../src/pm4.hpp"
 #include "../src/codeobj.hpp"
 #include "../src/gpuheap.hpp"
+#include "../src/flip.hpp"
+#include "../src/gpuvm.hpp"
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
+#include "../src/linuxref.hpp"
 #include "rdna4compute.h"
 
 #include <cstdarg>
@@ -1622,6 +1627,8 @@ static int testSdmaPackets() {
 	failures += check(Sdma::copyLinear(p, a, b, 4096) == 8 && p[0] == 0x00080001 && p[1] == 4095 &&
 	                  p[3] == 0x09002000 && p[5] == 0x10000000 && p[7] == 0,
 	                  "sdma: COPY_LINEAR %08x %08x", p[0], p[1]);
+	failures += check(Sdma::trap(p) == Sdma::kTrapDwords && p[0] == 0x00000006 && p[1] == 0,
+	                  "sdma: TRAP %08x %08x", p[0], p[1]);
 
 	// Ring: 256-byte ring; packets wrap in memory, the wptr never does
 	// (SDMA 7's 64-bit pointers: a wptr back at the start stalls the card).
@@ -1638,6 +1645,113 @@ static int testSdmaPackets() {
 
 	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR encodings and ring wrap %s\n",
 	       failures ? "FAILED" : "ok");
+	return failures;
+}
+
+// IH 7.0 vector fields and producer/consumer arithmetic.
+static int testIhRing() {
+	int failures = 0;
+	uint32_t dw[Ih::kEntryDwords] = {
+		0x8004030a, 0x11223344, 0x00005678, 0x00ab1234,
+		0xfeed0001, 0xfeed0002, 0xfeed0003, 0xfeed0004,
+	};
+	Ih::Entry e {};
+	Ih::decode(dw, e);
+	failures += check(e.clientId == 0x0a && e.srcId == 3 && e.ringId == 4 && e.vmid == 0 &&
+	                  e.vmidSrc && e.timestamp == 0x567811223344ull && e.pasid == 0x1234 &&
+	                  e.vmidSrcNode == 0xab && e.srcData[0] == 0xfeed0001 &&
+	                  e.srcData[3] == 0xfeed0004,
+	                  "ih: decode fields client=%u src=%u ring=%u timestamp=0x%llx",
+	                  e.clientId, e.srcId, e.ringId,
+	                  static_cast<unsigned long long>(e.timestamp));
+	constexpr uint32_t size = 256u << 10;
+	failures += check(Ih::advance(size - 16, 32, size) == 16 && Ih::hasEntries(size - 32, 0, size) &&
+	                  Ih::overflowRecovery(size - 32, size) == 0,
+	                  "ih: ring wrap/overflow arithmetic");
+        failures += check(!Ih::missEligible(false, true, false, true) &&
+                          !Ih::missEligible(true, true, false, false) &&
+                          !Ih::missEligible(true, true, true, true) &&
+                          Ih::missEligible(true, true, false, true),
+                          "ih: miss qualification requires sleep, completion, and a 5 ms recheck");
+		failures += check(Ih::isMec1Ring(4) && Ih::isMec1Ring(5) &&
+		                  Ih::isMec1Ring(0x74) && !Ih::isMec1Ring(0) &&
+		                  !Ih::isMec1Ring(0x10),
+		                  "ih: EOP accepts every MEC1 pipe/queue ring");
+	printf("\nih: v7 decode, ring wrap/overflow arithmetic, and wait-miss qualification %s\n",
+	       failures ? "FAILED" : "ok");
+	return failures;
+}
+
+// SmuMetrics_t as smu14_driver_if_v14_0.h:1649-1727 declares it, with the
+// enum counts of that header (PPCLK_COUNT :467, SVI_PLANE_COUNT :563,
+// TEMP_COUNT :549, THROTTLER_COUNT :216). The compiler computes the offsets,
+// so this test checks the constants against the layout, not against themselves.
+namespace {
+struct SmuMetricsMirror {
+	uint32_t CurrClock[11];
+	uint16_t AverageGfxclkFrequencyTarget, AverageGfxclkFrequencyPreDs,
+	         AverageGfxclkFrequencyPostDs, AverageFclkFrequencyPreDs,
+	         AverageFclkFrequencyPostDs, AverageMemclkFrequencyPreDs,
+	         AverageMemclkFrequencyPostDs, AverageVclk0Frequency, AverageDclk0Frequency,
+	         AverageVclk1Frequency, AverageDclk1Frequency, AveragePCIeBusy, dGPU_W_MAX, padding;
+	uint16_t MovingAverageGfxclkFrequencyTarget, MovingAverageGfxclkFrequencyPreDs,
+	         MovingAverageGfxclkFrequencyPostDs, MovingAverageFclkFrequencyPreDs,
+	         MovingAverageFclkFrequencyPostDs, MovingAverageMemclkFrequencyPreDs,
+	         MovingAverageMemclkFrequencyPostDs, MovingAverageVclk0Frequency,
+	         MovingAverageDclk0Frequency, MovingAverageGfxActivity, MovingAverageUclkActivity,
+	         MovingAverageVcn0ActivityPercentage, MovingAveragePCIeBusy,
+	         MovingAverageUclkActivity_MAX, MovingAverageSocketPower, MovingAveragePadding;
+	uint32_t MetricsCounter;
+	uint16_t AvgVoltage[4];
+	uint16_t AvgCurrent[4];
+	uint16_t AverageGfxActivity, AverageUclkActivity, AverageVcn0ActivityPercentage,
+	         Vcn1ActivityPercentage;
+	uint32_t EnergyAccumulator;
+	uint16_t AverageSocketPower, AverageTotalBoardPower;
+	uint16_t AvgTemperature[12];
+	uint16_t AvgTemperatureFanIntake;
+	uint8_t  PcieRate, PcieWidth, AvgFanPwm, Padding[1];
+	uint16_t AvgFanRpm;
+	uint8_t  ThrottlingPercentage[21];
+	uint8_t  VmaxThrottlingPercentage, padding1[2];
+};
+}
+
+static int testSmuMetricsPmOffsets() {
+	int failures = 0;
+	failures += check(offsetof(SmuMetricsMirror, CurrClock) == RDNA4_SMU_METRICS_CURR_CLOCK &&
+	                  offsetof(SmuMetricsMirror, AverageGfxclkFrequencyPreDs) == RDNA4_SMU_METRICS_AVG_GFXCLK_PRE_DS &&
+	                  offsetof(SmuMetricsMirror, AverageGfxclkFrequencyPostDs) == RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS &&
+	                  offsetof(SmuMetricsMirror, AverageMemclkFrequencyPostDs) == RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS &&
+	                  offsetof(SmuMetricsMirror, MovingAverageGfxActivity) == RDNA4_SMU_METRICS_MOVING_AVG_GFX_ACT &&
+	                  offsetof(SmuMetricsMirror, MetricsCounter) == RDNA4_SMU_METRICS_COUNTER &&
+	                  offsetof(SmuMetricsMirror, AvgVoltage) == RDNA4_SMU_METRICS_AVG_VOLTAGE &&
+	                  offsetof(SmuMetricsMirror, AvgCurrent) == RDNA4_SMU_METRICS_AVG_CURRENT &&
+	                  offsetof(SmuMetricsMirror, AverageGfxActivity) == RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY &&
+	                  offsetof(SmuMetricsMirror, AverageUclkActivity) == RDNA4_SMU_METRICS_AVG_UCLK_ACTIVITY &&
+	                  offsetof(SmuMetricsMirror, AverageSocketPower) == RDNA4_SMU_METRICS_AVG_SOCKET_POWER &&
+	                  offsetof(SmuMetricsMirror, AvgTemperature) == RDNA4_SMU_METRICS_AVG_TEMPERATURE &&
+	                  offsetof(SmuMetricsMirror, AvgFanRpm) == RDNA4_SMU_METRICS_AVG_FAN_RPM &&
+	                  offsetof(SmuMetricsMirror, ThrottlingPercentage) == RDNA4_SMU_METRICS_THROTTLING_PCT &&
+	                  sizeof(((SmuMetricsMirror *)0)->ThrottlingPercentage) == RDNA4_SMU_METRICS_THROTTLER_COUNT,
+	                  "smu: pm metrics offsets vs the SmuMetrics_t layout (counter at %u, activity at %u)",
+	                  RDNA4_SMU_METRICS_COUNTER, RDNA4_SMU_METRICS_AVG_GFX_ACTIVITY);
+	printf("\nsmu: SmuMetrics_t power-management offsets %s\n", failures ? "FAILED" : "ok");
+	return failures;
+}
+
+static int testSmuMetricsOffsets();
+static int testSmuMetricsOffsets() {
+	int failures = 0;
+	failures += check(RDNA4_SMU_METRICS_AVG_GFXCLK_POST_DS == 48u &&
+	                  RDNA4_SMU_METRICS_AVG_MEMCLK_POST_DS == 56u &&
+	                  RDNA4_SMU_METRICS_AVG_SOCKET_POWER == 136u &&
+	                  RDNA4_SMU_METRICS_AVG_TEMPERATURE == 140u &&
+	                  RDNA4_SMU_METRICS_AVG_FAN_RPM == 170u,
+	                  "smu: SmuMetrics_t offsets (fan at byte %u)",
+	                  RDNA4_SMU_METRICS_AVG_FAN_RPM);
+	printf("\nsmu: SmuMetrics_t telemetry offsets %s\n", failures ? "FAILED" : "ok");
+	failures += testSmuMetricsPmOffsets();
 	return failures;
 }
 
@@ -1660,6 +1774,9 @@ static int testPm4Packets() {
 	failures += check(Pm4::releaseMem(p, a, 9) == 8 && p[0] == 0xc0064900 &&
 	                  p[1] == 0x06600514 && p[2] == 0x20000000 && p[5] == 9 && p[7] == 0,
 	                  "pm4: RELEASE_MEM %08x %08x %08x", p[0], p[1], p[2]);
+	failures += check(Pm4::releaseMem(p, a, 10, true) == 8 &&
+	                  p[2] == (Pm4::kReleaseData32 | Pm4::kReleaseIntSel2),
+	                  "pm4: RELEASE_MEM interrupt select %08x", p[2]);
 
 	// PACKET3(SET_SH_REG, 2): COMPUTE_PGM_LO/HI (GC seg0 0x1260 + 0x1bac).
 	const uint32_t pgm[2] = { 0x80080e00, 0 };
@@ -1672,6 +1789,11 @@ static int testPm4Packets() {
 	failures += check(Pm4::acquireMem(p, Pm4::kGcrMemSync) == 8 && p[0] == 0xc0065800 &&
 	                  p[2] == 0xffffffff && p[3] == 0xffffff && p[6] == 0xa && p[7] == 0xc3b1,
 	                  "pm4: ACQUIRE_MEM %08x gcr %08x", p[0], p[7]);
+	failures += check(Pm4::indirectBufferCompute(p, a, 37, 8) == 4 && p[0] == 0xc0023f00 &&
+	                  p[1] == 0x0c003080 && p[2] == 0x80 && p[3] == 0x08800025,
+	                  "pm4: compute INDIRECT_BUFFER VALID/VMID %08x", p[3]);
+	failures += check(!(p[3] & ((1u << 20) | (1u << 21) | (1u << 31))),
+	                  "pm4: compute INDIRECT_BUFFER is unprivileged and unchained");
 
 	uint32_t mem[256];
 	Pm4::Queue q;
@@ -1738,11 +1860,12 @@ static int testCodeObject() {
 	failures += check(!CodeObj::parseImage(kVaddCodeObject, 200, img, &why),
 	                  "codeobj: image of a truncated file accepted");
 
-	// bench.cl: six kernels in one file, each with its own descriptor and
+	// bench.cl: eight kernels in one file, each with its own descriptor and
 	// LDS (llvm-readelf --notes: group_segment_fixed_size).
 	struct { const char *name; uint32_t lds, kernarg; } bench[] = {
-		{ "lds_reverse", 256, 24 }, { "copy", 0, 16 }, { "sgemm", 8320, 28 },
+		{ "lds_reverse", 256, 24 }, { "spin", 0, 8 }, { "copy", 0, 16 }, { "sgemm", 8320, 28 },
 		{ "wmma16", 0, 24 }, { "hgemm", 20480, 28 }, { "bf16gemm", 20480, 28 },
+		{ "mandelbrot", 0, 40 }, { "mandelbrot_zoom", 0, 40 },
 	};
 	const int nBench = sizeof(bench) / sizeof(bench[0]);
 	uint64_t entries[nBench] = {};
@@ -1831,6 +1954,210 @@ static int testGpuHeap() {
 	                  "abi: RDNA4Dispatch is %zu bytes", sizeof(RDNA4Dispatch));
 	printf("\nheap: first-fit VRAM heap allocates, frees and refuses %s\n",
 	       failures ? "FAILED" : "correctly");
+	return failures;
+}
+
+// W43: the `linux diff:` formatter is bounded. Worst-case 'why' strings and every capacity from 1 up must leave the canary bytes
+// after the buffer untouched, keep the string NUL-terminated inside the capacity, and never report a length past it.
+static int testLinuxRefFormat() {
+	int failures = 0;
+	static char longWhy[4096];
+	memset(longWhy, 'w', sizeof(longWhy) - 1);
+	longWhy[sizeof(longWhy) - 1] = '\0';
+	const LinuxRefTable::Ref worst = { "A_VERY_LONG_REGISTER_NAME_FOR_THE_TEST", { 1, 0xffff }, 0xffffffffu, 0xffffffffu, longWhy };
+	const LinuxRefTable::Ref noWhy = { "R", { 0, 1 }, 1, 0xffffffffu, "" };
+	const LinuxRefTable::Ref nullWhy = { "R", { 0, 1 }, 1, 0xffffffffu, nullptr };
+	bool ok = true;
+	size_t maxReal = 0;
+	for (size_t cap = 1; cap <= 600 && ok; cap++) {
+		char buf[700];
+		memset(buf, 0xA5, sizeof(buf));
+		for (int which = 0; which < 3 && ok; which++) {
+			const LinuxRefTable::Ref &r = which == 0 ? worst : which == 1 ? noWhy : nullWhy;
+			memset(buf, 0xA5, sizeof(buf));
+			const size_t len = LinuxRefTable::format(buf, cap, r, 0x12345678u);
+			bool canary = true;
+			for (size_t i = cap; i < sizeof(buf); i++)
+				canary = canary && static_cast<unsigned char>(buf[i]) == 0xA5;
+			ok = canary && len < cap && buf[len] == '\0' && strlen(buf) == len;
+			if (!ok)
+				printf("  linuxref: cap %zu entry %d: len %zu canary %d\n", cap, which, len, (int)canary);
+		}
+	}
+	failures += check(ok, "linuxref: every capacity 1..600 stays inside its buffer with a %zu-char why", strlen(longWhy));
+	char zero[4] = { 'x', 'x', 'x', 'x' };
+	failures += check(LinuxRefTable::format(zero, 0, worst, 1) == 0 && zero[0] == 'x', "linuxref: capacity 0 writes nothing");
+	failures += check(LinuxRefTable::format(nullptr, 8, worst, 1) == 0, "linuxref: a null buffer is refused");
+	// The real table: every entry fits the line the kext uses without truncation.
+	bool fits = true;
+	for (size_t i = 0; i < LinuxRefTable::kCount; i++) {
+		char line[LinuxRefTable::kLineMax];
+		const size_t len = LinuxRefTable::format(line, sizeof(line), LinuxRefTable::kRefs[i], 0xffffffffu);
+		maxReal = len > maxReal ? len : maxReal;
+		const size_t full = strlen(LinuxRefTable::kRefs[i].name) + strlen(LinuxRefTable::kRefs[i].why) + 64;
+		fits = fits && len < sizeof(line) - 1 && full < sizeof(line) * 2;
+		fits = fits && (len == 0 || line[len] == '\0');
+	}
+	failures += check(fits && maxReal + 1 < LinuxRefTable::kLineMax, "linuxref: the real table's longest line is %zu of %zu bytes (not truncated)",
+	                  maxReal, LinuxRefTable::kLineMax);
+	printf("\nlinuxref: the linux-diff formatter is bounded %s\n", failures ? "FAILED" : "ok");
+	return failures;
+}
+
+static int testFlipArithmetic() {
+	int failures = 0;
+	failures += check(Flip::surfaceBytes(1920, 1080) == 1920ull * 1080 * 4,
+	                  "flip: 1920x1080 surface size");
+	failures += check(Flip::surfaceBytes(3840, 2160) == 3840ull * 2160 * 4,
+	                  "flip: 3840x2160 surface size");
+	failures += check(Flip::surfaceBytes(0, 1080) == 0 && Flip::surfaceBytes(1920, 0) == 0,
+	                  "flip: zero-sized surface accepted");
+	const uint64_t address = 0x123456789abcde00ull;
+	failures += check(Flip::addressLo(address) == 0x9abcde00u &&
+	                  Flip::addressHi(address) == 0x12345678u,
+	                  "flip: address split");
+	printf("\nflip: surface arithmetic and address split %s\n",
+	       failures ? "FAILED" : "ok");
+	return failures;
+}
+
+// A synthetic v1 discovery binary (binary_header + IPDS + one die + a GC
+// table) for IpDiscovery::gcInfo. init() needs a >= 512 byte buffer whose
+// checksum, IPDS and die header are right, so build those, then vary the GC
+// table: its offset, table_id, version and where it ends.
+static void buildDiscovery(uint8_t *b, uint16_t gcOff, uint32_t tableId, uint16_t gcMajor,
+                           uint32_t se, uint32_t rbPerSe) {
+	memset(b, 0, 512);
+	auto p16 = [&](size_t o, uint16_t v) { b[o] = v & 0xff; b[o + 1] = v >> 8; };
+	auto p32 = [&](size_t o, uint32_t v) { p16(o, v & 0xffff); p16(o + 2, v >> 16); };
+	p32(0, 0x28211407);                        // binary_header: signature
+	p16(4, 1); p16(6, 3);                      // version 1.3 (this card's ROM)
+	p16(10, 512);                              // binary_size
+	p16(12, 0x40); p16(16, 0x60);              // table_list[0] IP_DISCOVERY: offset, size
+	p16(20, gcOff);                            // table_list[1] GC: offset
+	p32(0x40, 0x53445049);                     // "IPDS"
+	p16(0x40 + 12, 1);                         // num_dies
+	p16(0x40 + 16, 0xb0);                      // die_info[0].die_offset
+	p16(0xb0 + 2, 1);                          // die_header.num_ips
+	if (gcOff) {
+		p32(gcOff, tableId);                   // gpu_info_header
+		p16(gcOff + 4, gcMajor); p16(gcOff + 6, 0);
+		if (gcOff + 12 < 512) p32(gcOff + 12, se);
+		if (gcOff + 24 < 512) p32(gcOff + 24, rbPerSe);
+	}
+	uint16_t sum = 0;
+	for (size_t i = 10; i < 512; i++)
+		sum = static_cast<uint16_t>(sum + b[i]);
+	p16(8, sum);
+}
+
+static int testGcInfo() {
+	int failures = 0;
+	uint8_t buf[512];
+	IpDiscovery d;
+	uint32_t se = 99, rb = 99, ver = 0;
+
+	buildDiscovery(buf, 0xc0, 0x4347, 1, 4, 4);
+	failures += check(d.init(buf, sizeof(buf)), "gc_info: the synthetic binary initialises");
+	failures += check(d.gcInfo(se, rb, &ver) && se == 4 && rb == 4 && ver == (1u << 16),
+	                  "gc_info: good v1.0 table gives 4 SEs, 4 RBs per SE, version 1.0");
+	buildDiscovery(buf, 0xc0, 0x4347, 2, 4, 4);
+	d.init(buf, sizeof(buf));
+	failures += check(d.gcInfo(se, rb, &ver) && ver == (2u << 16), "gc_info: v2 table accepted");
+
+	se = rb = 99;
+	buildDiscovery(buf, 0, 0x4347, 1, 4, 4);
+	d.init(buf, sizeof(buf));
+	failures += check(!d.gcInfo(se, rb) && se == 99 && rb == 99, "gc_info: zero table offset refused");
+	buildDiscovery(buf, 0xc0, 0x4347, 3, 4, 4);
+	d.init(buf, sizeof(buf));
+	failures += check(!d.gcInfo(se, rb) && se == 99, "gc_info: version 3 refused (amdgpu: Unhandled GC info table)");
+	buildDiscovery(buf, 0xc0, 0x4348, 1, 4, 4);
+	d.init(buf, sizeof(buf));
+	failures += check(!d.gcInfo(se, rb) && se == 99, "gc_info: wrong table_id refused (GC_TABLE_ID 0x4347)");
+	buildDiscovery(buf, 512 - 16, 0x4347, 1, 4, 4);   // gc_num_rb_per_se falls past the buffer
+	d.init(buf, sizeof(buf));
+	failures += check(!d.gcInfo(se, rb) && se == 99, "gc_info: table truncated by the buffer refused");
+	IpDiscovery none;
+	failures += check(!none.gcInfo(se, rb), "gc_info: no discovery refused");
+
+	printf("\ngc_info: %s\n", failures ? "FAILED" : "ok");
+	return failures;
+}
+
+struct VmTestTable {
+	uint64_t base;
+	uint64_t entries[4096];
+};
+
+static bool readVmTestEntry(void *ctx, uint64_t address, uint64_t &entry) {
+	VmTestTable *t = static_cast<VmTestTable *>(ctx);
+	if (address < t->base || address >= t->base + sizeof(t->entries) || (address & 7))
+		return false;
+	entry = t->entries[(address - t->base) / 8];
+	return true;
+}
+
+static int testGpuVm() {
+	int failures = 0;
+	const uint64_t physical = 0x0000123400000000ull;
+	const uint64_t pte = GpuVm::encodePte(physical,
+		GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable | GpuVm::kIsPte,
+		true);
+	failures += check((pte & GpuVm::kPhysicalMask) == physical && (pte & GpuVm::kValid) &&
+	                  ((pte >> 7) & 0x1f) == GpuVm::kFragment64K,
+	                  "gfx12 PTE encodes physical address, valid/write and 64 KiB fragment");
+	const uint64_t pde2 = GpuVm::encodePde(0x0000000000400000ull, GpuVm::kValid | GpuVm::kSnooped, 2);
+	const uint64_t pde1 = GpuVm::encodePde(0x0000000000410000ull, GpuVm::kValid | GpuVm::kSnooped, 1);
+	const uint64_t pde0 = GpuVm::encodePde(0x0000000000420000ull, GpuVm::kValid | GpuVm::kSnooped, 0);
+	failures += check(pde2 == (0x0000000000400000ull | GpuVm::kValid) &&
+	                  pde1 == (0x0000000000410000ull | GpuVm::kValid) &&
+	                  pde0 == (0x0000000000420000ull | GpuVm::kValid),
+	                  "gfx12 regular PDEs encode GPU physical address and VALID only");
+	const uint64_t bus = 0x00000012345000ull;
+	const uint64_t systemPte = GpuVm::encodePte(
+		bus, GpuVm::kSystem | GpuVm::kSnooped | GpuVm::kValid |
+		GpuVm::kReadable | GpuVm::kWritable, false);
+	failures += check(systemPte == ((bus & GpuVm::kPhysicalMask) |
+		                              GpuVm::kSystem | GpuVm::kSnooped |
+		                              GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable) &&
+	                  !(systemPte & GpuVm::kFragMask) && !(systemPte & GpuVm::kMtypeMask),
+	                  "gfx12 system PTE encodes bus address, SYSTEM/SNOOPED and cached MTYPE_NC");
+	uint64_t converted = 0;
+	failures += check(GpuVm::mcToPhysical(0x0000008012345000ull, 0x0000008000000000ull,
+	                                      0x12, converted) &&
+	                  converted == 0x0000000024345000ull,
+	                  "gfx12 MC VRAM address converts to FB_OFFSET GPU physical address");
+	failures += check(!GpuVm::mcToPhysical(0x0000007ffff00000ull, 0x0000008000000000ull,
+	                                       0x12, converted),
+	                  "gfx12 MC conversion rejects an address below the VRAM aperture");
+
+	VmTestTable table { 0x0000000000400000ull, {} };
+	/* One compact table image, laid out at 4 KiB boundaries. */
+	const uint64_t root = table.base;
+	const uint64_t pdb1 = root + 0x1000, pdb0 = root + 0x2000, ptb = root + 0x3000;
+	auto put = [&table](uint64_t address, uint64_t value) {
+		table.entries[(address - table.base) / 8] = value;
+	};
+	const uint64_t va = GpuVm::kVaStart + 0x12345000ull;
+	put(root + GpuVm::index(va, 0) * 8, GpuVm::encodePde(pdb1, GpuVm::kValid | GpuVm::kSnooped, 2));
+	put(pdb1 + GpuVm::index(va, 1) * 8, GpuVm::encodePde(pdb0, GpuVm::kValid | GpuVm::kSnooped, 1));
+	put(pdb0 + GpuVm::index(va, 2) * 8, GpuVm::encodePde(ptb, GpuVm::kValid | GpuVm::kSnooped, 0));
+	put(ptb + GpuVm::index(va, 3) * 8,
+	    GpuVm::encodePte(physical, GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable | GpuVm::kIsPte,
+	                      true));
+	uint64_t got = 0, flags = 0;
+	failures += check(GpuVm::walk(root, va + 0x345, readVmTestEntry, &table, got, flags) &&
+	                  got == physical + 0x345 && (flags & GpuVm::kWritable),
+	                  "gfx12 page-table walk returns the mapped physical address");
+	failures += check(!GpuVm::walk(root, 0x2000, readVmTestEntry, &table, got, flags),
+	                  "gfx12 page-table walk rejects an unmapped VA");
+	/* Negative control: the round 2-4 leaf (no bit 63) is a directory entry to GFX12 and faults. */
+	put(ptb + GpuVm::index(va, 3) * 8,
+	    GpuVm::encodePte(physical, GpuVm::kValid | GpuVm::kSnooped | GpuVm::kReadable | GpuVm::kWritable,
+	                      true));
+	failures += check(!GpuVm::walk(root, va + 0x345, readVmTestEntry, &table, got, flags),
+	                  "gfx12 page-table walk faults on a leaf PTE without IS_PTE (bit 63)");
 	return failures;
 }
 
@@ -2025,9 +2352,15 @@ int main(int argc, char **argv) {
 	failures += testPsp();
 	failures += testGfxImages();
 	failures += testSdmaPackets();
+	failures += testIhRing();
+	failures += testSmuMetricsOffsets();
 	failures += testPm4Packets();
 	failures += testCodeObject();
 	failures += testGpuHeap();
+	failures += testFlipArithmetic();
+	failures += testGcInfo();
+	failures += testGpuVm();
+	failures += testLinuxRefFormat();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

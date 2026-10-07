@@ -26,6 +26,15 @@ void lds_reverse(__global const uint *a, __global const uint *b, __global uint *
 	c[gid] = tile[63u - lid] + b[gid];
 }
 
+// A deliberately non-terminating work-item for the queue-recovery test. The
+// host never writes flag[0], so the runtime must time out and reset its queue.
+__kernel __attribute__((reqd_work_group_size(1, 1, 1)))
+void spin(__global const uint *flag)
+{
+	while (flag[0] == 0)
+		;
+}
+
 // Memory bandwidth: 16 bytes per work-item, read once and written once.
 __kernel __attribute__((reqd_work_group_size(256, 1, 1)))
 void copy(__global const uint4 *src, __global uint4 *dst)
@@ -185,4 +194,67 @@ void bf16gemm(__global const ushort *A, __global const ushort *Bt, __global floa
 {
 	__local ushort As[HT * HKP], Bs[HT * HKP];
 	gemm16(A, Bt, C, n, As, Bs, true);
+}
+
+// One work-item per sample block. The host supplies the affine complex-plane
+// mapping so this kernel needs no floating-point division (which also keeps
+// the bring-up interpreter's instruction set small). A scale greater than one
+// lets the VM proof render a useful image with fewer work-items: one sample is
+// replicated into a clipped scale x scale block.
+static inline __attribute__((always_inline))
+void mandelbrotRender(__global uint *out, uint width, uint height, uint pitch,
+                      float x0, float dx, float y0, float dy, uint scale)
+{
+	const uint blockX = WG_ID(x) * 16u + LID_X;
+	const uint blockY = WG_ID(y) * 16u + LID_Y;
+	if (!scale)
+		return;
+	const uint x = blockX * scale;
+	const uint y = blockY * scale;
+	if (x >= width || y >= height)
+		return;
+	const float cx = x0 + (float)x * dx;
+	const float cy = y0 + (float)y * dy;
+	float zx = 0.0f, zy = 0.0f;
+	uint iteration = 0;
+	#pragma clang loop unroll(disable)
+	for (; iteration < 256u; iteration++) {
+		const float zx2 = zx * zx;
+		const float zy2 = zy * zy;
+		if (zx2 + zy2 > 4.0f)
+			break;
+		const float nextZx = zx2 - zy2 + cx;
+		zy = 2.0f * zx * zy + cy;
+		zx = nextZx;
+	}
+	uint color = 0xff000000u;
+	if (iteration < 256u) {
+		const float t = (float)iteration * (1.0f / 255.0f);
+		const uint r = (uint)(9.0f + 246.0f * t);
+		const uint g = (uint)(20.0f + 200.0f * (1.0f - t));
+		const uint b = (uint)(80.0f + 175.0f * t);
+		color = 0xff000000u | (r << 16) | (g << 8) | b;
+	}
+	for (uint oy = 0; oy < scale; oy++) {
+		for (uint ox = 0; ox < scale; ox++) {
+			const uint px = x + ox;
+			const uint py = y + oy;
+			if (px < width && py < height)
+				out[py * pitch + px] = color;
+		}
+	}
+}
+
+__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
+void mandelbrot(__global uint *out, uint width, uint height, uint pitch,
+                float x0, float dx, float y0, float dy, uint scale)
+{
+	mandelbrotRender(out, width, height, pitch, x0, dx, y0, dy, scale);
+}
+
+__kernel __attribute__((reqd_work_group_size(16, 16, 1)))
+void mandelbrot_zoom(__global uint *out, uint width, uint height, uint pitch,
+                     float x0, float dx, float y0, float dy, uint scale)
+{
+	mandelbrotRender(out, width, height, pitch, x0, dx, y0, dy, scale);
 }

@@ -16,6 +16,41 @@ uint32_t setUconfigReg(uint32_t *out, uint32_t reg, uint32_t value) {
 	return 3;
 }
 
+uint32_t setContextReg(uint32_t *out, uint32_t offset, uint32_t value) {
+	out[0] = header(OpSetContextReg, 1);
+	out[1] = offset;
+	out[2] = value;
+	return 3;
+}
+
+uint32_t eventWrite(uint32_t *out, uint32_t eventDw) {
+	out[0] = header(OpEventWrite, 0);
+	out[1] = eventDw;
+	return 2;
+}
+
+uint32_t eventWriteAddr(uint32_t *out, uint32_t eventDw, uint64_t addr) {
+	out[0] = header(OpEventWrite, 2);
+	out[1] = eventDw;
+	out[2] = static_cast<uint32_t>(addr) & ~7u;
+	out[3] = static_cast<uint32_t>(addr >> 32);
+	return 4;
+}
+
+uint32_t setContextRegs(uint32_t *out, uint32_t offset, const uint32_t *values, uint32_t count) {
+	out[0] = header(OpSetContextReg, count);
+	out[1] = offset;
+	for (uint32_t i = 0; i < count; i++)
+		out[2 + i] = values[i];
+	return 2 + count;
+}
+
+uint32_t nop(uint32_t *out) {
+	out[0] = header(OpNop, 0);
+	out[1] = 0;
+	return 2;
+}
+
 uint32_t writeData(uint32_t *out, uint64_t addr, uint32_t value) {
 	out[0] = header(OpWriteData, 3);
 	out[1] = kWriteDstMemory | kWriteConfirm;
@@ -25,13 +60,23 @@ uint32_t writeData(uint32_t *out, uint64_t addr, uint32_t value) {
 	return 5;
 }
 
+uint32_t copyDataRegToMem(uint32_t *out, uint32_t regDword, uint64_t addr) {
+	out[0] = header(OpCopyData, 4);
+	out[1] = (0u << 0) | (5u << 8) | kWriteConfirm;   // src: register, dst: memory, wait for the write
+	out[2] = regDword;
+	out[3] = 0;
+	out[4] = static_cast<uint32_t>(addr) & ~3u;
+	out[5] = static_cast<uint32_t>(addr >> 32);
+	return 6;
+}
+
 // gfx_v12_0_ring_emit_fence: end-of-pipe event with GL2 write-back, then
 // the sequence number to `addr`, no interrupt.
-uint32_t releaseMem(uint32_t *out, uint64_t addr, uint32_t seq) {
+uint32_t releaseMem(uint32_t *out, uint64_t addr, uint32_t seq, bool interrupt) {
 	out[0] = header(OpReleaseMem, 6);
 	out[1] = kReleaseGcrSeq | kReleaseGcrGl2Wb | kReleaseCachePolicy3 | kEventCacheFlushTs |
 	         kReleaseEventIndex5;
-	out[2] = kReleaseData32;
+	out[2] = kReleaseData32 | (interrupt ? kReleaseIntSel2 : 0);
 	out[3] = static_cast<uint32_t>(addr) & ~3u;
 	out[4] = static_cast<uint32_t>(addr >> 32);
 	out[5] = seq;
@@ -68,6 +113,23 @@ uint32_t acquireMem(uint32_t *out, uint32_t gcrCntl) {
 	out[6] = 0x0000000a;   // POLL_INTERVAL
 	out[7] = gcrCntl;
 	return 8;
+}
+
+uint32_t indirectBufferGfx(uint32_t *out, uint64_t addr, uint32_t dwords, uint32_t vmid) {
+	out[0] = header(OpIndirectBuffer, 2);
+	out[1] = static_cast<uint32_t>(addr) & ~3u;
+	out[2] = static_cast<uint32_t>(addr >> 32);
+	out[3] = (dwords & 0xfffff) | ((vmid & 0xf) << 24);
+	return 4;
+}
+
+uint32_t indirectBufferCompute(uint32_t *out, uint64_t addr, uint32_t dwords, uint32_t vmid) {
+	out[0] = header(OpIndirectBuffer, 2);
+	out[1] = static_cast<uint32_t>(addr) & ~3u;
+	out[2] = static_cast<uint32_t>(addr >> 32);
+	/* INDIRECT_BUFFER_VALID is bit 23; CHAIN, OFFLOAD_POLLING and PRIV stay 0. */
+	out[3] = (dwords & 0xfffff) | (1u << 23) | ((vmid & 0xf) << 24);
+	return 4;
 }
 
 bool Queue::init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes) {

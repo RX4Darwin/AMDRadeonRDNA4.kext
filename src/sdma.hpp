@@ -38,12 +38,14 @@ constexpr uint32_t kCopyCpv         = 1u << 19;   // COPY_LINEAR: CPV (cpv_shift
 // Packet sizes in dwords.
 constexpr uint32_t kWriteDwords = 5;   // header, addr lo/hi, count, 1 data dword
 constexpr uint32_t kFenceDwords = 4;   // header, addr lo/hi, value
+constexpr uint32_t kTrapDwords  = 2;   // header, interrupt context
 constexpr uint32_t kFillDwords  = 5;   // header, addr lo/hi, pattern, bytes - 1
 constexpr uint32_t kCopyDwords  = 8;   // header, count, param, src lo/hi, dst lo/hi, DCC
 
 // Build into `out`; return the dwords written.
 uint32_t writeDword(uint32_t *out, uint64_t addr, uint32_t value);
 uint32_t fence(uint32_t *out, uint64_t addr, uint32_t value);
+uint32_t trap(uint32_t *out);
 uint32_t constFill(uint32_t *out, uint64_t addr, uint32_t pattern, uint32_t bytes);
 uint32_t copyLinear(uint32_t *out, uint64_t src, uint64_t dst, uint32_t bytes);
 

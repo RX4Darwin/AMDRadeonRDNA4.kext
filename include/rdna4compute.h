@@ -31,7 +31,7 @@
 #include <stdint.h>
 
 #define RDNA4_COMPUTE_SERVICE   "RDNA4ComputeService"
-#define RDNA4_COMPUTE_ABI       3u   /* 2: dynamic LDS; 3: DMA transfers, VRAM past the BAR */
+#define RDNA4_COMPUTE_ABI       4u   /* 4: per-client GPUVM and one MEC queue per client */
 
 /* Largest kernarg block a dispatch carries; bytes past what the caller
  * passes, up to the kernel's own kernarg size, are zero. */
@@ -43,7 +43,7 @@
 
 /* Selectors: scalar inputs -> scalar outputs, unless a struct is named. */
 enum {
-	/* -> abi, stage, flags (RDNA4_FLAG_*), heap bytes, heap free, heap GPU base */
+	/* -> abi, stage, flags, heap bytes, heap free, heap GPU/VA base, VMID, pipe, queue */
 	kRDNA4MethodInfo = 0,
 	/* bytes -> handle, GPU address (4 KiB aligned) */
 	kRDNA4MethodAlloc,
@@ -61,12 +61,83 @@ enum {
 	kRDNA4MethodUnload,
 	/* struct in: RDNA4Dispatch -> microseconds from doorbell to fence */
 	kRDNA4MethodDispatch,
+	/* timeout milliseconds -> vblank count, timestamp in nanoseconds */
+	kRDNA4MethodWaitVBlank,
+	/* handle, byte offset (0,0 queries geometry) -> width | height<<16, pitch */
+	kRDNA4MethodPresent,
+	/* restore the desktop surface for this connection */
+	kRDNA4MethodRestore,
+	/* bytes, flags -> handle, GPU VA, user CPU address */
+	kRDNA4MethodAllocHost,
+	/* -> RDNA4Sensors, the current SMU metrics snapshot */
+	kRDNA4MethodSensors,
+	/* debug-only root sleep cycle: 1 quiesce, 2 re-bring-up */
+	kRDNA4MethodSleepTest,
+	/* debug-only root quiesce using the shutdown/restart path */
+	kRDNA4MethodQuiesce,
+	/* handle, byte offset -> present id */
+	kRDNA4MethodPresentAsync,
+	/* present id, timeout ms -> latched OTG frame count */
+	kRDNA4MethodWaitPresent,
+	/* IB GPU VA, dwords, flags -> fence value */
+	kRDNA4MethodSubmitIb,
+	/* fence value, timeout milliseconds -> elapsed nanoseconds */
+	kRDNA4MethodWaitFence,
+	/* -> RDNA4SensorsEx: one SMU metrics sample with the power-management fields */
+	kRDNA4MethodSensorsEx,
 	kRDNA4MethodCount
 };
+
+/* AllocHost flags.  Host memory is non-executable unless this bit is set. */
+#define RDNA4_HOST_EXECUTABLE (1u << 0)
 
 #define RDNA4_FLAG_READY   (1u << 0)   /* bring-up reached a dispatching stage */
 #define RDNA4_FLAG_WEDGED  (1u << 1)   /* a dispatch timed out: no more work */
 #define RDNA4_FLAG_DMA     (1u << 2)   /* Write/Read by SDMA; buffers from all of VRAM */
+#define RDNA4_FLAG_VM      (1u << 3)   /* this client has a private GPU VM and queue */
+#define RDNA4_FLAG_RESUMED (1u << 4)   /* runtime was re-published after system sleep */
+
+/* A compact view of the SMU 14.0.2/14.0.3 metrics table. */
+typedef struct {
+	uint32_t edgeTempC, hotspotTempC;
+	uint32_t gfxClockMHz, memoryClockMHz;
+	uint32_t socketPowerW, fanRpm;
+} RDNA4Sensors;
+
+#ifdef __cplusplus
+static_assert(sizeof(RDNA4Sensors) == 6 * sizeof(uint32_t), "RDNA4Sensors layout");
+#else
+_Static_assert(sizeof(RDNA4Sensors) == 6 * sizeof(uint32_t), "RDNA4Sensors layout");
+#endif
+
+/* One SMU metrics sample with the fields that show why the GFX clock sits
+ * where it does (SmuMetrics_t, smu14_driver_if_v14_0.h:1649-1727).  Additive:
+ * the ABI version does not change. */
+#define RDNA4_SENSORS_THROTTLERS 21
+
+#define RDNA4_SENSORS_EX_LIVE  (1u << 0)   /* the SMU rewrote the table for this request */
+
+typedef struct {
+	uint32_t flags;             /* RDNA4_SENSORS_EX_* */
+	uint32_t currGfxclkMHz;     /* CurrClock[PPCLK_GFXCLK] */
+	uint32_t avgGfxclkPreDsMHz; /* AverageGfxclkFrequencyPreDs */
+	uint32_t avgGfxclkPostDsMHz;/* AverageGfxclkFrequencyPostDs */
+	uint32_t gfxActivity;       /* AverageGfxActivity, percent */
+	uint32_t uclkActivity;      /* AverageUclkActivity, percent */
+	uint32_t metricsCounter;    /* MetricsCounter: advances while the SMU is alive */
+	uint32_t vddGfxMv;          /* AvgVoltage[SVI_PLANE_VDD_GFX] */
+	uint32_t vddGfxCurrentA;    /* AvgCurrent[SVI_PLANE_VDD_GFX] */
+	uint32_t socketPowerW;
+	uint32_t hotspotTempC;
+	uint32_t throttlingMask;    /* bit n set when throttler n reports > 0 % */
+	uint8_t  throttlingPercent[24]; /* ThrottlingPercentage[21], zero padded */
+} RDNA4SensorsEx;
+
+#ifdef __cplusplus
+static_assert(sizeof(RDNA4SensorsEx) == 12 * sizeof(uint32_t) + 24, "RDNA4SensorsEx layout");
+#else
+_Static_assert(sizeof(RDNA4SensorsEx) == 12 * sizeof(uint32_t) + 24, "RDNA4SensorsEx layout");
+#endif
 
 typedef struct {
 	uint32_t program;

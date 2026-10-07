@@ -26,10 +26,15 @@
 #include <IOKit/graphics/IOGraphicsTypes.h>   // header-only types for IOMacOSVideo.h
 #include <IOKit/ndrvsupport/IOMacOSTypes.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
+#include <IOKit/ndrvsupport/IONDRVLibraries.h>
+#include <pexpert/pexpert.h>
 
 #include "compute.hpp"
 #include "device.hpp"
 #include "ndrv.hpp"
+
+uint32_t rdna4TraceLevel { 0 };
+
 #ifdef RDNA4FB_VM_TEST
 #include "bochsvbe.hpp"
 #endif
@@ -88,7 +93,11 @@ static_assert(Ndrv::cscGetCurMode == ::cscGetCurMode && Ndrv::cscGetSync == ::cs
               Ndrv::cscGetVideoParameters == ::cscGetVideoParameters &&
               Ndrv::cscGetDDCBlock == ::cscGetDDCBlock &&
               Ndrv::cscGetDetailedTiming == ::cscGetDetailedTiming &&
-              Ndrv::cscSwitchMode == ::cscSwitchMode && Ndrv::cscSetSync == ::cscSetSync,
+              Ndrv::cscSupportsHardwareCursor == ::cscSupportsHardwareCursor &&
+              Ndrv::cscGetHardwareCursorDrawState == ::cscGetHardwareCursorDrawState &&
+              Ndrv::cscSwitchMode == ::cscSwitchMode && Ndrv::cscSetSync == ::cscSetSync &&
+              Ndrv::cscSetHardwareCursor == ::cscSetHardwareCursor &&
+              Ndrv::cscDrawHardwareCursor == ::cscDrawHardwareCursor,
               "csc selectors");
 static_assert(Ndrv::kDeclROMtables == static_cast<uint32_t>(::kDeclROMtables) &&
               Ndrv::kDepthMode1 == ::kDepthMode1 &&
@@ -104,6 +113,11 @@ static_assert(Ndrv::kDeclROMtables == static_cast<uint32_t>(::kDeclROMtables) &&
               Ndrv::kBadArgument == static_cast<int32_t>(kIOReturnBadArgument) &&
               Ndrv::kUnsupported == static_cast<int32_t>(kIOReturnUnsupported),
               "NDRV constants");
+static_assert(sizeof(Ndrv::VDSetHardwareCursorRec) == sizeof(::VDSetHardwareCursorRec) &&
+              sizeof(Ndrv::VDDrawHardwareCursorRec) == sizeof(::VDDrawHardwareCursorRec) &&
+              sizeof(Ndrv::VDSupportsHardwareCursorRec) == sizeof(::VDSupportsHardwareCursorRec) &&
+              sizeof(Ndrv::VDHardwareCursorDrawStateRec) == sizeof(::VDHardwareCursorDrawStateRec),
+              "NDRV cursor records");
 
 namespace {
 
@@ -128,6 +142,10 @@ KernelPatcher::KextInfo kextIONDRVSupport {
 };
 
 mach_vm_address_t orgDoDriverIO { 0 };
+mach_vm_address_t orgVslNew { 0 };
+mach_vm_address_t orgVslDispose { 0 };
+mach_vm_address_t orgVslDo { 0 };
+mach_vm_address_t orgVslPrepareCursor { 0 };
 bool traceEnabled { false };
 uint32_t traceBudget { 400 };   // bounded: gamma/CLUT calls can be frequent
 uint32_t computeStage { 0 };    // rdna4-compute=<stage>, see compute.hpp
@@ -148,6 +166,10 @@ struct FbEntry {
 	FbState *state;
 };
 FbEntry fbTable[8] {};
+
+// Forward declaration: the explicit open-time VBL service creation below
+// goes through the same wrapper as a legacy NDRV call.
+int32_t wrapVslNew(void *entryID, UInt32 type, void **service);
 
 // The GPU behind a framebuffer: its provider, or the provider's provider.
 IOPCIDevice *pciFor(IOService *provider) {
@@ -211,6 +233,47 @@ void deviceSetPower(void *ctx, bool on) {
 	static_cast<RDNA4Device *>(ctx)->setDisplayPower(on);
 }
 
+void createVblankService(IOService *framebuffer) {
+	uint32_t ih = 0, requested = 0;
+	if (!PE_parse_boot_argn("rdna4-ih", &ih, sizeof(ih)) || ih < 2 ||
+	    !PE_parse_boot_argn("rdna4-vbl", &requested, sizeof(requested)) || !requested ||
+	    Ndrv::vslServicePresent() || !orgVslNew || !orgVslDo || !framebuffer)
+		return;
+	IOService *provider = framebuffer->getProvider();
+	OSData *entry = provider ? OSDynamicCast(OSData,
+		provider->getProperty(kAAPLRegEntryIDKey)) : nullptr;
+	if (!entry || entry->getLength() < sizeof(RegEntryID)) {
+		FBLOG("ndrv: VBL service needs provider AAPL,RegEntryID");
+		return;
+	}
+	void *service = nullptr;
+	IOReturn ret = wrapVslNew(const_cast<void *>(entry->getBytesNoCopy()),
+	                          ::kVBLInterruptServiceType, &service);
+	if (ret != kIOReturnSuccess)
+		FBLOG("ndrv: open-time VBL service creation failed 0x%x", ret);
+}
+
+bool deviceSupportsHardwareCursor(void *ctx) {
+	return static_cast<RDNA4Device *>(ctx)->supportsHardwareCursor();
+}
+
+int32_t deviceSetHardwareCursor(void *ctx, void *cursorRef) {
+	return static_cast<RDNA4Device *>(ctx)->setHardwareCursor(cursorRef);
+}
+
+int32_t deviceDrawHardwareCursor(void *ctx, int32_t x, int32_t y, uint32_t visible) {
+	return static_cast<RDNA4Device *>(ctx)->drawHardwareCursor(x, y, visible);
+}
+
+void deviceCursorProbe(void *ctx, const char *why) {
+	static_cast<RDNA4Device *>(ctx)->cursorRegProbe(why);
+}
+
+int32_t deviceGetHardwareCursorDrawState(void *ctx,
+	                                         Ndrv::VDHardwareCursorDrawStateRec &state) {
+	return static_cast<RDNA4Device *>(ctx)->getHardwareCursorDrawState(state);
+}
+
 #ifdef RDNA4FB_VM_TEST
 // Size QEMU is scanning out (the last mode it took); one VM test device.
 uint16_t vmWidth { 0 }, vmHeight { 0 };
@@ -252,7 +315,9 @@ void attach(FbEntry &e) {
 		delete st;
 		return;
 	}
-	Ndrv::Backend be { &dev, deviceSurfaceFor, deviceSwitchTo, deviceSetPower };
+	Ndrv::Backend be { &dev, deviceSurfaceFor, deviceSwitchTo, deviceSetPower,
+	                   deviceSupportsHardwareCursor, deviceSetHardwareCursor,
+	                   deviceDrawHardwareCursor, deviceGetHardwareCursorDrawState };
 #ifdef RDNA4FB_VM_TEST
 	if (!dev.isAmd) {
 		pci->setIOEnable(true);
@@ -275,7 +340,8 @@ void attach(FbEntry &e) {
 	// when asked for: it must never be the reason the desktop is missing.
 	if (computeStage && dev.isAmd) {
 		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
-		                        dev.fbPhysBase, dev.fbLength };
+		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
+		                        createVblankService, deviceCursorProbe, &dev };
 		st->compute.start(env, computeStage);
 	}
 }
@@ -342,6 +408,39 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 	return ret;
 }
 
+// Apple IOGraphics IONDRVFramebuffer.cpp:849-890 creates and links the
+// service directly; unlike doControl/doStatus at :1159-1170, VSLNew does not
+// enter the controller work-loop gate.  The bring-up callback may therefore
+// call it from the IH bring-up thread.  W1's deferred action calls the
+// original VSLDoInterruptService, so IONDRV runs the registered IOFramebuffer
+// callback exactly as it does for a real NDRV.
+int32_t wrapVslNew(void *entryID, UInt32 type, void **service) {
+	auto org = FunctionCast(wrapVslNew, orgVslNew);
+	int32_t ret = org(entryID, type, service);
+	if (ret == kIOReturnSuccess && type == ::kVBLInterruptServiceType && service && *service) {
+		Ndrv::vslServiceCreated(*service,
+		                        reinterpret_cast<Ndrv::VslDoInterruptService>(orgVslDo));
+		FBLOG("ndrv: VBL interrupt service created (%p)", *service);
+	}
+	return ret;
+}
+
+int32_t wrapVslDispose(void *service) {
+	auto org = FunctionCast(wrapVslDispose, orgVslDispose);
+	Ndrv::vslServiceDisposed(service);
+	return org(service);
+}
+
+int32_t wrapVslDo(void *service) {
+	auto org = FunctionCast(wrapVslDo, orgVslDo);
+	return org(service);
+}
+
+bool wrapVslPrepareCursor(void *cursorRef, void *descriptor, void *info) {
+	auto org = FunctionCast(wrapVslPrepareCursor, orgVslPrepareCursor);
+	return org(cursorRef, descriptor, info);
+}
+
 void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address,
                  size_t size) {
 	if (index != kextIONDRVSupport.loadIndex)
@@ -355,6 +454,45 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d)",
 		      patcher.getError());
 	patcher.clearError();
+	uint32_t vbl = 0, cursor = 0;
+	const bool vslRequested =
+		(PE_parse_boot_argn("rdna4-vbl", &vbl, sizeof(vbl)) && vbl != 0) ||
+		(PE_parse_boot_argn("rdna4-cursor", &cursor, sizeof(cursor)) && cursor != 0);
+	if (!vslRequested) {
+		FBLOG("ndrv: VSL routes disabled (rdna4-vbl and rdna4-cursor are off)");
+		return;
+	}
+
+	KernelPatcher::RouteRequest vslNew {
+		"__ZN17IONDRVFramebuffer22VSLNewInterruptServiceEPvjPP11_VSLService",
+		wrapVslNew, orgVslNew,
+	};
+	if (!patcher.routeMultiple(index, &vslNew, 1, address, size))
+		FBLOG("ndrv: VSLNewInterruptService route unavailable (error %d)", patcher.getError());
+	patcher.clearError();
+	KernelPatcher::RouteRequest vslDispose {
+		"__ZN17IONDRVFramebuffer26VSLDisposeInterruptServiceEP11_VSLService",
+		wrapVslDispose, orgVslDispose,
+	};
+	if (!patcher.routeMultiple(index, &vslDispose, 1, address, size))
+		FBLOG("ndrv: VSLDisposeInterruptService route unavailable (error %d)", patcher.getError());
+	patcher.clearError();
+	KernelPatcher::RouteRequest vslDo {
+		"__ZN17IONDRVFramebuffer21VSLDoInterruptServiceEP11_VSLService",
+		wrapVslDo, orgVslDo,
+	};
+	if (!patcher.routeMultiple(index, &vslDo, 1, address, size))
+		FBLOG("ndrv: VSLDoInterruptService route unavailable (error %d)", patcher.getError());
+	patcher.clearError();
+	KernelPatcher::RouteRequest vslPrepare {
+		"__ZN17IONDRVFramebuffer33VSLPrepareCursorForHardwareCursorEPvP26IOHardwareCursorDescriptorP20IOHardwareCursorInfo",
+		wrapVslPrepareCursor, orgVslPrepareCursor,
+	};
+	if (patcher.routeMultiple(index, &vslPrepare, 1, address, size))
+		Ndrv::vslPrepareCursorInstalled(reinterpret_cast<Ndrv::VslPrepareCursor>(orgVslPrepareCursor));
+	else
+		FBLOG("ndrv: VSLPrepareCursor route unavailable (error %d)", patcher.getError());
+	patcher.clearError();
 }
 
 void pluginStart() {
@@ -364,13 +502,18 @@ void pluginStart() {
 		return;
 	}
 	uint32_t trace = 0;
-	traceEnabled = PE_parse_boot_argn("rdna4-trace", &trace, sizeof(trace)) && trace;
+	const bool traceArg = PE_parse_boot_argn("rdna4-trace", &trace, sizeof(trace));
+	rdna4TraceLevel = traceArg ? trace : 0;
+	traceEnabled = rdna4TraceLevel != 0;
 #ifdef RDNA4FB_VM_TEST
 	// VM test builds trace by default (OpenCore images often pin boot-args).
-	if (!PE_parse_boot_argn("rdna4-trace", &trace, sizeof(trace)))
+	if (!traceArg) {
+		rdna4TraceLevel = 1;
 		traceEnabled = true;
+	}
 #endif
 	computeStage = RDNA4Compute::requestedStage();
+	Ndrv::vslInit();
 	FBLOG("Lilu plugin started (trace %s, compute stage %u)", traceEnabled ? "on" : "off",
 	      computeStage);
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
