@@ -496,6 +496,16 @@ void RDNA4Compute::n48nClose(const void *owner) {
 
 // Called with rtLock held, by the wake's cleanup before it makes the heaps anew: the VRAM and the table went with
 // the card's power. Only the system memory is still someone's.
+// The graphics ring was set up again (gfxRingAgain): what this client had on it is gone, and work of its that had not
+// finished never will. It is told so (lost, as by a timeout) at its next call.
+void RDNA4Compute::n48nRingGone() {
+	if (!n48n)
+		return;
+	if (*poolDw(static_cast<uint32_t>(n48n->fencePage)) != n48n->ringSequence)
+		n48n->client.abandon();
+	n48n->ringDwords = 0;
+}
+
 void RDNA4Compute::n48nDiscard() {
 	if (!n48n)
 		return;

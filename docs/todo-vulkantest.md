@@ -677,13 +677,61 @@ runtime: gfx: IB wait: CP_VMID_RESET 0x00000100, attempt 2: the lost work's fenc
   waves ends a hung compute shader, not a hung draw.
 - The ring was then shut as before: the triangles after it FAIL, the GPU sits at 100 % and 68 W, the compute rows
   pass. The same as before this change, for this kind of hang.
-- The Vulkan programs ran after the ring was shut and failed at their first submission, so **the Vulkan fault
-  test through the shared function has not run in this kext**. One boot with `vkprobe ... fault`, `vkprobe ... show`
-  and the script, without `trifault`, would show that.
+- The Vulkan programs ran after the ring was shut and failed at their first submission. The Vulkan fault test
+  through the shared function ran in the next boot (kext `7A646E26`, `vkfault-7.txt`, `vkprobe-11.txt`, log
+  `rdna4fb-diag-20261007-183819`): `runtime: gfx: vulkan client: CP_VMID_RESET 0x00000100, attempt 1: the lost work's
+  fence came through`, 80 us after the state line; the next `vkprobe` `done: all ok`; the table all PASS, idle 3 %.
+  **So a hung compute shader is handled through the shared function, in three boots now; a hung draw is not.**
 
 Open: what gets the ring back after a hung draw. amdgpu's reset names the queue as well and has the MES map it
 again; whether this ring, which the kext sets up by registers, can be set up again after that is the next question,
 and an experiment of its own.
+
+### Next run: the ring taken down and set up again (kext `A5F496FD`, an experiment)
+
+Written 2026-10-07. When the address-space reset does not bring the client's fence, the kext now goes on
+(`gfxRingAgain`, `src/runtime.cpp`):
+
+1. amdgpu's reset of a graphics queue: `CP_VMID_RESET` with the address space's bit **and the queue's**, then up to
+   100 ms for the queue to go inactive. Under Linux the MES maps the queue again after that.
+2. Here instead: PFP and ME halted, the ring's registers written again as at bring-up, one `WRITE_DATA` and one fence
+   through the new ring.
+
+If that packet runs, the ring is in service again and whatever any client had on it is gone (a Vulkan client with
+unfinished work is told its device is lost). If not, the ring is shut as before. **No source has the second half**,
+and the same idea failed for the compute queues; this ring is of another kind (a bare ring the kext has only ever
+set up by registers), which is the reason to try.
+
+New kext (`make`); `rdna4-run` and `vkprobe` as they are. Same boot:
+
+```
+rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
+```
+
+```bash
+sudo ./rdna4-run trifault > trifault.txt 2>&1
+```
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
+```
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+What to look for:
+
+- `trifault.txt`: after the `ok    trifault: ... did not finish` line, `PASS  tricol` if the ring came back, `FAIL ... the
+  gfx ring is not available` if it was shut.
+- Kernel log, `runtime: gfx: IB wait:` lines in order: the two `CP_VMID_RESET 0x00000100, attempt N` lines (expected
+  `did not come`, as in the last run), then `CP_VMID_RESET 0x00010100 (with the queue): CP_GFX_HQD_ACTIVE ... GRBM ...`,
+  then `the ring set up again: WRITE_DATA 0x600df00d (ok), fence signalled; ...` or `not written` / `NOT signalled`,
+  then `the graphics ring was set up again and is in service` or the old `a client gfx IB did not finish`.
+- `vkprobe.txt` ending `done: all ok` and the table all PASS, if the ring came back. If it did not: as in the last
+  run, the GPU busy until the reboot.
+
+Report the two text files and the log.
 
 ## After the tests
 
