@@ -3036,6 +3036,9 @@ void RDNA4Compute::gfxClientReset() {
  * a compute queue, the queue is left alone: amdgpu (mes_v12_0_reset_queue_mmio) sets the queue's bit too, which takes
  * the queue down for the MES to map again, and there is no MES here (docs/vm-client-rootcause.md section 20). A second
  * try in case one is not enough, as it sometimes is not on the compute queues.
+ * It does NOT help when a draw hangs (same day, rdna4-run trifault: the colour triangle with its attribute ring unmapped):
+ * GRBM_STATUS 0xaa61382c, the geometry engine and the primitive assembler busy besides the SPI, unchanged by both attempts,
+ * and the ring was given up as before. Removing the waves is not enough there; what is, is not known.
  * ponytail: every client in that address space loses its waves; with rdna4-vmshared=2, where address spaces are lent
  * per job, the caller has none to name and the ring is given up as before. */
 bool RDNA4Compute::gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why) {

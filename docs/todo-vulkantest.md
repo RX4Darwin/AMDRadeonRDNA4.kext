@@ -655,6 +655,36 @@ Expected:
 
 Report the three text files and the log.
 
+### Run 2026-10-07 (kext `EBDE3299`): a draw that hangs is not recovered
+
+`trifault.txt`, `vkfault-6.txt`, `vkprobe-13.txt`, log `rdna4fb-diag-20261007-181836`.
+
+```
+  ok    trifault: the stream with its ring block freed did not finish ((iokit/common) I/O Timeout after 0 ms)
+  FAIL  tricol: the gfx ring is not available to clients (...)
+```
+
+```
+runtime: gfx: IB wait: work in address space 8 did not finish (fence 0 of 1): hub fault 0x00000d3d at 0x0, GRBM 0xaa61382c, CP_STAT 0x80040000
+runtime: gfx: IB wait: CP_VMID_RESET 0x00000100, attempt 1: the lost work's fence did not come; GRBM 0xaa61382c, CP_STAT 0x80040000
+runtime: gfx: IB wait: CP_VMID_RESET 0x00000100, attempt 2: the lost work's fence did not come; GRBM 0xaa61382c, CP_STAT 0x80040000
+```
+
+- The test does produce a hang: the triangle with its attribute ring unmapped never finishes.
+- **The recovery does not work for it.** `GRBM_STATUS` 0xaa61382c has, besides SPI busy, the geometry engine (bits 16
+  and 21) and the primitive assembler (bit 25) busy, and neither attempt changes anything. The compute shader's hang
+  of the section above was SPI busy alone (0xa840382c) and went with the first write. So removing an address space's
+  waves ends a hung compute shader, not a hung draw.
+- The ring was then shut as before: the triangles after it FAIL, the GPU sits at 100 % and 68 W, the compute rows
+  pass. The same as before this change, for this kind of hang.
+- The Vulkan programs ran after the ring was shut and failed at their first submission, so **the Vulkan fault
+  test through the shared function has not run in this kext**. One boot with `vkprobe ... fault`, `vkprobe ... show`
+  and the script, without `trifault`, would show that.
+
+Open: what gets the ring back after a hung draw. amdgpu's reset names the queue as well and has the MES map it
+again; whether this ring, which the kext sets up by registers, can be set up again after that is the next question,
+and an experiment of its own.
+
 ## After the tests
 
 For what passes, the README's file table, `docs/vulkan-port.md` and `vulkan/README.md` get the date and what ran.

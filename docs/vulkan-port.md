@@ -376,7 +376,9 @@ system memory are the command processor's, which is how the first tries of this 
   clients, ran (two boots, kexts `E0FE5F97` and `C1C4B053`). amdgpu's own reset also names the queue, which takes it down for the
   MES to map again; that is left out, as for the compute queues (`docs/vm-client-rootcause.md` sections 19 and 20).
 
-Not done: the fault is only noticed by the ten seconds, during which the ring serves nobody; and after a failed
-copy by the command processor its next fill is silently not done. `docs/todo-vulkantest.md`, "A shader that
+Not done: the fault is only noticed by the ten seconds, during which the ring serves nobody; a draw that hangs
+(the runtime's `rdna4-run trifault`: geometry engine and primitive assembler busy besides the SPI) is not ended by
+this reset and still costs the ring; and after a failed copy by the command processor its next fill is silently
+not done. `docs/todo-vulkantest.md`, "A shader that
 faults", has the runs.
 
