@@ -41,6 +41,12 @@ dele = nv['Delete'].setdefault(GUID, [])
 if 'boot-args' not in dele:
     dele.append('boot-args')
 cfg['Misc']['Boot']['Timeout'] = timeout
+# OC_SCAN_POLICY=<int|0xHEX>: OpenCore's Misc->Security->ScanPolicy. 0x10303 = APFS+HFS volumes on SATA only (no ESP): the picker then lists only
+# the macOS volumes (no "EFI" entry for the OpenCore disk itself), so a timeout boots macOS (tools/emu-full.sh oc --run).
+import os
+if os.environ.get('OC_SCAN_POLICY'):
+    cfg['Misc']['Security']['ScanPolicy'] = int(os.environ['OC_SCAN_POLICY'], 0)
+    print('ScanPolicy:', hex(cfg['Misc']['Security']['ScanPolicy']))
 if resolution:
     cfg.setdefault('UEFI', {}).setdefault('Output', {})['Resolution'] = resolution
 

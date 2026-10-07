@@ -23,6 +23,7 @@
 #   wait "regex" [SECS]   wait for a line in the serial log
 #   con "shell cmd"  Recovery/installer Terminal: type the command so that its output goes to /dev/console (= the serial log) and wait for it to end
 #   ssh [cmd...]     run a command in the installed macOS over SSH (user/key from `provision`); no args = a login shell
+#   snap list|save N|restore N|delete N   qcow2 snapshots of the VM disk (+ its NVRAM), VM stopped: roll back an experiment in seconds
 #   provision        (from Recovery, target disk mounted) create the admin user + Remote Login + the SSH key offline: no Setup Assistant
 #   verify           the facts M0 needs, read from the installed volume (AppleParavirtGPU, version, kernel collections)
 #
@@ -40,6 +41,7 @@ PCBIOS=${PCBIOS:-$EMU/qemu-10.0.13/pc-bios}
 OSXKVM=${OSXKVM:-$EMU/OSX-KVM}
 LILU=${LILU:-$EMU/kexts/Lilu.kext}
 OC_IMG=${OC_IMG:-OpenCore-full.qcow2}
+OC_RUN_IMG=${OC_RUN_IMG:-OpenCore-full-run.qcow2}
 BASE_IMG=${BASE_IMG:-$FULL/BaseSystem.img}   # OUR copy of the Recovery disk (Kiln's VMs hold a write lock on images/BaseSystem.img)
 D_TARGET=${D_TARGET:-$FULL/macos-26.6.2.qcow2}
 D_STAGE=${D_STAGE:-$FULL/stage.qcow2}
@@ -94,12 +96,21 @@ PY
 }
 
 cmd_oc() {
-	local kexts=() args="-v keepsyms=1 debug=0x100 serial=3" timeout=0
+	# Two images: OC_IMG (the picker waits for a key: Recovery/installer, you choose the entry) and OC_RUN_IMG (oc --run: auto-boots after --timeout, default 4 s;
+	# the default entry must be Macintosh HD: `start run` does that once, see s.2 of docs/emu-full.md). `start run` uses OC_RUN_IMG when it exists.
+	local kexts=() args="-v keepsyms=1 debug=0x100 serial=3" timeout="" out=$OC_IMG
 	while [ $# -gt 0 ]; do
-		case $1 in --kext) kexts+=(--kext "$2"); shift ;; --args) args=$2; shift ;; --timeout) timeout=$2; shift ;; *) die "oc: unknown $1" ;; esac
+		case $1 in
+			--kext) kexts+=(--kext "$2"); shift ;; --args) args=$2; shift ;; --timeout) timeout=$2; shift ;;
+			--run) out=$OC_RUN_IMG ;;
+			*) die "oc: unknown $1" ;;
+		esac
 		shift
 	done
-	OSXKVM=$OSXKVM bash "$HERE/tools/vm-opencore.sh" --lilu "$LILU" --args "$args" --timeout "$timeout" "${kexts[@]}" --out "$OC_IMG"
+	[ -n "$timeout" ] || { [ "$out" = "$OC_RUN_IMG" ] && timeout=4 || timeout=0; }
+	# run image: ScanPolicy 0x10303 (APFS+HFS on SATA, no ESP) so the picker has no "EFI" entry and the timeout boots Macintosh HD
+	[ "$out" = "$OC_RUN_IMG" ] && export OC_SCAN_POLICY=${OC_SCAN_POLICY:-0x10303}
+	OSXKVM=$OSXKVM bash "$HERE/tools/vm-opencore.sh" --lilu "$LILU" --args "$args" --timeout "$timeout" "${kexts[@]}" --out "$out"
 }
 
 cmd_serve() {
@@ -142,10 +153,11 @@ cmd_start() {
 			*) die "start: mode recovery|installer|run (or DISKS=...)" ;;
 		esac
 	fi
-	local dargs=() port=0 d
+	local dargs=() port=0 d ocimg=$OC_IMG
+	[ "$mode" = run ] && [ -f "$OSXKVM/OpenCore/$OC_RUN_IMG" ] && ocimg=$OC_RUN_IMG
 	for d in ${disks//,/ }; do
 		case $d in
-			oc)     dargs+=(-drive "id=oc,if=none,snapshot=on,format=qcow2,file=$OSXKVM/OpenCore/$OC_IMG" -device "ide-hd,bus=sata.$port,drive=oc") ;;
+			oc)     dargs+=(-drive "id=oc,if=none,snapshot=on,format=qcow2,file=$OSXKVM/OpenCore/$ocimg" -device "ide-hd,bus=sata.$port,drive=oc") ;;
 			base)   dargs+=(-drive "id=base,if=none,snapshot=on,format=raw,file=$BASE_IMG" -device "ide-hd,bus=sata.$port,drive=base") ;;
 			target) dargs+=(-drive "id=target,if=none,format=qcow2,file=$D_TARGET" -device "ide-hd,bus=sata.$port,drive=target") ;;
 			stage)  dargs+=(-drive "id=stage,if=none,format=qcow2,file=$D_STAGE" -device "ide-hd,bus=sata.$port,drive=stage") ;;
@@ -263,7 +275,7 @@ cmd_con() {   # con "shell cmd" [SECS]: run in the guest Terminal (Recovery/inst
 }
 
 cmd_provision() {   # provision: in Recovery (target installed, DISKS has target), create user/Remote Login/key/skip Setup Assistant
-	local user=${SSH_USER} pass=${SSH_PASS:-dev}
+	local user=${SSH_USER} pass=${SSH_PASS:-Emu-full-2026}
 	mkdir -p "$FULL/ssh" "$FULL/serve"
 	[ -f "$SSH_KEY" ] || ssh-keygen -q -t ed25519 -N "" -C "emu-full" -f "$SSH_KEY"
 	cp "$HERE/tools/emu-full-guest.sh" "$FULL/serve/emu-full-guest.sh"
@@ -272,11 +284,22 @@ cmd_provision() {   # provision: in Recovery (target installed, DISKS has target
 
 cmd_verify() {   # verify: the facts M0 needs, read from the installed volume (Recovery, via con) or over SSH (installed macOS running)
 	if [ -f "$SSH_KEY" ] && ( cmd_ssh true ) >/dev/null 2>&1; then
-		cmd_ssh 'sw_vers; echo "--- AppleParavirtGPU"; ls -d /System/Library/Extensions/*Paravirt* 2>&1; kmutil showloaded 2>/dev/null | grep -i -E "paravirt|RDNA4" || echo "(no paravirt/RDNA4 kext loaded)"; echo "--- kernel"; uname -a; sysctl kern.bootargs machdep.cpu.brand_string kern.hv_vmm_present 2>&1; echo "--- SIP/AMFI"; csrutil status 2>&1; nvram boot-args 2>&1'
+		cmd_ssh 'sw_vers; echo "--- AppleParavirtGPU"; ls -d /System/Library/Extensions/*Paravirt* 2>&1; for kc in /System/Library/KernelCollections/*.kc; do echo "$kc: $(grep -a -c com.apple.driver.AppleParavirtGPU "$kc") matches for com.apple.driver.AppleParavirtGPU"; done; kmutil showloaded 2>/dev/null | grep -i -E "paravirt|RDNA4" || echo "(no paravirt/RDNA4 kext loaded)"; echo "--- kernel"; uname -a; sysctl kern.bootargs machdep.cpu.brand_string kern.hv_vmm_present 2>&1; echo "--- SIP/AMFI"; csrutil status 2>&1; nvram boot-args 2>&1'
 	else
 		cp "$HERE/tools/emu-full-guest.sh" "$FULL/serve/emu-full-guest.sh"
 		cmd_con "curl -so /tmp/g.sh http://10.0.2.2:$HTTP_PORT/emu-full-guest.sh && bash /tmp/g.sh verify" "${1:-120}"
 	fi
+}
+
+cmd_snap() {   # snap list | save NAME | restore NAME | delete NAME: qcow2 internal snapshots of the VM disk (VM must be stopped)
+	vm_pid >/dev/null && die "snap: stop the VM first (emu-full.sh stop)"
+	case ${1:-list} in
+		list) qemu-img snapshot -l "$D_TARGET" ;;
+		save) [ -n "${2:-}" ] || die "snap save NAME"; qemu-img snapshot -c "$2" "$D_TARGET" && cp "$VARS" "$VARS.$2" && echo "snap: saved '$2' (disk + NVRAM copy $VARS.$2)" ;;
+		restore) [ -n "${2:-}" ] || die "snap restore NAME"; qemu-img snapshot -a "$2" "$D_TARGET" && { [ -f "$VARS.$2" ] && cp "$VARS.$2" "$VARS"; echo "snap: restored '$2'"; } ;;
+		delete) [ -n "${2:-}" ] || die "snap delete NAME"; qemu-img snapshot -d "$2" "$D_TARGET" && rm -f "$VARS.$2" && echo "snap: deleted '$2'" ;;
+		*) die "snap list|save NAME|restore NAME|delete NAME" ;;
+	esac
 }
 
 cmd_ssh() {
@@ -301,6 +324,7 @@ case $c in
 	con) cmd_con "$@" ;;
 	ssh) cmd_ssh "$@" ;;
 	provision) cmd_provision "$@" ;;
+	snap) cmd_snap "$@" ;;
 	verify) cmd_verify "$@" ;;
 	-h|--help|help) sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//' ;;
 	*) die "unknown command $c (try: help)" ;;

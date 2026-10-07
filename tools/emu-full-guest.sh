@@ -38,8 +38,11 @@ provision() {
 	dscl -f "$ds" localhost -create "$u" NFSHomeDirectory "/Users/$user"
 	dscl -f "$ds" localhost -create "$u" GeneratedUID "$(uuidgen)"
 	dscl -f "$ds" localhost -passwd "$u" "$pass" || echo "emu-full-guest: warning: dscl -passwd failed (login by key still works only if the record has a hash)"
-	dscl -f "$ds" localhost -append /Local/Default/Groups/admin GroupMembership "$user" 2>/dev/null || true
-	dscl -f "$ds" localhost -append /Local/Default/Groups/admin GroupMembers "$(dscl -f "$ds" localhost -read "$u" GeneratedUID | awk '{print $2}')" 2>/dev/null || true
+	dscl -f "$ds" localhost -delete /Local/Default/Groups/admin GroupMembership "$user" 2>/dev/null || true   # delete + merge: idempotent
+	dscl -f "$ds" localhost -merge /Local/Default/Groups/admin GroupMembership "$user" 2>/dev/null || true
+	local guid; guid=$(dscl -f "$ds" localhost -read "$u" GeneratedUID | awk '{print $2}')
+	dscl -f "$ds" localhost -delete /Local/Default/Groups/admin GroupMembers "$guid" 2>/dev/null || true
+	dscl -f "$ds" localhost -merge /Local/Default/Groups/admin GroupMembers "$guid" 2>/dev/null || true
 
 	# the home and the key
 	mkdir -p "$DATA/Users/$user/.ssh"
@@ -56,7 +59,7 @@ provision() {
 	local dis="$DATA/private/var/db/com.apple.xpc.launchd/disabled.plist"
 	mkdir -p "$(dirname "$dis")"
 	[ -f "$dis" ] || plutil -create xml1 "$dis" 2>/dev/null || printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict/></plist>\n' > "$dis"
-	plutil -replace com.openssh.sshd -bool false "$dis" 2>&1 || defaults write "${dis%.plist}" com.openssh.sshd -bool false
+	defaults write "${dis%.plist}" com.openssh.sshd -bool false   # (plutil -replace says "Key path not found" on this file; defaults works)
 	chown 0:0 "$dis"; chmod 644 "$dis"
 	sync
 	echo "provision: done: user $user (uid $uid, admin), Setup Assistant skipped, sshd enabled, key installed"
@@ -71,6 +74,7 @@ verify() {
 	find "$SYS/System/Library/Extensions" "$SYS/System/Library/DriverExtensions" -maxdepth 4 -iname '*Paravirt*' 2>/dev/null | head
 	echo "--- kernel collections"
 	ls -la "$SYS/System/Library/KernelCollections" 2>/dev/null
+	for kc in "$SYS"/System/Library/KernelCollections/*.kc; do echo "$kc: $(grep -a -c com.apple.driver.AppleParavirtGPU "$kc") matches for com.apple.driver.AppleParavirtGPU (its code is in the collection; the bundle in Extensions has Info.plist only)"; done
 	ls -la "$DATA/private/var/db/KernelExtensionManagement" 2>/dev/null | head
 	ls -d "$SYS"/System/Volumes/Preboot/*/boot/*/System/Library/Caches/com.apple.kernelcaches 2>/dev/null
 	ls -d /Volumes/*Preboot*/*/boot/*/System/Library/Caches/com.apple.kernelcaches 2>/dev/null
