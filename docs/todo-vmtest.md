@@ -1,8 +1,8 @@
 # Card tests for the runtime's client address spaces
 
 Written 2026-10-06 on `devel/address-space`. **First run on the card 2026-10-07** (below): clients now work in
-their own address spaces, and the two tests that fault on purpose hang their job. A first fix did not change that
-(second run); a second one is built and not run: the next run is the same boot again. Background: `docs/vm-client-rootcause.md` sections 11 and 12 and
+their own address spaces, and the two tests that fault on purpose hang their job. Two fixes did not change that
+(second and third run); a third is built and not run: the next run is the same boot again. Background: `docs/vm-client-rootcause.md` sections 11 and 12 and
 `docs/metal-readiness.md` section 4.
 
 ## First run, 2026-10-07
@@ -26,11 +26,16 @@ Kext `6F7D19C7`, the same arguments, log `rdna4fb-diag-20261007-131756`. The fau
 has it (`GCVM_L2_CNTL 0x00080601 -> 0x00080e01`), everything that passed before passes again, and **the two fault
 tests hang exactly as before**. So that was not it.
 
-## Next run: boot C again, with faults answered in the page table
+## Third run, 2026-10-07
 
-What Linux does when a shader touches an unmapped page is write a page-table entry for that address pointing at its
-dummy page; the card keeps retrying the access until then (`docs/vm-client-rootcause.md` section 13). The new kext
-does the same while it waits for a client's job. Same arguments:
+Kext `8CAB1DCC`, log `rdna4fb-diag-20261007-132834`. The kext saw each fault within 6 ms and mapped the dummy page
+at the address (`a shader touched 0x100030000, which is not mapped ...`), and the job still never finished: nothing
+tried the access again. As the address space was set up (the way Linux sets it up on this card), a fault is final.
+
+## Next run: boot C again, with faults made retryable
+
+The new kext sets one more bit in each client's address-space register, so that a faulting access waits for the page
+instead of ending the job (`docs/vm-client-rootcause.md` section 14). `rdna4-vmretry=0` turns it back. Same arguments:
 
 ```
 rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-hang=1 rdna4-trace=1
@@ -44,14 +49,12 @@ What to look for:
 
 - in the script's own test output: `ok    VM isolation: client B could not read client A's VA` and `ok    dispatch
   through freed host VA faulted cleanly`
-- in the kernel log: `runtime: vmid 9: a shader touched 0x100030000, which is not mapped (fault status 0x0090113d): the
-  dummy page answers there until the job is over`, then `runtime: vmid 9: 1 unmapped page(s) were answered from the
-  dummy page during the job`; the same for address space 8 with up to 64 pages
-- no `recovering shared queue` line
+- in the kernel log: `a shader touched 0x..., which is not mapped ...` and then `N unmapped page(s) were answered from the
+  dummy page during the job` with N up to 64 for address space 8, and no `the kernel's fence never came`
 - the rows `vm`, `runtime`, `submitib`, `fault` PASS, and `gfx-app-tri` with a result of its own
+- that what passed before still passes: `vmshared: boot test ... PASS`, `gfx-client PASS`, idle at a few percent
 
-If the two tests still hang, the log says whether the kext saw the fault and mapped the page (the `a shader touched`
-line) or never got that far.
+If the two tests still hang, faults cannot be survived this way, and the open work is recovering a queue after one.
 
 What changed: with `rdna4-vm=1` a client of the compute runtime (`RDNA4ComputeClient`, `rdna4-run`) gets its own
 GPU address space. Until now each such client also got a compute queue of its own inside that address space, and

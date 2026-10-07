@@ -781,8 +781,19 @@ bool RDNA4Compute::vmContextInit(RtClient &c) {
 	// W42 (Linux ground truth): GCVM_CONTEXT1..15_CNTL read 0x03fffc07 under amdgpu: the fault-enable defaults are bits 10..25 (16 bits;
 	// the header names only 10..23, bits 24-25 are reset defaults Linux keeps through its read-modify-write). Ours wrote 0x00fffc07.
 	const uint32_t faultDefaults = ((1u << 16) - 1) << 10;
-	const uint32_t cntl = kVmCtxEnable | (GpuVm::kDepth << 1) |
+	uint32_t cntl = kVmCtxEnable | (GpuVm::kDepth << 1) |
 		((GpuVm::kBlockSize - 9) << 4) | faultDefaults;
+	// RETRY_PERMISSION_OR_INVALID_PAGE_FAULT (bit 7). amdgpu leaves it 0 on this card, and so did this: a fault is
+	// then final. On the card the faulting job was dead from that moment: with the dummy page mapped at the address
+	// 6 ms later, nothing tried the access again and nothing else faulted (2026-10-07, third run,
+	// docs/vm-client-rootcause.md section 14). Linux gets out of that with a queue reset through the firmware
+	// scheduler, which is not here. With the bit set the access is tried again until the page is there, which is
+	// what vmRedirectFault needs to be of any use. Only for the runtime's own clients (rdna4-vm); rdna4-vmretry=0
+	// gives the old value.
+	uint32_t retry = 1;
+	(void)PE_parse_boot_argn("rdna4-vmretry", &retry, sizeof(retry));
+	if (vmEnabled && retry)
+		cntl |= 1u << 7;
 	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + n }, cntl);
 	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtBaseLo.dword + 2 * n },
 	   static_cast<uint32_t>(GpuVm::encodePde(c.rootPhys, GpuVm::kValid, 0)));

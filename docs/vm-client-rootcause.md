@@ -313,3 +313,38 @@ table), and the Vulkan interface's clients do not have it yet.
 Not looked at further: why the recovery of a queue whose wave is stuck does not bring the queue back. If H12 holds the
 tests no longer need it; a shader that loops for ever still would.
 
+## 14. 2026-10-07, third run: the redirect runs and the job is still dead
+
+Log `rdna4fb-diag-20261007-132834`, kext `8CAB1DCC`, the same boot-args. [M]:
+
+| t (s) | Event |
+|---|---|
+| 110.376 | isolation test: `copy` loaded for the client in address space 9 |
+| 110.382 | `vmid 9: a shader touched 0x100030000, which is not mapped (fault status 0x0090113d): the dummy page answers there` (5.6 ms after the load: the redirect works as written) |
+| 110.38 - 112.38 | nothing: no further fault, no fence |
+| 112.379 | `1 unmapped page(s) were answered from the dummy page`; `the kernel's fence never came`; fault status 0 |
+| 112.72 | freed-buffer test, address space 8: one page redirected (0x100110000) of the 64 the kernel writes; then the same silence for a second |
+
+So after the page is there, **nothing tries the access again, and no other wave of the job faults either**, although 63
+more unmapped pages lay in the freed buffer. The job is not retrying: it is dead from the first fault. H12 as stated is
+refuted for this configuration.
+
+That fits what the context register asks for. `vmContextInit` writes `GCVM_CONTEXTn_CNTL` as amdgpu has it on this card
+(0x03fffc07): `RETRY_PERMISSION_OR_INVALID_PAGE_FAULT` (bit 7) is 0, amdgpu's "Send no-retry XNACK on fault to suppress
+VM fault storm". A fault is then final. `amdgpu_vm_handle_fault` only ever sees faults the card reports as **retry**
+faults; the ones Linux prints are the final kind, and what follows them on Linux is a ring timeout and a queue reset
+through MES. This kext has neither MES nor a recovery that brings the queue back after such a fault (section 12).
+
+Two ways out, and they are different work:
+
+1. **Make the fault retryable** (bit 7 = 1) for the runtime's clients, so that the access waits for the page and
+   `vmRedirectFault` has something to answer. This is the model amdgpu uses where it does not set no-retry. **Done as an
+   experiment**: `vmContextInit` sets the bit when `rdna4-vm` is on; `rdna4-vmretry=0` gives the old value. Not for the
+   Vulkan interface's address space. Compile-checked.
+2. **Recover the queue after a final fault.** Needed anyway for a shader that never ends, and not understood: the
+   dequeue with RESET_WAVES succeeds, the queue is initialised again, and the first packet on it does not run
+   (`CPC_BUSY 0x00000810` / `0x00000481`, `GRBM2 0x34110000` / `0x30110000` at that point).
+
+**H13**: with bit 7 set, the faulting access is tried again after the redirect and both tests pass. If the job is dead
+all the same, way 2 is what is left.
+
