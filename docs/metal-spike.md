@@ -375,6 +375,38 @@ MetalCyan is a **strong existence proof that Apple's own AMD Metal stack (kernel
 
 **E1c: give the loader something to load.** Build with osxcross a minimal bundle `RDNA4CensusMTLDriver.bundle` whose principal class is `RDNA4CensusMtlDevice : MTLIOAccelDevice` (superclass resolved from `Metal.framework` at load time) and whose every method logs to the serial console before failing, then put it where Recovery can reach it (the FAT share, or `/Library/GPUBundles` if Recovery's root accepts the write; try both and see which the loader opens). Measures: the search path, the read of `MetalPluginClassName`, whether the subclass check passes, and the first calls into the class (`initWithAcceleratorPort:` arguments, `lazyInitialize`), then, with `rdna4-accelcensus=2`, the first user-client types/selectors Apple's generic code opens against the impostor. Effort [INFER] 1-2 days build plus one 2-minute run per variant; risk: a bundle that loads but misbehaves inside WindowServer (Recovery only, emulator only).
 
+## 12. E1c result: a loadable stub `MTLIOAccelDevice` bundle in the emulated Recovery (hub-task-427, runs by Kiln: `...-191354-boot1-e1c1` level 1, `...-191556-boot1-e1c2` level 2)
+
+**What ran.** `build/RDNA4CensusMTLDriver.bundle` (`tools/accelcensus/stub`, osxcross-built, **unsigned**): principal class `RDNA4CensusMtlDevice : MTLIOAccelDevice`, 762 inherited selectors re-routed through `forwardInvocation:` so every call is logged (arguments, result) and then forwarded to Apple's implementation; `libpathlog.dylib` (`DYLD_INSERT_LIBRARIES`) logging file lookups including the failed ones; the census kext at `rdna4-accelcensus=1` and `=2` (e4975d4 lineage, ce583c4 build). The guest copied the bundle into five candidate directories and ran `rdna4-census` (a plain tool, not a platform binary). Evidence in git: `docs/e1-census/e1c-level{1,2}-{place,tool,kernel}`, `e1c-loader-backtrace.txt`.
+
+### 12.1 Measured
+
+1. **Where Metal looks for the bundle: `/Library/GPUBundles/<MetalPluginName>.bundle` first, then `/System/Library/Extensions/<MetalPluginName>.bundle`; nowhere else.** With copies in `/Library/GPUBundles`, `/Library/Extensions`, `/Library/Apple/System/Library/Extensions` and `/tmp/GPUBundles` the first lookup is `stat /Library/GPUBundles/RDNA4CensusMTLDriver.bundle` (found, loaded). After deleting that copy the next process stats `/Library/GPUBundles/...` (ENOENT) and `/System/Library/Extensions/...` (ENOENT) and stops: the three other copies are never looked at. This closes the unknown of 9.5 (the name-to-path helper). In the emulated Recovery `/System/Library/Extensions` rejects writes (sealed root) and `/Library/GPUBundles` accepts them: on a real install `/Library/GPUBundles` is a user-writable data-volume path (SIP/AMFI/library-validation consequences for a platform process such as WindowServer: **not measured**, the test process is not hardened).
+2. **The loader contract, as seen from the bundle.** Loaded by `-[NSBundle classNamed:]` -> `loadAndReturnError:` -> `dlopen` (backtrace: `classNamed:` <- `-[NSBundle loadAndReturnError:]` <- `_CFBundleLoadExecutableAndReturnError` <- `_CFBundleDlfcnLoadBundle` <- `dlopen`); the bundle's `+load` and constructor run inside that `dlopen`. The kernel log shows the order of property reads: `MetalPluginName`, then `MetalPluginClassName` (only now that a bundle exists), then `IOGeneralInterest`, `SafeEjectRequested`. An unsigned bundle with an unresolved-at-link superclass (flat lookup of `_OBJC_CLASS_$_MTLIOAccelDevice`) loads and subclasses fine.
+3. **What Metal calls on the principal class, in order (level 2):** `-initWithAcceleratorPort:` (argument `0x2003`, the mach port of the opened accelerator) then, still inside Apple's base implementation, `updateGPUSelectionProperties`, `isRemovable` (0), `isSlotted` (0), `isBuiltIn` (1), `getBuiltInGPUProperties:transferRate:`, `isLowPower` (0), `supportLazyInitialization` (0), `lazyInitialize`; the process then dies with **SIGSEGV inside `lazyInitialize`** (the census kernel zero-fills every reply). Level 1 (every call refused): `initWithAcceleratorPort:` returns **nil** and Metal reports 0 devices.
+4. **The first user-client calls of the generic `MTLIOAccelDevice` init (the kernel side of what B would have to implement, and what `AppleParavirtAccelerator` answers in B'):**
+
+| order | user-client type | selector | input | output |
+|---|---|---|---|---|
+| 1 | open type 5 | | | |
+| 2 | 5 | 9 | struct 16 bytes: `"Metal"` + zeros (a client name) | none |
+| 3 | 5 | 2 | none | **struct 600 bytes** |
+| 4 | 5 | 0 | none | struct 64 bytes |
+| 5 | 5 | 7 | none | struct 24 bytes |
+| | | | (property read `AAPL,slot-name`) | |
+| 6 | open type 6 | | | |
+| 7 | 6 | 9 | none | struct 16 bytes |
+| 8 | 6 | 10 | none | struct 24 bytes |
+
+Types 5 and 6 are the `IOAccelDevice2`/`IOAccelShared2`-style connections of the IOAccelerator C API [INFER from the selector tables of section 9.4, not matched byte for byte]. The 600-byte reply of selector 2 is the device/accelerator description the base class builds the `MTLDevice` from; its layout is the next thing to measure (it is the zeroed reply that makes `lazyInitialize` crash) [INFER].
+
+### 12.2 What it means
+
+- **The E1c questions are answered.** Path: `/Library/GPUBundles` then `/System/Library/Extensions`. Class resolution: `MetalPluginClassName` via `classNamed:` (principal class would be the fallback, 9.5). First user-client types and selectors: table above. A wrong or crashing bundle takes only the calling process down (the child died, the census tool and the rest of Recovery went on).
+- **Route B (own bundle + kernel accelerator):** now has an executable skeleton for the user-space half (the stub loads, subclasses, and sees every call) and a measured list of what the kernel half must answer first (selectors 9, 2, 0, 7 of type 5; 9, 10 of type 6). The 600/64/24/16-byte replies are unknown layouts; they can be recovered by disassembling `IOAccelerator.framework`'s `IOAccelDeviceCreate`/`IOAccelSharedCreate` in the dyld cache (Recovery's cache is on disk) or, for B', read directly from `AppleParavirtAccelerator`'s handlers (`docs/m1-stream.md`).
+- **Route B':** unaffected, but the same generic init is what Apple's `AppleParavirtDevice` runs on top of the paravirt kernel driver: the replies it needs are the kernel driver's job, which M0 is about.
+- **Next, if wanted:** answer the type-5/type-6 selectors with plausible data at level 3 of the census kext and see how far `lazyInitialize` and the device properties go (still no GPU).
+
 ## Appendix A. How the [MEASURED] items were obtained
 
 ```sh
