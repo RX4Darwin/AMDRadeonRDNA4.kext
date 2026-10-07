@@ -5,8 +5,8 @@
 //  Drives the RADV Darwin build directly through its ICD entry point (no Vulkan loader needed): instance, the
 //  one device, a buffer with memory, two fills of it by the GPU and a triangle drawn into an image and copied back,
 //  each submitted, waited for and checked. With "show [seconds]" after the library's path it then puts a moving
-//  triangle on the boot display for that long (5 s) and gives the desktop back. With "fault" it instead makes a
-//  compute shader write to memory that is not there, and says how the driver reported it.
+//  triangle on the boot display for that long (5 s) and gives the desktop back. With "fault" it instead fills
+//  and copies through memory that is not there, and says what became of that work.
 //
 //    make mesa        (the driver and this program, into build/), or by hand:
 //    clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -I <work>/mesa/include vulkan/vkprobe.c -o vkprobe
@@ -119,33 +119,53 @@ int main(int argc, char **argv) {
 	printf("the bytes between the two fills: %s\n", untouched ? "untouched, ok" : "CHANGED");
 	wrong += !untouched;
 
-	/* "fault": a shader that faults. The compute-shader fill again, into a second buffer whose memory is freed
-	 * between recording and submitting, so that the shader writes to addresses nothing is mapped at. Not valid
-	 * Vulkan, on purpose: it is what a wrong program does. The kext should end the work at once and say so (RADV
-	 * then reports the device lost), and keep its graphics queue for the next program: run vkprobe again after
-	 * this to see that. Ends here; the process's exit closes the connection. */
+	/* "fault": work that touches memory which is not there. A fill into, then a copy out of, a second buffer whose
+	 * memory is freed between recording and submitting. Not valid Vulkan, on purpose: it is what a wrong program
+	 * does. On the card (2026-10-07) such work is not stopped: the card sends the access to a spare page and the
+	 * work finishes, as under Linux, where the fault is only logged. So both are expected to finish, and what the
+	 * copy brings back says where the accesses went (the fill's own value: the same spare page). Ends here. */
 	if (argc > 2 && !strcmp(argv[2], "fault")) {
-		VkBuffer fbuf; OK(vkCreateBuffer(dev, &bci, 0, &fbuf));
-		VkDeviceMemory fmem; OK(vkAllocateMemory(dev, &mai, 0, &fmem));
-		OK(vkBindBufferMemory(dev, fbuf, fmem, 0));
+		D(vkCmdCopyBuffer)
+		VkBufferCreateInfo gci = bci;
+		gci.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+		VkBuffer gone; OK(vkCreateBuffer(dev, &gci, 0, &gone));
+		VkDeviceMemory gmem; OK(vkAllocateMemory(dev, &mai, 0, &gmem));
+		OK(vkBindBufferMemory(dev, gone, gmem, 0));
+		VkCommandBufferAllocateInfo gai = cai;
+		gai.commandBufferCount = 2;
+		VkCommandBuffer gcb[2]; OK(vkAllocateCommandBuffers(dev, &gai, gcb));
 		VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-		OK(vkBeginCommandBuffer(cb[2], &bi));
-		vkCmdFillBuffer(cb[2], fbuf, 4096, (1 << 16) - 4096, 0xdeadbeef);
-		OK(vkEndCommandBuffer(cb[2]));
-		vkFreeMemory(dev, fmem, 0);
-		VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &cb[2] };
-		struct timespec t0, t1;
-		clock_gettime(CLOCK_MONOTONIC, &t0);
-		const VkResult submitted = vkQueueSubmit(q, 1, &si, fence);
-		const VkResult waited = submitted < 0 ? submitted : vkWaitForFences(dev, 1, &fence, VK_TRUE, 15000000000ull);
-		clock_gettime(CLOCK_MONOTONIC, &t1);
-		const double seconds = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
-		const int lost = submitted == VK_ERROR_DEVICE_LOST || waited == VK_ERROR_DEVICE_LOST;
-		printf("fault: submit -> %d, wait -> %d after %.3f s: %s\n", submitted, waited, seconds,
-		       lost ? (seconds < 1 ? "the device is reported lost at once: ok" : "the device is reported lost, but late")
-		            : waited == VK_SUCCESS ? "THE WORK FINISHED (no fault was produced?)" : "NOT REPORTED LOST");
+		const VkBufferCopy region = { 4096, 4096, (1 << 16) - 4096 };
+		OK(vkBeginCommandBuffer(gcb[0], &bi));
+		vkCmdFillBuffer(gcb[0], gone, region.srcOffset, region.size, 0xdeadbeef);
+		OK(vkEndCommandBuffer(gcb[0]));
+		OK(vkBeginCommandBuffer(gcb[1], &bi));
+		vkCmdCopyBuffer(gcb[1], gone, buf, 1, &region);
+		OK(vkEndCommandBuffer(gcb[1]));
+		vkFreeMemory(dev, gmem, 0);
+		static const char *const what[2] = { "a fill into", "a copy out of" };
+		int finished = 0;
+		for (int i = 0; i < 2; i++) {
+			VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &gcb[i] };
+			struct timespec t0, t1;
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			const VkResult submitted = vkQueueSubmit(q, 1, &si, fence);
+			const VkResult waited = submitted < 0 ? submitted : vkWaitForFences(dev, 1, &fence, VK_TRUE, 15000000000ull);
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+			printf("fault: %s memory that is gone: submit -> %d, wait -> %d after %.3f s: %s\n", what[i], submitted, waited,
+			       (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9,
+			       waited == VK_SUCCESS ? "the work finished" : waited == VK_ERROR_DEVICE_LOST ? "THE DEVICE IS LOST" : "NOT FINISHED");
+			if (waited != VK_SUCCESS)
+				break;
+			finished++;
+			vkResetFences(dev, 1, &fence);
+		}
+		const uint32_t *d = (const uint32_t *)((const char *)p + 4096);
+		printf("fault: the copy brought back 0x%08x ... 0x%08x (the fill wrote 0xdeadbeef; the buffer held 0x0badf00d)\n", d[0],
+		       d[region.size / 4 - 1]);
+		printf("fault: %s\n", finished == 2 ? "neither stopped the device: ok" : "FAILED");
 		fflush(stdout);
-		_Exit(lost && seconds < 1 ? 0 : 1);
+		_Exit(finished == 2 ? 0 : 1);
 	}
 
 	/* A picture: a red triangle over the upper-left half of a 64x64 image cleared to blue, drawn with two

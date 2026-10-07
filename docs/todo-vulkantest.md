@@ -504,20 +504,35 @@ at the same time.
 
 ## A shader that faults
 
-Written 2026-10-07. Until now a Vulkan program whose shader touched an address nothing is mapped at hung the
-graphics ring: ten seconds later its work counted as lost and the ring was shut for everybody until the next boot.
-Two changes, the second an **experiment**:
+Written 2026-10-07 on the assumption that a Vulkan program whose shader touches an address nothing is mapped at
+hangs the graphics ring until its work counts as lost after ten seconds. **The first run says that assumption was
+wrong.**
 
-- The fault is looked for while the work is waited for (the hub's entry naming the client's address space). The
-  client's work is then lost at once, and RADV reports the device lost. Host-tested.
-- Before the ring is shut, the kext tries to get it back, leaving the queue alone as the compute recovery does:
-  twice `CP_VMID_RESET` with the address space's bit and no queue, then `SPI_COMPUTE_QUEUE_RESET` with the graphics
-  engine selected, each followed by 200 ms for the lost work's own fence. Nothing of this is a sequence read
-  anywhere; amdgpu's own takes the queue down and has the MES map it again. If no step brings the fence, the ring
-  is shut as before.
+### First run 2026-10-07 (kext `68A68C07`): no hang at all
 
-New kext (`make`) and the new `build/vkprobe` (it has a `fault` mode: a compute-shader fill into a buffer whose memory
-it frees before submitting). Same library. Boot as for the last tests:
+`vkfault.txt`, `vkprobe-8.txt`, log `rdna4fb-diag-20261007-162610`. `vkprobe <lib> fault` made a compute shader fill a
+buffer whose memory had been freed and unmapped (the host run with call tracing shows the unmap and the free before
+the submission), and:
+
+```
+fault: submit -> 0, wait -> 0 after 0.001 s: THE WORK FINISHED (no fault was produced?)
+```
+
+The work finished in a millisecond, the next `vkprobe` passed, and no `vulkan:` line about lost work is in the log. So
+on the graphics ring a shader's access to an unmapped address does not stop the work. That is how it is under Linux
+too, where such a fault is logged and the program carries on with a spare page. It is **not** how the runtime's
+compute queues behave on this card, where the same kind of access hangs the waves (`docs/vm-client-rootcause.md`
+sections 13 to 19); why the two differ is not known.
+
+Nothing of that kext's new code ran. It made a fault end the client's work at once, which would have been wrong
+here (work that finishes by itself would have been reported lost), and it tried three register sequences to get a
+hung ring back, which could not be tested without a hang. **Both are taken out again** (kext `D0AEF75D`). What stays:
+when work really makes no progress for ten seconds, the ring's state goes into the log before the ring is shut.
+
+### Next run: where the accesses go
+
+`vkprobe`'s `fault` mode now does two things through the freed buffer, a fill into it and a copy out of it into a
+good one, and prints what the copy brought back. New kext and new `build/vkprobe`; same boot:
 
 ```
 rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
@@ -531,25 +546,13 @@ sudo ./vkprobe ./libvulkan_radeon.dylib fault > vkfault.txt 2>&1
 sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
 ```
 
-```bash
-sudo bash diagnostic-log.sh
-```
+Expected in `vkfault.txt`: both `the work finished`, then `the copy brought back 0xdeadbeef ... 0xdeadbeef` if writes
+and reads both go to the hub's spare page (the fill's value, read back through an address that is not mapped), and
+`neither stopped the device: ok`. Any other value is worth knowing too. Then `vkprobe.txt` ends `done: all ok`. The
+diagnostic script is not needed unless one of the two does not behave so.
 
-Report the two text files and the log, and whether anything on screen looked wrong.
-
-What to look for:
-
-- `vkfault.txt`, last line: `fault: submit -> 0, wait -> -4 after 0.0NN s: the device is reported lost at once: ok`.
-  `THE WORK FINISHED` would mean the test did not produce a fault; `but late` or `NOT REPORTED LOST`, that the fault
-  was not seen.
-- Kernel log, `vulkan:` lines: `work lost in address space 8 (...)` with the state, then `step N: ...: the fence came
-  through` or `did not come`, then either `the graphics ring is back and stays in service` or the old `a client gfx
-  IB did not finish` message.
-- If the ring is back: the second `vkprobe` ends `done: all ok` with its moving triangle, and the script's table is
-  all PASS.
-- If it is not: the second `vkprobe` fails at its first submission, `gfx-app-tri` and `gfx-app-tricol` FAIL, the
-  compute rows still pass, and the GPU may stay busy (fans) until the reboot. The display is not affected. That
-  outcome is as before this change, and the step lines say what each attempt did.
+If the copy does bring back the fill's value, one program can leave data in the spare page for the next one that
+faults to read. The runtime scrubs that page after a fault (`scrubFaultPage`); the Vulkan interface does not yet.
 
 ## After the tests
 

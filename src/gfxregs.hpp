@@ -361,8 +361,6 @@ constexpr Reg CpHqdPqWptrLo       { 0, 0x1fdf };
 constexpr Reg CpHqdPqWptrHi       { 0, 0x1fe0 };
 constexpr Reg ScratchReg0         { 1, 0x2040 };   // UCONFIG: absolute dword 0xa000 + 0x2040
 constexpr Reg SpiComputeQueueReset { 0, 0x1f73 };  // SPI_COMPUTE_QUEUE_RESET (gc_12_0_0_offset.h): 1 ends the selected queue's waves
-constexpr Reg CpVmidReset         { 0, 0x1e53 };   // RESET_REQUEST [15:0] one bit an address space, PIPE0_QUEUES [23:16], PIPE1_QUEUES [31:24]
-constexpr Reg GrbmGfxIndex        { 1, 0x2200 };   // SE_BROADCAST_WRITES [31]
 constexpr Reg SqCmd               { 0, 0x111b };   // gfx12 SQ_CMD: kill waves selected by VMID
 
 // CP_MEC_RS64_CNTL
