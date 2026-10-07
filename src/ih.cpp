@@ -59,6 +59,7 @@ static bool fenceReached(uint32_t current, uint32_t wanted) {
 constexpr uint8_t kIhClientGfx              = 0x0a;
 constexpr uint8_t kIhClientCp               = 0x14; // SOC21_IH_CLIENTID_GRBM_CP
 constexpr uint8_t kIhClientUtcl2            = 0x1b;
+constexpr uint8_t kIhSrcGfxVmFault          = 0;    // UTCL2_1_0__SRCID__FAULT, registered on client GFX for GC 12.0 (gmc_v12_0.c:895)
 constexpr uint8_t kIhClientDcn              = 0x04;
 constexpr uint8_t kIhSrcSdmaTrap            = 49;
 constexpr uint8_t kIhSrcCpEop               = 181;
@@ -812,16 +813,23 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 		}
 		return;
 	}
-	/* The GC hub VM-fault interrupt (gmc_v12_0_process_interrupt): address =
-	 * src_data[0] << 12 | (src_data[1] & 0xf) << 44, WRITE/RETRY in src_data[1]. */
-	static uint32_t faultIvLogs;
-	if (entry.clientId == 10 && entry.srcId == 0 && faultIvLogs < 4) {
-		faultIvLogs++;
-		HLOG("VM fault IV: vmid %u vmid_src %d pasid %u ring %u src_data 0x%08x 0x%08x 0x%08x 0x%08x, "
-		     "VA 0x%llx", entry.vmid, entry.vmidSrc, entry.pasid, entry.ringId, entry.srcData[0],
-		     entry.srcData[1], entry.srcData[2], entry.srcData[3],
-		     (static_cast<unsigned long long>(entry.srcData[0]) << 12) |
-		     ((static_cast<unsigned long long>(entry.srcData[1]) & 0xf) << 44));
+	/* The GC hub's VM page fault: client SOC21_IH_CLIENTID_GFX (0x0a), source UTCL2_1_0__SRCID__FAULT (0). amdgpu registers exactly this pair for
+	 * GC 12.0 (gmc_v12_0.c:895-897) and decodes it in gmc_v12_0_process_interrupt: address = src_data[0] << 12 | (src_data[1] & 0xf) << 44, the
+	 * access in src_data[1] (amdgpu_gmc.h: EXECUTE 0x10, WRITE 0x20, READ 0x40, RETRY 0x80). The card delivers it too (round-5 log, src_data
+	 * 0x00100001 0x00000050). Named here so it is not counted as an unknown source; the fault status register is read by the submit paths, not here. */
+	if (entry.clientId == kIhClientGfx && entry.srcId == kIhSrcGfxVmFault) {
+		ihFaultCount++;
+		if (ihFaultCount == 1 || ihFaultCount == 4 || (ihFaultCount & 0x3f) == 0) {
+			const uint32_t access = entry.srcData[1] & 0xf0;
+			HLOG("GC VM page fault (client GFX, UTCL2_1_0__SRCID__FAULT): VMID %u, PASID %u, %s%s%s%s at VA 0x%llx "
+			     "(src_data 0x%08x 0x%08x 0x%08x 0x%08x, %u so far)", entry.vmid, entry.pasid,
+			     (access & 0x40) ? "read " : "", (access & 0x20) ? "write " : "", (access & 0x10) ? "execute " : "",
+			     (access & 0x80) ? "(retry) " : "",
+			     (static_cast<unsigned long long>(entry.srcData[0]) << 12) |
+			     ((static_cast<unsigned long long>(entry.srcData[1]) & 0xf) << 44),
+			     entry.srcData[0], entry.srcData[1], entry.srcData[2], entry.srcData[3], ihFaultCount);
+		}
+		return;
 	}
 	ihUnknown(entry.clientId, entry.srcId, entry.ringId);
 }
@@ -904,6 +912,10 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 			done = fenceReached(*fence, value);
 			if (done || mach_absolute_time() > deadline)
 				break;
+			if (dispatch && !bringupRunning && sleepAbortWanted()) {      // P7: client compute waits end when a sleep is requested (DMA waits are short and never abort)
+				waitAborted = true;
+				break;
+			}
 			if (polls < 200)
 				IODelay(10);
 			else
@@ -918,6 +930,10 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 			done = fenceReached(*fence, value);
 			if (done || mach_absolute_time() > deadline)
 				break;
+			if (dispatch && !bringupRunning && sleepAbortWanted()) {      // P7
+				waitAborted = true;
+				break;
+			}
 			uint64_t sleepSpan = 0;
 			nanoseconds_to_absolutetime(2000000, &sleepSpan);
 			IOLockSleepDeadline(ihLock, ihWaitEvent, mach_absolute_time() + sleepSpan,

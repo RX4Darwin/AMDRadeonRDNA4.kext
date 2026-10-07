@@ -80,6 +80,11 @@ public:
 	// makes it a no-op.
 	void setDisplayPower(bool on);
 	bool displayPowerOn { true };
+	// The last 16 display power events (macOS display sleep / wake as the kext handled them), kept in the registry property RDNA4FB,DisplayPower
+	// (" ## " separated, newest last): the kernel log wraps, the registry does not. One small string is rebuilt per event (events are rare).
+	void displayPowerNote(bool on, const char *path, const char *result);
+	char     displayPowerHist[16][72] {};
+	uint32_t displayPowerEvents { 0 };
 
 	// NDRV hardware-cursor csc backend. Cursor memory and register programming
 	// are enabled only by rdna4-cursor=1; the default remains software cursor.

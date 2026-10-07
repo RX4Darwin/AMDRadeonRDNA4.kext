@@ -31,6 +31,7 @@
 
 #include "compute.hpp"
 #include "gfx12_draw.h"
+#include "isa.hpp"
 #include "linuxref.hpp"
 #include "ngg_kernel.h"
 #include "nggmsg_kernel.h"
@@ -211,6 +212,7 @@ void RDNA4Compute::gfxStatus(const char *tag) {
 }
 
 bool RDNA4Compute::stageGfxRing() {
+	gfxClientReset();   // W12k: a fresh ring (first bring-up or after a wake): nothing is pending, not wedged, not parked
 	OSDictionary *d = OSDictionary::withCapacity(8);
 	auto put = [d](const char *key, uint64_t v) {
 		if (OSNumber *num = d ? OSNumber::withNumber(v, 64) : nullptr) {
@@ -518,6 +520,12 @@ uint32_t findStreamPacket(const uint32_t *stream, uint32_t dwords, uint32_t opco
 uint32_t RDNA4Compute::requestedGfxProbe() {
 	uint32_t v = 0;
 	return PE_parse_boot_argn("rdna4-gfxprobe", &v, sizeof(v)) && v ? 1 : 0;
+}
+
+// rdna4-gfxclient=1 (default off): after a passing G3 baseline, submit a synthetic client gfx IB through the W12k path (runtime.cpp).
+bool RDNA4Compute::requestedGfxClient() {
+	uint32_t v = 0;
+	return PE_parse_boot_argn("rdna4-gfxclient", &v, sizeof(v)) && v;
 }
 
 uint32_t RDNA4Compute::requestedGfxCol() {
@@ -1233,6 +1241,7 @@ void RDNA4Compute::gfxPark() {
 	}
 	const uint32_t cntl0 = rdGc(CpMeCntl);
 	wr(IpDiscovery::HwGc, CpMeCntl, cntl0 | kCpMePfpHalt | kCpMeMeHalt);
+	gfxParked = true;   // W12k: client gfx IBs are refused while the microengines are halted (probe boots; rdna4-gfxpark=0 leaves them running)
 	IOSleep(20);
 	const uint32_t cntl1 = rdGc(CpMeCntl);
 	GLOG("park: after the draws CP_STAT 0x%08x%s, PFP/ME halted: CP_ME_CNTL 0x%08x -> 0x%08x, GRBM 0x%08x, RB0 rptr 0x%x wptr 0x%x",
@@ -1364,7 +1373,7 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	// Shaders, each followed by s_code_end padding for the SQ's prefetch.
 	auto place = [&](uint32_t at, const uint32_t *code, uint32_t dwords) {
 		for (uint32_t i = 0; i < 0x100; i++)
-			*poolDw(at + 4 * i) = i < dwords ? code[i] : 0xbf9f0000u;   // s_code_end
+			*poolDw(at + 4 * i) = i < dwords ? code[i] : Isa::kSCodeEnd;   // s_code_end
 	};
 	if (variant & 4)
 		place(kGfxVsOffset, kNggmsgKernel, sizeof(kNggmsgKernel) / 4);

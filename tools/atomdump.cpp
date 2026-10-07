@@ -32,6 +32,8 @@
 #include "../src/gpuheap.hpp"
 #include "../src/flip.hpp"
 #include "../src/gpuvm.hpp"
+#include "../src/vmid.hpp"
+#include "../src/ptpages.hpp"
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
@@ -1642,6 +1644,18 @@ static int testSdmaPackets() {
 	failures += check(ok && r.wptr() == 20 * 5 * 4 && mem[((19 * 5 + 4) * 4 % 256) / 4] == 19,
 	                  "sdma: ring wrap (wptr %llu)", static_cast<unsigned long long>(r.wptr()));
 	failures += check(!r.init(mem, 0x8008800010ull, sizeof(mem)), "sdma: unaligned ring accepted");
+	// P7: a ring that RESUMES at the engine's own 64-bit pointers (a wake without power loss): the wptr continues monotonically from there and the packets
+	// land at the pointer modulo the ring size.
+	{
+		uint32_t rm[64];
+		Sdma::Ring rr;
+		const uint64_t start = 0x17604;            // the emulator's 11s run: 95748 bytes
+		ok = rr.init(rm, 0x8008800000ull, sizeof(rm), start) && rr.wptr() == start && rm[0] == 0;
+		ok = ok && rr.emit(p, Sdma::writeDword(p, a, 0x77)) && rr.wptr() == start + 5 * 4;
+		failures += check(ok && rm[(start & 255) / 4] == p[0] && rr.wptr() > start,
+		                  "sdma: ring resumed at the engine's pointers (wptr 0x%llx)", static_cast<unsigned long long>(rr.wptr()));
+		failures += check(rr.init(rm, 0x8008800000ull, sizeof(rm), 0x17607) && rr.wptr() == 0x17604, "sdma: a resume pointer is dword aligned");
+	}
 
 	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR encodings and ring wrap %s\n",
 	       failures ? "FAILED" : "ok");
@@ -2161,6 +2175,304 @@ static int testGpuVm() {
 	return failures;
 }
 
+// --- W13: the VMID pool (src/vmid.cpp) -----------------------------------------
+
+namespace {
+struct FakeFences {
+	uint32_t now[Vmid::kMaxDomains] {};
+};
+bool fakeReached(void *context, uint32_t domain, uint32_t seq) {
+	// Wrap-aware "now >= seq", as the kext's fenceReached does.
+	return static_cast<int32_t>(static_cast<FakeFences *>(context)->now[domain] - seq) >= 0;
+}
+} // namespace
+
+static int testVmidPool() {
+	using namespace Vmid;
+	int f = 0;
+	FakeFences fences;
+	Pool pool;
+	Grant g;
+
+	// Reuse: the same owner and page directory keep their VMID; no rebind, no flush.
+	pool.init(fakeReached, &fences);
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.rebind && g.flush && !g.stolen &&
+	           g.vmid >= kFirst && g.vmid <= kLast, "vmid: first grab binds a fresh VMID");
+	const uint32_t v1 = g.vmid;
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid == v1 && !g.rebind && !g.flush,
+	           "vmid: same owner and PD reuse the VMID with no rebind and no flush");
+
+	// A flush is owed only when the client removed PTEs (its tlbSeq moved) since the last flush.
+	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.vmid == v1 && !g.rebind && g.flush,
+	           "vmid: tlbSeq advanced -> flush, still no rebind");
+	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && !g.flush, "vmid: the flush is owed once");
+	// Negative control: a pool that ignored tlbSeq would fail the two checks above.
+
+	// A flush does not need an idle VMID (an invalidation only drops cached translations).
+	pool.noteSubmit(v1, 0, 10);
+	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && g.vmid == v1 && g.flush && !g.rebind,
+	           "vmid: a busy VMID may be flushed");
+	fences.now[0] = 10;
+
+	// A changed page directory is not compatible: the client gets a rebind and the idle old slot is released.
+	f += check(pool.grab(1, 0x2000, 0, g) == Result::Ok && g.rebind && g.flush, "vmid: new PD -> rebind");
+	uint32_t owned = 0;
+	for (uint32_t v = kFirst; v <= kLast; v++)
+		owned += pool.ownerOf(v) == 1;
+	f += check(owned == 1, "vmid: the stale slot of the same owner is released (owns %u)", owned);
+
+	// Fifteen owners get fifteen distinct VMIDs.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	bool seen[kSlots] {};
+	bool distinct = true;
+	for (uintptr_t o = 1; o <= 15; o++) {
+		if (pool.grab(o, o * 0x1000, 0, g) != Result::Ok || seen[g.vmid] || g.stolen)
+			distinct = false;
+		seen[g.vmid] = true;
+	}
+	f += check(distinct && !seen[0], "vmid: 15 owners, 15 distinct VMIDs, VMID 0 never granted");
+
+	// Steal: all idle, the 16th takes the LEAST recently used. Owner 1 is older than 2..15; touch 1
+	// again and owner 2 becomes the victim.
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t v2 = [&] { for (uint32_t v = kFirst; v <= kLast; v++) if (pool.ownerOf(v) == 2) return v; return 0u; }();
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.rebind && g.stolen && g.vmid == v2,
+	           "vmid: steal takes the least recently used idle VMID (got %u want %u)", g.vmid, v2);
+	f += check(pool.ownerOf(v2) == 16, "vmid: the thief owns the stolen VMID");
+	f += check(pool.grab(2, 0x2000, 0, g) == Result::Ok && g.rebind && g.vmid != v2,
+	           "vmid: the victim comes back through a rebind on another VMID");
+
+	// Never steal a busy VMID; exhaustion returns the fence to wait on.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	for (uintptr_t o = 1; o <= 15; o++) {
+		pool.grab(o, o * 0x1000, 0, g);
+		pool.noteSubmit(g.vmid, 0, static_cast<uint32_t>(o));      // owner o: fence seq o on domain 0
+	}
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Busy && g.waitDomain == 0 && g.waitSeq == 1,
+	           "vmid: all busy -> Busy on the oldest job's fence (seq %u)", g.waitSeq);
+	bool untouched = true;
+	for (uintptr_t o = 1; o <= 15; o++) {
+		bool has = false;
+		for (uint32_t v = kFirst; v <= kLast; v++)
+			has |= pool.ownerOf(v) == o;
+		untouched &= has;
+	}
+	f += check(untouched, "vmid: a Busy grab takes nothing from anyone");
+
+	// Fairness: while that fence is pending a different newcomer waits too, but an owner that still
+	// has its VMID is served (the deliberate deviation from amdgpu).
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Busy && g.waitSeq == 1, "vmid: a second newcomer waits for the same fence");
+	f += check(pool.grab(5, 5 * 0x1000, 0, g) == Result::Ok && !g.rebind, "vmid: a bound owner is not starved by the wait");
+
+	// Fence 5 reached: owners 1..5 are idle; the thief takes the LRU among them (owner 1) and only them.
+	fences.now[0] = 5;
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.stolen, "vmid: fence reached -> the waiter gets a VMID");
+	f += check(pool.ownerOf(g.vmid) == 16, "vmid: the waiter owns it");
+	bool busyKept = true;
+	for (uintptr_t o = 6; o <= 15; o++) {
+		bool has = false;
+		for (uint32_t v = kFirst; v <= kLast; v++)
+			has |= pool.ownerOf(v) == o;
+		busyKept &= has;
+	}
+	f += check(busyKept, "vmid: owners with jobs in flight (seq 6..15) keep their VMIDs");
+	f += check(pool.ownerOf(g.vmid) == 16 && pool.grab(1, 0x1000, 0, g) == Result::Ok, "vmid: the victim is idle owner 1 (it rebinds)");
+
+	// Fairness across domains: the waiter is on domain 0; a VMID that frees up on domain 1 meanwhile
+	// must NOT go to a newcomer who arrived later (amdgpu's vmid_wait).
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	for (uintptr_t o = 1; o <= 14; o++) {
+		pool.grab(o, o * 0x1000, 0, g);
+		pool.noteSubmit(g.vmid, 0, static_cast<uint32_t>(o));
+	}
+	pool.grab(15, 15 * 0x1000, 0, g);
+	const uint32_t v15 = g.vmid;
+	pool.noteSubmit(v15, 1, 1);
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Busy && g.waitDomain == 0, "vmid: waiter parks on domain 0");
+	fences.now[1] = 1;                       // owner 15's job finished: a VMID is idle now
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Busy && g.waitDomain == 0,
+	           "vmid: an idle VMID is not handed to a newcomer while an earlier waiter is pending");
+	fences.now[0] = 1;                       // the waiter's fence
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok, "vmid: the waiter is served once its fence is reached");
+
+	// Several fence domains and sequence wrap.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t vm = g.vmid;
+	pool.noteSubmit(vm, 0, 0xfffffffeu);
+	pool.noteSubmit(vm, 1, 7);
+	fences.now[0] = 1;                       // wrapped past 0xfffffffe
+	f += check(!pool.idle(vm), "vmid: busy while domain 1 has not reached its seq");
+	fences.now[1] = 7;
+	f += check(pool.idle(vm), "vmid: idle once every domain reached its seq, wrap included");
+
+	// Exhaustion by pinning (static VMIDs, step S7).
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	bool pinsOk = true;
+	for (uintptr_t o = 1; o <= 15; o++)
+		pinsOk &= pool.pin(o, o * 0x1000, 0, g) == Result::Ok && pool.pinned(g.vmid);
+	f += check(pinsOk, "vmid: 15 pins succeed");
+	f += check(pool.pin(16, 0x16000, 0, g) == Result::Exhausted, "vmid: the 16th pin is Exhausted");
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Exhausted, "vmid: nothing can be stolen from pinned VMIDs");
+	f += check(pool.grab(3, 3 * 0x1000, 0, g) == Result::Ok && !g.rebind, "vmid: a pinned owner still reuses its VMID");
+	uint32_t released = 0;
+	f += check(pool.forget(3, false, released) && released != 0 && pool.ownerOf(released) == 0,
+	           "vmid: forget releases a pinned VMID and reports it");
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.vmid == released, "vmid: the released VMID is granted again");
+
+	// forget: refused while work is in flight, forced after a recovery.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	pool.grab(1, 0x1000, 0, g);
+	pool.noteSubmit(g.vmid, 0, 5);
+	f += check(!pool.forget(1, false, released) && pool.ownerOf(g.vmid) == 1, "vmid: forget is refused with a job in flight");
+	f += check(pool.forget(1, true, released) && released == g.vmid && pool.ownerOf(g.vmid) == 0 && pool.idle(g.vmid),
+	           "vmid: a forced forget releases it and clears the pending work");
+
+	// Reserved VMIDs are never granted.
+	pool.init(fakeReached, &fences, 1u << 8);
+	fences = FakeFences {};
+	bool reservedHit = false;
+	for (uintptr_t o = 1; o <= 14; o++)
+		reservedHit |= pool.grab(o, o * 0x1000, 0, g) != Result::Ok || g.vmid == 8;
+	f += check(!reservedHit, "vmid: 14 grants with VMID 8 reserved never return it");
+	f += check(pool.grab(15, 0x15000, 0, g) == Result::Ok && g.stolen && g.vmid != 8,
+	           "vmid: the 15th owner steals an idle VMID; the reserved one stays out");
+
+	// unbindAll (wake / GPU reset): nothing is bound any more, pins included.
+	pool.unbindAll();
+	bool none = true;
+	for (uint32_t v = kFirst; v <= kLast; v++)
+		none &= pool.ownerOf(v) == 0 && !pool.pinned(v);
+	f += check(none && pool.grab(1, 0x1000, 0, g) == Result::Ok && g.rebind, "vmid: after unbindAll the next grab rebinds");
+
+	f += check(pool.grab(0, 0x1000, 0, g) == Result::Exhausted, "vmid: owner 0 is invalid");
+	return f;
+}
+
+// --- W13 S6: demand-allocated page tables (src/ptpages.cpp) ---------------------------------
+
+namespace {
+struct FakeChunks {
+	uint64_t next { 0x1000000 };
+	uint32_t live { 0 }, allocs { 0 }, frees { 0 };
+	uint32_t failAfter { 0xffffffffu };     // refuse the allocation after this many
+	uint64_t freed[256];
+};
+bool fakeAllocChunk(void *ctx, uint64_t &off) {
+	auto *f = static_cast<FakeChunks *>(ctx);
+	if (f->allocs >= f->failAfter)
+		return false;
+	off = f->next;
+	f->next += 0x10000;
+	f->allocs++;
+	f->live++;
+	return true;
+}
+void fakeFreeChunk(void *ctx, uint64_t off) {
+	auto *f = static_cast<FakeChunks *>(ctx);
+	if (f->frees < 256)
+		f->freed[f->frees] = off;
+	f->frees++;
+	f->live--;
+}
+} // namespace
+
+static int testPtPages() {
+	int f = 0;
+	FakeChunks chunks;
+	PtPages::Backend be { fakeAllocChunk, fakeFreeChunk, &chunks };
+	static PtPages::Table t;
+	t.init(PtPages::kMaxPages);
+	uint64_t off = 0, prev = 0;
+
+	// A client's first pages (root, PDB1, PDB0, one PT) live in ONE 64 KiB chunk, 4 KiB apart.
+	bool ok = true;
+	uint64_t first = 0;
+	for (uint32_t i = 0; i < 4; i++) {
+		ok &= t.page(i, be, off);
+		if (i == 0)
+			first = off;
+		ok &= off == first + 0x1000ull * i;
+	}
+	f += check(ok && t.pages() == 4 && t.chunksHeld() == 1 && chunks.allocs == 1, "ptpages: four pages share one chunk, packed 4 KiB apart");
+	f += check(t.page(2, be, off) && off == first + 0x2000 && t.pages() == 4, "ptpages: asking again returns the same page and allocates nothing");
+	f += check(t.offsetOf(3) == first + 0x3000 && t.offsetOf(9) == 0 && !t.has(9), "ptpages: offsetOf / has for backed and unbacked pages");
+
+	// Sparse: a far PT page costs one page, not the distance.
+	ok = t.page(900, be, off) && off == first + 0x4000 && t.pages() == 5 && t.chunksHeld() == 1;
+	f += check(ok, "ptpages: a far-away logical page takes the next free slot of the chunk (no 4 MiB image)");
+
+	// The 17th page opens a second chunk.
+	for (uint32_t i = 10; i < 21; i++)
+		t.page(i, be, off);
+	f += check(t.pages() == 16 && t.chunksHeld() == 1, "ptpages: 16 pages fill the first chunk exactly");
+	f += check(t.page(21, be, off) && t.chunksHeld() == 2 && chunks.allocs == 2, "ptpages: the 17th page opens a second chunk");
+
+	// Dropping: a slot is reused; an emptied chunk goes back to the allocator.
+	t.drop(21, be);
+	f += check(t.chunksHeld() == 1 && chunks.frees == 1, "ptpages: dropping the only page of a chunk frees that chunk");
+	t.drop(3, be);
+	f += check(t.page(700, be, off) && off == first + 0x3000, "ptpages: a dropped slot is reused first");
+
+	// Quota and allocator failure leave no half-made page.
+	PtPages::Table q;
+	FakeChunks c2;
+	PtPages::Backend b2 { fakeAllocChunk, fakeFreeChunk, &c2 };
+	q.init(3);
+	bool three = q.page(0, b2, off) && q.page(1, b2, off) && q.page(2, b2, off);
+	f += check(three && !q.page(3, b2, off) && q.pages() == 3 && !q.has(3), "ptpages: the quota refuses the 4th page and leaves no trace");
+	PtPages::Table r;
+	FakeChunks c3;
+	c3.failAfter = 1;
+	PtPages::Backend b3 { fakeAllocChunk, fakeFreeChunk, &c3 };
+	r.init(PtPages::kMaxPages);
+	bool filled = true;
+	for (uint32_t i = 0; i < 16; i++)
+		filled &= r.page(i, b3, off);
+	f += check(filled && !r.page(16, b3, off) && r.pages() == 16 && !r.has(16) && r.chunksHeld() == 1,
+	           "ptpages: an allocator that refuses the second chunk fails the page cleanly");
+
+	// Release gives every chunk back exactly once.
+	t.release(be);
+	f += check(t.pages() == 0 && t.chunksHeld() == 0 && chunks.live == 0, "ptpages: release returns every chunk (none left live)");
+	bool unique = true;
+	for (uint32_t i = 0; i < chunks.frees && i < 256; i++)
+		for (uint32_t j = i + 1; j < chunks.frees && j < 256; j++)
+			unique &= chunks.freed[i] != chunks.freed[j];
+	f += check(unique, "ptpages: no chunk was freed twice");
+
+	// Worst case: the whole 4 MiB image backed = 1024 pages = 64 chunks.
+	PtPages::Table w;
+	FakeChunks c4;
+	PtPages::Backend b4 { fakeAllocChunk, fakeFreeChunk, &c4 };
+	w.init(PtPages::kMaxPages);
+	bool all = true;
+	for (uint32_t i = 0; i < PtPages::kMaxPages; i++)
+		all &= w.page(i, b4, off);
+	f += check(all && w.pages() == 1024 && w.chunksHeld() == 64, "ptpages: a fully mapped 4 MiB image takes 64 chunks");
+	w.release(b4);
+	f += check(c4.live == 0, "ptpages: and gives them all back");
+
+	// Pool-slot layout: the old layout (26 MiB, 64 KiB stride) runs into the gfx region at 30 MiB with slot 64.
+	uint32_t area = 0;
+	const uint32_t base = 26u << 20, gfx = 30u << 20;
+	f += check(PtPages::areaFor(base, 0x10000, 0, gfx, area) && area == base, "layout: slot 0 at the base");
+	f += check(PtPages::areaFor(base, 0x10000, 63, gfx, area) && area + 0x10000 == gfx, "layout: slot 63 ends exactly at the gfx region");
+	f += check(!PtPages::areaFor(base, 0x10000, 64, gfx, area), "layout: slot 64 (which the old code would have placed on the gfx ring) is refused");
+	f += check(PtPages::areaFor(27u << 20, 0x3000, 255, gfx, area) && !PtPages::areaFor(27u << 20, 0x3000, 256, gfx, area),
+	           "layout: the compact 12 KiB client area fits 256 clients below the gfx region, 257 is refused");
+	f += check(PtPages::areaFor(0, 10, 1, 20, area) && !PtPages::areaFor(0, 10, 1, 19, area), "layout: an area that overruns the limit by one byte is refused");
+	f += check(!PtPages::areaFor(base, 0, 0, gfx, area) && !PtPages::areaFor(0xfffff000u, 0x10000, 1, 0xffffffffu, area),
+	           "layout: a zero stride and a 32-bit overflow are refused");
+	return f;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
@@ -2360,6 +2672,8 @@ int main(int argc, char **argv) {
 	failures += testFlipArithmetic();
 	failures += testGcInfo();
 	failures += testGpuVm();
+	failures += testVmidPool();
+	failures += testPtPages();
 	failures += testLinuxRefFormat();
 
 	if (failures) {

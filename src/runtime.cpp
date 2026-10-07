@@ -390,6 +390,7 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 		if (resumePending) {
 			resumed = true;
 			powerSleeping = false;
+			powerSleepClear();
 		}
 		RLOG("user-space runtime up again: %s", RDNA4_COMPUTE_SERVICE);
 		publishResult("runtime", "PASS service ready");
@@ -1483,6 +1484,16 @@ void RDNA4Compute::scrubFaultPage() {
 }
 
 IOReturn RDNA4Compute::rtOpen(const void *owner) {
+	const IOReturn r = rtOpenInner(owner);
+	if (r != kIOReturnSuccess) {
+		char why[48];
+		snprintf(why, sizeof(why), "open FAILED 0x%x", r);
+		vmOpTrace(why, 0, 0, 0);
+	}
+	return r;
+}
+
+IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 	Locked g(rtLock);
 	if (!rtReady)
 		return kIOReturnNotReady;
@@ -1500,6 +1511,8 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 		c->active = true;
 		return kIOReturnSuccess;
 	}
+	if (vmShared)
+		return rtOpenShared(owner, slot, c);
 	uint32_t vmid = 0;
 	for (vmid = 8; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
 	if (vmid > 15)
@@ -1547,6 +1560,8 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	c->kernargCpu = poolDw(qoff + kVmKernarg);
 	c->queueCpu = poolDw(qoff + kVmPq);
 	c->fenceCpu = poolDw(qoff + kVmFence);
+	c->gfxFenceCpu = poolDw(qoff + kVmFence + kGfxFenceSlot);   // W12k: the client's gfx fence dword, in the same page (zeroed just above)
+	c->gfxFenceMc = poolMc(qoff + kVmFence + kGfxFenceSlot);
 	const uint64_t qva = c->nextVa; c->nextVa += 0x1000;
 	const uint64_t eva = c->nextVa; c->nextVa += 0x1000;
 	const uint64_t rva = c->nextVa; c->nextVa += 0x1000;
@@ -1583,6 +1598,83 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	c->active = true;
 	RLOG("vmid %u: client queue activated MEC1 pipe %u queue %u, PDB2 MC 0x%llx physical 0x%llx, doorbell dword %u",
 	     vmid, pipe, queue, c->rootMc, c->rootPhys, c->doorbell);
+	vmOpTrace("open", vmid, pipe, queue);
+	if (!vmSurveyClientDone) {
+		vmSurveyClientDone = true;
+		vmSurvey("after the first client opened");
+	}
+	return kIOReturnSuccess;
+}
+
+/* rdna4-vmshared=1 (vmshared.cpp): the client has a VMID and page tables but no queue. Same VA layout for the pages it keeps (kernarg, fence), plus
+ * the IB page the kernel writes each dispatch into. */
+IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *c) {
+	if (!vmSharedEnsure())
+		return kIOReturnNotReady;
+	uint32_t vmid = 0;
+	for (vmid = 8; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
+	if (vmid > 15)
+		return kIOReturnNoResources;
+	const uint32_t sq = slot & 1;
+	if (sharedQ[sq].wedged || !sharedQ[sq].up)
+		return kIOReturnNotResponding;
+	uint64_t table = 0;
+	if (!devHeap.size() || !devHeap.alloc(kVmTableBytes, table))
+		return kIOReturnNoMemory;
+	if (kVmQueueBase + slot * kVmQueueStride + kVmIb + 0x1000 > pool.size) {
+		devHeap.free(table);
+		return kIOReturnNoMemory;
+	}
+	*c = RtClient {};
+	c->owner = owner; c->vmid = vmid; c->shared = true; c->sq = static_cast<uint8_t>(sq);
+	c->pipe = sharedQ[sq].pipe; c->queue = sharedQ[sq].queue;   // for reporting; the client owns no HQD
+	c->tableOffset = table; c->rootMc = vramMc(table);
+	if (!gpuPhysical(c->rootMc, c->rootPhys)) {
+		devHeap.free(table); *c = RtClient {};
+		return kIOReturnNoMemory;
+	}
+	c->tableShadow = reinterpret_cast<uint64_t *>(IOMalloc(kVmTableBytes));
+	if (!c->tableShadow) {
+		devHeap.free(table); *c = RtClient {};
+		return kIOReturnNoMemory;
+	}
+	bzero(c->tableShadow, kVmTableBytes);
+	c->tableShadow[0] = GpuVm::encodePde(c->rootPhys + 0x1000, GpuVm::kValid, 2);
+	c->tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
+		GpuVm::encodePde(c->rootPhys + 0x2000, GpuVm::kValid, 1);
+	const uint32_t qoff = kVmQueueBase + slot * kVmQueueStride;
+	c->poolOff = qoff;
+	for (uint32_t off = 0; off < 0x8000; off += 4)
+		*poolDw(qoff + off) = 0;
+	flushHdp();
+	c->kernargCpu = poolDw(qoff + kVmKernarg);
+	c->fenceCpu = poolDw(qoff + kVmFence);
+	/* W12k: the client's gfx fence dword (same page, zeroed above): without it a shared-queue client cannot submit gfx IBs (Kiln's boot 13 dry run:
+	 * SubmitGfxIb 'resource shortage', gfx-client 'setup'); rtOpenInner sets the same two fields. */
+	c->gfxFenceCpu = poolDw(qoff + kVmFence + kGfxFenceSlot);
+	c->gfxFenceMc = poolMc(qoff + kVmFence + kGfxFenceSlot);
+	/* The same VA slots as the HQD path (six pages), of which the queue's four stay unmapped, then the IB page. */
+	c->nextVa += 4 * 0x1000;
+	c->fenceVa = c->nextVa; c->nextVa += 0x1000;
+	c->kernargVa = c->nextVa; c->nextVa += 0x1000;
+	c->ibVa = c->nextVa; c->nextVa += 0x1000;
+	if (!vmMap(*c, c->fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
+	    !vmMap(*c, c->kernargVa, poolMc(qoff + kVmKernarg), 0x1000, false) ||
+	    !vmMap(*c, c->ibVa, poolMc(qoff + kVmIb), 0x1000, true) || !vmContextInit(*c)) {
+		IOFree(c->tableShadow, kVmTableBytes); devHeap.free(table); *c = RtClient {};
+		return kIOReturnNoMemory;
+	}
+	c->doorbell = sharedQ[sq].doorbell;
+	(void)vmInvalidate(vmid, "client context enable");
+	vmidUsed[vmid] = true;
+	c->active = true;
+	RLOG("vmid %u: shared-queue client (rdna4-vmshared) on shared queue %u (MEC1 pipe %u queue %u, VMID 0), PDB2 MC 0x%llx, IB VA 0x%llx",
+	     vmid, sq, sharedQ[sq].pipe, sharedQ[sq].queue, c->rootMc, c->ibVa);
+	vmOpTrace("open", vmid, c->pipe, c->queue);
+	if (!vmSurveyClientDone) {
+		vmSurveyClientDone = true;
+		vmSurvey("after the first client opened");
+	}
 	return kIOReturnSuccess;
 }
 
@@ -1612,6 +1704,7 @@ bool RDNA4Compute::initPresentationTimer() {
 }
 
 void RDNA4Compute::stopPresentationTimer() {
+	idleStop();        // P2: the idle accounting's poll timer goes away with the presentation timer (shutdown/quiesce)
 	if (presentTimer) {
 		presentTimer->cancelTimeout();
 		if (presentWorkLoop)
@@ -1853,6 +1946,8 @@ IOReturn RDNA4Compute::rtInfo(const void *owner, uint64_t out[9]) {
 		out[2] |= RDNA4_FLAG_VM;
 	if (resumed)
 		out[2] |= RDNA4_FLAG_RESUMED;
+	if (vmEnabled && c && gfxClientReady() == kIOReturnSuccess)
+		out[2] |= RDNA4_FLAG_GFX;
 	return kIOReturnSuccess;
 }
 
@@ -1888,6 +1983,7 @@ IOReturn RDNA4Compute::rtSleepTest(const void *owner, uint32_t phase) {
 	}
 	if (phase == 1) {
 		RLOG("power: debug sleep selector phase 1");
+		powerSleepRequest();
 		powerWillSleep();
 	} else {
 		RLOG("power: debug sleep selector phase 2");
@@ -2090,11 +2186,18 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	if (presentActive && presentOwner == owner && presentHandle == handle)
 		restore = restorePresentationLocked("buffer free");
 	RtClient *c = vmClientFor(owner);
+	if (c && c->gfxOutstanding)
+		gfxClientDrain(*c, "buffer free");   // W12k: an outstanding gfx IB may still use it
 	const bool host = b->host;
 	if (c && b->va)
 		vmUnmap(*c, b->va, b->bytes);
-	if (host && c && !vmInvalidate(c->vmid, "host unmap"))
-		RLOG("vmid %u: host buffer unmap invalidation timed out", c->vmid);
+	/* Every unmap is followed by an invalidation before the memory goes back to its heap
+	 * (amdgpu sets tlb_seq on a cleared PTE and flushes before the VMID's next job,
+	 * amdgpu_vm.c:1272). Device buffers used to skip it: a cached translation could then
+	 * still reach VRAM that the heap hands to another client. Inferred from the code, not
+	 * measured on the card. Failure handling is the host path's: log and go on. */
+	if (c && (b->va || host) && !vmInvalidate(c->vmid, host ? "host unmap" : "device unmap"))
+		RLOG("vmid %u: %s buffer unmap invalidation timed out", c->vmid, host ? "host" : "device");
 	if (host) {
 		if (c) {
 			const uint64_t rounded = (b->bytes + GpuVm::kPageBytes - 1) &
@@ -2116,6 +2219,7 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
                               mach_vm_address_t user, uint64_t length, bool toGpu) {
 	Locked g(rtLock);
+	IdleUse idle(this, "copy");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
@@ -2224,8 +2328,12 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 	RtProgram *p = programFor(owner, program);
 	if (!p)
 		return kIOReturnBadArgument;
-	if (RtClient *c = vmClientFor(owner))
+	if (RtClient *c = vmClientFor(owner)) {
 		vmUnmap(*c, p->va, heap.lengthOf(p->offset));
+		/* As rtFree: invalidate before the code pages return to the heap. */
+		if (!vmInvalidate(c->vmid, "program unmap"))
+			RLOG("vmid %u: program unmap invalidation timed out", c->vmid);
+	}
 	heap.free(p->offset);
 	p->owner = nullptr;
 	return kIOReturnSuccess;
@@ -2233,13 +2341,16 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 
 IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros) {
 	Locked g(rtLock);
+	IdleUse idle(this, "dispatch");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
 		return state;
-	if (rtWedged)
-		return kIOReturnNotResponding;
 	RtClient *c = vmClientFor(owner);
+	if (rtWedged && !(c && c->shared)) {
+		vmOpTrace("dispatch REFUSED: rtWedged", c ? c->vmid : 0, c ? c->pipe : 0, c ? c->queue : 0);
+		return kIOReturnNotResponding;
+	}
 	if (vmEnabled && !c)
 		return kIOReturnNoResources;
 	if (c)
@@ -2308,17 +2419,57 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	l.recoveryWpoll = c ? c->wpollVa : 0;
 	l.recoveryProofAddress = c ? c->fenceVa : 0;
 	l.recoveryProofCpu = c ? c->fenceCpu : nullptr;
+	if (c && c->shared) {
+		/* rdna4-vmshared: the job runs on the client's shared VMID-0 queue as INDIRECT_BUFFER(vmid) + a ring-level fence to the client's
+		 * fence word (an MC address). The packets are written into the client's IB page. */
+		SharedQueue &sq = sharedQ[c->sq];
+		if (sq.wedged || !sq.up) {
+			vmOpTrace("dispatch REFUSED: shared queue wedged/down", c->vmid, sq.pipe, sq.queue);
+			return kIOReturnNotResponding;
+		}
+		l.queue = &sq.pm;
+		l.pipe = sq.pipe;
+		l.queueId = sq.queue;
+		l.doorbell = sq.doorbell;
+		l.fenceAddress = poolMc(c->poolOff + kVmFence);
+		l.ibCpu = poolDw(c->poolOff + kVmIb);
+		l.ibVa = c->ibVa;
+		l.ibVmid = vmidForSubmit(*c);
+		l.queueCpu = nullptr;
+	}
 
 	uint64_t ns = 0;
+	if (c)
+		vmOpTrace("dispatch entry", l.vmid, l.pipe, l.queueId);
+	waitAborted = false;
 	const bool done = launch(l, "runtime", ns);
 	micros = ns / 1000;
+	if (c)
+		vmOpTrace(done ? "dispatch done" : waitAborted ? "dispatch ABORTED (sleep requested)" : "dispatch TIMED OUT", l.vmid, l.pipe, l.queueId);
+	if (!done && waitAborted) {
+		/* P7: a sleep was requested while this dispatch waited. Not a timeout: no recovery, no wedge; powerWillSleep drains the HQD. */
+		waitAborted = false;
+		if (c)
+			c->ibOutstanding = 0;
+		RLOG("dispatch wait aborted: a sleep was requested");
+		return kIOReturnAborted;
+	}
 	if (!done) {
 		if (c)
 			c->ibOutstanding = 0;
+		if (c && c->shared) {
+			if (recoverSharedQueue(c->sq, c->vmid, "runtime")) {
+				RLOG("dispatch timed out after %u ms; shared queue recovered without a GPU reset", l.timeoutUs / 1000);
+			} else {
+				RLOG("dispatch timed out after %u ms: shared queue %u recovery failed; that queue stays wedged", l.timeoutUs / 1000, c->sq);
+			}
+			return kIOReturnTimeout;
+		}
 		if (recoverComputeQueue("runtime", &l)) {
 			rtWedged = false;
 			RLOG("dispatch timed out after %u ms; queue recovered without a GPU reset", l.timeoutUs / 1000);
 		} else {
+			vmOpTrace("rtWedged SET by a dispatch timeout (recovery failed)", l.vmid, l.pipe, l.queueId);
 			rtWedged = true;
 			RLOG("dispatch timed out after %u ms: queue recovery failed; runtime stays wedged",
 			     l.timeoutUs / 1000);
@@ -2335,6 +2486,7 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwords,
                                   uint64_t flags, uint64_t &fence) {
 	Locked g(rtLock);
+	IdleUse idle(this, "submit-ib");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
@@ -2344,8 +2496,14 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	RtClient *c = vmClientFor(owner);
 	if (!c)
 		return kIOReturnNoResources;
-	if (rtWedged)
+	if (rtWedged && !c->shared) {
+		vmOpTrace("submitib REFUSED: rtWedged", c->vmid, c->pipe, c->queue);
 		return kIOReturnNotResponding;
+	}
+	if (c->shared && (sharedQ[c->sq].wedged || !sharedQ[c->sq].up)) {
+		vmOpTrace("submitib REFUSED: shared queue wedged/down", c->vmid, c->pipe, c->queue);
+		return kIOReturnNotResponding;
+	}
 	if (!ibVa || (ibVa & 3) || !dwords || dwords > (1u << 20) || flags)
 		return kIOReturnBadArgument;
 	const uint64_t ibBytes = dwords * 4;
@@ -2364,25 +2522,33 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	if (!containing)
 		return kIOReturnBadArgument;
 	retireIbFences(*c);
-	if (c->ibOutstanding >= kMaxIbOutstanding)
+	/* A shared queue's ring (4 KiB) carries the jobs of up to four clients: 8 outstanding jobs of 20 dwords each keep it far from full. */
+	if (c->ibOutstanding >= (c->shared ? 8u : kMaxIbOutstanding))
 		return kIOReturnBusy;
 
 	/* The same VMID-selected shader memory state as launch(): the user IB
 	 * supplies the program and resource registers, while this selector only
-	 * chains it and fences it. */
-	grbmSelect(0, c->pipe, c->queue, c->vmid);
-	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
-	wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
+	 * chains it and fences it. (Shared mode: SH_MEM was written for every VMID at the queues' start.) */
+	const uint32_t ibVmid = vmidForSubmit(*c);
+	if (!c->shared) {
+		grbmSelect(0, c->pipe, c->queue, ibVmid);
+		wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
+		wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
+	}
 	const uint32_t value = nextFence(c->fence);
 	uint32_t pkt[8];
-	if (!c->pm4.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync)) ||
-	    !c->pm4.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), c->vmid)) ||
-	    !c->pm4.emit(pkt, Pm4::releaseMem(pkt, c->fenceVa, value,
-	                                      ihActive && c->pipe < 2)))
+	Pm4::Queue &ring = c->shared ? sharedQ[c->sq].pm : c->pm4;
+	/* Shared: the fence is a ring-level write to the client's fence word (MC address); else a write through the client's VM. */
+	const uint64_t fenceAt = c->shared ? poolMc(c->poolOff + kVmFence) : c->fenceVa;
+	if (!ring.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync)) ||
+	    !ring.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), ibVmid)) ||
+	    !ring.emit(pkt, Pm4::releaseMem(pkt, fenceAt, value,
+	                                    ihActive && c->pipe < 2)))
 		return kIOReturnNoResources;
 	c->fence = value;
 	flushHdp();
-	pm4Kick(c->pm4, c->doorbell, c->pm4.wptr());
+	pm4Kick(ring, c->doorbell, ring.wptr());
+	vmOpTrace("submitib kicked", c->vmid, c->pipe, c->queue);
 	c->ibFences[c->ibOutstanding++] = value;
 	fence = value;
 	RLOG("vmid %u: submitted unprivileged compute IB VA 0x%llx, %u dwords, fence %u",
@@ -2393,6 +2559,7 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t timeoutMs,
                                    uint64_t &ns) {
 	Locked g(rtLock);
+	IdleUse idle(this, "wait-fence");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
@@ -2402,13 +2569,16 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 	RtClient *c = vmClientFor(owner);
 	if (!c)
 		return kIOReturnNoResources;
-	if (rtWedged)
+	if (rtWedged && !c->shared) {
+		vmOpTrace("waitfence REFUSED: rtWedged", c->vmid, c->pipe, c->queue);
 		return kIOReturnNotResponding;
+	}
 	if (timeoutMs > RDNA4_MAX_TIMEOUT_MS ||
 	    static_cast<int32_t>(fence - c->fence) > 0)
 		return kIOReturnBadArgument;
 	const uint32_t waitMs = timeoutMs ? timeoutMs : 1000;
 	bool done = false;
+	waitAborted = false;
 	if (ihActive && c->pipe < 2) {
 		done = ihWaitFence(c->fenceCpu, fence, waitMs, true, "IB", ns);
 	} else {
@@ -2419,6 +2589,10 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 			done = fenceReached(*c->fenceCpu, fence);
 			if (done || mach_absolute_time() - t0 > span)
 				break;
+			if (sleepAbortWanted()) {          // P7
+				waitAborted = true;
+				break;
+			}
 			if (polls < 200)
 				IODelay(10);
 			else
@@ -2431,7 +2605,26 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 		logClientFault(*c, "IB wait");
 		return kIOReturnSuccess;
 	}
+	if (waitAborted) {
+		/* P7: a sleep was requested: not a timeout, so no queue recovery and no wedge. */
+		waitAborted = false;
+		c->ibOutstanding = 0;
+		RLOG("IB fence %u wait aborted: a sleep was requested", fence);
+		return kIOReturnAborted;
+	}
 
+	if (c->shared) {
+		/* The shared queue's recovery kills this client's waves only (SQ_CMD CHECK_VMID) and re-initialises the queue. */
+		const bool ok = recoverSharedQueue(c->sq, c->vmid, "IB");
+		c->ibOutstanding = 0;
+		if (ok) {
+			*c->fenceCpu = 0;
+			flushHdp();
+		}
+		RLOG("IB fence %u timed out after %u ms; shared queue %u %s", fence, waitMs, c->sq,
+		     ok ? "recovered without a GPU reset" : "recovery failed; that queue stays wedged");
+		return kIOReturnTimeout;
+	}
 	Launch l {};
 	l.queue = &c->pm4;
 	l.vmid = c->vmid;
@@ -2456,11 +2649,278 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 		RLOG("IB fence %u timed out after %u ms; queue recovered without a GPU reset",
 		     fence, waitMs);
 	} else {
+		vmOpTrace("rtWedged SET by an IB wait timeout (recovery failed)", c->vmid, c->pipe, c->queue);
 		rtWedged = true;
 		RLOG("IB fence %u timed out after %u ms; queue recovery failed; runtime stays wedged",
 		     fence, waitMs);
 	}
 	return kIOReturnTimeout;
+}
+
+/* ---- W12k: a client's own graphics IB on the kernel's gfx ring --------------------------------------------------------------
+ * Design and the comparison with amdgpu's wrapping of a user gfx IB: docs/w12k-gfx-submit.md, "Decisions".  The short form:
+ *  - ring packets per submission: CONTEXT_CONTROL, INDIRECT_BUFFER (client's VMID, no VALID/PRIV/CHAIN), RELEASE_MEM to a per-client
+ *    fence dword (VMID0 MC address); 15 dwords.  No ring-side VM flush / pipeline sync / HDP flush / COND_EXEC: see the doc.
+ *  - the kernel's own gfx work (stageGfxRing/stageGfxDraw/gfxPark) runs on the bring-up thread without rtLock while bringupRunning is
+ *    set; client submissions hold rtLock and refuse while it is set, so the ring has one user at a time.
+ *  - a client IB that does not finish wedges the gfx ring (no per-queue reset without MES): PFP/ME are halted and gfx submissions are
+ *    refused until the next bring-up; compute queues, the display and the other runtime selectors are unaffected. */
+
+IOReturn RDNA4Compute::gfxClientReady() const {
+	if (!gfxMode)
+		return kIOReturnUnsupported;                 // rdna4-gfx=2 is not set, or the ring bring-up failed
+	if (bringupRunning || shutdownQuiesced || powerSleeping || sleepAbortWanted())
+		return kIOReturnNotReady;                    // the kernel still owns the ring (bring-up draws), or hardware is going away
+	if (gfxParked)
+		return kIOReturnNotReady;                    // probe boots halt PFP/ME after their draws
+	if (gfxWedged)
+		return kIOReturnNotResponding;
+	return kIOReturnSuccess;
+}
+
+void RDNA4Compute::gfxClientRetire(RtClient &c) {
+	if (!c.gfxFenceCpu || !c.gfxOutstanding)
+		return;
+	const uint32_t current = *c.gfxFenceCpu;
+	uint32_t retired = 0;
+	while (retired < c.gfxOutstanding && fenceReached(current, c.gfxFences[retired]))
+		retired++;
+	if (!retired)
+		return;
+	for (uint32_t i = retired; i < c.gfxOutstanding; i++)
+		c.gfxFences[i - retired] = c.gfxFences[i];
+	c.gfxOutstanding -= retired;
+	gfxClientPending = gfxClientPending >= retired ? gfxClientPending - retired : 0;
+}
+
+void RDNA4Compute::gfxClientReset() {
+	// Called from stageGfxRing on the bring-up thread (no rtLock held): take it, clients open and close concurrently.
+	if (rtLock)
+		IOLockLock(rtLock);
+	gfxWedged = false;
+	gfxParked = false;
+	gfxClientPending = 0;
+	for (RtClient &c : clients) {
+		c.gfxOutstanding = 0;
+		if (c.gfxFenceCpu)
+			*c.gfxFenceCpu = 0;
+		c.gfxFence = 0;
+	}
+	if (rtLock)
+		IOLockUnlock(rtLock);
+}
+
+void RDNA4Compute::gfxClientWedge(const char *why) {
+	gfxWedged = true;
+	RLOG("gfx: %s: a client gfx IB did not finish. The gfx ring has no per-queue reset here (amdgpu's goes through MES): PFP/ME are halted so "
+	     "the CP fetches nothing more, and gfx submissions are refused until the next bring-up; compute queues and the display are not affected "
+	     "(a wave that is stuck in a shader may keep the GC busy: power-cycle if it does)", why);
+	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
+	for (RtClient &c : clients)
+		c.gfxOutstanding = 0;
+	gfxClientPending = 0;
+}
+
+/* Append IB + fence for `c`: the caller has checked the state (gfxClientReady, or the bring-up self-test) and the IB's ownership/range.
+ * Packets: CONTEXT_CONTROL (amdgpu #10), INDIRECT_BUFFER in the client's VMID (#11), RELEASE_MEM to the client's fence dword (#12/#13). */
+IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords, uint32_t &fence) {
+	if (!c.gfxFenceCpu || !c.gfxFenceMc)
+		return kIOReturnNoResources;
+	for (RtClient &o : clients)
+		gfxClientRetire(o);
+	if (c.gfxOutstanding >= kMaxIbOutstanding || gfxClientPending >= kMaxGfxOutstanding)
+		return kIOReturnBusy;
+	/* The VMID's shader memory state, as the compute path and gfx_v12_0_init_compute_vmid set it (boot already does it for VMIDs 8-15). */
+	const uint32_t ibVmid = vmidForSubmit(c);
+	grbmSelect(0, 0, 0, ibVmid);
+	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
+	wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
+	grbmSelect(0, 0, 0, 0);
+	const uint32_t value = nextFence(c.gfxFence);
+	uint32_t pkt[8];
+	if (!gfxRing.emit(pkt, Pm4::contextControl(pkt, 0x80000000u, 0x80000000u)) ||
+	    !gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, ibVa, dwords, ibVmid)) ||
+	    !gfxRing.emit(pkt, Pm4::releaseMem(pkt, c.gfxFenceMc, value)))
+		return kIOReturnNoResources;
+	c.gfxFence = value;
+	flushHdp();                                      // CPU-written IB/data through the BAR are visible to the CP (amdgpu #9, done from the CPU side)
+	gfxKick(gfxRing.wptr());
+	c.gfxFences[c.gfxOutstanding++] = value;
+	gfxClientPending++;
+	fence = value;
+	RLOG("vmid %u: submitted unprivileged gfx IB VA 0x%llx, %u dwords, gfx fence %u", c.vmid, ibVa, dwords, value);
+	return kIOReturnSuccess;
+}
+
+/* Poll `c`'s gfx fence dword; on a timeout the ring is wedged (see above). rtLock is held for the wait, like rtWaitFence's. */
+bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why) {
+	const uint64_t t0 = mach_absolute_time();
+	uint64_t span = 0;
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000, &span);
+	bool done = false;
+	for (uint32_t polls = 0;; polls++) {
+		done = fenceReached(*c.gfxFenceCpu, fence);
+		if (done || mach_absolute_time() - t0 > span)
+			break;
+		if (sleepAbortWanted()) {              // P7: a sleep was requested: end the wait WITHOUT wedging the ring (a timeout would halt PFP/ME)
+			waitAborted = true;
+			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+			RLOG("vmid %u: gfx fence %u wait aborted: a sleep was requested (%s)", c.vmid, fence, why);
+			return false;
+		}
+		if (polls < 200)
+			IODelay(10);
+		else
+			IOSleep(1);
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	if (done) {
+		gfxClientRetire(c);
+		return true;
+	}
+	RLOG("vmid %u: gfx fence %u not reached after %u ms (%s)", c.vmid, fence, timeoutMs, why);
+	gfxClientWedge(why);
+	return false;
+}
+
+/* Before a client's buffers go away (free, close) its outstanding gfx IBs must be done: they may still read or write them. */
+void RDNA4Compute::gfxClientDrain(RtClient &c, const char *why) {
+	gfxClientRetire(c);
+	if (!c.gfxOutstanding)
+		return;
+	uint64_t ns = 0;
+	(void)gfxClientWait(c, c.gfxFences[c.gfxOutstanding - 1], 2000, ns, why);
+}
+
+IOReturn RDNA4Compute::rtSubmitGfxIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags, uint64_t &fence) {
+	Locked g(rtLock);
+	IdleUse idle(this, "submit-gfx");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
+	checkPresentationTimeoutLocked();
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;                 // a gfx IB needs the client's own VMID: no GPUVM, no client gfx
+	RtClient *c = vmClientFor(owner);
+	if (!c)
+		return kIOReturnNoResources;
+	const IOReturn ready = gfxClientReady();
+	if (ready != kIOReturnSuccess)
+		return ready;
+	/* IB_SIZE is 20 bits; flags are reserved. The IB must lie inside one buffer this client owns (the same rule as rtSubmitIb): what the IB
+	 * then touches is limited by the client's page tables (VMID) and the CP's unprivileged-IB rules, not by anything the kext parses. */
+	if (!ibVa || (ibVa & 3) || !dwords || dwords > 0xfffffu || flags)
+		return kIOReturnBadArgument;
+	const uint64_t ibBytes = dwords * 4;
+	RtBuffer *containing = nullptr;
+	for (RtBuffer &b : buffers) {
+		if (b.owner != owner || (!b.device && !b.host) || !b.va || ibVa < b.va)
+			continue;
+		const uint64_t offset = ibVa - b.va;
+		if (offset <= b.bytes && ibBytes <= b.bytes - offset) {
+			containing = &b;
+			break;
+		}
+	}
+	if (!containing)
+		return kIOReturnBadArgument;
+	gfxClientRetire(*c);
+	uint32_t value = 0;
+	const IOReturn r = gfxClientEmit(*c, ibVa, static_cast<uint32_t>(dwords), value);
+	if (r == kIOReturnSuccess)
+		fence = value;
+	return r;
+}
+
+IOReturn RDNA4Compute::rtWaitGfxFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns) {
+	Locked g(rtLock);
+	IdleUse idle(this, "wait-gfx");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
+	checkPresentationTimeoutLocked();
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;
+	RtClient *c = vmClientFor(owner);
+	if (!c || !c->gfxFenceCpu)
+		return kIOReturnNoResources;
+	if (!gfxMode)
+		return kIOReturnUnsupported;
+	if (timeoutMs > RDNA4_MAX_TIMEOUT_MS || static_cast<int32_t>(fence - c->gfxFence) > 0)
+		return kIOReturnBadArgument;
+	if (gfxWedged)
+		return kIOReturnNotResponding;
+	waitAborted = false;
+	if (gfxClientWait(*c, fence, timeoutMs ? timeoutMs : 1000, ns, "IB wait"))
+		return kIOReturnSuccess;
+	if (waitAborted) {                               // P7
+		waitAborted = false;
+		return kIOReturnAborted;
+	}
+	return kIOReturnTimeout;
+}
+
+/* rdna4-gfxclient=1, on the bring-up thread after the G3 baseline passed: a synthetic client (internal owner token, its own VMID and page
+ * tables), a gfx IB built from two WRITE_DATA packets to a data page mapped in that VMID, two submissions with their per-client fences. It
+ * proves the ring path (CONTEXT_CONTROL + IB in a client VMID + fence) with memory the IB reaches only through the client's tables. The
+ * regular gates do not apply here: this IS the kernel using its ring, before gfxPark and before clients can submit. */
+bool RDNA4Compute::gfxClientSelfTest() {
+	static char token;
+	const void *owner = &token;
+	if (!vmEnabled || !gfxMode) {
+		RLOG("gfx client self-test skipped: needs rdna4-vm=1 and rdna4-gfx=2");
+		publishResult("gfx-client", "SKIPPED needs rdna4-vm=1 and rdna4-gfx=2");
+		return false;
+	}
+	if (rtOpen(owner) != kIOReturnSuccess) {
+		publishResult("gfx-client", "FAIL client open");
+		return false;
+	}
+	bool pass = false;
+	char result[128];
+	snprintf(result, sizeof(result), "FAIL setup");
+	{
+		Locked g(rtLock);
+		RtClient *c = clientFor(owner);
+		const uint32_t ibOff = kGfxOffset + 0x30000, dataOff = kGfxOffset + 0x31000;   // free pool pages between the G3 slots and the target
+		if (c && c->tableShadow && c->gfxFenceCpu) {
+			const uint64_t ibVa = c->nextVa, dataVa = c->nextVa + 0x1000;
+			c->nextVa += 0x2000;
+			if (vmMap(*c, ibVa, poolMc(ibOff), 0x1000, true) && vmMap(*c, dataVa, poolMc(dataOff), 0x1000, false)) {
+				uint32_t ib[16], n = 0;
+				n += Pm4::writeData(ib + n, dataVa, 0x600DF00Du);
+				n += Pm4::writeData(ib + n, dataVa + 4, 0x57EE1E57u);
+				for (uint32_t i = 0; i < n; i++)
+					*poolDw(ibOff + 4 * i) = ib[i];
+				*poolDw(dataOff) = 0;
+				*poolDw(dataOff + 4) = 0;
+				*c->gfxFenceCpu = 0;
+				c->gfxFence = 0;
+				flushHdp();
+				uint32_t f1 = 0, f2 = 0;
+				uint64_t ns1 = 0, ns2 = 0;
+				const IOReturn e1 = gfxClientEmit(*c, ibVa, n, f1);
+				const bool w1 = e1 == kIOReturnSuccess && gfxClientWait(*c, f1, 2000, ns1, "self-test");
+				const bool d1 = *poolDw(dataOff) == 0x600DF00Du && *poolDw(dataOff + 4) == 0x57EE1E57u;
+				*poolDw(dataOff) = 0;                                   // the second submission must write again: its own fence, its own effect
+				flushHdp();
+				const IOReturn e2 = w1 ? gfxClientEmit(*c, ibVa, n, f2) : kIOReturnNotReady;
+				const bool w2 = e2 == kIOReturnSuccess && gfxClientWait(*c, f2, 2000, ns2, "self-test");
+				const bool d2 = *poolDw(dataOff) == 0x600DF00Du;
+				pass = w1 && d1 && w2 && d2 && f2 == nextFence(f1) && !c->gfxOutstanding && !gfxClientPending;
+				RLOG("gfx client self-test: vmid %u, IB at VA 0x%llx (%u dwords), data at VA 0x%llx: submit %d fence %u %s data %s, "
+				     "submit %d fence %u %s data %s, pending %u/%u: %s", c->vmid, ibVa, n, dataVa, e1, f1, w1 ? "done" : "NOT done",
+				     d1 ? "ok" : "WRONG", e2, f2, w2 ? "done" : "NOT done", d2 ? "ok" : "WRONG", c->gfxOutstanding, gfxClientPending,
+				     pass ? "PASS" : "FAIL");
+				snprintf(result, sizeof(result), "%s client gfx IB in VMID %u: WRITE_DATA through the client's tables, two per-client fences (%llu / %llu us)",
+				         pass ? "PASS" : "FAIL", c->vmid, ns1 / 1000, ns2 / 1000);
+				logClientFault(*c, "gfx client self-test");
+			}
+		}
+	}
+	rtRelease(owner);
+	publishResult("gfx-client", result);
+	return pass;
 }
 
 IOReturn RDNA4Compute::rtPresent(const void *owner, uint64_t handle, uint64_t offset,
@@ -2635,6 +3095,8 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		if (slot.owner == owner)
 			slot = PresentSlot {};
 	RtClient *c = clientFor(owner);
+	if (c && c->gfxOutstanding)
+		gfxClientDrain(*c, "client close");   // W12k: before its buffers and page tables go away
 	uint32_t nb = 0, np = 0;
 	bool hostUnmapped = false;
 	for (RtBuffer &b : buffers) {
@@ -2677,7 +3139,21 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	if (nb || np)
 		RLOG("client closed: freed %u buffer(s), %u program(s)", nb, np);
 	if (c && vmEnabled) {
+		if (c->shared) {
+			/* No HQD to dequeue. Jobs still in flight on the shared queue must finish before the tables go: wait (bounded) for
+			 * the client's fence, and recover the queue (kill this VMID's waves) if they do not. */
+			vmOpTrace("release (shared)", c->vmid, c->pipe, c->queue);
+			if (c->ibOutstanding) {
+				const uint32_t want = c->fence;
+				for (uint32_t ms = 0; ms < 500 && !fenceReached(*c->fenceCpu, want); ms++)
+					IOSleep(1);
+				if (!fenceReached(*c->fenceCpu, want))
+					(void)recoverSharedQueue(c->sq, c->vmid, "client close");
+			}
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + c->vmid - 1 }, 0);   // the context goes off before its tables do
+		} else {
 		/* Dequeue is deliberately polled: W1's interrupt path is not required. */
+		vmOpTrace("release before dequeue", c->vmid, c->pipe, c->queue);
 		grbmSelect(1, c->pipe, c->queue, c->vmid);
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
 		bool inactive = false;
@@ -2690,6 +3166,8 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			RLOG("vmid %u: queue MEC1 pipe %u queue %u dequeue timeout (ACTIVE 0x%08x)",
 			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
 		grbmSelect(0, 0, 0, 0);
+		vmOpTrace(inactive ? "release after dequeue" : "release after dequeue TIMEOUT", c->vmid, c->pipe, c->queue);
+		}
 		/* The table allocation is reused by the next client.  Unmapping each
 		 * live object leaves untouched PDEs/PTEs behind, so clear the complete
 		 * image before releasing the VMID or its backing VRAM. */
@@ -2698,11 +3176,15 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			RLOG("vmid %u: page-table teardown clear failed", c->vmid);
 		vmInvalidate(c->vmid, "client close");
 		vmidUsed[c->vmid] = false;
-		queueUsed[c->pipe][c->queue] = false;
+		if (!c->shared)
+			queueUsed[c->pipe][c->queue] = false;
 		IOFree(c->tableShadow, kVmTableBytes);
 		devHeap.free(c->tableOffset);
-		RLOG("vmid %u: client closed, freed MEC1 pipe %u queue %u and page tables",
-		     c->vmid, c->pipe, c->queue);
+		if (c->shared)
+			RLOG("vmid %u: shared-queue client closed, freed its page tables", c->vmid);
+		else
+			RLOG("vmid %u: client closed, freed MEC1 pipe %u queue %u and page tables",
+			     c->vmid, c->pipe, c->queue);
 		*c = RtClient {};
 	} else if (c) {
 		*c = RtClient {};
@@ -2719,6 +3201,7 @@ void RDNA4Compute::powerWillSleep() {
 	powerSleeping = true;
 	resumePending = false;
 	RLOG("power: quiesce begin (runtime not ready)");
+	gcWake(0xfffffffdu);        // P7: lift GFXOFF explicitly first (every GC access below would wake it anyway); a clean log and no sleeping GC under the drain
 	// Calls serialize on rtLock, so no dispatch or SDMA fence can still be
 	// executing here. Drain every HQD with the same bounded poll used by W6.
 	auto drainQueue = [this](uint32_t pipe, uint32_t queue, uint32_t vmid,
@@ -2745,8 +3228,11 @@ void RDNA4Compute::powerWillSleep() {
 		return inactive;
 	};
 	(void)drainQueue(0, 0, 0, nullptr);
+	/* rdna4-vmshared: the shared queues are the only HQDs the clients use; they are re-created at the next open after the wake. */
+	if (vmShared && sharedInit)
+		sharedStopAll("system sleep");
 	for (RtClient &c : clients) {
-		if (!c.active || !c.vmid)
+		if (!c.active || !c.vmid || c.shared)
 			continue;
 		Launch recovery {};
 		recovery.queue = &c.pm4;
@@ -2769,6 +3255,7 @@ void RDNA4Compute::powerWillSleep() {
 	// The flip implementation has no independent timer in this worktree;
 	// IH DCN teardown is the hook that stops its vblank/pflip activity.
 	RLOG("power: IH disabled, flip timer hook stopped");
+	gfxSleepDrain();            // P7: give client gfx IBs 100 ms, then drop them (no wedge), BEFORE PFP/ME are halted
 	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
 	wr(IpDiscovery::HwGc, CpMecRs64Cntl, rdGc(CpMecRs64Cntl) | kRs64Halt);
 	dmaTeardown("system sleep");
@@ -2807,9 +3294,15 @@ void RDNA4Compute::resetRuntimeForResume() {
 		c.tableOffset = c.rootMc = c.rootPhys = 0;
 		c.queueCpu = nullptr;
 		c.kernargCpu = c.fenceCpu = nullptr;
+		c.gfxFenceCpu = nullptr;                 // W12k: the ring is re-initialised by the wake's stageGfxRing; nothing of this client is pending
+		c.gfxFenceMc = 0;
+		c.gfxOutstanding = 0;
 	}
 	bzero(vmidUsed, sizeof(vmidUsed));
 	bzero(queueUsed, sizeof(queueUsed));
+	for (SharedQueue &q : sharedQ)
+		q.up = q.wedged = false;
+	sharedInit = false;
 	if (devHeapMap) {
 		IOFree(devHeapMap, devHeapMapBytes);
 		devHeapMap = nullptr;

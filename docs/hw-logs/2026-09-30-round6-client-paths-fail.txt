@@ -1,0 +1,129 @@
+# Excerpt of rdna4fb-diag-20260930-061829.txt (real card, round 6, VM boot; copied read-only from the OPENCORE stick)
+# Lines 205-245 (sensors + rdna4-run selftest), 306 (RDNA4FB,Results), 419-475 (dmesg: client queues), 520-542 (summary).
+# The lead verified this run: only the boot self-test passes; every client path fails (memory note 2026-09-30).
+
+=== GPU sensors, idle baseline (before selftest and bench) ===
+sensors: edge 43 C, hotspot 49 C, GFX 3422 MHz, memory 193 MHz, socket 76 W, fan 0 RPM
+sensors-pm[1]: GFXCLK avg pre-DS 3422 post-DS 3422 MHz (CurrClock 1000, AvgCurrent 46355 A: not trusted on driver IF 0x33), GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1181 mV, socket 76 W, hotspot 49 C, MetricsCounter 187497
+sensors-pm[1]: throttling % none (mask 0x0; #12-17 = TDC/PPT, THROTTLER_*_BIT in smu14_driver_if_v14_0.h)
+sensors-pm[2]: GFXCLK avg pre-DS 3417 post-DS 3417 MHz (CurrClock 1000, AvgCurrent 49607 A: not trusted on driver IF 0x33), GFX activity 100 %, UCLK activity 1 %, VDD_GFX 1179 mV, socket 80 W, hotspot 55 C, MetricsCounter 935
+sensors-pm[2]: throttling % none (mask 0x0; #12-17 = TDC/PPT, THROTTLER_*_BIT in smu14_driver_if_v14_0.h)
+sensors-pm: MetricsCounter 187497 -> 935: table LIVE
+sensors-pm: verdict INCONCLUSIVE (activity field implausible: MetricsCounter delta not about 1 ms per tick; read the raw fields)
+
+=== user-space compute runtime (rdna4-run selftest) ===
+selftest: dispatch: (iokit/common) device not responding
+ABI 4, bring-up stage 7, ready
+heap: 7896 MiB, 7892 MiB free, GPU base 0x8010000000
+transfers: DMA by the GPU's copy engine; buffers from VRAM past the BAR
+GPUVM: VMID 8, MEC1 pipe 0 queue 1
+  FAIL  VM isolation dispatch: (iokit/common) I/O Timeout
+  FAIL  VM peer 0: (iokit/common) device not responding
+  FAIL  VM peer 1: (iokit/common) device not responding
+vadd: 12288-byte image, 24 bytes of kernargs, RSRC1 0x600f0040 RSRC2 0x00000084
+  FAIL  host-memory vadd dispatch: (iokit/common) device not responding
+  ok    dispatch through freed host VA faulted cleanly ((iokit/common) device not responding)
+  FAIL  SubmitIb vadd/wait: (os/kern) successful
+  FAIL  three IBs then oldest-fence wait: (iokit/common) device not responding
+  FAIL  ten back-to-back IBs: (iokit/common) device not responding (data differs)
+  ok    an IB VA outside the client's buffers refused ((iokit/common) device not responding)
+buffers: a 0x1001a0000, b 0x1001e0000, c 0x100220000 (256 KiB each)
+note: emulated card — using bounded rdna4-run bench small
+
+=== compute benchmarks (rdna4-run bench small) ===
+ABI 4, bring-up stage 7, ready, WEDGED (a dispatch timed out; reboot)
+heap: 7896 MiB, 7892 MiB free, GPU base 0x8010000000
+transfers: DMA by the GPU's copy engine; buffers from VRAM past the BAR
+GPUVM: VMID 8, MEC1 pipe 0 queue 1
+sgemm: 64x64 tiles, 16x16 work-items, 8320 bytes of LDS per work-group
+hgemm: 128x128 tiles, 8 waves of WMMA 16x16x16 (FP16/BF16 in, FP32 sums), 20480 bytes of LDS per work-group
+  ok    host->GPU 4028 MB/s, GPU->host 3528 MB/s (16 MiB each way)
+  FAIL  GPU read from host memory: (iokit/common) device not responding
+  FAIL  VRAM copy: (iokit/common) device not responding
+  FAIL  sgemm n=64: (iokit/common) device not responding
+  FAIL  hgemm FP16 n=128: (iokit/common) device not responding
+bench: FAILED
+[...]
+  |   "RDNA4FB,Results" = {"ih"="PASS ring up, 342 interrupt wakeups","vblank"="PASS IRQ frames 10800","flip"="PASS boot flip restored desktop","vm"="PASS boot self-test","runtime"="PASS service ready"}
+[...]
+      
+
+=== dmesg: feature lines (IH, VM, GFX, flip, trails and hangs) ===
+[  202.033778]: RDNA4FB: ih: vblank: OTG0 count 10800 (acknowledged)
+[  224.245769]: RDNA4FB: ih: SDMA trap interrupt: count 16
+[  224.249198]: RDNA4FB: runtime: vmid 8: client queue activated MEC1 pipe 0 queue 1, PDB2 MC 0x8010000000 physical 0x10000000, doorbell dword 26
+[  224.394352]: RDNA4FB: runtime: vmid 8: queue MEC1 pipe 0 queue 1 dequeue timeout (ACTIVE 0x00000001)
+[  224.497964]: RDNA4FB: ih: SDMA trap interrupt: count 28
+[  224.498179]: RDNA4FB: runtime: vmid 8: client closed, freed MEC1 pipe 0 queue 1 and page tables
+[  224.667858]: RDNA4FB: runtime: vmid 8: client queue activated MEC1 pipe 0 queue 1, PDB2 MC 0x8010000000 physical 0x10000000, doorbell dword 26
+[  225.832591]: RDNA4FB: runtime: vmid 8: queue MEC1 pipe 0 queue 1 dequeue timeout (ACTIVE 0x00000001)
+[  225.937636]: RDNA4FB: runtime: vmid 8: client closed, freed MEC1 pipe 0 queue 1 and page tables
+[  226.111836]: RDNA4FB: runtime: vmid 8: client queue activated MEC1 pipe 0 queue 1, PDB2 MC 0x8010000000 physical 0x10000000, doorbell dword 26
+[  226.115578]: RDNA4FB: runtime: vmid 9: client queue activated MEC1 pipe 0 queue 2, PDB2 MC 0x8010400000 physical 0x10400000, doorbell dword 28
+[  228.120968]: RDNA4FB: compute: runtime: HQD active 0x00000001 vmid 0x00000009 persistent 0x0be05501 PQ base 0x00000000:01000000 rptr 0x00000000 wptr 0x00000000:00000042 doorbell 0xc0000070 PQ_CONTROL 0xd0300909 dequeue 0x00000000
+[  228.411972]: RDNA4FB: runtime: vmid 9: queue MEC1 pipe 0 queue 2 dequeue timeout (ACTIVE 0x00000001)
+[  228.514668]: RDNA4FB: runtime: vmid 9: client closed, freed MEC1 pipe 0 queue 2 and page tables
+[  228.516350]: RDNA4FB: runtime: vmid 8: host buffer 262144 bytes mapped at GPU VA 0x100090000, user 0x10c370000, 64 pages
+[  228.516942]: RDNA4FB: runtime: vmid 8: host buffer 262144 bytes mapped at GPU VA 0x1000d0000, user 0x10c3b0000, 64 pages
+[  228.517512]: RDNA4FB: runtime: vmid 8: host buffer 262144 bytes mapped at GPU VA 0x100110000, user 0x10c3f0000, 64 pages
+[  228.517896]: RDNA4FB: runtime: vmid 8: host buffer handle 0x30003 unmapped
+[  228.518131]: RDNA4FB: runtime: vmid 8: host buffer handle 0x30002 unmapped
+[  228.518363]: RDNA4FB: runtime: vmid 8: host buffer handle 0x30001 unmapped
+[  228.519005]: RDNA4FB: runtime: vmid 8: host buffer 4096 bytes mapped at GPU VA 0x100150000, user 0x10c370000, 1 pages
+[  228.519619]: RDNA4FB: runtime: vmid 8: host buffer 4096 bytes mapped at GPU VA 0x100160000, user 0x10c371000, 1 pages
+[  228.520240]: RDNA4FB: runtime: vmid 8: host buffer 1024 bytes mapped at GPU VA 0x100170000, user 0x10c372000, 1 pages
+[  228.520849]: RDNA4FB: runtime: vmid 8: host buffer 1024 bytes mapped at GPU VA 0x100180000, user 0x10c373000, 1 pages
+[  228.521473]: RDNA4FB: runtime: vmid 8: host buffer 1024 bytes mapped at GPU VA 0x100190000, user 0x10c374000, 1 pages
+[  228.521704]: RDNA4FB: runtime: vmid 8: host buffer handle 0x20005 unmapped
+[  228.521930]: RDNA4FB: runtime: vmid 8: host buffer handle 0x30004 unmapped
+[  228.522150]: RDNA4FB: runtime: vmid 8: host buffer handle 0x40003 unmapped
+[  228.522369]: RDNA4FB: runtime: vmid 8: host buffer handle 0x40002 unmapped
+[  228.522588]: RDNA4FB: runtime: vmid 8: host buffer handle 0x40001 unmapped
+[  228.668049]: RDNA4FB: runtime: vmid 8: queue MEC1 pipe 0 queue 1 dequeue timeout (ACTIVE 0x00000001)
+[  228.771257]: RDNA4FB: runtime: vmid 8: client closed, freed MEC1 pipe 0 queue 1 and page tables
+[  228.935199]: RDNA4FB: runtime: vmid 8: client queue activated MEC1 pipe 0 queue 1, PDB2 MC 0x8010000000 physical 0x10000000, doorbell dword 26
+[  228.973297]: RDNA4FB: runtime: vmid 8: host buffer 4194304 bytes mapped at GPU VA 0x101050000, user 0x1002c2000, 1024 pages
+[  228.977276]: RDNA4FB: runtime: vmid 8: host buffer handle 0x70001 unmapped
+[  229.133476]: RDNA4FB: runtime: vmid 8: queue MEC1 pipe 0 queue 1 dequeue timeout (ACTIVE 0x00000001)
+[  229.236086]: RDNA4FB: runtime: vmid 8: client closed, freed MEC1 pipe 0 queue 1 and page tables
+[  229.433660]: RDNA4FB: runtime: vmid 8: client queue activated MEC1 pipe 0 queue 1, PDB2 MC 0x8010000000 physical 0x10000000, doorbell dword 26
+[  230.353589]: Sandbox apply: bluetoothd[886] <bytes>RDNA4FB: runtime: vmid 8: queue MEC1 pipe 0 queue 1 dequeue timeout (ACTIVE 0x00000001)
+[  230.681370]: RDNA4FB: runtime: vmid 8: client closed, freed MEC1 pipe 0 queue 1 and page tables
+[  230.844613]: RDNA4FB: runtime: vmid 8: client queue activated MEC1 pipe 0 queue 1, PDB2 MC 0x8010000000 physical 0x10000000, doorbell dword 26
+[  232.972897]: RDNA4FB: runtime: vmid 8: queue MEC1 pipe 0 queue 1 dequeue timeout (ACTIVE 0x00000001)
+[  233.075624]: RDNA4FB: runtime: vmid 8: client closed, freed MEC1 pipe 0 queue 1 and page tables
+[  233.238084]: RDNA4FB: runtime: vmid 8: client queue activated MEC1 pipe 0 queue 1, PDB2 MC 0x8010000000 physical 0x10000000, doorbell dword 26
+[  233.238121]: RDNA4FB: flip: pipe OTG0 OPP0 HUBP0 surface 0x8000000000, 1920x1080 pitch 1920 (8294400 bytes)
+[  233.381170]: RDNA4FB: runtime: vmid 8: queue MEC1 pipe 0 queue 1 dequeue timeout (ACTIVE 0x00000001)
+[  233.483890]: RDNA4FB: runtime: vmid 8: client closed, freed MEC1 pipe 0 queue 1 and page tables
+[  233.667125]: RDNA4FB: runtime: vmid 8: client queue activated MEC1 pipe 0 queue 1, PDB2 MC 0x8010000000 physical 0x10000000, doorbell dword 26
+[  233.667166]: RDNA4FB: flip: pipe OTG0 OPP0 HUBP0 surface 0x8000000000, 1920x1080 pitch 1920 (8294400 bytes)
+[  233.812297]: RDNA4FB: runtime: vmid 8: queue MEC1 pipe 0 queue 1 dequeue timeout (ACTIVE 0x00000001)
+[  233.915003]: RDNA4FB: runtime: vmid 8: client closed, freed MEC1 pipe 0 queue 1 and page tables
+
+=== ioreg: framebuffer properties ===
+    | |   |           | |   "VRAM,totalsize" = <0000000004000000>
+[...]
+
+=== WindowServer attached? ===
+2 IOFramebufferUserClient instance(s)
+
+=== feature summary ===
+FEATURE      STATUS   KEY
+runtime      FAIL     info/selftest/bench did not all pass
+submitib     FAIL     SubmitIb selftest did not prove ordered completion
+fault        FAIL     freed-VA fault did not recover cleanly
+vm           FAIL     GPUVM command and RDNA4FB,Results did not both pass
+ih           FAIL     IH self-test and RDNA4FB,Results did not both pass
+vblank       PASS     vsync: 120 vblanks, refresh 60.000 Hz, interval 16666557 ns (jitter 16571321..16775593 ns)
+gfx          SKIPPED  rdna4-gfx not enabled
+flip         FAIL     show did not restore the desktop
+anim         FAIL     animation command failed
+w6           SKIPPED  queue recovery disabled or runtime absent
+sensors      PASS     sensors: edge 49 C, hotspot 55 C, GFX 3418 MHz, memory 193 MHz, socket 80 W, fan 0 RPM
+sensors-idle PASS     INCONCLUSIVE (activity field implausible: MetricsCounter delta not about 1 ms per tick; read the raw fields) | avg GFXCLK 3417 MHz, activity 100%, 80 W
+sensors-pm   PASS     SMU-REPORTS-GFX-BUSY (100 % activity at an average of 3417 MHz; compare with the pm: survey lines' GRBM/CP/queue state to see which engine, if any, is busy) | avg GFXCLK 3417 MHz, activity 100%, 80 W
+gfxcg        SKIPPED  bring-up did not reach stage 7, so the default clock gating was not applied
+gfxoff       SKIPPED  rdna4-gfxoff not enabled
+gfxpm        SKIPPED  rdna4-gfxpm not enabled
+sleep        SKIPPED  rdna4-sleeptest not enabled
