@@ -1615,9 +1615,23 @@ void RDNA4Compute::scrubFaultPage() {
 // XNACK"), prints such a fault, and gets the queue back with a reset. So a wait for a client's job does not run
 // out its timeout once the hub has latched a fault for the client's address space: it ends there, the queue is
 // reset, and the client is told its job faulted (kIOReturnVMError), not that it timed out.
+//
+// The hub holds the first fault it latched until that is cleared, and records none after it. The graphics ring
+// leaves an entry there with every submission (address space 0, CPG, address 0: the stray fetch gfxring.cpp
+// describes), and behind it a client's fault went unseen (2026-10-07, with a Vulkan program presenting beside the
+// self-test: both fault tests ran into their timeout). Nobody waits for address space 0's, so such an entry is
+// cleared here; that is also why this is called before a job is kicked, with 0.
+// ponytail: a client's fault that arrives while such an entry sits there is still lost, and its job then ends by
+// timeout; the waits look every 10 us at first and every millisecond after, so the gap is small. Closing it
+// needs the hub's fault interrupt.
 bool RDNA4Compute::vmJobFaulted(uint32_t vmid) {
 	const uint32_t status = rdGc(GcL2FaultStatusLo);
-	return vmid && status && status != 0xffffffffu && ((status >> 20) & 0xf) == vmid;
+	if (!status || status == 0xffffffffu)
+		return false;
+	const uint32_t faulted = (status >> 20) & 0xf;
+	if (!faulted)
+		gcFaultClear();
+	return vmid && faulted == vmid;
 }
 
 // Where a faulting access goes. The hub's bring-up points the L2 fault default at a scratch page in VRAM, with
@@ -2836,6 +2850,7 @@ IOReturn RDNA4Compute::submitIbLocked(RtClient &c, uint64_t ibVa, uint64_t dword
 		return kIOReturnNoResources;
 	c.fence = value;
 	flushHdp();
+	(void)vmJobFaulted(0);             // an entry of the graphics ring's would hide this job's fault
 	pm4Kick(ring, c.doorbell, ring.wptr());
 	if (qseq) {
 		vmPool.noteSubmit(c.vmid, c.sq, qseq);
@@ -2887,12 +2902,13 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 				waitAborted = true;
 				break;
 			}
-			if (polls < 200)
-				IODelay(10);
-			else if (vmJobFaulted(c->vmid)) {
+			if (vmJobFaulted(c->vmid)) {
 				waitFaulted = true;
 				break;
-			} else
+			}
+			if (polls < 200)
+				IODelay(10);
+			else
 				IOSleep(1);
 		}
 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);

@@ -475,6 +475,8 @@ void RDNA4Compute::n48nClose(const void *owner) {
 		VLOG("client closes with work on the graphics queue that did not finish");
 	wr(IpDiscovery::HwGc, Reg { 0, static_cast<uint16_t>(GcCtx1Cntl.dword + n48n->vmid - 1) }, 0);   // the context goes off before its table does
 	vmidUsed[n48n->vmid] = false;
+	if (((rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == n48n->vmid)
+		gcFaultClear();                // a fault of this client's left in the hub would hide the next client's (vmJobFaulted)
 	if (n48n->copyTestPage)
 		heap.free(n48n->copyTestPage);
 	n48n->client.close();

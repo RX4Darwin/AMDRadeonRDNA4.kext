@@ -393,6 +393,29 @@ Expected: the triangle keeps moving, `vkprobe2.txt` ends as in step 1, and the t
 
 Report: the three text files and the two logs.
 
+### Run 2026-10-07 (kext `D6755449`): the Vulkan side passes, the runtime's two fault tests time out
+
+Logs `rdna4fb-diag-20261007-150805` (step 1) and `-151257` (step 2), `n48nprobe-2.txt`, `vkprobe-5.txt`, `vkprobe2.txt`.
+
+- **Vulkan with `rdna4-vm=1`: passes.** `n48nprobe` all ok in address space 8; `vkprobe` fills, triangle, 300 frames in
+  5.00 s, desktop back.
+- **At the same time: works.** `vkprobe` showed 6957 frames in 120 s while the script ran; the runtime's clients got
+  address spaces 9 and 10 (`runtime: vmid 9: shared-queue client`, `GPUVM: VMID 9`); 24 of the self-test's lines `ok`,
+  `gfx-app-tri` and `gfx-app-tricol` PASS on the ring the Vulkan program was drawing on.
+- **Failed in both steps:** `VM isolation dispatch: I/O Timeout`, and in step 2 also `dispatch through freed host VA
+  timed out`; so `runtime`, `submitib`, `fault` and `vm` FAIL in the table. The queue came back each time (`waves
+  reset ...: it runs`), after the 2 s timeout instead of after 3 ms.
+- Cause: the hub keeps the first fault it latched until it is cleared. Every submission on the graphics ring
+  leaves one there (`GC hub fault status 0x00000d3d (fault VMID 0)`, the known stray fetch at address 0), the Vulkan
+  program one per frame, and the client's fault behind it is not recorded. In the earlier passing runs nothing had
+  used the graphics ring between the boot's own clearing and the self-test.
+- The 237 frames `vkprobe2` is short of the display's count are the two timeouts: 2 s each with the runtime's lock held.
+
+**The fix** (kext `56AEEF41`, compile-checked): the fault check clears an entry that names address space 0, runs on
+every poll of a wait and once before a job is kicked; and the Vulkan client's close clears an entry of its own.
+**Next run: both steps again**, same arguments and commands. Expected now: all rows PASS in both, and `vkprobe2`'s
+frame count within a few of the display's.
+
 ## After the tests
 
 For what passes, the README's file table, `docs/vulkan-port.md` and `vulkan/README.md` get the date and what ran.

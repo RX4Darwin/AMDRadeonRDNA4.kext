@@ -191,8 +191,10 @@ carries the calls and maps a buffer into the process. One connection at a time.
 
 It needs the compute bring-up (`rdna4-compute=6` or `7`) with its copy engine and DMA working. Until 2026-10-07 it
 refused to open with `rdna4-vm=1`, whose clients use the same address-space numbers; since then it takes its number
-from the runtime's table of the ones in use (`vmidUsed`), so both work in one boot (code, not yet run on the card:
-`docs/todo-vulkantest.md`, "With `rdna4-vm=1`"). It still refuses with `rdna4-vmshared=2`, which hands address spaces out
+from the runtime's table of the ones in use (`vmidUsed`), so both work in one boot. On the card 2026-10-07: the probes
+pass with `rdna4-vm=1`, and a Vulkan program presented for two minutes in address space 8 while the runtime's
+self-test ran in 9 and 10 on the same graphics ring (`docs/todo-vulkantest.md`, "With `rdna4-vm=1`"; that run also
+found the runtime's fault check blinded by the graphics ring's stray fault entry, fixed since, fix not yet run). It still refuses with `rdna4-vmshared=2`, which hands address spaces out
 per job.
 
 **The proof on the card** is a call of this kext's own, outside the Vulkan interface

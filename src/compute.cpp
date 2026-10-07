@@ -3241,9 +3241,10 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	const uint32_t timeoutUs = l.timeoutUs ? l.timeoutUs : 1000000;
 	uint64_t t0 = mach_absolute_time(), span = 0;
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutUs) * 1000, &span);
-	if (vm)
+	if (vm) {
+		(void)vmJobFaulted(0);                           // an entry of the graphics ring's would hide this job's fault
 		pm4Kick(q, l.doorbell, q.wptr());
-	else {
+	} else {
 		pm4Fence = fenceValue;
 		pm4Kick(q.wptr());
 	}
@@ -3262,12 +3263,13 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 				waitAborted = true;
 				break;
 			}
-			if (polls < 200)
-				IODelay(10);
-			else if (vm && vmJobFaulted(l.vmid)) {       // its job is dead: no point in the rest of the timeout (runtime.cpp)
+			if (vm && vmJobFaulted(l.vmid)) {            // its job is dead: no point in the rest of the timeout (runtime.cpp)
 				waitFaulted = true;
 				break;
-			} else
+			}
+			if (polls < 200)
+				IODelay(10);
+			else
 				IOSleep(1);
 		}
 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
