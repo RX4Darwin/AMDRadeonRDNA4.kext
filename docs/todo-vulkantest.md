@@ -504,8 +504,8 @@ at the same time.
 
 ## A shader that faults
 
-Written 2026-10-07. The first two runs tested something else than they said; the third reproduced the hang; the
-fix for it is an experiment that has not run.
+Written 2026-10-07. The first two runs tested something else than they said; the third reproduced the hang; in
+the fourth the kext got its ring back after it.
 
 ### What the first two runs really tested
 
@@ -553,26 +553,48 @@ has to be seen.
 
 So for shaders the assumption this section began with holds, and now there is a way to produce the hang.
 
-### Next run: noticed at once, and the ring kept? (kext `E0FE5F97`, an experiment)
+### Fourth run 2026-10-07 (kext `E0FE5F97`): the ring is kept; the fault is not noticed early
 
-The kext has again what was taken out, with one change:
+`vkfault-4.txt`, `vkprobe-11.txt`, `vkfaultcp.txt`, `vkprobe2-7.txt`, log `rdna4fb-diag-20261007-165955`.
 
-- While a client's work is waited for, the hub's entry for its address space is looked at and cleared every
-  millisecond. Three looks in a row with a new entry count as work that hangs on a fault (hung waves on the compute
-  queues fault again as soon as the entry is cleared; the command processor's fault is one entry and its work
-  finishes). The client's work is then lost at once.
-- Then, before the ring is shut, the attempts to keep it, queue left alone: twice `CP_VMID_RESET` with the address
-  space's bit and no queue, then `SPI_COMPUTE_QUEUE_RESET` with the graphics engine selected, each followed by 200 ms
-  for the lost work's own fence. **No source has this sequence.** If the fence does not come, the ring is shut as in
-  the third run.
-
-New kext (`make`) and new `build/vkprobe`. Same boot:
+**Part 1, the shader.**
 
 ```
-rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
+vulkan: work lost in address space 8 (fence 3 of 4): 0 look(s) in a row found a fault, the last at 0x0; hub fault 0x00000000, GRBM 0xa840382c, CP_STAT 0x80040000
+vulkan: step 1: CP_VMID_RESET 0x00000100 written (GRBM_GFX_INDEX was 0xe0000000), read back 0x00000100 at once and 0x00000100 after the wait: the fence came through
+vulkan: after the attempts: hub fault 0x00000000, GRBM 0xa800382c, CP_STAT 0x00000000
+vulkan: the client's work is ended; the graphics ring is back and stays in service
 ```
 
-**Part 1, the shader:**
+- **The ring comes back.** `CP_VMID_RESET` with the address space's bit and no queue: the lost work's fence came
+  through within 200 ms, SPI busy went, `CP_STAT` 0. The `vkprobe` after it: `done: all ok`, compute-shader fill,
+  triangle and frames. The script's table: all rows PASS, `gfx-app-tri` and `gfx-app-tricol` among them, idle 3 % and
+  19 W. In the third run the same fault left the ring shut and the GPU at 100 % until the reboot.
+- **The fault is not noticed before the ten seconds** (`wait -> -13 after 10.207 s`). No look in ten seconds found an
+  entry for the address space: the shader's fault sits behind the stray entry its own submission leaves first, and
+  a hung wave on this ring does not fault again when that is cleared (on the compute queues it does). For those
+  ten seconds the ring serves nobody.
+- The bit in `CP_VMID_RESET` reads back set until it is written 0 again, which the kext does.
+
+**Part 2, the command processor** (`vkfaultcp.txt`):
+
+- its fill into freed memory finishes, and the fills of good memory right after it are done;
+- its copy out of freed memory finishes and leaves the destination as it was;
+- right after that copy, **the command processor's fill of good memory is not done**, the shader's in the same
+  submission is; 10 ms later and from then on both are done, and the next program (`vkprobe2-7.txt`) is all ok.
+
+In the second run (another kext) it was the next program's two fills, both the command processor's then, 2.9 s
+later, and its draw after them was right. What fits both: after a copy whose source cannot be read, the command
+processor's own copy engine does nothing more until a shader or a draw has run. That is a guess from two runs. It
+matters because the work is reported finished, and because in the second run it reached the next program.
+
+**After the run** (kext `C1C4B053`, compile-checked): only what the card confirmed stays. The look for faults is out
+again (it found none); the recovery is `CP_VMID_RESET` twice at most, without the third attempt that never ran.
+`vkprobe`'s `fault` no longer calls ten seconds late.
+
+### Next run: the reduced kext
+
+New kext (`make`), new `build/vkprobe`, same boot. The shader part again:
 
 ```bash
 sudo ./vkprobe ./libvulkan_radeon.dylib fault > vkfault.txt 2>&1
@@ -582,35 +604,17 @@ sudo ./vkprobe ./libvulkan_radeon.dylib fault > vkfault.txt 2>&1
 sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
 ```
 
-- `vkfault.txt`: `a shader's fill into memory that is gone: ... the device is lost, noticed at once` (well under a
-  second), or `NOTICED LATE` after ten.
-- `vkprobe.txt`: `done: all ok` if the ring was kept; a failed first submission if it was not. In that case go
-  straight to the script and reboot; part 2 needs a working ring.
-
-**Part 2, the command processor** (the fills that were not done after the second run):
-
-```bash
-sudo ./vkprobe ./libvulkan_radeon.dylib fault cp > vkfaultcp.txt 2>&1
-```
-
-and at once:
-
-```bash
-sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe2.txt 2>&1
-```
-
-`vkfaultcp.txt` says after each step whether fills of good memory were done, up to three seconds later; `vkprobe2.txt`
-whether the next program's are. Note that this kext clears the hub's entry before every submission, which the kext
-of the second run did not; if nothing is lost now, that is the first suspect.
-
 ```bash
 sudo bash diagnostic-log.sh
 ```
 
-Report the four text files and the log. In the kernel log the `vulkan:` lines say what was seen and tried: `work
-lost in address space 8 (...): N look(s) in a row found a fault, the last at 0x...`, a `step N: ...: the fence came
-through` or `did not come` for each attempt, and `the graphics ring is back and stays in service` or the old `a
-client gfx IB did not finish`.
+Expected: `vkfault.txt` ends `the work did not finish and the device is lost` after about ten seconds; the kernel log
+has `did not finish in 10 s (...)`, `CP_VMID_RESET 0x00000100, attempt 1: the lost work's fence came through`, `the
+graphics ring is back and stays in service`; `vkprobe.txt` ends `done: all ok`; the table is all PASS.
+
+Open after this: noticing the fault before the ten seconds; the same recovery for the runtime's own graphics
+clients (`rdna4-run tri`), whose timeout still shuts the ring; and the command processor's fills that are not done
+after its failed copy.
 
 ## After the tests
 

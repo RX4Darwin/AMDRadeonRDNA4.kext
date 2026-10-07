@@ -129,11 +129,10 @@ int main(int argc, char **argv) {
 	 * whose memory is freed between recording and submitting (not valid Vulkan, on purpose: it is what a wrong
 	 * program does); a fill into it, then a copy out of it into the good buffer. After each, fills of the good
 	 * buffer, one by the command processor and one by a shader, which have to land.
-	 * On the card (2026-10-07): done by a shader (the default here, 252 KiB) the fill hangs, and after ten seconds
-	 * the device is lost and the kext's graphics queue shut; the kext is to notice within milliseconds and keep its
-	 * queue, so the device is expected to be lost at once and the next program to run. Done by the command
-	 * processor ("fault cp", 60 KiB) both finish, but the program after one such run found its own fills not done:
-	 * the fills after each step are there to pin that down. Ends here. */
+	 * On the card (2026-10-07): done by a shader (the default here, 252 KiB) the fill hangs; after ten seconds the
+	 * device is lost, and the kext gets its graphics queue back, so the next program runs (run this one again
+	 * without "fault" to see that). Done by the command processor ("fault cp", 60 KiB) both finish, the copy leaves
+	 * its destination as it was, and the command processor's next fill is not done. Ends here. */
 	if (argc > 2 && !strcmp(argv[2], "fault")) {
 		D(vkCmdCopyBuffer)
 		VkBufferCreateInfo gci = bci;
@@ -185,10 +184,10 @@ int main(int argc, char **argv) {
 			const double seconds = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
 			if (waited != VK_SUCCESS) {
 				/* The call that finds the work lost gets -13 from this driver, every later one -4 (device lost). */
-				printf("fault: %s %s: submit -> %d, wait -> %d after %.3f s: the work did not finish and the device is lost%s\n", by,
-				       steps[i].what, submitted, waited, seconds, seconds < 1 ? ", noticed at once" : "; NOTICED LATE");
+				printf("fault: %s %s: submit -> %d, wait -> %d after %.3f s: the work did not finish and the device is lost\n", by,
+				       steps[i].what, submitted, waited, seconds);
 				fflush(stdout);
-				_Exit(seconds < 1 ? 0 : 1);
+				_Exit(0);
 			}
 			vkResetFences(dev, 1, &fence);
 			if (steps[i].kind == kProbe) {

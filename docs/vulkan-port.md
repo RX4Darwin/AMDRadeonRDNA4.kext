@@ -363,3 +363,20 @@ A mode switch by macOS while a program holds the display leaves the program's la
 shape, until the program releases or exits. The reference's status counters for interrupts, repeats and
 watchdogs stay zero.
 
+## 11. A program whose shader faults (2026-10-07)
+
+`vkprobe <lib> fault` fills a buffer whose memory it has freed, with a compute shader (252 KiB; smaller fills of
+system memory are the command processor's, which is how the first tries of this tested the wrong thing). On the card:
+
+- the shader's waves do not end and the ring stands behind them; after ten seconds without progress the client's
+  work is lost and the driver reports the device lost. Until this day the kext then shut its ring for everybody
+  until the next boot, with the GPU at 100 %;
+- now it writes `CP_VMID_RESET` with the client's address-space bit and no queue. The lost work's fence comes
+  through, the waves are gone, and the ring stays in service: the next program, and the runtime's graphics
+  clients, ran (once so far, kext `E0FE5F97`). amdgpu's own reset also names the queue, which takes it down for the
+  MES to map again; that is left out, as for the compute queues (`docs/vm-client-rootcause.md` sections 19 and 20).
+
+Not done: the fault is only noticed by the ten seconds, during which the ring serves nobody; and after a failed
+copy by the command processor its next fill is silently not done. `docs/todo-vulkantest.md`, "A shader that
+faults", has the runs.
+

@@ -2529,21 +2529,6 @@ static int testN48N() {
 	// Closing gives everything back: buffers, every table page, the root.
 	c.close();
 
-	// Work the backend finds hanging on a fault is lost at the next look, not after ten seconds.
-	const uint64_t faultFrom = host.clockNs;
-	host.finishedSequence = 0;         // a new client's sequences start again
-	failures += check(c.open(host.backend(), 8, 1, (12u << 16) | 1) && call(N48N_SEL_HELLO, hello, 2, nullptr, 0, 4, nullptr, 0) == N48N::kSuccess &&
-	                  create(0x2000, 0, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kSuccess &&
-	                  mapping(N48N_VA_OP_MAP, 1, code, 0, 0x2000, rw | N48N_VM_PAGE_EXECUTABLE) == N48N::kSuccess &&
-	                  call(N48N_SEL_CTX, nullptr, 0, &ctx, sizeof(ctx), 0, &reply, sizeof(reply)) == N48N::kSuccess &&
-	                  submit(plainCs) == N48N::kSuccess && call(N48N_SEL_WAITSEQ, newest, 3, nullptr, 0, 3, nullptr, 0) == N48N::kSuccess &&
-	                  out[0] == 1, "n48n: a second client's work, unfinished and without a fault, is waited for");
-	host.fault = true;
-	failures += check(call(N48N_SEL_WAITSEQ, newest, 3, nullptr, 0, 3, nullptr, 0) == N48N::kTimeout && host.lostCalls == 2 &&
-	                  host.clockNs - faultFrom < N48N::kLostAfterNs && submit(plainCs) == N48N::kAborted,
-	                  "n48n: a fault ends the client's work %llu ms after it was submitted", (unsigned long long)((host.clockNs - faultFrom) / 1000000));
-	host.fault = false;
-	c.close();
 	failures += check(host.memory.empty() && host.tablePages == 0 && host.visibleUsed == 0 && host.highUsed == 0 &&
 	                  host.shown == HostBackend::kConsole && !host.displayTaken,
 	                  "n48n: close left %zu allocation(s), %llu table page(s), the display %s", host.memory.size(),
