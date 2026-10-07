@@ -915,7 +915,7 @@ private:
 	// answers Busy). W12k's gfx submit takes the IB's VMID from here; the compute paths acquire explicitly (they reserve ring space first) and
 	// read c.vmid afterwards.
 	uint32_t vmidForSubmit(RtClient &c) { return c.shared && vmShared == 2 ? vmAcquire(c) : c.vmid; }
-	static constexpr uint32_t kGfxDomain = 2;   // the VMID pool's fence domain for the gfx ring (0 and 1 are the shared compute queues)
+	static constexpr uint32_t kGfxDomain = Vmid::kDomainGfx;   // the VMID pool's fence domain for the gfx ring (0 and 1 are the shared compute queues)
 	static bool requestedVmIdTest();
 	static uint32_t vmIdTestMask();          // rdna4-vmid-test: 1 probes, 2 flow-point surveys, 4 client-op trace
 	void vmIdSurvey(const char *tag, uint32_t settleMs = 0);

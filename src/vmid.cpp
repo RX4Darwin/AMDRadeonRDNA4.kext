@@ -24,7 +24,7 @@ bool Pool::idle(uint32_t v) {
 	if (v >= kSlots)
 		return true;
 	Slot &s = slot[v];
-	for (uint32_t d = 0; d < kMaxDomains; d++) {
+	for (uint32_t d = 0; d < kDomainGfx; d++) {
 		if (!s.pending[d])
 			continue;
 		if (!reached || !reached(ctx, d, s.pendingSeq[d]))

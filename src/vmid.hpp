@@ -41,6 +41,8 @@ constexpr uint32_t kFirst = 1;            // VMID 0 is the kernel's physical con
 constexpr uint32_t kLast = 15;
 constexpr uint32_t kSlots = kLast + 1;    // indexed by VMID; slot 0 is never granted
 constexpr uint32_t kMaxDomains = 4;       // gfx ring + shared compute queues
+constexpr uint32_t kDomainGfx = 2;        // the gfx ring (W12k client IBs); domains 0 and 1 are the two shared compute queues
+static_assert(kDomainGfx < kMaxDomains, "the gfx ring is a fence domain of the pool");
 
 // Has `seq` been reached on fence domain `domain`? (wrap-aware compare is the caller's)
 using FenceReached = bool (*)(void *context, uint32_t domain, uint32_t seq);

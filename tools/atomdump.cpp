@@ -2314,6 +2314,65 @@ static int testVmidPool() {
 	fences.now[1] = 7;
 	f += check(pool.idle(vm), "vmid: idle once every domain reached its seq, wrap included");
 
+	// The gfx ring is a fence domain too (W12k client IBs, S8 mode 2): a VMID with a gfx IB in flight is never rebound to another
+	// client until the ring's fence reaches that IB's seq (wrap-aware), whatever the compute domains say.
+	uint32_t released = 0;
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	for (uintptr_t o = 1; o <= 15; o++)
+		pool.grab(o, o * 0x1000, 0, g);
+	pool.grab(15, 15 * 0x1000, 0, g);
+	const uint32_t vgfx = g.vmid;
+	fences.now[kDomainGfx] = 0xfffffff0u;                        // the gfx ring is 14 short of the IB's seq, which is close to the wrap
+	pool.noteSubmit(vgfx, kDomainGfx, 0xfffffffeu);              // owner 15's gfx IB: seq 0xfffffffe on the gfx domain
+	f += check(!pool.idle(vgfx), "vmid gfx: busy while the gfx fence has not reached the IB's seq");
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.stolen && g.vmid != vgfx && pool.ownerOf(vgfx) == 15,
+	           "vmid gfx: a newcomer takes an idle VMID, never the one with a gfx IB in flight");
+	const uint32_t vnew = g.vmid;
+	// Everything else busy on compute domain 0, only the gfx one on domain 2: nothing is available and the pool names the right fence.
+	for (uint32_t v = kFirst; v <= kLast; v++)
+		if (v != vgfx)
+			pool.noteSubmit(v, 0, 50 + v);
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Busy, "vmid gfx: every VMID busy (14 on compute, 1 on gfx) -> Busy");
+	fences.now[0] = 100;                                         // all compute work done; the gfx IB is still in flight
+	// The newcomer's wait is pinned to the oldest job in the pool (amdgpu's vmid_wait): that is the gfx IB, so it is still Busy, on the
+	// GFX fence, although fourteen VMIDs are idle by now.
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Busy && g.waitDomain == kDomainGfx && g.waitSeq == 0xfffffffeu && pool.ownerOf(vgfx) == 15,
+	           "vmid gfx: compute fences passing does not free a VMID that is busy on the gfx domain; the wait names the gfx fence");
+	f += check(!pool.forget(15, false, released) && pool.ownerOf(vgfx) == 15,
+	           "vmid gfx: the owner's close is refused while its gfx IB is in flight (the kext drains first)");
+	fences.now[kDomainGfx] = 0xfffffffdu;                        // one short of the seq
+	f += check(!pool.idle(vgfx) && pool.grab(17, 0x17000, 0, g) == Result::Busy, "vmid gfx: one short of the seq is still busy");
+	fences.now[kDomainGfx] = 1;                                  // wrapped past 0xfffffffe
+	f += check(pool.idle(vgfx), "vmid gfx: idle once the gfx fence wrapped past the seq");
+	f += check(pool.forget(15, false, released) && released == vgfx, "vmid gfx: the close is accepted once the IB is done");
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Ok && g.rebind, "vmid gfx: the waiter is served once the gfx fence is reached");
+	(void)vnew;
+	// The gfx and a compute domain on the same VMID: both must pass.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t vb = g.vmid;
+	pool.noteSubmit(vb, 0, 5);
+	pool.noteSubmit(vb, kDomainGfx, 9);
+	fences.now[0] = 5;
+	f += check(!pool.idle(vb), "vmid gfx: compute done, gfx still pending -> busy");
+	fences.now[kDomainGfx] = 9;
+	f += check(pool.idle(vb), "vmid gfx: both domains done -> idle");
+
+	// "Grab, then read the VMID": a client's remembered VMID goes stale when the pool moves it; the VMID a job must run in is the
+	// one the grab returned (the kext's rtSubmitIb read the remembered one before the grab: tools/check-vmid-order.sh keeps that out).
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t remembered = g.vmid;                          // what the client's c.vmid holds
+	for (uintptr_t o = 2; o <= 15; o++)
+		pool.grab(o, o * 0x1000, 0, g);
+	pool.grab(16, 0x16000, 0, g);                                // steals the LRU idle VMID: owner 1's
+	f += check(pool.ownerOf(remembered) == 16, "vmid order: the least recently used owner lost its VMID to the newcomer");
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid != remembered && g.rebind,
+	           "vmid order: owner 1's next grab returns another VMID than the one it remembers (use the grab's result, not c.vmid)");
+
 	// Exhaustion by pinning (static VMIDs, step S7).
 	pool.init(fakeReached, &fences);
 	fences = FakeFences {};
@@ -2324,7 +2383,7 @@ static int testVmidPool() {
 	f += check(pool.pin(16, 0x16000, 0, g) == Result::Exhausted, "vmid: the 16th pin is Exhausted");
 	f += check(pool.grab(16, 0x16000, 0, g) == Result::Exhausted, "vmid: nothing can be stolen from pinned VMIDs");
 	f += check(pool.grab(3, 3 * 0x1000, 0, g) == Result::Ok && !g.rebind, "vmid: a pinned owner still reuses its VMID");
-	uint32_t released = 0;
+	released = 0;
 	f += check(pool.forget(3, false, released) && released != 0 && pool.ownerOf(released) == 0,
 	           "vmid: forget releases a pinned VMID and reports it");
 	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.vmid == released, "vmid: the released VMID is granted again");
