@@ -31,12 +31,15 @@
 
 #include "compute.hpp"
 #include "gfx12_draw.h"
+#include "isa.hpp"
 #include "linuxref.hpp"
 #include "ngg_kernel.h"
 #include "nggmsg_kernel.h"
 #include "nggstore_kernel.h"
 #include "nggvgpr_kernel.h"
 #include "nggconst_kernel.h"
+#include "../userspace/gfx12tricol.h"   // G4: the shared colour-triangle shaders, descriptor and check (also used by tools/linux-replay)
+#include "ngg64_kernel.h"
 #include "pm4.hpp"
 #include "psred_kernel.h"
 #include "psstore_kernel.h"
@@ -209,6 +212,7 @@ void RDNA4Compute::gfxStatus(const char *tag) {
 }
 
 bool RDNA4Compute::stageGfxRing() {
+	gfxClientReset();   // W12k: a fresh ring (first bring-up or after a wake): nothing is pending, not wedged, not parked
 	OSDictionary *d = OSDictionary::withCapacity(8);
 	auto put = [d](const char *key, uint64_t v) {
 		if (OSNumber *num = d ? OSNumber::withNumber(v, 64) : nullptr) {
@@ -407,7 +411,7 @@ uint32_t RDNA4Compute::requestedGfxDiag() {
 	uint32_t mask = 0;
 	if (!PE_parse_boot_argn("rdna4-gfxdiag", &mask, sizeof(mask)))
 		return 0;
-	return mask & 0xfff;   // bits 1,2,4,8,32,64,128,256,512 = variants, 16 = run them even if the baseline passed
+	return mask & 0x1fff;   // bits 1,2,4,8,32,64,128,256,512,1024,2048,4096 = variants, 16 = run them even if the baseline passed
 }
 
 namespace {
@@ -516,6 +520,17 @@ uint32_t findStreamPacket(const uint32_t *stream, uint32_t dwords, uint32_t opco
 uint32_t RDNA4Compute::requestedGfxProbe() {
 	uint32_t v = 0;
 	return PE_parse_boot_argn("rdna4-gfxprobe", &v, sizeof(v)) && v ? 1 : 0;
+}
+
+// rdna4-gfxclient=1 (default off): after a passing G3 baseline, submit a synthetic client gfx IB through the W12k path (runtime.cpp).
+bool RDNA4Compute::requestedGfxClient() {
+	uint32_t v = 0;
+	return PE_parse_boot_argn("rdna4-gfxclient", &v, sizeof(v)) && v;
+}
+
+uint32_t RDNA4Compute::requestedGfxCol() {
+	uint32_t v = 0;
+	return PE_parse_boot_argn("rdna4-gfxcol", &v, sizeof(v)) && v ? 1 : 0;
 }
 
 // One COPY_DATA per probed register into the result buffer at `poolOff` (slot i = kProbe[i]).
@@ -885,7 +900,9 @@ void RDNA4Compute::gfxDumpVa0(const char *tag) {
 // offsets si_query_pipestat_dw_offset: PS_INVOCATIONS 0, C_PRIMITIVES 2, C_INVOCATIONS 4, VS 6, GS_INV 8, GS_PRIM 10,
 // IA_PRIMITIVES 12, IA_VERTICES 14). Reading it: IA = 0: the GE dropped the draw; IA > 0 and C_INV = 0: the NGG /
 // export path; C_INV > 0 and C_PRIM = 0: clip or cull; C_PRIM > 0 and PS = 0: SC / scissor / raster state (#1);
-// PS > 0: pixel shaders ran.
+// PS > 0: pixel shaders ran. C_PRIMITIVES is supporting evidence only: on the card a good triangle reads 4, the old s_and_saveexec
+// shader read 0 in 3/3 runs, but one failing draw (wave64, VGPRS 0, 0 px) read 0, 0, 4, 0, 0, 8 in six runs. The signal is PS_INVOCATIONS
+// and the pixels; the "where" line below names a stage from the counters, it does not prove it.
 void RDNA4Compute::gfxPstatReport(const char *label) {
 	auto q = [&](uint32_t base, uint32_t idx, bool &written) {
 		const uint32_t lo = *poolDw(base + 8 * idx), hi = *poolDw(base + 8 * idx + 4);
@@ -924,8 +941,8 @@ void RDNA4Compute::gfxPstatReport(const char *label) {
 	const char *where = !allWritten ? "the SAMPLE_PIPELINESTAT events wrote nothing (counters unavailable on this path)"
 	                  : (!iaVert && !iaPrim) ? "IA = 0: the GE dropped the draw (queue mode / VA 0, #2)"
 	                  : !cinv ? "IA > 0 but C_INVOCATIONS = 0: lost in the NGG / export path (#4, #3)"
-	                  : !cprim ? "C_INVOCATIONS > 0 but C_PRIMITIVES = 0: clipped or culled (context state, #1)"
-	                  : !ps ? "C_PRIMITIVES > 0 but PS_INVOCATIONS = 0: lost between the clipper and the pixel shader (SC / raster state, #1)"
+	                  : !cprim ? "C_INVOCATIONS > 0 but C_PRIMITIVES 0 (not reliable alone: check PS_INVOCATIONS and the pixels): maybe clipped or culled (context state, #1)"
+	                  : !ps ? "C_PRIMITIVES > 0 but PS_INVOCATIONS = 0 (C_PRIMITIVES is not reliable alone): maybe lost between the clipper and the pixel shader (SC / raster state, #1)"
 	                  : "pixel shaders ran";
 	GLOG("%s: pipeline statistics say: %s%s", label, where, any ? "" : " (all deltas 0)");
 }
@@ -997,7 +1014,8 @@ void RDNA4Compute::gfxLinuxDiff(const char *tag) {
 
 // ---------------------------------------------------------------------------
 // W45: the clip / cull / viewport / scissor state of the first draw (round 5 boot 3 on the card: IA_PRIMITIVES 1, VS_INVOCATIONS 3,
-// C_INVOCATIONS 1, C_PRIMITIVES 0, PS_INVOCATIONS 0, the NGG wave ran: the primitive is dropped in the clipper / primitive assembly).
+// C_INVOCATIONS 1, C_PRIMITIVES 0, PS_INVOCATIONS 0, the NGG wave ran: the primitive is lost at or after the clipper; the root cause turned out to
+// be the shader's EXEC, docs/linux-replay.md. C_PRIMITIVES alone is not a reliable signature, PS_INVOCATIONS and the pixels are).
 // ---------------------------------------------------------------------------
 
 // rdna4-gfxsane=0 leaves the explicit "sane clip state" block out (the A/B control).
@@ -1223,6 +1241,7 @@ void RDNA4Compute::gfxPark() {
 	}
 	const uint32_t cntl0 = rdGc(CpMeCntl);
 	wr(IpDiscovery::HwGc, CpMeCntl, cntl0 | kCpMePfpHalt | kCpMeMeHalt);
+	gfxParked = true;   // W12k: client gfx IBs are refused while the microengines are halted (probe boots; rdna4-gfxpark=0 leaves them running)
 	IOSleep(20);
 	const uint32_t cntl1 = rdGc(CpMeCntl);
 	GLOG("park: after the draws CP_STAT 0x%08x%s, PFP/ME halted: CP_ME_CNTL 0x%08x -> 0x%08x, GRBM 0x%08x, RB0 rptr 0x%x wptr 0x%x",
@@ -1354,7 +1373,7 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	// Shaders, each followed by s_code_end padding for the SQ's prefetch.
 	auto place = [&](uint32_t at, const uint32_t *code, uint32_t dwords) {
 		for (uint32_t i = 0; i < 0x100; i++)
-			*poolDw(at + 4 * i) = i < dwords ? code[i] : 0xbf9f0000u;   // s_code_end
+			*poolDw(at + 4 * i) = i < dwords ? code[i] : Isa::kSCodeEnd;   // s_code_end
 	};
 	if (variant & 4)
 		place(kGfxVsOffset, kNggmsgKernel, sizeof(kNggmsgKernel) / 4);
@@ -1364,6 +1383,8 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		place(kGfxVsOffset, kNggvgprKernel, sizeof(kNggvgprKernel) / 4);
 	else if (variant & 1024)   // W46: the NGG shader that takes nothing from its VGPR inputs (constant primitive, lane-id vertices)
 		place(kGfxVsOffset, kNggconstKernel, sizeof(kNggconstKernel) / 4);
+	else if (variant & 4096)   // the wave64 fallback: ngg.s as a wave64 NGG shader, the way RADV runs its NGG (GS) stage (PS stays wave32)
+		place(kGfxVsOffset, kNgg64Kernel, sizeof(kNgg64Kernel) / 4);
 	else
 		place(kGfxVsOffset, kNggKernel, sizeof(kNggKernel) / 4);
 	if (variant & 32) {   // the two literal dwords of its s_mov_b32 sN, literal carry the marker address
@@ -1429,9 +1450,15 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 			     label, oldHdr, ib[at - 2], oldOff, ib[at - 1]);
 		}
 	}
+	// The variant bits are applied one per draw (the ladder runs a single bit at a time): 4096 must not be combined with the wave32
+	// marker shaders (32 / 512 / 1024), whose VGPRS=1 patch it would overwrite with 2 while clearing GS_W32_EN.
 	if (variant & (32 | 512 | 1024))   // the marker shader uses v8/v9: 10 VGPRs = 2 granules of 8 (VGPRS field = granules - 1)
 		patch(kOpSetShReg, 0x1a2a - kShBase, 0x0000003f, 1, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=1");
 
+	if (variant & 4096) {   // wave64 (proven on the card under Linux: tools/linux-replay REPLAY_VARIANT=4096, 8192 px)
+		patch(kOpSetContextReg, 0x02a6, 0x00400000, 0, "VGT_SHADER_STAGES_EN.GS_W32_EN=0 (wave64 NGG)");
+		patch(kOpSetShReg, 0x1a2a - kShBase, 0x0000003f, 2, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=2 (12 VGPRs: wave64 granules of 4)");
+	}
 	if (variant & 2048)   // W46: GE_PRIM_RING_SIZE without Mesa's GL2 hints (SCOPE, PAF/PAB_TEMPORAL, FORCE_SE_SCOPE, PAB_NOFILL): MEM_SIZE only
 		patch(0x79, 0x26b, 0xffffffff, 0x000007fe, "GE_PRIM_RING_SIZE = MEM_SIZE only (no GL2 hints)");
 	if (variant & 128)   // W45: PA_CL_CLIP_CNTL.CLIP_DISABLE: if the primitive survives, the clipper was dropping it
@@ -1519,6 +1546,8 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 		     r.nggS2, r.nggS3);
 	}
 	if (variant & 512) {   // W45: what the NGG wave got (v0, v3) and computed (x, y), lane by lane
+		// Only lane 0 holds the packed primitive in v0 (0x040a0300 on the card); v0 of lanes 1-3 is whatever those lanes hold (garbage by
+		// design, the wave has one primitive). x/y are stored under the 3-lane position exec, so lane 3 of x/y is the cleared slot (stale).
 		uint32_t v0[4], v3[4], px[4], py[4];
 		for (uint32_t l = 0; l < 4; l++) {
 			v0[l] = *poolDw(kGfxVgprOffset + 4 * l);
@@ -1608,6 +1637,130 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	return true;
 }
 
+// The persistent one-line summary of the G4 draw (registry property Compute,GFXVerdict, the same route and "##" separator as gfxVerdictDraw): the
+// pipeline counters of the draw (probe boots; zeros otherwise), the pixels, the ring state, the largest channel error in channel units and the
+// centroid pixel. No clip-state readback: G4 does not run the clip probe.
+void RDNA4Compute::gfxVerdictCol(const GfxColResult &r) {
+	const uint64_t *d = gfxPstatLast;
+	gfxVerdictAdd("col: ia %llu/%llu vs %llu ci %llu cp %llu ps %llu px %u ring %s err %u.%02u sum %u cen %08x%s",
+	              static_cast<unsigned long long>(d[6]), static_cast<unsigned long long>(d[7]),
+	              static_cast<unsigned long long>(d[3]), static_cast<unsigned long long>(d[2]),
+	              static_cast<unsigned long long>(d[1]), static_cast<unsigned long long>(d[0]), r.covered,
+	              r.ringDone ? "ok" : "HUNG", r.maxChannelErr256 * 100 / 256 / 100, r.maxChannelErr256 * 100 / 256 % 100, r.maxSumErr,
+	              r.centroid, r.ok ? " RIGHT" : "");
+}
+
+// G4: one draw of the colour triangle (src/gfx12_draw_col.h, shaders/nggcol.s + pscol.s) into the cleared target, exactly the way gfxDrawRun
+// draws G3: the same stream discipline (relocations, CSB replay, sane clip state, pipeline statistics on probe boots, one RELEASE_MEM fence,
+// the same timeout and "did not finish" handling), then the colour check shared with tools/linux-replay (userspace/gfx12tricol.h). `va` are
+// the relocation addresses (same order as G3's: VS, PS, target, three rings, fence); va[kColAttrRing] is also the address nggcol.s's attribute
+// ring descriptor carries. The G3 baseline must have passed (the caller checks), so the ring is healthy and the shared rings/target are in use
+// by nothing else.
+bool RDNA4Compute::gfxColDrawRun(const char *label, const uint64_t *va, GfxColResult &r) {
+	using namespace Gfx12DrawCol;
+	static_assert(kColRingBytes == Gfx12Draw::kRingBytes && kColWidth == Gfx12Draw::kWidth && kColHeight == Gfx12Draw::kHeight,
+	              "G4 shares the GE ring block and the target with G3");
+	memset(&r, 0, sizeof(r));
+
+	// Shaders in their own slots, each followed by s_code_end padding; the NGG shader's descriptor literals carry the attribute ring's address.
+	for (uint32_t i = 0; i < RDNA4_TRICOL_SHADER_PAD; i++) {
+		*poolDw(kGfxColVsOffset + 4 * i) = rdna4_tricol_vs_dword(i, va[kColAttrRing]);
+		*poolDw(kGfxColPsOffset + 4 * i) = rdna4_tricol_ps_dword(i);
+	}
+	// The command stream, its addresses filled in.
+	constexpr uint32_t n = sizeof(kColStream) / 4;
+	volatile uint32_t *ib = poolDw(kGfxIbOffset);
+	for (uint32_t i = 0; i < n; i++)
+		ib[i] = kColStream[i];
+	for (const ColReloc &rl : kColRelocs)
+		ib[rl.dword] = static_cast<uint32_t>((va[rl.sym] >> rl.shift) & rl.mask);
+	// The target, cleared; the fence, zero.
+	for (uint32_t i = 0; i < kColWidth * kColHeight; i++)
+		*poolDw(kGfxTargetOffset + 4 * i) = 0;
+	*poolDw(kGfxDrawFenceOffset) = 0;
+	flushHdp();
+	GLOG("%s: %u-dword stream at MC 0x%llx, VS 0x%llx PS 0x%llx, target 0x%llx, rings 0x%llx (%llu MiB), attribute ring descriptor "
+	     "0x%08x 0x%08x 0x%08x 0x%08x", label, n, poolMc(kGfxIbOffset), va[kColVs], va[kColPs], va[kColCb], va[kColAttrRing],
+	     kColRingBytes >> 20, static_cast<uint32_t>(va[kColAttrRing]),
+	     static_cast<uint32_t>((va[kColAttrRing] >> 32) & 0xffffu) | 0xc0000000u | (16u << 16), static_cast<uint32_t>(kColRingBytes), 0x0043ffacu);
+
+	trail("gfx: colour draw");
+	uint32_t pkt[16];
+	if (requestedGfxCsbReplay())
+		gfxEmitCsbReplay();   // the draw never depends on SRM having applied the clear state (as G3)
+	if (requestedGfxSane())
+		gfxEmitSaneClip();    // every clip/cull/viewport/scissor register the stream leaves at power-up garbage, explicitly neutral (as G3)
+	const bool pstat = requestedGfxProbe();
+	if (pstat) {   // pipeline statistics around the draw (both buffers pre-filled with a sentinel), as G3
+		for (uint32_t i = 0; i < 28; i++) {
+			*poolDw(kGfxPstatPre + 4 * i) = 0xdeadf00du;
+			*poolDw(kGfxPstatPost + 4 * i) = 0xdeadf00du;
+		}
+		flushHdp();
+		gfxRing.emit(pkt, Pm4::eventWrite(pkt, 0x19));   // PIPELINESTAT_START
+		gfxRing.emit(pkt, Pm4::eventWriteAddr(pkt, 0x1e | (2u << 8), poolMc(kGfxPstatPre)));   // SAMPLE_PIPELINESTAT
+	}
+	gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, poolMc(kGfxIbOffset), n, 0));
+	if (pstat)
+		gfxRing.emit(pkt, Pm4::eventWriteAddr(pkt, 0x1e | (2u << 8), poolMc(kGfxPstatPost)));
+	gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), ++gfxFence));
+	uint64_t t0 = mach_absolute_time();
+	gfxKick(gfxRing.wptr());
+	r.ringDone = gfxFenceWait(gfxFence, 500000);
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	r.ns = ns;
+	r.drawFence = *poolDw(kGfxDrawFenceOffset);
+	if (pstat && r.ringDone) {
+		gfxPstatReport(label);
+		r.cInv = static_cast<uint32_t>(gfxPstatLast[2]);
+		r.cPrim = static_cast<uint32_t>(gfxPstatLast[1]);
+		r.ps = static_cast<uint32_t>(gfxPstatLast[0]);
+	}
+	gfxEvidence(label, true);
+	gfxFaultMark(label);
+	if (!r.ringDone || r.drawFence != 1) {
+		GLOG("%s: did not finish (ring fence %s, draw fence 0x%x)", label, r.ringDone ? "ok" : "NOT signalled", r.drawFence);
+		gfxVerdictCol(r);
+		gfxStatus("colour draw");
+		return false;
+	}
+
+	// The check: the same function tools/linux-replay (REPLAY_DRAW=col) runs on the Linux side.
+	auto check = [&](GfxColResult &out) {
+		rdna4_tricol_result cr;
+		out.ok = rdna4_tricol_check(const_cast<const uint32_t *>(poolDw(kGfxTargetOffset)), &cr) != 0;
+		out.covered = cr.covered; out.badAlpha = cr.badAlpha; out.notDominant = cr.notDominant;
+		out.maxChannelErr256 = cr.maxChannelErr256; out.maxSumErr = cr.maxSumErr;
+		out.minX = cr.minX; out.maxX = cr.maxX; out.minY = cr.minY; out.maxY = cr.maxY;
+		out.near0 = cr.near0; out.near1 = cr.near1; out.near2 = cr.near2; out.centroid = cr.centroid;
+	};
+	check(r);
+	gfxVerdictCol(r);
+	GLOG("%s: %s in %llu us: %u pixels (want %u), bounds x %u..%u y %u..%u; max channel error %u.%02u (tolerance %u), max |R+G+B-255| %u, "
+	     "%u bad alpha, %u not dominated by the nearest vertex's colour; near v0 (66,65) 0x%08x, near v1 (189,65) 0x%08x, near v2 (128,188) "
+	     "0x%08x, centroid (128,106) 0x%08x (want ~85,85,85)", label, r.ok ? "THE COLOUR TRIANGLE IS RIGHT" : "wrong colour image",
+	     r.ns / 1000, r.covered, kColCoveredPixels, r.minX, r.maxX, r.minY, r.maxY, r.maxChannelErr256 * 100 / 256 / 100,
+	     r.maxChannelErr256 * 100 / 256 % 100, kColChannelTolerance, r.maxSumErr, r.badAlpha, r.notDominant, r.near0, r.near1, r.near2,
+	     r.centroid);
+
+	if (!r.ok && r.covered == 0) {   // nothing landed: the same two cheap questions as G3 (late write? stuck in a cache?)
+		IOSleep(2);
+		GfxColResult again;
+		check(again);
+		gfxRing.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync));
+		gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), ++gfxFence));
+		gfxKick(gfxRing.wptr());
+		const bool flushed = gfxFenceWait(gfxFence, 500000);
+		GfxColResult flush;
+		check(flush);
+		GLOG("%s: target still empty: after 2 ms %u px; after a full ACQUIRE_MEM GL2 write-back (fence %s) %u px", label, again.covered,
+		     flushed ? "ok" : "NOT signalled", flush.covered);
+		gfxEvidence("after col flush", false);
+	}
+	return true;
+}
+
 // G3: the first draw. Needs the gfx ring up and the device heap (the GE
 // rings, 10.5 MiB, live there); everything else is in the pool.
 bool RDNA4Compute::stageGfxDraw() {
@@ -1683,11 +1836,42 @@ bool RDNA4Compute::stageGfxDraw() {
 	publishResult("gfx", result);
 	env.owner->setProperty("Compute,GFXDrawPixels", static_cast<uint64_t>(base.covered), 32);
 
+	// G4 (rdna4-gfxcol=1, default off): the colour triangle, only after a passing G3 baseline and after its result is published. It runs BEFORE the
+	// ladder, which runs only when the baseline failed (or rdna4-gfxdiag has bit 16): the ring is healthy here, and a ladder variant that hangs
+	// cannot pre-empt it. A G4 draw that does not finish leaves the ring in an unknown state, so the ladder is skipped after it.
+	bool colHung = false;
+	if (requestedGfxCol()) {
+		if (!base.ok) {
+			GLOG("col: skipped, the G3 baseline did not pass");
+			publishResult("gfx-col", "SKIPPED G3 baseline did not pass");
+		} else {
+			const uint64_t vaCol[7] = {
+				poolMc(kGfxColVsOffset), poolMc(kGfxColPsOffset), poolMc(kGfxTargetOffset), ringVa,
+				ringVa + kAttrRingBytes, ringVa + kAttrRingBytes + kPosRingBytes, poolMc(kGfxDrawFenceOffset),
+			};
+			GfxColResult col;
+			if (!gfxColDrawRun("col", vaCol, col)) {
+				colHung = true;
+				publishResult("gfx-col", "FAIL colour draw fence");
+			} else {
+				char colResult[192];
+				snprintf(colResult, sizeof(colResult), "%s %s, draw %u px, max channel error %u.%02u, centroid 0x%08x in %llu us",
+				         col.ok ? "PASS" : "FAIL", col.ok ? "colour triangle, THE COLOUR TRIANGLE IS RIGHT" : "colour image", col.covered,
+				         col.maxChannelErr256 * 100 / 256 / 100, col.maxChannelErr256 * 100 / 256 % 100, col.centroid,
+				         static_cast<unsigned long long>(col.ns / 1000));
+				publishResult("gfx-col", colResult);
+				env.owner->setProperty("Compute,GFXColPixels", static_cast<uint64_t>(col.covered), 32);
+			}
+		}
+	}
+
 	// The diagnostic ladder (rdna4-gfxdiag=<mask>, default off): the same stream with
 	// one open question changed at a time, each logged with the same evidence, so that
 	// round 4 sees which stage of the pipeline works. Only the baseline decides PASS.
-	const uint32_t diag = requestedGfxDiag() | (requestedGfxDiag() && requestedGfxProbe() ? (32u | 64u | 128u | 256u | 512u | 1024u | 2048u) : 0u);   // W37: the NGG marker joins the ladder of a probe boot
-	if (diag && (!base.ok || (diag & 16))) {
+	const uint32_t diag = requestedGfxDiag() | (requestedGfxDiag() && requestedGfxProbe() ? (32u | 64u | 128u | 256u | 512u | 1024u | 2048u | 4096u) : 0u);   // W37: the NGG marker joins the ladder of a probe boot
+	if (diag && colHung)
+		GLOG("diag ladder: skipped, the G4 colour draw did not finish and left the ring in an unknown state");
+	if (diag && !colHung && (!base.ok || (diag & 16))) {
 		char summary[400], probes[240];
 		summary[0] = probes[0] = '\0';
 		size_t used = 0, pused = 0;
@@ -1698,10 +1882,13 @@ bool RDNA4Compute::stageGfxDraw() {
 		// no reset (W23 review S3), so boot 12 runs it alone (rdna4-gfxdiag=4). After a "hang/"
 		// result the next boot needs a cold power cycle: the GC state survives a warm restart.
 		// W45: the clip variants (128 clip off, 256 primitive filters off) and the NGG inputs (512) right after the marker: round 5 showed the
-		// primitive reaches the clipper (C_INVOCATIONS 1) and is dropped there (C_PRIMITIVES 0).
-		// W46: round 6 on the card: cprim stays 0 with CLIP_DISABLE (128) and the filters off (256), so the two new variants come first: 1024 takes
+		// primitive reaches the clipper (C_INVOCATIONS 1) and C_PRIMITIVES reads 0 (supporting evidence only: pixels and PS_INVOCATIONS are the signal).
+		// W46: round 6 on the card: cprim read 0 with CLIP_DISABLE (128) and the filters off (256) as well, so the two new variants come first: 1024 takes
 		// nothing from the wave's VGPR inputs, 2048 removes the GE ring's GL2 hints.
-		static const uint32_t order[11] = { 32, 1024, 2048, 512, 128, 256, 64, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
+		// The wave64 fallback (4096) right after the marker: RADV's NGG (GS) half for this draw, the other wave size (RADV also runs the PS as
+		// wave64, PS_W32_EN = 0; 4096 keeps the PS wave32), proven on the card under Linux; if the wave32 baseline is empty on macOS but 4096
+		// draws, the difference is the GS wave size there.
+		static const uint32_t order[12] = { 32, 4096, 1024, 2048, 512, 128, 256, 64, 8, 2, 1, 4 };   // 32 (NGG marker: did the wave launch?) is one extra store, no more risk than 8
 		for (uint32_t bit : order) {
 			if (!(diag & bit))
 				continue;
@@ -1714,7 +1901,7 @@ bool RDNA4Compute::stageGfxDraw() {
 			if (bit == 8 && did)
 				used += snprintf(summary + used, sizeof(summary) - used, "/marker %s",
 				                 r.marker == kMarkerValue ? "yes" : "no");
-			if ((bit == 32 || bit == 128 || bit == 256 || bit == 512 || bit == 1024 || bit == 2048) && did && r.probeSeen)
+			if ((bit == 32 || bit == 128 || bit == 256 || bit == 512 || bit == 1024 || bit == 2048 || bit == 4096) && did && r.probeSeen)
 				used += snprintf(summary + used, sizeof(summary) - used, "/cprim %u", r.cPrim);
 			if (bit == 64 && did)
 				used += snprintf(summary + used, sizeof(summary) - used, "/primtype-idx");

@@ -56,6 +56,9 @@
 #include "gpuvm.hpp"
 #include "ipdiscovery.hpp"
 #include "pm4.hpp"
+#include "gpuvmtable.hpp"
+#include "ptpages.hpp"
+#include "vmid.hpp"
 #include "pipe.hpp"
 #include "psp.hpp"
 #include "rdna4compute.h"
@@ -133,6 +136,7 @@ public:
 	// Returns the last stage completed inline.
 	uint32_t start(const Env &env, uint32_t stage);
 	void powerWillSleep();
+	void powerSleepRequest();   // P7: setPowerState(0) / the debug sleep selector call this first, without rtLock (src/pmidle.cpp)
 	void powerDidWake();
 
 	// Snapshot of the engines, as read by the survey.
@@ -286,6 +290,7 @@ private:
 	}
 	bool sdmaStartMcus();               // sdma_v7_0_enable: unhalt before queue setup
 	bool sdmaQueueInit();
+	uint64_t sdmaStartPtr { 0 };             // P7: the SDMA ring's 64-bit pointers after a wake without power loss (0 at boot and after a real power loss)
 	void sdmaKick(uint64_t wptrBytes);
 	bool sdmaDoorbell { false };        // kick SDMA0 through its doorbell (amdgpu's way)
 	Sdma::Ring sdmaRing;                // SDMA0 queue 0: stage 4, then the runtime's DMA
@@ -347,6 +352,13 @@ private:
 		uint64_t        recoveryMqd, recoveryEop, recoveryRptr, recoveryWpoll;
 		uint64_t        recoveryProofAddress;
 		volatile uint32_t *recoveryProofCpu;
+		// W13 S7-lite (rdna4-vmshared=1): the packets go into the client's IB page (ibCpu, at VA ibVa in the client's VM) and the
+		// shared VMID-0 queue `queue` runs INDIRECT_BUFFER(ibVmid) + a ring-level RELEASE_MEM to fenceAddress (an MC address).
+		volatile uint32_t *ibCpu;
+		uint64_t        ibVa;
+		uint32_t        ibVmid;
+		uint64_t        queueFenceAddr;       // rdna4-vmshared=2: a second ring-level fence on the shared queue's own word (the pool's idleness test)
+		uint32_t        queueFenceSeq;
 	};
 	bool launch(const Launch &l, const char *tag, uint64_t &ns);
 	void logComputeQueueState(const char *tag, uint32_t pipe = 0, uint32_t queue = 0,
@@ -389,6 +401,10 @@ private:
 	static constexpr uint32_t kGfxVsOffset    = kGfxOffset + 0x20000;
 	static constexpr uint32_t kGfxPsOffset    = kGfxOffset + 0x20400;
 	static constexpr uint32_t kGfxTargetOffset = kGfxOffset + 0x40000;   // 256 KiB
+	// G4 (rdna4-gfxcol=1, docs/g4-colour.md): its own code slots (256-byte aligned, 0x400 each like the G3 ones) so that nothing G3 or
+	// the ladder still needs is overwritten; it shares the target, the draw fence, the ring and the GE rings with G3.
+	static constexpr uint32_t kGfxColVsOffset = kGfxOffset + 0x28000;
+	static constexpr uint32_t kGfxColPsOffset = kGfxOffset + 0x28400;
 	static constexpr uint32_t kGfxDrawFenceOffset = kGfxTestOffset + 0x20;
 	static constexpr uint32_t kGfxMarkerOffset = kGfxTestOffset + 0x40;   // the PS-store diagnostic marker
 	static constexpr uint32_t kGfxProbeOffset  = kGfxRptrOffset + 0x200;  // CP-view readback, state before the draw (32 dwords); +0x100 is the PS marker (W33: they overlapped)
@@ -442,6 +458,17 @@ private:
 		uint32_t probeEqual, probeCounted;      // 'probe mid': registers equal to the stream / registers compared
 	};
 	bool gfxDrawRun(const char *label, uint32_t variant, const uint64_t *va, GfxDrawResult &r);
+	// G4: the colour triangle (vertex 0 red, 1 green, 2 blue through the attribute ring), after a passing G3 baseline, rdna4-gfxcol=1.
+	struct GfxColResult {
+		bool ok, ringDone;
+		uint32_t drawFence, covered, badAlpha, notDominant, maxChannelErr256, maxSumErr;   // the check of userspace/gfx12tricol.h
+		uint32_t minX, maxX, minY, maxY, near0, near1, near2, centroid;
+		uint32_t cInv, cPrim, ps;              // pipeline statistics deltas (probe boots)
+		uint64_t ns;
+	};
+	static uint32_t requestedGfxCol();       // rdna4-gfxcol=1 (default off): draw G4 after a passing G3 baseline
+	bool gfxColDrawRun(const char *label, const uint64_t *va, GfxColResult &r);
+	void gfxVerdictCol(const GfxColResult &r);
 	void gfxCountTarget(GfxDrawResult &r);
 	void gfxEvidence(const char *tag, bool state);
 	void gfxGoldenInit();
@@ -628,6 +655,9 @@ public:
 	IOReturn rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags,
 	                    uint64_t &fence);
 	IOReturn rtWaitFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns);
+	// W12k: a client's own gfx IB on the kernel's gfx ring (runtime.cpp, docs/w12k-gfx-submit.md)
+	IOReturn rtSubmitGfxIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags, uint64_t &fence);
+	IOReturn rtWaitGfxFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns);
 	IOReturn rtPresent(const void *owner, uint64_t handle, uint64_t offset,
 	                   uint64_t &geometry, uint64_t &pitch);
 	IOReturn rtPresentAsync(const void *owner, uint64_t handle, uint64_t offset,
@@ -642,9 +672,18 @@ private:
 	// when there is no DMA). With DMA, buffers come from the device heap:
 	// VRAM past the BAR, which the CPU never touches.
 	static constexpr uint32_t kHeapOffset  = 32u << 20;
-	static constexpr uint32_t kMaxBuffers  = 256;
+	static constexpr uint32_t kMaxBuffers  = 256;          // the legacy global caps (modes 0 and 1)
 	static constexpr uint32_t kMaxPrograms = 32;
-	static constexpr uint32_t kMaxClients = 8;
+	static constexpr uint32_t kBufferSlots  = 1024;        // rdna4-vmshared=2: array sizes; the cap is per client (accounting), not global
+	static constexpr uint32_t kProgramSlots = 256;
+	static constexpr uint32_t kClientBuffers  = 128;
+	static constexpr uint32_t kClientPrograms = 16;
+	uint32_t bufferCap() const { return vmShared == 2 ? kBufferSlots : kMaxBuffers; }
+	uint32_t programCap() const { return vmShared == 2 ? kProgramSlots : kMaxPrograms; }
+	bool clientOverQuota(const void *owner, bool program) const;   // rdna4-vmshared=2: per-client buffer/program counts
+	static constexpr uint32_t kMaxClients = 8;              // the per-client-HQD path and rdna4-vmshared=1 (static VMIDs 8-15)
+	static constexpr uint32_t kClientSlots = 64;            // rdna4-vmshared=2 (VMIDs from the pool): the array size, bounded by memory not hardware
+	uint32_t clientCap() const { return vmShared == 2 ? kClientSlots : kMaxClients; }
 	static constexpr uint32_t kVmTableBytes = 4u << 20;
 	static constexpr uint32_t kVmTableStage = 20u << 20;
 	static constexpr uint32_t kVmTableCpu = 28u << 20;    // W22 variant T: CPU-written tables (0x4000)
@@ -654,6 +693,10 @@ private:
 	uint32_t vmTableCpu { 0 };                            // W22 variant T: pool offset of CPU-written tables
 	static constexpr uint32_t kVmQueueBase = 26u << 20;
 	static constexpr uint32_t kVmQueueStride = 0x10000;
+	// rdna4-vmshared=2 keeps a client's kernarg, fence word and IB page in a compact 12 KiB pool area, not a 64 KiB slot; poolOff is set so
+	// that poolOff + kVmFence / kVmKernarg / kVmIb land on them. The area must end below the gfx region (PtPages::areaFor).
+	static constexpr uint32_t kVmDynBase = kVmQueueBase + (16u << 16);
+	static constexpr uint32_t kVmDynStride = 0x3000;
 	static constexpr uint32_t kVmMqd = 0x0000;
 	static constexpr uint32_t kVmEop = 0x1000;
 	static constexpr uint32_t kVmPq = 0x2000;
@@ -661,6 +704,7 @@ private:
 	static constexpr uint32_t kVmWptr = 0x4000;
 	static constexpr uint32_t kVmFence = 0x5000;
 	static constexpr uint32_t kVmKernarg = 0x6000;
+	static constexpr uint32_t kVmIb = 0x7000;                 // shared mode: the client's IB page
 	static constexpr uint64_t kHostMaxBuffer = 256ull << 20;
 	static constexpr uint64_t kHostMaxClient = 1ull << 30;
 	static constexpr uint64_t kHostMaxTotal = 4ull << 30;
@@ -678,6 +722,11 @@ private:
 		uint64_t    hostUser { 0 };
 	};
 	struct RtProgram { const void *owner; uint64_t offset, va; CodeObj::Kernel k; uint16_t gen; };
+	// Sparse page tables (rdna4-vmshared=2; ptpages.hpp, gpuvmtable.hpp): root, PDB1, PDB0 and PT pages exist only where VA is mapped, so a client's VA
+	// reaches as far as its page quota allows (the contiguous image of modes 0/1 stops at 1 GiB above kVaStart).
+	struct SparseTables {
+		PtPages::Sparse s;
+	};
 	struct RtClient {
 		const void *owner { nullptr };
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
@@ -689,8 +738,22 @@ private:
 		volatile uint32_t *kernargCpu { nullptr };
 		volatile uint32_t *fenceCpu { nullptr };
 		uint32_t fence { 0 }, doorbell { 0 };
+		SparseTables *sp { nullptr };   // rdna4-vmshared=2: demand-allocated page tables (ptpages.hpp) instead of tableShadow
+		uint64_t tlbSeq { 0 };            // bumped whenever a PTE is removed: the next job on a VMID owned by this client flushes (amdgpu's tlb_seq)
+		uint32_t pasid { 0 };             // what the IH_VMID_LUT of this client's VMID holds, so a fault names the client (slot + 1)
+		bool     shared { false };        // rdna4-vmshared: no HQD of its own; its jobs run on a shared VMID-0 queue
+		uint8_t  sq { 0 };                // which shared queue (fixed at open: a client's jobs stay in order)
+		uint32_t poolOff { 0 };           // this client's pool slot area (kVmQueueBase + slot * stride)
+		uint64_t ibVa { 0 };              // shared mode: the kernel-written IB page, mapped executable in the client's VM
 		uint32_t ibFences[kMaxIbOutstanding] {};
 		uint32_t ibOutstanding { 0 };
+		// W12k: this client's gfx fence: a dword of its own in the fence page (+0x40; the gfx ring writes it at the VMID0 MC
+		// address gfxFenceMc, the client can read it at fenceVa + 0x40), the last value handed out, and the ones not yet retired.
+		volatile uint32_t *gfxFenceCpu { nullptr };
+		uint64_t gfxFenceMc { 0 };
+		uint32_t gfxFence { 0 };
+		uint32_t gfxFences[kMaxIbOutstanding] {};
+		uint32_t gfxOutstanding { 0 };
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
 		bool active { false };
@@ -710,12 +773,12 @@ private:
 	bool           vmEnabled { false };
 	bool           vmidUsed[16] {};
 	bool           queueUsed[4][8] {};
-	RtClient       clients[kMaxClients] {};
+	RtClient       clients[kClientSlots] {};
 	GpuHeap::Heap  heap;
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
-	RtBuffer       buffers[kMaxBuffers] {};
+	RtBuffer       buffers[kBufferSlots] {};
 	uint64_t       hostBytesTotal { 0 };
-	RtProgram      programs[kMaxPrograms] {};
+	RtProgram      programs[kProgramSlots] {};
 	bool           presentActive { false };
 	const void    *presentOwner { nullptr };
 	uint64_t       presentHandle { 0 };
@@ -742,6 +805,42 @@ private:
 	void     schedulePresentationTimer();
 	void     schedulePresentationRetry();
 	void     presentTimerTick();
+	// P2 idle accounting (rdna4-gfxidle=1) and P7 sleep/wake hardening (docs/power-gfx.md): src/pmidle.cpp.
+	// Idle accounting is software only: it counts synchronous client operations (IdleUse, under rtLock) and looks at fences that are still
+	// outstanding; it sends no SMU message and touches no GC register. Its state is a log line per transition and the property Compute,GFXIdle.
+	struct IdleUse {
+		RDNA4Compute *c;
+		IdleUse(RDNA4Compute *self, const char *what) : c(self) { c->idleBegin(what); }
+		~IdleUse() { c->idleEnd(); }
+	};
+	static bool requestedGfxIdle();            // rdna4-gfxidle=1
+	static bool requestedSleepAbort();         // default ON; rdna4-sleepabort=0 restores waits that hold rtLock until their timeout
+	static bool requestedResumeTests();        // rdna4-resume-tests=1: the wake re-runs the G3/G4 draws, the gfx client self-test and the flip test
+	void     idleStart();                      // bring-up finished: create the poll timer, start counting (idempotent)
+	void     idleStop();                       // shutdown / sleep: cancel the timer
+	void     idleBegin(const char *what);      // rtLock held
+	void     idleEnd();                        // rtLock held
+	void     idleTouchLocked(const char *what);
+	void     idleEvaluateLocked();             // retire fences, then busy -> idle if nothing has used the GPU for 100 ms
+	void     idleTick();                       // the timer's body: TryLock rtLock, evaluate, re-arm while busy
+	void     idleReport(const char *why);      // registry property Compute,GFXIdle
+	static void idleTimerAction(OSObject *owner, IOTimerEventSource *timer);
+	bool     idleOn { false };
+	bool     idleBusy { true };                // the accounting state: bring-up counts as busy
+	uint32_t idleSync { 0 };                   // synchronous client operations in progress
+	uint64_t idleLastUseAbs { 0 }, idleStateAbs { 0 }, idleBusyNs { 0 }, idleIdleNs { 0 };
+	uint32_t idleTransitions { 0 };
+	char     idleLastWhat[24] {};
+	IOTimerEventSource *idleTimer { nullptr };
+	IOWorkLoop         *idleWorkLoop { nullptr };
+	OSObject           *idleContext { nullptr };
+	// P7: set by the power callback BEFORE it takes rtLock; waits that hold rtLock poll it and return kIOReturnAborted.
+	volatile uint32_t sleepRequested { 0 };
+	bool     sleepAbortOn { true };
+	bool     waitAborted { false };            // the last wait ended because of sleepRequested (rtLock held by the waiter)
+	bool     sleepAbortWanted() const { return sleepAbortOn && __atomic_load_n(&sleepRequested, __ATOMIC_ACQUIRE) != 0; }
+	void     powerSleepClear();                // the wake finished (or was cancelled)
+	void     gfxSleepDrain();                  // powerWillSleep, rtLock held: wait <= 100 ms for client gfx IBs, then drop them (no wedge)
 	PresentSlot *presentSlot(uint64_t id, const void *owner);
 	void     completePresentLocked(PresentSlot &slot, IOReturn result, uint64_t frame);
 	void     dropPendingPresentsLocked(IOReturn result);
@@ -753,6 +852,96 @@ private:
 	void publishRuntime(uint32_t stage);
 	bool initRuntimeHeap();
 	bool vmBootSelfTest();
+	// Sparse page tables (rdna4-vmshared=2): a multi-level tree, pages backed on demand.
+	static constexpr uint32_t kSparseShadowMax = 8192;        // wired 4 KiB shadow pages over all clients (32 MiB)
+	uint32_t sparseShadowPages { 0 };
+	static bool sparseAllocChunk(void *ctx, uint64_t &off);
+	static void sparseFreeChunk(void *ctx, uint64_t off);
+	PtPages::Backend sparseBackend() { return PtPages::Backend { sparseAllocChunk, sparseFreeChunk, this }; }
+	static uint64_t *sparseAllocShadow(void *ctx);
+	static void sparseFreeShadow(void *ctx, uint64_t *page);
+	static bool sparsePhysOf(void *ctx, uint64_t heapOffset, uint64_t &physical);
+	PtPages::Host sparseHost() { return PtPages::Host { sparseBackend(), sparseAllocShadow, sparseFreeShadow, sparsePhysOf, this }; }
+	struct TreeCtx { RDNA4Compute *self; RtClient *c; };
+	static bool treePageThunk(void *ctx, uint32_t level, uint64_t key, bool create, uint64_t *&entries, uint64_t &phys, uint32_t &id);
+	static void treeDirtyThunk(void *ctx, uint32_t id);
+	bool sparseSync(RtClient &c);      // every page whose shadow changed goes to its VRAM page
+	uint64_t *ptEntry(RtClient &c, uint64_t off);
+	struct PtCtx { RDNA4Compute *self; RtClient *c; };
+	static uint64_t *ptEntryThunk(void *ctx, uint64_t off);
+	static bool ptPhysThunk(void *ctx, uint64_t off, uint64_t &phys);
+	GpuVmTable::Policy vmPolicy() const { return GpuVmTable::Policy { vmIsPteOff, vmExecOff, vmPteSet, vmPteClear }; }
+	bool ptPhys(RtClient &c, uint64_t off, uint64_t &phys);
+	bool hasTables(const RtClient &c) const { return c.tableShadow || c.sp; }
+	bool sparseOpen(RtClient &c, uint32_t quotaPages);
+	void sparseTeardown(RtClient &c, bool clearVram);
+	// W13 S7-lite (docs/w13-vmid.md): with rdna4-vmshared=1 clients own no HQD. Two kernel-owned MEC queues (VMID 0, PRIV_STATE|KMD_QUEUE,
+	// one per MEC pipe) run every client job as INDIRECT_BUFFER(vmid = the client's) followed by a ring-level fence, as amdgpu's kernel
+	// compute rings do. Clients keep a static VMID 8-15. Default off; the per-client-HQD path is unchanged when off.
+	struct SharedQueue {
+		bool up { false }, wedged { false };
+		uint32_t pipe { 0 }, queue { 0 }, doorbell { 0 }, area { 0 };   // area: pool offset of MQD/EOP/PQ/rptr/wptr pages
+		Pm4::Queue pm;
+		// rdna4-vmshared=2: a per-queue fence (amdgpu's per-ring fence) every job also writes, and the ring space the jobs in flight occupy
+		volatile uint32_t *fenceCpu { nullptr };
+		uint64_t fenceMc { 0 };
+		uint32_t seq { 0 };
+		struct Job { uint32_t seq, dwords; };
+		Job      jobs[64] {};
+		uint32_t jobHead { 0 }, jobCount { 0 }, ringUsed { 0 };
+	};
+	static constexpr uint32_t kSharedQueues = 2;
+	SharedQueue sharedQ[kSharedQueues] {};
+	uint32_t vmShared { 0 };          // rdna4-vmshared: 0 off, 1 static VMIDs 8-15, 2 VMIDs from the pool per job
+	bool sharedInit { false };
+	Vmid::Pool vmPool;
+	static uint32_t requestedVmShared();
+	bool sharedFenceReached(uint32_t domain, uint32_t seq);
+	int vmClientSlotByPasid(uint32_t pasid) const;     // rdna4-vmshared=2: which client a fault vector's PASID names (-1: none); a racy read, for logs only
+	static bool poolFenceReached(void *context, uint32_t domain, uint32_t seq);
+	bool sharedReserve(uint32_t k, uint32_t dwords);
+	void sharedCommit(uint32_t k, uint32_t seq, uint32_t dwords);
+	uint32_t vmAcquire(RtClient &c);                 // a VMID bound to the client's tables, rebound/flushed as needed; 0 = none available
+	void vmReleaseVmids(RtClient &c);                // client closes: every VMID it owns goes back, contexts off
+	IOReturn rtOpenPooled(const void *owner, uint32_t slot, RtClient *c);
+	bool vmSharedEnsure();
+	IOReturn rtOpenShared(const void *owner, uint32_t slot, RtClient *c);
+	IOReturn rtOpenInner(const void *owner);
+	bool sharedStart(uint32_t k);
+	void sharedStopAll(const char *why);
+	bool recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const char *tag);
+	// The VMID a client's next submission runs in. One place: the client's fixed VMID (modes 0 and 1), or, with rdna4-vmshared=2, a VMID the
+	// pool binds to the client's tables for this job (vmAcquire: reused, or an idle one rebound over MMIO). 0 = none available (the caller
+	// answers Busy). W12k's gfx submit takes the IB's VMID from here; the compute paths acquire explicitly (they reserve ring space first) and
+	// read c.vmid afterwards.
+	uint32_t vmidForSubmit(RtClient &c) { return c.shared && vmShared == 2 ? vmAcquire(c) : c.vmid; }
+	static constexpr uint32_t kGfxDomain = Vmid::kDomainGfx;   // the VMID pool's fence domain for the gfx ring (0 and 1 are the shared compute queues)
+	static bool requestedVmIdTest();
+	static uint32_t vmIdTestMask();          // rdna4-vmid-test: 1 probes, 2 flow-point surveys, 4 client-op trace
+	void vmIdSurvey(const char *tag, uint32_t settleMs = 0);
+	void vmOpTrace(const char *op, uint32_t vmid, uint32_t pipe, uint32_t queue);
+	void vmSurvey(const char *tag, uint32_t settleMs = 0) { if (vmSurveyOn) vmIdSurvey(tag, settleMs); }
+	void vmIdTest(bool late);                 // late = the probes that repeat after clock gating (mask bit 8)
+	// Compact one-line entries for the registry (properties Compute,VMSurvey and Compute,VMOps), " ## " separated, bounded, like the gfx verdict:
+	// the dmesg window loses bring-up lines, the registry does not.
+	void vmRegistryAdd(const char *prop, char *buf, size_t cap, uint32_t &len, bool &full, const char *entry);
+	bool     vmSurveyOn { false };
+	bool     vmOpTraceOn { false };
+	uint32_t vmOpTraceLines { 0 };        // runtime clients (boot self-tests, diagnostic-log clients, the user client)
+	uint32_t vmOpProbeLines { 0 };        // the S1 probes of vmIdTest: their own budget, so they cannot use up the clients' (hub-task-347)
+	bool     vmOpInProbe { false };
+	bool     vmSurveyClientDone { false };
+	bool     vmSurveyDispatchDone { false };
+	bool     vmIdShaderHung { false };        // an early S1 shader probe hung: the late ones are skipped
+	char     vmSurveyBuf[3072] {};
+	uint32_t vmSurveyLen { 0 };
+	bool     vmSurveyFull { false };
+	char     vmOpsBuf[3072] {};               // Compute,VMOps: runtime clients
+	uint32_t vmOpsLen { 0 };
+	bool     vmOpsFull { false };
+	char     vmProbeOpsBuf[1536] {};          // Compute,VMProbeOps: the S1 probes' own operations
+	uint32_t vmProbeOpsLen { 0 };
+	bool     vmProbeOpsFull { false };
 	void vmDumpHubWindows(const char *tag);   // W17 E1, read-only
 	RtBuffer  *bufferFor(const void *owner, uint64_t handle);
 	RtProgram *programFor(const void *owner, uint64_t handle);
@@ -766,10 +955,28 @@ private:
 	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
 	bool vmContextInit(RtClient &client);
 	bool vmInvalidate(uint32_t vmid, const char *tag);
+	bool vmInvalidateOwned(RtClient &c, const char *tag);
 	void logClientFault(RtClient &client, const char *tag);
 	void scrubFaultPage();
 	void releaseHost(RtBuffer &buffer);
 	void retireIbFences(RtClient &client);
+	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
+	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
+	// so the two never use the ring at the same time. Everything below runs under rtLock.
+	static constexpr uint32_t kMaxGfxOutstanding = 16;     // submissions in the ring across all clients (15 dwords each, 22 with the pool's ring fence: 352 of 4096)
+	static constexpr uint32_t kGfxFenceSlot = 0x40;        // bytes into the client's fence page
+	bool     gfxWedged { false };                          // a client gfx IB timed out: the gfx ring is given up until the next bring-up
+	bool     gfxParked { false };                          // gfxPark halted PFP/ME (probe boots)
+	uint32_t gfxClientPending { 0 };                       // client submissions not yet retired, all clients
+	IOReturn gfxClientReady() const;                       // kIOReturnSuccess when a client may use the ring now
+	void     gfxClientRetire(RtClient &client);
+	IOReturn gfxClientEmit(RtClient &client, uint64_t ibVa, uint32_t dwords, uint32_t &fence);
+	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why);
+	void     gfxClientWedge(const char *why);
+	void     gfxClientDrain(RtClient &client, const char *why);
+	void     gfxClientReset();                             // a fresh gfx ring: nothing is pending
+	bool     gfxClientSelfTest();                          // rdna4-gfxclient=1 (bring-up thread)
+	static bool requestedGfxClient();
 
 	// DMA between host memory and VRAM (runtime.cpp). One pinned, physically
 	// contiguous bounce buffer; the GC hub's AGP aperture maps system memory

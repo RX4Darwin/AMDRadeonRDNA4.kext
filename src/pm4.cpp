@@ -115,6 +115,13 @@ uint32_t acquireMem(uint32_t *out, uint32_t gcrCntl) {
 	return 8;
 }
 
+uint32_t contextControl(uint32_t *out, uint32_t load, uint32_t shadow) {
+	out[0] = header(OpContextControl, 1);
+	out[1] = load;
+	out[2] = shadow;
+	return 3;
+}
+
 uint32_t indirectBufferGfx(uint32_t *out, uint64_t addr, uint32_t dwords, uint32_t vmid) {
 	out[0] = header(OpIndirectBuffer, 2);
 	out[1] = static_cast<uint32_t>(addr) & ~3u;

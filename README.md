@@ -350,6 +350,9 @@ tools/vm-opencore.sh --kext build/RDNA4FB.kext --lilu ~/kexts/Lilu.kext \
 tools/emu-boot.sh         # the VM on the emulated card (VNC :0, serial ~/tahoe-serial.log)
 ```
 
+On Linux, `tools/emu-linux.sh <boot 0-7> [--diag]` dry-runs a real-card boot (macOS Recovery, headless,
+kernel log and the diagnostic table saved per run): see `docs/emu-linux.md`.
+
 `tools/emu-boot.sh trace=on` logs every BAR5 access to the QEMU log. The
 `ih-dead=on` device option leaves IH ring writebacks enabled while suppressing
 MSI delivery, which exercises the runtime's polling fallback. The same option

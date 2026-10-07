@@ -2,21 +2,31 @@
 
 2026-09-30, Linux side, RX 9070 XT, amdgpu (kernel 7.2.2), no root, no reboot.
 
+**Scope of the evidence.** Everything here was measured on amdgpu's own gfx queue, in a per-process VMID, with normal
+(amdgpu-allocated) memory. The kext's macOS path (a bare RB0 without MQD/HQD, VMID0, UC memory) is untested with the
+fix until real-card boot 3. (The title of commit 2228397, "the first triangle draws on the card", overstates this; it
+is already pushed and cannot be changed.)
+
 ## Result
 
 **An NGG (merged ES/GS) wave on gfx12 starts with `EXEC = 0x00000001`: lane 0 only.** Every kext NGG
 shader built its lane masks with `s_and_saveexec_b32`, which ANDs with that initial EXEC. Only vertex 0
 exported a position; vertices 1 and 2 never did, so the primitive reached the clipper incomplete and was
-dropped. That is the card's signature in rounds 4-6: `IA 1/3, VS 3, C_INVOCATIONS 1, C_PRIMITIVES 0, PS 0`.
+dropped. That is the card's picture in rounds 4-6: `IA 1/3, VS 3, C_INVOCATIONS 1, C_PRIMITIVES 0, PS 0`, 0 pixels. The pixels
+and PS_INVOCATIONS are the signal; C_PRIMITIVES is supporting evidence only (below).
 
 The fix is to **set** EXEC from `merged_wave_info` (`s_mov_b32 exec_lo, <mask>`) instead of ANDing it, as
 ACO does (`s_bfe_u64 exec, -1, s0` at the top of RADV's NGG shader). The diagnostic shaders that
 compute or store per-lane values before that (`nggconst`, `nggstore`, `nggvgpr`) open all lanes first
 (`s_mov_b32 exec_lo, -1`).
 
-With the fix, **the kext's unchanged draw stream and registers draw the triangle on the card: 8192 px,
-bounds x 64..191 y 64..190, C_PRIMITIVES 4, PS_INVOCATIONS 8192**. That holds for all five NGG shaders,
+With the fix, **the kext's unchanged draw stream and registers draw the triangle on amdgpu's gfx queue: 8192 px,
+bounds x 64..191 y 64..190, PS_INVOCATIONS 8192** (C_PRIMITIVES reads 4). That holds for all five NGG shaders,
 each with its ladder variant's register patch.
+
+**C_PRIMITIVES is not a reliable signature.** A good triangle reads 4 and the old `s_and_saveexec` shader read 0 in 3/3
+runs, but one failing draw (wave64, `VGPRS = 0`, 0 px, PS 0) read 0, 0, 4, 0, 0, 8 in six runs. Judge a draw by its pixels
+and PS_INVOCATIONS.
 
 The emulator launched NGG waves with EXEC = all ones, which hid the bug. It now starts them with `0x1` like
 the card, so the old shaders fail there too (negative control).
@@ -30,7 +40,7 @@ SET_*_REG writes before the draw, and `REPLAY_VS` picks the VS binary.
 
 | Step | Result on the card |
 |---|---|
-| kext stream + kext `ngg.s`, as on macOS | **0 px, C_INV 1, C_PRIM 0**: the macOS symptom reproduced on amdgpu's own queue, so NOT the bare ring, VMID0 or UC memory |
+| kext stream + kext `ngg.s`, as on macOS | **0 px, PS 0, C_INV 1, C_PRIM 0**: the macOS symptom reproduced on amdgpu's own queue. This shows the shader bug alone is enough to give the symptom; it does not show that the bare ring, VMID0 or UC memory are innocent on macOS |
 | + every context/uconfig register RADV had at its draw (98 regs, `radv-state.py`) | 0 px |
 | RADV's VS binary (wave64) + RADV's SH regs, rest = kext stream | **8192 px**: everything but the VS is right |
 | RADV's VS hand-ported to wave32 in the kext's wave32 config | 8192 px: wave32 is fine |
@@ -52,6 +62,43 @@ Ruled out along the way (all on the card): the export order (`linux-radv-triangl
     tools/linux-replay/run.sh                                 # the committed ngg.s: 8192 px
     REPLAY_VS=old tools/linux-replay/run.sh                   # the round-6 ngg.s (edc5f81): 0 px
     REPLAY_SET="c:0x10b=0x43800000" tools/linux-replay/run.sh # any register override
+
+## W12k groundwork: the app-side triangle IB
+
+`userspace/gfx12tri.h` is the triangle as an application records it: `rdna4_tri_place_shaders`,
+`rdna4_tri_record` (the stream with the app's code/target/ring/fence addresses) and `rdna4_tri_count`.
+It is plain C (rdna4-run) and C++ (the replay), over `src/gfx12_draw.h`, which the generator now emits
+for both languages. The regenerated stream and relocations are byte-identical and the kext's code is
+unchanged. The replay records through it, so the exact bytes `rdna4-run tri` will submit are proven on
+the card as an unprivileged IB in a per-process VMID: 8192 px, and the stream's own RELEASE_MEM
+writes the fence the app waits on.
+
+The emulator (W12e) agrees for this stream in a client VMID: every opcode is modelled (none takes the
+OPCODE_ERROR fault) and all its SET_UCONFIG_REG writes are in the unprivileged range.
+
+`tools/linux-replay/ring-capture.sh` (needs sudo, read-only) dumps amdgpu's gfx rings right after a
+replay and decodes the packets around our INDIRECT_BUFFER. That shows what the kernel wraps a user gfx IB
+with on this card, which is the reference for the kext side of W12k.
+
+## The wave64 fallback (ladder variant 4096)
+
+`shaders/ngg64.s` is `ngg.s` as a wave64 NGG shader (64-bit EXEC and compare masks; `tools/build-shaders.sh`
+assembles `*64.s` with `+wavefrontsize64`). It is RADV's NGG (GS) half only: RADV also runs the pixel shader as wave64
+(`PS_W32_EN = 0`, `hw-logs/2026-09-30-linux-radv-triangle/radv-shaders-and-ibs.txt:882`), while variant 4096 keeps the PS wave32. Variant 4096 places it, clears `VGT_SHADER_STAGES_EN.GS_W32_EN`
+and sets `SPI_SHADER_PGM_RSRC1_GS.VGPRS = 2`. On the card (`REPLAY_VARIANT=4096`) it draws **8192 px**, with
+the same counters as the wave32 baseline.
+
+Proof that it runs as wave64: the same `ngg64` binary with the same `VGPRS = 0` (8 VGPRs in wave32, 4 in wave64)
+and only `GS_W32_EN` differing. Wave32 mode draws 8192 px; wave64 mode draws 0 px (PS 0, C_INV 1; C_PRIM read 0, 4 or 8 over six runs, so the pixel count is the signal, not C_PRIM).
+With `VGPRS = 1` (8 VGPRs in wave64) it draws again. Reproduce, after `run.sh` has built `tools/linux-replay/build/replay`:
+
+    REPLAY_VARIANT=4096 REPLAY_SET="c:0x2a6=0x04400000;s:0x8a=0x000c0000" tools/linux-replay/build/replay   # wave32: 8192 px
+    REPLAY_VARIANT=4096 REPLAY_SET="s:0x8a=0x000c0000" tools/linux-replay/build/replay                      # wave64: 0 px
+
+It joins every probe boot's ladder right after the NGG marker. The ladder only runs when the baseline draw
+is not right. If boot 3's wave32 baseline were still empty on macOS, `diag 4096` says whether the wave size
+matters there. The emulator refuses wave64 draws ("requires GS_W32_EN"): the draw is skipped, 0 px, no
+false pass.
 
 ## Next
 

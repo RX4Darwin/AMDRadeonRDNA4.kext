@@ -56,7 +56,9 @@ uint32_t copyLinear(uint32_t *out, uint64_t src, uint64_t dst, uint32_t bytes);
 // memory; the pointer does not.
 class Ring {
 public:
-	bool init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes);
+	// startWptr: the monotonic 64-bit byte pointer the ring continues from (0 on a fresh engine; after a wake WITHOUT power loss the engine still
+	// holds its pointers and lowering the wptr stalls it, docs/power-gfx.md s.9.6).
+	bool init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes, uint64_t startWptr = 0);
 	uint64_t mc() const { return base; }
 	uint32_t sizeBytes() const { return size; }
 	uint32_t sizeLog2Dwords() const;          // RB_SIZE field

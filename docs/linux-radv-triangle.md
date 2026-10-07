@@ -2,7 +2,7 @@
 
 > **Update 2026-09-30 04:20: the export-order hypothesis below is DISPROVEN on the card.** RADV patched to
 > export the primitive first (the kext's old order; `tools/radv-triangle/mesa-26.2.2-force-early-prim.patch`,
-> `RADV_FORCE_EARLY_PRIM=1`) still draws 8192 px with C_PRIMITIVES > 0 on this RX 9070 XT. Mesa's late
+> `RADV_FORCE_EARLY_PRIM=1`) still draws 8192 px (C_PRIMITIVES > 0) on this RX 9070 XT. Mesa's late
 > primitive export is a choice, not a hardware rule. The reordered kext shaders are harmless (Mesa's order)
 > but do not fix the triangle. The "second tier" table is still open, and the next test is replaying the
 > kext's own stream through amdgpu on Linux.
@@ -23,8 +23,9 @@ and the command stream (`RADV_DEBUG=dumpibs`). Capture: `hw-logs/2026-09-30-linu
     stats: ia_verts 3 ia_prims 1 vs_inv 3 c_inv 1 c_prim 4 ps_inv 2112
 
 Exactly the pixels `gfxring.cpp` expects, so the draw itself is right. The kext on the same card gets
-`ia 1/3 vs 3 ci 1 cp 0 ps 0`. (RADV's C_PRIMITIVES reads 4 for one triangle: the counter sums more than one
-clipper instance. Only 0 vs > 0 matters here.)
+`ia 1/3 vs 3 ci 1 cp 0 ps 0`. (C_PRIMITIVES reads 4 for one good triangle; why is unexplained. It is also not a reliable
+signature: one failing draw on the card (wave64, VGPRS 0, 0 px) read 0, 0, 4, 0, 0, 8 in six runs, so the pixels and
+PS_INVOCATIONS are the signal and C_PRIMITIVES only supporting evidence.)
 
 RADV compiles the VS as NGG passthrough (no culling; the `nonggc` run is byte-identical), which is the
 kext's configuration: `VGT_SHADER_STAGES_EN.PRIMGEN_PASSTHRU_NO_MSG=1`, `GE_CNTL 0xa0010080`,

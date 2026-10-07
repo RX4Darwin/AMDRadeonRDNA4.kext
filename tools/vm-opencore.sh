@@ -2,7 +2,7 @@
 # Build a development OpenCore disk for an OSX-KVM macOS VM that loads
 # RDNA4FB the way a real Hackintosh does: injected by OpenCore after Lilu.
 #
-#   tools/vm-opencore.sh [--kext build-vmtest/RDNA4FB.kext] [--lilu path/Lilu.kext]
+#   tools/vm-opencore.sh [--kext build-vmtest/RDNA4FB.kext]... [--lilu path/Lilu.kext] [--timeout SECS]
 #                        [--args "<boot-args>"] [--resolution WxH] [--out NAME.qcow2]
 #
 # Starts from the stock $OSXKVM/OpenCore/OpenCore.qcow2 every time and writes
@@ -23,13 +23,15 @@ set -euo pipefail
 
 OSXKVM=${OSXKVM:-$HOME/OSX-KVM}
 ARGS="-v keepsyms=1 debug=0x100 serial=3"
-KEXT=""
+KEXTS=()
+TIMEOUT=0
 LILU=""
 RES="1920x1080"
 OUTIMG="OpenCore-dev.qcow2"
 while [ $# -gt 0 ]; do
 	case $1 in
-		--kext) KEXT=$(realpath "$2"); shift ;;
+		--kext) KEXTS+=("$(realpath "$2")"); shift ;;   # repeatable: injected after Lilu in the order given
+		--timeout) TIMEOUT=$2; shift ;;                      # picker auto-boot seconds (default 0 = wait for a key)
 		--lilu) LILU=$(realpath "$2"); shift ;;
 		--args) ARGS=$2; shift ;;
 		--resolution) RES=$2; shift ;;
@@ -58,13 +60,13 @@ if [ -n "$LILU" ]; then
 fi
 RESOPT=()
 [ -n "$RES" ] && RESOPT=(--resolution "$RES")
-if [ -n "$KEXT" ]; then
-	mdeltree -i "$IMG" "::/EFI/OC/Kexts/$(basename "$KEXT")" 2>/dev/null || true
-	mcopy -s -o -i "$IMG" "$KEXT" ::/EFI/OC/Kexts/
-	python3 "$HERE/vm-ocplist.py" "$TMP/config.plist" "$ARGS" "$(basename "$KEXT")" "${RESOPT[@]}"
-else
-	python3 "$HERE/vm-ocplist.py" "$TMP/config.plist" "$ARGS" "${RESOPT[@]}"
-fi
+NAMES=()
+for K in "${KEXTS[@]}"; do
+	mdeltree -i "$IMG" "::/EFI/OC/Kexts/$(basename "$K")" 2>/dev/null || true
+	mcopy -s -o -i "$IMG" "$K" ::/EFI/OC/Kexts/
+	NAMES+=("$(basename "$K")")
+done
+python3 "$HERE/vm-ocplist.py" "$TMP/config.plist" "$ARGS" "${NAMES[@]}" "${RESOPT[@]}" --timeout "$TIMEOUT"
 mcopy -o -i "$IMG" "$TMP/config.plist" ::/EFI/OC/config.plist
 mcopy -n -o -i "$IMG" ::/EFI/OC/config.plist "$TMP/config.check"
 cmp -s "$TMP/config.plist" "$TMP/config.check" || { echo "config.plist write-back mismatch" >&2; exit 1; }

@@ -54,6 +54,7 @@ CXX_SRCS := \
 	src/modeset.cpp \
 	src/compute.cpp \
 	src/gfxring.cpp \
+	src/pmidle.cpp \
 	src/flip.cpp \
 	src/amdfw.cpp \
 	src/psp.cpp \
@@ -64,8 +65,16 @@ CXX_SRCS := \
 	src/codeobj.cpp \
 	src/gpuheap.cpp \
 	src/gpuvm.cpp \
+	src/vmid.cpp \
+	src/ptpages.cpp \
+	src/gpuvmtable.cpp \
 	src/runtime.cpp \
+	src/vmtest.cpp \
+	src/vmshared.cpp \
 	src/userclient.cpp \
+	src/accelcensus.cpp \
+	src/pvgpu.cpp \
+	src/pvstream.cpp \
 	$(LILU)/Library/plugin_start.cpp \
 	src/atombios.cpp \
 	src/ipdiscovery.cpp \
@@ -154,27 +163,66 @@ USER_FLAGS := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK
               -mmacosx-version-min=$(DEPLOY) -std=c11 -O2 -Wall -Iinclude -Isrc
 
 # --- rules -------------------------------------------------------------------
-.PHONY: all clean test userspace
+.PHONY: all clean test userspace check-isa census-tool census-stub census-pathlog
 all: $(KEXT) $(RUN_TOOL)
 
-$(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp src/amdfw.cpp src/amdfw.hpp src/psp.cpp src/psp.hpp src/sdma.cpp src/sdma.hpp src/pm4.cpp src/pm4.hpp src/codeobj.cpp src/codeobj.hpp src/vadd_codeobj.h src/bench_codeobj.h src/gfxregs.hpp src/linuxref.hpp src/gpuheap.cpp src/gpuheap.hpp src/flip.hpp include/rdna4compute.h src/ihdecode.cpp src/ih.hpp src/gpuvm.cpp src/gpuvm.hpp
+$(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp src/amdfw.cpp src/amdfw.hpp src/psp.cpp src/psp.hpp src/sdma.cpp src/sdma.hpp src/pm4.cpp src/pm4.hpp src/codeobj.cpp src/codeobj.hpp src/vadd_codeobj.h src/bench_codeobj.h src/gfxregs.hpp src/linuxref.hpp src/gpuheap.cpp src/gpuheap.hpp src/flip.hpp include/rdna4compute.h src/ihdecode.cpp src/ih.hpp src/gpuvm.cpp src/gpuvm.hpp src/vmid.cpp src/vmid.hpp src/ptpages.cpp src/ptpages.hpp src/gpuvmtable.cpp src/gpuvmtable.hpp
 	@mkdir -p $(BUILD)
-	$(CXX) -std=c++17 -Wall -O2 -Iinclude -o $@ tools/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp src/modeset.cpp src/amdfw.cpp src/psp.cpp src/sdma.cpp src/ihdecode.cpp src/pm4.cpp src/codeobj.cpp src/gpuheap.cpp src/gpuvm.cpp
+	$(CXX) -std=c++17 -Wall -O2 -Iinclude -o $@ tools/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp src/modeset.cpp src/amdfw.cpp src/psp.cpp src/sdma.cpp src/ihdecode.cpp src/pm4.cpp src/codeobj.cpp src/gpuheap.cpp src/gpuvm.cpp src/vmid.cpp src/ptpages.cpp src/gpuvmtable.cpp
 
 # Linked by the C++ driver: it is the one pointed at ld64 (build-osxcross.sh).
-$(RUN_TOOL): userspace/rdna4-run.c userspace/librdna4.c userspace/librdna4.h userspace/pm4build.h include/rdna4compute.h src/vadd_codeobj.h src/bench_codeobj.h
+$(RUN_TOOL): userspace/rdna4-run.c userspace/librdna4.c userspace/librdna4.h userspace/pm4build.h userspace/gfx12tri.h userspace/gfx12tricol.h userspace/gfx12trirun.h src/gfx12_draw.h src/gfx12_draw_col.h src/ngg_kernel.h src/psred_kernel.h src/nggcol_kernel.h src/pscol_kernel.h include/rdna4compute.h src/vadd_codeobj.h src/bench_codeobj.h
 	@mkdir -p $(BUILD)
 	$(CXX) -x c $(USER_FLAGS) userspace/rdna4-run.c userspace/librdna4.c \
 		-framework IOKit -framework CoreFoundation -weak_framework Accelerate -o $@
 
 userspace: $(RUN_TOOL)
 
+# E1 trigger (docs/metal-spike.md): Objective-C, runs in Recovery next to rdna4-run.
+CENSUS_TOOL := $(BUILD)/rdna4-census
+$(CENSUS_TOOL): tools/accelcensus/census.m
+	@mkdir -p $(BUILD)
+	$(CXX) -x objective-c -fobjc-arc -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
+		-mmacosx-version-min=$(DEPLOY) -std=gnu11 -O1 -Wall $< -framework Foundation -framework Metal -framework IOKit -o $@
+
+census-tool: $(CENSUS_TOOL)
+
+# E1c stub bundle (docs/metal-spike.md s.11.4): a Metal device bundle that only logs. MTLIOAccelDevice is private (exported by Metal), hence
+# dynamic_lookup for the superclass reference.
+CENSUS_STUB := $(BUILD)/RDNA4CensusMTLDriver.bundle
+$(CENSUS_STUB): tools/accelcensus/stub/RDNA4CensusMTLDriver.m tools/accelcensus/stub/Info.plist
+	@mkdir -p $@/Contents/MacOS
+	$(CXX) -x objective-c -fno-objc-arc -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
+		-mmacosx-version-min=$(DEPLOY) -std=gnu11 -O1 -Wall -bundle -undefined dynamic_lookup \
+		tools/accelcensus/stub/RDNA4CensusMTLDriver.m -framework Foundation -o $@/Contents/MacOS/RDNA4CensusMTLDriver
+	cp tools/accelcensus/stub/Info.plist $@/Contents/Info.plist
+
+census-stub: $(CENSUS_STUB)
+
+CENSUS_PATHLOG := $(BUILD)/libpathlog.dylib
+$(CENSUS_PATHLOG): tools/accelcensus/pathlog.c
+	@mkdir -p $(BUILD)
+	$(CXX) -x c -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) -mmacosx-version-min=$(DEPLOY) -std=gnu11 -O1 -Wall \
+		-dynamiclib $< -o $@
+
+census-pathlog: $(CENSUS_PATHLOG)
+
+check-isa:
+	bash tools/check-isa.sh
+
 atomdump: $(ATOMDUMP)
 
 # Runs the kext's AtomBIOS parser (compiled for the host) against the real
 # ROM dump — verifies parsing logic without GPU hardware.
-test: $(ATOMDUMP)
+PVSTREAM_TEST := $(BUILD)/pvstream-test
+$(PVSTREAM_TEST): tools/pvstream-test.cpp src/pvstream.cpp src/pvstream.hpp src/pvopcodes.inc src/pvdevinfo.inc
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 -Wall -O1 -o $@ tools/pvstream-test.cpp src/pvstream.cpp
+
+test: $(ATOMDUMP) $(PVSTREAM_TEST)
 	$(ATOMDUMP) $(FIRMWARE)
+	$(PVSTREAM_TEST)
+	bash tools/check-isa.sh
 
 $(LILU_STAMP): $(LILU)/../hde/hde32.h $(LILU)/../hde/hde64.h
 	@mkdir -p $(LILU_SHIM)/Headers/capstone

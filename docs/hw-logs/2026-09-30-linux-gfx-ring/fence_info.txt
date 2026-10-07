@@ -1,0 +1,42 @@
+--- ring 0 (gfx_0.0.0) ---
+Last signaled fence          0x000a90ed
+Last emitted                 0x000a90ed
+Last signaled trailing fence 0x00000000
+Last emitted                 0x00000000
+Last preempted               0x00000000
+Last reset                   0x00000000
+Last both                    0x00000000
+--- ring 1 (comp_1.0.0) ---
+Last signaled fence          0x00000001
+Last emitted                 0x00000001
+--- ring 2 (comp_1.1.0) ---
+Last signaled fence          0x00000913
+Last emitted                 0x00000913
+--- ring 3 (comp_1.0.1) ---
+Last signaled fence          0x000005c4
+Last emitted                 0x000005c4
+--- ring 4 (comp_1.1.1) ---
+Last signaled fence          0x00000418
+Last emitted                 0x00000418
+--- ring 5 (sdma0) ---
+Last signaled fence          0x00016833
+Last emitted                 0x00016833
+Last signaled trailing fence 0x00000000
+Last emitted                 0x00000000
+--- ring 6 (sdma1) ---
+Last signaled fence          0x0000f001
+Last emitted                 0x0000f001
+Last signaled trailing fence 0x00000000
+Last emitted                 0x00000000
+--- ring 7 (vcn_unified_0) ---
+Last signaled fence          0x0000c84a
+Last emitted                 0x0000c84a
+--- ring 8 (jpeg_dec) ---
+Last signaled fence          0x00000001
+Last emitted                 0x00000001
+--- ring 9 (mes_3.0.0) ---
+Last signaled fence          0x00000003
+Last emitted                 0x00000003
+--- ring 10 (mes_3.1.0) ---
+Last signaled fence          0x00000109
+Last emitted                 0x00000109

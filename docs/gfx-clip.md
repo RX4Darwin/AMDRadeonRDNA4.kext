@@ -1,5 +1,7 @@
 # W45: the clip / cull / viewport / scissor state of the first draw
 
+(Later note: C_PRIMITIVES alone is not a reliable signature, see docs/gfx-ngg.md; the quoted log line is the wording of that round.)
+
 Round 5, boot 3 on the card (`E:\rdna4fb-diag-20260930-053620.txt`, `-053909.txt`): **every draw and every ladder variant** reads
 
     PS_INVOCATIONS 0, C_PRIMITIVES 0, C_INVOCATIONS 1, VS_INVOCATIONS 3, IA_PRIMITIVES 1, IA_VERTICES 3

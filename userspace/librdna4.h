@@ -97,6 +97,14 @@ kern_return_t rdna4_submit_ib(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t 
 kern_return_t rdna4_wait_fence(rdna4_t *dev, uint64_t fence, uint32_t timeoutMs,
                                uint64_t *ns);
 
+/* W12k: append the client's own unprivileged GRAPHICS IB (PM4 for the gfx command processor: state, draws, end-of-pipe fences; it runs in this
+ * client's VMID and may only reach this client's buffers) to the kernel's gfx ring. The fence is per client and ordered with this client's
+ * earlier gfx submissions; it is NOT the compute fence of rdna4_submit_ib. Needs RDNA4_FLAG_GFX in rdna4_info (rdna4-gfx=2 boot). A wait that
+ * times out means the gfx ring is wedged until the next bring-up (kIOReturnTimeout, then kIOReturnNotResponding). See docs/w12k-gfx-submit.md. */
+kern_return_t rdna4_submit_gfx_ib(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offsetBytes,
+                                  uint32_t dwords, uint64_t *fence);
+kern_return_t rdna4_wait_gfx_fence(rdna4_t *dev, uint64_t fence, uint32_t timeoutMs, uint64_t *ns);
+
 kern_return_t rdna4_wait_vblank(rdna4_t *dev, uint32_t timeoutMs, uint64_t *count,
                                 uint64_t *timeNs);
 /* Present a 256-byte-aligned ARGB8888 slice of a device buffer. The returned

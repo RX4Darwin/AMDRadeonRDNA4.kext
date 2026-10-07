@@ -596,6 +596,10 @@ struct RDNA4State {
     bool     trace;
     bool     kiq_only;       /* model a MEC that runs only the RLC-named KIQ */
     bool     inv_noack;      /* model the card (2026-09-28): GC hub flushes never ack */
+    uint32_t inv_ack_reads;  /* W13 E2: a GC hub invalidation acks (and takes effect) only after this many reads of its ACK register */
+    uint32_t tlb_evict_ppm;  /* W13 E1 stress mode: chance per lookup, in parts per million, that a cached translation has been evicted */
+    bool     tlb_off;        /* W13 E1: the old model, tables walked on every access (A/B against the TLB model) */
+    bool     test_gfx_booted; /* unit tests over qtest: start with the RLC autoload complete (see rdna4_reset) */
     bool     sdma_no_db;     /* model an SDMA that ignores its doorbell */
     bool     dma_broken;     /* model a system-memory path that faults */
     bool     flip_stuck;     /* leave a surface flip pending forever */
@@ -739,6 +743,30 @@ struct RDNA4State {
         uint64_t mqd_stall_logged;   /* MQD address | VMID last reported stalled */
     } hqd[4][8];
     uint32_t selected_pipe, selected_queue, selected_vmid;
+
+    /* W13 (docs/w13-vmid.md section 7). E1: the GC hub's translation caches. A walk fills them;
+     * only a GCVM_INVALIDATE_ENGn_REQ that names the VMID and the level removes entries; writing a
+     * context's PAGE_TABLE_BASE or changing the tables does not. L1 and L2 hold leaf PTEs, L2 also
+     * the PDEs of walk levels 0-2 (PDE2 .. PDE0 in the register's names). Invalid entries are not
+     * cached, and there is no spontaneous eviction unless tlb-evict-ppm is set, so a missing flush
+     * is deterministic. */
+    GHashTable *tlb[5];              /* 0 L1 leaf, 1 L2 leaf, 2..4 L2 PDE of walk level 0..2 */
+    bool        tlb_used;            /* the walk in progress used a cached entry */
+    bool        tlb_verify;          /* a verification walk: no cache reads or fills, no faults */
+    bool        tlb_faulted;         /* the walk in progress ended in a fault (the span walker then answers with the dummy page) */
+    uint64_t    tlb_rng;
+    uint64_t    tlb_hits, tlb_fills, tlb_stale;
+    /* E2: the 18 invalidation engines. The invalidation takes effect, and ACK shows, when the ACK
+     * register has been read inv_ack_reads times (0: at the REQ write). */
+    struct {
+        uint32_t req;                /* the pending request, 0 = none */
+        uint32_t left;               /* ACK reads still to go */
+    } inv[18];
+    /* E4: SH_MEM_CONFIG / SH_MEM_BASES are per VMID, banked by GRBM_GFX_CNTL.VMID. */
+    uint32_t    sh_mem[16][2];
+    bool        sh_mem_written[16][2];
+    /* E5: IH_VMID_n_LUT, the PASID the IH stamps into a vector from that VMID. */
+    uint32_t    ih_vmid_lut[16];
 };
 
 static void rdna4_work_schedule(RDNA4State *s);
@@ -768,9 +796,22 @@ static bool rdna4_sh_reg(uint32_t byte, uint32_t *off)
 
 static void rdna4_gfx_wptr(RDNA4State *s, uint64_t wptr, bool doorbell);
 
+/* W13 E4: SH_MEM_CONFIG (0x09e4) and SH_MEM_BASES (0x09e3) live per VMID, not per queue
+ * (gfx_v12_0_constants_init / init_compute_vmid program them with GRBM_GFX_CNTL.VMID selecting).
+ * VMID 0 stays in the plain register image. */
+static inline bool rdna4_sh_mem_reg(uint32_t byte, uint32_t *which)
+{
+    uint32_t dword = byte / 4;
+    if (dword == 0xa000 + 0x09e4) { *which = 0; return true; }
+    if (dword == 0xa000 + 0x09e3) { *which = 1; return true; }
+    return false;
+}
+
 static inline uint32_t reg_get(RDNA4State *s, uint32_t byte)
 {
-    uint32_t off;
+    uint32_t off, which;
+    if (rdna4_sh_mem_reg(byte, &which))
+        return s->selected_vmid ? s->sh_mem[s->selected_vmid & 15][which] : s->regs[byte / 4];
     if (rdna4_hqd_reg(byte, &off) && s->selected_pipe < 4 && s->selected_queue < 8 &&
         (s->selected_pipe || s->selected_queue || s->selected_vmid))
         return s->hqd[s->selected_pipe][s->selected_queue].q[off];
@@ -782,7 +823,16 @@ static inline uint32_t reg_get(RDNA4State *s, uint32_t byte)
 
 static inline void reg_set(RDNA4State *s, uint32_t byte, uint32_t val)
 {
-    uint32_t off;
+    uint32_t off, which;
+    if (rdna4_sh_mem_reg(byte, &which)) {
+        if (s->selected_vmid) {
+            s->sh_mem[s->selected_vmid & 15][which] = val;
+            s->sh_mem_written[s->selected_vmid & 15][which] = true;
+        } else {
+            s->regs[byte / 4] = val;
+        }
+        return;
+    }
     if (rdna4_hqd_reg(byte, &off) && s->selected_pipe < 4 && s->selected_queue < 8 &&
         (s->selected_pipe || s->selected_queue || s->selected_vmid)) {
         s->hqd[s->selected_pipe][s->selected_queue].q[off] = val;
@@ -2013,8 +2063,17 @@ static bool rdna4_ih_ready(RDNA4State *s)
 /* A GPU IH producer writes vectors into the system-memory ring and then
  * writebacks the producer pointer. The QEMU card has no IOMMU, so the bus
  * addresses programmed through MC_SPACE=2 are guest physical addresses. */
+static void rdna4_ih_emit_iv(RDNA4State *s, uint8_t client, uint8_t source, uint8_t ring,
+                             uint32_t vmid, uint32_t data0, uint32_t data1);
+
 static void rdna4_ih_emit_vmid(RDNA4State *s, uint8_t client, uint8_t source,
                                uint8_t ring, uint32_t vmid, uint32_t data0)
+{
+    rdna4_ih_emit_iv(s, client, source, ring, vmid, data0, 0);
+}
+
+static void rdna4_ih_emit_iv(RDNA4State *s, uint8_t client, uint8_t source, uint8_t ring,
+                             uint32_t vmid, uint32_t data0, uint32_t data1)
 {
     if (!rdna4_ih_ready(s)) {
         return;
@@ -2032,7 +2091,11 @@ static void rdna4_ih_emit_vmid(RDNA4State *s, uint8_t client, uint8_t source,
     uint64_t timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) & ((1ull << 48) - 1);
     stl_le_p(entry + 1 * 4, (uint32_t)timestamp);
     stl_le_p(entry + 2 * 4, (uint32_t)(timestamp >> 32) & 0xffff);
+    /* W13 E5: dword 3 [15:0] is the PASID, looked up in IH_VMID_LUT when the vector is WRITTEN, so a
+     * vector produced before a VMID was re-targeted keeps the old PASID, as on the card. */
+    stl_le_p(entry + 3 * 4, s->ih_vmid_lut[vmid & 0xf] & 0xffff);
     stl_le_p(entry + 4 * 4, data0);
+    stl_le_p(entry + 5 * 4, data1);
     uint64_t ring_bus = ((uint64_t)reg_get(s, REG_IH_RB_BASE) << 8) |
                         ((uint64_t)(reg_get(s, REG_IH_RB_BASE_HI) & 0xff) << 40);
     if (rdna4_dma_write(s, ring_bus + wptr, entry, sizeof(entry)) != MEMTX_OK) {
@@ -2067,6 +2130,11 @@ static void rdna4_ih_emit(RDNA4State *s, uint8_t client, uint8_t source,
 static void rdna4_ih_reg_write(RDNA4State *s, uint32_t dw, uint32_t val)
 {
     uint32_t byte = OSSSYS(dw);
+    if (dw < 16) {                    /* IH_VMID_0_LUT .. IH_VMID_15_LUT (osssys_7_0_0_offset.h: 0x0000) */
+        s->ih_vmid_lut[dw] = val & 0xffff;
+        reg_set(s, byte, val);
+        return;
+    }
     switch (dw) {
     case 0x0080: { /* RB_CNTL; overflow clear is a pulse */
         if (val & IH_WPTR_OVERFLOW_CLR) {
@@ -2120,8 +2188,182 @@ static uint8_t *rdna4_phys_span(RDNA4State *s, uint64_t physical, uint64_t len)
 #define RDNA4_VM_PHYS_MASK   0x0000FFFFFFFFF000ull
 #define RDNA4_VM_PDE_PTE     (1ull << 63)
 
-static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va, int kind)
+static bool rdna4_vm_entry(RDNA4State *s, uint64_t address, uint64_t *entry);
+
+/* W13 E1: the translation caches (see the state struct). */
+#define RDNA4_TLB_L1        0
+#define RDNA4_TLB_L2        1
+#define RDNA4_TLB_PDE(lvl)  (2 + (lvl))
+
+static uint64_t rdna4_tlb_key(uint32_t vmid, uint32_t level, uint64_t va)
 {
+    return ((uint64_t)(vmid & 0xf) << 56) | ((uint64_t)level << 52) |
+           (va >> (12 + (3 - level) * 9));
+}
+
+static bool rdna4_tlb_get(RDNA4State *s, uint32_t table, uint64_t key, uint64_t *entry)
+{
+    if (s->tlb_off || s->tlb_verify || !s->tlb[table])
+        return false;
+    uint64_t *e = g_hash_table_lookup(s->tlb[table], &key);
+    if (!e)
+        return false;
+    if (s->tlb_evict_ppm) {
+        s->tlb_rng = s->tlb_rng * 6364136223846793005ull + 1442695040888963407ull;
+        if (((s->tlb_rng >> 33) % 1000000) < s->tlb_evict_ppm) {
+            g_hash_table_remove(s->tlb[table], &key);
+            return false;
+        }
+    }
+    *entry = *e;
+    s->tlb_hits++;
+    return true;
+}
+
+static void rdna4_tlb_put(RDNA4State *s, uint32_t table, uint64_t key, uint64_t entry)
+{
+    if (s->tlb_off || s->tlb_verify || !s->tlb[table])
+        return;
+    uint64_t *k = g_new(uint64_t, 1), *v = g_new(uint64_t, 1);
+    *k = key;
+    *v = entry;
+    g_hash_table_replace(s->tlb[table], k, v);
+    s->tlb_fills++;
+}
+
+/* One page-table entry of the walk at `level` (0 = root .. 3 = PTB), read through the caches. On a
+ * hit `table` (the live table address the walk computed) is not looked at: that is what makes a
+ * stale entry stale. Only VALID entries are cached. */
+static bool rdna4_vm_entry_tlb(RDNA4State *s, uint32_t vmid, uint64_t va, uint32_t level,
+                               uint64_t table, uint64_t *entry)
+{
+    const uint64_t key = rdna4_tlb_key(vmid, level, va);
+    const uint32_t shift = 12 + (3 - level) * 9;
+
+    if (level == 3) {
+        if (rdna4_tlb_get(s, RDNA4_TLB_L1, key, entry)) {
+            s->tlb_used = true;
+            return true;
+        }
+        if (rdna4_tlb_get(s, RDNA4_TLB_L2, key, entry)) {
+            rdna4_tlb_put(s, RDNA4_TLB_L1, key, *entry);
+            s->tlb_used = true;
+            return true;
+        }
+    } else if (rdna4_tlb_get(s, RDNA4_TLB_PDE(level), key, entry)) {
+        s->tlb_used = true;
+        return true;
+    }
+    if (!rdna4_vm_entry(s, table + (uint64_t)((va >> shift) & 0x1ff) * 8, entry))
+        return false;
+    if (*entry & RDNA4_VM_VALID) {
+        if (level == 3) {
+            rdna4_tlb_put(s, RDNA4_TLB_L1, key, *entry);
+            rdna4_tlb_put(s, RDNA4_TLB_L2, key, *entry);
+        } else {
+            rdna4_tlb_put(s, RDNA4_TLB_PDE(level), key, *entry);
+        }
+    }
+    return true;
+}
+
+static gboolean rdna4_tlb_match(gpointer key, gpointer value, gpointer user)
+{
+    return (GPOINTER_TO_UINT(user) >> ((*(uint64_t *)key >> 56) & 0xf)) & 1;
+}
+
+/* GCVM_INVALIDATE_ENGn_REQ (gfxhub_v12_0_get_invalidate_req): PER_VMID_INVALIDATE_REQ [15:0],
+ * INVALIDATE_L2_PTES [19], L2_PDE0 [20], L2_PDE1 [21], L2_PDE2 [22], L1_PTES [23]. PDE0 is the
+ * lowest directory (walk level 2), PDE2 the root's entries (walk level 0). FLUSH_TYPE is not
+ * modelled (legacy). */
+static void rdna4_tlb_invalidate(RDNA4State *s, uint32_t req)
+{
+    static const struct { uint32_t bit; uint32_t table; } levels[] = {
+        { 1u << 23, RDNA4_TLB_L1 },         { 1u << 19, RDNA4_TLB_L2 },
+        { 1u << 20, RDNA4_TLB_PDE(2) },     { 1u << 21, RDNA4_TLB_PDE(1) },
+        { 1u << 22, RDNA4_TLB_PDE(0) },
+    };
+    const uint32_t mask = req & 0xffff;
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(levels); i++)
+        if ((req & levels[i].bit) && s->tlb[levels[i].table])
+            g_hash_table_foreach_remove(s->tlb[levels[i].table], rdna4_tlb_match,
+                                        GUINT_TO_POINTER(mask));
+}
+
+static void rdna4_tlb_flush_all(RDNA4State *s)
+{
+    for (unsigned i = 0; i < G_N_ELEMENTS(s->tlb); i++)
+        if (s->tlb[i])
+            g_hash_table_remove_all(s->tlb[i]);
+}
+
+static void rdna4_tlb_stale(RDNA4State *s, uint32_t vmid, uint64_t va, const char *what)
+{
+    s->tlb_stale++;
+    if (s->tlb_stale <= 8 || !(s->tlb_stale & 0x3f))
+        fprintf(stderr, "rdna4: vm: STALE TRANSLATION used (%s): VMID %u VA 0x%" PRIx64
+                " resolves differently in the live tables (%" PRIu64 " so far): the tables or the "
+                "context changed and no invalidation of this VMID covered it\n",
+                what, vmid, va, s->tlb_stale);
+}
+
+/* E2: the 18 invalidation engines. A REQ write starts an invalidation; it takes effect and ACK
+ * shows for the requested VMIDs after inv_ack_reads reads of the engine's ACK register (0 = at
+ * once). inv-noack (the card's behaviour in the 2026-09-28 logs) never completes it. ACK bits of the
+ * requested VMIDs are cleared by the request. Until it completes the old translations stay valid. */
+#define RDNA4_INV_ENGINES 18
+#define REG_GCVM_INV_REQ(e) GC_SEG0(0x1647 + (e))
+#define REG_GCVM_INV_ACK(e) GC_SEG0(0x1659 + (e))
+
+static void rdna4_inv_complete(RDNA4State *s, unsigned eng)
+{
+    if (!s->inv[eng].req)
+        return;
+    rdna4_tlb_invalidate(s, s->inv[eng].req);
+    reg_set(s, REG_GCVM_INV_ACK(eng), reg_get(s, REG_GCVM_INV_ACK(eng)) | (s->inv[eng].req & 0xffff));
+    s->inv[eng].req = 0;
+}
+
+static void rdna4_inv_req(RDNA4State *s, unsigned eng, uint32_t val)
+{
+    reg_set(s, REG_GCVM_INV_REQ(eng), val);
+    reg_set(s, REG_GCVM_INV_ACK(eng), reg_get(s, REG_GCVM_INV_ACK(eng)) & ~(val & 0xffff));
+    if (s->inv_noack)
+        return;
+    s->inv[eng].req = val ? val : 0;
+    s->inv[eng].left = s->inv_ack_reads;
+    if (!s->inv[eng].left)
+        rdna4_inv_complete(s, eng);
+}
+
+/* A read of an ACK register counts towards the pending invalidation. */
+static void rdna4_inv_ack_read(RDNA4State *s, unsigned eng)
+{
+    if (s->inv[eng].req && s->inv[eng].left && --s->inv[eng].left == 0)
+        rdna4_inv_complete(s, eng);
+}
+
+/* Register writes that have side effects and can come from the CP as well as from MMIO
+ * (WRITE_DATA / COPY_DATA to a register in a PRIVILEGED stream): the invalidation engines and the
+ * IH LUT. Everything else is a plain register store. */
+static void rdna4_reg_store_hw(RDNA4State *s, uint32_t byte, uint32_t val)
+{
+    const uint32_t dw = byte / 4;
+
+    if (byte >= REG_GCVM_INV_REQ(0) && byte <= REG_GCVM_INV_REQ(RDNA4_INV_ENGINES - 1)) {
+        rdna4_inv_req(s, (byte - REG_GCVM_INV_REQ(0)) / 4, val);
+    } else if (dw >= OSSSYS_SEG0 && dw < OSSSYS_SEG0 + 0x300) {
+        rdna4_ih_reg_write(s, dw - OSSSYS_SEG0, val);
+    } else {
+        reg_set(s, byte, val);
+    }
+}
+
+static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va, int kind, uint32_t access)
+{
+    if (s->tlb_verify)
+        return;
     /* gc_12_0_0_sh_mask.h GCVM_L2_PROTECTION_FAULT_STATUS_LO32: MORE_FAULTS
      * [0], PERMISSION_FAULTS [7:4] (bit 4: the valid bit), VMID [23:20].
      * The first fault latches until an invalidation clears it; later ones
@@ -2146,6 +2388,16 @@ static void rdna4_vm_fault(RDNA4State *s, uint32_t vmid, uint64_t va, int kind)
         reg_set(s, REG_GCVM_FAULT_STATUS, (1u << 4) | ((vmid & 0xfu) << 20));
     reg_set(s, REG_GCVM_FAULT_ADDR_LO, (uint32_t)(va >> 12));
     reg_set(s, REG_GCVM_FAULT_ADDR_HI, (uint32_t)(va >> 44) & 0xfu);
+    /* W13 E5: the GC hub's VM-fault vector (client 10 = UTCL2, source 0; gmc_v12_0_process_interrupt):
+     * src_data[0] = VA >> 12, src_data[1] = VA bits 47:44 | access (amdgpu_gmc.h: EXECUTE 0x10,
+     * WRITE 0x20, READ 0x40), so a fetch shows 0x50 like the card's round-5 log. */
+    rdna4_ih_emit_iv(s, 0x0a, 0, 0, vmid, (uint32_t)(va >> 12), (uint32_t)((va >> 44) & 0xf) | access);
+}
+
+/* The access bits of a fault vector for a read/write/execute request. */
+static uint32_t rdna4_vm_access_bits(bool write, bool execute)
+{
+    return (execute ? 0x10u : 0) | (write ? 0x20u : 0x40u);
 }
 
 static bool rdna4_vm_entry(RDNA4State *s, uint64_t address, uint64_t *entry)
@@ -2157,8 +2409,8 @@ static bool rdna4_vm_entry(RDNA4State *s, uint64_t address, uint64_t *entry)
     return true;
 }
 
-static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
-                                   uint32_t vmid, bool write, bool execute)
+static uint8_t *rdna4_gc_span_vmid_walk(RDNA4State *s, uint64_t va, uint64_t len,
+                                        uint32_t vmid, bool write, bool execute)
 {
     if (!vmid)
         return rdna4_gc_span(s, va, len);
@@ -2178,9 +2430,7 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
            ((uint64_t)reg_get(s, REG_GCVM_CTX1_BASE_HI + n * 8) << 32);
     table = base & RDNA4_VM_PHYS_MASK;
     for (uint32_t level = 0; level < 4; level++) {
-        uint32_t shift = 12 + (3 - level) * 9;
-        uint32_t idx = (va >> shift) & 0x1ff;
-        if (!rdna4_vm_entry(s, table + (uint64_t)idx * 8, &entry) ||
+        if (!rdna4_vm_entry_tlb(s, vmid, va, level, table, &entry) ||
             !(entry & RDNA4_VM_VALID))
             goto fault;
         if (level < 3 && (entry & RDNA4_VM_PDE_PTE)) {
@@ -2220,7 +2470,10 @@ static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
         table = entry & RDNA4_VM_PHYS_MASK;
     }
 fault:
-    rdna4_vm_fault(s, vmid, va, fault_kind);
+    if (s->tlb_verify)
+        return NULL;
+    s->tlb_faulted = true;
+    rdna4_vm_fault(s, vmid, va, fault_kind, rdna4_vm_access_bits(write, execute));
     /* Retry is off: serve the configured dummy page so the queue can drain.
      * GCVM_L2_CNTL.ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY [11] (amdgpu sets it,
      * gfxhub_v12_0.c:248) makes it a system-memory page: modelled as one shared zeroed
@@ -2239,6 +2492,29 @@ fault:
     return NULL;
 }
 
+/* The span walker with the stale-translation check: when the walk used a cached entry, walk the
+ * live tables too (no caches, no faults) and compare. The cached answer is what the access uses. */
+static uint8_t *rdna4_gc_span_vmid(RDNA4State *s, uint64_t va, uint64_t len,
+                                   uint32_t vmid, bool write, bool execute)
+{
+    if (!vmid || s->tlb_verify)
+        return rdna4_gc_span_vmid_walk(s, va, len, vmid, write, execute);
+    s->tlb_used = false;
+    s->tlb_faulted = false;
+    uint8_t *p = rdna4_gc_span_vmid_walk(s, va, len, vmid, write, execute);
+    /* A faulting walk returns the fault-default (dummy) page, which a clean verification walk cannot reproduce: that is the fault, not a stale
+     * translation (Kiln's dry run, hub-task-333: every 'STALE' line was an access at exactly a VA the kext logged a fault for, reached through a
+     * cached upper-level PDE). Only a walk that completed is compared. */
+    if (p && s->tlb_used && !s->tlb_faulted) {
+        s->tlb_verify = true;
+        uint8_t *live = rdna4_gc_span_vmid_walk(s, va, len, vmid, write, execute);
+        s->tlb_verify = false;
+        if (live != p)
+            rdna4_tlb_stale(s, vmid, va, "span");
+    }
+    return p;
+}
+
 typedef struct RDNA4VmTarget {
     bool system;
     uint64_t address;
@@ -2247,9 +2523,9 @@ typedef struct RDNA4VmTarget {
 /* Resolve one page of a VMID mapping.  GPU-physical VRAM and PCI bus
  * addresses are deliberately kept distinct: an MC address in a page-table
  * entry cannot accidentally reach the VRAM array. */
-static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
-                            uint32_t vmid, bool write, bool execute,
-                            RDNA4VmTarget *target)
+static bool rdna4_vm_target_walk(RDNA4State *s, uint64_t va, uint64_t len,
+                                 uint32_t vmid, bool write, bool execute,
+                                 RDNA4VmTarget *target)
 {
     uint32_t n = vmid - 1;
     uint32_t cntl = reg_get(s, REG_GCVM_CTX1_CNTL + n * 4);
@@ -2269,9 +2545,7 @@ static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
            ((uint64_t)reg_get(s, REG_GCVM_CTX1_BASE_HI + n * 8) << 32);
     table = base & RDNA4_VM_PHYS_MASK;
     for (uint32_t level = 0; level < 4; level++) {
-        uint32_t shift = 12 + (3 - level) * 9;
-        uint32_t idx = (va >> shift) & 0x1ff;
-        if (!rdna4_vm_entry(s, table + (uint64_t)idx * 8, &entry) ||
+        if (!rdna4_vm_entry_tlb(s, vmid, va, level, table, &entry) ||
             !(entry & RDNA4_VM_VALID))
             goto fault;
         if (level < 3 && (entry & RDNA4_VM_PDE_PTE)) {
@@ -2308,8 +2582,29 @@ static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
         table = entry & RDNA4_VM_PHYS_MASK;
     }
 fault:
-    rdna4_vm_fault(s, vmid, va, fault_kind);
+    if (s->tlb_verify)
+        return false;
+    rdna4_vm_fault(s, vmid, va, fault_kind, rdna4_vm_access_bits(write, execute));
     return false;
+}
+
+static bool rdna4_vm_target(RDNA4State *s, uint64_t va, uint64_t len,
+                            uint32_t vmid, bool write, bool execute,
+                            RDNA4VmTarget *target)
+{
+    if (s->tlb_verify)
+        return rdna4_vm_target_walk(s, va, len, vmid, write, execute, target);
+    s->tlb_used = false;
+    const bool ok = rdna4_vm_target_walk(s, va, len, vmid, write, execute, target);
+    if (ok && s->tlb_used) {
+        RDNA4VmTarget live;
+        s->tlb_verify = true;
+        const bool lok = rdna4_vm_target_walk(s, va, len, vmid, write, execute, &live);
+        s->tlb_verify = false;
+        if (!lok || live.system != target->system || live.address != target->address)
+            rdna4_tlb_stale(s, vmid, va, "target");
+    }
+    return ok;
 }
 
 /* Shader global memory operations can target system PTEs.  Accesses are split
@@ -2344,13 +2639,13 @@ static bool rdna4_vm_access(RDNA4State *s, uint64_t va, uint8_t *data, uint64_t 
                     memcpy(data, dummy, chunk);
             } else if (target.system) {
                 if (!rdna4_bus_master_enabled(s)) {
-                    rdna4_vm_fault(s, vmid, va, false);
+                    rdna4_vm_fault(s, vmid, va, false, rdna4_vm_access_bits(write, execute));
                     return false;
                 }
                 MemTxResult result = write ? rdna4_dma_write(s, target.address, data, chunk)
                                            : rdna4_dma_read(s, target.address, data, chunk);
                 if (result != MEMTX_OK) {
-                    rdna4_vm_fault(s, vmid, va, false);
+                    rdna4_vm_fault(s, vmid, va, false, rdna4_vm_access_bits(write, execute));
                     return false;
                 }
             } else {
@@ -2498,6 +2793,8 @@ static void rdna4_sdma_wptr(RDNA4State *s, uint64_t wptr64)
 {
     uint32_t wptr = (uint32_t)wptr64;
 
+    if (!wptr64 && s->sdma_wptr)
+        fprintf(stderr, "rdna4: sdma: wptr restarted at 0 (was 0x%" PRIx64 "): the queue is being programmed\n", s->sdma_wptr);
     if (wptr64 && wptr64 < s->sdma_wptr) {
         fprintf(stderr, "rdna4: sdma: wptr went back from 0x%" PRIx64 " to 0x%" PRIx64
                 ": ignored, the engine waits\n", s->sdma_wptr, wptr64);
@@ -2526,7 +2823,9 @@ static bool rdna4_sdma_process_slice(RDNA4State *s, uint64_t deadline)
             s->sdma_work.size = 4u << ((cntl >> 1) & 0x1f);
             s->sdma_work.ring = ((uint64_t)reg_get(s, REG_SDMA0_RB_BASE) << 8) |
                                  ((uint64_t)reg_get(s, REG_SDMA0_RB_BASE_HI) << 40);
-            s->sdma_work.rptr = reg_get(s, REG_SDMA0_RB_RPTR);
+            /* The engine's pointers are 64-bit and monotonic; the ring position is the pointer modulo the ring size (a driver that resumes at the
+             * engine's own pointers after a wake without power loss programs RB_RPTR = RB_WPTR = 0x17604 etc.). */
+            s->sdma_work.rptr = reg_get(s, REG_SDMA0_RB_RPTR) & (s->sdma_work.size - 1);
             s->sdma_work.wptr = s->sdma_work.pending_wptr & (s->sdma_work.size - 1);
             s->sdma_work.packet_active = false;
             if (!s->gfx_booted || !(cntl & 1) || (reg_get(s, REG_SDMA0_MCU_CNTL) & 1))
@@ -2767,6 +3066,8 @@ static uint64_t rdna4_mmio_read(void *opaque, hwaddr addr, unsigned size)
             val = reg_get(s, addr);
         }
     } else {
+        if (addr >= REG_GCVM_INV_ACK(0) && addr <= REG_GCVM_INV_ACK(RDNA4_INV_ENGINES - 1))
+            rdna4_inv_ack_read(s, (addr - REG_GCVM_INV_ACK(0)) / 4);
         val = reg_get(s, addr);
     }
     if (s->trace && addr != REG_MM_DATA) {
@@ -2825,11 +3126,9 @@ static void rdna4_mmio_write(void *opaque, hwaddr addr, uint64_t data,
                         ((uint64_t)reg_get(s, REG_GFX_CP_RB0_WPTR_HI) << 32), false);
     } else if (addr == REG_SDMA0_RB_WPTR) {
         rdna4_sdma_wptr(s, val | ((uint64_t)reg_get(s, REG_SDMA0_RB_WPTR + 4) << 32));
-    } else if (addr == REG_GCVM_INV17_REQ) {
-        reg_set(s, addr, val);
-        if (!s->inv_noack) {
-            reg_set(s, REG_GCVM_INV17_ACK, val & 0xffff);   /* per-VMID ack */
-        }
+    } else if (addr >= REG_GCVM_INV_REQ(0) && addr <= REG_GCVM_INV_REQ(RDNA4_INV_ENGINES - 1)) {
+        /* W13 E2: all 18 engines (the kext's MMIO flush uses 17, amdgpu's gfx ring 0). */
+        rdna4_inv_req(s, (addr - REG_GCVM_INV_REQ(0)) / 4, val);
         /* The invalidation does not clear the fault status: amdgpu never
          * relies on CLEAR_PROTECTION_FAULT_STATUS_ADDR here (bit 24, left 0
          * by gfxhub_v12_0_get_invalidate_req); see REG_GCVM_FAULT_CNTL. */
@@ -3663,12 +3962,18 @@ static bool rdna4_dispatch_begin(RDNA4State *s, RDNA4Dispatch *d,
     d->lds.size = ((d->rsrc2 >> 15) & 0x1ff) * 512;
     d->groups_total = (uint64_t)dim_x * dim_y * dim_z;
 
-    if (!(initiator & 1) || !reg_get(s, REG_SH_MEM_CONFIG) ||
+    /* W13 E4: the dispatch runs in d->vmid and uses THAT VMID's SH_MEM_CONFIG, whatever queue it came
+     * from. A VMID whose SH_MEM_CONFIG was never programmed is refused as a zero config always was,
+     * and named, because with per-job VMIDs it is the typical bug (a VMID the kext never initialised). */
+    const uint32_t sh_mem_config = vmid ? s->sh_mem[vmid & 15][0] : reg_get(s, REG_SH_MEM_CONFIG);
+    if (vmid && !s->sh_mem_written[vmid & 15][0])
+        fprintf(stderr, "rdna4: cs: dispatch in VMID %u whose SH_MEM_CONFIG was never written\n", vmid);
+    if (!(initiator & 1) || !sh_mem_config ||
         !reg_get(s, REG_CS_THREAD_SE0) || !d->tx || !d->ty || !d->tz ||
         (uint64_t)d->items > 1024 || !dim_x || !dim_y || !dim_z) {
         fprintf(stderr, "rdna4: cs: dispatch %ux%ux%u refused (initiator 0x%x, SH_MEM_CONFIG "
                 "0x%x, CU mask SE0 0x%x, group %ux%ux%u)\n", dim_x, dim_y, dim_z,
-                initiator, reg_get(s, REG_SH_MEM_CONFIG), reg_get(s, REG_CS_THREAD_SE0),
+                initiator, sh_mem_config, reg_get(s, REG_CS_THREAD_SE0),
                 d->tx, d->ty, d->tz);
         d->groups_total = 0;
         return true;
@@ -3924,6 +4229,12 @@ static bool rdna4_select_mec_queue(RDNA4State *s, uint32_t db_dword)
         for (uint32_t pipe = 0; pipe < 4; pipe++) {
             for (uint32_t queue = 0; queue < 8; queue++) {
                 uint32_t doorbell = s->hqd[pipe][queue].q[off];
+                uint32_t act_off;
+                /* A doorbell goes to an ACTIVE HQD that owns the dword. A dequeued queue keeps its doorbell register, and the S1 probe queues and the
+                 * shared queues of rdna4-vmshared=1 use the same dwords (hub-task-347): routing to the first queue ever used with the dword sent the
+                 * shared queues' doorbells to a dead HQD ("ignored: HQD not active") and their jobs never ran. */
+                if (!rdna4_hqd_reg(REG_CP_HQD_ACTIVE, &act_off) || !(s->hqd[pipe][queue].q[act_off] & 1))
+                    continue;
                 if (s->hqd[pipe][queue].used && (doorbell & (1u << 30)) &&
                     ((doorbell >> 2) & 0x3ffffff) == db_dword) {
                     s->selected_pipe = pipe;
@@ -4207,6 +4518,11 @@ static bool rdna4_mec_process_slice(RDNA4State *s, uint64_t deadline)
                 s->mec_hung = true;
                 return false;
             }
+            /* W13 E6: ASSUMPTION U1 (docs/w13-vmid.md s.8), not a measurement. On a PRIV_STATE (kernel)
+             * queue the IB runs in the VMID of the IB packet, as amdgpu's kernel compute rings rely on
+             * (gfx_v12_0_ring_emit_ib_compute; their MQD has CP_HQD_VMID 0). Measured on this card for
+             * the GFX ring only (docs/hw-logs/2026-09-30-linux-gfx-ring). The rule below is that
+             * assumption written as code: a pass here is NOT evidence for it. */
             const uint32_t ib_vmid = s->mec_work.priv ? (control >> 24) & 0xf : s->mec_work.vmid;
             if (!ib_dwords || !rdna4_gc_span_vmid(s, (uint64_t)dw[1] | ((uint64_t)dw[2] << 32),
                                     (uint64_t)ib_dwords * 4,
@@ -5033,8 +5349,13 @@ static bool rdna4_gfx_check_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
         return rdna4_gfx_draw_refuse(s, "SPI_PS_INPUT_ADDR", "does not cover SPI_PS_INPUT_ENA");
     if (!(reg_get(s, REG_GFX_SPI_PS_IN_CONTROL) & (1u << 15)))
         return rdna4_gfx_draw_refuse(s, "SPI_PS_IN_CONTROL", "PS_W32_EN is off");
+    /* NO_PC_EXPORT = 0 (with NUM_INTERP > 0) is the attribute-ring path of the G4 colour triangle (rdna4-gfxcol=1, docs/g4-colour.md): the NGG stage
+     * stores the colour with buffer_store_b128 and the PS reads it with ds_param_load / v_interp, none of which this model has. It is refused HERE, before
+     * any shader runs, like the wave64 case: the ring is not stopped, the stream's own RELEASE_MEM still completes the fence, the target stays empty (0 px)
+     * and the kext reports "gfx-col FAIL" (never a false PASS). G4 is deliberately not modelled. */
     if (!(reg_get(s, REG_GFX_SPI_SHADER_GS_OUT_CONFIG_PS) & (1u << 10)))
-        return rdna4_gfx_draw_refuse(s, "SPI_SHADER_GS_OUT_CONFIG_PS", "NO_PC_EXPORT is off");
+        return rdna4_gfx_draw_refuse(s, "SPI_SHADER_GS_OUT_CONFIG_PS",
+                                     "NO_PC_EXPORT is off: the attribute-ring path (G4: buffer stores, ds_param_load, v_interp) is not modelled");
     ses = rdna4_gfx_discovery_num_se(s);
     if (!ses || ses > REG_GFX_GE_RING_MIN_SE)
         return rdna4_gfx_draw_refuse(s, "gc_info gc_num_se", "shader-engine count is not modelled");
@@ -5228,9 +5549,11 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
     ngg.s[3] = 0x10000103;             /* merged_wave_info: wave 0 of 1 */
     /* W46: gfx12 hands the NGG wave the primitive export value ALREADY PACKED in VGPR0 ("NGG passthrough mode: the HW already packs the
      * primitive export value to a single register", ac_nir_lower_intrinsics_to_args.c; the vertices are ubfe(v0, 9 * v, 8), ac_nir_lower_ngg.c):
-     * indices 0,1,2 at a 9-bit stride, no edge flags. The earlier model gave byte-packed indices (0x04020100) and converted them at the
-     * export; that conversion is not what the hardware does (the shader exports v0 unchanged). */
-    ngg.v[0][0] = 0x00080200;
+     * indices 0,1,2 at a 9-bit stride. The earlier model gave byte-packed indices (0x04020100) and converted them at the
+     * export; that conversion is not what the hardware does (the shader exports v0 unchanged). The value the card really hands lane 0 was
+     * measured by nggvgpr under Linux (docs/linux-replay.md): 0x040a0300 = the indices 0, 1, 2 plus the three edge-flag bits (8, 17, 26).
+     * The triangle assembly below reads only the 8-bit index fields and bit 31 (null primitive), so the edge bits change nothing here. */
+    ngg.v[0][0] = 0x040a0300;
     for (unsigned lane = 0; lane < count; lane++)
         ngg.v[3][lane] = lane;         /* auto-index VertexID */
     if (!rdna4_gfx_wave_run(s, &ngg, true,
@@ -5581,16 +5904,30 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
             addr = (uint64_t)lo | ((uint64_t)hi << 32);
             reg_dword = addr;
             if (operation == 1) {
-                if (function != 3 || mem_space != 0 ||
-                    lo != REG_GCVM_INV0_REQ / 4 ||
-                    hi != REG_GCVM_INV0_ACK / 4 ||
-                    ref != ((1u << st->vmid) | 0x00f80000u) ||
-                    mask != (1u << st->vmid)) {
+                /* Write-register-and-wait on a GC hub invalidation engine (gmc_v12_0_emit_flush_gpu_tlb:
+                 * REQ in `lo`, ACK in `hi`, the request in `ref`, the wait mask 1 << vmid). W13 E3: a
+                 * PRIVILEGED stream (the ring: amdgpu's vm flush) may flush any VMID on any engine, as
+                 * the captured sequence does for VMID 5 on engine 0; an unprivileged IB only its own
+                 * VMID (kept as before; that form inside a user IB is not from a measured stream). */
+                const uint32_t req0 = REG_GCVM_INV_REQ(0) / 4, ack0 = REG_GCVM_INV_ACK(0) / 4;
+                const bool engine_ok = lo >= req0 && lo < req0 + RDNA4_INV_ENGINES &&
+                                       hi == lo - req0 + ack0;
+                if (function != 3 || mem_space != 0 || !engine_ok || (mask & ~0xffffu) || !mask ||
+                    (ref & 0xffff) != mask) {
                     fprintf(stderr, "rdna4: gfx: WAIT_REG_MEM invalidate form refused, stopping\n");
                     return false;
                 }
-                reg_set(s, REG_GCVM_INV0_REQ, ref);
-                reg_set(s, REG_GCVM_INV0_ACK, mask);
+                if (!st->priv && (!st->vmid || mask != (1u << st->vmid))) {
+                    rdna4_gfx_fault(s, st->vmid, 184, "PRIV_REG", at);
+                    return false;
+                }
+                /* The CP waits for the ACK, so the invalidation has completed when it moves on. */
+                rdna4_inv_req(s, lo - req0, ref);
+                rdna4_inv_complete(s, lo - req0);
+                if ((reg_get(s, REG_GCVM_INV_ACK(lo - req0)) & mask) != mask) {
+                    fprintf(stderr, "rdna4: gfx: WAIT_REG_MEM invalidate: no ACK (inv-noack), stopping\n");
+                    return false;
+                }
                 break;
             }
             if (operation != 0 || (function != 3 && function != 4 && function != 5) ||
@@ -5667,7 +6004,7 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                     if (!rdna4_gfx_stream_dw(s, st, at + 4 + i, &value)) {
                         return false;
                     }
-                    reg_set(s, (uint32_t)(reg_dword + i) * 4, value);
+                    rdna4_reg_store_hw(s, (uint32_t)(reg_dword + i) * 4, value);
                 }
             } else {
                 fprintf(stderr, "rdna4: gfx: WRITE_DATA DST_SEL %u or register dword refused, stopping\n",
@@ -5715,7 +6052,7 @@ static bool rdna4_gfx_packets(RDNA4State *s, RDNA4GfxStream *st, bool allow_ib,
                 return false;
             }
             if (dst_sel == 0 && rdna4_gfx_reg_range_valid(dst_dword, 1)) {
-                reg_set(s, (uint32_t)dst_dword * 4, value);
+                rdna4_reg_store_hw(s, (uint32_t)dst_dword * 4, value);
             } else if (dst_sel == 5 && rdna4_gfx_mem_write(s, dst, &value, sizeof(value),
                                                             st->vmid)) {
                 /* completed */
@@ -6991,6 +7328,12 @@ static void rdna4_reset(DeviceState *dev)
     memset(s->resv, 0, RDNA4_RESV_SIZE);
     memset(s->hqd, 0, sizeof(s->hqd));
     s->selected_pipe = s->selected_queue = s->selected_vmid = 0;
+    /* W13: the hub's caches, invalidation engines, per-VMID SH_MEM and the IH LUT are power-on state. */
+    rdna4_tlb_flush_all(s);
+    memset(s->inv, 0, sizeof(s->inv));
+    memset(s->sh_mem, 0, sizeof(s->sh_mem));
+    memset(s->sh_mem_written, 0, sizeof(s->sh_mem_written));
+    memset(s->ih_vmid_lut, 0, sizeof(s->ih_vmid_lut));
     memset(&s->i2c, 0, sizeof(s->i2c));
     if (s->state_file) {
         Error *err = NULL;
@@ -7078,6 +7421,14 @@ static void rdna4_reset(DeviceState *dev)
     s->gfx_work_ring_dw = 0;
     s->gfx_num_instances = 0;
     s->gfx_draw_refused = false;
+    if (s->test_gfx_booted) {
+        /* Unit-test shortcut (tools/emu-qtest-vm.py drives the device over qtest with no guest): take the
+         * PSP AUTOLOAD_RLC + PMFW GFX_IMU route's end state, so the CP queues accept work. Not a model
+         * of anything: the kext's own bring-up still runs the real sequence. */
+        s->autoload_armed = true;
+        s->smu_running |= 1ull << SMU_FEATURE_GFX_IMU;
+        rdna4_gfx_autoload(s);
+    }
     memset(s->symclk_khz, 0, sizeof(s->symclk_khz));
     memset(s->dig_mode, 0, sizeof(s->dig_mode));
     /*
@@ -7182,6 +7533,10 @@ static void rdna4_realize(PCIDevice *dev, Error **errp)
         err = NULL;
     }
 
+    for (unsigned i = 0; i < G_N_ELEMENTS(s->tlb); i++)
+        s->tlb[i] = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+    s->tlb_rng = 0x9e3779b97f4a7c15ull;
+
     s->con = graphic_console_init(DEVICE(dev), 0, &rdna4_gfx_ops, s);
     memory_region_set_log(&s->vram, true, DIRTY_MEMORY_VGA);
 }
@@ -7219,6 +7574,11 @@ static void rdna4_exit(PCIDevice *dev)
     }
     graphic_console_close(s->con);
     msi_uninit(dev);
+    for (unsigned i = 0; i < G_N_ELEMENTS(s->tlb); i++) {
+        if (s->tlb[i])
+            g_hash_table_destroy(s->tlb[i]);
+        s->tlb[i] = NULL;
+    }
     g_free(s->regs);
     g_free(s->resv);
     g_free(s->discovery);
@@ -7253,6 +7613,10 @@ static const Property rdna4_properties[] = {
     DEFINE_PROP_BOOL("trace", RDNA4State, trace, false),
     DEFINE_PROP_BOOL("kiq-only", RDNA4State, kiq_only, false),
     DEFINE_PROP_BOOL("inv-noack", RDNA4State, inv_noack, false),
+    DEFINE_PROP_UINT32("inv-ack-reads", RDNA4State, inv_ack_reads, 0),
+    DEFINE_PROP_UINT32("tlb-evict-ppm", RDNA4State, tlb_evict_ppm, 0),
+    DEFINE_PROP_BOOL("tlb-off", RDNA4State, tlb_off, false),
+    DEFINE_PROP_BOOL("test-gfx-booted", RDNA4State, test_gfx_booted, false),
     DEFINE_PROP_BOOL("sdma-no-doorbell", RDNA4State, sdma_no_db, false),
     DEFINE_PROP_BOOL("dma-broken", RDNA4State, dma_broken, false),
     DEFINE_PROP_BOOL("flip-stuck", RDNA4State, flip_stuck, false),

@@ -53,13 +53,13 @@ uint32_t copyLinear(uint32_t *out, uint64_t src, uint64_t dst, uint32_t bytes) {
 	return kCopyDwords;
 }
 
-bool Ring::init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes) {
+bool Ring::init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes, uint64_t startWptr) {
 	if (!cpu || sizeBytes < 256 || (sizeBytes & (sizeBytes - 1)) || (mc & 0xff))
 		return false;
 	ring = cpu;
 	base = mc;
 	size = sizeBytes;
-	wp = 0;
+	wp = startWptr & ~3ull;
 	for (uint32_t i = 0; i < size / 4; i++)
 		ring[i] = 0;                     // NOPs
 	return true;

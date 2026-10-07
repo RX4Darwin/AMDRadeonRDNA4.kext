@@ -32,6 +32,9 @@
 #include "../src/gpuheap.hpp"
 #include "../src/flip.hpp"
 #include "../src/gpuvm.hpp"
+#include "../src/vmid.hpp"
+#include "../src/ptpages.hpp"
+#include "../src/gpuvmtable.hpp"
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
@@ -45,6 +48,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <map>
+#include <utility>
 
 // The Samsung LS27DG702 (Odyssey G70D) full 256-byte EDID (base + CTA-861
 // extension) captured from the live system's IODisplayEDID (2026-07-11) —
@@ -1642,6 +1647,18 @@ static int testSdmaPackets() {
 	failures += check(ok && r.wptr() == 20 * 5 * 4 && mem[((19 * 5 + 4) * 4 % 256) / 4] == 19,
 	                  "sdma: ring wrap (wptr %llu)", static_cast<unsigned long long>(r.wptr()));
 	failures += check(!r.init(mem, 0x8008800010ull, sizeof(mem)), "sdma: unaligned ring accepted");
+	// P7: a ring that RESUMES at the engine's own 64-bit pointers (a wake without power loss): the wptr continues monotonically from there and the packets
+	// land at the pointer modulo the ring size.
+	{
+		uint32_t rm[64];
+		Sdma::Ring rr;
+		const uint64_t start = 0x17604;            // the emulator's 11s run: 95748 bytes
+		ok = rr.init(rm, 0x8008800000ull, sizeof(rm), start) && rr.wptr() == start && rm[0] == 0;
+		ok = ok && rr.emit(p, Sdma::writeDword(p, a, 0x77)) && rr.wptr() == start + 5 * 4;
+		failures += check(ok && rm[(start & 255) / 4] == p[0] && rr.wptr() > start,
+		                  "sdma: ring resumed at the engine's pointers (wptr 0x%llx)", static_cast<unsigned long long>(rr.wptr()));
+		failures += check(rr.init(rm, 0x8008800000ull, sizeof(rm), 0x17607) && rr.wptr() == 0x17604, "sdma: a resume pointer is dword aligned");
+	}
 
 	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR encodings and ring wrap %s\n",
 	       failures ? "FAILED" : "ok");
@@ -2161,6 +2178,915 @@ static int testGpuVm() {
 	return failures;
 }
 
+// --- W13: the VMID pool (src/vmid.cpp) -----------------------------------------
+
+namespace {
+struct FakeFences {
+	uint32_t now[Vmid::kMaxDomains] {};
+};
+bool fakeReached(void *context, uint32_t domain, uint32_t seq) {
+	// Wrap-aware "now >= seq", as the kext's fenceReached does.
+	return static_cast<int32_t>(static_cast<FakeFences *>(context)->now[domain] - seq) >= 0;
+}
+} // namespace
+
+static int testVmidPool() {
+	using namespace Vmid;
+	int f = 0;
+	FakeFences fences;
+	Pool pool;
+	Grant g;
+
+	// Reuse: the same owner and page directory keep their VMID; no rebind, no flush.
+	pool.init(fakeReached, &fences);
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.rebind && g.flush && !g.stolen &&
+	           g.vmid >= kFirst && g.vmid <= kLast, "vmid: first grab binds a fresh VMID");
+	const uint32_t v1 = g.vmid;
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid == v1 && !g.rebind && !g.flush,
+	           "vmid: same owner and PD reuse the VMID with no rebind and no flush");
+
+	// A flush is owed only when the client removed PTEs (its tlbSeq moved) since the last flush.
+	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.vmid == v1 && !g.rebind && g.flush,
+	           "vmid: tlbSeq advanced -> flush, still no rebind");
+	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && !g.flush, "vmid: the flush is owed once");
+	// Negative control: a pool that ignored tlbSeq would fail the two checks above.
+
+	// A flush does not need an idle VMID (an invalidation only drops cached translations).
+	pool.noteSubmit(v1, 0, 10);
+	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && g.vmid == v1 && g.flush && !g.rebind,
+	           "vmid: a busy VMID may be flushed");
+	fences.now[0] = 10;
+
+	// A changed page directory is not compatible: the client gets a rebind and the idle old slot is released.
+	f += check(pool.grab(1, 0x2000, 0, g) == Result::Ok && g.rebind && g.flush, "vmid: new PD -> rebind");
+	uint32_t owned = 0;
+	for (uint32_t v = kFirst; v <= kLast; v++)
+		owned += pool.ownerOf(v) == 1;
+	f += check(owned == 1, "vmid: the stale slot of the same owner is released (owns %u)", owned);
+
+	// Fifteen owners get fifteen distinct VMIDs.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	bool seen[kSlots] {};
+	bool distinct = true;
+	for (uintptr_t o = 1; o <= 15; o++) {
+		if (pool.grab(o, o * 0x1000, 0, g) != Result::Ok || seen[g.vmid] || g.stolen)
+			distinct = false;
+		seen[g.vmid] = true;
+	}
+	f += check(distinct && !seen[0], "vmid: 15 owners, 15 distinct VMIDs, VMID 0 never granted");
+
+	// Steal: all idle, the 16th takes the LEAST recently used. Owner 1 is older than 2..15; touch 1
+	// again and owner 2 becomes the victim.
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t v2 = [&] { for (uint32_t v = kFirst; v <= kLast; v++) if (pool.ownerOf(v) == 2) return v; return 0u; }();
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.rebind && g.stolen && g.vmid == v2,
+	           "vmid: steal takes the least recently used idle VMID (got %u want %u)", g.vmid, v2);
+	f += check(pool.ownerOf(v2) == 16, "vmid: the thief owns the stolen VMID");
+	f += check(g.prevOwner == 2, "vmid: a steal reports the previous owner (a fault latched for it is attributed to it, not to the thief)");
+	f += check(pool.grab(2, 0x2000, 0, g) == Result::Ok && g.rebind && g.vmid != v2,
+	           "vmid: the victim comes back through a rebind on another VMID");
+
+	// Never steal a busy VMID; exhaustion returns the fence to wait on.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	for (uintptr_t o = 1; o <= 15; o++) {
+		pool.grab(o, o * 0x1000, 0, g);
+		pool.noteSubmit(g.vmid, 0, static_cast<uint32_t>(o));      // owner o: fence seq o on domain 0
+	}
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Busy && g.waitDomain == 0 && g.waitSeq == 1,
+	           "vmid: all busy -> Busy on the oldest job's fence (seq %u)", g.waitSeq);
+	bool untouched = true;
+	for (uintptr_t o = 1; o <= 15; o++) {
+		bool has = false;
+		for (uint32_t v = kFirst; v <= kLast; v++)
+			has |= pool.ownerOf(v) == o;
+		untouched &= has;
+	}
+	f += check(untouched, "vmid: a Busy grab takes nothing from anyone");
+
+	// Fairness: while that fence is pending a different newcomer waits too, but an owner that still
+	// has its VMID is served (the deliberate deviation from amdgpu).
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Busy && g.waitSeq == 1, "vmid: a second newcomer waits for the same fence");
+	f += check(pool.grab(5, 5 * 0x1000, 0, g) == Result::Ok && !g.rebind, "vmid: a bound owner is not starved by the wait");
+
+	// Fence 5 reached: owners 1..5 are idle; the thief takes the LRU among them (owner 1) and only them.
+	fences.now[0] = 5;
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.stolen, "vmid: fence reached -> the waiter gets a VMID");
+	f += check(pool.ownerOf(g.vmid) == 16, "vmid: the waiter owns it");
+	bool busyKept = true;
+	for (uintptr_t o = 6; o <= 15; o++) {
+		bool has = false;
+		for (uint32_t v = kFirst; v <= kLast; v++)
+			has |= pool.ownerOf(v) == o;
+		busyKept &= has;
+	}
+	f += check(busyKept, "vmid: owners with jobs in flight (seq 6..15) keep their VMIDs");
+	f += check(pool.ownerOf(g.vmid) == 16 && pool.grab(1, 0x1000, 0, g) == Result::Ok, "vmid: the victim is idle owner 1 (it rebinds)");
+
+	// Fairness across domains: the waiter is on domain 0; a VMID that frees up on domain 1 meanwhile
+	// must NOT go to a newcomer who arrived later (amdgpu's vmid_wait).
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	for (uintptr_t o = 1; o <= 14; o++) {
+		pool.grab(o, o * 0x1000, 0, g);
+		pool.noteSubmit(g.vmid, 0, static_cast<uint32_t>(o));
+	}
+	pool.grab(15, 15 * 0x1000, 0, g);
+	const uint32_t v15 = g.vmid;
+	pool.noteSubmit(v15, 1, 1);
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Busy && g.waitDomain == 0, "vmid: waiter parks on domain 0");
+	fences.now[1] = 1;                       // owner 15's job finished: a VMID is idle now
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Busy && g.waitDomain == 0,
+	           "vmid: an idle VMID is not handed to a newcomer while an earlier waiter is pending");
+	fences.now[0] = 1;                       // the waiter's fence
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok, "vmid: the waiter is served once its fence is reached");
+
+	// Several fence domains and sequence wrap.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t vm = g.vmid;
+	pool.noteSubmit(vm, 0, 0xfffffffeu);
+	pool.noteSubmit(vm, 1, 7);
+	fences.now[0] = 1;                       // wrapped past 0xfffffffe
+	f += check(!pool.idle(vm), "vmid: busy while domain 1 has not reached its seq");
+	fences.now[1] = 7;
+	f += check(pool.idle(vm), "vmid: idle once every domain reached its seq, wrap included");
+
+	// The gfx ring is a fence domain too (W12k client IBs, S8 mode 2): a VMID with a gfx IB in flight is never rebound to another
+	// client until the ring's fence reaches that IB's seq (wrap-aware), whatever the compute domains say.
+	uint32_t released = 0;
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	for (uintptr_t o = 1; o <= 15; o++)
+		pool.grab(o, o * 0x1000, 0, g);
+	pool.grab(15, 15 * 0x1000, 0, g);
+	const uint32_t vgfx = g.vmid;
+	fences.now[kDomainGfx] = 0xfffffff0u;                        // the gfx ring is 14 short of the IB's seq, which is close to the wrap
+	pool.noteSubmit(vgfx, kDomainGfx, 0xfffffffeu);              // owner 15's gfx IB: seq 0xfffffffe on the gfx domain
+	f += check(!pool.idle(vgfx), "vmid gfx: busy while the gfx fence has not reached the IB's seq");
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.stolen && g.vmid != vgfx && pool.ownerOf(vgfx) == 15,
+	           "vmid gfx: a newcomer takes an idle VMID, never the one with a gfx IB in flight");
+	const uint32_t vnew = g.vmid;
+	// Everything else busy on compute domain 0, only the gfx one on domain 2: nothing is available and the pool names the right fence.
+	for (uint32_t v = kFirst; v <= kLast; v++)
+		if (v != vgfx)
+			pool.noteSubmit(v, 0, 50 + v);
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Busy, "vmid gfx: every VMID busy (14 on compute, 1 on gfx) -> Busy");
+	fences.now[0] = 100;                                         // all compute work done; the gfx IB is still in flight
+	// The newcomer's wait is pinned to the oldest job in the pool (amdgpu's vmid_wait): that is the gfx IB, so it is still Busy, on the
+	// GFX fence, although fourteen VMIDs are idle by now.
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Busy && g.waitDomain == kDomainGfx && g.waitSeq == 0xfffffffeu && pool.ownerOf(vgfx) == 15,
+	           "vmid gfx: compute fences passing does not free a VMID that is busy on the gfx domain; the wait names the gfx fence");
+	f += check(!pool.forget(15, false, released) && pool.ownerOf(vgfx) == 15,
+	           "vmid gfx: the owner's close is refused while its gfx IB is in flight (the kext drains first)");
+	fences.now[kDomainGfx] = 0xfffffffdu;                        // one short of the seq
+	f += check(!pool.idle(vgfx) && pool.grab(17, 0x17000, 0, g) == Result::Busy, "vmid gfx: one short of the seq is still busy");
+	fences.now[kDomainGfx] = 1;                                  // wrapped past 0xfffffffe
+	f += check(pool.idle(vgfx), "vmid gfx: idle once the gfx fence wrapped past the seq");
+	f += check(pool.forget(15, false, released) && released == vgfx, "vmid gfx: the close is accepted once the IB is done");
+	f += check(pool.grab(17, 0x17000, 0, g) == Result::Ok && g.rebind, "vmid gfx: the waiter is served once the gfx fence is reached");
+	(void)vnew;
+	// The gfx and a compute domain on the same VMID: both must pass.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t vb = g.vmid;
+	pool.noteSubmit(vb, 0, 5);
+	pool.noteSubmit(vb, kDomainGfx, 9);
+	fences.now[0] = 5;
+	f += check(!pool.idle(vb), "vmid gfx: compute done, gfx still pending -> busy");
+	fences.now[kDomainGfx] = 9;
+	f += check(pool.idle(vb), "vmid gfx: both domains done -> idle");
+
+	// "Grab, then read the VMID": a client's remembered VMID goes stale when the pool moves it; the VMID a job must run in is the
+	// one the grab returned (the kext's rtSubmitIb read the remembered one before the grab: tools/check-vmid-order.sh keeps that out).
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t remembered = g.vmid;                          // what the client's c.vmid holds
+	for (uintptr_t o = 2; o <= 15; o++)
+		pool.grab(o, o * 0x1000, 0, g);
+	pool.grab(16, 0x16000, 0, g);                                // steals the LRU idle VMID: owner 1's
+	f += check(pool.ownerOf(remembered) == 16, "vmid order: the least recently used owner lost its VMID to the newcomer");
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid != remembered && g.rebind,
+	           "vmid order: owner 1's next grab returns another VMID than the one it remembers (use the grab's result, not c.vmid)");
+
+	// Exhaustion by pinning (static VMIDs, step S7).
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	bool pinsOk = true;
+	for (uintptr_t o = 1; o <= 15; o++)
+		pinsOk &= pool.pin(o, o * 0x1000, 0, g) == Result::Ok && pool.pinned(g.vmid);
+	f += check(pinsOk, "vmid: 15 pins succeed");
+	f += check(pool.pin(16, 0x16000, 0, g) == Result::Exhausted, "vmid: the 16th pin is Exhausted");
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Exhausted, "vmid: nothing can be stolen from pinned VMIDs");
+	f += check(pool.grab(3, 3 * 0x1000, 0, g) == Result::Ok && !g.rebind, "vmid: a pinned owner still reuses its VMID");
+	released = 0;
+	f += check(pool.forget(3, false, released) && released != 0 && pool.ownerOf(released) == 0,
+	           "vmid: forget releases a pinned VMID and reports it");
+	f += check(pool.grab(16, 0x16000, 0, g) == Result::Ok && g.vmid == released, "vmid: the released VMID is granted again");
+
+	// forget: refused while work is in flight, forced after a recovery.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	pool.grab(1, 0x1000, 0, g);
+	pool.noteSubmit(g.vmid, 0, 5);
+	f += check(!pool.forget(1, false, released) && pool.ownerOf(g.vmid) == 1, "vmid: forget is refused with a job in flight");
+	f += check(pool.forget(1, true, released) && released == g.vmid && pool.ownerOf(g.vmid) == 0 && pool.idle(g.vmid),
+	           "vmid: a forced forget releases it and clears the pending work");
+
+	// Reserved VMIDs are never granted.
+	pool.init(fakeReached, &fences, 1u << 8);
+	fences = FakeFences {};
+	bool reservedHit = false;
+	for (uintptr_t o = 1; o <= 14; o++)
+		reservedHit |= pool.grab(o, o * 0x1000, 0, g) != Result::Ok || g.vmid == 8;
+	f += check(!reservedHit, "vmid: 14 grants with VMID 8 reserved never return it");
+	f += check(pool.grab(15, 0x15000, 0, g) == Result::Ok && g.stolen && g.vmid != 8,
+	           "vmid: the 15th owner steals an idle VMID; the reserved one stays out");
+
+	// unbindAll (wake / GPU reset): nothing is bound any more, pins included.
+	pool.unbindAll();
+	bool none = true;
+	for (uint32_t v = kFirst; v <= kLast; v++)
+		none &= pool.ownerOf(v) == 0 && !pool.pinned(v);
+	f += check(none && pool.grab(1, 0x1000, 0, g) == Result::Ok && g.rebind, "vmid: after unbindAll the next grab rebinds");
+
+	f += check(pool.grab(0, 0x1000, 0, g) == Result::Exhausted, "vmid: owner 0 is invalid");
+	return f;
+}
+
+// --- W13 S6: demand-allocated page tables (src/ptpages.cpp) ---------------------------------
+
+namespace {
+struct FakeChunks {
+	uint64_t next { 0x1000000 };
+	uint32_t live { 0 }, allocs { 0 }, frees { 0 };
+	uint32_t failAfter { 0xffffffffu };     // refuse the allocation after this many
+	uint64_t freed[256];
+};
+bool fakeAllocChunk(void *ctx, uint64_t &off) {
+	auto *f = static_cast<FakeChunks *>(ctx);
+	if (f->allocs >= f->failAfter)
+		return false;
+	off = f->next;
+	f->next += 0x10000;
+	f->allocs++;
+	f->live++;
+	return true;
+}
+void fakeFreeChunk(void *ctx, uint64_t off) {
+	auto *f = static_cast<FakeChunks *>(ctx);
+	if (f->frees < 256)
+		f->freed[f->frees] = off;
+	f->frees++;
+	f->live--;
+}
+} // namespace
+
+static int testPtPages() {
+	int f = 0;
+	FakeChunks chunks;
+	PtPages::Backend be { fakeAllocChunk, fakeFreeChunk, &chunks };
+	static PtPages::Table t;
+	t.init(PtPages::kMaxPages);
+	uint64_t off = 0;
+
+	// A client's first pages (root, PDB1, PDB0, one PT) live in ONE 64 KiB chunk, 4 KiB apart.
+	bool ok = true;
+	uint64_t first = 0;
+	for (uint32_t i = 0; i < 4; i++) {
+		ok &= t.page(i, be, off);
+		if (i == 0)
+			first = off;
+		ok &= off == first + 0x1000ull * i;
+	}
+	f += check(ok && t.pages() == 4 && t.chunksHeld() == 1 && chunks.allocs == 1, "ptpages: four pages share one chunk, packed 4 KiB apart");
+	f += check(t.page(2, be, off) && off == first + 0x2000 && t.pages() == 4, "ptpages: asking again returns the same page and allocates nothing");
+	f += check(t.offsetOf(3) == first + 0x3000 && t.offsetOf(9) == 0 && !t.has(9), "ptpages: offsetOf / has for backed and unbacked pages");
+
+	// Sparse: a far PT page costs one page, not the distance.
+	ok = t.page(900, be, off) && off == first + 0x4000 && t.pages() == 5 && t.chunksHeld() == 1;
+	f += check(ok, "ptpages: a far-away logical page takes the next free slot of the chunk (no 4 MiB image)");
+
+	// The 17th page opens a second chunk.
+	for (uint32_t i = 10; i < 21; i++)
+		t.page(i, be, off);
+	f += check(t.pages() == 16 && t.chunksHeld() == 1, "ptpages: 16 pages fill the first chunk exactly");
+	f += check(t.page(21, be, off) && t.chunksHeld() == 2 && chunks.allocs == 2, "ptpages: the 17th page opens a second chunk");
+
+	// Dropping: a slot is reused; an emptied chunk goes back to the allocator.
+	t.drop(21, be);
+	f += check(t.chunksHeld() == 1 && chunks.frees == 1, "ptpages: dropping the only page of a chunk frees that chunk");
+	t.drop(3, be);
+	f += check(t.page(700, be, off) && off == first + 0x3000, "ptpages: a dropped slot is reused first");
+
+	// Quota and allocator failure leave no half-made page.
+	PtPages::Table q;
+	FakeChunks c2;
+	PtPages::Backend b2 { fakeAllocChunk, fakeFreeChunk, &c2 };
+	q.init(3);
+	bool three = q.page(0, b2, off) && q.page(1, b2, off) && q.page(2, b2, off);
+	f += check(three && !q.page(3, b2, off) && q.pages() == 3 && !q.has(3), "ptpages: the quota refuses the 4th page and leaves no trace");
+	PtPages::Table r;
+	FakeChunks c3;
+	c3.failAfter = 1;
+	PtPages::Backend b3 { fakeAllocChunk, fakeFreeChunk, &c3 };
+	r.init(PtPages::kMaxPages);
+	bool filled = true;
+	for (uint32_t i = 0; i < 16; i++)
+		filled &= r.page(i, b3, off);
+	f += check(filled && !r.page(16, b3, off) && r.pages() == 16 && !r.has(16) && r.chunksHeld() == 1,
+	           "ptpages: an allocator that refuses the second chunk fails the page cleanly");
+
+	// Release gives every chunk back exactly once.
+	t.release(be);
+	f += check(t.pages() == 0 && t.chunksHeld() == 0 && chunks.live == 0, "ptpages: release returns every chunk (none left live)");
+	bool unique = true;
+	for (uint32_t i = 0; i < chunks.frees && i < 256; i++)
+		for (uint32_t j = i + 1; j < chunks.frees && j < 256; j++)
+			unique &= chunks.freed[i] != chunks.freed[j];
+	f += check(unique, "ptpages: no chunk was freed twice");
+
+	// Worst case: a client holding its whole quota, kMaxPages pages = kMaxPages / 16 chunks.
+	PtPages::Table w;
+	FakeChunks c4;
+	PtPages::Backend b4 { fakeAllocChunk, fakeFreeChunk, &c4 };
+	w.init(PtPages::kMaxPages);
+	bool all = true;
+	for (uint32_t i = 0; i < PtPages::kMaxPages; i++)
+		all &= w.page(i, b4, off);
+	f += check(all && w.pages() == PtPages::kMaxPages && w.chunksHeld() == PtPages::kMaxPages / PtPages::kChunkPages,
+	           "ptpages: a client holding its whole quota takes kMaxPages / 16 chunks");
+	w.release(b4);
+	f += check(c4.live == 0, "ptpages: and gives them all back");
+
+	// Pool-slot layout: the old layout (26 MiB, 64 KiB stride) runs into the gfx region at 30 MiB with slot 64.
+	uint32_t area = 0;
+	const uint32_t base = 26u << 20, gfx = 30u << 20;
+	f += check(PtPages::areaFor(base, 0x10000, 0, gfx, area) && area == base, "layout: slot 0 at the base");
+	f += check(PtPages::areaFor(base, 0x10000, 63, gfx, area) && area + 0x10000 == gfx, "layout: slot 63 ends exactly at the gfx region");
+	f += check(!PtPages::areaFor(base, 0x10000, 64, gfx, area), "layout: slot 64 (which the old code would have placed on the gfx ring) is refused");
+	f += check(PtPages::areaFor(27u << 20, 0x3000, 255, gfx, area) && !PtPages::areaFor(27u << 20, 0x3000, 256, gfx, area),
+	           "layout: the compact 12 KiB client area fits 256 clients below the gfx region, 257 is refused");
+	f += check(PtPages::areaFor(0, 10, 1, 20, area) && !PtPages::areaFor(0, 10, 1, 19, area), "layout: an area that overruns the limit by one byte is refused");
+	f += check(!PtPages::areaFor(base, 0, 0, gfx, area) && !PtPages::areaFor(0xfffff000u, 0x10000, 1, 0xffffffffu, area),
+	           "layout: a zero stride and a 32-bit overflow are refused");
+	return f;
+}
+
+// --- hub-task-340: differential test of the page-table writing ---------------------------------------------------------------
+// The pre-S8 code (tools/legacy-vmtable-ref.inc, verbatim from commit 0cfa416) against src/gpuvmtable.cpp, which the kext now runs for vmMap, vmMapHost
+// and vmUnmap, on the contiguous 4 MiB image of modes 0 and 1: return values, the PT pages handed to vmTableSync, and the whole image byte for byte
+// (PDEs, PTE flags: IS_PTE bit 63, EXECUTABLE, SNOOPED/SYSTEM, FRAG, the W22 set/clear masks). A third image is built with the sparse accessor of
+// rdna4-vmshared=2 and compared logically (every PTE equal, PDE validity equal).
+
+#include "legacy-vmtable-ref.inc"
+
+namespace {
+
+constexpr uint64_t kTableBytes = 4u << 20;
+constexpr uint64_t kRootPhys = 0x10000000ull;
+constexpr uint64_t kFbMcBase = 0x8000000000ull;
+
+struct PolicySet { bool isPteOff, execOff; uint64_t pteSet, pteClear; const char *name; };
+const PolicySet kPolicies[] = {
+	{ false, false, 0, 0, "default" },
+	{ false, true, 0, 0, "rdna4-vm-exec=0" },
+	{ true, false, 0, 0, "rdna4-vm-ispte=0" },
+	{ false, false, 1ull << 54, GpuVm::kExecutable, "set MTYPE bit, clear EXECUTABLE" },
+	{ true, true, GpuVm::kSnooped, 0, "ispte=0, exec=0, SNOOPED set" },
+};
+
+// The new code behind an accessor, with the kernel wrappers' (runtime.cpp vmMap/vmMapHost/vmUnmap) argument checks and sync order mirrored.
+struct NewImage {
+	std::vector<uint64_t> words;              // contiguous image (legacy accessor)
+	uint64_t rootPhys { kRootPhys };
+	GpuVmTable::Policy pol {};
+	uint64_t fbMcBase { kFbMcBase };
+	uint32_t fbOffset { 0 };
+	std::vector<std::pair<uint32_t, uint32_t>> syncs;
+	bool failSync { false };
+	bool sync(uint32_t offset, uint32_t bytes) { syncs.push_back({ offset, bytes }); return !failSync; }
+};
+
+uint64_t *newEntry(void *ctx, uint64_t off) {
+	auto *n = static_cast<NewImage *>(ctx);
+	return off < kTableBytes ? GpuVmTable::legacyEntry(n->words.data(), off) : nullptr;
+}
+
+bool newPhys(void *ctx, uint64_t off, uint64_t &phys) {
+	phys = GpuVmTable::legacyPhys(static_cast<NewImage *>(ctx)->rootPhys, off);
+	return true;
+}
+
+bool newVmMap(NewImage &n, uint64_t va, uint64_t mc, uint64_t bytes, bool executable) {
+	if (!bytes || (va & (GpuVm::kPageBytes - 1)) || (mc & (GpuVm::kPageBytes - 1)))
+		return false;
+	uint64_t physical = 0;
+	if (!GpuVm::mcToPhysical(mc, n.fbMcBase, n.fbOffset, physical))
+		return false;
+	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
+	if (end < va || end > GpuVm::kVaEnd)
+		return false;
+	const GpuVmTable::Access access { newEntry, newPhys, &n };
+	GpuVmTable::Span span;
+	if (!GpuVmTable::mapVram(access, n.pol, kTableBytes, va, end, physical, executable, span))
+		return false;
+	if (span.firstPt == ~0ull || !n.sync(0, 0x3000))
+		return false;
+	for (uint64_t pt = span.firstPt; pt <= span.lastPt; pt += 0x1000)
+		if (!n.sync(static_cast<uint32_t>(pt), 0x1000))
+			return false;
+	return true;
+}
+
+bool newVmMapHost(NewImage &n, uint64_t va, const uint64_t *pageBuses, uint64_t bytes, bool executable) {
+	if (!pageBuses || !bytes || (va & (GpuVm::kPageBytes - 1)))
+		return false;
+	const uint64_t mapped = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	const uint64_t end = va + mapped;
+	if (mapped < bytes || end < va || end > GpuVm::kVaEnd)
+		return false;
+	const GpuVmTable::Access access { newEntry, newPhys, &n };
+	GpuVmTable::Span span;
+	if (!GpuVmTable::mapHost(access, n.pol, kTableBytes, va, end, pageBuses, executable, span))
+		return false;
+	if (span.firstPt == ~0ull || !n.sync(0, 0x3000))
+		return false;
+	for (uint64_t pt = span.firstPt; pt <= span.lastPt; pt += 0x1000)
+		if (!n.sync(static_cast<uint32_t>(pt), 0x1000))
+			return false;
+	return true;
+}
+
+void newVmUnmap(NewImage &n, uint64_t va, uint64_t bytes) {
+	if (!bytes || va & (GpuVm::kPageBytes - 1))
+		return;
+	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
+	const GpuVmTable::Access access { newEntry, newPhys, &n };
+	GpuVmTable::Span span;
+	GpuVmTable::unmap(access, kTableBytes, va, end, span);
+	for (uint64_t pt = span.firstPt; pt != ~0ull && pt <= span.lastPt; pt += 0x1000)
+		n.sync(static_cast<uint32_t>(pt), 0x1000);
+}
+
+// rtOpen's initial image: root -> PDB1 -> PDB0.
+void initLegacy(std::vector<uint64_t> &w, uint64_t rootPhys) {
+	std::fill(w.begin(), w.end(), 0);
+	w[0] = GpuVm::encodePde(rootPhys + 0x1000, GpuVm::kValid, 2);
+	w[0x1000 / 8 + GpuVm::index(GpuVm::kVaStart, 1)] = GpuVm::encodePde(rootPhys + 0x2000, GpuVm::kValid, 1);
+}
+
+struct Pair {
+	LegacyRef ref;
+	NewImage nw;
+	std::vector<uint64_t> refWords;
+	int failures { 0 };
+	const char *policy { "" };
+	uint32_t ops { 0 }, okMaps { 0 }, failedMaps { 0 }, okHost { 0 }, failedHost { 0 }, unmaps { 0 };
+
+	void setup(const PolicySet &p, uint32_t fbOffset) {
+		refWords.assign(kTableBytes / 8, 0);
+		ref.shadow = refWords.data();
+		ref.rootPhys = kRootPhys;
+		ref.tableBytes = kTableBytes;
+		ref.pol = { p.isPteOff, p.execOff, p.pteSet, p.pteClear };
+		ref.fbMcBase = kFbMcBase;
+		ref.fbOffset = fbOffset;
+		nw.pol = GpuVmTable::Policy { p.isPteOff, p.execOff, p.pteSet, p.pteClear };
+		nw.fbMcBase = kFbMcBase;
+		nw.fbOffset = fbOffset;
+		nw.words.assign(kTableBytes / 8, 0);
+		policy = p.name;
+		reopen();
+	}
+	void reopen() {
+		initLegacy(refWords, kRootPhys);
+		nw.words = refWords;
+		ref.syncs.clear();
+		nw.syncs.clear();
+	}
+	void setFailSync(bool f) { ref.failSync = nw.failSync = f; }
+
+	// After one operation: same result, same syncs, same bytes.
+	void compare(const char *what, bool rr, bool rn) {
+		ops++;
+		auto fail = [&](const char *why) {
+			if (failures < 5)
+				fprintf(stderr, "FAIL: vmtable diff [%s] op %u %s: %s\n", policy, ops, what, why);
+			failures++;
+		};
+		if (rr != rn)
+			fail("return value differs from the pre-S8 code");
+		if (ref.syncs != nw.syncs)
+			fail("the PT pages handed to vmTableSync differ");
+		if (memcmp(refWords.data(), nw.words.data(), kTableBytes) != 0) {
+			uint64_t i = 0;
+			while (refWords[i] == nw.words[i])
+				i++;
+			char buf[160];
+			snprintf(buf, sizeof(buf), "image differs at byte 0x%llx: old 0x%016llx new 0x%016llx", (unsigned long long)(i * 8),
+			         (unsigned long long)refWords[i], (unsigned long long)nw.words[i]);
+			fail(buf);
+		}
+		ref.syncs.clear();
+		nw.syncs.clear();
+	}
+
+	void map(uint64_t va, uint64_t mc, uint64_t bytes, bool exec) {
+		const bool a = legacyVmMap(ref, va, mc, bytes, exec), b = newVmMap(nw, va, mc, bytes, exec);
+		(a ? okMaps : failedMaps)++;
+		compare("map", a, b);
+	}
+	void mapHost(uint64_t va, const std::vector<uint64_t> &buses, uint64_t bytes, bool exec) {
+		const bool a = legacyVmMapHost(ref, va, buses.data(), bytes, exec), b = newVmMapHost(nw, va, buses.data(), bytes, exec);
+		(a ? okHost : failedHost)++;
+		compare("mapHost", a, b);
+	}
+	void unmap(uint64_t va, uint64_t bytes) {
+		legacyVmUnmap(ref, va, bytes);
+		newVmUnmap(nw, va, bytes);
+		unmaps++;
+		compare("unmap", true, true);
+	}
+};
+
+struct Rng {
+	uint64_t s;
+	uint64_t next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; }
+	uint64_t below(uint64_t n) { return next() % n; }
+};
+
+} // namespace
+
+static int testVmTableDifferential() {
+	int failures = 0;
+	uint32_t totOps = 0, totOk = 0, totBad = 0, totHostOk = 0, totHostBad = 0, totUnmap = 0;
+	const uint64_t V = GpuVm::kVaStart;
+	const uint64_t MC = kFbMcBase;
+	for (const PolicySet &pol : kPolicies) {
+		for (uint32_t fbOffset : { 0u, 0x10u }) {
+			static Pair pair;
+			pair = Pair {};
+			pair.setup(pol, fbOffset);
+			Pair &P = pair;
+
+			// 1. The boot self-test / rtOpen layout: ring (executable), EOP, rptr, wptr, fence, kernarg, then user buffers.
+			P.map(V + 0x0000, MC + 0x1a000000, 0x1000, true);
+			for (uint32_t i = 1; i < 6; i++)
+				P.map(V + 0x1000ull * i, MC + 0x1a000000 + 0x1000ull * i, 0x1000, false);
+			// a program image (12 KiB, executable), a 256 KiB device buffer on a 64 KiB boundary (FRAG=4), one that is not aligned to it
+			P.map(V + 0x10000, MC + 0x20000000, 0x3000, true);
+			P.map(V + 0x40000, MC + 0x30000000, 0x40000, false);
+			P.map(V + 0x80000 + 0x1000, MC + 0x31000000 + 0x1000, 0x40000, false);
+			// 2. host buffers: 64 KiB of 16 bus pages mapped, unmapped, then mapped again elsewhere (rdna4-run's host vadd and freed-VA sequence)
+			std::vector<uint64_t> buses(16);
+			for (uint32_t i = 0; i < 16; i++)
+				buses[i] = 0x104048000ull + 0x3000ull * i;
+			P.mapHost(V + 0xb0000, buses, 0x10000, false);
+			P.unmap(V + 0xb0000, 0x10000);                       // the freed buffer; the next dispatch through it must fault
+			P.mapHost(V + 0xd0000, buses, 0x10000, true);
+			P.unmap(V + 0x10000, 0x3000);                        // the program is unloaded
+			P.map(V + 0x10000, MC + 0x21000000, 0x3000, true);   // and its VA reused
+			// 3. across a 2 MiB boundary (two PT pages) and a large device buffer
+			P.map(V + 0x1ff000, MC + 0x40000000, 0x3000, false);
+			P.map(V + 0x400000, MC + 0x50000000, 0x600000, false);
+			// 3b. the legacy layout's first-writer-wins quirk: PT pages 88 and 88 + 512 (1.2 GiB up) share PDB0[88]; whichever is mapped first owns the PDE
+			P.map(V + 600ull * 0x200000, MC + 0x60000000, 0x1000, false);
+			P.map(V + 88ull * 0x200000, MC + 0x61000000, 0x1000, false);
+			// 4. client close and reopen on the same tables
+			P.reopen();
+			P.map(V + 0x0000, MC + 0x1a000000, 0x1000, true);
+			P.map(V + 0x7000, MC + 0x1a007000, 0x2000, false);
+			P.unmap(V + 0x7000, 0x2000);
+			// 5. argument failures, and a vmTableSync failure
+			P.map(V + 0x1001, MC, 0x1000, false);                // unaligned va
+			P.map(V, MC + 0x1001, 0x1000, false);                // unaligned mc
+			P.map(V, MC - 0x1000, 0x1000, false);                // mc below the FB base
+			P.map(V, MC, 0, false);                              // zero bytes
+			P.map(V - 0x1000, MC, 0x2000, false);                // starts below kVaStart
+			P.map(V + 2046ull * 0x100000 + 0x10000, MC, 0x400000, false);   // runs past the end of the 4 MiB image
+			P.map(~0ull - 0xfff, MC, 0x2000, false);             // overflow
+			P.setFailSync(true);
+			P.map(V + 0x300000, MC + 0x1000000, 0x2000, false);
+			P.setFailSync(false);
+
+			// 6. fuzz: random histories, seeded
+			Rng r { 0x9e3779b97f4a7c15ull ^ (static_cast<uint64_t>(fbOffset) << 7) ^ reinterpret_cast<uintptr_t>(pol.name) };
+			P.reopen();
+			for (uint32_t op = 0; op < 160; op++) {
+				const uint64_t kind = r.below(100);
+				uint64_t va = V + r.below(0x40000000 / 0x1000) * 0x1000;       // anywhere in the first GiB
+				if (r.below(25) == 0)
+					va = V + r.below(0x1000) * 0x1000 + 0x1ff000;            // straddle the first 2 MiB boundary
+				if (r.below(40) == 0)
+					va += 0x123;                                              // unaligned
+				if (r.below(60) == 0)
+					va = V - 0x1000 * (1 + r.below(4));                        // below the start
+				uint64_t pages = 1 + r.below(16);
+				if (r.below(4) == 0)
+					pages = 16 + r.below(600);
+				if (r.below(25) == 0)
+					pages = 1024 + r.below(512);
+				const uint64_t bytes = pages * 0x1000 - (r.below(8) == 0 ? r.below(0x1000) : 0);
+				if (kind < 40) {
+					uint64_t mc = MC + (r.below(0x100000) << 12);
+					if (r.below(30) == 0)
+						mc = MC - 0x1000 * (1 + r.below(8));                  // below the FB base
+					if (r.below(50) == 0)
+						mc += 0x100;                                          // unaligned
+					P.map(va, mc, bytes, r.below(2) != 0);
+				} else if (kind < 60) {
+					std::vector<uint64_t> bus(pages + 1);
+					for (uint64_t i = 0; i < bus.size(); i++)
+						bus[i] = (r.below(1ull << 28) << 12);
+					if (r.below(40) == 0)
+						bus[r.below(pages)] |= 0x40;                          // a misaligned bus address
+					P.mapHost(va, bus, bytes, r.below(2) != 0);
+				} else if (kind < 92) {
+					P.unmap(va, bytes);
+				} else if (kind < 97) {
+					P.reopen();
+				} else {
+					P.setFailSync(!P.ref.failSync);
+				}
+			}
+			failures += P.failures;
+			totOps += P.ops; totOk += P.okMaps; totBad += P.failedMaps; totHostOk += P.okHost; totHostBad += P.failedHost; totUnmap += P.unmaps;
+		}
+	}
+	printf("vmtable differential: %u operations (%u maps ok, %u refused, %u host maps ok, %u refused, %u unmaps), "
+	       "pre-S8 code vs src/gpuvmtable.cpp (contiguous image of modes 0/1): identical\n", totOps, totOk, totBad, totHostOk, totHostBad, totUnmap);
+	return failures + check(totOk > 200 && totBad > 50 && totHostOk > 100 && totHostBad > 10 && totUnmap > 100,
+	                        "vmtable differential: the histories cover successful and refused maps, host maps and unmaps");
+}
+
+// ---- the multi-level layout of rdna4-vmshared=2 (hub-task-346): VA beyond 1 GiB ----
+namespace {
+// A fake device for PtPages::Sparse: chunks from a counter, shadow pages from the host, and a "VRAM" that only ever holds what sync() copied, so a walk over
+// it proves the dirty tracking too (a page that was changed but not marked never reaches it).
+struct TreeEnv {
+	PtPages::Sparse sp;
+	uint64_t nextChunk { 0x2000000 };
+	uint32_t chunksLive { 0 }, shadowLive { 0 }, shadowLimit { 0xffffffffu };
+	std::map<uint64_t, std::vector<uint64_t>> vram;           // heap offset -> synced page
+	std::vector<uint64_t> dirtyLog;
+	uint64_t rootPhys { 0 };
+	bool dropDirty { false };                                   // mutation switch: the tree forgets to mark pages
+	PtPages::Host host;
+	static constexpr uint64_t kBase = 0x4000000000ull;
+
+	static bool allocChunk(void *c, uint64_t &off) { auto *e = static_cast<TreeEnv *>(c); off = e->nextChunk; e->nextChunk += 0x10000; e->chunksLive++; return true; }
+	static void freeChunk(void *c, uint64_t) { static_cast<TreeEnv *>(c)->chunksLive--; }
+	static uint64_t *allocShadow(void *c) {
+		auto *e = static_cast<TreeEnv *>(c);
+		if (e->shadowLive >= e->shadowLimit)
+			return nullptr;
+		e->shadowLive++;
+		return static_cast<uint64_t *>(calloc(512, 8));
+	}
+	static void freeShadow(void *c, uint64_t *p) { static_cast<TreeEnv *>(c)->shadowLive--; free(p); }
+	static bool physOf(void *, uint64_t heapOffset, uint64_t &phys) { phys = kBase + heapOffset; return true; }
+	static bool treePage(void *c, uint32_t level, uint64_t key, bool create, uint64_t *&entries, uint64_t &phys, uint32_t &id) {
+		auto *e = static_cast<TreeEnv *>(c);
+		PtPages::Page p;
+		if (!e->sp.get(e->host, level, key, create, p))
+			return false;
+		entries = p.entries; phys = p.phys; id = p.id;
+		return true;
+	}
+	static void treeDirty(void *c, uint32_t id) {
+		auto *e = static_cast<TreeEnv *>(c);
+		e->dirtyLog.push_back(id);
+		if (!e->dropDirty)
+			e->sp.markDirty(id);
+	}
+	GpuVmTable::Tree tree() { return GpuVmTable::Tree { treePage, treeDirty, this }; }
+
+	void open(uint32_t quota) {
+		host = PtPages::Host { PtPages::Backend { allocChunk, freeChunk, this }, allocShadow, freeShadow, physOf, this };
+		sp.init(quota);
+		PtPages::Page root;
+		sp.get(host, 0, 0, true, root);
+		rootPhys = root.phys;
+		sync();
+	}
+	void sync() {
+		uint32_t id; uint64_t *shadow, off;
+		while (sp.nextDirty(id, shadow, off)) {
+			vram[off] = std::vector<uint64_t>(shadow, shadow + 512);
+			sp.clean(id);
+		}
+	}
+	static bool readEntry(void *c, uint64_t address, uint64_t &entry) {
+		auto *e = static_cast<TreeEnv *>(c);
+		auto it = e->vram.find((address & ~0xfffull) - kBase);
+		if (it == e->vram.end())
+			return false;                                       // the walker reads a VRAM page that never got written: a fault
+		entry = it->second[(address & 0xfff) / 8];
+		return true;
+	}
+	// The GPU's view: walk the SYNCED pages from the root.
+	bool translate(uint64_t va, uint64_t &physical) {
+		uint64_t flags = 0;
+		return GpuVm::walk(rootPhys, va, readEntry, this, physical, flags);
+	}
+	void close() {
+		sp.releaseAll(host, true);
+		vram.clear();
+		dirtyLog.clear();
+	}
+};
+
+bool treeMap(TreeEnv &e, uint64_t va, uint64_t mc, uint64_t bytes) {
+	const GpuVmTable::Policy pol {};
+	uint64_t physical = 0;
+	GpuVm::mcToPhysical(mc, kFbMcBase, 0, physical);
+	const uint64_t end = va + ((bytes + 0xfff) & ~0xfffull);
+	const bool ok = GpuVmTable::treeMapVram(e.tree(), pol, va, end, physical, false);
+	e.sync();
+	return ok;
+}
+
+// Every page of [va, va + bytes) translates to physical + offset (and nothing else does outside).
+bool treeResolves(TreeEnv &e, uint64_t va, uint64_t mc, uint64_t bytes) {
+	uint64_t physical0 = 0;
+	GpuVm::mcToPhysical(mc, kFbMcBase, 0, physical0);
+	for (uint64_t off = 0; off < bytes; off += 0x1000) {
+		uint64_t phys = 0;
+		if (!e.translate(va + off, phys) || phys != physical0 + off)
+			return false;
+	}
+	return true;
+}
+} // namespace
+
+static int testSparseTree() {
+	int f = 0;
+	const uint64_t V = GpuVm::kVaStart, G = 1ull << 30;
+	const uint64_t MC = kFbMcBase + 0x1000000;
+	static TreeEnv e;
+	e = TreeEnv {};
+	e.open(PtPages::kMaxPages);
+	f += check(e.sp.pages() == 1 && e.sp.chunksHeld() == 1 && e.shadowLive == 1, "tree: a fresh client is one page (the root), nothing below it");
+	uint64_t phys = 0;
+	f += check(!e.translate(V, phys), "tree: before any mapping every VA faults");
+
+	// A map inside the first GiB: root + PDB1 + PDB0 + one PT.
+	f += check(treeMap(e, V + 0x1000, MC, 0x3000) && treeResolves(e, V + 0x1000, MC, 0x3000) && e.sp.pages() == 4,
+	           "tree: a first mapping backs root, PDB1, PDB0 and one PT page (4 pages)");
+	f += check(!e.translate(V, phys) && !e.translate(V + 0x4000, phys), "tree: the neighbouring unmapped pages still fault");
+	// A second map into the SAME, already synced PT page: only the dirty mark gets it to VRAM (a new page is dirty from birth, an old one is not).
+	f += check(treeMap(e, V + 0x8000, MC + 0x50000, 0x2000) && treeResolves(e, V + 0x8000, MC + 0x50000, 0x2000) && e.sp.pages() == 4,
+	           "tree: a later map into an existing PT page reaches VRAM and backs no new page");
+
+	// THE FIX: a map that crosses 1 GiB. It needs a second PDB0 page (PDB1 entry 5 of the same PDB1 page).
+	const uint64_t cross = V + G - 0x10000, crossMc = MC + 0x100000;
+	bool ok = treeMap(e, cross, crossMc, 0x20000);
+	f += check(ok && treeResolves(e, cross, crossMc, 0x20000), "tree: a 128 KiB map across the 1 GiB line succeeds and every page translates");
+	f += check(e.sp.pages() == 4 + 1 /*PT of the far side*/ + 1 /*PT of the near side*/ + 1 /*second PDB0*/, "tree: the crossing cost exactly two PT pages and one more PDB0");
+	// The walk above already proves the far side is reachable; check the structure too: PDB1 entries 4 and 5 name two different PDB0 pages.
+	{
+		uint64_t *p1 = nullptr, *p0a = nullptr, *p0b = nullptr, ph1 = 0, ph2 = 0, ph3 = 0;
+		uint32_t i1 = 0, i2 = 0, i3 = 0;
+		const bool got = TreeEnv::treePage(&e, 1, V >> 39, false, p1, ph1, i1) && TreeEnv::treePage(&e, 2, V >> 30, false, p0a, ph2, i2) &&
+		                 TreeEnv::treePage(&e, 2, (V + G) >> 30, false, p0b, ph3, i3);
+		f += check(got && i2 != i3 && GpuVm::entryPhysical(p1[GpuVm::index(V, 1)]) == ph2 && GpuVm::entryPhysical(p1[GpuVm::index(V + G, 1)]) == ph3,
+		           "tree: PDB1 entries 4 and 5 name two different PDB0 pages");
+	}
+
+	// NEGATIVE CONTROL: the contiguous layout of modes 0/1 accepts the same map and then cannot reach the far side. This is the defect being fixed;
+	// without it the test above would pass for a walker that never reads PDB1.
+	{
+		NewImage n;
+		n.words.assign(kTableBytes / 8, 0);
+		initLegacy(n.words, kRootPhys);
+		const bool mapped = newVmMap(n, cross, crossMc, 0x20000, false);
+		auto legacyRead = [](void *c, uint64_t address, uint64_t &entry) {
+			auto *img = static_cast<NewImage *>(c);
+			const uint64_t off = address - kRootPhys;
+			if (off >= kTableBytes)
+				return false;
+			entry = img->words[off / 8];
+			return true;
+		};
+		uint64_t pa = 0, fl = 0;
+		const bool nearOk = GpuVm::walk(kRootPhys, cross, legacyRead, &n, pa, fl);
+		const bool farOk = GpuVm::walk(kRootPhys, cross + 0x10000, legacyRead, &n, pa, fl);
+		f += check(mapped && nearOk && !farOk, "negative control: the contiguous layout takes a map across 1 GiB but the far side does not translate (PDB1 entry 5 is empty)");
+	}
+
+	// Far apart: another PDB1 page (512 GiB up), and the top of the 48-bit space.
+	const uint64_t far = V + (600ull << 30);
+	f += check(treeMap(e, far, MC + 0x200000, 0x1000) && treeResolves(e, far, MC + 0x200000, 0x1000), "tree: a map 600 GiB up (root entry 1, its own PDB1 page) translates");
+	const uint64_t top = GpuVm::kVaEnd - 0x2000;
+	f += check(treeMap(e, top, MC + 0x300000, 0x2000) && treeResolves(e, top, MC + 0x300000, 0x2000), "tree: the last two pages of the 48-bit space translate");
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V - 0x1000, V + 0x1000, 0x1000, false), "tree: a map starting below kVaStart is refused");
+	f += check(treeResolves(e, cross, crossMc, 0x20000) && treeResolves(e, V + 0x1000, MC, 0x3000), "tree: the earlier mappings are undisturbed by the later ones");
+
+	// Unmap: PTEs go (through the dirty path), pages stay, nothing is created for a range that was never mapped.
+	const uint32_t before = e.sp.pages();
+	GpuVmTable::treeUnmap(e.tree(), cross, cross + 0x20000);
+	e.sync();
+	f += check(!e.translate(cross, phys) && !e.translate(cross + 0x10000, phys) && treeResolves(e, V + 0x1000, MC, 0x3000),
+	           "tree: unmap clears exactly its PTEs, on both sides of the line");
+	GpuVmTable::treeUnmap(e.tree(), V + 40 * G, V + 40 * G + 0x100000);
+	f += check(e.sp.pages() == before, "tree: unmapping a range that was never backed backs nothing");
+	// Host mapping through the same tree.
+	{
+		std::vector<uint64_t> buses(8);
+		for (uint32_t i = 0; i < 8; i++)
+			buses[i] = 0x104048000ull + 0x3000ull * i;
+		const uint64_t hv = V + 3 * G + 0x7000;
+		const bool hm = GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, hv, hv + 0x8000, buses.data(), false);
+		e.sync();
+		bool all = hm;
+		for (uint32_t i = 0; i < 8; i++)
+			all &= e.translate(hv + 0x1000ull * i, phys) && phys == buses[i];
+		f += check(all, "tree: a host mapping in the fourth GiB translates to its bus addresses");
+		// and a second one into the same, already synced PT page
+		const uint64_t hv2 = hv + 0x10000;
+		const bool hm2 = GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, hv2, hv2 + 0x2000, buses.data(), false);
+		e.sync();
+		f += check(hm2 && e.translate(hv2, phys) && phys == buses[0] && e.translate(hv2 + 0x1000, phys) && phys == buses[1],
+		           "tree: a later host mapping into an existing PT page reaches VRAM");
+		buses[3] |= 0x40;
+		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, hv + 0x20000, hv + 0x28000, buses.data(), false), "tree: a misaligned bus address is refused");
+	}
+
+	// Quota: the VA limit is the page quota. Nothing half-made, earlier mappings survive.
+	{
+		static TreeEnv q;
+		q = TreeEnv {};
+		q.open(8);
+		// root + PDB1 + PDB0 + 5 PT pages = 8
+		bool fine = true;
+		for (uint32_t i = 0; i < 5; i++)
+			fine &= treeMap(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		f += check(fine && q.sp.pages() == 8, "quota: root, PDB1, PDB0 and five PT pages fill a quota of 8");
+		f += check(!treeMap(q, V + 5 * 0x200000ull, MC, 0x1000) && q.sp.pages() == 8, "quota: the sixth PT page is refused and leaves no page behind");
+		f += check(!treeMap(q, V + G, MC, 0x1000) && q.sp.pages() == 8, "quota: a map into a new GiB (needs PDB0 + PT) is refused too");
+		bool still = true;
+		for (uint32_t i = 0; i < 5; i++)
+			still &= treeResolves(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		f += check(still, "quota: what was mapped before the refusal still translates");
+		q.close();
+		f += check(q.chunksLive == 0 && q.shadowLive == 0, "quota: close returns every chunk and shadow page");
+		// host memory exhaustion behaves like the quota
+		q = TreeEnv {};
+		q.shadowLimit = 3;
+		q.open(PtPages::kMaxPages);
+		f += check(!treeMap(q, V, MC, 0x1000) && q.sp.pages() <= 3, "quota: running out of host shadow pages fails the map cleanly");
+		q.close();
+		f += check(q.chunksLive == 0 && q.shadowLive == 0, "quota: and close still returns everything");
+	}
+
+	// A wide client: many GiB at once, including straddles of each 1 GiB line; everything resolves.
+	{
+		static TreeEnv w;
+		w = TreeEnv {};
+		w.open(PtPages::kMaxPages);
+		bool all = true;
+		for (uint32_t g = 0; g < 40; g++)
+			all &= treeMap(w, V + (g + 1ull) * G - 0x2000, MC + 0x400000 + g * 0x10000ull, 0x4000);
+		for (uint32_t g = 0; g < 40; g++)
+			all &= treeResolves(w, V + (g + 1ull) * G - 0x2000, MC + 0x400000 + g * 0x10000ull, 0x4000);
+		f += check(all && w.sp.pages() > 40 * 2, "tree: 40 straddles of consecutive 1 GiB lines (a 40 GiB client) all translate");
+		w.close();
+		f += check(w.chunksLive == 0 && w.shadowLive == 0, "tree: close returns everything");
+	}
+
+	// The directory: collisions, duplicates, misses.
+	{
+		static PtPages::Directory d;
+		d.init();
+		bool ok2 = true;
+		for (uint16_t i = 0; i < 2048; i++)
+			ok2 &= d.insert(0x1000000000ull + i * 512ull, i);
+		for (uint16_t i = 0; i < 2048; i++)
+			ok2 &= d.find(0x1000000000ull + i * 512ull) == i;
+		f += check(ok2 && d.find(12345) == -1 && !d.insert(0x1000000000ull, 7), "directory: 2048 keys found, a miss is -1, a duplicate is refused");
+	}
+
+	// Mutation switch (the checker of the checks): a tree that forgets to mark pages dirty must be caught by the walk over the synced VRAM.
+	{
+		static TreeEnv m;
+		m = TreeEnv {};
+		m.open(PtPages::kMaxPages);
+		m.dropDirty = true;
+		const bool mapped = treeMap(m, V, MC, 0x2000);
+		f += check(mapped && !treeResolves(m, V, MC, 0x2000), "mutation check: if the walker forgot Tree::dirty the GPU's view would fault (the test sees it)");
+		m.close();
+	}
+	e.close();
+	f += check(e.chunksLive == 0 && e.shadowLive == 0, "tree: close returns every chunk and shadow page");
+	printf("sparse tree: multi-level layout ok (VA beyond 1 GiB, quota, dirty sync, negative control)\n");
+	return f;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <vbios.rom>\n", argv[0]);
@@ -2360,6 +3286,10 @@ int main(int argc, char **argv) {
 	failures += testFlipArithmetic();
 	failures += testGcInfo();
 	failures += testGpuVm();
+	failures += testVmidPool();
+	failures += testPtPages();
+	failures += testVmTableDifferential();
+	failures += testSparseTree();
 	failures += testLinuxRefFormat();
 
 	if (failures) {
