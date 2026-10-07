@@ -154,40 +154,49 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 		return *word == 0x600DF00D;
 	};
 	/* Only the hung waves are reset; the queue is left as it is. When recovery starts the queue itself is in order (read pointer at the
-	 * write pointer, doorbell enabled); what hangs is the faulted shader's waves. VERIFIED on the card 2026-10-07 (eighth and ninth run): the proof
-	 * lands within 1.1 ms on both queues and every later job runs. amdgpu's own reset (mes_v12_0_reset_queue_mmio: this write with a
+	 * write pointer, doorbell enabled); what hangs is the faulted shader's waves. VERIFIED on the card 2026-10-07 (eighth and ninth run): a packet
+	 * runs within 1.1 ms on both queues and every later job runs. amdgpu's own reset (mes_v12_0_reset_queue_mmio: this write with a
 	 * dequeue request, then the queue made again) was tried in the sixth and seventh run and is not here: without an MES to map the
 	 * queue afterwards the remade queue never ran (docs/vm-client-rootcause.md sections 17 to 19).
 	 * ponytail: a hang that is not the waves' (a command buffer the CP cannot fetch) is not recovered, the queue stays out of service
 	 * and new clients go to the other one; that needs the MES or a GPU reset. */
-	const bool safe = rlcSafeMode(true);
-	grbmSelect(1, s.pipe, s.queue, 0);
-	wr(IpDiscovery::HwGc, SpiComputeQueueReset, 1);
-	grbmSelect(0, 0, 0, 0);
-	rlcSafeMode(false);
-	const bool proof = proves(false);
-	/* The dead job's own fence can still be on its way: the command processor had stopped in front of it (read pointer short of the
-	 * write pointer above), and it shares its word and its numbering with the client's next job. Written after that job's fence it
-	 * would take the word back, and the wait for that job would never see it (suspected 2026-10-07: a SubmitIb wait that ran out 30 ms
-	 * after a recovery, with a Vulkan program presenting). So a fence of our own goes through behind it before anybody is told. */
-	const bool drained = proof && proves(true);
+	/* One reset is not always enough. 2026-10-07, with a Vulkan program presenting beside the self-test: after the reset the proof packet
+	 * ran, but no fence came through any more (GRBM_STATUS still SPI busy), and the next job's wait ran out; the reset that wait's
+	 * recovery then did was enough. Why the first was not is not known (waves launched after it, perhaps). A fence (RELEASE_MEM) is
+	 * written when the pipeline reports it, so a fence of our own coming through is what says the waves are gone, and the reset is
+	 * repeated until one does. */
+	bool safe = true, proof = false, fences = false;
+	uint32_t resets = 0;
+	while (resets < 4 && !fences) {
+		safe = rlcSafeMode(true) && safe;
+		grbmSelect(1, s.pipe, s.queue, 0);
+		wr(IpDiscovery::HwGc, SpiComputeQueueReset, 1);
+		grbmSelect(0, 0, 0, 0);
+		rlcSafeMode(false);
+		resets++;
+		proof = proves(false);
+		if (!proof)
+			break;
+		fences = proves(true);
+	}
 	/* The hung waves fault again as soon as the hub's entry is cleared (the state dump above clears it), until they are reset. What they
 	 * left there would end this address space's next job at its first look (2026-10-07: three SubmitIb tests "faulted" after 8 us). */
 	if (((rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == guiltyVmid)
 		gcFaultClear();
-	SLOG("%s: shared queue %u: waves reset, the queue left as it was (RLC safe mode %s): %s%s", tag, k, safe ? "acknowledged" : "NOT acknowledged",
-	     proof ? "it runs" : "it does not run", !proof ? "" : drained ? ", its fences are through" : ", a fence did NOT come through in 200 ms");
-	if (!proof)
+	SLOG("%s: shared queue %u: waves reset %u time(s), the queue left as it was (RLC safe mode %s): %s%s", tag, k, resets,
+	     safe ? "acknowledged" : "NOT acknowledged", proof ? "it runs" : "it does not run",
+	     !proof ? "" : fences ? ", its fences are through" : ", but no fence comes through");
+	if (!fences)
 		logComputeQueueState(tag, s.pipe, s.queue, 0);
-	s.wedged = !proof;
-	/* The proof ran behind everything that was in the ring, so the jobs that were in it are over. Their queue-fence numbers count as
+	s.wedged = !fences;
+	/* The proof and the fence ran behind everything that was in the ring, so the jobs that were in it are over. Their queue-fence numbers count as
 	 * reached so the VMIDs they held are idle again (a job that did not run to completion never signals its client's own fence, and
 	 * that wait times out), and the ring is empty. */
 	*s.fenceCpu = s.seq;
 	s.jobHead = s.jobCount = s.ringUsed = 0;
 	flushHdp();
-	SLOG("%s: shared queue %u %s", tag, k, proof ? "recovered (WRITE_DATA proof landed)" : "NOT recovered: wedged");
-	return proof;
+	SLOG("%s: shared queue %u %s", tag, k, fences ? "recovered (a packet and a fence went through)" : "NOT recovered: wedged");
+	return fences;
 }
 
 /* ---- rdna4-vmshared=2: VMIDs from the pool ---------------------------------------------------------------------- */

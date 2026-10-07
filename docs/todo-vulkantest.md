@@ -448,12 +448,32 @@ Logs `rdna4fb-diag-20261007-153754` (step 1) and `-153835` (step 2), `n48nprobe-
   0x3d9), so it is written only after the waves are reset, late; it shares its word and numbering with the client's
   next job, and landing after that job's fence it takes the word back to 3 while the wait wants 4.
 
-**The change** (kext `A4A96CB4`, compile-checked): the recovery sends a fence of its own through the queue after the
-proof packet and waits for it, so that every fence before it has been written before anybody is told (`it runs, its
-fences are through`); and a wait that runs out says in its one line what it last saw (`IB fence N timed out (fence
-word 0x..., hub fault 0x..., GRBM 0x...)`). **Next run: both steps again**; step 2 twice if there is time, since
-this failure did not show in every run. Expected: all rows PASS. If the timeout comes again, that line says whether
-the suspicion was right (`fence word 0x3` against `IB fence 4`).
+**The change** (kext `A4A96CB4`): the recovery sends a fence of its own through the queue after the proof packet and
+waits for it, and a wait that runs out says in its one line what it last saw.
+
+### Fourth run 2026-10-07 (kext `A4A96CB4`): the suspicion was wrong; one reset was not enough
+
+Logs `rdna4fb-diag-20261007-155046` (step 1) and `-155129` (step 2), `n48nprobe-2.txt`, `vkprobe-5.txt`, `vkprobe2-4.txt`.
+
+- **Step 1: everything passes again** (27 `ok` lines, all rows PASS, both recoveries `it runs, its fences are through`).
+- **Step 2: the same one failure**, `SubmitIb vadd/wait: I/O Timeout`, and now with its reason in the log:
+
+  ```
+  runtime: shared queue 0: waves reset ...: it runs, a fence did NOT come through in 200 ms
+  runtime: IB fence 4 timed out (fence word 0x0, hub fault 0x00000000, GRBM 0xa840382c); ...
+  IB: shared queue 0: waves reset ...: it runs, its fences are through
+  ```
+
+  The fence word is 0, not 3: no late fence took it back, so **the suspicion of the third run is refuted**. What the
+  lines say instead: after the freed-buffer fault's reset the queue runs packets but no fence comes through, and
+  `GRBM_STATUS` still has SPI busy five seconds later. Waves were still there. The second reset, done by the timed-out
+  wait's recovery, removed them. It is the reset after the second fault, on queue 0, with the Vulkan program
+  presenting, in both runs that have it; why one reset is not enough there is not known.
+
+**The change** (kext `DCD5BF79`, compile-checked): the recovery repeats the reset, up to four times, until a fence of
+its own comes through, and only then counts the queue as recovered (`waves reset N time(s) ...: it runs, its fences
+are through`). **Next run: both steps again.** Expected: all rows PASS in both; in step 2 the line for queue 0
+probably says `2 time(s)`.
 
 ## After the tests
 
