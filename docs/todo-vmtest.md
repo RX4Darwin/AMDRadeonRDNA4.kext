@@ -67,8 +67,8 @@ safe mode acknowledged): it runs`, `recovered (WRITE_DATA proof landed)`, 1.1 ms
 the self-test `ok`; the table has `runtime`, `submitib`, `fault`, `vm`, `gfx-client`, `gfx-app-tri` and
 `gfx-app-tricol` at PASS, `idle-pin` and `post-idle` at 3 % and 18 W.
 
-The kext built after this run (`39B99DC7`) only drops the full reset that did not run here. If boot C is run again
-with it, the log should read the same.
+The kext built after this run (`39B99DC7`) only drops the full reset that did not run here. It ran the same boot
+right after (log `rdna4fb-diag-20261007-142500`) and the log reads the same: both recoveries `it runs`, all rows PASS.
 
 What changed: with `rdna4-vm=1` a client of the compute runtime (`RDNA4ComputeClient`, `rdna4-run`) gets its own
 GPU address space. Until now each such client also got a compute queue of its own inside that address space, and

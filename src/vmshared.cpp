@@ -149,7 +149,7 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 		return *word == 0x600DF00D;
 	};
 	/* Only the hung waves are reset; the queue is left as it is. When recovery starts the queue itself is in order (read pointer at the
-	 * write pointer, doorbell enabled); what hangs is the faulted shader's waves. VERIFIED on the card 2026-10-07 (eighth run): the proof
+	 * write pointer, doorbell enabled); what hangs is the faulted shader's waves. VERIFIED on the card 2026-10-07 (eighth and ninth run): the proof
 	 * lands within 1.1 ms on both queues and every later job runs. amdgpu's own reset (mes_v12_0_reset_queue_mmio: this write with a
 	 * dequeue request, then the queue made again) was tried in the sixth and seventh run and is not here: without an MES to map the
 	 * queue afterwards the remade queue never ran (docs/vm-client-rootcause.md sections 17 to 19).

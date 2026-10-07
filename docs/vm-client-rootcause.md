@@ -526,7 +526,8 @@ So, for a compute job whose shader touches an address that is not mapped, on thi
 
 **After the run** the full reset and the remade queue are removed from `recoverSharedQueue` (they did not run in this
 log and never recovered a queue in the two before). The kext that ran is `8C8B6470`; the one with that removal is
-`39B99DC7`, compile-checked.
+`39B99DC7`, which ran the same boot right after (log `rdna4fb-diag-20261007-142500`) with the same result: both
+queues recovered (`it runs`), every test `ok`, the same rows at PASS, idle 3 % and 18 W.
 
 Not covered by any of this: a queue hung by something other than a shader's waves (a command buffer the CP cannot
 fetch), more than one job in the ring when the fault comes, the graphics ring and the copy engine, and the old path
