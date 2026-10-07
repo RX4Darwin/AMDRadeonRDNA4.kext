@@ -214,6 +214,23 @@ ioreg -l -w0 -c IOAccelerator > /tmp/census.ioreg 2>&1
 GUEST
 	export EXTRA_QEMU="${EXTRA_QEMU:-} -drive id=share,if=none,format=raw,readonly=on,file=fat:ro:$RUN/share -device usb-storage,bus=xhci.0,drive=share"
 fi
+if [ "$CENSUS" = 1 ]; then
+	[ -f "$HERE/build/rdna4-census" ] || { echo "emu-linux: --census needs build/rdna4-census (tools/build-osxcross.sh build/rdna4-census)" >&2; exit 1; }
+	mkdir -p "$RUN/share"
+	cp "$HERE/build/rdna4-census" "$RUN/share/"
+	cat > "$RUN/share/run-census.sh" <<'GUEST'
+cp /Volumes/QEMU*/rdna4-census /tmp/ && cd /tmp || exit 1
+echo RDNA4CENSUS-RUNNING > /dev/console
+./rdna4-census all > /tmp/census.out 2>&1
+(log show --last 10m --style compact --predicate 'process == "rdna4-census" OR eventMessage CONTAINS[c] "MTL" OR eventMessage CONTAINS[c] "IOAccel" OR eventMessage CONTAINS[c] "plugin"' > /tmp/census.log 2>&1 &)
+for i in $(seq 1 60); do sleep 1; pgrep -x log >/dev/null || break; done
+pkill -x log 2>/dev/null
+ioreg -l -w0 -c IOAccelerator > /tmp/census.ioreg 2>&1
+(echo RDNA4CENSUS-BEGIN; cat /tmp/census.out; echo RDNA4CENSUS-IOREG; cat /tmp/census.ioreg; echo RDNA4CENSUS-LOG; head -400 /tmp/census.log; echo RDNA4CENSUS-END) |
+	sed 's/^/RDNA4CENSUS|/' > /dev/console
+GUEST
+	export EXTRA_QEMU="${EXTRA_QEMU:-} -drive id=share,if=none,format=raw,readonly=on,file=fat:ro:$RUN/share -device usb-storage,bus=xhci.0,drive=share"
+fi
 : > "$SERIAL"
 OC_IMAGE=$OCIMG RAM_MB=${RAM_MB:-8192} MONITOR=$MON SERIAL_LOG=$SERIAL BASE_IMG=$BASE_IMG MACHDD=none \
 	OVMF_CODE=$OSXKVM/OVMF_CODE_4M.fd OVMF_VARS=$RUN/vars.fd VNC_DISPLAY=${VNC_DISPLAY:-0} \
