@@ -431,7 +431,29 @@ Logs `rdna4fb-diag-20261007-152847` (step 1) and `-152932` (step 2), `n48nprobe-
   after 2 ms, by when such a job had long finished, so the leftover never showed.
 
 **The fix** (kext `7248396D`, compile-checked): the recovery clears the faulted address space's entry after the waves
-are reset. **Next run: both steps again**, same arguments and commands. Expected: all rows PASS in both.
+are reset.
+
+### Third run 2026-10-07 (kext `7248396D`): step 1 passes; in step 2 one wait ran out
+
+Logs `rdna4fb-diag-20261007-153754` (step 1) and `-153835` (step 2), `n48nprobe-2.txt`, `vkprobe-7.txt`, `vkprobe2-3.txt`.
+
+- **Step 1: everything passes.** `n48nprobe` all ok, `vkprobe` 301 frames in 5.01 s, the script's table all PASS (27
+  `ok` lines, both faults seen after 31 and 76 us, idle 3 % and 18 W).
+- **Step 2:** both fault tests pass beside the Vulkan program (166 and 39 us), 26 `ok` lines, the graphics rows PASS.
+  One failure: `SubmitIb vadd/wait: I/O Timeout`. That job was submitted 30 ms after the second fault's recovery and
+  its 5 s wait ran out; the queue was fine (`it runs`) and the same job passes three and ten times right after.
+  `vkprobe` lost 358 frames to that wait (6837 of 7195).
+- Cause **not established**: the state dump's lines for that timeout did not survive in the kernel log. Suspected:
+  the faulted job's own fence. The command processor had stopped in front of it (read pointer 0x3d1, write pointer
+  0x3d9), so it is written only after the waves are reset, late; it shares its word and numbering with the client's
+  next job, and landing after that job's fence it takes the word back to 3 while the wait wants 4.
+
+**The change** (kext `A4A96CB4`, compile-checked): the recovery sends a fence of its own through the queue after the
+proof packet and waits for it, so that every fence before it has been written before anybody is told (`it runs, its
+fences are through`); and a wait that runs out says in its one line what it last saw (`IB fence N timed out (fence
+word 0x..., hub fault 0x..., GRBM 0x...)`). **Next run: both steps again**; step 2 twice if there is time, since
+this failure did not show in every run. Expected: all rows PASS. If the timeout comes again, that line says whether
+the suspicion was right (`fence word 0x3` against `IB fence 4`).
 
 ## After the tests
 

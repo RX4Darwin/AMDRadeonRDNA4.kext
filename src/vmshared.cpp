@@ -138,13 +138,15 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 	}
 	SLOG("%s: recovering shared queue %u (guilty VMID %u) without a GPU reset", tag, k, guiltyVmid);
 	logComputeQueueState(tag, s.pipe, s.queue, 0);
-	// One packet through the queue as it stands: true if it ran.
-	auto proves = [&]() {
+	// One packet through the queue as it stands: true if it ran. As a fence (RELEASE_MEM) it is written when the pipeline reports it,
+	// behind every fence emitted before it; as WRITE_DATA, when the command processor reads it.
+	auto proves = [&](bool asFence) {
 		volatile uint32_t *word = poolDw(s.area + kVmKernarg);
 		*word = 0;
 		flushHdp();
 		uint32_t pkt[8];
-		if (!s.pm.emit(pkt, Pm4::writeData(pkt, poolMc(s.area + kVmKernarg), 0x600DF00D)))
+		if (!s.pm.emit(pkt, asFence ? Pm4::releaseMem(pkt, poolMc(s.area + kVmKernarg), 0x600DF00D)
+		                            : Pm4::writeData(pkt, poolMc(s.area + kVmKernarg), 0x600DF00D)))
 			return false;
 		pm4Kick(s.pm, s.doorbell, s.pm.wptr());
 		for (uint32_t ms = 0; ms < 200 && *word != 0x600DF00D; ms++)
@@ -163,13 +165,18 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 	wr(IpDiscovery::HwGc, SpiComputeQueueReset, 1);
 	grbmSelect(0, 0, 0, 0);
 	rlcSafeMode(false);
-	const bool proof = proves();
+	const bool proof = proves(false);
+	/* The dead job's own fence can still be on its way: the command processor had stopped in front of it (read pointer short of the
+	 * write pointer above), and it shares its word and its numbering with the client's next job. Written after that job's fence it
+	 * would take the word back, and the wait for that job would never see it (suspected 2026-10-07: a SubmitIb wait that ran out 30 ms
+	 * after a recovery, with a Vulkan program presenting). So a fence of our own goes through behind it before anybody is told. */
+	const bool drained = proof && proves(true);
 	/* The hung waves fault again as soon as the hub's entry is cleared (the state dump above clears it), until they are reset. What they
 	 * left there would end this address space's next job at its first look (2026-10-07: three SubmitIb tests "faulted" after 8 us). */
 	if (((rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == guiltyVmid)
 		gcFaultClear();
-	SLOG("%s: shared queue %u: waves reset, the queue left as it was (RLC safe mode %s): %s", tag, k, safe ? "acknowledged" : "NOT acknowledged",
-	     proof ? "it runs" : "it does not run");
+	SLOG("%s: shared queue %u: waves reset, the queue left as it was (RLC safe mode %s): %s%s", tag, k, safe ? "acknowledged" : "NOT acknowledged",
+	     proof ? "it runs" : "it does not run", !proof ? "" : drained ? ", its fences are through" : ", a fence did NOT come through in 200 ms");
 	if (!proof)
 		logComputeQueueState(tag, s.pipe, s.queue, 0);
 	s.wedged = !proof;

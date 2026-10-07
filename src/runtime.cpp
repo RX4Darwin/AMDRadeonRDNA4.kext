@@ -2927,14 +2927,17 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 	}
 
 	if (c->shared) {
-		/* The shared queue's recovery kills this client's waves only (SQ_CMD CHECK_VMID) and re-initialises the queue. */
+		const uint32_t fenceSeen = *c->fenceCpu, hubSeen = rdGc(GcL2FaultStatusLo), grbmSeen = rdGc(GrbmStatus);
+		/* The shared queue's recovery resets this queue's waves and leaves the queue as it is (vmshared.cpp). */
 		const bool ok = recoverSharedQueue(c->sq, c->vmid, "IB");
 		c->ibOutstanding = 0;
 		if (ok) {
 			*c->fenceCpu = 0;
 			flushHdp();
 		}
-		RLOG("IB fence %u %s; shared queue %u %s", fence, waitFaulted ? "not reached: the job faulted" : "timed out", c->sq,
+		// One line with what the wait last saw: the state dump's lines do not all survive in the kernel log.
+		RLOG("IB fence %u %s (fence word 0x%x, hub fault 0x%08x, GRBM 0x%08x); shared queue %u %s", fence,
+		     waitFaulted ? "not reached: the job faulted" : "timed out", fenceSeen, hubSeen, grbmSeen, c->sq,
 		     ok ? "recovered without a GPU reset" : "recovery failed; that queue stays wedged");
 		return waitFaulted ? kIOReturnVMError : kIOReturnTimeout;
 	}
