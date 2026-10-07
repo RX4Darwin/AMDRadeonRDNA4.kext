@@ -194,7 +194,8 @@ refused to open with `rdna4-vm=1`, whose clients use the same address-space numb
 from the runtime's table of the ones in use (`vmidUsed`), so both work in one boot. On the card 2026-10-07: the probes
 pass with `rdna4-vm=1`, and a Vulkan program presented for two minutes in address space 8 while the runtime's
 self-test ran in 9 and 10 on the same graphics ring (`docs/todo-vulkantest.md`, "With `rdna4-vm=1`"; that run also
-found the runtime's fault check blinded by the graphics ring's stray fault entry, fixed since, fix not yet run). It still refuses with `rdna4-vmshared=2`, which hands address spaces out
+found the runtime's fault check blinded by the graphics ring's stray fault entry; the fix for that works on the card,
+a follow-up to it is not yet run). It still refuses with `rdna4-vmshared=2`, which hands address spaces out
 per job.
 
 **The proof on the card** is a call of this kext's own, outside the Vulkan interface

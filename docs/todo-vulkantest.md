@@ -413,8 +413,25 @@ Logs `rdna4fb-diag-20261007-150805` (step 1) and `-151257` (step 2), `n48nprobe-
 
 **The fix** (kext `56AEEF41`, compile-checked): the fault check clears an entry that names address space 0, runs on
 every poll of a wait and once before a job is kicked; and the Vulkan client's close clears an entry of its own.
-**Next run: both steps again**, same arguments and commands. Expected now: all rows PASS in both, and `vkprobe2`'s
-frame count within a few of the display's.
+
+
+### Second run 2026-10-07 (kext `56AEEF41`): the faults are seen at once; three tests after them are wrongly "faulted"
+
+Logs `rdna4fb-diag-20261007-152847` (step 1) and `-152932` (step 2), `n48nprobe-2.txt`, `vkprobe-6.txt`, `vkprobe2-2.txt`.
+
+- Vulkan as before: all ok, 300 frames in 5.01 s; beside the script 7137 frames in 120 s against the display's 7194.
+  The two-second stalls are gone.
+- **Both fault tests pass in both steps**, with the Vulkan program presenting in step 2: `dispatch ended by a fault in
+  address space 10 after 46 us`, `... 9 after 38 us`. (The 3 ms of the earlier runs was the check only starting
+  after 2 ms.)
+- **New failure, from the fix:** `SubmitIb vadd/wait: misc. VM failure` (step 1: all three `SubmitIb` tests). These
+  jobs did not fault. The hung waves of the fault test before them fault again as soon as the hub's entry is
+  cleared, which the recovery's state dump does before it resets them; that second entry stayed, and the next job
+  in the same address space was ended by it at its first look (`after 8 us`). Before the fix the check started
+  after 2 ms, by when such a job had long finished, so the leftover never showed.
+
+**The fix** (kext `7248396D`, compile-checked): the recovery clears the faulted address space's entry after the waves
+are reset. **Next run: both steps again**, same arguments and commands. Expected: all rows PASS in both.
 
 ## After the tests
 

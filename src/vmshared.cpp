@@ -164,6 +164,10 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 	grbmSelect(0, 0, 0, 0);
 	rlcSafeMode(false);
 	const bool proof = proves();
+	/* The hung waves fault again as soon as the hub's entry is cleared (the state dump above clears it), until they are reset. What they
+	 * left there would end this address space's next job at its first look (2026-10-07: three SubmitIb tests "faulted" after 8 us). */
+	if (((rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == guiltyVmid)
+		gcFaultClear();
 	SLOG("%s: shared queue %u: waves reset, the queue left as it was (RLC safe mode %s): %s", tag, k, safe ? "acknowledged" : "NOT acknowledged",
 	     proof ? "it runs" : "it does not run");
 	if (!proof)
