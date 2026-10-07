@@ -374,6 +374,27 @@ static int testVadd(rdna4_t *gpu, uint32_t items) {
 	return fails;
 }
 
+// Kiln (emulator dry runs, S8 mode 2): push the client's VA past `padMiB` with 64 MiB device buffers, then run the vadd check
+// on buffers allocated there. Not part of the round's scripts.
+static int cmdBigVa(rdna4_t *gpu, uint32_t padMiB) {
+	enum { kPad = 64, kMax = 160 };
+	rdna4_buffer_t pad[kMax];
+	uint32_t n = 0;
+	kern_return_t kr = KERN_SUCCESS;
+	for (; n < padMiB / kPad && n < kMax; n++)
+		if ((kr = rdna4_alloc(gpu, (uint64_t)kPad << 20, &pad[n])))
+			break;
+	printf("bigva: %u x %u MiB pad buffers allocated%s%s, first VA 0x%llx, last VA 0x%llx\n", n, kPad,
+	       kr ? ", stopped: " : "", kr ? rdna4_error(kr) : "", n ? (unsigned long long)pad[0].gpu : 0ull,
+	       n ? (unsigned long long)pad[n - 1].gpu : 0ull);
+	int fails = kr ? 1 : 0;
+	fails += testVadd(gpu, 256);
+	for (uint32_t i = 0; i < n; i++)
+		rdna4_free(gpu, &pad[i]);
+	printf("bigva: %s\n", fails ? "FAILED" : "PASS");
+	return fails ? 1 : 0;
+}
+
 static int cmdHangtest(rdna4_t *gpu) {
 	int fails = 0;
 	rdna4_program_t spin;
@@ -2112,6 +2133,10 @@ int main(int argc, char **argv) {
 		} else {
 			rc = cmdSelftest(&gpu, argc == 3 ? (uint32_t)strtoul(argv[2], NULL, 0) : 65536, 0);
 		}
+	} else if (!strcmp(argv[1], "bigva") && argc == 3) {
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdBigVa(&gpu, (uint32_t)strtoul(argv[2], NULL, 0));
 	} else if (!strcmp(argv[1], "hangtest") && argc == 2) {
 		if (!openRuntime(&gpu))
 			return 1;

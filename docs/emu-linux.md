@@ -141,6 +141,33 @@ Paths are overridable: `EMU`, `QEMU_SRC`, `OSXKVM`, `KEXT` (default `build/RDNA4
   the combination the Windows flow used; Arch's `/usr/share/edk2/x64/OVMF_CODE.4m.fd` was not
   tried (its VARS layout differs from OSX-KVM's 128 KB file).
 
+## Options added later (all in `tools/emu-linux.sh -h`)
+
+- `QEMU_BIN=<binary>`: which emulator build to use (A/B of `emu/qemu/rdna4.c` versions; keep each build as a copy, e.g.
+  `$EMU/bin/<name>/qemu-system-x86_64`, because rebuilding in `$QEMU_SRC` overwrites it). `TAG=<name>` suffixes the run dir.
+  After `emu-boot.sh`/`emu-linux.sh` start a VM, a new run only stops QEMU binaries under `$EMU` (never another QEMU on the box).
+- Any boot id of `set-boot.sh` (`9b`, `11s`, `10`..`13`). `--args "..."` replaces the table, `--extra "..."` appends.
+- Every run also writes `emu-warnings.txt` (QEMU stderr without host-CPU noise) and `emu-context.txt` (each distinct emulator message
+  with the kext lines printed just before it, from the 0.1 s byte-offset sampler `offsets.txt`; `tools/emu-context.py`).
+- `--pre "CMD"` (with `--diag`): a guest command run before `diagnostic-log.sh` in the same Terminal session, e.g.
+  `--pre 'pmset displaysleepnow; sleep 8'` (output over the console; the blanked display does not matter).
+- `--sleep-reset` (boot 11s): triggers the emulator's compute power reset (`qom-set /machine/peripheral/rdna4 sleep-reset true`) right
+  after `power: quiesce complete`: the power-loss case; without it 11s is a wake without power loss.
+- `--census` (E1 of `docs/metal-spike.md`, kext boot-arg `rdna4-accelcensus`): mounts `build/rdna4-census`, runs it in the Recovery Terminal and
+  returns `census.txt` / `census-kernel.log`. Not combinable with `--diag`.
+- `tools/emu-type.py <monitor.sock> <text>` types into the guest through the QEMU monitor (`\n` is Enter). Cmd+Shift+T opens the Recovery
+  Terminal; the mouse does not reach the guest through the monitor here, but Ctrl+F2 + Enter opens the Apple menu.
+- The picker is read from the screendump before each key press (efi vs Recovery tile) and retried; one run in ten used to lose both presses.
+
+## What the emulated Recovery cannot do (measured)
+
+- `pmset sleepnow` is a display sleep only (`power: HDMI display blanked via DPG`, powerd stays in DarkWake); the display does not come back
+  and there is no system S3. The Apple menu in Recovery has no Sleep entry. Use boot `11s` (the driver's simulated cycle) for the sleep path.
+- The SMU/sensors are synthetic (3 % / 120 W): the `post-idle` row always FAILs on the emulator.
+- G4 (the attribute-ring colour draw) is not modelled: `gfx-col`, `gfx-app-tricol` FAIL.
+- A kext that links IOGraphicsFamily/IOAcceleratorFamily2 does not load when OpenCore injects it (those families are in
+  `BaseSystemKernelExtensions.kc`, not in the boot KC), see `docs/metal-spike.md`.
+
 ## Pitfalls met
 
 - `pkill -f monitor.sock` kills the shell that runs it if its own command line contains the
