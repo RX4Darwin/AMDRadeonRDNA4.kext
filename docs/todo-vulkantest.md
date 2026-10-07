@@ -504,55 +504,80 @@ at the same time.
 
 ## A shader that faults
 
-Written 2026-10-07 on the assumption that a Vulkan program whose shader touches an address nothing is mapped at
-hangs the graphics ring until its work counts as lost after ten seconds. **The first run says that assumption was
-wrong.**
+Written 2026-10-07. **Not answered yet**: the two runs so far tested something else than they said.
 
-### First run 2026-10-07 (kext `68A68C07`): no hang at all
+### What the first two runs really tested
 
-`vkfault.txt`, `vkprobe-8.txt`, log `rdna4fb-diag-20261007-162610`. `vkprobe <lib> fault` made a compute shader fill a
-buffer whose memory had been freed and unmapped (the host run with call tracing shows the unmap and the free before
-the submission), and:
+`vkprobe`'s buffer is in system memory (`buffer memory: type 2 (flags 0x6) of heap 1`), and there RADV does fills and
+copies of up to 64 KiB with the command processor's own copy engine, not with a compute shader
+(`radv_prefer_compute_or_cp_dma`, `RADV_BUFFER_OPS_GTT_CP_DMA_MAX_BYTES`). The "compute shader" fill of 61440 bytes
+was under that limit. So:
 
-```
-fault: submit -> 0, wait -> 0 after 0.001 s: THE WORK FINISHED (no fault was produced?)
-```
+- the fill "by a compute shader" that `vkprobe` has reported since 2026-10-06 was the command processor's. **No
+  compute shader of the driver's has run on the card.** The triangle's vertex and fragment shaders have. The places
+  that said otherwise are corrected (`docs/vulkan-port.md` section 9, the README, `vulkan/README.md`,
+  `docs/metal-readiness.md`).
+- the `fault` runs made the **command processor** write to and read from unmapped memory, not a shader.
 
-The work finished in a millisecond, the next `vkprobe` passed, and no `vulkan:` line about lost work is in the log. So
-on the graphics ring a shader's access to an unmapped address does not stop the work. That is how it is under Linux
-too, where such a fault is logged and the program carries on with a spare page. It is **not** how the runtime's
-compute queues behave on this card, where the same kind of access hangs the waves (`docs/vm-client-rootcause.md`
-sections 13 to 19); why the two differ is not known.
+What those runs do show, for the command processor:
 
-Nothing of that kext's new code ran. It made a fault end the client's work at once, which would have been wrong
-here (work that finishes by itself would have been reported lost), and it tried three register sequences to get a
-hung ring back, which could not be tested without a hang. **Both are taken out again** (kext `D0AEF75D`). What stays:
-when work really makes no progress for ten seconds, the ring's state goes into the log before the ring is shut.
+- **First run** (kext `68A68C07`, `vkfault.txt`): a fill into freed, unmapped memory finished in 1 ms; the next
+  `vkprobe`, 12.6 s later, passed.
+- **Second run** (kext `D0AEF75D`, `vkfault-2.txt`, `vkprobe-9.txt`): the fill finished, a copy out of the freed memory
+  finished too and left its destination as it was (`brought back 0x0badf00d`). **The next `vkprobe`, 2.9 s later,
+  had both its fills not done** (`NOT FILLED (dword 0 is 0x11111111 ...)`), while its triangle and its five seconds
+  of frames were right. Work that reports finished and was not done is worse than a hang; what causes it is not
+  known. Between the two runs differ: the copy, the time to the next program, and the kext (the first cleared the
+  hub's fault entry before every submission).
 
-### Next run: where the accesses go
+The kext of the first run made a fault end the client's work at once and tried register sequences to get a hung
+ring back. Neither ran, neither had a hang to be tested on, and both are out again (`D0AEF75D`): first the failure
+has to be seen.
 
-`vkprobe`'s `fault` mode now does two things through the freed buffer, a fill into it and a copy out of it into a
-good one, and prints what the copy brought back. New kext and new `build/vkprobe`; same boot:
+### Next run: real shaders, and what happens to the work after a fault
+
+New `build/vkprobe` only; the kext stays `D0AEF75D`. Its buffer is now 256 KiB, the second fill 252 KiB, which is a
+compute shader (the driver sets one up before it: seen in the host run's call trace). `fault` now runs, in one
+program: fills of good memory (one by the command processor, one by a shader), a shader's fill into freed memory,
+the good fills again, a shader's copy out of freed memory, and the good fills again at once and 10 ms, 100 ms, 1 s
+and 3 s later. Same boot:
 
 ```
 rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
+```
+
+First the plain run, since the compute shader in it is new on the card:
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
 ```
 
 ```bash
 sudo ./vkprobe ./libvulkan_radeon.dylib fault > vkfault.txt 2>&1
 ```
 
+and right after it, without waiting, the plain run again:
+
 ```bash
-sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
+sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe2.txt 2>&1
 ```
 
-Expected in `vkfault.txt`: both `the work finished`, then `the copy brought back 0xdeadbeef ... 0xdeadbeef` if writes
-and reads both go to the hub's spare page (the fill's value, read back through an address that is not mapped), and
-`neither stopped the device: ok`. Any other value is worth knowing too. Then `vkprobe.txt` ends `done: all ok`. The
-diagnostic script is not needed unless one of the two does not behave so.
+```bash
+sudo bash diagnostic-log.sh
+```
 
-If the copy does bring back the fill's value, one program can leave data in the spare page for the next one that
-faults to read. The runtime scrubs that page after a fault (`scrubFaultPage`); the Vulkan interface does not yet.
+What can happen, all of it worth having:
+
+- The first plain run: `fill by a compute shader, 258048 bytes: ok` or not. If it is not ok or the program stops
+  there for ten seconds, send what there is and skip the rest: the driver's compute shaders then do not run on this
+  ring yet, which is its own item.
+- `fault`: every line says whether the work finished and whether the good fills after it were done. If a shader's
+  fault hangs the ring as it hangs the runtime's compute queues, the step stops for ten seconds and says `THE
+  DEVICE IS LOST`; the kernel log then has `work on the graphics queue did not finish in 10 s (...)` with the ring's
+  state, the ring is shut until the reboot, and the plain run after it fails at its first submission.
+- The plain run after it: whether its fills are done.
+
+Report the three text files and the log.
 
 ## After the tests
 

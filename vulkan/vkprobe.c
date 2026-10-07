@@ -74,27 +74,32 @@ int main(int argc, char **argv) {
 	D(vkCmdBindPipeline) D(vkCmdSetViewport) D(vkCmdSetScissor) D(vkCmdDraw) D(vkCmdCopyImageToBuffer) D(vkDestroyPipeline)
 	D(vkDestroyPipelineLayout) D(vkDestroyShaderModule) D(vkDestroyImageView) D(vkDestroyImage)
 	VkQueue q; vkGetDeviceQueue(dev, fam, 0, &q);
-	VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, 1 << 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+	enum { kBytes = 1 << 18 };
+	VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, kBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT };
 	VkBuffer buf; OK(vkCreateBuffer(dev, &bci, 0, &buf));
 	VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, buf, &mr);
 	uint32_t type = 0;
 	for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
 		if ((mr.memoryTypeBits >> i & 1) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { type = i; break; }
 	VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size, type };
+	printf("buffer memory: type %u (flags 0x%x) of heap %u (flags 0x%x)\n", type, mp.memoryTypes[type].propertyFlags,
+	       mp.memoryTypes[type].heapIndex, mp.memoryHeaps[mp.memoryTypes[type].heapIndex].flags);
 	VkDeviceMemory mem; OK(vkAllocateMemory(dev, &mai, 0, &mem));
 	OK(vkBindBufferMemory(dev, buf, mem, 0));
 	void *p = 0; OK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &p));
-	memset(p, 0x11, 1 << 16);
+	memset(p, 0x11, kBytes);
 	VkCommandPoolCreateInfo cpi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, 0, 0, fam };
 	VkCommandPool pool; OK(vkCreateCommandPool(dev, &cpi, 0, &pool));
 	VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 3 };
 	VkCommandBuffer cb[3]; OK(vkAllocateCommandBuffers(dev, &cai, cb));
 	VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
 	VkFence fence; OK(vkCreateFence(dev, &fci, 0, &fence));
-	/* Two kinds of GPU work, the simpler first: RADV fills under 4 KiB with the command processor's own copy
-	 * (no shader), anything larger with a compute shader. */
+	/* Two kinds of GPU work, the simpler first: RADV fills under 4 KiB with the command processor's own copy (no
+	 * shader), and larger ones with a compute shader; but in system memory, which this buffer is in, only above
+	 * 64 KiB (radv_prefer_compute_or_cp_dma, RADV_BUFFER_OPS_GTT_CP_DMA_MAX_BYTES). Until 2026-10-07 the second
+	 * fill here was 61440 bytes, so it too was the command processor's, whatever this program called it. */
 	const struct { VkDeviceSize offset, size; uint32_t value; const char *by; } fills[2] = {
-		{ 0, 1024, 0xcafef00d, "the command processor" }, { 4096, (1 << 16) - 4096, 0x0badf00d, "a compute shader" } };
+		{ 0, 1024, 0xcafef00d, "the command processor" }, { 4096, kBytes - 4096, 0x0badf00d, "a compute shader" } };
 	int wrong = 0;
 	for (int f = 0; f < 2; f++) {
 		VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -119,11 +124,14 @@ int main(int argc, char **argv) {
 	printf("the bytes between the two fills: %s\n", untouched ? "untouched, ok" : "CHANGED");
 	wrong += !untouched;
 
-	/* "fault": work that touches memory which is not there. A fill into, then a copy out of, a second buffer whose
-	 * memory is freed between recording and submitting. Not valid Vulkan, on purpose: it is what a wrong program
-	 * does. On the card (2026-10-07) such work is not stopped: the card sends the access to a spare page and the
-	 * work finishes, as under Linux, where the fault is only logged. So both are expected to finish, and what the
-	 * copy brings back says where the accesses went (the fill's own value: the same spare page). Ends here. */
+	/* "fault": work that touches memory which is not there, and what it does to the work after it. A second buffer
+	 * whose memory is freed between recording and submitting (not valid Vulkan, on purpose: it is what a wrong
+	 * program does); a fill into it, then a copy out of it into the good buffer. After each, fills of the good
+	 * buffer, a small one and a large one, which have to land.
+	 * What is known from the card (2026-10-07) is only about the command processor's own fill and copy, which the
+	 * first two versions of this used without meaning to: neither stops the device, and the run after one with the
+	 * copy found its first two fills not done. Now the fill and the copy are large enough to be shaders, and the
+	 * fills after them say whether later work is lost, and for how long. Ends here. */
 	if (argc > 2 && !strcmp(argv[2], "fault")) {
 		D(vkCmdCopyBuffer)
 		VkBufferCreateInfo gci = bci;
@@ -131,41 +139,68 @@ int main(int argc, char **argv) {
 		VkBuffer gone; OK(vkCreateBuffer(dev, &gci, 0, &gone));
 		VkDeviceMemory gmem; OK(vkAllocateMemory(dev, &mai, 0, &gmem));
 		OK(vkBindBufferMemory(dev, gone, gmem, 0));
+		/* The steps, all recorded before the memory goes. A probe: 1024 bytes at 0 (the command processor) and 128 KiB at 8192
+		 * (a compute shader), each step's own value. The fill and the copy through the freed buffer are large: shaders. */
+		enum { kFillGone, kCopyGone, kProbe };
+		static const struct { int kind; long sleepMs; const char *what; } steps[] = {
+			{ kProbe, 0, "before anything" }, { kFillGone, 0, "a shader's fill into memory that is gone" }, { kProbe, 0, "right after it" },
+			{ kCopyGone, 0, "a shader's copy out of memory that is gone" }, { kProbe, 0, "right after it" }, { kProbe, 10, "10 ms later" },
+			{ kProbe, 100, "100 ms later" }, { kProbe, 1000, "1 s later" }, { kProbe, 3000, "3 s later" } };
+		enum { kSteps = sizeof(steps) / sizeof(steps[0]) };
 		VkCommandBufferAllocateInfo gai = cai;
-		gai.commandBufferCount = 2;
-		VkCommandBuffer gcb[2]; OK(vkAllocateCommandBuffers(dev, &gai, gcb));
-		VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-		const VkBufferCopy region = { 4096, 4096, (1 << 16) - 4096 };
-		OK(vkBeginCommandBuffer(gcb[0], &bi));
-		vkCmdFillBuffer(gcb[0], gone, region.srcOffset, region.size, 0xdeadbeef);
-		OK(vkEndCommandBuffer(gcb[0]));
-		OK(vkBeginCommandBuffer(gcb[1], &bi));
-		vkCmdCopyBuffer(gcb[1], gone, buf, 1, &region);
-		OK(vkEndCommandBuffer(gcb[1]));
+		gai.commandBufferCount = kSteps;
+		VkCommandBuffer gcb[kSteps]; OK(vkAllocateCommandBuffers(dev, &gai, gcb));
+		const VkBufferCopy region = { 4096, 4096, kBytes - 4096 };
+		for (int i = 0; i < kSteps; i++) {
+			VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+			if (vkBeginCommandBuffer(gcb[i], &bi) < 0) return 1;
+			if (steps[i].kind == kFillGone)
+				vkCmdFillBuffer(gcb[i], gone, region.srcOffset, region.size, 0xdeadbeef);
+			else if (steps[i].kind == kCopyGone)
+				vkCmdCopyBuffer(gcb[i], gone, buf, 1, &region);
+			else {
+				vkCmdFillBuffer(gcb[i], buf, 0, 1024, 0x51000000u + (uint32_t)i);
+				vkCmdFillBuffer(gcb[i], buf, 8192, 1 << 17, 0x52000000u + (uint32_t)i);
+			}
+			if (vkEndCommandBuffer(gcb[i]) < 0) return 1;
+		}
 		vkFreeMemory(dev, gmem, 0);
-		static const char *const what[2] = { "a fill into", "a copy out of" };
-		int finished = 0;
-		for (int i = 0; i < 2; i++) {
+		const uint32_t *d = (const uint32_t *)p;
+		int bad = 0;
+		for (int i = 0; i < kSteps; i++) {
+			if (steps[i].sleepMs) {
+				const struct timespec nap = { steps[i].sleepMs / 1000, steps[i].sleepMs % 1000 * 1000000L };
+				nanosleep(&nap, 0);
+			}
 			VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &gcb[i] };
 			struct timespec t0, t1;
 			clock_gettime(CLOCK_MONOTONIC, &t0);
 			const VkResult submitted = vkQueueSubmit(q, 1, &si, fence);
 			const VkResult waited = submitted < 0 ? submitted : vkWaitForFences(dev, 1, &fence, VK_TRUE, 15000000000ull);
 			clock_gettime(CLOCK_MONOTONIC, &t1);
-			printf("fault: %s memory that is gone: submit -> %d, wait -> %d after %.3f s: %s\n", what[i], submitted, waited,
-			       (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9,
-			       waited == VK_SUCCESS ? "the work finished" : waited == VK_ERROR_DEVICE_LOST ? "THE DEVICE IS LOST" : "NOT FINISHED");
-			if (waited != VK_SUCCESS)
+			const double seconds = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+			if (waited != VK_SUCCESS) {
+				printf("fault: %s: submit -> %d, wait -> %d after %.3f s: %s\n", steps[i].what, submitted, waited, seconds,
+				       waited == VK_ERROR_DEVICE_LOST ? "THE DEVICE IS LOST" : "NOT FINISHED");
+				bad++;
 				break;
-			finished++;
+			}
 			vkResetFences(dev, 1, &fence);
+			if (steps[i].kind == kProbe) {
+				const int small = d[0] == 0x51000000u + (uint32_t)i && d[255] == 0x51000000u + (uint32_t)i;
+				const int large = d[2048] == 0x52000000u + (uint32_t)i && d[2048 + (1 << 15) - 1] == 0x52000000u + (uint32_t)i;
+				printf("fault:   fills of good memory, %s: the command processor's %s, the shader's %s\n", steps[i].what,
+				       small ? "ok" : "NOT DONE", large ? "ok" : "NOT DONE");
+				bad += !small + !large;
+			} else if (steps[i].kind == kCopyGone)
+				printf("fault: %s: finished in %.3f s; it brought back 0x%08x ... 0x%08x (the fill wrote 0xdeadbeef, the buffer held "
+				       "0x%08x there)\n", steps[i].what, seconds, d[1024], d[kBytes / 4 - 1], 0x0badf00d);
+			else
+				printf("fault: %s: finished in %.3f s\n", steps[i].what, seconds);
 		}
-		const uint32_t *d = (const uint32_t *)((const char *)p + 4096);
-		printf("fault: the copy brought back 0x%08x ... 0x%08x (the fill wrote 0xdeadbeef; the buffer held 0x0badf00d)\n", d[0],
-		       d[region.size / 4 - 1]);
-		printf("fault: %s\n", finished == 2 ? "neither stopped the device: ok" : "FAILED");
+		printf("fault: %s\n", bad ? "FAILED: work after the faults was not done" : "nothing after the faults was lost: ok");
 		fflush(stdout);
-		_Exit(finished == 2 ? 0 : 1);
+		_Exit(bad ? 1 : 0);
 	}
 
 	/* A picture: a red triangle over the upper-left half of a 64x64 image cleared to blue, drawn with two

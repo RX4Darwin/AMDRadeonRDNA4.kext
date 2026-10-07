@@ -73,8 +73,8 @@ the one this section describes as failing:
 - **card**: address space 8, its context registers set over MMIO (`vmContextInit`), a four-level table written by the CPU
   through the BAR, and work in it from kernel queues that stay in address space 0, the address space named in the packet:
   the copy engine (`INDIRECT` with VMID 8, three copies between VRAM and system memory) and the graphics ring
-  (`INDIRECT_BUFFER` with VMID 8). On the ring, Mesa's RADV ran fills, a compute shader, and a draw with a vertex and a
-  fragment shader, and showed frames through `Flip::flipTo`. `docs/vulkan-port.md` sections 8 to 10 have the logs.
+  (`INDIRECT_BUFFER` with VMID 8). On the ring, Mesa's RADV ran fills (by the command processor; not a compute shader, as
+  was written here until 2026-10-07) and a draw with a vertex and a fragment shader, and showed frames through `Flip::flipTo`. `docs/vulkan-port.md` sections 8 to 10 have the logs.
 - In none of those boots was a queue ever built **inside** a non-zero address space; `rdna4-vm` was not set, so neither
   the boot self-test nor a client queue ran. That is the one thing every failing boot of rounds 2 to 6 did and these did
   not. It is a correlation, not a root cause: `docs/vm-client-rootcause.md` section 11.

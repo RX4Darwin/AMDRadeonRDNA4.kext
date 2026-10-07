@@ -25,8 +25,9 @@ the part of Linux's amdgpu ioctls RADV uses (buffers, address-space mapping, con
 fences) plus calls to present to the screen.
 
 **Status: the driver runs against this kext on the card and shows a picture.** On 2026-10-06 (Big Sur 11.6.6)
-it found the interface, created its device, ran two fills of a buffer (one by the command processor, one by a
-compute shader it compiled), rendered a triangle into an image and read it back right, and with `vkprobe ... show`
+it found the interface, created its device, ran two fills of a buffer (both by the command processor; the second
+was taken for a compute shader's until 2026-10-07, see `docs/vulkan-port.md` section 9), rendered a triangle into an
+image with a vertex and a fragment shader it compiled and read it back right, and with `vkprobe ... show`
 put a moving triangle on the boot display for five seconds at 60 frames a second, the desktop back afterwards.
 There is no Vulkan window-system layer: a program presents through the six functions the driver exports
 (`radv_darwin_scanout_*`). `docs/vulkan-port.md` has what the port needs from the kext, the order of work and

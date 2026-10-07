@@ -74,8 +74,9 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
    connection to the kext: section 8, **verified on the card 2026-10-06**: `build/n48nprobe` says "all ok", which
    includes a pattern the GPU's copy engine carried between three buffers at addresses the process chose.
 2. **Submit and wait** on the graphics queue in the client's address space, section 9. **Done on the card
-   2026-10-06: `vkprobe` said "done: all ok"** for a fill by the command processor, one by a compute shader, and
-   a triangle rendered into an image and read back with exactly the right pixels (`docs/todo-vulkantest.md`).
+   2026-10-06: `vkprobe` said "done: all ok"** for two fills by the command processor (the second was taken for a
+   compute shader's until 2026-10-07, section 9) and a triangle rendered into an image and read back with exactly
+   the right pixels (`docs/todo-vulkantest.md`).
    This was the step that met the open blocker.
 3. **Present** through the flip path, section 10. **Done on the card 2026-10-06**: `vkprobe ... show` put a moving
    triangle on the boot display for five seconds, 60 frames a second, and the desktop came back.
@@ -268,9 +269,9 @@ closes with nothing left behind. `vulkan/vkprobe.c` checks two fills, which only
 
 **On the card, 2026-10-06** (the boot of section 8; `vkprobe.txt`, no kernel log taken after it): the driver
 opened the interface, created its device and submitted twice; a 1024-byte fill by the command processor's own
-copy and a 61440-byte fill by a compute shader both came out right, the bytes between them untouched. So this
+copy and a 61440-byte fill both came out right, the bytes between them untouched. So this
 kext's graphics ring, programmed directly and without the firmware scheduler, runs the driver's command buffers
-in another address space, a shader the driver compiled included. That is what `docs/metal-readiness.md` section 4
+in another address space. (Correction 2026-10-07: the second fill was not a compute shader. The buffer is in system memory, where RADV fills up to 64 KiB with the command processor too; `vkprobe` called it a shader's by mistake, and so did this section. No compute shader of the driver's has run on the card yet; the triangle's vertex and fragment shaders have.) With the triangle later that day, shaders the driver compiled are included. That is what `docs/metal-readiness.md` section 4
 names as the open blocker, met by another route than the one that failed there: the kernel's own ring with the
 address space in the packet, not a queue per client.
 
