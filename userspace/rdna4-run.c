@@ -462,12 +462,18 @@ static int testVmIsolationAndPeers(rdna4_t *a) {
 		const uint32_t groups[3] = { 1, 1, 1 }, size[3] = { 256, 1, 1 };
 		kr = rdna4_dispatch(&b, &copy, groups, size, args, sizeof(args), 2000, NULL);
 	}
+	/* B's read of A's VA must fault. On the card a fault ends the job: the kext
+	 * resets the queue and says so (kIOReturnVMError), which is the expected
+	 * outcome here. The emulator answers the read from the fault-default page
+	 * and lets the job finish. Either way the property is "none of A's data
+	 * in B's buffer", not "all zero". */
+	const int stopped = kr == kIOReturnVMError;
+	if (stopped)
+		kr = 0;
 	if (kr || (kr = rdna4_read(&b, &bDst, 0, dst, sizeof(dst)))) {
 		printf("  FAIL  VM isolation dispatch: %s\n", rdna4_error(kr));
 		fails++;
 	} else {
-		/* B's read of A's VA must fault. A fault reads the GPU's fault-default
-		 * page, so the property is "none of A's data", not "all zero". */
 		uint32_t leaked = 0, other = 0;
 		for (uint32_t i = 0; i < 1024; i++) {
 			if (dst[i] == src[i])
@@ -479,6 +485,8 @@ static int testVmIsolationAndPeers(rdna4_t *a) {
 		printf("  %s  VM isolation: client B could not read client A's VA", leaked ? "FAIL" : "ok");
 		if (leaked || other)
 			printf(" (%u of A's words seen, %u other non-zero words)", leaked, other);
+		if (stopped)
+			printf(" (the job faulted and was stopped)");
 		printf("\n");
 	}
 

@@ -120,9 +120,12 @@ void RDNA4Compute::sharedStopAll(const char *why) {
 	sharedInit = false;
 }
 
-// The W6 sequence for a shared queue after a job timed out: RESET_WAVES dequeue, SQ_CMD kill of the GUILTY client's VMID only (CHECK_VMID), the
-// same HQD registers again (VMID 0, the same ring), a fenced WRITE_DATA proof. Other clients' jobs queued behind the hung one are lost with the
-// ring; their waits time out and recover in turn (documented: first version fails innocents rather than re-emitting them).
+// A shared queue after a job that did not finish, as amdgpu resets a compute queue over MMIO on this chip (mes_v12_0_reset_queue_mmio, its
+// AMDGPU_RING_TYPE_COMPUTE branch, which needs no firmware scheduler): inside RLC safe mode, the queue selected, CP_HQD_DEQUEUE_REQUEST = 2
+// and SPI_COMPUTE_QUEUE_RESET = 1, then wait for the queue to go inactive. Then the same HQD registers again (VMID 0, the same ring) and a
+// fenced WRITE_DATA proof. Until 2026-10-07 this killed the guilty VMID's waves with SQ_CMD instead of the SPI reset; on the card the queue
+// then dequeued and came up again, and its first packet never ran (docs/vm-client-rootcause.md sections 12 to 16). Other clients' jobs queued
+// behind the dead one are lost with the ring; their waits time out and recover in turn.
 bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const char *tag) {
 	SharedQueue &s = sharedQ[k];
 	if (!hangRecoveryEnabled) {
@@ -132,9 +135,10 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 	}
 	SLOG("%s: recovering shared queue %u (guilty VMID %u) without a GPU reset", tag, k, guiltyVmid);
 	logComputeQueueState(tag, s.pipe, s.queue, 0);
+	const bool safe = rlcSafeMode(true);
 	grbmSelect(1, s.pipe, s.queue, 0);
 	wr(IpDiscovery::HwGc, CpHqdDequeueReq, 2);   // RESET_WAVES
-	wr(IpDiscovery::HwGc, SqCmd, 3u | (1u << 4) | (1u << 7) | ((guiltyVmid & 0xf) << 28));
+	wr(IpDiscovery::HwGc, SpiComputeQueueReset, 1);
 	bool inactive = false;
 	for (uint32_t us = 0; us < 100000 && !inactive; us += 10) {
 		inactive = !(rdGc(CpHqdActive) & 1);
@@ -143,6 +147,9 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 	}
 	wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
 	grbmSelect(0, 0, 0, 0);
+	rlcSafeMode(false);
+	SLOG("%s: shared queue %u reset (RLC safe mode %s): %s", tag, k, safe ? "acknowledged" : "NOT acknowledged",
+	     inactive ? "inactive" : "still ACTIVE");
 	if (!inactive) {
 		SLOG("%s: shared queue %u did not dequeue; wedged", tag, k);
 		s.wedged = true;

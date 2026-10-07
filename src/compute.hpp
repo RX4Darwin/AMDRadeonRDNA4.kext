@@ -744,7 +744,6 @@ private:
 	struct SparseTables {
 		PtPages::Sparse s;
 	};
-	static constexpr uint32_t kFaultRedirects = 96;        // pages one job may fault on and still finish
 	struct RtClient {
 		const void *owner { nullptr };
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
@@ -774,10 +773,6 @@ private:
 		uint32_t gfxOutstanding { 0 };
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
-		// Pages of this address space that hold the dummy page while a job runs, because a shader touched them
-		// unmapped (vmRedirectFault); taken out again when the job is over.
-		uint64_t faultVa[kFaultRedirects] {};
-		uint32_t faultCount { 0 };
 		bool active { false };
 		bool aborted { false };
 	};
@@ -860,6 +855,7 @@ private:
 	volatile uint32_t sleepRequested { 0 };
 	bool     sleepAbortOn { true };
 	bool     waitAborted { false };            // the last wait ended because of sleepRequested (rtLock held by the waiter)
+	bool     waitFaulted { false };            // the last wait ended because the job faulted (vmJobFaulted)
 	bool     sleepAbortWanted() const { return sleepAbortOn && __atomic_load_n(&sleepRequested, __ATOMIC_ACQUIRE) != 0; }
 	void     powerSleepClear();                // the wake finished (or was cancelled)
 	void     gfxSleepDrain();                  // powerWillSleep, rtLock held: wait <= 100 ms for client gfx IBs, then drop them (no wedge)
@@ -1025,8 +1021,7 @@ private:
 	IODMACommand  *faultPageDma { nullptr };
 	uint64_t       faultPageBus { 0 };
 	void faultPageToSystem();
-	bool vmRedirectFault();            // a client's shader waits on an unmapped page: the dummy page goes there
-	void vmEndRedirects();             // the job is over: every such page is unmapped again
+	bool vmJobFaulted(uint32_t vmid);  // the hub has latched a fault for this address space: its job is dead
 	void dmaTeardown(const char *why);
 	void devHeapInit();
 	bool sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeoutMs);

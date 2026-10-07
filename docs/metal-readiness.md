@@ -85,9 +85,11 @@ the one this section describes as failing:
   queue runs a command buffer in the address space its packet names), the graphics-ring client self-test passes, a
   compute kernel runs in a client's address space on the shared queue (`rdna4-run`'s zero-copy vadd), and the GPU is
   not pinned at idle. **Still failing**: a job whose shader faults never finishes and its queue cannot be recovered, so
-  the two deliberate-fault tests of the self-test hang and take the rest with them. Setting the fault default page up
-  as Linux does changed nothing (card, second run). Answering the fault as amdgpu does, by mapping a dummy page at the
-  faulting address, is **code, not run** (`docs/vm-client-rootcause.md` section 13, `docs/todo-vmtest.md`).
+  the two deliberate-fault tests of the self-test hang and take the rest with them. Nothing lets such a job finish on
+  the card (three attempts, `docs/vm-client-rootcause.md` sections 13 to 16); a fault ends the job, as under Linux.
+  The queue's recovery now uses amdgpu's MMIO reset for a compute queue (`SPI_COMPUTE_QUEUE_RESET`), which this
+  document's "no per-queue reset without MES" did not know of: **code, not run** (`docs/todo-vmtest.md`). amdgpu has
+  the same kind of reset for the graphics ring and the copy engine; neither is used here yet.
 
 The table in section 1 and the text below are as written on 2026-09-30.
 

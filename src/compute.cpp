@@ -3264,16 +3264,14 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 			}
 			if (polls < 200)
 				IODelay(10);
-			else {
-				if (vm)
-					(void)vmRedirectFault();   // a shader waiting on an unmapped page gets the dummy page (runtime.cpp)
+			else if (vm && vmJobFaulted(l.vmid)) {       // its job is dead: no point in the rest of the timeout (runtime.cpp)
+				waitFaulted = true;
+				break;
+			} else
 				IOSleep(1);
-			}
 		}
 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	}
-	if (vm)
-		vmEndRedirects();
 	if (!done && waitAborted) {
 		CLOG("%s: dispatch wait aborted: a sleep was requested (no timeout, no recovery)", tag);
 		return false;

@@ -374,3 +374,52 @@ tables there is no S-A and clients run.
 
 **The change**: the bit is 8 (`kVmCtxRetryFault`), kext rebuilt. H13 is now what the next run tests.
 
+## 16. 2026-10-07, fifth run: H13 is out too. A fault ends the job; the question was always the reset
+
+Log `rdna4fb-diag-20261007-134456`, kext `E71A9E01` (the retry bit at bit 8, the redirect in place). [M]:
+
+- The results of sections 12 and 13 are back: `boot test ... PASS` (1026 us a job), `gfx-client PASS`, idle 3 % / 18 W.
+- The fault tests: exactly as the third run. `a shader touched 0x100030000 ...` 5.8 ms after the load, then two seconds of
+  nothing; one page of 64 in the write test.
+
+So with the retry bit set as well, nothing tries the access again. **H13 is refuted.** Three ways of letting a faulting
+job finish (the default page as Linux has it, a page-table entry at the address, the retry bit) have each run on the
+card and none did anything. On this card, as set up here and as amdgpu sets it up, **a shader fault ends its job**. The
+self-test's expectation that the job finishes comes from the emulator, which answers the access from the default page.
+
+What amdgpu does with such a job is reset the queue, and on this chip it has a reset that needs no firmware scheduler,
+which this repository's notes say does not exist ("no source-backed no-MES queue reset"). `mes_v12_0_reset_queue_mmio`
+(`mes_v12_0.c`, read 2026-10-07), inside RLC safe mode:
+
+| Queue | What it writes |
+|---|---|
+| compute | the queue selected; `CP_HQD_DEQUEUE_REQUEST` = 2; **`SPI_COMPUTE_QUEUE_RESET` = 1**; wait for `CP_HQD_ACTIVE` bit 0 to clear |
+| graphics | `GRBM_GFX_INDEX` to broadcast; `CP_VMID_RESET` with `RESET_REQUEST` = 1 << vmid and the pipe's queue bit; wait for `CP_GFX_HQD_ACTIVE` |
+| copy engine | `SDMA0_QUEUE_RESET_REQ` = 1 << queue; wait for the bit to clear |
+
+`recoverSharedQueue` did the first with `SQ_CMD` (kill the guilty address space's waves) where Linux has the SPI reset,
+and outside safe mode. On the card the queue dequeued and came up again and its first packet never ran: the waves of the
+dead job were still there. Register addresses from `gc_12_0_0_offset.h`: `SPI_COMPUTE_QUEUE_RESET` 0x1f73, `CP_VMID_RESET`
+0x1e53, `SDMA0_QUEUE_RESET_REQ` 0x006c, all BASE_IDX 0 (the same header gives 0x1fc1, 0x1fab and 0x111b for the three
+registers this kext already had, which agree).
+
+**The change** (`devel/address-space`, compile-checked):
+
+- **Out**: `vmRedirectFault` / `vmEndRedirects` and the retry bit. The fault page in system memory stays (it is Linux's
+  setting and does no harm).
+- **`recoverSharedQueue`** is amdgpu's compute-queue reset: safe mode, `CP_HQD_DEQUEUE_REQUEST` = 2,
+  `SPI_COMPUTE_QUEUE_RESET` = 1, wait, safe mode off; then the HQD again and the WRITE_DATA proof, as before.
+- **`vmJobFaulted`**: the polled waits for a client's job stop as soon as the hub has latched a fault for the client's
+  address space (after their first 2 ms), instead of running out the timeout. The queue is reset and the call answers
+  `kIOReturnVMError`, not a timeout.
+- **`rdna4-run`**'s isolation test takes that answer as what it is, the expected outcome, and still checks that none of
+  the other client's data arrived. The freed-buffer test already accepted any answer but a timeout.
+
+**H14**: with the SPI reset the queue runs again after a dead job, so a fault costs the faulting client its job and
+nobody else anything. What the next run shows: `vmshared: runtime: shared queue N reset (RLC safe mode acknowledged):
+inactive`, then `shared queue N recovered (WRITE_DATA proof landed)`.
+
+**For later, not done here**: the graphics ring and the copy engine have the same hole. Lost work on the graphics ring
+halts it until the next boot (`gfxClientWedge`, also the Vulkan interface's lost-work rule), and a copy that does not
+finish leaves the copy engine stopped. Linux's two other branches above are the way out of both.
+

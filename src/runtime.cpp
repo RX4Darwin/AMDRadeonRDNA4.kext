@@ -781,23 +781,10 @@ bool RDNA4Compute::vmContextInit(RtClient &c) {
 	// W42 (Linux ground truth): GCVM_CONTEXT1..15_CNTL read 0x03fffc07 under amdgpu: the fault-enable defaults are bits 10..25 (16 bits;
 	// the header names only 10..23, bits 24-25 are reset defaults Linux keeps through its read-modify-write). Ours wrote 0x00fffc07.
 	const uint32_t faultDefaults = ((1u << 16) - 1) << 10;
-	uint32_t cntl = kVmCtxEnable | (GpuVm::kDepth << 1) |
+	// GC 12's layout: enable 0, depth [2:1], block size [7:4], RETRY_PERMISSION_OR_INVALID_PAGE_FAULT 8 (left 0, as
+	// amdgpu has it on this card: a fault is final), the fault enables from 10 (gc_12_0_0_sh_mask.h).
+	const uint32_t cntl = kVmCtxEnable | (GpuVm::kDepth << 1) |
 		((GpuVm::kBlockSize - 9) << 4) | faultDefaults;
-	// RETRY_PERMISSION_OR_INVALID_PAGE_FAULT is bit 8 on GC 12 (gc_12_0_0_sh_mask.h: the block size is [7:4], the
-	// depth [2:1]; on older hubs the block size is [6:3] and this bit is 7, which is what a first version of this
-	// set: it made the block size 8, the walker then failed on every valid page, and the boot test hung with the
-	// GPU pinned, 2026-10-07, fourth run). amdgpu leaves the bit 0 on this card, and so did this: a fault is
-	// then final. On the card the faulting job was dead from that moment: with the dummy page mapped at the address
-	// 6 ms later, nothing tried the access again and nothing else faulted (2026-10-07, third run,
-	// docs/vm-client-rootcause.md section 14). Linux gets out of that with a queue reset through the firmware
-	// scheduler, which is not here. With the bit set the access is tried again until the page is there, which is
-	// what vmRedirectFault needs to be of any use. Only for the runtime's own clients (rdna4-vm); rdna4-vmretry=0
-	// gives the old value.
-	uint32_t retry = 1;
-	(void)PE_parse_boot_argn("rdna4-vmretry", &retry, sizeof(retry));
-	constexpr uint32_t kVmCtxRetryFault = 1u << 8;
-	if (vmEnabled && retry)
-		cntl |= kVmCtxRetryFault;
 	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + n }, cntl);
 	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtBaseLo.dword + 2 * n },
 	   static_cast<uint32_t>(GpuVm::encodePde(c.rootPhys, GpuVm::kValid, 0)));
@@ -1622,64 +1609,15 @@ void RDNA4Compute::scrubFaultPage() {
 		bzero(faultPage->getBytesNoCopy(), 0x1000);
 }
 
-// A shader that touches a page its address space does not map gets no error on this card: the access is tried
-// again until the page is there, and the job never ends (2026-10-07: both of rdna4-run's fault tests, with the
-// default page in VRAM and in system memory alike; docs/vm-client-rootcause.md section 13). amdgpu has the same
-// card behave: its fault handler maps its dummy page at the faulting address and the retry goes through
-// (amdgpu_vm_handle_fault: "Redirect the access to the dummy page"; without it, "Let the hw retry silently on the
-// PTE"). So does this, from the loops that wait for a client's job, which hold rtLock: if the hub has latched a
-// fault for a client's address space on a page with no translation, the fault page is mapped there, read and
-// write, and the address space's translation cache flushed. Not for the command processor's own fetches (clients
-// 4 to 6): a command stream read from the dummy page is not a stream. The pages are remembered and unmapped again
-// when the job is over (vmEndRedirects), and the dummy page is cleared then.
-//
-// ponytail: only the polled waits call this. With rdna4-ih the waits sleep in ihWaitFence, which cannot call it
-// (the table update runs the copy engine, whose wait takes the same lock); slice those waits if faults have to
-// be survived with interrupts on.
-bool RDNA4Compute::vmRedirectFault() {
-	if (!faultPageBus || !vmEnabled)
-		return false;
+// A fault in a client's address space ends the job that caused it. On this card nothing tries the access again:
+// not with the dummy page mapped at the address milliseconds later, and not with the context's retry bit set
+// (2026-10-07, docs/vm-client-rootcause.md sections 13 to 16). amdgpu sets the context up the same way ("no-retry
+// XNACK"), prints such a fault, and gets the queue back with a reset. So a wait for a client's job does not run
+// out its timeout once the hub has latched a fault for the client's address space: it ends there, the queue is
+// reset, and the client is told its job faulted (kIOReturnVMError), not that it timed out.
+bool RDNA4Compute::vmJobFaulted(uint32_t vmid) {
 	const uint32_t status = rdGc(GcL2FaultStatusLo);
-	const uint32_t vmid = (status >> 20) & 0xf, hubClient = (status >> 9) & 0x1ff;
-	constexpr uint32_t kMappingError = 1u << 8;
-	if (!status || status == 0xffffffffu || !vmid || !(status & kMappingError) || (hubClient >= 4 && hubClient <= 6))
-		return false;
-	RtClient *c = nullptr;
-	for (RtClient &k : clients)
-		if (k.active && !k.aborted && k.vmid == vmid && hasTables(k)) {
-			c = &k;
-			break;
-		}
-	if (!c)
-		return false;
-	const uint64_t va = gcFaultVa() & ~(GpuVm::kPageBytes - 1);
-	bool known = false;
-	for (uint32_t i = 0; i < c->faultCount; i++)
-		known |= c->faultVa[i] == va;
-	if (!known) {
-		if (c->faultCount >= kFaultRedirects || !vmMapHost(*c, va, &faultPageBus, GpuVm::kPageBytes, false))
-			return false;
-		c->faultVa[c->faultCount++] = va;
-		if (c->faultCount == 1)
-			RLOG("vmid %u: a shader touched 0x%llx, which is not mapped (fault status 0x%08x): the dummy page answers "
-			     "there until the job is over", vmid, va, status);
-	}
-	gcFaultClear();
-	(void)vmInvalidate(vmid, "fault redirect");
-	return true;
-}
-
-void RDNA4Compute::vmEndRedirects() {
-	for (RtClient &c : clients) {
-		if (!c.faultCount)
-			continue;
-		for (uint32_t i = 0; i < c.faultCount; i++)
-			vmUnmap(c, c.faultVa[i], GpuVm::kPageBytes);
-		RLOG("vmid %u: %u unmapped page(s) were answered from the dummy page during the job", c.vmid, c.faultCount);
-		c.faultCount = 0;
-		(void)vmInvalidateOwned(c, "fault redirect end");
-		scrubFaultPage();
-	}
+	return vmid && status && status != 0xffffffffu && ((status >> 20) & 0xf) == vmid;
 }
 
 // Where a faulting access goes. The hub's bring-up points the L2 fault default at a scratch page in VRAM, with
@@ -2763,6 +2701,7 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 		vmOpTrace("dispatch entry", l.vmid, l.pipe, l.queueId);
 	waitAborted = false;
 	const uint64_t ringBefore = qseq ? sharedQ[c->sq].pm.wptr() : 0;
+	waitFaulted = false;
 	const bool done = launch(l, "runtime", ns);
 	micros = ns / 1000;
 	if (qseq && sharedQ[c->sq].pm.wptr() > ringBefore) {
@@ -2784,12 +2723,15 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 		if (c)
 			c->ibOutstanding = 0;
 		if (c && c->shared) {
-			if (recoverSharedQueue(c->sq, c->vmid, "runtime")) {
+			const bool back = recoverSharedQueue(c->sq, c->vmid, "runtime");
+			if (waitFaulted)
+				RLOG("dispatch ended by a fault in address space %u after %llu us; shared queue %u %s", c->vmid, micros, c->sq,
+				     back ? "recovered without a GPU reset" : "recovery failed; that queue stays wedged");
+			else if (back)
 				RLOG("dispatch timed out after %u ms; shared queue recovered without a GPU reset", l.timeoutUs / 1000);
-			} else {
+			else
 				RLOG("dispatch timed out after %u ms: shared queue %u recovery failed; that queue stays wedged", l.timeoutUs / 1000, c->sq);
-			}
-			return kIOReturnTimeout;
+			return waitFaulted ? kIOReturnVMError : kIOReturnTimeout;
 		}
 		if (recoverComputeQueue("runtime", &l)) {
 			rtWedged = false;
@@ -2927,6 +2869,7 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 	const uint32_t waitMs = timeoutMs ? timeoutMs : 1000;
 	bool done = false;
 	waitAborted = false;
+	waitFaulted = false;
 	if (ihActive && c->pipe < 2) {
 		done = ihWaitFence(c->fenceCpu, fence, waitMs, true, "IB", ns);
 	} else {
@@ -2943,14 +2886,14 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 			}
 			if (polls < 200)
 				IODelay(10);
-			else {
-				(void)vmRedirectFault();
+			else if (vmJobFaulted(c->vmid)) {
+				waitFaulted = true;
+				break;
+			} else
 				IOSleep(1);
-			}
 		}
 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	}
-	vmEndRedirects();
 	if (done) {
 		retireIbFences(*c);
 		logClientFault(*c, "IB wait");
@@ -2972,9 +2915,9 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 			*c->fenceCpu = 0;
 			flushHdp();
 		}
-		RLOG("IB fence %u timed out after %u ms; shared queue %u %s", fence, waitMs, c->sq,
+		RLOG("IB fence %u %s; shared queue %u %s", fence, waitFaulted ? "not reached: the job faulted" : "timed out", c->sq,
 		     ok ? "recovered without a GPU reset" : "recovery failed; that queue stays wedged");
-		return kIOReturnTimeout;
+		return waitFaulted ? kIOReturnVMError : kIOReturnTimeout;
 	}
 	Launch l {};
 	l.queue = &c->pm4;
@@ -3133,13 +3076,10 @@ bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs
 		}
 		if (polls < 200)
 			IODelay(10);
-		else {
-			(void)vmRedirectFault();
+		else
 			IOSleep(1);
-		}
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
-	vmEndRedirects();
 	if (done) {
 		gfxClientRetire(c);
 		return true;
