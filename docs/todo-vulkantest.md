@@ -472,8 +472,21 @@ Logs `rdna4fb-diag-20261007-155046` (step 1) and `-155129` (step 2), `n48nprobe-
 
 **The change** (kext `DCD5BF79`, compile-checked): the recovery repeats the reset, up to four times, until a fence of
 its own comes through, and only then counts the queue as recovered (`waves reset N time(s) ...: it runs, its fences
-are through`). **Next run: both steps again.** Expected: all rows PASS in both; in step 2 the line for queue 0
-probably says `2 time(s)`.
+are through`).
+
+### Fifth run 2026-10-07 (kext `DCD5BF79`): both steps pass
+
+Logs `rdna4fb-diag-20261007-160112` (step 1) and `-160156` (step 2), `n48nprobe-2.txt`, `vkprobe-5.txt`, `vkprobe2-5.txt`.
+
+- **Step 1:** `n48nprobe` all ok, `vkprobe` 300 frames in 5.00 s, the table all PASS, 27 `ok` lines.
+- **Step 2:** the table all PASS, 27 `ok` lines, with the Vulkan program presenting in address space 8 and the
+  runtime's clients in 9 and 10; both faults seen (85 and 166 us) and both queues recovered; `vkprobe` 7136 frames
+  in 120 s against the display's 7194 (the difference is the script's own short holds of the lock).
+- **Not exercised:** all four recoveries read `waves reset 1 time(s)`. The case the repeat was written for (one reset
+  not enough, third and fourth run) did not come up, so the repeat itself has not run on the card.
+
+**Still worth doing:** step 2 a few more times in one boot (no reboot needed between them), until a line reads `waves
+reset 2 time(s) ...: it runs, its fences are through` with the table still all PASS.
 
 ## After the tests
 
