@@ -609,6 +609,52 @@ Open, none of it started: noticing the fault before the ten seconds (the ring se
 recovery for the runtime's own graphics clients (`rdna4-run tri`), whose timeout still shuts the ring; and the
 command processor's fill that is not done after its failed copy (fourth run, part 2).
 
+## The runtime's own graphics clients after a stream that hangs
+
+Written 2026-10-07. The recovery of the section above is now one function (`gfxRingRelease`, `src/runtime.cpp`), and the
+runtime's graphics clients (`rdna4-run tri`, `SubmitGfxIb`) use it too. Until now a wait of theirs that ran out shut
+the ring until the next boot, whatever the reason. Now the client's address space gets `CP_VMID_RESET`, and the ring
+is only shut if the client's fence still does not come.
+
+The test: `rdna4-run trifault` records the colour triangle, frees its ring block (the memory its shaders write
+attributes to and read them from) and submits. If that hangs, as a shader's access to unmapped memory did for the
+Vulkan client, the wait runs out after 5 s and the kernel ends the work. Then it draws the colour triangle again.
+**Whether this stream hangs at all is not known**; if it does not, the tool says so and the new path stays untested.
+
+New kext (`make`), new `build/rdna4-run`, same boot:
+
+```
+rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
+```
+
+```bash
+sudo ./rdna4-run trifault > trifault.txt 2>&1
+```
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib fault > vkfault.txt 2>&1
+```
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
+```
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+Expected:
+
+- `trifault.txt`: `ok    trifault: the stream with its ring block freed did not finish (... I/O Timeout after 5000 ms)`, then
+  `after it, the colour triangle again:` and a `PASS  tricol` line. A `FAIL ... the gfx ring is not available` there
+  means the ring was shut; `note  trifault: ... FINISHED: no hang was produced` means the test did not hang.
+- Kernel log: `runtime: gfx: IB wait: work in address space 8 did not finish (...)`, `CP_VMID_RESET 0x00000100, attempt
+  1: the lost work's fence came through`, `the graphics ring is back and stays in service`.
+- The Vulkan fault test as in the fifth run (it now goes through the same function, with `runtime: gfx: vulkan
+  client:` lines), `vkprobe.txt` ending `done: all ok`, and the table all PASS.
+
+Report the three text files and the log.
+
 ## After the tests
 
 For what passes, the README's file table, `docs/vulkan-port.md` and `vulkan/README.md` get the date and what ran.

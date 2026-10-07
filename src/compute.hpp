@@ -993,6 +993,7 @@ private:
 	IOReturn gfxClientEmit(RtClient &client, uint64_t ibVa, uint32_t dwords, uint32_t &fence);
 	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why);
 	void     gfxClientWedge(const char *why);
+	bool     gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why);   // end one address space's hung work
 	void     gfxClientDrain(RtClient &client, const char *why);
 	void     gfxClientReset();                             // a fresh gfx ring: nothing is pending
 	bool     gfxClientSelfTest();                          // rdna4-gfxclient=1 (bring-up thread)

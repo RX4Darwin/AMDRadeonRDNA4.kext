@@ -2979,8 +2979,9 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
  *    fence dword (VMID0 MC address); 15 dwords.  No ring-side VM flush / pipeline sync / HDP flush / COND_EXEC: see the doc.
  *  - the kernel's own gfx work (stageGfxRing/stageGfxDraw/gfxPark) runs on the bring-up thread without rtLock while bringupRunning is
  *    set; client submissions hold rtLock and refuse while it is set, so the ring has one user at a time.
- *  - a client IB that does not finish wedges the gfx ring (no per-queue reset without MES): PFP/ME are halted and gfx submissions are
- *    refused until the next bring-up; compute queues, the display and the other runtime selectors are unaffected. */
+ *  - a client IB that does not finish in its wait's time is ended: its address space's waves are reset and the ring carries on
+ *    (gfxRingRelease, since 2026-10-07). Only if that does not bring the client's fence is the ring wedged as before: PFP/ME are halted
+ *    and gfx submissions refused until the next bring-up; compute queues, the display and the other runtime selectors are unaffected. */
 
 IOReturn RDNA4Compute::gfxClientReady() const {
 	if (!gfxMode)
@@ -3024,6 +3025,41 @@ void RDNA4Compute::gfxClientReset() {
 	}
 	if (rtLock)
 		IOLockUnlock(rtLock);
+}
+
+/* A client's work on the graphics ring does not finish: remove what hangs and keep the ring for everybody else. True if
+ * the client's fence then came through, false if the ring has to be given up (gfxClientWedge).
+ * Card, 2026-10-07 (vkprobe's "fault", two boots): a shader that writes to an address nothing is mapped at leaves waves
+ * that do not end (GRBM_STATUS SPI busy), and the ring behind them stands. CP_VMID_RESET with the address space's bit and
+ * no queue removes them: the lost work's own fence came through within 200 ms, SPI busy went, and the next program and
+ * the runtime's graphics clients ran. The bit reads back set until it is written 0 again. As recoverSharedQueue does for
+ * a compute queue, the queue is left alone: amdgpu (mes_v12_0_reset_queue_mmio) sets the queue's bit too, which takes
+ * the queue down for the MES to map again, and there is no MES here (docs/vm-client-rootcause.md section 20). A second
+ * try in case one is not enough, as it sometimes is not on the compute queues.
+ * ponytail: every client in that address space loses its waves; with rdna4-vmshared=2, where address spaces are lent
+ * per job, the caller has none to name and the ring is given up as before. */
+bool RDNA4Compute::gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why) {
+	if (vmid < 1 || vmid > 15)
+		return false;
+	RLOG("gfx: %s: work in address space %u did not finish (fence %u of %u): hub fault 0x%08x at 0x%llx, GRBM 0x%08x, CP_STAT 0x%08x",
+	     why, vmid, *fenceWord, fence, rdGc(GcL2FaultStatusLo), gcFaultVa(), rdGc(GrbmStatus), rdGc(CpStat));
+	bool back = false;
+	for (uint32_t attempt = 1; attempt <= 2 && !back; attempt++) {
+		const uint32_t index = rdGc(GrbmGfxIndex);
+		wr(IpDiscovery::HwGc, GrbmGfxIndex, 1u << 31);       // all shader engines, as amdgpu writes it
+		wr(IpDiscovery::HwGc, CpVmidReset, 1u << vmid);
+		wr(IpDiscovery::HwGc, GrbmGfxIndex, index);
+		for (uint32_t ms = 0; ms < 200 && !(back = fenceReached(*fenceWord, fence)); ms++)
+			IOSleep(1);
+		wr(IpDiscovery::HwGc, CpVmidReset, 0);
+		RLOG("gfx: %s: CP_VMID_RESET 0x%08x, attempt %u: the lost work's fence %s; GRBM 0x%08x, CP_STAT 0x%08x", why, 1u << vmid, attempt,
+		     back ? "came through" : "did not come", rdGc(GrbmStatus), rdGc(CpStat));
+	}
+	if (((rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == vmid)
+		gcFaultClear();                // an entry of this client's would end the next compute job in this address space (vmJobFaulted)
+	if (back)
+		RLOG("gfx: %s: the client's work is ended; the graphics ring is back and stays in service", why);
+	return back;
 }
 
 void RDNA4Compute::gfxClientWedge(const char *why) {
@@ -3107,7 +3143,13 @@ bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs
 		return true;
 	}
 	RLOG("vmid %u: gfx fence %u not reached after %u ms (%s)", c.vmid, fence, timeoutMs, why);
-	gfxClientWedge(why);
+	/* The wait is over for the caller either way. Everything of this client's on the ring is ended with it: its newest fence coming
+	 * through is what says the ring runs again. */
+	const uint32_t newest = c.gfxOutstanding ? c.gfxFences[c.gfxOutstanding - 1] : fence;
+	if (gfxRingRelease(c.vmid, c.gfxFenceCpu, newest, why))
+		gfxClientRetire(c);
+	else
+		gfxClientWedge(why);
 	return false;
 }
 

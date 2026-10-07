@@ -275,16 +275,8 @@ struct N48nBackend {
 		const RDNA4Compute &c = of(context);
 		return *c.poolDw(static_cast<uint32_t>(c.n48n->fencePage));
 	}
-	/* The client's work made no progress for ten seconds. The client is finished (n48n.cpp); what is done here is to
-	 * keep the graphics ring for everybody else.
-	 * Card, 2026-10-07 (vkprobe's "fault"): a shader that writes to an address nothing is mapped at leaves waves that
-	 * do not end (GRBM_STATUS SPI busy), and the ring behind them stands. CP_VMID_RESET with the address space's bit
-	 * and no queue removes them: the lost work's own fence came through within 200 ms, SPI busy went, and the next
-	 * program and the runtime's graphics clients ran. VERIFIED on the card that day, in two boots. The bit reads back set
-	 * until it is written 0 again. As recoverSharedQueue does for a compute queue, the queue is left alone: amdgpu
-	 * (mes_v12_0_reset_queue_mmio) sets the queue's bit too, which takes the queue down for the MES to map again,
-	 * and there is no MES here (docs/vm-client-rootcause.md section 20). A second try in case one is not enough, as
-	 * it sometimes is not on the compute queues; if the fence still does not come, the ring is shut as before.
+	/* The client's work made no progress for ten seconds. The client is finished (n48n.cpp); the ring is kept for
+	 * everybody else if its hung waves can be removed (gfxRingRelease, runtime.cpp: verified with this client).
 	 * ponytail: the fault is not noticed before the ten seconds, during which the ring serves nobody. The hub
 	 * records only the first fault after a clear, every submission's own stray entry comes first, and a hung wave
 	 * here does not fault again when that is cleared (tried: no entry for the address space in 10 s of looking).
@@ -292,31 +284,7 @@ struct N48nBackend {
 	static void lost(void *context) {
 		RDNA4Compute &c = of(context);
 		RDNA4Compute::N48nState &s = *c.n48n;
-		const uint32_t want = s.ringSequence;
-		auto through = [&]() {
-			for (uint32_t ms = 0; ms < 200 && finished(context) != want; ms++)
-				IOSleep(1);
-			return finished(context) == want;
-		};
-		VLOG("work on the graphics queue did not finish in %llu s (address space %u, fence %u of %u): hub fault 0x%08x at 0x%llx, "
-		     "GRBM 0x%08x, CP_STAT 0x%08x", N48N::kLostAfterNs / 1000000000ull, s.vmid, finished(context), want,
-		     c.rdGc(GcL2FaultStatusLo), c.gcFaultVa(), c.rdGc(GrbmStatus), c.rdGc(CpStat));
-		bool back = false;
-		for (uint32_t attempt = 1; attempt <= 2 && !back; attempt++) {
-			const uint32_t index = c.rdGc(GrbmGfxIndex);
-			c.wr(IpDiscovery::HwGc, GrbmGfxIndex, 1u << 31);       // all shader engines, as amdgpu writes it
-			c.wr(IpDiscovery::HwGc, CpVmidReset, 1u << s.vmid);
-			c.wr(IpDiscovery::HwGc, GrbmGfxIndex, index);
-			back = through();
-			c.wr(IpDiscovery::HwGc, CpVmidReset, 0);
-			VLOG("CP_VMID_RESET 0x%08x, attempt %u: the lost work's fence %s; GRBM 0x%08x, CP_STAT 0x%08x", 1u << s.vmid, attempt,
-			     back ? "came through" : "did not come", c.rdGc(GrbmStatus), c.rdGc(CpStat));
-		}
-		if (((c.rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == s.vmid)
-			c.gcFaultClear();              // an entry of this client's would end the runtime's next job in this address space
-		if (back)
-			VLOG("the client's work is ended; the graphics ring is back and stays in service");
-		else
+		if (!c.gfxRingRelease(s.vmid, c.poolDw(static_cast<uint32_t>(s.fencePage)), s.ringSequence, "vulkan client"))
 			c.gfxClientWedge("vulkan client");
 	}
 	static uint64_t now(void *) {
