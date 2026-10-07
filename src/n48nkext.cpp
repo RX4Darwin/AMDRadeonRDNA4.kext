@@ -280,7 +280,7 @@ struct N48nBackend {
 	 * Card, 2026-10-07 (vkprobe's "fault"): a shader that writes to an address nothing is mapped at leaves waves that
 	 * do not end (GRBM_STATUS SPI busy), and the ring behind them stands. CP_VMID_RESET with the address space's bit
 	 * and no queue removes them: the lost work's own fence came through within 200 ms, SPI busy went, and the next
-	 * program and the runtime's graphics clients ran. VERIFIED on the card that day, once. The bit reads back set
+	 * program and the runtime's graphics clients ran. VERIFIED on the card that day, in two boots. The bit reads back set
 	 * until it is written 0 again. As recoverSharedQueue does for a compute queue, the queue is left alone: amdgpu
 	 * (mes_v12_0_reset_queue_mmio) sets the queue's bit too, which takes the queue down for the MES to map again,
 	 * and there is no MES here (docs/vm-client-rootcause.md section 20). A second try in case one is not enough, as

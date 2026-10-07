@@ -505,7 +505,7 @@ at the same time.
 ## A shader that faults
 
 Written 2026-10-07. The first two runs tested something else than they said; the third reproduced the hang; in
-the fourth the kext got its ring back after it.
+the fourth and fifth the kext got its ring back after it. **Done**, with what is listed as open at the end.
 
 ### What the first two runs really tested
 
@@ -592,29 +592,22 @@ matters because the work is reported finished, and because in the second run it 
 again (it found none); the recovery is `CP_VMID_RESET` twice at most, without the third attempt that never ran.
 `vkprobe`'s `fault` no longer calls ten seconds late.
 
-### Next run: the reduced kext
+### Fifth run 2026-10-07 (kext `C1C4B053`, the reduced one): confirmed
 
-New kext (`make`), new `build/vkprobe`, same boot. The shader part again:
+`vkfault-5.txt`, `vkprobe-12.txt`, log `rdna4fb-diag-20261007-171012`.
 
-```bash
-sudo ./vkprobe ./libvulkan_radeon.dylib fault > vkfault.txt 2>&1
+```
+vulkan: work on the graphics queue did not finish in 10 s (address space 8, fence 3 of 4): hub fault 0x00000d3d at 0x0 ...
+vulkan: CP_VMID_RESET 0x00000100, attempt 1: the lost work's fence came through; GRBM 0x0000382c, CP_STAT 0x00000000
+vulkan: the client's work is ended; the graphics ring is back and stays in service
 ```
 
-```bash
-sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
-```
+The fault run ended after 10.003 s with the device lost; the `vkprobe` after it `done: all ok`; the table all PASS,
+idle 3 % and 18 W. **A program whose shader faults loses its own device and nothing else**, in two boots now.
 
-```bash
-sudo bash diagnostic-log.sh
-```
-
-Expected: `vkfault.txt` ends `the work did not finish and the device is lost` after about ten seconds; the kernel log
-has `did not finish in 10 s (...)`, `CP_VMID_RESET 0x00000100, attempt 1: the lost work's fence came through`, `the
-graphics ring is back and stays in service`; `vkprobe.txt` ends `done: all ok`; the table is all PASS.
-
-Open after this: noticing the fault before the ten seconds; the same recovery for the runtime's own graphics
-clients (`rdna4-run tri`), whose timeout still shuts the ring; and the command processor's fills that are not done
-after its failed copy.
+Open, none of it started: noticing the fault before the ten seconds (the ring serves nobody meanwhile); the same
+recovery for the runtime's own graphics clients (`rdna4-run tri`), whose timeout still shuts the ring; and the
+command processor's fill that is not done after its failed copy (fourth run, part 2).
 
 ## After the tests
 
