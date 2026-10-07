@@ -230,3 +230,53 @@ not pinned, the boot test passes and `rdna4-run selftest` passes on the shared q
 fails: H10 stands and the old path can go. Both fail: the kernel compute queue with a packet VMID (U1) is the next
 suspect, and the surveys of boot A say where it stops.
 
+## 12. 2026-10-07: the shared default on the card (Sunneva's rig, log `rdna4fb-diag-20261007-130428`)
+
+Kext `52493F80`, boot-args `rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-hang=1 rdna4-trace=1`
+(shared mode by default; no `rdna4-vm-diag`, no `rdna4-ih`). All [M] from that log.
+
+**What works**
+
+- `vmshared: shared queue 0: MEC1 pipe 0 queue 2, VMID 0, doorbell dword 74: active`, queue 1 likewise.
+- `vmshared: boot test: address space 8 from shared queue 0 ...: job 1 submit 0x0 fence reached data ok (1029 us), job 2
+  ... (1060 us): PASS`. **U1 is measured for a kernel MEC queue**: it runs a command buffer in the address space its
+  packet names.
+- `gfx client self-test ...: PASS`: a runtime client's command buffer on the graphics ring in address space 8 (W12k), first
+  time on a card.
+- **No S-A**: with `rdna4-vm=1`, idle before any client is 3 % at 789 MHz, 18 W (`sensors-idle`), where every earlier
+  `rdna4-vm=1` boot read 100 % and 75-81 W. No queue was built inside an address space in this boot. H10 has its first
+  half; the control (the same boot with `rdna4-vmshared=0`) has not been logged.
+- A real kernel in a client's address space on the shared queue: `ok zero-copy vadd: 65536 items read/written through CPU
+  pointers` (client in address space 8, host buffers, fences 1 and 2 reached).
+
+**What fails, and it is one thing**: the two tests that fault on purpose.
+
+| t (s) | Event |
+|---|---|
+| 113.27 | isolation test: the client in address space 9 (shared queue 1) runs `copy` reading an address only client 8 has mapped |
+| 115.27 | `the kernel's fence never came`; fault status `0x0090113d` = VMID 9, CID 8, read, VA 0x100030000, MAPPING_ERROR; HQD rptr = wptr = 0xc (the ring was consumed); `GRBM 0xa840382c`, `CPC_BUSY 0x00000810` |
+| 115.48 | `shared queue 1 recovery failed; that queue stays wedged`: the dequeue with RESET_WAVES went through (the HQD is initialised again 0.5 ms later), the WRITE_DATA proof on the fresh queue did not land in 200 ms |
+| 115.59 | client 8 (queue 0): the zero-copy vadd passes |
+| 115.60 | `dispatch through freed host VA`: a host buffer unmapped, then a dispatch that writes to it |
+| 116.60 | fence 3 never came; fault status `0x0084115d` = VMID 8, CID 8, **write**, VA 0x100116000 (inside the freed buffer) |
+| 116.81 | `shared queue 0 recovery failed` |
+| after | every later test and every later open: `device not responding` / `unsupported function` (both queues wedged) |
+
+So `runtime`, `submitib`, `fault`, `vm` and `gfx-app-tri` are FAIL in the table because of two faulting jobs and what
+follows them, not because clients cannot run. In the emulator a faulting access is answered from the default page and
+the job finishes; on the card the wave that faulted never finished, and the queue's pipe would not run a fresh queue
+afterwards. The recovery's own lines (`vmshared:`) were not in the log: the script's sections after the tests did not
+collect that prefix (fixed).
+
+**The difference from Linux that concerns faults.** The hub's bring-up points the L2 fault default at a scratch page in
+VRAM with `ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY` off; amdgpu points it at a page of system memory with the bit on.
+The kext's own `linux diff` prints this on every boot (`GCVM_L2_CNTL ours 0x00080601 linux 0x00080e01`), and diagnostic F
+of `vmBootSelfTest` was written to try it. Whether the hub honours a default page in VRAM at all is not known. **H11**:
+it does not, so the faulting access is retried or dropped and its wave never ends.
+
+**The change**: `faultPageToSystem` (`src/runtime.cpp`), called once DMA is up and again after a wake: one wired page of
+host memory, its bus address in `GCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR`, the bit on in `GCVM_L2_CNTL`, for the whole
+boot and for every address space, as amdgpu has it. `scrubFaultPage` clears it too. `rdna4-faultpage=0` keeps the VRAM
+page. Compile-checked; `docs/todo-vmtest.md` has the run that tells: the same boot again, and the two fault tests either
+pass or fail as before.
+

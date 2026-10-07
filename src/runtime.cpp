@@ -711,6 +711,7 @@ bool RDNA4Compute::initRuntimeHeap() {
 	 * "ih: ...". */
 	if (dmaInit()) {
 		devHeapInit();
+		faultPageToSystem();
 		if (featureAllowed("ih"))
 			ihInit();
 	}
@@ -1602,6 +1603,56 @@ void RDNA4Compute::scrubFaultPage() {
 	for (uint32_t i = 0; i < 0x1000 / 4; i++)
 		*poolDw(kScratchOffset + i * 4) = 0;
 	flushHdp();
+	if (faultPageBus)
+		bzero(faultPage->getBytesNoCopy(), 0x1000);
+}
+
+// Where a faulting access goes. The hub's bring-up points the L2 fault default at a scratch page in VRAM, with
+// ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY off. amdgpu points it at a page of system memory with that bit on (its
+// dummy page: gfxhub_v12_0_init_system_aperture_regs, gfxhub_v12_0_init_cache_regs), and the kext's own comparison
+// with Linux has listed the difference on every boot. On the card a shader that faulted with the VRAM page never
+// finished and its queue could not be recovered (2026-10-07, docs/vm-client-rootcause.md section 12). So, once the
+// card can reach host memory: one wired page, for good, as Linux has it. rdna4-faultpage=0 keeps the VRAM page.
+// Runs again after a wake, when the hub's bring-up has put its own value back.
+void RDNA4Compute::faultPageToSystem() {
+	uint32_t wanted = 1;
+	(void)PE_parse_boot_argn("rdna4-faultpage", &wanted, sizeof(wanted));
+	if (!wanted || !dmaReady || !busMasterSet) {
+		RLOG("fault default page: left in VRAM (%s)", !wanted ? "rdna4-faultpage=0" : "the card cannot reach host memory");
+		return;
+	}
+	if (!faultPageBus) {
+		// As the bounce buffer: wired, and within the 40 bits the DMA specification below allows.
+		faultPage = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+			kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x1000, 0x000000fffffff000ull);
+		faultPageDma = IODMACommand::withSpecification(kIODMACommandOutputHost64, 40, 0, IODMACommand::kMapped, 0, 1);
+		UInt64 offset = 0;
+		IODMACommand::Segment64 segment {};
+		UInt32 segments = 1;
+		if (faultPage && faultPageDma && faultPage->getBytesNoCopy() &&
+		    faultPageDma->setMemoryDescriptor(faultPage) == kIOReturnSuccess &&
+		    faultPageDma->gen64IOVMSegments(&offset, &segment, &segments) == kIOReturnSuccess && segments == 1 &&
+		    segment.fLength >= 0x1000 && !(segment.fIOVMAddr & 0xfff)) {
+			faultPageBus = segment.fIOVMAddr;
+		} else {
+			if (faultPageDma) {
+				(void)faultPageDma->clearMemoryDescriptor();
+				faultPageDma->release();
+				faultPageDma = nullptr;
+			}
+			OSSafeReleaseNULL(faultPage);
+			RLOG("fault default page: left in VRAM (no page of host memory the card can reach)");
+			return;
+		}
+	}
+	bzero(faultPage->getBytesNoCopy(), 0x1000);
+	const uint32_t before = rdGc(GcL2Cntl);
+	wr(IpDiscovery::HwGc, GcL2FaultDefaultLo, static_cast<uint32_t>(faultPageBus >> 12));
+	wr(IpDiscovery::HwGc, GcL2FaultDefaultHi, static_cast<uint32_t>(faultPageBus >> 44));
+	wr(IpDiscovery::HwGc, GcL2Cntl, before | kL2DefaultPageToSys);
+	(void)gcHubFlush();
+	RLOG("fault default page: a page of system memory at bus 0x%llx, GCVM_L2_CNTL 0x%08x -> 0x%08x (as amdgpu's dummy page)",
+	     faultPageBus, before, rdGc(GcL2Cntl));
 }
 
 IOReturn RDNA4Compute::rtOpen(const void *owner) {

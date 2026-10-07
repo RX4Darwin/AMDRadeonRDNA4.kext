@@ -16,10 +16,12 @@ Kernel paths below are relative to `drivers/gpu/drm/amd/` (`amdgpu/…`, `amdkfd
 
 **Update 2026-10-06 (Sunneva, `devel/address-space`).** Assumption U1's general form, a queue in address space 0
 running a command buffer in the address space its packet names, is **measured on the card** for the copy engine
-and the graphics ring (`docs/vulkan-port.md` sections 8 and 9), not yet for a kernel MEC queue. The shared mode of
-this design is now the default with `rdna4-vm=1` (`rdna4-vmshared` defaults to 1, 0 gives the fixed-VMID queue
-path), and step S1 exists as the shared mode's boot test (`vmSharedBootTest`). None of that has run on the card:
-`docs/todo-vmtest.md`. The rest of this document is as written.
+and the graphics ring (`docs/vulkan-port.md` sections 8 and 9), and since 2026-10-07 for a kernel MEC queue: the
+shared mode's boot test passed on the card and a compute kernel ran in a client's address space on a shared queue
+(`docs/vm-client-rootcause.md` section 12). The shared mode of this design is now the default with `rdna4-vm=1`
+(`rdna4-vmshared` defaults to 1, 0 gives the fixed-VMID queue path), and step S1 exists as its boot test
+(`vmSharedBootTest`). Open on the card: a faulting job hangs its shared queue and the recovery of section 5 does not
+bring the queue back. The rest of this document is as written.
 
 **Status after the lead's review (hub-task-307, 2026-09-30/10-01):** design B approved; two shared queues, C deferred, old fixed-VMID path kept
 behind a boot-arg until S9, root-only userclient unchanged for pre-Metal. Done on `premetal/w13`: **S0** (`3b8df07`, the `rtFree`/`rtUnload` invalidate),

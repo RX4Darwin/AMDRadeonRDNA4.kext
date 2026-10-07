@@ -1015,6 +1015,11 @@ private:
 	uint8_t       *devHeapMap { nullptr };
 	uint32_t       devHeapMapBytes { 0 };
 	bool dmaInit();
+	// The page of system memory faults are answered from, as amdgpu's dummy page (runtime.cpp, faultPageToSystem).
+	IOBufferMemoryDescriptor *faultPage { nullptr };
+	IODMACommand  *faultPageDma { nullptr };
+	uint64_t       faultPageBus { 0 };
+	void faultPageToSystem();
 	void dmaTeardown(const char *why);
 	void devHeapInit();
 	bool sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeoutMs);

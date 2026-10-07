@@ -1,7 +1,43 @@
 # Card tests for the runtime's client address spaces
 
-Written 2026-10-06 on `devel/address-space`. Built, not run on the card. Background: `docs/vm-client-rootcause.md`
-section 11 and `docs/metal-readiness.md` section 4.
+Written 2026-10-06 on `devel/address-space`. **First run on the card 2026-10-07** (below): clients now work in
+their own address spaces, and the two tests that fault on purpose hang their job. The fix for that is built and
+not run: the next run is the same boot again. Background: `docs/vm-client-rootcause.md` sections 11 and 12 and
+`docs/metal-readiness.md` section 4.
+
+## First run, 2026-10-07
+
+Kext `52493F80`, boot C's arguments (`rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-hang=1
+rdna4-trace=1`), log `rdna4fb-diag-20261007-130428`.
+
+- **Passed**: both shared queues active; the boot test (`address space 8 from shared queue 0 ...: PASS`, about 1 ms a
+  job); the graphics-ring client self-test (`gfx-client PASS`); a real compute kernel in a client's address space
+  (`ok zero-copy vadd: 65536 items`).
+- **The GPU is not pinned** with `rdna4-vm=1`: 3 % and 18 W at idle, where the September boots read 100 % and 75 W.
+- **Failed**: the isolation test and the freed-buffer test, which make a shader touch an address that is not mapped
+  and expect the job to finish anyway. On the card the job never finished, the queue could not be recovered, and
+  every test after that failed with it. That is why the table shows `runtime`, `submitib`, `fault`, `vm` and
+  `gfx-app-tri` as FAIL.
+- Only this one log arrived. Boot B's (the control with `rdna4-vmshared=0`) is not among the files.
+
+## Next run: boot C again, with the fault page in system memory
+
+New kext (it prints `runtime: fault default page: a page of system memory at bus 0x..., GCVM_L2_CNTL 0x00080601 ->
+0x00080e01 (as amdgpu's dummy page)` during the bring-up). Same arguments as the first run:
+
+```
+rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-hang=1 rdna4-trace=1
+```
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+What to look for: in the script's own test output, `VM isolation: client B could not read client A` and
+`ok    dispatch through freed host VA faulted cleanly`, and then the rows `vm`, `runtime`, `submitib`, `fault` PASS
+and `gfx-app-tri` with a result of its own. If the two fault tests hang as before, the log now has the recovery's
+lines (`vmshared: runtime: recovering shared queue ...`), and the same boot with `rdna4-faultpage=0` added is the
+old setting for comparison.
 
 What changed: with `rdna4-vm=1` a client of the compute runtime (`RDNA4ComputeClient`, `rdna4-run`) gets its own
 GPU address space. Until now each such client also got a compute queue of its own inside that address space, and

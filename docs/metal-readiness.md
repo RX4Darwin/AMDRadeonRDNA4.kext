@@ -78,11 +78,15 @@ the one this section describes as failing:
 - In none of those boots was a queue ever built **inside** a non-zero address space; `rdna4-vm` was not set, so neither
   the boot self-test nor a client queue ran. That is the one thing every failing boot of rounds 2 to 6 did and these did
   not. It is a correlation, not a root cause: `docs/vm-client-rootcause.md` section 11.
-- **code, not run**: since `devel/address-space`, `rdna4-vm=1` uses the shared kernel compute queues by default (W13
-  S7-lite, `rdna4-vmshared=1`), and the boot self-test goes through them too (`vmSharedBootTest`, which is W13's step S1),
-  so that a `rdna4-vm=1` boot no longer builds such a queue at all. `rdna4-vmshared=0` gives the old path. Whether a
-  kernel **compute** queue honours the packet's address space on this card under this kext is the part still to be shown;
-  the card test is `docs/todo-vmtest.md`.
+- Since `devel/address-space`, `rdna4-vm=1` uses the shared kernel compute queues by default (W13 S7-lite,
+  `rdna4-vmshared=1`), and the boot self-test goes through them too (`vmSharedBootTest`, which is W13's step S1), so
+  that a `rdna4-vm=1` boot no longer builds such a queue at all. `rdna4-vmshared=0` gives the old path.
+- **card, 2026-10-07** (`docs/vm-client-rootcause.md` section 12): with that default the boot test passes (a kernel MEC
+  queue runs a command buffer in the address space its packet names), the graphics-ring client self-test passes, a
+  compute kernel runs in a client's address space on the shared queue (`rdna4-run`'s zero-copy vadd), and the GPU is
+  not pinned at idle. **Still failing**: a job whose shader faults never finishes and its queue cannot be recovered, so
+  the two deliberate-fault tests of the self-test hang and take the rest with them. A fix that sets the fault default
+  page up as Linux does is **code, not run** (`docs/todo-vmtest.md`).
 
 The table in section 1 and the text below are as written on 2026-09-30.
 

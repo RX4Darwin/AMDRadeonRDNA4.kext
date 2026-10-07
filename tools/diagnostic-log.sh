@@ -557,7 +557,7 @@ registry_value() {
 		klines 'RDNA4FB: vmidtest:' || true
 	fi
 	section "dmesg: runtime client lines (open, close, dequeue, dispatch, wedge, recovery; host buffer map/unmap noise removed)"
-	klines 'RDNA4FB: runtime:' | grep -v 'host buffer' || true
+	klines 'RDNA4FB: (runtime|vmshared):' | grep -v 'host buffer' || true
 	section "dmesg: Vulkan interface and copy engine (vulkan:, dma:; docs/todo-vulkantest.md)"
 	klines 'RDNA4FB: (vulkan:|runtime: dma:)' | grep . || echo "(no vulkan: or dma: lines: no client opened the interface, or no rdna4-compute)"
 	section "dmesg: MEC / HQD / VM boot-test lines (compute: mec|vm|runtime|hqd|pm: survey)"
