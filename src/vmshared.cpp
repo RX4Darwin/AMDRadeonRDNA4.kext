@@ -135,37 +135,8 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 	}
 	SLOG("%s: recovering shared queue %u (guilty VMID %u) without a GPU reset", tag, k, guiltyVmid);
 	logComputeQueueState(tag, s.pipe, s.queue, 0);
-	const bool safe = rlcSafeMode(true);
-	grbmSelect(1, s.pipe, s.queue, 0);
-	wr(IpDiscovery::HwGc, CpHqdDequeueReq, 2);   // RESET_WAVES
-	wr(IpDiscovery::HwGc, SpiComputeQueueReset, 1);
-	bool inactive = false;
-	for (uint32_t us = 0; us < 100000 && !inactive; us += 10) {
-		inactive = !(rdGc(CpHqdActive) & 1);
-		if (!inactive)
-			IODelay(10);
-	}
-	wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
-	grbmSelect(0, 0, 0, 0);
-	rlcSafeMode(false);
-	SLOG("%s: shared queue %u reset (RLC safe mode %s): %s", tag, k, safe ? "acknowledged" : "NOT acknowledged",
-	     inactive ? "inactive" : "still ACTIVE");
-	if (!inactive) {
-		SLOG("%s: shared queue %u did not dequeue; wedged", tag, k);
-		s.wedged = true;
-		return false;
-	}
-	// The queue's registers again, and one packet through it.
-	bool up = false;
-	auto again = [&] {
-		for (uint32_t off = 0; off < 0x7000; off += 4)
-			*poolDw(s.area + off) = 0;
-		flushHdp();
-		up = s.pm.init(poolDw(s.area + kVmPq), poolMc(s.area + kVmPq), kPqSize) &&
-		     hqdInitFor(false, s.pipe, s.queue, 0, poolMc(s.area + kVmMqd), poolMc(s.area + kVmEop) >> 8,
-		                poolMc(s.area + kVmPq) >> 8, poolMc(s.area + kVmRptr), poolMc(s.area + kVmWptr), s.doorbell);
-		if (!up)
-			return false;
+	// One packet through the queue as it stands: true if it ran.
+	auto proves = [&]() {
 		volatile uint32_t *word = poolDw(s.area + kVmKernarg);
 		*word = 0;
 		flushHdp();
@@ -177,35 +148,67 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 			IOSleep(1);
 		return *word == 0x600DF00D;
 	};
-	bool proof = again();
-	if (!proof && up) {
-		/* 2026-10-07, sixth run: after a job that faulted, the queue reset above goes through (safe mode acknowledged, the queue inactive)
-		 * and the fresh queue still runs nothing; the pipe's instruction pointer had not moved across the reset. An experiment, not a
-		 * sequence read anywhere: restart that one pipe of the MEC the way the bring-up starts all four (mecStart: its reset bit in
-		 * CP_MEC_RS64_CNTL pulsed, its entry address still in place), then the queue once more. Every other queue of the pipe loses its
-		 * place too; pipe 0 also carries the kernel's boot queue. */
+	/* 2026-10-07, seventh run. When recovery starts the queue itself is in order: read pointer at the write pointer, doorbell enabled, and
+	 * a dequeue request answered within 150 us. What hangs is the shader's waves (GRBM_STATUS SPI busy, MEC1_EOP_QUEUE_BUSY). The queue
+	 * made afresh after amdgpu's reset is what does not work: its doorbell enable reads back off, it fetches nothing, and a dequeue
+	 * request to it is not answered in 100 ms; amdgpu has the MES map the queue at that point, and there is no MES here. So first the
+	 * waves alone are reset and the queue is left as it is. An experiment: amdgpu never does the one without the other. */
+	bool safe = rlcSafeMode(true);
+	grbmSelect(1, s.pipe, s.queue, 0);
+	wr(IpDiscovery::HwGc, SpiComputeQueueReset, 1);
+	grbmSelect(0, 0, 0, 0);
+	rlcSafeMode(false);
+	bool up = s.up, proof = proves();
+	SLOG("%s: shared queue %u: waves reset, the queue left as it was (RLC safe mode %s): %s", tag, k, safe ? "acknowledged" : "NOT acknowledged",
+	     proof ? "it runs" : "it does not run");
+	if (!proof) {
+		// amdgpu's reset (mes_v12_0_reset_queue_mmio), then the queue's registers again.
 		logComputeQueueState(tag, s.pipe, s.queue, 0);
-		const uint32_t cntl = rdGc(CpMecRs64Cntl), bit = 1u << (16 + s.pipe);
-		const bool safe2 = rlcSafeMode(true);
-		grbmSelect(1, s.pipe, 0, 0);          // the instruction pointer is read per pipe
-		const uint32_t pcBefore = rdGc(CpMecRs64InstrPntr);
-		wr(IpDiscovery::HwGc, CpMecRs64Cntl, cntl | bit);
-		wr(IpDiscovery::HwGc, CpMecRs64Cntl, cntl & ~bit);
-		IODelay(50);
-		const uint32_t pcAfter = rdGc(CpMecRs64InstrPntr);
+		safe = rlcSafeMode(true);
+		grbmSelect(1, s.pipe, s.queue, 0);
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 2);   // RESET_WAVES
+		wr(IpDiscovery::HwGc, SpiComputeQueueReset, 1);
+		bool inactive = false;
+		for (uint32_t us = 0; us < 100000 && !inactive; us += 10) {
+			inactive = !(rdGc(CpHqdActive) & 1);
+			if (!inactive)
+				IODelay(10);
+		}
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
 		grbmSelect(0, 0, 0, 0);
 		rlcSafeMode(false);
-		SLOG("%s: shared queue %u still dead: MEC pipe %u restarted (RLC safe mode %s), CP_MEC_RS64_CNTL 0x%08x -> 0x%08x, "
-		     "instruction pointer 0x%x -> 0x%x", tag, k, s.pipe, safe2 ? "acknowledged" : "NOT acknowledged", cntl,
-		     rdGc(CpMecRs64Cntl), pcBefore, pcAfter);
-		proof = again();
+		SLOG("%s: shared queue %u reset (RLC safe mode %s): %s", tag, k, safe ? "acknowledged" : "NOT acknowledged",
+		     inactive ? "inactive" : "still ACTIVE");
+		if (!inactive) {
+			SLOG("%s: shared queue %u did not dequeue; wedged", tag, k);
+			s.wedged = true;
+			return false;
+		}
+		for (uint32_t off = 0; off < 0x7000; off += 4)
+			*poolDw(s.area + off) = 0;
+		flushHdp();
+		up = s.pm.init(poolDw(s.area + kVmPq), poolMc(s.area + kVmPq), kPqSize) &&
+		     hqdInitFor(false, s.pipe, s.queue, 0, poolMc(s.area + kVmMqd), poolMc(s.area + kVmEop) >> 8,
+		                poolMc(s.area + kVmPq) >> 8, poolMc(s.area + kVmRptr), poolMc(s.area + kVmWptr), s.doorbell);
+		// Does the doorbell enable hqdInitFor wrote hold? At once, and a millisecond later.
+		uint32_t doorbell[2];
+		for (uint32_t i = 0; i < 2; i++) {
+			grbmSelect(1, s.pipe, s.queue, 0);
+			doorbell[i] = rdGc(CpHqdPqDoorbell);
+			grbmSelect(0, 0, 0, 0);
+			IOSleep(1);
+		}
+		SLOG("%s: shared queue %u made again: doorbell control 0x%08x at once, 0x%08x a millisecond later (enable is bit 30)", tag, k,
+		     doorbell[0], doorbell[1]);
+		proof = up && proves();
 		if (!proof)
 			logComputeQueueState(tag, s.pipe, s.queue, 0);
 	}
 	s.up = up;
 	s.wedged = !proof;
-	/* The ring was re-initialised: the jobs that were in it are gone. Their queue-fence numbers count as reached so the VMIDs they held are idle
-	 * again (they never ran to completion, their clients' own fences never signal and those waits time out), and the ring is empty. */
+	/* The proof ran behind everything that was in the ring, or the ring was made again: either way the jobs that were in it are over. Their
+	 * queue-fence numbers count as reached so the VMIDs they held are idle again (a job that did not run to completion never signals its
+	 * client's own fence, and that wait times out), and the ring is empty. */
 	*s.fenceCpu = s.seq;
 	s.jobHead = s.jobCount = s.ringUsed = 0;
 	flushHdp();

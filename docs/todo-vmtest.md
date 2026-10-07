@@ -3,7 +3,8 @@
 Written 2026-10-06 on `devel/address-space`. **First run on the card 2026-10-07** (below): clients now work in
 their own address spaces, and the two tests that fault on purpose hang their job. Three ways of letting such a job finish did
 nothing (second to fifth run). Since the sixth run a fault is caught and reported and both fault tests pass; what is
-left is getting the queue back afterwards. The next run is the same boot again. Background: `docs/vm-client-rootcause.md` sections 11 and 12 and
+left is getting the queue back afterwards (seventh run: a restart of the pipe does not). The next run is the same
+boot again. Background: `docs/vm-client-rootcause.md` sections 11 and 12 and
 `docs/metal-readiness.md` section 4.
 
 ## First run, 2026-10-07
@@ -54,11 +55,17 @@ caught in under 3 ms and the client is told its job faulted. The queue's reset g
 mode acknowledged): inactive`) and the fresh queue still runs nothing, so everything after the first fault on each
 queue fails as before.
 
-## Next run: boot C again, with a second stage in the recovery
+## Seventh run, 2026-10-07
 
-When the reset is not enough, the new kext restarts that one pipe of the compute engine and tries the queue again,
-logging the state before and after; and a new client goes to the other shared queue when its own is out of service
-(`docs/vm-client-rootcause.md` section 17). The pipe restart is an experiment. Only the kext is new. Same arguments:
+Kext `F15C3784`, log `rdna4fb-diag-20261007-140244`. Both fault tests pass again. The pipe restart ran and changed
+nothing (`instruction pointer 0x5044 -> 0x5044`, `NOT recovered`), and is taken out. The new dumps show where the
+trouble is: before the reset the queue is in order and only the shader's waves hang; the queue made afresh after the
+reset has its doorbell switched off and answers nothing (`docs/vm-client-rootcause.md` section 18).
+
+## Next run: boot C again, the waves reset first
+
+The new kext first resets only the hung waves and leaves the queue as it is, and falls back to the full reset if
+that does not get a packet through. An experiment. Only the kext is new. Same arguments:
 
 ```
 rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-hang=1 rdna4-trace=1
@@ -68,10 +75,11 @@ rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-hang=1 rdna4-trac
 sudo bash diagnostic-log.sh
 ```
 
-What to look for in the kernel log after each fault: `shared queue N reset ...: inactive`, then either `recovered
-(WRITE_DATA proof landed)` at once, or `still dead: MEC pipe N restarted ..., instruction pointer 0x... -> 0x...` and
-then `recovered` or `NOT recovered`. In the script's output: the two fault tests `ok` as in the sixth run, and whether
-the tests after them (`VM peer`, the three `SubmitIb` lines) now have results of their own.
+What to look for in the kernel log after each fault: `waves reset, the queue left as it was (...): it runs`, then
+`recovered (WRITE_DATA proof landed)`. If it says `it does not run`, the full reset follows with `made again: doorbell
+control 0x... at once, 0x... a millisecond later` and `recovered` or `NOT recovered`. In the script's output: the two
+fault tests `ok` as before, and whether the tests after them (`VM peer`, the three `SubmitIb` lines) now have results
+of their own.
 
 What changed: with `rdna4-vm=1` a client of the compute runtime (`RDNA4ComputeClient`, `rdna4-run`) gets its own
 GPU address space. Until now each such client also got a compute queue of its own inside that address space, and

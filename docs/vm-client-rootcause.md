@@ -455,3 +455,43 @@ What the dumps of the failed recoveries have in common, across all runs: on pipe
 
 Whatever the second stage does, the next log has the state of a fresh queue that will not run, which no log so far has.
 
+## 18. 2026-10-07, seventh run: the pipe restart does nothing; what the fresh queue looks like
+
+Log `rdna4fb-diag-20261007-140244`, kext `F15C3784`. [M] Both fault tests `ok` again; the second stage ran and changed
+nothing: `MEC pipe 1 restarted (RLC safe mode acknowledged), CP_MEC_RS64_CNTL 0x3c000000 -> 0x3c000000, instruction
+pointer 0x5044 -> 0x5044`, then `NOT recovered`; the same on pipe 0. The pipe restart is taken out again.
+
+The three dumps of shared queue 1, bit names from `gc_12_0_0_sh_mask.h` (read for this section, not from memory):
+
+| | before anything | after the reset and a fresh `hqdInitFor` | after the restart and a second `hqdInitFor` |
+|---|---|---|---|
+| `GRBM_STATUS` | 0xa840382c (bit 22, SPI busy) | 0xa800382c | 0xa800382c |
+| `CP_CPC_STATUS` | 0x80000001: MEC1 | 0xa0000041: MEC1, ROQ1, CPG_CPC | 0xa0000041 |
+| `CP_CPC_BUSY_STAT` | 0x810: MEC1 EOP queue, pipe 1 | 0x001: MEC1 load | 0x808: MEC1 message, pipe 1 |
+| read / write pointer | 0xc / 0xc | 0 / 0 | 0 / 0 |
+| `CP_HQD_PQ_DOORBELL_CONTROL` | 0xc0000130 (EN, HIT) | 0x00000130 | 0x00000130 |
+| `CP_HQD_HQ_STATUS0` | 0x40008040 (idle, slot connected) | 0x40000040 | 0x40000040 |
+| `CP_HQD_EOP_RPTR` | 0x40000000 | 0 | 0 |
+| MEC instruction pointer | 0x3fb5 | 0x5044 | 0x5044 |
+
+What that says:
+
+- **Before the reset the queue itself is in order.** The CP has fetched everything (read pointer at the write pointer),
+  the doorbell is enabled, and the dequeue request is answered within 150 us. What hangs is the shader's waves: SPI
+  busy, and the MEC waiting for an end-of-pipe that does not come.
+- **The queue made afresh is what does not work.** The doorbell enable `hqdInitFor` writes (twice) reads back off, so
+  the kick never arrives and the write pointer stays 0. The second `hqdInitFor`, 200 ms later, found the queue active
+  and asked it to drain; it took 140 ms where the first took 0.3 ms, which is the drain loop running to its 100 ms
+  limit: a dequeue request to the fresh queue is not answered. So after amdgpu's reset the pipe's firmware no longer
+  serves that queue by registers. Under Linux the next step is the MES mapping the queue again, and there is no MES
+  here.
+- The reset does remove the waves (SPI busy is gone after it).
+
+H15, from the first two points: **reset the waves and leave the queue alone.** An experiment; amdgpu never writes
+`SPI_COMPUTE_QUEUE_RESET` without the dequeue request.
+
+**The change** (kext `8C8B6470`, compile-checked): `recoverSharedQueue` first writes `SPI_COMPUTE_QUEUE_RESET` alone (in
+safe mode, the queue selected) and sends the proof packet through the queue as it is: `waves reset, the queue left as
+it was (...): it runs` or `it does not run`. Only if it does not run comes amdgpu's reset and the fresh queue as
+before, now with the doorbell enable read back at once and a millisecond later (`made again: doorbell control ...`),
+which says whether the write is ignored or undone.
