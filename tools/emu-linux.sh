@@ -20,6 +20,10 @@
 #                   (tools/accelcensus/census.m: registry, MTLCopyAllDevices, IOServiceOpen) in the Recovery Terminal; its output and the
 #                   unified-log lines about Metal come back over the serial console (census.txt), the kext's census lines in census-kernel.log.
 #                   Not combinable with --diag.
+#   --census-stub   E1c (docs/metal-spike.md s.11.4): as --census, plus the stub Metal driver bundle build/RDNA4CensusMTLDriver.bundle (tools/accelcensus/stub, `make census-stub`)
+#                   copied into every candidate bundle directory of the emulated Recovery, and build/libpathlog.dylib (`make census-pathlog`) injected
+#                   with DYLD_INSERT_LIBRARIES to log the paths Metal's loader looks up (including failures). Output in census.txt: RDNA4CENSUS-PLACE
+#                   (which directories accepted the bundle), RDNA4STUB| lines (who loaded it, from where, every MTLIOAccelDevice call), RDNA4PATH| lines.
 #   --sleep-reset   with boot 11s: trigger the emulator's compute power reset (device property sleep-reset)
 #                   in the sleep window, right after "power: quiesce complete": the power-loss case
 #   --pre "CMD"     with --diag: a shell command the guest runs first, before diagnostic-log.sh
@@ -49,7 +53,7 @@ BASE_IMG=${BASE_IMG:-$EMU/images/BaseSystem.img}
 export QEMU_BIN=${QEMU_BIN:-$QEMU_SRC/build/qemu-system-x86_64}   # e.g. $EMU/bin/w13/qemu-system-x86_64
 export PATH="$QEMU_SRC/build:$EMU/local/bin:$PATH"   # qemu-img, mcopy/mdeltree
 
-WAIT=420 EXTRA="" ARGS="" DEV="" KEEP=0 BUILD=1 BOOT="" DIAG=0 CENSUS=0 SLEEPRESET=0 PRE="" POST=""
+WAIT=420 EXTRA="" ARGS="" DEV="" KEEP=0 BUILD=1 BOOT="" DIAG=0 CENSUS=0 STUB=0 SLEEPRESET=0 PRE="" POST=""
 while [ $# -gt 0 ]; do
 	case $1 in
 		--wait) WAIT=$2; shift ;;
@@ -59,6 +63,7 @@ while [ $# -gt 0 ]; do
 		--keep) KEEP=1 ;;
 		--diag) DIAG=1 ;;
 		--census) CENSUS=1 ;;
+		--census-stub) CENSUS=1; STUB=1 ;;
 		--sleep-reset) SLEEPRESET=1 ;;
 		--pre) PRE=$2; shift ;;
 		--post) POST=$(realpath "$2"); shift ;;
@@ -145,6 +150,11 @@ if [ "$CENSUS" = 1 ]; then
 	[ -f "$HERE/build/rdna4-census" ] || { echo "emu-linux: --census needs build/rdna4-census (tools/build-osxcross.sh build/rdna4-census)" >&2; exit 1; }
 	mkdir -p "$RUN/share"
 	cp "$HERE/build/rdna4-census" "$RUN/share/"
+	if [ "$STUB" = 1 ]; then
+		[ -d "$HERE/build/RDNA4CensusMTLDriver.bundle" ] && [ -f "$HERE/build/libpathlog.dylib" ] || { echo "emu-linux: --census-stub needs build/RDNA4CensusMTLDriver.bundle and build/libpathlog.dylib (tools/build-osxcross.sh build/RDNA4CensusMTLDriver.bundle build/libpathlog.dylib)" >&2; exit 1; }
+		cp -R "$HERE/build/RDNA4CensusMTLDriver.bundle" "$RUN/share/"
+		cp "$HERE/build/libpathlog.dylib" "$RUN/share/"
+	fi
 	cat > "$RUN/share/run-census.sh" <<'GUEST'
 cp /Volumes/QEMU*/rdna4-census /tmp/ && cd /tmp || exit 1
 echo RDNA4CENSUS-RUNNING > /dev/console
@@ -156,6 +166,35 @@ ioreg -l -w0 -c IOAccelerator > /tmp/census.ioreg 2>&1
 (echo RDNA4CENSUS-BEGIN; cat /tmp/census.out; echo RDNA4CENSUS-IOREG; cat /tmp/census.ioreg; echo RDNA4CENSUS-LOG; head -400 /tmp/census.log;  echo RDNA4CENSUS-END) |
 	sed 's/^/RDNA4CENSUS|/' > /dev/console
 GUEST
+	if [ "$STUB" = 1 ]; then
+		cat > "$RUN/share/run-census.sh" <<'GUEST'
+cp /Volumes/QEMU*/rdna4-census /tmp/ && cp /Volumes/QEMU*/libpathlog.dylib /tmp/ && cd /tmp || exit 1
+echo RDNA4CENSUS-RUNNING > /dev/console
+rm -rf /tmp/stubsrc
+cp -R /Volumes/QEMU*/RDNA4CensusMTLDriver.bundle /tmp/stubsrc && chmod -R u+rwX,go+rX /tmp/stubsrc
+# The loader's name-to-path helper was not found in the disassembly: offer the bundle at every plausible place and see which one is loaded.
+for d in /System/Library/Extensions /Library/GPUBundles /Library/Extensions /Library/Apple/System/Library/Extensions /tmp/GPUBundles; do
+	if mkdir -p "$d" 2>/dev/null && cp -R /tmp/stubsrc "$d/RDNA4CensusMTLDriver.bundle" 2>/dev/null; then echo "placed in $d"; else echo "cannot place in $d"; fi
+done > /tmp/place.out 2>&1
+export DYLD_INSERT_LIBRARIES=/tmp/libpathlog.dylib
+# 1. the whole census once with every candidate in place (registry, Metal, user-client opens)
+DYLD_PRINT_LIBRARIES=1 ./rdna4-census all > /tmp/census.out 2>&1
+# 2. search order: after each round delete the copy that was loaded and ask again, until nothing loads
+: > /tmp/rounds.out
+for round in 1 2 3 4 5 6; do
+	DYLD_PRINT_LIBRARIES=1 ./rdna4-census metal > /tmp/round.out 2>&1
+	{ echo "== round $round"; cat /tmp/round.out; } >> /tmp/rounds.out
+	img=$(grep -a 'RDNA4STUB|[0-9]* constructor' /tmp/round.out | head -1 | sed 's/.*image \(.*\), process.*/\1/')
+	echo "round $round: loaded image '$img'" >> /tmp/rounds.out
+	[ -n "$img" ] || break
+	rm -rf "${img%/Contents/MacOS/*}"
+done
+unset DYLD_INSERT_LIBRARIES
+ioreg -l -w0 -c IOAccelerator > /tmp/census.ioreg 2>&1
+(echo RDNA4CENSUS-PLACE; cat /tmp/place.out; echo RDNA4CENSUS-BEGIN; cat /tmp/census.out; echo RDNA4CENSUS-ROUNDS; cat /tmp/rounds.out; echo RDNA4CENSUS-IOREG; cat /tmp/census.ioreg; echo RDNA4CENSUS-LOG; echo RDNA4CENSUS-END) |
+	sed 's/^/RDNA4CENSUS|/' > /dev/console
+GUEST
+	fi
 	export EXTRA_QEMU="${EXTRA_QEMU:-} -drive id=share,if=none,format=raw,readonly=on,file=fat:ro:$RUN/share -device usb-storage,bus=xhci.0,drive=share"
 fi
 : > "$SERIAL"
