@@ -123,11 +123,13 @@ private:
 	};
 	void consume(const CmdSource &src, uint32_t read, uint32_t n);
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
-	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd);
+	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void completeStamp(uint32_t index, uint32_t value);
 	// display pipes (docs/m1-stream.md s.1b): the shared-state pages the guest announced, the events the host puts into them
 	void dropPipes();
+	void dropPipe(uint32_t port, const char *why);
+	bool pipeStillOurs(uint32_t port);
 	void pollDisplay();
 	void unmapFifo();
 	// child channels (docs/m1-stream.md s.1): DefineChannel -> state record in the root page -> page-list ring
@@ -165,6 +167,7 @@ private:
 		IOMemoryDescriptor *desc { nullptr };
 		IOMemoryMap *map { nullptr };
 		uint32_t page { 0 };
+		uint32_t channel { 0 };             // the channel the pipe's DisplaySetupSharedState arrived on (0 = root FIFO): the pipe goes when it does
 		uint32_t lastEnabled { 0 };
 		uint32_t cursorPos { 0xffffffff };
 		uint8_t cursorVisible { 0 };
@@ -435,7 +438,7 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 		if (c.id == 0x01 && c.length <= sizeof(mWin)) {
 			if (mCmds > 150)
 				copy(at, mWin, c.length);
-			answerDisplaySharedState(c, mWin);
+			answerDisplaySharedState(c, mWin, src.channel);
 		}
 		if (c.id == 0x02 && c.length <= sizeof(mWin)) {
 			copy(at, mWin, c.length);
@@ -495,7 +498,7 @@ void RDNA4PvHost::answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t
 // into the pipe (0 = SubmitTransaction is FIFO 0x06). The page stays mapped: it is where the host's display events go (docs/m1-stream.md s.1b). With the
 // online event on, the host also fills the display's info and sets the *online* pending bit: process_online runs when the guest enables the pipe (enable()
 // signals its own pending bits) or when the interrupt arrives afterwards.
-void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd) {
+void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel) {
 	const uint8_t *pl = cmd + c.payloadOffset;
 	if (c.length - c.payloadOffset < 8)
 		return;
@@ -522,6 +525,7 @@ void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const
 	}
 	uint8_t *va = reinterpret_cast<uint8_t *>(p.map->getVirtualAddress());
 	p.page = page;
+	p.channel = channel;
 	if (mDisp & kDispOnline) {
 		pvstream::disp::Info info = mDispInfo;
 		info.id = port + 1;
@@ -569,6 +573,39 @@ void RDNA4PvHost::dropPipes() {
 	mDispBits = 0;
 }
 
+// The shared-state page is guest memory the host only borrows: the guest frees it when the pipe goes (teardownSharedState sends nothing), after which the
+// physical page can be anything, and the host writes into it every frame. So before every host write the page must still look like the pipe's: the u16 at +0x12
+// is the port the host wrote there, and the enabled mask holds only the three event bits the driver ever stores (0xc, 0, 1, 0xd). If not, the pipe is let go and
+// never written again. (The check cannot close the race between it and the write; it closes the long window after a teardown.)
+bool RDNA4PvHost::pipeStillOurs(uint32_t port) {
+	const Pipe &p = mPipe[port];
+	if (!p.live || !p.map)
+		return false;
+	const uint8_t *va = reinterpret_cast<const uint8_t *>(p.map->getVirtualAddress());
+	uint16_t seen;
+	memcpy(&seen, va + pvstream::disp::kPort, 2);
+	const uint32_t enabled = *reinterpret_cast<const volatile uint32_t *>(va + pvstream::disp::kEnabled);
+	const uint32_t known = pvstream::disp::kEventVbl | pvstream::disp::kEventOnline | pvstream::disp::kEventOffline;
+	if (seen == port && !(enabled & ~known))
+		return true;
+	pvlog("host: display pipe %u: shared state page 0x%x is no longer ours (port field %u, enabled mask 0x%x): unmapped, no more writes to it", port, p.page, seen, enabled);
+	return false;
+}
+
+void RDNA4PvHost::dropPipe(uint32_t port, const char *why) {
+	Pipe &p = mPipe[port];
+	if (!p.live && !p.map)
+		return;
+	if (why)
+		pvlog("host: display pipe %u dropped: %s", port, why);
+	OSSafeReleaseNULL(p.map);
+	OSSafeReleaseNULL(p.desc);
+	p = Pipe();
+	if (volatile uint32_t *c = mNub->ctrl())
+		c[kRegIntrStatusDisp / 4] &= ~(1u << port);
+	mDispBits &= ~(1u << port);
+}
+
 // Each tick, for every live pipe: log what the guest enabled and what the cursor does, add a VBL event when a frame is due and the guest enabled VBL, and keep
 // INTR_STATUS_DISP bit `port` asserted for as long as an enabled event is pending (the guest's signalDisplay takes the pending bits atomically, which is what
 // drops it again). Level-triggered on purpose: the handler reads the register when its work-loop thread gets to it, which can be later than our next tick, and a
@@ -601,6 +638,10 @@ void RDNA4PvHost::pollDisplay() {
 		Pipe &p = mPipe[port];
 		if (!p.live)
 			continue;
+		if (!pipeStillOurs(port)) {
+			dropPipe(port, nullptr);
+			continue;
+		}
 		uint8_t *va = reinterpret_cast<uint8_t *>(p.map->getVirtualAddress());
 		uint32_t *pending = reinterpret_cast<uint32_t *>(va + pvstream::disp::kPending);
 		const uint32_t enabled = *reinterpret_cast<volatile uint32_t *>(va + pvstream::disp::kEnabled);
@@ -714,6 +755,9 @@ void RDNA4PvHost::freeChannel(uint32_t n) {
 	OSSafeReleaseNULL(mCh[n].desc);
 	mCh[n] = Channel();
 	pvlog("host: channel %u freed", n);
+	for (uint32_t port = 0; port < pvstream::disp::kMaxPorts; port++)
+		if (mPipe[port].live && mPipe[port].channel == n)
+			dropPipe(port, "its channel was freed");
 }
 
 void RDNA4PvHost::defineChannel(uint32_t n) {
@@ -1145,10 +1189,35 @@ void RDNA4PvHost::selfTest() {
 			mDispPhase = 6;
 			return;
 		}
-		default: {
+		case 6: {
 			if (nowMs() < mDispT0 + 20)
 				return;
 			testCheck(mPipe[5].cursorPos == (10u | (20u << 16)) && mPipe[5].cursorVisible == 1, "host noticed the cursor position and visibility in the shared state");
+			// "the page is no longer ours" (hub-task-456): VBL on again for pipe 5, wait for the host's first write, then the guest "frees" the pages: pipe 5's
+			// port field is overwritten, pipe 2's enabled mask becomes one the driver never stores. Neither pipe may be written again.
+			__atomic_store_n(enabled(page2), kEventVbl, __ATOMIC_SEQ_CST);
+			mDispT0 = nowMs();
+			mDispPhase = 7;
+			return;
+		}
+		case 7: {
+			if (!(__atomic_load_n(pending(page2), __ATOMIC_SEQ_CST) & kEventVbl) && nowMs() < mDispT0 + 300)
+				return;
+			testCheck(take(page2) & kEventVbl, "(control) the host still writes VBL events into pipe 5's page while it is ours");
+			const uint16_t scribble = 0xdead;
+			memcpy(page2 + kPort, &scribble, 2);                                  // pipe 5's page reused by someone else
+			__atomic_store_n(enabled(page1), 0x80, __ATOMIC_SEQ_CST);              // pipe 2's page reused: not a mask the driver stores
+			mDispT0 = nowMs();
+			mDispPhase = 8;
+			return;
+		}
+		default: {
+			if (nowMs() < mDispT0 + 60)   // more than three frames
+				return;
+			testCheck(!mPipe[5].live && !mPipe[2].live, "host let go of both pipes: port field overwritten (pipe 5), implausible enabled mask (pipe 2)");
+			testCheck(!(__atomic_load_n(pending(page2), __ATOMIC_SEQ_CST) & kEventVbl) && __atomic_load_n(pending(page1), __ATOMIC_SEQ_CST) == 0,
+			          "... and wrote nothing more into either page");
+			testCheck((c[kRegIntrStatusDisp / 4] & 0xff) == 0 && mDispBits == 0, "... and dropped their INTR_STATUS_DISP bits");
 			mStep = kStepTeardown;
 			return;
 		}
