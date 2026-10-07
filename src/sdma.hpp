@@ -38,12 +38,14 @@ constexpr uint32_t kCopyCpv         = 1u << 19;   // COPY_LINEAR: CPV (cpv_shift
 // Packet sizes in dwords.
 constexpr uint32_t kWriteDwords = 5;   // header, addr lo/hi, count, 1 data dword
 constexpr uint32_t kFenceDwords = 4;   // header, addr lo/hi, value
+constexpr uint32_t kTrapDwords  = 2;   // header, interrupt context
 constexpr uint32_t kFillDwords  = 5;   // header, addr lo/hi, pattern, bytes - 1
 constexpr uint32_t kCopyDwords  = 8;   // header, count, param, src lo/hi, dst lo/hi, DCC
 
 // Build into `out`; return the dwords written.
 uint32_t writeDword(uint32_t *out, uint64_t addr, uint32_t value);
 uint32_t fence(uint32_t *out, uint64_t addr, uint32_t value);
+uint32_t trap(uint32_t *out);
 uint32_t constFill(uint32_t *out, uint64_t addr, uint32_t pattern, uint32_t bytes);
 uint32_t copyLinear(uint32_t *out, uint64_t src, uint64_t dst, uint32_t bytes);
 
@@ -54,7 +56,9 @@ uint32_t copyLinear(uint32_t *out, uint64_t src, uint64_t dst, uint32_t bytes);
 // memory; the pointer does not.
 class Ring {
 public:
-	bool init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes);
+	// startWptr: the monotonic 64-bit byte pointer the ring continues from (0 on a fresh engine; after a wake WITHOUT power loss the engine still
+	// holds its pointers and lowering the wptr stalls it, docs/power-gfx.md s.9.6).
+	bool init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes, uint64_t startWptr = 0);
 	uint64_t mc() const { return base; }
 	uint32_t sizeBytes() const { return size; }
 	uint32_t sizeLog2Dwords() const;          // RB_SIZE field

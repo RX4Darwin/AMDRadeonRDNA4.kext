@@ -26,7 +26,10 @@
 #include "ipdiscovery.hpp"
 #include "modes.hpp"
 #include "modeset.hpp"
+#include "ndrv.hpp"
 #include "pipe.hpp"
+
+class IOMemoryMap;
 
 class RDNA4Device {
 public:
@@ -77,12 +80,26 @@ public:
 	// makes it a no-op.
 	void setDisplayPower(bool on);
 	bool displayPowerOn { true };
+	// The last 16 display power events (macOS display sleep / wake as the kext handled them), kept in the registry property RDNA4FB,DisplayPower
+	// (" ## " separated, newest last): the kernel log wraps, the registry does not. One small string is rebuilt per event (events are rare).
+	void displayPowerNote(bool on, const char *path, const char *result);
+	char     displayPowerHist[16][72] {};
+	uint32_t displayPowerEvents { 0 };
+
+	// NDRV hardware-cursor csc backend. Cursor memory and register programming
+	// are enabled only by rdna4-cursor=1; the default remains software cursor.
+	bool supportsHardwareCursor() const { return hwCursorReady; }
+	IOReturn setHardwareCursor(void *cursorRef);
+	IOReturn drawHardwareCursor(int32_t x, int32_t y, uint32_t visible);
+	void cursorRegProbe(const char *why);   // W32: read-only cursor plane dump (also called from the compute thread after a flip)
+	IOReturn getHardwareCursorDrawState(Ndrv::VDHardwareCursorDrawStateRec &state) const;
 
 	// Shared with the compute bring-up (compute.hpp): the BAR5 mapping and
 	// the IP discovery table. Null until init() found them.
 	volatile uint32_t *mmioBase() const { return rmmio; }
 	size_t mmioSize() const { return rmmioSize; }
 	const IpDiscovery *discovery() const { return ipDiscovery.isValid() ? &ipDiscovery : nullptr; }
+	uint64_t liveFramePeriodNs() const;
 
 private:
 	IOPCIDevice *pciDevice { nullptr };
@@ -187,6 +204,71 @@ private:
 	bool pathForPipe(AtomBios::DisplayPath &out);
 	bool runPlan(const ModeSet::Plan &plan);
 	bool waitFrames(uint32_t frames);
+
+	bool initHardwareCursor();
+	void freeHardwareCursor();
+	bool hwCursorRequested { false };
+	bool hwCursorReady { false };
+	bool hwCursorSet { false };
+	bool hwCursorVisible { false };
+	int32_t hwCursorX { 0 }, hwCursorY { 0 };
+	uint16_t hwCursorHotX { 0 }, hwCursorHotY { 0 };
+	uint32_t cursorDrawCalls { 0 }, cursorDrawLogs { 0 };
+	uint32_t *cursorStage { nullptr };
+	volatile uint32_t *cursorVram { nullptr };
+	IODeviceMemory *cursorMemory { nullptr };
+	IOMemoryMap *cursorMap { nullptr };
+	uint64_t cursorMcAddr { 0 };
+	uint32_t cursorWidth { 0 }, cursorHeight { 0 };
+	uint32_t cursorCtlBase { 0 };                // HUBP CURSOR_CONTROL without the enable bit
+	bool hwCursorEnabledHw { false };            // the enable bits as last written to the hardware
+	uint32_t cursorVisChanges { 0 };
+	// Evidence that survives the kernel log wrapping: registry property
+	// RDNA4FB,Cursor (cursor.cpp cursorNote).
+	char cursorTrail[16384] { 0 };   // W40: 16 KiB, the Linux diff and the CM/MPCC lines came on top of the 12 KiB trail
+	uint16_t cursorTrailLen { 0 };
+	bool cursorTrailFull { false };
+	void cursorNote(const char *fmt, ...) __printflike(2, 3);
+	void cursorDumpState(const char *why);
+	void latchNote(const char *fmt, ...) __printflike(2, 3);   // "latch:" line, also into the cursor trail
+	void cursorTrailAppend(const char *line);
+	void cursorTrailAppendLocked(const char *line);
+	// The MPC cursor lock (CUR_VUPDATE_LOCK_SET<opp>, dc/mpc/dcn10/dcn10_mpc.c:458-463) that
+	// brackets every cursor update in amdgpu; nested calls are counted.
+	void cursorMpcLock(bool lock);
+	void cursorLockNote(const char *why);
+	bool cursorWaitLatched(const char *why, uint32_t maxMs);
+	uint32_t cursorLockDepth { 0 }, cursorLatchLogs { 0 };
+	bool cursorUseLock { true };   // rdna4-cursorlock=0 turns the lock handling off (A/B control)
+	bool cursorGopHeld { false };  // the lock was found held at arming; released at the end of the first bracket
+	void cursorProgramPlane(bool enable);
+	void cursorSelfTest();
+	// W32: cursor request scheduling (DCN_CUR0_TTU_CNTL0/1). cursorRegProbe only reads and is callable from
+	// the compute thread (flip hook); cursorProgramTtu writes, only inside the rdna4-cursor=2 lock bracket.
+	bool cursorProgramTtu();            // opt-in: rdna4-cursorttu=1
+	bool cursorProgramMissionMode();    // W34: HUBPREQ_DEBUG_DB = 1 << 8 as amdgpu does (rdna4-cursordlg=0 skips)
+	// W38 (premetal/rootcause-cursor.md), rdna4-cursor=2 only:
+	void cursorDsclDump(const char *why);   // read-only: DSCL, HUBP request and MPCC lock state the GOP left
+	void cursorPipeFixes();                 // CRQ_EXPANSION_MODE, cursor memory power, (rdna4-cursormpcsel=1) MPCC_UPDATE_LOCK_SEL
+	void cursorDsclDecide();                // DSCL_MODE/RECOUT verdict; rdna4-cursordscl=1 writes amdgpu's mode-0 set
+	bool cursorWaitFrames(uint32_t n);
+	const char *cursorCrcCheck(const char *label);   // OTG CRC over the square's window, cursor on/off/on/off: "YES"/"NO"/"INCONCLUSIVE"
+	// W40 (premetal/verify-cursor.md): the DPP colour-management block
+	void cursorCmDump(const char *why);     // read-only: CM0_CM_CONTROL and the CM sub-blocks
+	void cursorDlgDump(const char *why);    // read-only: the DLG/TTU registers 0x063b-0x0655
+	bool cursorCmApply();                   // CM_BYPASS = 0 + amdgpu's SDR identity CM state, OTG-locked (default on; rdna4-cursorcm=0 skips)
+	void cursorCmAuto(const char *why);     // W45: cursorCmApply at arming in the normal cursor mode (rdna4-cursor=1)
+	bool cursorMpccApply();                 // rdna4-cursormpcc=1: MPCC_MODE TOP_LAYER_ONLY, ALPHA_MULTIPLIED 0, as the Linux capture
+	void cursorLinuxDiff(const char *why);  // read-only: static pipe registers that differ from the Linux capture
+	bool cursorOtgUpdateLock(bool lock);    // the modeset OTG update-lock bracket, bounded
+	bool cursorPipeFixesOn { false };
+	uint32_t cursorProbeLogs { 0 };
+	bool cursorProbedSet { false }, cursorProbedDraw { false };
+	IOLock *cursorTrailLock { nullptr };   // the trail is appended from the display and the compute thread
+	uint32_t cursorDstXOffset(uint32_t px) const;
+	uint32_t cursorRefClkKHz { 50000 };          // DCHUB refclk for CURSOR_DST_X_OFFSET
+	bool cursorHold { false };                   // rdna4-cursor=2: keep the test square, ignore macOS's cursor calls
+	uint32_t cursorHeldCalls { 0 };
 };
 
 #endif /* RDNA4Device_hpp */
