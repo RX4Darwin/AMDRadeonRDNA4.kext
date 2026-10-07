@@ -2,8 +2,8 @@
 
 Written 2026-10-06 on `devel/address-space`. **First run on the card 2026-10-07** (below): clients now work in
 their own address spaces, and the two tests that fault on purpose hang their job. Three ways of letting such a job finish did
-nothing (second to fifth run). It is the queue's reset that was wrong; Linux's is built in and not run: the next run
-is the same boot again. Background: `docs/vm-client-rootcause.md` sections 11 and 12 and
+nothing (second to fifth run). Since the sixth run a fault is caught and reported and both fault tests pass; what is
+left is getting the queue back afterwards. The next run is the same boot again. Background: `docs/vm-client-rootcause.md` sections 11 and 12 and
 `docs/metal-readiness.md` section 4.
 
 ## First run, 2026-10-07
@@ -47,15 +47,18 @@ PASS, `gfx-client PASS`, idle 3 %), and the two fault tests are exactly as in th
 its job on this card whatever is done about the page, as it does under Linux. The question was the wrong one: not
 how the job can finish, but how the queue is got back.
 
-## Next run: boot C again, with Linux's queue reset
+## Sixth run, 2026-10-07
 
-Linux resets a compute queue on this chip with two register writes that need no firmware scheduler; the kext's
-recovery used a different one and never got the queue back (`docs/vm-client-rootcause.md` section 16). The new kext
-uses Linux's, ends a wait as soon as the job has faulted, and answers "the job faulted" rather than a timeout. The
-attempts of the last three runs are taken out again.
+Kext `61554AD5` and the new `rdna4-run`, log `rdna4fb-diag-20261007-135449`. **Both fault tests pass**: the fault is
+caught in under 3 ms and the client is told its job faulted. The queue's reset goes through cleanly (`reset (RLC safe
+mode acknowledged): inactive`) and the fresh queue still runs nothing, so everything after the first fault on each
+queue fails as before.
 
-**Both** `build/RDNA4FB.kext` and `build/rdna4-run` are new (the isolation test now takes "the job faulted" as the
-expected answer). Same arguments:
+## Next run: boot C again, with a second stage in the recovery
+
+When the reset is not enough, the new kext restarts that one pipe of the compute engine and tries the queue again,
+logging the state before and after; and a new client goes to the other shared queue when its own is out of service
+(`docs/vm-client-rootcause.md` section 17). The pipe restart is an experiment. Only the kext is new. Same arguments:
 
 ```
 rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-hang=1 rdna4-trace=1
@@ -65,18 +68,10 @@ rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-hang=1 rdna4-trac
 sudo bash diagnostic-log.sh
 ```
 
-What to look for:
-
-- in the kernel log, twice: `vmshared: runtime: shared queue N reset (RLC safe mode acknowledged): inactive`, then
-  `vmshared: runtime: shared queue N recovered (WRITE_DATA proof landed)`, and `runtime: dispatch ended by a fault in
-  address space N after ... us; shared queue N recovered without a GPU reset`
-- in the script's own test output: `ok    VM isolation: client B could not read client A's VA (the job faulted and was
-  stopped)`, `ok    dispatch through freed host VA faulted cleanly ((iokit/common) misc. VM failure)`, and the tests
-  after them with results of their own instead of `device not responding`
-- the rows `vm`, `runtime`, `submitib`, `fault`, and `gfx-app-tri`
-
-If the queue is `NOT recovered` again, the lines just before say whether safe mode was acknowledged and whether the
-queue went inactive, which is where to look next.
+What to look for in the kernel log after each fault: `shared queue N reset ...: inactive`, then either `recovered
+(WRITE_DATA proof landed)` at once, or `still dead: MEC pipe N restarted ..., instruction pointer 0x... -> 0x...` and
+then `recovered` or `NOT recovered`. In the script's output: the two fault tests `ok` as in the sixth run, and whether
+the tests after them (`VM peer`, the three `SubmitIb` lines) now have results of their own.
 
 What changed: with `rdna4-vm=1` a client of the compute runtime (`RDNA4ComputeClient`, `rdna4-run`) gets its own
 GPU address space. Until now each such client also got a compute queue of its own inside that address space, and

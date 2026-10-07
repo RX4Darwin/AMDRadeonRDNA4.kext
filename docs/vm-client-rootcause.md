@@ -423,3 +423,35 @@ inactive`, then `shared queue N recovered (WRITE_DATA proof landed)`.
 halts it until the next boot (`gfxClientWedge`, also the Vulkan interface's lost-work rule), and a copy that does not
 finish leaves the copy engine stopped. Linux's two other branches above are the way out of both.
 
+## 17. 2026-10-07, sixth run: faults are caught and reported; the queue still does not come back
+
+Log `rdna4fb-diag-20261007-135449`, kext `61554AD5`, new `rdna4-run`. [M]:
+
+- `ok  VM isolation: client B could not read client A's VA (the job faulted and was stopped)` and `ok    dispatch through
+  freed host VA faulted cleanly ((iokit/common) misc. VM failure)`: **both fault tests pass.** The kext sees the fault
+  2.8 ms after the job starts (`dispatch ended by a fault in address space 9 after 2852 us`) and answers
+  `kIOReturnVMError`.
+- The reset: `shared queue 1 reset (RLC safe mode acknowledged): inactive` within 0.2 ms, the HQD initialised again, and
+  `shared queue 1 NOT recovered: wedged` 200 ms later. The same on queue 0. **H14 is refuted**: amdgpu's MMIO reset
+  for a compute queue takes the queue down cleanly here, and the fresh queue still runs nothing.
+- Everything after the faults on those queues fails as before (`VM peer`, the `SubmitIb` tests, later opens).
+
+One thing was wrong in section 16: it called a reset of the whole pipe "Linux's fallback". The function I had in mind
+(`gfx_v12_reset_compute_pipe`) is not in the current `gfx_v12_0.c`, and today's `amdgpu_gfx_reset_mes_compute` does its
+work through MES (suspend all queues, have the firmware name the hung ones, resume). The MMIO queue reset of section 16
+is real and was read; in Linux it runs inside that MES sequence, which is not here.
+
+What the dumps of the failed recoveries have in common, across all runs: on pipe 1 the MEC's instruction pointer reads
+0x3fb5 before the reset and again when the proof has failed; `CPC_BUSY` 0x810 (pipe 1) and 0x480/0x481 (pipe 0).
+
+**The change** (kext `F15C3784`, compile-checked):
+
+- `recoverSharedQueue` has a second stage when the proof fails: the queue's state is logged, then **that one pipe of the
+  MEC is restarted** the way the bring-up starts all four (`mecStart`: its reset bit in `CP_MEC_RS64_CNTL` pulsed, in
+  safe mode), the queue initialised once more and the proof tried again; the instruction pointer before and after and
+  the queue's state after are logged. This is an experiment from the observation above, not a sequence read anywhere.
+- `rtOpenShared` puts a new client on the other shared queue when its own is out of service, so that one dead job
+  costs one queue and not the runtime.
+
+Whatever the second stage does, the next log has the state of a fresh queue that will not run, which no log so far has.
+

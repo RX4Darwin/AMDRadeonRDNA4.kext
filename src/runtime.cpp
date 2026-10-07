@@ -1802,7 +1802,10 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 	for (vmid = 8; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
 	if (vmid > 15)
 		return kIOReturnNoResources;
-	const uint32_t sq = slot & 1;
+	// The slot's own queue, or the other one if a dead job took that out of service (vmshared.cpp, recoverSharedQueue).
+	uint32_t sq = slot & 1;
+	if (sharedQ[sq].wedged || !sharedQ[sq].up)
+		sq ^= 1;
 	if (sharedQ[sq].wedged || !sharedQ[sq].up)
 		return kIOReturnNotResponding;
 	uint64_t table = 0;

@@ -155,24 +155,52 @@ bool RDNA4Compute::recoverSharedQueue(uint32_t k, uint32_t guiltyVmid, const cha
 		s.wedged = true;
 		return false;
 	}
-	for (uint32_t off = 0; off < 0x7000; off += 4)
-		*poolDw(s.area + off) = 0;
-	flushHdp();
-	const bool up = s.pm.init(poolDw(s.area + kVmPq), poolMc(s.area + kVmPq), kPqSize) &&
-	                hqdInitFor(false, s.pipe, s.queue, 0, poolMc(s.area + kVmMqd), poolMc(s.area + kVmEop) >> 8,
-	                           poolMc(s.area + kVmPq) >> 8, poolMc(s.area + kVmRptr), poolMc(s.area + kVmWptr), s.doorbell);
-	bool proof = false;
-	if (up) {
+	// The queue's registers again, and one packet through it.
+	bool up = false;
+	auto again = [&] {
+		for (uint32_t off = 0; off < 0x7000; off += 4)
+			*poolDw(s.area + off) = 0;
+		flushHdp();
+		up = s.pm.init(poolDw(s.area + kVmPq), poolMc(s.area + kVmPq), kPqSize) &&
+		     hqdInitFor(false, s.pipe, s.queue, 0, poolMc(s.area + kVmMqd), poolMc(s.area + kVmEop) >> 8,
+		                poolMc(s.area + kVmPq) >> 8, poolMc(s.area + kVmRptr), poolMc(s.area + kVmWptr), s.doorbell);
+		if (!up)
+			return false;
 		volatile uint32_t *word = poolDw(s.area + kVmKernarg);
 		*word = 0;
 		flushHdp();
 		uint32_t pkt[8];
-		if (s.pm.emit(pkt, Pm4::writeData(pkt, poolMc(s.area + kVmKernarg), 0x600DF00D))) {
-			pm4Kick(s.pm, s.doorbell, s.pm.wptr());
-			for (uint32_t ms = 0; ms < 200 && *word != 0x600DF00D; ms++)
-				IOSleep(1);
-			proof = *word == 0x600DF00D;
-		}
+		if (!s.pm.emit(pkt, Pm4::writeData(pkt, poolMc(s.area + kVmKernarg), 0x600DF00D)))
+			return false;
+		pm4Kick(s.pm, s.doorbell, s.pm.wptr());
+		for (uint32_t ms = 0; ms < 200 && *word != 0x600DF00D; ms++)
+			IOSleep(1);
+		return *word == 0x600DF00D;
+	};
+	bool proof = again();
+	if (!proof && up) {
+		/* 2026-10-07, sixth run: after a job that faulted, the queue reset above goes through (safe mode acknowledged, the queue inactive)
+		 * and the fresh queue still runs nothing; the pipe's instruction pointer had not moved across the reset. An experiment, not a
+		 * sequence read anywhere: restart that one pipe of the MEC the way the bring-up starts all four (mecStart: its reset bit in
+		 * CP_MEC_RS64_CNTL pulsed, its entry address still in place), then the queue once more. Every other queue of the pipe loses its
+		 * place too; pipe 0 also carries the kernel's boot queue. */
+		logComputeQueueState(tag, s.pipe, s.queue, 0);
+		const uint32_t cntl = rdGc(CpMecRs64Cntl), bit = 1u << (16 + s.pipe);
+		const bool safe2 = rlcSafeMode(true);
+		grbmSelect(1, s.pipe, 0, 0);          // the instruction pointer is read per pipe
+		const uint32_t pcBefore = rdGc(CpMecRs64InstrPntr);
+		wr(IpDiscovery::HwGc, CpMecRs64Cntl, cntl | bit);
+		wr(IpDiscovery::HwGc, CpMecRs64Cntl, cntl & ~bit);
+		IODelay(50);
+		const uint32_t pcAfter = rdGc(CpMecRs64InstrPntr);
+		grbmSelect(0, 0, 0, 0);
+		rlcSafeMode(false);
+		SLOG("%s: shared queue %u still dead: MEC pipe %u restarted (RLC safe mode %s), CP_MEC_RS64_CNTL 0x%08x -> 0x%08x, "
+		     "instruction pointer 0x%x -> 0x%x", tag, k, s.pipe, safe2 ? "acknowledged" : "NOT acknowledged", cntl,
+		     rdGc(CpMecRs64Cntl), pcBefore, pcAfter);
+		proof = again();
+		if (!proof)
+			logComputeQueueState(tag, s.pipe, s.queue, 0);
 	}
 	s.up = up;
 	s.wedged = !proof;
