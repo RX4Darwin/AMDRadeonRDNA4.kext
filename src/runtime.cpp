@@ -446,10 +446,25 @@ void RDNA4Compute::publishRuntime(uint32_t stage) {
 	}
 }
 
+/* Per-client accounting (rdna4-vmshared=2): one client cannot take the global tables. */
+bool RDNA4Compute::clientOverQuota(const void *owner, bool program) const {
+	if (vmShared != 2)
+		return false;
+	uint32_t n = 0;
+	if (program) {
+		for (const RtProgram &p : programs)
+			n += p.owner == owner;
+		return n >= kClientPrograms;
+	}
+	for (const RtBuffer &b : buffers)
+		n += b.owner == owner;
+	return n >= kClientBuffers;
+}
+
 RDNA4Compute::RtBuffer *RDNA4Compute::bufferFor(const void *owner, uint64_t handle) {
 	uint32_t slot;
 	uint16_t gen;
-	if (!owner || !slotOf(handle, kMaxBuffers, slot, gen))
+	if (!owner || !slotOf(handle, bufferCap(), slot, gen))
 		return nullptr;
 	RtBuffer &b = buffers[slot];
 	return b.owner == owner && b.gen == gen ? &b : nullptr;
@@ -458,7 +473,7 @@ RDNA4Compute::RtBuffer *RDNA4Compute::bufferFor(const void *owner, uint64_t hand
 RDNA4Compute::RtProgram *RDNA4Compute::programFor(const void *owner, uint64_t handle) {
 	uint32_t slot;
 	uint16_t gen;
-	if (!owner || !slotOf(handle, kMaxPrograms, slot, gen))
+	if (!owner || !slotOf(handle, programCap(), slot, gen))
 		return nullptr;
 	RtProgram &p = programs[slot];
 	return p.owner == owner && p.gen == gen ? &p : nullptr;
@@ -478,7 +493,7 @@ RDNA4Compute::RtClient *RDNA4Compute::clientFor(const void *owner) {
  * that map memory or use the client's queue ask for this one. */
 RDNA4Compute::RtClient *RDNA4Compute::vmClientFor(const void *owner) {
 	RtClient *c = clientFor(owner);
-	return vmEnabled && c && c->tableShadow ? c : nullptr;
+	return vmEnabled && c && hasTables(*c) ? c : nullptr;
 }
 
 IOReturn RDNA4Compute::ownerStateLocked(const void *owner) const {
@@ -490,8 +505,145 @@ IOReturn RDNA4Compute::ownerStateLocked(const void *owner) const {
 	return kIOReturnSuccess;
 }
 
+/* ---- sparse page tables (rdna4-vmshared=2; ptpages.hpp) ------------------------------------------------ */
+
+bool RDNA4Compute::sparseAllocChunk(void *ctx, uint64_t &off) {
+	return static_cast<RDNA4Compute *>(ctx)->devHeap.alloc(PtPages::kChunkPages * PtPages::kPageBytes, off);
+}
+
+void RDNA4Compute::sparseFreeChunk(void *ctx, uint64_t off) {
+	static_cast<RDNA4Compute *>(ctx)->devHeap.free(off);
+}
+
+/* Modes 0/1: the shadow entry at logical byte offset `off` of the client's contiguous table image (GpuVmTable::legacyEntry / legacyPhys, which the host
+ * test compares against the pre-S8 code). Sparse clients never come through here: they use the tree below. */
+uint64_t *RDNA4Compute::ptEntry(RtClient &c, uint64_t off) {
+	return GpuVmTable::legacyEntry(c.tableShadow, off);
+}
+
+bool RDNA4Compute::ptPhys(RtClient &c, uint64_t off, uint64_t &phys) {
+	phys = GpuVmTable::legacyPhys(c.rootPhys, off);
+	return true;
+}
+
+/* ---- the tree (rdna4-vmshared=2) ---- */
+
+uint64_t *RDNA4Compute::sparseAllocShadow(void *ctx) {
+	auto *self = static_cast<RDNA4Compute *>(ctx);
+	if (self->sparseShadowPages >= kSparseShadowMax)
+		return nullptr;
+	auto *mem = static_cast<uint64_t *>(IOMalloc(0x1000));
+	if (!mem)
+		return nullptr;
+	bzero(mem, 0x1000);
+	self->sparseShadowPages++;
+	return mem;
+}
+
+void RDNA4Compute::sparseFreeShadow(void *ctx, uint64_t *page) {
+	auto *self = static_cast<RDNA4Compute *>(ctx);
+	IOFree(page, 0x1000);
+	if (self->sparseShadowPages)
+		self->sparseShadowPages--;
+}
+
+bool RDNA4Compute::sparsePhysOf(void *ctx, uint64_t heapOffset, uint64_t &physical) {
+	auto *self = static_cast<RDNA4Compute *>(ctx);
+	return self->gpuPhysical(self->vramMc(heapOffset), physical);
+}
+
+bool RDNA4Compute::treePageThunk(void *ctx, uint32_t level, uint64_t key, bool create, uint64_t *&entries, uint64_t &phys, uint32_t &id) {
+	auto *t = static_cast<TreeCtx *>(ctx);
+	PtPages::Page page;
+	if (!t->c->sp->s.get(t->self->sparseHost(), level, key, create, page))
+		return false;
+	entries = page.entries;
+	phys = page.phys;
+	id = page.id;
+	return true;
+}
+
+void RDNA4Compute::treeDirtyThunk(void *ctx, uint32_t id) {
+	auto *t = static_cast<TreeCtx *>(ctx);
+	t->c->sp->s.markDirty(id);
+}
+
+/* Every page whose shadow changed goes to its own VRAM page (staging + SDMA). A page stays marked until its copy worked. */
+bool RDNA4Compute::sparseSync(RtClient &c) {
+	if (!c.sp || !poolCpu || !devHeap.size())
+		return false;
+	uint32_t id = 0;
+	uint64_t *shadow = nullptr, heapOffset = 0;
+	while (c.sp->s.nextDirty(id, shadow, heapOffset)) {
+		memcpy(poolCpu + kVmTableStage, shadow, 0x1000);
+		(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + kVmTableStage);
+		flushHdp();
+		uint32_t pkt[Sdma::kCopyDwords];
+		if (!Sdma::copyLinear(pkt, poolMc(kVmTableStage), vramMc(heapOffset), 0x1000) ||
+		    !sdmaRun(pkt, Sdma::kCopyDwords, 2000)) {
+			RLOG("vmid %u: sparse page-table SDMA sync failed (page %u)", c.vmid, id);
+			return false;
+		}
+		c.sp->s.clean(id);
+	}
+	return true;
+}
+
+/* The root (always the first page, so id 0) is the client's page directory; nothing below it exists until a mapping needs it. */
+bool RDNA4Compute::sparseOpen(RtClient &c, uint32_t quotaPages) {
+	c.sp = static_cast<SparseTables *>(IOMalloc(sizeof(SparseTables)));
+	if (!c.sp)
+		return false;
+	bzero(c.sp, sizeof(SparseTables));
+	c.sp->s.init(quotaPages);
+	PtPages::Page root;
+	uint64_t *shadow = nullptr, heapOffset = 0;
+	if (!c.sp->s.get(sparseHost(), 0, 0, true, root) || root.id != 0 || !c.sp->s.pageAt(0, shadow, heapOffset)) {
+		sparseTeardown(c, false);
+		return false;
+	}
+	c.rootMc = vramMc(heapOffset);
+	c.rootPhys = root.phys;
+	if (!sparseSync(c)) {
+		sparseTeardown(c, true);
+		return false;
+	}
+	return true;
+}
+
+/* Give a sparse client's table memory back. With clearVram the VRAM pages are first overwritten with zeros (a stale PTE page must not be
+ * readable through a reused chunk); after a resume the VRAM is gone and only the host memory is freed. */
+void RDNA4Compute::sparseTeardown(RtClient &c, bool clearVram) {
+	if (!c.sp)
+		return;
+	if (clearVram) {
+		for (uint32_t id = 0; id < c.sp->s.idCount(); id++) {
+			uint64_t *shadow = nullptr, heapOffset = 0;
+			if (!c.sp->s.pageAt(id, shadow, heapOffset))
+				continue;
+			bzero(shadow, 0x1000);
+			c.sp->s.markDirty(id);
+		}
+		(void)sparseSync(c);
+	}
+	c.sp->s.releaseAll(sparseHost(), clearVram);
+	IOFree(c.sp, sizeof(SparseTables));
+	c.sp = nullptr;
+	c.rootMc = c.rootPhys = 0;
+}
+
+uint64_t *RDNA4Compute::ptEntryThunk(void *ctx, uint64_t off) {
+	auto *p = static_cast<PtCtx *>(ctx);
+	return p->self->ptEntry(*p->c, off);
+}
+
+bool RDNA4Compute::ptPhysThunk(void *ctx, uint64_t off, uint64_t &phys) {
+	auto *p = static_cast<PtCtx *>(ctx);
+	return p->self->ptPhys(*p->c, off, phys);
+}
+
 bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, bool executable) {
-	if (!poolCpu || !c.tableShadow || !bytes || (va & (GpuVm::kPageBytes - 1)) ||
+	if (!poolCpu || !hasTables(c) || !bytes || (va & (GpuVm::kPageBytes - 1)) ||
 	    (mc & (GpuVm::kPageBytes - 1)))
 		return false;
 	uint64_t physical = 0;
@@ -500,52 +652,23 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (end < va || end > GpuVm::kVaEnd)
 		return false;
-	auto entry = [&c](uint64_t off) -> uint64_t * {
-		return c.tableShadow + off / sizeof(uint64_t);
-	};
-	uint64_t firstPt = ~0ull, lastPt = 0;
-	for (uint64_t at = va, phys = physical; at < end;
-	     at += GpuVm::kPageBytes, phys += GpuVm::kPageBytes) {
-		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
-		const uint64_t ptOff = 0x3000 + relative * 0x1000;
-		if (at < GpuVm::kVaStart || ptOff + 0x1000 > kVmTableBytes)
-			return false;
-		const uint32_t pdeIndex = GpuVm::index(at, 2);
-		const uint64_t pdeOff = 0x2000 + static_cast<uint64_t>(pdeIndex) * 8;
-		if (!*entry(pdeOff))
-			*entry(pdeOff) = GpuVm::encodePde(c.rootPhys + ptOff, GpuVm::kValid, 0);
-		const uint64_t pteOff = ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8;
-		if (firstPt == ~0ull)
-			firstPt = ptOff;
-		lastPt = ptOff;
-		/* amdgpu's composition for a VRAM BO on GC 12: VALID, READABLE, WRITEABLE, IS_PTE
-		 * (gart_pte_flags, amdgpu_ttm.c:1477; gmc_v12_0.c:794-796), EXECUTABLE when asked
-		 * (gmc_v12_0_get_vm_pte), MTYPE NC = 0, and no SNOOPED: amdgpu_ttm_tt_pde_flags adds it for
-		 * VRAM only when the BO is cached (amdgpu_ttm.c:1456-1458). */
-		uint64_t flags = GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable |
-		                 (vmIsPteOff ? 0 : GpuVm::kIsPte);
-		/* Linux's own tables on this card (rdna4-groundtruth vm-walk.txt) have EXE, READ and
-		 * WRITE on every leaf (0x...5f1 / 0x...3f1): the CP fetches the EOP buffer, the ring and
-		 * IBs with EXECUTE (IV src_data[1] 0x50 = READ|EXE; round 5: PERMISSION_FAULTS 8 on the EOP
-		 * page mapped R|W).  Mesa maps every BO R|W|X the same way (ac_linux_drm.c:235).
-		 * rdna4-vm-exec=0 restores the old R|W-only pages (negative control). */
-		if (executable || !vmExecOff)
-			flags |= GpuVm::kExecutable;
-		flags = (flags | vmPteSet) & ~vmPteClear;   /* W22 diagnostics only, 0 otherwise */
-		/* FRAG=4 says this PTE is part of a contiguous, 64 KiB-aligned run of
-		 * sixteen: only when the whole aligned block lies inside this mapping
-		 * (amdgpu_vm_pte_fragment); a lone 4 KiB page that merely happens to
-		 * be 64 KiB-aligned must stay FRAG=0. */
-		const uint64_t block = at & ~0xffffull;
-		const bool fragment64k = block >= va && block + 0x10000 <= end &&
-			((phys - (at - block)) & 0xffff) == 0;
-		*entry(pteOff) = GpuVm::encodePte(phys, flags, fragment64k);
+	if (c.sp) {
+		/* Sparse tables: GpuVmTable::treeMapVram creates the directories and PT pages the range needs; the pages it changed are synced. */
+		TreeCtx tc { this, &c };
+		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
+		return GpuVmTable::treeMapVram(tree, vmPolicy(), va, end, physical, executable) && sparseSync(c);
 	}
+	/* The entries are written by GpuVmTable::mapVram (src/gpuvmtable.cpp): the pre-S8 loop, byte-compared against the old code by the host test. */
+	PtCtx ctx { this, &c };
+	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
+	GpuVmTable::Span span;
+	if (!GpuVmTable::mapVram(access, vmPolicy(), kVmTableBytes, va, end, physical, executable, span))
+		return false;
 	/* The root, PDB1, and the PDB0 entry that points at the PT all have to
 	 * reach VRAM before the queue can walk this mapping. */
-	if (firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
+	if (span.firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
 		return false;
-	for (uint64_t pt = firstPt; pt <= lastPt; pt += 0x1000)
+	for (uint64_t pt = span.firstPt; pt <= span.lastPt; pt += 0x1000)
 		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
 			return false;
 	return true;
@@ -553,43 +676,26 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 
 bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses,
                              uint64_t bytes, bool executable) {
-	if (!poolCpu || !c.tableShadow || !pageBuses || !bytes ||
+	if (!poolCpu || !hasTables(c) || !pageBuses || !bytes ||
 	    (va & (GpuVm::kPageBytes - 1)))
 		return false;
 	const uint64_t mapped = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
 	const uint64_t end = va + mapped;
 	if (mapped < bytes || end < va || end > GpuVm::kVaEnd)
 		return false;
-	auto entry = [&c](uint64_t off) -> uint64_t * {
-		return c.tableShadow + off / sizeof(uint64_t);
-	};
-	uint64_t firstPt = ~0ull, lastPt = 0;
-	uint64_t page = 0;
-	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes, page++) {
-		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
-			return false;
-		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
-		const uint64_t ptOff = 0x3000 + relative * 0x1000;
-		if (at < GpuVm::kVaStart || ptOff + 0x1000 > kVmTableBytes)
-			return false;
-		const uint32_t pdeIndex = GpuVm::index(at, 2);
-		const uint64_t pdeOff = 0x2000 + static_cast<uint64_t>(pdeIndex) * 8;
-		if (!*entry(pdeOff))
-			*entry(pdeOff) = GpuVm::encodePde(c.rootPhys + ptOff, GpuVm::kValid, 0);
-		const uint64_t pteOff = ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8;
-		if (firstPt == ~0ull)
-			firstPt = ptOff;
-		lastPt = ptOff;
-		uint64_t flags = GpuVm::kSystem | GpuVm::kSnooped | GpuVm::kValid |
-		                 GpuVm::kReadable | GpuVm::kWritable | (vmIsPteOff ? 0 : GpuVm::kIsPte);
-		if (executable || !vmExecOff)
-			flags |= GpuVm::kExecutable;
-		/* Cached GTT on gfx12.0 uses MTYPE_NC, encoded as zero. */
-		*entry(pteOff) = GpuVm::encodePte(pageBuses[page], flags, false);
+	if (c.sp) {
+		TreeCtx tc { this, &c };
+		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
+		return GpuVmTable::treeMapHost(tree, vmPolicy(), va, end, pageBuses, executable) && sparseSync(c);
 	}
-	if (firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
+	PtCtx ctx { this, &c };
+	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
+	GpuVmTable::Span span;
+	if (!GpuVmTable::mapHost(access, vmPolicy(), kVmTableBytes, va, end, pageBuses, executable, span))
 		return false;
-	for (uint64_t pt = firstPt; pt <= lastPt; pt += 0x1000)
+	if (span.firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
+		return false;
+	for (uint64_t pt = span.firstPt; pt <= span.lastPt; pt += 0x1000)
 		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
 			return false;
 	return true;
@@ -613,28 +719,31 @@ bool RDNA4Compute::initRuntimeHeap() {
 }
 
 void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
-	if (!poolCpu || !c.tableShadow || !bytes || va & (GpuVm::kPageBytes - 1))
+	if (!poolCpu || !hasTables(c) || !bytes || va & (GpuVm::kPageBytes - 1))
 		return;
+	c.tlbSeq++;      /* a removed PTE: the next job on any VMID this client owns flushes first (amdgpu's tlb_seq) */
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
-	uint64_t firstPt = ~0ull, lastPt = 0;
-	for (uint64_t at = va; at < end && at >= va; at += GpuVm::kPageBytes) {
-		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
-		const uint64_t ptOff = 0x3000 + relative * 0x1000;
-		if (at < GpuVm::kVaStart || ptOff + 0x1000 > kVmTableBytes)
-			break;
-		const uint64_t pteOff = ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8;
-		c.tableShadow[pteOff / sizeof(uint64_t)] = 0;
-		if (firstPt == ~0ull)
-			firstPt = ptOff;
-		lastPt = ptOff;
+	if (c.sp) {
+		TreeCtx tc { this, &c };   // treeUnmap never backs a page just to clear a PTE in it
+		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
+		GpuVmTable::treeUnmap(tree, va, end);
+		if (!sparseSync(c))
+			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
+		return;
 	}
-	for (uint64_t pt = firstPt; pt != ~0ull && pt <= lastPt; pt += 0x1000)
+	PtCtx ctx { this, &c };
+	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
+	GpuVmTable::Span span;
+	GpuVmTable::unmap(access, kVmTableBytes, va, end, span);
+	for (uint64_t pt = span.firstPt; pt != ~0ull && pt <= span.lastPt; pt += 0x1000)
 		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
 			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
 }
 
 bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
-	if (!c.tableShadow || offset > kVmTableBytes || bytes > kVmTableBytes - offset ||
+	if (c.sp)
+		return sparseSync(c);       // the tree tracks what changed; (offset, bytes) only describe the contiguous image
+	if (!hasTables(c) || offset > kVmTableBytes || bytes > kVmTableBytes - offset ||
 	    !poolCpu || !devHeap.size() || offset & 0xfff || bytes & 0xfff) {
 		RLOG("vmid %u: page-table sync arguments rejected (offset 0x%x bytes 0x%x)",
 		     c.vmid, offset, bytes);
@@ -683,6 +792,18 @@ bool RDNA4Compute::vmContextInit(RtClient &c) {
 	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtEndLo.dword + 2 * n }, 0xffffffff);
 	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1PtEndHi.dword + 2 * n }, 0xffff);
 	return rdGc(Reg { 0, GcCtx1Cntl.dword + n }) == cntl;
+}
+
+/* Invalidate the VMID(s) the client's translations can be cached in: its fixed VMID, or (rdna4-vmshared=2) each VMID the pool has bound to it. A client with
+ * none bound has nothing cached; its removed PTEs are caught by tlbSeq at its next grab (amdgpu's tlb_seq). */
+bool RDNA4Compute::vmInvalidateOwned(RtClient &c, const char *tag) {
+	if (vmShared != 2)
+		return vmInvalidate(c.vmid, tag);
+	bool ok = true;
+	for (uint32_t v = Vmid::kFirst; v <= Vmid::kLast; v++)
+		if (vmPool.ownerOf(v) == reinterpret_cast<uintptr_t>(&c))
+			ok &= vmInvalidate(v, tag);
+	return ok;
 }
 
 bool RDNA4Compute::vmInvalidate(uint32_t vmid, const char *tag) {
@@ -1501,7 +1622,7 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 		return old->aborted ? kIOReturnAborted : kIOReturnSuccess;
 	RtClient *c = nullptr;
 	uint32_t slot = 0;
-	for (; slot < kMaxClients; slot++)
+	for (; slot < clientCap(); slot++)
 		if (!clients[slot].active) { c = &clients[slot]; break; }
 	if (!c)
 		return kIOReturnNoResources;
@@ -1511,6 +1632,8 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 		c->active = true;
 		return kIOReturnSuccess;
 	}
+	if (vmShared == 2)
+		return rtOpenPooled(owner, slot, c);
 	if (vmShared)
 		return rtOpenShared(owner, slot, c);
 	uint32_t vmid = 0;
@@ -1671,6 +1794,59 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 	RLOG("vmid %u: shared-queue client (rdna4-vmshared) on shared queue %u (MEC1 pipe %u queue %u, VMID 0), PDB2 MC 0x%llx, IB VA 0x%llx",
 	     vmid, sq, sharedQ[sq].pipe, sharedQ[sq].queue, c->rootMc, c->ibVa);
 	vmOpTrace("open", vmid, c->pipe, c->queue);
+	if (!vmSurveyClientDone) {
+		vmSurveyClientDone = true;
+		vmSurvey("after the first client opened");
+	}
+	return kIOReturnSuccess;
+}
+
+/* rdna4-vmshared=2: a client is an address space (sparse tables), a PASID and three pool pages; it holds no VMID and no queue until it submits. */
+IOReturn RDNA4Compute::rtOpenPooled(const void *owner, uint32_t slot, RtClient *c) {
+	if (!vmSharedEnsure())
+		return kIOReturnNotReady;
+	const uint32_t sq = slot & 1;
+	if (sharedQ[sq].wedged || !sharedQ[sq].up)
+		return kIOReturnNotResponding;
+	uint32_t area = 0;
+	if (!PtPages::areaFor(kVmDynBase, kVmDynStride, slot, kGfxOffset, area) || area + kVmDynStride > pool.size)
+		return kIOReturnNoMemory;   // the old 64 KiB-slot layout put slot 64 on the gfx ring; this one is checked against it
+	if (!devHeap.size())
+		return kIOReturnNoMemory;
+	*c = RtClient {};
+	c->owner = owner; c->shared = true; c->sq = static_cast<uint8_t>(sq);
+	c->pipe = sharedQ[sq].pipe; c->queue = sharedQ[sq].queue;
+	c->pasid = slot + 1;
+	c->poolOff = area - kVmFence;       // poolOff + kVmFence / kVmKernarg / kVmIb are the three pages of the area
+	if (!sparseOpen(*c, PtPages::kMaxPages)) {
+		*c = RtClient {};
+		return kIOReturnNoMemory;
+	}
+	for (uint32_t off = 0; off < kVmDynStride; off += 4)
+		*poolDw(area + off) = 0;
+	flushHdp();
+	c->kernargCpu = poolDw(c->poolOff + kVmKernarg);
+	c->fenceCpu = poolDw(c->poolOff + kVmFence);
+	/* W12k: the client's gfx fence dword (same page, zeroed above), as rtOpenInner and rtOpenShared set it: without it SubmitGfxIb answers
+	 * 'resource shortage' and the gfx client self-test fails 'setup' (Kiln's boot 13 + rdna4-vmshared=2 dry run). */
+	c->gfxFenceCpu = poolDw(c->poolOff + kVmFence + kGfxFenceSlot);
+	c->gfxFenceMc = poolMc(c->poolOff + kVmFence + kGfxFenceSlot);
+	c->nextVa += 4 * 0x1000;
+	c->fenceVa = c->nextVa; c->nextVa += 0x1000;
+	c->kernargVa = c->nextVa; c->nextVa += 0x1000;
+	c->ibVa = c->nextVa; c->nextVa += 0x1000;
+	if (!vmMap(*c, c->fenceVa, poolMc(c->poolOff + kVmFence), 0x1000, false) ||
+	    !vmMap(*c, c->kernargVa, poolMc(c->poolOff + kVmKernarg), 0x1000, false) ||
+	    !vmMap(*c, c->ibVa, poolMc(c->poolOff + kVmIb), 0x1000, true)) {
+		sparseTeardown(*c, true);
+		*c = RtClient {};
+		return kIOReturnNoMemory;
+	}
+	c->doorbell = sharedQ[sq].doorbell;
+	c->active = true;
+	RLOG("client slot %u (PASID %u) opened on shared queue %u: %u table pages (%u chunk), no VMID until its first job, %u shadow pages wired in all",
+	     slot, c->pasid, sq, c->sp->s.pages(), c->sp->s.chunksHeld(), sparseShadowPages);
+	vmOpTrace("open (pooled)", 0, c->pipe, c->queue);
 	if (!vmSurveyClientDone) {
 		vmSurveyClientDone = true;
 		vmSurvey("after the first client opened");
@@ -2023,9 +2199,9 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	if (!bytes || bytes > h.size())
 		return kIOReturnBadArgument;
 	uint32_t slot = 0;
-	while (slot < kMaxBuffers && buffers[slot].owner)
+	while (slot < bufferCap() && buffers[slot].owner)
 		slot++;
-	if (slot == kMaxBuffers)
+	if (slot == bufferCap() || clientOverQuota(owner, false))
 		return kIOReturnNoResources;
 	uint64_t off;
 	if (!h.alloc(bytes, off))
@@ -2073,9 +2249,9 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 	    rounded > kHostMaxTotal - hostBytesTotal)
 		return kIOReturnNoResources;
 	uint32_t slot = 0;
-	while (slot < kMaxBuffers && buffers[slot].owner)
+	while (slot < bufferCap() && buffers[slot].owner)
 		slot++;
-	if (slot == kMaxBuffers)
+	if (slot == bufferCap() || clientOverQuota(owner, false))
 		return kIOReturnNoResources;
 
 	IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithOptions(
@@ -2156,7 +2332,7 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 	}
 	if (pageBuses)
 		IOFree(pageBuses, pageCount * sizeof(uint64_t));
-	if (!vmInvalidate(c->vmid, "host map")) {
+	if (!vmInvalidateOwned(*c, "host map")) {
 		vmUnmap(*c, b.va, rounded);
 		releaseHost(b);
 		b.owner = nullptr;
@@ -2196,7 +2372,7 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	 * amdgpu_vm.c:1272). Device buffers used to skip it: a cached translation could then
 	 * still reach VRAM that the heap hands to another client. Inferred from the code, not
 	 * measured on the card. Failure handling is the host path's: log and go on. */
-	if (c && (b->va || host) && !vmInvalidate(c->vmid, host ? "host unmap" : "device unmap"))
+	if (c && (b->va || host) && !vmInvalidateOwned(*c, host ? "host unmap" : "device unmap"))
 		RLOG("vmid %u: %s buffer unmap invalidation timed out", c->vmid, host ? "host" : "device");
 	if (host) {
 		if (c) {
@@ -2254,9 +2430,9 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 	if (!length || length > RDNA4_MAX_CODE_OBJECT)
 		return kIOReturnBadArgument;
 	uint32_t slot = 0;
-	while (slot < kMaxPrograms && programs[slot].owner)
+	while (slot < programCap() && programs[slot].owner)
 		slot++;
-	if (slot == kMaxPrograms)
+	if (slot == programCap() || clientOverQuota(owner, true))
 		return kIOReturnNoResources;
 
 	auto *file = static_cast<uint8_t *>(IOMalloc(length));
@@ -2331,7 +2507,7 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 	if (RtClient *c = vmClientFor(owner)) {
 		vmUnmap(*c, p->va, heap.lengthOf(p->offset));
 		/* As rtFree: invalidate before the code pages return to the heap. */
-		if (!vmInvalidate(c->vmid, "program unmap"))
+		if (!vmInvalidateOwned(*c, "program unmap"))
 			RLOG("vmid %u: program unmap invalidation timed out", c->vmid);
 	}
 	heap.free(p->offset);
@@ -2385,6 +2561,20 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 
 	const uint64_t kernarg = c ? c->kernargVa : poolMc(kKernargOffset);
 	const uint32_t user[2] = { static_cast<uint32_t>(kernarg), static_cast<uint32_t>(kernarg >> 32) };
+	uint32_t qseq = 0;
+	if (c && c->shared && vmShared == 2) {
+		/* rdna4-vmshared=2: room in the shared ring, then a VMID bound to this client's tables (reused, or an idle one rebound over MMIO). */
+		SharedQueue &sq0 = sharedQ[c->sq];
+		if (sq0.wedged || !sq0.up) {
+			vmOpTrace("dispatch REFUSED: shared queue wedged/down", c->vmid, sq0.pipe, sq0.queue);
+			return kIOReturnNotResponding;
+		}
+		if (!sharedReserve(c->sq, 32) || !vmAcquire(*c)) {
+			vmOpTrace("dispatch REFUSED: no ring space or no VMID", c->vmid, sq0.pipe, sq0.queue);
+			return kIOReturnBusy;
+		}
+		qseq = ++sq0.seq;
+	}
 	Launch l {};
 	l.code = (c ? p->va : poolMc(p->offset)) + k.entryVa;
 	l.rsrc1 = k.rsrc1;
@@ -2434,16 +2624,26 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 		l.fenceAddress = poolMc(c->poolOff + kVmFence);
 		l.ibCpu = poolDw(c->poolOff + kVmIb);
 		l.ibVa = c->ibVa;
-		l.ibVmid = vmidForSubmit(*c);
+		l.ibVmid = c->vmid;          // after vmAcquire above (mode 2) or the fixed one
 		l.queueCpu = nullptr;
+		if (qseq) {
+			l.queueFenceAddr = sq.fenceMc;
+			l.queueFenceSeq = qseq;
+		}
 	}
 
 	uint64_t ns = 0;
 	if (c)
 		vmOpTrace("dispatch entry", l.vmid, l.pipe, l.queueId);
 	waitAborted = false;
+	const uint64_t ringBefore = qseq ? sharedQ[c->sq].pm.wptr() : 0;
 	const bool done = launch(l, "runtime", ns);
 	micros = ns / 1000;
+	if (qseq && sharedQ[c->sq].pm.wptr() > ringBefore) {
+		/* The job is in the ring: its VMID is busy until the queue fence reaches qseq, and it holds ring space until then. */
+		vmPool.noteSubmit(c->vmid, c->sq, qseq);
+		sharedCommit(c->sq, qseq, static_cast<uint32_t>(sharedQ[c->sq].pm.wptr() - ringBefore));
+	}
 	if (c)
 		vmOpTrace(done ? "dispatch done" : waitAborted ? "dispatch ABORTED (sleep requested)" : "dispatch TIMED OUT", l.vmid, l.pipe, l.queueId);
 	if (!done && waitAborted) {
@@ -2529,25 +2729,41 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	/* The same VMID-selected shader memory state as launch(): the user IB
 	 * supplies the program and resource registers, while this selector only
 	 * chains it and fences it. (Shared mode: SH_MEM was written for every VMID at the queues' start.) */
-	const uint32_t ibVmid = vmidForSubmit(*c);
+	uint32_t ibVmid = c->vmid;
 	if (!c->shared) {
 		grbmSelect(0, c->pipe, c->queue, ibVmid);
 		wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
 		wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 	}
+	uint32_t qseq = 0;
+	if (c->shared && vmShared == 2) {
+		/* rdna4-vmshared=2: ring space first, then a VMID bound to this client's tables; the job also writes the queue's own fence. */
+		if (!sharedReserve(c->sq, 40) || !vmAcquire(*c)) {
+			vmOpTrace("submitib REFUSED: no ring space or no VMID", c->vmid, c->pipe, c->queue);
+			return kIOReturnBusy;
+		}
+		qseq = ++sharedQ[c->sq].seq;
+		ibVmid = c->vmid;    // the one the pool just granted: it was read before the grab, which handed a stale VMID to the IB packet when the pool had moved the client
+	}
 	const uint32_t value = nextFence(c->fence);
 	uint32_t pkt[8];
 	Pm4::Queue &ring = c->shared ? sharedQ[c->sq].pm : c->pm4;
+	const uint64_t ringBefore = ring.wptr();
 	/* Shared: the fence is a ring-level write to the client's fence word (MC address); else a write through the client's VM. */
 	const uint64_t fenceAt = c->shared ? poolMc(c->poolOff + kVmFence) : c->fenceVa;
 	if (!ring.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync)) ||
 	    !ring.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), ibVmid)) ||
 	    !ring.emit(pkt, Pm4::releaseMem(pkt, fenceAt, value,
-	                                    ihActive && c->pipe < 2)))
+	                                    ihActive && c->pipe < 2)) ||
+	    (qseq && !ring.emit(pkt, Pm4::releaseMem(pkt, sharedQ[c->sq].fenceMc, qseq, false))))
 		return kIOReturnNoResources;
 	c->fence = value;
 	flushHdp();
 	pm4Kick(ring, c->doorbell, ring.wptr());
+	if (qseq) {
+		vmPool.noteSubmit(c->vmid, c->sq, qseq);
+		sharedCommit(c->sq, qseq, static_cast<uint32_t>(ring.wptr() - ringBefore));
+	}
 	vmOpTrace("submitib kicked", c->vmid, c->pipe, c->queue);
 	c->ibFences[c->ibOutstanding++] = value;
 	fence = value;
@@ -2730,8 +2946,12 @@ IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords
 		gfxClientRetire(o);
 	if (c.gfxOutstanding >= kMaxIbOutstanding || gfxClientPending >= kMaxGfxOutstanding)
 		return kIOReturnBusy;
-	/* The VMID's shader memory state, as the compute path and gfx_v12_0_init_compute_vmid set it (boot already does it for VMIDs 8-15). */
+	/* The VMID's shader memory state, as the compute path and gfx_v12_0_init_compute_vmid set it (boot already does it for VMIDs 8-15).
+	 * rdna4-vmshared=2: the VMID comes from the pool, bound to this client's tables for this job. */
 	const uint32_t ibVmid = vmidForSubmit(c);
+	if (!ibVmid)
+		return kIOReturnBusy;
+	const bool pooled = c.shared && vmShared == 2;
 	grbmSelect(0, 0, 0, ibVmid);
 	wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
 	wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
@@ -2742,13 +2962,21 @@ IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords
 	    !gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, ibVa, dwords, ibVmid)) ||
 	    !gfxRing.emit(pkt, Pm4::releaseMem(pkt, c.gfxFenceMc, value)))
 		return kIOReturnNoResources;
+	if (pooled) {
+		/* The pool must know this VMID has work in flight on the gfx ring: a ring-level fence (the ring's own, kGfxFenceOffset, in order) after
+		 * the client's: the VMID is not rebound for another client until it is reached. */
+		const uint32_t domainSeq = ++gfxFence;
+		if (!gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), domainSeq)))
+			return kIOReturnNoResources;
+		vmPool.noteSubmit(ibVmid, kGfxDomain, domainSeq);
+	}
 	c.gfxFence = value;
 	flushHdp();                                      // CPU-written IB/data through the BAR are visible to the CP (amdgpu #9, done from the CPU side)
 	gfxKick(gfxRing.wptr());
 	c.gfxFences[c.gfxOutstanding++] = value;
 	gfxClientPending++;
 	fence = value;
-	RLOG("vmid %u: submitted unprivileged gfx IB VA 0x%llx, %u dwords, gfx fence %u", c.vmid, ibVa, dwords, value);
+	RLOG("vmid %u: submitted unprivileged gfx IB VA 0x%llx, %u dwords, gfx fence %u", ibVmid, ibVa, dwords, value);
 	return kIOReturnSuccess;
 }
 
@@ -2883,7 +3111,7 @@ bool RDNA4Compute::gfxClientSelfTest() {
 		Locked g(rtLock);
 		RtClient *c = clientFor(owner);
 		const uint32_t ibOff = kGfxOffset + 0x30000, dataOff = kGfxOffset + 0x31000;   // free pool pages between the G3 slots and the target
-		if (c && c->tableShadow && c->gfxFenceCpu) {
+		if (c && hasTables(*c) && c->gfxFenceCpu) {
 			const uint64_t ibVa = c->nextVa, dataVa = c->nextVa + 0x1000;
 			c->nextVa += 0x2000;
 			if (vmMap(*c, ibVa, poolMc(ibOff), 0x1000, true) && vmMap(*c, dataVa, poolMc(dataOff), 0x1000, false)) {
@@ -3121,7 +3349,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			np++;
 		}
 	}
-	if (c && hostUnmapped && !vmInvalidate(c->vmid, "host unmap"))
+	if (c && hostUnmapped && !vmInvalidateOwned(*c, "host unmap"))
 		RLOG("vmid %u: host buffer cleanup invalidation timed out", c->vmid);
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner && b.host) {
@@ -3150,7 +3378,10 @@ void RDNA4Compute::rtRelease(const void *owner) {
 				if (!fenceReached(*c->fenceCpu, want))
 					(void)recoverSharedQueue(c->sq, c->vmid, "client close");
 			}
-			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + c->vmid - 1 }, 0);   // the context goes off before its tables do
+			if (vmShared == 2)
+				vmReleaseVmids(*c);    // every VMID the client owns: context off, IH LUT cleared, flushed, back to the pool
+			else
+				wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + c->vmid - 1 }, 0);   // the context goes off before its tables do
 		} else {
 		/* Dequeue is deliberately polled: W1's interrupt path is not required. */
 		vmOpTrace("release before dequeue", c->vmid, c->pipe, c->queue);
@@ -3167,6 +3398,14 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
 		grbmSelect(0, 0, 0, 0);
 		vmOpTrace(inactive ? "release after dequeue" : "release after dequeue TIMEOUT", c->vmid, c->pipe, c->queue);
+		}
+		if (c->sp) {
+			/* Sparse tables: zero every backed page in VRAM, then give the chunks and the wired shadow pages back. */
+			sparseTeardown(*c, true);
+			RLOG("client slot %d (PASID %u) closed: page tables freed (%u shadow pages still wired in all)",
+			     static_cast<int>(c - clients), c->pasid, sparseShadowPages);
+			*c = RtClient {};
+			return;
 		}
 		/* The table allocation is reused by the next client.  Unmapping each
 		 * live object leaves untouched PDEs/PTEs behind, so clear the complete
@@ -3290,6 +3529,10 @@ void RDNA4Compute::resetRuntimeForResume() {
 			IOFree(c.tableShadow, kVmTableBytes);
 			c.tableShadow = nullptr;
 		}
+		if (c.sp)
+			sparseTeardown(c, false);   // the VRAM is gone after the sleep; only the host memory goes back
+		if (vmShared == 2)
+			c.vmid = 0;        // pooled clients hold no VMID; the other modes keep what they had
 		c.aborted = true;
 		c.tableOffset = c.rootMc = c.rootPhys = 0;
 		c.queueCpu = nullptr;
@@ -3303,6 +3546,7 @@ void RDNA4Compute::resetRuntimeForResume() {
 	for (SharedQueue &q : sharedQ)
 		q.up = q.wedged = false;
 	sharedInit = false;
+	vmPool.unbindAll();         // every context is gone: the next job of each client rebinds
 	if (devHeapMap) {
 		IOFree(devHeapMap, devHeapMapBytes);
 		devHeapMap = nullptr;

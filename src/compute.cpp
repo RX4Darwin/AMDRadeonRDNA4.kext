@@ -114,9 +114,11 @@ uint32_t RDNA4Compute::requestedStage() {
 	return stage > StageKernel ? StageKernel : stage;
 }
 
-bool RDNA4Compute::requestedVmShared() {
-	uint32_t enabled = 0;
-	return PE_parse_boot_argn("rdna4-vmshared", &enabled, sizeof(enabled)) && enabled != 0;
+uint32_t RDNA4Compute::requestedVmShared() {
+	uint32_t mode = 0;
+	if (!PE_parse_boot_argn("rdna4-vmshared", &mode, sizeof(mode)))
+		return 0;
+	return mode > 2 ? 2 : mode;
 }
 
 bool RDNA4Compute::requestedVm() {
@@ -1369,7 +1371,7 @@ bool RDNA4Compute::gfxOffAllowedNow(const char **why) {
 	bool client = false;
 	if (rtLock) {
 		IOLockLock(rtLock);
-		for (uint32_t i = 0; i < kMaxClients; i++)
+		for (uint32_t i = 0; i < kClientSlots; i++)
 			if (clients[i].owner)
 				client = true;
 		IOLockUnlock(rtLock);
@@ -3224,6 +3226,8 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 		q.emit(pkt, Pm4::indirectBufferCompute(pkt, l.ibVa, ibN, l.ibVmid));
 	}
 	q.emit(pkt, Pm4::releaseMem(pkt, fenceAddress, fenceValue, irq));
+	if (viaIb && l.queueFenceAddr)
+		q.emit(pkt, Pm4::releaseMem(pkt, l.queueFenceAddr, l.queueFenceSeq, false));   // the shared queue's own fence (vmshared=2)
 
 	// The client's own queue (W2) or the kernel's; the end-of-pipe interrupt
 	// (W1) only wakes the wait, the fence decides. Without it: spin for the
