@@ -106,7 +106,8 @@ int main(void) {
 		printf("open: 0x%08x%s\n", r,
 		       r == (kern_return_t)kIOReturnNotFound ? " (no " RDNA4_VULKAN_SERVICE ": did the bring-up finish? rdna4-compute=7)"
 		       : r == (kern_return_t)kIOReturnNotPrivileged ? " (needs root)"
-		       : r == (kern_return_t)kIOReturnNotReady ? " (the runtime is not ready, has no DMA, or rdna4-vm is set)" : "");
+		       : r == (kern_return_t)kIOReturnNoResources ? " (address spaces 8 to 15 are all taken by the runtime's clients)"
+	       : r == (kern_return_t)kIOReturnNotReady ? " (the runtime is not ready, has no DMA, or rdna4-vmshared=2 is set)" : "");
 		return 1;
 	}
 	const uint64_t hello[2] = { N48N_ABI_VERSION, 0 };

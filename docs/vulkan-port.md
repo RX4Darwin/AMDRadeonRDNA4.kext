@@ -185,12 +185,15 @@ carries the calls and maps a buffer into the process. One connection at a time.
 | VRAM it does not | the device heap past the BAR; a buffer that allows it goes there first, because the other pool is small |
 | System memory | wired pages, zeroed, with the address the card reaches each page by (as the runtime's host buffers) |
 | The page table | 4 KiB pages of the pool heap, read and written by the CPU through the BAR |
-| The address space | number 8: the table's root, the range and the enable in that context's registers (`vmContextInit`), and after every change of the table an HDP flush and a flush of that address space's translation caches (`vmInvalidate`) |
+| The address space | number 8, or with `rdna4-vm=1` the lowest of 8 to 15 that no client of the runtime holds: the table's root, the range and the enable in that context's registers (`vmContextInit`), and after every change of the table an HDP flush and a flush of that address space's translation caches (`vmInvalidate`) |
 | A buffer in the process | `clientMemoryForType`: the system pages, or that part of BAR0 |
 | `GB_ADDR_CONFIG` | read from the card |
 
-It needs the compute bring-up (`rdna4-compute=6` or `7`) with its copy engine and DMA working, and refuses to open
-with `rdna4-vm=1`, whose clients use the same address-space numbers.
+It needs the compute bring-up (`rdna4-compute=6` or `7`) with its copy engine and DMA working. Until 2026-10-07 it
+refused to open with `rdna4-vm=1`, whose clients use the same address-space numbers; since then it takes its number
+from the runtime's table of the ones in use (`vmidUsed`), so both work in one boot (code, not yet run on the card:
+`docs/todo-vulkantest.md`, "With `rdna4-vm=1`"). It still refuses with `rdna4-vmshared=2`, which hands address spaces out
+per job.
 
 **The proof on the card** is a call of this kext's own, outside the Vulkan interface
 (`include/rdna4vulkan.h`): the kernel's copy queue, which stays in address space 0, is given a command buffer to

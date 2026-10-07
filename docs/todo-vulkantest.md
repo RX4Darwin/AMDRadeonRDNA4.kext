@@ -175,7 +175,7 @@ What failure looks like, from the bottom layer up:
 - `compute: ... failed; stopping`, or no `bring-up finished at stage 7`: the bring-up itself did not get through.
   That is below everything of this work; the `compute:` lines and the NVRAM trail in the log say where.
 - `n48nprobe` prints `open: 0x...` with a reason: no service (the bring-up did not finish), needs root, or not
-  ready (`runtime: dma: off` in the log: the interface needs the copy engine; or `rdna4-vm` is set).
+  ready (`runtime: dma: off` in the log: the interface needs the copy engine; or `rdna4-vmshared=2` is set).
 - A `FAILED` line before `the CPU reads back what it wrote to VRAM`: buffers, mappings or the mapping into the
   process; the probe then stops before the GPU is asked for anything.
 - `GPU copy: ... FAILED` with `0xe00002ed` and, in the log, `runtime: dma: SDMA fence N never came` and
@@ -345,6 +345,53 @@ What boot 4 did not cover, each one run of the same command with the Samsung set
 ```bash
 sudo ./vkprobe ./libvulkan_radeon.dylib show 2>&1 | tee vkprobe.txt
 ```
+
+## With `rdna4-vm=1`: the Vulkan interface and the runtime's clients in one boot
+
+Written 2026-10-07. Until now the interface refused to open with `rdna4-vm=1`. It now takes the lowest address
+space of 8 to 15 that no client of the runtime holds. New kext (`make`), new `build/n48nprobe` (`make n48nprobe`; only
+a message changed), the `vkprobe` and library of boot 4, and `build/rdna4-run` beside `diagnostic-log.sh`.
+
+```
+rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
+```
+
+**Step 1, one after the other.**
+
+```bash
+sudo ./n48nprobe > n48nprobe.txt 2>&1
+```
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
+```
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+Expected: `n48nprobe` prints `address space 8` and `all ok`; `vkprobe` as in boot 4 (fills, the triangle, the moving
+triangle for 5 s, the desktop back); the script's table as in the runs of `docs/todo-vmtest.md` (all rows PASS).
+
+**Step 2, at the same time.** Only if step 1 passed. The Vulkan program holds address space 8 and the boot display
+for two minutes while the runtime's tests run beside it, in address spaces 9 and up, on the same graphics ring. The
+triangle covers the Samsung, so both terminal windows go on the Lenovo (or use ssh). In the first:
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib show 120 > vkprobe2.txt 2>&1
+```
+
+and at once, in the second:
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+Expected: the triangle keeps moving, `vkprobe2.txt` ends as in step 1, and the table is all PASS, with `runtime: vmid
+9: shared-queue client` (not 8) in the kernel log. If the triangle stops or the script hangs, wait for both to end
+(the Vulkan side gives up after 10 s without progress) and send the log anyway.
+
+Report: the three text files and the two logs.
 
 ## After the tests
 

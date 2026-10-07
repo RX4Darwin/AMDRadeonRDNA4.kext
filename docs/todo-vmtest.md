@@ -96,8 +96,8 @@ Rig as for the Vulkan tests: RX 9070 XT, Big Sur 11.6.6, the firmware in the bui
 - Put `build/rdna4-run` **beside** `diagnostic-log.sh` (in the earlier runs it was missing, and the script then
   skips every runtime test). The script runs the tests itself; nothing else has to be typed.
 - Run the script within the first minutes after login, and reboot between boots A and B.
-- The Vulkan programs do not work in these boots: the Vulkan interface refuses to open with `rdna4-vm=1` (both
-  would use address space 8).
+- Since 2026-10-07 the Vulkan programs open in these boots too (the interface takes an address space the runtime's
+  clients do not hold); `docs/todo-vulkantest.md` has that test.
 
 ## Boot A: the new default
 

@@ -26,9 +26,10 @@
 //                             the client's buffers with the runtime's flip
 //                             and given back at the release or the close
 //
-//  One client at a time, root only, and not together with rdna4-vm, whose
-//  clients use the same address-space numbers. What shows that the address
-//  space works before anything is drawn in it is the copy test at the end
+//  One client at a time, root only. Its address space is the lowest of 8 to
+//  15 that no client of the runtime holds (rdna4-vm), so both can be open in
+//  one boot; not with rdna4-vmshared=2. What shows that the address space
+//  works before anything is drawn in it is the copy test at the end
 //  (include/rdna4vulkan.h).
 //
 //  Not run on the card.
@@ -53,7 +54,6 @@ using namespace GfxReg;
 
 namespace {
 
-constexpr uint32_t kVmid = 8;
 constexpr uint32_t kBuild = 1;             // what Hello and QueryInfo report as the kext's build
 constexpr uint64_t kPage = GpuVm::kPageBytes;
 constexpr uint32_t kBad = 0xffffffff;        // what RDNA4Compute::rd gives for a register it could not read
@@ -114,6 +114,7 @@ bool mapForCard(SystemMemory *s) {
 
 struct RDNA4Compute::N48nState {
 	const void  *owner;
+	uint32_t     vmid;           // its address space: the lowest of 8 to 15 no client of the runtime holds (vmidUsed)
 	uint64_t     copyTestPage;   // pool offset of the copy test's command page; 0 until the first test
 	uint64_t     fencePage;      // pool offset of the dword the graphics queue reports finished work in
 	uint32_t     ringDwords;     // what this client has put on the graphics ring since the ring last ran dry
@@ -217,7 +218,7 @@ struct N48nBackend {
 	static void flush(void *context) {
 		RDNA4Compute &c = of(context);
 		c.flushHdp();
-		(void)c.vmInvalidate(kVmid, "vulkan client");
+		(void)c.vmInvalidate(c.n48n->vmid, "vulkan client");
 	}
 
 	static bool readRegs(void *context, uint32_t dword, uint32_t count, uint32_t *out) {
@@ -250,7 +251,7 @@ struct N48nBackend {
 		const uint32_t need = 3 + 4 * count + 8;
 		if (s.ringDwords + need > c.gfxRing.sizeDwords() / 2)
 			return N48N::kBusy;
-		c.grbmSelect(0, 0, 0, kVmid);      // the address space's shader memory setup, as gfx_v12_0_init_compute_vmid has it
+		c.grbmSelect(0, 0, 0, s.vmid);     // the address space's shader memory setup, as gfx_v12_0_init_compute_vmid has it
 		c.wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
 		c.wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 		c.grbmSelect(0, 0, 0, 0);
@@ -260,7 +261,7 @@ struct N48nBackend {
 		// start with their own CONTEXT_CONTROL).
 		bool ok = c.gfxRing.emit(pkt, Pm4::contextControl(pkt, 0x80000000u, 0));
 		for (uint32_t i = 0; i < count; i++)
-			ok = ok && c.gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, ibs[i].va, ibs[i].dwords, kVmid));
+			ok = ok && c.gfxRing.emit(pkt, Pm4::indirectBufferGfx(pkt, ibs[i].va, ibs[i].dwords, s.vmid));
 		ok = ok && c.gfxRing.emit(pkt, Pm4::releaseMem(pkt, c.poolMc(static_cast<uint32_t>(s.fencePage)), sequence));
 		if (!ok)
 			return N48N::kNoResources;
@@ -417,34 +418,46 @@ IOReturn RDNA4Compute::n48nOpen(const void *owner) {
 	// System memory needs the card to reach host pages, which the DMA setup established.
 	if (!rtReady || powerSleeping || rtWedged || !poolCpu || !heap.size() || !dmaReady || !busMasterSet)
 		return kIOReturnNotReady;
-	if (vmEnabled) {
-		VLOG("not with rdna4-vm: its clients use address space %u too", kVmid);
-		return kIOReturnNotReady;
-	}
 	if (n48n)
 		return kIOReturnExclusiveAccess;
+	// ponytail: with rdna4-vmshared=2 the runtime hands address spaces out per job from a pool of its own (vmPool), which this does not
+	// know; the interface stays shut there. Take one from that pool when both are wanted.
+	if (vmShared == 2) {
+		VLOG("not with rdna4-vmshared=2: its address spaces are handed out per job");
+		return kIOReturnNotReady;
+	}
+	// An address space no client of the runtime holds, picked as rtOpenShared picks: 8 when none is open.
+	uint32_t vmid = 8;
+	for (; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
+	if (vmid > 15) {
+		VLOG("open failed: all of the address spaces 8 to 15 are taken");
+		return kIOReturnNoResources;
+	}
 	auto *s = static_cast<N48nState *>(IOMalloc(sizeof(N48nState)));
 	if (!s)
 		return kIOReturnNoMemory;
 	bzero(s, sizeof(*s));
 	s->owner = owner;
+	s->vmid = vmid;
+	n48n = s;                          // the backend reads the address space from it while the client opens
 	RtClient context {};
-	context.vmid = kVmid;
+	context.vmid = vmid;
 	const uint32_t gc = (static_cast<uint32_t>(sv.gcMajor) << 16) | (static_cast<uint32_t>(sv.gcMinor) << 8) | sv.gcRev;
-	if (!heap.alloc(kPage, s->fencePage) || !s->client.open(N48nBackend::make(this), kVmid, kBuild, gc) ||
+	if (!heap.alloc(kPage, s->fencePage) || !s->client.open(N48nBackend::make(this), vmid, kBuild, gc) ||
 	    !(context.rootPhys = s->client.root()) || !vmContextInit(context)) {
 		VLOG("open failed: %s", s->client.root() ? "the address space's registers did not take" : "no page for the table");
 		s->client.close();
 		if (s->fencePage)
 			heap.free(s->fencePage);
 		IOFree(s, sizeof(*s));
+		n48n = nullptr;
 		return kIOReturnNoMemory;
 	}
 	N48nBackend::zero(*this, s->fencePage, kPage);
 	N48nBackend::flush(this);
-	n48n = s;
+	vmidUsed[vmid] = true;
 	VLOG("client open: address space %u, table root at physical 0x%llx; %llu MiB of VRAM behind the BAR, %llu MiB past it",
-	     kVmid, s->client.root(), heap.size() >> 20, devHeap.size() >> 20);
+	     vmid, s->client.root(), heap.size() >> 20, devHeap.size() >> 20);
 	return kIOReturnSuccess;
 }
 
@@ -460,7 +473,8 @@ void RDNA4Compute::n48nClose(const void *owner) {
 	}
 	if (!n48n->client.quiesce())       // its work first: that still needs the address space
 		VLOG("client closes with work on the graphics queue that did not finish");
-	wr(IpDiscovery::HwGc, Reg { 0, static_cast<uint16_t>(GcCtx1Cntl.dword + kVmid - 1) }, 0);   // the context goes off before its table does
+	wr(IpDiscovery::HwGc, Reg { 0, static_cast<uint16_t>(GcCtx1Cntl.dword + n48n->vmid - 1) }, 0);   // the context goes off before its table does
+	vmidUsed[n48n->vmid] = false;
 	if (n48n->copyTestPage)
 		heap.free(n48n->copyTestPage);
 	n48n->client.close();
@@ -480,6 +494,7 @@ void RDNA4Compute::n48nDiscard() {
 		if (b && b->memory.system)
 			N48nBackend::free(this, b->memory, b->bytes);
 	}
+	vmidUsed[n48n->vmid] = false;
 	IOFree(n48n, sizeof(N48nState));
 	n48n = nullptr;
 	VLOG("client dropped: the card lost its memory; its calls answer \"not ready\" from here on");
@@ -562,13 +577,13 @@ IOReturn RDNA4Compute::n48nCopyTest(uint64_t source, uint64_t destination, uint6
 
 	uint32_t ring[7 + Sdma::kIndirectDwords] {};
 	uint32_t n = Sdma::indirectPad(sdmaRing.wptr());
-	n += Sdma::indirect(ring + n, kCopyTestVa, Sdma::kCopyDwords, kVmid);
+	n += Sdma::indirect(ring + n, kCopyTestVa, Sdma::kCopyDwords, n48n->vmid);
 	if (!sdmaRun(ring, n, 2000)) {
 		VLOG("copy test: the copy engine did not finish 0x%llx -> 0x%llx (%llu bytes) in address space %u", source,
-		     destination, bytes, kVmid);
+		     destination, bytes, n48n->vmid);
 		return kIOReturnNotResponding;
 	}
-	VLOG("copy test: 0x%llx -> 0x%llx, %llu bytes, in address space %u", source, destination, bytes, kVmid);
+	VLOG("copy test: 0x%llx -> 0x%llx, %llu bytes, in address space %u", source, destination, bytes, n48n->vmid);
 	return kIOReturnSuccess;
 }
 
