@@ -533,3 +533,42 @@ Not covered by any of this: a queue hung by something other than a shader's wave
 fetch), more than one job in the ring when the fault comes, the graphics ring and the copy engine, and the old path
 (`rdna4-vmshared=0`), whose control boot is still owed.
 
+## 20. 2026-10-07, the control boot: the old path fails on the same rig, kext and day, and H10 is corrected
+
+Log `rdna4fb-diag-20261007-143954`, kext `1D3AE3CC` (the one of the tenth run), the passing boot's arguments with
+`rdna4-vmshared=0` and `rdna4-vmid-test=6` (surveys only). [M]
+
+- The old boot self-test **passes** (`"vm"="PASS boot self-test"`): a queue built inside address space 8 (MEC1 pipe 0
+  queue 1) runs its job, and is dequeued cleanly afterwards (`HQD 0/1 ACTIVE 0`, no timeout line).
+- **From that point the GPU is pinned**: `survey before vmBootSelfTest: GRBM 0x0000382c`, `after vmBootSelfTest: GRBM
+  0xa800382c`, `GRBM_STATUS2 0x10008000` (CPF busy, UTCL2 busy), `CPF 0x90000001`, `L2_BUSY 1`, SMU 100 % activity; it
+  stays so through every later survey point. `idle-pin FAIL` at 100 % and 70 W, `post-idle FAIL` the same.
+- The first client then loads the same HQD again: `ACTIVE 1 VMID 8 rptr 0 wptr 0 doorbell 0x00000068 HQ_STATUS0
+  0x40000040 EOP_RPTR 0x00000000`. The doorbell enable is off. It never fetches, and its release ends in `dequeue
+  timeout`; 56 such lines in the log. `runtime`, `submitib`, `fault` and `vm` FAIL.
+- The graphics ring is not affected: `gfx`, `gfx-client`, `gfx-app-tri` and `gfx-app-tricol` PASS in this boot too.
+
+That is the September failure, reproduced with one argument changed. And the state of the client's queue is, register
+for register, the state of the remade queue of the seventh run (section 18): doorbell enable off although written,
+`CP_HQD_EOP_RPTR` 0, `CP_HQD_HQ_STATUS0` 0x40000040, write pointer 0, a dequeue request that is never answered,
+`GRBM_STATUS` 0xa800382c. That queue was in address space **0**.
+
+So H10 as written in section 11 ("a queue inside a non-zero address space is what pins the engine") is not right. A
+queue inside address space 8 ran its job in this very boot. What the two failures share is the other thing: **a
+compute queue was dequeued and then loaded again through its registers.** Read that way:
+
+- the old path dequeues at the end of its boot self-test and at every client's close, and loads a queue at every
+  open; after the first dequeue nothing loaded by registers runs;
+- amdgpu's reset dequeues, and has the MES load the queue again; with no MES the load by registers does nothing
+  (sections 17 and 18);
+- the shared path loads its two queues once at boot and never dequeues them, and the recovery of section 19 works
+  because it leaves the dequeue out.
+
+This is an inference from two cases with one signature, not something measured in isolation. The boot that would
+measure it: load a kernel queue in address space 0, dequeue it, load it again, and send one packet. Nothing needs it
+now. One place does dequeue and reload the shared queues: the runtime's sleep path. Whether that survives is not
+known; compute across sleep has not been tried on the card with `rdna4-vm=1`.
+
+**Consequence:** the old path (`rdna4-vmshared=0`: `vmBootSelfTest`, a queue per client) cannot work on this card
+without MES, and the shared path is verified. The old path can go.
+

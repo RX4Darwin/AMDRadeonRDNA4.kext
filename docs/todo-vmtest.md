@@ -2,8 +2,8 @@
 
 Written 2026-10-06 on `devel/address-space`. **Passed on the card 2026-10-07** (eighth run, below): with
 `rdna4-vm=1` every row of the runtime's self-test passes, the two fault tests included, and the GPU idles at 3 %.
-What it took is in the runs below and in `docs/vm-client-rootcause.md` sections 11 to 19. Still owed: boot B (the
-control with `rdna4-vmshared=0`).
+What it took is in the runs below and in `docs/vm-client-rootcause.md` sections 11 to 20. The control boot with
+`rdna4-vmshared=0` (boot B, below) failed as expected on the same kext.
 
 ## First run, 2026-10-07
 
@@ -152,23 +152,20 @@ What failure looks like:
 - `idle-pin FAIL` although no queue was built inside an address space: the pinned GPU has another cause than the
   one suspected; the `vm-survey` rows say from which point of the boot on.
 
-## Boot B: the old path, as a control
+## Boot B: the old path, as a control. Run 2026-10-07: fails as expected
 
-Only worth running if boot A passed. It is expected to fail, and that failure on the same rig and the same day
-is what turns "the new path works" into "and this is why the old one did not".
+Kext `1D3AE3CC`, log `rdna4fb-diag-20261007-143954`:
 
 ```
-rdna4-compute=7 rdna4-vm=1 rdna4-vmshared=0 rdna4-hang=1 rdna4-vmid-test=6 rdna4-trace=1
+rdna4-compute=7 rdna4-vm=1 rdna4-vmshared=0 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-vmid-test=6 rdna4-trace=1
 ```
 
-```bash
-sudo bash diagnostic-log.sh
-```
-
-Report the log. Expected, from the September rounds: the old boot self-test may pass, `idle-pin FAIL` with the
-GPU near 100 %, `runtime FAIL` with `dequeue timeout` lines for every client. The display is not affected; reboot
-afterwards. If boot B **passes** on this rig, the old path's failure belongs to something else in the September
-boots (they also carried `rdna4-vm-diag=4065`), and both paths stay.
+The passing boot of the eighth to tenth run with `rdna4-vmshared=0`, and the surveys added. The old boot self-test
+passes, and from the moment it has dequeued its queue the GPU is pinned (`GRBM 0x0000382c` before, `0xa800382c`
+after; 100 % and 70 W at idle). No client's queue ever runs (56 `dequeue timeout` lines); `runtime`, `submitib`,
+`fault`, `vm`, `idle-pin` and `post-idle` FAIL. The graphics rows pass. What it says about the cause is in
+`docs/vm-client-rootcause.md` section 20: a compute queue that was dequeued does not run again when loaded through
+its registers, in whatever address space.
 
 ## Boot C: a runtime client's graphics work (after A)
 
@@ -189,5 +186,6 @@ program through the runtime). The colour triangle has not been confirmed on the 
 
 ## After the tests
 
-`docs/vm-client-rootcause.md` section 11, `docs/metal-readiness.md` section 4 and `docs/w13-vmid.md` get the
-results. If A passes and B fails, the old path and its boot test can be removed.
+Done: the results are in `docs/vm-client-rootcause.md` sections 12 to 20, `docs/metal-readiness.md` section 4 and
+`docs/w13-vmid.md` section 0. Boot A as written below was never run by itself; boot C covers it. The new path passes
+and the old one fails, so the old path and its boot test can be removed.

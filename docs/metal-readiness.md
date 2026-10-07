@@ -94,7 +94,12 @@ the one this section describes as failing:
   compute queue does not work here: it needs the MES to map the queue again (sections 17 and 18). This recovery is
   on by default (`rdna4-hang=0` switches it off); the default ran on the card without the boot-arg, same result
   (log `rdna4fb-diag-20261007-143342`). Not covered: a hang that is not a shader's (a command buffer that cannot be fetched), the same for
-  the graphics ring and the copy engine, and the control boot with `rdna4-vmshared=0`.
+  the graphics ring and the copy engine.
+- **card, 2026-10-07, control** (section 20, log `rdna4fb-diag-20261007-143954`): the same kext and arguments with
+  `rdna4-vmshared=0` fail as in September: the old boot self-test passes, the GPU is pinned at 100 % from the moment
+  its queue is dequeued, and no client's queue runs. The failing queue has the same register state as the queue
+  remade after amdgpu's reset, which was in address space 0. So the cause is not the address space the queue is in
+  but a queue being dequeued and loaded again through its registers (an inference from the two cases).
 
 The table in section 1 and the text below are as written on 2026-09-30.
 
