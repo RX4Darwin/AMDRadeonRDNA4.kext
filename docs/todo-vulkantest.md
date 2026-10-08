@@ -687,51 +687,32 @@ Open: what gets the ring back after a hung draw. amdgpu's reset names the queue 
 again; whether this ring, which the kext sets up by registers, can be set up again after that is the next question,
 and an experiment of its own.
 
-### Next run: the ring taken down and set up again (kext `A5F496FD`, an experiment)
+### Run 2026-10-07 (kext `A5F496FD`): the queue reset and the ring set up again do not help either
 
-Written 2026-10-07. When the address-space reset does not bring the client's fence, the kext now goes on
-(`gfxRingAgain`, `src/runtime.cpp`):
-
-1. amdgpu's reset of a graphics queue: `CP_VMID_RESET` with the address space's bit **and the queue's**, then up to
-   100 ms for the queue to go inactive. Under Linux the MES maps the queue again after that.
-2. Here instead: PFP and ME halted, the ring's registers written again as at bring-up, one `WRITE_DATA` and one fence
-   through the new ring.
-
-If that packet runs, the ring is in service again and whatever any client had on it is gone (a Vulkan client with
-unfinished work is told its device is lost). If not, the ring is shut as before. **No source has the second half**,
-and the same idea failed for the compute queues; this ring is of another kind (a bare ring the kext has only ever
-set up by registers), which is the reason to try.
-
-New kext (`make`); `rdna4-run` and `vkprobe` as they are. Same boot:
+`trifault.txt`, `vkprobe-13.txt`, log `rdna4fb-diag-20261007-205132`. The kext went on, after the two address-space
+resets, to amdgpu's reset of the queue and then wrote the ring's registers again as at bring-up:
 
 ```
-rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
+runtime: gfx: IB wait: CP_VMID_RESET 0x00000100, attempt 2: the lost work's fence did not come; GRBM 0xaa61382c, CP_STAT 0x80040000
+runtime: gfx: IB wait: CP_VMID_RESET 0x00010100 (with the queue): CP_GFX_HQD_ACTIVE 0x1 after 100 ms, CP_RB_ACTIVE 0x1; GRBM 0xaa61382c, CP_STAT 0x80078000
+gfx: ring 0: 16 KiB at MC 0x8009e00000, CP_RB0_CNTL 0x0000098b, doorbell, CP_ME_CNTL 0x0100a000, CP_STAT 0x80078000 (did not idle: amdgpu reports and goes on)
+runtime: gfx: IB wait: the ring set up again: WRITE_DATA 0x00000000 (not written), fence NOT signalled; CP_ME_CNTL 0x0100a000, GRBM 0xaa61382c, CP_STAT 0x80078000
 ```
 
-```bash
-sudo ./rdna4-run trifault > trifault.txt 2>&1
-```
+- The queue reset did not take the queue down (`CP_GFX_HQD_ACTIVE` and `CP_RB_ACTIVE` still 1 after 100 ms) and did
+  not touch the pipeline: `GRBM_STATUS` is 0xaa61382c before and after.
+- The ring set up again ran nothing: the command processor did not idle, the test packet was not written.
+- The ring was shut as before; the triangles after it and the `vkprobe` fail, the GPU at 100 % and 70 W, the compute
+  rows pass.
 
-```bash
-sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
-```
+Through all four attempts `GRBM_STATUS` never changed. What hangs is the pipeline (geometry engine, primitive
+assembler, SPI), not the ring or its queue, and nothing tried here reaches it. The code of this run is out again
+(kext after it: the one of the commit before, rebuilt).
 
-```bash
-sudo bash diagnostic-log.sh
-```
-
-What to look for:
-
-- `trifault.txt`: after the `ok    trifault: ... did not finish` line, `PASS  tricol` if the ring came back, `FAIL ... the
-  gfx ring is not available` if it was shut.
-- Kernel log, `runtime: gfx: IB wait:` lines in order: the two `CP_VMID_RESET 0x00000100, attempt N` lines (expected
-  `did not come`, as in the last run), then `CP_VMID_RESET 0x00010100 (with the queue): CP_GFX_HQD_ACTIVE ... GRBM ...`,
-  then `the ring set up again: WRITE_DATA 0x600df00d (ok), fence signalled; ...` or `not written` / `NOT signalled`,
-  then `the graphics ring was set up again and is in service` or the old `a client gfx IB did not finish`.
-- `vkprobe.txt` ending `done: all ok` and the table all PASS, if the ring came back. If it did not: as in the last
-  run, the GPU busy until the reboot.
-
-Report the two text files and the log.
+**Where this stands.** A compute shader that hangs is ended and the ring kept (three boots). A draw that hangs
+costs the ring until the reboot, as it always did. For that, amdgpu on this chip has the MES, or a reset of the
+whole GPU through the SMU; `gfx_v12_0.c` has no reset of the pipeline alone. Either is a project of its own, not a
+next attempt.
 
 ## After the tests
 

@@ -378,7 +378,8 @@ system memory are the command processor's, which is how the first tries of this 
 
 Not done: the fault is only noticed by the ten seconds, during which the ring serves nobody; a draw that hangs
 (the runtime's `rdna4-run trifault`: geometry engine and primitive assembler busy besides the SPI) is not ended by
-this reset and still costs the ring; and after a failed copy by the command processor its next fill is silently
+this reset, nor by amdgpu's queue reset, nor by setting the ring up again, and still costs the ring until the
+reboot (that needs the MES or a reset of the whole GPU); and after a failed copy by the command processor its next fill is silently
 not done. `docs/todo-vulkantest.md`, "A shader that
 faults", has the runs.
 

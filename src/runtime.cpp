@@ -3014,12 +3014,6 @@ void RDNA4Compute::gfxClientReset() {
 	// Called from stageGfxRing on the bring-up thread (no rtLock held): take it, clients open and close concurrently.
 	if (rtLock)
 		IOLockLock(rtLock);
-	gfxClientResetLocked();
-	if (rtLock)
-		IOLockUnlock(rtLock);
-}
-
-void RDNA4Compute::gfxClientResetLocked() {
 	gfxWedged = false;
 	gfxParked = false;
 	gfxClientPending = 0;
@@ -3029,10 +3023,12 @@ void RDNA4Compute::gfxClientResetLocked() {
 			*c.gfxFenceCpu = 0;
 		c.gfxFence = 0;
 	}
+	if (rtLock)
+		IOLockUnlock(rtLock);
 }
 
 /* A client's work on the graphics ring does not finish: remove what hangs and keep the ring for everybody else. True if
- * the ring is in service afterwards, false if it has to be given up (gfxClientWedge).
+ * the client's fence then came through, false if the ring has to be given up (gfxClientWedge).
  * Card, 2026-10-07 (vkprobe's "fault", two boots): a shader that writes to an address nothing is mapped at leaves waves
  * that do not end (GRBM_STATUS SPI busy), and the ring behind them stands. CP_VMID_RESET with the address space's bit and
  * no queue removes them: the lost work's own fence came through within 200 ms, SPI busy went, and the next program and
@@ -3042,11 +3038,13 @@ void RDNA4Compute::gfxClientResetLocked() {
  * try in case one is not enough, as it sometimes is not on the compute queues.
  * It does NOT help when a draw hangs (same day, rdna4-run trifault: the colour triangle with its attribute ring unmapped):
  * GRBM_STATUS 0xaa61382c, the geometry engine and the primitive assembler busy besides the SPI, unchanged by both attempts,
- * and the ring was given up as before. Removing the waves is not enough there; what is, is not known.
+ * and the ring was given up as before. Two more things were tried for that and are not here (kext A5F496FD, the day's
+ * last run): amdgpu's own queue reset (CP_VMID_RESET with the queue's bit as well) left CP_GFX_HQD_ACTIVE and CP_RB_ACTIVE
+ * at 1 and the pipeline as busy as before, and the ring's registers written again as at bring-up gave a ring that ran
+ * nothing (CP_STAT 0x80078000, the test packet not written). The hang is in the pipeline, not in the ring; on this chip
+ * amdgpu has only the MES or a reset of the whole GPU for it.
  * ponytail: every client in that address space loses its waves; with rdna4-vmshared=2, where address spaces are lent
- * per job, the caller has none to name and the ring is given up as before.
- * True also when the ring had to be set up again (gfxRingAgain): the ring is in service, the fence did not come, and
- * every client's work on the ring is gone. */
+ * per job, the caller has none to name and the ring is given up as before. */
 bool RDNA4Compute::gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why) {
 	if (vmid < 1 || vmid > 15)
 		return false;
@@ -3066,63 +3064,9 @@ bool RDNA4Compute::gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceW
 	}
 	if (((rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == vmid)
 		gcFaultClear();                // an entry of this client's would end the next compute job in this address space (vmJobFaulted)
-	if (back) {
+	if (back)
 		RLOG("gfx: %s: the client's work is ended; the graphics ring is back and stays in service", why);
-		return true;
-	}
-	return gfxRingAgain(vmid, why);
-}
-
-/* AN EXPERIMENT (2026-10-07; nothing here has run on the card, and no source has the second half). When removing the address
- * space's waves does not bring the ring back, which is what a hung draw looks like (above), the ring itself is taken down and
- * set up again:
- *   1. amdgpu's reset of a graphics queue (mes_v12_0_reset_queue_mmio): CP_VMID_RESET with the address space's bit and the
- *      queue's (PIPE0_QUEUES, queue 0), then up to 100 ms for CP_GFX_HQD_ACTIVE to drop. amdgpu has the MES map the queue
- *      again after that; there is no MES here.
- *   2. Instead: PFP and ME halted, and the ring's registers written again exactly as at bring-up (gfxRingResume, which
- *      empties the ring and lets PFP and ME run), then one WRITE_DATA and one fence through it, as stageGfxRing's test.
- * A compute queue taken down did not come up again by its registers (docs/vm-client-rootcause.md section 20). This ring is
- * another kind: a bare CP_RB0 that the kext has only ever set up by registers, so it may. If the test packet runs, the ring
- * is in service again and everything every client had on it is gone; if not, the caller gives the ring up as before. */
-bool RDNA4Compute::gfxRingAgain(uint32_t vmid, const char *why) {
-	const uint32_t index = rdGc(GrbmGfxIndex), request = (1u << vmid) | (1u << 16);
-	wr(IpDiscovery::HwGc, GrbmGfxIndex, 1u << 31);
-	wr(IpDiscovery::HwGc, CpVmidReset, request);
-	wr(IpDiscovery::HwGc, GrbmGfxIndex, index);
-	grbmSelect(0, 0, 0, 0);
-	uint32_t ms = 0;
-	for (; ms < 100 && (rdGc(CpGfxHqdActive) & 1); ms++)
-		IOSleep(1);
-	RLOG("gfx: %s: CP_VMID_RESET 0x%08x (with the queue): CP_GFX_HQD_ACTIVE 0x%x after %u ms, CP_RB_ACTIVE 0x%x; GRBM 0x%08x, CP_STAT 0x%08x",
-	     why, request, rdGc(CpGfxHqdActive), ms, rdGc(CpRbActive), rdGc(GrbmStatus), rdGc(CpStat));
-	wr(IpDiscovery::HwGc, CpVmidReset, 0);
-
-	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
-	IOSleep(1);
-	bool ok = gfxRingResume();
-	trail("gfx: ring set up again at run time");     // gfxRingResume leaves its bring-up step there
-	uint32_t data = 0;
-	bool fenced = false;
-	if (ok) {
-		*poolDw(kGfxTestOffset) = 0;
-		flushHdp();
-		uint32_t pkt[16];
-		gfxRing.emit(pkt, Pm4::writeData(pkt, poolMc(kGfxTestOffset), 0x600DF00D));
-		gfxRing.emit(pkt, Pm4::releaseMem(pkt, poolMc(kGfxFenceOffset), ++gfxFence));
-		gfxKick(gfxRing.wptr());
-		fenced = gfxFenceWait(gfxFence, 200000);
-		data = *poolDw(kGfxTestOffset);
-		ok = fenced && data == 0x600DF00D;
-	}
-	RLOG("gfx: %s: the ring set up again: WRITE_DATA 0x%08x (%s), fence %s; CP_ME_CNTL 0x%08x, GRBM 0x%08x, CP_STAT 0x%08x", why, data,
-	     data == 0x600DF00D ? "ok" : "not written", fenced ? "signalled" : "NOT signalled", rdGc(CpMeCntl), rdGc(GrbmStatus), rdGc(CpStat));
-	if (!ok)
-		return false;
-	// Everything that was on the ring went with it: no client has anything pending there now.
-	gfxClientResetLocked();
-	n48nRingGone();
-	RLOG("gfx: %s: the graphics ring was set up again and is in service; what clients had on it is gone", why);
-	return true;
+	return back;
 }
 
 void RDNA4Compute::gfxClientWedge(const char *why) {

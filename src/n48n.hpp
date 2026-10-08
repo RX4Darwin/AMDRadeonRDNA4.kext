@@ -108,8 +108,6 @@ public:
 	bool open(const Backend &backend, uint32_t vmid, uint32_t build, uint32_t gcVersion);
 	// Waits for the client's work on the queue (until it finished or counts as lost). False if it is lost.
 	bool quiesce();
-	// The queue was set up again under the client: its unfinished work is lost, as by a timeout, without the backend being asked.
-	void abandon() { lost = true; jobCount = 0; }
 	// Everything the client still holds goes back: mappings, buffers, the table. Quiesces first.
 	void close();
 

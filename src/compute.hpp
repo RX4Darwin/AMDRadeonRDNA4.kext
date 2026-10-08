@@ -994,9 +994,6 @@ private:
 	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why);
 	void     gfxClientWedge(const char *why);
 	bool     gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why);   // end one address space's hung work
-	bool     gfxRingAgain(uint32_t vmid, const char *why);  // the queue reset and the ring's registers again (experiment)
-	void     gfxClientResetLocked();                       // gfxClientReset's work, rtLock held
-	void     n48nRingGone();                               // the ring was set up again under the Vulkan client
 	void     gfxClientDrain(RtClient &client, const char *why);
 	void     gfxClientReset();                             // a fresh gfx ring: nothing is pending
 	bool     gfxClientSelfTest();                          // rdna4-gfxclient=1 (bring-up thread)
