@@ -233,19 +233,25 @@ when it suspends, which this kext does not do. This failure says nothing about a
 its power and the security processor starts afresh; whether it does on this machine is what the `bootloader:` line
 of stage 2 shows.
 
-**Stage 2, a real sleep** (the card loses its power; stage 1's failure does not stand in its way):
+**Stage 2 ran on 2026-10-12, and was not a real sleep.** Sleep from the Apple menu with `rdna4-pm=1`: both displays
+went dark and did not come back; the machine had to be restarted. What the rest shows:
 
-```
-rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1 rdna4-pm=1
-```
+- `pmset -g log`: `Kernel System sleep preventers: .Display_boot, IONDRVFramebuffer` in every boot, and `Sleep/Wakes
+  since boot: 0`. **This machine does not sleep with this driver**: the framebuffer driver prevents it, as the README
+  says (after a power loss nobody could set the display pipeline up again). Sleep from the Apple menu puts the
+  displays to sleep and nothing more. The card never lost its power.
+- The same from a boot **without** `rdna4-pm=1` (`sleep-dmesg.txt`, a kernel log written by a delayed command): the
+  displays go off and come back 21 s later, `power: display off ...`, `power: pipe2 display off: 39 steps ran`, `power:
+  display on ...`, `power: pipe2 display on: 128 steps ran`. The compute runtime is not told and is not touched.
+- So with `rdna4-pm=1` the displays stay dark after a display sleep that the Sleep menu starts. Why is not known: no
+  kernel log of that boot exists (the driver's lines are not kept across a restart). Suspects: the compute side
+  shutting down at the sleep request and running its bring-up again on a card that kept its power (which fails, stage
+  1), or what the PCI device does once this service says it may be powered down.
 
-Apple menu, Sleep; wait until the machine is really asleep; wake it; then
-
-```bash
-sudo bash diagnostic-log.sh
-```
-
-Report: do both displays come back, and the log. Expected lines as in stage 1, without the script's own cycle.
+**Where that leaves sleep.** There is nothing for the compute runtime to survive until the machine can sleep at
+all, and that needs the display pipeline brought up from nothing after a power loss, a display project of its own.
+Until then: **leave `rdna4-pm` out.** Without it the Sleep menu is a display sleep, which works. With it, it costs
+the displays until the restart.
 
 ## After the tests
 

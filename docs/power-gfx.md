@@ -19,7 +19,7 @@ the originals on the OPENCORE stick, `rdna4fb-diag-20260930-<time>.txt`); source
    with a live ring behind measurements that can say whether it is worth doing at all.
 4. **Sleep/wake** today: quiesce halts PFP/ME and the MEC, drains only compute HQDs; wake re-runs the whole bring-up, including the G3/G4 draws and the flip
    self-test, aborts every client. Needed for clients+gfx: abortable waits (a wait holds `rtLock` up to 10 s and so can stall the sleep handler),
-   no draws/flip test on resume, gfx fences failed as Aborted. `rdna4-pm=1` has **never** run on the card [M]; it needs its own boot with a power-cycle plan.
+   no draws/flip test on resume, gfx fences failed as Aborted. `rdna4-pm=1` has **never** run on the card [M]; it needs its own boot with a power-cycle plan. (It ran on 2026-10-12, Sunneva's rig: the driver's own cycle fails at the wake in the PSP stage, and Sleep from the Apple menu, which is only a display sleep on this machine, leaves both displays dark until the restart. `docs/todo-vmtest.md`, "Sleep with `rdna4-vm=1`". Do not use it on the card.)
 5. A stepwise plan (§6) P0-P7, each behind a boot-arg (default off), with what the emulator can and cannot say (§5) and the real-card boots with expected log lines (§7).
 
 ## 1. What the logs say (measured)
