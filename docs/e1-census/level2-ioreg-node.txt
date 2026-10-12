@@ -1,0 +1,16 @@
+    | |   |     {
+    | |   |       "GPURawCounterBundleName" = "RDNA4CensusRawCounterPlugin"
+    | |   |       "IOUserClientClass" = "RDNA4AccelCensusClient"
+    | |   |       "MetalStatisticsName" = "RDNA4CensusStatistics"
+    | |   |       "MetalPluginClassName" = "RDNA4CensusMtlDevice"
+    | |   |       "IOOCDBundleName" = "RDNA4CensusGLDriver"
+    | |   |       "MetalPluginName" = "RDNA4CensusMTLDriver"
+    | |   |       "IOMatchCategory" = "IOAccelerator"
+    | |   |       "GPURawCounterPluginClassName" = "RDNA4CensusRawCounterSourceGroup"
+    | |   |       "CensusLog" = (see level2-kernel.log)
+    | |   |       "IOAccelRevision" = 2
+    | |   |       "IODVDBundleName" = "RDNA4CensusVADriver"
+    | |   |       "IOGLBundleName" = "RDNA4CensusGLDriver"
+    | |   |       "CensusLevel" = 2
+    | |   |     }
+    | |   |     

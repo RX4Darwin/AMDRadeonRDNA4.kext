@@ -1,0 +1,7 @@
+device: AMD Radeon RX 9070 XT (RADV GFX1201)
+pixels: 0 red (0xFF0000FF, kext wants 8192), 8192 others; bounds x 64..191 y 64..190
+stats: ia_verts 3 ia_prims 1 vs_inv 3 c_inv 1 c_prim 4 ps_inv 8192
+colour: 8192 covered pixels (want 8192), 0 with alpha != 0xFF
+colour: max |channel - exact barycentric| 0.50, max |R+G+B - 255| 1, dominant channel = nearest vertex's in 8192/8192 pixels
+colour: near v0 (66,65) 0xff0303f9  near v1 (189,65) 0xff03f903  near v2 (128,188) 0xfff80402  centroid (128,106) 0xff555654 (want ~85,85,85)
+colour: THE COLOUR TRIANGLE IS RIGHT

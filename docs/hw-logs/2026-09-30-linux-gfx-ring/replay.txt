@@ -1,0 +1,8 @@
+amdgpu 3.64, family 152, 4 SEs
+code 0x100000000 target 0x100002000 rings 0x100200000 fence 0x100042000 (VS new, variant 0)
+IB VA 0x100043000, 504 dwords, seq 1
+submission: done (query 0), context reset state 0
+pixels: 8192 0xff0000ff (want 8192), 0 others; bounds x 64..191 y 64..190
+rdna4_tri_count: 8192 px, 0 others: THE TRIANGLE IS RIGHT
+draw fence: 0x00000001
+stats: PS_INV 8192 C_PRIM 4 C_INV 1 VS_INV 3 GS_INV 0 GS_PRIM 0 IA_PRIM 1 IA_VERT 3

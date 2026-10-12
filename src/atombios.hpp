@@ -1,6 +1,6 @@
 //
 //  atombios.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Minimal, bounds-checked AtomBIOS (atomfirmware-era) parser for the data
 //  tables needed to eventually drive Navi 48's DCN display engine.

@@ -1,0 +1,124 @@
+/*
+ *  librdna4.h
+ *  AMDRadeonRDNA4
+ *
+ *  A thin C API over RDNA4ComputeClient (include/rdna4compute.h) for macOS
+ *  programs: open the service, allocate VRAM buffers, copy data, load an
+ *  AMDGPU code object and dispatch its kernels. Needs root.
+ *
+ *    rdna4_t gpu;
+ *    rdna4_open(&gpu);
+ *    rdna4_buffer_t buf;  rdna4_alloc(&gpu, bytes, &buf);   // buf.gpu -> kernargs
+ *    rdna4_write(&gpu, &buf, 0, host, bytes);
+ *    rdna4_program_t k;   rdna4_load(&gpu, elf, elfBytes, "kernel", &k);
+ *    rdna4_dispatch(&gpu, &k, groups, groupSize, &args, sizeof args, 1000, &us);
+ *    rdna4_read(&gpu, &buf, 0, host, bytes);
+ *    rdna4_close(&gpu);                                     // frees everything
+ *
+ *  Every call returns an IOKit status (kIOReturnSuccess = 0);
+ *  rdna4_error() names it.
+ */
+
+#ifndef LibRDNA4_h
+#define LibRDNA4_h
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <IOKit/IOKitLib.h>
+
+#include "rdna4compute.h"
+
+typedef struct {
+	io_connect_t conn;
+} rdna4_t;
+
+typedef struct {
+	uint64_t abi, stage, flags;             /* flags: RDNA4_FLAG_* */
+	uint64_t heapBytes, heapFree, heapBase;
+	uint64_t vmid, pipe, queue;
+} rdna4_info_t;
+
+typedef struct {
+	uint64_t handle;
+	uint64_t gpu;                           /* GPU (MC) address, 4 KiB aligned */
+	uint64_t bytes;
+} rdna4_buffer_t;
+
+typedef struct {
+	uint64_t handle;
+	uint64_t gpu;                           /* GPU VA of the kernel entry point */
+	uint64_t kernargBytes;                  /* the kernel's kernarg segment */
+	uint64_t imageBytes;
+	uint64_t rsrc1, rsrc2, rsrc3, properties;
+	uint64_t ldsBytes;                      /* static LDS per work-group */
+} rdna4_program_t;
+
+kern_return_t rdna4_open(rdna4_t *dev);
+void          rdna4_close(rdna4_t *dev);
+kern_return_t rdna4_info(rdna4_t *dev, rdna4_info_t *out);
+kern_return_t rdna4_sensors(rdna4_t *dev, RDNA4Sensors *out);
+kern_return_t rdna4_sensors_ex(rdna4_t *dev, RDNA4SensorsEx *out);
+/* Debug-only simulated sleep: phase 1 quiesces, phase 2 re-brings up. */
+kern_return_t rdna4_sleep_test(rdna4_t *dev, uint32_t phase);
+/* Debug-only root quiesce through the system shutdown/restart path. */
+kern_return_t rdna4_quiesce(rdna4_t *dev);
+
+kern_return_t rdna4_alloc(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out);
+/* Allocate snooped system memory, mapped into the client's GPUVM and task. */
+kern_return_t rdna4_alloc_host(rdna4_t *dev, uint64_t bytes, rdna4_buffer_t *out,
+                                void **cpu);
+kern_return_t rdna4_free(rdna4_t *dev, const rdna4_buffer_t *buf);
+kern_return_t rdna4_write(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                          const void *src, uint64_t bytes);
+kern_return_t rdna4_read(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                         void *dst, uint64_t bytes);
+
+kern_return_t rdna4_load(rdna4_t *dev, const void *elf, size_t bytes, const char *kernel,
+                         rdna4_program_t *out);
+kern_return_t rdna4_unload(rdna4_t *dev, const rdna4_program_t *prog);
+
+/* groups/groupSize: 3 dimensions each; kernargs may be NULL when bytes is 0.
+ * timeoutMs 0 = 1000. micros may be NULL. */
+kern_return_t rdna4_dispatch(rdna4_t *dev, const rdna4_program_t *prog, const uint32_t groups[3],
+                             const uint32_t groupSize[3], const void *kernargs,
+                             uint32_t kernargBytes, uint32_t timeoutMs, uint64_t *micros);
+/* The same, with LDS per work-group beyond the kernel's static size. */
+kern_return_t rdna4_dispatch_lds(rdna4_t *dev, const rdna4_program_t *prog,
+                                 const uint32_t groups[3], const uint32_t groupSize[3],
+                                 const void *kernargs, uint32_t kernargBytes,
+                                 uint32_t dynamicLdsBytes, uint32_t timeoutMs, uint64_t *micros);
+
+/* Record an unprivileged compute PM4 IB in `buf` and append it to this client's
+ * queue. `offsetBytes` is relative to the buffer and the returned fence is
+ * ordered with kernel-built Dispatch calls on the same queue. */
+kern_return_t rdna4_submit_ib(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offsetBytes,
+                              uint32_t dwords, uint64_t *fence);
+kern_return_t rdna4_wait_fence(rdna4_t *dev, uint64_t fence, uint32_t timeoutMs,
+                               uint64_t *ns);
+
+/* W12k: append the client's own unprivileged GRAPHICS IB (PM4 for the gfx command processor: state, draws, end-of-pipe fences; it runs in this
+ * client's VMID and may only reach this client's buffers) to the kernel's gfx ring. The fence is per client and ordered with this client's
+ * earlier gfx submissions; it is NOT the compute fence of rdna4_submit_ib. Needs RDNA4_FLAG_GFX in rdna4_info (rdna4-gfx=2 boot). A wait that
+ * times out means the gfx ring is wedged until the next bring-up (kIOReturnTimeout, then kIOReturnNotResponding). See docs/w12k-gfx-submit.md. */
+kern_return_t rdna4_submit_gfx_ib(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offsetBytes,
+                                  uint32_t dwords, uint64_t *fence);
+kern_return_t rdna4_wait_gfx_fence(rdna4_t *dev, uint64_t fence, uint32_t timeoutMs, uint64_t *ns);
+
+kern_return_t rdna4_wait_vblank(rdna4_t *dev, uint32_t timeoutMs, uint64_t *count,
+                                uint64_t *timeNs);
+/* Present a 256-byte-aligned ARGB8888 slice of a device buffer. The returned
+ * geometry is the active scanout width, height and pitch in pixels. */
+kern_return_t rdna4_present(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                            uint32_t *width, uint32_t *height, uint32_t *pitch);
+kern_return_t rdna4_present_async(rdna4_t *dev, const rdna4_buffer_t *buf, uint64_t offset,
+                                   uint64_t *presentId);
+kern_return_t rdna4_wait_present(rdna4_t *dev, uint64_t presentId, uint32_t timeoutMs,
+                                  uint64_t *frame);
+kern_return_t rdna4_display_query(rdna4_t *dev, uint32_t *width, uint32_t *height,
+                                  uint32_t *pitch);
+kern_return_t rdna4_restore(rdna4_t *dev);
+
+const char *rdna4_error(kern_return_t kr);
+
+#endif /* LibRDNA4_h */

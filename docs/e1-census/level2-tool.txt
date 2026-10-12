@@ -1,0 +1,63 @@
+RDNA4CENSUS-BEGIN
+registry: IOServiceGetMatchingServices(IOAccelerator) = 0x0
+registry: service 0: name RDNA4AccelCensus class IOAccelerator registry-id 0x1000002de
+registry:   CensusLevel = 2
+registry:   GPURawCounterBundleName = RDNA4CensusRawCounterPlugin
+registry:   GPURawCounterPluginClassName = RDNA4CensusRawCounterSourceGroup
+registry:   IOAccelRevision = 2
+registry:   IODVDBundleName = RDNA4CensusVADriver
+registry:   IOGLBundleName = RDNA4CensusGLDriver
+registry:   IOMatchCategory = IOAccelerator
+registry:   IOOCDBundleName = RDNA4CensusGLDriver
+registry:   IOUserClientClass = RDNA4AccelCensusClient
+registry:   MetalPluginClassName = RDNA4CensusMtlDevice
+registry:   MetalPluginName = RDNA4CensusMTLDriver
+registry:   MetalStatisticsName = RDNA4CensusStatistics
+registry: 1 IOAccelerator service(s)
+registry: child exited 0
+metal: calling MTLCopyAllDevices()
+metal: MTLCopyAllDevices() returned 0 device(s)
+metal: calling MTLCreateSystemDefaultDevice()
+metal: MTLCreateSystemDefaultDevice() = nil
+metal: child exited 0
+open: IOServiceOpen(type 0) = 0x0
+open:   type 0 selector 0 scalar call = 0x0
+open:   type 0 selector 1 scalar call = 0x0
+open:   type 0 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 1) = 0x0
+open:   type 1 selector 0 scalar call = 0x0
+open:   type 1 selector 1 scalar call = 0x0
+open:   type 1 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 2) = 0x0
+open:   type 2 selector 0 scalar call = 0x0
+open:   type 2 selector 1 scalar call = 0x0
+open:   type 2 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 4) = 0x0
+open:   type 4 selector 0 scalar call = 0x0
+open:   type 4 selector 1 scalar call = 0x0
+open:   type 4 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 5) = 0x0
+open:   type 5 selector 0 scalar call = 0x0
+open:   type 5 selector 1 scalar call = 0x0
+open:   type 5 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 6) = 0x0
+open:   type 6 selector 0 scalar call = 0x0
+open:   type 6 selector 1 scalar call = 0x0
+open:   type 6 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 7) = 0x0
+open:   type 7 selector 0 scalar call = 0x0
+open:   type 7 selector 1 scalar call = 0x0
+open:   type 7 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 8) = 0x0
+open:   type 8 selector 0 scalar call = 0x0
+open:   type 8 selector 1 scalar call = 0x0
+open:   type 8 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 9) = 0x0
+open:   type 9 selector 0 scalar call = 0x0
+open:   type 9 selector 1 scalar call = 0x0
+open:   type 9 selector 2 scalar call = 0x0
+open: IOServiceOpen(type 256) = 0x0
+open:   type 256 selector 0 scalar call = 0x0
+open:   type 256 selector 1 scalar call = 0x0
+open:   type 256 selector 2 scalar call = 0x0
+open: child exited 0

@@ -1,6 +1,6 @@
 //
 //  otgtiming.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Mirrors drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c
 //  optc1_program_timing (borders are zero for EDID DTDs).

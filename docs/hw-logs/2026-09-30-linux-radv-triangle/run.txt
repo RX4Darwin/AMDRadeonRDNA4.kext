@@ -1,0 +1,3 @@
+device: AMD Radeon RX 9070 XT (RADV GFX1201)
+pixels: 8192 red (0xFF0000FF, kext wants 8192), 0 others; bounds x 64..191 y 64..190
+stats: ia_verts 3 ia_prims 1 vs_inv 3 c_inv 1 c_prim 4 ps_inv 2112

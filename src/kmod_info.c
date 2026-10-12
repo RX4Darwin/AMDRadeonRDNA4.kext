@@ -1,6 +1,6 @@
 //
 //  kmod_info.c
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Hand-written replacement for the kmod_info glue that Xcode's kext build
 //  normally generates from CreateKModInfo.perl.
@@ -10,9 +10,10 @@
 //      then jump to _realmain / _antimain.
 //    * this file defines _realmain / _antimain and the kmod_info struct.
 //
-//  The kext is a plain IOKit driver (no Lilu linkage): all work happens in
-//  the RDNA4FB class instantiated by IOKit matching, so the module entry
-//  points have nothing to do.
+//  The kext is a Lilu plugin: _realmain / _antimain are Lilu's plugin entry
+//  points from Lilu/Library/plugin_start.cpp (ADDPR(kern_start) /
+//  ADDPR(kern_stop), i.e. AMDRadeonRDNA4_kern_start / AMDRadeonRDNA4_kern_stop) — what
+//  Xcode's MODULE_START / MODULE_STOP settings point at for other plugins.
 //
 
 #include <mach/mach_types.h>
@@ -23,17 +24,13 @@
 extern kern_return_t _start(kmod_info_t *ki, void *data);
 extern kern_return_t _stop(kmod_info_t *ki, void *data);
 
-static kern_return_t rdna4_kmod_start(kmod_info_t *ki, void *data) {
-	(void)ki; (void)data;
-	return KERN_SUCCESS;
-}
+extern kern_return_t AMDRadeonRDNA4_kern_start(kmod_info_t *ki, void *data);
+extern kern_return_t AMDRadeonRDNA4_kern_stop(kmod_info_t *ki, void *data);
 
-static kern_return_t rdna4_kmod_stop(kmod_info_t *ki, void *data) {
-	(void)ki; (void)data;
-	return KERN_SUCCESS;
-}
+// The version is the Makefile's (-DMODULE_VERSION), the same that goes into Info.plist: the two have to agree for the kext to load.
+#define VERSION_TEXT2(v) #v
+#define VERSION_TEXT(v) VERSION_TEXT2(v)
+KMOD_EXPLICIT_DECL(com.hackintosh.AMDRadeonRDNA4, VERSION_TEXT(MODULE_VERSION), _start, _stop)
 
-KMOD_EXPLICIT_DECL(com.hackintosh.RDNA4FB, "0.0.1", _start, _stop)
-
-__private_extern__ kmod_start_func_t *_realmain = rdna4_kmod_start;
-__private_extern__ kmod_stop_func_t  *_antimain = rdna4_kmod_stop;
+__private_extern__ kmod_start_func_t *_realmain = AMDRadeonRDNA4_kern_start;
+__private_extern__ kmod_stop_func_t  *_antimain = AMDRadeonRDNA4_kern_stop;

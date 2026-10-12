@@ -1,0 +1,21 @@
+metal: calling MTLCopyAllDevices()
+dyld[172]: dlopen("/usr/lib/system/libsystem_asl.dylib", 0x00000000)
+dyld[172]:       dlopen(libsystem_asl.dylib) => 0x19f54a9d0
+metal: MTLCopyAllDevices() returned 0 device(s)
+metal: calling MTLCreateSystemDefaultDevice()
+dyld[172]: dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", 0x00000011)
+dyld[172]:       dlopen(CoreGraphics) => 0x19f5491a0
+dyld[172]: dlsym(0x19f5491a0, "CGSCreateDefaultMetalDevice")
+dyld[172]:      dlsym("CGSCreateDefaultMetalDevice") => 0x7ff815b6112c
+dyld[172]: dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", 0x00000005)
+dyld[172]:       dlopen(QuartzCore) => 0x19f54e398
+dyld[172]: dlsym(0x19f54e398, "CAMetalLayerDidQueryMetalDevice")
+dyld[172]:      dlsym("CAMetalLayerDidQueryMetalDevice") => 0x7ff81992c6c6
+dyld[172]: dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", 0x00000005)
+dyld[172]:       dlopen(TCC) => 0x19f54ac38
+dyld[172]: dlsym(0x19f54ac38, "TCCAccessPreflight")
+dyld[172]:      dlsym("TCCAccessPreflight") => 0x7ff815732ed8
+dyld[172]: dlsym(0x19f54ac38, "TCCAccessRequest")
+dyld[172]:      dlsym("TCCAccessRequest") => 0x7ff815731e87
+metal: MTLCreateSystemDefaultDevice() = nil
+metal: child exited 0

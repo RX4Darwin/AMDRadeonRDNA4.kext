@@ -1,0 +1,103 @@
+// zpay: list/extract files matching a regex from the payloadv2/payload.NNN members of a macOS installer asset zip, in pure Go (pbzx + yaa from
+// blacktop/ipsw), because `ipsw ota extract` shells out to Apple's `aa`, which does not exist on Linux. Forge's local helper, not part of ipsw.
+//   zpay <asset.zip> <regex> <outdir|-> [payload-regex]      outdir "-" = list only
+package main
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+
+	"github.com/blacktop/ipsw/pkg/ota/pbzx"
+	"github.com/blacktop/ipsw/pkg/ota/yaa"
+)
+
+func main() {
+	if len(os.Args) < 4 {
+		fmt.Fprintln(os.Stderr, "usage: zpay <asset.zip> <regex> <outdir|-> [payload-regex]")
+		os.Exit(2)
+	}
+	zr, err := zip.OpenReader(os.Args[1])
+	if err != nil {
+		panic(err)
+	}
+	re := regexp.MustCompile(os.Args[2])
+	out := os.Args[3]
+	prx := regexp.MustCompile(`^AssetData/payloadv2/payload\.\d+$`)
+	if len(os.Args) > 4 {
+		prx = regexp.MustCompile(os.Args[4])
+	}
+	for _, f := range zr.File {
+		if !prx.MatchString(f.Name) {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", f.Name, err)
+			continue
+		}
+		var buf bytes.Buffer
+		if err := pbzx.Extract(context.Background(), rc, &buf, runtime.NumCPU()); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: pbzx: %v\n", f.Name, err)
+			rc.Close()
+			continue
+		}
+		rc.Close()
+		aa := &yaa.YAA{}
+		if err := aa.Parse(bytes.NewReader(buf.Bytes())); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: yaa: %v\n", f.Name, err)
+			continue
+		}
+		n := 0
+		for _, e := range aa.Entries {
+			if e.Path == "" || !re.MatchString(e.Path) {
+				continue
+			}
+			n++
+			switch e.Type {
+			case yaa.RegularFile:
+				fmt.Printf("%s\tF\t%d\t%s\n", filepath.Base(f.Name), e.Size, e.Path)
+				if out != "-" {
+					dst := filepath.Join(out, filepath.Clean("/"+e.Path))
+					if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+						panic(err)
+					}
+					data := make([]byte, e.Size)
+					if _, err := io.ReadFull(readerAt(&e.Size, e), data); err != nil && e.Size > 0 {
+						fmt.Fprintf(os.Stderr, "%s: read: %v\n", e.Path, err)
+						continue
+					}
+					if err := os.WriteFile(dst, data, 0o644); err != nil {
+						panic(err)
+					}
+				}
+			case yaa.SymbolicLink:
+				fmt.Printf("%s\tL\t0\t%s -> %s\n", filepath.Base(f.Name), e.Path, e.Link)
+			case yaa.Directory:
+			}
+		}
+	}
+}
+
+type entryReader struct {
+	e   *yaa.Entry
+	off int
+}
+
+func readerAt(_ *uint64, e *yaa.Entry) io.Reader { return &entryReader{e: e} }
+
+func (r *entryReader) Read(p []byte) (int, error) {
+	// yaa.Entry.Read seeks to the file offset every call, so read the whole file in one call
+	n, err := r.e.Read(p)
+	if err == nil && n < len(p) {
+		// partial read from a bytes.Reader: keep reading is not possible without an offset API; report what we got
+		return n, io.EOF
+	}
+	return n, err
+}

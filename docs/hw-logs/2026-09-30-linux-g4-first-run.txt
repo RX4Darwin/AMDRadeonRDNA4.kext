@@ -1,0 +1,25 @@
+First G4 draw of the kext's own stream on the card (docs/g4-colour.md, section 6)
+
+date/time : 2026-09-30 16:21:55 (local, Linux box)
+run by    : the lead, with the user's OK (hub-task-300)
+tree      : premetal/g4 a1b5a1f
+command   : REPLAY_DRAW=col REPLAY_COL_OK=1 bash tools/linux-replay/run.sh
+card      : RX 9070 XT, amdgpu on Linux 7.2.2, the G4 stream through amdgpu's gfx queue (per-process VMID)
+
+NOTE: transcribed by the builder from the lead's report; the raw terminal output of this run was not saved.
+Nothing was re-run to produce this file.
+
+result
+  colour    : THE COLOUR TRIANGLE IS RIGHT
+  pixels    : 8192 covered (want 8192), 0 with alpha != 0xFF, 0 not dominated by the nearest vertex's colour
+  errors    : max |channel - exact barycentric| 0.50, max |R+G+B - 255| 1
+  near v0 (66,65)   0xff0303f9
+  near v1 (189,65)  0xff03f903
+  near v2 (128,188) 0xfff80402
+  centroid (128,106) 0xff555654   (identical to RADV's colour triangle, docs/hw-logs/2026-09-30-linux-radv-colour/run.txt)
+  fence     : 1
+  context reset state : 0
+  stats     : PS_INV 8192, C_PRIM 4, C_INV 1, VS_INV 3, IA_PRIM 1, IA_VERT 3
+  exit status : 0
+  attr ring : 0 dwords changed from the 0xee pattern (the CPU-visible ring block kept its pre-fill)
+  kernel journal since the run: no amdgpu message (no VM fault, no ring timeout, no reset)

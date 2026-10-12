@@ -1,0 +1,6 @@
+RDNA4CENSUS-PLACE
+cannot place in /System/Library/Extensions
+placed in /Library/GPUBundles
+placed in /Library/Extensions
+placed in /Library/Apple/System/Library/Extensions
+placed in /tmp/GPUBundles

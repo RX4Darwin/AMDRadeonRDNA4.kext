@@ -73,3 +73,7 @@ Testing/
 # R&D & reference files
 firmware/amd-ucode/*
 firmware/amdgpu/*
+
+# Python
+__pycache__/
+*.pyc

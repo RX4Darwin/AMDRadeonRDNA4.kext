@@ -1,0 +1,2527 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+shader: MESA_SHADER_FRAGMENT
+source_blake3: {0x13eca67b, 0x8c1b405d, 0xc68368cc, 0x576824b8, 0x06c2f6a7, 0x6ce143e0, 0x68772b31, 0x10a7e46c}
+name: 
+prev_stage: MESA_SHADER_VERTEX
+inputs_read: 32
+outputs_written: 4
+perspective_varyings: 32
+system_values_read: 0x00000000'00000000'08000000'00000000
+api_subgroup_size: 64
+max_subgroup_size: 64
+min_subgroup_size: 64
+separate_shader: true
+known_interpolation_qualifiers: true
+flrp_lowered: true
+origin_upper_left: true
+decl_function main () (entrypoint)
+
+impl main {
+    block b0:   // preds:
+    32x2   %0 = @load_vector_arg_amd (base=3, arg_upper_bound_u32_amd=0, arg_num_lsb_zero=0)
+    32     %1 = load_const (0x00000000)
+    32     %2 = @load_interpolated_input (%0, %1 (0x0)) (base=0, component=1, dest_type=float32, io location=VARYING_SLOT_VAR0 slots=1 no_signed_zero)  // col
+    32     %3 = @load_interpolated_input (%0, %1 (0x0)) (base=0, component=0, dest_type=float32, io location=VARYING_SLOT_VAR0 slots=1 no_signed_zero)  // col
+    32     %4 = pack_half_2x16_rtz_split %3, %2 // preserve:sz,inf,nan
+    32     %5 = @load_interpolated_input (%0, %1 (0x0)) (base=0, component=2, dest_type=float32, io location=VARYING_SLOT_VAR0 slots=1 no_signed_zero)  // col
+    32     %6 = load_const (0x3f800000 = 1.000000)
+    32     %7 = pack_half_2x16_rtz_split %5, %6 (1.000000) // preserve:sz,inf,nan
+    32     %8 = undefined
+    32x4   %9 = vec4 %4, %7, %8, %8
+                @export_amd (%9) (target=0, enabled_channels=3, flags=6)
+                // succs: b1
+    block b1:
+}
+
+After RA:
+ACO shader stage: SW (FS), HW (PIXEL_SHADER)
+BB0
+/* logical preds: / linear preds: / kind: uniform, top-level, export_end, */
+	 s2: %11:s[0-1],  s1: %12:s[2],  v2: %13:v[0-1] = p_startpgm
+	 s2: %0:exec,  s1: %25:scc = s_wqm_b64 %0:exec
+	p_logical_start
+	 s1: %26:m0 = p_parallelcopy %12:s[2]
+	 v1: %18:v[2] = lds_param_load %26:m0 attr0.y
+	 v1: %20:v[3] = lds_param_load %26:m0 attr0.x
+	 v1: %22:v[4] = lds_param_load %26:m0 attr0.z
+	 v1: %16:v[0],  v1: %17:v[1] = p_split_vector %13:v[0-1]
+	 v1: %19:v[5] = v_interp_p10_f32_inreg %18:v[2], %16:v[0], %18:v[2]
+	 v2b: %3:v[6][16:32] = p_v_fma_mixhi_f16_rtz %18:v[2], %17:v[1], %19:v[5] quad_perm:[2,2,2,2] fi
+	 v1: %21:v[7] = v_interp_p10_f32_inreg %20:v[3], %16:v[0], %20:v[3]
+	 v2b: %4:v[6][0:16] = p_v_fma_mixlo_f16_rtz %20:v[3], %17:v[1], %21:v[7] quad_perm:[2,2,2,2] fi
+	 v1: (SzInfNaNPreserve)%5:v[6] = p_create_vector %4:v[6][0:16], %3:v[6][16:32]
+	 v1: %23:v[0] = v_interp_p10_f32_inreg %22:v[4], %16:v[0], %22:v[4]
+	 v1: %6:v[4] = v_interp_p2_f32_inreg %22:v[4], %17:v[1], %23:v[0]
+	 v1: (SzInfNaNPreserve)%8:v[4] = v_cvt_pkrtz_f16_f32 %6:v[4], 1.0
+	exp %5:v[6], %8:v[4],  v1: undef,  v1: undef en:rg** mrt0
+	p_logical_end
+	s_endpgm
+
+Pixel Shader
+disasm:
+BB0:
+	s_wqm_b64 exec, exec                                        ; befe1d7e
+	s_mov_b32 m0, s2                                            ; befd0002
+	ds_param_load v2, attr0.y wait_va_vdst:15 wait_vm_vsrc:1    ; ce8f0102
+	ds_param_load v3, attr0.x wait_va_vdst:15 wait_vm_vsrc:1    ; ce8f0003
+	ds_param_load v4, attr0.z wait_va_vdst:15 wait_vm_vsrc:1    ; ce8f0204
+	v_interp_p10_f32 v5, v2, v0, v2 wait_exp:2                  ; cd000205 040a0102
+	v_interp_p10_f32 v7, v3, v0, v3 wait_exp:1                  ; cd000107 040e0103
+	v_interp_p10_f32 v0, v4, v0, v4 wait_exp:0                  ; cd000000 04120104
+	s_delay_alu instid0(VALU_DEP_3) | instskip(SKIP_2) | instid1(VALU_DEP_1) ; bf8700b3
+	v_fma_mixhi_f16_e64_dpp v6, v2, v1, v5 quad_perm:[2,2,2,0] row_mask:0xf bank_mask:0xf fi:1 ; cc220006 041602fa ff04aa02
+	v_fma_mixlo_f16_e64_dpp v6, v3, v1, v7 quad_perm:[2,2,2,0] row_mask:0xf bank_mask:0xf fi:1 ; cc210006 041e02fa ff04aa03
+	v_interp_p2_f32 v4, v4, v1, v0 wait_exp:7                   ; cd010704 04020304
+	v_cvt_pk_rtz_f16_f32_e64 v4, v4, 1.0                        ; d52f0004 0201e504
+	export mrt0 v6, v4, off, off done                           ; f8000803 80800406
+	s_endpgm                                                    ; bfb00000
+
+shader: MESA_SHADER_VERTEX
+source_blake3: {0x85c317ef, 0xd0fde8d7, 0x4aa2fb9a, 0xefedfb41, 0xc74bfcba, 0x2f5bf741, 0xa0d88871, 0x4608fc6c}
+name: 
+next_stage: MESA_SHADER_FRAGMENT
+outputs_written: 0,32
+system_values_read: 0x00000000'00000000'00000000'00005000
+api_subgroup_size: 64
+max_subgroup_size: 64
+min_subgroup_size: 64
+bit_sizes_float: 0x20
+bit_sizes_int: 0x21
+separate_shader: true
+flrp_lowered: true
+decl_function main () (entrypoint)
+
+impl main {
+    block b0:   // preds:
+    32     %0 = @load_vector_arg_amd (base=12, arg_upper_bound_u32_amd=0, arg_num_lsb_zero=0)
+    32     %1 = @load_scalar_arg_wg_div_amd (base=2, arg_upper_bound_u32_amd=0, arg_num_lsb_zero=0)
+    32     %2 = @load_vector_arg_amd (base=9, arg_upper_bound_u32_amd=0, arg_num_lsb_zero=0)
+    1      %3 = @is_subgroup_invocation_lt_amd (%1) (base=0)
+                // succs: b1 b2
+    if %3 {
+        block b1:   // preds: b0
+        32     %4 = @load_scalar_arg_amd (base=7, arg_upper_bound_u32_amd=0, arg_num_lsb_zero=0)
+        32     %5 = iadd %0, %4
+        32     %6 = load_const (0xbf000000 = -0.500000 = -1090519040 = 3204448256)
+        32     %7 = load_const (0x00000001)
+        32     %8 = load_const (0x3f000000 = 0.500000 = 1056964608)
+        32     %9 = load_const (0x00000000)
+        1     %10 = ieq %5, %7 (0x1)
+        32    %11 = bcsel %10, %8 (0x3f000000), %9 (0x0)
+        1     %12 = ieq %5, %9 (0x0)
+        32    %13 = bcsel %12, %6 (0xbf000000), %11
+        32    %14 = load_const (0x3f800000 = 1.000000 = 1065353216)
+        32    %15 = load_const (0x00000002)
+        1     %16 = ieq %5, %15 (0x2)
+        32    %17 = bcsel %16, %8 (0x3f000000), %6 (0xbf000000)
+        32x4  %18 = vec4 %13, %17, %9 (0x0), %14 (0x3f800000)
+                    @export_amd (%18) (target=12, enabled_channels=15, flags=2)
+                    // succs: b3
+    } else {
+        block b2:   // preds: b0
+        1     %19 = undefined
+        1     %20 = undefined
+        1     %21 = undefined
+                    // succs: b3
+    }
+    block b3:   // preds: b1 b2
+    1     %22 = phi b1: %12, b2: %19
+    1     %23 = phi b1: %10, b2: %21
+    1     %24 = phi b1: %16, b2: %20
+    1     %25 = @is_subgroup_invocation_lt_amd (%1) (base=8)
+                // succs: b4 b5
+    if %25 {
+        block b4:   // preds: b3
+        32    %26 = undefined
+        32x4  %27 = vec4 %2, %26, %26, %26
+                    @export_amd (%27) (target=20, enabled_channels=1, flags=2)
+                    // succs: b6
+    } else {
+        block b5:  // preds: b3, succs: b6
+    }
+    block b6:   // preds: b4 b5
+    32x2  %28 = @load_scalar_arg_amd (base=0, arg_upper_bound_u32_amd=0, arg_num_lsb_zero=0)
+    32    %29 = load_const (0xffffbfff = -16385 = 4294950911)
+    32    %30 = iand %28.y, %29 (0xffffbfff)
+    64    %31 = pack_64_2x32_split %28.x, %30
+    32    %32 = load_const (0x00000000)
+    32x4  %33 = @load_global_amd (%31, %32 (0x0)) (base=160, access=readonly|reorderable|speculatable|smem-amd, align_mul=4, align_offset=0)
+    32    %34 = load_const (0xfffffff8 = -8 = 4294967288)
+    32    %35 = load_const (0x00000007)
+    32    %36 = iadd %1, %35 (0x7)
+    32    %37 = iand %36, %34 (0xfffffff8)
+    1     %38 = @is_subgroup_invocation_lt_amd (%37) (base=0)
+                // succs: b7 b8
+    if %38 {
+        block b7:   // preds: b6
+        32    %39 = @load_scalar_arg_amd (base=4, arg_upper_bound_u32_amd=0, arg_num_lsb_zero=0)
+        64    %40 = load_const (0xffffffffffffffff = -nan = -1 = 18446744073709551615)
+        32    %41 = load_const (0x00000004)
+        32    %42 = load_const (0x00000018 = 24)
+        32    %43 = ubfe %1, %42 (0x18), %41 (0x4)
+        32    %44 = load_const (0x00000006)
+        32    %45 = ishl %43, %44 (0x6)
+        32    %46 = @mbcnt_amd (%40 (0xffffffffffffffff), %45)
+        32    %47 = undefined
+        32    %48 = b2f32 %24
+        32    %49 = b2f32 %23
+        32    %50 = b2f32 %22
+        32x4  %51 = vec4 %50, %49, %48, %47
+        32    %52 = load_const (0x00100000 = 1048576)
+        32    %53 = ior %33.y, %52 (0x100000)
+        32x4  %54 = vec4 %33.x, %53, %33.z, %33.w
+        32    %55 = load_const (0x00007fff = 32767)
+        32    %56 = iand %39, %55 (0x7fff)
+        32    %57 = load_const (0x00000009)
+        32    %58 = ishl %56, %57 (0x9)
+                    @store_buffer_amd (%51, %54, %32 (0x0), %58, %46) (base=0, wrmask=xyzw, mem_modes=shader_out, access=coherent|is-swizzled-amd, align_mul=16, align_offset=0)
+                    // succs: b9
+    } else {
+        block b8:  // preds: b6, succs: b9
+    }
+    block b9:  // preds: b7 b8, succs: b10
+    block b10:
+}
+
+After RA:
+ACO shader stage: SW (VS), HW (NEXT_GEN_GEOMETRY_SHADER)
+BB0
+/* logical preds: / linear preds: / kind: top-level, branch, */
+	 s2: %60:s[0-1],  s1: %61:s[2],  s1: %62:s[3],  s1: %63:s[4],  s1: %64:s[5],  s1: %65:s[6],  s1: %66:s[7],  s1: %67:s[8],  s1: %68:s[9],  v1: %69:v[0],  v1: %70:v[1],  v1: %71:v[2],  v1: %72:v[3],  v1: %73:v[4] = p_startpgm
+	s_setprio imm:3
+	 s2: %0:exec = p_parallelcopy -1
+	p_logical_start
+	 s1: %74:s[2] = s_pack_ll_b32_b16 0, %62:s[3]
+	 s2: %76:s[6-7],  s1: %75:scc = s_bfe_u64 -1, %74:s[2]
+	p_logical_end
+	 s2: %0:exec = p_parallelcopy %76:s[6-7]
+	p_cbranch_z %0:exec BB2, BB1
+BB1
+/* logical preds: BB0, / linear preds: BB0, / kind: uniform, export_end, */
+	p_logical_start
+	 v1: %6:v[3] = v_add_u32 %67:s[8], %72:v[3]
+	 s2: %11:vcc = v_cmp_eq_i32 1, %6:v[3]
+	 v1: %78:v[1] = p_parallelcopy 0
+	 v1: %12:v[2] = v_cndmask_b32 0, 0.5, %11:vcc
+	 s2: %13:s[6-7] = v_cmp_eq_i32 0, %6:v[3]
+	 v1: %14:v[2] = v_cndmask_b32 %12:v[2], -0.5, %13:s[6-7]
+	 s2: %17:s[8-9] = v_cmp_eq_i32 2, %6:v[3]
+	 v1: %18:v[3] = v_cndmask_b32 -0.5, 0.5, %17:s[8-9]
+	 v1: %83:v[4] = p_parallelcopy 1.0
+	exp %14:v[2], %18:v[3], %78:v[1], %83:v[4] pos0
+	p_logical_end
+	p_branch BB3
+BB2
+/* logical preds: / linear preds: BB0, / kind: uniform, */
+	p_branch BB3
+BB3
+/* logical preds: / linear preds: BB1, BB2, / kind: invert, */
+	 s2: %111:s[6-7] = p_linear_phi %13:s[6-7],  s2: undef
+	 s2: %110:vcc = p_linear_phi %11:vcc,  s2: undef
+	 s2: %109:s[8-9] = p_linear_phi %17:s[8-9],  s2: undef
+	 s2: %0:exec,  s1: %112:scc = s_andn2_b64 -1, %0:exec
+	p_cbranch_z %0:exec BB5, BB4
+BB4
+/* logical preds: BB0, / linear preds: BB3, / kind: uniform, */
+	p_logical_start
+	p_logical_end
+	p_branch BB6
+BB5
+/* logical preds: / linear preds: BB3, / kind: uniform, */
+	p_branch BB6
+BB6
+/* logical preds: BB1, BB4, / linear preds: BB4, BB5, / kind: top-level, branch, merge, */
+	 s2: %0:exec = p_parallelcopy -1
+	p_logical_start
+	 s1: %85:s[2],  s1: %84:scc = s_lshl_b32 %62:s[3], 8
+	 s2: %87:s[10-11],  s1: %86:scc = s_bfe_u64 -1, %85:s[2]
+	p_logical_end
+	 s2: %0:exec = p_parallelcopy %87:s[10-11]
+	p_cbranch_z %0:exec BB8, BB7
+BB7
+/* logical preds: BB6, / linear preds: BB6, / kind: uniform, */
+	p_logical_start
+	exp %69:v[0],  v1: undef,  v1: undef,  v1: undef en:r*** done prim
+	p_logical_end
+	p_branch BB9
+BB8
+/* logical preds: / linear preds: BB6, / kind: uniform, */
+	p_branch BB9
+BB9
+/* logical preds: / linear preds: BB7, BB8, / kind: invert, */
+	 s2: %0:exec,  s1: %113:scc = s_andn2_b64 -1, %0:exec
+	p_cbranch_z %0:exec BB11, BB10
+BB10
+/* logical preds: BB6, / linear preds: BB9, / kind: uniform, */
+	p_logical_start
+	p_logical_end
+	p_branch BB12
+BB11
+/* logical preds: / linear preds: BB9, / kind: uniform, */
+	p_branch BB12
+BB12
+/* logical preds: BB7, BB10, / linear preds: BB10, BB11, / kind: top-level, branch, merge, */
+	 s2: %0:exec = p_parallelcopy -1
+	p_logical_start
+	 s1: %88:s[0],  s1: %89:s[1] = p_split_vector %60:s[0-1]
+	 s1: %31:s[1] = s_bitset0_b32 14, %89:s[1]
+	 s2: %32:s[0-1] = p_create_vector %88:s[0], %31:s[1]
+	 s4: %34:s[12-15] = s_load_dwordx4 %32:s[0-1], 0xa0 storage:buffer semantics:private,reorder
+	 s1: %37:s[0],  s1: %95:scc = s_add_u32 %62:s[3], 7
+	 s1: %38:s[0],  s1: %96:scc = s_and_b32 %37:s[0], -8
+	 s1: %97:s[0] = s_pack_ll_b32_b16 0, %38:s[0]
+	 s2: %99:s[0-1],  s1: %98:scc = s_bfe_u64 -1, %97:s[0]
+	 s1: %91:s[12],  s1: %92:s[13],  s1: %93:s[14],  s1: %94:s[15] = p_split_vector %34:s[12-15]
+	p_logical_end
+	 s2: %0:exec = p_parallelcopy %99:s[0-1]
+	p_cbranch_z %0:exec BB14, BB13
+BB13
+/* logical preds: BB12, / linear preds: BB12, / kind: uniform, */
+	p_logical_start
+	 s1: %44:s[3],  s1: %100:scc = s_bfe_u32 %62:s[3], 0x40018
+	 s1: %46:s[3],  s1: %101:scc = s_lshl_b32 (is16bit)%44:s[3], 6
+	 v1: %105:v[0] = v_mbcnt_lo_u32_b32 -1, %46:s[3]
+	 v1: %47:v[0] = v_mbcnt_hi_u32_b32_e64 -1, %105:v[0]
+	 v1: %49:v[6] = v_cndmask_b32 0, 1.0, %109:s[8-9]
+	 v1: %50:v[5] = v_cndmask_b32 0, 1.0, %110:vcc
+	 v1: %51:v[4] = v_cndmask_b32 0, 1.0, %111:s[6-7]
+	 v4: %52:v[4-7] = p_create_vector %51:v[4], %50:v[5], %49:v[6],  v1: undef
+	 s1: %54:s[13] = s_bitset1_b32 20, %92:s[13]
+	 s4: %55:s[12-15] = p_create_vector %91:s[12], %54:s[13], %93:s[14], %94:s[15]
+	 s1: %57:s[5],  s1: %107:scc = s_and_b32 %64:s[5], 0x7fff
+	 s1: %59:s[5],  s1: %108:scc = s_lshl_b32 (is16bit)%57:s[5], 9
+	buffer_store_dwordx4 %55:s[12-15], %47:v[0], %59:s[5], %52:v[4-7] idxen device swizzled storage:vmem_output
+	p_logical_end
+	p_branch BB15
+BB14
+/* logical preds: / linear preds: BB12, / kind: uniform, */
+	p_branch BB15
+BB15
+/* logical preds: / linear preds: BB13, BB14, / kind: invert, */
+	 s2: %0:exec,  s1: %114:scc = s_andn2_b64 -1, %0:exec
+	p_cbranch_z %0:exec BB17, BB16
+BB16
+/* logical preds: BB12, / linear preds: BB15, / kind: uniform, */
+	p_logical_start
+	p_logical_end
+	p_branch BB18
+BB17
+/* logical preds: / linear preds: BB15, / kind: uniform, */
+	p_branch BB18
+BB18
+/* logical preds: BB13, BB16, / linear preds: BB16, BB17, / kind: uniform, top-level, merge, */
+	 s2: %0:exec = p_parallelcopy -1
+	p_logical_start
+	p_logical_end
+	s_endpgm
+
+Vertex Shader as ESGS
+disasm:
+BB0:
+	s_setprio 3                                                 ; bfb50003
+	s_pack_ll_b32_b16 s2, 0, s3                                 ; 99020380
+	s_delay_alu instid0(SALU_CYCLE_1)                           ; bf870009
+	s_bfe_u64 exec, -1, s2                                      ; 947e02c1
+	s_cbranch_execz BB6                                         ; bfa50012
+BB1:
+	v_add_nc_u32_e32 v3, s8, v3                                 ; 4a060608
+	v_mov_b32_e32 v1, 0                                         ; 7e020280
+	v_mov_b32_e32 v4, 1.0                                       ; 7e0802f2
+	s_delay_alu instid0(VALU_DEP_3)                             ; bf870003
+	v_cmp_eq_i32_e32 vcc, 1, v3                                 ; 7c840681
+	v_cmp_eq_i32_e64 s[6:7], 0, v3                              ; d4420006 02020680
+	v_cmp_eq_i32_e64 s[8:9], 2, v3                              ; d4420008 02020682
+	v_cndmask_b32_e64 v2, 0, 0.5, vcc                           ; d5010002 01a9e080
+	s_wait_alu 0xf1ff                                           ; bf88f1ff
+	v_cndmask_b32_e64 v3, -0.5, 0.5, s[8:9]                     ; d5010003 0021e0f1
+	v_cndmask_b32_e64 v2, v2, -0.5, s[6:7]                      ; d5010002 0019e302
+	export pos0 v2, v3, v1, v4 done                             ; f80008cf 04010302
+BB6:
+	s_lshl_b32 s2, s3, 8                                        ; 84028803
+	s_wait_expcnt 0x0                                           ; bfc40000
+	s_delay_alu instid0(SALU_CYCLE_1)                           ; bf870009
+	s_bfe_u64 exec, -1, s2                                      ; 947e02c1
+	s_cbranch_execz BB12                                        ; bfa50002
+BB7:
+	export prim v0, off, off, off done                          ; f8000941 80808000
+BB12:
+	s_bitset0_b32 s1, 14                                        ; be81108e
+	s_load_b128 s[12:15], s[0:1], 0xa0                          ; f4004300 f80000a0
+	s_add_co_u32 s0, s3, 7                                      ; 80008703
+	s_delay_alu instid0(SALU_CYCLE_1) | instskip(NEXT) | instid1(SALU_CYCLE_1) ; bf870499
+	s_and_b32 s0, s0, -8                                        ; 8b00c800
+	s_pack_ll_b32_b16 s0, 0, s0                                 ; 99000080
+	s_wait_expcnt 0x0                                           ; bfc40000
+	s_delay_alu instid0(SALU_CYCLE_1)                           ; bf870009
+	s_bfe_u64 exec, -1, s0                                      ; 947e00c1
+	s_cbranch_execz BB18                                        ; bfa50016
+BB13:
+	s_bfe_u32 s3, s3, 0x40018                                   ; 9303ff03 00040018
+	v_cndmask_b32_e64 v6, 0, 1.0, s[8:9]                        ; d5010006 0021e480
+	v_cndmask_b32_e64 v5, 0, 1.0, vcc                           ; d5010005 01a9e480
+	v_cndmask_b32_e64 v4, 0, 1.0, s[6:7]                        ; d5010004 0019e480
+	s_lshl_b32 s3, s3, 6                                        ; 84038603
+	s_and_b32 s5, s5, 0x7fff                                    ; 8b05ff05 00007fff
+	v_mbcnt_lo_u32_b32 v0, -1, s3                               ; d71f0000 020006c1
+	s_lshl_b32 s5, s5, 9                                        ; 84058905
+	s_delay_alu instid0(VALU_DEP_1)                             ; bf870001
+	v_mbcnt_hi_u32_b32 v0, -1, v0                               ; d7200000 020200c1
+	s_wait_kmcnt 0x0                                            ; bfc70000
+	s_bitset1_b32 s13, 20                                       ; be8d1294
+	buffer_store_b128 v[4:7], v0, s[12:15], s5 idxen scope:SCOPE_DEV ; c4074005 80881804 00000000
+BB18:
+	s_endpgm                                                    ; bfb00000
+
+------------------ Preamble IB begin - GFX ------------------
+c0023f00 INDIRECT_BUFFER:
+00015000         IB_BASE_LO <- 0x00015000
+ffff8001         IB_BASE_HI <- 0xffff8001
+00000148         IB_CONTROL <- 328 (0x00000148)
+                               IB_SIZE = 328 (0x00148)
+                               CHAIN = 0
+                               PRE_ENA = 0
+                               VALID = 0
+c0064900 RELEASE_MEM:
+80000528         VGT_EVENT_INITIATOR <- 40 (0x00000028)
+                                        EVENT_TYPE = BOTTOM_OF_PIPE_TS
+                 WAIT_SYNC <- 0
+                 EVENT_INDEX <- END_OF_PIPE
+                 GCR_CNTL <- 0
+                 TEMPORAL <- RT
+                 EXECUTE <- NORMAL_FENCE_WITH_ADJUST
+                 GLK_INV <- 0
+                 PWS_ENABLE <- 1
+00000000         DST_SEL <- MEMORY_CONTROLLER
+                 MES_INTR_PIPE <- 0
+                 MES_ACTION_ID <- NO_MES_NOTIFICATION
+                 INT_SEL <- NONE
+                 DATA_SEL <- NONE
+00000000         [A]ADDRESS_LO_32B <- 0
+                 [B]ADDRESS_LO_64B <- 0
+00000000         [A]ADDRESS_HI <- 0
+00000000         [A]DATA_LO <- 0
+                 [B]CMP_DATA_LO <- 0
+00000000         [A]DATA_HI <- 0
+                 [B]CMP_DATA_HI <- 0
+00000000         INT_CTXID <- 0
+c0065800 ACQUIRE_MEM:
+00022800         0x301f0 <- 0x00022800
+                 [A]ENGINE_SEL <- PREFETCH_PARSER
+                 [B]PWS_STAGE_SEL <- CP_ME
+                 [B]PWS_COUNTER_SEL <- TS_SELECT
+                 [B]PWS_ENA2 <- PIXEL_WAIT_SYNC_ENABLE
+                 [B]PWS_COUNT <- 0
+ffffffff         [A]COHER_SIZE <- 0xffffffff
+                 [B]GCR_SIZE <- 0xffffffff
+01ffffff         [A]COHER_SIZE_HI <- 0xffffff
+                 [B]GCR_SIZE_HI <- 0x1ffffff
+00000000         [A]COHER_BASE_LO <- 0
+                 [B]GCR_BASE_LO <- 0
+00000000         [A]COHER_BASE_HI <- 0
+                 [B]GCR_BASE_HI <- 0
+80000000         [A]POLL_INTERVAL <- 0
+                 [B]PWS_ENA <- PIXEL_WAIT_SYNC_ENABLE
+00000000         GCR_CNTL <- 0
+                             GLI_INV = GLI_NOP
+                             GL1_RANGE = GL1_ALL
+                             GLM_WB = 0
+                             GLM_INV = 0
+                             GLK_WB = 0
+                             GLK_INV = 0
+                             GLV_INV = 0
+                             GL1_INV = 0
+                             GL2_US = 0
+                             GL2_RANGE = GL2_ALL
+                             GL2_DISCARD = 0
+                             GL2_INV = 0
+                             GL2_WB = 0
+                             SEQ = SEQ_PARALLEL
+                             RANGE_IS_PA = 0
+c0047900 SET_UCONFIG_REG:
+00000444 
+12355123         SPI_GS_THROTTLE_CNTL1 <- 0x12355123
+                                          PH_POLL_INTERVAL = 3
+                                          PH_THROTTLE_BASE = 2
+                                          PH_THROTTLE_STEP_SIZE = 1
+                                          SPI_VGPR_THRESHOLD = 5
+                                          SPI_LDS_THRESHOLD = 5
+                                          SPI_POLL_INTERVAL = 3
+                                          SPI_THROTTLE_BASE = 2
+                                          SPI_THROTTLE_STEP_SIZE = 1
+0001544d         SPI_GS_THROTTLE_CNTL2 <- 0x0001544d
+                                          SPI_THROTTLE_MODE = 1
+                                          GRP_LIFETIME_THRESHOLD = 3
+                                          GRP_LIFETIME_THRESHOLD_FACTOR = 1
+                                          GRP_LIFETIME_PENALTY1 = 4
+                                          GRP_LIFETIME_PENALTY2 = 2
+                                          PS_STALL_THRESHOLD = 1
+                                          PH_MODE = 1
+                                          RESERVED = 0
+80000020         SPI_ATTRIBUTE_RING_BASE <- 0x80000020
+00020015         SPI_ATTRIBUTE_RING_SIZE <- 0x00020015
+                                            MEM_SIZE = 21 (0x15)
+                                            BIG_PAGE = 0
+                                            L1_POLICY = 1
+                                            L2_POLICY = 0
+                                            LLC_NOALLOC = 0
+                                            GL1_PERF_COUNTER_DISABLE = 0
+c0047900 SET_UCONFIG_REG:
+00000268 
+80000078         GE_POS_RING_BASE <- 0x80000078
+00002000         GE_POS_RING_SIZE <- 8192 (0x00002000)
+                                     MEM_SIZE = 8192 (0x2000)
+800000b8         GE_PRIM_RING_BASE <- 0x800000b8
+0c6e07fe         GE_PRIM_RING_SIZE <- 0x0c6e07fe
+                                      MEM_SIZE = 2046 (0x7fe)
+                                      SCOPE = 2
+                                      PAF_TEMPORAL = 3
+                                      PAB_TEMPORAL = 3
+                                      SPEC_DATA_READ = 0
+                                      FORCE_SE_SCOPE = 1
+                                      PAB_NOFILL = 1
+c000ef00 UPDATE_DB_SUMMARIZER_TIMEOUT:
+00000000         REG_VALUE <- 0
+c0027600 SET_SH_REG:
+0000000c 
+00002000         SPI_SHADER_USER_DATA_PS_0 <- 8192 (0x00002000)
+ffff8001         SPI_SHADER_USER_DATA_PS_1 <- 0xffff8001
+c0027600 SET_SH_REG:
+00000104 
+00002000         SPI_SHADER_PGM_LO_HS <- 8192 (0x00002000)
+ffff8001         SPI_SHADER_PGM_HI_HS <- 0xffff8001
+c0027600 SET_SH_REG:
+00000084 
+00002000         SPI_SHADER_PGM_LO_GS <- 8192 (0x00002000)
+ffff8001         SPI_SHADER_PGM_HI_GS <- 0xffff8001
+c0065800 ACQUIRE_MEM:
+00000000         0x301f0 <- 0x00000000
+                 [A]ENGINE_SEL <- PREFETCH_PARSER
+                 [B]PWS_STAGE_SEL <- PRE_DEPTH
+                 [B]PWS_COUNTER_SEL <- TS_SELECT
+                 [B]PWS_ENA2 <- PIXEL_WAIT_SYNC_DISABLE
+                 [B]PWS_COUNT <- 0
+ffffffff         [A]COHER_SIZE <- 0xffffffff
+                 [B]GCR_SIZE <- 0xffffffff
+00ffffff         [A]COHER_SIZE_HI <- 0xffffff
+                 [B]GCR_SIZE_HI <- 0xffffff
+00000000         [A]COHER_BASE_LO <- 0
+                 [B]GCR_BASE_LO <- 0
+00000000         [A]COHER_BASE_HI <- 0
+                 [B]GCR_BASE_HI <- 0
+0000000a         [A]POLL_INTERVAL <- 10 (0x000a)
+                 [B]PWS_ENA <- PIXEL_WAIT_SYNC_DISABLE
+0000c181         GCR_CNTL <- 0x0000c181
+                             GLI_INV = GLI_ALL
+                             GL1_RANGE = GL1_ALL
+                             GLM_WB = 0
+                             GLM_INV = 0
+                             GLK_WB = 0
+                             GLK_INV = 1
+                             GLV_INV = 1
+                             GL1_INV = 0
+                             GL2_US = 0
+                             GL2_RANGE = GL2_ALL
+                             GL2_DISCARD = 0
+                             GL2_INV = 1
+                             GL2_WB = 1
+                             SEQ = SEQ_PARALLEL
+                             RANGE_IS_PA = 0
+c0004600 EVENT_WRITE:
+00000019         VGT_EVENT_INITIATOR <- 25 (0x00000019)
+                                        EVENT_TYPE = PIPELINESTAT_START
+                 EVENT_INDEX <- OTHER
+c0021000 NOP:
+00000000         (unused)
+00000000         (unused)
+00000000         (unused)
+c0021000 NOP:
+00000000         (unused)
+00000000         (unused)
+00000000         (unused)
+         
+------------------- Preamble IB end - GFX -------------------
+
+------------------ Main IB begin - GFX ------------------
+c0043700 WRITE_DATA:
+40100500         DST_SEL <- MEMORY
+                 ADDR_INCR <- INCREMENT_ADDRESS
+                 WR_CONFIRM <- WAIT_FOR_WRITE_CONFIRMATION
+                 MODE <- PF_VF_DISABLED
+                 AID_ID <- 0
+                 TEMPORAL <- RT
+                 ENGINE_SEL <- PREFETCH_PARSER
+00040000         [A]DST_MMREG_ADDR_LO <- 0x00040000
+                 [B]DST_MEM_ADDR_LO <- 0x00040000
+ffff8000         [A]DST_MMREG_ADDR_HI <- 0
+                 [B]DST_MEM_ADDR_HI <- 0xffff8000
+                 (FULL ADDRESS) <- 0xffff800000040000
+00000000         (data)
+00000000 
+c0065800 ACQUIRE_MEM:
+00000000         0x301f0 <- 0x00000000
+                 [A]ENGINE_SEL <- PREFETCH_PARSER
+                 [B]PWS_STAGE_SEL <- PRE_DEPTH
+                 [B]PWS_COUNTER_SEL <- TS_SELECT
+                 [B]PWS_ENA2 <- PIXEL_WAIT_SYNC_DISABLE
+                 [B]PWS_COUNT <- 0
+ffffffff         [A]COHER_SIZE <- 0xffffffff
+                 [B]GCR_SIZE <- 0xffffffff
+00ffffff         [A]COHER_SIZE_HI <- 0xffffff
+                 [B]GCR_SIZE_HI <- 0xffffff
+00000000         [A]COHER_BASE_LO <- 0
+                 [B]GCR_BASE_LO <- 0
+00000000         [A]COHER_BASE_HI <- 0
+                 [B]GCR_BASE_HI <- 0
+0000000a         [A]POLL_INTERVAL <- 10 (0x000a)
+                 [B]PWS_ENA <- PIXEL_WAIT_SYNC_DISABLE
+0000c000         GCR_CNTL <- 0x0000c000
+                             GLI_INV = GLI_NOP
+                             GL1_RANGE = GL1_ALL
+                             GLM_WB = 0
+                             GLM_INV = 0
+                             GLK_WB = 0
+                             GLK_INV = 0
+                             GLV_INV = 0
+                             GL1_INV = 0
+                             GL2_US = 0
+                             GL2_RANGE = GL2_ALL
+                             GL2_DISCARD = 0
+                             GL2_INV = 1
+                             GL2_WB = 1
+                             SEQ = SEQ_PARALLEL
+                             RANGE_IS_PA = 0
+c0055000 DMA_DATA:
+c0300000 
+00000000 
+00000000 
+00001000 
+ffff8001 
+400000e0         ENGINE_SEL <- MICRO_ENGINE
+                 SRC_INDIRECT <- 0
+                 DST_INDIRECT <- 0
+                 SRC_TEMPORAL <- RT
+                 DST_SEL <- DST_ADDR_USING_L2
+                 DST_TEMPORAL <- RT
+                 SRC_SEL <- DATA
+                 CP_SYNC <- 1
+                 SRC_ADDR_LO_OR_DATA <- 0
+                 SRC_ADDR_HI <- 0
+                 DST_ADDR_LO <- 4096 (0x00001000)
+                 DST_ADDR_HI <- 0xffff8001
+                 (FULL ADDRESS) <- 0xffff800100001000
+                 BYTE_COUNT <- 224 (0x0000e0)
+                 SAS <- MEMORY
+                 DAS <- MEMORY
+                 SAIC <- INCREMENT
+                 DAIC <- INCREMENT
+                 RAW_WAIT <- 1
+                 DIS_WC <- 0
+                 DISABLE_WR_CONFIRM <- 0
+c0004200 PFP_SYNC_ME:
+00000000 
+c0065800 ACQUIRE_MEM:
+00000000         0x301f0 <- 0x00000000
+                 [A]ENGINE_SEL <- PREFETCH_PARSER
+                 [B]PWS_STAGE_SEL <- PRE_DEPTH
+                 [B]PWS_COUNTER_SEL <- TS_SELECT
+                 [B]PWS_ENA2 <- PIXEL_WAIT_SYNC_DISABLE
+                 [B]PWS_COUNT <- 0
+ffffffff         [A]COHER_SIZE <- 0xffffffff
+                 [B]GCR_SIZE <- 0xffffffff
+00ffffff         [A]COHER_SIZE_HI <- 0xffffff
+                 [B]GCR_SIZE_HI <- 0xffffff
+00000000         [A]COHER_BASE_LO <- 0
+                 [B]GCR_BASE_LO <- 0
+00000000         [A]COHER_BASE_HI <- 0
+                 [B]GCR_BASE_HI <- 0
+0000000a         [A]POLL_INTERVAL <- 10 (0x000a)
+                 [B]PWS_ENA <- PIXEL_WAIT_SYNC_DISABLE
+0000c000         GCR_CNTL <- 0x0000c000
+                             GLI_INV = GLI_NOP
+                             GL1_RANGE = GL1_ALL
+                             GLM_WB = 0
+                             GLM_INV = 0
+                             GLK_WB = 0
+                             GLK_INV = 0
+                             GLV_INV = 0
+                             GL1_INV = 0
+                             GL2_US = 0
+                             GL2_RANGE = GL2_ALL
+                             GL2_DISCARD = 0
+                             GL2_INV = 1
+                             GL2_WB = 1
+                             SEQ = SEQ_PARALLEL
+                             RANGE_IS_PA = 0
+c0055000 DMA_DATA:
+c0300000 
+00000000 
+00000000 
+000010e0 
+ffff8001 
+40000004         ENGINE_SEL <- MICRO_ENGINE
+                 SRC_INDIRECT <- 0
+                 DST_INDIRECT <- 0
+                 SRC_TEMPORAL <- RT
+                 DST_SEL <- DST_ADDR_USING_L2
+                 DST_TEMPORAL <- RT
+                 SRC_SEL <- DATA
+                 CP_SYNC <- 1
+                 SRC_ADDR_LO_OR_DATA <- 0
+                 SRC_ADDR_HI <- 0
+                 DST_ADDR_LO <- 4320 (0x000010e0)
+                 DST_ADDR_HI <- 0xffff8001
+                 (FULL ADDRESS) <- 0xffff8001000010e0
+                 BYTE_COUNT <- 4
+                 SAS <- MEMORY
+                 DAS <- MEMORY
+                 SAIC <- INCREMENT
+                 DAIC <- INCREMENT
+                 RAW_WAIT <- 1
+                 DIS_WC <- 0
+                 DISABLE_WR_CONFIRM <- 0
+c0004200 PFP_SYNC_ME:
+00000000 
+c005b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000081 
+00000000         PA_SC_WINDOW_SCISSOR_TL <- 0
+                                            TL_X = 0
+                                            TL_Y = 0
+00000082 
+00ff00ff         PA_SC_WINDOW_SCISSOR_BR <- 0x00ff00ff
+                                            BR_X = 255 (0x00ff)
+                                            BR_Y = 255 (0x00ff)
+00000061 
+01000100         PA_SC_SCREEN_SCISSOR_BR <- 0x01000100
+                                            BR_X = 256 (0x0100)
+                                            BR_Y = 256 (0x0100)
+c011b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000318 
+01000400         CB_COLOR0_BASE <- 0x01000400
+00000319 
+00000000         CB_COLOR0_VIEW <- 0
+                                   SLICE_START = 0
+                                   SLICE_MAX = 0
+0000031a 
+00000000         CB_COLOR0_VIEW2 <- 0
+                                    MIP_LEVEL = 0
+0000031b 
+00000000         CB_COLOR0_ATTRIB <- 0
+                                     NUM_FRAGMENTS = 0
+                                     FORCE_DST_ALPHA_1 = 0
+                                     FORCE_LIMIT_COLOR_SECTOR_TO_256B_MAX = 0
+0000031c 
+10000004         CB_COLOR0_FDCC_CONTROL <- 0x10000004
+                                           MAX_UNCOMPRESSED_BLOCK_SIZE = MAX_BLOCK_SIZE_128B
+                                           MAX_COMPRESSED_BLOCK_SIZE = 0
+                                           FRAGMENT_COMPRESS_DISABLE = 0
+                                           COMPRESSION_MODE = 0
+                                           ENABLE_MAX_COMP_FRAG_OVERRIDE = 1
+                                           MAX_COMP_FRAGS = 0
+0000031e 
+00ff00ff         CB_COLOR0_ATTRIB2 <- 0x00ff00ff
+                                      MIP0_HEIGHT = 255 (0x00ff)
+                                      MIP0_WIDTH = 255 (0x00ff)
+0000031f 
+01000000         CB_COLOR0_ATTRIB3 <- 0x01000000
+                                      MIP0_DEPTH = 0
+                                      COLOR_SW_MODE = 0
+                                      MAX_MIP = 0
+                                      RESOURCE_TYPE = 1
+                                      SPECULATIVE_READ = 0
+00000390 
+00000080         CB_COLOR0_BASE_EXT <- 128 (0x00000080)
+                                       BASE_256B = 128 (0x80)
+000003b0 
+0002800a         CB_COLOR0_INFO <- 0x0002800a
+                                   FORMAT = COLOR_8_8_8_8
+                                   LINEAR_GENERAL = 0
+                                   NUMBER_TYPE = NUMBER_UNORM
+                                   COMP_SWAP = SWAP_STD
+                                   BLEND_CLAMP = 1
+                                   BLEND_BYPASS = 0
+                                   SIMPLE_FLOAT = 1
+                                   ROUND_MODE = 0
+                                   DISABLE_WA_FOR_PARTIAL_TARGET_MASK_ALL = 0
+c0016900 SET_CONTEXT_REG:
+000003b1 
+00000000         CB_COLOR1_INFO <- 0
+                                   FORMAT = COLOR_INVALID
+                                   LINEAR_GENERAL = 0
+                                   NUMBER_TYPE = NUMBER_UNORM
+                                   COMP_SWAP = SWAP_STD
+                                   BLEND_CLAMP = 0
+                                   BLEND_BYPASS = 0
+                                   SIMPLE_FLOAT = 0
+                                   ROUND_MODE = 0
+                                   DISABLE_WA_FOR_PARTIAL_TARGET_MASK_ALL = 0
+c0016900 SET_CONTEXT_REG:
+000003b2 
+00000000         CB_COLOR2_INFO <- 0
+                                   FORMAT = COLOR_INVALID
+                                   LINEAR_GENERAL = 0
+                                   NUMBER_TYPE = NUMBER_UNORM
+                                   COMP_SWAP = SWAP_STD
+                                   BLEND_CLAMP = 0
+                                   BLEND_BYPASS = 0
+                                   SIMPLE_FLOAT = 0
+                                   ROUND_MODE = 0
+                                   DISABLE_WA_FOR_PARTIAL_TARGET_MASK_ALL = 0
+c0016900 SET_CONTEXT_REG:
+000003b3 
+00000000         CB_COLOR3_INFO <- 0
+                                   FORMAT = COLOR_INVALID
+                                   LINEAR_GENERAL = 0
+                                   NUMBER_TYPE = NUMBER_UNORM
+                                   COMP_SWAP = SWAP_STD
+                                   BLEND_CLAMP = 0
+                                   BLEND_BYPASS = 0
+                                   SIMPLE_FLOAT = 0
+                                   ROUND_MODE = 0
+                                   DISABLE_WA_FOR_PARTIAL_TARGET_MASK_ALL = 0
+c0016900 SET_CONTEXT_REG:
+000003b4 
+00000000         CB_COLOR4_INFO <- 0
+                                   FORMAT = COLOR_INVALID
+                                   LINEAR_GENERAL = 0
+                                   NUMBER_TYPE = NUMBER_UNORM
+                                   COMP_SWAP = SWAP_STD
+                                   BLEND_CLAMP = 0
+                                   BLEND_BYPASS = 0
+                                   SIMPLE_FLOAT = 0
+                                   ROUND_MODE = 0
+                                   DISABLE_WA_FOR_PARTIAL_TARGET_MASK_ALL = 0
+c0016900 SET_CONTEXT_REG:
+000003b5 
+00000000         CB_COLOR5_INFO <- 0
+                                   FORMAT = COLOR_INVALID
+                                   LINEAR_GENERAL = 0
+                                   NUMBER_TYPE = NUMBER_UNORM
+                                   COMP_SWAP = SWAP_STD
+                                   BLEND_CLAMP = 0
+                                   BLEND_BYPASS = 0
+                                   SIMPLE_FLOAT = 0
+                                   ROUND_MODE = 0
+                                   DISABLE_WA_FOR_PARTIAL_TARGET_MASK_ALL = 0
+c0016900 SET_CONTEXT_REG:
+000003b6 
+00000000         CB_COLOR6_INFO <- 0
+                                   FORMAT = COLOR_INVALID
+                                   LINEAR_GENERAL = 0
+                                   NUMBER_TYPE = NUMBER_UNORM
+                                   COMP_SWAP = SWAP_STD
+                                   BLEND_CLAMP = 0
+                                   BLEND_BYPASS = 0
+                                   SIMPLE_FLOAT = 0
+                                   ROUND_MODE = 0
+                                   DISABLE_WA_FOR_PARTIAL_TARGET_MASK_ALL = 0
+c0016900 SET_CONTEXT_REG:
+000003b7 
+00000000         CB_COLOR7_INFO <- 0
+                                   FORMAT = COLOR_INVALID
+                                   LINEAR_GENERAL = 0
+                                   NUMBER_TYPE = NUMBER_UNORM
+                                   COMP_SWAP = SWAP_STD
+                                   BLEND_CLAMP = 0
+                                   BLEND_BYPASS = 0
+                                   SIMPLE_FLOAT = 0
+                                   ROUND_MODE = 0
+                                   DISABLE_WA_FOR_PARTIAL_TARGET_MASK_ALL = 0
+c007b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000006 
+00000000         DB_Z_INFO <- 0
+                              FORMAT = Z_INVALID
+                              NUM_SAMPLES = 0
+                              SW_MODE = 0
+                              RESERVED_FIELD_2 = 0
+                              RESERVED_FIELD_11 = 0
+                              RESERVED_FIELD_12 = 0
+                              RESERVED_FIELD_1 = 0
+                              MAXMIP = 0
+                              RESERVED_FIELD_20 = 0
+                              DECOMPRESS_ON_N_ZPLANES = 0
+                              RESERVED_FIELD_27 = 0
+                              RESERVED_FIELD_28 = 0
+                              TILE_SURFACE_ENABLE = 0
+00000007 
+20000000         DB_STENCIL_INFO <- 0x20000000
+                                    FORMAT = STENCIL_INVALID
+                                    SW_MODE = 0
+                                    RESERVED_FIELD_2 = 0
+                                    RESERVED_FIELD_11 = 0
+                                    RESERVED_FIELD_12 = 0
+                                    RESERVED_FIELD_1 = 0
+                                    RESERVED_FIELD_20 = 0
+                                    RESERVED_FIELD_27 = 0
+                                    TILE_STENCIL_DISABLE = 1
+000002e5 
+00000000         PA_SC_HIZ_INFO <- 0
+                                   SURFACE_ENABLE = 0
+                                   FORMAT = 0
+                                   SW_MODE = 0
+                                   DST_OUTSIDE_ZERO_TO_ONE = 0
+00000004 
+08000000         DB_RENDER_OVERRIDE2 <- 0x08000000
+                                        PARTIAL_SQUAD_LAUNCH_CONTROL = PSLC_AUTO
+                                        PARTIAL_SQUAD_LAUNCH_COUNTDOWN = 0
+                                        RESERVED_FIELD_5 = 0
+                                        RESERVED_FIELD_6 = 0
+                                        DISABLE_COLOR_ON_VALIDATION = 0
+                                        DECOMPRESS_Z_ON_FLUSH = 0
+                                        RESERVED_FIELD_1 = 0
+                                        DEPTH_BOUNDS_HIER_DEPTH_DISABLE = 0
+                                        FORCE_SUMM_Z_RANGE_TO_MAX = 0
+                                        FORCE_SUMM_STENCIL_RANGE_TO_MAX = 0
+                                        RESERVED_FIELD_2 = 0
+                                        PRESERVE_ZRANGE = 0
+                                        DISABLE_FAST_PASS = 0
+                                        ALLOW_PARTIAL_RES_HIER_KILL = 0
+                                        CENTROID_COMPUTATION_MODE = 1
+                                        DISABLE_NOZ = 0
+c0036900 SET_CONTEXT_REG:
+000001d5 
+00000005         SX_PS_DOWNCONVERT <- 5
+                                      MRT0 = SX_RT_EXPORT_8_8_8_8
+                                      MRT1 = SX_RT_EXPORT_NO_CONVERSION
+                                      MRT2 = SX_RT_EXPORT_NO_CONVERSION
+                                      MRT3 = SX_RT_EXPORT_NO_CONVERSION
+                                      MRT4 = SX_RT_EXPORT_NO_CONVERSION
+                                      MRT5 = SX_RT_EXPORT_NO_CONVERSION
+                                      MRT6 = SX_RT_EXPORT_NO_CONVERSION
+                                      MRT7 = SX_RT_EXPORT_NO_CONVERSION
+00000006         SX_BLEND_OPT_EPSILON <- 6
+                                         MRT0_EPSILON = 8BIT_FORMAT_0_5
+                                         MRT1_EPSILON = 0
+                                         MRT2_EPSILON = 0
+                                         MRT3_EPSILON = 0
+                                         MRT4_EPSILON = 0
+                                         MRT5_EPSILON = 0
+                                         MRT6_EPSILON = 0
+                                         MRT7_EPSILON = 0
+00000000         SX_BLEND_OPT_CONTROL <- 0
+                                         MRT0_COLOR_OPT_DISABLE = 0
+                                         MRT0_ALPHA_OPT_DISABLE = 0
+                                         MRT1_COLOR_OPT_DISABLE = 0
+                                         MRT1_ALPHA_OPT_DISABLE = 0
+                                         MRT2_COLOR_OPT_DISABLE = 0
+                                         MRT2_ALPHA_OPT_DISABLE = 0
+                                         MRT3_COLOR_OPT_DISABLE = 0
+                                         MRT3_ALPHA_OPT_DISABLE = 0
+                                         MRT4_COLOR_OPT_DISABLE = 0
+                                         MRT4_ALPHA_OPT_DISABLE = 0
+                                         MRT5_COLOR_OPT_DISABLE = 0
+                                         MRT5_ALPHA_OPT_DISABLE = 0
+                                         MRT6_COLOR_OPT_DISABLE = 0
+                                         MRT6_ALPHA_OPT_DISABLE = 0
+                                         MRT7_COLOR_OPT_DISABLE = 0
+                                         MRT7_ALPHA_OPT_DISABLE = 0
+                                         PIXEN_ZERO_OPT_DISABLE = 0
+c0016900 SET_CONTEXT_REG:
+00000018 
+00000000         DB_COUNT_CONTROL <- 0
+                                     PERFECT_ZPASS_COUNTS = 0
+                                     DISABLE_CONSERVATIVE_ZPASS_COUNTS = 0
+                                     ENHANCED_CONSERVATIVE_ZPASS_COUNTS = 0
+                                     ZPASS_ENABLE = 0
+                                     ZFAIL_ENABLE = 0
+                                     SFAIL_ENABLE = 0
+                                     DBFAIL_ENABLE = 0
+                                     SLICE_EVEN_ENABLE = 0
+                                     SLICE_ODD_ENABLE = 0
+c0016900 SET_CONTEXT_REG:
+00000311 
+19fc01b0         PA_SC_BINNER_CNTL_0 <- 0x19fc01b0
+                                        BINNING_MODE = BINNING_ALLOWED
+                                        BIN_SIZE_X = 0
+                                        BIN_SIZE_Y = 0
+                                        BIN_SIZE_X_EXTEND = BIN_SIZE_256_PIXELS
+                                        BIN_SIZE_Y_EXTEND = BIN_SIZE_256_PIXELS
+                                        CONTEXT_STATES_PER_BIN = 0
+                                        PERSISTENT_STATES_PER_BIN = 0
+                                        DISABLE_START_OF_PRIM = 1
+                                        FPOVS_PER_BATCH = 63 (0x3f)
+                                        OPTIMAL_BIN_SELECTION = 1
+                                        FLUSH_ON_BINNING_TRANSITION = 1
+                                        BIN_MAPPING_MODE = BIN_MAP_MODE_NONE
+                                        RESERVED_31 = 0
+c00bb804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000206 
+01240000         PA_CL_VS_OUT_CNTL <- 0x01240000
+                                      CLIP_DIST_ENA_0 = 0
+                                      CLIP_DIST_ENA_1 = 0
+                                      CLIP_DIST_ENA_2 = 0
+                                      CLIP_DIST_ENA_3 = 0
+                                      CLIP_DIST_ENA_4 = 0
+                                      CLIP_DIST_ENA_5 = 0
+                                      CLIP_DIST_ENA_6 = 0
+                                      CLIP_DIST_ENA_7 = 0
+                                      CULL_DIST_ENA_0 = 0
+                                      CULL_DIST_ENA_1 = 0
+                                      CULL_DIST_ENA_2 = 0
+                                      CULL_DIST_ENA_3 = 0
+                                      CULL_DIST_ENA_4 = 0
+                                      CULL_DIST_ENA_5 = 0
+                                      CULL_DIST_ENA_6 = 0
+                                      CULL_DIST_ENA_7 = 0
+                                      USE_VTX_POINT_SIZE = 0
+                                      USE_VTX_EDGE_FLAG = 0
+                                      USE_VTX_RENDER_TARGET_INDX = 1
+                                      USE_VTX_VIEWPORT_INDX = 0
+                                      USE_VTX_KILL_FLAG = 0
+                                      VS_OUT_MISC_VEC_ENA = 1
+                                      VS_OUT_CCDIST0_VEC_ENA = 0
+                                      VS_OUT_CCDIST1_VEC_ENA = 0
+                                      VS_OUT_MISC_SIDE_BUS_ENA = 1
+                                      USE_VTX_LINE_WIDTH = 0
+                                      USE_VTX_VRS_RATE = 0
+                                      BYPASS_VTX_RATE_COMBINER = 0
+                                      BYPASS_PRIM_RATE_COMBINER = 0
+000002cf 
+00000004         VGT_GS_INSTANCE_CNT <- 4
+                                        ENABLE = 0
+                                        CNT = 1
+                                        EN_MAX_VERT_OUT_PER_GS_INSTANCE = 0
+00000192 
+00000001         SPI_SHADER_IDX_FORMAT <- 1
+                                          IDX0_EXPORT_FORMAT = SPI_SHADER_1COMP
+00000193 
+00000044         SPI_SHADER_POS_FORMAT <- 68 (0x00000044)
+                                          POS0_EXPORT_FORMAT = SPI_SHADER_4COMP
+                                          POS1_EXPORT_FORMAT = SPI_SHADER_4COMP
+                                          POS2_EXPORT_FORMAT = SPI_SHADER_NONE
+                                          POS3_EXPORT_FORMAT = SPI_SHADER_NONE
+                                          POS4_EXPORT_FORMAT = SPI_SHADER_NONE
+000001ff 
+00000080         GE_MAX_OUTPUT_PER_SUBGROUP <- 128 (0x00000080)
+                                               MAX_VERTS_PER_SUBGROUP = 128 (0x80)
+000002d3 
+00000001         GE_NGG_SUBGRP_CNTL <- 1
+                                       PRIM_AMP_FACTOR = 1
+                                       THDS_PER_SUBGRP = 0
+c0017900 SET_UCONFIG_REG:
+0000025b 
+a0010080         GE_CNTL <- 0xa0010080
+                            PRIMS_PER_SUBGRP = 128 (0x80)
+                            VERTS_PER_SUBGRP = 128 (0x80)
+                            BREAK_SUBGRP_AT_EOI = 0
+                            PACKET_TO_ONE_PA = 0
+                            BREAK_PRIMGRP_AT_EOI = 0
+                            PRIM_GRP_SIZE = 256 (0x100)
+                            GCR_DISABLE = 0
+                            DIS_PG_SIZE_ADJUST_FOR_STRIP = 1
+c0017900 SET_UCONFIG_REG:
+00000262 
+00000000         VGT_PRIMITIVEID_EN <- 0
+                                       NGG_DISABLE_PROVOK_REUSE = 0
+c005b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000198 
+00000001         SPI_PS_INPUT_ADDR <- 1
+                                      PERSP_SAMPLE_ENA = 1
+                                      PERSP_CENTER_ENA = 0
+                                      PERSP_CENTROID_ENA = 0
+                                      PERSP_PULL_MODEL_ENA = 0
+                                      LINEAR_SAMPLE_ENA = 0
+                                      LINEAR_CENTER_ENA = 0
+                                      LINEAR_CENTROID_ENA = 0
+                                      LINE_STIPPLE_TEX_ENA = 0
+                                      POS_X_FLOAT_ENA = 0
+                                      POS_Y_FLOAT_ENA = 0
+                                      POS_Z_FLOAT_ENA = 0
+                                      POS_W_FLOAT_ENA = 0
+                                      FRONT_FACE_ENA = 0
+                                      ANCILLARY_ENA = 0
+                                      SAMPLE_COVERAGE_ENA = 0
+                                      POS_FIXED_PT_ENA = 0
+00000190 
+00000000         SPI_PS_IN_CONTROL <- 0
+                                      PARAM_GEN = 0
+                                      BC_OPTIMIZE_DISABLE = 0
+                                      PS_W32_EN = 0
+000002ef 
+00000002         PA_SC_HISZ_CONTROL <- 2
+                                       ROUND = 2
+                                       CONSERVATIVE_Z_EXPORT = EXPORT_ANY_Z
+c0016900 SET_CONTEXT_REG:
+000002a6 
+04000000         VGT_SHADER_STAGES_EN <- 0x04000000
+                                         HS_EN = HS_STAGE_OFF
+                                         GS_EN = GS_STAGE_OFF
+                                         GS_FAST_LAUNCH = 0
+                                         HS_W32_EN = 0
+                                         GS_W32_EN = 0
+                                         NGG_WAVE_ID_EN = 0
+                                         PRIMGEN_PASSTHRU_NO_MSG = 1
+c0016900 SET_CONTEXT_REG:
+000002a8 
+00000040         VGT_DRAW_PAYLOAD_CNTL <- 64 (0x00000040)
+                                          EN_REG_RT_INDEX = 0
+                                          EN_PRIM_PAYLOAD = 0
+                                          EN_DRAW_VP = 0
+                                          UNUSED = 0
+                                          EN_VRS_RATE = 1
+c005b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000215 
+0000000f         CB_SHADER_MASK <- 15 (0x0000000f)
+                                   OUTPUT0_ENABLE = 15 (0xf)
+                                   OUTPUT1_ENABLE = 0
+                                   OUTPUT2_ENABLE = 0
+                                   OUTPUT3_ENABLE = 0
+                                   OUTPUT4_ENABLE = 0
+                                   OUTPUT5_ENABLE = 0
+                                   OUTPUT6_ENABLE = 0
+                                   OUTPUT7_ENABLE = 0
+00000194 
+00000000         SPI_SHADER_Z_FORMAT <- 0
+                                        Z_EXPORT_FORMAT = SPI_SHADER_ZERO
+00000195 
+00000004         SPI_SHADER_COL_FORMAT <- 4
+                                          COL0_EXPORT_FORMAT = SPI_SHADER_FP16_ABGR
+                                          COL1_EXPORT_FORMAT = SPI_SHADER_ZERO
+                                          COL2_EXPORT_FORMAT = SPI_SHADER_ZERO
+                                          COL3_EXPORT_FORMAT = SPI_SHADER_ZERO
+                                          COL4_EXPORT_FORMAT = SPI_SHADER_ZERO
+                                          COL5_EXPORT_FORMAT = SPI_SHADER_ZERO
+                                          COL6_EXPORT_FORMAT = SPI_SHADER_ZERO
+                                          COL7_EXPORT_FORMAT = SPI_SHADER_ZERO
+c0046900 SET_CONTEXT_REG:
+0000010b 
+43800000         PA_CL_GB_VERT_CLIP_ADJ <- 256.0f (0x43800000)
+3f800000         PA_CL_GB_VERT_DISC_ADJ <- 1.0f (0x3f800000)
+43800000         PA_CL_GB_HORZ_CLIP_ADJ <- 256.0f (0x43800000)
+3f800000         PA_CL_GB_HORZ_DISC_ADJ <- 1.0f (0x3f800000)
+c0016900 SET_CONTEXT_REG:
+0000008d 
+00080008         PA_SU_HARDWARE_SCREEN_OFFSET <- 0x00080008
+                                                 HW_SCREEN_OFFSET_X = 8
+                                                 HW_SCREEN_OFFSET_Y = 8
+c0016900 SET_CONTEXT_REG:
+0000001b 
+00000010         DB_SHADER_CONTROL <- 16 (0x00000010)
+                                      Z_EXPORT_ENABLE = 0
+                                      STENCIL_TEST_VAL_EXPORT_ENABLE = 0
+                                      STENCIL_OP_VAL_EXPORT_ENABLE = 0
+                                      Z_ORDER = EARLY_Z_THEN_LATE_Z
+                                      KILL_ENABLE = 0
+                                      COVERAGE_TO_MASK_ENABLE = 0
+                                      MASK_EXPORT_ENABLE = 0
+                                      EXEC_ON_HIER_FAIL = 0
+                                      EXEC_ON_NOOP = 0
+                                      ALPHA_TO_MASK_DISABLE = 0
+                                      DEPTH_BEFORE_SHADER = 0
+                                      CONSERVATIVE_Z_EXPORT = EXPORT_ANY_Z
+                                      DUAL_QUAD_DISABLE = 0
+                                      PRIMITIVE_ORDERED_PIXEL_SHADER = 0
+                                      PRE_SHADER_DEPTH_COVERAGE_ENABLE = 0
+                                      OREO_BLEND_ENABLE = 0
+                                      OVERRIDE_INTRINSIC_RATE_ENABLE = 0
+                                      OVERRIDE_INTRINSIC_RATE = 0
+c0016900 SET_CONTEXT_REG:
+00000083 
+0000ffff         PA_SC_CLIPRECT_RULE <- 0x0000ffff
+                                        CLIP_RULE = 0xffff
+c0086900 SET_CONTEXT_REG:
+0000010f 
+43000000         PA_CL_VPORT_XSCALE <- 128.0f (0x43000000)
+43000000         PA_CL_VPORT_XOFFSET <- 128.0f (0x43000000)
+43000000         PA_CL_VPORT_YSCALE <- 128.0f (0x43000000)
+43000000         PA_CL_VPORT_YOFFSET <- 128.0f (0x43000000)
+3f800000         PA_CL_VPORT_ZSCALE <- 1.0f (0x3f800000)
+00000000         PA_CL_VPORT_ZOFFSET <- 0
+00000000         PA_SC_VPORT_ZMIN_0 <- 0
+3f800000         PA_SC_VPORT_ZMAX_0 <- 1.0f (0x3f800000)
+c0016900 SET_CONTEXT_REG:
+00000019 
+00000000         DB_VIEWPORT_CONTROL <- 0
+                                        DISABLE_VIEWPORT_CLAMP = 0
+c0026900 SET_CONTEXT_REG:
+00000094 
+00000000         PA_SC_VPORT_SCISSOR_0_TL <- 0
+                                             TL_X = 0
+                                             TL_Y = 0
+00ff00ff         PA_SC_VPORT_SCISSOR_0_BR <- 0x00ff00ff
+                                             BR_X = 255 (0x00ff)
+                                             BR_Y = 255 (0x00ff)
+c0017a00 SET_UCONFIG_REG_INDEX:
+10000242         INDEX <- 1
+00000011         VGT_PRIMITIVE_TYPE <- 17 (0x00000011)
+                                       PRIM_TYPE = DI_PT_RECTLIST
+                                       NUM_INPUT_CP = 0
+                                       PRIMS_PER_SUBGROUP = 0
+c0017900 SET_UCONFIG_REG:
+00000266 
+00000003         VGT_GS_OUT_PRIM_TYPE <- 3
+                                         OUTPRIM_TYPE = RECT_2D
+c00bb804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000282 
+00000008         PA_SU_LINE_CNTL <- 8
+                                    WIDTH = 8
+00000283 
+00ff0000         PA_SC_LINE_STIPPLE <- 0x00ff0000
+                                       LINE_PATTERN = 0
+                                       REPEAT_COUNT = 255 (0xff)
+                                       PATTERN_BIT_ORDER = 0
+000002f7 
+00000000         PA_SC_LINE_CNTL <- 0
+                                    EXPAND_LINE_WIDTH = 0
+                                    LAST_PIXEL = 0
+                                    PERPENDICULAR_ENDCAP_ENA = 0
+                                    DX10_DIAMOND_TEST_ENA = 0
+                                    EXTRA_DX_DY_PRECISION = 0
+00000204 
+01080000         PA_CL_CLIP_CNTL <- 0x01080000
+                                    UCP_ENA_0 = 0
+                                    UCP_ENA_1 = 0
+                                    UCP_ENA_2 = 0
+                                    UCP_ENA_3 = 0
+                                    UCP_ENA_4 = 0
+                                    UCP_ENA_5 = 0
+                                    PS_UCP_Y_SCALE_NEG = 0
+                                    PS_UCP_MODE = 0
+                                    CLIP_DISABLE = 0
+                                    UCP_CULL_ONLY_ENA = 0
+                                    BOUNDARY_EDGE_FLAG_ENA = 0
+                                    DX_CLIP_SPACE_DEF = 1
+                                    DIS_CLIP_ERR_DETECT = 0
+                                    VTX_KILL_OR = 0
+                                    DX_RASTERIZATION_KILL = 0
+                                    DX_LINEAR_ATTR_CLIP_ENA = 1
+                                    VTE_VPORT_PROVOKE_DISABLE = 0
+                                    ZCLIP_NEAR_DISABLE = 0
+                                    ZCLIP_FAR_DISABLE = 0
+                                    ZCLIP_PROG_NEAR_ENA = 0
+00000291 
+00000002         PA_SC_LINE_STIPPLE_RESET <- 2
+                                             AUTO_RESET_CNTL = 2
+00000207 
+00000240         PA_SU_SC_MODE_CNTL <- 576 (0x00000240)
+                                       CULL_FRONT = 0
+                                       CULL_BACK = 0
+                                       FACE = 0
+                                       POLY_MODE = X_DISABLE_POLY_MODE
+                                       POLYMODE_FRONT_PTYPE = X_DRAW_TRIANGLES
+                                       POLYMODE_BACK_PTYPE = X_DRAW_TRIANGLES
+                                       POLY_OFFSET_FRONT_ENABLE = 0
+                                       POLY_OFFSET_BACK_ENABLE = 0
+                                       POLY_OFFSET_PARA_ENABLE = 0
+                                       VTX_WINDOW_OFFSET_ENABLE = 0
+                                       PROVOKING_VTX_LAST = 0
+                                       PERSP_CORR_DIS = 0
+                                       MULTI_PRIM_IB_ENA = 0
+                                       RIGHT_TRIANGLE_ALTERNATE_GRADIENT_REF = 0
+                                       NEW_QUAD_DECOMPOSITION = 0
+c0056900 SET_CONTEXT_REG:
+000002df 
+00000000         PA_SU_POLY_OFFSET_CLAMP <- 0
+00000000         PA_SU_POLY_OFFSET_FRONT_SCALE <- 0
+00000000         PA_SU_POLY_OFFSET_FRONT_OFFSET <- 0
+00000000         PA_SU_POLY_OFFSET_BACK_SCALE <- 0
+00000000         PA_SU_POLY_OFFSET_BACK_OFFSET <- 0
+c0016900 SET_CONTEXT_REG:
+000002de 
+00000000         PA_SU_POLY_OFFSET_DB_FMT_CNTL <- 0
+                                                  POLY_OFFSET_NEG_NUM_DB_BITS = 0
+                                                  POLY_OFFSET_DB_IS_FLOAT_FMT = 0
+c003b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000003 
+00001000         DB_RENDER_OVERRIDE <- 4096 (0x00001000)
+                                       FORCE_HIZ_ENABLE = FORCE_OFF
+                                       FORCE_HIS_ENABLE0 = FORCE_OFF
+                                       FORCE_HIS_ENABLE1 = FORCE_OFF
+                                       FORCE_SHADER_Z_ORDER = 0
+                                       FAST_Z_DISABLE = 0
+                                       FAST_STENCIL_DISABLE = 0
+                                       NOOP_CULL_DISABLE = 0
+                                       FORCE_COLOR_KILL = 0
+                                       FORCE_Z_READ = 0
+                                       FORCE_STENCIL_READ = 1
+                                       FORCE_FULL_Z_RANGE = FORCE_OFF
+                                       FORCE_Z_ALLOC = 0
+                                       FORCE_Z_LIMIT_SUMM = FORCE_SUMM_OFF
+                                       MAX_TILES_IN_DTT = 0
+                                       DISABLE_TILE_RATE_TILES = 0
+                                       FORCE_Z_DIRTY = 0
+                                       FORCE_STENCIL_DIRTY = 0
+                                       FORCE_Z_VALID = 0
+                                       FORCE_STENCIL_VALID = 0
+                                       PRESERVE_COMPRESSION = 0
+0000001c 
+00700770         DB_DEPTH_CONTROL <- 0x00700770
+                                     STENCIL_ENABLE = 0
+                                     Z_ENABLE = 0
+                                     Z_WRITE_ENABLE = 0
+                                     DEPTH_BOUNDS_ENABLE = 0
+                                     ZFUNC = FRAG_ALWAYS
+                                     BACKFACE_ENABLE = 0
+                                     STENCILFUNC = FRAG_ALWAYS
+                                     STENCILFUNC_BF = FRAG_ALWAYS
+                                     RESERVED_FIELD_30 = 0
+                                     RESERVED_FIELD_31 = 0
+c0086900 SET_CONTEXT_REG:
+000001e0 
+00000000         CB_BLEND0_CONTROL <- 0
+                                      COLOR_SRCBLEND = BLEND_ZERO
+                                      COLOR_COMB_FCN = COMB_DST_PLUS_SRC
+                                      COLOR_DESTBLEND = BLEND_ZERO
+                                      ALPHA_SRCBLEND = BLEND_ZERO
+                                      ALPHA_COMB_FCN = COMB_DST_PLUS_SRC
+                                      ALPHA_DESTBLEND = BLEND_ZERO
+                                      SEPARATE_ALPHA_BLEND = 0
+                                      ENABLE = 0
+                                      DISABLE_ROP3 = 0
+00000000         CB_BLEND1_CONTROL <- 0
+                                      COLOR_SRCBLEND = BLEND_ZERO
+                                      COLOR_COMB_FCN = COMB_DST_PLUS_SRC
+                                      COLOR_DESTBLEND = BLEND_ZERO
+                                      ALPHA_SRCBLEND = BLEND_ZERO
+                                      ALPHA_COMB_FCN = COMB_DST_PLUS_SRC
+                                      ALPHA_DESTBLEND = BLEND_ZERO
+                                      SEPARATE_ALPHA_BLEND = 0
+                                      ENABLE = 0
+                                      DISABLE_ROP3 = 0
+00000000         CB_BLEND2_CONTROL <- 0
+                                      COLOR_SRCBLEND = BLEND_ZERO
+                                      COLOR_COMB_FCN = COMB_DST_PLUS_SRC
+                                      COLOR_DESTBLEND = BLEND_ZERO
+                                      ALPHA_SRCBLEND = BLEND_ZERO
+                                      ALPHA_COMB_FCN = COMB_DST_PLUS_SRC
+                                      ALPHA_DESTBLEND = BLEND_ZERO
+                                      SEPARATE_ALPHA_BLEND = 0
+                                      ENABLE = 0
+                                      DISABLE_ROP3 = 0
+00000000         CB_BLEND3_CONTROL <- 0
+                                      COLOR_SRCBLEND = BLEND_ZERO
+                                      COLOR_COMB_FCN = COMB_DST_PLUS_SRC
+                                      COLOR_DESTBLEND = BLEND_ZERO
+                                      ALPHA_SRCBLEND = BLEND_ZERO
+                                      ALPHA_COMB_FCN = COMB_DST_PLUS_SRC
+                                      ALPHA_DESTBLEND = BLEND_ZERO
+                                      SEPARATE_ALPHA_BLEND = 0
+                                      ENABLE = 0
+                                      DISABLE_ROP3 = 0
+00000000         CB_BLEND4_CONTROL <- 0
+                                      COLOR_SRCBLEND = BLEND_ZERO
+                                      COLOR_COMB_FCN = COMB_DST_PLUS_SRC
+                                      COLOR_DESTBLEND = BLEND_ZERO
+                                      ALPHA_SRCBLEND = BLEND_ZERO
+                                      ALPHA_COMB_FCN = COMB_DST_PLUS_SRC
+                                      ALPHA_DESTBLEND = BLEND_ZERO
+                                      SEPARATE_ALPHA_BLEND = 0
+                                      ENABLE = 0
+                                      DISABLE_ROP3 = 0
+00000000         CB_BLEND5_CONTROL <- 0
+                                      COLOR_SRCBLEND = BLEND_ZERO
+                                      COLOR_COMB_FCN = COMB_DST_PLUS_SRC
+                                      COLOR_DESTBLEND = BLEND_ZERO
+                                      ALPHA_SRCBLEND = BLEND_ZERO
+                                      ALPHA_COMB_FCN = COMB_DST_PLUS_SRC
+                                      ALPHA_DESTBLEND = BLEND_ZERO
+                                      SEPARATE_ALPHA_BLEND = 0
+                                      ENABLE = 0
+                                      DISABLE_ROP3 = 0
+00000000         CB_BLEND6_CONTROL <- 0
+                                      COLOR_SRCBLEND = BLEND_ZERO
+                                      COLOR_COMB_FCN = COMB_DST_PLUS_SRC
+                                      COLOR_DESTBLEND = BLEND_ZERO
+                                      ALPHA_SRCBLEND = BLEND_ZERO
+                                      ALPHA_COMB_FCN = COMB_DST_PLUS_SRC
+                                      ALPHA_DESTBLEND = BLEND_ZERO
+                                      SEPARATE_ALPHA_BLEND = 0
+                                      ENABLE = 0
+                                      DISABLE_ROP3 = 0
+00000000         CB_BLEND7_CONTROL <- 0
+                                      COLOR_SRCBLEND = BLEND_ZERO
+                                      COLOR_COMB_FCN = COMB_DST_PLUS_SRC
+                                      COLOR_DESTBLEND = BLEND_ZERO
+                                      ALPHA_SRCBLEND = BLEND_ZERO
+                                      ALPHA_COMB_FCN = COMB_DST_PLUS_SRC
+                                      ALPHA_DESTBLEND = BLEND_ZERO
+                                      SEPARATE_ALPHA_BLEND = 0
+                                      ENABLE = 0
+                                      DISABLE_ROP3 = 0
+c0086900 SET_CONTEXT_REG:
+000001d8 
+06000600         SX_MRT0_BLEND_OPT <- 0x06000600
+                                      COLOR_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_COMB_FCN = OPT_COMB_BLEND_DISABLED
+                                      ALPHA_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_COMB_FCN = OPT_COMB_BLEND_DISABLED
+06000600         SX_MRT1_BLEND_OPT <- 0x06000600
+                                      COLOR_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_COMB_FCN = OPT_COMB_BLEND_DISABLED
+                                      ALPHA_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_COMB_FCN = OPT_COMB_BLEND_DISABLED
+06000600         SX_MRT2_BLEND_OPT <- 0x06000600
+                                      COLOR_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_COMB_FCN = OPT_COMB_BLEND_DISABLED
+                                      ALPHA_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_COMB_FCN = OPT_COMB_BLEND_DISABLED
+06000600         SX_MRT3_BLEND_OPT <- 0x06000600
+                                      COLOR_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_COMB_FCN = OPT_COMB_BLEND_DISABLED
+                                      ALPHA_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_COMB_FCN = OPT_COMB_BLEND_DISABLED
+06000600         SX_MRT4_BLEND_OPT <- 0x06000600
+                                      COLOR_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_COMB_FCN = OPT_COMB_BLEND_DISABLED
+                                      ALPHA_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_COMB_FCN = OPT_COMB_BLEND_DISABLED
+06000600         SX_MRT5_BLEND_OPT <- 0x06000600
+                                      COLOR_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_COMB_FCN = OPT_COMB_BLEND_DISABLED
+                                      ALPHA_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_COMB_FCN = OPT_COMB_BLEND_DISABLED
+06000600         SX_MRT6_BLEND_OPT <- 0x06000600
+                                      COLOR_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_COMB_FCN = OPT_COMB_BLEND_DISABLED
+                                      ALPHA_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_COMB_FCN = OPT_COMB_BLEND_DISABLED
+06000600         SX_MRT7_BLEND_OPT <- 0x06000600
+                                      COLOR_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      COLOR_COMB_FCN = OPT_COMB_BLEND_DISABLED
+                                      ALPHA_SRC_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_DST_OPT = BLEND_OPT_PRESERVE_NONE_IGNORE_ALL
+                                      ALPHA_COMB_FCN = OPT_COMB_BLEND_DISABLED
+c0016900 SET_CONTEXT_REG:
+00000214 
+0000000f         CB_TARGET_MASK <- 15 (0x0000000f)
+                                   TARGET0_ENABLE = 15 (0xf)
+                                   TARGET1_ENABLE = 0
+                                   TARGET2_ENABLE = 0
+                                   TARGET3_ENABLE = 0
+                                   TARGET4_ENABLE = 0
+                                   TARGET5_ENABLE = 0
+                                   TARGET6_ENABLE = 0
+                                   TARGET7_ENABLE = 0
+c0016900 SET_CONTEXT_REG:
+00000216 
+00cc0010         CB_COLOR_CONTROL <- 0x00cc0010
+                                     DISABLE_DUAL_QUAD = 0
+                                     ENABLE_1FRAG_PS_INVOKE = 0
+                                     DEGAMMA_ENABLE = 0
+                                     MODE = CB_NORMAL
+                                     ROP3 = ROP3_COPY
+c00fb804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+0000030e 
+ffffffff         PA_SC_AA_MASK_X0Y0_X1Y0 <- 0xffffffff
+                                            AA_MASK_X0Y0 = 0xffff
+                                            AA_MASK_X1Y0 = 0xffff
+0000030f 
+ffffffff         PA_SC_AA_MASK_X0Y1_X1Y1 <- 0xffffffff
+                                            AA_MASK_X0Y1 = 0xffff
+                                            AA_MASK_X1Y1 = 0xffff
+000002f8 
+00000000         PA_SC_AA_CONFIG <- 0
+                                    MSAA_NUM_SAMPLES = 0
+                                    AA_MASK_CENTROID_DTMN = 0
+                                    MSAA_EXPOSED_SAMPLES = 0
+                                    DETAIL_TO_EXPOSED_MODE = 0
+                                    PS_ITER_SAMPLES = 0
+00000292 
+00000022         PA_SC_MODE_CNTL_0 <- 34 (0x00000022)
+                                      MSAA_ENABLE = 0
+                                      VPORT_SCISSOR_ENABLE = 1
+                                      LINE_STIPPLE_ENABLE = 0
+                                      SEND_UNLIT_STILES_TO_PKR = 0
+                                      ALTERNATE_RBS_PER_TILE = 1
+                                      COARSE_TILE_STARTS_ON_EVEN_RB = 0
+                                      IMPLICIT_VPORT_SCISSOR_ENABLE = 0
+0000001f 
+00018700         DB_ALPHA_TO_MASK <- 0x00018700
+                                     ALPHA_TO_MASK_ENABLE = 0
+                                     ALPHA_TO_MASK_OFFSET0 = 3
+                                     ALPHA_TO_MASK_OFFSET1 = 1
+                                     ALPHA_TO_MASK_OFFSET2 = 0
+                                     ALPHA_TO_MASK_OFFSET3 = 2
+                                     OFFSET_ROUND = 1
+00000317 
+00000000         PA_SC_SAMPLE_PROPERTIES <- 0
+                                            MAX_SAMPLE_DIST = 0
+0000001e 
+00110000         DB_EQAA <- 0x00110000
+                            RESERVED_FIELD_1 = 0
+                            MASK_EXPORT_NUM_SAMPLES = 0
+                            ALPHA_TO_MASK_NUM_SAMPLES = 0
+                            HIGH_QUALITY_INTERSECTIONS = 1
+                            RESERVED_FIELD_17 = 0
+                            RESERVED_FIELD_18 = 0
+                            RESERVED_FIELD_19 = 0
+                            STATIC_ANCHOR_ASSOCIATIONS = 1
+                            RESERVED_FIELD_21 = 0
+                            OVERRASTERIZATION_AMOUNT = 0
+                            ENABLE_POSTZ_OVERRASTERIZATION = 0
+00000315 
+00100000         PA_SC_CONSERVATIVE_RASTERIZATION_CNTL <- 0x00100000
+                                                          OVER_RAST_ENABLE = 0
+                                                          OVER_RAST_SAMPLE_SELECT = 0
+                                                          UNDER_RAST_ENABLE = 0
+                                                          UNDER_RAST_SAMPLE_SELECT = 0
+                                                          PBB_UNCERTAINTY_REGION_ENABLE = 0
+                                                          ZMM_TRI_EXTENT = 0
+                                                          ZMM_TRI_OFFSET = 0
+                                                          OVERRIDE_OVER_RAST_INNER_TO_NORMAL = 0
+                                                          OVERRIDE_UNDER_RAST_INNER_TO_NORMAL = 0
+                                                          DEGENERATE_OVERRIDE_INNER_TO_NORMAL_DISABLE = 0
+                                                          UNCERTAINTY_REGION_MODE = SC_HALF_LSB
+                                                          OUTER_UNCERTAINTY_EDGERULE_OVERRIDE = 0
+                                                          INNER_UNCERTAINTY_EDGERULE_OVERRIDE = 0
+                                                          NULL_SQUAD_AA_MASK_ENABLE = 1
+                                                          COVERAGE_AA_MASK_ENABLE = 0
+                                                          PREZ_AA_MASK_ENABLE = 0
+                                                          POSTZ_AA_MASK_ENABLE = 0
+                                                          CENTROID_SAMPLE_OVERRIDE = 0
+                                                          UNCERTAINTY_REGION_MULT = 0
+                                                          UNCERTAINTY_REGION_PBB_MULT = 0
+c0017900 SET_UCONFIG_REG:
+00000263 
+00000000         GE_VRS_RATE <- 0
+                                RATE_X = 0
+                                RATE_Y = 0
+c0016900 SET_CONTEXT_REG:
+00000212 
+00000000         PA_CL_VRS_CNTL <- 0
+                                   VERTEX_RATE_COMBINER_MODE = SC_VRS_COMB_MODE_PASSTHRU
+                                   PRIMITIVE_RATE_COMBINER_MODE = SC_VRS_COMB_MODE_PASSTHRU
+                                   HTILE_RATE_COMBINER_MODE = SC_VRS_COMB_MODE_PASSTHRU
+                                   SAMPLE_ITER_COMBINER_MODE = SC_VRS_COMB_MODE_PASSTHRU
+                                   EXPOSE_VRS_PIXELS_MASK = 0
+                                   CMASK_RATE_HINT_FORCE_ZERO = 0
+                                   SAMPLE_COVERAGE_ENCODING = 0
+c0016900 SET_CONTEXT_REG:
+000002fe 
+00000000         PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 <- 0
+                                                      S0_X = 0
+                                                      S0_Y = 0
+                                                      S1_X = 0
+                                                      S1_Y = 0
+                                                      S2_X = 0
+                                                      S2_Y = 0
+                                                      S3_X = 0
+                                                      S3_Y = 0
+c0016900 SET_CONTEXT_REG:
+00000302 
+00000000         PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y0_0 <- 0
+                                                      S0_X = 0
+                                                      S0_Y = 0
+                                                      S1_X = 0
+                                                      S1_Y = 0
+                                                      S2_X = 0
+                                                      S2_Y = 0
+                                                      S3_X = 0
+                                                      S3_Y = 0
+c0016900 SET_CONTEXT_REG:
+00000306 
+00000000         PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0 <- 0
+                                                      S0_X = 0
+                                                      S0_Y = 0
+                                                      S1_X = 0
+                                                      S1_Y = 0
+                                                      S2_X = 0
+                                                      S2_Y = 0
+                                                      S3_X = 0
+                                                      S3_Y = 0
+c0016900 SET_CONTEXT_REG:
+0000030a 
+00000000         PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y1_0 <- 0
+                                                      S0_X = 0
+                                                      S0_Y = 0
+                                                      S1_X = 0
+                                                      S1_Y = 0
+                                                      S2_X = 0
+                                                      S2_Y = 0
+                                                      S3_X = 0
+                                                      S3_Y = 0
+c0026900 SET_CONTEXT_REG:
+000002fc 
+00000000         PA_SC_CENTROID_PRIORITY_0 <- 0
+                                              DISTANCE_0 = 0
+                                              DISTANCE_1 = 0
+                                              DISTANCE_2 = 0
+                                              DISTANCE_3 = 0
+                                              DISTANCE_4 = 0
+                                              DISTANCE_5 = 0
+                                              DISTANCE_6 = 0
+                                              DISTANCE_7 = 0
+00000000         PA_SC_CENTROID_PRIORITY_1 <- 0
+                                              DISTANCE_8 = 0
+                                              DISTANCE_9 = 0
+                                              DISTANCE_10 = 0
+                                              DISTANCE_11 = 0
+                                              DISTANCE_12 = 0
+                                              DISTANCE_13 = 0
+                                              DISTANCE_14 = 0
+                                              DISTANCE_15 = 0
+c003b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000196 
+00000000         SPI_BARYC_CNTL <- 0
+                                   PERSP_CENTER_CNTL = 0
+                                   PERSP_CENTROID_CNTL = 0
+                                   LINEAR_CENTER_CNTL = 0
+                                   LINEAR_CENTROID_CNTL = 0
+                                   POS_FLOAT_LOCATION = 0
+                                   POS_FLOAT_ULC = 0
+                                   FRONT_FACE_ALL_BITS = 0
+00000293 
+060201bc         PA_SC_MODE_CNTL_1 <- 0x060201bc
+                                      WALK_SIZE = 0
+                                      WALK_ALIGNMENT = 0
+                                      WALK_ALIGN8_PRIM_FITS_ST = 1
+                                      WALK_FENCE_ENABLE = 1
+                                      WALK_FENCE_SIZE = 3
+                                      SUPERTILE_WALK_ORDER_ENABLE = 1
+                                      TILE_WALK_ORDER_ENABLE = 1
+                                      TILE_COVER_DISABLE = 0
+                                      TILE_COVER_NO_SCISSOR = 0
+                                      ZMM_LINE_EXTENT = 0
+                                      ZMM_LINE_OFFSET = 0
+                                      ZMM_RECT_EXTENT = 0
+                                      KILL_PIX_POST_HI_Z = 0
+                                      KILL_PIX_POST_DETAIL_MASK = 0
+                                      PS_ITER_SAMPLE = 0
+                                      MULTI_SHADER_ENGINE_PRIM_DISCARD_ENABLE = 1
+                                      MULTI_GPU_SUPERTILE_ENABLE = 0
+                                      GPU_ID_OVERRIDE_ENABLE = 0
+                                      GPU_ID_OVERRIDE = 0
+                                      MULTI_GPU_PRIM_DISCARD_ENABLE = 0
+                                      FORCE_EOV_CNTDWN_ENABLE = 1
+                                      FORCE_EOV_REZ_ENABLE = 1
+                                      OUT_OF_ORDER_PRIMITIVE_ENABLE = 0
+                                      OUT_OF_ORDER_WATER_MARK = 0
+                                      DISABLE_4X_TILE_PICKING = 0
+c001b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+000000f4 
+00000051         PA_SC_VRS_OVERRIDE_CNTL <- 81 (0x00000051)
+                                            VRS_OVERRIDE_RATE_COMBINER_MODE = SC_VRS_COMB_MODE_OVERRIDE
+                                            VRS_RATE = VRS_SHADING_RATE_2X2
+                                            VRS_SURFACE_ENABLE = 0
+                                            RATE_HINT_WRITE_BACK_ENABLE = 0
+                                            VRS_FEEDBACK_RATE_OVERRIDE = 0
+c0016900 SET_CONTEXT_REG:
+00000197 
+00000001         SPI_PS_INPUT_ENA <- 1
+                                     PERSP_SAMPLE_ENA = 1
+                                     PERSP_CENTER_ENA = 0
+                                     PERSP_CENTROID_ENA = 0
+                                     PERSP_PULL_MODEL_ENA = 0
+                                     LINEAR_SAMPLE_ENA = 0
+                                     LINEAR_CENTER_ENA = 0
+                                     LINEAR_CENTROID_ENA = 0
+                                     LINE_STIPPLE_TEX_ENA = 0
+                                     POS_X_FLOAT_ENA = 0
+                                     POS_Y_FLOAT_ENA = 0
+                                     POS_Z_FLOAT_ENA = 0
+                                     POS_W_FLOAT_ENA = 0
+                                     FRONT_FACE_ENA = 0
+                                     ANCILLARY_ENA = 0
+                                     SAMPLE_COVERAGE_ENA = 0
+                                     POS_FIXED_PT_ENA = 0
+                                     COVERAGE_TO_SHADER_SELECT = INPUT_COVERAGE
+c01bba04 SET_SH_REG_PAIRS(reset_filter_cam):
+00000089 
+00000004         SPI_SHADER_PGM_LO_ES <- 4
+0000008a 
+000c0002         SPI_SHADER_PGM_RSRC1_GS <- 0x000c0002
+                                            VGPRS = 2
+                                            SGPRS = 0
+                                            PRIORITY = 0
+                                            FLOAT_MODE = FP_16_64_DENORMS
+                                            PRIV = 0
+                                            WG_RR_EN = 0
+                                            DEBUG_MODE = 0
+                                            DISABLE_PERF = 0
+                                            CU_GROUP_ENABLE = 0
+                                            FWD_PROGRESS = 0
+                                            WGP_MODE = 0
+                                            CDBG_USER = 0
+                                            GS_VGPR_COMP_CNT = 0
+                                            FP16_OVFL = 0
+0000008b 
+00010006         SPI_SHADER_PGM_RSRC2_GS <- 0x00010006
+                                            SCRATCH_EN = 0
+                                            USER_SGPR = 3
+                                            TRAP_PRESENT = 0
+                                            EXCP_EN = 0
+                                            ES_VGPR_COMP_CNT = 1
+                                            OC_LDS_EN = 0
+                                            LDS_SIZE = 0
+                                            USER_SGPR_MSB = 0
+                                            SHARED_VGPR_CNT = 0
+00000088 
+01ff0bff         SPI_SHADER_PGM_RSRC4_GS <- 0x01ff0bff
+                                            WAVE_LIMIT = 1023 (0x3ff)
+                                            GLG_EN_OVERRIDE = 0
+                                            GLG_FORCE_DISABLE = 1
+                                            PH_THROTTLE_EN = 0
+                                            SPI_THROTTLE_EN = 0
+                                            SPI_SHADER_LATE_ALLOC_GS = 127 (0x7f)
+                                            INST_PREF_SIZE = 3
+                                            IMAGE_OP = 0
+0000008e 
+00000000         SPI_SHADER_USER_DATA_GS_2 <- 0
+00000008 
+00000006         SPI_SHADER_PGM_LO_PS <- 6
+0000000a 
+000c0002         SPI_SHADER_PGM_RSRC1_PS <- 0x000c0002
+                                            VGPRS = 2
+                                            SGPRS = 0
+                                            PRIORITY = 0
+                                            FLOAT_MODE = FP_16_64_DENORMS
+                                            PRIV = 0
+                                            WG_RR_EN = 0
+                                            DEBUG_MODE = 0
+                                            DISABLE_PERF = 0
+                                            CU_GROUP_DISABLE = 0
+                                            FWD_PROGRESS = 0
+                                            LOAD_PROVOKING_VTX = 0
+                                            CDBG_USER = 0
+                                            FP16_OVFL = 0
+0000000b 
+0000000c         SPI_SHADER_PGM_RSRC2_PS <- 12 (0x0000000c)
+                                            SCRATCH_EN = 0
+                                            USER_SGPR = 6
+                                            TRAP_PRESENT = 0
+                                            WAVE_CNT_EN = 0
+                                            EXTRA_LDS_SIZE = 0
+                                            EXCP_EN = 0
+                                            LOAD_COLLISION_WAVEID = 0
+                                            LOAD_INTRAWAVE_COLLISION = 0
+                                            USER_SGPR_MSB = 0
+                                            SHARED_VGPR_CNT = 0
+00000007 
+000207ff         SPI_SHADER_PGM_RSRC4_PS <- 0x000207ff
+                                            WAVE_LIMIT = 1023 (0x3ff)
+                                            LDS_GROUP_SIZE = 1
+                                            INST_PREF_SIZE = 2
+                                            IMAGE_OP = 0
+00000031 
+00000000         SPI_SHADER_GS_OUT_CONFIG_PS <- 0
+                                                VS_EXPORT_COUNT = 0
+                                                PRIM_EXPORT_COUNT = 0
+                                                NO_PC_EXPORT = 0
+                                                NUM_INTERP = 0
+                                                NUM_PRIM_INTERP = 0
+0000000e 
+00000000         SPI_SHADER_USER_DATA_PS_2 <- 0
+0000000f 
+00000000         SPI_SHADER_USER_DATA_PS_3 <- 0
+00000010 
+00000000         SPI_SHADER_USER_DATA_PS_4 <- 0
+00000011 
+00000000         SPI_SHADER_USER_DATA_PS_5 <- 0
+c0055000 DMA_DATA:
+60200000 
+00000400 
+ffff8000 
+00000400 
+ffff8000 
+800000a0         ENGINE_SEL <- MICRO_ENGINE
+                 SRC_INDIRECT <- 0
+                 DST_INDIRECT <- 0
+                 SRC_TEMPORAL <- RT
+                 DST_SEL <- DST_NOWHERE
+                 DST_TEMPORAL <- RT
+                 SRC_SEL <- SRC_ADDR_USING_L2
+                 CP_SYNC <- 0
+                 SRC_ADDR_LO_OR_DATA <- 1024 (0x00000400)
+                 SRC_ADDR_HI <- 0xffff8000
+                 (FULL ADDRESS) <- 0xffff800000000400
+                 DST_ADDR_LO <- 1024 (0x00000400)
+                 DST_ADDR_HI <- 0xffff8000
+                 BYTE_COUNT <- 160 (0x0000a0)
+                 SAS <- MEMORY
+                 DAS <- MEMORY
+                 SAIC <- INCREMENT
+                 DAIC <- INCREMENT
+                 RAW_WAIT <- 0
+                 DIS_WC <- 1
+                 DISABLE_WR_CONFIRM <- 1
+c0002f00 NUM_INSTANCES:
+00000001         NUM_INSTANCES <- 1
+c0027600 SET_SH_REG:
+0000008c 
+00000000         SPI_SHADER_USER_DATA_GS_0 <- 0
+00000000         SPI_SHADER_USER_DATA_GS_1 <- 0
+c0012d00 DRAW_INDEX_AUTO:
+00000003         INDEX_COUNT <- 3
+00000002         VGT_DRAW_INITIATOR <- 2
+                                       SOURCE_SELECT = DI_SRC_SEL_AUTO_INDEX
+                                       NOT_EOP = 0
+                                       USE_OPAQUE = 0
+                                       REG_RT_INDEX = 0
+c0055000 DMA_DATA:
+60200000 
+00000600 
+ffff8000 
+00000600 
+ffff8000 
+80000040         ENGINE_SEL <- MICRO_ENGINE
+                 SRC_INDIRECT <- 0
+                 DST_INDIRECT <- 0
+                 SRC_TEMPORAL <- RT
+                 DST_SEL <- DST_NOWHERE
+                 DST_TEMPORAL <- RT
+                 SRC_SEL <- SRC_ADDR_USING_L2
+                 CP_SYNC <- 0
+                 SRC_ADDR_LO_OR_DATA <- 1536 (0x00000600)
+                 SRC_ADDR_HI <- 0xffff8000
+                 (FULL ADDRESS) <- 0xffff800000000600
+                 DST_ADDR_LO <- 1536 (0x00000600)
+                 DST_ADDR_HI <- 0xffff8000
+                 BYTE_COUNT <- 64 (0x000040)
+                 SAS <- MEMORY
+                 DAS <- MEMORY
+                 SAIC <- INCREMENT
+                 DAIC <- INCREMENT
+                 RAW_WAIT <- 0
+                 DIS_WC <- 1
+                 DISABLE_WR_CONFIRM <- 1
+c0024600 EVENT_WRITE:
+0000021e         VGT_EVENT_INITIATOR <- 30 (0x0000001e)
+                                        EVENT_TYPE = SAMPLE_PIPELINESTAT
+                 EVENT_INDEX <- SAMPLE_PIPELINESTAT
+00001000         [A]ADDRESS_LO <- 4096 (0x00001000)
+                 [B]COUNTER_ID <- PIXEL_PIPE_OCCLUSION_COUNT_0
+                 [B]STRIDE <- 0
+                 [B]INSTANCE_ENABLE <- 2
+ffff8001         [A]ADDRESS_HI <- 0xffff8001
+                 (FULL ADDRESS) <- 0xffff800100001000
+c005b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000206 
+00000000         PA_CL_VS_OUT_CNTL <- 0
+                                      CLIP_DIST_ENA_0 = 0
+                                      CLIP_DIST_ENA_1 = 0
+                                      CLIP_DIST_ENA_2 = 0
+                                      CLIP_DIST_ENA_3 = 0
+                                      CLIP_DIST_ENA_4 = 0
+                                      CLIP_DIST_ENA_5 = 0
+                                      CLIP_DIST_ENA_6 = 0
+                                      CLIP_DIST_ENA_7 = 0
+                                      CULL_DIST_ENA_0 = 0
+                                      CULL_DIST_ENA_1 = 0
+                                      CULL_DIST_ENA_2 = 0
+                                      CULL_DIST_ENA_3 = 0
+                                      CULL_DIST_ENA_4 = 0
+                                      CULL_DIST_ENA_5 = 0
+                                      CULL_DIST_ENA_6 = 0
+                                      CULL_DIST_ENA_7 = 0
+                                      USE_VTX_POINT_SIZE = 0
+                                      USE_VTX_EDGE_FLAG = 0
+                                      USE_VTX_RENDER_TARGET_INDX = 0
+                                      USE_VTX_VIEWPORT_INDX = 0
+                                      USE_VTX_KILL_FLAG = 0
+                                      VS_OUT_MISC_VEC_ENA = 0
+                                      VS_OUT_CCDIST0_VEC_ENA = 0
+                                      VS_OUT_CCDIST1_VEC_ENA = 0
+                                      VS_OUT_MISC_SIDE_BUS_ENA = 0
+                                      USE_VTX_LINE_WIDTH = 0
+                                      USE_VTX_VRS_RATE = 0
+                                      BYPASS_VTX_RATE_COMBINER = 0
+                                      BYPASS_PRIM_RATE_COMBINER = 0
+00000192 
+00000001         SPI_SHADER_IDX_FORMAT <- 1
+                                          IDX0_EXPORT_FORMAT = SPI_SHADER_1COMP
+00000193 
+00000004         SPI_SHADER_POS_FORMAT <- 4
+                                          POS0_EXPORT_FORMAT = SPI_SHADER_4COMP
+                                          POS1_EXPORT_FORMAT = SPI_SHADER_NONE
+                                          POS2_EXPORT_FORMAT = SPI_SHADER_NONE
+                                          POS3_EXPORT_FORMAT = SPI_SHADER_NONE
+                                          POS4_EXPORT_FORMAT = SPI_SHADER_NONE
+c0017900 SET_UCONFIG_REG:
+0000025b 
+a0010080         GE_CNTL <- 0xa0010080
+                            PRIMS_PER_SUBGRP = 128 (0x80)
+                            VERTS_PER_SUBGRP = 128 (0x80)
+                            BREAK_SUBGRP_AT_EOI = 0
+                            PACKET_TO_ONE_PA = 0
+                            BREAK_PRIMGRP_AT_EOI = 0
+                            PRIM_GRP_SIZE = 256 (0x100)
+                            GCR_DISABLE = 0
+                            DIS_PG_SIZE_ADJUST_FOR_STRIP = 1
+c0017900 SET_UCONFIG_REG:
+00000262 
+00000000         VGT_PRIMITIVEID_EN <- 0
+                                       NGG_DISABLE_PROVOK_REUSE = 0
+c001b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000198 
+00000002         SPI_PS_INPUT_ADDR <- 2
+                                      PERSP_SAMPLE_ENA = 0
+                                      PERSP_CENTER_ENA = 1
+                                      PERSP_CENTROID_ENA = 0
+                                      PERSP_PULL_MODEL_ENA = 0
+                                      LINEAR_SAMPLE_ENA = 0
+                                      LINEAR_CENTER_ENA = 0
+                                      LINEAR_CENTROID_ENA = 0
+                                      LINE_STIPPLE_TEX_ENA = 0
+                                      POS_X_FLOAT_ENA = 0
+                                      POS_Y_FLOAT_ENA = 0
+                                      POS_Z_FLOAT_ENA = 0
+                                      POS_W_FLOAT_ENA = 0
+                                      FRONT_FACE_ENA = 0
+                                      ANCILLARY_ENA = 0
+                                      SAMPLE_COVERAGE_ENA = 0
+                                      POS_FIXED_PT_ENA = 0
+c0016900 SET_CONTEXT_REG:
+00000199 
+00000000         SPI_PS_INPUT_CNTL_0 <- 0
+                                        OFFSET = 0
+                                        DEFAULT_VAL = 0
+                                        FLAT_SHADE = 0
+                                        ROTATE_PC_PTR = 0
+                                        PRIM_ATTR = 0
+                                        PT_SPRITE_TEX = 0
+                                        DUP = 0
+                                        FP16_INTERP_MODE = 0
+                                        USE_DEFAULT_ATTR1 = 0
+                                        DEFAULT_VAL_ATTR1 = 0
+                                        PT_SPRITE_TEX_ATTR1 = 0
+                                        ATTR0_VALID = 0
+                                        ATTR1_VALID = 0
+c0046900 SET_CONTEXT_REG:
+0000010b 
+43800000         PA_CL_GB_VERT_CLIP_ADJ <- 256.0f (0x43800000)
+3f800000         PA_CL_GB_VERT_DISC_ADJ <- 1.0f (0x3f800000)
+43800000         PA_CL_GB_HORZ_CLIP_ADJ <- 256.0f (0x43800000)
+3f800000         PA_CL_GB_HORZ_DISC_ADJ <- 1.0f (0x3f800000)
+c0016900 SET_CONTEXT_REG:
+0000008d 
+00080008         PA_SU_HARDWARE_SCREEN_OFFSET <- 0x00080008
+                                                 HW_SCREEN_OFFSET_X = 8
+                                                 HW_SCREEN_OFFSET_Y = 8
+c0016900 SET_CONTEXT_REG:
+00000083 
+0000ffff         PA_SC_CLIPRECT_RULE <- 0x0000ffff
+                                        CLIP_RULE = 0xffff
+c0086900 SET_CONTEXT_REG:
+0000010f 
+43000000         PA_CL_VPORT_XSCALE <- 128.0f (0x43000000)
+43000000         PA_CL_VPORT_XOFFSET <- 128.0f (0x43000000)
+43000000         PA_CL_VPORT_YSCALE <- 128.0f (0x43000000)
+43000000         PA_CL_VPORT_YOFFSET <- 128.0f (0x43000000)
+3f800000         PA_CL_VPORT_ZSCALE <- 1.0f (0x3f800000)
+00000000         PA_CL_VPORT_ZOFFSET <- 0
+00000000         PA_SC_VPORT_ZMIN_0 <- 0
+3f800000         PA_SC_VPORT_ZMAX_0 <- 1.0f (0x3f800000)
+c0016900 SET_CONTEXT_REG:
+00000019 
+00000000         DB_VIEWPORT_CONTROL <- 0
+                                        DISABLE_VIEWPORT_CLAMP = 0
+c0026900 SET_CONTEXT_REG:
+00000094 
+00000000         PA_SC_VPORT_SCISSOR_0_TL <- 0
+                                             TL_X = 0
+                                             TL_Y = 0
+00ff00ff         PA_SC_VPORT_SCISSOR_0_BR <- 0x00ff00ff
+                                             BR_X = 255 (0x00ff)
+                                             BR_Y = 255 (0x00ff)
+c0017a00 SET_UCONFIG_REG_INDEX:
+10000242         INDEX <- 1
+00000004         VGT_PRIMITIVE_TYPE <- 4
+                                       PRIM_TYPE = DI_PT_TRILIST
+                                       NUM_INPUT_CP = 0
+                                       PRIMS_PER_SUBGROUP = 0
+c0017900 SET_UCONFIG_REG:
+00000266 
+00000002         VGT_GS_OUT_PRIM_TYPE <- 2
+                                         OUTPRIM_TYPE = TRISTRIP
+c0017900 SET_UCONFIG_REG:
+00000263 
+00000000         GE_VRS_RATE <- 0
+                                RATE_X = 0
+                                RATE_Y = 0
+c0016900 SET_CONTEXT_REG:
+000002fe 
+00000000         PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 <- 0
+                                                      S0_X = 0
+                                                      S0_Y = 0
+                                                      S1_X = 0
+                                                      S1_Y = 0
+                                                      S2_X = 0
+                                                      S2_Y = 0
+                                                      S3_X = 0
+                                                      S3_Y = 0
+c0016900 SET_CONTEXT_REG:
+00000302 
+00000000         PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y0_0 <- 0
+                                                      S0_X = 0
+                                                      S0_Y = 0
+                                                      S1_X = 0
+                                                      S1_Y = 0
+                                                      S2_X = 0
+                                                      S2_Y = 0
+                                                      S3_X = 0
+                                                      S3_Y = 0
+c0016900 SET_CONTEXT_REG:
+00000306 
+00000000         PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0 <- 0
+                                                      S0_X = 0
+                                                      S0_Y = 0
+                                                      S1_X = 0
+                                                      S1_Y = 0
+                                                      S2_X = 0
+                                                      S2_Y = 0
+                                                      S3_X = 0
+                                                      S3_Y = 0
+c0016900 SET_CONTEXT_REG:
+0000030a 
+00000000         PA_SC_AA_SAMPLE_LOCS_PIXEL_X1Y1_0 <- 0
+                                                      S0_X = 0
+                                                      S0_Y = 0
+                                                      S1_X = 0
+                                                      S1_Y = 0
+                                                      S2_X = 0
+                                                      S2_Y = 0
+                                                      S3_X = 0
+                                                      S3_Y = 0
+c0026900 SET_CONTEXT_REG:
+000002fc 
+00000000         PA_SC_CENTROID_PRIORITY_0 <- 0
+                                              DISTANCE_0 = 0
+                                              DISTANCE_1 = 0
+                                              DISTANCE_2 = 0
+                                              DISTANCE_3 = 0
+                                              DISTANCE_4 = 0
+                                              DISTANCE_5 = 0
+                                              DISTANCE_6 = 0
+                                              DISTANCE_7 = 0
+00000000         PA_SC_CENTROID_PRIORITY_1 <- 0
+                                              DISTANCE_8 = 0
+                                              DISTANCE_9 = 0
+                                              DISTANCE_10 = 0
+                                              DISTANCE_11 = 0
+                                              DISTANCE_12 = 0
+                                              DISTANCE_13 = 0
+                                              DISTANCE_14 = 0
+                                              DISTANCE_15 = 0
+c003b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+00000196 
+00000000         SPI_BARYC_CNTL <- 0
+                                   PERSP_CENTER_CNTL = 0
+                                   PERSP_CENTROID_CNTL = 0
+                                   LINEAR_CENTER_CNTL = 0
+                                   LINEAR_CENTROID_CNTL = 0
+                                   POS_FLOAT_LOCATION = 0
+                                   POS_FLOAT_ULC = 0
+                                   FRONT_FACE_ALL_BITS = 0
+00000293 
+060201bc         PA_SC_MODE_CNTL_1 <- 0x060201bc
+                                      WALK_SIZE = 0
+                                      WALK_ALIGNMENT = 0
+                                      WALK_ALIGN8_PRIM_FITS_ST = 1
+                                      WALK_FENCE_ENABLE = 1
+                                      WALK_FENCE_SIZE = 3
+                                      SUPERTILE_WALK_ORDER_ENABLE = 1
+                                      TILE_WALK_ORDER_ENABLE = 1
+                                      TILE_COVER_DISABLE = 0
+                                      TILE_COVER_NO_SCISSOR = 0
+                                      ZMM_LINE_EXTENT = 0
+                                      ZMM_LINE_OFFSET = 0
+                                      ZMM_RECT_EXTENT = 0
+                                      KILL_PIX_POST_HI_Z = 0
+                                      KILL_PIX_POST_DETAIL_MASK = 0
+                                      PS_ITER_SAMPLE = 0
+                                      MULTI_SHADER_ENGINE_PRIM_DISCARD_ENABLE = 1
+                                      MULTI_GPU_SUPERTILE_ENABLE = 0
+                                      GPU_ID_OVERRIDE_ENABLE = 0
+                                      GPU_ID_OVERRIDE = 0
+                                      MULTI_GPU_PRIM_DISCARD_ENABLE = 0
+                                      FORCE_EOV_CNTDWN_ENABLE = 1
+                                      FORCE_EOV_REZ_ENABLE = 1
+                                      OUT_OF_ORDER_PRIMITIVE_ENABLE = 0
+                                      OUT_OF_ORDER_WATER_MARK = 0
+                                      DISABLE_4X_TILE_PICKING = 0
+c001b804 SET_CONTEXT_REG_PAIRS(reset_filter_cam):
+000000f4 
+00000000         PA_SC_VRS_OVERRIDE_CNTL <- 0
+                                            VRS_OVERRIDE_RATE_COMBINER_MODE = SC_VRS_COMB_MODE_PASSTHRU
+                                            VRS_RATE = VRS_SHADING_RATE_1X1
+                                            VRS_SURFACE_ENABLE = 0
+                                            RATE_HINT_WRITE_BACK_ENABLE = 0
+                                            VRS_FEEDBACK_RATE_OVERRIDE = 0
+c0016900 SET_CONTEXT_REG:
+00000197 
+00000002         SPI_PS_INPUT_ENA <- 2
+                                     PERSP_SAMPLE_ENA = 0
+                                     PERSP_CENTER_ENA = 1
+                                     PERSP_CENTROID_ENA = 0
+                                     PERSP_PULL_MODEL_ENA = 0
+                                     LINEAR_SAMPLE_ENA = 0
+                                     LINEAR_CENTER_ENA = 0
+                                     LINEAR_CENTROID_ENA = 0
+                                     LINE_STIPPLE_TEX_ENA = 0
+                                     POS_X_FLOAT_ENA = 0
+                                     POS_Y_FLOAT_ENA = 0
+                                     POS_Z_FLOAT_ENA = 0
+                                     POS_W_FLOAT_ENA = 0
+                                     FRONT_FACE_ENA = 0
+                                     ANCILLARY_ENA = 0
+                                     SAMPLE_COVERAGE_ENA = 0
+                                     POS_FIXED_PT_ENA = 0
+                                     COVERAGE_TO_SHADER_SELECT = INPUT_COVERAGE
+c013ba04 SET_SH_REG_PAIRS(reset_filter_cam):
+00000089 
+00000000         SPI_SHADER_PGM_LO_ES <- 0
+0000008a 
+000c0002         SPI_SHADER_PGM_RSRC1_GS <- 0x000c0002
+                                            VGPRS = 2
+                                            SGPRS = 0
+                                            PRIORITY = 0
+                                            FLOAT_MODE = FP_16_64_DENORMS
+                                            PRIV = 0
+                                            WG_RR_EN = 0
+                                            DEBUG_MODE = 0
+                                            DISABLE_PERF = 0
+                                            CU_GROUP_ENABLE = 0
+                                            FWD_PROGRESS = 0
+                                            WGP_MODE = 0
+                                            CDBG_USER = 0
+                                            GS_VGPR_COMP_CNT = 0
+                                            FP16_OVFL = 0
+0000008b 
+00000004         SPI_SHADER_PGM_RSRC2_GS <- 4
+                                            SCRATCH_EN = 0
+                                            USER_SGPR = 2
+                                            TRAP_PRESENT = 0
+                                            EXCP_EN = 0
+                                            ES_VGPR_COMP_CNT = 0
+                                            OC_LDS_EN = 0
+                                            LDS_SIZE = 0
+                                            USER_SGPR_MSB = 0
+                                            SHARED_VGPR_CNT = 0
+00000088 
+027f0bff         SPI_SHADER_PGM_RSRC4_GS <- 0x027f0bff
+                                            WAVE_LIMIT = 1023 (0x3ff)
+                                            GLG_EN_OVERRIDE = 0
+                                            GLG_FORCE_DISABLE = 1
+                                            PH_THROTTLE_EN = 0
+                                            SPI_THROTTLE_EN = 0
+                                            SPI_SHADER_LATE_ALLOC_GS = 127 (0x7f)
+                                            INST_PREF_SIZE = 4
+                                            IMAGE_OP = 0
+0000008d 
+00000000         SPI_SHADER_USER_DATA_GS_1 <- 0
+00000008 
+00000002         SPI_SHADER_PGM_LO_PS <- 2
+0000000a 
+000cc002         SPI_SHADER_PGM_RSRC1_PS <- 0x000cc002
+                                            VGPRS = 2
+                                            SGPRS = 0
+                                            PRIORITY = 0
+                                            FLOAT_MODE = 204 (0xcc)
+                                            PRIV = 0
+                                            WG_RR_EN = 0
+                                            DEBUG_MODE = 0
+                                            DISABLE_PERF = 0
+                                            CU_GROUP_DISABLE = 0
+                                            FWD_PROGRESS = 0
+                                            LOAD_PROVOKING_VTX = 0
+                                            CDBG_USER = 0
+                                            FP16_OVFL = 0
+0000000b 
+00000004         SPI_SHADER_PGM_RSRC2_PS <- 4
+                                            SCRATCH_EN = 0
+                                            USER_SGPR = 2
+                                            TRAP_PRESENT = 0
+                                            WAVE_CNT_EN = 0
+                                            EXTRA_LDS_SIZE = 0
+                                            EXCP_EN = 0
+                                            LOAD_COLLISION_WAVEID = 0
+                                            LOAD_INTRAWAVE_COLLISION = 0
+                                            USER_SGPR_MSB = 0
+                                            SHARED_VGPR_CNT = 0
+00000007 
+000307ff         SPI_SHADER_PGM_RSRC4_PS <- 0x000307ff
+                                            WAVE_LIMIT = 1023 (0x3ff)
+                                            LDS_GROUP_SIZE = 1
+                                            INST_PREF_SIZE = 3
+                                            IMAGE_OP = 0
+00000031 
+00000800         SPI_SHADER_GS_OUT_CONFIG_PS <- 2048 (0x00000800)
+                                                VS_EXPORT_COUNT = 0
+                                                PRIM_EXPORT_COUNT = 0
+                                                NO_PC_EXPORT = 0
+                                                NUM_INTERP = 1
+                                                NUM_PRIM_INTERP = 0
+c0004600 EVENT_WRITE:
+00000019         VGT_EVENT_INITIATOR <- 25 (0x00000019)
+                                        EVENT_TYPE = PIPELINESTAT_START
+                 EVENT_INDEX <- OTHER
+c0055000 DMA_DATA:
+60200000 
+00000000 
+ffff8000 
+00000000 
+ffff8000 
+80000120         ENGINE_SEL <- MICRO_ENGINE
+                 SRC_INDIRECT <- 0
+                 DST_INDIRECT <- 0
+                 SRC_TEMPORAL <- RT
+                 DST_SEL <- DST_NOWHERE
+                 DST_TEMPORAL <- RT
+                 SRC_SEL <- SRC_ADDR_USING_L2
+                 CP_SYNC <- 0
+                 SRC_ADDR_LO_OR_DATA <- 0
+                 SRC_ADDR_HI <- 0xffff8000
+                 (FULL ADDRESS) <- 0xffff800000000000
+                 DST_ADDR_LO <- 0
+                 DST_ADDR_HI <- 0xffff8000
+                 BYTE_COUNT <- 288 (0x000120)
+                 SAS <- MEMORY
+                 DAS <- MEMORY
+                 SAIC <- INCREMENT
+                 DAIC <- INCREMENT
+                 RAW_WAIT <- 0
+                 DIS_WC <- 1
+                 DISABLE_WR_CONFIRM <- 1
+c0017600 SET_SH_REG:
+0000008c 
+00000000         SPI_SHADER_USER_DATA_GS_0 <- 0
+c0012d00 DRAW_INDEX_AUTO:
+00000003         INDEX_COUNT <- 3
+00000002         VGT_DRAW_INITIATOR <- 2
+                                       SOURCE_SELECT = DI_SRC_SEL_AUTO_INDEX
+                                       NOT_EOP = 0
+                                       USE_OPAQUE = 0
+                                       REG_RT_INDEX = 0
+c0055000 DMA_DATA:
+60200000 
+00000200 
+ffff8000 
+00000200 
+ffff8000 
+80000080         ENGINE_SEL <- MICRO_ENGINE
+                 SRC_INDIRECT <- 0
+                 DST_INDIRECT <- 0
+                 SRC_TEMPORAL <- RT
+                 DST_SEL <- DST_NOWHERE
+                 DST_TEMPORAL <- RT
+                 SRC_SEL <- SRC_ADDR_USING_L2
+                 CP_SYNC <- 0
+                 SRC_ADDR_LO_OR_DATA <- 512 (0x00000200)
+                 SRC_ADDR_HI <- 0xffff8000
+                 (FULL ADDRESS) <- 0xffff800000000200
+                 DST_ADDR_LO <- 512 (0x00000200)
+                 DST_ADDR_HI <- 0xffff8000
+                 BYTE_COUNT <- 128 (0x000080)
+                 SAS <- MEMORY
+                 DAS <- MEMORY
+                 SAIC <- INCREMENT
+                 DAIC <- INCREMENT
+                 RAW_WAIT <- 0
+                 DIS_WC <- 1
+                 DISABLE_WR_CONFIRM <- 1
+c0024600 EVENT_WRITE:
+0000021e         VGT_EVENT_INITIATOR <- 30 (0x0000001e)
+                                        EVENT_TYPE = SAMPLE_PIPELINESTAT
+                 EVENT_INDEX <- SAMPLE_PIPELINESTAT
+00001070         [A]ADDRESS_LO <- 4208 (0x00001070)
+                 [B]COUNTER_ID <- (null)
+                 [B]STRIDE <- 0
+                 [B]INSTANCE_ENABLE <- 2
+ffff8001         [A]ADDRESS_HI <- 0xffff8001
+                 (FULL ADDRESS) <- 0xffff800100001070
+c0064900 RELEASE_MEM:
+00000528         VGT_EVENT_INITIATOR <- 40 (0x00000028)
+                                        EVENT_TYPE = BOTTOM_OF_PIPE_TS
+                 WAIT_SYNC <- 0
+                 EVENT_INDEX <- END_OF_PIPE
+                 GCR_CNTL <- 0
+                 TEMPORAL <- RT
+                 EXECUTE <- NORMAL_FENCE_WITH_ADJUST
+                 GLK_INV <- 0
+                 PWS_ENABLE <- 0
+23000000         DST_SEL <- MEMORY_CONTROLLER
+                 MES_INTR_PIPE <- 0
+                 MES_ACTION_ID <- NO_MES_NOTIFICATION
+                 INT_SEL <- SEND_DATA_AND_WRITE_CONFIRM
+                 DATA_SEL <- SEND_32_BIT_LOW
+000010e0         [A]ADDRESS_LO_32B <- 4320 (0x000010e0)
+                 [B]ADDRESS_LO_64B <- 4320 (0x000010e0)
+ffff8001         [A]ADDRESS_HI <- 0xffff8001
+00000001         [A]DATA_LO <- 1
+                 [B]CMP_DATA_LO <- 1
+00000000         [A]DATA_HI <- 0
+                 [B]CMP_DATA_HI <- 0
+00000000         INT_CTXID <- 0
+c017ba04 SET_SH_REG_PAIRS(reset_filter_cam):
+0000020c 
+00000007         COMPUTE_PGM_LO <- 7
+00000212 
+200c0002         COMPUTE_PGM_RSRC1 <- 0x200c0002
+                                      VGPRS = 2
+                                      SGPRS = 0
+                                      PRIORITY = 0
+                                      FLOAT_MODE = FP_16_64_DENORMS
+                                      PRIV = 0
+                                      WG_RR_EN = 0
+                                      DEBUG_MODE = 0
+                                      DISABLE_PERF = 0
+                                      BULKY = 0
+                                      CDBG_USER = 0
+                                      FP16_OVFL = 0
+                                      WGP_MODE = 1
+                                      MEM_ORDERED = 0
+                                      FWD_PROGRESS = 0
+00000213 
+00000988         COMPUTE_PGM_RSRC2 <- 2440 (0x00000988)
+                                      SCRATCH_EN = 0
+                                      USER_SGPR = 4
+                                      DYNAMIC_VGPR = 0
+                                      TGID_X_EN = 1
+                                      TGID_Y_EN = 1
+                                      TGID_Z_EN = 0
+                                      TG_SIZE_EN = 0
+                                      TIDIG_COMP_CNT = 1
+                                      EXCP_EN_MSB = 0
+                                      LDS_SIZE = 0
+                                      EXCP_EN = 0
+                                      WGP_TAKEOVER = 0
+00000228 
+00000030         COMPUTE_PGM_RSRC3 <- 48 (0x00000030)
+                                      SHARED_VGPR_CNT = 0
+                                      INST_PREF_SIZE = 3
+                                      GLG_EN = 0
+                                      IMAGE_OP = 0
+00000215 
+01000000         COMPUTE_RESOURCE_LIMITS <- 0x01000000
+                                            WAVES_PER_SH = 0
+                                            TG_PER_CU = 0
+                                            LOCK_THRESHOLD = 0
+                                            SIMD_DEST_CNTL = 0
+                                            FORCE_SIMD_DIST = 0
+                                            CU_GROUP_COUNT = 1
+00000207 
+00000008         COMPUTE_NUM_THREAD_X <- 8
+                                         NUM_THREAD_FULL = 8
+                                         INTERLEAVE_BITS_X = 0
+                                         NUM_THREAD_PARTIAL = 0
+00000208 
+00000008         COMPUTE_NUM_THREAD_Y <- 8
+                                         NUM_THREAD_FULL = 8
+                                         INTERLEAVE_BITS_Y = 0
+                                         NUM_THREAD_PARTIAL = 0
+00000209 
+00000001         COMPUTE_NUM_THREAD_Z <- 1
+                                         NUM_THREAD_FULL = 1
+                                         NUM_THREAD_PARTIAL = 0
+00000240 
+00040008         COMPUTE_USER_DATA_0 <- 0x00040008
+00000241 
+00000000         COMPUTE_USER_DATA_1 <- 0
+00000242 
+00000000         COMPUTE_USER_DATA_2 <- 0
+00000243 
+00000100         COMPUTE_USER_DATA_3 <- 256 (0x00000100)
+c0064900 RELEASE_MEM:
+8040452d         VGT_EVENT_INITIATOR <- 45 (0x0000002d)
+                                        EVENT_TYPE = FLUSH_AND_INV_CB_DATA_TS
+                 WAIT_SYNC <- 0
+                 EVENT_INDEX <- END_OF_PIPE
+                 GCR_CNTL <- 1028 (0x404)
+                 TEMPORAL <- RT
+                 EXECUTE <- NORMAL_FENCE_WITH_ADJUST
+                 GLK_INV <- 0
+                 PWS_ENABLE <- 1
+00000000         DST_SEL <- MEMORY_CONTROLLER
+                 MES_INTR_PIPE <- 0
+                 MES_ACTION_ID <- NO_MES_NOTIFICATION
+                 INT_SEL <- NONE
+                 DATA_SEL <- NONE
+00000000         [A]ADDRESS_LO_32B <- 0
+                 [B]ADDRESS_LO_64B <- 0
+00000000         [A]ADDRESS_HI <- 0
+00000000         [A]DATA_LO <- 0
+                 [B]CMP_DATA_LO <- 0
+00000000         [A]DATA_HI <- 0
+                 [B]CMP_DATA_HI <- 0
+00000000         INT_CTXID <- 0
+c0065800 ACQUIRE_MEM:
+00022000         0x301f0 <- 0x00022000
+                 [A]ENGINE_SEL <- PREFETCH_PARSER
+                 [B]PWS_STAGE_SEL <- CP_PFP
+                 [B]PWS_COUNTER_SEL <- TS_SELECT
+                 [B]PWS_ENA2 <- PIXEL_WAIT_SYNC_ENABLE
+                 [B]PWS_COUNT <- 0
+ffffffff         [A]COHER_SIZE <- 0xffffffff
+                 [B]GCR_SIZE <- 0xffffffff
+01ffffff         [A]COHER_SIZE_HI <- 0xffffff
+                 [B]GCR_SIZE_HI <- 0x1ffffff
+00000000         [A]COHER_BASE_LO <- 0
+                 [B]GCR_BASE_LO <- 0
+00000000         [A]COHER_BASE_HI <- 0
+                 [B]GCR_BASE_HI <- 0
+80000000         [A]POLL_INTERVAL <- 0
+                 [B]PWS_ENA <- PIXEL_WAIT_SYNC_ENABLE
+00010000         GCR_CNTL <- 0x00010000
+                             GLI_INV = GLI_NOP
+                             GL1_RANGE = GL1_ALL
+                             GLM_WB = 0
+                             GLM_INV = 0
+                             GLK_WB = 0
+                             GLK_INV = 0
+                             GLV_INV = 0
+                             GL1_INV = 0
+                             GL2_US = 0
+                             GL2_RANGE = GL2_ALL
+                             GL2_DISCARD = 0
+                             GL2_INV = 0
+                             GL2_WB = 0
+                             SEQ = SEQ_FORWARD
+                             RANGE_IS_PA = 0
+c0004200 PFP_SYNC_ME:
+00000000 
+c0004600 EVENT_WRITE:
+0000001a         VGT_EVENT_INITIATOR <- 26 (0x0000001a)
+                                        EVENT_TYPE = PIPELINESTAT_STOP
+                 EVENT_INDEX <- OTHER
+c0037600 SET_SH_REG:
+00000207 
+00080008         COMPUTE_NUM_THREAD_X <- 0x00080008
+                                         NUM_THREAD_FULL = 8
+                                         INTERLEAVE_BITS_X = 0
+                                         NUM_THREAD_PARTIAL = 8
+00080008         COMPUTE_NUM_THREAD_Y <- 0x00080008
+                                         NUM_THREAD_FULL = 8
+                                         INTERLEAVE_BITS_Y = 0
+                                         NUM_THREAD_PARTIAL = 8
+00010001         COMPUTE_NUM_THREAD_Z <- 0x00010001
+                                         NUM_THREAD_FULL = 1
+                                         NUM_THREAD_PARTIAL = 1
+c0031502 DISPATCH_DIRECT(shader_type=compute):
+00000020         DIM_X <- 32 (0x00000020)
+00000020         DIM_Y <- 32 (0x00000020)
+00000001         DIM_Z <- 1
+00002047         COMPUTE_DISPATCH_INITIATOR <- 8263 (0x00002047)
+                                               COMPUTE_SHADER_EN = 1
+                                               PARTIAL_TG_EN = 1
+                                               FORCE_START_AT_000 = 1
+                                               ORDERED_APPEND_ENBL = 0
+                                               ORDERED_APPEND_MODE = 0
+                                               USE_THREAD_DIMENSIONS = 0
+                                               ORDER_MODE = 1
+                                               SCALAR_L1_INV_VOL = 0
+                                               VECTOR_L1_INV_VOL = 0
+                                               PING_PONG_EN = 0
+                                               TUNNEL_ENABLE = 1
+                                               RESTORE = 0
+                                               CS_W32_EN = 0
+                                               AMP_SHADER_EN = 0
+                                               DISABLE_DISP_PREMPT_EN = 0
+                                               INTERLEAVE_2D_EN = 0
+                                               TTRACE_QUEUE_ID = 0
+c0055000 DMA_DATA:
+60200000 
+00000700 
+ffff8000 
+00000700 
+ffff8000 
+800000a0         ENGINE_SEL <- MICRO_ENGINE
+                 SRC_INDIRECT <- 0
+                 DST_INDIRECT <- 0
+                 SRC_TEMPORAL <- RT
+                 DST_SEL <- DST_NOWHERE
+                 DST_TEMPORAL <- RT
+                 SRC_SEL <- SRC_ADDR_USING_L2
+                 CP_SYNC <- 0
+                 SRC_ADDR_LO_OR_DATA <- 1792 (0x00000700)
+                 SRC_ADDR_HI <- 0xffff8000
+                 (FULL ADDRESS) <- 0xffff800000000700
+                 DST_ADDR_LO <- 1792 (0x00000700)
+                 DST_ADDR_HI <- 0xffff8000
+                 BYTE_COUNT <- 160 (0x0000a0)
+                 SAS <- MEMORY
+                 DAS <- MEMORY
+                 SAIC <- INCREMENT
+                 DAIC <- INCREMENT
+                 RAW_WAIT <- 0
+                 DIS_WC <- 1
+                 DISABLE_WR_CONFIRM <- 1
+c0004600 EVENT_WRITE:
+00000407         VGT_EVENT_INITIATOR <- 7
+                                        EVENT_TYPE = CS_PARTIAL_FLUSH
+                 EVENT_INDEX <- CS_VS_PS_PARTIAL_FLUSH
+c0064900 RELEASE_MEM:
+8070052b         VGT_EVENT_INITIATOR <- 43 (0x0000002b)
+                                        EVENT_TYPE = FLUSH_AND_INV_DB_DATA_TS
+                 WAIT_SYNC <- 0
+                 EVENT_INDEX <- END_OF_PIPE
+                 GCR_CNTL <- 1792 (0x700)
+                 TEMPORAL <- RT
+                 EXECUTE <- NORMAL_FENCE_WITH_ADJUST
+                 GLK_INV <- 0
+                 PWS_ENABLE <- 1
+00000000         DST_SEL <- MEMORY_CONTROLLER
+                 MES_INTR_PIPE <- 0
+                 MES_ACTION_ID <- NO_MES_NOTIFICATION
+                 INT_SEL <- NONE
+                 DATA_SEL <- NONE
+00000000         [A]ADDRESS_LO_32B <- 0
+                 [B]ADDRESS_LO_64B <- 0
+00000000         [A]ADDRESS_HI <- 0
+00000000         [A]DATA_LO <- 0
+                 [B]CMP_DATA_LO <- 0
+00000000         [A]DATA_HI <- 0
+                 [B]CMP_DATA_HI <- 0
+00000000         INT_CTXID <- 0
+c0065800 ACQUIRE_MEM:
+00022000         0x301f0 <- 0x00022000
+                 [A]ENGINE_SEL <- PREFETCH_PARSER
+                 [B]PWS_STAGE_SEL <- CP_PFP
+                 [B]PWS_COUNTER_SEL <- TS_SELECT
+                 [B]PWS_ENA2 <- PIXEL_WAIT_SYNC_ENABLE
+                 [B]PWS_COUNT <- 0
+ffffffff         [A]COHER_SIZE <- 0xffffffff
+                 [B]GCR_SIZE <- 0xffffffff
+01ffffff         [A]COHER_SIZE_HI <- 0xffffff
+                 [B]GCR_SIZE_HI <- 0x1ffffff
+00000000         [A]COHER_BASE_LO <- 0
+                 [B]GCR_BASE_LO <- 0
+00000000         [A]COHER_BASE_HI <- 0
+                 [B]GCR_BASE_HI <- 0
+80000000         [A]POLL_INTERVAL <- 0
+                 [B]PWS_ENA <- PIXEL_WAIT_SYNC_ENABLE
+00010000         GCR_CNTL <- 0x00010000
+                             GLI_INV = GLI_NOP
+                             GL1_RANGE = GL1_ALL
+                             GLM_WB = 0
+                             GLM_INV = 0
+                             GLK_WB = 0
+                             GLK_INV = 0
+                             GLV_INV = 0
+                             GL1_INV = 0
+                             GL2_US = 0
+                             GL2_RANGE = GL2_ALL
+                             GL2_DISCARD = 0
+                             GL2_INV = 0
+                             GL2_WB = 0
+                             SEQ = SEQ_FORWARD
+                             RANGE_IS_PA = 0
+c0004200 PFP_SYNC_ME:
+00000000 
+c0051000 NOP:
+00000000         (unused)
+00000000         (unused)
+00000000         (unused)
+00000000         (unused)
+00000000         (unused)
+00000000         (unused)
+c0021000 NOP:
+00000000         (unused)
+00000000         (unused)
+00000000         (unused)
+         
+------------------- Main IB end - GFX -------------------
+
