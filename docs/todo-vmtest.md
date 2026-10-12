@@ -216,7 +216,24 @@ shared queue 0 ...: active`, `user-space runtime up again`. In the second log: t
 the GPU busy or the runtime not ready, skip the second run and power the machine off before the next boot (a warm
 reboot keeps some of the card's state).
 
-**Stage 2, a real sleep** (only if stage 1 passed; the card loses its power):
+**Stage 1 ran on 2026-10-12** (kext `0.1.0 (dbabb353)`, logs `amdradeonrdna4-diag-20261012-173208` and `-173322`): the
+sleep half is clean (`power: quiesce complete; compute engines halted`), the wake half stops in the bring-up's second
+stage:
+
+```
+compute: psp: bootloader: sOS already running (0x03afe407), 0 component(s) loaded
+compute: psp: ring: create not acknowledged (C2PMSG_64=0x80c20115)
+compute: stage 2 (psp) failed; stopping, the display is not affected
+```
+
+The card kept its power, so its security processor still has the command ring of the first bring-up and refuses a
+second one. The runtime is then not ready until the reboot (`sleep FAIL`; the second run has `runtime FAIL`). The
+queues, which were the worry, were never reached. amdgpu ends that ring (and the memory region it set up with it)
+when it suspends, which this kext does not do. This failure says nothing about a real sleep, where the card loses
+its power and the security processor starts afresh; whether it does on this machine is what the `bootloader:` line
+of stage 2 shows.
+
+**Stage 2, a real sleep** (the card loses its power; stage 1's failure does not stand in its way):
 
 ```
 rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1 rdna4-pm=1
