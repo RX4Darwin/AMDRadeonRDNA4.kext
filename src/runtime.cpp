@@ -3850,6 +3850,42 @@ bool RDNA4Compute::dmaInit() {
 		return false;
 	}
 
+	// 6b. A uniform block, each way. Cobalt64 (the former Navi48-MacOS) reports for this chip that the engine compresses what it
+	//     writes by physical address, as these copies do, and decompresses what it reads so: a block of one value is then stored
+	//     as a code, which anything that does not go through the engine (the CPU through the BAR, a shader through a page table)
+	//     reads instead of the bytes. Its SDMA0_DCC_CNTL read 0x0000aabe at boot and it clears the eight *_COMP_EN bits. The tests
+	//     above would not see that: their patterns are not uniform. So one block of zeros and one of 0xa5a5a5a5 go through the
+	//     engine and are read without it, and the other way round. Nothing is changed and nothing depends on the result yet:
+	//     this is to find out whether this kext has the problem.
+	constexpr uint32_t kFill = 0xA5A5A5A5u;
+	auto uniform = [](uint32_t i) { return i < n / 8 ? 0u : kFill; };
+	for (uint32_t i = 0; i < n / 4; i++) {
+		host[i] = uniform(i);
+		*poolDw(kDmaTestOffset + 4 * i) = pat2(i);          // so that a copy that did nothing is not taken for a right one
+		*poolDw(kDmaTestOffset + n + 4 * i) = uniform(i);
+		host[n / 4 + i] = pat1(i);
+	}
+	bounce->performOperation(kIOMemoryIncoherentIOFlush, 0, 2 * n);
+	flushHdp();
+	const bool wrote = bounceCopy(poolMc(kDmaTestOffset), 0, n, true);
+	const bool read = bounceCopy(poolMc(kDmaTestOffset + n), n, n, false);
+	bounce->performOperation(kIOMemoryIncoherentIOFlush, n, n);
+	uint32_t wrongWritten = 0, firstWritten = 0, wrongRead = 0, firstRead = 0;
+	for (uint32_t i = 0; i < n / 4; i++) {
+		const uint32_t w = *poolDw(kDmaTestOffset + 4 * i), r = host[n / 4 + i];
+		if (w != uniform(i) && !wrongWritten++)
+			firstWritten = w;
+		if (r != uniform(i) && !wrongRead++)
+			firstRead = r;
+	}
+	RLOG("dma: SDMA0_DCC_CNTL 0x%08x, SDMA1_DCC_CNTL 0x%08x (compression of data reached by physical address: bits 0x%08x). "
+	     "Uniform blocks, 64 KiB each way: written by the engine and read through the BAR: %s (%u of %u dwords differ, the first "
+	     "0x%08x); written through the BAR and read by the engine: %s (%u of %u dwords differ, the first 0x%08x)",
+	     rdGc(sdma(0, SdmaDccCntl)), rdGc(sdma(1, SdmaDccCntl)), kSdmaDccCompEn,
+	     !wrote ? "the copy never finished" : wrongWritten ? "NOT the bytes written" : "the bytes written", wrongWritten, n / 4,
+	     firstWritten, !read ? "the copy never finished" : wrongRead ? "NOT the bytes written" : "the bytes written", wrongRead,
+	     n / 4, firstRead);
+
 	// 7. Speed, for the log: the whole buffer each way, into the pool's
 	//    heap area (not handed out yet).
 	uint64_t t0 = mach_absolute_time(), ns1 = 0, ns2 = 0;

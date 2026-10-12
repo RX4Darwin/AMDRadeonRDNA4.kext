@@ -166,6 +166,11 @@ constexpr uint32_t SdmaQ0DoorbellOffset = 0x0091;   // OFFSET [27:2]: doorbell d
 constexpr uint32_t SdmaQ0WptrPollLo  = 0x0098;
 constexpr uint32_t SdmaQ0WptrPollHi  = 0x0099;
 constexpr uint32_t SdmaQ0MinorPtrUpd = 0x009b;
+// SDMA0_DCC_CNTL (gc_12_0_0_offset.h; SDMA1's is 0x600 further on, as the engine's other registers): what the engine does
+// with data it reaches by physical address. DCC_FORCE_BYPASS [0]; then for n = 0..3 RD_NOPTE_OVERRIDE_n [1+4n],
+// RD_NOPTE_COMP_EN_n [2+4n], WR_NOPTE_OVERRIDE_n [3+4n], WR_NOPTE_COMP_EN_n [4+4n] (gc_12_0_0_sh_mask.h).
+constexpr uint32_t SdmaDccCntl       = 0x0034;
+constexpr uint32_t kSdmaDccCompEn    = 0x00015554;   // the eight *_COMP_EN_n bits
 
 // SDMA0_QUEUE0_RB_CNTL fields
 constexpr uint32_t kSdmaRbSizeShift       = 1;          // [5:1] log2(dwords)
