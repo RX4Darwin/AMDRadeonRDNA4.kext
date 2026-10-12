@@ -184,6 +184,52 @@ Rows to look at: `gfx PASS`, `gfx-client PASS` (a kernel-made client's command b
 address space), `gfx-app-tri` and `gfx-app-tricol` (`rdna4-run tri` / `tricol`: a triangle drawn by a user
 program through the runtime). The colour triangle has not been confirmed on the card by any path.
 
+## Sleep with `rdna4-vm=1` (written 2026-10-12, not run)
+
+Neither kind of sleep has run on the card with the compute runtime. At a sleep the kext stops every queue, the shared
+ones included; at the wake it runs its whole bring-up again and creates them anew. Section 20 of
+`docs/vm-client-rootcause.md` found that a compute queue that was dequeued does not run again when loaded through its
+registers, which is what this would be unless the bring-up's restart of the engine makes the difference. So a
+failure here would not be a surprise; the log says where.
+
+Both need `rdna4-pm=1`: without it the kext is not told about a sleep at all.
+
+**Stage 1, the driver's own cycle** (the machine stays on, the card keeps its power):
+
+```
+rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1 rdna4-pm=1 rdna4-sleeptest=1
+```
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+and once more, so that the second run's tests are tests after a wake:
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+Near its end the script runs `rdna4-run sleeptest`: sleep, 15 s, wake, 15 s for the bring-up. In the first log: row
+`sleep`, and in the kernel log `power: quiesce complete`, `power: wake received`, the bring-up's stages again, `vmshared:
+shared queue 0 ...: active`, `user-space runtime up again`. In the second log: the table. If the first cycle leaves
+the GPU busy or the runtime not ready, skip the second run and power the machine off before the next boot (a warm
+reboot keeps some of the card's state).
+
+**Stage 2, a real sleep** (only if stage 1 passed; the card loses its power):
+
+```
+rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1 rdna4-pm=1
+```
+
+Apple menu, Sleep; wait until the machine is really asleep; wake it; then
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+Report: do both displays come back, and the log. Expected lines as in stage 1, without the script's own cycle.
+
 ## After the tests
 
 Done: the results are in `docs/vm-client-rootcause.md` sections 12 to 20, `docs/metal-readiness.md` section 4 and
