@@ -30,6 +30,10 @@
  *                                          through the attribute ring (G4,
  *                                          userspace/gfx12tricol.h); the colour
  *                                          check of docs/g4-colour.md
+ *    rdna4-run bigva <MiB>                 fill that much of the client's GPU address space with
+ *                                          64 MiB buffers (at most 160), then run the vadd check
+ *                                          on buffers allocated past them: a client beyond 1 GiB
+ *                                          needs rdna4-vmshared=2
  *    rdna4-run trifault                    the colour triangle with its ring block freed before
  *                                          it is submitted (a stream that hangs), then the colour
  *                                          triangle again: does the kernel keep its graphics ring?
@@ -2115,6 +2119,7 @@ static void usage(void) {
 	                "       rdna4-run selftest [items]\n"
 	                "       rdna4-run selftest hang\n"
 	                "       rdna4-run selftest ibbad\n"
+	                "       rdna4-run bigva <MiB>\n"
 	                "       rdna4-run hangtest\n"
 	                "       rdna4-run bench [small]\n"
 	                "       rdna4-run vsync [n]\n"
