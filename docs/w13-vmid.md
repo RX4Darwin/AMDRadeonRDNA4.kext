@@ -25,8 +25,10 @@ the hung waves alone: with that the whole runtime self-test passes on the card w
 run, `docs/vm-client-rootcause.md` section 19). **Mode 2** (`rdna4-vmshared=2`, section 5.10) ran on the card on
 2026-10-12, kext `0.1.0 (f9b1c0e9)` plus one log line: the diagnostic script's table all PASS (`runtime`, `submitib`,
 `fault`, `vm`, the graphics rows; the graphics-ring client in VMID 1), idle 3 % and 18 W, and the full `rdna4-run
-bench` PASS up to SGEMM n=8192 (log `amdradeonrdna4-diag-20261012-165804`, `bench-mode2.txt`). `rdna4-run bigva`,
-the test of a client beyond 1 GiB, has not run there yet. The rest of this document is as written.
+bench` PASS up to SGEMM n=8192 (log `amdradeonrdna4-diag-20261012-165804`, `bench-mode2.txt`). `rdna4-run bigva 2048`,
+the test of a client beyond 1 GiB, passed the same day: 32 buffers of 64 MiB from VA 0x100010000 to 0x17c010000, then
+the vadd check on buffers past them, 256 results correct (`bigva.txt`; its "after queue reset" is the check's own
+wording, nothing was reset). The rest of this document is as written.
 
 **Status after the lead's review (hub-task-307, 2026-09-30/10-01):** design B approved; two shared queues, C deferred, old fixed-VMID path kept
 behind a boot-arg until S9, root-only userclient unchanged for pre-Metal. Done on `premetal/w13`: **S0** (`3b8df07`, the `rtFree`/`rtUnload` invalidate),

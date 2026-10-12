@@ -9,8 +9,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - Address spaces lent per job (`rdna4-vmshared=2`), which lifts the 1 GiB limit of a client's address space, ran
   on the card for the first time on 2026-10-12: the diagnostic script's table all PASS, and the full benchmark in a
   client address space passes (SGEMM n=4096 at 12.1 TFLOPS, n=8192 at 12.8; the matrix units at 53 TFLOPS in FP16;
-  host to GPU 4.1 GB/s). Not yet run there: a client that really uses more than 1 GiB (`rdna4-run bigva`). The
-  default stays `rdna4-vmshared=1`, and the Vulkan interface does not open in mode 2.
+  host to GPU 4.1 GB/s). A client beyond 1 GiB works: `rdna4-run bigva 2048` fills 2 GiB of its address space and
+  computes correctly on buffers past that. The default stays `rdna4-vmshared=1`, and the Vulkan interface does not
+  open in mode 2.
 - The copy engine's compression setting (`SDMA0_DCC_CNTL`, 0x0000aabe on this card) does not alter uniform blocks in
   any direction this kext copies in; the boot log says so at every start (`runtime: dma: SDMA0_DCC_CNTL ...`).
 
