@@ -22,6 +22,8 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLib.h>
+#include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>   // header-only types for IOMacOSVideo.h
 #include <IOKit/ndrvsupport/IOMacOSTypes.h>
@@ -98,6 +100,7 @@ static_assert(Ndrv::cscGetCurMode == ::cscGetCurMode && Ndrv::cscGetSync == ::cs
               Ndrv::cscSupportsHardwareCursor == ::cscSupportsHardwareCursor &&
               Ndrv::cscGetHardwareCursorDrawState == ::cscGetHardwareCursorDrawState &&
               Ndrv::cscSwitchMode == ::cscSwitchMode && Ndrv::cscSetSync == ::cscSetSync &&
+              Ndrv::cscSetEntries == ::cscSetEntries && Ndrv::cscSetGamma == ::cscSetGamma &&
               Ndrv::cscSetHardwareCursor == ::cscSetHardwareCursor &&
               Ndrv::cscDrawHardwareCursor == ::cscDrawHardwareCursor,
               "csc selectors");
@@ -301,6 +304,536 @@ int32_t vbeSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 }
 #endif
 
+// --- rdna4-head2=1: a phantom second head (docs/second-head-ndrv.md s.7) ------
+//
+// A second IONDRVFramebuffer, on an IONDRVDevice nub the plugin creates. It
+// has no IOBootNDRV behind it (IOBootNDRV only takes the console), so
+// wrapDoDriverIO answers its Initialize/Open and every csc request. It serves
+// one mode of the second sink's EDID on a spare VRAM surface behind the
+// console. No display register is written and no pipe scans the surface out:
+// this only shows whether macOS takes a second head.
+//
+// The nub has to exist before WindowServer looks for framebuffers: one that
+// appeared during head 0's open was never opened (card boot of 2026-10-03).
+// So it is created from the routed IONDRVFramebuffer::start, just before
+// head 0 starts on the PCI device, and the two are made dependents of one
+// controller (IOFBDependentID, IOFBDependentIndex 0 and 1) the way
+// IONDRVSupport's own multi-head code does: IOFramebuffer::open of either
+// head then opens the other.
+struct Head2 {
+	IOPCIDevice     *pci { nullptr };
+	IOService       *nub { nullptr };
+	RDNA4Device     *dev { nullptr };       // once the second pipe is lit: display power goes to it
+	bool             ready { false };       // fillHead2 set the mode, surface and EDID
+	Ndrv::Translator ndrv;
+	Ndrv::Surface    surface {};
+	IODeviceMemory  *vram { nullptr };      // the surface, for getVRAMRange (wrapGetVRAMRange)
+	Modes::Mode      table[Modes::MaxModes] {};
+	uint8_t          edid[256] {};          // base block and one extension
+	size_t           edidLen { 0 };
+	uint32_t         traceBudget { 400 };   // its own: head 0 must not use up the lines
+	// The device memory range that holds the console (BAR0 on the card).
+	IODeviceMemory  *range { nullptr };
+	uint64_t         rangeBase { 0 }, rangeLen { 0 };
+	// Hot-plug (rdna4-hotplug): the display on the pipe's connector comes and goes.
+	bool             connected { false };   // what macOS has been told
+	void           (*connectProc)(OSObject *, void *) { nullptr };   // IOFramebuffer's connect interrupt handler
+	OSObject        *connectTarget { nullptr };
+	void            *connectRef { nullptr };
+	IOTimerEventSource *hpdTimer { nullptr };
+	bool             hpdSeen { false };     // the pin at the last poll
+	uint8_t          hpdPin { 0 };          // the pin that was last seen high
+	uint32_t         hpdSame { 0 };         // polls it has read that way
+	uint32_t         hpdGone { 0 };         // polls it has been low with the link up
+};
+Head2 *head2 { nullptr };
+// rdna4-head2: 0 none, 1 phantom, 2..4 see RDNA4Device::lightSecondPipe. 4 unless
+// the boot-arg says otherwise: a second display on HDMI ran on the card.
+uint32_t head2Level { 0 };
+// rdna4-hotplug, with rdna4-head2 >= 2: 0 off, 1 logs what the connector's HPD
+// pin does, 2 (unless the boot-arg says otherwise) acts on it. With 2 the head
+// exists without a monitor too, offline.
+uint32_t hotplugLevel { 0 };
+mach_vm_address_t orgStart { 0 };
+mach_vm_address_t orgGetVRAMRange { 0 };
+mach_vm_address_t orgRegisterForInterruptType { 0 };
+
+void attach(FbEntry &e);
+
+bool isHead2(void *fb) {
+	return head2 && static_cast<IOService *>(fb)->getProvider() == head2->nub;
+}
+
+// Every mode scans the one surface, from its first pixel and with its pitch.
+bool head2SurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) {
+	const Ndrv::Surface &s = static_cast<Head2 *>(ctx)->surface;
+	if (m.t.hActive > s.width || m.t.vActive > s.height)
+		return false;
+	out = { s.physBase, s.rowBytes, m.t.hActive, m.t.vActive };
+	return true;
+}
+
+int32_t head2SwitchTo(void *ctx, const Modes::Mode &m, bool) {
+	return static_cast<Head2 *>(ctx)->dev->applySecondPipeMode(m);
+}
+
+void head2SetPower(void *ctx, bool on) {
+	auto *h = static_cast<Head2 *>(ctx);
+	if (h->connected || !on)             // the link of an unplugged display stays off
+		h->dev->setSecondPipePower(on);
+}
+
+// From wrapStart, before IONDRVFramebuffer starts on the PCI device.
+void createHead2(IOPCIDevice *pci) {
+	if (computeStage) {   // the compute pool takes the VRAM behind the console
+		FBLOG("head2: not created: rdna4-compute is set");
+		return;
+	}
+	auto *h = new Head2;
+	// IONDRVDevice is private to IONDRVSupport: made by name, driven as an IOService.
+	IOService *nub = h ? OSDynamicCast(IOService, OSMetaClass::allocClassWithName("IONDRVDevice"))
+	                   : nullptr;
+	if (!nub || !nub->init()) {
+		FBLOG("head2: not created: IONDRVSupport gave no IONDRVDevice");
+		OSSafeReleaseNULL(nub);
+		delete h;
+		return;
+	}
+	// A device-tree style "display" node: what personality 2 of IONDRVSupport
+	// matches and IONDRVFramebuffer::start accepts.
+	static const char kDisplay[] = "display";
+	const uint64_t id = pci->getRegistryEntryID();
+	nub->setName(kDisplay);
+	nub->setProperty("name", const_cast<char *>(kDisplay), sizeof(kDisplay));
+	nub->setProperty("device_type", const_cast<char *>(kDisplay), sizeof(kDisplay));
+	nub->setProperty("IOFBDependentID", id, 64);
+	nub->setProperty("IOFBDependentIndex", 1ull, 32);
+	nub->setLocation("1");
+	if (OSArray *memory = pci->getDeviceMemory())
+		nub->setDeviceMemory(memory);   // getApertureRange maps the surface out of these
+	// IONDRVFramebuffer takes its device, and IONDRVDevice its power parent,
+	// from the device-tree plane.
+	nub->attachToParent(pci, gIODTPlane);
+	if (!nub->attach(pci)) {
+		FBLOG("head2: not created: the nub did not attach");
+		nub->detachFromParent(pci, gIODTPlane);
+		nub->release();
+		delete h;
+		return;
+	}
+	// Head 0 copies these from its provider when it starts, right after this.
+	pci->setProperty("IOFBDependentID", id, 64);
+	pci->setProperty("IOFBDependentIndex", 0ull, 32);
+	h->pci = pci;
+	h->nub = nub;
+	head2 = h;   // before registerService: the framebuffer may start at once
+	nub->registerService();
+	FBLOG("head2: nub registered, dependent 1 of 0x%llx", id);
+}
+
+// Once head 0's device exists: what head 2 serves.
+// The modes of the sink whose EDID is in h->edid that the head can serve, and
+// the one it starts in: the first, in table order (native first), whose
+// surface fits. With the pipe to be lit (rdna4-head2 >= 2) that has to be
+// the mode the second-pipe plan was generated for, and the table only holds
+// what the pipe can be switched to.
+const Modes::Mode *head2BuildTable(Head2 *h, RDNA4Device &dev, size_t &n) {
+	const Edid::DetailedTiming &lit = Pipe2::config().timing;
+	n = Modes::build(h->edid, h->edidLen, head2Level >= 2 ? dev.secondPipeModeLimits() : Modes::Limits {},
+	                 h->table, Modes::MaxModes);
+	if (head2Level >= 2) {
+		size_t kept = 0;
+		for (size_t i = 0; i < n; i++)
+			if (dev.secondPipeModeOk(h->table[i].t))
+				h->table[kept++] = h->table[i];
+		n = kept;
+	}
+	for (size_t i = 0; i < n; i++) {
+		const Edid::DetailedTiming &t = h->table[i].t;
+		if (head2Level >= 2 && !Edid::sameTiming(t, lit))
+			continue;
+		if (Ndrv::spareSurface(dev.fbPhysBase, dev.fbLength, h->rangeBase, h->rangeLen, t.hActive, t.vActive,
+		                       h->surface))
+			return &h->table[i];
+	}
+	return nullptr;
+}
+
+// Hand the table to the translator, with `mode` as the one the head is in.
+void head2Init(Head2 *h, RDNA4Device &dev, const Modes::Mode *mode, size_t n) {
+	Ndrv::Backend be {};
+	be.ctx = h;
+	be.surfaceFor = head2SurfaceFor;
+	// Only a lit pipe answers cscGetSync, so only then does macOS send this
+	// head display sleep (a phantom head has nothing to put to sleep).
+	if (dev.pipe2Lit)
+		be.setPower = head2SetPower;
+	// Like the boot display, the other modes are offered with rdna4-modeset=1.
+	const bool switching = dev.pipe2Lit && dev.modesetRequested;
+	if (switching)
+		be.switchTo = head2SwitchTo;
+	h->ndrv.init(switching ? h->table : mode, switching ? n : 1, mode->id, h->edid, h->edidLen, be);
+	for (size_t i = 0; switching && i < n; i++) {
+		const Modes::Mode &m = h->table[i];
+		FBLOG("head2: mode id %u %ux%u@%u.%03u %u kHz%s%s", m.id, m.t.hActive, m.t.vActive,
+		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, m.t.pixelClockKHz, &m == mode ? " (lit)" : "",
+		      Pipe2::modeKnown(m.t) ? "" : " (on the lit mode's request timing)");
+	}
+}
+
+void fillHead2(RDNA4Device &dev) {
+	Head2 *h = head2;
+	if (!h || h->ready)
+		return;
+	IOService *client = h->nub->getClient();
+	FBLOG("head2: framebuffer on the nub: %s", client ? client->getName() : "none started");
+	h->dev = &dev;
+	for (UInt32 i = 0; i < h->pci->getDeviceMemoryCount(); i++) {
+		IODeviceMemory *mem = h->pci->getDeviceMemoryWithIndex(i);
+		if (!mem)
+			continue;
+		const uint64_t base = mem->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+		if (dev.fbPhysBase >= base && dev.fbPhysBase - base < mem->getLength()) {
+			h->range = mem;
+			h->rangeBase = base;
+			h->rangeLen = mem->getLength();
+			break;
+		}
+	}
+	const Edid::DetailedTiming &lit = Pipe2::config().timing;
+	// A pipe to light needs a second monitor. Until one is plugged in the
+	// head is there but offline (rdna4-hotplug=2): macOS shows no display.
+	// For a pipe to light, a second display counts if it is on a connector
+	// there is a plan for.
+	const bool sink = dev.edid2Len && (head2Level < 2 || dev.usePlanFor(dev.edid2Hpd));
+	const bool offline = head2Level >= 2 && !sink && hotplugLevel >= 2;
+	const Modes::Mode *mode = nullptr;
+	size_t n = 0;
+	if (offline) {
+		if (dev.edid2Len)
+			FBLOG("head2: the display on HPD%u is not served: no second-pipe plan for that connector (a "
+			      "DisplayPort one needs rdna4-head2dp=1); the head waits offline", dev.edid2Hpd);
+		// The one mode the pipe will be lit in, on its surface; no EDID.
+		h->table[0] = Modes::Mode { 1, lit, lit.refreshMilliHz(), true, Modes::SourceBoot };
+		n = 1;
+		if (Ndrv::spareSurface(dev.fbPhysBase, dev.fbLength, h->rangeBase, h->rangeLen, lit.hActive, lit.vActive,
+		                       h->surface))
+			mode = &h->table[0];
+	} else {
+		// The second sink if one answered, else a copy of the boot display's.
+		const uint8_t *edid = dev.edid2Len ? dev.edid2Data : dev.edidData;
+		h->edidLen = min(static_cast<size_t>(dev.edid2Len ? dev.edid2Len : dev.edidLen), sizeof(h->edid));
+		if (h->edidLen < 128) {
+			FBLOG("head2: nothing to serve: no EDID");
+			return;
+		}
+		memcpy(h->edid, edid, h->edidLen);
+		// Without hot-plug a head with no monitor would be the phantom, an
+		// invisible display for windows to get lost on: that is rdna4-head2=1,
+		// asked for by name.
+		if (head2Level >= 2 && !sink) {
+			if (dev.edid2Len)
+				FBLOG("head2: nothing to serve: the second display is on HPD%u, a connector there is no "
+				      "second-pipe plan for (a DisplayPort one needs rdna4-head2dp=1)", dev.edid2Hpd);
+			else
+				FBLOG("head2: nothing to serve: no second sink answered on DDC (hot-plug is off: rdna4-hotplug=2 "
+				      "waits for one, rdna4-head2=1 makes a phantom head)");
+			return;
+		}
+		mode = head2BuildTable(h, dev, n);
+	}
+	if (!mode) {
+		if (head2Level >= 2)
+			FBLOG("head2: nothing to serve: the sink has no %ux%u mode at %u kHz, the one the "
+			      "second-pipe plan is for, or it does not fit behind the console", lit.hActive,
+			      lit.vActive, lit.pixelClockKHz);
+		else
+			FBLOG("head2: nothing to serve: no mode of the sink fits behind the console");
+		return;
+	}
+	if (!offline && head2Level >= 2 && dev.isAmd)
+		dev.lightSecondPipe(head2Level, h->surface.physBase);
+	head2Init(h, dev, mode, n);
+	h->connected = !offline;
+	h->ndrv.setConnected(h->connected);
+	// WindowServer maps a framebuffer through getVRAMRange, which IONDRVFramebuffer
+	// only has for an IOBootNDRV: without this it gives up on the head with
+	// "Failed to map VRAM" (card boot of 2026-10-03, 19:46).
+	h->vram = IODeviceMemory::withSubRange(h->range, h->surface.physBase - h->rangeBase,
+	                                       static_cast<uint64_t>(h->surface.rowBytes) * h->surface.height);
+	if (!h->vram)
+		FBLOG("head2: no VRAM range for the surface: WindowServer will not map it");
+	h->ready = true;
+	FBLOG("head2: serving %ux%u@%u.%03u on surface 0x%llx, %s", mode->t.hActive,
+	      mode->t.vActive, mode->refreshMilliHz / 1000, mode->refreshMilliHz % 1000, h->surface.physBase,
+	      offline ? "offline until a display is plugged in" : dev.edid2Len ? "EDID of the second sink"
+	              : "EDID of the boot display (no second sink)");
+}
+
+// --- hot-plug of the second pipe's connector ---------------------------------
+// The pin is polled: twice a second is soon enough, and it needs no interrupt
+// from the card. A change is told to macOS through the handler IOFramebuffer
+// registered for connect interrupts; it then asks cscGetConnection again,
+// takes the framebuffer online or offline and reads the EDID and the modes.
+
+void head2ConnectChanged(Head2 *h) {
+	if (h->connectProc)
+		h->connectProc(h->connectTarget, h->connectRef);
+	else
+		FBLOG("hotplug: macOS registered no connect handler on head 2: it is not told");
+}
+
+// A display on the connector: read what it is and let macOS find it. For
+// another display than before the pipe goes to the mode it is lit in (and is
+// lit, if this is the first display it sees), which is where a new mode table
+// starts.
+void head2Plugged(Head2 *h, uint8_t hpd) {
+	RDNA4Device &dev = *h->dev;
+	if (!dev.readSecondEdid(hpd)) {
+		FBLOG("hotplug: HPD%u is high but there is no EDID on DDC (yet)", hpd);
+		return;
+	}
+	// A pipe that is not lit yet takes the plan for this connector.
+	if (!dev.pipe2Lit && !dev.usePlanFor(hpd)) {
+		FBLOG("hotplug: no second-pipe plan for HPD%u", hpd);
+		return;
+	}
+	const Edid::DetailedTiming &lit = Pipe2::config().timing;
+	const size_t len = min(static_cast<size_t>(dev.edid2Len), sizeof(h->edid));
+	// The display that was there before: the link comes back in the mode it
+	// was in, and macOS finds the head, its modes and their IDs as it left them.
+	if (dev.pipe2Lit && len == h->edidLen && memcmp(h->edid, dev.edid2Data, len) == 0) {
+		dev.secondPipeTo(hpd);
+		if (!dev.pipe2On) {
+			FBLOG("hotplug: the link did not come back: the display stays offline");
+			return;
+		}
+		h->connected = true;
+		h->ndrv.setConnected(true);
+		FBLOG("hotplug: the same display is back on HPD%u", Pipe2::config().hpd);
+		head2ConnectChanged(h);
+		return;
+	}
+	h->edidLen = len;
+	memcpy(h->edid, dev.edid2Data, h->edidLen);
+	size_t n = 0;
+	const Modes::Mode *mode = head2BuildTable(h, dev, n);
+	if (!mode) {
+		FBLOG("hotplug: the display has no %ux%u mode at %u kHz, the one the pipe is lit in: left off",
+		      lit.hActive, lit.vActive, lit.pixelClockKHz);
+		return;
+	}
+	if (!dev.pipe2Lit) {
+		dev.lightSecondPipe(head2Level, h->surface.physBase);
+	} else {
+		dev.secondPipeTo(hpd);
+		if (dev.pipe2On && !Edid::sameTiming(dev.pipe2Target.now, lit))
+			dev.applySecondPipeMode(*mode);
+	}
+	if (!dev.pipe2Lit || !dev.pipe2On) {
+		FBLOG("hotplug: the pipe did not come up: the display stays offline");
+		return;
+	}
+	head2Init(h, dev, mode, n);
+	h->connected = true;
+	h->ndrv.setConnected(true);
+	FBLOG("hotplug: display connected on HPD%u: %lu mode(s), EDID %lu bytes", Pipe2::config().hpd,
+	      static_cast<unsigned long>(n), static_cast<unsigned long>(h->edidLen));
+	head2ConnectChanged(h);
+}
+
+void head2Unplugged(Head2 *h) {
+	h->dev->setSecondPipePower(false);
+	h->connected = false;
+	h->ndrv.setConnected(false);
+	FBLOG("hotplug: display gone from HPD%u: link off", Pipe2::config().hpd);
+	head2ConnectChanged(h);
+}
+
+constexpr uint32_t kHpdPollMs = 500;
+
+void hotplugPoll(OSObject *, IOTimerEventSource *timer) {
+	Head2 *h = head2;
+	RDNA4Device &dev = *h->dev;
+	// A display that is gone may come back on another connector.
+	const uint8_t hpd = dev.secondSinkHpd(!h->connected);
+	const bool present = hpd != 0;
+	if (present != h->hpdSeen) {
+		if (present)
+			h->hpdPin = hpd;
+		FBLOG("hotplug: HPD%u went %s", h->hpdPin, present ? "high" : "low");
+		h->hpdSeen = present;
+		h->hpdSame = 0;
+	} else {
+		h->hpdSame++;
+	}
+	// Low only counts while the link is up: a monitor that macOS has put to
+	// sleep may drop the pin, and takes a while to raise it again on waking.
+	h->hpdGone = present || !dev.pipe2On ? 0 : h->hpdGone + 1;
+	if (hotplugLevel >= 2) {
+		// A second of high, and again after 3 and 7 s if the display's EDID
+		// was not there yet; three seconds of low.
+		if (!h->connected && present && (h->hpdSame == 2 || h->hpdSame == 6 || h->hpdSame == 14))
+			head2Plugged(h, hpd);
+		else if (h->connected && h->hpdGone >= 6)
+			head2Unplugged(h);
+	}
+	timer->setTimeoutMS(kHpdPollMs);
+}
+
+// --- the boot display on DisplayPort (rdna4-dptrain) --------------------------
+// The firmware keeps the boot display's link itself: with the link taken down
+// under it, it had trained it again within two seconds (card, 2026-10-06),
+// and the monitor comes back after a cable pull with the kext doing nothing.
+// So the pin is only watched and the link's state logged when it returns; a
+// second trainer on the same link would be in the firmware's way.
+// rdna4-dptrain=2 still retrains once, to try the kext's own training.
+struct BootDp {
+	RDNA4Device        *dev { nullptr };
+	IOTimerEventSource *timer { nullptr };
+	bool                seen { false };   // the pin at the last poll
+	bool                gone { false };   // it was low for a second since the link was last good
+	uint32_t            same { 0 };       // polls it has read that way
+	uint32_t            polls { 0 };
+} bootDp;
+
+void bootDpPoll(OSObject *, IOTimerEventSource *timer) {
+	RDNA4Device &dev = *bootDp.dev;
+	const bool present = dev.bootSinkPresent();
+	if (present != bootDp.seen) {
+		FBLOG("dptrain: the boot display's HPD pin went %s", present ? "high" : "low");
+		bootDp.seen = present;
+		bootDp.same = 0;
+	} else {
+		bootDp.same++;
+	}
+	if (!present && bootDp.same == 2)
+		bootDp.gone = true;
+	if (present && bootDp.gone && bootDp.same == 2) {
+		bootDp.gone = false;
+		dev.logBootLink("the display is back");
+	}
+	// rdna4-dptrain=2: once, 15 s after the framebuffer opened, with the
+	// cable left alone, to try the training by itself.
+	if (dev.dpTrainLevel >= 2 && ++bootDp.polls == 15000 / kHpdPollMs)
+		dev.retrainBootLink("self-test");
+	// ... and what the link is like once that has settled.
+	if (dev.dpTrainLevel >= 2 && (bootDp.polls == 17000 / kHpdPollMs || bootDp.polls == 25000 / kHpdPollMs))
+		dev.logBootLink(bootDp.polls == 17000 / kHpdPollMs ? "2 s later" : "10 s later");
+	timer->setTimeoutMS(kHpdPollMs);
+}
+
+void startBootDpPoll(IOService *fb, RDNA4Device &dev) {
+	IOWorkLoop *loop = fb->getWorkLoop();
+	bootDp.timer = loop ? IOTimerEventSource::timerEventSource(fb, bootDpPoll) : nullptr;
+	if (!bootDp.timer || loop->addEventSource(bootDp.timer) != kIOReturnSuccess) {
+		FBLOG("dptrain: no timer on the boot display's work loop: off");
+		OSSafeReleaseNULL(bootDp.timer);
+		return;
+	}
+	bootDp.dev = &dev;
+	bootDp.seen = dev.bootSinkPresent();
+	FBLOG("dptrain: watching the boot display's HPD pin (now %s)%s", bootDp.seen ? "high" : "low",
+	      dev.dpTrainLevel >= 2 ? "; self-test in 15 s" : "");
+	bootDp.timer->setTimeoutMS(kHpdPollMs);
+}
+
+void startHead2Hotplug(IOService *fb, void (*proc)(OSObject *, void *), OSObject *target, void *ref) {
+	Head2 *h = head2;
+	IOWorkLoop *loop = fb->getWorkLoop();
+	h->hpdTimer = loop ? IOTimerEventSource::timerEventSource(fb, hotplugPoll) : nullptr;
+	if (!h->hpdTimer || loop->addEventSource(h->hpdTimer) != kIOReturnSuccess) {
+		FBLOG("hotplug: no timer on head 2's work loop: off");
+		OSSafeReleaseNULL(h->hpdTimer);
+		return;
+	}
+	h->connectProc = proc;
+	h->connectTarget = target;
+	h->connectRef = ref;
+	h->hpdPin = h->dev->secondSinkHpd();
+	h->hpdSeen = h->hpdPin != 0;
+	if (!h->hpdSeen)
+		h->hpdPin = Pipe2::config().hpd;
+	FBLOG("hotplug: polling HPD%u (now %s), %s; head 2 is %s", h->hpdPin, h->hpdSeen ? "high" : "low",
+	      hotplugLevel >= 2 ? "acting on it" : "logging only (rdna4-hotplug=2 acts)",
+	      h->connected ? "connected" : "offline");
+	h->hpdTimer->setTimeoutMS(kHpdPollMs);
+}
+
+// IOFramebuffer registers its connect interrupt handler when it opens: by
+// then it has its work loop, which is where the polls above run. There is no
+// interrupt service behind an IOBootNDRV, so the registration fails as
+// before; head 2's handler is kept for its poll to call.
+IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSObject *, void *),
+                                      OSObject *target, void *ref, void **interruptRef) {
+	const IOReturn ret = FunctionCast(wrapRegisterForInterruptType, orgRegisterForInterruptType)(
+		fb, type, proc, target, ref, interruptRef);
+	if (type != kIOFBConnectInterruptType)
+		return ret;
+	auto *service = static_cast<IOService *>(fb);
+	if (isHead2(fb)) {
+		Head2 *h = head2;
+		if (hotplugLevel && h->ready && h->dev && !h->hpdTimer && head2Level >= 2 && h->dev->isAmd)
+			startHead2Hotplug(service, proc, target, ref);
+		return ret;
+	}
+	FbEntry *e = fbEntry(fb);
+	if (e && e->ours && e->state && e->state->dev.bootDpLinkKnown && !bootDp.timer)
+		startBootDpPoll(service, e->state->dev);
+	return ret;
+}
+
+// The stand-in for IOBootNDRV::doDriverIO.
+IOReturn head2DriverIO(void *contents, UInt32 commandCode, uint16_t &code) {
+	if (!head2->ready) {
+		// macOS opened this head before head 0: build head 0's device, which
+		// is where the EDID and the console geometry come from, now.
+		IOService *fb0 = nullptr;
+		if (OSIterator *clients = head2->pci->getClientIterator()) {
+			while (OSObject *client = clients->getNextObject())
+				if (client->metaCast("IONDRVFramebuffer")) {
+					fb0 = static_cast<IOService *>(client);
+					break;
+				}
+			clients->release();
+		}
+		FbEntry *e0 = fb0 ? fbEntry(fb0) : nullptr;
+		if (e0 && e0->ours && !e0->tried)
+			attach(*e0);
+		if (!head2->ready)
+			return kIOReturnNotReady;
+	}
+	if (commandCode == kIONDRVInitializeCommand || commandCode == kIONDRVOpenCommand)
+		return kIOReturnSuccess;
+	const bool isStatus = commandCode == kIONDRVStatusCommand;
+	if ((!isStatus && commandCode != kIONDRVControlCommand) || !contents)
+		return kIOReturnUnsupported;
+	auto *pb = static_cast<NdrvControlParameters *>(contents);
+	code = pb->code;
+	int32_t r = 0;
+	if (isStatus ? head2->ndrv.status(code, pb->params, r) : head2->ndrv.control(code, pb->params, r))
+		return static_cast<IOReturn>(r);
+	return static_cast<IOReturn>(Ndrv::bootReply(isStatus, code));
+}
+
+// IONDRVFramebuffer::getVRAMRange returns IOBootNDRV's console range, so
+// nothing for head 2: hand out its surface instead (retained, as the original
+// does).
+IODeviceMemory *wrapGetVRAMRange(void *fb) {
+	if (isHead2(fb) && head2->vram) {
+		head2->vram->retain();
+		return head2->vram;
+	}
+	return FunctionCast(wrapGetVRAMRange, orgGetVRAMRange)(fb);
+}
+
+bool wrapStart(void *fb, IOService *provider) {
+	auto *pci = OSDynamicCast(IOPCIDevice, provider);
+	if (!head2 && pci && isOurDevice(pci))
+		createHead2(pci);
+	return FunctionCast(wrapStart, orgStart)(fb, provider);
+}
+
 // Create the state for one of our framebuffers, once. Runs after the
 // original handled Open (or, if the route arrived later, before the first
 // Control/Status), so IOBootNDRV already owns the console framebuffer.
@@ -339,6 +872,7 @@ void attach(FbEntry &e) {
 	e.state = st;
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
+	fillHead2(dev);
 
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
 	if (accelCensus && dev.isAmd)
@@ -375,6 +909,19 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 	FbEntry *e = fbEntry(fb);
 	if (!e || !e->ours)
 		return org(fb, commandID, contents, commandCode, commandKind);
+
+	// The phantom head has no NDRV: the original would refuse every command.
+	if (isHead2(fb)) {
+		uint16_t code = 0;
+		const IOReturn ret = head2DriverIO(contents, commandCode, code);
+		const bool lifecycle = commandCode != kIONDRVControlCommand && commandCode != kIONDRVStatusCommand;
+		const bool traced = !lifecycle && traceEnabled && head2->traceBudget;
+		if (traced)
+			head2->traceBudget--;
+		if (lifecycle || traced)
+			FBLOG("head2: %s csc %u -> 0x%x", commandName(commandCode), code, ret);
+		return ret;
+	}
 
 	const bool isStatus = commandCode == kIONDRVStatusCommand;
 	const bool csc = (isStatus || commandCode == kIONDRVControlCommand) && contents;
@@ -465,6 +1012,57 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d)",
 		      patcher.getError());
 	patcher.clearError();
+	// The second display and its hot-plug are on unless turned off: lit at
+	// boot, mode switching, display sleep and hot-plug ran on the card for an
+	// HDMI monitor on either connector (2026-10-04..06). Not in VM test
+	// builds, which have no second pipe to light, and not with rdna4-compute.
+#ifdef RDNA4FB_VM_TEST
+	uint32_t second = 0;
+#else
+	uint32_t second = 4;
+#endif
+	PE_parse_boot_argn("rdna4-head2", &second, sizeof(second));
+	if (second) {
+		head2Level = second;
+		KernelPatcher::RouteRequest start {
+			"__ZN17IONDRVFramebuffer5startEP9IOService", wrapStart, orgStart,
+		};
+		if (patcher.routeMultiple(index, &start, 1, address, size))
+			FBLOG("head2: routed IONDRVFramebuffer::start");
+		else
+			FBLOG("head2: not available: no IONDRVFramebuffer::start route (error %d)",
+			      patcher.getError());
+		patcher.clearError();
+		KernelPatcher::RouteRequest vram {
+			"__ZN17IONDRVFramebuffer12getVRAMRangeEv", wrapGetVRAMRange, orgGetVRAMRange,
+		};
+		if (patcher.routeMultiple(index, &vram, 1, address, size))
+			FBLOG("head2: routed IONDRVFramebuffer::getVRAMRange");
+		else
+			FBLOG("head2: no IONDRVFramebuffer::getVRAMRange route (error %d): WindowServer "
+			      "will not map the second head", patcher.getError());
+		patcher.clearError();
+	}
+	// Both kinds of hot-plug start their HPD poll when IOFramebuffer opens.
+	uint32_t hotplug = second >= 2 ? 2 : 0, dptrain = 0;
+	if (second >= 2)
+		PE_parse_boot_argn("rdna4-hotplug", &hotplug, sizeof(hotplug));
+	PE_parse_boot_argn("rdna4-dptrain", &dptrain, sizeof(dptrain));
+	if (hotplug || dptrain) {
+		KernelPatcher::RouteRequest connect {
+			"__ZN17IONDRVFramebuffer24registerForInterruptTypeEjPFvP8OSObjectPvES1_S2_PS2_",
+			wrapRegisterForInterruptType, orgRegisterForInterruptType,
+		};
+		if (patcher.routeMultiple(index, &connect, 1, address, size)) {
+			hotplugLevel = hotplug;
+			FBLOG("hotplug: routed IONDRVFramebuffer::registerForInterruptType (rdna4-hotplug=%u, "
+			      "rdna4-dptrain=%u)", hotplug, dptrain);
+		} else {
+			FBLOG("hotplug: not available: no IONDRVFramebuffer::registerForInterruptType route (error %d)",
+			      patcher.getError());
+		}
+		patcher.clearError();
+	}
 	uint32_t vbl = 0, cursor = 0;
 	const bool vslRequested =
 		(PE_parse_boot_argn("rdna4-vbl", &vbl, sizeof(vbl)) && vbl != 0) ||

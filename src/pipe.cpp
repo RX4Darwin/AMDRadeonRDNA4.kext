@@ -82,7 +82,13 @@ bool discover(ReadFn rd, void *ctx, State &out) {
 			if (beCntl != kUnreadable && beClk != kUnreadable &&
 			    (beCntl & (1u << (8 + out.dig)))) {
 				out.signal = static_cast<Signal>(beClk & 0x7);
-				out.hpd    = static_cast<uint8_t>((beCntl >> 28) & 0x7);
+				// DIG_HPD_SELECT counts from 0 (0 = HPD1, Linux's hpd_source_id;
+				// 6 and 7 are not sources). The VBIOS path records and the DMUB
+				// transmitter command count pins from 1. Both card logs show the
+				// field one below the lit sink's pin: 3 for hpd-pin 4 (HDMI,
+				// 2026-09-28), 0 for hpd-pin 1 (DP, 2026-10-03).
+				const uint32_t sel = (beCntl >> 28) & 0x7;
+				out.hpd    = sel < 6 ? static_cast<uint8_t>(sel + 1) : 0;
 			}
 		}
 		switch (out.signal) {

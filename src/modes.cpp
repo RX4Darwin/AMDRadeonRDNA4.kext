@@ -166,7 +166,8 @@ size_t build(const uint8_t *edid, size_t len, const Limits &lim, Mode *out, size
 		Edid::CtaCaps cta {};
 		if (!Edid::blockChecksumOk(ext) || !Edid::parseCtaBlock(ext, cta))
 			continue;
-		capPclk(b.sinkMaxPclkKHz, cta.maxTmdsKHz);
+		// The HDMI Forum block raises the HDMI 1.4 block's limit past 340 MHz.
+		capPclk(b.sinkMaxPclkKHz, cta.hfMaxTmdsKHz > cta.maxTmdsKHz ? cta.hfMaxTmdsKHz : cta.maxTmdsKHz);
 		size_t nd = cta.dtdCount < Edid::MaxCtaDtds ? cta.dtdCount : Edid::MaxCtaDtds;
 		for (size_t i = 0; i < nd; i++)
 			b.add(cta.dtds[i], SourceCtaDtd, false);

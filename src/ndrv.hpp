@@ -48,6 +48,8 @@ enum : uint16_t {
 	cscSupportsHardwareCursor = 22,
 	cscGetHardwareCursorDrawState = 23,
 	// Control
+	cscSetEntries         = 3,
+	cscSetGamma           = 4,
 	cscSwitchMode         = 10,
 	cscSetSync            = 11,
 	cscSetHardwareCursor  = 22,
@@ -77,6 +79,7 @@ constexpr uint16_t kGenericLCD                = 20;
 constexpr uint32_t kHasDirectConnection       = 1u << 3;
 constexpr uint32_t kReportsDDCConnection      = 1u << 7;
 constexpr uint32_t kHasDDCConnection          = 1u << 8;
+constexpr uint32_t kConnectionInactive        = 1u << 9;    // nothing connected: IONDRVFramebuffer goes offline
 constexpr uint32_t kDDCBlockTypeEDID          = 0;
 constexpr uint32_t kSyncPositivePolarityMask  = 1;
 constexpr uint32_t kDMSModeReady              = 0;
@@ -271,6 +274,11 @@ public:
 	bool control(uint16_t code, void *params, int32_t &ret);
 
 	int32_t currentModeId() const { return current; }
+
+	// Whether a display is on the connector. Without one cscGetConnection
+	// says so and there is no DDC block: macOS takes the framebuffer offline
+	// until a connect interrupt makes it ask again.
+	void setConnected(bool on) { connected = on; }
 	size_t  modeCount() const { return count; }
 	// NDRV mode ID of table entry `m`.
 	int32_t idFor(const Modes::Mode &m) const;
@@ -284,6 +292,7 @@ private:
 	Backend  be {};
 	int32_t  current { kBootModeId };
 	uint8_t  syncState { kDPMSSyncOn };
+	bool     connected { true };
 
 	const Modes::Mode *modeFor(int32_t id) const;
 	bool surface(const Modes::Mode &m, Surface &out) const;
@@ -299,6 +308,21 @@ private:
 	int32_t switchMode(VDSwitchInfoRec &r);
 	int32_t setSync(const VDSyncInfoRec &r);
 };
+
+// --- a head with no IOBootNDRV behind it (docs/second-head-ndrv.md) ----------
+
+// What IOBootNDRV answers to a csc request the Translator leaves alone: the
+// CLUT and gamma writes succeed and do nothing, everything else is
+// unsupported (IOBootNDRV::doControl / doStatus).
+int32_t bootReply(bool isStatus, uint16_t code);
+
+// Place a width x height, 32 bpp surface for a second head in the memory
+// range [rangeBase, rangeBase + rangeLen) that holds the console framebuffer
+// [fbBase, fbBase + fbLen): 1 MiB aligned and at least 1 MiB past the
+// console's end (the cursor sprite sits right behind it), with the 128 bytes
+// IONDRVFramebuffer::getApertureRange adds. False if it does not fit.
+bool spareSurface(uint64_t fbBase, uint64_t fbLen, uint64_t rangeBase, uint64_t rangeLen,
+                  uint32_t width, uint32_t height, Surface &out);
 
 } // namespace Ndrv
 

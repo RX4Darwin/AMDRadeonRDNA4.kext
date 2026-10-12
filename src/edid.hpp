@@ -51,6 +51,14 @@ struct DetailedTiming {
 	}
 };
 
+// The same raster and sync polarities.
+inline bool sameTiming(const DetailedTiming &a, const DetailedTiming &b) {
+	return a.pixelClockKHz == b.pixelClockKHz && a.hActive == b.hActive && a.hBlank == b.hBlank &&
+	       a.hSyncOffset == b.hSyncOffset && a.hSyncWidth == b.hSyncWidth && a.vActive == b.vActive &&
+	       a.vBlank == b.vBlank && a.vSyncOffset == b.vSyncOffset && a.vSyncWidth == b.vSyncWidth &&
+	       a.hSyncPositive == b.hSyncPositive && a.vSyncPositive == b.vSyncPositive && a.interlaced == b.interlaced;
+}
+
 // Parse one 18-byte descriptor. Returns false if it is not a detailed timing
 // (pixel clock 0 marks display/monitor descriptors) or is malformed.
 bool parseDetailedTiming(const uint8_t d[18], DetailedTiming &out);
@@ -134,6 +142,8 @@ bool dmtTiming(uint16_t hActive, uint16_t vActive, uint16_t hz,
 
 // CEA-861 VIC -> timing. False for unknown and for interlaced VICs.
 bool vicTiming(uint8_t vic, DetailedTiming &out);
+// The (first) VIC whose timing is exactly `t`, or 0.
+uint8_t vicOf(const DetailedTiming &t);
 
 // --- CTA-861 extension block ------------------------------------------------
 // Sink capabilities needed to pick a legal signal for mode setting: pixel
@@ -153,6 +163,9 @@ struct CtaCaps {
 	size_t   vicCount   { 0 };
 	bool     hasHdmiVsdb { false };  // IEEE OUI 00-0C-03 vendor block present
 	uint32_t maxTmdsKHz { 0 };       // 0 = not advertised
+	// HDMI Forum vendor block (OUI C4-5D-D8), HDMI 2.0:
+	bool     scdcPresent { false };  // the sink has the SCDC registers (scrambling control)
+	uint32_t hfMaxTmdsKHz { 0 };     // Max_TMDS_Character_Rate; 0 = no more than 340 MHz
 	size_t   dtdCount   { 0 };       // additional 18-byte timings in the block
 	DetailedTiming firstDtd {};      // valid when dtdCount > 0
 	DetailedTiming dtds[MaxCtaDtds] {};   // dtds[0..dtdCount)
@@ -161,6 +174,14 @@ struct CtaCaps {
 // Parse one 128-byte CTA-861 extension (tag 0x02). Returns false if the tag
 // or structure is invalid. Does not verify the checksum (see blockChecksumOk).
 bool parseCtaBlock(const uint8_t ext[128], CtaCaps &out);
+
+// What the extensions of an EDID say about HDMI 2.0: whether the sink has
+// SCDC, and the highest TMDS character rate it takes above 340 MHz (0: none).
+struct Hdmi2Caps {
+	bool     scdc;
+	uint32_t maxTmdsKHz;
+};
+Hdmi2Caps hdmi2Caps(const uint8_t *edid, size_t len);
 
 } // namespace Edid
 

@@ -1,0 +1,23 @@
+# The modes tools/pipegen/run.sh asks Linux about, besides the one the second pipe is lit in: for each, the
+# registers a mode switch on that pipe has to change with the timing (HUBP request timing, DET size, global
+# sync), from DML 2.1, with the plane on the surface of the lit mode. A mode that is not here can still be
+# switched to if its pixel clock is within 25 % of the lit mode's; it then keeps the lit mode's values.
+#
+# These are the timings of the test rig's second monitor (Lenovo G25-10, EDID base block and CTA extension),
+# as src/modes.cpp builds them. One per line: hactive hfront hsync hback  vactive vfront vsync vback  kHz
+# hsync-positive vsync-positive VIC. DML rejects some (too little vertical blank for its prefetch): run.sh
+# says which, and they stay on the 25 % rule.
+1920 24 32 80  1080 3 5 37  333070 1 0 0   # 1920x1080@143.999
+1920 48 32 80  1080 3 5 56  285500 1 0 0   # 1920x1080@119.982
+1920 528 44 148  1080 4 5 36  148500 1 1 31   # 1920x1080@50.000
+1680 48 32 80  1050 3 6 21  119000 1 0 0   # 1680x1050@59.883
+1600 24 80 96  900 1 3 96  108000 1 1 0   # 1600x900@60.000
+1440 48 32 80  900 3 6 17  88750 1 0 0   # 1440x900@59.901
+1280 48 112 248  1024 1 3 38  108000 1 1 0   # 1280x1024@60.020
+1280 110 40 220  720 5 5 20  74250 1 1 4   # 1280x720@60.000
+1280 440 40 220  720 5 5 20  74250 1 1 19   # 1280x720@50.000
+1024 24 136 160  768 3 6 29  65000 0 0 0   # 1024x768@60.004
+800 40 128 88  600 1 4 23  40000 1 1 0   # 800x600@60.317
+720 12 64 68  576 5 5 39  27000 0 0 17   # 720x576@50.000
+720 16 62 60  480 9 6 30  27000 0 0 2   # 720x480@59.940
+640 16 96 48  480 10 2 33  25175 0 0 1   # 640x480@59.940

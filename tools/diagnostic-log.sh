@@ -216,12 +216,13 @@ registry_value() {
 	sw_vers
 	sysctl -n machdep.cpu.brand_string
 	date
+	uptime    # kernel log timestamps count from boot: how long after the last RDNA4FB line this ran
 
 	section "active RDNA4FB boot-args"
 	found=""
 	for a in off cmap lutbypass 8bpc noedid nosleep modedump hwcursor \
 	         curmode curtest dmubping dmubhist dmubver dmubcursor smuping \
-	         ihdump pspdump vbl cursor pm trace compute ih vm vm-diag vm-exec vm-ispte vm-force-fail vmid-test vmshared flip gfx gfxcol gfxclient \
+	         ihdump pspdump vbl cursor pm trace modeset head2 hotplug dptrain compute ih vm vm-diag vm-exec vm-ispte vm-force-fail vmid-test vmshared flip gfx gfxcol gfxclient \
 	         gfxidle sleepabort resume-tests gfxpm gfxcg gfxoff gfxcap hang sleeptest; do
 		value="$(arg_value "$a")"
 		[ -n "$value" ] && found="$found rdna4-$a=$value"
@@ -264,7 +265,7 @@ registry_value() {
 	section "dmesg: display power (sleep/wake; the DPG blank/un-blank of macOS display sleep, DPMS csc 11)"
 	# bd442a0: the blank/un-blank path has never run on the card; these are its lines: "power: HDMI display blanked/unblanked via DPG", "power: display on/off (... sink D0/D3 ...)"
 	# (DP) and the framebuffer's "ndrv: Control csc 11 -> 0x.." (the DPMS request macOS sent). klines falls back to the unified log when the kernel buffer wrapped.
-	klines 'RDNA4FB: (power:|.*ndrv: Control csc 11|.*display (un)?blanked|.*display sleep)' | sed 's/^/  /' || true
+	klines 'RDNA4FB: (power:|.*(ndrv|head2): Control csc 11|.*display (un)?blanked|.*display sleep)' | sed 's/^/  /' || true
 	echo "(no line above = no display power event in the log window; after the optional idle step of START-HERE a blank AND an un-blank are expected)"
 	echo "--- registry copy (survives the kernel log wrapping): RDNA4FB,DisplayPower (last 16 events, oldest first)"
 	DPW_PROP="$(ioreg -l -w0 2>/dev/null | grep '"RDNA4FB,DisplayPower"' | sed -n -E 's/.*"RDNA4FB,DisplayPower" = "([^"]*)".*/\1/p' | head -1)"
@@ -318,6 +319,17 @@ registry_value() {
 	section "dmesg: emulated VBL"
 	dmesg | grep -E 'RDNA4FB: vbl:' || true
 	gated "mode-setting survey" 'RDNA4FB: mode:' modedump
+
+	section "second head and second pipe (rdna4-head2)"
+	klines 'RDNA4FB: (head2|pipe2|hotplug|dptrain):' | grep . || echo "(no head2/pipe2 lines: rdna4-head2=0, rdna4-compute, or a VM test build)"
+	echo '--- registry copy of the second-pipe survey: RDNA4FB,Pipe2 (step, segment:dword, value now, value after, Linux function and register)'
+	P2_PROP="$(ioreg -l -w0 2>/dev/null | grep '"RDNA4FB,Pipe2"' | sed -n -E 's/.*"RDNA4FB,Pipe2" = "(.*)"[^"]*$/\1/p' | head -1)"
+	if [ -n "$P2_PROP" ]; then
+		echo "$P2_PROP" | sed 's/ ## /\
+/g'
+	else
+		echo "(no RDNA4FB,Pipe2 property: rdna4-head2=2 publishes it)"
+	fi
 
 	section "compute bring-up (rdna4-compute=<stage>)"
 	klines 'RDNA4FB: compute:' | grep . || \
@@ -984,6 +996,29 @@ SURVEOF
 
 	section "ioreg: what the OS sees (display identity)"
 	ioreg -lw0 | grep -E 'IODisplayEDID|DisplayProductID|DisplayVendorID' || true
+
+	# Every mode macOS offers per display (what Displays preferences chooses from), current one starred. A second
+	# display with one 60 Hz mode and the boot display's identity is the phantom head of rdna4-head2=1.
+	section "CoreGraphics: displays and their modes"
+	CGMODES='
+from __future__ import print_function
+import Quartz as Q
+err, ids, n = Q.CGGetOnlineDisplayList(16, None, None)
+for d in ids or []:
+    cur = Q.CGDisplayCopyDisplayMode(d)
+    key = lambda m: (Q.CGDisplayModeGetIODisplayModeID(m), Q.CGDisplayModeGetWidth(m), Q.CGDisplayModeGetPixelWidth(m))
+    b = Q.CGDisplayBounds(d)
+    print("display 0x%x vendor %d model %d at %d,%d%s%s" % (d, Q.CGDisplayVendorNumber(d), Q.CGDisplayModelNumber(d),
+          b.origin.x, b.origin.y, " main" if Q.CGDisplayIsMain(d) else "", " mirrored" if Q.CGDisplayIsInMirrorSet(d) else ""))
+    for m in Q.CGDisplayCopyAllDisplayModes(d, {Q.kCGDisplayShowDuplicateLowResolutionModes: True}) or []:
+        print(" %s id %d %dx%d (%dx%d pixels) %.3f Hz ioflags 0x%x%s" % ("*" if cur and key(m) == key(cur) else " ",
+              Q.CGDisplayModeGetIODisplayModeID(m), Q.CGDisplayModeGetWidth(m), Q.CGDisplayModeGetHeight(m),
+              Q.CGDisplayModeGetPixelWidth(m), Q.CGDisplayModeGetPixelHeight(m), Q.CGDisplayModeGetRefreshRate(m),
+              Q.CGDisplayModeGetIOFlags(m), "" if Q.CGDisplayModeIsUsableForDesktopGUI(m) else " not for the desktop"))
+'
+	# /usr/bin/python has the Quartz module up to macOS 12.2; a failure shows as its traceback.
+	CGPY=/usr/bin/python; [ -x "$CGPY" ] || CGPY=python3
+	"$CGPY" -c "$CGMODES" 2>&1 | tail -200 || true
 
 	section "WindowServer attached?"
 	ioreg -l -w0 | grep -c IOFramebufferUserClient | \

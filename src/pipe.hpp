@@ -79,7 +79,7 @@ constexpr uint32_t kDigFeEnCntl      = 0x2095;   // DIG_FE_ENABLE [0]
 constexpr uint32_t kHdmiControl      = 0x209e;
 constexpr uint32_t kHdmiGc           = 0x20a8;   // HDMI_GC_AVMUTE [0]
 constexpr uint32_t kDigBeClkCntl     = 0x20bb;   // DIG_BE_MODE [2:0], DIG_BE_CLK_EN [4]
-constexpr uint32_t kDigBeCntl        = 0x20bc;   // DIG_FE_SOURCE_SELECT [14:8], DIG_HPD_SELECT [30:28]
+constexpr uint32_t kDigBeCntl        = 0x20bc;   // DIG_FE_SOURCE_SELECT [14:8], DIG_HPD_SELECT [30:28] (0 = HPD1)
 constexpr uint32_t kDigBeEnCntl      = 0x20bd;   // DIG_BE_ENABLE [0]
 // DIGn_STREAM_MAPPER_CONTROL (base 2, stride 1, DIG0..6)
 constexpr uint32_t kStreamMapper     = 0x1f0d;   // DIG_STREAM_LINK_TARGET [2:0]
@@ -89,7 +89,7 @@ struct State {
 	uint8_t otg  { kNone };   // lit timing generator
 	uint8_t dig  { kNone };   // DIG front-end with DIG_SOURCE_SELECT == otg
 	uint8_t link { kNone };   // back-end / PHY the front-end is mapped to
-	uint8_t hpd  { 0 };       // DIG_HPD_SELECT of the back-end (1-based, 0 none)
+	uint8_t hpd  { 0 };       // HPD pin of the back-end, 1-based like the VBIOS records (DIG_HPD_SELECT + 1), 0 none
 	uint8_t opp  { kNone };   // OPTC_SEG0_SRC_SEL of the OTG's ODM
 	uint8_t hubp { kNone };   // MPCC whose MPCC_OPP_ID == opp (MPCC n <-> HUBP n)
 	Signal  signal { Signal::None };   // from DIG_BE_MODE (FE mode if BE unreadable)

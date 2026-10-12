@@ -22,6 +22,9 @@
 #include "../src/pipe.hpp"
 #include "../src/ndrv.hpp"
 #include "../src/modeset.hpp"
+#include "../src/pipe2.hpp"
+#include "../src/dptrain.hpp"
+#include "../src/dpphy.hpp"
 #include "../src/amdfw.hpp"
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
@@ -545,6 +548,37 @@ static int testModes() {
 	                  yc.vics[0] == 16 && yc.vicNative[0] && yc.vics[1] == 4 && !yc.vicNative[1] &&
 	                  yc.vics[2] == 31 && yc.vics[3] == 2 && yc.hasHdmiVsdb && yc.maxTmdsKHz == 0 &&
 	                  yc.dtdCount == 1, "synthetic CTA block fields");
+	// HDMI 2.0: without an HDMI Forum block the sink has no SCDC; with one
+	// (version 1, 600 MHz, SCDC_Present) it does, and the mode table's TMDS
+	// limit follows it past the HDMI 1.4 block's.
+	const Edid::Hdmi2Caps none = Edid::hdmi2Caps(syn, sizeof(syn));
+	uint8_t hf[256];
+	memcpy(hf, syn, sizeof(hf));
+	static const uint8_t hfCta[] = {
+		0x02, 0x03, 0x18, 0x71,                               // data blocks up to offset 24
+		0x41, 0x61,                                           // video: VIC 97 (3840x2160@60, 594 MHz)
+		0x67, 0x03, 0x0c, 0x00, 0x10, 0x00, 0x00, 0x3c,       // HDMI 1.4 block, 300 MHz
+		0x67, 0xd8, 0x5d, 0xc4, 0x01, 0x78, 0x80, 0x00,       // HDMI Forum block, 600 MHz, SCDC
+	};
+	memset(hf + 128, 0, 128);
+	memcpy(hf + 128, hfCta, sizeof(hfCta));
+	fixChecksum(hf + 128);
+	hf[99] = 60;                                              // range limits: 600 MHz, not 180
+	fixChecksum(hf);
+	Edid::CtaCaps hc {};
+	const Edid::Hdmi2Caps two = Edid::hdmi2Caps(hf, sizeof(hf));
+	failures += check(!none.scdc && none.maxTmdsKHz == 0 && Edid::parseCtaBlock(hf + 128, hc) &&
+	                  hc.maxTmdsKHz == 300000 && hc.hfMaxTmdsKHz == 600000 && hc.scdcPresent &&
+	                  two.scdc && two.maxTmdsKHz == 600000,
+	                  "HDMI Forum block: scdc %d/%d max %u/%u kHz", none.scdc, two.scdc, none.maxTmdsKHz,
+	                  two.maxTmdsKHz);
+	static Mode hfModes[Modes::MaxModes];
+	const Limits hdmi2 { 0, 0, 600000 };
+	size_t hn = Modes::build(hf, sizeof(hf), hdmi2, hfModes, Modes::MaxModes);
+	bool has594 = false;
+	for (size_t i = 0; i < hn; i++)
+		has594 = has594 || hfModes[i].t.pixelClockKHz == 594000;
+	failures += check(has594, "HDMI Forum block: the 594 MHz mode is not offered (%zu modes)", hn);
 
 	// The 75 Hz DTD is `cvt -r 1920 1080 75`: 1080/3/5/31, i.e. 74.97 Hz.
 	const Edid::DetailedTiming &t75 = yb.dtds[1];
@@ -782,7 +816,7 @@ static int testPipeDiscovery() {
 	dcn.set(2, Reg::kDigFeEnCntl + d, 0x1);
 	dcn.set(2, Reg::kDigFeClkCntl + d, 0x13);              // FE mode HDMI, clk en
 	dcn.set(2, Reg::kStreamMapper + 2, 0x2);               // DIG2 -> link 2
-	dcn.set(2, Reg::kDigBeCntl + d, (1u << (8 + 2)) | (3u << 28));
+	dcn.set(2, Reg::kDigBeCntl + d, (1u << (8 + 2)) | (2u << 28));   // DIG_HPD_SELECT 2 = HPD3
 	dcn.set(2, Reg::kDigBeClkCntl + d, 0x13);              // BE mode HDMI
 	dcn.set(2, Reg::kOptcDataSource + 1 * Reg::kOdmStride, 1u << 16);   // seg0 <- OPP1
 	for (uint32_t m = 0; m < 4; m++)
@@ -969,7 +1003,7 @@ static int testModeSet() {
 	// HUBP0, DIG2 -> link 2 (UNIPHYC), HPD3, VBIOS path 0x330c / 0x2120.
 	ModeSet::Target t {};
 	t.otg = 0; t.dig = 2; t.link = 2; t.hpd = 3; t.opp = 0; t.hubp = 0;
-	t.encoderObjId = 0x2120; t.connectorObjId = 0x330c; t.pllId = 0x14;
+	t.encoderObjId = 0x2120; t.connectorObjId = 0x330c;
 	t.from = t1080; t.to = t720;
 
 	static ModeSet::Plan plan;
@@ -984,7 +1018,7 @@ static int testModeSet() {
 	failures += check(off[0] == 0x3c000180 && off[1] == 0x00030002 && (off[3] & 0xffff) == 0x0003 &&
 	                  ((off[3] >> 16) & 0xff) == 0x0c,
 	                  "modeset: transmitter disable %08x %08x %08x %08x", off[0], off[1], off[2], off[3]);
-	failures += check(pll[0] == 0x10000280 && pll[1] == 742500 && pll[2] == 0x00032014 &&
+	failures += check(pll[0] == 0x10000280 && pll[1] == 742500 && pll[2] == 0x00032016 &&
 	                  (pll[3] & 0xff) == 0,
 	                  "modeset: set pixel clock %08x %08x %08x %08x", pll[0], pll[1], pll[2], pll[3]);
 	failures += check(enc[0] == 0x0c000080 && enc[1] == 0x04030f02 && enc[2] == 7425,
@@ -1040,7 +1074,7 @@ static int testModeSet() {
 	regs.set(2, Pipe::Reg::kDigFeEnCntl + d2, 1);
 	regs.set(2, Pipe::Reg::kDigFeClkCntl + d2, 0x13);
 	regs.set(2, Pipe::Reg::kStreamMapper + 2, 2);
-	regs.set(2, Pipe::Reg::kDigBeCntl + d2, (1u << 10) | (3u << 28));
+	regs.set(2, Pipe::Reg::kDigBeCntl + d2, (1u << 10) | (2u << 28));   // DIG_HPD_SELECT 2 = HPD3
 	regs.set(2, Pipe::Reg::kDigBeClkCntl + d2, 0x13);
 	for (uint32_t m = 0; m < 4; m++)
 		regs.set(3, Pipe::Reg::kMpccOppId + m * Pipe::Reg::kMpccStride, m == 0 ? 0 : 0xf);
@@ -1071,16 +1105,1168 @@ static int testModeSet() {
 
 	const size_t steps = plan.count, cmds = plan.ncmds;
 
-	// Refusals: interlaced targets and clocks beyond single-link TMDS.
+	// Below 340 MHz the scrambler is turned off, and a sink without SCDC gets
+	// no SCDC write.
+	auto scdcStep = [&](const ModeSet::Plan &p, size_t *at) -> const ModeSet::Step * {
+		for (size_t i = 0; i < p.count; i++)
+			if (p.steps[i].op == ModeSet::Op::Scdc) {
+				*at = i;
+				return &p.steps[i];
+			}
+		return nullptr;
+	};
+	size_t at = 0;
+	failures += check((regs.get(2, 0x209e + d2) & 0x6) == 0 && !scdcStep(plan, &at),
+	                  "modeset: 720p without SCDC: HDMI_CONTROL 0x%x, SCDC step %d",
+	                  regs.get(2, 0x209e + d2), scdcStep(plan, &at) != nullptr);
+
+	// HDMI 2.0: 3840x2160@60 (VIC 97, 594 MHz) on a sink with SCDC. The
+	// scrambler and the quarter-rate clock go on, and the sink is told (3)
+	// before the transmitter is enabled; back at 720p it is told 0.
+	static ModeSet::Plan plan2;
+	ModeSet::Target hdmi2 = t;
+	hdmi2.sinkScdc = true;
+	hdmi2.ddcLine = 2;
+	failures += check(Edid::vicTiming(97, hdmi2.to) && hdmi2.to.pixelClockKHz == 594000, "VIC 97 is not 594 MHz");
+	if (!ModeSet::build(hdmi2, plan2, &why)) {
+		failures += check(false, "modeset: 594 MHz plan refused on an SCDC sink: %s", why);
+	} else {
+		PlanRegs r2;
+		r2.run(plan2);
+		const ModeSet::Step *sc = scdcStep(plan2, &at);
+		size_t txOn = 0;
+		for (size_t i = 0; i < plan2.count; i++)
+			if (plan2.steps[i].op == ModeSet::Op::Dmub && plan2.steps[i].arg == 3)
+				txOn = i;
+		failures += check((r2.get(2, 0x209e + d2) & 0x6) == 0x6 && sc && sc->value == 3 && sc->arg == 2 &&
+		                  at < txOn && plan2.cmds[1][1] == 5940000 && plan2.cmds[3][2] == 59400,
+		                  "modeset: 594 MHz: HDMI_CONTROL 0x%x, SCDC %u on DDC%u at step %zu (transmitter on at "
+		                  "%zu), pixel clock %u, symclk %u", r2.get(2, 0x209e + d2), sc ? sc->value : 99,
+		                  sc ? sc->arg : 99, at, txOn, plan2.cmds[1][1], plan2.cmds[3][2]);
+		hdmi2.from = hdmi2.to;
+		hdmi2.to = t720;
+		failures += check(ModeSet::build(hdmi2, plan2, &why) && (sc = scdcStep(plan2, &at)) && sc->value == 0,
+		                  "modeset: back to 720p on an SCDC sink does not clear TMDS_CONFIG");
+	}
+
+	// Refusals: interlaced targets, more than 340 MHz without SCDC, more than
+	// HDMI 2.0 TMDS carries.
 	ModeSet::Target bad = t;
 	bad.to.interlaced = true;
 	failures += check(!ModeSet::build(bad, plan, &why), "modeset: interlaced target accepted");
 	bad = t;
 	bad.to.pixelClockKHz = 594000;
-	failures += check(!ModeSet::build(bad, plan, &why), "modeset: 594 MHz target accepted");
+	failures += check(!ModeSet::build(bad, plan, &why), "modeset: 594 MHz accepted for a sink without SCDC");
+	bad.sinkScdc = true;
+	bad.to.pixelClockKHz = 600001;
+	failures += check(!ModeSet::build(bad, plan, &why), "modeset: 600.001 MHz target accepted");
 
 	printf("\nmodeset: 1080p60 -> 720p60 on OTG0/DIG2/UNIPHYC: %zu steps, %zu DMUB commands, "
 	       "vstartup %u %s\n", steps, cmds, vstartup, failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
+// A DisplayPort mode switch retimes the stream on a link that stays trained.
+// The reference is what Linux's own functions write for the same job
+// (tools/pipegen's "dp" scenario): 3840x2160@60 down to 2560x1440@60 on pipe 0,
+// DIG0. Every bit both write has to end up the same.
+static int testDpRetime() {
+	int failures = 0;
+	static const struct { uint8_t seg; uint32_t dw, mask, value; } linux[] = {
+#include "dp_retime_linux.inc"
+	};
+	Edid::DetailedTiming t4k {}, t1440 {};
+	t4k.pixelClockKHz = 533250;                 // the GOP's 4K raster (CVT reduced blanking)
+	t4k.hActive = 3840; t4k.hBlank = 160; t4k.hSyncOffset = 48; t4k.hSyncWidth = 32;
+	t4k.vActive = 2160; t4k.vBlank = 62; t4k.vSyncOffset = 3; t4k.vSyncWidth = 5;
+	t4k.hSyncPositive = true;
+	t1440.pixelClockKHz = 241500;
+	t1440.hActive = 2560; t1440.hBlank = 160; t1440.hSyncOffset = 48; t1440.hSyncWidth = 32;
+	t1440.vActive = 1440; t1440.vBlank = 41; t1440.vSyncOffset = 3; t1440.vSyncWidth = 5;
+	t1440.hSyncPositive = true;
+
+	// The DTO, from one programmed amdgpu's way for the 4K mode on a 720 MHz
+	// reference: exact. From one that counts in other units: by ratio.
+	ModeSet::DpDto now { 0, 533250000, 720000000 }, dto {};
+	failures += check(ModeSet::scaleDpDto(now, 533250, 241500, dto) && dto.integer == 0 &&
+	                  dto.phase == 241500000 && dto.modulo == 720000000,
+	                  "dp: DTO in Hz: %u + %u / %u", dto.integer, dto.phase, dto.modulo);
+	ModeSet::DpDto ratio { 1, 0x400000, 0x1000000 }, scaled {};     // 1.25 x the reference
+	failures += check(ModeSet::scaleDpDto(ratio, 500000, 300000, scaled) && scaled.integer == 0 &&
+	                  scaled.phase == 0xc00000 && scaled.modulo == 0x1000000,   // 0.75 x
+	                  "dp: DTO by ratio: %u + 0x%x / 0x%x", scaled.integer, scaled.phase, scaled.modulo);
+	failures += check(!ModeSet::scaleDpDto(ModeSet::DpDto { 0, 1, 0 }, 533250, 241500, scaled) &&
+	                  !ModeSet::scaleDpDto(ratio, 500000, 8000000, scaled),
+	                  "dp: a DTO with no modulo or an integer past 15 accepted");
+
+	ModeSet::Target t {};
+	t.otg = 0; t.dig = 0; t.link = 0; t.hpd = 1; t.opp = 0; t.hubp = 0;
+	t.from = t4k; t.to = t1440;
+	t.dp = true;
+	t.dpMaxKHz = 533250;
+	t.dto = dto;
+	t.vidM = static_cast<uint32_t>(0x8000ull * 241500 / 810000);   // four lanes of HBR3: 810 MHz
+	static ModeSet::Plan plan;
+	const char *why = "";
+	if (!ModeSet::build(t, plan, &why))
+		return failures + check(false, "dp: 4K -> 1440p plan refused: %s", why);
+	failures += check(plan.ncmds == 0, "dp: %zu DMUB commands: the link is not to be touched", plan.ncmds);
+
+	// What each side wrote, and with which bits.
+	struct Written { uint8_t seg; uint32_t dw, mask, value; };
+	auto apply = [](std::vector<Written> &regs, uint8_t seg, uint32_t dw, uint32_t mask, uint32_t value) {
+		for (Written &r : regs)
+			if (r.seg == seg && r.dw == dw) {
+				r.value = (r.value & ~mask) | (value & mask);
+				r.mask |= mask;
+				return;
+			}
+		regs.push_back({ seg, dw, mask, value & mask });
+	};
+	std::vector<Written> ours, theirs;
+	for (size_t i = 0; i < plan.count; i++) {
+		const ModeSet::Step &s = plan.steps[i];
+		if (s.op == ModeSet::Op::Write)
+			apply(ours, s.seg, s.dword, 0xffffffffu, s.value);
+		else if (s.op == ModeSet::Op::Update)
+			apply(ours, s.seg, s.dword, s.mask, s.value);
+	}
+	for (const auto &l : linux)
+		apply(theirs, l.seg, l.dw, l.mask, l.value);
+
+	// Where the plan knowingly differs from that run of Linux:
+	auto differs = [](uint8_t seg, uint32_t dw) -> uint32_t {
+		if (seg == 2 && dw >= 0x1b85 && dw <= 0x1b87)
+			return 0xffffffffu;      // VSTARTUP, VUPDATE, VREADY: by rule here, from DML there
+		if (seg == 2 && dw == 0x0530)
+			return 0x00007fffu;      // VTG FP2 follows VSTARTUP
+		if (seg == 2 && (dw == 0x1b30 || dw == 0x1b31))
+			return 0xffffffffu;      // V_TOTAL_MIN/MAX: unused with V_TOTAL_CONTROL 0; the plan keeps them at v total
+		if (seg == 2 && dw >= 0x1854 && dw <= 0x185a)
+			return 0xffffffffu;      // the pattern generator: the plan ends unblanked, Linux's stream part blanked
+		return 0;
+	};
+	size_t compared = 0;
+	for (const Written &o : ours)
+		for (const Written &l : theirs) {
+			if (o.seg != l.seg || o.dw != l.dw)
+				continue;
+			const uint32_t both = o.mask & l.mask & ~differs(o.seg, o.dw);
+			compared += both != 0;
+			failures += check(((o.value ^ l.value) & both) == 0, "dp: %u:0x%04x: plan 0x%08x, Linux 0x%08x "
+			                  "(bits both write: 0x%08x)", o.seg, o.dw, o.value & both, l.value & both, both);
+		}
+	// The registers a retime is about must be among those compared.
+	static const struct { uint8_t seg; uint32_t dw; const char *name; } must[] = {
+		{ 1, 0x0081, "DP_DTO0_PHASE" }, { 1, 0x0082, "DP_DTO0_MODULO" }, { 1, 0x006f, "OTG_PIXEL_RATE_DIV" },
+		{ 2, 0x1b2a, "OTG0 h total" }, { 2, 0x1b2f, "OTG0 v total" }, { 2, 0x1b2b, "OTG0 h blank" },
+		{ 2, 0x1b38, "OTG0 v blank" }, { 2, 0x1b43, "OTG0 control" },
+		{ 2, 0x2162, "MSA 1" }, { 2, 0x2163, "MSA 2" }, { 2, 0x2164, "MSA 3" }, { 2, 0x2165, "MSA 4" },
+		{ 2, 0x2122, "DP_VID_STREAM_CNTL" }, { 2, 0x2123, "DP_STEER_FIFO" }, { 2, 0x2126, "DP_VID_TIMING" },
+		{ 2, 0x2127, "DP_VID_N" }, { 2, 0x2128, "DP_VID_M" }, { 2, 0x209b, "DIG_FIFO_CTRL0" },
+	};
+	for (const auto &m : must) {
+		bool inOurs = false, inTheirs = false;
+		for (const Written &o : ours)
+			inOurs = inOurs || (o.seg == m.seg && o.dw == m.dw);
+		for (const Written &l : theirs)
+			inTheirs = inTheirs || (l.seg == m.seg && l.dw == m.dw);
+		failures += check(inOurs && inTheirs, "dp: %s is written by the plan %d, by Linux %d", m.name, inOurs, inTheirs);
+	}
+	// The link encoder and the PHY side of the DIG stay as they are.
+	for (const Written &o : ours)
+		failures += check(!(o.seg == 2 && o.dw >= 0x20bb && o.dw <= 0x20bd),
+		                  "dp: the plan writes the link encoder (0x%04x)", o.dw);
+
+	// Refusals: more than the link was trained for; no DTO.
+	ModeSet::Target bad = t;
+	bad.to.pixelClockKHz = 533251;
+	failures += check(!ModeSet::build(bad, plan, &why), "dp: a pixel clock above the trained one accepted");
+	bad = t;
+	bad.dto = {};
+	failures += check(!ModeSet::build(bad, plan, &why), "dp: a target without a DTO accepted");
+
+	printf("\ndp: 3840x2160@60 -> 2560x1440@60 on OTG0/DIG0: %zu registers written, %zu also by Linux and "
+	       "equal %s\n", ours.size(), compared, failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
+// The second-pipe plan (pipe2.hpp) lights pipe 1 next to a lit pipe 0. What the
+// generated table may address is checked here against the block layout, not
+// against the register names tools/pipegen/mkinc.py went by: every per-instance
+// block is `stride` dwords per instance from `first`, and a step inside a
+// family has to be in the instance the plan is for. Outside the families only
+// the listed shared registers, and only the listed bits.
+// DisplayPort link training against simulated sinks, held against what Linux
+// does with the same sinks (tools/pipegen's "dplink" scenario): every DPCD
+// transfer with its bytes, every pattern, lane drive, delay and transmitter
+// command, in order.
+struct TrainEvent { char kind; uint32_t a, b; uint8_t data[6]; };
+struct TrainReg { uint8_t seg; uint32_t dword, mask, value; };
+struct TrainRun {
+	char kind; uint8_t swing, pre, link;
+	const TrainEvent *events; size_t count;
+	const TrainReg *regs; size_t nregs;
+};
+#include "dp_train_linux.inc"
+
+// The sink of tools/pipegen/pipegen.c (sink_reset, sink_settle), four HBR3
+// lanes: it reports clock recovery on a lane once a pattern is on and the
+// lane's swing is what it wants, equalisation, symbol lock and alignment once
+// the pattern is TPS2 or later and the pre-emphasis is, and asks for those
+// levels until then. Kinds: a DPCD 1.4 with TPS4, b DPCD 1.2 with TPS3 and a
+// 4 ms reading interval, c DPCD 1.2 with TPS2 only. `fails`: transfers left
+// before the AUX channel stops answering (-1 = never).
+struct TrainRig {
+	uint8_t dpcd[0x800] {};
+	int swing, pre, fails;
+	std::vector<TrainEvent> ev;
+
+	TrainRig(char kind, int wantSwing, int wantPre, int failAfter = -1)
+		: swing(wantSwing), pre(wantPre), fails(failAfter) {
+		dpcd[0x000] = kind == 'a' ? 0x14 : 0x12;
+		dpcd[0x001] = 0x1e;
+		dpcd[0x002] = kind == 'c' ? 0x84 : 0xc4;
+		dpcd[0x003] = kind == 'a' ? 0x81 : 0x01;
+		dpcd[0x00e] = kind == 'b' ? 0x01 : 0x00;
+	}
+	void settle() {
+		const int pattern = dpcd[0x102] & 0x0f, lanes = dpcd[0x101] & 0x1f;
+		if (!pattern)
+			return;
+		bool aligned = lanes > 0;
+		memset(&dpcd[0x202], 0, 6);
+		for (int l = 0; l < lanes; l++) {
+			const int s = dpcd[0x103 + l] & 3, p = (dpcd[0x103 + l] >> 3) & 3;
+			const int cr = pattern && s >= swing, eq = cr && pattern >= 2 && p >= pre;
+			dpcd[0x202 + l / 2] |= (cr | eq << 1 | eq << 2) << (4 * (l & 1));
+			dpcd[0x206 + l / 2] |= (swing | (pattern >= 2 ? pre : 0) << 2) << (4 * (l & 1));
+			aligned = aligned && eq;
+		}
+		dpcd[0x204] = aligned;
+	}
+	void add(char kind, uint32_t a, uint32_t b, const uint8_t *data = nullptr, size_t len = 0) {
+		TrainEvent e { kind, a, b, {} };
+		for (size_t i = 0; i < len && i < sizeof(e.data); i++)
+			e.data[i] = data[i];
+		ev.push_back(e);
+	}
+	bool alive() { return fails < 0 || fails-- > 0; }
+
+	static bool read(void *ctx, uint32_t address, uint8_t *data, size_t len) {
+		auto *r = static_cast<TrainRig *>(ctx);
+		if (!r->alive())
+			return false;
+		r->settle();
+		memcpy(data, &r->dpcd[address], len);
+		r->add('R', address, static_cast<uint32_t>(len), data, len);
+		return true;
+	}
+	static bool write(void *ctx, uint32_t address, const uint8_t *data, size_t len) {
+		auto *r = static_cast<TrainRig *>(ctx);
+		if (!r->alive())
+			return false;
+		r->add('W', address, static_cast<uint32_t>(len), data, len);
+		memcpy(&r->dpcd[address], data, len);
+		if (address <= 0x101 && address + len > 0x100)
+			memset(&r->dpcd[0x202], 0, 6);
+		return true;
+	}
+	static bool phyOn(void *ctx, const DpTrain::Link &l) {
+		static_cast<TrainRig *>(ctx)->add('X', l.lanes, DpTrain::symbolClockKHz(l.rate));
+		return true;
+	}
+	static bool phyOff(void *ctx) { static_cast<TrainRig *>(ctx)->add('O', 0, 0); return true; }
+	static bool pattern(void *ctx, DpTrain::Pattern p) { static_cast<TrainRig *>(ctx)->add('P', p, 0); return true; }
+	static bool drive(void *ctx, uint8_t lane, uint8_t s, uint8_t p) {
+		static_cast<TrainRig *>(ctx)->add('V', lane, s | (p << 3));
+		return true;
+	}
+	static void delayUs(void *ctx, uint32_t us) { static_cast<TrainRig *>(ctx)->add('D', us, 0); }
+	DpTrain::Io io() { return { this, read, write, phyOn, phyOff, pattern, drive, delayUs }; }
+};
+
+static int testDpTrain() {
+	int failures = 0;
+	const DpTrain::Link hbr2x4 { 4, DpTrain::kHbr2 };
+	size_t events = 0, regWrites = 0;
+	for (const TrainRun &run : kTrainRuns) {
+		TrainRig rig(run.kind, run.swing, run.pre);
+		DpTrain::Sink sink {};
+		DpTrain::Report rep {};
+		const bool caps = DpTrain::parseCaps(rig.dpcd, 16, sink);
+		const DpTrain::Result r = DpTrain::bringUp(rig.io(), sink, hbr2x4, &rep);
+		// Past swing 1 the sink of this run asks for more pre-emphasis than its
+		// swing allows, so it never equalises: the one run that fails.
+		const bool trains = run.pre <= 3 - run.swing;
+		failures += check(caps && r == (trains ? DpTrain::Result::Ok : DpTrain::Result::Equalisation) &&
+		                  rep.attempts == (trains ? 1 : DpTrain::kAttempts),
+		                  "dptrain: sink %c wanting swing %u, pre-emphasis %u: %s after %u attempt(s)", run.kind, run.swing,
+		                  run.pre, DpTrain::resultName(r), rep.attempts);
+		size_t at = 0;
+		const size_t n = rig.ev.size() < run.count ? rig.ev.size() : run.count;
+		while (at < n && rig.ev[at].kind == run.events[at].kind && rig.ev[at].a == run.events[at].a &&
+		       rig.ev[at].b == run.events[at].b && memcmp(rig.ev[at].data, run.events[at].data, 6) == 0)
+			at++;
+		const bool same = at == run.count && rig.ev.size() == run.count;
+		const TrainEvent none { '-', 0, 0, {} };
+		const TrainEvent &ours = at < rig.ev.size() ? rig.ev[at] : none, &theirs = at < run.count ? run.events[at] : none;
+		failures += check(same, "dptrain: sink %c %u/%u: event %zu of %zu (Linux has %zu) is %c 0x%x %u [%02x %02x], "
+		                  "Linux's is %c 0x%x %u [%02x %02x]", run.kind, run.swing, run.pre, at, rig.ev.size(), run.count,
+		                  ours.kind, ours.a, ours.b, ours.data[0], ours.data[1], theirs.kind, theirs.a, theirs.b,
+		                  theirs.data[0], theirs.data[1]);
+		if (trains)
+			failures += check(rep.swing == run.swing && rep.preEmphasis == run.pre,
+			                  "dptrain: sink %u/%u: the lanes ended at swing %u, pre-emphasis %u", run.swing, run.pre,
+			                  rep.swing, rep.preEmphasis);
+		events += run.count;
+
+		// The link encoder registers behind the transmitter and pattern
+		// events (DpPhy), against the ones Linux wrote on the way.
+		std::vector<TrainReg> wrote;
+		for (const TrainEvent &e : rig.ev) {
+			ModeSet::Step steps[DpPhy::kMaxSteps];
+			const size_t ns = e.kind == 'X' ? DpPhy::configureSteps(run.link, static_cast<uint8_t>(e.a), steps)
+			                : e.kind == 'P' ? DpPhy::patternSteps(run.link, static_cast<DpTrain::Pattern>(e.a), steps)
+			                : e.kind == 'O' ? DpPhy::offSteps(run.link, steps) : 0;
+			for (size_t i = 0; i < ns; i++)
+				wrote.push_back({ steps[i].seg, steps[i].dword,
+				                 steps[i].op == ModeSet::Op::Write ? 0xffffffffu : steps[i].mask, steps[i].value });
+		}
+		size_t r0 = 0;
+		while (r0 < wrote.size() && r0 < run.nregs && wrote[r0].seg == run.regs[r0].seg &&
+		       wrote[r0].dword == run.regs[r0].dword && wrote[r0].mask == run.regs[r0].mask &&
+		       wrote[r0].value == run.regs[r0].value)
+			r0++;
+		failures += check(r0 == run.nregs && wrote.size() == run.nregs, "dpphy: sink %c %u/%u on link %u: register "
+		                  "write %zu of %zu (Linux has %zu) differs", run.kind, run.swing, run.pre, run.link, r0,
+		                  wrote.size(), run.nregs);
+		regWrites += run.nregs;
+	}
+
+	// The transmitter commands, as transmitter_control_v1_7 fills them: phy,
+	// action, mode (or the drive), lanes; the symbol clock in 10 kHz; the HPD
+	// pin and, where amdgpu gives it, the connector.
+	{
+		Dmub::Cmd on, drive, off;
+		DpPhy::buildEnable(on, 1, 2, hbr2x4);
+		DpPhy::buildDrive(drive, 1, 2, 0x13, hbr2x4, 2, 1);
+		DpPhy::buildDisable(off, 1, 2, 0x13);
+		failures += check(on[0] == 0x3c000180 && on[1] == 0x04000101 && on[2] == 54000 && on[3] == 0x00000002,
+		                  "dpphy: transmitter enable %08x %08x %08x %08x", on[0], on[1], on[2], on[3]);
+		failures += check(drive[0] == 0x3c000180 && drive[1] == 0x040a0b01 && drive[2] == 54000 && drive[3] == 0x00130002,
+		                  "dpphy: lane drive %08x %08x %08x %08x", drive[0], drive[1], drive[2], drive[3]);
+		failures += check(off[0] == 0x3c000180 && off[1] == 0x00000001 && off[2] == 0 && off[3] == 0x00130002,
+		                  "dpphy: transmitter disable %08x %08x %08x %08x", off[0], off[1], off[2], off[3]);
+	}
+
+	// What Linux's runs do not cover. A sink that never recovers the clock:
+	// the swing goes to its maximum and that attempt ends there.
+	{
+		TrainRig rig('a', 4, 0);
+		DpTrain::Sink sink {};
+		DpTrain::parseCaps(rig.dpcd, 16, sink);
+		DpTrain::Report rep {};
+		rig.swing = 3;                         // it asks for the maximum ...
+		const DpTrain::Io io = rig.io();
+		struct Never { static bool read(void *ctx, uint32_t a, uint8_t *d, size_t n) {
+			const bool ok = TrainRig::read(ctx, a, d, n);
+			if (a == 0x202)                    // ... and reports no lock on any lane even there
+				d[0] = d[1] = d[2] = 0;
+			return ok;
+		} };
+		DpTrain::Io never = io;
+		never.read = Never::read;
+		const DpTrain::Result r = DpTrain::bringUp(never, sink, hbr2x4, &rep);
+		size_t rounds = 0, offs = 0;
+		for (const TrainEvent &e : rig.ev) {
+			rounds += e.kind == 'R' && e.a == 0x202;
+			offs += e.kind == 'O';
+		}
+		failures += check(r == DpTrain::Result::ClockRecovery && rep.attempts == DpTrain::kAttempts && rep.swing == 3 &&
+		                  rounds == 2 * DpTrain::kAttempts && offs == DpTrain::kAttempts - 1u,
+		                  "dptrain: no clock recovery: %s, %u attempts, %zu status reads, %zu transmitter-offs",
+		                  DpTrain::resultName(r), rep.attempts, rounds, offs);
+	}
+	// A sink that stops answering: no second attempt.
+	{
+		TrainRig rig('a', 0, 0, 9);
+		DpTrain::Sink sink {};
+		DpTrain::parseCaps(rig.dpcd, 16, sink);
+		DpTrain::Report rep {};
+		const DpTrain::Result r = DpTrain::bringUp(rig.io(), sink, hbr2x4, &rep);
+		failures += check(r == DpTrain::Result::Io && rep.attempts == 1, "dptrain: AUX failure: %s after %u attempt(s)",
+		                  DpTrain::resultName(r), rep.attempts);
+	}
+	// A link the sink does not have, and the capability field of something that is no sink.
+	{
+		TrainRig rig('a', 0, 0);
+		DpTrain::Sink sink {}, bad {};
+		DpTrain::parseCaps(rig.dpcd, 16, sink);
+		sink.maxRate = DpTrain::kHbr;
+		const uint8_t zeros[16] {};
+		failures += check(DpTrain::bringUp(rig.io(), sink, hbr2x4) == DpTrain::Result::BadLink && rig.ev.empty() &&
+		                  DpTrain::bringUp(rig.io(), sink, DpTrain::Link { 3, DpTrain::kHbr }) == DpTrain::Result::BadLink &&
+		                  !DpTrain::parseCaps(zeros, 16, bad) && !DpTrain::parseCaps(rig.dpcd, 3, bad),
+		                  "dptrain: a link beyond the sink, or no sink, was accepted");
+	}
+	// The link for a stream: the smallest that carries it, lanes before rate.
+	// The firmware trains this card's 4K monitor at four HBR2 lanes for
+	// 3840x2160@60 at 10 bpc, which is what this gives.
+	{
+		const DpTrain::Sink sink { 0x14, DpTrain::kHbr3, 4, true, true };
+		DpTrain::Link l {};
+		failures += check(DpTrain::pickLink(sink, 533250, 30, l) && l.lanes == 4 && l.rate == DpTrain::kHbr2,
+		                  "dptrain: link for 4K60 at 10 bpc: %u lanes, rate 0x%02x", l.lanes, l.rate);
+		failures += check(DpTrain::pickLink(sink, 148500, 24, l) && l.lanes == 4 && l.rate == DpTrain::kRbr,
+		                  "dptrain: link for 1080p60 at 8 bpc: %u lanes, rate 0x%02x", l.lanes, l.rate);
+		static const uint8_t up4[3] = { 0x77, 0x77, 0x01 }, lane3[3] = { 0x77, 0x37, 0x01 }, skew[3] = { 0x77, 0x77, 0x80 },
+		                     up2[3] = { 0x77, 0x00, 0x81 };
+		failures += check(DpTrain::linkUp(up4, 4) && !DpTrain::linkUp(lane3, 4) && !DpTrain::linkUp(skew, 4) &&
+		                  DpTrain::linkUp(up2, 2) && !DpTrain::linkUp(up2, 4) && !DpTrain::linkUp(up4, 0),
+		                  "dptrain: link status read wrong");
+		failures += check(DpTrain::pickLink(sink, 25175, 24, l) && l.lanes == 1 && l.rate == DpTrain::kRbr &&
+		                  !DpTrain::pickLink(sink, 1066500, 30, l), "dptrain: smallest and too-large links");
+	}
+
+	printf("\ndptrain: %zu runs, %zu events and %zu register writes as Linux has them %s\n",
+	       sizeof(kTrainRuns) / sizeof(kTrainRuns[0]), events, regWrites, failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
+// One generated table: the one in use (Pipe2::use).
+static int testPipe2Table() {
+	int failures = 0;
+	const Pipe2::Config &c = Pipe2::config();
+	// The plan's stream encoder and link encoder registers (DIG0's, by
+	// instance), its connector's DDC line and its VBIOS encoder object:
+	// UNIPHY, UNIPHY1, UNIPHY2 with two links each.
+	const uint32_t kFeCntl = 0x2093 + c.dig * 0x124u, kFeEn = 0x2095 + c.dig * 0x124u;
+	const uint32_t kHdmiGc = 0x20a8 + c.dig * 0x124u, kVpgData = 0x2069 + c.dig * 0x124u;
+	const uint32_t kBeCntl = 0x20bc + c.link * 0x124u, kBeEn = 0x20bd + c.link * 0x124u;
+	const uint32_t kBeFromFe = 1u << (8 + c.dig), kMapper = 0x1f0du + c.dig;
+	const uint8_t  kDdcLine = static_cast<uint8_t>(c.hpd - 1);
+	static const uint8_t uniphy[3] = { 0x1e, 0x20, 0x21 };
+	const uint16_t kEncoderObj = static_cast<uint16_t>(0x2000 | (((c.link & 1) + 1) << 8) | uniphy[c.link / 2]);
+	failures += check(Pipe2::linkOfEncoder(kEncoderObj) == c.link, "pipe2: encoder object 0x%04x is not link %u",
+	                  kEncoderObj, c.link);
+	enum Who { ThePipe, TheDig, TheLink };
+	struct Family { uint8_t seg; uint32_t first, stride; Who who; const char *name; };
+	static const Family families[] = {
+		{ 2, 0x05e5, 0xdc,  ThePipe, "HUBP" },        { 2, 0x0cc5, 0x16b, ThePipe, "DPP" },
+		{ 2, 0x183c, 0x5a,  ThePipe, "OPP" },         { 2, 0x1aca, 0x10,  ThePipe, "ODM" },
+		{ 2, 0x1b2a, 0x80,  ThePipe, "OTG" },         { 1, 0x0080, 0x04,  ThePipe, "OTG pixel rate" },
+		{ 2, 0x0530, 0x01,  ThePipe, "VTG" },         { 2, 0x2068, 0x124, TheDig,  "DIO" },
+		{ 2, 0x1f0d, 0x01,  TheDig,  "stream mapper" }, { 3, 0x0000, 0x15, ThePipe, "MPCC" },
+		{ 3, 0x007e, 0x5e,  ThePipe, "MPCC OGAM" },   { 3, 0x0453, 0xb0,  ThePipe, "MPCC MCM" },
+		{ 3, 0x02f2, 0x04,  ThePipe, "MPC out mux" }, { 3, 0x030b, 0x0d,  ThePipe, "MPC out CSC" },
+		{ 2, 0x0080, 0x02,  ThePipe, "PG domain" },   { 2, 0x04bb, 0x01,  ThePipe, "DET" },
+		{ 1, 0x0099, 0x01,  ThePipe, "DPPCLK DTO" },  { 1, 0x0040, 0x01,  TheLink, "PHY PLL resync" },
+		{ 3, 0x02d5, 0x02,  ThePipe, "HUBP 3D LUT" },
+	};
+	struct Shared { uint8_t seg; uint32_t dword, mask, waitMask; const char *name; };
+	const Shared shared[] = {
+		{ 1, 0x006f, 1u << (5 * c.pipe), 0, "OTG_PIXEL_RATE_DIV" },
+		{ 1, 0x0064, 0, 0x00080000, "DENTIST_DISPCLK_CNTL" },
+		{ 1, 0x00a8, 1u << (3 * c.pipe), 0, "DPPCLK_CTRL" },
+		{ 2, 0x00a0, 0, 1, "DC_IP_REQUEST_CNTL" },             // only required to be open
+		{ 2, 0x04fe, 0, 0, "DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A" },
+		{ 1, 0x00a0u + c.dig, 0x710, 0, "SYMCLKn_CLOCK_ENABLE, the stream encoder's half" },
+		// A DisplayPort stream's pixel-rate DTO: its integer part, clock source and gates
+		{ 1, 0x006f, c.dp ? 0xfu << (1 + 5 * c.pipe) : 0, 0, "OTG_PIXEL_RATE_DIV, DPDTOn_INT" },
+		{ 1, 0x0068, c.dp ? 0x7u << (3 * c.pipe) : 0, 0, "DTBCLK_P_CNTL" },
+		{ 1, 0x0069, c.dp ? 1u << c.pipe : 0, 0, "DCCG_GATE_DISABLE_CNTL5" },
+		{ 2, 0x005a, c.dp ? (0x3u << (8 + 2 * c.pipe)) | (0x3u << (20 + 2 * c.pipe)) : 0, 0, "DCCG_GATE_DISABLE_CNTL3" },
+		{ 3, 0x030a, 1u << c.pipe, 0, "MPC_OUT_CSC_COEF_FORMAT" },
+	};
+	// The instance of a family a register is in, or -1; -2 if in no family.
+	auto instanceOf = [&](uint8_t seg, uint32_t dw, const Family **fam) -> int {
+		for (const Family &f : families)
+			if (seg == f.seg && dw >= f.first && dw < f.first + 4 * f.stride) {
+				*fam = &f;
+				return static_cast<int>((dw - f.first) / f.stride);
+			}
+		return -2;
+	};
+	auto own = [&](const Family &f) -> int { return f.who == ThePipe ? c.pipe : f.who == TheDig ? c.dig : c.link; };
+
+	Pipe2::Target t {};
+	t.litHubp = 0;
+	t.encoderObjId = kEncoderObj;
+	t.surface = 0x8002100000ull;
+	t.depth = Pipe2::Depth::Plane;
+	t.linkRate = DpTrain::kHbr2;       // DisplayPort: the rate Linux's own run trained at
+	static Pipe2::Plan plan, stream;
+	const char *why = "";
+	if (!Pipe2::build(t, plan, &why))
+		return check(false, "pipe2: plan refused: %s", why);
+
+	size_t requires = 0, writes = 0, outside = 0;
+	bool wrote = false;
+	// Every register step of a plan stays in the pipe's blocks.
+	auto stepsInBlocks = [&](const ModeSet::Step *steps, size_t count) {
+	for (size_t i = 0; i < count; i++) {
+		const ModeSet::Step &s = steps[i];
+		if (s.op == ModeSet::Op::Dmub || s.op == ModeSet::Op::Delay || s.op == ModeSet::Op::Scdc ||
+		    s.op == ModeSet::Op::WaitFrames || s.op == ModeSet::Op::Aux || s.op == ModeSet::Op::Train)
+			continue;
+		if (s.op == ModeSet::Op::Require) {
+			requires++;
+			failures += check(!wrote, "pipe2: step %zu: a requirement after the first write", i);
+		} else if (s.op != ModeSet::Op::WaitValue) {
+			wrote = true;
+			writes++;
+		}
+		const bool reads = s.op == ModeSet::Op::Require || s.op == ModeSet::Op::WaitValue;
+		const Family *fam = nullptr;
+		const int inst = instanceOf(s.seg, s.dword, &fam);
+		if (inst >= 0) {
+			if (inst != own(*fam)) {
+				outside++;
+				failures += check(false, "pipe2: step %zu (%s) is in %s instance %d, the plan's is %d", i,
+				                  s.what, fam->name, inst, own(*fam));
+			}
+		} else {
+			bool known = false;
+			uint32_t allowed = 0;
+			for (const Shared &x : shared)
+				if (x.seg == s.seg && x.dword == s.dword) {
+					known = true;
+					allowed |= reads ? x.waitMask : x.mask;
+				}
+			const uint32_t mask = s.op == ModeSet::Op::Write || s.op == ModeSet::Op::Copy ? 0xffffffffu : s.mask;
+			if (!known || (mask & ~allowed)) {
+				outside++;
+				failures += check(false, "pipe2: step %zu (%s) touches %u:0x%04x mask 0x%08x: not the pipe's "
+				                  "and not an allowed shared bit", i, s.what, s.seg, s.dword, mask);
+			}
+		}
+		if (s.op == ModeSet::Op::Copy) {
+			const Family *src = nullptr;
+			failures += check(instanceOf(s.seg, s.arg, &src) == t.litHubp && src == &families[0] &&
+			                  s.arg + (c.pipe - t.litHubp) * 0xdc == s.dword,
+			                  "pipe2: step %zu copies from 0x%04x, not the lit HUBP's twin of 0x%04x", i,
+			                  s.arg, s.dword);
+		}
+	}
+	};
+	auto inBlocks = [&](const Pipe2::Plan &p) { stepsInBlocks(p.steps, p.count); };
+	inBlocks(plan);
+	const size_t lightWrites = writes;
+	failures += check(requires == 5, "pipe2: %zu requirements, expected 5", requires);
+
+	if (!c.dp) {
+	// A sink with SCDC is told the link is not scrambled (148.5 MHz), before
+	// the transmitter is enabled; one without is left alone (above).
+	Pipe2::Target scdc = t;
+	scdc.sinkScdc = true;
+	scdc.ddcLine = kDdcLine;
+	bool told = false, before = false;
+	if (Pipe2::build(scdc, stream, &why))
+		for (size_t i = 0; i < stream.count; i++) {
+			const ModeSet::Step &s = stream.steps[i];
+			if (s.op == ModeSet::Op::Scdc)
+				told = s.value == 0 && s.arg == kDdcLine && !before;
+			before = before || (s.op == ModeSet::Op::Dmub && s.arg == 2);
+		}
+	failures += check(told && stream.count == plan.count + 1, "pipe2: SCDC step for a sink with SCDC: %d, %zu steps",
+	                  told, stream.count);
+
+	// The three kinds of DMUB command, as amdgpu sends them for OTG1 on PLL 2.
+	failures += check(plan.ncmds == 4, "pipe2: %zu DMUB commands, expected 4", plan.ncmds);
+	if (plan.ncmds == 4) {
+		const Dmub::Cmd &pll = plan.cmds[0], &enc = plan.cmds[1], &on = plan.cmds[2], &enc2 = plan.cmds[3];
+		failures += check(pll[0] == 0x10000280 && pll[1] == 1485000 && pll[2] == (0x00032014u + c.link) &&
+		                  (pll[3] & 0xffff) == c.pipe,
+		                  "pipe2: set pixel clock %08x %08x %08x %08x", pll[0], pll[1], pll[2], pll[3]);
+		failures += check(enc[0] == 0x0c000080 && enc[1] == (0x04030f00u | c.dig) && enc[2] == 14850 &&
+		                  memcmp(enc, enc2, sizeof(Dmub::Cmd)) == 0,
+		                  "pipe2: stream setup %08x %08x %08x", enc[0], enc[1], enc[2]);
+		failures += check(on[0] == 0x3c000180 && on[1] == (0x04030100u | c.link) && on[2] == 14850 && (on[3] & 0xff) == c.hpd,
+		                  "pipe2: transmitter enable %08x %08x %08x %08x", on[0], on[1], on[2], on[3]);
+	}
+	}
+
+	// What the registers hold afterwards: timing of VIC 16, the surface, the
+	// blender feeding OPP1 from DPP1, the OTG enabled and the lock released.
+	PlanRegs regs;
+	auto apply = [&](const Pipe2::Plan &p) {
+		for (size_t i = 0; i < p.count; i++) {
+			const ModeSet::Step &s = p.steps[i];
+			if (s.op == ModeSet::Op::Write)
+				regs.set(s.seg, s.dword, s.value);
+			else if (s.op == ModeSet::Op::Update)
+				regs.set(s.seg, s.dword, (regs.get(s.seg, s.dword) & ~s.mask) | s.value);
+		}
+	};
+	apply(plan);
+	struct { uint8_t seg; uint32_t dw, mask, want; const char *name; } after[] = {
+		{ 2, 0x1baa, 0xffffffff, 2199, "OTG1 h total" },         { 2, 0x1baf, 0xffffffff, 1124, "OTG1 v total" },
+		{ 2, 0x1bab, 0x7fff7fff, 0x00c00840, "OTG1 h blank" },   { 2, 0x1bb8, 0x7fff7fff, 0x00290461, "OTG1 v blank" },
+		{ 2, 0x1c05, 0x3ff, c.vstartup, "OTG1 vstartup" },       { 2, 0x1bc3, 0x1, 0x1, "OTG1 master enable" },
+		{ 2, 0x1c09, 0x1, 0x0, "OTG1 update lock released" },    { 2, 0x1adb, 0xf0000, 0x10000, "ODM1 source OPP1" },
+		{ 2, 0x06e6, 0xffffffff, 0x02100000, "surface low" },    { 2, 0x06e7, 0xffffffff, 0x80, "surface high" },
+		{ 2, 0x06e3, 0xffff, 1919, "pitch" },                    { 2, 0x06c7, 0xffffffff, 0x04380780, "viewport" },
+		// The scaler's output rectangle and the blender's size: 0x0 (a table generated
+		// without Linux's scaler library) lights the plane and shows black, as on the
+		// card on 2026-10-04.
+		{ 2, 0x0e8a, 0xffffffff, 0x04380780, "DSCL1 recout size" }, { 2, 0x0e8b, 0xffffffff, 0x04380780, "DSCL1 MPC size" },
+		{ 3, 0x0015, 0xf, 1, "MPCC1 top = DPP1" },               { 3, 0x0017, 0xf, 1, "MPCC1 OPP id" },
+		{ 3, 0x02f6, 0xf, 1, "OPP1 out mux = MPCC1" },           { 2, 0x18ae, 0x1, 0, "DPG1 off (video)" },
+		{ 2, kFeEn, 0x1, 1, "DIG front-end enabled" },           { 2, kBeEn, 0x1, 1, "DIG back-end enabled" },
+		{ 2, kMapper, 0x7, c.link, "DIG mapped to its link" },   { 2, kFeCntl, 0x7, c.pipe, "DIG sourced by the OTG" },
+		{ 2, 0x04bc, 0x1f, c.detSegments, "DET1 segments" },
+		// HDMI: the PHY's clock / 4. DisplayPort: the pixel-rate DTO, in Hz against the 720 MHz reference
+		// (how the firmware programs the boot display's), with no integer part.
+		{ 1, 0x006f, c.dp ? 0x3c0u : 0x20u, c.dp ? 0 : 0x20u, "OTG1 pixel rate divider" },
+		{ 1, 0x0085, c.dp ? 0xffffffffu : 0, c.dp ? 148500000u : 0, "DP_DTO1 phase" },
+		{ 1, 0x0086, c.dp ? 0xffffffffu : 0, c.dp ? 720000000u : 0, "DP_DTO1 modulo" },
+	};
+	for (const auto &e : after)
+		failures += check((regs.get(e.seg, e.dw) & e.mask) == e.want, "pipe2: %s: %u:0x%04x = 0x%08x, want 0x%08x "
+		                  "under 0x%08x", e.name, e.seg, e.dw, regs.get(e.seg, e.dw), e.want, e.mask);
+
+	// Lit, every register that changes with the mode holds what Linux leaves
+	// in it for the plan's mode (on DisplayPort the MSA is worked out, not copied).
+	{
+		static ModeSet::Step litWant[Pipe2::kMaxModeSteps];
+		const size_t n = Pipe2::modeSteps(c.timing, litWant, Pipe2::kMaxModeSteps, Pipe2::ModeRegs::All);
+		failures += check(n > 0, "pipe2: no mode table row for the plan's mode");
+		for (size_t i = 0; i < n; i++)
+			failures += check((regs.get(litWant[i].seg, litWant[i].dword) & litWant[i].mask) == litWant[i].value,
+			                  "pipe2: lit, %s = 0x%08x, the mode table has 0x%08x", litWant[i].what,
+			                  regs.get(litWant[i].seg, litWant[i].dword), litWant[i].value);
+	}
+
+	// The switch itself is the boot display's mode-set engine pointed at this
+	// pipe, with the registers of the mode table added inside its update lock.
+	// For every mode Linux was asked about: the plan stays in the pipe's
+	// blocks, and afterwards every register that changes with the mode holds
+	// what Linux leaves in it when it lights the pipe in that mode. That also
+	// holds the engine's own timing arithmetic against Linux, mode by mode.
+	static ModeSet::Plan ms;
+	static ModeSet::Step extra[Pipe2::kMaxModeSteps], want[Pipe2::kMaxModeSteps];
+	ModeSet::Target mt {};
+	mt.otg = mt.opp = mt.hubp = c.pipe;
+	mt.dig = c.dig;
+	mt.link = c.link;
+	mt.hpd = c.hpd;
+	mt.encoderObjId = kEncoderObj;
+	mt.connectorObjId = 0x330c;
+	mt.extra = extra;
+	size_t nmodes = 0;
+	const Edid::DetailedTiming *known = Pipe2::knownModes(nmodes);
+	// From `from` (the registers in `r`) to `to`; the number of registers that do not end as Linux has them.
+	auto switchTo = [&](PlanRegs &r, const Edid::DetailedTiming &from, const Edid::DetailedTiming &to) -> size_t {
+		mt.from = from;
+		mt.to = to;
+		if (c.dp) {
+			// As the device does: the DTO the pipe runs on, scaled; the first Mvid of the link.
+			const ModeSet::DpDto now { (r.get(1, 0x006f) >> (1 + 5 * c.pipe)) & 0xf, r.get(1, 0x0081 + 4 * c.pipe),
+			                           r.get(1, 0x0082 + 4 * c.pipe) };
+			mt.dp = true;
+			mt.dpMaxKHz = 600000;
+			mt.vidM = ModeSet::dpVidM(to.pixelClockKHz, DpTrain::symbolClockKHz(DpTrain::kHbr2));
+			if (!ModeSet::scaleDpDto(now, from.pixelClockKHz, to.pixelClockKHz, mt.dto))
+				return check(false, "pipe2: no DP DTO for %u kHz from %u + %u / %u", to.pixelClockKHz, now.integer,
+				             now.phase, now.modulo);
+		}
+		mt.nextra = Pipe2::modeSteps(to, extra, Pipe2::kMaxModeSteps);
+		if (!ModeSet::build(mt, ms, &why))
+			return check(false, "pipe2: mode switch to %ux%u at %u kHz refused: %s", to.hActive, to.vActive,
+			             to.pixelClockKHz, why);
+		stepsInBlocks(ms.steps, ms.count);
+		r.run(ms);
+		size_t wrong = 0;
+		const size_t n = Pipe2::modeSteps(to, want, Pipe2::kMaxModeSteps, Pipe2::ModeRegs::All);
+		// The DisplayPort pixel-rate DTO is held as the clock it makes: Linux programs
+		// the video rates a hair under their nominal clock (25.175 MHz is one) as an
+		// exact 1000/1001 of that, the engine the timing's own clock, within 10 ppm.
+		const uint32_t kPhase = 0x0081 + 4u * c.pipe, kModulo = kPhase + 1;
+		double linuxPhase = r.get(1, kPhase), linuxModulo = r.get(1, kModulo);
+		for (size_t i = 0; i < n; i++) {
+			if (c.dp && want[i].seg == 1 && (want[i].dword == kPhase || want[i].dword == kModulo)) {
+				(want[i].dword == kPhase ? linuxPhase : linuxModulo) = want[i].value;
+				continue;
+			}
+			wrong += check((r.get(want[i].seg, want[i].dword) & want[i].mask) == want[i].value,
+			               "pipe2: after a switch to %ux%u at %u kHz %s = 0x%08x, Linux has 0x%08x under 0x%08x",
+			               to.hActive, to.vActive, to.pixelClockKHz, want[i].what, r.get(want[i].seg, want[i].dword),
+			               want[i].value, want[i].mask);
+		}
+		if (c.dp) {
+			const double ours = static_cast<double>(r.get(1, kPhase)) / r.get(1, kModulo);
+			wrong += check(fabs(ours / (linuxPhase / linuxModulo) - 1) < 1e-5,
+			               "pipe2: after a switch to %u kHz the DP DTO is %u / %u, Linux has %.0f / %.0f",
+			               to.pixelClockKHz, r.get(1, kPhase), r.get(1, kModulo), linuxPhase, linuxModulo);
+		}
+		return wrong;
+	};
+	// The number of registers that do not end as Linux has them, over all modes.
+	auto modeSwitches = [&](const PlanRegs &lit) -> size_t {
+	size_t modeMismatch = 0;
+	const size_t outsideBefore = outside;
+	failures += check(nmodes >= 2 && Edid::sameTiming(known[0], c.timing), "pipe2: the mode table has %zu modes",
+	                  nmodes);
+	PlanRegs chain = lit;                              // one mode after the other: nothing is left over from the last
+	for (size_t i = 0; i < nmodes; i++) {
+		PlanRegs direct = lit;                         // straight from the lit state
+		modeMismatch += switchTo(direct, c.timing, known[i]);
+		modeMismatch += switchTo(chain, i ? known[i - 1] : c.timing, known[i]);
+		failures += check((direct.get(2, kFeEn) & 1) == 1 && (direct.get(2, 0x1bc3) & 1) == 1 &&
+		                  direct.get(2, 0x06e6) == lit.get(2, 0x06e6) && direct.get(2, 0x06e3) == lit.get(2, 0x06e3),
+		                  "pipe2: after a switch to mode %zu the stream is off or the surface moved", i);
+	}
+	modeMismatch += switchTo(chain, known[nmodes - 1], c.timing);       // and back to the lit mode
+	// A timing Linux was not asked about keeps the lit mode's request timing
+	// and gets the engine's rule for the rest.
+	Edid::DetailedTiming other = c.timing;
+	other.hSyncOffset += 8;
+	const size_t nOther = Pipe2::modeSteps(other, extra, Pipe2::kMaxModeSteps);
+	const size_t nKnown = Pipe2::modeSteps(known[1], want, Pipe2::kMaxModeSteps);
+	bool otherIsLit = !Pipe2::modeKnown(other) && nOther > 0 && nOther < nKnown &&
+	                  Pipe2::modeSteps(other, want, Pipe2::kMaxModeSteps, Pipe2::ModeRegs::All) == 0;
+	for (size_t i = 0; i < nOther; i++)
+		otherIsLit = otherIsLit && (lit.get(extra[i].seg, extra[i].dword) & extra[i].mask) == extra[i].value;
+	failures += check(otherIsLit, "pipe2: a mode outside the table: %zu steps (a known one %zu)", nOther, nKnown);
+	failures += check(outside == outsideBefore, "pipe2: a mode switch leaves the pipe's blocks");
+	// DML gives the 144 Hz mode more of the DET buffer than the lit one.
+	failures += check(Pipe2::modeDetSegments(c.timing) == c.detSegments && Pipe2::modeDetSegments(other) == c.detSegments &&
+	                  Pipe2::modeDetSegments(known[1]) == 7, "pipe2: DET segments: lit %u, 1080p144 %u",
+	                  Pipe2::modeDetSegments(c.timing), Pipe2::modeDetSegments(known[1]));
+	// A console the firmware stretches onto a larger timing (seen on the card
+	// 2026-10-06: 1920x1080 on the 4K timing) has the scaler on, working out its
+	// own ratio. A switch leaves the scaler as Linux does for a 1:1 plane.
+	{
+		const uint32_t dscl[3] = { 0x0d08 + c.pipe * 0x16bu, 0x0d0a + c.pipe * 0x16bu, 0x0d19 + c.pipe * 0x16bu };
+		PlanRegs stretched = lit;
+		for (uint32_t r : dscl)
+			stretched.set(2, r, 1);
+		mt.scalerOff = true;
+		modeMismatch += switchTo(stretched, c.timing, known[1]);
+		for (uint32_t r : dscl)
+			modeMismatch += check(stretched.get(2, r) == lit.get(2, r), "pipe2: after a switch from a stretched console "
+			                      "2:0x%04x = 0x%08x, Linux leaves 0x%08x", r, stretched.get(2, r), lit.get(2, r));
+		// Not otherwise: at its native size the firmware runs the scaler 1:1 (DSCL_MODE 1) and
+		// the switch leaves it so, as on every card run before 2026-10-06.
+		PlanRegs native = lit;
+		native.set(2, dscl[0], 1);
+		mt.scalerOff = false;
+		modeMismatch += switchTo(native, c.timing, known[1]);
+		modeMismatch += check(native.get(2, dscl[0]) == 1, "pipe2: a switch changed the scaler mode of a console that "
+		                      "was not stretched: 0x%08x", native.get(2, dscl[0]));
+	}
+	return modeMismatch;
+	};
+
+	// DisplayPort: where Linux trains the link the plan has one step, after
+	// the source's OUI went to the sink, and no VBIOS-style command. Sleep
+	// sends the sink to D3 and turns the transmitter off; wake trains again;
+	// afterwards every register lighting set holds the same.
+	if (c.dp) {
+		static const uint8_t oui[3] = { 0x00, 0x00, 0x1a };
+		auto count = [](const Pipe2::Plan &p, ModeSet::Op op) {
+			size_t n = 0;
+			for (size_t i = 0; i < p.count; i++)
+				n += p.steps[i].op == op;
+			return n;
+		};
+		size_t trainAt = 0, auxAt = 0;
+		for (size_t i = 0; i < plan.count; i++) {
+			if (plan.steps[i].op == ModeSet::Op::Train)
+				trainAt = i;
+			if (plan.steps[i].op == ModeSet::Op::Aux && plan.steps[i].arg == 0)
+				auxAt = i;
+		}
+		failures += check(count(plan, ModeSet::Op::Train) == 1 && plan.ncmds == 0 && plan.naux == 2 && auxAt < trainAt &&
+		                  plan.aux[0].address == 0x300 && plan.aux[0].len == 3 && memcmp(plan.aux[0].data, oui, 3) == 0 &&
+		                  plan.aux[1].address == 0x303 && plan.aux[1].len == 9,
+		                  "pipe2: DisplayPort lighting: %zu training step(s), %zu DMUB commands, %zu AUX writes",
+		                  count(plan, ModeSet::Op::Train), plan.ncmds, plan.naux);
+		const PlanRegs lit = regs;
+		static Pipe2::Plan dpms;
+		Pipe2::Target power {};
+		power.connectorObjId = 0x13;
+		power.linkRate = DpTrain::kHbr2;
+		power.part = Pipe2::Part::Sleep;
+		Dmub::Cmd off;
+		DpPhy::buildDisable(off, c.link, c.hpd, 0x13);
+		const bool slept = Pipe2::build(power, dpms, &why);
+		inBlocks(dpms);
+		apply(dpms);
+		const size_t sleepSteps = dpms.count;
+		failures += check(slept && dpms.naux == 1 && dpms.aux[0].address == 0x600 && dpms.aux[0].len == 1 &&
+		                  dpms.aux[0].data[0] == 0x02 && dpms.ncmds == 1 && memcmp(dpms.cmds[0], off, sizeof(off)) == 0 &&
+		                  count(dpms, ModeSet::Op::Train) == 0 && (regs.get(2, kFeEn) & 1) == 0 &&
+		                  (regs.get(2, 0x1bc3) & 1) == 1 && regs.get(2, 0x06e6) == lit.get(2, 0x06e6),
+		                  "pipe2: DisplayPort sleep: %s, %zu AUX writes, %zu DMUB commands, DIG FE %08x",
+		                  slept ? "built" : why, dpms.naux, dpms.ncmds, regs.get(2, kFeEn));
+		power.part = Pipe2::Part::Wake;
+		const bool woke = Pipe2::build(power, dpms, &why);
+		inBlocks(dpms);
+		apply(dpms);
+		const size_t wakeSteps = dpms.count;
+		failures += check(woke && count(dpms, ModeSet::Op::Train) == 1 && dpms.ncmds == 0 && dpms.naux == 2 &&
+		                  dpms.aux[0].address == 0x300, "pipe2: DisplayPort wake: %s, %zu training step(s), %zu AUX "
+		                  "writes", woke ? "built" : why, count(dpms, ModeSet::Op::Train), dpms.naux);
+		for (const PlanRegs::R &r : lit.regs)
+			failures += check(regs.get(r.seg, r.dw) == r.v, "pipe2: after sleep and wake %u:0x%04x = 0x%08x, lit it "
+			                  "was 0x%08x", r.seg, r.dw, regs.get(r.seg, r.dw), r.v);
+		failures += check(requires == 5, "pipe2: a sleep or wake plan has a requirement");
+
+		// What ties the stream encoder to the trained link (DpPhy::streamSteps,
+		// for a retrain outside these tables): each step is one Linux makes
+		// in the wake part, after the training step.
+		{
+			ModeSet::Step tie[DpPhy::kMaxSteps];
+			const size_t ntie = DpPhy::streamSteps(c.dig, c.link, tie);
+			size_t trained = 0, found = 0;
+			for (size_t i = 0; i < dpms.count; i++)
+				if (dpms.steps[i].op == ModeSet::Op::Train)
+					trained = i;
+			for (size_t k = 0; k < ntie; k++) {
+				bool there = false;
+				for (size_t i = trained; i < dpms.count && !there; i++) {
+					const ModeSet::Step &x = dpms.steps[i];
+					// Linux clears a field and sets a bit of one register in two updates where streamSteps has one.
+					there = x.op == ModeSet::Op::Update && x.seg == tie[k].seg && x.dword == tie[k].dword &&
+					        (x.mask & tie[k].mask) == x.mask && (tie[k].value & x.mask) == x.value;
+				}
+				found += there;
+				failures += check(there, "dpphy: stream step %zu (%s, %u:0x%04x mask 0x%x = 0x%x) is not in Linux's wake",
+				                  k, tie[k].what, tie[k].seg, tie[k].dword, tie[k].mask, tie[k].value);
+			}
+			failures += check(ntie == 8 && found == ntie && trained > 0, "dpphy: %zu of %zu stream steps in Linux's wake",
+			                  found, ntie);
+		}
+
+		// The first Mvid follows the rate the link is trained at: what Linux
+		// writes when its link is at that rate (pipegen with PIPEGEN_DP_LINK).
+		const uint32_t kVidM = 0x2128 + c.dig * 0x124u;
+		auto vidM = [&](const Pipe2::Plan &p) {
+			uint32_t v = 0;
+			for (size_t i = 0; i < p.count; i++)
+				if (p.steps[i].op == ModeSet::Op::Update && p.steps[i].seg == 2 && p.steps[i].dword == kVidM)
+					v = p.steps[i].value;
+			return v;
+		};
+		static const struct { uint8_t rate; uint32_t m; } mvid[] = {
+			{ DpTrain::kRbr, 0x7555 }, { DpTrain::kHbr, 0x4666 }, { DpTrain::kHbr2, 0x2333 }, { DpTrain::kHbr3, 0x1777 } };
+		for (const auto &e : mvid) {
+			Pipe2::Target at = t;
+			at.linkRate = e.rate;
+			failures += check(Pipe2::build(at, stream, &why) && vidM(stream) == e.m,
+			                  "pipe2: first Mvid at rate 0x%02x is 0x%x, Linux writes 0x%x", e.rate, vidM(stream), e.m);
+		}
+		Pipe2::Target norate = t;
+		norate.linkRate = 0;
+		failures += check(!Pipe2::build(norate, stream, &why), "pipe2: a DisplayPort plan without a link rate accepted");
+
+		// Mode switching: the engine's DisplayPort retime (DTO, MSA, Mvid)
+		// pointed at this pipe, held against Linux mode by mode. Then sleep and
+		// wake in a mode the pipe was switched to: the MSA and Mvid wake sends
+		// are that mode's, on the link it was trained at for it.
+		const size_t modeMismatch = modeSwitches(lit);
+		failures += static_cast<int>(modeMismatch);
+		{
+			PlanRegs at = lit;
+			size_t wrong = switchTo(at, c.timing, known[1]);
+			power.now = known[1];
+			power.linkRate = DpTrain::kHbr;
+			bool parts = true;
+			for (Pipe2::Part part : { Pipe2::Part::Sleep, Pipe2::Part::Wake }) {
+				power.part = part;
+				parts = parts && Pipe2::build(power, dpms, &why);
+				for (size_t i = 0; i < dpms.count; i++) {
+					const ModeSet::Step &x = dpms.steps[i];
+					if (x.op == ModeSet::Op::Write)
+						at.set(x.seg, x.dword, x.value);
+					else if (x.op == ModeSet::Op::Update)
+						at.set(x.seg, x.dword, (at.get(x.seg, x.dword) & ~x.mask) | x.value);
+				}
+			}
+			const size_t n = Pipe2::modeSteps(known[1], want, Pipe2::kMaxModeSteps, Pipe2::ModeRegs::All);
+			for (size_t i = 0; i < n; i++)
+				wrong += check((at.get(want[i].seg, want[i].dword) & want[i].mask) == want[i].value,
+				               "pipe2: after sleep and wake at %u kHz %s = 0x%08x, Linux has 0x%08x", known[1].pixelClockKHz,
+				               want[i].what, at.get(want[i].seg, want[i].dword), want[i].value);
+			failures += check(parts && wrong == 0 && vidM(dpms) == ModeSet::dpVidM(known[1].pixelClockKHz, 270000),
+			                  "pipe2: DisplayPort sleep and wake at %u kHz: %s, %zu mode registers not Linux's, Mvid 0x%x",
+			                  known[1].pixelClockKHz, parts ? "built" : why, wrong, vidM(dpms));
+			power.now = {};
+			power.linkRate = DpTrain::kHbr2;
+		}
+
+		// Stream only: stops before the plane, with the link trained.
+		t.depth = Pipe2::Depth::Stream;
+		t.surface = 0;
+		const bool ok = Pipe2::build(t, stream, &why);
+		failures += check(ok && stream.count < plan.count && count(stream, ModeSet::Op::Train) == 1,
+		                  "pipe2: DisplayPort stream-only plan: %s, %zu steps", ok ? "built" : why, stream.count);
+		printf("\npipe2: pipe %u DIG%u link %u HPD%u %ux%u at %u kHz, DisplayPort: %zu steps (%zu register writes, "
+		       "%zu requirements), the link trained in one; sleep %zu steps, wake %zu; %zu modes to switch to, %zu "
+		       "registers not as Linux has them; %zu outside the pipe %s\n",
+		       c.pipe, c.dig, c.link, c.hpd, c.timing.hActive, c.timing.vActive, c.timing.pixelClockKHz, plan.count,
+		       lightWrites, requires, sleepSteps, wakeSteps, nmodes, modeMismatch, outside, failures ? "MISMATCH" : "ok");
+		return failures;
+	}
+
+	// Display sleep, then wake, of the lit pipe: no requirements, nothing
+	// outside the pipe's blocks. Sleep takes the stream encoder away and leaves
+	// the timing generator and the plane running; wake sends the encoder and
+	// transmitter commands of lighting again, and afterwards every register
+	// lighting set holds the same again.
+	const PlanRegs lit = regs;
+	static Pipe2::Plan dpms;
+	Pipe2::Target power {};
+	power.encoderObjId = t.encoderObjId;
+	power.part = Pipe2::Part::Sleep;
+	bool slept = Pipe2::build(power, dpms, &why);
+	failures += check(slept && dpms.ncmds == 1 && memcmp(dpms.cmds[0], plan.cmds[0], sizeof(Dmub::Cmd)) == 0,
+	                  "pipe2: sleep plan: %s, %zu DMUB commands", slept ? "built" : why, dpms.ncmds);
+	inBlocks(dpms);
+	apply(dpms);
+	const size_t sleepSteps = dpms.count;
+	failures += check((regs.get(2, kFeEn) & 1) == 0 && (regs.get(2, kBeCntl) & kBeFromFe) == 0 &&
+	                  (regs.get(2, kHdmiGc) & 1) == 1 && (regs.get(2, 0x1bc3) & 1) == 1 &&
+	                  regs.get(2, 0x06e6) == lit.get(2, 0x06e6),
+	                  "pipe2: asleep: DIG FE %08x, BE %08x, HDMI_GC %08x, OTG1 %08x", regs.get(2, kFeEn),
+	                  regs.get(2, kBeCntl), regs.get(2, kHdmiGc), regs.get(2, 0x1bc3));
+	power.part = Pipe2::Part::Wake;
+	bool woke = Pipe2::build(power, dpms, &why);
+	failures += check(woke && dpms.ncmds == 3 && memcmp(dpms.cmds, plan.cmds + 1, 3 * sizeof(Dmub::Cmd)) == 0,
+	                  "pipe2: wake plan: %s, %zu DMUB commands", woke ? "built" : why, dpms.ncmds);
+	inBlocks(dpms);
+	apply(dpms);
+	const size_t wakeSteps = dpms.count;
+	for (const PlanRegs::R &r : lit.regs)
+		failures += check(regs.get(r.seg, r.dw) == r.v, "pipe2: after sleep and wake %u:0x%04x = 0x%08x, lit it "
+		                  "was 0x%08x", r.seg, r.dw, regs.get(r.seg, r.dw), r.v);
+	failures += check(requires == 5, "pipe2: a sleep or wake plan has a requirement");
+
+	// A mode switch on the lit pipe. The AVI infoframe follows the timing: the
+	// words are what Linux sends (tools/pipegen run for each of these modes),
+	// for the plan's mode in the lighting plan itself.
+	const auto aviWords = [&](const Pipe2::Plan &p, uint32_t *w) {
+		size_t n = 0;
+		for (size_t i = 0; i < p.count; i++)
+			if (p.steps[i].op == ModeSet::Op::Write && p.steps[i].seg == 2 && p.steps[i].dword == kVpgData)
+				w[n++ % 9] = p.steps[i].value;     // the last infoframe of the plan
+		return n;
+	};
+	struct { Edid::DetailedTiming t; uint32_t w[4]; } avi[] = {
+		{ c.timing,                                                           { 0x88281e86, 0x10, 0x466, 0x899 } },
+		{ { 108000, 1600, 200, 24, 80, 900, 100, 1, 3, true, true, false },   { 0x88281ea5, 0x00, 0x3e9, 0x709 } },
+		{ { 74250, 1280, 370, 110, 40, 720, 30, 5, 5, true, true, false },    { 0x88281e33, 0x04, 0x2ef, 0x673 } },
+		{ { 108000, 1280, 408, 48, 112, 1024, 42, 1, 3, true, true, false },  { 0x88081ef3, 0x00, 0x42b, 0x699 } },
+		{ { 148500, 1920, 720, 528, 44, 1080, 45, 4, 5, true, true, false },  { 0x88281ebd, 0x1f, 0x466, 0xa51 } },
+		{ { 333070, 1920, 136, 24, 32, 1080, 45, 3, 5, true, false, false },  { 0x88281e26, 0x00, 0x466, 0x809 } },
+		{ { 25175, 640, 160, 16, 96, 480, 45, 10, 2, false, false, false },   { 0x88181e7c, 0x01, 0x20e, 0x321 } },
+	};
+	uint32_t w[9] {};
+	failures += check(aviWords(plan, w) == 18 && w[0] == 0x000d0282 && memcmp(w + 1, avi[0].w, sizeof(avi[0].w)) == 0,
+	                  "pipe2: the lighting plan's AVI infoframe is %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3], w[4]);
+	for (const auto &a : avi) {
+		power.part = Pipe2::Part::Avi;
+		power.now = a.t;
+		const bool built = Pipe2::build(power, dpms, &why);
+		const size_t before = outside;
+		inBlocks(dpms);
+		failures += check(built && dpms.count == 13 && dpms.ncmds == 0 && outside == before && aviWords(dpms, w) == 9 &&
+		                  w[0] == 0x000d0282 && memcmp(w + 1, a.w, sizeof(a.w)) == 0 && w[5] == 0,
+		                  "pipe2: AVI infoframe for %ux%u at %u kHz: %08x %08x %08x %08x, Linux sends %08x %08x %08x %08x",
+		                  a.t.hActive, a.t.vActive, a.t.pixelClockKHz, w[1], w[2], w[3], w[4], a.w[0], a.w[1], a.w[2], a.w[3]);
+	}
+	// Sleep and wake after a switch carry the running pixel clock, not the plan's.
+	power.now = avi[1].t;
+	power.part = Pipe2::Part::Sleep;
+	failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 1 && dpms.cmds[0][1] == 1080000,
+	                  "pipe2: sleep at 108 MHz sets the pixel clock to %u x 100 Hz", dpms.cmds[0][1]);
+	power.part = Pipe2::Part::Wake;
+	failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 3 && dpms.cmds[0][2] == 10800 &&
+	                  dpms.cmds[1][2] == 10800, "pipe2: wake at 108 MHz: encoder %u, transmitter %u x 10 kHz",
+	                  dpms.cmds[0][2], dpms.cmds[1][2]);
+	const size_t modeMismatch = modeSwitches(lit);
+	failures += static_cast<int>(modeMismatch);
+
+	// The boot display's own sleep (ModeSet::buildSleep) is that sleep part
+	// shortened: on this pipe it sends the same SET_PIXEL_CLOCK and leaves every
+	// register it touches as Linux's does, and the mode set to the running
+	// timing brings the stream back.
+	{
+		static ModeSet::Plan sl;
+		static Pipe2::Plan linuxSleep;
+		ModeSet::Target st = mt;
+		st.extra = nullptr;
+		st.nextra = 0;
+		st.from = st.to = c.timing;
+		power.part = Pipe2::Part::Sleep;
+		power.now = c.timing;
+		PlanRegs ours = lit, theirs = lit;
+		const size_t before = outside;
+		const bool ok = ModeSet::buildSleep(st, sl, &why) && Pipe2::build(power, linuxSleep, &why);
+		stepsInBlocks(sl.steps, sl.count);
+		ours.run(sl);
+		for (size_t i = 0; i < linuxSleep.count; i++) {
+			const ModeSet::Step &x = linuxSleep.steps[i];
+			if (x.op == ModeSet::Op::Write)
+				theirs.set(x.seg, x.dword, x.value);
+			else if (x.op == ModeSet::Op::Update)
+				theirs.set(x.seg, x.dword, (theirs.get(x.seg, x.dword) & ~x.mask) | x.value);
+		}
+		size_t differ = 0;
+		for (size_t i = 0; ok && i < sl.count; i++)
+			if (sl.steps[i].op == ModeSet::Op::Write || sl.steps[i].op == ModeSet::Op::Update)
+				differ += ours.get(sl.steps[i].seg, sl.steps[i].dword) != theirs.get(sl.steps[i].seg, sl.steps[i].dword);
+		failures += check(ok && sl.ncmds == 1 && linuxSleep.ncmds == 1 &&
+		                  memcmp(sl.cmds[0], linuxSleep.cmds[0], sizeof(Dmub::Cmd)) == 0 && differ == 0 &&
+		                  outside == before && (ours.get(2, kFeEn) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
+		                  "modeset: HDMI sleep: %s, %zu registers not as Linux's sleep leaves them", ok ? "built" : why,
+		                  differ);
+		const bool back = ModeSet::build(st, ms, &why);
+		ours.run(ms);
+		failures += check(back && (ours.get(2, kFeEn) & 1) == 1 && (ours.get(2, kBeCntl) & kBeFromFe) == kBeFromFe &&
+		                  (ours.get(2, kHdmiGc) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
+		                  "modeset: HDMI wake by mode set: FE %08x BE %08x GC %08x", ours.get(2, kFeEn),
+		                  ours.get(2, kBeCntl), ours.get(2, kHdmiGc));
+		Edid::DetailedTiming none = c.timing;
+		none.pixelClockKHz = 0;
+		st.to = none;
+		failures += check(!ModeSet::buildSleep(st, sl, &why), "modeset: HDMI sleep without a pixel clock accepted");
+	}
+
+	// Stream only: stops before the plane, shows the pattern colour, and never
+	// reaches the HUBP.
+	t.depth = Pipe2::Depth::Stream;
+	t.surface = 0;
+	bool ok = Pipe2::build(t, stream, &why);
+	failures += check(ok && stream.count < plan.count && stream.ncmds == 4, "pipe2: stream-only plan: %s, %zu steps",
+	                  ok ? "built" : why, stream.count);
+	bool hubp = false, colour = false;
+	for (size_t i = 0; ok && i < stream.count; i++) {
+		const ModeSet::Step &s = stream.steps[i];
+		const Family *fam = nullptr;
+		if (s.op != ModeSet::Op::Dmub && s.op != ModeSet::Op::Delay && instanceOf(s.seg, s.dword, &fam) >= 0 &&
+		    fam == &families[0])
+			hubp = true;
+		if (s.op == ModeSet::Op::Write && s.dword == 0x18b2)      // DPG1_DPG_COLOUR_G_Y
+			colour = s.value == ((static_cast<uint32_t>(Pipe2::kPatternColour[1]) << 16) | Pipe2::kPatternColour[1]);
+	}
+	failures += check(!hubp && colour, "pipe2: stream-only plan: HUBP touched %d, pattern colour %d", hubp, colour);
+
+	// Refusals: the lit pipe on the plan's HUBP, no surface for a plane.
+	Pipe2::Target bad = t;
+	bad.litHubp = c.pipe;
+	failures += check(!Pipe2::build(bad, stream, &why), "pipe2: lit pipe on the plan's HUBP accepted");
+	bad = t;
+	bad.depth = Pipe2::Depth::Plane;
+	failures += check(!Pipe2::build(bad, stream, &why), "pipe2: plane without a surface accepted");
+
+	printf("\npipe2: pipe %u DIG%u link %u HPD%u %ux%u at %u kHz: %zu steps (%zu register writes, %zu "
+	       "requirements), %zu DMUB commands; sleep %zu steps, wake %zu; %zu modes to switch to, %zu registers "
+	       "not as Linux has them; %zu outside the pipe %s\n", c.pipe, c.dig, c.link, c.hpd, c.timing.hActive,
+	       c.timing.vActive, c.timing.pixelClockKHz, plan.count, lightWrites, requires, plan.ncmds, sleepSteps,
+	       wakeSteps, nmodes, modeMismatch, outside, failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
+// The second display moved to another connector while its pipe runs (hot-plug:
+// unplugged from one HDMI port, plugged into the other). The pipe was lit by
+// table `from`; the old link went down with its sleep part. Then, with table
+// `to` in use: the mode-set engine to the running timing on the new
+// connector's encoder and link (the pipe's clock from that PHY's PLL), and
+// that table's sleep, wake and infoframe parts. Afterwards every register
+// that lighting on `to` sets holds what lighting there would have left.
+static int testPipe2Move(uint8_t from, uint8_t to) {
+	int failures = 0;
+	static const uint8_t uniphy[3] = { 0x1e, 0x20, 0x21 };
+	auto encoderObj = [](const Pipe2::Config &c) {
+		return static_cast<uint16_t>(0x2000 | (((c.link & 1) + 1) << 8) | uniphy[c.link / 2]);
+	};
+	auto apply = [](PlanRegs &regs, const Pipe2::Plan &p) {
+		for (size_t i = 0; i < p.count; i++) {
+			const ModeSet::Step &s = p.steps[i];
+			if (s.op == ModeSet::Op::Write)
+				regs.set(s.seg, s.dword, s.value);
+			else if (s.op == ModeSet::Op::Update)
+				regs.set(s.seg, s.dword, (regs.get(s.seg, s.dword) & ~s.mask) | s.value);
+		}
+	};
+	static Pipe2::Plan plan, lightTo;
+	static ModeSet::Plan ms;
+	static ModeSet::Step extra[Pipe2::kMaxModeSteps];
+	const char *why = "";
+	auto target = [&](Pipe2::Part part) {
+		Pipe2::Target t {};
+		t.litHubp = 0;
+		t.encoderObjId = encoderObj(Pipe2::config());
+		t.surface = 0x8002100000ull;
+		t.depth = Pipe2::Depth::Plane;
+		t.part = part;
+		return t;
+	};
+	PlanRegs moved, lit;
+	bool ok = Pipe2::use(from) && Pipe2::build(target(Pipe2::Part::Light), plan, &why);
+	apply(moved, plan);
+	ok = ok && Pipe2::build(target(Pipe2::Part::Sleep), plan, &why);
+	apply(moved, plan);
+
+	ok = ok && Pipe2::use(to);
+	const Pipe2::Config &c = Pipe2::config();
+	ModeSet::Target mt {};
+	mt.otg = mt.opp = mt.hubp = c.pipe;
+	mt.dig = c.dig;
+	mt.link = c.link;
+	mt.hpd = c.hpd;
+	mt.encoderObjId = encoderObj(c);
+	mt.connectorObjId = 0x330c;
+	mt.from = mt.to = c.timing;
+	mt.extra = extra;
+	mt.nextra = Pipe2::modeSteps(c.timing, extra, Pipe2::kMaxModeSteps);
+	ok = ok && ModeSet::build(mt, ms, &why);
+	moved.run(ms);
+	for (Pipe2::Part part : { Pipe2::Part::Sleep, Pipe2::Part::Wake, Pipe2::Part::Avi }) {
+		ok = ok && Pipe2::build(target(part), plan, &why);
+		apply(moved, plan);
+	}
+	ok = ok && Pipe2::build(target(Pipe2::Part::Light), lightTo, &why);
+	apply(lit, lightTo);
+	failures += check(ok, "pipe2: move HPD%u -> HPD%u: a plan was refused: %s", from, to, why);
+
+	size_t differ = 0;
+	for (const PlanRegs::R &r : lit.regs) {
+		// OTG_V_TOTAL_MIN and _MAX: the engine sets them to the frame length on every
+		// mode switch, lighting leaves 0; without variable refresh they are not used.
+		const bool vTotalRange = r.seg == 2 && (r.dw == 0x1b30 + c.pipe * 0x80u || r.dw == 0x1b31 + c.pipe * 0x80u);
+		if (moved.get(r.seg, r.dw) == r.v || vTotalRange)
+			continue;
+		const char *what = "?";
+		for (size_t i = 0; i < lightTo.count; i++)
+			if (lightTo.steps[i].seg == r.seg && lightTo.steps[i].dword == r.dw)
+				what = lightTo.steps[i].what;
+		differ++;
+		failures += check(false, "pipe2: moved HPD%u -> HPD%u: %u:0x%04x = 0x%08x, lit there it is 0x%08x (%s)", from, to,
+		                  r.seg, r.dw, moved.get(r.seg, r.dw), r.v, what);
+	}
+	printf("pipe2: moved from HPD%u to HPD%u: %zu of %zu registers differ from lighting there %s\n", from, to, differ,
+	       lit.regs.size(), failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
+// Every table, in turn the one in use; the first is in use again afterwards.
+static int testPipe2() {
+	int failures = 0;
+	const uint8_t first = Pipe2::config().hpd;
+	failures += check(Pipe2::configCount() == 4 && !Pipe2::use(5) && Pipe2::config().hpd == first,
+	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
+	for (size_t i = 0; i < Pipe2::configCount(); i++) {
+		const uint8_t hpd = Pipe2::configAt(i).hpd;
+		failures += check(Pipe2::use(hpd) && Pipe2::config().hpd == hpd, "pipe2: no table for HPD%u", hpd);
+		failures += testPipe2Table();
+	}
+	failures += testPipe2Move(3, 4);
+	failures += testPipe2Move(4, 3);
+	Pipe2::use(first);
 	return failures;
 }
 
@@ -1265,6 +2451,19 @@ static int testNdrv() {
 	failures += check(tr.status(Ndrv::cscGetConnection, &ci, ret) && ret == Ndrv::kSuccess &&
 	                  (ci.csConnectFlags & ddc) == ddc, "ndrv: connection flags 0x%x",
 	                  ci.csConnectFlags);
+	// Nothing on the connector: the connection is inactive and has no DDC
+	// block, which is what takes IONDRVFramebuffer offline; and back.
+	Ndrv::VDDDCBlockRec gone {};
+	gone.ddcBlockNumber = 1;
+	tr.setConnected(false);
+	failures += check(tr.status(Ndrv::cscGetConnection, &ci, ret) && ret == Ndrv::kSuccess &&
+	                  (ci.csConnectFlags & (Ndrv::kConnectionInactive | Ndrv::kHasDDCConnection)) ==
+	                  Ndrv::kConnectionInactive && !tr.status(Ndrv::cscGetDDCBlock, &gone, ret),
+	                  "ndrv: disconnected: connection flags 0x%x", ci.csConnectFlags);
+	tr.setConnected(true);
+	failures += check(tr.status(Ndrv::cscGetConnection, &ci, ret) && (ci.csConnectFlags & ddc) == ddc &&
+	                  !(ci.csConnectFlags & Ndrv::kConnectionInactive), "ndrv: reconnected: flags 0x%x",
+	                  ci.csConnectFlags);
 	// The Lenovo base block announces a CTA extension the fixture (like the
 	// VM build's fake EDID) does not carry: the count is trimmed to what is
 	// cached, with a fixed checksum, and the rest is served unchanged.
@@ -1343,6 +2542,37 @@ static int testNdrv() {
 	                  !none.control(Ndrv::cscSwitchMode, &sw, ret) &&
 	                  none.status(Ndrv::cscGetDDCBlock, &ddcRec, ret),
 	                  "ndrv: empty mode table not passed through");
+
+	// A head with no IOBootNDRV behind it: the fallback replies and where its
+	// surface goes.
+	failures += check(Ndrv::bootReply(false, Ndrv::cscSetEntries) == Ndrv::kSuccess &&
+	                  Ndrv::bootReply(false, Ndrv::cscSetGamma) == Ndrv::kSuccess &&
+	                  Ndrv::bootReply(true, Ndrv::cscSetGamma) == Ndrv::kUnsupported &&
+	                  Ndrv::bootReply(false, Ndrv::cscSetSync) == Ndrv::kUnsupported,
+	                  "ndrv: boot fallback replies");
+	const uint64_t kBar = 0x840000000ull, kMiB = 1ull << 20;
+	const uint64_t k4k = 3840ull * 2160 * 4, k1080 = 1920ull * 1080 * 4, k720 = 1280ull * 720 * 4;
+	Ndrv::Surface spare {};
+	// A 4K console ends inside MiB 31; one clear MiB after it puts the surface at MiB 33.
+	failures += check(Ndrv::spareSurface(kBar, k4k, kBar, 256 * kMiB, 1920, 1080, spare) &&
+	                  spare.physBase == kBar + 33 * kMiB && spare.rowBytes == 7680 &&
+	                  spare.width == 1920 && spare.height == 1080,
+	                  "ndrv: spare surface behind a 4K console at 0x%llx",
+	                  static_cast<unsigned long long>(spare.physBase));
+	// A 16 MiB range (the VM): 1080p console, surface at MiB 9; 1080p does not fit, 720p does.
+	failures += check(!Ndrv::spareSurface(kBar, k1080, kBar, 16 * kMiB, 1920, 1080, spare) &&
+	                  Ndrv::spareSurface(kBar, k1080, kBar, 16 * kMiB, 1280, 720, spare) &&
+	                  spare.physBase == kBar + 9 * kMiB,
+	                  "ndrv: spare surface in a 16 MiB range");
+	// The last byte counts (the surface plus the 128 bytes getApertureRange adds).
+	failures += check(Ndrv::spareSurface(kBar, k1080, kBar, 9 * kMiB + k720 + 128, 1280, 720, spare) &&
+	                  !Ndrv::spareSurface(kBar, k1080, kBar, 9 * kMiB + k720 + 127, 1280, 720, spare),
+	                  "ndrv: spare surface exact fit");
+	// A console outside the range, or larger than it, gives no surface.
+	failures += check(!Ndrv::spareSurface(kBar - kMiB, k1080, kBar, 256 * kMiB, 1280, 720, spare) &&
+	                  !Ndrv::spareSurface(kBar + 250 * kMiB, k1080, kBar, 256 * kMiB, 1280, 720, spare) &&
+	                  !Ndrv::spareSurface(kBar, k1080, kBar, 256 * kMiB, 0, 720, spare),
+	                  "ndrv: spare surface refuses a console outside the range");
 
 	printf("\nndrv: %zu modes (boot = 100 = %ux%u, other e.g. %d = %ux%u), EDID/DPMS %s\n", n,
 	       table[bootIdx].t.hActive, table[bootIdx].t.vActive, otherId, other->t.hActive,
@@ -3275,6 +4505,9 @@ int main(int argc, char **argv) {
 	failures += testDmubPayloads();
 	failures += testNdrv();
 	failures += testModeSet();
+	failures += testDpRetime();
+	failures += testPipe2();
+	failures += testDpTrain();
 	failures += testPsp();
 	failures += testGfxImages();
 	failures += testSdmaPackets();

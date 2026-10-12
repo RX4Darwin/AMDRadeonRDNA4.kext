@@ -8,6 +8,7 @@
 //
 
 #include "device.hpp"
+#include "dpphy.hpp"
 #include "edid.hpp"
 #include "dmub.hpp"
 #include <IOKit/IOLib.h>
@@ -379,13 +380,16 @@ void RDNA4Device::dumpDCN() {
 	// MSA reads consistent (RGB 10bpc, MISC0=0x40 in COLORIMETRY[31:24]).
 	// Remaining GPU-side suspect: secondary data packets (VSC/GSP) that DP1.3+
 	// sinks may honor over the MSA. Dump the SDP enables and stream control.
-	FBLOG("dcn:   DP0_DP_MSA_MISC = 0x%08x (MISC1..4)", regReadDmu(2, 0x2124));
-	FBLOG("dcn:   DP0_DP_VID_STREAM_CNTL = 0x%08x", regReadDmu(2, 0x2122));
-	FBLOG("dcn:   DP0_DP_SEC_CNTL  = 0x%08x (GSP/VSC/ASP enables)", regReadDmu(2, 0x2141));
-	FBLOG("dcn:   DP0_DP_SEC_CNTL1 = 0x%08x", regReadDmu(2, 0x2142));
-	FBLOG("dcn:   DP0_DP_SEC_CNTL2 = 0x%08x", regReadDmu(2, 0x2169));
-	FBLOG("dcn:   DP0_DP_SEC_CNTL7 = 0x%08x", regReadDmu(2, 0x216e));
-	FBLOG("dcn:   DP0_DP_MSA_VBID_MISC = 0x%08x", regReadDmu(2, 0x2170));
+	// Of the lit pipe's stream encoder (DP0 if no pipe was found).
+	const uint32_t dig = digOff();
+	const unsigned enc = dig / Pipe::Reg::kDigStride;
+	FBLOG("dcn:   DP%u_DP_MSA_MISC = 0x%08x (MISC1..4)", enc, regReadDmu(2, 0x2124 + dig));
+	FBLOG("dcn:   DP%u_DP_VID_STREAM_CNTL = 0x%08x", enc, regReadDmu(2, 0x2122 + dig));
+	FBLOG("dcn:   DP%u_DP_SEC_CNTL  = 0x%08x (GSP/VSC/ASP enables)", enc, regReadDmu(2, 0x2141 + dig));
+	FBLOG("dcn:   DP%u_DP_SEC_CNTL1 = 0x%08x", enc, regReadDmu(2, 0x2142 + dig));
+	FBLOG("dcn:   DP%u_DP_SEC_CNTL2 = 0x%08x", enc, regReadDmu(2, 0x2169 + dig));
+	FBLOG("dcn:   DP%u_DP_SEC_CNTL7 = 0x%08x", enc, regReadDmu(2, 0x216e + dig));
+	FBLOG("dcn:   DP%u_DP_MSA_VBID_MISC = 0x%08x", enc, regReadDmu(2, 0x2170 + dig));
 
 	// MPC MCM blocks (shaper -> 3DLUT -> 1DLUT), the post-CSC colour stages
 	// not covered by earlier dumps. An enabled 3DLUT with unloaded RAM would
@@ -459,6 +463,7 @@ constexpr uint8_t kActI2CWriteMot = 0x40;
 constexpr uint8_t kActI2CReadMot  = 0x50;
 constexpr uint8_t kActI2CRead     = 0x10;
 constexpr uint8_t kActDpWrite     = 0x80;  // native AUX (DPCD) write
+constexpr uint8_t kActDpRead      = 0x90;  // native AUX (DPCD) read
 
 // AUX_REG_RW_CNTL_STATUS grant codes.
 constexpr uint32_t kSwCanAccess   = 1;
@@ -468,9 +473,13 @@ constexpr uint32_t kDmcuCanAccess = 2;
 constexpr int kReplyAck      = 0x0;  // AUX ACK + I2C ACK
 constexpr int kReplyAuxDefer = 0x2;
 constexpr int kReplyI2CDefer = 0x8;
+constexpr int kAuxNoReply    = -2;   // the transaction ran and the sink did not answer
 
 constexpr uint8_t kDdcSlave  = 0x50; // VESA DDC/EDID I2C address
 constexpr uint8_t kAuxRetry  = 7;    // per-transaction defer retries
+// A DPCD transfer waits out a deferring sink for about 50 ms in all, amdgpu's
+// AUX_MAX_DEFER_TIMEOUT_MS: seven tries 500 us apart, the rest 1 ms apart.
+constexpr uint8_t kDpcdDeferTries = 54;
 } // namespace
 
 uint32_t RDNA4Device::auxDword(uint8_t inst, uint32_t reg) const {
@@ -482,6 +491,8 @@ int RDNA4Device::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
                                uint8_t *reply, uint8_t replyCap,
                                uint8_t *replyBytes) {
 	if (replyBytes) *replyBytes = 0;
+	auxWhy = "no register access";
+	auxSts = 0;
 	if (!ipDiscovery.isValid() || !rmmio)
 		return -1;
 
@@ -502,6 +513,8 @@ int RDNA4Device::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
 	uint32_t arb = regReadDmu(2, rArb);
 	if (arb == 0xFFFFFFFF)
 		return -1;
+	auxSts = arb;
+	auxWhy = "the firmware holds the AUX engine";
 	if (((arb & kAuxRwStatMask) >> kAuxRwStatShift) == kDmcuCanAccess)
 		return -1;  // the firmware microcontroller owns this engine
 	uint32_t ctl = regReadDmu(2, rCtl);
@@ -509,7 +522,9 @@ int RDNA4Device::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
 		regWriteDmu(2, rCtl, ctl | kAuxEn);
 	regWriteDmu(2, rArb, regReadDmu(2, rArb) | kAuxUseReq);
 	arb = regReadDmu(2, rArb);
+	auxSts = arb;
 	if (((arb & kAuxRwStatMask) >> kAuxRwStatShift) != kSwCanAccess) {
+		auxWhy = "the AUX engine was not granted";
 		release();
 		return -1;
 	}
@@ -560,13 +575,15 @@ int RDNA4Device::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
 		if (sts & kAuxSwDone) { done = true; break; }
 		IODelay(10);
 	}
+	auxSts = sts;
 	if (!done || (sts & kAuxHpdDiscon) ||
 	    (sts & kAuxRxTimeout) || (sts & kAuxRxTimeoutState)) {
+		auxWhy = !done ? "the engine did not finish" : (sts & kAuxHpdDiscon) ? "HPD low" : "no reply (timeout)";
 		release();
-		return -1;
+		return kAuxNoReply;
 	}
-
 	uint32_t nbytes = (sts & kAuxReplyCountMask) >> kAuxReplyCountShift;
+	auxWhy = nbytes ? "" : "empty reply";
 
 	// --- read the reply (read_channel_reply) ---
 	int replyCode = -1;
@@ -623,6 +640,64 @@ bool RDNA4Device::readEDID(uint8_t inst, uint8_t *edid, size_t count,
 		}
 		if (!got || rb == 0) return false;
 		pos += rb;  // advance by what the sink actually returned
+	}
+	return true;
+}
+
+// Native AUX: up to 16 bytes a transfer, a deferred one asked again.
+bool RDNA4Device::dpcdRead(uint8_t aux, uint32_t address, uint8_t *data, size_t len) {
+	for (size_t pos = 0; pos < len; ) {
+		const uint8_t chunk = len - pos > 16 ? 16 : static_cast<uint8_t>(len - pos);
+		uint8_t got = 0;
+		int rc = kReplyAuxDefer;
+		uint8_t timeouts = 0;
+		for (uint8_t t = 0; t < kDpcdDeferTries && rc == kReplyAuxDefer; t++) {
+			rc = auxTransaction(aux, kActDpRead, address + static_cast<uint32_t>(pos), nullptr, chunk,
+			                    data + pos, chunk, &got);
+			if (rc == kAuxNoReply && timeouts++ < 3)
+				rc = kReplyAuxDefer;                // dce_aux_transfer_with_retries: AUX_MAX_TIMEOUT_RETRIES
+			// The Samsung answers a native transfer with the I2C defer code for a
+			// while after its link dropped (card, 2026-10-06); amdgpu waits out both.
+			if (rc == kReplyI2CDefer)
+				rc = kReplyAuxDefer;
+			if (rc == kReplyAuxDefer)
+				IODelay(t < kAuxRetry ? 500 : 1000);
+		}
+		if (rc != kReplyAck || got == 0) {
+			FBLOG("aux: AUX%u DPCD read 0x%03x (%u byte(s)) failed: %s (reply %d, status 0x%08x)", aux,
+			      address + static_cast<uint32_t>(pos), chunk, rc == kAuxNoReply || rc == -1 ? auxWhy : "refused", rc,
+			      auxSts);
+			return false;
+		}
+		pos += got;   // a sink may answer with fewer bytes than asked
+	}
+	return true;
+}
+
+bool RDNA4Device::dpcdWrite(uint8_t aux, uint32_t address, const uint8_t *data, size_t len) {
+	for (size_t pos = 0; pos < len; ) {
+		const uint8_t chunk = len - pos > 16 ? 16 : static_cast<uint8_t>(len - pos);
+		int rc = kReplyAuxDefer;
+		uint8_t timeouts = 0;
+		for (uint8_t t = 0; t < kDpcdDeferTries && rc == kReplyAuxDefer; t++) {
+			rc = auxTransaction(aux, kActDpWrite, address + static_cast<uint32_t>(pos), data + pos, chunk,
+			                    nullptr, 0, nullptr);
+			if (rc == kAuxNoReply && timeouts++ < 3)
+				rc = kReplyAuxDefer;                // dce_aux_transfer_with_retries: AUX_MAX_TIMEOUT_RETRIES
+			// The Samsung answers a native transfer with the I2C defer code for a
+			// while after its link dropped (card, 2026-10-06); amdgpu waits out both.
+			if (rc == kReplyI2CDefer)
+				rc = kReplyAuxDefer;
+			if (rc == kReplyAuxDefer)
+				IODelay(t < kAuxRetry ? 500 : 1000);
+		}
+		if (rc != kReplyAck) {
+			FBLOG("aux: AUX%u DPCD write 0x%03x (%u byte(s)) failed: %s (reply %d, status 0x%08x)", aux,
+			      address + static_cast<uint32_t>(pos), chunk, rc == kAuxNoReply || rc == -1 ? auxWhy : "refused", rc,
+			      auxSts);
+			return false;
+		}
+		pos += chunk;
 	}
 	return true;
 }
@@ -710,9 +785,11 @@ void RDNA4Device::probeEDID() {
 		snprintf(key, sizeof(key), "EDID,%s%u-Vendor", bus, inst);
 		owner->setProperty(key, mfg);
 
-		// Cache the first sink's EDID for hasDDCConnect()/getDDCBlock(). Only
-		// the boot display is scanned out, and that is AUX0/DP0 on this board.
-		if (edidLen == 0) {
+		// Cache the boot display's EDID for hasDDCConnect()/getDDCBlock(): the
+		// sink on the lit pipe's connector, or the first that answers if the
+		// pipe is not known. Another sink is the second display's.
+		const bool boot = pipe.valid() && pipe.hpd ? rec.hasHpd && rec.hpdPin == pipe.hpd : edidLen == 0;
+		if (boot && edidLen == 0) {
 			memcpy(edidData, edid, 128);
 			edidLen = 128;
 			if (viaAux) {   // DPCD power writes only exist on AUX sinks
@@ -729,10 +806,32 @@ void RDNA4Device::probeEDID() {
 				FBLOG("edid: connector %zu (%s%u): read extension block "
 				      "(tag 0x%02x)", i, bus, inst, edidData[128]);
 			}
+		} else if (!boot && edid2Len == 0) {
+			memcpy(edid2Data, edid, 128);
+			edid2Len = 128;
+			edid2Hpd = rec.hasHpd ? rec.hpdPin : 0;
+			if (viaAux)
+				readSecondDpSink(inst);
+			// The extension says whether the sink has SCDC (Edid::hdmi2Caps).
+			if (edid[126] > 0 && (viaAux ? readEDID(inst, edid2Data + 128, 128, 128)
+			                             : readEDIDI2C(inst, edid2Data + 128, 128, 128)))
+				edid2Len = 256;
 		}
 	}
 	if (!any)
 		FBLOG("edid: no sink EDID read on any connector");
+	// The lit pipe's connector gave nothing but another did: the pipe's HPD
+	// pin was read wrong, or its sink does not answer. As before the pipe was
+	// consulted, the sink that answered is taken for the boot display.
+	if (edidLen == 0 && edid2Len != 0) {
+		FBLOG("edid: no EDID on the lit pipe's connector (HPD%u): taking the sink on HPD%u for the boot display",
+		      pipe.hpd, edid2Hpd);
+		memcpy(edidData, edid2Data, sizeof(edidData));
+		edidLen = edid2Len;
+		edid2Len = 0;
+		edid2Hpd = 0;
+		pipe2Sink = {};
+	}
 }
 
 namespace {
@@ -793,7 +892,15 @@ constexpr uint32_t kMicrosecondTimeBaseDiv = 0x007b;
 
 bool RDNA4Device::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
                              uint8_t start) {
-	if (!ipDiscovery.isValid() || !rmmio || count == 0 || count > 256)
+	return count != 0 && i2cTransfer(line, kDdcSlave << 1, &start, 1, edid, count);
+}
+
+// One DDC exchange on the DC_I2C hardware engine: write `wlen` bytes to the
+// device at 8-bit address `addr`, then (with `rlen`) read `rlen` bytes back
+// after a repeated start.
+bool RDNA4Device::i2cTransfer(uint8_t line, uint8_t addr, const uint8_t *wr, size_t wlen,
+                              uint8_t *rd, size_t rlen) {
+	if (!ipDiscovery.isValid() || !rmmio || wlen == 0 || wlen > 8 || rlen > 256)
 		return false;
 
 	const uint32_t rSetup = kI2cSetupBase + 2u * line;
@@ -856,20 +963,25 @@ bool RDNA4Device::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
 		regWriteDmu(2, rSpeed, (prescale << 16) | (2u << 8) | 2u);
 	}
 
-	// --- queue both transactions, then a single GO (process_transaction /
-	// execute_transaction): [START 0xA0 <start>] [START 0xA1 read*count STOP]
+	// --- queue the transactions, then a single GO (process_transaction /
+	// execute_transaction): [START addr <wr>] [START addr|1 read*rlen STOP],
+	// or the write alone with its own STOP.
 	regWriteDmu(2, kI2cTxn0,
-	            kTxnStopOnNack | kTxnStart | (1u << kTxnCountShift));
-	regWriteDmu(2, kI2cTxn0 + 1,
-	            kTxnStopOnNack | kTxnStart | kTxnRead | kTxnStop |
-	            (static_cast<uint32_t>(count) << kTxnCountShift));
+	            kTxnStopOnNack | kTxnStart | (rlen ? 0 : kTxnStop) |
+	            (static_cast<uint32_t>(wlen) << kTxnCountShift));
+	if (rlen)
+		regWriteDmu(2, kI2cTxn0 + 1,
+		            kTxnStopOnNack | kTxnStart | kTxnRead | kTxnStop |
+		            (static_cast<uint32_t>(rlen) << kTxnCountShift));
 	// Data FIFO: address bytes carry the R/W bit in bit 0.
-	regWriteDmu(2, kI2cDataReg, kI2cIndexWrite | (0xA0u << kI2cDataShiftI2C));
-	regWriteDmu(2, kI2cDataReg, static_cast<uint32_t>(start) << kI2cDataShiftI2C);
-	regWriteDmu(2, kI2cDataReg, 0xA1u << kI2cDataShiftI2C);
+	regWriteDmu(2, kI2cDataReg, kI2cIndexWrite | (static_cast<uint32_t>(addr) << kI2cDataShiftI2C));
+	for (size_t i = 0; i < wlen; i++)
+		regWriteDmu(2, kI2cDataReg, static_cast<uint32_t>(wr[i]) << kI2cDataShiftI2C);
+	if (rlen)
+		regWriteDmu(2, kI2cDataReg, (addr | 1u) << kI2cDataShiftI2C);
 
 	uint32_t ctl = (static_cast<uint32_t>(line) << kI2cDdcSelectShift) |
-	               (1u << kI2cTxnCountShift);  // TRANSACTION_COUNT = 2-1
+	               ((rlen ? 1u : 0u) << kI2cTxnCountShift);  // TRANSACTION_COUNT = transactions - 1
 	regWriteDmu(2, kI2cControl, ctl);
 	regWriteDmu(2, kI2cControl, ctl | kI2cGo);
 
@@ -891,15 +1003,33 @@ bool RDNA4Device::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
 	}
 
 	// --- read the reply FIFO (process_channel_reply): the read data starts
-	// after the 3 bytes we wrote (0xA0, start, 0xA1).
-	regWriteDmu(2, kI2cDataReg,
-	            kI2cIndexWrite | kI2cDataRead | (3u << kI2cIndexShift));
-	for (size_t i = 0; i < count; i++)
-		edid[i] = static_cast<uint8_t>(
-		    (regReadDmu(2, kI2cDataReg) >> kI2cDataShiftI2C) & 0xff);
+	// after the bytes we wrote (address, data, address again).
+	if (rlen) {
+		regWriteDmu(2, kI2cDataReg,
+		            kI2cIndexWrite | kI2cDataRead | (static_cast<uint32_t>(wlen + 2) << kI2cIndexShift));
+		for (size_t i = 0; i < rlen; i++)
+			rd[i] = static_cast<uint8_t>(
+			    (regReadDmu(2, kI2cDataReg) >> kI2cDataShiftI2C) & 0xff);
+	}
 
 	release();
 	return true;
+}
+
+// What amdgpu's write_scdc_data does for a sink that has SCDC: answer its
+// version, then say whether the link is scrambled (TMDS_CONFIG).
+void RDNA4Device::scdcConfigure(uint8_t line, uint8_t tmdsConfig) {
+	constexpr uint8_t kScdc = 0x54 << 1;                       // HDMI_SCDC_ADDRESS
+	constexpr uint8_t kSinkVersion = 0x01, kSourceVersion = 0x02, kTmdsConfig = 0x20;
+	uint8_t version = 0;
+	if (i2cTransfer(line, kScdc, &kSinkVersion, 1, &version, 1) && version == 1) {
+		const uint8_t source[2] = { kSourceVersion, 1 };
+		i2cTransfer(line, kScdc, source, sizeof(source), nullptr, 0);
+	}
+	const uint8_t config[2] = { kTmdsConfig, tmdsConfig };
+	const bool ok = i2cTransfer(line, kScdc, config, sizeof(config), nullptr, 0);
+	FBLOG("scdc: DDC%u: sink version %u, TMDS_CONFIG = %u %s", line, version, tmdsConfig,
+	      ok ? "written" : "NOT written");
 }
 
 void RDNA4Device::dumpModeState() {
@@ -989,11 +1119,11 @@ uint64_t RDNA4Device::liveFramePeriodNs() const {
 // only way to learn the exact rate the GOP chose. Edges are detected by
 // polling every 10 us, so 10 frames give ~0.01 % precision. Returns 0 if the
 // counter does not move (OTG stopped / unreadable).
-uint64_t RDNA4Device::measureFramePeriodNs() {
+uint64_t RDNA4Device::measureFramePeriodNs(uint32_t otgOffset) {
 	if (!pipe.valid())
 		return 0;
 	constexpr uint32_t kFrames = 10;
-	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otgOff();
+	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otgOffset;
 
 	auto count = [&]() { return regReadDmu(2, reg) & 0xffffff; };
 	auto nowNs = [&]() {
@@ -1399,6 +1529,7 @@ void RDNA4Device::dmubHistory() {
 // boot state in the DMCUB_SCRATCH bank (SCRATCH0 = boot status; higher
 // slots carry version/build markers on most builds). Pure register reads —
 // no ring traffic, no state change, safe alongside the live DP0 console.
+// rdna4-dmubver=2 adds one write: the GPINT version query below.
 void RDNA4Device::dumpDmubVersion() {
 	uint32_t on = 0;
 	if (!PE_parse_boot_argn("rdna4-dmubver", &on, sizeof(on)) || on == 0)
@@ -1422,6 +1553,36 @@ void RDNA4Device::dumpDmubVersion() {
 	    (static_cast<uint64_t>(regReadDmu(2, kDmcubRegion4OffsetHigh)) << 32);
 	FBLOG("dmubver: cntl=0x%08x cntl2=0x%08x region4 mc=0x%llx",
 	      regReadDmu(2, 0x01f6), regReadDmu(2, 0x0200), region4Mc);
+
+	// rdna4-dmubver=2: ask the firmware itself (DMUB_GPINT__GET_FW_VERSION).
+	// This is the one write here: DMCUB_GPINT_DATAIN1, which interrupts the
+	// firmware. Level 1 stays read-only. Only sent to an enabled DMCUB whose
+	// boot status says the mailbox is ready.
+	if (on >= 2) {
+		constexpr uint32_t kGpintDataIn1 = 0x01f8, kScratch7 = kScratch0 + 7;
+		const uint32_t cntl = regReadDmu(2, 0x01f6), boot = regReadDmu(2, kScratch0);
+		const uint32_t word = Dmub::gpintWord(Dmub::GpintGetFwVersion, 0);
+		if (cntl == 0xFFFFFFFF || !(cntl & (1u << 16)) || !(boot & 0x2)) {   // DMCUB_ENABLE, mailbox_rdy
+			FBLOG("dmubver: GPINT not sent: DMCUB not enabled or its mailbox not ready");
+		} else {
+			const uint32_t before = regReadDmu(2, kScratch7);
+			regWriteDmu(2, kGpintDataIn1, word);
+			const uint32_t acked = Dmub::gpintAcked(word);
+			uint32_t seen = regReadDmu(2, kGpintDataIn1), us = 0;
+			while (seen != acked && us < 100000) {
+				IODelay(10);
+				us += 10;
+				seen = regReadDmu(2, kGpintDataIn1);
+			}
+			if (seen == acked)
+				FBLOG("dmubver: GPINT GET_FW_VERSION acknowledged after %u us: fw_version=0x%08x "
+				      "(SCRATCH7 was 0x%08x); amdgpu's own DMUB on Debian reports 0x00010300",
+				      us, regReadDmu(2, kScratch7), before);
+			else
+				FBLOG("dmubver: GPINT GET_FW_VERSION not acknowledged in 100 ms (DATAIN1 reads "
+				      "0x%08x): this firmware does not serve GPINT", seen);
+		}
+	}
 
 	// The scratch bank carries boot status, not the firmware version, so it
 	// can't answer the dialect question on its own. Escalate: dmub_fw_meta_info
@@ -1527,8 +1688,42 @@ void RDNA4Device::setDisplayPower(bool on) {
 		return;
 	}
 
-	// HDMI/DVI boot pipe: there is no DP stream or DPCD to toggle. Blank to
-	// solid black with the OPP's display pattern generator, the way
+	// HDMI/DVI boot pipe, with the mode-set engine asked for (rdna4-modeset=1):
+	// the link goes down, so the monitor loses the signal and sleeps, and the
+	// way back is the mode set to the running timing (ModeSet::buildSleep).
+	if (pipe.valid() && pipe.isTmds() && (on ? hdmiLinkOff : modesetRequested && liveTimingValid)) {
+		ModeSet::Target t {};
+		const char *why = "";
+		char res[48];
+		if (on) {
+			const IOReturn ret = applyMode(Modes::Mode { currentModeId, liveTiming, liveTiming.refreshMilliHz(),
+			                                             false, Modes::SourceBoot });
+			hdmiLinkOff = false;
+			FBLOG("power: HDMI display on: mode set to the running timing %s (0x%x)",
+			      ret == kIOReturnSuccess ? "done" : "FAILED", ret);
+			snprintf(res, sizeof(res), "mode set 0x%x", ret);
+			displayPowerNote(true, "HDMI link", res);
+			displayPowerOn = true;
+			return;
+		}
+		t.to = liveTiming;
+		if (bootPipeTarget(t) && ModeSet::buildSleep(t, modePlan, &why)) {
+			const bool ran = runPlan(modePlan);
+			hdmiLinkOff = true;   // also after a plan that stopped: waking is a full mode set either way
+			const uint32_t fe = regReadDmu(2, Pipe::Reg::kDigFeEnCntl + digOff());
+			FBLOG("power: HDMI display off: stream encoder and transmitter down, %lu steps %s; "
+			      "DIG%u_DIG_FE_EN_CNTL=0x%08x", static_cast<unsigned long>(modePlan.count),
+			      ran ? "ran" : "STOPPED", pipe.dig, fe);
+			snprintf(res, sizeof(res), "%s, FE %08x", ran ? "ran" : "STOPPED", fe);
+			displayPowerNote(false, "HDMI link", res);
+			displayPowerOn = false;
+			return;
+		}
+		FBLOG("power: HDMI link stays up (%s): blanking instead", why[0] ? why : "no VBIOS path");
+	}
+
+	// Otherwise an HDMI/DVI boot pipe is blanked: there is no DP stream or
+	// DPCD to toggle. Solid black with the OPP's display pattern generator, the way
 	// opp2_set_disp_pattern_generator does for SOLID_COLOR (DPG colours 0,
 	// DPG_MODE = TEST_PATTERN_MODE_HORIZONTALBARS, DPG_EN).
 	if (pipe.valid() && pipe.isTmds()) {
@@ -1701,9 +1896,14 @@ void RDNA4Device::tryForce8bpc() {
 	if (!PE_parse_boot_argn("rdna4-8bpc", &v, sizeof(v)) || v == 0)
 		return;
 
-	// DP0 stream encoder (the active one on this machine).
-	constexpr uint32_t kDpPixelFormat   = 0x211f; // base 2
-	constexpr uint32_t kDpMsaColorimetry= 0x2120; // base 2
+	// The firmware does not always light the DP display on DIG0.
+	if (!pipe.valid() || pipe.signal != Pipe::Signal::DpSst) {
+		FBLOG("8bpc: the lit pipe is not DisplayPort: nothing done");
+		return;
+	}
+	// The lit pipe's DP stream encoder (DP0's registers, base 2, DIG stride).
+	const uint32_t kDpPixelFormat    = 0x211f + digOff();
+	const uint32_t kDpMsaColorimetry = 0x2120 + digOff();
 	constexpr uint32_t kDepthMask       = 0x00000700; // UNCOMPRESSED_COMPONENT_DEPTH
 	constexpr uint32_t kDepth8bpc       = 1u << 8;
 	constexpr uint32_t kMisc0Mask       = 0xFF000000; // MISC0 in [31:24]
@@ -1718,8 +1918,8 @@ void RDNA4Device::tryForce8bpc() {
 
 	uint32_t pfNew  = (pf  & ~kDepthMask) | kDepth8bpc;
 	uint32_t colNew = (col & ~kMisc0Mask) | kMisc0Rgb8bpc;
-	FBLOG("8bpc: DP_PIXEL_FORMAT 0x%08x -> 0x%08x, MSA_COLORIMETRY 0x%08x -> 0x%08x",
-	      pf, pfNew, col, colNew);
+	FBLOG("8bpc: DP%u: DP_PIXEL_FORMAT 0x%08x -> 0x%08x, MSA_COLORIMETRY 0x%08x -> 0x%08x",
+	      pipe.dig, pf, pfNew, col, colNew);
 	regWriteDmu(2, kDpPixelFormat, pfNew);
 	regWriteDmu(2, kDpMsaColorimetry, colNew);
 	FBLOG("8bpc: readback DP_PIXEL_FORMAT=0x%08x MSA_COLORIMETRY=0x%08x",
@@ -1821,9 +2021,7 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 				initHardwareCursor();
 			probeMemSize();
 			dumpDCN();
-			// DP-stream experiment; meaningless (and aimed at DP0) on HDMI.
-			if (!pipe.isTmds())
-				tryForce8bpc();
+			tryForce8bpc();   // DP-stream experiment (rdna4-8bpc=1)
 			probeEDID();
 			dumpModeState();
 			dmubHistory();
@@ -1834,6 +2032,13 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 			dumpPSP();
 		}
 	}
+
+	uint32_t head2dp = 0;
+	pipe2DpAllowed = PE_parse_boot_argn("rdna4-head2dp", &head2dp, sizeof(head2dp)) && head2dp != 0;
+
+	// Needs the lit pipe (discoverPipe) and the sink's AUX channel (probeEDID).
+	if (PE_parse_boot_argn("rdna4-dptrain", &dpTrainLevel, sizeof(dpTrainLevel)) && dpTrainLevel)
+		noteBootDpLink();
 
 	// Needs the boot timing (discoverPipe) and the sink's EDID (probeEDID).
 	buildModeTable();
@@ -1879,12 +2084,11 @@ static const uint8_t kVmFixtureEdid[128] = {
 
 void RDNA4Device::buildModeTable() {
 	modeCount = 0;
+	// The sink's other modes are offered unless rdna4-modeset=0: switching
+	// ran on the card for HDMI and DisplayPort boot displays (2026-10-04/06).
+	uint32_t ms = 1;
 #ifdef RDNA4FB_VM_TEST
-	// VM test builds exercise the mode table by default (OpenCore images
-	// often pin boot-args, so opt-out rather than opt-in); "=0" disables.
-	uint32_t ms = 1, fake = 1;
-#else
-	uint32_t ms = 0;
+	uint32_t fake = 1;   // the fixture EDID, unless rdna4-fakeedid=0
 #endif
 	PE_parse_boot_argn("rdna4-modeset", &ms, sizeof(ms));
 	modesetRequested = ms != 0;
@@ -1899,15 +2103,27 @@ void RDNA4Device::buildModeTable() {
 #endif
 
 	// Modes reuse the GOP framebuffer's memory and pitch, so none may be
-	// larger than it. TMDS stays below 340 MHz (no HDMI 2.0 scrambling yet)
-	// and within 25 % of the boot pixel clock, which the GOP's DISPCLK is
-	// known to carry, until DISPCLK is read and raised explicitly.
+	// larger than it. TMDS stays at 340 MHz or less unless the sink takes
+	// HDMI 2.0 scrambling (SCDC and a higher character rate in its EDID), and
+	// within 25 % of the boot pixel clock, which the GOP's DISPCLK is known to
+	// carry, until DISPCLK is read and raised explicitly.
 	Modes::Limits lim {};
 	lim.maxHActive = fbWidth;
 	lim.maxVActive = fbHeight;
-	lim.maxPixelClockKHz = 340000;
-	if (bootTimingValid && bootTiming.pixelClockKHz && bootTiming.pixelClockKHz * 5 / 4 < 340000)
+	if (bootTimingValid && (bootTiming.hActive > fbWidth || bootTiming.vActive > fbHeight))
+		FBLOG("modes: the console is %ux%u and the firmware stretches it onto its %ux%u timing: nothing larger "
+		      "than the console is offered (the bootloader's console resolution decides this)", fbWidth, fbHeight,
+		      bootTiming.hActive, bootTiming.vActive);
+	const Edid::Hdmi2Caps hdmi2 = Edid::hdmi2Caps(edidData, edidLen);
+	lim.maxPixelClockKHz = ModeSet::kScrambleFromKHz;
+	if (hdmi2.scdc && hdmi2.maxTmdsKHz > lim.maxPixelClockKHz)
+		lim.maxPixelClockKHz = hdmi2.maxTmdsKHz < ModeSet::kMaxTmdsKHz ? hdmi2.maxTmdsKHz : ModeSet::kMaxTmdsKHz;
+	if (bootTimingValid && bootTiming.pixelClockKHz && bootTiming.pixelClockKHz * 5 / 4 < lim.maxPixelClockKHz)
 		lim.maxPixelClockKHz = bootTiming.pixelClockKHz * 5 / 4;
+	// DisplayPort has no TMDS limit, but its link is not retrained: nothing
+	// above the pixel clock it was brought up for (ModeSet::build).
+	if (pipe.valid() && pipe.signal == Pipe::Signal::DpSst && bootTimingValid && bootTiming.pixelClockKHz)
+		lim.maxPixelClockKHz = bootTiming.pixelClockKHz;
 
 	if (modesetRequested && edidLen)
 		modeCount = Modes::build(edidData, edidLen, lim, modeTable, Modes::MaxModes);
@@ -1958,7 +2174,12 @@ void RDNA4Device::buildModeTable() {
 		      m.native ? " native" : "", m.id == currentModeId ? " (live)" : "");
 	}
 	FBLOG("modes: %lu mode(s), switching %s", static_cast<unsigned long>(modeCount),
-	      modesetRequested ? "requested (rdna4-modeset=1)" : "off (boot mode only)");
+	      modesetRequested ? "on (rdna4-modeset=0 turns it off)" : "off (rdna4-modeset=0: boot mode only)");
+	// The plane's blank-end register as the firmware has it for its own mode,
+	// next to what the mode switch would write there for that mode.
+	if (bootTimingValid && bootTiming.pixelClockKHz)
+		FBLOG("modes: plane blank end: the firmware has 0x%08x, the rule gives 0x%08x for the boot timing",
+		      regReadDmu(2, 0x063b + hubpOff()), ModeSet::dlgBlankEnd(bootTiming));
 	owner->setProperty("Modes,Count", static_cast<uint64_t>(modeCount), 32);
 }
 
@@ -1969,24 +2190,26 @@ const Modes::Mode *RDNA4Device::findMode(uint32_t id) const {
 	return nullptr;
 }
 
-// The VBIOS display path wired to the lit pipe: the one whose HPD pin is
-// the back-end's DIG_HPD_SELECT.
-bool RDNA4Device::pathForPipe(AtomBios::DisplayPath &out) {
+// The VBIOS display path wired to an HPD pin (counted from 1, as the lit
+// pipe's is).
+bool RDNA4Device::pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out, uint8_t *ddcLine) {
 	AtomBios::DisplayPath paths[AtomBios::MaxDisplayPaths];
 	size_t n = atomBios.getDisplayPaths(paths, AtomBios::MaxDisplayPaths);
 	for (size_t i = 0; i < n; i++) {
 		AtomBios::PathRecords rec;
-		if (atomBios.getPathRecords(paths[i], rec) && rec.hasHpd && rec.hpdPin == pipe.hpd) {
+		if (atomBios.getPathRecords(paths[i], rec) && rec.hasHpd && rec.hpdPin == hpdPin) {
 			out = paths[i];
+			if (ddcLine)
+				*ddcLine = rec.ddcLine;
 			return true;
 		}
 	}
 	return false;
 }
 
-// Let `frames` frames of the lit OTG pass, by its frame counter.
-bool RDNA4Device::waitFrames(uint32_t frames) {
-	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otgOff();
+// Let `frames` frames of an OTG pass, by its frame counter.
+bool RDNA4Device::waitFrames(uint32_t frames, uint32_t otgOffset) {
+	const uint32_t reg = Pipe::Reg::kOtgFrameCount + otgOffset;
 	uint32_t last = regReadDmu(2, reg) & 0xffffff;
 	for (uint32_t seen = 0, us = 0; seen < frames; us += 100) {
 		if (us > frames * 100000u)                // 100 ms per frame is 10 Hz
@@ -2001,9 +2224,10 @@ bool RDNA4Device::waitFrames(uint32_t frames) {
 	return true;
 }
 
-bool RDNA4Device::runPlan(const ModeSet::Plan &plan) {
-	for (size_t i = 0; i < plan.count; i++) {
-		const ModeSet::Step &s = plan.steps[i];
+bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds,
+                           size_t ncmds, const char *tag, uint32_t otgOffset, const Pipe2::AuxWrite *aux) {
+	for (size_t i = 0; i < count; i++) {
+		const ModeSet::Step &s = steps[i];
 		switch (s.op) {
 		case ModeSet::Op::Write:
 			regWriteDmu(s.seg, s.dword, s.value);
@@ -2011,12 +2235,32 @@ bool RDNA4Device::runPlan(const ModeSet::Plan &plan) {
 		case ModeSet::Op::Update:
 			regWriteDmu(s.seg, s.dword, (regReadDmu(s.seg, s.dword) & ~s.mask) | s.value);
 			break;
+		case ModeSet::Op::Copy:
+			regWriteDmu(s.seg, s.dword, regReadDmu(s.seg, s.arg));
+			break;
+		case ModeSet::Op::Delay:
+			IODelay(s.arg);
+			break;
+		case ModeSet::Op::Scdc:
+			// Like amdgpu, carry on if the sink does not answer.
+			scdcConfigure(static_cast<uint8_t>(s.arg), static_cast<uint8_t>(s.value));
+			break;
+		case ModeSet::Op::Require: {
+			const uint32_t v = regReadDmu(s.seg, s.dword);
+			if (v == 0xFFFFFFFF || (v & s.mask) != s.value) {
+				FBLOG("%s: step %lu not met (%s): 0x%08x", tag, static_cast<unsigned long>(i), s.what, v);
+				return false;
+			}
+			break;
+		}
 		case ModeSet::Op::WaitSet:
-		case ModeSet::Op::WaitClear: {
+		case ModeSet::Op::WaitClear:
+		case ModeSet::Op::WaitValue: {
+			const uint32_t want = s.op == ModeSet::Op::WaitSet ? s.mask
+			                    : s.op == ModeSet::Op::WaitClear ? 0 : s.value;
 			bool ok = false;
 			for (uint32_t us = 0;; us += 10) {
-				uint32_t v = regReadDmu(s.seg, s.dword) & s.mask;
-				if (s.op == ModeSet::Op::WaitSet ? v == s.mask : v == 0) {
+				if ((regReadDmu(s.seg, s.dword) & s.mask) == want) {
 					ok = true;
 					break;
 				}
@@ -2025,7 +2269,7 @@ bool RDNA4Device::runPlan(const ModeSet::Plan &plan) {
 				IODelay(10);
 			}
 			if (!ok) {
-				FBLOG("modeset: step %lu (%s) timed out%s", static_cast<unsigned long>(i),
+				FBLOG("%s: step %lu (%s) timed out%s", tag, static_cast<unsigned long>(i),
 				      s.what, s.optional ? ", continuing" : "");
 				if (!s.optional)
 					return false;
@@ -2033,15 +2277,27 @@ bool RDNA4Device::runPlan(const ModeSet::Plan &plan) {
 			break;
 		}
 		case ModeSet::Op::Dmub:
-			if (s.arg >= plan.ncmds || !dmubSubmit(&plan.cmds[s.arg], 1, "modeset")) {
-				FBLOG("modeset: step %lu (%s): DMUB did not take the command",
+			if (s.arg >= ncmds || !dmubSubmit(&cmds[s.arg], 1, tag)) {
+				FBLOG("%s: step %lu (%s): DMUB did not take the command", tag,
 				      static_cast<unsigned long>(i), s.what);
 				return false;
 			}
 			break;
+		case ModeSet::Op::Aux:
+			// Like amdgpu, carry on if the sink does not take it.
+			if (!aux || !dpcdWrite(pipe2Aux, aux[s.arg].address, aux[s.arg].data, aux[s.arg].len))
+				FBLOG("%s: step %lu (%s): the sink did not take the AUX write, continuing", tag,
+				      static_cast<unsigned long>(i), s.what);
+			break;
+		case ModeSet::Op::Train:
+			if (!trainSecondLink()) {
+				FBLOG("%s: step %lu (%s): the link did not train", tag, static_cast<unsigned long>(i), s.what);
+				return false;
+			}
+			break;
 		case ModeSet::Op::WaitFrames:
-			if (!waitFrames(s.arg)) {
-				FBLOG("modeset: step %lu (%s): the OTG is not counting frames",
+			if (!waitFrames(s.arg, otgOffset)) {
+				FBLOG("%s: step %lu (%s): the OTG is not counting frames", tag,
 				      static_cast<unsigned long>(i), s.what);
 				return false;
 			}
@@ -2051,18 +2307,166 @@ bool RDNA4Device::runPlan(const ModeSet::Plan &plan) {
 	return true;
 }
 
-IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
-	if (!pipe.valid() || !pipe.isTmds() || !liveTimingValid || !rmmio || !ipDiscovery.isValid()) {
-		FBLOG("modes: switch to id %u refused: no programmable HDMI pipe", m.id);
-		return kIOReturnUnsupported;
-	}
-	AtomBios::DisplayPath path {};
-	if (!pathForPipe(path)) {
-		FBLOG("modes: switch to id %u refused: no VBIOS path for HPD%u", m.id, pipe.hpd);
-		return kIOReturnUnsupported;
-	}
+// ---------------------------------------------------------------------------
+// DisplayPort link training on the boot display
+// ---------------------------------------------------------------------------
 
-	ModeSet::Target t {};
+bool RDNA4Device::bootSinkPresent() {
+	const uint32_t hpdY = regReadDmu(2, 0x28f7);   // DC_GPIO_HPD_Y: one byte per pin, HPD1 lowest
+	return hpdY != 0xFFFFFFFF && pipe.hpd >= 1 && pipe.hpd <= 4 && ((hpdY >> (8 * (pipe.hpd - 1))) & 1);
+}
+
+void RDNA4Device::noteBootDpLink() {
+	bootDpLinkKnown = false;
+	if (!pipe.valid() || pipe.signal != Pipe::Signal::DpSst || !sinkAuxValid) {
+		FBLOG("dptrain: the boot display is not on DisplayPort: nothing to retrain");
+		return;
+	}
+	// Receiver capability, then what the firmware told the sink: LINK_BW_SET,
+	// LANE_COUNT_SET, and from 0x202 on how the lanes are doing.
+	uint8_t caps[16] {}, set[2] {}, status[6] {};
+	if (!dpcdRead(sinkAuxInst, 0x000, caps, sizeof(caps)) || !dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) ||
+	    !dpcdRead(sinkAuxInst, 0x202, status, sizeof(status))) {
+		FBLOG("dptrain: the sink's DPCD did not answer on AUX%u", sinkAuxInst);
+		return;
+	}
+	const bool sink = DpTrain::parseCaps(caps, sizeof(caps), bootDpSink);
+	bootDpLink = DpTrain::Link { static_cast<uint8_t>(set[1] & 0x1f), set[0] };
+	FBLOG("dptrain: sink DPCD %u.%u, up to %u lane(s) at rate 0x%02x%s%s, reading interval 0x%02x; the firmware's "
+	      "link: %u lane(s) at rate 0x%02x (LANE_COUNT_SET 0x%02x); lanes %02x %02x, aligned %u", caps[0] >> 4,
+	      caps[0] & 0xf, bootDpSink.maxLanes, bootDpSink.maxRate, bootDpSink.tps3 ? ", TPS3" : "",
+	      bootDpSink.tps4 ? ", TPS4" : "", caps[0x0e], bootDpLink.lanes, bootDpLink.rate, set[1], status[0],
+	      status[1], status[2] & 1);
+	const bool lanes = bootDpLink.lanes == 1 || bootDpLink.lanes == 2 || bootDpLink.lanes == 4;
+	bootDpLinkKnown = sink && lanes && bootDpLink.lanes <= bootDpSink.maxLanes && bootDpLink.rate >= DpTrain::kRbr &&
+	                  bootDpLink.rate <= bootDpSink.maxRate;
+	if (!bootDpLinkKnown)
+		FBLOG("dptrain: that is not a link this sink says it has: it will not be retrained");
+}
+
+// DpTrain on one link of this card: the sink's DPCD over AUX channel `aux`,
+// and DpPhy's register steps and DMUB commands for link encoder `link`, whose
+// connector has hot-plug pin `hpd` and VBIOS object `conn`.
+DpTrain::Result RDNA4Device::trainLink(uint8_t aux, uint8_t link, uint8_t hpd, uint8_t conn, const DpTrain::Sink &sink,
+                                       const DpTrain::Link &settings, bool offFirst, DpTrain::Report &rep) {
+	struct Ctx {
+		RDNA4Device  *dev;
+		uint8_t       aux, link, hpd, conn;
+		DpTrain::Link settings;
+		bool steps(const ModeSet::Step *s, size_t n) { return dev->runSteps(s, n, nullptr, 0, "dptrain", dev->otgOff()); }
+		bool dmub(const Dmub::Cmd &cmd) { return dev->dmubSubmit(&cmd, 1, "dptrain"); }
+	} ctx { this, aux, link, hpd, conn, settings };
+	DpTrain::Io io {};
+	io.ctx = &ctx;
+	io.read = [](void *c, uint32_t address, uint8_t *data, size_t len) {
+		auto *x = static_cast<Ctx *>(c);
+		return x->dev->dpcdRead(x->aux, address, data, len);
+	};
+	io.write = [](void *c, uint32_t address, const uint8_t *data, size_t len) {
+		auto *x = static_cast<Ctx *>(c);
+		return x->dev->dpcdWrite(x->aux, address, data, len);
+	};
+	io.phyOn = [](void *c, const DpTrain::Link &l) {
+		auto *x = static_cast<Ctx *>(c);
+		ModeSet::Step s[DpPhy::kMaxSteps];
+		Dmub::Cmd cmd;
+		DpPhy::buildEnable(cmd, x->link, x->hpd, l);
+		return x->steps(s, DpPhy::configureSteps(x->link, l.lanes, s)) && x->dmub(cmd);
+	};
+	io.phyOff = [](void *c) {
+		auto *x = static_cast<Ctx *>(c);
+		ModeSet::Step s[DpPhy::kMaxSteps];
+		Dmub::Cmd cmd;
+		DpPhy::buildDisable(cmd, x->link, x->hpd, x->conn);
+		return x->dmub(cmd) && x->steps(s, DpPhy::offSteps(x->link, s));
+	};
+	io.pattern = [](void *c, DpTrain::Pattern p) {
+		auto *x = static_cast<Ctx *>(c);
+		ModeSet::Step s[DpPhy::kMaxSteps];
+		return x->steps(s, DpPhy::patternSteps(x->link, p, s));
+	};
+	io.drive = [](void *c, uint8_t, uint8_t swing, uint8_t preEmphasis) {
+		auto *x = static_cast<Ctx *>(c);
+		Dmub::Cmd cmd;
+		DpPhy::buildDrive(cmd, x->link, x->hpd, x->conn, x->settings, swing, preEmphasis);
+		return x->dmub(cmd);
+	};
+	io.delayUs = [](void *, uint32_t us) {
+		if (us >= 10000)
+			IOSleep(us / 1000);
+		else
+			IODelay(us);
+	};
+	if (offFirst && !io.phyOff(&ctx))
+		return rep.result = DpTrain::Result::Io;
+	return DpTrain::bringUp(io, sink, settings, &rep);
+}
+
+// The boot display's link as the sink and the link encoder have it, in one
+// line: to see what a retrain left and whether anything changed it afterwards.
+void RDNA4Device::logBootLink(const char *when) {
+	uint8_t set[2] {}, status[3] {};
+	const bool sink = dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) && dpcdRead(sinkAuxInst, 0x202, status, sizeof(status));
+	const uint32_t dp = pipe.link * 0x124u, arb = regReadDmu(2, auxDword(sinkAuxInst, kAuxArbControl));
+	FBLOG("dptrain: %s: sink %s rate 0x%02x lanes 0x%02x status %02x %02x %02x; DP_VID_STREAM_CNTL 0x%08x "
+	      "DP_LINK_CNTL 0x%08x DP_CONFIG 0x%08x pattern 0x%08x; AUX arbitration 0x%08x", when,
+	      sink ? "answers:" : "does not answer:", set[0], set[1], status[0], status[1], status[2],
+	      regReadDmu(2, 0x2122 + digOff()), regReadDmu(2, 0x211e + dp), regReadDmu(2, 0x2121 + dp),
+	      regReadDmu(2, 0x212e + dp), arb);
+	// What ties the stream encoder to the link, and what a reset of it would lose.
+	FBLOG("dptrain: %s: SYMCLK 0x%08x BE_CLK 0x%08x BE_EN 0x%08x BE_CNTL 0x%08x FE_CLK 0x%08x FE_EN 0x%08x FIFO 0x%08x "
+	      "mapper 0x%08x; DP_PIXEL_FORMAT 0x%08x MSA_MISC 0x%08x DP_VID_TIMING 0x%08x DP_STEER_FIFO 0x%08x", when,
+	      regReadDmu(1, 0x00a0 + pipe.dig), regReadDmu(2, 0x20bb + dp), regReadDmu(2, 0x20bd + dp),
+	      regReadDmu(2, 0x20bc + dp), regReadDmu(2, 0x2094 + digOff()), regReadDmu(2, 0x2095 + digOff()),
+	      regReadDmu(2, 0x209b + digOff()), regReadDmu(2, 0x1f0d + pipe.dig), regReadDmu(2, 0x211f + digOff()),
+	      regReadDmu(2, 0x2124 + digOff()), regReadDmu(2, 0x2126 + digOff()), regReadDmu(2, 0x2123 + digOff()));
+}
+
+DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
+	AtomBios::DisplayPath path {};
+	if (!bootDpLinkKnown || !pathForHpd(pipe.hpd, path)) {
+		FBLOG("dptrain: %s: not retrained: the firmware's link is not known", why);
+		return DpTrain::Result::BadLink;
+	}
+	// The stream stops feeding the link while it is down, as for display
+	// sleep, and the transmitter goes off before it is brought up again.
+	const uint32_t kDpVidStreamCntl = 0x2122 + digOff();
+	const uint32_t stream = regReadDmu(2, kDpVidStreamCntl);
+	FBLOG("dptrain: %s: retraining %u lane(s) at rate 0x%02x on link %u (AUX%u, HPD%u), stream 0x%08x", why,
+	      bootDpLink.lanes, bootDpLink.rate, pipe.link, sinkAuxInst, pipe.hpd, stream);
+	logBootLink("before");
+	regWriteDmu(2, kDpVidStreamCntl, stream & ~1u);
+	DpTrain::Report rep {};
+	const DpTrain::Result r = trainLink(sinkAuxInst, pipe.link, pipe.hpd, static_cast<uint8_t>(path.connectorObjId & 0xff),
+	                                    bootDpSink, bootDpLink, true, rep);
+	// The video back, unless display sleep had it off. Setting the enable again
+	// is not enough once the transmitter has been off: the link trained and the
+	// screen stayed black, DP_VID_STREAM_STATUS 0 (card, 2026-10-06). The stream
+	// is started the way a mode switch starts it, on the timing it runs.
+	// That alone left the stream encoder's FIFO without its reset and the
+	// stream stopped (the same day), so first what amdgpu does between
+	// training and unblank: the stream encoder tied to the link again.
+	if (r == DpTrain::Result::Ok && (stream & 1)) {
+		ModeSet::Step s[DpPhy::kMaxSteps];
+		runSteps(s, DpPhy::streamSteps(pipe.dig, pipe.link, s), nullptr, 0, "dptrain", otgOff());
+		if (applyMode(Modes::Mode { currentModeId, liveTiming, liveTiming.refreshMilliHz(), false, Modes::SourceBoot }) !=
+		    kIOReturnSuccess)
+			regWriteDmu(2, kDpVidStreamCntl, stream);
+	}
+	FBLOG("dptrain: %s after %u attempt(s): swing %u, pre-emphasis %u, lanes %02x %02x, aligned %u; stream 0x%08x",
+	      DpTrain::resultName(r), rep.attempts, rep.swing, rep.preEmphasis, rep.status[0], rep.status[1],
+	      rep.status[2] & 1, regReadDmu(2, kDpVidStreamCntl));
+	logBootLink("after");
+	return r;
+}
+
+bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
+	AtomBios::DisplayPath path {};
+	uint8_t ddcLine = 0;
+	if (!pathForHpd(pipe.hpd, path, &ddcLine))
+		return false;
+	t.sinkScdc = Edid::hdmi2Caps(edidData, edidLen).scdc;
+	t.ddcLine = ddcLine;
 	t.otg = pipe.otg;
 	t.dig = pipe.dig;
 	t.link = pipe.link;
@@ -2071,9 +2475,55 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	t.hubp = pipe.hubp;
 	t.encoderObjId = path.encoderObjId;
 	t.connectorObjId = path.connectorObjId;
-	t.pllId = 0x14;                  // ATOM_COMBOPHY_PLL0, amdgpu's first free PLL
-	t.from = liveTiming;
-	t.to = m.t;
+	// DSCL_AUTOCAL.AUTOCAL_MODE: the firmware stretching a smaller console.
+	const uint32_t autocal = regReadDmu(2, 0x0d19 + dppOff());
+	t.scalerOff = autocal != 0xFFFFFFFF && (autocal & 0x3) != 0;
+	return true;
+}
+
+IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
+	const bool dp = pipe.signal == Pipe::Signal::DpSst;
+	if (!pipe.valid() || !(pipe.isTmds() || dp) || !liveTimingValid || !rmmio || !ipDiscovery.isValid()) {
+		FBLOG("modes: switch to id %u refused: no programmable HDMI or DisplayPort pipe", m.id);
+		return kIOReturnUnsupported;
+	}
+	ModeSet::Target t {};
+	if (!bootPipeTarget(t)) {
+		FBLOG("modes: switch to id %u refused: no VBIOS path for HPD%u", m.id, pipe.hpd);
+		return kIOReturnUnsupported;
+	}
+
+	// DisplayPort: the link stays as the firmware trained it and only the
+	// stream is retimed, so the pixel clock comes from the DTO running now,
+	// scaled. Both it and DP_VID_M are read once, before anything changes.
+	ModeSet::DpDto dtoNow {};
+	uint32_t vidMNow = 0;
+	const uint32_t dtoFromKHz = liveTiming.pixelClockKHz;
+	if (dp) {
+		constexpr uint32_t kDpVidM = 0x2128;
+		uint32_t cntl = 0;
+		if (!readDpDto(pipe.otg, dtoNow, &cntl)) {
+			FBLOG("modes: switch to id %u refused: OTG%u's pixel clock is not the DP DTO (0x%08x)", m.id,
+			      pipe.otg, cntl);
+			return kIOReturnUnsupported;
+		}
+		vidMNow = regReadDmu(2, kDpVidM + digOff()) & 0xffffff;
+		t.dp = true;
+		t.dpMaxKHz = bootTiming.pixelClockKHz;
+	}
+	auto aim = [&](const Edid::DetailedTiming &from, const Edid::DetailedTiming &to) {
+		t.from = from;
+		t.to = to;
+		if (!dp)
+			return;
+		if (!ModeSet::scaleDpDto(dtoNow, dtoFromKHz, to.pixelClockKHz, t.dto))
+			t.dto = {};
+		// M / 0x8000 = pixel clock / link clock; the hardware measures it once the
+		// stream runs. Seed it from the running value, or as on four HBR3 lanes.
+		t.vidM = vidMNow ? static_cast<uint32_t>(static_cast<uint64_t>(vidMNow) * to.pixelClockKHz / dtoFromKHz)
+		                 : static_cast<uint32_t>(0x8000ull * to.pixelClockKHz / 810000);
+	};
+	aim(liveTiming, m.t);
 	const char *why = "";
 	if (!ModeSet::build(t, modePlan, &why)) {
 		FBLOG("modes: switch to id %u refused: %s", m.id, why);
@@ -2083,19 +2533,613 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	      "%lu DMUB commands", m.id, m.t.hActive, m.t.vActive, m.refreshMilliHz / 1000,
 	      m.refreshMilliHz % 1000, m.t.pixelClockKHz, ModeSet::vstartupLines(m.t),
 	      static_cast<unsigned long>(modePlan.count), static_cast<unsigned long>(modePlan.ncmds));
+	if (dp)
+		FBLOG("modes: DisplayPort, link untouched: DTO %u + %u / %u -> %u + %u / %u, DP_VID_M 0x%x -> 0x%x",
+		      dtoNow.integer, dtoNow.phase, dtoNow.modulo, t.dto.integer, t.dto.phase, t.dto.modulo,
+		      vidMNow, t.vidM);
 	if (runPlan(modePlan)) {
 		liveTiming = m.t;
-		FBLOG("modes: now %ux%u@%u.%03u", m.t.hActive, m.t.vActive,
-		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000);
+		// The firmware taking SET_PIXEL_CLOCK does not show the PLL runs at
+		// the new rate: time the OTG's frames. An unchanged clock would give
+		// the old pixel clock over the new totals, not this refresh.
+		const uint64_t periodNs = measureFramePeriodNs();
+		const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
+		FBLOG("modes: now %ux%u@%u.%03u, measured %u.%03u Hz", m.t.hActive, m.t.vActive,
+		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, mHz / 1000, mHz % 1000);
+		// Where the picture sits: the scaler's mode and the rectangles around it,
+		// and the plane's underflow flags (a picture cut off at the top, 2026-10-06).
+		FBLOG("modes: scaler mode 0x%08x autocal 0x%08x%s; viewport 0x%08x at 0x%08x, recout 0x%08x at 0x%08x, mpc "
+		      "0x%08x; plane blank end 0x%08x; HUBP%u_DCHUBP_CNTL 0x%08x", regReadDmu(2, 0x0d08 + dppOff()),
+		      regReadDmu(2, 0x0d19 + dppOff()), t.scalerOff ? " (turned off: stretched console)" : "",
+		      regReadDmu(2, 0x05eb + hubpOff()), regReadDmu(2, 0x05e9 + hubpOff()), regReadDmu(2, 0x0d1f + dppOff()),
+		      regReadDmu(2, 0x0d1e + dppOff()), regReadDmu(2, 0x0d20 + dppOff()), regReadDmu(2, 0x063b + hubpOff()),
+		      pipe.hubp, regReadDmu(2, 0x05f4 + hubpOff()));
 		return kIOReturnSuccess;
 	}
 
 	// Put the previous timing back so the display is not left dark.
-	t.from = m.t;
-	t.to = liveTiming;
+	aim(m.t, liveTiming);
 	bool restored = ModeSet::build(t, modePlan, &why) && runPlan(modePlan);
 	FBLOG("modes: switch to id %u failed, previous mode %s", m.id,
 	      restored ? "restored" : "NOT restored");
 	return kIOReturnIOError;
 }
 
+
+// ---------------------------------------------------------------------------
+// The second pipe
+// ---------------------------------------------------------------------------
+
+// What each step of a plan would do, with the register as it is now, as the
+// registry property RDNA4FB,Pipe2 (lines joined with " ## ", like
+// RDNA4FB,Cursor): several hundred lines do not survive the kernel log.
+void RDNA4Device::surveySteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds) {
+	constexpr size_t kCap = 96 * 1024;
+	char *text = static_cast<char *>(IOMalloc(kCap));
+	if (!text)
+		return;
+	size_t len = 0, differ = 0, unmet = 0;
+	text[0] = '\0';
+	for (size_t i = 0; i < count && len + 256 < kCap; i++) {
+		const ModeSet::Step &s = steps[i];
+		const uint32_t cur = regReadDmu(s.seg, s.dword);
+		char line[224];
+		switch (s.op) {
+		case ModeSet::Op::Write:
+		case ModeSet::Op::Update:
+		case ModeSet::Op::Copy: {
+			const uint32_t next = s.op == ModeSet::Op::Write ? s.value
+			                    : s.op == ModeSet::Op::Copy ? regReadDmu(s.seg, s.arg)
+			                    : (cur & ~s.mask) | s.value;
+			differ += next != cur;
+			snprintf(line, sizeof(line), "%lu %u:%04x %08x %s %08x %s", static_cast<unsigned long>(i),
+			         s.seg, s.dword, cur, next == cur ? "==" : "->", next, s.what);
+			break;
+		}
+		case ModeSet::Op::Require:
+		case ModeSet::Op::WaitValue: {
+			const bool met = cur != 0xFFFFFFFF && (cur & s.mask) == s.value;
+			unmet += s.op == ModeSet::Op::Require && !met;
+			snprintf(line, sizeof(line), "%lu %u:%04x %08x %s &%08x=%08x %s%s", static_cast<unsigned long>(i),
+			         s.seg, s.dword, cur, s.op == ModeSet::Op::Require ? "require" : "wait", s.mask, s.value,
+			         s.what, met ? "" : " (not so now)");
+			if (s.op == ModeSet::Op::Require)
+				FBLOG("pipe2: %s", line);
+			break;
+		}
+		case ModeSet::Op::Dmub:
+			snprintf(line, sizeof(line), "%lu dmub %08x %08x %08x %08x %s", static_cast<unsigned long>(i),
+			         cmds[s.arg][0], cmds[s.arg][1], cmds[s.arg][2], cmds[s.arg][3], s.what);
+			break;
+		case ModeSet::Op::Scdc:
+			snprintf(line, sizeof(line), "%lu scdc DDC%u TMDS_CONFIG=%u %s", static_cast<unsigned long>(i),
+			         s.arg, s.value, s.what);
+			break;
+		case ModeSet::Op::Aux:
+		case ModeSet::Op::Train:
+			snprintf(line, sizeof(line), "%lu %s %s", static_cast<unsigned long>(i),
+			         s.op == ModeSet::Op::Train ? "train the link:" : "aux write:", s.what);
+			break;
+		default:
+			snprintf(line, sizeof(line), "%lu delay %u us %s", static_cast<unsigned long>(i), s.arg, s.what);
+		}
+		len += snprintf(text + len, kCap - len, "%s ## ", line);
+	}
+	if (owner)
+		owner->setProperty("RDNA4FB,Pipe2", text);
+	FBLOG("pipe2: survey of %lu steps in the registry (RDNA4FB,Pipe2): %lu would change a register, "
+	      "%lu requirement(s) not met; nothing written", static_cast<unsigned long>(count),
+	      static_cast<unsigned long>(differ), static_cast<unsigned long>(unmet));
+	IOFree(text, kCap);
+}
+
+bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhys) {
+	if (!pipe.valid() || !rmmio || !ipDiscovery.isValid()) {
+		FBLOG("pipe2: not lit: no lit pipe to stand next to");
+		return false;
+	}
+	// The plan for the connector the second display is on.
+	if (!usePlanFor(edid2Hpd)) {
+		FBLOG("pipe2: not lit: the second display is on HPD%u, a connector there is no plan for (a DisplayPort "
+		      "one needs rdna4-head2dp=1)", edid2Hpd);
+		return false;
+	}
+	const Pipe2::Config &c = Pipe2::config();
+	if (pipe.otg == c.pipe || pipe.opp == c.pipe || pipe.hubp == c.pipe || pipe.dig == c.dig ||
+	    pipe.link == c.link) {
+		FBLOG("pipe2: not lit: the firmware's pipe (OTG%u OPP%u HUBP%u DIG%u link %u) uses a block of the "
+		      "plan's (pipe %u, DIG%u, link %u)", pipe.otg, pipe.opp, pipe.hubp, pipe.dig, pipe.link,
+		      c.pipe, c.dig, c.link);
+		return false;
+	}
+	AtomBios::DisplayPath path {};
+	uint8_t ddcLine = 0;
+	if (!pathForHpd(c.hpd, path, &ddcLine) || Pipe2::linkOfEncoder(path.encoderObjId) != c.link) {
+		FBLOG("pipe2: not lit: the plan is for a connector on HPD%u and link %u, which this board's VBIOS "
+		      "does not have", c.hpd, c.link);
+		return false;
+	}
+
+	if (c.dp && ((!pipe2Sink.maxRate && !readSecondDpSink(ddcLine)) || !pickSecondLink(c.timing.pixelClockKHz))) {
+		FBLOG("pipe2: not lit: no DisplayPort sink with a link for the mode on AUX%u", ddcLine);
+		return false;
+	}
+
+	Pipe2::Target t {};
+	t.litHubp = pipe.hubp;
+	t.encoderObjId = path.encoderObjId;
+	t.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
+	t.linkRate = pipe2Link.rate;
+	// Only level 3 stops at the stream; the survey (2) covers the whole plan.
+	t.depth = level == 3 ? Pipe2::Depth::Stream : Pipe2::Depth::Plane;
+	t.sinkScdc = Edid::hdmi2Caps(edid2Data, edid2Len).scdc;
+	t.ddcLine = ddcLine;
+	// The lit pipe scans the console from the address in its HUBP; the second
+	// surface lies in the same memory, so the same distance further on.
+	constexpr uint32_t kSurfaceLo = 0x060a, kSurfaceHi = 0x060b;   // HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS(_HIGH)
+	const uint64_t lit = regReadDmu(2, kSurfaceLo + hubpOff()) |
+	                     (static_cast<uint64_t>(regReadDmu(2, kSurfaceHi + hubpOff()) & 0xffff) << 32);
+	if (surfacePhys <= fbPhysBase || lit == 0) {
+		FBLOG("pipe2: not lit: no scanout address (console 0x%llx at 0x%llx, surface 0x%llx)", fbPhysBase,
+		      lit, surfacePhys);
+		return false;
+	}
+	t.surface = lit + (surfacePhys - fbPhysBase);
+
+	// The plane needs its share of the DET buffer; what the others hold is
+	// theirs (taking it back means reprogramming the lit pipe).
+	uint32_t det[4] {}, others = 0;
+	for (uint32_t i = 0; i < 4; i++) {
+		det[i] = regReadDmu(c.detSeg, c.detCtrl[i]) & 0x1f;
+		if (i != c.pipe)
+			others += det[i];
+	}
+	const bool detFits = others + c.detSegments <= Pipe2::kDetSegmentsTotal;
+	FBLOG("pipe2: DET segments %u %u %u %u of %u: %u for the plane %s", det[0], det[1], det[2], det[3],
+	      Pipe2::kDetSegmentsTotal, c.detSegments, detFits ? "fit" : "do NOT fit");
+
+	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
+	if (!plan)
+		return false;
+	const char *why = "";
+	bool ok = Pipe2::build(t, *plan, &why);
+	if (!ok) {
+		FBLOG("pipe2: not lit: %s", why);
+	} else if (level <= 2) {
+		FBLOG("pipe2: pipe %u DIG%u link %u HPD%u, %ux%u at %u kHz, surface at 0x%llx: %lu steps, "
+		      "%lu DMUB commands", c.pipe, c.dig, c.link, c.hpd, c.timing.hActive, c.timing.vActive,
+		      c.timing.pixelClockKHz, t.surface, static_cast<unsigned long>(plan->count),
+		      static_cast<unsigned long>(plan->ncmds));
+		surveySteps(plan->steps, plan->count, plan->cmds);
+	} else if (t.depth == Pipe2::Depth::Plane && !detFits) {
+		FBLOG("pipe2: not lit: the lit pipe holds the DET buffer; rdna4-head2=3 lights the stream alone");
+		ok = false;
+	} else {
+		FBLOG("pipe2: lighting pipe %u DIG%u link %u HPD%u, %ux%u at %u kHz, %s: %lu steps, %lu DMUB "
+		      "commands", c.pipe, c.dig, c.link, c.hpd, c.timing.hActive, c.timing.vActive,
+		      c.timing.pixelClockKHz, t.depth == Pipe2::Depth::Plane ? "stream and plane" : "stream only",
+		      static_cast<unsigned long>(plan->count), static_cast<unsigned long>(plan->ncmds));
+		// Before the plan runs: its training step reads the connector from here.
+		pipe2Target = t;
+		pipe2Target.now = c.timing;
+		pipe2ConnectorObjId = path.connectorObjId;
+		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", c.pipe * Pipe::Reg::kOtgStride,
+		              plan->aux);
+		pipe2Lit = pipe2On = ok;
+		// Whether it runs: the frame rate of its timing generator, and the
+		// underflow flags of the plane and the OPTC (HUBPn_DCHUBP_CNTL,
+		// ODMn_OPTC_INPUT_GLOBAL_CONTROL), raw.
+		const uint64_t periodNs = measureFramePeriodNs(c.pipe * Pipe::Reg::kOtgStride);
+		const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
+		const uint32_t want = c.timing.refreshMilliHz();
+		FBLOG("pipe2: %s; OTG%u measured %u.%03u Hz (the mode is %u.%03u); HUBP%u_DCHUBP_CNTL=0x%08x "
+		      "ODM%u_OPTC_INPUT_GLOBAL_CONTROL=0x%08x", ok ? "plan ran" : "plan STOPPED", c.pipe,
+		      mHz / 1000, mHz % 1000, want / 1000, want % 1000, c.pipe,
+		      regReadDmu(2, 0x05f4 + c.pipe * Pipe::Reg::kHubpStride), c.pipe,
+		      regReadDmu(2, 0x1aca + c.pipe * Pipe::Reg::kOdmStride));
+		if (ok && level >= 4)
+			comparePipeColour(*plan);
+		// With the stream lit, what the plane would still change.
+		t.depth = Pipe2::Depth::Plane;
+		if (ok && level == 3 && Pipe2::build(t, *plan, &why))
+			surveySteps(plan->steps, plan->count, plan->cmds);
+	}
+	IOFree(plan, sizeof(Pipe2::Plan));
+	return ok;
+}
+
+// One pipe was programmed by the firmware and one by Linux's code: where the
+// two colour paths differ is where a difference in the picture can come from.
+// Geometry and instance numbers differ by nature (DSCL sizes, TOP_SEL, DPG
+// dimensions).
+void RDNA4Device::comparePipeColour(const Pipe2::Plan &plan) {
+	const Pipe2::Config &c = Pipe2::config();
+	uint32_t compared = 0, differ = 0;
+	auto planStep = [&](uint8_t seg, uint32_t dword, size_t before) -> const ModeSet::Step * {
+		for (size_t i = 0; i < before; i++) {
+			const ModeSet::Step &s = plan.steps[i];
+			if ((s.op == ModeSet::Op::Write || s.op == ModeSet::Op::Update) && s.seg == seg && s.dword == dword)
+				return &s;
+		}
+		return nullptr;
+	};
+	auto compare = [&](uint8_t seg, uint32_t dword, const char *what) {
+		const int twin = Pipe2::colourTwin(seg, dword, c.pipe, pipe.hubp, pipe.opp);
+		if (twin < 0)
+			return;
+		compared++;
+		const uint32_t mine = regReadDmu(seg, dword), lit = regReadDmu(seg, static_cast<uint32_t>(twin));
+		if (mine == lit)
+			return;
+		differ++;
+		FBLOG("pipe2: colour: %u:%04x %08x, lit pipe %u:%04x %08x  %s", seg, dword, mine, seg, twin, lit, what);
+	};
+	// What the plan set on its pipe, each register once ...
+	for (size_t i = 0; i < plan.count; i++) {
+		const ModeSet::Step &s = plan.steps[i];
+		if ((s.op == ModeSet::Op::Write || s.op == ModeSet::Op::Update) && !planStep(s.seg, s.dword, i))
+			compare(s.seg, s.dword, s.what);
+	}
+	// ... and what it left at reset there, in the blocks that can be read whole.
+	for (const Pipe2::ColourBlock &b : Pipe2::kColourBlocks) {
+		const uint32_t first = b.first + c.pipe * b.stride;
+		for (uint32_t dword = first; b.whole && dword < first + b.stride; dword++)
+			if (!planStep(b.seg, dword, plan.count))
+				compare(b.seg, dword, "(not set by the plan)");
+	}
+	FBLOG("pipe2: colour: %u registers of pipe %u compared with the lit pipe's (HUBP%u, OPP%u): %u differ",
+	      compared, c.pipe, pipe.hubp, pipe.opp, differ);
+}
+
+// What a DisplayPort plan needs of its sink before it can train: the
+// receiver capability, read where the sink's EDID is.
+bool RDNA4Device::readSecondDpSink(uint8_t aux) {
+	uint8_t caps[16] {};
+	pipe2Aux = aux;
+	pipe2Sink = {};
+	if (!dpcdRead(aux, 0x000, caps, sizeof(caps)) || !DpTrain::parseCaps(caps, sizeof(caps), pipe2Sink)) {
+		pipe2Sink = {};
+		FBLOG("pipe2: no DisplayPort receiver capability on AUX%u", aux);
+		return false;
+	}
+	FBLOG("pipe2: DisplayPort sink on AUX%u: DPCD %u.%u, up to %u lane(s) at rate 0x%02x%s%s", aux, caps[0] >> 4,
+	      caps[0] & 0xf, pipe2Sink.maxLanes, pipe2Sink.maxRate, pipe2Sink.tps3 ? ", TPS3" : "",
+	      pipe2Sink.tps4 ? ", TPS4" : "");
+	return true;
+}
+
+// The smallest link of the sink's that carries a mode at 8 bpc: what the next
+// training step brings up.
+bool RDNA4Device::pickSecondLink(uint32_t pixelClockKHz) {
+	if (!pipe2Sink.maxRate || !DpTrain::pickLink(pipe2Sink, pixelClockKHz, 24, pipe2Link)) {
+		FBLOG("pipe2: the DisplayPort sink has no link for %u kHz", pixelClockKHz);
+		return false;
+	}
+	FBLOG("pipe2: %u lane(s) at rate 0x%02x for %u kHz", pipe2Link.lanes, pipe2Link.rate, pixelClockKHz);
+	return true;
+}
+
+bool RDNA4Device::readDpDto(uint8_t otg, ModeSet::DpDto &out, uint32_t *cntlOut) {
+	constexpr uint32_t kOtgPixelRateCntl = 0x0080, kDpDtoPhase = 0x0081, kDpDtoModulo = 0x0082;   // + 4 per OTG, base_idx 1
+	constexpr uint32_t kOtgPixelRateDiv = 0x006f;
+	const uint32_t cntl = regReadDmu(1, kOtgPixelRateCntl + 4 * otg);
+	if (cntlOut)
+		*cntlOut = cntl;
+	// DP_DTO_ENABLE and PIPE_DTO_SRC_SEL, as dccg401_set_dp_dto leaves them
+	if (cntl == 0xFFFFFFFF || (cntl & 0x1010) != 0x1010)
+		return false;
+	out.phase = regReadDmu(1, kDpDtoPhase + 4 * otg);
+	out.modulo = regReadDmu(1, kDpDtoModulo + 4 * otg);
+	out.integer = (regReadDmu(1, kOtgPixelRateDiv) >> (1 + 5 * otg)) & 0xf;
+	return true;
+}
+
+// The Op::Train step of a DisplayPort plan.
+bool RDNA4Device::trainSecondLink() {
+	const Pipe2::Config &c = Pipe2::config();
+	DpTrain::Report rep {};
+	const DpTrain::Result r = trainLink(pipe2Aux, c.link, c.hpd, pipe2Target.connectorObjId, pipe2Sink, pipe2Link,
+	                                    false, rep);
+	FBLOG("pipe2: link %u, %u lane(s) at rate 0x%02x: %s after %u attempt(s): swing %u, pre-emphasis %u, lanes %02x "
+	      "%02x, aligned %u", c.link, pipe2Link.lanes, pipe2Link.rate, DpTrain::resultName(r), rep.attempts, rep.swing,
+	      rep.preEmphasis, rep.status[0], rep.status[1], rep.status[2] & 1);
+	return r == DpTrain::Result::Ok;
+}
+
+bool RDNA4Device::usePlanFor(uint8_t hpd) {
+	const uint8_t was = Pipe2::config().hpd;
+	if (!Pipe2::use(hpd))
+		return false;
+	if (Pipe2::config().dp && !pipe2DpAllowed) {
+		Pipe2::use(was);
+		return false;
+	}
+	return true;
+}
+
+uint8_t RDNA4Device::secondSinkHpd(bool orAnother) {
+	// DC_GPIO_HPD_Y: one byte per pin, HPD1 lowest (probeEDID).
+	const uint32_t hpdY = regReadDmu(2, 0x28f7);
+	if (hpdY == 0xFFFFFFFF)
+		return 0;
+	auto high = [&](uint8_t hpd) { return hpd && ((hpdY >> (8 * (hpd - 1))) & 1); };
+	const Pipe2::Config &now = Pipe2::config();
+	if (pipe2Lit && (high(now.hpd) || !orAnother))   // its own connector first
+		return high(now.hpd) ? now.hpd : 0;
+	for (size_t i = 0; i < Pipe2::configCount(); i++) {
+		const Pipe2::Config &c = Pipe2::configAt(i);
+		if (c.hpd == pipe.hpd || !high(c.hpd) || (c.dp && !pipe2DpAllowed))
+			continue;
+		// A lit pipe moves between HDMI connectors only (secondPipeTo).
+		if (!pipe2Lit || (!c.dp && !now.dp))
+			return c.hpd;
+	}
+	return 0;
+}
+
+bool RDNA4Device::secondPipeTo(uint8_t hpd) {
+	if (!pipe2Lit)
+		return false;
+	const Pipe2::Config was = Pipe2::config();
+	if (hpd == was.hpd) {
+		setSecondPipePower(true);
+		return pipe2On;
+	}
+	AtomBios::DisplayPath path {};
+	uint8_t ddcLine = 0;
+	const Pipe2::Target target = pipe2Target;
+	const uint16_t connector = pipe2ConnectorObjId;
+	bool ok = !was.dp && usePlanFor(hpd);
+	const Pipe2::Config &c = Pipe2::config();
+	ok = ok && !c.dp && pipe.dig != c.dig && pipe.link != c.link && pathForHpd(hpd, path, &ddcLine) &&
+	     Pipe2::linkOfEncoder(path.encoderObjId) == c.link;
+	if (!ok) {
+		FBLOG("pipe2: not moved from HPD%u to HPD%u: only between HDMI connectors the boot display does not use",
+		      was.hpd, hpd);
+		Pipe2::use(was.hpd);
+		return false;
+	}
+	FBLOG("pipe2: moving from HPD%u (DIG%u, link %u) to HPD%u (DIG%u, link %u) at %ux%u, %u kHz", was.hpd, was.dig,
+	      was.link, c.hpd, c.dig, c.link, pipe2Target.now.hActive, pipe2Target.now.vActive,
+	      pipe2Target.now.pixelClockKHz);
+	if (pipe2On) {   // the old link down first, by its own table
+		Pipe2::use(was.hpd);
+		runSecondPipePart(Pipe2::Part::Sleep);
+		Pipe2::use(hpd);
+		pipe2On = false;
+	}
+	pipe2Target.encoderObjId = path.encoderObjId;
+	pipe2Target.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
+	pipe2Target.ddcLine = ddcLine;
+	pipe2ConnectorObjId = path.connectorObjId;
+	// The mode set to the running timing: the pipe's clock from the new
+	// connector's PLL, its encoder and transmitter. Then that connector's sleep
+	// and wake, which leave its encoder and link as lighting there would
+	// (tools/atomdump.cpp, testPipe2Move).
+	const Modes::Mode same { 0, pipe2Target.now, pipe2Target.now.refreshMilliHz(), false, Modes::SourceBoot };
+	ok = applySecondPipeMode(same) == kIOReturnSuccess && runSecondPipePart(Pipe2::Part::Sleep) &&
+	     runSecondPipePart(Pipe2::Part::Wake);
+	if (!ok) {
+		FBLOG("pipe2: the move to HPD%u did not complete: the pipe stays with HPD%u, off", hpd, was.hpd);
+		Pipe2::use(was.hpd);
+		pipe2Target = target;
+		pipe2ConnectorObjId = connector;
+		return false;
+	}
+	pipe2On = true;
+	FBLOG("pipe2: now on HPD%u; DIG%u_DIG_FE_EN_CNTL=0x%08x SYMCLK%c_CLOCK_ENABLE=0x%08x", c.hpd, c.dig,
+	      regReadDmu(2, Pipe::Reg::kDigFeEnCntl + c.dig * Pipe::Reg::kDigStride), 'A' + c.dig,
+	      regReadDmu(1, 0x00a0 + c.dig));
+	return true;
+}
+
+bool RDNA4Device::readSecondEdid(uint8_t hpd) {
+	AtomBios::DisplayPath path {};
+	uint8_t ddcLine = 0;
+	uint8_t edid[256] {};
+	static const uint8_t sig[8] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
+	if (!pathForHpd(hpd, path, &ddcLine))
+		return false;
+	// A DisplayPort sink's EDID comes over its AUX channel, and with it what
+	// its receiver can do: it may be another monitor than before.
+	const AtomBios::ConnectorType type = AtomBios::connectorType(path.connectorObjId);
+	const bool viaAux = type == AtomBios::ConnectorDP || type == AtomBios::ConnectorUSBC;
+	auto read = [&](uint8_t *to, uint8_t start) {
+		return viaAux ? readEDID(ddcLine, to, 128, start) : readEDIDI2C(ddcLine, to, 128, start);
+	};
+	if (!read(edid, 0) || memcmp(edid, sig, sizeof(sig)) != 0 || (viaAux && !readSecondDpSink(ddcLine)))
+		return false;
+	// The extension says whether the sink has SCDC and carries more modes.
+	const bool ext = edid[126] > 0 && read(edid + 128, 128);
+	edid2Len = ext ? 256 : 128;
+	edid2Hpd = hpd;
+	memcpy(edid2Data, edid, sizeof(edid));
+	pipe2Target.sinkScdc = Edid::hdmi2Caps(edid2Data, edid2Len).scdc;   // it may be another monitor
+	return true;
+}
+
+// One part of the generated table for the timing the pipe runs now.
+bool RDNA4Device::runSecondPipePart(Pipe2::Part part, size_t *steps) {
+	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
+	if (!plan)
+		return false;
+	Pipe2::Target t = pipe2Target;
+	t.part = part;
+	t.linkRate = pipe2Link.rate;
+	const char *why = "";
+	bool ok = Pipe2::build(t, *plan, &why);
+	if (!ok)
+		FBLOG("pipe2: no plan: %s", why);
+	else
+		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2",
+		              Pipe2::config().pipe * Pipe::Reg::kOtgStride, plan->aux);
+	if (steps)
+		*steps = plan->count;
+	IOFree(plan, sizeof(Pipe2::Plan));
+	return ok;
+}
+
+void RDNA4Device::setSecondPipePower(bool on) {
+	if (!pipe2Lit || on == pipe2On)
+		return;
+	if (!displaySleepEnabled) {
+		displayPowerNote(on, "pipe2", "ignored: rdna4-nosleep=1");
+		return;
+	}
+	const Pipe2::Config &c = Pipe2::config();
+	// The wake part trains the link: the smallest for the mode the pipe runs,
+	// of the sink that is there now.
+	if (on && c.dp && !pickSecondLink(pipe2Target.now.pixelClockKHz)) {
+		displayPowerNote(on, "pipe2", "no DisplayPort link for the mode");
+		return;
+	}
+	size_t steps = 0;
+	const bool ok = runSecondPipePart(on ? Pipe2::Part::Wake : Pipe2::Part::Sleep, &steps);
+	// The stream encoder's enable, and its symbol clock gate: amdgpu clears
+	// the gate going to sleep and, for HDMI, never sets it again.
+	const uint32_t fe = regReadDmu(2, Pipe::Reg::kDigFeEnCntl + c.dig * Pipe::Reg::kDigStride);
+	const uint32_t symclk = regReadDmu(1, 0x00a0 + c.dig);                       // SYMCLKn_CLOCK_ENABLE
+	FBLOG("power: pipe2 display %s: %lu steps %s; DIG%u_DIG_FE_EN_CNTL=0x%08x SYMCLK%c_CLOCK_ENABLE=0x%08x",
+	      on ? "on" : "off", static_cast<unsigned long>(steps), ok ? "ran" : "STOPPED", c.dig, fe,
+	      'A' + c.dig, symclk);
+	char res[48];
+	snprintf(res, sizeof(res), "%s, FE %08x SYMCLK %08x", ok ? "ran" : "STOPPED", fe, symclk);
+	displayPowerNote(on, "pipe2", res);
+	pipe2On = on;   // also after a plan that stopped: the next request runs the other one
+}
+
+// The modes the second pipe can be switched to scan the surface it was lit
+// on, so none is larger than the plan's; and the sleep and wake parts of the
+// table are for an unscrambled link.
+Modes::Limits RDNA4Device::secondPipeModeLimits() const {
+	const Edid::DetailedTiming &plan = Pipe2::config().timing;
+	Modes::Limits lim {};
+	lim.maxHActive = plan.hActive;
+	lim.maxVActive = plan.vActive;
+	// On DisplayPort, what the sink's largest link carries at 8 bpc.
+	lim.maxPixelClockKHz = Pipe2::config().dp
+		? DpTrain::bandwidthKbps(DpTrain::Link { pipe2Sink.maxLanes, pipe2Sink.maxRate }) / 24
+		: ModeSet::kScrambleFromKHz;
+	return lim;
+}
+
+bool RDNA4Device::secondPipeModeOk(const Edid::DetailedTiming &t, const char **why) {
+	const Pipe2::Config &c = Pipe2::config();
+	const char *dummy;
+	const char *&err = why ? *why : dummy;
+	// Without Linux's request timing for the mode the pipe keeps the lit
+	// mode's, which carries a pixel clock up to a quarter above its own: the
+	// margin the boot display's switching runs with (buildModeTable).
+	if (!Pipe2::modeKnown(t) && t.pixelClockKHz > c.timing.pixelClockKHz * 5 / 4) {
+		err = "no request timing for a pixel clock this far above the lit mode's";
+		return false;
+	}
+	// The DET segments the mode needs, next to what the other pipes hold.
+	uint32_t segments = Pipe2::modeDetSegments(t);
+	for (uint32_t i = 0; i < 4; i++)
+		if (i != c.pipe)
+			segments += regReadDmu(c.detSeg, c.detCtrl[i]) & 0x1f;
+	if (segments > Pipe2::kDetSegmentsTotal) {
+		err = "the DET buffer is too small for it next to the other pipes";
+		return false;
+	}
+	return true;
+}
+
+// A mode that needs more of a DisplayPort link than it has: the link goes
+// down and comes up larger, as for sleep and wake, with the stream still in
+// the mode it runs. A link that is large enough stays.
+bool RDNA4Device::relinkSecondPipe(uint32_t pixelClockKHz) {
+	if (DpTrain::bandwidthKbps(pipe2Link) >= static_cast<uint64_t>(pixelClockKHz) * 24)
+		return true;
+	const DpTrain::Link had = pipe2Link;
+	if (!pickSecondLink(pixelClockKHz))
+		return false;
+	const bool ok = runSecondPipePart(Pipe2::Part::Sleep) && runSecondPipePart(Pipe2::Part::Wake);
+	if (!ok) {
+		FBLOG("pipe2: the larger link did not come up: back to %u lane(s) at rate 0x%02x", had.lanes, had.rate);
+		pipe2Link = had;
+		runSecondPipePart(Pipe2::Part::Sleep);
+		pipe2On = runSecondPipePart(Pipe2::Part::Wake);
+	}
+	return ok;
+}
+
+IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
+	if (!pipe2Lit)
+		return kIOReturnUnsupported;
+	const Pipe2::Config &c = Pipe2::config();
+	const uint32_t otgOffset = c.pipe * Pipe::Reg::kOtgStride;
+	const char *why = "";
+	if (!secondPipeModeOk(m.t, &why)) {
+		FBLOG("pipe2: switch to id %u refused: %s", m.id, why);
+		return kIOReturnUnsupported;
+	}
+	struct Work {
+		ModeSet::Plan plan;
+		ModeSet::Step extra[Pipe2::kMaxModeSteps];
+	};
+	auto *work = static_cast<Work *>(IOMalloc(sizeof(Work)));
+	if (!work)
+		return kIOReturnNoMemory;
+	ModeSet::Plan *plan = &work->plan;
+	ModeSet::Target t {};
+	t.extra = work->extra;
+	t.otg = t.opp = t.hubp = c.pipe;
+	t.dig = c.dig;
+	t.link = c.link;
+	t.hpd = c.hpd;
+	t.encoderObjId = pipe2Target.encoderObjId;
+	t.connectorObjId = pipe2ConnectorObjId;
+	t.sinkScdc = pipe2Target.sinkScdc;
+	t.ddcLine = pipe2Target.ddcLine;
+	// DisplayPort: the stream is retimed on the link as it is, like the boot
+	// display's, after the link was made large enough for the mode.
+	const Edid::DetailedTiming was = pipe2Target.now;
+	ModeSet::DpDto dtoNow {};
+	if (c.dp && (!relinkSecondPipe(m.t.pixelClockKHz) || !readDpDto(c.pipe, dtoNow))) {
+		FBLOG("pipe2: switch to id %u refused: no DisplayPort link or pixel-rate DTO for it", m.id);
+		IOFree(work, sizeof(Work));
+		return kIOReturnUnsupported;
+	}
+	t.dp = c.dp;
+	t.dpMaxKHz = DpTrain::bandwidthKbps(pipe2Link) / 24;
+	// From the timing the pipe runs to `to`, then the infoframe for it.
+	bool touched = false;   // a refused plan changes nothing; one that stops half-way does
+	auto retime = [&](const Edid::DetailedTiming &to) {
+		t.from = pipe2Target.now;
+		t.to = to;
+		if (c.dp) {
+			if (!ModeSet::scaleDpDto(dtoNow, was.pixelClockKHz, to.pixelClockKHz, t.dto))
+				t.dto = {};
+			t.vidM = ModeSet::dpVidM(to.pixelClockKHz, DpTrain::symbolClockKHz(pipe2Link.rate));
+		}
+		t.nextra = Pipe2::modeSteps(to, work->extra, Pipe2::kMaxModeSteps);
+		if (!ModeSet::build(t, *plan, &why))
+			return false;
+		why = "a step failed";
+		touched = true;
+		if (!runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", otgOffset))
+			return false;
+		pipe2Target.now = to;
+		return c.dp || runSecondPipePart(Pipe2::Part::Avi);
+	};
+	FBLOG("pipe2: switching to id %u %ux%u@%u.%03u (%u kHz), request timing %s", m.id, m.t.hActive, m.t.vActive,
+	      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, m.t.pixelClockKHz,
+	      Pipe2::modeKnown(m.t) ? "from Linux for this mode" : "of the lit mode");
+	const bool ok = retime(m.t);
+	if (!ok) {
+		FBLOG("pipe2: switch to id %u failed: %s", m.id, why);
+		if (touched && !retime(was))
+			FBLOG("pipe2: the previous mode is NOT restored: %s", why);
+	}
+	const uint64_t periodNs = measureFramePeriodNs(otgOffset);
+	const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
+	FBLOG("pipe2: now %ux%u at %u kHz, OTG%u measured %u.%03u Hz; HUBP%u_DCHUBP_CNTL=0x%08x "
+	      "ODM%u_OPTC_INPUT_GLOBAL_CONTROL=0x%08x DET %u", pipe2Target.now.hActive, pipe2Target.now.vActive,
+	      pipe2Target.now.pixelClockKHz, c.pipe, mHz / 1000, mHz % 1000, c.pipe,
+	      regReadDmu(2, 0x05f4 + c.pipe * Pipe::Reg::kHubpStride), c.pipe,
+	      regReadDmu(2, 0x1aca + c.pipe * Pipe::Reg::kOdmStride), regReadDmu(c.detSeg, c.detCtrl[c.pipe]) & 0x1f);
+	IOFree(work, sizeof(Work));
+	return ok ? kIOReturnSuccess : kIOReturnIOError;
+}
