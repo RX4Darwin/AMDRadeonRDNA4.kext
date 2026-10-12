@@ -1,6 +1,6 @@
 //
 //  modeset.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See modeset.hpp. Register offsets are dcn_4_1_0_offset.h (instance 0,
 //  base_idx 2 unless noted), fields dcn_4_1_0_sh_mask.h; the DC function

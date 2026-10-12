@@ -1,6 +1,6 @@
 //
 //  modes.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See modes.hpp for the ordering, priority and filtering rules.
 //

@@ -2,7 +2,7 @@
 
 Written 2026-09-30 by the lead as the closing document of the pre-Metal phase. Status words, used strictly:
 
-- **card**: measured on the RX 9070 XT under macOS with the kext (a `rdna4fb-diag-*` log on the stick or in `docs/hw-logs/`).
+- **card**: measured on the RX 9070 XT under macOS with the kext (a `amdradeonrdna4-diag-*` log on the stick or in `docs/hw-logs/`).
 - **card (Linux)**: measured on the same card under Linux with the kext's own bytes (tools/linux-replay, tools/radv-triangle).
 - **emulator**: passes in the QEMU model (`emu/qemu/rdna4.c`, `tools/emu-linux.sh`). The emulator has passed things the card then
   failed (VM clients, the G3 EXEC bug), so it is not evidence for the card.

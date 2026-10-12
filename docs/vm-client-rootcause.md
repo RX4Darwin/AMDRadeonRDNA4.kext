@@ -28,7 +28,7 @@ The final definition of the boots is `docs/boot9-vm-diagnostic.md` on branch `pr
      is **not** what pins the GPU: something `vm=1` does at boot does, and it survives a clean boot test [I].
    - **S-B/S-C** client queues are never serviced (doorbell HIT still set, rptr 0) and **no client HQD can ever be dequeued, not even clients that never kicked anything** [M/I §2].
 3. The boot self-test is a weak proof: it runs **no shader and no ACQUIRE_MEM/SET_SH_REG/DISPATCH**, only WRITE_DATA + RELEASE_MEM, and in round 6 the
-   bring-up lines are **not in the log at all** (dmesg ring wrapped; only `RDNA4FB,Results vm=PASS` survives, 061829:306). **The first shader wave in a
+   bring-up lines are **not in the log at all** (dmesg ring wrapped; only `AMDRadeonRDNA4,Results vm=PASS` survives, 061829:306). **The first shader wave in a
    non-zero VMID on this card is the client's** (Forge, confirmed in code: `launch()` compute.cpp:3115-3139 vs `vmBootSelfTest` runtime.cpp:984-985).
 4. The lead's replay shows our exact vadd IB and code object run correctly in a per-process VMID under amdgpu's setup (all 256 results right). That clears the
    **shader bytes and the PM4 stream content**; what is left is kext-side VM/queue/SH_MEM/MQD state and the busy-before-any-client state (§3).
@@ -68,7 +68,7 @@ then could not be drained: the CPF was stalled on the faulting fetch. [I]
 
 ### 2.2 Round 6 boot 2 (`061829`) and boot 3 (`062351`) — boot self-test PASS, every client fails
 
-- **Bring-up lines are gone** [M]: the dmesg section `=== dmesg: full RDNA4FB log ===` (:22) begins at 146.7 s and is cursor spam; the boot test, the cg
+- **Bring-up lines are gone** [M]: the dmesg section `=== dmesg: full AMDRadeonRDNA4 log ===` (:22) begins at 146.7 s and is cursor spam; the boot test, the cg
   sequence and the HQD lines are not in any round 6 log. The diagnostic script's `gfxcg SKIPPED: bring-up did not reach stage 7` (:539) is therefore an
   **artefact of the missing lines**, not evidence that clock gating was not applied. Forge's note 5 ("CG was NOT applied in the failing boot") is **wrong**
   [M/I]: the boot finished stage 7 (:197 "finished at stage 7", :200 "ready") and the GPU draws 76-81 W, not the 268-315 W of every ungated boot; the

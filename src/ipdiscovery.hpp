@@ -1,6 +1,6 @@
 //
 //  ipdiscovery.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Parser for AMD's IP discovery binary — the authoritative per-card list of
 //  IP blocks, their versions, and their register base addresses. Modern

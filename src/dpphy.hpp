@@ -1,6 +1,6 @@
 //
 //  dpphy.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  What DisplayPort link training (dptrain.hpp) asks of the hardware, for
 //  DCN 4.01: the link encoder registers behind a training pattern, and the

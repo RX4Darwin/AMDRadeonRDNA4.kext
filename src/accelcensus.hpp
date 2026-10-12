@@ -1,6 +1,6 @@
 //
 //  accelcensus.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  E1 of docs/metal-spike.md (hub-task-354): the impostor-IOAccelerator census. With the boot-arg rdna4-accelcensus=1 (or 2) the kext publishes one
 //  IOAccelerator-class service on the GPU's IOPCIDevice that carries the registry properties Apple's AMD accelerators use to point Metal at a
@@ -11,7 +11,7 @@
 //  level 2 answers every selector with success and zeroed outputs so the caller goes further and shows the next selectors. Default off, and meant
 //  for the emulator only: it must never be in a real-card boot (docs/metal-spike.md, E1).
 //
-//  The census lives in the kernel log (lines "RDNA4FB: accelcensus: ...") and, bounded, in the service's registry property "CensusLog".
+//  The census lives in the kernel log (lines "AMDRadeonRDNA4: accelcensus: ...") and, bounded, in the service's registry property "CensusLog".
 //
 
 #ifndef RDNA4AccelCensus_hpp
@@ -22,7 +22,7 @@
 
 // Why this is not a subclass of IOAccelerator: OpenCore injects our kext into the BOOT kernel collection, and IOGraphicsFamily (which defines
 // IOAccelerator) is not in it (in Recovery it is in BaseSystemKernelExtensions.kc, on a full system in SystemKernelExtensions.kc), so a kext that
-// links against it is never loaded (hub-task-356, measured: with that one dependency line added to a kext that otherwise loads, the serial log has 0 "RDNA4FB" lines). The
+// links against it is never loaded (hub-task-356, measured: with that one dependency line added to a kext that otherwise loads, the serial log has 0 "AMDRadeonRDNA4" lines). The
 // public header shows IOAccelerator adding no data members and no virtuals of its own to IOService [INFER for the real class], so the census object is an IOService whose getMetaClass() answers with the
 // metaclass of the REAL IOAccelerator, looked up by name at run time: IOServiceMatching("IOAccelerator"), OSDynamicCast and metaCast all walk
 // the metaclass chain and accept it. The registry shows the class name "IOAccelerator"; the registry NAME is "RDNA4AccelCensus". Census only:

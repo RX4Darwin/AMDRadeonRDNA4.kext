@@ -117,16 +117,16 @@ If the machine does not get to the desktop at all, take `rdna4-compute` out of t
    Check that the firmware is in: this must print a number above 0.
 
    ```bash
-   nm build/RDNA4FB.kext/Contents/MacOS/RDNA4FB | grep -c rdna4_fw_
+   nm build/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4 | grep -c rdna4_fw_
    ```
 
    And note the kext's UUID, to compare with the `kext loaded?` line of the log after the boot:
 
    ```bash
-   dwarfdump --uuid build/RDNA4FB.kext/Contents/MacOS/RDNA4FB
+   dwarfdump --uuid build/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4
    ```
 
-4. To the rig: `build/RDNA4FB.kext` (into the EFI as usual), and into one folder `build/n48nprobe`,
+4. To the rig: `build/AMDRadeonRDNA4.kext` (into the EFI as usual), and into one folder `build/n48nprobe`,
    `build/rdna4-run` and `tools/diagnostic-log.sh`. (With `rdna4-run` beside it the diagnostic script also runs the
    runtime's own self-test, a compute dispatch; that is m1guer's and useful to have in the same log.)
 

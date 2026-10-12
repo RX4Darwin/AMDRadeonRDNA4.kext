@@ -1,4 +1,4 @@
-# RDNA4FB real-card batch plan
+# AMDRadeonRDNA4 real-card batch plan
 
 ## How to run it (one loop per boot)
 
@@ -15,13 +15,13 @@ The USB stick `OPENCORE` holds the kext, `rdna4-run`, `diagnostic-log.sh`,
 
 Boot 0 is today's known-good argument set: it enables no new behavior at all.
 The summary reads the
-durable `RDNA4FB,Results` IORegistry dictionary first and uses the current
+durable `AMDRadeonRDNA4,Results` IORegistry dictionary first and uses the current
 boot's dmesg as supporting evidence. A PASS requires the command's result and
 the registry result to agree. The optional
 `bash /Volumes/OPENCORE/diagnostic-log.sh hang` step is last, on boot 2;
 ordinary collection never runs a hang test.
 
-To roll back the kext, replace `EFI/OC/Kexts/RDNA4FB.kext` with the copy in
+To roll back the kext, replace `EFI/OC/Kexts/AMDRadeonRDNA4.kext` with the copy in
 `backup-before-premetal/`. `set-boot.sh` keeps the first config backup and
 validates a new plist with `plutil` when that tool is available.
 
@@ -55,7 +55,7 @@ trail if it hangs.
    the next boot; animation is skipped if its command is unavailable.
 
 4. **GFX ring and first draw (G3).** Add `rdna4-gfx=2` to boot 3 (`=1`, the MMIO write pointer, halts PFP/ME on the card and is now an alias of 2).
-   `gfx PASS` is recorded in the current boot's `RDNA4FB,Results` value,
+   `gfx PASS` is recorded in the current boot's `AMDRadeonRDNA4,Results` value,
    containing `THE TRIANGLE IS RIGHT` and 8192 pixels. The registry is read
    per boot, so this durable result is the batch evidence; a stale NVRAM trail
    never proves PASS. A ring or draw hang leaves a `gfx:` trail, and the next
@@ -85,7 +85,7 @@ separate power-management work.
    leaves the `cursor:` trail. W12's future `rdna4-run tri` gets the next plan
    slot; its PASS will require the app marker plus a durable registry result,
    with `tri:` as the hang fallback.
-   The cursor evidence is also in the registry property `RDNA4FB,Cursor` (printed
+   The cursor evidence is also in the registry property `AMDRadeonRDNA4,Cursor` (printed
    by diagnostic-log.sh). **Boot 9** is the same with `rdna4-cursor=2`: a magenta
    64x64 square at (100,100) that macOS's pointer does not replace; see
    `docs/cursor-audit.md` for how to read the result.
@@ -244,7 +244,7 @@ addresses plus pipe reset); stage 5 performs that configuration first. The
 emulator reproduces a missing acknowledgement with
 `RDNA4_DEV=inv-noack=on`. If `vmid N: VM invalidate timeout` appears, VM fails
 gracefully: compute stays up, per-client GPUVM turns off, and the other rows
-continue. The `RDNA4FB,Results` property records `vm = FAIL invalidate timeout`
+continue. The `AMDRadeonRDNA4,Results` property records `vm = FAIL invalidate timeout`
 even if dmesg wrapped. The fix path is in-ring invalidation on the
 gfx/compute ring, planned by W12 D1.
 

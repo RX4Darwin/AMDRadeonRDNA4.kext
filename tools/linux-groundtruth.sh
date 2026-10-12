@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # linux-groundtruth.sh: READ-ONLY capture of what Linux amdgpu programs on this
-# RX 9070 XT (gfx1201 / GC 12.0.1 / DCN 4.0.1), to compare with RDNA4FB.
+# RX 9070 XT (gfx1201 / GC 12.0.1 / DCN 4.0.1), to compare with AMDRadeonRDNA4.
 # Written 2026-09-29 for the round-5 root-cause work (see
 # docs/linux-ground-truth.md). It never writes a register or VRAM.
 #

@@ -1,6 +1,6 @@
 //
 //  ipdiscovery.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See ipdiscovery.hpp for scope and the ROM this was validated against.
 //

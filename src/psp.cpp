@@ -1,6 +1,6 @@
 //
 //  psp.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See psp.hpp.
 //

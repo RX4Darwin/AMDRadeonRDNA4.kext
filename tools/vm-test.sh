@@ -70,13 +70,13 @@ echo "vm-test: building the host tests, the kext and rdna4-run first (a failure 
 make test >"$BUILD_LOG" 2>&1 || { tail -30 "$BUILD_LOG"; die "make test failed (host unit tests)"; }
 tail -2 "$BUILD_LOG"
 # No stale artefact may survive a failed build.
-rm -rf build/RDNA4FB.kext build/rdna4-run
+rm -rf build/AMDRadeonRDNA4.kext build/rdna4-run
 tools/build-osxcross.sh >"$BUILD_LOG" 2>&1 || {
 	grep -E 'error|Error' "$BUILD_LOG" | head -30; tail -5 "$BUILD_LOG"
 	die "the kext / rdna4-run build failed (tools/build-osxcross.sh returned non-zero)"
 }
 grep -E 'error:|warning: [^o]|Built' "$BUILD_LOG" || true
-KEXT_BIN=build/RDNA4FB.kext/Contents/MacOS/RDNA4FB
+KEXT_BIN=build/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4
 [ -f "$KEXT_BIN" ] || die "the build reported success but there is no $KEXT_BIN"
 [ -x build/rdna4-run ] || die "the build reported success but there is no build/rdna4-run"
 for p in "$KEXT_BIN" build/rdna4-run; do
@@ -87,13 +87,13 @@ done
 NM=$(ls "$HOME"/osxcross/target/bin/x86_64-apple-darwin*-nm 2>/dev/null | head -1 || true)
 if [ -n "$NM" ]; then
 	UNDEF=$("$NM" -u "$KEXT_BIN" 2>/dev/null | grep -E '__ZN[K]?[0-9]+RDNA4|__ZN[0-9]+RDNA4|rdna4_' || true)
-	[ -z "$UNDEF" ] || { echo "$UNDEF" | head; die "the kext has undefined RDNA4FB symbols (it would not load in the guest)"; }
+	[ -z "$UNDEF" ] || { echo "$UNDEF" | head; die "the kext has undefined AMDRadeonRDNA4 symbols (it would not load in the guest)"; }
 fi
 # Snapshot what will boot: a rebuild of this checkout while the run waits in the queue
 # must not change it.
-cp -a build/RDNA4FB.kext "$SNAP/RDNA4FB.kext"
+cp -a build/AMDRadeonRDNA4.kext "$SNAP/AMDRadeonRDNA4.kext"
 cp -a build/rdna4-run "$SNAP/rdna4-run"
-SNAP_KEXT="$SNAP/RDNA4FB.kext/Contents/MacOS/RDNA4FB"
+SNAP_KEXT="$SNAP/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4"
 STAMP_HEAD=$(repo_stamp)
 echo "vm-test: build stamp: git HEAD $STAMP_HEAD"
 echo "vm-test: build stamp: kext      $(stamp_file "$SNAP_KEXT")"
@@ -160,7 +160,7 @@ if [ ! -f build-emu/rdna4.rom ]; then
 	fi
 fi
 [ -f build-emu/rdna4.rom ] || { echo "vm-test: no build-emu/rdna4.rom"; exit 1; }
-tools/vm-opencore.sh --kext "$SNAP/RDNA4FB.kext" --lilu ~/kexts/Lilu.kext \
+tools/vm-opencore.sh --kext "$SNAP/AMDRadeonRDNA4.kext" --lilu ~/kexts/Lilu.kext \
 	--out OpenCore-emu.qcow2 --args "$ARGS" >"$BUILD_LOG" 2>&1 ||
 	{ tail -20 "$BUILD_LOG"; die "the OpenCore image build failed"; }
 tail -1 "$BUILD_LOG"
@@ -185,15 +185,15 @@ for i in $(seq 1 60); do grep -aq "BdsDxe: starting" ~/tahoe-serial.log 2>/dev/n
 sleep 12
 pick
 # Keys sent too early are lost: if the kernel has not started, pick again.
-for i in $(seq 1 30); do grep -aq "Darwin Kernel\|RDNA4FB" ~/tahoe-serial.log && break; sleep 2; done
-grep -aq "Darwin Kernel\|RDNA4FB" ~/tahoe-serial.log || { echo "vm-test: picking again"; pick; }
+for i in $(seq 1 30); do grep -aq "Darwin Kernel\|AMDRadeonRDNA4" ~/tahoe-serial.log && break; sleep 2; done
+grep -aq "Darwin Kernel\|AMDRadeonRDNA4" ~/tahoe-serial.log || { echo "vm-test: picking again"; pick; }
 
 # 3. Wait for the compute bring-up, then test from user space.
 for i in $(seq 1 200); do
 	grep -aqE "compute: (bring-up finished|.*failed; stopping)|panic|Kernel trap" ~/tahoe-serial.log && break
 	sleep 2
 done
-grep -aE "RDNA4FB: (compute: (bring-up finished|stage [0-9])|runtime: user-space)|panic" \
+grep -aE "AMDRadeonRDNA4: (compute: (bring-up finished|stage [0-9])|runtime: user-space)|panic" \
 	~/tahoe-serial.log | tail -3
 # A guest that panics leaves an SSH session to it hanging forever (09:20: a
 # run sat 15 minutes on a panicked VM, holding the lock). So every step in

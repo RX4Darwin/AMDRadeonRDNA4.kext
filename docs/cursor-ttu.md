@@ -28,7 +28,7 @@ combination on this ASIC, so it is now a **secondary opt-in** (`rdna4-cursorttu=
 
 ## 3. Read-only evidence (unchanged, `rdna4-cursor` = 1 or 2)
 
-Two lines per probe in the `RDNA4FB,Cursor` trail and the kernel log, at `armed`, `selftest`, after every boot flip (compute-thread hook `Env::cursorProbe`), and at the first
+Two lines per probe in the `AMDRadeonRDNA4,Cursor` trail and the kernel log, at `armed`, `selftest`, after every boot flip (compute-thread hook `Env::cursorProbe`), and at the first
 `cscSetHardwareCursor` / `cscDrawHardwareCursor` (max 10 probes):
 
 - `ttu: cur0 <CNTL0>/<CNTL1> surf0 <CNTL0>/<CNTL1> surf1 <CNTL0> global <GLOBAL_TTU_CNTL> qos_wm <QOS_WM> debug_db <HUBPREQ_DEBUG_DB>`
@@ -60,7 +60,7 @@ contradicts; a VM pass with it says only that the kext writes the register (`rdn
 
 ## 7. W38: DSCL / pipe state, per-update fields and the CRC self-check (`rdna4-cursor=2`)
 
-Source: premetal/rootcause-cursor.md (candidates #1 DSCL stage, #3 cursor-only state, #4 MPCC lock-set mapping). Everything logs into `RDNA4FB,Cursor`, every wait is bounded (<= 50 ms),
+Source: premetal/rootcause-cursor.md (candidates #1 DSCL stage, #3 cursor-only state, #4 MPCC lock-set mapping). Everything logs into `AMDRadeonRDNA4,Cursor`, every wait is bounded (<= 50 ms),
 only display registers are touched, the GPU is never reset.
 
 Order inside the self-test: `dscl:`/`pipe:` dump (`selftest pre`) -> per-update fields -> `DSCL decision:` -> mission mode (W34) -> arm -> `dscl:`/`pipe:` dump (`selftest post`) -> CRC check.

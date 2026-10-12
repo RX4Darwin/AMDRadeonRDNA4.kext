@@ -1,6 +1,6 @@
 //
 //  otgtiming.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Compute DCN OTG (timing generator) register images from an EDID detailed
 //  timing, following amdgpu's optc1_program_timing exactly. The OTG's pixel

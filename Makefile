@@ -1,18 +1,22 @@
-# Makefile — cross-compile the RDNA4FB kext for x86_64 (Intel hackintosh)
+# Makefile — cross-compile the AMDRadeonRDNA4 kext for x86_64 (Intel hackintosh)
 # from any host, including Apple Silicon. Targets macOS 11 (Big Sur) ABI.
 #
-#   make            build RDNA4FB.kext
+#   make            build AMDRadeonRDNA4.kext
 #   make VMTEST=1   build a VM smoke-test variant into build-vmtest/ (see below)
 #   make clean      remove build products
 #
-# RDNA4FB is a Lilu plugin (see src/plugin.cpp): Lilu's plugin_start.cpp is
+# AMDRadeonRDNA4 is a Lilu plugin (see src/plugin.cpp): Lilu's plugin_start.cpp is
 # compiled in, Lilu symbols are left undefined in the -kext bundle and
 # resolved by the kernel loader through OSBundleLibraries (as.vit9696.Lilu).
 # Install it with OpenCore (Kernel -> Add, after Lilu.kext).
 
-PRODUCT      := RDNA4FB
-BUNDLE_ID    := com.hackintosh.RDNA4FB
-VERSION      := 0.0.1
+PRODUCT      := AMDRadeonRDNA4
+BUNDLE_ID    := com.hackintosh.AMDRadeonRDNA4
+# The one place the version is written (CONTRIBUTING.md says when it changes). It goes into the bundle's Info.plist
+# and the kext's kmod_info; BUILD_REV says which commit a build was made from ("-dirty": with uncommitted changes) and
+# goes into the kernel log and the registry (AMDRadeonRDNA4,Build).
+VERSION      := 0.1.0
+BUILD_REV    := $(shell git describe --always --dirty --abbrev=8 2>/dev/null || echo unknown)
 
 ARCH         := x86_64
 DEPLOY       := 11.0
@@ -110,7 +114,7 @@ ASM_SRCS := src/fwblobs.S
 FW_FLAGS :=
 else
 ASM_SRCS :=
-FW_FLAGS := -DRDNA4FB_NO_FIRMWARE
+FW_FLAGS := -DAMDRadeonRDNA4_NO_FIRMWARE
 endif
 
 OBJS := $(patsubst %.cpp,$(BUILD)/%.o,$(CXX_SRCS)) \
@@ -146,7 +150,7 @@ CXXFLAGS := $(COMMON_FLAGS) -std=c++17 -fno-exceptions -fno-rtti -fcheck-new \
 CFLAGS   := $(COMMON_FLAGS)
 
 ifeq ($(VMTEST),1)
-CXXFLAGS += -DRDNA4FB_VM_TEST
+CXXFLAGS += -DAMDRadeonRDNA4_VM_TEST
 endif
 
 LDFLAGS := \
@@ -257,9 +261,19 @@ $(LILU_STAMP): $(LILU)/../hde/hde32.h $(LILU)/../hde/hde64.h
 	cp $(LILU)/../capstone/include/*.h $(LILU_SHIM)/Headers/capstone/
 	@touch $@
 
+# Rewritten only when the revision changes, so that only the two files that print it are compiled again.
+REV_HDR := $(BUILD)/buildrev.h
+.PHONY: FORCE
+$(REV_HDR): FORCE
+	@mkdir -p $(BUILD)
+	@echo '#define AMDRADEONRDNA4_BUILD "$(VERSION) ($(BUILD_REV))"' | cmp -s - $@ || \
+		echo '#define AMDRADEONRDNA4_BUILD "$(VERSION) ($(BUILD_REV))"' > $@
+# kmod_info.o carries the version too (MODULE_VERSION): it follows the header so that a new version reaches it.
+$(BUILD)/src/plugin.o $(BUILD)/src/device.o $(BUILD)/src/kmod_info.o: $(REV_HDR)
+
 $(BUILD)/%.o: %.cpp | $(LILU_STAMP)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -I$(BUILD) -c $< -o $@
 
 $(BUILD)/%.o: %.c | $(LILU_STAMP)
 	@mkdir -p $(dir $@)
@@ -279,9 +293,9 @@ $(EXEC): $(OBJS)
 	@mkdir -p $(MACOS)
 	$(CXX) $(LDFLAGS) $(USER_OBJS) $(KMOD_OBJ) -o $@
 
-$(KEXT): $(EXEC) Info.plist
+$(KEXT): $(EXEC) Info.plist Makefile
 	@mkdir -p $(KEXT)/Contents
-	cp Info.plist $(KEXT)/Contents/Info.plist
+	sed 's/@VERSION@/$(VERSION)/' Info.plist > $(KEXT)/Contents/Info.plist
 	@# AMD's firmware license travels with the binary that embeds its firmware.
 	@if [ -n "$(ASM_SRCS)" ] && [ -f firmware/amdgpu/LICENSE.amdgpu ]; then \
 		mkdir -p $(KEXT)/Contents/Resources && \

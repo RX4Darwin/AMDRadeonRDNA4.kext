@@ -1,6 +1,6 @@
 //
 //  gpuvm.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See gpuvm.hpp.
 //

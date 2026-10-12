@@ -1,6 +1,6 @@
 //
 //  gpuvmtable.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  The page-table writing of runtime.cpp's vmMap / vmMapHost / vmUnmap, freestanding (like gpuvm.cpp) so that a host test runs the SAME code the kext
 //  runs. Entries are reached through an accessor (contiguous 4 MiB image for modes 0/1, sparse pages for rdna4-vmshared=2), so one body serves both.

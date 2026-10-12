@@ -1,6 +1,6 @@
 //
 //  vkprobe.c
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Drives the RADV Darwin build directly through its ICD entry point (no Vulkan loader needed): instance, the
 //  one device, a buffer with memory, two fills of it by the GPU and a triangle drawn into an image and copied back,

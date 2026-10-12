@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build a development OpenCore disk for an OSX-KVM macOS VM that loads
-# RDNA4FB the way a real Hackintosh does: injected by OpenCore after Lilu.
+# AMDRadeonRDNA4 the way a real Hackintosh does: injected by OpenCore after Lilu.
 #
-#   tools/vm-opencore.sh [--kext build-vmtest/RDNA4FB.kext]... [--lilu path/Lilu.kext] [--timeout SECS]
+#   tools/vm-opencore.sh [--kext build-vmtest/AMDRadeonRDNA4.kext]... [--lilu path/Lilu.kext] [--timeout SECS]
 #                        [--args "<boot-args>"] [--resolution WxH] [--out NAME.qcow2]
 #
 # Starts from the stock $OSXKVM/OpenCore/OpenCore.qcow2 every time and writes
@@ -14,7 +14,7 @@
 #     fixture's; "" keeps the image's own setting),
 #   - --lilu replaces the image's Lilu.kext (OSX-KVM ships Lilu 1.6.8, which
 #     disables itself on macOS 26; Lilu 1.7.1+ supports Tahoe),
-#   - --kext copies RDNA4FB.kext in and adds it to Kernel -> Add after Lilu.
+#   - --kext copies AMDRadeonRDNA4.kext in and adds it to Kernel -> Add after Lilu.
 # QEMU keeps the old image open until it restarts; the new one is swapped in
 # with a rename, so a running VM is unaffected.
 #

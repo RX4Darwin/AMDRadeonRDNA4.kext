@@ -1,6 +1,6 @@
 //
 //  userclient.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See userclient.hpp. The selectors, their scalar/struct shapes and the
 //  dispatch struct are in include/rdna4compute.h; IOUserClient's own
@@ -26,7 +26,7 @@ IOReturn RDNA4ComputeService::setPowerState(unsigned long powerStateOrdinal,
                                              IOService *) {
 	uint64_t nowNs = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
-	IOLog("RDNA4FB: power: setPowerState ordinal %lu at %llu ns\n",
+	IOLog("AMDRadeonRDNA4: power: setPowerState ordinal %lu at %llu ns\n",
 	      powerStateOrdinal, nowNs);
 	if (!compute)
 		return kIOPMAckImplied;

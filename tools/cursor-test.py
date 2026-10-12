@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # rdna4-curdump.py — dump DCN cursor-path registers under Linux/amdgpu
-# (working hardware cursor) for diffing against the macOS RDNA4FB values.
+# (working hardware cursor) for diffing against the macOS AMDRadeonRDNA4 values.
 # Usage: sudo python3 rdna4-curdump.py   [GPU at 0000:56:00.0, BAR5]
 import mmap, os
 

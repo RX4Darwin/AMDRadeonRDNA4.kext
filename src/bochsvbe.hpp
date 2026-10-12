@@ -1,6 +1,6 @@
 //
 //  bochsvbe.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  VM test builds only: mode switching on QEMU's vmware-svga through the
 //  Bochs VBE "DISPI" interface (I/O ports 0x1ce/0x1cf) that QEMU's VGA core

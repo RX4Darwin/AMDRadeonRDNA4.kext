@@ -1,6 +1,6 @@
 //
 //  psp.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  The PSP (AMD security processor, MP0 14.0.3 on Navi 48) as a driver sees
 //  it: a bootloader mailbox that accepts the secure-OS components, then a

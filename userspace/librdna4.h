@@ -1,6 +1,6 @@
 /*
  *  librdna4.h
- *  RDNA4FB
+ *  AMDRadeonRDNA4
  *
  *  A thin C API over RDNA4ComputeClient (include/rdna4compute.h) for macOS
  *  programs: open the service, allocate VRAM buffers, copy data, load an

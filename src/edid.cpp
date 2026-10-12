@@ -1,6 +1,6 @@
 //
 //  edid.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  DTD field packing per VESA E-EDID 1.4 §3.10.2; base-block layout per
 //  E-EDID 1.4 §3; CTA extension per CTA-861-G §7.

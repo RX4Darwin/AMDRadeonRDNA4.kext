@@ -1,6 +1,6 @@
 //
 //  userclient.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  The user-space door to the compute runtime (include/rdna4compute.h):
 //

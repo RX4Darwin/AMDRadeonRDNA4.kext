@@ -1,6 +1,6 @@
 //
 //  ih.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  OSSSYS IH v7 ring and MSI delivery.  The ring is deliberately a small
 //  completion path: the fence in VRAM remains authoritative and this code
@@ -22,7 +22,7 @@
 #include <libkern/c++/OSObject.h>
 #include <pexpert/pexpert.h>
 
-#define HLOG(fmt, ...) IOLog("RDNA4FB: ih: " fmt "\n", ## __VA_ARGS__)
+#define HLOG(fmt, ...) IOLog("AMDRadeonRDNA4: ih: " fmt "\n", ## __VA_ARGS__)
 
 using namespace GfxReg;
 

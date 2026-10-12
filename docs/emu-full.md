@@ -4,7 +4,7 @@ Author: Anvil, branch `premetal/emu-full` (hub-task-428 / 432). Evidence tags as
 
 Why: the Metal phase (M0, `docs/metal-spike.md`) needs Apple's `AppleParavirtGPU.kext`, which exists only in a **full** install's kernel
 collections, not in Recovery (the Recovery/`BaseSystem` VMs of `tools/emu-linux.sh` have no such kext). This VM is the base for that: a
-plain QEMU/KVM macOS (OpenCore + Lilu, vmware-svga display), **no rdna4 device and no RDNA4FB kext needed**. `start --rdna4` swaps the
+plain QEMU/KVM macOS (OpenCore + Lilu, vmware-svga display), **no rdna4 device and no AMDRadeonRDNA4 kext needed**. `start --rdna4` swaps the
 display for Kiln's emulated RX 9070 XT, the same device line as `tools/emu-boot.sh`.
 
 ## 1. What exists (all outside the repo, nothing downloaded again)
@@ -32,7 +32,7 @@ tools/emu-full.sh stop                          # quit OUR qemu (pid file, /proc
 Extra kexts and boot-args go into the OpenCore image, not the command line (macOS reads the boot-args from OpenCore's `config.plist`):
 
 ```sh
-tools/emu-full.sh oc --kext ~/work/rx4darwin/RDNA4FB-m0/build/RDNA4FB.kext --args "-v keepsyms=1 debug=0x100 serial=3 rdna4-pvgpu=1" --timeout 3
+tools/emu-full.sh oc --kext ~/work/rx4darwin/RDNA4FB-m0/build/AMDRadeonRDNA4.kext --args "-v keepsyms=1 debug=0x100 serial=3 rdna4-pvgpu=1" --timeout 3
 tools/emu-full.sh start run --rdna4 "trace=on"   # the emulated card instead of vmware-svga (needs build-emu/rdna4.rom: RDNA4_ROM/RDNA4_STATE/RDNA4_FLASH override)
 ```
 

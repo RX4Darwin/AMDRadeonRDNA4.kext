@@ -1,6 +1,6 @@
 //
 //  runtime.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  The compute runtime user space reaches through RDNA4ComputeClient
 //  (userclient.cpp, include/rdna4compute.h): VRAM buffers from a heap in
@@ -32,7 +32,7 @@
 #include <kern/clock.h>
 #include <libkern/c++/OSObject.h>
 
-#define RLOG(fmt, ...)  IOLog("RDNA4FB: runtime: " fmt "\n", ## __VA_ARGS__)
+#define RLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: runtime: " fmt "\n", ## __VA_ARGS__)
 #define CLOG(...) RLOG(__VA_ARGS__)
 
 using namespace GfxReg;

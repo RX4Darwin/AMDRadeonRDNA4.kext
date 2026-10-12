@@ -41,13 +41,13 @@ confound; every other hypothesis (H1-H8) is read from either boot's survey/probe
 - `active:` now lists `vm-diag vm-exec vm-ispte vm-force-fail vmid-test gfxpm gfxcg gfxoff gfxcap` (the omission hid the confound).
 - Sections: `dmesg: VM/queue diagnostic` (every `vmidtest:` line), `dmesg: runtime client lines` (every `runtime:` line, host-buffer noise removed; the old feature filter dropped every
   runtime line without `vmid` in it, e.g. "dispatch timed out ..." and the recovery lines [M]), `dmesg: MEC / HQD / VM boot-test lines`, and `registry copies that survive the kernel log
-  wrapping` (`Compute,VMSurvey`, `Compute,VMOps`, `RDNA4FB,Results`; the first two exist only when Forge's persistence lands, G2 below; the section says so when absent).
+  wrapping` (`Compute,VMSurvey`, `Compute,VMOps`, `AMDRadeonRDNA4,Results`; the first two exist only when Forge's persistence lands, G2 below; the section says so when absent).
 - Rows (summary table):
 
 | Row | Reads | PASS / FAIL meaning |
 |---|---|---|
 | `vm-confound` | the boot-args | INFO only: "plain VM boot" (9) or "rdna4-vm-diag=N set ... the round 6 configuration" (9b) |
-| `vmidtest` | `RDNA4FB,Results vmidtest` (`T0=P T1=P ... T5c=H ...`) | FAIL if any `=F`, `=H` (shader hang) or `=D` (SH_MEM readback differs); the **first** non-P step is the answer; also FAIL if the probes never finished (no result) |
+| `vmidtest` | `AMDRadeonRDNA4,Results vmidtest` (`T0=P T1=P ... T5c=H ...`) | FAIL if any `=F`, `=H` (shader hang) or `=D` (SH_MEM readback differs); the **first** non-P step is the answer; also FAIL if the probes never finished (no result) |
 | `vm-survey` | the `vmidtest: survey <tag>: GRBM 0x...` lines | PASS always when lines exist; the text names the **first survey point where `GRBM_STATUS` bit 31 (GUI_ACTIVE) is set**, or says it never is, with every point's value |
 | `vm-trace` | the `vmidtest: op ...` lines | counts of op lines, REFUSED, TIMED OUT/TIMEOUT; the first problem line |
 | `idle-pin` | `sensors-pm[2]` (taken before the selftest) | FAIL `PINNED` when SMU GFX activity >= 50 % at idle (the round 6 signature: 100 % / 75-81 W); PASS with the figures otherwise |

@@ -24,8 +24,8 @@
 #include <libkern/c++/OSObject.h>
 #include <pexpert/pexpert.h>
 
-#define ILOG(fmt, ...)  IOLog("RDNA4FB: idle: " fmt "\n", ## __VA_ARGS__)
-#define PLOG(fmt, ...)  IOLog("RDNA4FB: power: " fmt "\n", ## __VA_ARGS__)
+#define ILOG(fmt, ...)  IOLog("AMDRadeonRDNA4: idle: " fmt "\n", ## __VA_ARGS__)
+#define PLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: power: " fmt "\n", ## __VA_ARGS__)
 
 namespace {
 

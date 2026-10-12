@@ -1,6 +1,6 @@
 //
 //  ptpages.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See ptpages.hpp.
 //

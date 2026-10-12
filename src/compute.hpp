@@ -1,6 +1,6 @@
 //
 //  compute.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  RDNA4Compute: our own bring-up of the RX 9070 XT's compute engines, next
 //  to (never instead of) the display path. Written from scratch against the

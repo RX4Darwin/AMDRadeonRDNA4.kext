@@ -1,7 +1,7 @@
 # Linux ground truth for round 5 (VM, triangle, cursor, power)
 
 Written 2026-09-29. Three root-cause passes (`docs/rootcause/`) found concrete
-differences between RDNA4FB and amdgpu. The cheapest way to confirm them is to
+differences between AMDRadeonRDNA4 and amdgpu. The cheapest way to confirm them is to
 read what Linux amdgpu actually programs on **this** card, on the same machine,
 instead of inferring it from source. Everything below is **read-only**: it reads
 registers through debugfs and page tables through debugfs `amdgpu_vram`; it
@@ -22,7 +22,7 @@ never writes to the GPU.
 ## The captures (about 5 minutes in total)
 
 Run each from a terminal in the repository, with the desktop on the monitor
-that RDNA4FB drives (the HDMI output of the RX 9070 XT):
+that AMDRadeonRDNA4 drives (the HDMI output of the RX 9070 XT):
 
 1. **Desktop idle, mouse pointer visible on screen** (move it into the middle of
    the screen first, then leave the mouse alone):
@@ -50,15 +50,15 @@ to the OPENCORE stick and tell Claude.
 |---|---|---|
 | **VM**: does amdgpu set bit 63 (IS_PTE) on leaf PTEs on this card? (W36, `rootcause/rootcause-vm.md`) | `vm-walk.txt` in `idle` and `vkcube` | leaf lines `PTE ... bit63 1`, and the other bits (exe/read/write/snooped/mtype) of real amdgpu mappings, to compare with W36's encoding |
 | VM: how amdgpu programs VMID contexts 1-15 and the GC hub | `gc-regs.txt`: `GCVM_CONTEXT*`, `GCVM_L2_CNTL*`, `GCMC_VM_*`, `GCVM_CONTEXTS_DISABLE` | the values to compare with our `vm: diag` lines (CONTEXT8 0x00fffc07, L2_CNTL 0x00080601, ...) |
-| **Triangle**: is the RLC save/restore machine enabled? (W37, `rootcause/rootcause-draw.md` #1) | `gc-regs.txt` `RLC_SRM_CNTL` | bits 0-1 set (`SRM_ENABLE`, `AUTO_INCR_ADDR`) under amdgpu; RDNA4FB never sets them |
+| **Triangle**: is the RLC save/restore machine enabled? (W37, `rootcause/rootcause-draw.md` #1) | `gc-regs.txt` `RLC_SRM_CNTL` | bits 0-1 set (`SRM_ENABLE`, `AUTO_INCR_ADDR`) under amdgpu; AMDRadeonRDNA4 never sets them |
 | Triangle: clear-state buffer, gfx queue setup, RS64 data bases | `RLC_CSIB_*`, `CP_RB0_*`, `CP_GFX_HQD_*`, `CP_GFX_MQD_BASE_ADDR*`, `CP_GFX_RS64_DC_BASE*` | whether amdgpu runs the gfx pipe through an HQD/MQD (non-zero `CP_GFX_HQD_ACTIVE`/`MQD_BASE`) and what the RS64 data bases hold (#2 in the draw doc) |
-| Triangle: context registers the draw stream never writes | `PA_RATE_CNTL`, `CONTEXT_RESERVED_REG0/1`, `VGT_SHADER_STAGES_EN`, ... in `vkcube` | clean values next to the garbage RDNA4FB reads (MMIO shows the last context, so read them as a hint only) |
-| **Cursor**: the whole DCN pipe-0 state with a visible hardware cursor (W38, `rootcause/rootcause-cursor.md`) | `dcn-regs.txt` (`CURSOR0_0_*`, `CM_CUR0_*`, `CM0_*` incl. `CM0_CM_CONTROL` (CM_BYPASS, `verify-cursor.md`), `CNVC_*`, `DSCL0_*`, `HUBP0_*`, `HUBPREQ0_*`, `MPCC0_*`) and `linux-capture.sh --snap-only` | the exact register values amdgpu uses for a cursor that is on screen: diff them against our `RDNA4FB,Cursor` trail (DSCL mode, RECOUT, CURSOR_REQ_MODE, TTU/DLG, mission mode `HUBPREQ_DEBUG_DB`, MALL/CRQ bits, cursor memory power) |
+| Triangle: context registers the draw stream never writes | `PA_RATE_CNTL`, `CONTEXT_RESERVED_REG0/1`, `VGT_SHADER_STAGES_EN`, ... in `vkcube` | clean values next to the garbage AMDRadeonRDNA4 reads (MMIO shows the last context, so read them as a hint only) |
+| **Cursor**: the whole DCN pipe-0 state with a visible hardware cursor (W38, `rootcause/rootcause-cursor.md`) | `dcn-regs.txt` (`CURSOR0_0_*`, `CM_CUR0_*`, `CM0_*` incl. `CM0_CM_CONTROL` (CM_BYPASS, `verify-cursor.md`), `CNVC_*`, `DSCL0_*`, `HUBP0_*`, `HUBPREQ0_*`, `MPCC0_*`) and `linux-capture.sh --snap-only` | the exact register values amdgpu uses for a cursor that is on screen: diff them against our `AMDRadeonRDNA4,Cursor` trail (DSCL mode, RECOUT, CURSOR_REQ_MODE, TTU/DLG, mission mode `HUBPREQ_DEBUG_DB`, MALL/CRQ bits, cursor memory power) |
 | **Power**: idle watts and gating under Linux | `pm.txt` (`gpu_metrics`, `amdgpu_pm_info` clock-gating flags, `pp_dpm_sclk`) | Linux's idle power, clock and CG/PG flags, to compare with our 20 W after W29 |
 
 ## After the capture
 
 Claude diffs these against the kext's own logs (`hw-logs/`) and the round-5
-code; any register where amdgpu differs from RDNA4FB on the same card is a
+code; any register where amdgpu differs from AMDRadeonRDNA4 on the same card is a
 candidate fix with no guessing. The scripts only read; if a read fails (lockdown,
 missing debugfs file) the output says so and the rest still runs.

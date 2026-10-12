@@ -128,7 +128,7 @@ port needs:
 - a kext user client with amdgpu-like calls (BO alloc, VA map, CS submit,
   syncobj) or a new winsys behind `ac_drm_*`;
 - changes to `ac_linux_drm.c`, `vk_drm_syncobj` and the meson platform gating;
-- a Darwin WSI that presents to an IOSurface or the RDNA4FB scanout;
+- a Darwin WSI that presents to an IOSurface or the AMDRadeonRDNA4 scanout;
 - a GFX ring, not just compute queues.
 
 The payoff is limited to Vulkan apps; the macOS desktop stays unaccelerated.
@@ -141,8 +141,8 @@ The payoff is limited to Vulkan apps; the macOS desktop stays unaccelerated.
    - tinygrad AM's full boot does an **SMU mode1 reset** when PSP and SMU are
      alive, which is exactly the state after the VBIOS POSTs the card.
    - It also reprograms **GMC and IH**, which the DCN scanout depends on.
-   - Either would likely blank the screen RDNA4FB drives, unless a no-reset
-     partial init works, or RDNA4FB re-lights the display afterwards (DMUB
+   - Either would likely blank the screen AMDRadeonRDNA4 drives, unless a no-reset
+     partial init works, or AMDRadeonRDNA4 re-lights the display afterwards (DMUB
      included). This is inferred, not observed.
 3. **Platform plumbing.**
    - The DriverKit entitlement: SIP off, or fold a BAR/DMA user client into
@@ -154,7 +154,7 @@ PSP firmware loading, the blocker originally feared most, is solved.
 
 ## Recommended path
 
-Aim for **compute first**, as a separate component next to RDNA4FB, and keep
+Aim for **compute first**, as a separate component next to AMDRadeonRDNA4, and keep
 the display driver the one thing that must never break.
 
 | Phase | What | Estimate |

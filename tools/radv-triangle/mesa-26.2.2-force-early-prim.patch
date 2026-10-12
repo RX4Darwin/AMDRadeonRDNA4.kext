@@ -11,7 +11,7 @@ index d4d4fba..7749f8e 100644
  
     if (ngg_stage->stage != MESA_SHADER_GEOMETRY) {
        nir_function_impl *impl = nir_shader_get_entrypoint(ngg_stage->nir);
-+      /* RDNA4FB experiment: RADV_FORCE_EARLY_PRIM=1 exports the primitive before the positions
++      /* AMDRadeonRDNA4 experiment: RADV_FORCE_EARLY_PRIM=1 exports the primitive before the positions
 +       * (the order the kext used) to test whether gfx12 drops the primitive. */
        ngg_stage->info.has_ngg_early_prim_export =
 -         compiler_info->ac->gfx_level < GFX11 && exec_list_is_singular(&impl->body);

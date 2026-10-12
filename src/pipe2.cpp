@@ -1,6 +1,6 @@
 //
 //  pipe2.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See pipe2.hpp.
 //

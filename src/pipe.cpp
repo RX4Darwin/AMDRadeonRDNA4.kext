@@ -1,6 +1,6 @@
 //
 //  pipe.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 
 #include "pipe.hpp"

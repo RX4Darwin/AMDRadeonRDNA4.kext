@@ -18,7 +18,7 @@ The levels are a ladder, so that each boot answers one question:
 | `rdna4-head2` | What happens | What it shows |
 |---|---|---|
 | 1 | Phantom head only, as before. | macOS takes a second display. |
-| 2 | The plan is built and every step is published with the register's value now and after (`RDNA4FB,Pipe2` in the registry, and in `tools/diagnostic-log.sh`). **Nothing is written.** | What the firmware left in the dormant pipe; whether the requirements hold. |
+| 2 | The plan is built and every step is published with the register's value now and after (`AMDRadeonRDNA4,Pipe2` in the registry, and in `tools/diagnostic-log.sh`). **Nothing is written.** | What the firmware left in the dormant pipe; whether the requirements hold. |
 | 3 | The stream only: clock, timing generator, encoder, PHY. No plane. Afterwards the survey of what the plane would still change is published. | The monitor wakes and shows a solid teal-blue. The DMUB commands work for a pipe the firmware never lit. |
 | 4 | Stream and plane. | The monitor shows the second desktop. |
 
@@ -230,7 +230,7 @@ lighting set holds the same value again.
 Sleep clears the stream encoder's half of `SYMCLKC_CLOCK_ENABLE` (`dccg401_disable_symclk_se`), and for HDMI Linux
 never sets it again: the firmware does, on the encoder command (section 7). The log line shows it:
 `power: pipe2 display off: 39 steps ran; DIG2_DIG_FE_EN_CNTL=... SYMCLKC_CLOCK_ENABLE=...`, and the same for `on`
-(also in the `RDNA4FB,DisplayPower` registry history). `rdna4-nosleep=1` turns it off.
+(also in the `AMDRadeonRDNA4,DisplayPower` registry history). `rdna4-nosleep=1` turns it off.
 
 ### DisplayPort (host-tested, not yet run on the card)
 
@@ -343,7 +343,7 @@ also carries the slower modes, as the firmware's does on the boot display. `HUBP
 after the 1600x900 switch (0x000f0012 after the others): bit 3 is `HUBP_IN_BLANK`, a live status, there most likely
 caught in that mode's longer vertical blank.
 
-Reading the log: kernel lines from other senders (ALF, Sandbox) can lack a newline, and an RDNA4FB line glued to one
+Reading the log: kernel lines from other senders (ALF, Sandbox) can lack a newline, and an AMDRadeonRDNA4 line glued to one
 carries that line's older timestamp.
 
 **120 and 144 Hz, 2026-10-05 16:01 (`rdna4-head2=4 rdna4-modeset=1`): work.** The second head offered 15 modes.

@@ -1,6 +1,6 @@
 /*
  *  librdna4.c
- *  RDNA4FB
+ *  AMDRadeonRDNA4
  *
  *  See librdna4.h.
  */

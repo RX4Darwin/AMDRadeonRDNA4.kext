@@ -1,9 +1,13 @@
-# RDNA4FB.kext
+# AMDRadeonRDNA4
 
 A **display driver** for the AMD Radeon **RX 9070 XT** (Navi 48 / RDNA 4,
 PCI `0x1002:0x7550`) on x86_64 Hackintosh, built as a **Lilu plugin** against
 MacKernelSDK and injected by OpenCore. Cross-compiles on Apple Silicon and on
 Linux/WSL. No 3D/Metal acceleration (see Scope below); rendering is software.
+
+Until October 2026 the driver was called RDNA4FB; log files written before then carry that name. Versions are in
+[CHANGELOG.md](CHANGELOG.md); branches, version numbers and how a build names its commit are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Status.** The Lilu plugin is verified end to end in a macOS Tahoe 26 VM
 (QEMU/OSX-KVM): it loads from OpenCore, takes over the display requests of
@@ -27,7 +31,7 @@ boot-arg to turn it off (below).
 > injects into the *Boot* collection, so the kext was silently dropped. The
 > fallback, `/Library/Extensions` and the auxiliary collection, is closed to
 > ad-hoc-signed kexts on Tahoe (`syspolicyd` blocks them with no approval
-> button). Instead, RDNA4FB now extends the driver macOS already runs on an
+> button). Instead, AMDRadeonRDNA4 now extends the driver macOS already runs on an
 > unsupported GPU — Apple's `IONDRVFramebuffer` with its boot NDRV — at
 > runtime through Lilu, the way WhateverGreen and NootRX do. It is injected by
 > OpenCore after Lilu, like any other plugin.
@@ -63,7 +67,7 @@ each `csc` Control/Status call — goes through `IONDRVFramebuffer::doDriverIO`.
    PCI device is the Navi 48 family (`0x7550` RX 9070/9070 XT, `0x7551`
    R9700) are ours; everything else goes straight to Apple's code.
 2. **Device** (`src/device.cpp`): when Apple's driver opens our framebuffer,
-   RDNA4FB reads the console geometry, maps BAR5, loads the VBIOS and IP
+   AMDRadeonRDNA4 reads the console geometry, maps BAR5, loads the VBIOS and IP
    discovery, finds the pipe the GOP lit, reads the sink's EDID and builds the
    mode table. **Hard-won detail:** `v_baseAddr` carries flag bits in its low
    bits (this machine reads `0x840000001`); they must be masked off. Passing
@@ -73,7 +77,7 @@ each `csc` Control/Status call — goes through `IONDRVFramebuffer::doDriverIO`.
    register archaeology to trace.
 3. **Answers** (`src/ndrv.cpp`): the mode list, per-mode video parameters and
    timings, the current mode, the connection flags, the EDID blocks and DPMS
-   (`cscSetSync`) are answered from RDNA4FB's state, record for record the
+   (`cscSetSync`) are answered from AMDRadeonRDNA4's state, record for record the
    way `IOBootNDRV` answers the same requests. The boot mode keeps
    `IOBootNDRV`'s ID 100; the other modes get 100 + their mode-table ID.
    Everything else (gamma, CLUT, power states, cursor) stays with
@@ -103,7 +107,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-off=1` | Kill switch: the plugin does not hook anything and macOS runs its stock fallback framebuffer. Lilu's `-liluoff` disables all plugins. |
 | `rdna4-trace=1` | Log every NDRV request for our framebuffer and who answered it (`rdna4` or `boot`), up to 400 lines. On by default in `VMTEST` builds. Mode switches are always logged. |
 | `rdna4-modeset=0` | **Mode switching is on by default; `0` turns it off** (the boot mode alone is offered). On, the kext offers the sink's EDID modes (DTDs, CTA DTDs/VICs, standard and established timings; ≤ boot framebuffer size, TMDS ≤ 340 MHz or, for a sink whose EDID announces SCDC and a higher rate, ≤ 600 MHz, and ≤ 1.25 × boot pixel clock) instead of the boot mode alone. On an HDMI/DVI boot display a switch runs the mode-set engine (verified on the card 2026-10-04: 1920x1080 to 1600x900 on a 1080p HDMI sink, picture confirmed; the log line `modes: now ..., measured ... Hz` gives the refresh the OTG really runs at). On a DP boot display a switch retimes the stream and leaves the link as the firmware trained it, so only modes at or below the boot pixel clock are offered (verified on the card 2026-10-04: 3840x2160 to 2560x1440 on a 4K DP monitor over four HBR2 lanes, picture confirmed; the log shows `modes: DisplayPort, link untouched: DTO ...` and the measured refresh). Until 2026-10-06 a switch left the plane expecting the blank to end where it does in the boot mode, which cut the top of the picture off in modes whose blank ends earlier (the menu bar at 2560x1440, everything at 1280x720); the switch now sets that for the new mode, and 2560x1440, 1920x1080 and 1280x720 were confirmed whole on the 4K monitor that day. From 340 MHz up the link is HDMI 2.0 scrambled: the encoder's scrambler is switched with the mode and the monitor is told over SCDC, in both directions, so a monitor the GOP lit at 4K60 (533 MHz, scrambled) can be switched down as well. The scrambled path ran on the card 2026-10-05: a monitor the GOP lit at 3840x2160 (533 MHz) switched to 1920x1080@60, to 1920x1080@144 (333 MHz, measured 143.996 Hz) and back to 3840x2160 (`scdc: ... TMDS_CONFIG = 3 written`, measured 59.996 Hz), and showed the desktop again at 3840x2160. |
-| `rdna4-head2=0` | **A second display is on by default (level 4, below); `0` turns it off.** `1` is the experiment it grew from: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Next to `rdna4-compute` since 2026-10-06 (its surface is kept below the compute pool; ran together on the card that day). Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. **Higher values also light the pipe (`docs/second-pipe.md`; all verified on the card 2026-10-04):** `2` writes nothing and publishes what every step of the plan would do to the dormant pipe's registers (`RDNA4FB,Pipe2`, shown by `tools/diagnostic-log.sh`); `3` lights the stream alone, so the second monitor shows a solid teal-blue; `4` also lights the plane, so it shows the second desktop. There is a plan per connector of the card, all at 1920x1080@60 next to a boot display on another connector: HDMI on HPD3 / link 2 (the one verified), HDMI on HPD4 / link 3 (verified 2026-10-06), and DisplayPort on HPD1 / link 0 or HPD2 / link 1, whose link the kext trains itself (those two host-tested, not yet run on the card, and only used with `rdna4-head2dp=1`). Not in `VMTEST` builds. |
+| `rdna4-head2=0` | **A second display is on by default (level 4, below); `0` turns it off.** `1` is the experiment it grew from: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Next to `rdna4-compute` since 2026-10-06 (its surface is kept below the compute pool; ran together on the card that day). Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. **Higher values also light the pipe (`docs/second-pipe.md`; all verified on the card 2026-10-04):** `2` writes nothing and publishes what every step of the plan would do to the dormant pipe's registers (`AMDRadeonRDNA4,Pipe2`, shown by `tools/diagnostic-log.sh`); `3` lights the stream alone, so the second monitor shows a solid teal-blue; `4` also lights the plane, so it shows the second desktop. There is a plan per connector of the card, all at 1920x1080@60 next to a boot display on another connector: HDMI on HPD3 / link 2 (the one verified), HDMI on HPD4 / link 3 (verified 2026-10-06), and DisplayPort on HPD1 / link 0 or HPD2 / link 1, whose link the kext trains itself (those two host-tested, not yet run on the card, and only used with `rdna4-head2dp=1`). Not in `VMTEST` builds. |
 | `rdna4-head2dp=1` | Also serve a second display on a DisplayPort connector (lighting it, sleep, hot-plug and mode switching as on HDMI). Off by default because it has not run on the card yet: `docs/todo-dptest.md` has the tests. |
 | `rdna4-hotplug=0` | **Hot-plug of the second display is on by default (level 2); `0` turns it off, `1` only logs what the pin does.** On: The connector's HPD pin is polled; unplugging takes the head offline in macOS, plugging reads the display, lights or wakes the pipe and brings the head back, and the head exists (offline) when no monitor was there at boot. `1` only logs what the pin does. Verified on the card 2026-10-05 (`docs/second-pipe.md`), and on 2026-10-06 on the other HDMI connector and through a 10-minute display sleep. A display unplugged from one HDMI connector and plugged into the other gets the pipe moved to it (verified on the card 2026-10-06, in both directions, at 60 and at 144 Hz). |
 | `rdna4-dptrain=1` | Diagnostic for a DisplayPort boot display: log what the monitor can do and which link the firmware trained, watch its HPD pin, and log the link's state when the monitor comes back. The kext does not retrain that link, because the firmware keeps it itself (card, 2026-10-06: it retrains within two seconds of the pin returning). `2` also runs the kext's own training on that link once, 15 s after the desktop is up (`src/dptrain.cpp`, as amdgpu trains): on the card that day, 4 lanes at HBR2 trained and the video was back 0.57 s after the link was taken down. |
@@ -182,8 +186,8 @@ monitor really sleeps, and wakes it with a mode set to the running timing
 | `src/kmod_info.c` | kmod glue pointing at Lilu's plugin start/stop. |
 | `Lilu/` | Lilu submodule (v1.7.3), for the plugin headers and `plugin_start.cpp`. |
 | `tools/atomdump.cpp` | Host test harness: parsers against the real ROM and captured EDID fixtures, pipe discovery, DMUB payloads, the NDRV translator (`make test`). |
-| `tools/vm-opencore.sh`, `tools/vm-ocplist.py` | Build a development OpenCore disk for an OSX-KVM VM with RDNA4FB injected after Lilu. |
-| `tools/logs-ssh.sh` | Pull the RDNA4FB kernel log and registry properties from a macOS machine over SSH. |
+| `tools/vm-opencore.sh`, `tools/vm-ocplist.py` | Build a development OpenCore disk for an OSX-KVM VM with AMDRadeonRDNA4 injected after Lilu. |
+| `tools/logs-ssh.sh` | Pull the AMDRadeonRDNA4 kernel log and registry properties from a macOS machine over SSH. |
 | `src/dptrain.{hpp,cpp}` | DisplayPort link training (clock recovery, channel equalisation, retries), as amdgpu does it; everything the hardware and the monitor do comes through callbacks. Host-tested against `tools/dp_train_linux.inc`. |
 | `src/dpphy.{hpp,cpp}` | What training asks of DCN 4.01: the link encoder registers behind each training pattern and the DMUB transmitter commands (enable, lane drive, disable). Host-tested against the same reference. |
 | `src/n48n.{hpp,cpp}`, `src/vmtree.{hpp,cpp}` | The kernel half of the Vulkan driver's interface: one client's buffers, mappings, contexts, submitted work (what a command buffer may be, sequences, waits, when work counts as lost) and the display it may show pictures on, and its four-level page table. Freestanding. Host-tested, and run under the real driver with `tools/n48n-host/`. |
@@ -267,7 +271,7 @@ Clone with the submodule (`git clone --recursive`, or
 `git submodule update --init` in an existing checkout).
 
 ```sh
-make            # -> build/RDNA4FB.kext  (x86_64, min macOS 11)
+make            # -> build/AMDRadeonRDNA4.kext  (x86_64, min macOS 11)
 make test       # host-side tests: parsers against the real ROM and EDID
                 # fixtures, pipe discovery, DMUB payloads, NDRV translator
 make clean
@@ -276,7 +280,7 @@ make clean
 Verify the output:
 
 ```sh
-file build/RDNA4FB.kext/Contents/MacOS/RDNA4FB   # Mach-O 64-bit kext bundle x86_64
+file build/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4   # Mach-O 64-bit kext bundle x86_64
 ```
 
 ### Building on Linux / WSL (osxcross)
@@ -287,8 +291,8 @@ LLVM's `ld64.lld` cannot emit kext bundles, but Apple's ld64 can: build an
 `libkmodc++.a`), then:
 
 ```sh
-tools/build-osxcross.sh            # -> build/RDNA4FB.kext
-tools/build-osxcross.sh VMTEST=1   # -> build-vmtest/RDNA4FB.kext
+tools/build-osxcross.sh            # -> build/AMDRadeonRDNA4.kext
+tools/build-osxcross.sh VMTEST=1   # -> build-vmtest/AMDRadeonRDNA4.kext
 make test                          # host tests need only clang++
 ```
 
@@ -298,13 +302,13 @@ text files; the Makefile copies the real headers into `build*/liluhdr` first.
 ## Installing (OpenCore)
 
 1. Use **Lilu 1.7.1 or newer** (older Lilu disables itself on macOS 26).
-2. Copy `build/RDNA4FB.kext` to `EFI/OC/Kexts/` and add a `Kernel → Add`
+2. Copy `build/AMDRadeonRDNA4.kext` to `EFI/OC/Kexts/` and add a `Kernel → Add`
    entry **after Lilu**:
 
    | Key | Value |
    |-----|-------|
-   | `BundlePath` | `RDNA4FB.kext` |
-   | `ExecutablePath` | `Contents/MacOS/RDNA4FB` |
+   | `BundlePath` | `AMDRadeonRDNA4.kext` |
+   | `ExecutablePath` | `Contents/MacOS/AMDRadeonRDNA4` |
    | `PlistPath` | `Contents/Info.plist` |
    | `Arch` | `x86_64` |
    | `Enabled` | `true` |
@@ -338,17 +342,17 @@ guest:
 
 ```sh
 tools/build-osxcross.sh VMTEST=1
-tools/vm-opencore.sh --kext build-vmtest/RDNA4FB.kext --lilu ~/kexts/Lilu.kext
+tools/vm-opencore.sh --kext build-vmtest/AMDRadeonRDNA4.kext --lilu ~/kexts/Lilu.kext
 ```
 
 `vm-opencore.sh` starts from the stock `OpenCore/OpenCore.qcow2` and writes
 `OpenCore-dev.qcow2`: verbose boot with the kernel log on the serial port,
-a picker that waits, WhateverGreen disabled, the given Lilu, RDNA4FB after
+a picker that waits, WhateverGreen disabled, the given Lilu, AMDRadeonRDNA4 after
 Lilu, and a 1920x1080 console (`--resolution`; the fixture is a 1080p
 monitor, and its modes are only published when the console matches its
 preferred timing). Boot QEMU with that image; QEMU keeps an image open until
 it restarts. With Remote Login on and a key authorised,
-`REMOTE_USER=<account> tools/logs-ssh.sh` pulls the RDNA4FB log and registry
+`REMOTE_USER=<account> tools/logs-ssh.sh` pulls the AMDRadeonRDNA4 log and registry
 properties back.
 
 ### Emulated RX 9070 XT (no card needed, no VMTEST shortcuts)
@@ -372,7 +376,7 @@ real code paths in the same OSX-KVM VM:
 
 ```sh
 tools/emu-build.sh        # QEMU 10.0.13 + device, edk2 BaseTools + GOP driver, build-emu/rdna4.rom
-tools/vm-opencore.sh --kext build/RDNA4FB.kext --lilu ~/kexts/Lilu.kext \
+tools/vm-opencore.sh --kext build/AMDRadeonRDNA4.kext --lilu ~/kexts/Lilu.kext \
     --out OpenCore-emu.qcow2 --args "-v keepsyms=1 debug=0x100 serial=3 rdna4-trace=1"
 tools/emu-boot.sh         # the VM on the emulated card (VNC :0, serial ~/tahoe-serial.log)
 ```

@@ -57,10 +57,10 @@ with open(os.path.join(run, "qemu.out"), "rb") as f:
 for k, g in sorted(groups.items(), key=lambda kv: kv[1]["off"]):
     lo, hi = serial_window(g["off"])
     window = serial[max(0, lo - 4000):hi + 2000].decode(errors="replace").splitlines()
-    kext = [l for l in window if "RDNA4FB" in l or "RDNA4DIAG" in l]
+    kext = [l for l in window if "AMDRadeonRDNA4" in l or "RDNA4DIAG" in l]
     # the lines ending the window and a few before it: what the kext had just printed
     cut = serial[:hi].decode(errors="replace").count("\n")
-    before = [l for l in serial[:hi].decode(errors="replace").splitlines()[-60:] if "RDNA4FB" in l][-ctx:]
+    before = [l for l in serial[:hi].decode(errors="replace").splitlines()[-60:] if "AMDRadeonRDNA4" in l][-ctx:]
     out.append("### %d x  %s" % (g["n"], g["first"]))
     if g["n"] > 1:
         out.append("    last: %s" % g["last"])

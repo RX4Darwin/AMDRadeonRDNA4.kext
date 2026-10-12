@@ -1,6 +1,6 @@
 //
 //  dpphy.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See dpphy.hpp. Register offsets are dcn_4_1_0_offset.h (DP0's, base_idx 2;
 //  one block per link encoder), fields dcn_4_1_0_sh_mask.h.

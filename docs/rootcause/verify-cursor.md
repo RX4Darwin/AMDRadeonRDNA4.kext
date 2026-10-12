@@ -6,7 +6,7 @@ Path prefixes:
 - `dc:` = `~/src/linux-amd/drivers/gpu/drm/amd/display/dc/`
 - `dm:` = `.../display/amdgpu_dm/`
 - `hdr:` = `.../include/asic_reg/dcn/dcn_4_1_0_{offset,sh_mask}.h`
-- `k:` = `RDNA4FB-int/src/`
+- `k:` = `AMDRadeonRDNA4-int/src/`
 - `log:` = `premetal/hw-logs/rdna4fb-diag-20260929-`
 
 The Linux tree is at d266640 (7.3-rc5).
@@ -41,7 +41,7 @@ Sources: `hdr sh_mask` lines as cited; values from `log:082237.txt:245` (boot 9)
 | `HOT_SPOT = 0`, `DST_OFFSET = 0x21` (`:7953-7966`) | DST_X = 33 = 100*50000/148511 | `dcn401_hubp.c:838-856` (x_viewport * ref / pix) | yes |
 | `CURSOR_SETTINGS = 0x300` (`:7686-7687`) | DST_Y_OFFSET 0, CHUNK_HDL_ADJUST 3 | `dcn32_hubp.c:159-163` | yes |
 | `ADDR = 0x0080 / 0x007e9000` (`:7937-7941`) | MC `0x80_007e9000`, in `DCN_VM_FB_LOCATION` 0x8000-0x83fb, same space as the primary `0x80_00000000` | MC address of the BO | yes |
-| `CM_CUR0_CURSOR0_CONTROL = 0xa5` (`:11072-11085`) | ENABLE[0]=1, EXPANSION[1]=0, PIX_INV[2]=1, ROM_EN[3]=0, MODE[6:4]=2, ALPHA_MOD[7]=1, PENDING[16]=0 | MODE/EXPANSION=0/ROM_EN (`dc:dpp/dcn401/dcn401_dpp_cm.c:102-106`), ENABLE (`:138-141`); bits 2 and 7 = reset (GOP `0x84`) = July Linux capture `0xa5` (RDNA4FB `565377e`); ROM_EN=1 only with legacy gamma (`dm:amdgpu_dm_plane.c:1703-1707`, `amdgpu_dm_color.c:1290-1313`) | yes |
+| `CM_CUR0_CURSOR0_CONTROL = 0xa5` (`:11072-11085`) | ENABLE[0]=1, EXPANSION[1]=0, PIX_INV[2]=1, ROM_EN[3]=0, MODE[6:4]=2, ALPHA_MOD[7]=1, PENDING[16]=0 | MODE/EXPANSION=0/ROM_EN (`dc:dpp/dcn401/dcn401_dpp_cm.c:102-106`), ENABLE (`:138-141`); bits 2 and 7 = reset (GOP `0x84`) = July Linux capture `0xa5` (AMDRadeonRDNA4 `565377e`); ROM_EN=1 only with legacy gamma (`dm:amdgpu_dm_plane.c:1703-1707`, `amdgpu_dm_color.c:1290-1313`) | yes |
 | `FP_SCALE_BIAS_G_Y / _RB_CRCB = 0x00003c00` (`:11093-11101`) | SCALE[15:0]=0x3c00 = 1.0 (s1e5m10), BIAS[31:16]=0 | `hw_scale=0x3c00, bias=0` (`dc:hwss/dcn10/dcn10_hwseq.c:3942-3966` -> `dcn401_dpp_cm.c:147-165`); DM never sets `sdr_white_level` (grep `amdgpu_dm/`: no hit) | yes (already 0x3c00 at arming) |
 | `CUR0_MATRIX_MODE = 0` (`:11103-11108`) | bypass | forced bypass (`dcn401_dpp_cm.c:234-244`) | yes |
 | `MPC_DPP_PENDING_STATUS = 0x2220` (`:17514-17525`) | bits 5, 9, 13 = `IN_DPP1/2/3_CONFIG_UPDATE_PENDING`; DPP0 bits 0-2 (incl. CURSOR bit 2) = 0; same before any write | n/a | harmless |
@@ -70,11 +70,11 @@ Sources: `hdr sh_mask` lines as cited; values from `log:082237.txt:245` (boot 9)
    - [I] The cursor has its own degamma ROM, FP scale and matrix: the exact counterparts of GAMCOR, HDR_MULT and POST_CSC. That points to a blend at or near the end of the CM chain.
 4. **[G] What follows.** If `CM_BYPASS` routes the pixel stream around the whole CM, it routes it around the cursor blend too.
    - Every cursor register would then read back right and latch, and zero cursor pixels would come out, for any image, position and address.
-   - That is exactly all three rounds. It is also why the July "all registers match Linux" diff found nothing: `CM_CONTROL` was never in it (`RDNA4FB/tools/cursor-test.py:10-42`).
-   - The new Linux ground-truth list would miss it too: its CM entries are only `CM_CUR0_*` (`RDNA4FB-int/tools/linux-groundtruth.sh:464-481`).
+   - That is exactly all three rounds. It is also why the July "all registers match Linux" diff found nothing: `CM_CONTROL` was never in it (`AMDRadeonRDNA4/tools/cursor-test.py:10-42`).
+   - The new Linux ground-truth list would miss it too: its CM entries are only `CM_CUR0_*` (`AMDRadeonRDNA4-int/tools/linux-groundtruth.sh:464-481`).
 5. **Why the earlier analyses passed over it.** `cursor-invisible-analysis.md:39` labelled `CM_BYPASS = 1` "normal for no color management", with no source cited. That inference is contradicted by the amdgpu chain in point 1.
 6. **Against this theory.** [G] The bypass mux could sit *before* the cursor stage, in which case CM_BYPASS is irrelevant. No public document settles this. It is decided in one boot by the CRC A/B (section 7).
-7. **The emulator cannot catch it.** [F] `rdna4_get_cursor` ignores `CM_CONTROL` (`RDNA4FB-int/emu/qemu/rdna4.c:6488-6560`), so every VM pass is silent on it.
+7. **The emulator cannot catch it.** [F] `rdna4_get_cursor` ignores `CM_CONTROL` (`AMDRadeonRDNA4-int/emu/qemu/rdna4.c:6488-6560`), so every VM pass is silent on it.
 
 ## 3. DCN4-specific requirements (question 2)
 
@@ -104,7 +104,7 @@ All points are [F]:
 
 - [F] `0x3c00` is the **scale** half (bits 15:0) and equals amdgpu's default: `hw_scale = 0x3c00` ("1.0 default multiplier"), s1e5m10 format, **bias = 0** (`dcn10_hwseq.c:3946-3963`).
 - [F] It was already `0x3c00/0x3c00` at arming, before any kext write (`log:082237.txt:245`, `armed: cm ctl=0x00000084 fp=...`).
-- [I] The FP stage has only G_Y and RB_CRCB fields and no alpha field (`sh_mask:11093-11101`). A scale of 0 would therefore give an **opaque black** square, not an invisible one. The July reasoning "multiplied to invisibility" (`RDNA4FB` `ab1c117`) could not have been right either.
+- [I] The FP stage has only G_Y and RB_CRCB fields and no alpha field (`sh_mask:11093-11101`). A scale of 0 would therefore give an **opaque black** square, not an invisible one. The July reasoning "multiplied to invisibility" (`AMDRadeonRDNA4` `ab1c117`) could not have been right either.
 
 ## 6. Ranked candidates
 

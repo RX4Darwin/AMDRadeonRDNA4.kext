@@ -1,6 +1,6 @@
 //
 //  atombios.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Freestanding AtomBIOS parser — see atombios.hpp for scope and the ROM the
 //  layout was validated against.

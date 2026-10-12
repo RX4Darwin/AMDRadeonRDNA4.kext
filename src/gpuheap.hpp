@@ -1,6 +1,6 @@
 //
 //  gpuheap.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  A first-fit allocator over a range of VRAM, in fixed granules: user
 //  buffers and uploaded kernel code. One byte of state per granule (free /

@@ -1,6 +1,6 @@
 //
 //  n48nkext.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  The Vulkan interface on the card (docs/vulkan-port.md, step 1): the user
 //  client that carries the calls of vulkan/navi48_native_abi.h, and what
@@ -50,7 +50,7 @@
 
 using namespace GfxReg;
 
-#define VLOG(fmt, ...)  IOLog("RDNA4FB: vulkan: " fmt "\n", ## __VA_ARGS__)
+#define VLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: vulkan: " fmt "\n", ## __VA_ARGS__)
 
 namespace {
 

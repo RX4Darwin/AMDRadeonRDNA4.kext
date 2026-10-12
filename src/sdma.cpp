@@ -1,6 +1,6 @@
 //
 //  sdma.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See sdma.hpp.
 //

@@ -1,6 +1,6 @@
 //
 //  codeobj.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Freestanding reader for AMDGPU code objects (the ELF64 files clang/lld
 //  produce for -target amdgcn-amd-amdhsa -mcpu=gfx1201): finds a kernel's

@@ -1,6 +1,6 @@
 //
 //  atomdump.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Host-side harness for the kext's AtomBios parser. Compiles the exact same
 //  src/atombios.cpp the kext uses and runs it against a ROM dump, so the

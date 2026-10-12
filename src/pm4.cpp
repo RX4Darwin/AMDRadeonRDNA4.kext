@@ -1,6 +1,6 @@
 //
 //  pm4.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See pm4.hpp.
 //

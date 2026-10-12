@@ -50,7 +50,7 @@ Fallbacks if the catalogue does not offer the personality (checked from the `mat
 
 **A. Self-test, no Apple kext, in Kiln's emulated Recovery** (level 2: the kext plays the guest driver against the nub). **Measured so far:** the first run (`...-191810-boot1-m0`, tip 2118816) published the nub (the size check passed: `IOPCIDevice is 184 bytes here (header 184)`) and then **panicked with a kernel stack overflow**: `IOService::matchPropertyTable(table, score)` calls the virtual one-argument version, and the nub's overloads called each other; fixed in 1f9a905 (the PCI logic is in a helper that calls neither). **Second run** (`...-193513-boot1-m0b`, kext with the GetDeviceInfo and display answers, 91ed891): **no panic, `selftest: PASS`**: IOKit offered the nub 37 PCI personalities (Intel/AMD framebuffers, XHCI, AHCI, NVMe, ...; the log keeps at most 40) and all were refused, then every check above passed in the emulated Recovery (version handshake, FIFO announce, three decoded commands across the ring wrap, the 31-pair reply, stamp 2, port 2 at +0x12, interrupt delivered, status bit dropped, mapping released).
 **Third run** (`...-195557-boot1-m0c`, kext with child-channel polling, f04afac): **no panic, `selftest: PASS`** with every new check ok: root page mapped, channel 3 defined from its state record (stamp index 3, ring of 2 physical pages mapped as one range set), the `DisplaySetupSharedState` read from the child ring across its wrap and answered (`port 5 written at +0x12`), `stamp[3] = 7` with `INTR_STATUS_GPU` bit 3, the record's read counter caught up, both interrupts seen, bits dropped, all mappings released when the registers were cleared.
-`KEXT=~/work/rx4darwin/RDNA4FB-m0/build/RDNA4FB.kext tools/emu-linux.sh 1 --extra 'rdna4-pvgpu=2'`, then read `rdna4fb.log`. Expected lines (all prefixed `RDNA4FB: pvgpu:`):
+`KEXT=~/work/rx4darwin/RDNA4FB-m0/build/AMDRadeonRDNA4.kext tools/emu-linux.sh 1 --extra 'rdna4-pvgpu=2'`, then read `amdradeonrdna4.log`. Expected lines (all prefixed `AMDRadeonRDNA4: pvgpu:`):
 
 ```
 fake Apple paravirtual GPU published under <GPU name>: PCI 106b:eeee, BAR0 16384 bytes of RAM (control block at +0x1000), level 2; IOPCIDevice is 184 bytes here (header 184)
@@ -75,10 +75,10 @@ host: GetDeviceInfo answered: reply buffer page 0x... (4096 bytes, 512 pair slot
 host: root page 0x... mapped (channel state records at +0x400)
 host: channel 3 defined: stamp index 3, ring of 2 pages (8192 bytes) from page list 0x..., counters write 8204 read 8184
 host: fifo @0x20: cmd 0x01 DisplaySetupSharedState, 20 bytes (8 payload), 0 barrier(s), signal 0x2: pipe port 2, shared state page 0x...
-host: display shared state page 0x...: port 2 written at +0x12; display info filled (1920x1080, 1 mode(s), name "RDNA4FB PV", transactions via FIFO 0x06), online event pending (+0x100 bit 2)
+host: display shared state page 0x...: port 2 written at +0x12; display info filled (1920x1080, 1 mode(s), name "AMD RDNA4 PV", transactions via FIFO 0x06), online event pending (+0x100 bit 2)
 host: stamp[0] = 2 written (FIFO page offset 0x0), INTR_STATUS_GPU bit 0 set, interrupt 0 raised
 host: ch3 @0x1ff8: cmd 0x01 DisplaySetupSharedState, 20 bytes (8 payload), 0 barrier(s), signal 0x7: pipe port 5, shared state page 0x...   (across the child ring's wrap)
-host: display shared state page 0x...: port 5 written at +0x12; display info filled (1920x1080, 1 mode(s), name "RDNA4FB PV", transactions via FIFO 0x06), online event pending (+0x100 bit 2)
+host: display shared state page 0x...: port 5 written at +0x12; display info filled (1920x1080, 1 mode(s), name "AMD RDNA4 PV", transactions via FIFO 0x06), online event pending (+0x100 bit 2)
 host: stamp[3] = 7 written (FIFO page offset 0xc), INTR_STATUS_GPU bit 3 set, interrupt 0 raised
 selftest: host consumed the FIFO (FIFO_READ caught up with FIFO_WRITTEN)   ok
 selftest: host mapped the announced FIFO page                      ok

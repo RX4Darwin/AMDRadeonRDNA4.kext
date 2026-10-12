@@ -1,6 +1,6 @@
 //
 //  gfxregs.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Register map of the compute side of Navi 48 (GC 12.0.1, SDMA 7.0.1,
 //  GC/MM hubs, MP0/MP1): dword offset + base segment, the same pairs as the

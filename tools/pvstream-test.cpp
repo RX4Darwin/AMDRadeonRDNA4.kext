@@ -128,7 +128,7 @@ int main() {
 		disp::readInfo(page, &r);
 		CHECK(r.id == 0x1234 && r.port == 3 && r.width == 1920 && r.height == 1080 && r.cursorWidth == 64 && r.cursorHeight == 64);
 		CHECK(r.txnProtocol == 1 && r.flags == 3 && r.cookie == 1 && r.count == 2);
-		CHECK(std::strcmp(r.name, "RDNA4FB PV") == 0);
+		CHECK(std::strcmp(r.name, "AMD RDNA4 PV") == 0);
 		CHECK(r.modes[0].width == 1920 && r.modes[0].height == 1080 && r.modes[0].refresh == (60u << 16));
 		CHECK(r.modes[1].width == 1280 && r.modes[1].height == 720 && r.modes[1].refresh == (30u << 16));
 		uint32_t e, pd;

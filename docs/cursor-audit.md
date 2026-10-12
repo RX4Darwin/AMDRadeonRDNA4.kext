@@ -56,15 +56,15 @@ CM_CUR0 bits 2 and 7, `3c713b7`). The W14 port kept those register values; nobod
 
 ## Evidence that survives (W21 part 1)
 
-- Every `cursor:` line is also appended to the registry property `RDNA4FB,Cursor` (first ~2 KiB, `cursor.cpp:474-500`).
-  `tools/diagnostic-log.sh` prints it (`ioreg -l -w0 | grep RDNA4FB,Cursor`) and falls back to `log show --last boot`
+- Every `cursor:` line is also appended to the registry property `AMDRadeonRDNA4,Cursor` (first ~2 KiB, `cursor.cpp:474-500`).
+  `tools/diagnostic-log.sh` prints it (`ioreg -l -w0 | grep AMDRadeonRDNA4,Cursor`) and falls back to `log show --last boot`
   when dmesg lost the early lines (also for `compute:`).
 - Per-interrupt IH lines (`CP EOP interrupt`, `SDMA trap interrupt`) are limited to the first three unless
   `rdna4-trace=2` (`ih.cpp:731`). Vblank and page-flip lines were already thinned to 1, 60 and then once a minute.
 
 ## Next boot 6: what to read
 
-`RDNA4FB,Cursor` in the diagnostic report:
+`AMDRadeonRDNA4,Cursor` in the diagnostic report:
 1. `armed` / `vm:` lines: the scanout and sprite MC addresses, the FB window and system aperture. A sprite address
    outside them explains a zero fetch.
 2. `image ...`: `max alpha` > 0 and `(match)`; `MISMATCH` means the CPU writes do not reach VRAM.

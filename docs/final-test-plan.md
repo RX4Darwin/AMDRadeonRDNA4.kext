@@ -9,14 +9,14 @@ Everything below was built and dry-checked off the card only (kext + `rdna4-run`
 `premetal/vmdiag` (= `premetal/w13` d9ec129: S0 invalidate fix, S1 VMID/queue diagnostic round 2, S7-lite shared queues `rdna4-vmshared=1`, ptpages; + boots 9/9b) + `premetal/power` (P2 idle
 accounting, P3 post-client idle row, P7 sleep/wake hardening, on `premetal/w12k` f43d3c9: W12k client gfx IBs, G4 colour triangle) + `premetal/emu-linux` 658e1a2 and Kiln's script commits 762bf45, 8080095.
 Not included: Forge's S8 (hub-task-329) and any stale-TLB correctness fix Forge may still commit to `premetal/w13` (hub-task-334): `git merge premetal/w13` refreshes the tree when it lands; this
-document does not change. **Build the kext from `premetal/final`'s tip** (`OSXCROSS=$HOME/.local/share/osxcross bash tools/build-osxcross.sh`, then copy `build/RDNA4FB.kext` and `build/rdna4-run` to the stick
+document does not change. **Build the kext from `premetal/final`'s tip** (`OSXCROSS=$HOME/.local/share/osxcross bash tools/build-osxcross.sh`, then copy `build/AMDRadeonRDNA4.kext` and `build/rdna4-run` to the stick
 together with `tools/set-boot.sh` and `tools/diagnostic-log.sh`).
 
 ## 1. How to run one boot (unchanged loop)
 
 1. Boot 1 (or whatever the stick is set to) into macOS Recovery, open Terminal (Utilities > Terminal), run `bash /Volumes/OPENCORE/set-boot.sh <id>`, then restart (Apple menu > Restart).
 2. The restarted boot again lands in Recovery (as in rounds 5-7): open Terminal and **immediately** run `bash /Volumes/OPENCORE/diagnostic-log.sh` (it waits up to 2 minutes for the bring-up, which starts 5 s after the kext
-   loads). It writes `rdna4fb-diag-<date>-<time>.txt` next to the script and prints the summary table. **Keep every log; send them all.** (`tools/stage-stick.sh` generates `START-HERE.txt` with the same steps in plain words.)
+   loads). It writes `amdradeonrdna4-diag-<date>-<time>.txt` next to the script and prints the summary table. **Keep every log; send them all.** (`tools/stage-stick.sh` generates `START-HERE.txt` with the same steps in plain words.)
 3. If a boot hangs or the screen does not come back: power-cycle, pick the stick again, `set-boot.sh 1` (or 0). The NVRAM trail (`rdna4-trail`) makes the next boot skip the feature that hung, once: boot the same id a second
    time before drawing conclusions from the skip.
 4. `NOVMDIAG=1 bash set-boot.sh <id>` gives the same boot without `rdna4-vm-diag=4065` (see step 3 of the order).
@@ -47,7 +47,7 @@ mouse; if it does not come back within ~10 s, hold the power button to power off
 
 ## 3. What each boot should print (rows of the summary table)
 
-General: `PASS` needs the command's own success line **and** the durable `RDNA4FB,Results` value to agree. `SKIPPED` is fine when the row's argument is absent. Reference values from round 6 [M]: idle GFX
+General: `PASS` needs the command's own success line **and** the durable `AMDRadeonRDNA4,Results` value to agree. `SKIPPED` is fine when the row's argument is absent. Reference values from round 6 [M]: idle GFX
 **3-8 % / 42-45 W** in boots without VM (`061510`, `054257`); **100 % / 76-81 W** in every VM boot so far (`061829`, `062351`); clients failed in every VM boot.
 
 ### Boot 1 (base)
@@ -95,7 +95,7 @@ unproven on the card. If the screen goes black or the machine hangs: power-cycle
 
 ## 4. Getting back
 - **Daily use**: `set-boot.sh 1` (base + real pointer) — or `0` for the known-good argument set without any new feature.
-- **Kext rollback**: replace `EFI/OC/Kexts/RDNA4FB.kext` with `backup-before-premetal/RDNA4FB.kext` on the stick (see `docs/real-card-plan.md`).
+- **Kext rollback**: replace `EFI/OC/Kexts/AMDRadeonRDNA4.kext` with `backup-before-premetal/AMDRadeonRDNA4.kext` on the stick (see `docs/real-card-plan.md`).
 - `set-boot.sh` keeps the first config backup (`config.plist.before-set-boot`) and validates with `plutil`.
 - After any GPU-side hang: power-cycle (not a warm reboot): clock-gating and SMU state persist across warm reboots ([M] `docs/gfx-pm-audit.md`).
 
@@ -108,7 +108,7 @@ Boot 10: `gfx-idle-acct PASS` with the expected `idle:` transitions. **Findings 
 - **Boot 11s FAILED on the emulator** (`sleep FAIL`): after the simulated sleep the re-bring-up stopped at stage 4 (SDMA): the engine still held its 64-bit pointers (0x17604) and the kext restarted the ring at wptr 0, which SDMA 7 treats as "nothing to do" (card-proven rule, `ae70f2e`). Kiln's run never triggered the emulator's sleep reset (its `power reset` line is at VM start), so this **was the no-power-loss case, which is what the real card is in after the driver's simulated sleep**; it was *not* an emulator gap. Fixed in `12ac79b` (the ring resumes at the engine's own pointers after a wake; emulator: ring position = RB_RPTR mod size); **re-run **passes with and without a power loss** (Kiln, hub-task-363). What the emulator still cannot validate: the rest of the re-bring-up (PSP/firmware autoload again on a live GPU) and what a real S3 does to the card. Treat 11s as a low-value fallback.
 - `post-idle FAIL` and every idle figure on the emulator come from a constant synthetic SMU (3 % / 120 W): not a kext result. `vmidtest` all-P means **the emulator does not reproduce the round 6 card failure**: what breaks the clients on the card is not modelled (this is what boots 9/9b/12 are for).
 - **Kiln's re-run on `20c2997` (hub-task-371), 11s with and without a power loss:** `sleep PASS`; `gfx PASS` ("ring test after the sleep cycle ... draw proven BEFORE the sleep"); `runtime/submitib/fault/vm/ih/gfx-client/gfx-app-tri/gfx-idle-acct PASS`; **zero** `IH self-test CP wait timed out` / `dispatch waits will use polling` (961a0d2 fixed it) and `ih: self-test: CP EOP delivered` after the wake; `sdma: ... the ring resumes at 0x17604` (no loss) / `at 0x0` (reset run). Boot 11 (no sleeptest) unchanged.
-- **Display power property (emulator, boot 1 after `pmset displaysleepnow`):** the section printed `power: HDMI display blanked via DPG on OPP0 (ctl 0x00000041)`, `ndrv: Control csc 11 -> 0x0` and the registry copy `RDNA4FB,DisplayPower = #1 t92638ms OFF HDMI DPG: DPG ctl 0x00000041`. No ON event: macOS never sent a power-on request in the emulated Recovery, so the un-blank path is still unexercised (what the optional idle step on the card is for).
+- **Display power property (emulator, boot 1 after `pmset displaysleepnow`):** the section printed `power: HDMI display blanked via DPG on OPP0 (ctl 0x00000041)`, `ndrv: Control csc 11 -> 0x0` and the registry copy `AMDRadeonRDNA4,DisplayPower = #1 t92638ms OFF HDMI DPG: DPG ctl 0x00000041`. No ON event: macOS never sent a power-on request in the emulated Recovery, so the un-blank path is still unexercised (what the optional idle step on the card is for).
 - `pmset sleepnow` in the emulator's Recovery is a display sleep only and the display does not come back (hub-task-344): see the plan for boot 11s and `docs/power-gfx.md` s.9.7.
 
 ## 5. What is not known

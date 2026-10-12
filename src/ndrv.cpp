@@ -1,6 +1,6 @@
 //
 //  ndrv.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See ndrv.hpp. The replies follow IOBootNDRV (IONDRVFramebuffer.cpp,
 //  IOGraphics) field for field where it answers the same request, so Apple's

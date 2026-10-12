@@ -1,14 +1,14 @@
 //
 //  flip.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  The display page-flip smoke test. The implementation is kept separate
 //  from the compute bring-up; compute only supplies the one post-stage-7
 //  entry point and its DMA/device-heap state.
 //
 
-#ifndef RDNA4FB_FLIP_HPP
-#define RDNA4FB_FLIP_HPP
+#ifndef AMDRadeonRDNA4_FLIP_HPP
+#define AMDRadeonRDNA4_FLIP_HPP
 
 #include <stdint.h>
 
@@ -67,4 +67,4 @@ bool run(RDNA4Compute &compute);
 
 } // namespace Flip
 
-#endif /* RDNA4FB_FLIP_HPP */
+#endif /* AMDRadeonRDNA4_FLIP_HPP */

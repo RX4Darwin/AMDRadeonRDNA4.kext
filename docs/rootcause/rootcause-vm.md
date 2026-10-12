@@ -5,7 +5,7 @@ Sources and snapshots:
 - amdgpu: `~/src/linux-amd/drivers/gpu/drm/amd` (WSL, torvalds d266640, 2026-09-27). Paths below are relative to it.
 - umr: AMD's register and VM debugger, `gitlab.freedesktop.org/tomstdenis/umr` @ 8438c15 (2026-09-23), shallow clone.
 - Mesa: `~/src/mesa`.
-- Kext: `RDNA4FB-int/src`.
+- Kext: `AMDRadeonRDNA4-int/src`.
 - Logs: `premetal/hw-logs/rdna4fb-diag-20260929-081555.txt` (round 4 boot 8, "L" below), -013433 (round 3 boot 2), -015807 (round 3 boot 8).
 
 ## 0. Answer
@@ -114,7 +114,7 @@ The same holds for the PQ page (13 ring dwords written, so +0x40 is 0) and for E
 - no `vm: boot queue test failed` line;
 - the fence reaches 0x564d0001 and the data word is 0x600df00d;
 - fault status 0;
-- `RDNA4FB,Results "vm"="PASS ..."`;
+- `AMDRadeonRDNA4,Results "vm"="PASS ..."`;
 - the table dump shows `PT[eop] ... 0x8000000009a01061 ... ok`.
 
 How to read other outcomes:

@@ -4,12 +4,12 @@
 #   bash tools/stage-stick.sh [--dry-run] [--rebuild] <stick mountpoint>
 #
 # What it does, in this order (--dry-run prints each step and changes nothing):
-#   1. refuses unless the git tree is clean (tracked files) and build/RDNA4FB.kext + build/rdna4-run are newer than every build input of HEAD
+#   1. refuses unless the git tree is clean (tracked files) and build/AMDRadeonRDNA4.kext + build/rdna4-run are newer than every build input of HEAD
 #      (--rebuild runs tools/build-osxcross.sh first; OSXCROSS must be set or ~/.local/share/osxcross exists);
 #   2. backs up what it will replace into backup-<YYYYMMDD>-<commit>/ on the stick (kext, set-boot.sh, diagnostic-log.sh, rdna4-run, START-HERE.txt,
 #      and a READ-ONLY copy of EFI/OC/config.plist); refuses if that folder already exists (never overwrites a backup); never writes to
-#      backup-prev-*/ or backup-before-premetal/ or old-logs/ or any rdna4fb-diag-*.txt;
-#   3. copies the kext (EFI/OC/Kexts/RDNA4FB.kext), rdna4-run, tools/set-boot.sh, tools/diagnostic-log.sh and a generated START-HERE.txt
+#      backup-prev-*/ or backup-before-premetal/ or old-logs/ or any amdradeonrdna4-diag-*.txt;
+#   3. copies the kext (EFI/OC/Kexts/AMDRadeonRDNA4.kext), rdna4-run, tools/set-boot.sh, tools/diagnostic-log.sh and a generated START-HERE.txt
 #      (docs/start-here.template.txt + the boot order table of docs/final-test-plan.md);
 #   4. verifies every copy with cmp (kext: diff -r) and prints a manifest (sha1 of each staged file, the commit); the manifest is also saved on the
 #      stick as MANIFEST-<commit>.txt;
@@ -40,7 +40,7 @@ git rev-parse --git-dir >/dev/null 2>&1 || die "not a git tree"
 COMMIT="$(git rev-parse --short HEAD)"
 BRANCH="$(git branch --show-current)"; [ -n "$BRANCH" ] || BRANCH="detached"
 say "tree: $BRANCH @ $COMMIT (clean)"
-KEXT_BIN=build/RDNA4FB.kext/Contents/MacOS/RDNA4FB
+KEXT_BIN=build/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4
 RUN_BIN=build/rdna4-run
 if [ "$REBUILD" = 1 ]; then
 	act "OSXCROSS=\${OSXCROSS:-\$HOME/.local/share/osxcross} bash tools/build-osxcross.sh"
@@ -52,7 +52,7 @@ fi
 stale_kext="$(git ls-files src include shaders Makefile tools/build-osxcross.sh Lilu MacKernelSDK 2>/dev/null | while read -r f; do [ -f "$f" ] && [ "$f" -nt "$KEXT_BIN" ] && echo "$f"; done | head -3)"
 stale_run="$(git ls-files userspace include Makefile 2>/dev/null | while read -r f; do [ -f "$f" ] && [ "$f" -nt "$RUN_BIN" ] && echo "$f"; done | head -3)"
 if [ "$DRY" = 0 ] || [ "$REBUILD" = 0 ]; then
-	[ -z "$stale_kext" ] || die "build/RDNA4FB.kext is older than $(echo $stale_kext | tr '\n' ' ')- rebuild (tools/build-osxcross.sh or --rebuild)"
+	[ -z "$stale_kext" ] || die "build/AMDRadeonRDNA4.kext is older than $(echo $stale_kext | tr '\n' ' ')- rebuild (tools/build-osxcross.sh or --rebuild)"
 	[ -z "$stale_run" ] || die "build/rdna4-run is older than $(echo $stale_run | tr '\n' ' ')- rebuild (tools/build-osxcross.sh or --rebuild)"
 fi
 say "build: kext and rdna4-run are newer than every tracked build input"
@@ -128,7 +128,7 @@ backup_one() {   # <relative path on the stick> <name in the backup folder>
 		say "  (no $1 on the stick: nothing to back up)"
 	fi
 }
-backup_one EFI/OC/Kexts/RDNA4FB.kext RDNA4FB.kext
+backup_one EFI/OC/Kexts/AMDRadeonRDNA4.kext AMDRadeonRDNA4.kext
 backup_one set-boot.sh set-boot.sh
 backup_one diagnostic-log.sh diagnostic-log.sh
 backup_one rdna4-run rdna4-run
@@ -136,10 +136,10 @@ backup_one START-HERE.txt START-HERE.txt
 backup_one EFI/OC/config.plist config.plist      # a read-only copy: staging never writes config.plist (only set-boot.sh 1 does, at the end)
 
 # ---- 3. copy ------------------------------------------------------------------------------------------------------------------------------------
-act "replace $STICK/EFI/OC/Kexts/RDNA4FB.kext with build/RDNA4FB.kext"
+act "replace $STICK/EFI/OC/Kexts/AMDRadeonRDNA4.kext with build/AMDRadeonRDNA4.kext"
 if [ "$DRY" = 0 ]; then
-	rm -rf "$STICK/EFI/OC/Kexts/RDNA4FB.kext"
-	cp -R build/RDNA4FB.kext "$STICK/EFI/OC/Kexts/RDNA4FB.kext"
+	rm -rf "$STICK/EFI/OC/Kexts/AMDRadeonRDNA4.kext"
+	cp -R build/AMDRadeonRDNA4.kext "$STICK/EFI/OC/Kexts/AMDRadeonRDNA4.kext"
 fi
 act "cp build/rdna4-run $STICK/rdna4-run";                         [ "$DRY" = 1 ] || cp "$RUN_BIN" "$STICK/rdna4-run"
 act "cp tools/set-boot.sh $STICK/set-boot.sh";                     [ "$DRY" = 1 ] || cp tools/set-boot.sh "$STICK/set-boot.sh"
@@ -149,7 +149,7 @@ act "write $STICK/START-HERE.txt (generated)";                     [ "$DRY" = 1 
 # ---- 4. verify + manifest -----------------------------------------------------------------------------------------------------------------------
 MAN="$TMPD/manifest.txt"
 {
-	echo "RDNA4FB final round staging manifest"
+	echo "AMDRadeonRDNA4 final round staging manifest"
 	echo "commit: $COMMIT ($BRANCH), staged $(date '+%Y-%m-%d %H:%M')"
 	echo "backup of the previous files: $BK/"
 } > "$MAN"
@@ -158,14 +158,14 @@ if [ "$DRY" = 1 ]; then
 	echo "sha1 (of the sources that would be staged):" >> "$MAN"
 	for f in "$KEXT_BIN" "$RUN_BIN" tools/set-boot.sh tools/diagnostic-log.sh "$TMPD/START-HERE.txt"; do sha1sum "$f" | sed "s|$TMPD/||" >> "$MAN"; done
 else
-	diff -r build/RDNA4FB.kext "$STICK/EFI/OC/Kexts/RDNA4FB.kext" >/dev/null || die "verify: the kext on the stick differs from build/RDNA4FB.kext (the backup in $BK is intact)"
+	diff -r build/AMDRadeonRDNA4.kext "$STICK/EFI/OC/Kexts/AMDRadeonRDNA4.kext" >/dev/null || die "verify: the kext on the stick differs from build/AMDRadeonRDNA4.kext (the backup in $BK is intact)"
 	cmp -s "$RUN_BIN" "$STICK/rdna4-run" || die "verify: rdna4-run differs"
 	cmp -s tools/set-boot.sh "$STICK/set-boot.sh" || die "verify: set-boot.sh differs"
 	cmp -s tools/diagnostic-log.sh "$STICK/diagnostic-log.sh" || die "verify: diagnostic-log.sh differs"
 	cmp -s "$TMPD/START-HERE.txt" "$STICK/START-HERE.txt" || die "verify: START-HERE.txt differs"
 	say "verify: every copy identical to its source (cmp / diff -r)"
 	echo "sha1 (as found on the stick after staging):" >> "$MAN"
-	(cd "$STICK" && sha1sum EFI/OC/Kexts/RDNA4FB.kext/Contents/MacOS/RDNA4FB EFI/OC/Kexts/RDNA4FB.kext/Contents/Info.plist rdna4-run set-boot.sh diagnostic-log.sh START-HERE.txt) >> "$MAN"
+	(cd "$STICK" && sha1sum EFI/OC/Kexts/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4 EFI/OC/Kexts/AMDRadeonRDNA4.kext/Contents/Info.plist rdna4-run set-boot.sh diagnostic-log.sh START-HERE.txt) >> "$MAN"
 fi
 
 # ---- 5. leave the stick on boot 1 ---------------------------------------------------------------------------------------------------------------

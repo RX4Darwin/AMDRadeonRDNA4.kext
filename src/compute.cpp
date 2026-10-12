@@ -1,6 +1,6 @@
 //
 //  compute.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See compute.hpp. Stage 1 (survey) only reads registers. Stage 2 is the
 //  first to write: PSP mailbox/ring registers, the HDP flush, and the compute
@@ -27,7 +27,7 @@
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
 
-#define CLOG(fmt, ...)  IOLog("RDNA4FB: compute: " fmt "\n", ## __VA_ARGS__)
+#define CLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: compute: " fmt "\n", ## __VA_ARGS__)
 
 // Lilu's vendor GUID; `nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail`
 // reads it back.
@@ -38,7 +38,7 @@ static const char *kNvramForceSync = "IONVRAM-FORCESYNCNOW-PROPERTY";
 
 using namespace GfxReg;
 
-#ifndef RDNA4FB_NO_FIRMWARE
+#ifndef AMDRadeonRDNA4_NO_FIRMWARE
 // src/fwblobs.S: linux-firmware blobs embedded at build time.
 extern "C" {
 extern const uint8_t rdna4_fw_psp_sos[], rdna4_fw_psp_sos_end[];
@@ -96,7 +96,7 @@ void RDNA4Compute::publishResult(const char *feature, const char *value) {
 		if (OSString *s = OSString::withCString(value)) {
 			next->setObject(feature, s);
 			s->release();
-			env.owner->setProperty("RDNA4FB,Results", next);
+			env.owner->setProperty("AMDRadeonRDNA4,Results", next);
 			if (resultDictionary)
 				resultDictionary->release();
 			resultDictionary = next;
@@ -1913,7 +1913,7 @@ void RDNA4Compute::gfxPmExperiment(uint32_t mask) {
 // ---------------------------------------------------------------------------
 
 bool RDNA4Compute::stagePsp() {
-#ifdef RDNA4FB_NO_FIRMWARE
+#ifdef AMDRadeonRDNA4_NO_FIRMWARE
 	CLOG("psp: this build carries no firmware (firmware/amdgpu/ was empty at build time)");
 	publishResult("firmware", "FAIL none in this kext: tools/fetch-firmware.sh, then make clean && make");
 	return false;
@@ -2053,7 +2053,7 @@ bool RDNA4Compute::stagePsp() {
 // ---------------------------------------------------------------------------
 
 bool RDNA4Compute::stageGfx() {
-#ifdef RDNA4FB_NO_FIRMWARE
+#ifdef AMDRadeonRDNA4_NO_FIRMWARE
 	return false;
 #else
 	OSDictionary *d = OSDictionary::withCapacity(12);
@@ -2418,7 +2418,7 @@ bool RDNA4Compute::gcHubFlush() {
 // start address from its firmware header and a pipe-reset pulse; nothing is
 // unhalted here (the MEC is, in stage 5).
 void RDNA4Compute::cpConfigRs64() {
-#ifndef RDNA4FB_NO_FIRMWARE
+#ifndef AMDRadeonRDNA4_NO_FIRMWARE
 	auto start = [](const AmdFw::Blob &b, uint32_t &lo, uint32_t &hi) {
 		if (b.size < 60)
 			return false;
@@ -2701,7 +2701,7 @@ void RDNA4Compute::grbmSelect(uint32_t me, uint32_t pipe, uint32_t queue, uint32
 // point every MEC pipe at the firmware's entry, pulse the pipe resets, then
 // unhalt the MEC with all four pipes active.
 bool RDNA4Compute::mecStart() {
-#ifdef RDNA4FB_NO_FIRMWARE
+#ifdef AMDRadeonRDNA4_NO_FIRMWARE
 	return false;
 #else
 	const AmdFw::Blob mec = FW_BLOB(mec);

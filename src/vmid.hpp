@@ -1,6 +1,6 @@
 //
 //  vmid.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  W13 (docs/w13-vmid.md): the VMID pool. A freestanding, hardware-free policy
 //  object like gpuvm.cpp, so the host test exercises the exact rules the kext

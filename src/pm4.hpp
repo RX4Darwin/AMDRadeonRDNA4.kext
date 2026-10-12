@@ -1,6 +1,6 @@
 //
 //  pm4.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  PM4 type-3 packets for the GFX12 command processor (MEC compute queues),
 //  as amdgpu's gfx_v12_0 emits them (nvd.h encodings), and a queue writer

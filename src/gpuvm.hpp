@@ -1,6 +1,6 @@
 //
 //  gpuvm.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  The small, freestanding part of the gfx12 GPUVM implementation.  The
 //  runtime owns the page-table storage and calls these routines while holding

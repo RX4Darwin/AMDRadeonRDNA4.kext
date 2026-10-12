@@ -1,6 +1,6 @@
 //
 //  isa.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  The few shader instruction words the kext writes by hand (everything else comes from shaders/*.s through tools/build-shaders.sh). gfx12 (RDNA4) shares
 //  the SOPP encodings of gfx11, NOT gfx6-10's: s_endpgm is SOPP opcode 48, and the old 0xbf810000 is s_setkill on this ISA (hub-task-347: vmtest.cpp's T5c

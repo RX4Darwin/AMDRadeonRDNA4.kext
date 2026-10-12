@@ -1,6 +1,6 @@
 //
 //  codeobj.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See codeobj.hpp.
 //

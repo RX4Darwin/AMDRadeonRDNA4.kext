@@ -1,6 +1,6 @@
 //
 //  pvstream.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See pvstream.hpp.
 //

@@ -7,7 +7,7 @@
 #
 # Build first: tools/emu-build.sh (QEMU + option ROM), and an OpenCore image
 # with the bare-metal kext:
-#   tools/vm-opencore.sh --kext build/RDNA4FB.kext --out OpenCore-emu.qcow2
+#   tools/vm-opencore.sh --kext build/AMDRadeonRDNA4.kext --out OpenCore-emu.qcow2
 # Env: OSXKVM (~/OSX-KVM), QEMU_SRC (~/qemu-10.0.13), RAM_MB (16384), OC_IMAGE
 # (OpenCore-emu.qcow2 in $OSXKVM/OpenCore). Display: VNC 127.0.0.1:5900;
 # VNC_WS=<port> adds a websocket listener for a browser client (noVNC).

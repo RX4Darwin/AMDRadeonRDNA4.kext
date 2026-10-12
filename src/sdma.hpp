@@ -1,6 +1,6 @@
 //
 //  sdma.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  SDMA 7 (RDNA 4 copy engine) command packets and a ring writer. The
 //  encodings follow the SDMA packet layout amdgpu's sdma_v7_0 uses

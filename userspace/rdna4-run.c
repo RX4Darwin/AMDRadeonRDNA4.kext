@@ -1,8 +1,8 @@
 /*
  *  rdna4-run.c
- *  RDNA4FB
+ *  AMDRadeonRDNA4
  *
- *  Command-line client of the RDNA4FB compute runtime (run as root):
+ *  Command-line client of the AMDRadeonRDNA4 compute runtime (run as root):
  *
  *    rdna4-run info                        what the runtime reports
  *    rdna4-run sleeptest                  debug-only simulated sleep cycle

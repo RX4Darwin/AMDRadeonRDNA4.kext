@@ -36,10 +36,10 @@
 # see docs/emu-linux.md for how it is built): qemu-10.0.13/ (with the rdna4
 # device), OSX-KVM/ (stock OpenCore image + OVMF pair), images/BaseSystem.img
 # (Recovery, made from the USB's BaseSystem.dmg), kexts/Lilu.kext, local/ (mtools).
-# Env: TAG (suffix of the run dir, e.g. the emulator name), EMU, QEMU_BIN (the emulator binary; default the QEMU tree's build), KEXT (default build/RDNA4FB.kext of this checkout), RAM_MB (8192).
+# Env: TAG (suffix of the run dir, e.g. the emulator name), EMU, QEMU_BIN (the emulator binary; default the QEMU tree's build), KEXT (default build/AMDRadeonRDNA4.kext of this checkout), RAM_MB (8192).
 #
 # Each run gets $EMU/runs/<time>-boot<N>/ with serial.log (kernel log),
-# rdna4fb.log (the RDNA4FB lines), qemu.out, screen-*.png (monitor screendumps)
+# amdradeonrdna4.log (the AMDRadeonRDNA4 lines), qemu.out, screen-*.png (monitor screendumps)
 # and summary.txt; nothing is ever written to the OpenCore USB.
 set -euo pipefail
 
@@ -47,7 +47,7 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 EMU=${EMU:-$HOME/work/tools/emu}
 export QEMU_SRC=${QEMU_SRC:-$EMU/qemu-10.0.13}
 export OSXKVM=${OSXKVM:-$EMU/OSX-KVM}
-KEXT=${KEXT:-$HERE/build/RDNA4FB.kext}
+KEXT=${KEXT:-$HERE/build/AMDRadeonRDNA4.kext}
 LILU=${LILU:-$EMU/kexts/Lilu.kext}
 BASE_IMG=${BASE_IMG:-$EMU/images/BaseSystem.img}
 export QEMU_BIN=${QEMU_BIN:-$QEMU_SRC/build/qemu-system-x86_64}   # e.g. $EMU/bin/w13/qemu-system-x86_64
@@ -77,7 +77,7 @@ done
 [ "$DIAG$CENSUS" != 11 ] || { echo "--diag and --census cannot be combined" >&2; exit 2; }
 [ -n "$BOOT" ] || [ -n "$ARGS" ] || { echo "usage: $0 <boot> [options] (try -h)" >&2; exit 2; }
 
-for f in "$QEMU_BIN" "$HERE/build-emu/rdna4.rom" "$KEXT/Contents/MacOS/RDNA4FB" \
+for f in "$QEMU_BIN" "$HERE/build-emu/rdna4.rom" "$KEXT/Contents/MacOS/AMDRadeonRDNA4" \
 	"$LILU/Contents/Info.plist" "$BASE_IMG" "$OSXKVM/OpenCore/OpenCore.qcow2" "$EMU/local/bin/mcopy"; do
 	[ -e "$f" ] || { echo "emu-linux: missing $f (docs/emu-linux.md says how to make it)" >&2; exit 1; }
 done
@@ -104,7 +104,7 @@ SERIAL=$RUN/serial.log
 MON=$RUN/monitor.sock
 OCIMG=OpenCore-emu-boot${BOOT:-custom}.qcow2
 say() { echo "emu-linux: $*" | tee -a "$RUN/summary.txt"; }
-say "boot ${BOOT:-custom}, kext $(sha256sum "$KEXT/Contents/MacOS/RDNA4FB" | cut -c1-12) ($(git -C "$HERE" rev-parse --short HEAD))"
+say "boot ${BOOT:-custom}, kext $(sha256sum "$KEXT/Contents/MacOS/AMDRadeonRDNA4" | cut -c1-12) ($(git -C "$HERE" rev-parse --short HEAD))"
 say "boot-args: $ARGS"
 
 if [ "$BUILD" = 1 ] || [ ! -f "$OSXKVM/OpenCore/$OCIMG" ]; then
@@ -126,7 +126,7 @@ cp /Volumes/QEMU*/diagnostic-log.sh /Volumes/QEMU*/rdna4-run /tmp/ && cd /tmp ||
 echo RDNA4DIAG-RUNNING > /dev/console
 #PRE
 bash ./diagnostic-log.sh > /tmp/diag.out 2>&1
-(echo RDNA4DIAG-BEGIN; cat /tmp/diag.out; echo RDNA4DIAG-FULL; cat /tmp/rdna4fb-diag-*.txt; echo RDNA4DIAG-END) |
+(echo RDNA4DIAG-BEGIN; cat /tmp/diag.out; echo RDNA4DIAG-FULL; cat /tmp/amdradeonrdna4-diag-*.txt; echo RDNA4DIAG-END) |
 	sed 's/^/RDNA4DIAG|/' > /dev/console
 GUEST
 	if [ -n "$PRE" ]; then
@@ -354,7 +354,7 @@ while [ $(( $(date +%s) - START )) -lt "$WAIT" ]; do
 		REC=1; say "Recovery userland up after $(( $(date +%s) - START )) s"; shot recovery
 	fi
 	if [ -z "$DONE_AT" ] && [ "$REC" = 1 ] &&
-		grep -aqE "RDNA4FB: (compute: (bring-up finished|.*failed; stopping)|accelcensus: IOAccelerator service published)" "$SERIAL"; then
+		grep -aqE "AMDRadeonRDNA4: (compute: (bring-up finished|.*failed; stopping)|accelcensus: IOAccelerator service published)" "$SERIAL"; then
 		DONE_AT=$(date +%s)
 	fi
 	[ -n "$DONE_AT" ] && [ $(( $(date +%s) - DONE_AT )) -ge "${GRACE_S:-45}" ] && break
@@ -398,20 +398,20 @@ if [ "$CENSUS" = 1 ] && [ "$REC" = 1 ]; then
 		say "the census tool did not finish in ${CENSUS_WAIT:-300} s (see screen-census.png); partial output in census.txt"
 		sed -n 's/^.*RDNA4CENSUS|//p' "$SERIAL" | tr -d '\r' > "$RUN/census.txt" || true
 	fi
-	grep -a "accelcensus" "$SERIAL" | sed 's/^.*RDNA4FB: //' | tr -d '\r' > "$RUN/census-kernel.log" || true
+	grep -a "accelcensus" "$SERIAL" | sed 's/^.*AMDRadeonRDNA4: //' | tr -d '\r' > "$RUN/census-kernel.log" || true
 	say "$(wc -l < "$RUN/census-kernel.log") kernel census lines -> census-kernel.log"
 fi
 LAST=$(stat -c %s "$SERIAL")
 say "kernel log ${LAST} bytes after $(( $(date +%s) - START )) s"
 shot final
-grep -a "RDNA4FB" "$SERIAL" | grep -av "RDNA4DIAG|\|RDNA4POST|" > "$RUN/rdna4fb.log" || true
-say "$(wc -l < "$RUN/rdna4fb.log") RDNA4FB lines -> $RUN/rdna4fb.log"
+grep -a "AMDRadeonRDNA4" "$SERIAL" | grep -av "RDNA4DIAG|\|RDNA4POST|" > "$RUN/amdradeonrdna4.log" || true
+say "$(wc -l < "$RUN/amdradeonrdna4.log") AMDRadeonRDNA4 lines -> $RUN/amdradeonrdna4.log"
 # The headline results the kext itself prints (user-space rows such as "vm PASS"
 # come from diagnostic-log.sh, not from the kernel log).
 {
 	echo "== verdicts from the kernel log"
-	grep -aE "compute: bring-up finished|runtime: user-space runtime up|THE TRIANGLE IS RIGHT|gfx: draw: .*(EMPTY|wrong|empty)|gfx: col: (wrong|THE|target still)|ih: (self-test totals|page flip|vblank self-test passed)" "$RUN/rdna4fb.log" |
-		sed 's/^.*RDNA4FB: /RDNA4FB: /' | cut -c1-230 | awk '!seen[$0]++'
+	grep -aE "compute: bring-up finished|runtime: user-space runtime up|THE TRIANGLE IS RIGHT|gfx: draw: .*(EMPTY|wrong|empty)|gfx: col: (wrong|THE|target still)|ih: (self-test totals|page flip|vblank self-test passed)" "$RUN/amdradeonrdna4.log" |
+		sed 's/^.*AMDRadeonRDNA4: /AMDRadeonRDNA4: /' | cut -c1-230 | awk '!seen[$0]++'
 } | tee -a "$RUN/summary.txt"
 # What the emulator itself said (stderr of QEMU, without the host-CPU feature noise).
 grep -av "host doesn't support requested feature" "$RUN/qemu.out" > "$RUN/emu-warnings.txt" || true

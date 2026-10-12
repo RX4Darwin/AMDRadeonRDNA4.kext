@@ -1,6 +1,6 @@
 //
 //  vmtree.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  A process's GPU page table for the Vulkan interface (n48n.hpp): four
 //  levels, 48 bits, pages mapped wherever the caller asks. Unlike the

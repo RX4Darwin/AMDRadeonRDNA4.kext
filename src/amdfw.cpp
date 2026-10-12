@@ -1,6 +1,6 @@
 //
 //  amdfw.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See amdfw.hpp.
 //

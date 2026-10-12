@@ -1,6 +1,6 @@
 //
 //  n48n.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See n48n.hpp.
 //

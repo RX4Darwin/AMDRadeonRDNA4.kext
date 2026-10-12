@@ -2,7 +2,7 @@
 #
 # linux-capture.sh — capture amdgpu's HDMI mode-set ground truth under Linux.
 #
-# Supersedes dmub-trace.sh. RDNA4FB is gaining native mode setting for the
+# Supersedes dmub-trace.sh. AMDRadeonRDNA4 is gaining native mode setting for the
 # HDMI monitor (1080p 60-75 Hz, TMDS) on the RX 9070 XT (Navi 48, DCN 4.1.0).
 # The GOP-loaded DMUB firmware may speak a VBIOS-command dialect that does
 # not match mainline, so instead of guessing we record what a *working*
@@ -36,11 +36,11 @@
 # picture, then press Enter (s + Enter skips a step, e.g. if 75 Hz is not
 # offered). The last step is a physical HDMI unplug/replug, which forces
 # amdgpu through the full link/PHY/pixel-clock bring-up — the sequence
-# RDNA4FB has to replay.
+# AMDRadeonRDNA4 has to replay.
 #
 # SEND BACK: the rdna4-capture-<timestamp>.tar.gz printed at the end. Copy it
 # to Windows (USB stick, or mount the Windows partition — commands printed)
-# and put it in C:\Users\miguer\Documents\tools\RDNA4FB\captures\.
+# and put it in C:\Users\miguer\Documents\tools\AMDRadeonRDNA4\captures\.
 #
 # Read-only: registers are only ever read, never written. Indirect data-port
 # registers (VPG/RDPCS/DPCSSYS *_DATA) are listed but not read unless
@@ -1933,7 +1933,7 @@ snap() {
 	t=$(mono_ns)
 	echo "$t snap $label" >> "$OUT/steps.txt"
 	{
-		echo "# RDNA4FB DCN register snapshot: label=$label mono_ns=$t reader=$READER src=${REG_SRC:-none}"
+		echo "# AMDRadeonRDNA4 DCN register snapshot: label=$label mono_ns=$t reader=$READER src=${REG_SRC:-none}"
 		echo "# DMU segment bases (base_idx 0,1,..): $DMU_BASES_STR  [$DMU_BASES_SRC]"
 		echo "# byte_addr = (base[base_idx] + dword_off) * 4   SKIP:dataport = indirect data port, not read"
 		echo "# NAME base_idx dword_off byte_addr value"
@@ -2450,7 +2450,7 @@ bundle() {
 	hdr "done"
 	echo "capture:  $tarball  ($(du -h "$tarball" | cut -f1))"
 	echo
-	printf '%s\n' "Copy it to Windows and put it in C:\\Users\\miguer\\Documents\\tools\\RDNA4FB\\captures\\"
+	printf '%s\n' "Copy it to Windows and put it in C:\\Users\\miguer\\Documents\\tools\\AMDRadeonRDNA4\\captures\\"
 	echo "  USB stick:  cp '$tarball' /media/\$USER/<stick>/"
 	echo "  or the Windows partition (Windows Fast Startup / hibernation must be OFF):"
 	ntfs=$(lsblk -rpno NAME,FSTYPE,SIZE,LABEL 2>/dev/null | awk '$2 == "ntfs" {printf "    %s  %s  %s\n", $1, $3, $4}')

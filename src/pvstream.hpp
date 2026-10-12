@@ -1,6 +1,6 @@
 //
 //  pvstream.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  M1 prep (docs/m1-stream.md, hub-task-440): decoding of the three command layers of Apple's paravirtual GPU, as measured in AppleParavirtGPU.kext and
 //  AppleParavirtGPUMetal.bundle. Host-testable (tools/pvstream-test.cpp), no kernel dependencies: the polling host (pvgpu.cpp) logs the FIFO with it.
@@ -109,7 +109,7 @@ struct Mode {
 // What the host puts into a pipe's page for process_online (all of it is what AppleParavirtDisplayPipe::process_online and its callbacks read).
 struct Info {
 	uint32_t id { 0 };
-	char name[kNameBytes] { 'R', 'D', 'N', 'A', '4', 'F', 'B', ' ', 'P', 'V', 0 };
+	char name[kNameBytes] = "AMD RDNA4 PV";   // the field holds 13 characters: the driver's full name does not fit
 	uint16_t width { 1920 }, height { 1080 };
 	uint16_t cursorWidth { 64 }, cursorHeight { 64 };
 	uint32_t txnProtocol { 0 };         // 0: SubmitTransaction is FIFO 0x06; non-zero: 0x07 (with the gamma table)

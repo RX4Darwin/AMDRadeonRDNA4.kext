@@ -1,12 +1,12 @@
 //
 //  fwblobs.S
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  AMD firmware the compute bring-up hands to the PSP, embedded as-is from
 //  firmware/amdgpu/ (linux-firmware blobs, redistributable under AMD's
 //  license, firmware/amdgpu/LICENSE.amdgpu). The PSP authenticates them;
 //  nothing here is modified. Built only when the files are present (see
-//  the Makefile); otherwise the kext is built with RDNA4FB_NO_FIRMWARE.
+//  the Makefile); otherwise the kext is built with AMDRadeonRDNA4_NO_FIRMWARE.
 //
 
 	.section __TEXT,__const

@@ -35,7 +35,7 @@
 +[ "$DIAG$CENSUS" != 11 ] || { echo "--diag and --census cannot be combined" >&2; exit 2; }
  [ -n "$BOOT" ] || [ -n "$ARGS" ] || { echo "usage: $0 <boot> [options] (try -h)" >&2; exit 2; }
  
- for f in "$QEMU_BIN" "$HERE/build-emu/rdna4.rom" "$KEXT/Contents/MacOS/RDNA4FB" \
+ for f in "$QEMU_BIN" "$HERE/build-emu/rdna4.rom" "$KEXT/Contents/MacOS/AMDRadeonRDNA4" \
 @@ -110,6 +116,23 @@
  GUEST
  	export EXTRA_QEMU="${EXTRA_QEMU:-} -drive id=share,if=none,format=raw,readonly=on,file=fat:ro:$RUN/share -device usb-storage,bus=xhci.0,drive=share"
@@ -64,8 +64,8 @@
  		REC=1; say "Recovery userland up after $(( $(date +%s) - START )) s"; shot recovery
  	fi
  	if [ -z "$DONE_AT" ] && [ "$REC" = 1 ] &&
--		grep -aqE "RDNA4FB: compute: (bring-up finished|.*failed; stopping)" "$SERIAL"; then
-+		grep -aqE "RDNA4FB: (compute: (bring-up finished|.*failed; stopping)|accelcensus: IOAccelerator service published)" "$SERIAL"; then
+-		grep -aqE "AMDRadeonRDNA4: compute: (bring-up finished|.*failed; stopping)" "$SERIAL"; then
++		grep -aqE "AMDRadeonRDNA4: (compute: (bring-up finished|.*failed; stopping)|accelcensus: IOAccelerator service published)" "$SERIAL"; then
  		DONE_AT=$(date +%s)
  	fi
  	[ -n "$DONE_AT" ] && [ $(( $(date +%s) - DONE_AT )) -ge "${GRACE_S:-45}" ] && break
@@ -93,7 +93,7 @@
 +		say "the census tool did not finish in ${CENSUS_WAIT:-300} s (see screen-census.png); partial output in census.txt"
 +		sed -n 's/^.*RDNA4CENSUS|//p' "$SERIAL" | tr -d '\r' > "$RUN/census.txt" || true
 +	fi
-+	grep -a "accelcensus" "$SERIAL" | sed 's/^.*RDNA4FB: //' | tr -d '\r' > "$RUN/census-kernel.log" || true
++	grep -a "accelcensus" "$SERIAL" | sed 's/^.*AMDRadeonRDNA4: //' | tr -d '\r' > "$RUN/census-kernel.log" || true
 +	say "$(wc -l < "$RUN/census-kernel.log") kernel census lines -> census-kernel.log"
 +fi
  LAST=$(stat -c %s "$SERIAL")

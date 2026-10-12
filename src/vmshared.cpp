@@ -1,6 +1,6 @@
 //
 //  vmshared.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  W13 S7-lite (docs/w13-vmid.md, sections 4-5): with the boot-arg rdna4-vmshared=1 a client owns no MEC queue. Two kernel-owned queues, one
 //  per MEC pipe, run every client job. They are configured as amdgpu's kernel compute rings are (gfx_v12_0_compute_mqd_init): CP_HQD_VMID 0,
@@ -20,7 +20,7 @@
 
 #include <IOKit/IOLib.h>
 
-#define SLOG(fmt, ...) IOLog("RDNA4FB: vmshared: " fmt "\n", ## __VA_ARGS__)
+#define SLOG(fmt, ...) IOLog("AMDRadeonRDNA4: vmshared: " fmt "\n", ## __VA_ARGS__)
 
 using namespace GfxReg;
 

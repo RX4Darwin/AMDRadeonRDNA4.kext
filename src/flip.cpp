@@ -1,6 +1,6 @@
 //
 //  flip.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  DCN page-flip discovery and latch helpers. The boot-time W5 test adds
 //  trails around its first hardware operations; runtime Present/Restore uses
@@ -17,7 +17,7 @@
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 
-#define FLOG(fmt, ...) IOLog("RDNA4FB: flip: " fmt "\n", ## __VA_ARGS__)
+#define FLOG(fmt, ...) IOLog("AMDRadeonRDNA4: flip: " fmt "\n", ## __VA_ARGS__)
 
 namespace Flip {
 

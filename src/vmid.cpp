@@ -1,6 +1,6 @@
 //
 //  vmid.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See vmid.hpp.
 //

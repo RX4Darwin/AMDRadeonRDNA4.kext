@@ -1,6 +1,6 @@
 /*
  *  rdna4vulkan.h
- *  RDNA4FB
+ *  AMDRadeonRDNA4
  *
  *  What this kext adds to the interface the RADV Darwin port speaks
  *  (vulkan/navi48_native_abi.h; docs/vulkan-port.md): where the interface is

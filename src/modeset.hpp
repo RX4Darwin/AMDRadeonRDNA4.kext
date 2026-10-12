@@ -1,6 +1,6 @@
 //
 //  modeset.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Mode change on the lit pipe, as an ordered list of register writes, polls
 //  and DMUB commands. For HDMI (TMDS) the sequence is amdgpu DC's full

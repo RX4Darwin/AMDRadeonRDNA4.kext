@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# rdna4fb-diagnose.sh — collect the RDNA4FB log and run the bounded feature
+# amdradeonrdna4-diagnose.sh — collect the AMDRadeonRDNA4 log and run the bounded feature
 # batch. Run on the target hackintosh as: sudo bash diagnostic-log.sh
-# Output: rdna4fb-diag-<timestamp>.txt next to this script.
+# Output: amdradeonrdna4-diag-<timestamp>.txt next to this script.
 #
 # The script is also used by the VM dry run. Keep every user-space test
 # behind run_step(): Recovery has no timeout(1), and a GPU fence must never
@@ -12,15 +12,15 @@ set -u
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo (dmesg needs root)"; exit 1; }
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-OUT="$HERE/rdna4fb-diag-$(date +%Y%m%d-%H%M%S).txt"
-SUMMARY="/tmp/rdna4fb-summary.$$"
-STEP_PREFIX="/tmp/rdna4fb-step.$$"
-KLOG="/tmp/rdna4fb-dmesg.$$"
+OUT="$HERE/amdradeonrdna4-diag-$(date +%Y%m%d-%H%M%S).txt"
+SUMMARY="/tmp/amdradeonrdna4-summary.$$"
+STEP_PREFIX="/tmp/amdradeonrdna4-step.$$"
+KLOG="/tmp/amdradeonrdna4-dmesg.$$"
 REG_RESULTS=""
 STEP_TIMEOUT=120
 STEP_SEQ=0
 : > "$SUMMARY"
-trap 'rm -f "$SUMMARY" "$KLOG" "$STEP_PREFIX"-* "/tmp/rdna4fb-klogfb.$$" "/tmp/rdna4fb-klogfb.$$.raw" "/tmp/rdna4fb-klogfb.$$.err"' EXIT
+trap 'rm -f "$SUMMARY" "$KLOG" "$STEP_PREFIX"-* "/tmp/amdradeonrdna4-klogfb.$$" "/tmp/amdradeonrdna4-klogfb.$$.raw" "/tmp/amdradeonrdna4-klogfb.$$.err"' EXIT
 
 # The kernel copy is preferred because Recovery's nvram command can return an
 # empty boot-args value while the running kernel still has its arguments.
@@ -84,19 +84,19 @@ fi
 section() { echo; echo "=== $1 ==="; }
 
 # The kernel message buffer wraps on a long boot (round 2, boot 6: not one
-# RDNA4FB line survived, so the HW cursor and compute sections came out empty).
+# AMDRadeonRDNA4 line survived, so the HW cursor and compute sections came out empty).
 # klines PATTERN prints the matching dmesg lines; when dmesg has none it falls
 # back to the same lines from the unified log (log show, read once per run).
-KFB="/tmp/rdna4fb-klogfb.$$"
+KFB="/tmp/amdradeonrdna4-klogfb.$$"
 # One bounded `log show` attempt: run it in the background and stop it after
 # $1 seconds (macOS has no timeout(1)); the rest of the arguments are log show's.
-# Output goes to $KFB.raw, errors to $KFB.err. Returns 0 when RDNA4FB lines came out.
+# Output goes to $KFB.raw, errors to $KFB.err. Returns 0 when AMDRadeonRDNA4 lines came out.
 klog_try() {
 	local secs="$1" lpid t=0
 	shift
 	: > "$KFB.raw"
 	log show "$@" --style compact --info --debug \
-		--predicate 'eventMessage CONTAINS "RDNA4FB:"' > "$KFB.raw" 2>> "$KFB.err" &
+		--predicate 'eventMessage CONTAINS "AMDRadeonRDNA4:"' > "$KFB.raw" 2>> "$KFB.err" &
 	lpid=$!
 	while kill -0 "$lpid" 2>/dev/null && [ "$t" -lt "$secs" ]; do
 		sleep 1
@@ -108,7 +108,7 @@ klog_try() {
 		kill -9 "$lpid" 2>/dev/null || true
 		echo "log show $* stopped after ${t} s" >> "$KFB.err"
 	fi
-	grep -q 'RDNA4FB:' "$KFB.raw" 2>/dev/null
+	grep -q 'AMDRadeonRDNA4:' "$KFB.raw" 2>/dev/null
 }
 klog_fallback() {
 	if [ ! -e "$KFB" ]; then
@@ -118,10 +118,10 @@ klog_fallback() {
 		# empty result says why.
 		: > "$KFB.err"
 		if klog_try 20 --last boot || klog_try 20 --last 1h || klog_try 20; then
-			grep 'RDNA4FB:' "$KFB.raw" > "$KFB"
+			grep 'AMDRadeonRDNA4:' "$KFB.raw" > "$KFB"
 		else
 			: > "$KFB"
-			echo "# log show fallback found no RDNA4FB lines (no unified-log store in this environment?):" >> "$KFB"
+			echo "# log show fallback found no AMDRadeonRDNA4 lines (no unified-log store in this environment?):" >> "$KFB"
 			head -5 "$KFB.err" | sed 's/^/# /' >> "$KFB"
 		fi
 		rm -f "$KFB.raw" "$KFB.err"
@@ -140,7 +140,7 @@ klines() {
 
 snapshot_logs() {
 	dmesg > "$KLOG" 2>&1
-	REG_RESULTS="$(ioreg -r -w0 -l -k 'RDNA4FB,Results' 2>/dev/null || true)"
+	REG_RESULTS="$(ioreg -r -w0 -l -k 'AMDRadeonRDNA4,Results' 2>/dev/null || true)"
 }
 
 # Run one command with a hard wall-clock bound. STEP_FILE remains available
@@ -217,9 +217,9 @@ registry_value() {
 	sw_vers
 	sysctl -n machdep.cpu.brand_string
 	date
-	uptime    # kernel log timestamps count from boot: how long after the last RDNA4FB line this ran
+	uptime    # kernel log timestamps count from boot: how long after the last AMDRadeonRDNA4 line this ran
 
-	section "active RDNA4FB boot-args"
+	section "active AMDRadeonRDNA4 boot-args"
 	found=""
 	for a in off cmap lutbypass 8bpc noedid nosleep modedump hwcursor \
 	         curmode curtest dmubping dmubhist dmubver dmubcursor smuping \
@@ -231,7 +231,9 @@ registry_value() {
 	[ -n "$found" ] && echo "active:$found" || echo "(no rdna4-* boot-args set)"
 
 	section "kext loaded?"
-	kextstat | grep -i rdna4 || echo "RDNA4FB NOT LOADED"
+	kextstat | grep -i rdna4 || echo "AMDRadeonRDNA4 NOT LOADED"
+	# The version and the commit the kext was built from (kexts older than 0.1.0 do not say).
+	ioreg -r -w0 -l -k 'AMDRadeonRDNA4,Build' 2>/dev/null | grep -m1 'AMDRadeonRDNA4,Build' | sed 's/^[ |]*/build: /' || true
 
 	section "boot-args"
 	echo "kernel: $(sysctl -n kern.bootargs 2>/dev/null || echo '(unreadable)')"
@@ -242,59 +244,59 @@ registry_value() {
 	if [ "$COMPUTE_STAGE" -ge 2 ]; then
 		echo "waiting for the compute bring-up to finish (up to 2 minutes)..."
 		for i in $(seq 1 120); do
-			dmesg | grep -qE 'RDNA4FB: compute: (bring-up finished|.*failed; stopping|could not start)' && break
+			dmesg | grep -qE 'AMDRadeonRDNA4: compute: (bring-up finished|.*failed; stopping|could not start)' && break
 			sleep 1
 		done
-		dmesg | grep -E 'RDNA4FB: compute: (bring-up finished|.*failed; stopping)' | tail -1
+		dmesg | grep -E 'AMDRadeonRDNA4: compute: (bring-up finished|.*failed; stopping)' | tail -1
 	fi
 
-	section "dmesg: full RDNA4FB log"
-	dmesg | grep 'RDNA4FB:' || { echo "(no RDNA4FB dmesg lines — buffer wrapped or kext absent; unified log follows)"; klog_fallback; }
+	section "dmesg: full AMDRadeonRDNA4 log"
+	dmesg | grep 'AMDRadeonRDNA4:' || { echo "(no AMDRadeonRDNA4 dmesg lines — buffer wrapped or kext absent; unified log follows)"; klog_fallback; }
 
 	section "dmesg: discovery / variant"
-	dmesg | grep -E 'RDNA4FB: (probe|Navi 48|discovery):' || true
+	dmesg | grep -E 'AMDRadeonRDNA4: (probe|Navi 48|discovery):' || true
 
 	section "dmesg: EDID / I2C / HPD"
-	dmesg | grep -E 'RDNA4FB: (edid|i2c|cmd):' || true
+	dmesg | grep -E 'AMDRadeonRDNA4: (edid|i2c|cmd):' || true
 
 	section "dmesg: lit pipe + boot timing"
-	dmesg | grep -E 'RDNA4FB: (pipe|latch):' || true
+	dmesg | grep -E 'AMDRadeonRDNA4: (pipe|latch):' || true
 
 	section "dmesg: display modes"
-	dmesg | grep -E 'RDNA4FB: modes:' || true
+	dmesg | grep -E 'AMDRadeonRDNA4: modes:' || true
 
 	section "dmesg: display power (sleep/wake; the DPG blank/un-blank of macOS display sleep, DPMS csc 11)"
 	# bd442a0: the blank/un-blank path has never run on the card; these are its lines: "power: HDMI display blanked/unblanked via DPG", "power: display on/off (... sink D0/D3 ...)"
 	# (DP) and the framebuffer's "ndrv: Control csc 11 -> 0x.." (the DPMS request macOS sent). klines falls back to the unified log when the kernel buffer wrapped.
-	klines 'RDNA4FB: (power:|.*(ndrv|head2): Control csc 11|.*display (un)?blanked|.*display sleep)' | sed 's/^/  /' || true
+	klines 'AMDRadeonRDNA4: (power:|.*(ndrv|head2): Control csc 11|.*display (un)?blanked|.*display sleep)' | sed 's/^/  /' || true
 	echo "(no line above = no display power event in the log window; after the optional idle step of START-HERE a blank AND an un-blank are expected)"
-	echo "--- registry copy (survives the kernel log wrapping): RDNA4FB,DisplayPower (last 16 events, oldest first)"
-	DPW_PROP="$(ioreg -l -w0 2>/dev/null | grep '"RDNA4FB,DisplayPower"' | sed -n -E 's/.*"RDNA4FB,DisplayPower" = "([^"]*)".*/\1/p' | head -1)"
+	echo "--- registry copy (survives the kernel log wrapping): AMDRadeonRDNA4,DisplayPower (last 16 events, oldest first)"
+	DPW_PROP="$(ioreg -l -w0 2>/dev/null | grep '"AMDRadeonRDNA4,DisplayPower"' | sed -n -E 's/.*"AMDRadeonRDNA4,DisplayPower" = "([^"]*)".*/\1/p' | head -1)"
 	if [ -n "$DPW_PROP" ]; then
 		echo "$DPW_PROP" | sed 's/ ## /\
 /g' | sed 's/^/  /'
 	else
-		echo "  (no RDNA4FB,DisplayPower property: no display power request reached the kext since boot, or the kext build predates it)"
+		echo "  (no AMDRadeonRDNA4,DisplayPower property: no display power request reached the kext since boot, or the kext build predates it)"
 	fi
 
 	section "dmesg: idle accounting (rdna4-gfxidle=1) and the Compute,GFXIdle registry copy"
-	dmesg | grep -E 'RDNA4FB: idle:' || echo "(no idle: lines - rdna4-gfxidle not enabled, or no transition yet)"
+	dmesg | grep -E 'AMDRadeonRDNA4: idle:' || echo "(no idle: lines - rdna4-gfxidle not enabled, or no transition yet)"
 	ioreg -l -w0 2>/dev/null | grep '"Compute,GFXIdle"' | sed -n -E 's/.*"Compute,GFXIdle" = "([^"]*)".*/Compute,GFXIdle: \1/p' | head -1
 
 	section "dmesg: GFX power-management experiment (rdna4-gfxpm)"
-	dmesg | grep -E 'RDNA4FB: compute: (pm|cg|gfxoff):' || echo "(rdna4-gfxpm/gfxcg/gfxoff not enabled or no such lines)"
+	dmesg | grep -E 'AMDRadeonRDNA4: compute: (pm|cg|gfxoff):' || echo "(rdna4-gfxpm/gfxcg/gfxoff not enabled or no such lines)"
 
 	section "dmesg: HW cursor (incl. vm routing + curtest)"
-	klines 'RDNA4FB: cursor:'
-	echo '--- registry copy (survives the kernel log wrapping): RDNA4FB,Cursor'
+	klines 'AMDRadeonRDNA4: cursor:'
+	echo '--- registry copy (survives the kernel log wrapping): AMDRadeonRDNA4,Cursor'
 	# ioreg prints the string with literal \n between lines; show one per line.
-	CUR_PROP="$(ioreg -l -w0 2>/dev/null | grep 'RDNA4FB,Cursor' || true)"
+	CUR_PROP="$(ioreg -l -w0 2>/dev/null | grep 'AMDRadeonRDNA4,Cursor' || true)"
 	if [ -n "$CUR_PROP" ]; then
 		# One ioreg line; the kext joins its cursor lines with " ## ".
 		echo "$CUR_PROP" | sed 's/ ## /\
 /g'
 	else
-		echo "(no RDNA4FB,Cursor property: the kext never reached cursor init; with rdna4-cursor off it holds only the "unavailable" line)"
+		echo "(no AMDRadeonRDNA4,Cursor property: the kext never reached cursor init; with rdna4-cursor off it holds only the "unavailable" line)"
 	fi
 
 	# DMUB: catches both dmub: (ping) and dmub-hist: (GOP command decode).
@@ -310,30 +312,30 @@ registry_value() {
 			echo "(inactive — add rdna4-$arg=1 to boot-args)"
 		fi
 	}
-	gated "DMUB mailbox + GOP command history" 'RDNA4FB: dmub' dmubping
+	gated "DMUB mailbox + GOP command history" 'AMDRadeonRDNA4: dmub' dmubping
 	gated "DMUB firmware fingerprint (dialect check vs amdgpu)" \
-		'RDNA4FB: dmubver:' dmubver
-	gated "SMU handshake" 'RDNA4FB: smu:' smuping
-	gated "interrupt-delivery survey" 'RDNA4FB: ih:' ihdump
-	gated "PSP status" 'RDNA4FB: psp:' pspdump
+		'AMDRadeonRDNA4: dmubver:' dmubver
+	gated "SMU handshake" 'AMDRadeonRDNA4: smu:' smuping
+	gated "interrupt-delivery survey" 'AMDRadeonRDNA4: ih:' ihdump
+	gated "PSP status" 'AMDRadeonRDNA4: psp:' pspdump
 
 	section "dmesg: emulated VBL"
-	dmesg | grep -E 'RDNA4FB: vbl:' || true
-	gated "mode-setting survey" 'RDNA4FB: mode:' modedump
+	dmesg | grep -E 'AMDRadeonRDNA4: vbl:' || true
+	gated "mode-setting survey" 'AMDRadeonRDNA4: mode:' modedump
 
 	section "second head and second pipe (rdna4-head2)"
-	klines 'RDNA4FB: (head2|pipe2|hotplug|dptrain):' | grep . || echo "(no head2/pipe2 lines: rdna4-head2=0, or a VM test build)"
-	echo '--- registry copy of the second-pipe survey: RDNA4FB,Pipe2 (step, segment:dword, value now, value after, Linux function and register)'
-	P2_PROP="$(ioreg -l -w0 2>/dev/null | grep '"RDNA4FB,Pipe2"' | sed -n -E 's/.*"RDNA4FB,Pipe2" = "(.*)"[^"]*$/\1/p' | head -1)"
+	klines 'AMDRadeonRDNA4: (head2|pipe2|hotplug|dptrain):' | grep . || echo "(no head2/pipe2 lines: rdna4-head2=0, or a VM test build)"
+	echo '--- registry copy of the second-pipe survey: AMDRadeonRDNA4,Pipe2 (step, segment:dword, value now, value after, Linux function and register)'
+	P2_PROP="$(ioreg -l -w0 2>/dev/null | grep '"AMDRadeonRDNA4,Pipe2"' | sed -n -E 's/.*"AMDRadeonRDNA4,Pipe2" = "(.*)"[^"]*$/\1/p' | head -1)"
 	if [ -n "$P2_PROP" ]; then
 		echo "$P2_PROP" | sed 's/ ## /\
 /g'
 	else
-		echo "(no RDNA4FB,Pipe2 property: rdna4-head2=2 publishes it)"
+		echo "(no AMDRadeonRDNA4,Pipe2 property: rdna4-head2=2 publishes it)"
 	fi
 
 	section "compute bring-up (rdna4-compute=<stage>)"
-	klines 'RDNA4FB: compute:' | grep . || \
+	klines 'AMDRadeonRDNA4: compute:' | grep . || \
 		echo "(no compute lines — add rdna4-compute=1 to boot-args)"
 
 	section "compute NVRAM trail (last step reached)"
@@ -542,9 +544,9 @@ registry_value() {
 	# for diagnosis and as the fallback when the property is unavailable.
 	snapshot_logs
 	section "IORegistry: compact feature results"
-	[ -n "$REG_RESULTS" ] && echo "$REG_RESULTS" || echo "(no RDNA4FB,Results property)"
+	[ -n "$REG_RESULTS" ] && echo "$REG_RESULTS" || echo "(no AMDRadeonRDNA4,Results property)"
 	section "dmesg: feature lines (IH, VM, GFX, flip, trails and hangs)"
-	grep -E 'RDNA4FB: (.*ih:|.*vm:|.*vmid|.*gfx:|.*flip:|.*trail|.*hang|.*PreviousHang)' "$KLOG" || \
+	grep -E 'AMDRadeonRDNA4: (.*ih:|.*vm:|.*vmid|.*gfx:|.*flip:|.*trail|.*hang|.*PreviousHang)' "$KLOG" || \
 		echo "(no feature-specific lines)"
 
 	# Boot 9 (docs/vm-client-rootcause.md). The feature-line filter above drops every runtime line without "vmid" in it (round 6 lost all the
@@ -554,15 +556,15 @@ registry_value() {
 	if [ "$VMIDTEST_MODE" -eq 0 ]; then
 		echo "(inactive - add rdna4-vmid-test=7 to boot-args)"
 	else
-		klines 'RDNA4FB: vmidtest:' || true
+		klines 'AMDRadeonRDNA4: vmidtest:' || true
 	fi
 	section "dmesg: runtime client lines (open, close, dequeue, dispatch, wedge, recovery; host buffer map/unmap noise removed)"
-	klines 'RDNA4FB: (runtime|vmshared):' | grep -v 'host buffer' || true
+	klines 'AMDRadeonRDNA4: (runtime|vmshared):' | grep -v 'host buffer' || true
 	section "dmesg: Vulkan interface and copy engine (vulkan:, dma:; docs/todo-vulkantest.md)"
-	klines 'RDNA4FB: (vulkan:|runtime: dma:)' | grep . || echo "(no vulkan: or dma: lines: no client opened the interface, or no rdna4-compute)"
+	klines 'AMDRadeonRDNA4: (vulkan:|runtime: dma:)' | grep . || echo "(no vulkan: or dma: lines: no client opened the interface, or no rdna4-compute)"
 	section "dmesg: MEC / HQD / VM boot-test lines (compute: mec|vm|runtime|hqd|pm: survey)"
-	klines 'RDNA4FB: (compute: (mec|vm|runtime|hqd|pm: survey)|ih: .*(VM page fault|VM fault IV))' || true
-	section "registry copies that survive the kernel log wrapping: Compute,VMSurvey / VMOps / VMProbeOps / RDNA4FB,Results"
+	klines 'AMDRadeonRDNA4: (compute: (mec|vm|runtime|hqd|pm: survey)|ih: .*(VM page fault|VM fault IV))' || true
+	section "registry copies that survive the kernel log wrapping: Compute,VMSurvey / VMOps / VMProbeOps / AMDRadeonRDNA4,Results"
 	for prop in VMSurvey VMOps VMProbeOps; do
 		echo "--- Compute,$prop"
 		REGP="$(ioreg -l -w0 2>/dev/null | grep "\"Compute,$prop\"" | sed -E "s/.*\"Compute,$prop\" = \"([^\"]*)\".*/\1/" | head -1)"
@@ -573,7 +575,7 @@ registry_value() {
 			echo "(no Compute,$prop property: the kext build has no registry copy of the survey/trace, or rdna4-vmid-test is off)"
 		fi
 	done
-	echo "--- RDNA4FB,Results"
+	echo "--- AMDRadeonRDNA4,Results"
 	echo "$REG_RESULTS"
 
 	# Feature summary. PASS means the bounded command and its result marker
@@ -629,27 +631,27 @@ registry_value() {
 	elif printf '%s\n' "$(registry_value vm)" | grep -q '^FAIL'; then
 		record vm FAIL "$(registry_value vm)"
 	else
-		record vm FAIL "GPUVM command and RDNA4FB,Results did not both pass"
+		record vm FAIL "GPUVM command and AMDRadeonRDNA4,Results did not both pass"
 	fi
 
 	if [ "$IH_MODE" -eq 0 ]; then
 		record ih SKIPPED "rdna4-ih not enabled"
-	elif ! grep -q 'RDNA4FB: compute:' "$KLOG"; then
+	elif ! grep -q 'AMDRadeonRDNA4: compute:' "$KLOG"; then
 		record ih SKIPPED "kernel compute log unavailable"
-	elif grep -q 'RDNA4FB: ih: self-test:' "$KLOG" && \
-		grep -q 'RDNA4FB: ih: self-test totals:' "$KLOG" && \
+	elif grep -q 'AMDRadeonRDNA4: ih: self-test:' "$KLOG" && \
+		grep -q 'AMDRadeonRDNA4: ih: self-test totals:' "$KLOG" && \
 		case "$(registry_value ih)" in PASS*) true;; *) false;; esac; then
 		ih_key="$(registry_value ih | sed 's/^PASS //')"
-		if grep -q 'RDNA4FB: ih: self-test: SDMA fence/trap delivered' "$KLOG"; then
+		if grep -q 'AMDRadeonRDNA4: ih: self-test: SDMA fence/trap delivered' "$KLOG"; then
 			ih_key="$ih_key; self-test SDMA trap delivered"
 		else
 			ih_key="$ih_key; self-test completed with polling fallback"
 		fi
-		grep -q 'RDNA4FB: ih: self-test: CP EOP delivered' "$KLOG" &&
+		grep -q 'AMDRadeonRDNA4: ih: self-test: CP EOP delivered' "$KLOG" &&
 			ih_key="$ih_key; CP EOP delivered"
 		record ih PASS "$ih_key"
 	else
-		record ih FAIL "IH self-test and RDNA4FB,Results did not both pass"
+		record ih FAIL "IH self-test and AMDRadeonRDNA4,Results did not both pass"
 	fi
 
 	if [ "$IH_MODE" -lt 2 ]; then
@@ -664,23 +666,23 @@ registry_value() {
 
 	if [ "$GFX_MODE" -eq 0 ]; then
 		record gfx SKIPPED "rdna4-gfx not enabled"
-	elif grep -Eq 'RDNA4FB: .*gfx: .*failure|RDNA4FB: .*stage gfx ring.*failed|RDNA4FB: .*gfx ring.*off' "$KLOG"; then
+	elif grep -Eq 'AMDRadeonRDNA4: .*gfx: .*failure|AMDRadeonRDNA4: .*stage gfx ring.*failed|AMDRadeonRDNA4: .*gfx ring.*off' "$KLOG"; then
 		record gfx FAIL "ring/draw path reported a failure"
 	elif printf '%s\n' "$(registry_value gfx)" |
 		grep -Eq '^PASS.*THE TRIANGLE IS RIGHT.*8192'; then
 		record gfx PASS "$(registry_value gfx | sed 's/^PASS //')"
-	elif printf '%s\n' "$(registry_value gfx)" | grep -q '^PASS' && grep -q 'RDNA4FB: .*power: resume: skipping the G3/G4 draws' "$KLOG"; then
+	elif printf '%s\n' "$(registry_value gfx)" | grep -q '^PASS' && grep -q 'AMDRadeonRDNA4: .*power: resume: skipping the G3/G4 draws' "$KLOG"; then
 		# A sleep cycle (rdna4-sleeptest=1, boot 11s) overwrote the durable gfx result with the wake's ring test: the wake skips the draws on purpose (P7).
 		# The draw verdict is the one from before the sleep step, in the kernel log.
-		if grep -q 'RDNA4FB: .*gfx: draw: THE TRIANGLE IS RIGHT' "$KLOG"; then
-			record gfx PASS "ring test after the sleep cycle (the wake skips the draws by design); draw proven BEFORE the sleep: $(grep 'RDNA4FB: .*gfx: draw: THE TRIANGLE IS RIGHT' "$KLOG" | head -1 | sed -E 's/.*(THE TRIANGLE IS RIGHT[^,]*).*/\1/')"
+		if grep -q 'AMDRadeonRDNA4: .*gfx: draw: THE TRIANGLE IS RIGHT' "$KLOG"; then
+			record gfx PASS "ring test after the sleep cycle (the wake skips the draws by design); draw proven BEFORE the sleep: $(grep 'AMDRadeonRDNA4: .*gfx: draw: THE TRIANGLE IS RIGHT' "$KLOG" | head -1 | sed -E 's/.*(THE TRIANGLE IS RIGHT[^,]*).*/\1/')"
 		else
 			record gfx SKIPPED "after a sleep cycle the wake skips the draws by design; the pre-sleep draw line is not in the kernel log window (see the earlier boots for the draw verdict)"
 		fi
 	elif printf '%s\n' "$(registry_value gfx)" | grep -q '^PASS'; then
 		record gfx FAIL "gfx ring passed but the draw result was not proven"
-	elif grep -Eq 'RDNA4FB: .*gfx: .*ring|RDNA4FB: .*gfx: .*draw' "$KLOG"; then
-		record gfx FAIL "gfx command result and RDNA4FB,Results did not both pass"
+	elif grep -Eq 'AMDRadeonRDNA4: .*gfx: .*ring|AMDRadeonRDNA4: .*gfx: .*draw' "$KLOG"; then
+		record gfx FAIL "gfx command result and AMDRadeonRDNA4,Results did not both pass"
 	else
 		record gfx SKIPPED "feature skipped before ring test"
 	fi
@@ -698,8 +700,8 @@ registry_value() {
 		record gfx-col FAIL "colour draw passed but the image was not proven"
 	elif printf '%s\n' "$(registry_value gfx-col)" | grep -q '^FAIL'; then
 		record gfx-col FAIL "$(registry_value gfx-col | sed 's/^FAIL //')"
-	elif grep -Eq 'RDNA4FB: .*gfx: col:' "$KLOG"; then
-		record gfx-col FAIL "colour draw logged but RDNA4FB,Results has no result"
+	elif grep -Eq 'AMDRadeonRDNA4: .*gfx: col:' "$KLOG"; then
+		record gfx-col FAIL "colour draw logged but AMDRadeonRDNA4,Results has no result"
 	else
 		record gfx-col SKIPPED "G4 not reached (the gfx stage did not get to the draw)"
 	fi
@@ -759,7 +761,7 @@ registry_value() {
 	else
 		VT="$(registry_value vmidtest)"
 		if [ -z "$VT" ]; then
-			record vmidtest FAIL "no RDNA4FB,Results vmidtest: the probes did not finish (see the vmidtest: lines and the NVRAM trail)"
+			record vmidtest FAIL "no AMDRadeonRDNA4,Results vmidtest: the probes did not finish (see the vmidtest: lines and the NVRAM trail)"
 		elif printf '%s\n' "$VT" | grep -Eq '=[FHD]( |$)'; then
 			record vmidtest FAIL "$VT  (F fail, H shader hang, D SH_MEM readback differs, S skipped; the first =F/=H is the first failing step)"
 		else
@@ -772,7 +774,7 @@ registry_value() {
 	else
 		VTL="$(registry_value vmidtest-late)"
 		if [ -z "$VTL" ]; then
-			record vmidtest-late FAIL "no RDNA4FB,Results vmidtest-late: the late probes did not run or finish (an early shader probe hung, or bring-up did not reach them)"
+			record vmidtest-late FAIL "no AMDRadeonRDNA4,Results vmidtest-late: the late probes did not run or finish (an early shader probe hung, or bring-up did not reach them)"
 		elif printf '%s\n' "$VTL" | grep -Eq '=[FHD]( |$)'; then
 			record vmidtest-late FAIL "$VTL  (compare with the early row: a probe that passes early and fails late points at clock gating / timing, H7)"
 		else
@@ -783,7 +785,7 @@ registry_value() {
 	if [ $((VMIDTEST_MODE & 2)) -eq 0 ]; then
 		record vm-survey SKIPPED "rdna4-vmid-test bit 2 (surveys) not set"
 	else
-		SURV="$(klines 'RDNA4FB: vmidtest: survey .*: GRBM 0x' || true)"
+		SURV="$(klines 'AMDRadeonRDNA4: vmidtest: survey .*: GRBM 0x' || true)"
 		SURV_SRC="kernel log"
 		if [ -z "$SURV" ]; then
 			# The kernel log window lost the bring-up lines: use the registry copy (entries "<tag> G<grbm>/<grbm2> C... ## ").
@@ -815,7 +817,7 @@ SURVEOF
 	if [ $((VMIDTEST_MODE & 4)) -eq 0 ]; then
 		record vm-trace SKIPPED "rdna4-vmid-test bit 4 (client-op trace) not set"
 	else
-		OPS="$(klines 'RDNA4FB: vmidtest( late)?: op ' || true)"   # the late probe pass logs "vmidtest late: op ..." (Kiln's dry run: the row missed them)
+		OPS="$(klines 'AMDRadeonRDNA4: vmidtest( late)?: op ' || true)"   # the late probe pass logs "vmidtest late: op ..." (Kiln's dry run: the row missed them)
 		if [ -z "$OPS" ]; then
 			record vm-trace FAIL "no op-trace lines (no client opened, or the window lost them)"
 		else
@@ -846,7 +848,7 @@ SURVEOF
 	elif [ "$SHOW_RC" -eq 0 ] && grep -q 'show: desktop restored' "$SHOW_FILE" && \
 		case "$(registry_value flip)" in PASS*) true;; *) false;; esac; then
 		flip_key="show restored desktop"
-		grep -q 'RDNA4FB: .*flip:' "$KLOG" && flip_key="show restored desktop; kernel flip lines"
+		grep -q 'AMDRadeonRDNA4: .*flip:' "$KLOG" && flip_key="show restored desktop; kernel flip lines"
 		record flip PASS "$flip_key"
 	else
 		record flip FAIL "show did not restore the desktop"
@@ -911,13 +913,13 @@ SURVEOF
 	# rdna4-gfxcg: "cg: ..." lines with a sample before and after (SMU average clock,
 	# activity, power). PASS = the enable sequence finished; read the values.
 	# Clock gating is on by default; the row reports the before/after sample of the "cg:" block.
-	if dmesg | grep -q 'RDNA4FB: compute: cg: finished'; then
-		cg_before="$(dmesg | grep 'RDNA4FB: compute: pm: cg before:' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
-		cg_after="$(dmesg | grep 'RDNA4FB: compute: pm: cg after (+1.3 s):' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
+	if dmesg | grep -q 'AMDRadeonRDNA4: compute: cg: finished'; then
+		cg_before="$(dmesg | grep 'AMDRadeonRDNA4: compute: pm: cg before:' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
+		cg_after="$(dmesg | grep 'AMDRadeonRDNA4: compute: pm: cg after (+1.3 s):' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
 		cg_kind="default on"
 		[ -n "$GFXCG_MODE" ] && cg_kind="rdna4-gfxcg=$GFXCG_MODE"
 		record gfxcg PASS "$cg_kind: before $cg_before -> after $cg_after"
-	elif dmesg | grep -q 'RDNA4FB: compute: cg: RLC is not running\|RLC safe mode did not acknowledge'; then
+	elif dmesg | grep -q 'AMDRadeonRDNA4: compute: cg: RLC is not running\|RLC safe mode did not acknowledge'; then
 		record gfxcg FAIL "clock gating not applied (see the cg: lines)"
 	elif [ -z "$GFXCG_MODE" ]; then
 		record gfxcg SKIPPED "bring-up did not reach stage 7, so the default clock gating was not applied"
@@ -929,19 +931,19 @@ SURVEOF
 	# The sample is SMU-only. "first GC access" is the guard waking GFX; WAKE FAILED is a FAIL.
 	if [ -z "$GFXOFF_MODE" ] || [ "$GFXOFF_MODE" = 0 ]; then
 		record gfxoff SKIPPED "rdna4-gfxoff not enabled"
-	elif dmesg | grep -q 'RDNA4FB: compute: gfxoff:.*WAKE FAILED'; then
+	elif dmesg | grep -q 'AMDRadeonRDNA4: compute: gfxoff:.*WAKE FAILED'; then
 		record gfxoff FAIL "the guard could not wake GFX (see the gfxoff: lines)"
-	elif dmesg | grep -q 'RDNA4FB: compute: gfxoff: AllowGfxOff refused'; then
+	elif dmesg | grep -q 'AMDRadeonRDNA4: compute: gfxoff: AllowGfxOff refused'; then
 		go_why="$(dmesg | grep -a -o 'gfxoff: AllowGfxOff refused: [^[]*' | tail -1 | cut -c1-160)"
 		record gfxoff SKIPPED "$go_why"
-	elif dmesg | grep -q 'RDNA4FB: compute: gfxoff: 1.5 s after AllowGfxOff'; then
-		go_line="$(dmesg | grep 'RDNA4FB: compute: gfxoff: 1.5 s after AllowGfxOff' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
+	elif dmesg | grep -q 'AMDRadeonRDNA4: compute: gfxoff: 1.5 s after AllowGfxOff'; then
+		go_line="$(dmesg | grep 'AMDRadeonRDNA4: compute: gfxoff: 1.5 s after AllowGfxOff' | tail -1 | sed -E 's/.*avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
 		go_wake="no GC access yet"
-		dmesg | grep -q 'RDNA4FB: compute: gfxoff: GFXOFF ended by' && go_wake="the guard woke GFX on a later GC access"
+		dmesg | grep -q 'AMDRadeonRDNA4: compute: gfxoff: GFXOFF ended by' && go_wake="the guard woke GFX on a later GC access"
 		dmesg | grep -q 'not a GFXOFF reading' && go_wake="a user-space GC access ended GFXOFF inside the wait: the sample is NOT a GFXOFF reading"
 		go_q=""
-		dmesg | grep -q 'RDNA4FB: compute: gfxoff: the boot HQD is back' && go_q="; boot HQD lost in the power-down and restored"
-		dmesg | grep -q 'RDNA4FB: compute: gfxoff: the boot HQD could not be restored' && go_q="; BOOT HQD LOST AND NOT RESTORED"
+		dmesg | grep -q 'AMDRadeonRDNA4: compute: gfxoff: the boot HQD is back' && go_q="; boot HQD lost in the power-down and restored"
+		dmesg | grep -q 'AMDRadeonRDNA4: compute: gfxoff: the boot HQD could not be restored' && go_q="; BOOT HQD LOST AND NOT RESTORED"
 		record gfxoff PASS "1.5 s after Allow: $go_line; $go_wake$go_q"
 	else
 		record gfxoff FAIL "GFXOFF was not allowed (see the gfxoff: lines)"
@@ -951,9 +953,9 @@ SURVEOF
 	# step; show the first and the last so one row says whether anything moved.
 	if [ "$GFXPM_MODE" -eq 0 ]; then
 		record gfxpm SKIPPED "rdna4-gfxpm not enabled"
-	elif grep -q 'RDNA4FB: compute: pm: experiment finished' "$KLOG"; then
-		pm_first="$(grep 'RDNA4FB: compute: pm: baseline' "$KLOG" | tail -1 | sed -E 's/.*pm: baseline[^:]*: avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
-		pm_last="$(grep 'RDNA4FB: compute: pm: ' "$KLOG" | grep -v 'pm: survey ' | grep 'avg GFXCLK pre-DS [0-9]*'  | tail -1 | sed -E 's/.*pm: ([^:]*): avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1: \2 MHz \3% \4 W/')"
+	elif grep -q 'AMDRadeonRDNA4: compute: pm: experiment finished' "$KLOG"; then
+		pm_first="$(grep 'AMDRadeonRDNA4: compute: pm: baseline' "$KLOG" | tail -1 | sed -E 's/.*pm: baseline[^:]*: avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1 MHz \2% \3 W/')"
+		pm_last="$(grep 'AMDRadeonRDNA4: compute: pm: ' "$KLOG" | grep -v 'pm: survey ' | grep 'avg GFXCLK pre-DS [0-9]*'  | tail -1 | sed -E 's/.*pm: ([^:]*): avg GFXCLK pre-DS ([0-9]+) post-DS.*GFX activity ([0-9]+) %.*socket ([0-9]+) W.*/\1: \2 MHz \3% \4 W/')"
 		record gfxpm PASS "baseline $pm_first -> $pm_last"
 	else
 		record gfxpm FAIL "pm experiment did not finish (see the pm: lines)"
@@ -984,7 +986,7 @@ SURVEOF
 		IDLE_PROP="$(ioreg -l -w0 2>/dev/null | grep '"Compute,GFXIdle"' | sed -n -E 's/.*"Compute,GFXIdle" = "([^"]*)".*/\1/p' | head -1)"
 		if [ -n "$IDLE_PROP" ]; then
 			record gfx-idle-acct PASS "$IDLE_PROP"
-		elif dmesg | grep -q 'RDNA4FB: idle: accounting on'; then
+		elif dmesg | grep -q 'AMDRadeonRDNA4: idle: accounting on'; then
 			record gfx-idle-acct FAIL "accounting started but the Compute,GFXIdle property was never written (no transition)"
 		else
 			record gfx-idle-acct FAIL "rdna4-gfxidle=1 but no idle: line: the kext build has no idle accounting, or bring-up did not reach publish"

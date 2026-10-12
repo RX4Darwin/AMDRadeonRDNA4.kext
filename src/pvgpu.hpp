@@ -1,6 +1,6 @@
 //
 //  pvgpu.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  M0 of docs/metal-phase-plan.md (route B', docs/metal-spike.md s.6.1 and s.9.2, hub-task-427): the fake Apple paravirtual GPU.
 //

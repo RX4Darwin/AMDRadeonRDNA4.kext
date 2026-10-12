@@ -1,6 +1,6 @@
 //
 //  pipe2.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Light a display pipe the firmware left dark: an HDMI stream on its own
 //  timing generator and encoder, then one plane scanning a 32-bit linear

@@ -1,6 +1,6 @@
 //
 //  dptrain.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See dptrain.hpp. The DC function each part mirrors is named above it.
 //

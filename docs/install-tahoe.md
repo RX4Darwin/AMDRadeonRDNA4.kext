@@ -13,7 +13,7 @@ the author's, on x86 OpenCore. It is the only published project that has solved 
 ## 1. Why this blocks the roadmap
 
 Every real-card result in this repo — rounds 1 through 7, `docs/hw-logs/*`, every
-`rdna4fb-diag-*.txt` — was taken in **macOS Recovery**, driven by
+`amdradeonrdna4-diag-*.txt` — was taken in **macOS Recovery**, driven by
 `diagnostic-log.sh` from the OPENCORE stick. That loop is excellent for bring-up and must stay.
 But Recovery cannot produce any of the following, and all of them are on the critical path:
 
@@ -32,14 +32,14 @@ day on it.
 
 The macOS installer runs **before** any of our configuration exists, on whatever framebuffer
 macOS can drive by itself. On this card that is Apple's generic `IONDRVFramebuffer` +
-`IOBootNDRV` over the scanout OpenCore's GOP programmed — the exact surface RDNA4FB adopts at
+`IOBootNDRV` over the scanout OpenCore's GOP programmed — the exact surface AMDRadeonRDNA4 adopts at
 runtime. Two consequences:
 
 1. **The installer's screen is the GOP's scanout and nothing else.** If it dies during macOS's
    PCI configuration, the install is blind (and this machine has no iGPU fallback to install on:
    the 5700G *does* have Cezanne graphics, which is an escape hatch worth keeping in mind —
    see §6).
-2. **RDNA4FB will be loaded during the install** if it is in `EFI/OC/Kexts`, because OpenCore
+2. **AMDRadeonRDNA4 will be loaded during the install** if it is in `EFI/OC/Kexts`, because OpenCore
    injects it into the boot kernel collection on every boot, Recovery and installer alike. It
    has never run against an installer environment.
 
@@ -54,7 +54,7 @@ the driver is in place.
 
 **For us this is a genuine tension, not a copy-paste**, and it is the first spike below:
 
-- small BAR → the GOP scanout survives PCI setup → the installer draws, and RDNA4FB's display
+- small BAR → the GOP scanout survives PCI setup → the installer draws, and AMDRadeonRDNA4's display
   adoption (which reads the console geometry and maps BAR5) is in its proven configuration;
 - large BAR → the compute runtime can place buffers in all of VRAM directly. Today, without
   DMA, buffers share a **96 MiB CPU-visible heap** limited by the BAR; with SDMA + the AGP
@@ -62,7 +62,7 @@ the driver is in place.
   (`docs/hw-logs/2026-09-28-recovery-dma-pass.txt`), i.e. **we may not need the big BAR at all**.
 
 Note that BAR5 (registers) is not what is being resized here; `ResizeGpuBars` targets BAR0 (the
-VRAM aperture). RDNA4FB's register MMIO is unaffected either way.
+VRAM aperture). AMDRadeonRDNA4's register MMIO is unaffected either way.
 
 ## 3. Proposed install procedure (to be executed, then corrected in place)
 
@@ -70,10 +70,10 @@ VRAM aperture). RDNA4FB's register MMIO is unaffected either way.
 - Full image or verified backup of the target disk. The installer step erases a volume.
 - Keep the known-good `OPENCORE` stick exactly as it is; build the installer on a **second**
   stick so the bring-up loop is never at risk.
-- Copy `backup-before-premetal/RDNA4FB.kext` and `config.plist.before-set-boot` as today.
+- Copy `backup-before-premetal/AMDRadeonRDNA4.kext` and `config.plist.before-set-boot` as today.
 
 ### 3.2 Installer medium
-- **RDNA4FB disabled for the install itself.** Either leave the kext out of the installer EFI,
+- **AMDRadeonRDNA4 disabled for the install itself.** Either leave the kext out of the installer EFI,
   or inject it with `rdna4-off=1` in the installer's boot-args. Rationale: the plugin has never
   seen an installer environment, and a hook on `IONDRVFramebuffer::doDriverIO` that misbehaves
   there costs the whole install. Turn it on for the first post-install boot, not before.
@@ -98,7 +98,7 @@ VRAM aperture). RDNA4FB's register MMIO is unaffected either way.
   bundle later (step 10).
 
 ### 3.3 First boot after install
-1. Boot with RDNA4FB present but `rdna4-off=1`: proves macOS 26 reaches the desktop on this
+1. Boot with AMDRadeonRDNA4 present but `rdna4-off=1`: proves macOS 26 reaches the desktop on this
    hardware at all, on the stock fallback framebuffer. **This is the baseline; if it fails, the
    problem is not ours.**
 2. Boot with the plugin on and nothing else (`set-boot.sh 1` argument set): desktop, correct
@@ -126,7 +126,7 @@ buffers, the large BAR buys little and costs the GOP-scanout risk. If confirmed,
 profile is simply "small BAR, always", which is strictly safer than 1401's two-phase dance.
 Evidence: a bench row per configuration plus whether the desktop still comes up.
 
-**S2 — does RDNA4FB survive the installer environment?**
+**S2 — does AMDRadeonRDNA4 survive the installer environment?**
 After a successful install, repeat one install (or an OS update) with the plugin *enabled* and
 see whether the installer's framebuffer still works. Until that is known, §3.2's "disabled for
 the install" stands. This also pre-empts the first macOS point update bricking a user's machine.
@@ -160,7 +160,7 @@ and `plutil`-validate half of this, which is a good sign about the design.
 | Risk | Mitigation |
 |---|---|
 | Installer screen dies during PCI setup | small-BAR installer profile (§3.2); S3 iGPU fallback |
-| RDNA4FB misbehaves in the installer | ship the installer EFI without it, or `rdna4-off=1` |
+| AMDRadeonRDNA4 misbehaves in the installer | ship the installer EFI without it, or `rdna4-off=1` |
 | WhateverGreen panic on 26 | remove the kext *and* its boot-args (1401 `tahoe-weg-amd`) |
 | A boot that never reaches a shell tells us nothing | OpenCore logs + Apple boot log + panic to the stick (1401 `boot-logs-on-stick`) |
 | Losing the working Recovery bring-up loop | build on a second stick; never modify OPENCORE |

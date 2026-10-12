@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# Edit an OSX-KVM OpenCore config.plist for RDNA4FB VM testing.
+# Edit an OSX-KVM OpenCore config.plist for AMDRadeonRDNA4 VM testing.
 #
-#   vm-ocplist.py <config.plist> "<boot-args>" [RDNA4FB.kext ...] [--resolution WxH] [--timeout SECS]
+#   vm-ocplist.py <config.plist> "<boot-args>" [AMDRadeonRDNA4.kext ...] [--resolution WxH] [--timeout SECS]
 #
 # - sets the macOS boot-args and makes OpenCore replace the NVRAM copy;
 # - makes the picker wait instead of auto-booting after 2 s (the stock default
 #   entry is the OpenCore disk itself, so a timeout just relaunches OpenCore);
-# - disables WhateverGreen (RDNA4FB owns the display path under test);
+# - disables WhateverGreen (AMDRadeonRDNA4 owns the display path under test);
 # - optionally injects the named kexts (already copied to EFI/OC/Kexts) through
 #   Kernel -> Add, after everything already listed — i.e. after Lilu, in the
 #   order given (tools/emu-full.sh passes several);

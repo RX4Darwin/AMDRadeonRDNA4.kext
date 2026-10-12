@@ -1,6 +1,6 @@
 //
 //  hostbackend.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  N48N::Backend on a host: buffers are ordinary memory and GPU-physical
 //  addresses are made up (they only have to be distinct and page aligned),

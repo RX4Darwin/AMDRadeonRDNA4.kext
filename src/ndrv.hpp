@@ -1,13 +1,13 @@
 //
 //  ndrv.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Answers Apple's IONDRVFramebuffer the way a display NDRV would. On a GPU
 //  without a macOS driver, IONDRVFramebuffer drives the GOP framebuffer
 //  through IOBootNDRV, which knows one fixed mode (ID 100) and nothing about
 //  the monitor. The plugin (plugin.cpp) hands the csc Status/Control
 //  requests for our framebuffer to a Translator first; it answers the mode
-//  list, timings, EDID, connection and DPMS requests from the RDNA4FB mode
+//  list, timings, EDID, connection and DPMS requests from the AMDRadeonRDNA4 mode
 //  table and the sink's EDID, and everything it does not handle (gamma,
 //  CLUT, power state, cursor, ...) stays with IOBootNDRV.
 //

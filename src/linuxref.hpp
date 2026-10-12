@@ -1,6 +1,6 @@
 //
 //  linuxref.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  W42/W43: the registers Linux amdgpu 7.2.2 reads on this RX 9070 XT (E:\linux\rdna4-groundtruth-{idle,vkcube}-*\gc-regs.txt), for the
 //  `linux diff:` lines gfxring.cpp logs before the draw. Kept in a header with a bounded formatter so a host test can feed it worst-case

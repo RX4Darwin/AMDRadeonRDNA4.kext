@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # A FULL macOS 26.6.2 (25G83) install in a plain QEMU VM on this Linux box (docs/emu-full.md): the base the Metal phase's M0 needs, because
-# Apple's AppleParavirtGPU.kext only exists in the full install's kernel collection, not in Recovery. No rdna4 device, no RDNA4FB kext needed.
+# Apple's AppleParavirtGPU.kext only exists in the full install's kernel collection, not in Recovery. No rdna4 device, no AMDRadeonRDNA4 kext needed.
 #
 #   tools/emu-full.sh <command> [options]
 #

@@ -1,7 +1,7 @@
 # Root cause: the first gfx12 draw writes 0 pixels (RX 9070 XT, round 4)
 
 Read-only review. Nothing edited, no VM run. Tags: **[F]** fact with a citation, **[I]** inference, **[G]** guess.
-Sources: kext `RDNA4FB-int/src`. amdgpu `~/src/linux-amd/drivers/gpu/drm/amd` (d266640), paths relative to `amdgpu/` unless given.
+Sources: kext `AMDRadeonRDNA4-int/src`. amdgpu `~/src/linux-amd/drivers/gpu/drm/amd` (d266640), paths relative to `amdgpu/` unless given.
 Mesa `~/src/mesa/src` (eda9ace). Logs `premetal/hw-logs/rdna4fb-diag-20260929-081934.txt` (**L4a**) and `-083603.txt` (**L4b**).
 
 ## 0. Verdict

@@ -220,11 +220,11 @@ look again after 2 ms, then a full ACQUIRE_MEM GL2 write-back" re-check. The pro
 nearest-vertex dominance within the tolerance, vertex spot pixels and centroid ~85. The host test (`userspace/test-gfx12tricol.c`) runs the same function.
 
 **Evidence.**
-- `RDNA4FB,Results` key **`gfx-col`**: `PASS colour triangle, THE COLOUR TRIANGLE IS RIGHT, draw 8192 px, max channel error 0.49, centroid 0xff555654 in N us` / `FAIL colour image, draw N px, ...` /
+- `AMDRadeonRDNA4,Results` key **`gfx-col`**: `PASS colour triangle, THE COLOUR TRIANGLE IS RIGHT, draw 8192 px, max channel error 0.49, centroid 0xff555654 in N us` / `FAIL colour image, draw N px, ...` /
   `FAIL colour draw fence` / `SKIPPED G3 baseline did not pass`. (The error prints as hundredths truncated from 1/256 units: 127/256 -> 0.49.)
 - `Compute,GFXColPixels` (like `Compute,GFXDrawPixels`), and a `Compute,GFXVerdict` entry labelled `col`: `col: ia 1/3 vs 3 ci 1 cp 4 ps 8192 px 8192 ring ok err 0.49 sum 1 cen ff555654 RIGHT`
   (the counters are real on probe boots, zeros otherwise; no clip-state fields: G4 does not run the clip probe).
-- Kernel log, `RDNA4FB: gfx: col: ...` lines in G3's style: the stream/addresses/descriptor line, the pipeline-statistics verdict (probe boots), and
+- Kernel log, `AMDRadeonRDNA4: gfx: col: ...` lines in G3's style: the stream/addresses/descriptor line, the pipeline-statistics verdict (probe boots), and
   `col: THE COLOUR TRIANGLE IS RIGHT in N us: 8192 pixels (want 8192), bounds x 64..191 y 64..190; max channel error 0.49 (tolerance 3), max |R+G+B-255| 1, 0 bad alpha, 0 not dominated by the nearest vertex's colour; near v0 (66,65) 0xff0303f9, near v1 (189,65) 0xff03f903, near v2 (128,188) 0xfff80402, centroid (128,106) 0xff555654 (want ~85,85,85)`
   (or `wrong colour image` with the measured errors, or `did not finish ...`).
 - `tools/set-boot.sh`: **boot 3** adds `rdna4-gfxcol=1` (boot 6, the A/B control of the G3 fix, deliberately does not). `tools/diagnostic-log.sh`: the boot-arg list shows `rdna4-gfxcol`, the feature summary has a

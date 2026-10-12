@@ -1,6 +1,6 @@
 /*
  *  n48nprobe.c
- *  RDNA4FB
+ *  AMDRadeonRDNA4
  *
  *  The card test of the Vulkan interface's memory half (docs/vulkan-port.md,
  *  step 1), without Mesa: open the interface, make a buffer of each kind

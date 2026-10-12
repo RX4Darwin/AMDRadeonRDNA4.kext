@@ -6,7 +6,7 @@ Sources:
 - amdgpu: `~/src/linux-amd/drivers/gpu/drm/amd` (WSL, torvalds d266640). It is a *shallow* clone, so `git log -S` is not possible there; commit history comes from the amd-gfx archives (URLs below).
 - umr @ 8438c15 (shallow clone in the session scratchpad).
 - tinygrad @ 7bfaa18 (sparse clone, `tinygrad/runtime/support/am`).
-- Kext: `RDNA4FB-int` @ 5651214 (contains merge e7817ce).
+- Kext: `AMDRadeonRDNA4-int` @ 5651214 (contains merge e7817ce).
 - Card logs: `premetal/hw-logs/rdna4fb-diag-20260929-081555.txt` ("L" below) and -013433.
 
 ## Verdict: **LIKELY**, about 85%

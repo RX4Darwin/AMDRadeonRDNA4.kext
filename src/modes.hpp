@@ -1,6 +1,6 @@
 //
 //  modes.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  The display-mode table offered to macOS, built from the sink's EDID.
 //  IOFramebuffer identifies modes by driver-chosen IDs that WindowServer

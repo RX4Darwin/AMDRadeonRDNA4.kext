@@ -1,6 +1,6 @@
 //
 //  gfxring.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  W3, the graphics side: the gfx ring (PFP/ME, RS64 firmware) brought up
 //  the way amdgpu's gfx_v12_0 does with PSP-loaded firmware:
@@ -54,7 +54,7 @@
 #include <libkern/c++/OSNumber.h>
 #include <pexpert/pexpert.h>
 
-#define GLOG(fmt, ...)  IOLog("RDNA4FB: gfx: " fmt "\n", ## __VA_ARGS__)
+#define GLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: gfx: " fmt "\n", ## __VA_ARGS__)
 
 using namespace GfxReg;
 
@@ -67,7 +67,7 @@ uint32_t RDNA4Compute::requestedGfx() {
 		// and ring_set_wptr_gfx writes the doorbell then; the MMIO branch is
 		// only for a ring without one. On the real card the MMIO write
 		// pointer halts PFP/ME (round 2, R2-2), so 1 now means the doorbell.
-		IOLog("RDNA4FB: gfx: rdna4-gfx=1 (MMIO write pointer) halts PFP/ME on silicon; using the doorbell like amdgpu\n");
+		IOLog("AMDRadeonRDNA4: gfx: rdna4-gfx=1 (MMIO write pointer) halts PFP/ME on silicon; using the doorbell like amdgpu\n");
 		return 2;
 	}
 	return mode == 2 ? mode : 0;

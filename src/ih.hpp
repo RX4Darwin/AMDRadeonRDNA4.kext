@@ -1,6 +1,6 @@
 //
 //  ih.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Freestanding helpers for the OSSSYS IH v7 ring.  The kext-facing setup
 //  and interrupt delivery live in ih.cpp; these pieces are also used by the

@@ -1,6 +1,6 @@
 //
 //  dptrain.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  DisplayPort link training (8b/10b): what brings a link up before a stream
 //  can be sent over it. The firmware does this for the boot display and the

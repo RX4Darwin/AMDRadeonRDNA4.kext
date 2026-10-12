@@ -1,7 +1,7 @@
 /*
  * AMD Radeon RX 9070 XT (Navi 48, RDNA 4) display-engine model.
  *
- * A development model for RDNA4FB: it emulates what the kext's bare-metal
+ * A development model for AMDRadeonRDNA4: it emulates what the kext's bare-metal
  * path touches, so the unmodified kext runs its real code paths in a VM.
  *
  *  - PCI identity and BAR layout of the card: BAR0/1 VRAM aperture, BAR2/3
@@ -7664,7 +7664,7 @@ static void rdna4_class_init(ObjectClass *klass, void *data)
     k->config_write = rdna4_config_write;
     device_class_set_legacy_reset(dc, rdna4_reset);
     device_class_set_props(dc, rdna4_properties);
-    dc->desc = "AMD Radeon RX 9070 XT display-engine model (RDNA4FB development)";
+    dc->desc = "AMD Radeon RX 9070 XT display-engine model (AMDRadeonRDNA4 development)";
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
 }
 

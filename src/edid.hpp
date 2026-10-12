@@ -1,6 +1,6 @@
 //
 //  edid.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Freestanding EDID parser. A detailed timing descriptor (DTD) carries
 //  everything the OTG timing generator needs to be programmed with (totals,

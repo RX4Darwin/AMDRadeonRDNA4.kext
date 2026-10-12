@@ -21,8 +21,8 @@ bash tools/emu-linux.sh 3 --diag                                     # boot 3, ~
 |---|---|
 | `summary.txt` | what happened, with timings, then the kernel-log verdicts and (`--diag`) the feature table |
 | `serial.log` | the whole kernel log (OpenCore, XNU, launchd, the kext); ~0.7 MB |
-| `rdna4fb.log` | its `RDNA4FB:` lines (the serial console interleaves lines from other writers, so some are cut) |
-| `diag-summary.txt`, `diag.txt` | `--diag`: the `Feature summary:` table, and the full `rdna4fb-diag-*.txt` (dmesg feature lines, the `RDNA4FB,Results` / `Compute,*` registry properties, every bounded test) |
+| `amdradeonrdna4.log` | its `AMDRadeonRDNA4:` lines (the serial console interleaves lines from other writers, so some are cut) |
+| `diag-summary.txt`, `diag.txt` | `--diag`: the `Feature summary:` table, and the full `amdradeonrdna4-diag-*.txt` (dmesg feature lines, the `AMDRadeonRDNA4,Results` / `Compute,*` registry properties, every bounded test) |
 | `screen-*.png` | monitor screendumps: `picker`, `recovery`, `terminal`, `diag`, `final` |
 | `qemu.out` | QEMU's stderr, including the emulator's own messages |
 
@@ -57,8 +57,8 @@ gfxcg PASS; vm/gfx/gfx-col SKIPPED (not enabled).
 Boot 3 (Recovery reached, no panic), kernel log:
 
 ```
-RDNA4FB: gfx: draw: THE TRIANGLE IS RIGHT in 1186 us: 8192 pixels 0xff0000ff (want 8192), 0 others ...
-RDNA4FB: gfx: col: wrong colour image in 76..122 us: 0 pixels (want 8192) ... target still empty
+AMDRadeonRDNA4: gfx: draw: THE TRIANGLE IS RIGHT in 1186 us: 8192 pixels 0xff0000ff (want 8192), 0 others ...
+AMDRadeonRDNA4: gfx: col: wrong colour image in 76..122 us: 0 pixels (want 8192) ... target still empty
 ```
 
 and the diagnostic table: runtime, submitib, fault, **vm**, ih, vblank, **gfx** ("ring test, THE
@@ -108,15 +108,15 @@ dmg2img/dmg2img -i images/BaseSystem.dmg -o images/BaseSystem.img    # 2.5 GB ra
 cp -r /run/media/miguer/OPENCORE/EFI/OC/Kexts/Lilu.kext kexts/
 ```
 
-Paths are overridable: `EMU`, `QEMU_SRC`, `OSXKVM`, `KEXT` (default `build/RDNA4FB.kext`),
+Paths are overridable: `EMU`, `QEMU_SRC`, `OSXKVM`, `KEXT` (default `build/AMDRadeonRDNA4.kext`),
 `LILU`, `BASE_IMG`, `RAM_MB` (default 8192).
 
 ## How it works, and where it differs from the real stick
 
 - **OpenCore image**: `tools/vm-opencore.sh` starts from OSX-KVM's stock image, injects Lilu +
-  RDNA4FB after it, disables WhateverGreen, sets the boot-args, a waiting picker and the
+  AMDRadeonRDNA4 after it, disables WhateverGreen, sets the boot-args, a waiting picker and the
   1920x1080 GOP resolution. It is **not** the stick's `config.plist`: the stick also loads the
-  AMD CPU kexts, VirtualSMC, NootRX etc. and real-board ACPI/SMBIOS; here only Lilu and RDNA4FB
+  AMD CPU kexts, VirtualSMC, NootRX etc. and real-board ACPI/SMBIOS; here only Lilu and AMDRadeonRDNA4
   are loaded. The boot-args are exactly the table's; the kext set around them is not.
 - **Display**: the emulated card's option ROM (AtomBIOS image + `RdnaGopDxe`) provides the GOP;
   OpenCore's picker and the Recovery UI are drawn through the card model at 1920x1080

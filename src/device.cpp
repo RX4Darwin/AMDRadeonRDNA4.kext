@@ -1,9 +1,9 @@
 //
 //  device.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
-//  Hardware side of RDNA4FB (see device.hpp). Moved out of the former
-//  IOFramebuffer subclass unchanged in behaviour when RDNA4FB became a Lilu
+//  Hardware side of AMDRadeonRDNA4 (see device.hpp). Moved out of the former
+//  IOFramebuffer subclass unchanged in behaviour when AMDRadeonRDNA4 became a Lilu
 //  plugin that extends Apple's IONDRVFramebuffer.
 //
 
@@ -15,7 +15,9 @@
 #include <IOKit/IODeviceMemory.h>
 #include <kern/clock.h>
 
-#define FBLOG(fmt, ...)  IOLog("RDNA4FB: " fmt "\n", ## __VA_ARGS__)
+#include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
+
+#define FBLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
 
 // ---------------------------------------------------------------------------
 // Console framebuffer discovery
@@ -71,6 +73,7 @@ bool RDNA4Device::captureConsoleInfo() {
 
 	// Publish what we adopted so `ioreg -lw0` on the target shows the
 	// geometry without needing the kernel log.
+	owner->setProperty("AMDRadeonRDNA4,Build", AMDRADEONRDNA4_BUILD);   // which build this is, where the kernel log's first lines may be gone
 	owner->setProperty("Console,BaseAddress", fbPhysBase, 64);
 	owner->setProperty("Console,Width", static_cast<uint64_t>(fbWidth), 32);
 	owner->setProperty("Console,Height", static_cast<uint64_t>(fbHeight), 32);
@@ -1673,7 +1676,7 @@ void RDNA4Device::displayPowerNote(bool on, const char *path, const char *result
 		if (len >= sizeof(all))
 			break;
 	}
-	owner->setProperty("RDNA4FB,DisplayPower", all);
+	owner->setProperty("AMDRadeonRDNA4,DisplayPower", all);
 }
 
 void RDNA4Device::setDisplayPower(bool on) {
@@ -2066,7 +2069,7 @@ RDNA4Device::~RDNA4Device() {
 // Mode table
 // ---------------------------------------------------------------------------
 
-#ifdef RDNA4FB_VM_TEST
+#ifdef AMDRadeonRDNA4_VM_TEST
 // Lenovo G25-10 base block (the tools/atomdump.cpp fixture). With boot-arg
 // "rdna4-fakeedid=1" the VM test build serves it as the sink's EDID, so the
 // mode table and how a given macOS release presents it can be checked
@@ -2088,13 +2091,13 @@ void RDNA4Device::buildModeTable() {
 	// The sink's other modes are offered unless rdna4-modeset=0: switching
 	// ran on the card for HDMI and DisplayPort boot displays (2026-10-04/06).
 	uint32_t ms = 1;
-#ifdef RDNA4FB_VM_TEST
+#ifdef AMDRadeonRDNA4_VM_TEST
 	uint32_t fake = 1;   // the fixture EDID, unless rdna4-fakeedid=0
 #endif
 	PE_parse_boot_argn("rdna4-modeset", &ms, sizeof(ms));
 	modesetRequested = ms != 0;
 
-#ifdef RDNA4FB_VM_TEST
+#ifdef AMDRadeonRDNA4_VM_TEST
 	PE_parse_boot_argn("rdna4-fakeedid", &fake, sizeof(fake));
 	if (!edidLen && fake) {
 		memcpy(edidData, kVmFixtureEdid, sizeof(kVmFixtureEdid));
@@ -2589,8 +2592,8 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 // ---------------------------------------------------------------------------
 
 // What each step of a plan would do, with the register as it is now, as the
-// registry property RDNA4FB,Pipe2 (lines joined with " ## ", like
-// RDNA4FB,Cursor): several hundred lines do not survive the kernel log.
+// registry property AMDRadeonRDNA4,Pipe2 (lines joined with " ## ", like
+// AMDRadeonRDNA4,Cursor): several hundred lines do not survive the kernel log.
 void RDNA4Device::surveySteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds) {
 	constexpr size_t kCap = 96 * 1024;
 	char *text = static_cast<char *>(IOMalloc(kCap));
@@ -2644,8 +2647,8 @@ void RDNA4Device::surveySteps(const ModeSet::Step *steps, size_t count, const Dm
 		len += snprintf(text + len, kCap - len, "%s ## ", line);
 	}
 	if (owner)
-		owner->setProperty("RDNA4FB,Pipe2", text);
-	FBLOG("pipe2: survey of %lu steps in the registry (RDNA4FB,Pipe2): %lu would change a register, "
+		owner->setProperty("AMDRadeonRDNA4,Pipe2", text);
+	FBLOG("pipe2: survey of %lu steps in the registry (AMDRadeonRDNA4,Pipe2): %lu would change a register, "
 	      "%lu requirement(s) not met; nothing written", static_cast<unsigned long>(count),
 	      static_cast<unsigned long>(differ), static_cast<unsigned long>(unmet));
 	IOFree(text, kCap);

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build RDNA4FB.kext on Linux / WSL with an osxcross toolchain
+# Build AMDRadeonRDNA4.kext on Linux / WSL with an osxcross toolchain
 # (https://github.com/tpoechtrager/osxcross: Apple ld64 + a macOS SDK).
 #
-#   tools/build-osxcross.sh            build/RDNA4FB.kext
-#   tools/build-osxcross.sh VMTEST=1   build-vmtest/RDNA4FB.kext
+#   tools/build-osxcross.sh            build/AMDRadeonRDNA4.kext
+#   tools/build-osxcross.sh VMTEST=1   build-vmtest/AMDRadeonRDNA4.kext
 #
 # OSXCROSS defaults to ~/osxcross; the target triple and SDK are taken from
 # its target/ directory. Extra arguments are passed through to make.

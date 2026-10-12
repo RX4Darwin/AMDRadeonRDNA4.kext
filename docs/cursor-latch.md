@@ -1,6 +1,6 @@
 # W25: what makes a DCN 4.01 cursor update latch (and why ours stays pending)
 
-Round 3 on the card (`RDNA4FB,Cursor`, boot 6 and 9): after every cursor write `CM_CUR0_CURSOR0_CONTROL` reads
+Round 3 on the card (`AMDRadeonRDNA4,Cursor`, boot 6 and 9): after every cursor write `CM_CUR0_CURSOR0_CONTROL` reads
 `0x000100a4/a5`, i.e. `CUR0_UPDATE_PENDING` (bit 16) is 1, while `OTG_MASTER_UPDATE_LOCK` reads 0 (released),
 `OTG_GLOBAL_SYNC_STATUS` is `0x00104104` (VUPDATE occurred) and the OTG double-buffer control reads 0. The hardware
 accepted the writes but never latched them, so nothing moved into the live cursor state.
@@ -111,7 +111,7 @@ does not write them, and the card's own GOP state already reads `0x84` before th
 4. `delay_cursor_until_vupdate` (skip the lock if VUPDATE is < 70 us away): not needed to make the latch happen; add only if cursor tearing shows.
 5. DMUB cursor offload / `UPDATE_CURSOR_INFO`: not indicated (section 3); needs the maintainer's approval before any DMUB command.
 
-## What the card should show next (`RDNA4FB,Cursor`)
+## What the card should show next (`AMDRadeonRDNA4,Cursor`)
 
 `locks:` lines at `armed`, `set`, `shown`, ...: `cur=0x00000001` at `armed` means the GOP left the cursor lock held (the hypothesis
 confirmed); after `set`/`shown` the same registers read 0 and `cm ctl ... (update pending 0)` within a few milliseconds. If `cur` was already 0

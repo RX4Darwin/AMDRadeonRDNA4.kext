@@ -1,13 +1,13 @@
 //
 //  plugin.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Lilu plugin entry. On a GPU macOS has no driver for, Apple's generic
 //  IONDRVFramebuffer (com.apple.iokit.IONDRVSupport) drives the GOP
 //  framebuffer through its boot NDRV (IOBootNDRV). Every request that driver
 //  makes of its NDRV — Initialize/Open and every csc Control/Status call —
 //  goes through IONDRVFramebuffer::doDriverIO. Routing that one function lets
-//  RDNA4FB answer the requests for the RX 9070 XT's framebuffer while Apple's
+//  AMDRadeonRDNA4 answer the requests for the RX 9070 XT's framebuffer while Apple's
 //  code keeps doing everything IOFramebuffer-side (mode caching, pixel
 //  formats, aperture remapping, console, gamma, power states).
 //
@@ -34,16 +34,17 @@
 #include "accelcensus.hpp"
 #include "pvgpu.hpp"
 #include "compute.hpp"
+#include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
 #include "device.hpp"
 #include "ndrv.hpp"
 
 uint32_t rdna4TraceLevel { 0 };
 
-#ifdef RDNA4FB_VM_TEST
+#ifdef AMDRadeonRDNA4_VM_TEST
 #include "bochsvbe.hpp"
 #endif
 
-#define FBLOG(fmt, ...)  IOLog("RDNA4FB: " fmt "\n", ## __VA_ARGS__)
+#define FBLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
 
 // The local csc record mirrors (ndrv.hpp) must match the SDK exactly.
 #define NDRV_SAME_SIZE(T) \
@@ -194,7 +195,7 @@ bool isOurDevice(IOService *provider) {
 	uint16_t vendor = vd & 0xffff, device = static_cast<uint16_t>(vd >> 16);
 	if (vendor == 0x1002 && (device == 0x7550 || device == 0x7551))
 		return true;
-#ifdef RDNA4FB_VM_TEST
+#ifdef AMDRadeonRDNA4_VM_TEST
 	if (vendor == 0x15ad && device == 0x0405)
 		return true;
 #endif
@@ -281,7 +282,7 @@ int32_t deviceGetHardwareCursorDrawState(void *ctx,
 	return static_cast<RDNA4Device *>(ctx)->getHardwareCursorDrawState(state);
 }
 
-#ifdef RDNA4FB_VM_TEST
+#ifdef AMDRadeonRDNA4_VM_TEST
 // Size QEMU is scanning out (the last mode it took); one VM test device.
 uint16_t vmWidth { 0 }, vmHeight { 0 };
 
@@ -865,7 +866,7 @@ void attach(FbEntry &e) {
 	Ndrv::Backend be { &dev, deviceSurfaceFor, deviceSwitchTo, deviceSetPower,
 	                   deviceSupportsHardwareCursor, deviceSetHardwareCursor,
 	                   deviceDrawHardwareCursor, deviceGetHardwareCursorDrawState };
-#ifdef RDNA4FB_VM_TEST
+#ifdef AMDRadeonRDNA4_VM_TEST
 	if (!dev.isAmd) {
 		pci->setIOEnable(true);
 		if (BochsVbe::present()) {
@@ -1026,7 +1027,7 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	// boot, mode switching, display sleep and hot-plug ran on the card for an
 	// HDMI monitor on either connector (2026-10-04..06). Not in VM test
 	// builds, which have no second pipe to light.
-#ifdef RDNA4FB_VM_TEST
+#ifdef AMDRadeonRDNA4_VM_TEST
 	uint32_t second = 0;
 #else
 	uint32_t second = 4;
@@ -1115,6 +1116,7 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 }
 
 void pluginStart() {
+	FBLOG("version " AMDRADEONRDNA4_BUILD);
 	uint32_t off = 0;
 	if (PE_parse_boot_argn("rdna4-off", &off, sizeof(off)) && off) {
 		FBLOG("disabled by rdna4-off boot-arg");
@@ -1124,7 +1126,7 @@ void pluginStart() {
 	const bool traceArg = PE_parse_boot_argn("rdna4-trace", &trace, sizeof(trace));
 	rdna4TraceLevel = traceArg ? trace : 0;
 	traceEnabled = rdna4TraceLevel != 0;
-#ifdef RDNA4FB_VM_TEST
+#ifdef AMDRadeonRDNA4_VM_TEST
 	// VM test builds trace by default (OpenCore images often pin boot-args).
 	if (!traceArg) {
 		rdna4TraceLevel = 1;

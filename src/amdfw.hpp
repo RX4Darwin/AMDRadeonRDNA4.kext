@@ -1,6 +1,6 @@
 //
 //  amdfw.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Freestanding parser for AMD's firmware containers (the linux-firmware
 //  amdgpu/*.bin files): the common header every blob starts with, the

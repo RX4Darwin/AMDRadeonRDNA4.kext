@@ -1,6 +1,6 @@
 //
 //  n48n.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  The kernel half of the interface the RADV Darwin port speaks
 //  (vulkan/navi48_native_abi.h, "N48N"; docs/vulkan-port.md): one client's

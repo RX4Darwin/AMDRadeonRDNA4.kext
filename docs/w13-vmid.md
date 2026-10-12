@@ -97,7 +97,7 @@ SDMA path that writes tables (`vmTableSync`, `runtime.cpp:635-664`). The design 
 
 [MEASURED], from `rdna4fb-diag-20260930-061829.txt` (round 6, VM boot, kext = `premetal/int`; excerpt in `docs/hw-logs/2026-09-30-round6-client-paths-fail.txt`):
 
-- `RDNA4FB,Results`: `vm = PASS boot self-test`, `runtime = PASS service ready`. The boot self-test is **one** translated MEC queue (VMID 8, pipe 0 queue 1,
+- `AMDRadeonRDNA4,Results`: `vm = PASS boot self-test`, `runtime = PASS service ready`. The boot self-test is **one** translated MEC queue (VMID 8, pipe 0 queue 1,
   doorbell 0x1a, `vmBootSelfTest`, `runtime.cpp:742`): a ring `WRITE_DATA` and a `RELEASE_MEM` fence. It runs **no shader**.
 - `rdna4-run selftest`: `VM isolation dispatch: I/O Timeout`, then `device not responding` for peers, host-memory vadd, SubmitIb, three/ten IBs, sgemm, hgemm; the
   runtime reports `WEDGED (a dispatch timed out; reboot)`. Every `rtOpen` logs `client queue activated MEC1 pipe 0 queue 1` (the same slot the boot test used) or
@@ -543,7 +543,7 @@ during the baseline attempt, so "a clean vm=1 boot pins the GPU" was never shown
 surveys and the op trace are also appended as compact entries to the registry properties `Compute,VMSurvey`, `Compute,VMOps` (runtime clients, 96 lines) and `Compute,VMProbeOps` (the probes' own operations, 48 lines; separate budgets since hub-task-347, because the probes used up the single budget and the clients were never traced) (` ## ` separated, bounded), because the dmesg window loses bring-up lines;
 the op trace logs refusals (`dispatch/submitib/waitfence REFUSED: rtWedged`), every `rtWedged = true` with its cause, and `open FAILED`; one survey is taken after the first client dispatch, done or timed out.
 **Boot 9 runs WITHOUT `rdna4-vm-diag`; 9b replicates round 6 with it.** With `rdna4-vmshared=1` the same boot exercises S7-lite (section 5.9).
-Result string: `RDNA4FB,Results vmidtest` (`P` pass, `F` fail, `H` shader hang, `S` skipped, `D` SH_MEM readback differs). It has **not been run anywhere**: built, reviewed, and its
+Result string: `AMDRadeonRDNA4,Results vmidtest` (`P` pass, `F` fail, `H` shader hang, `S` skipped, `D` SH_MEM readback differs). It has **not been run anywhere**: built, reviewed, and its
 emulator-side assumptions pinned by `tools/emu-qtest-vm.py` (35 checks); a macOS-guest dry run is for Kiln's loop.
 
 **What `rdna4-vmid-test` bit 1 does** (all on one spare MEC slot, never a slot a client can have, with the same EOP/rptr discipline as the boot test):
@@ -557,7 +557,7 @@ emulator-side assumptions pinned by `tools/emu-qtest-vm.py` (35 checks); a macOS
 | C4 | C3 again with the wave's code page mapped without `EXECUTABLE` | a permission fault (status bit 7 set, `PERMISSION 8`), VMID field 8 | proves the wave's instruction fetch really goes through VMID 8's tables (the W40 lesson, now for a wave) |
 | C5 | Dequeue the test queue and check `CP_HQD_ACTIVE` returns to 0 | inactive | a timeout here with C1-C4 passing points at dequeue while waves ran, the client-close symptom |
 
-**Order and stop rules.** C0, C1(n=8), C2, then C1(n=1, 15), then C3, C4, C5. On the first hang the code writes the durable `RDNA4FB,Results` key (`vmid = FAIL Cn`), attempts the W6 queue recovery
+**Order and stop rules.** C0, C1(n=8), C2, then C1(n=1, 15), then C3, C4, C5. On the first hang the code writes the durable `AMDRadeonRDNA4,Results` key (`vmid = FAIL Cn`), attempts the W6 queue recovery
 (needs `rdna4-hang=1`, set) and **does not continue**; the rest of the boot proceeds as a normal boot. Blast radius: one HQD slot, three VMIDs' contexts (all zeroed and invalidated afterwards),
 no display, no gfx ring, no power-state change.
 

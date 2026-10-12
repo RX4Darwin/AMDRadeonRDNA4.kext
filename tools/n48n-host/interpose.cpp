@@ -1,6 +1,6 @@
 //
 //  interpose.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Puts this repository's client engine (src/n48n.cpp) under the real RADV
 //  driver on a host, with no kext and no card: a library that, inserted into

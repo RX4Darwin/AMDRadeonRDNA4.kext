@@ -1,6 +1,6 @@
 //
 //  vmtest.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  W13 step S1 (docs/w13-vmid.md section 8.1): the diagnostic boot self-test, rdna4-vmid-test=1 (default
 //  off). It runs once, after vmBootSelfTest and before any client can open, and is written so that its log
@@ -13,7 +13,7 @@
 //  Each probe touches a slot of its own where it can, so a wedged slot cannot spoil the next one (round 3
 //  showed a slot is not serviced again after its first VM fault). Probes that cannot start a shader wave run
 //  first; the first probe that does and hangs stops everything else. Every probe logs one line; a failure adds
-//  the queue-state dump. The summary goes to RDNA4FB,Results "vmidtest" and the log.
+//  the queue-state dump. The summary goes to AMDRadeonRDNA4,Results "vmidtest" and the log.
 //
 //    T0  engine survey (which HQDs are active at idle) and SH_MEM_CONFIG/BASES for VMIDs 1-15
 //    T1  slot reuse, no VM involved: a VMID-0 queue on the boot self-test's own slot (0,1), twice
@@ -40,7 +40,7 @@
 #include <IOKit/IOLib.h>
 
 static const char *gVtPhase = "";     // "" for the early probes, " late" for the ones repeated after clock gating
-#define VLOG(fmt, ...) IOLog("RDNA4FB: vmidtest%s: " fmt "\n", gVtPhase, ## __VA_ARGS__)
+#define VLOG(fmt, ...) IOLog("AMDRadeonRDNA4: vmidtest%s: " fmt "\n", gVtPhase, ## __VA_ARGS__)
 
 using namespace GfxReg;
 

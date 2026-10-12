@@ -1,8 +1,8 @@
 //
 //  device.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
-//  Hardware side of RDNA4FB for one GPU: the GOP-programmed scanout, BAR5
+//  Hardware side of AMDRadeonRDNA4 for one GPU: the GOP-programmed scanout, BAR5
 //  register access, VBIOS / IP discovery, the lit display pipe, the DP AUX
 //  and DC_I2C engines (EDID), the DMUB mailbox, display power and the
 //  display-mode table.
@@ -155,7 +155,7 @@ public:
 	// makes it a no-op.
 	void setDisplayPower(bool on);
 	bool displayPowerOn { true };
-	// The last 16 display power events (macOS display sleep / wake as the kext handled them), kept in the registry property RDNA4FB,DisplayPower
+	// The last 16 display power events (macOS display sleep / wake as the kext handled them), kept in the registry property AMDRadeonRDNA4,DisplayPower
 	// (" ## " separated, newest last): the kernel log wraps, the registry does not. One small string is rebuilt per event (events are rare).
 	void displayPowerNote(bool on, const char *path, const char *result);
 	char     displayPowerHist[16][72] {};
@@ -328,7 +328,7 @@ private:
 	bool hwCursorEnabledHw { false };            // the enable bits as last written to the hardware
 	uint32_t cursorVisChanges { 0 };
 	// Evidence that survives the kernel log wrapping: registry property
-	// RDNA4FB,Cursor (cursor.cpp cursorNote).
+	// AMDRadeonRDNA4,Cursor (cursor.cpp cursorNote).
 	char cursorTrail[16384] { 0 };   // W40: 16 KiB, the Linux diff and the CM/MPCC lines came on top of the 12 KiB trail
 	uint16_t cursorTrailLen { 0 };
 	bool cursorTrailFull { false };

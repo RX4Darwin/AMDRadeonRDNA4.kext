@@ -125,7 +125,7 @@ forgot them would fault in its *own* VM (an unmapped address), not touch anyone 
 
 - **Kext boot self-test:** `rdna4-gfxclient=1` (with `rdna4-vm=1 rdna4-gfx=2`, not a probe boot if the result should be seen after park; it runs *before* park, after the G3 baseline passed): opens a synthetic client (internal token, own VMID
   and tables), maps two pool pages in it (IB, data), submits an IB of two `WRITE_DATA` packets to the data page twice, checks the data, the two per-client fences (`f2 = f1 + 1`) and that nothing is
-  pending afterwards; registry key `gfx-client` (`PASS ...` / `FAIL ...` / `SKIPPED ...`), `gfx-client` row in `tools/diagnostic-log.sh`, `RDNA4FB: vmid N: submitted unprivileged gfx IB ...` and `gfx client self-test: ...` lines.
+  pending afterwards; registry key `gfx-client` (`PASS ...` / `FAIL ...` / `SKIPPED ...`), `gfx-client` row in `tools/diagnostic-log.sh`, `AMDRadeonRDNA4: vmid N: submitted unprivileged gfx IB ...` and `gfx client self-test: ...` lines.
 - **Host tests:** `userspace/test-gfx12tri.c` (G3/G4 builders, the layout with a simulated allocator, refusals, the fact that the replay's stream and rdna4-run's differ only in relocated dwords, the image
   check), `userspace/test-gfx12tricol.c`, `userspace/test-w12k-pm4.cpp` (the ring packets against amdgpu's captured IB packet and the emulator's acceptance rules). The IB bytes `rdna4-run tri` records are the ones
   `tools/linux-replay` proves on the card through amdgpu (baseline and `REPLAY_VARIANT=4096` re-run: 8192 px).

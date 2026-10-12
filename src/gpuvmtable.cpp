@@ -1,6 +1,6 @@
 //
 //  gpuvmtable.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See gpuvmtable.hpp. The bodies are the loops of the pre-S8 vmMap / vmMapHost / vmUnmap (runtime.cpp at 0cfa416), statement for statement, with the
 //  table access going through Access.

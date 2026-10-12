@@ -1,6 +1,6 @@
 //
 //  ihdecode.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Host-testable IH 7.0 entry decoding.
 //

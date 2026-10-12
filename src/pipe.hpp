@@ -1,6 +1,6 @@
 //
 //  pipe.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Identify the display pipe the GOP lit — timing generator (OTG), DIG
 //  front-end, DIG back-end / PHY, OPP and HUBP — plus its signal type (DP

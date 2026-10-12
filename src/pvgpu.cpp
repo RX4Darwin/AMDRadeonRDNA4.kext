@@ -1,6 +1,6 @@
 //
 //  pvgpu.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See pvgpu.hpp and docs/m0-pvgpu.md.
 //
@@ -41,7 +41,7 @@ void pvlog(const char *fmt, ...) {
 	const uint32_t n = __atomic_fetch_add(&gLogLines, 1u, __ATOMIC_RELAXED);
 	if (n >= kMaxLogLines) {
 		if (n == kMaxLogLines)
-			IOLog("RDNA4FB: pvgpu: log budget (%u lines) used up\n", kMaxLogLines);
+			IOLog("AMDRadeonRDNA4: pvgpu: log budget (%u lines) used up\n", kMaxLogLines);
 		return;
 	}
 	char buf[240];
@@ -49,7 +49,7 @@ void pvlog(const char *fmt, ...) {
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
-	IOLog("RDNA4FB: pvgpu: %s\n", buf);
+	IOLog("AMDRadeonRDNA4: pvgpu: %s\n", buf);
 }
 
 // "0xEEEE106B", "0xEEEE106B&0xFFFFFFFF", several separated by blanks: does `ids` match one of them? (IOPCIMatch / IOPCIPrimaryMatch format)
@@ -1082,7 +1082,7 @@ void RDNA4PvHost::selfTest() {
 			readInfo(page1, &r);
 			testCheck(r.port == 2 && r.id == 3 && r.width == 1920 && r.height == 1080 && r.cursorWidth == 64 && r.cursorHeight == 64 && r.txnProtocol == 0 &&
 			              r.count == 1 && r.modes[0].width == 1920 && r.modes[0].height == 1080 && r.modes[0].refresh == (60u << 16) && r.cookie == 1 &&
-			              !strcmp(r.name, "RDNA4FB PV"),
+			              !strcmp(r.name, "AMD RDNA4 PV"),
 			          "display info in the shared state page: port, 1920x1080 @ 60, cursor 64x64, FIFO 0x06, one mode");
 			testCheck(__atomic_load_n(pending(page1), __ATOMIC_SEQ_CST) == kEventOnline && __atomic_load_n(pending(page2), __ATOMIC_SEQ_CST) == kEventOnline &&
 			              mOnlineEvents == 2,

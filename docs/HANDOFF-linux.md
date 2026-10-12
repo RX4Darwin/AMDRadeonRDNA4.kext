@@ -6,10 +6,10 @@ goal, architecture, hard-won rules). Install them with `install-memory.sh`.
 ## Goal
 Native macOS Tahoe 26 on the user's Hackintosh (Gigabyte B550M K, Ryzen 7 5700G,
 ASUS RX 9070 XT = Navi 48 / gfx1201, one HDMI 1080p60 monitor). Project:
-RDNA4FB, a Lilu plugin (display) plus from-scratch compute/gfx bring-up inside
+AMDRadeonRDNA4, a Lilu plugin (display) plus from-scratch compute/gfx bring-up inside
 the kext. Metal is a long-term goal; we are building the hardware foundation.
-Repo: https://github.com/RX4Darwin/RDNA4FB (PRIVATE). Remote `private` = that
-repo. `origin` = public upstream somestupidgirl/RDNA4FB: NEVER push there.
+Repo: https://github.com/RX4Darwin/AMDRadeonRDNA4.kext (PRIVATE). Remote `private` = that
+repo. `origin` = public upstream somestupidgirl/AMDRadeonRDNA4: NEVER push there.
 Working branch: `premetal/int`. Dev setup (osxcross, QEMU emulator of the card,
 Tahoe VM) lives in WSL Debian on the Windows box, not on this Linux.
 
@@ -34,7 +34,7 @@ Put results on the stick (`linux/`), then plug it into Windows and tell Claude t
 - Rule learned the hard way: when comparing to amdgpu, trace a value from its FIRST assignment to the register write (IS_PTE was composed in amdgpu_ttm_tt_pte_flags, not in the final gmc hook).
 
 ## Real-card routine (unchanged)
-Stick OPENCORE (E: on Windows): boot Recovery, `bash /Volumes/OPENCORE/diagnostic-log.sh` IMMEDIATELY (dmesg window rotates), then `bash /Volumes/OPENCORE/set-boot.sh <n>`. Boots: 1 base+cursor (daily, safe), 2 = +VM, 3 = +triangle (last, can wedge the GPU), 5 GFXOFF (optional, then set-boot 1 and power off), 6/7 isolation, 0 = known-good. Logs: rdna4fb-diag-*.txt on the stick (round 6: 20260930-06*).
+Stick OPENCORE (E: on Windows): boot Recovery, `bash /Volumes/OPENCORE/diagnostic-log.sh` IMMEDIATELY (dmesg window rotates), then `bash /Volumes/OPENCORE/set-boot.sh <n>`. Boots: 1 base+cursor (daily, safe), 2 = +VM, 3 = +triangle (last, can wedge the GPU), 5 GFXOFF (optional, then set-boot 1 and power off), 6/7 isolation, 0 = known-good. Logs: amdradeonrdna4-diag-*.txt on the stick (round 6: 20260930-06*).
 
 ## Agents / tooling (Windows only)
 A Relay canvas on the Windows box has Claude agents (pm, gfx, vmfix, review) and this lead session. From Linux you cannot `relay ask` them. Work in flight at handoff: gfx agent on `hub-task-288` (persist gfx verdicts to NVRAM, rethink what zeroes C_PRIMITIVES, probe idling); its result lands in a local Windows worktree branch. Nothing after commit bacb27b on premetal/int was pushed until the user says so; local head has the merges cursor7, vmfix6, gfx7 and set-boot.sh changes (42a1e96).

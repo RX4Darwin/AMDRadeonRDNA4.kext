@@ -1,6 +1,6 @@
 //
 //  ptpages.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  W13 S6/S8 (docs/w13-vmid.md s.5.2): demand-allocated page tables. A client's table is still addressed as the logical 4 MiB image runtime.cpp's
 //  vmMap uses (root, PDB1, PDB0, then one PT page per 2 MiB of VA at 0x3000 + n * 0x1000), but only the logical pages that hold something are backed,

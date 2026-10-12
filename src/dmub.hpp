@@ -1,6 +1,6 @@
 //
 //  dmub.hpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  Minimal DMUB (display microcontroller) mailbox ABI, from Linux
 //  drivers/gpu/drm/amd/display/dmub/inc/dmub_cmd.h. The GOP leaves DMUB

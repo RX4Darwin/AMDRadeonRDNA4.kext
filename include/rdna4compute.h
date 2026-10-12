@@ -1,6 +1,6 @@
 /*
  *  rdna4compute.h
- *  RDNA4FB
+ *  AMDRadeonRDNA4
  *
  *  The user-space compute interface: what a program passes to the kext's
  *  RDNA4ComputeClient through IOConnectCallMethod. Shared, unchanged, by the

@@ -1,6 +1,6 @@
 //
 //  bochsvbe.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See bochsvbe.hpp. Register numbers and the programming sequence follow
 //  QEMU's hw/display/vga.c and OVMF's QemuVideoDxe (InitializeBochsGraphicsMode).

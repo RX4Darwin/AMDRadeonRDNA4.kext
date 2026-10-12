@@ -1,6 +1,6 @@
 //
 //  cursor.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  PARKED — not built. The DCN hardware-cursor code from the former
 //  IOFramebuffer subclass (setCursorImage/setCursorState via
@@ -405,7 +405,7 @@ void RDNA4Device::dmubCursorTest() {
 #include <IOKit/graphics/IOGraphicsTypes.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 
-#define FBLOG(fmt, ...) IOLog("RDNA4FB: " fmt "\n", ## __VA_ARGS__)
+#define FBLOG(fmt, ...) IOLog("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
 
 namespace {
 
@@ -521,7 +521,7 @@ uint32_t premultiplyArgb(uint32_t pixel) {
 // Every cursor line goes to the kernel log AND to a registry property, because
 // the macOS kernel message buffer wraps before the diagnostic batch reads it
 // (boot 6 of round 2 lost every early line). The property is the durable copy:
-// ioreg -l | grep RDNA4FB,Cursor. The trail is 8 KiB and append-only: it keeps
+// ioreg -l | grep AMDRadeonRDNA4,Cursor. The trail is 8 KiB and append-only: it keeps
 // EVERY cursor line and every "latch:" line until it is full (round 3 filled the
 // old 2 KiB after 13 lines, so the later shown/hidden states were dropped);
 // a full trail ends in "...(full)" so a cut-off is never mistaken for the end.
@@ -543,7 +543,7 @@ void RDNA4Device::cursorTrailAppendLocked(const char *line) {
 			cursorTrailFull = true;
 			strlcat(cursorTrail, "...(full)", sizeof(cursorTrail));
 			if (owner)
-				owner->setProperty("RDNA4FB,Cursor", cursorTrail);
+				owner->setProperty("AMDRadeonRDNA4,Cursor", cursorTrail);
 		}
 		return;
 	}
@@ -553,7 +553,7 @@ void RDNA4Device::cursorTrailAppendLocked(const char *line) {
 	cursorTrailLen += 4;
 	cursorTrail[cursorTrailLen] = '\0';
 	if (owner)
-		owner->setProperty("RDNA4FB,Cursor", cursorTrail);
+		owner->setProperty("AMDRadeonRDNA4,Cursor", cursorTrail);
 }
 
 void RDNA4Device::cursorNote(const char *fmt, ...) {
@@ -562,12 +562,12 @@ void RDNA4Device::cursorNote(const char *fmt, ...) {
 	va_start(ap, fmt);
 	vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
-	IOLog("RDNA4FB: cursor: %s\n", line);
+	IOLog("AMDRadeonRDNA4: cursor: %s\n", line);
 	cursorTrailAppend(line);
 }
 
 // The OTG update-latch lines (device.cpp ensureUpdateLatch) keep their own
-// "RDNA4FB: latch:" log prefix; with the cursor requested they also go into the
+// "AMDRadeonRDNA4: latch:" log prefix; with the cursor requested they also go into the
 // trail, where they explain why a cursor write stays pending.
 void RDNA4Device::latchNote(const char *fmt, ...) {
 	char line[288];
@@ -575,7 +575,7 @@ void RDNA4Device::latchNote(const char *fmt, ...) {
 	va_start(ap, fmt);
 	vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
-	IOLog("RDNA4FB: latch: %s\n", line);
+	IOLog("AMDRadeonRDNA4: latch: %s\n", line);
 	if (hwCursorRequested) {
 		char tagged[300];
 		snprintf(tagged, sizeof(tagged), "latch: %s", line);

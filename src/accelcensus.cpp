@@ -1,6 +1,6 @@
 //
 //  accelcensus.cpp
-//  RDNA4FB
+//  AMDRadeonRDNA4
 //
 //  See accelcensus.hpp.
 //
@@ -45,7 +45,7 @@ void census(bool flush, const char *fmt, ...) {
 		IOLockLock(gLock);
 	if (gLines >= kMaxLines) {
 		if (gLines == kMaxLines)
-			IOLog("RDNA4FB: accelcensus: line budget (%u) used up\n", kMaxLines);
+			IOLog("AMDRadeonRDNA4: accelcensus: line budget (%u) used up\n", kMaxLines);
 		gLines++;
 		if (gLock)
 			IOLockUnlock(gLock);
@@ -59,7 +59,7 @@ void census(bool flush, const char *fmt, ...) {
 	va_start(ap, fmt);
 	vsnprintf(body, sizeof(body), fmt, ap);
 	va_end(ap);
-	IOLog("RDNA4FB: accelcensus: [%s/%d] %s\n", name, proc_selfpid(), body);
+	IOLog("AMDRadeonRDNA4: accelcensus: [%s/%d] %s\n", name, proc_selfpid(), body);
 	if (!gRegistryFull) {
 		char entry[240];
 		const int n = snprintf(entry, sizeof(entry), "[%s/%d] %s ## ", name, proc_selfpid(), body);
@@ -119,7 +119,7 @@ bool RDNA4AccelCensus::publish(IOService *provider, uint32_t level) {
 	gClaimedMeta = name ? OSMetaClass::getMetaClassWithName(name) : nullptr;
 	OSSafeReleaseNULL(name);
 	if (!gClaimedMeta) {
-		IOLog("RDNA4FB: accelcensus: IOAccelerator is not a registered class (IOGraphicsFamily not loaded?); no census\n");
+		IOLog("AMDRadeonRDNA4: accelcensus: IOAccelerator is not a registered class (IOGraphicsFamily not loaded?); no census\n");
 		return false;
 	}
 	gLevel = level;
@@ -127,7 +127,7 @@ bool RDNA4AccelCensus::publish(IOService *provider, uint32_t level) {
 	auto *svc = new RDNA4AccelCensus;
 	if (!svc || !svc->init()) {
 		OSSafeReleaseNULL(svc);
-		IOLog("RDNA4FB: accelcensus: could not create the service\n");
+		IOLog("AMDRadeonRDNA4: accelcensus: could not create the service\n");
 		return false;
 	}
 	svc->setName("RDNA4AccelCensus");
@@ -146,13 +146,13 @@ bool RDNA4AccelCensus::publish(IOService *provider, uint32_t level) {
 	svc->setProperty("CensusLog", "");
 	if (!svc->attach(provider)) {
 		svc->release();
-		IOLog("RDNA4FB: accelcensus: could not attach to the GPU\n");
+		IOLog("AMDRadeonRDNA4: accelcensus: could not attach to the GPU\n");
 		return false;
 	}
 	gService = svc;
 	svc->registerService();
 	svc->release();            // the registry keeps it
-	IOLog("RDNA4FB: accelcensus: IOAccelerator service published under %s (level %u: %s); no GPU action\n", provider->getName(), level,
+	IOLog("AMDRadeonRDNA4: accelcensus: IOAccelerator service published under %s (level %u: %s); no GPU action\n", provider->getName(), level,
 	      level == 1 ? "every call refused" : "every selector succeeds with zeroed outputs");
 	return true;
 }
