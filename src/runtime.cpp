@@ -3878,13 +3878,29 @@ bool RDNA4Compute::dmaInit() {
 		if (r != uniform(i) && !wrongRead++)
 			firstRead = r;
 	}
+	// The third way, which is the one Cobalt64 names: from VRAM to VRAM, both ends reached by physical address. On the card
+	// (2026-10-12) the two ways above brought the bytes written, with both registers at 0x0000aabe; one end of those copies is
+	// host memory.
+	for (uint32_t i = 0; i < n / 4; i++)
+		*poolDw(kDmaTestOffset + 4 * i) = pat2(i);
+	flushHdp();
+	uint32_t move[Sdma::kCopyDwords];
+	Sdma::copyLinear(move, poolMc(kDmaTestOffset + n), poolMc(kDmaTestOffset), n);
+	const bool moved = sdmaRun(move, Sdma::kCopyDwords, 2000);
+	uint32_t wrongMoved = 0, firstMoved = 0;
+	for (uint32_t i = 0; i < n / 4; i++) {
+		const uint32_t m = *poolDw(kDmaTestOffset + 4 * i);
+		if (m != uniform(i) && !wrongMoved++)
+			firstMoved = m;
+	}
+	auto verdict = [](bool finished, uint32_t wrong) {
+		return !finished ? "the copy never finished" : wrong ? "NOT the bytes written" : "the bytes written";
+	};
 	RLOG("dma: SDMA0_DCC_CNTL 0x%08x, SDMA1_DCC_CNTL 0x%08x (compression of data reached by physical address: bits 0x%08x). "
-	     "Uniform blocks, 64 KiB each way: written by the engine and read through the BAR: %s (%u of %u dwords differ, the first "
-	     "0x%08x); written through the BAR and read by the engine: %s (%u of %u dwords differ, the first 0x%08x)",
-	     rdGc(sdma(0, SdmaDccCntl)), rdGc(sdma(1, SdmaDccCntl)), kSdmaDccCompEn,
-	     !wrote ? "the copy never finished" : wrongWritten ? "NOT the bytes written" : "the bytes written", wrongWritten, n / 4,
-	     firstWritten, !read ? "the copy never finished" : wrongRead ? "NOT the bytes written" : "the bytes written", wrongRead,
-	     n / 4, firstRead);
+	     "Uniform blocks of 64 KiB, read without the engine unless said: host to VRAM: %s (%u of %u dwords differ, the first "
+	     "0x%08x); VRAM to host, read by the engine: %s (%u, 0x%08x); VRAM to VRAM: %s (%u, 0x%08x)",
+	     rdGc(sdma(0, SdmaDccCntl)), rdGc(sdma(1, SdmaDccCntl)), kSdmaDccCompEn, verdict(wrote, wrongWritten), wrongWritten, n / 4,
+	     firstWritten, verdict(read, wrongRead), wrongRead, firstRead, verdict(moved, wrongMoved), wrongMoved, firstMoved);
 
 	// 7. Speed, for the log: the whole buffer each way, into the pool's
 	//    heap area (not handed out yet).
