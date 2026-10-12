@@ -6,7 +6,7 @@
 # nullmoth/1401 gives the macOS installer a SMALL GPU BAR (ResizeAppleGpuBars 0,
 # ResizeGpuBars -1) because the installer draws on the firmware GOP screen, which
 # only survives macOS's PCI setup with a small BAR; it restores the full BAR only
-# after the driver is installed.  RDNA4FB adopts that same GOP scanout, so the
+# after the driver is installed.  AMDRadeonRDNA4 adopts that same GOP scanout, so the
 # small BAR is the safe profile for us too -- IF the large BAR buys us nothing.
 #
 # It may well buy nothing: since the DMA path landed (SDMA + AGP aperture +
@@ -72,10 +72,10 @@ if [ "$tag" = compare ]; then
   for key in \
     "heap total MiB" "heap free MiB" "DMA" \
     "host->GPU MB/s" "GPU->host MB/s" "VRAM copy GB/s" \
-    "SGEMM GFLOPS" "selftest" "BAR0 bytes"
+    "SGEMM GFLOPS" "selftest" "BAR0 MiB"
   do
-    va=$(grep -m1 "^$key: " "$a" 2>/dev/null | sed "s/^$key: //")
-    vb=$(grep -m1 "^$key: " "$b" 2>/dev/null | sed "s/^$key: //")
+    va=$(grep -m1 "^$key: " "$a" 2>/dev/null | sed "s|^$key: ||")   # "|": some keys have a "/" in them
+    vb=$(grep -m1 "^$key: " "$b" 2>/dev/null | sed "s|^$key: ||")
     printf '%-34s | %-22s | %-22s\n' "$key" "${va:-?}" "${vb:-?}"
   done
   echo
@@ -99,7 +99,7 @@ out=$(out_for "$tag")
 
 say() { echo "$@" | tee -a "$out"; }
 
-say "=== RDNA4FB spike S1: resizable BAR, run $tag ==="
+say "=== AMDRadeonRDNA4 spike S1: resizable BAR, run $tag ==="
 say "date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 say "boot-args: $(nvram boot-args 2>/dev/null | sed 's/^boot-args[[:space:]]*//')"
 say ""
@@ -109,7 +109,7 @@ say ""
 # 64-bit prefetchable memory window is BAR0 (the VRAM aperture).  We do not
 # decode it in shell -- we save it raw and print the registry's own view.
 say "--- PCI / registry evidence ---"
-ioreg -lw0 -p IOService -n "RDNA4FB" 2>/dev/null >> "$out"
+ioreg -lw0 -p IOService -n "AMDRadeonRDNA4" 2>/dev/null >> "$out"
 ioreg -lw0 -c IOPCIDevice 2>/dev/null \
   | grep -E '"(vendor-id|device-id|assigned-addresses|ranges|IOName)"' >> "$out" 2>/dev/null
 # The kext publishes what it found; these are the lines worth reading first.
@@ -119,6 +119,9 @@ done
 bar0=$(ioreg -lw0 -c IOPCIDevice 2>/dev/null \
   | grep -m1 -A0 '"assigned-addresses"' | head -c 400)
 say "BAR0 bytes: ${bar0:-unknown (see assigned-addresses above)}"
+# The kext says the size itself in its bring-up line ("... BAR0 0x840000000 (256 MiB) ..."); dmesg needs root.
+barmib=$(dmesg 2>/dev/null | grep -m1 'compute: memory:' | sed -n 's/.*BAR0 0x[0-9a-f]* (\([0-9]* MiB\)).*/\1/p')
+say "BAR0 MiB: ${barmib:-? (needs root)}"
 say ""
 
 # --- 2. the runtime's own view: heap size is the BAR-sensitive number ---------
@@ -135,7 +138,7 @@ echo "$info"
 # The info output names the heap; keep whatever numbers it prints verbatim and
 # also normalise the two we compare on.
 hs=$(echo "$info" | grep -iEo '[0-9]+ *MiB' | head -1)
-hf=$(echo "$info" | grep -iEo 'free[^0-9]*[0-9]+ *MiB' | grep -Eo '[0-9]+ *MiB' | head -1)
+hf=$(echo "$info" | grep -iEo '[0-9]+ *MiB free' | grep -Eo '[0-9]+ *MiB' | head -1)   # "heap: 7896 MiB, 7879 MiB free, ..."
 dma=$(echo "$info" | grep -iE 'dma|sdma|bounce' | head -1)
 say "heap total MiB: ${hs:-?}"
 say "heap free MiB: ${hf:-?}"
@@ -146,7 +149,7 @@ say "--- rdna4-run selftest ---"
 st=$("$run" selftest 2>&1)
 echo "$st" >> "$out"
 echo "$st" | tail -5
-if echo "$st" | grep -qi 'pass'; then say "selftest: PASS"; else say "selftest: FAIL"; fi
+if echo "$st" | grep -q '^selftest: PASS'; then say "selftest: PASS"; else say "selftest: FAIL"; fi
 say ""
 
 say "--- rdna4-run bench ---"
@@ -155,9 +158,12 @@ bench=$("$run" bench 2>&1)
 echo "$bench" >> "$out"
 echo "$bench"
 h2g=$(echo "$bench" | grep -iE 'host *-?> *gpu' | grep -Eo '[0-9.]+ *[MG]B/s' | head -1)
-g2h=$(echo "$bench" | grep -iE 'gpu *-?> *host' | grep -Eo '[0-9.]+ *[MG]B/s' | head -1)
-vram=$(echo "$bench" | grep -iE 'vram' | grep -Eo '[0-9.]+ *GB/s' | head -1)
-sgemm=$(echo "$bench" | grep -iE 'sgemm' | grep -Eo '[0-9.]+ *[TG]FLOPS' | head -1)
+# The shapes are rdna4-run's on the card: "host->GPU 4148 MB/s, GPU->host 3525 MB/s (...)" on one line,
+# "VRAM copy of 4 MiB: GPU 87.4 GB/s ..." (not the "GPU read host->VRAM" line), and one "sgemm n=N  GPU  X GFLOPS"
+# line a size, of which the largest is the last.
+g2h=$(echo "$bench" | sed -n 's/.*GPU *-> *host \([0-9.]* *[MG]B\/s\).*/\1/p' | head -1)
+vram=$(echo "$bench" | grep -i 'VRAM copy' | grep -Eo '[0-9.]+ *GB/s' | head -1)
+sgemm=$(echo "$bench" | grep -E 'sgemm n=[0-9]+ +GPU' | tail -1 | sed -n 's/.*\(n=[0-9]*\) *GPU *\([0-9.]* *[TG]FLOPS\).*/\2 (\1)/p')
 say ""
 say "host->GPU MB/s: ${h2g:-?}"
 say "GPU->host MB/s: ${g2h:-?}"
