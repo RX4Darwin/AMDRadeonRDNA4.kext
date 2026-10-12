@@ -47,8 +47,9 @@ constexpr uint32_t addressHi(uint64_t address) {
 }
 
 // Discover the lit OPP/HUBP and its scanout surface. No trail is written;
-// this function is also used by post-boot clients.
-bool findPipe(RDNA4Compute &compute, Surface &out);
+// this function is also used by post-boot clients. `log` false: only a
+// failure is logged (a client that presents asks once a frame).
+bool findPipe(RDNA4Compute &compute, Surface &out, bool log = true);
 
 // Poll the OTG frame counter until it advances. This is the temporary W5c
 // vblank interface; replace its polling body with ihWaitVblank when W1b lands.

@@ -64,6 +64,8 @@
 #include "rdna4compute.h"
 #include "sdma.hpp"
 
+struct IOExternalMethodArguments;
+
 class IOBufferMemoryDescriptor;
 class IODMACommand;
 class RDNA4Compute;
@@ -171,6 +173,9 @@ public:
 
 	// The VRAM window the compute side may use: inside the CPU-visible
 	// aperture (BAR0), clear of the scanout. Offsets are from VRAM start.
+	// It never starts below kPoolFloor: the firmware's console lives at the
+	// bottom of VRAM, and the plugin keeps a second display's surface there too.
+	static constexpr uint64_t kPoolFloor = 128ull << 20;
 	struct Pool {
 		uint64_t offset;
 		uint64_t size;
@@ -180,7 +185,7 @@ public:
 
 private:
 	friend bool Flip::run(RDNA4Compute &compute);
-	friend bool Flip::findPipe(RDNA4Compute &compute, Flip::Surface &out);
+	friend bool Flip::findPipe(RDNA4Compute &compute, Flip::Surface &out, bool log);
 	friend bool Flip::waitNextVblank(RDNA4Compute &compute, uint8_t otg, uint32_t timeoutMs,
 	                                uint64_t &frame);
 	friend bool Flip::flipTo(RDNA4Compute &compute, const Flip::Surface &surface,
@@ -667,7 +672,19 @@ public:
 	IOReturn rtRestore(const void *owner);
 	void     rtRelease(const void *owner);
 
+	// The Vulkan interface (src/n48nkext.cpp, docs/vulkan-port.md): one client at a time, in an address space of
+	// its own. `owner` is its user client.
+	IOReturn n48nOpen(const void *owner);
+	void     n48nClose(const void *owner);
+	IOReturn n48nCall(const void *owner, uint32_t selector, IOExternalMethodArguments *args);
+	IOReturn n48nMemory(const void *owner, uint32_t handle, IOMemoryDescriptor **memory);
+
 private:
+	friend struct N48nBackend;
+	struct N48nState;
+	N48nState *n48n { nullptr };
+	void     n48nDiscard();        // the card lost its memory under the client (sleep): forget it, write nothing
+	IOReturn n48nCopyTest(uint64_t source, uint64_t destination, uint64_t bytes);
 	// The pool past kHeapOffset is the CPU-visible heap (code, and buffers
 	// when there is no DMA). With DMA, buffers come from the device heap:
 	// VRAM past the BAR, which the CPU never touches.
@@ -838,6 +855,7 @@ private:
 	volatile uint32_t sleepRequested { 0 };
 	bool     sleepAbortOn { true };
 	bool     waitAborted { false };            // the last wait ended because of sleepRequested (rtLock held by the waiter)
+	bool     waitFaulted { false };            // the last wait ended because the job faulted (vmJobFaulted)
 	bool     sleepAbortWanted() const { return sleepAbortOn && __atomic_load_n(&sleepRequested, __ATOMIC_ACQUIRE) != 0; }
 	void     powerSleepClear();                // the wake finished (or was cancelled)
 	void     gfxSleepDrain();                  // powerWillSleep, rtLock held: wait <= 100 ms for client gfx IBs, then drop them (no wedge)
@@ -852,6 +870,7 @@ private:
 	void publishRuntime(uint32_t stage);
 	bool initRuntimeHeap();
 	bool vmBootSelfTest();
+	bool vmSharedBootTest();           // the same proof without a queue inside a client address space (vmshared.cpp)
 	// Sparse page tables (rdna4-vmshared=2): a multi-level tree, pages backed on demand.
 	static constexpr uint32_t kSparseShadowMax = 8192;        // wired 4 KiB shadow pages over all clients (32 MiB)
 	uint32_t sparseShadowPages { 0 };
@@ -960,6 +979,7 @@ private:
 	void scrubFaultPage();
 	void releaseHost(RtBuffer &buffer);
 	void retireIbFences(RtClient &client);
+	IOReturn submitIbLocked(RtClient &client, uint64_t ibVa, uint64_t dwords, uint64_t &fence);
 	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
 	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
 	// so the two never use the ring at the same time. Everything below runs under rtLock.
@@ -973,6 +993,7 @@ private:
 	IOReturn gfxClientEmit(RtClient &client, uint64_t ibVa, uint32_t dwords, uint32_t &fence);
 	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why);
 	void     gfxClientWedge(const char *why);
+	bool     gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why);   // end one address space's hung work
 	void     gfxClientDrain(RtClient &client, const char *why);
 	void     gfxClientReset();                             // a fresh gfx ring: nothing is pending
 	bool     gfxClientSelfTest();                          // rdna4-gfxclient=1 (bring-up thread)
@@ -996,6 +1017,12 @@ private:
 	uint8_t       *devHeapMap { nullptr };
 	uint32_t       devHeapMapBytes { 0 };
 	bool dmaInit();
+	// The page of system memory faults are answered from, as amdgpu's dummy page (runtime.cpp, faultPageToSystem).
+	IOBufferMemoryDescriptor *faultPage { nullptr };
+	IODMACommand  *faultPageDma { nullptr };
+	uint64_t       faultPageBus { 0 };
+	void faultPageToSystem();
+	bool vmJobFaulted(uint32_t vmid);  // the hub has latched a fault for this address space: its job is dead
 	void dmaTeardown(const char *why);
 	void devHeapInit();
 	bool sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeoutMs);

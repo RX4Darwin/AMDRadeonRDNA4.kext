@@ -64,6 +64,45 @@ These cost real-card rounds. Every one is measured unless marked.
 
 ## 4. The open blocker: applications' GPU work in their own VM
 
+**Update 2026-10-06 (Sunneva; card: Sunneva's RX 9070 XT under Big Sur 11.6.6, branches `devel/vulkan` and
+`devel/address-space`).** An application's GPU work in its own address space **runs on the card**, by another route than
+the one this section describes as failing:
+
+- **card**: the bring-up to stage 7, the graphics ring's own tests and the G3 triangle (`THE TRIANGLE IS RIGHT`, 8192 px)
+  under Big Sur with two displays lit; idle after clock gating 786 MHz / 3 % / 19 W, not pinned.
+- **card**: address space 8, its context registers set over MMIO (`vmContextInit`), a four-level table written by the CPU
+  through the BAR, and work in it from kernel queues that stay in address space 0, the address space named in the packet:
+  the copy engine (`INDIRECT` with VMID 8, three copies between VRAM and system memory) and the graphics ring
+  (`INDIRECT_BUFFER` with VMID 8). On the ring, Mesa's RADV ran fills (by the command processor; a compute shader of the driver's
+  first ran on 2026-10-07, not on the 6th as was written here) and a draw with a vertex and a fragment shader, and showed frames through `Flip::flipTo`. `docs/vulkan-port.md` sections 8 to 10 have the logs.
+- In none of those boots was a queue ever built **inside** a non-zero address space; `rdna4-vm` was not set, so neither
+  the boot self-test nor a client queue ran. That is the one thing every failing boot of rounds 2 to 6 did and these did
+  not. It is a correlation, not a root cause: `docs/vm-client-rootcause.md` section 11.
+- Since `devel/address-space`, `rdna4-vm=1` uses the shared kernel compute queues by default (W13 S7-lite,
+  `rdna4-vmshared=1`), and the boot self-test goes through them too (`vmSharedBootTest`, which is W13's step S1), so
+  that a `rdna4-vm=1` boot no longer builds such a queue at all. `rdna4-vmshared=0` gives the old path.
+- **card, 2026-10-07** (`docs/vm-client-rootcause.md` section 12): with that default the boot test passes (a kernel MEC
+  queue runs a command buffer in the address space its packet names), the graphics-ring client self-test passes, a
+  compute kernel runs in a client's address space on the shared queue (`rdna4-run`'s zero-copy vadd), and the GPU is
+  not pinned at idle.
+- **card, 2026-10-07, eighth run** (`docs/vm-client-rootcause.md` section 19, log `rdna4fb-diag-20261007-141737`):
+  **every row of the runtime passes with `rdna4-vm=1`**: `runtime`, `submitib`, `fault`, `vm` (isolation and two
+  clients at once), `gfx-client`, `gfx-app-tri`, `gfx-app-tricol`, and the GPU idles at 3 % and 18 W before and after.
+  A job whose shader faults is ended and reported to its client (`kIOReturnVMError`) within 3 ms, and its queue runs
+  the next job 1.1 ms later. Nothing lets such a job finish (sections 13 to 16); what brings the queue back is a
+  reset of the hung waves alone (`SPI_COMPUTE_QUEUE_RESET`) with the queue left as it is. amdgpu's full reset of a
+  compute queue does not work here: it needs the MES to map the queue again (sections 17 and 18). This recovery is
+  on by default (`rdna4-hang=0` switches it off); the default ran on the card without the boot-arg, same result
+  (log `rdna4fb-diag-20261007-143342`). Not covered: a hang that is not a shader's (a command buffer that cannot be fetched), the same for
+  the graphics ring and the copy engine.
+- **card, 2026-10-07, control** (section 20, log `rdna4fb-diag-20261007-143954`): the same kext and arguments with
+  `rdna4-vmshared=0` fail as in September: the old boot self-test passes, the GPU is pinned at 100 % from the moment
+  its queue is dequeued, and no client's queue runs. The failing queue has the same register state as the queue
+  remade after amdgpu's reset, which was in address space 0. So the cause is not the address space the queue is in
+  but a queue being dequeued and loaded again through its registers (an inference from the two cases).
+
+The table in section 1 and the text below are as written on 2026-09-30.
+
 (Filled in when the final real-card round has run.) Summary so far: in every real-card VM boot every client job fails (the first
 dispatch times out, then "device not responding"; every client close logs a dequeue timeout; the GPU reads ~100 % busy before any
 client). Only the kernel's boot VM test passes, and it runs no shader. Candidates and the boots that decide them:

@@ -345,6 +345,7 @@ struct Head2 {
 	uint8_t          hpdPin { 0 };          // the pin that was last seen high
 	uint32_t         hpdSame { 0 };         // polls it has read that way
 	uint32_t         hpdGone { 0 };         // polls it has been low with the link up
+	bool             hpdBack { false };     // it came back from a second or more of low with the head connected
 };
 Head2 *head2 { nullptr };
 // rdna4-head2: 0 none, 1 phantom, 2..4 see RDNA4Device::lightSecondPipe. 4 unless
@@ -385,10 +386,6 @@ void head2SetPower(void *ctx, bool on) {
 
 // From wrapStart, before IONDRVFramebuffer starts on the PCI device.
 void createHead2(IOPCIDevice *pci) {
-	if (computeStage) {   // the compute pool takes the VRAM behind the console
-		FBLOG("head2: not created: rdna4-compute is set");
-		return;
-	}
 	auto *h = new Head2;
 	// IONDRVDevice is private to IONDRVSupport: made by name, driven as an IOService.
 	IOService *nub = h ? OSDynamicCast(IOService, OSMetaClass::allocClassWithName("IONDRVDevice"))
@@ -497,6 +494,10 @@ void fillHead2(RDNA4Device &dev) {
 			h->range = mem;
 			h->rangeBase = base;
 			h->rangeLen = mem->getLength();
+			// With the compute bring-up the surface has to end below the compute pool, which never starts
+			// under RDNA4Compute::kPoolFloor.
+			if (computeStage && h->rangeLen > RDNA4Compute::kPoolFloor)
+				h->rangeLen = RDNA4Compute::kPoolFloor;
 			break;
 		}
 	}
@@ -661,6 +662,7 @@ void hotplugPoll(OSObject *, IOTimerEventSource *timer) {
 	if (present != h->hpdSeen) {
 		if (present)
 			h->hpdPin = hpd;
+		h->hpdBack = present && h->connected && h->hpdSame >= 1;
 		FBLOG("hotplug: HPD%u went %s", h->hpdPin, present ? "high" : "low");
 		h->hpdSeen = present;
 		h->hpdSame = 0;
@@ -675,8 +677,16 @@ void hotplugPoll(OSObject *, IOTimerEventSource *timer) {
 		// was not there yet; three seconds of low.
 		if (!h->connected && present && (h->hpdSame == 2 || h->hpdSame == 6 || h->hpdSame == 14))
 			head2Plugged(h, hpd);
-		else if (h->connected && h->hpdGone >= 6)
+		// Six seconds on DisplayPort: the test monitor drops its pin for up to
+		// 3.7 s on waking from display sleep (card, 2026-10-06). A shorter
+		// drop may still have cost the link: looked at a second after the pin
+		// is back.
+		else if (h->connected && h->hpdGone >= (Pipe2::config().dp ? 12u : 6u))
 			head2Unplugged(h);
+		else if (h->hpdBack && present && h->hpdSame == 2) {
+			h->hpdBack = false;
+			dev.secondLinkBack();
+		}
 	}
 	timer->setTimeoutMS(kHpdPollMs);
 }
@@ -1015,7 +1025,7 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	// The second display and its hot-plug are on unless turned off: lit at
 	// boot, mode switching, display sleep and hot-plug ran on the card for an
 	// HDMI monitor on either connector (2026-10-04..06). Not in VM test
-	// builds, which have no second pipe to light, and not with rdna4-compute.
+	// builds, which have no second pipe to light.
 #ifdef RDNA4FB_VM_TEST
 	uint32_t second = 0;
 #else

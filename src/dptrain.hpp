@@ -100,6 +100,7 @@ const char *resultName(Result r);
 struct Report {
 	Result  result;
 	uint8_t attempts;              // 1..kAttempts
+	Result  tries[4];              // what each attempt ended in
 	uint8_t swing, preEmphasis;    // the drive the lanes ended on
 	uint8_t status[6];             // the last LANE0_1_STATUS .. ADJUST_REQUEST_LANE2_3 read
 };

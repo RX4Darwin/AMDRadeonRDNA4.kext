@@ -242,7 +242,7 @@ Result bringUp(const Io &io, const Sink &sink, const Link &link, Report *report)
 	Trainer t { io, sink, link };
 	uint32_t pauseMs = 50;
 	for (rep.attempts = 1;; rep.attempts++) {
-		rep.result = t.attempt();
+		rep.result = rep.tries[rep.attempts - 1] = t.attempt();
 		rep.swing = t.swing;
 		rep.preEmphasis = t.pre;
 		for (size_t i = 0; i < sizeof(rep.status); i++)

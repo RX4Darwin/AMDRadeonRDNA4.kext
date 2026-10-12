@@ -61,7 +61,8 @@ case "$SLEEPTEST_MODE" in ''|*[!0-9]*) SLEEPTEST_MODE=0;; esac
 case "$GFXPM_MODE" in ''|*[!0-9]*) GFXPM_MODE=0;; esac
 case "$VMIDTEST_MODE" in ''|*[!0-9]*) VMIDTEST_MODE=0;; esac
 case "$GFXIDLE_MODE" in ''|*[!0-9]*) GFXIDLE_MODE=0;; esac
-case "$VMSHARED_MODE" in ''|*[!0-9]*) VMSHARED_MODE=0;; esac
+# Since 2026-10-06 the shared queues are the default with rdna4-vm=1; rdna4-vmshared=0 asks for the old path.
+case "$VMSHARED_MODE" in '') [ "$VM_MODE" -ne 0 ] && VMSHARED_MODE=1 || VMSHARED_MODE=0;; *[!0-9]*) VMSHARED_MODE=0;; esac
 
 # Queue recovery is an explicit last step. It is never part of an ordinary
 # collection, even when rdna4-hang=1 is present in the boot arguments.
@@ -321,7 +322,7 @@ registry_value() {
 	gated "mode-setting survey" 'RDNA4FB: mode:' modedump
 
 	section "second head and second pipe (rdna4-head2)"
-	klines 'RDNA4FB: (head2|pipe2|hotplug|dptrain):' | grep . || echo "(no head2/pipe2 lines: rdna4-head2=0, rdna4-compute, or a VM test build)"
+	klines 'RDNA4FB: (head2|pipe2|hotplug|dptrain):' | grep . || echo "(no head2/pipe2 lines: rdna4-head2=0, or a VM test build)"
 	echo '--- registry copy of the second-pipe survey: RDNA4FB,Pipe2 (step, segment:dword, value now, value after, Linux function and register)'
 	P2_PROP="$(ioreg -l -w0 2>/dev/null | grep '"RDNA4FB,Pipe2"' | sed -n -E 's/.*"RDNA4FB,Pipe2" = "(.*)"[^"]*$/\1/p' | head -1)"
 	if [ -n "$P2_PROP" ]; then
@@ -342,6 +343,9 @@ registry_value() {
 	# Capture durable evidence before any user-space command or display/GPU
 	# exercise. Refresh it after the steps below for the final registry values.
 	snapshot_logs
+	# A kext built without the AMD firmware stops at stage 2 and says so in the registry, where a wrapped kernel log cannot lose it.
+	FW_RESULT="$(registry_value firmware 2>/dev/null || true)"
+	[ -n "$FW_RESULT" ] && echo "FIRMWARE: $FW_RESULT" || true
 
 	RUNTIME_ACTIVE=0
 	RUNTIME_READY=0
@@ -553,7 +557,9 @@ registry_value() {
 		klines 'RDNA4FB: vmidtest:' || true
 	fi
 	section "dmesg: runtime client lines (open, close, dequeue, dispatch, wedge, recovery; host buffer map/unmap noise removed)"
-	klines 'RDNA4FB: runtime:' | grep -v 'host buffer' || true
+	klines 'RDNA4FB: (runtime|vmshared):' | grep -v 'host buffer' || true
+	section "dmesg: Vulkan interface and copy engine (vulkan:, dma:; docs/todo-vulkantest.md)"
+	klines 'RDNA4FB: (vulkan:|runtime: dma:)' | grep . || echo "(no vulkan: or dma: lines: no client opened the interface, or no rdna4-compute)"
 	section "dmesg: MEC / HQD / VM boot-test lines (compute: mec|vm|runtime|hqd|pm: survey)"
 	klines 'RDNA4FB: (compute: (mec|vm|runtime|hqd|pm: survey)|ih: .*(VM page fault|VM fault IV))' || true
 	section "registry copies that survive the kernel log wrapping: Compute,VMSurvey / VMOps / VMProbeOps / RDNA4FB,Results"
@@ -733,9 +739,11 @@ registry_value() {
 	# Boot 9 rows (docs/vm-client-rootcause.md). vm-confound: the round 6 boots carried rdna4-vm-diag=4065 (bit 512 "F" = the GC hub's fault default
 	# page pointed at a system page while the boot test runs); the script's "active:" list did not show it, so the confound was invisible.
 	if [ "$VMSHARED_MODE" -ne 0 ]; then
-		record vmshared INFO "rdna4-vmshared=$VMSHARED_MODE: client compute jobs run on the shared VMID-0 queues (design B); runtime/submitib/fault rows test that path, vmidtest probes are the same"
+		record vmshared INFO "shared mode $VMSHARED_MODE (the default with rdna4-vm=1): client compute jobs run on the shared VMID-0 queues (design B) and the boot test goes through them; runtime/submitib/fault rows test that path"
+	elif [ "$VM_MODE" -ne 0 ]; then
+		record vmshared INFO "rdna4-vmshared=0: the old path, clients own an MEC queue each in their own address space (never serviced on the card)"
 	else
-		record vmshared SKIPPED "rdna4-vmshared not enabled (clients own an MEC queue each: the old path)"
+		record vmshared SKIPPED "rdna4-vm not enabled"
 	fi
 	if [ "$VM_MODE" -eq 0 ]; then
 		record vm-confound SKIPPED "rdna4-vm not enabled"

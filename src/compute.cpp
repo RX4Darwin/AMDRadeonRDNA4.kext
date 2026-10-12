@@ -114,10 +114,13 @@ uint32_t RDNA4Compute::requestedStage() {
 	return stage > StageKernel ? StageKernel : stage;
 }
 
+// Since 2026-10-06 a client's work runs on the shared kernel queues unless rdna4-vmshared=0 asks for the old
+// path, a queue of its own in its own address space. That path was never serviced on the card; a kernel queue
+// that takes the address space from the packet was shown to work there for the graphics ring and the copy engine
+// (docs/vulkan-port.md sections 8 and 9).
 uint32_t RDNA4Compute::requestedVmShared() {
-	uint32_t mode = 0;
-	if (!PE_parse_boot_argn("rdna4-vmshared", &mode, sizeof(mode)))
-		return 0;
+	uint32_t mode = 1;
+	(void)PE_parse_boot_argn("rdna4-vmshared", &mode, sizeof(mode));
 	return mode > 2 ? 2 : mode;
 }
 
@@ -385,10 +388,9 @@ void RDNA4Compute::choosePool() {
 	// The bring-up needs 64 MiB (its layout ends below kHeapOffset); the rest
 	// of BAR0, up to 128 MiB in all, becomes the user-space heap.
 	constexpr uint64_t kAlign = 16 * kMiB, kNeed = 64 * kMiB, kMost = 128 * kMiB;
-	constexpr uint64_t kFloor = 128 * kMiB;
 	uint64_t start = (sv.scanoutOffset + env.scanoutLength + kAlign - 1) & ~(kAlign - 1);
-	if (start < kFloor)
-		start = kFloor;
+	if (start < kPoolFloor)
+		start = kPoolFloor;
 	if (start + kNeed > sv.bar0Size)
 		return;
 	const uint64_t room = (sv.bar0Size - start) & ~(kAlign - 1);
@@ -783,7 +785,9 @@ void RDNA4Compute::runStages() {
 		if (!bringupStepAllowed("VM self-test"))
 			return;
 		vmSurvey("before vmBootSelfTest");
-		if (!featureAllowed("vm") || !vmBootSelfTest()) {
+		// The old test builds a queue inside address space 8, which is what the shared mode exists to avoid:
+		// with shared queues the proof goes through them.
+		if (!featureAllowed("vm") || !(vmShared ? vmSharedBootTest() : vmBootSelfTest())) {
 		vmEnabled = false;
 		CLOG("vm: boot self-test failed; per-client GPU VM disabled");
 		}
@@ -1911,6 +1915,7 @@ void RDNA4Compute::gfxPmExperiment(uint32_t mask) {
 bool RDNA4Compute::stagePsp() {
 #ifdef RDNA4FB_NO_FIRMWARE
 	CLOG("psp: this build carries no firmware (firmware/amdgpu/ was empty at build time)");
+	publishResult("firmware", "FAIL none in this kext: tools/fetch-firmware.sh, then make clean && make");
 	return false;
 #else
 	OSDictionary *d = OSDictionary::withCapacity(12);
@@ -3236,9 +3241,10 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	const uint32_t timeoutUs = l.timeoutUs ? l.timeoutUs : 1000000;
 	uint64_t t0 = mach_absolute_time(), span = 0;
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutUs) * 1000, &span);
-	if (vm)
+	if (vm) {
+		(void)vmJobFaulted(0);                           // an entry of the graphics ring's would hide this job's fault
 		pm4Kick(q, l.doorbell, q.wptr());
-	else {
+	} else {
 		pm4Fence = fenceValue;
 		pm4Kick(q.wptr());
 	}
@@ -3255,6 +3261,10 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 				break;
 			if (vm && sleepAbortWanted()) {              // P7: a client dispatch ends when a sleep is requested
 				waitAborted = true;
+				break;
+			}
+			if (vm && vmJobFaulted(l.vmid)) {            // its job is dead: no point in the rest of the timeout (runtime.cpp)
+				waitFaulted = true;
 				break;
 			}
 			if (polls < 200)

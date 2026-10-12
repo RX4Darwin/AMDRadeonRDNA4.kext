@@ -1,0 +1,58 @@
+From 88b7baa3ed262e3b5c0415f5372b5026f1b85834 Mon Sep 17 00:00:00 2001
+From: "Sunneva N. Mariu" <sunnevanattsol@gmail.com>
+Date: Tue, 6 Oct 2026 19:21:18 +0000
+Subject: [PATCH] darwin: find the native interface on RDNA4FB's service too
+
+RDNA4FB serves the N48N interface from its compute service,
+RDNA4ComputeService, with the same user-client type. Look for that
+first and for Navi48Bringup after it; the two kexts cannot both be
+running.
+---
+ src/amd/common/darwin/ac_darwin_iokit.c | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/src/amd/common/darwin/ac_darwin_iokit.c b/src/amd/common/darwin/ac_darwin_iokit.c
+index 210e757..000cb01 100644
+--- a/src/amd/common/darwin/ac_darwin_iokit.c
++++ b/src/amd/common/darwin/ac_darwin_iokit.c
+@@ -1,8 +1,8 @@
+ /*
+  * SPDX-License-Identifier: MIT
+  *
+- * IOKit transport of the native kext ABI: IOServiceOpen of class Navi48Bringup
+- * with user-client type 'N48N' (NATIVE-S1C-ABI.md section 1).
++ * IOKit transport of the native kext ABI: IOServiceOpen of class RDNA4ComputeService
++ * or Navi48Bringup with user-client type 'N48N' (NATIVE-S1C-ABI.md section 1).
+  */
+ 
+ #include "ac_darwin_kext.h"
+@@ -68,10 +68,14 @@ int
+ acd_kext_open_iokit(struct acd_kext **out)
+ {
+    /* MACH_PORT_NULL is the default main port on every macOS; kIOMainPortDefault only exists from 12 on. */
+-   io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("Navi48Bringup"));
++   /* The interface is served by RDNA4FB's compute service (RDNA4ComputeService, type 'N48N') or by the Navi48
++    * kext it comes from (Navi48Bringup); only one of the two kexts can be running. */
++   io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("RDNA4ComputeService"));
++   if (!svc)
++      svc = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("Navi48Bringup"));
+    if (!svc) {
+-      fprintf(stderr, "radv-darwin: IOServiceGetMatchingService(Navi48Bringup) found nothing: the Navi48 kext is "
+-                      "not loaded (native backend unavailable)\n");
++      fprintf(stderr, "radv-darwin: neither RDNA4ComputeService nor Navi48Bringup is there: no kext is serving the "
++                      "native interface (with RDNA4FB, boot with rdna4-compute=7)\n");
+       return -ENODEV;
+    }
+ 
+@@ -87,7 +91,7 @@ acd_kext_open_iokit(struct acd_kext **out)
+    }
+    IOObjectRelease(svc);
+    if (kr != KERN_SUCCESS) {
+-      fprintf(stderr, "radv-darwin: IOServiceOpen(Navi48Bringup, type 'N48N') failed: IOReturn 0x%08x%s\n",
++      fprintf(stderr, "radv-darwin: IOServiceOpen(type 'N48N') failed: IOReturn 0x%08x%s\n",
+               (unsigned)kr,
+               (unsigned)kr == ACD_KR_EXCLUSIVE_ACCESS ? " (another native client is open)"
+               : (unsigned)kr == ACD_KR_NOT_PRIVILEGED ? " (needs root)"
+-- 
+2.55.0
+

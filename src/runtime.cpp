@@ -711,6 +711,7 @@ bool RDNA4Compute::initRuntimeHeap() {
 	 * "ih: ...". */
 	if (dmaInit()) {
 		devHeapInit();
+		faultPageToSystem();
 		if (featureAllowed("ih"))
 			ihInit();
 	}
@@ -780,6 +781,8 @@ bool RDNA4Compute::vmContextInit(RtClient &c) {
 	// W42 (Linux ground truth): GCVM_CONTEXT1..15_CNTL read 0x03fffc07 under amdgpu: the fault-enable defaults are bits 10..25 (16 bits;
 	// the header names only 10..23, bits 24-25 are reset defaults Linux keeps through its read-modify-write). Ours wrote 0x00fffc07.
 	const uint32_t faultDefaults = ((1u << 16) - 1) << 10;
+	// GC 12's layout: enable 0, depth [2:1], block size [7:4], RETRY_PERMISSION_OR_INVALID_PAGE_FAULT 8 (left 0, as
+	// amdgpu has it on this card: a fault is final), the fault enables from 10 (gc_12_0_0_sh_mask.h).
 	const uint32_t cntl = kVmCtxEnable | (GpuVm::kDepth << 1) |
 		((GpuVm::kBlockSize - 9) << 4) | faultDefaults;
 	wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + n }, cntl);
@@ -1602,6 +1605,81 @@ void RDNA4Compute::scrubFaultPage() {
 	for (uint32_t i = 0; i < 0x1000 / 4; i++)
 		*poolDw(kScratchOffset + i * 4) = 0;
 	flushHdp();
+	if (faultPageBus)
+		bzero(faultPage->getBytesNoCopy(), 0x1000);
+}
+
+// A fault in a client's address space ends the job that caused it. On this card nothing tries the access again:
+// not with the dummy page mapped at the address milliseconds later, and not with the context's retry bit set
+// (2026-10-07, docs/vm-client-rootcause.md sections 13 to 16). amdgpu sets the context up the same way ("no-retry
+// XNACK"), prints such a fault, and gets the queue back with a reset. So a wait for a client's job does not run
+// out its timeout once the hub has latched a fault for the client's address space: it ends there, the queue is
+// reset, and the client is told its job faulted (kIOReturnVMError), not that it timed out.
+//
+// The hub holds the first fault it latched until that is cleared, and records none after it. The graphics ring
+// leaves an entry there with every submission (address space 0, CPG, address 0: the stray fetch gfxring.cpp
+// describes), and behind it a client's fault went unseen (2026-10-07, with a Vulkan program presenting beside the
+// self-test: both fault tests ran into their timeout). Nobody waits for address space 0's, so such an entry is
+// cleared here; that is also why this is called before a job is kicked, with 0.
+// ponytail: a client's fault that arrives while such an entry sits there is still lost, and its job then ends by
+// timeout; the waits look every 10 us at first and every millisecond after, so the gap is small. Closing it
+// needs the hub's fault interrupt.
+bool RDNA4Compute::vmJobFaulted(uint32_t vmid) {
+	const uint32_t status = rdGc(GcL2FaultStatusLo);
+	if (!status || status == 0xffffffffu)
+		return false;
+	const uint32_t faulted = (status >> 20) & 0xf;
+	if (!faulted)
+		gcFaultClear();
+	return vmid && faulted == vmid;
+}
+
+// Where a faulting access goes. The hub's bring-up points the L2 fault default at a scratch page in VRAM, with
+// ENABLE_DEFAULT_PAGE_OUT_TO_SYSTEM_MEMORY off. amdgpu points it at a page of system memory with that bit on (its
+// dummy page: gfxhub_v12_0_init_system_aperture_regs, gfxhub_v12_0_init_cache_regs), and the kext's own comparison
+// with Linux has listed the difference on every boot. On the card a shader that faulted with the VRAM page never
+// finished and its queue could not be recovered (2026-10-07, docs/vm-client-rootcause.md section 12). So, once the
+// card can reach host memory: one wired page, for good, as Linux has it. rdna4-faultpage=0 keeps the VRAM page.
+// Runs again after a wake, when the hub's bring-up has put its own value back.
+void RDNA4Compute::faultPageToSystem() {
+	uint32_t wanted = 1;
+	(void)PE_parse_boot_argn("rdna4-faultpage", &wanted, sizeof(wanted));
+	if (!wanted || !dmaReady || !busMasterSet) {
+		RLOG("fault default page: left in VRAM (%s)", !wanted ? "rdna4-faultpage=0" : "the card cannot reach host memory");
+		return;
+	}
+	if (!faultPageBus) {
+		// As the bounce buffer: wired, and within the 40 bits the DMA specification below allows.
+		faultPage = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+			kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, 0x1000, 0x000000fffffff000ull);
+		faultPageDma = IODMACommand::withSpecification(kIODMACommandOutputHost64, 40, 0, IODMACommand::kMapped, 0, 1);
+		UInt64 offset = 0;
+		IODMACommand::Segment64 segment {};
+		UInt32 segments = 1;
+		if (faultPage && faultPageDma && faultPage->getBytesNoCopy() &&
+		    faultPageDma->setMemoryDescriptor(faultPage) == kIOReturnSuccess &&
+		    faultPageDma->gen64IOVMSegments(&offset, &segment, &segments) == kIOReturnSuccess && segments == 1 &&
+		    segment.fLength >= 0x1000 && !(segment.fIOVMAddr & 0xfff)) {
+			faultPageBus = segment.fIOVMAddr;
+		} else {
+			if (faultPageDma) {
+				(void)faultPageDma->clearMemoryDescriptor();
+				faultPageDma->release();
+				faultPageDma = nullptr;
+			}
+			OSSafeReleaseNULL(faultPage);
+			RLOG("fault default page: left in VRAM (no page of host memory the card can reach)");
+			return;
+		}
+	}
+	bzero(faultPage->getBytesNoCopy(), 0x1000);
+	const uint32_t before = rdGc(GcL2Cntl);
+	wr(IpDiscovery::HwGc, GcL2FaultDefaultLo, static_cast<uint32_t>(faultPageBus >> 12));
+	wr(IpDiscovery::HwGc, GcL2FaultDefaultHi, static_cast<uint32_t>(faultPageBus >> 44));
+	wr(IpDiscovery::HwGc, GcL2Cntl, before | kL2DefaultPageToSys);
+	(void)gcHubFlush();
+	RLOG("fault default page: a page of system memory at bus 0x%llx, GCVM_L2_CNTL 0x%08x -> 0x%08x (as amdgpu's dummy page)",
+	     faultPageBus, before, rdGc(GcL2Cntl));
 }
 
 IOReturn RDNA4Compute::rtOpen(const void *owner) {
@@ -1738,7 +1816,10 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 	for (vmid = 8; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
 	if (vmid > 15)
 		return kIOReturnNoResources;
-	const uint32_t sq = slot & 1;
+	// The slot's own queue, or the other one if a dead job took that out of service (vmshared.cpp, recoverSharedQueue).
+	uint32_t sq = slot & 1;
+	if (sharedQ[sq].wedged || !sharedQ[sq].up)
+		sq ^= 1;
 	if (sharedQ[sq].wedged || !sharedQ[sq].up)
 		return kIOReturnNotResponding;
 	uint64_t table = 0;
@@ -2637,6 +2718,7 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 		vmOpTrace("dispatch entry", l.vmid, l.pipe, l.queueId);
 	waitAborted = false;
 	const uint64_t ringBefore = qseq ? sharedQ[c->sq].pm.wptr() : 0;
+	waitFaulted = false;
 	const bool done = launch(l, "runtime", ns);
 	micros = ns / 1000;
 	if (qseq && sharedQ[c->sq].pm.wptr() > ringBefore) {
@@ -2658,12 +2740,15 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 		if (c)
 			c->ibOutstanding = 0;
 		if (c && c->shared) {
-			if (recoverSharedQueue(c->sq, c->vmid, "runtime")) {
+			const bool back = recoverSharedQueue(c->sq, c->vmid, "runtime");
+			if (waitFaulted)
+				RLOG("dispatch ended by a fault in address space %u after %llu us; shared queue %u %s", c->vmid, micros, c->sq,
+				     back ? "recovered without a GPU reset" : "recovery failed; that queue stays wedged");
+			else if (back)
 				RLOG("dispatch timed out after %u ms; shared queue recovered without a GPU reset", l.timeoutUs / 1000);
-			} else {
+			else
 				RLOG("dispatch timed out after %u ms: shared queue %u recovery failed; that queue stays wedged", l.timeoutUs / 1000, c->sq);
-			}
-			return kIOReturnTimeout;
+			return waitFaulted ? kIOReturnVMError : kIOReturnTimeout;
 		}
 		if (recoverComputeQueue("runtime", &l)) {
 			rtWedged = false;
@@ -2721,54 +2806,61 @@ IOReturn RDNA4Compute::rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwo
 	}
 	if (!containing)
 		return kIOReturnBadArgument;
-	retireIbFences(*c);
+	return submitIbLocked(*c, ibVa, dwords, fence);
+}
+
+/* Put one command buffer of `c`'s on its queue (its own, or the shared one it is pinned to) with the client's fence after it. The caller holds
+ * rtLock and has checked that the buffer is the client's to run. Also what the shared mode's boot test submits with (vmshared.cpp). */
+IOReturn RDNA4Compute::submitIbLocked(RtClient &c, uint64_t ibVa, uint64_t dwords, uint64_t &fence) {
+	retireIbFences(c);
 	/* A shared queue's ring (4 KiB) carries the jobs of up to four clients: 8 outstanding jobs of 20 dwords each keep it far from full. */
-	if (c->ibOutstanding >= (c->shared ? 8u : kMaxIbOutstanding))
+	if (c.ibOutstanding >= (c.shared ? 8u : kMaxIbOutstanding))
 		return kIOReturnBusy;
 
 	/* The same VMID-selected shader memory state as launch(): the user IB
 	 * supplies the program and resource registers, while this selector only
 	 * chains it and fences it. (Shared mode: SH_MEM was written for every VMID at the queues' start.) */
-	uint32_t ibVmid = c->vmid;
-	if (!c->shared) {
-		grbmSelect(0, c->pipe, c->queue, ibVmid);
+	uint32_t ibVmid = c.vmid;
+	if (!c.shared) {
+		grbmSelect(0, c.pipe, c.queue, ibVmid);
 		wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
 		wr(IpDiscovery::HwGc, ShMemBases, kShMemBasesDefault);
 	}
 	uint32_t qseq = 0;
-	if (c->shared && vmShared == 2) {
+	if (c.shared && vmShared == 2) {
 		/* rdna4-vmshared=2: ring space first, then a VMID bound to this client's tables; the job also writes the queue's own fence. */
-		if (!sharedReserve(c->sq, 40) || !vmAcquire(*c)) {
-			vmOpTrace("submitib REFUSED: no ring space or no VMID", c->vmid, c->pipe, c->queue);
+		if (!sharedReserve(c.sq, 40) || !vmAcquire(c)) {
+			vmOpTrace("submitib REFUSED: no ring space or no VMID", c.vmid, c.pipe, c.queue);
 			return kIOReturnBusy;
 		}
-		qseq = ++sharedQ[c->sq].seq;
-		ibVmid = c->vmid;    // the one the pool just granted: it was read before the grab, which handed a stale VMID to the IB packet when the pool had moved the client
+		qseq = ++sharedQ[c.sq].seq;
+		ibVmid = c.vmid;    // the one the pool just granted: it was read before the grab, which handed a stale VMID to the IB packet when the pool had moved the client
 	}
-	const uint32_t value = nextFence(c->fence);
+	const uint32_t value = nextFence(c.fence);
 	uint32_t pkt[8];
-	Pm4::Queue &ring = c->shared ? sharedQ[c->sq].pm : c->pm4;
+	Pm4::Queue &ring = c.shared ? sharedQ[c.sq].pm : c.pm4;
 	const uint64_t ringBefore = ring.wptr();
 	/* Shared: the fence is a ring-level write to the client's fence word (MC address); else a write through the client's VM. */
-	const uint64_t fenceAt = c->shared ? poolMc(c->poolOff + kVmFence) : c->fenceVa;
+	const uint64_t fenceAt = c.shared ? poolMc(c.poolOff + kVmFence) : c.fenceVa;
 	if (!ring.emit(pkt, Pm4::acquireMem(pkt, Pm4::kGcrMemSync)) ||
 	    !ring.emit(pkt, Pm4::indirectBufferCompute(pkt, ibVa, static_cast<uint32_t>(dwords), ibVmid)) ||
 	    !ring.emit(pkt, Pm4::releaseMem(pkt, fenceAt, value,
-	                                    ihActive && c->pipe < 2)) ||
-	    (qseq && !ring.emit(pkt, Pm4::releaseMem(pkt, sharedQ[c->sq].fenceMc, qseq, false))))
+	                                    ihActive && c.pipe < 2)) ||
+	    (qseq && !ring.emit(pkt, Pm4::releaseMem(pkt, sharedQ[c.sq].fenceMc, qseq, false))))
 		return kIOReturnNoResources;
-	c->fence = value;
+	c.fence = value;
 	flushHdp();
-	pm4Kick(ring, c->doorbell, ring.wptr());
+	(void)vmJobFaulted(0);             // an entry of the graphics ring's would hide this job's fault
+	pm4Kick(ring, c.doorbell, ring.wptr());
 	if (qseq) {
-		vmPool.noteSubmit(c->vmid, c->sq, qseq);
-		sharedCommit(c->sq, qseq, static_cast<uint32_t>(ring.wptr() - ringBefore));
+		vmPool.noteSubmit(c.vmid, c.sq, qseq);
+		sharedCommit(c.sq, qseq, static_cast<uint32_t>(ring.wptr() - ringBefore));
 	}
-	vmOpTrace("submitib kicked", c->vmid, c->pipe, c->queue);
-	c->ibFences[c->ibOutstanding++] = value;
+	vmOpTrace("submitib kicked", c.vmid, c.pipe, c.queue);
+	c.ibFences[c.ibOutstanding++] = value;
 	fence = value;
 	RLOG("vmid %u: submitted unprivileged compute IB VA 0x%llx, %u dwords, fence %u",
-	     c->vmid, ibVa, static_cast<uint32_t>(dwords), value);
+	     c.vmid, ibVa, static_cast<uint32_t>(dwords), value);
 	return kIOReturnSuccess;
 }
 
@@ -2795,6 +2887,7 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 	const uint32_t waitMs = timeoutMs ? timeoutMs : 1000;
 	bool done = false;
 	waitAborted = false;
+	waitFaulted = false;
 	if (ihActive && c->pipe < 2) {
 		done = ihWaitFence(c->fenceCpu, fence, waitMs, true, "IB", ns);
 	} else {
@@ -2807,6 +2900,10 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 				break;
 			if (sleepAbortWanted()) {          // P7
 				waitAborted = true;
+				break;
+			}
+			if (vmJobFaulted(c->vmid)) {
+				waitFaulted = true;
 				break;
 			}
 			if (polls < 200)
@@ -2830,16 +2927,19 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 	}
 
 	if (c->shared) {
-		/* The shared queue's recovery kills this client's waves only (SQ_CMD CHECK_VMID) and re-initialises the queue. */
+		const uint32_t fenceSeen = *c->fenceCpu, hubSeen = rdGc(GcL2FaultStatusLo), grbmSeen = rdGc(GrbmStatus);
+		/* The shared queue's recovery resets this queue's waves and leaves the queue as it is (vmshared.cpp). */
 		const bool ok = recoverSharedQueue(c->sq, c->vmid, "IB");
 		c->ibOutstanding = 0;
 		if (ok) {
 			*c->fenceCpu = 0;
 			flushHdp();
 		}
-		RLOG("IB fence %u timed out after %u ms; shared queue %u %s", fence, waitMs, c->sq,
+		// One line with what the wait last saw: the state dump's lines do not all survive in the kernel log.
+		RLOG("IB fence %u %s (fence word 0x%x, hub fault 0x%08x, GRBM 0x%08x); shared queue %u %s", fence,
+		     waitFaulted ? "not reached: the job faulted" : "timed out", fenceSeen, hubSeen, grbmSeen, c->sq,
 		     ok ? "recovered without a GPU reset" : "recovery failed; that queue stays wedged");
-		return kIOReturnTimeout;
+		return waitFaulted ? kIOReturnVMError : kIOReturnTimeout;
 	}
 	Launch l {};
 	l.queue = &c->pm4;
@@ -2879,8 +2979,9 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
  *    fence dword (VMID0 MC address); 15 dwords.  No ring-side VM flush / pipeline sync / HDP flush / COND_EXEC: see the doc.
  *  - the kernel's own gfx work (stageGfxRing/stageGfxDraw/gfxPark) runs on the bring-up thread without rtLock while bringupRunning is
  *    set; client submissions hold rtLock and refuse while it is set, so the ring has one user at a time.
- *  - a client IB that does not finish wedges the gfx ring (no per-queue reset without MES): PFP/ME are halted and gfx submissions are
- *    refused until the next bring-up; compute queues, the display and the other runtime selectors are unaffected. */
+ *  - a client IB that does not finish in its wait's time is ended: its address space's waves are reset and the ring carries on
+ *    (gfxRingRelease, since 2026-10-07). Only if that does not bring the client's fence is the ring wedged as before: PFP/ME are halted
+ *    and gfx submissions refused until the next bring-up; compute queues, the display and the other runtime selectors are unaffected. */
 
 IOReturn RDNA4Compute::gfxClientReady() const {
 	if (!gfxMode)
@@ -2924,6 +3025,48 @@ void RDNA4Compute::gfxClientReset() {
 	}
 	if (rtLock)
 		IOLockUnlock(rtLock);
+}
+
+/* A client's work on the graphics ring does not finish: remove what hangs and keep the ring for everybody else. True if
+ * the client's fence then came through, false if the ring has to be given up (gfxClientWedge).
+ * Card, 2026-10-07 (vkprobe's "fault", two boots): a shader that writes to an address nothing is mapped at leaves waves
+ * that do not end (GRBM_STATUS SPI busy), and the ring behind them stands. CP_VMID_RESET with the address space's bit and
+ * no queue removes them: the lost work's own fence came through within 200 ms, SPI busy went, and the next program and
+ * the runtime's graphics clients ran. The bit reads back set until it is written 0 again. As recoverSharedQueue does for
+ * a compute queue, the queue is left alone: amdgpu (mes_v12_0_reset_queue_mmio) sets the queue's bit too, which takes
+ * the queue down for the MES to map again, and there is no MES here (docs/vm-client-rootcause.md section 20). A second
+ * try in case one is not enough, as it sometimes is not on the compute queues.
+ * It does NOT help when a draw hangs (same day, rdna4-run trifault: the colour triangle with its attribute ring unmapped):
+ * GRBM_STATUS 0xaa61382c, the geometry engine and the primitive assembler busy besides the SPI, unchanged by both attempts,
+ * and the ring was given up as before. Two more things were tried for that and are not here (kext A5F496FD, the day's
+ * last run): amdgpu's own queue reset (CP_VMID_RESET with the queue's bit as well) left CP_GFX_HQD_ACTIVE and CP_RB_ACTIVE
+ * at 1 and the pipeline as busy as before, and the ring's registers written again as at bring-up gave a ring that ran
+ * nothing (CP_STAT 0x80078000, the test packet not written). The hang is in the pipeline, not in the ring; on this chip
+ * amdgpu has only the MES or a reset of the whole GPU for it.
+ * ponytail: every client in that address space loses its waves; with rdna4-vmshared=2, where address spaces are lent
+ * per job, the caller has none to name and the ring is given up as before. */
+bool RDNA4Compute::gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why) {
+	if (vmid < 1 || vmid > 15)
+		return false;
+	RLOG("gfx: %s: work in address space %u did not finish (fence %u of %u): hub fault 0x%08x at 0x%llx, GRBM 0x%08x, CP_STAT 0x%08x",
+	     why, vmid, *fenceWord, fence, rdGc(GcL2FaultStatusLo), gcFaultVa(), rdGc(GrbmStatus), rdGc(CpStat));
+	bool back = false;
+	for (uint32_t attempt = 1; attempt <= 2 && !back; attempt++) {
+		const uint32_t index = rdGc(GrbmGfxIndex);
+		wr(IpDiscovery::HwGc, GrbmGfxIndex, 1u << 31);       // all shader engines, as amdgpu writes it
+		wr(IpDiscovery::HwGc, CpVmidReset, 1u << vmid);
+		wr(IpDiscovery::HwGc, GrbmGfxIndex, index);
+		for (uint32_t ms = 0; ms < 200 && !(back = fenceReached(*fenceWord, fence)); ms++)
+			IOSleep(1);
+		wr(IpDiscovery::HwGc, CpVmidReset, 0);
+		RLOG("gfx: %s: CP_VMID_RESET 0x%08x, attempt %u: the lost work's fence %s; GRBM 0x%08x, CP_STAT 0x%08x", why, 1u << vmid, attempt,
+		     back ? "came through" : "did not come", rdGc(GrbmStatus), rdGc(CpStat));
+	}
+	if (((rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == vmid)
+		gcFaultClear();                // an entry of this client's would end the next compute job in this address space (vmJobFaulted)
+	if (back)
+		RLOG("gfx: %s: the client's work is ended; the graphics ring is back and stays in service", why);
+	return back;
 }
 
 void RDNA4Compute::gfxClientWedge(const char *why) {
@@ -3007,7 +3150,13 @@ bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs
 		return true;
 	}
 	RLOG("vmid %u: gfx fence %u not reached after %u ms (%s)", c.vmid, fence, timeoutMs, why);
-	gfxClientWedge(why);
+	/* The wait is over for the caller either way. Everything of this client's on the ring is ended with it: its newest fence coming
+	 * through is what says the ring runs again. */
+	const uint32_t newest = c.gfxOutstanding ? c.gfxFences[c.gfxOutstanding - 1] : fence;
+	if (gfxRingRelease(c.vmid, c.gfxFenceCpu, newest, why))
+		gfxClientRetire(c);
+	else
+		gfxClientWedge(why);
 	return false;
 }
 
@@ -3547,6 +3696,7 @@ void RDNA4Compute::resetRuntimeForResume() {
 		q.up = q.wedged = false;
 	sharedInit = false;
 	vmPool.unbindAll();         // every context is gone: the next job of each client rebinds
+	n48nDiscard();              // the Vulkan client's buffers and table went the same way
 	if (devHeapMap) {
 		IOFree(devHeapMap, devHeapMapBytes);
 		devHeapMap = nullptr;

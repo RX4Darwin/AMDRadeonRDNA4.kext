@@ -63,20 +63,29 @@ rdna4-head2dp=1 rdna4-dmubhist=1 rdna4-trace=1
 2. Does the other monitor show the second desktop, sharp and stable?
 3. Leave it for two minutes. Does the second monitor keep its picture, without blinking or going dark? (This is
    where the firmware would show if it meddles with a link the kext trained.)
-4. Let both displays sleep for a few minutes, then wake them. Do both come back?
-5. Pull the second monitor's cable, wait 5 s, plug it back into the same connector. Does macOS drop the display
-   and bring it back?
-6. Switch the second monitor off at its power button, wait 5 s, switch it on. Does it come back?
+4. Let both displays sleep for a few minutes, then wake them. Do both come back, and does the second one stay
+   on for the next 20 s?
+5. Pull the second monitor's cable, wait **10 s**, plug it back into the same connector. Does macOS drop the
+   display and bring it back? (On DisplayPort a pin has to be low for six seconds to count as unplugged.)
+6. Pull the cable again and plug it back within **3 s**. Does the picture come back within a few seconds?
+   (Too short to count as unplugged; the kext then asks the monitor whether its link is still up and trains it
+   again if not.)
+7. Switch the second monitor off at its power button, wait 10 s, switch it on. Does it come back?
 
 Lines to find, in order:
 
 - `pipe2: DisplayPort sink on AUXn: ...` and `pipe2: N lane(s) at rate 0x.. for 148500 kHz`
 - `pipe2: lighting pipe 1 DIGn link n HPDn, 1920x1080 at 148500 kHz, stream and plane: N steps`
-- `pipe2: link n, N lane(s) at rate 0x..: trained after N attempt(s): swing s, pre-emphasis p, lanes 77 77, aligned 1`
+- `pipe2: link n, N lane(s) at rate 0x..: trained after N attempt(s) (what each attempt ended in): swing s,
+  pre-emphasis p, lanes 77 77, aligned 1`. On the boot display's self-test the first attempt always failed and the
+  second trained; the text in brackets now says why.
 - `pipe2: plan ran; OTG1 measured 59.99x Hz`
 - for step 4: `power: pipe2 display off: N steps ran` and `power: pipe2 display on: N steps ran`, with another
   `pipe2: link n ...: trained after ...` before the second
 - for step 5: `hotplug: display gone from HPDn: link off`, then `hotplug: the same display is back on HPDn`
+- for step 6 (and after step 4, if the monitor drops its pin on waking as the Samsung does):
+  `pipe2: the display's pin is back and its link is up ...`, or `... its link is down ...: training it again`
+  followed by another `pipe2: link n ...: trained after ...`
 
 What failure looks like:
 
@@ -90,8 +99,8 @@ What failure looks like:
   timing the plan lights in.
 
 Known gaps, so they are not surprises: if training fails four times there is no retry at another rate or lane
-count, and a monitor that loses its link while lit and only signals that with a short pulse on the hot-plug pin
-is not noticed.
+count, and a monitor that loses its link while lit and signals that with a pulse on the hot-plug pin shorter
+than a second is not noticed.
 
 ## Test 2: mode switching on the DisplayPort second display
 
@@ -133,14 +142,6 @@ Only if test 1 passed. Boot with the second monitor's DisplayPort cable unplugge
 Lines to find: `head2: ... offline until a display is plugged in`, `hotplug: HPDn went high`,
 `pipe2: DisplayPort sink on AUXn: ...`, `pipe2: lighting ...`, `hotplug: display connected on HPDn: N mode(s)`.
 
-## Done: the HDMI display moved to the other HDMI port
-
-Confirmed on the card 2026-10-06 (kext `992B8D5C-...`): the Lenovo unplugged from one HDMI port and plugged into
-the other came back with its desktop, in both directions, the second time at 144 Hz; display sleep and a
-same-port replug afterwards worked. Log: `pipe2: moving from HPD4 (DIG3, link 3) to HPD3 (DIG2, link 2) at
-1920x1080, 148500 kHz`, `pipe2: now on HPD3; DIG2_DIG_FE_EN_CNTL=0x00000001 SYMCLKC_CLOCK_ENABLE=0x00000211`,
-`hotplug: the same display is back on HPD3`.
-
 ## Test 4: the stretched console (no extra hardware)
 
 This checks the fix for the zoomed picture of 2026-10-06, which could not be tried then because the console went
@@ -159,41 +160,22 @@ it onto its 3840x2160 timing`, then `modes: switching to id N ...` and `modes: n
 In this state the Samsung has no 3840x2160 mode: the kext offers nothing larger than the console. That is a
 known limit, not part of this test.
 
-## Test 5: pointer and input lag on the 4K display (no extra hardware)
-
-Observed 2026-10-06: in applications like Google Chrome the pointer and typing lag on the Samsung (DisplayPort)
-and behave almost normally on the Lenovo (HDMI). At that time the Samsung ran 1920x1080 HiDPI, which is a
-3840x2160 surface, and the Lenovo a plain 1920x1080 one. There is no graphics acceleration yet, so macOS draws
-every pixel of both on the CPU, and the pointer is drawn the same way (a software cursor).
-
-Two things differed between the screens then, and either could explain it without DisplayPort being at fault:
-the Samsung had four times as many pixels, and the Lenovo ran at 144 Hz against the Samsung's 60 Hz.
-
-Tried the same day with `rdna4-cursor=1 rdna4-vbl=1` (a hardware cursor on the boot display): the kext ran it on
-the 4K DisplayPort pipe next to `rdna4-head2=4` without an error in the log, through a switch to 2560x1440 and
-back, and the Samsung was still reported less responsive. So the pointer being drawn by macOS is not the whole
-cause. The log has nothing that measures responsiveness.
-
-Result, the same day: with the Samsung at 2560x1440 (the low-resolution mode Displays offers there) Chrome was
-equally responsive on both screens. So it is the number of pixels macOS has to draw on the CPU, not DisplayPort
-and not that pipe. 1920x1080 HiDPI on a 4K panel will stay sluggish in heavy applications until there is
-acceleration; 2560x1440 is the workable setting until then.
-
-### Done: the top of the picture in the Samsung's smaller modes
-
-Seen 2026-10-06: at 2560x1440 only the bottom edge of the menu bar showed, at the real 1920x1080 a little more,
-at 1600x900 all of it, and at 1280x720 the screen was black. Cause: the plane's `HUBPREQ BLANK_OFFSET_0` holds
-the line the vertical blank ends on, and the mode switch left it at the firmware's value for 3840x2160 (line 59;
-2560x1440 ends its blank on line 38, 1920x1080 on 41, 1600x900 on 99, 1280x720 on 25). The switch now writes it
-for the new timing, by the rule Linux uses. Confirmed on the card the same day with kext `078A0318-...`:
-2560x1440, 1920x1080 and 1280x720 all show the whole desktop; the log has `modes: plane blank end: the firmware
-has 0x003b000a, the rule gives 0x003b000a for the boot timing` and `plane blank end 0x00260017` after the switch
-to 2560x1440.
-
-`tools/cgmode.py` reaches the modes Displays does not list: `/usr/bin/python tools/cgmode.py` shows them,
-`/usr/bin/python tools/cgmode.py 2560x1440` switches for the login session.
-
 ## After the tests
 
 For each test that passes, the README's status list and `docs/second-pipe.md` get the date and what ran, as for
 the earlier ones, and `rdna4-head2dp=1` becomes the default like the rest.
+
+## Settled on 2026-10-06
+
+Kept here because they explain what the tests above no longer need to cover; the details are in the README and
+`docs/second-pipe.md`.
+
+- **Lag in heavy applications on the 4K display** is the number of pixels macOS draws on the CPU (1920x1080 HiDPI
+  is a 3840x2160 surface), not DisplayPort: with the Samsung at 2560x1440 Chrome is as responsive as on the
+  1080p display. A hardware cursor (`rdna4-cursor=1 rdna4-vbl=1`) made no noticeable difference. Until there is
+  acceleration, 2560x1440 is the workable setting.
+- **The top of the picture cut off in the boot display's smaller modes**: fixed (the plane's blank-end register
+  is written with the mode switch); 2560x1440, 1920x1080 and 1280x720 confirmed whole.
+- **The HDMI display moved to the other HDMI port**: works in both directions, also at 144 Hz.
+- `tools/cgmode.py` reaches the modes Displays preferences does not list: `/usr/bin/python tools/cgmode.py`
+  shows them, `/usr/bin/python tools/cgmode.py 2560x1440` switches for the login session.

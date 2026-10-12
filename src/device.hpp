@@ -125,14 +125,19 @@ public:
 	Pipe2::Target pipe2Target {};          // .now: the timing the pipe runs
 	uint16_t pipe2ConnectorObjId { 0 };
 	bool pipe2Lit { false }, pipe2On { false };
+	// A DisplayPort second display whose HPD pin dropped and came back without
+	// counting as unplugged: its link is trained again if the sink says it is
+	// down. Nothing else maintains a link the kext trained.
+	void secondLinkBack();
+	bool pipe2MoveOwed { false };   // secondPipeTo: the move to the connector in use has not completed
 	bool runSecondPipePart(Pipe2::Part part, size_t *steps = nullptr);
 
-	// DisplayPort link training on the boot display (rdna4-dptrain). The
-	// firmware trained the link; noteBootDpLink reads from the sink, while it
-	// is up, what it can do and what it was told, and retrainBootLink brings
-	// the same link up again after the display was unplugged or switched off:
-	// stream blanked, transmitter off, DpTrain::bringUp, stream on. The stream
-	// and its timing are not touched.
+	// The boot display's DisplayPort link (rdna4-dptrain, a diagnostic). The
+	// firmware trained it and keeps it up itself. noteBootDpLink reads from the
+	// sink what it can do and what it was told; logBootLink logs the link as
+	// the sink and the encoder have it; retrainBootLink is the self-test of
+	// the kext's own training on that link: stream off, transmitter off,
+	// DpTrain::bringUp, stream encoder tied to the link, video restarted.
 	void noteBootDpLink();
 	DpTrain::Result retrainBootLink(const char *why);
 	void logBootLink(const char *when);
@@ -142,7 +147,7 @@ public:
 	DpTrain::Sink bootDpSink {};
 	DpTrain::Link bootDpLink {};
 	bool bootDpLinkKnown { false };
-	uint32_t dpTrainLevel { 0 };         // rdna4-dptrain: 1 retrain when the display comes back, 2 also once by itself
+	uint32_t dpTrainLevel { 0 };         // rdna4-dptrain: 1 watch and log, 2 also retrain once by itself
 
 	// Display power (DPMS). Off = disable the DP video stream and put the
 	// sink in D3 via DPCD SET_POWER, or on an HDMI pipe blank to black via

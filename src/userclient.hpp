@@ -26,6 +26,10 @@ class RDNA4ComputeService : public IOService {
 	OSDeclareDefaultStructors(RDNA4ComputeService)
 public:
 	RDNA4Compute *compute;
+	// A connection of type 'N48N' is the Vulkan interface's (src/n48nkext.cpp); any other is the compute client.
+	using IOService::newUserClient;
+	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+	                       IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 	bool registerPowerManagement(IOService *provider);
 	IOReturn setPowerState(unsigned long powerStateOrdinal,
 	                       IOService *whatDevice) APPLE_KEXT_OVERRIDE;

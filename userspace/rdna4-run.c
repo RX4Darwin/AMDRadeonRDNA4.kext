@@ -30,6 +30,9 @@
  *                                          through the attribute ring (G4,
  *                                          userspace/gfx12tricol.h); the colour
  *                                          check of docs/g4-colour.md
+ *    rdna4-run trifault                    the colour triangle with its ring block freed before
+ *                                          it is submitted (a stream that hangs), then the colour
+ *                                          triangle again: does the kernel keep its graphics ring?
  *
  *  Exit status 0 only when everything asked for succeeded.
  */
@@ -483,12 +486,18 @@ static int testVmIsolationAndPeers(rdna4_t *a) {
 		const uint32_t groups[3] = { 1, 1, 1 }, size[3] = { 256, 1, 1 };
 		kr = rdna4_dispatch(&b, &copy, groups, size, args, sizeof(args), 2000, NULL);
 	}
+	/* B's read of A's VA must fault. On the card a fault ends the job: the kext
+	 * resets the queue and says so (kIOReturnVMError), which is the expected
+	 * outcome here. The emulator answers the read from the fault-default page
+	 * and lets the job finish. Either way the property is "none of A's data
+	 * in B's buffer", not "all zero". */
+	const int stopped = kr == kIOReturnVMError;
+	if (stopped)
+		kr = 0;
 	if (kr || (kr = rdna4_read(&b, &bDst, 0, dst, sizeof(dst)))) {
 		printf("  FAIL  VM isolation dispatch: %s\n", rdna4_error(kr));
 		fails++;
 	} else {
-		/* B's read of A's VA must fault. A fault reads the GPU's fault-default
-		 * page, so the property is "none of A's data", not "all zero". */
 		uint32_t leaked = 0, other = 0;
 		for (uint32_t i = 0; i < 1024; i++) {
 			if (dst[i] == src[i])
@@ -500,6 +509,8 @@ static int testVmIsolationAndPeers(rdna4_t *a) {
 		printf("  %s  VM isolation: client B could not read client A's VA", leaked ? "FAIL" : "ok");
 		if (leaked || other)
 			printf(" (%u of A's words seen, %u other non-zero words)", leaked, other);
+		if (stopped)
+			printf(" (the job faulted and was stopped)");
 		printf("\n");
 	}
 
@@ -1976,8 +1987,8 @@ static int cmdLoad(rdna4_t *gpu, const char *path, const char *kernel) {
 /* W12k: the triangle as an application's own gfx IB (docs/w12k-gfx-submit.md). Everything the stream touches is this program's: five device
  * buffers in its own GPU VM, the IB recorded by userspace/gfx12tri.h (or gfx12tricol.h) with their addresses, submitted with
  * rdna4_submit_gfx_ib and fenced per client. The bytes are the ones tools/linux-replay proves on the card through amdgpu. */
-static int cmdTri(rdna4_t *gpu, int col) {
-	const char *name = col ? "tricol" : "tri";
+static int cmdTri(rdna4_t *gpu, int col, int fault) {
+	const char *name = fault ? "trifault" : col ? "tricol" : "tri";
 	static uint32_t codeImg[RDNA4_TRI_CODE_BYTES / 4], zeros[256 * 256], img[256 * 256], ibImg[1024];
 	rdna4_info_t info;
 	kern_return_t kr = rdna4_info(gpu, &info);
@@ -2039,12 +2050,28 @@ static int cmdTri(rdna4_t *gpu, int col) {
 			printf("  FAIL  %s: writing the buffers: %s\n", name, rdna4_error(kr));
 			goto out;
 		}
+		if (fault) {
+			/* The ring block goes before the stream is submitted: its shaders then write and read addresses nothing is mapped at. */
+			if ((kr = rdna4_free(gpu, &rings)) != KERN_SUCCESS) {
+				printf("  FAIL  %s: freeing the ring block: %s\n", name, rdna4_error(kr));
+				goto out;
+			}
+			rings.handle = 0;
+		}
 		uint64_t fence = 0, ns = 0;
 		if ((kr = rdna4_submit_gfx_ib(gpu, &ib, 0, ibDwords, &fence)) != KERN_SUCCESS) {
 			printf("  FAIL  %s: SubmitGfxIb: %s\n", name, rdna4_error(kr));
 			goto out;
 		}
-		if ((kr = rdna4_wait_gfx_fence(gpu, fence, 5000, &ns)) != KERN_SUCCESS) {
+		kr = rdna4_wait_gfx_fence(gpu, fence, 5000, &ns);
+		if (fault) {
+			/* Expected: the stream hangs, the wait runs out, and the kernel ends this client's work and keeps the ring. */
+			printf("  %s  trifault: the stream with its ring block freed %s (%s after %llu ms)\n", kr == kIOReturnTimeout ? "ok  " : "note",
+			       kr == KERN_SUCCESS ? "FINISHED: no hang was produced" : "did not finish", rdna4_error(kr), (unsigned long long)(ns / 1000000));
+			rc = kr == kIOReturnTimeout ? 0 : 1;
+			goto out;
+		}
+		if (kr != KERN_SUCCESS) {
 			printf("  FAIL  %s: the gfx IB did not finish (fence %llu): %s%s\n", name, (unsigned long long)fence, rdna4_error(kr),
 			       kr == kIOReturnTimeout ? "; the kernel has wedged the gfx ring until the next bring-up" : "");
 			goto out;
@@ -2095,7 +2122,8 @@ static void usage(void) {
 	                "       rdna4-run anim [seconds]\n"
 	                "       rdna4-run load <file.hsaco> <kernel>\n"
 	                "       rdna4-run tri\n"
-	                "       rdna4-run tricol\n");
+	                "       rdna4-run tricol\n"
+	                "       rdna4-run trifault\n");
 }
 
 int main(int argc, char **argv) {
@@ -2167,7 +2195,14 @@ int main(int argc, char **argv) {
 	} else if ((!strcmp(argv[1], "tri") || !strcmp(argv[1], "tricol")) && argc == 2) {
 		if (!openRuntime(&gpu))
 			return 1;
-		rc = cmdTri(&gpu, !strcmp(argv[1], "tricol"));
+		rc = cmdTri(&gpu, !strcmp(argv[1], "tricol"), 0);
+	} else if (!strcmp(argv[1], "trifault") && argc == 2) {
+		/* A stream that hangs, then the colour triangle again: it passes only if the kernel kept its graphics ring. */
+		if (!openRuntime(&gpu))
+			return 1;
+		rc = cmdTri(&gpu, 1, 1);
+		printf("after it, the colour triangle again:\n");
+		rc |= cmdTri(&gpu, 1, 0);
 	} else if (!strcmp(argv[1], "load") && argc == 4) {
 		if (!openRuntime(&gpu))
 			return 1;

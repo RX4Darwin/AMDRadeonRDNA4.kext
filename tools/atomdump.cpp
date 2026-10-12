@@ -38,6 +38,9 @@
 #include "../src/vmid.hpp"
 #include "../src/ptpages.hpp"
 #include "../src/gpuvmtable.hpp"
+#include "../src/vmtree.hpp"
+#include "../src/n48n.hpp"
+#include "n48n-host/hostbackend.hpp"
 #include "../src/vadd_codeobj.h"
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
@@ -964,7 +967,8 @@ struct PlanRegs {
 	static uint32_t read(void *ctx, uint8_t seg, uint32_t dw) {
 		return static_cast<PlanRegs *>(ctx)->get(seg, dw);
 	}
-	void run(const ModeSet::Plan &p) {
+	// What the registers hold after a plan's writes and updates (a ModeSet::Plan or a Pipe2::Plan).
+	template <typename Plan> void run(const Plan &p) {
 		for (size_t i = 0; i < p.count; i++) {
 			const ModeSet::Step &s = p.steps[i];
 			if (s.op == ModeSet::Op::Write)
@@ -974,6 +978,12 @@ struct PlanRegs {
 		}
 	}
 };
+
+// The VBIOS encoder object of a second-pipe plan's link: UNIPHY, UNIPHY1, UNIPHY2 with two links each.
+static uint16_t encoderObjOf(const Pipe2::Config &c) {
+	static const uint8_t uniphy[3] = { 0x1e, 0x20, 0x21 };
+	return static_cast<uint16_t>(0x2000 | (((c.link & 1) + 1) << 8) | uniphy[c.link / 2]);
+}
 
 // The last write to `dw` in the plan (its final value).
 static const ModeSet::Step *findWrite(const ModeSet::Plan &p, uint32_t dw, size_t *at = nullptr) {
@@ -1484,6 +1494,7 @@ static int testDpTrain() {
 			offs += e.kind == 'O';
 		}
 		failures += check(r == DpTrain::Result::ClockRecovery && rep.attempts == DpTrain::kAttempts && rep.swing == 3 &&
+		                  rep.tries[0] == r && rep.tries[DpTrain::kAttempts - 1] == r &&
 		                  rounds == 2 * DpTrain::kAttempts && offs == DpTrain::kAttempts - 1u,
 		                  "dptrain: no clock recovery: %s, %u attempts, %zu status reads, %zu transmitter-offs",
 		                  DpTrain::resultName(r), rep.attempts, rounds, offs);
@@ -1546,8 +1557,7 @@ static int testPipe2Table() {
 	const uint32_t kBeCntl = 0x20bc + c.link * 0x124u, kBeEn = 0x20bd + c.link * 0x124u;
 	const uint32_t kBeFromFe = 1u << (8 + c.dig), kMapper = 0x1f0du + c.dig;
 	const uint8_t  kDdcLine = static_cast<uint8_t>(c.hpd - 1);
-	static const uint8_t uniphy[3] = { 0x1e, 0x20, 0x21 };
-	const uint16_t kEncoderObj = static_cast<uint16_t>(0x2000 | (((c.link & 1) + 1) << 8) | uniphy[c.link / 2]);
+	const uint16_t kEncoderObj = encoderObjOf(c);
 	failures += check(Pipe2::linkOfEncoder(kEncoderObj) == c.link, "pipe2: encoder object 0x%04x is not link %u",
 	                  kEncoderObj, c.link);
 	enum Who { ThePipe, TheDig, TheLink };
@@ -1690,16 +1700,7 @@ static int testPipe2Table() {
 	// What the registers hold afterwards: timing of VIC 16, the surface, the
 	// blender feeding OPP1 from DPP1, the OTG enabled and the lock released.
 	PlanRegs regs;
-	auto apply = [&](const Pipe2::Plan &p) {
-		for (size_t i = 0; i < p.count; i++) {
-			const ModeSet::Step &s = p.steps[i];
-			if (s.op == ModeSet::Op::Write)
-				regs.set(s.seg, s.dword, s.value);
-			else if (s.op == ModeSet::Op::Update)
-				regs.set(s.seg, s.dword, (regs.get(s.seg, s.dword) & ~s.mask) | s.value);
-		}
-	};
-	apply(plan);
+	regs.run(plan);
 	struct { uint8_t seg; uint32_t dw, mask, want; const char *name; } after[] = {
 		{ 2, 0x1baa, 0xffffffff, 2199, "OTG1 h total" },         { 2, 0x1baf, 0xffffffff, 1124, "OTG1 v total" },
 		{ 2, 0x1bab, 0x7fff7fff, 0x00c00840, "OTG1 h blank" },   { 2, 0x1bb8, 0x7fff7fff, 0x00290461, "OTG1 v blank" },
@@ -1893,7 +1894,7 @@ static int testPipe2Table() {
 		DpPhy::buildDisable(off, c.link, c.hpd, 0x13);
 		const bool slept = Pipe2::build(power, dpms, &why);
 		inBlocks(dpms);
-		apply(dpms);
+		regs.run(dpms);
 		const size_t sleepSteps = dpms.count;
 		failures += check(slept && dpms.naux == 1 && dpms.aux[0].address == 0x600 && dpms.aux[0].len == 1 &&
 		                  dpms.aux[0].data[0] == 0x02 && dpms.ncmds == 1 && memcmp(dpms.cmds[0], off, sizeof(off)) == 0 &&
@@ -1904,7 +1905,7 @@ static int testPipe2Table() {
 		power.part = Pipe2::Part::Wake;
 		const bool woke = Pipe2::build(power, dpms, &why);
 		inBlocks(dpms);
-		apply(dpms);
+		regs.run(dpms);
 		const size_t wakeSteps = dpms.count;
 		failures += check(woke && count(dpms, ModeSet::Op::Train) == 1 && dpms.ncmds == 0 && dpms.naux == 2 &&
 		                  dpms.aux[0].address == 0x300, "pipe2: DisplayPort wake: %s, %zu training step(s), %zu AUX "
@@ -1977,13 +1978,7 @@ static int testPipe2Table() {
 			for (Pipe2::Part part : { Pipe2::Part::Sleep, Pipe2::Part::Wake }) {
 				power.part = part;
 				parts = parts && Pipe2::build(power, dpms, &why);
-				for (size_t i = 0; i < dpms.count; i++) {
-					const ModeSet::Step &x = dpms.steps[i];
-					if (x.op == ModeSet::Op::Write)
-						at.set(x.seg, x.dword, x.value);
-					else if (x.op == ModeSet::Op::Update)
-						at.set(x.seg, x.dword, (at.get(x.seg, x.dword) & ~x.mask) | x.value);
-				}
+				at.run(dpms);
 			}
 			const size_t n = Pipe2::modeSteps(known[1], want, Pipe2::kMaxModeSteps, Pipe2::ModeRegs::All);
 			for (size_t i = 0; i < n; i++)
@@ -2025,7 +2020,7 @@ static int testPipe2Table() {
 	failures += check(slept && dpms.ncmds == 1 && memcmp(dpms.cmds[0], plan.cmds[0], sizeof(Dmub::Cmd)) == 0,
 	                  "pipe2: sleep plan: %s, %zu DMUB commands", slept ? "built" : why, dpms.ncmds);
 	inBlocks(dpms);
-	apply(dpms);
+	regs.run(dpms);
 	const size_t sleepSteps = dpms.count;
 	failures += check((regs.get(2, kFeEn) & 1) == 0 && (regs.get(2, kBeCntl) & kBeFromFe) == 0 &&
 	                  (regs.get(2, kHdmiGc) & 1) == 1 && (regs.get(2, 0x1bc3) & 1) == 1 &&
@@ -2037,7 +2032,7 @@ static int testPipe2Table() {
 	failures += check(woke && dpms.ncmds == 3 && memcmp(dpms.cmds, plan.cmds + 1, 3 * sizeof(Dmub::Cmd)) == 0,
 	                  "pipe2: wake plan: %s, %zu DMUB commands", woke ? "built" : why, dpms.ncmds);
 	inBlocks(dpms);
-	apply(dpms);
+	regs.run(dpms);
 	const size_t wakeSteps = dpms.count;
 	for (const PlanRegs::R &r : lit.regs)
 		failures += check(regs.get(r.seg, r.dw) == r.v, "pipe2: after sleep and wake %u:0x%04x = 0x%08x, lit it "
@@ -2107,13 +2102,7 @@ static int testPipe2Table() {
 		const bool ok = ModeSet::buildSleep(st, sl, &why) && Pipe2::build(power, linuxSleep, &why);
 		stepsInBlocks(sl.steps, sl.count);
 		ours.run(sl);
-		for (size_t i = 0; i < linuxSleep.count; i++) {
-			const ModeSet::Step &x = linuxSleep.steps[i];
-			if (x.op == ModeSet::Op::Write)
-				theirs.set(x.seg, x.dword, x.value);
-			else if (x.op == ModeSet::Op::Update)
-				theirs.set(x.seg, x.dword, (theirs.get(x.seg, x.dword) & ~x.mask) | x.value);
-		}
+		theirs.run(linuxSleep);
 		size_t differ = 0;
 		for (size_t i = 0; ok && i < sl.count; i++)
 			if (sl.steps[i].op == ModeSet::Op::Write || sl.steps[i].op == ModeSet::Op::Update)
@@ -2179,19 +2168,6 @@ static int testPipe2Table() {
 // that lighting on `to` sets holds what lighting there would have left.
 static int testPipe2Move(uint8_t from, uint8_t to) {
 	int failures = 0;
-	static const uint8_t uniphy[3] = { 0x1e, 0x20, 0x21 };
-	auto encoderObj = [](const Pipe2::Config &c) {
-		return static_cast<uint16_t>(0x2000 | (((c.link & 1) + 1) << 8) | uniphy[c.link / 2]);
-	};
-	auto apply = [](PlanRegs &regs, const Pipe2::Plan &p) {
-		for (size_t i = 0; i < p.count; i++) {
-			const ModeSet::Step &s = p.steps[i];
-			if (s.op == ModeSet::Op::Write)
-				regs.set(s.seg, s.dword, s.value);
-			else if (s.op == ModeSet::Op::Update)
-				regs.set(s.seg, s.dword, (regs.get(s.seg, s.dword) & ~s.mask) | s.value);
-		}
-	};
 	static Pipe2::Plan plan, lightTo;
 	static ModeSet::Plan ms;
 	static ModeSet::Step extra[Pipe2::kMaxModeSteps];
@@ -2199,7 +2175,7 @@ static int testPipe2Move(uint8_t from, uint8_t to) {
 	auto target = [&](Pipe2::Part part) {
 		Pipe2::Target t {};
 		t.litHubp = 0;
-		t.encoderObjId = encoderObj(Pipe2::config());
+		t.encoderObjId = encoderObjOf(Pipe2::config());
 		t.surface = 0x8002100000ull;
 		t.depth = Pipe2::Depth::Plane;
 		t.part = part;
@@ -2207,9 +2183,9 @@ static int testPipe2Move(uint8_t from, uint8_t to) {
 	};
 	PlanRegs moved, lit;
 	bool ok = Pipe2::use(from) && Pipe2::build(target(Pipe2::Part::Light), plan, &why);
-	apply(moved, plan);
+	moved.run(plan);
 	ok = ok && Pipe2::build(target(Pipe2::Part::Sleep), plan, &why);
-	apply(moved, plan);
+	moved.run(plan);
 
 	ok = ok && Pipe2::use(to);
 	const Pipe2::Config &c = Pipe2::config();
@@ -2218,7 +2194,7 @@ static int testPipe2Move(uint8_t from, uint8_t to) {
 	mt.dig = c.dig;
 	mt.link = c.link;
 	mt.hpd = c.hpd;
-	mt.encoderObjId = encoderObj(c);
+	mt.encoderObjId = encoderObjOf(c);
 	mt.connectorObjId = 0x330c;
 	mt.from = mt.to = c.timing;
 	mt.extra = extra;
@@ -2227,10 +2203,10 @@ static int testPipe2Move(uint8_t from, uint8_t to) {
 	moved.run(ms);
 	for (Pipe2::Part part : { Pipe2::Part::Sleep, Pipe2::Part::Wake, Pipe2::Part::Avi }) {
 		ok = ok && Pipe2::build(target(part), plan, &why);
-		apply(moved, plan);
+		moved.run(plan);
 	}
 	ok = ok && Pipe2::build(target(Pipe2::Part::Light), lightTo, &why);
-	apply(lit, lightTo);
+	lit.run(lightTo);
 	failures += check(ok, "pipe2: move HPD%u -> HPD%u: a plan was refused: %s", from, to, why);
 
 	size_t differ = 0;
@@ -2250,6 +2226,325 @@ static int testPipe2Move(uint8_t from, uint8_t to) {
 	}
 	printf("pipe2: moved from HPD%u to HPD%u: %zu of %zu registers differ from lighting there %s\n", from, to, differ,
 	       lit.regs.size(), failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
+// The kernel half of the Vulkan interface (src/n48n.cpp) and its page table (src/vmtree.cpp), over
+// ordinary memory: what each call accepts and refuses, and what a mapping leaves in the table, read
+// back with the walk the runtime's own tests use.
+static int testN48N() {
+	int failures = 0;
+	HostBackend host;
+	static N48N::Client c;
+	failures += check(c.open(host.backend(), 8, 1, (12u << 16) | 1) && host.tablePages == 1, "n48n: open");
+	uint64_t out[4] {};
+	uint32_t n = 4;
+	auto call = [&](uint32_t sel, const uint64_t *in, uint32_t nIn, const void *sin, size_t sinSize, uint32_t nOut,
+	                void *sout, size_t soutSize) {
+		n = nOut;
+		size_t size = soutSize;
+		return c.call(sel, in, nIn, sin, sinSize, nOut ? out : nullptr, nOut ? &n : nullptr, sout, soutSize ? &size : nullptr);
+	};
+	n48n_info info {};
+	const uint64_t hello[2] = { N48N_ABI_VERSION, N48N_HELLO_F_MINOR }, old[2] = { 2, 0 };
+	failures += check(call(N48N_SEL_QUERYINFO, nullptr, 0, nullptr, 0, 0, &info, sizeof(info)) == N48N::kNotReady,
+	                  "n48n: a call before Hello accepted");
+	failures += check(call(N48N_SEL_HELLO, hello, 2, nullptr, 0, 3, nullptr, 0) == N48N::kBadArgument &&
+	                  call(N48N_SEL_HELLO, old, 2, nullptr, 0, 4, nullptr, 0) == N48N::kUnsupported,
+	                  "n48n: Hello with the wrong shape or version accepted");
+	failures += check(call(N48N_SEL_HELLO, hello, 2, nullptr, 0, 4, nullptr, 0) == N48N::kSuccess &&
+	                  out[0] == (N48N_ABI_VERSION | (static_cast<uint64_t>(N48N_ABI_MINOR) << 16)) && out[3] == 8,
+	                  "n48n: Hello -> %llx, vmid %llu", (unsigned long long)out[0], (unsigned long long)out[3]);
+	failures += check(call(N48N_SEL_QUERYINFO, nullptr, 0, nullptr, 0, 0, &info, sizeof(info)) == N48N::kSuccess &&
+	                  info.vmid == 8 && info.vram_vis_total == HostBackend::kVisible && info.gb_addr_config == 0x08200545 &&
+	                  info.va_low_first == 0x10000 && info.va_high_last == ~0ull && info.max_bos == N48N_MAX_BOS &&
+	                  info.reserved[2] == N48N_ABI_MINOR, "n48n: QueryInfo");
+	uint32_t regs[4] {};
+	const uint64_t reg[3] = { 0x263e, 1, 0xffffffff }, other[3] = { 0x1000, 1, 0xffffffff };
+	failures += check(call(N48N_SEL_READREGS, reg, 3, nullptr, 0, 0, regs, 4) == N48N::kSuccess && regs[0] == 0x08200545 &&
+	                  call(N48N_SEL_READREGS, other, 3, nullptr, 0, 0, regs, 4) == N48N::kBadArgument,
+	                  "n48n: ReadRegs reads GB_ADDR_CONFIG and nothing else");
+
+	// Buffers: VRAM the CPU can reach, then the pool it cannot once that is full, system memory within its caps.
+	auto create = [&](uint64_t bytes, uint64_t align, uint64_t domains, uint64_t flags) {
+		const n48n_gem_create_in in { bytes, align, domains, flags };
+		return call(N48N_SEL_BOCREATE, nullptr, 0, &in, sizeof(in), 4, nullptr, 0);
+	};
+	failures += check(create(0x2345, 0, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kSuccess && out[0] == 1 && out[1] == 0x3000 &&
+	                  out[2] == N48N_GEM_DOMAIN_VRAM && out[3] == (N48N_PLACED_CPU_MAPPABLE | N48N_PLACED_ZEROED),
+	                  "n48n: a VRAM buffer: handle %llu, %llu bytes, bits %llx", (unsigned long long)out[0],
+	                  (unsigned long long)out[1], (unsigned long long)out[3]);
+	const uint32_t vram = 1;
+	failures += check(create(0x4000, 0, N48N_GEM_DOMAIN_GTT, N48N_GEM_UNCACHED) == N48N::kSuccess && out[0] == 2 &&
+	                  out[2] == N48N_GEM_DOMAIN_GTT && out[3] == N48N_PLACED_ZEROED, "n48n: a system-memory buffer");
+	const uint32_t sys = 2;
+	failures += check(create(HostBackend::kVisible, 0, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kNoMemory &&
+	                  create(HostBackend::kVisible, 0, N48N_GEM_DOMAIN_VRAM, N48N_GEM_NO_CPU_ACCESS) == N48N::kSuccess &&
+	                  out[3] == N48N_PLACED_HI_POOL && !c.buffer(3)->memory.cpuVisible,
+	                  "n48n: a buffer too large for the visible pool goes to the other only if the CPU need not reach it");
+	failures += check(create(0, 0, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kBadArgument &&
+	                  create(4096, 3000, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kBadArgument &&
+	                  create(4096, 0, N48N_GEM_DOMAIN_CPU, 0) == N48N::kUnsupported &&
+	                  create(4096, 0, N48N_GEM_DOMAIN_VRAM, N48N_GEM_ENCRYPTED) == N48N::kUnsupported &&
+	                  create(N48N::kSystemMaxBuffer + 4096, 0, N48N_GEM_DOMAIN_GTT, 0) == N48N::kNoMemory,
+	                  "n48n: a malformed or unsupported buffer request accepted");
+
+	// Mappings, where the caller says: read back through the table.
+	auto mapping = [&](uint32_t op, uint32_t handle, uint64_t va, uint64_t offset, uint64_t bytes, uint32_t flags) {
+		n48n_gem_va v {};
+		v.handle = handle; v.operation = op; v.flags = flags; v.va_address = va; v.offset_in_bo = offset; v.map_size = bytes;
+		return call(N48N_SEL_GEMVA, nullptr, 0, &v, sizeof(v), 0, nullptr, 0);
+	};
+	auto readEntry = [](void *ctx, uint64_t address, uint64_t &entry) {
+		auto *h = static_cast<HostBackend *>(ctx);
+		const uint64_t page = address & ~4095ull;
+		if (!h->memory.count(page))
+			return false;
+		entry = static_cast<uint64_t *>(h->memory[page])[(address & 4095) / 8];
+		return true;
+	};
+	auto walk = [&](uint64_t va, uint64_t &physical, uint64_t &flags) {
+		return GpuVm::walk(c.root(), va, readEntry, &host, physical, flags);
+	};
+	const uint32_t rw = N48N_VM_PAGE_READABLE | N48N_VM_PAGE_WRITEABLE, rx = N48N_VM_PAGE_READABLE | N48N_VM_PAGE_EXECUTABLE;
+	const uint64_t low = 0x7fff00000000ull - 0x1000, high = 0xffff800000200000ull, flushesBefore = host.flushes;
+	uint64_t phys = 0, flags = 0;
+	failures += check(mapping(N48N_VA_OP_MAP, vram, low, 0x1000, 0x2000, rw) == N48N::kSuccess && host.flushes == flushesBefore + 1 &&
+	                  walk(low + 0x1004, phys, flags) && phys == c.buffer(vram)->memory.physical + 0x2004 &&
+	                  (flags & ~GpuVm::kPhysicalMask) == (GpuVm::kValid | GpuVm::kReadable | GpuVm::kWritable | GpuVm::kIsPte) &&
+	                  !walk(low + 0x2000, phys, flags) && !walk(low - 0x1000, phys, flags),
+	                  "n48n: a VRAM mapping at 0x%llx: physical 0x%llx flags 0x%llx", (unsigned long long)low,
+	                  (unsigned long long)phys, (unsigned long long)flags);
+	// The upper half of the address space, system memory (each page on its own), uncached from the buffer.
+	failures += check(mapping(N48N_VA_OP_MAP, sys, high, 0, 0x4000, rx) == N48N::kSuccess &&
+	                  walk((high & 0xffffffffffffull) + 0x3000, phys, flags) && phys == c.buffer(sys)->memory.token + 0x3000 &&
+	                  (flags & ~GpuVm::kPhysicalMask) == (GpuVm::kValid | GpuVm::kReadable | GpuVm::kExecutable | GpuVm::kSystem |
+	                                                      GpuVm::kSnooped | (2ull << 54) | GpuVm::kIsPte),
+	                  "n48n: a system-memory mapping in the upper half: physical 0x%llx flags 0x%llx",
+	                  (unsigned long long)phys, (unsigned long long)flags);
+	failures += check(mapping(N48N_VA_OP_MAP, vram, low + 0x1000, 0, 0x1000, rw) == N48N::kBadArgument &&      // over a mapping
+	                  mapping(N48N_VA_OP_MAP, vram, 0x8000, 0, 0x1000, rw) == N48N::kBadArgument &&            // below the first address
+	                  mapping(N48N_VA_OP_MAP, vram, 0x0000900000000000ull, 0, 0x1000, rw) == N48N::kBadArgument &&   // not canonical
+	                  mapping(N48N_VA_OP_MAP, vram, 0x7ffffffff000ull, 0, 0x2000, rw) == N48N::kBadArgument &&    // across the seam
+	                  mapping(N48N_VA_OP_MAP, vram, 0x200000, 0x2000, 0x2000, rw) == N48N::kBadArgument &&        // past the buffer's end
+	                  mapping(N48N_VA_OP_MAP, vram, 0x200800, 0, 0x1000, rw) == N48N::kBadArgument &&             // not page aligned
+	                  mapping(N48N_VA_OP_MAP, 77, 0x200000, 0, 0x1000, rw) == N48N::kNotFound &&
+	                  mapping(N48N_VA_OP_MAP, vram, 0x200000, 0, 0x1000, N48N_VM_PAGE_PRT) == N48N::kUnsupported &&
+	                  mapping(N48N_VA_OP_CLEAR, vram, 0x200000, 0, 0x1000, 0) == N48N::kUnsupported &&
+	                  mapping(N48N_VA_OP_UNMAP, vram, low, 0x1000, 0x1000, 0) == N48N::kBadArgument,              // not the mapping that is there
+	                  "n48n: a mapping request that must be refused was accepted");
+	failures += check(mapping(N48N_VA_OP_UNMAP, vram, low, 0x1000, 0x2000, 0) == N48N::kSuccess && !walk(low, phys, flags) &&
+	                  mapping(N48N_VA_OP_MAP, vram, low, 0, 0x3000, rw) == N48N::kSuccess && walk(low + 0x2000, phys, flags),
+	                  "n48n: unmap, then the range mapped again");
+	// Freeing a buffer takes its mappings with it, and the GPU is told before the memory is reused.
+	const uint64_t flushes = host.flushes;
+	const uint64_t free1[1] = { vram }, free9[1] = { 9 };
+	failures += check(call(N48N_SEL_BOFREE, free1, 1, nullptr, 0, 0, nullptr, 0) == N48N::kSuccess && !walk(low, phys, flags) &&
+	                  host.flushes == flushes + 1 && !c.buffer(vram) &&
+	                  call(N48N_SEL_BOFREE, free9, 1, nullptr, 0, 0, nullptr, 0) == N48N::kNotFound &&
+	                  mapping(N48N_VA_OP_MAP, vram, low, 0, 0x1000, rw) == N48N::kNotFound, "n48n: BoFree");
+
+	// Contexts: 64 of them, numbered from 1.
+	n48n_ctx ctx { N48N_CTX_OP_ALLOC, 0, 0, 0 }, reply {};
+	uint32_t last = 0, allocated = 0;
+	while (call(N48N_SEL_CTX, nullptr, 0, &ctx, sizeof(ctx), 0, &reply, sizeof(reply)) == N48N::kSuccess && allocated < 100) {
+		last = reply.op;
+		allocated++;
+	}
+	const n48n_ctx drop { N48N_CTX_OP_FREE, 0, 5, 0 }, query { N48N_CTX_OP_QUERY_STATE2, 0, 1, 0 }, bad { 9, 0, 1, 0 };
+	failures += check(allocated == N48N_MAX_CTX && last == N48N_MAX_CTX &&
+	                  call(N48N_SEL_CTX, nullptr, 0, &drop, sizeof(drop), 0, &reply, sizeof(reply)) == N48N::kSuccess &&
+	                  call(N48N_SEL_CTX, nullptr, 0, &drop, sizeof(drop), 0, &reply, sizeof(reply)) == N48N::kNotFound &&
+	                  call(N48N_SEL_CTX, nullptr, 0, &ctx, sizeof(ctx), 0, &reply, sizeof(reply)) == N48N::kSuccess && reply.op == 5 &&
+	                  call(N48N_SEL_CTX, nullptr, 0, &query, sizeof(query), 0, &reply, sizeof(reply)) == N48N::kSuccess &&
+	                  call(N48N_SEL_CTX, nullptr, 0, &bad, sizeof(bad), 0, &reply, sizeof(reply)) == N48N::kBadArgument,
+	                  "n48n: contexts: %u allocated, last id %u", allocated, last);
+	// Work. Two executable mappings side by side and one that is not; a fence in system memory.
+	const uint64_t code = 0x70000000, plain = 0x70100000;
+	failures += check(create(0x2000, 0, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kSuccess && out[0] == 1 &&
+	                  create(0x1000, 0, N48N_GEM_DOMAIN_GTT, 0) == N48N::kSuccess && out[0] == 4 &&
+	                  mapping(N48N_VA_OP_MAP, 1, code, 0, 0x1000, rw | N48N_VM_PAGE_EXECUTABLE) == N48N::kSuccess &&
+	                  mapping(N48N_VA_OP_MAP, 1, code + 0x1000, 0x1000, 0x1000, rw | N48N_VM_PAGE_EXECUTABLE) == N48N::kSuccess &&
+	                  mapping(N48N_VA_OP_MAP, 4, plain, 0, 0x1000, rw) == N48N::kSuccess, "n48n: buffers for the work checks");
+	const uint32_t fenceBo = 4;
+	struct Cs { n48n_cs_in h; n48n_cs_ib ib[2]; };
+	const Cs good { { N48N_ABI_VERSION, 1, 1, N48N_CS_HAS_FENCE, fenceBo, 16, 0 },
+	                { { 0, N48N_IB_FLAG_PREAMBLE, code + 0xff0, 0x40, N48N_HW_IP_GFX, 0, 0 }, {} } };
+	auto submit = [&](const Cs &cs) { return call(N48N_SEL_SUBMIT, nullptr, 0, &cs, 32 + 32 * cs.h.num_ibs, 1, nullptr, 0); };
+	auto changed = [&](void (*change)(Cs &)) {
+		Cs cs = good;
+		change(cs);
+		return submit(cs);
+	};
+	failures += check(changed([](Cs &c) { c.h.abi = 2; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.h.num_ibs = 0; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.h.flags = 2; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.h.ctx_id = 0; }) == N48N::kNotFound &&
+	                  call(N48N_SEL_SUBMIT, nullptr, 0, &good, 96, 1, nullptr, 0) == N48N::kBadArgument &&
+	                  call(N48N_SEL_SUBMIT, nullptr, 0, &good, 64, 0, nullptr, 0) == N48N::kBadArgument,
+	                  "n48n: a malformed submission accepted");
+	failures += check(changed([](Cs &c) { c.ib[0].ip_type = 1; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.ib[0].ib_bytes = 0x42; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.ib[0].va_start |= 1ull << 50; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.ib[0].flags = N48N_IB_FLAG_CE; }) == N48N::kUnsupported &&
+	                  changed([](Cs &c) { c.ib[0].flags = 1u << 9; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.ib[0].va_start = 0x70100000; }) == N48N::kBadArgument &&    // mapped, not executable
+	                  changed([](Cs &c) { c.ib[0].ib_bytes = 0x1014; }) == N48N::kBadArgument &&        // runs off the second mapping
+	                  changed([](Cs &c) { c.ib[0].va_start = 0x60000000; }) == N48N::kBadArgument,      // not mapped
+	                  "n48n: a command buffer the card could not run accepted");
+	failures += check(changed([](Cs &c) { c.h.fence_handle = 9; }) == N48N::kNotFound &&
+	                  changed([](Cs &c) { c.h.fence_offset = 12; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.h.fence_offset = 0xffc; }) == N48N::kBadArgument &&
+	                  changed([](Cs &c) { c.h.fence_handle = 3; }) == N48N::kBadArgument &&             // VRAM the CPU cannot reach
+	                  changed([](Cs &c) { c.h.flags = 0; }) == N48N::kBadArgument && host.lastSequence == 0,
+	                  "n48n: a bad fence accepted, or a refused submission reached the queue");
+
+	// A good one: across the two mappings, the card slow to finish. The fence appears when it has.
+	host.finishAt = ~0ull;
+	uint64_t fence = 0;
+	auto fenceNow = [&] {
+		memcpy(&fence, static_cast<uint8_t *>(host.bytesOf(c.buffer(fenceBo)->memory)) + 16, 8);
+		return fence;
+	};
+	const uint64_t now1[3] = { 1, 0, 0 }, newest[3] = { N48N_SEQ_LAST, 5000000, 0 }, ahead[3] = { 2, 0, 0 };
+	failures += check(submit(good) == N48N::kSuccess && out[0] == 1 && host.lastSequence == 1 && host.lastCount == 1 &&
+	                  host.lastIbs[0].va == code + 0xff0 && host.lastIbs[0].dwords == 0x10,
+	                  "n48n: Submit -> sequence %llu, %u dwords at 0x%llx", (unsigned long long)out[0], host.lastIbs[0].dwords,
+	                  (unsigned long long)host.lastIbs[0].va);
+	failures += check(call(N48N_SEL_WAITSEQ, now1, 3, nullptr, 0, 3, nullptr, 0) == N48N::kSuccess && out[0] == 1 && out[1] == 0 &&
+	                  out[2] == 1 && fenceNow() == 0 && call(N48N_SEL_WAITSEQ, ahead, 3, nullptr, 0, 3, nullptr, 0) == N48N::kBadArgument,
+	                  "n48n: WaitSeq on unfinished work: busy %llu", (unsigned long long)out[0]);
+	const uint64_t before = host.clockNs;
+	failures += check(call(N48N_SEL_WAITSEQ, newest, 3, nullptr, 0, 3, nullptr, 0) == N48N::kSuccess && out[0] == 1 &&
+	                  host.clockNs - before == 5000000, "n48n: WaitSeq gives up after its timeout, still busy");
+	host.finishAt = host.pauses + 3;
+	failures += check(call(N48N_SEL_WAITSEQ, newest, 3, nullptr, 0, 3, nullptr, 0) == N48N::kSuccess && out[0] == 0 && out[1] == 1 &&
+	                  fenceNow() == 1, "n48n: WaitSeq sees the work finish; fence %llu", (unsigned long long)fence);
+
+	// More than the queue holds at once, a queue with no room, and freeing a buffer under work in flight: each waits.
+	host.finishAt = 4;
+	bool many = true;
+	for (uint32_t i = 0; i < N48N_FENCE_SLOTS + 2; i++)
+		many &= submit(good) == N48N::kSuccess;
+	host.busyReplies = 1;
+	const uint64_t free4[1] = { fenceBo };
+	failures += check(many && submit(good) == N48N::kSuccess && out[0] == N48N_FENCE_SLOTS + 4 && host.busyReplies == 0 &&
+	                  host.finishedSequence == N48N_FENCE_SLOTS + 3, "n48n: a full queue is waited out; sequence %llu",
+	                  (unsigned long long)out[0]);
+	failures += check(call(N48N_SEL_BOFREE, free4, 1, nullptr, 0, 0, nullptr, 0) == N48N::kSuccess &&
+	                  host.finishedSequence == N48N_FENCE_SLOTS + 4 && !c.buffer(fenceBo),
+	                  "n48n: a buffer freed before the work on the queue had finished");
+
+	// The display. Handle 3 is 168 MiB of VRAM past the BAR: room for three pictures of 2560x1440.
+	const uint64_t picture = 2560ull * 1440 * 4, zero1[1] = { 0 }, one1[1] = { 1 };
+	n48n_scan_query sq {};
+	n48n_scan_status ss {};
+	auto show = [&](uint32_t handle, uint64_t offset, uint32_t width = 2560, uint32_t format = N48N_SCAN_FMT_ARGB8888) {
+		const n48n_scan_reg r { handle, 0, offset, width * 4, 1440, width, format };
+		return call(N48N_SEL_SCAN_REGISTER, nullptr, 0, &r, sizeof(r), 2, nullptr, 0);
+	};
+	auto present = [&](uint64_t slot, uint64_t flags = 0) {
+		const uint64_t in[2] = { slot, flags };
+		return call(N48N_SEL_SCAN_PRESENT, in, 2, nullptr, 0, 3, nullptr, 0);
+	};
+	auto scanRelease = [&] { return call(N48N_SEL_SCAN_RELEASE, nullptr, 0, nullptr, 0, 2, nullptr, 0); };
+	failures += check(call(N48N_SEL_SCAN_QUERY, nullptr, 0, nullptr, 0, 0, &sq, sizeof(sq)) == N48N::kSuccess && !sq.acquired &&
+	                  sq.plane_w == 2560 && sq.plane_mc == HostBackend::kConsole && show(3, 0) == N48N::kNotReady &&
+	                  present(0) == N48N::kNotReady && scanRelease() == N48N::kSuccess && out[0] == 1 &&
+	                  out[1] == HostBackend::kConsole && !host.displayTaken, "n48n: the display before it is taken");
+	host.displayElsewhere = true;
+	const uint32_t elsewhere = call(N48N_SEL_SCAN_ACQUIRE, zero1, 1, nullptr, 0, 2, nullptr, 0);
+	host.displayElsewhere = false;
+	failures += check(elsewhere == N48N::kBusy && call(N48N_SEL_SCAN_ACQUIRE, one1, 1, nullptr, 0, 2, nullptr, 0) == N48N::kBadArgument &&
+	                  call(N48N_SEL_SCAN_ACQUIRE, zero1, 1, nullptr, 0, 2, nullptr, 0) == N48N::kSuccess &&
+	                  out[0] == HostBackend::kConsole && out[1] == 100 && host.displayTaken &&
+	                  call(N48N_SEL_SCAN_ACQUIRE, zero1, 1, nullptr, 0, 2, nullptr, 0) == N48N::kBusy, "n48n: taking the display");
+	// Each rule by itself: one field off at a time, and a system buffer that is large enough.
+	auto showRaw = [&](void (*change)(n48n_scan_reg &)) {
+		n48n_scan_reg r { 3, 0, 0, 2560 * 4, 1440, 2560, N48N_SCAN_FMT_ARGB8888 };
+		change(r);
+		return call(N48N_SEL_SCAN_REGISTER, nullptr, 0, &r, sizeof(r), 2, nullptr, 0);
+	};
+	failures += check(create(picture, 0, N48N_GEM_DOMAIN_GTT, 0) == N48N::kSuccess && out[0] == 4 &&
+	                  show(4, 0) == N48N::kBadArgument &&                                         // system memory cannot be shown
+	                  showRaw([](n48n_scan_reg &r) { r.width = 1920; }) == N48N::kBadArgument &&
+	                  showRaw([](n48n_scan_reg &r) { r.height = 1080; }) == N48N::kBadArgument &&
+	                  showRaw([](n48n_scan_reg &r) { r.pitch_bytes = 2568 * 4; }) == N48N::kBadArgument &&
+	                  showRaw([](n48n_scan_reg &r) { r.reserved0 = 1; }) == N48N::kBadArgument,
+	                  "n48n: system memory, or a buffer of another shape than the plane, registered");
+	failures += check(show(3, 0, 2560, 10) == N48N::kBadArgument && show(9, 0) == N48N::kNotFound &&
+	                  show(1, 0) == N48N::kBadArgument &&                                        // too small
+	                  show(3, 0x100) == N48N::kBadArgument &&                                    // not on a page
+	                  show(3, HostBackend::kVisible - picture + 4096) == N48N::kBadArgument,     // runs off the buffer
+	                  "n48n: a buffer that cannot be shown registered");
+	const uint64_t base3 = c.buffer(3)->memory.scanout;
+	failures += check(show(3, 0) == N48N::kSuccess && out[0] == 0 && out[1] == base3 && show(3, 0) == N48N::kBadArgument &&
+	                  show(3, 16ull << 20) == N48N::kSuccess && out[0] == 1 && show(3, 32ull << 20) == N48N::kSuccess &&
+	                  out[0] == 2 && show(3, 48ull << 20) == N48N::kNoResources, "n48n: three buffers registered, no fourth");
+	failures += check(present(5) == N48N::kBadArgument && present(0, 1) == N48N::kBadArgument && host.shown == HostBackend::kConsole &&
+	                  present(1) == N48N::kSuccess && out[0] == 1 && out[1] == 101 && host.shown == base3 + (16ull << 20),
+	                  "n48n: Present -> id %llu in frame %llu", (unsigned long long)out[0], (unsigned long long)out[1]);
+	host.planeWidth = 1920;                    // the mode changed under the client
+	const uint32_t stale = present(2);
+	host.planeWidth = 2560;
+	failures += check(stale == N48N::kNotReady && host.shown == base3 + (16ull << 20) &&
+	                  call(N48N_SEL_SCAN_STATUS, nullptr, 0, nullptr, 0, 0, &ss, sizeof(ss)) == N48N::kSuccess && ss.acquired &&
+	                  ss.front_slot == 1 && ss.pending_slot == N48N_SCAN_NO_SLOT && ss.presents == 1 && ss.refused == 3 &&
+	                  ss.console_mc == HostBackend::kConsole && ss.plane_mc == base3 + (16ull << 20) &&
+	                  ss.slot[1].flags == N48N_SCANSLOT_INUSE && ss.slot[1].latched_frame == 101 &&
+	                  ss.slot[0].flags == N48N_SCANSLOT_REUSABLE && ss.slot[2].used,
+	                  "n48n: a present after the plane changed shape is refused; status: front %u, %llu refused", ss.front_slot,
+	                  (unsigned long long)ss.refused);
+	// Freeing the buffer on the display gives the display back first; so does a release, and so does the close.
+	const uint64_t free3[1] = { 3 };
+	failures += check(call(N48N_SEL_BOFREE, free3, 1, nullptr, 0, 0, nullptr, 0) == N48N::kSuccess &&
+	                  host.shown == HostBackend::kConsole && !host.displayTaken && present(1) == N48N::kNotReady &&
+	                  call(N48N_SEL_SCAN_STATUS, nullptr, 0, nullptr, 0, 0, &ss, sizeof(ss)) == N48N::kSuccess && !ss.acquired &&
+	                  !ss.slot[1].used && ss.front_slot == N48N_SCAN_NO_SLOT, "n48n: the shown buffer freed: the display goes back");
+	failures += check(create(picture, 0, N48N_GEM_DOMAIN_VRAM, 0) == N48N::kSuccess && out[0] == 3 &&
+	                  call(N48N_SEL_SCAN_ACQUIRE, zero1, 1, nullptr, 0, 2, nullptr, 0) == N48N::kSuccess && show(3, 0) == N48N::kSuccess &&
+	                  present(0) == N48N::kSuccess && host.shown == c.buffer(3)->memory.scanout &&
+	                  scanRelease() == N48N::kSuccess && out[0] == 1 && out[1] == HostBackend::kConsole && !host.displayTaken &&
+	                  call(N48N_SEL_SCAN_ACQUIRE, zero1, 1, nullptr, 0, 2, nullptr, 0) == N48N::kSuccess && show(3, 0) == N48N::kSuccess &&
+	                  present(0) == N48N::kSuccess && host.displayTaken, "n48n: release, and the display taken again for the close");
+
+	// Work that never finishes: ten seconds without progress and it is lost, for good.
+	Cs plainCs = good;
+	plainCs.h.flags = plainCs.h.fence_handle = plainCs.h.fence_offset = 0;
+	host.finishAt = ~0ull;
+	const uint64_t two[3] = { N48N_SEQ_LAST, ~0ull, 0 };
+	uint32_t waits = 0, r = submit(plainCs);
+	const uint64_t lostFrom = host.clockNs;
+	while (r == N48N::kSuccess && waits++ < 10)
+		r = call(N48N_SEL_WAITSEQ, two, 3, nullptr, 0, 3, nullptr, 0);
+	failures += check(r == N48N::kTimeout && waits == 5 && host.clockNs - lostFrom == N48N::kLostAfterNs && host.lostCalls == 1,
+	                  "n48n: lost work noticed after %llu ms, in wait %u", (unsigned long long)((host.clockNs - lostFrom) / 1000000), waits);
+	const uint64_t free1b[1] = { 1 };
+	failures += check(submit(plainCs) == N48N::kAborted && call(N48N_SEL_WAITSEQ, two, 3, nullptr, 0, 3, nullptr, 0) == N48N::kAborted &&
+	                  call(N48N_SEL_QUERYINFO, nullptr, 0, nullptr, 0, 0, &info, sizeof(info)) == N48N::kSuccess &&
+	                  (info.flags & N48N_INFO_HUNG) && info.seq_emitted == info.seq_retired + 1 && host.lostCalls == 1 &&
+	                  call(N48N_SEL_BOFREE, free1b, 1, nullptr, 0, 0, nullptr, 0) == N48N::kSuccess,
+	                  "n48n: after lost work: submit and wait refused, freeing still works");
+
+	// Closing gives everything back: buffers, every table page, the root.
+	c.close();
+
+	failures += check(host.memory.empty() && host.tablePages == 0 && host.visibleUsed == 0 && host.highUsed == 0 &&
+	                  host.shown == HostBackend::kConsole && !host.displayTaken,
+	                  "n48n: close left %zu allocation(s), %llu table page(s), the display %s", host.memory.size(),
+	                  (unsigned long long)host.tablePages, host.displayTaken ? "taken" : "given back");
+
+	// The table by itself: three pages across a 2 MiB boundary need two last-level tables.
+	uint64_t root = 0;
+	const VmTree::Pages pages = host.backend().tables;
+	bool ok = pages.alloc(pages.context, root) && VmTree::map(pages, root, 0x1ff000, 0xabc000, 3, GpuVm::kValid);
+	uint64_t entry = 0;
+	ok = ok && host.tablePages == 5 && GpuVm::walk(root, 0x201000, readEntry, &host, phys, entry) && phys == 0xabe000;
+	VmTree::unmap(pages, root, 0x200000, 1);
+	ok = ok && !GpuVm::walk(root, 0x200000, readEntry, &host, phys, entry) && GpuVm::walk(root, 0x1ff000, readEntry, &host, phys, entry);
+	VmTree::destroy(pages, root);
+	failures += check(ok && host.tablePages == 0 && host.memory.empty(), "vmtree: map, unmap and destroy across a table boundary");
+	printf("n48n: the Vulkan interface (memory, work, display) and its page table %s\n", failures ? "MISMATCH" : "ok");
 	return failures;
 }
 
@@ -2560,6 +2855,13 @@ static int testNdrv() {
 	                  "ndrv: spare surface behind a 4K console at 0x%llx",
 	                  static_cast<unsigned long long>(spare.physBase));
 	// A 16 MiB range (the VM): 1080p console, surface at MiB 9; 1080p does not fit, 720p does.
+	// With the compute bring-up the range ends at the compute pool's floor (128 MiB): a 4K surface still fits
+	// behind a 4K console, and nothing may reach past the floor.
+	failures += check(Ndrv::spareSurface(kBar, k4k, kBar, 128 * kMiB, 3840, 2160, spare) &&
+	                  spare.physBase + k4k + 128 <= kBar + 128 * kMiB &&
+	                  !Ndrv::spareSurface(kBar, 96 * kMiB, kBar, 128 * kMiB, 3840, 2160, spare),
+	                  "ndrv: a second display's surface below the compute pool: ends at +0x%llx",
+	                  (unsigned long long)(spare.physBase + k4k + 128 - kBar));
 	failures += check(!Ndrv::spareSurface(kBar, k1080, kBar, 16 * kMiB, 1920, 1080, spare) &&
 	                  Ndrv::spareSurface(kBar, k1080, kBar, 16 * kMiB, 1280, 720, spare) &&
 	                  spare.physBase == kBar + 9 * kMiB,
@@ -2864,6 +3166,15 @@ static int testSdmaPackets() {
 	                  "sdma: COPY_LINEAR %08x %08x", p[0], p[1]);
 	failures += check(Sdma::trap(p) == Sdma::kTrapDwords && p[0] == 0x00000006 && p[1] == 0,
 	                  "sdma: TRAP %08x %08x", p[0], p[1]);
+	// A command buffer run in another address space (SDMA_OP_INDIRECT 4, the VMID at bit 16, the buffer 32-byte
+	// aligned), and the padding that makes the packet end on an 8-dword boundary of the ring.
+	bool padded = true;
+	for (uint32_t dw = 0; dw < 64; dw++)
+		padded &= Sdma::indirectPad(dw * 4) < 8 && (dw + Sdma::indirectPad(dw * 4) + Sdma::kIndirectDwords) % 8 == 0;
+	failures += check(Sdma::indirect(p, 0xffff80000000101full, 8, 8) == 6 && p[0] == 0x00080004 && p[1] == 0x00001000 &&
+	                  p[2] == 0xffff8000 && p[3] == 8 && p[4] == 0 && p[5] == 0 && padded,
+	                  "sdma: INDIRECT %08x %08x %08x %08x, ends on an 8-dword boundary from any write pointer", p[0], p[1],
+	                  p[2], p[3]);
 
 	// Ring: 256-byte ring; packets wrap in memory, the wptr never does
 	// (SDMA 7's 64-bit pointers: a wptr back at the start stalls the card).
@@ -2890,7 +3201,7 @@ static int testSdmaPackets() {
 		failures += check(rr.init(rm, 0x8008800000ull, sizeof(rm), 0x17607) && rr.wptr() == 0x17604, "sdma: a resume pointer is dword aligned");
 	}
 
-	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR encodings and ring wrap %s\n",
+	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR/INDIRECT encodings and ring wrap %s\n",
 	       failures ? "FAILED" : "ok");
 	return failures;
 }
@@ -4508,6 +4819,7 @@ int main(int argc, char **argv) {
 	failures += testDpRetime();
 	failures += testPipe2();
 	failures += testDpTrain();
+	failures += testN48N();
 	failures += testPsp();
 	failures += testGfxImages();
 	failures += testSdmaPackets();
