@@ -816,8 +816,9 @@ B8G8R8A8 only; every present waits for the GPU and copies the whole picture (22 
   pass.
 - Nothing on the graphics ring went wrong during either: no wait ran out, no fault of address space 8 outside the
   diagnostic script's own fault tests. The script's table after it: all PASS.
-- Not looked at: whether the cube's faces and their order in depth were right in every detail (it was reported as
-  rendered, not described); other sizes than the display's; more than one run of each.
+- The cube was right to look at (Sunneva, asked afterwards: "cube rendered correctly"): the texture on its faces
+  and their order in depth.
+- Not looked at: other sizes than the display's; more than one run of each.
 
 So the first run's vkcube failure was in how the loader was reached or told about the driver, not in the driver:
 which of the two, the first run's output cannot say, and with the manifest beside the program it no longer matters.
