@@ -199,11 +199,11 @@ vulkan-products:
 	done
 
 # A Vulkan application that is not ours: Khronos's vkcube with their loader and the manifest that tells the loader
-# where the driver of `make mesa` is, beside that driver in bin/ (userspace/vulkan/build-app.sh; fetches about 65 MB
+# where the driver of `make mesa` is (bin/vulkan/icd.d/), beside that driver in bin/ (userspace/vulkan/build-app.sh; fetches about 65 MB
 # into $(BUILD)/vk-app the first time; needs cmake). docs/todo-vulkantest.md has the commands.
 vkcube: mesa
 	$(VULKAN)/build-app.sh $(BUILD)/vk-app $(RADV_BUILT) $(BIN)
-	@echo "Built $(BIN)/vkcube with libvulkan.1.dylib and radeon_icd.json beside it"
+	@echo "Built $(BIN)/vkcube with libvulkan.dylib and vulkan/icd.d/radeon_icd.json beside it"
 
 # E1 trigger (docs/metal-spike.md): Objective-C, runs in Recovery next to rdna4-run.
 $(BIN)/rdna4-census: $(CENSUS)/census.m

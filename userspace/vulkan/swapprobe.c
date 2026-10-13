@@ -41,7 +41,11 @@ int main(int argc, char **argv) {
 	if (!lib) { printf("dlopen: %s\n", dlerror()); return 1; }
 	GetProc gip = (GetProc)dlsym(lib, "vk_icdGetInstanceProcAddr");
 	if (!gip) { printf("no vk_icdGetInstanceProcAddr\n"); return 1; }
-	const double length = argc > 2 ? atof(argv[2]) : 5;
+	double length = 5;
+	if (argc > 2 && (length = atof(argv[2])) <= 0) {
+		printf("\"%s\" is not a number of seconds: swapprobe <libvulkan_radeon.dylib> [seconds]\n", argv[2]);
+		return 2;
+	}
 
 	F(NULL, vkCreateInstance)
 	const char *instanceExtensions[] = { "VK_KHR_surface", "VK_EXT_headless_surface" };
@@ -183,6 +187,10 @@ int main(int argc, char **argv) {
 	OK(vkDeviceWaitIdle(dev));
 	vkDestroySwapchainKHR(dev, swapchain, 0);     /* gives the display back */
 	printf("presented: %u frames in %.2f s (%.1f a second)\n", frames, took, took > 0 ? frames / took : 0);
+	if (!frames) {
+		printf("FAILED: no frame was presented\n");
+		return 1;
+	}
 	printf("done: all ok\n");
 	return 0;
 }

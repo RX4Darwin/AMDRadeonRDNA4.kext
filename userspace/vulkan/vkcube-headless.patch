@@ -49,3 +49,23 @@ index a396fd4..c1ba40d 100644
  int main(int argc, char **argv) {
      struct demo demo;
  
+diff --git a/cube/cube_functions.h b/cube/cube_functions.h
+index 975f65f..9ce264a 100644
+--- a/cube/cube_functions.h
++++ b/cube/cube_functions.h
+@@ -182,7 +182,14 @@ static VkResult load_vulkan_library() {
+ 
+     vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void (*)(void))GetProcAddress(library, "vkGetInstanceProcAddr");
+ #elif defined(__APPLE__)
+-    void* library = dlopen("libvulkan.dylib", RTLD_NOW | RTLD_LOCAL);
++    void* library = NULL;
++#if defined(CUBE_HEADLESS)
++    // The loader built with this vkcube, beside it: not whichever one the system has, and from any directory.
++    library = dlopen("@executable_path/libvulkan.dylib", RTLD_NOW | RTLD_LOCAL);
++#endif
++    if (library == NULL) {
++        library = dlopen("libvulkan.dylib", RTLD_NOW | RTLD_LOCAL);
++    }
+     if (library == NULL) {
+         library = dlopen("libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL);
+     }

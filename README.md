@@ -302,7 +302,7 @@ version and configuration:
 Build/AMDRadeonRDNA4-<version>-RELEASE/AMDRadeonRDNA4.kext
 Build/AMDRadeonRDNA4-<version>-RELEASE/bin/    rdna4-run, n48nprobe, diagnostic-log.sh; with Mesa built
                                               (make mesa) also libvulkan_radeon.dylib, vkprobe and swapprobe;
-                                              make vkcube adds Khronos's vkcube, their loader and the manifest
+                                              make vkcube adds Khronos's vkcube, their loader and vulkan/icd.d/
 Build/AMDRadeonRDNA4-<version>-DEBUG/...       make CONFIG=DEBUG
 Build/vmtest/AMDRadeonRDNA4-<version>-.../     make VMTEST=1
 ```

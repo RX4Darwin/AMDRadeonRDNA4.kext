@@ -398,9 +398,9 @@ kext does not give a client (the copy now goes on the presenting queue). The buf
 large VRAM heap, as `vkprobe show`'s did on the card.
 
 **A loader and vkcube** (`userspace/vulkan/build-app.sh`, `make vkcube`). Khronos's Vulkan-Loader builds for macOS as it is
-and finds the driver through a manifest named in `VK_DRIVER_FILES`. Their `vkcube` on macOS draws into a Metal
+and finds the driver through a manifest; the one built here is in `vulkan/icd.d/` beside the program, where the loader looks without being told. Their `vkcube` on macOS draws into a Metal
 layer, which this driver has no surface for; `cube.c` also has a mode for a bare display, and an 18-line patch gives
-that mode a headless surface.
+that mode a headless surface, and makes vkcube open the loader beside itself (it would otherwise take a Vulkan SDK's, if the machine has one).
 
 **On a host** (the client engine of section 7 with a stand-in display, row pitch 3840 as on the rig): `swapprobe`
 and `vkcube` each create a swapchain; the driver takes the display, registers three buffers, presents every frame
