@@ -32,8 +32,9 @@ it found the interface, created its device, ran two fills of a buffer (both by t
 was taken for a compute shader's until 2026-10-07, when a real one first ran; see `docs/vulkan-port.md` section 9), rendered a triangle into an
 image with a vertex and a fragment shader it compiled and read it back right, and with `vkprobe ... show`
 put a moving triangle on the boot display for five seconds at 60 frames a second, the desktop back afterwards.
-Since 2026-10-13 (patch 0008; on a host only so far, not on the card) a program can also present the usual way,
-with a headless surface and a swapchain, and Khronos's `vkcube` runs on the driver through their loader; before
+Since 2026-10-13 (patch 0008) a program can also present the usual way, with a headless surface and a swapchain,
+and Khronos's `vkcube` runs on the driver through their loader (**both on the card that day**: `swapprobe` 300
+frames in 5 s, vkcube's cube for ten seconds); before
 that a program had to call the six functions the driver exports (`radv_darwin_scanout_*`) itself. `docs/vulkan-port.md` has what the port needs from the kext, the order of work and
 what each step showed; `docs/todo-vulkantest.md` is the record of the card tests and the way to repeat them.
 

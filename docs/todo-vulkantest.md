@@ -716,8 +716,8 @@ next attempt.
 
 ## A program with a swapchain, and one that is not ours
 
-Written 2026-10-13, branch `devel/vulkan-application`. **Run on the card once (below): the old test passes with
-the new library; neither new program has presented a frame there yet.** Until now a program had to call
+Written 2026-10-13, branch `devel/vulkan-application`. **Verified on the card that day, second run (below):
+both programs present through their swapchains, and vkcube runs through Khronos's loader.** Until now a program had to call
 the driver's own `radv_darwin_scanout_*` functions to get a picture on the display, which no existing Vulkan program
 does. With `mesa-patches/0008` the driver offers `VK_KHR_surface`, `VK_EXT_headless_surface` and `VK_KHR_swapchain`,
 and shows a headless swapchain's images on the display the kext lends: at present each image is copied into a buffer
@@ -803,6 +803,24 @@ B8G8R8A8 only; every present waits for the GPU and copies the whole picture (22 
   being told. On the development Mac that arrangement runs on the loader built here (it says
   `Vulkan Loader Version 1.4.363`) from any directory, with no variable. If it fails on the card again, the
   loader's own messages are in `vkcube.txt` this time.
+
+### Second run 2026-10-13 (same boot, same kext; the programs of commit `f1dc5f8`): both present
+
+- `swapprobe`: `swapchain: 2560x1440, format 44, 3 images`, **`presented: 300 frames in 5.01 s (59.8 a second)`,
+  `done: all ok`**, and the picture was on the Samsung. Kernel log: display taken at 1265.69 s, given back at
+  1270.72 s, the desktop's address latched again one frame later.
+- `vkcube`, started as written above (no variable naming the driver): `Selected GPU 0: AMD Radeon RX 9070 XT (RADV
+  GFX1201)`, no message from the loader, and **the cube was on the Samsung**. Kernel log: display held from
+  1311.49 s to 1321.52 s, which is `--c 600` at 60 frames a second; the desktop back after it. It is the first
+  program on the card that is not ours, and the first with a depth buffer, a texture, uniform buffers and a render
+  pass.
+- Nothing on the graphics ring went wrong during either: no wait ran out, no fault of address space 8 outside the
+  diagnostic script's own fault tests. The script's table after it: all PASS.
+- Not looked at: whether the cube's faces and their order in depth were right in every detail (it was reported as
+  rendered, not described); other sizes than the display's; more than one run of each.
+
+So the first run's vkcube failure was in how the loader was reached or told about the driver, not in the driver:
+which of the two, the first run's output cannot say, and with the manifest beside the program it no longer matters.
 
 ## After the tests
 

@@ -15,6 +15,15 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - The copy engine's compression setting (`SDMA0_DCC_CNTL`, 0x0000aabe on this card) does not alter uniform blocks in
   any direction this kext copies in; the boot log says so at every start (`runtime: dma: SDMA0_DCC_CNTL ...`).
 
+**Vulkan**
+- Swapchains: the driver offers `VK_KHR_surface`, `VK_EXT_headless_surface` and `VK_KHR_swapchain`, and shows a
+  headless swapchain on the boot display (Mesa patch 0008). Verified on the card 2026-10-13: `swapprobe`, 300
+  frames in 5 s.
+- A Vulkan application that is not ours: `make vkcube` builds Khronos's loader and `vkcube` beside the driver.
+  Verified on the card 2026-10-13: the cube on the boot display for ten seconds, through the loader. Limits: the
+  program has to be given the display's size, three images at most, B8G8R8A8 only, and every present waits for the
+  GPU and copies the picture.
+
 **Tools**
 - `tools/rig/spike-bar.sh` and `tools/metal/air/sample-operands.py`, the two spikes of the roadmap (issue #3).
 

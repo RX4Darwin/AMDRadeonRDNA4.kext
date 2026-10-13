@@ -383,7 +383,7 @@ reboot (that needs the MES or a reset of the whole GPU); and after a failed copy
 not done. `docs/todo-vulkantest.md`, "A shader that
 faults", has the runs.
 
-## 12. A Vulkan application (2026-10-13, on a host; not on the card yet)
+## 12. A Vulkan application (2026-10-13, verified on the card)
 
 Everything up to here was shown with `vkprobe`, which presents by calling the driver's scanout functions. No other
 program does that. Two things were missing for a program somebody else wrote: swapchains, and a Vulkan loader.
@@ -404,9 +404,13 @@ that mode a headless surface, and makes vkcube open the loader beside itself (it
 
 **On a host** (the client engine of section 7 with a stand-in display, row pitch 3840 as on the rig): `swapprobe`
 and `vkcube` each create a swapchain; the driver takes the display, registers three buffers, presents every frame
-and releases the display; every call is accepted. **On the card: not run.** The test is in
-`docs/todo-vulkantest.md`. What the host cannot show is the picture, and vkcube is the first program here with a
-depth buffer and a texture.
+and releases the display; every call is accepted.
+
+**On the card** (2026-10-13, second run; `docs/todo-vulkantest.md`): `swapprobe` presents 300 frames in 5.01 s and
+its picture is on the display; `vkcube` shows its cube for the ten seconds asked for, through Khronos's loader,
+with nothing but the files beside it telling the loader where the driver is. vkcube is the first program on the
+card with a depth buffer, a texture and a render pass, and the first that somebody else wrote. The first run had
+failed before any frame, for reasons outside the driver (a wrong argument; the loader not finding the driver).
 
 Not done: a surface with a size of its own (the physical device has no connection to the kext in this Mesa, only
 the device has, so the surface cannot ask for the display's size); more than three images; formats other than
