@@ -184,6 +184,75 @@ Rows to look at: `gfx PASS`, `gfx-client PASS` (a kernel-made client's command b
 address space), `gfx-app-tri` and `gfx-app-tricol` (`rdna4-run tri` / `tricol`: a triangle drawn by a user
 program through the runtime). The colour triangle has not been confirmed on the card by any path.
 
+## Sleep with `rdna4-vm=1` (written 2026-10-12, not run)
+
+Neither kind of sleep has run on the card with the compute runtime. At a sleep the kext stops every queue, the shared
+ones included; at the wake it runs its whole bring-up again and creates them anew. Section 20 of
+`docs/vm-client-rootcause.md` found that a compute queue that was dequeued does not run again when loaded through its
+registers, which is what this would be unless the bring-up's restart of the engine makes the difference. So a
+failure here would not be a surprise; the log says where.
+
+Both need `rdna4-pm=1`: without it the kext is not told about a sleep at all.
+
+**Stage 1, the driver's own cycle** (the machine stays on, the card keeps its power):
+
+```
+rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1 rdna4-pm=1 rdna4-sleeptest=1
+```
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+and once more, so that the second run's tests are tests after a wake:
+
+```bash
+sudo bash diagnostic-log.sh
+```
+
+Near its end the script runs `rdna4-run sleeptest`: sleep, 15 s, wake, 15 s for the bring-up. In the first log: row
+`sleep`, and in the kernel log `power: quiesce complete`, `power: wake received`, the bring-up's stages again, `vmshared:
+shared queue 0 ...: active`, `user-space runtime up again`. In the second log: the table. If the first cycle leaves
+the GPU busy or the runtime not ready, skip the second run and power the machine off before the next boot (a warm
+reboot keeps some of the card's state).
+
+**Stage 1 ran on 2026-10-12** (kext `0.1.0 (dbabb353)`, logs `amdradeonrdna4-diag-20261012-173208` and `-173322`): the
+sleep half is clean (`power: quiesce complete; compute engines halted`), the wake half stops in the bring-up's second
+stage:
+
+```
+compute: psp: bootloader: sOS already running (0x03afe407), 0 component(s) loaded
+compute: psp: ring: create not acknowledged (C2PMSG_64=0x80c20115)
+compute: stage 2 (psp) failed; stopping, the display is not affected
+```
+
+The card kept its power, so its security processor still has the command ring of the first bring-up and refuses a
+second one. The runtime is then not ready until the reboot (`sleep FAIL`; the second run has `runtime FAIL`). The
+queues, which were the worry, were never reached. amdgpu ends that ring (and the memory region it set up with it)
+when it suspends, which this kext does not do. This failure says nothing about a real sleep, where the card loses
+its power and the security processor starts afresh; whether it does on this machine is what the `bootloader:` line
+of stage 2 shows.
+
+**Stage 2 ran on 2026-10-12, and was not a real sleep.** Sleep from the Apple menu with `rdna4-pm=1`: both displays
+went dark and did not come back; the machine had to be restarted. What the rest shows:
+
+- `pmset -g log`: `Kernel System sleep preventers: .Display_boot, IONDRVFramebuffer` in every boot, and `Sleep/Wakes
+  since boot: 0`. **This machine does not sleep with this driver**: the framebuffer driver prevents it, as the README
+  says (after a power loss nobody could set the display pipeline up again). Sleep from the Apple menu puts the
+  displays to sleep and nothing more. The card never lost its power.
+- The same from a boot **without** `rdna4-pm=1` (`sleep-dmesg.txt`, a kernel log written by a delayed command): the
+  displays go off and come back 21 s later, `power: display off ...`, `power: pipe2 display off: 39 steps ran`, `power:
+  display on ...`, `power: pipe2 display on: 128 steps ran`. The compute runtime is not told and is not touched.
+- So with `rdna4-pm=1` the displays stay dark after a display sleep that the Sleep menu starts. Why is not known: no
+  kernel log of that boot exists (the driver's lines are not kept across a restart). Suspects: the compute side
+  shutting down at the sleep request and running its bring-up again on a card that kept its power (which fails, stage
+  1), or what the PCI device does once this service says it may be powered down.
+
+**Where that leaves sleep.** There is nothing for the compute runtime to survive until the machine can sleep at
+all, and that needs the display pipeline brought up from nothing after a power loss, a display project of its own.
+Until then: **leave `rdna4-pm` out.** Without it the Sleep menu is a display sleep, which works. With it, it costs
+the displays until the restart.
+
 ## After the tests
 
 Done: the results are in `docs/vm-client-rootcause.md` sections 12 to 20, `docs/metal-readiness.md` section 4 and
