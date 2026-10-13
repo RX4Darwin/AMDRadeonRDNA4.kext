@@ -12,7 +12,8 @@
 #
 #   Build/AMDRadeonRDNA4-<version>-<CONFIG>/AMDRadeonRDNA4.kext
 #   Build/AMDRadeonRDNA4-<version>-<CONFIG>/bin/     rdna4-run, n48nprobe, diagnostic-log.sh, and with Mesa built
-#                                                   (`make mesa`) libvulkan_radeon.dylib and vkprobe
+#                                                   (`make mesa`) libvulkan_radeon.dylib, vkprobe and swapprobe;
+#                                                   `make vkcube` adds Khronos's vkcube and loader
 #   Build/obj/<CONFIG>/                             the kext's objects
 #   Build/host/                                     the host tests' programs
 #   Build/vmtest/...                                the same two levels for VMTEST=1
@@ -98,7 +99,7 @@ RUN          = userspace/rdna4-run
 VULKAN       = userspace/vulkan
 CENSUS       = tools/metal/accelcensus
 
-.PHONY: all kext tools userspace n48nprobe mesa vulkan-products census-tool census-stub census-pathlog \
+.PHONY: all kext tools userspace n48nprobe mesa vulkan-products vkcube census-tool census-stub census-pathlog \
         test atomdump check-isa check-config product-dir clean distclean
 
 all: check-config kext tools
@@ -172,10 +173,10 @@ $(BIN)/diagnostic-log.sh: tools/rig/diagnostic-log.sh
 	@mkdir -p $(BIN)
 	cp tools/rig/diagnostic-log.sh $@
 
-# The Vulkan driver and its test program for the card tests (docs/todo-vulkantest.md): Mesa with the patches of
+# The Vulkan driver and its test programs for the card tests (docs/todo-vulkantest.md): Mesa with the patches of
 # userspace/vulkan/mesa-patches, fetched (about 150 MB, the first time) and built in $(BUILD)/radv-build by `make mesa`.
-# `make clean` keeps that tree. Once it is built, every `make` puts the library and vkprobe (built against Mesa's
-# headers) beside the other programs, for whichever configuration is being made.
+# `make clean` keeps that tree. Once it is built, every `make` puts the library, vkprobe and swapprobe (built against
+# Mesa's headers) beside the other programs, for whichever configuration is being made.
 RADV_DIR     = $(BUILD)/radv-build
 RADV_BUILT   = $(RADV_DIR)/build/src/amd/vulkan/libvulkan_radeon.dylib
 RADV_LIB     = $(BIN)/libvulkan_radeon.dylib
@@ -184,14 +185,25 @@ mesa:
 	@$(MAKE) vulkan-products
 	@otool -l $(RADV_LIB) | grep -A4 LC_BUILD_VERSION | grep -q 'minos $(DEPLOY)' || \
 		{ echo "$(RADV_LIB) is not built for macOS $(DEPLOY)" >&2; exit 1; }
-	@echo "Built $(RADV_LIB) and $(BIN)/vkprobe for $(ARCH) (min macOS $(DEPLOY))"
+	@echo "Built $(RADV_LIB), $(BIN)/vkprobe and $(BIN)/swapprobe for $(ARCH) (min macOS $(DEPLOY))"
 
 vulkan-products:
-	@if [ -f $(RADV_BUILT) ]; then mkdir -p $(BIN); \
-		cmp -s $(RADV_BUILT) $(RADV_LIB) || { echo "cp $(RADV_BUILT) $(RADV_LIB)"; cp $(RADV_BUILT) $(RADV_LIB); }; \
-		if [ ! -f $(BIN)/vkprobe ] || [ $(VULKAN)/vkprobe.c -nt $(BIN)/vkprobe ]; then \
-			echo "$(CXX) -x c ... $(VULKAN)/vkprobe.c -o $(BIN)/vkprobe"; \
-			$(CXX) -x c $(USER_FLAGS) -I$(RADV_DIR)/mesa/include $(VULKAN)/vkprobe.c -o $(BIN)/vkprobe; fi; fi
+	@[ -f $(RADV_BUILT) ] || exit 0; \
+	mkdir -p $(BIN); \
+	cmp -s $(RADV_BUILT) $(RADV_LIB) || { echo "cp $(RADV_BUILT) $(RADV_LIB)"; cp $(RADV_BUILT) $(RADV_LIB); }; \
+	for p in vkprobe swapprobe; do \
+		if [ ! -f $(BIN)/$$p ] || [ $(VULKAN)/$$p.c -nt $(BIN)/$$p ]; then \
+			echo "$(CXX) -x c ... $(VULKAN)/$$p.c -o $(BIN)/$$p"; \
+			$(CXX) -x c $(USER_FLAGS) -I$(RADV_DIR)/mesa/include -I$(VULKAN) $(VULKAN)/$$p.c -o $(BIN)/$$p || exit 1; \
+		fi; \
+	done
+
+# A Vulkan application that is not ours: Khronos's vkcube with their loader and the manifest that tells the loader
+# where the driver of `make mesa` is (bin/vulkan/icd.d/), beside that driver in bin/ (userspace/vulkan/build-app.sh; fetches about 65 MB
+# into $(BUILD)/vk-app the first time; needs cmake). docs/todo-vulkantest.md has the commands.
+vkcube: mesa
+	$(VULKAN)/build-app.sh $(BUILD)/vk-app $(RADV_BUILT) $(BIN)
+	@echo "Built $(BIN)/vkcube with libvulkan.dylib and vulkan/icd.d/radeon_icd.json beside it"
 
 # E1 trigger (docs/metal-spike.md): Objective-C, runs in Recovery next to rdna4-run.
 $(BIN)/rdna4-census: $(CENSUS)/census.m

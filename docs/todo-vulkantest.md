@@ -714,6 +714,114 @@ costs the ring until the reboot, as it always did. For that, amdgpu on this chip
 whole GPU through the SMU; `gfx_v12_0.c` has no reset of the pipeline alone. Either is a project of its own, not a
 next attempt.
 
+## A program with a swapchain, and one that is not ours
+
+Written 2026-10-13, branch `devel/vulkan-application`. **Verified on the card that day, second run (below):
+both programs present through their swapchains, and vkcube runs through Khronos's loader.** Until now a program had to call
+the driver's own `radv_darwin_scanout_*` functions to get a picture on the display, which no existing Vulkan program
+does. With `mesa-patches/0008` the driver offers `VK_KHR_surface`, `VK_EXT_headless_surface` and `VK_KHR_swapchain`,
+and shows a headless swapchain's images on the display the kext lends: at present each image is copied into a buffer
+of the display's shape (VRAM, the same kind `vkprobe show` used) and the display is flipped to it. Nothing changed
+in the kext; any kext from `next` or `main` will do.
+
+On this Mac (`test/n48n-host/run.sh`, stand-in display with the rig's row pitch of 3840): both programs below
+create their swapchain, the driver takes the display, registers three buffers, presents every frame and gives the
+display back. Whether the picture is right can only be seen on the card.
+
+Build: `make vkcube` (it runs `make mesa` first; fetches Khronos's loader, headers and tools the first time, about
+65 MB, and needs cmake). To the rig: the whole `bin/` directory of the build
+(`Build/AMDRadeonRDNA4-<version>-RELEASE/bin/`: the library, `vkprobe`, `swapprobe`, `vkcube` with its loader
+`libvulkan.dylib` and the folder `vulkan/`, `rdna4-run` and `diagnostic-log.sh`). Every command below is typed
+inside that directory. The usual boot:
+
+```
+rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
+```
+
+**1. The old test with the new library** (the window-system code is now part of it):
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
+```
+
+Expected: as before, ending `done: all ok`.
+
+**2. Our own program with a swapchain** (`userspace/vulkan/swapprobe.c`), five seconds. No `show` after the
+library's path: the one optional argument is a number of seconds.
+
+```bash
+sudo ./swapprobe ./libvulkan_radeon.dylib > swapprobe.txt 2>&1
+```
+
+Expected on the Samsung: a red triangle a third of the screen high moving left to right and starting over every four
+seconds, on a background going from dark blue to dark green and back; then the desktop. In the file: `display: the
+kext has one to lend`, `swapchain: 2560x1440, format 44, 3 images` (the numbers of the mode in use), `presented:
+about 300 frames in 5.0 s (60.0 a second)`, `done: all ok`. A blue triangle would mean red and blue are swapped.
+
+**3. vkcube**, Khronos's demo, through their loader, ten seconds. Only if step 2 passed. It opens the loader
+beside itself, and the loader finds the driver through `vulkan/icd.d/` beside the program: no variable names the
+driver. `VK_LOADER_DEBUG` only makes the loader say what goes wrong, if anything does. With the width and height
+step 2 printed:
+
+```bash
+sudo env VK_LOADER_DEBUG=error,warn ./vkcube --wsi display --width 2560 --height 1440 --c 600 > vkcube.txt 2>&1
+```
+
+Expected: a turning cube with the LunarG picture on its faces, filling the screen, for ten seconds; then the desktop.
+The file has `Selected GPU 0: AMD Radeon RX 9070 XT (RADV GFX1201)`. This is the first program on the card that uses
+a depth buffer, a texture, uniform buffers and a render pass, so a wrong or missing picture here is a finding, not a
+surprise. A line `radv-darwin: wsi: ... not shown` means the swapchain did not fit the display (wrong size).
+
+**4.** `sudo bash diagnostic-log.sh`
+
+If a picture freezes: wait (the driver gives up after 10 s without progress), run step 4 anyway, and reboot before
+anything else. A draw that hangs costs the graphics ring until the reboot (the section above).
+
+Report: the three text files, the log, and what was on the screen in steps 2 and 3.
+
+Limits, known before the run: a headless surface has no size, so the program has to be told the display's (a
+smaller swapchain is shown in the top left corner with whatever its buffer held around it); at most three images;
+B8G8R8A8 only; every present waits for the GPU and copies the whole picture (22 MiB at 2560x1440).
+
+### Run 2026-10-13 (kext `0.1.0 (4f794034)`): the old test passes; the two new programs did not get to a frame
+
+- `vkprobe ... show` with the new library: `done: all ok` (both fills, the triangle read back right, 301 frames in
+  5.01 s). The window-system code now in the library changes nothing for a program that does not use it.
+- `swapprobe`: `swapchain: 2560x1440, format 44, 3 images`, then `presented: 0 frames in 0.00 s` and `done: all ok`.
+  The kernel log has it three times: the display taken and given back within a millisecond. **The swapchain was
+  created on the card and its three buffers were accepted as scanout slots; no frame was drawn.** The loop runs no
+  frame only when the seconds argument reads as zero, which a word does (`show`, as `vkprobe` takes it); two of the
+  three runs follow a `vkprobe ... show` by a few seconds. The program now refuses such an argument and fails when
+  it has presented nothing, where it said `all ok`.
+- `vkcube`: `vkEnumerateInstanceExtensionProperties failed to find the VK_KHR_surface instance extension`: the
+  loader had no driver. Nothing in the kernel log, as expected of a program that never opened the device. **Why
+  the loader did not take the driver named in `VK_DRIVER_FILES` is not known.** What is known is that the test on
+  the development Mac had not tested this: that Mac has a Vulkan SDK, vkcube opens `libvulkan.dylib` first, and
+  that name was the SDK's loader in `/usr/local/lib`, not the one built here. The rig, without an SDK, was the
+  first to run ours. Changed since: vkcube opens the loader beside itself first; the loader is shipped under the
+  name vkcube asks for; and the manifest is in `vulkan/icd.d/` beside the program, where the loader looks without
+  being told. On the development Mac that arrangement runs on the loader built here (it says
+  `Vulkan Loader Version 1.4.363`) from any directory, with no variable. If it fails on the card again, the
+  loader's own messages are in `vkcube.txt` this time.
+
+### Second run 2026-10-13 (same boot, same kext; the programs of commit `f1dc5f8`): both present
+
+- `swapprobe`: `swapchain: 2560x1440, format 44, 3 images`, **`presented: 300 frames in 5.01 s (59.8 a second)`,
+  `done: all ok`**, and the picture was on the Samsung. Kernel log: display taken at 1265.69 s, given back at
+  1270.72 s, the desktop's address latched again one frame later.
+- `vkcube`, started as written above (no variable naming the driver): `Selected GPU 0: AMD Radeon RX 9070 XT (RADV
+  GFX1201)`, no message from the loader, and **the cube was on the Samsung**. Kernel log: display held from
+  1311.49 s to 1321.52 s, which is `--c 600` at 60 frames a second; the desktop back after it. It is the first
+  program on the card that is not ours, and the first with a depth buffer, a texture, uniform buffers and a render
+  pass.
+- Nothing on the graphics ring went wrong during either: no wait ran out, no fault of address space 8 outside the
+  diagnostic script's own fault tests. The script's table after it: all PASS.
+- Not looked at: whether the cube's faces and their order in depth were right in every detail (it was reported as
+  rendered, not described); other sizes than the display's; more than one run of each.
+
+So the first run's vkcube failure was in how the loader was reached or told about the driver, not in the driver:
+which of the two, the first run's output cannot say, and with the manifest beside the program it no longer matters.
+
 ## After the tests
 
 For what passes, the README's file table, `docs/vulkan-port.md` and `userspace/vulkan/README.md` get the date and what ran.

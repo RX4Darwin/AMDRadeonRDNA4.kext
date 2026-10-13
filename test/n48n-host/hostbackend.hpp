@@ -34,6 +34,7 @@ struct HostBackend {
 	static constexpr uint64_t kConsole = 0x8000000000ull;
 	uint64_t shown = kConsole, frame = 100;
 	uint32_t planeWidth = 2560, planeHeight = 1440, showReply = N48N::kSuccess;
+	uint32_t planePitch = 0;                   // pixels in a row of the plane's memory; 0 = the width (the rig: 3840)
 	bool     displayTaken = false, displayElsewhere = false;
 
 	void *bytesOf(const N48N::Memory &m) { return memory.count(m.token) ? memory[m.token] : nullptr; }
@@ -128,7 +129,8 @@ struct HostBackend {
 		b.scanQuery = [](void *c, n48n_scan_query &q) {
 			auto *h = static_cast<HostBackend *>(c);
 			q = n48n_scan_query {};
-			q.h_active = q.plane_w = q.pitch_px = h->planeWidth;
+			q.h_active = q.plane_w = h->planeWidth;
+			q.pitch_px = h->planePitch ? h->planePitch : h->planeWidth;
 			q.v_active = q.plane_h = h->planeHeight;
 			q.h_total = 2720; q.v_total = 1481; q.refresh_mhz = 60000; q.pix_clk_khz = 241700;
 			q.hubp_format = N48N_SCAN_FMT_ARGB8888;
@@ -147,7 +149,8 @@ struct HostBackend {
 		};
 		b.scanShow = [](void *c, uint64_t address, uint32_t width, uint32_t height, uint32_t pitchBytes, uint64_t &frame) -> uint32_t {
 			auto *h = static_cast<HostBackend *>(c);
-			if (h->showReply != N48N::kSuccess || width != h->planeWidth || height != h->planeHeight || pitchBytes != width * 4)
+			if (h->showReply != N48N::kSuccess || width != h->planeWidth || height != h->planeHeight ||
+			    pitchBytes != (h->planePitch ? h->planePitch : width) * 4)
 				return h->showReply != N48N::kSuccess ? h->showReply : N48N::kNotReady;
 			h->shown = address;
 			frame = ++h->frame;
