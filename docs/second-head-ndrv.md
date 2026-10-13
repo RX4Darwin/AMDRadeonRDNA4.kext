@@ -169,7 +169,7 @@ accepts a second unaccelerated head. The monitor stays dark: no pipe scans the s
   first mode of that EDID, native first, whose surface fits. If macOS opens head 2 first, `head2DriverIO` attaches
   head 0 on the spot.
 - The surface is 1 MiB aligned and at least 1 MiB behind the console, inside the device memory range that holds the
-  console (`Ndrv::spareSurface`, host-tested in `tools/atomdump.cpp`).
+  console (`Ndrv::spareSurface`, host-tested in `test/atomdump.cpp`).
 - `head2DriverIO` answers Initialize/Open and every csc request for the framebuffer on the nub: a `Translator` with
   one mode, then IOBootNDRV's fallback (`Ndrv::bootReply`).
 - `IONDRVFramebuffer::getVRAMRange` is routed too and returns the surface for head 2 (added after the second boot).

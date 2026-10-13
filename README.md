@@ -107,7 +107,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-off=1` | Kill switch: the plugin does not hook anything and macOS runs its stock fallback framebuffer. Lilu's `-liluoff` disables all plugins. |
 | `rdna4-trace=1` | Log every NDRV request for our framebuffer and who answered it (`rdna4` or `boot`), up to 400 lines. On by default in `VMTEST` builds. Mode switches are always logged. |
 | `rdna4-modeset=0` | **Mode switching is on by default; `0` turns it off** (the boot mode alone is offered). On, the kext offers the sink's EDID modes (DTDs, CTA DTDs/VICs, standard and established timings; ≤ boot framebuffer size, TMDS ≤ 340 MHz or, for a sink whose EDID announces SCDC and a higher rate, ≤ 600 MHz, and ≤ 1.25 × boot pixel clock) instead of the boot mode alone. On an HDMI/DVI boot display a switch runs the mode-set engine (verified on the card 2026-10-04: 1920x1080 to 1600x900 on a 1080p HDMI sink, picture confirmed; the log line `modes: now ..., measured ... Hz` gives the refresh the OTG really runs at). On a DP boot display a switch retimes the stream and leaves the link as the firmware trained it, so only modes at or below the boot pixel clock are offered (verified on the card 2026-10-04: 3840x2160 to 2560x1440 on a 4K DP monitor over four HBR2 lanes, picture confirmed; the log shows `modes: DisplayPort, link untouched: DTO ...` and the measured refresh). Until 2026-10-06 a switch left the plane expecting the blank to end where it does in the boot mode, which cut the top of the picture off in modes whose blank ends earlier (the menu bar at 2560x1440, everything at 1280x720); the switch now sets that for the new mode, and 2560x1440, 1920x1080 and 1280x720 were confirmed whole on the 4K monitor that day. From 340 MHz up the link is HDMI 2.0 scrambled: the encoder's scrambler is switched with the mode and the monitor is told over SCDC, in both directions, so a monitor the GOP lit at 4K60 (533 MHz, scrambled) can be switched down as well. The scrambled path ran on the card 2026-10-05: a monitor the GOP lit at 3840x2160 (533 MHz) switched to 1920x1080@60, to 1920x1080@144 (333 MHz, measured 143.996 Hz) and back to 3840x2160 (`scdc: ... TMDS_CONFIG = 3 written`, measured 59.996 Hz), and showed the desktop again at 3840x2160. |
-| `rdna4-head2=0` | **A second display is on by default (level 4, below); `0` turns it off.** `1` is the experiment it grew from: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Next to `rdna4-compute` since 2026-10-06 (its surface is kept below the compute pool; ran together on the card that day). Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. **Higher values also light the pipe (`docs/second-pipe.md`; all verified on the card 2026-10-04):** `2` writes nothing and publishes what every step of the plan would do to the dormant pipe's registers (`AMDRadeonRDNA4,Pipe2`, shown by `tools/diagnostic-log.sh`); `3` lights the stream alone, so the second monitor shows a solid teal-blue; `4` also lights the plane, so it shows the second desktop. There is a plan per connector of the card, all at 1920x1080@60 next to a boot display on another connector: HDMI on HPD3 / link 2 (the one verified), HDMI on HPD4 / link 3 (verified 2026-10-06), and DisplayPort on HPD1 / link 0 or HPD2 / link 1, whose link the kext trains itself (those two host-tested, not yet run on the card, and only used with `rdna4-head2dp=1`). Not in `VMTEST` builds. |
+| `rdna4-head2=0` | **A second display is on by default (level 4, below); `0` turns it off.** `1` is the experiment it grew from: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Next to `rdna4-compute` since 2026-10-06 (its surface is kept below the compute pool; ran together on the card that day). Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. **Higher values also light the pipe (`docs/second-pipe.md`; all verified on the card 2026-10-04):** `2` writes nothing and publishes what every step of the plan would do to the dormant pipe's registers (`AMDRadeonRDNA4,Pipe2`, shown by `tools/rig/diagnostic-log.sh`); `3` lights the stream alone, so the second monitor shows a solid teal-blue; `4` also lights the plane, so it shows the second desktop. There is a plan per connector of the card, all at 1920x1080@60 next to a boot display on another connector: HDMI on HPD3 / link 2 (the one verified), HDMI on HPD4 / link 3 (verified 2026-10-06), and DisplayPort on HPD1 / link 0 or HPD2 / link 1, whose link the kext trains itself (those two host-tested, not yet run on the card, and only used with `rdna4-head2dp=1`). Not in `VMTEST` builds. |
 | `rdna4-head2dp=1` | Also serve a second display on a DisplayPort connector (lighting it, sleep, hot-plug and mode switching as on HDMI). Off by default because it has not run on the card yet: `docs/todo-dptest.md` has the tests. |
 | `rdna4-hotplug=0` | **Hot-plug of the second display is on by default (level 2); `0` turns it off, `1` only logs what the pin does.** On: The connector's HPD pin is polled; unplugging takes the head offline in macOS, plugging reads the display, lights or wakes the pipe and brings the head back, and the head exists (offline) when no monitor was there at boot. `1` only logs what the pin does. Verified on the card 2026-10-05 (`docs/second-pipe.md`), and on 2026-10-06 on the other HDMI connector and through a 10-minute display sleep. A display unplugged from one HDMI connector and plugged into the other gets the pipe moved to it (verified on the card 2026-10-06, in both directions, at 60 and at 144 Hz). |
 | `rdna4-dptrain=1` | Diagnostic for a DisplayPort boot display: log what the monitor can do and which link the firmware trained, watch its HPD pin, and log the link's state when the monitor comes back. The kext does not retrain that link, because the firmware keeps it itself (card, 2026-10-06: it retrains within two seconds of the pin returning). `2` also runs the kext's own training on that link once, 15 s after the desktop is up (`src/dptrain.cpp`, as amdgpu trains): on the card that day, 4 lanes at HBR2 trained and the video was back 0.57 s after the link was taken down. |
@@ -124,7 +124,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-ihdump=1` | Read-only interrupt-delivery survey: OSSSYS IH ring state, per-OTG vertical-interrupt line config, PCI MSI/MSI-X capability words. Groundwork for real VBL interrupts. |
 | `rdna4-ih=1` | Enable the RDNA 4 IH v7 ring and PCI MSI completion path after the runtime's DMA setup. Runtime fences remain authoritative; a missing interrupt source falls back to bounded polling. Default off. |
 | `rdna4-pspdump=1` | Read-only PSP (security processor) survey: bootloader/sOS/GPCOM-ring status from the MPASP scratch registers. Publishes `PSP,Alive` / `PSP,SOSVersion`. Decides whether loading fresh firmware (e.g. a current DMUB) is viable. |
-| `rdna4-compute=<stage>` | Compute bring-up, written from scratch (`src/compute.cpp`), run after the display is answered for and never with a GPU reset. `1` = read-only survey: GFX (IMU/RLC/PFP/ME/MEC/MES), both SDMA engines, GC and MM hub apertures, PSP, HDP flush remap, and the VRAM window chosen for compute; published as the `Compute,Survey` dictionary. `2` = PSP bring-up on a background thread 5 s after the desktop: the secure-OS components through the PSP bootloader, the GPCOM command ring, `LOAD_TOC`, then the SMU firmware via `LOAD_IP_FW`, proven by the SMU answering its mailbox; published as `Compute,PSP` and `Compute,Stage`. `3` = the 19 GC firmware images through the PSP and the RLC autoload (`Compute,GFX`). `4` = GC hub for VMID0, SDMA0 queue, a WRITE and a 1 MiB fill checked by the CPU (`Compute,SDMA`). `5` = a MEC compute queue programmed directly (no MES), fed through its doorbell, running PM4: the scratch-register ring test, WRITE_DATA and a RELEASE_MEM fence (`Compute,MEC`). `6` = a real gfx1201 kernel (`shaders/probe.s`) dispatched on the compute units, all 256 results checked (`Compute,Dispatch`). `7` = a clang-built kernel (`shaders/vadd.cl`) launched from its AMDGPU code object: the loader (`src/codeobj.cpp`) finds the kernel and its descriptor, the dispatch uses the compiled RSRC1/2/3 and a kernarg buffer, and 4096 results of `c = a + 3b` are checked (`Compute,Kernel`). After stage 6 or 7 the runtime is published for user space (see *User-space compute*). Each step leaves a breadcrumb in NVRAM (`4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail`) so a hang names the step. Needs the linux-firmware blobs in `firmware/amdgpu/` at build time (`tools/fetch-firmware.sh`). |
+| `rdna4-compute=<stage>` | Compute bring-up, written from scratch (`src/compute.cpp`), run after the display is answered for and never with a GPU reset. `1` = read-only survey: GFX (IMU/RLC/PFP/ME/MEC/MES), both SDMA engines, GC and MM hub apertures, PSP, HDP flush remap, and the VRAM window chosen for compute; published as the `Compute,Survey` dictionary. `2` = PSP bring-up on a background thread 5 s after the desktop: the secure-OS components through the PSP bootloader, the GPCOM command ring, `LOAD_TOC`, then the SMU firmware via `LOAD_IP_FW`, proven by the SMU answering its mailbox; published as `Compute,PSP` and `Compute,Stage`. `3` = the 19 GC firmware images through the PSP and the RLC autoload (`Compute,GFX`). `4` = GC hub for VMID0, SDMA0 queue, a WRITE and a 1 MiB fill checked by the CPU (`Compute,SDMA`). `5` = a MEC compute queue programmed directly (no MES), fed through its doorbell, running PM4: the scratch-register ring test, WRITE_DATA and a RELEASE_MEM fence (`Compute,MEC`). `6` = a real gfx1201 kernel (`src/shaders/probe.s`) dispatched on the compute units, all 256 results checked (`Compute,Dispatch`). `7` = a clang-built kernel (`src/shaders/vadd.cl`) launched from its AMDGPU code object: the loader (`src/codeobj.cpp`) finds the kernel and its descriptor, the dispatch uses the compiled RSRC1/2/3 and a kernarg buffer, and 4096 results of `c = a + 3b` are checked (`Compute,Kernel`). After stage 6 or 7 the runtime is published for user space (see *User-space compute*). Each step leaves a breadcrumb in NVRAM (`4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail`) so a hang names the step. Needs the linux-firmware blobs in `firmware/amdgpu/` at build time (`tools/build/fetch-firmware.sh`). |
 | `rdna4-fakeedid=0` | `VMTEST=1` builds only: they serve the Lenovo fixture EDID and enable `rdna4-modeset` by default (so the mode list can be checked in a VM whose OpenCore pins boot-args); `=0` turns either off. |
 | `-rdna4dbg` | Lilu debug logging for the plugin (Lilu DEBUG builds). |
 
@@ -168,9 +168,9 @@ monitor really sleeps, and wakes it with a mode set to the running timing
 | `src/runtime.cpp`, `src/gpuheap.{hpp,cpp}` | The user-space compute runtime: a 4 KiB-granule VRAM heap, buffers and programs per connection, synchronous dispatches on the MEC queue, hung-queue detection. The heap is host-tested. |
 | `src/userclient.{hpp,cpp}` | `RDNA4ComputeService` (published once stage 6/7 finished) and `RDNA4ComputeClient`, the IOUserClient that checks each call and hands it to the runtime. Root only. |
 | `include/rdna4compute.h` | The user-space ABI: selectors, scalar/struct shapes, the dispatch struct. Shared by the kext and user space. |
-| `shaders/bench.cl`, `src/bench_codeobj.h` | `lds_reverse` (LDS + barrier test), `copy` (VRAM bandwidth), a tiled `sgemm` (64x64 tiles through LDS), the matrix units (`wmma16`, `hgemm`, `bf16gemm`), and the affine/scaled `mandelbrot` and `mandelbrot_zoom` kernels, one clang-built code object used by `rdna4-run`. |
-| `userspace/librdna4.{h,c}`, `userspace/rdna4-run.c` | C library over the user client, including synchronous and queued Present/Restore display ownership, and `rdna4-run` (`info`, `selftest`, `bench`, `show`, `anim`, `load`). Built with the kext (`build/rdna4-run`). |
-| `shaders/probe.s`, `src/probe_kernel.h` | The stage-6 test kernel (gfx1201 assembly) and its machine code, generated by `tools/build-shaders.sh` with upstream LLVM. |
+| `src/shaders/bench.cl`, `src/bench_codeobj.h` | `lds_reverse` (LDS + barrier test), `copy` (VRAM bandwidth), a tiled `sgemm` (64x64 tiles through LDS), the matrix units (`wmma16`, `hgemm`, `bf16gemm`), and the affine/scaled `mandelbrot` and `mandelbrot_zoom` kernels, one clang-built code object used by `rdna4-run`. |
+| `userspace/rdna4-run/librdna4.{h,c}`, `userspace/rdna4-run/rdna4-run.c` | C library over the user client, including synchronous and queued Present/Restore display ownership, and `rdna4-run` (`info`, `selftest`, `bench`, `show`, `anim`, `load`). Built with the kext (`Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run`). |
+| `src/shaders/probe.s`, `src/probe_kernel.h` | The stage-6 test kernel (gfx1201 assembly) and its machine code, generated by `tools/gen/build-shaders.sh` with upstream LLVM. |
 | `src/ndrv.{hpp,cpp}` | Freestanding NDRV `csc` translator: mode list, video parameters, timings, current mode, connection, EDID blocks, DPMS, mode switch. Host-tested. |
 | `src/bochsvbe.{hpp,cpp}` | `VMTEST` only: mode switches on QEMU's `vmware-svga` through the Bochs VBE interface (the one OVMF's GOP uses on that card). |
 | `src/cursor.cpp` | The DCN hardware cursor behind the NDRV cursor calls (`rdna4-cursor=1`). |
@@ -184,19 +184,19 @@ monitor really sleeps, and wakes it with a mode set to the running timing
 | `src/dmub.hpp` | DMUB ring command ABI and builders for the VBIOS-family commands (transmitter control v1.7, set pixel clock v1.7, DIG encoder stream setup v1.5). |
 | `src/otgtiming.{hpp,cpp}` | EDID timing → DCN OTG register images, per amdgpu's `optc1_program_timing` (mode-set groundwork). |
 | `src/kmod_info.c` | kmod glue pointing at Lilu's plugin start/stop. |
-| `Lilu/` | Lilu submodule (v1.7.3), for the plugin headers and `plugin_start.cpp`. |
-| `tools/atomdump.cpp` | Host test harness: parsers against the real ROM and captured EDID fixtures, pipe discovery, DMUB payloads, the NDRV translator (`make test`). |
-| `tools/vm-opencore.sh`, `tools/vm-ocplist.py` | Build a development OpenCore disk for an OSX-KVM VM with AMDRadeonRDNA4 injected after Lilu. |
-| `tools/logs-ssh.sh` | Pull the AMDRadeonRDNA4 kernel log and registry properties from a macOS machine over SSH. |
-| `src/dptrain.{hpp,cpp}` | DisplayPort link training (clock recovery, channel equalisation, retries), as amdgpu does it; everything the hardware and the monitor do comes through callbacks. Host-tested against `tools/dp_train_linux.inc`. |
+| `lib/Lilu/` | Lilu submodule (v1.7.3), for the plugin headers and `plugin_start.cpp`. |
+| `test/atomdump.cpp` | Host test harness: parsers against the real ROM and captured EDID fixtures, pipe discovery, DMUB payloads, the NDRV translator (`make test`). |
+| `tools/vm/vm-opencore.sh`, `tools/vm/vm-ocplist.py` | Build a development OpenCore disk for an OSX-KVM VM with AMDRadeonRDNA4 injected after Lilu. |
+| `tools/vm/logs-ssh.sh` | Pull the AMDRadeonRDNA4 kernel log and registry properties from a macOS machine over SSH. |
+| `src/dptrain.{hpp,cpp}` | DisplayPort link training (clock recovery, channel equalisation, retries), as amdgpu does it; everything the hardware and the monitor do comes through callbacks. Host-tested against `test/ref/dp_train_linux.inc`. |
 | `src/dpphy.{hpp,cpp}` | What training asks of DCN 4.01: the link encoder registers behind each training pattern and the DMUB transmitter commands (enable, lane drive, disable). Host-tested against the same reference. |
-| `src/n48n.{hpp,cpp}`, `src/vmtree.{hpp,cpp}` | The kernel half of the Vulkan driver's interface: one client's buffers, mappings, contexts, submitted work (what a command buffer may be, sequences, waits, when work counts as lost) and the display it may show pictures on, and its four-level page table. Freestanding. Host-tested, and run under the real driver with `tools/n48n-host/`. |
-| `src/n48nkext.cpp`, `include/rdna4vulkan.h` | That engine on the card: a user client of type `'N48N'` on the compute service (root only, one at a time), buffers from the runtime's VRAM heaps and from system memory, the client's page table in VRAM, its address space (number 8), its work on the kernel's graphics ring, its pictures on the boot display through the runtime's flip, and a copy test that has the GPU's copy engine work in that address space. Needs `rdna4-compute=7`, and `rdna4-gfx=2` to submit work; with `rdna4-vm=1` it takes an address space the runtime's clients do not hold (**verified on the card** 2026-10-07: the probes, and a Vulkan program presenting for two minutes beside the runtime's whole self-test, all rows PASS). A program whose shader faults loses its own device after ten seconds and the ring stays in service (`vkprobe <lib> fault`, verified 2026-10-07). **Verified on the card** (2026-10-06): the memory half and the copy test (`vulkan/n48nprobe.c`: all ok), and the driver's work through submit and wait: two fills by the command processor (the second was taken for a compute shader's until 2026-10-07, when a real one, a 252 KiB fill, first ran) and a triangle rendered into an image and read back (`vulkan/vkprobe.c`: done, all ok). and a picture on the boot display: a moving triangle for five seconds at 60 frames a second, the desktop back afterwards (`vkprobe ... show`) (`docs/vulkan-port.md` sections 8 to 10, `docs/todo-vulkantest.md`). |
-| `tools/n48n-host/` | Runs the real RADV driver, and the card test's program, on that engine on a Mac, with no kext: a library that answers their IOKit calls with it (`run.sh`). |
-| `vulkan/` | The RADV (Mesa Vulkan) port to macOS for this card, from Navi48-MacOS: five patches and the kernel interface they expect, two small patches of this repository's, a build script, and `n48nprobe.c`, the card test of the interface's memory half (`make n48nprobe`). On the card (2026-10-06) `n48nprobe` passes and the driver creates its device, runs two fills and renders a triangle through the kext, read back right (`vkprobe`: done, all ok). `vkprobe ... show` puts a picture on the boot display, 60 frames a second, and gives the desktop back (`docs/vulkan-port.md`). Since 2026-10-13 an eighth patch gives the driver swapchains on a headless surface, shown on that display, and `make vkcube` builds Khronos's loader and `vkcube` to run on it; both run on a host, **not on the card yet** (`docs/vulkan-port.md` section 12). |
-| `tools/cgmode.py` | On the test machine: list a display's modes and switch to any of them for the login session (Displays preferences hides most modes of a monitor it takes for a television). |
-| `tools/pipegen/` | Runs Linux's own DCN 4.01 display code on the host against a recorder: generates `src/pipe2_linux*.inc` and the DisplayPort references `tools/dp_retime_linux.inc` (a mode switch) and `tools/dp_train_linux.inc` (link training against simulated monitors) (`run.sh <linux tree>`). |
-| `tools/linux-capture.sh` | Ground-truth capture of amdgpu's display programming on Linux, for the mode-set engine. |
+| `src/n48n.{hpp,cpp}`, `src/vmtree.{hpp,cpp}` | The kernel half of the Vulkan driver's interface: one client's buffers, mappings, contexts, submitted work (what a command buffer may be, sequences, waits, when work counts as lost) and the display it may show pictures on, and its four-level page table. Freestanding. Host-tested, and run under the real driver with `test/n48n-host/`. |
+| `src/n48nkext.cpp`, `include/rdna4vulkan.h` | That engine on the card: a user client of type `'N48N'` on the compute service (root only, one at a time), buffers from the runtime's VRAM heaps and from system memory, the client's page table in VRAM, its address space (number 8), its work on the kernel's graphics ring, its pictures on the boot display through the runtime's flip, and a copy test that has the GPU's copy engine work in that address space. Needs `rdna4-compute=7`, and `rdna4-gfx=2` to submit work; with `rdna4-vm=1` it takes an address space the runtime's clients do not hold (**verified on the card** 2026-10-07: the probes, and a Vulkan program presenting for two minutes beside the runtime's whole self-test, all rows PASS). A program whose shader faults loses its own device after ten seconds and the ring stays in service (`vkprobe <lib> fault`, verified 2026-10-07). **Verified on the card** (2026-10-06): the memory half and the copy test (`userspace/vulkan/n48nprobe.c`: all ok), and the driver's work through submit and wait: two fills by the command processor (the second was taken for a compute shader's until 2026-10-07, when a real one, a 252 KiB fill, first ran) and a triangle rendered into an image and read back (`userspace/vulkan/vkprobe.c`: done, all ok). and a picture on the boot display: a moving triangle for five seconds at 60 frames a second, the desktop back afterwards (`vkprobe ... show`) (`docs/vulkan-port.md` sections 8 to 10, `docs/todo-vulkantest.md`). |
+| `test/n48n-host/` | Runs the real RADV driver, and the card test's program, on that engine on a Mac, with no kext: a library that answers their IOKit calls with it (`run.sh`). |
+| `userspace/vulkan/` | The RADV (Mesa Vulkan) port to macOS for this card, from Navi48-MacOS: five patches and the kernel interface they expect, two small patches of this repository's, a build script, and `n48nprobe.c`, the card test of the interface's memory half (`make n48nprobe`). On the card (2026-10-06) `n48nprobe` passes and the driver creates its device, runs two fills and renders a triangle through the kext, read back right (`vkprobe`: done, all ok). `vkprobe ... show` puts a picture on the boot display, 60 frames a second, and gives the desktop back (`docs/vulkan-port.md`). Since 2026-10-13 an eighth patch gives the driver swapchains on a headless surface, shown on that display, and `make vkcube` builds Khronos's loader and `vkcube` to run on it; both run on a host, **not on the card yet** (`docs/vulkan-port.md` section 12). |
+| `tools/rig/cgmode.py` | On the test machine: list a display's modes and switch to any of them for the login session (Displays preferences hides most modes of a monitor it takes for a television). |
+| `tools/gen/pipegen/` | Runs Linux's own DCN 4.01 display code on the host against a recorder: generates `src/pipe2_linux*.inc` and the DisplayPort references `test/ref/dp_retime_linux.inc` (a mode switch) and `test/ref/dp_train_linux.inc` (link training against simulated monitors) (`run.sh <linux tree>`). |
+| `tools/linux/linux-capture.sh` | Ground-truth capture of amdgpu's display programming on Linux, for the mode-set engine. |
 | `Info.plist` | Lilu plugin personality (`IOResources`), OSBundleLibraries (Lilu, IOPCIFamily, KPIs). |
 | `Makefile` | Cross-compiles x86_64 on any host, assembles the `.kext`. |
 
@@ -211,16 +211,16 @@ then `ld.lld -shared`), dispatch a kernel over a 3-D grid and wait for it.
 Buffers and programs belong to the connection and are freed when it closes.
 
 ```sh
-sudo build/rdna4-run info                     # stage, heap size and free space
-sudo build/rdna4-run selftest [items]         # vadd and an LDS/barrier kernel, every result checked
-sudo build/rdna4-run bench [small]            # host<->GPU MB/s, VRAM GB/s, SGEMM GFLOPS, each vs the
+sudo ./rdna4-run       info                     # stage, heap size and free space
+sudo ./rdna4-run       selftest [items]         # vadd and an LDS/barrier kernel, every result checked
+sudo ./rdna4-run       bench [small]            # host<->GPU MB/s, VRAM GB/s, SGEMM GFLOPS, each vs the
                                               # CPU (memcpy; Accelerate's cblas_sgemm, weak-linked),
                                               # then FP16/BF16 GEMM on the matrix units (WMMA)
-sudo build/rdna4-run show [seconds]           # render a Mandelbrot into a device buffer, present it,
+sudo ./rdna4-run       show [seconds]           # render a Mandelbrot into a device buffer, present it,
                                               # CPU-check 64 spread pixels, then restore the desktop;
                                               # VM runs use scale 4 and real hardware uses scale 1
-sudo build/rdna4-run anim [seconds]          # double-buffered zoom with async presents and FPS stats
-sudo build/rdna4-run load k.hsaco my_kernel   # load a code object, describe a kernel
+sudo ./rdna4-run       anim [seconds]          # double-buffered zoom with async presents and FPS stats
+sudo ./rdna4-run       load k.hsaco my_kernel   # load a code object, describe a kernel
 ```
 
 `rdna4_display_query`, `rdna4_present`, `rdna4_present_async`,
@@ -233,7 +233,7 @@ client close, buffer free, or the 30-second idle timeout returns the recorded
 desktop surface. The flip hardware operations are serialized with the runtime
 lock and do not write boot trails after bring-up.
 
-From C, `userspace/librdna4.h`:
+From C, `userspace/rdna4-run/librdna4.h`:
 
 ```c
 rdna4_t gpu;              rdna4_open(&gpu);
@@ -265,22 +265,60 @@ Limits for now:
 - A dispatch that misses its timeout marks the runtime wedged until reboot,
   because there is no queue reset yet.
 
+## Where things are
+
+| Directory | What |
+|---|---|
+| `src/` | The kext. `src/shaders/` has the sources of the GPU test kernels whose machine code is committed beside them; `src/kext.mk` builds the objects. |
+| `include/` | The kext's interface to user space, shared by both sides. |
+| `userspace/` | Programs that use that interface: `rdna4-run/` (the compute runtime's client and its library) and `vulkan/` (the RADV port and its test programs). |
+| `test/` | Host tests, run by `make test`; `test/ref/` holds the tables taken from Linux that they compare against. |
+| `tools/` | Development scripts by purpose (`tools/README.md`). |
+| `emu/` | The emulated card: a QEMU device and the EFI driver of its option ROM. |
+| `firmware/` | Where fetched firmware goes; nothing of it is in the repository (`firmware/README.md`). |
+| `lib/` | The submodules: Lilu and MacKernelSDK. |
+| `docs/` | Notes, plans and the records of the card tests. |
+| `Build/` | Everything that is built (not in the repository). |
+
 ## Building
 
-Clone with the submodule (`git clone --recursive`, or
-`git submodule update --init` in an existing checkout).
+Clone with the submodules (`git clone --recursive`, or
+`git submodule update --init` in an existing checkout; they are in `lib/`).
 
 ```sh
-make            # -> build/AMDRadeonRDNA4.kext  (x86_64, min macOS 11)
-make test       # host-side tests: parsers against the real ROM and EDID
-                # fixtures, pipe discovery, DMUB payloads, NDRV translator
-make clean
+tools/build/fetch-firmware.sh   # once: AMD's firmware for the compute bring-up, into firmware/amdgpu/
+make                    # the kext and the programs for the test machine (x86_64, min macOS 11)
+make CONFIG=DEBUG       # the same, unoptimised and with DEBUG defined
+make test               # host-side tests: parsers, EDID fixtures, pipe discovery, DMUB payloads,
+                        # NDRV translator, the engines; with a ROM dump (firmware/README.md) also
+                        # the AtomBIOS and IP discovery checks
+make clean              # what make built; the Mesa tree of `make mesa` stays (make distclean: all of Build/)
 ```
+
+Everything that is built goes to `Build/`, and what is meant to be used goes to one directory per
+version and configuration:
+
+```
+Build/AMDRadeonRDNA4-<version>-RELEASE/AMDRadeonRDNA4.kext
+Build/AMDRadeonRDNA4-<version>-RELEASE/bin/    rdna4-run, n48nprobe, diagnostic-log.sh; with Mesa built
+                                              (make mesa) also libvulkan_radeon.dylib, vkprobe and swapprobe;
+                                              make vkcube adds Khronos's vkcube, their loader and the manifest
+Build/AMDRadeonRDNA4-<version>-DEBUG/...       make CONFIG=DEBUG
+Build/vmtest/AMDRadeonRDNA4-<version>-.../     make VMTEST=1
+```
+
+`make product-dir` prints that directory for the configuration it is given. `RELEASE` (`-Os`) is the
+default and what every card test up to 0.1.0 ran; `DEBUG` (`-O0`, `DEBUG` defined) has not run on the card.
+
+The `Makefile` (and `src/kext.mk`, which it runs for the kext's objects) keep to what GNU make, from the
+3.81 that macOS ships, and BSD make (`bmake`) both understand. `AMDRadeonRDNA4.xcodeproj` is a front for
+it: its targets run `make` (Debug and Release are `CONFIG=DEBUG` and `CONFIG=RELEASE`), and it shows the
+directories as they are on disk, so there is no second list of sources or flags to keep in step.
 
 Verify the output:
 
 ```sh
-file build/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4   # Mach-O 64-bit kext bundle x86_64
+file "$(make -s product-dir)"/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4   # Mach-O 64-bit kext bundle x86_64
 ```
 
 ### Building on Linux / WSL (osxcross)
@@ -291,18 +329,18 @@ LLVM's `ld64.lld` cannot emit kext bundles, but Apple's ld64 can: build an
 `libkmodc++.a`), then:
 
 ```sh
-tools/build-osxcross.sh            # -> build/AMDRadeonRDNA4.kext
-tools/build-osxcross.sh VMTEST=1   # -> build-vmtest/AMDRadeonRDNA4.kext
-make test                          # host tests need only clang++
+tools/build/build-osxcross.sh            # -> Build/AMDRadeonRDNA4-<version>-RELEASE/
+tools/build/build-osxcross.sh VMTEST=1   # -> Build/vmtest/AMDRadeonRDNA4-<version>-RELEASE/
+make test                                # host tests need only clang and clang++
 ```
 
 On Windows checkouts without symlink support, Lilu's header symlinks become
-text files; the Makefile copies the real headers into `build*/liluhdr` first.
+text files; the Makefile copies the real headers into `Build/liluhdr` first.
 
 ## Installing (OpenCore)
 
 1. Use **Lilu 1.7.1 or newer** (older Lilu disables itself on macOS 26).
-2. Copy `build/AMDRadeonRDNA4.kext` to `EFI/OC/Kexts/` and add a `Kernel → Add`
+2. Copy `Build/AMDRadeonRDNA4-<version>-RELEASE/AMDRadeonRDNA4.kext` to `EFI/OC/Kexts/` and add a `Kernel → Add`
    entry **after Lilu**:
 
    | Key | Value |
@@ -341,8 +379,8 @@ Bochs VBE interface. With an [OSX-KVM](https://github.com/kholia/OSX-KVM)
 guest:
 
 ```sh
-tools/build-osxcross.sh VMTEST=1
-tools/vm-opencore.sh --kext build-vmtest/AMDRadeonRDNA4.kext --lilu ~/kexts/Lilu.kext
+tools/build/build-osxcross.sh VMTEST=1
+tools/vm/vm-opencore.sh --kext "$(make -s product-dir VMTEST=1)"/AMDRadeonRDNA4.kext --lilu ~/kexts/Lilu.kext
 ```
 
 `vm-opencore.sh` starts from the stock `OpenCore/OpenCore.qcow2` and writes
@@ -352,7 +390,7 @@ Lilu, and a 1920x1080 console (`--resolution`; the fixture is a 1080p
 monitor, and its modes are only published when the console matches its
 preferred timing). Boot QEMU with that image; QEMU keeps an image open until
 it restarts. With Remote Login on and a key authorised,
-`REMOTE_USER=<account> tools/logs-ssh.sh` pulls the AMDRadeonRDNA4 log and registry
+`REMOTE_USER=<account> tools/vm/logs-ssh.sh` pulls the AMDRadeonRDNA4 log and registry
 properties back.
 
 ### Emulated RX 9070 XT (no card needed, no VMTEST shortcuts)
@@ -365,7 +403,7 @@ real code paths in the same OSX-KVM VM:
   aperture plus MM_INDEX/MM_DATA access to the top of VRAM (where the IP
   discovery copy sits), a BAR5 register file loaded from
   `emu/qemu/gop-state.txt` (the state the GOP leaves; same format as
-  `tools/linux-capture.sh` register dumps — the current file is synthesized,
+  `tools/linux/linux-capture.sh` register dumps — the current file is synthesized,
   a real capture drops in), and live engines for what the kext polls: OTG
   frame counter, DC_I2C with an EDID on HDMI line 2, DP AUX with nothing
   attached, RCC_CONFIG_MEMSIZE. The QEMU console scans out whatever the
@@ -375,19 +413,19 @@ real code paths in the same OSX-KVM VM:
   (OVMF skips the legacy image, the kext reads it as on hardware).
 
 ```sh
-tools/emu-build.sh        # QEMU 10.0.13 + device, edk2 BaseTools + GOP driver, build-emu/rdna4.rom
-tools/vm-opencore.sh --kext build/AMDRadeonRDNA4.kext --lilu ~/kexts/Lilu.kext \
+tools/vm/emu-build.sh        # QEMU 10.0.13 + device, edk2 BaseTools + GOP driver, Build/emu/rdna4.rom
+tools/vm/vm-opencore.sh --kext "$(make -s product-dir)"/AMDRadeonRDNA4.kext --lilu ~/kexts/Lilu.kext \
     --out OpenCore-emu.qcow2 --args "-v keepsyms=1 debug=0x100 serial=3 rdna4-trace=1"
-tools/emu-boot.sh         # the VM on the emulated card (VNC :0, serial ~/tahoe-serial.log)
+tools/vm/emu-boot.sh         # the VM on the emulated card (VNC :0, serial ~/tahoe-serial.log)
 ```
 
-On Linux, `tools/emu-linux.sh <boot 0-7> [--diag]` dry-runs a real-card boot (macOS Recovery, headless,
+On Linux, `tools/vm/emu-linux.sh <boot 0-7> [--diag]` dry-runs a real-card boot (macOS Recovery, headless,
 kernel log and the diagnostic table saved per run): see `docs/emu-linux.md`.
 
-`tools/emu-boot.sh trace=on` logs every BAR5 access to the QEMU log. The
+`tools/vm/emu-boot.sh trace=on` logs every BAR5 access to the QEMU log. The
 `ih-dead=on` device option leaves IH ring writebacks enabled while suppressing
 MSI delivery, which exercises the runtime's polling fallback. The same option
-can be passed to `tools/vm-test.sh` alongside `rdna4-ih=1`. The
+can be passed to `tools/vm/vm-test.sh` alongside `rdna4-ih=1`. The
 device sits on the root bus: behind a `pcie-root-port`, macOS's PCI
 configurator closed the port's windows at boot. The QEMU device is
 GPL-2.0-or-later (QEMU's license) and the GOP driver BSD-2-Clause-Patent
@@ -419,7 +457,7 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    display command tables — only `asic_init` survives;
    `setpixelclock`/`dig1transmittercontrol` are absent because DCN 3.1+ moved
    that work to DMUB firmware mailbox commands. The DMUB payloads are built
-   and host-tested (`src/dmub.hpp`); `tools/linux-capture.sh` records what
+   and host-tested (`src/dmub.hpp`); `tools/linux/linux-capture.sh` records what
    amdgpu programs on the same card as ground truth. **First run on the
    card 2026-10-04** (HDMI boot display, 1920x1080 to 1600x900): the GOP's
    DMUB firmware (version 0x0000e840, read over GPINT) takes the mainline
@@ -508,7 +546,7 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       2026-10-04, Big Sur 11.6.6): the kext lights a second pipe for an
       HDMI monitor next to the DisplayPort boot display and macOS extends
       the desktop onto it. The register sequence is generated from Linux's
-      own DCN 4.01 code by `tools/pipegen` (`src/pipe2.cpp`). One
+      own DCN 4.01 code by `tools/gen/pipegen` (`src/pipe2.cpp`). One
       configuration: HDMI on HPD3 / link 2 at 1920x1080@60. Display
       sleep and wake reach it too (verified on hardware 2026-10-05).
 - [x] Mode switching on the second display (`rdna4-modeset=1` with
@@ -522,7 +560,7 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       the 4K boot display, picture confirmed, measured 119.971 and
       144.012 Hz): each switch also programs what Linux's DML computes
       for the mode (request timing, DET size, global sync), generated
-      per mode by `tools/pipegen` (`tools/pipegen/modes.txt`). Display
+      per mode by `tools/gen/pipegen` (`tools/gen/pipegen/modes.txt`). Display
       sleep and wake ran at 144 Hz too (picture confirmed 2026-10-06,
       after a 12-minute sleep).
 - [x] Hot-plug of the second display (`rdna4-hotplug=2` with
@@ -557,7 +595,7 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       host: `src/dptrain.cpp` trains a link through callbacks and
       `make test` holds its DPCD transfers, patterns, lane drive and
       delays against Linux's own code run on ten simulated monitors
-      (`tools/pipegen`'s `dplink` scenario), and `src/dpphy.cpp`'s
+      (`tools/gen/pipegen`'s `dplink` scenario), and `src/dpphy.cpp`'s
       registers and transmitter commands against what Linux writes on
       the way. For the boot display it turned out not to be needed:
       the firmware retrains that link itself (seen on the card
@@ -578,7 +616,7 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       2026-10-04, Big Sur 11.6.6: 3840x2160 to 2560x1440, picture
       confirmed; `rdna4-modeset=1`). The plan's register writes are held
       against what Linux's own functions write for the same retime
-      (`tools/dp_retime_linux.inc`).
+      (`test/ref/dp_retime_linux.inc`).
 - [x] Hardware cursor through the NDRV cursor path (`rdna4-cursor=1`,
       off by default; `docs/HANDOFF-linux.md`)
 - [ ] Acceleration / Metal

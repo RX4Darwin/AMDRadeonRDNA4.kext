@@ -14,7 +14,7 @@
 //
 //  Freestanding: register reads go through a caller-supplied function, so
 //  the host test harness can run discovery against synthetic register
-//  images. Shared by the kext and tools/atomdump.cpp.
+//  images. Shared by the kext and test/atomdump.cpp.
 //
 
 #ifndef Pipe_hpp

@@ -139,7 +139,7 @@ public:
 	void _RESERVEDIOPCIDevice20() APPLE_KEXT_OVERRIDE {}
 	void _RESERVEDIOPCIDevice21() APPLE_KEXT_OVERRIDE {}
 
-	// The slots Tahoe's IOPCIDevice has beyond MacKernelSDK's header (the header calls them reserved): see patchVtable() and tools/m0/check-vtable.py.
+	// The slots Tahoe's IOPCIDevice has beyond MacKernelSDK's header (the header calls them reserved): see patchVtable() and tools/metal/m0/check-vtable.py.
 	UInt32 tahoeConfigRead(UInt32 width, UInt8 offset);
 	void tahoeConfigWrite(UInt32 width, UInt8 offset, UInt32 data);
 	IOReturn tahoeDeviceMemoryRead(UInt8 bar, UInt64 offset, void *data, UInt8 size);

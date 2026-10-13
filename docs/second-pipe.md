@@ -18,7 +18,7 @@ The levels are a ladder, so that each boot answers one question:
 | `rdna4-head2` | What happens | What it shows |
 |---|---|---|
 | 1 | Phantom head only, as before. | macOS takes a second display. |
-| 2 | The plan is built and every step is published with the register's value now and after (`AMDRadeonRDNA4,Pipe2` in the registry, and in `tools/diagnostic-log.sh`). **Nothing is written.** | What the firmware left in the dormant pipe; whether the requirements hold. |
+| 2 | The plan is built and every step is published with the register's value now and after (`AMDRadeonRDNA4,Pipe2` in the registry, and in `tools/rig/diagnostic-log.sh`). **Nothing is written.** | What the firmware left in the dormant pipe; whether the requirements hold. |
 | 3 | The stream only: clock, timing generator, encoder, PHY. No plane. Afterwards the survey of what the plane would still change is published. | The monitor wakes and shows a solid teal-blue. The DMUB commands work for a pipe the firmware never lit. |
 | 4 | Stream and plane. | The monitor shows the second desktop. |
 
@@ -27,7 +27,7 @@ second monitor answering on DDC there is no second head at all (an invisible dis
 
 ## 2. Where the sequence comes from
 
-Not from reading Linux and typing it in. `tools/pipegen` compiles amdgpu's display core as a host program and runs
+Not from reading Linux and typing it in. `tools/gen/pipegen` compiles amdgpu's display core as a host program and runs
 it [F]:
 
 - `pipegen.c` includes `dc/resource/dcn401/dcn401_resource.c` for Linux's own register tables and block constructors,
@@ -45,7 +45,7 @@ it [F]:
 pixel clock for OTG1 on PLL 2, stream setup for DIG2 twice as Linux sends it, transmitter enable for link 2), the
 surface address, and the lit pipe's VM aperture.
 
-Regenerate with `tools/pipegen/run.sh <linux tree>`; the script says which sparse checkout is enough. The checked-in
+Regenerate with `tools/gen/pipegen/run.sh <linux tree>`; the script says which sparse checkout is enough. The checked-in
 table is from Linux `6addb4f38557` and has 402 entries.
 
 ## 3. What keeps it off the lit pipe
@@ -58,7 +58,7 @@ table is from Linux `6addb4f38557` and has 402 entries.
 - **Names.** `mkinc.py` refuses a table in which any register is not one of pipe 1's, DIG2's or link 2's by its Linux
   name, or one of six shared registers, and then only the listed bits. Where Linux writes a shared register whole
   (`MPC_OUT_CSC_COEF_FORMAT`), the step is narrowed to this pipe's bit.
-- **Layout.** `testPipe2` in `tools/atomdump.cpp` checks the built plan again, by block address and stride instead of
+- **Layout.** `testPipe2` in `test/atomdump.cpp` checks the built plan again, by block address and stride instead of
   by name. Planting a write to OPP0's output mux or a whole write of `DENTIST_DISPCLK_CNTL` fails it.
 - **Requirements.** Before the first write the plan checks that OTG1 is not running, DIG2's front-end and back-end are
   off, MPCC1 feeds no OPP, and the IP request window is open. If the firmware lit this pipe after all, nothing is
@@ -105,7 +105,7 @@ Departures:
 
 ## 5. Reading a card log
 
-Boot `rdna4-head2=2` first. In `tools/diagnostic-log.sh` output, under "second head and second pipe":
+Boot `rdna4-head2=2` first. In `tools/rig/diagnostic-log.sh` output, under "second head and second pipe":
 
 - `pipe2: DET segments a b c d of 21: 4 for the plane fit` — the DET budget.
 - `pipe2: N require ...` lines — each requirement with the register's value; `(not so now)` means level 3 would refuse.
@@ -133,7 +133,7 @@ Escape: remove the boot-arg. The plan has no undo; a reboot restores the firmwar
   card 2026-10-06: lit at boot, 144 Hz, display sleep and wake), and for DisplayPort DIG0 and link 0 for HPD1
   (`src/pipe2_linux_dp1.inc`) and DIG1 and link 1 for HPD2 (`src/pipe2_linux_dp2.inc`). The two DisplayPort ones
   are host-tested like the others and not yet run on the card. The plan is picked by the connector the second display
-  answers on (`Pipe2::use`). Another board, or another mode to start in, needs `tools/pipegen/run.sh` run with other
+  answers on (`Pipe2::use`). Another board, or another mode to start in, needs `tools/gen/pipegen/run.sh` run with other
   arguments. Once lit the pipe can change mode (below) and move between the two HDMI connectors (hot-plug, below).
 - An HDMI mode above 340 MHz needs the table regenerated for it (the generator then turns the scrambler on by
   itself).
@@ -149,7 +149,7 @@ rectangle, unblank. Then the AVI infoframe is sent again for the new timing (VIC
 checksum; `testPipe2` holds the words against what Linux sends for five modes). Display sleep and wake follow the
 running mode's pixel clock and infoframe.
 
-What else changes with the mode comes from Linux too (verified on the card 2026-10-05, section 7). `tools/pipegen/run.sh` runs the generator once for each timing in `tools/pipegen/modes.txt`,
+What else changes with the mode comes from Linux too (verified on the card 2026-10-05, section 7). `tools/gen/pipegen/run.sh` runs the generator once for each timing in `tools/gen/pipegen/modes.txt`,
 with the plane on the lit mode's surface, and `mkinc.py` keeps the registers Linux leaves different from mode to
 mode: 34 of them for the 15 modes of the test rig's Lenovo. They are the HUBP's request timing from DML (DLG, TTU,
 `REF_FREQ_TO_PIX_FREQ`), the DET size (2 to 7 segments), `VSTARTUP`, `VUPDATE`, `VREADY` and the timing itself. The

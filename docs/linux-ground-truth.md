@@ -17,7 +17,7 @@ never writes to the GPU.
   `amdgpu_regs` / `amdgpu_vram` are refused under `lockdown=confidentiality`).
 - Optional: `vkcube` (package `vulkan-tools`) for the 3D capture.
 - This repository on the machine (clone the `private` remote, branch
-  `premetal/int`), or just copy the two scripts in `tools/`.
+  `premetal/int`), or just copy the two scripts in `tools/linux/`.
 
 ## The captures (about 5 minutes in total)
 
@@ -27,18 +27,18 @@ that AMDRadeonRDNA4 drives (the HDMI output of the RX 9070 XT):
 1. **Desktop idle, mouse pointer visible on screen** (move it into the middle of
    the screen first, then leave the mouse alone):
 
-       sudo bash tools/linux-groundtruth.sh idle
-       sudo bash tools/linux-capture.sh --snap-only
+       sudo bash tools/linux/linux-groundtruth.sh idle
+       sudo bash tools/linux/linux-capture.sh --snap-only
 
 2. **A 3D app on screen**: start `vkcube` (keep its window visible), then in a
    second terminal:
 
-       sudo bash tools/linux-groundtruth.sh vkcube
+       sudo bash tools/linux/linux-groundtruth.sh vkcube
 
 3. Optional, only if ROCm or an OpenCL runtime is installed: start any compute
    job (e.g. `clinfo` in a loop, or a ROCm sample) and run
 
-       sudo bash tools/linux-groundtruth.sh compute
+       sudo bash tools/linux/linux-groundtruth.sh compute
 
 Each run leaves a `rdna4-groundtruth-<label>-<time>.tar.gz` (and
 `linux-capture.sh` an `rdna4-capture-<time>.tar.gz`). Copy all `.tar.gz` files

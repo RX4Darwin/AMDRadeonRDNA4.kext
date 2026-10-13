@@ -1,6 +1,6 @@
 # W12k: what amdgpu wraps around an application's gfx IB on this card
 
-Captured 2026-09-30 on the RX 9070 XT under Linux (`tools/linux-replay/ring-capture.sh`, debugfs,
+Captured 2026-09-30 on the RX 9070 XT under Linux (`tools/linux/linux-replay/ring-capture.sh`, debugfs,
 read-only). The raw ring and its decode are in `hw-logs/2026-09-30-linux-gfx-ring/`. Our own IB had
 already been overwritten: the desktop wraps the 2048-dword gfx ring within milliseconds. The kernel
 wraps every user gfx IB the same way, though, so this is the compositor's (VMID 5) most recent
@@ -28,7 +28,7 @@ submission.
 
 - **The IB packet**: `Pm4::indirectBufferGfx(addr, dwords, vmid)` already encodes exactly #11. What an
   app IB needs is a non-zero VMID; PRIV stays 0. The kext's own draw uses VMID 0.
-- **The IB contents**: `userspace/gfx12tri.h`. The replay proves those bytes on the card as an
+- **The IB contents**: `userspace/rdna4-run/gfx12tri.h`. The replay proves those bytes on the card as an
   unprivileged IB in a per-process VMID (`linux-replay.md`). They carry their own rings, CONTEXT_CONTROL,
   cache invalidation and end-of-pipe fence.
 - **VM**: the kext's clients have fixed VMIDs (8-15) programmed over MMIO at client creation (W36/W40).
@@ -125,10 +125,10 @@ forgot them would fault in its *own* VM (an unmapped address), not touch anyone 
 
 - **Kext boot self-test:** `rdna4-gfxclient=1` (with `rdna4-vm=1 rdna4-gfx=2`, not a probe boot if the result should be seen after park; it runs *before* park, after the G3 baseline passed): opens a synthetic client (internal token, own VMID
   and tables), maps two pool pages in it (IB, data), submits an IB of two `WRITE_DATA` packets to the data page twice, checks the data, the two per-client fences (`f2 = f1 + 1`) and that nothing is
-  pending afterwards; registry key `gfx-client` (`PASS ...` / `FAIL ...` / `SKIPPED ...`), `gfx-client` row in `tools/diagnostic-log.sh`, `AMDRadeonRDNA4: vmid N: submitted unprivileged gfx IB ...` and `gfx client self-test: ...` lines.
-- **Host tests:** `userspace/test-gfx12tri.c` (G3/G4 builders, the layout with a simulated allocator, refusals, the fact that the replay's stream and rdna4-run's differ only in relocated dwords, the image
-  check), `userspace/test-gfx12tricol.c`, `userspace/test-w12k-pm4.cpp` (the ring packets against amdgpu's captured IB packet and the emulator's acceptance rules). The IB bytes `rdna4-run tri` records are the ones
-  `tools/linux-replay` proves on the card through amdgpu (baseline and `REPLAY_VARIANT=4096` re-run: 8192 px).
+  pending afterwards; registry key `gfx-client` (`PASS ...` / `FAIL ...` / `SKIPPED ...`), `gfx-client` row in `tools/rig/diagnostic-log.sh`, `AMDRadeonRDNA4: vmid N: submitted unprivileged gfx IB ...` and `gfx client self-test: ...` lines.
+- **Host tests:** `test/test-gfx12tri.c` (G3/G4 builders, the layout with a simulated allocator, refusals, the fact that the replay's stream and rdna4-run's differ only in relocated dwords, the image
+  check), `test/test-gfx12tricol.c`, `test/test-w12k-pm4.cpp` (the ring packets against amdgpu's captured IB packet and the emulator's acceptance rules). The IB bytes `rdna4-run tri` records are the ones
+  `tools/linux/linux-replay` proves on the card through amdgpu (baseline and `REPLAY_VARIANT=4096` re-run: 8192 px).
 - **Emulator / macOS later:** `rdna4-run tri` / `tricol` on a booted kext with `rdna4-vm=1 rdna4-gfx=2` (no probe): `info` shows the GFX flag; `tri` prints `PASS tri: 8192 px ...`. For `tricol` the emulator refuses the draw (G4 is
   not modelled, `docs/g4-colour.md` section 7), so there `tricol` FAILs with 0 px by design.
 
@@ -151,7 +151,7 @@ The VMID an IB runs in comes from **one function**, `RDNA4Compute::vmidForSubmit
 `INDIRECT_BUFFER` (`gfxClientEmit`), the compute `INDIRECT_BUFFER` (`rtSubmitIb`) and the `SH_MEM_CONFIG/BASES` selection made for it. W13's VMID pool replaces the body later (a per-submission grab);
 nothing else in the submit paths names `c.vmid` for this purpose. No behaviour change.
 
-### Boot 8: clients on a live ring (tools/set-boot.sh, tools/diagnostic-log.sh)
+### Boot 8: clients on a live ring (tools/rig/set-boot.sh, tools/rig/diagnostic-log.sh)
 
 Boot 3 (probe) halts PFP/ME after its draws (`gfxPark`), so applications cannot draw there. **Boot 8** = boot 2 (`rdna4-ih=2 rdna4-flip=1 rdna4-hang=1 rdna4-vm=1 rdna4-vm-diag=4065 rdna4-vbl=1 rdna4-cursor=1`) +
 `rdna4-gfx=2 rdna4-gfxcol=1 rdna4-gfxclient=1`, **without** `rdna4-gfxprobe` / `rdna4-gfxdiag`, so the ring stays up after bring-up. Bring-up draws G3 and (after a passing baseline) G4, then runs the kernel's
@@ -163,7 +163,7 @@ synthetic client-IB self-test (`gfx-client`); the ring is not parked. `diagnosti
 Otherwise both rows are SKIPPED with the reason (gfx not enabled / probe boot / runtime unavailable / needs rdna4-vm=1).
 
 **Which binary the stick needs:** the script uses `$HERE/rdna4-run`, i.e. a file named `rdna4-run` **next to `diagnostic-log.sh`** (the stick root, where the script lives), copies it to `/tmp/rdna4-run` and runs
-that. For boot 8 it must be the `build/rdna4-run` of a build that contains `tri`/`tricol` and the new selectors (this branch's `make`/`tools/build-osxcross.sh` output); an older `rdna4-run` has no `tri` command and
+that. For boot 8 it must be the `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run` of a build that contains `tri`/`tricol` and the new selectors (this branch's `make`/`tools/build/build-osxcross.sh` output); an older `rdna4-run` has no `tri` command and
 would print its usage and exit non-zero (row FAIL). The kext on the stick must be built from the same tree (the selectors are new).
 
 **Expected on the emulator (Kiln's / the Windows dry run), boot 8:** `gfx` PASS (G3), `gfx-client` PASS (the self-test's WRITE_DATA IB in a client VMID is modelled by W12e), `gfx-app-info` implicit (the GFX line is

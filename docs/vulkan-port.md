@@ -11,7 +11,7 @@ Decided by Sunneva on 2026-10-06, after looking at https://github.com/Almosst-DE
 kext BSD 3-Clause; commit `69695975`):
 
 - **Take** its Vulkan driver port: five patches that make RADV, Mesa's Vulkan driver, run on macOS against this
-  card (`vulkan/`).
+  card (`userspace/vulkan/`).
 - **Use as a reference** its kernel-side way of giving a process its own GPU address space.
 - **Leave** its Metal bundle, its helper accelerator kext and its hooks into Apple's Radeon driver.
 
@@ -28,7 +28,7 @@ Mesa compiles the shaders.
 ## 2. What the port needs from a kext
 
 The patched RADV opens an IOKit user client (service `Navi48Bringup`, type `'N48N'`) and uses the calls in
-`vulkan/navi48_native_abi.h`, a close copy of the Linux amdgpu ioctls RADV uses.
+`userspace/vulkan/navi48_native_abi.h`, a close copy of the Linux amdgpu ioctls RADV uses.
 
 | Need | Their kext | This repository today | Gap |
 |---|---|---|---|
@@ -71,7 +71,7 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
 0. **Build the patched Mesa on a Mac and run its own tests.** Done 2026-10-06, section 6.
 1. **The interface in this kext, memory half**: connection, buffers, mapping into the process, the 4-level table
    with caller-chosen addresses, contexts. The engine, which needs no card: done 2026-10-06, section 7. Its
-   connection to the kext: section 8, **verified on the card 2026-10-06**: `build/n48nprobe` says "all ok", which
+   connection to the kext: section 8, **verified on the card 2026-10-06**: `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/n48nprobe` says "all ok", which
    includes a pattern the GPU's copy engine carried between three buffers at addresses the process chose.
 2. **Submit and wait** on the graphics queue in the client's address space, section 9. **Done on the card
    2026-10-06: `vkprobe` said "done: all ok"** for two fills by the command processor (the second was taken for a
@@ -98,14 +98,14 @@ Each step has something that shows it is done. Steps 0 and 1 need no card.
 
 ## 6. Step 0: the port builds and runs against its stand-in kext (2026-10-06)
 
-On an Apple-silicon Mac (macOS 26.5). `vulkan/build-mesa.sh <directory>` does all of it from an empty directory;
+On an Apple-silicon Mac (macOS 26.5). `userspace/vulkan/build-mesa.sh <directory>` does all of it from an empty directory;
 that script was run end to end.
 
 - Mesa at `f5cb8ee0` fetched; the five patches applied with `git am` without a conflict.
 - The AMD Vulkan driver alone builds, for arm64 and cross-built for x86_64, the card's machines.
 - **Two things in the build were tied to newer macOS, and neither is needed.** The port's own code opened its
   IOKit connection with a symbol that only exists from macOS 12 on: a driver built for macOS 11 would have read
-  through a null address there. `vulkan/mesa-patches/0006` replaces it (one line). And Mesa's window-system layer
+  through a null address there. `userspace/vulkan/mesa-patches/0006` replaces it (one line). And Mesa's window-system layer
   for macOS brings in Apple's Metal and two more macOS 12 symbols: the driver builds without that layer
   (`-Dplatforms=`), and the port presents through its own calls anyway.
 - The result, as the script builds it: `libvulkan_radeon.dylib`, x86_64, minimum macOS 11.0, no availability
@@ -115,7 +115,7 @@ that script was run end to end.
 - One defect left alone: with Mesa's tests switched on, two of its AMD tests fail to link, because the patches
   make `libamd_common` need IOKit and those tests do not ask for it. The driver is not affected; the script
   leaves the tests off.
-- `vulkan/vkprobe.c`, a small program that drives the driver through its entry point with no Vulkan loader, ran
+- `userspace/vulkan/vkprobe.c`, a small program that drives the driver through its entry point with no Vulkan loader, ran
   with `RADV_DARWIN_FAKE=1 RADV_DARWIN_MOCK=1` (Mesa's in-process stand-in for the kext, which checks arguments
   the way their kext does but runs nothing): the driver offers `AMD Radeon RX 9070 XT (RADV GFX1201)`, Vulkan
   1.4.363, heaps of 15448, 512 and 168 MiB (the stand-in's figures); device creation, a buffer with mapped
@@ -153,7 +153,7 @@ call has to enforce, argument by argument; it is the closest thing to a specific
   reference, none of it is copied. `Submit` and `WaitSeq` answer "unsupported" until step 2. Memory and registers
   come through a small backend interface, so the same code runs in the kext, in the host test and under the
   driver. Both files are compiled into the kext already; nothing there calls them yet.
-- `make test` (`testN48N` in `tools/atomdump.cpp`): what each call accepts and refuses (wrong sizes, a call before
+- `make test` (`testN48N` in `test/atomdump.cpp`): what each call accepts and refuses (wrong sizes, a call before
   `Hello`, buffers that are malformed or too large, mappings below the first address, across the seam of the
   address space, not canonical, over another mapping, past a buffer's end), buffer placement (the pool the CPU can
   reach, the other one only for a buffer the CPU need not touch, system memory within its caps), and what a
@@ -161,8 +161,8 @@ call has to enforce, argument by argument; it is the closest thing to a specific
   permissions asked for, system memory marked as such, uncached when the buffer says so. Freeing a buffer takes
   its mappings out of the table and flushes before the memory is given back; closing leaves nothing behind. Three
   planted faults were caught.
-- **The real driver on this engine**: `tools/n48n-host/run.sh <build directory>` inserts a small library into
-  `vulkan/vkprobe.c` that answers the driver's IOKit calls (find the service, open it, call a method, map a
+- **The real driver on this engine**: `test/n48n-host/run.sh <build directory>` inserts a small library into
+  `userspace/vulkan/vkprobe.c` that answers the driver's IOKit calls (find the service, open it, call a method, map a
   buffer) with the engine over ordinary memory. RADV's device creation, its ten buffers, eleven mappings, nine
   context calls and the CPU mapping of the program's buffer all go through `src/n48n.cpp` and succeed; the first
   connection closes with nothing left behind; `vkQueueSubmit` is refused at selector 7, as it must be for now.
@@ -204,11 +204,11 @@ per job.
 run **in the client's address space** and copies between two ranges the client mapped. That is how Linux runs a
 process's copy work, and it is the same idea step 2 needs on the graphics queue, tried first where a failure is
 easy to read. The kext looks both ranges up in the client's table before it lets the card try.
-`vulkan/n48nprobe.c` (`make n48nprobe`) uses it: a buffer of each kind, mapped at 4 GiB, at the top of the lower
+`userspace/vulkan/n48nprobe.c` (`make n48nprobe`) uses it: a buffer of each kind, mapped at 4 GiB, at the top of the lower
 half and in the upper half of the address space; a pattern written by the CPU, copied by the GPU from the first to
 the second to the third and back, and compared.
 
-Checked on a host: `make test` has the new packet against Linux's encoding; `tools/n48n-host/run.sh` runs
+Checked on a host: `make test` has the new packet against Linux's encoding; `test/n48n-host/run.sh` runs
 `n48nprobe` on the engine with the CPU standing in for the copy engine (all ok; a planted fault in the copy is
 caught) and then the real driver with the seventh patch, as before.
 
@@ -263,9 +263,9 @@ queues and the display are not involved.
 good one across two mappings handed over as given; the fence appearing only when the work has finished; a wait
 that gives up after exactly its timeout; a full queue and a ring with no room waited out; a buffer freed under
 work in flight; lost work noticed after 10 s, in the fifth 2 s wait, and what follows it. Four planted faults
-were caught. `tools/n48n-host/run.sh`: the real driver now gets through `vkQueueSubmit`, `vkWaitForFences`,
+were caught. `test/n48n-host/run.sh`: the real driver now gets through `vkQueueSubmit`, `vkWaitForFences`,
 `vkDeviceWaitIdle` and its teardown on the engine (the stand-in queue reports everything finished at once), and
-closes with nothing left behind. `vulkan/vkprobe.c` checks two fills, which only a GPU can make true.
+closes with nothing left behind. `userspace/vulkan/vkprobe.c` checks two fills, which only a GPU can make true.
 
 **On the card, 2026-10-06** (the boot of section 8; `vkprobe.txt`, no kernel log taken after it): the driver
 opened the interface, created its device and submitted twice; a 1024-byte fill by the command processor's own
@@ -304,12 +304,12 @@ path (`amd/native_s1b.cpp`, `amd/native_s1c_pure.h`, `amd/amdgpu_init.cpp`) and 
 
 The copy test of section 8 is there to tell a broken address space from a broken graphics queue.
 
-**The card boots, in order** (each needs the firmware in the build, `tools/fetch-firmware.sh`):
+**The card boots, in order** (each needs the firmware in the build, `tools/build/fetch-firmware.sh`):
 
 1. `rdna4-compute=7 rdna4-trace=1`: the bring-up's own results first (`compute:` lines, `runtime: PASS service
-   ready`), then `sudo build/n48nprobe`.
+   ready`), then `sudo Build/AMDRadeonRDNA4-<version>-RELEASE/bin/n48nprobe`.
 2. The same plus `rdna4-gfx=2`: `sudo ./vkprobe ./libvulkan_radeon.dylib`, with the library
-   from `vulkan/build-mesa.sh` copied over. `docs/real-card-plan.md` ran its graphics-ring boots with
+   from `userspace/vulkan/build-mesa.sh` copied over. `docs/real-card-plan.md` ran its graphics-ring boots with
    `rdna4-ih=2 rdna4-hang=1` as well.
 
 The guide for the card tests, with what to look for and what failure looks like: `docs/todo-vulkantest.md`.
@@ -346,7 +346,7 @@ when it is not to be had), seven kinds of buffer that cannot be shown (system me
 pitch, off a page, too small, off the buffer's end), three buffers and no fourth, a present and the status after
 it, a present refused after the plane changed shape, and the display given back by freeing the shown buffer, by a
 release and by the close. Five planted faults were caught, two of them only after the test's cases were made to
-check one rule each. `vulkan/vkprobe.c` has a `show` mode (a triangle sliding over a dark blue ground, an image of
+check one rule each. `userspace/vulkan/vkprobe.c` has a `show` mode (a triangle sliding over a dark blue ground, an image of
 the display's size, two buffers shown in turn); with it the real driver ran 350,000 frames in a second against
 the engine's stand-in display, none refused, the display given back, nothing left behind.
 
@@ -388,7 +388,7 @@ faults", has the runs.
 Everything up to here was shown with `vkprobe`, which presents by calling the driver's scanout functions. No other
 program does that. Two things were missing for a program somebody else wrote: swapchains, and a Vulkan loader.
 
-**Swapchains** (`vulkan/mesa-patches/0008`). Mesa's window-system code has a headless platform that needs nothing
+**Swapchains** (`userspace/vulkan/mesa-patches/0008`). Mesa's window-system code has a headless platform that needs nothing
 from an operating system, and an image type whose pictures are copied into a linear buffer at present. The patch
 turns both on for macOS and makes that buffer the scanout buffer: the display's shape and row pitch, VRAM, registered
 as a slot, flipped to at present after the copy has finished. Three things had to be found out on the way: RADV
@@ -397,7 +397,7 @@ DRM image type (the CPU type is used instead); and RADV sends the copy to a priv
 kext does not give a client (the copy now goes on the presenting queue). The buffers are not mapped and come from the
 large VRAM heap, as `vkprobe show`'s did on the card.
 
-**A loader and vkcube** (`vulkan/build-app.sh`, `make vkcube`). Khronos's Vulkan-Loader builds for macOS as it is
+**A loader and vkcube** (`userspace/vulkan/build-app.sh`, `make vkcube`). Khronos's Vulkan-Loader builds for macOS as it is
 and finds the driver through a manifest named in `VK_DRIVER_FILES`. Their `vkcube` on macOS draws into a Metal
 layer, which this driver has no surface for; `cube.c` also has a mode for a bare display, and an 18-line patch gives
 that mode a headless surface.

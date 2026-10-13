@@ -33,8 +33,8 @@
 //    (enc401_stream_encoder_dp_set_stream_attribute) -> FIFO reset ->
 //    enc401_stream_encoder_dp_unblank.
 //
-//  The link encoder, the PHY and DMUB are not touched. tools/pipegen's "dp"
-//  scenario runs those Linux functions; tools/atomdump.cpp holds this plan
+//  The link encoder, the PHY and DMUB are not touched. tools/gen/pipegen's "dp"
+//  scenario runs those Linux functions; test/atomdump.cpp holds this plan
 //  against its output.
 //
 //  Not programmed (kept as the GOP left them): DCHUBBUB watermarks and the

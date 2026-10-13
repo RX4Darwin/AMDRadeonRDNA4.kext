@@ -64,7 +64,7 @@ regs = [
     ('MP0_SMN_C2PMSG_35', 'mp0', 0x0063, 0x80000000),
 ]
 out = ['''# RX 9070 XT register image at OS handoff (what the GOP leaves behind),
-# for the rdna4 QEMU device (state=). Format of tools/linux-capture.sh:
+# for the rdna4 QEMU device (state=). Format of tools/linux/linux-capture.sh:
 #   NAME base_idx dword_off byte_addr 0xVALUE
 # base_idx/dword_off are segment-relative within the register's IP block
 # (DMU = DCN 4.1.0 unless the name says MP0); byte_addr is the BAR5 offset
@@ -72,7 +72,7 @@ out = ['''# RX 9070 XT register image at OS handoff (what the GOP leaves behind)
 # 0x9000; MP0 seg0 0x16000). Unlisted registers power on as 0.
 #
 # SYNTHESIZED, not captured: the layout follows amdgpu's register semantics
-# and the values the kext expects (see tools/atomdump.cpp testPipeDiscovery).
+# and the values the kext expects (see test/atomdump.cpp testPipeDiscovery).
 # Replace with a real capture of the GOP-left state when one exists.
 ''']
 for r in regs:

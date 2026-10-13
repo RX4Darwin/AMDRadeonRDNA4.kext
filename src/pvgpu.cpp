@@ -82,7 +82,7 @@ const char *stringKey(OSDictionary *table, const char *key) {
 	return s ? s->getCStringNoCopy() : nullptr;
 }
 
-// ---- Tahoe's IOPCIDevice slots that MacKernelSDK's header calls reserved (tools/m0/check-vtable.py): free functions with `this` first, SysV ABI ----
+// ---- Tahoe's IOPCIDevice slots that MacKernelSDK's header calls reserved (tools/metal/m0/check-vtable.py): free functions with `this` first, SysV ABI ----
 constexpr int kSlotConfigRead32 = 272, kSlotConfigRead16 = 273, kSlotConfigRead8 = 274;
 constexpr int kSlotConfigWrite32 = 275, kSlotConfigWrite16 = 276, kSlotConfigWrite8 = 277;
 constexpr int kSlotConfigureInterrupts = 300, kSlotDeviceMemoryRead = 301, kSlotDeviceMemoryWrite = 302;

@@ -32,6 +32,16 @@ kext's own version record, which have to agree for the kext to load.
 `CHANGELOG.md` has a section for the version `next` will become. Add to it when something is finished, and say what
 of it has run on the card.
 
+## Building
+
+`make` (GNU make or BSD make), or the targets of `AMDRadeonRDNA4.xcodeproj`, which run it. The `README` has the
+commands and where the results go. Two rules keep it working for both makes and for Xcode:
+
+- The `Makefile` and `src/kext.mk` use no conditionals, functions or pattern rules (their headers say what is used
+  instead). `bmake` and `make` should both build after a change to either.
+- A new source file of the kext is one more name in `USER_OBJS` in `src/kext.mk`. The Xcode project lists
+  directories, not files, and needs no change.
+
 ## Releasing
 
 On `next`, with `VERSION` and `CHANGELOG.md` saying what is being released:
@@ -53,7 +63,7 @@ end means the tree had changes that were not committed.
 
 - Kernel log, first line of the driver: `AMDRadeonRDNA4: version 0.1.0 (a634d7d9-dirty)`
 - Registry: `ioreg -r -w0 -l -k AMDRadeonRDNA4,Build`
-- `tools/diagnostic-log.sh` prints it under "kext loaded?", next to the UUID from `kextstat`.
+- `tools/rig/diagnostic-log.sh` prints it under "kext loaded?", next to the UUID from `kextstat`.
 
 A test log should come from a committed build where possible: a `-dirty` build can only be told from another by its
 UUID.

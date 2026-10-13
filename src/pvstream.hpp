@@ -3,7 +3,7 @@
 //  AMDRadeonRDNA4
 //
 //  M1 prep (docs/m1-stream.md, hub-task-440): decoding of the three command layers of Apple's paravirtual GPU, as measured in AppleParavirtGPU.kext and
-//  AppleParavirtGPUMetal.bundle. Host-testable (tools/pvstream-test.cpp), no kernel dependencies: the polling host (pvgpu.cpp) logs the FIFO with it.
+//  AppleParavirtGPUMetal.bundle. Host-testable (test/pvstream-test.cpp), no kernel dependencies: the polling host (pvgpu.cpp) logs the FIFO with it.
 //
 //    FIFO (kernel driver -> host; root FIFO in guest RAM, child rings per channel)   {u16 id, u16 barriers, u32 length, u32 signal, barriers..., payload}
 //    stream (Metal bundle -> host; command buffers in guest resources)             {u32 id, u32 size} + payload, grouped in segments

@@ -15,7 +15,7 @@
 //  is bounds-checked and malformed fields are treated as absent.
 //
 //  No kernel or libc dependencies; usable from both the kext and the host
-//  test harness (tools/atomdump).
+//  test harness (test/atomdump).
 //
 
 #ifndef Edid_hpp

@@ -4,7 +4,7 @@
 //
 //  The page-table writing of runtime.cpp's vmMap / vmMapHost / vmUnmap, freestanding (like gpuvm.cpp) so that a host test runs the SAME code the kext
 //  runs. Entries are reached through an accessor (contiguous 4 MiB image for modes 0/1, sparse pages for rdna4-vmshared=2), so one body serves both.
-//  tools/atomdump.cpp compares it byte for byte against the pre-S8 code (tools/legacy-vmtable-ref.inc, from commit 0cfa416) for the contiguous
+//  test/atomdump.cpp compares it byte for byte against the pre-S8 code (test/ref/legacy-vmtable-ref.inc, from commit 0cfa416) for the contiguous
 //  image: docs/w13-vmid.md s.5.10 (hub-task-340).
 //
 //  The logical image: root at 0, PDB1 at 0x1000, PDB0 at 0x2000, one PT page per 2 MiB of VA from kVaStart at 0x3000 + n * 0x1000.
