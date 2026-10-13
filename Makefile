@@ -173,7 +173,7 @@ USER_FLAGS := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK
               -mmacosx-version-min=$(DEPLOY) -std=c11 -O2 -Wall -Iinclude -Isrc
 
 # --- rules -------------------------------------------------------------------
-.PHONY: all clean test userspace n48nprobe mesa check-isa census-tool census-stub census-pathlog
+.PHONY: all clean test userspace n48nprobe mesa vkcube check-isa census-tool census-stub census-pathlog
 all: $(KEXT) $(RUN_TOOL)
 
 $(ATOMDUMP): tools/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp src/pipe2.cpp src/pipe2.hpp src/pipe2_linux.inc src/pipe2_linux_hpd4.inc src/pipe2_linux_dp1.inc src/pipe2_linux_dp2.inc tools/dp_retime_linux.inc src/dptrain.cpp src/dptrain.hpp src/dpphy.cpp src/dpphy.hpp tools/dp_train_linux.inc src/amdfw.cpp src/amdfw.hpp src/psp.cpp src/psp.hpp src/sdma.cpp src/sdma.hpp src/pm4.cpp src/pm4.hpp src/codeobj.cpp src/codeobj.hpp src/vadd_codeobj.h src/bench_codeobj.h src/gfxregs.hpp src/linuxref.hpp src/gpuheap.cpp src/gpuheap.hpp src/flip.hpp include/rdna4compute.h src/ihdecode.cpp src/ih.hpp src/gpuvm.cpp src/vmtree.cpp src/vmtree.hpp src/n48n.cpp src/n48n.hpp tools/n48n-host/hostbackend.hpp vulkan/navi48_native_abi.h src/gpuvm.hpp src/vmid.cpp src/vmid.hpp src/ptpages.cpp src/ptpages.hpp src/gpuvmtable.cpp src/gpuvmtable.hpp
@@ -205,9 +205,17 @@ mesa:
 	vulkan/build-mesa.sh $(RADV_DIR)
 	cp $(RADV_DIR)/build/src/amd/vulkan/libvulkan_radeon.dylib $(RADV_LIB)
 	$(CXX) -x c $(USER_FLAGS) -I$(RADV_DIR)/mesa/include vulkan/vkprobe.c -o $(BUILD)/vkprobe
+	$(CXX) -x c $(USER_FLAGS) -I$(RADV_DIR)/mesa/include -Ivulkan vulkan/swapprobe.c -o $(BUILD)/swapprobe
 	@otool -l $(RADV_LIB) | grep -A4 LC_BUILD_VERSION | grep -q 'minos $(DEPLOY)' || \
 		{ echo "$(RADV_LIB) is not built for macOS $(DEPLOY)" >&2; exit 1; }
-	@echo "Built $(RADV_LIB) and $(BUILD)/vkprobe for $(ARCH) (min macOS $(DEPLOY))"
+	@echo "Built $(RADV_LIB), $(BUILD)/vkprobe and $(BUILD)/swapprobe for $(ARCH) (min macOS $(DEPLOY))"
+
+# A Vulkan application that is not ours: Khronos's vkcube with their loader, the driver of `make mesa` and the
+# manifest that connects the two, in one directory to take to the rig (vulkan/build-app.sh; fetches about 65 MB the
+# first time; needs cmake). docs/todo-vulkantest.md has the commands.
+vkcube: mesa
+	vulkan/build-app.sh $(BUILD)/vk-app $(RADV_LIB) $(BUILD)/vkcube
+	@echo "Built $(BUILD)/vkcube/ (vkcube, libvulkan.1.dylib, libvulkan_radeon.dylib, radeon_icd.json)"
 
 # E1 trigger (docs/metal-spike.md): Objective-C, runs in Recovery next to rdna4-run.
 CENSUS_TOOL := $(BUILD)/rdna4-census

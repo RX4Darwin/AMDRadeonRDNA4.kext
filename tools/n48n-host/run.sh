@@ -25,3 +25,10 @@ DYLD_INSERT_LIBRARIES="$W/n48n-host.dylib" "$W/n48nprobe"
 # Then the driver: its submissions are checked and accepted, and reported finished at once. Nothing executes.
 # "show 1": a second of frames on the stand-in display, as fast as they are accepted.
 VKPROBE_NOGPU=1 DYLD_INSERT_LIBRARIES="$W/n48n-host.dylib" "$W/vkprobe" "$lib" show 1
+# And a program with a swapchain (mesa-patches/0008): the driver takes the display, registers the images' buffers
+# and presents by itself.
+clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -Wall -I "$W/mesa/include" -I "$repo/vulkan" \
+	"$repo/vulkan/swapprobe.c" -o "$W/swapprobe"
+DYLD_INSERT_LIBRARIES="$W/n48n-host.dylib" "$W/swapprobe" "$lib" 1
+# The same with rows longer than the picture, as on the rig.
+N48N_HOST_PITCH=3840 DYLD_INSERT_LIBRARIES="$W/n48n-host.dylib" "$W/swapprobe" "$lib" 1

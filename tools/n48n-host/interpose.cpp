@@ -45,6 +45,8 @@ kern_return_t serviceOpen(io_service_t service, task_port_t, uint32_t type, io_c
 		return kIOReturnExclusiveAccess;   // one client at a time, as in the kext
 	if (!client)
 		client = new N48N::Client;
+	if (const char *pitch = getenv("N48N_HOST_PITCH"))   // the rig's plane: 2560 wide, 3840 a row
+		host.planePitch = static_cast<uint32_t>(atoi(pitch));
 	if (!client->open(host.backend(), 8, 1, (12u << 16) | 1))
 		return kIOReturnNoMemory;
 	open = true;

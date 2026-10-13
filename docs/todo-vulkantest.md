@@ -714,6 +714,73 @@ costs the ring until the reboot, as it always did. For that, amdgpu on this chip
 whole GPU through the SMU; `gfx_v12_0.c` has no reset of the pipeline alone. Either is a project of its own, not a
 next attempt.
 
+## A program with a swapchain, and one that is not ours
+
+Written 2026-10-13, branch `devel/vulkan-application`. **Not run on the card yet.** Until now a program had to call
+the driver's own `radv_darwin_scanout_*` functions to get a picture on the display, which no existing Vulkan program
+does. With `mesa-patches/0008` the driver offers `VK_KHR_surface`, `VK_EXT_headless_surface` and `VK_KHR_swapchain`,
+and shows a headless swapchain's images on the display the kext lends: at present each image is copied into a buffer
+of the display's shape (VRAM, the same kind `vkprobe show` used) and the display is flipped to it. Nothing changed
+in the kext; any kext from `next` or `main` will do.
+
+On this Mac (`tools/n48n-host/run.sh`, stand-in display with the rig's row pitch of 3840): both programs below
+create their swapchain, the driver takes the display, registers three buffers, presents every frame and gives the
+display back. Whether the picture is right can only be seen on the card.
+
+Build: `make vkcube` (it runs `make mesa` first; fetches Khronos's loader, headers and tools the first time, about
+65 MB, and needs cmake). To the rig: `build/libvulkan_radeon.dylib`, `build/vkprobe`, `build/swapprobe`, the whole
+directory `build/vkcube/`, and `diagnostic-log.sh` with `rdna4-run` as before. The usual boot:
+
+```
+rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
+```
+
+**1. The old test with the new library** (the window-system code is now part of it):
+
+```bash
+sudo ./vkprobe ./libvulkan_radeon.dylib show > vkprobe.txt 2>&1
+```
+
+Expected: as before, ending `done: all ok`.
+
+**2. Our own program with a swapchain** (`vulkan/swapprobe.c`), five seconds:
+
+```bash
+sudo ./swapprobe ./libvulkan_radeon.dylib > swapprobe.txt 2>&1
+```
+
+Expected on the Samsung: a red triangle a third of the screen high moving left to right and starting over every four
+seconds, on a background going from dark blue to dark green and back; then the desktop. In the file: `display: the
+kext has one to lend`, `swapchain: 2560x1440, format 44, 3 images` (the numbers of the mode in use), `presented:
+about 300 frames in 5.0 s (60.0 a second)`, `done: all ok`. A blue triangle would mean red and blue are swapped.
+
+**3. vkcube**, Khronos's demo, through their loader, ten seconds. Only if step 2 passed. Started from inside its
+directory (it opens `libvulkan.1.dylib` by name), with the width and height step 2 printed:
+
+```bash
+cd vkcube
+```
+
+```bash
+sudo env VK_DRIVER_FILES=$PWD/radeon_icd.json ./vkcube --wsi display --width 2560 --height 1440 --c 600 > ../vkcube.txt 2>&1
+```
+
+Expected: a turning cube with the LunarG picture on its faces, filling the screen, for ten seconds; then the desktop.
+The file has `Selected GPU 0: AMD Radeon RX 9070 XT (RADV GFX1201)`. This is the first program on the card that uses
+a depth buffer, a texture, uniform buffers and a render pass, so a wrong or missing picture here is a finding, not a
+surprise. A line `radv-darwin: wsi: ... not shown` means the swapchain did not fit the display (wrong size).
+
+**4.** `sudo bash diagnostic-log.sh`
+
+If a picture freezes: wait (the driver gives up after 10 s without progress), run step 4 anyway, and reboot before
+anything else. A draw that hangs costs the graphics ring until the reboot (the section above).
+
+Report: the three text files, the log, and what was on the screen in steps 2 and 3.
+
+Limits, known before the run: a headless surface has no size, so the program has to be told the display's (a
+smaller swapchain is shown in the top left corner with whatever its buffer held around it); at most three images;
+B8G8R8A8 only; every present waits for the GPU and copies the whole picture (22 MiB at 2560x1440).
+
 ## After the tests
 
 For what passes, the README's file table, `docs/vulkan-port.md` and `vulkan/README.md` get the date and what ran.

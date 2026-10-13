@@ -23,8 +23,13 @@ if [ ! -d mesa/.git ]; then
 	git -C mesa remote add origin https://gitlab.freedesktop.org/mesa/mesa.git
 	git -C mesa fetch -q --depth 1 origin $BASE
 	git -C mesa checkout -q FETCH_HEAD
-	git -C mesa -c user.name=local -c user.email=local@invalid am --quiet "$here"/mesa-patches/*.patch
 fi
+# The patches the tree does not have yet: it has as many commits after the base as patches applied.
+have=$(git -C mesa rev-list --count $BASE..HEAD)
+for p in "$here"/mesa-patches/*.patch; do
+	n=$(basename "$p" | cut -c1-4)
+	[ "$((10#$n))" -le "$have" ] || git -C mesa -c user.name=local -c user.email=local@invalid am --quiet "$p"
+done
 [ -x venv/bin/meson ] || { python3 -m venv venv; venv/bin/pip -q install meson mako pyyaml packaging; }
 export PATH=$W/venv/bin:$PATH MACOSX_DEPLOYMENT_TARGET=11.0
 # Homebrew's libraries on an Apple-silicon Mac are arm64 only: keep pkg-config away from them.
