@@ -66,9 +66,12 @@ END {
 		else if (cause[i + 1] + 0 == 5) how = "clean (the next boot says cause 5)"
 		else { how = "CUT OFF (the next boot says cause " cause[i + 1] ")"; cut++ }
 		printf "\nboot %d: %s to %s, up %d s, %d kernel lines; driver %s\n  ended: %s\n", i, firstText[i], lastText[i], last[i] - first[i], lines[i],
-			(version[i] == "" ? "(no version line: not loaded, or the start of this boot is older than the period)" : version[i]), how
+			(version[i] == "" ? "(no version line in the log)" : version[i]), how
+		if (i < n) printf "  the next boot began %d s after its last line\n", first[i + 1] - last[i]
 		if (bringup[i] != "") printf "  last bring-up line: %s\n", substr(bringup[i], 1, 170)
-		if (how ~ /^CUT OFF|^unknown/) {
+		if (cause[i + 1] != "" || i == n) known++
+		# Without a shutdown cause to go by, the last lines are only worth printing for a boot that ended young.
+		if (how ~ /^CUT OFF/ || (how ~ /^unknown/ && last[i] - first[i] < 300)) {
 			printf "  --- its last %d kernel lines:\n", (lines[i] < TAIL ? lines[i] : TAIL)
 			for (k = lines[i] - TAIL + 1; k <= lines[i]; k++) if (k > 0) print "  " ring[i, k % TAIL]
 			if (ours[i]) {
@@ -78,6 +81,12 @@ END {
 		}
 	}
 	printf "\n%d boot(s) in the period, %d cut off\n", n, cut
+	if (known <= 1 && n > 1) {
+		print "No boot here has a shutdown-cause line: on this system the early kernel lines, and this driver, are not in"
+		print "the log on disk (Big Sur keeps them in dmesg only). What is left to go by: a boot much shorter than the"
+		print "others, followed by a longer pause than a restart takes, is what a freeze and a reset look like."
+		print "freeze-watch.sh keeps the lines this cannot see."
+	}
 }'
 
 echo

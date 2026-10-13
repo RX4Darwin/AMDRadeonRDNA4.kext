@@ -151,7 +151,7 @@ $(LILU_STAMP): $(LILU)/../hde/hde32.h $(LILU)/../hde/hde64.h
 	@touch $@
 
 # --- what goes to the test machine beside the kext -----------------------------
-tools: $(BIN)/rdna4-run $(BIN)/n48nprobe $(BIN)/diagnostic-log.sh $(BIN)/boot-history.sh vulkan-products
+tools: $(BIN)/rdna4-run $(BIN)/n48nprobe $(BIN)/diagnostic-log.sh $(BIN)/boot-history.sh $(BIN)/freeze-watch.sh vulkan-products
 
 # The compute runtime's client. Linked by the C++ driver: it is the one pointed at ld64 (tools/build/build-osxcross.sh).
 $(BIN)/rdna4-run: $(RUN)/rdna4-run.c $(RUN)/librdna4.c $(RUN)/librdna4.h $(RUN)/pm4build.h $(RUN)/gfx12tri.h $(RUN)/gfx12tricol.h $(RUN)/gfx12trirun.h src/gfx12_draw.h src/gfx12_draw_col.h src/ngg_kernel.h src/psred_kernel.h src/nggcol_kernel.h src/pscol_kernel.h include/rdna4compute.h src/vadd_codeobj.h src/bench_codeobj.h
@@ -173,10 +173,15 @@ $(BIN)/diagnostic-log.sh: tools/rig/diagnostic-log.sh
 	@mkdir -p $(BIN)
 	cp tools/rig/diagnostic-log.sh $@
 
-# For a machine that freezes: which of the last boots were cut off, and their last kernel lines.
+# For a machine that freezes: which of the last boots ended young (boot-history.sh, from the log on disk), and a
+# daemon that keeps each boot's kernel lines on disk as they come (freeze-watch.sh).
 $(BIN)/boot-history.sh: tools/rig/boot-history.sh
 	@mkdir -p $(BIN)
 	cp tools/rig/boot-history.sh $@
+
+$(BIN)/freeze-watch.sh: tools/rig/freeze-watch.sh
+	@mkdir -p $(BIN)
+	cp tools/rig/freeze-watch.sh $@
 
 # The Vulkan driver and its test programs for the card tests (docs/todo-vulkantest.md): Mesa with the patches of
 # userspace/vulkan/mesa-patches, fetched (about 150 MB, the first time) and built in $(BUILD)/radv-build by `make mesa`.
