@@ -35,7 +35,7 @@
 #include "codeobj.hpp"
 #include "isa.hpp"
 #include "vadd_codeobj.h"
-#include "../userspace/pm4build.h"
+#include "../userspace/rdna4-run/pm4build.h"
 
 #include <IOKit/IOLib.h>
 
@@ -165,7 +165,7 @@ namespace {
 constexpr uint32_t kItems = 256;
 constexpr uint32_t kNop = 0xffff1000u;       // the one-dword PKT3 NOP
 
-// The vadd IB as userspace/rdna4-run.c and tools/linux-replay/replay-compute.cpp record it (the latter ran on
+// The vadd IB as userspace/rdna4-run/rdna4-run.c and tools/linux/linux-replay/replay-compute.cpp record it (the latter ran on
 // the card under amdgpu's compute ring on 2026-09-30/10-01 and gave the right data).
 uint32_t recordVaddIb(uint32_t *ib, uint64_t codeVa, const CodeObj::Kernel &k, uint64_t kernarg, uint32_t groups) {
 	uint32_t n = 0;

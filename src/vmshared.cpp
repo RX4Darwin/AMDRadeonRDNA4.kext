@@ -7,7 +7,7 @@
 //  CP_MQD_CONTROL.VMID 0, PRIV_STATE | KMD_QUEUE, every address an MC address in the compute pool. A job is
 //  INDIRECT_BUFFER(vmid = the client's VMID, VA of the IB in the client's VM) followed by a ring-level RELEASE_MEM to the client's fence word,
 //  the VMID coming from the IB packet (gfx_v12_0_ring_emit_ib_compute). Assumption U1 of the design: proven on this card for amdgpu's own compute
-//  ring by tools/linux-replay/replay-compute.cpp (2026-10-01); the kext's own queues like this are what this mode tests.
+//  ring by tools/linux/linux-replay/replay-compute.cpp (2026-10-01); the kext's own queues like this are what this mode tests.
 //
 //  Why: on the real card every client HQD with a non-zero VMID is never serviced (docs/w13-vmid.md s.1.1, docs/vm-client-rootcause.md), and
 //  amdgpu has no gfx12 precedent for MMIO-loaded HQDs with a non-zero VMID (KFD needs MES). VMID-0 kernel queues + the IB's VMID is the model

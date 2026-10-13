@@ -91,7 +91,7 @@ The method is optc1_configure_crc / optc1_get_crc (dcn10_optc.c:1465-1576); the 
 NOT the silicon CRC algorithm or its values (unknown to the model), and it takes the window in active-area coordinates, which the silicon may not (blanking offset unverified). It
 can only demonstrate that the kext's CRC program/compare logic works and that a plane the model composites is detected; it says nothing about the card's DSCL or MPC dropping the cursor.
 
-Emulator options for the W38 review tests (`RDNA4_DEV=cursor=on,...`, boot-4 arguments plus `rdna4-cursordscl=1`; `tools/vm-test.sh`):
+Emulator options for the W38 review tests (`RDNA4_DEV=cursor=on,...`, boot-4 arguments plus `rdna4-cursordscl=1`; `tools/vm/vm-test.sh`):
 
 | Option | Effect |
 |---|---|
@@ -188,4 +188,4 @@ Problem: `rdna4-cursor=2` deliberately ignores macOS's `cscSetHardwareCursor`/`c
   `set: hubp ctl=0x03000204..05 ... size=0x00400040 ... set=0x00000300`, `shown: ... cm ctl=0x000000a5`, `move #n x= y=`.
 * Not carried over from the self-test (the card did not need them): DLG mission mode, CROB/MALL/CRQ pipe fixes, DSCL write, MPCC write.
 
-`tools/set-boot.sh`: boot 4 = base + `rdna4-vbl=1 rdna4-cursor=1` (the real pointer, CM clear by default); new boot 7 = base + `rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1` (the magenta self-test with the CRC A/B).
+`tools/rig/set-boot.sh`: boot 4 = base + `rdna4-vbl=1 rdna4-cursor=1` (the real pointer, CM clear by default); new boot 7 = base + `rdna4-vbl=1 rdna4-cursor=2 rdna4-cursorcm=1` (the magenta self-test with the CRC A/B).

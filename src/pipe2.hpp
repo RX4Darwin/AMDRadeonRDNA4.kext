@@ -6,7 +6,7 @@
 //  timing generator and encoder, then one plane scanning a 32-bit linear
 //  surface. This is what a second monitor needs; the lit pipe is not touched.
 //
-//  The register sequence is not written here. It is Linux's: tools/pipegen
+//  The register sequence is not written here. It is Linux's: tools/gen/pipegen
 //  runs amdgpu DC's own DCN 4.01 functions (dce110_apply_single_controller_
 //  ctx_to_hw, link_set_dpms_on, dcn401_program_pipe, with the HUBP timing
 //  values from DML 2.1) against a recorder and writes the result to
@@ -20,7 +20,7 @@
 //  plan runs), and the plan's writes to the sink's DPCD as Op::Aux steps.
 //  Nothing else in it depends on the link's rate or lane count.
 //
-//  Freestanding; shared by the kext and tools/atomdump.cpp.
+//  Freestanding; shared by the kext and test/atomdump.cpp.
 //
 
 #ifndef Pipe2_hpp
@@ -121,8 +121,8 @@ bool build(const Target &t, Plan &out, const char **why);
 
 // What changes with the mode on the lit pipe besides the timing itself: the
 // HUBP's request timing (DLG, TTU), the DET size and the timing generator's
-// global sync, all of which Linux takes from DML. tools/pipegen ran it for
-// the timings of tools/pipegen/modes.txt with the plane on the plan's
+// global sync, all of which Linux takes from DML. tools/gen/pipegen ran it for
+// the timings of tools/gen/pipegen/modes.txt with the plane on the plan's
 // surface, and the table holds what differs.
 //
 // modeSteps gives the updates for a switch to `to`, for the OTG update lock

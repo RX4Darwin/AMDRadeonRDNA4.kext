@@ -16,7 +16,25 @@ otherwise). The newest version is on top. How versions and branches work is in `
   any direction this kext copies in; the boot log says so at every start (`runtime: dma: SDMA0_DCC_CNTL ...`).
 
 **Tools**
-- `tools/spike-bar.sh` and `tools/air/sample-operands.py`, the two spikes of the roadmap (issue #3).
+- `tools/rig/spike-bar.sh` and `tools/metal/air/sample-operands.py`, the two spikes of the roadmap (issue #3).
+
+**Layout and build**
+- The repository is sorted: the submodules in `lib/`, the GPU test kernels' sources in `src/shaders/`, the programs
+  that talk to the kext in `userspace/rdna4-run/` and `userspace/vulkan/`, the host tests in `test/`, and the
+  development scripts by purpose in `tools/{build,gen,rig,vm,linux,metal}/` (`tools/README.md`). Paths written in
+  older documents and logs were updated; a path in an old kernel log or test record names the old place.
+- Everything that is built goes to `Build/`. The kext and the programs for the test machine land in
+  `Build/AMDRadeonRDNA4-<version>-<CONFIG>/` (`AMDRadeonRDNA4.kext`, `bin/`, with `diagnostic-log.sh` in it), the VM
+  variant under `Build/vmtest/`. `CONFIG` is `RELEASE` (the default: what ran on the card, same code as before the
+  move) or `DEBUG` (`-O0`, `DEBUG` defined; not run on the card). `make product-dir` prints the directory.
+- The `Makefile` works with GNU make (3.81 and later) and BSD make. `make clean` no longer removes the Mesa tree of
+  `make mesa`; `make distclean` does. A firmware fetched after a build is now noticed (it was not before: the kext
+  stayed without it until the objects were deleted).
+- `AMDRadeonRDNA4.xcodeproj`: targets that run `make`, for building and browsing in Xcode.
+- `make test` also runs three host tests that had to be started by hand (`test/test-gfx12tri.c`,
+  `test-gfx12tricol.c`, `test-w12k-pm4.cpp`).
+- The card's ROM dump is no longer in the repository (`firmware/README.md` says where it is to be had). Without it
+  `make test` leaves out the AtomBIOS and IP discovery checks, says so, and runs the rest.
 
 ## 0.1.0 (2026-10-12)
 
@@ -45,7 +63,7 @@ version and the commit, for example `0.1.0 (a634d7d9-dirty)`; the diagnostic scr
 - A job whose shader faults is ended and reported within milliseconds, and its queue runs the next job.
 
 **Vulkan** (verified on the card 2026-10-06 and 2026-10-07)
-- A kernel interface for the RADV driver (`vulkan/`): buffers, a private address space, submit and wait, and pictures
+- A kernel interface for the RADV driver (`userspace/vulkan/`): buffers, a private address space, submit and wait, and pictures
   on the boot display. `vkprobe` runs fills, a compute shader, a rendered triangle and 60 frames a second.
 - It works in the same boot as the compute runtime's clients, and at the same time.
 - A program whose compute shader hangs loses its own device after ten seconds; the graphics ring stays in service.

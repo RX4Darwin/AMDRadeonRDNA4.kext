@@ -21,8 +21,8 @@
 //  thread; a failure halts PFP/ME again and leaves compute as it was.
 //
 //  G3, once the ring is up and the runtime's device heap exists: the first
-//  draw. One triangle from an NGG passthrough VS (shaders/ngg.s) and a
-//  constant-colour PS (shaders/psred.s) into a 256x256 R8G8B8A8 target, from
+//  draw. One triangle from an NGG passthrough VS (src/shaders/ngg.s) and a
+//  constant-colour PS (src/shaders/psred.s) into a 256x256 R8G8B8A8 target, from
 //  the command stream in gfx12_draw.h (generated from Mesa's register
 //  database; premetal/gfx12-draw-notes.md cites every register), then the
 //  target is read back: 8192 pixels in rows 64..190 must be 0xFF0000FF and
@@ -38,7 +38,7 @@
 #include "nggstore_kernel.h"
 #include "nggvgpr_kernel.h"
 #include "nggconst_kernel.h"
-#include "../userspace/gfx12tricol.h"   // G4: the shared colour-triangle shaders, descriptor and check (also used by tools/linux-replay)
+#include "../userspace/rdna4-run/gfx12tricol.h"   // G4: the shared colour-triangle shaders, descriptor and check (also used by tools/linux/linux-replay)
 #include "ngg64_kernel.h"
 #include "pm4.hpp"
 #include "psred_kernel.h"
@@ -1455,7 +1455,7 @@ bool RDNA4Compute::gfxDrawRun(const char *label, uint32_t variant, const uint64_
 	if (variant & (32 | 512 | 1024))   // the marker shader uses v8/v9: 10 VGPRs = 2 granules of 8 (VGPRS field = granules - 1)
 		patch(kOpSetShReg, 0x1a2a - kShBase, 0x0000003f, 1, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=1");
 
-	if (variant & 4096) {   // wave64 (proven on the card under Linux: tools/linux-replay REPLAY_VARIANT=4096, 8192 px)
+	if (variant & 4096) {   // wave64 (proven on the card under Linux: tools/linux/linux-replay REPLAY_VARIANT=4096, 8192 px)
 		patch(kOpSetContextReg, 0x02a6, 0x00400000, 0, "VGT_SHADER_STAGES_EN.GS_W32_EN=0 (wave64 NGG)");
 		patch(kOpSetShReg, 0x1a2a - kShBase, 0x0000003f, 2, "SPI_SHADER_PGM_RSRC1_GS.VGPRS=2 (12 VGPRs: wave64 granules of 4)");
 	}
@@ -1650,9 +1650,9 @@ void RDNA4Compute::gfxVerdictCol(const GfxColResult &r) {
 	              r.centroid, r.ok ? " RIGHT" : "");
 }
 
-// G4: one draw of the colour triangle (src/gfx12_draw_col.h, shaders/nggcol.s + pscol.s) into the cleared target, exactly the way gfxDrawRun
+// G4: one draw of the colour triangle (src/gfx12_draw_col.h, src/shaders/nggcol.s + pscol.s) into the cleared target, exactly the way gfxDrawRun
 // draws G3: the same stream discipline (relocations, CSB replay, sane clip state, pipeline statistics on probe boots, one RELEASE_MEM fence,
-// the same timeout and "did not finish" handling), then the colour check shared with tools/linux-replay (userspace/gfx12tricol.h). `va` are
+// the same timeout and "did not finish" handling), then the colour check shared with tools/linux/linux-replay (userspace/rdna4-run/gfx12tricol.h). `va` are
 // the relocation addresses (same order as G3's: VS, PS, target, three rings, fence); va[kColAttrRing] is also the address nggcol.s's attribute
 // ring descriptor carries. The G3 baseline must have passed (the caller checks), so the ring is healthy and the shared rings/target are in use
 // by nothing else.
@@ -1726,7 +1726,7 @@ bool RDNA4Compute::gfxColDrawRun(const char *label, const uint64_t *va, GfxColRe
 		return false;
 	}
 
-	// The check: the same function tools/linux-replay (REPLAY_DRAW=col) runs on the Linux side.
+	// The check: the same function tools/linux/linux-replay (REPLAY_DRAW=col) runs on the Linux side.
 	auto check = [&](GfxColResult &out) {
 		rdna4_tricol_result cr;
 		out.ok = rdna4_tricol_check(const_cast<const uint32_t *>(poolDw(kGfxTargetOffset)), &cr) != 0;

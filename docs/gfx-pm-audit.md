@@ -15,7 +15,7 @@ correct. This document is what we send the SMU compared with amdgpu, and a ranke
 `readSensorsEx` (`compute.cpp:856`), `rdna4-run sensors`, and two new diagnostic-log rows.
 Offsets, all in `smu14_driver_if` `SmuMetrics_t` (:1649-1727) with `PPCLK_COUNT` 11 (:456-467),
 `SVI_PLANE_COUNT` 4 (:558-563), `TEMP_COUNT` 12, `THROTTLER_COUNT` 21 (:216); `src/smu_metrics.h`
-holds them and `tools/atomdump.cpp` checks them against a compiler-laid-out mirror of the struct:
+holds them and `test/atomdump.cpp` checks them against a compiler-laid-out mirror of the struct:
 
 | Field | Offset | Note |
 |---|---|---|
@@ -153,7 +153,7 @@ Every message uses `smuSend` with a 100 ms bound; an answer other than `0x01` st
 each step is followed by a 300 ms settle and a `pm:` line (GFXCLK, pre/post-DS, activity, VDD_GFX, power,
 counter live/STALE, throttle mask, `GRBM_STATUS`, `CP_STAT`). No reset, no display or DCN register, no GFXOFF.
 Trails: `pm: baseline sample`, `pm: SetWorkloadMask`, `pm: soft limits auto`, `pm: cap probe`, `pm: cap restore`.
-Real-card set: boot 7 in `tools/set-boot.sh` (`rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15`), described in
+Real-card set: boot 7 in `tools/rig/set-boot.sh` (`rdna4-ih=1 rdna4-hang=1 rdna4-gfxpm=15`), described in
 `docs/real-card-plan.md`. The emulator models `SetWorkloadMask`, the soft limits (CurrClock follows a lower soft
 max), a `MetricsCounter` on the virtual clock, and a `smu-stale` option that acks the transfer without rewriting.
 It does **not** model the SCPM refusal of the allowed mask (real card: 0xFD); noted, not changed.

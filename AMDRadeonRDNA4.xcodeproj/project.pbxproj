@@ -1,0 +1,237 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXFileReference section */
+		84ACD6E77294339908EF10C1 /* src */ = {isa = PBXFileReference; lastKnownFileType = folder; path = src; sourceTree = "<group>"; };
+		1CF276C2D67FEB420FB16FB2 /* include */ = {isa = PBXFileReference; lastKnownFileType = folder; path = include; sourceTree = "<group>"; };
+		F78C8E257629CC4B1C333135 /* userspace */ = {isa = PBXFileReference; lastKnownFileType = folder; path = userspace; sourceTree = "<group>"; };
+		87A46F999EEBA5D1D920929F /* test */ = {isa = PBXFileReference; lastKnownFileType = folder; path = test; sourceTree = "<group>"; };
+		0F6D69002085BFBF7147D1A6 /* tools */ = {isa = PBXFileReference; lastKnownFileType = folder; path = tools; sourceTree = "<group>"; };
+		85271B6AE8F801E2516D9D5C /* emu */ = {isa = PBXFileReference; lastKnownFileType = folder; path = emu; sourceTree = "<group>"; };
+		F544CC891EA48E7FE119F356 /* firmware */ = {isa = PBXFileReference; lastKnownFileType = folder; path = firmware; sourceTree = "<group>"; };
+		4D383E0A9233A0B016207A1E /* docs */ = {isa = PBXFileReference; lastKnownFileType = folder; path = docs; sourceTree = "<group>"; };
+		54AA4844075FC7029A6A1C02 /* Makefile */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.make; path = Makefile; sourceTree = "<group>"; };
+		1507F021100E808DBE2FAA00 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		72638434B198B71E5CD8C0C5 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		BAAB5830238B492ED9EF1162 /* CHANGELOG.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = CHANGELOG.md; sourceTree = "<group>"; };
+		E0876C998CF20D26A1FFD24C /* CONTRIBUTING.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = CONTRIBUTING.md; sourceTree = "<group>"; };
+		53535121747E76194BCB35DD /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		ADCF10F76EBF2A74473E9DC4 = {
+			isa = PBXGroup;
+			children = (
+				54AA4844075FC7029A6A1C02 /* Makefile */,
+				1507F021100E808DBE2FAA00 /* Info.plist */,
+				84ACD6E77294339908EF10C1 /* src */,
+				1CF276C2D67FEB420FB16FB2 /* include */,
+				F78C8E257629CC4B1C333135 /* userspace */,
+				87A46F999EEBA5D1D920929F /* test */,
+				0F6D69002085BFBF7147D1A6 /* tools */,
+				85271B6AE8F801E2516D9D5C /* emu */,
+				F544CC891EA48E7FE119F356 /* firmware */,
+				4D383E0A9233A0B016207A1E /* docs */,
+				72638434B198B71E5CD8C0C5 /* README.md */,
+				BAAB5830238B492ED9EF1162 /* CHANGELOG.md */,
+				E0876C998CF20D26A1FFD24C /* CONTRIBUTING.md */,
+				53535121747E76194BCB35DD /* LICENSE */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXLegacyTarget section */
+		9C8C32BE0AB0457F39A2CAE6 /* AMDRadeonRDNA4 */ = {
+			isa = PBXLegacyTarget;
+			buildArgumentsString = "CONFIG=$(RDNA4_CONFIG) $(RDNA4_ACTION_$(ACTION))";
+			buildConfigurationList = A76F5C6566BDFDBCDC761029 /* Build configuration list for PBXLegacyTarget "AMDRadeonRDNA4" */;
+			buildPhases = (
+			);
+			buildToolPath = /usr/bin/make;
+			buildWorkingDirectory = "$(SRCROOT)";
+			dependencies = (
+			);
+			name = "AMDRadeonRDNA4";
+			passBuildSettingsInEnvironment = 1;
+			productName = "AMDRadeonRDNA4";
+		};
+		98417DAD59EC16CE24D9E1EC /* AMDRadeonRDNA4 (VM test) */ = {
+			isa = PBXLegacyTarget;
+			buildArgumentsString = "VMTEST=1 CONFIG=$(RDNA4_CONFIG) $(RDNA4_ACTION_$(ACTION))";
+			buildConfigurationList = CC439EAB91442FB8478456E0 /* Build configuration list for PBXLegacyTarget "AMDRadeonRDNA4 (VM test)" */;
+			buildPhases = (
+			);
+			buildToolPath = /usr/bin/make;
+			buildWorkingDirectory = "$(SRCROOT)";
+			dependencies = (
+			);
+			name = "AMDRadeonRDNA4 (VM test)";
+			passBuildSettingsInEnvironment = 1;
+			productName = "AMDRadeonRDNA4 (VM test)";
+		};
+		99E4CC5C0DA7D2E7A2D82F89 /* Host tests */ = {
+			isa = PBXLegacyTarget;
+			buildArgumentsString = "$(RDNA4_TEST_$(ACTION))";
+			buildConfigurationList = 1584E19E323ACBE5D3F17972 /* Build configuration list for PBXLegacyTarget "Host tests" */;
+			buildPhases = (
+			);
+			buildToolPath = /usr/bin/make;
+			buildWorkingDirectory = "$(SRCROOT)";
+			dependencies = (
+			);
+			name = "Host tests";
+			passBuildSettingsInEnvironment = 1;
+			productName = "Host tests";
+		};
+/* End PBXLegacyTarget section */
+
+/* Begin PBXProject section */
+		98F54143AB4E86B28C3AFEE0 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 2600;
+			};
+			buildConfigurationList = 3D29D9F3A882C4202964FB56 /* Build configuration list for PBXProject "AMDRadeonRDNA4" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = ADCF10F76EBF2A74473E9DC4;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				9C8C32BE0AB0457F39A2CAE6 /* AMDRadeonRDNA4 */,
+				98417DAD59EC16CE24D9E1EC /* AMDRadeonRDNA4 (VM test) */,
+				99E4CC5C0DA7D2E7A2D82F89 /* Host tests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin XCBuildConfiguration section */
+		855D4B0C75ECD556474FD8F5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				SDKROOT = macosx;
+				OBJROOT = "$(SRCROOT)/Build/xcode";
+				SYMROOT = "$(SRCROOT)/Build/xcode";
+				RDNA4_CONFIG = DEBUG;
+				RDNA4_ACTION_ = all;
+				RDNA4_ACTION_build = all;
+				RDNA4_ACTION_clean = clean;
+				RDNA4_TEST_ = test;
+				RDNA4_TEST_build = test;
+				RDNA4_TEST_clean = clean;
+			};
+			name = Debug;
+		};
+		77922AE90B0BD8BCB42DCA16 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		7E0330A0A83E7C8D7E6481C5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		E5743290CE4A6BC4B62160DA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		4E74312DBBD620AE1CB5D771 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				SDKROOT = macosx;
+				OBJROOT = "$(SRCROOT)/Build/xcode";
+				SYMROOT = "$(SRCROOT)/Build/xcode";
+				RDNA4_CONFIG = RELEASE;
+				RDNA4_ACTION_ = all;
+				RDNA4_ACTION_build = all;
+				RDNA4_ACTION_clean = clean;
+				RDNA4_TEST_ = test;
+				RDNA4_TEST_build = test;
+				RDNA4_TEST_clean = clean;
+			};
+			name = Release;
+		};
+		4D5C56C8FBEE2E978B69E953 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
+		D9E08E5477566BEE351D6AE7 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
+		5837AFAAACE84A39D1EB68C3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		3D29D9F3A882C4202964FB56 /* Build configuration list for PBXProject "AMDRadeonRDNA4" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				855D4B0C75ECD556474FD8F5 /* Debug */,
+				4E74312DBBD620AE1CB5D771 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A76F5C6566BDFDBCDC761029 /* Build configuration list for PBXLegacyTarget "AMDRadeonRDNA4" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				77922AE90B0BD8BCB42DCA16 /* Debug */,
+				4D5C56C8FBEE2E978B69E953 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		CC439EAB91442FB8478456E0 /* Build configuration list for PBXLegacyTarget "AMDRadeonRDNA4 (VM test)" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7E0330A0A83E7C8D7E6481C5 /* Debug */,
+				D9E08E5477566BEE351D6AE7 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1584E19E323ACBE5D3F17972 /* Build configuration list for PBXLegacyTarget "Host tests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E5743290CE4A6BC4B62160DA /* Debug */,
+				5837AFAAACE84A39D1EB68C3 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 98F54143AB4E86B28C3AFEE0 /* Project object */;
+}

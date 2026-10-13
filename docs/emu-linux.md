@@ -1,14 +1,14 @@
 # Dry-running a real-card boot in the emulator (Linux box)
 
-`tools/emu-linux.sh <boot>` boots macOS Recovery (Tahoe) headless in QEMU on the
+`tools/vm/emu-linux.sh <boot>` boots macOS Recovery (Tahoe) headless in QEMU on the
 emulated RX 9070 XT (`emu/qemu/rdna4.c`) with the kext from this checkout, using the
-boot-args of boot `<boot>` of `tools/set-boot.sh` / `docs/real-card-plan.md`, and saves
-the kext's log. `--diag` additionally runs `tools/diagnostic-log.sh` in the Recovery
+boot-args of boot `<boot>` of `tools/rig/set-boot.sh` / `docs/real-card-plan.md`, and saves
+the kext's log. `--diag` additionally runs `tools/rig/diagnostic-log.sh` in the Recovery
 Terminal, the way the user does on the stick, and brings the PASS/FAIL table back.
 
 ```sh
-OSXCROSS=$HOME/.local/share/osxcross bash tools/build-osxcross.sh   # the kext + rdna4-run
-bash tools/emu-linux.sh 3 --diag                                     # boot 3, ~2 min
+OSXCROSS=$HOME/.local/share/osxcross bash tools/build/build-osxcross.sh   # the kext + rdna4-run
+bash tools/vm/emu-linux.sh 3 --diag                                     # boot 3, ~2 min
 ```
 
 (The scripts are not executable in git: run them with `bash`.)
@@ -29,10 +29,10 @@ bash tools/emu-linux.sh 3 --diag                                     # boot 3, ~
 Options: `--extra "args"` (append boot-args), `--args "..."` (replace the table),
 `--dev trace=on` (rdna4 device options, e.g. `ih-dead=on`), `--keep` (leave the VM up; its
 monitor socket is `monitor.sock` in the run dir), `--no-build` (reuse the OpenCore image of
-the previous run of that boot), `--wait SECS`. `tools/emu-linux.sh -h` lists them.
+the previous run of that boot), `--wait SECS`. `tools/vm/emu-linux.sh -h` lists them.
 Only one VM runs at a time (a new run kills the previous one).
 
-Boot-args come from `tools/set-boot.sh` itself: it is run against a scratch config and its
+Boot-args come from `tools/rig/set-boot.sh` itself: it is run against a scratch config and its
 printed line is taken, so a change to the table is followed automatically. `serial=3` is
 appended (the log is how the run is observed) and `--extra` after that.
 
@@ -80,22 +80,22 @@ already installed; `iasl` and `mtools` were not and are **not needed from the sy
 ```sh
 EMU=~/work/tools/emu; mkdir -p $EMU/{images,kexts} && cd $EMU
 
-# 1. QEMU 10.0.13 + the rdna4 device (tools/emu-build.sh links emu/qemu/rdna4.c into the tree)
+# 1. QEMU 10.0.13 + the rdna4 device (tools/vm/emu-build.sh links emu/qemu/rdna4.c into the tree)
 curl -sSL https://download.qemu.org/qemu-10.0.13.tar.xz | tar xJ
-QEMU_SRC=$EMU/qemu-10.0.13 bash tools/emu-build.sh qemu      # x86_64-softmmu only
-ninja -C qemu-10.0.13/build qemu-img                          # qemu-img, used by tools/vm-opencore.sh
+QEMU_SRC=$EMU/qemu-10.0.13 bash tools/vm/emu-build.sh qemu      # x86_64-softmmu only
+ninja -C qemu-10.0.13/build qemu-img                          # qemu-img, used by tools/vm/vm-opencore.sh
 
 # 2. The GOP option ROM. The RdnaGopPkg platform has no ASL, so edk2 needs no iasl.
 git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/tianocore/edk2
 make -C edk2/BaseTools -j8
-QEMU_SRC=$EMU/qemu-10.0.13 EDK2=$EMU/edk2 bash tools/emu-build.sh gop
-QEMU_SRC=$EMU/qemu-10.0.13 EDK2=$EMU/edk2 bash tools/emu-build.sh rom   # -> build-emu/rdna4.rom (git-ignored, per checkout)
+QEMU_SRC=$EMU/qemu-10.0.13 EDK2=$EMU/edk2 bash tools/vm/emu-build.sh gop
+QEMU_SRC=$EMU/qemu-10.0.13 EDK2=$EMU/edk2 bash tools/vm/emu-build.sh rom   # -> Build/emu/rdna4.rom (git-ignored, per checkout)
 
 # 3. OVMF + the stock OpenCore image: OSX-KVM (its OVMF_CODE_4M.fd / OVMF_VARS-1920x1080.fd pair
-#    and OpenCore/OpenCore.qcow2, which tools/vm-opencore.sh starts from)
+#    and OpenCore/OpenCore.qcow2, which tools/vm/vm-opencore.sh starts from)
 git clone --depth 1 https://github.com/kholia/OSX-KVM
 
-# 4. mtools (tools/vm-opencore.sh needs mcopy/mdeltree)
+# 4. mtools (tools/vm/vm-opencore.sh needs mcopy/mdeltree)
 curl -sSL https://ftp.gnu.org/gnu/mtools/mtools-4.0.49.tar.gz | tar xz
 (cd mtools-4.0.49 && ./configure --prefix=$EMU/local && make -j8 && make install)
 
@@ -108,12 +108,12 @@ dmg2img/dmg2img -i images/BaseSystem.dmg -o images/BaseSystem.img    # 2.5 GB ra
 cp -r /run/media/miguer/OPENCORE/EFI/OC/Kexts/Lilu.kext kexts/
 ```
 
-Paths are overridable: `EMU`, `QEMU_SRC`, `OSXKVM`, `KEXT` (default `build/AMDRadeonRDNA4.kext`),
+Paths are overridable: `EMU`, `QEMU_SRC`, `OSXKVM`, `KEXT` (default `Build/AMDRadeonRDNA4-<version>-RELEASE/AMDRadeonRDNA4.kext`),
 `LILU`, `BASE_IMG`, `RAM_MB` (default 8192).
 
 ## How it works, and where it differs from the real stick
 
-- **OpenCore image**: `tools/vm-opencore.sh` starts from OSX-KVM's stock image, injects Lilu +
+- **OpenCore image**: `tools/vm/vm-opencore.sh` starts from OSX-KVM's stock image, injects Lilu +
   AMDRadeonRDNA4 after it, disables WhateverGreen, sets the boot-args, a waiting picker and the
   1920x1080 GOP resolution. It is **not** the stick's `config.plist`: the stick also loads the
   AMD CPU kexts, VirtualSMC, NootRX etc. and real-board ACPI/SMBIOS; here only Lilu and AMDRadeonRDNA4
@@ -127,10 +127,10 @@ Paths are overridable: `EMU`, `QEMU_SRC`, `OSXKVM`, `KEXT` (default `build/AMDRa
   and here wraps back to `EFI`, which relaunches OpenCore.
 - **Kernel log**: `serial=3` sends the kernel log to QEMU's `-serial file:`; launchd and the kext
   lines are in it. There is no installed macOS disk (`MACHDD=none`), so the SSH flow of
-  `tools/vm-test.sh` does not apply.
-- **`--diag`**: Cmd+Shift+T opens Terminal in Recovery (root prompt); `tools/emu-type.py` types
+  `tools/vm/vm-test.sh` does not apply.
+- **`--diag`**: Cmd+Shift+T opens Terminal in Recovery (root prompt); `tools/vm/emu-type.py` types
   `bash /Volumes/QEMU*/run-diag.sh` with monitor `sendkey`. The scripts (`diagnostic-log.sh`,
-  `build/rdna4-run`) arrive on a read-only `fat:ro:` disk (QEMU vvfat, attached as usb-storage,
+  `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run`) arrive on a read-only `fat:ro:` disk (QEMU vvfat, attached as usb-storage,
   mounted as `/Volumes/QEMU VVFAT`), are run from `/tmp`, and the output goes to
   `/dev/console`, which is the serial log (lines prefixed `RDNA4DIAG|`). Why not write back to
   the FAT disk: vvfat's `rw` mode left the host copy of the output file stuck at its first 1200
@@ -141,21 +141,21 @@ Paths are overridable: `EMU`, `QEMU_SRC`, `OSXKVM`, `KEXT` (default `build/AMDRa
   the combination the Windows flow used; Arch's `/usr/share/edk2/x64/OVMF_CODE.4m.fd` was not
   tried (its VARS layout differs from OSX-KVM's 128 KB file).
 
-## Options added later (all in `tools/emu-linux.sh -h`)
+## Options added later (all in `tools/vm/emu-linux.sh -h`)
 
 - `QEMU_BIN=<binary>`: which emulator build to use (A/B of `emu/qemu/rdna4.c` versions; keep each build as a copy, e.g.
   `$EMU/bin/<name>/qemu-system-x86_64`, because rebuilding in `$QEMU_SRC` overwrites it). `TAG=<name>` suffixes the run dir.
   After `emu-boot.sh`/`emu-linux.sh` start a VM, a new run only stops QEMU binaries under `$EMU` (never another QEMU on the box).
 - Any boot id of `set-boot.sh` (`9b`, `11s`, `10`..`13`). `--args "..."` replaces the table, `--extra "..."` appends.
 - Every run also writes `emu-warnings.txt` (QEMU stderr without host-CPU noise) and `emu-context.txt` (each distinct emulator message
-  with the kext lines printed just before it, from the 0.1 s byte-offset sampler `offsets.txt`; `tools/emu-context.py`).
+  with the kext lines printed just before it, from the 0.1 s byte-offset sampler `offsets.txt`; `tools/vm/emu-context.py`).
 - `--pre "CMD"` (with `--diag`): a guest command run before `diagnostic-log.sh` in the same Terminal session, e.g.
   `--pre 'pmset displaysleepnow; sleep 8'` (output over the console; the blanked display does not matter).
 - `--sleep-reset` (boot 11s): triggers the emulator's compute power reset (`qom-set /machine/peripheral/rdna4 sleep-reset true`) right
   after `power: quiesce complete`: the power-loss case; without it 11s is a wake without power loss.
-- `--census` (E1 of `docs/metal-spike.md`, kext boot-arg `rdna4-accelcensus`): mounts `build/rdna4-census`, runs it in the Recovery Terminal and
+- `--census` (E1 of `docs/metal-spike.md`, kext boot-arg `rdna4-accelcensus`): mounts `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-census`, runs it in the Recovery Terminal and
   returns `census.txt` / `census-kernel.log`. Not combinable with `--diag`.
-- `tools/emu-type.py <monitor.sock> <text>` types into the guest through the QEMU monitor (`\n` is Enter). Cmd+Shift+T opens the Recovery
+- `tools/vm/emu-type.py <monitor.sock> <text>` types into the guest through the QEMU monitor (`\n` is Enter). Cmd+Shift+T opens the Recovery
   Terminal; the mouse does not reach the guest through the monitor here, but Ctrl+F2 + Enter opens the Apple menu.
 - The picker is read from the screendump before each key press (efi vs Recovery tile) and retried; one run in ten used to lose both presses.
 

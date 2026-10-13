@@ -47,7 +47,7 @@ The best-supported explanation is this: the kext programs every per-update curso
    - `init_pipes = dcn10_init_pipes` (`dc:hwss/dcn401/dcn401_init.c:126`) disables every pipe that is not in seamless boot (`dc:hwss/dcn10/dcn10_hwseq.c:1695-1738`).
    - That path runs `dcn401_plane_atomic_power_down`, which sets `DOMAINn_PG_CONFIG.DOMAIN_POWER_GATE=1` (`dc:hwss/dcn401/dcn401_hwseq.c:3094-3115`, `dc:hwss/dcn32/dcn32_hwseq.c:167-184`). Power gating is enabled by default for DCN401 (no `disable_*_power_gate` in `dc:resource/dcn401/dcn401_resource.c:750-806`).
    - [I] On Linux, every HUBP/DPP register amdgpu does not write is at its hardware reset value. On our card, those same registers hold whatever the GOP/VBIOS left.
-   - The July Linux diff covered only about 30 registers (`AMDRadeonRDNA4/tools/cursor-test.py`), and it did **not** compare DCHUBP_CNTL (commit `565377e` message).
+   - The July Linux diff covered only about 30 registers (`AMDRadeonRDNA4/tools/linux/cursor-test.py`), and it did **not** compare DCHUBP_CNTL (commit `565377e` message).
 7. **[F] Other refuted or neutral points.**
    - `dpp pending 0x2220` means DPP1-3 CONFIG_UPDATE_PENDING (bits 5/9/13, `hdr sh_mask:17514-17525`). DPP0 is clean.
    - DCN401 has no IPS capability in `dcn401_resource.c` (grep: none).
@@ -109,7 +109,7 @@ The best-supported explanation is this: the kext programs every per-update curso
 - **[F] A gap in the pending W34/W35 experiment.**
   - It writes mission mode only if the GOP already programmed `SURF0_TTU_CNTL0` (`k:cursor.cpp:667-672`).
   - If the GOP left the DLG in test mode with zero values, which is exactly when this cause is live, the round logs "NOT written" and tests nothing.
-- **Fix.** Replay amdgpu's DLG/TTU/RQ block for 1080p60 (HUBPREQ0 `0x0620-0x065f` plus `DEBUG_DB=0x100`) under the OTG lock. The values must come from DML21; the cheapest source is `AMDRadeonRDNA4/tools/linux-capture.sh --snap-only`, whose list already includes HUBP0/HUBPREQ0 (`linux-capture.sh:414-451`).
+- **Fix.** Replay amdgpu's DLG/TTU/RQ block for 1080p60 (HUBPREQ0 `0x0620-0x065f` plus `DEBUG_DB=0x100`) under the OTG lock. The values must come from DML21; the cheapest source is `AMDRadeonRDNA4/tools/linux/linux-capture.sh --snap-only`, whose list already includes HUBP0/HUBPREQ0 (`linux-capture.sh:414-451`).
 
 ### #3 Cursor-only state that Linux gets from reset defaults or from writes the kext lacks
 

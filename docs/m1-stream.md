@@ -2,7 +2,7 @@
 
 Static map of what the guest writes for the host, from Apple's own binaries: `AppleParavirtGPU.kext` (kernel driver; the full 26.6.2 install's `SystemKernelExtensions.kc`) and `AppleParavirtGPUMetal.bundle` (the x86_64 slice of the user-space Metal device; `PGSerializer*` encoders). Branch `premetal/m0`.
 Status words: **measured** = read from the binaries (instruction level) or from a run; **INFER** = reasoned, not shown; **code** = written and compiled/tested on the host, not yet run against Apple's driver.
-Clean-room: everything below was derived from Apple's binaries with the tools in `tools/m0` and `tools/m1`; the only other source consulted was the register map already in `docs/metal-spike.md` s.6.1 (which cites reims-vgpu's public documentation, LGPL, as the pointer to look at the control block). No reims code, table or structure was used. No Apple bytes are in git: tables contain ids, sizes and names we derived.
+Clean-room: everything below was derived from Apple's binaries with the tools in `tools/metal/m0` and `tools/metal/m1`; the only other source consulted was the register map already in `docs/metal-spike.md` s.6.1 (which cites reims-vgpu's public documentation, LGPL, as the pointer to look at the control block). No reims code, table or structure was used. No Apple bytes are in git: tables contain ids, sizes and names we derived.
 
 ## 0. The answer in one page
 
@@ -16,7 +16,7 @@ There are **three command layers**, not one:
 
 The host sees FIFO commands directly in guest RAM; to see operations and the stream it must follow the kernel's `ExecIndirect`/object commands to **guest resources** and read them through the guest-built GPU page tables (`DefineHostTask` + `CommitIntoGPUPageTable`), which is the core of M1. In this commit the polling host decodes the FIFO layer (log-and-consume), `src/pvstream` carries the tables and walkers for all three layers, and `docs/m1-opcodes.md` and the tables in `src/pvopcodes.inc` hold **172 stream commands (148 with a constant-length writer, 24 more reached through helpers), 31 operations and 24 FIFO commands**.
 
-## 1. The FIFO layer (kernel driver -> host) [measured, `tools/m0/pvdis.py`]
+## 1. The FIFO layer (kernel driver -> host) [measured, `tools/metal/m0/pvdis.py`]
 
 **Framing.** `AppleParavirtCommandAllocator` builds each command in a 0x400-byte buffer (more via `IOMallocData` for big ones): `init(id, size)` writes `{u16 id at +0, u16 nBarriers at +2 (0), u32 length at +4 (= 0xc), u32 signal at +8 (0)}`; `addBarrier(a, b)` appends 8 bytes and bumps `nBarriers`; `addSignal(_, v)` writes `v` at +8; `getCommandBytes(n)` appends `n` payload bytes and grows `length`; `submitOnChannel(ch, desc)` hands `{pointer, length/4}` to the channel. The first record of a payload begins at `12 + 8 * nBarriers` (`getPayloadOffset`). A command is therefore **self-sized**: `length` (bytes, multiple of 4) covers header, barriers and payload.
 
@@ -58,7 +58,7 @@ Per-command log lines for all of these come from `pvstream::describeFifo` (`Defi
 
 ## 1b. The display pipe: shared state, events, transactions, cursor [measured unless marked; hub-task-451]
 
-Read with `tools/m0/pvdis.py dis AppleParavirtDisplayPipe::...` (26.6.2). Classes: `AppleParavirtDisplayMachine` (one per accelerator; `signalDisplays`), `AppleParavirtDisplayPipe` (one per display, **port < 8**, name `Display<port>`; `init` refuses port >= 8), `AppleParavirtFramebuffer` (the IOFramebuffer; `connectionChange`). The number of displays is `ctrl+0x22c` (`kRegNumDisplays`).
+Read with `tools/metal/m0/pvdis.py dis AppleParavirtDisplayPipe::...` (26.6.2). Classes: `AppleParavirtDisplayMachine` (one per accelerator; `signalDisplays`), `AppleParavirtDisplayPipe` (one per display, **port < 8**, name `Display<port>`; `init` refuses port >= 8), `AppleParavirtFramebuffer` (the IOFramebuffer; `connectionChange`). The number of displays is `ctrl+0x22c` (`kRegNumDisplays`).
 
 **The pipe's channel.** `DisplayPipe::init` creates its own `AppleParavirtVirtualChannel`: `init(accel, port + 5, 8, 0x90, 0x480, "Display<port>", ring 0x1000, port + 5)`, i.e. **channel number `port + 5`** (5..12) with a **one-page ring**; the root channel is `ROOT` with `(0, 0x80, 0x90, 0x4800)`. The record's `kind` (the stamp index) is the channel object's u16 at +0x20, which the base class sets from the first int [INFER: = the channel id, 0 for ROOT, 1..4 for the standard four, port + 5 for a display; the host takes it from the record anyway]. Everything the pipe sends (0x01 setup, 0x02, 0x04-0x07, 0x1e) goes **on that channel**, not on the root FIFO.
 
@@ -141,7 +141,7 @@ Not found as simple immediates (variable, built by helpers): render/compute **pi
 
 **Command framing inside a segment.** `-[PGSerializerCommandEncoder getCommandBytes:forCommand:]` is the single writer: it asks the stream for `align4(payload + 8)` bytes, stores `{u32 id (command), u32 size (bytes including this header)}` and returns a pointer to the payload (which the caller fills; a NULL means the chunk is full: the encoder retries after a split).
 
-**Commands.** `docs/m1-opcodes.md` (generated by `tools/m1/gen-opcodes.py --md` from the writers' call sites) has every id, payload length and field list. Ranges:
+**Commands.** `docs/m1-opcodes.md` (generated by `tools/metal/m1/gen-opcodes.py --md` from the writers' call sites) has every id, payload length and field list. Ranges:
 
 | group | ids | examples (payload bytes) |
 |---|---|---|
@@ -163,7 +163,7 @@ Not found as simple immediates (variable, built by helpers): render/compute **pi
 
 ## 6. What is implemented now (code)
 
-- `src/pvstream.{hpp,cpp}` + generated `src/pvopcodes.inc`: names/lengths of the three layers (binary-searched), `fifoHeader`/`describeFifo` (FIFO framing validation and per-command description), `streamHeader`/`walkCommands` (stream and operation framing), `segmentTypeName`. Host test `tools/pvstream-test.cpp` (in `make test`): framing across a ring wrap, barriers, malformed headers, unknown ids, truncation, table spot checks against the values read above.
+- `src/pvstream.{hpp,cpp}` + generated `src/pvopcodes.inc`: names/lengths of the three layers (binary-searched), `fifoHeader`/`describeFifo` (FIFO framing validation and per-command description), `streamHeader`/`walkCommands` (stream and operation framing), `segmentTypeName`. Host test `test/pvstream-test.cpp` (in `make test`): framing across a ring wrap, barriers, malformed headers, unknown ids, truncation, table spot checks against the values read above.
 - `src/pvgpu.cpp` polling host: every new FIFO span is walked as commands and logged as `host: fifo @0x...: cmd 0x3a GetDeviceInfo, 24 bytes (12 payload), 0 barrier(s), signal 0x7: reply buffer page 0x1234, 4096 bytes`; a span that does not start with a command header is hex-dumped (12 times) and abandoned; everything is acknowledged (`FIFO_READ = FIFO_WRITTEN`). The self-test sends two valid commands, one across the ring wrap. Still log-and-consume, default off.
 - Child channels (`DefineChannel` -> record in the root page -> page-list ring, polled every tick, commands decoded and answered, per-channel stamp and interrupt bit): implemented in the M0 host and self-tested (`docs/m0-pvgpu.md`, hub-task-447). The page list has no length field: the host takes the entries up to the first zero (the driver zeroes the page first).
 - Display pipe (hub-task-451, `src/pvgpu.cpp` + `pvstream::disp`): the shared-state page stays mapped; optional *online* event with the display info (`rdna4-pvgpu-disp` bit 0), ~60 Hz VBL events for pipes whose guest enabled VBL (bit 1, default), level-triggered `INTR_STATUS_DISP`, the 0x02/0x04-0x07/0x1e commands decoded and counted (their completion is the generic stamp), cursor fields and the `ctrl+0x220` kick logged; self-tested (`docs/m0-pvgpu.md` Test A).
@@ -182,6 +182,6 @@ Not found as simple immediates (variable, built by helpers): render/compute **pi
 ## 8. Reproducing
 
 Needs `~/work/tools/macos-full` (Apple's collections and the bundle, outside the repo; `lipo -thin x86_64` of the bundle's binary to `m1/apv-x86_64`).
-- `tools/m1/apvdis.py classes|methods|dis|strings|addr` (the bundle: ObjC classes with ivars, method addresses/sizes, annotated disassembly with selector/CFString/cstring resolution; `llvm-objdump` for the instruction listing),
-- `tools/m1/apvcmds.py table|layout|json` (the command scanner), `tools/m1/gen-opcodes.py [--md]` (generates `src/pvopcodes.inc` and `docs/m1-opcodes.md`),
-- `tools/m0/pvdis.py list|dis|xref|vt` (the kernel driver in the collection, imports resolved through the chained fixups).
+- `tools/metal/m1/apvdis.py classes|methods|dis|strings|addr` (the bundle: ObjC classes with ivars, method addresses/sizes, annotated disassembly with selector/CFString/cstring resolution; `llvm-objdump` for the instruction listing),
+- `tools/metal/m1/apvcmds.py table|layout|json` (the command scanner), `tools/metal/m1/gen-opcodes.py [--md]` (generates `src/pvopcodes.inc` and `docs/m1-opcodes.md`),
+- `tools/metal/m0/pvdis.py list|dis|xref|vt` (the kernel driver in the collection, imports resolved through the chained fixups).

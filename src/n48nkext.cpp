@@ -3,7 +3,7 @@
 //  AMDRadeonRDNA4
 //
 //  The Vulkan interface on the card (docs/vulkan-port.md, step 1): the user
-//  client that carries the calls of vulkan/navi48_native_abi.h, and what
+//  client that carries the calls of userspace/vulkan/navi48_native_abi.h, and what
 //  stands behind the client engine of n48n.cpp here, the runtime's own
 //  pieces:
 //

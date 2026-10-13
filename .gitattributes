@@ -3,4 +3,4 @@
 *.sh text eol=lf
 
 # Vendored patches apply byte for byte: no end-of-line conversion.
-vulkan/mesa-patches/*.patch -text
+userspace/vulkan/mesa-patches/*.patch -text

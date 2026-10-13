@@ -17,7 +17,7 @@ MEC queue service). It is also the cheapest thing to test, because it is one boo
 Hence **two boots, in this order**: **9** (plain VM boot + the instrumentation), then **9b** (exactly round 6's VM configuration + the instrumentation). The pair is an A/B on the
 confound; every other hypothesis (H1-H8) is read from either boot's survey/probe lines.
 
-## 1. The boots (`tools/set-boot.sh 9` / `9b`)
+## 1. The boots (`tools/rig/set-boot.sh 9` / `9b`)
 
 | Boot | boot-args added to the base (`keepsyms=1 debug=0x100 npci=0x2000 -v -lilubetaall rdna4-trace=1 rdna4-compute=7 rdna4-pspdump=1`) |
 |---|---|
@@ -36,7 +36,7 @@ confound; every other hypothesis (H1-H8) is read from either boot's survey/probe
 
 ## 2. What to do and what the script extracts
 
-`bash set-boot.sh 9` -> reboot -> log in -> `bash diagnostic-log.sh` (unchanged usage). New in `tools/diagnostic-log.sh`:
+`bash set-boot.sh 9` -> reboot -> log in -> `bash diagnostic-log.sh` (unchanged usage). New in `tools/rig/diagnostic-log.sh`:
 
 - `active:` now lists `vm-diag vm-exec vm-ispte vm-force-fail vmid-test gfxpm gfxcg gfxoff gfxcap` (the omission hid the confound).
 - Sections: `dmesg: VM/queue diagnostic` (every `vmidtest:` line), `dmesg: runtime client lines` (every `runtime:` line, host-buffer noise removed; the old feature filter dropped every

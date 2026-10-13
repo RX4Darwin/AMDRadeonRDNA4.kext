@@ -266,7 +266,7 @@ Branch `premetal/power` on `premetal/w12k` (f43d3c9). New file `src/pmidle.cpp`;
   `Compute,GFXIdle` = `idle|busy for N ms (<why>); total busy M ms idle K ms, T transitions; last use: <what>` (updated on the first 32 transitions, then every 8th). `diagnostic-log.sh` row `gfx-idle-acct`.
 - Not done (by design): no hook in `rtAlloc`/`rtLoad` (CPU copies), no SDMA-engine busy probe, no SMU coupling. The 100 ms / 50 ms constants are in `pmidle.cpp` (`kIdleDelayMs`, `kIdlePollMs`).
 
-### 9.2 P3 — post-client idle (`tools/diagnostic-log.sh`, no kext change)
+### 9.2 P3 — post-client idle (`tools/rig/diagnostic-log.sh`, no kext change)
 
 After the application steps (`tri`/`tricol`, or whatever clients ran) and before the recovery/sleep steps: `sleep 3`, then `rdna4-run sensors`; row **`post-idle`**: PASS when SMU GFX activity < 10 % **and**
 socket power < 40 W, FAIL `STAYS HIGH` otherwise, with the pre-selftest baseline in the text; SKIPPED when the runtime is unavailable. (`sensors` opens one short connection; it reads the SMU, it does not use
@@ -298,11 +298,11 @@ What is **not** guaranteed: that the display is blanked before the GPU's MEC/PFP
 
 ### 9.5 Verification so far, and what is open
 
-- Kext + `rdna4-run` build (`OSXCROSS=$HOME/.local/share/osxcross bash tools/build-osxcross.sh`, exit 0; one pre-existing warning `cgArg`); `nm -u` of the new kext identical to `AMDRadeonRDNA4-int`'s; `bash -n` on the scripts.
+- Kext + `rdna4-run` build (`OSXCROSS=$HOME/.local/share/osxcross bash tools/build/build-osxcross.sh`, exit 0; one pre-existing warning `cgArg`); `nm -u` of the new kext identical to `AMDRadeonRDNA4-int`'s; `bash -n` on the scripts.
 - Emulator dry runs requested from Kiln (boot 8 + `rdna4-gfxidle=1`; `rdna4-sleeptest=1` sleep path with and without `rdna4-resume-tests=1`; a wait in flight during the debug sleep selector): results in the hub-task-328 report.
 - **Emulator runs on the final tree (Kiln, hub-task-330, `premetal/final` 20c2997, bin/final3)**: boot 10: `gfx-idle-acct PASS` with the expected `idle:` transitions (e.g. `busy -> idle after 1373 ms busy (last use: copy ...)`, `idle -> busy after 3812 ms idle (dispatch)`), no timer/lock hang, clients PASS; `post-idle` FAILs only because the emulator's SMU is a constant 3 % / 120 W. Boot 11s: `sleep PASS`, `power: sleep requested`, `gfx: no client gfx IB in flight`, the wake skips the G3/G4 draws and the flip test; with `rdna4-resume-tests=1` the draws and the flip test run again after the wake (old behaviour back); with `rdna4-sleepabort=0` the cycle also passes (the emulator's sleeptest op is too short to show the old waiting-to-timeout behaviour). **Still not exercised**: an abort of a long/hung dispatch in flight during the sleep selector (the emulator does not model that), and everything on the real card.
 - Not verified anywhere: the idle state machine against a real client mix; that `removeEventSource` in `powerWillSleep` (under `rtLock`) cannot deadlock against `idleTick` (it only `TryLock`s; the present timer's stop path has the same shape) [I]; the abort while a real wave runs.
-- Real-card boots (`tools/set-boot.sh`): **10** = boot 8 + `rdna4-gfxidle=1` (P2/P3, no hardware change); **11** = boot 8 + `rdna4-pm=1 rdna4-gfxidle=1`, the sleep/wake boot: **never run on the card, run it last**,
+- Real-card boots (`tools/rig/set-boot.sh`): **10** = boot 8 + `rdna4-gfxidle=1` (P2/P3, no hardware change); **11** = boot 8 + `rdna4-pm=1 rdna4-gfxidle=1`, the sleep/wake boot: **never run on the card, run it last**,
   power-cycle after. (Boot numbers 9/9b belong to the VM diagnostic on `premetal/vmdiag`; the numbering in §7 above predates that and its "boot 9/10/11" are superseded by this list and by `docs/boot9-vm-diagnostic.md`.)
 
 ### 9.6 SDMA across a wake: what the kext does with the engine's pointers (hub-task-357)
@@ -319,7 +319,7 @@ or on an engine whose power was lost. Whether our unhalt-only sequence resets th
 **The fix (P7, `stageSdma`, only when `resumePending`)**: read the engine's RB_RPTR/RB_WPTR (64-bit) and **resume the ring at `max(rptr, wptr)`** (dword aligned): `Sdma::Ring::init(..., startWptr)`, RB_RPTR = RB_WPTR = that value, the MCU poll copy and rptr writeback likewise. It never lowers a pointer, so it is
 correct whether or not the engine was reset (it reads 0 after a power loss and behaves as before), needs no claim about what a halt does to the pointers, and leaves the **first boot path untouched** (the proven one). Ring memory is re-zeroed (NOPs) as before.
 **Emulator** (only where it was wrong about the hardware): the ring position is now `RB_RPTR mod ring size` (the emulator took the raw register as the position: a driver programming the engine's own 64-bit pointer broke it), and a zero write to RB_WPTR logs
-`wptr restarted at 0 (was 0x...)` so the harness output shows whether the queue was re-programmed. The emulator's monotonic-wptr rule stays (it is the card's, `ae70f2e`). Host test: `tools/atomdump.cpp` `sdma: ring resumed at the engine's pointers`.
+`wptr restarted at 0 (was 0x...)` so the harness output shows whether the queue was re-programmed. The emulator's monotonic-wptr rule stays (it is the card's, `ae70f2e`). Host test: `test/atomdump.cpp` `sdma: ring resumed at the engine's pointers`.
 **Not claimed**: that the rest of the bring-up works on a live GPU (PSP `LOAD_IP_FW`/autoload again while the firmware runs is unproven on the card: the emulator accepts it), nor what an actual S3 does to the card.
 
 ### 9.7 Display sleep in Recovery, and the post-resume IH self-test (hub-task-367)

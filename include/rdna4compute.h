@@ -4,7 +4,7 @@
  *
  *  The user-space compute interface: what a program passes to the kext's
  *  RDNA4ComputeClient through IOConnectCallMethod. Shared, unchanged, by the
- *  kext (src/userclient.cpp) and user space (userspace/librdna4.c), so it
+ *  kext (src/userclient.cpp) and user space (userspace/rdna4-run/librdna4.c), so it
  *  is plain C with fixed-width types.
  *
  *  The service appears once the bring-up reached stage 6 (rdna4-compute=6

@@ -326,7 +326,7 @@ private:
 	void pm4Kick(Pm4::Queue &queue, uint32_t doorbell, uint64_t wptrDwords);
 	bool stageCompute();
 
-	// Stage 6: run a real kernel (shaders/probe.s) on the compute units.
+	// Stage 6: run a real kernel (src/shaders/probe.s) on the compute units.
 	static constexpr uint32_t kShaderOffset   = 14u << 20;            // code, 256-byte aligned
 	static constexpr uint32_t kDispatchBuffer = 20u << 20;            // results
 	static constexpr uint32_t kDispatchGroups = 4, kGroupSize = 64;
@@ -375,7 +375,7 @@ private:
 	static bool kernelFits(const CodeObj::Kernel &k, const char **why);
 	bool stageDispatch();
 
-	// Stage 7: a clang-built kernel (shaders/vadd.cl) from its code object.
+	// Stage 7: a clang-built kernel (src/shaders/vadd.cl) from its code object.
 	static constexpr uint32_t kCodeObjCode    = kShaderOffset + 0x10000;   // up to 64 KiB
 	static constexpr uint32_t kCodeObjCodeMax = 0x10000 - 0x100;          // + prefetch pad
 	static constexpr uint32_t kKernargOffset  = kShaderOffset + 0x20000;   // up to 4 KiB
@@ -466,7 +466,7 @@ private:
 	// G4: the colour triangle (vertex 0 red, 1 green, 2 blue through the attribute ring), after a passing G3 baseline, rdna4-gfxcol=1.
 	struct GfxColResult {
 		bool ok, ringDone;
-		uint32_t drawFence, covered, badAlpha, notDominant, maxChannelErr256, maxSumErr;   // the check of userspace/gfx12tricol.h
+		uint32_t drawFence, covered, badAlpha, notDominant, maxChannelErr256, maxSumErr;   // the check of userspace/rdna4-run/gfx12tricol.h
 		uint32_t minX, maxX, minY, maxY, near0, near1, near2, centroid;
 		uint32_t cInv, cPrim, ps;              // pipeline statistics deltas (probe boots)
 		uint64_t ns;

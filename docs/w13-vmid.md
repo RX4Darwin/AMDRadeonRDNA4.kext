@@ -32,7 +32,7 @@ wording, nothing was reset). The rest of this document is as written.
 
 **Status after the lead's review (hub-task-307, 2026-09-30/10-01):** design B approved; two shared queues, C deferred, old fixed-VMID path kept
 behind a boot-arg until S9, root-only userclient unchanged for pre-Metal. Done on `premetal/w13`: **S0** (`3b8df07`, the `rtFree`/`rtUnload` invalidate),
-**S5** (`4386290`, `src/vmid.{hpp,cpp}` + 36 host checks, mutation-checked), **S4** (`2867f86` emulator E1-E6, `3fc6950` `tools/emu-qtest-vm.py`, 32 checks
+**S5** (`4386290`, `src/vmid.{hpp,cpp}` + 36 host checks, mutation-checked), **S4** (`2867f86` emulator E1-E6, `3fc6950` `tools/vm/emu-qtest-vm.py`, 32 checks
 that run on the built emulator with no guest), and the compute replay for U1 (`446e48c`, written, **not run**). Not done: S1-S3, S6-S10. Section 6 has the
 per-step status, section 7 what the emulator now models, section 8.1 the final real-card boot plan.
 
@@ -127,7 +127,7 @@ VM boot costs nothing. (3) I do **not** claim design B fixes the failure: it rem
 register writes, which are two of the differences above, but the wave-in-VMID-8 difference stays. (4) S7's "first client path on the card" is therefore a diagnosis step as
 much as a feature step.
 
-The two-client selftest in `userspace/rdna4-run.c:482-533` is what produced the `VM peer` lines above; in the emulator the two "concurrent" clients are serialised by limit 9 anyway.
+The two-client selftest in `userspace/rdna4-run/rdna4-run.c:482-533` is what produced the `VM peer` lines above; in the emulator the two "concurrent" clients are serialised by limit 9 anyway.
 
 ## 2. How amdgpu does it (7.2.2, read)
 
@@ -331,7 +331,7 @@ priorities or preemption turn out to matter.
 - `RtClient` becomes a heap object, found through a table keyed by owner (linear or hash; ≤ a few hundred). Holds: PD (root MC/physical), page-table
   state (5.2), `tlbSeq`, `hostBytes`, fence counter, a small in-flight job ring (client fence value → `{queue, seq}`; replaces `ibFences[16]`), the kernarg
   page and kernel-IB page, `aborted`. **No** `vmid`, `pipe`, `queue`, `doorbell`, `pm4`, queue VAs.
-- `VmidPool` (new, freestanding `src/vmid.{hpp,cpp}` so the policy is host-testable the way `gpuvm.cpp` is, through `tools/atomdump.cpp`/`make test`):
+- `VmidPool` (new, freestanding `src/vmid.{hpp,cpp}` so the policy is host-testable the way `gpuvm.cpp` is, through `test/atomdump.cpp`/`make test`):
   15 slots, `grab`, `noteSubmit(vmid, queue, seq)`, `forget(client)` (on close), `unbindAll()` (after wake/reset). Policy only; it takes a
   "has this fence been reached" callback and never touches hardware.
 - `CmdQueue[]` (new): the shared compute queues and the gfx ring as two kinds of the same thing: a ring (`Pm4::Queue`), a kernel fence address + next
@@ -429,7 +429,7 @@ per-client buffer (128) and program (16) quotas with the global tables raised (1
 Faults name the client: the IH logs the PASID's client slot for both the UTCL2 and the GC-hub VM-fault vectors (`vmClientSlotByPasid`, a racy read on purpose: the IH thread must not take `rtLock`).
 **Tests**: host: `testPtPages` (20 checks; lazy/packed/sparse pages, quota, allocator failure, release-once, a quota-full client = 128 chunks, layout bounds incl. slot 64 and a one-byte overrun) and the pool's `prevOwner` check; emulator (qtest, no guest): `test_vmid_rebind_protocol` — client A and B on one VMID, rebind + invalidate isolates them and the fault vector carries the current PASID;
 **negative control**: the same rebind without the invalidate lets A's job reach B's page and the emulator logs `STALE TRANSLATION used` (E1). **Legacy-path safety (hub-task-340).** S8 touched the page-table code that modes 0 and 1 use, so that code is now `src/gpuvmtable.{hpp,cpp}` (freestanding; `vmMap`/`vmMapHost`/`vmUnmap` call it, and `ptEntry`/`ptPhys` use its `legacyEntry`/`legacyPhys`) and
-`testVmTableDifferential` (tools/atomdump.cpp, `make test CXX=g++`) runs the **pre-S8 code verbatim** (`tools/legacy-vmtable-ref.inc`, commit `0cfa416`) against it on the contiguous 4 MiB image: return values, the PT pages handed to `vmTableSync`, and the whole image byte for byte
+`testVmTableDifferential` (test/atomdump.cpp, `make test CXX=g++`) runs the **pre-S8 code verbatim** (`test/ref/legacy-vmtable-ref.inc`, commit `0cfa416`) against it on the contiguous 4 MiB image: return values, the PT pages handed to `vmTableSync`, and the whole image byte for byte
 (IS_PTE bit 63, EXECUTABLE, SYSTEM/SNOOPED, FRAG=4, the W22 set/clear masks) for 5 flag policies × 2 FB offsets: scripted histories (the rtOpen layout, program/device/host buffers mapped, unmapped, remapped, the freed-VA sequence, a 2 MiB-boundary straddle, close/reopen, every refusal path, a `vmTableSync` failure)
 plus 160 seeded random operations each (about 1750 in all: ~500 maps ok / ~370 refused, ~190 host maps ok / ~150 refused, ~550 unmaps; it is seeded from a pointer, so the counts move between builds). (Until hub-task-346 this test also compared a third, sparse image of the same logical layout; mode 2 no longer uses that layout, see below, so that arm is gone.) Mutation-checked: an off-by-one-page PDE or `ptPhys`/`legacyEntry`, dropped IS_PTE, dropped EXECUTABLE rule, a wrong FRAG condition, dropped SNOOPED,
 an unmap that misses the last page, an ignored clear mask, a short `lastPt`, a wrong host physical address and a PDE that is always rewritten each fail; a +8 byte PDE offset cannot (the PDE encoder masks the low 12 bits: equivalent mutant).
@@ -437,7 +437,7 @@ Found by the test (pre-existing, **not changed in modes 0 and 1**): the contiguo
 **Metal-phase note (modes 0/1):** a Metal client will want far more than 1 GiB of VA, so modes 0/1 stay legacy-only (never the path for Metal); the page-table layout of mode 2 is the one to carry forward. Changing the contiguous image would change the page-table bytes of the paths that have run on the real card, which is why it was left alone.
 **The 1 GiB limit, fixed in mode 2 only (hub-task-346).** `GpuVmTable::treeMapVram/treeMapHost/treeUnmap` walk a per-client `PtPages::Sparse`: a directory keyed by (level, va >> 39 / >> 30 / >> 21) that backs a page on first use, links it into its parent (PDE written only where empty, like the contiguous code) and marks every page it changes dirty; `sparseSync` copies the dirty pages to their VRAM pages by SDMA (a page stays dirty until its copy worked, so a failed sync loses nothing).
 Nothing is shared between GiB, so a mapping can sit anywhere in 4 GiB..2^48; the limit is the page quota (2048 pages, 8 MiB of VRAM and of wired shadow per client, at most 8192 pages over all clients). The leaf PTE code is shared with the contiguous walker (`vramLeaf`/`hostLeaf`, still guarded by the differential test).
-Host tests (`testSparseTree`, tools/atomdump.cpp): every mapped VA is checked by `GpuVm::walk` over the **synced VRAM copy** from the root, so a missing dirty mark or a missing PDE is a fault, not a pass; a 128 KiB map across the 1 GiB line; 40 consecutive GiB straddles; a map 600 GiB up (second PDB1 page); the top of the 48-bit space; host maps; unmap (PTEs cleared through the dirty path, nothing backed for a range never mapped); quota (8 pages: refusal leaves nothing behind and earlier mappings resolve) and host-memory exhaustion; close returns every chunk and shadow page; the directory hash.
+Host tests (`testSparseTree`, test/atomdump.cpp): every mapped VA is checked by `GpuVm::walk` over the **synced VRAM copy** from the root, so a missing dirty mark or a missing PDE is a fault, not a pass; a 128 KiB map across the 1 GiB line; 40 consecutive GiB straddles; a map 600 GiB up (second PDB1 page); the top of the 48-bit space; host maps; unmap (PTEs cleared through the dirty path, nothing backed for a range never mapped); quota (8 pages: refusal leaves nothing behind and earlier mappings resolve) and host-memory exhaustion; close returns every chunk and shadow page; the directory hash.
 **Negative control**: the same crossing map on the contiguous layout succeeds and the far side does not translate. **Mutants that fail the tests**: PDB0 page shared between GiB, PDB1 PDE never written, new PDE not marked dirty, unmap or map (VRAM and host) not marking an existing PT page dirty. Not run: the kext path (no guest); `sparseSync` per call copies only dirty pages, which is fewer copies than the old fixed three plus the touched PT pages.
 What is still reviewed, not executed: the wrappers around the module (argument checks, sync order: mirrored in the test), `launch()`'s `put`/`viaIb` split, `rtRelease`'s sparse branch; the legacy paths are otherwise unchanged except `clientCap()`, `bufferCap()/programCap()` (256/32 in modes 0/1), larger arrays, `vmInvalidateOwned` (= `vmInvalidate(c.vmid)` in modes 0/1).
 **Shared-queue doorbells (hub-task-347):** dwords 74 and 76, no longer 42/44, which the S1 probe queues at (0,1)/(1,1) also use (client slots use 26-40); the emulator had routed the shared queues' doorbells to a dequeued probe HQD (the first queue ever used with the dword) and the jobs silently never ran. The emulator now routes only to ACTIVE HQDs (qtest `test_doorbell_routes_to_active_queue`).
@@ -447,7 +447,7 @@ What is still reviewed, not executed: the wrappers around the module (argument c
 ## 6. Implementation plan — small steps, each with a test
 
 "Emu" = QEMU `rdna4` device + macOS guest (the Linux emulator loop being built by Kiln, workstream #1) and the host unit tests
-(`make test`, extended like `gpuvm.cpp` via `tools/atomdump.cpp`). "Card" = needs the real card, only after the lead's OK.
+(`make test`, extended like `gpuvm.cpp` via `test/atomdump.cpp`). "Card" = needs the real card, only after the lead's OK.
 Every step is behind a boot-arg until the last (`rdna4-vmid=1`); default behaviour does not change until step S9.
 
 | Step | Change | Emu test | Card proof needed |
@@ -470,7 +470,7 @@ rebinding), then S8 (rebinding). S6 has no hardware effect. The two halves of B 
 
 ## 7. Emulator changes needed to model this faithfully (`emu/qemu/rdna4.c`)
 
-**Status (2026-10-01).** E1-E6 are implemented in `emu/qemu/rdna4.c` (`2867f86`) and compile clean against QEMU 10.0.13. `tools/emu-qtest-vm.py` (`3fc6950`) drives the
+**Status (2026-10-01).** E1-E6 are implemented in `emu/qemu/rdna4.c` (`2867f86`) and compile clean against QEMU 10.0.13. `tools/vm/emu-qtest-vm.py` (`3fc6950`) drives the
 built device over qtest with no guest and checks 32 things, each with its negative control: a stale translation survives a remap until an invalidation names the VMID
 (and not another VMID); L1-only, L2-only and PDE-level invalidations behave per their bits; a context-base rewrite does not flush; `inv-ack-reads=3` delays the effect
 until the third ACK read; engines 0, 5, 17 work and `inv-noack` never completes; `tlb-off` reproduces what the old emulator hid; `SH_MEM_*` are per VMID; `IH_VMID_LUT`
@@ -479,7 +479,7 @@ stamps the PASID into a fault vector at write time. One mutation was tried (an i
 **Not exercised:** E3 (the ring-level write-register-and-wait flush needs the gfx ring's clear-state bring-up to run; it is reviewed and compiled, not run), E9 (prefetch past
 `PFP_SYNC_ME`, deliberately not modelled), and any macOS-guest run. Expect the first guest runs to print `STALE TRANSLATION used` wherever the kext skips an
 invalidation: each one is a finding, not noise. The E5 fault vector is new behaviour for every guest run (the emulator raised none before).
-Run: `QEMU=<qemu-system-x86_64 with the rdna4 device> tools/emu-qtest-vm.py` (builds are described in `tools/emu-build.sh`).
+Run: `QEMU=<qemu-system-x86_64 with the rdna4 device> tools/vm/emu-qtest-vm.py` (builds are described in `tools/vm/emu-build.sh`).
 
 
 The project's past mistake (W36 review: the emulator was bent until the kext passed, then the real card failed) applies directly: **a VMID-virtualisation design
@@ -550,7 +550,7 @@ surveys and the op trace are also appended as compact entries to the registry pr
 the op trace logs refusals (`dispatch/submitib/waitfence REFUSED: rtWedged`), every `rtWedged = true` with its cause, and `open FAILED`; one survey is taken after the first client dispatch, done or timed out.
 **Boot 9 runs WITHOUT `rdna4-vm-diag`; 9b replicates round 6 with it.** With `rdna4-vmshared=1` the same boot exercises S7-lite (section 5.9).
 Result string: `AMDRadeonRDNA4,Results vmidtest` (`P` pass, `F` fail, `H` shader hang, `S` skipped, `D` SH_MEM readback differs). It has **not been run anywhere**: built, reviewed, and its
-emulator-side assumptions pinned by `tools/emu-qtest-vm.py` (35 checks); a macOS-guest dry run is for Kiln's loop.
+emulator-side assumptions pinned by `tools/vm/emu-qtest-vm.py` (35 checks); a macOS-guest dry run is for Kiln's loop.
 
 **What `rdna4-vmid-test` bit 1 does** (all on one spare MEC slot, never a slot a client can have, with the same EOP/rptr discipline as the boot test):
 
@@ -559,7 +559,7 @@ emulator-side assumptions pinned by `tools/emu-qtest-vm.py` (35 checks); a macOS
 | C0 | Read-only: `GRBM_STATUS`, `CP_STAT`, `CP_CPC_BUSY_STAT`, `SQ` busy bits, before and after `vmBootSelfTest` (the `pm:` survey) | logged | names the engine that is busy at idle |
 | C1 | A queue with `CP_HQD_VMID` = 0, `PRIV_STATE \| KMD_QUEUE`, PQ/EOP/rptr/wptr at MC addresses. Its ring holds `INDIRECT_BUFFER(vmid = n, VA of an IB page mapped ONLY in VMID n's tables, unprivileged)`, then a `RELEASE_MEM` fence at a VMID-0 address. The IB: `WRITE_DATA` of a known pattern to a second VA page of VMID n, then nothing else. Repeat for n = 1, 8, 15 (each with its own tables and `CONTEXTn` programming) | fence seen, pattern in the page, `GCVM_L2_PROTECTION_FAULT_STATUS` = 0 | **U1** if n = 8 fails; **U2** if only 1 or 15 fail |
 | C2 | Negative control of C1: the same ring with the IB packet's VMID = n+1 (context never enabled) | a fault whose VMID field is n+1 (the IB fetch), no pattern | if it instead *succeeds*, the IB ran in VMID 0 or in the queue's VMID: the packet's VMID field is not what decides, and U1 is false |
-| C3 | Same as C1 (n = 8) but the IB is the recorded vadd dispatch (`userspace/pm4build.h`, the kext's `kVaddCodeObject`, code page executable in VMID 8's tables, kernarg and data pages R/W), `SH_MEM_CONFIG/BASES` for VMIDs 1-15 programmed beforehand (S2) | `c[i] = a[i] + 3 b[i]` for 256 items | **the first shader wave in a non-zero VMID**: a failure here with C1 passing isolates the wave/SH_MEM/code-fetch part of the client-path failure |
+| C3 | Same as C1 (n = 8) but the IB is the recorded vadd dispatch (`userspace/rdna4-run/pm4build.h`, the kext's `kVaddCodeObject`, code page executable in VMID 8's tables, kernarg and data pages R/W), `SH_MEM_CONFIG/BASES` for VMIDs 1-15 programmed beforehand (S2) | `c[i] = a[i] + 3 b[i]` for 256 items | **the first shader wave in a non-zero VMID**: a failure here with C1 passing isolates the wave/SH_MEM/code-fetch part of the client-path failure |
 | C4 | C3 again with the wave's code page mapped without `EXECUTABLE` | a permission fault (status bit 7 set, `PERMISSION 8`), VMID field 8 | proves the wave's instruction fetch really goes through VMID 8's tables (the W40 lesson, now for a wave) |
 | C5 | Dequeue the test queue and check `CP_HQD_ACTIVE` returns to 0 | inactive | a timeout here with C1-C4 passing points at dequeue while waves ran, the client-close symptom |
 
@@ -576,7 +576,7 @@ with `0x00800880`-like status; with the new TLB model a missing `vmInvalidate` b
 
 Kext (this worktree, `premetal/g4`): `src/runtime.cpp` (rtOpen/rtRelease/rtDispatch/rtSubmitIb/rtWaitFence/vm*/power), `src/compute.cpp` (`hqdInitFor`,
 `recoverComputeQueue`, `launch`, `gfxOffAllowedNow`), `src/compute.hpp`, `src/gpuvm.*`, `src/userclient.*`, `src/ih.*`/`ihdecode.cpp`, `src/gfxring.cpp`, `src/pm4.*`,
-`src/gfxregs.hpp`, `include/rdna4compute.h`, `userspace/rdna4-run.c`; docs `rootcause/verify-vm.md`, `w12k-gfx-submit.md`, `linux-replay.md`, `hw-logs/2026-09-30-linux-gfx-ring/`;
+`src/gfxregs.hpp`, `include/rdna4compute.h`, `userspace/rdna4-run/rdna4-run.c`; docs `rootcause/verify-vm.md`, `w12k-gfx-submit.md`, `linux-replay.md`, `hw-logs/2026-09-30-linux-gfx-ring/`;
 `w36-report.md`, `w40-report.md`; `emu/qemu/rdna4.c` (VM walk `:2113-2420`, banked registers `:745-800`, MEC `:3789-4225`, gfx stream `:5560-5720`).
 
 Linux 7.2.2 (`~/work/tools/linux-amdgpu/src`, sparse checkout of `drivers/gpu/drm/amd/{amdgpu,amdkfd,include}`, read-only):

@@ -1915,7 +1915,7 @@ void RDNA4Compute::gfxPmExperiment(uint32_t mask) {
 bool RDNA4Compute::stagePsp() {
 #ifdef AMDRadeonRDNA4_NO_FIRMWARE
 	CLOG("psp: this build carries no firmware (firmware/amdgpu/ was empty at build time)");
-	publishResult("firmware", "FAIL none in this kext: tools/fetch-firmware.sh, then make clean && make");
+	publishResult("firmware", "FAIL none in this kext: tools/build/fetch-firmware.sh, then make clean && make");
 	return false;
 #else
 	OSDictionary *d = OSDictionary::withCapacity(12);
@@ -3327,7 +3327,7 @@ bool RDNA4Compute::kernelFits(const CodeObj::Kernel &k, const char **why) {
 	return !w;
 }
 
-// shaders/probe.s: VMID0, wave32, 4 groups of 64 work-items, each writing
+// src/shaders/probe.s: VMID0, wave32, 4 groups of 64 work-items, each writing
 // 0x5EED0000 + 3 * its global id.
 bool RDNA4Compute::stageDispatch() {
 	OSDictionary *d = OSDictionary::withCapacity(8);
@@ -3406,7 +3406,7 @@ bool RDNA4Compute::stageDispatch() {
 // Stage 7: a clang-built kernel from its code object
 // ---------------------------------------------------------------------------
 
-// shaders/vadd.cl as clang and ld.lld built it: the loader finds the kernel
+// src/shaders/vadd.cl as clang and ld.lld built it: the loader finds the kernel
 // and its descriptor in the ELF, and the launch is what the descriptor asks
 // for — RSRC1/2/3 as compiled, the kernarg pointer in the first user SGPRs.
 // c[i] = a[i] + 3 * b[i] over kVaddItems work-items.

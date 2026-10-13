@@ -46,7 +46,7 @@ struct ModeReg {
 };
 
 // One generated table per connector a second display can be on (the HDMI
-// connectors of this project's card; tools/pipegen/run.sh).
+// connectors of this project's card; tools/gen/pipegen/run.sh).
 namespace Hpd3 {
 #include "pipe2_linux.inc"
 }

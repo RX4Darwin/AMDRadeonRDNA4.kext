@@ -12,9 +12,9 @@ Citations: `RADV-G4` = `docs/hw-logs/2026-09-30-linux-radv-colour/radv-shaders-a
 triangle, system Mesa 26.2.2, same box as the G3 capture), `RADV-G3` = `docs/hw-logs/2026-09-30-linux-radv-triangle/radv-shaders-and-ibs.txt`.
 Mesa source lines are named only where they were read (Mesa 26.2.2 tree).
 
-## 1. Phase 1: RADV draws it (tools/radv-triangle, TRI_COLOR=1)
+## 1. Phase 1: RADV draws it (tools/linux/radv-triangle, TRI_COLOR=1)
 
-`TRI_COLOR=1 tools/radv-triangle/run.sh <outdir>` compiles `tri_col.vert` / `tri_col.frag` (the G3 positions; `col = vec3(vid==0, vid==1,
+`TRI_COLOR=1 tools/linux/radv-triangle/run.sh <outdir>` compiles `tri_col.vert` / `tri_col.frag` (the G3 positions; `col = vec3(vid==0, vid==1,
 vid==2)`; the PS writes `vec4(col, 1)`; G3's `tri.vert`/`tri.frag` and the default are unchanged) and checks the read-back target against the
 exact barycentric colour of every covered pixel. On the RX 9070 XT (RADV GFX1201), both the default and the `nonggc` runs:
 
@@ -25,7 +25,7 @@ exact barycentric colour of every covered pixel. On the RX 9070 XT (RADV GFX1201
     colour: THE COLOUR TRIANGLE IS RIGHT
 
 Tolerances measured: every channel within **0.5** of `255 * barycentric` (pure rounding of UNORM), R+G+B within **1** of 255. The builder's
-check (`userspace/gfx12tricol.h`, `kColChannelTolerance`) allows 3. The pixel centre (128.5,106.5) of the centroid is (0x54,0x56,0x55) = ~85 each.
+check (`userspace/rdna4-run/gfx12tricol.h`, `kColChannelTolerance`) allows 3. The pixel centre (128.5,106.5) of the centroid is (0x54,0x56,0x55) = ~85 each.
 The same triangle covers exactly the G3 pixels (8192, rows 64..190).
 
 ## 2. What RADV does (the ground truth)
@@ -78,7 +78,7 @@ The register encodings of these instructions were checked against the dump: `llv
 wait_vm_vsrc:1` gives `ce8f0102`, `v_interp_p10_f32 v5, v2, v0, v2 wait_exp:2` gives `cd000205 040a0102`, `v_interp_p2_f32 v4, v4, v1, v0 wait_exp:7`
 gives `cd010704 04020304`, exactly the dump's words.
 
-### 2.3 Registers: RADV's G3 against RADV's G4 (triangle draw, `tools/linux-replay/radv-state-diff.py`; `register-diff-g3-vs-g4.txt`)
+### 2.3 Registers: RADV's G3 against RADV's G4 (triangle draw, `tools/linux/linux-replay/radv-state-diff.py`; `register-diff-g3-vs-g4.txt`)
 
 Only eight registers differ, and five of them are shader-size or VRS detail:
 
@@ -101,14 +101,14 @@ Identical in RADV's G3 and G4 (so not delta for G4): `SPI_SHADER_PGM_RSRC2_PS` =
 
 | File | What |
 |---|---|
-| `shaders/nggcol.s` -> `src/nggcol_kernel.h` | wave32 NGG VS: ngg.s (EXEC SET from merged_wave_info, never ANDed; pos0 then `s_wait_expcnt 0` then prim) plus the attribute store above: EXEC = (vertices + 7) & ~7, colour `v8..v10` from the vid masks, `v12` = wave index * 32 + lane, `s5 = (s5 & 0x7fff) << 9`, the descriptor built in `s12..s15` from three patched literals and the constant dword3, `buffer_store_b128 v[8:11], v12, s[12:15], s5 idxen scope:SCOPE_DEV`. 13 VGPRs |
-| `shaders/pscol.s` -> `src/pscol_kernel.h` | wave32 PS: RADV's sequence for three channels, `s_mov_b32 m0, s2`, `s_wqm_b32`, `ds_param_load` x3, `v_interp_p10/p2`, alpha 1.0, `export mrt0 v5..v8` as 4 x fp32 (COL_FORMAT 32_ABGR like psred.s). 9 VGPRs |
-| `tools/gen-gfx12-draw.py header-col` -> `src/gfx12_draw_col.h` | the G3 stream (byte-identical regeneration of `gfx12_draw.h` checked) plus the deltas below; Col-prefixed names, namespace `Gfx12DrawCol`, C and C++ |
-| `userspace/gfx12tricol.h` | `rdna4_tricol_place_shaders(code, attrRingVa)` (patches the three descriptor literals), `rdna4_tricol_record` (same alignment/range/relocation logic as gfx12tri.h, plus the end-of-buffer checks), `rdna4_tricol_check` (phase 1's colour check) |
-| `userspace/test-gfx12tricol.c` | host test, no GPU (C11 gcc and clang): literals patched, stream records and walks, registers present, checker accepts the exact image and rejects flat red / a missing pixel / a wrong colour / a wrong alpha |
-| `tools/linux-replay` `REPLAY_DRAW=col` | see section 5 |
+| `src/shaders/nggcol.s` -> `src/nggcol_kernel.h` | wave32 NGG VS: ngg.s (EXEC SET from merged_wave_info, never ANDed; pos0 then `s_wait_expcnt 0` then prim) plus the attribute store above: EXEC = (vertices + 7) & ~7, colour `v8..v10` from the vid masks, `v12` = wave index * 32 + lane, `s5 = (s5 & 0x7fff) << 9`, the descriptor built in `s12..s15` from three patched literals and the constant dword3, `buffer_store_b128 v[8:11], v12, s[12:15], s5 idxen scope:SCOPE_DEV`. 13 VGPRs |
+| `src/shaders/pscol.s` -> `src/pscol_kernel.h` | wave32 PS: RADV's sequence for three channels, `s_mov_b32 m0, s2`, `s_wqm_b32`, `ds_param_load` x3, `v_interp_p10/p2`, alpha 1.0, `export mrt0 v5..v8` as 4 x fp32 (COL_FORMAT 32_ABGR like psred.s). 9 VGPRs |
+| `tools/gen/gen-gfx12-draw.py header-col` -> `src/gfx12_draw_col.h` | the G3 stream (byte-identical regeneration of `gfx12_draw.h` checked) plus the deltas below; Col-prefixed names, namespace `Gfx12DrawCol`, C and C++ |
+| `userspace/rdna4-run/gfx12tricol.h` | `rdna4_tricol_place_shaders(code, attrRingVa)` (patches the three descriptor literals), `rdna4_tricol_record` (same alignment/range/relocation logic as gfx12tri.h, plus the end-of-buffer checks), `rdna4_tricol_check` (phase 1's colour check) |
+| `test/test-gfx12tricol.c` | host test, no GPU (C11 gcc and clang): literals patched, stream records and walks, registers present, checker accepts the exact image and rejects flat red / a missing pixel / a wrong colour / a wrong alpha |
+| `tools/linux/linux-replay` `REPLAY_DRAW=col` | see section 5 |
 
-**Register deltas of the kext's G4 stream against its G3 stream** (each is also in the generator with its citation; `python3 tools/gen-gfx12-draw.py table-col`):
+**Register deltas of the kext's G4 stream against its G3 stream** (each is also in the generator with its citation; `python3 tools/gen/gen-gfx12-draw.py table-col`):
 
 | Register | G3 | G4 | Why / citation |
 |---|---|---|---|
@@ -133,7 +133,7 @@ The list below was written before the first run (section 6). Status after it:
 1. **The descriptor's `size`/`stride` and the swizzle layout are copied from RADV, not measured for our ring.** *Resolved functionally:* the PS read back per-vertex colours
    that are exact to 0.50, so what nggcol.s stored and what SPI read agree on the layout. Not observed directly: *where* in the ring the data went (section 6).
 2. **`s5` really is gs_attr_offset under our configuration.** Mesa says so (radv_shader_args.c:797-798) for merged NGG on gfx11+, and RADV's dump works on this card
-   with USER_SGPR 2. Probed on the card with the plain G3 stream (`shaders/nggsgpr.s`, `REPLAY_VS=file:<hex> REPLAY_DUMP_MARKER=1`, 10 runs, 8192 px each): the NGG wave's
+   with USER_SGPR 2. Probed on the card with the plain G3 stream (`src/shaders/nggsgpr.s`, `REPLAY_VS=file:<hex> REPLAY_DUMP_MARKER=1`, 10 runs, 8192 px each): the NGG wave's
    initial `s0 s1 s2 s3 s4 s5` = `0 0 0x00403000 0x10000103 <x> 0`, with `s5 = 0` in 10/10 runs and `s4` (tess_offchip_offset, unused) 0 in 6, 0x8 in 1 and 0x88888888 in 3 (so
    the unused system SGPRs are not reliably zeroed, which makes a constant `s5 = 0` more credible than stale). `s2`/`s3` reproduce the earlier measurement and `s0/s1 = 0` (nothing
    programs the GS pointer registers in the G3 stream). `(s5 & 0x7fff) << 9 = 0`: the first subgroup sits at the start of the attribute ring, well inside 0x580000. **Caveat:** G3
@@ -151,7 +151,7 @@ The list below was written before the first run (section 6). Status after it:
 
 ## 5. The first G4 replay run (the plan, as written before it was run; result in section 6)
 
-`REPLAY_DRAW=col REPLAY_COL_OK=1 tools/linux-replay/build/replay` (after `tools/linux-replay/run.sh` has built it; no other `REPLAY_*` variable is accepted with it):
+`REPLAY_DRAW=col REPLAY_COL_OK=1 tools/linux/linux-replay/build/replay` (after `tools/linux/linux-replay/run.sh` has built it; no other `REPLAY_*` variable is accepted with it):
 
 1. opens the amdgpu render node, creates a context, and allocates: code BO (VRAM, CPU-visible), target (256 KiB VRAM), the **ring block (0xA80000 B, 2 MiB aligned, VRAM,
    CPU-visible, filled with 0xee)**, a GTT page for the fence/statistics, the IB BO;
@@ -167,7 +167,7 @@ register-by-register discipline was meant to prevent. Expected if right: 8192 px
 
 ## 6. First run on the card
 
-2026-09-30 16:21:55, run by the lead with the user's OK: tree `a1b5a1f`, `REPLAY_DRAW=col REPLAY_COL_OK=1 bash tools/linux-replay/run.sh`
+2026-09-30 16:21:55, run by the lead with the user's OK: tree `a1b5a1f`, `REPLAY_DRAW=col REPLAY_COL_OK=1 bash tools/linux/linux-replay/run.sh`
 (`docs/hw-logs/2026-09-30-linux-g4-first-run.txt`; transcribed from the lead's report, the raw output was not saved).
 
 | | |
@@ -199,8 +199,8 @@ Until one of these is done this stays a hypothesis.
 
 The kext draws the G4 colour triangle on a macOS boot when `rdna4-gfxcol=1` (default OFF) is set, **after the G3 baseline has passed**, with the same evidence G3 has.
 Code: `src/gfxring.cpp` (`requestedGfxCol`, `gfxColDrawRun`, `gfxVerdictCol`, the hook in `stageGfxDraw`), `src/compute.hpp`; the shaders, the attribute-ring
-descriptor and the colour check come from the same header the Linux replay uses, `userspace/gfx12tricol.h` (freestanding: `<stdint.h>` and integer arithmetic only;
-the kext includes it as `../userspace/gfx12tricol.h`, since its flags carry no `-Isrc`/`-Iuserspace`).
+descriptor and the colour check come from the same header the Linux replay uses, `userspace/rdna4-run/gfx12tricol.h` (freestanding: `<stdint.h>` and integer arithmetic only;
+the kext includes it as `../userspace/rdna4-run/gfx12tricol.h`, since its flags carry no `-Isrc`/`-Iuserspace`).
 
 **Gate and flow.** `stageGfxDraw`: G3 baseline (`gfxDrawRun("draw", 0, ...)`) -> result published (`gfx`, `Compute,GFXDrawPixels`) -> **G4** (only if `rdna4-gfxcol=1`):
 baseline failed -> `gfx-col SKIPPED G3 baseline did not pass`, no draw; baseline passed -> `gfxColDrawRun("col", ...)` -> `gfx-col` published -> the diagnostic ladder. G4 runs
@@ -211,13 +211,13 @@ G3's stream, `gfxDrawRun` and its variants are untouched (the diff to existing c
 **The draw (`gfxColDrawRun`).** Own code slots in the pool (`kGfxColVsOffset = +0x28000`, `kGfxColPsOffset = +0x28400`: nothing G3 or the ladder uses is overwritten); the same target (cleared),
 draw fence, IB area, GE ring block (`ringVa`, the same 2 MiB-aligned VMID0 MC address G3's relocations use) and relocation order; `kColStream`/`kColRelocs` copied and relocated exactly as
 `gfxDrawRun` does `kStream`/`kRelocs`; `nggcol.s`'s three descriptor literals patched by `rdna4_tricol_vs_dword(i, ringVa)` (dword0 = VA low, dword1 = VA[47:32] | 0xc0000000 | 16 << 16, dword2 =
-`kColRingBytes` = 0xA80000; dword3 constant, all as `userspace/gfx12tricol.h` and the Linux run). Then the same ring discipline: CSB replay and sane clip state (same boot-args), PIPELINESTAT sampling on
+`kColRingBytes` = 0xA80000; dword3 constant, all as `userspace/rdna4-run/gfx12tricol.h` and the Linux run). Then the same ring discipline: CSB replay and sane clip state (same boot-args), PIPELINESTAT sampling on
 probe boots, the stream as one indirect buffer, one RELEASE_MEM fence, `gfxFenceWait(…, 500000)`, `gfxEvidence`, `gfxFaultMark`, the same "did not finish" handling, and the same "target empty:
 look again after 2 ms, then a full ACQUIRE_MEM GL2 write-back" re-check. The probe split of G3 (CP-side register readback) is not repeated for G4.
 
 **The check** is `rdna4_tricol_check`, now integer-only (the kext is built `-mkernel`, no SSE; `gfxring.o` has no new SSE use and the kext's `nm -u` list is unchanged). Same tolerances as section 1/6
 (channel error <= 3, here measured in 1/256 units; the RADV and first-run value 0.50 is 127/256 on the exact rounded image), the same bounds (x 64..191, y 64..190), 8192 covered pixels, alpha 0xFF,
-nearest-vertex dominance within the tolerance, vertex spot pixels and centroid ~85. The host test (`userspace/test-gfx12tricol.c`) runs the same function.
+nearest-vertex dominance within the tolerance, vertex spot pixels and centroid ~85. The host test (`test/test-gfx12tricol.c`) runs the same function.
 
 **Evidence.**
 - `AMDRadeonRDNA4,Results` key **`gfx-col`**: `PASS colour triangle, THE COLOUR TRIANGLE IS RIGHT, draw 8192 px, max channel error 0.49, centroid 0xff555654 in N us` / `FAIL colour image, draw N px, ...` /
@@ -227,7 +227,7 @@ nearest-vertex dominance within the tolerance, vertex spot pixels and centroid ~
 - Kernel log, `AMDRadeonRDNA4: gfx: col: ...` lines in G3's style: the stream/addresses/descriptor line, the pipeline-statistics verdict (probe boots), and
   `col: THE COLOUR TRIANGLE IS RIGHT in N us: 8192 pixels (want 8192), bounds x 64..191 y 64..190; max channel error 0.49 (tolerance 3), max |R+G+B-255| 1, 0 bad alpha, 0 not dominated by the nearest vertex's colour; near v0 (66,65) 0xff0303f9, near v1 (189,65) 0xff03f903, near v2 (128,188) 0xfff80402, centroid (128,106) 0xff555654 (want ~85,85,85)`
   (or `wrong colour image` with the measured errors, or `did not finish ...`).
-- `tools/set-boot.sh`: **boot 3** adds `rdna4-gfxcol=1` (boot 6, the A/B control of the G3 fix, deliberately does not). `tools/diagnostic-log.sh`: the boot-arg list shows `rdna4-gfxcol`, the feature summary has a
+- `tools/rig/set-boot.sh`: **boot 3** adds `rdna4-gfxcol=1` (boot 6, the A/B control of the G3 fix, deliberately does not). `tools/rig/diagnostic-log.sh`: the boot-arg list shows `rdna4-gfxcol`, the feature summary has a
   **`gfx-col`** row (SKIPPED when the boot-arg is absent or G3 did not pass, PASS only with `THE COLOUR TRIANGLE IS RIGHT ... 8192`, else FAIL), `Compute,GFXColPixels` and `Compute,GFXVerdict` are in the existing `Compute,` ioreg capture, and the
   `gfx:` dmesg filter already matches the `col:` lines.
 

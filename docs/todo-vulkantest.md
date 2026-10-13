@@ -93,7 +93,7 @@ If the machine does not get to the desktop at all, take `rdna4-compute` out of t
 ## Before the first boot (on the development Mac)
 
 1. The card's revision. The firmware the build embeds is for revision `0xC0`; a `0xC8` card needs other files,
-   which `tools/fetch-firmware.sh` does not fetch. On the rig:
+   which `tools/build/fetch-firmware.sh` does not fetch. On the rig:
 
    ```bash
    system_profiler SPDisplaysDataType | grep -i revision
@@ -105,7 +105,7 @@ If the machine does not get to the desktop at all, take `rdna4-compute` out of t
    into `firmware/amdgpu/`, which git ignores:
 
    ```bash
-   tools/fetch-firmware.sh
+   tools/build/fetch-firmware.sh
    ```
 
 3. Build everything again; a kext built before the firmware was there has none in it.
@@ -117,17 +117,17 @@ If the machine does not get to the desktop at all, take `rdna4-compute` out of t
    Check that the firmware is in: this must print a number above 0.
 
    ```bash
-   nm build/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4 | grep -c rdna4_fw_
+   nm "$(make -s product-dir)"/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4 | grep -c rdna4_fw_
    ```
 
    And note the kext's UUID, to compare with the `kext loaded?` line of the log after the boot:
 
    ```bash
-   dwarfdump --uuid build/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4
+   dwarfdump --uuid "$(make -s product-dir)"/AMDRadeonRDNA4.kext/Contents/MacOS/AMDRadeonRDNA4
    ```
 
-4. To the rig: `build/AMDRadeonRDNA4.kext` (into the EFI as usual), and into one folder `build/n48nprobe`,
-   `build/rdna4-run` and `tools/diagnostic-log.sh`. (With `rdna4-run` beside it the diagnostic script also runs the
+4. To the rig: `Build/AMDRadeonRDNA4-<version>-RELEASE/AMDRadeonRDNA4.kext` (into the EFI as usual), and into one folder `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/n48nprobe`,
+   `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run` and `tools/rig/diagnostic-log.sh`. (With `rdna4-run` beside it the diagnostic script also runs the
    runtime's own self-test, a compute dispatch; that is m1guer's and useful to have in the same log.)
 
 ## Boot 1: the bring-up, then the memory half
@@ -190,14 +190,14 @@ What failure looks like, from the bottom layer up:
 Only if boot 1 ended in `all ok`.
 
 The driver and its test program, on the development Mac (the first time this downloads Mesa, about 150 MB, into
-`build/radv-build`, and needs clang, ninja, bison, flex, pkg-config and glslangValidator; `make clean` removes all
+`Build/radv-build`, and needs clang, ninja, bison, flex, pkg-config and glslangValidator; `make distclean` removes all
 of it again):
 
 ```bash
 make mesa
 ```
 
-To the rig, next to the other files: `build/vkprobe` and `build/libvulkan_radeon.dylib` (27 MB).
+To the rig, next to the other files: `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/vkprobe` and `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/libvulkan_radeon.dylib` (27 MB).
 
 ```
 rdna4-compute=7 rdna4-gfx=2 rdna4-trace=1
@@ -261,7 +261,7 @@ vertex and a fragment shader the driver compiles, then copied into the buffer an
 of the graphics pipeline proper: the geometry stage, the rasteriser, a render target. On a Mac it gets as far as
 it can without a GPU (every call succeeds, the submission is accepted by the engine).
 
-Same boot-args as boots 1 and 2. To the rig, from the development Mac: the new `build/vkprobe` (the library is
+Same boot-args as boots 1 and 2. To the rig, from the development Mac: the new `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/vkprobe` (the library is
 unchanged). In the first two or three minutes after login:
 
 ```bash
@@ -295,7 +295,7 @@ dark blue ground for five seconds, and gives the desktop back. Each frame is dra
 size, copied into one of two buffers and shown at a vertical blank (`docs/vulkan-port.md` section 10).
 
 A new kext is needed for this one (the display calls are new), with the firmware in it as before, and the new
-`build/vkprobe`; the library is unchanged. Same boot-args. Start it from a terminal **on the Lenovo, or over
+`Build/AMDRadeonRDNA4-<version>-RELEASE/bin/vkprobe`; the library is unchanged. Same boot-args. Start it from a terminal **on the Lenovo, or over
 SSH**: the Samsung shows the program's picture while it runs, and if the desktop should not come back you still
 have a screen to work from. In the first two or three minutes after login:
 
@@ -340,7 +340,7 @@ What boot 4 did not cover, each one run of the same command with the Samsung set
 
 - **3840x2160** (the "1920x1080" HiDPI setting): each frame is then a 33 MiB copy. Does `show:` still say 60 a
   second, and is the motion smooth?
-- **2560x1440 at 120 Hz** (`/usr/bin/python tools/cgmode.py` lists the modes): does `show:` say 120 a second?
+- **2560x1440 at 120 Hz** (`/usr/bin/python tools/rig/cgmode.py` lists the modes): does `show:` say 120 a second?
 
 ```bash
 sudo ./vkprobe ./libvulkan_radeon.dylib show 2>&1 | tee vkprobe.txt
@@ -349,8 +349,8 @@ sudo ./vkprobe ./libvulkan_radeon.dylib show 2>&1 | tee vkprobe.txt
 ## With `rdna4-vm=1`: the Vulkan interface and the runtime's clients in one boot
 
 Written 2026-10-07. Until now the interface refused to open with `rdna4-vm=1`. It now takes the lowest address
-space of 8 to 15 that no client of the runtime holds. New kext (`make`), new `build/n48nprobe` (`make n48nprobe`; only
-a message changed), the `vkprobe` and library of boot 4, and `build/rdna4-run` beside `diagnostic-log.sh`.
+space of 8 to 15 that no client of the runtime holds. New kext (`make`), new `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/n48nprobe` (`make n48nprobe`; only
+a message changed), the `vkprobe` and library of boot 4, and `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run` beside `diagnostic-log.sh`.
 
 ```
 rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
@@ -517,7 +517,7 @@ was under that limit. So:
 - the fill "by a compute shader" that `vkprobe` has reported since 2026-10-06 was the command processor's. No
   compute shader of the driver's had run on the card until the third run below. The triangle's vertex and fragment
   shaders had. The places
-  that said otherwise are corrected (`docs/vulkan-port.md` section 9, the README, `vulkan/README.md`,
+  that said otherwise are corrected (`docs/vulkan-port.md` section 9, the README, `userspace/vulkan/README.md`,
   `docs/metal-readiness.md`).
 - the `fault` runs made the **command processor** write to and read from unmapped memory, not a shader.
 
@@ -621,7 +621,7 @@ attributes to and read them from) and submits. If that hangs, as a shader's acce
 Vulkan client, the wait runs out after 5 s and the kernel ends the work. Then it draws the colour triangle again.
 **Whether this stream hangs at all is not known**; if it does not, the tool says so and the new path stays untested.
 
-New kext (`make`), new `build/rdna4-run`, same boot:
+New kext (`make`), new `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run`, same boot:
 
 ```
 rdna4-compute=7 rdna4-vm=1 rdna4-gfx=2 rdna4-gfxclient=1 rdna4-trace=1
@@ -716,5 +716,5 @@ next attempt.
 
 ## After the tests
 
-For what passes, the README's file table, `docs/vulkan-port.md` and `vulkan/README.md` get the date and what ran.
+For what passes, the README's file table, `docs/vulkan-port.md` and `userspace/vulkan/README.md` get the date and what ran.
 With the triangle right, step 3, showing a picture, has something to stand on.

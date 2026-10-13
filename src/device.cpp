@@ -2070,7 +2070,7 @@ RDNA4Device::~RDNA4Device() {
 // ---------------------------------------------------------------------------
 
 #ifdef AMDRadeonRDNA4_VM_TEST
-// Lenovo G25-10 base block (the tools/atomdump.cpp fixture). With boot-arg
+// Lenovo G25-10 base block (the test/atomdump.cpp fixture). With boot-arg
 // "rdna4-fakeedid=1" the VM test build serves it as the sink's EDID, so the
 // mode table and how a given macOS release presents it can be checked
 // without RDNA 4 hardware.
@@ -2958,7 +2958,7 @@ bool RDNA4Device::secondPipeTo(uint8_t hpd) {
 	// The mode set to the running timing: the pipe's clock from this
 	// connector's PLL, its encoder and transmitter. Then this connector's sleep
 	// and wake, which leave its encoder and link as lighting here would
-	// (tools/atomdump.cpp, testPipe2Move).
+	// (test/atomdump.cpp, testPipe2Move).
 	const Pipe2::Config &c = Pipe2::config();
 	const Modes::Mode same { 0, pipe2Target.now, pipe2Target.now.refreshMilliHz(), false, Modes::SourceBoot };
 	if (applySecondPipeMode(same) != kIOReturnSuccess || !runSecondPipePart(Pipe2::Part::Sleep) ||

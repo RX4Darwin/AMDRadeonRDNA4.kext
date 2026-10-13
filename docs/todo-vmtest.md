@@ -89,11 +89,11 @@ What is not known: whether a kernel **compute** queue honours the address space 
 this kext. The graphics ring and the copy engine do. That is what boot A shows.
 
 Rig as for the Vulkan tests: RX 9070 XT, Big Sur 11.6.6, the firmware in the build (`make clean && make` after
-`tools/fetch-firmware.sh`). For every boot:
+`tools/build/fetch-firmware.sh`). For every boot:
 
 - Take `rdna4-cursor`, `rdna4-vbl`, `rdna4-dmubhist` and `rdna4-dmubver` out of the boot-args: their lines push the
   bring-up's out of the kernel log.
-- Put `build/rdna4-run` **beside** `diagnostic-log.sh` (in the earlier runs it was missing, and the script then
+- Put `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run` **beside** `diagnostic-log.sh` (in the earlier runs it was missing, and the script then
   skips every runtime test). The script runs the tests itself; nothing else has to be typed.
 - Run the script within the first minutes after login, and reboot between boots A and B.
 - Since 2026-10-07 the Vulkan programs open in these boots too (the interface takes an address space the runtime's

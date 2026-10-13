@@ -1,7 +1,7 @@
 # The first triangle drawn by RADV on this card: what the kext does differently
 
 > **Update 2026-09-30 04:20: the export-order hypothesis below is DISPROVEN on the card.** RADV patched to
-> export the primitive first (the kext's old order; `tools/radv-triangle/mesa-26.2.2-force-early-prim.patch`,
+> export the primitive first (the kext's old order; `tools/linux/radv-triangle/mesa-26.2.2-force-early-prim.patch`,
 > `RADV_FORCE_EARLY_PRIM=1`) still draws 8192 px (C_PRIMITIVES > 0) on this RX 9070 XT. Mesa's late
 > primitive export is a choice, not a hardware rule. The reordered kext shaders are harmless (Mesa's order)
 > but do not fix the triangle. The "second tier" table is still open, and the next test is replaying the
@@ -12,7 +12,7 @@
 Linux side of the handoff (`docs/HANDOFF-linux.md`, "what we need from Linux"), 2026-09-30, on the same PC
 (RX 9070 XT, Arch Linux 7.2.2, Mesa 26.2.2, linux-firmware 20260810). No root needed.
 
-`tools/radv-triangle/` draws **the kext's G3 triangle** with RADV: a 256x256 linear R8G8B8A8 target cleared
+`tools/linux/radv-triangle/` draws **the kext's G3 triangle** with RADV: a 256x256 linear R8G8B8A8 target cleared
 to 0, one triangle from VertexID only (0 -> (-0.5,-0.5), 1 -> (0.5,-0.5), 2 -> (0,0.5), z 0, w 1), a constant red
 PS, then reads the target back and the pipeline statistics. `run.sh` dumps the ISA/config (`RADV_DEBUG=shaders`)
 and the command stream (`RADV_DEBUG=dumpibs`). Capture: `hw-logs/2026-09-30-linux-radv-triangle/`.
@@ -52,7 +52,7 @@ RADV's NGG shader for this triangle (ACO, gfx1201):
     BB12:
     s_endpgm
 
-`shaders/ngg.s` and every variant of the W41-W46 ladder (nggmsg, nggstore, nggvgpr, nggconst) did the
+`src/shaders/ngg.s` and every variant of the W41-W46 ladder (nggmsg, nggstore, nggvgpr, nggconst) did the
 opposite: **prim export first, position export after**. Mesa never emits that order on this generation:
 
     radv_shader_info.c:  has_ngg_early_prim_export = gfx_level < GFX11 && exec_list_is_singular(...)
