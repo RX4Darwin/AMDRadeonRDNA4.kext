@@ -19,7 +19,7 @@ $cxx -dynamiclib -o "$W/n48n-host.dylib" "$here/interpose.cpp" "$repo/src/n48n.c
 	"$repo/src/gpuvm.cpp" -framework IOKit -framework CoreFoundation
 clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -I "$W/mesa/include" "$repo/userspace/vulkan/vkprobe.c" -o "$W/vkprobe"
 # The card test's own program (no Mesa) first, with the CPU standing in for the GPU's copy engine: it has to pass.
-clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -Wall -I "$repo/include" -I "$repo/vulkan" \
+clang -arch x86_64 -mmacosx-version-min=11.0 -std=gnu11 -Wall -I "$repo/include" -I "$repo/userspace/vulkan" \
 	"$repo/userspace/vulkan/n48nprobe.c" -framework IOKit -framework CoreFoundation -o "$W/n48nprobe"
 DYLD_INSERT_LIBRARIES="$W/n48n-host.dylib" "$W/n48nprobe"
 # Then the driver: its submissions are checked and accepted, and reported finished at once. Nothing executes.
