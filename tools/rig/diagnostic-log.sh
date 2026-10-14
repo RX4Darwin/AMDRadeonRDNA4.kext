@@ -81,7 +81,9 @@ elif [ "$VM_MODE" -eq 0 ]; then
 	fi
 fi
 
-section() { echo; echo "=== $1 ==="; }
+# Each heading goes to disk before the section runs: a run that freezes the machine leaves a file that ends at the
+# section it was in.
+section() { echo; echo "=== $1 ==="; sync >/dev/null 2>&1 || true; }
 
 # The kernel message buffer wraps on a long boot (round 2, boot 6: not one
 # AMDRadeonRDNA4 line survived, so the HW cursor and compute sections came out empty).

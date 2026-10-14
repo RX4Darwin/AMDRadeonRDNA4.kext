@@ -4,14 +4,17 @@
 # its last lines behind. On Big Sur the kernel lines of this driver are only in the kernel's own buffer (dmesg),
 # which a freeze takes with it; the system log on disk does not have them (tools/rig/boot-history.sh showed that).
 #
-#   sudo bash freeze-watch.sh install      start at every boot from now on (a launch daemon), and now
+#   sudo bash freeze-watch.sh install [seconds]   start at every boot from now on (a launch daemon), and now;
+#                                                 watch each boot for that long (default 300; 86400 = a day)
 #   sudo bash freeze-watch.sh show         what the last boots left: when each was last alive, and its last lines
 #   sudo bash freeze-watch.sh uninstall    stop and remove the daemon and its copy of this script (the records stay)
 #
 # What the daemon does: for the first five minutes after it starts, twice a second, it writes the whole of dmesg
-# to one file for that boot in /var/log/rdna4-freeze-watch/ and asks for it to be flushed. The file's last line is
-# the time of that write, so the record of a frozen boot ends within about a second of the freeze. A boot that
-# lives past the five minutes gets a closing line, and the daemon exits. The last twelve boots are kept.
+# to one file for that boot in /var/log/rdna4-freeze-watch/ and asks for it to be flushed; after that, if it was
+# installed for longer, once a second and only the last 400 lines (the whole buffer every second would be a lot of
+# writing over a day). The file's last line is the time of that write, so the record of a frozen boot ends within
+# about a second of the freeze. A boot that lives past the watched time gets a closing line, and the daemon exits.
+# The last twelve boots are kept.
 #
 # install puts two files on the machine: /Library/LaunchDaemons/com.rx4darwin.rdna4.freeze-watch.plist and
 # /usr/local/libexec/rdna4-freeze-watch.sh (a copy of this script, so that the daemon does not depend on where
@@ -29,12 +32,16 @@ run() {
 	mkdir -p "$DIR" || exit 1
 	ls -t "$DIR"/boot-*.txt 2>/dev/null | tail -n +12 | while read -r old; do rm -f "$old"; done
 	f="$DIR/boot-$(date +%Y%m%d-%H%M%S).txt"
-	n=$((SECONDS_WATCHED * 2)) i=0
-	while [ "$i" -lt "$n" ]; do
-		{ $DMESG 2>&1; echo "=== freeze-watch: alive at $(date '+%Y-%m-%d %H:%M:%S'), write $((i + 1)) of $n ==="; } > "$f.new" && mv -f "$f.new" "$f"
-		sync
-		sleep 0.5
+	start=$(date +%s) i=0
+	while [ $(($(date +%s) - start)) -lt "$SECONDS_WATCHED" ]; do
 		i=$((i + 1))
+		if [ $(($(date +%s) - start)) -lt 300 ]; then
+			{ $DMESG 2>&1; echo "=== freeze-watch: alive at $(date '+%Y-%m-%d %H:%M:%S'), write $i ==="; } > "$f.new" && mv -f "$f.new" "$f"
+			sync; sleep 0.5
+		else
+			{ $DMESG 2>&1 | tail -n 400; echo "=== freeze-watch: alive at $(date '+%Y-%m-%d %H:%M:%S'), write $i (the last 400 lines) ==="; } > "$f.new" && mv -f "$f.new" "$f"
+			sync; sleep 1
+		fi
 	done
 	echo "=== freeze-watch: this boot lived past the $SECONDS_WATCHED s that are watched ===" >> "$f"
 	sync
@@ -62,7 +69,7 @@ show() {
 }
 
 case "${1:-}" in
-	run) run ;;
+	run) [ -n "${2:-}" ] && SECONDS_WATCHED=$2; run ;;
 	show) show ;;
 	install)
 		[ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
@@ -73,14 +80,14 @@ case "${1:-}" in
 <plist version="1.0">
 <dict>
 	<key>Label</key><string>$LABEL</string>
-	<key>ProgramArguments</key><array><string>/bin/bash</string><string>$COPY</string><string>run</string></array>
+	<key>ProgramArguments</key><array><string>/bin/bash</string><string>$COPY</string><string>run</string><string>${2:-300}</string></array>
 	<key>RunAtLoad</key><true/>
 </dict>
 </plist>
 EOF
 		chown root:wheel "$PLIST" && chmod 644 "$PLIST"
 		launchctl unload "$PLIST" 2>/dev/null
-		launchctl load -w "$PLIST" && echo "installed: watching now and at every boot; records in $DIR (sudo bash $0 show)" ;;
+		launchctl load -w "$PLIST" && echo "installed: watching ${2:-300} s of every boot, from now; records in $DIR (sudo bash $0 show)" ;;
 	uninstall)
 		[ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
 		launchctl unload -w "$PLIST" 2>/dev/null
