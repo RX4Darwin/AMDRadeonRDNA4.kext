@@ -2220,6 +2220,7 @@ IOReturn RDNA4Compute::rtInfo(const void *owner, uint64_t out[9]) {
 	out[3] = h.size();
 	out[4] = h.freeBytes();
 	out[5] = dev ? vramMc(devHeap.base()) : poolMc(kHeapOffset);
+	rdna4Step("rtInfo: done");
 	RtClient *c = vmClientFor(owner);
 	out[6] = c ? c->vmid : 0;
 	out[7] = c ? c->pipe : 0;
@@ -3475,7 +3476,9 @@ IOReturn RDNA4Compute::rtRestore(const void *owner) {
 void RDNA4Compute::rtRelease(const void *owner) {
 	if (!rtLock || !owner)
 		return;
+	rdna4Step("rtRelease: taking rtLock");
 	Locked g(rtLock);
+	rdna4Step("rtRelease: rtLock taken");
 	checkPresentationTimeoutLocked();
 	RtClient *early = clientFor(owner);
 	if (powerSleeping || (early && early->aborted)) {
@@ -3497,6 +3500,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		if (slot.owner == owner)
 			slot = PresentSlot {};
 	RtClient *c = clientFor(owner);
+	rdna4Step("rtRelease: draining gfx work, unmapping buffers");
 	if (c && c->gfxOutstanding)
 		gfxClientDrain(*c, "client close");   // W12k: before its buffers and page tables go away
 	uint32_t nb = 0, np = 0;
@@ -3552,6 +3556,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 				if (!fenceReached(*c->fenceCpu, want))
 					(void)recoverSharedQueue(c->sq, c->vmid, "client close");
 			}
+			rdna4Step("rtRelease: shared client, VM context off");
 			if (vmShared == 2)
 				vmReleaseVmids(*c);    // every VMID the client owns: context off, IH LUT cleared, flushed, back to the pool
 			else
@@ -3584,10 +3589,13 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		/* The table allocation is reused by the next client.  Unmapping each
 		 * live object leaves untouched PDEs/PTEs behind, so clear the complete
 		 * image before releasing the VMID or its backing VRAM. */
+		rdna4Step("rtRelease: clearing the page table in VRAM (vmTableSync)");
 		bzero(c->tableShadow, kVmTableBytes);
 		if (!vmTableSync(*c, 0, kVmTableBytes))
 			RLOG("vmid %u: page-table teardown clear failed", c->vmid);
+		rdna4Step("rtRelease: TLB invalidate");
 		vmInvalidate(c->vmid, "client close");
+		rdna4Step("rtRelease: done");
 		vmidUsed[c->vmid] = false;
 		if (!c->shared)
 			queueUsed[c->pipe][c->queue] = false;
