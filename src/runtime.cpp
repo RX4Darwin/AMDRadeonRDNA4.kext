@@ -268,6 +268,7 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         if (alreadyQuiesced)
                 return;
         CLOG("quiesce: begin %s", why ? why : "shutdown");
+        rdna4Step("quiesce: waiting for the bring-up");
 
         // Do not tear down MMIO while a bring-up stage is using it. The
         // bring-up thread checks the flag between every stage and wakes this
@@ -297,7 +298,9 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         // the persistent flag). If it cannot be lifted every GC access below is dropped.
         bootQueueLive = false;
         gcSnapValid = false;
+        rdna4Step("quiesce: lifting GFXOFF (gcWake)");
         gcWake(0xfffffffeu);
+        rdna4Step("quiesce: interrupts off");
         if (gcState == kGcHold)
                 CLOG("quiesce: GFXOFF could not be lifted; the GC quiesce steps are dropped and engines may keep running");
         if (ihActive)
@@ -310,6 +313,7 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         wr(IpDiscovery::HwGc, CpMe1Pipe1IntCntl,
            rd(IpDiscovery::HwGc, CpMe1Pipe1IntCntl) & ~kCpTimeStampIntEnable);
 
+        rdna4Step("quiesce: restoring the desktop");
         // Restore the desktop while the display engine still has a valid
         // source surface. Pending client presents are completed as aborted by
         // restorePresentationLocked; simply dropping them would leave the
@@ -339,6 +343,7 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         if (rtLock) {
                 IOLockLock(rtLock);
         }
+        rdna4Step("quiesce: draining HQDs");
         drain(0, 0, 0);
         for (const RtClient &client : clients)
                 if (client.active)
@@ -362,6 +367,7 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         if (rtLock)
                 IOLockUnlock(rtLock);
 
+        rdna4Step("quiesce: DMA teardown");
         // dmaTeardown clears the AGP aperture before releasing its memory and
         // clears PCI Command.BusMaster only here, after all producers stopped.
         dmaTeardown(why ? why : "system shutdown");
@@ -1682,8 +1688,18 @@ void RDNA4Compute::faultPageToSystem() {
 	     faultPageBus, before, rdGc(GcL2Cntl));
 }
 
+void rdna4Step(const char *what) {
+	uint32_t ms = 0;
+	if (!PE_parse_boot_argn("rdna4-steptrace", &ms, sizeof(ms)) || !ms)
+		return;
+	IOLog("AMDRadeonRDNA4: step: %s\n", what);
+	IOSleep(ms);
+}
+
 IOReturn RDNA4Compute::rtOpen(const void *owner) {
+	rdna4Step("rtOpen: taking rtLock");
 	const IOReturn r = rtOpenInner(owner);
+	rdna4Step(r == kIOReturnSuccess ? "rtOpen: done" : "rtOpen: failed");
 	if (r != kIOReturnSuccess) {
 		char why[48];
 		snprintf(why, sizeof(why), "open FAILED 0x%x", r);
@@ -1694,6 +1710,7 @@ IOReturn RDNA4Compute::rtOpen(const void *owner) {
 
 IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 	Locked g(rtLock);
+	rdna4Step("rtOpen: rtLock taken");
 	if (!rtReady)
 		return kIOReturnNotReady;
 	if (RtClient *old = clientFor(owner))
@@ -1810,8 +1827,10 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 /* rdna4-vmshared=1 (vmshared.cpp): the client has a VMID and page tables but no queue. Same VA layout for the pages it keeps (kernarg, fence), plus
  * the IB page the kernel writes each dispatch into. */
 IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *c) {
+	rdna4Step("rtOpenShared: shared queues (vmSharedEnsure)");
 	if (!vmSharedEnsure())
 		return kIOReturnNotReady;
+	rdna4Step("rtOpenShared: shared queues up; page table");
 	uint32_t vmid = 0;
 	for (vmid = 8; vmid <= 15 && vmidUsed[vmid]; vmid++) {}
 	if (vmid > 15)
@@ -1848,9 +1867,12 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 		GpuVm::encodePde(c->rootPhys + 0x2000, GpuVm::kValid, 1);
 	const uint32_t qoff = kVmQueueBase + slot * kVmQueueStride;
 	c->poolOff = qoff;
+	rdna4Step("rtOpenShared: zeroing the client's pool pages (CPU writes to VRAM)");
 	for (uint32_t off = 0; off < 0x8000; off += 4)
 		*poolDw(qoff + off) = 0;
+	rdna4Step("rtOpenShared: HDP flush");
 	flushHdp();
+	rdna4Step("rtOpenShared: mapping fence, kernarg and IB pages");
 	c->kernargCpu = poolDw(qoff + kVmKernarg);
 	c->fenceCpu = poolDw(qoff + kVmFence);
 	/* W12k: the client's gfx fence dword (same page, zeroed above): without it a shared-queue client cannot submit gfx IBs (Kiln's boot 13 dry run:
@@ -1864,12 +1886,14 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 	c->ibVa = c->nextVa; c->nextVa += 0x1000;
 	if (!vmMap(*c, c->fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
 	    !vmMap(*c, c->kernargVa, poolMc(qoff + kVmKernarg), 0x1000, false) ||
-	    !vmMap(*c, c->ibVa, poolMc(qoff + kVmIb), 0x1000, true) || !vmContextInit(*c)) {
+	    !vmMap(*c, c->ibVa, poolMc(qoff + kVmIb), 0x1000, true) || (rdna4Step("rtOpenShared: VM context"), !vmContextInit(*c))) {
 		IOFree(c->tableShadow, kVmTableBytes); devHeap.free(table); *c = RtClient {};
 		return kIOReturnNoMemory;
 	}
 	c->doorbell = sharedQ[sq].doorbell;
+	rdna4Step("rtOpenShared: TLB invalidate");
 	(void)vmInvalidate(vmid, "client context enable");
+	rdna4Step("rtOpenShared: TLB invalidate done");
 	vmidUsed[vmid] = true;
 	c->active = true;
 	RLOG("vmid %u: shared-queue client (rdna4-vmshared) on shared queue %u (MEC1 pipe %u queue %u, VMID 0), PDB2 MC 0x%llx, IB VA 0x%llx",
@@ -2181,6 +2205,7 @@ void RDNA4Compute::checkPresentationTimeoutLocked() {
 }
 
 IOReturn RDNA4Compute::rtInfo(const void *owner, uint64_t out[9]) {
+	rdna4Step("rtInfo");
 	Locked g(rtLock);
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)

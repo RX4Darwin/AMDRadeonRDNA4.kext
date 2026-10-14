@@ -64,6 +64,11 @@
 #include "rdna4compute.h"
 #include "sdma.hpp"
 
+// rdna4-steptrace=<ms> (runtime.cpp): a log line and a pause of that many milliseconds after each step of opening a
+// runtime client and of the shutdown quiesce. For a machine that freezes in one of them: tools/rig/freeze-watch.sh,
+// which copies the kernel log to disk twice a second, then holds the last step that ran.
+void rdna4Step(const char *what);
+
 struct IOExternalMethodArguments;
 
 class IOBufferMemoryDescriptor;

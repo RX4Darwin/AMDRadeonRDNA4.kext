@@ -50,9 +50,11 @@ bool RDNA4Compute::sharedStart(uint32_t k) {
 	s.wedged = false;
 	if (s.area + 0x7000 > pool.size)
 		return false;
+	rdna4Step(k ? "sharedStart 1: zeroing its pool area" : "sharedStart 0: zeroing its pool area");
 	for (uint32_t off = 0; off < 0x7000; off += 4)
 		*poolDw(s.area + off) = 0;
 	flushHdp();
+	rdna4Step(k ? "sharedStart 1: HQD init" : "sharedStart 0: HQD init");
 	s.fenceCpu = poolDw(s.area + kVmFence);      // the queue's own fence word (vmshared=2), zero with the area
 	s.fenceMc = poolMc(s.area + kVmFence);
 	s.seq = 0;
@@ -72,8 +74,10 @@ bool RDNA4Compute::sharedStart(uint32_t k) {
 bool RDNA4Compute::vmSharedEnsure() {
 	if (sharedInit)
 		return true;
+	rdna4Step("vmSharedEnsure: GC awake (gcEnsureAwake)");
 	if (!poolCpu || !gcEnsureAwake(0xfffffff0u))
 		return false;
+	rdna4Step("vmSharedEnsure: SH_MEM_CONFIG/BASES for VMIDs 1-15");
 	for (uint32_t v = 1; v <= 15; v++) {
 		grbmSelect(0, 0, 0, v);
 		wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);
