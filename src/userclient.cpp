@@ -58,6 +58,7 @@ bool RDNA4ComputeClient::initWithTask(task_t owningTask, void *securityToken, UI
 
 bool RDNA4ComputeClient::start(IOService *provider) {
 	auto *svc = OSDynamicCast(RDNA4ComputeService, provider);
+	rdna4Step("user client: start");
 	if (!svc || !svc->compute || !IOUserClient::start(provider))
 		return false;
 	compute = svc->compute;

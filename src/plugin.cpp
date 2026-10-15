@@ -32,7 +32,9 @@
 #include <pexpert/pexpert.h>
 
 #include "accelcensus.hpp"
+#ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
+#endif
 #include "compute.hpp"
 #include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
 #include "device.hpp"
@@ -889,8 +891,10 @@ void attach(FbEntry &e) {
 	if (accelCensus && dev.isAmd)
 		RDNA4AccelCensus::publish(pci, accelCensus);
 	// M0: the fake paravirtual GPU, independent of everything else here.
+#ifdef AMDRadeonRDNA4_PVGPU
 	if (pvGpu && dev.isAmd)
 		RDNA4PvNub::publish(pci, pvGpu);
+#endif
 
 	// Compute bring-up runs after the display is answered for, and only
 	// when asked for: it must never be the reason the desktop is missing.
@@ -1136,10 +1140,12 @@ void pluginStart() {
 	computeStage = RDNA4Compute::requestedStage();
 	if (!PE_parse_boot_argn("rdna4-accelcensus", &accelCensus, sizeof(accelCensus)) || accelCensus > 2)
 		accelCensus = 0;
+#ifdef AMDRadeonRDNA4_PVGPU   // built in with make PVGPU=1 only (Makefile)
 	if (!PE_parse_boot_argn("rdna4-pvgpu", &pvGpu, sizeof(pvGpu)) || pvGpu > 2)
 		pvGpu = 0;
 	if (pvGpu)
 		RDNA4PvNub::publishLater(pvGpu, 25000);   // a VM without the emulated RDNA4 device never reaches attach()
+#endif
 	Ndrv::vslInit();
 	FBLOG("Lilu plugin started (trace %s, compute stage %u%s%s)", traceEnabled ? "on" : "off",
 	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "", pvGpu ? ", FAKE PARAVIRT GPU (VM only)" : "");

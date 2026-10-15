@@ -4,6 +4,7 @@
 #   make                  the kext and the programs that go to the test machine
 #   make CONFIG=DEBUG     the same without optimisation and with DEBUG defined
 #   make VMTEST=1         the VM smoke-test variant (see below)
+#   make PVGPU=1          with the fake paravirtual GPU of M0 (rdna4-pvgpu, emulator only; see below)
 #   make test             the host tests (no GPU needed)
 #   make clean            remove what this Makefile builds; `make distclean` removes Build/
 #   make product-dir      print the directory the products of this configuration go to
@@ -11,7 +12,7 @@
 # Everything that is built goes to Build/:
 #
 #   Build/AMDRadeonRDNA4-<version>-<CONFIG>/AMDRadeonRDNA4.kext
-#   Build/AMDRadeonRDNA4-<version>-<CONFIG>/bin/     rdna4-run, n48nprobe, diagnostic-log.sh, and with Mesa built
+#   Build/AMDRadeonRDNA4-<version>-<CONFIG>/bin/     rdna4-run, n48nprobe, the rig's scripts, and with Mesa built
 #                                                   (`make mesa`) libvulkan_radeon.dylib, vkprobe and swapprobe;
 #                                                   `make vkcube` adds Khronos's vkcube and loader
 #   Build/obj/<CONFIG>/                             the kext's objects
@@ -45,6 +46,11 @@ CONFIG       ?= RELEASE
 # can be checked in a VM without RDNA 4 hardware. All BAR5 register work is
 # skipped there because the device has no BAR5.
 VMTEST       ?= 0
+
+# PVGPU=1: the fake Apple paravirtual GPU of M0 (src/pvgpu.cpp, rdna4-pvgpu; docs/m0-pvgpu.md) is built in. Left out
+# otherwise: on Tahoe, with it merely in the kext (its classes registered, no instance, even with rdna4-off=1), Restart
+# and Shut Down from the Apple menu froze the whole machine (2026-10-14, cause inside macOS unknown).
+PVGPU        ?= 0
 
 ARCH         = x86_64
 DEPLOY       = 11.0
@@ -105,8 +111,8 @@ CENSUS       = tools/metal/accelcensus
 all: check-config kext tools
 
 check-config:
-	@case "$(CONFIG)/$(VMTEST)" in DEBUG/[01]|RELEASE/[01]) ;; \
-	*) echo "CONFIG is DEBUG or RELEASE, VMTEST is 0 or 1 (got CONFIG=$(CONFIG) VMTEST=$(VMTEST))" >&2; exit 1 ;; esac
+	@case "$(CONFIG)/$(VMTEST)/$(PVGPU)" in DEBUG/[01]/[01]|RELEASE/[01]/[01]) ;; \
+	*) echo "CONFIG is DEBUG or RELEASE, VMTEST and PVGPU are 0 or 1 (got CONFIG=$(CONFIG) VMTEST=$(VMTEST) PVGPU=$(PVGPU))" >&2; exit 1 ;; esac
 
 product-dir:
 	@echo $(PRODUCT_DIR)
@@ -114,7 +120,7 @@ product-dir:
 # --- the kext ----------------------------------------------------------------
 # The objects are built by src/kext.mk, run in the object directory. Two small headers are made there first, each
 # rewritten only when its content changes, so that only what includes it is compiled again: buildrev.h (the version
-# and the commit) and fwconfig.h (whether the firmware is there, and which). The objects that follow a header are
+# and the commit) and fwconfig.h (whether the firmware is there, and which; and PVGPU). The objects that follow a header are
 # removed with it: a change within the second of the last build would otherwise go unseen (make compares whole
 # seconds).
 kext: check-config $(LILU_STAMP)
@@ -125,13 +131,13 @@ kext: check-config $(LILU_STAMP)
 		rm -f $(OBJDIR)/plugin.o $(OBJDIR)/device.o $(OBJDIR)/kmod_info.o; }; \
 	rm -f $(OBJDIR)/buildrev.h.new
 	@missing=; for f in $(FW_BLOBS); do [ -f $$f ] || missing=1; done; \
-	if [ -n "$$missing" ]; then echo "#define AMDRadeonRDNA4_NO_FIRMWARE 1"; else cksum $(FW_BLOBS) | sed 's|^|// |'; fi \
-		> $(OBJDIR)/fwconfig.h.new; \
+	{ if [ -n "$$missing" ]; then echo "#define AMDRadeonRDNA4_NO_FIRMWARE 1"; else cksum $(FW_BLOBS) | sed 's|^|// |'; fi; \
+	  if [ "$(PVGPU)" = 1 ]; then echo "#define AMDRadeonRDNA4_PVGPU 1"; fi; } > $(OBJDIR)/fwconfig.h.new; \
 	cmp -s $(OBJDIR)/fwconfig.h.new $(OBJDIR)/fwconfig.h || { cp $(OBJDIR)/fwconfig.h.new $(OBJDIR)/fwconfig.h; \
 		rm -f $(OBJDIR)/*.o; }; \
 	rm -f $(OBJDIR)/fwconfig.h.new
 	@(cd $(OBJDIR) && $(MAKE) -f $(UP_$(VMTEST))/src/kext.mk ROOT=$(UP_$(VMTEST)) SDK="$(SDK)" CXX="$(CXX)" CC="$(CC)" \
-		PRODUCT=$(PRODUCT) VERSION=$(VERSION) ARCH=$(ARCH) DEPLOY=$(DEPLOY) CONFIG=$(CONFIG) VMTEST=$(VMTEST) \
+		PRODUCT=$(PRODUCT) VERSION=$(VERSION) ARCH=$(ARCH) DEPLOY=$(DEPLOY) CONFIG=$(CONFIG) VMTEST=$(VMTEST) PVGPU=$(PVGPU) \
 		LILU_SHIM=$(UP_$(VMTEST))/$(LILU_SHIM))
 	@cp $(OBJDIR)/$(PRODUCT) $(KEXT)/Contents/MacOS/$(PRODUCT)
 	@sed 's/@VERSION@/$(VERSION)/' Info.plist > $(KEXT)/Contents/Info.plist
@@ -151,7 +157,7 @@ $(LILU_STAMP): $(LILU)/../hde/hde32.h $(LILU)/../hde/hde64.h
 	@touch $@
 
 # --- what goes to the test machine beside the kext -----------------------------
-tools: $(BIN)/rdna4-run $(BIN)/n48nprobe $(BIN)/diagnostic-log.sh vulkan-products
+tools: $(BIN)/rdna4-run $(BIN)/n48nprobe $(BIN)/diagnostic-log.sh $(BIN)/boot-history.sh $(BIN)/freeze-watch.sh vulkan-products
 
 # The compute runtime's client. Linked by the C++ driver: it is the one pointed at ld64 (tools/build/build-osxcross.sh).
 $(BIN)/rdna4-run: $(RUN)/rdna4-run.c $(RUN)/librdna4.c $(RUN)/librdna4.h $(RUN)/pm4build.h $(RUN)/gfx12tri.h $(RUN)/gfx12tricol.h $(RUN)/gfx12trirun.h src/gfx12_draw.h src/gfx12_draw_col.h src/ngg_kernel.h src/psred_kernel.h src/nggcol_kernel.h src/pscol_kernel.h include/rdna4compute.h src/vadd_codeobj.h src/bench_codeobj.h
@@ -172,6 +178,16 @@ n48nprobe: $(BIN)/n48nprobe
 $(BIN)/diagnostic-log.sh: tools/rig/diagnostic-log.sh
 	@mkdir -p $(BIN)
 	cp tools/rig/diagnostic-log.sh $@
+
+# For a machine that freezes: which of the last boots ended young (boot-history.sh, from the log on disk), and a
+# daemon that keeps each boot's kernel lines on disk as they come (freeze-watch.sh).
+$(BIN)/boot-history.sh: tools/rig/boot-history.sh
+	@mkdir -p $(BIN)
+	cp tools/rig/boot-history.sh $@
+
+$(BIN)/freeze-watch.sh: tools/rig/freeze-watch.sh
+	@mkdir -p $(BIN)
+	cp tools/rig/freeze-watch.sh $@
 
 # The Vulkan driver and its test programs for the card tests (docs/todo-vulkantest.md): Mesa with the patches of
 # userspace/vulkan/mesa-patches, fetched (about 150 MB, the first time) and built in $(BUILD)/radv-build by `make mesa`.
