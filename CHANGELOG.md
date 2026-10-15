@@ -24,8 +24,22 @@ otherwise). The newest version is on top. How versions and branches work is in `
   program has to be given the display's size, three images at most, B8G8R8A8 only, and every present waits for the
   GPU and copies the picture.
 
+**macOS Tahoe** (the rig runs 26.6.2, 25G83, since 2026-10-13)
+- Restart and Shut Down from the Apple menu froze the whole machine on Tahoe whenever this kext was installed, even
+  with `rdna4-off=1`. The cause is the fake paravirtual GPU of the Metal work (M0, `src/pvgpu.cpp`): having its
+  classes in the kext was enough, without any instance of them. Why macOS minds is not known. It is now built in only
+  with `make PVGPU=1` (for the emulator runs of `docs/m0-pvgpu.md`); without it `rdna4-pvgpu` does nothing.
+  Verified on the card 2026-10-14 with the driver off (`rdna4-off=1`): the kext without that code restarts from the
+  menu, the kext with it freezes.
+- Still open on Tahoe: freezes in use with the compute side on (the first `rdna4-run info` of a boot, the machine
+  stops within a second of the tool's end); none with compute off.
+
 **Tools**
 - `tools/rig/spike-bar.sh` and `tools/metal/air/sample-operands.py`, the two spikes of the roadmap (issue #3).
+- `tools/rig/boot-history.sh` (how the last boots ended, from the log on disk) and `tools/rig/freeze-watch.sh` (a
+  launch daemon that keeps each boot's kernel log on disk while it runs, so that a freeze leaves its last lines);
+  both are in `bin/`. `rdna4-steptrace=<ms>`: a log line and a pause after each step of a compute client's open,
+  info call and close and of the shutdown quiesce, for finding where a freeze happens.
 
 **Layout and build**
 - The repository is sorted: the submodules in `lib/`, the GPU test kernels' sources in `src/shaders/`, the programs
