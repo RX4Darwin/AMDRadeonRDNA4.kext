@@ -3,7 +3,7 @@
 # Run by the top-level Makefile, never by hand: with the object directory as
 # the working directory, ROOT the way from there to the top of the repository,
 # and the configuration (SDK, CXX, CC, PRODUCT, VERSION, ARCH, DEPLOY, CONFIG,
-# VMTEST, LILU_SHIM) on the command line. buildrev.h and fwconfig.h are already
+# VMTEST, PVGPU, LILU_SHIM) on the command line. buildrev.h and fwconfig.h are already
 # in the object directory.
 #
 # Same language rules as the Makefile (GNU make and BSD make): the sources are
@@ -22,6 +22,10 @@ VMTEST_OBJS_1  = bochsvbe.o
 VMTEST_FLAGS_0 =
 VMTEST_FLAGS_1 = -DAMDRadeonRDNA4_VM_TEST
 
+# The fake paravirtual GPU of M0 (PVGPU=1 in the Makefile, which also defines AMDRadeonRDNA4_PVGPU in fwconfig.h).
+PVGPU_OBJS_0   =
+PVGPU_OBJS_1   = pvgpu.o pvstream.o
+
 # RELEASE is what has run on the card. DEBUG has not, as of 0.1.0: no optimisation (larger stack frames), and
 # DEBUG defined, which turns Lilu's DBGLOG lines on.
 OPT_RELEASE    = -Os
@@ -31,7 +35,7 @@ OPT_DEBUG      = -O0 -DDEBUG
 USER_OBJS = plugin.o device.o cursor.o ndrv.o modeset.o pipe2.o dptrain.o dpphy.o compute.o gfxring.o pmidle.o \
             flip.o amdfw.o psp.o sdma.o ih.o ihdecode.o pm4.o codeobj.o gpuheap.o gpuvm.o vmtree.o n48n.o \
             n48nkext.o vmid.o ptpages.o gpuvmtable.o runtime.o vmtest.o vmshared.o userclient.o accelcensus.o \
-            pvgpu.o pvstream.o plugin_start.o atombios.o ipdiscovery.o edid.o otgtiming.o modes.o pipe.o \
+            $(PVGPU_OBJS_$(PVGPU)) plugin_start.o atombios.o ipdiscovery.o edid.o otgtiming.o modes.o pipe.o \
             $(VMTEST_OBJS_$(VMTEST)) fwblobs.o
 # kmod_info.o is linked after the other objects.
 OBJS      = $(USER_OBJS) kmod_info.o
