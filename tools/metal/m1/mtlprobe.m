@@ -6,6 +6,9 @@
 //   mtlprobe blit      fill a 4 KiB buffer with 0x5a, copy it into a second buffer
 //   mtlprobe compute   c[i] = a[i] + b[i] over 64 floats (the kernel compiled from source here)
 //   mtlprobe grid      out[y * 50 + x] = x + 1000 * y over 50 x 20 threads in groups of 16 x 4 (2D, partial groups at the edges)
+//   mtlprobe mix       out[i] = 3 * in[i] + 100000 * group + 1000 * thread in group + group size over 100 threads in groups of 32 (the
+//                      last group has 4, and Metal reports 4 as its size); a kernel that is not in the kext's table: it runs only if
+//                      translated at run time
 //   mtlprobe render    one render pass that clears a 64x64 BGRA texture to (0.25, 0.5, 0.75, 1)
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
 //
@@ -115,6 +118,39 @@ static void grid(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	OUT("grid: out[0] %u out[50] %u out[999] %u, %d of %d wrong (0 1000 19049, 0 wrong = executed)", p[0], p[50], p[999], wrong, W * H);
 }
 
+static void mix(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"kernel void mix(device const uint *in [[buffer(0)]], device uint *out [[buffer(1)]], uint i [[thread_position_in_grid]],"
+	                                              " uint g [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]], uint n [[threads_per_threadgroup]]) {"
+	                                              " out[i] = 3 * in[i] + 100000 * g + 1000 * t + n; }"
+	                                     options:nil
+	                                       error:&err];
+	id<MTLComputePipelineState> ps = lib ? [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mix"] error:&err] : nil;
+	OUT("mix: pipeline %s%s", ps ? "created" : "NOT created: ", ps ? "" : err.localizedDescription.UTF8String);
+	if (!ps)
+		return;
+	enum { N = 100, G = 32 };
+	id<MTLBuffer> in = [d newBufferWithLength:N * 4 options:MTLResourceStorageModeShared], out = [d newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
+	uint32_t *pi = in.contents, *po = out.contents;
+	for (int i = 0; i < N; i++) {
+		pi[i] = i;
+		po[i] = 0xffffffff;
+	}
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe mix";
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+	[e setComputePipelineState:ps];
+	[e setBuffer:in offset:0 atIndex:0];
+	[e setBuffer:out offset:0 atIndex:1];
+	[e dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(G, 1, 1)];
+	[e endEncoding];
+	run(cb, "mix");
+	int wrong = 0;
+	for (int i = 0; i < N; i++)
+		wrong += po[i] != (uint32_t)(3 * i + 100000 * (i / G) + 1000 * (i % G) + (N - i / G * G < G ? N - i / G * G : G));
+	OUT("mix: out[0] %u out[33] %u out[99] %u, %d of %d wrong (32 101131 303301, 0 wrong = executed)", po[0], po[33], po[99], wrong, N);
+}
+
 static void render(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
 	td.usage = MTLTextureUsageRenderTarget;
@@ -143,8 +179,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "render"};
-			for (int i = 0; i < 5; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "render"};
+			for (int i = 0; i < 6; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -169,10 +205,12 @@ int main(int argc, char **argv) {
 			compute(d, q);
 		else if (!strcmp(mode, "grid"))
 			grid(d, q);
+		else if (!strcmp(mode, "mix"))
+			mix(d, q);
 		else if (!strcmp(mode, "render"))
 			render(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, render, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, render, all)", mode);
 			return 2;
 		}
 	}

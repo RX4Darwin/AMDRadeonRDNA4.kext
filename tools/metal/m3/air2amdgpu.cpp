@@ -1,18 +1,21 @@
-// air2amdgpu: one compute kernel of Apple AIR (the LLVM bitcode Metal compiles to, as metallibs carry it) as an AMDGPU object for gfx1201
+// air2amdgpu: one compute kernel of Apple AIR (the LLVM bitcode Metal compiles to, as metallibs carry it) as an AMDGPU code object for gfx1201
 // (M3 of docs/metal-phase-plan.md, track b: AIR -> LLVM AMDGPU). Upstream LLVM reads AIR as it is (air64_v28, Metal 4, tested with LLVM 23):
 // buffers are `ptr addrspace(1)` as on AMDGPU, and what makes a function a kernel is only metadata (!air.kernel, one record per argument).
 //
-//   air2amdgpu <kernel.air or .bc> <kernel name> <out.o>      then: ld.lld -shared out.o -o out.hsaco
+//   air2amdgpu <kernel.air, .bc or .metallib> <kernel name> <out.hsaco>
+//       prints `<name> <buffers> <write mask>` (bit i: buffer index i is written), for tools/metal/m3/build.sh's table
+//   air2amdgpu --serve
+//       the run-time translator: as root, a user client of the kext (include/rdna4mtlc.h) that translates each function the fake paravirtual
+//       GPU's host asks for (the guest's metallib) and hands the code object back
 //
-// It prints `<name> <buffers> <write mask>` on stdout (bit i: buffer index i is written), for tools/metal/m3/build.sh's table.
-//
-// The object holds an amdgpu_kernel of the same name whose kernargs are (the ABI the fake paravirtual GPU's host fills, src/pvgpu.cpp):
+// The code object holds an amdgpu_kernel of the same name whose kernargs are (the ABI the host fills, src/pvgpu.cpp):
 //   +0           a 64-bit buffer address per Metal buffer index, 0 .. the highest index the kernel uses
 //   +8 * N       u32 threads per threadgroup x, y, z
 //   +8 * N + 12  u32 threads in the grid x, y, z (threads past it do nothing: dispatchThreads need not fill whole groups)
 // It computes the AIR function's position arguments from the work-group and work-item ids and calls the AIR function, inlined.
 // Supported so far: device buffers (address space 1) and the arguments thread_position_in_grid, thread_position_in_threadgroup,
 // threadgroup_position_in_grid, threads_per_threadgroup and threads_per_grid, as uint, uint2 or uint3. Anything else is reported and refused.
+#include "lld/Common/Driver.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
@@ -24,19 +27,62 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
+#include <IOKit/IOKitLib.h>
 #include <map>
 #include <string>
+#include <unistd.h>
+
+#include "../../../include/rdna4mtlc.h"
+
+LLD_HAS_DRIVER(elf)
 
 using namespace llvm;
 
 static int fail(const std::string &why) {
 	errs() << "air2amdgpu: " << why << "\n";
 	return 1;
+}
+
+static uint64_t le(StringRef s, size_t at, size_t bytes) {
+	uint64_t v = 0;
+	for (size_t i = 0; i < bytes && at + i < s.size(); i++)
+		v |= uint64_t(uint8_t(s[at + i])) << (8 * i);
+	return v;
+}
+
+// The named function's bitcode in a metallib (layout measured, docs/m1-stream.md s.5b): header u64 function list offset at 0x18 and bitcode
+// section offset at 0x48; the list is u32 count, then per function u32 bytes (counting itself) and tags {char[4], u16 length, data} to ENDT,
+// among them NAME (the name, NUL-terminated), OFFT (u64 offsets: public metadata, private metadata, bitcode in its section) and MDSZ (u64
+// bitcode bytes). Empty if it is not there or does not fit the file.
+static StringRef functionBitcode(StringRef lib, StringRef name) {
+	const uint64_t list = le(lib, 0x18, 8), section = le(lib, 0x48, 8);
+	uint64_t at = list + 4;
+	for (uint64_t f = 0, n = le(lib, list, 4); f < n && at + 4 <= lib.size(); f++) {
+		const uint64_t end = at + le(lib, at, 4);
+		std::string fname;
+		uint64_t offset = ~0ull, bytes = 0;
+		for (uint64_t t = at + 4; t + 6 <= end && t + 6 <= lib.size() && lib.substr(t, 4) != "ENDT"; t += 6 + le(lib, t + 4, 2)) {
+			const StringRef tag = lib.substr(t, 4), data = lib.substr(t + 6, le(lib, t + 4, 2));
+			if (tag == "NAME")
+				fname = data.split('\0').first.str();
+			else if (tag == "OFFT" && data.size() == 24)
+				offset = le(data, 16, 8);
+			else if (tag == "MDSZ" && data.size() == 8)
+				bytes = le(data, 0, 8);
+		}
+		if (fname == name && offset != ~0ull && section + offset >= section && section + offset + bytes <= lib.size())
+			return lib.substr(section + offset, bytes);
+		if (end <= at)
+			break;
+		at = end;
+	}
+	return {};
 }
 
 static std::string mdString(const MDNode *n, unsigned i) {
@@ -62,15 +108,25 @@ static Value *asType(IRBuilder<> &b, Type *t, Value *const xyz[3]) {
 	return r;
 }
 
-int main(int argc, char **argv) {
-	if (argc != 4)
-		return fail("usage: air2amdgpu <kernel.air> <kernel name> <out.o>");
+static bool gLldSpent;   // lld said it cannot be run again in this process: --serve exits after its reply (launchd starts a new one)
+
+struct Kernel {
+	std::string hsaco;   // the linked code object
+	unsigned buffers;
+	uint32_t written;
+};
+
+// The kernel `fname` of `input` (AIR bitcode, or a metallib holding it) as a code object; the reason when it cannot be translated.
+static std::string translate(StringRef input, StringRef fname, Kernel &out) {
+	const StringRef bitcode = input.starts_with("MTLB") ? functionBitcode(input, fname) : input;
+	if (bitcode.empty())
+		return "no function " + fname.str() + " in the metallib";
 	LLVMContext ctx;
 	SMDiagnostic diag;
-	std::unique_ptr<Module> m = parseIRFile(argv[1], diag, ctx);
+	std::unique_ptr<Module> m = parseIR(MemoryBufferRef(bitcode, "air"), diag, ctx);
 	if (!m)
-		return fail("cannot read " + std::string(argv[1]) + ": " + diag.getMessage().str());
-	Function *air = m->getFunction(argv[2]);
+		return "cannot read the AIR: " + diag.getMessage().str();
+	Function *air = m->getFunction(fname);
 	NamedMDNode *kernels = m->getNamedMetadata("air.kernel");
 	const MDNode *args = nullptr;
 	for (unsigned i = 0; kernels && i < kernels->getNumOperands(); i++) {
@@ -79,7 +135,7 @@ int main(int argc, char **argv) {
 			args = dyn_cast<MDNode>(k->getOperand(2));
 	}
 	if (!air || !args)
-		return fail(std::string("no AIR kernel named ") + argv[2]);
+		return "no AIR kernel named " + fname.str();
 
 	// What each argument of the AIR function is.
 	enum Role { Buffer, PosInGrid, PosInGroup, GroupInGrid, GroupSize, GridSize };
@@ -100,7 +156,7 @@ int main(int argc, char **argv) {
 				writes |= mdString(a, k) == "air.read_write" || mdString(a, k) == "air.write";
 			}
 			if (location < 0 || location > 31 || index >= air->arg_size() || air->getArg(index)->getType() != PointerType::get(ctx, 1))
-				return fail("argument " + std::to_string(index) + ": only device buffers (address space 1) are supported so far");
+				return "argument " + std::to_string(index) + ": only device buffers (address space 1) are supported so far";
 			roles[index] = {Buffer, location};
 			written |= writes ? 1u << location : 0;
 			maxLocation = location > maxLocation ? location : maxLocation;
@@ -115,11 +171,11 @@ int main(int argc, char **argv) {
 		} else if (kind == "air.threads_per_grid") {
 			roles[index] = {GridSize, -1};
 		} else {
-			return fail("argument " + std::to_string(index) + ": " + kind + " is not supported yet");
+			return "argument " + std::to_string(index) + ": " + kind + " is not supported yet";
 		}
 	}
 	if (roles.size() != air->arg_size())
-		return fail("not every argument of the AIR function is described");
+		return "not every argument of the AIR function is described";
 
 	// The kernel: kernargs as documented above.
 	const unsigned nBuffers = static_cast<unsigned>(maxLocation + 1);
@@ -134,7 +190,7 @@ int main(int argc, char **argv) {
 	kernel->setCallingConv(CallingConv::AMDGPU_KERNEL);
 	kernel->addFnAttr("amdgpu-flat-work-group-size", "1,1024");
 	IRBuilder<> b(BasicBlock::Create(ctx, "entry", kernel));
-	Value *group[3], *item[3], *size[3], *grid[3], *pos[3];
+	Value *group[3], *item[3], *size[3], *actual[3], *grid[3], *pos[3];
 	const Intrinsic::ID groupId[3] = {Intrinsic::amdgcn_workgroup_id_x, Intrinsic::amdgcn_workgroup_id_y, Intrinsic::amdgcn_workgroup_id_z};
 	const Intrinsic::ID itemId[3] = {Intrinsic::amdgcn_workitem_id_x, Intrinsic::amdgcn_workitem_id_y, Intrinsic::amdgcn_workitem_id_z};
 	Value *inside = b.getTrue();
@@ -143,7 +199,9 @@ int main(int argc, char **argv) {
 		item[d] = b.CreateIntrinsic(itemId[d], {});
 		size[d] = kernel->getArg(nBuffers + d);
 		grid[d] = kernel->getArg(nBuffers + 3 + d);
-		pos[d] = b.CreateAdd(b.CreateMul(group[d], size[d]), item[d]);
+		Value *first = b.CreateMul(group[d], size[d]);
+		pos[d] = b.CreateAdd(first, item[d]);
+		actual[d] = b.CreateBinaryIntrinsic(Intrinsic::umin, size[d], b.CreateSub(grid[d], first));   // Metal: a partial group's own size
 		inside = b.CreateAnd(inside, b.CreateICmpULT(pos[d], grid[d]));
 	}
 	BasicBlock *run = BasicBlock::Create(ctx, "run", kernel), *done = BasicBlock::Create(ctx, "done", kernel);
@@ -156,10 +214,10 @@ int main(int argc, char **argv) {
 		         : a.role == PosInGrid   ? asType(b, air->getArg(i)->getType(), pos)
 		         : a.role == PosInGroup  ? asType(b, air->getArg(i)->getType(), item)
 		         : a.role == GroupInGrid ? asType(b, air->getArg(i)->getType(), group)
-		         : a.role == GroupSize   ? asType(b, air->getArg(i)->getType(), size)
+		         : a.role == GroupSize   ? asType(b, air->getArg(i)->getType(), actual)
 		                                 : asType(b, air->getArg(i)->getType(), grid);
 		if (!v)
-			return fail("argument " + std::to_string(i) + ": an unsupported type for a position");
+			return "argument " + std::to_string(i) + ": an unsupported type for a position";
 		callArgs.push_back(v);
 	}
 	b.CreateCall(air, callArgs);
@@ -168,14 +226,11 @@ int main(int argc, char **argv) {
 	b.CreateRetVoid();
 
 	// Retarget: AMDGPU's triple and data layout, no AIR metadata.
-	InitializeAllTargets();
-	InitializeAllTargetMCs();
-	InitializeAllAsmPrinters();
 	const Triple triple("amdgcn-amd-amdhsa");
 	std::string err;
 	const Target *target = TargetRegistry::lookupTarget(triple, err);
 	if (!target)
-		return fail("no AMDGPU target in this LLVM: " + err);
+		return "no AMDGPU target in this LLVM: " + err;
 	std::unique_ptr<TargetMachine> tm(target->createTargetMachine(triple, "gfx1201", "", TargetOptions(), std::nullopt));
 	m->setTargetTriple(triple);
 	m->setDataLayout(tm->createDataLayout());
@@ -186,7 +241,7 @@ int main(int argc, char **argv) {
 	for (NamedMDNode *n : airMd)
 		m->eraseNamedMetadata(n);
 	if (verifyModule(*m, &errs()))
-		return fail("the retargeted module does not verify");
+		return "the retargeted module does not verify";
 
 	// Only the new kernel stays visible: the module's other AIR kernels and functions go unless it uses them.
 	for (Function &f : *m)
@@ -207,17 +262,100 @@ int main(int argc, char **argv) {
 	pb.buildPerModuleDefaultPipeline(OptimizationLevel::O2).run(*m, mam);
 	for (Instruction &i : instructions(*kernel))
 		if (isa<AllocaInst>(i))
-			return fail("private memory (an alloca in AIR's address space 0) is not supported yet");
+			return "private memory (an alloca in AIR's address space 0) is not supported yet";
 
+	// Emit the object and link it into a code object (ld.lld -shared), through temporary files: lld's driver reads and writes files.
+	SmallVector<char, 0> object;
+	raw_svector_ostream objectOut(object);
+	legacy::PassManager cg;
+	if (tm->addPassesToEmitFile(cg, objectOut, nullptr, CodeGenFileType::ObjectFile))
+		return "this LLVM cannot emit an AMDGPU object";
+	cg.run(*m);
+	SmallString<128> objPath, elfPath;
+	int fd = -1;
+	if (sys::fs::createTemporaryFile("air2amdgpu", "o", fd, objPath))
+		return "no temporary file";
+	{
+		raw_fd_ostream o(fd, true);
+		o << StringRef(object.data(), object.size());
+	}
+	if (sys::fs::createTemporaryFile("air2amdgpu", "hsaco", elfPath)) {
+		sys::fs::remove(objPath);
+		return "no temporary file";
+	}
+	std::string linkErrors;
+	raw_string_ostream linkErr(linkErrors);
+	const char *lldArgs[] = {"ld.lld", "-shared", objPath.c_str(), "-o", elfPath.c_str()};
+	const lld::Result linked = lld::lldMain(lldArgs, outs(), linkErr, {{lld::Gnu, &lld::elf::link}});
+	auto elf = MemoryBuffer::getFile(elfPath);
+	sys::fs::remove(objPath);
+	sys::fs::remove(elfPath);
+	if (linked.retCode || !elf)
+		return "ld.lld failed: " + linkErrors;
+	gLldSpent |= !linked.canRunAgain;
+	out.hsaco = (*elf)->getBuffer().str();
+	out.buffers = nBuffers;
+	out.written = written;
+	return "";
+}
+
+// --serve: connect to the kext (retrying until the host is up), then translate each function it asks for. Ends when the kext's call fails
+// (it went away, or this process was signalled); run it under launchd with KeepAlive.
+static int serve() {
+	io_connect_t conn = 0;
+	for (bool said = false;; said = true) {
+		const io_service_t svc = IOServiceGetMatchingService(MACH_PORT_NULL, IOServiceMatching("RDNA4ComputeService"));
+		const kern_return_t kr = svc ? IOServiceOpen(svc, mach_task_self(), RDNA4_MTLC_TYPE, &conn) : KERN_FAILURE;
+		if (svc)
+			IOObjectRelease(svc);
+		if (kr == KERN_SUCCESS)
+			break;
+		if (!said)
+			errs() << "air2amdgpu: waiting for the kext's translator door (0x" << Twine::utohexstr(kr) << ")\n";
+		sleep(5);
+	}
+	errs() << "air2amdgpu: connected\n";
+	std::vector<char> lib(RDNA4_MTLC_MAX_LIB);
+	for (;;) {
+		const uint64_t in[2] = {reinterpret_cast<uint64_t>(lib.data()), lib.size()};
+		uint64_t req[2] = {};
+		uint32_t nReq = 2;
+		char name[64] = {};
+		size_t nameLen = sizeof(name);
+		const kern_return_t kr = IOConnectCallMethod(conn, kMtlcNext, in, 2, nullptr, 0, req, &nReq, name, &nameLen);
+		if (kr != KERN_SUCCESS)
+			return fail("the kext ended the session (0x" + Twine::utohexstr(kr).str() + ")");
+		name[sizeof(name) - 1] = 0;
+		Kernel k {};
+		const std::string why = translate(StringRef(lib.data(), req[1]), name, k);
+		errs() << "air2amdgpu: request " << req[0] << ": " << name << ": " << (why.empty() ? "translated, " + std::to_string(k.hsaco.size()) + " bytes" : why) << "\n";
+		const uint64_t reply[5] = {req[0], reinterpret_cast<uint64_t>(k.hsaco.data()), why.empty() ? k.hsaco.size() : 0, k.buffers, k.written};
+		IOConnectCallScalarMethod(conn, kMtlcDeliver, reply, 5, nullptr, nullptr);
+		if (gLldSpent)
+			return fail("lld cannot run again in this process; exiting");
+	}
+}
+
+int main(int argc, char **argv) {
+	InitializeAllTargets();
+	InitializeAllTargetMCs();
+	InitializeAllAsmPrinters();
+	if (argc == 2 && StringRef(argv[1]) == "--serve")
+		return serve();
+	if (argc != 4)
+		return fail("usage: air2amdgpu <kernel.air|.metallib> <kernel name> <out.hsaco>  |  air2amdgpu --serve");
+	auto input = MemoryBuffer::getFile(argv[1]);
+	if (!input)
+		return fail("cannot read " + std::string(argv[1]));
+	Kernel k {};
+	const std::string why = translate((*input)->getBuffer(), argv[2], k);
+	if (!why.empty())
+		return fail(why);
 	std::error_code ec;
 	raw_fd_ostream out(argv[3], ec, sys::fs::OF_None);
 	if (ec)
 		return fail("cannot write " + std::string(argv[3]) + ": " + ec.message());
-	legacy::PassManager cg;
-	if (tm->addPassesToEmitFile(cg, out, nullptr, CodeGenFileType::ObjectFile))
-		return fail("this LLVM cannot emit an AMDGPU object");
-	cg.run(*m);
-	out.flush();
-	outs() << name << " " << nBuffers << " " << written << "\n";
+	out << k.hsaco;
+	outs() << argv[2] << " " << k.buffers << " " << k.written << "\n";
 	return 0;
 }

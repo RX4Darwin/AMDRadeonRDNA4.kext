@@ -10,12 +10,14 @@
 #include "compute.hpp"
 #include "mtlkernels.h"
 #include "rdna4compute.h"
+#include "rdna4mtlc.h"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <libkern/c++/OSData.h>
@@ -41,6 +43,20 @@ uint32_t gLogLines { 0 };
 RDNA4PvNub *gNub { nullptr };
 IOService *gLateParent { nullptr };   // RDNA4PvNub::setLateParent
 RDNA4Compute *gCompute { nullptr };   // RDNA4PvNub::setCompute
+
+// M3: the one request slot between the host and the translator helper (include/rdna4mtlc.h). The host posts a function (id != 0) and
+// waits on &done; the helper's kMtlcNext waits on &id, copies the metallib out and sets taken; kMtlcDeliver fills elf and sets done.
+struct Translation {
+	IOLock *lock;                 // allocated with the host (RDNA4PvHost::start)
+	bool helper;                  // a helper is connected
+	uint32_t seq, id;
+	bool taken, done;
+	const uint8_t *lib;
+	uint32_t libLen;
+	char name[64];
+	uint8_t *elf;                 // IOMalloc'd by kMtlcDeliver, freed by the host
+	uint32_t elfLen, buffers, written;
+} gTr;
 
 void pvlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void pvlog(const char *fmt, ...) {
@@ -153,8 +169,11 @@ private:
 	bool readGuest(uint32_t task, uint64_t va, uint8_t *dst, uint32_t len) { return copyGuest(task, va, dst, len, false); }
 	void decodeExec(uint32_t task, uint64_t va, uint64_t len);
 	void dmaSelfTest();
-	bool functionOf(uint32_t task, char *name, size_t nameCap, uint8_t hash[32]);
+	bool functionOf(uint32_t task, char *name, size_t nameCap, uint8_t hash[32], uint64_t *lib);
+	uint32_t load(const uint8_t *elf, uint32_t size, const char *name);
 	uint32_t program(unsigned kernel);
+	struct Jit { uint8_t hash[32]; uint32_t program, buffers, written; };
+	const Jit *translated(uint32_t task, uint64_t lib, const char *name, const uint8_t hash[32]);
 	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
 	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
 	bool dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes);
@@ -201,6 +220,8 @@ private:
 	uint32_t mTaskRoot[64] {};          // M1: page-table root PFN per task id (DefineHostTask), for the dumps after a commit
 	bool mRtOpen { false };              // M2: this host is a client of the card's runtime
 	uint32_t mProgram[kMtlKernelCount] {};   // M3: kMtlKernels loaded into it, 0 = not yet
+	Jit mJit[32] {};                     // M3: functions the helper translated, by hash (program 0: it could not); oldest replaced first
+	uint32_t mJits { 0 };
 	uint32_t mRenderLines { 0 };          // M2: render-pass and texture lines so far (other processes render every frame)
 	uint8_t mWin[1024] {};              // one FIFO command copied out of the ring for decoding
 
@@ -298,6 +319,8 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	}
 	h->mNub = nub;
 	h->mLevel = level;
+	if (!gTr.lock)
+		gTr.lock = IOLockAlloc();   // ponytail: never freed, like the host
 	uint32_t disp = 0;
 	if (PE_parse_boot_argn("rdna4-pvgpu-disp", &disp, sizeof(disp)))
 		h->mDisp = disp & 3;
@@ -894,7 +917,7 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 
 // M2: the task's function: its one type-6 resource (several are not told apart yet), whose 32-byte descriptor starts with the GPU address of a
 // metallib ('MTLB', measured 2026-10-21); the function's NAME and HASH tags from that library's first KiB.
-bool RDNA4PvHost::functionOf(uint32_t task, char *name, size_t nameCap, uint8_t hash[32]) {
+bool RDNA4PvHost::functionOf(uint32_t task, char *name, size_t nameCap, uint8_t hash[32], uint64_t *libOut) {
 	uint64_t lib = 0;
 	unsigned found = 0;
 	for (uint32_t id = 1; id <= 64; id++) {
@@ -921,60 +944,128 @@ bool RDNA4PvHost::functionOf(uint32_t task, char *name, size_t nameCap, uint8_t 
 			memcpy(hash, head + i + 6, 32);
 		}
 	}
+	*libOut = lib;
 	return name[0] != 0;
 }
 
-// kMtlKernels[kernel] loaded into the card's runtime (on first use), or 0.
-uint32_t RDNA4PvHost::program(unsigned kernel) {
+// A code object loaded into the card's runtime: its program, or 0.
+uint32_t RDNA4PvHost::load(const uint8_t *elf, uint32_t size, const char *name) {
 	if (!gCompute)
 		return 0;
 	if (!mRtOpen)
 		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;   // ponytail: never closed, the host lives as long as the boot
-	const MtlKernel &k = kMtlKernels[kernel];
-	if (mRtOpen && !mProgram[kernel]) {
-		uint64_t out[8] = {};
-		if (gCompute->rtLoad(this, kernel_task, reinterpret_cast<mach_vm_address_t>(k.elf), k.size, k.name, out) == kIOReturnSuccess)
-			mProgram[kernel] = static_cast<uint32_t>(out[0]);
-		pvlog("host: compute: %s %s (program 0x%x)", k.name, mProgram[kernel] ? "loaded into the runtime" : "did NOT load", mProgram[kernel]);
-	}
+	uint64_t out[8] = {};
+	const bool ok = mRtOpen && gCompute->rtLoad(this, kernel_task, reinterpret_cast<mach_vm_address_t>(elf), size, name, out) == kIOReturnSuccess;
+	pvlog("host: compute: %s %s (program 0x%llx)", name, ok ? "loaded into the runtime" : "did NOT load", out[0]);
+	return ok ? static_cast<uint32_t>(out[0]) : 0;
+}
+
+// kMtlKernels[kernel] loaded into the card's runtime (on first use), or 0.
+uint32_t RDNA4PvHost::program(unsigned kernel) {
+	if (!mProgram[kernel])
+		mProgram[kernel] = load(kMtlKernels[kernel].elf, kMtlKernels[kernel].size, kMtlKernels[kernel].name);
 	return mProgram[kernel];
 }
 
-// M3: Compute.dispatchThreads (size: threads in the grid[3], threads per threadgroup[3]), run on the card when the function is one of
-// src/mtlkernels.h (Metal kernels translated AIR -> gfx1201 by tools/metal/m3; picked by the function's name, its hash logged to key it by
-// later). Each bound buffer, from its offset to its end, is copied into a runtime buffer, the kernel dispatched, and the buffers it writes
-// copied back into the guest's pages.
+// M3: the function translated at run time by the helper (include/rdna4mtlc.h) and loaded into the runtime, cached by its hash (failures too,
+// so a function that cannot be translated is asked for once). Null without a helper, or when it did not answer within 3 s (not cached).
+const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, const char *name, const uint8_t hash[32]) {
+	for (uint32_t i = 0; i < mJits && i < 32; i++)
+		if (!memcmp(mJit[i].hash, hash, 32))
+			return mJit[i].program ? &mJit[i] : nullptr;
+	if (!gTr.lock || !gTr.helper)
+		return nullptr;
+	uint64_t size = 0;   // the metallib's file size (header u64 at 0x10)
+	auto *bytes = readGuest(task, lib + 0x10, reinterpret_cast<uint8_t *>(&size), 8) && size >= 0x58 && size <= RDNA4_MTLC_MAX_LIB
+	              ? static_cast<uint8_t *>(IOMalloc(size)) : nullptr;
+	if (!bytes || !readGuest(task, lib, bytes, static_cast<uint32_t>(size))) {
+		pvlog("host: compute: \"%s\": metallib of %llu bytes not read", name, size);
+		if (bytes)
+			IOFree(bytes, size);
+		return nullptr;
+	}
+	IOLockLock(gTr.lock);
+	gTr.id = ++gTr.seq ? gTr.seq : ++gTr.seq;   // never 0 (0 = no request)
+	gTr.taken = gTr.done = false;
+	gTr.lib = bytes;
+	gTr.libLen = static_cast<uint32_t>(size);
+	strlcpy(gTr.name, name, sizeof(gTr.name));
+	IOLockWakeup(gTr.lock, &gTr.id, false);
+	uint64_t deadline = 0;
+	clock_interval_to_deadline(3, kSecondScale, &deadline);
+	while (!gTr.done && IOLockSleepDeadline(gTr.lock, &gTr.done, deadline, THREAD_UNINT) == THREAD_AWAKENED) {
+	}
+	const bool done = gTr.done;
+	uint8_t *elf = gTr.elf;
+	const uint32_t elfLen = gTr.elfLen, buffers = gTr.buffers, written = gTr.written;
+	gTr.id = 0;
+	gTr.lib = nullptr;
+	gTr.elf = nullptr;
+	IOLockUnlock(gTr.lock);
+	IOFree(bytes, size);
+	if (!done) {
+		pvlog("host: compute: \"%s\": the helper did not translate it within 3 s", name);
+		return nullptr;
+	}
+	Jit &j = mJit[mJits++ % 32];
+	if (j.program)
+		gCompute->rtUnload(this, j.program);
+	memcpy(j.hash, hash, 32);
+	j.program = elf && buffers <= 8 ? load(elf, elfLen, name) : 0;
+	j.buffers = buffers;
+	j.written = written;
+	if (elf)
+		IOFree(elf, elfLen);
+	pvlog("host: compute: \"%s\" %s by the helper (%llu bytes of metallib, %u bytes of code)", name, elf ? "translated" : "could NOT be translated", size, elfLen);
+	return j.program ? &j : nullptr;
+}
+
+// M3: Compute.dispatchThreads (size: threads in the grid[3], threads per threadgroup[3]), run on the card with the function translated
+// AIR -> gfx1201 (at run time by the helper, or ahead of time into src/mtlkernels.h by tools/metal/m3). Each bound buffer, from its offset
+// to its end, is copied into a runtime buffer, the kernel dispatched, and the buffers it writes copied back into the guest's pages.
 void RDNA4PvHost::runCompute(uint32_t task, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size) {
 	static constexpr uint64_t kMaxBuffer = 64ull << 20;   // ponytail: staged through one kernel allocation; map the guest pages if bigger is needed
 	char name[64];
 	uint8_t hash[32];
-	if (!functionOf(task, name, sizeof(name), hash))
+	uint64_t lib = 0;
+	if (!functionOf(task, name, sizeof(name), hash, &lib))
 		return;
 	pvlog("host: compute: task %u dispatches \"%s\" (hash %02x%02x%02x%02x%02x%02x%02x%02x...), %llu x %llu x %llu threads in groups of %llu x %llu x %llu",
 	      task, name, hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], size[0], size[1], size[2], size[3], size[4], size[5]);
-	unsigned ki = 0;
-	while (ki < kMtlKernelCount && strcmp(name, kMtlKernels[ki].name))
-		ki++;
-	bool ok = ki < kMtlKernelCount && kMtlKernels[ki].buffers <= 8 && size[3] * size[4] * size[5] <= 1024;
+	// The kernel: translated now by the helper, else (no helper) from the table of src/mtlkernels.h by name.
+	uint32_t prog = 0, nb = 0, written = 0;
+	const char *from = "translated at run time";
+	if (const Jit *j = translated(task, lib, name, hash)) {
+		prog = j->program;
+		nb = j->buffers;
+		written = j->written;
+	} else {
+		for (unsigned i = 0; i < kMtlKernelCount && !prog; i++)
+			if (!strcmp(name, kMtlKernels[i].name)) {
+				prog = program(i);
+				nb = kMtlKernels[i].buffers;
+				written = kMtlKernels[i].written;
+				from = "from the table";
+			}
+	}
+	bool ok = prog && nb <= 8 && size[3] * size[4] * size[5] <= 1024;
 	for (unsigned d = 0; d < 3 && ok; d++)
 		ok = size[d] && size[d] < (1ull << 31) && size[d + 3];
 	if (!ok) {
-		pvlog("host: compute: no translated kernel for it (or the dispatch is out of range): not run");
+		pvlog("host: compute: no kernel for it (or the dispatch is out of range): not run");
 		return;
 	}
-	const MtlKernel &k = kMtlKernels[ki];
 	uint64_t handle[8] = {}, gpu[8] = {}, va[8] = {}, bytes[8] = {}, most = 0;
-	for (unsigned b = 0; b < k.buffers && ok; b++) {
+	for (unsigned b = 0; b < nb && ok; b++) {
 		uint64_t len = 0;
 		ok = buffer[b] && bufferRange(task, buffer[b], &va[b], &len) && offset[b] < len && len - offset[b] <= kMaxBuffer;
 		va[b] += offset[b];
 		bytes[b] = len - offset[b];
 		most = bytes[b] > most ? bytes[b] : most;
 	}
-	const uint32_t prog = ok ? program(ki) : 0;
-	auto *stage = prog ? static_cast<uint8_t *>(IOMalloc(most)) : nullptr;
+	auto *stage = ok && most ? static_cast<uint8_t *>(IOMalloc(most)) : nullptr;
 	ok = stage != nullptr;
-	for (unsigned b = 0; b < k.buffers && ok; b++)
+	for (unsigned b = 0; b < nb && ok; b++)
 		ok = gCompute->rtAlloc(this, bytes[b], handle[b], gpu[b]) == kIOReturnSuccess && readGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b])) &&
 		     gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], true) == kIOReturnSuccess;
 	uint64_t micros = 0;
@@ -987,21 +1078,21 @@ void RDNA4PvHost::runCompute(uint32_t task, const uint32_t *buffer, const uint64
 			dims[i + 3] = static_cast<uint32_t>(size[i]);
 			d.groups[i] = static_cast<uint32_t>((size[i] + size[i + 3] - 1) / size[i + 3]);
 		}
-		memcpy(d.kernargs, gpu, 8 * k.buffers);
-		memcpy(d.kernargs + 8 * k.buffers, dims, sizeof(dims));
-		d.kernargBytes = 8 * k.buffers + sizeof(dims);
+		memcpy(d.kernargs, gpu, 8 * nb);
+		memcpy(d.kernargs + 8 * nb, dims, sizeof(dims));
+		d.kernargBytes = 8 * nb + sizeof(dims);
 		ok = gCompute->rtDispatch(this, d, micros) == kIOReturnSuccess;
 	}
-	for (unsigned b = 0; b < k.buffers && ok; b++)
-		if (k.written & (1u << b))
+	for (unsigned b = 0; b < nb && ok; b++)
+		if (written & (1u << b))
 			ok = gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], false) == kIOReturnSuccess &&
 			     copyGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b]), true);
-	for (unsigned b = 0; b < k.buffers; b++)
+	for (unsigned b = 0; b < nb; b++)
 		if (handle[b])
 			gCompute->rtFree(this, handle[b]);
 	if (stage)
 		IOFree(stage, most);
-	pvlog("host: compute: %s on the card (translated from AIR): %s (%llu us)", k.name, ok ? "done" : "NOT done", micros);
+	pvlog("host: compute: %s on the card (%s): %s (%llu us)", name, from, ok ? "done" : "NOT done", micros);
 }
 
 // M2: can the card write memory like the guest's (system RAM by physical address, through the AGP aperture)? Two kernel pages: SDMA fills the first
@@ -2367,3 +2458,139 @@ IOReturn RDNA4PvNub::disableInterrupt(int source) {
 	return kIOReturnSuccess;
 }
 IOReturn RDNA4PvNub::causeInterrupt(int source) { PVCALL("causeInterrupt"); return raiseInterrupt(source) ? kIOReturnSuccess : kIOReturnNotReady; }
+
+// ======================================================================================================================================
+// M3: the translator helper's user client (include/rdna4mtlc.h): one helper at a time, root only.
+// ======================================================================================================================================
+
+class RDNA4MtlcClient : public IOUserClient {
+	OSDeclareDefaultStructors(RDNA4MtlcClient)
+public:
+	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+	IOReturn clientClose() APPLE_KEXT_OVERRIDE;
+	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) APPLE_KEXT_OVERRIDE;
+
+private:
+	bool mHelper { false };   // this client is the helper (another was not connected)
+	IOReturn next(IOExternalMethodArguments *a);
+	IOReturn deliver(IOExternalMethodArguments *a);
+};
+
+OSDefineMetaClassAndStructors(RDNA4MtlcClient, IOUserClient)
+
+bool RDNA4MtlcClient::start(IOService *provider) {
+	if (!IOUserClient::start(provider))
+		return false;
+	IOLockLock(gTr.lock);
+	mHelper = !gTr.helper;
+	gTr.helper = true;
+	IOLockUnlock(gTr.lock);
+	pvlog("host: translator helper %s", mHelper ? "connected" : "refused: one is connected already");
+	return mHelper;
+}
+
+// Also what IOUserClient::clientDied comes to. A kMtlcNext still waiting is aborted with the process's thread.
+IOReturn RDNA4MtlcClient::clientClose() {
+	if (mHelper) {
+		IOLockLock(gTr.lock);
+		gTr.helper = false;
+		IOLockUnlock(gTr.lock);
+		mHelper = false;
+		pvlog("host: translator helper gone");
+	}
+	terminate();
+	return kIOReturnSuccess;
+}
+
+IOReturn RDNA4MtlcClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a, IOExternalMethodDispatch *, OSObject *, void *) {
+	if (!mHelper)
+		return kIOReturnNotOpen;
+	if (selector == kMtlcNext && a->scalarInputCount == 2 && a->scalarOutputCount == 2 && a->structureOutput &&
+	    a->structureOutputSize == sizeof(gTr.name))
+		return next(a);
+	if (selector == kMtlcDeliver && a->scalarInputCount == 5 && a->scalarInput[2] <= RDNA4_MTLC_MAX_ELF)
+		return deliver(a);
+	return kIOReturnBadArgument;
+}
+
+IOReturn RDNA4MtlcClient::next(IOExternalMethodArguments *a) {
+	IOLockLock(gTr.lock);
+	while (!gTr.id || gTr.taken)
+		if (IOLockSleep(gTr.lock, &gTr.id, THREAD_ABORTSAFE) != THREAD_AWAKENED) {
+			IOLockUnlock(gTr.lock);
+			return kIOReturnAborted;
+		}
+	IOReturn r = kIOReturnNoSpace;
+	if (gTr.libLen <= a->scalarInput[1]) {
+		IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(a->scalarInput[0], gTr.libLen, kIODirectionIn, current_task());
+		r = md ? md->prepare() : kIOReturnNoMemory;
+		if (r == kIOReturnSuccess) {
+			r = md->writeBytes(0, gTr.lib, gTr.libLen) == gTr.libLen ? kIOReturnSuccess : kIOReturnVMError;
+			md->complete();
+		}
+		OSSafeReleaseNULL(md);
+	}
+	if (r == kIOReturnSuccess) {
+		a->scalarOutput[0] = gTr.id;
+		a->scalarOutput[1] = gTr.libLen;
+		memcpy(a->structureOutput, gTr.name, sizeof(gTr.name));
+		gTr.taken = true;
+	}
+	IOLockUnlock(gTr.lock);
+	return r;
+}
+
+IOReturn RDNA4MtlcClient::deliver(IOExternalMethodArguments *a) {
+	const uint64_t *in = a->scalarInput;
+	const uint32_t len = static_cast<uint32_t>(in[2]);
+	auto *elf = len ? static_cast<uint8_t *>(IOMalloc(len)) : nullptr;
+	if (len) {
+		IOMemoryDescriptor *md = elf ? IOMemoryDescriptor::withAddressRange(in[1], len, kIODirectionOut, current_task()) : nullptr;
+		IOReturn r = md ? md->prepare() : kIOReturnNoMemory;
+		if (r == kIOReturnSuccess) {
+			r = md->readBytes(0, elf, len) == len ? kIOReturnSuccess : kIOReturnVMError;
+			md->complete();
+		}
+		OSSafeReleaseNULL(md);
+		if (r != kIOReturnSuccess) {
+			if (elf)
+				IOFree(elf, len);
+			return r;
+		}
+	}
+	IOLockLock(gTr.lock);
+	const bool current = in[0] && in[0] == gTr.id && gTr.taken && !gTr.done;
+	if (current) {
+		gTr.elf = elf;
+		gTr.elfLen = len;
+		gTr.buffers = static_cast<uint32_t>(in[3]);
+		gTr.written = static_cast<uint32_t>(in[4]);
+		gTr.done = true;
+		IOLockWakeup(gTr.lock, &gTr.done, false);
+	}
+	IOLockUnlock(gTr.lock);
+	if (!current && elf)
+		IOFree(elf, len);
+	return current ? kIOReturnSuccess : kIOReturnNotFound;   // NotFound: the host stopped waiting for it
+}
+
+IOReturn pvTranslatorClient(IOService *service, task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) {
+	if (IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+		return kIOReturnNotPrivileged;
+	if (!gTr.lock)
+		return kIOReturnNotReady;   // the host has not started yet (rdna4-pvgpu-delay)
+	auto *client = OSTypeAlloc(RDNA4MtlcClient);
+	if (!client)
+		return kIOReturnNoMemory;
+	if (!client->initWithTask(owningTask, securityID, type, properties) || !client->attach(service)) {
+		client->release();
+		return kIOReturnNoResources;
+	}
+	if (!client->start(service)) {
+		client->detach(service);
+		client->release();
+		return kIOReturnBusy;
+	}
+	*handler = client;
+	return kIOReturnSuccess;
+}

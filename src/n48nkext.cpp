@@ -41,6 +41,10 @@
 #include "pipe.hpp"
 #include "rdna4vulkan.h"
 #include "userclient.hpp"
+#ifdef AMDRadeonRDNA4_PVGPU
+#include "pvgpu.hpp"
+#include "rdna4mtlc.h"
+#endif
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODMACommand.h>
@@ -647,6 +651,10 @@ IOReturn RDNA4VulkanClient::clientMemoryForType(UInt32 type, IOOptionBits *, IOM
 
 IOReturn RDNA4ComputeService::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
                                             IOUserClient **handler) {
+#ifdef AMDRadeonRDNA4_PVGPU
+	if (type == RDNA4_MTLC_TYPE)   // the Metal kernel translator (src/pvgpu.cpp)
+		return pvTranslatorClient(this, owningTask, securityID, type, properties, handler);
+#endif
 	if (type != N48N_UC_TYPE)
 		return IOService::newUserClient(owningTask, securityID, type, properties, handler);
 	// Root only until there is a policy for who may have the GPU (docs/vulkan-port.md, "What a client may reach").

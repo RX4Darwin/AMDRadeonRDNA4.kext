@@ -217,6 +217,20 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   groups and copies back the written ones (`src/shaders/mtlvadd.cl` is gone). **On the card (2026-10-21): mtlprobe's `compute` reads
   `c[0] 1000 c[1] 1001 c[63] 1063` (vadd, 23 us) and the new `grid` (50 x 20 threads in groups of 16 x 4, partial groups at the edges)
   `0 of 1000 wrong` (grid2d, 28 us), both through the translated kernels; blit and render still pass.**
+- **M3, second step: translated at run time.** A root helper (`air2amdgpu --serve`, installed as a LaunchDaemon by
+  `tools/metal/m3/install-helper.sh`) opens a user client of type `'MTLC'` on `RDNA4ComputeService` (`include/rdna4mtlc.h`). A function the
+  host has not seen (by its metallib `HASH`) is handed to it whole: the metallib's file size is the header u64 at 0x10; the helper finds
+  the function's bitcode by its `NAME`, `OFFT` (third u64: offset in the bitcode section, whose offset is the header u64 at 0x48) and `MDSZ`
+  (bytes), translates it, links it with lld in the same process and returns the code object with its buffer count and written mask. The host
+  waits at most 3 s, loads it into the runtime and caches it by hash (32 entries). Without a helper it falls back to `src/mtlkernels.h`.
+  The helper for the rig is x86_64 with LLVM/lld 23.1.1 built from source for x86_64, AMDGPU only, linked in statically (`build.sh
+  helper`, 58 MB); its code objects match Homebrew LLVM's byte for byte except the linker's name in `.comment`; one translation takes about
+  30 ms on the rig. A partial threadgroup's `threads_per_threadgroup` is its own size in Metal (measured on Apple's GPU), not the requested
+  one. **On the card (2026-10-21): vadd, grid2d and mtlprobe's new `mix` (a kernel only the guest has: read and written buffers, threadgroup
+  position, position in the threadgroup, a partial last group) were each translated at run time and are correct (`0 of 100 wrong`), 27 us
+  each on the card.** Open: one boot before that run froze with a panic in `AppleGPUWrangler` (null pointer in its work loop, 2 s after the
+  host publishes the fake GPU at `rdna4-pvgpu-delay`); the next boot with the same kext did not; that boot also lit only the DP display, at
+  another resolution, before the host started. The helper parses data from Metal clients as root: sandbox it before it is on by default.
 
 ## 6. What is implemented now (code)
 

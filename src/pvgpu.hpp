@@ -190,4 +190,7 @@ private:
 	IOLock *mLock { nullptr };
 };
 
+// M3: the Metal kernel translator's user client (include/rdna4mtlc.h), handed out by RDNA4ComputeService::newUserClient.
+IOReturn pvTranslatorClient(IOService *service, task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler);
+
 #endif /* RDNA4PvGpu_hpp */
