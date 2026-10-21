@@ -207,6 +207,16 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   u32 slice, u32 level}` for a whole linear texture: mtlprobe's render reads `B 191 G 128 R 64 A 255`. **All three mtlprobe checks now pass on
   the card.** Other processes (system UI) also send render passes to the device now; theirs carry other values at +0x4c (no texture resources
   there) and are refused, and nothing they draw is executed.
+- **M3, first step: kernels translated from AIR.** `tools/metal/m3/air2amdgpu.cpp` reads a kernel's AIR with upstream LLVM (23 reads
+  `air64_v28` as it is: buffers are `ptr addrspace(1)` as on AMDGPU, the roles are `!air.kernel` metadata), wraps it in an `amdgpu_kernel`
+  that computes the position arguments from the work-group and work-item ids and bounds-checks them against the grid (dispatchThreads need not
+  fill whole groups), and emits a gfx1201 object. Its kernargs: a 64-bit address per buffer index, then u32 threads per threadgroup[3] and
+  u32 threads in the grid[3]. `tools/metal/m3/build.sh` translates `tools/metal/m3/kernels.metal` (mtlprobe's `vadd` and the 2D `grid2d`)
+  into the committed table `src/mtlkernels.h` (with each kernel's written buffers, from `air.read` / `air.read_write`); the host picks the
+  entry by the function's name, copies every bound buffer from its offset to its end into the runtime, dispatches `ceil(threads / per group)`
+  groups and copies back the written ones (`src/shaders/mtlvadd.cl` is gone). **On the card (2026-10-21): mtlprobe's `compute` reads
+  `c[0] 1000 c[1] 1001 c[63] 1063` (vadd, 23 us) and the new `grid` (50 x 20 threads in groups of 16 x 4, partial groups at the edges)
+  `0 of 1000 wrong` (grid2d, 28 us), both through the translated kernels; blit and render still pass.**
 
 ## 6. What is implemented now (code)
 

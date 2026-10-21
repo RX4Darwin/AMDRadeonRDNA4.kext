@@ -5,8 +5,9 @@
 //   mtlprobe info      the device and what it reports
 //   mtlprobe blit      fill a 4 KiB buffer with 0x5a, copy it into a second buffer
 //   mtlprobe compute   c[i] = a[i] + b[i] over 64 floats (the kernel compiled from source here)
+//   mtlprobe grid      out[y * 50 + x] = x + 1000 * y over 50 x 20 threads in groups of 16 x 4 (2D, partial groups at the edges)
 //   mtlprobe render    one render pass that clears a 64x64 BGRA texture to (0.25, 0.5, 0.75, 1)
-//   mtlprobe all       the four, each in its own child process (a crash or hang in one does not hide the others)
+//   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
 //
 // Build: clang -arch x86_64 -mmacosx-version-min=11.0 -fobjc-arc tools/metal/m1/mtlprobe.m -framework Foundation -framework Metal -o mtlprobe
 #import <Foundation/Foundation.h>
@@ -86,6 +87,34 @@ static void compute(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	OUT("compute: c[0] %.0f c[1] %.0f c[63] %.0f (1000 1001 1063 = executed)", pc[0], pc[1], pc[63]);
 }
 
+static void grid(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"kernel void grid2d(device uint *out [[buffer(0)]], uint2 p [[thread_position_in_grid]], uint2 n [[threads_per_grid]]) {"
+	                                              "\tout[p.y * n.x + p.x] = p.x + 1000 * p.y;\n}"
+	                                     options:nil
+	                                       error:&err];
+	id<MTLComputePipelineState> ps = lib ? [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"grid2d"] error:&err] : nil;
+	OUT("grid: pipeline %s%s", ps ? "created" : "NOT created: ", ps ? "" : err.localizedDescription.UTF8String);
+	if (!ps)
+		return;
+	enum { W = 50, H = 20 };
+	id<MTLBuffer> out = [d newBufferWithLength:W * H * 4 options:MTLResourceStorageModeShared];
+	uint32_t *p = out.contents;
+	memset(p, 0xff, W * H * 4);
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe grid";
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+	[e setComputePipelineState:ps];
+	[e setBuffer:out offset:0 atIndex:0];
+	[e dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(16, 4, 1)];
+	[e endEncoding];
+	run(cb, "grid");
+	int wrong = 0;
+	for (int i = 0; i < W * H; i++)
+		wrong += p[i] != (uint32_t)(i % W + 1000 * (i / W));
+	OUT("grid: out[0] %u out[50] %u out[999] %u, %d of %d wrong (0 1000 19049, 0 wrong = executed)", p[0], p[50], p[999], wrong, W * H);
+}
+
 static void render(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
 	td.usage = MTLTextureUsageRenderTarget;
@@ -114,8 +143,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "render"};
-			for (int i = 0; i < 4; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "render"};
+			for (int i = 0; i < 5; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -138,10 +167,12 @@ int main(int argc, char **argv) {
 			blit(d, q);
 		else if (!strcmp(mode, "compute"))
 			compute(d, q);
+		else if (!strcmp(mode, "grid"))
+			grid(d, q);
 		else if (!strcmp(mode, "render"))
 			render(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, render, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, render, all)", mode);
 			return 2;
 		}
 	}

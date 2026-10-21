@@ -8,7 +8,7 @@
 #include "pvgpu.hpp"
 #include "pvstream.hpp"
 #include "compute.hpp"
-#include "mtlvadd_codeobj.h"
+#include "mtlkernels.h"
 #include "rdna4compute.h"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -154,14 +154,14 @@ private:
 	void decodeExec(uint32_t task, uint64_t va, uint64_t len);
 	void dmaSelfTest();
 	bool functionOf(uint32_t task, char *name, size_t nameCap, uint8_t hash[32]);
-	bool rtReady();
+	uint32_t program(unsigned kernel);
 	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
 	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
 	bool dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes);
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
 	void runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
-	void runCompute(uint32_t task, const uint32_t *buffer, const uint64_t *offset, const uint64_t *threads);
+	void runCompute(uint32_t task, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size);
 private:
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
@@ -198,10 +198,10 @@ private:
 	uint32_t mCmds { 0 };               // FIFO commands decoded so far
 	uint32_t mBadHeaders { 0 };
 	uint8_t mDumped[256] {};            // M1: payload dumps per FIFO id so far
-	uint32_t mTaskRoot[64] {};
+	uint32_t mTaskRoot[64] {};          // M1: page-table root PFN per task id (DefineHostTask), for the dumps after a commit
 	bool mRtOpen { false };              // M2: this host is a client of the card's runtime
-	uint64_t mVaddProgram { 0 };          // M2: mtlvadd.cl loaded into it
-	uint32_t mRenderLines { 0 };          // M2: render-pass and texture lines so far (other processes render every frame)          // M1: page-table root PFN per task id (DefineHostTask), for the dumps after a commit
+	uint32_t mProgram[kMtlKernelCount] {};   // M3: kMtlKernels loaded into it, 0 = not yet
+	uint32_t mRenderLines { 0 };          // M2: render-pass and texture lines so far (other processes render every frame)
 	uint8_t mWin[1024] {};              // one FIFO command copied out of the ring for decoding
 
 	// Display side. rdna4-pvgpu-disp: bit 0 = report the display online (fill the pipe's info, set the online event), bit 1 = ~60 Hz VBL events for pipes whose
@@ -684,9 +684,9 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			memcpy(&t->offset[first + k], payload + 12 + 12 * k, 8);
 		}
 	} else if (id == 0x0ca && bytes >= 48) {   // Compute.dispatchThreads {u64 threads[3], u64 per group[3]}
-		uint64_t threads[3];
-		memcpy(threads, payload, sizeof(threads));
-		t->host->runCompute(t->task, t->buffer, t->offset, threads);
+		uint64_t size[6];
+		memcpy(size, payload, sizeof(size));
+		t->host->runCompute(t->task, t->buffer, t->offset, size);
 	}
 	if (t->lines++ >= 80)
 		return;
@@ -924,67 +924,84 @@ bool RDNA4PvHost::functionOf(uint32_t task, char *name, size_t nameCap, uint8_t 
 	return name[0] != 0;
 }
 
-bool RDNA4PvHost::rtReady() {
+// kMtlKernels[kernel] loaded into the card's runtime (on first use), or 0.
+uint32_t RDNA4PvHost::program(unsigned kernel) {
 	if (!gCompute)
-		return false;
+		return 0;
 	if (!mRtOpen)
 		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;   // ponytail: never closed, the host lives as long as the boot
-	if (mRtOpen && !mVaddProgram) {
+	const MtlKernel &k = kMtlKernels[kernel];
+	if (mRtOpen && !mProgram[kernel]) {
 		uint64_t out[8] = {};
-		if (gCompute->rtLoad(this, kernel_task, reinterpret_cast<mach_vm_address_t>(kMtlvaddCodeObject), sizeof(kMtlvaddCodeObject), "mtlvadd", out) ==
-		    kIOReturnSuccess)
-			mVaddProgram = out[0];
-		pvlog("host: compute: mtlvadd.cl %s (program 0x%llx)", mVaddProgram ? "loaded into the runtime" : "did NOT load", mVaddProgram);
+		if (gCompute->rtLoad(this, kernel_task, reinterpret_cast<mach_vm_address_t>(k.elf), k.size, k.name, out) == kIOReturnSuccess)
+			mProgram[kernel] = static_cast<uint32_t>(out[0]);
+		pvlog("host: compute: %s %s (program 0x%x)", k.name, mProgram[kernel] ? "loaded into the runtime" : "did NOT load", mProgram[kernel]);
 	}
-	return mRtOpen && mVaddProgram;
+	return mProgram[kernel];
 }
 
-// M2: Compute.dispatchThreads, run on the card with a precompiled kernel when the function is one we have (the bootstrap of
-// docs/metal-phase-plan.md M2 before the AIR compiler: a table keyed by the Metal function; so far one entry, mtlprobe's vadd, matched by its
-// name and its three bound buffers, its hash logged to key it by later). The bound buffers are copied into runtime buffers, the kernel
-// dispatched, the written one (c) copied back into the guest's pages.
-void RDNA4PvHost::runCompute(uint32_t task, const uint32_t *buffer, const uint64_t *offset, const uint64_t *threads) {
+// M3: Compute.dispatchThreads (size: threads in the grid[3], threads per threadgroup[3]), run on the card when the function is one of
+// src/mtlkernels.h (Metal kernels translated AIR -> gfx1201 by tools/metal/m3; picked by the function's name, its hash logged to key it by
+// later). Each bound buffer, from its offset to its end, is copied into a runtime buffer, the kernel dispatched, and the buffers it writes
+// copied back into the guest's pages.
+void RDNA4PvHost::runCompute(uint32_t task, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size) {
+	static constexpr uint64_t kMaxBuffer = 64ull << 20;   // ponytail: staged through one kernel allocation; map the guest pages if bigger is needed
 	char name[64];
 	uint8_t hash[32];
 	if (!functionOf(task, name, sizeof(name), hash))
 		return;
-	pvlog("host: compute: task %u dispatches \"%s\" (hash %02x%02x%02x%02x%02x%02x%02x%02x...), %llu x %llu x %llu threads, buffers %u %u %u", task, name,
-	      hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], threads[0], threads[1], threads[2], buffer[0], buffer[1], buffer[2]);
-	if (strcmp(name, "vadd") || !buffer[0] || !buffer[1] || !buffer[2] || threads[1] != 1 || threads[2] != 1 || !threads[0] || threads[0] > (1u << 24)) {
-		pvlog("host: compute: no precompiled kernel for it: not run");
+	pvlog("host: compute: task %u dispatches \"%s\" (hash %02x%02x%02x%02x%02x%02x%02x%02x...), %llu x %llu x %llu threads in groups of %llu x %llu x %llu",
+	      task, name, hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], size[0], size[1], size[2], size[3], size[4], size[5]);
+	unsigned ki = 0;
+	while (ki < kMtlKernelCount && strcmp(name, kMtlKernels[ki].name))
+		ki++;
+	bool ok = ki < kMtlKernelCount && kMtlKernels[ki].buffers <= 8 && size[3] * size[4] * size[5] <= 1024;
+	for (unsigned d = 0; d < 3 && ok; d++)
+		ok = size[d] && size[d] < (1ull << 31) && size[d + 3];
+	if (!ok) {
+		pvlog("host: compute: no translated kernel for it (or the dispatch is out of range): not run");
 		return;
 	}
-	if (!rtReady())
-		return;
-	const uint32_t n = static_cast<uint32_t>(threads[0]), bytes = n * 4;
-	uint64_t handle[3] = {}, gpu[3] = {}, va[3], len[3];
-	auto *stage = static_cast<uint8_t *>(IOMalloc(bytes));
-	bool ok = stage != nullptr;
-	for (unsigned k = 0; k < 3 && ok; k++)
-		ok = bufferRange(task, buffer[k], &va[k], &len[k]) && offset[k] <= len[k] && bytes <= len[k] - offset[k] &&
-		     gCompute->rtAlloc(this, bytes, handle[k], gpu[k]) == kIOReturnSuccess && readGuest(task, va[k] + offset[k], stage, bytes) &&
-		     gCompute->rtCopy(this, handle[k], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes, true) == kIOReturnSuccess;
+	const MtlKernel &k = kMtlKernels[ki];
+	uint64_t handle[8] = {}, gpu[8] = {}, va[8] = {}, bytes[8] = {}, most = 0;
+	for (unsigned b = 0; b < k.buffers && ok; b++) {
+		uint64_t len = 0;
+		ok = buffer[b] && bufferRange(task, buffer[b], &va[b], &len) && offset[b] < len && len - offset[b] <= kMaxBuffer;
+		va[b] += offset[b];
+		bytes[b] = len - offset[b];
+		most = bytes[b] > most ? bytes[b] : most;
+	}
+	const uint32_t prog = ok ? program(ki) : 0;
+	auto *stage = prog ? static_cast<uint8_t *>(IOMalloc(most)) : nullptr;
+	ok = stage != nullptr;
+	for (unsigned b = 0; b < k.buffers && ok; b++)
+		ok = gCompute->rtAlloc(this, bytes[b], handle[b], gpu[b]) == kIOReturnSuccess && readGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b])) &&
+		     gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], true) == kIOReturnSuccess;
 	uint64_t micros = 0;
 	if (ok) {
 		RDNA4Dispatch d {};
-		d.program = static_cast<uint32_t>(mVaddProgram);
-		d.groups[0] = (n + 63) / 64;
-		d.groups[1] = d.groups[2] = 1;
-		d.groupSize[0] = 64;
-		d.groupSize[1] = d.groupSize[2] = 1;
-		d.kernargBytes = 28;   // a, b, c, n (mtlvadd.cl)
-		memcpy(d.kernargs, gpu, 24);
-		memcpy(d.kernargs + 24, &n, 4);
-		ok = gCompute->rtDispatch(this, d, micros) == kIOReturnSuccess &&
-		     gCompute->rtCopy(this, handle[2], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes, false) == kIOReturnSuccess &&
-		     copyGuest(task, va[2] + offset[2], stage, bytes, true);
+		d.program = prog;
+		uint32_t dims[6];   // the kernargs after the buffers: threads per threadgroup[3], threads in the grid[3] (air2amdgpu.cpp)
+		for (unsigned i = 0; i < 3; i++) {
+			d.groupSize[i] = dims[i] = static_cast<uint32_t>(size[i + 3]);
+			dims[i + 3] = static_cast<uint32_t>(size[i]);
+			d.groups[i] = static_cast<uint32_t>((size[i] + size[i + 3] - 1) / size[i + 3]);
+		}
+		memcpy(d.kernargs, gpu, 8 * k.buffers);
+		memcpy(d.kernargs + 8 * k.buffers, dims, sizeof(dims));
+		d.kernargBytes = 8 * k.buffers + sizeof(dims);
+		ok = gCompute->rtDispatch(this, d, micros) == kIOReturnSuccess;
 	}
-	for (unsigned k = 0; k < 3; k++)
-		if (handle[k])
-			gCompute->rtFree(this, handle[k]);
+	for (unsigned b = 0; b < k.buffers && ok; b++)
+		if (k.written & (1u << b))
+			ok = gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], false) == kIOReturnSuccess &&
+			     copyGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b]), true);
+	for (unsigned b = 0; b < k.buffers; b++)
+		if (handle[b])
+			gCompute->rtFree(this, handle[b]);
 	if (stage)
-		IOFree(stage, bytes);
-	pvlog("host: compute: vadd over %u threads on the card with mtlvadd.cl: %s (%llu us)", n, ok ? "done" : "NOT done", micros);
+		IOFree(stage, most);
+	pvlog("host: compute: %s on the card (translated from AIR): %s (%llu us)", k.name, ok ? "done" : "NOT done", micros);
 }
 
 // M2: can the card write memory like the guest's (system RAM by physical address, through the AGP aperture)? Two kernel pages: SDMA fills the first
