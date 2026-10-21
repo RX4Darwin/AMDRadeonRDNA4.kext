@@ -105,7 +105,7 @@ RUN          = userspace/rdna4-run
 VULKAN       = userspace/vulkan
 CENSUS       = tools/metal/accelcensus
 
-.PHONY: all kext tools userspace n48nprobe mesa vulkan-products vkcube census-tool census-stub census-pathlog \
+.PHONY: all kext tools userspace n48nprobe mesa metal-helper vulkan-products vkcube census-tool census-stub census-pathlog \
         test atomdump check-isa check-config product-dir clean distclean
 
 all: check-config kext tools
@@ -218,6 +218,10 @@ vulkan-products:
 			$(CXX) -x c $(USER_FLAGS) -I$(RADV_DIR)/mesa/include -I$(VULKAN) $(VULKAN)/$$p.c -o $(BIN)/$$p || exit 1; \
 		fi; \
 	done
+
+# The Metal kernel translator's run-time helper for the rig (M3, docs/m1-stream.md s.5b); builds LLVM for x86_64 the first time.
+metal-helper:
+	tools/metal/m3/build.sh helper
 
 # A Vulkan application that is not ours: Khronos's vkcube with their loader and the manifest that tells the loader
 # where the driver of `make mesa` is (bin/vulkan/icd.d/), beside that driver in bin/ (userspace/vulkan/build-app.sh; fetches about 65 MB

@@ -4,8 +4,9 @@
 #   tools/metal/m3/build.sh           translate tools/metal/m3/kernels.metal (Apple's Metal compiler -> AIR -> air2amdgpu) into
 #                                     src/mtlkernels.h, the table the fake paravirtual GPU's host falls back to without the helper
 #                                     (committed, so building the kext needs neither LLVM nor the Metal toolchain)
-#   tools/metal/m3/build.sh helper    the run-time helper for the rig: Build/m3/x86_64/air2amdgpu, x86_64, LLVM and lld linked in
-#                                     statically from LLVM_X86 (an LLVM 23 build tree with AMDGPU and lld: see docs/m1-stream.md s.5b)
+#   tools/metal/m3/build.sh helper    the run-time helper for the rig (make metal-helper): Build/m3/x86_64/air2amdgpu, x86_64, LLVM and
+#                                     lld linked in statically from LLVM_X86 (default Build/llvm/x86_64, which is downloaded and built the
+#                                     first time: llvm-project 23.1.1, pinned by its SHA-256, AMDGPU only, about 40 minutes and 2.5 GB)
 #
 # Here: upstream LLVM 23 and lld from Homebrew (LLVM=/opt/homebrew/opt/llvm, LLD=/opt/homebrew/opt/lld by default) and Xcode's metal.
 set -euo pipefail
@@ -15,8 +16,33 @@ LLD=${LLD:-/opt/homebrew/opt/lld}
 B=Build/m3
 mkdir -p "$B"
 
+# LLVM and lld for x86_64 with only the AMDGPU backend, static libraries, in Build/llvm (once).
+LLVM_VERSION=23.1.1
+LLVM_SHA256=ebe9be46fe8756d58c5b198ffad0fa2a766257add81a4dc52179bfacc7888ee6
+llvm_x86() {
+	local d=Build/llvm tar=Build/llvm/llvm-project-$LLVM_VERSION.src.tar.xz top=llvm-project-$LLVM_VERSION.src
+	[ -f "$d/x86_64/lib/liblldELF.a" ] && [ -f "$d/x86_64/lib/libLLVMAMDGPUTargetMCA.a" ] && return
+	mkdir -p "$d"
+	[ -f "$tar" ] || curl -fL -o "$tar" "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$top.tar.xz"
+	echo "$LLVM_SHA256  $tar" | shasum -a 256 -c -
+	if [ ! -d "$d/src" ]; then
+		tar -xf "$tar" -C "$d" "$top/llvm" "$top/lld" "$top/cmake" "$top/third-party" "$top/libc"   # libc: shared headers LLVM 23 needs
+		mv "$d/$top" "$d/src"
+	fi
+	cmake -G Ninja -S "$d/src/llvm" -B "$d/x86_64" -DCMAKE_BUILD_TYPE=MinSizeRel -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DLLVM_TARGETS_TO_BUILD=AMDGPU -DLLVM_ENABLE_PROJECTS=lld -DLLVM_INCLUDE_TESTS=OFF \
+		-DLLVM_INCLUDE_EXAMPLES=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_DOCS=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF \
+		-DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_ASSERTIONS=OFF
+	# The tools built for x86_64 (llvm-config, tablegen) run under Rosetta on Apple silicon.
+	ninja -C "$d/x86_64" llvm-config lldELF lldCommon LLVMAMDGPUCodeGen LLVMAMDGPUAsmParser LLVMAMDGPUTargetMCA LLVMMCA \
+		LLVMIRReader LLVMBitReader LLVMPasses
+}
+
 if [ "${1:-}" = helper ]; then
-	: "${LLVM_X86:?set LLVM_X86 to the x86_64 LLVM build tree}"
+	if [ -z "${LLVM_X86:-}" ]; then
+		llvm_x86
+		LLVM_X86=$PWD/Build/llvm/x86_64
+	fi
 	mkdir -p "$B/x86_64"
 	cfg="$LLVM_X86/bin/llvm-config"   # x86_64: runs under Rosetta here
 	lld=$(sed -n 's/^LLVM_EXTERNAL_LLD_SOURCE_DIR:[A-Z]*=//p' "$LLVM_X86/CMakeCache.txt")
