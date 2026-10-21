@@ -9,6 +9,8 @@
 #include "pvstream.hpp"
 #include "compute.hpp"
 #include "mtlkernels.h"
+#include "../userspace/rdna4-run/gfx12tri.h"     // M4: the triangle stream the host's draws are built from
+#include "../userspace/rdna4-run/gfx12trirun.h"
 #include "rdna4compute.h"
 #include "rdna4mtlc.h"
 
@@ -170,17 +172,24 @@ private:
 	void decodeExec(uint32_t task, uint64_t va, uint64_t len);
 	void dmaSelfTest();
 	bool functionOf(uint32_t task, uint32_t pipeline, char *name, size_t nameCap, uint8_t hash[32], uint64_t *lib);
+	bool functionName(uint32_t task, uint32_t fn, char *name, size_t nameCap, uint8_t hash[32], uint64_t *lib);
 	uint32_t resourceType(uint32_t task, uint32_t id, uint64_t *desc = nullptr, uint32_t *bytes = nullptr);
 	uint32_t load(const uint8_t *elf, uint32_t size, const char *name);
 	uint32_t program(unsigned kernel);
-	struct Jit { uint8_t hash[32]; uint32_t program, buffers, written; };
+	struct Jit {
+		uint8_t hash[32];
+		uint32_t program, buffers, written;   // a compute kernel loaded into the runtime
+		uint8_t *gfx;                         // or a vertex or fragment shader: the helper's RGFX blob (air2amdgpu.cpp translateShader)
+		uint32_t gfxLen;
+	};
 	const Jit *translated(uint32_t task, uint64_t lib, const char *name, const uint8_t hash[32]);
 	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
-	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
+	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow = nullptr, uint32_t *width = nullptr);
 	bool dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes);
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
-	void runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
+	uint32_t runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
+	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uint32_t type, uint32_t start, uint32_t count, uint32_t instances);
 	void runCompute(uint32_t task, uint32_t pipeline, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size);
 	void describeRenderPipeline(uint32_t task, uint32_t pipeline);
 private:
@@ -223,7 +232,8 @@ private:
 	bool mRtOpen { false };              // M2: this host is a client of the card's runtime
 	uint32_t mProgram[kMtlKernelCount] {};   // M3: kMtlKernels loaded into it, 0 = not yet
 	uint32_t mFnLines { 0 };              // M3: pipeline -> function lines so far
-	uint32_t mRenderPipeSeen[16] {};      // M4: (task << 16) | pipeline of the render pipelines described so far
+	uint32_t mRenderPipeSeen[16] {};
+	struct GfxBuffers { uint64_t handle, gpu; } mGfxCode {}, mGfxRings {}, mGfxMisc {}, mGfxIb {};   // M4: kept for the boot once made      // M4: (task << 16) | pipeline of the render pipelines described so far
 	Jit mJit[32] {};                     // M3: functions the helper translated, by hash (program 0: it could not); oldest replaced first
 	uint32_t mJits { 0 };
 	uint32_t mRenderLines { 0 };          // M2: render-pass and texture lines so far (other processes render every frame)
@@ -680,6 +690,7 @@ struct ExecTally {
 	RDNA4PvHost *host;
 	uint32_t task;
 	uint32_t pipeline;                  // Compute.setComputePipelineState
+	uint32_t target, renderPipeline;    // Render: colour attachment 0's texture (writeDescriptor), setRenderPipelineState
 	uint32_t buffer[8];                 // Compute.setBuffers: resource id per index (0 = none)
 	uint64_t offset[8];
 };
@@ -691,11 +702,18 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 	if (id == 0x132 || id == 0x12d || id == 0x12e)
 		t->host->runBlit(t->task, id, payload, bytes);
 	else if (id == 0x01a)
-		t->host->runRenderPass(t->task, payload, bytes);
+		t->target = t->host->runRenderPass(t->task, payload, bytes);
 	else if (id == 0x074 && bytes >= 4) {   // Render.setRenderPipelineState {u32 pipeline id}
-		uint32_t pipeline;
-		memcpy(&pipeline, payload, 4);
-		t->host->describeRenderPipeline(t->task, pipeline);
+		memcpy(&t->renderPipeline, payload, 4);
+		t->host->describeRenderPipeline(t->task, t->renderPipeline);
+	} else if (id == 0x001 && bytes >= 8) {   // Render.drawPrimitives {u32 primitive type, u16 vertex start, u16 count} (measured)
+		uint32_t w[2];
+		memcpy(w, payload, 8);
+		t->host->runDraw(t->task, t->target, t->renderPipeline, w[0], w[1] & 0xffff, w[1] >> 16, 1);
+	} else if (id == 0x003 && bytes >= 8) {   // Render.drawPrimitives {u16 start, u16 count, u16 instances, u16 type}
+		uint32_t w[2];
+		memcpy(w, payload, 8);
+		t->host->runDraw(t->task, t->target, t->renderPipeline, w[1] >> 16, w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff);
 	}
 	else if (id == 0x0d0 && bytes >= 4)
 		memcpy(&t->pipeline, payload, 4);
@@ -791,7 +809,7 @@ bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t
 // M2: a texture's GPU range: a type-2 resource with a 116-byte descriptor, dwords {u64 size in bytes, u32 page number of its start, ...,
 // [13] bytes per row, [15] width, ...} (mtlprobe's 64x64 BGRA8 render target: 0x4000 bytes at page 0x101, 0x100 per row: linear; measured
 // 2026-10-21). Where the pixel format is (0x04010101 at [8]?) is still open; the first descriptors of a boot are logged.
-bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len) {
+bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow, uint32_t *width) {
 	uint32_t rec[3], desc[29];
 	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) || (rec[0] & 0xff) != 2 ||
 	    (rec[0] >> 8) < sizeof(desc) || !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(desc), sizeof(desc))) {
@@ -804,6 +822,10 @@ bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_
 	      desc[1], desc[2], desc[3], desc[4], desc[5], desc[6], desc[7], desc[8], desc[9], desc[10], desc[11], desc[12], desc[13], desc[14], desc[15]);
 	*len = desc[0] | static_cast<uint64_t>(desc[1]) << 32;
 	*va = static_cast<uint64_t>(desc[2]) << 12;
+	if (bytesPerRow)
+		*bytesPerRow = desc[13];
+	if (width)
+		*width = desc[15];
 	return *len && *len <= (1ull << 30) && guestPfn(task, *va);
 }
 
@@ -823,22 +845,163 @@ static uint32_t unorm8(uint64_t bits) {
 // << 16) | load action at +0x60, double clear colour[4] at +0x68} (mtlprobe: texture 1, 0x00010002 = clear and store, 0.25 0.5 0.75 1; measured
 // 2026-10-21). A clear is a fill of the texture's memory with the colour as a BGRA8 pixel: the format is assumed (mtlprobe's) until it is found in
 // the texture's descriptor. Nothing else of a pass is carried out yet (draws need shaders).
-void RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes) {
+uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes) {
 	if (!gCompute || bytes < 0x88)
-		return;
+		return 0;
 	uint32_t tex, actions;
 	uint64_t rgba[4];   // the clear colour as IEEE-754 doubles, converted with integers only (no floating point in the kernel)
 	memcpy(&tex, p + 0x4c, 4);
 	memcpy(&actions, p + 0x60, 4);
 	memcpy(rgba, p + 0x68, sizeof(rgba));
 	if ((actions & 0xffff) != 2 || !tex)   // MTLLoadActionClear
-		return;
+		return tex;
 	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
 	const uint32_t pixel = b | g << 8 | r << 16 | a << 24;   // B, G, R, A in memory
 	uint64_t va, len;
 	const bool ok = textureRange(task, tex, &va, &len) && !(len & 3) && dmaGuest(task, va, 0, pixel, len);
 	if (mRenderLines++ < 24)
 		pvlog("host: render: clear texture %u to RGBA8 (%u, %u, %u, %u) = BGRA8 pixel 0x%08x on the card: %s", tex, r, g, b, a, pixel, ok ? "done" : "NOT done");
+	return tex;
+}
+
+// M4: the value dword of register `reg` (offset as in the packet: context from 0xa000, SH from 0x2c00, uconfig from 0xc000) in a stream's
+// SET_*_REG packet `opcode` (0x69 context, 0x76 SH, 0x79 uconfig), or null.
+static uint32_t *streamReg(uint32_t *ib, uint32_t n, uint32_t opcode, uint32_t reg) {
+	for (uint32_t i = 0; i + 1 < n;) {
+		const uint32_t h = ib[i], count = ((h >> 16) & 0x3fff) + 1;   // PM4 type 3: dwords after the header
+		if ((h >> 30) != 3)
+			return nullptr;
+		if (((h >> 8) & 0xff) == opcode && reg >= ib[i + 1] && reg - ib[i + 1] < count - 1 && i + 2 + (reg - ib[i + 1]) < n)
+			return &ib[i + 2 + (reg - ib[i + 1])];
+		i += 1 + count;
+	}
+	return nullptr;
+}
+
+// n / 2 as an IEEE-754 single's bits, negated if asked, for n < 2^24 (no floating point in the kernel).
+static uint32_t halfAsFloat(uint32_t n, bool negative) {
+	if (!n)
+		return 0;
+	const uint32_t e = 31 - static_cast<uint32_t>(__builtin_clz(n));
+	return (negative ? 0x80000000u : 0) | ((126 + e) << 23) | ((n << (23 - e)) & 0x7fffff);
+}
+
+// M4: Render.drawPrimitives on the card: the pipeline's vertex and fragment functions translated by the helper (air2amdgpu.cpp
+// translateShader), drawn with the stream of src/gfx12_draw.h (the triangle every gfx test of the kext draws, proven on the card) with the
+// translated shaders in place of its own and the target, viewport and draw patched; the colour attachment staged through a linear RGBA8
+// target (the texture is BGRA8, swapped on the way in and out). So far: triangle lists from vertex 0, one instance, no vertex buffers.
+void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uint32_t type, uint32_t start, uint32_t count, uint32_t instances) {
+	const bool talk = mRenderLines++ < 48;
+	// The pipeline: {16-byte header, u8 n, n x {u8 key, u8 size, value}}: key 1 the vertex function, key 2 the fragment function (measured).
+	uint64_t pd[8] = {};
+	uint32_t pbytes = 0, fn[3] = {};
+	if (resourceType(task, pipeline, pd, &pbytes) == 7 && pbytes >= 17) {
+		const auto *pb = reinterpret_cast<const uint8_t *>(pd);
+		for (uint32_t k = 0, at = 17; k < pb[16] && at + 2 <= pbytes; k++, at += 2 + pb[at + 1])
+			if (pb[at] >= 1 && pb[at] <= 2 && pb[at + 1] == 4 && at + 6 <= pbytes)
+				memcpy(&fn[pb[at]], pb + at + 2, 4);
+	}
+	const char *why = !fn[1] || !fn[2] ? "the pipeline has no vertex or no fragment function"
+	                : type != 3 ? "only triangle lists so far" : start || instances > 1 ? "only from vertex 0, one instance, so far"
+	                : !count || count > 0xffff ? "no vertices" : nullptr;
+	const Jit *shader[3] = {};
+	char name[3][64] = {};
+	for (unsigned k = 1; k <= 2 && !why; k++) {
+		uint8_t hash[32];
+		uint64_t lib = 0;
+		shader[k] = functionName(task, fn[k], name[k], sizeof(name[k]), hash, &lib) ? translated(task, lib, name[k], hash) : nullptr;
+		// The RGFX header: {"RGFX", u32 stage, u32 code bytes, ...}; the code must fit its 4 KiB slot with room for the prefetch.
+		const auto *head = shader[k] && shader[k]->gfx && shader[k]->gfxLen >= 32 ? reinterpret_cast<const uint32_t *>(shader[k]->gfx) : nullptr;
+		if (!head || head[1] != k || head[2] > 0xf00 || head[2] + 32 > shader[k]->gfxLen)
+			why = k == 1 ? "no translated vertex shader" : "no translated fragment shader";
+	}
+	uint64_t va = 0, len = 0;
+	uint32_t bpr = 0, width = 0;
+	if (!why && !(textureRange(task, target, &va, &len, &bpr, &width) && width && bpr == width * 4 && len % bpr == 0 && width <= 16384 && len / bpr <= 16384))
+		why = "the colour attachment is not a linear 32-bit texture";
+	if (why) {
+		if (talk)
+			pvlog("host: render: draw of %u vertices (type %u) with pipeline %u: %s: not run", count, type, pipeline, why);
+		return;
+	}
+	const uint32_t height = static_cast<uint32_t>(len / bpr), pitch = (width + 31) & ~31u;   // a linear target's pitch: a multiple of 128 bytes
+	const uint64_t targetBytes = static_cast<uint64_t>(pitch) * height * 4;
+
+	// The buffers kept for the boot (made by the first draw), and the target for this one.
+	auto make = [&](GfxBuffers &g, uint64_t bytes) { return g.handle || gCompute->rtAlloc(this, bytes, g.handle, g.gpu) == kIOReturnSuccess; };
+	if (!mRtOpen)
+		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;
+	GfxBuffers tgt {};
+	auto *stage = static_cast<uint32_t *>(IOMalloc(targetBytes));
+	bool ok = mRtOpen && stage && make(mGfxCode, RDNA4_TRI_CODE_BYTES) && make(mGfxRings, rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK) &&
+	          make(mGfxMisc, RDNA4_TRIRUN_PAGE) && make(mGfxIb, RDNA4_TRIRUN_PAGE) &&
+	          rdna4_trirun_rings_fit(mGfxRings.gpu, rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK, rdna4_tri_ring_bytes()) &&
+	          gCompute->rtAlloc(this, targetBytes, tgt.handle, tgt.gpu) == kIOReturnSuccess;
+
+	// The shaders: VS at +0, PS at +RDNA4_TRI_PS_OFFSET, each slot padded with s_code_end for the SQ's prefetch.
+	static uint32_t code[RDNA4_TRI_CODE_BYTES / 4];   // ponytail: one host, draws run one at a time on its work loop
+	for (uint32_t i = 0; i < RDNA4_TRI_CODE_BYTES / 4; i++)
+		code[i] = 0xbf9f0000u;
+	for (unsigned k = 1; k <= 2; k++)
+		memcpy(reinterpret_cast<uint8_t *>(code) + (k == 1 ? 0 : RDNA4_TRI_PS_OFFSET), shader[k]->gfx + 32, reinterpret_cast<const uint32_t *>(shader[k]->gfx)[2]);
+	const uint32_t *vs = reinterpret_cast<const uint32_t *>(shader[1]->gfx), *ps = reinterpret_cast<const uint32_t *>(shader[2]->gfx);
+
+	// The stream: the triangle's, with this draw's addresses, shaders' registers, target, viewport and vertex count.
+	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];
+	const rdna4_tri_va where = {mGfxCode.gpu, tgt.gpu, rdna4_trirun_rings_va(mGfxRings.gpu), mGfxMisc.gpu};
+	const uint32_t n = ok ? rdna4_tri_record(ib, &where) : 0;
+	struct Patch { uint32_t opcode, reg, value; } patch[] = {
+		{0x76, 0x8a, vs[3]}, {0x76, 0x8b, vs[4]},                          // SPI_SHADER_PGM_RSRC1_GS, RSRC2_GS: as LLVM compiled the vertex shader
+		{0x76, 0x0a, ps[3]}, {0x76, 0x0b, ps[4]},                          // SPI_SHADER_PGM_RSRC1_PS, RSRC2_PS
+		{0x69, 0x197, ps[5]}, {0x69, 0x198, ps[6]},                        // SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR
+		{0x69, 0x31e, (pitch - 1) << 16 | (height - 1)},                    // CB_COLOR0_ATTRIB2: MIP0_WIDTH (the pitch), MIP0_HEIGHT
+		{0x69, 0x82, width | height << 16},                                // PA_SC_WINDOW_SCISSOR_BR
+		{0x69, 0x95, width | height << 16},                                // PA_SC_VPORT_SCISSOR_0_BR
+		{0x69, 0x10f, halfAsFloat(width, false)}, {0x69, 0x110, halfAsFloat(width, false)},   // PA_CL_VPORT_XSCALE, XOFFSET: w / 2
+		{0x69, 0x111, halfAsFloat(height, true)}, {0x69, 0x112, halfAsFloat(height, false)},  // YSCALE -h / 2 (Metal's y points up), YOFFSET h / 2
+	};
+	for (const Patch &pt : patch)
+		if (uint32_t *d = n ? streamReg(ib, n, pt.opcode, pt.reg) : nullptr)
+			*d = pt.value;
+		else
+			ok = false;
+	for (uint32_t i = 0; i + 2 < n && ok; i++)   // DRAW_INDEX_AUTO {u32 vertex count, u32 initiator}
+		if (ib[i] == 0xc0012d00u) {
+			ib[i + 1] = count;
+			break;
+		}
+
+	// The attachment in (BGRA8 rows -> RGBA8 at the target's pitch), the draw, the attachment out.
+	auto swap = [&]() {
+		for (uint64_t i = 0; i < static_cast<uint64_t>(pitch) * height; i++)
+			stage[i] = (stage[i] & 0xff00ff00u) | (stage[i] >> 16 & 0xff) | (stage[i] & 0xff) << 16;
+	};
+	for (uint32_t y = 0; y < height && ok; y++)
+		ok = readGuest(task, va + static_cast<uint64_t>(y) * bpr, reinterpret_cast<uint8_t *>(stage + static_cast<uint64_t>(y) * pitch), bpr);
+	const uint32_t zero = 0;
+	uint64_t fence = 0, ns = 0;
+	if (ok) {
+		swap();
+		ok = gCompute->rtCopy(this, tgt.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), targetBytes, true) == kIOReturnSuccess &&
+		     gCompute->rtCopy(this, mGfxCode.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(code), sizeof(code), true) == kIOReturnSuccess &&
+		     gCompute->rtCopy(this, mGfxMisc.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(&zero), 4, true) == kIOReturnSuccess &&
+		     gCompute->rtCopy(this, mGfxIb.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(ib), n * 4, true) == kIOReturnSuccess &&
+		     gCompute->rtSubmitGfxIb(this, mGfxIb.gpu, n, 0, fence) == kIOReturnSuccess &&
+		     gCompute->rtWaitGfxFence(this, static_cast<uint32_t>(fence), 2000, ns) == kIOReturnSuccess &&
+		     gCompute->rtCopy(this, tgt.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), targetBytes, false) == kIOReturnSuccess;
+	}
+	if (ok) {
+		swap();
+		for (uint32_t y = 0; y < height && ok; y++)
+			ok = copyGuest(task, va + static_cast<uint64_t>(y) * bpr, reinterpret_cast<uint8_t *>(stage + static_cast<uint64_t>(y) * pitch), bpr, true);
+	}
+	if (tgt.handle)
+		gCompute->rtFree(this, tgt.handle);
+	if (stage)
+		IOFree(stage, targetBytes);
+	if (talk)
+		pvlog("host: render: draw of %u vertices into texture %u (%ux%u) with \"%s\" and \"%s\" on the card: %s (%llu us)", count, target, width, height,
+		      name[1], name[2], ok ? "done" : "NOT done", ns / 1000);
 }
 
 // M2: an SDMA fill (srcVa 0: `pattern`) or copy (from srcVa) over `bytes` of a task's GPU address space, page by page through its page table, the CPU
@@ -979,6 +1142,14 @@ bool RDNA4PvHost::functionOf(uint32_t task, uint32_t pipeline, char *name, size_
 		pvlog("host: compute: pipeline %u -> function %u (%s), descriptor: %08x %08x %08x %08x %08x %08x %08x %08x", pipeline, fn, rule, dw[0], dw[1],
 		      dw[2], dw[3], dw[4], dw[5], dw[6], dw[7]);
 	}
+	return functionName(task, fn, name, nameCap, hash, libOut);
+}
+
+// A function resource's name and hash from its metallib (tags {char[4], u16 length, bytes}, NAME then HASH) and the metallib's address.
+bool RDNA4PvHost::functionName(uint32_t task, uint32_t fn, char *name, size_t nameCap, uint8_t hash[32], uint64_t *libOut) {
+	uint64_t desc[8] = {};
+	if (resourceType(task, fn, desc) != 6)
+		return false;
 	const uint64_t lib = desc[0];
 	uint8_t head[1024];
 	if (!readGuest(task, lib, head, sizeof(head)) || memcmp(head, "MTLB", 4)) {
@@ -1030,7 +1201,7 @@ uint32_t RDNA4PvHost::program(unsigned kernel) {
 const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, const char *name, const uint8_t hash[32]) {
 	for (uint32_t i = 0; i < mJits && i < 32; i++)
 		if (!memcmp(mJit[i].hash, hash, 32))
-			return mJit[i].program ? &mJit[i] : nullptr;
+			return mJit[i].program || mJit[i].gfx ? &mJit[i] : nullptr;
 	if (!gTr.lock || !gTr.helper)
 		return nullptr;
 	uint64_t size = 0;   // the metallib's file size (header u64 at 0x10)
@@ -1068,14 +1239,20 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	Jit &j = mJit[mJits++ % 32];
 	if (j.program)
 		gCompute->rtUnload(this, j.program);
+	if (j.gfx)
+		IOFree(j.gfx, j.gfxLen);
 	memcpy(j.hash, hash, 32);
-	j.program = elf && buffers <= 8 ? load(elf, elfLen, name) : 0;
+	const bool shader = elf && elfLen >= 32 && !memcmp(elf, "RGFX", 4);
+	j.program = elf && !shader && buffers <= 8 ? load(elf, elfLen, name) : 0;
 	j.buffers = buffers;
 	j.written = written;
-	if (elf)
+	j.gfx = shader ? elf : nullptr;   // kept: the host places it into its code buffer for each draw
+	j.gfxLen = shader ? elfLen : 0;
+	if (elf && !shader)
 		IOFree(elf, elfLen);
-	pvlog("host: compute: \"%s\" %s by the helper (%llu bytes of metallib, %u bytes of code)", name, elf ? "translated" : "could NOT be translated", size, elfLen);
-	return j.program ? &j : nullptr;
+	pvlog("host: \"%s\" %s by the helper (%llu bytes of metallib, %u bytes of %s)", name, elf ? "translated" : "could NOT be translated", size, elfLen,
+	      shader ? "shader" : "code");
+	return j.program || j.gfx ? &j : nullptr;
 }
 
 // M4, first look at render pipelines: the pipeline's resource record and its whole descriptor, and the task's first resources with their

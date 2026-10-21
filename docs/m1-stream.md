@@ -274,6 +274,21 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   NGG shader and the fragment function as a pixel shader: LLVM compiles an `amdgpu_gs` function with the ABI of `src/shaders/nggcol.s`
   (`llvm.amdgcn.init.exec`, position and primitive exports) to almost the same code as the hand-written shader, and its PAL metadata gives
   RSRC1 and the VGPR count; the draw itself can be the template stream of `src/gfx12_draw.h` with its target, viewport and draw patched.
+- **M4, second step: a Metal triangle drawn on the card (2026-10-21).** The helper translates vertex and fragment functions too
+  (`translateShader()` in `tools/metal/m3/air2amdgpu.cpp`): a vertex function becomes an `amdgpu_gs` NGG shader with the ABI of
+  `src/shaders/nggcol.s` (s3 = merged_wave_info, v0 = the packed primitive, v3 = VertexID; `llvm.amdgcn.init.exec`, pos0 and prim
+  exports; no GS_ALLOC_REQ: the stream sets PRIMGEN_PASSTHRU_NO_MSG), a fragment function an `amdgpu_ps` exporting MRT0 as 4 x fp32; both
+  are compiled for `amdgcn-amd-amdpal`, whose metadata note gives RSRC1/RSRC2 and SPI_PS_INPUT_ENA/ADDR, and handed back as an `RGFX` blob
+  `{"RGFX", u32 stage, u32 code bytes, u32 RSRC1, u32 RSRC2, u32 PS_INPUT_ENA, u32 PS_INPUT_ADDR, u32 0}` + code. The host
+  (`runDraw()` in `src/pvgpu.cpp`) takes the pipeline's functions from its descriptor (keys 1 and 2), the target from the render pass's
+  colour attachment, and draws with the stream of `src/gfx12_draw.h` (built by `userspace/rdna4-run/gfx12tri.h`, the triangle every gfx
+  test draws) with the translated shaders, their registers, the target's size (CB_COLOR0_ATTRIB2 = pitch - 1 << 16 | height - 1, the
+  window and viewport scissors), the viewport (Y scale -h/2: Metal's y points up) and the vertex count patched; the BGRA8 texture is
+  staged through a linear RGBA8 target (pitch a multiple of 32 pixels) and swapped on the way in and out. **On the card: mtlprobe's
+  `tri` (vertices from vertex_id, a constant colour, 64x64 BGRA8) equals Apple's GPU: centre 64 128 255 255, upright, 512 pixels lit;
+  16 us for the draw.** So far: triangle lists from vertex 0, one instance, no vertex buffers, no vertex outputs but the position, no
+  fragment inputs; anything else is refused by name. The rig once failed the compute bring-up at stage 4 (SDMA's test write did not land)
+  after a warm restart; a cold boot cleared it.
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's

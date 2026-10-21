@@ -20,9 +20,9 @@
 
 #include <stdint.h>
 
-#include "gfx12_draw.h"
-#include "ngg_kernel.h"
-#include "psred_kernel.h"
+#include "../../src/gfx12_draw.h"   /* relative, as gfx12tricol.h: the kext has no -Isrc */
+#include "../../src/ngg_kernel.h"
+#include "../../src/psred_kernel.h"
 
 #ifdef __cplusplus
 #define RDNA4_TRI(x) Gfx12Draw::x

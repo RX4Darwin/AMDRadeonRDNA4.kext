@@ -19,6 +19,7 @@
 // arrays (as long as LLVM keeps them out of scratch memory, which the kext's runtime does not give kernels), device and threadgroup atomic
 // read-modify-writes, and the math and integer functions of legalize() below. Anything else is reported and refused.
 #include "lld/Common/Driver.h"
+#include "llvm/BinaryFormat/MsgPackDocument.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -29,6 +30,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -304,6 +306,79 @@ static std::string legalize(Function &k) {
 	return "";
 }
 
+// The entry (a kernel or shader wrapping the AIR function `air`) as an object for gfx1201: the AIR function inlined, legalised, optimised.
+static std::string compile(Module &m, Function *entry, Function *air, bool pal, SmallVectorImpl<char> &object) {
+	// The AIR function and whatever it calls inlined into the entry; the module's other entry points go (they need not translate).
+	for (const char *list : {"air.kernel", "air.vertex", "air.fragment"})
+		for (unsigned i = 0; m.getNamedMetadata(list) && i < m.getNamedMetadata(list)->getNumOperands(); i++)
+			if (auto *k = mdconst::dyn_extract_or_null<Function>(m.getNamedMetadata(list)->getOperand(i)->getOperand(0)); k && k != air) {
+				k->replaceAllUsesWith(PoisonValue::get(k->getType()));
+				k->eraseFromParent();
+			}
+	for (bool again = true; again;) {
+		again = false;
+		for (Instruction &i : instructions(*entry))
+			if (auto *c = dyn_cast<CallInst>(&i); c && c->getCalledFunction() && !c->getCalledFunction()->isDeclaration()) {
+				InlineFunctionInfo ifi;
+				if (!InlineFunction(*c, ifi).isSuccess())
+					return "cannot inline " + c->getCalledFunction()->getName().str();
+				again = true;
+				break;
+			}
+	}
+	if (air->use_empty())
+		air->eraseFromParent();   // inlined: its original body would only have to be legalised too
+	if (std::string why = legalize(*entry); !why.empty())
+		return why;
+
+	// Retarget: AMDGPU's triple (HSA for kernels, PAL for shaders: its metadata carries their register values) and data layout, no AIR
+	// metadata.
+	const Triple triple(pal ? "amdgcn-amd-amdpal" : "amdgcn-amd-amdhsa");
+	std::string err;
+	const Target *target = TargetRegistry::lookupTarget(triple, err);
+	if (!target)
+		return "no AMDGPU target in this LLVM: " + err;
+	std::unique_ptr<TargetMachine> tm(target->createTargetMachine(triple, "gfx1201", "", TargetOptions(), std::nullopt));
+	m.setTargetTriple(triple);
+	m.setDataLayout(tm->createDataLayout());
+	SmallVector<NamedMDNode *, 8> airMd;
+	for (NamedMDNode &n : m.named_metadata())
+		if (n.getName().starts_with("air."))
+			airMd.push_back(&n);
+	for (NamedMDNode *n : airMd)
+		m.eraseNamedMetadata(n);
+	if (verifyModule(m, &errs()))
+		return "the retargeted module does not verify";
+
+	// Only the new kernel stays visible: the module's other AIR kernels and functions go unless it uses them.
+	for (Function &f : m)
+		if (&f != entry && !f.isDeclaration())
+			f.setLinkage(GlobalValue::InternalLinkage);
+
+	// Optimise (inlines the AIR function), then refuse what AMDGPU cannot take as AIR leaves it.
+	LoopAnalysisManager lam;
+	FunctionAnalysisManager fam;
+	CGSCCAnalysisManager cam;
+	ModuleAnalysisManager mam;
+	PassBuilder pb(tm.get());
+	pb.registerModuleAnalyses(mam);
+	pb.registerCGSCCAnalyses(cam);
+	pb.registerFunctionAnalyses(fam);
+	pb.registerLoopAnalyses(lam);
+	pb.crossRegisterProxies(lam, fam, cam, mam);
+	pb.buildPerModuleDefaultPipeline(OptimizationLevel::O2).run(m, mam);
+	for (Instruction &i : instructions(*entry))
+		if (isa<AllocaInst>(i))
+			return "private memory (an alloca in AIR's address space 0) is not supported yet";
+
+	raw_svector_ostream objectOut(object);
+	legacy::PassManager cg;
+	if (tm->addPassesToEmitFile(cg, objectOut, nullptr, CodeGenFileType::ObjectFile))
+		return "this LLVM cannot emit an AMDGPU object";
+	cg.run(m);
+	return "";
+}
+
 static bool gLldSpent;   // lld said it cannot be run again in this process: --serve exits after its reply (launchd starts a new one)
 
 struct Kernel {
@@ -311,6 +386,151 @@ struct Kernel {
 	unsigned buffers;
 	uint32_t written;
 };
+
+// A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
+// (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
+// u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 0}, then the code (relocation-free, the entry at its start).
+//   vertex   amdgpu_gs, an NGG shader as src/shaders/nggcol.s: s3 = merged_wave_info ([7:0] vertices, [15:8] primitives), v0 = the packed
+//            primitive, v3 = VertexID; the position goes out as pos0, the primitive as prim. So far: vertex_id (and instance_id, 0: the
+//            host draws one instance), the position as the only output.
+//   fragment amdgpu_ps exporting render target 0 as four floats (SPI_SHADER_COL_FORMAT 32_ABGR); so far no inputs.
+static std::string translateShader(Module &m, Function *air, const MDNode *md, bool vertex, Kernel &out) {
+	LLVMContext &ctx = m.getContext();
+	Type *i32 = Type::getInt32Ty(ctx), *f32 = Type::getFloatTy(ctx);
+	const auto *outputs = md->getNumOperands() > 1 ? dyn_cast<MDNode>(md->getOperand(1)) : nullptr;
+	const auto *inputs = md->getNumOperands() > 2 ? dyn_cast<MDNode>(md->getOperand(2)) : nullptr;
+	if (!outputs || !inputs)
+		return "the AIR shader's metadata is not as expected";
+	// The inputs: index -> where its value comes from (-1: unused, poison).
+	std::map<unsigned, int> from;   // 0 vertex id, 1 zero
+	for (const MDOperand &op : inputs->operands()) {
+		const auto *a = cast<MDNode>(op);
+		const unsigned index = static_cast<unsigned>(mdInt(a, 0));
+		const std::string kind = mdString(a, 1);
+		bool unused = false;
+		for (unsigned k = 2; k < a->getNumOperands(); k++)
+			unused |= mdString(a, k) == "air.arg_unused";
+		if (vertex && kind == "air.vertex_id")
+			from[index] = 0;
+		else if (vertex && kind == "air.instance_id")
+			from[index] = 1;
+		else if (unused)
+			from[index] = -1;
+		else
+			return std::string(vertex ? "vertex" : "fragment") + " input " + kind + " is not supported yet";
+	}
+	if (from.size() != air->arg_size())
+		return "not every argument of the AIR shader is described";
+	int position = -1;
+	for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
+		const std::string kind = mdString(cast<MDNode>(outputs->getOperand(k)), vertex ? 0 : 0);
+		if (vertex && kind == "air.position")
+			position = static_cast<int>(k);
+		else if (!(!vertex && kind == "air.render_target" && outputs->getNumOperands() == 1 && air->getReturnType() == FixedVectorType::get(f32, 4)))
+			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet";
+	}
+	if (vertex && (position < 0 || outputs->getNumOperands() != 1))
+		return "the vertex function must have the position as its only output (so far)";
+
+	// The shader.
+	const unsigned nArgs = vertex ? 10 : 0;   // vertex: s0-s5, v0-v3
+	Function *f = Function::Create(FunctionType::get(Type::getVoidTy(ctx), SmallVector<Type *, 10>(nArgs, i32), false), GlobalValue::ExternalLinkage,
+	                               vertex ? "vs" : "ps", &m);
+	f->setCallingConv(vertex ? CallingConv::AMDGPU_GS : CallingConv::AMDGPU_PS);
+	for (unsigned k = 0; k < 6 && vertex; k++)
+		f->addParamAttr(k, Attribute::InReg);
+	IRBuilder<> b(BasicBlock::Create(ctx, "entry", f));
+	auto callAir = [&](Value *vid) {
+		SmallVector<Value *, 4> args;
+		for (unsigned k = 0; k < air->arg_size(); k++)
+			args.push_back(from[k] == 0 ? vid : from[k] == 1 ? static_cast<Value *>(b.getInt32(0)) : PoisonValue::get(air->getArg(k)->getType()));
+		return b.CreateCall(air, args);
+	};
+	auto exportF32 = [&](unsigned target, Value *v4, bool vm) {
+		Value *c[4];
+		for (unsigned k = 0; k < 4; k++)
+			c[k] = b.CreateExtractElement(v4, k);
+		b.CreateIntrinsic(Intrinsic::amdgcn_exp, {f32}, {b.getInt32(target), b.getInt32(15), c[0], c[1], c[2], c[3], b.getTrue(), b.getInt1(vm)});
+	};
+	if (vertex) {
+		b.CreateIntrinsic(Intrinsic::amdgcn_init_exec, {}, {b.getInt64(-1)});
+		Value *lane = b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {b.getInt32(-1), b.getInt32(0)});
+		Value *info = f->getArg(3);
+		BasicBlock *pos = BasicBlock::Create(ctx, "pos", f), *afterPos = BasicBlock::Create(ctx, "after_pos", f);
+		BasicBlock *prim = BasicBlock::Create(ctx, "prim", f), *done = BasicBlock::Create(ctx, "done", f);
+		b.CreateCondBr(b.CreateICmpULT(lane, b.CreateAnd(info, 255)), pos, afterPos);
+		b.SetInsertPoint(pos);
+		Value *r = callAir(f->getArg(9));
+		exportF32(12, r->getType()->isStructTy() ? b.CreateExtractValue(r, static_cast<unsigned>(position)) : r, false);   // pos0
+		b.CreateBr(afterPos);
+		b.SetInsertPoint(afterPos);
+		b.CreateCondBr(b.CreateICmpULT(lane, b.CreateAnd(b.CreateLShr(info, 8), 255)), prim, done);
+		b.SetInsertPoint(prim);
+		Value *undef = PoisonValue::get(i32);
+		b.CreateIntrinsic(Intrinsic::amdgcn_exp, {i32}, {b.getInt32(20), b.getInt32(1), f->getArg(6), undef, undef, undef, b.getTrue(), b.getFalse()});
+		b.CreateBr(done);
+		b.SetInsertPoint(done);
+	} else {
+		exportF32(0, callAir(nullptr), true);   // mrt0
+	}
+	b.CreateRetVoid();
+
+	SmallVector<char, 0> object;
+	if (std::string why = compile(m, f, air, true, object); !why.empty())
+		return why;
+	// The code and the registers LLVM chose (PAL metadata: amdpal.pipelines[0].registers, register number -> value).
+	auto obj = object::ObjectFile::createObjectFile(MemoryBufferRef(StringRef(object.data(), object.size()), "shader"));
+	auto *elf = obj ? dyn_cast<object::ELF64LEObjectFile>(obj->get()) : nullptr;
+	if (!elf) {
+		if (!obj)
+			consumeError(obj.takeError());
+		return "the shader object cannot be read";
+	}
+	StringRef code;
+	for (const object::SectionRef &sec : elf->sections()) {
+		auto name = sec.getName();
+		if (name && *name == ".text") {
+			if (sec.relocations().begin() != sec.relocations().end())
+				return "the shader needs relocations";
+			if (auto c = sec.getContents())
+				code = *c;
+		}
+	}
+	for (const object::SymbolRef &sym : elf->symbols())
+		if (auto name = sym.getName(); name && *name == f->getName())
+			if (auto v = sym.getValue(); !v || *v != 0)
+				return "the shader's entry is not at the start of its code";
+	uint32_t regs[4] = {};   // RSRC1, RSRC2, SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR
+	const uint64_t want[4] = {vertex ? 0x2c8au : 0x2c0au, vertex ? 0x2c8bu : 0x2c0bu, 0xa1b3, 0xa1b4};
+	const auto &ef = elf->getELFFile();
+	if (auto shdrs = ef.sections())
+		for (const auto &sh : *shdrs) {
+			if (sh.sh_type != ELF::SHT_NOTE)
+				continue;
+			Error err = Error::success();
+			for (const auto &note : ef.notes(sh, err)) {
+				msgpack::Document doc;
+				if (note.getName() != "AMDGPU" || note.getType() != ELF::NT_AMDGPU_METADATA || !doc.readFromBlob(toStringRef(note.getDesc(4)), false))
+					continue;
+				msgpack::DocNode &pipes = doc.getRoot().getMap(true)["amdpal.pipelines"];
+				if (!pipes.isArray() || pipes.getArray().size() < 1)
+					continue;
+				for (auto &kv : pipes.getArray()[0].getMap(true)[".registers"].getMap(true))
+					for (unsigned k = 0; k < 4; k++)
+						if (kv.first.getKind() == msgpack::Type::UInt && kv.first.getUInt() == want[k])
+								regs[k] = static_cast<uint32_t>(kv.second.getUInt());
+			}
+			consumeError(std::move(err));
+		}
+	if (code.empty() || !regs[0])
+		return "no code or no register values in the shader object";
+	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3], 0};
+	out.hsaco.assign(reinterpret_cast<const char *>(head), sizeof(head));
+	out.hsaco += code.str();
+	out.buffers = 0;
+	out.written = 0;
+	return "";
+}
 
 // The kernel `fname` of `input` (AIR bitcode, or a metallib holding it) as a code object; the reason when it cannot be translated.
 static std::string translate(StringRef input, StringRef fname, Kernel &out) {
@@ -323,6 +543,10 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 	if (!m)
 		return "cannot read the AIR: " + diag.getMessage().str();
 	Function *air = m->getFunction(fname);
+	for (const char *list : {"air.vertex", "air.fragment"})
+		for (unsigned i = 0; air && m->getNamedMetadata(list) && i < m->getNamedMetadata(list)->getNumOperands(); i++)
+			if (const MDNode *md = m->getNamedMetadata(list)->getOperand(i); mdconst::dyn_extract<Function>(md->getOperand(0)) == air)
+				return translateShader(*m, air, md, list[4] == 'v', out);
 	NamedMDNode *kernels = m->getNamedMetadata("air.kernel");
 	const MDNode *args = nullptr;
 	for (unsigned i = 0; kernels && i < kernels->getNumOperands(); i++) {
@@ -443,74 +667,10 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 	b.SetInsertPoint(done);
 	b.CreateRetVoid();
 
-	// The AIR function and whatever it calls inlined into the kernel; the module's other kernels go (they need not translate).
-	for (unsigned i = 0; kernels && i < kernels->getNumOperands(); i++)
-		if (auto *k = mdconst::dyn_extract_or_null<Function>(kernels->getOperand(i)->getOperand(0)); k && k != air) {
-			k->replaceAllUsesWith(PoisonValue::get(k->getType()));
-			k->eraseFromParent();
-		}
-	for (bool again = true; again;) {
-		again = false;
-		for (Instruction &i : instructions(*kernel))
-			if (auto *c = dyn_cast<CallInst>(&i); c && c->getCalledFunction() && !c->getCalledFunction()->isDeclaration()) {
-				InlineFunctionInfo ifi;
-				if (!InlineFunction(*c, ifi).isSuccess())
-					return "cannot inline " + c->getCalledFunction()->getName().str();
-				again = true;
-				break;
-			}
-	}
-	if (air->use_empty())
-		air->eraseFromParent();   // inlined: its original body would only have to be legalised too
-	if (std::string why = legalize(*kernel); !why.empty())
-		return why;
-
-	// Retarget: AMDGPU's triple and data layout, no AIR metadata.
-	const Triple triple("amdgcn-amd-amdhsa");
-	std::string err;
-	const Target *target = TargetRegistry::lookupTarget(triple, err);
-	if (!target)
-		return "no AMDGPU target in this LLVM: " + err;
-	std::unique_ptr<TargetMachine> tm(target->createTargetMachine(triple, "gfx1201", "", TargetOptions(), std::nullopt));
-	m->setTargetTriple(triple);
-	m->setDataLayout(tm->createDataLayout());
-	SmallVector<NamedMDNode *, 8> airMd;
-	for (NamedMDNode &n : m->named_metadata())
-		if (n.getName().starts_with("air."))
-			airMd.push_back(&n);
-	for (NamedMDNode *n : airMd)
-		m->eraseNamedMetadata(n);
-	if (verifyModule(*m, &errs()))
-		return "the retargeted module does not verify";
-
-	// Only the new kernel stays visible: the module's other AIR kernels and functions go unless it uses them.
-	for (Function &f : *m)
-		if (&f != kernel && !f.isDeclaration())
-			f.setLinkage(GlobalValue::InternalLinkage);
-
-	// Optimise (inlines the AIR function), then refuse what AMDGPU cannot take as AIR leaves it.
-	LoopAnalysisManager lam;
-	FunctionAnalysisManager fam;
-	CGSCCAnalysisManager cam;
-	ModuleAnalysisManager mam;
-	PassBuilder pb(tm.get());
-	pb.registerModuleAnalyses(mam);
-	pb.registerCGSCCAnalyses(cam);
-	pb.registerFunctionAnalyses(fam);
-	pb.registerLoopAnalyses(lam);
-	pb.crossRegisterProxies(lam, fam, cam, mam);
-	pb.buildPerModuleDefaultPipeline(OptimizationLevel::O2).run(*m, mam);
-	for (Instruction &i : instructions(*kernel))
-		if (isa<AllocaInst>(i))
-			return "private memory (an alloca in AIR's address space 0) is not supported yet";
-
-	// Emit the object and link it into a code object (ld.lld -shared), through temporary files: lld's driver reads and writes files.
 	SmallVector<char, 0> object;
-	raw_svector_ostream objectOut(object);
-	legacy::PassManager cg;
-	if (tm->addPassesToEmitFile(cg, objectOut, nullptr, CodeGenFileType::ObjectFile))
-		return "this LLVM cannot emit an AMDGPU object";
-	cg.run(*m);
+	if (std::string why = compile(*m, kernel, air, false, object); !why.empty())
+		return why;
+	// Link it into a code object (ld.lld -shared), through temporary files: lld's driver reads and writes files.
 	SmallString<128> objPath, elfPath;
 	int fd = -1;
 	if (sys::fs::createTemporaryFile("air2amdgpu", "o", fd, objPath))

@@ -441,8 +441,9 @@ static void tri(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	int lit = 0;
 	for (int i = 0; i < 64 * 64; i++)
 		lit += ((const uint8_t *)out.contents)[i * 4 + 2] == 255;
-	OUT("tri: centre B %u G %u R %u A %u, corner B %u G %u R %u, %d pixels lit (64 128 255 255, 0 0 0, 512 = executed)", c[0], c[1], c[2], c[3],
-	    k[0], k[1], k[2], lit);
+	const uint8_t *top = (const uint8_t *)out.contents + (20 * 64 + 24) * 4, *bottom = (const uint8_t *)out.contents + (44 * 64 + 24) * 4;
+	OUT("tri: centre B %u G %u R %u A %u, corner R %u, near the apex row 20 R %u, near the base row 44 R %u, %d pixels lit "
+	    "(64 128 255 255, 0, 0, 255, 512 = executed, upright)", c[0], c[1], c[2], c[3], k[2], top[2], bottom[2], lit);
 }
 
 static void drawargs(id<MTLDevice> d, id<MTLCommandQueue> q) {
