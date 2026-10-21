@@ -158,6 +158,7 @@ bool traceEnabled { false };
 uint32_t traceBudget { 400 };   // bounded: gamma/CLUT calls can be frequent
 uint32_t computeStage { 0 };    // rdna4-compute=<stage>, see compute.hpp
 uint32_t pvGpu { 0 };           // rdna4-pvgpu=1|2: M0 of docs/metal-phase-plan.md, the fake Apple paravirtual GPU nub (pvgpu.hpp); VM/emulator only
+uint32_t pvDelay { 0 };         // rdna4-pvgpu-delay=<s>: publish the nub this long after plugin start instead (no GPU-side publish)
 uint32_t accelCensus { 0 };     // rdna4-accelcensus=1|2: the E1 impostor-IOAccelerator census (accelcensus.hpp), emulator only
 
 // What we keep for one of our framebuffers.
@@ -892,8 +893,10 @@ void attach(FbEntry &e) {
 		RDNA4AccelCensus::publish(pci, accelCensus);
 	// M0: the fake paravirtual GPU, independent of everything else here.
 #ifdef AMDRadeonRDNA4_PVGPU
-	if (pvGpu && dev.isAmd)
+	if (pvGpu && dev.isAmd && !pvDelay)
 		RDNA4PvNub::publish(pci, pvGpu);
+	if (pvGpu && dev.isAmd && pvDelay)
+		RDNA4PvNub::setLateParent(pci);
 #endif
 
 	// Compute bring-up runs after the display is answered for, and only
@@ -1143,8 +1146,11 @@ void pluginStart() {
 #ifdef AMDRadeonRDNA4_PVGPU   // built in with make PVGPU=1 only (Makefile)
 	if (!PE_parse_boot_argn("rdna4-pvgpu", &pvGpu, sizeof(pvGpu)) || pvGpu > 2)
 		pvGpu = 0;
+	// A VM without the emulated RDNA4 device never reaches attach(). rdna4-pvgpu-delay: on the rig the default 25 s falls into the system volume's snapshot
+	// remount (~26 s), where freeze-watch.sh cannot write; a later publish comes after login, where a live kernel log over ssh sees what follows.
+	PE_parse_boot_argn("rdna4-pvgpu-delay", &pvDelay, sizeof(pvDelay));
 	if (pvGpu)
-		RDNA4PvNub::publishLater(pvGpu, 25000);   // a VM without the emulated RDNA4 device never reaches attach()
+		RDNA4PvNub::publishLater(pvGpu, pvDelay ? pvDelay * 1000 : 25000);
 #endif
 	Ndrv::vslInit();
 	FBLOG("Lilu plugin started (trace %s, compute stage %u%s%s)", traceEnabled ? "on" : "off",

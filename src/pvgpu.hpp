@@ -57,6 +57,10 @@ public:
 	// For machines where the GPU path never runs (a VM without the emulated RDNA4 device): if nothing published the nub within `delayMs`, publish it under
 	// the platform expert. Starts a work loop and a timer; call once from plugin start.
 	static void publishLater(uint32_t level, uint32_t delayMs);
+	// The parent for publishLater when the delay runs out: the GPU's IOPCIDevice once its attach has run (plugin.cpp), else the platform expert. Under the
+	// GPU the nub has a PCI bridge above it, which AppleGPUWrangler requires of every GPU (it walks the providers up to an IOPCIBridge and panicked on
+	// the rig, 26.6.2, when there was none: 2026-10-17).
+	static void setLateParent(IOService *gpu);
 
 	// Host side: the control block of BAR0 as dwords, valid while the nub lives (the nub is never released once published).
 	volatile uint32_t *ctrl() const { return mBar0 ? reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(mBar0) + pvgpu::kCtrl) : nullptr; }
@@ -70,6 +74,23 @@ public:
 	bool attach(IOService *provider) APPLE_KEXT_OVERRIDE;
 	void detach(IOService *provider) APPLE_KEXT_OVERRIDE;
 	void detachAbove(const IORegistryPlane *plane) APPLE_KEXT_OVERRIDE;
+	// Every method that Tahoe's IOPCIDevice overrides but MacKernelSDK's header does not know about MUST be overridden here. Otherwise the kext linker
+	// fills our vtable slot by redirecting the base-class symbol (IORegistryEntry::setProperty, ...) to IOPCIDevice's method for the WHOLE kext: every
+	// IOService of ours then runs IOPCIDevice code on an object that is not one. On the rig (macOS 26.6.2) that panicked systemstats reading the Lilu
+	// service's interrupt keys (the Apple-menu Restart "freeze"), and our nub when a probing driver let go (2026-10-15). The list is the slots where
+	// 25G83's IOPCIDevice vtable names IOPCIDevice and ours a base class (tools/metal/m0/check-vtable.py). The bodies call the base versions: the
+	// nub has no bridge (`parent`), which IOPCIDevice's versions use.
+	bool setProperty(const OSSymbol *aKey, OSObject *anObject) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const OSString *aKey, OSObject *anObject) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *aKey, OSObject *anObject) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *aKey, const char *aString) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *aKey, bool aBoolean) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *aKey, unsigned long long aValue, unsigned int aNumberOfBits) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *aKey, void *bytes, unsigned int length) APPLE_KEXT_OVERRIDE;
+	OSObject *getProperty(const OSSymbol *aKey) const APPLE_KEXT_OVERRIDE;
+	void detachFromChild(IORegistryEntry *child, const IORegistryPlane *plane) APPLE_KEXT_OVERRIDE;
+	IOReturn addPowerChild(IOService *theChild) APPLE_KEXT_OVERRIDE;
+	IOReturn removePowerChild(IOPowerConnection *theChild) APPLE_KEXT_OVERRIDE;
 	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
 	                       IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 	bool handleOpen(IOService *forClient, IOOptionBits options, void *arg) APPLE_KEXT_OVERRIDE;

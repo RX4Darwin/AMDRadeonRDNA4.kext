@@ -53,8 +53,11 @@ def norm(s):
 
 for i in sorted(h):
     ha, aa = h[i], a.get(i, '<none>')
-    if ha != aa and norm(ha).split('::')[1:] != norm(aa).split('::')[1:]:
+    # A different method is a mismatch; so is the same method that Tahoe's IOPCIDevice overrides where the header inherits it from a base class: the
+    # kext linker then redirects that base-class symbol to IOPCIDevice's method for the whole kext, unless the nub overrides it (src/pvgpu.hpp).
+    redirected = aa.startswith('IOPCIDevice::') and not ha.startswith('IOPCIDevice::') and '~' not in aa
+    if ha != aa and (redirected or norm(ha).split('::')[1:] != norm(aa).split('::')[1:]):
         bad += 1
-        print('slot %3d (+0x%03x): header %-52s Tahoe %s' % (i, 8 * i, ha, aa))
+        print('slot %3d (+0x%03x): header %-52s Tahoe %s%s' % (i, 8 * i, ha, aa, '  (override it in the nub)' if redirected else ''))
 print('%d header slots, %d Tahoe slots, %d mismatches' % (len(h), len(a), bad))
 sys.exit(1 if bad else 0)

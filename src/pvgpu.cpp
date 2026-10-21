@@ -35,6 +35,7 @@ constexpr uint32_t kMaxLogLines = 400;
 constexpr uint32_t kGpuCoreCount = 64;
 uint32_t gLogLines { 0 };
 RDNA4PvNub *gNub { nullptr };
+IOService *gLateParent { nullptr };   // RDNA4PvNub::setLateParent
 
 void pvlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void pvlog(const char *fmt, ...) {
@@ -50,6 +51,23 @@ void pvlog(const char *fmt, ...) {
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 	IOLog("AMDRadeonRDNA4: pvgpu: %s\n", buf);
+}
+
+// The first three calls of each of the nub's methods: what macOS and Apple's driver do with the nub, in order (the M0 runs on the rig, 2026-10-15/21).
+// With rdna4-steptrace=<ms> each of those lines is followed by a pause, so that freeze-watch.sh (a write every 0.5 s) keeps the last one before a stop.
+void pvPause() {
+	uint32_t ms = 0;
+	if (PE_parse_boot_argn("rdna4-steptrace", &ms, sizeof(ms)) && ms)
+		IOSleep(ms);
+}
+#define PVCALL(name) do { static uint32_t calls_; if (__atomic_fetch_add(&calls_, 1u, __ATOMIC_RELAXED) < 3) { pvlog("call: %s", name); pvPause(); } } while (0)
+
+// The PCI class code the nub reports (rdna4-pvgpu-class=<24 bits>, default 0x030000 = display controller). Apple's driver matches by IOPCIMatch alone.
+// On the rig AppleGPUWrangler took the nub with 0x030000 and with 0xff0000 alike (it follows the accelerator, not the class).
+uint32_t pvClass() {
+	uint32_t c = 0x030000;
+	PE_parse_boot_argn("rdna4-pvgpu-class", &c, sizeof(c));
+	return c & 0xffffff;
 }
 
 // "0xEEEE106B", "0xEEEE106B&0xFFFFFFFF", several separated by blanks: does `ids` match one of them? (IOPCIMatch / IOPCIPrimaryMatch format)
@@ -284,7 +302,8 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 }
 
 void RDNA4PvHost::tick() {
-	mTicks++;
+	if (mTicks++ < 3)
+		pvlog("host: tick %llu", mTicks);
 	if (mIrqBits) {
 		// The real register clears on read; RAM cannot, so the bits we raised are dropped a tick later (the handler has had its chance: the driver also
 		// re-reads the stamp after every timed wait, so a missed wake-up costs at most the 1 s wait of IOAccelEventMachine2::waitForStamp).
@@ -1297,7 +1316,8 @@ bool RDNA4PvNub::build() {
 	auto put32 = [this](unsigned off, uint32_t v) { memcpy(&mConfig[off], &v, sizeof(v)); };
 	put32(0x00, (static_cast<uint32_t>(kDevice) << 16) | kVendor);
 	put32(0x04, 0x00100000);          // command 0, status: capabilities list
-	put32(0x08, 0x03000001);          // class 03 (display), subclass 00, prog-if 00, revision 1
+	const uint32_t klass = pvClass();
+	put32(0x08, klass << 8 | 1);      // class (default 03 display, subclass 00, prog-if 00), revision 1
 	put32(0x0c, 0x00000000);          // header type 0
 	put32(0x10, 0xe0000000);          // BAR0: 32-bit memory, 16 KiB (never decoded: the RAM stands in for it)
 	put32(0x2c, (0x0000u << 16) | kVendor);   // subsystem 106b:0000
@@ -1316,9 +1336,10 @@ bool RDNA4PvNub::build() {
 	data("revision-id", "\x01\x00\x00\x00", 4);
 	data("subsystem-vendor-id", "\x6b\x10\x00\x00", 4);
 	data("subsystem-id", "\x00\x00\x00\x00", 4);
-	data("class-code", "\x00\x00\x03\x00", 4);
-	static const char kCompatible[] = "pci106b,eeee\0pciclass,030000\0pciclass,0300";
-	data("compatible", kCompatible, sizeof(kCompatible));
+	data("class-code", &klass, 4);   // little-endian, as in the device tree
+	char compatible[48];   // "pci106b,eeee", "pciclass,<class>", "pciclass,<class without prog-if>", each NUL-terminated
+	const int len = snprintf(compatible, sizeof(compatible), "pci106b,eeee%cpciclass,%06x%cpciclass,%04x", 0, klass, 0, klass >> 8);
+	data("compatible", compatible, static_cast<unsigned>(len) + 1);
 	setProperty("RDNA4PvGpu", "fake Apple paravirtual GPU (106b:eeee), BAR0 in RAM, M0 of docs/metal-phase-plan.md");
 	setName("PVGPU");
 	return true;
@@ -1386,6 +1407,8 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 	}
 	gNub = nub;   // keeps the creation reference: never released
 	nub->registerService();
+	pvlog("registerService returned");
+	pvPause();
 	pvlog("fake Apple paravirtual GPU published under %s: PCI %04x:%04x, BAR0 %u bytes of RAM (control block at +0x%x), level %u; IOPCIDevice is %zu bytes here (header %zu)",
 	      parent->getName(), kVendor, kDevice, kBar0Size, kCtrl, level, realSize, sizeof(IOPCIDevice));
 	gHost = RDNA4PvHost::start(nub, level);
@@ -1423,10 +1446,10 @@ private:
 	void tick() {
 		if (gNub)
 			return;   // the GPU path got there first
-		IOService *platform = nowMs() >= mDeadline ? IOService::getPlatform() : nullptr;
-		if (platform) {
-			pvlog("no GPU-side publish after the delay: publishing under the platform expert (%s)", platform->getName());
-			RDNA4PvNub::publish(platform, mLevel);
+		IOService *parent = nowMs() < mDeadline ? nullptr : gLateParent ? gLateParent : IOService::getPlatform();
+		if (parent) {
+			pvlog("publishing after the delay under %s (%s)", parent->getName(), parent == gLateParent ? "the GPU" : "the platform expert: no GPU attached");
+			RDNA4PvNub::publish(parent, mLevel);
 			return;
 		}
 		mTimer->setTimeoutMS(500);
@@ -1439,6 +1462,8 @@ private:
 OSDefineMetaClassAndStructors(RDNA4PvLate, OSObject)
 
 void RDNA4PvNub::publishLater(uint32_t level, uint32_t delayMs) { RDNA4PvLate::schedule(level, delayMs); }
+void RDNA4PvNub::setLateParent(IOService *gpu) { gLateParent = gpu; }   // the GPU stays for the boot: no reference taken
+
 
 bool RDNA4PvNub::raiseInterrupt(int source) {
 	if (source < 0 || source >= kMaxInterrupts)
@@ -1488,9 +1513,11 @@ bool RDNA4PvNub::configTest() {
 
 // ---- lifecycle: the IOService behaviour, none of IOPCIDevice's bridge-dependent code ----
 
-bool RDNA4PvNub::init(OSDictionary *propTable) { return IOService::init(propTable); }
-bool RDNA4PvNub::init(IORegistryEntry *from, const IORegistryPlane *plane) { return IOService::init(from, plane); }
+// IOPCIDevice::init allocates the class's private data (`reserved`), which Tahoe's IOPCIDevice methods use without checking.
+bool RDNA4PvNub::init(OSDictionary *propTable) { PVCALL("init"); return IOPCIDevice::init(propTable); }
+bool RDNA4PvNub::init(IORegistryEntry *from, const IORegistryPlane *plane) { PVCALL("init"); return IOPCIDevice::init(from, plane); }
 void RDNA4PvNub::free() {
+	PVCALL("free");
 	if (mBar0Desc) {
 		mBar0Desc->complete();
 		OSSafeReleaseNULL(mBar0Desc);
@@ -1501,31 +1528,51 @@ void RDNA4PvNub::free() {
 	}
 	IOService::free();
 }
-bool RDNA4PvNub::attach(IOService *provider) { return IOService::attach(provider); }
-void RDNA4PvNub::detach(IOService *provider) { IOService::detach(provider); }
-void RDNA4PvNub::detachAbove(const IORegistryPlane *plane) { IOService::detachAbove(plane); }
+bool RDNA4PvNub::attach(IOService *provider) { PVCALL("attach"); return IOService::attach(provider); }
+void RDNA4PvNub::detach(IOService *provider) { PVCALL("detach"); IOService::detach(provider); }
+void RDNA4PvNub::detachAbove(const IORegistryPlane *plane) { PVCALL("detachAbove"); IOService::detachAbove(plane); }
+// The overrides that keep the kext linker from redirecting base-class symbols (pvgpu.hpp). Not traced: every property access comes here.
+bool RDNA4PvNub::setProperty(const OSSymbol *aKey, OSObject *anObject) { return IORegistryEntry::setProperty(aKey, anObject); }
+bool RDNA4PvNub::setProperty(const OSString *aKey, OSObject *anObject) { return IORegistryEntry::setProperty(aKey, anObject); }
+bool RDNA4PvNub::setProperty(const char *aKey, OSObject *anObject) { return IORegistryEntry::setProperty(aKey, anObject); }
+bool RDNA4PvNub::setProperty(const char *aKey, const char *aString) { return IORegistryEntry::setProperty(aKey, aString); }
+bool RDNA4PvNub::setProperty(const char *aKey, bool aBoolean) { return IORegistryEntry::setProperty(aKey, aBoolean); }
+bool RDNA4PvNub::setProperty(const char *aKey, unsigned long long aValue, unsigned int aNumberOfBits) {
+	return IORegistryEntry::setProperty(aKey, aValue, aNumberOfBits);
+}
+bool RDNA4PvNub::setProperty(const char *aKey, void *bytes, unsigned int length) { return IORegistryEntry::setProperty(aKey, bytes, length); }
+OSObject *RDNA4PvNub::getProperty(const OSSymbol *aKey) const { return IORegistryEntry::getProperty(aKey); }
+IOReturn RDNA4PvNub::addPowerChild(IOService *theChild) { return IOService::addPowerChild(theChild); }
+IOReturn RDNA4PvNub::removePowerChild(IOPowerConnection *theChild) { return IOService::removePowerChild(theChild); }
+void RDNA4PvNub::detachFromChild(IORegistryEntry *child, const IORegistryPlane *plane) {
+	PVCALL("detachFromChild");
+	IORegistryEntry::detachFromChild(child, plane);
+}
 IOReturn RDNA4PvNub::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) {
+	PVCALL("newUserClient");
 	return IOService::newUserClient(owningTask, securityID, type, properties, handler);
 }
-bool RDNA4PvNub::handleOpen(IOService *forClient, IOOptionBits options, void *arg) { return IOService::handleOpen(forClient, options, arg); }
-void RDNA4PvNub::handleClose(IOService *forClient, IOOptionBits options) { IOService::handleClose(forClient, options); }
-IOReturn RDNA4PvNub::requestProbe(IOOptionBits) { return kIOReturnUnsupported; }
-IOReturn RDNA4PvNub::powerStateWillChangeTo(IOPMPowerFlags, unsigned long, IOService *) { return IOPMAckImplied; }
-IOReturn RDNA4PvNub::setPowerState(unsigned long, IOService *) { return IOPMAckImplied; }
-unsigned long RDNA4PvNub::maxCapabilityForDomainState(IOPMPowerFlags) { return 0; }
-unsigned long RDNA4PvNub::initialPowerStateForDomainState(IOPMPowerFlags) { return 0; }
-unsigned long RDNA4PvNub::powerStateForDomainState(IOPMPowerFlags) { return 0; }
-bool RDNA4PvNub::compareName(OSString *name, OSString **matched) const { return IOService::compareName(name, matched); }
-IOService *RDNA4PvNub::matchLocation(IOService *client) { return IOService::matchLocation(client); }
-IOReturn RDNA4PvNub::getResources() { return IOService::getResources(); }
-IOReturn RDNA4PvNub::setProperties(OSObject *properties) { return IOService::setProperties(properties); }
+bool RDNA4PvNub::handleOpen(IOService *forClient, IOOptionBits options, void *arg) { PVCALL("handleOpen"); return IOService::handleOpen(forClient, options, arg); }
+void RDNA4PvNub::handleClose(IOService *forClient, IOOptionBits options) { PVCALL("handleClose"); IOService::handleClose(forClient, options); }
+IOReturn RDNA4PvNub::requestProbe(IOOptionBits) { PVCALL("requestProbe"); return kIOReturnUnsupported; }
+IOReturn RDNA4PvNub::powerStateWillChangeTo(IOPMPowerFlags, unsigned long, IOService *) { PVCALL("powerStateWillChangeTo"); return IOPMAckImplied; }
+IOReturn RDNA4PvNub::setPowerState(unsigned long, IOService *) { PVCALL("setPowerState"); return IOPMAckImplied; }
+unsigned long RDNA4PvNub::maxCapabilityForDomainState(IOPMPowerFlags) { PVCALL("maxCapabilityForDomainState"); return 0; }
+unsigned long RDNA4PvNub::initialPowerStateForDomainState(IOPMPowerFlags) { PVCALL("initialPowerStateForDomainState"); return 0; }
+unsigned long RDNA4PvNub::powerStateForDomainState(IOPMPowerFlags) { PVCALL("powerStateForDomainState"); return 0; }
+bool RDNA4PvNub::compareName(OSString *name, OSString **matched) const { PVCALL("compareName"); return IOService::compareName(name, matched); }
+IOService *RDNA4PvNub::matchLocation(IOService *client) { PVCALL("matchLocation"); return IOService::matchLocation(client); }
+IOReturn RDNA4PvNub::getResources() { PVCALL("getResources"); return IOService::getResources(); }
+IOReturn RDNA4PvNub::setProperties(OSObject *properties) { PVCALL("setProperties"); return IOService::setProperties(properties); }
 IOReturn RDNA4PvNub::callPlatformFunction(const OSSymbol *f, bool w, void *p1, void *p2, void *p3, void *p4) {
+	PVCALL("callPlatformFunction");
 	return IOService::callPlatformFunction(f, w, p1, p2, p3, p4);
 }
 IOReturn RDNA4PvNub::callPlatformFunction(const char *f, bool w, void *p1, void *p2, void *p3, void *p4) {
+	PVCALL("callPlatformFunction");
 	return IOService::callPlatformFunction(f, w, p1, p2, p3, p4);
 }
-IODeviceMemory *RDNA4PvNub::getDeviceMemoryWithIndex(unsigned int) { return nullptr; }
+IODeviceMemory *RDNA4PvNub::getDeviceMemoryWithIndex(unsigned int) { PVCALL("getDeviceMemoryWithIndex"); return nullptr; }
 
 // ---- matching: only a personality that names this device by IOPCIMatch / IOPCIPrimaryMatch matches; everything else is offered and refused ----
 
@@ -1544,50 +1591,64 @@ bool RDNA4PvNub::matchPci(OSDictionary *table) {
 	bool ok = primary != nullptr && matchIds(primary, ids);
 	if (ok && secondary && !matchIds(secondary, sub))
 		ok = false;
-	if (ok && klass && !matchIds(klass, 0x03000000))
+	if (ok && klass && !matchIds(klass, pvClass() << 8))
+		ok = false;
+	// rdna4-pvgpu-match=0: the nub stays published but no driver matches it (to tell the nub's own effects from those of Apple's driver).
+	uint32_t allow = 1;
+	PE_parse_boot_argn("rdna4-pvgpu-match", &allow, sizeof(allow));
+	const bool refused = ok && !allow;
+	if (refused)
 		ok = false;
 	static uint32_t offered = 0;
 	if (__atomic_fetch_add(&offered, 1u, __ATOMIC_RELAXED) < 40) {
 		const char *cls = stringKey(table, "IOClass"), *bundle = stringKey(table, "CFBundleIdentifier");
-		pvlog("match offered: %s %s (IOPCIMatch %s) -> %s", bundle ? bundle : "?", cls ? cls : "?", primary ? primary : "-", ok ? "MATCH" : "no");
+		pvlog("match offered: %s %s (IOPCIMatch %s) -> %s", bundle ? bundle : "?", cls ? cls : "?", primary ? primary : "-",
+		      ok ? "MATCH" : refused ? "no (refused: rdna4-pvgpu-match=0)" : "no");
 	}
 	return ok;
 }
 
-bool RDNA4PvNub::matchPropertyTable(OSDictionary *table) { return matchPci(table) && IOService::matchPropertyTable(table); }
+bool RDNA4PvNub::matchPropertyTable(OSDictionary *table) { PVCALL("matchPropertyTable"); return matchPci(table) && IOService::matchPropertyTable(table); }
 
-bool RDNA4PvNub::matchPropertyTable(OSDictionary *table, SInt32 *score) { return matchPci(table) && IOService::matchPropertyTable(table, score); }
+bool RDNA4PvNub::matchPropertyTable(OSDictionary *table, SInt32 *score) { PVCALL("matchPropertyTable"); return matchPci(table) && IOService::matchPropertyTable(table, score); }
 
 // ---- config space ----
 
 UInt32 RDNA4PvNub::configRead32(IOPCIAddressSpace, UInt8 offset) {
+	PVCALL("configRead32");
 	uint32_t v = 0;
 	memcpy(&v, &mConfig[offset & 0xfc], sizeof(v));
 	return v;
 }
 UInt16 RDNA4PvNub::configRead16(IOPCIAddressSpace, UInt8 offset) {
+	PVCALL("configRead16");
 	uint16_t v = 0;
 	memcpy(&v, &mConfig[offset & 0xfe], sizeof(v));
 	return v;
 }
-UInt8 RDNA4PvNub::configRead8(IOPCIAddressSpace, UInt8 offset) { return mConfig[offset]; }
+UInt8 RDNA4PvNub::configRead8(IOPCIAddressSpace, UInt8 offset) { PVCALL("configRead8"); return mConfig[offset]; }
 void RDNA4PvNub::configWrite32(IOPCIAddressSpace, UInt8 offset, UInt32 data) {
+	PVCALL("configWrite32");
 	if (offset >= 0x04)   // vendor/device are read-only
 		memcpy(&mConfig[offset & 0xfc], &data, sizeof(data));
 }
 void RDNA4PvNub::configWrite16(IOPCIAddressSpace, UInt8 offset, UInt16 data) {
+	PVCALL("configWrite16");
 	if (offset >= 0x04)
 		memcpy(&mConfig[offset & 0xfe], &data, sizeof(data));
 }
 void RDNA4PvNub::configWrite8(IOPCIAddressSpace, UInt8 offset, UInt8 data) {
+	PVCALL("configWrite8");
 	if (offset >= 0x04)
 		mConfig[offset] = data;
 }
 UInt32 RDNA4PvNub::tahoeConfigRead(UInt32 width, UInt8 offset) {
+	PVCALL("tahoeConfigRead");
 	IOPCIAddressSpace sp {};
 	return width == 32 ? configRead32(sp, offset) : width == 16 ? configRead16(sp, offset) : configRead8(sp, offset);
 }
 void RDNA4PvNub::tahoeConfigWrite(UInt32 width, UInt8 offset, UInt32 data) {
+	PVCALL("tahoeConfigWrite");
 	IOPCIAddressSpace sp {};
 	if (width == 32)
 		configWrite32(sp, offset, data);
@@ -1597,44 +1658,51 @@ void RDNA4PvNub::tahoeConfigWrite(UInt32 width, UInt8 offset, UInt32 data) {
 		configWrite8(sp, offset, static_cast<UInt8>(data));
 }
 IOReturn RDNA4PvNub::tahoeDeviceMemoryRead(UInt8, UInt64 offset, void *data, UInt8 size) {
+	PVCALL("tahoeDeviceMemoryRead");
 	if (!mBar0 || !data || !size || offset + size > kBar0Size)
 		return kIOReturnBadArgument;
 	memcpy(data, static_cast<uint8_t *>(mBar0) + offset, size);
 	return kIOReturnSuccess;
 }
 IOReturn RDNA4PvNub::tahoeDeviceMemoryWrite(UInt8, UInt64 offset, UInt64 data, UInt8 size) {
+	PVCALL("tahoeDeviceMemoryWrite");
 	if (!mBar0 || !size || size > 8 || offset + size > kBar0Size)
 		return kIOReturnBadArgument;
 	memcpy(static_cast<uint8_t *>(mBar0) + offset, &data, size);
 	return kIOReturnSuccess;
 }
-IOReturn RDNA4PvNub::saveDeviceState(IOOptionBits) { return kIOReturnSuccess; }
-IOReturn RDNA4PvNub::restoreDeviceState(IOOptionBits) { return kIOReturnSuccess; }
+IOReturn RDNA4PvNub::saveDeviceState(IOOptionBits) { PVCALL("saveDeviceState"); return kIOReturnSuccess; }
+IOReturn RDNA4PvNub::restoreDeviceState(IOOptionBits) { PVCALL("restoreDeviceState"); return kIOReturnSuccess; }
 UInt32 RDNA4PvNub::setConfigBits(UInt8 offset, UInt32 mask, UInt32 value) {
+	PVCALL("setConfigBits");
 	IOPCIAddressSpace sp {};
 	const UInt32 old = configRead32(sp, offset);
 	configWrite32(sp, offset, (old & ~mask) | (value & mask));
 	return old;
 }
 bool RDNA4PvNub::setMemoryEnable(bool enable) {
+	PVCALL("setMemoryEnable");
 	IOPCIAddressSpace sp {};
 	const UInt16 cmd = configRead16(sp, 0x04);
 	configWrite16(sp, 0x04, enable ? (cmd | 0x2) : (cmd & ~0x2));
 	return (cmd & 0x2) != 0;
 }
 bool RDNA4PvNub::setIOEnable(bool enable, bool) {
+	PVCALL("setIOEnable");
 	IOPCIAddressSpace sp {};
 	const UInt16 cmd = configRead16(sp, 0x04);
 	configWrite16(sp, 0x04, enable ? (cmd | 0x1) : (cmd & ~0x1));
 	return (cmd & 0x1) != 0;
 }
 bool RDNA4PvNub::setBusMasterEnable(bool enable) {
+	PVCALL("setBusMasterEnable");
 	IOPCIAddressSpace sp {};
 	const UInt16 cmd = configRead16(sp, 0x04);
 	configWrite16(sp, 0x04, enable ? (cmd | 0x4) : (cmd & ~0x4));
 	return (cmd & 0x4) != 0;
 }
 UInt32 RDNA4PvNub::findPCICapability(UInt8 capabilityID, UInt8 *offset) {
+	PVCALL("findPCICapability");
 	UInt8 at = mConfig[0x34] & 0xfc;
 	if (offset && *offset)   // continue after the previous hit
 		at = mConfig[(*offset) + 1] & 0xfc;
@@ -1651,6 +1719,7 @@ UInt32 RDNA4PvNub::findPCICapability(UInt8 capabilityID, UInt8 *offset) {
 	return 0;
 }
 UInt32 RDNA4PvNub::extendedFindPCICapability(UInt32 capabilityID, IOByteCount *offset) {
+	PVCALL("extendedFindPCICapability");
 	if (capabilityID >= 0x80000000u || capabilityID > 0xff)
 		return 0;   // no extended capabilities
 	UInt8 o = offset ? static_cast<UInt8>(*offset) : 0;
@@ -1659,29 +1728,31 @@ UInt32 RDNA4PvNub::extendedFindPCICapability(UInt32 capabilityID, IOByteCount *o
 		*offset = o;
 	return r;
 }
-UInt8 RDNA4PvNub::getBusNumber() { return 0; }
-UInt8 RDNA4PvNub::getDeviceNumber() { return 0; }
-UInt8 RDNA4PvNub::getFunctionNumber() { return 0; }
-IODeviceMemory *RDNA4PvNub::getDeviceMemoryWithRegister(UInt8) { return nullptr; }
+UInt8 RDNA4PvNub::getBusNumber() { PVCALL("getBusNumber"); return 0; }
+UInt8 RDNA4PvNub::getDeviceNumber() { PVCALL("getDeviceNumber"); return 0; }
+UInt8 RDNA4PvNub::getFunctionNumber() { PVCALL("getFunctionNumber"); return 0; }
+IODeviceMemory *RDNA4PvNub::getDeviceMemoryWithRegister(UInt8) { PVCALL("getDeviceMemoryWithRegister"); return nullptr; }
 IOMemoryMap *RDNA4PvNub::mapDeviceMemoryWithRegister(UInt8 reg, IOOptionBits) {
+	PVCALL("mapDeviceMemoryWithRegister");
 	if (reg != 0x10 || !mBar0Desc)
 		return nullptr;
 	// An alias of the RAM the host polls: a second mapping of the same pages, retained for the caller.
 	return mBar0Desc->createMappingInTask(kernel_task, 0, kIOMapAnywhere);
 }
-IODeviceMemory *RDNA4PvNub::ioDeviceMemory() { return nullptr; }
-void RDNA4PvNub::ioWrite32(UInt16, UInt32, IOMemoryMap *) {}
-void RDNA4PvNub::ioWrite16(UInt16, UInt16, IOMemoryMap *) {}
-void RDNA4PvNub::ioWrite8(UInt16, UInt8, IOMemoryMap *) {}
-UInt32 RDNA4PvNub::ioRead32(UInt16, IOMemoryMap *) { return 0xffffffff; }
-UInt16 RDNA4PvNub::ioRead16(UInt16, IOMemoryMap *) { return 0xffff; }
-UInt8 RDNA4PvNub::ioRead8(UInt16, IOMemoryMap *) { return 0xff; }
-bool RDNA4PvNub::hasPCIPowerManagement(IOOptionBits) { return false; }
-IOReturn RDNA4PvNub::enablePCIPowerManagement(IOOptionBits) { return kIOReturnUnsupported; }
+IODeviceMemory *RDNA4PvNub::ioDeviceMemory() { PVCALL("ioDeviceMemory"); return nullptr; }
+void RDNA4PvNub::ioWrite32(UInt16, UInt32, IOMemoryMap *) { PVCALL("ioWrite32");}
+void RDNA4PvNub::ioWrite16(UInt16, UInt16, IOMemoryMap *) { PVCALL("ioWrite16");}
+void RDNA4PvNub::ioWrite8(UInt16, UInt8, IOMemoryMap *) { PVCALL("ioWrite8");}
+UInt32 RDNA4PvNub::ioRead32(UInt16, IOMemoryMap *) { PVCALL("ioRead32"); return 0xffffffff; }
+UInt16 RDNA4PvNub::ioRead16(UInt16, IOMemoryMap *) { PVCALL("ioRead16"); return 0xffff; }
+UInt8 RDNA4PvNub::ioRead8(UInt16, IOMemoryMap *) { PVCALL("ioRead8"); return 0xff; }
+bool RDNA4PvNub::hasPCIPowerManagement(IOOptionBits) { PVCALL("hasPCIPowerManagement"); return false; }
+IOReturn RDNA4PvNub::enablePCIPowerManagement(IOOptionBits) { PVCALL("enablePCIPowerManagement"); return kIOReturnUnsupported; }
 
 // ---- interrupts: the nub is its own interrupt controller; the host side calls the handler ----
 
 IOReturn RDNA4PvNub::registerInterrupt(int source, OSObject *target, IOInterruptAction handler, void *refCon) {
+	PVCALL("registerInterrupt");
 	if (source < 0 || source >= kMaxInterrupts || !handler)
 		return kIOReturnBadArgument;
 	IOLockLock(mLock);
@@ -1698,6 +1769,7 @@ IOReturn RDNA4PvNub::registerInterrupt(int source, OSObject *target, IOInterrupt
 	return busy ? kIOReturnNoResources : kIOReturnSuccess;
 }
 IOReturn RDNA4PvNub::unregisterInterrupt(int source) {
+	PVCALL("unregisterInterrupt");
 	if (source < 0 || source >= kMaxInterrupts)
 		return kIOReturnBadArgument;
 	IOLockLock(mLock);
@@ -1707,12 +1779,14 @@ IOReturn RDNA4PvNub::unregisterInterrupt(int source) {
 	return kIOReturnSuccess;
 }
 IOReturn RDNA4PvNub::getInterruptType(int source, int *type) {
+	PVCALL("getInterruptType");
 	if (source < 0 || source >= kMaxInterrupts || !type)
 		return kIOReturnBadArgument;
 	*type = kIOInterruptTypeEdge;   // MSI
 	return kIOReturnSuccess;
 }
 IOReturn RDNA4PvNub::enableInterrupt(int source) {
+	PVCALL("enableInterrupt");
 	if (source < 0 || source >= kMaxInterrupts)
 		return kIOReturnBadArgument;
 	IOLockLock(mLock);
@@ -1721,6 +1795,7 @@ IOReturn RDNA4PvNub::enableInterrupt(int source) {
 	return kIOReturnSuccess;
 }
 IOReturn RDNA4PvNub::disableInterrupt(int source) {
+	PVCALL("disableInterrupt");
 	if (source < 0 || source >= kMaxInterrupts)
 		return kIOReturnBadArgument;
 	IOLockLock(mLock);
@@ -1728,4 +1803,4 @@ IOReturn RDNA4PvNub::disableInterrupt(int source) {
 	IOLockUnlock(mLock);
 	return kIOReturnSuccess;
 }
-IOReturn RDNA4PvNub::causeInterrupt(int source) { return raiseInterrupt(source) ? kIOReturnSuccess : kIOReturnNotReady; }
+IOReturn RDNA4PvNub::causeInterrupt(int source) { PVCALL("causeInterrupt"); return raiseInterrupt(source) ? kIOReturnSuccess : kIOReturnNotReady; }
