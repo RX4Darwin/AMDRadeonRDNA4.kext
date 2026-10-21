@@ -14,7 +14,8 @@
 //   +8 * N + 12  u32 threads in the grid x, y, z (threads past it do nothing: dispatchThreads need not fill whole groups)
 // It computes the AIR function's position arguments from the work-group and work-item ids and calls the AIR function, inlined.
 // Supported so far: device and constant buffers, the arguments thread_position_in_grid, thread_position_in_threadgroup,
-// threadgroup_position_in_grid, threads_per_threadgroup and threads_per_grid (uint, uint2 or uint3), threadgroup memory and barriers, local
+// threadgroup_position_in_grid, threads_per_threadgroup and threads_per_grid (uint, uint2 or uint3), thread_index_in_threadgroup and the
+// SIMD-group indices (a SIMD group is a wave of 32), SIMD-group functions (simdOp() below), threadgroup memory and barriers, local
 // arrays (as long as LLVM keeps them out of scratch memory, which the kext's runtime does not give kernels), device and threadgroup atomic
 // read-modify-writes, and the math and integer functions of legalize() below. Anything else is reported and refused.
 #include "lld/Common/Driver.h"
@@ -38,6 +39,7 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <IOKit/IOKitLib.h>
+#include <array>
 #include <map>
 #include <string>
 #include <unistd.h>
@@ -112,6 +114,73 @@ static Value *asType(IRBuilder<> &b, Type *t, Value *const xyz[3]) {
 	return r;
 }
 
+// A Metal SIMD-group function (simd_<op>[.u|.s]) on a wave of 32, Metal's SIMD-group width; null if not supported. Measured on Apple's
+// GPU: a shuffle up or down past the group's edge keeps the lane's own value; reductions, ballots and any/all see the active lanes only.
+// Prefix sums shuffle upwards, so they are right when the inactive lanes are the top ones (a group cut by the grid's edge).
+static Value *simdOp(IRBuilder<> &b, StringRef op, CallInst *c) {
+	Type *t = c->getType();
+	Value *x = c->arg_size() ? c->getArgOperand(0) : nullptr;
+	Value *lane = b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {b.getInt32(-1), b.getInt32(0)});
+	auto index = [&]() { return b.CreateZExtOrTrunc(c->getArgOperand(1), b.getInt32Ty()); };
+	auto shuffle = [&](Value *v, Value *from) -> Value * {   // lane `from`'s v: 32-bit types directly, smaller ones through i32
+		Type *vt = v->getType();
+		const unsigned bits = vt->getPrimitiveSizeInBits();
+		if (bits == 32)
+			return b.CreateIntrinsic(Intrinsic::amdgcn_wave_shuffle, {vt}, {v, from});
+		if (bits != 16 && bits != 8)
+			return nullptr;
+		Value *w = b.CreateZExt(b.CreateBitCast(v, b.getIntNTy(bits)), b.getInt32Ty());
+		w = b.CreateIntrinsic(Intrinsic::amdgcn_wave_shuffle, {b.getInt32Ty()}, {w, from});
+		return b.CreateBitCast(b.CreateTrunc(w, b.getIntNTy(bits)), vt);
+	};
+	auto ballot = [&](Value *cond) { return b.CreateIntrinsic(Intrinsic::amdgcn_ballot, {b.getInt32Ty()}, {cond}); };
+	const auto [what, sign] = op.drop_front(5).split('.');   // "sum" and "u", "max" and "", ...
+	const bool fp = t->isFloatingPointTy();
+	if (what == "shuffle" || what == "broadcast")
+		return shuffle(x, index());
+	if (what == "shuffle_xor")
+		return shuffle(x, b.CreateXor(lane, index()));
+	if (what == "shuffle_down" || what == "shuffle_up") {
+		Value *d = index();
+		Value *from = what == "shuffle_down" ? b.CreateAdd(lane, d) : b.CreateSub(lane, d);
+		Value *inside = what == "shuffle_down" ? b.CreateICmpULT(from, b.getInt32(32)) : b.CreateICmpUGE(lane, d);
+		Value *v = shuffle(x, b.CreateAnd(from, 31));
+		return v ? b.CreateSelect(inside, v, x) : nullptr;
+	}
+	if (what == "ballot")
+		return b.CreateZExt(ballot(x), t);
+	if (what == "any")
+		return b.CreateICmpNE(ballot(x), b.getInt32(0));
+	if (what == "all")
+		return b.CreateICmpEQ(ballot(x), ballot(b.getTrue()));
+	if (what == "prefix_inclusive_sum" || what == "prefix_exclusive_sum") {
+		Value *sum = x;
+		for (unsigned k = 1; k < 32; k <<= 1) {
+			Value *below = shuffle(sum, b.CreateAnd(b.CreateSub(lane, b.getInt32(k)), 31));
+			if (!below)
+				return nullptr;
+			Value *added = fp ? b.CreateFAdd(sum, below) : b.CreateAdd(sum, below);
+			sum = b.CreateSelect(b.CreateICmpUGE(lane, b.getInt32(k)), added, sum);
+		}
+		if (what == "prefix_inclusive_sum")
+			return sum;
+		Value *before = shuffle(sum, b.CreateAnd(b.CreateSub(lane, b.getInt32(1)), 31));
+		return b.CreateSelect(b.CreateICmpEQ(lane, b.getInt32(0)), Constant::getNullValue(t), before);
+	}
+	static const std::map<std::string, std::array<Intrinsic::ID, 3>> reduce = {   // float, signed, unsigned
+		{"sum", {Intrinsic::amdgcn_wave_reduce_fadd, Intrinsic::amdgcn_wave_reduce_add, Intrinsic::amdgcn_wave_reduce_add}},
+		{"max", {Intrinsic::amdgcn_wave_reduce_fmax, Intrinsic::amdgcn_wave_reduce_max, Intrinsic::amdgcn_wave_reduce_umax}},
+		{"min", {Intrinsic::amdgcn_wave_reduce_fmin, Intrinsic::amdgcn_wave_reduce_min, Intrinsic::amdgcn_wave_reduce_umin}},
+		{"and", {Intrinsic::not_intrinsic, Intrinsic::amdgcn_wave_reduce_and, Intrinsic::amdgcn_wave_reduce_and}},
+		{"or", {Intrinsic::not_intrinsic, Intrinsic::amdgcn_wave_reduce_or, Intrinsic::amdgcn_wave_reduce_or}},
+		{"xor", {Intrinsic::not_intrinsic, Intrinsic::amdgcn_wave_reduce_xor, Intrinsic::amdgcn_wave_reduce_xor}}};
+	const auto it = reduce.find(what.str());
+	if (it == reduce.end() || t->getPrimitiveSizeInBits() != 32)
+		return nullptr;
+	const Intrinsic::ID id = it->second[fp ? 0 : sign == "u" ? 2 : 1];
+	return id == Intrinsic::not_intrinsic ? nullptr : b.CreateIntrinsic(id, {t}, {x, b.getInt32(0)});
+}
+
 // What AIR leaves in the inlined kernel that AMDGPU does not take, rewritten; the reason when something cannot be.
 //  - AIR's constant address space (2) is AMDGPU's GDS: constant buffers become global memory (1) again.
 //  - local arrays: AMDGPU's allocas live in address space 5 (private), seen through a flat pointer.
@@ -173,12 +242,31 @@ static std::string legalize(Function &k) {
 		IRBuilder<> b(c);
 		Value *r = nullptr;
 		const auto [op, type] = name.rsplit('.');   // e.g. "min.s" and "i32", "sqrt" and "f32", "wg" and "barrier"
-		if (name == "wg.barrier") {
+		if (op.starts_with("simd_")) {
+			r = simdOp(b, op, c);
+			if (!r)
+				return f->getName().str() + " is not supported yet";
+		} else if (name == "wg.barrier") {
 			// (memory flags: 1 device, 2 threadgroup, 4 texture; scope): fence, the hardware barrier, fence.
 			const SyncScope::ID scope = ctx.getOrInsertSyncScopeID(cast<ConstantInt>(c->getArgOperand(0))->getZExtValue() & 1 ? "agent" : "workgroup");
 			b.CreateFence(AtomicOrdering::Release, scope);
 			b.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {});
 			b.CreateFence(AtomicOrdering::Acquire, scope);
+		} else if (name.starts_with("convert.")) {   // convert.<to kind>.<to type>.<from kind>.<from type>; kinds f, s, u
+			SmallVector<StringRef, 5> k;
+			name.split(k, '.');
+			if (k.size() != 5)
+				return f->getName().str() + " is not supported yet";
+			Value *v = c->getArgOperand(0);
+			Type *to = c->getType();
+			if (k[1] == "f" && k[3] == "f")
+				r = b.CreateFPCast(v, to);
+			else if (k[3] == "f")   // float to integer: saturating
+				r = b.CreateIntrinsic(k[1] == "s" ? Intrinsic::fptosi_sat : Intrinsic::fptoui_sat, {to, v->getType()}, {v});
+			else if (k[1] == "f")
+				r = k[3] == "s" ? b.CreateSIToFP(v, to) : b.CreateUIToFP(v, to);
+			else
+				r = b.CreateIntCast(v, to, k[3] == "s");
 		} else if (name.consume_front("atomic.global.") || name.consume_front("atomic.local.")) {
 			// (pointer, value, memory order, scope, volatile): Metal's are relaxed; device or threadgroup scope by the memory.
 			auto it = rmw.find(name.rsplit('.').first.str());   // "add.u" -> "add"/"min.u"
@@ -246,7 +334,7 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 		return "no AIR kernel named " + fname.str();
 
 	// What each argument of the AIR function is.
-	enum Role { Buffer, PosInGrid, PosInGroup, GroupInGrid, GroupSize, GridSize };
+	enum Role { Buffer, PosInGrid, PosInGroup, GroupInGrid, GroupSize, GridSize, IndexInGroup, Lane, SimdInGroup, SimdWidth, SimdsInGroup };
 	struct Arg { Role role; int location; };
 	std::map<unsigned, Arg> roles;
 	int maxLocation = -1;
@@ -279,6 +367,16 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 			roles[index] = {GroupSize, -1};
 		} else if (kind == "air.threads_per_grid") {
 			roles[index] = {GridSize, -1};
+		} else if (kind == "air.thread_index_in_threadgroup") {
+			roles[index] = {IndexInGroup, -1};
+		} else if (kind == "air.thread_index_in_simdgroup") {
+			roles[index] = {Lane, -1};
+		} else if (kind == "air.simdgroup_index_in_threadgroup") {
+			roles[index] = {SimdInGroup, -1};
+		} else if (kind == "air.threads_per_simdgroup") {
+			roles[index] = {SimdWidth, -1};
+		} else if (kind == "air.simdgroups_per_threadgroup") {
+			roles[index] = {SimdsInGroup, -1};
 		} else {
 			return "argument " + std::to_string(index) + ": " + kind + " is not supported yet";
 		}
@@ -313,6 +411,9 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 		actual[d] = b.CreateBinaryIntrinsic(Intrinsic::umin, size[d], b.CreateSub(grid[d], first));   // Metal: a partial group's own size
 		inside = b.CreateAnd(inside, b.CreateICmpULT(pos[d], grid[d]));
 	}
+	// The thread's index in its group, x fastest: the order the hardware packs a group into waves of 32, Metal's SIMD groups.
+	Value *linear = b.CreateAdd(item[0], b.CreateMul(size[0], b.CreateAdd(item[1], b.CreateMul(size[1], item[2]))));
+	Value *groupThreads = b.CreateMul(actual[0], b.CreateMul(actual[1], actual[2]));
 	BasicBlock *run = BasicBlock::Create(ctx, "run", kernel), *done = BasicBlock::Create(ctx, "done", kernel);
 	b.CreateCondBr(inside, run, done);
 	b.SetInsertPoint(run);
@@ -325,7 +426,14 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 		         : a.role == PosInGroup  ? asType(b, air->getArg(i)->getType(), item)
 		         : a.role == GroupInGrid ? asType(b, air->getArg(i)->getType(), group)
 		         : a.role == GroupSize   ? asType(b, air->getArg(i)->getType(), actual)
-		                                 : asType(b, air->getArg(i)->getType(), grid);
+		         : a.role == GridSize    ? asType(b, air->getArg(i)->getType(), grid)
+		         : a.role == IndexInGroup ? linear
+		         : a.role == Lane         ? b.CreateAnd(linear, 31)
+		         : a.role == SimdInGroup  ? b.CreateLShr(linear, 5)
+		         : a.role == SimdWidth    ? b.getInt32(32)
+		                                  : b.CreateLShr(b.CreateAdd(groupThreads, b.getInt32(31)), 5);
+		if (v && v->getType() != air->getArg(i)->getType())
+			v = nullptr;   // the index arguments are uint
 		if (!v)
 			return "argument " + std::to_string(i) + ": an unsupported type for a position";
 		callArgs.push_back(v);

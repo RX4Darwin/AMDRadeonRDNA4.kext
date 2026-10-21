@@ -15,6 +15,8 @@
 //                      arrays, integer functions, half), each checked against the CPU
 //   mtlprobe bytes     o[i] *= k with k from setBytes and dispatchThreadgroups (2 x 32), then k = 10 again over o[32..63] by
 //                      setBufferOffset: o[i] = 3 i below 32, 30 i above
+//   mtlprobe simd      SIMD-group functions over 40 threads in one group (a full SIMD group of 32 and one of 8), against a CPU model of
+//                      what Apple's GPU does
 //   mtlprobe render    one render pass that clears a 64x64 BGRA texture to (0.25, 0.5, 0.75, 1)
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
 //
@@ -351,6 +353,50 @@ static void bytes(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	OUT("bytes: o[1] %.0f o[33] %.0f o[63] %.0f, %d of 64 wrong (3 990 1890, 0 wrong = executed)", po[1], po[33], po[63], wrong);
 }
 
+static void simd(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	enum { N = 40, K = 11 };
+	id<MTLBuffer> o = [d newBufferWithLength:N * K * 4 options:MTLResourceStorageModeShared];
+	memset(o.contents, 0xff, N * K * 4);
+	BOOL ran = runKernel(d, q,
+	    @"kernel void simdprobe(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]],"
+	     " uint sg [[simdgroup_index_in_threadgroup]], uint w [[threads_per_simdgroup]], uint n [[simdgroups_per_threadgroup]]) {"
+	     " uint x = 100 + i; float f = i * 0.5f; device uint *r = o + i * 11;"
+	     " r[0] = simd_sum(x); r[1] = (uint)(simd_max(f) * 2); r[2] = simd_prefix_exclusive_sum(x);"
+	     " r[3] = (uint)(simd_prefix_inclusive_sum(f) * 2); r[4] = simd_shuffle_xor(x, 1); r[5] = simd_shuffle_up(x, 3);"
+	     " r[6] = simd_broadcast(x, 2); r[7] = (uint)(uint64_t)simd_ballot(x % 3 == 0);"
+	     " r[8] = lane + 100 * sg + 10000 * w + 1000000 * n; r[9] = (simd_any(x == 105) ? 1 : 0) + (simd_all(x >= 100) ? 2 : 0);"
+	     " r[10] = simd_shuffle_down(x, 3); }",
+	    @"simdprobe", @[o], N, N);
+	const uint32_t *p = o.contents;
+	int bad = 0, first = -1;
+	for (int i = 0; i < N; i++) {
+		const int g0 = i / 32 * 32, gn = i < 32 ? 32 : N - 32, lane = i % 32;   // this lane's SIMD group: its first thread and its active count
+		uint32_t want[11] = {0}, sum = 0, ex = 0, ball = 0;
+		float mx = 0, inc = 0;
+		for (int k = 0; k < gn; k++) {
+			const uint32_t xk = 100 + g0 + k;
+			sum += xk;
+			mx = fmaxf(mx, (g0 + k) * 0.5f);
+			if (k < lane) ex += xk;
+			if (k <= lane) inc += (g0 + k) * 0.5f;
+			if (xk % 3 == 0) ball |= 1u << k;
+		}
+		const uint32_t x = 100 + i;
+		want[0] = sum; want[1] = (uint32_t)(mx * 2); want[2] = ex; want[3] = (uint32_t)(inc * 2); want[4] = 100 + g0 + (lane ^ 1);
+		want[5] = lane >= 3 ? x - 3 : x; want[6] = 100 + g0 + 2; want[7] = ball; want[8] = lane + 100 * (i / 32) + 10000 * 32 + 1000000 * 2;
+		bool any = false, all = true;
+		for (int k = 0; k < gn; k++) { any |= 100 + g0 + k == 105; all &= 100 + g0 + k >= 100; }
+		want[9] = (any ? 1 : 0) + (all ? 2 : 0);
+		want[10] = lane + 3 < 32 ? x + 3 : x;
+		for (int k = 0; k < 11; k++)
+			if ((k != 10 || i < 32) && p[i * 11 + k] != want[k] && bad++ == 0) {
+				first = i * 11 + k;
+				OUT("simd: thread %d result %d: got %u, want %u", i, k, p[first], want[k]);
+			}
+	}
+	OUT("simd: %s, %d of %d results wrong (0 = executed)", ran ? "ran" : "NOT RUN", bad, N * 11 - 8);
+}
+
 static void render(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
 	td.usage = MTLTextureUsageRenderTarget;
@@ -379,8 +425,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "render"};
-			for (int i = 0; i < 10; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render"};
+			for (int i = 0; i < 11; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -421,10 +467,12 @@ int main(int argc, char **argv) {
 			feat(d, q);
 		else if (!strcmp(mode, "bytes"))
 			bytes(d, q);
+		else if (!strcmp(mode, "simd"))
+			simd(d, q);
 		else if (!strcmp(mode, "render"))
 			render(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, render, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, all)", mode);
 			return 2;
 		}
 	}

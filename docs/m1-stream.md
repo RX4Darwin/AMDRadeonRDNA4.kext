@@ -254,6 +254,14 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   of its own and binds it with `setBuffers` (resource 4, offsets 0 and 0x20 in mtlprobe's `bytes`). `Compute.dispatchThreadgroups` (0x0c8)
   is `{u64 groups[3], u64 threads per group[3]}` and was skipped until now; `Compute.setBufferOffset` (0x0cf) is `{u32 index, u64 offset}`.
   **On the card (2026-10-21): mtlprobe's `bytes` (setBytes, dispatchThreadgroups, setBufferOffset) `0 of 64 wrong`; all other probes pass.**
+- **M3, sixth step: SIMD-group functions and conversions.** A Metal SIMD group is a wave of 32 (Metal's width; the kernels are wave32):
+  `thread_index_in_simdgroup`, `simdgroup_index_in_threadgroup` and `simdgroups_per_threadgroup` come from the thread's linear index in its
+  group (x fastest, the order the hardware packs waves); reductions are `llvm.amdgcn.wave.reduce.*` (active lanes only, as on Apple's GPU),
+  shuffles and broadcast `llvm.amdgcn.wave.shuffle`, ballot/any/all `llvm.amdgcn.ballot`, prefix sums five upward shuffles (right when the
+  inactive lanes are the top ones, as at the grid's edge). Measured on Apple's GPU first: a shuffle up or down past the group's edge keeps
+  the lane's own value. `air.convert.<to kind>.<to type>.<from kind>.<from type>` (kinds f, s, u) become LLVM casts, float to integer
+  saturating; every kernel mixing integers and floats needs them. **On the card (2026-10-21): mtlprobe's `simd` (40 threads: a full SIMD
+  group and one of 8 lanes; reductions, prefix sums, shuffles, broadcast, ballot, any/all, the indices) 0 of 432 results wrong.**
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's
