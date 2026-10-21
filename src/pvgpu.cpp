@@ -156,9 +156,11 @@ private:
 	bool functionOf(uint32_t task, char *name, size_t nameCap, uint8_t hash[32]);
 	bool rtReady();
 	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
+	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
 	bool dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes);
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
+	void runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
 	void runCompute(uint32_t task, const uint32_t *buffer, const uint64_t *offset, const uint64_t *threads);
 private:
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
@@ -198,7 +200,8 @@ private:
 	uint8_t mDumped[256] {};            // M1: payload dumps per FIFO id so far
 	uint32_t mTaskRoot[64] {};
 	bool mRtOpen { false };              // M2: this host is a client of the card's runtime
-	uint64_t mVaddProgram { 0 };          // M2: mtlvadd.cl loaded into it          // M1: page-table root PFN per task id (DefineHostTask), for the dumps after a commit
+	uint64_t mVaddProgram { 0 };          // M2: mtlvadd.cl loaded into it
+	uint32_t mRenderLines { 0 };          // M2: render-pass and texture lines so far (other processes render every frame)          // M1: page-table root PFN per task id (DefineHostTask), for the dumps after a commit
 	uint8_t mWin[1024] {};              // one FIFO command copied out of the ring for decoding
 
 	// Display side. rdna4-pvgpu-disp: bit 0 = report the display online (fill the pipe's info, set the online event), bit 1 = ~60 Hz VBL events for pipes whose
@@ -666,8 +669,10 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 	t->commands++;
 	if (!name)
 		t->unknown++;
-	if (id == 0x132 || id == 0x12d)
+	if (id == 0x132 || id == 0x12d || id == 0x12e)
 		t->host->runBlit(t->task, id, payload, bytes);
+	else if (id == 0x01a)
+		t->host->runRenderPass(t->task, payload, bytes);
 	else if (id == 0x0d0 && bytes >= 4)
 		memcpy(&t->pipeline, payload, 4);
 	else if (id == 0x0cb && bytes >= 8) {   // {u32 first index, u32 count, count x {u32 resource id, u64 offset}} (measured, docs/m1-stream.md s.5b)
@@ -751,6 +756,59 @@ bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t
 	return desc[0] && desc[1] < (1ull << 36) && guestPfn(task, *va);
 }
 
+// M2: a texture's GPU range: a type-2 resource with a 116-byte descriptor, dwords {u64 size in bytes, u32 page number of its start, ...,
+// [13] bytes per row, [15] width, ...} (mtlprobe's 64x64 BGRA8 render target: 0x4000 bytes at page 0x101, 0x100 per row: linear; measured
+// 2026-10-21). Where the pixel format is (0x04010101 at [8]?) is still open; the first descriptors of a boot are logged.
+bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len) {
+	uint32_t rec[3], desc[29];
+	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) || (rec[0] & 0xff) != 2 ||
+	    (rec[0] >> 8) < sizeof(desc) || !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(desc), sizeof(desc))) {
+		if (mRenderLines++ < 24)
+			pvlog("host: task %u resource %u: no texture", task, id);
+		return false;
+	}
+	if (mRenderLines++ < 24)
+		pvlog("host: task %u texture %u: descriptor %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", task, id, desc[0],
+	      desc[1], desc[2], desc[3], desc[4], desc[5], desc[6], desc[7], desc[8], desc[9], desc[10], desc[11], desc[12], desc[13], desc[14], desc[15]);
+	*len = desc[0] | static_cast<uint64_t>(desc[1]) << 32;
+	*va = static_cast<uint64_t>(desc[2]) << 12;
+	return *len && *len <= (1ull << 30) && guestPfn(task, *va);
+}
+
+// A double in [0, 1] (its bits) as an 8-bit unorm, round(v * 255), with integers only; below 0 (or NaN) 0, from 1 up 255.
+static uint32_t unorm8(uint64_t bits) {
+	const uint32_t e = static_cast<uint32_t>(bits >> 52) & 0x7ff;
+	if (bits >> 63 || e < 1023 - 60)
+		return 0;   // negative, zero, tiny or NaN with the sign set
+	if (e >= 1023)
+		return e == 0x7ff && (bits & ((1ull << 52) - 1)) ? 0 : 255;   // 1 and up (NaN: 0)
+	const uint64_t m = (bits & ((1ull << 52) - 1)) | (1ull << 52);    // 53-bit significand, v = m * 2^(e - 1075)
+	const uint32_t shift = 52 + (1023 - e);
+	return static_cast<uint32_t>((m * 255 + (1ull << (shift - 1))) >> shift);
+}
+
+// M2: a render pass with nothing drawn: Render.writeDescriptor (584 bytes) carries colour attachment 0 as {u32 texture at +0x4c, u32 (store action
+// << 16) | load action at +0x60, double clear colour[4] at +0x68} (mtlprobe: texture 1, 0x00010002 = clear and store, 0.25 0.5 0.75 1; measured
+// 2026-10-21). A clear is a fill of the texture's memory with the colour as a BGRA8 pixel: the format is assumed (mtlprobe's) until it is found in
+// the texture's descriptor. Nothing else of a pass is carried out yet (draws need shaders).
+void RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes) {
+	if (!gCompute || bytes < 0x88)
+		return;
+	uint32_t tex, actions;
+	uint64_t rgba[4];   // the clear colour as IEEE-754 doubles, converted with integers only (no floating point in the kernel)
+	memcpy(&tex, p + 0x4c, 4);
+	memcpy(&actions, p + 0x60, 4);
+	memcpy(rgba, p + 0x68, sizeof(rgba));
+	if ((actions & 0xffff) != 2 || !tex)   // MTLLoadActionClear
+		return;
+	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
+	const uint32_t pixel = b | g << 8 | r << 16 | a << 24;   // B, G, R, A in memory
+	uint64_t va, len;
+	const bool ok = textureRange(task, tex, &va, &len) && !(len & 3) && dmaGuest(task, va, 0, pixel, len);
+	if (mRenderLines++ < 24)
+		pvlog("host: render: clear texture %u to RGBA8 (%u, %u, %u, %u) = BGRA8 pixel 0x%08x on the card: %s", tex, r, g, b, a, pixel, ok ? "done" : "NOT done");
+}
+
 // M2: an SDMA fill (srcVa 0: `pattern`) or copy (from srcVa) over `bytes` of a task's GPU address space, page by page through its page table, the CPU
 // caches flushed before and after each piece (the engine does not snoop them).
 bool RDNA4PvHost::dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes) {
@@ -811,6 +869,26 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 		const bool ok = bufferRange(task, src, &va, &len) && bufferRange(task, dst, &va2, &len2) && so <= len && n <= len - so && dof <= len2 &&
 		                n <= len2 - dof && dmaGuest(task, va2 + dof, va + so, 0, n);
 		pvlog("host: blit: copyFromBuffer %u +0x%llx -> %u +0x%llx, 0x%llx bytes on the card: %s", src, so, dst, dof, n, ok ? "done" : "NOT done");
+	} else if (id == 0x12e && bytes >= 88) {
+		// Blit.copyFromTexture {u32 texture, u32 buffer, u64 origin[3], u64 size[3], u64 destination offset, u64 bytes per row, u64 bytes per image,
+		// u32 slice, u32 level} (mtlprobe: 64x64x1, 0x100 per row, 0x4000 per image; measured 2026-10-21). Only the whole of a linear texture, copied
+		// as bytes: what a texture's memory looks like is not measured yet beyond its size (64x64 BGRA8 = exactly 0x4000).
+		uint32_t tex, buf, slice, level;
+		uint64_t origin[3], size[3], dof, bpr, bpi;
+		memcpy(&tex, p, 4);
+		memcpy(&buf, p + 4, 4);
+		memcpy(origin, p + 8, 24);
+		memcpy(size, p + 32, 24);
+		memcpy(&dof, p + 56, 8);
+		memcpy(&bpr, p + 64, 8);
+		memcpy(&bpi, p + 72, 8);
+		memcpy(&slice, p + 80, 4);
+		memcpy(&level, p + 84, 4);
+		const bool whole = !origin[0] && !origin[1] && !origin[2] && size[2] == 1 && !slice && !level && bpr == size[0] * 4 && bpi == bpr * size[1];
+		const bool ok = whole && textureRange(task, tex, &va, &len) && bpi == len && bufferRange(task, buf, &va2, &len2) && dof <= len2 &&
+		                bpi <= len2 - dof && dmaGuest(task, va2 + dof, va, 0, bpi);
+		pvlog("host: blit: copyFromTexture %u (%llux%llu, %llu bytes per row) -> buffer %u +0x%llx on the card: %s", tex, size[0], size[1], bpr, buf, dof,
+		      ok ? "done" : whole ? "NOT done" : "not run (not the whole of a texture)");
 	}
 }
 

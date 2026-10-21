@@ -197,7 +197,16 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   compiler): `src/shaders/mtlvadd.cl`, chosen by the function's name and its three bound buffers. The host follows `setComputePipelineState`,
   `setBuffers {u32 first index, u32 count, count x {u32 resource id, u64 offset}}` and `dispatchThreads`, copies the bound buffers into runtime
   buffers, dispatches through the runtime as one of its clients, and writes `c` back into the guest's pages: mtlprobe's compute reads
-  `c[0] 1000 c[1] 1001 c[63] 1063` (64 threads, 30 us on the card). Render is still only acknowledged.
+  `c[0] 1000 c[1] 1001 c[63] 1063` (64 threads, 30 us on the card).
+- **M2, third step: a render pass that only clears.** `Render.writeDescriptor` (584 bytes) carries colour attachment 0 as `{u32 texture at
+  +0x4c, u32 (store action << 16) | load action at +0x60, double clear colour[4] at +0x68}` (mtlprobe: texture 1, 0x00010002 = clear + store,
+  0.25 0.5 0.75 1). A texture (type 2, 116-byte descriptor) is dwords `{u64 size, u32 start page, ..., [13] bytes per row, [15] width}`, linear
+  (mtlprobe: 0x4000 bytes at page 0x101, 0x100 per row). The host fills the texture with the colour as a BGRA8 pixel (the format is assumed
+  until found in the descriptor; the colour is converted from the doubles' bits with integers, no floating point in the kernel) and carries out
+  `Blit.copyFromTexture {u32 texture, u32 buffer, u64 origin[3], u64 size[3], u64 destination offset, u64 bytes per row, u64 bytes per image,
+  u32 slice, u32 level}` for a whole linear texture: mtlprobe's render reads `B 191 G 128 R 64 A 255`. **All three mtlprobe checks now pass on
+  the card.** Other processes (system UI) also send render passes to the device now; theirs carry other values at +0x4c (no texture resources
+  there) and are refused, and nothing they draw is executed.
 
 ## 6. What is implemented now (code)
 
