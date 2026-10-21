@@ -262,6 +262,18 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   the lane's own value. `air.convert.<to kind>.<to type>.<from kind>.<from type>` (kinds f, s, u) become LLVM casts, float to integer
   saturating; every kernel mixing integers and floats needs them. **On the card (2026-10-21): mtlprobe's `simd` (40 threads: a full SIMD
   group and one of 8 lanes; reductions, prefix sums, shuffles, broadcast, ballot, any/all, the indices) 0 of 432 results wrong.**
+- **M4, first look at draws (2026-10-21, measured with mtlprobe's `tri` and `drawargs`).** A render pipeline has no FIFO command of its
+  own: it is a resource (type 7, like a compute pipeline) whose descriptor starts with the same 16-byte header `{u32 tag (0xe render, 0xb
+  compute), u32 bytes, u32 its own id, u32 ?}` and continues with a list `{u8 count, count x {u8 key, u8 size, value}}`: render key 1 =
+  the vertex function's resource id, key 2 = the fragment function's, key 8 = 0x14 (not known); compute key 0 = the function (so the
+  compute rule "top byte of the fifth dword" is this list for small ids). After the list come the attachment states: 0x50 = 80 =
+  MTLPixelFormatBGRA8Unorm for colour attachment 0. `Render.setRenderPipelineState {u32 id}`. The draws are one opcode per encoding,
+  odd = compact 16-bit fields: 0x001 `{u32 primitive type, u16 vertex start, u16 count}`; 0x003 `{u16 start, u16 count, u16 instances, u16
+  type}`; 0x005 `{u16 start, u16 count, u16 instances, u16 base instance, u32 type}`; 0x007 drawIndexed `{u32 type, u32 index buffer, u16
+  count, u16 offset}` (uint16 indices; the even opcodes are the wide forms, not seen yet). Executing a draw needs the vertex function as an
+  NGG shader and the fragment function as a pixel shader: LLVM compiles an `amdgpu_gs` function with the ABI of `src/shaders/nggcol.s`
+  (`llvm.amdgcn.init.exec`, position and primitive exports) to almost the same code as the hand-written shader, and its PAL metadata gives
+  RSRC1 and the VGPR count; the draw itself can be the template stream of `src/gfx12_draw.h` with its target, viewport and draw patched.
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's

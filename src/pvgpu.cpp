@@ -182,6 +182,7 @@ public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
 	void runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
 	void runCompute(uint32_t task, uint32_t pipeline, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size);
+	void describeRenderPipeline(uint32_t task, uint32_t pipeline);
 private:
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
@@ -222,6 +223,7 @@ private:
 	bool mRtOpen { false };              // M2: this host is a client of the card's runtime
 	uint32_t mProgram[kMtlKernelCount] {};   // M3: kMtlKernels loaded into it, 0 = not yet
 	uint32_t mFnLines { 0 };              // M3: pipeline -> function lines so far
+	uint32_t mRenderPipeSeen[16] {};      // M4: (task << 16) | pipeline of the render pipelines described so far
 	Jit mJit[32] {};                     // M3: functions the helper translated, by hash (program 0: it could not); oldest replaced first
 	uint32_t mJits { 0 };
 	uint32_t mRenderLines { 0 };          // M2: render-pass and texture lines so far (other processes render every frame)
@@ -690,6 +692,11 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		t->host->runBlit(t->task, id, payload, bytes);
 	else if (id == 0x01a)
 		t->host->runRenderPass(t->task, payload, bytes);
+	else if (id == 0x074 && bytes >= 4) {   // Render.setRenderPipelineState {u32 pipeline id}
+		uint32_t pipeline;
+		memcpy(&pipeline, payload, 4);
+		t->host->describeRenderPipeline(t->task, pipeline);
+	}
 	else if (id == 0x0d0 && bytes >= 4)
 		memcpy(&t->pipeline, payload, 4);
 	else if (id == 0x0cb && bytes >= 8) {   // {u32 first index, u32 count, count x {u32 resource id, u64 offset}} (measured, docs/m1-stream.md s.5b)
@@ -1069,6 +1076,46 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 		IOFree(elf, elfLen);
 	pvlog("host: compute: \"%s\" %s by the helper (%llu bytes of metallib, %u bytes of code)", name, elf ? "translated" : "could NOT be translated", size, elfLen);
 	return j.program ? &j : nullptr;
+}
+
+// M4, first look at render pipelines: the pipeline's resource record and its whole descriptor, and the task's first resources with their
+// types (functions with their names). Each (task, pipeline) once, the first 16 of the boot.
+void RDNA4PvHost::describeRenderPipeline(uint32_t task, uint32_t pipeline) {
+	const uint32_t key = (task << 16) | (pipeline & 0xffff);
+	unsigned slot = 0;
+	while (slot < 16 && mRenderPipeSeen[slot] && mRenderPipeSeen[slot] != key)
+		slot++;
+	if (slot == 16 || mRenderPipeSeen[slot] == key)
+		return;
+	mRenderPipeSeen[slot] = key;
+	uint32_t rec[3];
+	if (pipeline && pipeline <= 0x10000 && readGuest(task, 0x1000 + 12ull * pipeline, reinterpret_cast<uint8_t *>(rec), sizeof(rec))) {
+		pvlog("host: render: task %u pipeline %u: type %u, %u-byte descriptor at 0x%x", task, pipeline, rec[0] & 0xff, rec[0] >> 8, rec[1]);
+		dumpGuest(task, rec[1], (rec[0] >> 8) < 256 ? rec[0] >> 8 : 256);
+	}
+	for (uint32_t id = 1; id <= 24; id++) {
+		uint64_t desc[8] = {};
+		uint32_t bytes = 0;
+		const uint32_t type = resourceType(task, id, desc, &bytes);
+		if (!type)
+			continue;
+		const auto *dw = reinterpret_cast<const uint32_t *>(desc);
+		char name[48] = "";
+		uint8_t head[512];
+		if (type == 6 && readGuest(task, desc[0], head, sizeof(head)) && !memcmp(head, "MTLB", 4))
+			for (size_t i = 0; i + 6 < sizeof(head); i++)
+				if (!memcmp(head + i, "NAME", 4)) {
+					uint16_t n;
+					memcpy(&n, head + i + 4, 2);
+					if (n && n < sizeof(name) && i + 6 + n <= sizeof(head)) {
+						memcpy(name, head + i + 6, n);
+						name[n] = 0;
+					}
+					break;
+				}
+		pvlog("host: render: task %u resource %u: type %u, %u bytes: %08x %08x %08x %08x %08x %08x %08x %08x %s", task, id, type, bytes, dw[0], dw[1], dw[2],
+		      dw[3], dw[4], dw[5], dw[6], dw[7], name);
+	}
 }
 
 // M3: Compute.dispatchThreads (size: threads in the grid[3], threads per threadgroup[3]), run on the card with the function translated

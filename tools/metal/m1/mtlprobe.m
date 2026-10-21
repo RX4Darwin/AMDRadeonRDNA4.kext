@@ -17,6 +17,8 @@
 //                      setBufferOffset: o[i] = 3 i below 32, 30 i above
 //   mtlprobe simd      SIMD-group functions over 40 threads in one group (a full SIMD group of 32 and one of 8), against a CPU model of
 //                      what Apple's GPU does
+//   mtlprobe tri       one triangle (vertices from vertex_id, a constant colour) drawn into a 64x64 BGRA texture cleared to black
+//   mtlprobe drawargs  draws with distinct arguments, nothing checked (for decoding the draw commands)
 //   mtlprobe render    one render pass that clears a 64x64 BGRA texture to (0.25, 0.5, 0.75, 1)
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
 //
@@ -397,6 +399,89 @@ static void simd(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	OUT("simd: %s, %d of %d results wrong (0 = executed)", ran ? "ran" : "NOT RUN", bad, N * 11 - 8);
 }
 
+static void tri(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "struct V { float4 pos [[position]]; };\n"
+	                                              "vertex V tri_v(uint vid [[vertex_id]]) { V v; v.pos = float4(vid == 0 ? -0.5 : vid == 1 ? 0.5 : 0.0, vid == 2 ? 0.5 : -0.5, 0, 1); return v; }\n"
+	                                              "fragment float4 tri_f() { return float4(1, 0.5, 0.25, 1); }"
+	                                     options:nil
+	                                       error:&err];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"tri_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"tri_f"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	OUT("tri: pipeline %s%s", ps ? "created" : "NOT created: ", ps ? "" : err.localizedDescription.UTF8String);
+	if (!ps)
+		return;
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	id<MTLBuffer> out = [d newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
+	memset(out.contents, 0x11, 64 * 64 * 4);
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = t;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe tri";
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[re endEncoding];
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 64, 1) toBuffer:out
+	      destinationOffset:0 destinationBytesPerRow:64 * 4 destinationBytesPerImage:64 * 64 * 4];
+	[e endEncoding];
+	run(cb, "tri");
+	const uint8_t *c = (const uint8_t *)out.contents + (32 * 64 + 32) * 4, *k = out.contents;
+	int lit = 0;
+	for (int i = 0; i < 64 * 64; i++)
+		lit += ((const uint8_t *)out.contents)[i * 4 + 2] == 255;
+	OUT("tri: centre B %u G %u R %u A %u, corner B %u G %u R %u, %d pixels lit (64 128 255 255, 0 0 0, 512 = executed)", c[0], c[1], c[2], c[3],
+	    k[0], k[1], k[2], lit);
+}
+
+static void drawargs(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "struct V { float4 pos [[position]]; };\n"
+	                                              "vertex V args_v(uint vid [[vertex_id]], uint iid [[instance_id]]) { V v; v.pos = float4((vid % 3) * 0.1, iid * 0.1, 0, 1); return v; }\n"
+	                                              "fragment float4 args_f() { return float4(0, 1, 0, 1); }"
+	                                     options:nil
+	                                       error:&err];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"args_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"args_f"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	if (!ps) {
+		OUT("drawargs: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = [d newTextureWithDescriptor:td];
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	id<MTLBuffer> idx = [d newBufferWithLength:64 options:MTLResourceStorageModeShared];
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe drawargs";
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:5 vertexCount:7];
+	[re drawPrimitives:MTLPrimitiveTypeLine vertexStart:2 vertexCount:6 instanceCount:3];
+	[re drawPrimitives:MTLPrimitiveTypeLineStrip vertexStart:9 vertexCount:4 instanceCount:2 baseInstance:4];
+	[re drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16 indexBuffer:idx indexBufferOffset:8];
+	[re endEncoding];
+	run(cb, "drawargs");
+}
+
 static void render(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
 	td.usage = MTLTextureUsageRenderTarget;
@@ -425,8 +510,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render"};
-			for (int i = 0; i < 11; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri"};
+			for (int i = 0; i < 12; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -471,8 +556,12 @@ int main(int argc, char **argv) {
 			simd(d, q);
 		else if (!strcmp(mode, "render"))
 			render(d, q);
+		else if (!strcmp(mode, "tri"))
+			tri(d, q);
+		else if (!strcmp(mode, "drawargs"))
+			drawargs(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, drawargs, all)", mode);
 			return 2;
 		}
 	}
