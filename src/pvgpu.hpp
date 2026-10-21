@@ -48,6 +48,8 @@ constexpr uint32_t kRegCursorKick = 0x220;  // written with the port number by D
 constexpr uint32_t kRegNumDisplays = 0x22c;  // read once by AppleParavirtGPUControl::start; 0 means one, more than 8 is clamped
 } // namespace pvgpu
 
+class RDNA4Compute;
+
 class RDNA4PvNub : public IOPCIDevice {
 	OSDeclareDefaultStructors(RDNA4PvNub)
 public:
@@ -61,6 +63,8 @@ public:
 	// GPU the nub has a PCI bridge above it, which AppleGPUWrangler requires of every GPU (it walks the providers up to an IOPCIBridge and panicked on
 	// the rig, 26.6.2, when there was none: 2026-10-17).
 	static void setLateParent(IOService *gpu);
+	// The card's runtime, for running the guest's blits on it (M2; plugin.cpp sets it where the GPU attaches).
+	static void setCompute(RDNA4Compute *compute);
 
 	// Host side: the control block of BAR0 as dwords, valid while the nub lives (the nub is never released once published).
 	volatile uint32_t *ctrl() const { return mBar0 ? reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(mBar0) + pvgpu::kCtrl) : nullptr; }

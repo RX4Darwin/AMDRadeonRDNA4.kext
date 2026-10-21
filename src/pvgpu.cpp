@@ -7,6 +7,7 @@
 
 #include "pvgpu.hpp"
 #include "pvstream.hpp"
+#include "compute.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOInterruptEventSource.h>
@@ -37,6 +38,7 @@ constexpr uint32_t kGpuCoreCount = 64;
 uint32_t gLogLines { 0 };
 RDNA4PvNub *gNub { nullptr };
 IOService *gLateParent { nullptr };   // RDNA4PvNub::setLateParent
+RDNA4Compute *gCompute { nullptr };   // RDNA4PvNub::setCompute
 
 void pvlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void pvlog(const char *fmt, ...) {
@@ -147,6 +149,12 @@ private:
 	void dumpGuest(uint32_t task, uint64_t va, uint32_t len);
 	bool readGuest(uint32_t task, uint64_t va, uint8_t *dst, uint32_t len);
 	void decodeExec(uint32_t task, uint64_t va, uint64_t len);
+	void dmaSelfTest();
+	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
+	bool dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes);
+public:
+	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
+private:
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
@@ -313,6 +321,8 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 void RDNA4PvHost::tick() {
 	if (mTicks++ < 3)
 		pvlog("host: tick %llu", mTicks);
+	if (mTicks == 1)
+		dmaSelfTest();
 	if (mIrqBits) {
 		// The real register clears on read; RAM cannot, so the bits we raised are dropped a tick later (the handler has had its chance: the driver also
 		// re-reads the stamp after every timed wait, so a missed wake-up costs at most the 1 s wait of IOAccelEventMachine2::waitForStamp).
@@ -635,12 +645,16 @@ namespace {
 struct ExecTally {
 	const char *segment;
 	uint32_t commands, unknown, lines;
+	RDNA4PvHost *host;
+	uint32_t task;
 };
 void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload, uint32_t bytes, size_t offset) {
 	auto *t = static_cast<ExecTally *>(user);
 	t->commands++;
 	if (!name)
 		t->unknown++;
+	if (id == 0x132 || id == 0x12d)
+		t->host->runBlit(t->task, id, payload, bytes);
 	if (t->lines++ >= 80)
 		return;
 	char hex[6 * 9 + 1];
@@ -668,6 +682,8 @@ void RDNA4PvHost::decodeExec(uint32_t task, uint64_t va, uint64_t len) {
 		return;
 	}
 	ExecTally t {};
+	t.host = this;
+	t.task = task;
 	uint32_t at = 0, segments = 0, undecoded = 0;
 	while (at + 8 <= n) {
 		uint32_t slen;
@@ -689,6 +705,123 @@ void RDNA4PvHost::decodeExec(uint32_t task, uint64_t va, uint64_t len) {
 	pvlog("host: stream: task %u command buffer at 0x%llx, %llu bytes: %u segment(s), %u command(s), %u unknown, %u byte(s) undecoded%s", task, va, len,
 	      segments, t.commands, t.unknown, undecoded, len > n ? " (only the first 64 KiB read)" : "");
 	IOFree(buf, n ? n : 1);
+}
+
+// M2: a buffer's GPU range, from the task's resource heap (SetResourceHeap: 1 MiB at VA 0x1000; measured on the rig, 2026-10-21): 12-byte records
+// indexed by resource id, {u32 (descriptor bytes << 8) | type, u32 descriptor address, u32 0}; a buffer (type 1) has a 16-byte descriptor
+// {u64 length, u64 page number of its start} (mtlprobe's two 4 KiB buffers: {0x1000, 0x101}, {0x1000, 0x102}).
+bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len) {
+	uint32_t rec[3];
+	uint64_t desc[2];
+	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) || (rec[0] & 0xff) != 1 ||
+	    !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(desc), sizeof(desc))) {
+		pvlog("host: blit: task %u resource %u: no buffer", task, id);
+		return false;
+	}
+	*len = desc[0];
+	*va = desc[1] << 12;
+	return desc[0] && desc[1] < (1ull << 36) && guestPfn(task, *va);
+}
+
+// M2: an SDMA fill (srcVa 0: `pattern`) or copy (from srcVa) over `bytes` of a task's GPU address space, page by page through its page table, the CPU
+// caches flushed before and after each piece (the engine does not snoop them).
+bool RDNA4PvHost::dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes) {
+	while (bytes) {
+		uint64_t n = 0x1000 - (dstVa & 0xfff);
+		if (srcVa && 0x1000 - (srcVa & 0xfff) < n)
+			n = 0x1000 - (srcVa & 0xfff);
+		if (bytes < n)
+			n = bytes;
+		const uint32_t dp = guestPfn(task, dstVa), sp = srcVa ? guestPfn(task, srcVa) : 1;
+		if (!dp || !sp)
+			return false;
+		const uint64_t dst = (static_cast<uint64_t>(dp) << 12) + (dstVa & 0xfff), src = (static_cast<uint64_t>(sp) << 12) + (srcVa & 0xfff);
+		IOMemoryDescriptor *dd = IOMemoryDescriptor::withPhysicalAddress(dst, n, kIODirectionInOut);
+		IOMemoryDescriptor *sd = srcVa ? IOMemoryDescriptor::withPhysicalAddress(src, n, kIODirectionInOut) : nullptr;
+		if (dd)
+			dd->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+		if (sd)
+			sd->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+		const bool ok = srcVa ? gCompute->sysCopy(src, dst, static_cast<uint32_t>(n)) : gCompute->sysFill(dst, pattern, static_cast<uint32_t>(n));
+		if (dd)
+			dd->performOperation(kIOMemoryIncoherentIOFlush, 0, n);
+		OSSafeReleaseNULL(dd);
+		OSSafeReleaseNULL(sd);
+		if (!ok)
+			return false;
+		dstVa += n;
+		srcVa += srcVa ? n : 0;
+		bytes -= n;
+	}
+	return true;
+}
+
+// M2: Blit.fillBuffer {u32 buffer, u64 offset, u64 length, u32 value} and Blit.copyFromBuffer {u32 source, u32 destination, u64 source offset,
+// u64 destination offset, u64 size} (measured against mtlprobe on the rig, 2026-10-21), run on the card.
+void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes) {
+	if (!gCompute)
+		return;
+	uint64_t va, len, va2, len2;
+	if (id == 0x132 && bytes >= 24) {
+		uint32_t buf, value;
+		uint64_t off, n;
+		memcpy(&buf, p, 4);
+		memcpy(&off, p + 4, 8);
+		memcpy(&n, p + 12, 8);
+		memcpy(&value, p + 20, 4);
+		const bool ok = bufferRange(task, buf, &va, &len) && off <= len && n <= len - off && !(n & 3) && !((va + off) & 3) &&
+		                dmaGuest(task, va + off, 0, (value & 0xff) * 0x01010101u, n);
+		pvlog("host: blit: fillBuffer buffer %u +0x%llx 0x%llx bytes with 0x%02x on the card: %s", buf, off, n, value & 0xff, ok ? "done" : "NOT done");
+	} else if (id == 0x12d && bytes >= 32) {
+		uint32_t src, dst;
+		uint64_t so, dof, n;
+		memcpy(&src, p, 4);
+		memcpy(&dst, p + 4, 4);
+		memcpy(&so, p + 8, 8);
+		memcpy(&dof, p + 16, 8);
+		memcpy(&n, p + 24, 8);
+		const bool ok = bufferRange(task, src, &va, &len) && bufferRange(task, dst, &va2, &len2) && so <= len && n <= len - so && dof <= len2 &&
+		                n <= len2 - dof && dmaGuest(task, va2 + dof, va + so, 0, n);
+		pvlog("host: blit: copyFromBuffer %u +0x%llx -> %u +0x%llx, 0x%llx bytes on the card: %s", src, so, dst, dof, n, ok ? "done" : "NOT done");
+	}
+}
+
+// M2: can the card write memory like the guest's (system RAM by physical address, through the AGP aperture)? Two kernel pages: SDMA fills the first
+// with 0x5a5a5a5a and copies it to the second; the CPU checks both. The caches are flushed around the transfer (without, the CPU read its own
+// zeros back: 0/1024 on the rig, 2026-10-21).
+void RDNA4PvHost::dmaSelfTest() {
+	if (!gCompute) {
+		pvlog("host: dma self-test: no runtime (the GPU has not attached)");
+		return;
+	}
+	IOBufferMemoryDescriptor *a = IOBufferMemoryDescriptor::withCapacity(4096, kIODirectionInOut, true);
+	IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::withCapacity(4096, kIODirectionInOut, true);
+	if (a && b && a->prepare() == kIOReturnSuccess && b->prepare() == kIOReturnSuccess) {
+		auto *pa = static_cast<volatile uint32_t *>(a->getBytesNoCopy());
+		auto *pb = static_cast<volatile uint32_t *>(b->getBytesNoCopy());
+		for (unsigned i = 0; i < 1024; i++)
+			pa[i] = pb[i] = 0;
+		a->performOperation(kIOMemoryIncoherentIOFlush, 0, 4096);   // the engine does not snoop the CPU's caches (seen on the rig, 2026-10-21)
+		b->performOperation(kIOMemoryIncoherentIOFlush, 0, 4096);
+		const uint64_t busA = a->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone), busB = b->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+		const bool fill = gCompute->sysFill(busA, 0x5a5a5a5a, 4096);
+		const bool copy = fill && gCompute->sysCopy(busA, busB, 4096);
+		a->performOperation(kIOMemoryIncoherentIOFlush, 0, 4096);
+		b->performOperation(kIOMemoryIncoherentIOFlush, 0, 4096);
+		unsigned goodA = 0, goodB = 0;
+		for (unsigned i = 0; i < 1024; i++) {
+			goodA += pa[i] == 0x5a5a5a5a;
+			goodB += pb[i] == 0x5a5a5a5a;
+		}
+		pvlog("host: dma self-test: pages at 0x%llx and 0x%llx: fill %s, %u/1024 dwords; copy %s, %u/1024 dwords -> %s", busA, busB, fill ? "ran" : "FAILED",
+		      goodA, copy ? "ran" : "FAILED", goodB, goodA == 1024 && goodB == 1024 ? "PASS" : "FAIL");
+		a->complete();
+		b->complete();
+	} else {
+		pvlog("host: dma self-test: no test pages");
+	}
+	OSSafeReleaseNULL(a);
+	OSSafeReleaseNULL(b);
 }
 
 // GetDeviceInfo (FIFO 0x3a): the record 0x2d names the 4 KiB buffer the host fills; the layout and the values are docs/m0-pvgpu.md "The GetDeviceInfo reply".
@@ -1674,6 +1807,7 @@ OSDefineMetaClassAndStructors(RDNA4PvLate, OSObject)
 
 void RDNA4PvNub::publishLater(uint32_t level, uint32_t delayMs) { RDNA4PvLate::schedule(level, delayMs); }
 void RDNA4PvNub::setLateParent(IOService *gpu) { gLateParent = gpu; }   // the GPU stays for the boot: no reference taken
+void RDNA4PvNub::setCompute(RDNA4Compute *compute) { gCompute = compute; }
 
 
 bool RDNA4PvNub::raiseInterrupt(int source) {

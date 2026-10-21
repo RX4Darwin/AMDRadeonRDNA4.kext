@@ -180,7 +180,15 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   as doubles) and `Blit.copyFromTexture`.
 - **`CreateComputePipeline` (FIFO 0x3b)** is `{task, pipeline ref (2, the one setComputePipelineState names), 5, 6, u64 gpu address}`; the address
   lies in a 1 MiB region committed just before, and read as zeros at that moment (where the compiled function lives is still open).
-- The host completes every command with its stamp and executes nothing: the probe's results stay unwritten (M2).
+- **The resource heap** (VA 0x1000, 1 MiB) starts with 12-byte records indexed by resource id: `{u32 (descriptor bytes << 8) | type, u32 descriptor
+  address, u32 0}`. Types seen: 1 buffer (16-byte descriptor), 6 (32 bytes, probably the function), 7 compute pipeline (24 bytes; the stream's
+  pipeline ref). A buffer's descriptor is `{u64 length, u64 page number of its start}` (mtlprobe's two 4 KiB buffers: `{0x1000, 0x101}`,
+  `{0x1000, 0x102}`). The stream names buffers by these resource ids.
+- **M2, first step: blits run on the card.** `Blit.fillBuffer` and `Blit.copyFromBuffer` are carried out with SDMA on the guest's pages, found through
+  the resource heap and the page table, reached through the GC hub's AGP aperture (grown on demand to the highest bus address needed) by
+  `RDNA4Compute::sysFill/sysCopy`. The engine does not snoop the CPU's caches: without `kIOMemoryIncoherentIOFlush` around each transfer the CPU
+  reads its stale lines (a kernel-page self-test read 0/1024 written dwords; with the flushes 1024/1024). mtlprobe's blit now reads
+  `0x5a 0x5a .. 0x5a` in its destination buffer. Everything else is still acknowledged without being done (compute and render need M3's shaders).
 
 ## 6. What is implemented now (code)
 

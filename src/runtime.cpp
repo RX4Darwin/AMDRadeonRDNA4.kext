@@ -3802,6 +3802,44 @@ bool RDNA4Compute::bounceCopy(uint64_t vram, uint32_t hostOffset, uint32_t bytes
 	return sdmaRun(pkt, Sdma::kCopyDwords, 2000);
 }
 
+// Extend the AGP aperture (and the system aperture over it, as dmaInit sets them) to reach bus address busEnd - 1, in whole GiB. amdgpu sizes it
+// to the largest free hole of the MC space; here it grows on demand from the bounce buffer's end. False without DMA, or with an IOMMU in between
+// (the bounce buffer's bus address then differs from its physical one, and a bus address names no fixed memory). Caller holds rtLock.
+bool RDNA4Compute::agpReach(uint64_t busEnd) {
+	if (!dmaReady || !busEnd || bounceBus != bounce->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone))
+		return false;
+	if (agpStart + busEnd - 1 <= agpEnd)
+		return true;
+	const uint64_t end = agpStart + ((busEnd + (1ull << 30) - 1) & ~((1ull << 30) - 1)) - 1;
+	if (end >= (1ull << 48))
+		return false;
+	wr(IpDiscovery::HwGc, GcAgpTop, static_cast<uint32_t>(end >> 24));
+	wr(IpDiscovery::HwGc, GcSysApertureHigh, static_cast<uint32_t>(end >> 18));
+	gcHubFlush();
+	RLOG("dma: AGP aperture extended to MC 0x%llx (bus addresses below 0x%llx)", end, end - agpStart + 1);
+	agpEnd = end;
+	return true;
+}
+
+// M2: one CONST_FILL / COPY_LINEAR on system memory by bus address (pvgpu.cpp runs the fake paravirtual GPU's blits with these).
+bool RDNA4Compute::sysFill(uint64_t bus, uint32_t pattern, uint32_t bytes) {
+	Locked g(rtLock);
+	if (!bytes || !agpReach(bus + bytes))
+		return false;
+	uint32_t pkt[Sdma::kFillDwords];
+	Sdma::constFill(pkt, agpStart + bus, pattern, bytes);
+	return sdmaRun(pkt, Sdma::kFillDwords, 2000);
+}
+
+bool RDNA4Compute::sysCopy(uint64_t srcBus, uint64_t dstBus, uint32_t bytes) {
+	Locked g(rtLock);
+	if (!bytes || !agpReach((srcBus > dstBus ? srcBus : dstBus) + bytes))
+		return false;
+	uint32_t pkt[Sdma::kCopyDwords];
+	Sdma::copyLinear(pkt, agpStart + srcBus, agpStart + dstBus, bytes);
+	return sdmaRun(pkt, Sdma::kCopyDwords, 2000);
+}
+
 bool RDNA4Compute::dmaInit() {
 	if (!poolCpu || !sdmaRing.sizeBytes() || !sv.fbMcTop) {
 		RLOG("dma: not set up: %s", !sdmaRing.sizeBytes() ? "no SDMA queue" : "no compute pool");
@@ -3838,7 +3876,7 @@ bool RDNA4Compute::dmaInit() {
 	//    and the system aperture extended over it. It reaches bus addresses
 	//    up to the bounce buffer's end, not all of memory.
 	agpStart = (sv.fbMcTop + (16ull << 30)) & ~((16ull << 30) - 1);
-	const uint64_t agpEnd = agpStart + bounceBus + kBounceBytes - 1;
+	agpEnd = agpStart + bounceBus + kBounceBytes - 1;
 	wr(IpDiscovery::HwGc, GcAgpBase, 0);
 	wr(IpDiscovery::HwGc, GcAgpBot, static_cast<uint32_t>(agpStart >> 24));
 	wr(IpDiscovery::HwGc, GcAgpTop, static_cast<uint32_t>(agpEnd >> 24));

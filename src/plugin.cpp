@@ -897,6 +897,8 @@ void attach(FbEntry &e) {
 		RDNA4PvNub::publish(pci, pvGpu);
 	if (pvGpu && dev.isAmd && pvDelay)
 		RDNA4PvNub::setLateParent(pci);
+	if (pvGpu && dev.isAmd)
+		RDNA4PvNub::setCompute(&st->compute);
 #endif
 
 	// Compute bring-up runs after the display is answered for, and only

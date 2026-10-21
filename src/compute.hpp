@@ -95,6 +95,10 @@ extern uint32_t rdna4TraceLevel;
 class RDNA4Compute {
 public:
 	~RDNA4Compute();
+	// The copy engine on system memory named by bus address (M2 of docs/metal-phase-plan.md: the blits of the fake paravirtual GPU, pvgpu.cpp). Under the
+	// runtime lock; false when DMA is not up, the system has an IOMMU (a bus address would then not be the physical one), or the engine did not answer.
+	bool sysFill(uint64_t bus, uint32_t pattern, uint32_t bytes);
+	bool sysCopy(uint64_t srcBus, uint64_t dstBus, uint32_t bytes);
 	// Called by the IOKit filter/action callbacks; they only inspect the
 	// writeback pointer and drain the already-programmed ring.
 	bool ihHasWork() const;
@@ -1016,6 +1020,8 @@ private:
 	uint8_t       *bounceVa { nullptr };
 	uint64_t       bounceBus { 0 };           // the device's address for it
 	uint64_t       agpStart { 0 };            // MC address of bus address 0
+	uint64_t       agpEnd { 0 };              // last MC address the AGP aperture reaches (agpReach extends it)
+	bool agpReach(uint64_t busEnd);            // make the aperture reach bus address busEnd - 1
 	bool           dmaReady { false };
 	bool           busMasterSet { false }, busMasterWas { false };
 	GpuHeap::Heap  devHeap;                   // VRAM offsets
