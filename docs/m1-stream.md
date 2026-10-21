@@ -188,7 +188,16 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   the resource heap and the page table, reached through the GC hub's AGP aperture (grown on demand to the highest bus address needed) by
   `RDNA4Compute::sysFill/sysCopy`. The engine does not snoop the CPU's caches: without `kIOMemoryIncoherentIOFlush` around each transfer the CPU
   reads its stale lines (a kernel-page self-test read 0/1024 written dwords; with the flushes 1024/1024). mtlprobe's blit now reads
-  `0x5a 0x5a .. 0x5a` in its destination buffer. Everything else is still acknowledged without being done (compute and render need M3's shaders).
+  `0x5a 0x5a .. 0x5a` in its destination buffer.
+- **The compiled function is a metallib.** A function resource (type 6) has a 32-byte descriptor whose first qword is the GPU address of a
+  standard Metal library (magic `MTLB`, 0xe20 bytes for mtlprobe's vadd), with the function's `NAME`, `TYPE` and a 32-byte `HASH` tag (vadd:
+  `552cf258b072b59d...`): the AIR reaches the host in the clear, no compiler plug-in is involved. `CreateComputePipeline`'s address is the end of
+  that library. A compute pipeline is type 7 (24 bytes, not decoded), a texture type 2 (116 bytes; the first qword is its size, 0x4000 = 64x64x4).
+- **M2, second step: a compute dispatch runs on the card** with a precompiled stand-in for the function (the plan's bootstrap before the AIR
+  compiler): `src/shaders/mtlvadd.cl`, chosen by the function's name and its three bound buffers. The host follows `setComputePipelineState`,
+  `setBuffers {u32 first index, u32 count, count x {u32 resource id, u64 offset}}` and `dispatchThreads`, copies the bound buffers into runtime
+  buffers, dispatches through the runtime as one of its clients, and writes `c` back into the guest's pages: mtlprobe's compute reads
+  `c[0] 1000 c[1] 1001 c[63] 1063` (64 threads, 30 us on the card). Render is still only acknowledged.
 
 ## 6. What is implemented now (code)
 
