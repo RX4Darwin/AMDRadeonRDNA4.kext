@@ -45,9 +45,9 @@ The host sees FIFO commands directly in guest RAM; to see operations and the str
 | 0x34 | PageBacking | `AppleParavirtResource::pageBacking` | |
 | 0x35 | SynchronizeForUnwire | `Resource::synchronizeForUnwire` | |
 | 0x36 | DeleteHostIOSurfaceBacking | `Resource::deleteHostIOSurfaceBacking` | |
-| **0x37** | **ExecIndirect** | `AppleParavirtCommandQueue::processExecIndirect` | chunks `{u32 resource id, u32 length}` (copied from the kernel command, below) |
+| **0x37** | **ExecIndirect** | `AppleParavirtCommandQueue::processExecIndirect` | `{u32 task, u32 n, n resource entries, u64 command-buffer gpu address, u64 length}` [measured on the rig, s.5b]; the resource entries are 6-7 dwords, the first the resource id |
 | **0x38** | **DefineHostTask** | `AppleParavirtTask::defineHostTask` | `{u32 task << 1, u64 address-space size, u32 page-table root PFN}` (16 bytes) |
-| **0x39** | **CommitIntoGPUPageTable** | `AppleParavirtMemoryMap::commitIntoGPUPageTable` | `{u32 task, u64 gpu address, u64 length}` (20 bytes) [field meanings INFER from the sources: task id, resource GPU address and length] |
+| **0x39** | **CommitIntoGPUPageTable** | `AppleParavirtMemoryMap::commitIntoGPUPageTable` | `{u32 task, u64 gpu address, u64 length}` (20 bytes) [measured on the rig, s.5b] |
 | **0x3a** | **GetDeviceInfo** | `AppleParavirtAccelerator::setupDeviceInfo` | record `0x2d`: `{u32 0x2d, u32 bytes/8, u32 page}` (12 bytes): *the 4 KiB buffer the host fills with the device-info blob*, then the command's signal/barrier completes it |
 | 0x3b | CreateComputePipeline | `AppleParavirtShared::createComputePipeline` | |
 | 0x3c | ReplacePhysical | `AppleParavirtResource::replacePhysical` | |
@@ -160,6 +160,27 @@ Not found as simple immediates (variable, built by helpers): render/compute **pi
 - **Memory is guest RAM described by page tables**: the host never gets data in the stream; it reads resources through the guest GPU page table (`DefineHostTask` root + `CommitIntoGPUPageTable` ranges) and the resource list of each exec.
 - **Shaders**: Metal asks `MTLCompiler` (plug-in path chosen by the bundle: `libAppleParavirtCompilerPlugin.dylib`, in the OS cryptex we could not obtain) for the "compiler output". `-[AppleParavirtFunctionVariant initWithCompilerOutput:device:functionType:]` **copies that blob** (`dispatch_data`) into a new *descriptor buffer* resource (`AppleParavirtDescriptorBuffer`, `newDescriptorBuffer:size`), then builds a 24-byte record `{u32 functionRef, u32 descriptor-buffer resource id, u64 resource address, u64 size}` and sends operation 0x0f (`newFunctionWithIR`). Pipeline states reference function refs; their descriptors are serialised into descriptor buffers likewise (`AppleParavirtRenderPipelineState` holds two). **The shader that reaches the host is a blob in guest memory named by a resource id; what the blob is (AIR bitcode wrapped by the plug-in?) is [INFER: AIR, as reims-vgpu's `metal2vulkan` host translates it; to be verified by capturing one with the stub bundle of `docs/metal-spike.md` s.12 or from a VM run].**
 - **Textures**: `serializeTextureDescriptor:`/`...2:` write the descriptor into the creation op; texture data moves through blit commands (`copyFromBuffer:...toTexture`) and the Uploads/Downloads channels [INFER].
+
+## 5b. Measured on the rig (Tahoe 26.6.2, RX 9070 XT, 2026-10-21) [measured]
+
+M0 runs on the real machine (`make PVGPU=1`, `rdna4-pvgpu=1 rdna4-pvgpu-class=0xff0000 rdna4-pvgpu-delay=120`): Apple's driver talks to our host and
+Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a compute dispatch, a render pass) and the host's log shows it:
+
+- **A task's GPU page table.** `DefineHostTask` names a root page: a header whose first dword is the page number of the top table (then 3, ...; the
+  dword at +0x18 is 4, the top table's entries for the 16 GiB space). Below it three tables of **dword** entries: top `[va >> 32]`, middle
+  `[(va >> 22) & 1023]`, leaf `[(va >> 12) & 1023]`. Leaf entries are `0x80000000 | page number` (bit 31 = mapped), upper entries bare page numbers.
+  The leaf counts match the commits exactly (a 1 MiB heap at VA 0x1000, a 128 KiB command-buffer region, one page per small buffer).
+- **Resources.** Each resource id has a fixed GPU range: `DeleteHostResourceID {task, id}` comes paired with `ReleaseFromGPUPageTable {task, va,
+  length}` (buffer 1 at 0x101000, 4 KiB). `SetResourceHeap` is `{task, 1, 0x100000}`; every task commits VA 0x1000, 1 MiB.
+- **`ExecIndirect`** carries the task, its resource list and the command buffer's GPU address and length (table in s.1). The command buffer, read
+  through the page table, is the stream of s.4 with the framing as written there: segment `{u32 length, u8 type, ...}`, commands `{u32 id, u32 size}`.
+  The probe's work decodes with **zero unknown ids and zero undecoded bytes** against `src/pvopcodes.inc`: `Blit.fillBuffer {buffer 1, offset 0,
+  length 0x1000, value 0x5a}` + `Blit.copyFromBuffer {1 -> 2, 0x1000}`; `Compute.setComputePipelineState {2}` + 3x `Compute.setBuffers {index, 1,
+  buffer, u64 offset}` + `Compute.dispatchThreads {u64 threads[3], u64 per group[3]}` (64/64); `Render.writeDescriptor` (584 bytes, the clear colour
+  as doubles) and `Blit.copyFromTexture`.
+- **`CreateComputePipeline` (FIFO 0x3b)** is `{task, pipeline ref (2, the one setComputePipelineState names), 5, 6, u64 gpu address}`; the address
+  lies in a 1 MiB region committed just before, and read as zeros at that moment (where the compiled function lives is still open).
+- The host completes every command with its stamp and executes nothing: the probe's results stay unwritten (M2).
 
 ## 6. What is implemented now (code)
 

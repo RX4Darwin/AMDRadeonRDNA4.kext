@@ -29,7 +29,8 @@ using namespace pvgpu;
 
 namespace {
 
-constexpr uint32_t kMaxLogLines = 400;
+constexpr uint32_t kLoggedCmds = 1500;    // FIFO commands logged one by one
+constexpr uint32_t kMaxLogLines = 4000;   // M1 reads the protocol from this log (docs/m1-stream.md)
 // Compute units of the card behind GpuCoreCount: RX 9070 XT (Navi 48) has 64. From the product specification, not read from the card (the kext's IP discovery
 // exposes shader-engine and render-backend counts only).
 constexpr uint32_t kGpuCoreCount = 64;
@@ -140,6 +141,12 @@ private:
 		uint32_t channel;         // 0 = root FIFO
 	};
 	void consume(const CmdSource &src, uint32_t read, uint32_t n);
+	void dumpPayload(const char *tag, const pvstream::FifoCommand &c, const uint8_t *cmd);
+	void dumpPage(const char *what, uint32_t pfn);
+	uint32_t guestPfn(uint32_t task, uint64_t va);
+	void dumpGuest(uint32_t task, uint64_t va, uint32_t len);
+	bool readGuest(uint32_t task, uint64_t va, uint8_t *dst, uint32_t len);
+	void decodeExec(uint32_t task, uint64_t va, uint64_t len);
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
@@ -174,6 +181,8 @@ private:
 	uint64_t mTicks { 0 };
 	uint32_t mCmds { 0 };               // FIFO commands decoded so far
 	uint32_t mBadHeaders { 0 };
+	uint8_t mDumped[256] {};            // M1: payload dumps per FIFO id so far
+	uint32_t mTaskRoot[64] {};          // M1: page-table root PFN per task id (DefineHostTask), for the dumps after a commit
 	uint8_t mWin[1024] {};              // one FIFO command copied out of the ring for decoding
 
 	// Display side. rdna4-pvgpu-disp: bit 0 = report the display online (fill the pipe's info, set the online event), bit 1 = ~60 Hz VBL events for pipes whose
@@ -429,7 +438,7 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 		}
 		mCmds++;
 		const bool display = c.id == 0x02 || (c.id >= 0x04 && c.id <= 0x07) || c.id == 0x1e;   // the display pipe's commands keep being shown
-		if (mCmds <= 150 || (display && mDispCmdLines++ < 60)) {
+		if (mCmds <= kLoggedCmds || (display && mDispCmdLines++ < 60)) {
 			char line[200];
 			if (c.length <= sizeof(mWin)) {
 				copy(at, mWin, c.length);
@@ -439,8 +448,50 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			}
 			pvlog("host: %s @0x%x: %s", src.tag, (read + at) % src.ringLen, line);
 		}
+		// M1: the payloads of the commands whose layout is still being worked out.
+		if (c.length <= sizeof(mWin) && (c.id == 0x33 || c.id == 0x37 || c.id == 0x3b || c.id == 0x25 || c.id == 0x28 || c.id == 0x22 || c.id == 0x38) &&
+		    mDumped[c.id] < 40) {
+			mDumped[c.id]++;
+			copy(at, mWin, c.length);
+			dumpPayload(src.tag, c, mWin);
+		}
+		if (c.id == 0x38 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 16) {
+			copy(at, mWin, c.length);
+			uint32_t task;
+			memcpy(&task, mWin + c.payloadOffset, 4);   // DefineHostTask {u32 task << 1, u64 space size, u32 page-table root PFN}
+			memcpy(&mTaskRoot[(task >> 1) & 63], mWin + c.payloadOffset + 12, 4);
+		}
+		if (c.id == 0x37 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4) {
+			copy(at, mWin, c.length);
+			uint32_t task;
+			memcpy(&task, mWin + c.payloadOffset, 4);   // ExecIndirect {u32 task, u32 n, n resource entries, u64 gpu va, u64 length} (measured 2026-10-21)
+			// the command buffer: the last two qwords of the payload, {u64 gpu va, u64 length}
+			const uint32_t plen = c.length - c.payloadOffset;
+			if (plen >= 24) {
+				uint64_t va, len;
+				memcpy(&va, mWin + c.payloadOffset + plen - 16, 8);
+				memcpy(&len, mWin + c.payloadOffset + plen - 8, 8);
+				decodeExec(task, va, len);
+			}
+		}
+		if (c.id == 0x3b && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 24 && mDumped[0x3b] <= 8) {
+			copy(at, mWin, c.length);
+			uint32_t task;
+			uint64_t va;
+			memcpy(&task, mWin + c.payloadOffset, 4);   // CreateComputePipeline {u32 task, u32 ?, u32 ?, u32 ?, u64 gpu va} (measured 2026-10-21)
+			memcpy(&va, mWin + c.payloadOffset + 16, 8);
+			dumpGuest(task, va, 256 - static_cast<uint32_t>(va & 3));
+		}
+		if (c.id == 0x39 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4 && mDumped[0x39] < 16) {
+			mDumped[0x39]++;
+			copy(at, mWin, c.length);
+			uint32_t task;
+			memcpy(&task, mWin + c.payloadOffset, 4);                 // {u32 task, u64 gpu address, u64 length}
+			dumpPayload(src.tag, c, mWin);
+			dumpPage("task page-table root after a commit", mTaskRoot[task & 63]);
+		}
 		if ((c.id == 0x30 || c.id == 0x31) && src.channel == 0 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4) {
-			if (mCmds > 150)
+			if (mCmds > kLoggedCmds)
 				copy(at, mWin, c.length);
 			uint32_t n32;
 			memcpy(&n32, mWin + c.payloadOffset, 4);
@@ -450,12 +501,12 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 				freeChannel(n32);
 		}
 		if (c.id == 0x3a && c.length <= sizeof(mWin)) {
-			if (mCmds > 150)
+			if (mCmds > kLoggedCmds)
 				copy(at, mWin, c.length);   // logged commands already sit in mWin
 			answerDeviceInfo(c, mWin);
 		}
 		if (c.id == 0x01 && c.length <= sizeof(mWin)) {
-			if (mCmds > 150)
+			if (mCmds > kLoggedCmds)
 				copy(at, mWin, c.length);
 			answerDisplaySharedState(c, mWin, src.channel);
 		}
@@ -478,6 +529,166 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 	}
 	if (haveSignal)
 		completeStamp(src.stampIndex, lastSignal);
+}
+
+// One read-only kernel mapping of guest physical memory (the map keeps the descriptor); nullptr when it cannot be made.
+static IOMemoryMap *mapPhys(IOPhysicalAddress pa, IOByteCount len) {
+	IOMemoryDescriptor *d = IOMemoryDescriptor::withPhysicalAddress(pa, len, kIODirectionIn);
+	IOMemoryMap *m = d ? d->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly) : nullptr;
+	OSSafeReleaseNULL(d);
+	return m;
+}
+
+// M1: a command's payload as dwords (up to 32), to work its layout out against what the guest asked for (tools/metal/m1/mtlprobe.m).
+void RDNA4PvHost::dumpPayload(const char *tag, const pvstream::FifoCommand &c, const uint8_t *cmd) {
+	const uint32_t bytes = c.length - c.payloadOffset, words = bytes / 4 < 32 ? bytes / 4 : 32;
+	char line[32 * 9 + 1];
+	for (uint32_t i = 0; i < words; i++) {
+		uint32_t w;
+		memcpy(&w, cmd + c.payloadOffset + i * 4, 4);
+		snprintf(line + i * 9, 10, " %08x", w);
+	}
+	line[words * 9] = 0;
+	pvlog("host: %s cmd 0x%02x payload (%u bytes):%s%s", tag, c.id, bytes, line, bytes / 4 > words ? " ..." : "");
+}
+
+// M1: the non-zero qwords of one guest page (read-only), for pages the protocol names as RAM (a task's page-table root).
+void RDNA4PvHost::dumpPage(const char *what, uint32_t pfn) {
+	if (!pfn || pfn >= (1u << 28))   // 1 TiB of physical address space at most
+		return;
+	IOMemoryMap *m = mapPhys(static_cast<IOPhysicalAddress>(pfn) << 12, 0x1000);
+	if (!m) {
+		pvlog("host: %s page 0x%x: cannot map", what, pfn);
+		return;
+	}
+	const volatile uint64_t *q = reinterpret_cast<const volatile uint64_t *>(m->getVirtualAddress());
+	char line[220];
+	int len = 0;
+	unsigned nonzero = 0;
+	for (unsigned i = 0; i < 512; i++) {
+		const uint64_t v = q[i];
+		if (!v)
+			continue;
+		if (nonzero++ < 8 && len < 180)
+			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " [%u]=%llx", i, v);
+	}
+	line[len < static_cast<int>(sizeof(line)) ? len : static_cast<int>(sizeof(line)) - 1] = 0;
+	pvlog("host: %s page 0x%x: %u non-zero qwords%s", what, pfn, nonzero, nonzero ? line : "");
+	m->release();
+}
+
+// A task's GPU page table (measured on the rig, 2026-10-21; DefineHostTask names the root): the root page is a header whose first dword is the page
+// number of the top table (then 3, ..., the dword at +0x18 = 4, the top table's entry count for the 16 GiB space); below it three tables of dwords:
+// top [va >> 32], middle [(va >> 22) & 1023], leaf [(va >> 12) & 1023]. A leaf entry is 0x80000000 | the data page's number (bit 31 = mapped),
+// the upper two levels hold bare page numbers. 0 = not mapped.
+uint32_t RDNA4PvHost::guestPfn(uint32_t task, uint64_t va) {
+	const unsigned index[4] = {0, static_cast<unsigned>(va >> 32) & 1023, static_cast<unsigned>(va >> 22) & 1023, static_cast<unsigned>(va >> 12) & 1023};
+	uint32_t pfn = mTaskRoot[task & 63];
+	for (unsigned level = 0; level < 4; level++) {
+		IOMemoryMap *m = pfn && pfn < (1u << 28) ? mapPhys(static_cast<IOPhysicalAddress>(pfn) << 12, 0x1000) : nullptr;
+		if (!m)
+			return 0;
+		pfn = reinterpret_cast<const volatile uint32_t *>(m->getVirtualAddress())[index[level]];
+		m->release();
+	}
+	return (pfn & 0x80000000u) ? pfn & 0x0fffffffu : 0;
+}
+
+// M1: `len` bytes (<= 256) of a task's GPU address space, as dwords, 16 per line.
+void RDNA4PvHost::dumpGuest(uint32_t task, uint64_t va, uint32_t len) {
+	uint32_t w[64];
+	len = len < sizeof(w) ? len : static_cast<uint32_t>(sizeof(w));
+	if (!readGuest(task, va, reinterpret_cast<uint8_t *>(w), len)) {
+		pvlog("host: task %u gpu va 0x%llx (%u bytes) is not mapped", task, va, len);
+		return;
+	}
+	pvlog("host: task %u gpu va 0x%llx, %u bytes:", task, va, len);
+	for (uint32_t i = 0; i < len / 4; i += 16) {
+		char line[16 * 9 + 1];
+		uint32_t n = 0;
+		for (uint32_t k = i; k < i + 16 && k < len / 4; k++, n++)
+			snprintf(line + n * 9, 10, " %08x", w[k]);
+		line[n * 9] = 0;
+		pvlog("host:   +0x%03x:%s", i * 4, line);
+	}
+}
+
+// M1: [va, va + len) of a task's GPU address space, page by page through its page table; false at the first page that is not mapped.
+bool RDNA4PvHost::readGuest(uint32_t task, uint64_t va, uint8_t *dst, uint32_t len) {
+	while (len) {
+		const uint32_t pfn = guestPfn(task, va), off = static_cast<uint32_t>(va & 0xfff), take = len < 0x1000 - off ? len : 0x1000 - off;
+		if (!pfn)
+			return false;
+		IOMemoryMap *m = mapPhys((static_cast<IOPhysicalAddress>(pfn) << 12) + off, take);
+		if (!m)
+			return false;
+		memcpy(dst, reinterpret_cast<const void *>(m->getVirtualAddress()), take);
+		m->release();
+		dst += take;
+		va += take;
+		len -= take;
+	}
+	return true;
+}
+
+namespace {
+struct ExecTally {
+	const char *segment;
+	uint32_t commands, unknown, lines;
+};
+void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload, uint32_t bytes, size_t offset) {
+	auto *t = static_cast<ExecTally *>(user);
+	t->commands++;
+	if (!name)
+		t->unknown++;
+	if (t->lines++ >= 80)
+		return;
+	char hex[6 * 9 + 1];
+	uint32_t n = 0;
+	for (; n < 6 && n * 4 + 4 <= bytes; n++) {
+		uint32_t w;
+		memcpy(&w, payload + n * 4, 4);
+		snprintf(hex + n * 9, 10, " %08x", w);
+	}
+	hex[n * 9] = 0;
+	pvlog("host:   stream %s +0x%zx: 0x%03x %s (%u bytes)%s%s", t->segment, offset, id, name ? name : "UNKNOWN", bytes, hex, bytes > 24 ? " ..." : "");
+}
+} // namespace
+
+// M1: one command buffer of an ExecIndirect, decoded: segments {u32 length, u8 type, u8 continuation, u8 flags, u8 0}, in them stream commands
+// {u32 id, u32 size} + payload (docs/m1-stream.md section 4; the framing and the ids measured against tools/metal/m1/mtlprobe.m on the rig, 2026-10-21).
+void RDNA4PvHost::decodeExec(uint32_t task, uint64_t va, uint64_t len) {
+	const uint32_t n = len < 0x10000 ? static_cast<uint32_t>(len) : 0x10000;
+	auto *buf = static_cast<uint8_t *>(IOMalloc(n ? n : 1));
+	if (!buf)
+		return;
+	if (!readGuest(task, va, buf, n)) {
+		pvlog("host: stream: task %u command buffer at 0x%llx (%llu bytes) is not mapped", task, va, len);
+		IOFree(buf, n ? n : 1);
+		return;
+	}
+	ExecTally t {};
+	uint32_t at = 0, segments = 0, undecoded = 0;
+	while (at + 8 <= n) {
+		uint32_t slen;
+		memcpy(&slen, buf + at, 4);
+		const uint8_t type = buf[at + 4];
+		if (slen < 8 || slen > n - at) {
+			undecoded = n - at;
+			pvlog("host:   stream: segment framing breaks at +0x%x (length %u)", at, slen);
+			break;
+		}
+		segments++;
+		t.segment = pvstream::segmentTypeName(type);
+		if (type != 5) {   // 5: the protection-options envelope, a raw u64
+			const size_t ok = pvstream::walkCommands(buf + at + 8, slen - 8, false, execSink, &t);
+			undecoded += slen - 8 - static_cast<uint32_t>(ok);
+		}
+		at += slen;
+	}
+	pvlog("host: stream: task %u command buffer at 0x%llx, %llu bytes: %u segment(s), %u command(s), %u unknown, %u byte(s) undecoded%s", task, va, len,
+	      segments, t.commands, t.unknown, undecoded, len > n ? " (only the first 64 KiB read)" : "");
+	IOFree(buf, n ? n : 1);
 }
 
 // GetDeviceInfo (FIFO 0x3a): the record 0x2d names the 4 KiB buffer the host fills; the layout and the values are docs/m0-pvgpu.md "The GetDeviceInfo reply".
