@@ -9,6 +9,8 @@
 //   mtlprobe mix       out[i] = 3 * in[i] + 100000 * group + 1000 * thread in group + group size over 100 threads in groups of 32 (the
 //                      last group has 4, and Metal reports 4 as its size); a kernel that is not in the kext's table: it runs only if
 //                      translated at run time
+//   mtlprobe two       two kernels of one library in one command buffer: out[i] = in[i] + 1, then out[i] *= 3 (64 threads)
+//   mtlprobe twolib    the same with two libraries of one kernel each: out[i] = in[i] + 7, then out[i] *= out[i]
 //   mtlprobe render    one render pass that clears a 64x64 BGRA texture to (0.25, 0.5, 0.75, 1)
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
 //
@@ -151,6 +153,45 @@ static void mix(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	OUT("mix: out[0] %u out[33] %u out[99] %u, %d of %d wrong (32 101131 303301, 0 wrong = executed)", po[0], po[33], po[99], wrong, N);
 }
 
+// Two pipelines in one command buffer: first(in -> out), then second(out in place); 64 threads; check(i) is out[i]'s expected value.
+static void pair(id<MTLDevice> d, id<MTLCommandQueue> q, const char *what, NSArray<NSString *> *sources, NSString *first, NSString *second,
+                 uint32_t (^check)(uint32_t)) {
+	NSError *err = nil;
+	id<MTLComputePipelineState> ps[2] = {nil, nil};
+	NSString *names[2] = {first, second};
+	for (int k = 0; k < 2; k++) {
+		id<MTLLibrary> lib = [d newLibraryWithSource:sources[sources.count == 2 ? k : 0] options:nil error:&err];
+		ps[k] = lib ? [d newComputePipelineStateWithFunction:[lib newFunctionWithName:names[k]] error:&err] : nil;
+		if (!ps[k]) {
+			OUT("%s: pipeline %s NOT created: %s", what, names[k].UTF8String, err.localizedDescription.UTF8String);
+			return;
+		}
+	}
+	enum { N = 64 };
+	id<MTLBuffer> in = [d newBufferWithLength:N * 4 options:MTLResourceStorageModeShared], out = [d newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
+	uint32_t *pi = in.contents, *po = out.contents;
+	for (uint32_t i = 0; i < N; i++) {
+		pi[i] = i;
+		po[i] = 0xffffffff;
+	}
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = [NSString stringWithFormat:@"mtlprobe %s", what];
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+	[e setComputePipelineState:ps[0]];
+	[e setBuffer:in offset:0 atIndex:0];
+	[e setBuffer:out offset:0 atIndex:1];
+	[e dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(N, 1, 1)];
+	[e setComputePipelineState:ps[1]];
+	[e setBuffer:out offset:0 atIndex:0];
+	[e dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(N, 1, 1)];
+	[e endEncoding];
+	run(cb, what);
+	int wrong = 0;
+	for (uint32_t i = 0; i < N; i++)
+		wrong += po[i] != check(i);
+	OUT("%s: out[0] %u out[63] %u, %d of %d wrong (%u %u, 0 wrong = executed)", what, po[0], po[63], wrong, N, check(0), check(63));
+}
+
 static void render(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
 	td.usage = MTLTextureUsageRenderTarget;
@@ -179,8 +220,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "render"};
-			for (int i = 0; i < 6; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "render"};
+			for (int i = 0; i < 8; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -207,10 +248,20 @@ int main(int argc, char **argv) {
 			grid(d, q);
 		else if (!strcmp(mode, "mix"))
 			mix(d, q);
+		else if (!strcmp(mode, "two"))
+			pair(d, q, "two",
+			     @[ (@"kernel void add1(device const uint *in [[buffer(0)]], device uint *out [[buffer(1)]], uint i [[thread_position_in_grid]]) { out[i] = in[i] + 1; }\n"
+			         "kernel void mul3(device uint *io [[buffer(0)]], uint i [[thread_position_in_grid]]) { io[i] *= 3; }") ],
+			     @"add1", @"mul3", ^uint32_t(uint32_t i) { return (i + 1) * 3; });
+		else if (!strcmp(mode, "twolib"))
+			pair(d, q, "twolib",
+			     @[ @"kernel void inc7(device const uint *in [[buffer(0)]], device uint *out [[buffer(1)]], uint i [[thread_position_in_grid]]) { out[i] = in[i] + 7; }",
+			        @"kernel void square(device uint *io [[buffer(0)]], uint i [[thread_position_in_grid]]) { io[i] *= io[i]; }" ],
+			     @"inc7", @"square", ^uint32_t(uint32_t i) { return (i + 7) * (i + 7); });
 		else if (!strcmp(mode, "render"))
 			render(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, render, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, render, all)", mode);
 			return 2;
 		}
 	}

@@ -231,6 +231,14 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   each on the card.** Open: one boot before that run froze with a panic in `AppleGPUWrangler` (null pointer in its work loop, 2 s after the
   host publishes the fake GPU at `rdna4-pvgpu-delay`); the next boot with the same kext did not; that boot also lit only the DP display, at
   another resolution, before the host started. The helper parses data from Metal clients as root: sandbox it before it is on by default.
+- **M3, third step: several pipelines per process.** A compute pipeline's resource (type 7) has a 24-byte descriptor `{u32 0xb, u32 24, u32
+  its own id, u32 7, u32 (function id << 24) | 0x040001, u32 0}` (pipelines 2 and 4 of one process: 0x01040001 and 0x03040001, their
+  functions are resources 1 and 3; ids above 255 not seen). A function's descriptor is `{u64 metallib address, u32 metallib bytes, u32 0xf,
+  u32 0x14, u32 its own id, ...}`, and each function has a metallib of its own even when the source library has several kernels (add1 at
+  0x101000, 0xd70 bytes, mul3 right after it at 0x101d70). `CreateComputePipeline {u32 task, u32 pipeline id, u32 5, u32 6, u64 address}`
+  does not name the function (5 and 6 for every pipeline). **On the card (2026-10-21): mtlprobe's `two` (two kernels of one library) and
+  `twolib` (two libraries) each run two pipelines back to back in one command buffer, all four kernels translated at run time: both
+  `0 of 64 wrong`.**
 
 ## 6. What is implemented now (code)
 

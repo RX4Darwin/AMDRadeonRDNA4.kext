@@ -169,7 +169,8 @@ private:
 	bool readGuest(uint32_t task, uint64_t va, uint8_t *dst, uint32_t len) { return copyGuest(task, va, dst, len, false); }
 	void decodeExec(uint32_t task, uint64_t va, uint64_t len);
 	void dmaSelfTest();
-	bool functionOf(uint32_t task, char *name, size_t nameCap, uint8_t hash[32], uint64_t *lib);
+	bool functionOf(uint32_t task, uint32_t pipeline, char *name, size_t nameCap, uint8_t hash[32], uint64_t *lib);
+	uint32_t resourceType(uint32_t task, uint32_t id, uint64_t *desc = nullptr, uint32_t *bytes = nullptr);
 	uint32_t load(const uint8_t *elf, uint32_t size, const char *name);
 	uint32_t program(unsigned kernel);
 	struct Jit { uint8_t hash[32]; uint32_t program, buffers, written; };
@@ -180,7 +181,7 @@ private:
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
 	void runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
-	void runCompute(uint32_t task, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size);
+	void runCompute(uint32_t task, uint32_t pipeline, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size);
 private:
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
@@ -220,6 +221,7 @@ private:
 	uint32_t mTaskRoot[64] {};          // M1: page-table root PFN per task id (DefineHostTask), for the dumps after a commit
 	bool mRtOpen { false };              // M2: this host is a client of the card's runtime
 	uint32_t mProgram[kMtlKernelCount] {};   // M3: kMtlKernels loaded into it, 0 = not yet
+	uint32_t mFnLines { 0 };              // M3: pipeline -> function lines so far
 	Jit mJit[32] {};                     // M3: functions the helper translated, by hash (program 0: it could not); oldest replaced first
 	uint32_t mJits { 0 };
 	uint32_t mRenderLines { 0 };          // M2: render-pass and texture lines so far (other processes render every frame)
@@ -518,14 +520,6 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 				decodeExec(task, va, len);
 			}
 		}
-		if (c.id == 0x3b && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 24 && mDumped[0x3b] <= 8) {
-			copy(at, mWin, c.length);
-			uint32_t task;
-			uint64_t va;
-			memcpy(&task, mWin + c.payloadOffset, 4);   // CreateComputePipeline {u32 task, u32 ?, u32 ?, u32 ?, u64 gpu va} (measured 2026-10-21)
-			memcpy(&va, mWin + c.payloadOffset + 16, 8);
-			dumpGuest(task, va, 256 - static_cast<uint32_t>(va & 3));
-		}
 		if (c.id == 0x39 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4 && mDumped[0x39] < 16) {
 			mDumped[0x39]++;
 			copy(at, mWin, c.length);
@@ -709,7 +703,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 	} else if (id == 0x0ca && bytes >= 48) {   // Compute.dispatchThreads {u64 threads[3], u64 per group[3]}
 		uint64_t size[6];
 		memcpy(size, payload, sizeof(size));
-		t->host->runCompute(t->task, t->buffer, t->offset, size);
+		t->host->runCompute(t->task, t->pipeline, t->buffer, t->offset, size);
 	}
 	if (t->lines++ >= 80)
 		return;
@@ -917,35 +911,84 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 
 // M2: the task's function: its one type-6 resource (several are not told apart yet), whose 32-byte descriptor starts with the GPU address of a
 // metallib ('MTLB', measured 2026-10-21); the function's NAME and HASH tags from that library's first KiB.
-bool RDNA4PvHost::functionOf(uint32_t task, char *name, size_t nameCap, uint8_t hash[32], uint64_t *libOut) {
-	uint64_t lib = 0;
-	unsigned found = 0;
-	for (uint32_t id = 1; id <= 64; id++) {
-		uint32_t rec[3];
-		uint64_t desc[2];
-		if (readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) && (rec[0] & 0xff) == 6 &&
-		    readGuest(task, rec[1], reinterpret_cast<uint8_t *>(desc), sizeof(desc)) && found++ == 0)
-			lib = desc[0];
+// A resource's type from the task's heap (records at 0x1000 + 12 * id: {(descriptor bytes << 8) | type, u64 descriptor address}), 0 if
+// none; with desc, its descriptor's first 64 bytes (and their count in bytes).
+uint32_t RDNA4PvHost::resourceType(uint32_t task, uint32_t id, uint64_t *desc, uint32_t *bytes) {
+	uint32_t rec[3];
+	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
+		return 0;
+	const uint32_t n = (rec[0] >> 8) < 64 ? rec[0] >> 8 : 64;
+	if (desc && (!n || !readGuest(task, rec[1] | static_cast<uint64_t>(rec[2]) << 32, reinterpret_cast<uint8_t *>(desc), n)))
+		return 0;
+	if (bytes)
+		*bytes = n;
+	return rec[0] & 0xff;
+}
+
+// M3: the Metal function a compute pipeline runs: its name and hash from the metallib (tags {char[4], u16 length, bytes} per function, NAME
+// then HASH), and the metallib's address. The pipeline's descriptor names the function (measured 2026-10-21, docs/m1-stream.md s.5b):
+// {u32 0xb, u32 bytes (24), u32 its own id, u32 7, u32 (function id << 24) | 0x040001, u32 0}; seen with function ids 1 and 3 only, so an id
+// above 255 is not known to fit. Else the task's only function. Each function has a metallib of its own (measured); one holding several
+// is refused.
+bool RDNA4PvHost::functionOf(uint32_t task, uint32_t pipeline, char *name, size_t nameCap, uint8_t hash[32], uint64_t *libOut) {
+	const bool talk = mFnLines < 40;
+	uint32_t fn = 0;
+	const char *rule = "";
+	uint64_t desc[8] = {};
+	uint32_t bytes = 0;
+	if (resourceType(task, pipeline, desc, &bytes) == 7 && bytes >= 20) {
+		const auto *dw = reinterpret_cast<const uint32_t *>(desc);
+		if (talk)
+			pvlog("host: compute: pipeline %u descriptor (%u bytes): %08x %08x %08x %08x %08x %08x", pipeline, bytes, dw[0], dw[1], dw[2], dw[3], dw[4], dw[5]);
+		if (resourceType(task, dw[4] >> 24) == 6) {
+			fn = dw[4] >> 24;
+			rule = "named by the pipeline";
+		}
 	}
-	uint8_t head[1024];
-	if (found != 1 || !readGuest(task, lib, head, sizeof(head)) || memcmp(head, "MTLB", 4)) {
-		pvlog("host: compute: task %u: %u function(s), no single metallib", task, found);
+	if (!fn) {
+		unsigned found = 0;
+		for (uint32_t id = 1; id <= 64; id++)
+			if (resourceType(task, id) == 6 && found++ == 0)
+				fn = id;
+		rule = "the task's only function";
+		if (found != 1)
+			fn = 0;
+	}
+	if (!fn || resourceType(task, fn, desc, &bytes) != 6) {
+		pvlog("host: compute: task %u pipeline %u: no function found", task, pipeline);
 		return false;
 	}
+	if (talk) {
+		mFnLines += 3;
+		const auto *dw = reinterpret_cast<const uint32_t *>(desc);
+		pvlog("host: compute: pipeline %u -> function %u (%s), descriptor: %08x %08x %08x %08x %08x %08x %08x %08x", pipeline, fn, rule, dw[0], dw[1],
+		      dw[2], dw[3], dw[4], dw[5], dw[6], dw[7]);
+	}
+	const uint64_t lib = desc[0];
+	uint8_t head[1024];
+	if (!readGuest(task, lib, head, sizeof(head)) || memcmp(head, "MTLB", 4)) {
+		pvlog("host: compute: task %u function %u: no metallib at 0x%llx", task, fn, lib);
+		return false;
+	}
+	unsigned names = 0;
 	name[0] = 0;
 	memset(hash, 0, 32);
 	for (size_t i = 0; i + 6 < sizeof(head); i++) {   // tags: {char[4] tag, u16 length, bytes}
 		uint16_t n;
 		memcpy(&n, head + i + 4, 2);
-		if (!memcmp(head + i, "NAME", 4) && n && n < nameCap && i + 6 + n <= sizeof(head) && !name[0]) {
+		if (!memcmp(head + i, "NAME", 4) && n && n < nameCap && i + 6 + n <= sizeof(head) && names++ == 0) {
 			memcpy(name, head + i + 6, n);
 			name[n] = 0;
-		} else if (!memcmp(head + i, "HASH", 4) && n == 32 && i + 6 + 32 <= sizeof(head)) {
+		} else if (!memcmp(head + i, "HASH", 4) && n == 32 && i + 6 + 32 <= sizeof(head) && names == 1) {
 			memcpy(hash, head + i + 6, 32);
 		}
 	}
+	if (names != 1) {
+		pvlog("host: compute: task %u function %u: the metallib holds %u functions, not one: not run", task, fn, names);
+		return false;
+	}
 	*libOut = lib;
-	return name[0] != 0;
+	return true;
 }
 
 // A code object loaded into the card's runtime: its program, or 0.
@@ -1023,12 +1066,12 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 // M3: Compute.dispatchThreads (size: threads in the grid[3], threads per threadgroup[3]), run on the card with the function translated
 // AIR -> gfx1201 (at run time by the helper, or ahead of time into src/mtlkernels.h by tools/metal/m3). Each bound buffer, from its offset
 // to its end, is copied into a runtime buffer, the kernel dispatched, and the buffers it writes copied back into the guest's pages.
-void RDNA4PvHost::runCompute(uint32_t task, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size) {
+void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size) {
 	static constexpr uint64_t kMaxBuffer = 64ull << 20;   // ponytail: staged through one kernel allocation; map the guest pages if bigger is needed
 	char name[64];
 	uint8_t hash[32];
 	uint64_t lib = 0;
-	if (!functionOf(task, name, sizeof(name), hash, &lib))
+	if (!functionOf(task, pipeline, name, sizeof(name), hash, &lib))
 		return;
 	pvlog("host: compute: task %u dispatches \"%s\" (hash %02x%02x%02x%02x%02x%02x%02x%02x...), %llu x %llu x %llu threads in groups of %llu x %llu x %llu",
 	      task, name, hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], size[0], size[1], size[2], size[3], size[4], size[5]);
