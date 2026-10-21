@@ -11,6 +11,8 @@
 //                      translated at run time
 //   mtlprobe two       two kernels of one library in one command buffer: out[i] = in[i] + 1, then out[i] *= 3 (64 threads)
 //   mtlprobe twolib    the same with two libraries of one kernel each: out[i] = in[i] + 7, then out[i] *= out[i]
+//   mtlprobe feat      one kernel per Metal language feature (constant buffers, math, threadgroup memory and barriers, atomics, local
+//                      arrays, integer functions, half), each checked against the CPU
 //   mtlprobe render    one render pass that clears a 64x64 BGRA texture to (0.25, 0.5, 0.75, 1)
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
 //
@@ -192,6 +194,128 @@ static void pair(id<MTLDevice> d, id<MTLCommandQueue> q, const char *what, NSArr
 	OUT("%s: out[0] %u out[63] %u, %d of %d wrong (%u %u, 0 wrong = executed)", what, po[0], po[63], wrong, N, check(0), check(63));
 }
 
+// One kernel `name` from `src` over n threads in groups of g, with the given buffers at indices 0, 1, ...; false if it did not run.
+static bool runKernel(id<MTLDevice> d, id<MTLCommandQueue> q, NSString *src, NSString *name, NSArray<id<MTLBuffer>> *buffers, NSUInteger n, NSUInteger g) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:[@"#include <metal_stdlib>\nusing namespace metal;\n" stringByAppendingString:src] options:nil error:&err];
+	id<MTLComputePipelineState> ps = lib ? [d newComputePipelineStateWithFunction:[lib newFunctionWithName:name] error:&err] : nil;
+	if (!ps) {
+		OUT("feat: %s: NOT compiled: %s", name.UTF8String, err.localizedDescription.UTF8String);
+		return false;
+	}
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+	[e setComputePipelineState:ps];
+	for (NSUInteger k = 0; k < buffers.count; k++)
+		[e setBuffer:buffers[k] offset:0 atIndex:k];
+	[e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(g, 1, 1)];
+	[e endEncoding];
+	dispatch_semaphore_t done = dispatch_semaphore_create(0);
+	[cb addCompletedHandler:^(id<MTLCommandBuffer> b) { (void)b; dispatch_semaphore_signal(done); }];
+	[cb commit];
+	return dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0;
+}
+
+static void feat(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	id<MTLBuffer> (^buf)(NSUInteger) = ^(NSUInteger bytes) { return [d newBufferWithLength:bytes options:MTLResourceStorageModeShared]; };
+	int failed = 0;
+	// Each check: the kernel's output against the CPU's, exactly or (fast math) within a relative 1e-3.
+	void (^report)(const char *, BOOL, int, double, double) = ^(const char *what, BOOL ran, int bad, double got, double want) {
+		OUT("feat: %-12s %s (first wrong: got %g, want %g)", what, !ran ? "NOT RUN" : bad ? "WRONG" : "ok", got, want);
+	};
+	{   // constant reference
+		id<MTLBuffer> o = buf(256), k = buf(4);
+		float *po = o.contents;
+		for (int i = 0; i < 64; i++) po[i] = i;
+		*(float *)k.contents = 2.5f;
+		BOOL ran = runKernel(d, q, @"kernel void constref(device float *o [[buffer(0)]], constant float &k [[buffer(1)]], uint i [[thread_position_in_grid]]) { o[i] *= k; }", @"constref", @[o, k], 64, 64);
+		int bad = 0; double got = 0, want = 0;
+		for (int i = 0; i < 64; i++) if (po[i] != i * 2.5f && !bad++) { got = po[i]; want = i * 2.5f; }
+		report("constref", ran, bad, got, want); failed += !ran || bad;
+	}
+	{   // constant struct
+		id<MTLBuffer> o = buf(256), p = buf(8);
+		float *po = o.contents;
+		for (int i = 0; i < 64; i++) po[i] = i;
+		((float *)p.contents)[0] = 0.5f; ((uint32_t *)p.contents)[1] = 40;
+		BOOL ran = runKernel(d, q, @"struct P { float a; uint n; }; kernel void conststruct(device float *o [[buffer(0)]], constant P &p [[buffer(1)]], uint i [[thread_position_in_grid]]) { if (i < p.n) o[i] += p.a; }", @"conststruct", @[o, p], 64, 64);
+		int bad = 0; double got = 0, want = 0;
+		for (int i = 0; i < 64; i++) { float w = i < 40 ? i + 0.5f : i; if (po[i] != w && !bad++) { got = po[i]; want = w; } }
+		report("conststruct", ran, bad, got, want); failed += !ran || bad;
+	}
+	{   // constant array
+		id<MTLBuffer> o = buf(256), t = buf(32);
+		float *po = o.contents, *pt = t.contents;
+		for (int i = 0; i < 8; i++) pt[i] = 10 + i;
+		BOOL ran = runKernel(d, q, @"kernel void constptr(device float *o [[buffer(0)]], constant float *t [[buffer(1)]], uint i [[thread_position_in_grid]]) { o[i] = t[i & 7]; }", @"constptr", @[o, t], 64, 64);
+		int bad = 0; double got = 0, want = 0;
+		for (int i = 0; i < 64; i++) if (po[i] != 10 + (i & 7) && !bad++) { got = po[i]; want = 10 + (i & 7); }
+		report("constptr", ran, bad, got, want); failed += !ran || bad;
+	}
+	{   // math (fast math, Metal's default)
+		id<MTLBuffer> o = buf(256);
+		float *po = o.contents, x[64];
+		for (int i = 0; i < 64; i++) po[i] = x[i] = 0.5f + i / 16.0f;
+		BOOL ran = runKernel(d, q, @"kernel void math(device float *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { float x = o[i]; o[i] = sqrt(x) + exp(x) + sin(x) + pow(x, 1.5f) + fabs(x) + max(x, 2.0f) + floor(x) + rsqrt(x) + log2(x); }", @"math", @[o], 64, 64);
+		int bad = 0; double got = 0, want = 0;
+		for (int i = 0; i < 64; i++) {
+			double v = x[i], w = sqrt(v) + exp(v) + sin(v) + pow(v, 1.5) + fabs(v) + fmax(v, 2.0) + floor(v) + 1 / sqrt(v) + log2(v);
+			if (fabs(po[i] - w) > 1e-3 * fabs(w) && !bad++) { got = po[i]; want = w; }
+		}
+		report("math", ran, bad, got, want); failed += !ran || bad;
+	}
+	{   // threadgroup memory and barriers: sums of 64 in a tree
+		id<MTLBuffer> in = buf(1024), o = buf(16);
+		float *pi = in.contents, *po = o.contents;
+		for (int i = 0; i < 256; i++) pi[i] = i;
+		BOOL ran = runKernel(d, q, @"kernel void tgreduce(device const float *in [[buffer(0)]], device float *o [[buffer(1)]], uint t [[thread_position_in_threadgroup]], uint g [[threadgroup_position_in_grid]], uint i [[thread_position_in_grid]]) {"
+		                           " threadgroup float s[64]; s[t] = in[i]; threadgroup_barrier(mem_flags::mem_threadgroup);"
+		                           " for (uint k = 32; k > 0; k >>= 1) { if (t < k) s[t] += s[t + k]; threadgroup_barrier(mem_flags::mem_threadgroup); }"
+		                           " if (t == 0) o[g] = s[0]; }", @"tgreduce", @[in, o], 256, 64);
+		int bad = 0; double got = 0, want = 0;
+		for (int g = 0; g < 4; g++) { double w = 64 * 64 * g + 63 * 32; if (po[g] != w && !bad++) { got = po[g]; want = w; } }
+		report("tgreduce", ran, bad, got, want); failed += !ran || bad;
+	}
+	{   // device atomics
+		id<MTLBuffer> c = buf(4);
+		*(uint32_t *)c.contents = 0;
+		BOOL ran = runKernel(d, q, @"kernel void atomics(device atomic_uint *c [[buffer(0)]], uint i [[thread_position_in_grid]]) { atomic_fetch_add_explicit(c, i, memory_order_relaxed); }", @"atomics", @[c], 256, 64);
+		uint32_t got = *(uint32_t *)c.contents;
+		report("atomics", ran, got != 32640, got, 32640); failed += !ran || got != 32640;
+	}
+	{   // local array, indexed by data
+		id<MTLBuffer> in = buf(256), o = buf(256);
+		uint32_t *pi = in.contents, *po = o.contents;
+		for (int i = 0; i < 64; i++) pi[i] = i * 3;
+		BOOL ran = runKernel(d, q, @"kernel void localarr(device const uint *in [[buffer(0)]], device uint *o [[buffer(1)]], uint i [[thread_position_in_grid]]) { uint a[16]; for (int k = 0; k < 16; k++) a[k] = in[(i + k) & 63]; o[i] = a[in[i] & 15]; }", @"localarr", @[in, o], 64, 64);
+		int bad = 0; double got = 0, want = 0;
+		for (int i = 0; i < 64; i++) { uint32_t w = pi[(i + (pi[i] & 15)) & 63]; if (po[i] != w && !bad++) { got = po[i]; want = w; } }
+		report("localarr", ran, bad, got, want); failed += !ran || bad;
+	}
+	{   // integer functions
+		id<MTLBuffer> o = buf(256);
+		int32_t *po = o.contents, x[64];
+		for (int i = 0; i < 64; i++) po[i] = x[i] = i * 37 - 1000;
+		BOOL ran = runKernel(d, q, @"kernel void ints(device int *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { int x = o[i]; o[i] = x / 7 + x % 5 + popcount(x) + clz(x) + (int)((uint)x >> 3) + min(x, 9) + abs(x); }", @"ints", @[o], 64, 64);
+		int bad = 0; double got = 0, want = 0;
+		for (int i = 0; i < 64; i++) {
+			int32_t v = x[i], w = v / 7 + v % 5 + __builtin_popcount((uint32_t)v) + __builtin_clz((uint32_t)v) + (int32_t)((uint32_t)v >> 3) + (v < 9 ? v : 9) + (v < 0 ? -v : v);
+			if (po[i] != w && !bad++) { got = po[i]; want = w; }
+		}
+		report("ints", ran, bad, got, want); failed += !ran || bad;
+	}
+	{   // half
+		id<MTLBuffer> o = buf(128);
+		_Float16 *po = o.contents;
+		for (int i = 0; i < 64; i++) po[i] = (_Float16)(i * 0.25f);
+		BOOL ran = runKernel(d, q, @"kernel void halfs(device half *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = o[i] * 2.0h + 1.0h; }", @"halfs", @[o], 64, 64);
+		int bad = 0; double got = 0, want = 0;
+		for (int i = 0; i < 64; i++) { float w = i * 0.5f + 1; if ((float)po[i] != w && !bad++) { got = po[i]; want = w; } }
+		report("halfs", ran, bad, got, want); failed += !ran || bad;
+	}
+	OUT("feat: %d of 9 wrong or not run (0 = executed)", failed);
+}
+
 static void render(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
 	td.usage = MTLTextureUsageRenderTarget;
@@ -220,8 +344,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "render"};
-			for (int i = 0; i < 8; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "render"};
+			for (int i = 0; i < 9; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -258,10 +382,12 @@ int main(int argc, char **argv) {
 			     @[ @"kernel void inc7(device const uint *in [[buffer(0)]], device uint *out [[buffer(1)]], uint i [[thread_position_in_grid]]) { out[i] = in[i] + 7; }",
 			        @"kernel void square(device uint *io [[buffer(0)]], uint i [[thread_position_in_grid]]) { io[i] *= io[i]; }" ],
 			     @"inc7", @"square", ^uint32_t(uint32_t i) { return (i + 7) * (i + 7); });
+		else if (!strcmp(mode, "feat"))
+			feat(d, q);
 		else if (!strcmp(mode, "render"))
 			render(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, render, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, render, all)", mode);
 			return 2;
 		}
 	}

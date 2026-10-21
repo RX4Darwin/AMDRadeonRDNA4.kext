@@ -239,6 +239,17 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   does not name the function (5 and 6 for every pipeline). **On the card (2026-10-21): mtlprobe's `two` (two kernels of one library) and
   `twolib` (two libraries) each run two pipelines back to back in one command buffer, all four kernels translated at run time: both
   `0 of 64 wrong`.**
+- **M3, fourth step: the common parts of the language.** Before code generation the translator inlines the AIR function into the
+  kernel, drops the module's other kernels (one unsupported kernel no longer sinks the rest) and legalises the body (`legalize()` in
+  `tools/metal/m3/air2amdgpu.cpp`): AIR's constant address space (2) is AMDGPU's GDS, so constant buffers become global memory again; local
+  arrays move to address space 5 (they must stay out of scratch, which the runtime does not give kernels: LLVM keeps small ones in
+  registers); `air.*` calls (Metal compiles with fast math, so `air.fast_sqrt.f32` and the like) become LLVM intrinsics, `pow` becomes
+  `exp2(y log2 x)`, `rsqrt` `1 / sqrt`; `air.wg.barrier(flags, scope)` becomes fence, `s_barrier`, fence; `air.atomic.{global,local}.<op>`
+  becomes `atomicrmw` (relaxed, device or workgroup scope). Threadgroup memory is address space 3 on both sides. Refused by name for now:
+  SIMD-group functions (`air.simd_sum`...), constant tables in AIR's constant address space, anything else unmapped. **On the card
+  (2026-10-21): mtlprobe's `feat`, nine kernels (constant reference, struct and array, math, a threadgroup reduction with barriers, device
+  atomics, a local array indexed by data, integer functions, half), all translated at run time and equal to the CPU's results.** Not
+  decoded yet: `setBytes` (inline constants), a common way to pass small constants.
 
 ## 6. What is implemented now (code)
 

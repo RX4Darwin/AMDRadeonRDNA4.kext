@@ -13,11 +13,14 @@
 //   +8 * N       u32 threads per threadgroup x, y, z
 //   +8 * N + 12  u32 threads in the grid x, y, z (threads past it do nothing: dispatchThreads need not fill whole groups)
 // It computes the AIR function's position arguments from the work-group and work-item ids and calls the AIR function, inlined.
-// Supported so far: device buffers (address space 1) and the arguments thread_position_in_grid, thread_position_in_threadgroup,
-// threadgroup_position_in_grid, threads_per_threadgroup and threads_per_grid, as uint, uint2 or uint3. Anything else is reported and refused.
+// Supported so far: device and constant buffers, the arguments thread_position_in_grid, thread_position_in_threadgroup,
+// threadgroup_position_in_grid, threads_per_threadgroup and threads_per_grid (uint, uint2 or uint3), threadgroup memory and barriers, local
+// arrays (as long as LLVM keeps them out of scratch memory, which the kext's runtime does not give kernels), device and threadgroup atomic
+// read-modify-writes, and the math and integer functions of legalize() below. Anything else is reported and refused.
 #include "lld/Common/Driver.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -33,6 +36,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <IOKit/IOKitLib.h>
 #include <map>
 #include <string>
@@ -108,6 +112,110 @@ static Value *asType(IRBuilder<> &b, Type *t, Value *const xyz[3]) {
 	return r;
 }
 
+// What AIR leaves in the inlined kernel that AMDGPU does not take, rewritten; the reason when something cannot be.
+//  - AIR's constant address space (2) is AMDGPU's GDS: constant buffers become global memory (1) again.
+//  - local arrays: AMDGPU's allocas live in address space 5 (private), seen through a flat pointer.
+//  - air.* functions: LLVM intrinsics, fences and barriers, atomics.
+static std::string legalize(Function &k) {
+	LLVMContext &ctx = k.getContext();
+	PointerType *global = PointerType::get(ctx, 1);
+	SmallVector<Instruction *, 32> gone;
+	for (Instruction &i : instructions(k)) {
+		for (Use &u : i.operands())
+			if (u->getType()->isPointerTy() && u->getType()->getPointerAddressSpace() == 2) {
+				if (isa<ConstantPointerNull>(u.get()) || isa<UndefValue>(u.get()))
+					u.set(isa<ConstantPointerNull>(u.get()) ? static_cast<Value *>(ConstantPointerNull::get(global)) : PoisonValue::get(global));
+				else if (isa<Constant>(u.get()))
+					return "data in AIR's constant address space (a constant table) is not supported yet";
+			}
+		if (i.getType()->isPointerTy() && i.getType()->getPointerAddressSpace() == 2)
+			i.mutateType(global);
+	}
+	for (Instruction &i : instructions(k))
+		if (auto *c = dyn_cast<AddrSpaceCastInst>(&i); c && c->getSrcAddressSpace() == c->getDestAddressSpace()) {
+			c->replaceAllUsesWith(c->getOperand(0));
+			gone.push_back(c);
+		} else if (auto *m = dyn_cast<MemTransferInst>(&i); m && m->getRawSource()->getType() != m->getCalledFunction()->getArg(1)->getType()) {
+			IRBuilder<> b(m);
+			b.CreateMemCpy(m->getRawDest(), m->getDestAlign(), m->getRawSource(), m->getSourceAlign(), m->getLength(), m->isVolatile());
+			gone.push_back(m);
+		} else if (auto *a = dyn_cast<AllocaInst>(&i); a && a->getAddressSpace() != 5) {
+			IRBuilder<> b(a);
+			auto *priv = b.CreateAlloca(a->getAllocatedType(), 5, a->getArraySize());
+			priv->setAlignment(a->getAlign());
+			a->replaceAllUsesWith(b.CreateAddrSpaceCast(priv, a->getType()));
+			gone.push_back(a);
+		} else if (auto *l = dyn_cast<LifetimeIntrinsic>(&i)) {
+			gone.push_back(l);   // they must name an alloca directly; the ones moved above are cast
+		}
+	for (Instruction *i : gone)
+		i->eraseFromParent();
+	gone.clear();
+
+	// air.[fast_]<function>.<type>: the same function as an LLVM intrinsic of the call's type, or rewritten below.
+	static const std::map<std::string, Intrinsic::ID> same = {
+		{"sqrt", Intrinsic::sqrt}, {"exp", Intrinsic::exp}, {"exp2", Intrinsic::exp2}, {"log", Intrinsic::log}, {"log2", Intrinsic::log2},
+		{"sin", Intrinsic::sin}, {"cos", Intrinsic::cos}, {"fabs", Intrinsic::fabs}, {"floor", Intrinsic::floor}, {"ceil", Intrinsic::ceil},
+		{"trunc", Intrinsic::trunc}, {"rint", Intrinsic::rint}, {"round", Intrinsic::round}, {"fmax", Intrinsic::maxnum},
+		{"fmin", Intrinsic::minnum}, {"fma", Intrinsic::fma}, {"popcount", Intrinsic::ctpop}, {"min.s", Intrinsic::smin},
+		{"min.u", Intrinsic::umin}, {"max.s", Intrinsic::smax}, {"max.u", Intrinsic::umax}};
+	static const std::map<std::string, AtomicRMWInst::BinOp> rmw = {
+		{"add", AtomicRMWInst::Add}, {"sub", AtomicRMWInst::Sub}, {"and", AtomicRMWInst::And}, {"or", AtomicRMWInst::Or},
+		{"xor", AtomicRMWInst::Xor}, {"xchg", AtomicRMWInst::Xchg}, {"min.s", AtomicRMWInst::Min}, {"max.s", AtomicRMWInst::Max},
+		{"min.u", AtomicRMWInst::UMin}, {"max.u", AtomicRMWInst::UMax}};
+	for (Instruction &i : instructions(k)) {
+		auto *c = dyn_cast<CallInst>(&i);
+		Function *f = c ? c->getCalledFunction() : nullptr;
+		if (!f || !f->getName().starts_with("air."))
+			continue;
+		StringRef name = f->getName().drop_front(4);
+		name.consume_front("fast_");
+		IRBuilder<> b(c);
+		Value *r = nullptr;
+		const auto [op, type] = name.rsplit('.');   // e.g. "min.s" and "i32", "sqrt" and "f32", "wg" and "barrier"
+		if (name == "wg.barrier") {
+			// (memory flags: 1 device, 2 threadgroup, 4 texture; scope): fence, the hardware barrier, fence.
+			const SyncScope::ID scope = ctx.getOrInsertSyncScopeID(cast<ConstantInt>(c->getArgOperand(0))->getZExtValue() & 1 ? "agent" : "workgroup");
+			b.CreateFence(AtomicOrdering::Release, scope);
+			b.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {});
+			b.CreateFence(AtomicOrdering::Acquire, scope);
+		} else if (name.consume_front("atomic.global.") || name.consume_front("atomic.local.")) {
+			// (pointer, value, memory order, scope, volatile): Metal's are relaxed; device or threadgroup scope by the memory.
+			auto it = rmw.find(name.rsplit('.').first.str());   // "add.u" -> "add"/"min.u"
+			if (it == rmw.end())
+				it = rmw.find(name.rsplit('.').first.rsplit('.').first.str());
+			if (it == rmw.end())
+				return f->getName().str() + " is not supported yet";
+			const bool local = f->getName().contains(".local.");
+			r = b.CreateAtomicRMW(it->second, c->getArgOperand(0), c->getArgOperand(1), MaybeAlign(), AtomicOrdering::Monotonic,
+			                      ctx.getOrInsertSyncScopeID(local ? "workgroup" : "agent"));
+		} else if (same.count(op.str())) {
+			SmallVector<Value *, 3> args;   // one to three operands of the call's type; AIR's i1 flags have no counterpart
+			for (Value *v : c->args())
+				if (!v->getType()->isIntegerTy(1))
+					args.push_back(v);
+			r = b.CreateIntrinsic(same.at(op.str()), {c->getType()}, args);
+		} else if (op == "clz" || op == "ctz") {   // (x, is zero poison)
+			r = b.CreateIntrinsic(op == "clz" ? Intrinsic::ctlz : Intrinsic::cttz, {c->getType()}, {c->getArgOperand(0), b.getFalse()});
+		} else if (op == "rsqrt") {
+			r = b.CreateFDiv(ConstantFP::get(c->getType(), 1.0), b.CreateIntrinsic(Intrinsic::sqrt, {c->getType()}, {c->getArgOperand(0)}));
+		} else if (op == "pow" || op == "powr") {   // fast math's x^y = 2^(y log2 x)
+			r = b.CreateIntrinsic(Intrinsic::exp2, {c->getType()},
+			                      {b.CreateFMul(c->getArgOperand(1), b.CreateIntrinsic(Intrinsic::log2, {c->getType()}, {c->getArgOperand(0)}))});
+		} else if (op == "abs.s") {
+			r = b.CreateIntrinsic(Intrinsic::abs, {c->getType()}, {c->getArgOperand(0), b.getFalse()});
+		} else {
+			return f->getName().str() + " is not supported yet";
+		}
+		if (r)
+			c->replaceAllUsesWith(r);
+		gone.push_back(c);
+	}
+	for (Instruction *i : gone)
+		i->eraseFromParent();
+	return "";
+}
+
 static bool gLldSpent;   // lld said it cannot be run again in this process: --serve exits after its reply (launchd starts a new one)
 
 struct Kernel {
@@ -155,8 +263,9 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 					location = static_cast<int>(mdInt(a, k + 1));
 				writes |= mdString(a, k) == "air.read_write" || mdString(a, k) == "air.write";
 			}
-			if (location < 0 || location > 31 || index >= air->arg_size() || air->getArg(index)->getType() != PointerType::get(ctx, 1))
-				return "argument " + std::to_string(index) + ": only device buffers (address space 1) are supported so far";
+			if (location < 0 || location > 31 || index >= air->arg_size() ||
+			    (air->getArg(index)->getType() != PointerType::get(ctx, 1) && air->getArg(index)->getType() != PointerType::get(ctx, 2)))
+				return "argument " + std::to_string(index) + ": only device and constant buffers are supported so far";
 			roles[index] = {Buffer, location};
 			written |= writes ? 1u << location : 0;
 			maxLocation = location > maxLocation ? location : maxLocation;
@@ -210,7 +319,8 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 	SmallVector<Value *, 16> callArgs;
 	for (unsigned i = 0; i < air->arg_size(); i++) {
 		const Arg &a = roles[i];
-		Value *v = a.role == Buffer      ? kernel->getArg(static_cast<unsigned>(a.location))
+		// A constant buffer (AIR's address space 2) is cast here and made global memory again by legalize().
+		Value *v = a.role == Buffer      ? b.CreateAddrSpaceCast(kernel->getArg(static_cast<unsigned>(a.location)), air->getArg(i)->getType())
 		         : a.role == PosInGrid   ? asType(b, air->getArg(i)->getType(), pos)
 		         : a.role == PosInGroup  ? asType(b, air->getArg(i)->getType(), item)
 		         : a.role == GroupInGrid ? asType(b, air->getArg(i)->getType(), group)
@@ -224,6 +334,28 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 	b.CreateBr(done);
 	b.SetInsertPoint(done);
 	b.CreateRetVoid();
+
+	// The AIR function and whatever it calls inlined into the kernel; the module's other kernels go (they need not translate).
+	for (unsigned i = 0; kernels && i < kernels->getNumOperands(); i++)
+		if (auto *k = mdconst::dyn_extract_or_null<Function>(kernels->getOperand(i)->getOperand(0)); k && k != air) {
+			k->replaceAllUsesWith(PoisonValue::get(k->getType()));
+			k->eraseFromParent();
+		}
+	for (bool again = true; again;) {
+		again = false;
+		for (Instruction &i : instructions(*kernel))
+			if (auto *c = dyn_cast<CallInst>(&i); c && c->getCalledFunction() && !c->getCalledFunction()->isDeclaration()) {
+				InlineFunctionInfo ifi;
+				if (!InlineFunction(*c, ifi).isSuccess())
+					return "cannot inline " + c->getCalledFunction()->getName().str();
+				again = true;
+				break;
+			}
+	}
+	if (air->use_empty())
+		air->eraseFromParent();   // inlined: its original body would only have to be legalised too
+	if (std::string why = legalize(*kernel); !why.empty())
+		return why;
 
 	// Retarget: AMDGPU's triple and data layout, no AIR metadata.
 	const Triple triple("amdgcn-amd-amdhsa");
