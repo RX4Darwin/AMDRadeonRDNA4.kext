@@ -250,6 +250,16 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   (2026-10-21): mtlprobe's `feat`, nine kernels (constant reference, struct and array, math, a threadgroup reduction with barriers, device
   atomics, a local array indexed by data, integer functions, half), all translated at run time and equal to the CPU's results.** Not
   decoded yet: `setBytes` (inline constants), a common way to pass small constants.
+- **M3, fifth step: the rest of the usual compute encoder.** `setBytes` needs nothing of its own: the driver copies the bytes into a buffer
+  of its own and binds it with `setBuffers` (resource 4, offsets 0 and 0x20 in mtlprobe's `bytes`). `Compute.dispatchThreadgroups` (0x0c8)
+  is `{u64 groups[3], u64 threads per group[3]}` and was skipped until now; `Compute.setBufferOffset` (0x0cf) is `{u32 index, u64 offset}`.
+  **On the card (2026-10-21): mtlprobe's `bytes` (setBytes, dispatchThreadgroups, setBufferOffset) `0 of 64 wrong`; all other probes pass.**
+- **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
+  1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
+  brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's
+  case: Apple's driver came up on a GPU with nothing behind it. On real hardware the host no longer publishes without the card
+  (`rdna4-pvgpu` builds without `VMTEST`); the next such boot logs `not publishing after the delay`. Open: why the hook sometimes does not
+  run (three boots of about a dozen that day: two were the first boot of a newly installed kext, one the restart after such a freeze).
 
 ## 6. What is implemented now (code)
 

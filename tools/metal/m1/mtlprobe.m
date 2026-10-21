@@ -13,6 +13,8 @@
 //   mtlprobe twolib    the same with two libraries of one kernel each: out[i] = in[i] + 7, then out[i] *= out[i]
 //   mtlprobe feat      one kernel per Metal language feature (constant buffers, math, threadgroup memory and barriers, atomics, local
 //                      arrays, integer functions, half), each checked against the CPU
+//   mtlprobe bytes     o[i] *= k with k from setBytes and dispatchThreadgroups (2 x 32), then k = 10 again over o[32..63] by
+//                      setBufferOffset: o[i] = 3 i below 32, 30 i above
 //   mtlprobe render    one render pass that clears a 64x64 BGRA texture to (0.25, 0.5, 0.75, 1)
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
 //
@@ -316,6 +318,39 @@ static void feat(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	OUT("feat: %d of 9 wrong or not run (0 = executed)", failed);
 }
 
+static void bytes(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"kernel void scalebytes(device float *o [[buffer(0)]], constant float &k [[buffer(1)]], uint i [[thread_position_in_grid]]) { o[i] *= k; }"
+	                                     options:nil
+	                                       error:&err];
+	id<MTLComputePipelineState> ps = lib ? [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"scalebytes"] error:&err] : nil;
+	if (!ps) {
+		OUT("bytes: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	id<MTLBuffer> o = [d newBufferWithLength:256 options:MTLResourceStorageModeShared];
+	float *po = o.contents;
+	for (int i = 0; i < 64; i++)
+		po[i] = i;
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe bytes";
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+	[e setComputePipelineState:ps];
+	[e setBuffer:o offset:0 atIndex:0];
+	const float three = 3, ten = 10;
+	[e setBytes:&three length:4 atIndex:1];
+	[e dispatchThreadgroups:MTLSizeMake(2, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+	[e setBufferOffset:128 atIndex:0];
+	[e setBytes:&ten length:4 atIndex:1];
+	[e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+	[e endEncoding];
+	run(cb, "bytes");
+	int wrong = 0;
+	for (int i = 0; i < 64; i++)
+		wrong += po[i] != (i < 32 ? 3 * i : 30 * i);
+	OUT("bytes: o[1] %.0f o[33] %.0f o[63] %.0f, %d of 64 wrong (3 990 1890, 0 wrong = executed)", po[1], po[33], po[63], wrong);
+}
+
 static void render(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
 	td.usage = MTLTextureUsageRenderTarget;
@@ -344,8 +379,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "render"};
-			for (int i = 0; i < 9; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "render"};
+			for (int i = 0; i < 10; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -384,10 +419,12 @@ int main(int argc, char **argv) {
 			     @"inc7", @"square", ^uint32_t(uint32_t i) { return (i + 7) * (i + 7); });
 		else if (!strcmp(mode, "feat"))
 			feat(d, q);
+		else if (!strcmp(mode, "bytes"))
+			bytes(d, q);
 		else if (!strcmp(mode, "render"))
 			render(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, render, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, render, all)", mode);
 			return 2;
 		}
 	}

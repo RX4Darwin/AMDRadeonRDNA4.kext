@@ -700,9 +700,17 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			memcpy(&t->buffer[first + k], payload + 8 + 12 * k, 4);
 			memcpy(&t->offset[first + k], payload + 12 + 12 * k, 8);
 		}
-	} else if (id == 0x0ca && bytes >= 48) {   // Compute.dispatchThreads {u64 threads[3], u64 per group[3]}
+	} else if (id == 0x0cf && bytes >= 12) {   // Compute.setBufferOffset {u32 index, u64 offset} (measured; setBytes is setBuffers on a driver buffer)
+		uint32_t index;
+		memcpy(&index, payload, 4);
+		if (index < 8)
+			memcpy(&t->offset[index], payload + 4, 8);
+	} else if ((id == 0x0ca || id == 0x0c8) && bytes >= 48) {
+		// Compute.dispatchThreads {u64 threads[3], u64 per group[3]}; dispatchThreadgroups {u64 groups[3], u64 per group[3]}: whole groups
 		uint64_t size[6];
 		memcpy(size, payload, sizeof(size));
+		for (unsigned d = 0; d < 3 && id == 0x0c8; d++)
+			size[d] *= size[d + 3];
 		t->host->runCompute(t->task, t->pipeline, t->buffer, t->offset, size);
 	}
 	if (t->lines++ >= 80)
@@ -2142,13 +2150,24 @@ private:
 	void tick() {
 		if (gNub)
 			return;   // the GPU path got there first
-		IOService *parent = nowMs() < mDeadline ? nullptr : gLateParent ? gLateParent : IOService::getPlatform();
-		if (parent) {
-			pvlog("publishing after the delay under %s (%s)", parent->getName(), parent == gLateParent ? "the GPU" : "the platform expert: no GPU attached");
-			RDNA4PvNub::publish(parent, mLevel);
+		if (nowMs() < mDeadline) {
+			mTimer->setTimeoutMS(500);
 			return;
 		}
-		mTimer->setTimeoutMS(500);
+#ifdef AMDRadeonRDNA4_VM_TEST
+		IOService *parent = gLateParent ? gLateParent : IOService::getPlatform();   // a VM without the RDNA4 device: under the platform
+#else
+		// On a real machine a fake GPU without the card behind it is not published: three boots on the rig (2026-10-21) froze with
+		// AppleGPUWrangler panicking 1.5-2 s after the publish under the platform expert; in the two whose log could be read, the kext's
+		// IONDRVSupport hook had never run (no bring-up, only the firmware's picture on the DP display).
+		IOService *parent = gLateParent;
+		if (!parent) {
+			pvlog("not publishing after the delay: the GPU has not attached");
+			return;
+		}
+#endif
+		pvlog("publishing after the delay under %s (%s)", parent->getName(), parent == gLateParent ? "the GPU" : "the platform expert: no GPU attached");
+		RDNA4PvNub::publish(parent, mLevel);
 	}
 	uint32_t mLevel { 0 };
 	uint64_t mDeadline { 0 };
