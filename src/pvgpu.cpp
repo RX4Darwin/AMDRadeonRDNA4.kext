@@ -194,8 +194,10 @@ public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
 	uint32_t runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
 	struct Bindings { uint32_t buffer[8]; uint64_t offset[8]; };   // a stage's buffers by Metal index (resource id, 0 = none)
-	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uint32_t type, uint32_t start, uint32_t count, uint32_t instances,
-	             const Bindings *stage);
+	// A draw: Metal's primitive type, first vertex, vertices (indices), instances, base instance, and for an indexed draw the index buffer's
+	// resource id, offset and index size (bytes; 0: not indexed).
+	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes; };
+	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *stage);
 	void runCompute(uint32_t task, uint32_t pipeline, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size);
 	void describeRenderPipeline(uint32_t task, uint32_t pipeline);
 private:
@@ -712,14 +714,20 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 	else if (id == 0x074 && bytes >= 4) {   // Render.setRenderPipelineState {u32 pipeline id}
 		memcpy(&t->renderPipeline, payload, 4);
 		t->host->describeRenderPipeline(t->task, t->renderPipeline);
-	} else if (id == 0x001 && bytes >= 8) {   // Render.drawPrimitives {u32 primitive type, u16 vertex start, u16 count} (measured)
-		uint32_t w[2];
-		memcpy(w, payload, 8);
-		t->host->runDraw(t->task, t->target, t->renderPipeline, w[0], w[1] & 0xffff, w[1] >> 16, 1, t->stage);
-	} else if (id == 0x003 && bytes >= 8) {   // Render.drawPrimitives {u16 start, u16 count, u16 instances, u16 type}
-		uint32_t w[2];
-		memcpy(w, payload, 8);
-		t->host->runDraw(t->task, t->target, t->renderPipeline, w[1] >> 16, w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, t->stage);
+	} else if ((id == 0x001 || id == 0x003 || id == 0x005 || id == 0x007) && bytes >= (id >= 0x005 ? 12u : 8u)) {
+		// The compact draws (measured, docs/m1-stream.md s.5b): 0x001 drawPrimitives {u32 type, u16 start, u16 count}; 0x003 {u16 start, u16 count,
+		// u16 instances, u16 type}; 0x005 {u16 start, u16 count, u16 instances, u16 base instance, u32 type}; 0x007 drawIndexedPrimitives
+		// {u32 type, u32 index buffer, u16 count, u16 offset}, 16-bit indices.
+		uint32_t w[3] = {};
+		memcpy(w, payload, id >= 0x005 ? 12 : 8);
+		RDNA4PvHost::Draw d = {w[0], w[1] & 0xffff, w[1] >> 16, 1, 0, 0, 0, 0};
+		if (id == 0x003)
+			d = {w[1] >> 16, w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, 0, 0, 0, 0};
+		else if (id == 0x005)
+			d = {w[2], w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, w[1] >> 16, 0, 0, 0};
+		else if (id == 0x007)
+			d = {w[0], 0, w[2] & 0xffff, 1, 0, w[1], w[2] >> 16, 2};
+		t->host->runDraw(t->task, t->target, t->renderPipeline, d, t->stage);
 	} else if ((id == 0x0cb || id == 0x07d || id == 0x06e) && bytes >= 8) {
 		// Compute.setBuffers, Render.setVertexBuffers, setFragmentBuffers {u32 first index, u32 count, count x {u32 resource id, u64 offset}}
 		// (measured, docs/m1-stream.md s.5b; setBytes is setBuffers on a driver buffer)
@@ -898,13 +906,15 @@ static uint32_t halfAsFloat(uint32_t n, bool negative) {
 // M4: Render.drawPrimitives on the card: the pipeline's vertex and fragment functions translated by the helper (air2amdgpu.cpp
 // translateShader), drawn with the stream of src/gfx12_draw.h (the triangle every gfx test of the kext draws, proven on the card) with the
 // translated shaders in place of its own and the target, viewport and draw patched; the colour attachment staged through a linear RGBA8
-// target (the texture is BGRA8, swapped on the way in and out). With one value from the vertex to the fragment shader the stream is the colour
+// target (the texture is BGRA8, swapped on the way in and out). Triangle lists and strips, a first vertex, instances (repeated draws), 16-bit
+// indexed draws. With one value from the vertex to the fragment shader the stream is the colour
 // triangle's (src/gfx12_draw_col.h: one parameter in the attribute ring), whose descriptor literals in the vertex shader the host patches as
 // for nggcol.s. Each stage's bound buffers are staged into the runtime (read-only: nothing is copied back) and their addresses put in a
 // table per stage in the misc page, which the shaders find in their two user SGPRs (SPI_SHADER_USER_DATA_GS_0/1, _PS_0/1, set by a packet
-// added before the draw). So far: triangle lists from vertex 0, one instance, buffers 0-7, at most one attribute.
-void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uint32_t type, uint32_t start, uint32_t count, uint32_t instances,
-                          const Bindings *bound) {
+// added before the draw). So far: buffers 0-7, at most one attribute.
+void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *bound) {
+	static constexpr uint32_t kMaxInstances = 32;   // ponytail: the instances are repeated draws in the one IB page; NUM_INSTANCES if more are needed
+	const uint32_t count = draw.count;
 	const bool talk = mRenderLines++ < 48;
 	// The pipeline: {16-byte header, u8 n, n x {u8 key, u8 size, value}}: key 1 the vertex function, key 2 the fragment function (measured).
 	uint64_t pd[8] = {};
@@ -916,7 +926,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uin
 				memcpy(&fn[pb[at]], pb + at + 2, 4);
 	}
 	const char *why = !fn[1] || !fn[2] ? "the pipeline has no vertex or no fragment function"
-	                : type != 3 ? "only triangle lists so far" : start || instances > 1 ? "only from vertex 0, one instance, so far"
+	                : draw.type != 3 && draw.type != 4 ? "only triangle lists and strips so far"
+	                : !draw.instances || draw.instances > kMaxInstances ? "no instances, or more than 32 (so far)"
+	                : draw.indexBytes && draw.start ? "a base vertex in an indexed draw (so far)"
 	                : !count || count > 0xffff ? "no vertices" : nullptr;
 	const Jit *shader[3] = {};
 	char name[3][64] = {};
@@ -938,7 +950,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uin
 		why = "the colour attachment is not a linear 32-bit texture";
 	if (why) {
 		if (talk)
-			pvlog("host: render: draw of %u vertices (type %u) with pipeline %u: %s: not run", count, type, pipeline, why);
+			pvlog("host: render: draw of %u vertices (type %u) with pipeline %u: %s: not run", count, draw.type, pipeline, why);
 		return;
 	}
 	const uint32_t height = static_cast<uint32_t>(len / bpr), pitch = (width + 31) & ~31u;   // a linear target's pitch: a multiple of 128 bytes
@@ -985,18 +997,13 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uin
 		{0x69, 0x95, width | height << 16},                                // PA_SC_VPORT_SCISSOR_0_BR
 		{0x69, 0x10f, halfAsFloat(width, false)}, {0x69, 0x110, halfAsFloat(width, false)},   // PA_CL_VPORT_XSCALE, XOFFSET: w / 2
 		{0x69, 0x111, halfAsFloat(height, true)}, {0x69, 0x112, halfAsFloat(height, false)},  // YSCALE -h / 2 (Metal's y points up), YOFFSET h / 2
+		{0x79, 0x242, draw.type == 4 ? 6u : 4u},                           // VGT_PRIMITIVE_TYPE: DI_PT_TRISTRIP, DI_PT_TRILIST
 	};
 	for (const Patch &pt : patch)
 		if (uint32_t *d = n ? streamReg(ib, n, pt.opcode, pt.reg) : nullptr)
 			*d = pt.value;
 		else
 			ok = false;
-	for (uint32_t i = 0; i + 2 < n && ok; i++)   // DRAW_INDEX_AUTO {u32 vertex count, u32 initiator}
-		if (ib[i] == 0xc0012d00u) {
-			ib[i + 1] = count;
-			break;
-		}
-
 	// The stages' buffers, staged into the runtime, and their tables at +0x100 (vertex) and +0x200 (fragment) of the misc page (the fence at +0).
 	static constexpr uint64_t kMaxBuffer = 64ull << 20;
 	uint64_t misc[0x300 / 8] = {}, handle[2][8] = {};
@@ -1016,23 +1023,67 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uin
 				IOFree(copy, bytes);
 			misc[(0x100 + 0x100 * st) / 8 + k] = gpu;
 		}
-	// SPI_SHADER_USER_DATA_GS_0/1 and _PS_0/1 = the tables, just before the draw; both stages take two user SGPRs (air2amdgpu.cpp).
+	// An indexed draw's indices, staged too.
+	uint64_t indexHandle = 0, indexGpu = 0;
+	if (ok && draw.indexBytes) {
+		const uint64_t bytes = static_cast<uint64_t>(count) * draw.indexBytes;
+		uint64_t iva = 0, ilen = 0;
+		ok = bufferRange(task, draw.indexBuffer, &iva, &ilen) && draw.indexOffset <= ilen && bytes <= ilen - draw.indexOffset;
+		auto *copy = ok ? static_cast<uint8_t *>(IOMalloc(bytes)) : nullptr;
+		ok = copy && readGuest(task, iva + draw.indexOffset, copy, static_cast<uint32_t>(bytes)) &&
+		     gCompute->rtAlloc(this, bytes, indexHandle, indexGpu) == kIOReturnSuccess &&
+		     gCompute->rtCopy(this, indexHandle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(copy), bytes, true) == kIOReturnSuccess;
+		if (copy)
+			IOFree(copy, bytes);
+	}
+	// The draw, in place of the template's DRAW_INDEX_AUTO (3 dwords): the stages' tables (SPI_SHADER_USER_DATA_GS_0/1, _PS_0/1); for an indexed
+	// draw VGT_INDEX_TYPE (SET_UCONFIG_REG_INDEX, as RADV on gfx9+); per instance the first vertex and the instance id (USER_DATA_GS_2/3, the
+	// vertex shader's s10-s11) and the draw: DRAW_INDEX_AUTO, or DRAW_INDEX_2 from the staged indices (DI_SRC_SEL_DMA).
 	const uint64_t table[2] = {mGfxMisc.gpu + 0x100, mGfxMisc.gpu + 0x200};
-	const uint32_t userData[8] = {0xc0027600u, 0x8c, static_cast<uint32_t>(table[0]), static_cast<uint32_t>(table[0] >> 32),
-	                              0xc0027600u, 0x0c, static_cast<uint32_t>(table[1]), static_cast<uint32_t>(table[1] >> 32)};
-	uint32_t total = n;
-	for (uint32_t i = 0; ok && i < n; i++)
-		if (ib[i] == 0xc0012d00u && n + 8 <= sizeof(ib) / 4) {   // DRAW_INDEX_AUTO
-			memmove(&ib[i + 8], &ib[i], (n - i) * 4);
-			memcpy(&ib[i], userData, sizeof(userData));
-			total = n + 8;
+	uint32_t seq[8 + 3 + kMaxInstances * 10], m = 0;
+	auto put = [&](uint32_t v) { seq[m++] = v; };
+	for (unsigned st = 0; st < 2; st++) {
+		put(0xc0027600u);
+		put(st ? 0x0c : 0x8c);
+		put(static_cast<uint32_t>(table[st]));
+		put(static_cast<uint32_t>(table[st] >> 32));
+	}
+	if (draw.indexBytes) {
+		put(0xc0017a00u);
+		put(0x243 | 2u << 28);                // VGT_INDEX_TYPE, index 2
+		put(draw.indexBytes == 4 ? 1 : 0);    // 32- or 16-bit
+	}
+	for (uint32_t i = 0; i < draw.instances; i++) {
+		put(0xc0027600u);
+		put(0x8e);                            // SPI_SHADER_USER_DATA_GS_2, _3
+		put(draw.start);
+		put(draw.baseInstance + i);
+		if (draw.indexBytes) {
+			put(0xc0042700u);                 // DRAW_INDEX_2 {max indices, address, count, initiator}
+			put(count);
+			put(static_cast<uint32_t>(indexGpu));
+			put(static_cast<uint32_t>(indexGpu >> 32));
+			put(count);
+			put(0);
+		} else {
+			put(0xc0012d00u);                 // DRAW_INDEX_AUTO {count, initiator: DI_SRC_SEL_AUTO_INDEX}
+			put(count);
+			put(2);
+		}
+	}
+	uint32_t total = 0;
+	for (uint32_t i = 0; ok && i + 3 <= n; i++)
+		if (ib[i] == 0xc0012d00u && n - 3 + m <= sizeof(ib) / 4) {
+			memmove(&ib[i + m], &ib[i + 3], (n - i - 3) * 4);
+			memcpy(&ib[i], seq, m * 4);
+			total = n - 3 + m;
 			break;
 		}
-	ok &= total == n + 8;
-	static const uint32_t rsrc2[2] = {0x8b, 0x0b};   // SPI_SHADER_PGM_RSRC2_GS, _PS: USER_SGPR [5:1] = 2
-	for (uint32_t reg : rsrc2)
-		if (uint32_t *d = ok ? streamReg(ib, total, 0x76, reg) : nullptr)
-			*d = (*d & ~0x3eu) | 2u << 1;
+	ok &= total != 0;
+	static const uint32_t rsrc2[2][2] = {{0x8b, 4}, {0x0b, 2}};   // SPI_SHADER_PGM_RSRC2_GS, _PS: USER_SGPR [5:1] = 4 and 2 (air2amdgpu.cpp)
+	for (const auto &r : rsrc2)
+		if (uint32_t *d = ok ? streamReg(ib, total, 0x76, r[0]) : nullptr)
+			*d = (*d & ~0x3eu) | r[1] << 1;
 		else
 			ok = false;
 
@@ -1065,10 +1116,13 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uin
 		for (unsigned k = 0; k < 8; k++)
 			if (handle[st][k])
 				gCompute->rtFree(this, handle[st][k]);
+	if (indexHandle)
+		gCompute->rtFree(this, indexHandle);
 	if (stage)
 		IOFree(stage, targetBytes);
 	if (talk)
-		pvlog("host: render: draw of %u vertices into texture %u (%ux%u) with \"%s\" and \"%s\" on the card: %s (%llu us)", count, target, width, height,
+		pvlog("host: render: draw of %u %s x %u (type %u) into texture %u (%ux%u) with \"%s\" and \"%s\" on the card: %s (%llu us)", count,
+		      draw.indexBytes ? "indices" : "vertices", draw.instances, draw.type, target, width, height,
 		      name[1], name[2], ok ? "done" : "NOT done", ns / 1000);
 }
 

@@ -311,12 +311,25 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   SPI_SHADER_USER_DATA_GS_0/1` and `_PS_0/1` before the draw and sets USER_SGPR = 2 in both RSRC2s. **On the card: mtlprobe's `vbuf`
   (corners from a vertex buffer, a scale from setVertexBytes, the colour from setFragmentBytes) equals Apple's GPU: 496 pixels, colour and
   half right; tri and tricol (now with this ABI) still exact.**
+- **M4, fifth step: strips, a first vertex, instances, indexed draws (2026-10-22).** The vertex stage gets two more user SGPRs: s10 the
+  first vertex (added to VertexID, as RADV's base vertex), s11 the instance id (USER_SGPR = 4). The host runs the four compact draws
+  (0x001, 0x003, 0x005, 0x007): VGT_PRIMITIVE_TYPE 4 (list) or 6 (strip); instances as repeated draws in the one IB with USER_DATA_GS_2/3
+  set before each (up to 32); an indexed draw stages its 16-bit indices and sets VGT_INDEX_TYPE with SET_UCONFIG_REG_INDEX (0x7a, reg
+  0x243, index 2, as RADV on gfx9+), then DRAW_INDEX_2 `{max indices, address, count, DI_SRC_SEL_DMA}`, all in place of the template's
+  DRAW_INDEX_AUTO. **On the card: mtlprobe's `drawmodes` (a strip from vertex 3, 3 instances, base instance 3, an indexed quad from
+  offset 4) equals Apple's GPU pixel for pixel per colour (361, 135, 45, 361).** Not yet: lines, points, a base vertex in indexed draws,
+  32-bit indices, more than 32 instances.
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's
   case: Apple's driver came up on a GPU with nothing behind it. On real hardware the host no longer publishes without the card
-  (`rdna4-pvgpu` builds without `VMTEST`); the next such boot logs `not publishing after the delay`. Open: why the hook sometimes does not
-  run (three boots of about a dozen that day: two were the first boot of a newly installed kext, one the restart after such a freeze).
+  (`rdna4-pvgpu` builds without `VMTEST`); the next such boot logs `not publishing after the delay` (seen twice on 2026-10-22, no freeze).
+  **Why the hook did not run (2026-10-22):** SimpleHDA (restores AppleHDA on Tahoe) loads `IONDRVSupport` itself the moment the system kext
+  collection is ready; on the bad boots that was at 18 s and Lilu, whose load notice our hook depends on, reported no load before 21 s; on
+  a good boot it was at 24 s and our hook ran in the same millisecond. All four 2026-10-17 freezes (the day after SimpleHDA was installed)
+  are this crash at 121 s. The kext now checks from 30 s on whether its hook ran, and if not routes IONDRVSupport itself (its kmod, as
+  Lilu finds kexts) and registers the GPU again so IONDRVFramebuffer starts once more through the routes (`lateNdrvCheck` in
+  `src/plugin.cpp`); not yet run on a bad boot.
 
 ## 6. What is implemented now (code)
 
