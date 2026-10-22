@@ -193,7 +193,7 @@ private:
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
 	uint32_t runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
-	struct Bindings { uint32_t buffer[8]; uint64_t offset[8]; };   // a stage's buffers by Metal index (resource id, 0 = none)
+	struct Bindings { uint32_t buffer[8]; uint64_t offset[8]; uint32_t texture[8], sampler[8]; };   // a stage's resources by Metal index (0 = none)
 	// A draw: Metal's primitive type, first vertex, vertices (indices), instances, base instance, and for an indexed draw the index buffer's
 	// resource id, offset and index size (bytes; 0: not indexed).
 	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes; };
@@ -739,6 +739,14 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			memcpy(&g.buffer[first + k], payload + 8 + 12 * k, 4);
 			memcpy(&g.offset[first + k], payload + 12 + 12 * k, 8);
 		}
+	} else if ((id == 0x072 || id == 0x070) && bytes >= 8) {
+		// Render.setFragmentTextures / setFragmentSamplerStates {u32 first index, u32 count, count x u32 resource id} (measured)
+		uint32_t first, count;
+		memcpy(&first, payload, 4);
+		memcpy(&count, payload + 4, 4);
+		uint32_t *to = id == 0x072 ? t->stage[1].texture : t->stage[1].sampler;
+		for (uint32_t k = 0; k < count && first + k < 8 && 8 + 4 * (k + 1) <= bytes; k++)
+			memcpy(&to[first + k], payload + 8 + 4 * k, 4);
 	} else if ((id == 0x0cf || id == 0x07e || id == 0x06f) && bytes >= 12) {   // the set...BufferOffset of each: {u32 index, u64 offset}
 		RDNA4PvHost::Bindings &g = id == 0x0cf ? t->compute : t->stage[id == 0x06f];
 		uint32_t index;
@@ -1006,7 +1014,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			ok = false;
 	// The stages' buffers, staged into the runtime, and their tables at +0x100 (vertex) and +0x200 (fragment) of the misc page (the fence at +0).
 	static constexpr uint64_t kMaxBuffer = 64ull << 20;
-	uint64_t misc[0x300 / 8] = {}, handle[2][8] = {};
+	uint64_t misc[0x400 / 8] = {}, handle[2][8] = {};
 	for (unsigned st = 0; st < 2 && ok; st++)
 		for (unsigned k = 0; k < 8 && ok; k++) {
 			uint64_t bva = 0, blen = 0;
@@ -1023,6 +1031,81 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 				IOFree(copy, bytes);
 			misc[(0x100 + 0x100 * st) / 8 + k] = gpu;
 		}
+	// The fragment stage's textures: mip level 0 staged at a pitch of a multiple of 128 bytes (gfx12's linear images), their T#s at +64 + 32 n
+	// of the fragment table; its samplers as S#s at +320 + 16 n (air2amdgpu.cpp). A texture resource (measured, docs/m1-stream.md s.5b):
+	// {u64 bytes, u32 start page, u32 (array << 16) | mips, ..., from dword 9 per level {u64 offset, u64 bytes, u64 bytes per row, u32 width,
+	// height, depth}, then ..., 0x2c, its own id, (Metal pixel format << 16) | usage}. A sampler resource (type 7, tag 3, 36 bytes) packs at
+	// dword 3: mag [1:0], min [3:2], address s [10:8], t [14:12], r [18:16], mip [25:24], anisotropy [30:26], normalized [31].
+	uint64_t texHandle[8] = {};
+	uint32_t *fragTable = reinterpret_cast<uint32_t *>(&misc[0x200 / 8]);
+	for (unsigned k = 0; k < 8 && ok; k++) {
+		const uint32_t id = bound[1].texture[k];
+		uint32_t rec[3], td[64] = {};
+		if (!id)
+			continue;
+		ok = readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) && (rec[0] & 0xff) == 2 && (rec[0] >> 8) >= 4 * 29 &&   // 29 dwords with one mip level
+		     readGuest(task, rec[1], reinterpret_cast<uint8_t *>(td), (rec[0] >> 8) < sizeof(td) ? rec[0] >> 8 : sizeof(td));
+		const uint32_t dwords = ok ? ((rec[0] >> 8) < sizeof(td) ? rec[0] >> 8 : sizeof(td)) / 4 : 0;
+		uint32_t format = 0;
+		for (uint32_t j = 19; j + 1 < dwords; j++)
+			if (td[j - 1] == 0x2c && td[j] == id)
+				format = td[j + 1] >> 16;
+		// Metal pixel format -> gfx12 image format, its DST_SEL x, y, z, w (4 X .. 7 W, 0 zero, 1 one), bytes per pixel
+		struct Fmt { uint32_t metal, gfx, sel, bpp; };
+		static const Fmt fmts[] = {{70, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {71, 66, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},    // RGBA8 unorm, sRGB
+		                           {80, 42, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4}, {81, 66, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // BGRA8 unorm, sRGB
+		                           {55, 22, 4 | 0 << 3 | 0 << 6 | 1 << 9, 4}, {115, 57, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // R32Float, RGBA16Float
+		                           {125, 63, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16}};                                            // RGBA32Float
+		const Fmt *fm = nullptr;
+		for (const Fmt &e : fmts)
+			fm = e.metal == format ? &e : fm;
+		const uint32_t w = td[15], h = td[16], rowBytes = td[13];
+		ok = ok && fm && w && h && w <= 16384 && h <= 16384 && rowBytes >= w * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= (td[0] | uint64_t(td[1]) << 32);
+		if (!ok) {
+			if (talk)
+				pvlog("host: render: fragment texture %u (resource %u): format %u, %ux%u: not supported yet", k, id, format, w, h);
+			break;
+		}
+		const uint32_t texPitch = (w * fm->bpp + 127) & ~127u;   // bytes
+		const uint64_t bytes = static_cast<uint64_t>(texPitch) * h;
+		auto *copy = static_cast<uint8_t *>(IOMalloc(bytes));
+		uint64_t gpu = 0;
+		ok = copy != nullptr;
+		for (uint32_t y = 0; y < h && ok; y++)
+			ok = readGuest(task, (static_cast<uint64_t>(td[2]) << 12) + static_cast<uint64_t>(y) * rowBytes, copy + static_cast<uint64_t>(y) * texPitch, w * fm->bpp);
+		ok = ok && gCompute->rtAlloc(this, bytes, texHandle[k], gpu) == kIOReturnSuccess &&
+		     gCompute->rtCopy(this, texHandle[k], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(copy), bytes, true) == kIOReturnSuccess;
+		if (copy)
+			IOFree(copy, bytes);
+		const uint32_t pitchPx = texPitch / fm->bpp;
+		uint32_t *t = fragTable + (64 + 32 * k) / 4;   // SQ_IMG_RSRC_WORD0-7 (ac_build_gfx12_texture_descriptor, linear, custom pitch)
+		t[0] = static_cast<uint32_t>(gpu >> 8);
+		t[1] = static_cast<uint32_t>((gpu >> 40) & 0xff) | fm->gfx << 17 | ((w - 1) & 3) << 30;   // MAX_MIP 0, FORMAT, BASE_LEVEL 0, WIDTH_LO
+		t[2] = (w - 1) >> 2 | (h - 1) << 14;                                                      // WIDTH_HI, HEIGHT
+		t[3] = fm->sel | 9u << 28;                                                                // DST_SEL, LAST_LEVEL 0, SW_MODE linear, TYPE 2D
+		t[4] = ((pitchPx - 1) & 0x3fff) | ((pitchPx - 1) >> 14 & 3) << 14;                         // DEPTH = pitch - 1 low, PITCH_MSB
+		t[5] = 4u << 20;                                                                          // PERF_MOD 4
+		t[6] = 1u << 15;                                                                          // MAX_UNCOMPRESSED_BLOCK_SIZE 256 B
+		t[7] = 0;
+	}
+	for (unsigned k = 0; k < 8 && ok; k++) {
+		const uint32_t id = bound[1].sampler[k];
+		uint32_t rec[3], sd[9] = {};
+		if (!id)
+			continue;
+		ok = readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) && (rec[0] & 0xff) == 7 && (rec[0] >> 8) >= 16 &&
+		     readGuest(task, rec[1], reinterpret_cast<uint8_t *>(sd), 16) && sd[0] == 3;
+		const uint32_t d = sd[3];
+		static const uint32_t clamp[8] = {2, 3, 0, 1, 6, 6, 2, 2};   // Metal: edge, mirror-clamp-to-edge, repeat, mirror, zero, border
+		uint32_t *sm = fragTable + (320 + 16 * k) / 4;   // SQ_IMG_SAMP_WORD0-3; ponytail: no anisotropy, LOD unclamped, border transparent black
+		sm[0] = clamp[(d >> 8) & 7] | clamp[(d >> 12) & 7] << 3 | clamp[(d >> 16) & 7] << 6 | (d >> 31 ? 0 : 1u << 15);
+		sm[1] = 0xfffu << 13;
+		sm[2] = (d & 3) << 20 | ((d >> 2) & 3) << 22 | ((d >> 24) & 3) << 26;
+		sm[3] = 0;
+	}
+	if (!ok && talk)
+		pvlog("host: render: draw with pipeline %u: a fragment texture or sampler could not be set up: not run", pipeline);
+
 	// An indexed draw's indices, staged too.
 	uint64_t indexHandle = 0, indexGpu = 0;
 	if (ok && draw.indexBytes) {
@@ -1118,6 +1201,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 				gCompute->rtFree(this, handle[st][k]);
 	if (indexHandle)
 		gCompute->rtFree(this, indexHandle);
+	for (uint64_t h : texHandle)
+		if (h)
+			gCompute->rtFree(this, h);
 	if (stage)
 		IOFree(stage, targetBytes);
 	if (talk)
@@ -1415,6 +1501,9 @@ void RDNA4PvHost::describeRenderPipeline(uint32_t task, uint32_t pipeline) {
 				}
 		pvlog("host: render: task %u resource %u: type %u, %u bytes: %08x %08x %08x %08x %08x %08x %08x %08x %s", task, id, type, bytes, dw[0], dw[1], dw[2],
 		      dw[3], dw[4], dw[5], dw[6], dw[7], name);
+		uint32_t r[3];
+		if (type != 6 && type != 7 && readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(r), sizeof(r)) && (r[0] >> 8) > 32)
+			dumpGuest(task, r[1], (r[0] >> 8) < 256 ? r[0] >> 8 : 256);   // M4: textures and samplers in full, to read their formats
 	}
 }
 

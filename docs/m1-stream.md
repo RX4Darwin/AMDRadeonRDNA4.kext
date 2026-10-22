@@ -319,6 +319,23 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   DRAW_INDEX_AUTO. **On the card: mtlprobe's `drawmodes` (a strip from vertex 3, 3 instances, base instance 3, an indexed quad from
   offset 4) equals Apple's GPU pixel for pixel per colour (361, 135, 45, 361).** Not yet: lines, points, a base vertex in indexed draws,
   32-bit indices, more than 32 instances.
+- **M4, sixth step: textures and samplers in fragment shaders (2026-10-22).** Measured (mtlprobe's `texinfo`, the kext dumping each
+  resource): a texture resource (type 2) is `{u64 bytes, u32 start page, u32 (array << 16) | mips, ..., from dword 9 one record per level
+  {u64 offset, u64 bytes, u64 bytes per row, u32 width, height, depth}, then ..., 0x2c, its own id, (Metal pixel format << 16) | usage,
+  ...}` (29 dwords with one level); a sampler resource is type 7 tagged 3, 36 bytes, dword 3 = mag [1:0], min [3:2], address s [10:8], t
+  [14:12], r [18:16], mip [25:24], anisotropy [30:26], normalized [31] (Metal's enums), dword 6 the max LOD (float);
+  `Render.setFragmentTextures` (0x072) and `setFragmentSamplerStates` (0x070) are `{u32 first, u32 count, count x u32 id}`. A constexpr
+  sampler is a global `[2 x i64]` in AIR's constant address space: address s [2:0], t [5:3], r [8:6] (0 zero/border, 1 edge, 2 repeat, 3
+  mirror), mag [9] / min [11] linear, mip [14:13], pixel coordinates [15], compare [18:16], anisotropy [23:19] = 2n - 1, min / max LOD
+  halves at [39:24] / [55:40], border colour [57:56] (decoded against the Metal compiler). The translator gives the fragment stage its
+  textures and samplers as the addresses of their descriptors in its table (T# at +64 + 32 n, S# at +320 + 16 n) and maps
+  `air.sample_texture_2d` to `llvm.amdgcn.image.sample.2d` and `air.read_texture_2d` to `image.load.2d` (descriptors loaded through the
+  constant address space so they are SGPRs; their types are overloads of the intrinsics in LLVM 23); a constexpr sampler becomes an S#
+  constant. The host stages mip level 0 of each bound texture at a pitch of a multiple of 128 bytes and writes its gfx12 T# (linear,
+  custom pitch in DEPTH, Mesa's ac_build_gfx12_texture_descriptor) and each sampler's S#: formats RGBA8/BGRA8 (unorm, sRGB), R32F,
+  RGBA16F, RGBA32F. **On the card: mtlprobe's `texdraw` (a 4x4 RGBA8 texture, nearest, over a 64x64 quad) 0 of 4096 pixels wrong;
+  every other probe still passes.** A managed texture's replaceRegion lands in the guest's pages directly. Not yet: mip levels past 0,
+  anisotropy, LOD clamps, border colours, vertex-stage textures, other sample variants (LOD, bias, offset, gradients).
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's
@@ -329,7 +346,8 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   a good boot it was at 24 s and our hook ran in the same millisecond. All four 2026-10-17 freezes (the day after SimpleHDA was installed)
   are this crash at 121 s. The kext now checks from 30 s on whether its hook ran, and if not routes IONDRVSupport itself (its kmod, as
   Lilu finds kexts) and registers the GPU again so IONDRVFramebuffer starts once more through the routes (`lateNdrvCheck` in
-  `src/plugin.cpp`); not yet run on a bad boot.
+  `src/plugin.cpp`). First run on a bad boot: routing failed with "no loaded symbols buffer found": Lilu loads a kext's running symbols
+  (`updateRunningInfo`) before its load callbacks, which the late check now does too; not yet run on a bad boot since.
 
 ## 6. What is implemented now (code)
 

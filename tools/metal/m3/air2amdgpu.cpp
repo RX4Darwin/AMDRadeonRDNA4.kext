@@ -23,6 +23,7 @@
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -51,6 +52,7 @@
 LLD_HAS_DRIVER(elf)
 
 using namespace llvm;
+using namespace llvm::PatternMatch;
 
 static int fail(const std::string &why) {
 	errs() << "air2amdgpu: " << why << "\n";
@@ -187,10 +189,43 @@ static Value *simdOp(IRBuilder<> &b, StringRef op, CallInst *c) {
 //  - AIR's constant address space (2) is AMDGPU's GDS: constant buffers become global memory (1) again.
 //  - local arrays: AMDGPU's allocas live in address space 5 (private), seen through a flat pointer.
 //  - air.* functions: LLVM intrinsics, fences and barriers, atomics.
+// A Metal sampler as gfx12's sampler descriptor (S#, SQ_IMG_SAMP_WORD0-3), from AIR's packed constexpr sampler state (measured against the
+// Metal compiler, 2026-10-22): address s [2:0], t [5:3], r [8:6] (0 zero/border, 1 edge, 2 repeat, 3 mirror), mag [9], min [11] linear, mip
+// [14:13] (0 none, 1 nearest, 2 linear), pixel coordinates [15], anisotropy [23:19] = 2n - 1, min / max LOD halves at [39:24] / [55:40],
+// border colour [57:56].
+static uint32_t lod48(uint16_t half) {   // a half's value as gfx12's 4.8 fixed LOD, clamped to [0, 15.996]
+	const int e = (half >> 10) & 31, m = half & 1023;
+	if ((half & 0x8000) || !e)
+		return 0;
+	const double v = (1.0 + m / 1024.0) * double(1u << e) / 32768.0;
+	return v >= 15.996 ? 0xfff : static_cast<uint32_t>(v * 256 + 0.5);
+}
+static Constant *airSampler(LLVMContext &ctx, uint64_t st) {
+	static const uint32_t clamp[4] = {6, 2, 0, 1};   // zero -> CLAMP_BORDER, edge -> CLAMP_LAST_TEXEL, repeat -> WRAP, mirror -> MIRROR
+	const uint32_t aniso = ((st >> 19) & 31) / 2 + 1, ratio = aniso >= 16 ? 4 : aniso >= 8 ? 3 : aniso >= 4 ? 2 : aniso >= 2 ? 1 : 0;
+	const uint32_t w[4] = {
+		clamp[st & 3] | clamp[(st >> 3) & 3] << 3 | clamp[(st >> 6) & 3] << 6 | ratio << 9 | uint32_t((st >> 15) & 1) << 15,
+		lod48(uint16_t(st >> 24)) | lod48(uint16_t(st >> 40)) << 13,
+		uint32_t((st >> 9) & 1) << 20 | uint32_t((st >> 11) & 1) << 22 | uint32_t((st >> 13) & 3) << 26,
+		uint32_t((st >> 56) & 3) << 30};   // BORDER_COLOR_TYPE: 0 transparent black, 1 opaque black, 2 opaque white
+	Type *i32 = Type::getInt32Ty(ctx);
+	return ConstantVector::get({ConstantInt::get(i32, w[0]), ConstantInt::get(i32, w[1]), ConstantInt::get(i32, w[2]), ConstantInt::get(i32, w[3])});
+}
+
 static std::string legalize(Function &k) {
 	LLVMContext &ctx = k.getContext();
 	PointerType *global = PointerType::get(ctx, 1);
 	SmallVector<Instruction *, 32> gone;
+	// Constexpr samplers first: their state global (AIR's constant address space) becomes the S# constant of the call.
+	std::map<CallInst *, Constant *> constSampler;
+	for (Instruction &i : instructions(k))
+		if (auto *c = dyn_cast<CallInst>(&i); c && c->getCalledFunction() && c->getCalledFunction()->getName().starts_with("air.sample_texture") &&
+		                                        c->arg_size() > 1)
+			if (auto *g = dyn_cast<GlobalVariable>(c->getArgOperand(1)->stripPointerCasts()); g && g->hasInitializer())
+				if (auto *a = dyn_cast<ConstantDataArray>(g->getInitializer()); a && a->getNumElements() >= 1 && a->getElementType()->isIntegerTy(64)) {
+					constSampler[c] = airSampler(ctx, a->getElementAsInteger(0));
+					c->setArgOperand(1, ConstantPointerNull::get(cast<PointerType>(c->getArgOperand(1)->getType())));
+				}
 	for (Instruction &i : instructions(k)) {
 		for (Use &u : i.operands())
 			if (u->getType()->isPointerTy() && u->getType()->getPointerAddressSpace() == 2) {
@@ -244,7 +279,32 @@ static std::string legalize(Function &k) {
 		IRBuilder<> b(c);
 		Value *r = nullptr;
 		const auto [op, type] = name.rsplit('.');   // e.g. "min.s" and "i32", "sqrt" and "f32", "wg" and "barrier"
-		if (op.starts_with("simd_")) {
+		// A descriptor (T# 8 dwords, S# 4) at the handle's address, through the constant address space so it lands in SGPRs.
+		auto descriptor = [&](Value *handle, unsigned dwords) {
+			Value *at = b.CreateIntToPtr(b.CreatePtrToInt(handle, b.getInt64Ty()), PointerType::get(ctx, 4));
+			return b.CreateAlignedLoad(FixedVectorType::get(b.getInt32Ty(), dwords), at, Align(16));
+		};
+		if (name.starts_with("sample_texture_2d.v4f32") || name.starts_with("read_texture_2d.v4f32")) {
+			// sample (texture, sampler, float2 coord, i1, int2 offset, i1 lod or bias, float, float, i32) / read (texture, sampler, uint2, int2, lod, i32)
+			const bool sample = name.starts_with("sample");
+			if (c->arg_size() < 5 || !isa<ConstantAggregateZero>(c->getArgOperand(sample ? 4 : 3)) ||
+			    (sample && c->arg_size() > 5 && !match(c->getArgOperand(5), m_Zero())) || (!sample && !match(c->getArgOperand(4), m_Zero())))
+				return f->getName().str() + " with an offset, a LOD or a bias is not supported yet";
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(2);
+			Value *x = b.CreateExtractElement(xy, uint64_t(0)), *y = b.CreateExtractElement(xy, 1);
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
+			Value *texel;
+			if (sample) {
+				Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
+				texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_sample_2d, {v4f, b.getFloatTy(), t->getType(), sm->getType()},   // descriptors overloaded
+				                          {b.getInt32(15), x, y, t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			} else {
+				texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {v4f, b.getInt32Ty(), t->getType()}, {b.getInt32(15), x, y, t, b.getInt32(0), b.getInt32(0)});
+			}
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (name == "get_read_sampler") {
+			r = PoisonValue::get(c->getType());   // read_texture's sampler operand: unused
+		} else if (op.starts_with("simd_")) {
 			r = simdOp(b, op, c);
 			if (!r)
 				return f->getName().str() + " is not supported yet";
@@ -390,7 +450,8 @@ struct Kernel {
 // A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
 // (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
 // u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes}, then the code (relocation-free, the entry at its start).
-// Both stages get two user SGPRs, the address of a table of 64-bit buffer addresses by Metal buffer index (the host's, per stage; 0 if none).
+// Both stages get two user SGPRs, the address of the stage's table (the host's): 64-bit buffer addresses by Metal buffer index at +0, and in
+// the fragment stage the textures' T#s (8 dwords) at +64 + 32 n and the samplers' S#s (4 dwords) at +320 + 16 n.
 //   vertex   amdgpu_gs, an NGG shader as src/shaders/nggcol.s: s3 = merged_wave_info ([7:0] vertices, [15:8] primitives, [27:24] wave in
 //            the subgroup), s5 = gs_attr_offset (s0-s7 are the merged stage's system SGPRs), s8-s9 the table, s10 the first vertex
 //            (added to VertexID, as RADV's base vertex), s11 the instance id, v0 = the packed primitive, v3 = VertexID; the position goes out as pos0, the primitive
@@ -433,6 +494,14 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			    (air->getArg(index)->getType() != PointerType::get(ctx, 1) && air->getArg(index)->getType() != PointerType::get(ctx, 2)))
 				return "buffer argument " + std::to_string(index) + ": only device and constant buffers at indices 0-7 so far";
 			from[index] = 100 + location;
+		} else if (!vertex && (kind == "air.texture" || kind == "air.sampler") && !unused) {
+			int location = -1;
+			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
+				if (mdString(a, k) == "air.location_index")
+					location = static_cast<int>(mdInt(a, k + 1));
+			if (location < 0 || location > 7)
+				return kind + " argument " + std::to_string(index) + ": only indices 0-7 so far";
+			from[index] = (kind == "air.texture" ? 200 : 300) + location;
 		}
 		else if (unused)
 			from[index] = -1;
@@ -499,12 +568,16 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		return r;
 	};
 	Value *interpolated = nullptr;   // fragment: attribute 0 at the pixel centre
+	auto table = [&]() {   // the stage's table address, from its two user SGPRs
+		return b.CreateOr(b.CreateZExt(f->getArg(kTable), b.getInt64Ty()), b.CreateShl(b.CreateZExt(f->getArg(kTable + 1), b.getInt64Ty()), 32));
+	};
 	auto buffer = [&](unsigned n, Type *t) -> Value * {   // buffer n's address from the stage's table (constant memory, scalar loads)
-		Value *table = b.CreateOr(b.CreateZExt(f->getArg(kTable), b.getInt64Ty()), b.CreateShl(b.CreateZExt(f->getArg(kTable + 1), b.getInt64Ty()), 32));
-		Value *at = b.CreateIntToPtr(b.CreateAdd(table, b.getInt64(8 * n)), PointerType::get(ctx, 4));
+		Value *at = b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(8 * n)), PointerType::get(ctx, 4));
 		Value *address = b.CreateIntToPtr(b.CreateAlignedLoad(b.getInt64Ty(), at, Align(8)), PointerType::get(ctx, 1));
 		return t == address->getType() ? address : b.CreateAddrSpaceCast(address, t);   // a constant buffer: made global again by legalize()
 	};
+	// A texture or sampler handle: the address of its T# (table + 64 + 32 n) or S# (table + 320 + 16 n), which legalize() loads.
+	auto handle = [&](uint64_t offset, Type *t) -> Value * { return b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(offset)), t); };
 	auto fragPosition = [&]() {        // fragment: the pixel's window position x, y, depth z and w (POS_X..W_FLOAT)
 		Value *r = PoisonValue::get(v4f32);
 		for (unsigned c = 0; c < 4; c++)
@@ -518,6 +591,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			               : from[k] == 1 ? f->getArg(kInstance)
 			               : from[k] == 2 ? fromVec4(interpolated, air->getArg(k)->getType())
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
+			               : from[k] >= 300 ? handle(320 + 16 * static_cast<unsigned>(from[k] - 300), air->getArg(k)->getType())
+			               : from[k] >= 200 ? handle(64 + 32 * static_cast<unsigned>(from[k] - 200), air->getArg(k)->getType())
 			               : from[k] >= 100 ? buffer(static_cast<unsigned>(from[k] - 100), air->getArg(k)->getType())
 			                              : PoisonValue::get(air->getArg(k)->getType()));
 		return b.CreateCall(air, args);

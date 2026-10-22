@@ -22,6 +22,9 @@
 //   mtlprobe vbuf      a triangle from a vertex buffer (corners) scaled by setVertexBytes, coloured by setFragmentBytes
 //   mtlprobe drawmodes a triangle strip from vertex 3 (red), 3 instances (green), base instance 3 (yellow) and an indexed quad (blue):
 //                      pixels per colour, to compare with Apple's GPU
+//   mtlprobe texinfo   four textures (RGBA8 4x4, BGRA8 8x2, R32Float 3x5, RGBA16Float 16x16 with mips) and three samplers bound to one
+//                      draw, nothing checked (for decoding texture and sampler resources)
+//   mtlprobe texdraw   a 4x4 RGBA8 texture sampled (nearest, clamp) over a full-screen quad into 64x64: each 16x16 block one texel, checked
 //   mtlprobe drawargs  draws with distinct arguments, nothing checked (for decoding the draw commands)
 //   mtlprobe render    one render pass that clears a 64x64 BGRA texture to (0.25, 0.5, 0.75, 1)
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
@@ -637,6 +640,138 @@ static void drawmodes(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	OUT("drawmodes: red %d, green %d, yellow %d, blue %d, other %d (361, 135, 45, 361, 0 = executed, as Apple's GPU)", n[0], n[1], n[3], n[2], n[4]);
 }
 
+static void texinfo(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "struct V { float4 pos [[position]]; };\n"
+	                                              "vertex V ti_v(uint vid [[vertex_id]]) { V v; v.pos = float4(vid == 1 ? 1.0 : -1.0, vid == 2 ? 1.0 : -1.0, 0, 1); return v; }\n"
+	                                              "fragment float4 ti_f(texture2d<float> a [[texture(0)]], texture2d<float> b [[texture(1)]], texture2d<float> c [[texture(2)]],"
+	                                              " texture2d<float> e [[texture(3)]], sampler s0 [[sampler(0)]], sampler s1 [[sampler(1)]], sampler s2 [[sampler(2)]]) {"
+	                                              " float2 uv = float2(0.5); return a.sample(s0, uv) + b.sample(s1, uv) + c.sample(s2, uv) + e.sample(s0, uv); }"
+	                                     options:nil
+	                                       error:&err];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"ti_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"ti_f"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	if (!ps) {
+		OUT("texinfo: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	const MTLPixelFormat fmt[4] = {MTLPixelFormatRGBA8Unorm, MTLPixelFormatBGRA8Unorm, MTLPixelFormatR32Float, MTLPixelFormatRGBA16Float};
+	const NSUInteger w[4] = {4, 8, 3, 16}, h[4] = {4, 2, 5, 16};
+	id<MTLTexture> tex[4];
+	for (int k = 0; k < 4; k++) {
+		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt[k] width:w[k] height:h[k] mipmapped:k == 3];
+		td.storageMode = MTLStorageModeManaged;
+		tex[k] = [d newTextureWithDescriptor:td];
+		uint8_t bytes[16 * 16 * 8];
+		for (unsigned i = 0; i < sizeof(bytes); i++)
+			bytes[i] = (uint8_t)(i * 7 + k);
+		[tex[k] replaceRegion:MTLRegionMake2D(0, 0, w[k], h[k]) mipmapLevel:0 withBytes:bytes bytesPerRow:w[k] * (k == 3 ? 8 : 4)];
+		OUT("texinfo: texture %d: %lux%lu format %lu, mips %lu", k, (unsigned long)w[k], (unsigned long)h[k], (unsigned long)fmt[k], (unsigned long)tex[k].mipmapLevelCount);
+	}
+	MTLSamplerDescriptor *sd[3] = {[MTLSamplerDescriptor new], [MTLSamplerDescriptor new], [MTLSamplerDescriptor new]};
+	sd[0].minFilter = sd[0].magFilter = MTLSamplerMinMagFilterNearest;   // clamp to edge (default)
+	sd[1].minFilter = sd[1].magFilter = MTLSamplerMinMagFilterLinear;
+	sd[1].mipFilter = MTLSamplerMipFilterLinear;
+	sd[1].sAddressMode = sd[1].tAddressMode = MTLSamplerAddressModeRepeat;
+	sd[2].sAddressMode = MTLSamplerAddressModeMirrorRepeat;
+	sd[2].tAddressMode = MTLSamplerAddressModeClampToZero;
+	sd[2].maxAnisotropy = 4;
+	id<MTLSamplerState> ss[3];
+	for (int k = 0; k < 3; k++)
+		ss[k] = [d newSamplerStateWithDescriptor:sd[k]];
+	MTLTextureDescriptor *rtd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	rtd.usage = MTLTextureUsageRenderTarget;
+	rtd.storageMode = MTLStorageModePrivate;
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = [d newTextureWithDescriptor:rtd];
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe texinfo";
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	for (int k = 0; k < 4; k++)
+		[re setFragmentTexture:tex[k] atIndex:k];
+	for (int k = 0; k < 3; k++)
+		[re setFragmentSamplerState:ss[k] atIndex:k];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[re endEncoding];
+	run(cb, "texinfo");
+}
+
+static void texdraw(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "struct VT { float4 pos [[position]]; float2 uv; };\n"
+	                                              "vertex VT td_v(uint vid [[vertex_id]]) { float x = (vid == 1 || vid == 3 || vid == 4) ? 1.0 : -1.0;"
+	                                              " float y = (vid == 2 || vid == 4 || vid == 5) ? 1.0 : -1.0; VT v; v.pos = float4(x, y, 0, 1);"
+	                                              " v.uv = float2(x * 0.5 + 0.5, 0.5 - y * 0.5); return v; }\n"
+	                                              "fragment float4 td_f(VT in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {"
+	                                              " return t.sample(s, in.uv); }"
+	                                     options:nil
+	                                       error:&err];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"td_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"td_f"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	if (!ps) {
+		OUT("texdraw: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	MTLTextureDescriptor *xd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+	xd.storageMode = MTLStorageModeManaged;
+	id<MTLTexture> tex = [d newTextureWithDescriptor:xd];
+	uint8_t texels[4 * 4 * 4];
+	for (int y = 0; y < 4; y++)
+		for (int x = 0; x < 4; x++) {
+			uint8_t *e = texels + (y * 4 + x) * 4;
+			e[0] = (uint8_t)(x * 60 + 20);   // R
+			e[1] = (uint8_t)(y * 60 + 20);   // G
+			e[2] = 200;                      // B
+			e[3] = 255;
+		}
+	[tex replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:texels bytesPerRow:16];
+	MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];   // nearest, clamp to edge
+	id<MTLSamplerState> ss = [d newSamplerStateWithDescriptor:sd];
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	id<MTLBuffer> out = [d newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = t;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe texdraw";
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re setFragmentTexture:tex atIndex:0];
+	[re setFragmentSamplerState:ss atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+	[re endEncoding];
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 64, 1) toBuffer:out
+	      destinationOffset:0 destinationBytesPerRow:64 * 4 destinationBytesPerImage:64 * 64 * 4];
+	[e endEncoding];
+	run(cb, "texdraw");
+	const uint8_t *px = out.contents;
+	int wrong = 0;
+	for (int y = 0; y < 64; y++)
+		for (int x = 0; x < 64; x++) {
+			const uint8_t *p = px + (y * 64 + x) * 4, want[4] = {200, (uint8_t)(y / 16 * 60 + 20), (uint8_t)(x / 16 * 60 + 20), 255};   // B, G, R, A
+			wrong += memcmp(p, want, 4) != 0;
+		}
+	const uint8_t *c = px + (40 * 64 + 20) * 4;
+	OUT("texdraw: %d of 4096 pixels wrong; pixel (20, 40) B %u G %u R %u A %u (0, 200 140 80 255 = executed)", wrong, c[0], c[1], c[2], c[3]);
+}
+
 static void drawargs(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	NSError *err = nil;
 	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
@@ -702,8 +837,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes"};
-			for (int i = 0; i < 15; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw"};
+			for (int i = 0; i < 16; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -756,10 +891,14 @@ int main(int argc, char **argv) {
 			vbuf(d, q);
 		else if (!strcmp(mode, "drawmodes"))
 			drawmodes(d, q);
+		else if (!strcmp(mode, "texinfo"))
+			texinfo(d, q);
+		else if (!strcmp(mode, "texdraw"))
+			texdraw(d, q);
 		else if (!strcmp(mode, "drawargs"))
 			drawargs(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, drawargs, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, texinfo, drawargs, all)", mode);
 			return 2;
 		}
 	}
