@@ -336,6 +336,24 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   RGBA16F, RGBA32F. **On the card: mtlprobe's `texdraw` (a 4x4 RGBA8 texture, nearest, over a 64x64 quad) 0 of 4096 pixels wrong;
   every other probe still passes.** A managed texture's replaceRegion lands in the guest's pages directly. Not yet: mip levels past 0,
   anisotropy, LOD clamps, border colours, vertex-stage textures, other sample variants (LOD, bias, offset, gradients).
+- **M4, seventh step: blending, write masks and the blend colour (2026-10-22).** Measured (mtlprobe's `blendinfo`): after a render
+  pipeline's function list come a second list (empty so far), u32 colour attachments, u32 ?, then per attachment `{u8 n, n x {u8 key,
+  u8 size, value}}`: 0 index, 1 pixel format, 2 blending, 3 / 4 / 5 colour source factor, destination factor, operation, 6 / 7 / 8 the
+  same for alpha, 9 write mask (Metal's enums; defaults off, One, Zero, Add, One, Zero, Add, 0xf); `Render.setBlendColorRed` (0x065) is
+  four floats. The host sets CB_BLEND0_CONTROL (Metal's factors are AMD's BlendOp in another order; min and max want both factors One),
+  SX_MRT0_BLEND_OPT (no optimisation, the operation's OPT_COMB; 0 there would say the source is ignored), CB_TARGET_MASK and CB_BLEND_RED
+  .. ALPHA. **The card ignores SEPARATE_ALPHA_BLEND in our state:** mtlprobe's `blendx` (blend colour alpha 0.25 against RGB 0.5) showed
+  alpha always taking the colour equation; RADV sets the bit the same way, and DISABLE_DUAL_QUAD, SX_BLEND_OPT_CONTROL (both opt
+  disables: blending is skipped altogether) and SX_PS_DOWNCONVERT_CONTROL changed nothing (one boot, the kext cycling through them).
+  Untested difference from RADV: our fragment shaders export 32_ABGR into an 8-bit target (RADV exports FP16 with an 8_8_8_8
+  down-conversion). So each pass has one equation for all four channels, and when alpha's differs the draw runs twice in the same IB:
+  colour only, then alpha only with its own equation (a colour factor reading destination alpha sees the alpha from before the draw;
+  exact unless such a draw overlaps itself). **On the card: `blend` (source-over, additive, blend colour with alpha One, write mask red +
+  alpha) and `blendx` (blend colour on colour only, keep alpha, keep colour, blend colour on all) 0 of 32 channels off; every other probe
+  still passes.** The host also no longer publishes the fake GPU when the compute runtime is not up (a boot where stage 2 failed had
+  published it, and every probe "completed" with nothing run). Seen in passing: iTerm2 on the rig draws through Metal on our device
+  (several of its functions translated; its draws not run yet: render targets that are not linear 32-bit textures, a vertex function
+  not translated, no or more than 32 instances).
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's
@@ -347,7 +365,10 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   are this crash at 121 s. The kext now checks from 30 s on whether its hook ran, and if not routes IONDRVSupport itself (its kmod, as
   Lilu finds kexts) and registers the GPU again so IONDRVFramebuffer starts once more through the routes (`lateNdrvCheck` in
   `src/plugin.cpp`). First run on a bad boot: routing failed with "no loaded symbols buffer found": Lilu loads a kext's running symbols
-  (`updateRunningInfo`) before its load callbacks, which the late check now does too; not yet run on a bad boot since.
+  (`updateRunningInfo`) before its load callbacks, which the late check now does too. **Second bad boot (2026-10-22): the late check
+  routed at 31 s and the kext took the boot display at 34 s ("ours"), but the second display stayed dark:** the head-2 nub is made in the
+  routed `IONDRVFramebuffer::start`, and the existing framebuffer had started before the routes (registering the GPU again does not start
+  a second one). Compute stopped at stage 2 (PSP) on that boot, cause not known (late attach, or not a cold start).
 
 ## 6. What is implemented now (code)
 

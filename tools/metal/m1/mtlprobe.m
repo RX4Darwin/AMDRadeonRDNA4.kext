@@ -25,6 +25,9 @@
 //   mtlprobe texinfo   four textures (RGBA8 4x4, BGRA8 8x2, R32Float 3x5, RGBA16Float 16x16 with mips) and three samplers bound to one
 //                      draw, nothing checked (for decoding texture and sampler resources)
 //   mtlprobe texdraw   a 4x4 RGBA8 texture sampled (nearest, clamp) over a full-screen quad into 64x64: each 16x16 block one texel, checked
+//   mtlprobe blend     four quadrants over a cleared target: source-over, additive, blend-constant source, write mask red+alpha; checked
+//   mtlprobe blendx    the same with separate-alpha cases and a blend colour whose alpha (0.25) differs from its RGB; checked
+//   mtlprobe blendinfo six pipelines differing only in blending and write mask, one draw each, nothing checked (for decoding blend state)
 //   mtlprobe drawargs  draws with distinct arguments, nothing checked (for decoding the draw commands)
 //   mtlprobe render    one render pass that clears a 64x64 BGRA texture to (0.25, 0.5, 0.75, 1)
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
@@ -772,6 +775,152 @@ static void texdraw(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	OUT("texdraw: %d of 4096 pixels wrong; pixel (20, 40) B %u G %u R %u A %u (0, 200 140 80 255 = executed)", wrong, c[0], c[1], c[2], c[3]);
 }
 
+static void blend(id<MTLDevice> d, id<MTLCommandQueue> q, bool x) {   // x: the separate-alpha cases, blend colour alpha 0.25
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "struct V { float4 pos [[position]]; };\n"
+	                                              "vertex V bq_v(uint vid [[vertex_id]], constant float2 &o [[buffer(0)]]) {"
+	                                              " float x = (vid == 1 || vid == 3 || vid == 4) ? 1.0 : 0.0, y = (vid == 2 || vid == 4 || vid == 5) ? 1.0 : 0.0;"
+	                                              " V v; v.pos = float4(o.x + x, o.y + y, 0, 1); return v; }\n"
+	                                              "fragment float4 bq_f(constant float4 &c [[buffer(0)]]) { return c; }"
+	                                     options:nil
+	                                       error:&err];
+	// {enabled, rgb src, rgb dst, alpha src, alpha dst, write mask}; operations add
+	const NSUInteger cfg[4][6] = {
+		{1, MTLBlendFactorSourceAlpha, MTLBlendFactorOneMinusSourceAlpha, MTLBlendFactorSourceAlpha, MTLBlendFactorOneMinusSourceAlpha, 0xf},
+		{1, MTLBlendFactorOne, MTLBlendFactorOne, MTLBlendFactorOne, MTLBlendFactorOne, 0xf},
+		{1, MTLBlendFactorBlendColor, MTLBlendFactorZero, MTLBlendFactorOne, MTLBlendFactorZero, 0xf},
+		{0, MTLBlendFactorOne, MTLBlendFactorZero, MTLBlendFactorOne, MTLBlendFactorZero, MTLColorWriteMaskRed | MTLColorWriteMaskAlpha}};
+	const NSUInteger cfgx[4][6] = {
+		{1, MTLBlendFactorBlendColor, MTLBlendFactorZero, MTLBlendFactorOne, MTLBlendFactorZero, 0xf},
+		{1, MTLBlendFactorOne, MTLBlendFactorZero, MTLBlendFactorZero, MTLBlendFactorOne, 0xf},
+		{1, MTLBlendFactorZero, MTLBlendFactorOne, MTLBlendFactorOne, MTLBlendFactorZero, 0xf},
+		{1, MTLBlendFactorBlendColor, MTLBlendFactorZero, MTLBlendFactorBlendColor, MTLBlendFactorZero, 0xf}};
+	const NSUInteger (*set)[6] = x ? cfgx : cfg;
+	id<MTLRenderPipelineState> ps[4];
+	for (int k = 0; k < 4; k++) {
+		MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+		pd.vertexFunction = [lib newFunctionWithName:@"bq_v"];
+		pd.fragmentFunction = [lib newFunctionWithName:@"bq_f"];
+		MTLRenderPipelineColorAttachmentDescriptor *a = pd.colorAttachments[0];
+		a.pixelFormat = MTLPixelFormatBGRA8Unorm;
+		a.blendingEnabled = set[k][0];
+		a.sourceRGBBlendFactor = set[k][1];
+		a.destinationRGBBlendFactor = set[k][2];
+		a.sourceAlphaBlendFactor = set[k][3];
+		a.destinationAlphaBlendFactor = set[k][4];
+		a.writeMask = set[k][5];
+		ps[k] = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+		if (!ps[k]) {
+			OUT("blend: pipeline %d NOT created: %s", k, err.localizedDescription.UTF8String);
+			return;
+		}
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	id<MTLBuffer> out = [d newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = t;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0.2, 0.4, 0.6, 1);
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe blend";
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setBlendColorRed:0.5 green:0.5 blue:0.5 alpha:x ? 0.25 : 0.5];
+	const float colour[4] = {1, 0.5f, 0.25f, 0.5f}, origin[4][2] = {{-1, 0}, {0, 0}, {-1, -1}, {0, -1}};   // TL, TR, BL, BR
+	for (int k = 0; k < 4; k++) {
+		[re setRenderPipelineState:ps[k]];
+		[re setVertexBytes:origin[k] length:8 atIndex:0];
+		[re setFragmentBytes:colour length:16 atIndex:0];
+		[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+	}
+	[re endEncoding];
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 64, 1) toBuffer:out
+	      destinationOffset:0 destinationBytesPerRow:64 * 4 destinationBytesPerImage:64 * 64 * 4];
+	[e endEncoding];
+	run(cb, x ? "blendx" : "blend");
+	// Expected RGBA (0..1) per quadrant: d = (0.2, 0.4, 0.6, 1), s = (1, 0.5, 0.25, 0.5), K = 0.5 (x: alpha 0.25)
+	const double wantn[4][4] = {{0.6, 0.45, 0.425, 0.75}, {1, 0.9, 0.85, 1}, {0.5, 0.25, 0.125, 0.5}, {1, 0.4, 0.6, 0.5}},
+	             wantx[4][4] = {{0.5, 0.25, 0.125, 0.5}, {1, 0.5, 0.25, 1}, {0.2, 0.4, 0.6, 0.5}, {0.5, 0.25, 0.125, 0.125}};
+	const double (*want)[4] = x ? wantx : wantn;
+	const char *const names[2][4] = {{"over", "add", "const", "mask"}, {"constrgb", "keepalpha", "keeprgb", "constall"}};
+	const int at[4][2] = {{16, 16}, {48, 16}, {16, 48}, {48, 48}};
+	int wrong = 0;
+	char line[256] = "", expect[256] = "";
+	for (int k = 0; k < 4; k++) {
+		const uint8_t *p = (const uint8_t *)out.contents + (at[k][1] * 64 + at[k][0]) * 4;   // B, G, R, A
+		const int got[4] = {p[2], p[1], p[0], p[3]};
+		int w[4];
+		for (int ch = 0; ch < 4; ch++) {
+			w[ch] = (int)lround(want[k][ch] * 255);
+			wrong += abs(got[ch] - w[ch]) > 2;
+		}
+		snprintf(line + strlen(line), sizeof(line) - strlen(line), " %s %d %d %d %d;", names[x][k], got[0], got[1], got[2], got[3]);
+		snprintf(expect + strlen(expect), sizeof(expect) - strlen(expect), "%s%s %d %d %d %d", k ? ", " : "", names[x][k], w[0], w[1], w[2], w[3]);
+	}
+	OUT("%s: RGBA%s %d of 16 channels off by more than 2 (%s)", x ? "blendx" : "blend", line, wrong, expect);
+}
+
+static void blendinfo(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "struct V { float4 pos [[position]]; };\n"
+	                                              "vertex V bi_v(uint vid [[vertex_id]]) { V v; v.pos = float4(vid == 1 ? 0.5 : -0.5, vid == 2 ? 0.5 : -0.5, 0, 1); return v; }\n"
+	                                              "fragment float4 bi_f() { return float4(1, 0.5, 0.25, 0.5); }"
+	                                     options:nil
+	                                       error:&err];
+	// {enabled, rgb src, rgb dst, rgb op, alpha src, alpha dst, alpha op, write mask}
+	const NSUInteger cfg[6][8] = {
+		{0, 1, 0, 0, 1, 0, 0, 0xf},
+		{1, MTLBlendFactorSourceAlpha, MTLBlendFactorOneMinusSourceAlpha, MTLBlendOperationAdd, MTLBlendFactorSourceAlpha, MTLBlendFactorOneMinusSourceAlpha, MTLBlendOperationAdd, 0xf},
+		{1, MTLBlendFactorOne, MTLBlendFactorOne, MTLBlendOperationSubtract, MTLBlendFactorZero, MTLBlendFactorOne, MTLBlendOperationReverseSubtract, 0xf},
+		{1, MTLBlendFactorDestinationColor, MTLBlendFactorZero, MTLBlendOperationMin, MTLBlendFactorBlendAlpha, MTLBlendFactorOneMinusBlendAlpha, MTLBlendOperationMax, 0xf},
+		{0, 1, 0, 0, 1, 0, 0, MTLColorWriteMaskRed | MTLColorWriteMaskAlpha},
+		{1, MTLBlendFactorSourceAlphaSaturated, MTLBlendFactorOneMinusDestinationAlpha, MTLBlendOperationAdd, MTLBlendFactorOne, MTLBlendFactorZero, MTLBlendOperationAdd, 0xf}};
+	id<MTLRenderPipelineState> ps[6];
+	for (int k = 0; k < 6; k++) {
+		MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+		pd.vertexFunction = [lib newFunctionWithName:@"bi_v"];
+		pd.fragmentFunction = [lib newFunctionWithName:@"bi_f"];
+		MTLRenderPipelineColorAttachmentDescriptor *a = pd.colorAttachments[0];
+		a.pixelFormat = MTLPixelFormatBGRA8Unorm;
+		a.blendingEnabled = cfg[k][0];
+		a.sourceRGBBlendFactor = cfg[k][1];
+		a.destinationRGBBlendFactor = cfg[k][2];
+		a.rgbBlendOperation = cfg[k][3];
+		a.sourceAlphaBlendFactor = cfg[k][4];
+		a.destinationAlphaBlendFactor = cfg[k][5];
+		a.alphaBlendOperation = cfg[k][6];
+		a.writeMask = cfg[k][7];
+		ps[k] = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+		if (!ps[k]) {
+			OUT("blendinfo: pipeline %d NOT created: %s", k, err.localizedDescription.UTF8String);
+			return;
+		}
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = [d newTextureWithDescriptor:td];
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe blendinfo";
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setBlendColorRed:0.1 green:0.2 blue:0.3 alpha:0.4];
+	for (int k = 0; k < 6; k++) {
+		[re setRenderPipelineState:ps[k]];
+		[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	}
+	[re endEncoding];
+	run(cb, "blendinfo");
+}
+
 static void drawargs(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	NSError *err = nil;
 	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
@@ -837,8 +986,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw"};
-			for (int i = 0; i < 16; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend"};
+			for (int i = 0; i < 17; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -895,10 +1044,14 @@ int main(int argc, char **argv) {
 			texinfo(d, q);
 		else if (!strcmp(mode, "texdraw"))
 			texdraw(d, q);
+		else if (!strcmp(mode, "blend") || !strcmp(mode, "blendx"))
+			blend(d, q, mode[5] == 'x');
+		else if (!strcmp(mode, "blendinfo"))
+			blendinfo(d, q);
 		else if (!strcmp(mode, "drawargs"))
 			drawargs(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, texinfo, drawargs, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, blend, texinfo, blendinfo, drawargs, all)", mode);
 			return 2;
 		}
 	}

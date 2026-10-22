@@ -651,6 +651,7 @@ public:
 	// `owner` is the client: its buffers and programs are only its own, and
 	// rtRelease frees them all. Every call takes rtLock.
 	IOReturn rtOpen(const void *owner);
+	bool runtimeReady() const { return rtReady; }   // the bring-up reached a dispatching stage
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
 	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
 	IOReturn rtSensorsEx(const void *owner, RDNA4SensorsEx &out);

@@ -196,7 +196,7 @@ public:
 	struct Bindings { uint32_t buffer[8]; uint64_t offset[8]; uint32_t texture[8], sampler[8]; };   // a stage's resources by Metal index (0 = none)
 	// A draw: Metal's primitive type, first vertex, vertices (indices), instances, base instance, and for an indexed draw the index buffer's
 	// resource id, offset and index size (bytes; 0: not indexed).
-	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes; };
+	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes, blendColor[4]; };
 	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *stage);
 	void runCompute(uint32_t task, uint32_t pipeline, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size);
 	void describeRenderPipeline(uint32_t task, uint32_t pipeline);
@@ -700,6 +700,7 @@ struct ExecTally {
 	uint32_t pipeline;                  // Compute.setComputePipelineState
 	uint32_t target, renderPipeline;    // Render: colour attachment 0's texture (writeDescriptor), setRenderPipelineState
 	RDNA4PvHost::Bindings stage[2];     // Render.setVertexBuffers, setFragmentBuffers
+	uint32_t blendColor[4];             // Render.setBlendColorRed: four floats' bits
 	RDNA4PvHost::Bindings compute;      // Compute.setBuffers
 };
 void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload, uint32_t bytes, size_t offset) {
@@ -720,13 +721,14 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		// {u32 type, u32 index buffer, u16 count, u16 offset}, 16-bit indices.
 		uint32_t w[3] = {};
 		memcpy(w, payload, id >= 0x005 ? 12 : 8);
-		RDNA4PvHost::Draw d = {w[0], w[1] & 0xffff, w[1] >> 16, 1, 0, 0, 0, 0};
+		RDNA4PvHost::Draw d = {w[0], w[1] & 0xffff, w[1] >> 16, 1, 0, 0, 0, 0, {}};
 		if (id == 0x003)
-			d = {w[1] >> 16, w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, 0, 0, 0, 0};
+			d = {w[1] >> 16, w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, 0, 0, 0, 0, {}};
 		else if (id == 0x005)
-			d = {w[2], w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, w[1] >> 16, 0, 0, 0};
+			d = {w[2], w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, w[1] >> 16, 0, 0, 0, {}};
 		else if (id == 0x007)
-			d = {w[0], 0, w[2] & 0xffff, 1, 0, w[1], w[2] >> 16, 2};
+			d = {w[0], 0, w[2] & 0xffff, 1, 0, w[1], w[2] >> 16, 2, {}};
+		memcpy(d.blendColor, t->blendColor, sizeof(d.blendColor));
 		t->host->runDraw(t->task, t->target, t->renderPipeline, d, t->stage);
 	} else if ((id == 0x0cb || id == 0x07d || id == 0x06e) && bytes >= 8) {
 		// Compute.setBuffers, Render.setVertexBuffers, setFragmentBuffers {u32 first index, u32 count, count x {u32 resource id, u64 offset}}
@@ -739,6 +741,8 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			memcpy(&g.buffer[first + k], payload + 8 + 12 * k, 4);
 			memcpy(&g.offset[first + k], payload + 12 + 12 * k, 8);
 		}
+	} else if (id == 0x065 && bytes >= 16) {   // Render.setBlendColorRed {float red, green, blue, alpha}
+		memcpy(t->blendColor, payload, 16);
 	} else if ((id == 0x072 || id == 0x070) && bytes >= 8) {
 		// Render.setFragmentTextures / setFragmentSamplerStates {u32 first index, u32 count, count x u32 resource id} (measured)
 		uint32_t first, count;
@@ -903,6 +907,27 @@ static uint32_t *streamReg(uint32_t *ib, uint32_t n, uint32_t opcode, uint32_t r
 	return nullptr;
 }
 
+// One pass of colour attachment 0's Metal blend state: {source factor, destination factor, operation} -> CB_BLEND0_CONTROL and
+// SX_MRT0_BLEND_OPT. The card ignores SEPARATE_ALPHA_BLEND here (rig 2026-10-22, mtlprobe blendx: alpha always takes the colour
+// equation), so a pass has one equation for all four channels and differing alpha is a second pass (runDraw).
+// Metal's factors are AMD's BlendOp in another order; for min and max AMD wants both factors One (Metal ignores them there).
+struct BlendPass {
+	uint32_t control, opt;
+	BlendPass(uint32_t src, uint32_t dst, uint32_t op) {
+		static const uint8_t factor[19] = {0, 1, 2, 3, 4, 5, 8, 9, 6, 7, 10, 11, 12, 17, 18, 13, 14, 15, 16};   // by MTLBlendFactor
+		static const uint8_t comb[5] = {0, 1, 4, 2, 3};      // Add, Subtract (src - dst), ReverseSubtract, Min, Max -> COMB_*
+		static const uint8_t optComb[5] = {1, 2, 5, 3, 4};   // the same -> OPT_COMB_*
+		op = op < 5 ? op : 0;
+		src = src < 19 ? factor[src] : 1;
+		dst = dst < 19 ? factor[dst] : 1;
+		if (op >= 3)
+			src = dst = 1;
+		const uint32_t eq = src | uint32_t{comb[op]} << 5 | dst << 8;
+		control = eq | eq << 16 | 1u << 30;   // the same equation in the alpha fields, ENABLE
+		opt = 0x00770077 | uint32_t{optComb[op]} << 8 | uint32_t{optComb[op]} << 24;   // PRESERVE_NONE_IGNORE_NONE, as RADV for factors it has no rule for
+	}
+};
+
 // n / 2 as an IEEE-754 single's bits, negated if asked, for n < 2^24 (no floating point in the kernel).
 static uint32_t halfAsFloat(uint32_t n, bool negative) {
 	if (!n)
@@ -932,6 +957,30 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		for (uint32_t k = 0, at = 17; k < pb[16] && at + 2 <= pbytes; k++, at += 2 + pb[at + 1])
 			if (pb[at] >= 1 && pb[at] <= 2 && pb[at + 1] == 4 && at + 6 <= pbytes)
 				memcpy(&fn[pb[at]], pb + at + 2, 4);
+	}
+	// Colour attachment 0's blend state, after the function list (measured with mtlprobe's blendinfo, docs/m1-stream.md s.5b): a second
+	// list (empty so far), u32 colour attachments, u32 ?, then per attachment {u8 n, n x {u8 key, u8 size, value}}: 0 index, 1 pixel format,
+	// 2 blending, 3 / 4 / 5 colour source factor, destination factor, operation, 6 / 7 / 8 the same for alpha, 9 write mask (defaults:
+	// off, One, Zero, Add, One, Zero, Add, 0xf).
+	uint32_t blend[10] = {0, 0, 0, 1, 0, 0, 1, 0, 0, 0xf};
+	{
+		uint8_t pb[256] = {};
+		uint32_t rec[3];
+		const uint32_t len = readGuest(task, 0x1000 + 12ull * pipeline, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) ? rec[0] >> 8 : 0;
+		if (len >= 17 && len <= sizeof(pb) && readGuest(task, rec[1], pb, len)) {
+			uint32_t at = 17;
+			for (uint32_t k = 0; k < pb[16] && at + 2 <= len; k++)   // the function list
+				at += 2 + pb[at + 1];
+			for (uint32_t k = 0, n = at < len ? pb[at++] : 0; k < n && at + 2 <= len; k++)   // the second list
+				at += 2 + pb[at + 1];
+			uint32_t attachments = 0;
+			if (at + 9 <= len)
+				memcpy(&attachments, pb + at, 4);
+			at += 8;
+			for (uint32_t k = 0, n = attachments && at < len ? pb[at++] : 0; k < n && at + 2 <= len; k++, at += 2 + pb[at + 1])
+				if (pb[at] < 10 && pb[at + 1] == 4 && at + 6 <= len)
+					memcpy(&blend[pb[at]], pb + at + 2, 4);
+		}
 	}
 	const char *why = !fn[1] || !fn[2] ? "the pipeline has no vertex or no fragment function"
 	                : draw.type != 3 && draw.type != 4 ? "only triangle lists and strips so far"
@@ -996,6 +1045,13 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const rdna4_tri_va where = {mGfxCode.gpu, tgt.gpu, rings, mGfxMisc.gpu};
 	const rdna4_tricol_va whereCol = {mGfxCode.gpu, tgt.gpu, rings, mGfxMisc.gpu};
 	const uint32_t n = !ok ? 0 : attributes ? rdna4_tricol_record(ib, &whereCol) : rdna4_tri_record(ib, &where);
+	// Blending: the colour pass, and when alpha's equation differs and both are written, an alpha-only pass after it.
+	// ponytail: a colour factor reading destination alpha sees the alpha from before the draw, not from earlier triangles of the same
+	// draw; exact unless such a draw overlaps itself.
+	const uint32_t mask = (blend[9] >> 3 & 1) | (blend[9] >> 1 & 2) | (blend[9] << 1 & 4) | (blend[9] << 3 & 8);   // Metal's A, B, G, R bits
+	const BlendPass rgbPass(blend[3], blend[4], blend[5]), alphaPass(blend[6], blend[7], blend[8]);
+	const bool split = blend[2] && rgbPass.control != alphaPass.control && (mask & 7) && (mask & 8);
+	const BlendPass &first = mask & 7 ? rgbPass : alphaPass;
 	struct Patch { uint32_t opcode, reg, value; } patch[] = {
 		{0x76, 0x8a, vs[3]}, {0x76, 0x8b, vs[4]},                          // SPI_SHADER_PGM_RSRC1_GS, RSRC2_GS: as LLVM compiled the vertex shader
 		{0x76, 0x0a, ps[3]}, {0x76, 0x0b, ps[4]},                          // SPI_SHADER_PGM_RSRC1_PS, RSRC2_PS
@@ -1006,6 +1062,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x10f, halfAsFloat(width, false)}, {0x69, 0x110, halfAsFloat(width, false)},   // PA_CL_VPORT_XSCALE, XOFFSET: w / 2
 		{0x69, 0x111, halfAsFloat(height, true)}, {0x69, 0x112, halfAsFloat(height, false)},  // YSCALE -h / 2 (Metal's y points up), YOFFSET h / 2
 		{0x79, 0x242, draw.type == 4 ? 6u : 4u},                           // VGT_PRIMITIVE_TYPE: DI_PT_TRISTRIP, DI_PT_TRILIST
+		{0x69, 0x1e0, blend[2] ? first.control : 0},                       // CB_BLEND0_CONTROL
+		{0x69, 0x1d8, blend[2] ? first.opt : 0x06000600u},                 // SX_MRT0_BLEND_OPT: else BLEND_DISABLED
+		{0x69, 0x214, split ? mask & 7 : mask},                            // CB_TARGET_MASK
 	};
 	for (const Patch &pt : patch)
 		if (uint32_t *d = n ? streamReg(ib, n, pt.opcode, pt.reg) : nullptr)
@@ -1123,8 +1182,12 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// draw VGT_INDEX_TYPE (SET_UCONFIG_REG_INDEX, as RADV on gfx9+); per instance the first vertex and the instance id (USER_DATA_GS_2/3, the
 	// vertex shader's s10-s11) and the draw: DRAW_INDEX_AUTO, or DRAW_INDEX_2 from the staged indices (DI_SRC_SEL_DMA).
 	const uint64_t table[2] = {mGfxMisc.gpu + 0x100, mGfxMisc.gpu + 0x200};
-	uint32_t seq[8 + 3 + kMaxInstances * 10], m = 0;
+	uint32_t seq[8 + 6 + 3 + 9 + 2 * kMaxInstances * 10], m = 0;
 	auto put = [&](uint32_t v) { seq[m++] = v; };
+	put(0xc0046900u);   // CB_BLEND_RED .. ALPHA: Render.setBlendColor's floats
+	put(0x105);
+	for (uint32_t c : draw.blendColor)
+		put(c);
 	for (unsigned st = 0; st < 2; st++) {
 		put(0xc0027600u);
 		put(st ? 0x0c : 0x8c);
@@ -1136,22 +1199,32 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		put(0x243 | 2u << 28);                // VGT_INDEX_TYPE, index 2
 		put(draw.indexBytes == 4 ? 1 : 0);    // 32- or 16-bit
 	}
-	for (uint32_t i = 0; i < draw.instances; i++) {
-		put(0xc0027600u);
-		put(0x8e);                            // SPI_SHADER_USER_DATA_GS_2, _3
-		put(draw.start);
-		put(draw.baseInstance + i);
-		if (draw.indexBytes) {
-			put(0xc0042700u);                 // DRAW_INDEX_2 {max indices, address, count, initiator}
-			put(count);
-			put(static_cast<uint32_t>(indexGpu));
-			put(static_cast<uint32_t>(indexGpu >> 32));
-			put(count);
-			put(0);
-		} else {
-			put(0xc0012d00u);                 // DRAW_INDEX_AUTO {count, initiator: DI_SRC_SEL_AUTO_INDEX}
-			put(count);
-			put(2);
+	for (uint32_t pass = 0; pass < (split ? 2u : 1u); pass++) {
+		if (pass) {   // the alpha pass
+			const uint32_t regs[3][2] = {{0x1e0, alphaPass.control}, {0x1d8, alphaPass.opt}, {0x214, mask & 8}};
+			for (const auto &r : regs) {
+				put(0xc0016900u);   // SET_CONTEXT_REG
+				put(r[0]);
+				put(r[1]);
+			}
+		}
+		for (uint32_t i = 0; i < draw.instances; i++) {
+			put(0xc0027600u);
+			put(0x8e);                            // SPI_SHADER_USER_DATA_GS_2, _3
+			put(draw.start);
+			put(draw.baseInstance + i);
+			if (draw.indexBytes) {
+				put(0xc0042700u);                 // DRAW_INDEX_2 {max indices, address, count, initiator}
+				put(count);
+				put(static_cast<uint32_t>(indexGpu));
+				put(static_cast<uint32_t>(indexGpu >> 32));
+				put(count);
+				put(0);
+			} else {
+				put(0xc0012d00u);                 // DRAW_INDEX_AUTO {count, initiator: DI_SRC_SEL_AUTO_INDEX}
+				put(count);
+				put(2);
+			}
 		}
 	}
 	uint32_t total = 0;
@@ -2599,6 +2672,12 @@ private:
 		IOService *parent = gLateParent;
 		if (!parent) {
 			pvlog("not publishing after the delay: the GPU has not attached");
+			return;
+		}
+		// Nor one whose work cannot run: Metal would see a device whose every command buffer "completes" without the card (rig, 2026-10-22:
+		// stage 2 failed, all mtlprobe checks wrong).
+		if (!gCompute || !gCompute->runtimeReady()) {
+			pvlog("not publishing after the delay: the compute runtime is not up");
 			return;
 		}
 #endif
