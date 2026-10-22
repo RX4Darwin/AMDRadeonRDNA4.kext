@@ -9,7 +9,9 @@
 #include "pvstream.hpp"
 #include "compute.hpp"
 #include "mtlkernels.h"
-#include "../userspace/rdna4-run/gfx12tri.h"     // M4: the triangle stream the host's draws are built from
+#include "../userspace/rdna4-run/gfx12tri.h"     // M4: the triangle streams the host's draws are built from (plain, one attribute)
+#include "../userspace/rdna4-run/gfx12tricol.h"
+static_assert(Gfx12Draw::kRingBytes == Gfx12DrawCol::kColRingBytes, "one ring block serves both streams");
 #include "../userspace/rdna4-run/gfx12trirun.h"
 #include "rdna4compute.h"
 #include "rdna4mtlc.h"
@@ -51,6 +53,7 @@ RDNA4Compute *gCompute { nullptr };   // RDNA4PvNub::setCompute
 struct Translation {
 	IOLock *lock;                 // allocated with the host (RDNA4PvHost::start)
 	bool helper;                  // a helper is connected
+	uint32_t helpers;             // helpers connected so far: failures cached under an older one are asked again
 	uint32_t seq, id;
 	bool taken, done;
 	const uint8_t *lib;
@@ -181,6 +184,7 @@ private:
 		uint32_t program, buffers, written;   // a compute kernel loaded into the runtime
 		uint8_t *gfx;                         // or a vertex or fragment shader: the helper's RGFX blob (air2amdgpu.cpp translateShader)
 		uint32_t gfxLen;
+		uint32_t helper;                      // gTr.helpers when it was translated (or failed)
 	};
 	const Jit *translated(uint32_t task, uint64_t lib, const char *name, const uint8_t hash[32]);
 	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
@@ -889,7 +893,9 @@ static uint32_t halfAsFloat(uint32_t n, bool negative) {
 // M4: Render.drawPrimitives on the card: the pipeline's vertex and fragment functions translated by the helper (air2amdgpu.cpp
 // translateShader), drawn with the stream of src/gfx12_draw.h (the triangle every gfx test of the kext draws, proven on the card) with the
 // translated shaders in place of its own and the target, viewport and draw patched; the colour attachment staged through a linear RGBA8
-// target (the texture is BGRA8, swapped on the way in and out). So far: triangle lists from vertex 0, one instance, no vertex buffers.
+// target (the texture is BGRA8, swapped on the way in and out). With one value from the vertex to the fragment shader the stream is the colour
+// triangle's (src/gfx12_draw_col.h: one parameter in the attribute ring), whose descriptor literals in the vertex shader the host patches as
+// for nggcol.s. So far: triangle lists from vertex 0, one instance, no vertex buffers, at most one attribute.
 void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uint32_t type, uint32_t start, uint32_t count, uint32_t instances) {
 	const bool talk = mRenderLines++ < 48;
 	// The pipeline: {16-byte header, u8 n, n x {u8 key, u8 size, value}}: key 1 the vertex function, key 2 the fragment function (measured).
@@ -915,6 +921,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uin
 		if (!head || head[1] != k || head[2] > 0xf00 || head[2] + 32 > shader[k]->gfxLen)
 			why = k == 1 ? "no translated vertex shader" : "no translated fragment shader";
 	}
+	const uint32_t attributes = why ? 0 : reinterpret_cast<const uint32_t *>(shader[1]->gfx)[7];
+	if (!why && (attributes > 1 || attributes != reinterpret_cast<const uint32_t *>(shader[2]->gfx)[7]))
+		why = "the shaders' attributes do not match one plain draw or one with one attribute";
 	uint64_t va = 0, len = 0;
 	uint32_t bpr = 0, width = 0;
 	if (!why && !(textureRange(task, target, &va, &len, &bpr, &width) && width && bpr == width * 4 && len % bpr == 0 && width <= 16384 && len / bpr <= 16384))
@@ -944,12 +953,21 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uin
 		code[i] = 0xbf9f0000u;
 	for (unsigned k = 1; k <= 2; k++)
 		memcpy(reinterpret_cast<uint8_t *>(code) + (k == 1 ? 0 : RDNA4_TRI_PS_OFFSET), shader[k]->gfx + 32, reinterpret_cast<const uint32_t *>(shader[k]->gfx)[2]);
+	const uint64_t rings = rdna4_trirun_rings_va(mGfxRings.gpu);   // attribute ring first
+	for (uint32_t i = 0; attributes && i < RDNA4_TRI_PS_OFFSET / 4; i++)   // the vertex shader's ring descriptor literals (nggcol.s)
+		if (code[i] == 0xc01a0001u)
+			code[i] = static_cast<uint32_t>(rings);
+		else if (code[i] == 0xc01a0002u)
+			code[i] = static_cast<uint32_t>((rings >> 32) & 0xffff) | 0xc0000000u | 16u << 16;   // swizzle 3, stride 16 bytes (one vec4)
+		else if (code[i] == 0xc01a0003u)
+			code[i] = static_cast<uint32_t>(Gfx12DrawCol::kColAttrRingBytes);
 	const uint32_t *vs = reinterpret_cast<const uint32_t *>(shader[1]->gfx), *ps = reinterpret_cast<const uint32_t *>(shader[2]->gfx);
 
 	// The stream: the triangle's, with this draw's addresses, shaders' registers, target, viewport and vertex count.
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];
-	const rdna4_tri_va where = {mGfxCode.gpu, tgt.gpu, rdna4_trirun_rings_va(mGfxRings.gpu), mGfxMisc.gpu};
-	const uint32_t n = ok ? rdna4_tri_record(ib, &where) : 0;
+	const rdna4_tri_va where = {mGfxCode.gpu, tgt.gpu, rings, mGfxMisc.gpu};
+	const rdna4_tricol_va whereCol = {mGfxCode.gpu, tgt.gpu, rings, mGfxMisc.gpu};
+	const uint32_t n = !ok ? 0 : attributes ? rdna4_tricol_record(ib, &whereCol) : rdna4_tri_record(ib, &where);
 	struct Patch { uint32_t opcode, reg, value; } patch[] = {
 		{0x76, 0x8a, vs[3]}, {0x76, 0x8b, vs[4]},                          // SPI_SHADER_PGM_RSRC1_GS, RSRC2_GS: as LLVM compiled the vertex shader
 		{0x76, 0x0a, ps[3]}, {0x76, 0x0b, ps[4]},                          // SPI_SHADER_PGM_RSRC1_PS, RSRC2_PS
@@ -1200,8 +1218,8 @@ uint32_t RDNA4PvHost::program(unsigned kernel) {
 // so a function that cannot be translated is asked for once). Null without a helper, or when it did not answer within 3 s (not cached).
 const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, const char *name, const uint8_t hash[32]) {
 	for (uint32_t i = 0; i < mJits && i < 32; i++)
-		if (!memcmp(mJit[i].hash, hash, 32))
-			return mJit[i].program || mJit[i].gfx ? &mJit[i] : nullptr;
+		if (!memcmp(mJit[i].hash, hash, 32) && (mJit[i].program || mJit[i].gfx || mJit[i].helper == gTr.helpers))
+			return mJit[i].program || mJit[i].gfx ? &mJit[i] : nullptr;   // a failure stays one until another helper connects
 	if (!gTr.lock || !gTr.helper)
 		return nullptr;
 	uint64_t size = 0;   // the metallib's file size (header u64 at 0x10)
@@ -1242,6 +1260,7 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	if (j.gfx)
 		IOFree(j.gfx, j.gfxLen);
 	memcpy(j.hash, hash, 32);
+	j.helper = gTr.helpers;
 	const bool shader = elf && elfLen >= 32 && !memcmp(elf, "RGFX", 4);
 	j.program = elf && !shader && buffers <= 8 ? load(elf, elfLen, name) : 0;
 	j.buffers = buffers;
@@ -2770,6 +2789,7 @@ bool RDNA4MtlcClient::start(IOService *provider) {
 	IOLockLock(gTr.lock);
 	mHelper = !gTr.helper;
 	gTr.helper = true;
+	gTr.helpers += mHelper;
 	IOLockUnlock(gTr.lock);
 	pvlog("host: translator helper %s", mHelper ? "connected" : "refused: one is connected already");
 	return mHelper;

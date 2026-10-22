@@ -389,11 +389,14 @@ struct Kernel {
 
 // A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
 // (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
-// u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 0}, then the code (relocation-free, the entry at its start).
-//   vertex   amdgpu_gs, an NGG shader as src/shaders/nggcol.s: s3 = merged_wave_info ([7:0] vertices, [15:8] primitives), v0 = the packed
-//            primitive, v3 = VertexID; the position goes out as pos0, the primitive as prim. So far: vertex_id (and instance_id, 0: the
-//            host draws one instance), the position as the only output.
-//   fragment amdgpu_ps exporting render target 0 as four floats (SPI_SHADER_COL_FORMAT 32_ABGR); so far no inputs.
+// u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes}, then the code (relocation-free, the entry at its start).
+//   vertex   amdgpu_gs, an NGG shader as src/shaders/nggcol.s: s3 = merged_wave_info ([7:0] vertices, [15:8] primitives, [27:24] wave in
+//            the subgroup), s5 = gs_attr_offset, v0 = the packed primitive, v3 = VertexID; the position goes out as pos0, the primitive
+//            as prim, a vertex output to the attribute ring (buffer_store_b128 at index = thread in the subgroup, soffset = gs_attr_offset
+//            << 9, scope device; the ring's descriptor from the literals 0xc01a0001-3, which the host patches, as nggcol.s). So far:
+//            vertex_id (and instance_id, 0: the host draws one instance), the position and at most one other output.
+//   fragment amdgpu_ps exporting render target 0 as four floats (SPI_SHADER_COL_FORMAT 32_ABGR), PrimMask in s0 (the host sets no user
+//            SGPRs); at most one input, interpolated at the centre with perspective (ds_param_load + v_interp_p10/p2, as pscol.s).
 static std::string translateShader(Module &m, Function *air, const MDNode *md, bool vertex, Kernel &out) {
 	LLVMContext &ctx = m.getContext();
 	Type *i32 = Type::getInt32Ty(ctx), *f32 = Type::getFloatTy(ctx);
@@ -402,7 +405,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (!outputs || !inputs)
 		return "the AIR shader's metadata is not as expected";
 	// The inputs: index -> where its value comes from (-1: unused, poison).
-	std::map<unsigned, int> from;   // 0 vertex id, 1 zero
+	std::map<unsigned, int> from;   // 0 vertex id, 1 zero, 2 the interpolated attribute, 3 the fragment's position
 	for (const MDOperand &op : inputs->operands()) {
 		const auto *a = cast<MDNode>(op);
 		const unsigned index = static_cast<unsigned>(mdInt(a, 0));
@@ -414,6 +417,10 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			from[index] = 0;
 		else if (vertex && kind == "air.instance_id")
 			from[index] = 1;
+		else if (!vertex && kind == "air.fragment_input" && !unused && mdString(a, 3) == "air.center" && mdString(a, 4) == "air.perspective")
+			from[index] = 2;
+		else if (!vertex && kind == "air.position" && !unused)
+			from[index] = 3;
 		else if (unused)
 			from[index] = -1;
 		else
@@ -421,29 +428,75 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	}
 	if (from.size() != air->arg_size())
 		return "not every argument of the AIR shader is described";
-	int position = -1;
+	int position = -1, attribute = -1;
 	for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
-		const std::string kind = mdString(cast<MDNode>(outputs->getOperand(k)), vertex ? 0 : 0);
+		const std::string kind = mdString(cast<MDNode>(outputs->getOperand(k)), 0);
 		if (vertex && kind == "air.position")
 			position = static_cast<int>(k);
+		else if (vertex && kind == "air.vertex_output" && attribute < 0)
+			attribute = static_cast<int>(k);
 		else if (!(!vertex && kind == "air.render_target" && outputs->getNumOperands() == 1 && air->getReturnType() == FixedVectorType::get(f32, 4)))
-			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet";
+			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet (at most one vertex output so far)";
 	}
-	if (vertex && (position < 0 || outputs->getNumOperands() != 1))
-		return "the vertex function must have the position as its only output (so far)";
+	unsigned attributes = vertex ? (attribute >= 0) : 0;
+	for (const auto &kv : from)
+		attributes += kv.second == 2;
+	if (vertex && position < 0)
+		return "the vertex function has no position";
+	if (attributes > 1)
+		return "more than one value from the vertex to the fragment shader is not supported yet";
+	// An attribute's type: float, float2, float3 or float4 (padded to four floats on the way).
+	auto attrType = [&](Type *t) {
+		auto *v = dyn_cast<FixedVectorType>(t);
+		return t == f32 || (v && v->getElementType() == f32 && v->getNumElements() <= 4);
+	};
+	if (vertex && attribute >= 0 && !attrType(cast<StructType>(air->getReturnType())->getElementType(static_cast<unsigned>(attribute))))
+		return "the vertex output is not float, float2, float3 or float4 (so far)";
 
 	// The shader.
-	const unsigned nArgs = vertex ? 10 : 0;   // vertex: s0-s5, v0-v3
-	Function *f = Function::Create(FunctionType::get(Type::getVoidTy(ctx), SmallVector<Type *, 10>(nArgs, i32), false), GlobalValue::ExternalLinkage,
-	                               vertex ? "vs" : "ps", &m);
+	// vertex: s0-s5, v0-v3; fragment: PrimMask (s0), then the hardware's pixel inputs in their order up to the position (one argument each:
+	// PERSP_SAMPLE, PERSP_CENTER, PERSP_CENTROID, PERSP_PULL_MODEL, LINEAR_SAMPLE, LINEAR_CENTER, LINEAR_CENTROID, LINE_STIPPLE, POS_X, POS_Y,
+	// POS_Z, POS_W); LLVM enables the ones used and reports them (SPI_PS_INPUT_ENA/ADDR).
+	Type *v2f32 = FixedVectorType::get(f32, 2), *v3f32 = FixedVectorType::get(f32, 3), *v4f32 = FixedVectorType::get(f32, 4);
+	SmallVector<Type *, 13> params = vertex ? SmallVector<Type *, 13>(10, i32)
+	                                        : SmallVector<Type *, 13>{i32, v2f32, v2f32, v2f32, v3f32, v2f32, v2f32, v2f32, f32, f32, f32, f32, f32};
+	Function *f = Function::Create(FunctionType::get(Type::getVoidTy(ctx), params, false), GlobalValue::ExternalLinkage, vertex ? "vs" : "ps", &m);
 	f->setCallingConv(vertex ? CallingConv::AMDGPU_GS : CallingConv::AMDGPU_PS);
-	for (unsigned k = 0; k < 6 && vertex; k++)
+	for (unsigned k = 0; k < (vertex ? 6u : 1u); k++)
 		f->addParamAttr(k, Attribute::InReg);
 	IRBuilder<> b(BasicBlock::Create(ctx, "entry", f));
+	// A float, float2, float3 or float4 as four floats (missing components 0, w 1 as Metal's vertex outputs have none) and back.
+	auto toVec4 = [&](Value *v) -> Value * {
+		Value *r = ConstantVector::get({ConstantFP::get(f32, 0.0), ConstantFP::get(f32, 0.0), ConstantFP::get(f32, 0.0), ConstantFP::get(f32, 1.0)});
+		auto *vt = dyn_cast<FixedVectorType>(v->getType());
+		for (unsigned k = 0; k < (vt ? vt->getNumElements() : 1); k++)
+			r = b.CreateInsertElement(r, vt ? b.CreateExtractElement(v, k) : v, k);
+		return r;
+	};
+	auto fromVec4 = [&](Value *v4, Type *t) -> Value * {
+		auto *vt = dyn_cast<FixedVectorType>(t);
+		if (!vt)
+			return b.CreateExtractElement(v4, uint64_t(0));
+		Value *r = PoisonValue::get(t);
+		for (unsigned k = 0; k < vt->getNumElements(); k++)
+			r = b.CreateInsertElement(r, b.CreateExtractElement(v4, k), k);
+		return r;
+	};
+	Value *interpolated = nullptr;   // fragment: attribute 0 at the pixel centre
+	auto fragPosition = [&]() {        // fragment: the pixel's window position x, y, depth z and w (POS_X..W_FLOAT)
+		Value *r = PoisonValue::get(v4f32);
+		for (unsigned c = 0; c < 4; c++)
+			r = b.CreateInsertElement(r, f->getArg(9 + c), c);
+		return r;
+	};
 	auto callAir = [&](Value *vid) {
 		SmallVector<Value *, 4> args;
 		for (unsigned k = 0; k < air->arg_size(); k++)
-			args.push_back(from[k] == 0 ? vid : from[k] == 1 ? static_cast<Value *>(b.getInt32(0)) : PoisonValue::get(air->getArg(k)->getType()));
+			args.push_back(from[k] == 0 ? vid
+			               : from[k] == 1 ? static_cast<Value *>(b.getInt32(0))
+			               : from[k] == 2 ? fromVec4(interpolated, air->getArg(k)->getType())
+			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
+			                              : PoisonValue::get(air->getArg(k)->getType()));
 		return b.CreateCall(air, args);
 	};
 	auto exportF32 = [&](unsigned target, Value *v4, bool vm) {
@@ -455,22 +508,59 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (vertex) {
 		b.CreateIntrinsic(Intrinsic::amdgcn_init_exec, {}, {b.getInt64(-1)});
 		Value *lane = b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {b.getInt32(-1), b.getInt32(0)});
-		Value *info = f->getArg(3);
-		BasicBlock *pos = BasicBlock::Create(ctx, "pos", f), *afterPos = BasicBlock::Create(ctx, "after_pos", f);
-		BasicBlock *prim = BasicBlock::Create(ctx, "prim", f), *done = BasicBlock::Create(ctx, "done", f);
-		b.CreateCondBr(b.CreateICmpULT(lane, b.CreateAnd(info, 255)), pos, afterPos);
+		Value *info = f->getArg(3), *vertices = b.CreateAnd(info, 255);
+		BasicBlock *entry = b.GetInsertBlock(), *pos = BasicBlock::Create(ctx, "pos", f), *afterPos = BasicBlock::Create(ctx, "after_pos", f);
+		BasicBlock *prim = BasicBlock::Create(ctx, "prim", f), *afterPrim = BasicBlock::Create(ctx, "after_prim", f);
+		BasicBlock *done = BasicBlock::Create(ctx, "done", f);
+		b.CreateCondBr(b.CreateICmpULT(lane, vertices), pos, afterPos);
 		b.SetInsertPoint(pos);
 		Value *r = callAir(f->getArg(9));
 		exportF32(12, r->getType()->isStructTy() ? b.CreateExtractValue(r, static_cast<unsigned>(position)) : r, false);   // pos0
+		Value *attr = attribute >= 0 ? toVec4(b.CreateExtractValue(r, static_cast<unsigned>(attribute))) : nullptr;
 		b.CreateBr(afterPos);
 		b.SetInsertPoint(afterPos);
-		b.CreateCondBr(b.CreateICmpULT(lane, b.CreateAnd(b.CreateLShr(info, 8), 255)), prim, done);
+		PHINode *value = nullptr;
+		if (attr) {   // the padding lanes store zeros
+			value = b.CreatePHI(v4f32, 2);
+			value->addIncoming(attr, pos);
+			value->addIncoming(Constant::getNullValue(v4f32), entry);
+		}
+		b.CreateCondBr(b.CreateICmpULT(lane, b.CreateAnd(b.CreateLShr(info, 8), 255)), prim, afterPrim);
 		b.SetInsertPoint(prim);
 		Value *undef = PoisonValue::get(i32);
 		b.CreateIntrinsic(Intrinsic::amdgcn_exp, {i32}, {b.getInt32(20), b.getInt32(1), f->getArg(6), undef, undef, undef, b.getTrue(), b.getFalse()});
-		b.CreateBr(done);
+		b.CreateBr(afterPrim);
+		b.SetInsertPoint(afterPrim);
+		if (!attr) {
+			b.CreateBr(done);
+		} else {   // lanes [0, (vertices + 7) & ~7): whole vec4s in groups of 8 lanes (nggcol.s)
+			BasicBlock *store = BasicBlock::Create(ctx, "store", f, done);
+			b.CreateCondBr(b.CreateICmpULT(lane, b.CreateAnd(b.CreateAdd(vertices, b.getInt32(7)), b.getInt32(~7u))), store, done);
+			b.SetInsertPoint(store);
+			auto literal = [&](uint32_t marker) {   // s_mov_b32 with the marker as its literal, for the host to patch
+				InlineAsm *mov = InlineAsm::get(FunctionType::get(i32, false), "s_mov_b32 $0, " + std::to_string(marker), "=s", true);
+				return b.CreateCall(mov);
+			};
+			Value *rsrc = PoisonValue::get(FixedVectorType::get(i32, 4));
+			Value *dw[4] = {literal(0xc01a0001u), literal(0xc01a0002u), literal(0xc01a0003u), b.getInt32(0x0043ffac)};   // dword3 as nggcol.s
+			for (unsigned k = 0; k < 4; k++)
+				rsrc = b.CreateInsertElement(rsrc, dw[k], k);
+			Value *thread = b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {b.getInt32(-1), b.CreateShl(b.CreateAnd(b.CreateLShr(info, 24), 15), 5)});
+			Value *soffset = b.CreateShl(b.CreateAnd(f->getArg(5), 0x7fff), 9);
+			b.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_store, {v4f32}, {value, rsrc, thread, b.getInt32(0), soffset, b.getInt32(2 << 3)});   // scope device
+			b.CreateBr(done);
+		}
 		b.SetInsertPoint(done);
 	} else {
+		if (attributes) {   // attribute 0: P0 + P10 * i + P20 * j per channel (pscol.s)
+			Value *center = f->getArg(2), *i = b.CreateExtractElement(center, uint64_t(0)), *j = b.CreateExtractElement(center, 1);
+			interpolated = PoisonValue::get(v4f32);
+			for (unsigned c = 0; c < 4; c++) {
+				Value *p = b.CreateIntrinsic(Intrinsic::amdgcn_lds_param_load, {}, {b.getInt32(c), b.getInt32(0), f->getArg(0)});
+				Value *p10 = b.CreateIntrinsic(Intrinsic::amdgcn_interp_inreg_p10, {}, {p, i, p});
+				interpolated = b.CreateInsertElement(interpolated, b.CreateIntrinsic(Intrinsic::amdgcn_interp_inreg_p2, {}, {p, j, p10}), c);
+			}
+		}
 		exportF32(0, callAir(nullptr), true);   // mrt0
 	}
 	b.CreateRetVoid();
@@ -524,7 +614,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		}
 	if (code.empty() || !regs[0])
 		return "no code or no register values in the shader object";
-	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3], 0};
+	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3], attributes};
 	out.hsaco.assign(reinterpret_cast<const char *>(head), sizeof(head));
 	out.hsaco += code.str();
 	out.buffers = 0;
@@ -740,6 +830,7 @@ int main(int argc, char **argv) {
 	InitializeAllTargets();
 	InitializeAllTargetMCs();
 	InitializeAllAsmPrinters();
+	InitializeAllAsmParsers();   // the inline asm of translateShader()
 	if (argc == 2 && StringRef(argv[1]) == "--serve")
 		return serve();
 	if (argc != 4)

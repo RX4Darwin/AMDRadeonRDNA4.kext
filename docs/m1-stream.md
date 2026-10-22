@@ -289,6 +289,17 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   16 us for the draw.** So far: triangle lists from vertex 0, one instance, no vertex buffers, no vertex outputs but the position, no
   fragment inputs; anything else is refused by name. The rig once failed the compute bring-up at stage 4 (SDMA's test write did not land)
   after a warm restart; a cold boot cleared it.
+- **M4, third step: a value from the vertex to the fragment shader (2026-10-22).** One `vertex_output` (float to float4, padded to a vec4)
+  goes to the attribute ring as `src/shaders/nggcol.s` stores it: `buffer_store_b128` at index = thread in the subgroup
+  (`mbcnt(merged_wave_info[27:24] << 5)`), soffset = `gs_attr_offset << 9`, scope device, lanes up to the vertex count rounded to 8 (zeros
+  in the padding lanes); the ring's descriptor is three `s_mov_b32` literals 0xc01a0001-3 written as inline asm (so they stay literals) and
+  patched by the host as for nggcol.s. The fragment shader reads one interpolated `fragment_input` (centre, perspective) with
+  `llvm.amdgcn.lds.param.load` + `interp.inreg.p10/p2` (PrimMask in s0: RSRC2_PS.USER_SGPR = 0) and gets `[[position]]` from POS_X..W
+  (its arguments follow the hardware's pixel inputs in order; LLVM enables what is used). With one attribute the host draws with the
+  colour triangle's stream (`src/gfx12_draw_col.h`, one parameter). The rig's Metal compiler marks a stage_in `[[position]]` used where
+  the local one marks it unused: handle both. A failed translation is now asked again once a newer helper connects. **On the card:
+  mtlprobe's `tricol` (red, green, blue vertices, 64x64) is exact against the CPU's barycentric colours, worst error 0 over 512 pixels,
+  the same pixels as Apple's GPU; `tri` and every other probe still pass.**
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's
