@@ -1159,7 +1159,11 @@ void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
 		return;
 	}
 	FBLOG("ndrv: Lilu did not report IONDRVSupport's load (another kext loaded it); routing it now, at %llu s", up / NSEC_PER_SEC);
-	processKext(nullptr, *gPatcher, kextIONDRVSupport.loadIndex, ndrv->address, ndrv->size);
+	// As Lilu before its load callbacks (kern_api.cpp processKextLoadCallbacks): the kext's running symbols, and its whole size (a kmod's is
+	// only __TEXT since 11.0). Without this its symbols cannot be solved ("no loaded symbols buffer found", seen on the rig 2026-10-22).
+	const size_t size = gPatcher->updateRunningInfo(kextIONDRVSupport.loadIndex, ndrv->address, ndrv->size);
+	gPatcher->clearError();
+	processKext(nullptr, *gPatcher, kextIONDRVSupport.loadIndex, ndrv->address, size);
 	// The GPU again: IONDRVFramebuffer matches again (its first instance did not start without our routes).
 	OSDictionary *match = IOService::serviceMatching("IOPCIDevice");
 	OSIterator *it = match ? IOService::getMatchingServices(match) : nullptr;
