@@ -30,6 +30,8 @@
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 #include <IOKit/ndrvsupport/IONDRVLibraries.h>
 #include <pexpert/pexpert.h>
+#include <kern/thread_call.h>
+#include <mach/kmod.h>
 
 #include "accelcensus.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
@@ -1019,9 +1021,11 @@ bool wrapVslPrepareCursor(void *cursorRef, void *descriptor, void *info) {
 	return org(cursorRef, descriptor, info);
 }
 
+bool ndrvRouted = false;   // processKext ran: by Lilu's load notice, or by lateNdrvCheck
+
 void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address,
                  size_t size) {
-	if (index != kextIONDRVSupport.loadIndex)
+	if (index != kextIONDRVSupport.loadIndex || __atomic_exchange_n(&ndrvRouted, true, __ATOMIC_SEQ_CST))
 		return;
 	KernelPatcher::RouteRequest request {
 		"__ZN17IONDRVFramebuffer10doDriverIOEjPvjj", wrapDoDriverIO, orgDoDriverIO,
@@ -1124,6 +1128,51 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 	patcher.clearError();
 }
 
+// Boots where IONDRVSupport is loaded where Lilu does not see it: SimpleHDA loads it itself the moment the system kext collection is ready
+// (2026-10-22: at 18 s, the framebuffer published 0.4 s later; Lilu's first load notice of the boot at 21 s). Lilu then never calls
+// processKext, IONDRVFramebuffer starts without our routes and is gone, and the card is never brought up (only the firmware's picture).
+// From 30 s on (by then the boot's kexts have loaded; on other boots processKext has run long before): if processKext has not run and
+// IONDRVSupport is in the kernel's kext list, run it with that kext's address, then register the GPU again so that IONDRVFramebuffer matches
+// again, now through our routes. Tried every 2 s until 120 s.
+KernelPatcher *gPatcher = nullptr;
+thread_call_t gLateNdrv = nullptr;
+
+void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
+	if (__atomic_load_n(&ndrvRouted, __ATOMIC_SEQ_CST) || !gPatcher)
+		return;
+	kmod_info_t *ndrv = nullptr;
+	if (auto **kmods = reinterpret_cast<kmod_info_t **>(gPatcher->solveSymbol(KernelPatcher::KernelID, "_kmod")))
+		for (kmod_info_t *k = *kmods; k && !ndrv; k = k->next)   // as Lilu walks it (kern_patcher.cpp processAlreadyLoadedKexts)
+			if (!strncmp(k->name, kextIONDRVSupport.id, KMOD_MAX_NAME))
+				ndrv = k;
+	gPatcher->clearError();
+	uint64_t up = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &up);
+	if (!ndrv) {
+		if (up < 120ull * NSEC_PER_SEC) {
+			uint64_t deadline;
+			clock_interval_to_deadline(2, kSecondScale, &deadline);
+			thread_call_enter_delayed(gLateNdrv, deadline);
+		} else {
+			FBLOG("ndrv: IONDRVSupport never loaded and Lilu never reported it: the card is not brought up");
+		}
+		return;
+	}
+	FBLOG("ndrv: Lilu did not report IONDRVSupport's load (another kext loaded it); routing it now, at %llu s", up / NSEC_PER_SEC);
+	processKext(nullptr, *gPatcher, kextIONDRVSupport.loadIndex, ndrv->address, ndrv->size);
+	// The GPU again: IONDRVFramebuffer matches again (its first instance did not start without our routes).
+	OSDictionary *match = IOService::serviceMatching("IOPCIDevice");
+	OSIterator *it = match ? IOService::getMatchingServices(match) : nullptr;
+	OSSafeReleaseNULL(match);
+	while (OSObject *o = it ? it->getNextObject() : nullptr)
+		if (auto *pci = OSDynamicCast(IOPCIDevice, o))
+			if (pci->configRead16(kIOPCIConfigVendorID) == 0x1002 && pci->configRead8(kIOPCIConfigClassCode + 2) == 0x03) {
+				FBLOG("ndrv: registering %s again for IONDRVFramebuffer", pci->getName());
+				pci->registerService();
+			}
+	OSSafeReleaseNULL(it);
+}
+
 void pluginStart() {
 	FBLOG("version " AMDRADEONRDNA4_BUILD);
 	uint32_t off = 0;
@@ -1158,6 +1207,12 @@ void pluginStart() {
 	FBLOG("Lilu plugin started (trace %s, compute stage %u%s%s)", traceEnabled ? "on" : "off",
 	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "", pvGpu ? ", FAKE PARAVIRT GPU (VM only)" : "");
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
+	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) { gPatcher = &patcher; });
+	if ((gLateNdrv = thread_call_allocate(lateNdrvCheck, nullptr))) {   // ponytail: never freed, it lives for the boot
+		uint64_t deadline;
+		clock_interval_to_deadline(30, kSecondScale, &deadline);
+		thread_call_enter_delayed(gLateNdrv, deadline);
+	}
 }
 
 const char *bootargDebug[] { "-rdna4dbg" };
