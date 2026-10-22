@@ -300,6 +300,17 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   the local one marks it unused: handle both. A failed translation is now asked again once a newer helper connects. **On the card:
   mtlprobe's `tricol` (red, green, blue vertices, 64x64) is exact against the CPU's barycentric colours, worst error 0 over 512 pixels,
   the same pixels as Apple's GPU; `tri` and every other probe still pass.**
+- **M4, fourth step: buffers in vertex and fragment shaders (2026-10-22).** `Render.setVertexBuffers` (0x07d) and `setFragmentBuffers`
+  (0x06e) are `{u32 first, u32 count, count x {u32 resource id, u64 offset}}` like Compute.setBuffers (measured: the probe's vertex buffer
+  as resource 6, setVertexBytes / setFragmentBytes as resource 7 at offsets 0 and 0x20); `setVertexBufferOffset` (0x07e) and
+  `setFragmentBufferOffset` (0x06f) `{u32 index, u64 offset}` (assumed like Compute's, not yet seen). Both stages take two user SGPRs, the
+  address of a table of 64-bit buffer addresses by Metal index: the merged NGG stage has eight system SGPRs, so its user SGPRs are s8-s9
+  (RADV's dump on the card: USER_SGPR = 3, merged_wave_info still s3, its first user value s8), the pixel shader's s0-s1 (PrimMask then
+  s2). The translated shaders load their addresses from the table with scalar loads; the host stages each stage's bound buffers into the
+  runtime per draw (read-only), writes the tables into the misc page (+0x100 vertex, +0x200 fragment), adds `SET_SH_REG
+  SPI_SHADER_USER_DATA_GS_0/1` and `_PS_0/1` before the draw and sets USER_SGPR = 2 in both RSRC2s. **On the card: mtlprobe's `vbuf`
+  (corners from a vertex buffer, a scale from setVertexBytes, the colour from setFragmentBytes) equals Apple's GPU: 496 pixels, colour and
+  half right; tri and tricol (now with this ABI) still exact.**
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's

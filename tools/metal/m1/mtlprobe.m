@@ -19,6 +19,7 @@
 //                      what Apple's GPU does
 //   mtlprobe tri       one triangle (vertices from vertex_id, a constant colour) drawn into a 64x64 BGRA texture cleared to black
 //   mtlprobe tricol    the triangle with a colour per vertex (red, green, blue) interpolated across it, each pixel checked against the CPU
+//   mtlprobe vbuf      a triangle from a vertex buffer (corners) scaled by setVertexBytes, coloured by setFragmentBytes
 //   mtlprobe drawargs  draws with distinct arguments, nothing checked (for decoding the draw commands)
 //   mtlprobe render    one render pass that clears a 64x64 BGRA texture to (0.25, 0.5, 0.75, 1)
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
@@ -512,6 +513,61 @@ static void tricol(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	    lit, wrong, worst, c[0], c[1], c[2], c[3], p[(20 * 64 + 24) * 4 + 3]);
 }
 
+static void vbuf(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "struct V { float4 pos [[position]]; };\n"
+	                                              "vertex V vb_v(uint vid [[vertex_id]], device const float2 *p [[buffer(0)]], constant float &scale [[buffer(1)]]) {"
+	                                              " V v; v.pos = float4(p[vid] * scale, 0, 1); return v; }\n"
+	                                              "fragment float4 vb_f(constant float4 &c [[buffer(0)]]) { return c; }"
+	                                     options:nil
+	                                       error:&err];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"vb_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"vb_f"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	if (!ps) {
+		OUT("vbuf: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	id<MTLBuffer> out = [d newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
+	const float corners[6] = {-1, -1, 1, -1, -1, 1}, scale = 0.5f, colour[4] = {0.2f, 0.4f, 0.6f, 1};   // bottom-left, bottom-right, top-left
+	id<MTLBuffer> p = [d newBufferWithBytes:corners length:sizeof(corners) options:MTLResourceStorageModeShared];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = t;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe vbuf";
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re setVertexBuffer:p offset:0 atIndex:0];
+	[re setVertexBytes:&scale length:sizeof(scale) atIndex:1];
+	[re setFragmentBytes:colour length:sizeof(colour) atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[re endEncoding];
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 64, 1) toBuffer:out
+	      destinationOffset:0 destinationBytesPerRow:64 * 4 destinationBytesPerImage:64 * 64 * 4];
+	[e endEncoding];
+	run(cb, "vbuf");
+	const uint8_t *px = out.contents;
+	int lit = 0, wrongColour = 0;
+	for (int i = 0; i < 64 * 64; i++)
+		if (px[i * 4 + 3]) {
+			lit++;
+			wrongColour += abs(px[i * 4] - 153) > 1 || abs(px[i * 4 + 1] - 102) > 1 || abs(px[i * 4 + 2] - 51) > 1 || px[i * 4 + 3] != 255;
+		}
+	OUT("vbuf: %d pixels lit, %d of another colour; (20, 44) A %u, (44, 20) A %u (496, 0, 255, 0 = executed, as Apple's GPU)", lit, wrongColour,
+	    px[(44 * 64 + 20) * 4 + 3], px[(20 * 64 + 44) * 4 + 3]);
+}
+
 static void drawargs(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	NSError *err = nil;
 	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
@@ -577,8 +633,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol"};
-			for (int i = 0; i < 13; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf"};
+			for (int i = 0; i < 14; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -627,10 +683,12 @@ int main(int argc, char **argv) {
 			tri(d, q);
 		else if (!strcmp(mode, "tricol"))
 			tricol(d, q);
+		else if (!strcmp(mode, "vbuf"))
+			vbuf(d, q);
 		else if (!strcmp(mode, "drawargs"))
 			drawargs(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, drawargs, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawargs, all)", mode);
 			return 2;
 		}
 	}

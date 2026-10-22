@@ -390,13 +390,16 @@ struct Kernel {
 // A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
 // (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
 // u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes}, then the code (relocation-free, the entry at its start).
+// Both stages get two user SGPRs, the address of a table of 64-bit buffer addresses by Metal buffer index (the host's, per stage; 0 if none).
 //   vertex   amdgpu_gs, an NGG shader as src/shaders/nggcol.s: s3 = merged_wave_info ([7:0] vertices, [15:8] primitives, [27:24] wave in
-//            the subgroup), s5 = gs_attr_offset, v0 = the packed primitive, v3 = VertexID; the position goes out as pos0, the primitive
+//            the subgroup), s5 = gs_attr_offset (s0-s7 are the merged stage's system SGPRs), s8-s9 the table, v0 = the packed primitive,
+//            v3 = VertexID; the position goes out as pos0, the primitive
 //            as prim, a vertex output to the attribute ring (buffer_store_b128 at index = thread in the subgroup, soffset = gs_attr_offset
 //            << 9, scope device; the ring's descriptor from the literals 0xc01a0001-3, which the host patches, as nggcol.s). So far:
-//            vertex_id (and instance_id, 0: the host draws one instance), the position and at most one other output.
-//   fragment amdgpu_ps exporting render target 0 as four floats (SPI_SHADER_COL_FORMAT 32_ABGR), PrimMask in s0 (the host sets no user
-//            SGPRs); at most one input, interpolated at the centre with perspective (ds_param_load + v_interp_p10/p2, as pscol.s).
+//            vertex_id (and instance_id, 0: the host draws one instance), buffers, the position and at most one other output.
+//   fragment amdgpu_ps exporting render target 0 as four floats (SPI_SHADER_COL_FORMAT 32_ABGR), s0-s1 the table, PrimMask in s2;
+//            buffers, the position and at most one input interpolated at the centre with perspective (ds_param_load + v_interp_p10/p2,
+//            as pscol.s).
 static std::string translateShader(Module &m, Function *air, const MDNode *md, bool vertex, Kernel &out) {
 	LLVMContext &ctx = m.getContext();
 	Type *i32 = Type::getInt32Ty(ctx), *f32 = Type::getFloatTy(ctx);
@@ -405,7 +408,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (!outputs || !inputs)
 		return "the AIR shader's metadata is not as expected";
 	// The inputs: index -> where its value comes from (-1: unused, poison).
-	std::map<unsigned, int> from;   // 0 vertex id, 1 zero, 2 the interpolated attribute, 3 the fragment's position
+	std::map<unsigned, int> from;   // 0 vertex id, 1 zero, 2 the interpolated attribute, 3 the fragment's position, 100 + n buffer n
 	for (const MDOperand &op : inputs->operands()) {
 		const auto *a = cast<MDNode>(op);
 		const unsigned index = static_cast<unsigned>(mdInt(a, 0));
@@ -421,6 +424,16 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			from[index] = 2;
 		else if (!vertex && kind == "air.position" && !unused)
 			from[index] = 3;
+		else if (kind == "air.buffer" && !unused) {
+			int location = -1;
+			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
+				if (mdString(a, k) == "air.location_index")
+					location = static_cast<int>(mdInt(a, k + 1));
+			if (location < 0 || location > 7 || index >= air->arg_size() ||
+			    (air->getArg(index)->getType() != PointerType::get(ctx, 1) && air->getArg(index)->getType() != PointerType::get(ctx, 2)))
+				return "buffer argument " + std::to_string(index) + ": only device and constant buffers at indices 0-7 so far";
+			from[index] = 100 + location;
+		}
 		else if (unused)
 			from[index] = -1;
 		else
@@ -458,11 +471,14 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	// PERSP_SAMPLE, PERSP_CENTER, PERSP_CENTROID, PERSP_PULL_MODEL, LINEAR_SAMPLE, LINEAR_CENTER, LINEAR_CENTROID, LINE_STIPPLE, POS_X, POS_Y,
 	// POS_Z, POS_W); LLVM enables the ones used and reports them (SPI_PS_INPUT_ENA/ADDR).
 	Type *v2f32 = FixedVectorType::get(f32, 2), *v3f32 = FixedVectorType::get(f32, 3), *v4f32 = FixedVectorType::get(f32, 4);
-	SmallVector<Type *, 13> params = vertex ? SmallVector<Type *, 13>(10, i32)
-	                                        : SmallVector<Type *, 13>{i32, v2f32, v2f32, v2f32, v3f32, v2f32, v2f32, v2f32, f32, f32, f32, f32, f32};
+	SmallVector<Type *, 16> params = vertex ? SmallVector<Type *, 16>(14, i32)   // s0-s7, s8-s9, v0-v3
+	                                        : SmallVector<Type *, 16>{i32, i32, i32, v2f32, v2f32, v2f32, v3f32, v2f32, v2f32, v2f32, f32, f32, f32, f32, f32};
+	// The arguments by name: vertex s3, s5, s8-s9, v0, v3; fragment s0-s1, s2, PERSP_CENTER, POS_X.
+	const unsigned kInfo = 3, kAttrOffset = 5, kPrim = 10, kVertexId = 13, kPrimMask = 2, kCenter = 4, kPosX = 11;
+	const unsigned kTable = vertex ? 8 : 0;
 	Function *f = Function::Create(FunctionType::get(Type::getVoidTy(ctx), params, false), GlobalValue::ExternalLinkage, vertex ? "vs" : "ps", &m);
 	f->setCallingConv(vertex ? CallingConv::AMDGPU_GS : CallingConv::AMDGPU_PS);
-	for (unsigned k = 0; k < (vertex ? 6u : 1u); k++)
+	for (unsigned k = 0; k < (vertex ? 10u : 3u); k++)
 		f->addParamAttr(k, Attribute::InReg);
 	IRBuilder<> b(BasicBlock::Create(ctx, "entry", f));
 	// A float, float2, float3 or float4 as four floats (missing components 0, w 1 as Metal's vertex outputs have none) and back.
@@ -483,10 +499,16 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		return r;
 	};
 	Value *interpolated = nullptr;   // fragment: attribute 0 at the pixel centre
+	auto buffer = [&](unsigned n, Type *t) -> Value * {   // buffer n's address from the stage's table (constant memory, scalar loads)
+		Value *table = b.CreateOr(b.CreateZExt(f->getArg(kTable), b.getInt64Ty()), b.CreateShl(b.CreateZExt(f->getArg(kTable + 1), b.getInt64Ty()), 32));
+		Value *at = b.CreateIntToPtr(b.CreateAdd(table, b.getInt64(8 * n)), PointerType::get(ctx, 4));
+		Value *address = b.CreateIntToPtr(b.CreateAlignedLoad(b.getInt64Ty(), at, Align(8)), PointerType::get(ctx, 1));
+		return t == address->getType() ? address : b.CreateAddrSpaceCast(address, t);   // a constant buffer: made global again by legalize()
+	};
 	auto fragPosition = [&]() {        // fragment: the pixel's window position x, y, depth z and w (POS_X..W_FLOAT)
 		Value *r = PoisonValue::get(v4f32);
 		for (unsigned c = 0; c < 4; c++)
-			r = b.CreateInsertElement(r, f->getArg(9 + c), c);
+			r = b.CreateInsertElement(r, f->getArg(kPosX + c), c);
 		return r;
 	};
 	auto callAir = [&](Value *vid) {
@@ -496,6 +518,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			               : from[k] == 1 ? static_cast<Value *>(b.getInt32(0))
 			               : from[k] == 2 ? fromVec4(interpolated, air->getArg(k)->getType())
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
+			               : from[k] >= 100 ? buffer(static_cast<unsigned>(from[k] - 100), air->getArg(k)->getType())
 			                              : PoisonValue::get(air->getArg(k)->getType()));
 		return b.CreateCall(air, args);
 	};
@@ -508,13 +531,13 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (vertex) {
 		b.CreateIntrinsic(Intrinsic::amdgcn_init_exec, {}, {b.getInt64(-1)});
 		Value *lane = b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {b.getInt32(-1), b.getInt32(0)});
-		Value *info = f->getArg(3), *vertices = b.CreateAnd(info, 255);
+		Value *info = f->getArg(kInfo), *vertices = b.CreateAnd(info, 255);
 		BasicBlock *entry = b.GetInsertBlock(), *pos = BasicBlock::Create(ctx, "pos", f), *afterPos = BasicBlock::Create(ctx, "after_pos", f);
 		BasicBlock *prim = BasicBlock::Create(ctx, "prim", f), *afterPrim = BasicBlock::Create(ctx, "after_prim", f);
 		BasicBlock *done = BasicBlock::Create(ctx, "done", f);
 		b.CreateCondBr(b.CreateICmpULT(lane, vertices), pos, afterPos);
 		b.SetInsertPoint(pos);
-		Value *r = callAir(f->getArg(9));
+		Value *r = callAir(f->getArg(kVertexId));
 		exportF32(12, r->getType()->isStructTy() ? b.CreateExtractValue(r, static_cast<unsigned>(position)) : r, false);   // pos0
 		Value *attr = attribute >= 0 ? toVec4(b.CreateExtractValue(r, static_cast<unsigned>(attribute))) : nullptr;
 		b.CreateBr(afterPos);
@@ -528,7 +551,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		b.CreateCondBr(b.CreateICmpULT(lane, b.CreateAnd(b.CreateLShr(info, 8), 255)), prim, afterPrim);
 		b.SetInsertPoint(prim);
 		Value *undef = PoisonValue::get(i32);
-		b.CreateIntrinsic(Intrinsic::amdgcn_exp, {i32}, {b.getInt32(20), b.getInt32(1), f->getArg(6), undef, undef, undef, b.getTrue(), b.getFalse()});
+		b.CreateIntrinsic(Intrinsic::amdgcn_exp, {i32}, {b.getInt32(20), b.getInt32(1), f->getArg(kPrim), undef, undef, undef, b.getTrue(), b.getFalse()});
 		b.CreateBr(afterPrim);
 		b.SetInsertPoint(afterPrim);
 		if (!attr) {
@@ -546,17 +569,17 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			for (unsigned k = 0; k < 4; k++)
 				rsrc = b.CreateInsertElement(rsrc, dw[k], k);
 			Value *thread = b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {b.getInt32(-1), b.CreateShl(b.CreateAnd(b.CreateLShr(info, 24), 15), 5)});
-			Value *soffset = b.CreateShl(b.CreateAnd(f->getArg(5), 0x7fff), 9);
+			Value *soffset = b.CreateShl(b.CreateAnd(f->getArg(kAttrOffset), 0x7fff), 9);
 			b.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_store, {v4f32}, {value, rsrc, thread, b.getInt32(0), soffset, b.getInt32(2 << 3)});   // scope device
 			b.CreateBr(done);
 		}
 		b.SetInsertPoint(done);
 	} else {
 		if (attributes) {   // attribute 0: P0 + P10 * i + P20 * j per channel (pscol.s)
-			Value *center = f->getArg(2), *i = b.CreateExtractElement(center, uint64_t(0)), *j = b.CreateExtractElement(center, 1);
+			Value *center = f->getArg(kCenter), *i = b.CreateExtractElement(center, uint64_t(0)), *j = b.CreateExtractElement(center, 1);
 			interpolated = PoisonValue::get(v4f32);
 			for (unsigned c = 0; c < 4; c++) {
-				Value *p = b.CreateIntrinsic(Intrinsic::amdgcn_lds_param_load, {}, {b.getInt32(c), b.getInt32(0), f->getArg(0)});
+				Value *p = b.CreateIntrinsic(Intrinsic::amdgcn_lds_param_load, {}, {b.getInt32(c), b.getInt32(0), f->getArg(kPrimMask)});
 				Value *p10 = b.CreateIntrinsic(Intrinsic::amdgcn_interp_inreg_p10, {}, {p, i, p});
 				interpolated = b.CreateInsertElement(interpolated, b.CreateIntrinsic(Intrinsic::amdgcn_interp_inreg_p2, {}, {p, j, p10}), c);
 			}

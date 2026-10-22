@@ -193,7 +193,9 @@ private:
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
 	uint32_t runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
-	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uint32_t type, uint32_t start, uint32_t count, uint32_t instances);
+	struct Bindings { uint32_t buffer[8]; uint64_t offset[8]; };   // a stage's buffers by Metal index (resource id, 0 = none)
+	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uint32_t type, uint32_t start, uint32_t count, uint32_t instances,
+	             const Bindings *stage);
 	void runCompute(uint32_t task, uint32_t pipeline, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size);
 	void describeRenderPipeline(uint32_t task, uint32_t pipeline);
 private:
@@ -695,8 +697,8 @@ struct ExecTally {
 	uint32_t task;
 	uint32_t pipeline;                  // Compute.setComputePipelineState
 	uint32_t target, renderPipeline;    // Render: colour attachment 0's texture (writeDescriptor), setRenderPipelineState
-	uint32_t buffer[8];                 // Compute.setBuffers: resource id per index (0 = none)
-	uint64_t offset[8];
+	RDNA4PvHost::Bindings stage[2];     // Render.setVertexBuffers, setFragmentBuffers
+	RDNA4PvHost::Bindings compute;      // Compute.setBuffers
 };
 void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload, uint32_t bytes, size_t offset) {
 	auto *t = static_cast<ExecTally *>(user);
@@ -713,34 +715,37 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 	} else if (id == 0x001 && bytes >= 8) {   // Render.drawPrimitives {u32 primitive type, u16 vertex start, u16 count} (measured)
 		uint32_t w[2];
 		memcpy(w, payload, 8);
-		t->host->runDraw(t->task, t->target, t->renderPipeline, w[0], w[1] & 0xffff, w[1] >> 16, 1);
+		t->host->runDraw(t->task, t->target, t->renderPipeline, w[0], w[1] & 0xffff, w[1] >> 16, 1, t->stage);
 	} else if (id == 0x003 && bytes >= 8) {   // Render.drawPrimitives {u16 start, u16 count, u16 instances, u16 type}
 		uint32_t w[2];
 		memcpy(w, payload, 8);
-		t->host->runDraw(t->task, t->target, t->renderPipeline, w[1] >> 16, w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff);
-	}
-	else if (id == 0x0d0 && bytes >= 4)
-		memcpy(&t->pipeline, payload, 4);
-	else if (id == 0x0cb && bytes >= 8) {   // {u32 first index, u32 count, count x {u32 resource id, u64 offset}} (measured, docs/m1-stream.md s.5b)
+		t->host->runDraw(t->task, t->target, t->renderPipeline, w[1] >> 16, w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, t->stage);
+	} else if ((id == 0x0cb || id == 0x07d || id == 0x06e) && bytes >= 8) {
+		// Compute.setBuffers, Render.setVertexBuffers, setFragmentBuffers {u32 first index, u32 count, count x {u32 resource id, u64 offset}}
+		// (measured, docs/m1-stream.md s.5b; setBytes is setBuffers on a driver buffer)
+		RDNA4PvHost::Bindings &g = id == 0x0cb ? t->compute : t->stage[id == 0x06e];
 		uint32_t first, count;
 		memcpy(&first, payload, 4);
 		memcpy(&count, payload + 4, 4);
 		for (uint32_t k = 0; k < count && first + k < 8 && 8 + 12 * (k + 1) <= bytes; k++) {
-			memcpy(&t->buffer[first + k], payload + 8 + 12 * k, 4);
-			memcpy(&t->offset[first + k], payload + 12 + 12 * k, 8);
+			memcpy(&g.buffer[first + k], payload + 8 + 12 * k, 4);
+			memcpy(&g.offset[first + k], payload + 12 + 12 * k, 8);
 		}
-	} else if (id == 0x0cf && bytes >= 12) {   // Compute.setBufferOffset {u32 index, u64 offset} (measured; setBytes is setBuffers on a driver buffer)
+	} else if ((id == 0x0cf || id == 0x07e || id == 0x06f) && bytes >= 12) {   // the set...BufferOffset of each: {u32 index, u64 offset}
+		RDNA4PvHost::Bindings &g = id == 0x0cf ? t->compute : t->stage[id == 0x06f];
 		uint32_t index;
 		memcpy(&index, payload, 4);
 		if (index < 8)
-			memcpy(&t->offset[index], payload + 4, 8);
+			memcpy(&g.offset[index], payload + 4, 8);
+	} else if (id == 0x0d0 && bytes >= 4) {
+		memcpy(&t->pipeline, payload, 4);
 	} else if ((id == 0x0ca || id == 0x0c8) && bytes >= 48) {
 		// Compute.dispatchThreads {u64 threads[3], u64 per group[3]}; dispatchThreadgroups {u64 groups[3], u64 per group[3]}: whole groups
 		uint64_t size[6];
 		memcpy(size, payload, sizeof(size));
 		for (unsigned d = 0; d < 3 && id == 0x0c8; d++)
 			size[d] *= size[d + 3];
-		t->host->runCompute(t->task, t->pipeline, t->buffer, t->offset, size);
+		t->host->runCompute(t->task, t->pipeline, t->compute.buffer, t->compute.offset, size);
 	}
 	if (t->lines++ >= 80)
 		return;
@@ -895,8 +900,11 @@ static uint32_t halfAsFloat(uint32_t n, bool negative) {
 // translated shaders in place of its own and the target, viewport and draw patched; the colour attachment staged through a linear RGBA8
 // target (the texture is BGRA8, swapped on the way in and out). With one value from the vertex to the fragment shader the stream is the colour
 // triangle's (src/gfx12_draw_col.h: one parameter in the attribute ring), whose descriptor literals in the vertex shader the host patches as
-// for nggcol.s. So far: triangle lists from vertex 0, one instance, no vertex buffers, at most one attribute.
-void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uint32_t type, uint32_t start, uint32_t count, uint32_t instances) {
+// for nggcol.s. Each stage's bound buffers are staged into the runtime (read-only: nothing is copied back) and their addresses put in a
+// table per stage in the misc page, which the shaders find in their two user SGPRs (SPI_SHADER_USER_DATA_GS_0/1, _PS_0/1, set by a packet
+// added before the draw). So far: triangle lists from vertex 0, one instance, buffers 0-7, at most one attribute.
+void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uint32_t type, uint32_t start, uint32_t count, uint32_t instances,
+                          const Bindings *bound) {
 	const bool talk = mRenderLines++ < 48;
 	// The pipeline: {16-byte header, u8 n, n x {u8 key, u8 size, value}}: key 1 the vertex function, key 2 the fragment function (measured).
 	uint64_t pd[8] = {};
@@ -989,6 +997,45 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uin
 			break;
 		}
 
+	// The stages' buffers, staged into the runtime, and their tables at +0x100 (vertex) and +0x200 (fragment) of the misc page (the fence at +0).
+	static constexpr uint64_t kMaxBuffer = 64ull << 20;
+	uint64_t misc[0x300 / 8] = {}, handle[2][8] = {};
+	for (unsigned st = 0; st < 2 && ok; st++)
+		for (unsigned k = 0; k < 8 && ok; k++) {
+			uint64_t bva = 0, blen = 0;
+			if (!bound[st].buffer[k])
+				continue;
+			ok = bufferRange(task, bound[st].buffer[k], &bva, &blen) && bound[st].offset[k] < blen && blen - bound[st].offset[k] <= kMaxBuffer;
+			const uint64_t bytes = ok ? blen - bound[st].offset[k] : 0;
+			auto *copy = ok ? static_cast<uint8_t *>(IOMalloc(bytes)) : nullptr;
+			uint64_t gpu = 0;
+			ok = copy && readGuest(task, bva + bound[st].offset[k], copy, static_cast<uint32_t>(bytes)) &&
+			     gCompute->rtAlloc(this, bytes, handle[st][k], gpu) == kIOReturnSuccess &&
+			     gCompute->rtCopy(this, handle[st][k], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(copy), bytes, true) == kIOReturnSuccess;
+			if (copy)
+				IOFree(copy, bytes);
+			misc[(0x100 + 0x100 * st) / 8 + k] = gpu;
+		}
+	// SPI_SHADER_USER_DATA_GS_0/1 and _PS_0/1 = the tables, just before the draw; both stages take two user SGPRs (air2amdgpu.cpp).
+	const uint64_t table[2] = {mGfxMisc.gpu + 0x100, mGfxMisc.gpu + 0x200};
+	const uint32_t userData[8] = {0xc0027600u, 0x8c, static_cast<uint32_t>(table[0]), static_cast<uint32_t>(table[0] >> 32),
+	                              0xc0027600u, 0x0c, static_cast<uint32_t>(table[1]), static_cast<uint32_t>(table[1] >> 32)};
+	uint32_t total = n;
+	for (uint32_t i = 0; ok && i < n; i++)
+		if (ib[i] == 0xc0012d00u && n + 8 <= sizeof(ib) / 4) {   // DRAW_INDEX_AUTO
+			memmove(&ib[i + 8], &ib[i], (n - i) * 4);
+			memcpy(&ib[i], userData, sizeof(userData));
+			total = n + 8;
+			break;
+		}
+	ok &= total == n + 8;
+	static const uint32_t rsrc2[2] = {0x8b, 0x0b};   // SPI_SHADER_PGM_RSRC2_GS, _PS: USER_SGPR [5:1] = 2
+	for (uint32_t reg : rsrc2)
+		if (uint32_t *d = ok ? streamReg(ib, total, 0x76, reg) : nullptr)
+			*d = (*d & ~0x3eu) | 2u << 1;
+		else
+			ok = false;
+
 	// The attachment in (BGRA8 rows -> RGBA8 at the target's pitch), the draw, the attachment out.
 	auto swap = [&]() {
 		for (uint64_t i = 0; i < static_cast<uint64_t>(pitch) * height; i++)
@@ -996,15 +1043,14 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uin
 	};
 	for (uint32_t y = 0; y < height && ok; y++)
 		ok = readGuest(task, va + static_cast<uint64_t>(y) * bpr, reinterpret_cast<uint8_t *>(stage + static_cast<uint64_t>(y) * pitch), bpr);
-	const uint32_t zero = 0;
 	uint64_t fence = 0, ns = 0;
 	if (ok) {
 		swap();
 		ok = gCompute->rtCopy(this, tgt.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), targetBytes, true) == kIOReturnSuccess &&
 		     gCompute->rtCopy(this, mGfxCode.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(code), sizeof(code), true) == kIOReturnSuccess &&
-		     gCompute->rtCopy(this, mGfxMisc.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(&zero), 4, true) == kIOReturnSuccess &&
-		     gCompute->rtCopy(this, mGfxIb.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(ib), n * 4, true) == kIOReturnSuccess &&
-		     gCompute->rtSubmitGfxIb(this, mGfxIb.gpu, n, 0, fence) == kIOReturnSuccess &&
+		     gCompute->rtCopy(this, mGfxMisc.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(misc), sizeof(misc), true) == kIOReturnSuccess &&
+		     gCompute->rtCopy(this, mGfxIb.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(ib), total * 4, true) == kIOReturnSuccess &&
+		     gCompute->rtSubmitGfxIb(this, mGfxIb.gpu, total, 0, fence) == kIOReturnSuccess &&
 		     gCompute->rtWaitGfxFence(this, static_cast<uint32_t>(fence), 2000, ns) == kIOReturnSuccess &&
 		     gCompute->rtCopy(this, tgt.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), targetBytes, false) == kIOReturnSuccess;
 	}
@@ -1015,6 +1061,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, uin
 	}
 	if (tgt.handle)
 		gCompute->rtFree(this, tgt.handle);
+	for (unsigned st = 0; st < 2; st++)
+		for (unsigned k = 0; k < 8; k++)
+			if (handle[st][k])
+				gCompute->rtFree(this, handle[st][k]);
 	if (stage)
 		IOFree(stage, targetBytes);
 	if (talk)
