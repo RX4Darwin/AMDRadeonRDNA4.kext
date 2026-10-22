@@ -354,6 +354,24 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   published it, and every probe "completed" with nothing run). Seen in passing: iTerm2 on the rig draws through Metal on our device
   (several of its functions translated; its draws not run yet: render targets that are not linear 32-bit textures, a vertex function
   not translated, no or more than 32 instances).
+- **M4, eighth step: several values between the stages (2026-10-22).** AIR names each vertex output and fragment input
+  (`generated(...)` or the `user(...)` name: operand 1 of an `air.vertex_output`, operand 2 of an `air.fragment_input`, which also lists
+  `air.flat` / `air.center` / `air.centroid` and `air.perspective` / `air.no_perspective`); the stages are linked by those names. The
+  translator gives the vertex function's outputs ring slots in declaration order (slot n stored at offset 16 n, as Mesa's
+  ac_nir_store_parameters_to_attr_ring) and the fragment function's inputs hardware inputs in argument order, and appends to each RGFX blob
+  a table {FNV-1a hash of the name, flat}; the host sets SPI_PS_INPUT_CNTL_k (OFFSET = the vertex slot with input k's name, FLAT_SHADE)
+  and SPI_SHADER_GS_OUT_CONFIG_PS (VS_EXPORT_COUNT, NUM_INTERP). Values: up to four floats, halves (widened to float) or integers up to 32
+  bits (bool included; zero-extended), at most 16 per stage; interpolated values from LLVM's `lds.param.load` + `interp.inreg.p10/p2` with
+  the perspective or linear centre barycentrics, flat ones from quad lane 0 of `lds.param.load` (DPP quad_perm 0,0,0,0, as ACO).
+  `air.discard_fragment` is `llvm.amdgcn.kill`. **Found on the card (one-value cases, 2026-10-22):** (1) the attribute ring descriptor's
+  stride must be 16 bytes per value (RADV's radv_nir_lower_abi ORs `16 * params` in); with 16 every value past the first read back zeros
+  or garbage; (2) the draw templates carry PA_SU_SC_MODE_CNTL.PROVOKING_VTX_LAST from the Linux capture, so flat values came from each
+  triangle's last vertex: the host clears it (Metal's provoking vertex is the first); (3) PERSP_CENTROID barycentrics are wrong when
+  PERSP_CENTER is also enabled (each alone, and linear centre with perspective centroid, are right): centroid inputs are read at the centre,
+  exact for our single-sample targets (radeonsi also forces the centre without MSAA). **On the card: mtlprobe's `varyings` (float3
+  perspective, float without perspective, half2 centroid, uint and bool flat) 0 of 3660 pixels off, worst 0; every other probe still
+  passes.** iTerm2's background-colour shaders (a float4 and a flat bool, a discard) now translate; still missing for it: constant tables
+  in the fragment shader (`iTermTextureCursorFragmentShader`) and render targets other than linear 32-bit textures.
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's

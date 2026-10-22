@@ -998,9 +998,22 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		if (!head || head[1] != k || head[2] > 0xf00 || head[2] + 32 > shader[k]->gfxLen)
 			why = k == 1 ? "no translated vertex shader" : "no translated fragment shader";
 	}
-	const uint32_t attributes = why ? 0 : reinterpret_cast<const uint32_t *>(shader[1]->gfx)[7];
-	if (!why && (attributes > 1 || attributes != reinterpret_cast<const uint32_t *>(shader[2]->gfx)[7]))
-		why = "the shaders' attributes do not match one plain draw or one with one attribute";
+	// The values between the stages: after each shader's code its table {u32 name hash, u32 flags (bit 0 flat)}, the vertex function's
+	// outputs by ring slot, the fragment function's inputs by hardware input; input k reads the slot with its name (SPI_PS_INPUT_CNTL_k).
+	const uint32_t *vs = why ? nullptr : reinterpret_cast<const uint32_t *>(shader[1]->gfx), *ps = why ? nullptr : reinterpret_cast<const uint32_t *>(shader[2]->gfx);
+	const uint32_t outs = vs ? vs[7] : 0, ins = ps ? ps[7] : 0;
+	uint32_t inputCntl[16] = {};
+	if (!why && (outs > 16 || ins > 16 || 32 + vs[2] + 8 * outs > shader[1]->gfxLen || 32 + ps[2] + 8 * ins > shader[2]->gfxLen))
+		why = "more than 16 values between the stages, or a shader without its table of them";
+	for (uint32_t k = 0; k < ins && !why; k++) {
+		const uint32_t *out = vs + 8 + vs[2] / 4, *in = ps + 8 + ps[2] / 4 + 2 * k;   // the tables after the code (whole instructions)
+		uint32_t slot = 0;
+		while (slot < outs && out[2 * slot] != in[0])
+			slot++;
+		if (slot == outs)
+			why = "a fragment input the vertex function does not write";
+		inputCntl[k] = slot | (in[1] & 1) << 10;   // OFFSET, FLAT_SHADE
+	}
 	uint64_t va = 0, len = 0;
 	uint32_t bpr = 0, width = 0;
 	if (!why && !(textureRange(task, target, &va, &len, &bpr, &width) && width && bpr == width * 4 && len % bpr == 0 && width <= 16384 && len / bpr <= 16384))
@@ -1031,20 +1044,19 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	for (unsigned k = 1; k <= 2; k++)
 		memcpy(reinterpret_cast<uint8_t *>(code) + (k == 1 ? 0 : RDNA4_TRI_PS_OFFSET), shader[k]->gfx + 32, reinterpret_cast<const uint32_t *>(shader[k]->gfx)[2]);
 	const uint64_t rings = rdna4_trirun_rings_va(mGfxRings.gpu);   // attribute ring first
-	for (uint32_t i = 0; attributes && i < RDNA4_TRI_PS_OFFSET / 4; i++)   // the vertex shader's ring descriptor literals (nggcol.s)
+	for (uint32_t i = 0; outs && i < RDNA4_TRI_PS_OFFSET / 4; i++)   // the vertex shader's ring descriptor literals (nggcol.s)
 		if (code[i] == 0xc01a0001u)
 			code[i] = static_cast<uint32_t>(rings);
 		else if (code[i] == 0xc01a0002u)
-			code[i] = static_cast<uint32_t>((rings >> 32) & 0xffff) | 0xc0000000u | 16u << 16;   // swizzle 3, stride 16 bytes (one vec4)
+			code[i] = static_cast<uint32_t>((rings >> 32) & 0xffff) | 0xc0000000u | 16u * outs << 16;   // swizzle 3, stride 16 bytes per value (RADV)
 		else if (code[i] == 0xc01a0003u)
 			code[i] = static_cast<uint32_t>(Gfx12DrawCol::kColAttrRingBytes);
-	const uint32_t *vs = reinterpret_cast<const uint32_t *>(shader[1]->gfx), *ps = reinterpret_cast<const uint32_t *>(shader[2]->gfx);
 
 	// The stream: the triangle's, with this draw's addresses, shaders' registers, target, viewport and vertex count.
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];
 	const rdna4_tri_va where = {mGfxCode.gpu, tgt.gpu, rings, mGfxMisc.gpu};
 	const rdna4_tricol_va whereCol = {mGfxCode.gpu, tgt.gpu, rings, mGfxMisc.gpu};
-	const uint32_t n = !ok ? 0 : attributes ? rdna4_tricol_record(ib, &whereCol) : rdna4_tri_record(ib, &where);
+	const uint32_t n = !ok ? 0 : outs ? rdna4_tricol_record(ib, &whereCol) : rdna4_tri_record(ib, &where);
 	// Blending: the colour pass, and when alpha's equation differs and both are written, an alpha-only pass after it.
 	// ponytail: a colour factor reading destination alpha sees the alpha from before the draw, not from earlier triangles of the same
 	// draw; exact unless such a draw overlaps itself.
@@ -1062,6 +1074,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x10f, halfAsFloat(width, false)}, {0x69, 0x110, halfAsFloat(width, false)},   // PA_CL_VPORT_XSCALE, XOFFSET: w / 2
 		{0x69, 0x111, halfAsFloat(height, true)}, {0x69, 0x112, halfAsFloat(height, false)},  // YSCALE -h / 2 (Metal's y points up), YOFFSET h / 2
 		{0x79, 0x242, draw.type == 4 ? 6u : 4u},                           // VGT_PRIMITIVE_TYPE: DI_PT_TRISTRIP, DI_PT_TRILIST
+		{0x76, 0x31, outs ? (outs - 1) | ins << 11 : 0x400u},              // SPI_SHADER_GS_OUT_CONFIG_PS: VS_EXPORT_COUNT, NUM_INTERP; NO_PC_EXPORT
+		{0x69, 0x207, 0x00000240u},                                        // PA_SU_SC_MODE_CNTL: the template's, without PROVOKING_VTX_LAST (Metal's is the first)
 		{0x69, 0x1e0, blend[2] ? first.control : 0},                       // CB_BLEND0_CONTROL
 		{0x69, 0x1d8, blend[2] ? first.opt : 0x06000600u},                 // SX_MRT0_BLEND_OPT: else BLEND_DISABLED
 		{0x69, 0x214, split ? mask & 7 : mask},                            // CB_TARGET_MASK
@@ -1182,12 +1196,18 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// draw VGT_INDEX_TYPE (SET_UCONFIG_REG_INDEX, as RADV on gfx9+); per instance the first vertex and the instance id (USER_DATA_GS_2/3, the
 	// vertex shader's s10-s11) and the draw: DRAW_INDEX_AUTO, or DRAW_INDEX_2 from the staged indices (DI_SRC_SEL_DMA).
 	const uint64_t table[2] = {mGfxMisc.gpu + 0x100, mGfxMisc.gpu + 0x200};
-	uint32_t seq[8 + 6 + 3 + 9 + 2 * kMaxInstances * 10], m = 0;
+	uint32_t seq[8 + 6 + 2 + 16 + 3 + 9 + 2 * kMaxInstances * 10], m = 0;
 	auto put = [&](uint32_t v) { seq[m++] = v; };
 	put(0xc0046900u);   // CB_BLEND_RED .. ALPHA: Render.setBlendColor's floats
 	put(0x105);
 	for (uint32_t c : draw.blendColor)
 		put(c);
+	if (ins) {
+		put(0xc0006900u | ins << 16);   // SPI_PS_INPUT_CNTL_0 .. ins - 1
+		put(0x199);
+		for (uint32_t k = 0; k < ins; k++)
+			put(inputCntl[k]);
+	}
 	for (unsigned st = 0; st < 2; st++) {
 		put(0xc0027600u);
 		put(st ? 0x0c : 0x8c);

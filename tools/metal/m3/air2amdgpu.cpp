@@ -302,6 +302,8 @@ static std::string legalize(Function &k) {
 				texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {v4f, b.getInt32Ty(), t->getType()}, {b.getInt32(15), x, y, t, b.getInt32(0), b.getInt32(0)});
 			}
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (name == "discard_fragment") {   // fragment only: the lane ends
+			b.CreateIntrinsic(Intrinsic::amdgcn_kill, {}, {b.getFalse()});
 		} else if (name == "get_read_sampler") {
 			r = PoisonValue::get(c->getType());   // read_texture's sampler operand: unused
 		} else if (op.starts_with("simd_")) {
@@ -449,18 +451,23 @@ struct Kernel {
 
 // A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
 // (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
-// u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes}, then the code (relocation-free, the entry at its start).
+// u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes}, then the code (relocation-free, the entry at its start), then per attribute
+// {u32 hash of its AIR name (FNV-1a), u32 flags: bit 0 flat}: the vertex function's outputs in ring-slot order, the fragment function's
+// inputs in hardware-input order; the host matches them by name (SPI_PS_INPUT_CNTL_n).
 // Both stages get two user SGPRs, the address of the stage's table (the host's): 64-bit buffer addresses by Metal buffer index at +0, and in
 // the fragment stage the textures' T#s (8 dwords) at +64 + 32 n and the samplers' S#s (4 dwords) at +320 + 16 n.
 //   vertex   amdgpu_gs, an NGG shader as src/shaders/nggcol.s: s3 = merged_wave_info ([7:0] vertices, [15:8] primitives, [27:24] wave in
 //            the subgroup), s5 = gs_attr_offset (s0-s7 are the merged stage's system SGPRs), s8-s9 the table, s10 the first vertex
 //            (added to VertexID, as RADV's base vertex), s11 the instance id, v0 = the packed primitive, v3 = VertexID; the position goes out as pos0, the primitive
-//            as prim, a vertex output to the attribute ring (buffer_store_b128 at index = thread in the subgroup, soffset = gs_attr_offset
-//            << 9, scope device; the ring's descriptor from the literals 0xc01a0001-3, which the host patches, as nggcol.s). So far:
-//            vertex_id, instance_id, buffers, the position and at most one other output.
+//            as prim, the other outputs to the attribute ring, output n in slot n (buffer_store_b128 at index = thread in the subgroup,
+//            offset 16 n, soffset = gs_attr_offset << 9, scope device; the ring's descriptor from the literals 0xc01a0001-3, which the
+//            host patches, as nggcol.s and Mesa's ac_nir_store_parameters_to_attr_ring). So far: vertex_id, instance_id, buffers.
 //   fragment amdgpu_ps exporting render target 0 as four floats (SPI_SHADER_COL_FORMAT 32_ABGR), s0-s1 the table, PrimMask in s2;
-//            buffers, the position and at most one input interpolated at the centre with perspective (ds_param_load + v_interp_p10/p2,
-//            as pscol.s).
+//            buffers, textures, samplers, the position and inputs, input n from hardware input n: interpolated at the centre (centroid
+//            too, single-sample targets only so far), with or without perspective (ds_param_load + v_interp_p10/p2, as pscol.s), or flat (ds_param_load and quad lane 0,
+//            the provoking vertex's value, as ACO's emit_interp_mov_instr).
+// A value between the stages is up to four 32-bit words: float, half, int, short, char or bool, scalar or vector (half widened to float,
+// smaller integers zero-extended).
 static std::string translateShader(Module &m, Function *air, const MDNode *md, bool vertex, Kernel &out) {
 	LLVMContext &ctx = m.getContext();
 	Type *i32 = Type::getInt32Ty(ctx), *f32 = Type::getFloatTy(ctx);
@@ -469,7 +476,16 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (!outputs || !inputs)
 		return "the AIR shader's metadata is not as expected";
 	// The inputs: index -> where its value comes from (-1: unused, poison).
-	std::map<unsigned, int> from;   // 0 vertex id, 1 instance id, 2 the interpolated attribute, 3 the fragment's position, 100 + n buffer n
+	// 0 vertex id, 1 instance id, 3 the fragment's position, 100 + n buffer n, 200 + n texture n, 300 + n sampler n, 400 + n input n
+	std::map<unsigned, int> from;
+	struct Var { unsigned index; uint32_t hash; bool flat; unsigned bary; };   // a value between the stages (index: its argument or member)
+	std::vector<Var> vars;
+	auto fnv = [](const std::string &name) {
+		uint32_t h = 2166136261u;
+		for (unsigned char c : name)
+			h = (h ^ c) * 16777619u;
+		return h;
+	};
 	for (const MDOperand &op : inputs->operands()) {
 		const auto *a = cast<MDNode>(op);
 		const unsigned index = static_cast<unsigned>(mdInt(a, 0));
@@ -481,8 +497,24 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			from[index] = 0;
 		else if (vertex && kind == "air.instance_id")
 			from[index] = 1;
-		else if (!vertex && kind == "air.fragment_input" && !unused && mdString(a, 3) == "air.center" && mdString(a, 4) == "air.perspective")
-			from[index] = 2;
+		else if (!vertex && kind == "air.fragment_input" && !unused) {
+			// The interpolation: air.flat, or air.center / air.centroid with air.perspective / air.no_perspective; the hardware's
+			// barycentric inputs PERSP_CENTER 4 and LINEAR_CENTER 8 (the arguments below).
+			bool flat = false, centroid = false, linear = false, center = false;   // centroid: accepted, read at the centre (below)
+			for (unsigned k = 3; k < a->getNumOperands(); k++) {
+				const std::string q = mdString(a, k);
+				flat |= q == "air.flat";
+				centroid |= q == "air.centroid";
+				center |= q == "air.center";
+				linear |= q == "air.no_perspective";
+			}
+			if (!flat && !center && !centroid)
+				return "fragment input " + std::to_string(index) + ": only center, centroid or flat interpolation so far";
+			// ponytail: centroid read at the centre, exact for the single-sample targets drawn so far (the card's PERSP_CENTROID is
+			// wrong next to PERSP_CENTER, mtlprobe vycase 8, 2026-10-22; radeonsi also forces the centre without MSAA); MSAA needs it back.
+			from[index] = 400 + static_cast<int>(vars.size());
+			vars.push_back({index, fnv(mdString(a, 2)), flat, linear ? 8u : 4u});
+		}
 		else if (!vertex && kind == "air.position" && !unused)
 			from[index] = 3;
 		else if (kind == "air.buffer" && !unused) {
@@ -510,30 +542,31 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	}
 	if (from.size() != air->arg_size())
 		return "not every argument of the AIR shader is described";
-	int position = -1, attribute = -1;
+	int position = -1;
 	for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
-		const std::string kind = mdString(cast<MDNode>(outputs->getOperand(k)), 0);
+		const auto *o = cast<MDNode>(outputs->getOperand(k));
+		const std::string kind = mdString(o, 0);
 		if (vertex && kind == "air.position")
 			position = static_cast<int>(k);
-		else if (vertex && kind == "air.vertex_output" && attribute < 0)
-			attribute = static_cast<int>(k);
+		else if (vertex && kind == "air.vertex_output")
+			vars.push_back({k, fnv(mdString(o, 1)), false, 0});
 		else if (!(!vertex && kind == "air.render_target" && outputs->getNumOperands() == 1 && air->getReturnType() == FixedVectorType::get(f32, 4)))
-			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet (at most one vertex output so far)";
+			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet";
 	}
-	unsigned attributes = vertex ? (attribute >= 0) : 0;
-	for (const auto &kv : from)
-		attributes += kv.second == 2;
 	if (vertex && position < 0)
 		return "the vertex function has no position";
-	if (attributes > 1)
-		return "more than one value from the vertex to the fragment shader is not supported yet";
-	// An attribute's type: float, float2, float3 or float4 (padded to four floats on the way).
-	auto attrType = [&](Type *t) {
-		auto *v = dyn_cast<FixedVectorType>(t);
-		return t == f32 || (v && v->getElementType() == f32 && v->getNumElements() <= 4);
-	};
-	if (vertex && attribute >= 0 && !attrType(cast<StructType>(air->getReturnType())->getElementType(static_cast<unsigned>(attribute))))
-		return "the vertex output is not float, float2, float3 or float4 (so far)";
+	if (vars.size() > 16)
+		return "more than 16 values between the stages (so far)";
+	// A value's type: up to four floats, halves or integers of up to 32 bits (bool included); integers only flat.
+	for (const Var &v : vars) {
+		Type *t = vertex ? cast<StructType>(air->getReturnType())->getElementType(v.index) : air->getArg(v.index)->getType();
+		auto *vt = dyn_cast<FixedVectorType>(t);
+		Type *e = vt ? vt->getElementType() : t;
+		if ((vt && vt->getNumElements() > 4) || !(e == f32 || e->isHalfTy() || (e->isIntegerTy() && e->getIntegerBitWidth() <= 32)))
+			return "a value between the stages is not up to four floats, halves or 32-bit integers (so far)";
+		if (!vertex && e->isIntegerTy() && !v.flat)
+			return "an integer fragment input that is not flat";
+	}
 
 	// The shader.
 	// vertex: s0-s5, v0-v3; fragment: PrimMask (s0), then the hardware's pixel inputs in their order up to the position (one argument each:
@@ -542,32 +575,44 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	Type *v2f32 = FixedVectorType::get(f32, 2), *v3f32 = FixedVectorType::get(f32, 3), *v4f32 = FixedVectorType::get(f32, 4);
 	SmallVector<Type *, 16> params = vertex ? SmallVector<Type *, 16>(16, i32)   // s0-s7, s8-s11, v0-v3
 	                                        : SmallVector<Type *, 16>{i32, i32, i32, v2f32, v2f32, v2f32, v3f32, v2f32, v2f32, v2f32, f32, f32, f32, f32, f32};
-	// The arguments by name: vertex s3, s5, s8-s9, s10, s11, v0, v3; fragment s0-s1, s2, PERSP_CENTER, POS_X.
-	const unsigned kInfo = 3, kAttrOffset = 5, kFirstVertex = 10, kInstance = 11, kPrim = 12, kVertexId = 15, kPrimMask = 2, kCenter = 4, kPosX = 11;
+	// The arguments by name: vertex s3, s5, s8-s9, s10, s11, v0, v3; fragment s0-s1, s2, POS_X (the barycentrics: Var::bary).
+	const unsigned kInfo = 3, kAttrOffset = 5, kFirstVertex = 10, kInstance = 11, kPrim = 12, kVertexId = 15, kPrimMask = 2, kPosX = 11;
 	const unsigned kTable = vertex ? 8 : 0;
 	Function *f = Function::Create(FunctionType::get(Type::getVoidTy(ctx), params, false), GlobalValue::ExternalLinkage, vertex ? "vs" : "ps", &m);
 	f->setCallingConv(vertex ? CallingConv::AMDGPU_GS : CallingConv::AMDGPU_PS);
 	for (unsigned k = 0; k < (vertex ? 12u : 3u); k++)
 		f->addParamAttr(k, Attribute::InReg);
 	IRBuilder<> b(BasicBlock::Create(ctx, "entry", f));
-	// A float, float2, float3 or float4 as four floats (missing components 0, w 1 as Metal's vertex outputs have none) and back.
+	// A value as four floats' bits (missing components 0, w 1 as Metal's vertex outputs have none) and back; for float4 the identity.
+	auto components = [](Type *t) { auto *vt = dyn_cast<FixedVectorType>(t); return vt ? vt->getNumElements() : 1u; };
 	auto toVec4 = [&](Value *v) -> Value * {
 		Value *r = ConstantVector::get({ConstantFP::get(f32, 0.0), ConstantFP::get(f32, 0.0), ConstantFP::get(f32, 0.0), ConstantFP::get(f32, 1.0)});
-		auto *vt = dyn_cast<FixedVectorType>(v->getType());
-		for (unsigned k = 0; k < (vt ? vt->getNumElements() : 1); k++)
-			r = b.CreateInsertElement(r, vt ? b.CreateExtractElement(v, k) : v, k);
+		const bool vec = v->getType()->isVectorTy();
+		for (unsigned k = 0; k < components(v->getType()); k++) {
+			Value *x = vec ? b.CreateExtractElement(v, k) : v;
+			if (x->getType()->isHalfTy())
+				x = b.CreateFPExt(x, f32);
+			else if (x->getType()->isIntegerTy())
+				x = b.CreateBitCast(b.CreateZExt(x, i32), f32);
+			r = b.CreateInsertElement(r, x, k);
+		}
 		return r;
 	};
 	auto fromVec4 = [&](Value *v4, Type *t) -> Value * {
 		auto *vt = dyn_cast<FixedVectorType>(t);
-		if (!vt)
-			return b.CreateExtractElement(v4, uint64_t(0));
-		Value *r = PoisonValue::get(t);
-		for (unsigned k = 0; k < vt->getNumElements(); k++)
-			r = b.CreateInsertElement(r, b.CreateExtractElement(v4, k), k);
+		Type *e = vt ? vt->getElementType() : t;
+		Value *r = vt ? PoisonValue::get(t) : nullptr;
+		for (unsigned k = 0; k < components(t); k++) {
+			Value *x = b.CreateExtractElement(v4, k);
+			if (e->isHalfTy())
+				x = b.CreateFPTrunc(x, e);
+			else if (e->isIntegerTy())
+				x = b.CreateTrunc(b.CreateBitCast(x, i32), e);
+			r = vt ? b.CreateInsertElement(r, x, k) : x;
+		}
 		return r;
 	};
-	Value *interpolated = nullptr;   // fragment: attribute 0 at the pixel centre
+	std::vector<Value *> inValues;   // fragment: input n's value as four floats' bits
 	auto table = [&]() {   // the stage's table address, from its two user SGPRs
 		return b.CreateOr(b.CreateZExt(f->getArg(kTable), b.getInt64Ty()), b.CreateShl(b.CreateZExt(f->getArg(kTable + 1), b.getInt64Ty()), 32));
 	};
@@ -589,7 +634,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		for (unsigned k = 0; k < air->arg_size(); k++)
 			args.push_back(from[k] == 0 ? vid
 			               : from[k] == 1 ? f->getArg(kInstance)
-			               : from[k] == 2 ? fromVec4(interpolated, air->getArg(k)->getType())
+			               : from[k] >= 400 ? fromVec4(inValues[static_cast<unsigned>(from[k] - 400)], air->getArg(k)->getType())
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
 			               : from[k] >= 300 ? handle(320 + 16 * static_cast<unsigned>(from[k] - 300), air->getArg(k)->getType())
 			               : from[k] >= 200 ? handle(64 + 32 * static_cast<unsigned>(from[k] - 200), air->getArg(k)->getType())
@@ -614,14 +659,16 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		b.SetInsertPoint(pos);
 		Value *r = callAir(b.CreateAdd(f->getArg(kVertexId), f->getArg(kFirstVertex)));
 		exportF32(12, r->getType()->isStructTy() ? b.CreateExtractValue(r, static_cast<unsigned>(position)) : r, false);   // pos0
-		Value *attr = attribute >= 0 ? toVec4(b.CreateExtractValue(r, static_cast<unsigned>(attribute))) : nullptr;
+		std::vector<Value *> values;
+		for (const Var &v : vars)
+			values.push_back(toVec4(b.CreateExtractValue(r, v.index)));
 		b.CreateBr(afterPos);
 		b.SetInsertPoint(afterPos);
-		PHINode *value = nullptr;
-		if (attr) {   // the padding lanes store zeros
-			value = b.CreatePHI(v4f32, 2);
-			value->addIncoming(attr, pos);
-			value->addIncoming(Constant::getNullValue(v4f32), entry);
+		for (Value *&v : values) {   // the padding lanes store zeros
+			PHINode *phi = b.CreatePHI(v4f32, 2);
+			phi->addIncoming(v, pos);
+			phi->addIncoming(Constant::getNullValue(v4f32), entry);
+			v = phi;
 		}
 		b.CreateCondBr(b.CreateICmpULT(lane, b.CreateAnd(b.CreateLShr(info, 8), 255)), prim, afterPrim);
 		b.SetInsertPoint(prim);
@@ -629,7 +676,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		b.CreateIntrinsic(Intrinsic::amdgcn_exp, {i32}, {b.getInt32(20), b.getInt32(1), f->getArg(kPrim), undef, undef, undef, b.getTrue(), b.getFalse()});
 		b.CreateBr(afterPrim);
 		b.SetInsertPoint(afterPrim);
-		if (!attr) {
+		if (values.empty()) {
 			b.CreateBr(done);
 		} else {   // lanes [0, (vertices + 7) & ~7): whole vec4s in groups of 8 lanes (nggcol.s)
 			BasicBlock *store = BasicBlock::Create(ctx, "store", f, done);
@@ -645,19 +692,27 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 				rsrc = b.CreateInsertElement(rsrc, dw[k], k);
 			Value *thread = b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {b.getInt32(-1), b.CreateShl(b.CreateAnd(b.CreateLShr(info, 24), 15), 5)});
 			Value *soffset = b.CreateShl(b.CreateAnd(f->getArg(kAttrOffset), 0x7fff), 9);
-			b.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_store, {v4f32}, {value, rsrc, thread, b.getInt32(0), soffset, b.getInt32(2 << 3)});   // scope device
+			for (unsigned n = 0; n < values.size(); n++)   // slot n at offset 16 n, scope device
+				b.CreateIntrinsic(Intrinsic::amdgcn_struct_buffer_store, {v4f32}, {values[n], rsrc, thread, b.getInt32(16 * n), soffset, b.getInt32(2 << 3)});
 			b.CreateBr(done);
 		}
 		b.SetInsertPoint(done);
 	} else {
-		if (attributes) {   // attribute 0: P0 + P10 * i + P20 * j per channel (pscol.s)
-			Value *center = f->getArg(kCenter), *i = b.CreateExtractElement(center, uint64_t(0)), *j = b.CreateExtractElement(center, 1);
-			interpolated = PoisonValue::get(v4f32);
-			for (unsigned c = 0; c < 4; c++) {
-				Value *p = b.CreateIntrinsic(Intrinsic::amdgcn_lds_param_load, {}, {b.getInt32(c), b.getInt32(0), f->getArg(kPrimMask)});
-				Value *p10 = b.CreateIntrinsic(Intrinsic::amdgcn_interp_inreg_p10, {}, {p, i, p});
-				interpolated = b.CreateInsertElement(interpolated, b.CreateIntrinsic(Intrinsic::amdgcn_interp_inreg_p2, {}, {p, j, p10}), c);
+		for (unsigned n = 0; n < vars.size(); n++) {   // input n's used components: P0 + P10 * i + P20 * j (pscol.s), or P0 if flat
+			Value *v = PoisonValue::get(v4f32);
+			for (unsigned c = 0; c < components(air->getArg(vars[n].index)->getType()); c++) {
+				Value *p = b.CreateIntrinsic(Intrinsic::amdgcn_lds_param_load, {}, {b.getInt32(c), b.getInt32(n), f->getArg(kPrimMask)});
+				Value *x;
+				if (vars[n].flat) {   // quad lane 0 holds P0 (DPP quad_perm 0, 0, 0, 0)
+					x = b.CreateBitCast(b.CreateIntrinsic(Intrinsic::amdgcn_update_dpp, {i32}, {PoisonValue::get(i32), b.CreateBitCast(p, i32), b.getInt32(0),
+					                                                                            b.getInt32(15), b.getInt32(15), b.getFalse()}), f32);
+				} else {
+					Value *bary = f->getArg(vars[n].bary), *i = b.CreateExtractElement(bary, uint64_t(0)), *j = b.CreateExtractElement(bary, 1);
+					x = b.CreateIntrinsic(Intrinsic::amdgcn_interp_inreg_p2, {}, {p, j, b.CreateIntrinsic(Intrinsic::amdgcn_interp_inreg_p10, {}, {p, i, p})});
+				}
+				v = b.CreateInsertElement(v, x, c);
 			}
+			inValues.push_back(v);
 		}
 		exportF32(0, callAir(nullptr), true);   // mrt0
 	}
@@ -712,9 +767,14 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		}
 	if (code.empty() || !regs[0])
 		return "no code or no register values in the shader object";
-	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3], attributes};
+	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3],
+	                          static_cast<uint32_t>(vars.size())};
 	out.hsaco.assign(reinterpret_cast<const char *>(head), sizeof(head));
 	out.hsaco += code.str();
+	for (const Var &v : vars) {
+		const uint32_t entry[2] = {v.hash, v.flat ? 1u : 0u};
+		out.hsaco.append(reinterpret_cast<const char *>(entry), sizeof(entry));
+	}
 	out.buffers = 0;
 	out.written = 0;
 	return "";

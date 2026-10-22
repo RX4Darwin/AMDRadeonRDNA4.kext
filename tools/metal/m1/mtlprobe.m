@@ -30,6 +30,9 @@
 //   mtlprobe blendinfo six pipelines differing only in blending and write mask, one draw each, nothing checked (for decoding blend state)
 //   mtlprobe drawargs  draws with distinct arguments, nothing checked (for decoding the draw commands)
 //   mtlprobe render    one render pass that clears a 64x64 BGRA texture to (0.25, 0.5, 0.75, 1)
+//   mtlprobe varyings  five values from the vertex to the fragment function over a 64x64 quad: float3 perspective (red), float without
+//                      perspective (alpha), half2 centroid (green), uint and bool flat (blue: 0 in the first triangle, 0.65 in the second,
+//                      from its first vertex); checked away from the diagonal
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
 //
 // Build: clang -arch x86_64 -mmacosx-version-min=11.0 -fobjc-arc tools/metal/m1/mtlprobe.m -framework Foundation -framework Metal -o mtlprobe
@@ -982,12 +985,77 @@ static void render(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	OUT("render: first pixel B %u G %u R %u A %u (191 128 64 255 = executed)", p[0], p[1], p[2], p[3]);
 }
 
+static void varyings(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "struct VV { float4 pos [[position]]; float3 a; float b [[center_no_perspective]]; half2 h [[centroid_perspective]];"
+	                                              " uint t [[flat]]; bool odd [[flat]]; };\n"
+	                                              "vertex VV vy_v(uint vid [[vertex_id]]) { float x = (vid == 1 || vid == 3 || vid == 4) ? 1.0 : -1.0;"
+	                                              " float y = (vid == 2 || vid == 4 || vid == 5) ? 1.0 : -1.0; VV v; v.pos = float4(x, y, 0, 1);"
+	                                              " v.a = float3(x * 0.5 + 0.5, 0.25, 0.75); v.b = 0.5 - x * 0.5; v.h = half2(y * 0.5 + 0.5, 0.5);"
+	                                              " v.t = vid; v.odd = (vid & 1) != 0; return v; }\n"
+	                                              "fragment float4 vy_f(VV in [[stage_in]]) {"
+	                                              " return float4(in.a.x, float(in.h.x), float(in.t) * 0.2 + (in.odd ? 0.05 : 0.0), in.b); }"
+	                                     options:nil
+	                                       error:&err];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"vy_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"vy_f"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	if (!ps) {
+		OUT("varyings: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	id<MTLBuffer> out = [d newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = t;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe varyings";
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+	[re endEncoding];
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 64, 1) toBuffer:out
+	      destinationOffset:0 destinationBytesPerRow:64 * 4 destinationBytesPerImage:64 * 64 * 4];
+	[e endEncoding];
+	run(cb, "varyings");
+	// Pixel (px, py): x01 = (px + 0.5) / 64, y01 = 1 - (py + 0.5) / 64; the second triangle where x01 + y01 > 1.
+	const uint8_t *px = out.contents;
+	int wrong = 0, checked = 0, worst = 0;
+	for (int y = 0; y < 64; y++)
+		for (int x = 0; x < 64; x++) {
+			const double x01 = (x + 0.5) / 64, y01 = 1 - (y + 0.5) / 64;
+			if (fabs(x01 + y01 - 1) < 0.05)
+				continue;
+			const uint8_t *p = px + (y * 64 + x) * 4;   // B, G, R, A
+			const int want[4] = {x01 + y01 > 1 ? 166 : 0, (int)lround(y01 * 255), (int)lround(x01 * 255), (int)lround((1 - x01) * 255)};
+			int off = 0;
+			for (int c = 0; c < 4; c++)
+				off = MAX(off, abs(p[c] - want[c]));
+			worst = MAX(worst, off);
+			wrong += off > 2;
+			checked++;
+		}
+	const uint8_t *a = px + (40 * 64 + 20) * 4, *b = px + (20 * 64 + 44) * 4;
+	OUT("varyings: %d of %d pixels off by more than 2, worst %d; (20, 40) B %u G %u R %u A %u, (44, 20) B %u G %u R %u A %u (0 = executed)", wrong,
+	    checked, worst, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+}
+
 int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend"};
-			for (int i = 0; i < 17; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend", "blendx", "varyings"};
+			for (int i = 0; i < 19; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -1044,6 +1112,8 @@ int main(int argc, char **argv) {
 			texinfo(d, q);
 		else if (!strcmp(mode, "texdraw"))
 			texdraw(d, q);
+		else if (!strcmp(mode, "varyings"))
+			varyings(d, q);
 		else if (!strcmp(mode, "blend") || !strcmp(mode, "blendx"))
 			blend(d, q, mode[5] == 'x');
 		else if (!strcmp(mode, "blendinfo"))
@@ -1051,7 +1121,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(mode, "drawargs"))
 			drawargs(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, blend, texinfo, blendinfo, drawargs, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, blend, blendx, varyings, texinfo, blendinfo, drawargs, all)", mode);
 			return 2;
 		}
 	}
