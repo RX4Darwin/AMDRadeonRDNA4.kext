@@ -372,6 +372,16 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   perspective, float without perspective, half2 centroid, uint and bool flat) 0 of 3660 pixels off, worst 0; every other probe still
   passes.** iTerm2's background-colour shaders (a float4 and a flat bool, a discard) now translate; still missing for it: constant tables
   in the fragment shader (`iTermTextureCursorFragmentShader`) and render targets other than linear 32-bit textures.
+- **M4, ninth step: every function in iTerm2's Metal library translates (2026-10-22).** Running all 63 functions of iTerm2's
+  `default.metallib` through the translator on the Mac (39 translated) found: constexpr samplers stored as one `i64` (23 functions; the
+  "constant table" refusal was never a table; the Metal compiler also emits `[2 x i64]`, both decode the same), `fmod` (LLVM `frem`, C's
+  fmod), `clamp` (float, signed, unsigned: min(max())), `dot`, `mix` (x + (y - x) a), `get_width` / `get_height_texture_2d` (from the T#
+  the host writes: width - 1 in word1 [31:30] and word2 [13:0] << 2, height - 1 in word2 [27:14]; >> lod, at least 1), and helper functions
+  left in the module after inlining (never legalised, so a private array in one failed verification: unused functions now go before the
+  module is checked). **63 of 63 translate; on the card mtlprobe's `texsize` (a constexpr sampler, a 4x2 texture's width and height,
+  `discard_fragment` on the right quarter) 0 of 4096 pixels wrong and `feat`'s `vecmath` (fmod, clamp, dot, mix) right; every other probe
+  still passes.** The rig's Metal compiler emits the two-word sampler for the probe, so the one-word form is checked only through iTerm2's
+  shaders translating. iTerm2's draws still need render targets other than linear 32-bit textures.
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's

@@ -221,11 +221,15 @@ static std::string legalize(Function &k) {
 	for (Instruction &i : instructions(k))
 		if (auto *c = dyn_cast<CallInst>(&i); c && c->getCalledFunction() && c->getCalledFunction()->getName().starts_with("air.sample_texture") &&
 		                                        c->arg_size() > 1)
-			if (auto *g = dyn_cast<GlobalVariable>(c->getArgOperand(1)->stripPointerCasts()); g && g->hasInitializer())
-				if (auto *a = dyn_cast<ConstantDataArray>(g->getInitializer()); a && a->getNumElements() >= 1 && a->getElementType()->isIntegerTy(64)) {
-					constSampler[c] = airSampler(ctx, a->getElementAsInteger(0));
+			if (auto *g = dyn_cast<GlobalVariable>(c->getArgOperand(1)->stripPointerCasts()); g && g->hasInitializer()) {
+				// The state word: an i64, or the first of an array of them (both seen from the Metal compiler).
+				auto *a = dyn_cast<ConstantDataArray>(g->getInitializer());
+				auto *one = dyn_cast<ConstantInt>(g->getInitializer());
+				if ((a && a->getNumElements() >= 1 && a->getElementType()->isIntegerTy(64)) || (one && one->getBitWidth() == 64)) {
+					constSampler[c] = airSampler(ctx, a ? a->getElementAsInteger(0) : one->getZExtValue());
 					c->setArgOperand(1, ConstantPointerNull::get(cast<PointerType>(c->getArgOperand(1)->getType())));
 				}
+			}
 	for (Instruction &i : instructions(k)) {
 		for (Use &u : i.operands())
 			if (u->getType()->isPointerTy() && u->getType()->getPointerAddressSpace() == 2) {
@@ -265,6 +269,8 @@ static std::string legalize(Function &k) {
 		{"trunc", Intrinsic::trunc}, {"rint", Intrinsic::rint}, {"round", Intrinsic::round}, {"fmax", Intrinsic::maxnum},
 		{"fmin", Intrinsic::minnum}, {"fma", Intrinsic::fma}, {"popcount", Intrinsic::ctpop}, {"min.s", Intrinsic::smin},
 		{"min.u", Intrinsic::umin}, {"max.s", Intrinsic::smax}, {"max.u", Intrinsic::umax}};
+	static const std::map<std::string, std::pair<Intrinsic::ID, Intrinsic::ID>> clampOps = {   // clamp: its max and min
+		{"clamp", {Intrinsic::maxnum, Intrinsic::minnum}}, {"clamp.s", {Intrinsic::smax, Intrinsic::smin}}, {"clamp.u", {Intrinsic::umax, Intrinsic::umin}}};
 	static const std::map<std::string, AtomicRMWInst::BinOp> rmw = {
 		{"add", AtomicRMWInst::Add}, {"sub", AtomicRMWInst::Sub}, {"and", AtomicRMWInst::And}, {"or", AtomicRMWInst::Or},
 		{"xor", AtomicRMWInst::Xor}, {"xchg", AtomicRMWInst::Xchg}, {"min.s", AtomicRMWInst::Min}, {"max.s", AtomicRMWInst::Max},
@@ -349,6 +355,25 @@ static std::string legalize(Function &k) {
 			r = b.CreateIntrinsic(same.at(op.str()), {c->getType()}, args);
 		} else if (op == "clz" || op == "ctz") {   // (x, is zero poison)
 			r = b.CreateIntrinsic(op == "clz" ? Intrinsic::ctlz : Intrinsic::cttz, {c->getType()}, {c->getArgOperand(0), b.getFalse()});
+		} else if (name.starts_with("get_width_texture_2d") || name.starts_with("get_height_texture_2d")) {
+			// (texture, lod): from the T# the host wrote (src/pvgpu.cpp): width - 1 in word1 [31:30] and word2 [13:0] << 2, height - 1 in
+			// word2 [27:14]; then >> lod, at least 1.
+			Value *t = descriptor(c->getArgOperand(0), 8), *w1 = b.CreateExtractElement(t, 1), *w2 = b.CreateExtractElement(t, 2);
+			Value *size = name.starts_with("get_width") ? b.CreateOr(b.CreateLShr(w1, 30), b.CreateShl(b.CreateAnd(w2, 0x3fff), 2))
+			                                            : b.CreateAnd(b.CreateLShr(w2, 14), 0x3fff);
+			r = b.CreateIntrinsic(Intrinsic::umax, {b.getInt32Ty()}, {b.CreateLShr(b.CreateAdd(size, b.getInt32(1)), c->getArgOperand(1)), b.getInt32(1)});
+		} else if (auto cl = clampOps.find(op.str()); cl != clampOps.end()) {   // (x, low, high): min(max(x, low), high)
+			Value *lo = b.CreateIntrinsic(cl->second.first, {c->getType()}, {c->getArgOperand(0), c->getArgOperand(1)});
+			r = b.CreateIntrinsic(cl->second.second, {c->getType()}, {lo, c->getArgOperand(2)});
+		} else if (op == "mix") {   // (x, y, a): x + (y - x) * a
+			r = b.CreateFAdd(c->getArgOperand(0), b.CreateFMul(b.CreateFSub(c->getArgOperand(1), c->getArgOperand(0)), c->getArgOperand(2)));
+		} else if (op == "dot") {   // (a, b) of a float vector type: the sum of the products
+			Value *p = b.CreateFMul(c->getArgOperand(0), c->getArgOperand(1));
+			r = b.CreateExtractElement(p, uint64_t(0));
+			for (unsigned k = 1; k < cast<FixedVectorType>(p->getType())->getNumElements(); k++)
+				r = b.CreateFAdd(r, b.CreateExtractElement(p, k));
+		} else if (op == "fmod") {   // C's fmod, as Metal's: x - y * trunc(x / y)
+			r = b.CreateFRem(c->getArgOperand(0), c->getArgOperand(1));
 		} else if (op == "rsqrt") {
 			r = b.CreateFDiv(ConstantFP::get(c->getType(), 1.0), b.CreateIntrinsic(Intrinsic::sqrt, {c->getType()}, {c->getArgOperand(0)}));
 		} else if (op == "pow" || op == "powr") {   // fast math's x^y = 2^(y log2 x)
@@ -388,8 +413,15 @@ static std::string compile(Module &m, Function *entry, Function *air, bool pal, 
 				break;
 			}
 	}
-	if (air->use_empty())
-		air->eraseFromParent();   // inlined: its original body would only have to be legalised too
+	// Inlined functions go (the AIR function too): their original bodies would only have to be legalised as well.
+	for (bool again = true; again;) {
+		again = false;
+		for (Function &f : make_early_inc_range(m))
+			if (&f != entry && !f.isDeclaration() && f.use_empty()) {
+				f.eraseFromParent();
+				again = true;
+			}
+	}
 	if (std::string why = legalize(*entry); !why.empty())
 		return why;
 
