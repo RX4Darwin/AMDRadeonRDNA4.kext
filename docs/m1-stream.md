@@ -382,6 +382,36 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   `discard_fragment` on the right quarter) 0 of 4096 pixels wrong and `feat`'s `vecmath` (fmod, clamp, dot, mix) right; every other probe
   still passes.** The rig's Metal compiler emits the two-word sampler for the probe, so the one-word form is checked only through iTerm2's
   shaders translating. iTerm2's draws still need render targets other than linear 32-bit textures.
+- **M4, tenth step: iTerm2 draws correctly through the card (2026-10-22).** What it took, each found on the card and each with a probe:
+  - **IOSurface render targets.** A window's drawable is a type-5 resource (56 bytes: dword 0 the IOSurface id, dword 5 Metal pixel format
+    << 16, dwords 6 and 7 width and height). The host is the guest's own kernel, so it looks the surface up: IOSurfaceRoot::lookupSurface(root,
+    id, task) returns it retained (IOSurface::tryRetain), but only for the owner's task (find_surface), which the host reads from the root's
+    id table first (Tahoe 25G83: root +0xd0 table, +0xd8 count; surface +0x10 id, +0x170 owner task; checked against the id twice); then
+    getMemoryDescriptor / getBytesPerRow / getWidth / getHeight / getPixelFormat / getBaseOffset. The plugin resolves the eight functions
+    through Lilu when the IOSurface kext loads. Draws and clears go row by row through the surface's memory (padded rows allowed).
+    `surfdraw`: a padded IOSurface target, every pixel and the padding checked.
+  - **Instancing in hardware.** iTerm2's text is one instance per character cell (64 and more per draw; the host's repeated draws stopped
+    at 32): NUM_INSTANCES (PM4 0x2F) and one draw per pass; the vertex shader takes InstanceID from v4 (gfx12 NGG: v0-v2 the GS's, v3
+    VertexID, v4 InstanceID, loaded with RSRC2_GS.ES_VGPR_COMP_CNT = 1 as RADV) plus the base instance in s11. `manyinst`: 1024 instances.
+  - **Whole-quad mode for fragment inputs.** A flat input's DPP broadcast from quad lane 0 ran in exact mode, so quads whose lane 0 the
+    triangle does not cover got garbage (tiny triangles: every glyph). The broadcast and the interpolation now run in WQM (llvm.amdgcn.wqm),
+    as ACO. Found by `manyinst` (each 2x2 square only its first pixel right).
+  - **setViewport.** iTerm2 sets {-width, 0, 2 width, 2 height} and its vertex shader relies on it; the host used the whole target. Now
+    PA_CL_VPORT_X/YSCALE and OFFSET come from Render.setViewport (0x082, six doubles; reset by each encoder), converted with integer
+    operations, whole pixels only so far. `viewport`.
+  - **The pipeline's label.** A render pipeline descriptor carries its label as a C string between the function list and the colour
+    attachments (then 4-aligned; "the second list, empty so far" was the empty label's zero byte). With iTerm2's label the blend state was
+    misread as off, so each glyph's 22x20 quad (cells are 7x17) painted its transparent part over its neighbours: letters cut on the right.
+    `blend` and `glyphs2` now name their pipelines.
+  - **Checks that ruled things out:** `texlinear` (linear filtering), `fragpos` ([[position]] in the fragment shader), `glyphs` (64 instanced
+    quads with three values), `glyphs2` (iTerm2's text draw copied: branches, uint2 viewport size, a 4-channel atlas, blending, the 2x viewport;
+    its raw output compared byte for byte with Apple's GPU's).
+  - **Also:** BGRA8 texture targets may have padded rows (height from the descriptor; small targets have them); `pvlog`'s budget is 30000
+    lines (4000 ran out by 218 s); draw lines are counted per task (40 each, again for each new task) and log each draw's buffers (first
+    8 dwords) and textures; the first two command buffers of each task are listed command by command.
+  **On the card: iTerm2's window draws correctly; every mtlprobe check passes, and `glyphs2` matches Apple's GPU pixel for pixel.** iTerm2
+  starts at login, before the fake GPU is published (121 s), and then draws on the CPU; reopened later it uses the card. Seen in passing:
+  macOS's screenshot tool sends Blit.copyFromTexture and a compute pass with textures, neither run by the host yet.
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's

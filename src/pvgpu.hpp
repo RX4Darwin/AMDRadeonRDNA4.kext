@@ -65,6 +65,7 @@ public:
 	static void setLateParent(IOService *gpu);
 	// The card's runtime, for running the guest's blits on it (M2; plugin.cpp sets it where the GPU attaches).
 	static void setCompute(RDNA4Compute *compute);
+	static void setSurfaceFunctions(const mach_vm_address_t fn[8]);   // IOSurface kext functions for type-5 render targets (pvgpu.cpp)
 
 	// Host side: the control block of BAR0 as dwords, valid while the nub lives (the nub is never released once published).
 	volatile uint32_t *ctrl() const { return mBar0 ? reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(mBar0) + pvgpu::kCtrl) : nullptr; }

@@ -490,7 +490,8 @@ struct Kernel {
 // the fragment stage the textures' T#s (8 dwords) at +64 + 32 n and the samplers' S#s (4 dwords) at +320 + 16 n.
 //   vertex   amdgpu_gs, an NGG shader as src/shaders/nggcol.s: s3 = merged_wave_info ([7:0] vertices, [15:8] primitives, [27:24] wave in
 //            the subgroup), s5 = gs_attr_offset (s0-s7 are the merged stage's system SGPRs), s8-s9 the table, s10 the first vertex
-//            (added to VertexID, as RADV's base vertex), s11 the instance id, v0 = the packed primitive, v3 = VertexID; the position goes out as pos0, the primitive
+//            (added to VertexID, as RADV's base vertex), s11 the base instance (added to InstanceID), v0 = the packed primitive, v3 = VertexID,
+//            v4 = InstanceID (gfx12; the host sets ES_VGPR_COMP_CNT 1, as RADV); the position goes out as pos0, the primitive
 //            as prim, the other outputs to the attribute ring, output n in slot n (buffer_store_b128 at index = thread in the subgroup,
 //            offset 16 n, soffset = gs_attr_offset << 9, scope device; the ring's descriptor from the literals 0xc01a0001-3, which the
 //            host patches, as nggcol.s and Mesa's ac_nir_store_parameters_to_attr_ring). So far: vertex_id, instance_id, buffers.
@@ -543,7 +544,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			if (!flat && !center && !centroid)
 				return "fragment input " + std::to_string(index) + ": only center, centroid or flat interpolation so far";
 			// ponytail: centroid read at the centre, exact for the single-sample targets drawn so far (the card's PERSP_CENTROID is
-			// wrong next to PERSP_CENTER, mtlprobe vycase 8, 2026-10-22; radeonsi also forces the centre without MSAA); MSAA needs it back.
+			// wrong next to PERSP_CENTER, rig 2026-10-22, each alone right; radeonsi also forces the centre without MSAA); MSAA needs it back.
 			from[index] = 400 + static_cast<int>(vars.size());
 			vars.push_back({index, fnv(mdString(a, 2)), flat, linear ? 8u : 4u});
 		}
@@ -605,10 +606,11 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	// PERSP_SAMPLE, PERSP_CENTER, PERSP_CENTROID, PERSP_PULL_MODEL, LINEAR_SAMPLE, LINEAR_CENTER, LINEAR_CENTROID, LINE_STIPPLE, POS_X, POS_Y,
 	// POS_Z, POS_W); LLVM enables the ones used and reports them (SPI_PS_INPUT_ENA/ADDR).
 	Type *v2f32 = FixedVectorType::get(f32, 2), *v3f32 = FixedVectorType::get(f32, 3), *v4f32 = FixedVectorType::get(f32, 4);
-	SmallVector<Type *, 16> params = vertex ? SmallVector<Type *, 16>(16, i32)   // s0-s7, s8-s11, v0-v3
-	                                        : SmallVector<Type *, 16>{i32, i32, i32, v2f32, v2f32, v2f32, v3f32, v2f32, v2f32, v2f32, f32, f32, f32, f32, f32};
+	SmallVector<Type *, 17> params = vertex ? SmallVector<Type *, 17>(17, i32)   // s0-s7, s8-s11, v0-v4
+	                                        : SmallVector<Type *, 17>{i32, i32, i32, v2f32, v2f32, v2f32, v3f32, v2f32, v2f32, v2f32, f32, f32, f32, f32, f32};
 	// The arguments by name: vertex s3, s5, s8-s9, s10, s11, v0, v3; fragment s0-s1, s2, POS_X (the barycentrics: Var::bary).
-	const unsigned kInfo = 3, kAttrOffset = 5, kFirstVertex = 10, kInstance = 11, kPrim = 12, kVertexId = 15, kPrimMask = 2, kPosX = 11;
+	const unsigned kInfo = 3, kAttrOffset = 5, kFirstVertex = 10, kBaseInstance = 11, kPrim = 12, kVertexId = 15, kInstanceId = 16, kPrimMask = 2,
+	               kPosX = 11;
 	const unsigned kTable = vertex ? 8 : 0;
 	Function *f = Function::Create(FunctionType::get(Type::getVoidTy(ctx), params, false), GlobalValue::ExternalLinkage, vertex ? "vs" : "ps", &m);
 	f->setCallingConv(vertex ? CallingConv::AMDGPU_GS : CallingConv::AMDGPU_PS);
@@ -665,7 +667,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		SmallVector<Value *, 4> args;
 		for (unsigned k = 0; k < air->arg_size(); k++)
 			args.push_back(from[k] == 0 ? vid
-			               : from[k] == 1 ? f->getArg(kInstance)
+			               : from[k] == 1 ? b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance))   // Metal's includes the base instance
 			               : from[k] >= 400 ? fromVec4(inValues[static_cast<unsigned>(from[k] - 400)], air->getArg(k)->getType())
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
 			               : from[k] >= 300 ? handle(320 + 16 * static_cast<unsigned>(from[k] - 300), air->getArg(k)->getType())
@@ -735,12 +737,14 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			for (unsigned c = 0; c < components(air->getArg(vars[n].index)->getType()); c++) {
 				Value *p = b.CreateIntrinsic(Intrinsic::amdgcn_lds_param_load, {}, {b.getInt32(c), b.getInt32(n), f->getArg(kPrimMask)});
 				Value *x;
-				if (vars[n].flat) {   // quad lane 0 holds P0 (DPP quad_perm 0, 0, 0, 0)
-					x = b.CreateBitCast(b.CreateIntrinsic(Intrinsic::amdgcn_update_dpp, {i32}, {PoisonValue::get(i32), b.CreateBitCast(p, i32), b.getInt32(0),
-					                                                                            b.getInt32(15), b.getInt32(15), b.getFalse()}), f32);
+				if (vars[n].flat) {   // quad lane 0 holds P0 (DPP quad_perm 0, 0, 0, 0), in whole-quad mode as ACO: lane 0 can be uncovered
+					Value *mov = b.CreateIntrinsic(Intrinsic::amdgcn_update_dpp, {i32}, {PoisonValue::get(i32), b.CreateBitCast(p, i32), b.getInt32(0),
+					                                                                     b.getInt32(15), b.getInt32(15), b.getFalse()});
+					x = b.CreateBitCast(b.CreateIntrinsic(Intrinsic::amdgcn_wqm, {i32}, {mov}), f32);
 				} else {
 					Value *bary = f->getArg(vars[n].bary), *i = b.CreateExtractElement(bary, uint64_t(0)), *j = b.CreateExtractElement(bary, 1);
 					x = b.CreateIntrinsic(Intrinsic::amdgcn_interp_inreg_p2, {}, {p, j, b.CreateIntrinsic(Intrinsic::amdgcn_interp_inreg_p10, {}, {p, i, p})});
+					x = b.CreateIntrinsic(Intrinsic::amdgcn_wqm, {f32}, {x});   // in whole-quad mode too, as ACO
 				}
 				v = b.CreateInsertElement(v, x, c);
 			}

@@ -39,7 +39,7 @@ using namespace pvgpu;
 namespace {
 
 constexpr uint32_t kLoggedCmds = 1500;    // FIFO commands logged one by one
-constexpr uint32_t kMaxLogLines = 4000;   // M1 reads the protocol from this log (docs/m1-stream.md)
+constexpr uint32_t kMaxLogLines = 30000;   // M1 reads the protocol from this log (docs/m1-stream.md)
 // Compute units of the card behind GpuCoreCount: RX 9070 XT (Navi 48) has 64. From the product specification, not read from the card (the kext's IP discovery
 // exposes shader-engine and render-backend counts only).
 constexpr uint32_t kGpuCoreCount = 64;
@@ -47,6 +47,13 @@ uint32_t gLogLines { 0 };
 RDNA4PvNub *gNub { nullptr };
 IOService *gLateParent { nullptr };   // RDNA4PvNub::setLateParent
 RDNA4Compute *gCompute { nullptr };   // RDNA4PvNub::setCompute
+// The IOSurface kext's functions (RDNA4PvNub::setSurfaceFunctions, from the plugin's Lilu callback), in this order; methods take the object first.
+struct {
+	void *(*lookup)(void *root, uint32_t id, task_t task);   // IOSurfaceRoot::lookupSurface(unsigned int, task*)
+	IOMemoryDescriptor *(*memory)(const void *surface);      // IOSurface::getMemoryDescriptor() const
+	uint32_t (*bytesPerRow)(const void *), (*width)(const void *), (*height)(const void *), (*pixelFormat)(const void *), (*baseOffset)(const void *),
+	    (*surfaceId)(const void *);
+} gSurfaceFns;
 
 // M3: the one request slot between the host and the translator helper (include/rdna4mtlc.h). The host posts a function (id != 0) and
 // waits on &done; the helper's kMtlcNext waits on &id, copies the metallib out and sets taken; kMtlcDeliver fills elf and sets done.
@@ -188,7 +195,10 @@ private:
 	};
 	const Jit *translated(uint32_t task, uint64_t lib, const char *name, const uint8_t hash[32]);
 	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
-	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow = nullptr, uint32_t *width = nullptr);
+	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow = nullptr, uint32_t *width = nullptr,
+	                  uint32_t *height = nullptr, uint32_t *format = nullptr);
+	struct Surface;
+	bool surfaceRange(uint32_t task, uint32_t id, Surface &out);
 	bool dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes);
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
@@ -196,7 +206,7 @@ public:
 	struct Bindings { uint32_t buffer[8]; uint64_t offset[8]; uint32_t texture[8], sampler[8]; };   // a stage's resources by Metal index (0 = none)
 	// A draw: Metal's primitive type, first vertex, vertices (indices), instances, base instance, and for an indexed draw the index buffer's
 	// resource id, offset and index size (bytes; 0: not indexed).
-	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes, blendColor[4]; };
+	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes, blendColor[4]; uint64_t viewport[4]; bool viewportSet; };
 	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *stage);
 	void runCompute(uint32_t task, uint32_t pipeline, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size);
 	void describeRenderPipeline(uint32_t task, uint32_t pipeline);
@@ -245,6 +255,8 @@ private:
 	Jit mJit[32] {};                     // M3: functions the helper translated, by hash (program 0: it could not); oldest replaced first
 	uint32_t mJits { 0 };
 	uint32_t mRenderLines { 0 };          // M2: render-pass and texture lines so far (other processes render every frame)
+	uint8_t mDrawLines[64] {};            // M4: draw lines per task id, so far (40 each; a new task starts again)
+	uint8_t mListed[64] {};               // M4: command buffers listed command by command per task id (the first 2)
 	uint8_t mWin[1024] {};              // one FIFO command copied out of the ring for decoding
 
 	// Display side. rdna4-pvgpu-disp: bit 0 = report the display online (fill the pipe's info, set the online event), bit 1 = ~60 Hz VBL events for pipes whose
@@ -526,6 +538,8 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			uint32_t task;
 			memcpy(&task, mWin + c.payloadOffset, 4);   // DefineHostTask {u32 task << 1, u64 space size, u32 page-table root PFN}
 			memcpy(&mTaskRoot[(task >> 1) & 63], mWin + c.payloadOffset + 12, 4);
+			mDrawLines[(task >> 1) & 63] = 0;
+			mListed[(task >> 1) & 63] = 0;
 		}
 		if (c.id == 0x37 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4) {
 			copy(at, mWin, c.length);
@@ -695,12 +709,15 @@ namespace {
 struct ExecTally {
 	const char *segment;
 	uint32_t commands, unknown, lines;
+	bool listing;                       // every command logged (the first command buffers of a task)
 	RDNA4PvHost *host;
 	uint32_t task;
 	uint32_t pipeline;                  // Compute.setComputePipelineState
 	uint32_t target, renderPipeline;    // Render: colour attachment 0's texture (writeDescriptor), setRenderPipelineState
 	RDNA4PvHost::Bindings stage[2];     // Render.setVertexBuffers, setFragmentBuffers
 	uint32_t blendColor[4];             // Render.setBlendColorRed: four floats' bits
+	uint64_t viewport[4];               // Render.setViewport: originX, originY, width, height as doubles' bits (znear, zfar not used)
+	bool viewportSet;                   // since the encoder began (writeDescriptor); else the whole target
 	RDNA4PvHost::Bindings compute;      // Compute.setBuffers
 };
 void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload, uint32_t bytes, size_t offset) {
@@ -708,10 +725,17 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 	t->commands++;
 	if (!name)
 		t->unknown++;
+	if (t->listing) {
+		uint32_t w[4] = {};
+		memcpy(w, payload, bytes < sizeof(w) ? bytes : sizeof(w));
+		pvlog("host:   stream: task %u %s cmd 0x%03x %s, %u bytes: %08x %08x %08x %08x", t->task, t->segment, id, name ? name : "?", bytes, w[0], w[1], w[2], w[3]);
+	}
 	if (id == 0x132 || id == 0x12d || id == 0x12e)
 		t->host->runBlit(t->task, id, payload, bytes);
-	else if (id == 0x01a)
+	else if (id == 0x01a) {
 		t->target = t->host->runRenderPass(t->task, payload, bytes);
+		t->viewportSet = false;
+	}
 	else if (id == 0x074 && bytes >= 4) {   // Render.setRenderPipelineState {u32 pipeline id}
 		memcpy(&t->renderPipeline, payload, 4);
 		t->host->describeRenderPipeline(t->task, t->renderPipeline);
@@ -729,6 +753,8 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		else if (id == 0x007)
 			d = {w[0], 0, w[2] & 0xffff, 1, 0, w[1], w[2] >> 16, 2, {}};
 		memcpy(d.blendColor, t->blendColor, sizeof(d.blendColor));
+		memcpy(d.viewport, t->viewport, sizeof(d.viewport));
+		d.viewportSet = t->viewportSet;
 		t->host->runDraw(t->task, t->target, t->renderPipeline, d, t->stage);
 	} else if ((id == 0x0cb || id == 0x07d || id == 0x06e) && bytes >= 8) {
 		// Compute.setBuffers, Render.setVertexBuffers, setFragmentBuffers {u32 first index, u32 count, count x {u32 resource id, u64 offset}}
@@ -741,6 +767,9 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			memcpy(&g.buffer[first + k], payload + 8 + 12 * k, 4);
 			memcpy(&g.offset[first + k], payload + 12 + 12 * k, 8);
 		}
+	} else if (id == 0x082 && bytes >= 32) {   // Render.setViewport {double originX, originY, width, height, znear, zfar}
+		memcpy(t->viewport, payload, sizeof(t->viewport));
+		t->viewportSet = true;
 	} else if (id == 0x065 && bytes >= 16) {   // Render.setBlendColorRed {float red, green, blue, alpha}
 		memcpy(t->blendColor, payload, 16);
 	} else if ((id == 0x072 || id == 0x070) && bytes >= 8) {
@@ -796,6 +825,7 @@ void RDNA4PvHost::decodeExec(uint32_t task, uint64_t va, uint64_t len) {
 	ExecTally t {};
 	t.host = this;
 	t.task = task;
+	t.listing = mListed[task & 63] < 2 && ++mListed[task & 63];
 	uint32_t at = 0, segments = 0, undecoded = 0;
 	while (at + 8 <= n) {
 		uint32_t slen;
@@ -838,7 +868,8 @@ bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t
 // M2: a texture's GPU range: a type-2 resource with a 116-byte descriptor, dwords {u64 size in bytes, u32 page number of its start, ...,
 // [13] bytes per row, [15] width, ...} (mtlprobe's 64x64 BGRA8 render target: 0x4000 bytes at page 0x101, 0x100 per row: linear; measured
 // 2026-10-21). Where the pixel format is (0x04010101 at [8]?) is still open; the first descriptors of a boot are logged.
-bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow, uint32_t *width) {
+bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow, uint32_t *width, uint32_t *height,
+                               uint32_t *format) {
 	uint32_t rec[3], desc[29];
 	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) || (rec[0] & 0xff) != 2 ||
 	    (rec[0] >> 8) < sizeof(desc) || !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(desc), sizeof(desc))) {
@@ -855,7 +886,67 @@ bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_
 		*bytesPerRow = desc[13];
 	if (width)
 		*width = desc[15];
+	if (height)
+		*height = desc[16];
+	if (format) {   // {..., 0x2c, its own id, (Metal pixel format << 16) | usage} (0: not found)
+		*format = 0;
+		for (uint32_t j = 19; j + 1 < 29; j++)
+			if (desc[j - 1] == 0x2c && desc[j] == id)
+				*format = desc[j + 1] >> 16;
+	}
 	return *len && *len <= (1ull << 30) && guestPfn(task, *va);
+}
+
+// M4: an IOSurface-backed texture (resource type 5, 56 bytes: dword 0 the IOSurface id, dword 5 the Metal pixel format << 16 | ?, dwords 6
+// and 7 width and height; apps' drawables, iTerm2's measured 2026-10-22). The host is the guest's own kernel, so the surface is found by id:
+// IOSurfaceRoot::lookupSurface(root, id, task) returns it retained (IOSurface::tryRetain), but only for the surface's owner task (find_surface),
+// which is read from the root's id table first. ponytail: that table is Tahoe 25G83's private layout (root +0xd0 table, +0xd8 count;
+// surface +0x10 id, +0x170 owner task), read without IOSurfaceRoot's lock, and checked against the id twice; an OS update can move it (the
+// draw is then refused).
+struct RDNA4PvHost::Surface {
+	OSObject *surface = nullptr;
+	IOMemoryDescriptor *memory = nullptr;   // prepared while held
+	uint64_t base = 0;
+	uint32_t bytesPerRow = 0, width = 0, height = 0;
+	~Surface() {
+		if (memory)
+			memory->complete();
+		if (surface)
+			surface->release();
+	}
+};
+
+bool RDNA4PvHost::surfaceRange(uint32_t task, uint32_t id, Surface &out) {
+	static IOService *root;   // ponytail: kept for the boot
+	uint32_t rec[3], d[8];
+	if (!gSurfaceFns.lookup || !id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) ||
+	    (rec[0] & 0xff) != 5 || (rec[0] >> 8) < sizeof(d) || !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(d), sizeof(d)) || d[5] >> 16 != 80)
+		return false;   // not a type-5 MTLPixelFormatBGRA8Unorm texture (or no IOSurface functions)
+	if (!root) {
+		OSDictionary *match = IOService::serviceMatching("IOSurfaceRoot");
+		root = match ? IOService::copyMatchingService(match) : nullptr;
+		OSSafeReleaseNULL(match);
+	}
+	const auto *r = reinterpret_cast<const uint8_t *>(root);
+	const uint32_t sid = d[0];
+	const void *entry = r && sid < *reinterpret_cast<const uint32_t *>(r + 0xd8) ? (*reinterpret_cast<void *const *const *>(r + 0xd0))[sid] : nullptr;
+	if (!entry || *reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(entry) + 0x10) != sid)
+		return false;
+	void *s = gSurfaceFns.lookup(root, sid, *reinterpret_cast<task_t const *>(static_cast<const uint8_t *>(entry) + 0x170));
+	if (!s)
+		return false;
+	out.surface = static_cast<OSObject *>(s);
+	out.memory = gSurfaceFns.memory(s);
+	out.base = gSurfaceFns.baseOffset(s);
+	out.bytesPerRow = gSurfaceFns.bytesPerRow(s);
+	out.width = gSurfaceFns.width(s);
+	out.height = gSurfaceFns.height(s);
+	const bool ok = gSurfaceFns.surfaceId(s) == sid && gSurfaceFns.pixelFormat(s) == 0x42475241 /* 'BGRA' */ && out.width == d[6] && out.height == d[7] &&
+	                out.memory && out.bytesPerRow >= out.width * 4 && out.base + static_cast<uint64_t>(out.bytesPerRow) * out.height <= out.memory->getLength() &&
+	                out.memory->prepare() == kIOReturnSuccess;
+	if (!ok)
+		out.memory = nullptr;   // not prepared: nothing to complete
+	return ok;
 }
 
 // A double in [0, 1] (its bits) as an 8-bit unorm, round(v * 255), with integers only; below 0 (or NaN) 0, from 1 up 255.
@@ -887,8 +978,19 @@ uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t by
 	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
 	const uint32_t pixel = b | g << 8 | r << 16 | a << 24;   // B, G, R, A in memory
 	uint64_t va, len;
-	const bool ok = textureRange(task, tex, &va, &len) && !(len & 3) && dmaGuest(task, va, 0, pixel, len);
-	if (mRenderLines++ < 24)
+	bool ok = textureRange(task, tex, &va, &len) && !(len & 3) && dmaGuest(task, va, 0, pixel, len);
+	Surface surface;
+	if (!ok && surfaceRange(task, tex, surface) && surface.width <= 16384) {   // an IOSurface: row by row through its memory
+		auto *line = static_cast<uint32_t *>(IOMalloc(surface.width * 4));
+		ok = line;
+		for (uint32_t x = 0; line && x < surface.width; x++)
+			line[x] = pixel;
+		for (uint32_t y = 0; ok && y < surface.height; y++)
+			ok = surface.memory->writeBytes(surface.base + static_cast<uint64_t>(y) * surface.bytesPerRow, line, surface.width * 4) == surface.width * 4;
+		if (line)
+			IOFree(line, surface.width * 4);
+	}
+	if (mDrawLines[task & 63] < 40 && ++mDrawLines[task & 63])
 		pvlog("host: render: clear texture %u to RGBA8 (%u, %u, %u, %u) = BGRA8 pixel 0x%08x on the card: %s", tex, r, g, b, a, pixel, ok ? "done" : "NOT done");
 	return tex;
 }
@@ -929,6 +1031,24 @@ struct BlendPass {
 };
 
 // n / 2 as an IEEE-754 single's bits, negated if asked, for n < 2^24 (no floating point in the kernel).
+// A double (its bits) as a whole number of magnitude below 2^30; false if it has a fraction or is larger (no floating point in the kernel).
+static bool wholeDouble(uint64_t bits, int64_t &out) {
+	out = 0;
+	if (!(bits << 1))
+		return true;   // +-0
+	const uint32_t e = static_cast<uint32_t>(bits >> 52) & 0x7ff;
+	if (e < 1023 || e > 1023 + 29)
+		return false;
+	const uint32_t shift = 52 - (e - 1023);
+	const uint64_t m = (bits & ((1ull << 52) - 1)) | (1ull << 52);
+	if (m & ((1ull << shift) - 1))
+		return false;
+	out = static_cast<int64_t>(m >> shift);
+	if (bits >> 63)
+		out = -out;
+	return true;
+}
+
 static uint32_t halfAsFloat(uint32_t n, bool negative) {
 	if (!n)
 		return 0;
@@ -936,19 +1056,20 @@ static uint32_t halfAsFloat(uint32_t n, bool negative) {
 	return (negative ? 0x80000000u : 0) | ((126 + e) << 23) | ((n << (23 - e)) & 0x7fffff);
 }
 
+// The same for a signed n, |n| < 2^24.
+static uint32_t halfAsFloat(int64_t n) { return halfAsFloat(static_cast<uint32_t>(n < 0 ? -n : n), n < 0); }
+
 // M4: Render.drawPrimitives on the card: the pipeline's vertex and fragment functions translated by the helper (air2amdgpu.cpp
 // translateShader), drawn with the stream of src/gfx12_draw.h (the triangle every gfx test of the kext draws, proven on the card) with the
-// translated shaders in place of its own and the target, viewport and draw patched; the colour attachment staged through a linear RGBA8
-// target (the texture is BGRA8, swapped on the way in and out). Triangle lists and strips, a first vertex, instances (repeated draws), 16-bit
-// indexed draws. With one value from the vertex to the fragment shader the stream is the colour
-// triangle's (src/gfx12_draw_col.h: one parameter in the attribute ring), whose descriptor literals in the vertex shader the host patches as
-// for nggcol.s. Each stage's bound buffers are staged into the runtime (read-only: nothing is copied back) and their addresses put in a
-// table per stage in the misc page, which the shaders find in their two user SGPRs (SPI_SHADER_USER_DATA_GS_0/1, _PS_0/1, set by a packet
-// added before the draw). So far: buffers 0-7, at most one attribute.
+// translated shaders in place of its own and the target, viewport, blending and draw patched; the colour attachment (a BGRA8 texture or
+// IOSurface) staged through a linear RGBA8 target, swapped on the way in and out. Triangle lists and strips, a first vertex, instances
+// (NUM_INSTANCES), 16-bit indexed draws. With values from the vertex to the fragment shader the stream is the colour triangle's
+// (src/gfx12_draw_col.h: the attribute ring), whose descriptor literals in the vertex shader the host patches as for nggcol.s. Each stage's
+// bound buffers are staged into the runtime (read-only: nothing is copied back) and their addresses put in a table per stage in the misc
+// page, which the shaders find in their two user SGPRs (SPI_SHADER_USER_DATA_GS_0/1, _PS_0/1, set by a packet added before the draw).
 void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *bound) {
-	static constexpr uint32_t kMaxInstances = 32;   // ponytail: the instances are repeated draws in the one IB page; NUM_INSTANCES if more are needed
 	const uint32_t count = draw.count;
-	const bool talk = mRenderLines++ < 48;
+	const bool talk = mDrawLines[task & 63] < 40 && ++mDrawLines[task & 63];
 	// The pipeline: {16-byte header, u8 n, n x {u8 key, u8 size, value}}: key 1 the vertex function, key 2 the fragment function (measured).
 	uint64_t pd[8] = {};
 	uint32_t pbytes = 0, fn[3] = {};
@@ -958,8 +1079,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			if (pb[at] >= 1 && pb[at] <= 2 && pb[at + 1] == 4 && at + 6 <= pbytes)
 				memcpy(&fn[pb[at]], pb + at + 2, 4);
 	}
-	// Colour attachment 0's blend state, after the function list (measured with mtlprobe's blendinfo, docs/m1-stream.md s.5b): a second
-	// list (empty so far), u32 colour attachments, u32 ?, then per attachment {u8 n, n x {u8 key, u8 size, value}}: 0 index, 1 pixel format,
+	// Colour attachment 0's blend state, after the function list (measured with mtlprobe's blendinfo, docs/m1-stream.md s.5b): the label
+	// (a C string, 4-aligned after it; empty: one zero byte), u32 colour attachments, u32 ?, then per attachment {u8 n, n x {u8 key, u8 size, value}}: 0 index, 1 pixel format,
 	// 2 blending, 3 / 4 / 5 colour source factor, destination factor, operation, 6 / 7 / 8 the same for alpha, 9 write mask (defaults:
 	// off, One, Zero, Add, One, Zero, Add, 0xf).
 	uint32_t blend[10] = {0, 0, 0, 1, 0, 0, 1, 0, 0, 0xf};
@@ -971,8 +1092,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			uint32_t at = 17;
 			for (uint32_t k = 0; k < pb[16] && at + 2 <= len; k++)   // the function list
 				at += 2 + pb[at + 1];
-			for (uint32_t k = 0, n = at < len ? pb[at++] : 0; k < n && at + 2 <= len; k++)   // the second list
-				at += 2 + pb[at + 1];
+			while (at < len && pb[at])   // the pipeline's label, NUL-terminated (iTerm2's: "Pipeline for iTermMetalCellRenderer"), then 4-aligned
+				at++;
+			at = (at + 1 + 3) & ~3u;
 			uint32_t attachments = 0;
 			if (at + 9 <= len)
 				memcpy(&attachments, pb + at, 4);
@@ -984,7 +1106,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	}
 	const char *why = !fn[1] || !fn[2] ? "the pipeline has no vertex or no fragment function"
 	                : draw.type != 3 && draw.type != 4 ? "only triangle lists and strips so far"
-	                : !draw.instances || draw.instances > kMaxInstances ? "no instances, or more than 32 (so far)"
+	                : !draw.instances ? "no instances"
 	                : draw.indexBytes && draw.start ? "a base vertex in an indexed draw (so far)"
 	                : !count || count > 0xffff ? "no vertices" : nullptr;
 	const Jit *shader[3] = {};
@@ -1014,16 +1136,35 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			why = "a fragment input the vertex function does not write";
 		inputCntl[k] = slot | (in[1] & 1) << 10;   // OFFSET, FLAT_SHADE
 	}
+	// The colour attachment: a linear 32-bit texture, or a BGRA8 IOSurface (surfaceRange; its rows width * 4 bytes, bpr apart).
 	uint64_t va = 0, len = 0;
-	uint32_t bpr = 0, width = 0;
-	if (!why && !(textureRange(task, target, &va, &len, &bpr, &width) && width && bpr == width * 4 && len % bpr == 0 && width <= 16384 && len / bpr <= 16384))
-		why = "the colour attachment is not a linear 32-bit texture";
+	uint32_t bpr = 0, width = 0, height = 0;
+	Surface surface;
+	// A texture: BGRA8 (its rows may be padded; height from the descriptor), or of unknown format with unpadded 32-bit rows (as before).
+	uint32_t targetFormat = 0, texHeight = 0;
+	if (!why && textureRange(task, target, &va, &len, &bpr, &width, &texHeight, &targetFormat) && width && bpr >= width * 4 &&
+	    ((targetFormat == 80 || targetFormat == 81) ? texHeight && static_cast<uint64_t>(bpr) * texHeight <= len
+	                                                : !targetFormat && bpr == width * 4 && len % bpr == 0))
+		height = targetFormat ? texHeight : static_cast<uint32_t>(len / bpr);
+	else if (!why && surfaceRange(task, target, surface)) {
+		bpr = surface.bytesPerRow;
+		width = surface.width;
+		height = surface.height;
+	}
+	if (!why && !(width && height && width <= 16384 && height <= 16384))
+		why = "the colour attachment is neither a linear 32-bit texture nor a BGRA8 IOSurface";
+	// The viewport: Render.setViewport's, else the whole target; whole pixels only so far (window = origin + (ndc + 1) * size / 2, y down).
+	int64_t vx = 0, vy = 0, vw = width, vh = height;
+	if (!why && draw.viewportSet &&
+	    !(wholeDouble(draw.viewport[0], vx) && wholeDouble(draw.viewport[1], vy) && wholeDouble(draw.viewport[2], vw) && wholeDouble(draw.viewport[3], vh) &&
+	      vw > 0 && vh > 0 && vw <= 32768 && vh <= 32768 && vx > -32768 && vx < 32768 && vy > -32768 && vy < 32768))
+		why = "a viewport not in whole pixels, or too large (so far)";
 	if (why) {
 		if (talk)
 			pvlog("host: render: draw of %u vertices (type %u) with pipeline %u: %s: not run", count, draw.type, pipeline, why);
 		return;
 	}
-	const uint32_t height = static_cast<uint32_t>(len / bpr), pitch = (width + 31) & ~31u;   // a linear target's pitch: a multiple of 128 bytes
+	const uint32_t pitch = (width + 31) & ~31u;   // the staged target's pitch: a multiple of 128 bytes
 	const uint64_t targetBytes = static_cast<uint64_t>(pitch) * height * 4;
 
 	// The buffers kept for the boot (made by the first draw), and the target for this one.
@@ -1071,8 +1212,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x31e, (pitch - 1) << 16 | (height - 1)},                    // CB_COLOR0_ATTRIB2: MIP0_WIDTH (the pitch), MIP0_HEIGHT
 		{0x69, 0x82, width | height << 16},                                // PA_SC_WINDOW_SCISSOR_BR
 		{0x69, 0x95, width | height << 16},                                // PA_SC_VPORT_SCISSOR_0_BR
-		{0x69, 0x10f, halfAsFloat(width, false)}, {0x69, 0x110, halfAsFloat(width, false)},   // PA_CL_VPORT_XSCALE, XOFFSET: w / 2
-		{0x69, 0x111, halfAsFloat(height, true)}, {0x69, 0x112, halfAsFloat(height, false)},  // YSCALE -h / 2 (Metal's y points up), YOFFSET h / 2
+		{0x69, 0x10f, halfAsFloat(static_cast<uint32_t>(vw), false)},     // PA_CL_VPORT_XSCALE: width / 2
+		{0x69, 0x110, halfAsFloat(2 * vx + vw)},                            // XOFFSET: originX + width / 2
+		{0x69, 0x111, halfAsFloat(static_cast<uint32_t>(vh), true)},      // YSCALE: -height / 2 (Metal's y points up)
+		{0x69, 0x112, halfAsFloat(2 * vy + vh)},                            // YOFFSET: originY + height / 2
 		{0x79, 0x242, draw.type == 4 ? 6u : 4u},                           // VGT_PRIMITIVE_TYPE: DI_PT_TRISTRIP, DI_PT_TRILIST
 		{0x76, 0x31, outs ? (outs - 1) | ins << 11 : 0x400u},              // SPI_SHADER_GS_OUT_CONFIG_PS: VS_EXPORT_COUNT, NUM_INTERP; NO_PC_EXPORT
 		{0x69, 0x207, 0x00000240u},                                        // PA_SU_SC_MODE_CNTL: the template's, without PROVOKING_VTX_LAST (Metal's is the first)
@@ -1100,6 +1243,12 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			ok = copy && readGuest(task, bva + bound[st].offset[k], copy, static_cast<uint32_t>(bytes)) &&
 			     gCompute->rtAlloc(this, bytes, handle[st][k], gpu) == kIOReturnSuccess &&
 			     gCompute->rtCopy(this, handle[st][k], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(copy), bytes, true) == kIOReturnSuccess;
+			if (talk && copy) {   // what the draw reads (the first 8 dwords of each buffer)
+				uint32_t w[8] = {};
+				memcpy(w, copy, bytes < sizeof(w) ? bytes : sizeof(w));
+				pvlog("host: render:   %s buffer %u: resource %u + %llu, %llu bytes: %08x %08x %08x %08x %08x %08x %08x %08x", st ? "fragment" : "vertex", k,
+				      bound[st].buffer[k], bound[st].offset[k], bytes, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+			}
 			if (copy)
 				IOFree(copy, bytes);
 			misc[(0x100 + 0x100 * st) / 8 + k] = gpu;
@@ -1133,6 +1282,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		for (const Fmt &e : fmts)
 			fm = e.metal == format ? &e : fm;
 		const uint32_t w = td[15], h = td[16], rowBytes = td[13];
+		if (talk)
+			pvlog("host: render:   fragment texture %u: resource %u, format %u, %ux%u, %u bytes per row, %u mip level(s)", k, id, format, w, h, rowBytes,
+			      td[3] & 0xffff);
 		ok = ok && fm && w && h && w <= 16384 && h <= 16384 && rowBytes >= w * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= (td[0] | uint64_t(td[1]) << 32);
 		if (!ok) {
 			if (talk)
@@ -1196,7 +1348,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// draw VGT_INDEX_TYPE (SET_UCONFIG_REG_INDEX, as RADV on gfx9+); per instance the first vertex and the instance id (USER_DATA_GS_2/3, the
 	// vertex shader's s10-s11) and the draw: DRAW_INDEX_AUTO, or DRAW_INDEX_2 from the staged indices (DI_SRC_SEL_DMA).
 	const uint64_t table[2] = {mGfxMisc.gpu + 0x100, mGfxMisc.gpu + 0x200};
-	uint32_t seq[8 + 6 + 2 + 16 + 3 + 9 + 2 * kMaxInstances * 10], m = 0;
+	uint32_t seq[8 + 6 + 2 + 16 + 3 + 9 + 2 * 12], m = 0;
 	auto put = [&](uint32_t v) { seq[m++] = v; };
 	put(0xc0046900u);   // CB_BLEND_RED .. ALPHA: Render.setBlendColor's floats
 	put(0x105);
@@ -1228,23 +1380,23 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 				put(r[1]);
 			}
 		}
-		for (uint32_t i = 0; i < draw.instances; i++) {
-			put(0xc0027600u);
-			put(0x8e);                            // SPI_SHADER_USER_DATA_GS_2, _3
-			put(draw.start);
-			put(draw.baseInstance + i);
-			if (draw.indexBytes) {
-				put(0xc0042700u);                 // DRAW_INDEX_2 {max indices, address, count, initiator}
-				put(count);
-				put(static_cast<uint32_t>(indexGpu));
-				put(static_cast<uint32_t>(indexGpu >> 32));
-				put(count);
-				put(0);
-			} else {
-				put(0xc0012d00u);                 // DRAW_INDEX_AUTO {count, initiator: DI_SRC_SEL_AUTO_INDEX}
-				put(count);
-				put(2);
-			}
+		put(0xc0027600u);
+		put(0x8e);                                // SPI_SHADER_USER_DATA_GS_2, _3: the first vertex, the base instance
+		put(draw.start);
+		put(draw.baseInstance);
+		put(0xc0002f00u);                         // NUM_INSTANCES: the shader adds InstanceID (v4) to the base
+		put(draw.instances);
+		if (draw.indexBytes) {
+			put(0xc0042700u);                     // DRAW_INDEX_2 {max indices, address, count, initiator}
+			put(count);
+			put(static_cast<uint32_t>(indexGpu));
+			put(static_cast<uint32_t>(indexGpu >> 32));
+			put(count);
+			put(0);
+		} else {
+			put(0xc0012d00u);                     // DRAW_INDEX_AUTO {count, initiator: DI_SRC_SEL_AUTO_INDEX}
+			put(count);
+			put(2);
 		}
 	}
 	uint32_t total = 0;
@@ -1256,10 +1408,12 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			break;
 		}
 	ok &= total != 0;
-	static const uint32_t rsrc2[2][2] = {{0x8b, 4}, {0x0b, 2}};   // SPI_SHADER_PGM_RSRC2_GS, _PS: USER_SGPR [5:1] = 4 and 2 (air2amdgpu.cpp)
+	// SPI_SHADER_PGM_RSRC2_GS, _PS: USER_SGPR [5:1] = 4 and 2 (air2amdgpu.cpp); the GS also ES_VGPR_COMP_CNT [17:16] = 1, so the
+	// hardware loads InstanceID into v4 (gfx12, as RADV).
+	static const uint32_t rsrc2[2][3] = {{0x8b, 4, 1u << 16}, {0x0b, 2, 0}};
 	for (const auto &r : rsrc2)
 		if (uint32_t *d = ok ? streamReg(ib, total, 0x76, r[0]) : nullptr)
-			*d = (*d & ~0x3eu) | r[1] << 1;
+			*d = (*d & ~0x3003eu) | r[1] << 1 | r[2];
 		else
 			ok = false;
 
@@ -1268,8 +1422,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		for (uint64_t i = 0; i < static_cast<uint64_t>(pitch) * height; i++)
 			stage[i] = (stage[i] & 0xff00ff00u) | (stage[i] >> 16 & 0xff) | (stage[i] & 0xff) << 16;
 	};
+	auto row = [&](uint32_t y) { return reinterpret_cast<uint8_t *>(stage + static_cast<uint64_t>(y) * pitch); };
 	for (uint32_t y = 0; y < height && ok; y++)
-		ok = readGuest(task, va + static_cast<uint64_t>(y) * bpr, reinterpret_cast<uint8_t *>(stage + static_cast<uint64_t>(y) * pitch), bpr);
+		ok = surface.memory ? surface.memory->readBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
+		                    : readGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * 4);
 	uint64_t fence = 0, ns = 0;
 	if (ok) {
 		swap();
@@ -1284,7 +1440,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	if (ok) {
 		swap();
 		for (uint32_t y = 0; y < height && ok; y++)
-			ok = copyGuest(task, va + static_cast<uint64_t>(y) * bpr, reinterpret_cast<uint8_t *>(stage + static_cast<uint64_t>(y) * pitch), bpr, true);
+			ok = surface.memory ? surface.memory->writeBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
+			                    : copyGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * 4, true);
 	}
 	if (tgt.handle)
 		gCompute->rtFree(this, tgt.handle);
@@ -2714,6 +2871,7 @@ OSDefineMetaClassAndStructors(RDNA4PvLate, OSObject)
 void RDNA4PvNub::publishLater(uint32_t level, uint32_t delayMs) { RDNA4PvLate::schedule(level, delayMs); }
 void RDNA4PvNub::setLateParent(IOService *gpu) { gLateParent = gpu; }   // the GPU stays for the boot: no reference taken
 void RDNA4PvNub::setCompute(RDNA4Compute *compute) { gCompute = compute; }
+void RDNA4PvNub::setSurfaceFunctions(const mach_vm_address_t fn[8]) { memcpy(&gSurfaceFns, fn, sizeof(gSurfaceFns)); }
 
 
 bool RDNA4PvNub::raiseInterrupt(int source) {
