@@ -47,7 +47,7 @@
 //                      linearly, source-over blending, its 2x viewport) over 64x64; the raw BGRA8 pixels go to file F, to compare with
 //                      another GPU's (not checked here)
 //   mtlprobe coverage2 what Core Animation's shaders needed (2026-10-26): ushort vertex and instance ids, a half4 colour, saturate,
-//                      sign, dfdx, fwidth, and a sample with a texel offset, over 64x64; checked
+//                      sign, dfdx, fwidth, a sample with a texel offset from fragment texture 12, and vertex texture 9, over 64x64; checked
 //   mtlprobe varyings  five values from the vertex to the fragment function over a 64x64 quad: float3 perspective (red), float without
 //                      perspective (alpha), half2 centroid (green), uint and bool flat (blue: 0 in the first triangle, 0.65 in the second,
 //                      from its first vertex); checked away from the diagonal
@@ -1575,12 +1575,16 @@ static void glyphs2(id<MTLDevice> d, id<MTLCommandQueue> q, const char *file) {
 static void coverage2(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	NSError *err = nil;
 	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
-	                                              "vertex float4 c2_v(ushort vid [[vertex_id]], ushort iid [[instance_id]]) { float x = (vid == 1 || vid == 3 || vid == 4) ? 1.0 : -1.0;"
-	                                              " float y = (vid == 2 || vid == 4 || vid == 5) ? 1.0 : -1.0; return float4(x, y, float(iid), 1); }\n"
-	                                              "fragment half4 c2_f(float4 p [[position]], texture2d<half> t [[texture(0)]]) {"
+	                                              "struct C2 { float4 pos [[position]]; float v [[flat]]; };\n"
+	                                              "vertex C2 c2_v(ushort vid [[vertex_id]], ushort iid [[instance_id]], texture2d<float> vt [[texture(9)]]) {"
+	                                              " constexpr sampler s(filter::nearest); float x = (vid == 1 || vid == 3 || vid == 4) ? 1.0 : -1.0;"
+	                                              " float y = (vid == 2 || vid == 4 || vid == 5) ? 1.0 : -1.0; C2 o; o.pos = float4(x, y, float(iid), 1);"
+	                                              " o.v = vt.sample(s, float2(0.5, 0.5)).r; return o; }\n"
+	                                              "fragment half4 c2_f(C2 in [[stage_in]], texture2d<half> t [[texture(12)]]) { float4 p = in.pos;"
 	                                              " constexpr sampler s(filter::nearest, address::clamp_to_edge);"
 	                                              " half texel = t.sample(s, float2(0.375, 0.375), int2(1, 0)).r;"   // texel (1, 1) + (1, 0) = (2, 1)
-	                                              " return half4(saturate(p.x / 32 - 0.5), sign(p.y - 32) * 0.5 + 0.5, dfdx(p.x) * 0.25 + texel * 0.5, fwidth(p.y * 2) * 0.125); }"
+	                                              " return half4(saturate(p.x / 32 - 0.5), sign(p.y - 32) * 0.5 + 0.5, dfdx(p.x) * 0.25 + texel * 0.25 + in.v * 0.25,"
+	                                              " fwidth(p.y * 2) * 0.125); }"
 	                                     options:nil
 	                                       error:&err];
 	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
@@ -1599,6 +1603,11 @@ static void coverage2(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	uint8_t texels[4 * 4 * 4] = {};
 	texels[(1 * 4 + 2) * 4] = 255;
 	[tex replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:texels bytesPerRow:16];
+	MTLTextureDescriptor *wd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+	wd.storageMode = MTLStorageModeManaged;
+	id<MTLTexture> white = [d newTextureWithDescriptor:wd];   // the vertex stage's texture: one white texel
+	const uint8_t one[4] = {255, 255, 255, 255};
+	[white replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:one bytesPerRow:4];
 	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
 	td.usage = MTLTextureUsageRenderTarget;
 	td.storageMode = MTLStorageModePrivate;
@@ -1613,7 +1622,8 @@ static void coverage2(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	cb.label = @"mtlprobe coverage2";
 	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
 	[re setRenderPipelineState:ps];
-	[re setFragmentTexture:tex atIndex:0];
+	[re setVertexTexture:white atIndex:9];
+	[re setFragmentTexture:tex atIndex:12];
 	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
 	[re endEncoding];
 	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
@@ -1621,8 +1631,8 @@ static void coverage2(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	      destinationOffset:0 destinationBytesPerRow:64 * 4 destinationBytesPerImage:64 * 64 * 4];
 	[e endEncoding];
 	run(cb, "coverage2");
-	// R = saturate((x + 0.5) / 32 - 0.5), G = 0 above row 32 and 1 below, B = 0.25 + 0.5 (dfdx of x is 1, the offset texel 1), A = 0.25
-	// (fwidth of 2y is 2).
+	// R = saturate((x + 0.5) / 32 - 0.5), G = 0 above row 32 and 1 below, B = 0.25 * 3 (dfdx of x is 1, the offset texel 1, the vertex
+	// stage's texel 1), A = 0.25 (fwidth of 2y is 2).
 	const uint8_t *px = out.contents;
 	int wrong = 0, worst = 0;
 	for (int y = 0; y < 64; y++)

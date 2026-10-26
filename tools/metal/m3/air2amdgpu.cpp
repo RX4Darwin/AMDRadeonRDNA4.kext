@@ -314,13 +314,15 @@ static std::string legalize(Function &k) {
 				static const Intrinsic::ID ids[2][4] = {   // [offset][plain, bias, lod, lod zero]
 					{Intrinsic::amdgcn_image_sample_2d, Intrinsic::amdgcn_image_sample_b_2d, Intrinsic::amdgcn_image_sample_l_2d, Intrinsic::amdgcn_image_sample_lz_2d},
 					{Intrinsic::amdgcn_image_sample_o_2d, Intrinsic::amdgcn_image_sample_b_o_2d, Intrinsic::amdgcn_image_sample_l_o_2d, Intrinsic::amdgcn_image_sample_lz_o_2d}};
-				const unsigned mode = bias ? 1 : lod ? (zero ? 3 : 2) : 0;
+				// A vertex shader has no pixel quads to take derivatives from: its implicit-LOD samples (and biases) read level 0.
+				const bool vertexStage = k.getCallingConv() == CallingConv::AMDGPU_GS;
+				const unsigned mode = vertexStage && !(lod && !zero) ? 3 : bias ? 1 : lod ? (zero ? 3 : 2) : 0;
 				Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
 				SmallVector<Type *, 5> types = {v4f};   // the overloads: the texel, [the bias], the coordinates, the descriptors
 				SmallVector<Value *, 11> args = {b.getInt32(15)};
 				if (packed)
 					args.push_back(b.getInt32(packed));
-				if (bias) {
+				if (mode == 1) {
 					types.push_back(b.getFloatTy());
 					args.push_back(value);
 				}
@@ -556,7 +558,7 @@ struct Kernel {
 // {u32 hash of its AIR name (FNV-1a), u32 flags: bit 0 flat}: the vertex function's outputs in ring-slot order, the fragment function's
 // inputs in hardware-input order; the host matches them by name (SPI_PS_INPUT_CNTL_n).
 // Both stages get two user SGPRs, the address of the stage's table (the host's): 64-bit buffer addresses by Metal buffer index at +0, and in
-// the fragment stage the textures' T#s (8 dwords) at +64 + 32 n and the samplers' S#s (4 dwords) at +320 + 16 n.
+// both stages the textures' T#s (8 dwords) at +64 + 32 n and the samplers' S#s (4 dwords) at +576 + 16 n (n 0-15).
 //   vertex   amdgpu_gs, an NGG shader as src/shaders/nggcol.s: s3 = merged_wave_info ([7:0] vertices, [15:8] primitives, [27:24] wave in
 //            the subgroup), s5 = gs_attr_offset (s0-s7 are the merged stage's system SGPRs), s8-s9 the table, s10 the first vertex
 //            (added to VertexID, as RADV's base vertex), s11 the base instance (added to InstanceID), v0 = the packed primitive, v3 = VertexID,
@@ -628,13 +630,13 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			    (air->getArg(index)->getType() != PointerType::get(ctx, 1) && air->getArg(index)->getType() != PointerType::get(ctx, 2)))
 				return "buffer argument " + std::to_string(index) + ": only device and constant buffers at indices 0-7 so far";
 			from[index] = 100 + location;
-		} else if (!vertex && (kind == "air.texture" || kind == "air.sampler") && !unused) {
+		} else if ((kind == "air.texture" || kind == "air.sampler") && !unused) {
 			int location = -1;
 			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
 				if (mdString(a, k) == "air.location_index")
 					location = static_cast<int>(mdInt(a, k + 1));
-			if (location < 0 || location > 7)
-				return kind + " argument " + std::to_string(index) + ": only indices 0-7 so far";
+			if (location < 0 || location > 15)
+				return kind + " argument " + std::to_string(index) + ": only indices 0-15 so far";
 			from[index] = (kind == "air.texture" ? 200 : 300) + location;
 		}
 		else if (unused)
@@ -732,7 +734,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		Value *address = b.CreateIntToPtr(b.CreateAlignedLoad(b.getInt64Ty(), at, Align(8)), PointerType::get(ctx, 1));
 		return t == address->getType() ? address : b.CreateAddrSpaceCast(address, t);   // a constant buffer: made global again by legalize()
 	};
-	// A texture or sampler handle: the address of its T# (table + 64 + 32 n) or S# (table + 320 + 16 n), which legalize() loads.
+	// A texture or sampler handle: the address of its T# (table + 64 + 32 n) or S# (table + 576 + 16 n), which legalize() loads.
 	auto handle = [&](uint64_t offset, Type *t) -> Value * { return b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(offset)), t); };
 	auto fragPosition = [&]() {        // fragment: the pixel's window position x, y, depth z and w (POS_X..W_FLOAT)
 		Value *r = PoisonValue::get(v4f32);
@@ -747,8 +749,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			               : from[k] == 1 ? b.CreateZExtOrTrunc(b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance)), air->getArg(k)->getType())   // with the base instance
 			               : from[k] >= 400 ? fromVec4(inValues[static_cast<unsigned>(from[k] - 400)], air->getArg(k)->getType())
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
-			               : from[k] >= 300 ? handle(320 + 16 * static_cast<unsigned>(from[k] - 300), air->getArg(k)->getType())
-			               : from[k] >= 200 ? handle(64 + 32 * static_cast<unsigned>(from[k] - 200), air->getArg(k)->getType())
+			               : from[k] >= 300 ? handle(RDNA4_MTLC_TABLE_SAMPLERS + 16 * static_cast<unsigned>(from[k] - 300), air->getArg(k)->getType())
+			               : from[k] >= 200 ? handle(RDNA4_MTLC_TABLE_TEXTURES + 32 * static_cast<unsigned>(from[k] - 200), air->getArg(k)->getType())
 			               : from[k] >= 100 ? buffer(static_cast<unsigned>(from[k] - 100), air->getArg(k)->getType())
 			                              : PoisonValue::get(air->getArg(k)->getType()));
 		return b.CreateCall(air, args);

@@ -424,6 +424,14 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   on the rig), Apple's `imageblock` tile memory (16; not for this device), textures past index 7 (12), integer texture reads (7), vertex-stage
   textures (6), function constants (5 + SkyLight 7). Not run on the card yet; `mtlprobe coverage2` checks most of it (passes on this Mac's GPU).
   The host stages only mip level 0, so LOD and bias samples of a mipmapped texture will differ from Apple's until mip levels are staged.
+- **Textures: 16 per stage, and in vertex shaders (2026-10-26, not run on the card).** Each stage's table (the host's misc page: vertex at
+  +0x400, fragment at +0x800, the fence still at +0) has the buffers at +0, T# n at +64 + 32 n and S# n at +576 + 16 n for n 0-15
+  (`RDNA4_MTLC_TABLE_TEXTURES` / `_SAMPLERS` in `include/rdna4mtlc.h`, shared by the host and the translator). The host takes
+  `Render.setVertexTextures` (0x081) and `setVertexSamplerStates` (0x07f) with the fragment ones' layout (assumed, not measured). A vertex
+  shader has no pixel quads, so its implicit-LOD and bias samples read level 0 (`image.sample.lz`). Mip levels are still not staged: a
+  linear image's mip chain has to be laid out as the hardware addresses it, which wants the card to check. `mtlprobe coverage2` now also
+  samples vertex texture 9 and fragment texture 12. Core Animation 83 of 180; the rest of its texture refusals are compute kernels with
+  textures (not supported yet).
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's

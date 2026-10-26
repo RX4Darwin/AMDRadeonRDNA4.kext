@@ -18,3 +18,9 @@
 #define RDNA4_MTLC_MAX_ELF (1u << 20)
 
 enum { kMtlcNext = 0, kMtlcDeliver = 1 };
+
+/* A vertex or fragment shader's table (the host fills it; the shader finds its address in two user SGPRs): the buffers' 64-bit addresses at
+ * +0 (indices 0-7), texture n's T# (8 dwords) at RDNA4_MTLC_TABLE_TEXTURES + 32 n, sampler n's S# (4 dwords) at RDNA4_MTLC_TABLE_SAMPLERS
+ * + 16 n (n 0-15). */
+#define RDNA4_MTLC_TABLE_TEXTURES 64u
+#define RDNA4_MTLC_TABLE_SAMPLERS 576u
