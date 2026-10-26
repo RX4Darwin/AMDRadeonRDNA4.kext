@@ -12,12 +12,15 @@
 //   +0           a 64-bit buffer address per Metal buffer index, 0 .. the highest index the kernel uses
 //   +8 * N       u32 threads per threadgroup x, y, z
 //   +8 * N + 12  u32 threads in the grid x, y, z (threads past it do nothing: dispatchThreads need not fill whole groups)
+//   +8 * N + 24  u64 the address of the kernel's texture and sampler table (T# n at RDNA4_MTLC_TABLE_TEXTURES + 32 n, S# n at
+//                RDNA4_MTLC_TABLE_SAMPLERS + 16 n, include/rdna4mtlc.h); always there, 0 without textures
 // It computes the AIR function's position arguments from the work-group and work-item ids and calls the AIR function, inlined.
 // Supported so far: device and constant buffers, the arguments thread_position_in_grid, thread_position_in_threadgroup,
-// threadgroup_position_in_grid, threads_per_threadgroup and threads_per_grid (uint, uint2 or uint3), thread_index_in_threadgroup and the
+// threadgroup_position_in_grid, threads_per_threadgroup, threads_per_grid and threadgroups_per_grid (uint, uint2 or uint3; ushort too), thread_index_in_threadgroup and the
 // SIMD-group indices (a SIMD group is a wave of 32), SIMD-group functions (simdOp() below), threadgroup memory and barriers, local
 // arrays (as long as LLVM keeps them out of scratch memory, which the kext's runtime does not give kernels), device and threadgroup atomic
-// read-modify-writes, and the math and integer functions of legalize() below. Anything else is reported and refused.
+// read-modify-writes, textures and samplers (2D: read, write, sample at level 0), and the math and integer functions of legalize() below.
+// Anything else is reported and refused.
 #include "lld/Common/Driver.h"
 #include "llvm/BinaryFormat/MsgPackDocument.h"
 #include "llvm/Bitcode/BitcodeReader.h"
@@ -314,9 +317,10 @@ static std::string legalize(Function &k) {
 				static const Intrinsic::ID ids[2][4] = {   // [offset][plain, bias, lod, lod zero]
 					{Intrinsic::amdgcn_image_sample_2d, Intrinsic::amdgcn_image_sample_b_2d, Intrinsic::amdgcn_image_sample_l_2d, Intrinsic::amdgcn_image_sample_lz_2d},
 					{Intrinsic::amdgcn_image_sample_o_2d, Intrinsic::amdgcn_image_sample_b_o_2d, Intrinsic::amdgcn_image_sample_l_o_2d, Intrinsic::amdgcn_image_sample_lz_o_2d}};
-				// A vertex shader has no pixel quads to take derivatives from: its implicit-LOD samples (and biases) read level 0.
-				const bool vertexStage = k.getCallingConv() == CallingConv::AMDGPU_GS;
-				const unsigned mode = vertexStage && !(lod && !zero) ? 3 : bias ? 1 : lod ? (zero ? 3 : 2) : 0;
+				// Only a fragment shader has pixel quads to take derivatives from: elsewhere (vertex shaders, kernels) implicit-LOD samples
+				// (and biases) read level 0.
+				const bool quads = k.getCallingConv() == CallingConv::AMDGPU_PS;
+				const unsigned mode = !quads && !(lod && !zero) ? 3 : bias ? 1 : lod ? (zero ? 3 : 2) : 0;
 				Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
 				SmallVector<Type *, 5> types = {v4f};   // the overloads: the texel, [the bias], the coordinates, the descriptors
 				SmallVector<Value *, 11> args = {b.getInt32(15)};
@@ -341,6 +345,15 @@ static std::string legalize(Function &k) {
 			if (half)
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (name.starts_with("write_texture_2d.v4f")) {   // (texture, uint2 coord, float4 or half4 value, i32 lod, i32 access)
+			if (c->arg_size() < 4 || !match(c->getArgOperand(3), m_Zero()))
+				return f->getName().str() + " to a level other than 0 is not supported yet";
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(1), *value = c->getArgOperand(2);
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
+			if (value->getType() != v4f)
+				value = b.CreateFPExt(value, v4f);
+			b.CreateIntrinsic(Intrinsic::amdgcn_image_store_2d, {v4f, b.getInt32Ty(), t->getType()},
+			                  {value, b.getInt32(15), b.CreateExtractElement(xy, uint64_t(0)), b.CreateExtractElement(xy, 1), t, b.getInt32(0), b.getInt32(0)});
 		} else if (name == "discard_fragment") {   // fragment only: the lane ends
 			b.CreateIntrinsic(Intrinsic::amdgcn_kill, {}, {b.getFalse()});
 		} else if (name == "get_read_sampler") {
@@ -924,7 +937,7 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 		return "no AIR kernel named " + fname.str();
 
 	// What each argument of the AIR function is.
-	enum Role { Buffer, PosInGrid, PosInGroup, GroupInGrid, GroupSize, GridSize, IndexInGroup, Lane, SimdInGroup, SimdWidth, SimdsInGroup };
+	enum Role { Buffer, PosInGrid, PosInGroup, GroupInGrid, GroupSize, GridSize, IndexInGroup, Lane, SimdInGroup, SimdWidth, SimdsInGroup, Texture, Sampler, GroupsInGrid };
 	struct Arg { Role role; int location; };
 	std::map<unsigned, Arg> roles;
 	int maxLocation = -1;
@@ -947,6 +960,14 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 			roles[index] = {Buffer, location};
 			written |= writes ? 1u << location : 0;
 			maxLocation = location > maxLocation ? location : maxLocation;
+		} else if (kind == "air.texture" || kind == "air.sampler") {
+			int location = -1;
+			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
+				if (mdString(a, k) == "air.location_index")
+					location = static_cast<int>(mdInt(a, k + 1));
+			if (location < 0 || location > 15)
+				return "argument " + std::to_string(index) + ": " + kind + " only at indices 0-15 so far";
+			roles[index] = {kind == "air.texture" ? Texture : Sampler, location};
 		} else if (kind == "air.thread_position_in_grid") {
 			roles[index] = {PosInGrid, -1};
 		} else if (kind == "air.thread_position_in_threadgroup") {
@@ -957,6 +978,8 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 			roles[index] = {GroupSize, -1};
 		} else if (kind == "air.threads_per_grid") {
 			roles[index] = {GridSize, -1};
+		} else if (kind == "air.threadgroups_per_grid") {
+			roles[index] = {GroupsInGrid, -1};
 		} else if (kind == "air.thread_index_in_threadgroup") {
 			roles[index] = {IndexInGroup, -1};
 		} else if (kind == "air.thread_index_in_simdgroup") {
@@ -979,6 +1002,7 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 	SmallVector<Type *, 40> params(nBuffers, PointerType::get(ctx, 1));
 	for (unsigned k = 0; k < 6; k++)
 		params.push_back(Type::getInt32Ty(ctx));
+	params.push_back(Type::getInt64Ty(ctx));   // the texture and sampler table
 	const std::string name = air->getName().str();
 	air->setName(name + ".air");
 	air->setLinkage(GlobalValue::InternalLinkage);
@@ -987,7 +1011,7 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 	kernel->setCallingConv(CallingConv::AMDGPU_KERNEL);
 	kernel->addFnAttr("amdgpu-flat-work-group-size", "1,1024");
 	IRBuilder<> b(BasicBlock::Create(ctx, "entry", kernel));
-	Value *group[3], *item[3], *size[3], *actual[3], *grid[3], *pos[3];
+	Value *group[3], *item[3], *size[3], *actual[3], *grid[3], *pos[3], *groups[3];
 	const Intrinsic::ID groupId[3] = {Intrinsic::amdgcn_workgroup_id_x, Intrinsic::amdgcn_workgroup_id_y, Intrinsic::amdgcn_workgroup_id_z};
 	const Intrinsic::ID itemId[3] = {Intrinsic::amdgcn_workitem_id_x, Intrinsic::amdgcn_workitem_id_y, Intrinsic::amdgcn_workitem_id_z};
 	Value *inside = b.getTrue();
@@ -1000,6 +1024,7 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 		pos[d] = b.CreateAdd(first, item[d]);
 		actual[d] = b.CreateBinaryIntrinsic(Intrinsic::umin, size[d], b.CreateSub(grid[d], first));   // Metal: a partial group's own size
 		inside = b.CreateAnd(inside, b.CreateICmpULT(pos[d], grid[d]));
+		groups[d] = b.CreateUDiv(b.CreateAdd(grid[d], b.CreateSub(size[d], b.getInt32(1))), size[d]);   // whole and partial groups
 	}
 	// The thread's index in its group, x fastest: the order the hardware packs a group into waves of 32, Metal's SIMD groups.
 	Value *linear = b.CreateAdd(item[0], b.CreateMul(size[0], b.CreateAdd(item[1], b.CreateMul(size[1], item[2]))));
@@ -1011,12 +1036,17 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 	for (unsigned i = 0; i < air->arg_size(); i++) {
 		const Arg &a = roles[i];
 		// A constant buffer (AIR's address space 2) is cast here and made global memory again by legalize().
+		Value *table = kernel->getArg(nBuffers + 6);
+		const unsigned slot = static_cast<unsigned>(a.location);   // a texture's or sampler's index (0-15)
 		Value *v = a.role == Buffer      ? b.CreateAddrSpaceCast(kernel->getArg(static_cast<unsigned>(a.location)), air->getArg(i)->getType())
+		         : a.role == Texture     ? b.CreateIntToPtr(b.CreateAdd(table, b.getInt64(RDNA4_MTLC_TABLE_TEXTURES + 32 * slot)), air->getArg(i)->getType())
+		         : a.role == Sampler     ? b.CreateIntToPtr(b.CreateAdd(table, b.getInt64(RDNA4_MTLC_TABLE_SAMPLERS + 16 * slot)), air->getArg(i)->getType())
 		         : a.role == PosInGrid   ? asType(b, air->getArg(i)->getType(), pos)
 		         : a.role == PosInGroup  ? asType(b, air->getArg(i)->getType(), item)
 		         : a.role == GroupInGrid ? asType(b, air->getArg(i)->getType(), group)
 		         : a.role == GroupSize   ? asType(b, air->getArg(i)->getType(), actual)
 		         : a.role == GridSize    ? asType(b, air->getArg(i)->getType(), grid)
+		         : a.role == GroupsInGrid ? asType(b, air->getArg(i)->getType(), groups)
 		         : a.role == IndexInGroup ? linear
 		         : a.role == Lane         ? b.CreateAnd(linear, 31)
 		         : a.role == SimdInGroup  ? b.CreateLShr(linear, 5)

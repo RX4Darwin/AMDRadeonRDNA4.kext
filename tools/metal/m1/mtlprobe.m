@@ -48,6 +48,8 @@
 //                      another GPU's (not checked here)
 //   mtlprobe coverage2 what Core Animation's shaders needed (2026-10-26): ushort vertex and instance ids, a half4 colour, saturate,
 //                      sign, dfdx, fwidth, a sample with a texel offset from fragment texture 12, and vertex texture 9, over 64x64; checked
+//   mtlprobe ctex      a compute kernel with textures (2026-10-26): reads texture 0, samples texture 3 through sampler 2, writes texture 5,
+//                      and stores threadgroups_per_grid; 8x8 threads in 4x4 groups; checked
 //   mtlprobe varyings  five values from the vertex to the fragment function over a 64x64 quad: float3 perspective (red), float without
 //                      perspective (alpha), half2 centroid (green), uint and bool flat (blue: 0 in the first triangle, 0.65 in the second,
 //                      from its first vertex); checked away from the diagonal
@@ -1651,6 +1653,69 @@ static void coverage2(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	    a[2], a[3]);
 }
 
+static void ctex(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "kernel void ct_k(texture2d<float, access::read> a [[texture(0)]], texture2d<float> b [[texture(3)]],"
+	                                              " texture2d<float, access::write> c [[texture(5)]], sampler s [[sampler(2)]], device uint *g [[buffer(0)]],"
+	                                              " uint2 gid [[thread_position_in_grid]], uint2 groups [[threadgroups_per_grid]]) {"
+	                                              " float4 x = a.read(gid); float4 y = b.sample(s, (float2(gid) + 0.5) / 8.0, level(0));"
+	                                              " c.write(float4(x.r, y.g, 0.5, 1), gid);"
+	                                              " if (gid.x == 0 && gid.y == 0) { g[0] = groups.x; g[1] = groups.y; } }"
+	                                     options:nil
+	                                       error:&err];
+	id<MTLFunction> fn = [lib newFunctionWithName:@"ct_k"];
+	id<MTLComputePipelineState> ps = fn ? [d newComputePipelineStateWithFunction:fn error:&err] : nil;
+	if (!ps) {
+		OUT("ctex: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	MTLTextureDescriptor *xd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+	xd.storageMode = MTLStorageModeManaged;
+	xd.usage = MTLTextureUsageShaderRead;
+	id<MTLTexture> a = [d newTextureWithDescriptor:xd], b = [d newTextureWithDescriptor:xd];
+	xd.usage = MTLTextureUsageShaderWrite;
+	id<MTLTexture> c = [d newTextureWithDescriptor:xd];
+	uint8_t ta[8 * 8 * 4], tb[8 * 8 * 4], zero[8 * 8 * 4] = {};
+	for (int i = 0; i < 64; i++) {
+		const uint8_t va[4] = {(uint8_t)(i % 8 * 32), 0, 0, 255}, vb[4] = {0, (uint8_t)(i / 8 * 32), 0, 255};
+		memcpy(ta + 4 * i, va, 4);
+		memcpy(tb + 4 * i, vb, 4);
+	}
+	[a replaceRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0 withBytes:ta bytesPerRow:32];
+	[b replaceRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0 withBytes:tb bytesPerRow:32];
+	[c replaceRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0 withBytes:zero bytesPerRow:32];
+	MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];   // nearest, clamp to edge
+	id<MTLSamplerState> ss = [d newSamplerStateWithDescriptor:sd];
+	id<MTLBuffer> g = [d newBufferWithLength:16 options:MTLResourceStorageModeShared];
+	memset(g.contents, 0, 16);
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe ctex";
+	id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+	[ce setComputePipelineState:ps];
+	[ce setTexture:a atIndex:0];
+	[ce setTexture:b atIndex:3];
+	[ce setTexture:c atIndex:5];
+	[ce setSamplerState:ss atIndex:2];
+	[ce setBuffer:g offset:0 atIndex:0];
+	[ce dispatchThreadgroups:MTLSizeMake(2, 2, 1) threadsPerThreadgroup:MTLSizeMake(4, 4, 1)];
+	[ce endEncoding];
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e synchronizeResource:c];
+	[e endEncoding];
+	run(cb, "ctex");
+	uint8_t tc[8 * 8 * 4];
+	[c getBytes:tc bytesPerRow:32 fromRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0];
+	int wrong = 0;
+	for (int i = 0; i < 64; i++) {
+		const uint8_t want[4] = {(uint8_t)(i % 8 * 32), (uint8_t)(i / 8 * 32), 128, 255};   // R, G, B, A
+		wrong += memcmp(tc + 4 * i, want, 4) != 0;
+	}
+	const uint32_t *gs = g.contents;
+	OUT("ctex: %d of 64 texels wrong; texel (5, 6) R %u G %u B %u A %u; threadgroups_per_grid %u x %u (0, 160 192 128 255, 2 x 2 = executed)", wrong,
+	    tc[4 * 53], tc[4 * 53 + 1], tc[4 * 53 + 2], tc[4 * 53 + 3], gs[0], gs[1]);
+}
+
 static void varyings(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	NSError *err = nil;
 	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
@@ -1720,8 +1785,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend", "blendx", "varyings", "texsize", "surfdraw", "manyinst", "viewport", "texlinear", "fragpos", "glyphs", "coverage2"};
-			for (int i = 0; i < 27; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend", "blendx", "varyings", "texsize", "surfdraw", "manyinst", "viewport", "texlinear", "fragpos", "glyphs", "coverage2", "ctex"};
+			for (int i = 0; i < 28; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -1796,6 +1861,8 @@ int main(int argc, char **argv) {
 			glyphs(d, q);
 		else if (!strcmp(mode, "coverage2"))
 			coverage2(d, q);
+		else if (!strcmp(mode, "ctex"))
+			ctex(d, q);
 		else if (!strcmp(mode, "glyphs2"))
 			glyphs2(d, q, argc > 2 ? argv[2] : NULL);
 		else if (!strcmp(mode, "blend") || !strcmp(mode, "blendx"))
@@ -1805,7 +1872,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(mode, "drawargs"))
 			drawargs(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, blend, blendx, varyings, texsize, surfdraw, manyinst, viewport, texlinear, fragpos, glyphs, glyphs2 F, coverage2, texinfo, blendinfo, drawargs, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, blend, blendx, varyings, texsize, surfdraw, manyinst, viewport, texlinear, fragpos, glyphs, glyphs2 F, coverage2, ctex, texinfo, blendinfo, drawargs, all)", mode);
 			return 2;
 		}
 	}

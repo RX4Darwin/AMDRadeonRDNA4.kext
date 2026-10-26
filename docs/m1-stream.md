@@ -432,6 +432,14 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   linear image's mip chain has to be laid out as the hardware addresses it, which wants the card to check. `mtlprobe coverage2` now also
   samples vertex texture 9 and fragment texture 12. Core Animation 83 of 180; the rest of its texture refusals are compute kernels with
   textures (not supported yet).
+- **Compute kernels with textures (2026-10-26, not run on the card).** Every translated kernel now takes one more kernarg after the six
+  dimensions: the address of a texture and sampler table of the shader tables' layout (0 without textures; the table's precompiled kernels
+  ignore it). The host binds `Compute.setTextures` (0x0ce) and `setSamplerStates` (0x0cc) (`{first, count, ids}`, as seen in the rig's log
+  for the screenshot tool), stages them with the draws' code (`stageTextures`, shared now), and after the dispatch copies back the textures
+  whose Metal usage has ShaderWrite (`releaseTextures`). The translator maps `write_texture_2d` to `image.store`, samples at level 0 outside
+  fragment shaders, and gives `threadgroups_per_grid` (grid / group size, rounded up). Core Animation 86 of 180 (3 of its 6 texture kernels;
+  the other 3 take threadgroup memory as an argument, sized at dispatch: not supported yet). `mtlprobe ctex` (read, sample, write,
+  threadgroups_per_grid) passes on this Mac's GPU.
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's

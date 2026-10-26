@@ -208,7 +208,10 @@ public:
 	// resource id, offset and index size (bytes; 0: not indexed).
 	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes, blendColor[4]; uint64_t viewport[4]; bool viewportSet; };
 	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *stage);
-	void runCompute(uint32_t task, uint32_t pipeline, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size);
+	void runCompute(uint32_t task, uint32_t pipeline, const Bindings &bound, const uint64_t *size);
+	struct StagedTexture { uint64_t handle, va; uint32_t rowBytes, pitch, rowLen, height; bool writable; };   // a texture staged in the runtime
+	bool stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName);
+	bool releaseTextures(uint32_t task, StagedTexture (&staged)[16], bool copyBack);
 	void describeRenderPipeline(uint32_t task, uint32_t pipeline);
 private:
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
@@ -772,14 +775,16 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		t->viewportSet = true;
 	} else if (id == 0x065 && bytes >= 16) {   // Render.setBlendColorRed {float red, green, blue, alpha}
 		memcpy(t->blendColor, payload, 16);
-	} else if ((id == 0x072 || id == 0x070 || id == 0x081 || id == 0x07f) && bytes >= 8) {
+	} else if ((id == 0x072 || id == 0x070 || id == 0x081 || id == 0x07f || id == 0x0ce || id == 0x0cc) && bytes >= 8) {
 		// Render.setFragmentTextures / setFragmentSamplerStates {u32 first index, u32 count, count x u32 resource id} (measured), and
-		// setVertexTextures / setVertexSamplerStates (the same layout assumed, not measured: the rig is down, 2026-10-26)
+		// setVertexTextures / setVertexSamplerStates (the same layout assumed, not measured: the rig is down, 2026-10-26), and
+		// Compute.setTextures / setSamplerStates (the same layout, seen in the rig's log on 2026-10-22)
 		uint32_t first, count;
 		memcpy(&first, payload, 4);
 		memcpy(&count, payload + 4, 4);
-		RDNA4PvHost::Bindings &g = t->stage[id == 0x072 || id == 0x070];
-		uint32_t *to = id == 0x072 || id == 0x081 ? g.texture : g.sampler;
+		const bool compute = id == 0x0ce || id == 0x0cc;
+		RDNA4PvHost::Bindings &g = compute ? t->compute : t->stage[id == 0x072 || id == 0x070];
+		uint32_t *to = id == 0x072 || id == 0x081 || id == 0x0ce ? g.texture : g.sampler;
 		for (uint32_t k = 0; k < count && first + k < 16 && 8 + 4 * (k + 1) <= bytes; k++)
 			memcpy(&to[first + k], payload + 8 + 4 * k, 4);
 	} else if ((id == 0x0cf || id == 0x07e || id == 0x06f) && bytes >= 12) {   // the set...BufferOffset of each: {u32 index, u64 offset}
@@ -796,7 +801,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		memcpy(size, payload, sizeof(size));
 		for (unsigned d = 0; d < 3 && id == 0x0c8; d++)
 			size[d] *= size[d + 3];
-		t->host->runCompute(t->task, t->pipeline, t->compute.buffer, t->compute.offset, size);
+		t->host->runCompute(t->task, t->pipeline, t->compute, size);
 	}
 	if (t->lines++ >= 80)
 		return;
@@ -1061,6 +1066,116 @@ static uint32_t halfAsFloat(uint32_t n, bool negative) {
 // The same for a signed n, |n| < 2^24.
 static uint32_t halfAsFloat(int64_t n) { return halfAsFloat(static_cast<uint32_t>(n < 0 ? -n : n), n < 0); }
 
+// M4: a stage's (or a kernel's) textures 0-15 and samplers 0-15: each texture's mip level 0 staged into the runtime at a pitch of a multiple
+// of 128 bytes (gfx12's linear images), and the T#s and S#s written into `table` (its layout in include/rdna4mtlc.h, shared with
+// air2amdgpu.cpp). A texture resource (measured, docs/m1-stream.md s.5b):
+// {u64 bytes, u32 start page, u32 (array << 16) | mips, ..., from dword 9 per level {u64 offset, u64 bytes, u64 bytes per row, u32 width,
+// height, depth}, then ..., 0x2c, its own id, (Metal pixel format << 16) | usage}. A sampler resource (type 7, tag 3, 36 bytes) packs at
+// dword 3: mag [1:0], min [3:2], address s [10:8], t [14:12], r [18:16], mip [25:24], anisotropy [30:26], normalized [31].
+bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName) {
+	bool ok = true;
+	for (unsigned k = 0; k < 16 && ok; k++) {
+		const uint32_t id = bound.texture[k];
+		uint32_t rec[3], td[64] = {};
+		if (!id)
+			continue;
+		ok = readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) && (rec[0] & 0xff) == 2 && (rec[0] >> 8) >= 4 * 29 &&   // 29 dwords with one mip level
+		     readGuest(task, rec[1], reinterpret_cast<uint8_t *>(td), (rec[0] >> 8) < sizeof(td) ? rec[0] >> 8 : sizeof(td));
+		const uint32_t dwords = ok ? ((rec[0] >> 8) < sizeof(td) ? rec[0] >> 8 : sizeof(td)) / 4 : 0;
+		uint32_t format = 0, usage = 0;
+		for (uint32_t j = 19; j + 1 < dwords; j++)
+			if (td[j - 1] == 0x2c && td[j] == id) {
+				format = td[j + 1] >> 16;
+				usage = td[j + 1] & 0xffff;
+			}
+		// Metal pixel format -> gfx12 image format, its DST_SEL x, y, z, w (4 X .. 7 W, 0 zero, 1 one), bytes per pixel
+		struct Fmt { uint32_t metal, gfx, sel, bpp; };
+		static const Fmt fmts[] = {{70, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {71, 66, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},    // RGBA8 unorm, sRGB
+		                           {80, 42, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4}, {81, 66, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // BGRA8 unorm, sRGB
+		                           {55, 22, 4 | 0 << 3 | 0 << 6 | 1 << 9, 4}, {115, 57, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // R32Float, RGBA16Float
+		                           {125, 63, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16}};                                            // RGBA32Float
+		const Fmt *fm = nullptr;
+		for (const Fmt &e : fmts)
+			fm = e.metal == format ? &e : fm;
+		const uint32_t w = td[15], h = td[16], rowBytes = td[13];
+		if (talk)
+			pvlog("host: render:   %s texture %u: resource %u, format %u, %ux%u, %u bytes per row, %u mip level(s)", stageName, k, id, format, w, h,
+			      rowBytes, td[3] & 0xffff);
+		ok = ok && fm && w && h && w <= 16384 && h <= 16384 && rowBytes >= w * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= (td[0] | uint64_t(td[1]) << 32);
+		if (!ok) {
+			if (talk)
+				pvlog("host: render: %s texture %u (resource %u): format %u, %ux%u: not supported yet", stageName, k, id, format, w, h);
+			break;
+		}
+		const uint32_t texPitch = (w * fm->bpp + 127) & ~127u;   // bytes
+		const uint64_t bytes = static_cast<uint64_t>(texPitch) * h;
+		auto *copy = static_cast<uint8_t *>(IOMalloc(bytes));
+		uint64_t gpu = 0;
+		ok = copy != nullptr;
+		for (uint32_t y = 0; y < h && ok; y++)
+			ok = readGuest(task, (static_cast<uint64_t>(td[2]) << 12) + static_cast<uint64_t>(y) * rowBytes, copy + static_cast<uint64_t>(y) * texPitch, w * fm->bpp);
+		ok = ok && gCompute->rtAlloc(this, bytes, out[k].handle, gpu) == kIOReturnSuccess &&
+		     gCompute->rtCopy(this, out[k].handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(copy), bytes, true) == kIOReturnSuccess;
+		if (copy)
+			IOFree(copy, bytes);
+		const uint32_t pitchPx = texPitch / fm->bpp;
+		out[k].va = static_cast<uint64_t>(td[2]) << 12;
+		out[k].rowBytes = rowBytes;
+		out[k].pitch = texPitch;
+		out[k].rowLen = w * fm->bpp;
+		out[k].height = h;
+		out[k].writable = usage & 2;   // MTLTextureUsageShaderWrite
+		uint32_t *t = table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4;   // SQ_IMG_RSRC_WORD0-7 (ac_build_gfx12_texture_descriptor, linear, custom pitch)
+		t[0] = static_cast<uint32_t>(gpu >> 8);
+		t[1] = static_cast<uint32_t>((gpu >> 40) & 0xff) | fm->gfx << 17 | ((w - 1) & 3) << 30;   // MAX_MIP 0, FORMAT, BASE_LEVEL 0, WIDTH_LO
+		t[2] = (w - 1) >> 2 | (h - 1) << 14;                                                      // WIDTH_HI, HEIGHT
+		t[3] = fm->sel | 9u << 28;                                                                // DST_SEL, LAST_LEVEL 0, SW_MODE linear, TYPE 2D
+		t[4] = ((pitchPx - 1) & 0x3fff) | ((pitchPx - 1) >> 14 & 3) << 14;                         // DEPTH = pitch - 1 low, PITCH_MSB
+		t[5] = 4u << 20;                                                                          // PERF_MOD 4
+		t[6] = 1u << 15;                                                                          // MAX_UNCOMPRESSED_BLOCK_SIZE 256 B
+		t[7] = 0;
+	}
+	for (unsigned k = 0; k < 16 && ok; k++) {
+		const uint32_t id = bound.sampler[k];
+		uint32_t rec[3], sd[9] = {};
+		if (!id)
+			continue;
+		ok = readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) && (rec[0] & 0xff) == 7 && (rec[0] >> 8) >= 16 &&
+		     readGuest(task, rec[1], reinterpret_cast<uint8_t *>(sd), 16) && sd[0] == 3;
+		const uint32_t d = sd[3];
+		static const uint32_t clamp[8] = {2, 3, 0, 1, 6, 6, 2, 2};   // Metal: edge, mirror-clamp-to-edge, repeat, mirror, zero, border
+		uint32_t *sm = table + (RDNA4_MTLC_TABLE_SAMPLERS + 16 * k) / 4;   // SQ_IMG_SAMP_WORD0-3; ponytail: no anisotropy, LOD unclamped, border transparent black
+		sm[0] = clamp[(d >> 8) & 7] | clamp[(d >> 12) & 7] << 3 | clamp[(d >> 16) & 7] << 6 | (d >> 31 ? 0 : 1u << 15);
+		sm[1] = 0xfffu << 13;
+		sm[2] = (d & 3) << 20 | ((d >> 2) & 3) << 22 | ((d >> 24) & 3) << 26;
+		sm[3] = 0;
+	}
+	return ok;
+}
+
+// The textures stageTextures put in the runtime freed; with copyBack, the writable ones (MTLTextureUsageShaderWrite) first copied back into the
+// guest's texture, row by row. False if a copy back failed.
+bool RDNA4PvHost::releaseTextures(uint32_t task, StagedTexture (&staged)[16], bool copyBack) {
+	bool all = true;
+	for (StagedTexture &st : staged) {
+		if (!st.handle)
+			continue;
+		if (copyBack && st.writable) {
+			const uint64_t bytes = static_cast<uint64_t>(st.pitch) * st.height;
+			auto *copy = static_cast<uint8_t *>(IOMalloc(bytes));
+			bool ok = copy && gCompute->rtCopy(this, st.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(copy), bytes, false) == kIOReturnSuccess;
+			for (uint32_t y = 0; y < st.height && ok; y++)
+				ok = copyGuest(task, st.va + static_cast<uint64_t>(y) * st.rowBytes, copy + static_cast<uint64_t>(y) * st.pitch, st.rowLen, true);
+			if (copy)
+				IOFree(copy, bytes);
+			all &= ok;
+		}
+		gCompute->rtFree(this, st.handle);
+		st = {};
+	}
+	return all;
+}
+
 // M4: Render.drawPrimitives on the card: the pipeline's vertex and fragment functions translated by the helper (air2amdgpu.cpp
 // translateShader), drawn with the stream of src/gfx12_draw.h (the triangle every gfx test of the kext draws, proven on the card) with the
 // translated shaders in place of its own and the target, viewport, blending and draw patched; the colour attachment (a BGRA8 texture or
@@ -1255,84 +1370,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 				IOFree(copy, bytes);
 			misc[(0x400 + 0x400 * st) / 8 + k] = gpu;
 		}
-	// Each stage's textures (0-15): mip level 0 staged at a pitch of a multiple of 128 bytes (gfx12's linear images), their T#s at +64 + 32 n
-	// of the stage's table; its samplers (0-15) as S#s at +576 + 16 n (air2amdgpu.cpp). A texture resource (measured, docs/m1-stream.md s.5b):
-	// {u64 bytes, u32 start page, u32 (array << 16) | mips, ..., from dword 9 per level {u64 offset, u64 bytes, u64 bytes per row, u32 width,
-	// height, depth}, then ..., 0x2c, its own id, (Metal pixel format << 16) | usage}. A sampler resource (type 7, tag 3, 36 bytes) packs at
-	// dword 3: mag [1:0], min [3:2], address s [10:8], t [14:12], r [18:16], mip [25:24], anisotropy [30:26], normalized [31].
-	uint64_t texHandle[2][16] = {};
-	for (unsigned st = 0; st < 2 && ok; st++) {
-		uint32_t *stageTable = reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]);
-		const char *stageName = st ? "fragment" : "vertex";
-		for (unsigned k = 0; k < 16 && ok; k++) {
-			const uint32_t id = bound[st].texture[k];
-			uint32_t rec[3], td[64] = {};
-			if (!id)
-				continue;
-			ok = readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) && (rec[0] & 0xff) == 2 && (rec[0] >> 8) >= 4 * 29 &&   // 29 dwords with one mip level
-			     readGuest(task, rec[1], reinterpret_cast<uint8_t *>(td), (rec[0] >> 8) < sizeof(td) ? rec[0] >> 8 : sizeof(td));
-			const uint32_t dwords = ok ? ((rec[0] >> 8) < sizeof(td) ? rec[0] >> 8 : sizeof(td)) / 4 : 0;
-			uint32_t format = 0;
-			for (uint32_t j = 19; j + 1 < dwords; j++)
-				if (td[j - 1] == 0x2c && td[j] == id)
-					format = td[j + 1] >> 16;
-			// Metal pixel format -> gfx12 image format, its DST_SEL x, y, z, w (4 X .. 7 W, 0 zero, 1 one), bytes per pixel
-			struct Fmt { uint32_t metal, gfx, sel, bpp; };
-			static const Fmt fmts[] = {{70, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {71, 66, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},    // RGBA8 unorm, sRGB
-			                           {80, 42, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4}, {81, 66, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // BGRA8 unorm, sRGB
-			                           {55, 22, 4 | 0 << 3 | 0 << 6 | 1 << 9, 4}, {115, 57, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // R32Float, RGBA16Float
-			                           {125, 63, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16}};                                            // RGBA32Float
-			const Fmt *fm = nullptr;
-			for (const Fmt &e : fmts)
-				fm = e.metal == format ? &e : fm;
-			const uint32_t w = td[15], h = td[16], rowBytes = td[13];
-			if (talk)
-				pvlog("host: render:   %s texture %u: resource %u, format %u, %ux%u, %u bytes per row, %u mip level(s)", stageName, k, id, format, w, h,
-				      rowBytes, td[3] & 0xffff);
-			ok = ok && fm && w && h && w <= 16384 && h <= 16384 && rowBytes >= w * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= (td[0] | uint64_t(td[1]) << 32);
-			if (!ok) {
-				if (talk)
-					pvlog("host: render: %s texture %u (resource %u): format %u, %ux%u: not supported yet", stageName, k, id, format, w, h);
-				break;
-			}
-			const uint32_t texPitch = (w * fm->bpp + 127) & ~127u;   // bytes
-			const uint64_t bytes = static_cast<uint64_t>(texPitch) * h;
-			auto *copy = static_cast<uint8_t *>(IOMalloc(bytes));
-			uint64_t gpu = 0;
-			ok = copy != nullptr;
-			for (uint32_t y = 0; y < h && ok; y++)
-				ok = readGuest(task, (static_cast<uint64_t>(td[2]) << 12) + static_cast<uint64_t>(y) * rowBytes, copy + static_cast<uint64_t>(y) * texPitch, w * fm->bpp);
-			ok = ok && gCompute->rtAlloc(this, bytes, texHandle[st][k], gpu) == kIOReturnSuccess &&
-			     gCompute->rtCopy(this, texHandle[st][k], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(copy), bytes, true) == kIOReturnSuccess;
-			if (copy)
-				IOFree(copy, bytes);
-			const uint32_t pitchPx = texPitch / fm->bpp;
-			uint32_t *t = stageTable + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4;   // SQ_IMG_RSRC_WORD0-7 (ac_build_gfx12_texture_descriptor, linear, custom pitch)
-			t[0] = static_cast<uint32_t>(gpu >> 8);
-			t[1] = static_cast<uint32_t>((gpu >> 40) & 0xff) | fm->gfx << 17 | ((w - 1) & 3) << 30;   // MAX_MIP 0, FORMAT, BASE_LEVEL 0, WIDTH_LO
-			t[2] = (w - 1) >> 2 | (h - 1) << 14;                                                      // WIDTH_HI, HEIGHT
-			t[3] = fm->sel | 9u << 28;                                                                // DST_SEL, LAST_LEVEL 0, SW_MODE linear, TYPE 2D
-			t[4] = ((pitchPx - 1) & 0x3fff) | ((pitchPx - 1) >> 14 & 3) << 14;                         // DEPTH = pitch - 1 low, PITCH_MSB
-			t[5] = 4u << 20;                                                                          // PERF_MOD 4
-			t[6] = 1u << 15;                                                                          // MAX_UNCOMPRESSED_BLOCK_SIZE 256 B
-			t[7] = 0;
-		}
-		for (unsigned k = 0; k < 16 && ok; k++) {
-			const uint32_t id = bound[st].sampler[k];
-			uint32_t rec[3], sd[9] = {};
-			if (!id)
-				continue;
-			ok = readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) && (rec[0] & 0xff) == 7 && (rec[0] >> 8) >= 16 &&
-			     readGuest(task, rec[1], reinterpret_cast<uint8_t *>(sd), 16) && sd[0] == 3;
-			const uint32_t d = sd[3];
-			static const uint32_t clamp[8] = {2, 3, 0, 1, 6, 6, 2, 2};   // Metal: edge, mirror-clamp-to-edge, repeat, mirror, zero, border
-			uint32_t *sm = stageTable + (RDNA4_MTLC_TABLE_SAMPLERS + 16 * k) / 4;   // SQ_IMG_SAMP_WORD0-3; ponytail: no anisotropy, LOD unclamped, border transparent black
-			sm[0] = clamp[(d >> 8) & 7] | clamp[(d >> 12) & 7] << 3 | clamp[(d >> 16) & 7] << 6 | (d >> 31 ? 0 : 1u << 15);
-			sm[1] = 0xfffu << 13;
-			sm[2] = (d & 3) << 20 | ((d >> 2) & 3) << 22 | ((d >> 24) & 3) << 26;
-			sm[3] = 0;
-		}
-	}
+	StagedTexture staged[2][16] = {};
+	for (unsigned st = 0; st < 2 && ok; st++)
+		ok = stageTextures(task, bound[st], reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]), staged[st], talk, st ? "fragment" : "vertex");
 	if (!ok && talk)
 		pvlog("host: render: draw with pipeline %u: a texture or sampler could not be set up: not run", pipeline);
 
@@ -1456,10 +1496,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 				gCompute->rtFree(this, handle[st][k]);
 	if (indexHandle)
 		gCompute->rtFree(this, indexHandle);
-	for (const auto &stageHandles : texHandle)
-		for (uint64_t h : stageHandles)
-			if (h)
-				gCompute->rtFree(this, h);
+	for (auto &stageTextures : staged)
+		releaseTextures(task, stageTextures, false);
 	if (stage)
 		IOFree(stage, targetBytes);
 	if (talk)
@@ -1766,7 +1804,9 @@ void RDNA4PvHost::describeRenderPipeline(uint32_t task, uint32_t pipeline) {
 // M3: Compute.dispatchThreads (size: threads in the grid[3], threads per threadgroup[3]), run on the card with the function translated
 // AIR -> gfx1201 (at run time by the helper, or ahead of time into src/mtlkernels.h by tools/metal/m3). Each bound buffer, from its offset
 // to its end, is copied into a runtime buffer, the kernel dispatched, and the buffers it writes copied back into the guest's pages.
-void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const uint32_t *buffer, const uint64_t *offset, const uint64_t *size) {
+void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &bound, const uint64_t *size) {
+	const uint32_t *buffer = bound.buffer;
+	const uint64_t *offset = bound.offset;
 	static constexpr uint64_t kMaxBuffer = 64ull << 20;   // ponytail: staged through one kernel allocation; map the guest pages if bigger is needed
 	char name[64];
 	uint8_t hash[32];
@@ -1811,6 +1851,18 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const uint32_t *b
 	for (unsigned b = 0; b < nb && ok; b++)
 		ok = gCompute->rtAlloc(this, bytes[b], handle[b], gpu[b]) == kIOReturnSuccess && readGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b])) &&
 		     gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], true) == kIOReturnSuccess;
+	// The kernel's textures and samplers in a table of their own (air2amdgpu.cpp: its address follows the dimensions in the kernargs).
+	StagedTexture staged[16] = {};
+	uint64_t tableHandle = 0, tableGpu = 0;
+	bool textures = false;
+	for (unsigned k = 0; k < 16; k++)
+		textures |= bound.texture[k] || bound.sampler[k];
+	if (ok && textures) {
+		static uint32_t table[0x400 / 4];   // ponytail: one host, dispatches run one at a time on its work loop
+		memset(table, 0, sizeof(table));
+		ok = stageTextures(task, bound, table, staged, true, "kernel") && gCompute->rtAlloc(this, sizeof(table), tableHandle, tableGpu) == kIOReturnSuccess &&
+		     gCompute->rtCopy(this, tableHandle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(table), sizeof(table), true) == kIOReturnSuccess;
+	}
 	uint64_t micros = 0;
 	if (ok) {
 		RDNA4Dispatch d {};
@@ -1823,7 +1875,8 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const uint32_t *b
 		}
 		memcpy(d.kernargs, gpu, 8 * nb);
 		memcpy(d.kernargs + 8 * nb, dims, sizeof(dims));
-		d.kernargBytes = 8 * nb + sizeof(dims);
+		memcpy(d.kernargs + 8 * nb + sizeof(dims), &tableGpu, 8);   // 0 without textures (the table's kernels ignore it)
+		d.kernargBytes = 8 * nb + sizeof(dims) + 8;
 		ok = gCompute->rtDispatch(this, d, micros) == kIOReturnSuccess;
 	}
 	for (unsigned b = 0; b < nb && ok; b++)
@@ -1833,6 +1886,9 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const uint32_t *b
 	for (unsigned b = 0; b < nb; b++)
 		if (handle[b])
 			gCompute->rtFree(this, handle[b]);
+	ok = releaseTextures(task, staged, ok) && ok;   // the textures the kernel may write copied back
+	if (tableHandle)
+		gCompute->rtFree(this, tableHandle);
 	if (stage)
 		IOFree(stage, most);
 	pvlog("host: compute: %s on the card (%s): %s (%llu us)", name, from, ok ? "done" : "NOT done", micros);
