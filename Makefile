@@ -266,6 +266,10 @@ $(ATOMDUMP): test/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery
 atomdump: $(ATOMDUMP)
 
 PVSTREAM_TEST = $(HOST)/pvstream-test
+PVDRAW_TEST   = $(HOST)/pvdraw-test
+$(PVDRAW_TEST): test/pvdraw-test.cpp src/pvdraw.hpp
+	@mkdir -p $(HOST)
+	$(CXX) -std=c++17 -Wall -O1 -o $@ test/pvdraw-test.cpp
 $(PVSTREAM_TEST): test/pvstream-test.cpp src/pvstream.cpp src/pvstream.hpp src/pvopcodes.inc src/pvdevinfo.inc
 	@mkdir -p $(HOST)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ test/pvstream-test.cpp src/pvstream.cpp
@@ -287,9 +291,10 @@ $(HOST)/test-w12k-pm4: test/test-w12k-pm4.cpp src/pm4.cpp src/pm4.hpp
 check-isa:
 	bash test/check-isa.sh
 
-test: $(ATOMDUMP) $(PVSTREAM_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
+test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
 	@if [ -f $(ROM) ]; then echo "$(ATOMDUMP) $(ROM)"; $(ATOMDUMP) $(ROM); else echo "$(ATOMDUMP)   (no $(ROM))"; $(ATOMDUMP); fi
 	$(PVSTREAM_TEST)
+	$(PVDRAW_TEST)
 	$(HOST)/test-gfx12tri
 	$(HOST)/test-gfx12tricol
 	$(HOST)/test-w12k-pm4
