@@ -46,6 +46,8 @@
 //   mtlprobe glyphs2 F iTerm2's text draw copied closely (its vertex shader's branches and uint2 viewport, a 4-channel glyph atlas sampled
 //                      linearly, source-over blending, its 2x viewport) over 64x64; the raw BGRA8 pixels go to file F, to compare with
 //                      another GPU's (not checked here)
+//   mtlprobe coverage2 what Core Animation's shaders needed (2026-10-26): ushort vertex and instance ids, a half4 colour, saturate,
+//                      sign, dfdx, fwidth, and a sample with a texel offset, over 64x64; checked
 //   mtlprobe varyings  five values from the vertex to the fragment function over a 64x64 quad: float3 perspective (red), float without
 //                      perspective (alpha), half2 centroid (green), uint and bool flat (blue: 0 in the first triangle, 0.65 in the second,
 //                      from its first vertex); checked away from the diagonal
@@ -1570,6 +1572,75 @@ static void glyphs2(id<MTLDevice> d, id<MTLCommandQueue> q, const char *file) {
 	OUT("glyphs2: written to %s; (4, 4) B %u G %u R %u A %u", f ? file : "(nowhere)", a[0], a[1], a[2], a[3]);
 }
 
+static void coverage2(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "vertex float4 c2_v(ushort vid [[vertex_id]], ushort iid [[instance_id]]) { float x = (vid == 1 || vid == 3 || vid == 4) ? 1.0 : -1.0;"
+	                                              " float y = (vid == 2 || vid == 4 || vid == 5) ? 1.0 : -1.0; return float4(x, y, float(iid), 1); }\n"
+	                                              "fragment half4 c2_f(float4 p [[position]], texture2d<half> t [[texture(0)]]) {"
+	                                              " constexpr sampler s(filter::nearest, address::clamp_to_edge);"
+	                                              " half texel = t.sample(s, float2(0.375, 0.375), int2(1, 0)).r;"   // texel (1, 1) + (1, 0) = (2, 1)
+	                                              " return half4(saturate(p.x / 32 - 0.5), sign(p.y - 32) * 0.5 + 0.5, dfdx(p.x) * 0.25 + texel * 0.5, fwidth(p.y * 2) * 0.125); }"
+	                                     options:nil
+	                                       error:&err];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"c2_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"c2_f"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	if (!ps) {
+		OUT("coverage2: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	// A 4x4 R channel: 1 (255) at texel (2, 1) only, so the offset sample reads 1 and an unoffset one 0.
+	MTLTextureDescriptor *xd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
+	xd.storageMode = MTLStorageModeManaged;
+	id<MTLTexture> tex = [d newTextureWithDescriptor:xd];
+	uint8_t texels[4 * 4 * 4] = {};
+	texels[(1 * 4 + 2) * 4] = 255;
+	[tex replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:texels bytesPerRow:16];
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	id<MTLBuffer> out = [d newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = t;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe coverage2";
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re setFragmentTexture:tex atIndex:0];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+	[re endEncoding];
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 64, 1) toBuffer:out
+	      destinationOffset:0 destinationBytesPerRow:64 * 4 destinationBytesPerImage:64 * 64 * 4];
+	[e endEncoding];
+	run(cb, "coverage2");
+	// R = saturate((x + 0.5) / 32 - 0.5), G = 0 above row 32 and 1 below, B = 0.25 + 0.5 (dfdx of x is 1, the offset texel 1), A = 0.25
+	// (fwidth of 2y is 2).
+	const uint8_t *px = out.contents;
+	int wrong = 0, worst = 0;
+	for (int y = 0; y < 64; y++)
+		for (int x = 0; x < 64; x++) {
+			const double r = fmin(fmax((x + 0.5) / 32 - 0.5, 0), 1);
+			const int want[4] = {191, y < 32 ? 0 : 255, (int)lround(r * 255), 64};   // B, G, R, A
+			const uint8_t *p = px + (y * 64 + x) * 4;
+			int off = 0;
+			for (int c = 0; c < 4; c++)
+				off = MAX(off, abs(p[c] - want[c]));
+			worst = MAX(worst, off);
+			wrong += off > 2;
+		}
+	const uint8_t *a = px + (40 * 64 + 40) * 4;
+	OUT("coverage2: %d of 4096 pixels off by more than 2, worst %d; (40, 40) B %u G %u R %u A %u (0, 191 255 195 64 = executed)", wrong, worst, a[0], a[1],
+	    a[2], a[3]);
+}
+
 static void varyings(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	NSError *err = nil;
 	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
@@ -1639,8 +1710,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend", "blendx", "varyings", "texsize", "surfdraw", "manyinst", "viewport", "texlinear", "fragpos", "glyphs"};
-			for (int i = 0; i < 26; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend", "blendx", "varyings", "texsize", "surfdraw", "manyinst", "viewport", "texlinear", "fragpos", "glyphs", "coverage2"};
+			for (int i = 0; i < 27; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -1713,6 +1784,8 @@ int main(int argc, char **argv) {
 			fragpos(d, q);
 		else if (!strcmp(mode, "glyphs"))
 			glyphs(d, q);
+		else if (!strcmp(mode, "coverage2"))
+			coverage2(d, q);
 		else if (!strcmp(mode, "glyphs2"))
 			glyphs2(d, q, argc > 2 ? argv[2] : NULL);
 		else if (!strcmp(mode, "blend") || !strcmp(mode, "blendx"))
@@ -1722,7 +1795,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(mode, "drawargs"))
 			drawargs(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, blend, blendx, varyings, texsize, surfdraw, manyinst, viewport, texlinear, fragpos, glyphs, glyphs2 F, texinfo, blendinfo, drawargs, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, blend, blendx, varyings, texsize, surfdraw, manyinst, viewport, texlinear, fragpos, glyphs, glyphs2 F, coverage2, texinfo, blendinfo, drawargs, all)", mode);
 			return 2;
 		}
 	}

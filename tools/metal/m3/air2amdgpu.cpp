@@ -105,16 +105,17 @@ static int64_t mdInt(const MDNode *n, unsigned i) {
 	return c ? c->getSExtValue() : -1;
 }
 
-// One of the position arguments as the AIR function wants it (i32, <2 x i32> or <3 x i32>), from three i32 components.
+// One of the position arguments as the AIR function wants it (uint or ushort, scalar or up to three), from three i32 components.
 static Value *asType(IRBuilder<> &b, Type *t, Value *const xyz[3]) {
-	if (t->isIntegerTy(32))
-		return xyz[0];
 	auto *v = dyn_cast<FixedVectorType>(t);
-	if (!v || !v->getElementType()->isIntegerTy(32) || v->getNumElements() > 3)
+	Type *e = v ? v->getElementType() : t;
+	if (!(e->isIntegerTy(32) || e->isIntegerTy(16)) || (v && v->getNumElements() > 3))
 		return nullptr;
+	if (!v)
+		return b.CreateZExtOrTrunc(xyz[0], e);
 	Value *r = PoisonValue::get(t);
 	for (unsigned k = 0; k < v->getNumElements(); k++)
-		r = b.CreateInsertElement(r, xyz[k], k);
+		r = b.CreateInsertElement(r, b.CreateZExtOrTrunc(xyz[k], e), k);
 	return r;
 }
 
@@ -290,23 +291,53 @@ static std::string legalize(Function &k) {
 			Value *at = b.CreateIntToPtr(b.CreatePtrToInt(handle, b.getInt64Ty()), PointerType::get(ctx, 4));
 			return b.CreateAlignedLoad(FixedVectorType::get(b.getInt32Ty(), dwords), at, Align(16));
 		};
-		if (name.starts_with("sample_texture_2d.v4f32") || name.starts_with("read_texture_2d.v4f32")) {
-			// sample (texture, sampler, float2 coord, i1, int2 offset, i1 lod or bias, float, float, i32) / read (texture, sampler, uint2, int2, lod, i32)
-			const bool sample = name.starts_with("sample");
-			if (c->arg_size() < 5 || !isa<ConstantAggregateZero>(c->getArgOperand(sample ? 4 : 3)) ||
-			    (sample && c->arg_size() > 5 && !match(c->getArgOperand(5), m_Zero())) || (!sample && !match(c->getArgOperand(4), m_Zero())))
-				return f->getName().str() + " with an offset, a LOD or a bias is not supported yet";
+		if (name.starts_with("sample_texture_2d.v4f") || name.starts_with("read_texture_2d.v4f")) {
+			// sample (texture, sampler, float2 coord, i1, int2 offset, i1 level, float bias or LOD, float min LOD, i32) / read (texture,
+			// sampler, uint2, int2, lod, i32). A sample's level false: the float is a bias (0: none); true: an explicit LOD. Float or half texels.
+			const bool sample = name.starts_with("sample"), half = name.starts_with(sample ? "sample_texture_2d.v4f16" : "read_texture_2d.v4f16");
 			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(2);
 			Value *x = b.CreateExtractElement(xy, uint64_t(0)), *y = b.CreateExtractElement(xy, 1);
 			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
 			Value *texel;
 			if (sample) {
+				auto *offset = c->arg_size() > 7 ? dyn_cast<Constant>(c->getArgOperand(4)) : nullptr;
+				auto *level = c->arg_size() > 7 ? dyn_cast<ConstantInt>(c->getArgOperand(5)) : nullptr;
+				Value *value = c->arg_size() > 7 ? c->getArgOperand(6) : nullptr;
+				if (!offset || !level || !match(c->getArgOperand(7), m_AnyZeroFP()))
+					return f->getName().str() + " with a run-time offset or a minimum LOD is not supported yet";
+				// The offset as the hardware takes it: x [5:0], y [13:8], 6-bit signed.
+				uint32_t packed = 0;
+				for (unsigned k = 0; k < 2; k++)
+					if (auto *e = dyn_cast_or_null<ConstantInt>(offset->getAggregateElement(k)))
+						packed |= (static_cast<uint32_t>(e->getSExtValue()) & 0x3f) << (8 * k);
+				const bool zero = match(value, m_AnyZeroFP()), lod = level->isOne(), bias = !lod && !zero;
+				static const Intrinsic::ID ids[2][4] = {   // [offset][plain, bias, lod, lod zero]
+					{Intrinsic::amdgcn_image_sample_2d, Intrinsic::amdgcn_image_sample_b_2d, Intrinsic::amdgcn_image_sample_l_2d, Intrinsic::amdgcn_image_sample_lz_2d},
+					{Intrinsic::amdgcn_image_sample_o_2d, Intrinsic::amdgcn_image_sample_b_o_2d, Intrinsic::amdgcn_image_sample_l_o_2d, Intrinsic::amdgcn_image_sample_lz_o_2d}};
+				const unsigned mode = bias ? 1 : lod ? (zero ? 3 : 2) : 0;
 				Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
-				texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_sample_2d, {v4f, b.getFloatTy(), t->getType(), sm->getType()},   // descriptors overloaded
-				                          {b.getInt32(15), x, y, t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+				SmallVector<Type *, 5> types = {v4f};   // the overloads: the texel, [the bias], the coordinates, the descriptors
+				SmallVector<Value *, 11> args = {b.getInt32(15)};
+				if (packed)
+					args.push_back(b.getInt32(packed));
+				if (bias) {
+					types.push_back(b.getFloatTy());
+					args.push_back(value);
+				}
+				types.push_back(b.getFloatTy());
+				args.append({x, y});
+				if (mode == 2)
+					args.push_back(value);
+				types.append({t->getType(), sm->getType()});
+				args.append({t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+				texel = b.CreateIntrinsic(ids[packed != 0][mode], types, args);
 			} else {
+				if (c->arg_size() < 5 || !isa<ConstantAggregateZero>(c->getArgOperand(3)) || !match(c->getArgOperand(4), m_Zero()))
+					return f->getName().str() + " with an offset or a LOD is not supported yet";
 				texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {v4f, b.getInt32Ty(), t->getType()}, {b.getInt32(15), x, y, t, b.getInt32(0), b.getInt32(0)});
 			}
+			if (half)
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
 		} else if (name == "discard_fragment") {   // fragment only: the lane ends
 			b.CreateIntrinsic(Intrinsic::amdgcn_kill, {}, {b.getFalse()});
@@ -365,6 +396,44 @@ static std::string legalize(Function &k) {
 		} else if (auto cl = clampOps.find(op.str()); cl != clampOps.end()) {   // (x, low, high): min(max(x, low), high)
 			Value *lo = b.CreateIntrinsic(cl->second.first, {c->getType()}, {c->getArgOperand(0), c->getArgOperand(1)});
 			r = b.CreateIntrinsic(cl->second.second, {c->getType()}, {lo, c->getArgOperand(2)});
+		} else if (op == "saturate") {   // min(max(x, 0), 1)
+			r = b.CreateIntrinsic(Intrinsic::minnum, {c->getType()},
+			                      {b.CreateIntrinsic(Intrinsic::maxnum, {c->getType()}, {c->getArgOperand(0), ConstantFP::get(c->getType(), 0.0)}),
+			                       ConstantFP::get(c->getType(), 1.0)});
+		} else if (op == "sign") {   // 1, -1 or 0 (NaN: 0)
+			Value *x = c->getArgOperand(0), *zero = ConstantFP::get(c->getType(), 0.0);
+			r = b.CreateSelect(b.CreateFCmpOGT(x, zero), ConstantFP::get(c->getType(), 1.0),
+			                   b.CreateSelect(b.CreateFCmpOLT(x, zero), ConstantFP::get(c->getType(), -1.0), zero));
+		} else if (op == "any" || op == "all") {   // of a bool vector
+			r = b.CreateIntrinsic(op == "any" ? Intrinsic::vector_reduce_or : Intrinsic::vector_reduce_and, {c->getArgOperand(0)->getType()}, {c->getArgOperand(0)});
+		} else if (op == "dfdx" || op == "dfdy" || op == "fwidth") {
+			// Fine derivatives inside the pixel quad (lanes 0 1 / 2 3 in raster order): x = lane | 1 - lane & ~1, y = lane | 2 - lane & ~2,
+			// each component through DPP quad_perm in whole-quad mode; fwidth = |dfdx| + |dfdy|.
+			auto quadDiff = [&](Value *x, bool dy) {
+				Type *t = x->getType();
+				Value *f = t->isHalfTy() ? b.CreateFPExt(x, b.getFloatTy()) : x;
+				auto lane = [&](uint32_t perm) {
+					return b.CreateBitCast(b.CreateIntrinsic(Intrinsic::amdgcn_update_dpp, {b.getInt32Ty()},
+					                                          {PoisonValue::get(b.getInt32Ty()), b.CreateBitCast(f, b.getInt32Ty()), b.getInt32(perm),
+					                                           b.getInt32(15), b.getInt32(15), b.getFalse()}),
+					                       b.getFloatTy());
+				};
+				Value *d = b.CreateFSub(lane(dy ? 0xee : 0xf5), lane(dy ? 0x44 : 0xa0));   // quad_perm (2,3,2,3)-(0,1,0,1), (1,1,3,3)-(0,0,2,2)
+				d = b.CreateIntrinsic(Intrinsic::amdgcn_wqm, {b.getFloatTy()}, {d});
+				return t->isHalfTy() ? b.CreateFPTrunc(d, t) : d;
+			};
+			Value *x = c->getArgOperand(0);
+			auto *vt = dyn_cast<FixedVectorType>(x->getType());
+			r = vt ? PoisonValue::get(vt) : nullptr;
+			for (unsigned k = 0; k < (vt ? vt->getNumElements() : 1); k++) {
+				Value *e = vt ? b.CreateExtractElement(x, k) : x, *v;
+				if (op == "fwidth")
+					v = b.CreateFAdd(b.CreateIntrinsic(Intrinsic::fabs, {e->getType()}, {quadDiff(e, false)}),
+					                 b.CreateIntrinsic(Intrinsic::fabs, {e->getType()}, {quadDiff(e, true)}));
+				else
+					v = quadDiff(e, op == "dfdy");
+				r = vt ? b.CreateInsertElement(r, v, k) : v;
+			}
 		} else if (op == "mix") {   // (x, y, a): x + (y - x) * a
 			r = b.CreateFAdd(c->getArgOperand(0), b.CreateFMul(b.CreateFSub(c->getArgOperand(1), c->getArgOperand(0)), c->getArgOperand(2)));
 		} else if (op == "dot") {   // (a, b) of a float vector type: the sum of the products
@@ -575,6 +644,14 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	}
 	if (from.size() != air->arg_size())
 		return "not every argument of the AIR shader is described";
+	// A fragment function's colour: float or half, scalar or up to four, alone or as a struct's only member (to colour attachment 0).
+	auto colourType = [&](Type *t) {
+		if (auto *st = dyn_cast<StructType>(t))
+			t = st->getNumElements() == 1 ? st->getElementType(0) : nullptr;
+		auto *vt = t ? dyn_cast<FixedVectorType>(t) : nullptr;
+		Type *e = vt ? vt->getElementType() : t;
+		return e && (e == f32 || e->isHalfTy()) && (!vt || vt->getNumElements() <= 4);
+	};
 	int position = -1;
 	for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
 		const auto *o = cast<MDNode>(outputs->getOperand(k));
@@ -583,7 +660,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			position = static_cast<int>(k);
 		else if (vertex && kind == "air.vertex_output")
 			vars.push_back({k, fnv(mdString(o, 1)), false, 0});
-		else if (!(!vertex && kind == "air.render_target" && outputs->getNumOperands() == 1 && air->getReturnType() == FixedVectorType::get(f32, 4)))
+		else if (!(!vertex && kind == "air.render_target" && outputs->getNumOperands() == 1 && mdInt(o, 1) == 0 && colourType(air->getReturnType())))
 			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet";
 	}
 	if (vertex && position < 0)
@@ -666,8 +743,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	auto callAir = [&](Value *vid) {
 		SmallVector<Value *, 4> args;
 		for (unsigned k = 0; k < air->arg_size(); k++)
-			args.push_back(from[k] == 0 ? vid
-			               : from[k] == 1 ? b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance))   // Metal's includes the base instance
+			args.push_back(from[k] == 0 ? b.CreateZExtOrTrunc(vid, air->getArg(k)->getType())   // uint or ushort
+			               : from[k] == 1 ? b.CreateZExtOrTrunc(b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance)), air->getArg(k)->getType())   // with the base instance
 			               : from[k] >= 400 ? fromVec4(inValues[static_cast<unsigned>(from[k] - 400)], air->getArg(k)->getType())
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
 			               : from[k] >= 300 ? handle(320 + 16 * static_cast<unsigned>(from[k] - 300), air->getArg(k)->getType())
@@ -750,7 +827,10 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			}
 			inValues.push_back(v);
 		}
-		exportF32(0, callAir(nullptr), true);   // mrt0
+		Value *colour = callAir(nullptr);
+		if (colour->getType()->isStructTy())
+			colour = b.CreateExtractValue(colour, 0);
+		exportF32(0, toVec4(colour), true);   // mrt0: as four floats (half widened; missing components 0, alpha 1)
 	}
 	b.CreateRetVoid();
 
@@ -940,8 +1020,10 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 		         : a.role == SimdInGroup  ? b.CreateLShr(linear, 5)
 		         : a.role == SimdWidth    ? b.getInt32(32)
 		                                  : b.CreateLShr(b.CreateAdd(groupThreads, b.getInt32(31)), 5);
+		if (v && v->getType() != air->getArg(i)->getType() && v->getType()->isIntegerTy() && air->getArg(i)->getType()->isIntegerTy(16))
+			v = b.CreateTrunc(v, air->getArg(i)->getType());   // a ushort index
 		if (v && v->getType() != air->getArg(i)->getType())
-			v = nullptr;   // the index arguments are uint
+			v = nullptr;   // the index arguments are uint or ushort
 		if (!v)
 			return "argument " + std::to_string(i) + ": an unsupported type for a position";
 		callArgs.push_back(v);

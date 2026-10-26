@@ -412,6 +412,18 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   **On the card: iTerm2's window draws correctly; every mtlprobe check passes, and `glyphs2` matches Apple's GPU pixel for pixel.** iTerm2
   starts at login, before the fake GPU is published (121 s), and then draws on the CPU; reopened later it uses the card. Seen in passing:
   macOS's screenshot tool sends Blit.copyFromTexture and a compute pass with textures, neither run by the host yet.
+- **Translator coverage of macOS's own shaders (2026-10-26, on this Mac only: the rig is down).** Core Animation's
+  `QuartzCore.framework/.../default.metallib` is a fat file (`cafebabe`): slice 0 (CPU type 0x01000017) is the AIR library (180 functions),
+  the other 18 are precompiled Apple-GPU Mach-Os; WindowServer's is `SkyLight.framework/.../SkyLightShaders.air64.metallib` (31). Translating
+  every function: Core Animation 15 -> 81 of 180, SkyLight 8 -> 11 of 31, iTerm2 still 63 of 63, after adding a fragment colour of float or
+  half, scalar to four (or a one-member struct), to attachment 0; `saturate`, `sign`, `any`, `all`; `dfdx`, `dfdy`, `fwidth` (fine
+  derivatives: DPP quad_perm differences inside the pixel quad, in whole-quad mode); samples with a bias (`image.sample.b`), an explicit LOD
+  (`.l`, `.lz` for 0) and constant texel offsets (`.o`, packed x [5:0], y [13:8]), and half texels (LLVM makes them d16); `ushort` vertex
+  and instance ids (and ushort compute positions), which had produced invalid IR (an i32 passed for an i16). Still refused: several or
+  integer render targets (22), vertex descriptors (`air.vertex_input`: 18 + SkyLight 7; needs the paravirtual descriptor's layout, measured
+  on the rig), Apple's `imageblock` tile memory (16; not for this device), textures past index 7 (12), integer texture reads (7), vertex-stage
+  textures (6), function constants (5 + SkyLight 7). Not run on the card yet; `mtlprobe coverage2` checks most of it (passes on this Mac's GPU).
+  The host stages only mip level 0, so LOD and bias samples of a mipmapped texture will differ from Apple's until mip levels are staged.
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's
