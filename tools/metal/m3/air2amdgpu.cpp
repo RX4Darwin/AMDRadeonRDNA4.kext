@@ -294,10 +294,15 @@ static std::string legalize(Function &k) {
 			Value *at = b.CreateIntToPtr(b.CreatePtrToInt(handle, b.getInt64Ty()), PointerType::get(ctx, 4));
 			return b.CreateAlignedLoad(FixedVectorType::get(b.getInt32Ty(), dwords), at, Align(16));
 		};
-		if (name.starts_with("sample_texture_2d.v4f") || name.starts_with("read_texture_2d.v4f")) {
+		// Texture calls with ushort coordinates (".i16" after the name) are the uint ones with their coordinates widened.
+		std::string texName = name.str();
+		if (const size_t i16 = texName.find("_2d.i16."); i16 != std::string::npos)
+			texName.erase(i16 + 3, 4);
+		const StringRef tex = texName;
+		if (tex.starts_with("sample_texture_2d.v4f") || tex.starts_with("read_texture_2d.v4f")) {
 			// sample (texture, sampler, float2 coord, i1, int2 offset, i1 level, float bias or LOD, float min LOD, i32) / read (texture,
 			// sampler, uint2, int2, lod, i32). A sample's level false: the float is a bias (0: none); true: an explicit LOD. Float or half texels.
-			const bool sample = name.starts_with("sample"), half = name.starts_with(sample ? "sample_texture_2d.v4f16" : "read_texture_2d.v4f16");
+			const bool sample = tex.starts_with("sample"), half = tex.starts_with(sample ? "sample_texture_2d.v4f16" : "read_texture_2d.v4f16");
 			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(2);
 			Value *x = b.CreateExtractElement(xy, uint64_t(0)), *y = b.CreateExtractElement(xy, 1);
 			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
@@ -340,20 +345,22 @@ static std::string legalize(Function &k) {
 			} else {
 				if (c->arg_size() < 5 || !isa<ConstantAggregateZero>(c->getArgOperand(3)) || !match(c->getArgOperand(4), m_Zero()))
 					return f->getName().str() + " with an offset or a LOD is not supported yet";
+				x = b.CreateZExt(x, b.getInt32Ty());   // uint or ushort
+				y = b.CreateZExt(y, b.getInt32Ty());
 				texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {v4f, b.getInt32Ty(), t->getType()}, {b.getInt32(15), x, y, t, b.getInt32(0), b.getInt32(0)});
 			}
 			if (half)
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
-		} else if (name.starts_with("write_texture_2d.v4f")) {   // (texture, uint2 coord, float4 or half4 value, i32 lod, i32 access)
+		} else if (tex.starts_with("write_texture_2d.v4f")) {   // (texture, uint2 or ushort2 coord, float4 or half4 value, i32 lod, i32 access)
 			if (c->arg_size() < 4 || !match(c->getArgOperand(3), m_Zero()))
 				return f->getName().str() + " to a level other than 0 is not supported yet";
 			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(1), *value = c->getArgOperand(2);
 			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
 			if (value->getType() != v4f)
 				value = b.CreateFPExt(value, v4f);
-			b.CreateIntrinsic(Intrinsic::amdgcn_image_store_2d, {v4f, b.getInt32Ty(), t->getType()},
-			                  {value, b.getInt32(15), b.CreateExtractElement(xy, uint64_t(0)), b.CreateExtractElement(xy, 1), t, b.getInt32(0), b.getInt32(0)});
+			Value *x = b.CreateZExt(b.CreateExtractElement(xy, uint64_t(0)), b.getInt32Ty()), *y = b.CreateZExt(b.CreateExtractElement(xy, 1), b.getInt32Ty());
+			b.CreateIntrinsic(Intrinsic::amdgcn_image_store_2d, {v4f, b.getInt32Ty(), t->getType()}, {value, b.getInt32(15), x, y, t, b.getInt32(0), b.getInt32(0)});
 		} else if (name == "discard_fragment") {   // fragment only: the lane ends
 			b.CreateIntrinsic(Intrinsic::amdgcn_kill, {}, {b.getFalse()});
 		} else if (name == "get_read_sampler") {
@@ -567,7 +574,8 @@ struct Kernel {
 
 // A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
 // (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
-// u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes}, then the code (relocation-free, the entry at its start), then per attribute
+// u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes (bit 31: a fragment shader without a colour)}, then the code
+// (relocation-free, the entry at its start), then per attribute
 // {u32 hash of its AIR name (FNV-1a), u32 flags: bit 0 flat}: the vertex function's outputs in ring-slot order, the fragment function's
 // inputs in hardware-input order; the host matches them by name (SPI_PS_INPUT_CNTL_n).
 // Both stages get two user SGPRs, the address of the stage's table (the host's): 64-bit buffer addresses by Metal buffer index at +0, and in
@@ -593,7 +601,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (!outputs || !inputs)
 		return "the AIR shader's metadata is not as expected";
 	// The inputs: index -> where its value comes from (-1: unused, poison).
-	// 0 vertex id, 1 instance id, 3 the fragment's position, 100 + n buffer n, 200 + n texture n, 300 + n sampler n, 400 + n input n
+	// 0 vertex id, 1 instance id, 3 the fragment's position, 4 colour attachment 0, 100 + n buffer n, 200 + n texture n, 300 + n sampler n,
+	// 400 + n input n
 	std::map<unsigned, int> from;
 	struct Var { unsigned index; uint32_t hash; bool flat; unsigned bary; };   // a value between the stages (index: its argument or member)
 	std::vector<Var> vars;
@@ -634,6 +643,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		}
 		else if (!vertex && kind == "air.position" && !unused)
 			from[index] = 3;
+		else if (!vertex && kind == "air.render_target" && !unused && mdInt(a, 2) == 0)
+			from[index] = 4;   // colour attachment 0 as it is (programmable blending): read at the pixel from the host's staged target
 		else if (kind == "air.buffer" && !unused) {
 			int location = -1;
 			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
@@ -667,6 +678,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		Type *e = vt ? vt->getElementType() : t;
 		return e && (e == f32 || e->isHalfTy()) && (!vt || vt->getNumElements() <= 4);
 	};
+	// (Read now: compile() below deletes the AIR function once it is inlined.)
+	const bool noColour = !vertex && air->getReturnType()->isVoidTy();
 	int position = -1;
 	for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
 		const auto *o = cast<MDNode>(outputs->getOperand(k));
@@ -755,6 +768,13 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			r = b.CreateInsertElement(r, f->getArg(kPosX + c), c);
 		return r;
 	};
+	auto framebuffer = [&]() -> Value * {   // fragment: colour attachment 0 at this pixel (image.load from the T# at its place in the table)
+		Value *at = b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(RDNA4_MTLC_TABLE_FRAMEBUFFER)), PointerType::get(ctx, 4));
+		Value *t = b.CreateAlignedLoad(FixedVectorType::get(i32, 8), at, Align(16));
+		return b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {v4f32, i32, t->getType()},
+		                         {b.getInt32(15), b.CreateFPToUI(f->getArg(kPosX), i32), b.CreateFPToUI(f->getArg(kPosX + 1), i32), t, b.getInt32(0),
+		                          b.getInt32(0)});
+	};
 	auto callAir = [&](Value *vid) {
 		SmallVector<Value *, 4> args;
 		for (unsigned k = 0; k < air->arg_size(); k++)
@@ -762,6 +782,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			               : from[k] == 1 ? b.CreateZExtOrTrunc(b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance)), air->getArg(k)->getType())   // with the base instance
 			               : from[k] >= 400 ? fromVec4(inValues[static_cast<unsigned>(from[k] - 400)], air->getArg(k)->getType())
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
+			               : from[k] == 4 ? fromVec4(framebuffer(), air->getArg(k)->getType())
 			               : from[k] >= 300 ? handle(RDNA4_MTLC_TABLE_SAMPLERS + 16 * static_cast<unsigned>(from[k] - 300), air->getArg(k)->getType())
 			               : from[k] >= 200 ? handle(RDNA4_MTLC_TABLE_TEXTURES + 32 * static_cast<unsigned>(from[k] - 200), air->getArg(k)->getType())
 			               : from[k] >= 100 ? buffer(static_cast<unsigned>(from[k] - 100), air->getArg(k)->getType())
@@ -843,9 +864,14 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			inValues.push_back(v);
 		}
 		Value *colour = callAir(nullptr);
-		if (colour->getType()->isStructTy())
-			colour = b.CreateExtractValue(colour, 0);
-		exportF32(0, toVec4(colour), true);   // mrt0: as four floats (half widened; missing components 0, alpha 1)
+		if (colour->getType()->isVoidTy()) {   // no colour (it writes textures, say): an mrt0 export with no channels ends the shader (gfx11+
+			Value *undef = PoisonValue::get(f32);   // has no null target; the host sets SPI_SHADER_COL_FORMAT to none)
+			b.CreateIntrinsic(Intrinsic::amdgcn_exp, {f32}, {b.getInt32(0), b.getInt32(0), undef, undef, undef, undef, b.getTrue(), b.getTrue()});
+		} else {
+			if (colour->getType()->isStructTy())
+				colour = b.CreateExtractValue(colour, 0);
+			exportF32(0, toVec4(colour), true);   // mrt0: as four floats (half widened; missing components 0, alpha 1)
+		}
 	}
 	b.CreateRetVoid();
 
@@ -899,7 +925,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (code.empty() || !regs[0])
 		return "no code or no register values in the shader object";
 	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3],
-	                          static_cast<uint32_t>(vars.size())};
+	                          static_cast<uint32_t>(vars.size()) | (noColour ? 1u << 31 : 0)};
 	out.hsaco.assign(reinterpret_cast<const char *>(head), sizeof(head));
 	out.hsaco += code.str();
 	for (const Var &v : vars) {

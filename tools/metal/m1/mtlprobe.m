@@ -50,6 +50,8 @@
 //                      sign, dfdx, fwidth, a sample with a texel offset from fragment texture 12, and vertex texture 9, over 64x64; checked
 //   mtlprobe ctex      a compute kernel with textures (2026-10-26): reads texture 0, samples texture 3 through sampler 2, writes texture 5,
 //                      and stores threadgroups_per_grid; 8x8 threads in 4x4 groups; checked
+//   mtlprobe fbfetch   (2026-10-26) a fragment shader reading colour attachment 0 ([[color(0)]]) over a cleared 64x64 target, then one with no
+//                      colour that writes a texture at its pixel; both checked
 //   mtlprobe varyings  five values from the vertex to the fragment function over a 64x64 quad: float3 perspective (red), float without
 //                      perspective (alpha), half2 centroid (green), uint and bool flat (blue: 0 in the first triangle, 0.65 in the second,
 //                      from its first vertex); checked away from the diagonal
@@ -1716,6 +1718,80 @@ static void ctex(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	    tc[4 * 53], tc[4 * 53 + 1], tc[4 * 53 + 2], tc[4 * 53 + 3], gs[0], gs[1]);
 }
 
+static void fbfetch(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "vertex float4 ff_v(uint vid [[vertex_id]]) { float x = (vid == 1 || vid == 3 || vid == 4) ? 1.0 : -1.0;"
+	                                              " float y = (vid == 2 || vid == 4 || vid == 5) ? 1.0 : -1.0; return float4(x, y, 0, 1); }\n"
+	                                              "fragment float4 ff_f(float4 d [[color(0)]]) { return float4(1 - d.r, d.g * 0.5, d.b, 1); }\n"
+	                                              "fragment void fw_f(float4 p [[position]], texture2d<float, access::write> t [[texture(1)]]) {"
+	                                              " t.write(float4(p.x / 64, p.y / 64, 0.25, 1), uint2(p.xy)); }"
+	                                     options:nil
+	                                       error:&err];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"ff_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"ff_f"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	pd.fragmentFunction = [lib newFunctionWithName:@"fw_f"];
+	id<MTLRenderPipelineState> pw = ps ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	if (!ps || !pw) {
+		OUT("fbfetch: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	MTLTextureDescriptor *wd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:64 height:64 mipmapped:NO];
+	wd.usage = MTLTextureUsageShaderWrite;
+	wd.storageMode = MTLStorageModeManaged;
+	id<MTLTexture> w = [d newTextureWithDescriptor:wd];
+	id<MTLBuffer> out = [d newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = t;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0.2, 0.4, 0.6, 1);
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe fbfetch";
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+	[re endEncoding];
+	rp.colorAttachments[0].loadAction = MTLLoadActionLoad;   // the second pass keeps the first's result: it writes no colour
+	re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:pw];
+	[re setFragmentTexture:w atIndex:1];
+	[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+	[re endEncoding];
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 64, 1) toBuffer:out
+	      destinationOffset:0 destinationBytesPerRow:64 * 4 destinationBytesPerImage:64 * 64 * 4];
+	[e synchronizeResource:w];
+	[e endEncoding];
+	run(cb, "fbfetch");
+	// The target: (1 - 0.2, 0.4 * 0.5, 0.6, 1) everywhere, the second pass leaving it. The texture: (x / 64, y / 64, 0.25, 1) at pixel centres.
+	const uint8_t *px = out.contents;
+	uint8_t tw[64 * 64 * 4];
+	[w getBytes:tw bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+	int wrong = 0, wrongW = 0;
+	for (int i = 0; i < 64 * 64; i++) {
+		const uint8_t *p = px + 4 * i, *q2 = tw + 4 * i;
+		const int want[4] = {153, 51, 204, 255};   // B, G, R, A
+		const int wantW[4] = {(int)lround((i % 64 + 0.5) / 64 * 255), (int)lround((i / 64 + 0.5) / 64 * 255), 64, 255};   // R, G, B, A
+		int off = 0, offW = 0;
+		for (int c = 0; c < 4; c++) {
+			off = MAX(off, abs(p[c] - want[c]));
+			offW = MAX(offW, abs(q2[c] - wantW[c]));
+		}
+		wrong += off > 2;
+		wrongW += offW > 2;
+	}
+	OUT("fbfetch: target %d of 4096 pixels off by more than 2 (B %u G %u R %u A %u, want 153 51 204 255); written texture %d of 4096 off (0, 0 = executed)",
+	    wrong, px[0], px[1], px[2], px[3], wrongW);
+}
+
 static void varyings(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	NSError *err = nil;
 	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
@@ -1785,8 +1861,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend", "blendx", "varyings", "texsize", "surfdraw", "manyinst", "viewport", "texlinear", "fragpos", "glyphs", "coverage2", "ctex"};
-			for (int i = 0; i < 28; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend", "blendx", "varyings", "texsize", "surfdraw", "manyinst", "viewport", "texlinear", "fragpos", "glyphs", "coverage2", "ctex", "fbfetch"};
+			for (int i = 0; i < 29; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -1863,6 +1939,8 @@ int main(int argc, char **argv) {
 			coverage2(d, q);
 		else if (!strcmp(mode, "ctex"))
 			ctex(d, q);
+		else if (!strcmp(mode, "fbfetch"))
+			fbfetch(d, q);
 		else if (!strcmp(mode, "glyphs2"))
 			glyphs2(d, q, argc > 2 ? argv[2] : NULL);
 		else if (!strcmp(mode, "blend") || !strcmp(mode, "blendx"))
@@ -1872,7 +1950,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(mode, "drawargs"))
 			drawargs(d, q);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, blend, blendx, varyings, texsize, surfdraw, manyinst, viewport, texlinear, fragpos, glyphs, glyphs2 F, coverage2, ctex, texinfo, blendinfo, drawargs, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, blend, blendx, varyings, texsize, surfdraw, manyinst, viewport, texlinear, fragpos, glyphs, glyphs2 F, coverage2, ctex, fbfetch, texinfo, blendinfo, drawargs, all)", mode);
 			return 2;
 		}
 	}

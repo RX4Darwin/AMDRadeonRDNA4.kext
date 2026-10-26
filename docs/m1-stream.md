@@ -440,6 +440,15 @@ Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a
   fragment shaders, and gives `threadgroups_per_grid` (grid / group size, rounded up). Core Animation 86 of 180 (3 of its 6 texture kernels;
   the other 3 take threadgroup memory as an argument, sized at dispatch: not supported yet). `mtlprobe ctex` (read, sample, write,
   threadgroups_per_grid) passes on this Mac's GPU.
+- **Reading the render target in a fragment shader, and fragment shaders without a colour (2026-10-26, not run on the card).** Metal's
+  `[[color(0)]]` input (programmable blending; WindowServer's in-place shaders `InPlaceSover`, `InPlaceAlphaUnpremultiply`,
+  `InPlaceColorOrClampEDR` use it): AMD has no framebuffer fetch, but the host stages the target for each draw anyway, so every draw's
+  fragment table gets a T# of that staged RGBA8 copy at `RDNA4_MTLC_TABLE_FRAMEBUFFER` (+832), and the translator turns the input into an
+  `image.load` at the pixel's position. A pixel the same draw covers twice reads the value from before the draw. A fragment function that
+  returns nothing (it writes textures) ends with an mrt0 export with no channels (gfx11+ has no null export target) and is flagged (bit 31
+  of the RGFX attributes word); the host then sets SPI_SHADER_COL_FORMAT and CB_TARGET_MASK to 0. Textures the shaders may write
+  (ShaderWrite) are copied back after draws too, and texture reads and writes take ushort coordinates. Core Animation 90 of 180, SkyLight
+  (WindowServer) 14 of 31, iTerm2 63 of 63. `mtlprobe fbfetch` passes on this Mac's GPU.
 - **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
   1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
   brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's

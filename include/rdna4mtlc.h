@@ -24,3 +24,6 @@ enum { kMtlcNext = 0, kMtlcDeliver = 1 };
  * + 16 n (n 0-15). */
 #define RDNA4_MTLC_TABLE_TEXTURES 64u
 #define RDNA4_MTLC_TABLE_SAMPLERS 576u
+/* The fragment stage's colour attachment 0 as the draw found it, for shaders that read it (Metal's [[color(0)]] input): a T# of the host's
+ * staged RGBA8 copy of the target. */
+#define RDNA4_MTLC_TABLE_FRAMEBUFFER 832u

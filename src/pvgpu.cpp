@@ -1066,6 +1066,19 @@ static uint32_t halfAsFloat(uint32_t n, bool negative) {
 // The same for a signed n, |n| < 2^24.
 static uint32_t halfAsFloat(int64_t n) { return halfAsFloat(static_cast<uint32_t>(n < 0 ? -n : n), n < 0); }
 
+// A linear 2D image's T# (SQ_IMG_RSRC_WORD0-7, as ac_build_gfx12_texture_descriptor, one mip level, a custom pitch) at t: gfx12 image format,
+// DST_SEL x, y, z, w (4 X .. 7 W, 0 zero, 1 one), width, height, pitch in pixels.
+static void linearImage(uint32_t *t, uint64_t gpu, uint32_t format, uint32_t sel, uint32_t w, uint32_t h, uint32_t pitchPx) {
+	t[0] = static_cast<uint32_t>(gpu >> 8);
+	t[1] = static_cast<uint32_t>((gpu >> 40) & 0xff) | format << 17 | ((w - 1) & 3) << 30;   // MAX_MIP 0, FORMAT, BASE_LEVEL 0, WIDTH_LO
+	t[2] = (w - 1) >> 2 | (h - 1) << 14;                                                    // WIDTH_HI, HEIGHT
+	t[3] = sel | 9u << 28;                                                                  // DST_SEL, LAST_LEVEL 0, SW_MODE linear, TYPE 2D
+	t[4] = ((pitchPx - 1) & 0x3fff) | ((pitchPx - 1) >> 14 & 3) << 14;                       // DEPTH = pitch - 1 low, PITCH_MSB
+	t[5] = 4u << 20;                                                                        // PERF_MOD 4
+	t[6] = 1u << 15;                                                                        // MAX_UNCOMPRESSED_BLOCK_SIZE 256 B
+	t[7] = 0;
+}
+
 // M4: a stage's (or a kernel's) textures 0-15 and samplers 0-15: each texture's mip level 0 staged into the runtime at a pitch of a multiple
 // of 128 bytes (gfx12's linear images), and the T#s and S#s written into `table` (its layout in include/rdna4mtlc.h, shared with
 // air2amdgpu.cpp). A texture resource (measured, docs/m1-stream.md s.5b):
@@ -1125,15 +1138,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		out[k].rowLen = w * fm->bpp;
 		out[k].height = h;
 		out[k].writable = usage & 2;   // MTLTextureUsageShaderWrite
-		uint32_t *t = table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4;   // SQ_IMG_RSRC_WORD0-7 (ac_build_gfx12_texture_descriptor, linear, custom pitch)
-		t[0] = static_cast<uint32_t>(gpu >> 8);
-		t[1] = static_cast<uint32_t>((gpu >> 40) & 0xff) | fm->gfx << 17 | ((w - 1) & 3) << 30;   // MAX_MIP 0, FORMAT, BASE_LEVEL 0, WIDTH_LO
-		t[2] = (w - 1) >> 2 | (h - 1) << 14;                                                      // WIDTH_HI, HEIGHT
-		t[3] = fm->sel | 9u << 28;                                                                // DST_SEL, LAST_LEVEL 0, SW_MODE linear, TYPE 2D
-		t[4] = ((pitchPx - 1) & 0x3fff) | ((pitchPx - 1) >> 14 & 3) << 14;                         // DEPTH = pitch - 1 low, PITCH_MSB
-		t[5] = 4u << 20;                                                                          // PERF_MOD 4
-		t[6] = 1u << 15;                                                                          // MAX_UNCOMPRESSED_BLOCK_SIZE 256 B
-		t[7] = 0;
+		linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, h, pitchPx);
 	}
 	for (unsigned k = 0; k < 16 && ok; k++) {
 		const uint32_t id = bound.sampler[k];
@@ -1240,7 +1245,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// The values between the stages: after each shader's code its table {u32 name hash, u32 flags (bit 0 flat)}, the vertex function's
 	// outputs by ring slot, the fragment function's inputs by hardware input; input k reads the slot with its name (SPI_PS_INPUT_CNTL_k).
 	const uint32_t *vs = why ? nullptr : reinterpret_cast<const uint32_t *>(shader[1]->gfx), *ps = why ? nullptr : reinterpret_cast<const uint32_t *>(shader[2]->gfx);
-	const uint32_t outs = vs ? vs[7] : 0, ins = ps ? ps[7] : 0;
+	const uint32_t outs = vs ? vs[7] : 0, ins = ps ? ps[7] & 0xffff : 0;
+	const bool noColour = ps && ps[7] >> 31;   // the fragment shader writes no colour (air2amdgpu.cpp: textures, say)
 	uint32_t inputCntl[16] = {};
 	if (!why && (outs > 16 || ins > 16 || 32 + vs[2] + 8 * outs > shader[1]->gfxLen || 32 + ps[2] + 8 * ins > shader[2]->gfxLen))
 		why = "more than 16 values between the stages, or a shader without its table of them";
@@ -1338,7 +1344,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x207, 0x00000240u},                                        // PA_SU_SC_MODE_CNTL: the template's, without PROVOKING_VTX_LAST (Metal's is the first)
 		{0x69, 0x1e0, blend[2] ? first.control : 0},                       // CB_BLEND0_CONTROL
 		{0x69, 0x1d8, blend[2] ? first.opt : 0x06000600u},                 // SX_MRT0_BLEND_OPT: else BLEND_DISABLED
-		{0x69, 0x214, split ? mask & 7 : mask},                            // CB_TARGET_MASK
+		{0x69, 0x214, noColour ? 0 : split ? mask & 7 : mask},             // CB_TARGET_MASK
+		{0x69, 0x195, noColour ? 0u : 9u},                                 // SPI_SHADER_COL_FORMAT: 32_ABGR, or none
 	};
 	for (const Patch &pt : patch)
 		if (uint32_t *d = n ? streamReg(ib, n, pt.opcode, pt.reg) : nullptr)
@@ -1373,6 +1380,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	StagedTexture staged[2][16] = {};
 	for (unsigned st = 0; st < 2 && ok; st++)
 		ok = stageTextures(task, bound[st], reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]), staged[st], talk, st ? "fragment" : "vertex");
+	// Colour attachment 0 as the draw finds it, for fragment shaders that read it (Metal's [[color(0)]]; RDNA4_MTLC_TABLE_FRAMEBUFFER): a T# of
+	// the staged RGBA8 target. ponytail: a pixel the same draw covers twice reads the value from before the draw, not its first write.
+	linearImage(reinterpret_cast<uint32_t *>(&misc[(0x800 + RDNA4_MTLC_TABLE_FRAMEBUFFER) / 8]), tgt.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, width, height,
+	            pitch);   // 8_8_8_8 unorm, x y z w as staged (RGBA)
 	if (!ok && talk)
 		pvlog("host: render: draw with pipeline %u: a texture or sampler could not be set up: not run", pipeline);
 
@@ -1497,7 +1508,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	if (indexHandle)
 		gCompute->rtFree(this, indexHandle);
 	for (auto &stageTextures : staged)
-		releaseTextures(task, stageTextures, false);
+		ok = releaseTextures(task, stageTextures, ok) && ok;   // textures the shaders may write copied back
 	if (stage)
 		IOFree(stage, targetBytes);
 	if (talk)
