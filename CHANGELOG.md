@@ -24,6 +24,32 @@ otherwise). The newest version is on top. How versions and branches work is in `
   program has to be given the display's size, three images at most, B8G8R8A8 only, and every present waits for the
   GPU and copies the picture.
 
+**Displays**
+- Boots where the kext never took over the display (only the firmware's picture, on the DisplayPort display) are
+  explained: another kext (SimpleHDA, which restores AppleHDA on Tahoe) can load `IONDRVSupport` before Lilu notices
+  kext loads, so the kext's hook never ran. From 30 s on the kext now checks whether it did, and if not routes
+  `IONDRVSupport` itself and registers the GPU again. On two such boots (2026-10-22) this brought the boot display
+  under the kext at 31-34 s. Not yet: the second display stays dark on these boots (it is made where the framebuffer
+  starts, which happened before), and compute stopped at its PSP step on both (cause not known).
+
+**Metal** (macOS Tahoe; built in only with `make PVGPU=1`, experimental; `docs/m1-stream.md` section 5b)
+- A fake Apple paravirtual GPU on the card: Apple's own `AppleParavirtGPU` driver runs on it, Metal finds an "Apple
+  Paravirtual device", and the kext carries out its command stream on the RX 9070 XT. Verified on the card
+  2026-10-21/22: blits, compute dispatches, clears and draws, all checked by `tools/metal/m1/mtlprobe.m`.
+- Shaders are translated at run time from Apple's AIR to gfx1201 by a root helper (`tools/metal/m3/air2amdgpu.cpp`,
+  `make metal-helper`, installed with `tools/metal/m3/install-helper.sh`; builds LLVM for x86_64 in `Build/llvm` the
+  first time). Compute: buffers, constant data, math, threadgroup memory and barriers, atomics, SIMD-group functions,
+  conversions. Rendering: vertex and fragment functions, vertex and instance buffers, triangle lists and strips,
+  instancing, 16-bit indexed draws, up to 16 values between the stages (flat and interpolated), textures and
+  samplers, blending with write masks and a blend colour, viewports, discard.
+- Apps' windows: render targets backed by IOSurfaces (the surface is found by its id in the kernel). iTerm2 draws its
+  window correctly through the card (2026-10-22); all 63 functions of its Metal library translate.
+- Limits: the card ignores separate alpha blending in this setup, so the host draws twice when alpha's equation
+  differs; centroid inputs are read at the pixel centre (single-sample targets only); viewports in whole pixels; the
+  IOSurface lookup depends on Tahoe 25G83's IOSurface internals (an update can make it refuse such targets); the
+  device appears 121 s after boot, so apps started at login draw on the CPU until reopened; no fake GPU is published
+  when compute did not come up.
+
 **macOS Tahoe** (the rig runs 26.6.2, 25G83, since 2026-10-13)
 - Restart and Shut Down from the Apple menu froze the whole machine on Tahoe whenever this kext was installed, even
   with `rdna4-off=1`. The cause is the fake paravirtual GPU of the Metal work (M0, `src/pvgpu.cpp`): having its
