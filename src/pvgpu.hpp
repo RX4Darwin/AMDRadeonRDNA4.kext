@@ -70,6 +70,21 @@ public:
 	bool attach(IOService *provider) APPLE_KEXT_OVERRIDE;
 	void detach(IOService *provider) APPLE_KEXT_OVERRIDE;
 	void detachAbove(const IORegistryPlane *plane) APPLE_KEXT_OVERRIDE;
+	// IOPCIDevice's own versions of these read its private state, which the nub never has: a driver that probed the
+	// nub and failed was detached through IOPCIDevice::detachFromChild and the kernel faulted at 0x142 (card, Sequoia
+	// 24H232, 2026-11-03). The registry's and IOService's versions instead.
+	void detachFromChild(IORegistryEntry *child, const IORegistryPlane *plane) APPLE_KEXT_OVERRIDE;
+	using IORegistryEntry::getProperty;
+	OSObject *getProperty(const OSSymbol *key) const APPLE_KEXT_OVERRIDE;
+	bool setProperty(const OSSymbol *key, OSObject *object) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const OSString *key, OSObject *object) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *key, OSObject *object) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *key, const char *string) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *key, bool value) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *key, unsigned long long value, unsigned int bits) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *key, void *bytes, unsigned int length) APPLE_KEXT_OVERRIDE;
+	IOReturn addPowerChild(IOService *child) APPLE_KEXT_OVERRIDE;
+	IOReturn removePowerChild(IOPowerConnection *child) APPLE_KEXT_OVERRIDE;
 	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
 	                       IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 	bool handleOpen(IOService *forClient, IOOptionBits options, void *arg) APPLE_KEXT_OVERRIDE;
@@ -157,6 +172,7 @@ private:
 		void *refCon { nullptr };
 		bool registered { false };
 		bool enabled { false };
+		bool pending { false };   // raised while disabled: delivered when enabled again
 	};
 	IOBufferMemoryDescriptor *mBar0Desc { nullptr };
 	void *mBar0 { nullptr };                         // kernel VA of the BAR0 RAM (the buffer's own mapping; Apple's driver gets an alias)

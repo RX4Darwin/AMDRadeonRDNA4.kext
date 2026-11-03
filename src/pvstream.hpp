@@ -71,6 +71,9 @@ const char *segmentTypeName(uint8_t type);
 // and parses `bytes/8` pairs {u32 key, u32 value} into a 224-byte APVDeviceInfoStruct (parseDeviceInfo). Keys 0 and 0x2b and anything above 0x2c are ignored.
 constexpr uint32_t kDeviceInfoBytes = 224;
 constexpr uint32_t kDeviceInfoRecord = 0x2d;
+// Sequoia's (24H232) driver names the same buffer in record 0x2a and parses keys 1-0x29 only, the same keys as Tahoe's up to there (its key 0x12
+// is MaxMetalShaderVersion too): the reply needs no change.
+constexpr uint32_t kDeviceInfoRecordSequoia = 0x2a;
 struct DeviceInfoKey {
 	uint8_t key;
 	uint8_t value;      // offset of the u32 value in the struct

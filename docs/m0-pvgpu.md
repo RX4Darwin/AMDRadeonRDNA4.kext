@@ -140,6 +140,42 @@ Between them `host: ctrl+0x... a -> b` lines show the register writes the host s
 3. Our log: `host: ctrl+0x034 0x00000000 -> 0x00000006` (version handshake), `host: FIFO announced: ...` (setupFIFO), `host: fifo @0x...: cmd 0x.. <name>, N bytes ...` (the commands by name). Which of these appear is the M0 result.
 4. `host: GetDeviceInfo answered` in our log and `ioreg -c AppleParavirtAccelerator` / `ioreg -c IOAccelerator` showing the accelerator with `MetalPluginName AppleParavirtGPUMetal`: `setupDeviceInfo` completed; what to expect after that is under "What the kext does next".
 
+## On the card under Sequoia (2026-11-03): M0 passes
+
+**Measured**, card (RX 9070, Sequoia 15.8.2 24H232, the kext as a one-shot test boot `rdna4-pvgpu=1`, `src/trial.hpp`):
+
+- Sequoia ships the x86 `AppleParavirtGPU.kext` (15.0.0) with the same personality as Tahoe's (`IOPCIMatch 0xEEEE106B`). Its IOPCIDevice vtable has the
+  same 11 differences from MacKernelSDK's header as Tahoe's (`tools/metal/m0/check-vtable.py` against Sequoia's BootKernelExtensions.kc).
+- First run: kernel panic 20 s into the boot, in `IOPCIDevice::detachFromChild` on the nub (a driver that probed it and failed was detached). Sequoia's
+  IOPCIDevice overrides `detachFromChild`, `setProperty`/`getProperty` and the power-child calls with code that reads its private state; the nub now routes
+  them to the registry's and IOService's versions, and its vtable copy stubs slot 313 (`powerStateWillChangeToGated`), past the header's vtable.
+- Second run: `AppleParavirtGPUControl` matched, `AppleParavirtFramebuffer` and `AppleParavirtAccelerator` started, and `MTLCopyAllDevices()` returned
+  **"Apple Paravirtual device" as the system default Metal device**, next to the card's IONDRV displays. WindowServer opened the accelerator (shared user
+  client and a 2D context); SecurityAgent made a command queue and sent 16 `ExecIndirect` command buffers on channel 1 with page-table commits on channel 2;
+  loginwindow opened it too. So the pairing question of M4 has a first answer: macOS takes the paravirt device as its GPU while our framebuffers drive the
+  displays.
+- Two host bugs showed: the driver's `GetDeviceInfo` record is `0x2a` on Sequoia (`0x2d` on Tahoe; its parser takes keys 1-0x29, the same keys), so the
+  device's capabilities stayed zero and apps (Safari, the Displays settings) crashed; and a completion raised while the event source had the line
+  disabled was dropped, which stalled the driver after 16 command buffers. Both fixed, not yet run.
+- Nothing executes the decoded work yet: the host completes every command at once. The desktop felt fast in that boot for that reason, not because
+  anything ran on the card.
+
+### Third and fourth runs (2026-11-03, both fixes in): where Metal stops now
+
+- `GetDeviceInfo` is answered (31 pairs, GpuCoreCount 56) and no more command buffers arrive at boot. A minimal Metal client (one shared buffer, one blit
+  fill, run over ssh) **blocks in `makeBuffer`**: `IOAccelResourceCreate` -> `IOAccelSharedUserClient2::new_resource` ->
+  `IOGraphicsAccelerator2::acceleratorWaitEnabled` (symbolised against Sequoia's SystemKernelExtensions.kc). The accelerator is disabled.
+- `IOGraphicsAccelerator2::disableAccelerator` is only called from `IOAccelDisplayMachine::display_mode_will_change`, `enableAccelerator` only from
+  `display_mode_did_change`: a mode change of the paravirt framebuffer started and never finished. That held with the display reported offline
+  (default) and online (`rdna4-pvgpu-disp=3`).
+- With the display online it is worse: WindowServer, while starting, creates a Metal device for that display (`CoreDisplay::CreateMetalDevice`), compiles a
+  pipeline, allocates a heap and blocks in the same wait. WindowServer hangs at startup and no screen updates. **Do not boot with `rdna4-pvgpu-disp` bit 0 on
+  the card** until the mode change completes.
+- Next: find what completes the mode change on a real paravirt host. The handlers are reached through a pointer (no direct callers), most likely from
+  IOFramebuffer's notifications; the paravirt side has `AppleParavirtDisplayPipe::displayModeWillChange/DidChange`, `beginTransaction`,
+  `submitTransaction`, `isTransactionComplete` and `signalTransactionComplete`, which point at display-pipe transactions the host has to complete
+  (the display info says "transactions via FIFO 0x06").
+
 ## The GetDeviceInfo reply (hub-task-446) [measured in the kext and the bundle unless marked]
 
 **The wait.** `AppleParavirtAccelerator::setupDeviceInfo` (the last step of `Accelerator::start`) wires a 4 KiB `IOBufferMemoryDescriptor`, builds FIFO command `0x3a` with one record `{u32 0x2d, u32 bytes/8 (0x200), u32 physical page}`, submits it on the root channel through the generic `IOAccelChannel2` path, and then **`IOAccelEventMachineFast2::finishEvent`** waits for the event of that submission. After the wait it calls `parseDeviceInfo(buffer, 0x200, &accelerator->deviceInfo)` and returns true whatever the content (no validation: even an all-zero buffer passes). Then `Accelerator::start` releases its lock and `registerService()`.

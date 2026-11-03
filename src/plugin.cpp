@@ -20,6 +20,7 @@
 
 #include <Headers/plugin_start.hpp>
 #include "klog.hpp"
+#include "trial.hpp"
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLib.h>
@@ -35,6 +36,7 @@
 #include "accelcensus.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
+#include "pvhooks.hpp"
 #endif
 #include "compute.hpp"
 #include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
@@ -984,8 +986,12 @@ void attach(FbEntry &e) {
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
 	if (accelCensus && dev.isAmd)
 		RDNA4AccelCensus::publish(pci, accelCensus);
-	// M0: the fake paravirtual GPU, independent of everything else here.
+	// M0: the fake paravirtual GPU, independent of everything else here. A
+	// test boot's level (rdna4-trial) is only known once NVRAM is.
 #ifdef AMDRadeonRDNA4_PVGPU
+	uint32_t pvTrial = 0;
+	if (!pvGpu && Trial::option("rdna4-pvgpu", pvTrial) && pvTrial <= 2)
+		pvGpu = pvTrial;
 	if (pvGpu && dev.isAmd)
 		RDNA4PvNub::publish(pci, pvGpu);
 #endif
@@ -1246,6 +1252,9 @@ void pluginStart() {
 	FBLOG("Lilu plugin started (trace %s, compute stage %u%s%s)", traceEnabled ? "on" : "off",
 	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "", pvGpu ? ", FAKE PARAVIRT GPU (VM only)" : "");
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
+#ifdef AMDRadeonRDNA4_PVGPU
+	PvHooks::start();
+#endif
 }
 
 const char *bootargDebug[] { "-rdna4dbg" };

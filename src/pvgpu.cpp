@@ -6,6 +6,7 @@
 //
 
 #include "pvgpu.hpp"
+#include "trial.hpp"
 #include "klog.hpp"
 #include "pvstream.hpp"
 #include "sku.hpp"
@@ -91,6 +92,8 @@ const char *stringKey(OSDictionary *table, const char *key) {
 constexpr int kSlotConfigRead32 = 272, kSlotConfigRead16 = 273, kSlotConfigRead8 = 274;
 constexpr int kSlotConfigWrite32 = 275, kSlotConfigWrite16 = 276, kSlotConfigWrite8 = 277;
 constexpr int kSlotConfigureInterrupts = 300, kSlotDeviceMemoryRead = 301, kSlotDeviceMemoryWrite = 302;
+// The last real slot (Sequoia 24H232): past the header's vtable, so the copy holds whatever follows ours there.
+constexpr int kSlotPowerStateWillChangeToGated = 313;
 constexpr int kVtableSlots = 340;
 UInt32 tRead32(RDNA4PvNub *n, UInt8 o) { return n->tahoeConfigRead(32, o); }
 UInt16 tRead16(RDNA4PvNub *n, UInt8 o) { return static_cast<UInt16>(n->tahoeConfigRead(16, o)); }
@@ -99,6 +102,7 @@ void tWrite32(RDNA4PvNub *n, UInt8 o, UInt32 v) { n->tahoeConfigWrite(32, o, v);
 void tWrite16(RDNA4PvNub *n, UInt8 o, UInt16 v) { n->tahoeConfigWrite(16, o, v); }
 void tWrite8(RDNA4PvNub *n, UInt8 o, UInt8 v) { n->tahoeConfigWrite(8, o, v); }
 IOReturn tConfigureInterrupts(RDNA4PvNub *, UInt32, UInt32, UInt32, UInt32) { return kIOReturnSuccess; }
+IOReturn tPowerGated(RDNA4PvNub *, unsigned long *, unsigned long *, IOService *) { return kIOPMAckImplied; }
 IOReturn tDevRead(RDNA4PvNub *n, UInt8 bar, UInt64 off, void *data, UInt8 size, UInt32) { return n->tahoeDeviceMemoryRead(bar, off, data, size); }
 IOReturn tDevWrite(RDNA4PvNub *n, UInt8 bar, UInt64 off, UInt64 data, UInt8 size, UInt32) { return n->tahoeDeviceMemoryWrite(bar, off, data, size); }
 
@@ -258,13 +262,13 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	h->mNub = nub;
 	h->mLevel = level;
 	uint32_t disp = 0;
-	if (PE_parse_boot_argn("rdna4-pvgpu-disp", &disp, sizeof(disp)))
+	if (Trial::option("rdna4-pvgpu-disp", disp))
 		h->mDisp = disp & 3;
 	if (level >= 2)
 		h->mDisp = 3;   // the self-test plays the guest's side of the display events
 	uint32_t w = 0, ht = 0;
-	PE_parse_boot_argn("rdna4-pvgpu-width", &w, sizeof(w));
-	PE_parse_boot_argn("rdna4-pvgpu-height", &ht, sizeof(ht));
+	(void)Trial::option("rdna4-pvgpu-width", w);
+	(void)Trial::option("rdna4-pvgpu-height", ht);
 	if (w || ht) {
 		if (w >= 64 && w <= 8192 && ht >= 64 && ht <= 8192) {
 			h->mDispInfo.width = h->mDispInfo.modes[0].width = static_cast<uint16_t>(w);
@@ -473,8 +477,9 @@ void RDNA4PvHost::answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t
 	uint32_t rec[3] = {};
 	if (plen >= sizeof(rec))
 		memcpy(rec, pl, sizeof(rec));
-	if (plen < sizeof(rec) || rec[0] != pvstream::kDeviceInfoRecord) {
-		pvlog("host: GetDeviceInfo without a 0x2d record (%u payload bytes): not answered", plen);
+	const bool known = rec[0] == pvstream::kDeviceInfoRecord || rec[0] == pvstream::kDeviceInfoRecordSequoia;
+	if (plen < sizeof(rec) || !known) {
+		pvlog("host: GetDeviceInfo without a 0x2d or 0x2a record (%u payload bytes, first word 0x%x): not answered", plen, rec[0]);
 		return;
 	}
 	const uint32_t bytes = rec[1] * 8, page = rec[2];
@@ -701,7 +706,7 @@ void RDNA4PvHost::completeStamp(uint32_t index, uint32_t value) {
 	static uint32_t logged = 0;
 	if (logged++ < 12 || !delivered)
 		pvlog("host: stamp[%u] = %u written (FIFO page offset 0x%x), INTR_STATUS_GPU bit %u set, interrupt 0 %s", index, value, index * 4, index,
-		      delivered ? "raised" : "not raised (no handler registered yet)");
+		      delivered ? "raised" : "pending (the line is disabled or has no handler yet)");
 }
 
 // ---- child channels ----
@@ -1346,6 +1351,7 @@ void **RDNA4PvNub::patchVtable() {
 	copy[kSlotConfigureInterrupts] = reinterpret_cast<void *>(&tConfigureInterrupts);
 	copy[kSlotDeviceMemoryRead] = reinterpret_cast<void *>(&tDevRead);
 	copy[kSlotDeviceMemoryWrite] = reinterpret_cast<void *>(&tDevWrite);
+	copy[kSlotPowerStateWillChangeToGated] = reinterpret_cast<void *>(&tPowerGated);
 	*reinterpret_cast<void ***>(this) = copy;   // a published nub is never released, so the copy is never orphaned; publish() frees it if attach fails
 	return copy;
 }
@@ -1462,6 +1468,12 @@ bool RDNA4PvNub::raiseInterrupt(int source) {
 	void *r;
 	IOLockLock(mLock);
 	const bool ok = mInt[source].registered && mInt[source].enabled;
+	// Like a level interrupt: the status bits stay set until the driver clears
+	// them, so a raise while its event source has the line disabled (it does
+	// while its work loop runs) is not lost. Dropping it stalled Apple's driver
+	// after 16 command buffers (card, Sequoia, 2026-11-03).
+	if (mInt[source].registered && !mInt[source].enabled)
+		mInt[source].pending = true;
 	h = mInt[source].handler;
 	t = mInt[source].target;
 	r = mInt[source].refCon;
@@ -1518,6 +1530,23 @@ void RDNA4PvNub::free() {
 bool RDNA4PvNub::attach(IOService *provider) { return IOService::attach(provider); }
 void RDNA4PvNub::detach(IOService *provider) { IOService::detach(provider); }
 void RDNA4PvNub::detachAbove(const IORegistryPlane *plane) { IOService::detachAbove(plane); }
+void RDNA4PvNub::detachFromChild(IORegistryEntry *child, const IORegistryPlane *plane) {
+	IORegistryEntry::detachFromChild(child, plane);
+}
+OSObject *RDNA4PvNub::getProperty(const OSSymbol *key) const { return IORegistryEntry::getProperty(key); }
+bool RDNA4PvNub::setProperty(const OSSymbol *key, OSObject *object) { return IORegistryEntry::setProperty(key, object); }
+bool RDNA4PvNub::setProperty(const OSString *key, OSObject *object) { return IORegistryEntry::setProperty(key, object); }
+bool RDNA4PvNub::setProperty(const char *key, OSObject *object) { return IORegistryEntry::setProperty(key, object); }
+bool RDNA4PvNub::setProperty(const char *key, const char *string) { return IORegistryEntry::setProperty(key, string); }
+bool RDNA4PvNub::setProperty(const char *key, bool value) { return IORegistryEntry::setProperty(key, value); }
+bool RDNA4PvNub::setProperty(const char *key, unsigned long long value, unsigned int bits) {
+	return IORegistryEntry::setProperty(key, value, bits);
+}
+bool RDNA4PvNub::setProperty(const char *key, void *bytes, unsigned int length) {
+	return IORegistryEntry::setProperty(key, bytes, length);
+}
+IOReturn RDNA4PvNub::addPowerChild(IOService *child) { return IOService::addPowerChild(child); }
+IOReturn RDNA4PvNub::removePowerChild(IOPowerConnection *child) { return IOService::removePowerChild(child); }
 IOReturn RDNA4PvNub::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) {
 	return IOService::newUserClient(owningTask, securityID, type, properties, handler);
 }
@@ -1731,7 +1760,11 @@ IOReturn RDNA4PvNub::enableInterrupt(int source) {
 		return kIOReturnBadArgument;
 	IOLockLock(mLock);
 	mInt[source].enabled = true;
+	const bool pending = mInt[source].pending;
+	mInt[source].pending = false;
 	IOLockUnlock(mLock);
+	if (pending)
+		raiseInterrupt(source);
 	return kIOReturnSuccess;
 }
 IOReturn RDNA4PvNub::disableInterrupt(int source) {
