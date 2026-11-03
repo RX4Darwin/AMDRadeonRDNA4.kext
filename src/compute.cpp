@@ -110,9 +110,12 @@ void RDNA4Compute::publishResult(const char *feature, const char *value) {
 }
 
 uint32_t RDNA4Compute::requestedStage() {
-	uint32_t stage = 0;
-	if (!Trial::option("rdna4-compute", stage))
-		return StageOff;
+	// Stage 3 runs the power-management firmware, which the display clocks of
+	// a 3840x2160 pipe need (clk.cpp).
+	uint32_t stage = StageGfx;
+
+	(void)Trial::option("rdna4-compute", stage);
+
 	return stage > StageKernel ? StageKernel : stage;
 }
 

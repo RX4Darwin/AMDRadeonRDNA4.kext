@@ -30,8 +30,8 @@
 //    stage 7  kernel    a clang-built kernel launched from its code object.
 //
 //  Selected with rdna4-compute=<stage>, a boot-arg or a test boot's option
-//  (trial.hpp); absent/0 = off, and the plugin behaves exactly as without
-//  this file. Each stage runs the ones before it. Stage 1 runs inline;
+//  (trial.hpp); absent = stage 3 (the firmware the display clocks need),
+//  0 = off, and the plugin behaves exactly as without this file. Each stage runs the ones before it. Stage 1 runs inline;
 //  stages 2+ run on their own kernel thread a few seconds later, so the
 //  desktop never waits on (or for) them.
 //
@@ -138,7 +138,7 @@ public:
 		StageKernel   = 7,
 	};
 
-	// rdna4-compute=<stage>, clamped to StageKernel. 0 when absent.
+	// rdna4-compute=<stage>, clamped to StageKernel. StageGfx when absent.
 	static uint32_t requestedStage();
 	static bool requestedVm();
 	static bool requestedPowerManagement();
