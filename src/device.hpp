@@ -63,6 +63,35 @@ public:
 	size_t  edid2Len { 0 };
 	uint8_t edid2Hpd { 0 };   // the HPD pin of the connector it is on
 
+	// Bit (pin - 1): a DisplayPort connector whose sink answered on DDC,
+	// i.e. an HDMI monitor behind a passive DP++ adapter.
+	uint8_t dpDualHpds { 0 };
+
+	bool dpDual(uint8_t hpd) const {
+		return hpd >= 1 && hpd <= 8 && (dpDualHpds & (1u << (hpd - 1)));
+	}
+
+	void setDpDual(uint8_t hpd, bool on) {
+		if (hpd < 1 || hpd > 8)
+			return;
+
+		const uint8_t bit = static_cast<uint8_t>(1u << (hpd - 1));
+		if (on) {
+			dpDualHpds |= bit;
+		} else {
+			dpDualHpds &= static_cast<uint8_t>(~bit);
+			dpDualKHz[hpd - 1] = 0;
+		}
+	}
+
+	// The TMDS clock the DP++ adapter on that pin carries (dpdual.hpp); 0
+	// while its ID block has not been read.
+	uint32_t dpDualKHz[8] {};
+
+	uint32_t dpDualMaxKHz(uint8_t hpd) const {
+		return dpDual(hpd) ? dpDualKHz[hpd - 1] : 0;
+	}
+
 	// Display mode table (modes.hpp). By default it holds only the boot mode;
 	// with boot-arg "rdna4-modeset=1" it also carries the sink's EDID modes.
 	// Modes never exceed the GOP framebuffer, and every mode keeps the boot
@@ -222,6 +251,13 @@ private:
 	                   uint8_t *reply, uint8_t replyCap, uint8_t *replyBytes);
 	bool readEDID(uint8_t inst, uint8_t *edid, size_t count, uint8_t start);
 	bool readEDIDI2C(uint8_t line, uint8_t *edid, size_t count, uint8_t start);
+	// A DisplayPort connector's DDC pads in I2C (true) or AUX (false) mode.
+	// A passive DP++ (DP-to-HDMI) adapter carries the sink's DDC on them,
+	// which the DC_I2C engine reaches in I2C mode only (hw_ddc.c set_config).
+	void ddcPadMode(uint8_t line, bool i2c);
+	bool readEDIDDpDual(uint8_t line, uint8_t *edid, size_t count);
+	// The DP++ adapter's ID block on that pin's DDC line, pads in I2C mode.
+	void readDpDualAdaptor(uint8_t hpd, uint8_t line);
 	// The sink's DPCD over native AUX, any length (16 bytes a transfer).
 	bool dpcdRead(uint8_t aux, uint32_t address, uint8_t *data, size_t len);
 	bool dpcdWrite(uint8_t aux, uint32_t address, const uint8_t *data, size_t len);

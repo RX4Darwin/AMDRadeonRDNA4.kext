@@ -66,6 +66,7 @@ struct cfg {
 	int hpd;       /* 0-based HPD source */
 	bool dp;       /* the "dp" scenario: retime a DisplayPort stream that is already lit (sequence_dp) */
 	bool train;    /* the "dplink" scenario: light a DisplayPort stream on a dark pipe, training its link */
+	bool dual;     /* the "dpdual" scenario: an HDMI stream on a DisplayPort connector, through a passive DP++ adapter */
 	int sink_swing, sink_pre;     /* the drive the simulated sink asks for before it reports lock */
 	char sink_kind;               /* its capabilities: sink_reset() */
 	struct dc_crtc_timing t;      /* the new stream */
@@ -305,7 +306,7 @@ static void make_state(const struct cfg *c)
 	eid.encoder.id = ENCODER_ID_INTERNAL_UNIPHY + c->link / 2;   /* UNIPHY, UNIPHY1, ...: two links each */
 	eid.encoder.enum_id = ENUM_ID_1 + (c->link & 1);
 	eid.connector.type = OBJECT_TYPE_CONNECTOR;
-	eid.connector.id = c->dp ? CONNECTOR_ID_DISPLAY_PORT : CONNECTOR_ID_HDMI_TYPE_A;
+	eid.connector.id = c->dp || c->dual ? CONNECTOR_ID_DISPLAY_PORT : CONNECTOR_ID_HDMI_TYPE_A;
 	eid.connector.enum_id = ENUM_ID_1;
 	eid.ctx = &g_ctx;
 
@@ -313,7 +314,9 @@ static void make_state(const struct cfg *c)
 	dc->link_srv = &g_link_srv;
 	dc->links[0] = link; dc->link_count = 1;
 	const enum signal_type signal = c->dp ? SIGNAL_TYPE_DISPLAY_PORT : SIGNAL_TYPE_HDMI_TYPE_A;
-	link->dc = dc; link->ctx = &g_ctx; link->connector_signal = signal;
+	/* Behind a DP++ adapter the connector stays DisplayPort and the stream and sink are HDMI, as detection leaves a
+	 * link with a DP-HDMI dongle. */
+	link->dc = dc; link->ctx = &g_ctx; link->connector_signal = c->dual ? SIGNAL_TYPE_DISPLAY_PORT : signal;
 	if (c->train) {         /* a link to train: the sink of sink_reset(), as detection would have read it */
 		struct dc_link_settings want = { LANE_COUNT_FOUR, LINK_RATE_HIGH2, LINK_SPREAD_DISABLED };
 		const char *other = getenv("PIPEGEN_DP_LINK");          /* "lanes rate", rate as LINK_BW_SET has it */
@@ -621,6 +624,7 @@ int main(int argc, char **argv)
 	bool verbose;
 
 	if (argc > 1 && !strcmp(argv[1], "dp")) { c.dp = true; argv++; argc--; }
+	else if (argc > 1 && !strcmp(argv[1], "dpdual")) { c.dual = true; argv++; argc--; }
 	if (argc > 4 && !strcmp(argv[1], "dplink")) {
 		c.dp = c.train = g_link_detail = true;
 		c.sink_kind = argv[2][0]; c.sink_swing = atoi(argv[3]); c.sink_pre = atoi(argv[4]);
@@ -632,9 +636,10 @@ int main(int argc, char **argv)
 	}
 	verbose = argc > 17;
 	if (argc < 17) {
-		fprintf(stderr, "usage: pipegen [dp | dplink K S P] [on W H] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync "
+		fprintf(stderr, "usage: pipegen [dp | dpdual | dplink K S P] [on W H] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync "
 				"vback  khz hpositive vpositive vic [verbose]\n  hpd counts from 1, as the VBIOS path records do\n"
 				"  dp: the reference for retiming a lit DisplayPort stream instead of the second-pipe plan\n"
+				"  dpdual: an HDMI stream on a DisplayPort connector (a passive DP++ adapter)\n"
 				"  dplink K S P: light a DisplayPort stream, training its link against a simulated sink of kind\n"
 				"                K (a, b, c) that wants voltage swing S and pre-emphasis P\n"
 				"  on W H: the plane shows the top-left of a W x H surface, as after a mode switch\n");

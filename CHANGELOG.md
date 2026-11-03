@@ -12,6 +12,23 @@ otherwise). The newest version is on top. How versions and branches work is in `
   ROM and are the XT board's four (DP on HPD1/2, HDMI on HPD3/4), so the second-display tables apply unchanged; it
   uses the same firmware as the XT (the kicker variants are for revision 0xC8). Not yet run on an RX 9070.
 
+**Displays**
+- A monitor on a DisplayPort connector through a passive DP++ (DP-to-HDMI) adapter: the boot display's EDID is
+  read over DDC with the connector's pads switched to I2C mode (`DC_GPIO_DDCx_MASK.AUX_PADx_MODE`,
+  `DC_GPIO_AUX_CTRL_5.DDC_PADx_I2CMODE`, `PHY_AUX_CNTL.AUXx_PAD_RXSEL`, as amdgpu's `hw_ddc.c` does), so it gets
+  its name and mode list. Chosen when the lit pipe carries TMDS on a DP connector; another DP connector whose
+  sink does not answer on AUX gets the same second try. Run on the card 2026-11-03 (Sapphire RX 9070, Dell
+  P2723QE on both DP connectors through DP-to-HDMI cables, macOS 15.8.2): both EDIDs read, name and mode list.
+- A second display behind such an adapter: the DP connectors have an HDMI table each as well
+  (`pipe2_linux_dp{1,2}_tmds.inc`, pipegen's new `dpdual` scenario: a DisplayPort connector with an HDMI stream
+  and sink, as amdgpu has a link with a DP-HDMI dongle). `Pipe2::use(hpd, tmds)` picks the one for the sink the
+  connector has, and a hot-plug reads the EDID on AUX or DDC, whichever answers (a DP connector's sink that has
+  not been read yet is offered with its HDMI table unless `rdna4-head2dp=1`). Not yet run on the card.
+- What a passive DP++ adapter carries is read from its ID block (I2C 0x40, as amdgpu does): a type 2 adapter's
+  maximum TMDS clock, otherwise 165 MHz. It caps the modes offered on that connector, for the boot display (never
+  below its boot mode) and the second one; the boot log says `dp++: HPDn: ...`. The test card's cables are type 2
+  (CS5216) at 300 MHz, which carries 3840x2160@30 but not 4K60 in RGB. Not yet run on the card.
+
 **Compute runtime**
 - Address spaces lent per job (`rdna4-vmshared=2`), which lifts the 1 GiB limit of a client's address space, ran
   on the card for the first time on 2026-10-12: the diagnostic script's table all PASS, and the full benchmark in a

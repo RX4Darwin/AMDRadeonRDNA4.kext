@@ -29,6 +29,7 @@
 #include "../src/pipe2.hpp"
 #include "../src/dptrain.hpp"
 #include "../src/dpphy.hpp"
+#include "../src/dpdual.hpp"
 #include "../src/amdfw.hpp"
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
@@ -1686,11 +1687,12 @@ static int testPipe2Table() {
 	failures += check(told && stream.count == plan.count + 1, "pipe2: SCDC step for a sink with SCDC: %d, %zu steps",
 	                  told, stream.count);
 
-	// The three kinds of DMUB command, as amdgpu sends them for OTG1 on PLL 2.
+	// The three kinds of DMUB command, as amdgpu sends them for OTG1 on the link's PLL, with its UNIPHY encoder object.
 	failures += check(plan.ncmds == 4, "pipe2: %zu DMUB commands, expected 4", plan.ncmds);
 	if (plan.ncmds == 4) {
 		const Dmub::Cmd &pll = plan.cmds[0], &enc = plan.cmds[1], &on = plan.cmds[2], &enc2 = plan.cmds[3];
-		failures += check(pll[0] == 0x10000280 && pll[1] == 1485000 && pll[2] == (0x00032014u + c.link) &&
+		failures += check(pll[0] == 0x10000280 && pll[1] == 1485000 &&
+		                  pll[2] == (0x00030014u + c.link + ((kEncoderObj & 0xffu) << 8)) &&
 		                  (pll[3] & 0xffff) == c.pipe,
 		                  "pipe2: set pixel clock %08x %08x %08x %08x", pll[0], pll[1], pll[2], pll[3]);
 		failures += check(enc[0] == 0x0c000080 && enc[1] == (0x04030f00u | c.dig) && enc[2] == 14850 &&
@@ -2556,11 +2558,22 @@ static int testN48N() {
 static int testPipe2() {
 	int failures = 0;
 	const uint8_t first = Pipe2::config().hpd;
-	failures += check(Pipe2::configCount() == 4 && !Pipe2::use(5) && Pipe2::config().hpd == first,
+	failures += check(Pipe2::configCount() == 6 && !Pipe2::use(5) && Pipe2::config().hpd == first,
 	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
+	// A DisplayPort connector has its DisplayPort table and an HDMI one (a passive DP++ adapter); an HDMI
+	// connector's only table is taken whatever is asked for.
+	failures += check(Pipe2::use(2) && Pipe2::config().dp &&
+	                  Pipe2::use(2, true) && !Pipe2::config().dp && Pipe2::config().link == 1 &&
+	                  Pipe2::use(3, false) && !Pipe2::config().dp,
+	                  "pipe2: HPD2 has a DisplayPort and an HDMI table, HPD3 its HDMI one");
+	failures += check(Pipe2::hasDpTable(1) && Pipe2::hasDpTable(2) && !Pipe2::hasDpTable(3) &&
+	                  !Pipe2::hasDpTable(4) && !Pipe2::hasDpTable(5),
+	                  "pipe2: DisplayPort connectors on HPD1 and HPD2 only");
+
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
-		const uint8_t hpd = Pipe2::configAt(i).hpd;
-		failures += check(Pipe2::use(hpd) && Pipe2::config().hpd == hpd, "pipe2: no table for HPD%u", hpd);
+		const Pipe2::Config &c = Pipe2::configAt(i);
+		failures += check(Pipe2::use(c.hpd, !c.dp) && Pipe2::config().hpd == c.hpd && Pipe2::config().dp == c.dp,
+		                  "pipe2: no %s table for HPD%u", c.dp ? "DisplayPort" : "HDMI", c.hpd);
 		failures += testPipe2Table();
 	}
 	failures += testPipe2Move(3, 4);
@@ -4813,6 +4826,54 @@ static int testRom(const char *path) {
 	return failures;
 }
 
+// A passive DP++ adapter's ID block: the TMDS clock it carries, as amdgpu reads it.
+static int testDpDual() {
+	int failures = 0;
+
+	// A Sapphire RX 9070's DP connector through a DP-to-HDMI cable (i2cdump under Linux, 2026-11-03).
+	uint8_t id[DpDual::kIdBytes] = {
+		0x44, 0x50, 0x2d, 0x48, 0x44, 0x4d, 0x49, 0x20, 0x41, 0x44, 0x41, 0x50, 0x54, 0x4f, 0x52, 0x04,
+		0xa0, 0x00, 0x1b, 0xc5, 0x43, 0x53, 0x35, 0x32, 0x31, 0x36, 0x00, 0x00, 0x00, 0x78, 0x0f, 0x00,
+	};
+	DpDual::Adaptor a = DpDual::parse(id, sizeof(id));
+	failures += check(a.type2 && a.maxTmdsKHz == 300000 && !strcmp(a.deviceId, "CS5216"),
+	                  "dp++: type 2 CS5216 at 300 MHz: type2 %d, %u kHz, \"%s\"", a.type2, a.maxTmdsKHz,
+	                  a.deviceId);
+
+	a = DpDual::parse(nullptr, 0);
+	failures += check(!a.type2 && a.maxTmdsKHz == 165000, "dp++: no ID block: %u kHz, expected 165000",
+	                  a.maxTmdsKHz);
+
+	uint8_t type1[DpDual::kIdBytes];
+	memcpy(type1, id, sizeof(type1));
+	type1[DpDual::kRegId] = 0x00;
+	a = DpDual::parse(type1, sizeof(type1));
+	failures += check(!a.type2 && a.maxTmdsKHz == 165000, "dp++: type 1 adapter: %u kHz, expected 165000",
+	                  a.maxTmdsKHz);
+
+	uint8_t bad[DpDual::kIdBytes];
+	memcpy(bad, id, sizeof(bad));
+	bad[0] = 'X';
+	a = DpDual::parse(bad, sizeof(bad));
+	failures += check(!a.type2 && a.maxTmdsKHz == 165000, "dp++: wrong signature: %u kHz, expected 165000",
+	                  a.maxTmdsKHz);
+
+	memcpy(bad, id, sizeof(bad));
+	bad[DpDual::kRegMaxTmds] = 0xff;   // 637.5 MHz, beyond what amdgpu accepts
+	a = DpDual::parse(bad, sizeof(bad));
+	failures += check(!a.type2 && a.maxTmdsKHz == 165000, "dp++: clock out of range: %u kHz, expected 165000",
+	                  a.maxTmdsKHz);
+
+	a = DpDual::parse(id, DpDual::kIdBytes - 1);
+	failures += check(!a.type2 && a.maxTmdsKHz == 165000, "dp++: short read: %u kHz, expected 165000",
+	                  a.maxTmdsKHz);
+
+	if (!failures)
+		printf("dp++: adapter ID blocks ok\n");
+
+	return failures;
+}
+
 int main(int argc, char **argv) {
 	if (argc > 2) {
 		fprintf(stderr, "usage: %s [vbios.rom]\n", argv[0]);
@@ -4835,6 +4896,7 @@ int main(int argc, char **argv) {
 	failures += testDpRetime();
 	failures += testPipe2();
 	failures += testDpTrain();
+	failures += testDpDual();
 	failures += testN48N();
 	failures += testPsp();
 	failures += testGfxImages();

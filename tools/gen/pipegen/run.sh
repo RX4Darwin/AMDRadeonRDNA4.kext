@@ -98,6 +98,7 @@ table() {
 	out=$1; shift
 	pre=""
 	if [ "$1" = dplink ]; then pre="$1 $2 $3 $4"; shift 4; fi
+	if [ "$1" = dpdual ]; then pre="$1"; shift; fi
 	# shellcheck disable=SC2086
 	"$B/pipegen" $pre "$@" > "$B/trace.txt"
 
@@ -125,13 +126,15 @@ table() {
 	echo "wrote src/$out ($(grep -c "^	{ '" "$repo/src/$out") entries)"
 }
 
-# Without a configuration: one table for each connector of this project's card (two HDMI, two DisplayPort),
-# all for pipe 1 at CEA 1920x1080@60. src/pipe2.cpp picks the one for the connector the second display is on.
+# Without a configuration: one table for each connector of this project's card (two HDMI, two DisplayPort, and the
+# DisplayPort ones again for an HDMI monitor behind a passive DP++ adapter), all for pipe 1 at CEA 1920x1080@60. src/pipe2.cpp picks the one for the connector the second display is on.
 if [ $# -eq 0 ]; then
 	table pipe2_linux.inc       1 2 2 3  1920 88 44 148  1080 4 5 36  148500 1 1 16
 	table pipe2_linux_hpd4.inc  1 3 3 4  1920 88 44 148  1080 4 5 36  148500 1 1 16
 	table pipe2_linux_dp1.inc   dplink a 0 0  1 0 0 1  1920 88 44 148  1080 4 5 36  148500 1 1 16
 	table pipe2_linux_dp2.inc   dplink a 0 0  1 1 1 2  1920 88 44 148  1080 4 5 36  148500 1 1 16
+	table pipe2_linux_dp1_tmds.inc  dpdual  1 0 0 1  1920 88 44 148  1080 4 5 36  148500 1 1 16
+	table pipe2_linux_dp2_tmds.inc  dpdual  1 1 1 2  1920 88 44 148  1080 4 5 36  148500 1 1 16
 else
 	table pipe2_linux.inc "$@"
 fi

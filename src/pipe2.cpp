@@ -60,6 +60,14 @@ namespace Hpd1 {
 namespace Hpd2 {
 #include "pipe2_linux_dp2.inc"
 }
+// ... and those again for an HDMI monitor behind a passive DP++ adapter: the
+// connector is DisplayPort, the stream HDMI.
+namespace Hpd1Tmds {
+#include "pipe2_linux_dp1_tmds.inc"
+}
+namespace Hpd2Tmds {
+#include "pipe2_linux_dp2_tmds.inc"
+}
 
 struct Table {
 	const Config               &config;
@@ -90,6 +98,8 @@ constexpr Table kTables[] = {
 	      countOf(Hpd1::kAux)),
 	table(Hpd2::kConfig, Hpd2::kGen, Hpd2::kModeRegs, Hpd2::kModeTimings, Hpd2::kModeValues, Hpd2::kAux,
 	      countOf(Hpd2::kAux)),
+	table(Hpd1Tmds::kConfig, Hpd1Tmds::kGen, Hpd1Tmds::kModeRegs, Hpd1Tmds::kModeTimings, Hpd1Tmds::kModeValues),
+	table(Hpd2Tmds::kConfig, Hpd2Tmds::kGen, Hpd2Tmds::kModeRegs, Hpd2Tmds::kModeTimings, Hpd2Tmds::kModeValues),
 };
 constexpr size_t kTableCount = sizeof(kTables) / sizeof(kTables[0]);
 
@@ -125,12 +135,35 @@ const Config &config() { return cur->config; }
 size_t configCount() { return kTableCount; }
 const Config &configAt(size_t i) { return kTables[i].config; }
 
-bool use(uint8_t hpd) {
-	for (const Table &t : kTables)
-		if (t.config.hpd == hpd) {
+bool use(uint8_t hpd, bool tmds) {
+	const Table *fallback = nullptr;
+
+	for (const Table &t : kTables) {
+		if (t.config.hpd != hpd)
+			continue;
+
+		if (t.config.dp != tmds) {
 			cur = &t;
 			return true;
 		}
+
+		if (!fallback)
+			fallback = &t;   // an HDMI connector's only table
+	}
+
+	if (!fallback)
+		return false;
+
+	cur = fallback;
+	return true;
+}
+
+bool hasDpTable(uint8_t hpd) {
+	for (const Table &t : kTables) {
+		if (t.config.hpd == hpd && t.config.dp)
+			return true;
+	}
+
 	return false;
 }
 

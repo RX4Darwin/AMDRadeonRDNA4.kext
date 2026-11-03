@@ -50,10 +50,15 @@ struct Config {
 };
 // There is one table per connector a second display can be on. use() picks
 // the one for a display on that HPD pin, for everything below (false, and no
-// change, if there is none); until then it is the first.
+// change, if there is none); until then it is the first. A DisplayPort
+// connector has two: `tmds` picks the HDMI one, for a monitor behind a passive
+// DP++ adapter (the HDMI connectors' only table is taken either way).
 size_t configCount();
 const Config &configAt(size_t i);
-bool use(uint8_t hpd);
+bool use(uint8_t hpd, bool tmds = false);
+// Whether the connector on that HPD pin is a DisplayPort one (it has a
+// DisplayPort table besides its HDMI one).
+bool hasDpTable(uint8_t hpd);
 const Config &config();   // of the table in use
 
 // The DET buffer is 1344 KiB in 64 KiB segments, shared by all planes

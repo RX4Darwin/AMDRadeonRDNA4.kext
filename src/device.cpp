@@ -12,6 +12,7 @@
 #include "edid.hpp"
 #include "dmub.hpp"
 #include "sku.hpp"
+#include "dpdual.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <kern/clock.h>
@@ -724,6 +725,9 @@ void RDNA4Device::probeEDID() {
 	uint32_t hpdY = regReadDmu(2, 0x28f7);
 	FBLOG("edid: HPD_Y=0x%08x (hpd1=%u hpd2=%u hpd3=%u hpd4=%u)", hpdY,
 	      (hpdY >> 0) & 1, (hpdY >> 8) & 1, (hpdY >> 16) & 1, (hpdY >> 24) & 1);
+	auto hpdHigh = [&](uint8_t pin) {
+		return pin >= 1 && pin <= 4 && ((hpdY >> (8 * (pin - 1))) & 1);
+	};
 
 	AtomBios::DisplayPath paths[AtomBios::MaxDisplayPaths];
 	size_t n = atomBios.getDisplayPaths(paths, AtomBios::MaxDisplayPaths);
@@ -741,15 +745,46 @@ void RDNA4Device::probeEDID() {
 		AtomBios::PathRecords rec {};
 		atomBios.getPathRecords(paths[i], rec);
 		uint8_t inst = rec.ddcLine;  // AUX engine / DDC line index
-		const char *bus = viaAux ? "AUX" : "DDC";
 
+		// A DisplayPort connector behind a passive DP++ (DP-to-HDMI)
+		// adapter carries TMDS, and the sink's DDC is on the AUX pads in
+		// I2C mode. For the boot display the lit pipe says so.
+		const bool bootDpDual = viaAux && pipe.valid() && pipe.isTmds() &&
+		                        rec.hasHpd && rec.hpdPin == pipe.hpd;
+
+		if (bootDpDual) {
+			FBLOG("edid: connector %zu: TMDS on a DisplayPort connector "
+			      "(DP++ adapter): DDC%u in I2C mode", i, inst);
+			ddcPadMode(inst, true);
+			viaAux = false;
+			setDpDual(rec.hpdPin, true);
+		}
+
+		const char *bus = viaAux ? "AUX" : "DDC";
 		uint8_t edid[128] {};
 		bool got = viaAux ? readEDID(inst, edid, sizeof(edid), 0)
 		                  : readEDIDI2C(inst, edid, sizeof(edid), 0);
+
+		// Another DP connector with a sink that is silent on AUX gets the
+		// same try on DDC.
+		if (!got && viaAux && rec.hasHpd && hpdHigh(rec.hpdPin)) {
+			got = readEDIDDpDual(inst, edid, sizeof(edid));
+			if (got) {
+				FBLOG("edid: connector %zu: no AUX reply, the sink "
+				      "answers on DDC%u (DP++ adapter)", i, inst);
+				viaAux = false;
+				bus = "DDC";
+				setDpDual(rec.hpdPin, true);
+			}
+		}
+
 		if (!got) {
 			FBLOG("edid: connector %zu (%s%u): no reply", i, bus, inst);
 			continue;
 		}
+
+		if (rec.hasHpd && dpDual(rec.hpdPin))
+			readDpDualAdaptor(rec.hpdPin, inst);
 
 		static const uint8_t sig[8] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
 		if (memcmp(edid, sig, sizeof(sig)) != 0) {
@@ -892,7 +927,98 @@ constexpr uint32_t kI2cIndexWrite     = 1u << 31;
 
 // MICROSECOND_TIME_BASE_DIV (DMU base_idx 1): reference for SCL prescale.
 constexpr uint32_t kMicrosecondTimeBaseDiv = 0x007b;
+
+// The DDC pads of DDC line N (dcn_4_1_0_offset.h / _sh_mask.h, base_idx 2),
+// which hw_ddc.c set_config switches between AUX and I2C mode with DCN401's
+// DDC_REG_LIST_DCN2.
+constexpr uint32_t kGpioDdcMask       = 0x28d0;  // DC_GPIO_DDC1_MASK; DDCn at + 4 * line
+constexpr uint32_t kGpioDdcClkPdEn    = 1u << 4;
+constexpr uint32_t kGpioDdcDataPdEn   = 1u << 12;
+constexpr uint32_t kGpioDdcPdEn       = kGpioDdcClkPdEn | kGpioDdcDataPdEn;
+constexpr uint32_t kGpioDdcAuxPadMode = 1u << 16;
+constexpr uint32_t kGpioAuxCtrl5      = 0x291d;  // DDC_PADn_I2CMODE at bit 12 + line
+constexpr uint32_t kPhyAuxCntl        = 0x28ff;  // AUXn_PAD_RXSEL at [11:10] + 2 * line
+
+constexpr uint32_t ddcI2cModeBit(uint8_t line) { return 1u << (12 + line); }
+constexpr uint32_t auxRxselShift(uint8_t line) { return 10 + 2u * line; }
 } // namespace
+
+void RDNA4Device::ddcPadMode(uint8_t line, bool i2c) {
+	if (line > 3 || !ipDiscovery.isValid() || !rmmio)
+		return;
+
+	const uint32_t rMask = kGpioDdcMask + 4u * line;
+	const uint32_t was = regReadDmu(2, rMask);
+	if (was == 0xFFFFFFFF)
+		return;
+
+	if (!i2c) {
+		if (!(was & kGpioDdcAuxPadMode))
+			regWriteDmu(2, rMask, was | kGpioDdcAuxPadMode);
+
+		const uint32_t ctrl5 = regReadDmu(2, kGpioAuxCtrl5);
+		regWriteDmu(2, kGpioAuxCtrl5, ctrl5 & ~ddcI2cModeBit(line));
+		return;
+	}
+
+	// The pull-downs discharge what a plug-in left on the pads (2.5 ms),
+	// then the pads leave AUX mode.
+	if ((was & kGpioDdcPdEn) != kGpioDdcPdEn) {
+		regWriteDmu(2, rMask, was | kGpioDdcPdEn);
+		IOSleep(3);
+	}
+
+	if (regReadDmu(2, rMask) & kGpioDdcAuxPadMode) {
+		IOSleep(2);
+		regWriteDmu(2, rMask, regReadDmu(2, rMask) & ~kGpioDdcAuxPadMode);
+	}
+
+	const uint32_t ctrl5 = regReadDmu(2, kGpioAuxCtrl5);
+	regWriteDmu(2, kGpioAuxCtrl5, ctrl5 | ddcI2cModeBit(line));
+
+	// AUXn_PAD_RXSEL = 1: the pad receiver for I2C.
+	const uint32_t shift = auxRxselShift(line);
+	const uint32_t cntl = regReadDmu(2, kPhyAuxCntl);
+	regWriteDmu(2, kPhyAuxCntl, (cntl & ~(3u << shift)) | (1u << shift));
+
+	FBLOG("ddc: line %u in I2C mode: DDC%u_MASK 0x%08x -> 0x%08x, "
+	      "AUX_CTRL_5 0x%08x, PHY_AUX_CNTL 0x%08x", line, line + 1u, was,
+	      regReadDmu(2, rMask), regReadDmu(2, kGpioAuxCtrl5),
+	      regReadDmu(2, kPhyAuxCntl));
+}
+
+// A passive DP++ adapter's ID block (dpdual.hpp): the TMDS clock it carries
+// caps the modes of the display on that pin.
+void RDNA4Device::readDpDualAdaptor(uint8_t hpd, uint8_t line) {
+	if (hpd < 1 || hpd > 8)
+		return;
+
+	uint8_t id[DpDual::kIdBytes] {};
+	const uint8_t start = 0;
+	const uint8_t addr = static_cast<uint8_t>(DpDual::kI2cAddress << 1);
+	const bool got = i2cTransfer(line, addr, &start, 1, id, sizeof(id));
+	const DpDual::Adaptor a = DpDual::parse(id, got ? sizeof(id) : 0);
+
+	dpDualKHz[hpd - 1] = a.maxTmdsKHz;
+
+	if (a.type2)
+		FBLOG("dp++: HPD%u: type 2 adapter %s, TMDS up to %u kHz", hpd,
+		      a.deviceId, a.maxTmdsKHz);
+	else
+		FBLOG("dp++: HPD%u: %s, TMDS up to %u kHz", hpd,
+		      got ? "type 1 adapter" : "no adapter ID", a.maxTmdsKHz);
+}
+
+// The EDID of a sink behind a passive DP++ adapter: over DDC, with the
+// connector's pads in I2C mode. They go back to AUX mode if it is silent.
+bool RDNA4Device::readEDIDDpDual(uint8_t line, uint8_t *edid, size_t count) {
+	ddcPadMode(line, true);
+	if (readEDIDI2C(line, edid, count, 0))
+		return true;
+
+	ddcPadMode(line, false);
+	return false;
+}
 
 bool RDNA4Device::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
                              uint8_t start) {
@@ -2128,6 +2254,17 @@ void RDNA4Device::buildModeTable() {
 		lim.maxPixelClockKHz = hdmi2.maxTmdsKHz < ModeSet::kMaxTmdsKHz ? hdmi2.maxTmdsKHz : ModeSet::kMaxTmdsKHz;
 	if (bootTimingValid && bootTiming.pixelClockKHz && bootTiming.pixelClockKHz * 5 / 4 < lim.maxPixelClockKHz)
 		lim.maxPixelClockKHz = bootTiming.pixelClockKHz * 5 / 4;
+	// A passive DP++ adapter carries no more than its ID block says; the
+	// boot mode stays, the firmware has shown that it gets through.
+	const uint32_t adaptorKHz = pipe.valid() ? dpDualMaxKHz(pipe.hpd) : 0;
+	if (adaptorKHz) {
+		const uint32_t bootKHz = bootTimingValid ? bootTiming.pixelClockKHz : 0;
+		const uint32_t capKHz = adaptorKHz > bootKHz ? adaptorKHz : bootKHz;
+
+		if (capKHz < lim.maxPixelClockKHz)
+			lim.maxPixelClockKHz = capKHz;
+	}
+
 	// DisplayPort has no TMDS limit, but its link is not retrained: nothing
 	// above the pixel clock it was brought up for (ModeSet::build).
 	if (pipe.valid() && pipe.signal == Pipe::Signal::DpSst && bootTimingValid && bootTiming.pixelClockKHz)
@@ -2874,11 +3011,11 @@ bool RDNA4Device::trainSecondLink() {
 }
 
 bool RDNA4Device::usePlanFor(uint8_t hpd) {
-	const uint8_t was = Pipe2::config().hpd;
-	if (!Pipe2::use(hpd))
+	const Pipe2::Config was = Pipe2::config();
+	if (!Pipe2::use(hpd, dpDual(hpd)))
 		return false;
 	if (Pipe2::config().dp && !pipe2DpAllowed) {
-		Pipe2::use(was);
+		Pipe2::use(was.hpd, !was.dp);
 		return false;
 	}
 	return true;
@@ -2914,7 +3051,19 @@ uint8_t RDNA4Device::secondSinkHpd(bool orAnother) {
 		const Pipe2::Config &c = Pipe2::configAt(i);
 		if (c.hpd == pipe.hpd || !high(c.hpd) || (c.dp && !pipe2DpAllowed))
 			continue;
-		// A lit pipe moves between HDMI connectors only (secondPipeTo).
+
+		// A DisplayPort connector has a DisplayPort and an HDMI table. The
+		// HDMI one stands for it when its sink is behind a DP++ adapter,
+		// and while the second pipe may not drive DisplayPort: a sink not
+		// read yet is offered, and readSecondEdid finds its bus.
+		if (Pipe2::hasDpTable(c.hpd)) {
+			const bool hdmi = dpDual(c.hpd) || !pipe2DpAllowed;
+			if (c.dp == hdmi)
+				continue;
+		}
+
+		// A lit pipe moves only between connectors with an HDMI stream
+		// (secondPipeTo).
 		if (!pipe2Lit || (!c.dp && !now.dp))
 			return c.hpd;
 	}
@@ -2933,18 +3082,18 @@ bool RDNA4Device::secondPipeTo(uint8_t hpd) {
 		ok = ok && !to.dp && pipe.dig != to.dig && pipe.link != to.link && pathForHpd(hpd, path, &ddcLine) &&
 		     Pipe2::linkOfEncoder(path.encoderObjId) == to.link;
 		if (!ok) {
-			FBLOG("pipe2: not moved from HPD%u to HPD%u: only between HDMI connectors the boot display does not "
-			      "use", was.hpd, hpd);
-			Pipe2::use(was.hpd);
+			FBLOG("pipe2: not moved from HPD%u to HPD%u: only between connectors with an HDMI "
+			      "stream the boot display does not use", was.hpd, hpd);
+			Pipe2::use(was.hpd, !was.dp);
 			return false;
 		}
 		FBLOG("pipe2: moving from HPD%u (DIG%u, link %u) to HPD%u (DIG%u, link %u) at %ux%u, %u kHz", was.hpd,
 		      was.dig, was.link, to.hpd, to.dig, to.link, pipe2Target.now.hActive, pipe2Target.now.vActive,
 		      pipe2Target.now.pixelClockKHz);
 		if (pipe2On) {   // the old link down first, by its own table
-			Pipe2::use(was.hpd);
+			Pipe2::use(was.hpd, !was.dp);
 			runSecondPipePart(Pipe2::Part::Sleep);
-			Pipe2::use(hpd);
+			Pipe2::use(hpd, !to.dp);
 			pipe2On = false;
 		}
 		pipe2Target.encoderObjId = path.encoderObjId;
@@ -2986,13 +3135,45 @@ bool RDNA4Device::readSecondEdid(uint8_t hpd) {
 	if (!pathForHpd(hpd, path, &ddcLine))
 		return false;
 	// A DisplayPort sink's EDID comes over its AUX channel, and with it what
-	// its receiver can do: it may be another monitor than before.
+	// its receiver can do: it may be another monitor than before. Behind a
+	// passive DP++ adapter the sink has no AUX channel: its EDID is on the
+	// connector's DDC pads in I2C mode (probeEDID), and the second pipe
+	// lights it with the connector's HDMI table.
 	const AtomBios::ConnectorType type = AtomBios::connectorType(path.connectorObjId);
-	const bool viaAux = type == AtomBios::ConnectorDP || type == AtomBios::ConnectorUSBC;
+	const bool dpConnector = type == AtomBios::ConnectorDP ||
+	                         type == AtomBios::ConnectorUSBC;
+	bool viaAux = dpConnector && !dpDual(hpd);
 	auto read = [&](uint8_t *to, uint8_t start) {
-		return viaAux ? readEDID(ddcLine, to, 128, start) : readEDIDI2C(ddcLine, to, 128, start);
+		return viaAux ? readEDID(ddcLine, to, 128, start)
+		              : readEDIDI2C(ddcLine, to, 128, start);
 	};
-	if (!read(edid, 0) || memcmp(edid, sig, sizeof(sig)) != 0 || (viaAux && !readSecondDpSink(ddcLine)))
+
+	bool got = read(edid, 0);
+
+	// Another kind of sink than before on this connector: the other bus.
+	if (!got && dpConnector) {
+		viaAux = !viaAux;
+		ddcPadMode(ddcLine, !viaAux);
+		got = read(edid, 0);
+
+		if (got)
+			FBLOG("pipe2: HPD%u answers on %s: %s", hpd, viaAux ? "AUX" : "DDC",
+			      viaAux ? "a DisplayPort sink" : "an HDMI sink behind a DP++ adapter");
+	}
+
+	// Silent on both buses: the pads back in the mode dpDual says, which
+	// the next read starts from.
+	if (dpConnector) {
+		if (got)
+			setDpDual(hpd, !viaAux);
+		else
+			ddcPadMode(ddcLine, dpDual(hpd));
+	}
+
+	if (got && dpDual(hpd))
+		readDpDualAdaptor(hpd, ddcLine);
+
+	if (!got || memcmp(edid, sig, sizeof(sig)) != 0 || (viaAux && !readSecondDpSink(ddcLine)))
 		return false;
 	// The extension says whether the sink has SCDC and carries more modes.
 	const bool ext = edid[126] > 0 && read(edid + 128, 128);
@@ -3067,6 +3248,12 @@ Modes::Limits RDNA4Device::secondPipeModeLimits() const {
 	lim.maxPixelClockKHz = Pipe2::config().dp
 		? DpTrain::bandwidthKbps(DpTrain::Link { pipe2Sink.maxLanes, pipe2Sink.maxRate }) / 24
 		: ModeSet::kScrambleFromKHz;
+
+	// Behind a passive DP++ adapter, what the adapter carries.
+	const uint32_t adaptorKHz = dpDualMaxKHz(Pipe2::config().hpd);
+	if (adaptorKHz && adaptorKHz < lim.maxPixelClockKHz)
+		lim.maxPixelClockKHz = adaptorKHz;
+
 	return lim;
 }
 
