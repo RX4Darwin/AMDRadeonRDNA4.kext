@@ -1564,6 +1564,10 @@ static int testPipe2Table() {
 	const uint32_t kBeFromFe = 1u << (8 + c.dig), kMapper = 0x1f0du + c.dig;
 	const uint8_t  kDdcLine = static_cast<uint8_t>(c.hpd - 1);
 	const uint16_t kEncoderObj = encoderObjOf(c);
+	// The plan's pipe's own registers, from pipe 1's by the blocks' strides
+	// (the families below): OTG, HUBP, DSCL, DPG, ODM, MPCC, MPC out mux, DET.
+	const uint32_t dp1 = c.pipe - 1u;
+	const uint32_t kOtgCtl = 0x1bc3 + dp1 * 0x80, kSurfLo = 0x06e6 + dp1 * 0xdc, kPitch = 0x06e3 + dp1 * 0xdc;
 	failures += check(Pipe2::linkOfEncoder(kEncoderObj) == c.link, "pipe2: encoder object 0x%04x is not link %u",
 	                  kEncoderObj, c.link);
 	enum Who { ThePipe, TheDig, TheLink };
@@ -1705,30 +1709,31 @@ static int testPipe2Table() {
 	}
 
 	// What the registers hold afterwards: timing of VIC 16, the surface, the
-	// blender feeding OPP1 from DPP1, the OTG enabled and the lock released.
+	// blender feeding the pipe's OPP from its DPP, the OTG enabled and the
+	// lock released (names are pipe 1's, addresses the plan's pipe's).
 	PlanRegs regs;
 	regs.run(plan);
 	struct { uint8_t seg; uint32_t dw, mask, want; const char *name; } after[] = {
-		{ 2, 0x1baa, 0xffffffff, 2199, "OTG1 h total" },         { 2, 0x1baf, 0xffffffff, 1124, "OTG1 v total" },
-		{ 2, 0x1bab, 0x7fff7fff, 0x00c00840, "OTG1 h blank" },   { 2, 0x1bb8, 0x7fff7fff, 0x00290461, "OTG1 v blank" },
-		{ 2, 0x1c05, 0x3ff, c.vstartup, "OTG1 vstartup" },       { 2, 0x1bc3, 0x1, 0x1, "OTG1 master enable" },
-		{ 2, 0x1c09, 0x1, 0x0, "OTG1 update lock released" },    { 2, 0x1adb, 0xf0000, 0x10000, "ODM1 source OPP1" },
-		{ 2, 0x06e6, 0xffffffff, 0x02100000, "surface low" },    { 2, 0x06e7, 0xffffffff, 0x80, "surface high" },
-		{ 2, 0x06e3, 0xffff, 1919, "pitch" },                    { 2, 0x06c7, 0xffffffff, 0x04380780, "viewport" },
+		{ 2, 0x1baa + dp1 * 0x80, 0xffffffff, 2199, "OTG1 h total" },         { 2, 0x1baf + dp1 * 0x80, 0xffffffff, 1124, "OTG1 v total" },
+		{ 2, 0x1bab + dp1 * 0x80, 0x7fff7fff, 0x00c00840, "OTG1 h blank" },   { 2, 0x1bb8 + dp1 * 0x80, 0x7fff7fff, 0x00290461, "OTG1 v blank" },
+		{ 2, 0x1c05 + dp1 * 0x80, 0x3ff, c.vstartup, "OTG1 vstartup" },       { 2, kOtgCtl, 0x1, 0x1, "OTG1 master enable" },
+		{ 2, 0x1c09 + dp1 * 0x80, 0x1, 0x0, "OTG1 update lock released" },    { 2, 0x1adb + dp1 * 0x10, 0xf0000, uint32_t(c.pipe) << 16, "ODM1 source OPP1" },
+		{ 2, kSurfLo, 0xffffffff, 0x02100000, "surface low" },    { 2, 0x06e7 + dp1 * 0xdc, 0xffffffff, 0x80, "surface high" },
+		{ 2, kPitch, 0xffff, 1919, "pitch" },                    { 2, 0x06c7 + dp1 * 0xdc, 0xffffffff, 0x04380780, "viewport" },
 		// The scaler's output rectangle and the blender's size: 0x0 (a table generated
 		// without Linux's scaler library) lights the plane and shows black, as on the
 		// card on 2026-10-04.
-		{ 2, 0x0e8a, 0xffffffff, 0x04380780, "DSCL1 recout size" }, { 2, 0x0e8b, 0xffffffff, 0x04380780, "DSCL1 MPC size" },
-		{ 3, 0x0015, 0xf, 1, "MPCC1 top = DPP1" },               { 3, 0x0017, 0xf, 1, "MPCC1 OPP id" },
-		{ 3, 0x02f6, 0xf, 1, "OPP1 out mux = MPCC1" },           { 2, 0x18ae, 0x1, 0, "DPG1 off (video)" },
+		{ 2, 0x0e8a + dp1 * 0x16b, 0xffffffff, 0x04380780, "DSCL1 recout size" }, { 2, 0x0e8b + dp1 * 0x16b, 0xffffffff, 0x04380780, "DSCL1 MPC size" },
+		{ 3, 0x0015 + dp1 * 0x15, 0xf, uint32_t(c.pipe), "MPCC1 top = DPP1" },               { 3, 0x0017 + dp1 * 0x15, 0xf, uint32_t(c.pipe), "MPCC1 OPP id" },
+		{ 3, 0x02f6 + dp1 * 0x4, 0xf, uint32_t(c.pipe), "OPP1 out mux = MPCC1" },           { 2, 0x18ae + dp1 * 0x5a, 0x1, 0, "DPG1 off (video)" },
 		{ 2, kFeEn, 0x1, 1, "DIG front-end enabled" },           { 2, kBeEn, 0x1, 1, "DIG back-end enabled" },
 		{ 2, kMapper, 0x7, c.link, "DIG mapped to its link" },   { 2, kFeCntl, 0x7, c.pipe, "DIG sourced by the OTG" },
-		{ 2, 0x04bc, 0x1f, c.detSegments, "DET1 segments" },
+		{ 2, 0x04bc + dp1, 0x1f, c.detSegments, "DET1 segments" },
 		// HDMI: the PHY's clock / 4. DisplayPort: the pixel-rate DTO, in Hz against the 720 MHz reference
 		// (how the firmware programs the boot display's), with no integer part.
-		{ 1, 0x006f, c.dp ? 0x3c0u : 0x20u, c.dp ? 0 : 0x20u, "OTG1 pixel rate divider" },
-		{ 1, 0x0085, c.dp ? 0xffffffffu : 0, c.dp ? 148500000u : 0, "DP_DTO1 phase" },
-		{ 1, 0x0086, c.dp ? 0xffffffffu : 0, c.dp ? 720000000u : 0, "DP_DTO1 modulo" },
+		{ 1, 0x006f, c.dp ? 0xfu << (1 + 5 * c.pipe) : 1u << (5 * c.pipe), c.dp ? 0 : 1u << (5 * c.pipe), "OTG1 pixel rate divider" },
+		{ 1, 0x0085 + dp1 * 4, c.dp ? 0xffffffffu : 0, c.dp ? 148500000u : 0, "DP_DTO1 phase" },
+		{ 1, 0x0086 + dp1 * 4, c.dp ? 0xffffffffu : 0, c.dp ? 720000000u : 0, "DP_DTO1 modulo" },
 	};
 	for (const auto &e : after)
 		failures += check((regs.get(e.seg, e.dw) & e.mask) == e.want, "pipe2: %s: %u:0x%04x = 0x%08x, want 0x%08x "
@@ -1821,8 +1826,8 @@ static int testPipe2Table() {
 		PlanRegs direct = lit;                         // straight from the lit state
 		modeMismatch += switchTo(direct, c.timing, known[i]);
 		modeMismatch += switchTo(chain, i ? known[i - 1] : c.timing, known[i]);
-		failures += check((direct.get(2, kFeEn) & 1) == 1 && (direct.get(2, 0x1bc3) & 1) == 1 &&
-		                  direct.get(2, 0x06e6) == lit.get(2, 0x06e6) && direct.get(2, 0x06e3) == lit.get(2, 0x06e3),
+		failures += check((direct.get(2, kFeEn) & 1) == 1 && (direct.get(2, kOtgCtl) & 1) == 1 &&
+		                  direct.get(2, kSurfLo) == lit.get(2, kSurfLo) && direct.get(2, kPitch) == lit.get(2, kPitch),
 		                  "pipe2: after a switch to mode %zu the stream is off or the surface moved", i);
 	}
 	modeMismatch += switchTo(chain, known[nmodes - 1], c.timing);       // and back to the lit mode
@@ -1906,7 +1911,7 @@ static int testPipe2Table() {
 		failures += check(slept && dpms.naux == 1 && dpms.aux[0].address == 0x600 && dpms.aux[0].len == 1 &&
 		                  dpms.aux[0].data[0] == 0x02 && dpms.ncmds == 1 && memcmp(dpms.cmds[0], off, sizeof(off)) == 0 &&
 		                  count(dpms, ModeSet::Op::Train) == 0 && (regs.get(2, kFeEn) & 1) == 0 &&
-		                  (regs.get(2, 0x1bc3) & 1) == 1 && regs.get(2, 0x06e6) == lit.get(2, 0x06e6),
+		                  (regs.get(2, kOtgCtl) & 1) == 1 && regs.get(2, kSurfLo) == lit.get(2, kSurfLo),
 		                  "pipe2: DisplayPort sleep: %s, %zu AUX writes, %zu DMUB commands, DIG FE %08x",
 		                  slept ? "built" : why, dpms.naux, dpms.ncmds, regs.get(2, kFeEn));
 		power.part = Pipe2::Part::Wake;
@@ -2030,10 +2035,10 @@ static int testPipe2Table() {
 	regs.run(dpms);
 	const size_t sleepSteps = dpms.count;
 	failures += check((regs.get(2, kFeEn) & 1) == 0 && (regs.get(2, kBeCntl) & kBeFromFe) == 0 &&
-	                  (regs.get(2, kHdmiGc) & 1) == 1 && (regs.get(2, 0x1bc3) & 1) == 1 &&
-	                  regs.get(2, 0x06e6) == lit.get(2, 0x06e6),
+	                  (regs.get(2, kHdmiGc) & 1) == 1 && (regs.get(2, kOtgCtl) & 1) == 1 &&
+	                  regs.get(2, kSurfLo) == lit.get(2, kSurfLo),
 	                  "pipe2: asleep: DIG FE %08x, BE %08x, HDMI_GC %08x, OTG1 %08x", regs.get(2, kFeEn),
-	                  regs.get(2, kBeCntl), regs.get(2, kHdmiGc), regs.get(2, 0x1bc3));
+	                  regs.get(2, kBeCntl), regs.get(2, kHdmiGc), regs.get(2, kOtgCtl));
 	power.part = Pipe2::Part::Wake;
 	bool woke = Pipe2::build(power, dpms, &why);
 	failures += check(woke && dpms.ncmds == 3 && memcmp(dpms.cmds, plan.cmds + 1, 3 * sizeof(Dmub::Cmd)) == 0,
@@ -2116,13 +2121,13 @@ static int testPipe2Table() {
 				differ += ours.get(sl.steps[i].seg, sl.steps[i].dword) != theirs.get(sl.steps[i].seg, sl.steps[i].dword);
 		failures += check(ok && sl.ncmds == 1 && linuxSleep.ncmds == 1 &&
 		                  memcmp(sl.cmds[0], linuxSleep.cmds[0], sizeof(Dmub::Cmd)) == 0 && differ == 0 &&
-		                  outside == before && (ours.get(2, kFeEn) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
+		                  outside == before && (ours.get(2, kFeEn) & 1) == 0 && (ours.get(2, kOtgCtl) & 1) == 1,
 		                  "modeset: HDMI sleep: %s, %zu registers not as Linux's sleep leaves them", ok ? "built" : why,
 		                  differ);
 		const bool back = ModeSet::build(st, ms, &why);
 		ours.run(ms);
 		failures += check(back && (ours.get(2, kFeEn) & 1) == 1 && (ours.get(2, kBeCntl) & kBeFromFe) == kBeFromFe &&
-		                  (ours.get(2, kHdmiGc) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
+		                  (ours.get(2, kHdmiGc) & 1) == 0 && (ours.get(2, kOtgCtl) & 1) == 1,
 		                  "modeset: HDMI wake by mode set: FE %08x BE %08x GC %08x", ours.get(2, kFeEn),
 		                  ours.get(2, kBeCntl), ours.get(2, kHdmiGc));
 		Edid::DetailedTiming none = c.timing;
@@ -2145,7 +2150,7 @@ static int testPipe2Table() {
 		if (s.op != ModeSet::Op::Dmub && s.op != ModeSet::Op::Delay && instanceOf(s.seg, s.dword, &fam) >= 0 &&
 		    fam == &families[0])
 			hubp = true;
-		if (s.op == ModeSet::Op::Write && s.dword == 0x18b2)      // DPG1_DPG_COLOUR_G_Y
+		if (s.op == ModeSet::Op::Write && s.dword == 0x18b2 + dp1 * 0x5a)   // DPGn_DPG_COLOUR_G_Y
 			colour = s.value == ((static_cast<uint32_t>(Pipe2::kPatternColour[1]) << 16) | Pipe2::kPatternColour[1]);
 	}
 	failures += check(!hubp && colour, "pipe2: stream-only plan: HUBP touched %d, pattern colour %d", hubp, colour);
@@ -2559,7 +2564,8 @@ static int testN48N() {
 static int testPipe2() {
 	int failures = 0;
 	const uint8_t first = Pipe2::config().hpd;
-	failures += check(Pipe2::configCount() == 6 && !Pipe2::use(5) && Pipe2::config().hpd == first,
+	failures += check(Pipe2::configCount() == 18 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
+	                  Pipe2::config().hpd == first,
 	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
 	// A DisplayPort connector has its DisplayPort table and an HDMI one (a passive DP++ adapter); an HDMI
 	// connector's only table is taken whatever is asked for.
@@ -2567,14 +2573,20 @@ static int testPipe2() {
 	                  Pipe2::use(2, true) && !Pipe2::config().dp && Pipe2::config().link == 1 &&
 	                  Pipe2::use(3, false) && !Pipe2::config().dp,
 	                  "pipe2: HPD2 has a DisplayPort and an HDMI table, HPD3 its HDMI one");
+	// Each set is for its own pipe, on the connector's own stream encoder and link.
+	failures += check(Pipe2::use(3, false, 2) && Pipe2::config().pipe == 2 && Pipe2::config().dig == 2 &&
+	                  Pipe2::config().link == 2 && Pipe2::use(1, true, 3) && Pipe2::config().pipe == 3 &&
+	                  !Pipe2::config().dp && Pipe2::config().link == 0,
+	                  "pipe2: the tables of pipes 2 and 3");
 	failures += check(Pipe2::hasDpTable(1) && Pipe2::hasDpTable(2) && !Pipe2::hasDpTable(3) &&
 	                  !Pipe2::hasDpTable(4) && !Pipe2::hasDpTable(5),
 	                  "pipe2: DisplayPort connectors on HPD1 and HPD2 only");
 
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
 		const Pipe2::Config &c = Pipe2::configAt(i);
-		failures += check(Pipe2::use(c.hpd, !c.dp) && Pipe2::config().hpd == c.hpd && Pipe2::config().dp == c.dp,
-		                  "pipe2: no %s table for HPD%u", c.dp ? "DisplayPort" : "HDMI", c.hpd);
+		failures += check(Pipe2::use(c.hpd, !c.dp, c.pipe) && Pipe2::config().hpd == c.hpd &&
+		                  Pipe2::config().dp == c.dp && Pipe2::config().pipe == c.pipe,
+		                  "pipe2: no %s table for HPD%u on pipe %u", c.dp ? "DisplayPort" : "HDMI", c.hpd, c.pipe);
 		failures += testPipe2Table();
 	}
 	failures += testPipe2Move(3, 4);

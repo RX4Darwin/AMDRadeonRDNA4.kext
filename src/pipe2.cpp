@@ -68,6 +68,44 @@ namespace Hpd1Tmds {
 namespace Hpd2Tmds {
 #include "pipe2_linux_dp2_tmds.inc"
 }
+// ... and all six again for pipe 2, the third display.
+namespace P2Hpd3 {
+#include "pipe2_linux_p2_hpd3.inc"
+}
+namespace P2Hpd4 {
+#include "pipe2_linux_p2_hpd4.inc"
+}
+namespace P2Hpd1 {
+#include "pipe2_linux_p2_dp1.inc"
+}
+namespace P2Hpd2 {
+#include "pipe2_linux_p2_dp2.inc"
+}
+namespace P2Hpd1Tmds {
+#include "pipe2_linux_p2_dp1_tmds.inc"
+}
+namespace P2Hpd2Tmds {
+#include "pipe2_linux_p2_dp2_tmds.inc"
+}
+// ... and all six again for pipe 3, the fourth display.
+namespace P3Hpd3 {
+#include "pipe2_linux_p3_hpd3.inc"
+}
+namespace P3Hpd4 {
+#include "pipe2_linux_p3_hpd4.inc"
+}
+namespace P3Hpd1 {
+#include "pipe2_linux_p3_dp1.inc"
+}
+namespace P3Hpd2 {
+#include "pipe2_linux_p3_dp2.inc"
+}
+namespace P3Hpd1Tmds {
+#include "pipe2_linux_p3_dp1_tmds.inc"
+}
+namespace P3Hpd2Tmds {
+#include "pipe2_linux_p3_dp2_tmds.inc"
+}
 
 struct Table {
 	const Config               &config;
@@ -100,6 +138,22 @@ constexpr Table kTables[] = {
 	      countOf(Hpd2::kAux)),
 	table(Hpd1Tmds::kConfig, Hpd1Tmds::kGen, Hpd1Tmds::kModeRegs, Hpd1Tmds::kModeTimings, Hpd1Tmds::kModeValues),
 	table(Hpd2Tmds::kConfig, Hpd2Tmds::kGen, Hpd2Tmds::kModeRegs, Hpd2Tmds::kModeTimings, Hpd2Tmds::kModeValues),
+	table(P2Hpd3::kConfig, P2Hpd3::kGen, P2Hpd3::kModeRegs, P2Hpd3::kModeTimings, P2Hpd3::kModeValues),
+	table(P2Hpd4::kConfig, P2Hpd4::kGen, P2Hpd4::kModeRegs, P2Hpd4::kModeTimings, P2Hpd4::kModeValues),
+	table(P2Hpd1::kConfig, P2Hpd1::kGen, P2Hpd1::kModeRegs, P2Hpd1::kModeTimings, P2Hpd1::kModeValues, P2Hpd1::kAux,
+	      countOf(P2Hpd1::kAux)),
+	table(P2Hpd2::kConfig, P2Hpd2::kGen, P2Hpd2::kModeRegs, P2Hpd2::kModeTimings, P2Hpd2::kModeValues, P2Hpd2::kAux,
+	      countOf(P2Hpd2::kAux)),
+	table(P2Hpd1Tmds::kConfig, P2Hpd1Tmds::kGen, P2Hpd1Tmds::kModeRegs, P2Hpd1Tmds::kModeTimings, P2Hpd1Tmds::kModeValues),
+	table(P2Hpd2Tmds::kConfig, P2Hpd2Tmds::kGen, P2Hpd2Tmds::kModeRegs, P2Hpd2Tmds::kModeTimings, P2Hpd2Tmds::kModeValues),
+	table(P3Hpd3::kConfig, P3Hpd3::kGen, P3Hpd3::kModeRegs, P3Hpd3::kModeTimings, P3Hpd3::kModeValues),
+	table(P3Hpd4::kConfig, P3Hpd4::kGen, P3Hpd4::kModeRegs, P3Hpd4::kModeTimings, P3Hpd4::kModeValues),
+	table(P3Hpd1::kConfig, P3Hpd1::kGen, P3Hpd1::kModeRegs, P3Hpd1::kModeTimings, P3Hpd1::kModeValues, P3Hpd1::kAux,
+	      countOf(P3Hpd1::kAux)),
+	table(P3Hpd2::kConfig, P3Hpd2::kGen, P3Hpd2::kModeRegs, P3Hpd2::kModeTimings, P3Hpd2::kModeValues, P3Hpd2::kAux,
+	      countOf(P3Hpd2::kAux)),
+	table(P3Hpd1Tmds::kConfig, P3Hpd1Tmds::kGen, P3Hpd1Tmds::kModeRegs, P3Hpd1Tmds::kModeTimings, P3Hpd1Tmds::kModeValues),
+	table(P3Hpd2Tmds::kConfig, P3Hpd2Tmds::kGen, P3Hpd2Tmds::kModeRegs, P3Hpd2Tmds::kModeTimings, P3Hpd2Tmds::kModeValues),
 };
 constexpr size_t kTableCount = sizeof(kTables) / sizeof(kTables[0]);
 
@@ -135,11 +189,11 @@ const Config &config() { return cur->config; }
 size_t configCount() { return kTableCount; }
 const Config &configAt(size_t i) { return kTables[i].config; }
 
-bool use(uint8_t hpd, bool tmds) {
+bool use(uint8_t hpd, bool tmds, uint8_t pipe) {
 	const Table *fallback = nullptr;
 
 	for (const Table &t : kTables) {
-		if (t.config.hpd != hpd)
+		if (t.config.hpd != hpd || t.config.pipe != pipe)
 			continue;
 
 		if (t.config.dp != tmds) {

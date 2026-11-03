@@ -52,10 +52,12 @@ struct Config {
 // the one for a display on that HPD pin, for everything below (false, and no
 // change, if there is none); until then it is the first. A DisplayPort
 // connector has two: `tmds` picks the HDMI one, for a monitor behind a passive
-// DP++ adapter (the HDMI connectors' only table is taken either way).
+// DP++ adapter (the HDMI connectors' only table is taken either way). There
+// is a set of them for each pipe a display beyond the boot one can be on
+// (1 to 3): `pipe` picks the set.
 size_t configCount();
 const Config &configAt(size_t i);
-bool use(uint8_t hpd, bool tmds = false);
+bool use(uint8_t hpd, bool tmds = false, uint8_t pipe = 1);
 // Whether the connector on that HPD pin is a DisplayPort one (it has a
 // DisplayPort table besides its HDMI one).
 bool hasDpTable(uint8_t hpd);

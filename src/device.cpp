@@ -13,6 +13,7 @@
 #include "edid.hpp"
 #include "dmub.hpp"
 #include "sku.hpp"
+#include "trial.hpp"
 #include "dpdual.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
@@ -846,31 +847,33 @@ void RDNA4Device::probeEDID() {
 				FBLOG("edid: connector %zu (%s%u): read extension block "
 				      "(tag 0x%02x)", i, bus, inst, edidData[128]);
 			}
-		} else if (!boot && edid2Len == 0) {
-			memcpy(edid2Data, edid, 128);
-			edid2Len = 128;
-			edid2Hpd = rec.hasHpd ? rec.hpdPin : 0;
+		} else if (!boot && freeExtraSlot() < extraHeads()) {
+			selectExtra(freeExtraSlot());
+			memcpy(xp().edid, edid, 128);
+			xp().edidLen = 128;
+			xp().hpd = rec.hasHpd ? rec.hpdPin : 0;
 			if (viaAux)
 				readSecondDpSink(inst);
 			// The extension says whether the sink has SCDC (Edid::hdmi2Caps).
-			if (edid[126] > 0 && (viaAux ? readEDID(inst, edid2Data + 128, 128, 128)
-			                             : readEDIDI2C(inst, edid2Data + 128, 128, 128)))
-				edid2Len = 256;
+			if (edid[126] > 0 && (viaAux ? readEDID(inst, xp().edid + 128, 128, 128)
+			                             : readEDIDI2C(inst, xp().edid + 128, 128, 128)))
+				xp().edidLen = 256;
 		}
 	}
+	selectExtra(0);
 	if (!any)
 		FBLOG("edid: no sink EDID read on any connector");
 	// The lit pipe's connector gave nothing but another did: the pipe's HPD
 	// pin was read wrong, or its sink does not answer. As before the pipe was
 	// consulted, the sink that answered is taken for the boot display.
-	if (edidLen == 0 && edid2Len != 0) {
+	if (edidLen == 0 && xp().edidLen != 0) {
 		FBLOG("edid: no EDID on the lit pipe's connector (HPD%u): taking the sink on HPD%u for the boot display",
-		      pipe.hpd, edid2Hpd);
-		memcpy(edidData, edid2Data, sizeof(edidData));
-		edidLen = edid2Len;
-		edid2Len = 0;
-		edid2Hpd = 0;
-		pipe2Sink = {};
+		      pipe.hpd, xp().hpd);
+		memcpy(edidData, xp().edid, sizeof(edidData));
+		edidLen = xp().edidLen;
+		xp().edidLen = 0;
+		xp().hpd = 0;
+		xp().sink = {};
 	}
 }
 
@@ -2431,7 +2434,7 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 			break;
 		case ModeSet::Op::Aux:
 			// Like amdgpu, carry on if the sink does not take it.
-			if (!aux || !dpcdWrite(pipe2Aux, aux[s.arg].address, aux[s.arg].data, aux[s.arg].len))
+			if (!aux || !dpcdWrite(xp().aux, aux[s.arg].address, aux[s.arg].data, aux[s.arg].len))
 				FBLOG("%s: step %lu (%s): the sink did not take the AUX write, continuing", tag,
 				      static_cast<unsigned long>(i), s.what);
 			break;
@@ -2802,9 +2805,9 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		return false;
 	}
 	// The plan for the connector the second display is on.
-	if (!usePlanFor(edid2Hpd)) {
+	if (!usePlanFor(xp().hpd)) {
 		FBLOG("pipe2: not lit: the second display is on HPD%u, a connector there is no plan for (a DisplayPort "
-		      "one needs rdna4-head2dp=1)", edid2Hpd);
+		      "one needs rdna4-head2dp=1)", xp().hpd);
 		return false;
 	}
 	const Pipe2::Config &c = Pipe2::config();
@@ -2823,7 +2826,7 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		return false;
 	}
 
-	if (c.dp && ((!pipe2Sink.maxRate && !readSecondDpSink(ddcLine)) || !pickSecondLink(c.timing.pixelClockKHz))) {
+	if (c.dp && ((!xp().sink.maxRate && !readSecondDpSink(ddcLine)) || !pickSecondLink(c.timing.pixelClockKHz))) {
 		FBLOG("pipe2: not lit: no DisplayPort sink with a link for the mode on AUX%u", ddcLine);
 		return false;
 	}
@@ -2832,10 +2835,10 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 	t.litHubp = pipe.hubp;
 	t.encoderObjId = path.encoderObjId;
 	t.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
-	t.linkRate = pipe2Link.rate;
+	t.linkRate = xp().link.rate;
 	// Only level 3 stops at the stream; the survey (2) covers the whole plan.
 	t.depth = level == 3 ? Pipe2::Depth::Stream : Pipe2::Depth::Plane;
-	t.sinkScdc = Edid::hdmi2Caps(edid2Data, edid2Len).scdc;
+	t.sinkScdc = Edid::hdmi2Caps(xp().edid, xp().edidLen).scdc;
 	t.ddcLine = ddcLine;
 	// The lit pipe scans the console from the address in its HUBP; the second
 	// surface lies in the same memory, so the same distance further on.
@@ -2883,12 +2886,12 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		      c.timing.pixelClockKHz, t.depth == Pipe2::Depth::Plane ? "stream and plane" : "stream only",
 		      static_cast<unsigned long>(plan->count), static_cast<unsigned long>(plan->ncmds));
 		// Before the plan runs: its training step reads the connector from here.
-		pipe2Target = t;
-		pipe2Target.now = c.timing;
-		pipe2ConnectorObjId = path.connectorObjId;
+		xp().target = t;
+		xp().target.now = c.timing;
+		xp().connectorObjId = path.connectorObjId;
 		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", c.pipe * Pipe::Reg::kOtgStride,
 		              plan->aux);
-		pipe2Lit = pipe2On = ok;
+		xp().lit = xp().on = ok;
 		// Whether it runs: the frame rate of its timing generator, and the
 		// underflow flags of the plane and the OPTC (HUBPn_DCHUBP_CNTL,
 		// ODMn_OPTC_INPUT_GLOBAL_CONTROL), raw.
@@ -2958,27 +2961,27 @@ void RDNA4Device::comparePipeColour(const Pipe2::Plan &plan) {
 // receiver capability, read where the sink's EDID is.
 bool RDNA4Device::readSecondDpSink(uint8_t aux) {
 	uint8_t caps[16] {};
-	pipe2Aux = aux;
-	pipe2Sink = {};
-	if (!dpcdRead(aux, 0x000, caps, sizeof(caps)) || !DpTrain::parseCaps(caps, sizeof(caps), pipe2Sink)) {
-		pipe2Sink = {};
+	xp().aux = aux;
+	xp().sink = {};
+	if (!dpcdRead(aux, 0x000, caps, sizeof(caps)) || !DpTrain::parseCaps(caps, sizeof(caps), xp().sink)) {
+		xp().sink = {};
 		FBLOG("pipe2: no DisplayPort receiver capability on AUX%u", aux);
 		return false;
 	}
 	FBLOG("pipe2: DisplayPort sink on AUX%u: DPCD %u.%u, up to %u lane(s) at rate 0x%02x%s%s", aux, caps[0] >> 4,
-	      caps[0] & 0xf, pipe2Sink.maxLanes, pipe2Sink.maxRate, pipe2Sink.tps3 ? ", TPS3" : "",
-	      pipe2Sink.tps4 ? ", TPS4" : "");
+	      caps[0] & 0xf, xp().sink.maxLanes, xp().sink.maxRate, xp().sink.tps3 ? ", TPS3" : "",
+	      xp().sink.tps4 ? ", TPS4" : "");
 	return true;
 }
 
 // The smallest link of the sink's that carries a mode at 8 bpc: what the next
 // training step brings up.
 bool RDNA4Device::pickSecondLink(uint32_t pixelClockKHz) {
-	if (!pipe2Sink.maxRate || !DpTrain::pickLink(pipe2Sink, pixelClockKHz, 24, pipe2Link)) {
+	if (!xp().sink.maxRate || !DpTrain::pickLink(xp().sink, pixelClockKHz, 24, xp().link)) {
 		FBLOG("pipe2: the DisplayPort sink has no link for %u kHz", pixelClockKHz);
 		return false;
 	}
-	FBLOG("pipe2: %u lane(s) at rate 0x%02x for %u kHz", pipe2Link.lanes, pipe2Link.rate, pixelClockKHz);
+	FBLOG("pipe2: %u lane(s) at rate 0x%02x for %u kHz", xp().link.lanes, xp().link.rate, pixelClockKHz);
 	return true;
 }
 
@@ -3001,41 +3004,78 @@ bool RDNA4Device::readDpDto(uint8_t otg, ModeSet::DpDto &out, uint32_t *cntlOut)
 bool RDNA4Device::trainSecondLink() {
 	const Pipe2::Config &c = Pipe2::config();
 	DpTrain::Report rep {};
-	const DpTrain::Result r = trainLink(pipe2Aux, c.link, c.hpd, pipe2Target.connectorObjId, pipe2Sink, pipe2Link,
+	const DpTrain::Result r = trainLink(xp().aux, c.link, c.hpd, xp().target.connectorObjId, xp().sink, xp().link,
 	                                    false, rep);
 	char tries[160];
 	FBLOG("pipe2: link %u, %u lane(s) at rate 0x%02x: %s after %u attempt(s) (%s): swing %u, pre-emphasis %u, lanes "
-	      "%02x %02x, aligned %u", c.link, pipe2Link.lanes, pipe2Link.rate, DpTrain::resultName(r), rep.attempts,
+	      "%02x %02x, aligned %u", c.link, xp().link.lanes, xp().link.rate, DpTrain::resultName(r), rep.attempts,
 	      triesText(rep, tries, sizeof(tries)), rep.swing, rep.preEmphasis, rep.status[0], rep.status[1],
 	      rep.status[2] & 1);
 	return r == DpTrain::Result::Ok;
 }
 
+size_t RDNA4Device::extraHeads() {
+	// Every connector beside the boot one's unless asked for fewer: three
+	// displays ran on the card, a head without a monitor waits offline.
+	static uint32_t heads = 0;
+	if (!heads) {
+		uint32_t want = kMaxExtra;
+		Trial::option("rdna4-heads", want);
+		heads = want < 1 ? 1 : want > kMaxExtra ? kMaxExtra : want;
+		FBLOG("pipe2: up to %u display(s) beside the boot one (rdna4-heads)", heads);
+	}
+	return heads;
+}
+
+size_t RDNA4Device::freeExtraSlot() const {
+	size_t slot = 0;
+	while (slot < kMaxExtra && (extra[slot].edidLen || extra[slot].lit))
+		slot++;
+	return slot;
+}
+
+bool RDNA4Device::hpdTakenByOther(uint8_t hpd) const {
+	for (size_t i = 0; i < kMaxExtra; i++)
+		if (i != extraSlot && extra[i].hpd == hpd && (extra[i].edidLen || extra[i].lit))
+			return true;
+	return false;
+}
+
+void RDNA4Device::selectExtra(size_t slot) {
+	if (slot >= kMaxExtra || slot == extraSlot)
+		return;
+	extraSlot = slot;
+	// Its connector's table, or until it has a sink its pipe's first.
+	const ExtraPipe &x = xp();
+	if (!x.hpd || !Pipe2::use(x.hpd, dpDual(x.hpd), x.pipe))
+		Pipe2::use(3, false, x.pipe);
+}
+
 bool RDNA4Device::usePlanFor(uint8_t hpd) {
 	const Pipe2::Config was = Pipe2::config();
-	if (!Pipe2::use(hpd, dpDual(hpd)))
+	if (!Pipe2::use(hpd, dpDual(hpd), xp().pipe))
 		return false;
 	if (Pipe2::config().dp && !pipe2DpAllowed) {
-		Pipe2::use(was.hpd, !was.dp);
+		Pipe2::use(was.hpd, !was.dp, xp().pipe);
 		return false;
 	}
 	return true;
 }
 
 void RDNA4Device::secondLinkBack() {
-	if (!pipe2Lit || !pipe2On || !Pipe2::config().dp)
+	if (!xp().lit || !xp().on || !Pipe2::config().dp)
 		return;
 	uint8_t status[3] {};
-	if (!dpcdRead(pipe2Aux, 0x202, status, sizeof(status))) {
-		FBLOG("pipe2: the display's pin is back but its DPCD does not answer on AUX%u: link left alone", pipe2Aux);
-	} else if (DpTrain::linkUp(status, pipe2Link.lanes)) {
+	if (!dpcdRead(xp().aux, 0x202, status, sizeof(status))) {
+		FBLOG("pipe2: the display's pin is back but its DPCD does not answer on AUX%u: link left alone", xp().aux);
+	} else if (DpTrain::linkUp(status, xp().link.lanes)) {
 		FBLOG("pipe2: the display's pin is back and its link is up (lanes %02x %02x, aligned %u)", status[0],
 		      status[1], status[2] & 1);
 	} else {
 		FBLOG("pipe2: the display's pin is back and its link is down (lanes %02x %02x, aligned %u): training it "
 		      "again", status[0], status[1], status[2] & 1);
 		runSecondPipePart(Pipe2::Part::Sleep);
-		pipe2On = pickSecondLink(pipe2Target.now.pixelClockKHz) && runSecondPipePart(Pipe2::Part::Wake);
+		xp().on = pickSecondLink(xp().target.now.pixelClockKHz) && runSecondPipePart(Pipe2::Part::Wake);
 	}
 }
 
@@ -3046,11 +3086,12 @@ uint8_t RDNA4Device::secondSinkHpd(bool orAnother) {
 		return 0;
 	auto high = [&](uint8_t hpd) { return hpd && ((hpdY >> (8 * (hpd - 1))) & 1); };
 	const Pipe2::Config &now = Pipe2::config();
-	if (pipe2Lit && (high(now.hpd) || !orAnother))   // its own connector first
+	if (xp().lit && (high(now.hpd) || !orAnother))   // its own connector first
 		return high(now.hpd) ? now.hpd : 0;
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
 		const Pipe2::Config &c = Pipe2::configAt(i);
-		if (c.hpd == pipe.hpd || !high(c.hpd) || (c.dp && !pipe2DpAllowed))
+		if (c.pipe != xp().pipe || c.hpd == pipe.hpd || hpdTakenByOther(c.hpd) || !high(c.hpd) ||
+		    (c.dp && !pipe2DpAllowed))
 			continue;
 
 		// A DisplayPort connector has a DisplayPort and an HDMI table. The
@@ -3065,14 +3106,14 @@ uint8_t RDNA4Device::secondSinkHpd(bool orAnother) {
 
 		// A lit pipe moves only between connectors with an HDMI stream
 		// (secondPipeTo).
-		if (!pipe2Lit || (!c.dp && !now.dp))
+		if (!xp().lit || (!c.dp && !now.dp))
 			return c.hpd;
 	}
 	return 0;
 }
 
 bool RDNA4Device::secondPipeTo(uint8_t hpd) {
-	if (!pipe2Lit)
+	if (!xp().lit)
 		return false;
 	const Pipe2::Config was = Pipe2::config();
 	if (hpd != was.hpd) {
@@ -3085,27 +3126,27 @@ bool RDNA4Device::secondPipeTo(uint8_t hpd) {
 		if (!ok) {
 			FBLOG("pipe2: not moved from HPD%u to HPD%u: only between connectors with an HDMI "
 			      "stream the boot display does not use", was.hpd, hpd);
-			Pipe2::use(was.hpd, !was.dp);
+			Pipe2::use(was.hpd, !was.dp, xp().pipe);
 			return false;
 		}
 		FBLOG("pipe2: moving from HPD%u (DIG%u, link %u) to HPD%u (DIG%u, link %u) at %ux%u, %u kHz", was.hpd,
-		      was.dig, was.link, to.hpd, to.dig, to.link, pipe2Target.now.hActive, pipe2Target.now.vActive,
-		      pipe2Target.now.pixelClockKHz);
-		if (pipe2On) {   // the old link down first, by its own table
-			Pipe2::use(was.hpd, !was.dp);
+		      was.dig, was.link, to.hpd, to.dig, to.link, xp().target.now.hActive, xp().target.now.vActive,
+		      xp().target.now.pixelClockKHz);
+		if (xp().on) {   // the old link down first, by its own table
+			Pipe2::use(was.hpd, !was.dp, xp().pipe);
 			runSecondPipePart(Pipe2::Part::Sleep);
-			Pipe2::use(hpd, !to.dp);
-			pipe2On = false;
+			Pipe2::use(hpd, !to.dp, xp().pipe);
+			xp().on = false;
 		}
-		pipe2Target.encoderObjId = path.encoderObjId;
-		pipe2Target.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
-		pipe2Target.ddcLine = ddcLine;
-		pipe2ConnectorObjId = path.connectorObjId;
-		pipe2MoveOwed = true;
+		xp().target.encoderObjId = path.encoderObjId;
+		xp().target.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
+		xp().target.ddcLine = ddcLine;
+		xp().connectorObjId = path.connectorObjId;
+		xp().moveOwed = true;
 	}
-	if (!pipe2MoveOwed) {
+	if (!xp().moveOwed) {
 		setSecondPipePower(true);
-		return pipe2On;
+		return xp().on;
 	}
 	// The pipe belongs to this connector now, whatever happens next: a move
 	// that stops part-way is done again from here at the next plug.
@@ -3114,14 +3155,14 @@ bool RDNA4Device::secondPipeTo(uint8_t hpd) {
 	// and wake, which leave its encoder and link as lighting here would
 	// (test/atomdump.cpp, testPipe2Move).
 	const Pipe2::Config &c = Pipe2::config();
-	const Modes::Mode same { 0, pipe2Target.now, pipe2Target.now.refreshMilliHz(), false, Modes::SourceBoot };
+	const Modes::Mode same { 0, xp().target.now, xp().target.now.refreshMilliHz(), false, Modes::SourceBoot };
 	if (applySecondPipeMode(same) != kIOReturnSuccess || !runSecondPipePart(Pipe2::Part::Sleep) ||
 	    !runSecondPipePart(Pipe2::Part::Wake)) {
 		FBLOG("pipe2: the move to HPD%u did not complete: the display stays off until it is plugged in again", hpd);
 		return false;
 	}
-	pipe2MoveOwed = false;
-	pipe2On = true;
+	xp().moveOwed = false;
+	xp().on = true;
 	FBLOG("pipe2: now on HPD%u; DIG%u_DIG_FE_EN_CNTL=0x%08x SYMCLK%c_CLOCK_ENABLE=0x%08x", c.hpd, c.dig,
 	      regReadDmu(2, Pipe::Reg::kDigFeEnCntl + c.dig * Pipe::Reg::kDigStride), 'A' + c.dig,
 	      regReadDmu(1, 0x00a0 + c.dig));
@@ -3178,10 +3219,10 @@ bool RDNA4Device::readSecondEdid(uint8_t hpd) {
 		return false;
 	// The extension says whether the sink has SCDC and carries more modes.
 	const bool ext = edid[126] > 0 && read(edid + 128, 128);
-	edid2Len = ext ? 256 : 128;
-	edid2Hpd = hpd;
-	memcpy(edid2Data, edid, sizeof(edid));
-	pipe2Target.sinkScdc = Edid::hdmi2Caps(edid2Data, edid2Len).scdc;   // it may be another monitor
+	xp().edidLen = ext ? 256 : 128;
+	xp().hpd = hpd;
+	memcpy(xp().edid, edid, sizeof(edid));
+	xp().target.sinkScdc = Edid::hdmi2Caps(xp().edid, xp().edidLen).scdc;   // it may be another monitor
 	return true;
 }
 
@@ -3190,9 +3231,9 @@ bool RDNA4Device::runSecondPipePart(Pipe2::Part part, size_t *steps) {
 	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
 	if (!plan)
 		return false;
-	Pipe2::Target t = pipe2Target;
+	Pipe2::Target t = xp().target;
 	t.part = part;
-	t.linkRate = pipe2Link.rate;
+	t.linkRate = xp().link.rate;
 	const char *why = "";
 	bool ok = Pipe2::build(t, *plan, &why);
 	if (!ok)
@@ -3207,7 +3248,7 @@ bool RDNA4Device::runSecondPipePart(Pipe2::Part part, size_t *steps) {
 }
 
 void RDNA4Device::setSecondPipePower(bool on) {
-	if (!pipe2Lit || on == pipe2On)
+	if (!xp().lit || on == xp().on)
 		return;
 	if (!displaySleepEnabled) {
 		displayPowerNote(on, "pipe2", "ignored: rdna4-nosleep=1");
@@ -3216,7 +3257,7 @@ void RDNA4Device::setSecondPipePower(bool on) {
 	const Pipe2::Config &c = Pipe2::config();
 	// The wake part trains the link: the smallest for the mode the pipe runs,
 	// of the sink that is there now.
-	if (on && c.dp && !pickSecondLink(pipe2Target.now.pixelClockKHz)) {
+	if (on && c.dp && !pickSecondLink(xp().target.now.pixelClockKHz)) {
 		displayPowerNote(on, "pipe2", "no DisplayPort link for the mode");
 		return;
 	}
@@ -3234,7 +3275,7 @@ void RDNA4Device::setSecondPipePower(bool on) {
 	displayPowerNote(on, "pipe2", res);
 	// A wake that stopped did not bring the display up: the next request to
 	// turn it on, or the next plug, runs the wake again.
-	pipe2On = on && ok;
+	xp().on = on && ok;
 }
 
 // The modes the second pipe can be switched to scan the surface it was lit
@@ -3247,7 +3288,7 @@ Modes::Limits RDNA4Device::secondPipeModeLimits() const {
 	lim.maxVActive = plan.vActive;
 	// On DisplayPort, what the sink's largest link carries at 8 bpc.
 	lim.maxPixelClockKHz = Pipe2::config().dp
-		? DpTrain::bandwidthKbps(DpTrain::Link { pipe2Sink.maxLanes, pipe2Sink.maxRate }) / 24
+		? DpTrain::bandwidthKbps(DpTrain::Link { xp().sink.maxLanes, xp().sink.maxRate }) / 24
 		: ModeSet::kScrambleFromKHz;
 
 	// Behind a passive DP++ adapter, what the adapter carries.
@@ -3285,23 +3326,23 @@ bool RDNA4Device::secondPipeModeOk(const Edid::DetailedTiming &t, const char **w
 // down and comes up larger, as for sleep and wake, with the stream still in
 // the mode it runs. A link that is large enough stays.
 bool RDNA4Device::relinkSecondPipe(uint32_t pixelClockKHz) {
-	if (DpTrain::bandwidthKbps(pipe2Link) >= static_cast<uint64_t>(pixelClockKHz) * 24)
+	if (DpTrain::bandwidthKbps(xp().link) >= static_cast<uint64_t>(pixelClockKHz) * 24)
 		return true;
-	const DpTrain::Link had = pipe2Link;
+	const DpTrain::Link had = xp().link;
 	if (!pickSecondLink(pixelClockKHz))
 		return false;
 	const bool ok = runSecondPipePart(Pipe2::Part::Sleep) && runSecondPipePart(Pipe2::Part::Wake);
 	if (!ok) {
 		FBLOG("pipe2: the larger link did not come up: back to %u lane(s) at rate 0x%02x", had.lanes, had.rate);
-		pipe2Link = had;
+		xp().link = had;
 		runSecondPipePart(Pipe2::Part::Sleep);
-		pipe2On = runSecondPipePart(Pipe2::Part::Wake);
+		xp().on = runSecondPipePart(Pipe2::Part::Wake);
 	}
 	return ok;
 }
 
 IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
-	if (!pipe2Lit)
+	if (!xp().lit)
 		return kIOReturnUnsupported;
 	const Pipe2::Config &c = Pipe2::config();
 	const uint32_t otgOffset = c.pipe * Pipe::Reg::kOtgStride;
@@ -3324,13 +3365,13 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 	t.dig = c.dig;
 	t.link = c.link;
 	t.hpd = c.hpd;
-	t.encoderObjId = pipe2Target.encoderObjId;
-	t.connectorObjId = pipe2ConnectorObjId;
-	t.sinkScdc = pipe2Target.sinkScdc;
-	t.ddcLine = pipe2Target.ddcLine;
+	t.encoderObjId = xp().target.encoderObjId;
+	t.connectorObjId = xp().connectorObjId;
+	t.sinkScdc = xp().target.sinkScdc;
+	t.ddcLine = xp().target.ddcLine;
 	// DisplayPort: the stream is retimed on the link as it is, like the boot
 	// display's, after the link was made large enough for the mode.
-	const Edid::DetailedTiming was = pipe2Target.now;
+	const Edid::DetailedTiming was = xp().target.now;
 	ModeSet::DpDto dtoNow {};
 	if (c.dp && (!relinkSecondPipe(m.t.pixelClockKHz) || !readDpDto(c.pipe, dtoNow))) {
 		FBLOG("pipe2: switch to id %u refused: no DisplayPort link or pixel-rate DTO for it", m.id);
@@ -3338,16 +3379,16 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 		return kIOReturnUnsupported;
 	}
 	t.dp = c.dp;
-	t.dpMaxKHz = DpTrain::bandwidthKbps(pipe2Link) / 24;
+	t.dpMaxKHz = DpTrain::bandwidthKbps(xp().link) / 24;
 	// From the timing the pipe runs to `to`, then the infoframe for it.
 	bool touched = false;   // a refused plan changes nothing; one that stops half-way does
 	auto retime = [&](const Edid::DetailedTiming &to) {
-		t.from = pipe2Target.now;
+		t.from = xp().target.now;
 		t.to = to;
 		if (c.dp) {
 			if (!ModeSet::scaleDpDto(dtoNow, was.pixelClockKHz, to.pixelClockKHz, t.dto))
 				t.dto = {};
-			t.vidM = ModeSet::dpVidM(to.pixelClockKHz, DpTrain::symbolClockKHz(pipe2Link.rate));
+			t.vidM = ModeSet::dpVidM(to.pixelClockKHz, DpTrain::symbolClockKHz(xp().link.rate));
 		}
 		t.nextra = Pipe2::modeSteps(to, work->extra, Pipe2::kMaxModeSteps);
 		if (!ModeSet::build(t, *plan, &why))
@@ -3356,7 +3397,7 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 		touched = true;
 		if (!runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", otgOffset))
 			return false;
-		pipe2Target.now = to;
+		xp().target.now = to;
 		return c.dp || runSecondPipePart(Pipe2::Part::Avi);
 	};
 	FBLOG("pipe2: switching to id %u %ux%u@%u.%03u (%u kHz), request timing %s", m.id, m.t.hActive, m.t.vActive,
@@ -3371,8 +3412,8 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 	const uint64_t periodNs = measureFramePeriodNs(otgOffset);
 	const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
 	FBLOG("pipe2: now %ux%u at %u kHz, OTG%u measured %u.%03u Hz; HUBP%u_DCHUBP_CNTL=0x%08x "
-	      "ODM%u_OPTC_INPUT_GLOBAL_CONTROL=0x%08x DET %u", pipe2Target.now.hActive, pipe2Target.now.vActive,
-	      pipe2Target.now.pixelClockKHz, c.pipe, mHz / 1000, mHz % 1000, c.pipe,
+	      "ODM%u_OPTC_INPUT_GLOBAL_CONTROL=0x%08x DET %u", xp().target.now.hActive, xp().target.now.vActive,
+	      xp().target.now.pixelClockKHz, c.pipe, mHz / 1000, mHz % 1000, c.pipe,
 	      regReadDmu(2, 0x05f4 + c.pipe * Pipe::Reg::kHubpStride), c.pipe,
 	      regReadDmu(2, 0x1aca + c.pipe * Pipe::Reg::kOdmStride), regReadDmu(c.detSeg, c.detCtrl[c.pipe]) & 0x1f);
 	IOFree(work, sizeof(Work));

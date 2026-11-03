@@ -135,6 +135,15 @@ if [ $# -eq 0 ]; then
 	table pipe2_linux_dp2.inc   dplink a 0 0  1 1 1 2  1920 88 44 148  1080 4 5 36  148500 1 1 16
 	table pipe2_linux_dp1_tmds.inc  dpdual  1 0 0 1  1920 88 44 148  1080 4 5 36  148500 1 1 16
 	table pipe2_linux_dp2_tmds.inc  dpdual  1 1 1 2  1920 88 44 148  1080 4 5 36  148500 1 1 16
+	# The same six for pipes 2 and 3, the third and fourth display.
+	for p in 2 3; do
+		table pipe2_linux_p${p}_hpd3.inc       $p 2 2 3  1920 88 44 148  1080 4 5 36  148500 1 1 16
+		table pipe2_linux_p${p}_hpd4.inc       $p 3 3 4  1920 88 44 148  1080 4 5 36  148500 1 1 16
+		table pipe2_linux_p${p}_dp1.inc        dplink a 0 0  $p 0 0 1  1920 88 44 148  1080 4 5 36  148500 1 1 16
+		table pipe2_linux_p${p}_dp2.inc        dplink a 0 0  $p 1 1 2  1920 88 44 148  1080 4 5 36  148500 1 1 16
+		table pipe2_linux_p${p}_dp1_tmds.inc   dpdual  $p 0 0 1  1920 88 44 148  1080 4 5 36  148500 1 1 16
+		table pipe2_linux_p${p}_dp2_tmds.inc   dpdual  $p 1 1 2  1920 88 44 148  1080 4 5 36  148500 1 1 16
+	done
 else
 	table pipe2_linux.inc "$@"
 fi

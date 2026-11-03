@@ -57,11 +57,38 @@ public:
 	// present. 0 length = no DDC sink found.
 	uint8_t edidData[256] {};
 	size_t  edidLen { 0 };
-	// The next sink that answered on another connector, for the second head
-	// (rdna4-head2, plugin.cpp): base block plus one extension. 0 length = none.
-	uint8_t edid2Data[256] {};
-	size_t  edid2Len { 0 };
-	uint8_t edid2Hpd { 0 };   // the HPD pin of the connector it is on
+	// A display beyond the boot one (rdna4-head2, plugin.cpp): the sink on
+	// another connector, the pipe it is lit on and what the kext lit for it.
+	// The second-pipe functions below act on the selected one (selectExtra).
+	struct ExtraPipe {
+		uint8_t       pipe { 1 };          // OTG = HUBP = DPP = MPCC = OPP instance, 1 to 3
+		uint8_t       edid[256] {};        // base block plus one extension
+		size_t        edidLen { 0 };       // 0: no sink
+		uint8_t       hpd { 0 };           // the HPD pin of the connector it is on
+		Pipe2::Target target {};           // .now: the timing the pipe runs
+		uint16_t      connectorObjId { 0 };
+		bool          lit { false }, on { false };
+		bool          moveOwed { false };  // secondPipeTo: the move to the connector in use has not completed
+		// On DisplayPort: the sink's AUX channel and capabilities (read with
+		// its EDID), and the link picked for the mode it is to carry.
+		uint8_t       aux { 0 };
+		DpTrain::Sink sink {};
+		DpTrain::Link link {};
+	};
+	static constexpr size_t kMaxExtra = 3;
+	ExtraPipe extra[kMaxExtra] { { 1 }, { 2 }, { 3 } };
+	size_t extraSlot { 0 };
+	ExtraPipe &xp() { return extra[extraSlot]; }
+	const ExtraPipe &xp() const { return extra[extraSlot]; }
+	// The one the second-pipe functions act on, and its connector's table
+	// (Pipe2::use) once it has a sink.
+	void selectExtra(size_t slot);
+	// How many displays beside the boot one this boot may light (1 to 3,
+	// rdna4-heads); the first extra pipe without a sink (kMaxExtra if none);
+	// whether another extra pipe than the selected one has that connector.
+	static size_t extraHeads();
+	size_t freeExtraSlot() const;
+	bool hpdTakenByOther(uint8_t hpd) const;
 
 	// Bit (pin - 1): a DisplayPort connector whose sink answered on DDC,
 	// i.e. an HDMI monitor behind a passive DP++ adapter.
@@ -122,7 +149,7 @@ public:
 	// Hot-plug (plugin.cpp polls). secondSinkHpd: the HPD pin of the lit second
 	// pipe's connector if it is high; before the pipe is lit, of the first
 	// connector a plan exists for that is high and not the boot display's; else
-	// 0. readSecondEdid: the EDID of what is on that connector, into edid2Data.
+	// 0. readSecondEdid: the EDID of what is on that connector, into xp().edid.
 	// `orAnother`, for a lit pipe whose display is gone: if its own connector is
 	// empty, another connector the pipe can be moved to (secondPipeTo).
 	uint8_t secondSinkHpd(bool orAnother = false);
@@ -151,14 +178,10 @@ public:
 	// values for it are in the table or it is near the lit mode's pixel
 	// clock, and the DET buffer has the segments it needs.
 	bool secondPipeModeOk(const Edid::DetailedTiming &t, const char **why = nullptr);
-	Pipe2::Target pipe2Target {};          // .now: the timing the pipe runs
-	uint16_t pipe2ConnectorObjId { 0 };
-	bool pipe2Lit { false }, pipe2On { false };
 	// A DisplayPort second display whose HPD pin dropped and came back without
 	// counting as unplugged: its link is trained again if the sink says it is
 	// down. Nothing else maintains a link the kext trained.
 	void secondLinkBack();
-	bool pipe2MoveOwed { false };   // secondPipeTo: the move to the connector in use has not completed
 	bool runSecondPipePart(Pipe2::Part part, size_t *steps = nullptr);
 
 	// The boot display's DisplayPort link (rdna4-dptrain, a diagnostic). The
@@ -331,17 +354,14 @@ private:
 	              const char *tag, uint32_t otgOffset, const Pipe2::AuxWrite *aux = nullptr);
 	DpTrain::Result trainLink(uint8_t aux, uint8_t link, uint8_t hpd, uint8_t conn, const DpTrain::Sink &sink,
 	                          const DpTrain::Link &settings, bool offFirst, DpTrain::Report &rep);
-	// The second pipe on DisplayPort: its sink's AUX channel and capabilities
-	// (read with its EDID), and the link picked for the mode it is to carry.
+	// The second pipe on DisplayPort: its sink's capabilities (with its EDID),
+	// and the link for the mode it is to carry (xp().aux, .sink, .link).
 	bool readSecondDpSink(uint8_t aux);
 	bool pickSecondLink(uint32_t pixelClockKHz);
 	bool relinkSecondPipe(uint32_t pixelClockKHz);
 	bool trainSecondLink();
 	// The pixel-rate DTO an OTG runs on; false if its pixel clock is not that DTO.
 	bool readDpDto(uint8_t otg, ModeSet::DpDto &out, uint32_t *cntl = nullptr);
-	uint8_t       pipe2Aux { 0 };
-	DpTrain::Sink pipe2Sink {};
-	DpTrain::Link pipe2Link {};
 	void surveySteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds);
 	bool waitFrames(uint32_t frames, uint32_t otgOffset);
 
