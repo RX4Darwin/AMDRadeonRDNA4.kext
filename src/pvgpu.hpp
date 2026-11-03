@@ -183,6 +183,7 @@ private:
 		void *refCon { nullptr };
 		bool registered { false };
 		bool enabled { false };
+		bool pending { false };   // raised while disabled: delivered when enabled again
 	};
 	IOBufferMemoryDescriptor *mBar0Desc { nullptr };
 	void *mBar0 { nullptr };                         // kernel VA of the BAR0 RAM (the buffer's own mapping; Apple's driver gets an alias)

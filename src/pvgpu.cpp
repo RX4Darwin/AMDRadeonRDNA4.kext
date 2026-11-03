@@ -1866,8 +1866,9 @@ void RDNA4PvHost::answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t
 	uint32_t rec[3] = {};
 	if (plen >= sizeof(rec))
 		memcpy(rec, pl, sizeof(rec));
-	if (plen < sizeof(rec) || rec[0] != pvstream::kDeviceInfoRecord) {
-		pvlog("host: GetDeviceInfo without a 0x2d record (%u payload bytes): not answered", plen);
+	const bool known = rec[0] == pvstream::kDeviceInfoRecord || rec[0] == pvstream::kDeviceInfoRecordSequoia;
+	if (plen < sizeof(rec) || !known) {
+		pvlog("host: GetDeviceInfo without a 0x2d or 0x2a record (%u payload bytes, first word 0x%x): not answered", plen, rec[0]);
 		return;
 	}
 	const uint32_t bytes = rec[1] * 8, page = rec[2];
@@ -2094,7 +2095,7 @@ void RDNA4PvHost::completeStamp(uint32_t index, uint32_t value) {
 	static uint32_t logged = 0;
 	if (logged++ < 12 || !delivered)
 		pvlog("host: stamp[%u] = %u written (FIFO page offset 0x%x), INTR_STATUS_GPU bit %u set, interrupt 0 %s", index, value, index * 4, index,
-		      delivered ? "raised" : "not raised (no handler registered yet)");
+		      delivered ? "raised" : "pending (the line is disabled or has no handler yet)");
 }
 
 // ---- child channels ----
@@ -2880,6 +2881,12 @@ bool RDNA4PvNub::raiseInterrupt(int source) {
 	void *r;
 	IOLockLock(mLock);
 	const bool ok = mInt[source].registered && mInt[source].enabled;
+	// Like a level interrupt: the status bits stay set until the driver clears
+	// them, so a raise while its event source has the line disabled (it does
+	// while its work loop runs) is not lost. Dropping it stalled Apple's driver
+	// after 16 command buffers (card, Sequoia, 2026-11-03).
+	if (mInt[source].registered && !mInt[source].enabled)
+		mInt[source].pending = true;
 	h = mInt[source].handler;
 	t = mInt[source].target;
 	r = mInt[source].refCon;
@@ -3198,7 +3205,11 @@ IOReturn RDNA4PvNub::enableInterrupt(int source) {
 		return kIOReturnBadArgument;
 	IOLockLock(mLock);
 	mInt[source].enabled = true;
+	const bool pending = mInt[source].pending;
+	mInt[source].pending = false;
 	IOLockUnlock(mLock);
+	if (pending)
+		raiseInterrupt(source);
 	return kIOReturnSuccess;
 }
 IOReturn RDNA4PvNub::disableInterrupt(int source) {
