@@ -280,6 +280,10 @@ void deviceCursorProbe(void *ctx, const char *why) {
 	static_cast<RDNA4Device *>(ctx)->cursorRegProbe(why);
 }
 
+void deviceSmuReady(void *ctx) {
+	static_cast<RDNA4Device *>(ctx)->smuStarted();
+}
+
 int32_t deviceGetHardwareCursorDrawState(void *ctx,
 	                                         Ndrv::VDHardwareCursorDrawStateRec &state) {
 	return static_cast<RDNA4Device *>(ctx)->getHardwareCursorDrawState(state);
@@ -909,6 +913,8 @@ void attach(FbEntry &e) {
 		delete st;
 		return;
 	}
+	// A test boot's stage (rdna4-trial) is only known once NVRAM is.
+	computeStage = RDNA4Compute::requestedStage();
 	Ndrv::Backend be { &dev, deviceSurfaceFor, deviceSwitchTo, deviceSetPower,
 	                   deviceSupportsHardwareCursor, deviceSetHardwareCursor,
 	                   deviceDrawHardwareCursor, deviceGetHardwareCursorDrawState };
@@ -946,6 +952,7 @@ void attach(FbEntry &e) {
 		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
 		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
 		                        createVblankService, deviceCursorProbe, &dev };
+		env.smuReady = deviceSmuReady;
 		st->compute.start(env, computeStage);
 	}
 }

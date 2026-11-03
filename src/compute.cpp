@@ -8,6 +8,7 @@
 //
 
 #include "codeobj.hpp"
+#include "trial.hpp"
 #include "klog.hpp"
 #include "compute.hpp"
 #include "flip.hpp"
@@ -110,7 +111,7 @@ void RDNA4Compute::publishResult(const char *feature, const char *value) {
 
 uint32_t RDNA4Compute::requestedStage() {
 	uint32_t stage = 0;
-	if (!PE_parse_boot_argn("rdna4-compute", &stage, sizeof(stage)))
+	if (!Trial::option("rdna4-compute", stage))
 		return StageOff;
 	return stage > StageKernel ? StageKernel : stage;
 }
@@ -2129,6 +2130,8 @@ bool RDNA4Compute::stageGfx() {
 	trail("s3: SMU features (display-safe mask)");
 	uint64_t running = smuEnableFeatures(displaySafe, 0);
 	put("SmuFeatures", running);
+	if (env.smuReady)
+		env.smuReady(env.cursorProbeCtx);
 
 	// 4. gfx_v12_0_wait_for_rlc_autoload_complete: CP idle and the RLC
 	//    reports its bootload complete.

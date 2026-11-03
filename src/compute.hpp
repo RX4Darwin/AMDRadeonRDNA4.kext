@@ -29,10 +29,11 @@
 //    stage 6  dispatch  a hand-written gfx1201 kernel on the compute units.
 //    stage 7  kernel    a clang-built kernel launched from its code object.
 //
-//  Selected with the boot-arg rdna4-compute=<stage>; absent/0 = off, and the
-//  plugin behaves exactly as without this file. Each stage runs the ones
-//  before it. Stage 1 runs inline; stages 2+ run on their own kernel thread
-//  a few seconds later, so the desktop never waits on (or for) them.
+//  Selected with rdna4-compute=<stage>, a boot-arg or a test boot's option
+//  (trial.hpp); absent/0 = off, and the plugin behaves exactly as without
+//  this file. Each stage runs the ones before it. Stage 1 runs inline;
+//  stages 2+ run on their own kernel thread a few seconds later, so the
+//  desktop never waits on (or for) them.
 //
 //  Once stage 6 or 7 finished, the runtime (runtime.cpp) is published for
 //  user space as RDNA4ComputeService (userclient.cpp, include/rdna4compute.h).
@@ -121,6 +122,9 @@ public:
 		// W32: read-only cursor register dump the display device offers (flip.cpp calls it after each flip).
 		void (*cursorProbe)(void *ctx, const char *why) { nullptr };
 		void *cursorProbeCtx { nullptr };
+		// Once the power-management firmware runs its features (stage 3), on the bring-up thread before
+		// it sends anything else: the display device may talk to the firmware (ctx: cursorProbeCtx).
+		void (*smuReady)(void *ctx) { nullptr };
 	};
 
 	enum Stage : uint32_t {

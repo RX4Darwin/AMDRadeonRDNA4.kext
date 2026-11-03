@@ -32,6 +32,7 @@
 #include "dptrain.hpp"
 
 class IOMemoryMap;
+struct SmuMailbox;
 
 class RDNA4Device {
 public:
@@ -218,6 +219,10 @@ public:
 	bool supportsHardwareCursor() const { return hwCursorReady; }
 	IOReturn setHardwareCursor(void *cursorRef);
 	IOReturn drawHardwareCursor(int32_t x, int32_t y, uint32_t visible);
+	// Once the power-management firmware runs its features (compute stage
+	// 3's thread calls it): the display clocks, logged with rdna4-clocks=1
+	// and raised with rdna4-dispclk=<MHz> (clk.cpp).
+	void smuStarted();
 	void cursorRegProbe(const char *why);   // W32: read-only cursor plane dump (also called from the compute thread after a flip)
 	IOReturn getHardwareCursorDrawState(Ndrv::VDHardwareCursorDrawStateRec &state) const;
 
@@ -247,6 +252,7 @@ private:
 	// Register bases from the IP discovery binary (full flash dump injected
 	// as ATY,bin_image, or the PSP's on-die copy).
 	IpDiscovery ipDiscovery;
+	const SmuMailbox *smu { nullptr };   // the firmware mailbox that answers (clk.cpp), once it runs
 	uint8_t *onDieDisc { nullptr };
 	bool loadOnDieDiscovery();
 
@@ -297,6 +303,21 @@ private:
 	void dmubHistory();
 	void dumpDmubVersion();
 	void smuPing();
+	// The power-management firmware's mailboxes (clk.cpp).
+	bool smuRegs(const SmuMailbox &mb, uint32_t &msg, uint32_t &arg,
+		     uint32_t &resp) const;
+	uint32_t smuWait(uint32_t resp) const;
+	bool smuSend(const SmuMailbox &mb, uint32_t id, uint32_t param,
+		     uint32_t *out);
+	bool smuProbe(const SmuMailbox &mb);
+	const SmuMailbox *smuFind();
+	bool smuHardMinMet(uint32_t clk);
+	const char *smuSetHardMin(uint32_t clk, uint32_t mhz);
+	void raiseDisplayClocks();
+	void logDisplayClocks();
+	uint32_t dpmLevelCount(const SmuMailbox &mb, uint32_t clk);
+	void logDpmLevels(const SmuMailbox &mb, uint32_t clk, const char *name);
+	void logDispclkDivider();
 	void dumpIH();
 	void dumpPSP();
 	void dumpModeState();
