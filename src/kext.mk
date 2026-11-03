@@ -24,7 +24,7 @@ VMTEST_FLAGS_1 = -DAMDRadeonRDNA4_VM_TEST
 
 # The fake paravirtual GPU of M0 (PVGPU=1 in the Makefile, which also defines AMDRadeonRDNA4_PVGPU in fwconfig.h).
 PVGPU_OBJS_0   =
-PVGPU_OBJS_1   = pvgpu.o pvstream.o pvhooks.o
+PVGPU_OBJS_1   = pvgpu.o pvstream.o pvhooks.o pvexec.o pvrun.o
 
 # RELEASE is what has run on the card. DEBUG has not, as of 0.1.0: no optimisation (larger stack frames), and
 # DEBUG defined, which turns Lilu's DBGLOG lines on.

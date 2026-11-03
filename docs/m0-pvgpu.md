@@ -176,6 +176,29 @@ Between them `host: ctrl+0x... a -> b` lines show the register writes the host s
   `submitTransaction`, `isTransactionComplete` and `signalTransactionComplete`, which point at display-pipe transactions the host has to complete
   (the display info says "transactions via FIFO 0x06").
 
+### Fifth to eleventh runs (2026-11-04): a Metal client's blit runs on the host
+
+**Measured**, card, Sequoia 24H232, `rdna4-pvgpu=1`, display offline:
+
+- **Accelerator enable.** `IOGraphicsAccelerator2` starts disabled, is enabled by `display_mode_did_change` and disabled by `display_mode_will_change` of
+  its framebuffer. `src/pvhooks.cpp` (Lilu, PVGPU builds) enables the paravirt accelerator for the first client that waits and skips its disables.
+  A Metal client then runs to completion: buffer, blit, `ExecIndirect`, page-table commits, status *completed*.
+- **Page table.** Four levels of 4 KiB nodes with 1024 u32 entries, 10 bits of the page number per level, root first; entry = page number, bit 31 a
+  flag. `AppleParavirtTask::init` passes 3 to `PageTable::init`, yet the walk needs four for a 16 GiB task (`src/pvexec.hpp`).
+- **`SetResourceHeap`** `{u32 task, u32 heap GPU page, u32 bytes}`: the heap is in the task's GPU space (page 1, 1 MiB). Heap entry `i` (12 bytes) is
+  `{u32 kind | descriptor bytes << 8, u32 descriptor GPU address, u32 0}`; descriptors are packed one after the other. A buffer (kind 1) has the 16-byte
+  descriptor `{u64 length, u64 GPU page}`.
+- **`ExecIndirect`** `{u32 task, u32 count, u32 flags}`, `count` x `{u32 resource, u32 usage, u64, u64}`, then `{u64 command buffer GPU address,
+  u64 length}`. Task ids here and in `CommitIntoGPUPageTable` are `DefineHostTask`'s id >> 1.
+- **Command buffer.** Segments `{u32 length incl. header, u8 type (0 render, 1 compute, 2 blit, 4 info), u8, u8, u8}`, commands `{u32 id, u32 size incl.
+  header}`. A blit `fillBuffer` is `0x132 {u32 buffer ref, u64 offset, u64 length, u8 value}`; the ref is the heap entry index.
+- **First execution:** `src/pvrun.cpp` runs blit fills and buffer copies with the CPU on the client's memory. A one-blit client reads back 0xab over
+  4 KiB (it read its old contents before).
+- **Compute:** `makeLibrary(source:)` compiles inside the guest; `makeComputePipelineState` sends `CreateComputePipeline` (0x3b)
+  `{u32 task, u32 2, u32 5, u32 6, u64 GPU address}`: 5 and 6 are not heap refs (another namespace: the bundle's serializer objects), the address is
+  zeroed memory the host is presumably to fill (the client reads `threadExecutionWidth` 0). Objects reach the host another way:
+  `AppleParavirtShared::createObject`/`createFunction` do not use the FIFO command allocator. Next to find.
+
 ## The GetDeviceInfo reply (hub-task-446) [measured in the kext and the bundle unless marked]
 
 **The wait.** `AppleParavirtAccelerator::setupDeviceInfo` (the last step of `Accelerator::start`) wires a 4 KiB `IOBufferMemoryDescriptor`, builds FIFO command `0x3a` with one record `{u32 0x2d, u32 bytes/8 (0x200), u32 physical page}`, submits it on the root channel through the generic `IOAccelChannel2` path, and then **`IOAccelEventMachineFast2::finishEvent`** waits for the event of that submission. After the wait it calls `parseDeviceInfo(buffer, 0x200, &accelerator->deviceInfo)` and returns true whatever the content (no validation: even an all-zero buffer passes). Then `Accelerator::start` releases its lock and `registerService()`.

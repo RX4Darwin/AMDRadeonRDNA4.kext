@@ -8,6 +8,7 @@
 #include "pvgpu.hpp"
 #include "trial.hpp"
 #include "klog.hpp"
+#include "pvexec.hpp"
 #include "pvstream.hpp"
 #include "sku.hpp"
 
@@ -132,6 +133,7 @@ private:
 	};
 	void consume(const CmdSource &src, uint32_t read, uint32_t n);
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
+	void execCommand(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void completeStamp(uint32_t index, uint32_t value);
@@ -453,6 +455,12 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			copy(at, mWin, c.length);
 			answerDisplayOnline(c, mWin);
 		}
+		// Tasks, resource heaps and execs: the guest memory the work is in (pvexec.hpp).
+		if ((c.id == 0x38 || c.id == 0x20 || c.id == 0x33 || c.id == 0x37 || c.id == 0x3b) &&
+		    c.length <= sizeof(mWin)) {
+			copy(at, mWin, c.length);
+			execCommand(c, mWin, src.channel);
+		}
 		if (c.id == 0x06 || c.id == 0x07)
 			mTransactions++;   // completion is the generic stamp below: the pipe's fence waits for the command's signal (docs/m1-stream.md s.1b)
 		else if (c.id == 0x04 || c.id == 0x05)
@@ -471,6 +479,18 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 }
 
 // GetDeviceInfo (FIFO 0x3a): the record 0x2d names the 4 KiB buffer the host fills; the layout and the values are docs/m0-pvgpu.md "The GetDeviceInfo reply".
+void RDNA4PvHost::execCommand(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel) {
+	const uint8_t *pl = cmd + c.payloadOffset;
+	const uint32_t plen = c.length - c.payloadOffset;
+	switch (c.id) {
+	case 0x38: PvExec::defineTask(pl, plen); break;
+	case 0x20: PvExec::freeTask(pl, plen); break;
+	case 0x33: PvExec::setHeap(pl, plen); break;
+	case 0x37: PvExec::execIndirect(pl, plen, channel); break;
+	case 0x3b: PvExec::createComputePipeline(pl, plen); break;
+	}
+}
+
 void RDNA4PvHost::answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd) {
 	const uint8_t *pl = cmd + c.payloadOffset;
 	const uint32_t plen = c.length - c.payloadOffset;
