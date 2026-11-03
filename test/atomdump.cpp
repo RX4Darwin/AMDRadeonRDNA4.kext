@@ -1676,54 +1676,65 @@ static int testPipe2Table() {
 	failures += check(requires == 5, "pipe2: %zu requirements, expected 5", requires);
 
 	if (!c.dp) {
-	// A sink with SCDC is told the link is not scrambled (148.5 MHz), before
-	// the transmitter is enabled; one without is left alone (above).
+	// A sink with SCDC is told whether the link is scrambled (above 340 MHz:
+	// scrambling and the 1/40 clock ratio, 3), last before the transmitter is
+	// enabled; one without is left alone (above).
+	const uint32_t scrambled = c.timing.pixelClockKHz > ModeSet::kScrambleFromKHz ? 3 : 0;
 	Pipe2::Target scdc = t;
 	scdc.sinkScdc = true;
 	scdc.ddcLine = kDdcLine;
 	bool told = false, before = false;
+	size_t scdcSteps = 0;
 	if (Pipe2::build(scdc, stream, &why))
 		for (size_t i = 0; i < stream.count; i++) {
 			const ModeSet::Step &s = stream.steps[i];
-			if (s.op == ModeSet::Op::Scdc)
-				told = s.value == 0 && s.arg == kDdcLine && !before;
+			if (s.op == ModeSet::Op::Scdc) {
+				scdcSteps++;
+				told = s.value == scrambled && s.arg == kDdcLine && !before;
+			}
 			before = before || (s.op == ModeSet::Op::Dmub && s.arg == 2);
 		}
-	failures += check(told && stream.count == plan.count + 1, "pipe2: SCDC step for a sink with SCDC: %d, %zu steps",
-	                  told, stream.count);
+	failures += check(told && scdcSteps >= 1 && stream.count == plan.count + scdcSteps,
+	                  "pipe2: SCDC step for a sink with SCDC: %d, %zu steps", told, stream.count);
 
 	// The three kinds of DMUB command, as amdgpu sends them for OTG1 on the link's PLL, with its UNIPHY encoder object.
 	failures += check(plan.ncmds == 4, "pipe2: %zu DMUB commands, expected 4", plan.ncmds);
 	if (plan.ncmds == 4) {
 		const Dmub::Cmd &pll = plan.cmds[0], &enc = plan.cmds[1], &on = plan.cmds[2], &enc2 = plan.cmds[3];
-		failures += check(pll[0] == 0x10000280 && pll[1] == 1485000 &&
+		const uint32_t khz = c.timing.pixelClockKHz;
+		failures += check(pll[0] == 0x10000280 && pll[1] == khz * 10 &&
 		                  pll[2] == (0x00030014u + c.link + ((kEncoderObj & 0xffu) << 8)) &&
 		                  (pll[3] & 0xffff) == c.pipe,
 		                  "pipe2: set pixel clock %08x %08x %08x %08x", pll[0], pll[1], pll[2], pll[3]);
-		failures += check(enc[0] == 0x0c000080 && enc[1] == (0x04030f00u | c.dig) && enc[2] == 14850 &&
+		failures += check(enc[0] == 0x0c000080 && enc[1] == (0x04030f00u | c.dig) && enc[2] == khz / 10 &&
 		                  memcmp(enc, enc2, sizeof(Dmub::Cmd)) == 0,
 		                  "pipe2: stream setup %08x %08x %08x", enc[0], enc[1], enc[2]);
-		failures += check(on[0] == 0x3c000180 && on[1] == (0x04030100u | c.link) && on[2] == 14850 && (on[3] & 0xff) == c.hpd,
+		failures += check(on[0] == 0x3c000180 && on[1] == (0x04030100u | c.link) && on[2] == khz / 10 && (on[3] & 0xff) == c.hpd,
 		                  "pipe2: transmitter enable %08x %08x %08x %08x", on[0], on[1], on[2], on[3]);
 	}
 	}
 
-	// What the registers hold afterwards: timing of VIC 16, the surface, the
-	// blender feeding the pipe's OPP from its DPP, the OTG enabled and the
-	// lock released (names are pipe 1's, addresses the plan's pipe's).
+	// What the registers hold afterwards: the plan's timing (VIC 16 or 97), the
+	// surface, the blender feeding the pipe's OPP from its DPP, the OTG enabled
+	// and the lock released (names are pipe 1's, addresses the plan's pipe's).
+	// Blank is end << 16 | start: sync and back porch, total less front porch.
 	PlanRegs regs;
 	regs.run(plan);
+	const Edid::DetailedTiming &pt = c.timing;
+	const uint32_t hBlank = uint32_t(pt.hBlank - pt.hSyncOffset) << 16 | (pt.hTotal() - pt.hSyncOffset);
+	const uint32_t vBlank = uint32_t(pt.vBlank - pt.vSyncOffset) << 16 | (pt.vTotal() - pt.vSyncOffset);
+	const uint32_t size = uint32_t(pt.vActive) << 16 | pt.hActive;
 	struct { uint8_t seg; uint32_t dw, mask, want; const char *name; } after[] = {
-		{ 2, 0x1baa + dp1 * 0x80, 0xffffffff, 2199, "OTG1 h total" },         { 2, 0x1baf + dp1 * 0x80, 0xffffffff, 1124, "OTG1 v total" },
-		{ 2, 0x1bab + dp1 * 0x80, 0x7fff7fff, 0x00c00840, "OTG1 h blank" },   { 2, 0x1bb8 + dp1 * 0x80, 0x7fff7fff, 0x00290461, "OTG1 v blank" },
+		{ 2, 0x1baa + dp1 * 0x80, 0xffffffff, pt.hTotal() - 1, "OTG1 h total" }, { 2, 0x1baf + dp1 * 0x80, 0xffffffff, pt.vTotal() - 1, "OTG1 v total" },
+		{ 2, 0x1bab + dp1 * 0x80, 0x7fff7fff, hBlank, "OTG1 h blank" },         { 2, 0x1bb8 + dp1 * 0x80, 0x7fff7fff, vBlank, "OTG1 v blank" },
 		{ 2, 0x1c05 + dp1 * 0x80, 0x3ff, c.vstartup, "OTG1 vstartup" },       { 2, kOtgCtl, 0x1, 0x1, "OTG1 master enable" },
 		{ 2, 0x1c09 + dp1 * 0x80, 0x1, 0x0, "OTG1 update lock released" },    { 2, 0x1adb + dp1 * 0x10, 0xf0000, uint32_t(c.pipe) << 16, "ODM1 source OPP1" },
 		{ 2, kSurfLo, 0xffffffff, 0x02100000, "surface low" },    { 2, 0x06e7 + dp1 * 0xdc, 0xffffffff, 0x80, "surface high" },
-		{ 2, kPitch, 0xffff, 1919, "pitch" },                    { 2, 0x06c7 + dp1 * 0xdc, 0xffffffff, 0x04380780, "viewport" },
+		{ 2, kPitch, 0xffff, pt.hActive - 1u, "pitch" },         { 2, 0x06c7 + dp1 * 0xdc, 0xffffffff, size, "viewport" },
 		// The scaler's output rectangle and the blender's size: 0x0 (a table generated
 		// without Linux's scaler library) lights the plane and shows black, as on the
 		// card on 2026-10-04.
-		{ 2, 0x0e8a + dp1 * 0x16b, 0xffffffff, 0x04380780, "DSCL1 recout size" }, { 2, 0x0e8b + dp1 * 0x16b, 0xffffffff, 0x04380780, "DSCL1 MPC size" },
+		{ 2, 0x0e8a + dp1 * 0x16b, 0xffffffff, size, "DSCL1 recout size" }, { 2, 0x0e8b + dp1 * 0x16b, 0xffffffff, size, "DSCL1 MPC size" },
 		{ 3, 0x0015 + dp1 * 0x15, 0xf, uint32_t(c.pipe), "MPCC1 top = DPP1" },               { 3, 0x0017 + dp1 * 0x15, 0xf, uint32_t(c.pipe), "MPCC1 OPP id" },
 		{ 3, 0x02f6 + dp1 * 0x4, 0xf, uint32_t(c.pipe), "OPP1 out mux = MPCC1" },           { 2, 0x18ae + dp1 * 0x5a, 0x1, 0, "DPG1 off (video)" },
 		{ 2, kFeEn, 0x1, 1, "DIG front-end enabled" },           { 2, kBeEn, 0x1, 1, "DIG back-end enabled" },
@@ -1732,7 +1743,7 @@ static int testPipe2Table() {
 		// HDMI: the PHY's clock / 4. DisplayPort: the pixel-rate DTO, in Hz against the 720 MHz reference
 		// (how the firmware programs the boot display's), with no integer part.
 		{ 1, 0x006f, c.dp ? 0xfu << (1 + 5 * c.pipe) : 1u << (5 * c.pipe), c.dp ? 0 : 1u << (5 * c.pipe), "OTG1 pixel rate divider" },
-		{ 1, 0x0085 + dp1 * 4, c.dp ? 0xffffffffu : 0, c.dp ? 148500000u : 0, "DP_DTO1 phase" },
+		{ 1, 0x0085 + dp1 * 4, c.dp ? 0xffffffffu : 0, c.dp ? pt.pixelClockKHz * 1000 : 0, "DP_DTO1 phase" },
 		{ 1, 0x0086 + dp1 * 4, c.dp ? 0xffffffffu : 0, c.dp ? 720000000u : 0, "DP_DTO1 modulo" },
 	};
 	for (const auto &e : after)
@@ -1767,6 +1778,9 @@ static int testPipe2Table() {
 	mt.encoderObjId = kEncoderObj;
 	mt.connectorObjId = 0x330c;
 	mt.extra = extra;
+	// A sink a pipe is lit at 3840x2160 for has SCDC.
+	mt.sinkScdc = Pipe2::isUhd(c);
+	mt.ddcLine = kDdcLine;
 	size_t nmodes = 0;
 	const Edid::DetailedTiming *known = Pipe2::knownModes(nmodes);
 	// From `from` (the registers in `r`) to `to`; the number of registers that do not end as Linux has them.
@@ -2061,8 +2075,9 @@ static int testPipe2Table() {
 				w[n++ % 9] = p.steps[i].value;     // the last infoframe of the plan
 		return n;
 	};
+	const bool uhd = Pipe2::isUhd(c);
 	struct { Edid::DetailedTiming t; uint32_t w[4]; } avi[] = {
-		{ c.timing,                                                           { 0x88281e86, 0x10, 0x466, 0x899 } },
+		{ c.timing, { uhd ? 0x88281e2b : 0x88281e86, uhd ? 0x61u : 0x10u, uhd ? 0x8cbu : 0x466u, uhd ? 0x1131u : 0x899u } },
 		{ { 108000, 1600, 200, 24, 80, 900, 100, 1, 3, true, true, false },   { 0x88281ea5, 0x00, 0x3e9, 0x709 } },
 		{ { 74250, 1280, 370, 110, 40, 720, 30, 5, 5, true, true, false },    { 0x88281e33, 0x04, 0x2ef, 0x673 } },
 		{ { 108000, 1280, 408, 48, 112, 1024, 42, 1, 3, true, true, false },  { 0x88081ef3, 0x00, 0x42b, 0x699 } },
@@ -2084,15 +2099,21 @@ static int testPipe2Table() {
 		                  "pipe2: AVI infoframe for %ux%u at %u kHz: %08x %08x %08x %08x, Linux sends %08x %08x %08x %08x",
 		                  a.t.hActive, a.t.vActive, a.t.pixelClockKHz, w[1], w[2], w[3], w[4], a.w[0], a.w[1], a.w[2], a.w[3]);
 	}
-	// Sleep and wake after a switch carry the running pixel clock, not the plan's.
+	// Sleep and wake after a switch carry the running pixel clock, not the
+	// plan's; on the plan's side of 340 MHz only (the scrambler is the plan's).
 	power.now = avi[1].t;
 	power.part = Pipe2::Part::Sleep;
-	failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 1 && dpms.cmds[0][1] == 1080000,
-	                  "pipe2: sleep at 108 MHz sets the pixel clock to %u x 100 Hz", dpms.cmds[0][1]);
-	power.part = Pipe2::Part::Wake;
-	failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 3 && dpms.cmds[0][2] == 10800 &&
-	                  dpms.cmds[1][2] == 10800, "pipe2: wake at 108 MHz: encoder %u, transmitter %u x 10 kHz",
-	                  dpms.cmds[0][2], dpms.cmds[1][2]);
+	if (uhd) {
+		failures += check(!Pipe2::build(power, dpms, &why),
+		                  "pipe2: a 3840x2160 plan builds sleep for 108 MHz, below the scrambling threshold");
+	} else {
+		failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 1 && dpms.cmds[0][1] == 1080000,
+		                  "pipe2: sleep at 108 MHz sets the pixel clock to %u x 100 Hz", dpms.cmds[0][1]);
+		power.part = Pipe2::Part::Wake;
+		failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 3 && dpms.cmds[0][2] == 10800 &&
+		                  dpms.cmds[1][2] == 10800, "pipe2: wake at 108 MHz: encoder %u, transmitter %u x 10 kHz",
+		                  dpms.cmds[0][2], dpms.cmds[1][2]);
+	}
 	const size_t modeMismatch = modeSwitches(lit);
 	failures += static_cast<int>(modeMismatch);
 
@@ -2564,7 +2585,7 @@ static int testN48N() {
 static int testPipe2() {
 	int failures = 0;
 	const uint8_t first = Pipe2::config().hpd;
-	failures += check(Pipe2::configCount() == 18 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
+	failures += check(Pipe2::configCount() == 24 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
 	                  Pipe2::config().hpd == first,
 	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
 	// A DisplayPort connector has its DisplayPort table and an HDMI one (a passive DP++ adapter); an HDMI
@@ -2581,11 +2602,34 @@ static int testPipe2() {
 	failures += check(Pipe2::hasDpTable(1) && Pipe2::hasDpTable(2) && !Pipe2::hasDpTable(3) &&
 	                  !Pipe2::hasDpTable(4) && !Pipe2::hasDpTable(5),
 	                  "pipe2: DisplayPort connectors on HPD1 and HPD2 only");
+	// The HDMI connectors have a table lit at CEA 3840x2160@60 on each pipe, taken only when asked for.
+	// A switch down from 3840x2160 leaves the scrambler to the mode set: a mode
+	// table row of the lit mode must not turn it on again (the TV, 2026-11-03).
+	{
+		static ModeSet::Step steps[Pipe2::kMaxModeSteps];
+		const Edid::DetailedTiming fhd { 148500, 1920, 280, 88, 44, 1080, 45, 4, 5, true, true, false };
+		size_t scramblerWrites = 0;
+		Pipe2::use(3, false, 2, true);
+		const size_t n = Pipe2::modeSteps(fhd, steps, Pipe2::kMaxModeSteps);
+		for (size_t i = 0; i < n; i++)
+			scramblerWrites += steps[i].seg == 2 && steps[i].dword == 0x209e + 2 * 0x124u && (steps[i].mask & 0x6);
+		failures += check(n > 0 && scramblerWrites == 0, "pipe2: a switch from 3840x2160 to 1080p writes the "
+		                  "scrambler bits %zu time(s)", scramblerWrites);
+	}
+	failures += check(Pipe2::hasUhdTable(3) && Pipe2::hasUhdTable(4) && !Pipe2::hasUhdTable(1) &&
+	                  !Pipe2::hasUhdTable(2) && Pipe2::use(3, false, 2) && !Pipe2::isUhd(Pipe2::config()) &&
+	                  Pipe2::use(3, false, 2, true) && Pipe2::config().pipe == 2 && Pipe2::config().dig == 2 &&
+	                  Pipe2::config().timing.hActive == 3840 && Pipe2::config().timing.vActive == 2160 &&
+	                  Pipe2::config().timing.pixelClockKHz == 594000 && Edid::vicOf(Pipe2::config().timing) == 97 &&
+	                  Pipe2::config().detSegments == 10 && Pipe2::use(4, false, 3, true) &&
+	                  Pipe2::config().link == 3 && !Pipe2::use(1, true, 1, true),
+	                  "pipe2: 3840x2160@60 tables for the HDMI connectors");
 
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
 		const Pipe2::Config &c = Pipe2::configAt(i);
-		failures += check(Pipe2::use(c.hpd, !c.dp, c.pipe) && Pipe2::config().hpd == c.hpd &&
-		                  Pipe2::config().dp == c.dp && Pipe2::config().pipe == c.pipe,
+		failures += check(Pipe2::use(c.hpd, !c.dp, c.pipe, Pipe2::isUhd(c)) && Pipe2::config().hpd == c.hpd &&
+		                  Pipe2::config().dp == c.dp && Pipe2::config().pipe == c.pipe &&
+		                  Pipe2::config().timing.pixelClockKHz == c.timing.pixelClockKHz,
 		                  "pipe2: no %s table for HPD%u on pipe %u", c.dp ? "DisplayPort" : "HDMI", c.hpd, c.pipe);
 		failures += testPipe2Table();
 	}

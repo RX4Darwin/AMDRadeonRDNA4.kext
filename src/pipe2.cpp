@@ -107,6 +107,26 @@ namespace P3Hpd2Tmds {
 #include "pipe2_linux_p3_dp2_tmds.inc"
 }
 
+// The HDMI connectors lit at 3840x2160@60, for each pipe.
+namespace P1Hpd3Uhd {
+#include "pipe2_linux_p1_hpd3_uhd.inc"
+}
+namespace P1Hpd4Uhd {
+#include "pipe2_linux_p1_hpd4_uhd.inc"
+}
+namespace P2Hpd3Uhd {
+#include "pipe2_linux_p2_hpd3_uhd.inc"
+}
+namespace P2Hpd4Uhd {
+#include "pipe2_linux_p2_hpd4_uhd.inc"
+}
+namespace P3Hpd3Uhd {
+#include "pipe2_linux_p3_hpd3_uhd.inc"
+}
+namespace P3Hpd4Uhd {
+#include "pipe2_linux_p3_hpd4_uhd.inc"
+}
+
 struct Table {
 	const Config               &config;
 	const Gen                  *gen;        // the plan
@@ -154,10 +174,29 @@ constexpr Table kTables[] = {
 	      countOf(P3Hpd2::kAux)),
 	table(P3Hpd1Tmds::kConfig, P3Hpd1Tmds::kGen, P3Hpd1Tmds::kModeRegs, P3Hpd1Tmds::kModeTimings, P3Hpd1Tmds::kModeValues),
 	table(P3Hpd2Tmds::kConfig, P3Hpd2Tmds::kGen, P3Hpd2Tmds::kModeRegs, P3Hpd2Tmds::kModeTimings, P3Hpd2Tmds::kModeValues),
+	table(P1Hpd3Uhd::kConfig, P1Hpd3Uhd::kGen, P1Hpd3Uhd::kModeRegs, P1Hpd3Uhd::kModeTimings, P1Hpd3Uhd::kModeValues),
+	table(P1Hpd4Uhd::kConfig, P1Hpd4Uhd::kGen, P1Hpd4Uhd::kModeRegs, P1Hpd4Uhd::kModeTimings, P1Hpd4Uhd::kModeValues),
+	table(P2Hpd3Uhd::kConfig, P2Hpd3Uhd::kGen, P2Hpd3Uhd::kModeRegs, P2Hpd3Uhd::kModeTimings, P2Hpd3Uhd::kModeValues),
+	table(P2Hpd4Uhd::kConfig, P2Hpd4Uhd::kGen, P2Hpd4Uhd::kModeRegs, P2Hpd4Uhd::kModeTimings, P2Hpd4Uhd::kModeValues),
+	table(P3Hpd3Uhd::kConfig, P3Hpd3Uhd::kGen, P3Hpd3Uhd::kModeRegs, P3Hpd3Uhd::kModeTimings, P3Hpd3Uhd::kModeValues),
+	table(P3Hpd4Uhd::kConfig, P3Hpd4Uhd::kGen, P3Hpd4Uhd::kModeRegs, P3Hpd4Uhd::kModeTimings, P3Hpd4Uhd::kModeValues),
 };
 constexpr size_t kTableCount = sizeof(kTables) / sizeof(kTables[0]);
 
 const Table *cur = &kTables[0];   // the table in use (use())
+
+// DIGn_HDMI_CONTROL: DATA_SCRAMBLE_EN and CLOCK_CHANNEL_RATE are the mode
+// set's to write for the mode it switches to (ModeSet, "hdmi scrambler").
+constexpr uint32_t kHdmiControl = 0x209e, kDigStride = 0x124, kHdmiScrambler = 0x6;
+
+// What a mode-table register may write for a switch: all of its mask but the
+// scrambler bits, which a row of another mode would set for that mode.
+uint32_t applyMask(const ModeReg &r) {
+	if (r.seg == 2 && r.dword == kHdmiControl + cur->config.dig * kDigStride)
+		return r.mask & ~kHdmiScrambler;
+
+	return r.mask;
+}
 
 // Row of a timing in the mode table, or -1.
 int modeRow(const Edid::DetailedTiming &t) {
@@ -189,11 +228,11 @@ const Config &config() { return cur->config; }
 size_t configCount() { return kTableCount; }
 const Config &configAt(size_t i) { return kTables[i].config; }
 
-bool use(uint8_t hpd, bool tmds, uint8_t pipe) {
+bool use(uint8_t hpd, bool tmds, uint8_t pipe, bool uhd) {
 	const Table *fallback = nullptr;
 
 	for (const Table &t : kTables) {
-		if (t.config.hpd != hpd || t.config.pipe != pipe)
+		if (t.config.hpd != hpd || t.config.pipe != pipe || isUhd(t.config) != uhd)
 			continue;
 
 		if (t.config.dp != tmds) {
@@ -210,6 +249,17 @@ bool use(uint8_t hpd, bool tmds, uint8_t pipe) {
 
 	cur = fallback;
 	return true;
+}
+
+bool isUhd(const Config &c) { return c.timing.hActive >= kUhdWidth; }
+
+bool hasUhdTable(uint8_t hpd) {
+	for (const Table &t : kTables) {
+		if (t.config.hpd == hpd && isUhd(t.config))
+			return true;
+	}
+
+	return false;
 }
 
 bool hasDpTable(uint8_t hpd) {
@@ -245,9 +295,11 @@ size_t modeSteps(const Edid::DetailedTiming &to, ModeSet::Step *out, size_t cap,
 	for (size_t i = 0; i < cur->nregs && n < cap; i++) {
 		const ModeReg &r = cur->regs[i];
 		// Row 0 is the mode the pipe was lit in.
-		if (which == ModeRegs::All || r.who == 'D' || (r.who == 'S' && row >= 0))
-			out[n++] = ModeSet::Step { ModeSet::Op::Update, r.seg, false, r.dword, r.mask,
-			                           cur->values[(row < 0 ? 0 : row) * cur->nregs + i], 0, r.name };
+		if (which == ModeRegs::All || r.who == 'D' || (r.who == 'S' && row >= 0)) {
+			const uint32_t mask = which == ModeRegs::All ? r.mask : applyMask(r);
+			const uint32_t value = cur->values[(row < 0 ? 0 : row) * cur->nregs + i];
+			out[n++] = ModeSet::Step { ModeSet::Op::Update, r.seg, false, r.dword, mask, value & mask, 0, r.name };
+		}
 	}
 	return n;
 }
@@ -273,8 +325,9 @@ bool build(const Target &t, Plan &out, const char **why) {
 	const bool moved = t.part != Part::Light && t.now.pixelClockKHz;
 	const Edid::DetailedTiming &timing = moved ? t.now : c.timing;
 	const uint32_t khz = timing.pixelClockKHz;
-	// The scrambler setting in these parts is the plan's.
-	if (!c.dp && (khz > ModeSet::kScrambleFromKHz) != (c.timing.pixelClockKHz > ModeSet::kScrambleFromKHz)) {
+	// The scrambler setting in sleep and wake is the plan's (the infoframe has none).
+	if (!c.dp && t.part != Part::Avi &&
+	    (khz > ModeSet::kScrambleFromKHz) != (c.timing.pixelClockKHz > ModeSet::kScrambleFromKHz)) {
 		err = "sleep and wake are generated for the plan's side of 340 MHz";
 		return false;
 	}

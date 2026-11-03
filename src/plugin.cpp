@@ -355,6 +355,10 @@ struct Head2 {
 	uint32_t         hpdSame { 0 };         // polls it has read that way
 	uint32_t         hpdGone { 0 };         // polls it has been low with the link up
 	bool             hpdBack { false };     // it came back from a second or more of low with the head connected
+	// Its display can be lit at 3840x2160 once the compute bring-up has raised the display clocks: it waits
+	// offline for that, then is plugged in (or after kClockWaitPolls at the size it can have).
+	bool             waitClocks { false };
+	uint32_t         waitPolls { 0 };
 };
 #define HLOG(h, fmt, ...)  FBLOG("head%u: " fmt, static_cast<unsigned>((h)->slot + 2), ## __VA_ARGS__)
 // One per display beside the boot one (rdna4-heads): heads 2, 3 and 4.
@@ -455,17 +459,13 @@ void createHeads(IOPCIDevice *pci) {
 		createHead(pci, i);
 }
 
-// Where head h's surface may start: behind the console and the surfaces of
-// the heads before it.
+// Where head h's surface may start: behind the console, in a slot of its own
+// that holds the largest mode a pipe is lit at (3840x2160, 31.6 MiB) and the
+// gap Ndrv::spareSurface leaves, so a head can grow without moving another.
+constexpr uint64_t kHeadSlotBytes = 34ull << 20;
+
 uint64_t surfaceFloor(const Head2 *h, const RDNA4Device &dev) {
-	uint64_t floor = dev.fbPhysBase + dev.fbLength;
-	for (size_t i = 0; i < headCount && heads[i] != h; i++) {
-		const Ndrv::Surface &s = heads[i]->surface;
-		const uint64_t end = s.physBase + static_cast<uint64_t>(s.rowBytes) * s.height;
-		if (s.height && end > floor)
-			floor = end;
-	}
-	return floor;
+	return dev.fbPhysBase + dev.fbLength + h->slot * kHeadSlotBytes;
 }
 
 // Once head 0's device exists: what head 2 serves.
@@ -494,6 +494,26 @@ const Modes::Mode *head2BuildTable(Head2 *h, RDNA4Device &dev, size_t &n) {
 			return &h->table[i];
 	}
 	return nullptr;
+}
+
+// WindowServer maps a framebuffer through getVRAMRange, which IONDRVFramebuffer
+// only has for an IOBootNDRV: without this it gives up on the head with
+// "Failed to map VRAM" (card boot of 2026-10-03, 19:46). The range is the
+// largest surface the head's slot holds: the framebuffer maps it once, so a
+// head lit at 3840x2160 after waiting offline with a 1080p surface showed
+// only the top of the picture (the TV, 2026-11-03).
+constexpr uint64_t kHeadSurfaceMaxBytes = 3840ull * 4 * 2160;
+static_assert(kHeadSurfaceMaxBytes + (2ull << 20) <= kHeadSlotBytes, "a 3840x2160 surface fits a head's slot");
+
+void head2MapSurface(Head2 *h) {
+	const uint64_t bytes = static_cast<uint64_t>(h->surface.rowBytes) * h->surface.height;
+	IODeviceMemory *old = h->vram;
+
+	h->vram = IODeviceMemory::withSubRange(h->range, h->surface.physBase - h->rangeBase,
+	                                       bytes > kHeadSurfaceMaxBytes ? bytes : kHeadSurfaceMaxBytes);
+	OSSafeReleaseNULL(old);
+	if (!h->vram)
+		HLOG(h, "no VRAM range for the surface: WindowServer will not map it");
 }
 
 // Hand the table to the translator, with `mode` as the one the head is in.
@@ -547,11 +567,16 @@ void fillHead(Head2 *h, RDNA4Device &dev) {
 	// For a pipe to light, a second display counts if it is on a connector
 	// there is a plan for.
 	const bool sink = dev.xp().edidLen && (head2Level < 2 || dev.usePlanFor(dev.xp().hpd));
-	const bool offline = head2Level >= 2 && !sink && hotplugLevel >= 2;
+	h->waitClocks = head2Level >= 2 && sink && hotplugLevel >= 2 && computeStage >= RDNA4Compute::StageGfx &&
+	                !dev.uhdClocks && dev.sinkTakesUhd(dev.xp().hpd);
+	const bool offline = (head2Level >= 2 && !sink && hotplugLevel >= 2) || h->waitClocks;
 	const Modes::Mode *mode = nullptr;
 	size_t n = 0;
 	if (offline) {
-		if (dev.xp().edidLen)
+		if (h->waitClocks)
+			HLOG(h, "the display on HPD%u takes 3840x2160: the head waits offline for the display clocks",
+			      dev.xp().hpd);
+		else if (dev.xp().edidLen)
 			HLOG(h, "the display on HPD%u is not served: no second-pipe plan for that connector (a "
 			      "DisplayPort one needs rdna4-head2dp=1); the head waits offline", dev.xp().hpd);
 		// The one mode the pipe will be lit in, on its surface; no EDID.
@@ -597,13 +622,7 @@ void fillHead(Head2 *h, RDNA4Device &dev) {
 	head2Init(h, dev, mode, n);
 	h->connected = !offline;
 	h->ndrv.setConnected(h->connected);
-	// WindowServer maps a framebuffer through getVRAMRange, which IONDRVFramebuffer
-	// only has for an IOBootNDRV: without this it gives up on the head with
-	// "Failed to map VRAM" (card boot of 2026-10-03, 19:46).
-	h->vram = IODeviceMemory::withSubRange(h->range, h->surface.physBase - h->rangeBase,
-	                                       static_cast<uint64_t>(h->surface.rowBytes) * h->surface.height);
-	if (!h->vram)
-		HLOG(h, "no VRAM range for the surface: WindowServer will not map it");
+	head2MapSurface(h);
 	h->ready = true;
 	HLOG(h, "serving %ux%u@%u.%03u on surface 0x%llx, %s", mode->t.hActive,
 	      mode->t.vActive, mode->refreshMilliHz / 1000, mode->refreshMilliHz % 1000, h->surface.physBase,
@@ -682,6 +701,7 @@ void head2Plugged(Head2 *h, uint8_t hpd) {
 		HLOG(h, "hotplug: the pipe did not come up: the display stays offline");
 		return;
 	}
+	head2MapSurface(h);
 	head2Init(h, dev, mode, n);
 	h->connected = true;
 	h->ndrv.setConnected(true);
@@ -700,6 +720,24 @@ void head2Unplugged(Head2 *h) {
 }
 
 constexpr uint32_t kHpdPollMs = 500;
+
+// A minute for the compute bring-up to raise the display clocks.
+constexpr uint32_t kClockWaitPolls = 60000 / kHpdPollMs;
+
+// Whether a head waiting for the display clocks can be plugged in now.
+bool clocksSettled(Head2 *h, const RDNA4Device &dev) {
+	if (dev.uhdClocks) {
+		HLOG(h, "display clocks raised: lighting the display");
+		return true;
+	}
+
+	if (++h->waitPolls < kClockWaitPolls)
+		return false;
+
+	HLOG(h, "display clocks not raised after a minute: lighting the display at the size it can have");
+
+	return true;
+}
 
 void hotplugPoll(OSObject *owner, IOTimerEventSource *timer) {
 	Head2 *h = headFor(owner);
@@ -723,10 +761,16 @@ void hotplugPoll(OSObject *owner, IOTimerEventSource *timer) {
 	// Low only counts while the link is up: a monitor that macOS has put to
 	// sleep may drop the pin, and takes a while to raise it again on waking.
 	h->hpdGone = present || !dev.xp().on ? 0 : h->hpdGone + 1;
+	if (h->waitClocks && clocksSettled(h, dev)) {
+		h->waitClocks = false;
+		if (present && !h->connected)
+			head2Plugged(h, hpd);
+	}
 	if (hotplugLevel >= 2) {
 		// A second of high, and again after 3 and 7 s if the display's EDID
 		// was not there yet; three seconds of low.
-		if (!h->connected && present && (h->hpdSame == 2 || h->hpdSame == 6 || h->hpdSame == 14))
+		if (!h->connected && !h->waitClocks && present &&
+		    (h->hpdSame == 2 || h->hpdSame == 6 || h->hpdSame == 14))
 			head2Plugged(h, hpd);
 		// Six seconds on DisplayPort: the test monitor drops its pin for up to
 		// 3.7 s on waking from display sleep (card, 2026-10-06). A shorter

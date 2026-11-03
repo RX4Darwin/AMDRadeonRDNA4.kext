@@ -144,6 +144,12 @@ if [ $# -eq 0 ]; then
 		table pipe2_linux_p${p}_dp1_tmds.inc   dpdual  $p 0 0 1  1920 88 44 148  1080 4 5 36  148500 1 1 16
 		table pipe2_linux_p${p}_dp2_tmds.inc   dpdual  $p 1 1 2  1920 88 44 148  1080 4 5 36  148500 1 1 16
 	done
+	# The HDMI connectors again, each pipe lit at CEA 3840x2160@60 (VIC 97): an HDMI 2.0 sink, scrambled, with
+	# DISPCLK raised (src/clk.cpp). The pipe is lit at its largest mode, so a 4K display needs its own table.
+	for p in 1 2 3; do
+		table pipe2_linux_p${p}_hpd3_uhd.inc   $p 2 2 3  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		table pipe2_linux_p${p}_hpd4_uhd.inc   $p 3 3 4  3840 176 88 296  2160 8 10 72  594000 1 1 97
+	done
 else
 	table pipe2_linux.inc "$@"
 fi

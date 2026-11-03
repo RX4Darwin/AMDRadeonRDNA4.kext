@@ -3047,18 +3047,57 @@ void RDNA4Device::selectExtra(size_t slot) {
 	extraSlot = slot;
 	// Its connector's table, or until it has a sink its pipe's first.
 	const ExtraPipe &x = xp();
-	if (!x.hpd || !Pipe2::use(x.hpd, dpDual(x.hpd), x.pipe))
+	if (!x.hpd || !Pipe2::use(x.hpd, dpDual(x.hpd), x.pipe, x.uhd))
 		Pipe2::use(3, false, x.pipe);
+}
+
+/* The 3840x2160 table of the connector on that pin, or nullptr. */
+static const Pipe2::Config *uhdConfigFor(uint8_t hpd)
+{
+	for (size_t i = 0; i < Pipe2::configCount(); i++) {
+		const Pipe2::Config &c = Pipe2::configAt(i);
+
+		if (c.hpd == hpd && Pipe2::isUhd(c))
+			return &c;
+	}
+
+	return nullptr;
+}
+
+/* Whether the pipe's sink, on that pin, can be lit at 3840x2160. */
+bool RDNA4Device::sinkTakesUhd(uint8_t hpd) const
+{
+	const Pipe2::Config *c = uhdConfigFor(hpd);
+	const size_t bytes = sizeof(Modes::Mode) * Modes::MaxModes;
+	Modes::Mode *modes;
+	size_t n;
+	bool found;
+
+	if (!c || dpDual(hpd) || !Edid::hdmi2Caps(xp().edid, xp().edidLen).scdc)
+		return false;
+
+	modes = static_cast<Modes::Mode *>(IOMalloc(bytes));
+	if (!modes)
+		return false;
+
+	n = Modes::build(xp().edid, xp().edidLen, Modes::Limits {}, modes, Modes::MaxModes);
+	found = Modes::match(modes, n, c->timing) >= 0;
+	IOFree(modes, bytes);
+
+	return found;
 }
 
 bool RDNA4Device::usePlanFor(uint8_t hpd) {
 	const Pipe2::Config was = Pipe2::config();
-	if (!Pipe2::use(hpd, dpDual(hpd), xp().pipe))
+	// A lit pipe keeps the size it is lit at.
+	const bool uhd = xp().lit ? xp().uhd : uhdClocks && sinkTakesUhd(hpd);
+	if (!Pipe2::use(hpd, dpDual(hpd), xp().pipe, uhd))
 		return false;
 	if (Pipe2::config().dp && !pipe2DpAllowed) {
-		Pipe2::use(was.hpd, !was.dp, xp().pipe);
+		Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was));
 		return false;
 	}
+	xp().uhd = uhd;
 	return true;
 }
 
@@ -3126,16 +3165,16 @@ bool RDNA4Device::secondPipeTo(uint8_t hpd) {
 		if (!ok) {
 			FBLOG("pipe2: not moved from HPD%u to HPD%u: only between connectors with an HDMI "
 			      "stream the boot display does not use", was.hpd, hpd);
-			Pipe2::use(was.hpd, !was.dp, xp().pipe);
+			Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was));
 			return false;
 		}
 		FBLOG("pipe2: moving from HPD%u (DIG%u, link %u) to HPD%u (DIG%u, link %u) at %ux%u, %u kHz", was.hpd,
 		      was.dig, was.link, to.hpd, to.dig, to.link, xp().target.now.hActive, xp().target.now.vActive,
 		      xp().target.now.pixelClockKHz);
 		if (xp().on) {   // the old link down first, by its own table
-			Pipe2::use(was.hpd, !was.dp, xp().pipe);
+			Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was));
 			runSecondPipePart(Pipe2::Part::Sleep);
-			Pipe2::use(hpd, !to.dp, xp().pipe);
+			Pipe2::use(hpd, !to.dp, xp().pipe, Pipe2::isUhd(to));
 			xp().on = false;
 		}
 		xp().target.encoderObjId = path.encoderObjId;
@@ -3287,9 +3326,11 @@ Modes::Limits RDNA4Device::secondPipeModeLimits() const {
 	lim.maxHActive = plan.hActive;
 	lim.maxVActive = plan.vActive;
 	// On DisplayPort, what the sink's largest link carries at 8 bpc.
+	// On HDMI, TMDS without scrambling, or HDMI 2.0's 600 MHz for a pipe lit at
+	// 3840x2160 (its sink has SCDC).
 	lim.maxPixelClockKHz = Pipe2::config().dp
 		? DpTrain::bandwidthKbps(DpTrain::Link { xp().sink.maxLanes, xp().sink.maxRate }) / 24
-		: ModeSet::kScrambleFromKHz;
+		: Pipe2::isUhd(Pipe2::config()) ? ModeSet::kMaxTmdsKHz : ModeSet::kScrambleFromKHz;
 
 	// Behind a passive DP++ adapter, what the adapter carries.
 	const uint32_t adaptorKHz = dpDualMaxKHz(Pipe2::config().hpd);

@@ -70,6 +70,7 @@ public:
 		uint16_t      connectorObjId { 0 };
 		bool          lit { false }, on { false };
 		bool          moveOwed { false };  // secondPipeTo: the move to the connector in use has not completed
+		bool          uhd { false };       // its table lights it at 3840x2160 (Pipe2::isUhd)
 		// On DisplayPort: the sink's AUX channel and capabilities (read with
 		// its EDID), and the link picked for the mode it is to carry.
 		uint8_t       aux { 0 };
@@ -157,7 +158,11 @@ public:
 	// Take the second-pipe plan for a connector. A DisplayPort one only with
 	// rdna4-head2dp=1: lighting a second display over DisplayPort has not run
 	// on the card yet (docs/todo-dptest.md), the HDMI plans have.
+	// An HDMI connector's 3840x2160 plan is taken once the display clocks are
+	// raised for it (uhdClocks), if the sink has SCDC and the plan's mode.
 	bool usePlanFor(uint8_t hpd);
+	bool sinkTakesUhd(uint8_t hpd) const;
+	volatile bool uhdClocks { false };   // set by smuStarted, on the compute thread
 	bool pipe2DpAllowed { false };
 	bool readSecondEdid(uint8_t hpd);
 	// Display sleep and wake of the pipe lightSecondPipe lit, as amdgpu does
@@ -220,8 +225,8 @@ public:
 	IOReturn setHardwareCursor(void *cursorRef);
 	IOReturn drawHardwareCursor(int32_t x, int32_t y, uint32_t visible);
 	// Once the power-management firmware runs its features (compute stage
-	// 3's thread calls it): the display clocks, logged with rdna4-clocks=1
-	// and raised with rdna4-dispclk=<MHz> (clk.cpp).
+	// 3's thread calls it): the display clocks, logged with rdna4-clocks=1,
+	// raised for a 3840x2160 pipe (rdna4-dispclk=<MHz> overrides, 0 = off).
 	void smuStarted();
 	void cursorRegProbe(const char *why);   // W32: read-only cursor plane dump (also called from the compute thread after a flip)
 	IOReturn getHardwareCursorDrawState(Ndrv::VDHardwareCursorDrawStateRec &state) const;
@@ -312,8 +317,8 @@ private:
 	bool smuProbe(const SmuMailbox &mb);
 	const SmuMailbox *smuFind();
 	bool smuHardMinMet(uint32_t clk);
-	const char *smuSetHardMin(uint32_t clk, uint32_t mhz);
-	void raiseDisplayClocks();
+	bool smuSetHardMin(uint32_t clk, const char *name, uint32_t mhz);
+	bool raiseDisplayClocks();
 	void logDisplayClocks();
 	uint32_t dpmLevelCount(const SmuMailbox &mb, uint32_t clk);
 	void logDpmLevels(const SmuMailbox &mb, uint32_t clk, const char *name);

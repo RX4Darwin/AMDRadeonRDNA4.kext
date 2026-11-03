@@ -82,10 +82,22 @@ constexpr Clock kClocks[] = {
 	{ kPpclkDcfclk, "DCFCLK" },
 };
 
-/* What rdna4-dispclk=<MHz> raises: the clocks a wider mode needs. */
-constexpr Clock kRaised[] = {
-	{ kPpclkDispclk, "DISPCLK" },
-	{ kPpclkDppclk, "DPPCLK" },
+/*
+ * What a pipe lit at 3840x2160@60 needs, above what Linux's DML asks for it:
+ * DISPCLK 621, DPPCLK 598 and DCFCLK 228 MHz. rdna4-dispclk=<MHz> sets the
+ * first two instead, 0 leaves the clocks alone.
+ */
+struct HardMin {
+	uint32_t id;
+	const char *name;
+	uint32_t mhz;
+	bool dispclk;   /* follows rdna4-dispclk */
+};
+
+constexpr HardMin kRaised[] = {
+	{ kPpclkDispclk, "DISPCLK", 650, true },
+	{ kPpclkDppclk, "DPPCLK", 650, true },
+	{ kPpclkDcfclk, "DCFCLK", 300, false },
 };
 
 /* DENTIST_DISPCLK_CNTL (base index 1): the divider DISPCLK runs on. */
@@ -287,31 +299,53 @@ bool RDNA4Device::smuHardMinMet(uint32_t clk)
 	return false;
 }
 
-/* Keep a clock at or above `mhz`, as amdgpu's DCN 4.01 clock manager does. */
-const char *RDNA4Device::smuSetHardMin(uint32_t clk, uint32_t mhz)
+/*
+ * Keep a clock at or above `mhz`, as amdgpu's DCN 4.01 clock manager does:
+ * whether the firmware took it (and, where it says, met it).
+ */
+bool RDNA4Device::smuSetHardMin(uint32_t clk, const char *name, uint32_t mhz)
 {
 	if (!smuSend(*smu, smu->setHardMin, clk << 16 | (mhz & 0xffff),
-		     nullptr))
-		return "refused";
+		     nullptr)) {
+		KLOG("%s: hard minimum %u MHz refused", name, mhz);
+		return false;
+	}
 
-	if (!smu->hardMinStatus)
-		return "accepted";
+	if (!smu->hardMinStatus) {
+		KLOG("%s: hard minimum %u MHz accepted", name, mhz);
+		return true;
+	}
 
-	return smuHardMinMet(clk) ? "met" : "not met after 1 s";
+	if (!smuHardMinMet(clk)) {
+		KLOG("%s: hard minimum %u MHz not met after 1 s", name, mhz);
+		return false;
+	}
+
+	KLOG("%s: hard minimum %u MHz met", name, mhz);
+
+	return true;
 }
 
-void RDNA4Device::raiseDisplayClocks()
+/* Whether every clock a 3840x2160 pipe needs is held high enough. */
+bool RDNA4Device::raiseDisplayClocks()
 {
-	uint32_t mhz = 0;
+	uint32_t dispclk = 0;
+	const bool asked = Trial::option("rdna4-dispclk", dispclk);
+	bool met = true;
 
-	if (!Trial::option("rdna4-dispclk", mhz) || !mhz)
-		return;
+	if (asked && !dispclk)
+		return false;
 
-	for (const Clock &c : kRaised)
-		KLOG("%s: hard minimum %u MHz %s", c.name, mhz,
-		     smuSetHardMin(c.id, mhz));
+	for (const HardMin &c : kRaised) {
+		const uint32_t mhz = asked && c.dispclk ? dispclk : c.mhz;
+
+		if (!smuSetHardMin(c.id, c.name, mhz))
+			met = false;
+	}
 
 	logDispclkDivider();
+
+	return met;
 }
 
 void RDNA4Device::logDisplayClocks()
@@ -339,5 +373,5 @@ void RDNA4Device::smuStarted()
 		return;
 
 	logDisplayClocks();
-	raiseDisplayClocks();
+	uhdClocks = raiseDisplayClocks();
 }
