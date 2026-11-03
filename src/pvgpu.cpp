@@ -6,6 +6,7 @@
 //
 
 #include "pvgpu.hpp"
+#include "klog.hpp"
 #include "pvstream.hpp"
 #include "sku.hpp"
 
@@ -45,7 +46,7 @@ void pvlog(const char *fmt, ...) {
 	const uint32_t n = __atomic_fetch_add(&gLogLines, 1u, __ATOMIC_RELAXED);
 	if (n >= kMaxLogLines) {
 		if (n == kMaxLogLines)
-			IOLog("AMDRadeonRDNA4: pvgpu: log budget (%u lines) used up\n", kMaxLogLines);
+			rdna4Log("AMDRadeonRDNA4: pvgpu: log budget (%u lines) used up\n", kMaxLogLines);
 		return;
 	}
 	char buf[240];
@@ -53,7 +54,7 @@ void pvlog(const char *fmt, ...) {
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
-	IOLog("AMDRadeonRDNA4: pvgpu: %s\n", buf);
+	rdna4Log("AMDRadeonRDNA4: pvgpu: %s\n", buf);
 }
 
 // "0xEEEE106B", "0xEEEE106B&0xFFFFFFFF", several separated by blanks: does `ids` match one of them? (IOPCIMatch / IOPCIPrimaryMatch format)

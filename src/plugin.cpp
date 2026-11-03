@@ -19,6 +19,7 @@
 //
 
 #include <Headers/plugin_start.hpp>
+#include "klog.hpp"
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLib.h>
@@ -46,7 +47,7 @@ uint32_t rdna4TraceLevel { 0 };
 #include "bochsvbe.hpp"
 #endif
 
-#define FBLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
+#define FBLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
 
 // The local csc record mirrors (ndrv.hpp) must match the SDK exactly.
 #define NDRV_SAME_SIZE(T) \
@@ -1120,6 +1121,7 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 }
 
 void pluginStart() {
+	rdna4LogInit();
 	FBLOG("version " AMDRADEONRDNA4_BUILD);
 	uint32_t off = 0;
 	if (PE_parse_boot_argn("rdna4-off", &off, sizeof(off)) && off) {

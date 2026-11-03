@@ -8,6 +8,7 @@
 //
 
 #include "codeobj.hpp"
+#include "klog.hpp"
 #include "compute.hpp"
 #include "flip.hpp"
 #include "pm4.hpp"
@@ -27,7 +28,7 @@
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
 
-#define CLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: compute: " fmt "\n", ## __VA_ARGS__)
+#define CLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: compute: " fmt "\n", ## __VA_ARGS__)
 
 // Lilu's vendor GUID; `nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail`
 // reads it back.

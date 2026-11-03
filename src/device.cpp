@@ -8,6 +8,7 @@
 //
 
 #include "device.hpp"
+#include "klog.hpp"
 #include "dpphy.hpp"
 #include "edid.hpp"
 #include "dmub.hpp"
@@ -19,7 +20,7 @@
 
 #include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
 
-#define FBLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
+#define FBLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
 
 // ---------------------------------------------------------------------------
 // Console framebuffer discovery

@@ -8,6 +8,7 @@
 //
 
 #include "flip.hpp"
+#include "klog.hpp"
 
 #include "compute.hpp"
 #include "pipe.hpp"
@@ -17,7 +18,7 @@
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 
-#define FLOG(fmt, ...) IOLog("AMDRadeonRDNA4: flip: " fmt "\n", ## __VA_ARGS__)
+#define FLOG(fmt, ...) rdna4Log("AMDRadeonRDNA4: flip: " fmt "\n", ## __VA_ARGS__)
 
 namespace Flip {
 

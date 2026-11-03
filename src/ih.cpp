@@ -8,6 +8,7 @@
 //
 
 #include "compute.hpp"
+#include "klog.hpp"
 #include "ndrv.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -22,7 +23,7 @@
 #include <libkern/c++/OSObject.h>
 #include <pexpert/pexpert.h>
 
-#define HLOG(fmt, ...) IOLog("AMDRadeonRDNA4: ih: " fmt "\n", ## __VA_ARGS__)
+#define HLOG(fmt, ...) rdna4Log("AMDRadeonRDNA4: ih: " fmt "\n", ## __VA_ARGS__)
 
 using namespace GfxReg;
 
