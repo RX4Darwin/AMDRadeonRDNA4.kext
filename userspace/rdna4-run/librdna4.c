@@ -63,6 +63,27 @@ kern_return_t rdna4_sensors_ex(rdna4_t *dev, RDNA4SensorsEx *out) {
 	                                 out, &n);
 }
 
+kern_return_t rdna4_pv_next(rdna4_t *dev, uint32_t timeoutMs, RDNA4PvJob *out) {
+	uint64_t input = timeoutMs;
+	size_t n = sizeof(*out);
+
+	return IOConnectCallMethod(dev->conn, kRDNA4MethodPvNext, &input, 1, NULL, 0, NULL, NULL,
+	                           out, &n);
+}
+
+kern_return_t rdna4_pv_access(rdna4_t *dev, uint32_t task, uint64_t va, void *mem, uint64_t bytes,
+                              int write) {
+	uint64_t input[5] = { task, va, (uint64_t)(uintptr_t)mem, bytes, write ? 1u : 0u };
+
+	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodPvAccess, input, 5, NULL, NULL);
+}
+
+kern_return_t rdna4_pv_done(rdna4_t *dev, uint32_t id, uint32_t status) {
+	uint64_t input[2] = { id, status };
+
+	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodPvDone, input, 2, NULL, NULL);
+}
+
 kern_return_t rdna4_sleep_test(rdna4_t *dev, uint32_t phase) {
 	uint64_t input = phase;
 	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodSleepTest, &input, 1, NULL, NULL);

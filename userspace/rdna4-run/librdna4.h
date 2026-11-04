@@ -28,6 +28,7 @@
 #include <IOKit/IOKitLib.h>
 
 #include "rdna4compute.h"
+#include "rdna4pvjob.h"
 
 typedef struct {
 	io_connect_t conn;
@@ -118,6 +119,14 @@ kern_return_t rdna4_wait_present(rdna4_t *dev, uint64_t presentId, uint32_t time
 kern_return_t rdna4_display_query(rdna4_t *dev, uint32_t *width, uint32_t *height,
                                   uint32_t *pitch);
 kern_return_t rdna4_restore(rdna4_t *dev);
+
+/* The paravirtual host's compiler service (PVGPU builds, include/rdna4pvjob.h):
+ * the next compute dispatch (kIOReturnTimeout when none came), the client's
+ * memory by its GPU address, and the end of a job (status 0 = it ran). */
+kern_return_t rdna4_pv_next(rdna4_t *dev, uint32_t timeoutMs, RDNA4PvJob *out);
+kern_return_t rdna4_pv_access(rdna4_t *dev, uint32_t task, uint64_t va, void *mem, uint64_t bytes,
+                              int write);
+kern_return_t rdna4_pv_done(rdna4_t *dev, uint32_t id, uint32_t status);
 
 const char *rdna4_error(kern_return_t kr);
 

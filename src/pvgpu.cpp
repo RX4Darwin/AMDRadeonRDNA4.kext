@@ -194,6 +194,7 @@ private:
 	uint32_t mOnlineEvents { 0 }, mOnlineAcks { 0 };
 	uint32_t mTransactions { 0 }, mCursorCmds { 0 }, mFlushes { 0 };
 	uint32_t mDispCmdLines { 0 };
+	uint32_t mRareCmdLines { 0 };
 	uint32_t mKickPrev { 0 };
 
 	// Guest-supplied sizes are validated before anything is mapped: at most kMaxChannels channels, rings of at most kMaxRingPages pages.
@@ -421,7 +422,9 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 		}
 		mCmds++;
 		const bool display = c.id == 0x02 || (c.id >= 0x04 && c.id <= 0x07) || c.id == 0x1e;   // the display pipe's commands keep being shown
-		if (mCmds <= 150 || (display && mDispCmdLines++ < 60)) {
+		// past the boot's, the commands other than the frequent ones (execs, page-table commits, resource deletions) are shown too
+		const bool rare = c.id != 0x37 && c.id != 0x39 && c.id != 0x25 && c.id != 0x22;
+		if (mCmds <= 150 || (display && mDispCmdLines++ < 60) || (rare && mRareCmdLines++ < 300)) {
 			char line[200];
 			if (c.length <= sizeof(mWin)) {
 				copy(at, mWin, c.length);

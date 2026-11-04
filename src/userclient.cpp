@@ -11,6 +11,10 @@
 #include "userclient.hpp"
 #include "klog.hpp"
 #include "compute.hpp"
+#include "rdna4pvjob.h"
+#ifdef AMDRadeonRDNA4_PVGPU
+#include "pvjob.hpp"
+#endif
 
 #include <IOKit/IOLib.h>
 
@@ -105,8 +109,11 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sSensorsEx,  0,          0,                          0,           sizeof(RDNA4SensorsEx) },
 	{ sSubmitGfxIb, 3,         0,                          1,           0 },
 	{ sWaitGfxFence, 2,        0,                          1,           0 },
+	{ sPvNext,     1,          0,                          0,           sizeof(RDNA4PvJob) },
+	{ sPvAccess,   5,          0,                          0,           0 },
+	{ sPvDone,     2,          0,                          0,           0 },
 };
-static_assert(kRDNA4MethodCount == 22, "kMethods has one entry per selector");
+static_assert(kRDNA4MethodCount == 25, "kMethods has one entry per selector");
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                                             IOExternalMethodDispatch *, OSObject *, void *) {
@@ -240,4 +247,44 @@ IOReturn RDNA4ComputeClient::sWaitGfxFence(OSObject *t, void *, IOExternalMethod
 	return self(t)->compute->rtWaitGfxFence(t, static_cast<uint32_t>(a->scalarInput[0]),
 	                                        static_cast<uint32_t>(a->scalarInput[1]),
 	                                        a->scalarOutput[0]);
+}
+
+// The paravirtual host's compiler service (include/rdna4pvjob.h), PVGPU builds only.
+IOReturn RDNA4ComputeClient::sPvNext(OSObject *, void *, IOExternalMethodArguments *a)
+{
+#ifdef AMDRadeonRDNA4_PVGPU
+	if (!a->structureOutput || a->structureOutputSize != sizeof(RDNA4PvJob))
+		return kIOReturnBadArgument;
+
+	return PvJob::next(static_cast<uint32_t>(a->scalarInput[0]), *static_cast<RDNA4PvJob *>(a->structureOutput));
+#else
+	(void)a;
+
+	return kIOReturnUnsupported;
+#endif
+}
+
+IOReturn RDNA4ComputeClient::sPvAccess(OSObject *t, void *, IOExternalMethodArguments *a)
+{
+#ifdef AMDRadeonRDNA4_PVGPU
+	const uint64_t *in = a->scalarInput;
+
+	return PvJob::access(static_cast<uint32_t>(in[0]), in[1], self(t)->task, in[2], in[3], in[4] != 0);
+#else
+	(void)t;
+	(void)a;
+
+	return kIOReturnUnsupported;
+#endif
+}
+
+IOReturn RDNA4ComputeClient::sPvDone(OSObject *, void *, IOExternalMethodArguments *a)
+{
+#ifdef AMDRadeonRDNA4_PVGPU
+	return PvJob::done(static_cast<uint32_t>(a->scalarInput[0]), static_cast<uint32_t>(a->scalarInput[1]));
+#else
+	(void)a;
+
+	return kIOReturnUnsupported;
+#endif
 }

@@ -32,6 +32,11 @@ constexpr uint32_t kEntryPageMask = 0x7fffffff;
 
 /* Resource heap entry kinds (the low byte of an entry's first word). */
 constexpr uint32_t kResourceBuffer = 1;
+constexpr uint32_t kResourceTexture = 2;    /* 116 bytes, see Texture */
+constexpr uint32_t kResourceSurface = 5;    /* an IOSurface's texture, see SurfaceTexture */
+constexpr uint32_t kResourceFunction = 6;    /* {u64 code GPU address, u32 length, ...} */
+constexpr uint32_t kResourceObject = 7;      /* createObject: {u32 type, u32 size, ...} */
+constexpr uint32_t kObjectComputePipeline = 0xb;
 
 /* Index into a node at `level` (0 = leaf) for a GPU address. */
 inline uint32_t indexAt(uint64_t va, uint32_t level)
@@ -56,6 +61,41 @@ bool writeGpu(uint32_t task, uint64_t va, const void *in, size_t len);
 
 /* A buffer's GPU address and length by the ref the stream uses. */
 bool resolveBuffer(uint32_t task, uint32_t ref, uint64_t &va, uint64_t &len);
+
+/* Log every used entry of the task's resource heap and, with `code`, each function's code. */
+void logHeap(uint32_t task, bool code);
+
+/*
+ * A texture by its ref (kind 2): the guest lays it out linearly, rows
+ * `bytesPerRow` apart, in its own memory (measured, card: a private
+ * 64x64 BGRA8 texture, {u64 bytes, u32 page, ..., u64 bytes per row at
+ * 0x34, u32 width, height, depth at 0x3c, u16 MTLPixelFormat at 0x56}).
+ */
+struct Texture {
+	uint64_t va;
+	uint64_t bytes;
+	uint64_t bytesPerRow;
+	uint32_t width, height, depth;
+	uint32_t format;
+};
+
+bool resolveTexture(uint32_t task, uint32_t ref, Texture &out);
+
+/*
+ * A texture on an IOSurface by its ref (kind 5, 56 bytes): a CAMetalLayer's
+ * drawable. {u64 IOSurface ID, ..., u16 MTLPixelFormat at 0x16, u32 width,
+ * height at 0x18} (measured, card: a 960x640 BGRA8 layer).
+ */
+struct SurfaceTexture {
+	uint32_t surface;
+	uint32_t width, height;
+	uint32_t format;
+};
+
+bool resolveSurfaceTexture(uint32_t task, uint32_t ref, SurfaceTexture &out);
+
+/* A compute pipeline's function by the pipeline's ref: its metallib. */
+bool resolveComputePipeline(uint32_t task, uint32_t ref, uint64_t &codeVa, uint32_t &codeBytes);
 #endif
 
 } /* namespace PvExec */

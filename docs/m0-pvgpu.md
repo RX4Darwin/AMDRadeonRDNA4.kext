@@ -199,6 +199,61 @@ Between them `host: ctrl+0x... a -> b` lines show the register writes the host s
   zeroed memory the host is presumably to fill (the client reads `threadExecutionWidth` 0). Objects reach the host another way:
   `AppleParavirtShared::createObject`/`createFunction` do not use the FIFO command allocator. Next to find.
 
+### Twelfth and thirteenth runs (2026-11-04): where a compute function reaches the host
+
+**Measured**, card, Sequoia 24H232, `rdna4-pvgpu=1`, `rdna4-mtlcompute` (`b[i] = i * 3 + 1` over 1024 threads):
+
+- **Objects live in the resource heap.** `AppleParavirtShared::createObjectLocked` calls `AppleParavirtResourceHeap::addObject(7, index, size,
+  bytes)`, which copies the bytes into the heap's descriptor area and writes entry `index` as `{u32 kind | size << 8, u64 descriptor GPU address}`;
+  the handle the guest gets back (`AppleParavirtResourceHeapNamespace::addHandle`) is kernel-only. Kinds seen: 1 buffer, 2 (116 bytes; a texture
+  [INFER]), 6 function, 7 object (`createObject`; its first dword is the object type).
+- **A function (kind 6)** has the descriptor `{u64 code GPU address, u32 length, u32 0xf, u32 0x14, u32 index?, ...}`; the code is a **metallib**
+  (`MTLB`, one AIR 2.2 module, Metal language 2.2: the device's MaxMetalShaderVersion default). The test kernel's is 3309 bytes and
+  `tools/metal/air` compiles it to gfx1201 unchanged (`air2amdgcn` takes a buffer's address space from its pointer type in AIR 2.2).
+- **`CreateComputePipeline` (0x3b)** is `{u32 task, u32 heap index of the pipeline object, u32 args+0x18, u32 args+0x10, u64 address}`
+  (`AppleParavirtShared::createComputePipeline`). The pipeline object (kind 7, 24 bytes) is `{u32 0xb, u32 0x18, u32 own index, u32 7,
+  u8 function heap index, u8 4, u8 0, u8 1, u32 0}`. The address is in the function's code memory right behind the metallib (`0x101cf0` for
+  3309 bytes at `0x101000`), zeroed: the reflection the host is to write there (the client reads `threadExecutionWidth` 0 without it).
+- **A compute segment** (type 1) of the test: `0xd0 {u32 pipeline index}`, `0xcb {u32 buffer index, ...}` (set buffer), `0xca {u32 grid w, h, d,
+  u32 threadgroup w, h, d}` (dispatchThreads 1024x1x1 in groups of 64).
+
+### Fourteenth run (2026-11-04): the first Metal compute kernel runs on the card
+
+**Measured**, card, Sequoia 24H232, trial `rdna4-pvgpu=1 rdna4-compute=7`, `rdna4-pvexec -v` running as root, `rdna4-mtlcompute`:
+`pipeline made, thread execution width 32` and `status 4; b[0] = 1, b[5] = 16, b[1023] = 3070` (the expected values): the guest's own AIR,
+compiled for gfx1201 on the Mac (`air2amdgcn` and LLVM 23.1.4 in `~/opt/llvm`), dispatched through the compute runtime in 16 us.
+
+- **The reply to `CreateComputePipeline`** is up to six pairs `{u32 key, u32 value}` that the bundle's `_parseComputeInfo` reads: 1
+  maxTotalThreadsPerThreadgroup, 2 (a field no accessor reads), 3 threadExecutionWidth, 4 staticThreadgroupMemoryLength; key 0 is skipped.
+- **The path of a dispatch:** the host decodes the compute segment (`0xd0` pipeline, `0xcb` buffers by slot, `0xcf` offsets, `0xca`/`0xc8`
+  dispatch), resolves the pipeline to its metallib through the heap and posts a job (`include/rdna4pvjob.h`); `rdna4-pvexec` takes it through
+  `RDNA4ComputeClient` (PvNext, PvAccess, PvDone), compiles and caches the function per threadgroup size (`tools/metal/air/compile-metallib.sh`,
+  `/var/tmp/rdna4-pvexec`), copies the bound buffers into VRAM, dispatches, copies them back into the client's memory and ends the job; the host
+  then completes the command buffer. Without the service a dispatch is skipped at once, as before.
+- A system process's compute segment uses `0xce` (setTextures): not run yet.
+
+### Fifteenth to eighteenth runs (2026-11-04): render passes, textures and drawables
+
+**Measured**, card, Sequoia 24H232, trial `rdna4-pvgpu=1 rdna4-compute=7`; `rdna4-mtlclear` (a 64x64 BGRA8 private texture cleared to
+(1, 0.5, 0.25, 1) and copied into a buffer) reads back `0xffff8040` in every pixel, the colour asked for; `rdna4-mtlwindow` (a CAMetalLayer
+cleared every frame) runs its passes without failures.
+
+- **A texture (kind 2, 116 bytes)** is laid out by the guest, linearly in its own memory: `{u64 bytes, u32 GPU page, ..., u64 bytes per row
+  at 0x34, u32 width, height, depth at 0x3c, u16 MTLPixelFormat at 0x56}` (0x50 = BGRA8Unorm).
+- **A drawable (kind 5, 56 bytes)** has no memory of its own: `{u64 IOSurface ID, ..., u16 MTLPixelFormat at 0x16, u32 width, height at 0x18}`.
+  The host writes the surface through its memory descriptor (`src/pvsurface.cpp`): `IOSurfaceRoot::lookupSurface` only finds surfaces of the
+  asking task, so the host reads the root's table of surfaces by ID itself (`+0xd0` table, `+0xd8` count, `+0x138` lock, IOSurface ID at
+  `+0x10`; Sequoia only, each entry checked).
+- **A render pass** is one command `0x1a` (584 bytes) in a render segment: colour attachments of 0x3c bytes from 0x4c, `{u32 texture ref,
+  u32 resolve ref, u16 level, slice, depth plane, resolve level, slice, depth plane, u16 load action, u16 store action, u32 options, double
+  clear colour[4]}`; before them the depth and stencil attachments.
+- **`0x12e` copyFromTexture:...toBuffer:** is `{u32 texture, u32 buffer, u64 origin[3], u64 size[3], u64 destination offset, bytes per
+  row, bytes per image, u64 options}` (88 bytes).
+- **Windows stay invisible in a paravirtual boot.** The paravirtual device is the system's default Metal device, so Core Animation in each
+  app renders the window's contents with it; those are draws (textured quads) the host does not run yet, and the window server shows
+  transparent windows: a desktop with wallpaper and menu bar and no Dock or windows, the window of `rdna4-mtlwindow` listed on screen and
+  not visible. Visible results need draws with vertex and fragment functions and texture sampling.
+
 ## The GetDeviceInfo reply (hub-task-446) [measured in the kext and the bundle unless marked]
 
 **The wait.** `AppleParavirtAccelerator::setupDeviceInfo` (the last step of `Accelerator::start`) wires a 4 KiB `IOBufferMemoryDescriptor`, builds FIFO command `0x3a` with one record `{u32 0x2d, u32 bytes/8 (0x200), u32 physical page}`, submits it on the root channel through the generic `IOAccelChannel2` path, and then **`IOAccelEventMachineFast2::finishEvent`** waits for the event of that submission. After the wait it calls `parseDeviceInfo(buffer, 0x200, &accelerator->deviceInfo)` and returns true whatever the content (no validation: even an all-zero buffer passes). Then `Accelerator::start` releases its lock and `registerService()`.

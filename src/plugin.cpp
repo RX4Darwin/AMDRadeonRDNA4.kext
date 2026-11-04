@@ -38,6 +38,8 @@
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
 #include "pvhooks.hpp"
+#include "pvsurface.hpp"
+#include "pvrun.hpp"
 #endif
 #include "compute.hpp"
 #include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
@@ -1270,6 +1272,8 @@ void pluginStart() {
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
 #ifdef AMDRadeonRDNA4_PVGPU
 	PvHooks::start();
+	PvSurface::start();
+	PvRun::start();
 #endif
 }
 

@@ -8,8 +8,9 @@
  * the length counting the header; inside a segment, commands {u32 id,
  * u32 size} with the size counting their own header (measured, card).
  *
- * The first executor is the CPU: blit fills and buffer copies, done on the
- * client's memory through its page table. The rest is counted and logged.
+ * Blit fills and buffer copies run on the CPU, on the client's memory
+ * through its page table. A compute dispatch goes to the compiler service
+ * (pvjob.hpp), which runs it on the card. The rest is counted and logged.
  */
 
 #ifndef PvRun_hpp
@@ -28,12 +29,37 @@ enum Segment : uint8_t {
 	kInfo = 4,
 };
 
+/* Render commands (docs/m1-opcodes.md): the pass's attachments. */
+constexpr uint32_t kRenderPass = 0x1a;
+constexpr uint32_t kFirstAttachment = 0x4c;
+constexpr uint32_t kAttachmentBytes = 0x3c;
+constexpr uint32_t kColourAttachments = 8;
+constexpr uint32_t kLoadClear = 2;        /* MTLLoadActionClear */
+
+/* MTLPixelFormat values the CPU clear knows. */
+constexpr uint32_t kRGBA8Unorm = 70;
+constexpr uint32_t kRGBA8UnormSrgb = 71;
+constexpr uint32_t kBGRA8Unorm = 80;
+constexpr uint32_t kBGRA8UnormSrgb = 81;
+
+/* Compute commands (docs/m1-opcodes.md). */
+constexpr uint32_t kDispatchThreadgroups = 0xc8;
+constexpr uint32_t kDispatchThreads = 0xca;
+constexpr uint32_t kSetBuffers = 0xcb;
+constexpr uint32_t kSetBufferOffset = 0xcf;
+constexpr uint32_t kSetComputePipeline = 0xd0;
+constexpr uint32_t kComputeBarrier = 0xd7;
+
 /* Blit commands (docs/m1-opcodes.md). */
 constexpr uint32_t kCopyBufferToBuffer = 0x12d;
 constexpr uint32_t kFillBuffer = 0x132;
 constexpr uint32_t kFillBufferPattern = 0x13f;
+constexpr uint32_t kCopyTextureToBuffer = 0x12e;
 
 #ifdef KERNEL
+/* At plugin start: the sysctls that log command buffers. */
+void start();
+
 /* Run the command buffer of `len` bytes at `va` in `task`. */
 void run(uint32_t task, uint64_t va, uint64_t len);
 #endif

@@ -59,6 +59,19 @@ uint32_t gPipelines;
 constexpr uint32_t kDumpedExecs = 8;
 constexpr size_t kDumpBytes = 128;
 
+/*
+ * What CreateComputePipeline answers: the pairs {u32 key, u32 value}
+ * _parseComputeInfo of the Metal bundle reads (six of them; key 0 is
+ * skipped). 1 maxTotalThreadsPerThreadgroup, 3 threadExecutionWidth (a
+ * wave32 kernel of air2amdgcn), 4 staticThreadgroupMemoryLength; 2 sets a
+ * field no accessor reads and is left out.
+ */
+const uint32_t kComputeReply[12] = { 1, 1024, 3, 32, 4, 0, 0, 0, 0, 0, 0, 0 };
+
+/* Heap entries a pipeline's census looks at, and how much of a function it dumps. */
+constexpr uint32_t kCensusEntries = 32;
+constexpr uint32_t kFunctionDumpBytes = 16384;
+
 uint32_t rd32(const uint8_t *p)
 {
 	uint32_t v;
@@ -309,6 +322,82 @@ bool PvExec::resolveBuffer(uint32_t task, uint32_t ref, uint64_t &va, uint64_t &
 	return true;
 }
 
+/* Entry `ref` of the task's heap and its descriptor's first `len` bytes. */
+static bool heapEntry(uint32_t task, uint32_t ref, uint32_t &kind, void *desc, uint32_t len)
+{
+	const Task *t = taskById(task);
+	uint32_t entry[3];
+
+	if (!t || !t->heapVa || 12ull * (ref + 1) > t->heapSize)
+		return false;
+
+	if (!PvExec::readGpu(task, t->heapVa + 12ull * ref, entry, sizeof(entry)) || (entry[0] >> 8) < len)
+		return false;
+
+	kind = entry[0] & 0xff;
+
+	return PvExec::readGpu(task, entry[1], desc, len);
+}
+
+bool PvExec::resolveTexture(uint32_t task, uint32_t ref, Texture &out)
+{
+	uint8_t d[0x58];
+	uint32_t kind;
+
+	if (!heapEntry(task, ref, kind, d, sizeof(d)) || kind != kResourceTexture)
+		return false;
+
+	out.bytes = rd64(d);
+	out.va = static_cast<uint64_t>(rd32(d + 0x08)) << 12;
+	out.bytesPerRow = rd64(d + 0x34);
+	out.width = rd32(d + 0x3c);
+	out.height = rd32(d + 0x40);
+	out.depth = rd32(d + 0x44);
+	out.format = d[0x56] | d[0x57] << 8;
+
+	return out.width && out.height && out.bytesPerRow &&
+	       out.bytesPerRow * out.height <= out.bytes;
+}
+
+bool PvExec::resolveSurfaceTexture(uint32_t task, uint32_t ref, SurfaceTexture &out)
+{
+	uint8_t d[0x20];
+	uint32_t kind;
+
+	if (!heapEntry(task, ref, kind, d, sizeof(d)) || kind != kResourceSurface || rd64(d) >> 32)
+		return false;
+
+	out.surface = static_cast<uint32_t>(rd64(d));
+	out.format = d[0x16] | d[0x17] << 8;
+	out.width = rd32(d + 0x18);
+	out.height = rd32(d + 0x1c);
+
+	return out.surface && out.width && out.height;
+}
+
+/*
+ * The pipeline object (kind 7, type 0xb) names its function's heap index in
+ * byte 16; the function (kind 6) starts {u64 code GPU address, u32 length}
+ * (measured, card, docs/m0-pvgpu.md).
+ */
+bool PvExec::resolveComputePipeline(uint32_t task, uint32_t ref, uint64_t &codeVa, uint32_t &codeBytes)
+{
+	uint8_t pipeline[20], function[12];
+	uint32_t kind;
+
+	if (!heapEntry(task, ref, kind, pipeline, sizeof(pipeline)) || kind != kResourceObject ||
+	    rd32(pipeline) != kObjectComputePipeline)
+		return false;
+
+	if (!heapEntry(task, pipeline[16], kind, function, sizeof(function)) || kind != kResourceFunction)
+		return false;
+
+	codeVa = rd64(function);
+	codeBytes = rd32(function + 8);
+
+	return codeBytes != 0;
+}
+
 /* {u32 task << 1, u64 address-space size, u32 page-table root PFN} */
 void PvExec::defineTask(const uint8_t *payload, uint32_t len)
 {
@@ -361,46 +450,89 @@ void PvExec::setHeap(const uint8_t *payload, uint32_t len)
 }
 
 /*
- * A ref's heap entry, its descriptor and, for each u64 of the descriptor
- * that could be a GPU page number, the start of that page.
+ * A function's code, whole: its heap descriptor starts {u64 GPU address,
+ * u32 length}. One "fn" line of hex per 64 bytes, to be put back together
+ * off the card.
  */
-static void dumpRef(uint32_t task, uint32_t ref)
+static void dumpFunction(uint32_t task, uint32_t descVa)
+{
+	uint8_t desc[12];
+	uint8_t chunk[64];
+	char line[sizeof(chunk) * 3];
+	uint64_t va;
+	uint32_t len;
+
+	if (!PvExec::readGpu(task, descVa, desc, sizeof(desc)))
+		return;
+
+	va = rd64(desc);
+	len = rd32(desc + 8);
+	XLOG("fn begin: task %u, %u bytes at 0x%llx", task, len, va);
+
+	if (len > kFunctionDumpBytes)
+		len = kFunctionDumpBytes;
+
+	for (uint32_t off = 0; off < len; off += sizeof(chunk)) {
+		const uint32_t n = len - off < sizeof(chunk) ? len - off : sizeof(chunk);
+
+		if (!PvExec::readGpu(task, va + off, chunk, n))
+			break;
+
+		hex(chunk, n, line, sizeof(line));
+		XLOG("fn %05x %s", off, line);
+	}
+
+	XLOG("fn end");
+}
+
+/*
+ * Every used entry of a task's resource heap: kind, descriptor size and
+ * address, and the descriptor's first bytes. Objects (createObject, kind 7)
+ * and functions keep their bytes there (AppleParavirtResourceHeap::addObject
+ * copies them in).
+ */
+void PvExec::logHeap(uint32_t task, bool code)
 {
 	const Task *t = taskById(task);
-	uint32_t entry[3];
-	uint64_t desc[8] = {};
-	uint32_t size;
+	uint32_t n;
 
-	if (!t || !t->heapVa || 12ull * (ref + 1) > t->heapSize ||
-	    !PvExec::readGpu(task, t->heapVa + 12ull * ref, entry, sizeof(entry)))
+	if (!t || !t->heapVa)
 		return;
 
-	size = entry[0] >> 8;
-	if (size > sizeof(desc))
-		size = sizeof(desc);
+	n = static_cast<uint32_t>(t->heapSize / 12);
+	if (n > kCensusEntries)
+		n = kCensusEntries;
 
-	if (!PvExec::readGpu(task, entry[1], desc, size))
-		return;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t entry[3];
 
-	XLOG("  ref %u: kind %u, %u descriptor bytes at 0x%x: 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx",
-	     ref, entry[0] & 0xff, entry[0] >> 8, entry[1], desc[0], desc[1], desc[2], desc[3],
-	     desc[4], desc[5]);
+		if (!PvExec::readGpu(task, t->heapVa + 12ull * i, entry, sizeof(entry)) || !entry[0])
+			continue;
 
-	for (uint32_t i = 0; i < size / 8; i++) {
-		if (desc[i] >= 0x1 && desc[i] < (1ull << 22))
-			dumpGpu("    page", task, desc[i] << 12, kDumpBytes);
+		XLOG("  heap %u: kind %u, %u bytes at 0x%x", i, entry[0] & 0xff, entry[0] >> 8, entry[1]);
+
+		for (uint32_t off = 0; off < (entry[0] >> 8) && off < 2 * kDumpBytes; off += kDumpBytes)
+			dumpGpu("    bytes", task, entry[1] + off, (entry[0] >> 8) - off);
+
+		if (code && (entry[0] & 0xff) == PvExec::kResourceFunction)
+			dumpFunction(task, entry[1]);
 	}
 }
 
 /*
- * CreateComputePipeline (0x3b): its payload and, for every u64 in it that
- * could be an address in the task, the bytes there (the layout is still
- * being learnt; the first u32 is taken to be the task).
+ * CreateComputePipeline (0x3b), as AppleParavirtShared::createComputePipeline
+ * builds it: {u32 task, u32 heap index of the pipeline object it just
+ * created, u32, u32, u64 address in the function's memory} (the last is
+ * zeroed; the host is to fill it). The heap holds what the pipeline is made
+ * of: logged whole while its layout is learnt.
  */
 void PvExec::createComputePipeline(const uint8_t *payload, uint32_t len)
 {
 	char line[kDumpBytes * 3];
 	const uint32_t task = len >= 4 ? rd32(payload) : 0;
+
+	if (len >= 24 && !writeGpu(task, rd64(payload + 16), kComputeReply, sizeof(kComputeReply)))
+		XLOG("CreateComputePipeline: no reply written at 0x%llx", rd64(payload + 16));
 
 	if (gPipelines++ >= 4)
 		return;
@@ -408,8 +540,7 @@ void PvExec::createComputePipeline(const uint8_t *payload, uint32_t len)
 	hex(payload, len < kDumpBytes ? len : kDumpBytes, line, sizeof(line));
 	XLOG("CreateComputePipeline, %u payload bytes: %s", len, line);
 
-	for (uint32_t off = 4; off + 4 <= len && off < 16; off += 4)
-		dumpRef(task, rd32(payload + off));
+	logHeap(task, true);
 }
 
 /* The first execs, in full: their layout is still being learnt. */

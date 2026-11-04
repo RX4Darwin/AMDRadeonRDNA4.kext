@@ -19,6 +19,7 @@
 //     threads_per_threadgroup / threadgroups_per_grid / threads_per_grid / thread_index_in_simdgroup / simdgroup_index_in_threadgroup are
 //     computed in a prologue from workgroup id, workitem id and the hidden grid size; a simdgroup is one wave32;
 //   * threadgroup memory = the module's addrspace(3) globals (static LDS), unchanged.
+//   --abi FILE writes the kernargs in order, one line each: "buffer SLOT", "grid", "threadgroup SLOT" (SLOT = the argument's [[buffer(n)]]).
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Constants.h"
@@ -77,6 +78,7 @@ std::string family(StringRef name) {   // air.fast_fmax.f32 -> air.fast_fmax ; a
 struct Stats {
 	std::map<std::string, unsigned> lowered;       // family -> call sites lowered
 	std::map<std::string, unsigned> unsupported;   // full callee name -> call sites left alone
+	std::vector<std::string> abi;                  // kernel mode: the kernargs, one line each (--abi)
 };
 
 // ---- helpers --------------------------------------------------------------------------------------------------------------------------------
@@ -411,6 +413,7 @@ void lowerFunction(Function &F, Stats &st) {
 struct ArgInfo {
 	std::string kind;       // air.buffer, air.thread_position_in_grid, ...
 	unsigned aspace = 0;
+	unsigned slot = 0;      // air.location_index: the [[buffer(n)]] it binds
 	std::string name;
 };
 
@@ -429,6 +432,9 @@ ArgInfo parseArg(const MDNode *n) {
 		if (k == "air.address_space")
 			if (auto *c = mdconst::dyn_extract<ConstantInt>(n->getOperand(i + 1)))
 				a.aspace = c->getZExtValue();
+		if (k == "air.location_index")
+			if (auto *c = mdconst::dyn_extract<ConstantInt>(n->getOperand(i + 1)))
+				a.slot = c->getZExtValue();
 		if (k == "air.arg_name")
 			a.name = str(n->getOperand(i + 1));
 	}
@@ -493,6 +499,13 @@ bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::s
 		err = "argument metadata count != function arguments";
 		return false;
 	}
+	// AIR before 2.3 (a paravirtual device's Metal 2.2) leaves air.address_space out of a buffer's metadata: the
+	// pointer type carries it.
+	for (size_t i = 0; i < infos.size(); i++) {
+		auto *pt = dyn_cast<PointerType>(F->getArg(i)->getType());
+		if (infos[i].kind == "air.buffer" && !infos[i].aspace && pt)
+			infos[i].aspace = pt->getAddressSpace();
+	}
 	// 1. air.* calls in the body (before the type-changing clone, so the callees' declarations keep their AIR types)
 	lowerFunction(*F, st);
 	if (!st.unsupported.empty()) {
@@ -515,6 +528,13 @@ bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::s
 		}
 	}
 	const size_t nBuf = params.size();
+	// The kernargs as a runtime fills them: "buffer SLOT" (8 bytes), "grid" (3 x u32), "threadgroup SLOT" (u32).
+	for (size_t i = 0; i < infos.size(); i++)
+		if (infos[i].kind == "air.buffer" && infos[i].aspace != kAirThreadgroup)
+			st.abi.push_back("buffer " + std::to_string(infos[i].slot));
+	st.abi.push_back("grid");
+	for (size_t t : tgArgs)
+		st.abi.push_back("threadgroup " + std::to_string(infos[t].slot));
 	for (int d = 0; d < 3; d++)
 		params.push_back(i32);
 	for (size_t i = 0; i < tgArgs.size(); i++)
@@ -737,11 +757,11 @@ int main(int argc, char **argv) {
 	LLVMInitializeAMDGPUTargetMC();
 	LLVMInitializeAMDGPUAsmPrinter();
 	if (argc < 3) {
-		fprintf(stderr, "usage: %s kernel IN --tg X,Y,Z -o OUT.ll [--entry NAME] [--mcpu gfx1201]\n       %s coverage [--codegen] IN...\n", argv[0], argv[0]);
+		fprintf(stderr, "usage: %s kernel IN --tg X,Y,Z -o OUT.ll [--entry NAME] [--mcpu gfx1201] [--abi OUT.abi]\n       %s coverage [--codegen] IN...\n", argv[0], argv[0]);
 		return 2;
 	}
 	const std::string mode = argv[1];
-	std::string out, entry, cpu = "gfx1201", tgs = "64,1,1";
+	std::string out, entry, cpu = "gfx1201", tgs = "64,1,1", abi;
 	bool codegen = false;
 	std::vector<std::string> inputs;
 	for (int i = 2; i < argc; i++) {
@@ -754,6 +774,8 @@ int main(int argc, char **argv) {
 			entry = argv[++i];
 		else if (a == "--mcpu" && i + 1 < argc)
 			cpu = argv[++i];
+		else if (a == "--abi" && i + 1 < argc)
+			abi = argv[++i];
 		else if (a == "--codegen")
 			codegen = true;
 		else
@@ -797,6 +819,11 @@ int main(int argc, char **argv) {
 		std::error_code ec;
 		raw_fd_ostream os(out, ec);
 		M->print(os, nullptr);
+		if (!abi.empty()) {
+			raw_fd_ostream as(abi, ec);
+			for (const std::string &l : st.abi)
+				as << l << "\n";
+		}
 		fprintf(stderr, "air2amdgcn: lowered");
 		for (auto &l : st.lowered)
 			fprintf(stderr, " %s x%u", l.first.c_str(), l.second);

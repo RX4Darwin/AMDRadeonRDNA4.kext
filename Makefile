@@ -157,7 +157,7 @@ $(LILU_STAMP): $(LILU)/../hde/hde32.h $(LILU)/../hde/hde64.h
 	@touch $@
 
 # --- what goes to the test machine beside the kext -----------------------------
-tools: $(BIN)/rdna4-run $(BIN)/n48nprobe $(BIN)/diagnostic-log.sh $(BIN)/boot-history.sh $(BIN)/freeze-watch.sh vulkan-products
+tools: $(BIN)/rdna4-run $(BIN)/rdna4-pvexec $(BIN)/n48nprobe $(BIN)/diagnostic-log.sh $(BIN)/boot-history.sh $(BIN)/freeze-watch.sh vulkan-products
 
 # The compute runtime's client. Linked by the C++ driver: it is the one pointed at ld64 (tools/build/build-osxcross.sh).
 $(BIN)/rdna4-run: $(RUN)/rdna4-run.c $(RUN)/librdna4.c $(RUN)/librdna4.h $(RUN)/pm4build.h $(RUN)/gfx12tri.h $(RUN)/gfx12tricol.h $(RUN)/gfx12trirun.h src/gfx12_draw.h src/gfx12_draw_col.h src/ngg_kernel.h src/psred_kernel.h src/nggcol_kernel.h src/pscol_kernel.h include/rdna4compute.h src/vadd_codeobj.h src/bench_codeobj.h
@@ -165,7 +165,13 @@ $(BIN)/rdna4-run: $(RUN)/rdna4-run.c $(RUN)/librdna4.c $(RUN)/librdna4.h $(RUN)/
 	$(CXX) -x c $(USER_FLAGS) $(RUN)/rdna4-run.c $(RUN)/librdna4.c \
 		-framework IOKit -framework CoreFoundation -weak_framework Accelerate -o $@
 
-userspace: $(BIN)/rdna4-run
+# The paravirtual host's compiler service (PVGPU builds; include/rdna4pvjob.h).
+PVEXEC       = userspace/rdna4-pvexec
+$(BIN)/rdna4-pvexec: $(PVEXEC)/rdna4-pvexec.c $(RUN)/librdna4.c $(RUN)/librdna4.h include/rdna4compute.h include/rdna4pvjob.h
+	@mkdir -p $(BIN)
+	$(CXX) -x c $(USER_FLAGS) -I$(RUN) $(PVEXEC)/rdna4-pvexec.c $(RUN)/librdna4.c -framework IOKit -framework CoreFoundation -o $@
+
+userspace: $(BIN)/rdna4-run $(BIN)/rdna4-pvexec
 
 # The card test of the Vulkan interface's memory half (docs/vulkan-port.md): runs on the test machine, as root.
 $(BIN)/n48nprobe: $(VULKAN)/n48nprobe.c $(VULKAN)/navi48_native_abi.h include/rdna4vulkan.h
