@@ -40,6 +40,7 @@
 #include "pvhooks.hpp"
 #include "pvsurface.hpp"
 #include "pvrun.hpp"
+#include "pvscanout.hpp"
 #endif
 #include "compute.hpp"
 #include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
@@ -165,6 +166,9 @@ uint32_t traceBudget { 400 };   // bounded: gamma/CLUT calls can be frequent
 uint32_t computeStage { 0 };    // rdna4-compute=<stage>, see compute.hpp
 uint32_t pvGpu { 0 };           // rdna4-pvgpu=1|2: M0 of docs/metal-phase-plan.md, the fake Apple paravirtual GPU nub (pvgpu.hpp); VM/emulator only
 uint32_t accelCensus { 0 };     // rdna4-accelcensus=1|2: the E1 impostor-IOAccelerator census (accelcensus.hpp), emulator only
+// rdna4-pvgpu-disp bit 2 (with rdna4-pvgpu): the heads are the paravirtual GPU's displays (pvscanout.hpp), and macOS is told
+// that none of our framebuffers has one
+bool pvHeads { false };
 
 // What we keep for one of our framebuffers.
 struct FbState {
@@ -182,6 +186,8 @@ struct FbEntry {
 	FbState *state;
 };
 FbEntry fbTable[8] {};
+// The boot head's state, once attach made it (port 0 of the paravirtual displays).
+FbState *bootState { nullptr };
 
 // Forward declaration: the explicit open-time VBL service creation below
 // goes through the same wrapper as a legacy NDRV call.
@@ -246,6 +252,10 @@ int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 }
 
 void deviceSetPower(void *ctx, bool on) {
+	// a framebuffer macOS has no display on for must not blank the paravirtual display it scans out
+	if (pvHeads && !on)
+		return;
+
 	static_cast<RDNA4Device *>(ctx)->setDisplayPower(on);
 }
 
@@ -406,6 +416,10 @@ int32_t head2SwitchTo(void *ctx, const Modes::Mode &m, bool) {
 
 void head2SetPower(void *ctx, bool on) {
 	auto *h = static_cast<Head2 *>(ctx);
+
+	if (pvHeads && !on)
+		return;
+
 	h->dev->selectExtra(h->slot);
 	if (h->connected || !on)             // the link of an unplugged display stays off
 		h->dev->setSecondPipePower(on);
@@ -548,6 +562,11 @@ void head2Init(Head2 *h, RDNA4Device &dev, const Modes::Mode *mode, size_t n) {
 	}
 }
 
+// What macOS is told of a head's display: none while the heads are the paravirtual displays.
+void tellConnected(Head2 *h, bool on) {
+	h->ndrv.setConnected(on && !pvHeads);
+}
+
 void fillHead(Head2 *h, RDNA4Device &dev) {
 	if (h->ready)
 		return;
@@ -631,7 +650,7 @@ void fillHead(Head2 *h, RDNA4Device &dev) {
 		dev.lightSecondPipe(head2Level, h->surface.physBase);
 	head2Init(h, dev, mode, n);
 	h->connected = !offline;
-	h->ndrv.setConnected(h->connected);
+	tellConnected(h, h->connected);
 	head2MapSurface(h);
 	h->ready = true;
 	HLOG(h, "serving %ux%u@%u.%03u on surface 0x%llx, %s", mode->t.hActive,
@@ -691,7 +710,7 @@ void head2Plugged(Head2 *h, uint8_t hpd) {
 			return;
 		}
 		h->connected = true;
-		h->ndrv.setConnected(true);
+		tellConnected(h, true);
 		HLOG(h, "hotplug: the same display is back on HPD%u", Pipe2::config().hpd);
 		head2ConnectChanged(h);
 		return;
@@ -721,7 +740,7 @@ void head2Plugged(Head2 *h, uint8_t hpd) {
 	head2MapSurface(h);
 	head2Init(h, dev, mode, n);
 	h->connected = true;
-	h->ndrv.setConnected(true);
+	tellConnected(h, true);
 	HLOG(h, "hotplug: display connected on HPD%u: %lu mode(s), EDID %lu bytes", Pipe2::config().hpd,
 	      static_cast<unsigned long>(n), static_cast<unsigned long>(h->edidLen));
 	head2ConnectChanged(h);
@@ -731,7 +750,7 @@ void head2Unplugged(Head2 *h) {
 	h->dev->selectExtra(h->slot);
 	h->dev->setSecondPipePower(false);
 	h->connected = false;
-	h->ndrv.setConnected(false);
+	tellConnected(h, false);
 	HLOG(h, "hotplug: display gone from HPD%u: link off", Pipe2::config().hpd);
 	head2ConnectChanged(h);
 }
@@ -993,7 +1012,24 @@ void attach(FbEntry &e) {
 	}
 #endif
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidData, dev.edidLen, be);
+#ifdef AMDRadeonRDNA4_PVGPU
+	// A test boot's level (rdna4-trial) is only known once NVRAM is; the heads' framebuffers are told before macOS asks.
+	uint32_t pvTrial = 0, pvDisp = 0;
+
+	if (!pvGpu && Trial::option("rdna4-pvgpu", pvTrial) && pvTrial <= 2)
+		pvGpu = pvTrial;
+
+	pvHeads = pvGpu && dev.isAmd && Trial::option("rdna4-pvgpu-disp", pvDisp) && (pvDisp & 4);
+	if (pvHeads) {
+		st->ndrv.setConnected(false);
+		FBLOG("ndrv: the heads are the paravirtual displays: no display on our framebuffers for macOS");
+	}
+
+	if (dev.isAmd)
+		PvScanout::decided(pvHeads);
+#endif
 	e.state = st;
+	bootState = st;
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
 	fillHeads(dev);
@@ -1004,12 +1040,8 @@ void attach(FbEntry &e) {
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
 	if (accelCensus && dev.isAmd)
 		RDNA4AccelCensus::publish(pci, accelCensus);
-	// M0: the fake paravirtual GPU, independent of everything else here. A
-	// test boot's level (rdna4-trial) is only known once NVRAM is.
+	// M0: the fake paravirtual GPU, independent of everything else here, after the heads it may drive.
 #ifdef AMDRadeonRDNA4_PVGPU
-	uint32_t pvTrial = 0;
-	if (!pvGpu && Trial::option("rdna4-pvgpu", pvTrial) && pvTrial <= 2)
-		pvGpu = pvTrial;
 	if (pvGpu && dev.isAmd)
 		RDNA4PvNub::publish(pci, pvGpu);
 #endif
@@ -1274,6 +1306,7 @@ void pluginStart() {
 	PvHooks::start();
 	PvSurface::start();
 	PvRun::start();
+	PvScanout::start();
 #endif
 }
 
@@ -1292,3 +1325,86 @@ PluginConfiguration ADDPR(config) {
 	KernelVersion::Tahoe,
 	pluginStart,
 };
+
+#ifdef AMDRadeonRDNA4_PVGPU
+// --- the heads as the paravirtual displays (pvscanout.hpp) ---------------------
+
+bool PvScanout::enabled()
+{
+	return pvHeads;
+}
+
+// The extra heads by port (port - 1), numbered by the first count().
+const Head2 *pvPorts[RDNA4Device::kMaxExtra] {};
+// The size each of them is lit in, or will be: what its paravirtual display is announced with.
+uint32_t pvPortWidth[RDNA4Device::kMaxExtra] {}, pvPortHeight[RDNA4Device::kMaxExtra] {};
+uint32_t pvPortCount { 0 };
+bool pvPortsNumbered { false };
+
+uint32_t PvScanout::count()
+{
+	if (!pvPortsNumbered) {
+		for (size_t i = 0; i < headCount; i++) {
+			const Head2 *h = heads[i];
+
+			if (!h->connected && !h->waitClocks)
+				continue;
+
+			// a head waiting for the display clocks is lit at 3840x2160 once they are up (fillHead)
+			pvPortWidth[pvPortCount] = h->waitClocks ? 3840 : h->surface.width;
+			pvPortHeight[pvPortCount] = h->waitClocks ? 2160 : h->surface.height;
+			pvPorts[pvPortCount++] = h;
+		}
+
+		pvPortsNumbered = true;
+	}
+
+	return 1 + pvPortCount;
+}
+
+bool PvScanout::mode(uint32_t port, uint32_t &width, uint32_t &height)
+{
+	Head head;
+
+	if (PvScanout::head(port, head)) {
+		width = head.width;
+		height = head.height;
+
+		return true;
+	}
+
+	if (port == 0 || port > pvPortCount)
+		return false;
+
+	width = pvPortWidth[port - 1];
+	height = pvPortHeight[port - 1];
+
+	return true;
+}
+
+bool PvScanout::head(uint32_t port, Head &out)
+{
+	if (port == 0) {
+		if (!bootState)
+			return false;
+
+		const RDNA4Device &dev = bootState->dev;
+
+		out = { dev.fbPhysBase, dev.fbRowBytes, dev.fbWidth, dev.fbHeight };
+
+		return true;
+	}
+
+	if (port > pvPortCount)
+		return false;
+
+	const Head2 *h = pvPorts[port - 1];
+
+	if (!h->ready || !h->connected)
+		return false;
+
+	out = { h->surface.physBase, h->surface.rowBytes, h->surface.width, h->surface.height };
+
+	return true;
+}
+#endif

@@ -173,6 +173,44 @@ bool PvSurface::access(uint32_t id, uint64_t offset, void *buf, uint64_t len, bo
 	return ok;
 }
 
+bool PvSurface::copyOut(uint32_t id, uint8_t *dst, uint32_t dstPitch, uint32_t width, uint32_t height)
+{
+	OSObject *s = lookup(id);
+	IOMemoryDescriptor *md;
+	size_t bytesPerRow;
+	bool ok = false;
+
+	if (!s)
+		return false;
+
+	md = getDescriptor(s);
+	bytesPerRow = getBytesPerRow(s);
+
+	/* a surface of another size than the head: the part they share */
+	if (md && bytesPerRow) {
+		width = min(width, static_cast<uint32_t>(bytesPerRow / 4));
+		height = min(height, static_cast<uint32_t>(md->getLength() / bytesPerRow));
+	}
+
+	if (md && width && height && md->prepare() == kIOReturnSuccess) {
+		ok = true;
+
+		/* one read when the rows lie alike */
+		if (bytesPerRow == dstPitch && 4ull * width == bytesPerRow) {
+			ok = md->readBytes(0, dst, bytesPerRow * height) == bytesPerRow * height;
+		} else {
+			for (uint32_t y = 0; y < height && ok; y++)
+				ok = md->readBytes(bytesPerRow * y, dst + static_cast<size_t>(dstPitch) * y, 4ull * width) == 4ull * width;
+		}
+
+		md->complete();
+	}
+
+	s->release();
+
+	return ok;
+}
+
 uint32_t PvSurface::bytesPerRow(uint32_t id)
 {
 	OSObject *s = lookup(id);

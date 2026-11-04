@@ -9,6 +9,7 @@
 #include "trial.hpp"
 #include "klog.hpp"
 #include "pvexec.hpp"
+#include "pvscanout.hpp"
 #include "pvstream.hpp"
 #include "sku.hpp"
 
@@ -134,6 +135,7 @@ private:
 	void consume(const CmdSource &src, uint32_t read, uint32_t n);
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void execCommand(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
+	void presentTransaction(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void completeStamp(uint32_t index, uint32_t value);
@@ -269,6 +271,8 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 		h->mDisp = disp & 3;
 	if (level >= 2)
 		h->mDisp = 3;   // the self-test plays the guest's side of the display events
+	if (PvScanout::enabled())
+		h->mDisp = kDispOnline | kDispVbl;   // the heads are the displays: they are there, and WindowServer paces on their VBL
 	uint32_t w = 0, ht = 0;
 	(void)Trial::option("rdna4-pvgpu-width", w);
 	(void)Trial::option("rdna4-pvgpu-height", ht);
@@ -464,6 +468,10 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			copy(at, mWin, c.length);
 			execCommand(c, mWin, src.channel);
 		}
+		if ((c.id == 0x06 || c.id == 0x07) && PvScanout::enabled() && c.length <= sizeof(mWin)) {
+			copy(at, mWin, c.length);
+			presentTransaction(c, mWin);
+		}
 		if (c.id == 0x06 || c.id == 0x07)
 			mTransactions++;   // completion is the generic stamp below: the pipe's fence waits for the command's signal (docs/m1-stream.md s.1b)
 		else if (c.id == 0x04 || c.id == 0x05)
@@ -479,6 +487,22 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 	}
 	if (haveSignal)
 		completeStamp(src.stampIndex, lastSignal);
+}
+
+// SubmitTransaction (FIFO 0x06) {u32 port, u32 surface, u32 task}, or SubmitTransaction2 (0x07) {u32 port, u32 task, u32 surface, ..., the gamma
+// table}: the frame into the port's head (pvscanout.hpp), before the batch's stamp completes it. The gamma table is not applied.
+void RDNA4PvHost::presentTransaction(const pvstream::FifoCommand &c, const uint8_t *cmd) {
+	const uint8_t *pl = cmd + c.payloadOffset;
+	uint32_t f[3];
+
+	if (c.length - c.payloadOffset < sizeof(f))
+		return;
+
+	memcpy(f, pl, sizeof(f));
+	if (c.id == 0x07)
+		PvScanout::present(f[0], f[2], f[1]);
+	else
+		PvScanout::present(f[0], f[1], f[2]);
 }
 
 // GetDeviceInfo (FIFO 0x3a): the record 0x2d names the 4 KiB buffer the host fills; the layout and the values are docs/m0-pvgpu.md "The GetDeviceInfo reply".
@@ -561,7 +585,17 @@ void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const
 	p.channel = channel;
 	if (mDisp & kDispOnline) {
 		pvstream::disp::Info info = mDispInfo;
+		uint32_t width, height;
+
 		info.id = port + 1;
+		if (PvScanout::enabled() && PvScanout::mode(port, width, height) && width <= 0xffff && height <= 0xffff) {
+			info.width = info.modes[0].width = static_cast<uint16_t>(width);
+			info.height = info.modes[0].height = static_cast<uint16_t>(height);
+		}
+
+		// IOPresentment takes only a plane with gamma, which the guest announces when transactions carry the table (FIFO 0x07)
+		if (PvScanout::enabled())
+			info.txnProtocol = 1;
 		pvstream::disp::fillInfo(va, port, info);
 		__sync_synchronize();
 		__atomic_fetch_or(reinterpret_cast<uint32_t *>(va + pvstream::disp::kPending), pvstream::disp::kEventOnline, __ATOMIC_SEQ_CST);
@@ -1325,6 +1359,13 @@ bool RDNA4PvNub::build() {
 		return false;
 	mBar0 = mBar0Desc->getBytesNoCopy();
 	bzero(mBar0, kBar0Size);
+
+	// one display a head when the heads are the paravirtual displays (pvscanout.hpp)
+	if (PvScanout::enabled()) {
+		const uint32_t displays = PvScanout::count();
+
+		memcpy(static_cast<uint8_t *>(mBar0) + kCtrl + kRegNumDisplays, &displays, sizeof(displays));
+	}
 
 	// Config space of a display controller function with one memory BAR and an MSI capability.
 	auto put32 = [this](unsigned off, uint32_t v) { memcpy(&mConfig[off], &v, sizeof(v)); };
