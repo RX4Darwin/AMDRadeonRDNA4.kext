@@ -23,6 +23,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "rdna4pvjob.h"
+
 namespace PvExec
 {
 
@@ -106,6 +108,10 @@ bool resolveComputePipeline(uint32_t task, uint32_t ref, uint64_t &codeVa, uint3
 struct RenderPipeline {
 	uint64_t vertexVa, fragmentVa;
 	uint32_t vertexBytes, fragmentBytes;
+	uint32_t blend;     /* colour attachment 0, rdna4raster.c's blend word */
+	uint32_t attributeMask;
+	RDNA4PvAttribute attributes[RDNA4_PVJOB_MAX_ATTRIBUTES];
+	RDNA4PvLayout layouts[RDNA4_PVJOB_MAX_ATTRIBUTES];
 };
 
 bool resolveRenderPipeline(uint32_t task, uint32_t ref, RenderPipeline &out);

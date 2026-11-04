@@ -30,6 +30,7 @@
 #define RDNA4_PVJOB_MAX_BUFFERS 31u          /* Metal's buffer slots */
 #define RDNA4_PVJOB_MAX_TEXTURES 16u         /* of a draw's fragment function */
 #define RDNA4_PVJOB_MAX_SAMPLERS 16u
+#define RDNA4_PVJOB_MAX_ATTRIBUTES 31u       /* a vertex descriptor's attributes and layouts */
 #define RDNA4_PVJOB_MAX_CODE    (1u << 20)   /* metallib bytes */
 
 enum {
@@ -40,6 +41,13 @@ enum {
 enum {
 	RDNA4_PVJOB_VERTEX = 0,      /* a buffer of the vertex function (or the compute kernel) */
 	RDNA4_PVJOB_FRAGMENT = 1,
+	RDNA4_PVJOB_INDEX = 2,       /* a draw's indices (slot 0), vertexCount of them */
+};
+
+enum {
+	RDNA4_PVJOB_NOT_INDEXED = 0,
+	RDNA4_PVJOB_UINT16 = 1,
+	RDNA4_PVJOB_UINT32 = 2,
 };
 
 /* PvAccess flags: write, and `task` naming an IOSurface by ID, `va` an offset in it. */
@@ -69,6 +77,21 @@ typedef struct {
 	uint32_t word;
 } RDNA4PvSampler;
 
+/* A vertex attribute of the pipeline's vertex descriptor ([[attribute(index)]]): format 0 when unused. */
+typedef struct {
+	uint8_t format;         /* MTLVertexFormat */
+	uint8_t buffer;         /* the buffer slot, its layout */
+	uint16_t offset;        /* bytes into the element */
+} RDNA4PvAttribute;
+
+/* A buffer layout of the vertex descriptor, by buffer slot. */
+typedef struct {
+	uint32_t stride;
+	uint16_t stepRate;
+	uint8_t stepFunction;   /* MTLVertexStepFunction */
+	uint8_t reserved;
+} RDNA4PvLayout;
+
 typedef struct {
 	uint32_t id;
 	uint32_t task;
@@ -86,20 +109,26 @@ typedef struct {
 	uint32_t fragmentBytes;
 	uint32_t topology;      /* MTLPrimitiveType */
 	uint32_t vertexStart, vertexCount;
-	uint32_t instanceCount, reserved3;
+	uint32_t instanceCount;
+	uint32_t indexType;     /* RDNA4_PVJOB_NOT_INDEXED, _UINT16 or _UINT32 */
 	uint64_t targetVa;      /* a texture's memory in the client, or 0 */
 	uint32_t targetSurface; /* else an IOSurface ID */
 	uint32_t targetFormat;  /* MTLPixelFormat */
 	uint32_t targetWidth, targetHeight;
 	uint32_t targetPitch;   /* bytes per row */
-	uint32_t blend;         /* rdna4raster.c: 0 off, else the factors */
+	uint32_t blend;         /* rdna4raster.c: 0 off, else the enable bit and the factors */
 	uint32_t viewport[4];   /* x, y, w, h: float bits */
+	uint32_t scissor[4];    /* x, y, w, h: pixels */
 	uint32_t textureCount, samplerCount;
 	RDNA4PvTexture textures[RDNA4_PVJOB_MAX_TEXTURES];
 	RDNA4PvSampler samplers[RDNA4_PVJOB_MAX_SAMPLERS];
+	uint32_t attributeMask; /* the vertex descriptor's attributes, a bit each; 0 without one */
+	RDNA4PvAttribute attributes[RDNA4_PVJOB_MAX_ATTRIBUTES];
+	RDNA4PvLayout layouts[RDNA4_PVJOB_MAX_ATTRIBUTES];
 } RDNA4PvJob;
 
-#define RDNA4_PVJOB_BYTES (56 + RDNA4_PVJOB_MAX_BUFFERS * 24 + 88 + RDNA4_PVJOB_MAX_TEXTURES * 32 + RDNA4_PVJOB_MAX_SAMPLERS * 8)
+#define RDNA4_PVJOB_BYTES (56 + RDNA4_PVJOB_MAX_BUFFERS * 24 + 104 + RDNA4_PVJOB_MAX_TEXTURES * 32 + \
+			   RDNA4_PVJOB_MAX_SAMPLERS * 8 + 4 + RDNA4_PVJOB_MAX_ATTRIBUTES * 12)
 #ifdef __cplusplus
 static_assert(sizeof(RDNA4PvJob) == RDNA4_PVJOB_BYTES, "RDNA4PvJob layout");
 #else

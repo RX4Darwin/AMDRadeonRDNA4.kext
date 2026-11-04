@@ -4,42 +4,50 @@ target datalayout = "e-m:e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-
 target triple = "amdgcn-amd-amdhsa"
 
 ; Function Attrs: alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: write) uwtable
-define hidden void @rdna4_draw_init(ptr nofree noundef writeonly captures(none) initializes((0, 68)) %0, ptr addrspace(1) noundef %1, i32 noundef %2, i32 noundef %3, i32 noundef %4, i32 noundef %5, ptr addrspace(1) noundef %6, i32 noundef %7, i32 noundef %8, i32 noundef %9, i32 noundef %10, float noundef %11, float noundef %12, float noundef %13, float noundef %14, i32 noundef %15) local_unnamed_addr #0 {
+define hidden void @rdna4_draw_init(ptr nofree noundef writeonly captures(none) initializes((0, 84)) %0, ptr addrspace(1) noundef %1, i32 noundef %2, i32 noundef %3, i32 noundef %4, i32 noundef %5, ptr addrspace(1) noundef %6, i32 noundef %7, i32 noundef %8, i32 noundef %9, i32 noundef %10, float noundef %11, float noundef %12, float noundef %13, float noundef %14, i32 noundef %15, i32 noundef %16, i32 noundef %17, i32 noundef %18, i32 noundef %19) local_unnamed_addr #0 {
   store ptr addrspace(1) %1, ptr %0, align 8, !tbaa !9
-  %17 = getelementptr inbounds nuw i8, ptr %0, i64 8
-  store i32 %2, ptr %17, align 8, !tbaa !15
-  %18 = getelementptr inbounds nuw i8, ptr %0, i64 12
-  store i32 %3, ptr %18, align 4, !tbaa !16
-  %19 = getelementptr inbounds nuw i8, ptr %0, i64 16
-  store i32 %4, ptr %19, align 8, !tbaa !17
-  %20 = getelementptr inbounds nuw i8, ptr %0, i64 20
-  store i32 %5, ptr %20, align 4, !tbaa !18
-  %21 = getelementptr inbounds nuw i8, ptr %0, i64 24
-  store ptr addrspace(1) %6, ptr %21, align 8, !tbaa !19
-  %22 = getelementptr inbounds nuw i8, ptr %0, i64 32
-  store i32 %7, ptr %22, align 8, !tbaa !20
-  %23 = getelementptr inbounds nuw i8, ptr %0, i64 36
-  store i32 %8, ptr %23, align 4, !tbaa !21
-  %24 = getelementptr inbounds nuw i8, ptr %0, i64 40
-  store i32 %9, ptr %24, align 8, !tbaa !22
-  %25 = getelementptr inbounds nuw i8, ptr %0, i64 44
-  store i32 %10, ptr %25, align 4, !tbaa !23
-  %26 = getelementptr inbounds nuw i8, ptr %0, i64 48
-  store float %11, ptr %26, align 8, !tbaa !24
-  %27 = getelementptr inbounds nuw i8, ptr %0, i64 52
-  store float %12, ptr %27, align 4, !tbaa !25
-  %28 = getelementptr inbounds nuw i8, ptr %0, i64 56
-  store float %13, ptr %28, align 8, !tbaa !26
-  %29 = getelementptr inbounds nuw i8, ptr %0, i64 60
-  store float %14, ptr %29, align 4, !tbaa !27
-  %30 = getelementptr inbounds nuw i8, ptr %0, i64 64
-  store i32 %15, ptr %30, align 8, !tbaa !28
+  %21 = getelementptr inbounds nuw i8, ptr %0, i64 8
+  store i32 %2, ptr %21, align 8, !tbaa !15
+  %22 = getelementptr inbounds nuw i8, ptr %0, i64 12
+  store i32 %3, ptr %22, align 4, !tbaa !16
+  %23 = getelementptr inbounds nuw i8, ptr %0, i64 16
+  store i32 %4, ptr %23, align 8, !tbaa !17
+  %24 = getelementptr inbounds nuw i8, ptr %0, i64 20
+  store i32 %5, ptr %24, align 4, !tbaa !18
+  %25 = getelementptr inbounds nuw i8, ptr %0, i64 24
+  store ptr addrspace(1) %6, ptr %25, align 8, !tbaa !19
+  %26 = getelementptr inbounds nuw i8, ptr %0, i64 32
+  store i32 %7, ptr %26, align 8, !tbaa !20
+  %27 = getelementptr inbounds nuw i8, ptr %0, i64 36
+  store i32 %8, ptr %27, align 4, !tbaa !21
+  %28 = getelementptr inbounds nuw i8, ptr %0, i64 40
+  store i32 %9, ptr %28, align 8, !tbaa !22
+  %29 = getelementptr inbounds nuw i8, ptr %0, i64 44
+  store i32 %10, ptr %29, align 4, !tbaa !23
+  %30 = getelementptr inbounds nuw i8, ptr %0, i64 48
+  store float %11, ptr %30, align 8, !tbaa !24
+  %31 = getelementptr inbounds nuw i8, ptr %0, i64 52
+  store float %12, ptr %31, align 4, !tbaa !25
+  %32 = getelementptr inbounds nuw i8, ptr %0, i64 56
+  store float %13, ptr %32, align 8, !tbaa !26
+  %33 = getelementptr inbounds nuw i8, ptr %0, i64 60
+  store float %14, ptr %33, align 4, !tbaa !27
+  %34 = getelementptr inbounds nuw i8, ptr %0, i64 64
+  store i32 %15, ptr %34, align 8, !tbaa !28
+  %35 = getelementptr inbounds nuw i8, ptr %0, i64 68
+  store i32 %16, ptr %35, align 4, !tbaa !29
+  %36 = getelementptr inbounds nuw i8, ptr %0, i64 72
+  store i32 %17, ptr %36, align 8, !tbaa !30
+  %37 = getelementptr inbounds nuw i8, ptr %0, i64 76
+  store i32 %18, ptr %37, align 4, !tbaa !31
+  %38 = getelementptr inbounds nuw i8, ptr %0, i64 80
+  store i32 %19, ptr %38, align 8, !tbaa !32
   ret void
 }
 
 ; Function Attrs: alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(read, inaccessiblemem: none, target_mem: none) uwtable
 define hidden <4 x float> @rdna4_sample_2d(ptr addrspace(1) nofree noundef readonly captures(none) %0, ptr addrspace(4) nofree noundef readonly captures(none) %1, <2 x float> noundef %2) local_unnamed_addr #1 {
-  %4 = load i32, ptr addrspace(4) %1, align 4, !tbaa !29
+  %4 = load i32, ptr addrspace(4) %1, align 4, !tbaa !33
   %5 = lshr i32 %4, 5
   %6 = and i32 %5, 7
   %7 = lshr i32 %4, 8
@@ -50,7 +58,7 @@ define hidden <4 x float> @rdna4_sample_2d(ptr addrspace(1) nofree noundef reado
 
 11:                                               ; preds = %3
   %12 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 8
-  %13 = load i32, ptr addrspace(1) %12, align 8, !tbaa !31
+  %13 = load i32, ptr addrspace(1) %12, align 8, !tbaa !35
   %14 = uitofp contract i32 %13 to float
   %15 = fmul contract float %10, %14
   br label %16
@@ -62,7 +70,7 @@ define hidden <4 x float> @rdna4_sample_2d(ptr addrspace(1) nofree noundef reado
 
 19:                                               ; preds = %16
   %20 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 12
-  %21 = load i32, ptr addrspace(1) %20, align 4, !tbaa !33
+  %21 = load i32, ptr addrspace(1) %20, align 4, !tbaa !37
   %22 = uitofp contract i32 %21 to float
   %23 = fmul contract float %18, %22
   br label %24
@@ -70,13 +78,13 @@ define hidden <4 x float> @rdna4_sample_2d(ptr addrspace(1) nofree noundef reado
 24:                                               ; preds = %16, %19
   %25 = phi contract float [ %23, %19 ], [ %18, %16 ]
   %26 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 8
-  %27 = load i32, ptr addrspace(1) %26, align 8, !tbaa !31
+  %27 = load i32, ptr addrspace(1) %26, align 8, !tbaa !35
   %28 = icmp eq i32 %27, 0
   br i1 %28, label %462, label %29
 
 29:                                               ; preds = %24
   %30 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 12
-  %31 = load i32, ptr addrspace(1) %30, align 4, !tbaa !33
+  %31 = load i32, ptr addrspace(1) %30, align 4, !tbaa !37
   %32 = icmp eq i32 %31, 0
   br i1 %32, label %462, label %33
 
@@ -191,17 +199,17 @@ define hidden <4 x float> @rdna4_sample_2d(ptr addrspace(1) nofree noundef reado
   br i1 %104, label %105, label %462
 
 105:                                              ; preds = %101
-  %106 = load ptr addrspace(1), ptr addrspace(1) %0, align 8, !tbaa !34
+  %106 = load ptr addrspace(1), ptr addrspace(1) %0, align 8, !tbaa !38
   %107 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 16
-  %108 = load i32, ptr addrspace(1) %107, align 8, !tbaa !35
+  %108 = load i32, ptr addrspace(1) %107, align 8, !tbaa !39
   %109 = lshr i32 %108, 2
   %110 = mul i32 %109, %102
   %111 = add i32 %110, %69
   %112 = zext i32 %111 to i64
   %113 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %106, i64 %112
-  %114 = load i32, ptr addrspace(1) %113, align 4, !tbaa !36
+  %114 = load i32, ptr addrspace(1) %113, align 4, !tbaa !40
   %115 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 20
-  %116 = load i32, ptr addrspace(1) %115, align 4, !tbaa !37
+  %116 = load i32, ptr addrspace(1) %115, align 4, !tbaa !41
   %117 = and i32 %114, 255
   %118 = uitofp contract nneg i32 %117 to float
   %119 = fdiv contract float %118, 2.550000e+02
@@ -439,17 +447,17 @@ define hidden <4 x float> @rdna4_sample_2d(ptr addrspace(1) nofree noundef reado
   br i1 %280, label %281, label %318
 
 281:                                              ; preds = %277
-  %282 = load ptr addrspace(1), ptr addrspace(1) %0, align 8, !tbaa !34
+  %282 = load ptr addrspace(1), ptr addrspace(1) %0, align 8, !tbaa !38
   %283 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 16
-  %284 = load i32, ptr addrspace(1) %283, align 8, !tbaa !35
+  %284 = load i32, ptr addrspace(1) %283, align 8, !tbaa !39
   %285 = lshr i32 %284, 2
   %286 = mul i32 %285, %246
   %287 = add i32 %286, %183
   %288 = zext i32 %287 to i64
   %289 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %282, i64 %288
-  %290 = load i32, ptr addrspace(1) %289, align 4, !tbaa !36
+  %290 = load i32, ptr addrspace(1) %289, align 4, !tbaa !40
   %291 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 20
-  %292 = load i32, ptr addrspace(1) %291, align 4, !tbaa !37
+  %292 = load i32, ptr addrspace(1) %291, align 4, !tbaa !41
   %293 = and i32 %290, 255
   %294 = uitofp contract nneg i32 %293 to float
   %295 = fdiv contract float %294, 2.550000e+02
@@ -488,17 +496,17 @@ define hidden <4 x float> @rdna4_sample_2d(ptr addrspace(1) nofree noundef reado
   br i1 %325, label %326, label %363
 
 326:                                              ; preds = %318
-  %327 = load ptr addrspace(1), ptr addrspace(1) %0, align 8, !tbaa !34
+  %327 = load ptr addrspace(1), ptr addrspace(1) %0, align 8, !tbaa !38
   %328 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 16
-  %329 = load i32, ptr addrspace(1) %328, align 8, !tbaa !35
+  %329 = load i32, ptr addrspace(1) %328, align 8, !tbaa !39
   %330 = lshr i32 %329, 2
   %331 = mul i32 %330, %246
   %332 = add i32 %331, %215
   %333 = zext i32 %332 to i64
   %334 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %327, i64 %333
-  %335 = load i32, ptr addrspace(1) %334, align 4, !tbaa !36
+  %335 = load i32, ptr addrspace(1) %334, align 4, !tbaa !40
   %336 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 20
-  %337 = load i32, ptr addrspace(1) %336, align 4, !tbaa !37
+  %337 = load i32, ptr addrspace(1) %336, align 4, !tbaa !41
   %338 = and i32 %335, 255
   %339 = uitofp contract nneg i32 %338 to float
   %340 = fdiv contract float %339, 2.550000e+02
@@ -537,17 +545,17 @@ define hidden <4 x float> @rdna4_sample_2d(ptr addrspace(1) nofree noundef reado
   br i1 %370, label %371, label %408
 
 371:                                              ; preds = %363
-  %372 = load ptr addrspace(1), ptr addrspace(1) %0, align 8, !tbaa !34
+  %372 = load ptr addrspace(1), ptr addrspace(1) %0, align 8, !tbaa !38
   %373 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 16
-  %374 = load i32, ptr addrspace(1) %373, align 8, !tbaa !35
+  %374 = load i32, ptr addrspace(1) %373, align 8, !tbaa !39
   %375 = lshr i32 %374, 2
   %376 = mul i32 %375, %278
   %377 = add i32 %376, %183
   %378 = zext i32 %377 to i64
   %379 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %372, i64 %378
-  %380 = load i32, ptr addrspace(1) %379, align 4, !tbaa !36
+  %380 = load i32, ptr addrspace(1) %379, align 4, !tbaa !40
   %381 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 20
-  %382 = load i32, ptr addrspace(1) %381, align 4, !tbaa !37
+  %382 = load i32, ptr addrspace(1) %381, align 4, !tbaa !41
   %383 = and i32 %380, 255
   %384 = uitofp contract nneg i32 %383 to float
   %385 = fdiv contract float %384, 2.550000e+02
@@ -583,17 +591,17 @@ define hidden <4 x float> @rdna4_sample_2d(ptr addrspace(1) nofree noundef reado
   br i1 %412, label %413, label %450
 
 413:                                              ; preds = %408
-  %414 = load ptr addrspace(1), ptr addrspace(1) %0, align 8, !tbaa !34
+  %414 = load ptr addrspace(1), ptr addrspace(1) %0, align 8, !tbaa !38
   %415 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 16
-  %416 = load i32, ptr addrspace(1) %415, align 8, !tbaa !35
+  %416 = load i32, ptr addrspace(1) %415, align 8, !tbaa !39
   %417 = lshr i32 %416, 2
   %418 = mul i32 %417, %278
   %419 = add i32 %418, %215
   %420 = zext i32 %419 to i64
   %421 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %414, i64 %420
-  %422 = load i32, ptr addrspace(1) %421, align 4, !tbaa !36
+  %422 = load i32, ptr addrspace(1) %421, align 4, !tbaa !40
   %423 = getelementptr inbounds nuw i8, ptr addrspace(1) %0, i64 20
-  %424 = load i32, ptr addrspace(1) %423, align 4, !tbaa !37
+  %424 = load i32, ptr addrspace(1) %423, align 4, !tbaa !41
   %425 = and i32 %422, 255
   %426 = uitofp contract nneg i32 %425 to float
   %427 = fdiv contract float %426, 2.550000e+02
@@ -644,68 +652,87 @@ define hidden <4 x float> @rdna4_sample_2d(ptr addrspace(1) nofree noundef reado
 declare float @llvm.floor.f32(float) #2
 
 ; Function Attrs: alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(read, argmem: readwrite, inaccessiblemem: none, target_mem: none) uwtable
-define hidden range(i32 0, 2) i32 @rdna4_px_begin(ptr nofree noundef readonly captures(none) %0, i32 noundef %1, i32 noundef %2, ptr nofree noundef writeonly captures(none) %3) local_unnamed_addr #3 {
-  %5 = getelementptr inbounds nuw i8, ptr %0, i64 36
-  %6 = load i32, ptr %5, align 4, !tbaa !21
-  %7 = icmp ult i32 %1, %6
-  br i1 %7, label %8, label %53
+define hidden range(i32 0, 2) i32 @rdna4_px_begin(ptr nofree noundef readonly captures(none) %0, i32 noundef %1, i32 noundef %2, ptr nofree noundef writeonly captures(none) initializes((0, 8), (16, 36)) %3) local_unnamed_addr #3 {
+  store i32 %1, ptr %3, align 16, !tbaa !42
+  %5 = getelementptr inbounds nuw i8, ptr %3, i64 4
+  store i32 %2, ptr %5, align 4, !tbaa !44
+  %6 = getelementptr inbounds nuw i8, ptr %3, i64 16
+  store <4 x float> zeroinitializer, ptr %6, align 16, !tbaa !45
+  %7 = getelementptr inbounds nuw i8, ptr %3, i64 32
+  store i32 0, ptr %7, align 16, !tbaa !46
+  %8 = getelementptr inbounds nuw i8, ptr %0, i64 36
+  %9 = load i32, ptr %8, align 4, !tbaa !21
+  %10 = icmp ult i32 %1, %9
+  br i1 %10, label %11, label %67
 
-8:                                                ; preds = %4
-  %9 = getelementptr inbounds nuw i8, ptr %0, i64 40
-  %10 = load i32, ptr %9, align 8, !tbaa !22
-  %11 = icmp ult i32 %2, %10
-  br i1 %11, label %12, label %53
+11:                                               ; preds = %4
+  %12 = getelementptr inbounds nuw i8, ptr %0, i64 40
+  %13 = load i32, ptr %12, align 8, !tbaa !22
+  %14 = icmp ult i32 %2, %13
+  br i1 %14, label %15, label %67
 
-12:                                               ; preds = %8
-  store i32 %1, ptr %3, align 16, !tbaa !38
-  %13 = getelementptr inbounds nuw i8, ptr %3, i64 4
-  store i32 %2, ptr %13, align 4, !tbaa !40
-  %14 = getelementptr inbounds nuw i8, ptr %0, i64 24
-  %15 = load ptr addrspace(1), ptr %14, align 8, !tbaa !19
-  %16 = getelementptr inbounds nuw i8, ptr %0, i64 32
-  %17 = load i32, ptr %16, align 8, !tbaa !20
-  %18 = lshr i32 %17, 2
-  %19 = mul i32 %18, %2
-  %20 = add i32 %19, %1
-  %21 = zext i32 %20 to i64
-  %22 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %15, i64 %21
-  %23 = load i32, ptr addrspace(1) %22, align 4, !tbaa !36
-  %24 = getelementptr inbounds nuw i8, ptr %0, i64 44
-  %25 = load i32, ptr %24, align 4, !tbaa !23
-  %26 = and i32 %23, 255
-  %27 = uitofp contract nneg i32 %26 to float
-  %28 = fdiv contract float %27, 2.550000e+02
-  %29 = lshr i32 %23, 8
-  %30 = and i32 %29, 255
-  %31 = uitofp contract nneg i32 %30 to float
-  %32 = fdiv contract float %31, 2.550000e+02
-  %33 = lshr i32 %23, 16
-  %34 = and i32 %33, 255
-  %35 = uitofp contract nneg i32 %34 to float
-  %36 = fdiv contract float %35, 2.550000e+02
-  %37 = lshr i32 %23, 24
-  %38 = uitofp contract nneg i32 %37 to float
-  %39 = fdiv contract float %38, 2.550000e+02
-  %40 = and i32 %25, -2
-  %41 = icmp eq i32 %40, 80
-  %42 = insertelement <4 x float> poison, float %36, i64 0
-  %43 = insertelement <4 x float> %42, float %32, i64 1
-  %44 = insertelement <4 x float> %43, float %28, i64 2
-  %45 = insertelement <4 x float> %44, float %39, i64 3
-  %46 = insertelement <4 x float> poison, float %28, i64 0
-  %47 = insertelement <4 x float> %46, float %32, i64 1
-  %48 = insertelement <4 x float> %47, float %36, i64 2
-  %49 = insertelement <4 x float> %48, float %39, i64 3
-  %50 = select i1 %41, <4 x float> %45, <4 x float> %49
-  %51 = getelementptr inbounds nuw i8, ptr %3, i64 16
-  store <4 x float> %50, ptr %51, align 16, !tbaa !41
-  %52 = getelementptr inbounds nuw i8, ptr %3, i64 32
-  store i32 0, ptr %52, align 16, !tbaa !42
-  br label %53
+15:                                               ; preds = %11
+  %16 = getelementptr inbounds nuw i8, ptr %0, i64 68
+  %17 = load i32, ptr %16, align 4, !tbaa !29
+  %18 = sub i32 %1, %17
+  %19 = getelementptr inbounds nuw i8, ptr %0, i64 76
+  %20 = load i32, ptr %19, align 4, !tbaa !31
+  %21 = icmp ult i32 %18, %20
+  br i1 %21, label %22, label %67
 
-53:                                               ; preds = %4, %8, %12
-  %54 = phi i32 [ 1, %12 ], [ 0, %8 ], [ 0, %4 ]
-  ret i32 %54
+22:                                               ; preds = %15
+  %23 = getelementptr inbounds nuw i8, ptr %0, i64 72
+  %24 = load i32, ptr %23, align 8, !tbaa !30
+  %25 = sub i32 %2, %24
+  %26 = getelementptr inbounds nuw i8, ptr %0, i64 80
+  %27 = load i32, ptr %26, align 8, !tbaa !32
+  %28 = icmp ult i32 %25, %27
+  br i1 %28, label %29, label %67
+
+29:                                               ; preds = %22
+  %30 = getelementptr inbounds nuw i8, ptr %0, i64 24
+  %31 = load ptr addrspace(1), ptr %30, align 8, !tbaa !19
+  %32 = getelementptr inbounds nuw i8, ptr %0, i64 32
+  %33 = load i32, ptr %32, align 8, !tbaa !20
+  %34 = lshr i32 %33, 2
+  %35 = mul i32 %34, %2
+  %36 = add i32 %35, %1
+  %37 = zext i32 %36 to i64
+  %38 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %31, i64 %37
+  %39 = load i32, ptr addrspace(1) %38, align 4, !tbaa !40
+  %40 = getelementptr inbounds nuw i8, ptr %0, i64 44
+  %41 = load i32, ptr %40, align 4, !tbaa !23
+  %42 = and i32 %39, 255
+  %43 = uitofp contract nneg i32 %42 to float
+  %44 = fdiv contract float %43, 2.550000e+02
+  %45 = lshr i32 %39, 8
+  %46 = and i32 %45, 255
+  %47 = uitofp contract nneg i32 %46 to float
+  %48 = fdiv contract float %47, 2.550000e+02
+  %49 = lshr i32 %39, 16
+  %50 = and i32 %49, 255
+  %51 = uitofp contract nneg i32 %50 to float
+  %52 = fdiv contract float %51, 2.550000e+02
+  %53 = lshr i32 %39, 24
+  %54 = uitofp contract nneg i32 %53 to float
+  %55 = fdiv contract float %54, 2.550000e+02
+  %56 = and i32 %41, -2
+  %57 = icmp eq i32 %56, 80
+  %58 = insertelement <4 x float> poison, float %52, i64 0
+  %59 = insertelement <4 x float> %58, float %48, i64 1
+  %60 = insertelement <4 x float> %59, float %44, i64 2
+  %61 = insertelement <4 x float> %60, float %55, i64 3
+  %62 = insertelement <4 x float> poison, float %44, i64 0
+  %63 = insertelement <4 x float> %62, float %48, i64 1
+  %64 = insertelement <4 x float> %63, float %52, i64 2
+  %65 = insertelement <4 x float> %64, float %55, i64 3
+  %66 = select i1 %57, <4 x float> %61, <4 x float> %65
+  store <4 x float> %66, ptr %6, align 16, !tbaa !45
+  br label %67
+
+67:                                               ; preds = %4, %11, %15, %22, %29
+  %68 = phi i32 [ 1, %29 ], [ 0, %22 ], [ 0, %15 ], [ 0, %11 ], [ 0, %4 ]
+  ret i32 %68
 }
 
 ; Function Attrs: alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: read) uwtable
@@ -735,14 +762,14 @@ define hidden range(i32 0, -2) i32 @rdna4_tri_count(ptr nofree noundef readonly 
 }
 
 ; Function Attrs: alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(read, argmem: readwrite, inaccessiblemem: none, target_mem: none) uwtable
-define hidden range(i32 0, 2) i32 @rdna4_tri_cover(ptr nofree noundef readonly captures(none) %0, ptr nofree noundef readonly captures(none) %1, i32 noundef %2, ptr nofree noundef writeonly captures(none) initializes((0, 24)) %3) local_unnamed_addr #3 {
+define hidden range(i32 0, 3) i32 @rdna4_tri_cover(ptr nofree noundef readonly captures(none) %0, ptr nofree noundef readonly captures(none) %1, i32 noundef %2, ptr nofree noundef writeonly captures(none) initializes((0, 24)) %3) local_unnamed_addr #3 {
   %5 = mul i32 %2, 3
   %6 = add i32 %5, 1
-  %7 = load i32, ptr %1, align 16, !tbaa !38
+  %7 = load i32, ptr %1, align 16, !tbaa !42
   %8 = uitofp contract i32 %7 to float
   %9 = fadd contract float %8, 5.000000e-01
   %10 = getelementptr inbounds nuw i8, ptr %1, i64 4
-  %11 = load i32, ptr %10, align 4, !tbaa !40
+  %11 = load i32, ptr %10, align 4, !tbaa !44
   %12 = uitofp contract i32 %11 to float
   %13 = fadd contract float %12, 5.000000e-01
   %14 = getelementptr inbounds nuw i8, ptr %0, i64 16
@@ -761,26 +788,26 @@ define hidden range(i32 0, 2) i32 @rdna4_tri_cover(ptr nofree noundef readonly c
   %27 = mul i32 %22, %26
   %28 = zext i32 %27 to i64
   %29 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %24, i64 %28
-  store ptr addrspace(1) %29, ptr %3, align 8, !tbaa !43
+  store ptr addrspace(1) %29, ptr %3, align 8, !tbaa !47
   %30 = load ptr addrspace(1), ptr %0, align 8, !tbaa !9
   %31 = mul i32 %21, %26
   %32 = zext i32 %31 to i64
   %33 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %30, i64 %32
   %34 = getelementptr inbounds nuw i8, ptr %3, i64 8
-  store ptr addrspace(1) %33, ptr %34, align 8, !tbaa !43
+  store ptr addrspace(1) %33, ptr %34, align 8, !tbaa !47
   %35 = load ptr addrspace(1), ptr %0, align 8, !tbaa !9
   %36 = mul i32 %23, %26
   %37 = zext i32 %36 to i64
   %38 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %35, i64 %37
   %39 = getelementptr inbounds nuw i8, ptr %3, i64 16
-  store ptr addrspace(1) %38, ptr %39, align 8, !tbaa !43
+  store ptr addrspace(1) %38, ptr %39, align 8, !tbaa !47
   %40 = getelementptr inbounds nuw i8, ptr %0, i64 12
   %41 = load i32, ptr %40, align 4, !tbaa !16
   %42 = add i32 %41, 3
   %43 = zext i32 %42 to i64
   %44 = zext i32 %41 to i64
   %45 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %29, i64 %43
-  %46 = load float, ptr addrspace(1) %45, align 4, !tbaa !44
+  %46 = load float, ptr addrspace(1) %45, align 4, !tbaa !48
   %47 = fcmp contract ugt float %46, 0.000000e+00
   br i1 %47, label %48, label %186
 
@@ -791,10 +818,10 @@ define hidden range(i32 0, 2) i32 @rdna4_tri_cover(ptr nofree noundef readonly c
   %52 = getelementptr inbounds nuw i8, ptr %0, i64 48
   %53 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %29, i64 %44
   %54 = getelementptr inbounds nuw i8, ptr addrspace(1) %53, i64 12
-  %55 = load float, ptr addrspace(1) %54, align 4, !tbaa !44
+  %55 = load float, ptr addrspace(1) %54, align 4, !tbaa !48
   %56 = fdiv contract float 1.000000e+00, %55
   %57 = load float, ptr %52, align 8, !tbaa !24
-  %58 = load float, ptr addrspace(1) %53, align 4, !tbaa !44
+  %58 = load float, ptr addrspace(1) %53, align 4, !tbaa !48
   %59 = fmul contract float %56, %58
   %60 = fmul contract float %59, 5.000000e-01
   %61 = fadd contract float %60, 5.000000e-01
@@ -803,7 +830,7 @@ define hidden range(i32 0, 2) i32 @rdna4_tri_cover(ptr nofree noundef readonly c
   %64 = fadd contract float %57, %63
   %65 = load float, ptr %50, align 4, !tbaa !25
   %66 = getelementptr inbounds nuw i8, ptr addrspace(1) %53, i64 4
-  %67 = load float, ptr addrspace(1) %66, align 4, !tbaa !44
+  %67 = load float, ptr addrspace(1) %66, align 4, !tbaa !48
   %68 = fmul contract float %56, %67
   %69 = fmul contract float %68, 5.000000e-01
   %70 = fsub contract float 5.000000e-01, %69
@@ -811,71 +838,71 @@ define hidden range(i32 0, 2) i32 @rdna4_tri_cover(ptr nofree noundef readonly c
   %72 = fmul contract float %71, %70
   %73 = fadd contract float %65, %72
   %74 = getelementptr inbounds nuw i8, ptr addrspace(1) %53, i64 8
-  %75 = load float, ptr addrspace(1) %74, align 4, !tbaa !44
+  %75 = load float, ptr addrspace(1) %74, align 4, !tbaa !48
   %76 = fmul contract float %56, %75
   %77 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %33, i64 %43
-  %78 = load float, ptr addrspace(1) %77, align 4, !tbaa !44
+  %78 = load float, ptr addrspace(1) %77, align 4, !tbaa !48
   %79 = fcmp contract ugt float %78, 0.000000e+00
   br i1 %79, label %80, label %186
 
 80:                                               ; preds = %48
   %81 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %33, i64 %44
   %82 = getelementptr inbounds nuw i8, ptr addrspace(1) %81, i64 12
-  %83 = load float, ptr addrspace(1) %82, align 4, !tbaa !44
+  %83 = load float, ptr addrspace(1) %82, align 4, !tbaa !48
   %84 = fdiv contract float 1.000000e+00, %83
-  %85 = load float, ptr addrspace(1) %81, align 4, !tbaa !44
+  %85 = load float, ptr addrspace(1) %81, align 4, !tbaa !48
   %86 = fmul contract float %84, %85
   %87 = fmul contract float %86, 5.000000e-01
   %88 = fadd contract float %87, 5.000000e-01
   %89 = fmul contract float %62, %88
   %90 = fadd contract float %57, %89
   %91 = getelementptr inbounds nuw i8, ptr addrspace(1) %81, i64 4
-  %92 = load float, ptr addrspace(1) %91, align 4, !tbaa !44
+  %92 = load float, ptr addrspace(1) %91, align 4, !tbaa !48
   %93 = fmul contract float %84, %92
   %94 = fmul contract float %93, 5.000000e-01
   %95 = fsub contract float 5.000000e-01, %94
   %96 = fmul contract float %71, %95
   %97 = fadd contract float %65, %96
   %98 = getelementptr inbounds nuw i8, ptr addrspace(1) %81, i64 8
-  %99 = load float, ptr addrspace(1) %98, align 4, !tbaa !44
+  %99 = load float, ptr addrspace(1) %98, align 4, !tbaa !48
   %100 = fmul contract float %84, %99
   %101 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %38, i64 %43
-  %102 = load float, ptr addrspace(1) %101, align 4, !tbaa !44
+  %102 = load float, ptr addrspace(1) %101, align 4, !tbaa !48
   %103 = fcmp contract ugt float %102, 0.000000e+00
   br i1 %103, label %104, label %186
 
 104:                                              ; preds = %80
   %105 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %38, i64 %44
   %106 = getelementptr inbounds nuw i8, ptr addrspace(1) %105, i64 12
-  %107 = load float, ptr addrspace(1) %106, align 4, !tbaa !44
+  %107 = load float, ptr addrspace(1) %106, align 4, !tbaa !48
   %108 = fdiv contract float 1.000000e+00, %107
-  %109 = load float, ptr addrspace(1) %105, align 4, !tbaa !44
+  %109 = load float, ptr addrspace(1) %105, align 4, !tbaa !48
   %110 = fmul contract float %108, %109
   %111 = fmul contract float %110, 5.000000e-01
   %112 = fadd contract float %111, 5.000000e-01
   %113 = fmul contract float %62, %112
   %114 = fadd contract float %57, %113
   %115 = getelementptr inbounds nuw i8, ptr addrspace(1) %105, i64 4
-  %116 = load float, ptr addrspace(1) %115, align 4, !tbaa !44
+  %116 = load float, ptr addrspace(1) %115, align 4, !tbaa !48
   %117 = fmul contract float %108, %116
   %118 = fmul contract float %117, 5.000000e-01
   %119 = fsub contract float 5.000000e-01, %118
   %120 = fmul contract float %71, %119
   %121 = fadd contract float %65, %120
-  %122 = getelementptr inbounds nuw i8, ptr addrspace(1) %105, i64 8
-  %123 = load float, ptr addrspace(1) %122, align 4, !tbaa !44
-  %124 = fmul contract float %108, %123
-  %125 = fsub contract float %90, %64
-  %126 = fsub contract float %121, %73
+  %122 = fsub contract float %90, %64
+  %123 = fsub contract float %121, %73
+  %124 = fmul contract float %123, %122
+  %125 = fsub contract float %114, %64
+  %126 = fsub contract float %97, %73
   %127 = fmul contract float %126, %125
-  %128 = fsub contract float %114, %64
-  %129 = fsub contract float %97, %73
-  %130 = fmul contract float %129, %128
-  %131 = fsub contract float %127, %130
-  %132 = fcmp contract oeq float %131, 0.000000e+00
-  br i1 %132, label %186, label %133
+  %128 = fsub contract float %124, %127
+  %129 = fcmp contract oeq float %128, 0.000000e+00
+  br i1 %129, label %186, label %130
 
-133:                                              ; preds = %104
+130:                                              ; preds = %104
+  %131 = getelementptr inbounds nuw i8, ptr addrspace(1) %105, i64 8
+  %132 = load float, ptr addrspace(1) %131, align 4, !tbaa !48
+  %133 = fmul contract float %108, %132
   %134 = fsub contract float %114, %90
   %135 = fsub contract float %13, %97
   %136 = fmul contract float %135, %134
@@ -883,70 +910,64 @@ define hidden range(i32 0, 2) i32 @rdna4_tri_cover(ptr nofree noundef readonly c
   %138 = fsub contract float %9, %90
   %139 = fmul contract float %137, %138
   %140 = fsub contract float %136, %139
-  %141 = fsub contract float %13, %73
-  %142 = fmul contract float %141, %125
-  %143 = fsub contract float %9, %64
-  %144 = fmul contract float %129, %143
-  %145 = fsub contract float %142, %144
-  %146 = fdiv contract float %140, %131
-  %147 = fcmp contract olt float %146, 0.000000e+00
-  br i1 %147, label %186, label %148
-
-148:                                              ; preds = %133
-  %149 = fsub contract float %13, %121
-  %150 = fsub contract float %64, %114
-  %151 = fmul contract float %149, %150
-  %152 = fsub contract float %73, %121
-  %153 = fsub contract float %9, %114
-  %154 = fmul contract float %152, %153
-  %155 = fsub contract float %151, %154
-  %156 = fdiv contract float %155, %131
-  %157 = fcmp contract olt float %156, 0.000000e+00
-  br i1 %157, label %186, label %158
-
-158:                                              ; preds = %148
-  %159 = fdiv contract float %145, %131
-  %160 = fcmp contract olt float %159, 0.000000e+00
-  br i1 %160, label %186, label %161
-
-161:                                              ; preds = %158
-  %162 = fmul contract float %56, %146
-  %163 = fmul contract float %84, %156
-  %164 = fadd contract float %162, %163
-  %165 = fmul contract float %108, %159
-  %166 = fadd contract float %165, %164
-  %167 = getelementptr inbounds nuw i8, ptr %3, i64 36
-  %168 = getelementptr inbounds nuw i8, ptr %3, i64 24
-  store float %146, ptr %167, align 4, !tbaa !44
-  %169 = fdiv contract float %162, %166
-  store float %169, ptr %168, align 8, !tbaa !44
-  %170 = getelementptr inbounds nuw i8, ptr %3, i64 40
-  store float %156, ptr %170, align 8, !tbaa !44
-  %171 = fdiv contract float %163, %166
-  %172 = getelementptr inbounds nuw i8, ptr %3, i64 28
-  store float %171, ptr %172, align 4, !tbaa !44
-  %173 = getelementptr inbounds nuw i8, ptr %3, i64 44
-  store float %159, ptr %173, align 4, !tbaa !44
-  %174 = fdiv contract float %165, %166
-  %175 = getelementptr inbounds nuw i8, ptr %3, i64 32
-  store float %174, ptr %175, align 8, !tbaa !44
-  %176 = fmul contract float %76, %146
-  %177 = fmul contract float %100, %156
-  %178 = fadd contract float %176, %177
-  %179 = fmul contract float %124, %159
-  %180 = fadd contract float %179, %178
-  %181 = getelementptr inbounds nuw i8, ptr %3, i64 48
-  store float %180, ptr %181, align 8, !tbaa !45
-  %182 = getelementptr inbounds nuw i8, ptr %3, i64 52
-  store float %166, ptr %182, align 4, !tbaa !47
-  %183 = fcmp contract olt float %131, 0.000000e+00
-  %184 = zext i1 %183 to i32
-  %185 = getelementptr inbounds nuw i8, ptr %3, i64 56
-  store i32 %184, ptr %185, align 8, !tbaa !48
+  %141 = fsub contract float %64, %114
+  %142 = fsub contract float %13, %121
+  %143 = fmul contract float %142, %141
+  %144 = fsub contract float %73, %121
+  %145 = fsub contract float %9, %114
+  %146 = fmul contract float %144, %145
+  %147 = fsub contract float %143, %146
+  %148 = fsub contract float %13, %73
+  %149 = fmul contract float %148, %122
+  %150 = fsub contract float %9, %64
+  %151 = fmul contract float %126, %150
+  %152 = fsub contract float %149, %151
+  %153 = fdiv contract float %140, %128
+  %154 = fdiv contract float %147, %128
+  %155 = fdiv contract float %152, %128
+  %156 = fmul contract float %56, %153
+  %157 = fmul contract float %84, %154
+  %158 = fadd contract float %156, %157
+  %159 = fmul contract float %108, %155
+  %160 = fadd contract float %159, %158
+  %161 = getelementptr inbounds nuw i8, ptr %3, i64 36
+  %162 = getelementptr inbounds nuw i8, ptr %3, i64 24
+  store float %153, ptr %161, align 4, !tbaa !48
+  %163 = fdiv contract float %156, %160
+  store float %163, ptr %162, align 8, !tbaa !48
+  %164 = getelementptr inbounds nuw i8, ptr %3, i64 40
+  store float %154, ptr %164, align 8, !tbaa !48
+  %165 = fdiv contract float %157, %160
+  %166 = getelementptr inbounds nuw i8, ptr %3, i64 28
+  store float %165, ptr %166, align 4, !tbaa !48
+  %167 = getelementptr inbounds nuw i8, ptr %3, i64 44
+  store float %155, ptr %167, align 4, !tbaa !48
+  %168 = fdiv contract float %159, %160
+  %169 = getelementptr inbounds nuw i8, ptr %3, i64 32
+  store float %168, ptr %169, align 8, !tbaa !48
+  %170 = fcmp contract olt float %153, 0.000000e+00
+  %171 = fcmp contract olt float %154, 0.000000e+00
+  %172 = fcmp contract olt float %155, 0.000000e+00
+  %173 = select i1 %172, i1 true, i1 %171
+  %174 = select i1 %173, i1 true, i1 %170
+  %175 = fmul contract float %76, %153
+  %176 = fmul contract float %100, %154
+  %177 = fadd contract float %175, %176
+  %178 = fmul contract float %133, %155
+  %179 = fadd contract float %178, %177
+  %180 = getelementptr inbounds nuw i8, ptr %3, i64 48
+  store float %179, ptr %180, align 8, !tbaa !49
+  %181 = getelementptr inbounds nuw i8, ptr %3, i64 52
+  store float %160, ptr %181, align 4, !tbaa !51
+  %182 = fcmp contract olt float %128, 0.000000e+00
+  %183 = zext i1 %182 to i32
+  %184 = getelementptr inbounds nuw i8, ptr %3, i64 56
+  store i32 %183, ptr %184, align 8, !tbaa !52
+  %185 = select i1 %174, i32 2, i32 1
   br label %186
 
-186:                                              ; preds = %4, %48, %80, %133, %148, %158, %104, %161
-  %187 = phi i32 [ 0, %104 ], [ 1, %161 ], [ 0, %133 ], [ 0, %158 ], [ 0, %148 ], [ 0, %80 ], [ 0, %48 ], [ 0, %4 ]
+186:                                              ; preds = %4, %48, %80, %104, %130
+  %187 = phi i32 [ 0, %104 ], [ %185, %130 ], [ 0, %80 ], [ 0, %48 ], [ 0, %4 ]
   ret i32 %187
 }
 
@@ -957,11 +978,11 @@ define hidden <4 x float> @rdna4_interp(ptr nofree noundef readonly captures(non
   br i1 %6, label %19, label %7
 
 7:                                                ; preds = %4
-  %8 = load ptr addrspace(1), ptr %0, align 8, !tbaa !43
+  %8 = load ptr addrspace(1), ptr %0, align 8, !tbaa !47
   %9 = getelementptr inbounds nuw i8, ptr %0, i64 8
-  %10 = load ptr addrspace(1), ptr %9, align 8, !tbaa !43
+  %10 = load ptr addrspace(1), ptr %9, align 8, !tbaa !47
   %11 = getelementptr inbounds nuw i8, ptr %0, i64 16
-  %12 = load ptr addrspace(1), ptr %11, align 8, !tbaa !43
+  %12 = load ptr addrspace(1), ptr %11, align 8, !tbaa !47
   %13 = getelementptr inbounds nuw i8, ptr %0, i64 36
   %14 = getelementptr inbounds nuw i8, ptr %0, i64 40
   %15 = getelementptr inbounds nuw i8, ptr %0, i64 44
@@ -980,34 +1001,34 @@ define hidden <4 x float> @rdna4_interp(ptr nofree noundef readonly captures(non
   %24 = add i32 %23, %1
   %25 = zext i32 %24 to i64
   %26 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %8, i64 %25
-  %27 = load float, ptr addrspace(1) %26, align 4, !tbaa !44
+  %27 = load float, ptr addrspace(1) %26, align 4, !tbaa !48
   %28 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %10, i64 %25
-  %29 = load float, ptr addrspace(1) %28, align 4, !tbaa !44
+  %29 = load float, ptr addrspace(1) %28, align 4, !tbaa !48
   %30 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %12, i64 %25
-  %31 = load float, ptr addrspace(1) %30, align 4, !tbaa !44
+  %31 = load float, ptr addrspace(1) %30, align 4, !tbaa !48
   switch i32 %3, label %41 [
     i32 2, label %50
     i32 1, label %32
   ]
 
 32:                                               ; preds = %21
-  %33 = load float, ptr %13, align 4, !tbaa !44
+  %33 = load float, ptr %13, align 4, !tbaa !48
   %34 = fmul contract float %27, %33
-  %35 = load float, ptr %14, align 8, !tbaa !44
+  %35 = load float, ptr %14, align 8, !tbaa !48
   %36 = fmul contract float %29, %35
   %37 = fadd contract float %34, %36
-  %38 = load float, ptr %15, align 4, !tbaa !44
+  %38 = load float, ptr %15, align 4, !tbaa !48
   %39 = fmul contract float %31, %38
   %40 = fadd contract float %37, %39
   br label %50
 
 41:                                               ; preds = %21
-  %42 = load float, ptr %16, align 8, !tbaa !44
+  %42 = load float, ptr %16, align 8, !tbaa !48
   %43 = fmul contract float %27, %42
-  %44 = load float, ptr %17, align 4, !tbaa !44
+  %44 = load float, ptr %17, align 4, !tbaa !48
   %45 = fmul contract float %29, %44
   %46 = fadd contract float %43, %45
-  %47 = load float, ptr %18, align 8, !tbaa !44
+  %47 = load float, ptr %18, align 8, !tbaa !48
   %48 = fmul contract float %31, %47
   %49 = fadd contract float %46, %48
   br label %50
@@ -1017,25 +1038,25 @@ define hidden <4 x float> @rdna4_interp(ptr nofree noundef readonly captures(non
   %52 = insertelement <4 x float> %22, float %51, i32 %23
   %53 = add nuw nsw i32 %23, 1
   %54 = icmp eq i32 %53, %5
-  br i1 %54, label %19, label %21, !llvm.loop !49
+  br i1 %54, label %19, label %21, !llvm.loop !53
 }
 
 ; Function Attrs: alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: read) uwtable
 define hidden <4 x float> @rdna4_frag_position(ptr nofree noundef readonly captures(none) %0, ptr nofree noundef readonly captures(none) %1) local_unnamed_addr #4 {
-  %3 = load i32, ptr %0, align 16, !tbaa !38
+  %3 = load i32, ptr %0, align 16, !tbaa !42
   %4 = uitofp contract i32 %3 to float
   %5 = fadd contract float %4, 5.000000e-01
   %6 = insertelement <4 x float> poison, float %5, i64 0
   %7 = getelementptr inbounds nuw i8, ptr %0, i64 4
-  %8 = load i32, ptr %7, align 4, !tbaa !40
+  %8 = load i32, ptr %7, align 4, !tbaa !44
   %9 = uitofp contract i32 %8 to float
   %10 = fadd contract float %9, 5.000000e-01
   %11 = insertelement <4 x float> %6, float %10, i64 1
   %12 = getelementptr inbounds nuw i8, ptr %1, i64 48
-  %13 = load float, ptr %12, align 8, !tbaa !45
+  %13 = load float, ptr %12, align 8, !tbaa !49
   %14 = insertelement <4 x float> %11, float %13, i64 2
   %15 = getelementptr inbounds nuw i8, ptr %1, i64 52
-  %16 = load float, ptr %15, align 4, !tbaa !47
+  %16 = load float, ptr %15, align 4, !tbaa !51
   %17 = insertelement <4 x float> %14, float %16, i64 3
   ret <4 x float> %17
 }
@@ -1043,275 +1064,455 @@ define hidden <4 x float> @rdna4_frag_position(ptr nofree noundef readonly captu
 ; Function Attrs: alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: read) uwtable
 define hidden i32 @rdna4_front_facing(ptr nofree noundef readonly captures(none) %0) local_unnamed_addr #4 {
   %2 = getelementptr inbounds nuw i8, ptr %0, i64 56
-  %3 = load i32, ptr %2, align 8, !tbaa !48
+  %3 = load i32, ptr %2, align 8, !tbaa !52
   ret i32 %3
 }
 
-; Function Attrs: alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: readwrite) uwtable
+; Function Attrs: alwaysinline nofree norecurse nosync nounwind memory(argmem: readwrite) uwtable
 define hidden void @rdna4_px_blend(ptr nofree noundef readonly captures(none) %0, ptr nofree noundef captures(none) initializes((32, 36)) %1, <4 x float> noundef %2) local_unnamed_addr #6 {
   %4 = getelementptr inbounds nuw i8, ptr %1, i64 32
-  store i32 1, ptr %4, align 16, !tbaa !42
+  store i32 1, ptr %4, align 16, !tbaa !46
   %5 = getelementptr inbounds nuw i8, ptr %0, i64 64
   %6 = load i32, ptr %5, align 8, !tbaa !28
-  %7 = icmp eq i32 %6, 0
+  %7 = icmp sgt i32 %6, -1
   %8 = getelementptr inbounds nuw i8, ptr %1, i64 16
-  br i1 %7, label %102, label %9
+  br i1 %7, label %168, label %9
 
 9:                                                ; preds = %3
-  %10 = load <4 x float>, ptr %8, align 16, !tbaa !41
-  %11 = extractelement <4 x float> %10, i64 3
-  %12 = fsub contract float 1.000000e+00, %11
-  %13 = extractelement <4 x float> %2, i64 3
-  %14 = fsub contract float 1.000000e+00, %13
-  %15 = lshr i32 %6, 8
-  %16 = extractelement <4 x float> %2, i64 0
-  %17 = trunc i32 %6 to i8
-  switch i8 %17, label %22 [
-    i8 0, label %23
-    i8 4, label %18
-    i8 5, label %19
-    i8 8, label %20
-    i8 9, label %21
-  ]
-
-18:                                               ; preds = %9
-  br label %23
-
-19:                                               ; preds = %9
-  br label %23
-
-20:                                               ; preds = %9
-  br label %23
-
-21:                                               ; preds = %9
-  br label %23
-
-22:                                               ; preds = %9
-  br label %23
-
-23:                                               ; preds = %9, %18, %19, %20, %21, %22
-  %24 = phi float [ 1.000000e+00, %22 ], [ %12, %21 ], [ %13, %18 ], [ %14, %19 ], [ %11, %20 ], [ 0.000000e+00, %9 ]
-  %25 = fmul contract float %16, %24
-  %26 = extractelement <4 x float> %10, i64 0
-  %27 = trunc i32 %15 to i8
-  switch i8 %27, label %32 [
-    i8 0, label %33
-    i8 4, label %28
-    i8 5, label %29
-    i8 8, label %30
-    i8 9, label %31
-  ]
-
-28:                                               ; preds = %23
-  br label %33
-
-29:                                               ; preds = %23
-  br label %33
-
-30:                                               ; preds = %23
-  br label %33
-
-31:                                               ; preds = %23
-  br label %33
-
-32:                                               ; preds = %23
-  br label %33
-
-33:                                               ; preds = %23, %28, %29, %30, %31, %32
-  %34 = phi float [ 1.000000e+00, %32 ], [ %12, %31 ], [ %13, %28 ], [ %14, %29 ], [ %11, %30 ], [ 0.000000e+00, %23 ]
-  %35 = fmul contract float %26, %34
-  %36 = fadd contract float %25, %35
-  %37 = insertelement <4 x float> poison, float %36, i64 0
-  %38 = extractelement <4 x float> %2, i64 1
-  switch i8 %17, label %43 [
-    i8 0, label %44
-    i8 4, label %42
-    i8 5, label %41
-    i8 8, label %40
-    i8 9, label %39
-  ]
-
-39:                                               ; preds = %33
-  br label %44
-
-40:                                               ; preds = %33
-  br label %44
-
-41:                                               ; preds = %33
-  br label %44
-
-42:                                               ; preds = %33
-  br label %44
-
-43:                                               ; preds = %33
-  br label %44
-
-44:                                               ; preds = %43, %42, %41, %40, %39, %33
-  %45 = phi float [ 1.000000e+00, %43 ], [ %12, %39 ], [ %13, %42 ], [ %14, %41 ], [ %11, %40 ], [ 0.000000e+00, %33 ]
-  %46 = fmul contract float %38, %45
-  %47 = extractelement <4 x float> %10, i64 1
-  switch i8 %27, label %52 [
-    i8 0, label %53
-    i8 4, label %51
-    i8 5, label %50
-    i8 8, label %49
-    i8 9, label %48
-  ]
-
-48:                                               ; preds = %44
-  br label %53
-
-49:                                               ; preds = %44
-  br label %53
-
-50:                                               ; preds = %44
-  br label %53
-
-51:                                               ; preds = %44
-  br label %53
-
-52:                                               ; preds = %44
-  br label %53
-
-53:                                               ; preds = %52, %51, %50, %49, %48, %44
-  %54 = phi float [ 1.000000e+00, %52 ], [ %12, %48 ], [ %13, %51 ], [ %14, %50 ], [ %11, %49 ], [ 0.000000e+00, %44 ]
-  %55 = fmul contract float %47, %54
-  %56 = fadd contract float %46, %55
-  %57 = insertelement <4 x float> %37, float %56, i64 1
-  %58 = extractelement <4 x float> %2, i64 2
-  switch i8 %17, label %63 [
-    i8 0, label %64
-    i8 4, label %62
+  %10 = load <4 x float>, ptr %8, align 16, !tbaa !45
+  %11 = extractelement <4 x float> %2, i64 3
+  %12 = extractelement <4 x float> %10, i64 3
+  %13 = fsub contract float 1.000000e+00, %12
+  %14 = fcmp contract olt float %11, %13
+  %15 = select contract i1 %14, float %11, float %13
+  %16 = fsub contract float 1.000000e+00, %11
+  %17 = lshr i32 %6, 8
+  %18 = trunc i32 %6 to i8
+  %19 = trunc i32 %17 to i8
+  %20 = and i8 %19, 127
+  %21 = extractelement <4 x float> %2, i64 0
+  switch i8 %18, label %70 [
+    i8 0, label %71
+    i8 2, label %57
+    i8 3, label %58
+    i8 4, label %60
     i8 5, label %61
-    i8 8, label %60
-    i8 9, label %59
-  ]
-
-59:                                               ; preds = %53
-  br label %64
-
-60:                                               ; preds = %53
-  br label %64
-
-61:                                               ; preds = %53
-  br label %64
-
-62:                                               ; preds = %53
-  br label %64
-
-63:                                               ; preds = %53
-  br label %64
-
-64:                                               ; preds = %63, %62, %61, %60, %59, %53
-  %65 = phi float [ 1.000000e+00, %63 ], [ %12, %59 ], [ %13, %62 ], [ %14, %61 ], [ %11, %60 ], [ 0.000000e+00, %53 ]
-  %66 = fmul contract float %58, %65
-  %67 = extractelement <4 x float> %10, i64 2
-  switch i8 %27, label %72 [
-    i8 0, label %73
-    i8 4, label %71
-    i8 5, label %70
-    i8 8, label %69
+    i8 6, label %62
+    i8 7, label %64
+    i8 8, label %67
     i8 9, label %68
+    i8 10, label %69
   ]
 
-68:                                               ; preds = %64
-  br label %73
+22:                                               ; preds = %159
+  br label %35
 
-69:                                               ; preds = %64
-  br label %73
+23:                                               ; preds = %159
+  br label %35
 
-70:                                               ; preds = %64
-  br label %73
+24:                                               ; preds = %159
+  %25 = extractelement <4 x float> %10, i64 3
+  %26 = fsub contract float 1.000000e+00, %25
+  br label %35
 
-71:                                               ; preds = %64
-  br label %73
+27:                                               ; preds = %159
+  %28 = extractelement <4 x float> %10, i64 3
+  br label %35
 
-72:                                               ; preds = %64
-  br label %73
+29:                                               ; preds = %159
+  br label %35
 
-73:                                               ; preds = %72, %71, %70, %69, %68, %64
-  %74 = phi float [ 1.000000e+00, %72 ], [ %12, %68 ], [ %13, %71 ], [ %14, %70 ], [ %11, %69 ], [ 0.000000e+00, %64 ]
-  %75 = fmul contract float %67, %74
-  %76 = fadd contract float %66, %75
-  %77 = insertelement <4 x float> %57, float %76, i64 2
-  %78 = lshr i32 %6, 16
-  %79 = lshr i32 %6, 24
-  %80 = extractelement <4 x float> %2, i64 3
-  %81 = trunc i32 %78 to i8
-  switch i8 %81, label %86 [
+30:                                               ; preds = %159
+  br label %35
+
+31:                                               ; preds = %159
+  %32 = fsub contract float 1.000000e+00, %166
+  br label %35
+
+33:                                               ; preds = %159
+  br label %35
+
+34:                                               ; preds = %159
+  br label %35
+
+35:                                               ; preds = %34, %33, %31, %30, %29, %27, %24, %23, %22, %159
+  %36 = phi float [ 1.000000e+00, %34 ], [ 0.000000e+00, %159 ], [ %166, %33 ], [ %32, %31 ], [ %11, %30 ], [ %16, %29 ], [ %28, %27 ], [ %26, %24 ], [ %12, %23 ], [ %13, %22 ]
+  %37 = fmul contract float %166, %36
+  %38 = extractelement <4 x float> %10, i64 3
+  %39 = trunc nuw i32 %165 to i8
+  %40 = and i8 %39, 127
+  switch i8 %40, label %51 [
+    i8 0, label %52
+    i8 2, label %50
+    i8 3, label %48
+    i8 4, label %47
+    i8 5, label %46
+    i8 6, label %45
+    i8 7, label %43
+    i8 8, label %42
+    i8 9, label %41
+  ]
+
+41:                                               ; preds = %35
+  br label %52
+
+42:                                               ; preds = %35
+  br label %52
+
+43:                                               ; preds = %35
+  %44 = fsub contract float 1.000000e+00, %38
+  br label %52
+
+45:                                               ; preds = %35
+  br label %52
+
+46:                                               ; preds = %35
+  br label %52
+
+47:                                               ; preds = %35
+  br label %52
+
+48:                                               ; preds = %35
+  %49 = fsub contract float 1.000000e+00, %166
+  br label %52
+
+50:                                               ; preds = %35
+  br label %52
+
+51:                                               ; preds = %35
+  br label %52
+
+52:                                               ; preds = %51, %50, %48, %47, %46, %45, %43, %42, %41, %35
+  %53 = phi float [ 1.000000e+00, %51 ], [ 0.000000e+00, %35 ], [ %166, %50 ], [ %49, %48 ], [ %11, %47 ], [ %16, %46 ], [ %38, %45 ], [ %44, %43 ], [ %12, %42 ], [ %13, %41 ]
+  %54 = fmul contract float %38, %53
+  %55 = fadd contract float %37, %54
+  %56 = insertelement <4 x float> %163, float %55, i64 3
+  br label %168
+
+57:                                               ; preds = %9
+  br label %71
+
+58:                                               ; preds = %9
+  %59 = fsub contract float 1.000000e+00, %21
+  br label %71
+
+60:                                               ; preds = %9
+  br label %71
+
+61:                                               ; preds = %9
+  br label %71
+
+62:                                               ; preds = %9
+  %63 = extractelement <4 x float> %10, i64 0
+  br label %71
+
+64:                                               ; preds = %9
+  %65 = extractelement <4 x float> %10, i64 0
+  %66 = fsub contract float 1.000000e+00, %65
+  br label %71
+
+67:                                               ; preds = %9
+  br label %71
+
+68:                                               ; preds = %9
+  br label %71
+
+69:                                               ; preds = %9
+  br label %71
+
+70:                                               ; preds = %9
+  br label %71
+
+71:                                               ; preds = %9, %57, %58, %60, %61, %62, %64, %67, %68, %69, %70
+  %72 = phi float [ 1.000000e+00, %70 ], [ %15, %69 ], [ %21, %57 ], [ %59, %58 ], [ %11, %60 ], [ %16, %61 ], [ %63, %62 ], [ %66, %64 ], [ %12, %67 ], [ %13, %68 ], [ 0.000000e+00, %9 ]
+  %73 = fmul contract float %21, %72
+  %74 = extractelement <4 x float> %10, i64 0
+  switch i8 %20, label %86 [
     i8 0, label %87
-    i8 4, label %85
-    i8 5, label %84
+    i8 2, label %75
+    i8 3, label %76
+    i8 4, label %78
+    i8 5, label %79
+    i8 6, label %80
+    i8 7, label %81
     i8 8, label %83
-    i8 9, label %82
+    i8 9, label %84
+    i8 10, label %85
   ]
 
-82:                                               ; preds = %73
+75:                                               ; preds = %71
   br label %87
 
-83:                                               ; preds = %73
+76:                                               ; preds = %71
+  %77 = fsub contract float 1.000000e+00, %21
   br label %87
 
-84:                                               ; preds = %73
+78:                                               ; preds = %71
   br label %87
 
-85:                                               ; preds = %73
+79:                                               ; preds = %71
   br label %87
 
-86:                                               ; preds = %73
+80:                                               ; preds = %71
   br label %87
 
-87:                                               ; preds = %86, %85, %84, %83, %82, %73
-  %88 = phi float [ 1.000000e+00, %86 ], [ %12, %82 ], [ %13, %85 ], [ %14, %84 ], [ %11, %83 ], [ 0.000000e+00, %73 ]
-  %89 = fmul contract float %80, %88
-  %90 = extractelement <4 x float> %10, i64 3
-  %91 = trunc nuw i32 %79 to i8
-  switch i8 %91, label %96 [
-    i8 0, label %97
-    i8 4, label %95
-    i8 5, label %94
-    i8 8, label %93
-    i8 9, label %92
+81:                                               ; preds = %71
+  %82 = fsub contract float 1.000000e+00, %74
+  br label %87
+
+83:                                               ; preds = %71
+  br label %87
+
+84:                                               ; preds = %71
+  br label %87
+
+85:                                               ; preds = %71
+  br label %87
+
+86:                                               ; preds = %71
+  br label %87
+
+87:                                               ; preds = %71, %75, %76, %78, %79, %80, %81, %83, %84, %85, %86
+  %88 = phi float [ 1.000000e+00, %86 ], [ %15, %85 ], [ %21, %75 ], [ %77, %76 ], [ %11, %78 ], [ %16, %79 ], [ %74, %80 ], [ %82, %81 ], [ %12, %83 ], [ %13, %84 ], [ 0.000000e+00, %71 ]
+  %89 = fmul contract float %74, %88
+  %90 = fadd contract float %73, %89
+  %91 = insertelement <4 x float> poison, float %90, i64 0
+  %92 = extractelement <4 x float> %2, i64 1
+  switch i8 %18, label %106 [
+    i8 0, label %107
+    i8 2, label %105
+    i8 3, label %103
+    i8 4, label %102
+    i8 5, label %101
+    i8 6, label %99
+    i8 7, label %96
+    i8 8, label %95
+    i8 9, label %94
+    i8 10, label %93
   ]
-
-92:                                               ; preds = %87
-  br label %97
 
 93:                                               ; preds = %87
-  br label %97
+  br label %107
 
 94:                                               ; preds = %87
-  br label %97
+  br label %107
 
 95:                                               ; preds = %87
-  br label %97
+  br label %107
 
 96:                                               ; preds = %87
-  br label %97
+  %97 = extractelement <4 x float> %10, i64 1
+  %98 = fsub contract float 1.000000e+00, %97
+  br label %107
 
-97:                                               ; preds = %96, %95, %94, %93, %92, %87
-  %98 = phi float [ 1.000000e+00, %96 ], [ %12, %92 ], [ %13, %95 ], [ %14, %94 ], [ %11, %93 ], [ 0.000000e+00, %87 ]
-  %99 = fmul contract float %90, %98
-  %100 = fadd contract float %89, %99
-  %101 = insertelement <4 x float> %77, float %100, i64 3
-  br label %102
+99:                                               ; preds = %87
+  %100 = extractelement <4 x float> %10, i64 1
+  br label %107
 
-102:                                              ; preds = %3, %97
-  %103 = phi <4 x float> [ %101, %97 ], [ %2, %3 ]
-  store <4 x float> %103, ptr %8, align 16, !tbaa !41
+101:                                              ; preds = %87
+  br label %107
+
+102:                                              ; preds = %87
+  br label %107
+
+103:                                              ; preds = %87
+  %104 = fsub contract float 1.000000e+00, %92
+  br label %107
+
+105:                                              ; preds = %87
+  br label %107
+
+106:                                              ; preds = %87
+  br label %107
+
+107:                                              ; preds = %106, %105, %103, %102, %101, %99, %96, %95, %94, %93, %87
+  %108 = phi float [ 1.000000e+00, %106 ], [ %15, %93 ], [ %92, %105 ], [ %104, %103 ], [ %11, %102 ], [ %16, %101 ], [ %100, %99 ], [ %98, %96 ], [ %12, %95 ], [ %13, %94 ], [ 0.000000e+00, %87 ]
+  %109 = fmul contract float %92, %108
+  %110 = extractelement <4 x float> %10, i64 1
+  switch i8 %20, label %122 [
+    i8 0, label %123
+    i8 2, label %121
+    i8 3, label %119
+    i8 4, label %118
+    i8 5, label %117
+    i8 6, label %116
+    i8 7, label %114
+    i8 8, label %113
+    i8 9, label %112
+    i8 10, label %111
+  ]
+
+111:                                              ; preds = %107
+  br label %123
+
+112:                                              ; preds = %107
+  br label %123
+
+113:                                              ; preds = %107
+  br label %123
+
+114:                                              ; preds = %107
+  %115 = fsub contract float 1.000000e+00, %110
+  br label %123
+
+116:                                              ; preds = %107
+  br label %123
+
+117:                                              ; preds = %107
+  br label %123
+
+118:                                              ; preds = %107
+  br label %123
+
+119:                                              ; preds = %107
+  %120 = fsub contract float 1.000000e+00, %92
+  br label %123
+
+121:                                              ; preds = %107
+  br label %123
+
+122:                                              ; preds = %107
+  br label %123
+
+123:                                              ; preds = %122, %121, %119, %118, %117, %116, %114, %113, %112, %111, %107
+  %124 = phi float [ 1.000000e+00, %122 ], [ %15, %111 ], [ %92, %121 ], [ %120, %119 ], [ %11, %118 ], [ %16, %117 ], [ %110, %116 ], [ %115, %114 ], [ %12, %113 ], [ %13, %112 ], [ 0.000000e+00, %107 ]
+  %125 = fmul contract float %110, %124
+  %126 = fadd contract float %109, %125
+  %127 = insertelement <4 x float> %91, float %126, i64 1
+  %128 = extractelement <4 x float> %2, i64 2
+  switch i8 %18, label %142 [
+    i8 0, label %143
+    i8 2, label %141
+    i8 3, label %139
+    i8 4, label %138
+    i8 5, label %137
+    i8 6, label %135
+    i8 7, label %132
+    i8 8, label %131
+    i8 9, label %130
+    i8 10, label %129
+  ]
+
+129:                                              ; preds = %123
+  br label %143
+
+130:                                              ; preds = %123
+  br label %143
+
+131:                                              ; preds = %123
+  br label %143
+
+132:                                              ; preds = %123
+  %133 = extractelement <4 x float> %10, i64 2
+  %134 = fsub contract float 1.000000e+00, %133
+  br label %143
+
+135:                                              ; preds = %123
+  %136 = extractelement <4 x float> %10, i64 2
+  br label %143
+
+137:                                              ; preds = %123
+  br label %143
+
+138:                                              ; preds = %123
+  br label %143
+
+139:                                              ; preds = %123
+  %140 = fsub contract float 1.000000e+00, %128
+  br label %143
+
+141:                                              ; preds = %123
+  br label %143
+
+142:                                              ; preds = %123
+  br label %143
+
+143:                                              ; preds = %142, %141, %139, %138, %137, %135, %132, %131, %130, %129, %123
+  %144 = phi float [ 1.000000e+00, %142 ], [ %15, %129 ], [ %128, %141 ], [ %140, %139 ], [ %11, %138 ], [ %16, %137 ], [ %136, %135 ], [ %134, %132 ], [ %12, %131 ], [ %13, %130 ], [ 0.000000e+00, %123 ]
+  %145 = fmul contract float %128, %144
+  %146 = extractelement <4 x float> %10, i64 2
+  switch i8 %20, label %158 [
+    i8 0, label %159
+    i8 2, label %157
+    i8 3, label %155
+    i8 4, label %154
+    i8 5, label %153
+    i8 6, label %152
+    i8 7, label %150
+    i8 8, label %149
+    i8 9, label %148
+    i8 10, label %147
+  ]
+
+147:                                              ; preds = %143
+  br label %159
+
+148:                                              ; preds = %143
+  br label %159
+
+149:                                              ; preds = %143
+  br label %159
+
+150:                                              ; preds = %143
+  %151 = fsub contract float 1.000000e+00, %146
+  br label %159
+
+152:                                              ; preds = %143
+  br label %159
+
+153:                                              ; preds = %143
+  br label %159
+
+154:                                              ; preds = %143
+  br label %159
+
+155:                                              ; preds = %143
+  %156 = fsub contract float 1.000000e+00, %128
+  br label %159
+
+157:                                              ; preds = %143
+  br label %159
+
+158:                                              ; preds = %143
+  br label %159
+
+159:                                              ; preds = %158, %157, %155, %154, %153, %152, %150, %149, %148, %147, %143
+  %160 = phi float [ 1.000000e+00, %158 ], [ %15, %147 ], [ %128, %157 ], [ %156, %155 ], [ %11, %154 ], [ %16, %153 ], [ %146, %152 ], [ %151, %150 ], [ %12, %149 ], [ %13, %148 ], [ 0.000000e+00, %143 ]
+  %161 = fmul contract float %146, %160
+  %162 = fadd contract float %145, %161
+  %163 = insertelement <4 x float> %127, float %162, i64 2
+  %164 = lshr i32 %6, 16
+  %165 = lshr i32 %6, 24
+  %166 = extractelement <4 x float> %2, i64 3
+  %167 = trunc i32 %164 to i8
+  switch i8 %167, label %34 [
+    i8 0, label %35
+    i8 2, label %33
+    i8 3, label %31
+    i8 4, label %30
+    i8 5, label %29
+    i8 6, label %27
+    i8 7, label %24
+    i8 8, label %23
+    i8 9, label %22
+  ]
+
+168:                                              ; preds = %3, %52
+  %169 = phi <4 x float> [ %56, %52 ], [ %2, %3 ]
+  store <4 x float> %169, ptr %8, align 16, !tbaa !45
   ret void
 }
 
 ; Function Attrs: alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(write, argmem: readwrite, inaccessiblemem: none, target_mem: none) uwtable
 define hidden void @rdna4_px_end(ptr nofree noundef readonly captures(none) %0, ptr nofree noundef readonly captures(none) %1) local_unnamed_addr #7 {
   %3 = getelementptr inbounds nuw i8, ptr %1, i64 32
-  %4 = load i32, ptr %3, align 16, !tbaa !42
+  %4 = load i32, ptr %3, align 16, !tbaa !46
   %5 = icmp eq i32 %4, 0
   br i1 %5, label %65, label %6
 
 6:                                                ; preds = %2
   %7 = getelementptr inbounds nuw i8, ptr %1, i64 16
-  %8 = load <4 x float>, ptr %7, align 16, !tbaa !41
+  %8 = load <4 x float>, ptr %7, align 16, !tbaa !45
   %9 = getelementptr inbounds nuw i8, ptr %0, i64 44
   %10 = load i32, ptr %9, align 4, !tbaa !23
   %11 = extractelement <4 x float> %8, i64 0
@@ -1359,16 +1560,16 @@ define hidden void @rdna4_px_end(ptr nofree noundef readonly captures(none) %0, 
   %53 = getelementptr inbounds nuw i8, ptr %0, i64 24
   %54 = load ptr addrspace(1), ptr %53, align 8, !tbaa !19
   %55 = getelementptr inbounds nuw i8, ptr %1, i64 4
-  %56 = load i32, ptr %55, align 4, !tbaa !40
+  %56 = load i32, ptr %55, align 4, !tbaa !44
   %57 = getelementptr inbounds nuw i8, ptr %0, i64 32
   %58 = load i32, ptr %57, align 8, !tbaa !20
   %59 = lshr i32 %58, 2
   %60 = mul i32 %59, %56
-  %61 = load i32, ptr %1, align 16, !tbaa !38
+  %61 = load i32, ptr %1, align 16, !tbaa !42
   %62 = add i32 %60, %61
   %63 = zext i32 %62 to i64
   %64 = getelementptr inbounds nuw [4 x i8], ptr addrspace(1) %54, i64 %63
-  store i32 %52, ptr addrspace(1) %64, align 4, !tbaa !36
+  store i32 %52, ptr addrspace(1) %64, align 4, !tbaa !40
   br label %65
 
 65:                                               ; preds = %6, %2
@@ -1393,7 +1594,7 @@ attributes #2 = { mustprogress nocallback nocreateundeforpoison nofree nosync no
 attributes #3 = { alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(read, argmem: readwrite, inaccessiblemem: none, target_mem: none) uwtable "amdgpu-no-cluster-id-x" "amdgpu-no-cluster-id-y" "amdgpu-no-cluster-id-z" "amdgpu-no-completion-action" "amdgpu-no-default-queue" "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-flat-scratch-init" "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr" "amdgpu-no-workgroup-id-x" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-no-workitem-id-x" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z" "amdgpu-no-wwm" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="gfx1201" }
 attributes #4 = { alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: read) uwtable "amdgpu-no-cluster-id-x" "amdgpu-no-cluster-id-y" "amdgpu-no-cluster-id-z" "amdgpu-no-completion-action" "amdgpu-no-default-queue" "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-flat-scratch-init" "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr" "amdgpu-no-workgroup-id-x" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-no-workitem-id-x" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z" "amdgpu-no-wwm" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="gfx1201" }
 attributes #5 = { alwaysinline nofree norecurse nosync nounwind memory(read, inaccessiblemem: none, target_mem: none) uwtable "amdgpu-no-cluster-id-x" "amdgpu-no-cluster-id-y" "amdgpu-no-cluster-id-z" "amdgpu-no-completion-action" "amdgpu-no-default-queue" "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-flat-scratch-init" "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr" "amdgpu-no-workgroup-id-x" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-no-workitem-id-x" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z" "amdgpu-no-wwm" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="gfx1201" }
-attributes #6 = { alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(argmem: readwrite) uwtable "amdgpu-no-cluster-id-x" "amdgpu-no-cluster-id-y" "amdgpu-no-cluster-id-z" "amdgpu-no-completion-action" "amdgpu-no-default-queue" "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-flat-scratch-init" "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr" "amdgpu-no-workgroup-id-x" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-no-workitem-id-x" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z" "amdgpu-no-wwm" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="gfx1201" }
+attributes #6 = { alwaysinline nofree norecurse nosync nounwind memory(argmem: readwrite) uwtable "amdgpu-no-cluster-id-x" "amdgpu-no-cluster-id-y" "amdgpu-no-cluster-id-z" "amdgpu-no-completion-action" "amdgpu-no-default-queue" "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-flat-scratch-init" "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr" "amdgpu-no-workgroup-id-x" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-no-workitem-id-x" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z" "amdgpu-no-wwm" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="gfx1201" }
 attributes #7 = { alwaysinline mustprogress nofree norecurse nosync nounwind willreturn memory(write, argmem: readwrite, inaccessiblemem: none, target_mem: none) uwtable "amdgpu-no-cluster-id-x" "amdgpu-no-cluster-id-y" "amdgpu-no-cluster-id-z" "amdgpu-no-completion-action" "amdgpu-no-default-queue" "amdgpu-no-dispatch-id" "amdgpu-no-dispatch-ptr" "amdgpu-no-flat-scratch-init" "amdgpu-no-heap-ptr" "amdgpu-no-hostcall-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-lds-kernel-id" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-queue-ptr" "amdgpu-no-workgroup-id-x" "amdgpu-no-workgroup-id-y" "amdgpu-no-workgroup-id-z" "amdgpu-no-workitem-id-x" "amdgpu-no-workitem-id-y" "amdgpu-no-workitem-id-z" "amdgpu-no-wwm" "no-trapping-math"="true" "stack-protector-buffer-size"="8" "target-cpu"="gfx1201" }
 attributes #8 = { nocallback nocreateundeforpoison nofree nosync nounwind speculatable willreturn memory(none) }
 
@@ -1411,7 +1612,7 @@ attributes #8 = { nocallback nocreateundeforpoison nofree nosync nounwind specul
 !7 = !{!"omnipotent char", !8, i64 0}
 !8 = !{!"Simple C/C++ TBAA"}
 !9 = !{!10, !11, i64 0}
-!10 = !{!"rdna4_draw", !11, i64 0, !6, i64 8, !6, i64 12, !6, i64 16, !6, i64 20, !13, i64 24, !6, i64 32, !6, i64 36, !6, i64 40, !6, i64 44, !14, i64 48, !14, i64 52, !14, i64 56, !14, i64 60, !6, i64 64}
+!10 = !{!"rdna4_draw", !11, i64 0, !6, i64 8, !6, i64 12, !6, i64 16, !6, i64 20, !13, i64 24, !6, i64 32, !6, i64 36, !6, i64 40, !6, i64 44, !14, i64 48, !14, i64 52, !14, i64 56, !14, i64 60, !6, i64 64, !6, i64 68, !6, i64 72, !6, i64 76, !6, i64 80}
 !11 = !{!"p1 float", !12, i64 0}
 !12 = !{!"any pointer", !7, i64 0}
 !13 = !{!"p1 int", !12, i64 0}
@@ -1430,25 +1631,29 @@ attributes #8 = { nocallback nocreateundeforpoison nofree nosync nounwind specul
 !26 = !{!10, !14, i64 56}
 !27 = !{!10, !14, i64 60}
 !28 = !{!10, !6, i64 64}
-!29 = !{!30, !6, i64 0}
-!30 = !{!"rdna4_sampler", !6, i64 0}
-!31 = !{!32, !6, i64 8}
-!32 = !{!"rdna4_texture", !13, i64 0, !6, i64 8, !6, i64 12, !6, i64 16, !6, i64 20}
-!33 = !{!32, !6, i64 12}
-!34 = !{!32, !13, i64 0}
-!35 = !{!32, !6, i64 16}
-!36 = !{!6, !6, i64 0}
-!37 = !{!32, !6, i64 20}
-!38 = !{!39, !6, i64 0}
-!39 = !{!"rdna4_px", !6, i64 0, !6, i64 4, !7, i64 16, !6, i64 32}
-!40 = !{!39, !6, i64 4}
-!41 = !{!7, !7, i64 0}
-!42 = !{!39, !6, i64 32}
-!43 = !{!11, !11, i64 0}
-!44 = !{!14, !14, i64 0}
-!45 = !{!46, !14, i64 48}
-!46 = !{!"rdna4_tri", !7, i64 0, !7, i64 24, !7, i64 36, !14, i64 48, !14, i64 52, !6, i64 56}
-!47 = !{!46, !14, i64 52}
-!48 = !{!46, !6, i64 56}
-!49 = distinct !{!49, !50}
-!50 = !{!"llvm.loop.mustprogress"}
+!29 = !{!10, !6, i64 68}
+!30 = !{!10, !6, i64 72}
+!31 = !{!10, !6, i64 76}
+!32 = !{!10, !6, i64 80}
+!33 = !{!34, !6, i64 0}
+!34 = !{!"rdna4_sampler", !6, i64 0}
+!35 = !{!36, !6, i64 8}
+!36 = !{!"rdna4_texture", !13, i64 0, !6, i64 8, !6, i64 12, !6, i64 16, !6, i64 20}
+!37 = !{!36, !6, i64 12}
+!38 = !{!36, !13, i64 0}
+!39 = !{!36, !6, i64 16}
+!40 = !{!6, !6, i64 0}
+!41 = !{!36, !6, i64 20}
+!42 = !{!43, !6, i64 0}
+!43 = !{!"rdna4_px", !6, i64 0, !6, i64 4, !7, i64 16, !6, i64 32}
+!44 = !{!43, !6, i64 4}
+!45 = !{!7, !7, i64 0}
+!46 = !{!43, !6, i64 32}
+!47 = !{!11, !11, i64 0}
+!48 = !{!14, !14, i64 0}
+!49 = !{!50, !14, i64 48}
+!50 = !{!"rdna4_tri", !7, i64 0, !7, i64 24, !7, i64 36, !14, i64 48, !14, i64 52, !6, i64 56}
+!51 = !{!50, !14, i64 52}
+!52 = !{!50, !6, i64 56}
+!53 = distinct !{!53, !54}
+!54 = !{!"llvm.loop.mustprogress"}

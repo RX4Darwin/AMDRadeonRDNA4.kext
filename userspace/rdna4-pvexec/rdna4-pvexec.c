@@ -23,6 +23,7 @@
  */
 
 #include <errno.h>
+#include <time.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
@@ -54,6 +55,11 @@ static int gVerbose;
 static volatile sig_atomic_t gStop;
 static program_t gPrograms[MAX_PROGRAMS];
 static int gNumPrograms;
+
+static uint64_t nowUs(void)
+{
+	return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
+}
 
 static void onSignal(int sig)
 {
@@ -295,7 +301,7 @@ static int moveBuffers(rdna4_t *gpu, const RDNA4PvJob *job, rdna4_buffer_t *gpuB
 
 /* A compiled render pipeline: its two kernels and what their ABIs say. */
 typedef struct {
-	char key[48];
+	char key[56];
 	rdna4_program_t vertex, fragment;
 	char vabi[MAX_KERNARGS][48];
 	char fabi[MAX_KERNARGS][48];
@@ -430,18 +436,51 @@ static uint8_t *guestCopy(rdna4_t *gpu, uint32_t task, uint64_t va, uint32_t byt
 	return p;
 }
 
+/* The vertex descriptor as compile-pipeline.sh reads it (vertex.desc): a line per attribute; nothing without one. */
+static int writeVertexDesc(const char *dir, const RDNA4PvJob *job)
+{
+	char path[512];
+	FILE *f;
+
+	if (!job->attributeMask)
+		return 1;
+
+	snprintf(path, sizeof(path), "%s/vertex.desc", dir);
+	f = fopen(path, "w");
+	if (!f)
+		return 0;
+
+	for (uint32_t i = 0; i < RDNA4_PVJOB_MAX_ATTRIBUTES; i++) {
+		const RDNA4PvAttribute *a = &job->attributes[i];
+		const RDNA4PvLayout *l;
+
+		if (!(job->attributeMask & 1u << i) || a->buffer >= RDNA4_PVJOB_MAX_ATTRIBUTES)
+			continue;
+
+		l = &job->layouts[a->buffer];
+		fprintf(f, "attribute %u %u %u %u %u %u %u\n", i, a->format, a->buffer, a->offset, l->stride, l->stepFunction,
+		        l->stepRate);
+	}
+
+	return fclose(f) == 0;
+}
+
 /* The job's render pipeline, compiled (or found) and loaded. */
 static pipeline_t *pipeline(rdna4_t *gpu, const RDNA4PvJob *job)
 {
 	uint8_t *vs = guestCopy(gpu, job->task, job->codeVa, job->codeBytes);
 	uint8_t *fs = guestCopy(gpu, job->task, job->fragmentVa, job->fragmentBytes);
-	char key[48], dir[512], path[512];
+	char key[56], dir[512], path[512];
 	pipeline_t *p = NULL;
 
 	if (!vs || !fs)
 		goto out;
 
-	snprintf(key, sizeof(key), "pipe-%016" PRIx64 "-%016" PRIx64, fnv1a(vs, job->codeBytes), fnv1a(fs, job->fragmentBytes));
+	/* the vertex descriptor is compiled into the vertex kernel */
+	snprintf(key, sizeof(key), "pipe-%016" PRIx64 "-%016" PRIx64 "-%08" PRIx32, fnv1a(vs, job->codeBytes),
+	         fnv1a(fs, job->fragmentBytes),
+	         job->attributeMask ? (uint32_t)fnv1a((const uint8_t *)&job->attributeMask,
+	                                              sizeof(job->attributeMask) + sizeof(job->attributes) + sizeof(job->layouts)) : 0);
 
 	for (int i = 0; i < gNumPipelines; i++) {
 		if (!strcmp(gPipelines[i].key, key)) {
@@ -461,7 +500,7 @@ static pipeline_t *pipeline(rdna4_t *gpu, const RDNA4PvJob *job)
 		goto out;
 
 	snprintf(path, sizeof(path), "%s/fs.metallib", dir);
-	if (!writeFile(path, fs, job->fragmentBytes) || !compilePipeline(dir)) {
+	if (!writeFile(path, fs, job->fragmentBytes) || !writeVertexDesc(dir, job) || !compilePipeline(dir)) {
 		fprintf(stderr, "rdna4-pvexec: %s: does not compile (%s)\n", key, dir);
 		goto out;
 	}
@@ -534,6 +573,14 @@ static int vertexArgs(const pipeline_t *p, const RDNA4PvJob *job, const rdna4_bu
 			put32(k, instance);
 		} else if (!strcmp(l, "out")) {
 			put64(k, out);
+		} else if (!strcmp(l, "indices")) {
+			const RDNA4PvBuffer *ix = stageBuffer(job, RDNA4_PVJOB_INDEX, 0);
+
+			if (job->indexType && !ix)
+				return 0;
+
+			put64(k, ix ? bufs[ix - job->buffers].gpu : 0);
+			put32(k, job->indexType);
 		}
 	}
 
@@ -599,6 +646,8 @@ static int fragmentArgs(const pipeline_t *p, const RDNA4PvJob *job, const rdna4_
 			for (int v = 0; v < 4; v++)
 				put32(k, job->viewport[v]);
 			put32(k, job->blend);
+			for (int v = 0; v < 4; v++)
+				put32(k, job->scissor[v]);
 		}
 	}
 
@@ -691,7 +740,7 @@ static uint32_t runDraw(rdna4_t *gpu, const RDNA4PvJob *job)
 	void *host = NULL;
 	uint64_t hostBytes = targetBytes;
 	uint32_t status = 1;
-	uint64_t us = 0;
+	uint64_t us = 0, t0 = nowUs(), tIn = 0, tRun = 0;
 	kern_return_t kr;
 
 	if (!p || !targetBytes || targetBytes > MAX_BUFFER_BYTES) {
@@ -734,6 +783,8 @@ static uint32_t runDraw(rdna4_t *gpu, const RDNA4PvJob *job)
 		goto out;
 	}
 
+	tIn = nowUs();
+
 	for (uint32_t instance = 0; instance < job->instanceCount; instance++) {
 		kernargs_t va = { .at = 0 }, fa = { .at = 0 };
 
@@ -752,6 +803,7 @@ static uint32_t runDraw(rdna4_t *gpu, const RDNA4PvJob *job)
 		}
 	}
 
+	tRun = nowUs();
 	kr = rdna4_read(gpu, &target, 0, host, targetBytes);
 	if (!kr)
 		kr = rdna4_pv_access(gpu, targetTask, targetVa, host, targetBytes, targetFlags | RDNA4_PVACCESS_WRITE);
@@ -760,9 +812,11 @@ static uint32_t runDraw(rdna4_t *gpu, const RDNA4PvJob *job)
 	else
 		status = 0;
 
+	/* where a draw's time goes: copies in (buffers, textures, target), the kernels, the target back */
 	if (gVerbose)
-		printf("rdna4-pvexec: job %u: %s, %u vertices into %ux%u (%s), %" PRIu64 " us\n", job->id, p->key,
-		       job->vertexCount, job->targetWidth, job->targetHeight, job->targetSurface ? "IOSurface" : "texture", us);
+		printf("rdna4-pvexec: job %u: %s, %u vertices into %ux%u (%s), %" PRIu64 " us on the GPU; in %" PRIu64
+		       " us, kernels %" PRIu64 " us, back %" PRIu64 " us\n", job->id, p->key, job->vertexCount, job->targetWidth,
+		       job->targetHeight, job->targetSurface ? "IOSurface" : "texture", us, tIn - t0, tRun - tIn, nowUs() - tRun);
 
 out:
 	freeAll(gpu, bufs, job->bufferCount);

@@ -3,6 +3,7 @@
 #   tools/metal/air/compile-pipeline.sh VERTEX.metallib FRAGMENT.metallib OUTDIR
 # Writes OUTDIR/vertex.{hsaco,abi,name} (the vertex function run once per vertex, air2amdgcn vertex) and OUTDIR/fragment.{hsaco,abi,name}
 # (the fragment function inside a kernel that rasterizes the draw, air2amdgcn fragment, linked with rdna4raster.ll beside this script).
+# OUTDIR/vertex.desc, when there, is the pipeline's vertex descriptor (air2amdgcn --vertex-desc).
 # Needs air2amdgcn ($AIR2AMDGCN, else Build/air/air2amdgcn), and llc, ld.lld, llvm-link and opt of an LLVM with the AMDGPU target on PATH
 # (or in $LLVM/bin); metallib.py beside this script.
 set -eu
@@ -30,7 +31,10 @@ fbc=$(module "$fs" "$out/fs")
 vname=$(basename "$vbc" .bc)
 fname=$(basename "$fbc" .bc)
 
-"$air2amdgcn" vertex "$vbc" -o "$out/vertex.ll" --abi "$out/vertex.abi"
+desc=
+[ -f "$out/vertex.desc" ] && desc="--vertex-desc $out/vertex.desc"
+# shellcheck disable=SC2086
+"$air2amdgcn" vertex "$vbc" -o "$out/vertex.ll" --abi "$out/vertex.abi" $desc
 llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1201 -O2 -filetype=obj "$out/vertex.ll" -o "$out/vertex.o"
 ld.lld -shared "$out/vertex.o" -o "$out/vertex.hsaco"
 printf '%s\n' "${vname#*_}" > "$out/vertex.name"

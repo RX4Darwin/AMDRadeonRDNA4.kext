@@ -72,15 +72,23 @@ enum {
 	kFlat = 2,
 };
 
-/* Blend state of colour attachment 0 (MTLBlendFactor, MTLBlendOperation is add). */
+/* Blend factors of colour attachment 0 (MTLBlendFactor; the operation is add). */
 enum {
 	kZero = 0,
 	kOne = 1,
+	kSourceColor = 2,
+	kOneMinusSourceColor = 3,
 	kSourceAlpha = 4,
 	kOneMinusSourceAlpha = 5,
+	kDestinationColor = 6,
+	kOneMinusDestinationColor = 7,
 	kDestinationAlpha = 8,
 	kOneMinusDestinationAlpha = 9,
+	kSourceAlphaSaturated = 10,
 };
+
+/* The blend word: enable bit, then the RGB and alpha factors, a byte each. */
+#define BLEND_ON (1u << 31)
 
 /* What one draw's fragment kernel knows, filled by the generated code from its kernargs. */
 struct rdna4_draw {
@@ -90,7 +98,8 @@ struct rdna4_draw {
 	guint *rt;
 	uint pitch, width, height, format;
 	float vx, vy, vw, vh;      /* viewport, pixels */
-	uint blend;                /* 0 off; else src | dst << 8 | srcAlpha << 16 | dstAlpha << 24 */
+	uint blend;                /* BLEND_ON | src | dst << 8 | srcAlpha << 16 | dstAlpha << 24, or 0 */
+	uint sx, sy, sw, sh;       /* scissor, pixels */
 };
 
 /* One pixel's state across the triangles. */
@@ -117,7 +126,7 @@ _Static_assert(sizeof(struct rdna4_tri) <= 96, "rdna4_tri fits its block");
 /* The draw, from the fragment kernel's kernargs. */
 ENTRY void rdna4_draw_init(struct rdna4_draw *d, gfloat *verts, uint stride, uint pos, uint topology, uint count,
 		     guint *rt, uint pitch, uint width, uint height, uint format, float vx, float vy, float vw,
-		     float vh, uint blend)
+		     float vh, uint blend, uint sx, uint sy, uint sw, uint sh)
 {
 	d->verts = verts;
 	d->stride = stride;
@@ -134,6 +143,10 @@ ENTRY void rdna4_draw_init(struct rdna4_draw *d, gfloat *verts, uint stride, uin
 	d->vw = vw;
 	d->vh = vh;
 	d->blend = blend;
+	d->sx = sx;
+	d->sy = sy;
+	d->sw = sw;
+	d->sh = sh;
 }
 
 static float clamp01(float v)
@@ -233,13 +246,17 @@ ENTRY float4 rdna4_sample_2d(gtexture *t, csampler *s, float2 uv)
 /* The pixel this thread shades, and its current colour; false outside the target. */
 ENTRY int rdna4_px_begin(const struct rdna4_draw *d, uint x, uint y, struct rdna4_px *px)
 {
-	if (x >= d->width || y >= d->height)
-		return 0;
+	const float4 none = { 0, 0, 0, 0 };
 
 	px->x = x;
 	px->y = y;
-	px->dst = unpack(d->rt[y * (d->pitch / 4) + x], d->format);
+	px->dst = none;
 	px->covered = 0;
+
+	if (x >= d->width || y >= d->height || x - d->sx >= d->sw || y - d->sy >= d->sh)
+		return 0;
+
+	px->dst = unpack(d->rt[y * (d->pitch / 4) + x], d->format);
 
 	return 1;
 }
@@ -264,7 +281,11 @@ static void toScreen(const struct rdna4_draw *d, gfloat *v, float *sx, float *sy
 	*sz = v[2] * *rw;
 }
 
-/* Whether triangle `t` covers the pixel's centre; its weights if so. */
+/*
+ * Whether triangle `t` covers the pixel's centre: 1 if so, 2 if not but the
+ * pixel's weights are there (for a helper of a covered quad), 0 for a
+ * triangle with no pixels.
+ */
 ENTRY int rdna4_tri_cover(const struct rdna4_draw *d, const struct rdna4_px *px, uint t, struct rdna4_tri *tri)
 {
 	uint i0 = 3 * t, i1 = 3 * t + 1, i2 = 3 * t + 2;
@@ -298,10 +319,12 @@ ENTRY int rdna4_tri_cover(const struct rdna4_draw *d, const struct rdna4_px *px,
 	e[2] = (x[1] - x[0]) * (cy - y[0]) - (y[1] - y[0]) * (cx - x[0]);
 
 	/* both windings: the edge values share the area's sign inside */
+	int inside = 1;
+
 	for (int k = 0; k < 3; k++) {
 		e[k] /= area;
 		if (e[k] < 0)
-			return 0;
+			inside = 0;
 	}
 
 	const float pw = e[0] * rw[0] + e[1] * rw[1] + e[2] * rw[2];
@@ -316,7 +339,7 @@ ENTRY int rdna4_tri_cover(const struct rdna4_draw *d, const struct rdna4_px *px,
 	/* counter-clockwise on screen (y down: negative area) is front, Metal's default winding */
 	tri->front = area < 0;
 
-	return 1;
+	return inside ? 1 : 2;
 }
 
 /* Fragment input at dword `off` of the records, `n` <= 4 components. */
@@ -352,19 +375,30 @@ ENTRY int rdna4_front_facing(const struct rdna4_tri *tri)
 	return tri->front;
 }
 
-static float factor(uint f, float4 src, float4 dst, int alpha, int c)
+/* Blend factor `f` for channel `c` (3 is alpha). */
+static float factor(uint f, float4 src, float4 dst, int c)
 {
 	switch (f) {
 	case kZero:
 		return 0;
+	case kSourceColor:
+		return src[c];
+	case kOneMinusSourceColor:
+		return 1 - src[c];
 	case kSourceAlpha:
 		return src.w;
 	case kOneMinusSourceAlpha:
 		return 1 - src.w;
+	case kDestinationColor:
+		return dst[c];
+	case kOneMinusDestinationColor:
+		return 1 - dst[c];
 	case kDestinationAlpha:
 		return dst.w;
 	case kOneMinusDestinationAlpha:
 		return 1 - dst.w;
+	case kSourceAlphaSaturated:
+		return c == 3 ? 1 : (src.w < 1 - dst.w ? src.w : 1 - dst.w);
 	default:
 		return 1;
 	}
@@ -377,15 +411,15 @@ ENTRY void rdna4_px_blend(const struct rdna4_draw *d, struct rdna4_px *px, float
 
 	px->covered = 1;
 
-	if (!d->blend) {
+	if (!(d->blend & BLEND_ON)) {
 		px->dst = src;
 		return;
 	}
 
 	for (int c = 0; c < 4; c++) {
-		const uint sf = (d->blend >> (c == 3 ? 16 : 0)) & 0xff, df = (d->blend >> (c == 3 ? 24 : 8)) & 0xff;
+		const uint sf = (d->blend >> (c == 3 ? 16 : 0)) & 0xff, df = (d->blend >> (c == 3 ? 24 : 8)) & 0x7f;
 
-		out[c] = src[c] * factor(sf, src, px->dst, c == 3, c) + px->dst[c] * factor(df, src, px->dst, c == 3, c);
+		out[c] = src[c] * factor(sf, src, px->dst, c) + px->dst[c] * factor(df, src, px->dst, c);
 	}
 
 	px->dst = out;

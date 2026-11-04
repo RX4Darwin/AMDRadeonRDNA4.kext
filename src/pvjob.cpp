@@ -157,6 +157,25 @@ IOReturn PvJob::done(uint32_t id, uint32_t status)
 	return kIOReturnSuccess;
 }
 
+/*
+ * A chunk of the client's memory read page by page: a buffer's pages the
+ * client has not mapped yet (never written) read as zeros.
+ */
+static void readClient(uint32_t task, uint64_t va, uint8_t *chunk, size_t n)
+{
+	while (n) {
+		const size_t inPage = 0x1000 - (va & 0xfff);
+		const size_t len = n < inPage ? n : inPage;
+
+		if (!PvExec::readGpu(task, va, chunk, len))
+			memset(chunk, 0, len);
+
+		chunk += len;
+		va += len;
+		n -= len;
+	}
+}
+
 /* A chunk of the client's memory or of an IOSurface. */
 static bool guest(uint32_t task, uint64_t va, uint8_t *chunk, size_t n, uint32_t flags)
 {
@@ -165,7 +184,12 @@ static bool guest(uint32_t task, uint64_t va, uint8_t *chunk, size_t n, uint32_t
 	if (flags & RDNA4_PVACCESS_SURFACE)
 		return PvSurface::access(task, va, chunk, n, write);
 
-	return write ? PvExec::writeGpu(task, va, chunk, n) : PvExec::readGpu(task, va, chunk, n);
+	if (write)
+		return PvExec::writeGpu(task, va, chunk, n);
+
+	readClient(task, va, chunk, n);
+
+	return true;
 }
 
 IOReturn PvJob::access(uint32_t task, uint64_t va, task_t userTask, uint64_t user, uint64_t len, uint32_t flags)

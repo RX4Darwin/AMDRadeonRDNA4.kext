@@ -21,7 +21,7 @@
 //   * threadgroup memory = the module's addrspace(3) globals (static LDS), unchanged.
 //   --abi FILE writes the kernargs in order, one line each: "buffer SLOT", "grid", "threadgroup SLOT" (SLOT = the argument's [[buffer(n)]]).
 //
-//   air2amdgcn vertex   IN -o OUT.ll --abi OUT.abi                            a vertex function as a kernel that writes its outputs per vertex
+//   air2amdgcn vertex   IN -o OUT.ll --abi OUT.abi [--vertex-desc DESC]       a vertex function as a kernel that writes its outputs per vertex
 //   air2amdgcn fragment IN --vertex-abi V.abi -o OUT.ll --abi OUT.abi         a fragment function inside a kernel that rasterizes the draw
 //   (render stages as compute: see lowerVertex/lowerFragment; the fragment kernel is linked with rdna4raster.ll)
 #include <fstream>
@@ -135,6 +135,24 @@ FastMathFlags fastFlags() {
 
 // ---- air.* call lowering ----------------------------------------------------------------------------------------------------------------------
 
+// A 32-bit float of the lane `lane` (ds_bpermute; the lanes must be active).
+Value *laneValue(IRBuilder<> &B, Value *v, Value *lane) {
+	Value *i = B.CreateBitCast(v, B.getInt32Ty());
+	Value *r = B.CreateIntrinsic(B.getInt32Ty(), Intrinsic::amdgcn_ds_bpermute, {B.CreateShl(lane, 2), i});
+	return B.CreateBitCast(r, B.getFloatTy());
+}
+
+// The difference across the pixel's 2x2 quad of a float: the fragment kernel's lanes are the rows of its 8x8 tile, so the neighbour in x is
+// lane ^ 1 and in y lane ^ 8 (`bit`); coarse, the quad's right (lower) pixel less its left (upper) one.
+Value *quadDifference(IRBuilder<> &B, Value *v, unsigned bit) {
+	Type *T = v->getType();
+	Value *lane = B.CreateIntrinsic(B.getInt32Ty(), Intrinsic::amdgcn_mbcnt_lo, {B.getInt32(~0u), B.getInt32(0)});
+	Value *f = B.CreateFPExt(v, B.getFloatTy());
+	Value *hi = laneValue(B, f, B.CreateOr(lane, B.getInt32(bit)));
+	Value *lo = laneValue(B, f, B.CreateAnd(lane, B.getInt32(~bit)));
+	return B.CreateFPTrunc(B.CreateFSub(hi, lo), T);
+}
+
 // Returns the replacement value (or nullptr + *why when there is no rule). `isVoid` calls return a non-null sentinel (the call itself).
 Value *lowerCall(IRBuilder<> &B, CallInst *CI, StringRef name, std::string *why) {
 	LLVMContext &C = B.getContext();
@@ -164,6 +182,28 @@ Value *lowerCall(IRBuilder<> &B, CallInst *CI, StringRef name, std::string *why)
 		return bin(signOf(tok) == 's' ? Intrinsic::smin : Intrinsic::umin);
 	if (op == "fabs")
 		return un(Intrinsic::fabs);
+	if (op == "dfdx" || op == "dfdy") {   // the fragment kernel's quads (lowerFragment)
+		const unsigned bit = op == "dfdx" ? 1 : 8;
+		return elementwise(B, RT, {A[0]}, [&](IRBuilder<> &B, ArrayRef<Value *> e) { return quadDifference(B, e[0], bit); });
+	}
+	if (op == "fwidth")
+		return elementwise(B, RT, {A[0]}, [&](IRBuilder<> &B, ArrayRef<Value *> e) {
+			return B.CreateFAdd(B.CreateUnaryIntrinsic(Intrinsic::fabs, quadDifference(B, e[0], 1)),
+			                    B.CreateUnaryIntrinsic(Intrinsic::fabs, quadDifference(B, e[0], 8)));
+		});
+	if (op == "pack.unorm4x8") {   // float4 in [0, 1] -> 4 x u8, x lowest, rounded to nearest
+		Value *r = B.getInt32(0);
+		for (unsigned i = 0; i < 4; i++) {
+			Value *c = B.CreateExtractElement(A[0], i);
+			c = B.CreateFPExt(c, B.getFloatTy());
+			c = B.CreateBinaryIntrinsic(Intrinsic::minnum, B.CreateBinaryIntrinsic(Intrinsic::maxnum, c, ConstantFP::get(B.getFloatTy(), 0.0)),
+			                            ConstantFP::get(B.getFloatTy(), 1.0));
+			c = B.CreateFPToUI(B.CreateFAdd(B.CreateFMul(c, ConstantFP::get(B.getFloatTy(), 255.0)), ConstantFP::get(B.getFloatTy(), 0.5)),
+			                   B.getInt32Ty());
+			r = B.CreateOr(r, B.CreateShl(c, 8 * i));
+		}
+		return r;
+	}
 	if (op == "abs")   // integer abs (result is the unsigned type)
 		return B.CreateBinaryIntrinsic(Intrinsic::abs, A[0], B.getFalse());
 	if (op == "sqrt")
@@ -526,7 +566,7 @@ bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::s
 	for (size_t i = 0; i < infos.size(); i++) {
 		auto *pt = dyn_cast<PointerType>(F->getArg(i)->getType());
 		if (infos[i].kind == "air.buffer" && !infos[i].aspace && pt)
-			infos[i].aspace = pt->getAddressSpace();
+			infos[i].aspace = pt->getAddressSpace() == kAmdConstant ? kAirConstant : pt->getAddressSpace();
 	}
 	// 1. air.* calls in the body (before the type-changing clone, so the callees' declarations keep their AIR types)
 	lowerFunction(*F, st);
@@ -741,8 +781,10 @@ Function *stageEntry(Module &M, const char *md, std::vector<StageItem> &args, st
 	}
 	for (size_t i = 0; i < args.size(); i++) {
 		auto *pt = dyn_cast<PointerType>(F->getArg(i)->getType());
+		// AIR 2.2 names the space only in the pointer type, which remapConstantSpace has already renumbered: AMDGPU's
+		// constant space is AIR's
 		if (args[i].kind == "air.buffer" && !args[i].aspace && pt)
-			args[i].aspace = pt->getAddressSpace();
+			args[i].aspace = pt->getAddressSpace() == kAmdConstant ? kAirConstant : pt->getAddressSpace();
 		if (args[i].kind == "air.buffer" && args[i].aspace != kAirDevice && args[i].aspace != kAirConstant) {
 			err = "buffer argument " + args[i].name + " in AIR address space " + std::to_string(args[i].aspace);
 			return nullptr;
@@ -830,10 +872,159 @@ unsigned components(Type *T) {
 	return VT ? VT->getNumElements() : 1;
 }
 
-// air2amdgcn vertex: rdna4_vertex(buffers..., u32 first, u32 count, u32 instance, ptr out): thread i runs the function for vertex first + i
-// and stores its result at out + i * stride. ABI: "buffer SLOT"..., "vertex" (the three u32), "out", "stride BYTES", "position OFFSET",
-// "output KEY OFFSET COMPONENTS TYPE" per output the fragment stage reads.
-bool lowerVertex(Module &M, std::string &err, Stats &st) {
+// A vertex attribute of the pipeline's vertex descriptor, from --vertex-desc FILE (written by the compiler service), one line each:
+// "attribute LOCATION FORMAT BUFFER OFFSET STRIDE STEP_FUNCTION STEP_RATE" (MTLVertexFormat, MTLVertexStepFunction).
+struct VertexAttribute {
+	unsigned format = 0, buffer = 0, offset = 0, stride = 0, step = 1, rate = 1;
+};
+using VertexDescriptor = std::map<unsigned, VertexAttribute>;
+
+bool readVertexDesc(const std::string &path, VertexDescriptor &vd, std::string &err) {
+	std::ifstream f(path);
+	if (!f) {
+		err = "cannot read " + path;
+		return false;
+	}
+	std::string line;
+	while (std::getline(f, line)) {
+		std::istringstream ls(line);
+		std::string what;
+		unsigned loc;
+		VertexAttribute a;
+		if (ls >> what >> loc >> a.format >> a.buffer >> a.offset >> a.stride >> a.step >> a.rate && what == "attribute")
+			vd[loc] = a;
+	}
+	return true;
+}
+
+// How a MTLVertexFormat stores its components.
+enum class VertexEnc { U8, S8, UN8, SN8, U16, S16, UN16, SN16, F16, F32, I32, U32 };
+struct VertexFormat {
+	unsigned n;
+	VertexEnc enc;
+	bool bgra;
+};
+
+bool vertexFormat(unsigned f, VertexFormat &vf) {
+	using E = VertexEnc;
+	static const struct { unsigned first, last, n; E enc; } groups[] = {
+		{1, 3, 2, E::U8}, {4, 6, 2, E::S8}, {7, 9, 2, E::UN8}, {10, 12, 2, E::SN8}, {13, 15, 2, E::U16}, {16, 18, 2, E::S16},
+		{19, 21, 2, E::UN16}, {22, 24, 2, E::SN16}, {25, 27, 2, E::F16}, {28, 31, 1, E::F32}, {32, 35, 1, E::I32}, {36, 39, 1, E::U32},
+		{45, 45, 1, E::U8}, {46, 46, 1, E::S8}, {47, 47, 1, E::UN8}, {48, 48, 1, E::SN8}, {49, 49, 1, E::U16}, {50, 50, 1, E::S16},
+		{51, 51, 1, E::UN16}, {52, 52, 1, E::SN16}, {53, 53, 1, E::F16},
+	};
+	if (f == 42) {   // uchar4Normalized_BGRA
+		vf = {4, E::UN8, true};
+		return true;
+	}
+	for (const auto &g : groups)
+		if (f >= g.first && f <= g.last) {
+			vf = {g.n + f - g.first, g.enc, false};
+			return true;
+		}
+	return false;
+}
+
+// One component as a float (or an i32 for the integer encodings), loaded at p.
+Value *loadComponent(IRBuilder<> &B, Value *p, VertexEnc enc) {
+	using E = VertexEnc;
+	switch (enc) {
+	case E::F32:
+		return B.CreateAlignedLoad(B.getFloatTy(), p, Align(4));
+	case E::F16:
+		return B.CreateFPExt(B.CreateAlignedLoad(B.getHalfTy(), p, Align(2)), B.getFloatTy());
+	case E::I32:
+	case E::U32:
+		return B.CreateAlignedLoad(B.getInt32Ty(), p, Align(4));
+	default:
+		break;
+	}
+	const bool wide = enc == E::U16 || enc == E::S16 || enc == E::UN16 || enc == E::SN16;
+	const bool sign = enc == E::S8 || enc == E::SN8 || enc == E::S16 || enc == E::SN16;
+	Type *T = wide ? B.getInt16Ty() : B.getInt8Ty();
+	Value *v = B.CreateAlignedLoad(T, p, Align(wide ? 2 : 1));
+	if (enc == E::U8 || enc == E::S8 || enc == E::U16 || enc == E::S16)
+		return sign ? B.CreateSExt(v, B.getInt32Ty()) : B.CreateZExt(v, B.getInt32Ty());
+	// normalized: unsigned to [0, 1], signed to [-1, 1]
+	const float scale = wide ? (sign ? 32767.0f : 65535.0f) : (sign ? 127.0f : 255.0f);
+	Value *f = sign ? B.CreateSIToFP(v, B.getFloatTy()) : B.CreateUIToFP(v, B.getFloatTy());
+	f = B.CreateFMul(f, ConstantFP::get(B.getFloatTy(), 1.0f / scale));
+	return sign ? B.CreateMaxNum(f, ConstantFP::get(B.getFloatTy(), -1.0f)) : f;
+}
+
+// A component as the argument's element type.
+Value *convertComponent(IRBuilder<> &B, Value *v, Type *ET, VertexEnc enc) {
+	const bool isInt = enc == VertexEnc::U8 || enc == VertexEnc::S8 || enc == VertexEnc::U16 || enc == VertexEnc::S16 ||
+	                   enc == VertexEnc::I32 || enc == VertexEnc::U32;
+	const bool sign = enc == VertexEnc::S8 || enc == VertexEnc::S16 || enc == VertexEnc::I32;
+	if (ET->isFloatingPointTy()) {
+		if (isInt)
+			v = sign ? B.CreateSIToFP(v, B.getFloatTy()) : B.CreateUIToFP(v, B.getFloatTy());
+		return B.CreateFPTrunc(v, ET);
+	}
+	if (!isInt)
+		v = B.CreateFPToSI(v, B.getInt32Ty());
+	return B.CreateZExtOrTrunc(v, ET);
+}
+
+// The attribute of element `index` at `base` as the argument's type T: the format's components, the missing ones (0, 0, 0, 1).
+Value *fetchAttribute(IRBuilder<> &B, Value *base, Value *index, const VertexAttribute &a, const VertexFormat &vf, Type *T) {
+	using E = VertexEnc;
+	const unsigned size = vf.enc == E::F32 || vf.enc == E::I32 || vf.enc == E::U32 ? 4
+	                      : vf.enc == E::U16 || vf.enc == E::S16 || vf.enc == E::UN16 || vf.enc == E::SN16 || vf.enc == E::F16 ? 2 : 1;
+	Type *ET = T->getScalarType();
+	Value *at = B.CreateGEP(B.getInt8Ty(), base, B.CreateAdd(B.CreateMul(B.CreateZExt(index, B.getInt64Ty()), B.getInt64(a.stride)),
+	                                                         B.getInt64(a.offset)));
+	Value *c[4];
+	for (unsigned i = 0; i < 4; i++) {
+		if (i < vf.n) {
+			Value *v = loadComponent(B, B.CreateGEP(B.getInt8Ty(), at, B.getInt64(i * size)), vf.enc);
+			c[i] = convertComponent(B, v, ET, vf.enc);
+		} else {
+			c[i] = ET->isFloatingPointTy() ? ConstantFP::get(ET, i == 3 ? 1.0 : 0.0) : ConstantInt::get(ET, i == 3);
+		}
+	}
+	if (vf.bgra)
+		std::swap(c[0], c[2]);
+	const unsigned n = components(T);
+	if (!T->isVectorTy())
+		return c[0];
+	Value *r = PoisonValue::get(T);
+	for (unsigned i = 0; i < n && i < 4; i++)
+		r = B.CreateInsertElement(r, c[i], i);
+	return r;
+}
+
+// The vertex of thread `gid`: first + gid, or the index at gid of an indexed draw (type 1 uint16, 2 uint32), in blocks of its own.
+Value *vertexId(IRBuilder<> &B, Function *NF, Value *gid, Value *first, Value *indices, Value *type) {
+	LLVMContext &C = B.getContext();
+	BasicBlock *from = B.GetInsertBlock();
+	BasicBlock *i16b = BasicBlock::Create(C, "index16", NF), *i32b = BasicBlock::Create(C, "index32", NF);
+	BasicBlock *join = BasicBlock::Create(C, "vertex", NF);
+	Value *plain = B.CreateAdd(first, gid);
+	SwitchInst *sw = B.CreateSwitch(type, join, 2);
+	sw->addCase(B.getInt32(1), i16b);
+	sw->addCase(B.getInt32(2), i32b);
+	B.SetInsertPoint(i16b);
+	Value *v16 = B.CreateZExt(B.CreateAlignedLoad(B.getInt16Ty(), B.CreateGEP(B.getInt16Ty(), indices, gid), Align(2)), B.getInt32Ty());
+	B.CreateBr(join);
+	B.SetInsertPoint(i32b);
+	Value *v32 = B.CreateAlignedLoad(B.getInt32Ty(), B.CreateGEP(B.getInt32Ty(), indices, gid), Align(4));
+	B.CreateBr(join);
+	B.SetInsertPoint(join);
+	PHINode *phi = B.CreatePHI(B.getInt32Ty(), 3);
+	phi->addIncoming(plain, from);
+	phi->addIncoming(v16, i16b);
+	phi->addIncoming(v32, i32b);
+	return phi;
+}
+
+// air2amdgcn vertex: rdna4_vertex(buffers..., u32 first, u32 count, u32 instance, ptr out, ptr indices, u32 index type): thread i runs the
+// function for vertex first + i, or for indices[i] of an indexed draw (index type 1 uint16, 2 uint32, 0 none), and stores its result at
+// out + i * stride. ABI: "buffer SLOT"..., "vertex" (the three u32), "out", "indices" (the pointer and the type), "stride BYTES", "position OFFSET",
+// "output KEY OFFSET COMPONENTS TYPE" per output the fragment stage reads. Vertex inputs ([[stage_in]]) are loaded as the vertex
+// descriptor says, from one more "buffer SLOT" per buffer they read (after the function's own).
+bool lowerVertex(Module &M, const VertexDescriptor &vd, std::string &err, Stats &st) {
 	LLVMContext &C = M.getContext();
 	const DataLayout &DL = M.getDataLayout();
 	std::vector<StageItem> args, outs;
@@ -853,10 +1044,28 @@ bool lowerVertex(Module &M, std::string &err, Stats &st) {
 			return false;
 		}
 	resourceParams(C, args, params, st);
+	std::map<unsigned, unsigned> fetchParam;   // buffer slot -> parameter
+	for (const StageItem &a : args) {
+		if (a.kind != "air.vertex_input")
+			continue;
+		auto it = vd.find(a.slot);
+		VertexFormat vf;
+		if (it == vd.end() || !vertexFormat(it->second.format, vf) || it->second.step > 2) {
+			err = "vertex input '" + a.name + "' at attribute " + std::to_string(a.slot) + ": not in the vertex descriptor, or its format " +
+			      "or step function has no lowering yet";
+			return false;
+		}
+		if (fetchParam.count(it->second.buffer))
+			continue;
+		fetchParam[it->second.buffer] = params.size();
+		params.push_back(PointerType::get(C, kAmdGlobal));
+		st.abi.push_back("buffer " + std::to_string(it->second.buffer));
+	}
 	const size_t nBuf = params.size();
-	params.insert(params.end(), {i32, i32, i32, PointerType::get(C, kAmdGlobal)});
+	params.insert(params.end(), {i32, i32, i32, PointerType::get(C, kAmdGlobal), PointerType::get(C, kAmdGlobal), i32});
 	st.abi.push_back("vertex");
 	st.abi.push_back("out");
+	st.abi.push_back("indices");
 
 	Type *RT = F->getReturnType();
 	auto *STy = dyn_cast<StructType>(RT);
@@ -889,17 +1098,25 @@ bool lowerVertex(Module &M, std::string &err, Stats &st) {
 	Value *gid = B.CreateAdd(B.CreateMul(B.CreateIntrinsic(Intrinsic::amdgcn_workgroup_id_x, ArrayRef<Value *>{}), B.getInt32(64)),
 	                         B.CreateIntrinsic(Intrinsic::amdgcn_workitem_id_x, ArrayRef<Value *>{}));
 	Argument *first = NF->getArg(nBuf), *count = NF->getArg(nBuf + 1), *instance = NF->getArg(nBuf + 2), *out = NF->getArg(nBuf + 3);
+	Argument *indices = NF->getArg(nBuf + 4), *indexType = NF->getArg(nBuf + 5);
 	B.CreateCondBr(B.CreateICmpULT(gid, count), run, done);
 	B.SetInsertPoint(run);
+	Value *vid = vertexId(B, NF, gid, first, indices, indexType);
 	std::vector<Value *> callArgs;
 	size_t bi = 0;
 	for (size_t i = 0; i < args.size(); i++) {
 		Type *T = F->getArg(i)->getType();
 		const std::string &k = args[i].kind;
-		if (k == "air.buffer")
+		if (k == "air.buffer") {
 			callArgs.push_back(NF->getArg(bi++));
-		else if (k == "air.vertex_id")
-			callArgs.push_back(B.CreateZExtOrTrunc(B.CreateAdd(first, gid), T));
+		} else if (k == "air.vertex_input") {
+			const VertexAttribute &a = vd.at(args[i].slot);
+			VertexFormat vf;
+			vertexFormat(a.format, vf);
+			Value *index = a.step == 1 ? vid : a.step == 2 && a.rate ? B.CreateUDiv(instance, B.getInt32(a.rate)) : B.getInt32(0);
+			callArgs.push_back(fetchAttribute(B, NF->getArg(fetchParam.at(a.buffer)), index, a, vf, T));
+		} else if (k == "air.vertex_id")
+			callArgs.push_back(B.CreateZExtOrTrunc(vid, T));
 		else if (k == "air.instance_id")
 			callArgs.push_back(B.CreateZExtOrTrunc(instance, T));
 		else if (k == "air.base_vertex")
@@ -971,7 +1188,8 @@ Value *fromFloat4(IRBuilder<> &B, Value *v, Type *T) {
 }
 
 // air2amdgcn fragment: rdna4_fragment(buffers..., the draw: ptr verts, u32 stride, u32 position, u32 topology, u32 count, ptr target,
-// u32 pitch, width, height, format, float viewport x, y, w, h, u32 blend), threadgroups of 8x8 pixels. ABI: "buffer SLOT"..., "fragment".
+// u32 pitch, width, height, format, float viewport x, y, w, h, u32 blend, u32 scissor x, y, w, h), threadgroups of 8x8 pixels.
+// ABI: "buffer SLOT"..., "fragment".
 bool lowerFragment(Module &M, const VertexRecord &vr, std::string &err, Stats &st) {
 	LLVMContext &C = M.getContext();
 	std::vector<StageItem> args, outs;
@@ -1005,14 +1223,14 @@ bool lowerFragment(Module &M, const VertexRecord &vr, std::string &err, Stats &s
 	std::vector<Type *> params;
 	resourceParams(C, args, params, st);
 	const size_t nBuf = params.size();
-	params.insert(params.end(), {gptr, i32, i32, i32, i32, gptr, i32, i32, i32, i32, f32, f32, f32, f32, i32});
+	params.insert(params.end(), {gptr, i32, i32, i32, i32, gptr, i32, i32, i32, i32, f32, f32, f32, f32, i32, i32, i32, i32, i32});
 	st.abi.push_back("fragment");
 	Function *NF = stageKernel(M, F, params, "air.fragment");
 
 	// rdna4raster.c, linked in later
 	Type *ptr = PointerType::get(C, 0), *v4f = FixedVectorType::get(f32, 4), *vd = Type::getVoidTy(C);
 	auto decl = [&](const char *n, Type *ret, std::vector<Type *> ps) { return M.getOrInsertFunction(n, FunctionType::get(ret, ps, false)); };
-	auto init = decl("rdna4_draw_init", vd, {ptr, gptr, i32, i32, i32, i32, gptr, i32, i32, i32, i32, f32, f32, f32, f32, i32});
+	auto init = decl("rdna4_draw_init", vd, {ptr, gptr, i32, i32, i32, i32, gptr, i32, i32, i32, i32, f32, f32, f32, f32, i32, i32, i32, i32, i32});
 	auto begin = decl("rdna4_px_begin", i32, {ptr, i32, i32, ptr});
 	auto count = decl("rdna4_tri_count", i32, {ptr});
 	auto cover = decl("rdna4_tri_cover", i32, {ptr, ptr, i32, ptr});
@@ -1024,7 +1242,8 @@ bool lowerFragment(Module &M, const VertexRecord &vr, std::string &err, Stats &s
 
 	BasicBlock *entry = BasicBlock::Create(C, "entry", NF), *head = BasicBlock::Create(C, "triangle", NF),
 	           *test = BasicBlock::Create(C, "cover", NF), *shade = BasicBlock::Create(C, "shade", NF),
-	           *next = BasicBlock::Create(C, "next", NF), *store = BasicBlock::Create(C, "store", NF), *exit = BasicBlock::Create(C, "exit", NF);
+	           *write = BasicBlock::Create(C, "write", NF), *next = BasicBlock::Create(C, "next", NF),
+	           *store = BasicBlock::Create(C, "store", NF);
 	IRBuilder<> B(entry);
 	auto block = [&](unsigned bytes, const char *name) {
 		auto *a = B.CreateAlloca(ArrayType::get(B.getInt8Ty(), bytes), 5, nullptr, name);
@@ -1040,9 +1259,13 @@ bool lowerFragment(Module &M, const VertexRecord &vr, std::string &err, Stats &s
 	                       B.CreateIntrinsic(Intrinsic::amdgcn_workitem_id_x, ArrayRef<Value *>{}));
 	Value *y = B.CreateAdd(B.CreateMul(B.CreateIntrinsic(Intrinsic::amdgcn_workgroup_id_y, ArrayRef<Value *>{}), B.getInt32(8)),
 	                       B.CreateIntrinsic(Intrinsic::amdgcn_workitem_id_y, ArrayRef<Value *>{}));
-	Value *inside = B.CreateCall(begin, {draw, x, y, px});
+	// Pixels outside the target or the scissor stay as helpers: every lane of a 2x2 quad runs the function when one of them is covered,
+	// so that derivatives (dfdx) can read the others; only covered pixels blend.
+	Value *inside = B.CreateICmpNE(B.CreateCall(begin, {draw, x, y, px}), B.getInt32(0));
 	Value *n = B.CreateCall(count, {draw});
-	B.CreateCondBr(B.CreateICmpNE(inside, B.getInt32(0)), head, exit);
+	Value *lane = B.CreateIntrinsic(i32, Intrinsic::amdgcn_mbcnt_lo, {B.getInt32(~0u), B.getInt32(0)});
+	Value *quad = B.CreateShl(B.getInt32(0x303), B.CreateAnd(lane, B.getInt32(~9u)));
+	B.CreateBr(head);
 
 	B.SetInsertPoint(head);
 	PHINode *t = B.CreatePHI(i32, 2, "t");
@@ -1050,7 +1273,10 @@ bool lowerFragment(Module &M, const VertexRecord &vr, std::string &err, Stats &s
 	B.CreateCondBr(B.CreateICmpULT(t, n), test, store);
 
 	B.SetInsertPoint(test);
-	B.CreateCondBr(B.CreateICmpNE(B.CreateCall(cover, {draw, px, t, tri}), B.getInt32(0)), shade, next);
+	Value *cov = B.CreateCall(cover, {draw, px, t, tri});
+	Value *covered = B.CreateAnd(inside, B.CreateICmpEQ(cov, B.getInt32(1)));
+	Value *quadCovered = B.CreateICmpNE(B.CreateAnd(B.CreateIntrinsic(i32, Intrinsic::amdgcn_ballot, {covered}), quad), B.getInt32(0));
+	B.CreateCondBr(B.CreateAnd(quadCovered, B.CreateICmpNE(cov, B.getInt32(0))), shade, next);
 
 	B.SetInsertPoint(shade);
 	std::vector<Value *> callArgs;
@@ -1089,6 +1315,9 @@ bool lowerFragment(Module &M, const VertexRecord &vr, std::string &err, Stats &s
 			v = B.CreateInsertElement(v, components(CT) == 1 ? c : B.CreateExtractElement(c, k), k);
 		c = v;
 	}
+	B.CreateCondBr(covered, write, next);
+
+	B.SetInsertPoint(write);
 	B.CreateCall(blend, {draw, px, c});
 	B.CreateBr(next);
 
@@ -1099,8 +1328,6 @@ bool lowerFragment(Module &M, const VertexRecord &vr, std::string &err, Stats &s
 
 	B.SetInsertPoint(store);
 	B.CreateCall(end, {draw, px});
-	B.CreateBr(exit);
-	B.SetInsertPoint(exit);
 	B.CreateRetVoid();
 
 	const unsigned tg[3] = {8, 8, 1};
@@ -1203,13 +1430,13 @@ int main(int argc, char **argv) {
 	LLVMInitializeAMDGPUAsmPrinter();
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s kernel IN --tg X,Y,Z -o OUT.ll [--entry NAME] [--mcpu gfx1201] [--abi OUT.abi]\n"
-		                "       %s vertex IN -o OUT.ll --abi OUT.abi\n"
+		                "       %s vertex IN -o OUT.ll --abi OUT.abi [--vertex-desc DESC]\n"
 		                "       %s fragment IN --vertex-abi VERTEX.abi -o OUT.ll --abi OUT.abi\n"
 		                "       %s coverage [--codegen] IN...\n", argv[0], argv[0], argv[0], argv[0]);
 		return 2;
 	}
 	const std::string mode = argv[1];
-	std::string out, entry, cpu = "gfx1201", tgs = "64,1,1", abi, vertexAbi;
+	std::string out, entry, cpu = "gfx1201", tgs = "64,1,1", abi, vertexAbi, vertexDesc;
 	bool codegen = false;
 	std::vector<std::string> inputs;
 	for (int i = 2; i < argc; i++) {
@@ -1226,6 +1453,8 @@ int main(int argc, char **argv) {
 			abi = argv[++i];
 		else if (a == "--vertex-abi" && i + 1 < argc)
 			vertexAbi = argv[++i];
+		else if (a == "--vertex-desc" && i + 1 < argc)
+			vertexDesc = argv[++i];
 		else if (a == "--codegen")
 			codegen = true;
 		else
@@ -1296,11 +1525,12 @@ int main(int argc, char **argv) {
 		Stats st;
 		std::string err;
 		VertexRecord vr;
+		VertexDescriptor vd;
 		M = remapConstantSpace(std::move(M), ctx, err);
-		bool ok = M != nullptr;
+		bool ok = M != nullptr && (vertexDesc.empty() || readVertexDesc(vertexDesc, vd, err));
 		if (ok) {
 			M->setDataLayout(TM->createDataLayout());   // the vertex records are laid out as the AMDGPU back end stores them
-			ok = mode == "vertex" ? lowerVertex(*M, err, st) : readVertexAbi(vertexAbi, vr, err) && lowerFragment(*M, vr, err, st);
+			ok = mode == "vertex" ? lowerVertex(*M, vd, err, st) : readVertexAbi(vertexAbi, vr, err) && lowerFragment(*M, vr, err, st);
 		}
 		if (!ok) {
 			fprintf(stderr, "air2amdgcn: %s: %s\n", inputs[0].c_str(), err.c_str());

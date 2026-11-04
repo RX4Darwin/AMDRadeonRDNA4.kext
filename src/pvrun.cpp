@@ -61,6 +61,9 @@ struct Render {
 	uint32_t target;    /* texture ref, 0 = none */
 	Bindings vertex, fragment;
 	Refs textures, samplers;
+	bool haveViewport, haveScissor;
+	uint32_t viewport[4];   /* float bits */
+	uint32_t scissor[4];
 };
 
 /* A segment's encoder, whichever kind it is. */
@@ -77,16 +80,20 @@ uint32_t gRuns;
 /*
  * Command buffers with commands not run yet or failed that are still logged
  * whole, and whether with the functions' code: from boot, and again when
- * root writes debug.rdna4_pvdump (and _code) right before a test.
+ * root writes debug.rdna4_pvdump (and _code) right before a test; only a
+ * task's while debug.rdna4_pvdump_task names one.
  */
 int gDumps = 8;
 int gDumpCode;
+int gDumpTask;
 constexpr uint32_t kDumpBytes = 2048;
 
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvdump, CTLFLAG_RW | CTLFLAG_LOCKED, &gDumps, 0,
 	   "AMDRadeonRDNA4: paravirtual command buffers still to log");
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvdump_code, CTLFLAG_RW | CTLFLAG_LOCKED, &gDumpCode, 0,
 	   "AMDRadeonRDNA4: log the functions' code with them");
+SYSCTL_INT(_debug, OID_AUTO, rdna4_pvdump_task, CTLFLAG_RW | CTLFLAG_LOCKED, &gDumpTask, 0,
+	   "AMDRadeonRDNA4: log only this task's command buffers (0: all)");
 
 uint32_t rd32(const uint8_t *p)
 {
@@ -391,6 +398,52 @@ bool fillTexture(uint32_t task, const PvExec::Texture &t, uint32_t pixel)
 	return ok;
 }
 
+/* A double's bits as a float's (rounded toward zero), without the FPU. */
+uint32_t floatOfDouble(uint64_t bits)
+{
+	const uint32_t sign = static_cast<uint32_t>(bits >> 63) << 31;
+	const int exp = static_cast<int>((bits >> 52) & 0x7ff) - 1023 + 127;
+
+	if (!(bits << 1))
+		return sign;
+
+	if (exp <= 0)
+		return sign;
+
+	if (exp >= 255)
+		return sign | 0x7f800000;
+
+	return sign | static_cast<uint32_t>(exp) << 23 | static_cast<uint32_t>((bits >> 29) & 0x7fffff);
+}
+
+/* setViewport: {double x, y, width, height, znear, zfar} (measured, card) */
+bool setViewport(Render &r, const uint8_t *p, uint32_t size)
+{
+	if (size < 32)
+		return false;
+
+	for (int i = 0; i < 4; i++)
+		r.viewport[i] = floatOfDouble(rd64(p + 8 * i));
+
+	r.haveViewport = true;
+
+	return true;
+}
+
+/* setScissorRect: {u64 x, y, width, height} (measured, card) */
+bool setScissor(Render &r, const uint8_t *p, uint32_t size)
+{
+	if (size < 32)
+		return false;
+
+	for (int i = 0; i < 4; i++)
+		r.scissor[i] = static_cast<uint32_t>(rd64(p + 8 * i));
+
+	r.haveScissor = true;
+
+	return true;
+}
+
 /* The bits of a float of value `v` (a pixel count), built without the FPU. */
 uint32_t floatBits(uint32_t v)
 {
@@ -560,12 +613,42 @@ bool drawTarget(uint32_t task, uint32_t ref, RDNA4PvJob &job)
 	return true;
 }
 
+/* The index buffer of an indexed draw: a buffer ref, MTLIndexType (0 uint16, 1 uint32), the offset of the first index. */
+struct Indices {
+	uint32_t ref;
+	uint32_t type;
+	uint64_t offset;
+};
+
+/* The draw's `count` indices as the job's index buffer. */
+bool bindIndices(uint32_t task, const Indices &ix, uint64_t count, RDNA4PvJob &job)
+{
+	RDNA4PvBuffer &b = job.buffers[job.bufferCount];
+	const uint64_t bytes = count * (ix.type ? 4 : 2);
+	uint64_t va, len;
+
+	if (ix.type > 1 || job.bufferCount == RDNA4_PVJOB_MAX_BUFFERS || !PvExec::resolveBuffer(task, ix.ref, va, len) ||
+	    ix.offset > len || bytes > len - ix.offset)
+		return false;
+
+	b.slot = 0;
+	b.stage = RDNA4_PVJOB_INDEX;
+	b.va = va + ix.offset;
+	b.length = bytes;
+	job.bufferCount++;
+	job.indexType = ix.type ? RDNA4_PVJOB_UINT32 : RDNA4_PVJOB_UINT16;
+
+	return true;
+}
+
 /*
- * A draw of `count` vertices from `start`, run by the compiler service with
- * the encoder's pipeline and buffers into colour attachment 0, over the whole
- * target (no viewport command yet).
+ * A draw of `count` vertices from `start` (or of the vertices `ix` names),
+ * run by the compiler service with the encoder's pipeline, buffers,
+ * viewport and scissor into colour attachment 0 (the whole target without a
+ * viewport or scissor).
  */
-bool draw(uint32_t task, const Render &r, uint32_t topology, uint64_t start, uint64_t count, uint64_t instances)
+bool draw(uint32_t task, const Render &r, uint32_t topology, uint64_t start, uint64_t count, uint64_t instances,
+	  const Indices *ix = nullptr)
 {
 	RDNA4PvJob job {};
 	PvExec::RenderPipeline pl;
@@ -587,14 +670,56 @@ bool draw(uint32_t task, const Render &r, uint32_t topology, uint64_t start, uin
 	job.vertexStart = static_cast<uint32_t>(start);
 	job.vertexCount = static_cast<uint32_t>(count);
 	job.instanceCount = static_cast<uint32_t>(instances);
-	job.viewport[2] = floatBits(job.targetWidth);
-	job.viewport[3] = floatBits(job.targetHeight);
+	job.blend = pl.blend;
+	job.attributeMask = pl.attributeMask;
+	memcpy(job.attributes, pl.attributes, sizeof(job.attributes));
+	memcpy(job.layouts, pl.layouts, sizeof(job.layouts));
+
+	if (r.haveViewport) {
+		memcpy(job.viewport, r.viewport, sizeof(job.viewport));
+	} else {
+		job.viewport[2] = floatBits(job.targetWidth);
+		job.viewport[3] = floatBits(job.targetHeight);
+	}
+
+	if (r.haveScissor) {
+		memcpy(job.scissor, r.scissor, sizeof(job.scissor));
+	} else {
+		job.scissor[2] = job.targetWidth;
+		job.scissor[3] = job.targetHeight;
+	}
 
 	if (!bindBuffers(task, r.vertex, RDNA4_PVJOB_VERTEX, job) ||
-	    !bindBuffers(task, r.fragment, RDNA4_PVJOB_FRAGMENT, job) || !bindTextures(task, r, job))
+	    !bindBuffers(task, r.fragment, RDNA4_PVJOB_FRAGMENT, job) || !bindTextures(task, r, job) ||
+	    (ix && !bindIndices(task, *ix, count, job)))
 		return false;
 
 	return PvJob::run(job, kDispatchTimeoutMs);
+}
+
+/*
+ * drawIndexedPrimitives: {u16 type, u16 MTLIndexType, u32 index buffer ref}
+ * and then 0x006 {u64 count, u64 offset}, 0x007 {u16 count, u16 offset},
+ * 0x009 {u16 count, u16 offset, u32 instances} (measured, card).
+ */
+bool drawIndexed(uint32_t task, const Render &r, uint32_t id, const uint8_t *p, uint32_t size)
+{
+	auto u16 = [&](uint32_t off) { return static_cast<uint32_t>(p[off] | p[off + 1] << 8); };
+	Indices ix { size >= 8 ? rd32(p + 4) : 0, size >= 8 ? u16(2) : 0, 0 };
+
+	switch (id) {
+	case PvRun::kDrawIndexed:
+		ix.offset = size >= 24 ? rd64(p + 16) : 0;
+		return size >= 24 && draw(task, r, u16(0), 0, rd64(p + 8), 1, &ix);
+	case PvRun::kDrawIndexedShort:
+		ix.offset = size >= 12 ? u16(10) : 0;
+		return size >= 12 && draw(task, r, u16(0), 0, u16(8), 1, &ix);
+	case PvRun::kDrawIndexedInstancedShort:
+		ix.offset = size >= 16 ? u16(10) : 0;
+		return size >= 16 && draw(task, r, u16(0), 0, u16(8), rd32(p + 12), &ix);
+	default:
+		return false;
+	}
 }
 
 /*
@@ -643,8 +768,31 @@ bool runRender(uint32_t task, Render &r, uint32_t id, const uint8_t *p, uint32_t
 	case PvRun::kSetFragmentTextures:
 		ok = setRefs(r.textures, p, size);
 		break;
+	case PvRun::kSetViewport:
+		ok = setViewport(r, p, size);
+		break;
+	case PvRun::kSetScissor:
+		ok = setScissor(r, p, size);
+		break;
 	case PvRun::kSetFragmentSamplers:
 		ok = setRefs(r.samplers, p, size);
+		break;
+	case PvRun::kSetVertexBufferOffset:
+		ok = setBufferOffset(r.vertex, p, size);
+		break;
+	case PvRun::kSetFragmentBufferOffset:
+		ok = setBufferOffset(r.fragment, p, size);
+		break;
+	case PvRun::kSetCullMode:
+	case PvRun::kSetFrontFacing:
+	case PvRun::kSetFillMode:
+	case PvRun::kSetState17:
+		ok = size >= 4;   /* the rasterizer draws both faces, filled */
+		break;
+	case PvRun::kDrawIndexed:
+	case PvRun::kDrawIndexedShort:
+	case PvRun::kDrawIndexedInstancedShort:
+		ok = drawIndexed(task, r, id, p, size);
 		break;
 	case PvRun::kDraw:
 	case PvRun::kDrawShort:
@@ -783,6 +931,7 @@ void PvRun::start()
 {
 	sysctl_register_oid(&sysctl__debug_rdna4_pvdump);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvdump_code);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvdump_task);
 }
 
 void PvRun::run(uint32_t task, uint64_t va, uint64_t len)
@@ -800,7 +949,7 @@ void PvRun::run(uint32_t task, uint64_t va, uint64_t len)
 	if (PvExec::readGpu(task, va, buf, len))
 		runBuffer(task, buf, static_cast<uint32_t>(len), s);
 
-	if ((s.skipped || s.failed) && gDumps > 0) {
+	if ((s.skipped || s.failed) && gDumps > 0 && (!gDumpTask || task == static_cast<uint32_t>(gDumpTask))) {
 		gDumps--;
 		dumpBuffer(task, buf, static_cast<uint32_t>(len));
 	}

@@ -354,40 +354,127 @@ static bool resolveFunction(uint32_t task, uint32_t ref, uint64_t &va, uint32_t 
 	return bytes != 0;
 }
 
+/* An entry list {u8 count, count x {u8 key, u8 size, value}} at `at`: each u32 value by key, `at` past it. */
+static bool entries(const uint8_t *d, uint32_t len, uint32_t &at, uint32_t *values, uint32_t keys)
+{
+	uint32_t n;
+
+	if (at >= len)
+		return false;
+
+	n = d[at++];
+	for (uint32_t i = 0; i < n; i++) {
+		if (at + 2 > len || at + 2 + d[at + 1] > len)
+			return false;
+
+		if (d[at] < keys && d[at + 1] == 4)
+			values[d[at]] = rd32(d + at + 2);
+
+		at += 2 + d[at + 1];
+	}
+
+	return true;
+}
+
+/*
+ * A table of the vertex descriptor at `at`: {u32 count, u32 offset from the
+ * count to each entry list}; each list's keys 0-3 by its key 0, the index.
+ */
+static bool vertexTable(const uint8_t *d, uint32_t len, uint32_t at, uint32_t (*values)[4])
+{
+	uint32_t n;
+
+	if (at + 4 > len)
+		return false;
+
+	n = rd32(d + at);
+	if (n > RDNA4_PVJOB_MAX_ATTRIBUTES || at + 4 + 4 * n > len)
+		return false;
+
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t list = at + rd32(d + at + 4 + 4 * i), v[4] = {};
+
+		if (!entries(d, len, list, v, 4) || v[0] >= RDNA4_PVJOB_MAX_ATTRIBUTES)
+			return false;
+
+		values[v[0]][0] = 1;
+		memcpy(&values[v[0]][1], &v[1], 3 * sizeof(v[1]));
+	}
+
+	return true;
+}
+
+/*
+ * The vertex descriptor at `at`: an entry list, key 0 the attributes' table
+ * and key 1 the layouts', as offsets from it. Attribute keys: 1 format, 2
+ * offset, 3 buffer; layout keys: 1 step function (default per vertex), 2
+ * step rate (default 1), 3 stride.
+ */
+static bool vertexDescriptor(const uint8_t *d, uint32_t len, uint32_t at, PvExec::RenderPipeline &out)
+{
+	uint32_t top[2] = {}, list = at, attrs[RDNA4_PVJOB_MAX_ATTRIBUTES][4] = {};
+	uint32_t layouts[RDNA4_PVJOB_MAX_ATTRIBUTES][4] = {};
+
+	if (!entries(d, len, list, top, 2) || !vertexTable(d, len, at + top[0], attrs) ||
+	    !vertexTable(d, len, at + top[1], layouts))
+		return false;
+
+	for (uint32_t i = 0; i < RDNA4_PVJOB_MAX_ATTRIBUTES; i++) {
+		if (attrs[i][0] && attrs[i][1]) {
+			out.attributeMask |= 1u << i;
+			out.attributes[i] = { static_cast<uint8_t>(attrs[i][1]), static_cast<uint8_t>(attrs[i][3]),
+					      static_cast<uint16_t>(attrs[i][2]) };
+		}
+
+		if (layouts[i][0])
+			out.layouts[i] = { layouts[i][3], static_cast<uint16_t>(layouts[i][2] ? layouts[i][2] : 1),
+					   static_cast<uint8_t>(layouts[i][1] ? layouts[i][1] : 1), 0 };
+	}
+
+	return true;
+}
+
 /*
  * The render pipeline object (kind 7, type 0xe): {u32 0xe, u32 size, u32 own
- * ref, u32 length, the serialized descriptor}. The descriptor starts with a
- * count of entries {u8 key, u8 size, value}: key 1 is the vertex function's
- * ref, key 2 the fragment function's (measured, card: a triangle's pipeline).
+ * ref, u32 length, the serialized descriptor} (measured, card). The
+ * descriptor starts with an entry list: key 1 the vertex function's ref, key
+ * 2 the fragment function's, key 3 the vertex descriptor's offset and key 8
+ * the colour attachments', from the descriptor's start. The attachments:
+ * u32 count, u32, and an entry list per attachment in MTLRenderPipeline-
+ * ColorAttachmentDescriptor's order: 0 index, 1 pixel format, 2 blending
+ * enabled, 3 and 4 the RGB factors, 5 the RGB operation, 6 and 7 the alpha
+ * factors, 8 the alpha operation. Keys at their defaults are left out.
  */
 bool PvExec::resolveRenderPipeline(uint32_t task, uint32_t ref, RenderPipeline &out)
 {
-	uint8_t d[64];
-	uint32_t kind, vertex = 0, fragment = 0, at;
+	uint8_t d[512];
+	uint32_t kind, len, at = 0x10, top[9] = {}, colour[9] = { 0, 0, 0, 1, 0, 0, 1, 0, 0 };
 
 	if (!heapEntry(task, ref, kind, d, 0x14) || kind != kResourceObject || rd32(d) != kObjectRenderPipeline)
 		return false;
 
-	if (!heapEntry(task, ref, kind, d, rd32(d + 4) < sizeof(d) ? rd32(d + 4) : sizeof(d)))
+	len = rd32(d + 4) < sizeof(d) ? rd32(d + 4) : sizeof(d);
+	if (!heapEntry(task, ref, kind, d, len) || !entries(d, len, at, top, 9))
 		return false;
 
-	at = 0x11;
-	for (uint32_t i = 0; i < d[0x10] && at + 2 <= sizeof(d); i++) {
-		const uint32_t key = d[at], size = d[at + 1];
+	out.blend = 0;
+	out.attributeMask = 0;
+	memset(out.attributes, 0, sizeof(out.attributes));
+	memset(out.layouts, 0, sizeof(out.layouts));
 
-		if (at + 2 + size > sizeof(d))
-			return false;
+	if (top[3] && !vertexDescriptor(d, len, 0x10 + top[3], out))
+		return false;
 
-		if (size == 4 && key == 1)
-			vertex = rd32(d + at + 2);
-		else if (size == 4 && key == 2)
-			fragment = rd32(d + at + 2);
-
-		at += 2 + size;
+	/* attachment 0 */
+	at = 0x10 + top[8];
+	if (top[8] && at + 8 <= len && rd32(d + at) >= 1) {
+		at += 8;
+		if (entries(d, len, at, colour, 9) && colour[2])
+			out.blend = 1u << 31 | colour[3] | colour[4] << 8 | colour[6] << 16 | colour[7] << 24;
 	}
 
-	return resolveFunction(task, vertex, out.vertexVa, out.vertexBytes) &&
-	       resolveFunction(task, fragment, out.fragmentVa, out.fragmentBytes);
+	return resolveFunction(task, top[1], out.vertexVa, out.vertexBytes) &&
+	       resolveFunction(task, top[2], out.fragmentVa, out.fragmentBytes);
 }
 
 bool PvExec::resolveTexture(uint32_t task, uint32_t ref, Texture &out)
