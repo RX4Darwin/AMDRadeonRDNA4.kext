@@ -487,6 +487,11 @@ const Modes::Mode *head2BuildTable(Head2 *h, RDNA4Device &dev, size_t &n) {
 			if (dev.secondPipeModeOk(h->table[i].t))
 				h->table[kept++] = h->table[i];
 		n = kept;
+		// A sink whose own timing of that size and rate won (a monitor's
+		// CVT-RB 4K60 over CEA VIC 97) gets the plan's, which it lists too.
+		const uint8_t vic = Edid::vicOf(lit);
+		if (vic && Edid::hasVic(h->edid, h->edidLen, vic))
+			Modes::ensure(h->table, n, Modes::MaxModes, lit, Modes::SourceVic);
 	}
 	for (size_t i = 0; i < n; i++) {
 		const Edid::DetailedTiming &t = h->table[i].t;

@@ -54,9 +54,9 @@ struct Config {
 // connector has two: `tmds` picks the HDMI one, for a monitor behind a passive
 // DP++ adapter (the HDMI connectors' only table is taken either way). There
 // is a set of them for each pipe a display beyond the boot one can be on
-// (1 to 3): `pipe` picks the set. An HDMI connector has a second table that
-// lights the pipe at 3840x2160@60 (scrambled, and DISPCLK raised first):
-// `uhd` picks it.
+// (1 to 3): `pipe` picks the set. An HDMI connector, and a DisplayPort one
+// for an HDMI sink behind a DP++ adapter, has a second table that lights the
+// pipe at 3840x2160@60 (scrambled, and DISPCLK raised first): `uhd` picks it.
 size_t configCount();
 const Config &configAt(size_t i);
 bool use(uint8_t hpd, bool tmds = false, uint8_t pipe = 1, bool uhd = false);
@@ -106,6 +106,9 @@ struct Target {
 	// pixel clock in the DMUB commands, the infoframe's VIC and bars, and for
 	// DisplayPort the MSA and the first Mvid.
 	Edid::DetailedTiming now;
+	// Light: the DET segments to give the plane, when the plan's (DML's for
+	// this pipe alone) do not fit next to the other pipes; 0 = the plan's.
+	uint8_t detSegments;
 };
 
 constexpr size_t kMaxSteps = 448;

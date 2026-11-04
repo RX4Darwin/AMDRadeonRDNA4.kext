@@ -439,4 +439,20 @@ Hdmi2Caps hdmi2Caps(const uint8_t *edid, size_t len) {
 	return caps;
 }
 
+bool hasVic(const uint8_t *edid, size_t len, uint8_t vic) {
+	for (size_t off = BlockSize; edid && vic && off + BlockSize <= len; off += BlockSize) {
+		CtaCaps cta {};
+
+		if (!blockChecksumOk(edid + off) || !parseCtaBlock(edid + off, cta))
+			continue;
+
+		for (size_t i = 0; i < cta.vicCount; i++) {
+			if (cta.vics[i] == vic)
+				return true;
+		}
+	}
+
+	return false;
+}
+
 } // namespace Edid

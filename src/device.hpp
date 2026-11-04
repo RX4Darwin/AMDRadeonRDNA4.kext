@@ -30,6 +30,7 @@
 #include "pipe.hpp"
 #include "pipe2.hpp"
 #include "dptrain.hpp"
+#include "regsnap.hpp"
 
 class IOMemoryMap;
 struct SmuMailbox;
@@ -76,6 +77,7 @@ public:
 		uint8_t       aux { 0 };
 		DpTrain::Sink sink {};
 		DpTrain::Link link {};
+		RegSnap::Snap *snap { nullptr };   // rdna4-wakediff=1: what lighting left (regsnap.hpp)
 	};
 	static constexpr size_t kMaxExtra = 3;
 	ExtraPipe extra[kMaxExtra] { { 1 }, { 2 }, { 3 } };
@@ -117,6 +119,7 @@ public:
 	// while its ID block has not been read.
 	uint32_t dpDualKHz[8] {};
 
+	void overrideDpDual(uint8_t hpd);
 	uint32_t dpDualMaxKHz(uint8_t hpd) const {
 		return dpDual(hpd) ? dpDualKHz[hpd - 1] : 0;
 	}
@@ -162,6 +165,18 @@ public:
 	// raised for it (uhdClocks), if the sink has SCDC and the plan's mode.
 	bool usePlanFor(uint8_t hpd);
 	bool sinkTakesUhd(uint8_t hpd) const;
+	// DET buffer shares when a pipe is lit (lightSecondPipe).
+	static constexpr uint32_t kMinDetSegments = 6;
+	bool pipeInUse(uint32_t p) const;
+	void freeIdleDet(const Pipe2::Config &c);
+	uint32_t detShare(uint32_t plan, uint32_t others) const;
+	uint32_t shrinkCompbuf(const Pipe2::Config &c, uint32_t others);
+	void logUnderflow(const char *when);
+	// rdna4-wakediff=1: snapshot after lighting, compared after each wake.
+	void snapAfterLight(const Pipe2::Plan &plan);
+	void diffAfterWake();
+	static uint32_t snapRead(void *ctx, uint8_t seg, uint32_t dword);
+	static void snapDiff(void *ctx, const RegSnap::Reg &was, uint32_t now);
 	volatile bool uhdClocks { false };   // set by smuStarted, on the compute thread
 	bool pipe2DpAllowed { false };
 	bool readSecondEdid(uint8_t hpd);
@@ -296,7 +311,9 @@ private:
 	bool dpcdRead(uint8_t aux, uint32_t address, uint8_t *data, size_t len);
 	bool dpcdWrite(uint8_t aux, uint32_t address, const uint8_t *data, size_t len);
 	bool i2cTransfer(uint8_t line, uint8_t addr, const uint8_t *wr, size_t wlen, uint8_t *rd, size_t rlen);
-	void scdcConfigure(uint8_t line, uint8_t tmdsConfig);
+	bool scdcConfigure(uint8_t line, uint8_t tmdsConfig);
+	bool scdcConfigureWait(uint8_t line, uint8_t tmdsConfig);
+	void scdcRefresh();
 	void probeEDID();
 	// AUX engine of the sink whose EDID we cached — the target for DPCD
 	// power writes.
@@ -319,6 +336,7 @@ private:
 	bool smuHardMinMet(uint32_t clk);
 	bool smuSetHardMin(uint32_t clk, const char *name, uint32_t mhz);
 	bool raiseDisplayClocks();
+	uint32_t topDpmLevel(uint32_t clk);
 	void logDisplayClocks();
 	uint32_t dpmLevelCount(const SmuMailbox &mb, uint32_t clk);
 	void logDpmLevels(const SmuMailbox &mb, uint32_t clk, const char *name);

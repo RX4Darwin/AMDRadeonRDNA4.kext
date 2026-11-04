@@ -65,6 +65,8 @@ constexpr uint32_t kDpmFineGrained = 1u << 31;
 constexpr uint32_t kMaxDpmLevels = 16;
 
 /* PPCLK_e, dcn401_smu14_driver_if.h */
+constexpr uint32_t kPpclkUclk = 2;
+constexpr uint32_t kPpclkFclk = 3;
 constexpr uint32_t kPpclkDispclk = 6;
 constexpr uint32_t kPpclkDppclk = 7;
 constexpr uint32_t kPpclkDprefclk = 8;
@@ -76,6 +78,8 @@ struct Clock {
 };
 
 constexpr Clock kClocks[] = {
+	{ kPpclkUclk, "UCLK" },
+	{ kPpclkFclk, "FCLK" },
 	{ kPpclkDispclk, "DISPCLK" },
 	{ kPpclkDppclk, "DPPCLK" },
 	{ kPpclkDprefclk, "DPREFCLK" },
@@ -83,21 +87,31 @@ constexpr Clock kClocks[] = {
 };
 
 /*
- * What a pipe lit at 3840x2160@60 needs, above what Linux's DML asks for it:
- * DISPCLK 621, DPPCLK 598 and DCFCLK 228 MHz. rdna4-dispclk=<MHz> sets the
- * first two instead, 0 leaves the clocks alone.
+ * The hard minimums the display asks the firmware for once it runs. DISPCLK,
+ * DPPCLK and DCFCLK: above what Linux's DML asks for one 3840x2160@60 pipe
+ * (621, 598 and 228 MHz); they are required for 4K. UCLK at its top level:
+ * the firmware idles memory at 97 MHz, and two 4K planes underflowed there
+ * (card, 2026-11-04); the display does not take part in memory clock
+ * switches, so like Linux in that case it holds the memory clock. FCLK is
+ * the firmware's. Each has an option to set it instead (0 for DISPCLK:
+ * leave the clocks alone, and no 4K).
  */
+constexpr uint32_t kTopLevel = ~0u;
+
 struct HardMin {
 	uint32_t id;
 	const char *name;
-	uint32_t mhz;
-	bool dispclk;   /* follows rdna4-dispclk */
+	const char *option;
+	uint32_t mhz;        /* 0: not asked for, kTopLevel: the top DPM level */
+	bool required;
 };
 
 constexpr HardMin kRaised[] = {
-	{ kPpclkDispclk, "DISPCLK", 650, true },
-	{ kPpclkDppclk, "DPPCLK", 650, true },
-	{ kPpclkDcfclk, "DCFCLK", 300, false },
+	{ kPpclkDispclk, "DISPCLK", "rdna4-dispclk", 650, true },
+	{ kPpclkDppclk, "DPPCLK", "rdna4-dispclk", 650, true },
+	{ kPpclkDcfclk, "DCFCLK", "rdna4-dcfclk", 600, true },
+	{ kPpclkUclk, "UCLK", "rdna4-uclk", kTopLevel, false },
+	{ kPpclkFclk, "FCLK", "rdna4-fclk", 0, false },
 };
 
 /* DENTIST_DISPCLK_CNTL (base index 1): the divider DISPCLK runs on. */
@@ -227,6 +241,18 @@ uint32_t RDNA4Device::dpmLevelCount(const SmuMailbox &mb, uint32_t clk)
 	return count > kMaxDpmLevels ? kMaxDpmLevels : count;
 }
 
+/* A clock's highest DPM level in MHz, 0 if the firmware does not say. */
+uint32_t RDNA4Device::topDpmLevel(uint32_t clk)
+{
+	const uint32_t count = dpmLevelCount(*smu, clk);
+	uint32_t freq = 0;
+
+	if (!count || !smuSend(*smu, smu->getDpmFreq, clk << 16 | (count - 1), &freq))
+		return 0;
+
+	return freq & 0xffff;
+}
+
 void RDNA4Device::logDpmLevels(const SmuMailbox &mb, uint32_t clk,
 			       const char *name)
 {
@@ -330,16 +356,19 @@ bool RDNA4Device::smuSetHardMin(uint32_t clk, const char *name, uint32_t mhz)
 bool RDNA4Device::raiseDisplayClocks()
 {
 	uint32_t dispclk = 0;
-	const bool asked = Trial::option("rdna4-dispclk", dispclk);
 	bool met = true;
 
-	if (asked && !dispclk)
+	if (Trial::option("rdna4-dispclk", dispclk) && !dispclk)
 		return false;
 
 	for (const HardMin &c : kRaised) {
-		const uint32_t mhz = asked && c.dispclk ? dispclk : c.mhz;
+		uint32_t mhz = c.mhz;
 
-		if (!smuSetHardMin(c.id, c.name, mhz))
+		(void)Trial::option(c.option, mhz);
+		if (mhz == kTopLevel)
+			mhz = topDpmLevel(c.id);
+
+		if (mhz && !smuSetHardMin(c.id, c.name, mhz) && c.required)
 			met = false;
 	}
 

@@ -183,6 +183,11 @@ struct Hdmi2Caps {
 };
 Hdmi2Caps hdmi2Caps(const uint8_t *edid, size_t len);
 
+// Whether a CTA extension of the EDID lists `vic` among its video formats.
+// The mode table may not show it: a DTD of the same size and rate wins
+// (Modes::build), e.g. a monitor's CVT-RB 3840x2160@60 over CEA VIC 97.
+bool hasVic(const uint8_t *edid, size_t len, uint8_t vic);
+
 } // namespace Edid
 
 #endif /* Edid_hpp */

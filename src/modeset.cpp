@@ -76,6 +76,7 @@ constexpr uint32_t kDigFifoCtrl0  = 0x209b;      // ENABLE [0], RESET [1], READ_
                                                  // OUTPUT_PIXEL_PER_CYCLE [9:8], RESET_DONE [20]
 constexpr uint32_t kHdmiControl   = 0x209e;      // DATA_SCRAMBLE_EN [1], CLOCK_CHANNEL_RATE [2]
 constexpr uint32_t kHdmiGc        = 0x20a8;      // AVMUTE [0]
+constexpr uint32_t kHdmiVbiPacketControl = 0x20a2;   // NULL_SEND [0], GC_SEND [4], GC_CONT [5], ACP_SEND [12]
 constexpr uint32_t kDigBeClkCntl  = 0x20bb;      // BE_MODE [2:0], BE_CLK_EN [4]
 constexpr uint32_t kDigBeCntl     = 0x20bc;      // FE_SOURCE_SELECT [14:8]
 constexpr uint32_t kDigBeEnCntl   = 0x20bd;      // BE_ENABLE [0]
@@ -393,6 +394,12 @@ bool build(const Target &t, Plan &out, const char **why) {
 			es.pclk10kHz = symclk10kHz;
 			Dmub::buildDigEncoderStreamSetup(*c, es);
 		}
+		// The stream setup leaves the General Control packet off, and with
+		// it the avmute state below never reaches the sink. As
+		// enc401_stream_encoder_hdmi_set_stream_attribute: null and GC
+		// packets on, every frame; no ACP.
+		b.update(kHdmiVbiPacketControl + dig, 0x31, 0x31, "hdmi gc packets on");
+		b.update(kHdmiVbiPacketControl + dig, 0x1000, 0, "hdmi acp off");
 		b.update(kHdmiControl + dig, 0x6, t.to.pixelClockKHz >= kScrambleFromKHz ? 0x6 : 0, "hdmi scrambler");
 
 		// --- write_scdc_data: the sink's side of the scrambling, before the link is enabled ---

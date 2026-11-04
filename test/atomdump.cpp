@@ -588,6 +588,11 @@ static int testModes() {
 	for (size_t i = 0; i < hn; i++)
 		has594 = has594 || hfModes[i].t.pixelClockKHz == 594000;
 	failures += check(has594, "HDMI Forum block: the 594 MHz mode is not offered (%zu modes)", hn);
+	// The EDID's own list of formats, whatever the mode table kept of it.
+	failures += check(Edid::hasVic(hf, sizeof(hf), 97) && !Edid::hasVic(hf, sizeof(hf), 16) &&
+	                  Edid::hasVic(syn, sizeof(syn), 16) && !Edid::hasVic(syn, sizeof(syn), 97) &&
+	                  !Edid::hasVic(hf, 128, 97) && !Edid::hasVic(hf, sizeof(hf), 0),
+	                  "Edid::hasVic");
 
 	// The 75 Hz DTD is `cvt -r 1920 1080 75`: 1080/3/5/31, i.e. 74.97 Hz.
 	const Edid::DetailedTiming &t75 = yb.dtds[1];
@@ -2055,7 +2060,8 @@ static int testPipe2Table() {
 	                  regs.get(2, kBeCntl), regs.get(2, kHdmiGc), regs.get(2, kOtgCtl));
 	power.part = Pipe2::Part::Wake;
 	bool woke = Pipe2::build(power, dpms, &why);
-	failures += check(woke && dpms.ncmds == 3 && memcmp(dpms.cmds, plan.cmds + 1, 3 * sizeof(Dmub::Cmd)) == 0,
+	// HDMI: the PHY PLL first, then lighting's encoder and transmitter commands.
+	failures += check(woke && dpms.ncmds == 4 && memcmp(dpms.cmds, plan.cmds, 4 * sizeof(Dmub::Cmd)) == 0,
 	                  "pipe2: wake plan: %s, %zu DMUB commands", woke ? "built" : why, dpms.ncmds);
 	inBlocks(dpms);
 	regs.run(dpms);
@@ -2110,9 +2116,10 @@ static int testPipe2Table() {
 		failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 1 && dpms.cmds[0][1] == 1080000,
 		                  "pipe2: sleep at 108 MHz sets the pixel clock to %u x 100 Hz", dpms.cmds[0][1]);
 		power.part = Pipe2::Part::Wake;
-		failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 3 && dpms.cmds[0][2] == 10800 &&
-		                  dpms.cmds[1][2] == 10800, "pipe2: wake at 108 MHz: encoder %u, transmitter %u x 10 kHz",
-		                  dpms.cmds[0][2], dpms.cmds[1][2]);
+		failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 4 && dpms.cmds[0][1] == 1080000 &&
+		                  dpms.cmds[1][2] == 10800 && dpms.cmds[2][2] == 10800,
+		                  "pipe2: wake at 108 MHz: pixel clock %u x 100 Hz, encoder %u, transmitter %u x 10 kHz",
+		                  dpms.cmds[0][1], dpms.cmds[1][2], dpms.cmds[2][2]);
 	}
 	const size_t modeMismatch = modeSwitches(lit);
 	failures += static_cast<int>(modeMismatch);
@@ -2585,7 +2592,7 @@ static int testN48N() {
 static int testPipe2() {
 	int failures = 0;
 	const uint8_t first = Pipe2::config().hpd;
-	failures += check(Pipe2::configCount() == 24 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
+	failures += check(Pipe2::configCount() == 30 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
 	                  Pipe2::config().hpd == first,
 	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
 	// A DisplayPort connector has its DisplayPort table and an HDMI one (a passive DP++ adapter); an HDMI
@@ -2602,7 +2609,8 @@ static int testPipe2() {
 	failures += check(Pipe2::hasDpTable(1) && Pipe2::hasDpTable(2) && !Pipe2::hasDpTable(3) &&
 	                  !Pipe2::hasDpTable(4) && !Pipe2::hasDpTable(5),
 	                  "pipe2: DisplayPort connectors on HPD1 and HPD2 only");
-	// The HDMI connectors have a table lit at CEA 3840x2160@60 on each pipe, taken only when asked for.
+	// Every connector has a table lit at CEA 3840x2160@60 on each pipe (on DisplayPort for an HDMI sink behind
+	// a DP++ adapter), taken only when asked for.
 	// A switch down from 3840x2160 leaves the scrambler to the mode set: a mode
 	// table row of the lit mode must not turn it on again (the TV, 2026-11-03).
 	{
@@ -2616,14 +2624,16 @@ static int testPipe2() {
 		failures += check(n > 0 && scramblerWrites == 0, "pipe2: a switch from 3840x2160 to 1080p writes the "
 		                  "scrambler bits %zu time(s)", scramblerWrites);
 	}
-	failures += check(Pipe2::hasUhdTable(3) && Pipe2::hasUhdTable(4) && !Pipe2::hasUhdTable(1) &&
-	                  !Pipe2::hasUhdTable(2) && Pipe2::use(3, false, 2) && !Pipe2::isUhd(Pipe2::config()) &&
+	failures += check(Pipe2::hasUhdTable(3) && Pipe2::hasUhdTable(4) && Pipe2::hasUhdTable(1) &&
+	                  Pipe2::hasUhdTable(2) && !Pipe2::hasUhdTable(5) && Pipe2::use(3, false, 2) &&
+	                  !Pipe2::isUhd(Pipe2::config()) &&
 	                  Pipe2::use(3, false, 2, true) && Pipe2::config().pipe == 2 && Pipe2::config().dig == 2 &&
 	                  Pipe2::config().timing.hActive == 3840 && Pipe2::config().timing.vActive == 2160 &&
 	                  Pipe2::config().timing.pixelClockKHz == 594000 && Edid::vicOf(Pipe2::config().timing) == 97 &&
 	                  Pipe2::config().detSegments == 10 && Pipe2::use(4, false, 3, true) &&
-	                  Pipe2::config().link == 3 && !Pipe2::use(1, true, 1, true),
-	                  "pipe2: 3840x2160@60 tables for the HDMI connectors");
+	                  Pipe2::config().link == 3 && Pipe2::use(2, true, 1, true) && !Pipe2::config().dp &&
+	                  Pipe2::config().link == 1 && Pipe2::config().timing.pixelClockKHz == 594000,
+	                  "pipe2: 3840x2160@60 tables for the HDMI connectors and DP++");
 
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
 		const Pipe2::Config &c = Pipe2::configAt(i);

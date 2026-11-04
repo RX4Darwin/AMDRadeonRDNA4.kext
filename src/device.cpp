@@ -1011,6 +1011,25 @@ void RDNA4Device::readDpDualAdaptor(uint8_t hpd, uint8_t line) {
 	else
 		FBLOG("dp++: HPD%u: %s, TMDS up to %u kHz", hpd,
 		      got ? "type 1 adapter" : "no adapter ID", a.maxTmdsKHz);
+
+	overrideDpDual(hpd);
+}
+
+// rdna4-dpdual-khz=<kHz>: what the DP++ adapters are taken to carry instead
+// of what their ID block says. The test rig's CS5216 adapters report 300 MHz,
+// and that is what they carry: a Dell lit at 3840x2160@60 (594 MHz) through
+// one showed a broken picture (2026-11-04), so the default is the adapter's.
+void RDNA4Device::overrideDpDual(uint8_t hpd) {
+	uint32_t khz = 0;
+
+	if (!Trial::option("rdna4-dpdual-khz", khz) || !khz)
+		return;
+
+	if (khz > DpDual::kType2MaxKHz)
+		khz = DpDual::kType2MaxKHz;
+
+	FBLOG("dp++: HPD%u: taken to carry %u kHz", hpd, khz);
+	dpDualKHz[hpd - 1] = khz;
 }
 
 // The EDID of a sink behind a passive DP++ adapter: over DDC, with the
@@ -1152,7 +1171,7 @@ bool RDNA4Device::i2cTransfer(uint8_t line, uint8_t addr, const uint8_t *wr, siz
 
 // What amdgpu's write_scdc_data does for a sink that has SCDC: answer its
 // version, then say whether the link is scrambled (TMDS_CONFIG).
-void RDNA4Device::scdcConfigure(uint8_t line, uint8_t tmdsConfig) {
+bool RDNA4Device::scdcConfigure(uint8_t line, uint8_t tmdsConfig) {
 	constexpr uint8_t kScdc = 0x54 << 1;                       // HDMI_SCDC_ADDRESS
 	constexpr uint8_t kSinkVersion = 0x01, kSourceVersion = 0x02, kTmdsConfig = 0x20;
 	uint8_t version = 0;
@@ -1164,6 +1183,30 @@ void RDNA4Device::scdcConfigure(uint8_t line, uint8_t tmdsConfig) {
 	const bool ok = i2cTransfer(line, kScdc, config, sizeof(config), nullptr, 0);
 	FBLOG("scdc: DDC%u: sink version %u, TMDS_CONFIG = %u %s", line, version, tmdsConfig,
 	      ok ? "written" : "NOT written");
+	return ok;
+}
+
+/*
+ * TMDS_CONFIG, written until the sink answers: a display waking from sleep
+ * may take a while to (the TV did not answer at the wake's first write and
+ * stayed dark on a scrambled link it was not told about, 2026-11-04). A
+ * sink that does not answer within 2 s is left as amdgpu leaves it.
+ */
+bool RDNA4Device::scdcConfigureWait(uint8_t line, uint8_t tmdsConfig)
+{
+	constexpr int kTries = 20;
+
+	for (int i = 0; i < kTries; i++) {
+		if (scdcConfigure(line, tmdsConfig))
+			return true;
+
+		if (!tmdsConfig)
+			return false;
+
+		IOSleep(100);
+	}
+
+	return false;
 }
 
 void RDNA4Device::dumpModeState() {
@@ -2185,6 +2228,8 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	return true;
 }
 
+static uint32_t gSnapLines;   // wakediff lines of the current comparison
+
 RDNA4Device::~RDNA4Device() {
 	freeHardwareCursor();
 	if (cursorTrailLock) {
@@ -2391,8 +2436,8 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 			IODelay(s.arg);
 			break;
 		case ModeSet::Op::Scdc:
-			// Like amdgpu, carry on if the sink does not answer.
-			scdcConfigure(static_cast<uint8_t>(s.arg), static_cast<uint8_t>(s.value));
+			// Like amdgpu, carry on if the sink does not answer (in time).
+			scdcConfigureWait(static_cast<uint8_t>(s.arg), static_cast<uint8_t>(s.value));
 			break;
 		case ModeSet::Op::Require: {
 			const uint32_t v = regReadDmu(s.seg, s.dword);
@@ -2852,17 +2897,21 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 	}
 	t.surface = lit + (surfacePhys - fbPhysBase);
 
-	// The plane needs its share of the DET buffer; what the others hold is
-	// theirs (taking it back means reprogramming the lit pipe).
+	// The plane needs its share of the DET buffer; what the lit pipes hold is
+	// theirs (taking it back means reprogramming them), an idle pipe's is
+	// given back first.
+	freeIdleDet(c);
 	uint32_t det[4] {}, others = 0;
 	for (uint32_t i = 0; i < 4; i++) {
 		det[i] = regReadDmu(c.detSeg, c.detCtrl[i]) & 0x1f;
 		if (i != c.pipe)
 			others += det[i];
 	}
-	const bool detFits = others + c.detSegments <= Pipe2::kDetSegmentsTotal;
-	FBLOG("pipe2: DET segments %u %u %u %u of %u: %u for the plane %s", det[0], det[1], det[2], det[3],
-	      Pipe2::kDetSegmentsTotal, c.detSegments, detFits ? "fit" : "do NOT fit");
+	others += shrinkCompbuf(c, others);
+	t.detSegments = static_cast<uint8_t>(detShare(c.detSegments, others));
+	const bool detFits = t.detSegments != 0;
+	FBLOG("pipe2: DET segments %u %u %u %u of %u: %u for the plane (plan %u) %s", det[0], det[1], det[2], det[3],
+	      Pipe2::kDetSegmentsTotal, t.detSegments, c.detSegments, detFits ? "fit" : "do NOT fit");
 
 	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
 	if (!plan)
@@ -2905,6 +2954,10 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		      regReadDmu(2, 0x1aca + c.pipe * Pipe::Reg::kOdmStride));
 		if (ok && level >= 4)
 			comparePipeColour(*plan);
+		if (ok) {
+			logUnderflow("pipe2: after lighting");
+			snapAfterLight(*plan);
+		}
 		// With the stream lit, what the plane would still change.
 		t.depth = Pipe2::Depth::Plane;
 		if (ok && level == 3 && Pipe2::build(t, *plan, &why))
@@ -2912,6 +2965,39 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 	}
 	IOFree(plan, sizeof(Pipe2::Plan));
 	return ok;
+}
+
+/*
+ * The planes' underflow flags (HUBPn_DCHUBP_CNTL.HUBP_UNDERFLOW_STATUS,
+ * bits 30:28), sticky: what lighting itself caused, then, cleared
+ * (HUBP_UNDERFLOW_CLEAR, bit 31), what half a second of scanout adds. A
+ * plane whose DET share or clocks are too small for its mode keeps
+ * underflowing.
+ */
+void RDNA4Device::logUnderflow(const char *when)
+{
+	constexpr uint32_t kDchubpCntl = 0x05f4;
+	constexpr uint32_t kClear = 1u << 31;
+	uint32_t before[4], after[4];
+
+	IOSleep(200);
+
+	for (uint32_t i = 0; i < 4; i++) {
+		const uint32_t reg = kDchubpCntl + i * Pipe::Reg::kHubpStride;
+		const uint32_t v = regReadDmu(2, reg);
+
+		before[i] = v >> 28 & 0x7;
+		regWriteDmu(2, reg, v | kClear);
+		regWriteDmu(2, reg, v & ~kClear);
+	}
+
+	IOSleep(500);
+
+	for (uint32_t i = 0; i < 4; i++)
+		after[i] = regReadDmu(2, kDchubpCntl + i * Pipe::Reg::kHubpStride) >> 28 & 0x7;
+
+	FBLOG("%s: underflow HUBP0..3 %u %u %u %u, then in 0.5 s %u %u %u %u", when, before[0], before[1],
+	      before[2], before[3], after[0], after[1], after[2], after[3]);
 }
 
 // One pipe was programmed by the firmware and one by Linux's code: where the
@@ -3068,23 +3154,91 @@ static const Pipe2::Config *uhdConfigFor(uint8_t hpd)
 bool RDNA4Device::sinkTakesUhd(uint8_t hpd) const
 {
 	const Pipe2::Config *c = uhdConfigFor(hpd);
-	const size_t bytes = sizeof(Modes::Mode) * Modes::MaxModes;
-	Modes::Mode *modes;
-	size_t n;
-	bool found;
 
-	if (!c || dpDual(hpd) || !Edid::hdmi2Caps(xp().edid, xp().edidLen).scdc)
+	if (!c || !Edid::hdmi2Caps(xp().edid, xp().edidLen).scdc)
 		return false;
 
-	modes = static_cast<Modes::Mode *>(IOMalloc(bytes));
-	if (!modes)
+	// Behind a DP++ adapter: only if it carries the table's clock.
+	if (dpDual(hpd) && dpDualMaxKHz(hpd) < c->timing.pixelClockKHz)
 		return false;
 
-	n = Modes::build(xp().edid, xp().edidLen, Modes::Limits {}, modes, Modes::MaxModes);
-	found = Modes::match(modes, n, c->timing) >= 0;
-	IOFree(modes, bytes);
+	return Edid::hasVic(xp().edid, xp().edidLen, Edid::vicOf(c->timing));
+}
 
-	return found;
+/* Whether a pipe scans out: the boot pipe, or an extra one that is lit. */
+bool RDNA4Device::pipeInUse(uint32_t p) const
+{
+	if (p == pipe.otg)
+		return true;
+
+	for (const ExtraPipe &x : extra) {
+		if (x.pipe == p && x.lit)
+			return true;
+	}
+
+	return false;
+}
+
+/* Give the DET segments of pipes nothing scans out from back to the pool. */
+void RDNA4Device::freeIdleDet(const Pipe2::Config &c)
+{
+	for (uint32_t i = 0; i < 4; i++) {
+		const uint32_t v = regReadDmu(c.detSeg, c.detCtrl[i]);
+
+		if (i == c.pipe || pipeInUse(i) || !(v & 0x1f))
+			continue;
+
+		regWriteDmu(c.detSeg, c.detCtrl[i], v & ~0x1fu);
+		FBLOG("pipe2: DET of idle pipe %u (%u segments) given back", i, v & 0x1f);
+	}
+}
+
+/*
+ * The DET buffers and the compressed buffer share the 21 segments
+ * (dcn401_program_compbuf_segments). The firmware leaves the compressed
+ * buffer some; when the plan's DET would not fit next to the other pipes'
+ * and it, it shrinks (shrinking is always allowed): the scanout surfaces
+ * here are linear, nothing uses it. With it overcommitted every plane
+ * underflowed (two 4K pipes, card, 2026-11-04). Returns what it keeps.
+ */
+uint32_t RDNA4Device::shrinkCompbuf(const Pipe2::Config &c, uint32_t others)
+{
+	constexpr uint32_t kCompbufCtrl = 0x04ba;
+	const uint32_t v = regReadDmu(c.detSeg, kCompbufCtrl);
+	const uint32_t now = v >> 8 & 0x1f;
+	const uint32_t room = others + c.detSegments < Pipe2::kDetSegmentsTotal ?
+			      Pipe2::kDetSegmentsTotal - others - c.detSegments : 0;
+	uint32_t got = now;
+
+	if (now <= room)
+		return now;
+
+	regWriteDmu(c.detSeg, kCompbufCtrl, (v & ~0x1fu) | room);
+
+	for (int i = 0; i < 100 && got != room; i++) {
+		IOSleep(1);
+		got = regReadDmu(c.detSeg, kCompbufCtrl) >> 8 & 0x1f;
+	}
+
+	FBLOG("pipe2: compressed buffer %u -> %u segments%s", now, room,
+	      got == room ? "" : " (not taken yet)");
+
+	return got;
+}
+
+/*
+ * The DET segments a plane gets next to `others`: the plan's if they fit,
+ * else what is left down to kMinDetSegments, else 0. DML gave the plan's
+ * for the pipe alone; with more displays it would give each less too.
+ */
+uint32_t RDNA4Device::detShare(uint32_t plan, uint32_t others) const
+{
+	const uint32_t left = others < Pipe2::kDetSegmentsTotal ? Pipe2::kDetSegmentsTotal - others : 0;
+
+	if (plan <= left)
+		return plan;
+
+	return left >= kMinDetSegments ? left : 0;
 }
 
 bool RDNA4Device::usePlanFor(uint8_t hpd) {
@@ -3315,6 +3469,70 @@ void RDNA4Device::setSecondPipePower(bool on) {
 	// A wake that stopped did not bring the display up: the next request to
 	// turn it on, or the next plug, runs the wake again.
 	xp().on = on && ok;
+	if (xp().on) {
+		scdcRefresh();
+		diffAfterWake();
+	}
+}
+
+void RDNA4Device::snapAfterLight(const Pipe2::Plan &plan)
+{
+	uint32_t on = 0;
+
+	if (!Trial::option("rdna4-wakediff", on) || !on)
+		return;
+
+	if (!xp().snap)
+		xp().snap = static_cast<RegSnap::Snap *>(IOMalloc(sizeof(RegSnap::Snap)));
+
+	if (!xp().snap)
+		return;
+
+	RegSnap::take(*xp().snap, plan.steps, plan.count, snapRead, this);
+	FBLOG("wakediff: %zu registers of pipe %u taken after lighting", xp().snap->count, xp().pipe);
+}
+
+void RDNA4Device::diffAfterWake()
+{
+	size_t differ;
+
+	if (!xp().snap)
+		return;
+
+	gSnapLines = 0;
+	differ = RegSnap::compare(*xp().snap, snapRead, snapDiff, this);
+	FBLOG("wakediff: pipe %u after wake: %zu of %zu registers differ from after lighting", xp().pipe,
+	      differ, xp().snap->count);
+}
+
+uint32_t RDNA4Device::snapRead(void *ctx, uint8_t seg, uint32_t dword)
+{
+	return static_cast<RDNA4Device *>(ctx)->regReadDmu(seg, dword);
+}
+
+void RDNA4Device::snapDiff(void *, const RegSnap::Reg &was, uint32_t now)
+{
+	if (gSnapLines++ < 60)
+		FBLOG("wakediff:   %u:0x%04x %s: lit 0x%08x, now 0x%08x", was.seg, was.dword, was.what,
+		      was.value, now);
+}
+
+/*
+ * A scrambled link's TMDS_CONFIG once more, with the TMDS clock running: an
+ * HDMI 2.0 sink forgets it while the clock is gone, and the wake wrote it
+ * before the transmitter was on (the second Dell stayed dark after a wake
+ * that had written it, 2026-11-04).
+ */
+void RDNA4Device::scdcRefresh()
+{
+	const uint32_t khz = xp().target.now.pixelClockKHz ? xp().target.now.pixelClockKHz :
+							       Pipe2::config().timing.pixelClockKHz;
+
+	if (Pipe2::config().dp || !xp().target.sinkScdc || khz <= ModeSet::kScrambleFromKHz)
+		return;
+
+	IOSleep(100);
+	scdcConfigureWait(xp().target.ddcLine, static_cast<uint8_t>(ModeSet::scdcTmdsConfig(khz)));
 }
 
 // The modes the second pipe can be switched to scan the surface it was lit
@@ -3458,5 +3676,14 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 	      regReadDmu(2, 0x05f4 + c.pipe * Pipe::Reg::kHubpStride), c.pipe,
 	      regReadDmu(2, 0x1aca + c.pipe * Pipe::Reg::kOdmStride), regReadDmu(c.detSeg, c.detCtrl[c.pipe]) & 0x1f);
 	IOFree(work, sizeof(Work));
+
+	if (ok) {
+		// The sink's side of a scrambled link once more, with its clock
+		// running, as after a wake.
+		scdcRefresh();
+		logUnderflow("pipe2: after the switch");
+		diffAfterWake();
+	}
+
 	return ok ? kIOReturnSuccess : kIOReturnIOError;
 }

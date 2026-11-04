@@ -149,6 +149,9 @@ if [ $# -eq 0 ]; then
 	for p in 1 2 3; do
 		table pipe2_linux_p${p}_hpd3_uhd.inc   $p 2 2 3  3840 176 88 296  2160 8 10 72  594000 1 1 97
 		table pipe2_linux_p${p}_hpd4_uhd.inc   $p 3 3 4  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		# and the DisplayPort connectors with an HDMI sink behind a passive DP++ adapter
+		table pipe2_linux_p${p}_dp1_tmds_uhd.inc   dpdual  $p 0 0 1  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		table pipe2_linux_p${p}_dp2_tmds_uhd.inc   dpdual  $p 1 1 2  3840 176 88 296  2160 8 10 72  594000 1 1 97
 	done
 else
 	table pipe2_linux.inc "$@"

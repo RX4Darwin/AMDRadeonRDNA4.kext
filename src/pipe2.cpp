@@ -127,6 +127,27 @@ namespace P3Hpd4Uhd {
 #include "pipe2_linux_p3_hpd4_uhd.inc"
 }
 
+// The DisplayPort connectors lit at 3840x2160@60 for an HDMI sink behind a
+// passive DP++ adapter, for each pipe.
+namespace P1Hpd1TmdsUhd {
+#include "pipe2_linux_p1_dp1_tmds_uhd.inc"
+}
+namespace P1Hpd2TmdsUhd {
+#include "pipe2_linux_p1_dp2_tmds_uhd.inc"
+}
+namespace P2Hpd1TmdsUhd {
+#include "pipe2_linux_p2_dp1_tmds_uhd.inc"
+}
+namespace P2Hpd2TmdsUhd {
+#include "pipe2_linux_p2_dp2_tmds_uhd.inc"
+}
+namespace P3Hpd1TmdsUhd {
+#include "pipe2_linux_p3_dp1_tmds_uhd.inc"
+}
+namespace P3Hpd2TmdsUhd {
+#include "pipe2_linux_p3_dp2_tmds_uhd.inc"
+}
+
 struct Table {
 	const Config               &config;
 	const Gen                  *gen;        // the plan
@@ -180,6 +201,12 @@ constexpr Table kTables[] = {
 	table(P2Hpd4Uhd::kConfig, P2Hpd4Uhd::kGen, P2Hpd4Uhd::kModeRegs, P2Hpd4Uhd::kModeTimings, P2Hpd4Uhd::kModeValues),
 	table(P3Hpd3Uhd::kConfig, P3Hpd3Uhd::kGen, P3Hpd3Uhd::kModeRegs, P3Hpd3Uhd::kModeTimings, P3Hpd3Uhd::kModeValues),
 	table(P3Hpd4Uhd::kConfig, P3Hpd4Uhd::kGen, P3Hpd4Uhd::kModeRegs, P3Hpd4Uhd::kModeTimings, P3Hpd4Uhd::kModeValues),
+	table(P1Hpd1TmdsUhd::kConfig, P1Hpd1TmdsUhd::kGen, P1Hpd1TmdsUhd::kModeRegs, P1Hpd1TmdsUhd::kModeTimings, P1Hpd1TmdsUhd::kModeValues),
+	table(P1Hpd2TmdsUhd::kConfig, P1Hpd2TmdsUhd::kGen, P1Hpd2TmdsUhd::kModeRegs, P1Hpd2TmdsUhd::kModeTimings, P1Hpd2TmdsUhd::kModeValues),
+	table(P2Hpd1TmdsUhd::kConfig, P2Hpd1TmdsUhd::kGen, P2Hpd1TmdsUhd::kModeRegs, P2Hpd1TmdsUhd::kModeTimings, P2Hpd1TmdsUhd::kModeValues),
+	table(P2Hpd2TmdsUhd::kConfig, P2Hpd2TmdsUhd::kGen, P2Hpd2TmdsUhd::kModeRegs, P2Hpd2TmdsUhd::kModeTimings, P2Hpd2TmdsUhd::kModeValues),
+	table(P3Hpd1TmdsUhd::kConfig, P3Hpd1TmdsUhd::kGen, P3Hpd1TmdsUhd::kModeRegs, P3Hpd1TmdsUhd::kModeTimings, P3Hpd1TmdsUhd::kModeValues),
+	table(P3Hpd2TmdsUhd::kConfig, P3Hpd2TmdsUhd::kGen, P3Hpd2TmdsUhd::kModeRegs, P3Hpd2TmdsUhd::kModeTimings, P3Hpd2TmdsUhd::kModeValues),
 };
 constexpr size_t kTableCount = sizeof(kTables) / sizeof(kTables[0]);
 
@@ -304,6 +331,17 @@ size_t modeSteps(const Edid::DetailedTiming &to, ModeSet::Step *out, size_t cap,
 	return n;
 }
 
+// What a plan step writes, but for this pipe's DET size when the target
+// asks for another one.
+static uint32_t detValue(const Target &t, const Gen &g) {
+	const Config &c = cur->config;
+
+	if (!t.detSegments || g.seg != c.detSeg || g.dword != c.detCtrl[c.pipe])
+		return g.value;
+
+	return (g.value & ~g.mask) | (t.detSegments & g.mask);
+}
+
 bool build(const Target &t, Plan &out, const char **why) {
 	const char *dummy;
 	const char *&err = why ? *why : dummy;
@@ -351,6 +389,16 @@ bool build(const Target &t, Plan &out, const char **why) {
 		return &out.cmds[out.ncmds++];
 	};
 
+	// SET_PIXEL_CLOCK: the link's PHY PLL at the pixel clock.
+	auto pixelClock = [&](Dmub::Cmd &cmd) {
+		Dmub::SetPixelClock pc {};
+		pc.pixclk100Hz = khz * 10;
+		pc.pllId = static_cast<uint8_t>(0x14 + c.link);   // ATOM_COMBOPHY_PLL0 + the link's PHY
+		pc.encoderObjId = static_cast<uint8_t>(t.encoderObjId & 0xff);
+		pc.encoderMode = Dmub::EncoderModeHdmi;
+		pc.crtcId = c.pipe;
+		Dmub::buildSetPixelClock(cmd, pc);
+	};
 	Part part = Part::Light;   // of the entry: the requirements at the top belong to lighting
 	for (size_t i = 0; i < cur->ngen; i++) {
 		const Gen &g = cur->gen[i];
@@ -360,7 +408,19 @@ bool build(const Target &t, Plan &out, const char **why) {
 			continue;
 		bool ok = true;
 		switch (g.kind) {
-		case '1': case '2': case '4': case '5': case '6':
+		case '1': case '2': case '4': case '6':
+			break;
+		case '5':
+			// HDMI: the PHY PLL first, as lighting does. The generated table
+			// has the command at the end of the sleep part only, and a wake
+			// at 594 MHz left the display dark after the transmitter was off
+			// (both 4K displays, card, 2026-11-04).
+			if (!c.dp) {
+				Dmub::Cmd *cmd = dmub(g);
+				if (cmd)
+					pixelClock(*cmd);
+				ok = cmd != nullptr;
+			}
 			break;
 		case '3':
 			if (t.depth == Depth::Stream)
@@ -368,7 +428,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 			break;
 		case 'R': ok = step(ModeSet::Op::Require, g, g.mask, g.value, 0); break;
 		case 'W': ok = step(ModeSet::Op::Write, g, 0, g.value, 0); break;
-		case 'U': ok = step(ModeSet::Op::Update, g, g.mask, g.value, 0); break;
+		case 'U': ok = step(ModeSet::Op::Update, g, g.mask, detValue(t, g), 0); break;
 		// Linux carries on past a wait that times out, with a warning.
 		case 'T': ok = step(ModeSet::Op::WaitValue, g, g.mask, g.value, g.arg, true); break;
 		case 'D': ok = step(ModeSet::Op::Delay, g, 0, 0, g.arg); break;
@@ -410,13 +470,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 			if (!cmd) {
 				ok = false;
 			} else if (g.kind == 'P') {
-				Dmub::SetPixelClock pc {};
-				pc.pixclk100Hz = khz * 10;
-				pc.pllId = static_cast<uint8_t>(0x14 + c.link);   // ATOM_COMBOPHY_PLL0 + the link's PHY
-				pc.encoderObjId = static_cast<uint8_t>(t.encoderObjId & 0xff);
-				pc.encoderMode = Dmub::EncoderModeHdmi;
-				pc.crtcId = c.pipe;
-				Dmub::buildSetPixelClock(*cmd, pc);
+				pixelClock(*cmd);
 			} else if (g.kind == 'E') {
 				Dmub::DigEncoderStreamSetup es {};
 				es.digId = c.dig;
