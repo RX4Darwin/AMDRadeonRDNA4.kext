@@ -285,6 +285,29 @@ TextEdit's window listed on screen. Judging the paravirtual boots by such captur
 display. Measured meanwhile: WindowServer composites in software in a paravirtual boot (`CA::OGL::SW`), holding a Metal device, an
 `AppleParavirt2DContext` and a display pipe client of the paravirtual accelerator.
 
+### Twenty-third to twenty-fifth runs (2026-11-04): WindowServer's shaders, and why it composites in software
+
+**Measured**, card, trial `rdna4-pvgpu=1 rdna4-compute=7 rdna4-pvgpu-disp=3`: with vertex descriptors, indexed draws, buffer offsets,
+the state commands 0x6b/0x73/0x7c/0x17 and derivatives, every pipeline WindowServer's compositor creates compiles and its draws run (about
+700 into window surfaces after a restart, none failing). The paravirtual display (0x01800009) is accelerated in CoreDisplay's dump
+(`isAcc=YES`, an accelerator port); the Dells on the real framebuffer are not. Still, with a window animating on the unmirrored paravirtual
+display, WindowServer composites with `CompositorSW` and no `DisplaySubmitTransaction` (0x06) ever comes.
+
+**Why (read in SkyLight and CoreDisplay, `dyld_info -disassemble` of the shared cache).** SkyLight picks a compositor per accelerator
+(`WSGetCompositorForAccelerator`): Metal when a Metal device is not headless and one device's `acceleratorPort` equals the display's
+accelerator (the paravirtual device's does: `AppleParavirtAccelerator`, checked from a client). The frame reaches the paravirtual display
+only through its display pipe (`AppleParavirtDisplayPipe::submitTransaction`, an IOAccelDisplayPipe transaction), and CoreDisplay drives
+display pipes only through IOPresentment: `CoreDisplay::UseIOPresentment()` needs the preference `useIOP` (domain `com.apple.CoreDisplay`,
+any user, current host; its default is a hardware flag, off on this Mac) and every GPU vendor of the system enabled for it (APV is).
+Without it the paravirtual display gets the legacy framebuffer flush, which the paravirtual framebuffer has no memory for.
+
+**`useIOP` on** (set as root through CFPreferences, WindowServer restarted): CoreDisplay looks for a display pipe for every framebuffer,
+finds none for the Dells' (`Unable to find display pipe for IOFB service`, thousands a minute), logs `Attempting to get capabilities from
+plane with no gamma` for the paravirtual one, and ends with no display online at all. Removing the preference needed a reboot. So
+IOPresentment takes a system whose displays all have display pipes: the Dells would have to be displays of the paravirtual GPU (its display
+pipes, their transactions scanned out by the real display engine) with the real framebuffers hidden from WindowServer, and the pipe needs a
+gamma-capable plane (`txnProtocol` 0x07 may be what announces one).
+
 ## The GetDeviceInfo reply (hub-task-446) [measured in the kext and the bundle unless marked]
 
 **The wait.** `AppleParavirtAccelerator::setupDeviceInfo` (the last step of `Accelerator::start`) wires a 4 KiB `IOBufferMemoryDescriptor`, builds FIFO command `0x3a` with one record `{u32 0x2d, u32 bytes/8 (0x200), u32 physical page}`, submits it on the root channel through the generic `IOAccelChannel2` path, and then **`IOAccelEventMachineFast2::finishEvent`** waits for the event of that submission. After the wait it calls `parseDeviceInfo(buffer, 0x200, &accelerator->deviceInfo)` and returns true whatever the content (no validation: even an all-zero buffer passes). Then `Accelerator::start` releases its lock and `registerService()`.
