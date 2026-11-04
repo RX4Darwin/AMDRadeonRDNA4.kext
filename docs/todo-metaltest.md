@@ -1,7 +1,15 @@
 # Card tests for the Metal work
 
 Written 2026-11-04 for the tip of `devel/metal` (f4dc631), for anyone with an RX 9070 XT under macOS Tahoe (OpenCore, Lilu, this
-kext); the author's rig is away for repair. Everything after the iTerm2 run of 2026-10-22 (875b747's refactor,
+kext); the author's rig is away for repair.
+
+**Tahoe is required, not Sequoia.** The fake GPU was built against Tahoe 25G83 only: it fills in Tahoe's IOPCIDevice vtable
+slots, reads IOSurfaceRoot's private layout at Tahoe's offsets, and Apple's paravirtual Metal driver's command format was measured
+there. On another macOS the result means nothing and can panic. Without Tahoe, run only step 0.
+
+**An RX 9070 (revision 0xC3) instead of the XT (0xC0) is fine.** This branch does not have the RX 9070 detection
+(RX4Darwin/AMDRadeonRDNA4.kext#5), so System Report says "RX 9070 XT" and Metal is told 64 compute units instead of 56. Neither
+affects these tests (dispatches enable every compute unit and the hardware skips the disabled ones). Say which card ran the tests. Everything after the iTerm2 run of 2026-10-22 (875b747's refactor,
 9aa0c98, 03d842e, b3c7a9d, 2606981, f4dc631) has only been host-tested; these steps card-run it before devel/metal merges into
 next.
 
