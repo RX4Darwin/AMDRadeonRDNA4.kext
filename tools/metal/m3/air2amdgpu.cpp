@@ -122,6 +122,43 @@ static Value *asType(IRBuilder<> &b, Type *t, Value *const xyz[3]) {
 	return r;
 }
 
+// Metal's unpack_<unorm|snorm><4x8|2x16>_to_float (a u32 into float4 or float2, or half) and pack_float_to_<...> (back, rounded to
+// nearest); null for the others.
+static Value *packOp(IRBuilder<> &b, StringRef op, CallInst *c) {
+	const bool unpack = op.consume_front("unpack."), snorm = op.starts_with("snorm");
+
+	if (!unpack && !op.consume_front("pack."))
+		return nullptr;
+
+	const unsigned lanes = op.ends_with("4x8") ? 4 : op.ends_with("2x16") ? 2 : 0;
+	const unsigned bits = 32 / (lanes ? lanes : 1);
+
+	if (!lanes || !(snorm || op.starts_with("unorm")))
+		return nullptr;
+
+	const double scale = snorm ? (1u << (bits - 1)) - 1 : (1u << bits) - 1;
+	auto *ints = FixedVectorType::get(b.getIntNTy(bits), lanes), *floats = FixedVectorType::get(b.getFloatTy(), lanes);
+
+	if (unpack) {
+		Value *v = b.CreateBitCast(c->getArgOperand(0), ints);
+		v = snorm ? b.CreateSIToFP(v, floats) : b.CreateUIToFP(v, floats);
+		v = b.CreateFMul(v, ConstantFP::get(floats, 1.0 / scale));
+
+		if (snorm)
+			v = b.CreateIntrinsic(Intrinsic::maxnum, {floats}, {v, ConstantFP::get(floats, -1.0)});
+
+		return b.CreateFPCast(v, c->getType());
+	}
+
+	Value *v = b.CreateFPCast(c->getArgOperand(0), floats);
+	v = b.CreateIntrinsic(Intrinsic::maxnum, {floats}, {v, ConstantFP::get(floats, snorm ? -1.0 : 0.0)});
+	v = b.CreateIntrinsic(Intrinsic::minnum, {floats}, {v, ConstantFP::get(floats, 1.0)});
+	v = b.CreateIntrinsic(Intrinsic::rint, {floats}, {b.CreateFMul(v, ConstantFP::get(floats, scale))});
+	v = snorm ? b.CreateFPToSI(v, ints) : b.CreateFPToUI(v, ints);
+
+	return b.CreateBitCast(v, c->getType());
+}
+
 // A Metal SIMD-group function (simd_<op>[.u|.s]) on a wave of 32, Metal's SIMD-group width; null if not supported. Measured on Apple's
 // GPU: a shuffle up or down past the group's edge keeps the lane's own value; reductions, ballots and any/all see the active lanes only.
 // Prefix sums shuffle upwards, so they are right when the inactive lanes are the top ones (a group cut by the grid's edge).
@@ -301,9 +338,11 @@ static std::string legalize(Function &k) {
 		const StringRef tex = texName;
 		if (tex.starts_with("sample_texture_2d.v4f") || tex.starts_with("read_texture_2d.v4f")) {
 			// sample (texture, sampler, float2 coord, i1, int2 offset, i1 level, float bias or LOD, float min LOD, i32) / read (texture,
-			// sampler, uint2, int2, lod, i32). A sample's level false: the float is a bias (0: none); true: an explicit LOD. Float or half texels.
+			// sampler, uint2, int2, lod, i32), or without the sampler and the offset (texture, uint2, lod, i32: WindowServer's). A sample's
+			// level false: the float is a bias (0: none); true: an explicit LOD. Float or half texels.
 			const bool sample = tex.starts_with("sample"), half = tex.starts_with(sample ? "sample_texture_2d.v4f16" : "read_texture_2d.v4f16");
-			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(2);
+			const bool samplerless = !sample && c->arg_size() >= 3 && c->getArgOperand(1)->getType()->isVectorTy();
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(samplerless ? 1 : 2);
 			Value *x = b.CreateExtractElement(xy, uint64_t(0)), *y = b.CreateExtractElement(xy, 1);
 			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
 			Value *texel;
@@ -343,11 +382,25 @@ static std::string legalize(Function &k) {
 				args.append({t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
 				texel = b.CreateIntrinsic(ids[packed != 0][mode], types, args);
 			} else {
-				if (c->arg_size() < 5 || !isa<ConstantAggregateZero>(c->getArgOperand(3)) || !match(c->getArgOperand(4), m_Zero()))
-					return f->getName().str() + " with an offset or a LOD is not supported yet";
+				// The offset is added to the coordinates; a level other than 0 reads that mip level (image_load_mip).
+				if (!samplerless && c->arg_size() < 5)
+					return f->getName().str() + " without an offset and a LOD is not known";
+				Value *offset = samplerless ? ConstantAggregateZero::get(xy->getType()) : c->getArgOperand(3);
+				Value *lod = c->getArgOperand(samplerless ? 2 : 4);
 				x = b.CreateZExt(x, b.getInt32Ty());   // uint or ushort
 				y = b.CreateZExt(y, b.getInt32Ty());
-				texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {v4f, b.getInt32Ty(), t->getType()}, {b.getInt32(15), x, y, t, b.getInt32(0), b.getInt32(0)});
+
+				if (!isa<ConstantAggregateZero>(offset)) {
+					x = b.CreateAdd(x, b.CreateSExtOrTrunc(b.CreateExtractElement(offset, uint64_t(0)), b.getInt32Ty()));
+					y = b.CreateAdd(y, b.CreateSExtOrTrunc(b.CreateExtractElement(offset, 1), b.getInt32Ty()));
+				}
+
+				if (match(lod, m_Zero()))
+					texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {v4f, b.getInt32Ty(), t->getType()},
+					                          {b.getInt32(15), x, y, t, b.getInt32(0), b.getInt32(0)});
+				else
+					texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_mip_2d, {v4f, b.getInt32Ty(), t->getType()},
+					                          {b.getInt32(15), x, y, b.CreateZExtOrTrunc(lod, b.getInt32Ty()), t, b.getInt32(0), b.getInt32(0)});
 			}
 			if (half)
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
@@ -365,6 +418,10 @@ static std::string legalize(Function &k) {
 			b.CreateIntrinsic(Intrinsic::amdgcn_kill, {}, {b.getFalse()});
 		} else if (name == "get_read_sampler") {
 			r = PoisonValue::get(c->getType());   // read_texture's sampler operand: unused
+		} else if (op.starts_with("unpack.") || op.starts_with("pack.")) {
+			r = packOp(b, op, c);
+			if (!r)
+				return f->getName().str() + " is not supported yet";
 		} else if (op.starts_with("simd_")) {
 			r = simdOp(b, op, c);
 			if (!r)
@@ -470,6 +527,36 @@ static std::string legalize(Function &k) {
 		} else if (op == "pow" || op == "powr") {   // fast math's x^y = 2^(y log2 x)
 			r = b.CreateIntrinsic(Intrinsic::exp2, {c->getType()},
 			                      {b.CreateFMul(c->getArgOperand(1), b.CreateIntrinsic(Intrinsic::log2, {c->getType()}, {c->getArgOperand(0)}))});
+		} else if (op == "fmax3" || op == "fmin3") {   // (a, b, c): the largest or smallest of the three
+			const Intrinsic::ID id = op == "fmax3" ? Intrinsic::maxnum : Intrinsic::minnum;
+			Type *t = c->getType();
+			r = b.CreateIntrinsic(id, {t}, {b.CreateIntrinsic(id, {t}, {c->getArgOperand(0), c->getArgOperand(1)}), c->getArgOperand(2)});
+		} else if (op == "fmedian3") {   // max(min(a, b), min(max(a, b), c))
+			Type *t = c->getType();
+			Value *a = c->getArgOperand(0), *v = c->getArgOperand(1);
+			Value *hi = b.CreateIntrinsic(Intrinsic::minnum, {t}, {b.CreateIntrinsic(Intrinsic::maxnum, {t}, {a, v}), c->getArgOperand(2)});
+			r = b.CreateIntrinsic(Intrinsic::maxnum, {t}, {b.CreateIntrinsic(Intrinsic::minnum, {t}, {a, v}), hi});
+		} else if (op == "fract") {   // x - floor(x), below 1 (Metal's: at most 0x1.fffffep-1)
+			Type *t = c->getType();
+			Value *x = c->getArgOperand(0);
+			r = b.CreateFSub(x, b.CreateIntrinsic(Intrinsic::floor, {t}, {x}));
+			r = b.CreateIntrinsic(Intrinsic::minnum, {t}, {r, ConstantFP::get(t, t->getScalarType()->isHalfTy() ? 0.99951171875 : 0.99999994039535522)});
+		} else if (op == "atan2" || op == "atan") {
+			// atan(min / max) of |y|, |x| as a polynomial (error under 1e-5), then moved to its octant and quadrant; atan(x) is atan2(x, 1)
+			Type *t = c->getType();
+			Value *y = c->getArgOperand(0), *x = op == "atan" ? ConstantFP::get(t, 1.0) : c->getArgOperand(1);
+			Value *ax = b.CreateIntrinsic(Intrinsic::fabs, {t}, {x}), *ay = b.CreateIntrinsic(Intrinsic::fabs, {t}, {y});
+			Value *hi = b.CreateIntrinsic(Intrinsic::maxnum, {t}, {ax, ay}), *lo = b.CreateIntrinsic(Intrinsic::minnum, {t}, {ax, ay});
+			Value *zero = ConstantFP::get(t, 0.0);
+			Value *a = b.CreateSelect(b.CreateFCmpOEQ(hi, zero), zero, b.CreateFDiv(lo, hi));
+			Value *sq = b.CreateFMul(a, a), *p = ConstantFP::get(t, -0.0464964749);
+
+			p = b.CreateFAdd(b.CreateFMul(p, sq), ConstantFP::get(t, 0.15931422));
+			p = b.CreateFAdd(b.CreateFMul(p, sq), ConstantFP::get(t, -0.327622764));
+			r = b.CreateFAdd(b.CreateFMul(b.CreateFMul(p, sq), a), a);
+			r = b.CreateSelect(b.CreateFCmpOGT(ay, ax), b.CreateFSub(ConstantFP::get(t, 1.5707963267948966), r), r);
+			r = b.CreateSelect(b.CreateFCmpOLT(x, zero), b.CreateFSub(ConstantFP::get(t, 3.141592653589793), r), r);
+			r = b.CreateSelect(b.CreateFCmpOLT(y, zero), b.CreateFNeg(r), r);
 		} else if (op == "abs.s") {
 			r = b.CreateIntrinsic(Intrinsic::abs, {c->getType()}, {c->getArgOperand(0), b.getFalse()});
 		} else {
@@ -576,7 +663,7 @@ struct Kernel {
 // (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
 // u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes (bit 31: a fragment shader without a colour)}, then the code
 // (relocation-free, the entry at its start), then per attribute
-// {u32 hash of its AIR name (FNV-1a), u32 flags: bit 0 flat}: the vertex function's outputs in ring-slot order, the fragment function's
+// {u32 hash of its AIR name (FNV-1a), u32 flags: bit 0 flat, bit 1 the point's coordinate (no name)}: the vertex function's outputs in ring-slot order, the fragment function's
 // inputs in hardware-input order; the host matches them by name (SPI_PS_INPUT_CNTL_n).
 // Both stages get two user SGPRs, the address of the stage's table (the host's): 64-bit buffer addresses by Metal buffer index at +0, and in
 // both stages the textures' T#s (8 dwords) at +64 + 32 n and the samplers' S#s (4 dwords) at +576 + 16 n (n 0-15).
@@ -588,7 +675,7 @@ struct Kernel {
 //            offset 16 n, soffset = gs_attr_offset << 9, scope device; the ring's descriptor from the literals 0xc01a0001-3, which the
 //            host patches, as nggcol.s and Mesa's ac_nir_store_parameters_to_attr_ring). So far: vertex_id, instance_id, buffers.
 //   fragment amdgpu_ps exporting render target 0 as four floats (SPI_SHADER_COL_FORMAT 32_ABGR), s0-s1 the table, PrimMask in s2;
-//            buffers, textures, samplers, the position and inputs, input n from hardware input n: interpolated at the centre (centroid
+//            buffers, textures, samplers, the position, the point coordinate and inputs, input n from hardware input n: interpolated at the centre (centroid
 //            too, single-sample targets only so far), with or without perspective (ds_param_load + v_interp_p10/p2, as pscol.s), or flat (ds_param_load and quad lane 0,
 //            the provoking vertex's value, as ACO's emit_interp_mov_instr).
 // A value between the stages is up to four 32-bit words: float, half, int, short, char or bool, scalar or vector (half widened to float,
@@ -604,7 +691,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	// 0 vertex id, 1 instance id, 3 the fragment's position, 4 colour attachment 0, 100 + n buffer n, 200 + n texture n, 300 + n sampler n,
 	// 400 + n input n
 	std::map<unsigned, int> from;
-	struct Var { unsigned index; uint32_t hash; bool flat; unsigned bary; };   // a value between the stages (index: its argument or member)
+	// A value between the stages (index: its argument or member); sprite: the point's coordinate, which the hardware makes (no name)
+	struct Var { unsigned index; uint32_t hash; bool flat; unsigned bary; bool sprite = false; };
 	std::vector<Var> vars;
 	auto fnv = [](const std::string &name) {
 		uint32_t h = 2166136261u;
@@ -649,6 +737,11 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			// wrong next to PERSP_CENTER, rig 2026-10-22, each alone right; radeonsi also forces the centre without MSAA); MSAA needs it back.
 			from[index] = 400 + static_cast<int>(vars.size());
 			vars.push_back({index, fnv(mdString(a, 2)), flat, linear ? 8u : 4u});
+		}
+		else if (!vertex && kind == "air.point_coord" && !unused) {
+			// [[point_coord]]: an input the SPI fills with the point sprite's S, T (PT_SPRITE_TEX); undefined for lines and triangles
+			from[index] = 400 + static_cast<int>(vars.size());
+			vars.push_back({index, 0, false, 4u, true});
 		}
 		else if (!vertex && kind == "air.position" && !unused)
 			from[index] = 3;
@@ -1017,7 +1110,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	out.hsaco.assign(reinterpret_cast<const char *>(head), sizeof(head));
 	out.hsaco += code.str();
 	for (const Var &v : vars) {
-		const uint32_t entry[2] = {v.hash, v.flat ? 1u : 0u};
+		const uint32_t entry[2] = {v.hash, (v.flat ? 1u : 0u) | (v.sprite ? 2u : 0u)};
 		out.hsaco.append(reinterpret_cast<const char *>(entry), sizeof(entry));
 	}
 	out.buffers = 0;
@@ -1238,7 +1331,7 @@ static int serve() {
 			break;
 		if (!said)
 			errs() << "air2amdgpu: waiting for the kext's translator door (0x" << Twine::utohexstr(kr) << ")\n";
-		sleep(5);
+		sleep(1);   // the host holds WindowServer's first draws until the helper is there
 	}
 	errs() << "air2amdgpu: connected\n";
 	std::vector<char> lib(RDNA4_MTLC_MAX_LIB);
