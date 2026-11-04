@@ -767,6 +767,7 @@ private:
 	struct SparseTables {
 		PtPages::Sparse s;
 	};
+	static constexpr uint32_t kVaHoles = 32;
 	struct RtClient {
 		const void *owner { nullptr };
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
@@ -799,7 +800,13 @@ private:
 		Pm4::Queue pm4;
 		bool active { false };
 		bool aborted { false };
+		// VA given back by freed buffers, 64 KiB granules, reused before nextVa grows: the dense tables reach only 1 GiB above
+		// kVaStart, which a buffer a draw passes through without reuse.
+		struct VaHole { uint64_t va, bytes; } vaHoles[kVaHoles] {};
+		uint32_t vaHoleCount { 0 };
 	};
+	uint64_t vaTake(RtClient &c, uint64_t bytes);
+	void vaGive(RtClient &c, uint64_t va, uint64_t bytes);
 	bool scratchFor(RtClient &c, const void *owner, const CodeObj::Kernel &k, Launch &l);
         IOLock        *rtLock { nullptr };
         IONotifier   *shutdownInterest { nullptr };

@@ -2302,6 +2302,62 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	return allocLocked(owner, bytes, handle, gpu);
 }
 
+// VA for a buffer of `bytes`, 64 KiB aligned: the first hole that fits, else the end of the client's VA (nextVa). 0 if it would wrap.
+uint64_t RDNA4Compute::vaTake(RtClient &c, uint64_t bytes)
+{
+	const uint64_t size = (bytes + 0xffff) & ~0xffffull;
+
+	for (uint32_t i = 0; i < c.vaHoleCount; i++) {
+		RtClient::VaHole &h = c.vaHoles[i];
+
+		if (h.bytes < size)
+			continue;
+
+		const uint64_t va = h.va;
+		h.va += size;
+		h.bytes -= size;
+
+		if (!h.bytes)
+			h = c.vaHoles[--c.vaHoleCount];
+
+		return va;
+	}
+
+	const uint64_t va = (c.nextVa + 0xffff) & ~0xffffull;
+	if (va + size < va)
+		return 0;
+
+	c.nextVa = va + size;
+
+	return va;
+}
+
+// A freed buffer's VA back to the client: the end of its VA moves down when the range is last, else it becomes a hole, joined with
+// a neighbour where it touches one. With the holes all taken, the range is lost (VA only, not memory).
+void RDNA4Compute::vaGive(RtClient &c, uint64_t va, uint64_t bytes)
+{
+	uint64_t size = (bytes + 0xffff) & ~0xffffull;
+
+	for (uint32_t i = 0; i < c.vaHoleCount; i++) {
+		RtClient::VaHole &h = c.vaHoles[i];
+
+		if (h.va + h.bytes != va && va + size != h.va)
+			continue;
+
+		va = h.va < va ? h.va : va;
+		size += h.bytes;
+		c.vaHoles[i--] = c.vaHoles[--c.vaHoleCount];   // taken out and joined; look again for the other side
+	}
+
+	if (va + size == c.nextVa) {
+		c.nextVa = va;
+		return;
+	}
+
+	if (c.vaHoleCount < kVaHoles)
+		c.vaHoles[c.vaHoleCount++] = { va, size };
+}
+
 // rtAlloc under rtLock: a buffer of the owner's, mapped into its VM.
 IOReturn RDNA4Compute::allocLocked(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	RtClient *c = vmClientFor(owner);
@@ -2329,9 +2385,10 @@ IOReturn RDNA4Compute::allocLocked(const void *owner, uint64_t bytes, uint64_t &
 	b.gen = generation;
 	b.device = dev;
 	if (c) {
-		b.va = (c->nextVa + 0xffff) & ~0xffffull;
-		c->nextVa = b.va + ((bytes + 0xffff) & ~0xffffull);
-		if (c->nextVa < b.va || !vmMap(*c, b.va, b.mc, bytes, true)) {   /* IBs live in user buffers: R|W|X like Mesa (ac_linux_drm.c:235) */
+		b.va = vaTake(*c, bytes);
+		if (!b.va || !vmMap(*c, b.va, b.mc, bytes, true)) {   /* IBs live in user buffers: R|W|X like Mesa (ac_linux_drm.c:235) */
+			if (b.va)
+				vaGive(*c, b.va, bytes);
 			h.free(b.offset); b.owner = nullptr;
 			return kIOReturnNoMemory;
 		}
@@ -2425,20 +2482,23 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 	b = RtBuffer {};
 	b.owner = owner;
 	b.bytes = bytes;
-	b.va = (c->nextVa + 0xffff) & ~0xffffull;
+	b.va = vaTake(*c, rounded);
 	b.gen = generation;
 	b.host = true;
 	b.hostMemory = memory;
 	b.hostDma = dma;
 	b.hostMap = map;
 	b.hostUser = map->getAddress();
-	if (!b.hostUser ||
+	if (!b.hostUser || !b.va ||
 	    b.va + rounded < b.va || b.va + rounded > GpuVm::kVaEnd ||
 	    !vmMapHost(*c, b.va, pageBuses, rounded,
                 (flags & RDNA4_HOST_EXECUTABLE) != 0)) {
 		if (pageBuses)
 			IOFree(pageBuses, pageCount * sizeof(uint64_t));
-		vmUnmap(*c, b.va, rounded);
+		if (b.va) {
+			vmUnmap(*c, b.va, rounded);
+			vaGive(*c, b.va, rounded);
+		}
 		releaseHost(b);
 		b.owner = nullptr;
 		return kIOReturnNoMemory;
@@ -2447,11 +2507,11 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 		IOFree(pageBuses, pageCount * sizeof(uint64_t));
 	if (!vmInvalidateOwned(*c, "host map")) {
 		vmUnmap(*c, b.va, rounded);
+		vaGive(*c, b.va, rounded);
 		releaseHost(b);
 		b.owner = nullptr;
 		return kIOReturnNotResponding;
 	}
-	c->nextVa = b.va + ((rounded + 0xffff) & ~0xffffull);
 	c->hostBytes += rounded;
 	hostBytesTotal += rounded;
 	handle = makeHandle(slot, b.gen);
@@ -2487,6 +2547,9 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	 * measured on the card. Failure handling is the host path's: log and go on. */
 	if (c && (b->va || host) && !vmInvalidateOwned(*c, host ? "host unmap" : "device unmap"))
 		RLOG("vmid %u: %s buffer unmap invalidation timed out", c->vmid, host ? "host" : "device");
+
+	if (c && b->va)
+		vaGive(*c, b->va, b->bytes);   // after the invalidation: nothing cached reaches the range when it is mapped again
 	if (host) {
 		if (c) {
 			const uint64_t rounded = (b->bytes + GpuVm::kPageBytes - 1) &

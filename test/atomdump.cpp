@@ -4390,13 +4390,21 @@ struct Pair {
 		nw.syncs.clear();
 	}
 
+	// The pre-S8 code mapped up to 2 GiB above kVaStart, the second GiB into PT pages no directory reaches; the new code refuses
+	// anything past the first GiB, and so is expected to.
+	static bool beyondDense(uint64_t va, uint64_t bytes) {
+		const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
+
+		return end >= va && end > GpuVm::kVaStart + (1ull << 30);
+	}
 	void map(uint64_t va, uint64_t mc, uint64_t bytes, bool exec) {
-		const bool a = legacyVmMap(ref, va, mc, bytes, exec), b = newVmMap(nw, va, mc, bytes, exec);
+		const bool a = !beyondDense(va, bytes) && legacyVmMap(ref, va, mc, bytes, exec), b = newVmMap(nw, va, mc, bytes, exec);
 		(a ? okMaps : failedMaps)++;
 		compare("map", a, b);
 	}
 	void mapHost(uint64_t va, const std::vector<uint64_t> &buses, uint64_t bytes, bool exec) {
-		const bool a = legacyVmMapHost(ref, va, buses.data(), bytes, exec), b = newVmMapHost(nw, va, buses.data(), bytes, exec);
+		const bool a = !beyondDense(va, bytes) && legacyVmMapHost(ref, va, buses.data(), bytes, exec),
+		           b = newVmMapHost(nw, va, buses.data(), bytes, exec);
 		(a ? okHost : failedHost)++;
 		compare("mapHost", a, b);
 	}
@@ -4448,7 +4456,7 @@ static int testVmTableDifferential() {
 			// 3. across a 2 MiB boundary (two PT pages) and a large device buffer
 			P.map(V + 0x1ff000, MC + 0x40000000, 0x3000, false);
 			P.map(V + 0x400000, MC + 0x50000000, 0x600000, false);
-			// 3b. the legacy layout's first-writer-wins quirk: PT pages 88 and 88 + 512 (1.2 GiB up) share PDB0[88]; whichever is mapped first owns the PDE
+			// 3b. the legacy layout's first-writer-wins quirk: PT pages 88 and 88 + 512 (1.2 GiB up) share PDB0[88]; the one 1.2 GiB up is now refused
 			P.map(V + 600ull * 0x200000, MC + 0x60000000, 0x1000, false);
 			P.map(V + 88ull * 0x200000, MC + 0x61000000, 0x1000, false);
 			// 4. client close and reopen on the same tables
@@ -4652,8 +4660,8 @@ static int testSparseTree() {
 		           "tree: PDB1 entries 4 and 5 name two different PDB0 pages");
 	}
 
-	// NEGATIVE CONTROL: the contiguous layout of modes 0/1 accepts the same map and then cannot reach the far side. This is the defect being fixed;
-	// without it the test above would pass for a walker that never reads PDB1.
+	// NEGATIVE CONTROL: the contiguous layout of modes 0/1 cannot reach the far side of the same map, so it refuses it (it used to take it,
+	// and the GPU stalled on the far side); without this the test above would pass for a walker that never reads PDB1.
 	{
 		NewImage n;
 		n.words.assign(kTableBytes / 8, 0);
@@ -4670,7 +4678,7 @@ static int testSparseTree() {
 		uint64_t pa = 0, fl = 0;
 		const bool nearOk = GpuVm::walk(kRootPhys, cross, legacyRead, &n, pa, fl);
 		const bool farOk = GpuVm::walk(kRootPhys, cross + 0x10000, legacyRead, &n, pa, fl);
-		f += check(mapped && nearOk && !farOk, "negative control: the contiguous layout takes a map across 1 GiB but the far side does not translate (PDB1 entry 5 is empty)");
+		f += check(!mapped && !nearOk && !farOk, "negative control: the contiguous layout refuses a map across 1 GiB, whose far side it cannot translate (PDB1 entry 5 is empty)");
 	}
 
 	// Far apart: another PDB1 page (512 GiB up), and the top of the 48-bit space.

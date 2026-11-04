@@ -46,8 +46,16 @@ static uint64_t hostLeaf(const Policy &pol, uint64_t bus, bool executable) {
 	return GpuVm::encodePte(bus, flags, false);
 }
 
+/* The dense image has one PDB0 page, at 0x2000, and the one PDB1 entry for kVaStart points at it: 512 entries of 2 MiB. A
+ * mapping beyond would land in a PT page no directory reaches (the PDB0 index wraps), and the GPU stalls on it: refused
+ * whole, before anything is written. */
+static constexpr uint64_t kDenseVaBytes = 1ull << 30;
+
 bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, uint64_t physical, bool executable, Span &out) {
 	out = Span {};
+	if (end > GpuVm::kVaStart + kDenseVaBytes)
+		return false;
+
 	for (uint64_t at = va, phys = physical; at < end;
 	     at += GpuVm::kPageBytes, phys += GpuVm::kPageBytes) {
 		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
@@ -73,6 +81,9 @@ bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 
 bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, Span &out) {
 	out = Span {};
+	if (end > GpuVm::kVaStart + kDenseVaBytes)
+		return false;
+
 	uint64_t page = 0;
 	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes, page++) {
 		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
