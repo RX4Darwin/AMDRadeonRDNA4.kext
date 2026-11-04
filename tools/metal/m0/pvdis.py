@@ -105,11 +105,31 @@ def cstring(kx, va):
     raw = kx.d[o:o + 80].split(b'\0')[0]
     return raw.decode('latin1') if len(raw) >= 3 and all(32 <= c < 127 for c in raw) else None
 
-def disasm(raw, va, names, kx=None):
+def objdump(raw, va):
+    """AT&T disassembly of raw x86-64 bytes at `va`, one instruction a line ('call 0x..', '# 0x..' comments): binutils
+    when it has an x86 backend, else llvm-objdump on the bytes wrapped into an x86-64 ELF (an aarch64 host)."""
     open('/tmp/pvdis.bin', 'wb').write(raw)
-    r = subprocess.run(['objdump', '-D', '-b', 'binary', '-mi386:x86-64', '--adjust-vma=0x%x' % va, '-M', 'att', '--no-show-raw-insn', '/tmp/pvdis.bin'],
-                       capture_output=True, text=True)
-    for line in r.stdout.splitlines():
+    r = subprocess.run(['objdump', '-D', '-b', 'binary', '-mi386:x86-64', '--adjust-vma=0x%x' % va, '-M', 'att', '--no-show-raw-insn',
+                        '/tmp/pvdis.bin'], capture_output=True, text=True)
+    if r.returncode == 0:
+        return r.stdout
+    subprocess.run(['llvm-objcopy', '-I', 'binary', '-O', 'elf64-x86-64', '--rename-section', '.data=.text,alloc,code', '/tmp/pvdis.bin',
+                    '/tmp/pvdis.o'], check=True)
+    r = subprocess.run(['llvm-objdump', '-d', '--no-show-raw-insn', '--print-imm-hex', '--x86-asm-syntax=att', '--adjust-vma=0x%x' % va,
+                        '/tmp/pvdis.o'], capture_output=True, text=True, check=True)
+    # As binutils prints it: call/jmp, no '<symbol+off>' after a target, and a rip-relative operand's comment the
+    # address it names (llvm-objdump leaves --adjust-vma out of those).
+    lines = [re.sub(r'\b(call|jmp)q\b', r'\1', re.sub(r'\s*<[^>]*>', '', l)) for l in r.stdout.splitlines()]
+    addrs = [int(m.group(1), 16) if m else None for m in (re.match(r'\s*([0-9a-f]+):', l) for l in lines)]
+    for i, l in enumerate(lines):
+        m = re.search(r'([-+]?0x[0-9a-f]+)\(%rip\)', l)
+        nxt = next((a for a in addrs[i + 1:] if a is not None), None)
+        if m and nxt is not None:
+            lines[i] = re.sub(r'\s*# 0x[0-9a-f]+.*$', '', l) + '\t# 0x%x' % (nxt + int(m.group(1), 16))
+    return '\n'.join(lines)
+
+def disasm(raw, va, names, kx=None):
+    for line in objdump(raw, va).splitlines():
         note = []
         m = re.search(r'call\s+\*0x([0-9a-f]+)\(%[a-z0-9]+\)', line)
         if m:
@@ -146,10 +166,7 @@ if __name__ == '__main__':
         segs, _ = k.entry_segs(KEXT)
         for d, v, sz in func_ranges(k, KEXT, ''):
             if '_os_log_fmt' in d or sz > 0x3000: continue
-            raw = dump(k, v, sz)
-            open('/tmp/pvdis.bin', 'wb').write(raw)
-            r = subprocess.run(['objdump', '-D', '-b', 'binary', '-mi386:x86-64', '--adjust-vma=0x%x' % v, '-M', 'att', '--no-show-raw-insn', '/tmp/pvdis.bin'], capture_output=True, text=True)
-            for line in r.stdout.splitlines():
+            for line in objdump(dump(k, v, sz), v).splitlines():
                 if re.search(r'(call|jmp)\s+0x%x\s*$' % tgt, line) or re.search(r'# 0x%x\s*$' % tgt, line):
                     print('0x%x %s: %s' % (v, d, line.strip()))
     elif cmd == 'vt':

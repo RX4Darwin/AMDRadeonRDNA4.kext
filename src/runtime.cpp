@@ -2299,6 +2299,11 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
 		return state;
+	return allocLocked(owner, bytes, handle, gpu);
+}
+
+// rtAlloc under rtLock: a buffer of the owner's, mapped into its VM.
+IOReturn RDNA4Compute::allocLocked(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	RtClient *c = vmClientFor(owner);
 	if (vmEnabled && !c)
 		return kIOReturnNoResources;
@@ -2623,6 +2628,34 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 	return kIOReturnSuccess;
 }
 
+// Scratch for a kernel with a private segment (spilled registers): kScratchWaves waves at once, each its lanes' private bytes plus
+// kScratchLaneMargin (a dynamic stack has no fixed size), 256-byte units (Mesa's gfx12 COMPUTE_TMPRING_SIZE: WAVES [11:0], WAVESIZE
+// [26:12]). The SPI gives every wave its slice of COMPUTE_DISPATCH_SCRATCH_BASE (architected flat scratch). Made once per client and
+// grown when a kernel needs more; a buffer of the client's, freed with it.
+bool RDNA4Compute::scratchFor(RtClient &c, const void *owner, const CodeObj::Kernel &k, Launch &l) {
+	constexpr uint32_t kScratchWaves = 1024, kScratchLaneMargin = 256;
+	const uint64_t perWave = ((static_cast<uint64_t>(k.privateSegmentSize) + kScratchLaneMargin) * (k.wave32() ? 32 : 64) + 255) & ~255ull;
+	const uint64_t need = perWave * kScratchWaves;
+	uint64_t handle, va;
+
+	if ((perWave >> 8) > 0x7fff)
+		return false;
+
+	if (c.scratchBytes < need) {
+		if (allocLocked(owner, need, handle, va) != kIOReturnSuccess)
+			return false;
+
+		c.scratchVa = va;
+		c.scratchBytes = need;
+		CLOG("runtime: scratch for vmid %u: %llu KiB (%llu bytes a wave)", c.vmid, need >> 10, perWave);
+	}
+
+	l.scratchVa = c.scratchVa;
+	l.tmpring = kScratchWaves | static_cast<uint32_t>(perWave >> 8) << 12;
+
+	return true;
+}
+
 IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros) {
 	Locked g(rtLock);
 	IdleUse idle(this, "dispatch");          // P2: a synchronous client operation (no-op unless rdna4-gfxidle=1)
@@ -2697,6 +2730,8 @@ IOReturn RDNA4Compute::rtDispatch(const void *owner, const RDNA4Dispatch &d, uin
 	l.wave32 = k.wave32();
 	l.timeoutUs = (d.timeoutMs ? d.timeoutMs : 1000) * 1000;
 	l.ldsBytes = k.groupSegmentSize + d.dynamicLdsBytes;
+	if (k.privateSegmentSize && (!c || !scratchFor(*c, owner, k, l)))
+		return kIOReturnNoMemory;
 	l.useInterrupt = ihActive;
 	l.preserveFence = c && c->ibOutstanding != 0;
 	l.queue = c ? &c->pm4 : nullptr;

@@ -30,8 +30,8 @@
 //    stage 7  kernel    a clang-built kernel launched from its code object.
 //
 //  Selected with rdna4-compute=<stage>, a boot-arg or a test boot's option
-//  (trial.hpp); absent/0 = off, and the plugin behaves exactly as without
-//  this file. Each stage runs the ones before it. Stage 1 runs inline;
+//  (trial.hpp); absent = stage 3 (the firmware the display clocks need),
+//  0 = off, and the plugin behaves exactly as without this file. Each stage runs the ones before it. Stage 1 runs inline;
 //  stages 2+ run on their own kernel thread a few seconds later, so the
 //  desktop never waits on (or for) them.
 //
@@ -126,6 +126,9 @@ public:
 		// W32: read-only cursor register dump the display device offers (flip.cpp calls it after each flip).
 		void (*cursorProbe)(void *ctx, const char *why) { nullptr };
 		void *cursorProbeCtx { nullptr };
+		// Once the power-management firmware runs its features (stage 3), on the bring-up thread before
+		// it sends anything else: the display device may talk to the firmware (ctx: cursorProbeCtx).
+		void (*smuReady)(void *ctx) { nullptr };
 	};
 
 	enum Stage : uint32_t {
@@ -139,7 +142,7 @@ public:
 		StageKernel   = 7,
 	};
 
-	// rdna4-compute=<stage>, clamped to StageKernel. 0 when absent.
+	// rdna4-compute=<stage>, clamped to StageKernel. StageGfx when absent.
 	static uint32_t requestedStage();
 	static bool requestedVm();
 	static bool requestedPowerManagement();
@@ -356,6 +359,8 @@ private:
 		bool            wave32;
 		uint32_t        timeoutUs;
 		uint32_t        ldsBytes;           // per work-group (RSRC2.LDS_SIZE)
+		uint64_t        scratchVa;          // the kernel's scratch (COMPUTE_DISPATCH_SCRATCH_BASE), 0 for none
+		uint32_t        tmpring;            // COMPUTE_TMPRING_SIZE for it
 		bool            useInterrupt;       // runtime only; the fence remains authoritative
 		bool            preserveFence;      // another client IB may still be outstanding
 		Pm4::Queue     *queue;
@@ -659,6 +664,7 @@ public:
 	IOReturn rtSleepTest(const void *owner, uint32_t phase);
 	IOReturn rtQuiesce(const void *owner);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
+	IOReturn allocLocked(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtAllocHost(const void *owner, task_t task, uint64_t bytes, uint64_t flags,
 	                     uint64_t &handle, uint64_t &gpu, uint64_t &user);
 	IOReturn rtFree(const void *owner, uint64_t handle);
@@ -707,7 +713,13 @@ private:
 	static constexpr uint32_t kClientBuffers  = 128;
 	static constexpr uint32_t kClientPrograms = 16;
 	uint32_t bufferCap() const { return vmShared == 2 ? kBufferSlots : kMaxBuffers; }
+	// The paravirtual host's compiler service (PVGPU builds) loads a vertex and a fragment kernel for every render pipeline WindowServer
+	// makes: dozens. Its code takes heap space, which is checked on its own.
+#ifdef AMDRadeonRDNA4_PVGPU
+	uint32_t programCap() const { return kProgramSlots; }
+#else
 	uint32_t programCap() const { return vmShared == 2 ? kProgramSlots : kMaxPrograms; }
+#endif
 	bool clientOverQuota(const void *owner, bool program) const;   // rdna4-vmshared=2: per-client buffer/program counts
 	static constexpr uint32_t kMaxClients = 8;              // the per-client-HQD path and rdna4-vmshared=1 (static VMIDs 8-15)
 	static constexpr uint32_t kClientSlots = 64;            // rdna4-vmshared=2 (VMIDs from the pool): the array size, bounded by memory not hardware
@@ -768,6 +780,7 @@ private:
 		uint32_t fence { 0 }, doorbell { 0 };
 		SparseTables *sp { nullptr };   // rdna4-vmshared=2: demand-allocated page tables (ptpages.hpp) instead of tableShadow
 		uint64_t tlbSeq { 0 };            // bumped whenever a PTE is removed: the next job on a VMID owned by this client flushes (amdgpu's tlb_seq)
+		uint64_t scratchVa { 0 }, scratchBytes { 0 };   // scratch for kernels with a private segment, made at the first (a buffer of the client's)
 		uint32_t pasid { 0 };             // what the IH_VMID_LUT of this client's VMID holds, so a fault names the client (slot + 1)
 		bool     shared { false };        // rdna4-vmshared: no HQD of its own; its jobs run on a shared VMID-0 queue
 		uint8_t  sq { 0 };                // which shared queue (fixed at open: a client's jobs stay in order)
@@ -787,6 +800,7 @@ private:
 		bool active { false };
 		bool aborted { false };
 	};
+	bool scratchFor(RtClient &c, const void *owner, const CodeObj::Kernel &k, Launch &l);
         IOLock        *rtLock { nullptr };
         IONotifier   *shutdownInterest { nullptr };
         bool           shutdownQuiesced { false };

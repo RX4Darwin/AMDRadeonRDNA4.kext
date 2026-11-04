@@ -98,6 +98,8 @@ table() {
 	out=$1; shift
 	pre=""
 	if [ "$1" = dplink ]; then pre="$1 $2 $3 $4"; shift 4; fi
+	if [ "$1" = dpdual ]; then pre="$1"; shift; fi
+	if [ "$1" = y420 ]; then pre="$pre $1"; shift; fi
 	# shellcheck disable=SC2086
 	"$B/pipegen" $pre "$@" > "$B/trace.txt"
 
@@ -120,18 +122,54 @@ table() {
 		fi
 	done < "$here/modes.txt"
 
-	python3 "$here/mkinc.py" "$HDR" "$B/trace.txt" "$(git -C "$L" rev-parse HEAD)" "$B"/modes/*.txt > "$B/$out"
+	# A 4:2:0 table also gets what changes with the encoding: the same pipe and timing lit in RGB.
+	rgb=""
+	if [[ " $pre " == *" y420 "* ]]; then
+		# shellcheck disable=SC2086
+		"$B/pipegen" ${pre/ y420/} "$@" > "$B/rgb.txt"
+		rgb=$B/rgb.txt
+	fi
+	MKINC_RGB=$rgb python3 "$here/mkinc.py" "$HDR" "$B/trace.txt" "$(git -C "$L" rev-parse HEAD)" "$B"/modes/*.txt \
+		> "$B/$out"
 	cp -f "$B/$out" "$repo/src/$out"
 	echo "wrote src/$out ($(grep -c "^	{ '" "$repo/src/$out") entries)"
 }
 
-# Without a configuration: one table for each connector of this project's card (two HDMI, two DisplayPort),
-# all for pipe 1 at CEA 1920x1080@60. src/pipe2.cpp picks the one for the connector the second display is on.
+# Without a configuration: one table for each connector of this project's card (two HDMI, two DisplayPort, and the
+# DisplayPort ones again for an HDMI monitor behind a passive DP++ adapter), all for pipe 1 at CEA 1920x1080@60. src/pipe2.cpp picks the one for the connector the second display is on.
 if [ $# -eq 0 ]; then
 	table pipe2_linux.inc       1 2 2 3  1920 88 44 148  1080 4 5 36  148500 1 1 16
 	table pipe2_linux_hpd4.inc  1 3 3 4  1920 88 44 148  1080 4 5 36  148500 1 1 16
 	table pipe2_linux_dp1.inc   dplink a 0 0  1 0 0 1  1920 88 44 148  1080 4 5 36  148500 1 1 16
 	table pipe2_linux_dp2.inc   dplink a 0 0  1 1 1 2  1920 88 44 148  1080 4 5 36  148500 1 1 16
+	table pipe2_linux_dp1_tmds.inc  dpdual  1 0 0 1  1920 88 44 148  1080 4 5 36  148500 1 1 16
+	table pipe2_linux_dp2_tmds.inc  dpdual  1 1 1 2  1920 88 44 148  1080 4 5 36  148500 1 1 16
+	# The same six for pipes 2 and 3, the third and fourth display.
+	for p in 2 3; do
+		table pipe2_linux_p${p}_hpd3.inc       $p 2 2 3  1920 88 44 148  1080 4 5 36  148500 1 1 16
+		table pipe2_linux_p${p}_hpd4.inc       $p 3 3 4  1920 88 44 148  1080 4 5 36  148500 1 1 16
+		table pipe2_linux_p${p}_dp1.inc        dplink a 0 0  $p 0 0 1  1920 88 44 148  1080 4 5 36  148500 1 1 16
+		table pipe2_linux_p${p}_dp2.inc        dplink a 0 0  $p 1 1 2  1920 88 44 148  1080 4 5 36  148500 1 1 16
+		table pipe2_linux_p${p}_dp1_tmds.inc   dpdual  $p 0 0 1  1920 88 44 148  1080 4 5 36  148500 1 1 16
+		table pipe2_linux_p${p}_dp2_tmds.inc   dpdual  $p 1 1 2  1920 88 44 148  1080 4 5 36  148500 1 1 16
+	done
+	# The HDMI connectors again, each pipe lit at CEA 3840x2160@60 (VIC 97): an HDMI 2.0 sink, scrambled, with
+	# DISPCLK raised (src/clk.cpp). The pipe is lit at its largest mode, so a 4K display needs its own table.
+	for p in 1 2 3; do
+		table pipe2_linux_p${p}_hpd3_uhd.inc   $p 2 2 3  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		table pipe2_linux_p${p}_hpd4_uhd.inc   $p 3 3 4  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		# and the DisplayPort connectors with an HDMI sink behind a passive DP++ adapter
+		table pipe2_linux_p${p}_dp1_tmds_uhd.inc   dpdual  $p 0 0 1  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		table pipe2_linux_p${p}_dp2_tmds_uhd.inc   dpdual  $p 1 1 2  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		# and in YCbCr 4:2:0, at 297 MHz on the link, for an adapter that carries no more than 300 MHz: what
+		# amdgpu falls back to (force_yuv420_output) for a sink that takes VIC 97 in 4:2:0
+		table pipe2_linux_p${p}_dp1_tmds_y420.inc   dpdual y420  $p 0 0 1  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		table pipe2_linux_p${p}_dp2_tmds_y420.inc   dpdual y420  $p 1 1 2  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		# and with a DisplayPort sink, at CVT reduced blanking 3840x2160@60 (a 4K monitor's preferred timing on
+		# DisplayPort): no scrambling, the link trained for it at run time
+		table pipe2_linux_p${p}_dp1_uhd.inc   dplink a 0 0  $p 0 0 1  3840 48 32 80  2160 3 5 54  533250 1 0 0
+		table pipe2_linux_p${p}_dp2_uhd.inc   dplink a 0 0  $p 1 1 2  3840 48 32 80  2160 3 5 54  533250 1 0 0
+	done
 else
 	table pipe2_linux.inc "$@"
 fi

@@ -76,6 +76,7 @@ constexpr uint32_t kDigFifoCtrl0  = 0x209b;      // ENABLE [0], RESET [1], READ_
                                                  // OUTPUT_PIXEL_PER_CYCLE [9:8], RESET_DONE [20]
 constexpr uint32_t kHdmiControl   = 0x209e;      // DATA_SCRAMBLE_EN [1], CLOCK_CHANNEL_RATE [2]
 constexpr uint32_t kHdmiGc        = 0x20a8;      // AVMUTE [0]
+constexpr uint32_t kHdmiVbiPacketControl = 0x20a2;   // NULL_SEND [0], GC_SEND [4], GC_CONT [5], ACP_SEND [12]
 constexpr uint32_t kDigBeClkCntl  = 0x20bb;      // BE_MODE [2:0], BE_CLK_EN [4]
 constexpr uint32_t kDigBeCntl     = 0x20bc;      // FE_SOURCE_SELECT [14:8]
 constexpr uint32_t kDigBeEnCntl   = 0x20bd;      // BE_ENABLE [0]
@@ -156,7 +157,8 @@ void hdmiPixelClock(Builder &b, const Target &t) {
 	if (!c)
 		return;
 	Dmub::SetPixelClock pc {};
-	pc.pixclk100Hz = t.to.pixelClockKHz * 10;
+	pc.pixclk100Hz = tmdsKHz(t.to.pixelClockKHz, t.y420) * 10;
+	pc.miscInfo = t.y420 ? Dmub::kPixelClockMiscYuv420 : 0;
 	// Each combo PHY has its own PLL and amdgpu takes the one of the
 	// link's transmitter (find_matching_pll): ATOM_COMBOPHY_PLL0 (0x14)
 	// + the link. Captured from amdgpu on this card: pll_id 0x16 with
@@ -227,10 +229,10 @@ bool build(const Target &t, Plan &out, const char **why) {
 			err = "DisplayPort: no pixel-rate DTO for the target";
 			return false;
 		}
-	} else if (t.to.pixelClockKHz == 0 || t.to.pixelClockKHz > kMaxTmdsKHz) {
+	} else if (t.to.pixelClockKHz == 0 || tmdsKHz(t.to.pixelClockKHz, t.y420) > kMaxTmdsKHz) {
 		err = "pixel clock outside HDMI TMDS (<= 600 MHz)";
 		return false;
-	} else if (t.to.pixelClockKHz > kScrambleFromKHz && !t.sinkScdc) {
+	} else if (tmdsKHz(t.to.pixelClockKHz, t.y420) > kScrambleFromKHz && !t.sinkScdc) {
 		err = "above 340 MHz needs a sink with SCDC";
 		return false;
 	}
@@ -243,12 +245,15 @@ bool build(const Target &t, Plan &out, const char **why) {
 	const uint32_t dpp  = t.hubp * kDppStride;
 	const uint32_t dig  = t.dig * kDigStride;
 	const uint32_t w = t.to.hActive, h = t.to.vActive;
-	const uint32_t symclk10kHz = t.to.pixelClockKHz / 10;   // TMDS 8 bpc: symbol clock = pixel clock
+	const uint32_t tmds = tmdsKHz(t.to.pixelClockKHz, t.y420);
+	const uint32_t symclk10kHz = tmds / 10;   // TMDS 8 bpc: symbol clock = TMDS clock
 
 	// --- opp2_set_disp_pattern_generator: solid black at the old size ---
-	b.write(kDpgColourRCr + opp, 0, "dpg colour r");
-	b.write(kDpgColourGY + opp, 0, "dpg colour g");
-	b.write(kDpgColourBCb + opp, 0, "dpg colour b");
+	// In YCbCr, black is Y 16 and Cb, Cr at their middle, limited range
+	// (opp2_dpg_set_blank_color, both colours of the register).
+	b.write(kDpgColourRCr + opp, t.y420 ? 0x7d007d00 : 0, "dpg colour r");
+	b.write(kDpgColourGY + opp, t.y420 ? 0x10001000 : 0, "dpg colour g");
+	b.write(kDpgColourBCb + opp, t.y420 ? 0x7d007d00 : 0, "dpg colour b");
 	b.write(kDpgDimensions + opp, dpgDims(t.from.hActive, t.from.vActive), "dpg dimensions (old)");
 	b.write(kDpgOffsetSegment + opp, 0, "dpg offset segment");
 	b.update(kDpgControl + opp, 0x71, (kDpgModeBars << 4) | 1, "dpg blank");
@@ -393,18 +398,26 @@ bool build(const Target &t, Plan &out, const char **why) {
 			es.pclk10kHz = symclk10kHz;
 			Dmub::buildDigEncoderStreamSetup(*c, es);
 		}
-		b.update(kHdmiControl + dig, 0x6, t.to.pixelClockKHz >= kScrambleFromKHz ? 0x6 : 0, "hdmi scrambler");
+		// The stream setup leaves the General Control packet off, and with
+		// it the avmute state below never reaches the sink. As
+		// enc401_stream_encoder_hdmi_set_stream_attribute: null and GC
+		// packets on, every frame; no ACP.
+		b.update(kHdmiVbiPacketControl + dig, 0x31, 0x31, "hdmi gc packets on");
+		b.update(kHdmiVbiPacketControl + dig, 0x1000, 0, "hdmi acp off");
+		b.update(kHdmiControl + dig, 0x6, tmds >= kScrambleFromKHz ? 0x6 : 0, "hdmi scrambler");
 
 		// --- write_scdc_data: the sink's side of the scrambling, before the link is enabled ---
 		if (t.sinkScdc)
-			b.add(Op::Scdc, 0, 0, scdcTmdsConfig(t.to.pixelClockKHz), t.ddcLine, "scdc tmds config", true);
+			b.add(Op::Scdc, 0, 0, scdcTmdsConfig(tmds), t.ddcLine, "scdc tmds config", true);
 
 		// --- setup_dio_stream_encoder: connect, enable, map, FIFO reset ---
 		b.update(kDigBeCntl + t.link * kDigStride, 1u << (8 + t.dig), 1u << (8 + t.dig), "dig be source fe");
 		b.update(kDigFeClkCntl + dig, 0x17, 0x10 | kModeHdmi, "dig fe hdmi + clock");
 		b.write(kDigFeEnCntl + dig, 1, "dig fe enable");
 		b.update(kStreamMapper + t.dig, 0x7, t.link, "stream mapper link");
-		b.update(kDigFifoCtrl0 + dig, (0x1fu << 2) | (0x3u << 8), 7u << 2, "dig fifo 1 px/clk, start level 7");
+		// enc401_set_dig_input_mode: two pixels a cycle in 4:2:0 (dcn401_build_pipe_pix_clk_params).
+		b.update(kDigFifoCtrl0 + dig, (0x1fu << 2) | (0x3u << 8), (7u << 2) | (t.y420 ? 1u << 8 : 0),
+		         t.y420 ? "dig fifo 2 px/clk, start level 7" : "dig fifo 1 px/clk, start level 7");
 		b.update(kDigFifoCtrl0 + dig, 0x2, 0x2, "dig fifo reset");
 		b.waitSet(kDigFifoCtrl0 + dig, 1u << 20, 1 * kMs, "dig fifo reset done", true);
 		b.update(kDigFifoCtrl0 + dig, 0x2, 0, "dig fifo reset release");

@@ -10,6 +10,8 @@
 #include "klog.hpp"
 #include "pvstream.hpp"
 #include "pvdraw.hpp"
+#include "pvscanout.hpp"
+#include "sku.hpp"
 #include "compute.hpp"
 #include "mtlkernels.h"
 #include "../userspace/rdna4-run/gfx12tri.h"     // M4: the triangle streams the host's draws are built from (plain, one attribute)
@@ -18,7 +20,6 @@ static_assert(Gfx12Draw::kRingBytes == Gfx12DrawCol::kColRingBytes, "one ring bl
 #include "../userspace/rdna4-run/gfx12trirun.h"
 #include "rdna4compute.h"
 #include "rdna4mtlc.h"
-#include "sku.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOInterruptEventSource.h>
@@ -144,6 +145,8 @@ const char *stringKey(OSDictionary *table, const char *key) {
 constexpr int kSlotConfigRead32 = 272, kSlotConfigRead16 = 273, kSlotConfigRead8 = 274;
 constexpr int kSlotConfigWrite32 = 275, kSlotConfigWrite16 = 276, kSlotConfigWrite8 = 277;
 constexpr int kSlotConfigureInterrupts = 300, kSlotDeviceMemoryRead = 301, kSlotDeviceMemoryWrite = 302;
+// The last real slot (Sequoia 24H232): past the header's vtable, so the copy holds whatever follows ours there.
+constexpr int kSlotPowerStateWillChangeToGated = 313;
 constexpr int kVtableSlots = 340;
 UInt32 tRead32(RDNA4PvNub *n, UInt8 o) { return n->tahoeConfigRead(32, o); }
 UInt16 tRead16(RDNA4PvNub *n, UInt8 o) { return static_cast<UInt16>(n->tahoeConfigRead(16, o)); }
@@ -152,6 +155,7 @@ void tWrite32(RDNA4PvNub *n, UInt8 o, UInt32 v) { n->tahoeConfigWrite(32, o, v);
 void tWrite16(RDNA4PvNub *n, UInt8 o, UInt16 v) { n->tahoeConfigWrite(16, o, v); }
 void tWrite8(RDNA4PvNub *n, UInt8 o, UInt8 v) { n->tahoeConfigWrite(8, o, v); }
 IOReturn tConfigureInterrupts(RDNA4PvNub *, UInt32, UInt32, UInt32, UInt32) { return kIOReturnSuccess; }
+IOReturn tPowerGated(RDNA4PvNub *, unsigned long *, unsigned long *, IOService *) { return kIOPMAckImplied; }
 IOReturn tDevRead(RDNA4PvNub *n, UInt8 bar, UInt64 off, void *data, UInt8 size, UInt32) { return n->tahoeDeviceMemoryRead(bar, off, data, size); }
 IOReturn tDevWrite(RDNA4PvNub *n, UInt8 bar, UInt64 off, UInt64 data, UInt8 size, UInt32) { return n->tahoeDeviceMemoryWrite(bar, off, data, size); }
 
@@ -222,6 +226,7 @@ public:
 	void describeRenderPipeline(uint32_t task, uint32_t pipeline);
 private:
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
+	void presentTransaction(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void completeStamp(uint32_t index, uint32_t value);
@@ -294,6 +299,7 @@ private:
 	uint32_t mOnlineEvents { 0 }, mOnlineAcks { 0 };
 	uint32_t mTransactions { 0 }, mCursorCmds { 0 }, mFlushes { 0 };
 	uint32_t mDispCmdLines { 0 };
+	uint32_t mRareCmdLines { 0 };
 	uint32_t mKickPrev { 0 };
 
 	// Guest-supplied sizes are validated before anything is mapped: at most kMaxChannels channels, rings of at most kMaxRingPages pages.
@@ -370,6 +376,8 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 		h->mDisp = disp & 3;
 	if (level >= 2)
 		h->mDisp = 3;   // the self-test plays the guest's side of the display events
+	if (PvScanout::enabled())
+		h->mDisp = kDispOnline | kDispVbl;   // the heads are the displays: they are there, and WindowServer paces on their VBL
 	uint32_t w = 0, ht = 0;
 	(void)Trial::option("rdna4-pvgpu-width", w);
 	(void)Trial::option("rdna4-pvgpu-height", ht);
@@ -595,6 +603,10 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 		if (c.id == 0x02 && c.length <= sizeof(mWin)) {
 			copy(at, mWin, c.length);
 			answerDisplayOnline(c, mWin);
+		}
+		if ((c.id == 0x06 || c.id == 0x07) && PvScanout::enabled() && c.length <= sizeof(mWin)) {
+			copy(at, mWin, c.length);
+			presentTransaction(c, mWin);
 		}
 		if (c.id == 0x06 || c.id == 0x07)
 			mTransactions++;   // completion is the generic stamp below: the pipe's fence waits for the command's signal (docs/m1-stream.md s.1b)
@@ -930,23 +942,54 @@ struct RDNA4PvHost::Surface {
 	}
 };
 
-bool RDNA4PvHost::surfaceRange(uint32_t task, uint32_t id, Surface &out) {
+// The IOSurface with id `sid`, retained, or nullptr (the root's table; the layout above, the same on Sequoia 24H232: its find_surface reads the
+// owner at +0x170 too).
+static void *retainSurface(uint32_t sid) {
 	static IOService *root;   // ponytail: kept for the boot
-	uint32_t rec[3], d[8];
-	if (!gSurfaceFns.lookup || !id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) ||
-	    (rec[0] & 0xff) != 5 || (rec[0] >> 8) < sizeof(d) || !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(d), sizeof(d)) || d[5] >> 16 != 80)
-		return false;   // not a type-5 MTLPixelFormatBGRA8Unorm texture (or no IOSurface functions)
+	if (!gSurfaceFns.lookup || !sid)
+		return nullptr;
 	if (!root) {
 		OSDictionary *match = IOService::serviceMatching("IOSurfaceRoot");
 		root = match ? IOService::copyMatchingService(match) : nullptr;
 		OSSafeReleaseNULL(match);
 	}
 	const auto *r = reinterpret_cast<const uint8_t *>(root);
-	const uint32_t sid = d[0];
 	const void *entry = r && sid < *reinterpret_cast<const uint32_t *>(r + 0xd8) ? (*reinterpret_cast<void *const *const *>(r + 0xd0))[sid] : nullptr;
 	if (!entry || *reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(entry) + 0x10) != sid)
-		return false;
-	void *s = gSurfaceFns.lookup(root, sid, *reinterpret_cast<task_t const *>(static_cast<const uint8_t *>(entry) + 0x170));
+		return nullptr;
+	return gSurfaceFns.lookup(root, sid, *reinterpret_cast<task_t const *>(static_cast<const uint8_t *>(entry) + 0x170));
+}
+
+// The paravirtual displays' frames (pvscanout.hpp): at most height rows of at most width pixels of IOSurface `sid` into `dst`, as much as both have.
+bool PvScanout::copySurface(uint32_t sid, uint8_t *dst, uint32_t pitch, uint32_t width, uint32_t height) {
+	void *s = retainSurface(sid);
+	IOMemoryDescriptor *md = s ? gSurfaceFns.memory(s) : nullptr;
+	bool ok = false;
+	if (md) {
+		const uint64_t base = gSurfaceFns.baseOffset(s), bpr = gSurfaceFns.bytesPerRow(s);
+		if (bpr) {
+			width = width < bpr / 4 ? width : static_cast<uint32_t>(bpr / 4);
+			height = height < gSurfaceFns.height(s) ? height : gSurfaceFns.height(s);
+		}
+		if (bpr && width && height && base + bpr * height <= md->getLength() && md->prepare() == kIOReturnSuccess) {
+			ok = true;
+			for (uint32_t y = 0; y < height && ok; y++)
+				ok = md->readBytes(base + bpr * y, dst + static_cast<uint64_t>(pitch) * y, 4ull * width) == 4ull * width;
+			md->complete();
+		}
+	}
+	if (s)
+		static_cast<OSObject *>(s)->release();
+	return ok;
+}
+
+bool RDNA4PvHost::surfaceRange(uint32_t task, uint32_t id, Surface &out) {
+	uint32_t rec[3], d[8];
+	if (!gSurfaceFns.lookup || !id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) ||
+	    (rec[0] & 0xff) != 5 || (rec[0] >> 8) < sizeof(d) || !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(d), sizeof(d)) || d[5] >> 16 != 80)
+		return false;   // not a type-5 MTLPixelFormatBGRA8Unorm texture (or no IOSurface functions)
+	const uint32_t sid = d[0];
+	void *s = retainSurface(sid);
 	if (!s)
 		return false;
 	out.surface = static_cast<OSObject *>(s);
@@ -1893,6 +1936,22 @@ void RDNA4PvHost::dmaSelfTest() {
 	OSSafeReleaseNULL(b);
 }
 
+// SubmitTransaction (FIFO 0x06) {u32 port, u32 surface, u32 task}, or SubmitTransaction2 (0x07) {u32 port, u32 task, u32 surface, ..., the gamma
+// table}: the frame into the port's head (pvscanout.hpp), before the batch's stamp completes it. The gamma table is not applied.
+void RDNA4PvHost::presentTransaction(const pvstream::FifoCommand &c, const uint8_t *cmd) {
+	const uint8_t *pl = cmd + c.payloadOffset;
+	uint32_t f[3];
+
+	if (c.length - c.payloadOffset < sizeof(f))
+		return;
+
+	memcpy(f, pl, sizeof(f));
+	if (c.id == 0x07)
+		PvScanout::present(f[0], f[2], f[1]);
+	else
+		PvScanout::present(f[0], f[1], f[2]);
+}
+
 // GetDeviceInfo (FIFO 0x3a): the record 0x2d names the 4 KiB buffer the host fills; the layout and the values are docs/m0-pvgpu.md "The GetDeviceInfo reply".
 void RDNA4PvHost::answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd) {
 	const uint8_t *pl = cmd + c.payloadOffset;
@@ -1961,7 +2020,17 @@ void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const
 	p.channel = channel;
 	if (mDisp & kDispOnline) {
 		pvstream::disp::Info info = mDispInfo;
+		uint32_t width, height;
+
 		info.id = port + 1;
+		if (PvScanout::enabled() && PvScanout::mode(port, width, height) && width <= 0xffff && height <= 0xffff) {
+			info.width = info.modes[0].width = static_cast<uint16_t>(width);
+			info.height = info.modes[0].height = static_cast<uint16_t>(height);
+		}
+
+		// IOPresentment takes only a plane with gamma, which the guest announces when transactions carry the table (FIFO 0x07)
+		if (PvScanout::enabled())
+			info.txnProtocol = 1;
 		pvstream::disp::fillInfo(va, port, info);
 		__sync_synchronize();
 		__atomic_fetch_or(reinterpret_cast<uint32_t *>(va + pvstream::disp::kPending), pvstream::disp::kEventOnline, __ATOMIC_SEQ_CST);
@@ -2726,6 +2795,13 @@ bool RDNA4PvNub::build() {
 	mBar0 = mBar0Desc->getBytesNoCopy();
 	bzero(mBar0, kBar0Size);
 
+	// one display a head when the heads are the paravirtual displays (pvscanout.hpp)
+	if (PvScanout::enabled()) {
+		const uint32_t displays = PvScanout::count();
+
+		memcpy(static_cast<uint8_t *>(mBar0) + kCtrl + kRegNumDisplays, &displays, sizeof(displays));
+	}
+
 	// Config space of a display controller function with one memory BAR and an MSI capability.
 	auto put32 = [this](unsigned off, uint32_t v) { memcpy(&mConfig[off], &v, sizeof(v)); };
 	put32(0x00, (static_cast<uint32_t>(kDevice) << 16) | kVendor);
@@ -2776,6 +2852,7 @@ void **RDNA4PvNub::patchVtable() {
 	copy[kSlotConfigureInterrupts] = reinterpret_cast<void *>(&tConfigureInterrupts);
 	copy[kSlotDeviceMemoryRead] = reinterpret_cast<void *>(&tDevRead);
 	copy[kSlotDeviceMemoryWrite] = reinterpret_cast<void *>(&tDevWrite);
+	copy[kSlotPowerStateWillChangeToGated] = reinterpret_cast<void *>(&tPowerGated);
 	*reinterpret_cast<void ***>(this) = copy;   // a published nub is never released, so the copy is never orphaned; publish() frees it if attach fails
 	return copy;
 }

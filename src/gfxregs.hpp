@@ -403,6 +403,7 @@ constexpr uint32_t kComputeDoorbellDword    = 3 * 2;
 constexpr Reg ComputeStartX       { 0, 0x1ba4 };   // START_X/Y/Z
 constexpr Reg ComputeNumThreadX   { 0, 0x1ba7 };   // NUM_THREAD_X/Y/Z
 constexpr Reg ComputePgmLo        { 0, 0x1bac };   // address >> 8
+constexpr Reg ComputeDispatchScratchBase { 0, 0x1bb0 };   // LO, HI (R_00B840): scratch address >> 8 (gfx11+)
 constexpr Reg ComputePgmRsrc1     { 0, 0x1bb2 };   // RSRC1, RSRC2
 constexpr Reg ComputeResourceLim  { 0, 0x1bb5 };
 constexpr Reg ComputeThreadMgmtSe0{ 0, 0x1bb6 };   // SE0, SE1 (0x1bb7)
@@ -433,6 +434,8 @@ constexpr uint32_t kRsrc2TgidXEn       = 1u << 7;
 constexpr uint32_t kRsrc2LdsShift = 15, kRsrc2LdsMask = 0x1ffu << 15;
 constexpr uint32_t kLdsAllocGranule = 1024, kLdsEncodeGranule = 512;
 constexpr uint32_t kMaxLdsPerGroup = 65536;
+// A lane's scratch (private segment) at most: what the runtime's scratch is sized for (runtime.cpp, scratchFor).
+constexpr uint32_t kMaxPrivatePerLane = 16384;
 constexpr uint32_t ldsSizeField(uint32_t bytes) {
 	return ((bytes + kLdsAllocGranule - 1) / kLdsAllocGranule * kLdsAllocGranule / kLdsEncodeGranule)
 	       << kRsrc2LdsShift;
