@@ -72,6 +72,8 @@ public:
 		bool          lit { false }, on { false };
 		bool          moveOwed { false };  // secondPipeTo: the move to the connector in use has not completed
 		bool          uhd { false };       // its table lights it at 3840x2160 (Pipe2::isUhd)
+		bool          hdmi { false };      // its table is for an HDMI stream (on a DisplayPort connector: DP++)
+		bool          moveToPlan { false };   // the move owed goes to the table's own timing (adoptSinkKind)
 		// On DisplayPort: the sink's AUX channel and capabilities (read with
 		// its EDID), and the link picked for the mode it is to carry.
 		uint8_t       aux { 0 };
@@ -164,7 +166,9 @@ public:
 	// An HDMI connector's 3840x2160 plan is taken once the display clocks are
 	// raised for it (uhdClocks), if the sink has SCDC and the plan's mode.
 	bool usePlanFor(uint8_t hpd);
+	bool dpSinkTakes(const Edid::DetailedTiming &t) const;
 	bool sinkTakesUhd(uint8_t hpd) const;
+	bool adoptSinkKind(uint8_t hpd);
 	// DET buffer shares when a pipe is lit (lightSecondPipe).
 	static constexpr uint32_t kMinDetSegments = 6;
 	bool pipeInUse(uint32_t p) const;

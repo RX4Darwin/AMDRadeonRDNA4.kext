@@ -148,6 +148,27 @@ namespace P3Hpd2TmdsUhd {
 #include "pipe2_linux_p3_dp2_tmds_uhd.inc"
 }
 
+// The DisplayPort connectors lit at 3840x2160@60 (CVT reduced blanking) for a
+// DisplayPort sink, for each pipe.
+namespace P1Hpd1Uhd {
+#include "pipe2_linux_p1_dp1_uhd.inc"
+}
+namespace P1Hpd2Uhd {
+#include "pipe2_linux_p1_dp2_uhd.inc"
+}
+namespace P2Hpd1Uhd {
+#include "pipe2_linux_p2_dp1_uhd.inc"
+}
+namespace P2Hpd2Uhd {
+#include "pipe2_linux_p2_dp2_uhd.inc"
+}
+namespace P3Hpd1Uhd {
+#include "pipe2_linux_p3_dp1_uhd.inc"
+}
+namespace P3Hpd2Uhd {
+#include "pipe2_linux_p3_dp2_uhd.inc"
+}
+
 struct Table {
 	const Config               &config;
 	const Gen                  *gen;        // the plan
@@ -207,6 +228,18 @@ constexpr Table kTables[] = {
 	table(P2Hpd2TmdsUhd::kConfig, P2Hpd2TmdsUhd::kGen, P2Hpd2TmdsUhd::kModeRegs, P2Hpd2TmdsUhd::kModeTimings, P2Hpd2TmdsUhd::kModeValues),
 	table(P3Hpd1TmdsUhd::kConfig, P3Hpd1TmdsUhd::kGen, P3Hpd1TmdsUhd::kModeRegs, P3Hpd1TmdsUhd::kModeTimings, P3Hpd1TmdsUhd::kModeValues),
 	table(P3Hpd2TmdsUhd::kConfig, P3Hpd2TmdsUhd::kGen, P3Hpd2TmdsUhd::kModeRegs, P3Hpd2TmdsUhd::kModeTimings, P3Hpd2TmdsUhd::kModeValues),
+	table(P1Hpd1Uhd::kConfig, P1Hpd1Uhd::kGen, P1Hpd1Uhd::kModeRegs, P1Hpd1Uhd::kModeTimings, P1Hpd1Uhd::kModeValues, P1Hpd1Uhd::kAux,
+	      countOf(P1Hpd1Uhd::kAux)),
+	table(P1Hpd2Uhd::kConfig, P1Hpd2Uhd::kGen, P1Hpd2Uhd::kModeRegs, P1Hpd2Uhd::kModeTimings, P1Hpd2Uhd::kModeValues, P1Hpd2Uhd::kAux,
+	      countOf(P1Hpd2Uhd::kAux)),
+	table(P2Hpd1Uhd::kConfig, P2Hpd1Uhd::kGen, P2Hpd1Uhd::kModeRegs, P2Hpd1Uhd::kModeTimings, P2Hpd1Uhd::kModeValues, P2Hpd1Uhd::kAux,
+	      countOf(P2Hpd1Uhd::kAux)),
+	table(P2Hpd2Uhd::kConfig, P2Hpd2Uhd::kGen, P2Hpd2Uhd::kModeRegs, P2Hpd2Uhd::kModeTimings, P2Hpd2Uhd::kModeValues, P2Hpd2Uhd::kAux,
+	      countOf(P2Hpd2Uhd::kAux)),
+	table(P3Hpd1Uhd::kConfig, P3Hpd1Uhd::kGen, P3Hpd1Uhd::kModeRegs, P3Hpd1Uhd::kModeTimings, P3Hpd1Uhd::kModeValues, P3Hpd1Uhd::kAux,
+	      countOf(P3Hpd1Uhd::kAux)),
+	table(P3Hpd2Uhd::kConfig, P3Hpd2Uhd::kGen, P3Hpd2Uhd::kModeRegs, P3Hpd2Uhd::kModeTimings, P3Hpd2Uhd::kModeValues, P3Hpd2Uhd::kAux,
+	      countOf(P3Hpd2Uhd::kAux)),
 };
 constexpr size_t kTableCount = sizeof(kTables) / sizeof(kTables[0]);
 

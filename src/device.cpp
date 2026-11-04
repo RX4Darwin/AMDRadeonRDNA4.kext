@@ -2214,8 +2214,12 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 		}
 	}
 
-	uint32_t head2dp = 0;
-	pipe2DpAllowed = PE_parse_boot_argn("rdna4-head2dp", &head2dp, sizeof(head2dp)) && head2dp != 0;
+	// The extra pipes drive DisplayPort sinks (trained on the card, two
+	// Dells, 2026-11-04); rdna4-head2dp=0 leaves those connectors to HDMI.
+	uint32_t head2dp = 1;
+
+	(void)Trial::option("rdna4-head2dp", head2dp);
+	pipe2DpAllowed = head2dp != 0;
 
 	// Needs the lit pipe (discoverPipe) and the sink's AUX channel (probeEDID).
 	if (PE_parse_boot_argn("rdna4-dptrain", &dpTrainLevel, sizeof(dpTrainLevel)) && dpTrainLevel)
@@ -2852,7 +2856,7 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 	// The plan for the connector the second display is on.
 	if (!usePlanFor(xp().hpd)) {
 		FBLOG("pipe2: not lit: the second display is on HPD%u, a connector there is no plan for (a DisplayPort "
-		      "one needs rdna4-head2dp=1)", xp().hpd);
+		      "one is off with rdna4-head2dp=0)", xp().hpd);
 		return false;
 	}
 	const Pipe2::Config &c = Pipe2::config();
@@ -3133,29 +3137,51 @@ void RDNA4Device::selectExtra(size_t slot) {
 	extraSlot = slot;
 	// Its connector's table, or until it has a sink its pipe's first.
 	const ExtraPipe &x = xp();
-	if (!x.hpd || !Pipe2::use(x.hpd, dpDual(x.hpd), x.pipe, x.uhd))
+	if (!x.hpd || !Pipe2::use(x.hpd, x.lit ? x.hdmi : dpDual(x.hpd), x.pipe, x.uhd))
 		Pipe2::use(3, false, x.pipe);
 }
 
-/* The 3840x2160 table of the connector on that pin, or nullptr. */
-static const Pipe2::Config *uhdConfigFor(uint8_t hpd)
+/* The 3840x2160 table of the connector on that pin for that stream, or nullptr. */
+static const Pipe2::Config *uhdConfigFor(uint8_t hpd, bool dp)
 {
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
 		const Pipe2::Config &c = Pipe2::configAt(i);
 
-		if (c.hpd == hpd && Pipe2::isUhd(c))
+		if (c.hpd == hpd && c.dp == dp && Pipe2::isUhd(c))
 			return &c;
 	}
 
 	return nullptr;
 }
 
+/*
+ * Whether a DisplayPort sink takes the plan's timing: its preferred one (a 4K
+ * monitor's CVT-RB 3840x2160@60), on a link it can train.
+ */
+bool RDNA4Device::dpSinkTakes(const Edid::DetailedTiming &t) const
+{
+	Edid::DetailedTiming pref {};
+	DpTrain::Link link {};
+
+	if (!Edid::preferredTiming(xp().edid, xp().edidLen, pref) || !Edid::sameTiming(pref, t))
+		return false;
+
+	return xp().sink.maxRate && DpTrain::pickLink(xp().sink, t.pixelClockKHz, 24, link);
+}
+
 /* Whether the pipe's sink, on that pin, can be lit at 3840x2160. */
 bool RDNA4Device::sinkTakesUhd(uint8_t hpd) const
 {
-	const Pipe2::Config *c = uhdConfigFor(hpd);
+	const bool dp = Pipe2::hasDpTable(hpd) && !dpDual(hpd);
+	const Pipe2::Config *c = uhdConfigFor(hpd, dp);
 
-	if (!c || !Edid::hdmi2Caps(xp().edid, xp().edidLen).scdc)
+	if (!c)
+		return false;
+
+	if (dp)
+		return dpSinkTakes(c->timing);
+
+	if (!Edid::hdmi2Caps(xp().edid, xp().edidLen).scdc)
 		return false;
 
 	// Behind a DP++ adapter: only if it carries the table's clock.
@@ -3243,15 +3269,56 @@ uint32_t RDNA4Device::detShare(uint32_t plan, uint32_t others) const
 
 bool RDNA4Device::usePlanFor(uint8_t hpd) {
 	const Pipe2::Config was = Pipe2::config();
-	// A lit pipe keeps the size it is lit at.
+	// A lit pipe keeps the size and the kind of stream it is lit with.
 	const bool uhd = xp().lit ? xp().uhd : uhdClocks && sinkTakesUhd(hpd);
-	if (!Pipe2::use(hpd, dpDual(hpd), xp().pipe, uhd))
+	const bool hdmi = xp().lit ? xp().hdmi : dpDual(hpd);
+	if (!Pipe2::use(hpd, hdmi, xp().pipe, uhd))
 		return false;
 	if (Pipe2::config().dp && !pipe2DpAllowed) {
 		Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was));
 		return false;
 	}
 	xp().uhd = uhd;
+	xp().hdmi = !Pipe2::config().dp;
+	return true;
+}
+
+/*
+ * A lit pipe whose DisplayPort connector now has the other kind of sink: a
+ * DisplayPort monitor in place of an HDMI one behind a DP++ adapter, or the
+ * other way round. The pipe takes the connector's table for that kind, at
+ * the size the new sink takes, and its stream moves there at the next
+ * secondPipeTo, as between connectors. Until then a wake by the old table
+ * would drive the new sink with the wrong kind of stream.
+ */
+bool RDNA4Device::adoptSinkKind(uint8_t hpd)
+{
+	const Pipe2::Config was = Pipe2::config();
+	const bool hdmi = dpDual(hpd);
+	const bool uhd = uhdClocks && sinkTakesUhd(hpd);
+
+	if (!xp().lit || hpd != was.hpd || !Pipe2::hasDpTable(hpd) || hdmi == xp().hdmi)
+		return false;
+
+	if (xp().on) {
+		runSecondPipePart(Pipe2::Part::Sleep);
+		xp().on = false;
+	}
+
+	if (!Pipe2::use(hpd, hdmi, xp().pipe, uhd) || (Pipe2::config().dp && !pipe2DpAllowed)) {
+		Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was));
+		FBLOG("pipe2: HPD%u has another kind of sink, and no table for it: the pipe stays off", hpd);
+		return false;
+	}
+
+	xp().hdmi = hdmi;
+	xp().uhd = uhd;
+	xp().moveOwed = true;
+	xp().moveToPlan = true;
+	FBLOG("pipe2: HPD%u now has %s: the pipe moves to its %ux%u table", hpd,
+	      hdmi ? "an HDMI sink behind a DP++ adapter" : "a DisplayPort sink",
+	      Pipe2::config().timing.hActive, Pipe2::config().timing.vActive);
+
 	return true;
 }
 
@@ -3348,13 +3415,17 @@ bool RDNA4Device::secondPipeTo(uint8_t hpd) {
 	// and wake, which leave its encoder and link as lighting here would
 	// (test/atomdump.cpp, testPipe2Move).
 	const Pipe2::Config &c = Pipe2::config();
-	const Modes::Mode same { 0, xp().target.now, xp().target.now.refreshMilliHz(), false, Modes::SourceBoot };
+	const Edid::DetailedTiming at = xp().moveToPlan ? c.timing : xp().target.now;
+	const Modes::Mode same { 0, at, at.refreshMilliHz(), false, Modes::SourceBoot };
+
 	if (applySecondPipeMode(same) != kIOReturnSuccess || !runSecondPipePart(Pipe2::Part::Sleep) ||
 	    !runSecondPipePart(Pipe2::Part::Wake)) {
 		FBLOG("pipe2: the move to HPD%u did not complete: the display stays off until it is plugged in again", hpd);
 		return false;
 	}
+
 	xp().moveOwed = false;
+	xp().moveToPlan = false;
 	xp().on = true;
 	FBLOG("pipe2: now on HPD%u; DIG%u_DIG_FE_EN_CNTL=0x%08x SYMCLK%c_CLOCK_ENABLE=0x%08x", c.hpd, c.dig,
 	      regReadDmu(2, Pipe::Reg::kDigFeEnCntl + c.dig * Pipe::Reg::kDigStride), 'A' + c.dig,

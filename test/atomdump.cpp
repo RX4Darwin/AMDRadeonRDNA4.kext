@@ -1784,7 +1784,7 @@ static int testPipe2Table() {
 	mt.connectorObjId = 0x330c;
 	mt.extra = extra;
 	// A sink a pipe is lit at 3840x2160 for has SCDC.
-	mt.sinkScdc = Pipe2::isUhd(c);
+	mt.sinkScdc = Pipe2::isUhd(c) && !c.dp;
 	mt.ddcLine = kDdcLine;
 	size_t nmodes = 0;
 	const Edid::DetailedTiming *known = Pipe2::knownModes(nmodes);
@@ -1982,9 +1982,18 @@ static int testPipe2Table() {
 					v = p.steps[i].value;
 			return v;
 		};
-		static const struct { uint8_t rate; uint32_t m; } mvid[] = {
-			{ DpTrain::kRbr, 0x7555 }, { DpTrain::kHbr, 0x4666 }, { DpTrain::kHbr2, 0x2333 }, { DpTrain::kHbr3, 0x1777 } };
+		// The 1080p tables, and the 3840x2160 ones (533.25 MHz).
+		static const struct { uint32_t khz; uint8_t rate; uint32_t m; } mvid[] = {
+			{ 148500, DpTrain::kRbr, 0x7555 }, { 148500, DpTrain::kHbr, 0x4666 },
+			{ 148500, DpTrain::kHbr2, 0x2333 }, { 148500, DpTrain::kHbr3, 0x1777 },
+			{ 533250, DpTrain::kRbr, 0x1a555 }, { 533250, DpTrain::kHbr, 0xfccc },
+			{ 533250, DpTrain::kHbr2, 0x7e66 }, { 533250, DpTrain::kHbr3, 0x5444 } };
+
 		for (const auto &e : mvid) {
+			if (e.khz != c.timing.pixelClockKHz)
+				continue;
+
+
 			Pipe2::Target at = t;
 			at.linkRate = e.rate;
 			failures += check(Pipe2::build(at, stream, &why) && vidM(stream) == e.m,
@@ -2592,7 +2601,7 @@ static int testN48N() {
 static int testPipe2() {
 	int failures = 0;
 	const uint8_t first = Pipe2::config().hpd;
-	failures += check(Pipe2::configCount() == 30 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
+	failures += check(Pipe2::configCount() == 36 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
 	                  Pipe2::config().hpd == first,
 	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
 	// A DisplayPort connector has its DisplayPort table and an HDMI one (a passive DP++ adapter); an HDMI
@@ -2634,6 +2643,11 @@ static int testPipe2() {
 	                  Pipe2::config().link == 3 && Pipe2::use(2, true, 1, true) && !Pipe2::config().dp &&
 	                  Pipe2::config().link == 1 && Pipe2::config().timing.pixelClockKHz == 594000,
 	                  "pipe2: 3840x2160@60 tables for the HDMI connectors and DP++");
+	// The DisplayPort connectors again for a DisplayPort sink, at CVT-RB 3840x2160@60.
+	failures += check(Pipe2::use(2, false, 1, true) && Pipe2::config().dp && Pipe2::config().link == 1 &&
+	                  Pipe2::config().timing.pixelClockKHz == 533250 && Edid::vicOf(Pipe2::config().timing) == 0 &&
+	                  Pipe2::use(1, false, 3, true) && Pipe2::config().dp && Pipe2::config().pipe == 3,
+	                  "pipe2: 3840x2160@60 tables for DisplayPort sinks");
 
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
 		const Pipe2::Config &c = Pipe2::configAt(i);

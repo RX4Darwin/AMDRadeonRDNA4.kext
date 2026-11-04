@@ -586,7 +586,7 @@ void fillHead(Head2 *h, RDNA4Device &dev) {
 			      dev.xp().hpd);
 		else if (dev.xp().edidLen)
 			HLOG(h, "the display on HPD%u is not served: no second-pipe plan for that connector (a "
-			      "DisplayPort one needs rdna4-head2dp=1); the head waits offline", dev.xp().hpd);
+			      "DisplayPort one is off with rdna4-head2dp=0); the head waits offline", dev.xp().hpd);
 		// The one mode the pipe will be lit in, on its surface; no EDID.
 		h->table[0] = Modes::Mode { 1, lit, lit.refreshMilliHz(), true, Modes::SourceBoot };
 		n = 1;
@@ -608,7 +608,7 @@ void fillHead(Head2 *h, RDNA4Device &dev) {
 		if (head2Level >= 2 && !sink) {
 			if (dev.xp().edidLen)
 				HLOG(h, "nothing to serve: the second display is on HPD%u, a connector there is no "
-				      "second-pipe plan for (a DisplayPort one needs rdna4-head2dp=1)", dev.xp().hpd);
+				      "second-pipe plan for (a DisplayPort one is off with rdna4-head2dp=0)", dev.xp().hpd);
 			else
 				HLOG(h, "nothing to serve: no second sink answered on DDC (hot-plug is off: rdna4-hotplug=2 "
 				      "waits for one, rdna4-head2=1 makes a phantom head)");
@@ -668,6 +668,11 @@ void head2Plugged(Head2 *h, uint8_t hpd) {
 		HLOG(h, "hotplug: HPD%u is high but there is no EDID on DDC (yet)", hpd);
 		return;
 	}
+	// A lit pipe whose connector has another kind of sink now changes table:
+	// another display than before, whatever its EDID.
+	if (dev.adoptSinkKind(hpd))
+		h->edidLen = 0;
+
 	// A pipe that is not lit yet takes the plan for this connector.
 	if (!dev.xp().lit && !dev.usePlanFor(hpd)) {
 		HLOG(h, "hotplug: no second-pipe plan for HPD%u", hpd);
@@ -696,6 +701,8 @@ void head2Plugged(Head2 *h, uint8_t hpd) {
 	if (!mode) {
 		HLOG(h, "hotplug: the display has no %ux%u mode at %u kHz, the one the pipe is lit in: left off",
 		      lit.hActive, lit.vActive, lit.pixelClockKHz);
+		// Not served: the next plug is not "the same display" for it.
+		h->edidLen = 0;
 		return;
 	}
 	if (!dev.xp().lit) {

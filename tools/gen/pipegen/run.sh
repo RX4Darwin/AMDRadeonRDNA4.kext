@@ -152,6 +152,10 @@ if [ $# -eq 0 ]; then
 		# and the DisplayPort connectors with an HDMI sink behind a passive DP++ adapter
 		table pipe2_linux_p${p}_dp1_tmds_uhd.inc   dpdual  $p 0 0 1  3840 176 88 296  2160 8 10 72  594000 1 1 97
 		table pipe2_linux_p${p}_dp2_tmds_uhd.inc   dpdual  $p 1 1 2  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		# and with a DisplayPort sink, at CVT reduced blanking 3840x2160@60 (a 4K monitor's preferred timing on
+		# DisplayPort): no scrambling, the link trained for it at run time
+		table pipe2_linux_p${p}_dp1_uhd.inc   dplink a 0 0  $p 0 0 1  3840 48 32 80  2160 3 5 54  533250 1 0 0
+		table pipe2_linux_p${p}_dp2_uhd.inc   dplink a 0 0  $p 1 1 2  3840 48 32 80  2160 3 5 54  533250 1 0 0
 	done
 else
 	table pipe2_linux.inc "$@"
