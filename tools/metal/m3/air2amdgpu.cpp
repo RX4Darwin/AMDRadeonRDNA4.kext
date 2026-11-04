@@ -1211,6 +1211,20 @@ static std::string translate(StringRef input, StringRef fname, Kernel &out) {
 	return "";
 }
 
+// With AIR2AMDGPU_DUMP set to a directory: each request's library and what became of it, <request>-<name>.metallib and .rgfx, for
+// translating them again by hand (air2amdgpu <lib> <name> <out>) and disassembling them.
+static void dump(uint64_t req, const char *name, StringRef lib, const std::string &out) {
+	const char *dir = getenv("AIR2AMDGPU_DUMP");
+
+	if (!dir)
+		return;
+
+	const std::string base = std::string(dir) + "/" + std::to_string(req) + "-" + name;
+	std::error_code ec;
+	raw_fd_ostream(base + ".metallib", ec, sys::fs::OF_None) << lib;
+	raw_fd_ostream(base + ".rgfx", ec, sys::fs::OF_None) << out;
+}
+
 // --serve: connect to the kext (retrying until the host is up), then translate each function it asks for. Ends when the kext's call fails
 // (it went away, or this process was signalled); run it under launchd with KeepAlive.
 static int serve() {
@@ -1241,6 +1255,7 @@ static int serve() {
 		Kernel k {};
 		const std::string why = translate(StringRef(lib.data(), req[1]), name, k);
 		errs() << "air2amdgpu: request " << req[0] << ": " << name << ": " << (why.empty() ? "translated, " + std::to_string(k.hsaco.size()) + " bytes" : why) << "\n";
+		dump(req[0], name, StringRef(lib.data(), req[1]), k.hsaco);
 		const uint64_t reply[5] = {req[0], reinterpret_cast<uint64_t>(k.hsaco.data()), why.empty() ? k.hsaco.size() : 0, k.buffers, k.written};
 		IOConnectCallScalarMethod(conn, kMtlcDeliver, reply, 5, nullptr, nullptr);
 		if (gLldSpent)
