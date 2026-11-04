@@ -31,6 +31,7 @@
 
 #include "compute.hpp"
 #include "klog.hpp"
+#include "trial.hpp"
 #include "gfx12_draw.h"
 #include "isa.hpp"
 #include "linuxref.hpp"
@@ -61,7 +62,7 @@ using namespace GfxReg;
 
 uint32_t RDNA4Compute::requestedGfx() {
 	uint32_t mode = 0;
-	if (!PE_parse_boot_argn("rdna4-gfx", &mode, sizeof(mode)))
+	if (!Trial::option("rdna4-gfx", mode))
 		return 0;
 	if (mode == 1) {
 		// gfx_v12_0_gfx_ring_init sets ring->use_doorbell = true (gfx_v12_0.c:990)

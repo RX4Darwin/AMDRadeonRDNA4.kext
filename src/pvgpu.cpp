@@ -1403,13 +1403,45 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	uint64_t fence = 0, ns = 0;
 	if (ok) {
 		swap();
-		ok = gCompute->rtCopy(this, tgt.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), targetBytes, true) == kIOReturnSuccess &&
-		     gCompute->rtCopy(this, mGfxCode.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(code), sizeof(code), true) == kIOReturnSuccess &&
-		     gCompute->rtCopy(this, mGfxMisc.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(misc), sizeof(misc), true) == kIOReturnSuccess &&
-		     gCompute->rtCopy(this, mGfxIb.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(ib), total * 4, true) == kIOReturnSuccess &&
-		     gCompute->rtSubmitGfxIb(this, mGfxIb.gpu, total, 0, fence) == kIOReturnSuccess &&
-		     gCompute->rtWaitGfxFence(this, static_cast<uint32_t>(fence), 2000, ns) == kIOReturnSuccess &&
-		     gCompute->rtCopy(this, tgt.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), targetBytes, false) == kIOReturnSuccess;
+		// each step's result, so that a draw that fails says where
+		const char *step = "target in";
+		IOReturn r = gCompute->rtCopy(this, tgt.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), targetBytes, true);
+
+		if (r == kIOReturnSuccess) {
+			step = "code in";
+			r = gCompute->rtCopy(this, mGfxCode.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(code), sizeof(code), true);
+		}
+
+		if (r == kIOReturnSuccess) {
+			step = "state in";
+			r = gCompute->rtCopy(this, mGfxMisc.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(misc), sizeof(misc), true);
+		}
+
+		if (r == kIOReturnSuccess) {
+			step = "IB in";
+			r = gCompute->rtCopy(this, mGfxIb.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(ib), total * 4, true);
+		}
+
+		if (r == kIOReturnSuccess) {
+			step = "submit";
+			r = gCompute->rtSubmitGfxIb(this, mGfxIb.gpu, total, 0, fence);
+		}
+
+		if (r == kIOReturnSuccess) {
+			step = "fence";
+			r = gCompute->rtWaitGfxFence(this, static_cast<uint32_t>(fence), 2000, ns);
+		}
+
+		if (r == kIOReturnSuccess) {
+			step = "target out";
+			r = gCompute->rtCopy(this, tgt.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), targetBytes, false);
+		}
+
+		ok = r == kIOReturnSuccess;
+		if (!ok && talk)
+			pvlog("host: render: draw with pipeline %u: %s failed (0x%x)", pipeline, step, r);
+	} else if (talk) {
+		pvlog("host: render: draw with pipeline %u: no runtime client, buffers or target staging", pipeline);
 	}
 	if (ok) {
 		swap();

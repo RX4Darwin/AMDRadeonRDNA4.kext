@@ -128,7 +128,7 @@ uint32_t RDNA4Compute::requestedVmShared() {
 
 bool RDNA4Compute::requestedVm() {
 	uint32_t enabled = 0;
-	return PE_parse_boot_argn("rdna4-vm", &enabled, sizeof(enabled)) && enabled != 0;
+	return Trial::option("rdna4-vm", enabled) && enabled != 0;
 }
 
 bool RDNA4Compute::requestedPowerManagement() {

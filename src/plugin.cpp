@@ -1253,23 +1253,23 @@ void pluginStart() {
 	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "", pvGpu ? ", FAKE PARAVIRT GPU (VM only)" : "");
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
 #ifdef AMDRadeonRDNA4_PVGPU
-	if (pvGpu)
-		lilu.onKextLoadForce(&kextIOSurface, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-			if (index != kextIOSurface.loadIndex)
-				return;
-			// In the order of pvgpu.cpp's gSurfaceFns.
-			static const char *const names[8] = {"__ZN13IOSurfaceRoot13lookupSurfaceEjP4task", "__ZNK9IOSurface19getMemoryDescriptorEv",
-			                                     "__ZNK9IOSurface14getBytesPerRowEv", "__ZNK9IOSurface8getWidthEv", "__ZNK9IOSurface9getHeightEv",
-			                                     "__ZNK9IOSurface14getPixelFormatEv", "__ZNK9IOSurface13getBaseOffsetEv", "__ZNK9IOSurface12getSurfaceIDEv"};
-			mach_vm_address_t fn[8];
-			unsigned found = 0;
-			for (unsigned k = 0; k < 8; k++)
-				found += (fn[k] = patcher.solveSymbol(index, names[k], address, size)) != 0;
-			patcher.clearError();
-			if (found == 8)
-				RDNA4PvNub::setSurfaceFunctions(fn);
-			FBLOG("pvgpu: IOSurface: %u of 8 functions found%s", found, found == 8 ? "" : ": no IOSurface render targets");
-		}, nullptr);
+	// whether this boot has the fake GPU is only known once NVRAM is (rdna4-trial): the functions are resolved in any case
+	lilu.onKextLoadForce(&kextIOSurface, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+		if (index != kextIOSurface.loadIndex)
+			return;
+		// In the order of pvgpu.cpp's gSurfaceFns.
+		static const char *const names[8] = {"__ZN13IOSurfaceRoot13lookupSurfaceEjP4task", "__ZNK9IOSurface19getMemoryDescriptorEv",
+		                                     "__ZNK9IOSurface14getBytesPerRowEv", "__ZNK9IOSurface8getWidthEv", "__ZNK9IOSurface9getHeightEv",
+		                                     "__ZNK9IOSurface14getPixelFormatEv", "__ZNK9IOSurface13getBaseOffsetEv", "__ZNK9IOSurface12getSurfaceIDEv"};
+		mach_vm_address_t fn[8];
+		unsigned found = 0;
+		for (unsigned k = 0; k < 8; k++)
+			found += (fn[k] = patcher.solveSymbol(index, names[k], address, size)) != 0;
+		patcher.clearError();
+		if (found == 8)
+			RDNA4PvNub::setSurfaceFunctions(fn);
+		FBLOG("pvgpu: IOSurface: %u of 8 functions found%s", found, found == 8 ? "" : ": no IOSurface render targets");
+	}, nullptr);
 	PvHooks::start();
 #endif
 	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) { gPatcher = &patcher; });
