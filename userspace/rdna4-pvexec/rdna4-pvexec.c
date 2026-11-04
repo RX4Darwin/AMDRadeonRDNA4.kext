@@ -35,7 +35,7 @@
 
 #include "librdna4.h"
 
-#define MAX_PROGRAMS 64
+#define MAX_PROGRAMS 256
 #define MAX_KERNARGS 64
 #define MAX_BUFFER_BYTES (256ull << 20)
 #define DISPATCH_TIMEOUT_MS 5000

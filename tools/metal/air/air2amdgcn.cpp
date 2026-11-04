@@ -153,6 +153,24 @@ Value *quadDifference(IRBuilder<> &B, Value *v, unsigned bit) {
 	return B.CreateFPTrunc(B.CreateFSub(hi, lo), T);
 }
 
+// atan2(y, x) of floats, a minimax polynomial of atan on [0, 1] folded into the octants (error about 1e-5 rad).
+Value *atan2Approx(IRBuilder<> &B, Value *y, Value *x) {
+	Type *T = y->getType();
+	Value *f = B.CreateFPExt(y, B.getFloatTy()), *g = B.CreateFPExt(x, B.getFloatTy());
+	Value *ay = B.CreateUnaryIntrinsic(Intrinsic::fabs, f), *ax = B.CreateUnaryIntrinsic(Intrinsic::fabs, g);
+	Value *hi = B.CreateBinaryIntrinsic(Intrinsic::maxnum, ax, ay), *lo = B.CreateBinaryIntrinsic(Intrinsic::minnum, ax, ay);
+	auto c = [&](double v) { return ConstantFP::get(B.getFloatTy(), v); };
+	Value *a = B.CreateSelect(B.CreateFCmpOEQ(hi, c(0)), c(0), B.CreateFDiv(lo, hi));
+	Value *s = B.CreateFMul(a, a);
+	Value *r = B.CreateFAdd(B.CreateFMul(c(-0.0464964749), s), c(0.15931422));
+	r = B.CreateFAdd(B.CreateFMul(r, s), c(-0.327622764));
+	r = B.CreateFAdd(B.CreateFMul(B.CreateFMul(r, s), a), a);
+	r = B.CreateSelect(B.CreateFCmpOGT(ay, ax), B.CreateFSub(c(1.57079637), r), r);
+	r = B.CreateSelect(B.CreateFCmpOLT(g, c(0)), B.CreateFSub(c(3.14159274), r), r);
+	r = B.CreateSelect(B.CreateFCmpOLT(f, c(0)), B.CreateFNeg(r), r);
+	return B.CreateFPTrunc(r, T);
+}
+
 // Returns the replacement value (or nullptr + *why when there is no rule). `isVoid` calls return a non-null sentinel (the call itself).
 Value *lowerCall(IRBuilder<> &B, CallInst *CI, StringRef name, std::string *why) {
 	LLVMContext &C = B.getContext();
@@ -264,6 +282,12 @@ Value *lowerCall(IRBuilder<> &B, CallInst *CI, StringRef name, std::string *why)
 		return fm(un(Intrinsic::log2));
 	if (op == "log10")
 		return fm(un(Intrinsic::log10));
+	if (op == "atan2")
+		return elementwise(B, RT, {A[0], A[1]}, [&](IRBuilder<> &B, ArrayRef<Value *> e) { return atan2Approx(B, e[0], e[1]); });
+	if (op == "atan")
+		return elementwise(B, RT, {A[0]}, [&](IRBuilder<> &B, ArrayRef<Value *> e) {
+			return atan2Approx(B, e[0], ConstantFP::get(e[0]->getType(), 1.0));
+		});
 	if (op == "sin")
 		return fm(un(Intrinsic::sin));
 	if (op == "cos")
@@ -532,6 +556,8 @@ void kernelAttributes(Function *NF, const unsigned tg[3]) {
 	NF->addFnAttr("uniform-work-group-size", "false");
 }
 
+void lowerModule(Module &M, Stats &st, bool textures);
+
 bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::string &err, Stats &st) {
 	LLVMContext &C = M.getContext();
 	NamedMDNode *nk = M.getNamedMetadata("air.kernel");
@@ -568,8 +594,9 @@ bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::s
 		if (infos[i].kind == "air.buffer" && !infos[i].aspace && pt)
 			infos[i].aspace = pt->getAddressSpace() == kAmdConstant ? kAirConstant : pt->getAddressSpace();
 	}
-	// 1. air.* calls in the body (before the type-changing clone, so the callees' declarations keep their AIR types)
-	lowerFunction(*F, st);
+	// 1. air.* calls in the body and the functions it calls (before the type-changing clone, so the callees' declarations keep their
+	// AIR types)
+	lowerModule(M, st, false);
 	if (!st.unsupported.empty()) {
 		err = "unsupported air.* call: " + st.unsupported.begin()->first;
 		return false;
@@ -816,31 +843,85 @@ void resourceParams(LLVMContext &C, const std::vector<StageItem> &args, std::vec
 	}
 }
 
+// A constant sampler of the function (air.sampler_states: an i64 global) in the encoding rdna4raster.c reads, the guest's packed
+// MTLSamplerDescriptor word (docs/m0-pvgpu.md): AIR's has the s/t/r address in bits 0-2/3-5/6-8 in MSL's numbering (clamp_to_zero 0,
+// clamp_to_edge 1, repeat 2, mirrored_repeat 3, clamp_to_border 4), the mag and min filters in bits 9-10 and 11-12 and pixel
+// coordinates in bit 15 (read from WindowServer's samplers).
+uint64_t samplerWord(uint64_t air) {
+	static const unsigned address[] = {4, 0, 2, 3, 4, 4, 4, 4};   // MTLSamplerAddressMode
+	const unsigned s = address[air & 7], t = address[(air >> 3) & 7];
+	const unsigned mag = (air >> 9) & 3, min = (air >> 11) & 3;
+	return min | mag << 2 | s << 5 | t << 8 | ((air >> 15) & 1 ? 0u : 1u << 31);
+}
+
+void lowerConstantSamplers(Module &M) {
+	for (GlobalVariable &G : M.globals()) {
+		if (!G.getName().starts_with("__air_sampler_state") || !G.hasInitializer())
+			continue;
+		if (auto *CI = dyn_cast<ConstantInt>(G.getInitializer()))
+			G.setInitializer(ConstantInt::get(CI->getType(), samplerWord(CI->getZExtValue())));
+	}
+}
+
 // air.sample_texture_2d.* (texture, sampler, coordinate, ...) -> {colour, i8}: rdna4_sample_2d of rdna4raster.c, level 0, offsets, bias
-// and level of detail left out.
+// and level of detail left out; air.sample_texture_1d_array.* (texture, sampler, coordinate, slice, ...): rdna4_sample_1d_array;
+// air.sample_texture_3d.* (texture, sampler, coordinate, ...): rdna4_sample_3d; air.read_texture_2d.* of float texels (texture,
+// coordinate, ...): rdna4_read_2d.
 void lowerSampling(Module &M, Function &F) {
 	LLVMContext &C = M.getContext();
 	Type *f32 = Type::getFloatTy(C), *v4f = FixedVectorType::get(f32, 4);
-	auto sample = M.getOrInsertFunction("rdna4_sample_2d", FunctionType::get(v4f, {PointerType::get(C, kAmdGlobal), PointerType::get(C, kAmdConstant),
-	                                                                            FixedVectorType::get(f32, 2)}, false));
+	PointerType *tex = PointerType::get(C, kAmdGlobal), *smp = PointerType::get(C, kAmdConstant);
+	auto sample2d = M.getOrInsertFunction("rdna4_sample_2d", FunctionType::get(v4f, {tex, smp, FixedVectorType::get(f32, 2)}, false));
+	auto sample1da = M.getOrInsertFunction("rdna4_sample_1d_array", FunctionType::get(v4f, {tex, smp, f32, Type::getInt32Ty(C)}, false));
+	auto read2d = M.getOrInsertFunction("rdna4_read_2d", FunctionType::get(v4f, {tex, Type::getInt32Ty(C), Type::getInt32Ty(C)}, false));
+	auto sample3d = M.getOrInsertFunction("rdna4_sample_3d", FunctionType::get(v4f, {tex, smp, FixedVectorType::get(f32, 3)}, false));
 	SmallVector<CallInst *, 8> calls;
+	lowerConstantSamplers(M);
 	for (Instruction &I : instructions(F))
 		if (auto *CI = dyn_cast<CallInst>(&I))
 			if (Function *callee = CI->getCalledFunction())
-				if (callee->getName().starts_with("air.sample_texture_2d."))
+				if (callee->getName().starts_with("air.sample_texture_2d.") || callee->getName().starts_with("air.sample_texture_1d_array.") ||
+				    callee->getName().starts_with("air.sample_texture_3d.") || callee->getName().starts_with("air.read_texture_2d."))
 					calls.push_back(CI);
 	for (CallInst *CI : calls) {
 		auto *RT = dyn_cast<StructType>(CI->getType());
 		if (!RT || RT->getNumElements() != 2 || components(RT->getElementType(0)) != 4)
 			continue;
 		IRBuilder<> B(CI);
-		Value *v = B.CreateCall(sample, {CI->getArgOperand(0), CI->getArgOperand(1), CI->getArgOperand(2)});
+		const StringRef name = CI->getCalledFunction()->getName();
+		Value *v;
+		if (name.starts_with("air.read_texture_2d.")) {
+			// (texture, <2 x i32> coordinate, level, ...): float texels only, integer ones stay unsupported
+			if (!RT->getElementType(0)->getScalarType()->isFloatingPointTy())
+				continue;
+			Value *xy = CI->getArgOperand(1);
+			v = B.CreateCall(read2d, {CI->getArgOperand(0), B.CreateExtractElement(xy, uint64_t(0)), B.CreateExtractElement(xy, 1)});
+		} else if (name.starts_with("air.sample_texture_3d.")) {
+			v = B.CreateCall(sample3d, {CI->getArgOperand(0), CI->getArgOperand(1), CI->getArgOperand(2)});
+		} else if (name.starts_with("air.sample_texture_1d_array.")) {
+			v = B.CreateCall(sample1da, {CI->getArgOperand(0), CI->getArgOperand(1), CI->getArgOperand(2),
+			                             B.CreateZExtOrTrunc(CI->getArgOperand(3), Type::getInt32Ty(C))});
+		} else {
+			v = B.CreateCall(sample2d, {CI->getArgOperand(0), CI->getArgOperand(1), CI->getArgOperand(2)});
+		}
 		if (RT->getElementType(0)->getScalarType()->isHalfTy())
 			v = B.CreateFPTrunc(v, RT->getElementType(0));
 		Value *r = B.CreateInsertValue(PoisonValue::get(RT), v, 0);
 		r = B.CreateInsertValue(r, ConstantInt::get(RT->getElementType(1), 0), 1);
 		CI->replaceAllUsesWith(r);
 		CI->eraseFromParent();
+	}
+}
+
+// The air.* calls of every function the module defines: the stage function's and those of the functions it calls (CoreAnimation's
+// shaders keep some out of line), with the texture calls first for a render stage.
+void lowerModule(Module &M, Stats &st, bool textures) {
+	for (Function &G : M) {
+		if (G.isDeclaration())
+			continue;
+		if (textures)
+			lowerSampling(M, G);
+		lowerFunction(G, st);
 	}
 }
 
@@ -859,6 +940,15 @@ Function *stageKernel(Module &M, Function *F, ArrayRef<Type *> params, const cha
 	NF->setName(name);
 	if (NamedMDNode *nm = M.getNamedMetadata(md))
 		nm->eraseFromParent();
+	// every function of the module inlined too, noinline ones included (CoreAnimation's apply_color_opcode_noinline): a call takes a
+	// stack, which takes scratch memory the runtime does not set up
+	for (Function &G : M) {
+		if (G.isDeclaration() || &G == NF)
+			continue;
+		G.removeFnAttr(Attribute::NoInline);
+		G.removeFnAttr(Attribute::OptimizeNone);
+		G.addFnAttr(Attribute::AlwaysInline);
+	}
 	return NF;
 }
 
@@ -1031,7 +1121,7 @@ bool lowerVertex(Module &M, const VertexDescriptor &vd, std::string &err, Stats 
 	Function *F = stageEntry(M, "air.vertex", args, outs, err);
 	if (!F)
 		return false;
-	lowerFunction(*F, st);
+	lowerModule(M, st, false);
 	if (!st.unsupported.empty()) {
 		err = "unsupported air.* call: " + st.unsupported.begin()->first;
 		return false;
@@ -1196,8 +1286,7 @@ bool lowerFragment(Module &M, const VertexRecord &vr, std::string &err, Stats &s
 	Function *F = stageEntry(M, "air.fragment", args, outs, err);
 	if (!F)
 		return false;
-	lowerSampling(M, *F);
-	lowerFunction(*F, st);
+	lowerModule(M, st, true);
 	if (!st.unsupported.empty()) {
 		err = "unsupported air.* call: " + st.unsupported.begin()->first;
 		return false;
@@ -1288,6 +1377,10 @@ bool lowerFragment(Module &M, const VertexRecord &vr, std::string &err, Stats &s
 			callArgs.push_back(NF->getArg(bi++));
 		} else if (a.kind == "air.position") {
 			callArgs.push_back(fromFloat4(B, B.CreateCall(fragPos, {px, tri}), T));
+		} else if (a.kind == "air.point_coord") {
+			// only triangles are rasterized: a point's coordinate is the middle of the point
+			callArgs.push_back(fromFloat4(B, ConstantVector::get({ConstantFP::get(f32, 0.5), ConstantFP::get(f32, 0.5), ConstantFP::get(f32, 0),
+			                                                       ConstantFP::get(f32, 1)}), T));
 		} else if (a.kind == "air.front_facing") {
 			callArgs.push_back(B.CreateZExtOrTrunc(B.CreateICmpNE(B.CreateCall(front, {tri}), B.getInt32(0)), T));
 		} else if (a.kind == "air.fragment_input") {

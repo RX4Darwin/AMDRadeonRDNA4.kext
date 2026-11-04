@@ -75,6 +75,7 @@ constexpr uint32_t kCopyBufferToBuffer = 0x12d;
 constexpr uint32_t kFillBuffer = 0x132;
 constexpr uint32_t kFillBufferPattern = 0x13f;
 constexpr uint32_t kCopyTextureToBuffer = 0x12e;
+constexpr uint32_t kCopyBufferToTexture = 0x12c;
 
 #ifdef KERNEL
 /* At plugin start: the sysctls that log command buffers. */

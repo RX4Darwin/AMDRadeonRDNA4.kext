@@ -29,6 +29,8 @@ enum class State : uint32_t {
 
 /* A service that asked for work within this long is taken to be there. */
 constexpr uint64_t kServiceAliveMs = 5000;
+/* Up to this uptime a job waits for a service that has not asked yet. */
+constexpr uint64_t kBootGraceMs = 180000;
 constexpr size_t kChunk = 4096;
 
 IOLock *gLock;
@@ -74,6 +76,30 @@ bool serviceAlive()
 	return gLastAskMs && nowMs() - gLastAskMs < kServiceAliveMs;
 }
 
+/*
+ * Whether a job may wait for the service: in the first minutes after boot,
+ * before it ever asked. WindowServer composites its first frames before the
+ * service runs, and a login screen is not drawn again.
+ */
+bool serviceComing()
+{
+	return !gLastAskMs && nowMs() < kBootGraceMs;
+}
+
+/* Under gLock: wait, at most until `deadline`, for the slot to be free and the service to be there. */
+bool waitReady(uint64_t deadline)
+{
+	while (gState != State::Idle || !serviceAlive()) {
+		if (!serviceAlive() && !serviceComing())
+			return false;
+
+		if (IOLockSleepDeadline(gLock, &gState, deadline, THREAD_UNINT) == THREAD_TIMED_OUT)
+			return false;
+	}
+
+	return true;
+}
+
 } /* namespace */
 
 bool PvJob::run(RDNA4PvJob &job, uint32_t timeoutMs)
@@ -84,7 +110,7 @@ bool PvJob::run(RDNA4PvJob &job, uint32_t timeoutMs)
 	if (!lock())
 		return false;
 
-	if (gState != State::Idle || !serviceAlive()) {
+	if (!waitReady(deadline)) {
 		IOLockUnlock(gLock);
 		return false;
 	}
@@ -104,6 +130,7 @@ bool PvJob::run(RDNA4PvJob &job, uint32_t timeoutMs)
 		JLOG("job %u: no answer in %u ms", job.id, timeoutMs);
 
 	gState = State::Idle;
+	IOLockWakeup(gLock, &gState, false);   /* the next job waiting for the slot */
 	IOLockUnlock(gLock);
 
 	return ok;
@@ -117,6 +144,7 @@ IOReturn PvJob::next(uint32_t timeoutMs, RDNA4PvJob &out)
 		return kIOReturnNoMemory;
 
 	gLastAskMs = nowMs();
+	IOLockWakeup(gLock, &gState, false);   /* jobs that wait for the service to be there */
 
 	while (gState != State::Pending) {
 		const int r = IOLockSleepDeadline(gLock, &gState, deadline, THREAD_ABORTSAFE);

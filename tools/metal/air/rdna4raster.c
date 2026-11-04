@@ -31,6 +31,7 @@ typedef float float4 __attribute__((ext_vector_type(4)));
 typedef __attribute__((address_space(1))) const float gfloat;
 typedef __attribute__((address_space(1))) uint guint;
 typedef float float2 __attribute__((ext_vector_type(2)));
+typedef float float3 __attribute__((ext_vector_type(3)));
 
 /* A texture as the service describes it to a fragment kernel: level 0 of a linear 2D texture. */
 struct rdna4_texture {
@@ -59,6 +60,7 @@ enum {
 
 /* Pixel formats the store knows (MTLPixelFormat). */
 enum {
+	kR32Float = 55,
 	kRGBA8Unorm = 70,
 	kRGBA8UnormSrgb = 71,
 	kBGRA8Unorm = 80,
@@ -159,6 +161,9 @@ static float4 unpack(uint v, uint format)
 	const float4 c = { (v & 0xff) / 255.0f, ((v >> 8) & 0xff) / 255.0f, ((v >> 16) & 0xff) / 255.0f,
 			   (v >> 24) / 255.0f };
 
+	if (format == kR32Float)
+		return (float4){ __builtin_bit_cast(float, v), 0, 0, 1 };
+
 	if (format == kBGRA8Unorm || format == kBGRA8UnormSrgb)
 		return (float4){ c.z, c.y, c.x, c.w };
 
@@ -215,7 +220,7 @@ static float4 texel(gtexture *t, int x, int y)
 	if (x < 0 || y < 0)
 		return (float4){ 0, 0, 0, 0 };
 
-	return unpack(t->data[y * (t->pitch / 4) + x], t->format);
+	return unpack(t->data[y * (t->pitch / 4) + x], t->format & 0xffff);
 }
 
 /* air.sample_texture_2d: level 0, nearest or bilinear. */
@@ -241,6 +246,88 @@ ENTRY float4 rdna4_sample_2d(gtexture *t, csampler *s, float2 uv)
 	const float4 bottom = texel(t, u0, v1) * (1 - ax) + texel(t, u1, v1) * ax;
 
 	return top * (1 - ay) + bottom * ay;
+}
+
+/*
+ * air.sample_texture_3d: level 0, bilinear (or nearest) in the two slices
+ * around w and linear between them. The slices are stacked as rows: the
+ * depth is in the high half of the format (the host's describeTexture).
+ */
+ENTRY float4 rdna4_sample_3d(gtexture *t, csampler *s, float3 uvw)
+{
+	const uint depth = t->format >> 16 ? t->format >> 16 : 1;
+	const uint rows = t->height / depth;
+	const uint w = s->word;
+	const uint filter = (w >> 2) & 3;
+	const uint su = (w >> 5) & 7, sv = (w >> 8) & 7;
+	const float x = (w >> 31) ? uvw.x * t->width : uvw.x, y = (w >> 31) ? uvw.y * rows : uvw.y;
+	const float z = (w >> 31) ? uvw.z * depth : uvw.z;
+
+	if (!t->width || !rows)
+		return (float4){ 0, 0, 0, 0 };
+
+	const float fz = filter == kNearest ? __builtin_floorf(z) : z - 0.5f;
+	const int z0 = (int)__builtin_floorf(fz);
+	const float az = filter == kNearest ? 0 : fz - z0;
+	const int s0 = z0 < 0 ? 0 : z0 >= (int)depth ? (int)depth - 1 : z0;
+	const int s1 = z0 + 1 < 0 ? 0 : z0 + 1 >= (int)depth ? (int)depth - 1 : z0 + 1;
+	float4 c[2];
+
+	for (int k = 0; k < 2; k++) {
+		const int base = (k ? s1 : s0) * (int)rows;
+
+		if (filter == kNearest) {
+			c[k] = texel(t, address((int)__builtin_floorf(x), t->width, su),
+				     base + address((int)__builtin_floorf(y), rows, sv));
+			continue;
+		}
+
+		const float fx = x - 0.5f, fy = y - 0.5f;
+		const int x0 = (int)__builtin_floorf(fx), y0 = (int)__builtin_floorf(fy);
+		const float ax = fx - x0, ay = fy - y0;
+		const int u0 = address(x0, t->width, su), u1 = address(x0 + 1, t->width, su);
+		const int v0 = address(y0, rows, sv), v1 = address(y0 + 1, rows, sv);
+		const float4 top = texel(t, u0, v0 < 0 ? -1 : base + v0) * (1 - ax) + texel(t, u1, v0 < 0 ? -1 : base + v0) * ax;
+		const float4 bottom = texel(t, u0, v1 < 0 ? -1 : base + v1) * (1 - ax) + texel(t, u1, v1 < 0 ? -1 : base + v1) * ax;
+
+		c[k] = top * (1 - ay) + bottom * ay;
+	}
+
+	return c[0] * (1 - az) + c[1] * az;
+}
+
+/* air.read_texture_2d: the texel at (x, y) of level 0; zero outside the texture. */
+ENTRY float4 rdna4_read_2d(gtexture *t, uint x, uint y)
+{
+	if (x >= t->width || y >= t->height)
+		return (float4){ 0, 0, 0, 0 };
+
+	return texel(t, (int)x, (int)y);
+}
+
+/*
+ * air.sample_texture_1d_array: level 0, slice `slice`, filtered along it
+ * only. The slices are the texture's rows (the host describes a 1D array
+ * as one row a slice).
+ */
+ENTRY float4 rdna4_sample_1d_array(gtexture *t, csampler *s, float u, uint slice)
+{
+	const uint w = s->word;
+	const uint filter = (w >> 2) & 3, su = (w >> 5) & 7;
+	const float x = (w >> 31) ? u * t->width : u;
+	const int y = slice < t->height ? (int)slice : (int)t->height - 1;
+
+	if (!t->width || !t->height)
+		return (float4){ 0, 0, 0, 0 };
+
+	if (filter == kNearest)
+		return texel(t, address((int)__builtin_floorf(x), t->width, su), y);
+
+	const float fx = x - 0.5f;
+	const int x0 = (int)__builtin_floorf(fx);
+	const float ax = fx - x0;
+
+	return texel(t, address(x0, t->width, su), y) * (1 - ax) + texel(t, address(x0 + 1, t->width, su), y) * ax;
 }
 
 /* The pixel this thread shades, and its current colour; false outside the target. */

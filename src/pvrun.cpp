@@ -32,6 +32,7 @@ struct Stats {
 	uint32_t failed;
 	uint32_t skipped;
 	uint32_t firstSkipped;
+	uint32_t firstFailed;
 };
 
 /* Buffers bound by slot. */
@@ -74,6 +75,10 @@ struct Encoder {
 
 /* How long a dispatch may take the service, compiling included. */
 constexpr uint32_t kDispatchTimeoutMs = 20000;
+
+/* Draws whose refusal is logged with its reason, and resources logged for it. */
+constexpr uint32_t kRefusalsLogged = 64;
+uint32_t gResourceLogs;
 
 uint32_t gRuns;
 
@@ -337,8 +342,8 @@ bool runCompute(uint32_t task, Compute &c, uint32_t id, const uint8_t *p, uint32
 
 	if (ok)
 		s.done++;
-	else
-		s.failed++;
+	else if (!s.failed++)
+		s.firstFailed = id;
 
 	return true;
 }
@@ -510,6 +515,80 @@ bool renderPass(uint32_t task, Render &r, const uint8_t *p, uint32_t size)
  * u64 size[3], u64 destination offset, bytes per row, bytes per image,
  * u64 options} (measured, card), of the first slice and level.
  */
+/* Bytes a pixel of the MTLPixelFormats a blit copies; 0 for the others. */
+uint32_t bytesPerPixel(uint32_t format)
+{
+	switch (format) {
+	case 10:            /* R8Unorm */
+		return 1;
+	case 25:            /* R16Float */
+	case 30:            /* RG8Unorm */
+		return 2;
+	case 55:            /* R32Float */
+	case 65:            /* RG16Float */
+	case 70:            /* RGBA8Unorm */
+	case 71:            /* RGBA8Unorm_sRGB */
+	case 80:            /* BGRA8Unorm */
+	case 81:            /* BGRA8Unorm_sRGB */
+	case 90:            /* RGB10A2Unorm */
+	case 94:            /* BGR10A2Unorm */
+		return 4;
+	case 115:           /* RGBA16Float */
+		return 8;
+	case 125:           /* RGBA32Float */
+		return 16;
+	default:
+		return 0;
+	}
+}
+
+/*
+ * copyFromBuffer:...toTexture: {u32 buffer, u32 texture, u64 source offset,
+ * u64 source bytes per row, u64 source bytes per image, u64 size[3], u64
+ * destination origin[3], u64 destination slice} (measured, card: CoreDisplay
+ * filling the slices of a 1D array, level 0). A slice of the texture is
+ * bytesPerRow x height bytes.
+ */
+bool copyBufferToTexture(uint32_t task, const uint8_t *p, uint32_t size)
+{
+	PvExec::Texture t;
+	uint64_t buf, bufLen;
+	uint8_t *row;
+	bool ok = true;
+
+	if (size < 88 || !PvExec::resolveBuffer(task, rd32(p), buf, bufLen) ||
+	    !PvExec::resolveTexture(task, rd32(p + 4), t))
+		return false;
+
+	const uint64_t off = rd64(p + 8), pitch = rd64(p + 16), image = rd64(p + 24);
+	const uint64_t w = rd64(p + 32), h = rd64(p + 40), d = rd64(p + 48);
+	const uint64_t x = rd64(p + 56), y = rd64(p + 64), z = rd64(p + 72), slice = rd64(p + 80);
+	const uint64_t bpp = bytesPerPixel(t.format), rowBytes = bpp * w;
+	const uint64_t sliceBytes = t.bytesPerRow * t.height;
+
+	if (!bpp || !w || !h || !d || x + w > t.width || y + h > t.height || rowBytes > kChunk ||
+	    !inside(off, (d - 1) * image + (h - 1) * pitch + rowBytes, bufLen) ||
+	    !inside((slice + z + d - 1) * sliceBytes + (y + h - 1) * t.bytesPerRow + bpp * x, rowBytes, t.bytes))
+		return false;
+
+	row = static_cast<uint8_t *>(IOMalloc(kChunk));
+	if (!row)
+		return false;
+
+	for (uint64_t k = 0; ok && k < d; k++) {
+		for (uint64_t i = 0; ok && i < h; i++) {
+			const uint64_t dst = (slice + z + k) * sliceBytes + (y + i) * t.bytesPerRow + bpp * x;
+
+			ok = PvExec::readGpu(task, buf + off + k * image + i * pitch, row, rowBytes) &&
+			     PvExec::writeGpu(task, t.va + dst, row, rowBytes);
+		}
+	}
+
+	IOFree(row, kChunk);
+
+	return ok;
+}
+
 bool copyTextureToBuffer(uint32_t task, const uint8_t *p, uint32_t size)
 {
 	PvExec::Texture t;
@@ -556,6 +635,17 @@ bool describeTexture(uint32_t task, uint32_t ref, RDNA4PvTexture &t)
 		t.width = tex.width;
 		t.height = tex.height;
 		t.format = tex.format;
+
+		/* a 1D array: one row a slice, which is how rdna4raster.c samples it */
+		if (tex.height == 1 && tex.layers > 1 && tex.bytesPerRow * tex.layers <= tex.bytes)
+			t.height = tex.layers;
+
+		/* a 3D texture: its slices one below the other, the depth beside the format */
+		if (tex.depth > 1 && tex.depth <= 0xffff && tex.bytesPerRow * tex.height * tex.depth <= tex.bytes) {
+			t.height = tex.height * tex.depth;
+			t.format |= tex.depth << 16;
+		}
+
 		return true;
 	}
 
@@ -579,16 +669,22 @@ bool bindTextures(uint32_t task, const Render &r, RDNA4PvJob &job)
 			RDNA4PvTexture &t = job.textures[job.textureCount++];
 
 			t.slot = slot;
-			if (!describeTexture(task, r.textures.ref[slot], t))
+			if (!describeTexture(task, r.textures.ref[slot], t)) {
+				if (gResourceLogs++ < kRefusalsLogged)
+					PvExec::logRef(task, r.textures.ref[slot], "fragment texture not understood");
 				return false;
+			}
 		}
 
 		if (r.samplers.bound & (1u << slot)) {
 			RDNA4PvSampler &sm = job.samplers[job.samplerCount++];
 
 			sm.slot = slot;
-			if (!PvExec::resolveSampler(task, r.samplers.ref[slot], sm.word))
+			if (!PvExec::resolveSampler(task, r.samplers.ref[slot], sm.word)) {
+				if (gResourceLogs++ < kRefusalsLogged)
+					PvExec::logRef(task, r.samplers.ref[slot], "fragment sampler not understood");
 				return false;
+			}
 		}
 	}
 
@@ -647,18 +743,37 @@ bool bindIndices(uint32_t task, const Indices &ix, uint64_t count, RDNA4PvJob &j
  * viewport and scissor into colour attachment 0 (the whole target without a
  * viewport or scissor).
  */
+/* Why a draw was not run, for the first few (the guest only sees a command buffer that completed). */
+bool refuse(uint32_t task, const Render &r, const char *why)
+{
+	static uint32_t logged;
+
+	if (logged++ < kRefusalsLogged)
+		RLOG("task %u: draw with pipeline %u into %u not run: %s", task, r.pipeline, r.target, why);
+
+	return false;
+}
+
 bool draw(uint32_t task, const Render &r, uint32_t topology, uint64_t start, uint64_t count, uint64_t instances,
 	  const Indices *ix = nullptr)
 {
 	RDNA4PvJob job {};
 	PvExec::RenderPipeline pl;
 
-	if (!r.havePipeline || !r.target || !count || !instances || start + count > 0xffffffffull)
-		return false;
+	if (!r.havePipeline || !r.target)
+		return refuse(task, r, "no pipeline or no target");
 
-	if (!PvExec::resolveRenderPipeline(task, r.pipeline, pl) || pl.vertexBytes > RDNA4_PVJOB_MAX_CODE ||
-	    pl.fragmentBytes > RDNA4_PVJOB_MAX_CODE || !drawTarget(task, r.target, job))
-		return false;
+	if (!count || !instances || start + count > 0xffffffffull)
+		return refuse(task, r, "no vertices, or too many");
+
+	if (!PvExec::resolveRenderPipeline(task, r.pipeline, pl))
+		return refuse(task, r, "the pipeline object is not understood");
+
+	if (pl.vertexBytes > RDNA4_PVJOB_MAX_CODE || pl.fragmentBytes > RDNA4_PVJOB_MAX_CODE)
+		return refuse(task, r, "a function too large");
+
+	if (!drawTarget(task, r.target, job))
+		return refuse(task, r, "the target is no texture or IOSurface known");
 
 	job.kind = RDNA4_PVJOB_DRAW;
 	job.task = task;
@@ -689,10 +804,14 @@ bool draw(uint32_t task, const Render &r, uint32_t topology, uint64_t start, uin
 		job.scissor[3] = job.targetHeight;
 	}
 
-	if (!bindBuffers(task, r.vertex, RDNA4_PVJOB_VERTEX, job) ||
-	    !bindBuffers(task, r.fragment, RDNA4_PVJOB_FRAGMENT, job) || !bindTextures(task, r, job) ||
-	    (ix && !bindIndices(task, *ix, count, job)))
-		return false;
+	if (!bindBuffers(task, r.vertex, RDNA4_PVJOB_VERTEX, job) || !bindBuffers(task, r.fragment, RDNA4_PVJOB_FRAGMENT, job))
+		return refuse(task, r, "a bound buffer is not understood, or there are too many");
+
+	if (!bindTextures(task, r, job))
+		return refuse(task, r, "a texture or sampler is not understood");
+
+	if (ix && !bindIndices(task, *ix, count, job))
+		return refuse(task, r, "the indices are not understood");
 
 	return PvJob::run(job, kDispatchTimeoutMs);
 }
@@ -806,8 +925,8 @@ bool runRender(uint32_t task, Render &r, uint32_t id, const uint8_t *p, uint32_t
 
 	if (ok)
 		s.done++;
-	else
-		s.failed++;
+	else if (!s.failed++)
+		s.firstFailed = id;
 
 	return true;
 }
@@ -830,14 +949,17 @@ bool runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t size, Stats 
 	case PvRun::kCopyTextureToBuffer:
 		ok = copyTextureToBuffer(task, p, size);
 		break;
+	case PvRun::kCopyBufferToTexture:
+		ok = copyBufferToTexture(task, p, size);
+		break;
 	default:
 		return false;
 	}
 
 	if (ok)
 		s.done++;
-	else
-		s.failed++;
+	else if (!s.failed++)
+		s.firstFailed = id;
 
 	return true;
 }
@@ -957,6 +1079,6 @@ void PvRun::run(uint32_t task, uint64_t va, uint64_t len)
 	IOFree(buf, len);
 
 	if (gRuns++ < 32 || s.failed)
-		RLOG("task %u, %llu bytes: %u run, %u failed, %u not run yet (first id 0x%x)", task,
-		     len, s.done, s.failed, s.skipped, s.firstSkipped);
+		RLOG("task %u, %llu bytes: %u run, %u failed (first id 0x%x), %u not run yet (first id 0x%x)", task,
+		     len, s.done, s.failed, s.firstFailed, s.skipped, s.firstSkipped);
 }

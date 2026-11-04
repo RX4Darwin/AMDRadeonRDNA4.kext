@@ -35,6 +35,7 @@ constexpr uint32_t kEntryPageMask = 0x7fffffff;
 /* Resource heap entry kinds (the low byte of an entry's first word). */
 constexpr uint32_t kResourceBuffer = 1;
 constexpr uint32_t kResourceTexture = 2;    /* 116 bytes, see Texture */
+constexpr uint32_t kResourceTexture3 = 3;   /* the same descriptor (WindowServer's layer textures) */
 constexpr uint32_t kResourceSurface = 5;    /* an IOSurface's texture, see SurfaceTexture */
 constexpr uint32_t kResourceFunction = 6;    /* {u64 code GPU address, u32 length, ...} */
 constexpr uint32_t kResourceObject = 7;      /* createObject: {u32 type, u32 size, ...} */
@@ -80,10 +81,14 @@ struct Texture {
 	uint64_t bytes;
 	uint64_t bytesPerRow;
 	uint32_t width, height, depth;
+	uint32_t layers;     /* the array length (1 without) */
 	uint32_t format;
 };
 
 bool resolveTexture(uint32_t task, uint32_t ref, Texture &out);
+
+/* Heap entry `ref` of `task` into the log: its kind, size and first bytes (why a resource was not understood). */
+void logRef(uint32_t task, uint32_t ref, const char *what);
 
 /*
  * A texture on an IOSurface by its ref (kind 5, 56 bytes): a CAMetalLayer's

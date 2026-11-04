@@ -69,7 +69,7 @@ constexpr size_t kDumpBytes = 128;
 const uint32_t kComputeReply[12] = { 1, 1024, 3, 32, 4, 0, 0, 0, 0, 0, 0, 0 };
 
 /* Heap entries a pipeline's census looks at, and how much of a function it dumps. */
-constexpr uint32_t kCensusEntries = 32;
+constexpr uint32_t kCensusEntries = 96;
 constexpr uint32_t kFunctionDumpBytes = 16384;
 
 uint32_t rd32(const uint8_t *p)
@@ -482,7 +482,8 @@ bool PvExec::resolveTexture(uint32_t task, uint32_t ref, Texture &out)
 	uint8_t d[0x58];
 	uint32_t kind;
 
-	if (!heapEntry(task, ref, kind, d, sizeof(d)) || kind != kResourceTexture)
+	/* kind 3 has the same descriptor (WindowServer's window and layer textures) */
+	if (!heapEntry(task, ref, kind, d, sizeof(d)) || (kind != kResourceTexture && kind != kResourceTexture3))
 		return false;
 
 	out.bytes = rd64(d);
@@ -492,6 +493,7 @@ bool PvExec::resolveTexture(uint32_t task, uint32_t ref, Texture &out)
 	out.height = rd32(d + 0x40);
 	out.depth = rd32(d + 0x44);
 	out.format = d[0x56] | d[0x57] << 8;
+	out.layers = d[0x0e] | d[0x0f] << 8;   /* 3 for CoreDisplay's 1D array of three LUTs, 1 for 2D textures */
 
 	return out.width && out.height && out.bytesPerRow &&
 	       out.bytesPerRow * out.height <= out.bytes;
@@ -647,6 +649,21 @@ static void dumpFunction(uint32_t task, uint32_t descVa)
  * and functions keep their bytes there (AppleParavirtResourceHeap::addObject
  * copies them in).
  */
+void PvExec::logRef(uint32_t task, uint32_t ref, const char *what)
+{
+	const Task *t = taskById(task);
+	uint32_t entry[3];
+
+	if (!t || !t->heapVa || 12ull * (ref + 1) > t->heapSize ||
+	    !PvExec::readGpu(task, t->heapVa + 12ull * ref, entry, sizeof(entry))) {
+		XLOG("%s: task %u ref %u: no heap entry", what, task, ref);
+		return;
+	}
+
+	XLOG("%s: task %u ref %u: kind %u, %u bytes at 0x%x", what, task, ref, entry[0] & 0xff, entry[0] >> 8, entry[1]);
+	dumpGpu("    bytes", task, entry[1], entry[0] >> 8);
+}
+
 void PvExec::logHeap(uint32_t task, bool code)
 {
 	const Task *t = taskById(task);

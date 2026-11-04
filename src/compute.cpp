@@ -3213,7 +3213,12 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	put(Pm4::setShReg(pkt, shAbs(ComputePgmRsrc1), rsrc, 2));
 	put(Pm4::setShReg(pkt, shAbs(ComputePgmRsrc3), &l.rsrc3, 1));
 	put(Pm4::setShReg(pkt, shAbs(ComputeResourceLim), &zero, 1));
-	put(Pm4::setShReg(pkt, shAbs(ComputeTmpringSize), &zero, 1));
+	put(Pm4::setShReg(pkt, shAbs(ComputeTmpringSize), &l.tmpring, 1));
+	if (l.scratchVa) {
+		const uint32_t base[2] = { static_cast<uint32_t>(l.scratchVa >> 8), static_cast<uint32_t>(l.scratchVa >> 40) };
+
+		put(Pm4::setShReg(pkt, shAbs(ComputeDispatchScratchBase), base, 2));
+	}
 	put(Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe0), all, 2));
 	put(Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe2), all, 2));
 	put(Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe4), none4, 4));
@@ -3323,8 +3328,8 @@ bool RDNA4Compute::kernelFits(const CodeObj::Kernel &k, const char **why) {
 		w = "it asks for dispatch/queue pointers, a dispatch id or scratch setup";
 	else if (k.userSgprCount() != (k.wantsKernargPtr() ? 2u : 0u))
 		w = "its user SGPR count does not match its requests";
-	else if (k.privateSegmentSize)
-		w = "it needs scratch memory";
+	else if (k.privateSegmentSize > kMaxPrivatePerLane)
+		w = "it needs more scratch memory than a lane gets";
 	else if (k.groupSegmentSize > kMaxLdsPerGroup)
 		w = "it needs more than 64 KiB of LDS";
 	else if (k.kernargSize > kKernargMax)

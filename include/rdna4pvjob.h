@@ -68,7 +68,7 @@ typedef struct {
 	uint64_t va;            /* else the texture's memory in the client */
 	uint32_t width, height;
 	uint32_t pitch;         /* bytes per row */
-	uint32_t format;        /* MTLPixelFormat */
+	uint32_t format;        /* MTLPixelFormat; bits 16-31 a 3D texture's depth, its slices then the rows of `height` */
 } RDNA4PvTexture;
 
 /* A sampler of a draw: the guest's packed state (tools/metal/air/rdna4raster.c). */
