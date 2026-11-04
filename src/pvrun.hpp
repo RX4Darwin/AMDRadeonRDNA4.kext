@@ -29,8 +29,17 @@ enum Segment : uint8_t {
 	kInfo = 4,
 };
 
-/* Render commands (docs/m1-opcodes.md): the pass's attachments. */
+/* Render commands (docs/m1-opcodes.md): the pass's attachments, the pipeline, buffers and draws. */
 constexpr uint32_t kRenderPass = 0x1a;
+constexpr uint32_t kSetRenderPipeline = 0x74;
+constexpr uint32_t kSetVertexBuffers = 0x7d;
+constexpr uint32_t kSetFragmentBuffers = 0x6e;
+constexpr uint32_t kSetFragmentSamplers = 0x70;
+constexpr uint32_t kSetFragmentTextures = 0x72;
+constexpr uint32_t kDraw = 0x000;
+constexpr uint32_t kDrawShort = 0x001;
+constexpr uint32_t kDrawInstanced = 0x002;
+constexpr uint32_t kDrawInstancedShort = 0x003;
 constexpr uint32_t kFirstAttachment = 0x4c;
 constexpr uint32_t kAttachmentBytes = 0x3c;
 constexpr uint32_t kColourAttachments = 8;

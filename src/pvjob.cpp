@@ -7,6 +7,7 @@
 
 #include "pvjob.hpp"
 #include "pvexec.hpp"
+#include "pvsurface.hpp"
 #include "klog.hpp"
 
 #include <IOKit/IOLib.h>
@@ -156,8 +157,20 @@ IOReturn PvJob::done(uint32_t id, uint32_t status)
 	return kIOReturnSuccess;
 }
 
-IOReturn PvJob::access(uint32_t task, uint64_t va, task_t userTask, uint64_t user, uint64_t len, bool write)
+/* A chunk of the client's memory or of an IOSurface. */
+static bool guest(uint32_t task, uint64_t va, uint8_t *chunk, size_t n, uint32_t flags)
 {
+	const bool write = flags & RDNA4_PVACCESS_WRITE;
+
+	if (flags & RDNA4_PVACCESS_SURFACE)
+		return PvSurface::access(task, va, chunk, n, write);
+
+	return write ? PvExec::writeGpu(task, va, chunk, n) : PvExec::readGpu(task, va, chunk, n);
+}
+
+IOReturn PvJob::access(uint32_t task, uint64_t va, task_t userTask, uint64_t user, uint64_t len, uint32_t flags)
+{
+	const bool write = flags & RDNA4_PVACCESS_WRITE;
 	IOMemoryDescriptor *md;
 	uint8_t *chunk;
 	IOReturn ret = kIOReturnSuccess;
@@ -181,10 +194,10 @@ IOReturn PvJob::access(uint32_t task, uint64_t va, task_t userTask, uint64_t use
 		const size_t n = len - off < kChunk ? static_cast<size_t>(len - off) : kChunk;
 
 		if (write) {
-			if (md->readBytes(off, chunk, n) != n || !PvExec::writeGpu(task, va + off, chunk, n))
+			if (md->readBytes(off, chunk, n) != n || !guest(task, va + off, chunk, n, flags))
 				ret = kIOReturnIOError;
 		} else {
-			if (!PvExec::readGpu(task, va + off, chunk, n) || md->writeBytes(off, chunk, n) != n)
+			if (!guest(task, va + off, chunk, n, flags) || md->writeBytes(off, chunk, n) != n)
 				ret = kIOReturnIOError;
 		}
 	}

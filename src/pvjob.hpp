@@ -31,8 +31,9 @@ bool run(RDNA4PvJob &job, uint32_t timeoutMs);
 IOReturn next(uint32_t timeoutMs, RDNA4PvJob &out);
 
 /* The service: `len` bytes between the client's memory at its GPU address
- * `va` and `user` in the service's task. */
-IOReturn access(uint32_t task, uint64_t va, task_t userTask, uint64_t user, uint64_t len, bool write);
+ * `va` (or IOSurface `task` at offset `va`) and `user` in the service's task;
+ * flags RDNA4_PVACCESS_*. */
+IOReturn access(uint32_t task, uint64_t va, task_t userTask, uint64_t user, uint64_t len, uint32_t flags);
 
 /* The service: the job is over; status 0 = it ran. */
 IOReturn done(uint32_t id, uint32_t status);

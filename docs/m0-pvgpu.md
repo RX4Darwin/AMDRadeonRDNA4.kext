@@ -254,6 +254,37 @@ cleared every frame) runs its passes without failures.
   transparent windows: a desktop with wallpaper and menu bar and no Dock or windows, the window of `rdna4-mtlwindow` listed on screen and
   not visible. Visible results need draws with vertex and fragment functions and texture sampling.
 
+### Nineteenth to twenty-first runs (2026-11-04): the first draw
+
+**Measured**, card, Sequoia 24H232, trial `rdna4-pvgpu=1 rdna4-compute=7`: `rdna4-mtldraw` (a triangle with a colour per vertex into a 64x64
+BGRA8 texture, read back) shows the triangle with its three colours interpolated, drawn on the card in 15 us.
+
+- **A render pipeline has no FIFO command**: it is a heap object (kind 7) of type `0xe`, `{u32 0xe, u32 size, u32 own ref, u32 length, the
+  serialized descriptor}`; the descriptor starts with a count of entries `{u8 key, u8 size, value}`, key 1 the vertex function's ref and key 2
+  the fragment function's (both kind 6, metallibs), followed by the colour attachments (pixel format `0x50` in the triangle's).
+- **The draw's commands** in a render segment, after the pass `0x1a`: `0x74 {u32 pipeline}`, `0x7d` vertex buffers and `0x6e` fragment buffers
+  (as `0xcb`: `{u32 first, u32 count, {u32 ref, u64 offset}...}`), `0x001 {u32 MTLPrimitiveType, u16 start, u16 count}` (and the long and
+  instanced forms `0x000`, `0x002`, `0x003`).
+- **How it runs**: the host posts a draw job (`include/rdna4pvjob.h`) with both functions, the buffers of both stages, the vertices and colour
+  attachment 0 (a texture in the client's memory or an IOSurface the service reaches through `PvAccess`). `rdna4-pvexec` compiles the pair
+  (`tools/metal/air/compile-pipeline.sh`: the vertex function as a kernel that writes a record per vertex, the fragment function inside a
+  kernel of one thread per pixel that rasterizes the triangles with `rdna4raster.c`), copies buffers and target into VRAM by the copy engine,
+  runs both kernels and copies the target back. No hardware graphics pipeline is involved.
+- Not yet: textures and samplers in the shaders, blending from the pipeline's descriptor, viewports and scissors, depth, indexed draws.
+
+### Twenty-second run (2026-11-04): textures, and why windows stay invisible
+
+**Measured**, card, trial `rdna4-pvgpu=1 rdna4-compute=7`: `rdna4-mtltex` (a 4x4 checkerboard sampled with a nearest sampler over a quad)
+comes out as 16x16-pixel blocks in the right order, 29 us. Fragment textures are `0x72 {u32 first, u32 count, u32 ref...}`, samplers `0x70`
+the same; a sampler is an object of type 3 whose word at 0xc packs MTLSamplerDescriptor (min filter bits 0-1, mag 2-3, s/t address
+5-7/8-10, max anisotropy from bit 26, normalised coordinates bit 31: `0x84000000` for nearest/clamp).
+
+**Screenshots do not show windows.** `screencapture` run over ssh (root, without the Screen Recording permission) leaves out every
+window whose sharing state is none, which is every application window: a normal boot's capture also shows only wallpaper and menu bar, with
+TextEdit's window listed on screen. Judging the paravirtual boots by such captures was wrong; their windows have to be looked at on the
+display. Measured meanwhile: WindowServer composites in software in a paravirtual boot (`CA::OGL::SW`), holding a Metal device, an
+`AppleParavirt2DContext` and a display pipe client of the paravirtual accelerator.
+
 ## The GetDeviceInfo reply (hub-task-446) [measured in the kext and the bundle unless marked]
 
 **The wait.** `AppleParavirtAccelerator::setupDeviceInfo` (the last step of `Accelerator::start`) wires a 4 KiB `IOBufferMemoryDescriptor`, builds FIFO command `0x3a` with one record `{u32 0x2d, u32 bytes/8 (0x200), u32 physical page}`, submits it on the root channel through the generic `IOAccelChannel2` path, and then **`IOAccelEventMachineFast2::finishEvent`** waits for the event of that submission. After the wait it calls `parseDeviceInfo(buffer, 0x200, &accelerator->deviceInfo)` and returns true whatever the content (no validation: even an all-zero buffer passes). Then `Accelerator::start` releases its lock and `registerService()`.

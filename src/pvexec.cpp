@@ -339,6 +339,57 @@ static bool heapEntry(uint32_t task, uint32_t ref, uint32_t &kind, void *desc, u
 	return PvExec::readGpu(task, entry[1], desc, len);
 }
 
+/* A function (kind 6) by its ref: {u64 code GPU address, u32 length, ...}. */
+static bool resolveFunction(uint32_t task, uint32_t ref, uint64_t &va, uint32_t &bytes)
+{
+	uint8_t d[12];
+	uint32_t kind;
+
+	if (!heapEntry(task, ref, kind, d, sizeof(d)) || kind != PvExec::kResourceFunction)
+		return false;
+
+	va = rd64(d);
+	bytes = rd32(d + 8);
+
+	return bytes != 0;
+}
+
+/*
+ * The render pipeline object (kind 7, type 0xe): {u32 0xe, u32 size, u32 own
+ * ref, u32 length, the serialized descriptor}. The descriptor starts with a
+ * count of entries {u8 key, u8 size, value}: key 1 is the vertex function's
+ * ref, key 2 the fragment function's (measured, card: a triangle's pipeline).
+ */
+bool PvExec::resolveRenderPipeline(uint32_t task, uint32_t ref, RenderPipeline &out)
+{
+	uint8_t d[64];
+	uint32_t kind, vertex = 0, fragment = 0, at;
+
+	if (!heapEntry(task, ref, kind, d, 0x14) || kind != kResourceObject || rd32(d) != kObjectRenderPipeline)
+		return false;
+
+	if (!heapEntry(task, ref, kind, d, rd32(d + 4) < sizeof(d) ? rd32(d + 4) : sizeof(d)))
+		return false;
+
+	at = 0x11;
+	for (uint32_t i = 0; i < d[0x10] && at + 2 <= sizeof(d); i++) {
+		const uint32_t key = d[at], size = d[at + 1];
+
+		if (at + 2 + size > sizeof(d))
+			return false;
+
+		if (size == 4 && key == 1)
+			vertex = rd32(d + at + 2);
+		else if (size == 4 && key == 2)
+			fragment = rd32(d + at + 2);
+
+		at += 2 + size;
+	}
+
+	return resolveFunction(task, vertex, out.vertexVa, out.vertexBytes) &&
+	       resolveFunction(task, fragment, out.fragmentVa, out.fragmentBytes);
+}
+
 bool PvExec::resolveTexture(uint32_t task, uint32_t ref, Texture &out)
 {
 	uint8_t d[0x58];
@@ -373,6 +424,24 @@ bool PvExec::resolveSurfaceTexture(uint32_t task, uint32_t ref, SurfaceTexture &
 	out.height = rd32(d + 0x1c);
 
 	return out.surface && out.width && out.height;
+}
+
+/*
+ * The sampler object (kind 7, type 3, 36 bytes): {u32 3, u32 size, u32 own
+ * ref, u64 packed state, ...}; the bundle's newSamplerStateWithDescriptor:
+ * packs MTLSamplerDescriptor's fields into the low word.
+ */
+bool PvExec::resolveSampler(uint32_t task, uint32_t ref, uint32_t &word)
+{
+	uint8_t d[0x14];
+	uint32_t kind;
+
+	if (!heapEntry(task, ref, kind, d, sizeof(d)) || kind != kResourceObject || rd32(d) != kObjectSampler)
+		return false;
+
+	word = rd32(d + 0xc);
+
+	return true;
 }
 
 /*

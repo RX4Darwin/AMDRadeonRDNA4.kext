@@ -37,6 +37,8 @@ constexpr uint32_t kResourceSurface = 5;    /* an IOSurface's texture, see Surfa
 constexpr uint32_t kResourceFunction = 6;    /* {u64 code GPU address, u32 length, ...} */
 constexpr uint32_t kResourceObject = 7;      /* createObject: {u32 type, u32 size, ...} */
 constexpr uint32_t kObjectComputePipeline = 0xb;
+constexpr uint32_t kObjectRenderPipeline = 0xe;
+constexpr uint32_t kObjectSampler = 0x3;
 
 /* Index into a node at `level` (0 = leaf) for a GPU address. */
 inline uint32_t indexAt(uint64_t va, uint32_t level)
@@ -94,8 +96,19 @@ struct SurfaceTexture {
 
 bool resolveSurfaceTexture(uint32_t task, uint32_t ref, SurfaceTexture &out);
 
+/* A sampler's packed state by its ref (kind 7, type 3: the word at 0xc). */
+bool resolveSampler(uint32_t task, uint32_t ref, uint32_t &word);
+
 /* A compute pipeline's function by the pipeline's ref: its metallib. */
 bool resolveComputePipeline(uint32_t task, uint32_t ref, uint64_t &codeVa, uint32_t &codeBytes);
+
+/* A render pipeline's vertex and fragment functions by the pipeline's ref: their metallibs. */
+struct RenderPipeline {
+	uint64_t vertexVa, fragmentVa;
+	uint32_t vertexBytes, fragmentBytes;
+};
+
+bool resolveRenderPipeline(uint32_t task, uint32_t ref, RenderPipeline &out);
 #endif
 
 } /* namespace PvExec */

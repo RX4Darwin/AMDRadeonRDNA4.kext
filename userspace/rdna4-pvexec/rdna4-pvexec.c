@@ -8,7 +8,9 @@
  *  compiles the AIR for gfx1201 (tools/metal/air/compile-metallib.sh, cached
  *  by the metallib and the threadgroup size), runs it on the card through
  *  the compute runtime with copies of the buffers, and writes them back into
- *  the client's memory. The kext completes the client's command buffer when
+ *  the client's memory. A draw's render pipeline is compiled into a vertex
+ *  and a fragment kernel (tools/metal/air/compile-pipeline.sh) that run it
+ *  as compute. The kext completes the client's command buffer when
  *  the job is done.
  *
  *    rdna4-pvexec [-s compile-metallib.sh] [-c cache dir] [-v]
@@ -276,7 +278,7 @@ static int moveBuffers(rdna4_t *gpu, const RDNA4PvJob *job, rdna4_buffer_t *gpuB
 		} else {
 			kr = rdna4_read(gpu, &gpuBufs[i], 0, host, b->length);
 			if (!kr)
-				kr = rdna4_pv_access(gpu, job->task, b->va, host, b->length, 1);
+				kr = rdna4_pv_access(gpu, job->task, b->va, host, b->length, RDNA4_PVACCESS_WRITE);
 		}
 
 		free(host);
@@ -287,6 +289,491 @@ static int moveBuffers(rdna4_t *gpu, const RDNA4PvJob *job, rdna4_buffer_t *gpuB
 	}
 
 	return 1;
+}
+
+/* ---- draws ------------------------------------------------------------------------------------------------- */
+
+/* A compiled render pipeline: its two kernels and what their ABIs say. */
+typedef struct {
+	char key[48];
+	rdna4_program_t vertex, fragment;
+	char vabi[MAX_KERNARGS][48];
+	char fabi[MAX_KERNARGS][48];
+	int nvabi, nfabi;
+	uint32_t stride, position;   /* bytes, from the vertex ABI */
+} pipeline_t;
+
+static pipeline_t gPipelines[MAX_PROGRAMS];
+static int gNumPipelines;
+
+/* Kernargs as LLVM lays them out: each at its own alignment. */
+typedef struct {
+	uint8_t bytes[RDNA4_MAX_KERNARG];
+	uint32_t at;
+	int full;
+} kernargs_t;
+
+static void put(kernargs_t *k, const void *v, uint32_t size)
+{
+	k->at = (k->at + size - 1) & ~(size - 1);
+
+	if (k->at + size > sizeof(k->bytes)) {
+		k->full = 1;
+		return;
+	}
+
+	memcpy(k->bytes + k->at, v, size);
+	k->at += size;
+}
+
+static void put32(kernargs_t *k, uint32_t v)
+{
+	put(k, &v, 4);
+}
+
+static void put64(kernargs_t *k, uint64_t v)
+{
+	put(k, &v, 8);
+}
+
+/* An ABI file of compile-pipeline.sh, one entry a line. */
+static int readLines(const char *dir, const char *file, char lines[][48], int *n)
+{
+	char path[512], line[96];
+	FILE *f;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, file);
+	f = fopen(path, "r");
+	if (!f)
+		return 0;
+
+	*n = 0;
+	while (*n < MAX_KERNARGS && fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\n")] = 0;
+		snprintf(lines[(*n)++], 48, "%s", line);
+	}
+
+	fclose(f);
+
+	return *n > 0;
+}
+
+/* A code object of the pipeline's directory, loaded by its entry point. */
+static int loadKernel(rdna4_t *gpu, const char *dir, const char *what, rdna4_program_t *prog)
+{
+	char path[512], name[128] = { 0 };
+	size_t bytes, nameBytes;
+	void *elf, *txt;
+	kern_return_t kr;
+
+	snprintf(path, sizeof(path), "%s/%s.name", dir, what);
+	txt = readFile(path, &nameBytes);
+	if (!txt)
+		return 0;
+
+	snprintf(name, sizeof(name), "%.*s", (int)nameBytes, (const char *)txt);
+	name[strcspn(name, "\n")] = 0;
+	free(txt);
+
+	snprintf(path, sizeof(path), "%s/%s.hsaco", dir, what);
+	elf = readFile(path, &bytes);
+	if (!elf)
+		return 0;
+
+	kr = rdna4_load(gpu, elf, bytes, name, prog);
+	free(elf);
+	if (kr)
+		fprintf(stderr, "rdna4-pvexec: %s %s: load: %s\n", dir, what, rdna4_error(kr));
+
+	return kr == 0;
+}
+
+/* compile-pipeline.sh VS FS DIR, beside the compute script; true when both code objects are there. */
+static int compilePipeline(const char *dir)
+{
+	char script[512], vs[512], fs[512], hsaco[512];
+	const char *slash = strrchr(gScript, '/');
+	struct stat st;
+	pid_t pid;
+	int status;
+
+	snprintf(hsaco, sizeof(hsaco), "%s/fragment.hsaco", dir);
+	if (stat(hsaco, &st) == 0)
+		return 1;
+
+	snprintf(script, sizeof(script), "%.*scompile-pipeline.sh", slash ? (int)(slash - gScript + 1) : 0, gScript);
+	snprintf(vs, sizeof(vs), "%s/vs.metallib", dir);
+	snprintf(fs, sizeof(fs), "%s/fs.metallib", dir);
+
+	pid = fork();
+	if (pid == 0) {
+		execl("/bin/sh", "sh", script, vs, fs, dir, (char *)NULL);
+		_exit(127);
+	}
+
+	if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status))
+		return 0;
+
+	return stat(hsaco, &st) == 0;
+}
+
+/* Read `bytes` of the client's memory at `va` into a buffer. */
+static uint8_t *guestCopy(rdna4_t *gpu, uint32_t task, uint64_t va, uint32_t bytes)
+{
+	uint8_t *p = bytes ? malloc(bytes) : NULL;
+
+	if (p && rdna4_pv_access(gpu, task, va, p, bytes, 0)) {
+		free(p);
+		return NULL;
+	}
+
+	return p;
+}
+
+/* The job's render pipeline, compiled (or found) and loaded. */
+static pipeline_t *pipeline(rdna4_t *gpu, const RDNA4PvJob *job)
+{
+	uint8_t *vs = guestCopy(gpu, job->task, job->codeVa, job->codeBytes);
+	uint8_t *fs = guestCopy(gpu, job->task, job->fragmentVa, job->fragmentBytes);
+	char key[48], dir[512], path[512];
+	pipeline_t *p = NULL;
+
+	if (!vs || !fs)
+		goto out;
+
+	snprintf(key, sizeof(key), "pipe-%016" PRIx64 "-%016" PRIx64, fnv1a(vs, job->codeBytes), fnv1a(fs, job->fragmentBytes));
+
+	for (int i = 0; i < gNumPipelines; i++) {
+		if (!strcmp(gPipelines[i].key, key)) {
+			p = &gPipelines[i];
+			goto out;
+		}
+	}
+
+	if (gNumPipelines == MAX_PROGRAMS)
+		goto out;
+
+	snprintf(dir, sizeof(dir), "%s/%s", gCache, key);
+	mkdir(gCache, 0755);
+	mkdir(dir, 0755);
+	snprintf(path, sizeof(path), "%s/vs.metallib", dir);
+	if (!writeFile(path, vs, job->codeBytes))
+		goto out;
+
+	snprintf(path, sizeof(path), "%s/fs.metallib", dir);
+	if (!writeFile(path, fs, job->fragmentBytes) || !compilePipeline(dir)) {
+		fprintf(stderr, "rdna4-pvexec: %s: does not compile (%s)\n", key, dir);
+		goto out;
+	}
+
+	p = &gPipelines[gNumPipelines];
+	memset(p, 0, sizeof(*p));
+	if (!readLines(dir, "vertex.abi", p->vabi, &p->nvabi) || !readLines(dir, "fragment.abi", p->fabi, &p->nfabi) ||
+	    !loadKernel(gpu, dir, "vertex", &p->vertex) || !loadKernel(gpu, dir, "fragment", &p->fragment)) {
+		p = NULL;
+		goto out;
+	}
+
+	for (int i = 0; i < p->nvabi; i++) {
+		sscanf(p->vabi[i], "stride %u", &p->stride);
+		sscanf(p->vabi[i], "position %u", &p->position);
+	}
+
+	snprintf(p->key, sizeof(p->key), "%s", key);
+	gNumPipelines++;
+	if (gVerbose)
+		printf("rdna4-pvexec: %s: vertex records of %u bytes\n", key, p->stride);
+
+out:
+	free(vs);
+	free(fs);
+
+	return p;
+}
+
+static const RDNA4PvBuffer *stageBuffer(const RDNA4PvJob *job, uint32_t stage, uint32_t slot)
+{
+	for (uint32_t i = 0; i < job->bufferCount; i++) {
+		if (job->buffers[i].stage == stage && job->buffers[i].slot == slot)
+			return &job->buffers[i];
+	}
+
+	return NULL;
+}
+
+/* A stage's "buffer SLOT" kernarg: the GPU copy of the buffer bound there. */
+static int putBuffer(kernargs_t *k, const char *line, const RDNA4PvJob *job, uint32_t stage, const rdna4_buffer_t *bufs)
+{
+	unsigned slot;
+	const RDNA4PvBuffer *b;
+
+	if (sscanf(line, "buffer %u", &slot) != 1)
+		return 0;
+
+	b = stageBuffer(job, stage, slot);
+	if (!b)
+		return 0;
+
+	put64(k, bufs[b - job->buffers].gpu);
+
+	return 1;
+}
+
+static int vertexArgs(const pipeline_t *p, const RDNA4PvJob *job, const rdna4_buffer_t *bufs, uint64_t out,
+                      uint32_t instance, kernargs_t *k)
+{
+	for (int i = 0; i < p->nvabi; i++) {
+		const char *l = p->vabi[i];
+
+		if (!strncmp(l, "buffer ", 7)) {
+			if (!putBuffer(k, l, job, RDNA4_PVJOB_VERTEX, bufs))
+				return 0;
+		} else if (!strcmp(l, "vertex")) {
+			put32(k, job->vertexStart);
+			put32(k, job->vertexCount);
+			put32(k, instance);
+		} else if (!strcmp(l, "out")) {
+			put64(k, out);
+		}
+	}
+
+	return !k->full;
+}
+
+/* A fragment function's "texture SLOT" or "sampler SLOT" kernarg: the descriptor uploaded for the slot. */
+static int putObject(kernargs_t *k, const char *line, const char *kind, const uint32_t *slots, uint32_t n,
+                     const rdna4_buffer_t *descs)
+{
+	unsigned slot;
+	char fmt[32];
+
+	snprintf(fmt, sizeof(fmt), "%s %%u", kind);
+	if (sscanf(line, fmt, &slot) != 1)
+		return 0;
+
+	for (uint32_t i = 0; i < n; i++) {
+		if (slots[i] == slot) {
+			put64(k, descs[i].gpu);
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static int fragmentArgs(const pipeline_t *p, const RDNA4PvJob *job, const rdna4_buffer_t *bufs,
+                        const rdna4_buffer_t *texDescs, const rdna4_buffer_t *samplers, uint64_t verts,
+                        uint64_t target, kernargs_t *k)
+{
+	uint32_t texSlots[RDNA4_PVJOB_MAX_TEXTURES], samplerSlots[RDNA4_PVJOB_MAX_SAMPLERS];
+
+	for (uint32_t i = 0; i < job->textureCount; i++)
+		texSlots[i] = job->textures[i].slot;
+
+	for (uint32_t i = 0; i < job->samplerCount; i++)
+		samplerSlots[i] = job->samplers[i].slot;
+
+	for (int i = 0; i < p->nfabi; i++) {
+		const char *l = p->fabi[i];
+
+		if (!strncmp(l, "buffer ", 7)) {
+			if (!putBuffer(k, l, job, RDNA4_PVJOB_FRAGMENT, bufs))
+				return 0;
+		} else if (!strncmp(l, "texture ", 8)) {
+			if (!putObject(k, l, "texture", texSlots, job->textureCount, texDescs))
+				return 0;
+		} else if (!strncmp(l, "sampler ", 8)) {
+			if (!putObject(k, l, "sampler", samplerSlots, job->samplerCount, samplers))
+				return 0;
+		} else if (!strcmp(l, "fragment")) {
+			put64(k, verts);
+			put32(k, p->stride / 4);
+			put32(k, p->position / 4);
+			put32(k, job->topology);
+			put32(k, job->vertexCount);
+			put64(k, target);
+			put32(k, job->targetPitch);
+			put32(k, job->targetWidth);
+			put32(k, job->targetHeight);
+			put32(k, job->targetFormat);
+			for (int v = 0; v < 4; v++)
+				put32(k, job->viewport[v]);
+			put32(k, job->blend);
+		}
+	}
+
+	return !k->full;
+}
+
+/* `bytes` of the client's memory at `va` (or the IOSurface) into a new VRAM buffer, through `host`. */
+static kern_return_t upload(rdna4_t *gpu, uint32_t task, uint64_t va, uint32_t flags, void *host, uint64_t bytes,
+                            rdna4_buffer_t *out)
+{
+	kern_return_t kr = rdna4_alloc(gpu, bytes, out);
+
+	if (!kr)
+		kr = rdna4_pv_access(gpu, task, va, host, bytes, flags);
+	if (!kr)
+		kr = rdna4_write(gpu, out, 0, host, bytes);
+
+	return kr;
+}
+
+/* rdna4raster.c's struct rdna4_texture. */
+typedef struct {
+	uint64_t data;
+	uint32_t width, height, pitch, format;
+} gpu_texture_t;
+
+/*
+ * A texture of the draw in VRAM (its texels and their descriptor), and a
+ * sampler's state word, as the fragment kernel reads them.
+ */
+static kern_return_t uploadTextures(rdna4_t *gpu, const RDNA4PvJob *job, rdna4_buffer_t *texels,
+                                    rdna4_buffer_t *descs, rdna4_buffer_t *samplers)
+{
+	kern_return_t kr = 0;
+
+	for (uint32_t i = 0; i < job->textureCount && !kr; i++) {
+		const RDNA4PvTexture *t = &job->textures[i];
+		const uint64_t bytes = (uint64_t)t->pitch * t->height;
+		void *host = bytes && bytes <= MAX_BUFFER_BYTES ? malloc(bytes) : NULL;
+		gpu_texture_t d;
+
+		if (!host)
+			return kIOReturnNoMemory;
+
+		kr = t->surface ? upload(gpu, t->surface, 0, RDNA4_PVACCESS_SURFACE, host, bytes, &texels[i])
+		                : upload(gpu, job->task, t->va, 0, host, bytes, &texels[i]);
+		free(host);
+
+		d = (gpu_texture_t){ texels[i].gpu, t->width, t->height, t->pitch, t->format };
+		if (!kr)
+			kr = rdna4_alloc(gpu, sizeof(d), &descs[i]);
+		if (!kr)
+			kr = rdna4_write(gpu, &descs[i], 0, &d, sizeof(d));
+	}
+
+	for (uint32_t i = 0; i < job->samplerCount && !kr; i++) {
+		kr = rdna4_alloc(gpu, 16, &samplers[i]);
+		if (!kr)
+			kr = rdna4_write(gpu, &samplers[i], 0, &job->samplers[i].word, 4);
+	}
+
+	return kr;
+}
+
+static void freeAll(rdna4_t *gpu, rdna4_buffer_t *bufs, uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		if (bufs[i].handle)
+			rdna4_free(gpu, &bufs[i]);
+	}
+}
+
+/*
+ * One draw: the bound buffers and the render target copied into VRAM (by the
+ * copy engine), per instance the vertex kernel over the vertices, then the
+ * fragment kernel over the target; the target back into the client.
+ */
+static uint32_t runDraw(rdna4_t *gpu, const RDNA4PvJob *job)
+{
+	rdna4_buffer_t bufs[RDNA4_PVJOB_MAX_BUFFERS] = { { 0 } }, verts = { 0 }, target = { 0 };
+	rdna4_buffer_t texels[RDNA4_PVJOB_MAX_TEXTURES] = { { 0 } }, texDescs[RDNA4_PVJOB_MAX_TEXTURES] = { { 0 } };
+	rdna4_buffer_t samplers[RDNA4_PVJOB_MAX_SAMPLERS] = { { 0 } };
+	const uint64_t targetBytes = (uint64_t)job->targetPitch * job->targetHeight;
+	const uint32_t vgroups[3] = { (job->vertexCount + 63) / 64, 1, 1 }, vsize[3] = { 64, 1, 1 };
+	const uint32_t fgroups[3] = { (job->targetWidth + 7) / 8, (job->targetHeight + 7) / 8, 1 }, fsize[3] = { 8, 8, 1 };
+	pipeline_t *p = pipeline(gpu, job);
+	const uint32_t targetFlags = job->targetSurface ? RDNA4_PVACCESS_SURFACE : 0;
+	const uint32_t targetTask = job->targetSurface ? job->targetSurface : job->task;
+	const uint64_t targetVa = job->targetSurface ? 0 : job->targetVa;
+	void *host = NULL;
+	uint64_t hostBytes = targetBytes;
+	uint32_t status = 1;
+	uint64_t us = 0;
+	kern_return_t kr;
+
+	if (!p || !targetBytes || targetBytes > MAX_BUFFER_BYTES) {
+		fprintf(stderr, "rdna4-pvexec: job %u: no pipeline, or a target of %" PRIu64 " bytes\n", job->id, targetBytes);
+		return status;
+	}
+
+	for (uint32_t i = 0; i < job->bufferCount; i++) {
+		if (job->buffers[i].length > hostBytes)
+			hostBytes = job->buffers[i].length;
+	}
+
+	host = hostBytes <= MAX_BUFFER_BYTES ? malloc(hostBytes) : NULL;
+	if (!host)
+		goto out;
+
+	for (uint32_t i = 0; i < job->bufferCount; i++) {
+		const RDNA4PvBuffer *b = &job->buffers[i];
+
+		kr = upload(gpu, job->task, b->va, 0, host, b->length, &bufs[i]);
+		if (kr) {
+			fprintf(stderr, "rdna4-pvexec: job %u: buffer %u (%" PRIu64 " bytes): %s\n", job->id, b->slot, b->length,
+			        rdna4_error(kr));
+			goto out;
+		}
+	}
+
+	kr = uploadTextures(gpu, job, texels, texDescs, samplers);
+	if (kr) {
+		fprintf(stderr, "rdna4-pvexec: job %u: textures or samplers: %s\n", job->id, rdna4_error(kr));
+		goto out;
+	}
+
+	kr = rdna4_alloc(gpu, (uint64_t)p->stride * job->vertexCount, &verts);
+	if (!kr)
+		kr = upload(gpu, targetTask, targetVa, targetFlags, host, targetBytes, &target);
+	if (kr) {
+		fprintf(stderr, "rdna4-pvexec: job %u: vertices or target (%" PRIu64 " bytes): %s\n", job->id, targetBytes,
+		        rdna4_error(kr));
+		goto out;
+	}
+
+	for (uint32_t instance = 0; instance < job->instanceCount; instance++) {
+		kernargs_t va = { .at = 0 }, fa = { .at = 0 };
+
+		if (!vertexArgs(p, job, bufs, verts.gpu, instance, &va) ||
+		    !fragmentArgs(p, job, bufs, texDescs, samplers, verts.gpu, target.gpu, &fa)) {
+			fprintf(stderr, "rdna4-pvexec: job %u: a kernel argument has no buffer bound\n", job->id);
+			goto out;
+		}
+
+		kr = rdna4_dispatch(gpu, &p->vertex, vgroups, vsize, va.bytes, va.at, DISPATCH_TIMEOUT_MS, &us);
+		if (!kr)
+			kr = rdna4_dispatch(gpu, &p->fragment, fgroups, fsize, fa.bytes, fa.at, DISPATCH_TIMEOUT_MS, &us);
+		if (kr) {
+			fprintf(stderr, "rdna4-pvexec: job %u: draw: %s\n", job->id, rdna4_error(kr));
+			goto out;
+		}
+	}
+
+	kr = rdna4_read(gpu, &target, 0, host, targetBytes);
+	if (!kr)
+		kr = rdna4_pv_access(gpu, targetTask, targetVa, host, targetBytes, targetFlags | RDNA4_PVACCESS_WRITE);
+	if (kr)
+		fprintf(stderr, "rdna4-pvexec: job %u: target back: %s\n", job->id, rdna4_error(kr));
+	else
+		status = 0;
+
+	if (gVerbose)
+		printf("rdna4-pvexec: job %u: %s, %u vertices into %ux%u (%s), %" PRIu64 " us\n", job->id, p->key,
+		       job->vertexCount, job->targetWidth, job->targetHeight, job->targetSurface ? "IOSurface" : "texture", us);
+
+out:
+	freeAll(gpu, bufs, job->bufferCount);
+	freeAll(gpu, texels, RDNA4_PVJOB_MAX_TEXTURES);
+	freeAll(gpu, texDescs, RDNA4_PVJOB_MAX_TEXTURES);
+	freeAll(gpu, samplers, RDNA4_PVJOB_MAX_SAMPLERS);
+	freeAll(gpu, &verts, 1);
+	freeAll(gpu, &target, 1);
+	free(host);
+
+	return status;
 }
 
 /* One job: 0 when it ran. */
@@ -300,6 +787,9 @@ static uint32_t runJob(rdna4_t *gpu, const RDNA4PvJob *job)
 	uint64_t us = 0;
 	uint32_t status = 1;
 	kern_return_t kr;
+
+	if (job->kind == RDNA4_PVJOB_DRAW)
+		return runDraw(gpu, job);
 
 	if (job->codeBytes && job->codeBytes <= RDNA4_PVJOB_MAX_CODE)
 		code = malloc(job->codeBytes);

@@ -125,7 +125,7 @@ kern_return_t rdna4_restore(rdna4_t *dev);
  * memory by its GPU address, and the end of a job (status 0 = it ran). */
 kern_return_t rdna4_pv_next(rdna4_t *dev, uint32_t timeoutMs, RDNA4PvJob *out);
 kern_return_t rdna4_pv_access(rdna4_t *dev, uint32_t task, uint64_t va, void *mem, uint64_t bytes,
-                              int write);
+                              uint32_t flags);
 kern_return_t rdna4_pv_done(rdna4_t *dev, uint32_t id, uint32_t status);
 
 const char *rdna4_error(kern_return_t kr);

@@ -95,7 +95,8 @@ enum {
 	/* PVGPU builds, the paravirtual host's compiler service (include/rdna4pvjob.h):
 	 * timeout milliseconds -> struct out RDNA4PvJob, the next compute dispatch */
 	kRDNA4MethodPvNext,
-	/* task, GPU address in the task, user address, length, 1 = write: the client's memory */
+	/* task (or IOSurface ID), GPU address in the task (or offset), user address, length,
+	 * RDNA4_PVACCESS_* flags: the client's memory */
 	kRDNA4MethodPvAccess,
 	/* job id, status (0 = done): the host completes the client's command buffer */
 	kRDNA4MethodPvDone,

@@ -153,6 +153,40 @@ void PvSurface::start()
 	lilu.onKextLoadForce(&kextSurface, 1, processSurface, nullptr);
 }
 
+bool PvSurface::access(uint32_t id, uint64_t offset, void *buf, uint64_t len, bool write)
+{
+	OSObject *s = lookup(id);
+	IOMemoryDescriptor *md;
+	bool ok = false;
+
+	if (!s)
+		return false;
+
+	md = getDescriptor(s);
+	if (md && offset <= md->getLength() && len <= md->getLength() - offset && md->prepare() == kIOReturnSuccess) {
+		ok = (write ? md->writeBytes(offset, buf, len) : md->readBytes(offset, buf, len)) == len;
+		md->complete();
+	}
+
+	s->release();
+
+	return ok;
+}
+
+uint32_t PvSurface::bytesPerRow(uint32_t id)
+{
+	OSObject *s = lookup(id);
+	size_t n;
+
+	if (!s)
+		return 0;
+
+	n = getBytesPerRow(s);
+	s->release();
+
+	return static_cast<uint32_t>(n);
+}
+
 bool PvSurface::fill(uint32_t id, uint32_t width, uint32_t height, uint32_t pixel)
 {
 	OSObject *s = lookup(id);

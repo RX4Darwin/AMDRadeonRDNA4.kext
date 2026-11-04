@@ -34,13 +34,39 @@ struct Stats {
 	uint32_t firstSkipped;
 };
 
-/* A compute encoder's state between commands: the pipeline and the buffers bound by slot. */
-struct Compute {
-	uint32_t pipeline;
-	bool havePipeline;
+/* Buffers bound by slot. */
+struct Bindings {
 	uint32_t bound;     /* bit per slot */
 	uint32_t ref[RDNA4_PVJOB_MAX_BUFFERS];
 	uint64_t offset[RDNA4_PVJOB_MAX_BUFFERS];
+};
+
+/* A compute encoder's state between commands: the pipeline and the buffers. */
+struct Compute {
+	uint32_t pipeline;
+	bool havePipeline;
+	Bindings buffers;
+};
+
+/* Objects bound by slot: textures or samplers. */
+struct Refs {
+	uint32_t bound;
+	uint32_t ref[RDNA4_PVJOB_MAX_TEXTURES];
+};
+
+/* A render encoder's: the pipeline, both stages' buffers, the fragment textures and samplers, colour attachment 0. */
+struct Render {
+	uint32_t pipeline;
+	bool havePipeline;
+	uint32_t target;    /* texture ref, 0 = none */
+	Bindings vertex, fragment;
+	Refs textures, samplers;
+};
+
+/* A segment's encoder, whichever kind it is. */
+struct Encoder {
+	Compute compute;
+	Render render;
 };
 
 /* How long a dispatch may take the service, compiling included. */
@@ -166,8 +192,8 @@ bool copyBuffer(uint32_t task, const uint8_t *p, uint32_t size)
 	return copy(task, src + srcOff, dst + dstOff, len);
 }
 
-/* setBuffers: {u32 first slot, u32 count, count x {u32 ref, u64 offset}} */
-bool setBuffers(Compute &c, const uint8_t *p, uint32_t size)
+/* setBuffers (any stage): {u32 first slot, u32 count, count x {u32 ref, u64 offset}} */
+bool setBuffers(Bindings &c, const uint8_t *p, uint32_t size)
 {
 	const uint32_t first = size >= 8 ? rd32(p) : 0;
 	const uint32_t count = size >= 8 ? rd32(p + 4) : 0;
@@ -185,7 +211,7 @@ bool setBuffers(Compute &c, const uint8_t *p, uint32_t size)
 }
 
 /* setBufferOffset:atIndex: {u32 slot, u64 offset} */
-bool setBufferOffset(Compute &c, const uint8_t *p, uint32_t size)
+bool setBufferOffset(Bindings &c, const uint8_t *p, uint32_t size)
 {
 	const uint32_t slot = size >= 12 ? rd32(p) : RDNA4_PVJOB_MAX_BUFFERS;
 
@@ -197,8 +223,25 @@ bool setBufferOffset(Compute &c, const uint8_t *p, uint32_t size)
 	return true;
 }
 
+/* setTextures / setSamplerStates: {u32 first slot, u32 count, count x u32 ref} */
+bool setRefs(Refs &r, const uint8_t *p, uint32_t size)
+{
+	const uint32_t first = size >= 8 ? rd32(p) : 0;
+	const uint32_t count = size >= 8 ? rd32(p + 4) : 0;
+
+	if (size < 8 || first + count > RDNA4_PVJOB_MAX_TEXTURES || size < 8 + 4 * count)
+		return false;
+
+	for (uint32_t i = 0; i < count; i++) {
+		r.ref[first + i] = rd32(p + 8 + 4 * i);
+		r.bound |= 1u << (first + i);
+	}
+
+	return true;
+}
+
 /* The bound buffers into the job, by slot, each from its offset to its end. */
-bool bindBuffers(uint32_t task, const Compute &c, RDNA4PvJob &job)
+bool bindBuffers(uint32_t task, const Bindings &c, uint32_t stage, RDNA4PvJob &job)
 {
 	for (uint32_t slot = 0; slot < RDNA4_PVJOB_MAX_BUFFERS; slot++) {
 		RDNA4PvBuffer &b = job.buffers[job.bufferCount];
@@ -207,10 +250,12 @@ bool bindBuffers(uint32_t task, const Compute &c, RDNA4PvJob &job)
 		if (!(c.bound & (1u << slot)))
 			continue;
 
-		if (!PvExec::resolveBuffer(task, c.ref[slot], va, len) || c.offset[slot] > len)
+		if (job.bufferCount == RDNA4_PVJOB_MAX_BUFFERS ||
+		    !PvExec::resolveBuffer(task, c.ref[slot], va, len) || c.offset[slot] > len)
 			return false;
 
 		b.slot = slot;
+		b.stage = stage;
 		b.va = va + c.offset[slot];
 		b.length = len - c.offset[slot];
 		job.bufferCount++;
@@ -249,7 +294,7 @@ bool dispatch(uint32_t task, const Compute &c, const uint8_t *p, uint32_t size, 
 		job.groupSize[d] = static_cast<uint32_t>(tg);
 	}
 
-	if (!bindBuffers(task, c, job))
+	if (!bindBuffers(task, c.buffers, RDNA4_PVJOB_VERTEX, job))
 		return false;
 
 	return PvJob::run(job, kDispatchTimeoutMs);
@@ -267,10 +312,10 @@ bool runCompute(uint32_t task, Compute &c, uint32_t id, const uint8_t *p, uint32
 		c.havePipeline = ok;
 		break;
 	case PvRun::kSetBuffers:
-		ok = setBuffers(c, p, size);
+		ok = setBuffers(c.buffers, p, size);
 		break;
 	case PvRun::kSetBufferOffset:
-		ok = setBufferOffset(c, p, size);
+		ok = setBufferOffset(c.buffers, p, size);
 		break;
 	case PvRun::kComputeBarrier:
 		ok = true;   /* the service runs one dispatch after the other */
@@ -346,6 +391,22 @@ bool fillTexture(uint32_t task, const PvExec::Texture &t, uint32_t pixel)
 	return ok;
 }
 
+/* The bits of a float of value `v` (a pixel count), built without the FPU. */
+uint32_t floatBits(uint32_t v)
+{
+	uint32_t exp = 127 + 31;
+
+	if (!v)
+		return 0;
+
+	while (!(v & 0x80000000u)) {
+		v <<= 1;
+		exp--;
+	}
+
+	return exp << 23 | ((v >> 8) & 0x7fffff);
+}
+
 /* Clear the texture `ref` names, in the client's memory or on an IOSurface. */
 bool clearAttachment(uint32_t task, uint32_t ref, const uint8_t *rgba)
 {
@@ -369,9 +430,12 @@ bool clearAttachment(uint32_t task, uint32_t ref, const uint8_t *rgba)
  * u32 options, double clear colour[4]} (measured, card). The clears run
  * here; drawing is not done yet.
  */
-bool renderPass(uint32_t task, const uint8_t *p, uint32_t size)
+bool renderPass(uint32_t task, Render &r, const uint8_t *p, uint32_t size)
 {
 	bool ok = true;
+
+	if (size >= PvRun::kFirstAttachment + 4)
+		r.target = rd32(p + PvRun::kFirstAttachment);
 
 	for (uint32_t i = 0; i < PvRun::kColourAttachments; i++) {
 		const uint8_t *a = p + PvRun::kFirstAttachment + i * PvRun::kAttachmentBytes;
@@ -427,13 +491,172 @@ bool copyTextureToBuffer(uint32_t task, const uint8_t *p, uint32_t size)
 	return ok;
 }
 
-/* One render command: true when it was run. */
-bool runRender(uint32_t task, uint32_t id, const uint8_t *p, uint32_t size, Stats &s)
+/* A texture in the client's memory or an IOSurface, for the job. */
+bool describeTexture(uint32_t task, uint32_t ref, RDNA4PvTexture &t)
 {
-	if (id != PvRun::kRenderPass)
+	PvExec::Texture tex;
+	PvExec::SurfaceTexture st;
+
+	if (PvExec::resolveTexture(task, ref, tex)) {
+		t.va = tex.va;
+		t.pitch = static_cast<uint32_t>(tex.bytesPerRow);
+		t.width = tex.width;
+		t.height = tex.height;
+		t.format = tex.format;
+		return true;
+	}
+
+	if (!PvExec::resolveSurfaceTexture(task, ref, st))
 		return false;
 
-	if (renderPass(task, p, size))
+	t.surface = st.surface;
+	t.pitch = PvSurface::bytesPerRow(st.surface);
+	t.width = st.width;
+	t.height = st.height;
+	t.format = st.format;
+
+	return t.pitch != 0;
+}
+
+/* The fragment textures and samplers bound by slot, into the job. */
+bool bindTextures(uint32_t task, const Render &r, RDNA4PvJob &job)
+{
+	for (uint32_t slot = 0; slot < RDNA4_PVJOB_MAX_TEXTURES; slot++) {
+		if (r.textures.bound & (1u << slot)) {
+			RDNA4PvTexture &t = job.textures[job.textureCount++];
+
+			t.slot = slot;
+			if (!describeTexture(task, r.textures.ref[slot], t))
+				return false;
+		}
+
+		if (r.samplers.bound & (1u << slot)) {
+			RDNA4PvSampler &sm = job.samplers[job.samplerCount++];
+
+			sm.slot = slot;
+			if (!PvExec::resolveSampler(task, r.samplers.ref[slot], sm.word))
+				return false;
+		}
+	}
+
+	return true;
+}
+
+/* The draw's render target, colour attachment 0: a texture in the client's memory or an IOSurface. */
+bool drawTarget(uint32_t task, uint32_t ref, RDNA4PvJob &job)
+{
+	RDNA4PvTexture t {};
+
+	if (!describeTexture(task, ref, t))
+		return false;
+
+	job.targetVa = t.va;
+	job.targetSurface = t.surface;
+	job.targetPitch = t.pitch;
+	job.targetWidth = t.width;
+	job.targetHeight = t.height;
+	job.targetFormat = t.format;
+
+	return true;
+}
+
+/*
+ * A draw of `count` vertices from `start`, run by the compiler service with
+ * the encoder's pipeline and buffers into colour attachment 0, over the whole
+ * target (no viewport command yet).
+ */
+bool draw(uint32_t task, const Render &r, uint32_t topology, uint64_t start, uint64_t count, uint64_t instances)
+{
+	RDNA4PvJob job {};
+	PvExec::RenderPipeline pl;
+
+	if (!r.havePipeline || !r.target || !count || !instances || start + count > 0xffffffffull)
+		return false;
+
+	if (!PvExec::resolveRenderPipeline(task, r.pipeline, pl) || pl.vertexBytes > RDNA4_PVJOB_MAX_CODE ||
+	    pl.fragmentBytes > RDNA4_PVJOB_MAX_CODE || !drawTarget(task, r.target, job))
+		return false;
+
+	job.kind = RDNA4_PVJOB_DRAW;
+	job.task = task;
+	job.codeVa = pl.vertexVa;
+	job.codeBytes = pl.vertexBytes;
+	job.fragmentVa = pl.fragmentVa;
+	job.fragmentBytes = pl.fragmentBytes;
+	job.topology = topology;
+	job.vertexStart = static_cast<uint32_t>(start);
+	job.vertexCount = static_cast<uint32_t>(count);
+	job.instanceCount = static_cast<uint32_t>(instances);
+	job.viewport[2] = floatBits(job.targetWidth);
+	job.viewport[3] = floatBits(job.targetHeight);
+
+	if (!bindBuffers(task, r.vertex, RDNA4_PVJOB_VERTEX, job) ||
+	    !bindBuffers(task, r.fragment, RDNA4_PVJOB_FRAGMENT, job) || !bindTextures(task, r, job))
+		return false;
+
+	return PvJob::run(job, kDispatchTimeoutMs);
+}
+
+/*
+ * drawPrimitives: 0x000 {u32 type, u64 start, u64 count}, 0x001 {u32 type, u16
+ * start, u16 count}, 0x002 {u64 start, count, instances, u16 type}, 0x003
+ * {u16 start, count, instances, type} (docs/m1-opcodes.md).
+ */
+bool drawPrimitives(uint32_t task, const Render &r, uint32_t id, const uint8_t *p, uint32_t size)
+{
+	auto u16 = [&](uint32_t off) { return static_cast<uint32_t>(p[off] | p[off + 1] << 8); };
+
+	switch (id) {
+	case PvRun::kDraw:
+		return size >= 20 && draw(task, r, rd32(p), rd64(p + 4), rd64(p + 12), 1);
+	case PvRun::kDrawShort:
+		return size >= 8 && draw(task, r, rd32(p), u16(4), u16(6), 1);
+	case PvRun::kDrawInstanced:
+		return size >= 26 && draw(task, r, u16(24), rd64(p), rd64(p + 8), rd64(p + 16));
+	case PvRun::kDrawInstancedShort:
+		return size >= 8 && draw(task, r, u16(6), u16(0), u16(2), u16(4));
+	default:
+		return false;
+	}
+}
+
+/* One render command: true when it was run. */
+bool runRender(uint32_t task, Render &r, uint32_t id, const uint8_t *p, uint32_t size, Stats &s)
+{
+	bool ok;
+
+	switch (id) {
+	case PvRun::kRenderPass:
+		ok = renderPass(task, r, p, size);
+		break;
+	case PvRun::kSetRenderPipeline:
+		ok = size >= 4;
+		r.pipeline = ok ? rd32(p) : 0;
+		r.havePipeline = ok;
+		break;
+	case PvRun::kSetVertexBuffers:
+		ok = setBuffers(r.vertex, p, size);
+		break;
+	case PvRun::kSetFragmentBuffers:
+		ok = setBuffers(r.fragment, p, size);
+		break;
+	case PvRun::kSetFragmentTextures:
+		ok = setRefs(r.textures, p, size);
+		break;
+	case PvRun::kSetFragmentSamplers:
+		ok = setRefs(r.samplers, p, size);
+		break;
+	case PvRun::kDraw:
+	case PvRun::kDrawShort:
+	case PvRun::kDrawInstanced:
+	case PvRun::kDrawInstancedShort:
+		ok = drawPrimitives(task, r, id, p, size);
+		break;
+	default:
+		return false;
+	}
+
+	if (ok)
 		s.done++;
 	else
 		s.failed++;
@@ -472,25 +695,29 @@ bool runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t size, Stats 
 }
 
 /* One command of a segment: true when it was run (or failed running). */
-bool runCommand(uint32_t task, uint8_t type, Compute &c, uint32_t id, const uint8_t *p, uint32_t size, Stats &s)
+bool runCommand(uint32_t task, uint8_t type, Encoder &e, uint32_t id, const uint8_t *p, uint32_t size, Stats &s)
 {
 	if (type == PvRun::kBlit)
 		return runBlit(task, id, p, size, s);
 
 	if (type == PvRun::kCompute)
-		return runCompute(task, c, id, p, size, s);
+		return runCompute(task, e.compute, id, p, size, s);
 
 	if (type == PvRun::kRender)
-		return runRender(task, id, p, size, s);
+		return runRender(task, e.render, id, p, size, s);
 
 	return false;
 }
 
-/* The commands of one segment; a compute segment starts with nothing bound. */
+/* The commands of one segment; an encoder starts with nothing bound. */
 void runSegment(uint32_t task, uint8_t type, const uint8_t *p, uint32_t len, Stats &s)
 {
-	Compute c {};
+	auto *e = static_cast<Encoder *>(IOMallocZero(sizeof(Encoder)));
 	uint32_t at = 0;
+
+	if (!e)
+		return;
+
 
 	while (at + kCommandHeader <= len) {
 		const uint32_t id = rd32(p + at);
@@ -499,13 +726,15 @@ void runSegment(uint32_t task, uint8_t type, const uint8_t *p, uint32_t len, Sta
 		if (size < kCommandHeader || size > len - at)
 			break;
 
-		if (!runCommand(task, type, c, id, p + at + kCommandHeader, size - kCommandHeader, s)) {
+		if (!runCommand(task, type, *e, id, p + at + kCommandHeader, size - kCommandHeader, s)) {
 			if (!s.skipped++)
 				s.firstSkipped = id;
 		}
 
 		at += size;
 	}
+
+	IOFree(e, sizeof(Encoder));
 }
 
 void runBuffer(uint32_t task, const uint8_t *buf, uint32_t len, Stats &s)

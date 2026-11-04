@@ -72,8 +72,8 @@ kern_return_t rdna4_pv_next(rdna4_t *dev, uint32_t timeoutMs, RDNA4PvJob *out) {
 }
 
 kern_return_t rdna4_pv_access(rdna4_t *dev, uint32_t task, uint64_t va, void *mem, uint64_t bytes,
-                              int write) {
-	uint64_t input[5] = { task, va, (uint64_t)(uintptr_t)mem, bytes, write ? 1u : 0u };
+                              uint32_t flags) {
+	uint64_t input[5] = { task, va, (uint64_t)(uintptr_t)mem, bytes, flags };
 
 	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodPvAccess, input, 5, NULL, NULL);
 }

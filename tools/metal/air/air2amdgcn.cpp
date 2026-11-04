@@ -20,6 +20,12 @@
 //     computed in a prologue from workgroup id, workitem id and the hidden grid size; a simdgroup is one wave32;
 //   * threadgroup memory = the module's addrspace(3) globals (static LDS), unchanged.
 //   --abi FILE writes the kernargs in order, one line each: "buffer SLOT", "grid", "threadgroup SLOT" (SLOT = the argument's [[buffer(n)]]).
+//
+//   air2amdgcn vertex   IN -o OUT.ll --abi OUT.abi                            a vertex function as a kernel that writes its outputs per vertex
+//   air2amdgcn fragment IN --vertex-abi V.abi -o OUT.ll --abi OUT.abi         a fragment function inside a kernel that rasterizes the draw
+//   (render stages as compute: see lowerVertex/lowerFragment; the fragment kernel is linked with rdna4raster.ll)
+#include <fstream>
+#include <sstream>
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Constants.h"
@@ -470,6 +476,22 @@ std::unique_ptr<Module> remapConstantSpace(std::unique_ptr<Module> M, LLVMContex
 	return R;
 }
 
+// What every kernel of this compiler declares: its fixed threadgroup size, flushed f32 denormals (air.compile.denorms_disable) and the
+// inputs it does without. llc does not run AMDGPU's attributor: say what this ABI never uses, or the kernel asks the CP for dispatch/queue
+// pointers and an implicit-arg block (user SGPRs 8 instead of 2). Workgroup ids, workitem ids and the kernarg pointer are the only inputs.
+void kernelAttributes(Function *NF, const unsigned tg[3]) {
+	LLVMContext &C = NF->getContext();
+	auto i32 = [&](unsigned v) { return ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(C), v)); };
+	NF->addFnAttr("amdgpu-flat-work-group-size", std::to_string(tg[0] * tg[1] * tg[2]) + "," + std::to_string(tg[0] * tg[1] * tg[2]));
+	NF->setMetadata("reqd_work_group_size", MDNode::get(C, {i32(tg[0]), i32(tg[1]), i32(tg[2])}));
+	NF->addFnAttr("denormal-fp-math-f32", "preserve-sign,preserve-sign");
+	for (const char *a : {"amdgpu-no-dispatch-ptr", "amdgpu-no-queue-ptr", "amdgpu-no-dispatch-id", "amdgpu-no-implicitarg-ptr", "amdgpu-no-heap-ptr",
+	                      "amdgpu-no-hostcall-ptr", "amdgpu-no-multigrid-sync-arg", "amdgpu-no-completion-action", "amdgpu-no-default-queue",
+	                      "amdgpu-no-lds-kernel-id"})
+		NF->addFnAttr(a);
+	NF->addFnAttr("uniform-work-group-size", "false");
+}
+
 bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::string &err, Stats &st) {
 	LLVMContext &C = M.getContext();
 	NamedMDNode *nk = M.getNamedMetadata("air.kernel");
@@ -651,16 +673,439 @@ bool lowerKernel(Module &M, const std::string &entryName, unsigned tg[3], std::s
 		NF->removeParamAttr(i, "air-buffer-no-alias");
 	NF->removeFnAttr("frame-pointer");
 	NF->removeFnAttr(Attribute::Convergent);
-	NF->addFnAttr("amdgpu-flat-work-group-size", std::to_string(tg[0] * tg[1] * tg[2]) + "," + std::to_string(tg[0] * tg[1] * tg[2]));
-	NF->setMetadata("reqd_work_group_size", MDNode::get(C, {ConstantAsMetadata::get(B.getInt32(tg[0])), ConstantAsMetadata::get(B.getInt32(tg[1])), ConstantAsMetadata::get(B.getInt32(tg[2]))}));
-	NF->addFnAttr("denormal-fp-math-f32", "preserve-sign,preserve-sign");   // air.compile.denorms_disable
-	// llc does not run AMDGPU's attributor: say what this ABI never uses, or the kernel asks the CP for dispatch/queue pointers and an
-	// implicit-arg block (user SGPRs 8 instead of 2). Workgroup ids, workitem ids and the kernarg pointer are the only inputs.
-	for (const char *a : {"amdgpu-no-dispatch-ptr", "amdgpu-no-queue-ptr", "amdgpu-no-dispatch-id", "amdgpu-no-implicitarg-ptr", "amdgpu-no-heap-ptr",
-	                      "amdgpu-no-hostcall-ptr", "amdgpu-no-multigrid-sync-arg", "amdgpu-no-completion-action", "amdgpu-no-default-queue",
-	                      "amdgpu-no-lds-kernel-id"})
-		NF->addFnAttr(a);
-	NF->addFnAttr("uniform-work-group-size", "false");
+	kernelAttributes(NF, tg);
+	return true;
+}
+
+// ---- render stages: a draw as compute kernels -------------------------------------------------------------------------------------------------
+//
+// A vertex function becomes a kernel that runs it once per vertex and stores what it returns as a record; a fragment function becomes a
+// kernel of one thread per pixel of the render target that rasterizes the draw's triangles from those records (rdna4raster.c, linked in by
+// the compiler service) and calls it for every triangle covering the pixel. The AIR function itself stays as it is, internal, and is
+// inlined into its kernel.
+
+// One entry of a stage's argument or output list: !{[i32 index,] !"kind", [!"key",] flags...}.
+struct StageItem {
+	std::string kind, key, name;
+	unsigned aspace = 0, slot = 0;
+	unsigned interp = 0;    // rdna4raster.c: 0 perspective, 1 linear (air.no_perspective), 2 flat
+};
+
+StageItem parseStageItem(const MDNode *n, unsigned first) {
+	StageItem a;
+	a.kind = str(n->getOperand(first));
+	if ((a.kind == "air.vertex_output" || a.kind == "air.fragment_input") && n->getNumOperands() > first + 1)
+		a.key = str(n->getOperand(first + 1));
+	for (unsigned i = first + 1; i < n->getNumOperands(); i++) {
+		const std::string k = str(n->getOperand(i));
+		auto num = [&]() -> unsigned {
+			if (i + 1 < n->getNumOperands())
+				if (auto *c = mdconst::dyn_extract<ConstantInt>(n->getOperand(i + 1)))
+					return c->getZExtValue();
+			return 0;
+		};
+		if (k == "air.address_space")
+			a.aspace = num();
+		else if (k == "air.location_index")
+			a.slot = num();
+		else if (k == "air.arg_name" && i + 1 < n->getNumOperands())
+			a.name = str(n->getOperand(i + 1));
+		else if (k == "air.flat")
+			a.interp = 2;
+		else if (k == "air.no_perspective")
+			a.interp = 1;
+	}
+	return a;
+}
+
+// The stage's function and its argument and output lists, from !air.vertex or !air.fragment.
+Function *stageEntry(Module &M, const char *md, std::vector<StageItem> &args, std::vector<StageItem> &outs, std::string &err) {
+	NamedMDNode *nm = M.getNamedMetadata(md);
+	if (!nm || !nm->getNumOperands()) {
+		err = std::string("no ") + md + " metadata";
+		return nullptr;
+	}
+	MDNode *e = nm->getOperand(0);
+	auto *F = mdconst::dyn_extract<Function>(e->getOperand(0));
+	if (!F) {
+		err = std::string(md) + " names no function";
+		return nullptr;
+	}
+	for (const MDOperand &o : cast<MDNode>(e->getOperand(1))->operands())
+		outs.push_back(parseStageItem(cast<MDNode>(o), 0));
+	for (const MDOperand &o : cast<MDNode>(e->getOperand(2))->operands())
+		args.push_back(parseStageItem(cast<MDNode>(o), 1));
+	if (args.size() != F->arg_size()) {
+		err = "argument metadata count != function arguments";
+		return nullptr;
+	}
+	for (size_t i = 0; i < args.size(); i++) {
+		auto *pt = dyn_cast<PointerType>(F->getArg(i)->getType());
+		if (args[i].kind == "air.buffer" && !args[i].aspace && pt)
+			args[i].aspace = pt->getAddressSpace();
+		if (args[i].kind == "air.buffer" && args[i].aspace != kAirDevice && args[i].aspace != kAirConstant) {
+			err = "buffer argument " + args[i].name + " in AIR address space " + std::to_string(args[i].aspace);
+			return nullptr;
+		}
+	}
+	return F;
+}
+
+unsigned components(Type *T);
+
+bool isResource(const StageItem &a) {
+	return a.kind == "air.buffer" || a.kind == "air.texture" || a.kind == "air.sampler";
+}
+
+// The stage's resources as kernel parameters (and ABI lines), in argument order: buffers, and textures and samplers as pointers to what
+// the runtime describes them with (rdna4raster.c: an rdna4_texture in global memory, the packed sampler state in constant memory).
+void resourceParams(LLVMContext &C, const std::vector<StageItem> &args, std::vector<Type *> &params, Stats &st) {
+	for (const StageItem &a : args) {
+		if (a.kind == "air.buffer") {
+			params.push_back(PointerType::get(C, a.aspace == kAirDevice ? kAmdGlobal : kAmdConstant));
+			st.abi.push_back("buffer " + std::to_string(a.slot));
+		} else if (a.kind == "air.texture") {
+			params.push_back(PointerType::get(C, kAmdGlobal));
+			st.abi.push_back("texture " + std::to_string(a.slot));
+		} else if (a.kind == "air.sampler") {
+			params.push_back(PointerType::get(C, kAmdConstant));
+			st.abi.push_back("sampler " + std::to_string(a.slot));
+		}
+	}
+}
+
+// air.sample_texture_2d.* (texture, sampler, coordinate, ...) -> {colour, i8}: rdna4_sample_2d of rdna4raster.c, level 0, offsets, bias
+// and level of detail left out.
+void lowerSampling(Module &M, Function &F) {
+	LLVMContext &C = M.getContext();
+	Type *f32 = Type::getFloatTy(C), *v4f = FixedVectorType::get(f32, 4);
+	auto sample = M.getOrInsertFunction("rdna4_sample_2d", FunctionType::get(v4f, {PointerType::get(C, kAmdGlobal), PointerType::get(C, kAmdConstant),
+	                                                                            FixedVectorType::get(f32, 2)}, false));
+	SmallVector<CallInst *, 8> calls;
+	for (Instruction &I : instructions(F))
+		if (auto *CI = dyn_cast<CallInst>(&I))
+			if (Function *callee = CI->getCalledFunction())
+				if (callee->getName().starts_with("air.sample_texture_2d."))
+					calls.push_back(CI);
+	for (CallInst *CI : calls) {
+		auto *RT = dyn_cast<StructType>(CI->getType());
+		if (!RT || RT->getNumElements() != 2 || components(RT->getElementType(0)) != 4)
+			continue;
+		IRBuilder<> B(CI);
+		Value *v = B.CreateCall(sample, {CI->getArgOperand(0), CI->getArgOperand(1), CI->getArgOperand(2)});
+		if (RT->getElementType(0)->getScalarType()->isHalfTy())
+			v = B.CreateFPTrunc(v, RT->getElementType(0));
+		Value *r = B.CreateInsertValue(PoisonValue::get(RT), v, 0);
+		r = B.CreateInsertValue(r, ConstantInt::get(RT->getElementType(1), 0), 1);
+		CI->replaceAllUsesWith(r);
+		CI->eraseFromParent();
+	}
+}
+
+// The AIR function inlined into its kernel, which takes its name.
+Function *stageKernel(Module &M, Function *F, ArrayRef<Type *> params, const char *md) {
+	LLVMContext &C = M.getContext();
+	auto *NF = Function::Create(FunctionType::get(Type::getVoidTy(C), params, false), GlobalValue::ExternalLinkage, "", M);
+	NF->setCallingConv(CallingConv::AMDGPU_KERNEL);
+	const std::string name = F->getName().str();
+	F->setName(name + ".air");
+	F->setLinkage(GlobalValue::InternalLinkage);
+	F->removeFnAttr(Attribute::NoInline);
+	F->addFnAttr(Attribute::AlwaysInline);
+	for (unsigned i = 0; i < F->arg_size(); i++)
+		F->removeParamAttr(i, "air-buffer-no-alias");
+	NF->setName(name);
+	if (NamedMDNode *nm = M.getNamedMetadata(md))
+		nm->eraseFromParent();
+	return NF;
+}
+
+const char *componentType(Type *T) {
+	Type *e = T->getScalarType();
+	return e->isHalfTy() ? "f16" : e->isFloatTy() ? "f32" : e->isIntegerTy(32) ? "i32" : e->isIntegerTy(16) ? "i16" : "?";
+}
+
+unsigned components(Type *T) {
+	auto *VT = dyn_cast<FixedVectorType>(T);
+	return VT ? VT->getNumElements() : 1;
+}
+
+// air2amdgcn vertex: rdna4_vertex(buffers..., u32 first, u32 count, u32 instance, ptr out): thread i runs the function for vertex first + i
+// and stores its result at out + i * stride. ABI: "buffer SLOT"..., "vertex" (the three u32), "out", "stride BYTES", "position OFFSET",
+// "output KEY OFFSET COMPONENTS TYPE" per output the fragment stage reads.
+bool lowerVertex(Module &M, std::string &err, Stats &st) {
+	LLVMContext &C = M.getContext();
+	const DataLayout &DL = M.getDataLayout();
+	std::vector<StageItem> args, outs;
+	Function *F = stageEntry(M, "air.vertex", args, outs, err);
+	if (!F)
+		return false;
+	lowerFunction(*F, st);
+	if (!st.unsupported.empty()) {
+		err = "unsupported air.* call: " + st.unsupported.begin()->first;
+		return false;
+	}
+	Type *i32 = Type::getInt32Ty(C);
+	std::vector<Type *> params;
+	for (const StageItem &a : args)
+		if (a.kind == "air.texture" || a.kind == "air.sampler") {
+			err = "vertex function with textures or samplers: not lowered yet";
+			return false;
+		}
+	resourceParams(C, args, params, st);
+	const size_t nBuf = params.size();
+	params.insert(params.end(), {i32, i32, i32, PointerType::get(C, kAmdGlobal)});
+	st.abi.push_back("vertex");
+	st.abi.push_back("out");
+
+	Type *RT = F->getReturnType();
+	auto *STy = dyn_cast<StructType>(RT);
+	if (RT->isVoidTy() || (!STy && outs.size() != 1) || (STy && STy->getNumElements() != outs.size())) {
+		err = "vertex function outputs do not match its return type";
+		return false;
+	}
+	const uint64_t stride = alignTo(DL.getTypeAllocSize(RT), 4);
+	st.abi.push_back("stride " + std::to_string(stride));
+	bool havePos = false;
+	for (size_t i = 0; i < outs.size(); i++) {
+		Type *ET = STy ? STy->getElementType(i) : RT;
+		const uint64_t off = STy ? DL.getStructLayout(STy)->getElementOffset(i) : 0;
+		if (outs[i].kind == "air.position") {
+			st.abi.push_back("position " + std::to_string(off));
+			havePos = true;
+		} else if (outs[i].kind == "air.vertex_output") {
+			st.abi.push_back("output " + outs[i].key + " " + std::to_string(off) + " " + std::to_string(components(ET)) + " " +
+			                 componentType(ET));
+		}
+	}
+	if (!havePos) {
+		err = "vertex function without a position";
+		return false;
+	}
+
+	Function *NF = stageKernel(M, F, params, "air.vertex");
+	BasicBlock *entry = BasicBlock::Create(C, "entry", NF), *run = BasicBlock::Create(C, "run", NF), *done = BasicBlock::Create(C, "done", NF);
+	IRBuilder<> B(entry);
+	Value *gid = B.CreateAdd(B.CreateMul(B.CreateIntrinsic(Intrinsic::amdgcn_workgroup_id_x, ArrayRef<Value *>{}), B.getInt32(64)),
+	                         B.CreateIntrinsic(Intrinsic::amdgcn_workitem_id_x, ArrayRef<Value *>{}));
+	Argument *first = NF->getArg(nBuf), *count = NF->getArg(nBuf + 1), *instance = NF->getArg(nBuf + 2), *out = NF->getArg(nBuf + 3);
+	B.CreateCondBr(B.CreateICmpULT(gid, count), run, done);
+	B.SetInsertPoint(run);
+	std::vector<Value *> callArgs;
+	size_t bi = 0;
+	for (size_t i = 0; i < args.size(); i++) {
+		Type *T = F->getArg(i)->getType();
+		const std::string &k = args[i].kind;
+		if (k == "air.buffer")
+			callArgs.push_back(NF->getArg(bi++));
+		else if (k == "air.vertex_id")
+			callArgs.push_back(B.CreateZExtOrTrunc(B.CreateAdd(first, gid), T));
+		else if (k == "air.instance_id")
+			callArgs.push_back(B.CreateZExtOrTrunc(instance, T));
+		else if (k == "air.base_vertex")
+			callArgs.push_back(B.CreateZExtOrTrunc(first, T));
+		else if (k == "air.base_instance")
+			callArgs.push_back(ConstantInt::get(T, 0));
+		else {
+			err = "vertex argument '" + args[i].name + "' of kind " + k + " has no lowering yet";
+			NF->eraseFromParent();
+			return false;
+		}
+	}
+	Value *r = B.CreateCall(F, callArgs);
+	Value *at = B.CreateGEP(Type::getInt8Ty(C), out, {B.CreateMul(B.CreateZExt(gid, B.getInt64Ty()), B.getInt64(stride))});
+	B.CreateAlignedStore(r, at, Align(4));
+	B.CreateBr(done);
+	B.SetInsertPoint(done);
+	B.CreateRetVoid();
+	const unsigned tg[3] = {64, 1, 1};
+	kernelAttributes(NF, tg);
+	return true;
+}
+
+// What the vertex stage's ABI says about its records.
+struct VertexRecord {
+	unsigned stride = 0, position = 0;
+	std::map<std::string, std::pair<unsigned, unsigned>> outputs;   // key -> byte offset, components (32-bit ones only)
+};
+
+bool readVertexAbi(const std::string &path, VertexRecord &v, std::string &err) {
+	std::ifstream f(path);
+	std::string line;
+	bool stride = false;
+	while (std::getline(f, line)) {
+		std::istringstream is(line);
+		std::string w, key, type;
+		unsigned a = 0, b = 0;
+		is >> w;
+		if (w == "stride")
+			stride = bool(is >> v.stride);
+		else if (w == "position")
+			is >> v.position;
+		else if (w == "output" && (is >> key >> a >> b >> type)) {
+			if (type == "f32" || type == "i32")
+				v.outputs[key] = {a, b};
+		}
+	}
+	if (!stride || v.stride % 4) {
+		err = path + ": not a vertex ABI";
+		return false;
+	}
+	return true;
+}
+
+// <4 x float> from rdna4raster as the AIR type of a fragment input: float or i32 scalars and vectors (the bits as stored), halves.
+Value *fromFloat4(IRBuilder<> &B, Value *v, Type *T) {
+	const unsigned n = components(T);
+	Type *f32n = n == 1 ? B.getFloatTy() : (Type *)FixedVectorType::get(B.getFloatTy(), n);
+	Value *f = n == 1 ? B.CreateExtractElement(v, uint64_t(0)) : B.CreateShuffleVector(v, ArrayRef<int>(std::vector<int>{0, 1, 2, 3}).take_front(n));
+	Type *el = T->getScalarType();
+	if (el->isFloatTy())
+		return f;
+	if (el->isHalfTy())
+		return B.CreateFPTrunc(f, T);
+	Type *i32n = n == 1 ? B.getInt32Ty() : (Type *)FixedVectorType::get(B.getInt32Ty(), n);
+	Value *bits = B.CreateBitCast(f, i32n);
+	(void)f32n;
+	return B.CreateZExtOrTrunc(bits, T);
+}
+
+// air2amdgcn fragment: rdna4_fragment(buffers..., the draw: ptr verts, u32 stride, u32 position, u32 topology, u32 count, ptr target,
+// u32 pitch, width, height, format, float viewport x, y, w, h, u32 blend), threadgroups of 8x8 pixels. ABI: "buffer SLOT"..., "fragment".
+bool lowerFragment(Module &M, const VertexRecord &vr, std::string &err, Stats &st) {
+	LLVMContext &C = M.getContext();
+	std::vector<StageItem> args, outs;
+	Function *F = stageEntry(M, "air.fragment", args, outs, err);
+	if (!F)
+		return false;
+	lowerSampling(M, *F);
+	lowerFunction(*F, st);
+	if (!st.unsupported.empty()) {
+		err = "unsupported air.* call: " + st.unsupported.begin()->first;
+		return false;
+	}
+	// the colour of render target 0
+	Type *RT = F->getReturnType();
+	auto *STy = dyn_cast<StructType>(RT);
+	int colour = -1;
+	for (size_t i = 0; i < outs.size(); i++)
+		if (outs[i].kind == "air.render_target" && colour < 0)
+			colour = int(i);
+	if (colour < 0 || (STy && unsigned(colour) >= STy->getNumElements()) || (!STy && colour != 0)) {
+		err = "fragment function without a colour for render target 0";
+		return false;
+	}
+	Type *CT = STy ? STy->getElementType(colour) : RT;
+	if (!CT->getScalarType()->isFloatTy() && !CT->getScalarType()->isHalfTy()) {
+		err = "fragment colour of a type other than float or half";
+		return false;
+	}
+
+	Type *i32 = Type::getInt32Ty(C), *f32 = Type::getFloatTy(C), *gptr = PointerType::get(C, kAmdGlobal);
+	std::vector<Type *> params;
+	resourceParams(C, args, params, st);
+	const size_t nBuf = params.size();
+	params.insert(params.end(), {gptr, i32, i32, i32, i32, gptr, i32, i32, i32, i32, f32, f32, f32, f32, i32});
+	st.abi.push_back("fragment");
+	Function *NF = stageKernel(M, F, params, "air.fragment");
+
+	// rdna4raster.c, linked in later
+	Type *ptr = PointerType::get(C, 0), *v4f = FixedVectorType::get(f32, 4), *vd = Type::getVoidTy(C);
+	auto decl = [&](const char *n, Type *ret, std::vector<Type *> ps) { return M.getOrInsertFunction(n, FunctionType::get(ret, ps, false)); };
+	auto init = decl("rdna4_draw_init", vd, {ptr, gptr, i32, i32, i32, i32, gptr, i32, i32, i32, i32, f32, f32, f32, f32, i32});
+	auto begin = decl("rdna4_px_begin", i32, {ptr, i32, i32, ptr});
+	auto count = decl("rdna4_tri_count", i32, {ptr});
+	auto cover = decl("rdna4_tri_cover", i32, {ptr, ptr, i32, ptr});
+	auto interp = decl("rdna4_interp", v4f, {ptr, i32, i32, i32});
+	auto fragPos = decl("rdna4_frag_position", v4f, {ptr, ptr});
+	auto front = decl("rdna4_front_facing", i32, {ptr});
+	auto blend = decl("rdna4_px_blend", vd, {ptr, ptr, v4f});
+	auto end = decl("rdna4_px_end", vd, {ptr, ptr});
+
+	BasicBlock *entry = BasicBlock::Create(C, "entry", NF), *head = BasicBlock::Create(C, "triangle", NF),
+	           *test = BasicBlock::Create(C, "cover", NF), *shade = BasicBlock::Create(C, "shade", NF),
+	           *next = BasicBlock::Create(C, "next", NF), *store = BasicBlock::Create(C, "store", NF), *exit = BasicBlock::Create(C, "exit", NF);
+	IRBuilder<> B(entry);
+	auto block = [&](unsigned bytes, const char *name) {
+		auto *a = B.CreateAlloca(ArrayType::get(B.getInt8Ty(), bytes), 5, nullptr, name);
+		a->setAlignment(Align(16));
+		return B.CreateAddrSpaceCast(a, ptr);
+	};
+	Value *draw = block(128, "draw"), *px = block(64, "px"), *tri = block(96, "tri");
+	std::vector<Value *> initArgs{draw};
+	for (size_t i = nBuf; i < NF->arg_size(); i++)
+		initArgs.push_back(NF->getArg(i));
+	B.CreateCall(init, initArgs);
+	Value *x = B.CreateAdd(B.CreateMul(B.CreateIntrinsic(Intrinsic::amdgcn_workgroup_id_x, ArrayRef<Value *>{}), B.getInt32(8)),
+	                       B.CreateIntrinsic(Intrinsic::amdgcn_workitem_id_x, ArrayRef<Value *>{}));
+	Value *y = B.CreateAdd(B.CreateMul(B.CreateIntrinsic(Intrinsic::amdgcn_workgroup_id_y, ArrayRef<Value *>{}), B.getInt32(8)),
+	                       B.CreateIntrinsic(Intrinsic::amdgcn_workitem_id_y, ArrayRef<Value *>{}));
+	Value *inside = B.CreateCall(begin, {draw, x, y, px});
+	Value *n = B.CreateCall(count, {draw});
+	B.CreateCondBr(B.CreateICmpNE(inside, B.getInt32(0)), head, exit);
+
+	B.SetInsertPoint(head);
+	PHINode *t = B.CreatePHI(i32, 2, "t");
+	t->addIncoming(B.getInt32(0), entry);
+	B.CreateCondBr(B.CreateICmpULT(t, n), test, store);
+
+	B.SetInsertPoint(test);
+	B.CreateCondBr(B.CreateICmpNE(B.CreateCall(cover, {draw, px, t, tri}), B.getInt32(0)), shade, next);
+
+	B.SetInsertPoint(shade);
+	std::vector<Value *> callArgs;
+	size_t bi = 0;
+	for (size_t i = 0; i < args.size(); i++) {
+		Type *T = F->getArg(i)->getType();
+		const StageItem &a = args[i];
+		if (isResource(a)) {
+			callArgs.push_back(NF->getArg(bi++));
+		} else if (a.kind == "air.position") {
+			callArgs.push_back(fromFloat4(B, B.CreateCall(fragPos, {px, tri}), T));
+		} else if (a.kind == "air.front_facing") {
+			callArgs.push_back(B.CreateZExtOrTrunc(B.CreateICmpNE(B.CreateCall(front, {tri}), B.getInt32(0)), T));
+		} else if (a.kind == "air.fragment_input") {
+			auto o = vr.outputs.find(a.key);
+			if (o == vr.outputs.end()) {
+				err = "fragment input '" + a.name + "' (" + a.key + ") is no 32-bit output of the vertex function";
+				NF->eraseFromParent();
+				return false;
+			}
+			Value *v = B.CreateCall(interp, {tri, B.getInt32(o->second.first / 4), B.getInt32(components(T)), B.getInt32(a.interp)});
+			callArgs.push_back(fromFloat4(B, v, T));
+		} else {
+			err = "fragment argument '" + a.name + "' of kind " + a.kind + " has no lowering yet";
+			NF->eraseFromParent();
+			return false;
+		}
+	}
+	Value *r = B.CreateCall(F, callArgs);
+	Value *c = STy ? B.CreateExtractValue(r, colour) : r;
+	if (CT->getScalarType()->isHalfTy())
+		c = B.CreateFPExt(c, FixedVectorType::get(f32, components(CT)));
+	if (components(CT) != 4) {
+		Value *v = ConstantVector::get({ConstantFP::get(f32, 0), ConstantFP::get(f32, 0), ConstantFP::get(f32, 0), ConstantFP::get(f32, 1)});
+		for (unsigned k = 0; k < components(CT); k++)
+			v = B.CreateInsertElement(v, components(CT) == 1 ? c : B.CreateExtractElement(c, k), k);
+		c = v;
+	}
+	B.CreateCall(blend, {draw, px, c});
+	B.CreateBr(next);
+
+	B.SetInsertPoint(next);
+	Value *t1 = B.CreateAdd(t, B.getInt32(1));
+	t->addIncoming(t1, next);
+	B.CreateBr(head);
+
+	B.SetInsertPoint(store);
+	B.CreateCall(end, {draw, px});
+	B.CreateBr(exit);
+	B.SetInsertPoint(exit);
+	B.CreateRetVoid();
+
+	const unsigned tg[3] = {8, 8, 1};
+	kernelAttributes(NF, tg);
+	(void)vr.position;
 	return true;
 }
 
@@ -757,11 +1202,14 @@ int main(int argc, char **argv) {
 	LLVMInitializeAMDGPUTargetMC();
 	LLVMInitializeAMDGPUAsmPrinter();
 	if (argc < 3) {
-		fprintf(stderr, "usage: %s kernel IN --tg X,Y,Z -o OUT.ll [--entry NAME] [--mcpu gfx1201] [--abi OUT.abi]\n       %s coverage [--codegen] IN...\n", argv[0], argv[0]);
+		fprintf(stderr, "usage: %s kernel IN --tg X,Y,Z -o OUT.ll [--entry NAME] [--mcpu gfx1201] [--abi OUT.abi]\n"
+		                "       %s vertex IN -o OUT.ll --abi OUT.abi\n"
+		                "       %s fragment IN --vertex-abi VERTEX.abi -o OUT.ll --abi OUT.abi\n"
+		                "       %s coverage [--codegen] IN...\n", argv[0], argv[0], argv[0], argv[0]);
 		return 2;
 	}
 	const std::string mode = argv[1];
-	std::string out, entry, cpu = "gfx1201", tgs = "64,1,1", abi;
+	std::string out, entry, cpu = "gfx1201", tgs = "64,1,1", abi, vertexAbi;
 	bool codegen = false;
 	std::vector<std::string> inputs;
 	for (int i = 2; i < argc; i++) {
@@ -776,6 +1224,8 @@ int main(int argc, char **argv) {
 			cpu = argv[++i];
 		else if (a == "--abi" && i + 1 < argc)
 			abi = argv[++i];
+		else if (a == "--vertex-abi" && i + 1 < argc)
+			vertexAbi = argv[++i];
 		else if (a == "--codegen")
 			codegen = true;
 		else
@@ -828,6 +1278,45 @@ int main(int argc, char **argv) {
 		for (auto &l : st.lowered)
 			fprintf(stderr, " %s x%u", l.first.c_str(), l.second);
 		fprintf(stderr, "%s\n", st.lowered.empty() ? " (no air.* calls)" : "");
+		return 0;
+	}
+
+	if (mode == "vertex" || mode == "fragment") {
+		if (inputs.size() != 1 || out.empty() || abi.empty() || (mode == "fragment" && vertexAbi.empty())) {
+			fprintf(stderr, "%s mode: one input, -o, --abi%s\n", mode.c_str(), mode == "fragment" ? " and --vertex-abi" : "");
+			return 2;
+		}
+		LLVMContext ctx;
+		SMDiagnostic d;
+		auto M = parseIRFile(inputs[0], d, ctx);
+		if (!M) {
+			d.print(argv[0], errs());
+			return 1;
+		}
+		Stats st;
+		std::string err;
+		VertexRecord vr;
+		M = remapConstantSpace(std::move(M), ctx, err);
+		bool ok = M != nullptr;
+		if (ok) {
+			M->setDataLayout(TM->createDataLayout());   // the vertex records are laid out as the AMDGPU back end stores them
+			ok = mode == "vertex" ? lowerVertex(*M, err, st) : readVertexAbi(vertexAbi, vr, err) && lowerFragment(*M, vr, err, st);
+		}
+		if (!ok) {
+			fprintf(stderr, "air2amdgcn: %s: %s\n", inputs[0].c_str(), err.c_str());
+			return 1;
+		}
+		retarget(*M, *TM);
+		if (verifyModule(*M, &errs())) {
+			fprintf(stderr, "air2amdgcn: the lowered module does not verify\n");
+			return 1;
+		}
+		std::error_code ec;
+		raw_fd_ostream os(out, ec);
+		M->print(os, nullptr);
+		raw_fd_ostream as(abi, ec);
+		for (const std::string &l : st.abi)
+			as << l << "\n";
 		return 0;
 	}
 

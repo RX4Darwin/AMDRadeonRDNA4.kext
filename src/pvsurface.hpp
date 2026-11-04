@@ -25,6 +25,12 @@ namespace PvSurface
 /* At plugin start: resolve the IOSurface kext's methods when it loads. */
 void start();
 
+/* `len` bytes at `offset` in surface `id`, to or from `buf`. */
+bool access(uint32_t id, uint64_t offset, void *buf, uint64_t len, bool write);
+
+/* Bytes per row of surface `id`, 0 if there is none. */
+uint32_t bytesPerRow(uint32_t id);
+
 /* Every row of `width` pixels of the first `height` rows of surface `id`, filled with `pixel` (4 bytes). */
 bool fill(uint32_t id, uint32_t width, uint32_t height, uint32_t pixel);
 

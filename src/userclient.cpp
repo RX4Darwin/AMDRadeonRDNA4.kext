@@ -269,7 +269,7 @@ IOReturn RDNA4ComputeClient::sPvAccess(OSObject *t, void *, IOExternalMethodArgu
 #ifdef AMDRadeonRDNA4_PVGPU
 	const uint64_t *in = a->scalarInput;
 
-	return PvJob::access(static_cast<uint32_t>(in[0]), in[1], self(t)->task, in[2], in[3], in[4] != 0);
+	return PvJob::access(static_cast<uint32_t>(in[0]), in[1], self(t)->task, in[2], in[3], static_cast<uint32_t>(in[4]));
 #else
 	(void)t;
 	(void)a;
