@@ -87,6 +87,13 @@ int main() {
 		const uint32_t want[8] = {0x01234567, 0xc0540000, 0x0007c00f, 0x90000fac, 63, 0x00400000, 0x00008000, 0};
 		CHECK(!std::memcmp(t, want, sizeof(want)));
 	}
+	// linearVolume: a 5x3x4 RGBA8 3D image, the hardware's pitch (DEPTH the depth, no pitch).
+	{
+		uint32_t t[8];
+		linearVolume(t, 0x123456700ull, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 5, 3, 4);
+		const uint32_t want[8] = {0x01234567, 0x00540000, 0x00008001, 0xa0000fac, 3, 0x00400000, 0x00008000, 0};
+		CHECK(!std::memcmp(t, want, sizeof(want)));
+	}
 	// A render pipeline with a vertex descriptor (Sequoia 24H232, rdna4-mtlvdesc, 2026-11-04): attribute 0 float2 at 4 in buffer 1, attribute 3
 	// uchar4Normalized at 12 in buffer 1, attribute 5 half2 at 0 in buffer 2; layout 1 stride 20 per vertex, layout 2 stride 8 per instance, step
 	// rate 3; colour attachment 0 BGRA8Unorm (80) without blending. Key 8 says where the attachments are: they no longer follow the label.

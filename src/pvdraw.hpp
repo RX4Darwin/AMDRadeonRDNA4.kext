@@ -62,6 +62,14 @@ static inline void linearImage(uint32_t *t, uint64_t gpu, uint32_t format, uint3
 	t[7] = 0;
 }
 
+// A linear 3D image's T#, as linearImage: its slices `depth` deep, the hardware's own pitches: rows the row's bytes aligned to 128, slices
+// `height` rows of them aligned to 256 (rdna4-mtltex3d, 2026-11-04).
+static inline void linearVolume(uint32_t *t, uint64_t gpu, uint32_t format, uint32_t sel, uint32_t w, uint32_t h, uint32_t depth) {
+	linearImage(t, gpu, format, sel, w, h, 1);
+	t[3] = sel | 10u << 28;   // TYPE 3D
+	t[4] = (depth - 1) & 0x3fff;
+}
+
 // One pass of colour attachment 0's Metal blend state: {source factor, destination factor, operation} -> CB_BLEND0_CONTROL and
 // SX_MRT0_BLEND_OPT. The card ignores SEPARATE_ALPHA_BLEND here (rig 2026-10-22, mtlprobe blendx: alpha always takes the colour
 // equation), so a pass has one equation for all four channels and differing alpha is a second pass (runDraw).

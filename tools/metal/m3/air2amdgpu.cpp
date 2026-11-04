@@ -336,11 +336,12 @@ static std::string legalize(Function &k) {
 		if (const size_t i16 = texName.find("_2d.i16."); i16 != std::string::npos)
 			texName.erase(i16 + 3, 4);
 		const StringRef tex = texName;
-		if (tex.starts_with("sample_texture_2d.v4f") || tex.starts_with("read_texture_2d.v4f")) {
+		if (tex.starts_with("sample_texture_2d.v4f") || tex.starts_with("sample_texture_3d.v4f") || tex.starts_with("read_texture_2d.v4f")) {
 			// sample (texture, sampler, float2 coord, i1, int2 offset, i1 level, float bias or LOD, float min LOD, i32) / read (texture,
 			// sampler, uint2, int2, lod, i32), or without the sampler and the offset (texture, uint2, lod, i32: WindowServer's). A sample's
-			// level false: the float is a bias (0: none); true: an explicit LOD. Float or half texels.
-			const bool sample = tex.starts_with("sample"), half = tex.starts_with(sample ? "sample_texture_2d.v4f16" : "read_texture_2d.v4f16");
+			// level false: the float is a bias (0: none); true: an explicit LOD. Float or half texels. A 3D texture's sample: float3, int3.
+			const bool sample = tex.starts_with("sample"), cube = tex.starts_with("sample_texture_3d");
+			const bool half = tex.starts_with(sample ? (cube ? "sample_texture_3d.v4f16" : "sample_texture_2d.v4f16") : "read_texture_2d.v4f16");
 			const bool samplerless = !sample && c->arg_size() >= 3 && c->getArgOperand(1)->getType()->isVectorTy();
 			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(samplerless ? 1 : 2);
 			Value *x = b.CreateExtractElement(xy, uint64_t(0)), *y = b.CreateExtractElement(xy, 1);
@@ -354,13 +355,15 @@ static std::string legalize(Function &k) {
 					return f->getName().str() + " with a run-time offset or a minimum LOD is not supported yet";
 				// The offset as the hardware takes it: x [5:0], y [13:8], 6-bit signed.
 				uint32_t packed = 0;
-				for (unsigned k = 0; k < 2; k++)
+				for (unsigned k = 0; k < (cube ? 3u : 2u); k++)
 					if (auto *e = dyn_cast_or_null<ConstantInt>(offset->getAggregateElement(k)))
 						packed |= (static_cast<uint32_t>(e->getSExtValue()) & 0x3f) << (8 * k);
 				const bool zero = match(value, m_AnyZeroFP()), lod = level->isOne(), bias = !lod && !zero;
-				static const Intrinsic::ID ids[2][4] = {   // [offset][plain, bias, lod, lod zero]
-					{Intrinsic::amdgcn_image_sample_2d, Intrinsic::amdgcn_image_sample_b_2d, Intrinsic::amdgcn_image_sample_l_2d, Intrinsic::amdgcn_image_sample_lz_2d},
-					{Intrinsic::amdgcn_image_sample_o_2d, Intrinsic::amdgcn_image_sample_b_o_2d, Intrinsic::amdgcn_image_sample_l_o_2d, Intrinsic::amdgcn_image_sample_lz_o_2d}};
+				static const Intrinsic::ID ids[2][2][4] = {   // [3D][offset][plain, bias, lod, lod zero]
+					{{Intrinsic::amdgcn_image_sample_2d, Intrinsic::amdgcn_image_sample_b_2d, Intrinsic::amdgcn_image_sample_l_2d, Intrinsic::amdgcn_image_sample_lz_2d},
+					 {Intrinsic::amdgcn_image_sample_o_2d, Intrinsic::amdgcn_image_sample_b_o_2d, Intrinsic::amdgcn_image_sample_l_o_2d, Intrinsic::amdgcn_image_sample_lz_o_2d}},
+					{{Intrinsic::amdgcn_image_sample_3d, Intrinsic::amdgcn_image_sample_b_3d, Intrinsic::amdgcn_image_sample_l_3d, Intrinsic::amdgcn_image_sample_lz_3d},
+					 {Intrinsic::amdgcn_image_sample_o_3d, Intrinsic::amdgcn_image_sample_b_o_3d, Intrinsic::amdgcn_image_sample_l_o_3d, Intrinsic::amdgcn_image_sample_lz_o_3d}}};
 				// Only a fragment shader has pixel quads to take derivatives from: elsewhere (vertex shaders, kernels) implicit-LOD samples
 				// (and biases) read level 0.
 				const bool quads = k.getCallingConv() == CallingConv::AMDGPU_PS;
@@ -376,11 +379,13 @@ static std::string legalize(Function &k) {
 				}
 				types.push_back(b.getFloatTy());
 				args.append({x, y});
+				if (cube)
+					args.push_back(b.CreateExtractElement(xy, 2));
 				if (mode == 2)
 					args.push_back(value);
 				types.append({t->getType(), sm->getType()});
 				args.append({t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
-				texel = b.CreateIntrinsic(ids[packed != 0][mode], types, args);
+				texel = b.CreateIntrinsic(ids[cube][packed != 0][mode], types, args);
 			} else {
 				// The offset is added to the coordinates; a level other than 0 reads that mip level (image_load_mip).
 				if (!samplerless && c->arg_size() < 5)
