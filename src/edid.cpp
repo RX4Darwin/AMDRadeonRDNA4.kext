@@ -370,6 +370,14 @@ bool parseCtaBlock(const uint8_t ext[128], CtaCaps &out) {
 	out.ycbcr422   = (ext[3] & 0x10) != 0;
 
 	// Data block collection: [4, dtdOff). Each block: tag [7:5], length [4:0].
+	// The Y420 Capability Map has one bit per SVD, in the order of the video
+	// blocks, reserved codes included; a map without bitmap bytes means every
+	// SVD, and no map none.
+	uint8_t svdOf[32] {};
+	uint8_t svds = 0;
+	uint32_t y420Map = 0;
+	bool y420MapAll = false;
+
 	if (out.revision >= 3 && dtdOff >= 4) {
 		size_t pos = 4;
 		size_t end = dtdOff < 128 ? dtdOff : 127;
@@ -383,15 +391,24 @@ bool parseCtaBlock(const uint8_t ext[128], CtaCaps &out) {
 				// CTA-861-F §7.5.1: codes 129-192 are VIC 1-64 with the
 				// native flag; 65-127 and 193-253 are the VIC itself;
 				// 0, 128, 254, 255 are reserved.
-				for (uint8_t i = 0; i < len && out.vicCount < 32; i++) {
+				for (uint8_t i = 0; i < len && out.vicCount < 32; i++, svds++) {
 					uint8_t b = p[i];
 					if (b == 0 || b == 128 || b >= 254)
 						continue;
 					bool native = b >= 129 && b <= 192;
 					out.vics[out.vicCount]      = native ? static_cast<uint8_t>(b & 0x7f) : b;
 					out.vicNative[out.vicCount] = native;
+					svdOf[out.vicCount] = svds;
 					out.vicCount++;
 				}
+			} else if (tag == 7 && len >= 1 && p[0] == 14) {   // Y420 Video Data Block
+				for (uint8_t i = 1; i < len && out.y420OnlyCount < 8; i++)
+					out.y420Only[out.y420OnlyCount++] = p[i];
+			} else if (tag == 7 && len >= 1 && p[0] == 15) {   // Y420 Capability Map
+				y420MapAll = len == 1;
+
+				for (uint8_t i = 1; i < len && i <= 4; i++)
+					y420Map |= static_cast<uint32_t>(p[i]) << (8 * (i - 1));
 			} else if (tag == 3 && len >= 5 &&  // vendor block, HDMI LLC OUI
 			           p[0] == 0x03 && p[1] == 0x0c && p[2] == 0x00) {
 				out.hasHdmiVsdb = true;
@@ -407,6 +424,9 @@ bool parseCtaBlock(const uint8_t ext[128], CtaCaps &out) {
 			pos += 1u + len;
 		}
 	}
+
+	for (size_t i = 0; i < out.vicCount; i++)
+		out.vicY420[i] = y420MapAll || (y420Map >> svdOf[i] & 1);
 
 	// 18-byte detailed timings from dtdOff to the checksum byte.
 	if (dtdOff >= 4) {
@@ -448,6 +468,27 @@ bool hasVic(const uint8_t *edid, size_t len, uint8_t vic) {
 
 		for (size_t i = 0; i < cta.vicCount; i++) {
 			if (cta.vics[i] == vic)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+bool takesY420(const uint8_t *edid, size_t len, uint8_t vic) {
+	for (size_t off = BlockSize; edid && vic && off + BlockSize <= len; off += BlockSize) {
+		CtaCaps cta {};
+
+		if (!blockChecksumOk(edid + off) || !parseCtaBlock(edid + off, cta))
+			continue;
+
+		for (size_t i = 0; i < cta.vicCount; i++) {
+			if (cta.vics[i] == vic && cta.vicY420[i])
+				return true;
+		}
+
+		for (size_t i = 0; i < cta.y420OnlyCount; i++) {
+			if (cta.y420Only[i] == vic)
 				return true;
 		}
 	}

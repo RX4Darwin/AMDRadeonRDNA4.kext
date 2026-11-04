@@ -85,6 +85,19 @@ static const char kLenovoEdidHex[] =
 	"4500202f2100001e000000fd0030901eaa22000a202020202020000000fc004c"
 	"454e204732352d31300a2020000000ff005534423433304e390a202020200171";
 
+// The test rig's Dell P2723QE on HDMI, behind a DP++ adapter (2026-11-04): a
+// Y420 Capability Map that takes VIC 97 and 96 (its first two SVDs) in
+// YCbCr 4:2:0.
+static const char kDellHdmiEdidHex[] =
+	"00ffffffffffff0010ac3df14c4a4c4118200103803c2278ea5095a8544ea526"
+	"0f5054a54b00714f8180a9c0d1c001010101010101014dd000a0f0703e803020"
+	"350055502100001a000000ff00424437375a50330a2020202020000000fc0044"
+	"454c4c20503237323351450a000000fd0018560f873c000a2020202020200160"
+	"020331b15161605f5e5d101f222120041312110302016d030c001000383c2000"
+	"6001020367d85dc401788003e40f03000008e80030f2705a80b0588a00555021"
+	"00001c565e00a0a0a029503020350055502100001c114400a080002550302036"
+	"0055502100001c000000000000000000000000000000000000000000000000ad";
+
 // Synthetic 1080p 60/75 Hz HDMI monitor — the target user's class of sink.
 // Hand-assembled so every field the mode table depends on is known; the
 // checksums (bytes 127 and 255) are filled in at runtime.
@@ -593,6 +606,15 @@ static int testModes() {
 	                  Edid::hasVic(syn, sizeof(syn), 16) && !Edid::hasVic(syn, sizeof(syn), 97) &&
 	                  !Edid::hasVic(hf, 128, 97) && !Edid::hasVic(hf, sizeof(hf), 0),
 	                  "Edid::hasVic");
+
+	// YCbCr 4:2:0: the Dell's map names its first two SVDs (VIC 97, 96); the
+	// synthetic monitors have none.
+	uint8_t dell[256];
+	failures += check(hexToBytes(kDellHdmiEdidHex, dell, sizeof(dell)) && Edid::takesY420(dell, sizeof(dell), 97) &&
+	                  Edid::takesY420(dell, sizeof(dell), 96) && !Edid::takesY420(dell, sizeof(dell), 95) &&
+	                  !Edid::takesY420(dell, sizeof(dell), 16) && !Edid::takesY420(hf, sizeof(hf), 97) &&
+	                  !Edid::takesY420(dell, 128, 97),
+	                  "Edid::takesY420");
 
 	// The 75 Hz DTD is `cvt -r 1920 1080 75`: 1080/3/5/31, i.e. 74.97 Hz.
 	const Edid::DetailedTiming &t75 = yb.dtds[1];
@@ -1684,7 +1706,7 @@ static int testPipe2Table() {
 	// A sink with SCDC is told whether the link is scrambled (above 340 MHz:
 	// scrambling and the 1/40 clock ratio, 3), last before the transmitter is
 	// enabled; one without is left alone (above).
-	const uint32_t scrambled = c.timing.pixelClockKHz > ModeSet::kScrambleFromKHz ? 3 : 0;
+	const uint32_t scrambled = ModeSet::tmdsKHz(c.timing.pixelClockKHz, c.y420) > ModeSet::kScrambleFromKHz ? 3 : 0;
 	Pipe2::Target scdc = t;
 	scdc.sinkScdc = true;
 	scdc.ddcLine = kDdcLine;
@@ -1706,9 +1728,11 @@ static int testPipe2Table() {
 	failures += check(plan.ncmds == 4, "pipe2: %zu DMUB commands, expected 4", plan.ncmds);
 	if (plan.ncmds == 4) {
 		const Dmub::Cmd &pll = plan.cmds[0], &enc = plan.cmds[1], &on = plan.cmds[2], &enc2 = plan.cmds[3];
-		const uint32_t khz = c.timing.pixelClockKHz;
+		// In YCbCr 4:2:0 the link runs at half the pixel clock, the PLL told so (YUV420 in miscinfo).
+		const uint32_t khz = ModeSet::tmdsKHz(c.timing.pixelClockKHz, c.y420);
+		const uint32_t misc = c.y420 ? uint32_t(Dmub::kPixelClockMiscYuv420) << 24 : 0;
 		failures += check(pll[0] == 0x10000280 && pll[1] == khz * 10 &&
-		                  pll[2] == (0x00030014u + c.link + ((kEncoderObj & 0xffu) << 8)) &&
+		                  pll[2] == (0x00030014u + c.link + ((kEncoderObj & 0xffu) << 8) + misc) &&
 		                  (pll[3] & 0xffff) == c.pipe,
 		                  "pipe2: set pixel clock %08x %08x %08x %08x", pll[0], pll[1], pll[2], pll[3]);
 		failures += check(enc[0] == 0x0c000080 && enc[1] == (0x04030f00u | c.dig) && enc[2] == khz / 10 &&
@@ -1747,7 +1771,8 @@ static int testPipe2Table() {
 		{ 2, 0x04bc + dp1, 0x1f, c.detSegments, "DET1 segments" },
 		// HDMI: the PHY's clock / 4. DisplayPort: the pixel-rate DTO, in Hz against the 720 MHz reference
 		// (how the firmware programs the boot display's), with no integer part.
-		{ 1, 0x006f, c.dp ? 0xfu << (1 + 5 * c.pipe) : 1u << (5 * c.pipe), c.dp ? 0 : 1u << (5 * c.pipe), "OTG1 pixel rate divider" },
+		// OTGn_TMDS_PIXEL_RATE_DIV: Linux leaves it alone in 4:2:0
+		{ 1, 0x006f, c.dp ? 0xfu << (1 + 5 * c.pipe) : 1u << (5 * c.pipe), c.dp || c.y420 ? 0 : 1u << (5 * c.pipe), "OTG1 pixel rate divider" },
 		{ 1, 0x0085 + dp1 * 4, c.dp ? 0xffffffffu : 0, c.dp ? pt.pixelClockKHz * 1000 : 0, "DP_DTO1 phase" },
 		{ 1, 0x0086 + dp1 * 4, c.dp ? 0xffffffffu : 0, c.dp ? 720000000u : 0, "DP_DTO1 modulo" },
 	};
@@ -1785,6 +1810,7 @@ static int testPipe2Table() {
 	mt.extra = extra;
 	// A sink a pipe is lit at 3840x2160 for has SCDC.
 	mt.sinkScdc = Pipe2::isUhd(c) && !c.dp;
+	mt.y420 = c.y420;
 	mt.ddcLine = kDdcLine;
 	size_t nmodes = 0;
 	const Edid::DetailedTiming *known = Pipe2::knownModes(nmodes);
@@ -2091,8 +2117,10 @@ static int testPipe2Table() {
 		return n;
 	};
 	const bool uhd = Pipe2::isUhd(c);
+	// In YCbCr 4:2:0 Linux sends Y = 3 and BT.709 instead of the RGB range.
+	const uint32_t avi1 = c.y420 ? 0x80a87e53 : uhd ? 0x88281e2b : 0x88281e86;
 	struct { Edid::DetailedTiming t; uint32_t w[4]; } avi[] = {
-		{ c.timing, { uhd ? 0x88281e2b : 0x88281e86, uhd ? 0x61u : 0x10u, uhd ? 0x8cbu : 0x466u, uhd ? 0x1131u : 0x899u } },
+		{ c.timing, { avi1, uhd ? 0x61u : 0x10u, uhd ? 0x8cbu : 0x466u, uhd ? 0x1131u : 0x899u } },
 		{ { 108000, 1600, 200, 24, 80, 900, 100, 1, 3, true, true, false },   { 0x88281ea5, 0x00, 0x3e9, 0x709 } },
 		{ { 74250, 1280, 370, 110, 40, 720, 30, 5, 5, true, true, false },    { 0x88281e33, 0x04, 0x2ef, 0x673 } },
 		{ { 108000, 1280, 408, 48, 112, 1024, 42, 1, 3, true, true, false },  { 0x88081ef3, 0x00, 0x42b, 0x699 } },
@@ -2104,6 +2132,10 @@ static int testPipe2Table() {
 	failures += check(aviWords(plan, w) == 18 && w[0] == 0x000d0282 && memcmp(w + 1, avi[0].w, sizeof(avi[0].w)) == 0,
 	                  "pipe2: the lighting plan's AVI infoframe is %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3], w[4]);
 	for (const auto &a : avi) {
+		// A pipe in 4:2:0 runs only formats the sink takes so: the plan's.
+		if (c.y420 && &a != &avi[0])
+			continue;
+
 		power.part = Pipe2::Part::Avi;
 		power.now = a.t;
 		const bool built = Pipe2::build(power, dpms, &why);
@@ -2118,9 +2150,12 @@ static int testPipe2Table() {
 	// plan's; on the plan's side of 340 MHz only (the scrambler is the plan's).
 	power.now = avi[1].t;
 	power.part = Pipe2::Part::Sleep;
-	if (uhd) {
+	if (uhd && !c.y420) {
 		failures += check(!Pipe2::build(power, dpms, &why),
 		                  "pipe2: a 3840x2160 plan builds sleep for 108 MHz, below the scrambling threshold");
+	} else if (c.y420) {
+		failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 1 && dpms.cmds[0][1] == 540000,
+		                  "pipe2: a 4:2:0 plan sleeps at 108 MHz with the PLL at 54 MHz: %u x 100 Hz", dpms.cmds[0][1]);
 	} else {
 		failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 1 && dpms.cmds[0][1] == 1080000,
 		                  "pipe2: sleep at 108 MHz sets the pixel clock to %u x 100 Hz", dpms.cmds[0][1]);
@@ -2601,7 +2636,7 @@ static int testN48N() {
 static int testPipe2() {
 	int failures = 0;
 	const uint8_t first = Pipe2::config().hpd;
-	failures += check(Pipe2::configCount() == 36 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
+	failures += check(Pipe2::configCount() == 42 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
 	                  Pipe2::config().hpd == first,
 	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
 	// A DisplayPort connector has its DisplayPort table and an HDMI one (a passive DP++ adapter); an HDMI
@@ -2651,7 +2686,7 @@ static int testPipe2() {
 
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
 		const Pipe2::Config &c = Pipe2::configAt(i);
-		failures += check(Pipe2::use(c.hpd, !c.dp, c.pipe, Pipe2::isUhd(c)) && Pipe2::config().hpd == c.hpd &&
+		failures += check(Pipe2::use(c.hpd, !c.dp, c.pipe, Pipe2::isUhd(c), c.y420) && Pipe2::config().hpd == c.hpd &&
 		                  Pipe2::config().dp == c.dp && Pipe2::config().pipe == c.pipe &&
 		                  Pipe2::config().timing.pixelClockKHz == c.timing.pixelClockKHz,
 		                  "pipe2: no %s table for HPD%u on pipe %u", c.dp ? "DisplayPort" : "HDMI", c.hpd, c.pipe);

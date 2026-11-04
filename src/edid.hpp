@@ -160,7 +160,10 @@ struct CtaCaps {
 	bool     ycbcr422   { false };
 	uint8_t  vics[32]   {};     // short video descriptors (VIC codes, native flag stripped)
 	bool     vicNative[32] {};  // SVD native flag (only defined for VIC 1-64)
+	bool     vicY420[32] {};    // the format is also taken in YCbCr 4:2:0 (Y420 Capability Map)
 	size_t   vicCount   { 0 };
+	uint8_t  y420Only[8] {};    // formats taken only in YCbCr 4:2:0 (Y420 Video Data Block)
+	size_t   y420OnlyCount { 0 };
 	bool     hasHdmiVsdb { false };  // IEEE OUI 00-0C-03 vendor block present
 	uint32_t maxTmdsKHz { 0 };       // 0 = not advertised
 	// HDMI Forum vendor block (OUI C4-5D-D8), HDMI 2.0:
@@ -187,6 +190,10 @@ Hdmi2Caps hdmi2Caps(const uint8_t *edid, size_t len);
 // The mode table may not show it: a DTD of the same size and rate wins
 // (Modes::build), e.g. a monitor's CVT-RB 3840x2160@60 over CEA VIC 97.
 bool hasVic(const uint8_t *edid, size_t len, uint8_t vic);
+
+// Whether the sink takes `vic` in YCbCr 4:2:0: what amdgpu falls back to when
+// RGB needs more than a passive DP++ adapter carries.
+bool takesY420(const uint8_t *edid, size_t len, uint8_t vic);
 
 } // namespace Edid
 

@@ -73,6 +73,7 @@ public:
 		bool          moveOwed { false };  // secondPipeTo: the move to the connector in use has not completed
 		bool          uhd { false };       // its table lights it at 3840x2160 (Pipe2::isUhd)
 		bool          hdmi { false };      // its table is for an HDMI stream (on a DisplayPort connector: DP++)
+		bool          y420 { false };      // ... in YCbCr 4:2:0 (Pipe2::Config::y420)
 		bool          moveToPlan { false };   // the move owed goes to the table's own timing (adoptSinkKind)
 		// On DisplayPort: the sink's AUX channel and capabilities (read with
 		// its EDID), and the link picked for the mode it is to carry.
@@ -167,8 +168,9 @@ public:
 	// raised for it (uhdClocks), if the sink has SCDC and the plan's mode.
 	bool usePlanFor(uint8_t hpd);
 	bool dpSinkTakes(const Edid::DetailedTiming &t) const;
-	bool sinkTakesUhd(uint8_t hpd) const;
+	bool sinkTakesUhd(uint8_t hpd, bool *y420 = nullptr) const;
 	bool adoptSinkKind(uint8_t hpd);
+	bool secondPipeY420(const Edid::DetailedTiming &t) const;
 	// DET buffer shares when a pipe is lit (lightSecondPipe).
 	static constexpr uint32_t kMinDetSegments = 6;
 	bool pipeInUse(uint32_t p) const;

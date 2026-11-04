@@ -99,6 +99,7 @@ table() {
 	pre=""
 	if [ "$1" = dplink ]; then pre="$1 $2 $3 $4"; shift 4; fi
 	if [ "$1" = dpdual ]; then pre="$1"; shift; fi
+	if [ "$1" = y420 ]; then pre="$pre $1"; shift; fi
 	# shellcheck disable=SC2086
 	"$B/pipegen" $pre "$@" > "$B/trace.txt"
 
@@ -121,7 +122,15 @@ table() {
 		fi
 	done < "$here/modes.txt"
 
-	python3 "$here/mkinc.py" "$HDR" "$B/trace.txt" "$(git -C "$L" rev-parse HEAD)" "$B"/modes/*.txt > "$B/$out"
+	# A 4:2:0 table also gets what changes with the encoding: the same pipe and timing lit in RGB.
+	rgb=""
+	if [[ " $pre " == *" y420 "* ]]; then
+		# shellcheck disable=SC2086
+		"$B/pipegen" ${pre/ y420/} "$@" > "$B/rgb.txt"
+		rgb=$B/rgb.txt
+	fi
+	MKINC_RGB=$rgb python3 "$here/mkinc.py" "$HDR" "$B/trace.txt" "$(git -C "$L" rev-parse HEAD)" "$B"/modes/*.txt \
+		> "$B/$out"
 	cp -f "$B/$out" "$repo/src/$out"
 	echo "wrote src/$out ($(grep -c "^	{ '" "$repo/src/$out") entries)"
 }
@@ -152,6 +161,10 @@ if [ $# -eq 0 ]; then
 		# and the DisplayPort connectors with an HDMI sink behind a passive DP++ adapter
 		table pipe2_linux_p${p}_dp1_tmds_uhd.inc   dpdual  $p 0 0 1  3840 176 88 296  2160 8 10 72  594000 1 1 97
 		table pipe2_linux_p${p}_dp2_tmds_uhd.inc   dpdual  $p 1 1 2  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		# and in YCbCr 4:2:0, at 297 MHz on the link, for an adapter that carries no more than 300 MHz: what
+		# amdgpu falls back to (force_yuv420_output) for a sink that takes VIC 97 in 4:2:0
+		table pipe2_linux_p${p}_dp1_tmds_y420.inc   dpdual y420  $p 0 0 1  3840 176 88 296  2160 8 10 72  594000 1 1 97
+		table pipe2_linux_p${p}_dp2_tmds_y420.inc   dpdual y420  $p 1 1 2  3840 176 88 296  2160 8 10 72  594000 1 1 97
 		# and with a DisplayPort sink, at CVT reduced blanking 3840x2160@60 (a 4K monitor's preferred timing on
 		# DisplayPort): no scrambling, the link trained for it at run time
 		table pipe2_linux_p${p}_dp1_uhd.inc   dplink a 0 0  $p 0 0 1  3840 48 32 80  2160 3 5 54  533250 1 0 0

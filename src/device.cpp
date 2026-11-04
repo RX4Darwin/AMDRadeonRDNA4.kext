@@ -2945,6 +2945,7 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", c.pipe * Pipe::Reg::kOtgStride,
 		              plan->aux);
 		xp().lit = xp().on = ok;
+		xp().target.rgb = false;
 		// Whether it runs: the frame rate of its timing generator, and the
 		// underflow flags of the plane and the OPTC (HUBPn_DCHUBP_CNTL,
 		// ODMn_OPTC_INPUT_GLOBAL_CONTROL), raw.
@@ -3137,17 +3138,17 @@ void RDNA4Device::selectExtra(size_t slot) {
 	extraSlot = slot;
 	// Its connector's table, or until it has a sink its pipe's first.
 	const ExtraPipe &x = xp();
-	if (!x.hpd || !Pipe2::use(x.hpd, x.lit ? x.hdmi : dpDual(x.hpd), x.pipe, x.uhd))
+	if (!x.hpd || !Pipe2::use(x.hpd, x.lit ? x.hdmi : dpDual(x.hpd), x.pipe, x.uhd, x.y420))
 		Pipe2::use(3, false, x.pipe);
 }
 
 /* The 3840x2160 table of the connector on that pin for that stream, or nullptr. */
-static const Pipe2::Config *uhdConfigFor(uint8_t hpd, bool dp)
+static const Pipe2::Config *uhdConfigFor(uint8_t hpd, bool dp, bool y420 = false)
 {
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
 		const Pipe2::Config &c = Pipe2::configAt(i);
 
-		if (c.hpd == hpd && c.dp == dp && Pipe2::isUhd(c))
+		if (c.hpd == hpd && c.dp == dp && c.y420 == y420 && Pipe2::isUhd(c))
 			return &c;
 	}
 
@@ -3169,11 +3170,22 @@ bool RDNA4Device::dpSinkTakes(const Edid::DetailedTiming &t) const
 	return xp().sink.maxRate && DpTrain::pickLink(xp().sink, t.pixelClockKHz, 24, link);
 }
 
-/* Whether the pipe's sink, on that pin, can be lit at 3840x2160. */
-bool RDNA4Device::sinkTakesUhd(uint8_t hpd) const
+/*
+ * Whether the pipe's sink, on that pin, can be lit at 3840x2160; `y420` says
+ * whether in YCbCr 4:2:0. That is for a DP++ adapter that carries no more than
+ * 300 MHz: the TMDS clock is then half the pixel clock, as amdgpu runs it
+ * (a Dell at 3840x2160@60 through the test rig's adapters, 2026-11-04).
+ */
+bool RDNA4Device::sinkTakesUhd(uint8_t hpd, bool *y420) const
 {
 	const bool dp = Pipe2::hasDpTable(hpd) && !dpDual(hpd);
 	const Pipe2::Config *c = uhdConfigFor(hpd, dp);
+	const Pipe2::Config *half = dpDual(hpd) ? uhdConfigFor(hpd, false, true) : nullptr;
+	const uint32_t adaptorKHz = dpDual(hpd) ? dpDualMaxKHz(hpd) : 0;
+	bool dummy;
+	bool &y = y420 ? *y420 : dummy;
+
+	y = false;
 
 	if (!c)
 		return false;
@@ -3184,11 +3196,17 @@ bool RDNA4Device::sinkTakesUhd(uint8_t hpd) const
 	if (!Edid::hdmi2Caps(xp().edid, xp().edidLen).scdc)
 		return false;
 
-	// Behind a DP++ adapter: only if it carries the table's clock.
-	if (dpDual(hpd) && dpDualMaxKHz(hpd) < c->timing.pixelClockKHz)
-		return false;
+	const uint8_t vic = Edid::vicOf(c->timing);
 
-	return Edid::hasVic(xp().edid, xp().edidLen, Edid::vicOf(c->timing));
+	if (!adaptorKHz || adaptorKHz >= c->timing.pixelClockKHz)
+		return Edid::hasVic(xp().edid, xp().edidLen, vic);
+
+	// Behind a DP++ adapter that does not carry the table's clock: in 4:2:0
+	// at half of it, if the sink takes the format so.
+	y = half && adaptorKHz >= ModeSet::tmdsKHz(half->timing.pixelClockKHz, true) &&
+	    Edid::takesY420(xp().edid, xp().edidLen, Edid::vicOf(half->timing));
+
+	return y;
 }
 
 /* Whether a pipe scans out: the boot pipe, or an extra one that is lit. */
@@ -3270,15 +3288,17 @@ uint32_t RDNA4Device::detShare(uint32_t plan, uint32_t others) const
 bool RDNA4Device::usePlanFor(uint8_t hpd) {
 	const Pipe2::Config was = Pipe2::config();
 	// A lit pipe keeps the size and the kind of stream it is lit with.
-	const bool uhd = xp().lit ? xp().uhd : uhdClocks && sinkTakesUhd(hpd);
+	bool y420 = xp().y420;
+	const bool uhd = xp().lit ? xp().uhd : uhdClocks && sinkTakesUhd(hpd, &y420);
 	const bool hdmi = xp().lit ? xp().hdmi : dpDual(hpd);
-	if (!Pipe2::use(hpd, hdmi, xp().pipe, uhd))
+	if (!Pipe2::use(hpd, hdmi, xp().pipe, uhd, y420))
 		return false;
 	if (Pipe2::config().dp && !pipe2DpAllowed) {
-		Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was));
+		Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was), was.y420);
 		return false;
 	}
 	xp().uhd = uhd;
+	xp().y420 = Pipe2::config().y420;
 	xp().hdmi = !Pipe2::config().dp;
 	return true;
 }
@@ -3295,7 +3315,8 @@ bool RDNA4Device::adoptSinkKind(uint8_t hpd)
 {
 	const Pipe2::Config was = Pipe2::config();
 	const bool hdmi = dpDual(hpd);
-	const bool uhd = uhdClocks && sinkTakesUhd(hpd);
+	bool y420 = false;
+	const bool uhd = uhdClocks && sinkTakesUhd(hpd, &y420);
 
 	if (!xp().lit || hpd != was.hpd || !Pipe2::hasDpTable(hpd) || hdmi == xp().hdmi)
 		return false;
@@ -3305,14 +3326,15 @@ bool RDNA4Device::adoptSinkKind(uint8_t hpd)
 		xp().on = false;
 	}
 
-	if (!Pipe2::use(hpd, hdmi, xp().pipe, uhd) || (Pipe2::config().dp && !pipe2DpAllowed)) {
-		Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was));
+	if (!Pipe2::use(hpd, hdmi, xp().pipe, uhd, y420) || (Pipe2::config().dp && !pipe2DpAllowed)) {
+		Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was), was.y420);
 		FBLOG("pipe2: HPD%u has another kind of sink, and no table for it: the pipe stays off", hpd);
 		return false;
 	}
 
 	xp().hdmi = hdmi;
 	xp().uhd = uhd;
+	xp().y420 = Pipe2::config().y420;
 	xp().moveOwed = true;
 	xp().moveToPlan = true;
 	FBLOG("pipe2: HPD%u now has %s: the pipe moves to its %ux%u table", hpd,
@@ -3386,16 +3408,16 @@ bool RDNA4Device::secondPipeTo(uint8_t hpd) {
 		if (!ok) {
 			FBLOG("pipe2: not moved from HPD%u to HPD%u: only between connectors with an HDMI "
 			      "stream the boot display does not use", was.hpd, hpd);
-			Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was));
+			Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was), was.y420);
 			return false;
 		}
 		FBLOG("pipe2: moving from HPD%u (DIG%u, link %u) to HPD%u (DIG%u, link %u) at %ux%u, %u kHz", was.hpd,
 		      was.dig, was.link, to.hpd, to.dig, to.link, xp().target.now.hActive, xp().target.now.vActive,
 		      xp().target.now.pixelClockKHz);
 		if (xp().on) {   // the old link down first, by its own table
-			Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was));
+			Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was), was.y420);
 			runSecondPipePart(Pipe2::Part::Sleep);
-			Pipe2::use(hpd, !to.dp, xp().pipe, Pipe2::isUhd(to));
+			Pipe2::use(hpd, !to.dp, xp().pipe, Pipe2::isUhd(to), to.y420);
 			xp().on = false;
 		}
 		xp().target.encoderObjId = path.encoderObjId;
@@ -3596,8 +3618,9 @@ void RDNA4Device::snapDiff(void *, const RegSnap::Reg &was, uint32_t now)
  */
 void RDNA4Device::scdcRefresh()
 {
-	const uint32_t khz = xp().target.now.pixelClockKHz ? xp().target.now.pixelClockKHz :
-							       Pipe2::config().timing.pixelClockKHz;
+	const uint32_t pixelKHz = xp().target.now.pixelClockKHz ? xp().target.now.pixelClockKHz :
+								    Pipe2::config().timing.pixelClockKHz;
+	const uint32_t khz = ModeSet::tmdsKHz(pixelKHz, Pipe2::config().y420 && !xp().target.rgb);
 
 	if (Pipe2::config().dp || !xp().target.sinkScdc || khz <= ModeSet::kScrambleFromKHz)
 		return;
@@ -3621,12 +3644,22 @@ Modes::Limits RDNA4Device::secondPipeModeLimits() const {
 		? DpTrain::bandwidthKbps(DpTrain::Link { xp().sink.maxLanes, xp().sink.maxRate }) / 24
 		: Pipe2::isUhd(Pipe2::config()) ? ModeSet::kMaxTmdsKHz : ModeSet::kScrambleFromKHz;
 
-	// Behind a passive DP++ adapter, what the adapter carries.
-	const uint32_t adaptorKHz = dpDualMaxKHz(Pipe2::config().hpd);
+	// Behind a passive DP++ adapter, what the adapter carries: in 4:2:0
+	// twice that in pixels.
+	const uint32_t adaptorKHz = dpDualMaxKHz(Pipe2::config().hpd) * (Pipe2::config().y420 ? 2 : 1);
 	if (adaptorKHz && adaptorKHz < lim.maxPixelClockKHz)
 		lim.maxPixelClockKHz = adaptorKHz;
 
 	return lim;
+}
+
+// Whether the pipe runs `t` in YCbCr 4:2:0: on a 4:2:0 table, a mode the
+// adapter does not carry in RGB (amdgpu's force_yuv420_output).
+bool RDNA4Device::secondPipeY420(const Edid::DetailedTiming &t) const
+{
+	const Pipe2::Config &c = Pipe2::config();
+
+	return c.y420 && t.pixelClockKHz > dpDualMaxKHz(c.hpd);
 }
 
 bool RDNA4Device::secondPipeModeOk(const Edid::DetailedTiming &t, const char **why) {
@@ -3640,6 +3673,14 @@ bool RDNA4Device::secondPipeModeOk(const Edid::DetailedTiming &t, const char **w
 		err = "no request timing for a pixel clock this far above the lit mode's";
 		return false;
 	}
+
+	// A pipe lit in YCbCr 4:2:0 runs in RGB what the adapter carries so, and
+	// in 4:2:0 only formats the sink takes that way.
+	if (secondPipeY420(t) && !Edid::takesY420(xp().edid, xp().edidLen, Edid::vicOf(t))) {
+		err = "the adapter does not carry it in RGB, and the sink does not take it in YCbCr 4:2:0";
+		return false;
+	}
+
 	// The DET segments the mode needs, next to what the other pipes hold.
 	uint32_t segments = Pipe2::modeDetSegments(t);
 	for (uint32_t i = 0; i < 4; i++)
@@ -3720,7 +3761,10 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 				t.dto = {};
 			t.vidM = ModeSet::dpVidM(to.pixelClockKHz, DpTrain::symbolClockKHz(xp().link.rate));
 		}
-		t.nextra = Pipe2::modeSteps(to, work->extra, Pipe2::kMaxModeSteps);
+		// A 4:2:0 table's encoding first, then the mode's registers.
+		t.y420 = secondPipeY420(to);
+		t.nextra = Pipe2::encodingSteps(t.y420, work->extra, Pipe2::kMaxModeSteps);
+		t.nextra += Pipe2::modeSteps(to, work->extra + t.nextra, Pipe2::kMaxModeSteps - t.nextra);
 		if (!ModeSet::build(t, *plan, &why))
 			return false;
 		why = "a step failed";
@@ -3728,6 +3772,7 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 		if (!runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", otgOffset))
 			return false;
 		xp().target.now = to;
+		xp().target.rgb = c.y420 && !t.y420;
 		return c.dp || runSecondPipePart(Pipe2::Part::Avi);
 	};
 	FBLOG("pipe2: switching to id %u %ux%u@%u.%03u (%u kHz), request timing %s", m.id, m.t.hActive, m.t.vActive,

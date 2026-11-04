@@ -148,6 +148,27 @@ namespace P3Hpd2TmdsUhd {
 #include "pipe2_linux_p3_dp2_tmds_uhd.inc"
 }
 
+// The DisplayPort connectors lit at 3840x2160@60 in YCbCr 4:2:0 for an HDMI
+// sink behind a passive DP++ adapter that carries no more than 300 MHz.
+namespace P1Hpd1TmdsY420 {
+#include "pipe2_linux_p1_dp1_tmds_y420.inc"
+}
+namespace P1Hpd2TmdsY420 {
+#include "pipe2_linux_p1_dp2_tmds_y420.inc"
+}
+namespace P2Hpd1TmdsY420 {
+#include "pipe2_linux_p2_dp1_tmds_y420.inc"
+}
+namespace P2Hpd2TmdsY420 {
+#include "pipe2_linux_p2_dp2_tmds_y420.inc"
+}
+namespace P3Hpd1TmdsY420 {
+#include "pipe2_linux_p3_dp1_tmds_y420.inc"
+}
+namespace P3Hpd2TmdsY420 {
+#include "pipe2_linux_p3_dp2_tmds_y420.inc"
+}
+
 // The DisplayPort connectors lit at 3840x2160@60 (CVT reduced blanking) for a
 // DisplayPort sink, for each pipe.
 namespace P1Hpd1Uhd {
@@ -180,6 +201,8 @@ struct Table {
 	const uint32_t             *values;     // ... one row of nregs values per mode
 	const AuxWrite             *aux;        // DisplayPort: what 'a' entries write
 	size_t                      naux;
+	const EncodingReg          *enc;        // 4:2:0: what differs in RGB
+	size_t                      nenc;
 };
 
 template <size_t G, size_t R, size_t M>
@@ -187,7 +210,15 @@ constexpr Table table(const Config &config, const Gen (&gen)[G], const ModeReg (
                       const Edid::DetailedTiming (&timings)[M], const uint32_t (&values)[M][R],
                       const AuxWrite *aux = nullptr, size_t naux = 0) {
 	static_assert(R <= kMaxModeSteps, "the mode table");
-	return { config, gen, G, regs, R, timings, M, &values[0][0], aux, naux };
+	return { config, gen, G, regs, R, timings, M, &values[0][0], aux, naux, nullptr, 0 };
+}
+
+template <size_t G, size_t R, size_t M, size_t E>
+constexpr Table table(const Config &config, const Gen (&gen)[G], const ModeReg (&regs)[R],
+                      const Edid::DetailedTiming (&timings)[M], const uint32_t (&values)[M][R],
+                      const EncodingReg (&enc)[E]) {
+	static_assert(R + E <= kMaxModeSteps, "the mode table");
+	return { config, gen, G, regs, R, timings, M, &values[0][0], nullptr, 0, enc, E };
 }
 template <size_t N> constexpr size_t countOf(const AuxWrite (&)[N]) { return N; }
 
@@ -240,6 +271,12 @@ constexpr Table kTables[] = {
 	      countOf(P3Hpd1Uhd::kAux)),
 	table(P3Hpd2Uhd::kConfig, P3Hpd2Uhd::kGen, P3Hpd2Uhd::kModeRegs, P3Hpd2Uhd::kModeTimings, P3Hpd2Uhd::kModeValues, P3Hpd2Uhd::kAux,
 	      countOf(P3Hpd2Uhd::kAux)),
+	table(P1Hpd1TmdsY420::kConfig, P1Hpd1TmdsY420::kGen, P1Hpd1TmdsY420::kModeRegs, P1Hpd1TmdsY420::kModeTimings, P1Hpd1TmdsY420::kModeValues, P1Hpd1TmdsY420::kEncoding),
+	table(P1Hpd2TmdsY420::kConfig, P1Hpd2TmdsY420::kGen, P1Hpd2TmdsY420::kModeRegs, P1Hpd2TmdsY420::kModeTimings, P1Hpd2TmdsY420::kModeValues, P1Hpd2TmdsY420::kEncoding),
+	table(P2Hpd1TmdsY420::kConfig, P2Hpd1TmdsY420::kGen, P2Hpd1TmdsY420::kModeRegs, P2Hpd1TmdsY420::kModeTimings, P2Hpd1TmdsY420::kModeValues, P2Hpd1TmdsY420::kEncoding),
+	table(P2Hpd2TmdsY420::kConfig, P2Hpd2TmdsY420::kGen, P2Hpd2TmdsY420::kModeRegs, P2Hpd2TmdsY420::kModeTimings, P2Hpd2TmdsY420::kModeValues, P2Hpd2TmdsY420::kEncoding),
+	table(P3Hpd1TmdsY420::kConfig, P3Hpd1TmdsY420::kGen, P3Hpd1TmdsY420::kModeRegs, P3Hpd1TmdsY420::kModeTimings, P3Hpd1TmdsY420::kModeValues, P3Hpd1TmdsY420::kEncoding),
+	table(P3Hpd2TmdsY420::kConfig, P3Hpd2TmdsY420::kGen, P3Hpd2TmdsY420::kModeRegs, P3Hpd2TmdsY420::kModeTimings, P3Hpd2TmdsY420::kModeValues, P3Hpd2TmdsY420::kEncoding),
 };
 constexpr size_t kTableCount = sizeof(kTables) / sizeof(kTables[0]);
 
@@ -267,13 +304,16 @@ int modeRow(const Edid::DetailedTiming &t) {
 }
 
 // The words of the AVI infoframe (version 2, 13 bytes) that depend on the
-// timing, as amdgpu's set_avi_info_frame fills them for 8 bpc full-range RGB:
+// timing, as amdgpu's set_avi_info_frame fills them for 8 bpc full-range RGB,
+// or YCbCr 4:2:0 (Y = 3, BT.709 colorimetry, no RGB quantization range):
 // word 1 is the checksum and PB1..3 (PB2 holds the picture aspect), 2 the VIC,
 // 3 and 4 the bottom and right bar ends (v total + 1, h total + 1).
-uint32_t aviWord(const Edid::DetailedTiming &t, uint32_t word) {
+uint32_t aviWord(const Edid::DetailedTiming &t, uint32_t word, bool y420) {
 	const uint32_t aspect = t.hActive * 9 == t.vActive * 16 ? 2 : t.hActive * 3 == t.vActive * 4 ? 1 : 0;
-	const uint32_t pb[4] = { 0x1e | (((aspect << 4) | 8) << 8) | (0x88u << 16), Edid::vicOf(t),
-	                         t.vTotal() + 1, t.hTotal() + 1 };
+	const uint32_t pb1 = y420 ? 0x7e : 0x1e;
+	const uint32_t pb2 = (aspect << 4) | 8 | (y420 ? 0x80 : 0);
+	const uint32_t pb3 = y420 ? 0x80 : 0x88;
+	const uint32_t pb[4] = { pb1 | (pb2 << 8) | (pb3 << 16), Edid::vicOf(t), t.vTotal() + 1, t.hTotal() + 1 };
 	if (word != 1)
 		return pb[word - 1];
 	uint32_t sum = 0x82 + 0x02 + 0x0d;   // the header: type, version, length
@@ -288,11 +328,11 @@ const Config &config() { return cur->config; }
 size_t configCount() { return kTableCount; }
 const Config &configAt(size_t i) { return kTables[i].config; }
 
-bool use(uint8_t hpd, bool tmds, uint8_t pipe, bool uhd) {
+bool use(uint8_t hpd, bool tmds, uint8_t pipe, bool uhd, bool y420) {
 	const Table *fallback = nullptr;
 
 	for (const Table &t : kTables) {
-		if (t.config.hpd != hpd || t.config.pipe != pipe || isUhd(t.config) != uhd)
+		if (t.config.hpd != hpd || t.config.pipe != pipe || isUhd(t.config) != uhd || t.config.y420 != y420)
 			continue;
 
 		if (t.config.dp != tmds) {
@@ -364,6 +404,34 @@ size_t modeSteps(const Edid::DetailedTiming &to, ModeSet::Step *out, size_t cap,
 	return n;
 }
 
+size_t encodingSteps(bool y420, ModeSet::Step *out, size_t cap) {
+	size_t n = 0;
+
+	for (size_t i = 0; i < cur->nenc && n < cap; i++) {
+		const EncodingReg &r = cur->enc[i];
+
+		out[n++] = ModeSet::Step { ModeSet::Op::Update, r.seg, false, r.dword, r.mask, y420 ? r.y420 : r.rgb, 0,
+		                           r.what };
+	}
+
+	return n;
+}
+
+// DIGn_DIG_FIFO_CTRL0: OUTPUT_PIXEL_PER_CYCLE, two in 4:2:0
+// (enc401_set_dig_input_mode).
+constexpr uint32_t kDigFifoCtrl0 = 0x209b, kDigPixelsPerCycle = 0x300;
+
+// What a plan step writes, but with the DIG's pixels a cycle of the encoding
+// the pipe runs.
+static uint32_t digInputMode(const Gen &g, uint32_t value, bool y420) {
+	const Config &c = cur->config;
+
+	if (g.seg != 2 || g.dword != kDigFifoCtrl0 + c.dig * kDigStride || !(g.mask & kDigPixelsPerCycle))
+		return value;
+
+	return (value & ~kDigPixelsPerCycle) | (y420 ? 0x100 : 0);
+}
+
 // What a plan step writes, but for this pipe's DET size when the target
 // asks for another one.
 static uint32_t detValue(const Target &t, const Gen &g) {
@@ -395,10 +463,15 @@ bool build(const Target &t, Plan &out, const char **why) {
 	}
 	const bool moved = t.part != Part::Light && t.now.pixelClockKHz;
 	const Edid::DetailedTiming &timing = moved ? t.now : c.timing;
-	const uint32_t khz = timing.pixelClockKHz;
+	// What the HDMI link carries: in YCbCr 4:2:0 half the pixel clock. A 4:2:0
+	// table's pipe may run a smaller mode in RGB.
+	const bool y420 = c.y420 && !(moved && t.rgb);
+	const uint32_t khz = ModeSet::tmdsKHz(timing.pixelClockKHz, y420);
+	const uint32_t planKHz = ModeSet::tmdsKHz(c.timing.pixelClockKHz, c.y420);
+
 	// The scrambler setting in sleep and wake is the plan's (the infoframe has none).
 	if (!c.dp && t.part != Part::Avi &&
-	    (khz > ModeSet::kScrambleFromKHz) != (c.timing.pixelClockKHz > ModeSet::kScrambleFromKHz)) {
+	    (khz > ModeSet::kScrambleFromKHz) != (planKHz > ModeSet::kScrambleFromKHz)) {
 		err = "sleep and wake are generated for the plan's side of 340 MHz";
 		return false;
 	}
@@ -429,6 +502,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 		pc.pllId = static_cast<uint8_t>(0x14 + c.link);   // ATOM_COMBOPHY_PLL0 + the link's PHY
 		pc.encoderObjId = static_cast<uint8_t>(t.encoderObjId & 0xff);
 		pc.encoderMode = Dmub::EncoderModeHdmi;
+		pc.miscInfo = y420 ? Dmub::kPixelClockMiscYuv420 : 0;
 		pc.crtcId = c.pipe;
 		Dmub::buildSetPixelClock(cmd, pc);
 	};
@@ -461,11 +535,11 @@ bool build(const Target &t, Plan &out, const char **why) {
 			break;
 		case 'R': ok = step(ModeSet::Op::Require, g, g.mask, g.value, 0); break;
 		case 'W': ok = step(ModeSet::Op::Write, g, 0, g.value, 0); break;
-		case 'U': ok = step(ModeSet::Op::Update, g, g.mask, detValue(t, g), 0); break;
+		case 'U': ok = step(ModeSet::Op::Update, g, g.mask, digInputMode(g, detValue(t, g), y420), 0); break;
 		// Linux carries on past a wait that times out, with a warning.
 		case 'T': ok = step(ModeSet::Op::WaitValue, g, g.mask, g.value, g.arg, true); break;
 		case 'D': ok = step(ModeSet::Op::Delay, g, 0, 0, g.arg); break;
-		case 'A': ok = step(ModeSet::Op::Write, g, 0, aviWord(timing, g.arg), 0); break;
+		case 'A': ok = step(ModeSet::Op::Write, g, 0, aviWord(timing, g.arg, y420), 0); break;
 		case 'K': {
 			// The register holds the 16-bit colour twice (DPG_COLOUR0 and 1).
 			const uint32_t v = t.depth == Depth::Stream ? kPatternColour[g.arg] * 0x10001u : g.value;
