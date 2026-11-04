@@ -21,6 +21,7 @@
 #include <Headers/plugin_start.hpp>
 #include "klog.hpp"
 #include "trial.hpp"
+#include "vrambench.hpp"
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLib.h>
@@ -982,6 +983,9 @@ void attach(FbEntry &e) {
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
 	fillHeads(dev);
+	// Behind the extra heads' slots, below the compute pool (128 MiB).
+	VramBench::run(dev.fbPhysBase, ((dev.fbLength + (1ull << 20) - 1) & ~((1ull << 20) - 1)) +
+	                               RDNA4Device::kMaxExtra * kHeadSlotBytes + (2ull << 20));
 
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
 	if (accelCensus && dev.isAmd)
