@@ -46,7 +46,7 @@ static void exact_image(uint32_t *img) {
 }
 
 int main(void) {
-	static uint32_t code[0x800], ib[600], img[256 * 256];
+	static uint32_t code[RDNA4_TRICOL_CODE_BYTES / 4], ib[600], img[256 * 256];
 	const uint64_t ring = 0x0000800100200000ull;   /* a canonical-looking 48-bit VA with bits above 2^32 */
 	rdna4_tricol_va va = { 0x0000800100000000ull, 0x0000800100002000ull, ring, 0x0000800100042000ull };
 

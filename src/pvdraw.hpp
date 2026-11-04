@@ -83,22 +83,53 @@ struct BlendPass {
 	}
 };
 
+// The entry list {u8 n, n x {u8 key, u8 size, value}} at `at`: the 4-byte values of keys below `keys` into values (those absent keep theirs);
+// returns where the list ends, 0 if it runs past len.
+static inline uint32_t entryList(const uint8_t *pb, uint32_t len, uint32_t at, uint32_t *values, uint32_t keys) {
+	if (at >= len)
+		return 0;
+	const uint32_t n = pb[at++];
+	for (uint32_t k = 0; k < n; k++) {
+		if (at + 2 > len || at + 2 + pb[at + 1] > len)
+			return 0;
+		if (pb[at] < keys && pb[at + 1] == 4)
+			memcpy(&values[pb[at]], pb + at + 2, 4);
+		at += 2 + pb[at + 1];
+	}
+	return at;
+}
+
+// A render pipeline's descriptor (pb, len bytes: the object with its 16-byte header) starts with an entry list: key 1 the vertex function, 2 the
+// fragment function, 3 the vertex descriptor's offset and 8 the colour attachments', both counted from the descriptor (+16) (measured on Sequoia
+// 24H232 with a vertex descriptor of known values, rdna4-mtlvdesc, 2026-11-04; with one the attachments no longer follow the label).
+static inline void pipelineKeys(const uint8_t *pb, uint32_t len, uint32_t top[16]) {
+	memset(top, 0, 16 * sizeof(uint32_t));
+	if (len >= 17)
+		(void)entryList(pb, len, 16, top, 16);
+}
+
 // Colour attachment 0's blend state from a render pipeline's descriptor (pb, len bytes; measured with mtlprobe's blendinfo, docs/m1-stream.md
 // s.5b): a 16-byte header, the function list {u8 n, n x {u8 key, u8 size, value}}, the pipeline's label (a C string, then 4-aligned; empty: one
 // zero byte; iTerm2's: "Pipeline for iTermMetalCellRenderer"), u32 colour attachments, u32 ?, then per attachment {u8 n, n x {u8 key, u8 size,
 // value}}: 0 index, 1 pixel format, 2 blending, 3 / 4 / 5 colour source factor, destination factor, operation, 6 / 7 / 8 the same for alpha,
 // 9 write mask. Keys not given keep Metal's defaults (off, One, Zero, Add, One, Zero, Add, 0xf); so does everything for a short descriptor.
+// Where the list's key 8 says, the attachments are there (a vertex descriptor lies between the label and them).
 static inline void readBlendState(const uint8_t *pb, uint32_t len, uint32_t blend[10]) {
 	static const uint32_t defaults[10] = {0, 0, 0, 1, 0, 0, 1, 0, 0, 0xf};
 	memcpy(blend, defaults, sizeof(defaults));
 	if (len < 17)
 		return;
-	uint32_t at = 17;
-	for (uint32_t k = 0; k < pb[16] && at + 2 <= len; k++)   // the function list
-		at += 2 + pb[at + 1];
-	while (at < len && pb[at])   // the label
-		at++;
-	at = (at + 1 + 3) & ~3u;
+	uint32_t top[16], at = 17;
+	pipelineKeys(pb, len, top);
+	if (top[8]) {
+		at = 16 + top[8];
+	} else {
+		for (uint32_t k = 0; k < pb[16] && at + 2 <= len; k++)   // the function list
+			at += 2 + pb[at + 1];
+		while (at < len && pb[at])   // the label
+			at++;
+		at = (at + 1 + 3) & ~3u;
+	}
 	uint32_t attachments = 0;
 	if (at + 9 <= len)
 		memcpy(&attachments, pb + at, 4);
@@ -106,4 +137,69 @@ static inline void readBlendState(const uint8_t *pb, uint32_t len, uint32_t blen
 	for (uint32_t k = 0, n = attachments && at < len ? pb[at++] : 0; k < n && at + 2 <= len; k++, at += 2 + pb[at + 1])
 		if (pb[at] < 10 && pb[at + 1] == 4 && at + 6 <= len)
 			memcpy(&blend[pb[at]], pb + at + 2, 4);
+}
+
+// A MTLVertexFormat as the translator's attribute kind (include/rdna4mtlc.h) | components << 4 | BGRA << 7; 0 for formats not handled.
+static inline uint32_t vertexFormat(uint32_t f) {
+	static const struct { uint8_t first, last, kind, count; } groups[] = {
+		{1, 3, 4, 2}, {4, 6, 5, 2}, {7, 9, 2, 2}, {10, 12, 3, 2}, {13, 15, 8, 2}, {16, 18, 9, 2}, {19, 21, 6, 2}, {22, 24, 7, 2},
+		{25, 27, 1, 2}, {28, 31, 0, 1}, {32, 35, 10, 1}, {36, 39, 11, 1}, {45, 45, 4, 1}, {46, 46, 5, 1}, {47, 47, 2, 1}, {48, 48, 3, 1},
+		{49, 49, 8, 1}, {50, 50, 9, 1}, {51, 51, 6, 1}, {52, 52, 7, 1}, {53, 53, 1, 1},
+	};
+	if (f == 42)   // uchar4Normalized_BGRA
+		return 2 | 4u << 4 | 1u << 7;
+	for (const auto &g : groups)
+		if (f >= g.first && f <= g.last)
+			return g.kind | (g.count + f - g.first) << 4;
+	return 0;
+}
+
+// One table of the vertex descriptor at `at`: {u32 n, u32 offset of each entry list from the count}; each list's keys 0-3 by its key 0, the
+// index (below `max`), into out[index], with present[index] set.
+static inline bool vertexTable(const uint8_t *pb, uint32_t len, uint32_t at, uint32_t (*out)[4], bool *present, uint32_t max) {
+	uint32_t n;
+	if (at + 4 > len)
+		return false;
+	memcpy(&n, pb + at, 4);
+	if (n > 31 || at + 4 + 4 * n > len)
+		return false;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t off, v[4] = {};
+		memcpy(&off, pb + at + 4 + 4 * i, 4);
+		if (!entryList(pb, len, at + off, v, 4) || v[0] >= max)
+			return false;
+		present[v[0]] = true;
+		memcpy(out[v[0]] + 1, v + 1, 3 * sizeof(uint32_t));
+	}
+	return true;
+}
+
+// The pipeline's vertex descriptor as the vertex stage's attribute records (RDNA4_MTLC_TABLE_ATTRIBUTES, include/rdna4mtlc.h): at the list's key 3,
+// an entry list with key 0 the attributes' table and key 1 the layouts', both offsets from it. An attribute: key 1 format (MTLVertexFormat), 2
+// offset, 3 buffer index; a layout (by buffer index): key 1 step function (default per vertex), 2 step rate (default 1), 3 stride. A record:
+// {offset, stride, buffer | kind << 8 | components << 12 | BGRA << 15 | step function << 16, step rate}; all zero without a descriptor or for an
+// attribute of a format not handled (the shader then reads (0, 0, 0, 1)). False if the descriptor is there but not understood.
+static inline bool readVertexDescriptor(const uint8_t *pb, uint32_t len, uint32_t rec[16][4]) {
+	uint32_t top[16], vd[2] = {}, attr[16][4] = {}, layout[31][4] = {};
+	bool attrSeen[16] = {}, layoutSeen[31] = {};
+	memset(rec, 0, 16 * 4 * sizeof(uint32_t));
+	pipelineKeys(pb, len, top);
+	if (!top[3])
+		return true;
+	const uint32_t at = 16 + top[3];
+	if (!entryList(pb, len, at, vd, 2) || !vertexTable(pb, len, at + vd[0], attr, attrSeen, 16) ||
+	    !vertexTable(pb, len, at + vd[1], layout, layoutSeen, 31))
+		return false;
+	for (uint32_t i = 0; i < 16; i++) {
+		const uint32_t f = attrSeen[i] ? vertexFormat(attr[i][1]) : 0, buffer = attr[i][3];
+		if (!f || buffer >= 31)
+			continue;
+		const uint32_t step = layoutSeen[buffer] && layout[buffer][1] ? layout[buffer][1] : 1;
+		const uint32_t rate = layoutSeen[buffer] && layout[buffer][2] ? layout[buffer][2] : 1;
+		rec[i][0] = attr[i][2];
+		rec[i][1] = layoutSeen[buffer] ? layout[buffer][3] : 0;
+		rec[i][2] = buffer | (f & 15) << 8 | (f >> 4 & 7) << 12 | (f >> 7 & 1) << 15 | step << 16;
+		rec[i][3] = rate;
+	}
+	return true;
 }

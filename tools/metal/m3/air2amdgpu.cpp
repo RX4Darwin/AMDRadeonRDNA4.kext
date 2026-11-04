@@ -621,6 +621,15 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			unused |= mdString(a, k) == "air.arg_unused";
 		if (vertex && kind == "air.vertex_id")
 			from[index] = 0;
+		else if (vertex && kind == "air.vertex_input" && !unused) {   // [[stage_in]]: fetched as the pipeline's vertex descriptor says
+			int location = -1;
+			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
+				if (mdString(a, k) == "air.location_index")
+					location = static_cast<int>(mdInt(a, k + 1));
+			if (location < 0 || location >= static_cast<int>(RDNA4_MTLC_MAX_ATTRIBUTES))
+				return "vertex input " + std::to_string(index) + ": only attributes 0-15 so far";
+			from[index] = 500 + location;
+		}
 		else if (vertex && kind == "air.instance_id")
 			from[index] = 1;
 		else if (!vertex && kind == "air.fragment_input" && !unused) {
@@ -650,9 +659,9 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
 				if (mdString(a, k) == "air.location_index")
 					location = static_cast<int>(mdInt(a, k + 1));
-			if (location < 0 || location > 7 || index >= air->arg_size() ||
+			if (location < 0 || location >= static_cast<int>(RDNA4_MTLC_MAX_BUFFERS) || index >= air->arg_size() ||
 			    (air->getArg(index)->getType() != PointerType::get(ctx, 1) && air->getArg(index)->getType() != PointerType::get(ctx, 2)))
-				return "buffer argument " + std::to_string(index) + ": only device and constant buffers at indices 0-7 so far";
+				return "buffer argument " + std::to_string(index) + ": only device and constant buffers at indices 0-27 so far";
 			from[index] = 100 + location;
 		} else if ((kind == "air.texture" || kind == "air.sampler") && !unused) {
 			int location = -1;
@@ -688,6 +697,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			position = static_cast<int>(k);
 		else if (vertex && kind == "air.vertex_output")
 			vars.push_back({k, fnv(mdString(o, 1)), false, 0});
+		else if (vertex && kind == "air.point_size")
+			continue;   // only triangles are drawn: a point's size is not used
 		else if (!(!vertex && kind == "air.render_target" && outputs->getNumOperands() == 1 && mdInt(o, 1) == 0 && colourType(air->getReturnType())))
 			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet";
 	}
@@ -755,8 +766,9 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	auto table = [&]() {   // the stage's table address, from its two user SGPRs
 		return b.CreateOr(b.CreateZExt(f->getArg(kTable), b.getInt64Ty()), b.CreateShl(b.CreateZExt(f->getArg(kTable + 1), b.getInt64Ty()), 32));
 	};
+	auto bufferSlot = [](unsigned n) -> uint64_t { return n < 8 ? 8 * n : RDNA4_MTLC_TABLE_MORE_BUFFERS + 8 * (n - 8); };
 	auto buffer = [&](unsigned n, Type *t) -> Value * {   // buffer n's address from the stage's table (constant memory, scalar loads)
-		Value *at = b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(8 * n)), PointerType::get(ctx, 4));
+		Value *at = b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(bufferSlot(n))), PointerType::get(ctx, 4));
 		Value *address = b.CreateIntToPtr(b.CreateAlignedLoad(b.getInt64Ty(), at, Align(8)), PointerType::get(ctx, 1));
 		return t == address->getType() ? address : b.CreateAddrSpaceCast(address, t);   // a constant buffer: made global again by legalize()
 	};
@@ -775,10 +787,86 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		                         {b.getInt32(15), b.CreateFPToUI(f->getArg(kPosX), i32), b.CreateFPToUI(f->getArg(kPosX + 1), i32), t, b.getInt32(0),
 		                          b.getInt32(0)});
 	};
+	// Vertex input `location` of vertex `vid` (instance: InstanceID + base instance) as the AIR argument's type t: its record in the table
+	// (RDNA4_MTLC_TABLE_ATTRIBUTES) gives the buffer, offset, stride, step and the format as a kind and a component count. Each component is
+	// read from the dword holding it (offsets and strides are multiples of 4); components past the format's are (0, 0, 0, 1).
+	auto attribute = [&](unsigned location, Value *vid, Value *instance, Type *t) -> Value * {
+		Value *at = b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(RDNA4_MTLC_TABLE_ATTRIBUTES + 16 * location)), PointerType::get(ctx, 4));
+		Value *rec = b.CreateAlignedLoad(FixedVectorType::get(i32, 4), at, Align(16));
+		Value *offset = b.CreateExtractElement(rec, uint64_t(0)), *stride = b.CreateExtractElement(rec, 1), *info = b.CreateExtractElement(rec, 2);
+		Value *rate = b.CreateExtractElement(rec, 3);
+		Value *slot = b.CreateAnd(info, 31), *kind = b.CreateAnd(b.CreateLShr(info, 8), 15), *count = b.CreateAnd(b.CreateLShr(info, 12), 7);
+		Value *bgra = b.CreateICmpNE(b.CreateAnd(info, 1u << 15), b.getInt32(0)), *step = b.CreateAnd(b.CreateLShr(info, 16), 3);
+		// the buffer's address: indices 0-7 at +8 n, 8-27 at RDNA4_MTLC_TABLE_MORE_BUFFERS
+		Value *slotAt = b.CreateSelect(b.CreateICmpULT(slot, b.getInt32(8)), b.CreateShl(slot, 3),
+		                               b.CreateAdd(b.getInt32(RDNA4_MTLC_TABLE_MORE_BUFFERS - 64), b.CreateShl(slot, 3)));
+		Value *base = b.CreateAlignedLoad(b.getInt64Ty(), b.CreateIntToPtr(b.CreateAdd(table(), b.CreateZExt(slotAt, b.getInt64Ty())),
+		                                                                  PointerType::get(ctx, 4)), Align(8));
+		// the element: per vertex, per instance (step rate 0: always the first), or constant
+		Value *perInstance = b.CreateSelect(b.CreateICmpEQ(rate, b.getInt32(0)), b.getInt32(0),
+		                                    b.CreateUDiv(instance, b.CreateSelect(b.CreateICmpEQ(rate, b.getInt32(0)), b.getInt32(1), rate)));
+		Value *element = b.CreateSelect(b.CreateICmpEQ(step, b.getInt32(1)), vid, b.CreateSelect(b.CreateICmpEQ(step, b.getInt32(2)), perInstance,
+		                                                                                         b.getInt32(0)));
+		Value *start = b.CreateAdd(base, b.CreateZExt(b.CreateAdd(b.CreateMul(element, stride), offset), b.getInt64Ty()));
+		// An attribute without a record (not in the descriptor, or of a format not handled) or whose buffer is not bound reads the
+		// table, which is always mapped, and gets the defaults: an unbound buffer's address is 0, and a load from there faults the GPU.
+		Value *valid = b.CreateAnd(b.CreateICmpNE(count, b.getInt32(0)), b.CreateICmpNE(base, b.getInt64(0)));
+		start = b.CreateSelect(valid, start, table());
+		count = b.CreateSelect(valid, count, b.getInt32(0));
+		Value *last = b.CreateSelect(valid, b.CreateSub(count, b.getInt32(1)), b.getInt32(0));
+		// log2 of a component's bytes by kind, two bits each: float 2, half 1, the 8-bit ones 0, the 16-bit ones 1, the 32-bit integers 2
+		Value *shift = b.CreateAnd(b.CreateLShr(b.getInt32(0xa55006), b.CreateShl(kind, 1)), 3);
+		Value *fv[4], *iv[4];
+		for (unsigned c = 0; c < 4; c++) {
+			Value *cc = b.CreateSelect(b.CreateICmpULT(b.getInt32(c), count), b.getInt32(c), last);
+			Value *byte = b.CreateShl(cc, shift);
+			Value *ptr = b.CreateIntToPtr(b.CreateAdd(start, b.CreateZExt(b.CreateAnd(byte, ~3u), b.getInt64Ty())), PointerType::get(ctx, 1));
+			Value *bits = b.CreateLShr(b.CreateAlignedLoad(i32, ptr, Align(4)), b.CreateShl(b.CreateAnd(byte, 3), 3));
+			Value *u8 = b.CreateAnd(bits, 255), *u16 = b.CreateAnd(bits, 0xffff);
+			Value *s8 = b.CreateAShr(b.CreateShl(bits, 24), 24), *s16 = b.CreateAShr(b.CreateShl(bits, 16), 16);
+			auto fk = [&](unsigned k) { return b.CreateICmpEQ(kind, b.getInt32(k)); };
+			Value *half = b.CreateFPExt(b.CreateBitCast(b.CreateTrunc(bits, b.getInt16Ty()), b.getHalfTy()), f32);
+			Value *minusOne = ConstantFP::get(f32, -1.0);
+			Value *f = b.CreateBitCast(bits, f32);
+			f = b.CreateSelect(fk(1), half, f);
+			f = b.CreateSelect(fk(2), b.CreateFMul(b.CreateUIToFP(u8, f32), ConstantFP::get(f32, 1.0 / 255)), f);
+			f = b.CreateSelect(fk(3), b.CreateMaxNum(b.CreateFMul(b.CreateSIToFP(s8, f32), ConstantFP::get(f32, 1.0 / 127)), minusOne), f);
+			f = b.CreateSelect(fk(4), b.CreateUIToFP(u8, f32), f);
+			f = b.CreateSelect(fk(5), b.CreateSIToFP(s8, f32), f);
+			f = b.CreateSelect(fk(6), b.CreateFMul(b.CreateUIToFP(u16, f32), ConstantFP::get(f32, 1.0 / 65535)), f);
+			f = b.CreateSelect(fk(7), b.CreateMaxNum(b.CreateFMul(b.CreateSIToFP(s16, f32), ConstantFP::get(f32, 1.0 / 32767)), minusOne), f);
+			f = b.CreateSelect(fk(8), b.CreateUIToFP(u16, f32), f);
+			f = b.CreateSelect(fk(9), b.CreateSIToFP(s16, f32), f);
+			f = b.CreateSelect(fk(10), b.CreateSIToFP(bits, f32), f);
+			f = b.CreateSelect(fk(11), b.CreateUIToFP(bits, f32), f);
+			Value *n = b.CreateFPToSI(f, i32);   // an integer input of a float format (not Metal's), then the integer formats as they are
+			n = b.CreateSelect(b.CreateOr(fk(4), fk(8)), b.CreateSelect(fk(4), u8, u16), n);
+			n = b.CreateSelect(b.CreateOr(fk(5), fk(9)), b.CreateSelect(fk(5), s8, s16), n);
+			n = b.CreateSelect(b.CreateOr(fk(10), fk(11)), bits, n);
+			Value *present = b.CreateICmpULT(b.getInt32(c), count);
+			fv[c] = b.CreateSelect(present, f, ConstantFP::get(f32, c == 3 ? 1.0 : 0.0));
+			iv[c] = b.CreateSelect(present, n, b.getInt32(c == 3 ? 1 : 0));
+		}
+		for (Value **v : {fv, iv}) {   // BGRA formats: the first and third components swapped
+			Value *x = v[0];
+			v[0] = b.CreateSelect(bgra, v[2], v[0]);
+			v[2] = b.CreateSelect(bgra, x, v[2]);
+		}
+		auto *vt = dyn_cast<FixedVectorType>(t);
+		Type *e = vt ? vt->getElementType() : t;
+		Value *r = vt ? PoisonValue::get(t) : nullptr;
+		for (unsigned k = 0; k < components(t) && k < 4; k++) {
+			Value *x = e->isIntegerTy() ? b.CreateTrunc(iv[k], e) : e->isHalfTy() ? b.CreateFPTrunc(fv[k], e) : fv[k];
+			r = vt ? b.CreateInsertElement(r, x, k) : x;
+		}
+		return r;
+	};
 	auto callAir = [&](Value *vid) {
 		SmallVector<Value *, 4> args;
 		for (unsigned k = 0; k < air->arg_size(); k++)
-			args.push_back(from[k] == 0 ? b.CreateZExtOrTrunc(vid, air->getArg(k)->getType())   // uint or ushort
+			args.push_back(from[k] >= 500 ? attribute(static_cast<unsigned>(from[k] - 500), vid, b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance)),
+			                                          air->getArg(k)->getType())
+			               : from[k] == 0 ? b.CreateZExtOrTrunc(vid, air->getArg(k)->getType())   // uint or ushort
 			               : from[k] == 1 ? b.CreateZExtOrTrunc(b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance)), air->getArg(k)->getType())   // with the base instance
 			               : from[k] >= 400 ? fromVec4(inValues[static_cast<unsigned>(from[k] - 400)], air->getArg(k)->getType())
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())

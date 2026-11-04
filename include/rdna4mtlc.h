@@ -27,3 +27,12 @@ enum { kMtlcNext = 0, kMtlcDeliver = 1 };
 /* The fragment stage's colour attachment 0 as the draw found it, for shaders that read it (Metal's [[color(0)]] input): a T# of the host's
  * staged RGBA8 copy of the target. */
 #define RDNA4_MTLC_TABLE_FRAMEBUFFER 832u
+/* Buffers 8-27's addresses (indices 0-7 are at +0). */
+#define RDNA4_MTLC_TABLE_MORE_BUFFERS 864u
+#define RDNA4_MTLC_MAX_BUFFERS 28u
+/* The vertex stage's vertex descriptor: attribute n (0-15) at RDNA4_MTLC_TABLE_ATTRIBUTES + 16 n, {u32 offset in the element, u32 stride,
+ * u32 buffer index | kind << 8 | components << 12 | BGRA << 15 | step function << 16 (MTLVertexStepFunction), u32 step rate}; kind:
+ * 0 float, 1 half, 2 unorm8, 3 snorm8, 4 uint8, 5 sint8, 6 unorm16, 7 snorm16, 8 uint16, 9 sint16, 10 int, 11 uint (the host's
+ * vertexFormat). Metal keeps offsets and strides multiples of 4. */
+#define RDNA4_MTLC_TABLE_ATTRIBUTES 0x800u
+#define RDNA4_MTLC_MAX_ATTRIBUTES 16u

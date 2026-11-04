@@ -87,6 +87,30 @@ int main() {
 		const uint32_t want[8] = {0x01234567, 0xc0540000, 0x0007c00f, 0x90000fac, 63, 0x00400000, 0x00008000, 0};
 		CHECK(!std::memcmp(t, want, sizeof(want)));
 	}
+	// A render pipeline with a vertex descriptor (Sequoia 24H232, rdna4-mtlvdesc, 2026-11-04): attribute 0 float2 at 4 in buffer 1, attribute 3
+	// uchar4Normalized at 12 in buffer 1, attribute 5 half2 at 0 in buffer 2; layout 1 stride 20 per vertex, layout 2 stride 8 per instance, step
+	// rate 3; colour attachment 0 BGRA8Unorm (80) without blending. Key 8 says where the attachments are: they no longer follow the label.
+	{
+		static const char *hex =
+		    "0e000000f000000003000000dd0000000403041c0000000804c80000000104020000000204010000000000000200041000000001046800000000000003000000"
+		    "1000000029000000420000000400040000000001041d0000000204040000000304010000000400040300000001040900000002040c0000000304010000000300"
+		    "040500000001041900000003040200000000000003000000100000001d0000002a00000002000401000000030414000000020004010000000304140000000400"
+		    "040200000001040200000002040300000003040800000000010000000800000002000400000000010450000000000000";
+		uint8_t pb[240] = {};
+		for (unsigned k = 0; k < sizeof(pb); k++)
+			std::sscanf(hex + 2 * k, "%2hhx", &pb[k]);
+		uint32_t top[16], rec[16][4], blend[10];
+		pipelineKeys(pb, sizeof(pb), top);
+		CHECK(top[1] == 2 && top[2] == 1 && top[3] == 0x1c && top[8] == 0xc8);
+		CHECK(readVertexDescriptor(pb, sizeof(pb), rec));
+		CHECK(rec[0][0] == 4 && rec[0][1] == 20 && rec[0][2] == (1 | 0u << 8 | 2u << 12 | 1u << 16) && rec[0][3] == 1);   // float2
+		CHECK(rec[3][0] == 12 && rec[3][1] == 20 && rec[3][2] == (1 | 2u << 8 | 4u << 12 | 1u << 16));                  // uchar4Normalized
+		CHECK(rec[5][0] == 0 && rec[5][1] == 8 && rec[5][2] == (2 | 1u << 8 | 2u << 12 | 2u << 16) && rec[5][3] == 3);   // half2, per instance
+		CHECK(rec[1][2] == 0 && rec[2][2] == 0 && rec[4][2] == 0);
+		readBlendState(pb, sizeof(pb), blend);
+		CHECK(blend[1] == 80 && blend[2] == 0 && blend[3] == 1 && blend[9] == 0xf);
+		CHECK(vertexFormat(42) == (2 | 4u << 4 | 1u << 7) && vertexFormat(31) == (0 | 4u << 4) && vertexFormat(40) == 0);
+	}
 	if (failures) {
 		std::printf("pvdraw: %d check(s) FAILED\n", failures);
 		return 1;

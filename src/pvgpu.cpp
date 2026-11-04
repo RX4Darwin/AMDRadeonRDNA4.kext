@@ -13,6 +13,7 @@
 #include "pvscanout.hpp"
 #include "sku.hpp"
 #include "compute.hpp"
+#include "isa.hpp"
 #include "mtlkernels.h"
 #include "../userspace/rdna4-run/gfx12tri.h"     // M4: the triangle streams the host's draws are built from (plain, one attribute)
 #include "../userspace/rdna4-run/gfx12tricol.h"
@@ -205,6 +206,7 @@ private:
 		uint32_t helper;                      // gTr.helpers when it was translated (or failed)
 	};
 	const Jit *translated(uint32_t task, uint64_t lib, const char *name, const uint8_t hash[32]);
+	static void placeShaders(uint32_t *code, const Jit *const shader[3], uint64_t rings, uint32_t outs);
 	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
 	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow = nullptr, uint32_t *width = nullptr,
 	                  uint32_t *height = nullptr, uint32_t *format = nullptr);
@@ -214,7 +216,7 @@ private:
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
 	uint32_t runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
-	struct Bindings { uint32_t buffer[8]; uint64_t offset[8]; uint32_t texture[16], sampler[16]; };   // a stage's resources by Metal index (0 = none)
+	struct Bindings { uint32_t buffer[RDNA4_MTLC_MAX_BUFFERS]; uint64_t offset[RDNA4_MTLC_MAX_BUFFERS]; uint32_t texture[16], sampler[16]; };   // by Metal index (0 = none)
 	// A draw: Metal's primitive type, first vertex, vertices (indices), instances, base instance, and for an indexed draw the index buffer's
 	// resource id, offset and index size (bytes; 0: not indexed).
 	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes, blendColor[4]; uint64_t viewport[4]; bool viewportSet; };
@@ -785,7 +787,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		uint32_t first, count;
 		memcpy(&first, payload, 4);
 		memcpy(&count, payload + 4, 4);
-		for (uint32_t k = 0; k < count && first + k < 8 && 8 + 12 * (k + 1) <= bytes; k++) {
+		for (uint32_t k = 0; k < count && first + k < RDNA4_MTLC_MAX_BUFFERS && 8 + 12 * (k + 1) <= bytes; k++) {
 			memcpy(&g.buffer[first + k], payload + 8 + 12 * k, 4);
 			memcpy(&g.offset[first + k], payload + 12 + 12 * k, 8);
 		}
@@ -810,7 +812,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		RDNA4PvHost::Bindings &g = id == 0x0cf ? t->compute : t->stage[id == 0x06f];
 		uint32_t index;
 		memcpy(&index, payload, 4);
-		if (index < 8)
+		if (index < RDNA4_MTLC_MAX_BUFFERS)
 			memcpy(&g.offset[index], payload + 4, 8);
 	} else if (id == 0x0d0 && bytes >= 4) {
 		memcpy(&t->pipeline, payload, 4);
@@ -1156,6 +1158,42 @@ bool RDNA4PvHost::releaseTextures(uint32_t task, StagedTexture (&staged)[16], bo
 	return all;
 }
 
+namespace {
+
+const uint8_t kNoHash[32] = {};
+
+// A vertex shader's ring descriptor literals (nggcol.s) with the attribute ring at `rings`, `outs` values a vertex.
+uint32_t ringLiteral(uint32_t dw, uint64_t rings, uint32_t outs)
+{
+	if (dw == 0xc01a0001u)
+		return static_cast<uint32_t>(rings);
+
+	if (dw == 0xc01a0002u)
+		return static_cast<uint32_t>((rings >> 32) & 0xffff) | 0xc0000000u | 16u * outs << 16;   // swizzle 3, stride 16 bytes per value (RADV)
+
+	if (dw == 0xc01a0003u)
+		return static_cast<uint32_t>(Gfx12DrawCol::kColAttrRingBytes);
+
+	return dw;
+}
+
+} // namespace
+
+// The shaders' code as the draw stream finds it: VS at +0, PS at +RDNA4_TRI_PS_OFFSET, each slot padded with s_code_end for the SQ's
+// prefetch; the vertex shader's ring literals patched when it has values for the fragment shader.
+void RDNA4PvHost::placeShaders(uint32_t *code, const Jit *const shader[3], uint64_t rings, uint32_t outs)
+{
+	for (uint32_t i = 0; i < RDNA4_TRI_CODE_BYTES / 4; i++)
+		code[i] = Isa::kSCodeEnd;
+
+	for (unsigned k = 1; k <= 2; k++)
+		memcpy(reinterpret_cast<uint8_t *>(code) + (k == 1 ? 0 : RDNA4_TRI_PS_OFFSET), shader[k]->gfx + 32,
+		       reinterpret_cast<const uint32_t *>(shader[k]->gfx)[2]);
+
+	for (uint32_t i = 0; outs && i < RDNA4_TRI_PS_OFFSET / 4; i++)
+		code[i] = ringLiteral(code[i], rings, outs);
+}
+
 // M4: Render.drawPrimitives on the card: the pipeline's vertex and fragment functions translated by the helper (air2amdgpu.cpp
 // translateShader), drawn with the stream of src/gfx12_draw.h (the triangle every gfx test of the kext draws, proven on the card) with the
 // translated shaders in place of its own and the target, viewport, blending and draw patched; the colour attachment (a BGRA8 texture or
@@ -1177,14 +1215,19 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 				memcpy(&fn[pb[at]], pb + at + 2, 4);
 	}
 	// Colour attachment 0's blend state, from the pipeline's descriptor (readBlendState, pvdraw.hpp).
-	uint32_t blend[10];
+	// And its vertex descriptor as the vertex stage's attribute records (pvdraw.hpp, include/rdna4mtlc.h).
+	uint32_t blend[10], attributes[RDNA4_MTLC_MAX_ATTRIBUTES][4];
+	bool attributesKnown;
 	{
-		uint8_t pb[256] = {};
+		static uint8_t pb[1024];   // ponytail: one host, draws run one at a time on its work loop
 		uint32_t rec[3];
 		const uint32_t len = readGuest(task, 0x1000 + 12ull * pipeline, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) ? rec[0] >> 8 : 0;
-		readBlendState(pb, len >= 17 && len <= sizeof(pb) && readGuest(task, rec[1], pb, len) ? len : 0, blend);
+		const uint32_t got = len >= 17 && len <= sizeof(pb) && readGuest(task, rec[1], pb, len) ? len : 0;
+		readBlendState(pb, got, blend);
+		attributesKnown = readVertexDescriptor(pb, got, attributes);
 	}
 	const char *why = !fn[1] || !fn[2] ? "the pipeline has no vertex or no fragment function"
+	                : !attributesKnown ? "the pipeline's vertex descriptor is not understood"
 	                : draw.type != 3 && draw.type != 4 ? "only triangle lists and strips so far"
 	                : !draw.instances ? "no instances"
 	                : draw.indexBytes && draw.start ? "a base vertex in an indexed draw (so far)"
@@ -1195,9 +1238,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		uint8_t hash[32];
 		uint64_t lib = 0;
 		shader[k] = functionName(task, fn[k], name[k], sizeof(name[k]), hash, &lib) ? translated(task, lib, name[k], hash) : nullptr;
-		// The RGFX header: {"RGFX", u32 stage, u32 code bytes, ...}; the code must fit its 4 KiB slot with room for the prefetch.
+		// The RGFX header: {"RGFX", u32 stage, u32 code bytes, ...}; the code must fit its slot with room for the prefetch.
 		const auto *head = shader[k] && shader[k]->gfx && shader[k]->gfxLen >= 32 ? reinterpret_cast<const uint32_t *>(shader[k]->gfx) : nullptr;
-		if (!head || head[1] != k || head[2] > 0xf00 || head[2] + 32 > shader[k]->gfxLen)
+		if (!head || head[1] != k || head[2] > RDNA4_TRI_PS_OFFSET - 4 * RDNA4_TRI_SHADER_PAD || head[2] + 32 > shader[k]->gfxLen)
 			why = k == 1 ? "no translated vertex shader" : "no translated fragment shader";
 	}
 	// The values between the stages: after each shader's code its table {u32 name hash, u32 flags (bit 0 flat)}, the vertex function's
@@ -1259,20 +1302,14 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	          rdna4_trirun_rings_fit(mGfxRings.gpu, rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK, rdna4_tri_ring_bytes()) &&
 	          gCompute->rtAlloc(this, targetBytes, tgt.handle, tgt.gpu) == kIOReturnSuccess;
 
-	// The shaders: VS at +0, PS at +RDNA4_TRI_PS_OFFSET, each slot padded with s_code_end for the SQ's prefetch.
+	// The shaders, only uploaded when the pair changes: WindowServer draws with few pipelines, and the slots are large.
 	static uint32_t code[RDNA4_TRI_CODE_BYTES / 4];   // ponytail: one host, draws run one at a time on its work loop
-	for (uint32_t i = 0; i < RDNA4_TRI_CODE_BYTES / 4; i++)
-		code[i] = 0xbf9f0000u;
-	for (unsigned k = 1; k <= 2; k++)
-		memcpy(reinterpret_cast<uint8_t *>(code) + (k == 1 ? 0 : RDNA4_TRI_PS_OFFSET), shader[k]->gfx + 32, reinterpret_cast<const uint32_t *>(shader[k]->gfx)[2]);
+	static uint8_t loaded[2][32];   // the hashes of the pair in mGfxCode (all zero: none)
 	const uint64_t rings = rdna4_trirun_rings_va(mGfxRings.gpu);   // attribute ring first
-	for (uint32_t i = 0; outs && i < RDNA4_TRI_PS_OFFSET / 4; i++)   // the vertex shader's ring descriptor literals (nggcol.s)
-		if (code[i] == 0xc01a0001u)
-			code[i] = static_cast<uint32_t>(rings);
-		else if (code[i] == 0xc01a0002u)
-			code[i] = static_cast<uint32_t>((rings >> 32) & 0xffff) | 0xc0000000u | 16u * outs << 16;   // swizzle 3, stride 16 bytes per value (RADV)
-		else if (code[i] == 0xc01a0003u)
-			code[i] = static_cast<uint32_t>(Gfx12DrawCol::kColAttrRingBytes);
+	const bool newCode = ok && (memcmp(loaded[0], shader[1]->hash, 32) || memcmp(loaded[1], shader[2]->hash, 32));
+
+	if (newCode)
+		placeShaders(code, shader, rings, outs);
 
 	// The stream: the triangle's, with this draw's addresses, shaders' registers, target, viewport and vertex count.
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];
@@ -1315,9 +1352,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			ok = false;
 	// The stages' buffers, staged into the runtime, and their tables at +0x400 (vertex) and +0x800 (fragment) of the misc page (the fence at +0).
 	static constexpr uint64_t kMaxBuffer = 64ull << 20;
-	uint64_t misc[0xc00 / 8] = {}, handle[2][8] = {};
+	static uint64_t misc[RDNA4_TRIRUN_PAGE / 8];   // a page: too large for the kernel stack
+	uint64_t handle[2][RDNA4_MTLC_MAX_BUFFERS] = {};
+	memset(misc, 0, sizeof(misc));
 	for (unsigned st = 0; st < 2 && ok; st++)
-		for (unsigned k = 0; k < 8 && ok; k++) {
+		for (unsigned k = 0; k < RDNA4_MTLC_MAX_BUFFERS && ok; k++) {
 			uint64_t bva = 0, blen = 0;
 			if (!bound[st].buffer[k])
 				continue;
@@ -1336,8 +1375,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			}
 			if (copy)
 				IOFree(copy, bytes);
-			misc[(0x400 + 0x400 * st) / 8 + k] = gpu;
+			misc[(0x400 + 0x400 * st + (k < 8 ? 8 * k : RDNA4_MTLC_TABLE_MORE_BUFFERS + 8 * (k - 8))) / 8] = gpu;
 		}
+	memcpy(&misc[(0x400 + RDNA4_MTLC_TABLE_ATTRIBUTES) / 8], attributes, sizeof(attributes));
 	StagedTexture staged[2][16] = {};
 	for (unsigned st = 0; st < 2 && ok; st++)
 		ok = stageTextures(task, bound[st], reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]), staged[st], talk, st ? "fragment" : "vertex");
@@ -1450,9 +1490,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		const char *step = "target in";
 		IOReturn r = gCompute->rtCopy(this, tgt.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), targetBytes, true);
 
-		if (r == kIOReturnSuccess) {
+		if (r == kIOReturnSuccess && newCode) {
 			step = "code in";
 			r = gCompute->rtCopy(this, mGfxCode.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(code), sizeof(code), true);
+			for (unsigned k = 0; k < 2; k++)
+				memcpy(loaded[k], r == kIOReturnSuccess ? shader[k + 1]->hash : kNoHash, 32);
 		}
 
 		if (r == kIOReturnSuccess) {
@@ -1495,7 +1537,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	if (tgt.handle)
 		gCompute->rtFree(this, tgt.handle);
 	for (unsigned st = 0; st < 2; st++)
-		for (unsigned k = 0; k < 8; k++)
+		for (unsigned k = 0; k < RDNA4_MTLC_MAX_BUFFERS; k++)
 			if (handle[st][k])
 				gCompute->rtFree(this, handle[st][k]);
 	if (indexHandle)
