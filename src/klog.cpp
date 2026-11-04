@@ -77,6 +77,63 @@ SYSCTL_PROC(_debug, OID_AUTO, rdna4_log,
 	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, logSysctl,
 	    "A", "AMDRadeonRDNA4 log since boot");
 
+/* At most this much a read of debug.rdna4_log_read: the lock is held while it is copied. */
+constexpr size_t kReadChunk = 64 * 1024;
+
+/*
+ * debug.rdna4_log_read, for a reader following the log (rdna4-logd): given
+ * the u64 offset into everything ever logged it has read up to, it gets
+ * {u64 offset of the first byte returned, u64 bytes ever logged} and the
+ * bytes from there, up to kReadChunk. The first offset is later than the
+ * one given when the ring has dropped those bytes already.
+ */
+int readSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+	uint64_t from = 0, head[2];
+	char *buf;
+	size_t n;
+	int err;
+
+	if (req->newptr) {
+		err = SYSCTL_IN(req, &from, sizeof(from));
+		if (err)
+			return err;
+	}
+
+	if (!gLock)
+		return ENOENT;
+
+	buf = static_cast<char *>(IOMalloc(sizeof(head) + kReadChunk));
+	if (!buf)
+		return ENOMEM;
+
+	IOSimpleLockLock(gLock);
+
+	if (from + kRdna4LogRing < gWritten)
+		from = gWritten - kRdna4LogRing;
+
+	if (from > gWritten)
+		from = gWritten;
+
+	n = gWritten - from < kReadChunk ? gWritten - from : kReadChunk;
+	for (size_t i = 0; i < n; i++)
+		buf[sizeof(head) + i] = gRing[(from + i) % kRdna4LogRing];
+
+	head[0] = from;
+	head[1] = gWritten;
+	IOSimpleLockUnlock(gLock);
+
+	memcpy(buf, head, sizeof(head));
+	err = SYSCTL_OUT(req, buf, sizeof(head) + n);
+	IOFree(buf, sizeof(head) + kReadChunk);
+
+	return err;
+}
+
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_log_read,
+	    CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, readSysctl,
+	    "S", "AMDRadeonRDNA4 log from an offset (rdna4-logd)");
+
 } /* namespace */
 
 void rdna4Log(const char *fmt, ...)
@@ -105,6 +162,9 @@ void rdna4LogInit()
 		return;
 
 	gLock = IOSimpleLockAlloc();
-	if (gLock)
-		sysctl_register_oid(&sysctl__debug_rdna4_log);
+	if (!gLock)
+		return;
+
+	sysctl_register_oid(&sysctl__debug_rdna4_log);
+	sysctl_register_oid(&sysctl__debug_rdna4_log_read);
 }
