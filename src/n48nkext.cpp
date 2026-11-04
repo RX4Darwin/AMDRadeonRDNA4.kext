@@ -36,6 +36,7 @@
 //
 
 #include "compute.hpp"
+#include "klog.hpp"
 #include "flip.hpp"
 #include "n48n.hpp"
 #include "pipe.hpp"
@@ -54,7 +55,7 @@
 
 using namespace GfxReg;
 
-#define VLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: vulkan: " fmt "\n", ## __VA_ARGS__)
+#define VLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: vulkan: " fmt "\n", ## __VA_ARGS__)
 
 namespace {
 

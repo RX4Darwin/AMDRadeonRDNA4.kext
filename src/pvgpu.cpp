@@ -6,6 +6,8 @@
 //
 
 #include "pvgpu.hpp"
+#include "trial.hpp"
+#include "klog.hpp"
 #include "pvstream.hpp"
 #include "pvdraw.hpp"
 #include "compute.hpp"
@@ -80,7 +82,7 @@ void pvlog(const char *fmt, ...) {
 	const uint32_t n = __atomic_fetch_add(&gLogLines, 1u, __ATOMIC_RELAXED);
 	if (n >= kMaxLogLines) {
 		if (n == kMaxLogLines)
-			IOLog("AMDRadeonRDNA4: pvgpu: log budget (%u lines) used up\n", kMaxLogLines);
+			rdna4Log("AMDRadeonRDNA4: pvgpu: log budget (%u lines) used up\n", kMaxLogLines);
 		return;
 	}
 	char buf[240];
@@ -88,7 +90,7 @@ void pvlog(const char *fmt, ...) {
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
-	IOLog("AMDRadeonRDNA4: pvgpu: %s\n", buf);
+	rdna4Log("AMDRadeonRDNA4: pvgpu: %s\n", buf);
 }
 
 // The first three calls of each of the nub's methods: what macOS and Apple's driver do with the nub, in order (the M0 runs on the rig, 2026-10-15/21).
@@ -364,13 +366,13 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	if (!gTr.lock)
 		gTr.lock = IOLockAlloc();   // ponytail: never freed, like the host
 	uint32_t disp = 0;
-	if (PE_parse_boot_argn("rdna4-pvgpu-disp", &disp, sizeof(disp)))
+	if (Trial::option("rdna4-pvgpu-disp", disp))
 		h->mDisp = disp & 3;
 	if (level >= 2)
 		h->mDisp = 3;   // the self-test plays the guest's side of the display events
 	uint32_t w = 0, ht = 0;
-	PE_parse_boot_argn("rdna4-pvgpu-width", &w, sizeof(w));
-	PE_parse_boot_argn("rdna4-pvgpu-height", &ht, sizeof(ht));
+	(void)Trial::option("rdna4-pvgpu-width", w);
+	(void)Trial::option("rdna4-pvgpu-height", ht);
 	if (w || ht) {
 		if (w >= 64 && w <= 8192 && ht >= 64 && ht <= 8192) {
 			h->mDispInfo.width = h->mDispInfo.modes[0].width = static_cast<uint16_t>(w);

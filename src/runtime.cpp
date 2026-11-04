@@ -19,6 +19,7 @@
 //
 
 #include "compute.hpp"
+#include "klog.hpp"
 #include "userclient.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -32,7 +33,7 @@
 #include <kern/clock.h>
 #include <libkern/c++/OSObject.h>
 
-#define RLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: runtime: " fmt "\n", ## __VA_ARGS__)
+#define RLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: runtime: " fmt "\n", ## __VA_ARGS__)
 #define CLOG(...) RLOG(__VA_ARGS__)
 
 using namespace GfxReg;
@@ -1692,7 +1693,7 @@ void rdna4Step(const char *what) {
 	uint32_t ms = 0;
 	if (!PE_parse_boot_argn("rdna4-steptrace", &ms, sizeof(ms)) || !ms)
 		return;
-	IOLog("AMDRadeonRDNA4: step: %s\n", what);
+	rdna4Log("AMDRadeonRDNA4: step: %s\n", what);
 	IOSleep(ms);
 }
 

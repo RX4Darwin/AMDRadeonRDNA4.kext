@@ -16,6 +16,7 @@
 //
 
 #include "compute.hpp"
+#include "klog.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -24,8 +25,8 @@
 #include <libkern/c++/OSObject.h>
 #include <pexpert/pexpert.h>
 
-#define ILOG(fmt, ...)  IOLog("AMDRadeonRDNA4: idle: " fmt "\n", ## __VA_ARGS__)
-#define PLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: power: " fmt "\n", ## __VA_ARGS__)
+#define ILOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: idle: " fmt "\n", ## __VA_ARGS__)
+#define PLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: power: " fmt "\n", ## __VA_ARGS__)
 
 namespace {
 

@@ -396,6 +396,7 @@ void RDNA4Device::dmubCursorTest() {
 // ---------------------------------------------------------------------------
 
 #include "device.hpp"
+#include "klog.hpp"
 #include "ndrv.hpp"
 
 #include <stdarg.h>
@@ -405,7 +406,7 @@ void RDNA4Device::dmubCursorTest() {
 #include <IOKit/graphics/IOGraphicsTypes.h>
 #include <IOKit/ndrvsupport/IOMacOSVideo.h>
 
-#define FBLOG(fmt, ...) IOLog("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
+#define FBLOG(fmt, ...) rdna4Log("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
 
 namespace {
 
@@ -562,7 +563,7 @@ void RDNA4Device::cursorNote(const char *fmt, ...) {
 	va_start(ap, fmt);
 	vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
-	IOLog("AMDRadeonRDNA4: cursor: %s\n", line);
+	rdna4Log("AMDRadeonRDNA4: cursor: %s\n", line);
 	cursorTrailAppend(line);
 }
 
@@ -575,7 +576,7 @@ void RDNA4Device::latchNote(const char *fmt, ...) {
 	va_start(ap, fmt);
 	vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
-	IOLog("AMDRadeonRDNA4: latch: %s\n", line);
+	rdna4Log("AMDRadeonRDNA4: latch: %s\n", line);
 	if (hwCursorRequested) {
 		char tagged[300];
 		snprintf(tagged, sizeof(tagged), "latch: %s", line);

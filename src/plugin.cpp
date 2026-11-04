@@ -19,6 +19,8 @@
 //
 
 #include <Headers/plugin_start.hpp>
+#include "klog.hpp"
+#include "trial.hpp"
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLib.h>
@@ -36,6 +38,7 @@
 #include "accelcensus.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
+#include "pvhooks.hpp"
 #endif
 #include "compute.hpp"
 #include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
@@ -48,7 +51,7 @@ uint32_t rdna4TraceLevel { 0 };
 #include "bochsvbe.hpp"
 #endif
 
-#define FBLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
+#define FBLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
 
 // The local csc record mirrors (ndrv.hpp) must match the SDK exactly.
 #define NDRV_SAME_SIZE(T) \
@@ -899,6 +902,8 @@ void attach(FbEntry &e) {
 		delete st;
 		return;
 	}
+	// A test boot's stage (rdna4-trial) is only known once NVRAM is.
+	computeStage = RDNA4Compute::requestedStage();
 	Ndrv::Backend be { &dev, deviceSurfaceFor, deviceSwitchTo, deviceSetPower,
 	                   deviceSupportsHardwareCursor, deviceSetHardwareCursor,
 	                   deviceDrawHardwareCursor, deviceGetHardwareCursorDrawState };
@@ -924,8 +929,12 @@ void attach(FbEntry &e) {
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
 	if (accelCensus && dev.isAmd)
 		RDNA4AccelCensus::publish(pci, accelCensus);
-	// M0: the fake paravirtual GPU, independent of everything else here.
+	// M0: the fake paravirtual GPU, independent of everything else here. A
+	// test boot's level (rdna4-trial) is only known once NVRAM is.
 #ifdef AMDRadeonRDNA4_PVGPU
+	uint32_t pvTrial = 0;
+	if (!pvGpu && Trial::option("rdna4-pvgpu", pvTrial) && pvTrial <= 2)
+		pvGpu = pvTrial;
 	if (pvGpu && dev.isAmd && !pvDelay)
 		RDNA4PvNub::publish(pci, pvGpu);
 	if (pvGpu && dev.isAmd && pvDelay)
@@ -1209,6 +1218,7 @@ void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
 }
 
 void pluginStart() {
+	rdna4LogInit();
 	FBLOG("version " AMDRADEONRDNA4_BUILD);
 	uint32_t off = 0;
 	if (PE_parse_boot_argn("rdna4-off", &off, sizeof(off)) && off) {
@@ -1260,6 +1270,7 @@ void pluginStart() {
 				RDNA4PvNub::setSurfaceFunctions(fn);
 			FBLOG("pvgpu: IOSurface: %u of 8 functions found%s", found, found == 8 ? "" : ": no IOSurface render targets");
 		}, nullptr);
+	PvHooks::start();
 #endif
 	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) { gPatcher = &patcher; });
 	if ((gLateNdrv = thread_call_allocate(lateNdrvCheck, nullptr))) {   // ponytail: never freed, it lives for the boot

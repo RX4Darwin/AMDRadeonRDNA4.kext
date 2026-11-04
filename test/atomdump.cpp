@@ -49,6 +49,7 @@
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
 #include "../src/linuxref.hpp"
+#include "../src/trial.hpp"
 #include "rdna4compute.h"
 
 #include <cstdarg>
@@ -3521,6 +3522,26 @@ static int testGpuHeap() {
 
 // W43: the `linux diff:` formatter is bounded. Worst-case 'why' strings and every capacity from 1 up must leave the canary bytes
 // after the buffer untouched, keep the string NUL-terminated inside the capacity, and never report a length past it.
+// The options of one test boot (trial.hpp): what arms one and how its words are read.
+static int testTrial() {
+	int failures = 0;
+	uint32_t v = 0;
+	failures += check(Trial::armed("armed rdna4-heads=3") && Trial::armed("  armed") && !Trial::armed("used rdna4-heads=3") &&
+	                  !Trial::armed("armedx") && !Trial::armed("") && !Trial::armed(nullptr),
+	                  "trial: armed only by a first word \"armed\"");
+	failures += check(Trial::find("armed rdna4-heads=3 rdna4-x=0x1F", "rdna4-heads", v) && v == 3 &&
+	                  Trial::find("armed rdna4-heads=3 rdna4-x=0x1F", "rdna4-x", v) && v == 0x1f,
+	                  "trial: decimal and hex values");
+	failures += check(!Trial::find("armed rdna4-heads2=3", "rdna4-heads", v) && !Trial::find("armed rdna4-heads", "rdna4-heads", v) &&
+	                  !Trial::find("armed rdna4-heads=", "rdna4-heads", v) && !Trial::find("armed rdna4-heads=3x", "rdna4-heads", v) &&
+	                  !Trial::find("armed rdna4-heads=99999999999", "rdna4-heads", v) && !Trial::find("armed", "", v),
+	                  "trial: a longer key, no value, junk and overflow are not a value");
+	failures += check(Trial::find("armed a=1 rdna4-heads=4", "rdna4-heads", v) && v == 4 && !Trial::find(nullptr, "a", v),
+	                  "trial: a key after other words");
+	printf("trial: test-boot options %s\n", failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
 static int testLinuxRefFormat() {
 	int failures = 0;
 	static char longWhy[4096];
@@ -4852,6 +4873,7 @@ int main(int argc, char **argv) {
 	failures += testVmTableDifferential();
 	failures += testSparseTree();
 	failures += testLinuxRefFormat();
+	failures += testTrial();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

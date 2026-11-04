@@ -30,6 +30,7 @@
 //
 
 #include "compute.hpp"
+#include "klog.hpp"
 #include "gfx12_draw.h"
 #include "isa.hpp"
 #include "linuxref.hpp"
@@ -54,7 +55,7 @@
 #include <libkern/c++/OSNumber.h>
 #include <pexpert/pexpert.h>
 
-#define GLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: gfx: " fmt "\n", ## __VA_ARGS__)
+#define GLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: gfx: " fmt "\n", ## __VA_ARGS__)
 
 using namespace GfxReg;
 
@@ -67,7 +68,7 @@ uint32_t RDNA4Compute::requestedGfx() {
 		// and ring_set_wptr_gfx writes the doorbell then; the MMIO branch is
 		// only for a ring without one. On the real card the MMIO write
 		// pointer halts PFP/ME (round 2, R2-2), so 1 now means the doorbell.
-		IOLog("AMDRadeonRDNA4: gfx: rdna4-gfx=1 (MMIO write pointer) halts PFP/ME on silicon; using the doorbell like amdgpu\n");
+		rdna4Log("AMDRadeonRDNA4: gfx: rdna4-gfx=1 (MMIO write pointer) halts PFP/ME on silicon; using the doorbell like amdgpu\n");
 		return 2;
 	}
 	return mode == 2 ? mode : 0;

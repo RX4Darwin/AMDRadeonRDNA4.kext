@@ -9,6 +9,7 @@
 //
 
 #include "userclient.hpp"
+#include "klog.hpp"
 #include "compute.hpp"
 
 #include <IOKit/IOLib.h>
@@ -26,7 +27,7 @@ IOReturn RDNA4ComputeService::setPowerState(unsigned long powerStateOrdinal,
                                              IOService *) {
 	uint64_t nowNs = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
-	IOLog("AMDRadeonRDNA4: power: setPowerState ordinal %lu at %llu ns\n",
+	rdna4Log("AMDRadeonRDNA4: power: setPowerState ordinal %lu at %llu ns\n",
 	      powerStateOrdinal, nowNs);
 	if (!compute)
 		return kIOPMAckImplied;

@@ -8,6 +8,8 @@
 //
 
 #include "codeobj.hpp"
+#include "trial.hpp"
+#include "klog.hpp"
 #include "compute.hpp"
 #include "flip.hpp"
 #include "pm4.hpp"
@@ -27,7 +29,7 @@
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
 
-#define CLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: compute: " fmt "\n", ## __VA_ARGS__)
+#define CLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: compute: " fmt "\n", ## __VA_ARGS__)
 
 // Lilu's vendor GUID; `nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail`
 // reads it back.
@@ -109,7 +111,7 @@ void RDNA4Compute::publishResult(const char *feature, const char *value) {
 
 uint32_t RDNA4Compute::requestedStage() {
 	uint32_t stage = 0;
-	if (!PE_parse_boot_argn("rdna4-compute", &stage, sizeof(stage)))
+	if (!Trial::option("rdna4-compute", stage))
 		return StageOff;
 	return stage > StageKernel ? StageKernel : stage;
 }

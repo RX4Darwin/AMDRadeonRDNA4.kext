@@ -32,6 +32,7 @@
 //    T7  negative control: the IB packet names a VMID whose context is off: must fault with that VMID
 //
 #include "compute.hpp"
+#include "klog.hpp"
 #include "codeobj.hpp"
 #include "isa.hpp"
 #include "vadd_codeobj.h"
@@ -40,7 +41,7 @@
 #include <IOKit/IOLib.h>
 
 static const char *gVtPhase = "";     // "" for the early probes, " late" for the ones repeated after clock gating
-#define VLOG(fmt, ...) IOLog("AMDRadeonRDNA4: vmidtest%s: " fmt "\n", gVtPhase, ## __VA_ARGS__)
+#define VLOG(fmt, ...) rdna4Log("AMDRadeonRDNA4: vmidtest%s: " fmt "\n", gVtPhase, ## __VA_ARGS__)
 
 using namespace GfxReg;
 
