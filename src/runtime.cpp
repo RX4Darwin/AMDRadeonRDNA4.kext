@@ -673,12 +673,10 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 		return false;
 	/* The root, PDB1, and the PDB0 entry that points at the PT all have to
 	 * reach VRAM before the queue can walk this mapping. */
-	if (span.firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
-		return false;
-	for (uint64_t pt = span.firstPt; pt <= span.lastPt; pt += 0x1000)
-		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
-			return false;
-	return true;
+	/* The root and directory pages, then the leaf pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its
+	 * size, is what a mapping of thousands of pages costs. */
+	return span.firstPt != ~0ull && vmTableSync(c, 0, 0x3000) &&
+	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
 }
 
 bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses,
@@ -700,12 +698,10 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 	GpuVmTable::Span span;
 	if (!GpuVmTable::mapHost(access, vmPolicy(), kVmTableBytes, va, end, pageBuses, executable, span))
 		return false;
-	if (span.firstPt == ~0ull || !vmTableSync(c, 0, 0x3000))
-		return false;
-	for (uint64_t pt = span.firstPt; pt <= span.lastPt; pt += 0x1000)
-		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
-			return false;
-	return true;
+	/* The root and directory pages, then the leaf pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its
+	 * size, is what a mapping of thousands of pages costs. */
+	return span.firstPt != ~0ull && vmTableSync(c, 0, 0x3000) &&
+	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
 }
 
 bool RDNA4Compute::initRuntimeHeap() {
@@ -743,9 +739,8 @@ void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	GpuVmTable::unmap(access, kVmTableBytes, va, end, span);
-	for (uint64_t pt = span.firstPt; pt != ~0ull && pt <= span.lastPt; pt += 0x1000)
-		if (!vmTableSync(c, static_cast<uint32_t>(pt), 0x1000))
-			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
+	if (span.firstPt != ~0ull && !vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000)))
+		RLOG("vmid %u: page-table unmap sync failed", c.vmid);   // one SDMA job for the span, as vmMapHost
 }
 
 bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
@@ -2522,6 +2517,52 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 	return kIOReturnSuccess;
 }
 
+IOReturn RDNA4Compute::rtMapPages(const void *owner, const uint64_t *pageBuses, uint64_t pages, uint64_t &handle, uint64_t &gpu) {
+	Locked g(rtLock);
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;
+	RtClient *c = vmClientFor(owner);
+	if (!c || !dmaReady || !busMasterSet)
+		return kIOReturnUnsupported;
+	if (!pageBuses || !pages || pages > kHostMaxBuffer / GpuVm::kPageBytes)   // the count first: the product could wrap
+		return pages ? kIOReturnNoResources : kIOReturnBadArgument;
+	const uint64_t bytes = pages * GpuVm::kPageBytes;
+	if (bytes > kHostMaxClient - c->hostBytes || bytes > kHostMaxTotal - hostBytesTotal)
+		return kIOReturnNoResources;
+	uint32_t slot = 0;
+	while (slot < bufferCap() && buffers[slot].owner)
+		slot++;
+	if (slot == bufferCap() || clientOverQuota(owner, false))
+		return kIOReturnNoResources;
+
+	RtBuffer &b = buffers[slot];
+	const uint16_t generation = nextGen(b.gen);
+	b = RtBuffer {};
+	b.owner = owner;
+	b.bytes = bytes;
+	b.va = vaTake(*c, bytes);
+	b.gen = generation;
+	b.host = true;   // unmapped like a host buffer; it has no memory of its own to release
+	if (!b.va || b.va + bytes < b.va || b.va + bytes > GpuVm::kVaEnd || !vmMapHost(*c, b.va, pageBuses, bytes, false)) {
+		if (b.va) {
+			vmUnmap(*c, b.va, bytes);
+			vaGive(*c, b.va, bytes);
+		}
+		b.owner = nullptr;
+		return kIOReturnNoMemory;
+	}
+	/* No invalidation: the range held no translation since rtFree invalidated it after its last unmap (or it was never mapped), as amdgpu
+	 * flushes on unmapping and changing entries, not on adding them. */
+	c->hostBytes += bytes;
+	hostBytesTotal += bytes;
+	handle = makeHandle(slot, b.gen);
+	gpu = b.va;
+	return kIOReturnSuccess;
+}
+
 IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	Locked g(rtLock);
 	const IOReturn state = ownerStateLocked(owner);
@@ -2559,7 +2600,8 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 			if (hostBytesTotal >= rounded)
 				hostBytesTotal -= rounded;
 		}
-		RLOG("vmid %u: host buffer handle 0x%llx unmapped", c ? c->vmid : 0, handle);
+		if (b->hostMemory)   // rtMapPages' mappings come and go with every paravirtual draw
+			RLOG("vmid %u: host buffer handle 0x%llx unmapped", c ? c->vmid : 0, handle);
 		releaseHost(*b);
 	} else {
 		(b->device ? devHeap : heap).free(b->offset);

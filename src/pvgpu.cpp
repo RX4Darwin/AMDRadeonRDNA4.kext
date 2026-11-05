@@ -194,6 +194,7 @@ private:
 	void dumpPayload(const char *tag, const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void dumpPage(const char *what, uint32_t pfn);
 	uint32_t guestPfn(uint32_t task, uint64_t va, bool write = false);
+	bool guestPages(uint32_t task, uint64_t va, uint64_t count, uint64_t *pages);
 	void dumpGuest(uint32_t task, uint64_t va, uint32_t len);
 	bool copyGuest(uint32_t task, uint64_t va, uint8_t *buf, uint32_t len, bool toGuest);
 	bool readGuest(uint32_t task, uint64_t va, uint8_t *dst, uint32_t len) { return copyGuest(task, va, dst, len, false); }
@@ -235,6 +236,9 @@ public:
 	bool readTextureRow(uint32_t task, const TextureSource &src, uint32_t y, uint8_t *dst, uint32_t bytes);
 	bool stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName);
 	bool releaseTextures(uint32_t task, StagedTexture (&staged)[16], bool copyBack);
+	bool mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
+	bool mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
+	bool mapPages(const uint64_t *pages, uint64_t count, uint64_t &handle, uint64_t &gpu);
 	void describeRenderPipeline(uint32_t task, uint32_t pipeline);
 private:
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
@@ -282,6 +286,13 @@ private:
 	uint8_t mDumped[256] {};            // M1: payload dumps per FIFO id so far
 	uint32_t mTaskRoot[64] {};          // M1: page-table root PFN per task id (DefineHostTask), for the dumps after a commit
 	bool mRtOpen { false };              // M2: this host is a client of the card's runtime
+	// mapPages' mappings kept from draw to draw, by their page list: WindowServer draws with the same textures, buffers and targets every
+	// frame, and each mapping costs SDMA jobs (page tables) of about 2 ms.
+	struct Mapping { uint64_t *pages { nullptr }; uint64_t count { 0 }, handle { 0 }, gpu { 0 }, used { 0 }; };
+	static constexpr uint32_t kMappings = 64;
+	Mapping mMap[kMappings];
+	uint64_t mMapClock { 0 };
+	void dropMapping(Mapping &m);
 	uint32_t mProgram[kMtlKernelCount] {};   // M3: kMtlKernels loaded into it, 0 = not yet
 	uint32_t mFnLines { 0 };              // M3: pipeline -> function lines so far
 	uint32_t mRenderPipeSeen[16] {};
@@ -315,6 +326,8 @@ private:
 	Pipe mPipe[pvstream::disp::kMaxPorts];
 	uint64_t mDrawStatSince { 0 }, mDrawStatNs { 0 }, mDrawStatMaxNs { 0 };   // noteDraw: the draws of the last 5 s
 	uint64_t mPhaseNs[4] {};            // of those: textures in, target in and submit, the card, target out and the rest
+	uint64_t mMapNs { 0 };              // mapPages' share
+	uint32_t mInPlace { 0 }, mCopied { 0 };   // textures read in place, and copied
 	uint32_t mDrawStatCount { 0 };
 	uint32_t mDisp { kDispVbl };
 	pvstream::disp::Info mDispInfo;
@@ -748,6 +761,41 @@ uint32_t RDNA4PvHost::guestPfn(uint32_t task, uint64_t va, bool write) {
 		m->release();
 	}
 	return !write || (pfn & 0x80000000u) ? pfn & 0x0fffffffu : 0;
+}
+
+// The physical addresses of `count` pages of a task's GPU space from `va` (page-aligned) as guestPfn finds them for reading, each leaf table
+// walked to once for all of its pages (a page each would map 4 table pages: 32768 mappings for a 4K target); false if one is not mapped.
+bool RDNA4PvHost::guestPages(uint32_t task, uint64_t va, uint64_t count, uint64_t *pages) {
+	for (uint64_t i = 0; i < count;) {
+		const uint64_t at = va + (i << 12);
+		const unsigned index[3] = {0, static_cast<unsigned>(at >> 32) & 1023, static_cast<unsigned>(at >> 22) & 1023};
+		uint32_t pfn = mTaskRoot[task & 63];
+
+		for (unsigned level = 0; level < 3 && pfn; level++) {
+			IOMemoryMap *m = pfn < (1u << 28) ? mapPhys(static_cast<IOPhysicalAddress>(pfn) << 12, 0x1000) : nullptr;
+
+			pfn = m ? reinterpret_cast<const volatile uint32_t *>(m->getVirtualAddress())[index[level]] : 0;
+			OSSafeReleaseNULL(m);
+		}
+
+		IOMemoryMap *leaf = pfn && pfn < (1u << 28) ? mapPhys(static_cast<IOPhysicalAddress>(pfn) << 12, 0x1000) : nullptr;
+		if (!leaf)
+			return false;
+
+		const volatile uint32_t *entry = reinterpret_cast<const volatile uint32_t *>(leaf->getVirtualAddress());
+		bool ok = true;
+
+		for (uint32_t e = static_cast<uint32_t>(at >> 12) & 1023; e < 1024 && i < count && ok; e++, i++) {
+			pages[i] = static_cast<uint64_t>(entry[e] & 0x0fffffffu) << 12;
+			ok = pages[i] != 0;
+		}
+
+		leaf->release();
+		if (!ok)
+			return false;
+	}
+
+	return true;
 }
 
 // M1: `len` bytes (<= 256) of a task's GPU address space, as dwords, 16 per line.
@@ -1276,6 +1324,13 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, mGfxSpare.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 1, 1, 64);
 			continue;
 		}
+		bool earlier = false;   // the same texture in an earlier slot: its T#
+		for (unsigned j = 0; j < k && !earlier; j++)
+			if ((earlier = bound.texture[j] == id))
+				memcpy(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * j) / 4, 32);
+		if (earlier)
+			continue;
+
 		ok = textureSource(task, id, src);
 		const uint32_t format = src.format, usage = src.usage;
 		const TextureFormat *fm = textureFormat(format);
@@ -1293,12 +1348,31 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 				      id, src.type, format, w, h, depth, rowBytes);
 			break;
 		}
+		// In place when the hardware can read the texture as the guest has it: 2D, its rows a multiple of 128 bytes apart (the rig's linear pitch),
+		// or a single row.
+		const uint64_t used = static_cast<uint64_t>(rowBytes) * h;
+		uint64_t gpu = 0;
+
+		if (depth == 1 && (h == 1 || (!(rowBytes % 128) && !(rowBytes % fm->bpp))) &&
+		    (src.surface.memory ? mapMemory(src.surface.memory, src.surface.base, used, out[k].handle, gpu)
+		                        : mapGuest(task, src.va, used, out[k].handle, gpu))) {
+			out[k].va = 0;   // nothing to copy back: the card writes the guest's memory itself
+			out[k].writable = false;
+			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, h, h == 1 ? w : rowBytes / fm->bpp);
+			mInPlace++;
+			continue;
+		}
+
+		mCopied++;
+		if (mCopied < 8)
+			pvlog("host: render: %s texture %u (resource %u, type %u): format %u, %ux%u, %u bytes per row: copied", stageName, k, id, src.type,
+			      format, w, h, rowBytes);
+
 		const uint32_t texPitch = (w * fm->bpp + 127) & ~127u;   // bytes
 		// a 3D image's slices: height rows of the row's bytes aligned to 256, not to the pitch's 128 (rdna4-mtltex3d, 2026-11-04)
 		const uint64_t slice = depth > 1 ? static_cast<uint64_t>((w * fm->bpp + 255) & ~255u) * h : static_cast<uint64_t>(texPitch) * h;
 		const uint64_t bytes = slice * depth;
 		auto *copy = static_cast<uint8_t *>(depth > 1 ? IOMallocZero(bytes) : IOMalloc(bytes));
-		uint64_t gpu = 0;
 		ok = copy != nullptr;
 		const char *step = "staging memory";
 		uint32_t y = 0;
@@ -1357,6 +1431,101 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		sm[3] = 0;
 	}
 	return ok;
+}
+
+// `bytes` of a task's GPU address space from `va` at a GPU VA of the host's runtime client, in place (the guest's pages are the card's to read:
+// no IOMMU on the rig, bus = physical). The GPU address is `va`'s within its page.
+bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
+	const uint64_t first = va & ~0xfffull, count = (va + bytes + 0xfff - first) >> 12;
+	auto *pages = count && count <= (256u << 8) ? static_cast<uint64_t *>(IOMalloc(count * 8)) : nullptr;
+	bool ok = pages != nullptr;
+
+	ok = ok && guestPages(task, first, count, pages) && mapPages(pages, count, handle, gpu);
+	if (pages)
+		IOFree(pages, count * 8);
+	gpu += ok ? va & 0xfff : 0;
+
+	return ok;
+}
+
+// The same for `bytes` of a prepared memory descriptor (an IOSurface's) from `offset`, which must be 256-byte aligned (an image's base).
+bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
+	const uint64_t first = offset & ~0xfffull, count = (offset + bytes + 0xfff - first) >> 12;
+	auto *pages = !(offset & 0xff) && count && count <= (256u << 8) ? static_cast<uint64_t *>(IOMalloc(count * 8)) : nullptr;
+	bool ok = pages != nullptr;
+
+	for (uint64_t i = 0; i < count && ok; i++) {
+		IOByteCount length = 0;
+		const addr64_t phys = memory->getPhysicalSegment(first + (i << 12), &length, kIOMemoryMapperNone);
+
+		pages[i] = phys;
+		ok = phys && !(phys & 0xfff) && length;
+	}
+
+	ok = ok && mapPages(pages, count, handle, gpu);
+	if (pages)
+		IOFree(pages, count * 8);
+	gpu += ok ? offset & 0xfff : 0;
+
+	return ok;
+}
+
+// `count` pages at a GPU VA, from the cache of mappings when the same pages are mapped already (`handle` then 0: the cache keeps the mapping),
+// else mapped anew in place of the least recently used one (`handle` 0 too: the cache owns every mapping it hands out).
+bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &handle, uint64_t &gpu) {
+	Mapping *lru = &mMap[0];
+
+	handle = 0;
+	gpu = 0;
+	mMapClock++;
+	for (Mapping &m : mMap) {
+		if (m.count == count && !memcmp(m.pages, pages, count * 8)) {
+			m.used = mMapClock;
+			gpu = m.gpu;
+			return true;
+		}
+		lru = m.used < lru->used ? &m : lru;
+	}
+
+	const uint64_t from = nowNs();
+	auto *copy = static_cast<uint64_t *>(IOMalloc(count * 8));
+	uint64_t h = 0;
+	bool ok = copy && gCompute->rtMapPages(this, pages, count, h, gpu) == kIOReturnSuccess;
+
+	// The cache holds the client's GPU VA (1 GiB) and host quota: make room by dropping the least recently used mappings.
+	for (uint32_t tries = 0; copy && !ok && tries < kMappings; tries++) {
+		Mapping *oldest = nullptr;
+
+		for (Mapping &m : mMap)
+			oldest = m.handle && (!oldest || m.used < oldest->used) ? &m : oldest;
+		if (!oldest)
+			break;
+		dropMapping(*oldest);
+		ok = gCompute->rtMapPages(this, pages, count, h, gpu) == kIOReturnSuccess;
+	}
+
+	mMapNs += nowNs() - from;
+	if (!ok) {
+		if (copy)
+			IOFree(copy, count * 8);
+		return false;
+	}
+
+	for (Mapping &m : mMap)   // the slot to fill: an empty one (the loop above may have emptied some), else the least recently used
+		lru = !m.handle ? &m : lru->handle && m.used < lru->used ? &m : lru;
+	dropMapping(*lru);
+	memcpy(copy, pages, count * 8);
+	*lru = {copy, count, h, gpu, mMapClock};
+
+	return true;
+}
+
+void RDNA4PvHost::dropMapping(Mapping &m) {
+	if (m.handle)
+		gCompute->rtFree(this, m.handle);
+	if (m.pages)
+		IOFree(m.pages, m.count * 8);
+	m = {};
 }
 
 // The textures stageTextures put in the runtime freed; with copyBack, the writable ones (MTLTextureUsageShaderWrite) first copied back into the
@@ -1596,19 +1765,32 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint32_t sx = draw.scissorSet ? clampTo(draw.scissor[0], width) : 0, sy = draw.scissorSet ? clampTo(draw.scissor[1], height) : 0;
 	const uint32_t sx2 = draw.scissorSet ? clampTo(draw.scissor[0] + draw.scissor[2], width) : width;
 	const uint32_t sy2 = draw.scissorSet ? clampTo(draw.scissor[1] + draw.scissor[3], height) : height;
-	const uint32_t pitch = (width + 31) & ~31u;   // the staged target's pitch: a multiple of 128 bytes
+	// The target in place when the colour block can write it as the guest has it (its rows a multiple of 128 bytes apart, its base 256-byte
+	// aligned): no staging, no copies, and BGRA8 swapped by the colour block (COMP_SWAP) instead of the CPU. Else staged at a pitch of its own.
+	const bool inPlace = !(bpr % 128) && !((surface.memory ? surface.base : va) & 0xff);
+	const uint32_t pitch = inPlace ? bpr / 4 : (width + 31) & ~31u;   // pixels; staged: a multiple of 128 bytes
 	const uint64_t targetBytes = static_cast<uint64_t>(pitch) * height * 4;
+	// Only the scissor rectangle's rows are staged in and out (WindowServer limits most draws to what changed): nothing outside it is drawn.
+	const uint64_t regionAt = static_cast<uint64_t>(pitch) * sy * 4, regionBytes = static_cast<uint64_t>(pitch) * (sy2 - sy) * 4;
+
+	if (sx2 <= sx || sy2 <= sy) {
+		if (talk)
+			pvlog("host: render: draw with pipeline %u: an empty scissor rectangle: nothing to draw", pipeline);
+		return;
+	}
 
 	// The buffers kept for the boot (made by the first draw), and the target for this one.
 	auto make = [&](GfxBuffers &g, uint64_t bytes) { return g.handle || gCompute->rtAlloc(this, bytes, g.handle, g.gpu) == kIOReturnSuccess; };
 	if (!mRtOpen)
 		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;
 	GfxBuffers tgt {};
-	auto *stage = static_cast<uint32_t *>(IOMalloc(targetBytes));
-	bool ok = mRtOpen && stage && make(mGfxCode, RDNA4_TRI_CODE_BYTES) && make(mGfxRings, rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK) &&
-	          make(mGfxMisc, RDNA4_TRIRUN_PAGE) && make(mGfxIb, RDNA4_TRIRUN_PAGE) && makeSpare(mGfxSpare) &&
-	          rdna4_trirun_rings_fit(mGfxRings.gpu, rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK, rdna4_tri_ring_bytes()) &&
-	          gCompute->rtAlloc(this, targetBytes, tgt.handle, tgt.gpu) == kIOReturnSuccess;
+	auto *stage = inPlace ? nullptr : static_cast<uint32_t *>(IOMalloc(regionBytes));
+	bool ok = mRtOpen && (inPlace || stage) && make(mGfxCode, RDNA4_TRI_CODE_BYTES) &&
+	          make(mGfxRings, rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK) && make(mGfxMisc, RDNA4_TRIRUN_PAGE) && make(mGfxIb, RDNA4_TRIRUN_PAGE) &&
+	          makeSpare(mGfxSpare) && rdna4_trirun_rings_fit(mGfxRings.gpu, rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK, rdna4_tri_ring_bytes()) &&
+	          (inPlace ? surface.memory ? mapMemory(surface.memory, surface.base, static_cast<uint64_t>(bpr) * height, tgt.handle, tgt.gpu)
+	                                    : mapGuest(task, va, static_cast<uint64_t>(bpr) * height, tgt.handle, tgt.gpu)
+	                   : gCompute->rtAlloc(this, targetBytes, tgt.handle, tgt.gpu) == kIOReturnSuccess);
 	const bool allocated = ok;
 
 	// The shaders, only uploaded when the pair changes: WindowServer draws with few pipelines, and the slots are large.
@@ -1640,6 +1822,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x76, 0x0a, ps[3]}, {0x76, 0x0b, ps[4]},                          // SPI_SHADER_PGM_RSRC1_PS, RSRC2_PS
 		{0x69, 0x197, ps[5]}, {0x69, 0x198, ps[6]},                        // SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR
 		{0x69, 0x31e, (pitch - 1) << 16 | (height - 1)},                    // CB_COLOR0_ATTRIB2: MIP0_WIDTH (the pitch), MIP0_HEIGHT
+		{0x69, 0x3b0, inPlace && bgra ? 0x0002880au : 0x0002800au},        // CB_COLOR0_INFO: the template's 8_8_8_8 unorm, COMP_SWAP ALT for BGRA8
 		{0x69, 0x82, width | height << 16},                                // PA_SC_WINDOW_SCISSOR_BR
 		{0x69, 0x94, sx | sy << 16},                                       // PA_SC_VPORT_SCISSOR_0_TL, _BR: Metal's scissor rectangle
 		{0x69, 0x95, sx2 | sy2 << 16},
@@ -1664,34 +1847,35 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			*d = pt.value;
 		else
 			ok = false;
-	// The stages' buffers, staged into the runtime, and their tables at +0x400 (vertex) and +0x800 (fragment) of the misc page (the fence at +0).
+	// The stages' buffers, in place (each mapped once a draw, whole), and their tables at +0x400 (vertex) and +0x800 (fragment) of the misc page
+	// (the fence at +0).
 	static constexpr uint64_t kMaxBuffer = 64ull << 20;
 	static uint64_t misc[RDNA4_TRIRUN_PAGE / 8];   // a page: too large for the kernel stack
-	uint64_t handle[2][RDNA4_MTLC_MAX_BUFFERS] = {};
+	uint64_t handle[2][RDNA4_MTLC_MAX_BUFFERS] = {}, base[2][RDNA4_MTLC_MAX_BUFFERS] = {};
 	memset(misc, 0, sizeof(misc));
 	for (unsigned st = 0; st < 2 && ok; st++)
 		for (unsigned k = 0; k < RDNA4_MTLC_MAX_BUFFERS && ok; k++) {
+			const uint32_t id = bound[st].buffer[k];
 			uint64_t bva = 0, blen = 0;
-			if (!bound[st].buffer[k]) {   // read anyway by shaders whose buffers the host does not know (setVertexBytes, say)
+
+			if (!id) {   // read anyway by shaders whose buffers the host does not know (setVertexBytes, say)
 				misc[bufferSlot(st, k)] = mGfxSpare.gpu;
 				continue;
 			}
-			ok = bufferRange(task, bound[st].buffer[k], &bva, &blen) && bound[st].offset[k] < blen && blen - bound[st].offset[k] <= kMaxBuffer;
-			const uint64_t bytes = ok ? blen - bound[st].offset[k] : 0;
-			auto *copy = ok ? static_cast<uint8_t *>(IOMalloc(bytes)) : nullptr;
-			uint64_t gpu = 0;
-			ok = copy && readGuest(task, bva + bound[st].offset[k], copy, static_cast<uint32_t>(bytes)) &&
-			     gCompute->rtAlloc(this, bytes, handle[st][k], gpu) == kIOReturnSuccess &&
-			     gCompute->rtCopy(this, handle[st][k], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(copy), bytes, true) == kIOReturnSuccess;
-			if (talk && copy) {   // what the draw reads (the first 8 dwords of each buffer)
+
+			ok = bufferRange(task, id, &bva, &blen) && bound[st].offset[k] < blen && blen <= kMaxBuffer;
+			for (unsigned s2 = 0; s2 <= st && ok && !base[st][k]; s2++)   // the same buffer in an earlier slot: its mapping
+				for (unsigned k2 = 0; k2 < (s2 == st ? k : RDNA4_MTLC_MAX_BUFFERS) && !base[st][k]; k2++)
+					base[st][k] = bound[s2].buffer[k2] == id ? base[s2][k2] : 0;
+			ok = ok && (base[st][k] || mapGuest(task, bva, blen, handle[st][k], base[st][k]));
+			if (talk && ok) {   // what the draw reads (the first 8 dwords of each buffer)
 				uint32_t w[8] = {};
-				memcpy(w, copy, bytes < sizeof(w) ? bytes : sizeof(w));
+				readGuest(task, bva + bound[st].offset[k], reinterpret_cast<uint8_t *>(w), blen - bound[st].offset[k] < sizeof(w) ?
+				          static_cast<uint32_t>(blen - bound[st].offset[k]) : sizeof(w));
 				pvlog("host: render:   %s buffer %u: resource %u + %llu, %llu bytes: %08x %08x %08x %08x %08x %08x %08x %08x", st ? "fragment" : "vertex", k,
-				      bound[st].buffer[k], bound[st].offset[k], bytes, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+				      id, bound[st].offset[k], blen - bound[st].offset[k], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 			}
-			if (copy)
-				IOFree(copy, bytes);
-			misc[bufferSlot(st, k)] = gpu;
+			misc[bufferSlot(st, k)] = ok ? base[st][k] + bound[st].offset[k] : 0;
 		}
 	memcpy(&misc[(0x400 + RDNA4_MTLC_TABLE_ATTRIBUTES) / 8], attributes, sizeof(attributes));
 	StagedTexture staged[2][16] = {};
@@ -1701,8 +1885,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	mPhaseNs[0] += nowNs() - texturesFrom;
 	// Colour attachment 0 as the draw finds it, for fragment shaders that read it (Metal's [[color(0)]]; RDNA4_MTLC_TABLE_FRAMEBUFFER): a T# of
 	// the staged RGBA8 target. ponytail: a pixel the same draw covers twice reads the value from before the draw, not its first write.
-	linearImage(reinterpret_cast<uint32_t *>(&misc[(0x800 + RDNA4_MTLC_TABLE_FRAMEBUFFER) / 8]), tgt.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, width, height,
-	            pitch);   // 8_8_8_8 unorm, x y z w as staged (RGBA)
+	linearImage(reinterpret_cast<uint32_t *>(&misc[(0x800 + RDNA4_MTLC_TABLE_FRAMEBUFFER) / 8]), tgt.gpu, 42,
+	            inPlace && bgra ? 6 | 5 << 3 | 4 << 6 | 7 << 9 : 4 | 5 << 3 | 6 << 6 | 7 << 9, width, height, pitch);   // 8_8_8_8 unorm: RGBA
 	if (!ok && talk)
 		pvlog("host: render: draw with pipeline %u: a texture or sampler could not be set up: not run", pipeline);
 
@@ -1807,13 +1991,13 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const bool streamOk = ok;
 	const uint64_t targetFrom = nowNs();
 	uint64_t afterFence = 0;
-	// The attachment in (BGRA8 rows -> RGBA8 at the target's pitch), the draw, the attachment out.
+	// The attachment in (BGRA8 rows -> RGBA8 at the target's pitch), the draw, the attachment out; in place only the draw.
 	auto swap = [&]() {
-		for (uint64_t i = 0; bgra && i < static_cast<uint64_t>(pitch) * height; i++)
+		for (uint64_t i = 0; bgra && !inPlace && i < regionBytes / 4; i++)
 			stage[i] = (stage[i] & 0xff00ff00u) | (stage[i] >> 16 & 0xff) | (stage[i] & 0xff) << 16;
 	};
-	auto row = [&](uint32_t y) { return reinterpret_cast<uint8_t *>(stage + static_cast<uint64_t>(y) * pitch); };
-	for (uint32_t y = 0; y < height && ok; y++)
+	auto row = [&](uint32_t y) { return reinterpret_cast<uint8_t *>(stage + static_cast<uint64_t>(y - sy) * pitch); };
+	for (uint32_t y = sy; y < sy2 && ok && !inPlace; y++)
 		ok = surface.memory ? surface.memory->readBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
 		                    : readGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * 4);
 	uint64_t fence = 0, ns = 0;
@@ -1825,7 +2009,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		swap();
 		// each step's result, so that a draw that fails says where
 		const char *step = "target in";
-		IOReturn r = gCompute->rtCopy(this, tgt.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), targetBytes, true);
+		IOReturn r = inPlace ? kIOReturnSuccess
+		                     : gCompute->rtCopy(this, tgt.handle, regionAt, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), regionBytes, true);
 
 		if (r == kIOReturnSuccess && newCode) {
 			step = "code in";
@@ -1858,9 +2043,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			mPhaseNs[2] += afterFence - fenceFrom;
 		}
 
-		if (r == kIOReturnSuccess) {
+		if (r == kIOReturnSuccess && !inPlace) {
 			step = "target out";
-			r = gCompute->rtCopy(this, tgt.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), targetBytes, false);
+			r = gCompute->rtCopy(this, tgt.handle, regionAt, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), regionBytes, false);
 		}
 
 		ok = r == kIOReturnSuccess;
@@ -1874,7 +2059,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	}
 	if (ok) {
 		swap();
-		for (uint32_t y = 0; y < height && ok; y++)
+		for (uint32_t y = sy; y < sy2 && ok && !inPlace; y++)
 			ok = surface.memory ? surface.memory->writeBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
 			                    : copyGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * 4, true);
 	}
@@ -1889,7 +2074,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	for (auto &stageTextures : staged)
 		ok = releaseTextures(task, stageTextures, ok) && ok;   // textures the shaders may write copied back
 	if (stage)
-		IOFree(stage, targetBytes);
+		IOFree(stage, regionBytes);
 	mPhaseNs[3] += nowNs() - (afterFence ? afterFence : targetFrom);
 	if (talk)
 		pvlog("host: render: draw of %u %s x %u (type %u) into texture %u (%ux%u) with \"%s\" and \"%s\" on the card: %s (%llu us)", count,
@@ -2595,9 +2780,12 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	if (now - mDrawStatSince < 5000000000ull)
 		return;
 
-	pvlog("host: render: %u draws in the last %llu ms took %llu ms (the longest %llu ms): textures %llu, target in %llu, card %llu, out %llu ms",
-	      mDrawStatCount, (now - mDrawStatSince) / 1000000, mDrawStatNs / 1000000, mDrawStatMaxNs / 1000000, mPhaseNs[0] / 1000000,
-	      mPhaseNs[1] / 1000000, mPhaseNs[2] / 1000000, mPhaseNs[3] / 1000000);
+	pvlog("host: render: %u draws in the last %llu ms took %llu ms (the longest %llu ms): textures %llu, target in %llu, card %llu, out %llu ms; "
+	      "%u textures in place, %u copied, mapping %llu ms", mDrawStatCount, (now - mDrawStatSince) / 1000000, mDrawStatNs / 1000000,
+	      mDrawStatMaxNs / 1000000, mPhaseNs[0] / 1000000, mPhaseNs[1] / 1000000, mPhaseNs[2] / 1000000, mPhaseNs[3] / 1000000, mInPlace, mCopied,
+	      mMapNs / 1000000);
+	mInPlace = mCopied = 0;
+	mMapNs = 0;
 	memset(mPhaseNs, 0, sizeof(mPhaseNs));
 	mDrawStatSince = now;
 	mDrawStatCount = 0;

@@ -667,6 +667,9 @@ public:
 	IOReturn allocLocked(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtAllocHost(const void *owner, task_t task, uint64_t bytes, uint64_t flags,
 	                     uint64_t &handle, uint64_t &gpu, uint64_t &user);
+	// Pages that are not the runtime's (the paravirtual host's guest memory, pvgpu.cpp) at a fresh GPU VA of the client, by bus address; rtFree
+	// unmaps them. The caller keeps the pages alive meanwhile.
+	IOReturn rtMapPages(const void *owner, const uint64_t *pageBuses, uint64_t pages, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtFree(const void *owner, uint64_t handle);
 	IOReturn rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
 	                mach_vm_address_t user, uint64_t length, bool toGpu);
