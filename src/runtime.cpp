@@ -2667,11 +2667,50 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 		if (b->hostMemory)   // rtMapPages' mappings come and go with every paravirtual draw
 			RLOG("vmid %u: host buffer handle 0x%llx unmapped", c ? c->vmid : 0, handle);
 		releaseHost(*b);
-	} else {
+	} else if (!b->foreign) {
 		(b->device ? devHeap : heap).free(b->offset);
 	}
 	b->owner = nullptr;
 	return restore;
+}
+
+/* `bytes` of VRAM at CPU physical address `barPhys` (in BAR0: a display's scanout) at a GPU VA of the owner's; the memory is not ours,
+ * only the VA is given back when it is freed. */
+IOReturn RDNA4Compute::rtMapVram(const void *owner, uint64_t barPhys, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
+	Locked g(rtLock);
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;
+	RtClient *c = vmClientFor(owner);
+	if (!c || !bytes || bytes > sv.bar0Size || barPhys < sv.bar0Phys || barPhys - sv.bar0Phys > sv.bar0Size - bytes ||
+	    (barPhys & (GpuVm::kPageBytes - 1)))
+		return kIOReturnBadArgument;
+	uint32_t slot = 0;
+	while (slot < bufferCap() && buffers[slot].owner)
+		slot++;
+	if (slot == bufferCap() || clientOverQuota(owner, false))
+		return kIOReturnNoResources;
+
+	RtBuffer &b = buffers[slot];
+	const uint16_t generation = nextGen(b.gen);
+	b = RtBuffer {};
+	b.owner = owner;
+	b.bytes = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	b.mc = vramMc(barPhys - sv.bar0Phys);
+	b.va = vaTake(*c, b.bytes);
+	b.gen = generation;
+	b.foreign = true;
+	if (!b.va || !vmMap(*c, b.va, b.mc, b.bytes, false)) {
+		if (b.va)
+			vaGive(*c, b.va, b.bytes);
+		b.owner = nullptr;
+		return kIOReturnNoMemory;
+	}
+	handle = makeHandle(slot, b.gen);
+	gpu = b.va;
+	return kIOReturnSuccess;
 }
 
 IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,

@@ -662,6 +662,35 @@ public:
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
 	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
 	IOReturn rtSensorsEx(const void *owner, RDNA4SensorsEx &out);
+	// GRBM perf counters 0 and 1 counting GFX clocks (GRBM_PERF_SEL_COUNT) and busy clocks (GUI_ACTIVE): the counts since the call
+	// before (stopped and sampled, read, started again from zero).
+	bool rtGfxClocks(uint64_t &clocks, uint64_t &active)
+	{
+		static constexpr GfxReg::Reg kPerfmonCntl { 1, 0x3808 }, kSel0 { 1, 0x3840 }, kSel1 { 1, 0x3841 };
+		static constexpr GfxReg::Reg kLo0 { 1, 0x3040 }, kHi0 { 1, 0x3041 }, kLo1 { 1, 0x3043 }, kHi1 { 1, 0x3044 };
+
+		if (!rtReady)
+			return false;
+
+		if (!perfStarted) {
+			// RLC_CGTT_MGCG_OVERRIDE.PERFMON_CLOCK_STATE: the counters' clock not gated (gfx_v12_0_update_perf_clk)
+			wr(IpDiscovery::HwGc, GfxReg::RlcCgttMgcgOverride, rdGc(GfxReg::RlcCgttMgcgOverride) | 0x400);
+			wr(IpDiscovery::HwGc, kPerfmonCntl, 0);   // PERFMON_STATE: disable and reset
+			wr(IpDiscovery::HwGc, kSel0, 0);
+			wr(IpDiscovery::HwGc, kSel1, 2);
+			wr(IpDiscovery::HwGc, kPerfmonCntl, 1);   // start counting
+			perfStarted = true;
+		}
+
+		wr(IpDiscovery::HwGc, kPerfmonCntl, 2 | 1u << 10);   // STOP_COUNTING, PERFMON_SAMPLE_ENABLE
+		clocks = rdGc(kLo0) | static_cast<uint64_t>(rdGc(kHi0)) << 32;
+		active = rdGc(kLo1) | static_cast<uint64_t>(rdGc(kHi1)) << 32;
+		wr(IpDiscovery::HwGc, kPerfmonCntl, 0);
+		wr(IpDiscovery::HwGc, kPerfmonCntl, 1);
+
+		return true;
+	}
+	bool perfStarted { false };
 	IOReturn rtSleepTest(const void *owner, uint32_t phase);
 	IOReturn rtQuiesce(const void *owner);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
@@ -672,6 +701,7 @@ public:
 	// unmaps them. The caller keeps the pages alive meanwhile.
 	IOReturn rtMapPages(const void *owner, const uint64_t *pageBuses, uint64_t pages, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtFree(const void *owner, uint64_t handle);
+	IOReturn rtMapVram(const void *owner, uint64_t barPhys, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
 	                mach_vm_address_t user, uint64_t length, bool toGpu);
 	IOReturn rtLoad(const void *owner, task_t task, mach_vm_address_t elf, uint64_t length,
@@ -764,6 +794,7 @@ private:
 		uint16_t    gen { 0 };
 		bool        device { false };          // from the device heap
 		bool        host { false };
+		bool        foreign { false };         // VRAM that is not the runtime's (rtMapVram): only the VA is given back
 		IOBufferMemoryDescriptor *hostMemory { nullptr };
 		IODMACommand *hostDma { nullptr };
 		IOMemoryMap *hostMap { nullptr };
