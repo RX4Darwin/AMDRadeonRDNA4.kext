@@ -46,6 +46,9 @@ using namespace pvgpu;
 // debug.rdna4_pvtalk=1: every draw is logged as the first ones of a task are (what WindowServer draws when a window appears, say).
 static int gTalk;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvtalk, CTLFLAG_RW | CTLFLAG_LOCKED, &gTalk, 0, "AMDRadeonRDNA4: log every paravirtual draw");
+static int gInPlace = 3;
+SYSCTL_INT(_debug, OID_AUTO, rdna4_pvinplace, CTLFLAG_RW | CTLFLAG_LOCKED, &gInPlace, 0,
+	   "AMDRadeonRDNA4: what draws use in place (1 textures, 2 colour targets; 4 not IOSurface textures, 8 not Metal's); the rest is staged");
 
 namespace {
 
@@ -103,7 +106,7 @@ struct Translation {
 void pvlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void pvlog(const char *fmt, ...) {
 	const uint32_t n = __atomic_fetch_add(&gLogLines, 1u, __ATOMIC_RELAXED);
-	if (n >= kMaxLogLines) {
+	if (n >= kMaxLogLines && !gTalk) {   // asked for with debug.rdna4_pvtalk: logged past the budget
 		if (n == kMaxLogLines)
 			rdna4Log("AMDRadeonRDNA4: pvgpu: log budget (%u lines) used up\n", kMaxLogLines);
 		return;
@@ -203,6 +206,7 @@ class RDNA4PvHost : public OSObject {
 public:
 	static RDNA4PvHost *start(RDNA4PvNub *nub, uint32_t level);
 	void tick();
+	int dumpTexture(uint32_t task, uint32_t id, struct sysctl_req *req);
 
 private:
 	friend class RDNA4PvTestOwner;
@@ -436,6 +440,27 @@ uint64_t nowNs() {
 }
 uint64_t nowMs() { return nowNs() / 1000000ull; }
 } // namespace
+
+// debug.rdna4_pvtex: the texture debug.rdna4_pvtexid names ((task << 16) | resource id) as the guest has it, level 0, slice 0:
+// {u32 width, u32 height, u32 Metal pixel format, u32 bytes a pixel, u32 heap record[3], u32 descriptor[29]}, then its rows. To look at
+// what a draw sampled or drew into.
+static int gTexId;
+
+SYSCTL_INT(_debug, OID_AUTO, rdna4_pvtexid, CTLFLAG_RW | CTLFLAG_LOCKED, &gTexId, 0,
+	   "AMDRadeonRDNA4: the texture debug.rdna4_pvtex reads, (task << 16) | resource");
+
+static int texSysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	if (!gHost)
+		return ENOENT;
+
+	return gHost->dumpTexture(static_cast<uint32_t>(gTexId) >> 16, gTexId & 0xffff, req);
+}
+
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvtex, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, texSysctl, "S",
+	    "AMDRadeonRDNA4: a guest texture's pixels");
+
 
 RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	auto *h = OSTypeAlloc(RDNA4PvHost);
@@ -1170,6 +1195,16 @@ bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_
 	      desc[1], desc[2], desc[3], desc[4], desc[5], desc[6], desc[7], desc[8], desc[9], desc[10], desc[11], desc[12], desc[13], desc[14], desc[15]);
 	*len = desc[0] | static_cast<uint64_t>(desc[1]) << 32;
 	*va = static_cast<uint64_t>(desc[2]) << 12;
+
+	// where in its allocation the texture starts (dwords 4-5; 0x100 for CoreAnimation's text images, measured 2026-11-05)
+	const uint64_t start = desc[4] | static_cast<uint64_t>(desc[5]) << 32;
+
+	if (start >= *len)
+		return false;
+
+	*va += start;
+	*len -= start;
+
 	if (bytesPerRow)
 		*bytesPerRow = desc[13];
 	if (width)
@@ -1319,6 +1354,32 @@ bool RDNA4PvHost::surfaceRange(uint32_t task, uint32_t id, Surface &out) {
 // << 16) | load action at +0x60, double clear colour[4] at +0x68} (mtlprobe: texture 1, 0x00010002 = clear and store, 0.25 0.5 0.75 1; measured
 // 2026-10-21). A clear is a fill of the texture's memory with the colour as a BGRA8 pixel: the format is assumed (mtlprobe's) until it is found in
 // the texture's descriptor. Nothing else of a pass is carried out yet (draws need shaders).
+// A render pass descriptor's non-zero dwords, as offset:value (with debug.rdna4_pvtalk). Its colour attachments are 0x3c apart from
+// 0x4c, eight of them, each {u32 texture, ..., u32 (store << 16) | load at +0x14, double clear colour[4] at +0x1c} (WindowServer's passes,
+// 2026-11-05).
+static void logPassDescriptor(const uint8_t *p, uint32_t bytes)
+{
+	char line[200];
+	size_t at = 0;
+
+	for (uint32_t i = 0; i + 4 <= bytes; i += 4) {
+		uint32_t v;
+
+		memcpy(&v, p + i, 4);
+		if (!v)
+			continue;
+
+		at += static_cast<size_t>(snprintf(line + at, sizeof(line) - at, " %03x:%08x", i, v));
+		if (at > sizeof(line) - 16) {
+			pvlog("host: render: pass descriptor%s", line);
+			at = 0;
+		}
+	}
+
+	if (at)
+		pvlog("host: render: pass descriptor%s", line);
+}
+
 uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes) {
 	if (!gCompute || bytes < 0x88)
 		return 0;
@@ -1327,12 +1388,24 @@ uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t by
 	memcpy(&tex, p + 0x4c, 4);
 	memcpy(&actions, p + 0x60, 4);
 	memcpy(rgba, p + 0x68, sizeof(rgba));
+
+	if (gTalk)
+		logPassDescriptor(p, bytes);
+
 	if ((actions & 0xffff) != 2 || !tex)   // MTLLoadActionClear
 		return tex;
 	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
 	const uint32_t pixel = b | g << 8 | r << 16 | a << 24;   // B, G, R, A in memory
 	uint64_t va, len;
-	bool ok = textureRange(task, tex, &va, &len) && !(len & 3) && dmaGuest(task, va, 0, pixel, len);
+	uint32_t bpr = 0, w = 0, h = 0, format = 0;
+	const bool found = textureRange(task, tex, &va, &len, &bpr, &w, &h, &format) && !(len & 3);
+	// RGBA16Float: only to zero so far (a 32-bit pattern cannot hold four halves; transparent black is what CoreAnimation clears to)
+	const bool half = format == 115;
+	const bool zero = !(rgba[0] | rgba[1] | rgba[2] | rgba[3]);
+	bool ok = found && (!half || zero);
+
+	ok = ok && dmaGuest(task, va, 0, half ? 0 : pixel, len);
+
 	Surface surface;
 	if (!ok && surfaceRange(task, tex, surface) && surface.format == 80 && surface.width <= 16384) {   // a BGRA8 IOSurface: row by row
 		auto *line = static_cast<uint32_t *>(IOMalloc(surface.width * 4));
@@ -1421,6 +1494,16 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out)
 	out.va = static_cast<uint64_t>(td[2]) << 12;
 	out.length = td[0] | static_cast<uint64_t>(td[1]) << 32;
 	out.imageBytes = (td[11] | static_cast<uint64_t>(td[12]) << 32) / out.depth;   // level 0's bytes
+
+	// Where in its allocation the texture starts: dwords 4-5 (CoreAnimation's text images start 0x100 into theirs). Read from the
+	// allocation's start, text came out shifted by a row and a bit, its end at its start (rdna4_pvtex, 2026-11-05).
+	const uint64_t start = td[4] | static_cast<uint64_t>(td[5]) << 32;
+
+	if (start >= out.length)
+		return false;
+
+	out.va += start;
+	out.length -= start;
 	// an array's slices (WindowServer's 16384x1x3 R32Float: dword 3 0x00030001, dwords 6-7 0x10000; measured 2026-11-05)
 	out.slices = td[3] >> 16 ? td[3] >> 16 : 1;
 	out.sliceBytes = td[6] | static_cast<uint64_t>(td[7]) << 32;
@@ -1469,6 +1552,14 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			continue;
 
 		ok = textureSource(task, id, src);
+		// A 1D array (WindowServer's colour lookup tables) staged as a 3D image's slices are, sampled through a 1D-array T#.
+		const bool array1d = ok && src.slices > 1 && src.depth == 1 && src.height == 1 && src.sliceBytes;
+
+		if (array1d) {
+			src.depth = src.slices;
+			src.imageBytes = src.sliceBytes;
+		}
+
 		const uint32_t format = src.format, usage = src.usage;
 		const TextureFormat *fm = textureFormat(format);
 		const uint32_t w = src.width, h = src.height, depth = src.depth, rowBytes = src.rowBytes;
@@ -1491,9 +1582,13 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		const uint64_t used = static_cast<uint64_t>(rowBytes) * h;
 		uint64_t gpu = 0;
 
-		if (depth == 1 && (h == 1 || (!(rowBytes % 128) && !(rowBytes % fm->bpp))) && (src.surface.memory || !(src.va & 0xff)) &&
-		    (src.surface.memory ? mapMemory(src.surface.memory, src.surface.base, used, out[k].handle, gpu)
-		                        : mapGuest(task, src.va, used, out[k].handle, gpu))) {
+		const bool pitched = h == 1 || (!(rowBytes % 128) && !(rowBytes % fm->bpp));
+		const bool based = src.surface.memory || !(src.va & 0xff);
+		const bool kind = src.surface.memory ? !(gInPlace & 4) : !(gInPlace & 8);
+		const bool inPlace = (gInPlace & 1) && kind && depth == 1 && pitched && based;
+
+		if (inPlace && (src.surface.memory ? mapMemory(src.surface.memory, src.surface.base, used, out[k].handle, gpu)
+		                                   : mapGuest(task, src.va, used, out[k].handle, gpu))) {
 			out[k].va = 0;   // nothing to copy back: the card writes the guest's memory itself
 			out[k].writable = false;
 			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, h, h == 1 ? w : rowBytes / fm->bpp);
@@ -1556,7 +1651,9 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		out[k].rowLen = w * fm->bpp;
 		out[k].height = h;
 		out[k].writable = (usage & 2) && src.type == 2 && depth == 1;   // MTLTextureUsageShaderWrite; not read-only (type 3), IOSurface or 3D
-		if (depth > 1)
+		if (array1d)
+			linearArray1d(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, depth);
+		else if (depth > 1)
 			linearVolume(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, h, depth);
 		else
 			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, h, pitchPx);
@@ -1905,20 +2002,23 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			why = "a fragment input the vertex function does not write";
 		inputCntl[k] = slot | (in[1] & 1) << 10;   // OFFSET, FLAT_SHADE
 	}
-	// The colour attachment: a linear 32-bit texture, or a BGRA8 IOSurface (surfaceRange; its rows width * 4 bytes, bpr apart).
+	// The colour attachment: a linear 32-bit or RGBA16Float texture, or a BGRA8 IOSurface (surfaceRange; its rows width * 4 bytes, bpr apart).
 	uint64_t va = 0, len = 0;
 	uint32_t bpr = 0, width = 0, height = 0;
 	Surface surface;
 	// A texture: BGRA8 (its rows may be padded; height from the descriptor), or of unknown format with unpadded 32-bit rows (as before).
 	uint32_t targetFormat = 0, texHeight = 0;
 	bool bgra = true;   // swapped into and out of the staged RGBA8 target
-	// RGBA8 (70, 71) as BGRA8, but already in the staged target's order.
-	const auto rgba8 = [](uint32_t f) { return f == 70 || f == 71 || f == 80 || f == 81; };
-	if (!why && textureRange(task, target, &va, &len, &bpr, &width, &texHeight, &targetFormat) && width && bpr >= width * 4 &&
-	    (rgba8(targetFormat) ? texHeight && static_cast<uint64_t>(bpr) * texHeight <= len
-	                         : !targetFormat && bpr == width * 4 && len % bpr == 0)) {
+	// RGBA8 (70, 71) as BGRA8, but already in the staged target's order; RGBA16Float (115: CoreAnimation renders symbols into it) as
+	// itself, 8 bytes a pixel.
+	const auto known = [](uint32_t f) { return f == 70 || f == 71 || f == 80 || f == 81 || f == 115; };
+	const bool found = !why && textureRange(task, target, &va, &len, &bpr, &width, &texHeight, &targetFormat) && width;
+	const bool fitsKnown = known(targetFormat) && texHeight && static_cast<uint64_t>(bpr) * texHeight <= len;
+	const bool fitsPlain = !targetFormat && bpr == width * 4 && bpr && len % bpr == 0;   // of unknown format: unpadded 32-bit rows
+
+	if (found && bpr >= width * (targetFormat == 115 ? 8 : 4) && (fitsKnown || fitsPlain)) {
 		height = targetFormat ? texHeight : static_cast<uint32_t>(len / bpr);
-		bgra = targetFormat != 70 && targetFormat != 71;
+		bgra = targetFormat != 70 && targetFormat != 71 && targetFormat != 115;
 	}
 	else if (!why && surfaceRange(task, target, surface) && surface.format == 80) {
 		bpr = surface.bytesPerRow;
@@ -1928,7 +2028,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	if (!why && !(width && height && width <= 16384 && height <= 16384)) {
 		static uint32_t refusedTargets;
 
-		why = "the colour attachment is neither a linear 32-bit texture nor a BGRA8 IOSurface";
+		why = "the colour attachment is neither a linear 32-bit or RGBA16Float texture nor a BGRA8 IOSurface";
 		if (refusedTargets++ < 8)
 			pvlog("host: render: colour attachment %u: format %u, %ux%u, %u bytes per row, %llu bytes: not supported yet", target, targetFormat,
 			      width, texHeight, bpr, static_cast<unsigned long long>(len));
@@ -1951,11 +2051,13 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint32_t sy2 = draw.scissorSet ? clampTo(draw.scissor[1] + draw.scissor[3], height) : height;
 	// The target in place when the colour block can write it as the guest has it (its rows a multiple of 128 bytes apart, its base 256-byte
 	// aligned): no staging, no copies, and BGRA8 swapped by the colour block (COMP_SWAP) instead of the CPU. Else staged at a pitch of its own.
-	const bool inPlace = !(bpr % 128) && !((surface.memory ? surface.base : va) & 0xff);
-	const uint32_t pitch = inPlace ? bpr / 4 : (width + 31) & ~31u;   // pixels; staged: a multiple of 128 bytes
-	const uint64_t targetBytes = static_cast<uint64_t>(pitch) * height * 4;
+	const bool half = targetFormat == 115;
+	const uint32_t tp = half ? 8 : 4;   // bytes a pixel
+	const bool inPlace = (gInPlace & 2) && !(bpr % 128) && !((surface.memory ? surface.base : va) & 0xff);
+	const uint32_t pitch = inPlace ? bpr / tp : (width * tp + 127) / 128 * 128 / tp;   // pixels; staged: a multiple of 128 bytes
+	const uint64_t targetBytes = static_cast<uint64_t>(pitch) * height * tp;
 	// Only the scissor rectangle's rows are staged in and out (WindowServer limits most draws to what changed): nothing outside it is drawn.
-	const uint64_t regionAt = static_cast<uint64_t>(pitch) * sy * 4, regionBytes = static_cast<uint64_t>(pitch) * (sy2 - sy) * 4;
+	const uint64_t regionAt = static_cast<uint64_t>(pitch) * sy * tp, regionBytes = static_cast<uint64_t>(pitch) * (sy2 - sy) * tp;
 
 	if (sx2 <= sx || sy2 <= sy) {
 		if (talk)
@@ -2040,7 +2142,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x76, 0x0a, ps[3]}, {0x76, 0x0b, ps[4]},                          // SPI_SHADER_PGM_RSRC1_PS, RSRC2_PS
 		{0x69, 0x197, ps[5]}, {0x69, 0x198, ps[6]},                        // SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR
 		{0x69, 0x31e, (pitch - 1) << 16 | (height - 1)},                    // CB_COLOR0_ATTRIB2: MIP0_WIDTH (the pitch), MIP0_HEIGHT
-		{0x69, 0x3b0, inPlace && bgra ? 0x0002880au : 0x0002800au},        // CB_COLOR0_INFO: the template's 8_8_8_8 unorm, COMP_SWAP ALT for BGRA8
+		{0x69, 0x3b0, half ? 0x0002070cu : inPlace && bgra ? 0x0002880au : 0x0002800au},   // CB_COLOR0_INFO: 8_8_8_8 unorm (COMP_SWAP ALT: BGRA8), or 16_16_16_16 float
 		{0x69, 0x82, width | height << 16},                                // PA_SC_WINDOW_SCISSOR_BR
 		{0x69, 0x94, sx | sy << 16},                                       // PA_SC_VPORT_SCISSOR_0_TL, _BR: Metal's scissor rectangle
 		{0x69, 0x95, sx2 | sy2 << 16},
@@ -2103,7 +2205,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	mPhaseNs[0] += nowNs() - texturesFrom;
 	// Colour attachment 0 as the draw finds it, for fragment shaders that read it (Metal's [[color(0)]]; RDNA4_MTLC_TABLE_FRAMEBUFFER): a T# of
 	// the staged RGBA8 target. ponytail: a pixel the same draw covers twice reads the value from before the draw, not its first write.
-	linearImage(reinterpret_cast<uint32_t *>(&misc[(0x800 + RDNA4_MTLC_TABLE_FRAMEBUFFER) / 8]), tgt.gpu, 42,
+	linearImage(reinterpret_cast<uint32_t *>(&misc[(0x800 + RDNA4_MTLC_TABLE_FRAMEBUFFER) / 8]), tgt.gpu, half ? 57 : 42,
 	            inPlace && bgra ? 6 | 5 << 3 | 4 << 6 | 7 << 9 : 4 | 5 << 3 | 6 << 6 | 7 << 9, width, height, pitch);   // 8_8_8_8 unorm: RGBA
 	if (!ok && talk)
 		pvlog("host: render: draw with pipeline %u: a texture or sampler could not be set up: not run", pipeline);
@@ -2214,7 +2316,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		for (uint64_t i = 0; bgra && !inPlace && i < regionBytes / 4; i++)
 			stage[i] = (stage[i] & 0xff00ff00u) | (stage[i] >> 16 & 0xff) | (stage[i] & 0xff) << 16;
 	};
-	auto row = [&](uint32_t y) { return reinterpret_cast<uint8_t *>(stage + static_cast<uint64_t>(y - sy) * pitch); };
+	auto row = [&](uint32_t y) { return reinterpret_cast<uint8_t *>(stage) + static_cast<uint64_t>(y - sy) * pitch * tp; };
 	auto upload = [&](const GfxBuffers &g, const void *from, uint64_t bytes) {
 		if (!g.cpu)
 			return gCompute->rtCopy(this, g.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(from), bytes, true);
@@ -2226,7 +2328,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	};
 	for (uint32_t y = sy; y < sy2 && ok && !inPlace; y++)
 		ok = surface.memory ? surface.memory->readBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
-		                    : readGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * 4);
+		                    : readGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * tp);
 	uint64_t fence = 0, ns = 0;
 
 	if (streamOk && !ok && talk)
@@ -2293,7 +2395,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		swap();
 		for (uint32_t y = sy; y < sy2 && ok && !inPlace; y++)
 			ok = surface.memory ? surface.memory->writeBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
-			                    : copyGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * 4, true);
+			                    : copyGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * tp, true);
 	}
 	if (tgt.handle)
 		gCompute->rtFree(this, tgt.handle);
@@ -3846,6 +3948,9 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 	if (!parent || !level)
 		return false;
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtalk);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvinplace);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvtexid);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvtex);
 	// publish() is reached from two threads (the GPU path in attach() and RDNA4PvLate's work loop): claim the single slot atomically before building
 	// anything, give it back on the paths that can be retried.
 	static bool claimed = false;
@@ -3968,6 +4073,45 @@ void RDNA4PvNub::publishLater(uint32_t level, uint32_t delayMs) { RDNA4PvLate::s
 void RDNA4PvNub::setLateParent(IOService *gpu) { gLateParent = gpu; }   // the GPU stays for the boot: no reference taken
 void RDNA4PvNub::setCompute(RDNA4Compute *compute) { gCompute = compute; }
 void RDNA4PvNub::setSurfaceFunctions(const mach_vm_address_t fn[8]) { memcpy(&gSurfaceFns, fn, sizeof(gSurfaceFns)); }
+
+int RDNA4PvHost::dumpTexture(uint32_t task, uint32_t id, struct sysctl_req *req)
+{
+	TextureSource t;
+	const bool found = textureSource(task, id, t);   // not found: the header, the record and the descriptor only, to see why
+
+	const TextureFormat *fm = textureFormat(t.format);
+	const uint32_t bpp = fm ? fm->bpp : 4;
+	const uint32_t head[4] = { t.width, t.height, t.format, bpp };
+	const uint32_t rowBytes = found ? t.width * bpp : 0;
+	uint32_t rec[3] = {}, desc[29] = {};
+
+	readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec));
+	readGuest(task, rec[1], reinterpret_cast<uint8_t *>(desc), sizeof(desc));
+
+	if (rowBytes > 0x10000)
+		return EINVAL;
+
+	auto *row = static_cast<uint8_t *>(IOMalloc(rowBytes ? rowBytes : 1));
+
+	if (!row)
+		return ENOMEM;
+
+	int err = SYSCTL_OUT(req, head, sizeof(head));
+
+	err = err ? err : SYSCTL_OUT(req, rec, sizeof(rec));
+	err = err ? err : SYSCTL_OUT(req, desc, sizeof(desc));
+
+	for (uint32_t y = 0; rowBytes && y < t.height && !err; y++) {
+		if (!readTextureRow(task, t, y, row, rowBytes))
+			memset(row, 0, rowBytes);
+
+		err = SYSCTL_OUT(req, row, rowBytes);
+	}
+
+	IOFree(row, rowBytes ? rowBytes : 1);
+
+	return err;
+}
 
 void RDNA4PvNub::setPhysmap(uint8_t *base, uint8_t *max)
 {

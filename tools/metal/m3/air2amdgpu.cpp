@@ -411,6 +411,21 @@ static std::string legalize(Function &k) {
 			if (half)
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (tex.starts_with("sample_texture_1d_array.v4f")) {
+			// (texture, sampler, float x, uint slice, i1, int offset, i1 level, float bias or LOD, float min LOD, i32): WindowServer's colour
+			// lookup tables, one mip level, so read at level 0 (sample_lz); the slice is the T#'s array layer, given as a float.
+			const bool half = tex.starts_with("sample_texture_1d_array.v4f16");
+			if (c->arg_size() < 10 || !match(c->getArgOperand(5), m_Zero()) || !match(c->getArgOperand(8), m_AnyZeroFP()))
+				return f->getName().str() + " with an offset or a minimum LOD is not supported yet";
+			Value *t = descriptor(c->getArgOperand(0), 8);
+			Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
+			Value *slice = b.CreateUIToFP(c->getArgOperand(3), b.getFloatTy());
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
+			Value *texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_sample_lz_1darray, {v4f, b.getFloatTy(), t->getType(), sm->getType()},
+			                                 {b.getInt32(15), c->getArgOperand(2), slice, t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			if (half)
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
 		} else if (tex.starts_with("write_texture_2d.v4f")) {   // (texture, uint2 or ushort2 coord, float4 or half4 value, i32 lod, i32 access)
 			if (c->arg_size() < 4 || !match(c->getArgOperand(3), m_Zero()))
 				return f->getName().str() + " to a level other than 0 is not supported yet";
@@ -778,10 +793,12 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	}
 	if (from.size() != air->arg_size())
 		return "not every argument of the AIR shader is described";
-	// A fragment function's colour: float or half, scalar or up to four, alone or as a struct's only member (to colour attachment 0).
+	// A fragment function's colour: float or half, scalar or up to four, alone or as the struct member that is colour attachment 0. The host
+	// draws into attachment 0 only: other attachments' values are dropped (CoreAnimation's mask blit writes the same value to two).
+	unsigned colourMember = 0;
 	auto colourType = [&](Type *t) {
 		if (auto *st = dyn_cast<StructType>(t))
-			t = st->getNumElements() == 1 ? st->getElementType(0) : nullptr;
+			t = colourMember < st->getNumElements() ? st->getElementType(colourMember) : nullptr;
 		auto *vt = t ? dyn_cast<FixedVectorType>(t) : nullptr;
 		Type *e = vt ? vt->getElementType() : t;
 		return e && (e == f32 || e->isHalfTy()) && (!vt || vt->getNumElements() <= 4);
@@ -789,6 +806,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	// (Read now: compile() below deletes the AIR function once it is inlined.)
 	const bool noColour = !vertex && air->getReturnType()->isVoidTy();
 	int position = -1;
+	bool colourZero = false;
 	for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
 		const auto *o = cast<MDNode>(outputs->getOperand(k));
 		const std::string kind = mdString(o, 0);
@@ -798,9 +816,15 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			vars.push_back({k, fnv(mdString(o, 1)), false, 0});
 		else if (vertex && kind == "air.point_size")
 			continue;   // only triangles are drawn: a point's size is not used
-		else if (!(!vertex && kind == "air.render_target" && outputs->getNumOperands() == 1 && mdInt(o, 1) == 0 && colourType(air->getReturnType())))
+		else if (!vertex && kind == "air.render_target" && mdInt(o, 1) == 0) {
+			colourMember = k;
+			colourZero = colourType(air->getReturnType());
+		} else if (!(!vertex && kind == "air.render_target")) {
 			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet";
+		}
 	}
+	if (!vertex && !noColour && !colourZero)
+		return "fragment output: colour attachment 0 missing, or not up to four floats or halves";
 	if (vertex && position < 0)
 		return "the vertex function has no position";
 	if (vars.size() > 16)
@@ -1056,7 +1080,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			b.CreateIntrinsic(Intrinsic::amdgcn_exp, {f32}, {b.getInt32(0), b.getInt32(0), undef, undef, undef, undef, b.getTrue(), b.getTrue()});
 		} else {
 			if (colour->getType()->isStructTy())
-				colour = b.CreateExtractValue(colour, 0);
+				colour = b.CreateExtractValue(colour, colourMember);
 			exportF32(0, toVec4(colour), true);   // mrt0: as four floats (half widened; missing components 0, alpha 1)
 		}
 	}

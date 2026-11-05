@@ -45,6 +45,49 @@ int gHeads = -1;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvheads, CTLFLAG_RD | CTLFLAG_LOCKED, &gHeads, 0,
 	   "AMDRadeonRDNA4: the heads are the paravirtual displays (-1 not known yet)");
 
+/* debug.rdna4_pvshot: what port rdna4_pvshotport's monitor shows, at half size: {u32 width, u32 height}, then BGRA rows. screencapture
+ * gives a stale picture while the heads are the paravirtual displays; this reads the scanout itself. */
+int gShotPort;
+
+SYSCTL_INT(_debug, OID_AUTO, rdna4_pvshotport, CTLFLAG_RW | CTLFLAG_LOCKED, &gShotPort, 0,
+	   "AMDRadeonRDNA4: the port debug.rdna4_pvshot reads");
+
+int shot SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	const uint32_t port = static_cast<uint32_t>(gShotPort);
+	const Mapping *m = port < kMaxPorts ? &gMap[port] : nullptr;
+
+	if (!m || !m->map)
+		return ENOENT;
+
+	const PvScanout::Head h = m->head;
+	const uint32_t size[2] = { h.width / 2, h.height / 2 };
+	const uint8_t *src = reinterpret_cast<const uint8_t *>(m->map->getVirtualAddress());
+	auto *row = static_cast<uint32_t *>(IOMalloc(size[0] * 4));
+
+	if (!row)
+		return ENOMEM;
+
+	int err = SYSCTL_OUT(req, size, sizeof(size));
+
+	for (uint32_t y = 0; y < size[1] && !err; y++) {
+		const volatile uint32_t *line = reinterpret_cast<const volatile uint32_t *>(src + static_cast<uint64_t>(2 * y) * h.pitch);
+
+		for (uint32_t x = 0; x < size[0]; x++)
+			row[x] = line[2 * x];
+
+		err = SYSCTL_OUT(req, row, size[0] * 4);
+	}
+
+	IOFree(row, size[0] * 4);
+
+	return err;
+}
+
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvshot, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, shot, "S",
+	    "AMDRadeonRDNA4: the monitor's picture at half size");
+
 void unmap(Mapping &m)
 {
 	OSSafeReleaseNULL(m.map);
@@ -106,6 +149,8 @@ uint64_t nowNs()
 void PvScanout::start()
 {
 	sysctl_register_oid(&sysctl__debug_rdna4_pvheads);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvshotport);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvshot);
 }
 
 void PvScanout::decided(bool on)
