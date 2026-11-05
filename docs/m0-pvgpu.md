@@ -308,6 +308,32 @@ IOPresentment takes a system whose displays all have display pipes: the Dells wo
 pipes, their transactions scanned out by the real display engine) with the real framebuffers hidden from WindowServer, and the pipe needs a
 gamma-capable plane (`txnProtocol` 0x07 may be what announces one).
 
+### Runs of 2026-11-04/05: the desktop composited on the card
+
+**Measured**, card, Sequoia 24H232, trial `rdna4-pvgpu=1 rdna4-compute=7 rdna4-gfx=2 rdna4-vm=1 rdna4-pvgpu-disp=7`, `useIOP` on (rdna4-iop):
+
+- **WindowServer must not open our framebuffers' offline mode:** it copied its 4K boot screen into their 1x1 mapping (SIGBUS in
+  `CGXReleaseDisplayDeviceSurface`). The extra heads' framebuffers refuse user clients (`src/pvhooks.cpp`); the boot framebuffer is opened
+  before the plugin decides and must stay openable: CoreDisplay asserts in `CGXMappedDisplayStart` when none of a GPU's framebuffers opens.
+- **`CreateComputePipeline` (0x3b) wants an answer:** without the reflection pairs `threadExecutionWidth` is 0, and MetalPerformanceShaders
+  divides by it (SIGFPE in MPSImage at the first desktop blur after login; loginwindow then logged out again and again).
+- **Guest page-table leaf entries:** bit 31 is "the GPU may write", not "mapped": WindowServer's read-only textures (resource type 3:
+  wallpaper, icons, menu-bar text) have entries without it. Resource type 8 is a texture over another resource (a buffer, `{9, size, id,
+  buffer, u64 offset, u64 bytes per row, format << 16 | usage, w, h, ...}`, or a view, `{8, size, id, parent, format, ...}`); not run yet.
+- **Draw commands:** `drawIndexedPrimitives` is `{u16 type, u16 index type (1: 32-bit), u32 index buffer, ...}`: 0x007 `{u16 count, u16
+  offset}`, 0x009 `{u16 count, u16 offset, u32 instances}`, 0x006 `{u64 count, u64 offset}` (apps draw their windows with 0x006). Scissor
+  0x075 `{u64 x, y, w, h}`. `Blit.copyFromBuffer` into a texture (0x12c) mirrors 0x12e's layout.
+- **A linear 3D image** reads rows of the row's bytes aligned to 128, slices of `height` rows of the row's bytes aligned to 256
+  (`rdna4-mtltex3d`).
+- **Speed:** copying every draw's target, textures and buffers through the CPU took nearly all of WindowServer's frame time, and it never
+  finished a frame. They are now mapped in place (`rtMapPages`; no IOMMU on the rig), the mappings kept by page list; the card's own share is
+  about 1 ms in 5 s. Each page-table sync is an SDMA job of about a millisecond, which is what a mapping costs.
+- **With both Dells on** (two display pipes) WindowServer composites with Metal and presents on both pipes, the login window included.
+  **With one display it composites in software** (`Unsupported sw composite destination`, thousands a minute) and never presents; a second
+  pipe without a head is enough to make it present. Not understood yet.
+- **Open:** occasional hangs of draws whose fragment shader reads a texture at the pixel (`TcimBltnXc_Icir`, `Tc3sXc_Idst`; the ring
+  recovers); the menu bar's titles are cut where the first layout's were; draws whose target is not 128-byte aligned are still staged.
+
 ## The GetDeviceInfo reply (hub-task-446) [measured in the kext and the bundle unless marked]
 
 **The wait.** `AppleParavirtAccelerator::setupDeviceInfo` (the last step of `Accelerator::start`) wires a 4 KiB `IOBufferMemoryDescriptor`, builds FIFO command `0x3a` with one record `{u32 0x2d, u32 bytes/8 (0x200), u32 physical page}`, submits it on the root channel through the generic `IOAccelChannel2` path, and then **`IOAccelEventMachineFast2::finishEvent`** waits for the event of that submission. After the wait it calls `parseDeviceInfo(buffer, 0x200, &accelerator->deviceInfo)` and returns true whatever the content (no validation: even an all-zero buffer passes). Then `Accelerator::start` releases its lock and `registerService()`.
