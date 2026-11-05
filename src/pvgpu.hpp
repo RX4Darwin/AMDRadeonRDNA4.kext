@@ -72,6 +72,7 @@ public:
 	volatile uint32_t *ctrl() const { return mBar0 ? reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(mBar0) + pvgpu::kCtrl) : nullptr; }
 	// Run the registered handler of interrupt `source`, as the interrupt controller would. false when none is registered and enabled.
 	bool raiseInterrupt(int source);
+	bool interruptBusy(int source);   // the driver has the line disabled (handling it), or a raise waits for it
 	bool configTest();      // used by the self-test: config space, capabilities, matching
 
 	bool init(OSDictionary *propTable) APPLE_KEXT_OVERRIDE;

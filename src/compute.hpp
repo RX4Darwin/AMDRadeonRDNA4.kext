@@ -683,6 +683,7 @@ public:
 	// W12k: a client's own gfx IB on the kernel's gfx ring (runtime.cpp, docs/w12k-gfx-submit.md)
 	IOReturn rtSubmitGfxIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags, uint64_t &fence);
 	IOReturn rtWaitGfxFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns);
+	bool rtGfxFenceDone(const void *owner, uint32_t fence);   // without waiting: whether the card has written `fence` yet
 	IOReturn rtPresent(const void *owner, uint64_t handle, uint64_t offset,
 	                   uint64_t &geometry, uint64_t &pitch);
 	IOReturn rtPresentAsync(const void *owner, uint64_t handle, uint64_t offset,
@@ -752,6 +753,7 @@ private:
 	static constexpr uint64_t kHostMaxClient = 1ull << 30;
 	static constexpr uint64_t kHostMaxTotal = 4ull << 30;
 	static constexpr uint32_t kMaxIbOutstanding = 16;
+	static constexpr uint32_t kMaxGfxIbOutstanding = 64;   // a client's gfx IBs in flight: the paravirtual host submits draws without waiting
 	struct RtBuffer  {
 		const void *owner { nullptr };
 		uint64_t    offset { 0 }, bytes { 0 }; // heap offset (pool or VRAM), size
@@ -797,7 +799,7 @@ private:
 		volatile uint32_t *gfxFenceCpu { nullptr };
 		uint64_t gfxFenceMc { 0 };
 		uint32_t gfxFence { 0 };
-		uint32_t gfxFences[kMaxIbOutstanding] {};
+		uint32_t gfxFences[kMaxGfxIbOutstanding] {};
 		uint32_t gfxOutstanding { 0 };
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
@@ -1018,7 +1020,7 @@ private:
 	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
 	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
 	// so the two never use the ring at the same time. Everything below runs under rtLock.
-	static constexpr uint32_t kMaxGfxOutstanding = 16;     // submissions in the ring across all clients (15 dwords each, 22 with the pool's ring fence: 352 of 4096)
+	static constexpr uint32_t kMaxGfxOutstanding = 64;     // submissions in the ring across all clients (15 dwords each, 22 with the pool's ring fence: 1408 of 4096)
 	static constexpr uint32_t kGfxFenceSlot = 0x40;        // bytes into the client's fence page
 	bool     gfxWedged { false };                          // a client gfx IB timed out: the gfx ring is given up until the next bring-up
 	bool     gfxParked { false };                          // gfxPark halted PFP/ME (probe boots)

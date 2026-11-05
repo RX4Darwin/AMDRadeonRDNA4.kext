@@ -278,7 +278,34 @@ private:
 public:
 	void noteDraw(uint64_t ns);
 private:
-	IOReturn submitGfx(uint32_t dwords, uint64_t &fence);
+	IOReturn submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence);
+	// Draws in flight: submitted without a wait, each with its own state page and IB (slot n of mGfxMisc and mGfxIb), waited for together
+	// by waitDraws before anything reads or reuses what they use (a stamp completed, a present, a blit, new shader code, a mapping dropped).
+	static constexpr uint32_t kSlots = 64;
+	// At most this many in flight: the runtime ends one hung IB, not several (with three in flight a hang halted the ring for good).
+	static constexpr uint32_t kInFlight = 1;
+	uint32_t mSlot { 0 }, mPending { 0 };
+	// Shader pairs kept on the card, slot n at mGfxCode + n * RDNA4_TRI_CODE_BYTES: WindowServer switches between a few dozen pairs all the
+	// time, and with one slot each switch waited for the draws in flight and copied the slot in again.
+	static constexpr uint32_t kCodeSlots = 16;
+	struct CodeSlot { uint8_t hash[2][32]; uint64_t used; bool valid; };
+	CodeSlot mCode[kCodeSlots] {};
+	uint64_t mCodeClock { 0 };
+	uint32_t codeSlot(const uint8_t *vs, const uint8_t *ps, bool &fresh);
+	uint64_t mLastFence { 0 };
+	uint32_t mDirty[32] {}, mDirtyCount { 0 };   // the targets of the draws in flight, (task << 16) | resource
+	void waitDraws();
+	void readyDraws();
+	// Stamps whose command buffers have draws in flight: completed when the card has written the fence of their last draw (each tick and
+	// after each wait), so that the host goes on with the next command buffer meanwhile. In order, one queue for all channels.
+	struct LateStamp { uint32_t index, value; uint64_t fence; };
+	static constexpr uint32_t kLateStamps = 64;
+	LateStamp mLate[kLateStamps] {};
+	uint32_t mLateCount { 0 };
+	uint64_t mLateSince { 0 };   // when the oldest was queued
+	void stampLater(uint32_t index, uint32_t value);
+	void completeLate();
+	bool drawing(uint32_t task, uint32_t id) const;
 	struct BlitRegion;
 	bool copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex, uint32_t buf, const BlitRegion &r);
 	void presentTransaction(const pvstream::FifoCommand &c, const uint8_t *cmd);
@@ -510,13 +537,16 @@ void RDNA4PvHost::tick() {
 		pvlog("host: tick %llu", mTicks);
 	if (mTicks == 1)
 		dmaSelfTest();
-	if (mIrqBits) {
-		// The real register clears on read; RAM cannot, so the bits we raised are dropped a tick later (the handler has had its chance: the driver also
-		// re-reads the stamp after every timed wait, so a missed wake-up costs at most the 1 s wait of IOAccelEventMachine2::waitForStamp).
+	// The real register clears on read; RAM cannot, so the bits we raised are dropped once the driver is done with them: its event source keeps
+	// the line disabled from the interrupt until its work loop has read the status. Dropped a tick after the raise, a raise that came while the
+	// line was disabled reached the driver with no bits left, and it only saw its stamps and VBLs after IOAccelEventMachine2::waitForStamp's 1 s
+	// timed wait (most raises of a session: animations stood still, frames came late).
+	if (mIrqBits && !mNub->interruptBusy(0)) {
 		if (volatile uint32_t *c = mNub->ctrl())
 			c[kRegIntrStatusGpu / 4] &= ~mIrqBits;
 		mIrqBits = 0;
 	}
+	completeLate();
 	pollRegisters();
 	mapRoot();
 	pollFifo();
@@ -778,7 +808,7 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 		at += c.length;
 	}
 	if (haveSignal)
-		completeStamp(src.stampIndex, lastSignal);
+		stampLater(src.stampIndex, lastSignal);   // the guest takes the stamp for its command buffers being done
 
 	return at;
 }
@@ -840,18 +870,121 @@ void RDNA4PvHost::answerComputePipeline(const pvstream::FifoCommand &c, const ui
 
 // The draw's IB submitted, waiting up to kGfxWait while the ring is not ready: WindowServer's first draws come while the kernel still
 // brings the ring up, and a draw left out is not drawn again until its region changes.
-IOReturn RDNA4PvHost::submitGfx(uint32_t dwords, uint64_t &fence)
+IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 {
 	static constexpr uint32_t kGfxWait = 10000;   // ms
 	static constexpr uint32_t kGfxPoll = 20;      // ms
-	IOReturn r = gCompute->rtSubmitGfxIb(this, mGfxIb.gpu, dwords, 0, fence);
+	static constexpr uint32_t kBusyPolls = 20000; // of 10 us: the ring full of draws in flight drains in well under 200 ms
+	IOReturn r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
+
+	for (uint32_t polls = 0; r == kIOReturnBusy && polls < kBusyPolls; polls++) {
+		IODelay(10);
+		r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
+	}
 
 	for (uint32_t waited = 0; r == kIOReturnNotReady && waited < kGfxWait; waited += kGfxPoll) {
 		IOSleep(kGfxPoll);
-		r = gCompute->rtSubmitGfxIb(this, mGfxIb.gpu, dwords, 0, fence);
+		r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
 	}
 
 	return r;
+}
+
+// The draws in flight waited for: what they read and write is the guest's again, their slots and the pool free once readyDraws runs.
+void RDNA4PvHost::waitDraws()
+{
+	static constexpr uint32_t kBatchWait = 50;    // ms: a draw takes the card 6 ms at most
+	uint64_t ns = 0;
+
+	if (!mPending)
+		return;
+
+	const uint64_t from = nowNs();
+	const IOReturn r = gCompute->rtWaitGfxFence(this, static_cast<uint32_t>(mLastFence), kBatchWait, ns);
+
+	mPhaseNs[2] += nowNs() - from;
+
+	if (r != kIOReturnSuccess && mGfxHangLines++ < 12)
+		pvstat("host: render: %u draws in flight did not finish (fence %llu): 0x%x", mPending, static_cast<unsigned long long>(mLastFence), r);
+
+	mPending = 0;
+	mDirtyCount = 0;
+	completeLate();
+}
+
+void RDNA4PvHost::stampLater(uint32_t index, uint32_t value)
+{
+	if (!mPending && !mLateCount) {
+		completeStamp(index, value);
+		return;
+	}
+
+	if (mLateCount == kLateStamps)
+		waitDraws();
+
+	if (!mLateCount)
+		mLateSince = nowNs();
+
+	mLate[mLateCount++] = { index, value, mPending ? mLastFence : 0 };   // 0: nothing of it in flight
+	completeLate();
+}
+
+// The queued stamps whose draws are done, in order; all of them after waitDraws (nothing in flight then).
+void RDNA4PvHost::completeLate()
+{
+	static constexpr uint64_t kLateWait = 50000000;   // ns: then waited for, and a hang ended
+	uint32_t done = 0;
+
+	if (mPending && gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(mLastFence))) {
+		mPending = 0;
+		mDirtyCount = 0;
+	}
+
+	while (done < mLateCount) {
+		const LateStamp &l = mLate[done];
+
+		if (mPending && l.fence && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(l.fence)))
+			break;
+
+		completeStamp(l.index, l.value);
+		done++;
+	}
+
+	for (uint32_t i = done; i < mLateCount; i++)
+		mLate[i - done] = mLate[i];
+
+	mLateCount -= done;
+
+	if (done && mLateCount)
+		mLateSince = nowNs();
+
+	if (mLateCount && nowNs() - mLateSince > kLateWait)
+		waitDraws();
+}
+
+// Before a draw or dispatch is put together: slots and pool from the start when nothing is in flight; waited for first when they run low.
+void RDNA4PvHost::readyDraws()
+{
+	if (mSlot >= kSlots || mPoolUsed > kPoolBytes / 4)
+		waitDraws();
+
+	if (mPending)
+		return;
+
+	mSlot = 0;
+	mPoolUsed = 0;
+}
+
+// Whether a draw in flight draws into texture `id`: the CPU must not read it before they are done.
+bool RDNA4PvHost::drawing(uint32_t task, uint32_t id) const
+{
+	const uint32_t key = task << 16 | (id & 0xffff);
+
+	for (uint32_t i = 0; i < mDirtyCount; i++)
+		if (mDirty[i] == key)
+			return true;
+
+	return false;
 }
 
 // M1: a command's payload as dwords (up to 32), to work its layout out against what the guest asked for (tools/metal/m1/mtlprobe.m).
@@ -1394,6 +1527,8 @@ uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t by
 
 	if ((actions & 0xffff) != 2 || !tex)   // MTLLoadActionClear
 		return tex;
+
+	waitDraws();   // cleared with SDMA or the CPU, after the draws before
 	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
 	const uint32_t pixel = b | g << 8 | r << 16 | a << 24;   // B, G, R, A in memory
 	uint64_t va, len;
@@ -1615,6 +1750,9 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		if (ok && depth > 1)
 			memset(copy, 0, bytes);
 
+		if (drawing(task, id))   // copied by the CPU: what draws in flight put into it first
+			waitDraws();
+
 		for (; y < h * depth && ok; y++)
 			ok = readTextureRow(task, src, y, copy + (y / h) * slice + static_cast<uint64_t>(y % h) * texPitch, w * fm->bpp);
 
@@ -1752,6 +1890,7 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 			oldest = m.handle && (!oldest || m.used < oldest->used) ? &m : oldest;
 		if (!oldest)
 			break;
+		waitDraws();   // a draw in flight may use it
 		dropMapping(*oldest);
 		ok = gCompute->rtMapPages(this, pages, count, h, gpu) == kIOReturnSuccess;
 	}
@@ -1765,6 +1904,8 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 
 	for (Mapping &m : mMap)   // the slot to fill: an empty one (the loop above may have emptied some), else the least recently used
 		lru = !m.handle ? &m : lru->handle && m.used < lru->used ? &m : lru;
+	if (lru->handle)
+		waitDraws();   // a draw in flight may use it
 	dropMapping(*lru);
 	memcpy(copy, pages, count * 8);
 	*lru = {copy, count, h, gpu, mMapClock};
@@ -1812,8 +1953,6 @@ bool RDNA4PvHost::releaseTextures(uint32_t task, StagedTexture (&staged)[16], bo
 }
 
 namespace {
-
-const uint8_t kNoHash[32] = {};
 
 // A vertex shader's ring descriptor literals (nggcol.s) with the attribute ring at `rings`, `outs` values a vertex.
 uint32_t ringLiteral(uint32_t dw, uint64_t rings, uint32_t outs)
@@ -1930,6 +2069,54 @@ void RDNA4PvHost::placeShaders(uint32_t *code, const Jit *const shader[3], uint6
 // (src/gfx12_draw_col.h: the attribute ring), whose descriptor literals in the vertex shader the host patches as for nggcol.s. Each stage's
 // bound buffers are staged into the runtime (read-only: nothing is copied back) and their addresses put in a table per stage in the misc
 // page, which the shaders find in their two user SGPRs (SPI_SHADER_USER_DATA_GS_0/1, _PS_0/1, set by a packet added before the draw).
+// The slot of a shader pair: the one holding it, else the least recently used one, `fresh` (to be filled; it holds nothing until then).
+uint32_t RDNA4PvHost::codeSlot(const uint8_t *vs, const uint8_t *ps, bool &fresh)
+{
+	uint32_t lru = 0;
+
+	mCodeClock++;
+
+	for (uint32_t i = 0; i < kCodeSlots; i++) {
+		CodeSlot &c = mCode[i];
+
+		if (c.valid && !memcmp(c.hash[0], vs, 32) && !memcmp(c.hash[1], ps, 32)) {
+			c.used = mCodeClock;
+			fresh = false;
+
+			return i;
+		}
+
+		if (!c.valid ? mCode[lru].valid : c.used < mCode[lru].used)
+			lru = i;
+	}
+
+	CodeSlot &c = mCode[lru];
+
+	memcpy(c.hash[0], vs, 32);
+	memcpy(c.hash[1], ps, 32);
+	c.used = mCodeClock;
+	c.valid = false;
+	fresh = true;
+
+	return lru;
+}
+
+// Whether a draw's staging leaves the CPU work after the card: a texture to copy back, or memory of its own to free.
+static bool ownsMemory(const RDNA4PvHost::StagedTexture (&staged)[2][16], const uint64_t (&handle)[2][RDNA4_MTLC_MAX_BUFFERS])
+{
+	for (unsigned st = 0; st < 2; st++) {
+		for (const auto &t : staged[st])
+			if (t.handle || t.writable)
+				return true;
+
+		for (uint64_t h : handle[st])
+			if (h)
+				return true;
+	}
+
+	return false;
+}
+
 void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *bound) {
 	// A draw takes the card 6 ms at most; any of WindowServer's draws hangs it now and then (about every 8 s, any shader, also with clock
 	// gating off; cause open), and each held all drawing until the wait gave up and the ring was reset: 2 s, then 250 ms were visible stalls.
@@ -2085,7 +2272,13 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;
 	GfxBuffers tgt {};
 	uint8_t *pooledTarget = nullptr;
-	mPoolUsed = 0;   // the draw before this one is done
+
+	readyDraws();
+
+	// this draw's state page and IB
+	const uint32_t slot = mSlot++;
+	const uint64_t slotAt = static_cast<uint64_t>(slot) * RDNA4_TRIRUN_PAGE;
+
 	const bool pooled = !inPlace && mRtOpen && poolTake(targetBytes, tgt.gpu, pooledTarget);
 	uint32_t *stage = nullptr;
 
@@ -2107,25 +2300,27 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		return pooled || gCompute->rtAlloc(this, targetBytes, tgt.handle, tgt.gpu) == kIOReturnSuccess;
 	};
 	const uint64_t ringBytes = rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK;
-	bool ok = mRtOpen && (inPlace || stage) && make(mGfxCode, RDNA4_TRI_CODE_BYTES) && make(mGfxRings, ringBytes);
+	bool ok = mRtOpen && (inPlace || stage) && make(mGfxCode, RDNA4_TRI_CODE_BYTES * kCodeSlots) && make(mGfxRings, ringBytes);
 
-	ok = ok && makeHost(mGfxMisc, RDNA4_TRIRUN_PAGE) && makeHost(mGfxIb, RDNA4_TRIRUN_PAGE) && makeSpare(mGfxSpare);
+	ok = ok && makeHost(mGfxMisc, RDNA4_TRIRUN_PAGE * kSlots) && makeHost(mGfxIb, RDNA4_TRIRUN_PAGE * kSlots) && makeSpare(mGfxSpare);
 	ok = ok && rdna4_trirun_rings_fit(mGfxRings.gpu, ringBytes, rdna4_tri_ring_bytes()) && placeTarget();
 	const bool allocated = ok;
 
-	// The shaders, only uploaded when the pair changes: WindowServer draws with few pipelines, and the slots are large.
+	// The shaders: the pair's slot, uploaded when the pair is not on the card yet.
 	static uint32_t code[RDNA4_TRI_CODE_BYTES / 4];   // ponytail: one host, draws run one at a time on its work loop
-	static uint8_t loaded[2][32];   // the hashes of the pair in mGfxCode (all zero: none)
 	const uint64_t rings = rdna4_trirun_rings_va(mGfxRings.gpu);   // attribute ring first
-	const bool newCode = ok && (memcmp(loaded[0], shader[1]->hash, 32) || memcmp(loaded[1], shader[2]->hash, 32));
+	bool newCode = false;
+	const uint32_t pair = ok ? codeSlot(shader[1]->hash, shader[2]->hash, newCode) : 0;
+	const uint64_t codeAt = static_cast<uint64_t>(pair) * RDNA4_TRI_CODE_BYTES, codeGpu = mGfxCode.gpu + codeAt;
 
 	if (newCode)
 		placeShaders(code, shader, rings, outs);
 
 	// The stream: the triangle's, with this draw's addresses, shaders' registers, target, viewport and vertex count.
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];
-	const rdna4_tri_va where = {mGfxCode.gpu, tgt.gpu, rings, mGfxMisc.gpu};
-	const rdna4_tricol_va whereCol = {mGfxCode.gpu, tgt.gpu, rings, mGfxMisc.gpu};
+	const uint64_t miscGpu = mGfxMisc.gpu + slotAt, ibGpu = mGfxIb.gpu + slotAt;
+	const rdna4_tri_va where = {codeGpu, tgt.gpu, rings, miscGpu};
+	const rdna4_tricol_va whereCol = {codeGpu, tgt.gpu, rings, miscGpu};
 	const uint32_t n = !ok ? 0 : outs ? rdna4_tricol_record(ib, &whereCol) : rdna4_tri_record(ib, &where);
 	// Blending: the colour pass, and when alpha's equation differs and both are written, an alpha-only pass after it.
 	// ponytail: a colour factor reading destination alpha sees the alpha from before the draw, not from earlier triangles of the same
@@ -2216,13 +2411,21 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	if (ok && draw.indexBytes) {
 		const uint64_t bytes = static_cast<uint64_t>(count) * draw.indexBytes;
 		uint64_t iva = 0, ilen = 0;
+		uint8_t *pooledIndices = nullptr;
+
 		ok = bufferRange(task, draw.indexBuffer, &iva, &ilen) && draw.indexOffset <= ilen && bytes <= ilen - draw.indexOffset;
-		auto *copy = ok ? static_cast<uint8_t *>(IOMalloc(bytes)) : nullptr;
-		ok = copy && readGuest(task, iva + draw.indexOffset, copy, static_cast<uint32_t>(bytes)) &&
-		     gCompute->rtAlloc(this, bytes, indexHandle, indexGpu) == kIOReturnSuccess &&
-		     gCompute->rtCopy(this, indexHandle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(copy), bytes, true) == kIOReturnSuccess;
-		if (copy)
-			IOFree(copy, bytes);
+
+		if (ok && poolTake(bytes, indexGpu, pooledIndices)) {
+			ok = readGuest(task, iva + draw.indexOffset, pooledIndices, static_cast<uint32_t>(bytes));
+		} else if (ok) {   // a runtime buffer of its own
+			auto *copy = static_cast<uint8_t *>(IOMalloc(bytes));
+
+			ok = copy && readGuest(task, iva + draw.indexOffset, copy, static_cast<uint32_t>(bytes)) &&
+			     gCompute->rtAlloc(this, bytes, indexHandle, indexGpu) == kIOReturnSuccess &&
+			     gCompute->rtCopy(this, indexHandle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(copy), bytes, true) == kIOReturnSuccess;
+			if (copy)
+				IOFree(copy, bytes);
+		}
 	}
 
 	if (texturesOk && !ok && talk)
@@ -2232,7 +2435,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// The draw, in place of the template's DRAW_INDEX_AUTO (3 dwords): the stages' tables (SPI_SHADER_USER_DATA_GS_0/1, _PS_0/1); for an indexed
 	// draw VGT_INDEX_TYPE (SET_UCONFIG_REG_INDEX, as RADV on gfx9+); per instance the first vertex and the instance id (USER_DATA_GS_2/3, the
 	// vertex shader's s10-s11) and the draw: DRAW_INDEX_AUTO, or DRAW_INDEX_2 from the staged indices (DI_SRC_SEL_DMA).
-	const uint64_t table[2] = {mGfxMisc.gpu + 0x400, mGfxMisc.gpu + 0x800};
+	const uint64_t table[2] = {miscGpu + 0x400, miscGpu + 0x800};
 	uint32_t seq[8 + 6 + 2 + 16 + 3 + 3 + 9 + 2 * 12], m = 0;
 	auto put = [&](uint32_t v) { seq[m++] = v; };
 	put(0xc0046900u);   // CB_BLEND_RED .. ALPHA: Render.setBlendColor's floats
@@ -2319,13 +2522,16 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	auto row = [&](uint32_t y) { return reinterpret_cast<uint8_t *>(stage) + static_cast<uint64_t>(y - sy) * pitch * tp; };
 	auto upload = [&](const GfxBuffers &g, const void *from, uint64_t bytes) {
 		if (!g.cpu)
-			return gCompute->rtCopy(this, g.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(from), bytes, true);
+			return gCompute->rtCopy(this, g.handle, slotAt, kernel_task, reinterpret_cast<mach_vm_address_t>(from), bytes, true);
 
-		memcpy(g.cpu, from, bytes);
+		memcpy(g.cpu + slotAt, from, bytes);
 		__sync_synchronize();   // seen by the card (snooped) before the submit
 
 		return kIOReturnSuccess;
 	};
+	if (ok && !inPlace && drawing(task, target))
+		waitDraws();
+
 	for (uint32_t y = sy; y < sy2 && ok && !inPlace; y++)
 		ok = surface.memory ? surface.memory->readBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
 		                    : readGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * tp);
@@ -2342,10 +2548,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		                               : gCompute->rtCopy(this, tgt.handle, regionAt, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), regionBytes, true);
 
 		if (r == kIOReturnSuccess && newCode) {
+			waitDraws();   // a draw in flight may run the pair this slot held
 			step = "code in";
-			r = gCompute->rtCopy(this, mGfxCode.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(code), sizeof(code), true);
-			for (unsigned k = 0; k < 2; k++)
-				memcpy(loaded[k], r == kIOReturnSuccess ? shader[k + 1]->hash : kNoHash, 32);
+			r = gCompute->rtCopy(this, mGfxCode.handle, codeAt, kernel_task, reinterpret_cast<mach_vm_address_t>(code), sizeof(code), true);
+			mCode[pair].valid = r == kIOReturnSuccess;
 		}
 
 		if (r == kIOReturnSuccess) {
@@ -2358,18 +2564,38 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			r = upload(mGfxIb, ib, total * 4);
 		}
 
-		if (r == kIOReturnSuccess) {
-			step = "submit";
-			r = submitGfx(total, fence);
-		}
+		if (r == kIOReturnSuccess && mPending >= kInFlight)
+			waitDraws();
 
 		if (r == kIOReturnSuccess) {
+			step = "submit";
+			r = submitGfx(ibGpu, total, fence);
+		}
+
+		// Waited for now when the CPU has to finish the draw (a staged target or texture to copy back, a runtime buffer to free), else left
+		// in flight with those before it.
+		const bool sync = !inPlace || indexHandle || ownsMemory(staged, handle);
+
+		if (r == kIOReturnSuccess && !sync) {
+			mPhaseNs[1] += nowNs() - targetFrom;
+			mPending++;
+			mLastFence = fence;
+
+			if (mDirtyCount < 32)
+				mDirty[mDirtyCount++] = task << 16 | (target & 0xffff);
+			else
+				waitDraws();
+		}
+
+		if (r == kIOReturnSuccess && sync) {
 			mPhaseNs[1] += nowNs() - targetFrom;
 			step = "fence";
 			const uint64_t fenceFrom = nowNs();
 			r = gCompute->rtWaitGfxFence(this, static_cast<uint32_t>(fence), kDrawWait, ns);
 			afterFence = nowNs();
 			mPhaseNs[2] += afterFence - fenceFrom;
+			mPending = 0;   // in order: those before it are done too
+			mDirtyCount = 0;
 		}
 
 		if (r == kIOReturnSuccess && !inPlace && !pooled) {
@@ -2471,6 +2697,8 @@ struct RDNA4PvHost::BlitRegion {
 void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes) {
 	if (!gCompute)
 		return;
+
+	waitDraws();   // blits read and write with the CPU and SDMA, after the draws before them
 	uint64_t va = 0, len = 0, va2 = 0, len2 = 0;
 	if (id == 0x132 && bytes >= 24) {
 		uint32_t buf, value;
@@ -2924,7 +3152,8 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	if (ok && textures) {
 		static uint32_t table[0x400 / 4];   // ponytail: one host, dispatches run one at a time on its work loop
 		memset(table, 0, sizeof(table));
-		mPoolUsed = 0;   // the dispatch before this one is done
+		waitDraws();   // dispatches run alone
+		readyDraws();
 		ok = stageTextures(task, bound, table, staged, true, "kernel") && gCompute->rtAlloc(this, sizeof(table), tableHandle, tableGpu) == kIOReturnSuccess &&
 		     gCompute->rtCopy(this, tableHandle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(table), sizeof(table), true) == kIOReturnSuccess;
 	}
@@ -4141,6 +4370,19 @@ bool RDNA4PvNub::raiseInterrupt(int source) {
 	if (ok && h)
 		h(t, r, this, source);
 	return ok;
+}
+
+bool RDNA4PvNub::interruptBusy(int source) {
+	bool busy;
+
+	if (source < 0 || source >= kMaxInterrupts)
+		return false;
+
+	IOLockLock(mLock);
+	busy = mInt[source].registered && (!mInt[source].enabled || mInt[source].pending);
+	IOLockUnlock(mLock);
+
+	return busy;
 }
 
 bool RDNA4PvNub::configTest() {

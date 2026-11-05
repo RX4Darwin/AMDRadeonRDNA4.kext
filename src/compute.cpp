@@ -1689,12 +1689,12 @@ void RDNA4Compute::gfxCgGuiIdle(bool enable) {
 // steps, rdna4-gfxcg=0 writes amdgpu's disable branch.
 bool RDNA4Compute::gfxCgIsDefault() {
 	uint32_t v = 0;
-	return !PE_parse_boot_argn("rdna4-gfxcg", &v, sizeof(v));
+	return !Trial::option("rdna4-gfxcg", v);
 }
 
 bool RDNA4Compute::requestedGfxCg(uint32_t &mask) {
 	uint32_t v = 0;
-	if (!PE_parse_boot_argn("rdna4-gfxcg", &v, sizeof(v))) {
+	if (!Trial::option("rdna4-gfxcg", v)) {   // boot-args, else a test boot's (rdna4-trial)
 		mask = kCgStepCoarse | kCgStepMedium | kCgStepFine | kCgStepGuiIdle;
 		return true;
 	}

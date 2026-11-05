@@ -3254,7 +3254,7 @@ IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords
 		return kIOReturnNoResources;
 	for (RtClient &o : clients)
 		gfxClientRetire(o);
-	if (c.gfxOutstanding >= kMaxIbOutstanding || gfxClientPending >= kMaxGfxOutstanding)
+	if (c.gfxOutstanding >= kMaxGfxIbOutstanding || gfxClientPending >= kMaxGfxOutstanding)
 		return kIOReturnBusy;
 	/* The VMID's shader memory state, as the compute path and gfx_v12_0_init_compute_vmid set it (boot already does it for VMIDs 8-15).
 	 * rdna4-vmshared=2: the VMID comes from the pool, bound to this client's tables for this job. */
@@ -3375,6 +3375,16 @@ IOReturn RDNA4Compute::rtSubmitGfxIb(const void *owner, uint64_t ibVa, uint64_t 
 	if (r == kIOReturnSuccess)
 		fence = value;
 	return r;
+}
+
+bool RDNA4Compute::rtGfxFenceDone(const void *owner, uint32_t fence) {
+	Locked g(rtLock);
+	RtClient *c = ownerStateLocked(owner) == kIOReturnSuccess ? vmClientFor(owner) : nullptr;
+
+	if (!c || !c->gfxFenceCpu)
+		return false;
+
+	return fenceReached(*c->gfxFenceCpu, fence);
 }
 
 IOReturn RDNA4Compute::rtWaitGfxFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns) {
