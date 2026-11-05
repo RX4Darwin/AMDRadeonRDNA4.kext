@@ -241,8 +241,12 @@ private:
 	uint32_t resourceType(uint32_t task, uint32_t id, uint64_t *desc = nullptr, uint32_t *bytes = nullptr);
 	uint32_t load(const uint8_t *elf, uint32_t size, const char *name);
 	uint32_t program(unsigned kernel);
+	// Found by hash, name and, for a name not passed (empty), metallib: functions without a HASH tag share the all-zero hash, and once
+	// kernels were loaded a vertex function found a kernel's entry (windows were not drawn).
 	struct Jit {
 		uint8_t hash[32];
+		char name[64];
+		uint64_t lib;
 		uint32_t program, buffers, written;   // a compute kernel loaded into the runtime
 		uint8_t *gfx;                         // or a vertex or fragment shader: the helper's RGFX blob (air2amdgpu.cpp translateShader)
 		uint32_t gfxLen;
@@ -380,6 +384,9 @@ private:
 	uint64_t mPtGen[64] {};             // per task: bumped when the guest changes its page table
 	Mapping mMap[kMappings];
 	uint64_t mMapClock { 0 };
+	// mMapClock when the draw or dispatch being put together began: the mappings it uses (used after it) are not dropped for room, as
+	// their addresses are in its tables already (dropped, the card read unmapped memory and hung, the mouse with it).
+	uint64_t mMapFloor { 0 };
 	void dropMapping(Mapping &m);
 	uint32_t mProgram[kMtlKernelCount] {};   // M3: kMtlKernels loaded into it, 0 = not yet
 	uint32_t mFnLines { 0 };              // M3: pipeline -> function lines so far
@@ -455,12 +462,17 @@ private:
 	// A frame's icons and glyphs alone are hundreds of small textures: with 32 shadows they pushed each other out, and each was copied
 	// again. Large ones are kept within kShadowBudget.
 	static constexpr uint32_t kShadows = 256;
-	static constexpr uint64_t kShadowBudget = 256ull << 20, kShadowMax = 64ull << 20;
+	static constexpr uint64_t kShadowBudget = 128ull << 20, kShadowMax = 64ull << 20;   // the client has 1 GiB of VA for all
 	uint64_t mShadowBytes { 0 };
 	uint32_t mShadowsFreed { 0 }, mShadowsMade { 0 };   // for the draw stats
 	uint32_t mStagedLines { 0 };                         // textures copied for one draw, described in this stats period
+	static constexpr uint32_t kRecent = 16;              // the draws submitted last, logged when the card does not finish them
+	char mRecent[kRecent][192] {};
+	uint32_t mRecentAt { 0 };
 	// Draws not run in this stats period, and the first one's reason and fragment function: what is missing on screen.
 	uint32_t mNotRun { 0 };
+	uint32_t mShaderLines { 0 };
+	uint32_t mTexLines { 0 };            // textures and samplers refused, described in this stats period
 	const char *mNotRunWhy { nullptr };
 	char mNotRunName[64] {};
 	void noteNotRun(const char *why, const char *name)
@@ -473,6 +485,8 @@ private:
 	uint32_t mStale[3] {};                               // shadows filled again: dropped, too old, the surface locked since
 	uint64_t mDrawSerial { 0 };          // draws submitted
 	bool shadowIdle(const Shadow &s) const;
+	// Held, or read by the draw being put together: its address is in that draw's tables already, waiting would not help.
+	bool shadowBusy(const Shadow &s) const { return (mHeld.active && mHeld.shadow == &s) || s.serial == mDrawSerial + 1; }
 	void freeShadow(Shadow &s);
 	static constexpr uint64_t kShadowAge = 250000000;   // ns
 	Shadow mShadows[kShadows];
@@ -1062,8 +1076,14 @@ void RDNA4PvHost::waitDraws()
 
 	mPhaseNs[2] += nowNs() - from;
 
-	if (r != kIOReturnSuccess && mGfxHangLines++ < 12)
-		pvstat("host: render: %u draws in flight did not finish (fence %llu): 0x%x", mPending, static_cast<unsigned long long>(mLastFence), r);
+	if (r != kIOReturnSuccess && mGfxHangLines++ < 12) {
+		pvstat("host: render: %u draws in flight did not finish (fence %llu): 0x%x; the last ones submitted:", mPending,
+		       static_cast<unsigned long long>(mLastFence), r);
+
+		for (uint32_t i = 0; i < kRecent; i++)
+			if (mRecent[(mRecentAt + i) % kRecent][0])
+				pvstat("host: render:   %s", mRecent[(mRecentAt + i) % kRecent]);
+	}
 
 	mPending = 0;
 	mDirtyCount = 0;
@@ -1638,8 +1658,14 @@ bool RDNA4PvHost::surfaceRange(uint32_t task, uint32_t id, Surface &out) {
 		out.height = gSurfaceFns.planeHeight(s, plane);
 	}
 
+	// The texture may cover only the top left of its surface: CoreImage renders into surfaces from a pool, larger than the image
+	// (582x1174 in 640x1216, RGhA). Its size is the texture's then.
 	const bool bgra = out.format != 80 || planar || gSurfaceFns.pixelFormat(s) == 0x42475241;   // 'BGRA'
-	const bool same = gSurfaceFns.surfaceId(s) == sid && bgra && out.width == d[6] && out.height == d[7];
+	const bool same = gSurfaceFns.surfaceId(s) == sid && bgra && d[6] && d[7] && d[6] <= out.width && d[7] <= out.height;
+
+	out.width = same ? d[6] : out.width;
+	out.height = same ? d[7] : out.height;
+
 	const uint64_t used = out.base + static_cast<uint64_t>(out.bytesPerRow) * out.height;
 	const bool fits = out.memory && out.bytesPerRow >= out.width * fm->bpp && used <= out.memory->getLength();
 	const bool ok = same && fits && out.memory->prepare() == kIOReturnSuccess;
@@ -1886,6 +1912,15 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			continue;
 
 		ok = textureSource(task, id, src);
+
+		// Not a texture at all: a binding left from an earlier encoder whose id was used again (Xgc's slot 3 named a function), which the
+		// shader does not sample. The spare texel as for no binding; refused, it took the whole draw with it.
+		if (!ok && src.type != 2 && src.type != 3 && src.type != 5) {
+			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, mGfxSpare.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 1, 1, 64);
+			ok = true;
+			continue;
+		}
+
 		// A 1D array (WindowServer's colour lookup tables) staged as a 3D image's slices are, sampled through a 1D-array T#.
 		const bool array1d = ok && src.slices > 1 && src.depth == 1 && src.height == 1 && src.sliceBytes;
 
@@ -1903,10 +1938,8 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		ok = ok && fm && w && h && w <= 16384 && h <= 16384 && rowBytes >= w * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= src.length;
 		ok = ok && (depth == 1 || (depth <= 2048 && src.imageBytes >= static_cast<uint64_t>(rowBytes) * h && src.imageBytes * depth <= src.length));
 		if (!ok) {
-			static uint32_t refusedTextures;
-
-			if (talk || refusedTextures++ < 16)
-				pvlog("host: render: %s texture %u (resource %u, type %u): format %u, %ux%ux%u, %u bytes per row: not supported yet", stageName, k,
+			if (talk || mTexLines++ < 2)   // per stats period
+				pvstat("host: render: %s texture %u (resource %u, type %u): format %u, %ux%ux%u, %u bytes per row: not supported yet", stageName, k,
 				      id, src.type, format, w, h, depth, rowBytes);
 			break;
 		}
@@ -1996,10 +2029,8 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			IOFree(copy, bytes);
 
 		if (!ok) {
-			static uint32_t unstaged;
-
-			if (talk || unstaged++ < 16)
-				pvlog("host: render: %s texture %u (resource %u, type %u): format %u, %ux%ux%u, %llu bytes at 0x%llx of %llu: %s failed (row %u)",
+			if (talk || mTexLines++ < 2)
+				pvstat("host: render: %s texture %u (resource %u, type %u): format %u, %ux%ux%u, %llu bytes at 0x%llx of %llu: %s failed (row %u)",
 				      stageName, k, id, src.type, format, w, h, depth, static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(src.va),
 				      static_cast<unsigned long long>(src.length), step, y ? y - 1 : 0);
 			break;
@@ -2026,10 +2057,8 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		ok = readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) && (rec[0] & 0xff) == 7 && (rec[0] >> 8) >= 16 &&
 		     readGuest(task, rec[1], reinterpret_cast<uint8_t *>(sd), 16) && sd[0] == 3;
 		if (!ok) {
-			static uint32_t refusedSamplers;
-
-			if (talk || refusedSamplers++ < 8)
-				pvlog("host: render: %s sampler %u (resource %u): record %08x %08x, descriptor %08x %08x %08x %08x: not supported yet", stageName,
+			if (talk || mTexLines++ < 2)
+				pvstat("host: render: %s sampler %u (resource %u): record %08x %08x, descriptor %08x %08x %08x %08x: not supported yet", stageName,
 				      k, id, rec[0], rec[1], sd[0], sd[1], sd[2], sd[3]);
 			break;
 		}
@@ -2089,11 +2118,14 @@ RDNA4PvHost::Shadow *RDNA4PvHost::makeShadow(const ShadowKey &k)
 		return nullptr;
 
 	for (Shadow &e : mShadows) {
-		if (mHeld.active && mHeld.shadow == &e)
+		if (shadowBusy(e))
 			continue;
 
 		s = !s || e.used < s->used ? &e : s;
 	}
+
+	if (!s)
+		return nullptr;
 
 	if (s->handle && s->bytes < bytes)
 		freeShadow(*s);
@@ -2103,7 +2135,7 @@ RDNA4PvHost::Shadow *RDNA4PvHost::makeShadow(const ShadowKey &k)
 		Shadow *old = nullptr;
 
 		for (Shadow &e : mShadows)
-			if (e.handle && &e != s && !(mHeld.active && mHeld.shadow == &e))
+			if (e.handle && &e != s && !shadowBusy(e))
 				old = !old || e.used < old->used ? &e : old;
 
 		if (!old)
@@ -2429,7 +2461,7 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 		Mapping *oldest = nullptr;
 
 		for (Mapping &m : mMap)
-			oldest = m.handle && (!oldest || m.used < oldest->used) ? &m : oldest;
+			oldest = m.handle && m.used <= mMapFloor && (!oldest || m.used < oldest->used) ? &m : oldest;
 		if (!oldest)
 			break;
 		waitDraws();   // a draw in flight may use it
@@ -2448,6 +2480,13 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 
 	for (Mapping &m : mMap)   // the slot to fill: an empty one (the loop above may have emptied some), else the least recently used
 		lru = !m.handle ? &m : lru->handle && m.used < lru->used ? &m : lru;
+	if (lru->handle && lru->used > mMapFloor) {   // all in use by this draw: no room
+		gCompute->rtFree(this, h);
+		IOFree(copy, count * 8);
+		gpu = 0;
+
+		return false;
+	}
 	if (lru->handle)
 		waitDraws();   // a draw in flight may use it
 	dropMapping(*lru);
@@ -2773,6 +2812,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// gating off; cause open), and each held all drawing until the wait gave up and the ring was reset: 2 s, then 250 ms were visible stalls.
 	static constexpr uint32_t kDrawWait = 50;   // ms
 	const uint64_t drawFrom = nowNs();
+
+	mMapFloor = mMapClock;
 	const uint32_t count = draw.count;
 	const bool talk = (mDrawLines[task & 63] < 40 && ++mDrawLines[task & 63]) || gTalk;
 	const PipelineInfo &pi = pipelineInfo(task, pipeline);
@@ -2798,8 +2839,14 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		const auto *head = shader[k] && shader[k]->gfx && shader[k]->gfxLen >= 32 ? reinterpret_cast<const uint32_t *>(shader[k]->gfx) : nullptr;
 		const uint32_t room = (k == 1 ? RDNA4_TRI_PS_OFFSET : RDNA4_TRI_CODE_BYTES - RDNA4_TRI_PS_OFFSET) - 4 * RDNA4_TRI_SHADER_PAD;
 
-		if (!head || head[1] != k || head[2] > room || head[2] + 32 > shader[k]->gfxLen)
+		if (!head || head[1] != k || head[2] > room || head[2] + 32 > shader[k]->gfxLen) {
 			why = k == 1 ? "no translated vertex shader" : "no translated fragment shader";
+
+			if (mShaderLines++ < 8)
+				pvstat("host: render: pipeline %u's %s function \"%s\" (named %u, hash %02x%02x%02x%02x): %s", pipeline, k == 1 ? "vertex" : "fragment",
+				       name[k], pi.named[k], pi.hash[k][0], pi.hash[k][1], pi.hash[k][2], pi.hash[k][3],
+				       !shader[k] ? "no translation" : !head ? "a kernel, not a shader" : "its RGFX header does not fit");
+		}
 	}
 	// The values between the stages: after each shader's code its table {u32 name hash, u32 flags (bit 0 flat)}, the vertex function's
 	// outputs by ring slot, the fragment function's inputs by hardware input; input k reads the slot with its name (SPI_PS_INPUT_CNTL_k).
@@ -3187,6 +3234,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		pvlog("host: render: draw with pipeline %u: the stream does not fit or lacks a register (%u + %u dwords): not run", pipeline, n, m);
 
 	const bool streamOk = ok;
+	const char *failedStep = "its colour attachment's rows";   // read before the steps below
 	const uint64_t targetFrom = nowNs();
 	uint64_t afterFence = 0;
 	// The attachment in (BGRA8 rows -> RGBA8 at the target's pitch), the draw, the attachment out; in place only the draw.
@@ -3253,6 +3301,14 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		// in flight with those before it.
 		const bool sync = staged || indexHandle || ownsMemory(stagedTextures, handle);
 
+		if (r == kIOReturnSuccess) {   // described for a hang
+			snprintf(mRecent[mRecentAt], sizeof(mRecent[0]), "fence %llu: task %u, target %u (%ux%u, %s), \"%s\" / \"%s\", %u x %u, "
+			         "fragment textures %u %u %u %u", static_cast<unsigned long long>(fence), task, target, width, height,
+			         inPlace ? "in place" : held ? "held" : "staged", name[1], name[2], count, draw.instances, bound[1].texture[0],
+			         bound[1].texture[1], bound[1].texture[2], bound[1].texture[3]);
+			mRecentAt = (mRecentAt + 1) % kRecent;
+		}
+
 		if (r == kIOReturnSuccess && !sync) {
 			mPhaseNs[1] += nowNs() - targetFrom;
 			mPending++;
@@ -3283,6 +3339,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		ok = r == kIOReturnSuccess;
 		if (!ok && (talk || mGfxHangLines < 4))
 			pvlog("host: render: draw with pipeline %u: %s failed (0x%x)", pipeline, step, r);
+
+		failedStep = ok ? nullptr : step;
 
 		if (!ok && !strcmp(step, "fence") && mGfxHangLines++ < 12) {
 			const uint32_t *ft = reinterpret_cast<const uint32_t *>(&misc[(0x800 + RDNA4_MTLC_TABLE_TEXTURES) / 8]);
@@ -3319,7 +3377,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		IOFree(stage, regionBytes);
 	mPhaseNs[3] += nowNs() - (afterFence ? afterFence : targetFrom);
 	if (!ok)
-		noteNotRun("its target, textures, buffers or submission failed", name[2]);
+		noteNotRun(!allocated ? "no runtime buffers, or its target not mapped" : !texturesOk ? "a texture or sampler not set up"
+		           : !indicesOk ? "its indices not staged" : !streamOk ? "its stream does not fit"
+		           : failedStep ? failedStep : "its colour attachment's rows", name[2]);
 	if (talk)
 		pvlog("host: render: draw of %u %s x %u (type %u) into texture %u (%ux%u) with \"%s\" and \"%s\" on the card: %s (%llu us); blending %u, "
 		      "colour %u %u %u, alpha %u %u %u, mask 0x%x", count, draw.indexBytes ? "indices" : "vertices", draw.instances, draw.type, target,
@@ -3583,8 +3643,18 @@ bool RDNA4PvHost::functionOf(uint32_t task, uint32_t pipeline, char *name, size_
 		const auto *dw = reinterpret_cast<const uint32_t *>(desc);
 		if (talk)
 			pvlog("host: compute: pipeline %u descriptor (%u bytes): %08x %08x %08x %08x %08x %08x", pipeline, bytes, dw[0], dw[1], dw[2], dw[3], dw[4], dw[5]);
-		if (resourceType(task, dw[4] >> 24) == 6) {
-			fn = dw[4] >> 24;
+		// {16-byte header, u8 n, n x {u8 key, u8 size, value}} as a render pipeline's, then the kernel's name: key 0 its function
+		// (WindowServer's sum_rgba_columns: {2: 19, 1: 1, 0: 88}, the function made just before the pipeline). Key 2's value was taken for
+		// the function, and a task with more than one function never had its kernels run.
+		const auto *pb = reinterpret_cast<const uint8_t *>(desc);
+		uint32_t named = 0;
+
+		for (uint32_t k = 0, at = 17; k < pb[16] && at + 2 <= bytes; k++, at += 2 + pb[at + 1])
+			if (pb[at] == 0 && pb[at + 1] == 4 && at + 6 <= bytes)
+				memcpy(&named, pb + at + 2, 4);
+
+		if (named && named <= 0x10000 && resourceType(task, named) == 6) {
+			fn = named;
 			rule = "named by the pipeline";
 		}
 	}
@@ -3627,15 +3697,27 @@ bool RDNA4PvHost::functionName(uint32_t task, uint32_t fn, char *name, size_t na
 	for (size_t i = 0; i + 6 < sizeof(head); i++) {   // tags: {char[4] tag, u16 length, bytes}
 		uint16_t n;
 		memcpy(&n, head + i + 4, 2);
-		if (!memcmp(head + i, "NAME", 4) && n && n < nameCap && i + 6 + n <= sizeof(head) && names++ == 0) {
-			memcpy(name, head + i + 6, n);
-			name[n] = 0;
+		// A name longer than the helper's request holds (CoreImage's stitched kernels: hundreds of characters) is sent empty: the helper
+		// then takes the library's only function. The hash tells the functions apart.
+		if (!memcmp(head + i, "NAME", 4) && n && i + 6 + n <= sizeof(head) && names++ == 0) {
+			const bool fits = n < nameCap;
+
+			if (fits)
+				memcpy(name, head + i + 6, n);
+
+			name[fits ? n : 0] = 0;
+			i += 5 + n;   // not into the name: it may hold "NAME" or "HASH"
 		} else if (!memcmp(head + i, "HASH", 4) && n == 32 && i + 6 + 32 <= sizeof(head) && names == 1) {
 			memcpy(hash, head + i + 6, 32);
 		}
 	}
 	if (names != 1) {
-		pvlog("host: compute: task %u function %u: the metallib holds %u functions, not one: not run", task, fn, names);
+		const auto *h = reinterpret_cast<const uint32_t *>(head);
+		const auto *d = reinterpret_cast<const uint32_t *>(desc);
+
+		pvstat("host: compute: task %u function %u: the metallib holds %u functions, not one: not run; header %08x %08x %08x %08x %08x %08x %08x "
+		       "%08x %08x %08x %08x %08x, function %08x %08x %08x %08x %08x %08x", task, fn, names, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+		       h[8], h[9], h[10], h[11], d[0], d[1], d[2], d[3], d[4], d[5]);
 		return false;
 	}
 	*libOut = lib;
@@ -3710,7 +3792,7 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	for (uint32_t i = 0; i < mJits; i++) {
 		Jit &c = mJit[i];
 
-		if (memcmp(c.hash, hash, 32) || !(c.program || c.gfx || c.helper == gTr.helpers))
+		if (memcmp(c.hash, hash, 32) || strcmp(c.name, name) || (!name[0] && c.lib != lib) || !(c.program || c.gfx || c.helper == gTr.helpers))
 			continue;
 
 		c.used = mJitClock;
@@ -3761,6 +3843,8 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	if (j.gfx)
 		IOFree(j.gfx, j.gfxLen);
 	memcpy(j.hash, hash, 32);
+	strlcpy(j.name, name, sizeof(j.name));
+	j.lib = lib;
 	j.helper = gTr.helpers;
 	j.used = mJitClock;
 	const bool shader = elf && elfLen >= 32 && !memcmp(elf, "RGFX", 4);
@@ -3823,6 +3907,8 @@ void RDNA4PvHost::describeRenderPipeline(uint32_t task, uint32_t pipeline) {
 // AIR -> gfx1201 (at run time by the helper, or ahead of time into src/mtlkernels.h by tools/metal/m3). Each bound buffer, from its offset
 // to its end, is copied into a runtime buffer, the kernel dispatched, and the buffers it writes copied back into the guest's pages.
 void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &bound, const uint64_t *size) {
+	mMapFloor = mMapClock;
+
 	const uint32_t *buffer = bound.buffer;
 	const uint64_t *offset = bound.offset;
 	static constexpr uint64_t kMaxBuffer = 64ull << 20;   // ponytail: staged through one kernel allocation; map the guest pages if bigger is needed
@@ -4189,6 +4275,7 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		pvstat("host: render:   %u draws not run, the first with \"%s\": %s", mNotRun, mNotRunName, mNotRunWhy);
 
 	mNotRun = 0;
+	mTexLines = 0;
 	mShadowsMade = mShadowsFreed = 0;
 	mStagedLines = 0;
 	memset(mStale, 0, sizeof(mStale));

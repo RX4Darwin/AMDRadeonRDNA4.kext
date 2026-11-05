@@ -673,9 +673,9 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 		return false;
 	/* The root, PDB1, and the PDB0 entry that points at the PT all have to
 	 * reach VRAM before the queue can walk this mapping. */
-	/* The root and directory pages, then the leaf pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its
-	 * size, is what a mapping of thousands of pages costs. */
-	return span.firstPt != ~0ull && vmTableSync(c, 0, 0x3000) &&
+	/* The root and directory pages when a PDE was written (the first mapping in a 2 MiB range: once written, a PDE stays), then the leaf
+	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
+	return span.firstPt != ~0ull && (!span.directories || vmTableSync(c, 0, 0x3000)) &&
 	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
 }
 
@@ -698,9 +698,9 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 	GpuVmTable::Span span;
 	if (!GpuVmTable::mapHost(access, vmPolicy(), kVmTableBytes, va, end, pageBuses, executable, span))
 		return false;
-	/* The root and directory pages, then the leaf pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its
-	 * size, is what a mapping of thousands of pages costs. */
-	return span.firstPt != ~0ull && vmTableSync(c, 0, 0x3000) &&
+	/* The root and directory pages when a PDE was written (the first mapping in a 2 MiB range: once written, a PDE stays), then the leaf
+	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
+	return span.firstPt != ~0ull && (!span.directories || vmTableSync(c, 0, 0x3000)) &&
 	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
 }
 
@@ -2297,10 +2297,65 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	return allocLocked(owner, bytes, handle, gpu);
 }
 
-// VA for a buffer of `bytes`, 64 KiB aligned: the first hole that fits, else the end of the client's VA (nextVa). 0 if it would wrap.
+// The dense tables' VA (1 GiB from kVaStart) in 64 KiB granules, one bit each, per client slot: taken first fit, given back exactly.
+// The list of holes it replaces held 32: a range freed with them all taken was lost, and the paravirtual host's churn of mappings and
+// shadows filled the client's VA within minutes (Mission Control: every draw then failed to map). The VA below nextVa when the bitmap is
+// first used (the client's queue, fence and kernarg pages, taken by bumping nextVa) is marked taken. Sparse tables keep the list.
+uint64_t *RDNA4Compute::vaBitsOf(RtClient &c)
+{
+	uint64_t *bits = vaBits[&c - clients];
+
+	if (!c.vaBitsReady) {
+		const uint64_t below = c.nextVa > GpuVm::kVaStart ? (c.nextVa - GpuVm::kVaStart + 0xffff) >> 16 : 0;
+
+		memset(vaBits[&c - clients], 0, sizeof(vaBits[0]));
+
+		for (uint64_t g = 0; g < below && g < kVaGranules; g++)
+			bits[g / 64] |= 1ull << (g % 64);
+
+		c.vaBitsReady = true;
+	}
+
+	return bits;
+}
+
+// VA for a buffer of `bytes`, 64 KiB aligned; 0 if there is none.
 uint64_t RDNA4Compute::vaTake(RtClient &c, uint64_t bytes)
 {
 	const uint64_t size = (bytes + 0xffff) & ~0xffffull;
+
+	if (!c.sp) {
+		uint64_t *bits = vaBitsOf(c);
+		const uint64_t n = size >> 16;
+
+		for (uint64_t g = 0; g + n <= kVaGranules;) {
+			if (!(g % 64) && bits[g / 64] == ~0ull) {   // a word all taken
+				g += 64;
+				continue;
+			}
+
+			uint64_t run = 0;
+
+			while (run < n && !(bits[(g + run) / 64] >> ((g + run) % 64) & 1))
+				run++;
+
+			if (run < n) {
+				g += run + 1;
+				continue;
+			}
+
+			for (uint64_t i = g; i < g + n; i++)
+				bits[i / 64] |= 1ull << (i % 64);
+
+			const uint64_t va = GpuVm::kVaStart + (g << 16);
+
+			c.nextVa = va + size > c.nextVa ? va + size : c.nextVa;
+
+			return va;
+		}
+
+		return 0;
+	}
 
 	for (uint32_t i = 0; i < c.vaHoleCount; i++) {
 		RtClient::VaHole &h = c.vaHoles[i];
@@ -2327,11 +2382,20 @@ uint64_t RDNA4Compute::vaTake(RtClient &c, uint64_t bytes)
 	return va;
 }
 
-// A freed buffer's VA back to the client: the end of its VA moves down when the range is last, else it becomes a hole, joined with
-// a neighbour where it touches one. With the holes all taken, the range is lost (VA only, not memory).
+// A freed buffer's VA back to the client. Sparse tables: the end of its VA moves down when the range is last, else it becomes a hole,
+// joined with a neighbour where it touches one; with the holes all taken, the range is lost (VA only, not memory).
 void RDNA4Compute::vaGive(RtClient &c, uint64_t va, uint64_t bytes)
 {
 	uint64_t size = (bytes + 0xffff) & ~0xffffull;
+
+	if (!c.sp) {
+		uint64_t *bits = vaBitsOf(c);
+
+		for (uint64_t g = (va - GpuVm::kVaStart) >> 16; va >= GpuVm::kVaStart && g < kVaGranules && size; g++, size -= 0x10000)
+			bits[g / 64] &= ~(1ull << (g % 64));
+
+		return;
+	}
 
 	for (uint32_t i = 0; i < c.vaHoleCount; i++) {
 		RtClient::VaHole &h = c.vaHoles[i];

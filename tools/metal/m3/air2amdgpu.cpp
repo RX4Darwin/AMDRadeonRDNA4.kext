@@ -73,8 +73,9 @@ static uint64_t le(StringRef s, size_t at, size_t bytes) {
 // The named function's bitcode in a metallib (layout measured, docs/m1-stream.md s.5b): header u64 function list offset at 0x18 and bitcode
 // section offset at 0x48; the list is u32 count, then per function u32 bytes (counting itself) and tags {char[4], u16 length, data} to ENDT,
 // among them NAME (the name, NUL-terminated), OFFT (u64 offsets: public metadata, private metadata, bitcode in its section) and MDSZ (u64
-// bitcode bytes). Empty if it is not there or does not fit the file.
-static StringRef functionBitcode(StringRef lib, StringRef name) {
+// bitcode bytes). Empty if it is not there or does not fit the file. An empty name asks for the library's only function (the host sends
+// one for names longer than its request holds: CoreImage's stitched kernels have names of hundreds of characters); `found` its name.
+static StringRef functionBitcode(StringRef lib, StringRef name, std::string &found) {
 	const uint64_t list = le(lib, 0x18, 8), section = le(lib, 0x48, 8);
 	uint64_t at = list + 4;
 	for (uint64_t f = 0, n = le(lib, list, 4); f < n && at + 4 <= lib.size(); f++) {
@@ -90,8 +91,13 @@ static StringRef functionBitcode(StringRef lib, StringRef name) {
 			else if (tag == "MDSZ" && data.size() == 8)
 				bytes = le(data, 0, 8);
 		}
-		if (fname == name && offset != ~0ull && section + offset >= section && section + offset + bytes <= lib.size())
+		const bool match = name.empty() ? n == 1 : fname == name;
+
+		if (match && offset != ~0ull && section + offset >= section && section + offset + bytes <= lib.size()) {
+			found = fname;
+
 			return lib.substr(section + offset, bytes);
+		}
 		if (end <= at)
 			break;
 		at = end;
@@ -254,6 +260,44 @@ static Constant *airSampler(LLVMContext &ctx, uint64_t st) {
 	return ConstantVector::get({ConstantInt::get(i32, w[0]), ConstantInt::get(i32, w[1]), ConstantInt::get(i32, w[2]), ConstantInt::get(i32, w[3])});
 }
 
+// `t` with AIR's constant address space (2) replaced by the global one in pointers inside structs, arrays and vectors as well: CoreImage
+// carries a texture and its sampler in a struct (coreimage::Sampler), whose pointer fields must change with the values put into them, or
+// insertvalue and extractvalue no longer match (ci_lanczosDown2: "the retargeted module does not verify", blank app icons).
+static Type *globalType(Type *t, std::map<Type *, Type *> &done) {
+	if (auto it = done.find(t); it != done.end())
+		return it->second;
+
+	Type *r = t;
+
+	if (t->isPointerTy() && t->getPointerAddressSpace() == 2) {
+		r = PointerType::get(t->getContext(), 1);
+	} else if (auto *st = dyn_cast<StructType>(t); st && !st->isOpaque()) {
+		SmallVector<Type *, 8> el;
+		bool changed = false;
+
+		for (Type *e : st->elements()) {
+			el.push_back(globalType(e, done));
+			changed |= el.back() != e;
+		}
+
+		if (changed)
+			r = st->isLiteral() ? StructType::get(t->getContext(), el, st->isPacked())
+			                    : StructType::create(t->getContext(), el, (st->getName() + ".global").str(), st->isPacked());
+	} else if (auto *at = dyn_cast<ArrayType>(t)) {
+		Type *e = globalType(at->getElementType(), done);
+
+		r = e != at->getElementType() ? ArrayType::get(e, at->getNumElements()) : t;
+	} else if (auto *vt = dyn_cast<FixedVectorType>(t)) {
+		Type *e = globalType(vt->getElementType(), done);
+
+		r = e != vt->getElementType() ? FixedVectorType::get(e, vt->getNumElements()) : t;
+	}
+
+	done[t] = r;
+
+	return r;
+}
+
 static std::string legalize(Function &k) {
 	LLVMContext &ctx = k.getContext();
 	PointerType *global = PointerType::get(ctx, 1);
@@ -272,16 +316,26 @@ static std::string legalize(Function &k) {
 					c->setArgOperand(1, ConstantPointerNull::get(cast<PointerType>(c->getArgOperand(1)->getType())));
 				}
 			}
+	std::map<Type *, Type *> globalTypes;
 	for (Instruction &i : instructions(k)) {
-		for (Use &u : i.operands())
-			if (u->getType()->isPointerTy() && u->getType()->getPointerAddressSpace() == 2) {
-				if (isa<ConstantPointerNull>(u.get()) || isa<UndefValue>(u.get()))
-					u.set(isa<ConstantPointerNull>(u.get()) ? static_cast<Value *>(ConstantPointerNull::get(global)) : PoisonValue::get(global));
-				else if (isa<Constant>(u.get()))
-					return "data in AIR's constant address space (a constant table) is not supported yet";
-			}
-		if (i.getType()->isPointerTy() && i.getType()->getPointerAddressSpace() == 2)
-			i.mutateType(global);
+		for (Use &u : i.operands()) {
+			Type *from = u->getType(), *to = globalType(from, globalTypes);
+
+			if (from == to || !isa<Constant>(u.get()))
+				continue;
+
+			if (isa<ConstantPointerNull>(u.get()) || isa<ConstantAggregateZero>(u.get()))
+				u.set(Constant::getNullValue(to));
+			else if (isa<PoisonValue>(u.get()))
+				u.set(PoisonValue::get(to));
+			else if (isa<UndefValue>(u.get()))
+				u.set(from->isPointerTy() ? static_cast<Value *>(PoisonValue::get(to)) : UndefValue::get(to));
+			else
+				return "data in AIR's constant address space (a constant table) is not supported yet";
+		}
+
+		if (Type *to = globalType(i.getType(), globalTypes); to != i.getType())
+			i.mutateType(to);
 	}
 	for (Instruction &i : instructions(k))
 		if (auto *c = dyn_cast<AddrSpaceCastInst>(&i); c && c->getSrcAddressSpace() == c->getDestAddressSpace()) {
@@ -1149,10 +1203,12 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 }
 
 // The kernel `fname` of `input` (AIR bitcode, or a metallib holding it) as a code object; the reason when it cannot be translated.
-static std::string translate(StringRef input, StringRef fname, Kernel &out) {
-	const StringRef bitcode = input.starts_with("MTLB") ? functionBitcode(input, fname) : input;
+static std::string translate(StringRef input, StringRef requested, Kernel &out) {
+	std::string found = requested.str();
+	const StringRef bitcode = input.starts_with("MTLB") ? functionBitcode(input, requested, found) : input;
+	const StringRef fname = found;
 	if (bitcode.empty())
-		return "no function " + fname.str() + " in the metallib";
+		return "no function " + requested.str() + " in the metallib";
 	LLVMContext ctx;
 	SMDiagnostic diag;
 	std::unique_ptr<Module> m = parseIR(MemoryBufferRef(bitcode, "air"), diag, ctx);

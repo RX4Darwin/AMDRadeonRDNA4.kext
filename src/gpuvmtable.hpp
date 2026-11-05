@@ -35,6 +35,7 @@ struct Policy {
 // The PT pages a call touched: the caller syncs the top three pages and [firstPt, lastPt] step 0x1000. firstPt == ~0 when none.
 struct Span {
 	uint64_t firstPt { ~0ull }, lastPt { 0 };
+	bool directories { false };   // a PDE was written: the root and directory pages changed too
 };
 
 // The contiguous image of modes 0 and 1: entries live in one shadow array, PT pages at rootPhys + their logical offset. runtime.cpp's ptEntry/ptPhys use

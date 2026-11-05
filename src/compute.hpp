@@ -812,9 +812,11 @@ private:
 		// kVaStart, which a buffer a draw passes through without reuse.
 		struct VaHole { uint64_t va, bytes; } vaHoles[kVaHoles] {};
 		uint32_t vaHoleCount { 0 };
+		bool vaBitsReady { false };   // vaBits[this slot] set up (vaBitsOf)
 		uint32_t ibSlot { kBufferSlots };   // rtSubmitGfxIb: the buffer that held the last IB
 	};
 	uint64_t vaTake(RtClient &c, uint64_t bytes);
+	uint64_t *vaBitsOf(RtClient &c);
 	void vaGive(RtClient &c, uint64_t va, uint64_t bytes);
 	bool scratchFor(RtClient &c, const void *owner, const CodeObj::Kernel &k, Launch &l);
         IOLock        *rtLock { nullptr };
@@ -832,6 +834,8 @@ private:
 	bool           vmidUsed[16] {};
 	bool           queueUsed[4][8] {};
 	RtClient       clients[kClientSlots] {};
+	static constexpr uint32_t kVaGranules = (1u << 30) >> 16;   // the dense tables' 1 GiB, 64 KiB each
+	uint64_t       vaBits[kClientSlots][kVaGranules / 64] {};
 	GpuHeap::Heap  heap;
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
 	RtBuffer       buffers[kBufferSlots] {};

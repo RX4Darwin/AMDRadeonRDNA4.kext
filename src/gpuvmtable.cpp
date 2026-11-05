@@ -69,8 +69,10 @@ bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 		uint64_t ptPhysical = 0;
 		if (!pde || !pte || !a.phys(a.context, ptOff, ptPhysical))
 			return false;
-		if (!*pde)
+		if (!*pde) {
 			*pde = GpuVm::encodePde(ptPhysical, GpuVm::kValid, 0);
+			out.directories = true;
+		}
 		if (out.firstPt == ~0ull)
 			out.firstPt = ptOff;
 		out.lastPt = ptOff;
@@ -99,8 +101,10 @@ bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 		uint64_t ptPhysical = 0;
 		if (!pde || !pte || !a.phys(a.context, ptOff, ptPhysical))
 			return false;
-		if (!*pde)
+		if (!*pde) {
 			*pde = GpuVm::encodePde(ptPhysical, GpuVm::kValid, 0);
+			out.directories = true;
+		}
 		if (out.firstPt == ~0ull)
 			out.firstPt = ptOff;
 		out.lastPt = ptOff;
