@@ -190,7 +190,8 @@ private:
 		uint32_t stampIndex;      // stamp slot the completions of this source go to
 		uint32_t channel;         // 0 = root FIFO
 	};
-	void consume(const CmdSource &src, uint32_t read, uint32_t n);
+	uint32_t consume(const CmdSource &src, uint32_t read, uint32_t n);
+	bool barriersMet(const CmdSource &src, const uint8_t *cmd, const pvstream::FifoCommand &c);
 	void dumpPayload(const char *tag, const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void dumpPage(const char *what, uint32_t pfn);
 	uint32_t guestPfn(uint32_t task, uint64_t va, bool write = false);
@@ -219,6 +220,7 @@ private:
 	                  uint32_t *height = nullptr, uint32_t *format = nullptr);
 	struct Surface;
 	bool surfaceRange(uint32_t task, uint32_t id, Surface &out);
+	void dumpTexture(uint32_t task, uint32_t id);
 	bool dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes);
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
@@ -247,8 +249,8 @@ public:
 	void noteDraw(uint64_t ns);
 private:
 	IOReturn submitGfx(uint32_t dwords, uint64_t &fence);
-	bool copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex, uint32_t buf, const uint64_t origin[3], const uint64_t size[3],
-	                       uint64_t offset, uint64_t bytesPerRow);
+	struct BlitRegion;
+	bool copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex, uint32_t buf, const BlitRegion &r);
 	void presentTransaction(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
@@ -283,6 +285,8 @@ private:
 	uint64_t mTicks { 0 };
 	uint32_t mCmds { 0 };               // FIFO commands decoded so far
 	uint32_t mBadHeaders { 0 };
+	uint32_t mBarrierLines { 0 };
+	uint64_t mBarrierSince[17] {};   // per source (0 the root FIFO, n channel n): when its first unmet barrier was seen, 0 none
 	uint8_t mDumped[256] {};            // M1: payload dumps per FIFO id so far
 	uint32_t mTaskRoot[64] {};          // M1: page-table root PFN per task id (DefineHostTask), for the dumps after a commit
 	bool mRtOpen { false };              // M2: this host is a client of the card's runtime
@@ -541,7 +545,41 @@ void RDNA4PvHost::pollFifo() {
 	c[kRegFifoRead / 4] = written;   // acknowledge everything: AppleParavirtAccelerator::writeFifo spins until the host has read enough
 }
 
-void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
+// A command's barriers, {u32 stamp index, u32 value} each (AppleParavirtCommandAllocator::addBarrier): it may run once every named stamp reached its
+// value. A present's transaction waits so for the render that drew its surface on another channel; run before that render, it showed the
+// surface's older frame (windows and the cursor jumped back and forth). A barrier still unmet after kBarrierWait is logged and let go.
+bool RDNA4PvHost::barriersMet(const CmdSource &src, const uint8_t *cmd, const pvstream::FifoCommand &c) {
+	static constexpr uint64_t kBarrierWait = 1000000000;   // ns
+	const volatile uint32_t *stamps = reinterpret_cast<const volatile uint32_t *>(mFifoMap->getVirtualAddress());
+	uint64_t &since = mBarrierSince[src.channel];
+	uint64_t now;
+
+	for (uint32_t i = 0; i < c.barriers; i++) {
+		uint32_t b[2];
+
+		memcpy(b, cmd + pvstream::kFifoHeaderBytes + 8 * i, sizeof(b));
+		if (b[0] >= 0x1000 / 4 || static_cast<int32_t>(stamps[b[0]] - b[1]) >= 0)
+			continue;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+		if (!since)
+			since = now;
+
+		if (now - since < kBarrierWait)
+			return false;
+
+		pvlog("host: %s: cmd 0x%02x waited %llu ms for stamp[%u] to reach %u (it is %u): run anyway", src.tag, c.id, (now - since) / 1000000,
+		      b[0], b[1], stamps[b[0]]);
+		break;
+	}
+
+	since = 0;
+
+	return true;
+}
+
+// The bytes of commands handled, from `read`: all n, or up to a command whose barriers are not met yet (it is seen again on a later tick).
+uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 	// Decode what the guest wrote as FIFO commands ({u16 id, u16 barriers, u32 length, u32 signal, ...}, pvstream.hpp), log each by name and size.
 	uint32_t at = 0, lastSignal = 0;
 	bool haveSignal = false;
@@ -569,8 +607,25 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 					snprintf(hex + i * 2, 3, "%02x", raw[i]);
 				pvlog("host: %s +%u bytes at ring offset 0x%x do not start with a command header: %s%s", src.tag, left, (read + at) % src.ringLen, hex, left > take ? "..." : "");
 			}
+			at = n;   // skipped, as before: nothing later in it can be framed
 			break;
 		}
+
+		if (c.barriers && src.channel && c.payloadOffset <= sizeof(mWin)) {
+			uint32_t b[2];
+
+			copy(at, mWin, c.payloadOffset);
+			memcpy(b, mWin + pvstream::kFifoHeaderBytes, sizeof(b));
+
+			if (mBarrierLines < 16) {
+				mBarrierLines++;
+				pvlog("host: %s: cmd 0x%02x has %u barrier(s), the first {%u, %u}", src.tag, c.id, c.barriers, b[0], b[1]);
+			}
+
+			if (!barriersMet(src, mWin, c))
+				break;
+		}
+
 		mCmds++;
 		const bool display = c.id == 0x02 || (c.id >= 0x04 && c.id <= 0x07) || c.id == 0x1e;   // the display pipe's commands keep being shown
 		if (mCmds <= kLoggedCmds || (display && mDispCmdLines++ < 60)) {
@@ -666,6 +721,8 @@ void RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 	}
 	if (haveSignal)
 		completeStamp(src.stampIndex, lastSignal);
+
+	return at;
 }
 
 // One kernel mapping of guest physical memory, read-only unless asked (the map keeps the descriptor); nullptr when it cannot be made.
@@ -1036,11 +1093,11 @@ bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t
 // 2026-10-21). Where the pixel format is (0x04010101 at [8]?) is still open; the first descriptors of a boot are logged.
 bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow, uint32_t *width, uint32_t *height,
                                uint32_t *format) {
-	uint32_t rec[3], desc[29];
+	uint32_t rec[3] = {}, desc[29];
 	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) ||
 	    ((rec[0] & 0xff) != 2 && (rec[0] & 0xff) != 3) || (rec[0] >> 8) < sizeof(desc) || !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(desc), sizeof(desc))) {
 		if (mRenderLines++ < 24)
-			pvlog("host: task %u resource %u: no texture", task, id);
+			pvlog("host: task %u resource %u: no texture (heap record %08x)", task, id, rec[0]);
 		return false;
 	}
 	if (mRenderLines++ < 24)
@@ -1073,7 +1130,7 @@ struct RDNA4PvHost::Surface {
 	OSObject *surface = nullptr;
 	IOMemoryDescriptor *memory = nullptr;   // prepared while held
 	uint64_t base = 0;
-	uint32_t bytesPerRow = 0, width = 0, height = 0;
+	uint32_t bytesPerRow = 0, width = 0, height = 0, format = 0;   // format: Metal's
 	~Surface() {
 		if (memory)
 			memory->complete();
@@ -1123,6 +1180,29 @@ bool PvScanout::copySurface(uint32_t sid, uint8_t *dst, uint32_t pitch, uint32_t
 	return ok;
 }
 
+// Metal pixel format -> gfx12 image format, its DST_SEL x, y, z, w (4 X .. 7 W, 0 zero, 1 one), bytes per pixel
+struct TextureFormat { uint32_t metal, gfx, sel, bpp; };
+
+static const TextureFormat *textureFormat(uint32_t metal) {
+	static const TextureFormat fmts[] = {{70, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {71, 66, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},    // RGBA8 unorm, sRGB
+	                                     {80, 42, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4}, {81, 66, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // BGRA8 unorm, sRGB
+	                                     {55, 22, 4 | 0 << 3 | 0 << 6 | 1 << 9, 4}, {115, 57, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // R32Float, RGBA16Float
+	                                     {125, 63, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16},                                             // RGBA32Float
+	                                     {1, 1, 4 << 9, 1}, {10, 1, 4 | 1 << 9, 1}, {11, 64, 4 | 1 << 9, 1},         // A8, R8 unorm, sRGB
+	                                     {30, 14, 4 | 5 << 3 | 1 << 9, 2}, {31, 65, 4 | 5 << 3 | 1 << 9, 2},                      // RG8 unorm, sRGB
+	                                     {20, 7, 4 | 1 << 9, 2}, {25, 13, 4 | 1 << 9, 2},                                          // R16 unorm, float
+	                                     {60, 23, 4 | 5 << 3 | 1 << 9, 4}, {65, 29, 4 | 5 << 3 | 1 << 9, 4},                       // RG16 unorm, float
+	                                     {90, 36, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {94, 36, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // RGB10A2, BGR10A2
+	                                     {92, 30, 4 | 5 << 3 | 6 << 6 | 1 << 9, 4}, {110, 51, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8}};  // RG11B10Float, RGBA16
+	for (const TextureFormat &e : fmts)
+		if (e.metal == metal)
+			return &e;
+
+	return nullptr;
+}
+
+// A texture's IOSurface: any format of textureFormat() for sampling (CoreAnimation's layers come as RGBA16Float too), the colour targets
+// check for BGRA8 themselves.
 bool RDNA4PvHost::surfaceRange(uint32_t task, uint32_t id, Surface &out) {
 	uint32_t rec[3], d[8];
 	static uint32_t refused;
@@ -1131,9 +1211,11 @@ bool RDNA4PvHost::surfaceRange(uint32_t task, uint32_t id, Surface &out) {
 	    (rec[0] & 0xff) != 5 || (rec[0] >> 8) < sizeof(d) || !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(d), sizeof(d)))
 		return false;   // not a type-5 texture (or no IOSurface functions)
 
-	if (d[5] >> 16 != 80) {
+	const TextureFormat *fm = textureFormat(d[5] >> 16);
+
+	if (!fm) {
 		if (refused++ < 16)
-			pvlog("host: render: IOSurface %u (resource %u): Metal format %u, %ux%u: not BGRA8, not supported yet", d[0], id, d[5] >> 16, d[6], d[7]);
+			pvlog("host: render: IOSurface %u (resource %u): Metal format %u, %ux%u: not supported yet", d[0], id, d[5] >> 16, d[6], d[7]);
 		return false;
 	}
 
@@ -1150,9 +1232,14 @@ bool RDNA4PvHost::surfaceRange(uint32_t task, uint32_t id, Surface &out) {
 	out.bytesPerRow = gSurfaceFns.bytesPerRow(s);
 	out.width = gSurfaceFns.width(s);
 	out.height = gSurfaceFns.height(s);
-	const bool ok = gSurfaceFns.surfaceId(s) == sid && gSurfaceFns.pixelFormat(s) == 0x42475241 /* 'BGRA' */ && out.width == d[6] && out.height == d[7] &&
-	                out.memory && out.bytesPerRow >= out.width * 4 && out.base + static_cast<uint64_t>(out.bytesPerRow) * out.height <= out.memory->getLength() &&
-	                out.memory->prepare() == kIOReturnSuccess;
+	out.format = d[5] >> 16;
+
+	const bool bgra = out.format != 80 || gSurfaceFns.pixelFormat(s) == 0x42475241;   // 'BGRA'
+	const bool same = gSurfaceFns.surfaceId(s) == sid && bgra && out.width == d[6] && out.height == d[7];
+	const uint64_t used = out.base + static_cast<uint64_t>(out.bytesPerRow) * out.height;
+	const bool fits = out.memory && out.bytesPerRow >= out.width * fm->bpp && used <= out.memory->getLength();
+	const bool ok = same && fits && out.memory->prepare() == kIOReturnSuccess;
+
 	if (!ok) {
 		if (refused++ < 16)
 			pvlog("host: render: IOSurface %u (resource %u): id %u, format 0x%08x, %ux%u (Metal's %ux%u), %u bytes per row: not as expected", sid, id,
@@ -1182,7 +1269,7 @@ uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t by
 	uint64_t va, len;
 	bool ok = textureRange(task, tex, &va, &len) && !(len & 3) && dmaGuest(task, va, 0, pixel, len);
 	Surface surface;
-	if (!ok && surfaceRange(task, tex, surface) && surface.width <= 16384) {   // an IOSurface: row by row through its memory
+	if (!ok && surfaceRange(task, tex, surface) && surface.format == 80 && surface.width <= 16384) {   // a BGRA8 IOSurface: row by row
 		auto *line = static_cast<uint32_t *>(IOMalloc(surface.width * 4));
 		ok = line;
 		for (uint32_t x = 0; line && x < surface.width; x++)
@@ -1211,26 +1298,6 @@ static uint32_t *streamReg(uint32_t *ib, uint32_t n, uint32_t opcode, uint32_t r
 	return nullptr;
 }
 
-// Metal pixel format -> gfx12 image format, its DST_SEL x, y, z, w (4 X .. 7 W, 0 zero, 1 one), bytes per pixel
-struct TextureFormat { uint32_t metal, gfx, sel, bpp; };
-
-static const TextureFormat *textureFormat(uint32_t metal) {
-	static const TextureFormat fmts[] = {{70, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {71, 66, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},    // RGBA8 unorm, sRGB
-	                                     {80, 42, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4}, {81, 66, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // BGRA8 unorm, sRGB
-	                                     {55, 22, 4 | 0 << 3 | 0 << 6 | 1 << 9, 4}, {115, 57, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // R32Float, RGBA16Float
-	                                     {125, 63, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16},                                             // RGBA32Float
-	                                     {1, 1, 4 << 9, 1}, {10, 1, 4 | 1 << 9, 1}, {11, 64, 4 | 1 << 9, 1},         // A8, R8 unorm, sRGB
-	                                     {30, 14, 4 | 5 << 3 | 1 << 9, 2}, {31, 65, 4 | 5 << 3 | 1 << 9, 2},                      // RG8 unorm, sRGB
-	                                     {20, 7, 4 | 1 << 9, 2}, {25, 13, 4 | 1 << 9, 2},                                          // R16 unorm, float
-	                                     {60, 23, 4 | 5 << 3 | 1 << 9, 4}, {65, 29, 4 | 5 << 3 | 1 << 9, 4},                       // RG16 unorm, float
-	                                     {90, 36, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {94, 36, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // RGB10A2, BGR10A2
-	                                     {92, 30, 4 | 5 << 3 | 6 << 6 | 1 << 9, 4}, {110, 51, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8}};  // RG11B10Float, RGBA16
-	for (const TextureFormat &e : fmts)
-		if (e.metal == metal)
-			return &e;
-
-	return nullptr;
-}
 
 // A texture a shader samples or reads, as the guest has it: a Metal texture's memory (resource type 2, or 3 read-only, with the same
 // descriptor: 29 dwords with one mip level, its format record {0x2c, its own id, (Metal pixel format << 16) | usage} from dword 18), or an
@@ -1238,6 +1305,8 @@ static const TextureFormat *textureFormat(uint32_t metal) {
 struct RDNA4PvHost::TextureSource {
 	uint32_t type = 0, format = 0, usage = 0, width = 0, height = 0, depth = 1, rowBytes = 0;
 	uint64_t va = 0, length = 0, imageBytes = 0;   // imageBytes: a 3D texture's slices apart
+	uint32_t slices = 1;                            // an array's, sliceBytes apart
+	uint64_t sliceBytes = 0;
 	Surface surface;
 };
 
@@ -1253,7 +1322,7 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out)
 		if (!surfaceRange(task, id, out.surface))
 			return false;
 
-		out.format = 80;   // MTLPixelFormatBGRA8Unorm
+		out.format = out.surface.format;
 		out.width = out.surface.width;
 		out.height = out.surface.height;
 		out.rowBytes = out.surface.bytesPerRow;
@@ -1287,6 +1356,9 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out)
 	out.va = static_cast<uint64_t>(td[2]) << 12;
 	out.length = td[0] | static_cast<uint64_t>(td[1]) << 32;
 	out.imageBytes = (td[11] | static_cast<uint64_t>(td[12]) << 32) / out.depth;   // level 0's bytes
+	// an array's slices (WindowServer's 16384x1x3 R32Float: dword 3 0x00030001, dwords 6-7 0x10000; measured 2026-11-05)
+	out.slices = td[3] >> 16 ? td[3] >> 16 : 1;
+	out.sliceBytes = td[6] | static_cast<uint64_t>(td[7]) << 32;
 
 	static uint32_t volumes;
 
@@ -1736,7 +1808,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		height = targetFormat ? texHeight : static_cast<uint32_t>(len / bpr);
 		bgra = targetFormat != 70 && targetFormat != 71;
 	}
-	else if (!why && surfaceRange(task, target, surface)) {
+	else if (!why && surfaceRange(task, target, surface) && surface.format == 80) {
 		bpr = surface.bytesPerRow;
 		width = surface.width;
 		height = surface.height;
@@ -2115,12 +2187,29 @@ bool RDNA4PvHost::dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32
 	return true;
 }
 
+// A blit's texture region and the buffer's side of it. The texture's part: {u16 slice, u16 level} (rdna4-mtlslices: slice n of an array is
+// n, level n of a mipmap n << 16, the dword after it 0; measured 2026-11-05).
+struct RDNA4PvHost::BlitRegion {
+	uint64_t origin[3], size[3];
+	uint64_t offset, bytesPerRow, bytesPerImage;
+	uint32_t slice, level;
+
+	void place(const uint8_t *p)
+	{
+		uint32_t v;
+
+		memcpy(&v, p, 4);
+		slice = v & 0xffff;
+		level = v >> 16;
+	}
+};
+
 // M2: Blit.fillBuffer {u32 buffer, u64 offset, u64 length, u32 value} and Blit.copyFromBuffer {u32 source, u32 destination, u64 source offset,
 // u64 destination offset, u64 size} (measured against mtlprobe on the rig, 2026-10-21), run on the card.
 void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes) {
 	if (!gCompute)
 		return;
-	uint64_t va, len, va2, len2;
+	uint64_t va = 0, len = 0, va2 = 0, len2 = 0;
 	if (id == 0x132 && bytes >= 24) {
 		uint32_t buf, value;
 		uint64_t off, n;
@@ -2146,74 +2235,129 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 		// Blit.copyFromTexture {u32 texture, u32 buffer, u64 origin[3], u64 size[3], u64 destination offset, u64 bytes per row, u64 bytes per image,
 		// u32 slice, u32 level} (mtlprobe: 64x64x1, 0x100 per row, 0x4000 per image; measured 2026-10-21). Only the whole of a linear texture, copied
 		// as bytes: what a texture's memory looks like is not measured yet beyond its size (64x64 BGRA8 = exactly 0x4000).
-		uint32_t tex, buf, slice, level;
-		uint64_t origin[3], size[3], dof, bpr, bpi;
+		uint32_t tex, buf;
+		BlitRegion r;
 		memcpy(&tex, p, 4);
 		memcpy(&buf, p + 4, 4);
-		memcpy(origin, p + 8, 24);
-		memcpy(size, p + 32, 24);
-		memcpy(&dof, p + 56, 8);
-		memcpy(&bpr, p + 64, 8);
-		memcpy(&bpi, p + 72, 8);
-		memcpy(&slice, p + 80, 4);
-		memcpy(&level, p + 84, 4);
-		const bool whole = !origin[0] && !origin[1] && !origin[2] && size[2] == 1 && !slice && !level && bpr == size[0] * 4 && bpi == bpr * size[1];
-		const bool ok = whole ? textureRange(task, tex, &va, &len) && bpi == len && bufferRange(task, buf, &va2, &len2) && dof <= len2 &&
-		                        bpi <= len2 - dof && dmaGuest(task, va2 + dof, va, 0, bpi)
-		                      : !slice && !level && copyTextureRegion(task, false, tex, buf, origin, size, dof, bpr);
-		pvlog("host: blit: copyFromTexture %u (%llux%llu at %llu, %llu, %llu bytes per row) -> buffer %u +0x%llx %s: %s", tex, size[0], size[1],
-		      origin[0], origin[1], bpr, buf, dof, whole ? "on the card" : "by rows", ok ? "done" : "NOT done");
+		memcpy(r.origin, p + 8, 24);
+		memcpy(r.size, p + 32, 24);
+		memcpy(&r.offset, p + 56, 8);
+		memcpy(&r.bytesPerRow, p + 64, 8);
+		memcpy(&r.bytesPerImage, p + 72, 8);
+		r.place(p + 80);
+
+		// the whole of a linear 32-bit texture as bytes, on the card; else row by row
+		const uint64_t bpi = r.bytesPerImage, dof = r.offset;
+		const bool origin = !r.origin[0] && !r.origin[1] && !r.origin[2] && !r.slice && !r.level;
+		const bool whole = origin && r.size[2] == 1 && r.bytesPerRow == r.size[0] * 4 && bpi == r.bytesPerRow * r.size[1];
+		bool onCard = whole && textureRange(task, tex, &va, &len) && bpi == len && bufferRange(task, buf, &va2, &len2);
+
+		onCard = onCard && dof <= len2 && bpi <= len2 - dof && dmaGuest(task, va2 + dof, va, 0, bpi);
+
+		const bool ok = onCard || copyTextureRegion(task, false, tex, buf, r);
+		pvlog("host: blit: copyFromTexture %u (%llux%llux%llu at %llu, %llu, %llu, slice %u, level %u, %llu bytes per row) -> buffer %u +0x%llx %s: %s",
+		      tex, r.size[0], r.size[1], r.size[2], r.origin[0], r.origin[1], r.origin[2], r.slice, r.level, r.bytesPerRow, buf, dof,
+		      onCard ? "on the card" : "by rows", ok ? "done" : "NOT done");
+		if (!ok || gTalk)
+			dumpTexture(task, tex);
 	} else if (id == 0x12c && bytes >= 88) {
 		// Blit.copyFromBuffer into a texture {u32 buffer, u32 texture, u64 source offset, u64 source bytes per row, u64 source bytes per image,
 		// u64 size[3], u64 destination origin[3], u32 slice, u32 level} (rdna4-mtlbuftex private, 2026-11-05).
-		uint32_t buf, tex, slice, level;
-		uint64_t so, bpr, bpi, size[3], origin[3];
+		uint32_t buf, tex;
+		BlitRegion r;
 		memcpy(&buf, p, 4);
 		memcpy(&tex, p + 4, 4);
-		memcpy(&so, p + 8, 8);
-		memcpy(&bpr, p + 16, 8);
-		memcpy(&bpi, p + 24, 8);
-		memcpy(size, p + 32, 24);
-		memcpy(origin, p + 56, 24);
-		memcpy(&slice, p + 80, 4);
-		memcpy(&level, p + 84, 4);
-		const bool ok = !slice && !level && copyTextureRegion(task, true, tex, buf, origin, size, so, bpr);
-		pvlog("host: blit: copyFromBuffer %u +0x%llx (%llu bytes per row) -> texture %u (%llux%llu at %llu, %llu) by rows: %s", buf, so, bpr, tex,
-		      size[0], size[1], origin[0], origin[1], ok ? "done" : "NOT done");
+		memcpy(&r.offset, p + 8, 8);
+		memcpy(&r.bytesPerRow, p + 16, 8);
+		memcpy(&r.bytesPerImage, p + 24, 8);
+		memcpy(r.size, p + 32, 24);
+		memcpy(r.origin, p + 56, 24);
+		r.place(p + 80);
+		const bool ok = copyTextureRegion(task, true, tex, buf, r);
+		pvlog("host: blit: copyFromBuffer %u +0x%llx (%llu bytes per row, %llu per image) -> texture %u (%llux%llux%llu at %llu, %llu, %llu, slice %u, "
+		      "level %u) by rows: %s", buf, r.offset, r.bytesPerRow, r.bytesPerImage, tex, r.size[0], r.size[1], r.size[2], r.origin[0], r.origin[1],
+		      r.origin[2], r.slice, r.level, ok ? "done" : "NOT done");
+		if (!ok || gTalk)
+			dumpTexture(task, tex);
 	}
 }
 
-// A region of level 0 of a 2D texture from or into a buffer (rows `bytesPerRow` apart from `offset`), row by row with the CPU: the blits
-// the card does not run yet. The texture's memory as textureSource finds it; not into an IOSurface.
-bool RDNA4PvHost::copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex, uint32_t buf, const uint64_t origin[3], const uint64_t size[3],
-                                    uint64_t offset, uint64_t bytesPerRow)
+// A texture's whole heap descriptor, for the blits it failed (the first few of a boot).
+void RDNA4PvHost::dumpTexture(uint32_t task, uint32_t id)
+{
+	static uint32_t dumped;
+	uint32_t rec[3] = {}, td[32] = {};
+
+	if (dumped >= 16 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
+		return;
+
+	dumped++;
+	readGuest(task, rec[1], reinterpret_cast<uint8_t *>(td), (rec[0] >> 8) < sizeof(td) ? rec[0] >> 8 : sizeof(td));
+	for (uint32_t i = 0; i < 32; i += 8)
+		pvlog("host: blit: texture %u (heap record %08x) [%u]: %08x %08x %08x %08x %08x %08x %08x %08x", id, rec[0], i, td[i], td[i + 1], td[i + 2],
+		      td[i + 3], td[i + 4], td[i + 5], td[i + 6], td[i + 7]);
+}
+
+// A region of level 0 of a texture from or into a buffer (rows bytesPerRow, images bytesPerImage apart from offset), row by row with the
+// CPU: the blits the card does not run yet. A 2D texture, an array's slice or a 3D texture's depth slices; the texture's memory as
+// textureSource finds it; not into an IOSurface.
+bool RDNA4PvHost::copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex, uint32_t buf, const BlitRegion &r)
 {
 	TextureSource t;
 	uint64_t va, len;
 
-	if (!textureSource(task, tex, t) || (toTexture && t.surface.memory) || !bufferRange(task, buf, &va, &len))
+	if (r.level || !textureSource(task, tex, t) || (toTexture && t.surface.memory) || !bufferRange(task, buf, &va, &len))
 		return false;
 
 	const TextureFormat *fm = textureFormat(t.format);
-	const uint64_t rowBytes = fm ? size[0] * fm->bpp : 0;
+	const uint64_t images = r.size[2];
+	const uint64_t sliceAt = static_cast<uint64_t>(r.slice) * t.sliceBytes;
 
-	if (!rowBytes || !size[1] || size[2] != 1 || origin[2] || t.depth != 1 || origin[0] + size[0] > t.width || origin[1] + size[1] > t.height ||
-	    bytesPerRow < rowBytes || offset > len || (size[1] - 1) * bytesPerRow + rowBytes > len - offset || rowBytes > 0x10000)
+	if (!fm || !r.size[0] || !r.size[1] || !images)
+		return false;
+
+	// within the texture: its rows, depth slices and array slices (the guest's u64s checked without summing them)
+	if (r.size[0] > t.width || r.origin[0] > t.width - r.size[0] || r.size[1] > t.height || r.origin[1] > t.height - r.size[1] ||
+	    images > t.depth || r.origin[2] > t.depth - images)
+		return false;
+
+	const uint64_t rowBytes = r.size[0] * fm->bpp;   // the width is a u32: no wrap
+
+	if (rowBytes > 0x10000)
+		return false;
+
+	if (r.slice >= t.slices || (r.slice && !t.sliceBytes))
+		return false;
+
+	// within the buffer: the last image's last row ends inside it
+	uint64_t inBuffer, rows, end;
+
+	if (r.bytesPerRow < rowBytes || r.offset > len || __builtin_mul_overflow(images - 1, r.bytesPerImage, &inBuffer) ||
+	    __builtin_mul_overflow(r.size[1] - 1, r.bytesPerRow, &rows) || __builtin_add_overflow(inBuffer, rows, &end) ||
+	    __builtin_add_overflow(end, rowBytes, &end) || end > len - r.offset)
 		return false;
 
 	auto *row = static_cast<uint8_t *>(IOMalloc(rowBytes));
+	const uint32_t n = static_cast<uint32_t>(rowBytes);
 	bool ok = row != nullptr;
 
-	for (uint64_t y = 0; y < size[1] && ok; y++) {
-		const uint64_t at = (origin[1] + y) * t.rowBytes + origin[0] * fm->bpp, inBuffer = va + offset + y * bytesPerRow;
+	for (uint64_t z = 0; z < images && ok; z++) {
+		for (uint64_t y = 0; y < r.size[1] && ok; y++) {
+			const uint64_t at = sliceAt + (r.origin[2] + z) * t.imageBytes + (r.origin[1] + y) * t.rowBytes + r.origin[0] * fm->bpp;
+			const uint64_t other = va + r.offset + z * r.bytesPerImage + y * r.bytesPerRow;
 
-		const uint32_t n = static_cast<uint32_t>(rowBytes);
+			if (toTexture) {
+				ok = readGuest(task, other, row, n) && copyGuest(task, t.va + at, row, n, true);
+				continue;
+			}
 
-		if (toTexture)
-			ok = readGuest(task, inBuffer, row, n) && copyGuest(task, t.va + at, row, n, true);
-		else
-			ok = (t.surface.memory ? t.surface.memory->readBytes(t.surface.base + at, row, n) == n : readGuest(task, t.va + at, row, n)) &&
-			     copyGuest(task, inBuffer, row, n, true);
+			if (t.surface.memory)
+				ok = t.surface.memory->readBytes(t.surface.base + at, row, n) == n;
+			else
+				ok = readGuest(task, t.va + at, row, n);
+
+			ok = ok && copyGuest(task, other, row, n, true);
+		}
 	}
 
 	if (row)
@@ -3020,8 +3164,8 @@ void RDNA4PvHost::pollChannels() {
 		char tag[12];
 		snprintf(tag, sizeof(tag), "ch%u", n);
 		mChannelPolls++;
-		consume(CmdSource { tag, reinterpret_cast<const uint8_t *>(ch.map->getVirtualAddress()), ch.ringBytes, ch.kind, n }, read, pending);
-		rec[1] = written;   // the guest compares it with the write counter to see that the ring is empty and how much room is left
+		// the guest compares the read counter with the write counter to see that the ring is empty and how much room is left
+		rec[1] = read + consume(CmdSource { tag, reinterpret_cast<const uint8_t *>(ch.map->getVirtualAddress()), ch.ringBytes, ch.kind, n }, read, pending);
 	}
 }
 
