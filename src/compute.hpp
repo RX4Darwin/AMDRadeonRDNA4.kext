@@ -711,7 +711,9 @@ private:
 	// when there is no DMA). With DMA, buffers come from the device heap:
 	// VRAM past the BAR, which the CPU never touches.
 	static constexpr uint32_t kHeapOffset  = 32u << 20;
-	static constexpr uint32_t kMaxBuffers  = 256;          // the legacy global caps (modes 0 and 1)
+	// The legacy global caps (modes 0 and 1). Buffers as many as there are slots: the paravirtual host alone keeps hundreds (mappings,
+	// shadows), and with 256 its allocations failed once those were made.
+	static constexpr uint32_t kMaxBuffers  = 1024;
 	static constexpr uint32_t kMaxPrograms = 32;
 	static constexpr uint32_t kBufferSlots  = 1024;        // rdna4-vmshared=2: array sizes; the cap is per client (accounting), not global
 	static constexpr uint32_t kProgramSlots = 256;
@@ -810,6 +812,7 @@ private:
 		// kVaStart, which a buffer a draw passes through without reuse.
 		struct VaHole { uint64_t va, bytes; } vaHoles[kVaHoles] {};
 		uint32_t vaHoleCount { 0 };
+		uint32_t ibSlot { kBufferSlots };   // rtSubmitGfxIb: the buffer that held the last IB
 	};
 	uint64_t vaTake(RtClient &c, uint64_t bytes);
 	void vaGive(RtClient &c, uint64_t va, uint64_t bytes);

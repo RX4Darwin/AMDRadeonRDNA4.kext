@@ -48,7 +48,8 @@ static int gTalk;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvtalk, CTLFLAG_RW | CTLFLAG_LOCKED, &gTalk, 0, "AMDRadeonRDNA4: log every paravirtual draw");
 static int gInPlace = 3;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvinplace, CTLFLAG_RW | CTLFLAG_LOCKED, &gInPlace, 0,
-	   "AMDRadeonRDNA4: what draws use in place (1 textures, 2 colour targets; 4 not IOSurface textures, 8 not Metal's); the rest is staged");
+	   "AMDRadeonRDNA4: what draws use in place (1 textures, 2 colour targets; 4 not IOSurface textures, 8 not Metal's); the rest is staged "
+	   "(16: without shadows, each draw's own copy)");
 
 namespace {
 
@@ -73,6 +74,7 @@ struct {
 	uint32_t (*planeCount)(const void *);   // the planes: IOSurface::getPlaneCount() const, getPlaneOffset/BytesPerRow/Width/Height(unsigned) const
 	uint64_t (*planeOffset)(const void *, uint32_t);
 	uint32_t (*planeBytesPerRow)(const void *, uint32_t), (*planeWidth)(const void *, uint32_t), (*planeHeight)(const void *, uint32_t);
+	uint32_t (*lockSeed)(const void *), (*unlockSeed)(const void *);   // IOSurface::getLockSeed() const, getUnlockSeed() const
 } gSurfaceFns;
 // The kernel's map of all physical memory (x86_64 PHYSMAP_PTOV: physmap_base + address, up to physmap_max), from the plugin's Lilu callback:
 // the guest's pages read and written in place. Each access through an IOMemoryMap of its own made and dropped four or five mappings a page
@@ -272,11 +274,17 @@ public:
 	bool textureSource(uint32_t task, uint32_t id, TextureSource &out);
 	bool readTextureRow(uint32_t task, const TextureSource &src, uint32_t y, uint8_t *dst, uint32_t bytes);
 	int inkedBytes(uint32_t task, const TextureSource &src, uint32_t bpp);
-	bool stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName);
+	bool stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName,
+	                   bool writes);
 	bool releaseTextures(uint32_t task, StagedTexture (&staged)[16], bool copyBack);
 	bool mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	bool mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
-	bool mapPages(const uint64_t *pages, uint64_t count, uint64_t &handle, uint64_t &gpu);
+private:
+	struct Mapping;
+public:
+	bool mapPages(const uint64_t *pages, uint64_t count, uint64_t &handle, uint64_t &gpu, Mapping **entry = nullptr);
+	Mapping *keyedMapping(const void *memory, uint32_t task, uint64_t first, uint64_t count);
+	void keyMapping(Mapping *m, IOMemoryDescriptor *memory, uint32_t task, uint64_t first);
 	void describeRenderPipeline(uint32_t task, uint32_t pipeline);
 private:
 	void answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t *cmd);
@@ -288,12 +296,13 @@ private:
 	// Draws in flight: submitted without a wait, each with its own state page and IB (slot n of mGfxMisc and mGfxIb), waited for together
 	// by waitDraws before anything reads or reuses what they use (a stamp completed, a present, a blit, new shader code, a mapping dropped).
 	static constexpr uint32_t kSlots = 64;
-	// At most this many in flight: the runtime ends one hung IB, not several (with three in flight a hang halted the ring for good).
-	static constexpr uint32_t kInFlight = 1;
+	// At most this many in flight. With three a hang once halted the ring for good; the runtime now ends all of a client's IBs on the ring
+	// together (gfxRingRelease waits for its newest fence), and with one each draw waited for the one before: most of a draw's time.
+	static constexpr uint32_t kInFlight = 16;
 	uint32_t mSlot { 0 }, mPending { 0 };
 	// Shader pairs kept on the card, slot n at mGfxCode + n * RDNA4_TRI_CODE_BYTES: WindowServer switches between a few dozen pairs all the
 	// time, and with one slot each switch waited for the draws in flight and copied the slot in again.
-	static constexpr uint32_t kCodeSlots = 16;
+	static constexpr uint32_t kCodeSlots = 64;   // 640 KiB each: 40 MiB of VRAM
 	struct CodeSlot { uint8_t hash[2][32]; uint64_t used; bool valid; };
 	CodeSlot mCode[kCodeSlots] {};
 	uint64_t mCodeClock { 0 };
@@ -355,8 +364,20 @@ private:
 	bool mRtOpen { false };              // M2: this host is a client of the card's runtime
 	// mapPages' mappings kept from draw to draw, by their page list: WindowServer draws with the same textures, buffers and targets every
 	// frame, and each mapping costs SDMA jobs (page tables) of about 2 ms.
-	struct Mapping { uint64_t *pages { nullptr }; uint64_t count { 0 }, handle { 0 }, gpu { 0 }, used { 0 }; };
-	static constexpr uint32_t kMappings = 64;
+	// Found without its page list by a key as well: an IOSurface's memory (held while cached, so its pages stay) or a task's VA, valid
+	// while the task's page table is unchanged (mPtGen). Building the page list for each lookup walked the guest's tables every draw.
+	struct Mapping {
+		uint64_t *pages { nullptr };
+		uint64_t count { 0 }, handle { 0 }, gpu { 0 }, used { 0 };
+		IOMemoryDescriptor *memory { nullptr };
+		uint32_t task { 0 };
+		uint64_t first { 0 }, gen { 0 };
+		bool keyed { false };
+	};
+	// WindowServer uses well over 64 textures, targets and buffers a frame: the small ones pushed the large ones out, and each came back
+	// as thousands of pages mapped anew.
+	static constexpr uint32_t kMappings = 256;
+	uint64_t mPtGen[64] {};             // per task: bumped when the guest changes its page table
 	Mapping mMap[kMappings];
 	uint64_t mMapClock { 0 };
 	void dropMapping(Mapping &m);
@@ -378,7 +399,10 @@ private:
 	uint32_t mFaulted[kFaulted] {}, mFaultedCount { 0 };   // kernels (runtime programs) whose dispatch did not finish: not run again
 	void logHang(const char (*name)[64], const Draw &draw, const Bindings *bound, uint32_t count, uint64_t indexGpu, const uint64_t table[2],
 	             const uint32_t *seq, uint32_t m);
-	Jit mJit[32] {};                     // M3: functions the helper translated, by hash (program 0: it could not); least recently used replaced
+	// WindowServer alone uses about 60 functions: with 32 entries a translation pushed out one still in use, and a draw then waited
+	// for the helper again (seconds for the largest shaders).
+	static constexpr uint32_t kJits = 256;
+	Jit mJit[kJits] {};                  // M3: functions the helper translated, by hash (program 0: it could not); least recently used replaced
 	uint32_t mJits { 0 };
 	uint64_t mJitClock { 0 };
 	uint32_t mRenderLines { 0 };          // M2: render-pass and texture lines so far (other processes render every frame)
@@ -406,9 +430,100 @@ private:
 	};
 	Pipe mPipe[pvstream::disp::kMaxPorts];
 	uint64_t mDrawStatSince { 0 }, mDrawStatNs { 0 }, mDrawStatMaxNs { 0 };   // noteDraw: the draws of the last 5 s
-	uint64_t mPhaseNs[4] {};            // of those: textures in, target in and submit, the card, target out and the rest
+	uint64_t mPhaseNs[6] {};            // of those: textures in, target in and submit, the card, target out and the rest; the pipeline and
+	                                     // its shaders, the target and the buffers
 	uint64_t mMapNs { 0 };              // mapPages' share
+	uint32_t mMapMisses { 0 };          // its mappings made anew
+	uint64_t mMapPages { 0 }, mCopiedBytes { 0 }, mCopyNs { 0 };   // their pages; the copied textures' bytes and the time their rows took
+	uint32_t mWaits { 0 }, mCodeIns { 0 }, mTranslations { 0 };   // and the waits for draws in flight, shader pairs copied in, helper requests
+	uint32_t mPresents { 0 };            // frames presented meanwhile
 	uint32_t mInPlace { 0 }, mCopied { 0 };   // textures read in place, and copied
+	// Shadows: textures the card cannot read or write in place (rows not 128 bytes apart) at a pitch it can, in host memory, kept while
+	// they hold what the guest has. Translucency samples the same window contents every frame, and WindowServer draws into a surface and
+	// samples it right after: copying them anew each time was gigabytes a few seconds.
+	struct Shadow {
+		OSObject *surface { nullptr };   // held; else a guest texture of `task`
+		uint32_t task { 0 };
+		uint64_t at { 0 };               // the surface's base, or the texture's VA
+		uint32_t rowBytes { 0 }, width { 0 }, height { 0 }, depth { 0 }, bpp { 0 }, pitch { 0 }, lockSeed { 0 }, unlockSeed { 0 };
+		uint64_t imageBytes { 0 }, slice { 0 };   // the guest's slices apart, and the shadow's (the card's: rows aligned to 256 then)
+		uint64_t handle { 0 }, gpu { 0 }, bytes { 0 }, when { 0 }, used { 0 };
+		uint64_t serial { 0 };           // the last draw that read it (mDrawSerial)
+		uint8_t *cpu { nullptr };
+		bool valid { false };
+	};
+	// A frame's icons and glyphs alone are hundreds of small textures: with 32 shadows they pushed each other out, and each was copied
+	// again. Large ones are kept within kShadowBudget.
+	static constexpr uint32_t kShadows = 256;
+	static constexpr uint64_t kShadowBudget = 256ull << 20, kShadowMax = 64ull << 20;
+	uint64_t mShadowBytes { 0 };
+	uint32_t mShadowsFreed { 0 }, mShadowsMade { 0 };   // for the draw stats
+	uint32_t mStagedLines { 0 };                         // textures copied for one draw, described in this stats period
+	// Draws not run in this stats period, and the first one's reason and fragment function: what is missing on screen.
+	uint32_t mNotRun { 0 };
+	const char *mNotRunWhy { nullptr };
+	char mNotRunName[64] {};
+	void noteNotRun(const char *why, const char *name)
+	{
+		if (!mNotRun++) {
+			mNotRunWhy = why;
+			strlcpy(mNotRunName, name, sizeof(mNotRunName));
+		}
+	}
+	uint32_t mStale[3] {};                               // shadows filled again: dropped, too old, the surface locked since
+	uint64_t mDrawSerial { 0 };          // draws submitted
+	bool shadowIdle(const Shadow &s) const;
+	void freeShadow(Shadow &s);
+	static constexpr uint64_t kShadowAge = 250000000;   // ns
+	Shadow mShadows[kShadows];
+	uint64_t mShadowClock { 0 };
+	uint32_t mCopiesReused { 0 };
+	struct ShadowKey {
+		OSObject *surface;
+		uint32_t task;
+		uint64_t at;
+		uint32_t rowBytes, width, height, depth, bpp;
+		uint64_t imageBytes;
+	};
+	Shadow *findShadow(const ShadowKey &k);
+	bool shadowCurrent(const Shadow &s) const;
+	Shadow *makeShadow(const ShadowKey &k);
+	bool fillShadow(Shadow &s, IOMemoryDescriptor *memory, bool written);
+	bool shadowTexture(uint32_t task, uint32_t id, const TextureSource &src, uint32_t bpp, uint64_t &gpu, uint32_t &pitch);
+	void dropShadows(const OSObject *surface, uint32_t task, uint64_t at, bool all = false);
+	void dropShadowRange(uint32_t task, uint64_t va, uint64_t bytes);
+	// A colour target the card cannot write in place, drawn into its shadow from the first draw into it until another target, the end of
+	// the command buffer, a blit, a dispatch or a clear (flushHeld: its drawn rows written back), its draws left in flight; instead of each
+	// draw copying its rows in and out and waiting for the card. The colour block swaps BGRA8 as for a target in place.
+	struct HeldTarget {
+		bool active { false };
+		uint32_t task { 0 }, target { 0 };
+		Shadow *shadow { nullptr };
+		IOMemoryDescriptor *memory { nullptr };   // a surface's, held and prepared while active
+		uint32_t top { 0 }, bottom { 0 };         // the rows drawn
+	};
+	HeldTarget mHeld;
+	bool holdTarget(uint32_t task, uint32_t target, uint64_t va, const Surface &surface, uint32_t width, uint32_t height, uint32_t bpr,
+	                uint32_t tp);
+public:
+	void flushHeld();
+private:
+	// A render pipeline as its draws need it: its functions with their names, its blend state and vertex descriptor. Kept by the pipeline's
+	// and its functions' resource records (an id used again comes with a record of its own): each draw read the descriptor and both
+	// metallibs' headers from the guest and searched them, a third of a draw's time.
+	struct PipelineInfo {
+		uint32_t task { 0 }, pipeline { 0 }, rec[3] {}, fnRec[3][3] {};
+		uint64_t pd[8] {};
+		uint32_t fn[3] {}, blend[10] {}, attributes[RDNA4_MTLC_MAX_ATTRIBUTES][4] {}, skipped[RDNA4_MTLC_MAX_ATTRIBUTES] {};
+		bool valid { false }, attributesKnown { false }, named[3] {};
+		char name[3][64] {};
+		uint8_t hash[3][32] {};
+		uint64_t lib[3] {}, used { 0 };
+	};
+	static constexpr uint32_t kPipelines = 128;
+	PipelineInfo mPipelines[kPipelines];
+	uint64_t mPipelineClock { 0 };
+	const PipelineInfo &pipelineInfo(uint32_t task, uint32_t pipeline);
 	uint32_t mDrawStatCount { 0 };
 	uint32_t mDisp { kDispVbl };
 	pvstream::disp::Info mDispInfo;
@@ -754,6 +869,23 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			mDrawLines[(task >> 1) & 63] = 0;
 			mListed[(task >> 1) & 63] = 0;
 		}
+		// The guest changed a task's page table: the mappings found by that task's VAs are found by their pages again. A release's layout is
+		// not known: all tasks then.
+		const bool commit = c.id == 0x39 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4;
+
+		if (commit) {
+			uint32_t task;
+
+			copy(at, mWin, c.length);
+			memcpy(&task, mWin + c.payloadOffset, 4);   // CommitIntoGPUPageTable {u32 task, u64 gpu address, u64 length}
+			mPtGen[task & 63]++;
+		}
+
+		if (c.id == 0x22 || c.id == 0x38 || (c.id == 0x39 && !commit)) {
+			for (uint64_t &gen : mPtGen)
+				gen++;
+		}
+
 		if (c.id == 0x37 && c.length > sizeof(mWin) && mBigCmdLines++ < 8)
 			pvstat("host: %s: ExecIndirect of %u bytes does not fit the %zu-byte window: its command buffer is NOT run", src.tag, c.length,
 			       sizeof(mWin));
@@ -925,6 +1057,8 @@ void RDNA4PvHost::waitDraws()
 
 	const uint64_t from = nowNs();
 	const IOReturn r = gCompute->rtWaitGfxFence(this, static_cast<uint32_t>(mLastFence), kBatchWait, ns);
+
+	mWaits++;
 
 	mPhaseNs[2] += nowNs() - from;
 
@@ -1314,6 +1448,7 @@ void RDNA4PvHost::decodeExec(uint32_t task, uint64_t va, uint64_t len) {
 		}
 		at += slen;
 	}
+	flushHeld();   // the guest reads what the command buffer drew once its stamp completes
 	pvlog("host: stream: task %u command buffer at 0x%llx, %llu bytes: %u segment(s), %u command(s), %u unknown, %u byte(s) undecoded%s", task, va, len,
 	      segments, t.commands, t.unknown, undecoded, len > n ? " (only the first 64 KiB read)" : "");
 	IOFree(buf, n ? n : 1);
@@ -1564,6 +1699,7 @@ uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t by
 	if ((actions & 0xffff) != 2 || !tex)   // MTLLoadActionClear
 		return tex;
 
+	flushHeld();
 	waitDraws();   // cleared with SDMA or the CPU, after the draws before
 	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
 	const uint32_t pixel = b | g << 8 | r << 16 | a << 24;   // B, G, R, A in memory
@@ -1576,9 +1712,12 @@ uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t by
 	bool ok = found && (!half || zero);
 
 	ok = ok && dmaGuest(task, va, 0, half ? 0 : pixel, len);
+	if (found)
+		dropShadows(nullptr, task, va);
 
 	Surface surface;
 	if (!ok && surfaceRange(task, tex, surface) && surface.format == 80 && surface.width <= 16384) {   // a BGRA8 IOSurface: row by row
+		dropShadows(surface.surface, task, surface.base);
 		auto *line = static_cast<uint32_t *>(IOMalloc(surface.width * 4));
 		ok = line;
 		for (uint32_t x = 0; line && x < surface.width; x++)
@@ -1727,7 +1866,10 @@ int RDNA4PvHost::inkedBytes(uint32_t task, const TextureSource &src, uint32_t bp
 	return inked;
 }
 
-bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName) {
+// `writes`: the shader may write its textures (a kernel, or a fragment shader without a colour output); those with
+// MTLTextureUsageShaderWrite are then copied back after it. CoreAnimation makes its textures with that usage and draws only read them.
+bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName,
+                                bool writes) {
 	bool ok = true;
 	for (unsigned k = 0; k < 16 && ok; k++) {
 		const uint32_t id = bound.texture[k];
@@ -1788,10 +1930,28 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			continue;
 		}
 
+		// Through a shadow; not one the shader writes (copied back after the draw as before).
+		const bool shaderWrites = writes && (usage & 2) && src.type == 2;
+		uint32_t shadowPitch = 0;
+
+		if (!shaderWrites && !(gInPlace & 16) && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch)) {
+			uint32_t *t = table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4;
+
+			if (array1d)
+				linearArray1d(t, gpu, fm->gfx, fm->sel, w, depth);
+			else if (depth > 1)
+				linearVolume(t, gpu, fm->gfx, fm->sel, w, h, depth);
+			else
+				linearImage(t, gpu, fm->gfx, fm->sel, w, h, shadowPitch / fm->bpp);
+
+			mCopied++;
+			continue;
+		}
+
 		mCopied++;
-		if (mCopied < 8)
-			pvlog("host: render: %s texture %u (resource %u, type %u): format %u, %ux%u, %u bytes per row: copied", stageName, k, id, src.type,
-			      format, w, h, rowBytes);
+		if (mStagedLines++ < 4)
+			pvstat("host: render: %s texture %u (resource %u, type %u): format %u, usage 0x%x, %ux%ux%u, %u bytes per row: copied for the draw%s",
+			       stageName, k, id, src.type, format, usage, w, h, depth, rowBytes, shaderWrites ? " (the shader writes it)" : "");
 
 		const uint32_t texPitch = (w * fm->bpp + 127) & ~127u;   // bytes
 		// a 3D image's slices: height rows of the row's bytes aligned to 256, not to the pitch's 128 (rdna4-mtltex3d, 2026-11-04)
@@ -1810,8 +1970,13 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		if (drawing(task, id))   // copied by the CPU: what draws in flight put into it first
 			waitDraws();
 
+		const uint64_t copyFrom = nowNs();
+
 		for (; y < h * depth && ok; y++)
 			ok = readTextureRow(task, src, y, copy + (y / h) * slice + static_cast<uint64_t>(y % h) * texPitch, w * fm->bpp);
+
+		mCopyNs += nowNs() - copyFrom;
+		mCopiedBytes += static_cast<uint64_t>(w) * fm->bpp * h * depth;
 
 		if (!ok && copy)
 			step = "its rows";
@@ -1845,7 +2010,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		out[k].pitch = texPitch;
 		out[k].rowLen = w * fm->bpp;
 		out[k].height = h;
-		out[k].writable = (usage & 2) && src.type == 2 && depth == 1;   // MTLTextureUsageShaderWrite; not read-only (type 3), IOSurface or 3D
+		out[k].writable = writes && (usage & 2) && src.type == 2 && depth == 1;   // MTLTextureUsageShaderWrite; not read-only (type 3), IOSurface or 3D
 		if (array1d)
 			linearArray1d(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, depth);
 		else if (depth > 1)
@@ -1880,14 +2045,317 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 	return ok;
 }
 
+// The shadow of a texture with this key, or nullptr.
+RDNA4PvHost::Shadow *RDNA4PvHost::findShadow(const ShadowKey &k)
+{
+	for (Shadow &s : mShadows) {
+		const bool same = s.handle && s.surface == k.surface && (k.surface || s.task == k.task) && s.at == k.at && s.rowBytes == k.rowBytes &&
+		                  s.width == k.width && s.height == k.height && s.depth == k.depth && s.bpp == k.bpp && s.imageBytes == k.imageBytes;
+
+		if (same)
+			return &s;
+	}
+
+	return nullptr;
+}
+
+// Whether a shadow still holds what the guest has: not written since by anyone but the card through it, the surface's lock seeds where it
+// has them, and not older than kShadowAge (a write the host does not see: a guest texture the CPU wrote, a surface written without a lock).
+bool RDNA4PvHost::shadowCurrent(const Shadow &s) const
+{
+	if (mHeld.active && mHeld.shadow == &s)
+		return true;
+
+	const bool locked = s.surface && (gSurfaceFns.lockSeed(s.surface) != s.lockSeed || gSurfaceFns.unlockSeed(s.surface) != s.unlockSeed);
+	const int stale = !s.valid ? 0 : nowNs() - s.when >= kShadowAge ? 1 : locked ? 2 : -1;
+
+	if (stale >= 0)
+		const_cast<uint32_t &>(mStale[stale])++;
+
+	return stale < 0;
+}
+
+// A shadow for this key in place of the least recently used one, its buffer `pitch` bytes a row; nothing in it yet (valid false).
+RDNA4PvHost::Shadow *RDNA4PvHost::makeShadow(const ShadowKey &k)
+{
+	// as the card reads them: rows 128 bytes apart; a 3D image's or an array's slices `height` rows of the row's bytes aligned to 256
+	// (rdna4-mtltex3d, 2026-11-04)
+	const uint32_t pitch = (k.width * k.bpp + 127) & ~127u;
+	const uint64_t slice = k.depth > 1 ? static_cast<uint64_t>((k.width * k.bpp + 255) & ~255u) * k.height : static_cast<uint64_t>(pitch) * k.height;
+	const uint64_t bytes = slice * k.depth;
+	Shadow *s = nullptr;
+
+	if (bytes > kShadowMax)
+		return nullptr;
+
+	for (Shadow &e : mShadows) {
+		if (mHeld.active && mHeld.shadow == &e)
+			continue;
+
+		s = !s || e.used < s->used ? &e : s;
+	}
+
+	if (s->handle && s->bytes < bytes)
+		freeShadow(*s);
+
+	// within the budget: the least recently used ones' memory given back
+	while (mShadowBytes + (s->handle ? 0 : bytes) > kShadowBudget) {
+		Shadow *old = nullptr;
+
+		for (Shadow &e : mShadows)
+			if (e.handle && &e != s && !(mHeld.active && mHeld.shadow == &e))
+				old = !old || e.used < old->used ? &e : old;
+
+		if (!old)
+			break;
+
+		freeShadow(*old);
+	}
+
+	if (s->handle && !shadowIdle(*s))
+		waitDraws();   // draws in flight may read it
+
+	if (!s->handle) {
+		uint64_t cpu = 0;
+
+		if (gCompute->rtAllocHost(this, kernel_task, bytes, 0, s->handle, s->gpu, cpu) != kIOReturnSuccess) {
+			s->handle = 0;
+
+			return nullptr;
+		}
+
+		s->cpu = reinterpret_cast<uint8_t *>(cpu);
+		s->bytes = bytes;
+		mShadowBytes += bytes;
+	}
+
+	if (k.surface)
+		k.surface->retain();
+
+	if (s->surface)
+		s->surface->release();
+
+	s->surface = k.surface;
+	s->task = k.task;
+	s->at = k.at;
+	s->rowBytes = k.rowBytes;
+	s->width = k.width;
+	s->height = k.height;
+	s->depth = k.depth;
+	s->bpp = k.bpp;
+	s->imageBytes = k.imageBytes;
+	s->pitch = pitch;
+	s->slice = slice;
+	s->valid = false;
+	s->used = ++mShadowClock;
+	mShadowsMade++;
+
+	return s;
+}
+
+// The guest's rows copied into the shadow (after the draws in flight: one may write them); its seeds and time noted.
+bool RDNA4PvHost::fillShadow(Shadow &s, IOMemoryDescriptor *memory, bool written)
+{
+	const uint64_t from = nowNs();
+	const uint32_t rowLen = s.width * s.bpp;
+	bool ok = true;
+
+	if (written || !shadowIdle(s))
+		waitDraws();   // a draw in flight writes the texture, or reads the shadow
+
+	if (s.surface) {
+		s.lockSeed = gSurfaceFns.lockSeed(s.surface);
+		s.unlockSeed = gSurfaceFns.unlockSeed(s.surface);
+	}
+
+	for (uint32_t y = 0; y < s.height * s.depth && ok; y++) {
+		uint8_t *row = s.cpu + (y / s.height) * s.slice + static_cast<uint64_t>(y % s.height) * s.pitch;
+		const uint64_t at = s.at + (y / s.height) * s.imageBytes + static_cast<uint64_t>(y % s.height) * s.rowBytes;
+
+		ok = memory ? memory->readBytes(at, row, rowLen) == rowLen : readGuest(s.task, at, row, rowLen);
+	}
+
+	__sync_synchronize();   // seen by the card (snooped) before the submit
+	mCopyNs += nowNs() - from;
+	mCopiedBytes += static_cast<uint64_t>(rowLen) * s.height * s.depth;
+	s.valid = ok;
+	s.when = nowNs();
+
+	return ok;
+}
+
+// A texture the card cannot read in place, read from its shadow: the one kept while it holds what the guest has, else filled anew.
+bool RDNA4PvHost::shadowTexture(uint32_t task, uint32_t id, const TextureSource &src, uint32_t bpp, uint64_t &gpu, uint32_t &pitch)
+{
+	const Surface &sf = src.surface;
+	const uint32_t depth = src.depth > 1 ? src.depth : 1;
+	const ShadowKey key = {sf.surface, task, sf.memory ? sf.base : src.va, src.rowBytes, src.width, src.height, depth, bpp,
+	                       depth > 1 ? src.imageBytes : static_cast<uint64_t>(src.rowBytes) * src.height};
+	Shadow *s = findShadow(key);
+
+	if (s && shadowCurrent(*s)) {
+		mCopiesReused++;
+	} else {
+		s = s ? s : makeShadow(key);
+
+		if (!s || !fillShadow(*s, sf.memory, drawing(task, id)))
+			return false;
+	}
+
+	s->used = ++mShadowClock;
+	s->serial = mDrawSerial + 1;
+	gpu = s->gpu;
+	pitch = s->pitch;
+
+	return true;
+}
+
+// Shadows of what the guest's memory now holds differently: of this surface or task's texture at `at` (any when `all`).
+void RDNA4PvHost::dropShadows(const OSObject *surface, uint32_t task, uint64_t at, bool all)
+{
+	for (Shadow &s : mShadows) {
+		if (mHeld.active && mHeld.shadow == &s)
+			continue;
+
+		if (all || (s.surface == surface && (surface || s.task == task) && s.at == at))
+			s.valid = false;
+	}
+}
+
+// Guest textures' shadows within [va, va + bytes) of a task's memory, written by a blit or a dispatch.
+void RDNA4PvHost::dropShadowRange(uint32_t task, uint64_t va, uint64_t bytes)
+{
+	for (Shadow &s : mShadows) {
+		const uint64_t end = s.at + s.imageBytes * s.depth;
+
+		if (!s.surface && s.task == task && s.at < va + bytes && va < end && !(mHeld.active && mHeld.shadow == &s))
+			s.valid = false;
+	}
+}
+
+// Whether no draw in flight reads the shadow: none since it was last read, or more than kInFlight since (all of those were waited for
+// on the way: never more than kInFlight are in flight).
+bool RDNA4PvHost::shadowIdle(const Shadow &s) const
+{
+	return !mPending || (s.serial <= mDrawSerial && mDrawSerial - s.serial >= kInFlight);
+}
+
+// A shadow's memory given back (after the draws that read it).
+void RDNA4PvHost::freeShadow(Shadow &s)
+{
+	if (!s.handle)
+		return;
+
+	if (!shadowIdle(s))
+		waitDraws();
+
+	gCompute->rtFree(this, s.handle);
+	mShadowBytes -= s.bytes;
+	mShadowsFreed++;
+	s.handle = 0;
+	s.cpu = nullptr;
+	s.bytes = 0;
+	s.valid = false;
+}
+
+// The target held for this draw (true): its shadow, filled when it does not hold what the guest has; whatever was held before written
+// back first.
+bool RDNA4PvHost::holdTarget(uint32_t task, uint32_t target, uint64_t va, const Surface &surface, uint32_t width, uint32_t height,
+                             uint32_t bpr, uint32_t tp)
+{
+	HeldTarget &h = mHeld;
+	const uint64_t at = surface.memory ? surface.base : va;
+
+	const ShadowKey key = {surface.surface, task, at, bpr, width, height, 1, tp, static_cast<uint64_t>(bpr) * height};
+
+	if (h.active && h.task == task && h.target == target && h.shadow == findShadow(key))
+		return true;
+
+	flushHeld();
+
+	Shadow *s = findShadow(key);
+
+	if (!s || !shadowCurrent(*s)) {
+		s = s ? s : makeShadow(key);
+
+		if (!s || !fillShadow(*s, surface.memory, drawing(task, target)))
+			return false;
+	}
+
+	if (surface.memory && surface.memory->prepare() != kIOReturnSuccess)
+		return false;
+
+	if (surface.memory)
+		surface.memory->retain();
+
+	s->used = ++mShadowClock;
+	s->serial = ~0ull;   // read and written by draws until written back
+	h = {true, task, target, s, surface.memory, height, 0};
+
+	return true;
+}
+
+// The held target's drawn rows written back, after the draws into it; its shadow then holds what the guest has, and nothing is held.
+void RDNA4PvHost::flushHeld()
+{
+	HeldTarget &h = mHeld;
+
+	if (!h.active)
+		return;
+
+	Shadow &s = *h.shadow;
+	const uint32_t rowLen = s.width * s.bpp;
+
+	h.active = false;
+
+	if (h.top < h.bottom)
+		waitDraws();
+
+	for (uint32_t y = h.top; y < h.bottom; y++) {
+		const uint8_t *row = s.cpu + static_cast<uint64_t>(y) * s.pitch;
+		const uint64_t at = s.at + static_cast<uint64_t>(y) * s.rowBytes;
+
+		if (h.memory)
+			h.memory->writeBytes(at, row, rowLen);
+		else
+			copyGuest(s.task, at, const_cast<uint8_t *>(row), rowLen, true);
+	}
+
+	if (h.memory) {
+		h.memory->complete();
+		h.memory->release();
+	}
+
+	h.memory = nullptr;
+	s.valid = true;
+	s.when = nowNs();
+	s.serial = mDrawSerial;
+
+	if (s.surface) {   // as they are now: written back by the host, not by a lock
+		s.lockSeed = gSurfaceFns.lockSeed(s.surface);
+		s.unlockSeed = gSurfaceFns.unlockSeed(s.surface);
+	}
+}
+
 // `bytes` of a task's GPU address space from `va` at a GPU VA of the host's runtime client, in place (the guest's pages are the card's to read:
 // no IOMMU on the rig, bus = physical). The GPU address is `va`'s within its page.
 bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	const uint64_t first = va & ~0xfffull, count = (va + bytes + 0xfff - first) >> 12;
+
+	if (const Mapping *m = keyedMapping(nullptr, task, first, count)) {
+		handle = 0;
+		gpu = m->gpu + (va & 0xfff);
+
+		return true;
+	}
+
 	auto *pages = count && count <= (256u << 8) ? static_cast<uint64_t *>(IOMalloc(count * 8)) : nullptr;
 	bool ok = pages != nullptr;
+	Mapping *entry = nullptr;
 
-	ok = ok && guestPages(task, first, count, pages) && mapPages(pages, count, handle, gpu);
+	ok = ok && guestPages(task, first, count, pages) && mapPages(pages, count, handle, gpu, &entry);
+	if (ok)
+		keyMapping(entry, nullptr, task, first);
 	if (pages)
 		IOFree(pages, count * 8);
 	gpu += ok ? va & 0xfff : 0;
@@ -1898,18 +2366,33 @@ bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t 
 // The same for `bytes` of a prepared memory descriptor (an IOSurface's) from `offset`, which must be 256-byte aligned (an image's base).
 bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	const uint64_t first = offset & ~0xfffull, count = (offset + bytes + 0xfff - first) >> 12;
+
+	if (const Mapping *m = !(offset & 0xff) ? keyedMapping(memory, 0, first, count) : nullptr) {
+		handle = 0;
+		gpu = m->gpu + (offset & 0xfff);
+
+		return true;
+	}
+
+	Mapping *entry = nullptr;
 	auto *pages = !(offset & 0xff) && count && count <= (256u << 8) ? static_cast<uint64_t *>(IOMalloc(count * 8)) : nullptr;
 	bool ok = pages != nullptr;
 
-	for (uint64_t i = 0; i < count && ok; i++) {
+	// A segment at a time: a call a page was 3600 calls for a 2560x1440 target, each draw that wrote or read it.
+	for (uint64_t i = 0; i < count && ok;) {
 		IOByteCount length = 0;
 		const addr64_t phys = memory->getPhysicalSegment(first + (i << 12), &length, kIOMemoryMapperNone);
 
-		pages[i] = phys;
 		ok = phys && !(phys & 0xfff) && length;
+
+		// physical memory breaks only at page boundaries: a segment ending inside a page ends where the descriptor does
+		for (uint64_t p = 0; ok && p < (length + 0xfff) >> 12 && i < count; p++, i++)
+			pages[i] = phys + (p << 12);
 	}
 
-	ok = ok && mapPages(pages, count, handle, gpu);
+	ok = ok && mapPages(pages, count, handle, gpu, &entry);
+	if (ok)
+		keyMapping(entry, memory, 0, first);
 	if (pages)
 		IOFree(pages, count * 8);
 	gpu += ok ? offset & 0xfff : 0;
@@ -1919,7 +2402,7 @@ bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_
 
 // `count` pages at a GPU VA, from the cache of mappings when the same pages are mapped already (`handle` then 0: the cache keeps the mapping),
 // else mapped anew in place of the least recently used one (`handle` 0 too: the cache owns every mapping it hands out).
-bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &handle, uint64_t &gpu) {
+bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &handle, uint64_t &gpu, Mapping **entry) {
 	Mapping *lru = &mMap[0];
 
 	handle = 0;
@@ -1929,6 +2412,8 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 		if (m.count == count && !memcmp(m.pages, pages, count * 8)) {
 			m.used = mMapClock;
 			gpu = m.gpu;
+			if (entry)
+				*entry = &m;
 			return true;
 		}
 		lru = m.used < lru->used ? &m : lru;
@@ -1953,6 +2438,8 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 	}
 
 	mMapNs += nowNs() - from;
+	mMapMisses++;
+	mMapPages += count;
 	if (!ok) {
 		if (copy)
 			IOFree(copy, count * 8);
@@ -1966,6 +2453,8 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 	dropMapping(*lru);
 	memcpy(copy, pages, count * 8);
 	*lru = {copy, count, h, gpu, mMapClock};
+	if (entry)
+		*entry = lru;
 
 	return true;
 }
@@ -1975,7 +2464,46 @@ void RDNA4PvHost::dropMapping(Mapping &m) {
 		gCompute->rtFree(this, m.handle);
 	if (m.pages)
 		IOFree(m.pages, m.count * 8);
+	if (m.memory)
+		m.memory->release();
 	m = {};
+}
+
+// The cached mapping with this key and current generation, or nullptr. `memory` keys an IOSurface's pages, else `task` with its VA.
+RDNA4PvHost::Mapping *RDNA4PvHost::keyedMapping(const void *memory, uint32_t task, uint64_t first, uint64_t count)
+{
+	const uint64_t gen = memory ? 0 : mPtGen[task & 63];
+
+	for (Mapping &m : mMap) {
+		if (!m.keyed || m.memory != memory || m.first != first || m.count != count)
+			continue;
+
+		if (memory || (m.task == task && m.gen == gen)) {
+			m.used = ++mMapClock;
+
+			return &m;
+		}
+	}
+
+	return nullptr;
+}
+
+void RDNA4PvHost::keyMapping(Mapping *m, IOMemoryDescriptor *memory, uint32_t task, uint64_t first)
+{
+	if (!m)
+		return;
+
+	if (memory)
+		memory->retain();
+
+	if (m->memory)
+		m->memory->release();
+
+	m->memory = memory;
+	m->task = task;
+	m->first = first;
+	m->gen = memory ? 0 : mPtGen[task & 63];
+	m->keyed = true;
 }
 
 // The textures stageTextures put in the runtime freed; with copyBack, the writable ones (MTLTextureUsageShaderWrite) first copied back into the
@@ -1995,6 +2523,8 @@ bool RDNA4PvHost::releaseTextures(uint32_t task, StagedTexture (&staged)[16], bo
 
 			for (uint32_t y = 0; y < st.height && ok; y++)
 				ok = copyGuest(task, st.va + static_cast<uint64_t>(y) * st.rowBytes, copy + static_cast<uint64_t>(y) * st.pitch, st.rowLen, true);
+
+			dropShadowRange(task, st.va, static_cast<uint64_t>(st.rowBytes) * st.height);
 			if (copy && !st.cpu)
 				IOFree(copy, bytes);
 
@@ -2174,33 +2704,85 @@ static bool ownsMemory(const RDNA4PvHost::StagedTexture (&staged)[2][16], const 
 	return false;
 }
 
-void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *bound) {
-	// A draw takes the card 6 ms at most; any of WindowServer's draws hangs it now and then (about every 8 s, any shader, also with clock
-	// gating off; cause open), and each held all drawing until the wait gave up and the ring was reset: 2 s, then 250 ms were visible stalls.
-	static constexpr uint32_t kDrawWait = 50;   // ms
-	const uint32_t count = draw.count;
-	const bool talk = (mDrawLines[task & 63] < 40 && ++mDrawLines[task & 63]) || gTalk;
-	// The pipeline: {16-byte header, u8 n, n x {u8 key, u8 size, value}}: key 1 the vertex function, key 2 the fragment function (measured).
+const RDNA4PvHost::PipelineInfo &RDNA4PvHost::pipelineInfo(uint32_t task, uint32_t pipeline)
+{
+	uint32_t rec[3] = {}, fnRec[3][3] = {};
 	uint64_t pd[8] = {};
 	uint32_t pbytes = 0, fn[3] = {};
+
+	readGuest(task, 0x1000 + 12ull * pipeline, reinterpret_cast<uint8_t *>(rec), sizeof(rec));
+
+	// The pipeline: {16-byte header, u8 n, n x {u8 key, u8 size, value}}: key 1 the vertex function, key 2 the fragment function (measured).
 	if (resourceType(task, pipeline, pd, &pbytes) == 7 && pbytes >= 17) {
 		const auto *pb = reinterpret_cast<const uint8_t *>(pd);
+
 		for (uint32_t k = 0, at = 17; k < pb[16] && at + 2 <= pbytes; k++, at += 2 + pb[at + 1])
 			if (pb[at] >= 1 && pb[at] <= 2 && pb[at + 1] == 4 && at + 6 <= pbytes)
 				memcpy(&fn[pb[at]], pb + at + 2, 4);
 	}
-	// Colour attachment 0's blend state, from the pipeline's descriptor (readBlendState, pvdraw.hpp).
-	// And its vertex descriptor as the vertex stage's attribute records (pvdraw.hpp, include/rdna4mtlc.h).
-	uint32_t blend[10], attributes[RDNA4_MTLC_MAX_ATTRIBUTES][4], skippedAttributes[RDNA4_MTLC_MAX_ATTRIBUTES] = {};
-	bool attributesKnown;
-	{
-		static uint8_t pb[1024];   // ponytail: one host, draws run one at a time on its work loop
-		uint32_t rec[3];
-		const uint32_t len = readGuest(task, 0x1000 + 12ull * pipeline, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) ? rec[0] >> 8 : 0;
-		const uint32_t got = len >= 17 && len <= sizeof(pb) && readGuest(task, rec[1], pb, len) ? len : 0;
-		readBlendState(pb, got, blend);
-		attributesKnown = readVertexDescriptor(pb, got, attributes, skippedAttributes);
+
+	for (unsigned k = 1; k <= 2; k++)
+		if (fn[k] && fn[k] <= 0x10000)
+			readGuest(task, 0x1000 + 12ull * fn[k], reinterpret_cast<uint8_t *>(fnRec[k]), sizeof(fnRec[k]));
+
+	PipelineInfo *lru = &mPipelines[0];
+
+	for (PipelineInfo &e : mPipelines) {
+		const bool same = e.valid && e.task == task && e.pipeline == pipeline && !memcmp(e.rec, rec, sizeof(rec)) && !memcmp(e.pd, pd, sizeof(pd)) &&
+		                  !memcmp(e.fnRec, fnRec, sizeof(fnRec));
+
+		if (same) {
+			e.used = ++mPipelineClock;
+
+			return e;
+		}
+
+		lru = e.used < lru->used ? &e : lru;
 	}
+
+	PipelineInfo &e = *lru;
+
+	e = {};
+	e.task = task;
+	e.pipeline = pipeline;
+	memcpy(e.rec, rec, sizeof(rec));
+	memcpy(e.pd, pd, sizeof(pd));
+	memcpy(e.fnRec, fnRec, sizeof(fnRec));
+	memcpy(e.fn, fn, sizeof(fn));
+
+	// Colour attachment 0's blend state, from the pipeline's descriptor (readBlendState, pvdraw.hpp), and its vertex descriptor as the
+	// vertex stage's attribute records (pvdraw.hpp, include/rdna4mtlc.h).
+	static uint8_t pb[1024];   // ponytail: one host, draws run one at a time on its work loop
+	const uint32_t len = rec[0] >> 8;
+	const uint32_t got = len >= 17 && len <= sizeof(pb) && readGuest(task, rec[1], pb, len) ? len : 0;
+
+	readBlendState(pb, got, e.blend);
+	e.attributesKnown = readVertexDescriptor(pb, got, e.attributes, e.skipped);
+
+	for (unsigned k = 1; k <= 2; k++)
+		e.named[k] = fn[k] && functionName(task, fn[k], e.name[k], sizeof(e.name[k]), e.hash[k], &e.lib[k]);
+
+	e.valid = true;
+	e.used = ++mPipelineClock;
+
+	return e;
+}
+
+void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *bound) {
+	// A draw takes the card 6 ms at most; any of WindowServer's draws hangs it now and then (about every 8 s, any shader, also with clock
+	// gating off; cause open), and each held all drawing until the wait gave up and the ring was reset: 2 s, then 250 ms were visible stalls.
+	static constexpr uint32_t kDrawWait = 50;   // ms
+	const uint64_t drawFrom = nowNs();
+	const uint32_t count = draw.count;
+	const bool talk = (mDrawLines[task & 63] < 40 && ++mDrawLines[task & 63]) || gTalk;
+	const PipelineInfo &pi = pipelineInfo(task, pipeline);
+	const uint32_t (&fn)[3] = pi.fn, (&blend)[10] = pi.blend;
+	uint32_t attributes[RDNA4_MTLC_MAX_ATTRIBUTES][4];
+	const uint32_t (&skippedAttributes)[RDNA4_MTLC_MAX_ATTRIBUTES] = pi.skipped;
+	const bool attributesKnown = pi.attributesKnown;
+
+	memcpy(attributes, pi.attributes, sizeof(attributes));
+
 	const char *why = !fn[1] || !fn[2] ? "the pipeline has no vertex or no fragment function"
 	                : !attributesKnown ? "the pipeline's vertex descriptor is not understood"
 	                : draw.type > 4 ? "an unknown primitive type"
@@ -2210,9 +2792,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const Jit *shader[3] = {};
 	char name[3][64] = {};
 	for (unsigned k = 1; k <= 2 && !why; k++) {
-		uint8_t hash[32];
-		uint64_t lib = 0;
-		shader[k] = functionName(task, fn[k], name[k], sizeof(name[k]), hash, &lib) ? translated(task, lib, name[k], hash) : nullptr;
+		memcpy(name[k], pi.name[k], sizeof(name[k]));
+		shader[k] = pi.named[k] ? translated(task, pi.lib[k], name[k], pi.hash[k]) : nullptr;
 		// The RGFX header: {"RGFX", u32 stage, u32 code bytes, ...}; the code must fit its slot with room for the prefetch.
 		const auto *head = shader[k] && shader[k]->gfx && shader[k]->gfxLen >= 32 ? reinterpret_cast<const uint32_t *>(shader[k]->gfx) : nullptr;
 		const uint32_t room = (k == 1 ? RDNA4_TRI_PS_OFFSET : RDNA4_TRI_CODE_BYTES - RDNA4_TRI_PS_OFFSET) - 4 * RDNA4_TRI_SHADER_PAD;
@@ -2246,6 +2827,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			why = "a fragment input the vertex function does not write";
 		inputCntl[k] = slot | (in[1] & 1) << 10;   // OFFSET, FLAT_SHADE
 	}
+	const uint64_t targetAt = nowNs();
+
+	mPhaseNs[4] += targetAt - drawFrom;
 	// The colour attachment: a linear 32-bit or RGBA16Float texture, or a BGRA8 IOSurface (surfaceRange; its rows width * 4 bytes, bpr apart).
 	uint64_t va = 0, len = 0;
 	uint32_t bpr = 0, width = 0, height = 0;
@@ -2284,6 +2868,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	      vw > 0 && vh > 0 && vw <= 32768 && vh <= 32768 && vx > -32768 && vx < 32768 && vy > -32768 && vy < 32768))
 		why = "a viewport not in whole pixels, or too large (so far)";
 	if (why) {
+		noteNotRun(why, name[2]);
 		if (talk)
 			pvlog("host: render: draw of %u vertices (type %u) with pipeline %u: %s: not run", count, draw.type, pipeline, why);
 		return;
@@ -2299,6 +2884,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint32_t tp = half ? 8 : 4;   // bytes a pixel
 	const bool inPlace = (gInPlace & 2) && !(bpr % 128) && !((surface.memory ? surface.base : va) & 0xff);
 	const uint32_t pitch = inPlace ? bpr / tp : (width * tp + 127) / 128 * 128 / tp;   // pixels; staged: a multiple of 128 bytes
+
 	const uint64_t targetBytes = static_cast<uint64_t>(pitch) * height * tp;
 	// Only the scissor rectangle's rows are staged in and out (WindowServer limits most draws to what changed): nothing outside it is drawn.
 	const uint64_t regionAt = static_cast<uint64_t>(pitch) * sy * tp, regionBytes = static_cast<uint64_t>(pitch) * (sy2 - sy) * tp;
@@ -2330,19 +2916,31 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	GfxBuffers tgt {};
 	uint8_t *pooledTarget = nullptr;
 
+	if (inPlace)
+		flushHeld();   // another target: what was held is written back for the draws that read it
+
+	const bool held = !inPlace && mRtOpen && !(gInPlace & 16) && holdTarget(task, target, va, surface, width, height, bpr, tp);
+
+	if (!held)   // drawn otherwise: no shadow of it holds what the guest will have
+		dropShadows(surface.surface, task, surface.memory ? surface.base : va);
+
 	readyDraws();
 
 	// this draw's state page and IB
 	const uint32_t slot = mSlot++;
 	const uint64_t slotAt = static_cast<uint64_t>(slot) * RDNA4_TRIRUN_PAGE;
 
-	const bool pooled = !inPlace && mRtOpen && poolTake(targetBytes, tgt.gpu, pooledTarget);
+	const bool staged = !inPlace && !held;
+	const bool pooled = staged && mRtOpen && poolTake(targetBytes, tgt.gpu, pooledTarget);
 	uint32_t *stage = nullptr;
 
 	if (pooled)
 		stage = reinterpret_cast<uint32_t *>(pooledTarget + regionAt);
-	else if (!inPlace)
+	else if (staged)
 		stage = static_cast<uint32_t *>(IOMalloc(regionBytes));
+
+	if (held)
+		tgt.gpu = mHeld.shadow->gpu;
 
 	// The target for the card: the guest's memory mapped (in place), the pool, or a runtime buffer of its own.
 	auto placeTarget = [&]() {
@@ -2354,10 +2952,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		if (inPlace)
 			return mapGuest(task, va, bytes, tgt.handle, tgt.gpu);
 
-		return pooled || gCompute->rtAlloc(this, targetBytes, tgt.handle, tgt.gpu) == kIOReturnSuccess;
+		return held || pooled || gCompute->rtAlloc(this, targetBytes, tgt.handle, tgt.gpu) == kIOReturnSuccess;
 	};
 	const uint64_t ringBytes = rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK;
-	bool ok = mRtOpen && (inPlace || stage) && make(mGfxCode, RDNA4_TRI_CODE_BYTES * kCodeSlots) && make(mGfxRings, ringBytes);
+	bool ok = mRtOpen && (!staged || stage) && make(mGfxCode, RDNA4_TRI_CODE_BYTES * kCodeSlots) && make(mGfxRings, ringBytes);
 
 	ok = ok && makeHost(mGfxMisc, RDNA4_TRIRUN_PAGE * kSlots) && makeHost(mGfxIb, RDNA4_TRIRUN_PAGE * kSlots) && makeSpare(mGfxSpare);
 	ok = ok && rdna4_trirun_rings_fit(mGfxRings.gpu, ringBytes, rdna4_tri_ring_bytes()) && placeTarget();
@@ -2394,7 +2992,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x76, 0x0a, ps[3]}, {0x76, 0x0b, ps[4]},                          // SPI_SHADER_PGM_RSRC1_PS, RSRC2_PS
 		{0x69, 0x197, ps[5]}, {0x69, 0x198, ps[6]},                        // SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR
 		{0x69, 0x31e, (pitch - 1) << 16 | (height - 1)},                    // CB_COLOR0_ATTRIB2: MIP0_WIDTH (the pitch), MIP0_HEIGHT
-		{0x69, 0x3b0, half ? 0x0002070cu : inPlace && bgra ? 0x0002880au : 0x0002800au},   // CB_COLOR0_INFO: 8_8_8_8 unorm (COMP_SWAP ALT: BGRA8), or 16_16_16_16 float
+		{0x69, 0x3b0, half ? 0x0002070cu : (inPlace || held) && bgra ? 0x0002880au : 0x0002800au},   // CB_COLOR0_INFO: 8_8_8_8 unorm (COMP_SWAP ALT: BGRA8), or 16_16_16_16 float
 		{0x69, 0x82, (width - 1) | (height - 1) << 16},                    // PA_SC_WINDOW_SCISSOR_BR: inclusive on gfx12
 		{0x69, 0x94, sx | sy << 16},                                       // PA_SC_VPORT_SCISSOR_0_TL, _BR: Metal's scissor rectangle, BR inclusive
 		{0x69, 0x95, (sx2 - 1) | (sy2 - 1) << 16},
@@ -2450,15 +3048,25 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			misc[bufferSlot(st, k)] = ok ? base[st][k] + bound[st].offset[k] : 0;
 		}
 	memcpy(&misc[(0x400 + RDNA4_MTLC_TABLE_ATTRIBUTES) / 8], attributes, sizeof(attributes));
-	StagedTexture staged[2][16] = {};
+	mPhaseNs[5] += nowNs() - targetAt;
+	StagedTexture stagedTextures[2][16] = {};
 	const uint64_t texturesFrom = nowNs();
 	for (unsigned st = 0; st < 2 && ok; st++)
-		ok = stageTextures(task, bound[st], reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]), staged[st], talk, st ? "fragment" : "vertex");
+		ok = stageTextures(task, bound[st], reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]), stagedTextures[st], talk, st ? "fragment" : "vertex",
+		                   st && noColour);
 	mPhaseNs[0] += nowNs() - texturesFrom;
+
+	// The colour attachment bound as a texture too (CoreAnimation reads the layer it draws into): its copy holds the attachment from
+	// before the draw. Copied back after the attachment, it put the old pixels over the draw's: the Dock's menus lost their text.
+	for (auto &stageTextures : stagedTextures)
+		for (StagedTexture &st : stageTextures)
+			if (st.writable && !surface.memory && st.va >= va && st.va < va + len)
+				st.writable = false;
+
 	// Colour attachment 0 as the draw finds it, for fragment shaders that read it (Metal's [[color(0)]]; RDNA4_MTLC_TABLE_FRAMEBUFFER): a T# of
 	// the staged RGBA8 target. ponytail: a pixel the same draw covers twice reads the value from before the draw, not its first write.
 	linearImage(reinterpret_cast<uint32_t *>(&misc[(0x800 + RDNA4_MTLC_TABLE_FRAMEBUFFER) / 8]), tgt.gpu, half ? 57 : 42,
-	            inPlace && bgra ? 6 | 5 << 3 | 4 << 6 | 7 << 9 : 4 | 5 << 3 | 6 << 6 | 7 << 9, width, height, pitch);   // 8_8_8_8 unorm: RGBA
+	            (inPlace || held) && bgra ? 6 | 5 << 3 | 4 << 6 | 7 << 9 : 4 | 5 << 3 | 6 << 6 | 7 << 9, width, height, pitch);   // 8_8_8_8 unorm: RGBA
 	if (!ok && talk)
 		pvlog("host: render: draw with pipeline %u: a texture or sampler could not be set up: not run", pipeline);
 
@@ -2583,7 +3191,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	uint64_t afterFence = 0;
 	// The attachment in (BGRA8 rows -> RGBA8 at the target's pitch), the draw, the attachment out; in place only the draw.
 	auto swap = [&]() {
-		for (uint64_t i = 0; bgra && !inPlace && i < regionBytes / 4; i++)
+		for (uint64_t i = 0; bgra && staged && i < regionBytes / 4; i++)
 			stage[i] = (stage[i] & 0xff00ff00u) | (stage[i] >> 16 & 0xff) | (stage[i] & 0xff) << 16;
 	};
 	auto row = [&](uint32_t y) { return reinterpret_cast<uint8_t *>(stage) + static_cast<uint64_t>(y - sy) * pitch * tp; };
@@ -2596,10 +3204,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		return kIOReturnSuccess;
 	};
-	if (ok && !inPlace && drawing(task, target))
+	if (ok && staged && drawing(task, target))
 		waitDraws();
 
-	for (uint32_t y = sy; y < sy2 && ok && !inPlace; y++)
+	for (uint32_t y = sy; y < sy2 && ok && staged; y++)
 		ok = surface.memory ? surface.memory->readBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
 		                    : readGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * tp);
 	uint64_t fence = 0, ns = 0;
@@ -2611,12 +3219,13 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		swap();
 		// each step's result, so that a draw that fails says where
 		const char *step = "target in";
-		IOReturn r = inPlace || pooled ? kIOReturnSuccess
+		IOReturn r = !staged || pooled ? kIOReturnSuccess
 		                               : gCompute->rtCopy(this, tgt.handle, regionAt, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), regionBytes, true);
 
 		if (r == kIOReturnSuccess && newCode) {
 			waitDraws();   // a draw in flight may run the pair this slot held
 			step = "code in";
+			mCodeIns++;
 			r = gCompute->rtCopy(this, mGfxCode.handle, codeAt, kernel_task, reinterpret_cast<mach_vm_address_t>(code), sizeof(code), true);
 			mCode[pair].valid = r == kIOReturnSuccess;
 		}
@@ -2637,11 +3246,12 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		if (r == kIOReturnSuccess) {
 			step = "submit";
 			r = submitGfx(ibGpu, total, fence);
+			mDrawSerial += r == kIOReturnSuccess;
 		}
 
 		// Waited for now when the CPU has to finish the draw (a staged target or texture to copy back, a runtime buffer to free), else left
 		// in flight with those before it.
-		const bool sync = !inPlace || indexHandle || ownsMemory(staged, handle);
+		const bool sync = staged || indexHandle || ownsMemory(stagedTextures, handle);
 
 		if (r == kIOReturnSuccess && !sync) {
 			mPhaseNs[1] += nowNs() - targetFrom;
@@ -2665,7 +3275,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			mDirtyCount = 0;
 		}
 
-		if (r == kIOReturnSuccess && !inPlace && !pooled) {
+		if (r == kIOReturnSuccess && staged && !pooled) {
 			step = "target out";
 			r = gCompute->rtCopy(this, tgt.handle, regionAt, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), regionBytes, false);
 		}
@@ -2686,7 +3296,12 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	}
 	if (ok) {
 		swap();
-		for (uint32_t y = sy; y < sy2 && ok && !inPlace; y++)
+		if (held) {
+			mHeld.top = sy < mHeld.top ? sy : mHeld.top;
+			mHeld.bottom = sy2 > mHeld.bottom ? sy2 : mHeld.bottom;
+		}
+
+		for (uint32_t y = sy; y < sy2 && ok && staged; y++)
 			ok = surface.memory ? surface.memory->writeBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
 			                    : copyGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * tp, true);
 	}
@@ -2698,11 +3313,13 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 				gCompute->rtFree(this, handle[st][k]);
 	if (indexHandle)
 		gCompute->rtFree(this, indexHandle);
-	for (auto &stageTextures : staged)
+	for (auto &stageTextures : stagedTextures)
 		ok = releaseTextures(task, stageTextures, ok) && ok;   // textures the shaders may write copied back
 	if (stage && !pooled)
 		IOFree(stage, regionBytes);
 	mPhaseNs[3] += nowNs() - (afterFence ? afterFence : targetFrom);
+	if (!ok)
+		noteNotRun("its target, textures, buffers or submission failed", name[2]);
 	if (talk)
 		pvlog("host: render: draw of %u %s x %u (type %u) into texture %u (%ux%u) with \"%s\" and \"%s\" on the card: %s (%llu us); blending %u, "
 		      "colour %u %u %u, alpha %u %u %u, mask 0x%x", count, draw.indexBytes ? "indices" : "vertices", draw.instances, draw.type, target,
@@ -2766,6 +3383,7 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 	if (!gCompute)
 		return;
 
+	flushHeld();
 	waitDraws();   // blits read and write with the CPU and SDMA, after the draws before them
 	uint64_t va = 0, len = 0, va2 = 0, len2 = 0;
 	if (id == 0x132 && bytes >= 24) {
@@ -2777,6 +3395,9 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 		memcpy(&value, p + 20, 4);
 		const bool ok = bufferRange(task, buf, &va, &len) && off <= len && n <= len - off && !(n & 3) && !((va + off) & 3) &&
 		                dmaGuest(task, va + off, 0, (value & 0xff) * 0x01010101u, n);
+
+		if (ok)
+			dropShadowRange(task, va + off, n);   // a texture made from the buffer
 		pvlog("host: blit: fillBuffer buffer %u +0x%llx 0x%llx bytes with 0x%02x on the card: %s", buf, off, n, value & 0xff, ok ? "done" : "NOT done");
 	} else if (id == 0x12d && bytes >= 32) {
 		uint32_t src, dst;
@@ -2788,6 +3409,9 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 		memcpy(&n, p + 24, 8);
 		const bool ok = bufferRange(task, src, &va, &len) && bufferRange(task, dst, &va2, &len2) && so <= len && n <= len - so && dof <= len2 &&
 		                n <= len2 - dof && dmaGuest(task, va2 + dof, va + so, 0, n);
+
+		if (ok)
+			dropShadowRange(task, va2 + dof, n);
 		pvlog("host: blit: copyFromBuffer %u +0x%llx -> %u +0x%llx, 0x%llx bytes on the card: %s", src, so, dst, dof, n, ok ? "done" : "NOT done");
 	} else if (id == 0x12e && bytes >= 88) {
 		// Blit.copyFromTexture {u32 texture, u32 buffer, u64 origin[3], u64 size[3], u64 destination offset, u64 bytes per row, u64 bytes per image,
@@ -2832,6 +3456,10 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 		memcpy(r.origin, p + 56, 24);
 		r.place(p + 80);
 		const bool ok = copyTextureRegion(task, true, tex, buf, r);
+
+		if (textureRange(task, tex, &va2, &len2))
+			dropShadowRange(task, va2, len2);
+
 		pvlog("host: blit: copyFromBuffer %u +0x%llx (%llu bytes per row, %llu per image) -> texture %u (%llux%llux%llu at %llu, %llu, %llu, slice %u, "
 		      "level %u) by rows: %s", buf, r.offset, r.bytesPerRow, r.bytesPerImage, tex, r.size[0], r.size[1], r.size[2], r.origin[0], r.origin[1],
 		      r.origin[2], r.slice, r.level, ok ? "done" : "NOT done");
@@ -3066,10 +3694,10 @@ RDNA4PvHost::Jit &RDNA4PvHost::jitSlot()
 {
 	uint32_t lru = 0;
 
-	if (mJits < 32)
+	if (mJits < kJits)
 		return mJit[mJits++];
 
-	for (uint32_t i = 1; i < 32; i++)
+	for (uint32_t i = 1; i < kJits; i++)
 		if (mJit[i].used < mJit[lru].used)
 			lru = i;
 
@@ -3101,6 +3729,7 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 			IOFree(bytes, size);
 		return nullptr;
 	}
+	mTranslations++;
 	IOLockLock(gTr.lock);
 	gTr.id = ++gTr.seq ? gTr.seq : ++gTr.seq;   // never 0 (0 = no request)
 	gTr.taken = gTr.done = false;
@@ -3202,6 +3831,7 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	uint64_t lib = 0;
 	if (!functionOf(task, pipeline, name, sizeof(name), hash, &lib))
 		return;
+	flushHeld();   // the kernel reads and writes the guest's memory
 	pvlog("host: compute: task %u dispatches \"%s\" (hash %02x%02x%02x%02x%02x%02x%02x%02x...), %llu x %llu x %llu threads in groups of %llu x %llu x %llu",
 	      task, name, hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], size[0], size[1], size[2], size[3], size[4], size[5]);
 	// The kernel: translated now by the helper, else (no helper) from the table of src/mtlkernels.h by name.
@@ -3251,7 +3881,7 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		memset(table, 0, sizeof(table));
 		waitDraws();   // dispatches run alone
 		readyDraws();
-		ok = stageTextures(task, bound, table, staged, true, "kernel") && gCompute->rtAlloc(this, sizeof(table), tableHandle, tableGpu) == kIOReturnSuccess &&
+		ok = stageTextures(task, bound, table, staged, true, "kernel", true) && gCompute->rtAlloc(this, sizeof(table), tableHandle, tableGpu) == kIOReturnSuccess &&
 		     gCompute->rtCopy(this, tableHandle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(table), sizeof(table), true) == kIOReturnSuccess;
 	}
 	uint64_t micros = 0;
@@ -3286,10 +3916,14 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 			pvstat("host: compute: \"%s\" did not finish: not run again this boot", name);
 		}
 	}
-	for (unsigned b = 0; b < nb && ok; b++)
-		if (written & (1u << b))
-			ok = gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], false) == kIOReturnSuccess &&
-			     copyGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b]), true);
+	for (unsigned b = 0; b < nb && ok; b++) {
+		if (!(written & (1u << b)))
+			continue;
+
+		ok = gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], false) == kIOReturnSuccess &&
+		     copyGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b]), true);
+		dropShadowRange(task, va[b], bytes[b]);
+	}
 	for (unsigned b = 0; b < nb; b++)
 		if (handle[b])
 			gCompute->rtFree(this, handle[b]);
@@ -3352,6 +3986,8 @@ void RDNA4PvHost::presentTransaction(const pvstream::FifoCommand &c, const uint8
 
 	const uint32_t port = f[0], surface = c.id == 0x07 ? f[2] : f[1], task = c.id == 0x07 ? f[1] : f[2];
 	const bool ok = PvScanout::present(port, surface, task);
+
+	mPresents += ok;
 
 	if (gTalk)
 		pvlog("host: present: port %u, IOSurface %u (task %u): %s", port, surface, task, ok ? "copied" : "NOT copied");
@@ -3540,12 +4176,28 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	if (now - mDrawStatSince < 5000000000ull)
 		return;
 
-	pvstat("host: render: %u draws in the last %llu ms took %llu ms (the longest %llu ms): textures %llu, target in %llu, card %llu, out %llu ms; "
-	      "%u textures in place, %u copied, mapping %llu ms", mDrawStatCount, (now - mDrawStatSince) / 1000000, mDrawStatNs / 1000000,
-	      mDrawStatMaxNs / 1000000, mPhaseNs[0] / 1000000, mPhaseNs[1] / 1000000, mPhaseNs[2] / 1000000, mPhaseNs[3] / 1000000, mInPlace, mCopied,
-	      mMapNs / 1000000);
+	// two lines: one is cut off at the log's line length
+	pvstat("host: render: %u draws, %u frames in the last %llu ms took %llu ms (the longest %llu ms): textures %llu, target in %llu, card %llu, "
+	      "out %llu, pipeline %llu, target and buffers %llu ms; %u waits, %u shader pairs in, %u translations", mDrawStatCount, mPresents,
+	      (now - mDrawStatSince) / 1000000, mDrawStatNs / 1000000, mDrawStatMaxNs / 1000000, mPhaseNs[0] / 1000000, mPhaseNs[1] / 1000000,
+	      mPhaseNs[2] / 1000000, mPhaseNs[3] / 1000000, mPhaseNs[4] / 1000000, mPhaseNs[5] / 1000000, mWaits, mCodeIns, mTranslations);
+	pvstat("host: render:   %u textures in place, %u copied, mapping %llu ms (%u new, %llu pages), rows %llu ms (%llu KiB, %u copies reused); "
+	      "shadows: %u made, %u freed, %llu MiB; stale %u dropped, %u old, %u locked", mInPlace, mCopied, mMapNs / 1000000, mMapMisses, mMapPages, mCopyNs / 1000000, mCopiedBytes >> 10,
+	      mCopiesReused, mShadowsMade, mShadowsFreed, mShadowBytes >> 20, mStale[0], mStale[1], mStale[2]);
+
+	if (mNotRun)
+		pvstat("host: render:   %u draws not run, the first with \"%s\": %s", mNotRun, mNotRunName, mNotRunWhy);
+
+	mNotRun = 0;
+	mShadowsMade = mShadowsFreed = 0;
+	mStagedLines = 0;
+	memset(mStale, 0, sizeof(mStale));
 	mInPlace = mCopied = 0;
+	mWaits = mCodeIns = mTranslations = mPresents = 0;
 	mMapNs = 0;
+	mMapMisses = 0;
+	mMapPages = mCopiedBytes = mCopyNs = 0;
+	mCopiesReused = 0;
 	memset(mPhaseNs, 0, sizeof(mPhaseNs));
 	mDrawStatSince = now;
 	mDrawStatCount = 0;

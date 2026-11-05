@@ -1407,7 +1407,8 @@ void pluginStart() {
 			"__ZN13IOSurfaceRoot13lookupSurfaceEjP4task", "__ZNK9IOSurface19getMemoryDescriptorEv", "__ZNK9IOSurface14getBytesPerRowEv",
 			"__ZNK9IOSurface8getWidthEv", "__ZNK9IOSurface9getHeightEv", "__ZNK9IOSurface14getPixelFormatEv", "__ZNK9IOSurface13getBaseOffsetEv",
 			"__ZNK9IOSurface12getSurfaceIDEv", "__ZNK9IOSurface13getPlaneCountEv", "__ZNK9IOSurface14getPlaneOffsetEj",
-			"__ZNK9IOSurface19getPlaneBytesPerRowEj", "__ZNK9IOSurface13getPlaneWidthEj", "__ZNK9IOSurface14getPlaneHeightEj"};
+			"__ZNK9IOSurface19getPlaneBytesPerRowEj", "__ZNK9IOSurface13getPlaneWidthEj", "__ZNK9IOSurface14getPlaneHeightEj",
+			"__ZNK9IOSurface11getLockSeedEv", "__ZNK9IOSurface13getUnlockSeedEv"};
 		mach_vm_address_t fn[RDNA4PvNub::kSurfaceFunctions];
 		unsigned found = 0;
 		for (unsigned k = 0; k < RDNA4PvNub::kSurfaceFunctions; k++)

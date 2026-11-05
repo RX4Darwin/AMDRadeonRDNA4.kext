@@ -3373,14 +3373,15 @@ IOReturn RDNA4Compute::rtSubmitGfxIb(const void *owner, uint64_t ibVa, uint64_t 
 	if (!ibVa || (ibVa & 3) || !dwords || dwords > 0xfffffu || flags)
 		return kIOReturnBadArgument;
 	const uint64_t ibBytes = dwords * 4;
-	RtBuffer *containing = nullptr;
-	for (RtBuffer &b : buffers) {
-		if (b.owner != owner || (!b.device && !b.host) || !b.va || ibVa < b.va)
-			continue;
-		const uint64_t offset = ibVa - b.va;
-		if (offset <= b.bytes && ibBytes <= b.bytes - offset) {
-			containing = &b;
-			break;
+	auto contains = [&](const RtBuffer &b) {
+		return b.owner == owner && (b.device || b.host) && b.va && ibVa >= b.va && ibVa - b.va <= b.bytes && ibBytes <= b.bytes - (ibVa - b.va);
+	};
+	// The buffer found last time first: a client submits from the same few buffers, and the slots are many.
+	RtBuffer *containing = c->ibSlot < kBufferSlots && contains(buffers[c->ibSlot]) ? &buffers[c->ibSlot] : nullptr;
+	for (uint32_t i = 0; i < kBufferSlots && !containing; i++) {
+		if (contains(buffers[i])) {
+			containing = &buffers[i];
+			c->ibSlot = i;
 		}
 	}
 	if (!containing)

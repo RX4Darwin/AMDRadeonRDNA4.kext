@@ -65,7 +65,7 @@ public:
 	static void setLateParent(IOService *gpu);
 	// The card's runtime, for running the guest's blits on it (M2; plugin.cpp sets it where the GPU attaches).
 	static void setCompute(RDNA4Compute *compute);
-	static constexpr unsigned kSurfaceFunctions = 13;
+	static constexpr unsigned kSurfaceFunctions = 15;
 	static void setSurfaceFunctions(const mach_vm_address_t fn[kSurfaceFunctions]);   // IOSurface kext functions for type-5 textures (pvgpu.cpp)
 	static void setPhysmap(uint8_t *base, uint8_t *max);               // the kernel's map of all physical memory, for the guest's pages
 
