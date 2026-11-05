@@ -2689,12 +2689,20 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 	}
 
 	RtProgram &p = programs[slot];
-	p = { owner, off, 0, k, nextGen(p.gen) };
+	p = { owner, off, 0, k, nextGen(p.gen), 0 };
+	// The image's VA from the client's holes, given back by rtUnload: taken from the end each time, the translator's programs (reloaded
+	// as its cache turns over) filled the client's 1 GiB, and then no draw could map its target.
 	if (c) {
-		p.va = (c->nextVa + 0xfff) & ~0xfffull;
-		c->nextVa = p.va + ((img.size + kCodePad + 0xffff) & ~0xffffull);
-		if (c->nextVa < p.va || !vmMap(*c, p.va, poolMc(off), img.size + kCodePad, true)) {
-			heap.free(off); p.owner = nullptr;
+		p.vaBytes = img.size + kCodePad;
+		p.va = vaTake(*c, p.vaBytes);
+
+		if (!p.va || !vmMap(*c, p.va, poolMc(off), p.vaBytes, true)) {
+			if (p.va)
+				vaGive(*c, p.va, p.vaBytes);
+
+			heap.free(off);
+			p.owner = nullptr;
+
 			return kIOReturnNoMemory;
 		}
 	}
@@ -2727,6 +2735,8 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 		/* As rtFree: invalidate before the code pages return to the heap. */
 		if (!vmInvalidateOwned(*c, "program unmap"))
 			RLOG("vmid %u: program unmap invalidation timed out", c->vmid);
+
+		vaGive(*c, p->va, p->vaBytes);   // after the invalidation, as rtFree
 	}
 	heap.free(p->offset);
 	p->owner = nullptr;
@@ -3229,8 +3239,14 @@ bool RDNA4Compute::gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceW
 		RLOG("gfx: %s: CP_VMID_RESET 0x%08x, attempt %u: the lost work's fence %s; GRBM 0x%08x, CP_STAT 0x%08x", why, 1u << vmid, attempt,
 		     back ? "came through" : "did not come", rdGc(GrbmStatus), rdGc(CpStat));
 	}
-	if (((rdGc(GcL2FaultStatusLo) >> 20) & 0xf) == vmid)
-		gcFaultClear();                // an entry of this client's would end the next compute job in this address space (vmJobFaulted)
+	const uint32_t faultVmid = (rdGc(GcL2FaultStatusLo) >> 20) & 0xf;
+
+	// An entry of this client's would end the next compute job in this address space (vmJobFaulted). One of address
+	// space 0's (the ring tests leave one of the CPG's) belongs to no client: as the hub latches the first fault only, it
+	// would hide the next hang's.
+	if (faultVmid == vmid || !faultVmid)
+		gcFaultClear();
+
 	if (back)
 		RLOG("gfx: %s: the client's work is ended; the graphics ring is back and stays in service", why);
 	return back;

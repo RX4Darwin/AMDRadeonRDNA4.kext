@@ -611,6 +611,7 @@ private:
 	uint64_t ihLastInterruptLog { 0 };
 	uint32_t ihInterruptLogCount { 0 };   // lines allowed so far (see ihInterruptLogAllowed)
 	uint32_t ihFaultCount { 0 };
+	uint32_t ihClientFaultCount { 0 };   // VM faults of address spaces other than 0
 	uint32_t ihUnknownCount { 0 };
 	uint8_t ihUnknownSeen[256][32] {};
 	bool ihDcnRequested { false };
@@ -766,7 +767,7 @@ private:
 		IOMemoryMap *hostMap { nullptr };
 		uint64_t    hostUser { 0 };
 	};
-	struct RtProgram { const void *owner; uint64_t offset, va; CodeObj::Kernel k; uint16_t gen; };
+	struct RtProgram { const void *owner; uint64_t offset, va; CodeObj::Kernel k; uint16_t gen; uint64_t vaBytes; };
 	// Sparse page tables (rdna4-vmshared=2; ptpages.hpp, gpuvmtable.hpp): root, PDB1, PDB0 and PT pages exist only where VA is mapped, so a client's VA
 	// reaches as far as its page quota allows (the contiguous image of modes 0/1 stops at 1 GiB above kVaStart).
 	struct SparseTables {

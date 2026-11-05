@@ -10,6 +10,7 @@
 #include "compute.hpp"
 #include "klog.hpp"
 #include "ndrv.hpp"
+#include "trial.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODMACommand.h>
@@ -160,7 +161,7 @@ uint32_t RDNA4Compute::ihDcnRead(uint8_t baseIdx, uint32_t dword) const {
 
 bool RDNA4Compute::ihInit() {
 	uint32_t requested = 0;
-	if (!PE_parse_boot_argn("rdna4-ih", &requested, sizeof(requested)) || !requested)
+	if (!Trial::option("rdna4-ih", requested) || !requested)
 		return false;
 	auto fail = [this](const char *why) {
 		char value[128];
@@ -820,8 +821,12 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 	 * access in src_data[1] (amdgpu_gmc.h: EXECUTE 0x10, WRITE 0x20, READ 0x40, RETRY 0x80). The card delivers it too (round-5 log, src_data
 	 * 0x00100001 0x00000050). Named here so it is not counted as an unknown source; the fault status register is read by the submit paths, not here. */
 	if (entry.clientId == kIhClientGfx && entry.srcId == kIhSrcGfxVmFault) {
-		ihFaultCount++;
-		if (ihFaultCount == 1 || ihFaultCount == 4 || (ihFaultCount & 0x3f) == 0) {
+		// A client's faults counted apart from address space 0's: the ring's own (the CPG's, with no MQD) would thin them out.
+		uint32_t &count = entry.vmid ? ihClientFaultCount : ihFaultCount;
+
+		count++;
+
+		if (count <= 64 || (count & 0x3f) == 0) {
 			const uint32_t access = entry.srcData[1] & 0xf0;
 			HLOG("GC VM page fault (client GFX, UTCL2_1_0__SRCID__FAULT): VMID %u, PASID %u = client slot %d, %s%s%s%s at VA 0x%llx "
 			     "(src_data 0x%08x 0x%08x 0x%08x 0x%08x, %u so far)", entry.vmid, entry.pasid, vmClientSlotByPasid(entry.pasid),
@@ -829,7 +834,7 @@ void RDNA4Compute::ihDecodeEntry(const uint32_t *dw) {
 			     (access & 0x80) ? "(retry) " : "",
 			     (static_cast<unsigned long long>(entry.srcData[0]) << 12) |
 			     ((static_cast<unsigned long long>(entry.srcData[1]) & 0xf) << 44),
-			     entry.srcData[0], entry.srcData[1], entry.srcData[2], entry.srcData[3], ihFaultCount);
+			     entry.srcData[0], entry.srcData[1], entry.srcData[2], entry.srcData[3], count);
 		}
 		return;
 	}

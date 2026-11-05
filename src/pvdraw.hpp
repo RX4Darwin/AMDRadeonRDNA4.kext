@@ -194,7 +194,7 @@ static inline bool vertexTable(const uint8_t *pb, uint32_t len, uint32_t at, uin
 // offset, 3 buffer index; a layout (by buffer index): key 1 step function (default per vertex), 2 step rate (default 1), 3 stride. A record:
 // {offset, stride, buffer | kind << 8 | components << 12 | BGRA << 15 | step function << 16, step rate}; all zero without a descriptor or for an
 // attribute of a format not handled (the shader then reads (0, 0, 0, 1)). False if the descriptor is there but not understood.
-static inline bool readVertexDescriptor(const uint8_t *pb, uint32_t len, uint32_t rec[16][4]) {
+static inline bool readVertexDescriptor(const uint8_t *pb, uint32_t len, uint32_t rec[16][4], uint32_t *skipped = nullptr) {
 	uint32_t top[16], vd[2] = {}, attr[16][4] = {}, layout[31][4] = {};
 	bool attrSeen[16] = {}, layoutSeen[31] = {};
 	memset(rec, 0, 16 * 4 * sizeof(uint32_t));
@@ -207,6 +207,8 @@ static inline bool readVertexDescriptor(const uint8_t *pb, uint32_t len, uint32_
 		return false;
 	for (uint32_t i = 0; i < 16; i++) {
 		const uint32_t f = attrSeen[i] ? vertexFormat(attr[i][1]) : 0, buffer = attr[i][3];
+		if (attrSeen[i] && (!f || buffer >= 31) && skipped)
+			skipped[i] = attr[i][1] | buffer << 16;   // the Metal vertex format the host does not know, and its buffer
 		if (!f || buffer >= 31)
 			continue;
 		const uint32_t step = layoutSeen[buffer] && layout[buffer][1] ? layout[buffer][1] : 1;
