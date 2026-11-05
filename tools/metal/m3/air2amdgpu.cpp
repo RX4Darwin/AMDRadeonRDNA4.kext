@@ -41,6 +41,7 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/xxhash.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -1323,6 +1324,52 @@ static void dump(uint64_t req, const char *name, StringRef lib, const std::strin
 	raw_fd_ostream(base + ".rgfx", ec, sys::fs::OF_None) << out;
 }
 
+// The translations of earlier runs, by library, function and this build of the translator: WindowServer asks for its 70-odd shaders on every
+// boot, and each held the desktop for up to seconds while it was translated again. A file is {u32 buffers, u32 written, code object}.
+static const char *const kCacheDir = "/var/db/rdna4-air2amdgpu";
+
+static std::string cachePath(StringRef lib, const char *name) {
+	static const char build[] = __DATE__ " " __TIME__;
+	const uint64_t key = xxh3_64bits(arrayRefFromStringRef(lib)) ^ xxh3_64bits(arrayRefFromStringRef(StringRef(name))) * 31 ^
+	                     xxh3_64bits(arrayRefFromStringRef(StringRef(build)));
+
+	return std::string(kCacheDir) + "/" + Twine::utohexstr(key).str() + "-" + std::to_string(lib.size()) + ".rgfx";
+}
+
+static bool cached(StringRef lib, const char *name, Kernel &out) {
+	auto file = MemoryBuffer::getFile(cachePath(lib, name));
+	uint32_t head[2];
+
+	if (!file || (*file)->getBufferSize() <= sizeof(head))
+		return false;
+
+	memcpy(head, (*file)->getBufferStart(), sizeof(head));
+	out.buffers = head[0];
+	out.written = head[1];
+	out.hsaco = (*file)->getBuffer().drop_front(sizeof(head)).str();
+
+	return true;
+}
+
+static void keep(StringRef lib, const char *name, const Kernel &k) {
+	const std::string path = cachePath(lib, name), tmp = path + ".tmp";
+	const uint32_t head[2] = {k.buffers, k.written};
+	std::error_code ec;
+
+	sys::fs::create_directories(kCacheDir);
+	{
+		raw_fd_ostream out(tmp, ec, sys::fs::OF_None);
+
+		if (ec)
+			return;
+
+		out.write(reinterpret_cast<const char *>(head), sizeof(head));
+		out << k.hsaco;
+	}
+
+	sys::fs::rename(tmp, path);   // whole files only: a reader never sees half of one
+}
+
 // --serve: connect to the kext (retrying until the host is up), then translate each function it asks for. Ends when the kext's call fails
 // (it went away, or this process was signalled); run it under launchd with KeepAlive.
 static int serve() {
@@ -1351,8 +1398,16 @@ static int serve() {
 			return fail("the kext ended the session (0x" + Twine::utohexstr(kr).str() + ")");
 		name[sizeof(name) - 1] = 0;
 		Kernel k {};
-		const std::string why = translate(StringRef(lib.data(), req[1]), name, k);
-		errs() << "air2amdgpu: request " << req[0] << ": " << name << ": " << (why.empty() ? "translated, " + std::to_string(k.hsaco.size()) + " bytes" : why) << "\n";
+		const StringRef library(lib.data(), req[1]);
+		const bool hit = cached(library, name, k);
+		const std::string why = hit ? "" : translate(library, name, k);
+
+		if (!hit && why.empty())
+			keep(library, name, k);
+
+		const std::string what = (hit ? "cached, " : "translated, ") + std::to_string(k.hsaco.size()) + " bytes";
+
+		errs() << "air2amdgpu: request " << req[0] << ": " << name << ": " << (why.empty() ? what : why) << "\n";
 		dump(req[0], name, StringRef(lib.data(), req[1]), k.hsaco);
 		const uint64_t reply[5] = {req[0], reinterpret_cast<uint64_t>(k.hsaco.data()), why.empty() ? k.hsaco.size() : 0, k.buffers, k.written};
 		IOConnectCallScalarMethod(conn, kMtlcDeliver, reply, 5, nullptr, nullptr);

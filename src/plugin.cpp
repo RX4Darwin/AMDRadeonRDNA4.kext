@@ -1060,7 +1060,9 @@ void attach(FbEntry &e) {
 		FBLOG("ndrv: the heads are the paravirtual displays: no display on our framebuffers for macOS");
 	}
 
-	if (dev.isAmd)
+	// Before NVRAM is up a test boot looks like a normal one: decided only once the variable could be read (or boot-args set it),
+	// or the first WindowServer opened the boot framebuffer as macOS's display and died in its first frame (pvhooks.cpp).
+	if (dev.isAmd && (Trial::loaded() || pvGpu))
 		PvScanout::decided(pvHeads);
 #endif
 	e.state = st;
@@ -1416,7 +1418,18 @@ void pluginStart() {
 	PvHooks::start();
 	PvScanout::start();
 #endif
-	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) { gPatcher = &patcher; });
+	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
+		gPatcher = &patcher;
+#ifdef AMDRadeonRDNA4_PVGPU
+		auto **base = reinterpret_cast<uint8_t **>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_base"));
+		auto **max = reinterpret_cast<uint8_t **>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_max"));
+
+		patcher.clearError();
+		if (base && max)
+			RDNA4PvNub::setPhysmap(*base, *max);
+		FBLOG("pvgpu: physmap %s", base && max ? "found" : "NOT found: guest memory through mappings of each page");
+#endif
+	});
 	if ((gLateNdrv = thread_call_allocate(lateNdrvCheck, nullptr))) {   // ponytail: never freed, it lives for the boot
 		uint64_t deadline;
 		clock_interval_to_deadline(30, kSecondScale, &deadline);

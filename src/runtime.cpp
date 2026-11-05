@@ -3286,7 +3286,8 @@ IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords
 	c.gfxFences[c.gfxOutstanding++] = value;
 	gfxClientPending++;
 	fence = value;
-	RLOG("vmid %u: submitted unprivileged gfx IB VA 0x%llx, %u dwords, gfx fence %u", ibVmid, ibVa, dwords, value);
+	if (value <= 64 || !(value % 4096))   // the paravirtual host submits one a draw: a line each was hundreds a second
+		RLOG("vmid %u: submitted unprivileged gfx IB VA 0x%llx, %u dwords, gfx fence %u", ibVmid, ibVa, dwords, value);
 	return kIOReturnSuccess;
 }
 

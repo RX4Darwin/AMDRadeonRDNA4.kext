@@ -11,6 +11,7 @@
 
 #include <Headers/kern_api.hpp>
 #include <IOKit/IOReturn.h>
+#include <IOKit/IOService.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSObject.h>
 
@@ -41,6 +42,7 @@ constexpr const char kNdrvFramebuffer[] = "IONDRVFramebuffer";
 mach_vm_address_t orgDisable;
 mach_vm_address_t orgWait;
 mach_vm_address_t orgNewUserClient;
+mach_vm_address_t fbOpen;   /* IOFramebuffer::open() */
 mach_vm_address_t enable;
 uint32_t skipped;
 uint32_t enabled;
@@ -93,13 +95,51 @@ uint64_t wrapWait(void *accel)
  * While the heads are the paravirtual displays, our framebuffers have no
  * display for macOS and IOFramebuffer gives them its 1x1 offline mode.
  * WindowServer still opened them and copied its 4K boot screen into that
- * one page of mapping (SIGBUS in CGXReleaseDisplayDeviceSurface). The boot
- * framebuffer stays open: WindowServer opens it before the plugin decides,
- * and CoreDisplay asserts when none of a GPU's framebuffers opens.
+ * one page of mapping (SIGBUS in CGXReleaseDisplayDeviceSurface). The first
+ * open of the boot framebuffer is what has it answered (the NDRV's Open,
+ * plugin.cpp attach) and the heads decided: the first WindowServer of a boot
+ * got it before the decision and died in its first frame, and loginwindow
+ * does not log in automatically again after that. Refused undecided, the card
+ * was never brought up. So an undecided framebuffer is opened here first
+ * (IOFramebuffer::open takes its gates itself), and the client then refused.
  */
+/*
+ * CoreDisplay asserts when none of a GPU's framebuffers opens and there is
+ * no other display yet: the first WindowServer of a boot, refused before the
+ * paravirtual display was published, died in CGXMappedDisplayStart (its
+ * restart then found it). The first refusal waits for that display, at most
+ * kDisplayWait.
+ */
+void waitForParavirtDisplay()
+{
+	static constexpr uint64_t kDisplayWait = 30ull * NSEC_PER_SEC;
+	static bool waited;
+
+	if (waited)
+		return;
+
+	waited = true;
+
+	OSDictionary *match = IOService::serviceMatching("AppleParavirtFramebuffer");
+	IOService *display = match ? IOService::waitForMatchingService(match, kDisplayWait) : nullptr;
+
+	PLOG("paravirtual display %s", display ? "published: refusing our framebuffers" : "NOT published within 30 s");
+	OSSafeReleaseNULL(display);
+	OSSafeReleaseNULL(match);
+}
+
 IOReturn wrapNewUserClient(void *fb, void *task, void *security, uint32_t type, void **handler)
 {
-	if (PvScanout::enabled() && isClass(fb, kNdrvFramebuffer)) {
+	if (isClass(fb, kNdrvFramebuffer) && !PvScanout::known() && fbOpen) {
+		const IOReturn r = reinterpret_cast<IOReturn (*)(void *)>(fbOpen)(fb);
+
+		PLOG("opened framebuffer %p ahead of its first client (0x%x): the heads %s", fb, r,
+		     !PvScanout::known() ? "still undecided" : PvScanout::enabled() ? "are the paravirtual displays" : "are macOS's displays");
+	}
+
+	if (isClass(fb, kNdrvFramebuffer) && PvScanout::enabled()) {
+		waitForParavirtDisplay();
+
 		if (refused++ < 8)
 			PLOG("refused user client type %u of framebuffer %p: the heads are the paravirtual displays",
 			     type, fb);
@@ -156,8 +196,15 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index,
 		wrapNewUserClient, orgNewUserClient,
 	};
 
-	if (index == kextGraphics.loadIndex)
-		route(patcher, index, address, size, newUserClient);
+	if (index != kextGraphics.loadIndex)
+		return;
+
+	fbOpen = patcher.solveSymbol(index, "__ZN13IOFramebuffer4openEv", address, size);
+	if (!fbOpen)
+		PLOG("no IOFramebuffer::open (error %d): an undecided framebuffer is not opened ahead", patcher.getError());
+
+	patcher.clearError();
+	route(patcher, index, address, size, newUserClient);
 }
 
 } /* namespace */

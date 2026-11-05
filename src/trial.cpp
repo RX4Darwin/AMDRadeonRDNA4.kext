@@ -119,6 +119,13 @@ void load()
 
 } /* namespace */
 
+bool Trial::loaded()
+{
+	load();
+
+	return gLoaded;
+}
+
 bool Trial::option(const char *key, uint32_t &value)
 {
 	if (PE_parse_boot_argn(key, &value, sizeof(value)))

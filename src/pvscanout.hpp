@@ -37,6 +37,9 @@ void decided(bool on);
 /* Whether the heads are the paravirtual displays this boot (plugin.cpp). */
 bool enabled();
 
+/* Whether decided() has been told yet. */
+bool known();
+
 /*
  * The heads with a display (plugin.cpp): the boot head and the extra heads
  * that are lit or wait to be. Fixed at the first call, which numbers the

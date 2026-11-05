@@ -148,6 +148,9 @@ inline bool find(const char *text, const char *key, uint32_t &value)
  * test's. The first call consumes the test (writes "used ..." to NVRAM).
  */
 bool option(const char *key, uint32_t &value);
+
+/* Whether the variable could be read yet (NVRAM comes up after the first framebuffers). */
+bool loaded();
 #endif
 
 } /* namespace Trial */

@@ -12,6 +12,7 @@
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <kern/clock.h>
 #include <libkern/libkern.h>
 #include <sys/sysctl.h>
 
@@ -33,6 +34,7 @@ struct Mapping {
 	IOMemoryMap *map;
 	uint32_t frames;
 	uint32_t failures;
+	uint64_t copyNs;   /* the copies' time since the last line of samples */
 };
 
 Mapping gMap[kMaxPorts];
@@ -85,8 +87,18 @@ void logSamples(uint32_t port, const uint8_t *dst, const PvScanout::Head &h)
 	for (int i = 0; i < 5; i++)
 		px[i] = *reinterpret_cast<const volatile uint32_t *>(dst + static_cast<size_t>(ys[i]) * h.pitch + 4ull * xs[i]);
 
-	VLOG("port %u: %u frames, %u failed; pixels %08x %08x centre %08x %08x %08x", port, gMap[port].frames, gMap[port].failures,
-	     px[0], px[1], px[2], px[3], px[4]);
+	VLOG("port %u: %u frames, %u failed, %llu us a copy; pixels %08x %08x centre %08x %08x %08x", port, gMap[port].frames, gMap[port].failures,
+	     gMap[port].copyNs / kSampleEvery / 1000, px[0], px[1], px[2], px[3], px[4]);
+	gMap[port].copyNs = 0;
+}
+
+uint64_t nowNs()
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+
+	return ns;
 }
 
 } /* namespace */
@@ -101,10 +113,16 @@ void PvScanout::decided(bool on)
 	gHeads = on;
 }
 
+bool PvScanout::known()
+{
+	return gHeads >= 0;
+}
+
 bool PvScanout::present(uint32_t port, uint32_t surface, uint32_t task)
 {
 	PvScanout::Head h;
 	uint8_t *dst;
+	uint64_t from;
 	uint32_t id;
 	bool ok;
 
@@ -118,7 +136,9 @@ bool PvScanout::present(uint32_t port, uint32_t surface, uint32_t task)
 	Mapping &m = gMap[port];
 
 	id = surface;
+	from = nowNs();
 	ok = PvScanout::copySurface(id, dst, h.pitch, h.width, h.height);
+	m.copyNs += nowNs() - from;
 
 	if (m.frames < kLoggedFrames || (!ok && m.failures < kLoggedFrames))
 		VLOG("port %u: frame %u: IOSurface %u (task %u) %s", port, m.frames, id, task, ok ? "copied" : "NOT copied");
