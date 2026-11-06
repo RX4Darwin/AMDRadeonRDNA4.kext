@@ -216,6 +216,8 @@ public:
 	// values for it are in the table or it is near the lit mode's pixel
 	// clock, and the DET buffer has the segments it needs.
 	bool secondPipeModeOk(const Edid::DetailedTiming &t, const char **why = nullptr);
+	uint32_t secondPipeDet(const Edid::DetailedTiming &t) const;
+	void clampDet(ModeSet::Step *steps, size_t n, uint32_t segments) const;
 	// A DisplayPort second display whose HPD pin dropped and came back without
 	// counting as unplugged: its link is trained again if the sink says it is
 	// down. Nothing else maintains a link the kext trained.

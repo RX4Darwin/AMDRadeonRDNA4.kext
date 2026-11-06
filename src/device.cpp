@@ -3754,6 +3754,22 @@ bool RDNA4Device::secondPipeY420(const Edid::DetailedTiming &t) const
 	return c.y420 && t.pixelClockKHz > dpDualMaxKHz(c.hpd);
 }
 
+// The mode's DET step held to `segments`, the pipe's share.
+void RDNA4Device::clampDet(ModeSet::Step *steps, size_t n, uint32_t segments) const
+{
+	const Pipe2::Config &c = Pipe2::config();
+
+	for (size_t i = 0; i < n; i++) {
+		ModeSet::Step &s = steps[i];
+
+		if (s.seg != c.detSeg || s.dword != c.detCtrl[c.pipe] || (s.value & 0x1f) <= segments)
+			continue;
+
+		s.value = (s.value & ~0x1fu) | segments;
+		s.mask |= 0x1f;
+	}
+}
+
 bool RDNA4Device::secondPipeModeOk(const Edid::DetailedTiming &t, const char **why) {
 	const Pipe2::Config &c = Pipe2::config();
 	const char *dummy;
@@ -3773,16 +3789,33 @@ bool RDNA4Device::secondPipeModeOk(const Edid::DetailedTiming &t, const char **w
 		return false;
 	}
 
-	// The DET segments the mode needs, next to what the other pipes hold.
-	uint32_t segments = Pipe2::modeDetSegments(t);
-	for (uint32_t i = 0; i < 4; i++)
-		if (i != c.pipe)
-			segments += regReadDmu(c.detSeg, c.detCtrl[i]) & 0x1f;
-	if (segments > Pipe2::kDetSegmentsTotal) {
+	// The DET segments the mode needs, or a smaller share as it is lit with.
+	if (!secondPipeDet(t)) {
 		err = "the DET buffer is too small for it next to the other pipes";
 		return false;
 	}
 	return true;
+}
+
+/*
+ * The DET segments the second pipe gets for `t` next to what the other pipes
+ * and the compressed buffer hold: Linux's for the mode, or less as when it
+ * is lit (detShare). With the boot display's plane still holding its 3
+ * segments, Linux's 10 for 3840x2160 did not fit next to the other head's
+ * 10, and a head lit at 3840x2160 with 7 could not be switched back to it
+ * from a smaller mode.
+ */
+uint32_t RDNA4Device::secondPipeDet(const Edid::DetailedTiming &t) const
+{
+	constexpr uint32_t kCompbufCtrl = 0x04ba;   // as shrinkCompbuf: the compressed buffer's segments count too
+	const Pipe2::Config &c = Pipe2::config();
+	uint32_t others = regReadDmu(c.detSeg, kCompbufCtrl) >> 8 & 0x1f;
+
+	for (uint32_t i = 0; i < 4; i++)
+		if (i != c.pipe)
+			others += regReadDmu(c.detSeg, c.detCtrl[i]) & 0x1f;
+
+	return detShare(Pipe2::modeDetSegments(t), others);
 }
 
 // A mode that needs more of a DisplayPort link than it has: the link goes
@@ -3857,6 +3890,7 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 		t.y420 = secondPipeY420(to);
 		t.nextra = Pipe2::encodingSteps(t.y420, work->extra, Pipe2::kMaxModeSteps);
 		t.nextra += Pipe2::modeSteps(to, work->extra + t.nextra, Pipe2::kMaxModeSteps - t.nextra);
+		clampDet(work->extra, t.nextra, secondPipeDet(to));
 		if (!ModeSet::build(t, *plan, &why))
 			return false;
 		why = "a step failed";
