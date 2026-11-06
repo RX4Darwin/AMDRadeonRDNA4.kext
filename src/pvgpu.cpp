@@ -55,6 +55,10 @@ static int gPresentOnCard = 1;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvpresent, CTLFLAG_RW | CTLFLAG_LOCKED, &gPresentOnCard, 0,
 	   "AMDRadeonRDNA4: a presented frame copied on the card and flipped to at vblank (1), copied into the display's scanout on the card "
 	   "(2: it tears), or with the CPU (0)");
+// debug.rdna4_pvdrawsync=1: each draw in an IB of its own with its own fence, not batched: a hang names the draw that did not finish.
+static int gDrawSync;
+SYSCTL_INT(_debug, OID_AUTO, rdna4_pvdrawsync, CTLFLAG_RW | CTLFLAG_LOCKED, &gDrawSync, 0,
+	   "AMDRadeonRDNA4: submit each paravirtual draw on its own (1), so that a hang names the draw");
 static int gProfile;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvprofile, CTLFLAG_RW | CTLFLAG_LOCKED, &gProfile, 0,
 	   "AMDRadeonRDNA4: time each submit on the card and name the fragment functions (and copies) that took it longest in the draw stats");
@@ -4477,7 +4481,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		// Waited for now when the CPU has to finish the draw (a staged target or texture to copy back, a runtime buffer to free), else left
 		// in flight with those before it, put together with the next ones when it can be.
-		const bool sync = staged || indexHandle || ownsMemory(stagedTextures, handle);
+		const bool sync = staged || indexHandle || ownsMemory(stagedTextures, handle) || gDrawSync;
 		const bool batched = r == kIOReturnSuccess && !sync && batchDraw(ib, total, task, target);
 
 		if (r == kIOReturnSuccess && !batched) {
@@ -6873,6 +6877,7 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtalk);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvinplace);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvpresent);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvdrawsync);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvprofile);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtexid);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtex);
