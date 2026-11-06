@@ -1605,7 +1605,7 @@ uint32_t RDNA4PvHost::load(const uint8_t *elf, uint32_t size, const char *name) 
 		return 0;
 	if (!mRtOpen)
 		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;   // ponytail: never closed, the host lives as long as the boot
-	uint64_t out[8] = {};
+	uint64_t out[9] = {};
 	const bool ok = mRtOpen && gCompute->rtLoad(this, kernel_task, reinterpret_cast<mach_vm_address_t>(elf), size, name, out) == kIOReturnSuccess;
 	pvlog("host: compute: %s %s (program 0x%llx)", name, ok ? "loaded into the runtime" : "did NOT load", out[0]);
 	return ok ? static_cast<uint32_t>(out[0]) : 0;

@@ -664,7 +664,7 @@ public:
 	IOReturn rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
 	                mach_vm_address_t user, uint64_t length, bool toGpu);
 	IOReturn rtLoad(const void *owner, task_t task, mach_vm_address_t elf, uint64_t length,
-	                const char *name, uint64_t out[8]);
+	                const char *name, uint64_t out[9]);
 	IOReturn rtUnload(const void *owner, uint64_t program);
 	IOReturn rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros);
 	IOReturn rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags,

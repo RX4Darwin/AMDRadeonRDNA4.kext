@@ -2525,7 +2525,7 @@ IOReturn RDNA4Compute::rtCopy(const void *owner, uint64_t handle, uint64_t offse
 }
 
 IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t elf, uint64_t length,
-                              const char *name, uint64_t out[8]) {
+                              const char *name, uint64_t out[9]) {
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
 	const IOReturn state = ownerStateLocked(owner);
