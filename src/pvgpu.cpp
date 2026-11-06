@@ -5240,6 +5240,20 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		if (handle[b])
 			gCompute->rtFree(this, handle[b]);
 	ok = releaseTextures(task, staged, ok) && ok;   // the textures the kernel may write copied back
+
+	// What the kernel wrote in place is not what shadows of those textures hold: no lock changed a surface's seeds, so a draw reading
+	// one after (WindowServer compositing a layer CoreImage drew: Preview's tiles) took the old shadow, empty or of an image before.
+	for (unsigned k = 0; k < 16; k++) {
+		TextureSource src;
+
+		if (!(texturesWritten & (1u << k)) || !bound.texture[k] || !textureSource(task, bound.texture[k], src))
+			continue;
+
+		if (src.surface.memory)
+			dropShadows(src.surface.surface, 0, src.surface.base, false);
+		else
+			dropShadowRange(task, src.va, src.length);
+	}
 	if (tableHandle)
 		gCompute->rtFree(this, tableHandle);
 	if (stage)
