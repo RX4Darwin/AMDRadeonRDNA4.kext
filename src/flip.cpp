@@ -367,6 +367,21 @@ bool shown(RDNA4Compute &compute, uint8_t hubp, uint64_t &requested, uint64_t &i
 	return true;
 }
 
+bool underflowed(RDNA4Compute &compute, uint8_t hubp) {
+	constexpr uint32_t kDchubpCntl = 0x05f4;
+	constexpr uint32_t kUnderflowStatus = 7u << 28, kUnderflowClear = 1u << 31;
+	const GfxReg::Reg reg { 2, kDchubpCntl + static_cast<uint32_t>(hubp) * Pipe::Reg::kHubpStride };
+	const uint32_t v = hubp < Pipe::kMaxOtg ? compute.rd(IpDiscovery::HwDmu, reg) : kBad;
+
+	if (v == kBad || !(v & kUnderflowStatus))
+		return false;
+
+	compute.wr(IpDiscovery::HwDmu, reg, v | kUnderflowClear);
+	compute.wr(IpDiscovery::HwDmu, reg, v & ~kUnderflowClear);
+
+	return true;
+}
+
 bool run(RDNA4Compute &compute) {
 	uint32_t mode = 0;
 	if (!PE_parse_boot_argn("rdna4-flip", &mode, sizeof(mode)) || !mode)

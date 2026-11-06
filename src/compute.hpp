@@ -208,6 +208,7 @@ private:
 	friend uint8_t Flip::hubpShowing(RDNA4Compute &compute, uint64_t mc);
 	friend bool Flip::request(RDNA4Compute &compute, uint8_t hubp, uint64_t mc);
 	friend bool Flip::shown(RDNA4Compute &compute, uint8_t hubp, uint64_t &requested, uint64_t &inUse);
+	friend bool Flip::underflowed(RDNA4Compute &compute, uint8_t hubp);
 
 	Env    env {};
 	Survey sv {};
@@ -722,6 +723,7 @@ public:
 	uint64_t rtBufferMc(const void *owner, uint64_t handle);
 	bool rtScanoutFlip(uint8_t hubp, uint64_t mc);
 	bool rtScanoutShown(uint8_t hubp, uint64_t &requested, uint64_t &inUse);
+	bool rtScanoutUnderflowed(uint8_t hubp);
 	IOReturn rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
 	                mach_vm_address_t user, uint64_t length, bool toGpu);
 	IOReturn rtLoad(const void *owner, task_t task, mach_vm_address_t elf, uint64_t length,

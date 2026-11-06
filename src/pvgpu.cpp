@@ -589,7 +589,8 @@ private:
 	uint32_t mPresents { 0 };            // frames presented meanwhile
 	// Frame timing, per port: frames, frames later than one period after the one before (a frame missed), the time from the VBL to the
 	// present (sum and most); and how long the stamps queued behind draws in flight waited (sum, most, count).
-	struct PortTiming { uint64_t last, vblNs, vblMaxNs; uint32_t frames, missed, gaps[4]; };   // gaps: frames 1, 2, 3 and 4 to 8 VBLs after the one before
+	// gaps: frames 1, 2, 3 and 4 to 8 VBLs after the one before; underflows: frames before which the head's HUBP had run out of data
+	struct PortTiming { uint64_t last, vblNs, vblMaxNs; uint32_t frames, missed, gaps[4], underflows; };
 	PortTiming mPortTiming[8] {};
 	void timePresent(PortTiming &t);
 	uint64_t mVblAt { 0 }, mLateNs { 0 }, mLateMaxNs { 0 };
@@ -5607,6 +5608,9 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 
 	flipDone();   // the frame before asked for, if its copy is done: this one goes into another buffer
 
+	if (sm.flips && port < 8 && gCompute->rtScanoutUnderflowed(sm.hubp))
+		mPortTiming[port].underflows++;
+
 	roomForDraw();
 
 	// the rows, or the whole frame in chunks when the surface's rows are the scanout's
@@ -6172,15 +6176,15 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		pvstat("host: render:   waits:%s", sites);
 	memset(mWaitSites, 0, sizeof(mWaitSites));
 
-	char ports[200] = "", gaps[200] = "";
+	char ports[320] = "", gaps[200] = "";
 	for (uint32_t p = 0, at = 0, gat = 0; p < 8 && at < sizeof(ports) - 64 && gat < sizeof(gaps) - 64; p++) {
 		const PortTiming &t = mPortTiming[p];
 
 		if (!t.frames)
 			continue;
 
-		at += snprintf(ports + at, sizeof(ports) - at, " port %u: %u (%u missed, VBL to present %llu us, most %llu us);", p, t.frames,
-		               t.missed, t.vblNs / t.frames / 1000, t.vblMaxNs / 1000);
+		at += snprintf(ports + at, sizeof(ports) - at, " port %u: %u (%u missed, %u underflows, VBL to present %llu us, most %llu us);", p,
+		               t.frames, t.missed, t.underflows, t.vblNs / t.frames / 1000, t.vblMaxNs / 1000);
 		gat += snprintf(gaps + gat, sizeof(gaps) - gat, " port %u: %u/%u/%u/%u;", p, t.gaps[0], t.gaps[1], t.gaps[2], t.gaps[3]);
 	}
 	if (ports[0] || mLateDone)

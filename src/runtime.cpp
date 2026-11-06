@@ -2815,6 +2815,12 @@ bool RDNA4Compute::rtScanoutShown(uint8_t hubp, uint64_t &requested, uint64_t &i
 	return Flip::shown(*this, hubp, requested, inUse);
 }
 
+bool RDNA4Compute::rtScanoutUnderflowed(uint8_t hubp) {
+	Locked g(rtLock);
+
+	return Flip::underflowed(*this, hubp);
+}
+
 IOReturn RDNA4Compute::rtMapVram(const void *owner, uint64_t barPhys, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	Locked g(rtLock);
 	const IOReturn state = ownerStateLocked(owner);

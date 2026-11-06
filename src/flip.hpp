@@ -72,6 +72,10 @@ bool request(RDNA4Compute &compute, uint8_t hubp, uint64_t mc);
 // once the request latched. False when they cannot be read.
 bool shown(RDNA4Compute &compute, uint8_t hubp, uint64_t &requested, uint64_t &inUse);
 
+// Whether HUBP `hubp` ran out of data since the last call (DCHUBP_CNTL.HUBP_UNDERFLOW_STATUS, sticky; cleared here): its picture then
+// shows lines of garbage or of the frame before.
+bool underflowed(RDNA4Compute &compute, uint8_t hubp);
+
 // Run the rdna4-flip=<mode> test once. False means the requested test failed
 // and the feature has been disabled after attempting to restore the desktop.
 bool run(RDNA4Compute &compute);
