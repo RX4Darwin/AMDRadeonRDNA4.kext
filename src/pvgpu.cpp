@@ -5190,6 +5190,11 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		readyDraws();
 		ok = stageTextures(task, bound, table, staged, true, "kernel", true, texturesWritten) && gCompute->rtAlloc(this, sizeof(table), tableHandle, tableGpu) == kIOReturnSuccess &&
 		     gCompute->rtCopy(this, tableHandle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(table), sizeof(table), true) == kIOReturnSuccess;
+
+		// The shadows the staging filled are filled by the card in the graphics ring (put together with draws, not even submitted yet);
+		// the kernel runs on the compute queue, which does not wait for them: it read what the shadows held before (another image's
+		// pixels: CoreImage's tiles in Preview, the Finder's thumbnails).
+		waitDraws();
 	}
 	uint64_t micros = 0;
 
