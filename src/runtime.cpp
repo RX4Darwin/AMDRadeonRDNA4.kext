@@ -2361,7 +2361,7 @@ IOReturn RDNA4Compute::rtQuiesce(const void *owner) {
 	return kIOReturnSuccess;
 }
 
-// Contents are undefined, as with any GPU allocation; callers write first.
+// Contents are zero (allocLocked): the memory may have been another client's.
 IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	Locked g(rtLock);
 	checkPresentationTimeoutLocked();
@@ -2520,6 +2520,21 @@ IOReturn RDNA4Compute::allocLocked(const void *owner, uint64_t bytes, uint64_t &
 	uint64_t off;
 	if (!h.alloc(bytes, off))
 		return kIOReturnNoMemory;
+
+	// Zeroed: the heaps hand out what other clients left. Without the copy engine the CPU zeroes the pool it reaches.
+	const uint64_t length = h.lengthOf(off);
+
+	if (dmaReady) {
+		if (!vramZero(dev ? vramMc(off) : poolMc(off), length)) {
+			h.free(off);
+			return kIOReturnNotResponding;
+		}
+	} else {
+		memset(poolWc + off, 0, length);
+		__builtin_ia32_sfence();
+		flushHdp();
+	}
+
 	RtBuffer &b = buffers[slot];
 	const uint16_t generation = nextGen(b.gen);
 	b = RtBuffer {};
@@ -4221,6 +4236,26 @@ bool RDNA4Compute::agpReach(uint64_t busEnd) {
 	gcHubFlush();
 	RLOG("dma: AGP aperture extended to MC 0x%llx (bus addresses below 0x%llx)", end, end - agpStart + 1);
 	agpEnd = end;
+	return true;
+}
+
+// A buffer's VRAM before it goes to its owner: the last one's data must not reach the next. CONST_FILL in pieces of 64 MiB, well
+// within the packet's byte count.
+bool RDNA4Compute::vramZero(uint64_t mc, uint64_t bytes) {
+	constexpr uint64_t kPiece = 64ull << 20;
+
+	if (!dmaReady || (bytes & 3))
+		return false;
+
+	for (uint64_t at = 0; at < bytes; at += kPiece) {
+		const uint32_t n = static_cast<uint32_t>(bytes - at < kPiece ? bytes - at : kPiece);
+		uint32_t pkt[Sdma::kFillDwords];
+
+		Sdma::constFill(pkt, mc + at, 0, n);
+		if (!sdmaRun(pkt, Sdma::kFillDwords, 2000))
+			return false;
+	}
+
 	return true;
 }
 

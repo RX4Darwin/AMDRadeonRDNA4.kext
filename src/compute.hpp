@@ -1112,6 +1112,7 @@ private:
 	uint64_t       agpStart { 0 };            // MC address of bus address 0
 	uint64_t       agpEnd { 0 };              // last MC address the AGP aperture reaches (agpReach extends it)
 	bool agpReach(uint64_t busEnd);            // make the aperture reach bus address busEnd - 1
+	bool vramZero(uint64_t mc, uint64_t bytes); // the copy engine fills [mc, mc + bytes) with 0; caller holds rtLock
 	bool           dmaReady { false };
 	bool           busMasterSet { false }, busMasterWas { false };
 	GpuHeap::Heap  devHeap;                   // VRAM offsets

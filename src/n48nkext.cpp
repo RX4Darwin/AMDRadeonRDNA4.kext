@@ -156,9 +156,10 @@ struct N48nBackend {
 	static bool allocVram(void *context, uint64_t bytes, uint64_t, bool highAllowed, N48N::Memory &out) {
 		RDNA4Compute &c = of(context);
 		uint64_t offset = 0, physical = 0;
-		// The pool the CPU reaches is small: a buffer that does not need it goes past the BAR when it can.
+		// The pool the CPU reaches is small: a buffer that does not need it goes past the BAR when it can. Zeroed by the
+		// copy engine, as the CPU cannot reach it: it may hold what another client left.
 		if (highAllowed && c.devHeap.size() && c.devHeap.alloc(bytes, offset)) {
-			if (c.gpuPhysical(c.vramMc(offset), physical)) {
+			if (c.vramZero(c.vramMc(offset), c.devHeap.lengthOf(offset)) && c.gpuPhysical(c.vramMc(offset), physical)) {
 				out = N48N::Memory { offset, physical, false, false, true, c.vramMc(offset) };
 				return true;
 			}
