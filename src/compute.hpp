@@ -253,9 +253,10 @@ private:
 	// in the middle of a step rather than ending the bring-up itself.
 	bool logPreviousTrail(char *text, size_t size);
 
-	// The compute pool, mapped uncached through BAR0.
-	IOMemoryMap *poolMap { nullptr };
-	uint8_t     *poolCpu { nullptr };
+	// The compute pool, mapped uncached through BAR0; and write-combined for bulk writes (page tables): uncached, memcpy wrote
+	// some 12 MB/s, a large surface's PTEs took a draw 14 ms. Writes there are fenced (sfence) before the HDP flush.
+	IOMemoryMap *poolMap { nullptr }, *poolWcMap { nullptr };
+	uint8_t     *poolCpu { nullptr }, *poolWc { nullptr };
 	bool mapPool();
 	void flushHdp();
 

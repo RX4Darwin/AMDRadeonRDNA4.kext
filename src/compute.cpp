@@ -908,10 +908,12 @@ bool RDNA4Compute::mapPool() {
 	if (!sub)
 		return false;
 	poolMap = sub->map(kIOMapInhibitCache);
+	poolWcMap = sub->map(kIOMapWriteCombineCache);
 	sub->release();
 	if (!poolMap)
 		return false;
 	poolCpu = reinterpret_cast<uint8_t *>(poolMap->getVirtualAddress());
+	poolWc = poolWcMap ? reinterpret_cast<uint8_t *>(poolWcMap->getVirtualAddress()) : poolCpu;
 	return poolCpu != nullptr;
 }
 

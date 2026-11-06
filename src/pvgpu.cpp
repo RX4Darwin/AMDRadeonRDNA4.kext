@@ -452,7 +452,7 @@ private:
 	// Draws put together into one IB and submitted at once (rdna4_pvinplace bit 512 off): Safari's live resize drew 26000 times a second,
 	// each draw its own submit. The batch goes before any other submit, a wait, a stamp, and at the end of each tick; a misc slot is taken
 	// again only once the submit that used it is done (mSlotSubmit).
-	static constexpr uint32_t kBatchSlots = 8, kBatchBytes = 128 * 1024, kBatchDraws = 32;
+	static constexpr uint32_t kBatchSlots = 16, kBatchBytes = 128 * 1024, kBatchDraws = 32;
 	GfxBuffers mBatchIb {};
 	uint64_t mBatchFence[kBatchSlots] {};
 	uint32_t mBatchSlot { 0 }, mBatchDwords { 0 }, mBatchDraws { 0 }, mBatchDirty[kBatchDraws] {};
@@ -545,10 +545,12 @@ private:
 	uint32_t mPresents { 0 };            // frames presented meanwhile
 	// Frame timing, per port: frames, frames later than one period after the one before (a frame missed), the time from the VBL to the
 	// present (sum and most); and how long the stamps queued behind draws in flight waited (sum, most, count).
-	struct PortTiming { uint64_t last, vblNs, vblMaxNs; uint32_t frames, missed; };
+	struct PortTiming { uint64_t last, vblNs, vblMaxNs; uint32_t frames, missed, gaps[4]; };   // gaps: frames 1, 2, 3 and 4 to 8 VBLs after the one before
 	PortTiming mPortTiming[8] {};
 	void timePresent(PortTiming &t);
 	uint64_t mVblAt { 0 }, mLateNs { 0 }, mLateMaxNs { 0 };
+	uint64_t mVblLateNs { 0 }, mVblLateMaxNs { 0 };   // how late the VBL events fired (the host's tick was busy)
+	uint32_t mVbls { 0 }, mVblsLate { 0 };            // VBL events, those 2 ms or more late
 	uint64_t mClocksAt { 0 };   // when the GFX clocks were last counted
 	// The draws by their target: a surface on the card, one in the guest's memory, a Metal texture shared, managed or private; their
 	// scissor rectangles' bytes.
@@ -1122,6 +1124,11 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			haveSignal = true;
 		}
 		at += c.length;
+
+		// A VBL due while a long run of commands is worked through raised now, not after them (Safari's live resize: some 30 a second
+		// came 2 to 5 ms late)
+		if (mNextVblNs && nowNs() >= mNextVblNs)
+			pollDisplay();
 	}
 	if (haveSignal && gTalk)
 		pvlog("host: %s: the batch signals stamp[%u] = %u", src.tag, src.stampIndex, lastSignal);
@@ -1539,7 +1546,8 @@ uint32_t RDNA4PvHost::takeSlot()
 	return slot;
 }
 
-// A draw's stream added to the batch (false: submit it alone). Its target is dirty from now on (drawing()).
+// A draw's, clear's or copy's stream added to the batch (false: submit it alone). Its target is dirty from now on (drawing()); a copy
+// (task and target 0) has none.
 bool RDNA4PvHost::batchDraw(const uint32_t *ib, uint32_t dwords, uint32_t task, uint32_t target)
 {
 	uint64_t cpu = 0;
@@ -1603,7 +1611,8 @@ void RDNA4PvHost::flushBatch()
 	mBatchFence[slot] = fence;
 
 	for (uint32_t i = 0; i < draws; i++)
-		dirtied(dirty[i] >> 16, dirty[i] & 0xffff, fence);
+		if (dirty[i])   // not a copy's
+			dirtied(dirty[i] >> 16, dirty[i] & 0xffff, fence);
 }
 
 // M1: a command's payload as dwords (up to 32), to work its layout out against what the guest asked for (tools/metal/m1/mtlprobe.m).
@@ -2439,6 +2448,13 @@ bool RDNA4PvHost::clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_
 		n += timeStamp(ib + n, true);
 	}
 
+	mClearBytes += static_cast<uint64_t>(pitch) * bpp * height;
+
+	// With the draws put together: alone, each of WindowServer's clears closed a batch (some 400 a second). Its slot and the target's
+	// mapping are noted with a submit no earlier than the batch's.
+	if (batchDraw(ib, n, task, tex))
+		return true;
+
 	memcpy(mGfxIb.cpu + slotAt, ib, n * 4);
 	__sync_synchronize();   // seen by the card (snooped) before the submit
 
@@ -2448,7 +2464,6 @@ bool RDNA4PvHost::clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_
 		return false;
 
 	mDrawSerial++;
-	mClearBytes += static_cast<uint64_t>(pitch) * bpp * height;
 	flying(fence, "clear by draw");
 	dirtied(task, tex, fence);
 
@@ -2498,6 +2513,10 @@ bool RDNA4PvHost::rowsOnCard(uint64_t src, uint32_t srcPitch, uint64_t dst, uint
 		return false;
 
 	n += timed ? timeStamp(ib + n, true) : 0;
+
+	// With the draws put together, as clears are: alone, each shadow's fill and write-back closed a batch.
+	if (batchDraw(ib, n, 0, 0))
+		return true;
 
 	__sync_synchronize();   // seen by the card (snooped) before the submit
 	roomForDraw();
@@ -5212,6 +5231,12 @@ void RDNA4PvHost::timePresent(PortTiming &t)
 	if (t.last && now - t.last > kVblPeriodNs * 3 / 2 && now - t.last < 4 * kVblPeriodNs)   // an animation, one frame or more missed
 		t.missed++;
 
+	// How smooth an animation was: the time since the last frame in VBLs (rounded), longer gaps an idle display's
+	const uint64_t gap = t.last ? (now - t.last + kVblPeriodNs / 2) / kVblPeriodNs : 0;
+
+	if (gap >= 1 && gap <= 8)
+		t.gaps[gap < 4 ? gap - 1 : 3]++;
+
 	t.last = now;
 	t.frames++;
 
@@ -5541,17 +5566,27 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		pvstat("host: render:   waits:%s", sites);
 	memset(mWaitSites, 0, sizeof(mWaitSites));
 
-	char ports[200] = "";
-	for (uint32_t p = 0, at = 0; p < 8 && at < sizeof(ports) - 64; p++) {
+	char ports[200] = "", gaps[200] = "";
+	for (uint32_t p = 0, at = 0, gat = 0; p < 8 && at < sizeof(ports) - 64 && gat < sizeof(gaps) - 64; p++) {
 		const PortTiming &t = mPortTiming[p];
 
-		if (t.frames)
-			at += snprintf(ports + at, sizeof(ports) - at, " port %u: %u (%u missed, VBL to present %llu us, most %llu us);", p, t.frames,
-			               t.missed, t.vblNs / t.frames / 1000, t.vblMaxNs / 1000);
+		if (!t.frames)
+			continue;
+
+		at += snprintf(ports + at, sizeof(ports) - at, " port %u: %u (%u missed, VBL to present %llu us, most %llu us);", p, t.frames,
+		               t.missed, t.vblNs / t.frames / 1000, t.vblMaxNs / 1000);
+		gat += snprintf(gaps + gat, sizeof(gaps) - gat, " port %u: %u/%u/%u/%u;", p, t.gaps[0], t.gaps[1], t.gaps[2], t.gaps[3]);
 	}
 	if (ports[0] || mLateDone)
 		pvstat("host: render:   frames:%s stamps behind draws %u, waited %llu us, most %llu us", ports, mLateDone,
 		       mLateDone ? mLateNs / mLateDone / 1000 : 0, mLateMaxNs / 1000);
+	if (gaps[0])
+		pvstat("host: render:   frames after 1, 2, 3 and 4 to 8 VBLs:%s", gaps);
+	if (mVbls)
+		pvstat("host: render:   VBL events: %u, %llu us late on average, %u by 2 ms or more, the latest %llu us", mVbls,
+		       mVblLateNs / mVbls / 1000, mVblsLate, mVblLateMaxNs / 1000);
+	mVbls = mVblsLate = 0;
+	mVblLateNs = mVblLateMaxNs = 0;
 
 	uint64_t clocks = 0, active = 0;
 
@@ -5652,8 +5687,14 @@ void RDNA4PvHost::pollDisplay() {
 		if (!mNextVblNs)
 			mNextVblNs = now + kVblPeriodNs;
 		if (now >= mNextVblNs) {
+			const uint64_t late = now - mNextVblNs;
+
 			frame = true;
 			mVblAt = now;
+			mVbls++;
+			mVblLateNs += late < 4 * kVblPeriodNs ? late : 0;
+			mVblLateMaxNs = late < 4 * kVblPeriodNs && late > mVblLateMaxNs ? late : mVblLateMaxNs;
+			mVblsLate += late >= 2000000 && late < 4 * kVblPeriodNs;
 			// the next frame is one period after the last due time; after a long stall start over instead of firing a burst
 			mNextVblNs = now - mNextVblNs > 4 * kVblPeriodNs ? now + kVblPeriodNs : mNextVblNs + kVblPeriodNs;
 		}

@@ -770,11 +770,12 @@ bool RDNA4Compute::vmSyncCpu(RtClient &c, uint64_t va, uint64_t end) {
 		if (pteEnd > kVmTableBytes)
 			return false;
 
-		memcpy(poolCpu + c.tableOffset + pde, shadow + pde, pdeEnd - pde);
-		memcpy(poolCpu + c.tableOffset + pte, shadow + pte, pteEnd - pte);
+		memcpy(poolWc + c.tableOffset + pde, shadow + pde, pdeEnd - pde);
+		memcpy(poolWc + c.tableOffset + pte, shadow + pte, pteEnd - pte);
 		at = to;
 	}
 
+	__builtin_ia32_sfence();   // the write-combined writes out before the read that posts them
 	(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + c.tableOffset);
 	flushHdp();
 	return true;
@@ -790,7 +791,8 @@ bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
 		return false;
 	}
 	if (c.tableCpu) {   // rtPreferCpuTables: written through the BAR, no SDMA job
-		memcpy(poolCpu + c.tableOffset + offset, reinterpret_cast<uint8_t *>(c.tableShadow) + offset, bytes);
+		memcpy(poolWc + c.tableOffset + offset, reinterpret_cast<uint8_t *>(c.tableShadow) + offset, bytes);
+		__builtin_ia32_sfence();
 		(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + c.tableOffset + offset);
 		flushHdp();
 		return true;
@@ -806,7 +808,8 @@ bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
 	/* Through the staging area 2 MiB at a time: it is 4 MiB, the table larger (the client's queue pages follow it). */
 	for (uint32_t at = offset; at < offset + bytes;) {
 		const uint32_t n = offset + bytes - at < (2u << 20) ? offset + bytes - at : 2u << 20;
-		memcpy(poolCpu + kVmTableStage, reinterpret_cast<uint8_t *>(c.tableShadow) + at, n);
+		memcpy(poolWc + kVmTableStage, reinterpret_cast<uint8_t *>(c.tableShadow) + at, n);
+		__builtin_ia32_sfence();
 		(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + kVmTableStage);
 		flushHdp();
 		uint32_t pkt[Sdma::kCopyDwords];
@@ -1909,7 +1912,9 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 		Sdma::constFill(fill, poolMc(table), 0, kVmTableBytes);
 		const bool zeroed = sdmaRun(fill, Sdma::kFillDwords, 2000);
 
-		memcpy(poolCpu + table, c->tableShadow, zeroed ? 0x3000 : kVmTableBytes);
+		memcpy(poolWc + table, c->tableShadow, zeroed ? 0x3000 : kVmTableBytes);
+		__builtin_ia32_sfence();
+		(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + table);
 		flushHdp();
 	}
 	const uint32_t qoff = kVmQueueBase + slot * kVmQueueStride;
