@@ -558,8 +558,13 @@ bool RDNA4Compute::logPreviousTrail(char *text, size_t size) {
 // ---------------------------------------------------------------------------
 
 void RDNA4Compute::threadMain(void *arg, wait_result_t) {
-	// Let the desktop come up first: nothing below is on its path.
-	IOSleep(5000);
+	uint32_t pvgpu = 0;
+
+	// Let the desktop come up first: nothing below is on its path. With the paravirtual GPU it is: WindowServer's first frames (the boot's
+	// progress bar) waited for the graphics ring, a second and more. Its test boot is known once NVRAM is (asked again meanwhile).
+	for (uint32_t ms = 0; ms < 5000 && !(Trial::option("rdna4-pvgpu", pvgpu) && pvgpu); ms += 100)
+		IOSleep(100);
+
 	static_cast<RDNA4Compute *>(arg)->runStages();
 	thread_terminate(current_thread());
 }

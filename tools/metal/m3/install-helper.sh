@@ -26,6 +26,7 @@ cat > "$plist" <<PLIST
 	<key>ProgramArguments</key><array><string>$bin</string><string>--serve</string></array>
 	<key>RunAtLoad</key><true/>
 	<key>KeepAlive</key><true/>
+	<key>ProcessType</key><string>Interactive</string>
 	<key>ThrottleInterval</key><integer>10</integer>
 	<key>StandardErrorPath</key><string>/var/log/rdna4-air2amdgpu.log</string>
 </dict>

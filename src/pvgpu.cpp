@@ -50,10 +50,13 @@ SYSCTL_INT(_debug, OID_AUTO, rdna4_pvtalk, CTLFLAG_RW | CTLFLAG_LOCKED, &gTalk, 
 static int gPresentOnCard = 1;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvpresent, CTLFLAG_RW | CTLFLAG_LOCKED, &gPresentOnCard, 0,
 	   "AMDRadeonRDNA4: copy a presented frame into the display's scanout on the card (1), or with the CPU (0)");
+static int gProfile;
+SYSCTL_INT(_debug, OID_AUTO, rdna4_pvprofile, CTLFLAG_RW | CTLFLAG_LOCKED, &gProfile, 0,
+	   "AMDRadeonRDNA4: time each submit on the card and name the fragment functions (and copies) that took it longest in the draw stats");
 static int gInPlace = 3;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvinplace, CTLFLAG_RW | CTLFLAG_LOCKED, &gInPlace, 0,
 	   "AMDRadeonRDNA4: what draws use in place (1 textures, 2 colour targets; 4 not IOSurface textures, 8 not Metal's); the rest is staged "
-	   "(16: without shadows, each draw's own copy)");
+	   "(16: without shadows, each draw's own copy; 32: the displays' frames not kept on the card)");
 
 namespace {
 
@@ -262,7 +265,7 @@ private:
 	static void placeShaders(uint32_t *code, const Jit *const shader[3], uint64_t rings, uint32_t outs);
 	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
 	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow = nullptr, uint32_t *width = nullptr,
-	                  uint32_t *height = nullptr, uint32_t *format = nullptr);
+	                  uint32_t *height = nullptr, uint32_t *format = nullptr, uint32_t *storage = nullptr);
 	struct Surface;
 	bool surfaceRange(uint32_t task, uint32_t id, Surface &out);
 	void dumpTexture(uint32_t task, uint32_t id);
@@ -321,10 +324,23 @@ private:
 	// and the card is not left idle while the CPU puts the next one together.
 	uint64_t mFlight[kInFlight] {};
 	uint32_t mFlightAt { 0 };
+	// Submits left in flight so far, and the fences of the last kSubmitFences: what used a mapping is waited for alone before it goes.
+	static constexpr uint32_t kSubmitFences = 64;
+	uint64_t mSubmits { 0 }, mSubmitFence[kSubmitFences] {};
+	void waitSubmit(uint64_t submit, uint32_t line = __builtin_LINE());
+	// rdna4_pvprofile: each submit's time on the card (RELEASE_MEM of the GPU's 100 MHz clock at its start and end into its slot of
+	// mTimes), added up by what it was (a fragment function's name, a copy, a clear, a present) once it is done.
+	char mSubmitName[kSubmitFences][24] {};
+	struct GpuTime { char name[24]; uint64_t ticks; uint32_t count; };
+	GpuTime mGpuTimes[24] {};
+	uint64_t mTimedTo { 0 }, mClearBytes { 0 };
+	bool profiling();
+	uint32_t timeStamp(uint32_t *out, bool end);
+	void addTimes();
 	struct Dirty { uint32_t key; uint64_t fence; };
 	Dirty mDirty[32] {};   // the targets of the draws in flight, key (task << 16) | resource
 	uint32_t mDirtyCount { 0 };
-	void flying(uint64_t fence);
+	void flying(uint64_t fence, const char *what = "?");
 	void landed();
 	void roomForDraw(uint32_t line = __builtin_LINE());
 	void waitFor(uint64_t fence, uint32_t line = __builtin_LINE());
@@ -393,6 +409,7 @@ private:
 	struct Mapping {
 		uint64_t *pages { nullptr };
 		uint64_t count { 0 }, handle { 0 }, gpu { 0 }, used { 0 };
+		uint64_t submit { 0 };   // the submit that uses it last (mSubmits then + 1)
 		IOMemoryDescriptor *memory { nullptr };
 		uint32_t task { 0 };
 		uint64_t first { 0 }, gen { 0 };
@@ -423,6 +440,28 @@ private:
 	GfxBuffers mPresentIb {};
 	bool presentOnCard(uint32_t port, uint32_t sid);
 	bool clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_t bytes, uint32_t pattern);
+	// Copies by the card (CP DMA in the graphics ring, after the work before them), each with an IB of its own of kDmaIbBytes, taken in turn.
+	static constexpr uint32_t kDmaSlots = 8, kDmaIbBytes = 64 * 1024;
+	static constexpr uint32_t kDmaRows = kDmaIbBytes / 28 - 8;   // DMA_DATA packets an IB holds, the idle barrier besides
+	GfxBuffers mDmaIb {};
+	GfxBuffers mTimes {};   // rdna4_pvprofile's slots
+	uint64_t mDmaFence[kDmaSlots] {};
+	uint32_t mDmaSlot { 0 };
+	bool rowsOnCard(uint64_t src, uint32_t srcPitch, uint64_t dst, uint32_t dstPitch, uint32_t rowLen, uint32_t rows);
+	// IOSurfaces kept on the card: the displays' frames (the surfaces presented) drawn, cleared, sampled and presented in VRAM, not across
+	// the bus in the guest's memory (each pass of WindowServer's read and wrote a 4K frame there, and a present copied it once more). The
+	// guest's memory has what they hold only once they are written back, before the CPU reads or writes it (cardToMemory).
+	struct CardSurface { OSObject *surface; IOMemoryDescriptor *memory; uint64_t base, bytes, handle, gpu, used; bool loaded; };
+	static constexpr uint32_t kCardSurfaces = 8;
+	CardSurface mCardSurface[kCardSurfaces] {};
+	uint64_t mCardClock { 0 };
+	uint32_t mCardLoads { 0 }, mCardBacks { 0 };   // for the draw stats
+	CardSurface *cardSurface(const void *surface);
+	void keepOnCard(void *surface);
+	bool onCard(const Surface &s, uint64_t bytes, uint64_t &gpu);
+	void cardToMemory(const void *surface);
+	void dropCardSurface(CardSurface &c);
+	void dropReleasedSurfaces();
 	// A dword in host memory the card writes when everything before it in the ring is done, caches flushed (idleBarrier), and waits for.
 	GfxBuffers mIdle {};
 	uint32_t mIdleSeq { 0 };
@@ -485,6 +524,12 @@ private:
 	void timePresent(PortTiming &t);
 	uint64_t mVblAt { 0 }, mLateNs { 0 }, mLateMaxNs { 0 };
 	uint64_t mClocksAt { 0 };   // when the GFX clocks were last counted
+	// The draws by their target: a surface on the card, one in the guest's memory, a Metal texture shared, managed or private; their
+	// scissor rectangles' bytes.
+	uint32_t mTargetDraws[5] {};
+	struct CopiedTop { uint64_t at, bytes; uint32_t task, width, height, rowBytes, times; bool surface; };
+	CopiedTop mCopiedTop[8] {};
+	uint64_t mTargetBytes[5] {};
 	uint32_t mLateDone { 0 };
 	uint32_t mInPlace { 0 }, mCopied { 0 };   // textures read in place, and copied
 	// Shadows: textures the card cannot read or write in place (rows not 128 bytes apart) at a pitch it can, in host memory, kept while
@@ -545,8 +590,11 @@ private:
 	bool shadowCurrent(const Shadow &s) const;
 	Shadow *makeShadow(const ShadowKey &k);
 	bool fillShadow(Shadow &s, IOMemoryDescriptor *memory, bool written);
+	bool fillShadowOnCard(Shadow &s, IOMemoryDescriptor *memory);
+	uint32_t mCardFills { 0 }, mCardFlushes { 0 };   // shadows on the card filled and written back by the card, for the draw stats
 	bool shadowTexture(uint32_t task, uint32_t id, const TextureSource &src, uint32_t bpp, uint64_t &gpu, uint32_t &pitch);
 	void dropShadows(const OSObject *surface, uint32_t task, uint64_t at, bool all = false);
+	void clearShadows(const OSObject *surface, uint32_t task, uint64_t at, uint32_t tex, uint32_t pattern);
 	void dropShadowRange(uint32_t task, uint64_t va, uint64_t bytes);
 	// A colour target the card cannot write in place, drawn into its shadow from the first draw into it until another target, the end of
 	// the command buffer, a blit, a dispatch or a clear (flushHeld: its drawn rows written back), its draws left in flight; instead of each
@@ -1145,6 +1193,7 @@ void RDNA4PvHost::waitDraws(uint32_t line)
 
 	mPending = 0;
 	mDirtyCount = 0;
+	addTimes();
 	completeLate();
 }
 
@@ -1162,8 +1211,10 @@ void RDNA4PvHost::noteWait(uint32_t line)
 }
 
 // A submit without a wait: in flight from now on.
-void RDNA4PvHost::flying(uint64_t fence)
+void RDNA4PvHost::flying(uint64_t fence, const char *what)
 {
+	mSubmitFence[++mSubmits % kSubmitFences] = fence;
+	strlcpy(mSubmitName[mSubmits % kSubmitFences], what, sizeof(mSubmitName[0]));
 	mFlight[(mFlightAt + mPending) % kInFlight] = fence;
 	mPending++;
 	mLastFence = fence;
@@ -1176,6 +1227,8 @@ void RDNA4PvHost::landed()
 		mFlightAt = (mFlightAt + 1) % kInFlight;
 		mPending--;
 	}
+
+	addTimes();
 
 	if (!mPending) {
 		mDirtyCount = 0;
@@ -1222,6 +1275,80 @@ void RDNA4PvHost::waitFor(uint64_t fence, uint32_t line)
 	}
 
 	landed();
+}
+
+// Whether submits are timed (rdna4_pvprofile), their slots made.
+bool RDNA4PvHost::profiling()
+{
+	uint64_t cpu = 0;
+
+	if (gProfile && !mTimes.handle && gCompute->rtAllocHost(this, kernel_task, kSubmitFences * 16, 0, mTimes.handle, mTimes.gpu, cpu) == kIOReturnSuccess)
+		mTimes.cpu = reinterpret_cast<uint8_t *>(cpu);
+
+	return gProfile && mTimes.cpu;
+}
+
+// A RELEASE_MEM of the GPU's clock into the next submit's slot, at its start or end: written when the work before it is done. 8 dwords.
+uint32_t RDNA4PvHost::timeStamp(uint32_t *out, bool end)
+{
+	const uint64_t at = mTimes.gpu + ((mSubmits + 1) % kSubmitFences) * 16 + (end ? 8 : 0);
+	const uint32_t n = Pm4::releaseMem(out, at, 0);
+
+	out[1] = 0x28 | Pm4::kReleaseEventIndex5;   // BOTTOM_OF_PIPE_TS, no cache action
+	out[2] = 3u << 29;                          // DATA_SEL 3: the 64-bit GPU clock
+
+	return n;
+}
+
+// The times of the submits done since added up by name.
+void RDNA4PvHost::addTimes()
+{
+	const uint64_t done = mSubmits - mPending;
+
+	for (uint64_t s = mTimedTo + 1; mTimes.cpu && s <= done; s++) {
+		auto *t = reinterpret_cast<volatile uint64_t *>(mTimes.cpu + (s % kSubmitFences) * 16);
+		const char *name = mSubmitName[s % kSubmitFences];
+		GpuTime *slot = nullptr;
+
+		if (done - s >= kSubmitFences || !t[0] || t[1] < t[0])
+			continue;
+
+		for (GpuTime &g : mGpuTimes) {   // its entry, else a free one
+			if (!strcmp(g.name, name)) {
+				slot = &g;
+				break;
+			}
+			slot = !slot && !g.name[0] ? &g : slot;
+		}
+
+		if (slot) {
+			if (!slot->name[0])
+				strlcpy(slot->name, name, sizeof(slot->name));
+			slot->ticks += t[1] - t[0];
+			slot->count++;
+		}
+
+		t[0] = t[1] = 0;
+	}
+
+	mTimedTo = done;
+}
+
+// Submit number `submit` (of flying()'s count) done: waited for when it may be in flight, alone (and those before it); everything when it
+// is the one being put together.
+void RDNA4PvHost::waitSubmit(uint64_t submit, uint32_t line)
+{
+	if (submit > mSubmits) {
+		waitDraws(line);
+		return;
+	}
+
+	// never more than kInFlight in flight, in order: one that many submits back is done
+	if (!mPending || mSubmits - submit >= kInFlight)
+		return;
+
+	if (!gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(mSubmitFence[submit % kSubmitFences])))
+		waitFor(mSubmitFence[submit % kSubmitFences], line);
 }
 
 // Target `id` drawn into by the submit with `fence`: dirty until it is done.
@@ -1645,7 +1772,7 @@ bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t
 // [13] bytes per row, [15] width, ...} (mtlprobe's 64x64 BGRA8 render target: 0x4000 bytes at page 0x101, 0x100 per row: linear; measured
 // 2026-10-21). Where the pixel format is (0x04010101 at [8]?) is still open; the first descriptors of a boot are logged.
 bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow, uint32_t *width, uint32_t *height,
-                               uint32_t *format) {
+                               uint32_t *format, uint32_t *storage) {
 	uint32_t rec[3] = {}, desc[29];
 	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) ||
 	    ((rec[0] & 0xff) != 2 && (rec[0] & 0xff) != 3) || (rec[0] >> 8) < sizeof(desc) || !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(desc), sizeof(desc))) {
@@ -1674,6 +1801,8 @@ bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_
 		*width = desc[15];
 	if (height)
 		*height = desc[16];
+	if (storage)   // Metal's storage mode: 0 shared, 1 managed, 2 private (rdna4/probes/storage.swift, 2026-11-06)
+		*storage = desc[25] >> 20 & 3;
 	if (format) {   // {..., 0x2c, its own id, (Metal pixel format << 16) | usage} (0: not found)
 		*format = 0;
 		for (uint32_t j = 19; j + 1 < 29; j++)
@@ -1894,17 +2023,19 @@ uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t by
 	// On the card in the graphics ring, after the draws before: the host does not wait for them (the clears of WindowServer's passes were
 	// most of its waits with two displays).
 	if (ok && mapGuest(task, va, len, handle, gpu) && clearOnCard(task, tex, gpu, len, half ? 0 : pixel)) {
-		dropShadows(nullptr, task, va);
+		clearShadows(nullptr, task, va, tex, half ? 0 : pixel);
 
 		return tex;
 	}
 
-	if (!found && surfaceRange(task, tex, surface) && surface.format == 80 && surface.width <= 16384 &&
-	    mapMemory(surface.memory, surface.base, static_cast<uint64_t>(surface.bytesPerRow) * surface.height, handle, gpu) &&
-	    clearOnCard(task, tex, gpu, static_cast<uint64_t>(surface.bytesPerRow) * surface.height, pixel)) {
-		dropShadows(surface.surface, task, surface.base);
+	if (!found && surfaceRange(task, tex, surface) && surface.format == 80 && surface.width <= 16384) {
+		const uint64_t bytes = static_cast<uint64_t>(surface.bytesPerRow) * surface.height;
 
-		return tex;
+		if ((onCard(surface, bytes, gpu) || mapMemory(surface.memory, surface.base, bytes, handle, gpu)) && clearOnCard(task, tex, gpu, bytes, pixel)) {
+			clearShadows(surface.surface, task, surface.base, tex, pixel);
+
+			return tex;
+		}
 	}
 
 	waitDraws();   // cleared with SDMA or the CPU, after the draws before
@@ -1913,6 +2044,7 @@ uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t by
 		dropShadows(nullptr, task, va);
 
 	if (!ok && (surface.memory || surfaceRange(task, tex, surface)) && surface.format == 80 && surface.width <= 16384) {   // a BGRA8 IOSurface: row by row
+		cardToMemory(surface.surface);
 		dropShadows(surface.surface, task, surface.base);
 		auto *line = static_cast<uint32_t *>(IOMalloc(surface.width * 4));
 		ok = line;
@@ -1980,7 +2112,11 @@ bool RDNA4PvHost::clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_
 	if (!mGfxIb.cpu || !bytes || (bytes & 3) || !(n = idleBarrier(ib)))
 		return false;
 
-	while (at < bytes && n + 7 <= RDNA4_TRIRUN_PAGE / 4) {
+	const bool timed = profiling();
+
+	n += timed ? timeStamp(ib + n, false) : 0;
+
+	while (at < bytes && n + 7 + 8 <= RDNA4_TRIRUN_PAGE / 4) {
 		const uint32_t len = static_cast<uint32_t>(bytes - at < kChunk ? bytes - at : kChunk);
 
 		at += len;
@@ -1989,6 +2125,8 @@ bool RDNA4PvHost::clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_
 
 	if (at < bytes)
 		return false;
+
+	n += timed ? timeStamp(ib + n, true) : 0;
 
 	readyDraws();
 
@@ -2004,10 +2142,188 @@ bool RDNA4PvHost::clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_
 		return false;
 
 	mDrawSerial++;
-	flying(fence);
+	mClearBytes += bytes;
+	flying(fence, "clear");
 	dirtied(task, tex, fence);
 
 	return true;
+}
+
+static uint32_t dmaData(uint32_t *out, uint64_t src, uint64_t dst, uint32_t bytes, bool sync);
+
+// `rows` rows of `rowLen` bytes from `src`, `srcPitch` apart, to `dst`, `dstPitch` apart, copied by the card in the graphics ring after
+// the work before them, left in flight; in chunks of 1 MiB when both pitches are the row's. False when the IB does not hold them.
+bool RDNA4PvHost::rowsOnCard(uint64_t src, uint32_t srcPitch, uint64_t dst, uint32_t dstPitch, uint32_t rowLen, uint32_t rows)
+{
+	static constexpr uint32_t kChunk = 1u << 20;
+	const bool whole = srcPitch == rowLen && dstPitch == rowLen;
+	const uint64_t total = whole ? static_cast<uint64_t>(rowLen) * rows : rows;
+	uint64_t cpu = 0, fence = 0;
+
+	if (!rowLen || !rows || (!whole && rows > kDmaRows))
+		return false;
+
+	if (!mDmaIb.handle && gCompute->rtAllocHost(this, kernel_task, kDmaIbBytes * kDmaSlots, RDNA4_HOST_EXECUTABLE, mDmaIb.handle, mDmaIb.gpu,
+	                                            cpu) == kIOReturnSuccess)
+		mDmaIb.cpu = reinterpret_cast<uint8_t *>(cpu);
+
+	if (!mDmaIb.cpu)
+		return false;
+
+	const uint32_t slot = mDmaSlot++ % kDmaSlots;
+
+	if (mDmaFence[slot] && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(mDmaFence[slot])))
+		waitFor(mDmaFence[slot]);   // its IB still read by the card
+
+	auto *ib = reinterpret_cast<uint32_t *>(mDmaIb.cpu + static_cast<uint64_t>(slot) * kDmaIbBytes);
+	uint32_t n = idleBarrier(ib);
+	const bool timed = n && profiling();
+
+	n += timed ? timeStamp(ib + n, false) : 0;
+
+	for (uint64_t i = 0; n && i < total && n + 7 + 8 <= kDmaIbBytes / 4;) {
+		const uint64_t from = whole ? i : i * srcPitch, to = whole ? i : i * dstPitch;
+		const uint32_t len = whole ? static_cast<uint32_t>(total - i < kChunk ? total - i : kChunk) : rowLen;
+
+		i += whole ? len : 1;
+		n += dmaData(ib + n, src + from, dst + to, len, i >= total);
+	}
+
+	if (!n || n + 7 + 8 > kDmaIbBytes / 4)
+		return false;
+
+	n += timed ? timeStamp(ib + n, true) : 0;
+
+	__sync_synchronize();   // seen by the card (snooped) before the submit
+	roomForDraw();
+
+	if (submitGfx(mDmaIb.gpu + static_cast<uint64_t>(slot) * kDmaIbBytes, n, fence) != kIOReturnSuccess)
+		return false;
+
+	mDrawSerial++;
+	flying(fence, "copy");
+	mDmaFence[slot] = fence;
+
+	return true;
+}
+
+RDNA4PvHost::CardSurface *RDNA4PvHost::cardSurface(const void *surface)
+{
+	for (CardSurface &c : mCardSurface)
+		if (surface && c.surface == surface)
+			return &c;
+
+	return nullptr;
+}
+
+// A surface just presented kept on the card from its next use on: a frame of a display, drawn and presented again and again.
+void RDNA4PvHost::keepOnCard(void *surface)
+{
+	CardSurface *slot = nullptr;
+	IOMemoryDescriptor *md = surface ? gSurfaceFns.memory(surface) : nullptr;
+	const uint64_t bpr = md ? gSurfaceFns.bytesPerRow(surface) : 0, bytes = bpr * (md ? gSurfaceFns.height(surface) : 0);
+
+	if ((gInPlace & 32) || !md || cardSurface(surface) || gSurfaceFns.planeCount(surface) > 1 || (bpr % 128) || (gSurfaceFns.baseOffset(surface) & 0xff) || !bytes ||
+	    gSurfaceFns.baseOffset(surface) + bytes > md->getLength())
+		return;
+
+	dropReleasedSurfaces();
+
+	for (CardSurface &c : mCardSurface)   // a free one, else the least recently used
+		slot = !c.surface ? &c : slot && (!slot->surface || slot->used <= c.used) ? slot : &c;
+
+	if (slot->surface) {
+		cardToMemory(slot->surface);
+		dropCardSurface(*slot);
+	}
+
+	static_cast<OSObject *>(surface)->retain();
+	*slot = {static_cast<OSObject *>(surface), md, gSurfaceFns.baseOffset(surface), bytes, 0, 0, ++mCardClock, false};
+}
+
+// Surface `s` on the card (its VRAM copy at `gpu`) when it is kept there; made and loaded with what the guest's memory has on first use.
+// Not again when its lock seeds move: a frame's do with every one WindowServer draws, and the CPU does not write frames.
+bool RDNA4PvHost::onCard(const Surface &s, uint64_t bytes, uint64_t &gpu)
+{
+	CardSurface *c = cardSurface(s.surface);
+	uint64_t handle = 0, src = 0;
+
+	if (c && (gInPlace & 32))   // switched off: back to the guest's memory
+		cardToMemory(c->surface);
+
+	if (!c || (gInPlace & 32) || s.base != c->base || bytes > c->bytes)
+		return false;
+
+	if (!c->handle && gCompute->rtAlloc(this, c->bytes, c->handle, c->gpu) != kIOReturnSuccess) {
+		c->handle = 0;
+		return false;
+	}
+
+	if (!c->loaded) {
+		if (c->memory->prepare() != kIOReturnSuccess)
+			return false;
+
+		const bool ok = mapMemory(c->memory, c->base, c->bytes, handle, src) && rowsOnCard(src, static_cast<uint32_t>(c->bytes), c->gpu,
+		                                                                                    static_cast<uint32_t>(c->bytes), static_cast<uint32_t>(c->bytes), 1);
+
+		c->memory->complete();
+
+		if (!ok)
+			return false;
+
+		c->loaded = true;
+		mCardLoads++;
+	}
+
+	c->used = ++mCardClock;
+	gpu = c->gpu;
+
+	return true;
+}
+
+// What the card drew into a surface it keeps written back into the guest's memory, before the CPU reads or writes it there; the surface
+// is then the guest's memory's again until it is presented anew.
+void RDNA4PvHost::cardToMemory(const void *surface)
+{
+	CardSurface *c = cardSurface(surface);
+	uint64_t handle = 0, dst = 0;
+
+	if (!c)
+		return;
+
+	if (c->loaded && c->memory->prepare() == kIOReturnSuccess) {
+		const uint32_t bytes = static_cast<uint32_t>(c->bytes);
+
+		if (mapMemory(c->memory, c->base, c->bytes, handle, dst) && rowsOnCard(c->gpu, bytes, dst, bytes, bytes, 1))
+			mCardBacks++;
+
+		c->memory->complete();
+	}
+
+	waitDraws();
+	dropCardSurface(*c);
+}
+
+// A kept surface given up: its VRAM freed (after the draws that use it), the surface released.
+void RDNA4PvHost::dropCardSurface(CardSurface &c)
+{
+	if (c.handle) {
+		waitDraws();
+		gCompute->rtFree(this, c.handle);
+	}
+
+	if (c.surface)
+		c.surface->release();
+
+	c = {};
+}
+
+// The kept surfaces only the host still holds (the guest freed them) given up, without writing them back.
+void RDNA4PvHost::dropReleasedSurfaces()
+{
+	for (CardSurface &c : mCardSurface)
+		if (c.surface && c.surface->getRetainCount() <= 1)
+			dropCardSurface(c);
 }
 
 // M4: the value dword of register `reg` (offset as in the packet: context from 0xa000, SH from 0x2c00, uconfig from 0xc000) in a stream's
@@ -2038,7 +2354,7 @@ struct RDNA4PvHost::TextureSource {
 
 bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out)
 {
-	uint32_t rec[3], td[64] = {};
+	uint32_t rec[3], td[160] = {};   // a mipmapped texture's levels come before its format (6 levels: 29 dwords more)
 
 	if (!readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
 		return false;
@@ -2111,8 +2427,11 @@ bool RDNA4PvHost::readTextureRow(uint32_t task, const TextureSource &src, uint32
 {
 	const uint64_t at = static_cast<uint64_t>(y / src.height) * src.imageBytes + static_cast<uint64_t>(y % src.height) * src.rowBytes;
 
-	if (src.surface.memory)
+	if (src.surface.memory) {
+		cardToMemory(src.surface.surface);
+
 		return src.surface.memory->readBytes(src.surface.base + at, dst, bytes) == bytes;
+	}
 
 	return readGuest(task, src.va + at, dst, bytes);
 }
@@ -2206,7 +2525,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		const bool kind = src.surface.memory ? !(gInPlace & 4) : !(gInPlace & 8);
 		const bool inPlace = (gInPlace & 1) && kind && depth == 1 && pitched && based;
 
-		if (inPlace && (src.surface.memory ? mapMemory(src.surface.memory, src.surface.base, used, out[k].handle, gpu)
+		if (inPlace && (src.surface.memory ? onCard(src.surface, used, gpu) || mapMemory(src.surface.memory, src.surface.base, used, out[k].handle, gpu)
 		                                   : mapGuest(task, src.va, used, out[k].handle, gpu))) {
 			out[k].va = 0;   // nothing to copy back: the card writes the guest's memory itself
 			out[k].writable = false;
@@ -2379,7 +2698,10 @@ RDNA4PvHost::Shadow *RDNA4PvHost::makeShadow(const ShadowKey &k)
 	if (!s)
 		return nullptr;
 
-	if (s->handle && s->bytes < bytes)
+	// on the card when the card can fill it and write it back (a 2D texture, a DMA packet a row), else in host memory for the CPU
+	const bool onCard = k.depth == 1 && k.height <= kDmaRows && !(gInPlace & 64);
+
+	if (s->handle && (s->bytes < bytes || onCard != !s->cpu))
 		freeShadow(*s);
 
 	// within the budget: the least recently used ones' memory given back
@@ -2401,8 +2723,10 @@ RDNA4PvHost::Shadow *RDNA4PvHost::makeShadow(const ShadowKey &k)
 
 	if (!s->handle) {
 		uint64_t cpu = 0;
+		const IOReturn r = onCard ? gCompute->rtAlloc(this, bytes, s->handle, s->gpu)
+		                          : gCompute->rtAllocHost(this, kernel_task, bytes, 0, s->handle, s->gpu, cpu);
 
-		if (gCompute->rtAllocHost(this, kernel_task, bytes, 0, s->handle, s->gpu, cpu) != kIOReturnSuccess) {
+		if (r != kIOReturnSuccess) {
 			s->handle = 0;
 
 			return nullptr;
@@ -2444,6 +2768,11 @@ bool RDNA4PvHost::fillShadow(Shadow &s, IOMemoryDescriptor *memory, bool written
 	const uint32_t rowLen = s.width * s.bpp;
 	bool ok = true;
 
+	cardToMemory(s.surface);
+
+	if (!s.cpu)
+		return fillShadowOnCard(s, memory);
+
 	if (written || !shadowIdle(s))
 		waitDraws();   // a draw in flight writes the texture, or reads the shadow
 
@@ -2462,8 +2791,52 @@ bool RDNA4PvHost::fillShadow(Shadow &s, IOMemoryDescriptor *memory, bool written
 	__sync_synchronize();   // seen by the card (snooped) before the submit
 	mCopyNs += nowNs() - from;
 	mCopiedBytes += static_cast<uint64_t>(rowLen) * s.height * s.depth;
+
+	CopiedTop *slot = nullptr;
+	for (CopiedTop &t : mCopiedTop) {   // the textures copied most: this one's entry, else the one copied least
+		if (t.at == s.at && t.task == s.task) {
+			slot = &t;
+			break;
+		}
+		slot = !slot || t.bytes < slot->bytes ? &t : slot;
+	}
+	if (slot->at != s.at || slot->task != s.task)
+		*slot = {s.at, 0, s.task, s.width, s.height, s.rowBytes, 0, s.surface != nullptr};
+	slot->bytes += static_cast<uint64_t>(rowLen) * s.height * s.depth;
+	slot->times++;
+
 	s.valid = ok;
 	s.when = nowNs();
+
+	return ok;
+}
+
+// A shadow on the card filled by the card: the guest's rows copied into it in the graphics ring, after the draws before (which may write
+// the texture, or read the shadow), before the draws after; the CPU neither copies nor waits.
+bool RDNA4PvHost::fillShadowOnCard(Shadow &s, IOMemoryDescriptor *memory)
+{
+	const uint64_t span = static_cast<uint64_t>(s.rowBytes) * (s.height - 1) + s.width * s.bpp;
+	uint64_t handle = 0, src = 0;
+	bool ok = memory ? memory->prepare() == kIOReturnSuccess : true;
+
+	if (ok) {   // a surface's memory mapped from 256 bytes below (mapMemory's alignment)
+		ok = (memory ? mapMemory(memory, s.at & ~0xffull, span + (s.at & 0xff), handle, src) : mapGuest(s.task, s.at, span, handle, src)) &&
+		     rowsOnCard(src + (memory ? s.at & 0xff : 0), s.rowBytes, s.gpu, s.pitch, s.width * s.bpp, s.height);
+
+		if (memory)
+			memory->complete();
+	}
+
+	if (s.surface) {
+		s.lockSeed = gSurfaceFns.lockSeed(s.surface);
+		s.unlockSeed = gSurfaceFns.unlockSeed(s.surface);
+	}
+
+	mCopiedBytes += static_cast<uint64_t>(s.width) * s.bpp * s.height;
+	mCardFills++;
+	s.valid = ok;
+	s.when = nowNs();
+	s.serial = mDrawSerial;   // the fill in flight writes it
 
 	return ok;
 }
@@ -2503,6 +2876,19 @@ void RDNA4PvHost::dropShadows(const OSObject *surface, uint32_t task, uint64_t a
 
 		if (all || (s.surface == surface && (surface || s.task == task) && s.at == at))
 			s.valid = false;
+	}
+}
+
+// The shadows on the card of a texture just cleared on the card cleared with it (they hold what the guest has then without being filled
+// anew; a view of other than 4 bytes a pixel only when cleared to 0); the others dropped.
+void RDNA4PvHost::clearShadows(const OSObject *surface, uint32_t task, uint64_t at, uint32_t tex, uint32_t pattern)
+{
+	for (Shadow &s : mShadows) {
+		if (s.surface != surface || (!surface && s.task != task) || s.at != at || (mHeld.active && mHeld.shadow == &s))
+			continue;
+
+		s.valid = s.handle && !s.cpu && (!pattern || s.bpp == 4) && clearOnCard(task, tex, s.gpu, s.bytes, pattern);
+		s.when = nowNs();
 	}
 }
 
@@ -2556,6 +2942,7 @@ bool RDNA4PvHost::holdTarget(uint32_t task, uint32_t target, uint64_t va, const 
 		return true;
 
 	flushHeld();
+	cardToMemory(surface.surface);
 
 	Shadow *s = findShadow(key);
 
@@ -2591,6 +2978,19 @@ void RDNA4PvHost::flushHeld()
 	const uint32_t rowLen = s.width * s.bpp;
 
 	h.active = false;
+
+	if (h.top < h.bottom && !s.cpu) {   // on the card: written back by it, left in flight before the batch's stamp
+		const uint64_t span = static_cast<uint64_t>(s.rowBytes) * (h.bottom - h.top - 1) + rowLen, at = s.at + static_cast<uint64_t>(h.top) * s.rowBytes;
+		uint64_t handle = 0, dst = 0;
+
+		if (!(h.memory ? mapMemory(h.memory, at & ~0xffull, span + (at & 0xff), handle, dst) : mapGuest(s.task, at, span, handle, dst)) ||
+		    !rowsOnCard(s.gpu + static_cast<uint64_t>(h.top) * s.pitch, s.pitch, dst + (h.memory ? at & 0xff : 0), s.rowBytes, rowLen,
+		                h.bottom - h.top))
+			pvstat("host: render: a held target of %ux%u not written back", s.width, s.height);
+
+		mCardFlushes++;
+		h.top = h.bottom;
+	}
 
 	if (h.top < h.bottom)
 		waitDraws();
@@ -2695,6 +3095,7 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 	for (Mapping &m : mMap) {
 		if (m.count == count && !memcmp(m.pages, pages, count * 8)) {
 			m.used = mMapClock;
+			m.submit = mSubmits + 1;
 			gpu = m.gpu;
 			if (entry)
 				*entry = &m;
@@ -2716,7 +3117,7 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 			oldest = m.handle && m.used <= mMapFloor && (!oldest || m.used < oldest->used) ? &m : oldest;
 		if (!oldest)
 			break;
-		waitDraws();   // a draw in flight may use it
+		waitSubmit(oldest->submit);   // a draw in flight may use it
 		dropMapping(*oldest);
 		ok = gCompute->rtMapPages(this, pages, count, h, gpu) == kIOReturnSuccess;
 	}
@@ -2740,10 +3141,10 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 		return false;
 	}
 	if (lru->handle)
-		waitDraws();   // a draw in flight may use it
+		waitSubmit(lru->submit);   // a draw in flight may use it
 	dropMapping(*lru);
 	memcpy(copy, pages, count * 8);
-	*lru = {copy, count, h, gpu, mMapClock};
+	*lru = {copy, count, h, gpu, mMapClock, mSubmits + 1};
 	if (entry)
 		*entry = lru;
 
@@ -2771,6 +3172,7 @@ RDNA4PvHost::Mapping *RDNA4PvHost::keyedMapping(const void *memory, uint32_t tas
 
 		if (memory || (m.task == task && m.gen == gen)) {
 			m.used = ++mMapClock;
+			m.submit = mSubmits + 1;
 
 			return &m;
 		}
@@ -3139,7 +3541,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// RGBA8 (70, 71) as BGRA8, but already in the staged target's order; RGBA16Float (115: CoreAnimation renders symbols into it) as
 	// itself, 8 bytes a pixel.
 	const auto known = [](uint32_t f) { return f == 70 || f == 71 || f == 80 || f == 81 || f == 115; };
-	const bool found = !why && textureRange(task, target, &va, &len, &bpr, &width, &texHeight, &targetFormat) && width;
+	uint32_t storage = 0;
+	const bool found = !why && textureRange(task, target, &va, &len, &bpr, &width, &texHeight, &targetFormat, &storage) && width;
 	const bool fitsKnown = known(targetFormat) && texHeight && static_cast<uint64_t>(bpr) * texHeight <= len;
 	const bool fitsPlain = !targetFormat && bpr == width * 4 && bpr && len % bpr == 0;   // of unknown format: unpadded 32-bit rows
 
@@ -3194,6 +3597,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		return;
 	}
 
+	const uint32_t kind = surface.memory ? (cardSurface(surface.surface) ? 0 : 1) : 2 + storage;
+
+	mTargetDraws[kind]++;
+	mTargetBytes[kind] += static_cast<uint64_t>(sx2 - sx) * (sy2 - sy) * tp;
+
 	// The buffers kept for the boot (made by the first draw), and the target for this one.
 	auto make = [&](GfxBuffers &g, uint64_t bytes) { return g.handle || gCompute->rtAlloc(this, bytes, g.handle, g.gpu) == kIOReturnSuccess; };
 	// The state page and the IB in host memory the CPU writes in place: an SDMA copy each was two of a draw's waits. Else as the others.
@@ -3246,7 +3654,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		const uint64_t bytes = static_cast<uint64_t>(bpr) * height;
 
 		if (inPlace && surface.memory)
-			return mapMemory(surface.memory, surface.base, bytes, tgt.handle, tgt.gpu);
+			return onCard(surface, bytes, tgt.gpu) || mapMemory(surface.memory, surface.base, bytes, tgt.handle, tgt.gpu);
 
 		if (inPlace)
 			return mapGuest(task, va, bytes, tgt.handle, tgt.gpu);
@@ -3507,6 +3915,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	if (ok && staged && drawing(task, target))
 		waitDraws();
 
+	if (ok && staged)
+		cardToMemory(surface.surface);
+
 	for (uint32_t y = sy; y < sy2 && ok && staged; y++)
 		ok = surface.memory ? surface.memory->readBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
 		                    : readGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * tp);
@@ -3519,20 +3930,40 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		swap();
 		// each step's result, so that a draw that fails says where
 		const char *step = "target in";
+		uint64_t t[6] = {nowNs()};
 		IOReturn r = !staged || pooled ? kIOReturnSuccess
 		                               : gCompute->rtCopy(this, tgt.handle, regionAt, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), regionBytes, true);
+		t[1] = nowNs();
 
 		if (r == kIOReturnSuccess && newCode) {
 			waitDraws();   // a draw in flight may run the pair this slot held
 			step = "code in";
 			mCodeIns++;
-			r = gCompute->rtCopy(this, mGfxCode.handle, codeAt, kernel_task, reinterpret_cast<mach_vm_address_t>(code), sizeof(code), true);
+
+			// Only what each shader takes, with its pad of s_code_end: the rest of the slot is never run (the shaders end in s_endpgm). It
+			// was the whole slot, 640 KiB through the bounce buffer, for a few KiB of code.
+			for (unsigned k = 1; k <= 2 && r == kIOReturnSuccess; k++) {
+				const uint32_t at = k == 1 ? 0 : RDNA4_TRI_PS_OFFSET;
+				const uint32_t bytes = (reinterpret_cast<const uint32_t *>(shader[k]->gfx)[2] + 4 * RDNA4_TRI_SHADER_PAD + 255) & ~255u;
+
+				r = gCompute->rtCopy(this, mGfxCode.handle, codeAt + at, kernel_task, reinterpret_cast<mach_vm_address_t>(code) + at, bytes, true);
+			}
+
 			mCode[pair].valid = r == kIOReturnSuccess;
 		}
+
+		t[2] = nowNs();
 
 		if (r == kIOReturnSuccess) {
 			step = "state in";
 			r = upload(mGfxMisc, misc, sizeof(misc));
+		}
+
+		if (profiling() && total + 16 <= sizeof(ib) / 4) {   // timed: its start and end
+			memmove(ib + 8, ib, total * 4);
+			timeStamp(ib, false);
+			total += 8;
+			total += timeStamp(ib + total, true);
 		}
 
 		if (r == kIOReturnSuccess) {
@@ -3540,14 +3971,26 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			r = upload(mGfxIb, ib, total * 4);
 		}
 
+		t[3] = nowNs();
+
 		if (r == kIOReturnSuccess)
 			roomForDraw();
+
+		t[4] = nowNs();
 
 		if (r == kIOReturnSuccess) {
 			step = "submit";
 			r = submitGfx(ibGpu, total, fence);
 			mDrawSerial += r == kIOReturnSuccess;
 		}
+
+		t[5] = nowNs();
+
+		static uint32_t slowLines;
+		if (t[5] - targetFrom > 30000000 && slowLines++ < 12)
+			pvstat("host: render: slow draw: rows %llu, target in %llu, code %llu, state and IB %llu, room %llu, submit %llu us (%s, staged %d, new code %d)",
+			       (t[0] - targetFrom) / 1000, (t[1] - t[0]) / 1000, (t[2] - t[1]) / 1000, (t[3] - t[2]) / 1000, (t[4] - t[3]) / 1000, (t[5] - t[4]) / 1000,
+			       name[2], staged, newCode);
 
 		// Waited for now when the CPU has to finish the draw (a staged target or texture to copy back, a runtime buffer to free), else left
 		// in flight with those before it.
@@ -3563,7 +4006,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		if (r == kIOReturnSuccess && !sync) {
 			mPhaseNs[1] += nowNs() - targetFrom;
-			flying(fence);
+			flying(fence, name[2]);
 			dirtied(task, target, fence);
 		}
 
@@ -3576,6 +4019,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			mPhaseNs[2] += afterFence - fenceFrom;
 			mPending = 0;   // in order: those before it are done too
 			mDirtyCount = 0;
+			addTimes();
 		}
 
 		if (r == kIOReturnSuccess && staged && !pooled) {
@@ -3834,6 +4278,8 @@ bool RDNA4PvHost::copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex,
 	const uint32_t n = static_cast<uint32_t>(rowBytes);
 	bool ok = row != nullptr;
 
+	cardToMemory(t.surface.surface);   // read by the CPU
+
 	for (uint64_t z = 0; z < images && ok; z++) {
 		for (uint64_t y = 0; y < r.size[1] && ok; y++) {
 			const uint64_t at = sliceAt + (r.origin[2] + z) * t.imageBytes + (r.origin[1] + y) * t.rowBytes + r.origin[0] * fm->bpp;
@@ -4059,6 +4505,7 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 		return nullptr;
 	}
 	mTranslations++;
+	const uint64_t askedAt = nowNs();
 	IOLockLock(gTr.lock);
 	gTr.id = ++gTr.seq ? gTr.seq : ++gTr.seq;   // never 0 (0 = no request)
 	gTr.taken = gTr.done = false;
@@ -4102,8 +4549,8 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	j.gfxLen = shader ? elfLen : 0;
 	if (elf && !shader)
 		IOFree(elf, elfLen);
-	pvlog("host: \"%s\" %s by the helper (%llu bytes of metallib, %u bytes of %s)", name, elf ? "translated" : "could NOT be translated", size, elfLen,
-	      shader ? "shader" : "code");
+	pvstat("host: \"%s\" %s by the helper in %llu ms (%llu bytes of metallib, %u bytes of %s)", name, elf ? "translated" : "could NOT be translated",
+	       (nowNs() - askedAt) / 1000000, size, elfLen, shader ? "shader" : "code");
 	return j.program || j.gfx ? &j : nullptr;
 }
 
@@ -4318,7 +4765,17 @@ void RDNA4PvHost::presentTransaction(const pvstream::FifoCommand &c, const uint8
 	memcpy(f, pl, sizeof(f));
 
 	const uint32_t port = f[0], surface = c.id == 0x07 ? f[2] : f[1], task = c.id == 0x07 ? f[1] : f[2];
-	const bool ok = (gPresentOnCard && presentOnCard(port, surface)) || PvScanout::present(port, surface, task);
+	bool ok = gPresentOnCard && presentOnCard(port, surface);
+
+	if (!ok) {   // copied by the CPU from the guest's memory
+		void *s = retainSurface(surface);
+
+		cardToMemory(s);
+		if (s)
+			static_cast<OSObject *>(s)->release();
+
+		ok = PvScanout::present(port, surface, task);
+	}
 
 	mPresents += ok;
 
@@ -4393,12 +4850,22 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	const uint32_t width = bpr && h.width < bpr / 4 ? h.width : static_cast<uint32_t>(bpr / 4);
 	const uint32_t height = md && h.height < gSurfaceFns.height(s) ? h.height : md ? gSurfaceFns.height(s) : 0;
 	uint64_t handle = 0, src = 0;
-	bool ok = md && width && height && base + bpr * height <= md->getLength() && md->prepare() == kIOReturnSuccess;
+	const CardSurface *card = cardSurface(s);
+	bool ok = md && width && height && base + bpr * height <= md->getLength();
 
-	if (ok) {
+	if (ok && card && card->loaded && card->base == base) {   // the frame on the card already
+		src = card->gpu;
+	}
+	else if (ok && md->prepare() == kIOReturnSuccess) {
 		ok = mapMemory(md, base, bpr * height, handle, src);
 		md->complete();
 	}
+	else {
+		ok = false;
+	}
+
+	if (ok)
+		keepOnCard(s);   // its next frame drawn on the card
 
 	if (s)
 		static_cast<OSObject *>(s)->release();
@@ -4424,11 +4891,14 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	const bool whole = bpr == h.pitch;
 	const uint64_t total = whole ? bpr * height : height;
 	uint32_t n = idleBarrier(ib);   // the frame's draws done, their colour caches written back
+	const bool timed = n && profiling();
 
 	if (!n)
 		return false;
 
-	for (uint64_t i = 0; i < total && n + 7 <= maxDw;) {
+	n += timed ? timeStamp(ib + n, false) : 0;
+
+	for (uint64_t i = 0; i < total && n + 7 + 8 <= maxDw;) {
 		const uint64_t at = whole ? i : i * bpr, to = whole ? i : i * h.pitch;
 		const uint32_t len = whole ? static_cast<uint32_t>(total - i < kChunk ? total - i : kChunk) : width * 4;
 
@@ -4436,8 +4906,10 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 		n += dmaData(ib + n, src + at, sm.gpu + to, len, i >= total);
 	}
 
-	if (n + 7 > maxDw)   // too many rows for the IB
+	if (n + 7 + 8 > maxDw)   // too many rows for the IB
 		return false;
+
+	n += timed ? timeStamp(ib + n, true) : 0;
 
 	__sync_synchronize();   // seen by the card (snooped) before the submit
 
@@ -4446,7 +4918,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	if (submitGfx(mPresentIb.gpu + ibAt, n, fence) != kIOReturnSuccess)
 		return false;
 
-	flying(fence);
+	flying(fence, "present");
 	sm.fence = fence;
 
 	return true;
@@ -4687,6 +5159,54 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	}
 
 	mClocksAt = now;
+
+	pvstat("host: render:   targets: surfaces on the card %u (%llu MiB), in memory %u (%llu MiB); textures shared %u (%llu MiB), managed %u (%llu MiB), "
+	       "private %u (%llu MiB)", mTargetDraws[0], mTargetBytes[0] >> 20, mTargetDraws[1], mTargetBytes[1] >> 20, mTargetDraws[2], mTargetBytes[2] >> 20,
+	       mTargetDraws[3], mTargetBytes[3] >> 20, mTargetDraws[4], mTargetBytes[4] >> 20);
+	memset(mTargetDraws, 0, sizeof(mTargetDraws));
+
+	for (uint32_t k = 0; k < 4; k++) {
+		CopiedTop *top = nullptr;
+
+		for (CopiedTop &t : mCopiedTop)
+			top = t.bytes && (!top || t.bytes > top->bytes) ? &t : top;
+
+		if (!top)
+			break;
+
+		pvstat("host: render:   copied most: %s of task %u, %ux%u, %u bytes a row: %u times, %llu MiB", top->surface ? "a surface" : "a texture", top->task,
+		       top->width, top->height, top->rowBytes, top->times, top->bytes >> 20);
+		top->bytes = 0;
+	}
+	memset(mCopiedTop, 0, sizeof(mCopiedTop));
+	memset(mTargetBytes, 0, sizeof(mTargetBytes));
+
+	addTimes();
+
+	char times[200] = "";
+	for (uint32_t k = 0, at = 0; k < 8 && at < sizeof(times) - 48; k++) {
+		GpuTime *top = nullptr;
+
+		for (GpuTime &g : mGpuTimes)
+			top = g.ticks && (!top || g.ticks > top->ticks) ? &g : top;
+
+		if (!top)
+			break;
+
+		at += snprintf(times + at, sizeof(times) - at, " %s %u: %llu ms;", top->name, top->count, top->ticks / 100000);
+		top->ticks = 0;
+	}
+	if (times[0])
+		pvstat("host: render:   on the card:%s clears %llu MiB", times, mClearBytes >> 20);
+	mClearBytes = 0;
+	memset(mGpuTimes, 0, sizeof(mGpuTimes));
+
+	uint32_t kept = 0;
+	for (const CardSurface &c : mCardSurface)
+		kept += c.handle != 0;
+	pvstat("host: render:   surfaces on the card: %u, %u loaded into it, %u written back; shadows filled and written back by the card: %u, %u", kept,
+	       mCardLoads, mCardBacks, mCardFills, mCardFlushes);
+	mCardLoads = mCardBacks = mCardFills = mCardFlushes = 0;
 
 	for (PortTiming &t : mPortTiming)
 		t = { t.last, 0, 0, 0, 0 };
@@ -5465,6 +5985,7 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtalk);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvinplace);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvpresent);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvprofile);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtexid);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtex);
 	// publish() is reached from two threads (the GPU path in attach() and RDNA4PvLate's work loop): claim the single slot atomically before building
