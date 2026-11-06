@@ -3631,6 +3631,15 @@ static int testGpuHeap() {
 	h.free(d);
 	failures += check(h.freeBytes() == h.size() && h.alloc(64 * G, a) && a == base,
 	                  "heap: everything back in one piece");
+	h.free(a);
+	// take: exactly the range asked for, only when all of it is free.
+	ok = h.take(base + 8 * G, 2 * G + 1) && h.lengthOf(base + 8 * G) == 3 * G && h.freeBytes() == 61 * G &&
+	     !h.take(base + 10 * G, G) && !h.take(base + 7 * G, 2 * G) && !h.take(base + 63 * G, 2 * G) &&
+	     !h.take(base + 100, G) && !h.take(base, 0) && h.alloc(8 * G, b) && b == base && h.alloc(G, c) && c == base + 11 * G;
+	failures += check(ok, "heap: take (b 0x%llx c 0x%llx)", (unsigned long long)b, (unsigned long long)c);
+	h.free(b);
+	h.free(c);
+	failures += check(h.free(base + 8 * G) && h.freeBytes() == h.size(), "heap: a taken range is freed like an allocation");
 
 	// The device heap's shape: gigabytes in 64 KiB granules, the map cut
 	// short by its capacity, and allocations far from the base.
