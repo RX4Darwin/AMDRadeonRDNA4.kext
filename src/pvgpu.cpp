@@ -618,6 +618,7 @@ private:
 		uint8_t *cpu { nullptr };
 		bool valid { false };
 		bool readOnly { false };         // of a texture shaders only read (type 3): held longer (kShadowAgeReadOnly)
+		uint64_t print { 0 };            // a read-only texture's texturePrint when filled
 	};
 	// A frame's icons and glyphs alone are hundreds of small textures: with 32 shadows they pushed each other out, and each was copied
 	// again. Large ones are kept within kShadowBudget.
@@ -642,7 +643,7 @@ private:
 			strlcpy(mNotRunName, name, sizeof(mNotRunName));
 		}
 	}
-	uint32_t mStale[3] {};                               // shadows filled again: dropped, too old, the surface locked since
+	uint32_t mStale[4] {};                               // shadows filled again: dropped, too old, the surface locked since, rewritten
 	uint64_t mDrawSerial { 0 };          // draws submitted
 	bool shadowIdle(const Shadow &s) const;
 	// What the draw being put together uses, noted again with the submit it went out with once it has: a copy the draw itself needed (a
@@ -678,6 +679,7 @@ private:
 	bool fillShadowOnCard(Shadow &s, IOMemoryDescriptor *memory);
 	uint32_t mCardFills { 0 }, mCardFlushes { 0 };   // shadows on the card filled and written back by the card, for the draw stats
 	bool shadowTexture(uint32_t task, uint32_t id, const TextureSource &src, uint32_t bpp, uint64_t &gpu, uint32_t &pitch);
+	uint64_t texturePrint(uint32_t task, const TextureSource &src, uint32_t bpp);
 	void dropShadows(const OSObject *surface, uint32_t task, uint64_t at, bool all = false);
 	void clearShadows(const OSObject *surface, uint32_t task, uint64_t at, uint32_t tex, uint32_t pattern);
 	void dropShadowRange(uint32_t task, uint64_t va, uint64_t bytes);
@@ -3260,9 +3262,16 @@ bool RDNA4PvHost::shadowTexture(uint32_t task, uint32_t id, const TextureSource 
 	const uint32_t depth = src.depth > 1 ? src.depth : 1;
 	const ShadowKey key = {sf.surface, task, sf.memory ? sf.base : src.va, src.rowBytes, src.width, src.height, depth, bpp,
 	                       depth > 1 ? src.imageBytes : static_cast<uint64_t>(src.rowBytes) * src.height};
+	const bool readOnly = !sf.surface && src.type == 3;
+	const uint64_t print = readOnly ? texturePrint(task, src, bpp) : 0;
 	Shadow *s = findShadow(key);
 
-	if (s && shadowCurrent(*s)) {
+	const bool current = s && shadowCurrent(*s);
+
+	if (current && s->readOnly && s->print != print)
+		mStale[3]++;
+
+	if (current && (!s->readOnly || s->print == print)) {
 		mCopiesReused++;
 	} else {
 		s = s ? s : makeShadow(key);
@@ -3273,7 +3282,8 @@ bool RDNA4PvHost::shadowTexture(uint32_t task, uint32_t id, const TextureSource 
 
 	s->used = ++mShadowClock;
 	s->serial = nextSerial();
-	s->readOnly = src.type == 3;
+	s->readOnly = readOnly;
+	s->print = print;
 
 	if (mBuilding && mUsedShadowCount < kUsedMax)
 		mUsedShadows[mUsedShadowCount++] = s;
@@ -3281,6 +3291,32 @@ bool RDNA4PvHost::shadowTexture(uint32_t task, uint32_t id, const TextureSource 
 	pitch = s->pitch;
 
 	return true;
+}
+
+// A guest texture's fingerprint: three of its rows (the first 4 KiB of each) hashed. WindowServer frees a texture and writes the next one of
+// the same size at the same address with the CPU, which the host does not see: the icons of a Finder window moved to the other display
+// came out as other apps' icons from the read-only shadows of the textures before (2026-11-06).
+uint64_t RDNA4PvHost::texturePrint(uint32_t task, const TextureSource &src, uint32_t bpp)
+{
+	const uint32_t len = src.width * bpp < 4096 ? src.width * bpp : 4096;
+	uint64_t hash = 0xcbf29ce484222325ull;   // FNV-1a
+	uint8_t chunk[256];
+
+	for (uint32_t k = 1; k <= 3; k++) {
+		const uint64_t row = src.va + static_cast<uint64_t>(src.height * k / 4) * src.rowBytes;
+
+		for (uint32_t off = 0; off < len; off += sizeof(chunk)) {
+			const uint32_t n = len - off < sizeof(chunk) ? len - off : sizeof(chunk);
+
+			if (!readGuest(task, row + off, chunk, n))
+				return 0;
+
+			for (uint32_t i = 0; i < n; i++)
+				hash = (hash ^ chunk[i]) * 0x100000001b3ull;
+		}
+	}
+
+	return hash;
 }
 
 // Shadows of what the guest's memory now holds differently: of this surface or task's texture at `at` (any when `all`).
@@ -6112,8 +6148,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	      (now - mDrawStatSince) / 1000000, mDrawStatNs / 1000000, mDrawStatMaxNs / 1000000, mPhaseNs[0] / 1000000, mPhaseNs[1] / 1000000,
 	      mPhaseNs[2] / 1000000, mPhaseNs[3] / 1000000, mPhaseNs[4] / 1000000, mPhaseNs[5] / 1000000, mWaits, mCodeIns, mTranslations);
 	pvstat("host: render:   %u textures in place, %u copied, mapping %llu ms (%u new, %llu pages), rows %llu ms (%llu KiB, %u copies reused); "
-	      "shadows: %u made, %u freed, %llu MiB; stale %u dropped, %u old, %u locked", mInPlace, mCopied, mMapNs / 1000000, mMapMisses, mMapPages, mCopyNs / 1000000, mCopiedBytes >> 10,
-	      mCopiesReused, mShadowsMade, mShadowsFreed, mShadowBytes >> 20, mStale[0], mStale[1], mStale[2]);
+	      "shadows: %u made, %u freed, %llu MiB; stale %u dropped, %u old, %u locked, %u rewritten", mInPlace, mCopied, mMapNs / 1000000, mMapMisses, mMapPages, mCopyNs / 1000000, mCopiedBytes >> 10,
+	      mCopiesReused, mShadowsMade, mShadowsFreed, mShadowBytes >> 20, mStale[0], mStale[1], mStale[2], mStale[3]);
 
 	if (mNotRun)
 		pvstat("host: render:   %u draws not run, the first with \"%s\": %s", mNotRun, mNotRunName, mNotRunWhy);
