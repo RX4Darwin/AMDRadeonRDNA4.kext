@@ -5130,7 +5130,7 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		most = bytes[b] > most ? bytes[b] : most;
 	}
 	auto *stage = ok && most ? static_cast<uint8_t *>(IOMalloc(most)) : nullptr;
-	ok = stage != nullptr;
+	ok = ok && (!most || stage);   // a kernel of textures only has no buffers to stage
 	for (unsigned b = 0; b < nb && ok; b++)
 		ok = gCompute->rtAlloc(this, bytes[b], handle[b], gpu[b]) == kIOReturnSuccess && readGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b])) &&
 		     gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], true) == kIOReturnSuccess;
