@@ -61,6 +61,17 @@ bool waitNextVblank(RDNA4Compute &compute, uint8_t otg, uint32_t timeoutMs,
 bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 			const char *name, uint64_t *latencyUs = nullptr, bool async = false);
 
+// The HUBP whose primary surface is at MC address `mc` (a head's scanout), or kNone. The caller holds rtLock, as below.
+uint8_t hubpShowing(RDNA4Compute &compute, uint64_t mc);
+
+// HUBP `hubp` to the surface at `mc` at its next vblank (a vsync flip: the low address word's write requests it, as DC's
+// hubp401_program_surface_flip_and_addr). Nothing is waited for.
+bool request(RDNA4Compute &compute, uint8_t hubp, uint64_t mc);
+
+// What HUBP `hubp` was last asked to show (`requested`) and what it reads now (`inUse`, DCSURF_SURFACE_EARLIEST_INUSE): the same
+// once the request latched. False when they cannot be read.
+bool shown(RDNA4Compute &compute, uint8_t hubp, uint64_t &requested, uint64_t &inUse);
+
 // Run the rdna4-flip=<mode> test once. False means the requested test failed
 // and the feature has been disabled after attempting to restore the desktop.
 bool run(RDNA4Compute &compute);

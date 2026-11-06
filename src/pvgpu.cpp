@@ -51,7 +51,8 @@ static int gTalk;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvtalk, CTLFLAG_RW | CTLFLAG_LOCKED, &gTalk, 0, "AMDRadeonRDNA4: log every paravirtual draw");
 static int gPresentOnCard = 1;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvpresent, CTLFLAG_RW | CTLFLAG_LOCKED, &gPresentOnCard, 0,
-	   "AMDRadeonRDNA4: copy a presented frame into the display's scanout on the card (1), or with the CPU (0)");
+	   "AMDRadeonRDNA4: a presented frame copied on the card and flipped to at vblank (1), copied into the display's scanout on the card "
+	   "(2: it tears), or with the CPU (0)");
 static int gProfile;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvprofile, CTLFLAG_RW | CTLFLAG_LOCKED, &gProfile, 0,
 	   "AMDRadeonRDNA4: time each submit on the card and name the fragment functions (and copies) that took it longest in the draw stats");
@@ -435,12 +436,25 @@ private:
 	// A frame copied into a display's scanout by the card (CP DMA in the graphics ring, after the draws that made it), left in flight: the
 	// batch's stamp completes once it is done. With the CPU each frame took 2.4 ms (2560x1440) or 5.3 ms (4K) of the host's thread, and
 	// two displays at 60 Hz could not be kept up with (a window dragged from one to the other).
-	struct ScanoutMap { uint64_t phys, bytes, handle, gpu, fence; };   // fence: of its last frame's IB
+	// A port's scanout at a VA of ours (fence: of its last frame's IB). When its frames are flipped at vblank (`flips`: they were copied
+	// into the scanout the display reads, torn where the copy overtook the scan), three buffers: the head's own (0) and two of ours; a frame
+	// goes into the one the HUBP neither reads nor was asked to show, and is asked for once its copy is done (`queued`: that buffer + 1).
+	struct ScanoutMap {
+		uint64_t phys, bytes, handle, gpu, fence;
+		uint64_t back[2], mc[3], va[3], flipFence;
+		uint8_t hubp, queued, mode;   // mode: rdna4_pvpresent when it was set up
+		bool flips;
+	};
 	static constexpr uint32_t kScanoutPorts = 8;
 	static constexpr uint32_t kPresentIbBytes = 64 * 1024;
 	ScanoutMap mScanout[kScanoutPorts] {};
 	GfxBuffers mPresentIb {};
 	bool presentOnCard(uint32_t port, uint32_t sid);
+	void setUpFlips(ScanoutMap &sm, uint32_t port);
+	uint32_t flipTarget(ScanoutMap &sm);
+	void flipDone();
+	void scanoutHome(ScanoutMap &sm, uint64_t mc);
+	void dropScanout(ScanoutMap &sm);
 	bool clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_t bytes, uint32_t pattern);
 	GfxBuffers mFillCode {};   // nggfill.s and psfill.s, as a shader pair's slot
 	bool clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_t pitch, uint32_t width, uint32_t height, bool half, bool bgra,
@@ -828,6 +842,7 @@ void RDNA4PvHost::tick() {
 	pollFifo();
 	pollChannels();
 	flushBatch();   // what the commands drew, on the card while the host waits for more
+	flipDone();
 	pollDisplay();
 	if (mLevel >= 2)
 		selfTest();
@@ -5193,6 +5208,9 @@ void RDNA4PvHost::presentTransaction(const pvstream::FifoCommand &c, const uint8
 	if (!ok) {   // copied by the CPU from the guest's memory
 		void *s = retainSurface(surface);
 
+		if (port < kScanoutPorts && mScanout[port].flips)   // into the head's own surface, which the HUBP must read then
+			dropScanout(mScanout[port]);
+
 		cardToMemory(s);
 		if (s)
 			static_cast<OSObject *>(s)->release();
@@ -5258,19 +5276,16 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	ScanoutMap &sm = mScanout[port];
 	const uint64_t scanBytes = static_cast<uint64_t>(h.pitch) * h.height;
 
-	if (sm.phys != h.phys || sm.bytes != scanBytes) {
-		if (sm.handle) {
-			waitDraws();
-			gCompute->rtFree(this, sm.handle);
-		}
-
-		sm = {};
+	if (sm.phys != h.phys || sm.bytes != scanBytes || sm.mode != gPresentOnCard) {   // set up again when rdna4_pvpresent changed too
+		dropScanout(sm);
 
 		if (gCompute->rtMapVram(this, h.phys, scanBytes, sm.handle, sm.gpu) != kIOReturnSuccess)
 			return false;
 
 		sm.phys = h.phys;
 		sm.bytes = scanBytes;
+		sm.mode = static_cast<uint8_t>(gPresentOnCard);
+		setUpFlips(sm, port);
 	}
 
 	void *s = retainSurface(sid);
@@ -5311,6 +5326,8 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	if (sm.fence && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(sm.fence)))
 		waitFor(sm.fence);   // the port's IB of the frame before (each port has its own: the other display's frame is not waited for)
 
+	flipDone();   // the frame before asked for, if its copy is done: this one goes into another buffer
+
 	roomForDraw();
 
 	// the rows, or the whole frame in chunks when the surface's rows are the scanout's
@@ -5327,12 +5344,15 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 
 	n += timed ? timeStamp(ib + n, false) : 0;
 
+	const uint32_t target = sm.flips ? flipTarget(sm) : 0;
+	const uint64_t dst = sm.flips ? sm.va[target] : sm.gpu;
+
 	for (uint64_t i = 0; i < total && n + 7 + 8 <= maxDw;) {
 		const uint64_t at = whole ? i : i * bpr, to = whole ? i : i * h.pitch;
 		const uint32_t len = whole ? static_cast<uint32_t>(total - i < kChunk ? total - i : kChunk) : width * 4;
 
 		i += whole ? len : 1;
-		n += dmaData(ib + n, src + at, sm.gpu + to, len, i >= total);
+		n += dmaData(ib + n, src + at, dst + to, len, i >= total);
 	}
 
 	if (n + 7 + 8 > maxDw)   // too many rows for the IB
@@ -5350,7 +5370,121 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	flying(fence, "present");
 	sm.fence = fence;
 
+	if (sm.flips) {   // shown once the copy is done (flipDone)
+		sm.queued = static_cast<uint8_t>(target + 1);
+		sm.flipFence = fence;
+	}
+
 	return true;
+}
+
+// The port's two buffers of its own for flipping, and the HUBP that reads its scanout; flipping stays off without them.
+void RDNA4PvHost::setUpFlips(ScanoutMap &sm, uint32_t port)
+{
+	uint8_t hubp = 0;
+	uint64_t mc = 0;
+
+	if (gPresentOnCard != 1 || !gCompute->rtScanoutHubp(sm.phys, hubp, mc))
+		return;
+
+	sm.hubp = hubp;
+	sm.mc[0] = mc;
+	sm.va[0] = sm.gpu;
+
+	for (uint32_t k = 0; k < 2; k++) {
+		if (gCompute->rtAlloc(this, sm.bytes, sm.back[k], sm.va[k + 1]) != kIOReturnSuccess) {
+			sm.back[k] = 0;
+			break;
+		}
+
+		sm.mc[k + 1] = gCompute->rtBufferMc(this, sm.back[k]);
+
+		// what the head shows now: a frame smaller than the head leaves the rest as it was
+		if (sm.mc[k + 1] && !rowsOnCard(sm.gpu, static_cast<uint32_t>(sm.bytes), sm.va[k + 1], static_cast<uint32_t>(sm.bytes),
+		                                 static_cast<uint32_t>(sm.bytes), 1))
+			sm.mc[k + 1] = 0;
+	}
+
+	sm.flips = sm.mc[1] && sm.mc[2];
+	pvlog("host: present: port %u: HUBP%u reads its scanout at MC 0x%llx; frames %s", port, hubp, mc,
+	      sm.flips ? "flipped at vblank between it and two buffers of ours" : "copied into it (no VRAM for flipping)");
+}
+
+// The buffer a frame goes into: the one the HUBP neither reads nor was asked to show; the one queued already if a frame's copy into it
+// is not done yet (after it in the ring).
+uint32_t RDNA4PvHost::flipTarget(ScanoutMap &sm)
+{
+	uint64_t requested = 0, inUse = 0;
+
+	if (sm.queued)
+		return sm.queued - 1u;
+
+	if (!gCompute->rtScanoutShown(sm.hubp, requested, inUse) || (requested != sm.mc[0] && requested != sm.mc[1] && requested != sm.mc[2])) {
+		pvlog("host: present: HUBP%u shows 0x%llx, none of the port's buffers: frames copied into the scanout again", sm.hubp, requested);
+		sm.flips = false;
+
+		return 0;
+	}
+
+	for (uint32_t k = 0; k < 3; k++)
+		if (sm.mc[k] != requested && sm.mc[k] != inUse)
+			return k;
+
+	return 0;   // not reached: three buffers, two of them taken at most
+}
+
+// The frames whose copy is done asked for at the next vblank.
+void RDNA4PvHost::flipDone()
+{
+	for (ScanoutMap &sm : mScanout) {
+		if (!sm.flips || !sm.queued || !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(sm.flipFence)))
+			continue;
+
+		gCompute->rtScanoutFlip(sm.hubp, sm.mc[sm.queued - 1]);
+		sm.queued = 0;
+	}
+}
+
+// The HUBP back on surface `mc` (the head's own) before the CPU writes that or our buffers go: waited for until it reads it.
+void RDNA4PvHost::scanoutHome(ScanoutMap &sm, uint64_t mc)
+{
+	uint64_t requested = 0, inUse = 0;
+
+	if (!sm.flips)
+		return;
+
+	if (sm.queued) {
+		waitDraws();
+		sm.queued = 0;
+	}
+
+	gCompute->rtScanoutFlip(sm.hubp, mc);
+
+	for (uint32_t i = 0; i < 100 && gCompute->rtScanoutShown(sm.hubp, requested, inUse) && inUse != mc; i++)   // a frame at most
+		IOSleep(1);
+}
+
+// A port's scanout given up (the head moved, or frames go by the CPU): what the HUBP reads is the head's own surface again.
+void RDNA4PvHost::dropScanout(ScanoutMap &sm)
+{
+	PvScanout::Head h;
+	uint8_t hubp = 0;
+	uint64_t mc = 0;
+	const uint32_t port = static_cast<uint32_t>(&sm - mScanout);
+
+	// where the head is now, if it moved: the HUBP the display code set up reads that
+	scanoutHome(sm, PvScanout::head(port, h) && gCompute->rtScanoutHubp(h.phys, hubp, mc) ? mc : sm.mc[0]);
+
+	if (sm.handle || sm.back[0] || sm.back[1])
+		waitDraws();
+
+	const uint64_t handles[] = {sm.handle, sm.back[0], sm.back[1]};
+
+	for (uint64_t handle : handles)
+		if (handle)
+			gCompute->rtFree(this, handle);
+
+	sm = {};
 }
 
 // GetDeviceInfo (FIFO 0x3a): the record 0x2d names the 4 KiB buffer the host fills; the layout and the values are docs/m0-pvgpu.md "The GetDeviceInfo reply".

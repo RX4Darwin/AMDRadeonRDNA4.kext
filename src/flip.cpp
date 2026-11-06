@@ -322,6 +322,51 @@ bool flipTo(RDNA4Compute &compute, const Surface &surface, uint64_t target,
 	return true;
 }
 
+uint8_t hubpShowing(RDNA4Compute &compute, uint64_t mc) {
+	for (uint8_t i = 0; i < Pipe::kMaxOtg; i++) {
+		const uint32_t base = i * Pipe::Reg::kHubpStride;
+		const uint32_t lo = compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { 2, kHubpAddressLo + base });
+		const uint32_t hi = compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { 2, kHubpAddressHi + base });
+
+		if (lo != kBad && hi != kBad && (static_cast<uint64_t>(lo) | static_cast<uint64_t>(hi) << 32) == mc)
+			return i;
+	}
+
+	return kNone;
+}
+
+bool request(RDNA4Compute &compute, uint8_t hubp, uint64_t mc) {
+	const uint32_t base = static_cast<uint32_t>(hubp) * Pipe::Reg::kHubpStride;
+	const uint32_t control = compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { 2, kHubpFlipControl + base });
+
+	if (hubp >= Pipe::kMaxOtg || control == kBad)
+		return false;
+
+	if (control & (kHubpFlipType | kHubpStereoMode | kHubpStereoIn))   // at vblank, not at once
+		compute.wr(IpDiscovery::HwDmu, GfxReg::Reg { 2, kHubpFlipControl + base }, control & ~(kHubpFlipType | kHubpStereoMode | kHubpStereoIn));
+
+	compute.wr(IpDiscovery::HwDmu, GfxReg::Reg { 2, kHubpAddressHi + base }, addressHi(mc));
+	compute.wr(IpDiscovery::HwDmu, GfxReg::Reg { 2, kHubpAddressLo + base }, addressLo(mc));
+
+	return true;
+}
+
+bool shown(RDNA4Compute &compute, uint8_t hubp, uint64_t &requested, uint64_t &inUse) {
+	const uint32_t base = static_cast<uint32_t>(hubp) * Pipe::Reg::kHubpStride;
+	const uint32_t lo = compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { 2, kHubpAddressLo + base });
+	const uint32_t hi = compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { 2, kHubpAddressHi + base });
+	const uint32_t useLo = compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { 2, kHubpEarliestLo + base });
+	const uint32_t useHi = compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { 2, kHubpEarliestHi + base });
+
+	if (hubp >= Pipe::kMaxOtg || lo == kBad || hi == kBad || useLo == kBad || useHi == kBad)
+		return false;
+
+	requested = static_cast<uint64_t>(lo) | static_cast<uint64_t>(hi) << 32;
+	inUse = static_cast<uint64_t>(useLo) | static_cast<uint64_t>(useHi) << 32;
+
+	return true;
+}
+
 bool run(RDNA4Compute &compute) {
 	uint32_t mode = 0;
 	if (!PE_parse_boot_argn("rdna4-flip", &mode, sizeof(mode)) || !mode)

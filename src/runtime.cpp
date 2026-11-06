@@ -19,6 +19,7 @@
 //
 
 #include "compute.hpp"
+#include "flip.hpp"
 #include "klog.hpp"
 #include "userclient.hpp"
 
@@ -2744,6 +2745,37 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 
 /* `bytes` of VRAM at CPU physical address `barPhys` (in BAR0: a display's scanout) at a GPU VA of the owner's; the memory is not ours,
  * only the VA is given back when it is freed. */
+bool RDNA4Compute::rtScanoutHubp(uint64_t barPhys, uint8_t &hubp, uint64_t &mc) {
+	Locked g(rtLock);
+
+	if (barPhys < sv.bar0Phys || barPhys - sv.bar0Phys >= sv.bar0Size)
+		return false;
+
+	mc = vramMc(barPhys - sv.bar0Phys);
+	hubp = Flip::hubpShowing(*this, mc);
+
+	return hubp != Flip::kNone;
+}
+
+uint64_t RDNA4Compute::rtBufferMc(const void *owner, uint64_t handle) {
+	Locked g(rtLock);
+	const RtBuffer *b = bufferFor(owner, handle);
+
+	return b && !b->host && !b->foreign ? b->mc : 0;
+}
+
+bool RDNA4Compute::rtScanoutFlip(uint8_t hubp, uint64_t mc) {
+	Locked g(rtLock);
+
+	return Flip::request(*this, hubp, mc);
+}
+
+bool RDNA4Compute::rtScanoutShown(uint8_t hubp, uint64_t &requested, uint64_t &inUse) {
+	Locked g(rtLock);
+
+	return Flip::shown(*this, hubp, requested, inUse);
+}
+
 IOReturn RDNA4Compute::rtMapVram(const void *owner, uint64_t barPhys, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	Locked g(rtLock);
 	const IOReturn state = ownerStateLocked(owner);

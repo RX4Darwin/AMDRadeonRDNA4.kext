@@ -205,6 +205,9 @@ private:
 	friend bool Flip::flipTo(RDNA4Compute &compute, const Flip::Surface &surface,
 	                         uint64_t target, const char *name, uint64_t *latencyUs,
 	                         bool async);
+	friend uint8_t Flip::hubpShowing(RDNA4Compute &compute, uint64_t mc);
+	friend bool Flip::request(RDNA4Compute &compute, uint8_t hubp, uint64_t mc);
+	friend bool Flip::shown(RDNA4Compute &compute, uint8_t hubp, uint64_t &requested, uint64_t &inUse);
 
 	Env    env {};
 	Survey sv {};
@@ -712,6 +715,13 @@ public:
 	IOReturn rtMapPages(const void *owner, const uint64_t *pageBuses, uint64_t pages, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtFree(const void *owner, uint64_t handle);
 	IOReturn rtMapVram(const void *owner, uint64_t barPhys, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
+	// The paravirtual displays' frames flipped at vblank (pvgpu.cpp, presentOnCard): the HUBP showing a head's scanout at `barPhys` and
+	// the scanout's MC address; a VRAM runtime buffer's MC address (0 for another); a flip requested; what the HUBP was asked to show
+	// and what it reads now (Flip::shown).
+	bool rtScanoutHubp(uint64_t barPhys, uint8_t &hubp, uint64_t &mc);
+	uint64_t rtBufferMc(const void *owner, uint64_t handle);
+	bool rtScanoutFlip(uint8_t hubp, uint64_t mc);
+	bool rtScanoutShown(uint8_t hubp, uint64_t &requested, uint64_t &inUse);
 	IOReturn rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
 	                mach_vm_address_t user, uint64_t length, bool toGpu);
 	IOReturn rtLoad(const void *owner, task_t task, mach_vm_address_t elf, uint64_t length,
