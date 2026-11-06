@@ -1879,7 +1879,13 @@ static int testPipe2Table() {
 	// A timing Linux was not asked about keeps the lit mode's request timing
 	// and gets the engine's rule for the rest.
 	Edid::DetailedTiming other = c.timing;
-	other.hSyncOffset += 8;
+	other.hBlank += 8;
+	// One whose syncs alone sit elsewhere is the same mode for the request timing.
+	Edid::DetailedTiming moved = known[1];
+	moved.hSyncOffset += 8;
+	moved.vSyncPositive = !moved.vSyncPositive;
+	failures += check(Pipe2::modeKnown(moved) && Pipe2::modeDetSegments(moved) == Pipe2::modeDetSegments(known[1]),
+	                  "pipe2: a known mode with its syncs elsewhere is not found");
 	const size_t nOther = Pipe2::modeSteps(other, extra, Pipe2::kMaxModeSteps);
 	const size_t nKnown = Pipe2::modeSteps(known[1], want, Pipe2::kMaxModeSteps);
 	bool otherIsLit = !Pipe2::modeKnown(other) && nOther > 0 && nOther < nKnown &&

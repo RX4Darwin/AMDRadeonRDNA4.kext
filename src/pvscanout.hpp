@@ -54,6 +54,25 @@ bool mode(uint32_t port, uint32_t &width, uint32_t &height);
 /* The EDID of what is on head `port` (plugin.cpp); false when there is none. */
 bool edid(uint32_t port, const uint8_t *&data, size_t &len);
 
+/* A mode a port's paravirtual display is offered: its size and refresh. */
+struct Mode {
+	uint32_t width, height, milliHz;
+};
+
+/*
+ * The modes head `port`'s paravirtual display is offered (plugin.cpp): those
+ * of its monitor's EDID the head's pipe can run, each size once at the
+ * refresh nearest 60 Hz, the one it is lit in first; 0 when the head has
+ * only the one it is in.
+ */
+uint32_t modes(uint32_t port, Mode *out, uint32_t cap);
+
+/*
+ * Head `port` switched to its mode of `width` x `height` (plugin.cpp): what
+ * macOS presents in after the mode was chosen in the Displays settings.
+ */
+bool setMode(uint32_t port, uint32_t width, uint32_t height);
+
 /* The scanout of head `port` (plugin.cpp); false while it is not lit. */
 bool head(uint32_t port, Head &out);
 

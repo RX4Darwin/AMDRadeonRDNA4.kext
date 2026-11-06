@@ -300,6 +300,17 @@ int modeRow(const Edid::DetailedTiming &t) {
 	for (size_t i = 0; i < cur->nmodes; i++)
 		if (Edid::sameTiming(cur->timings[i], t))
 			return static_cast<int>(i);
+
+	// The request timing and the DET a mode needs follow from its clock and totals: a sink's timing that differs only in
+	// where its syncs sit or which way they go (a Dell's 2560x1440 against Linux's CVT-RB one) takes that row.
+	for (size_t i = 0; i < cur->nmodes; i++) {
+		const Edid::DetailedTiming &k = cur->timings[i];
+
+		if (k.pixelClockKHz == t.pixelClockKHz && k.hActive == t.hActive && k.hBlank == t.hBlank && k.vActive == t.vActive &&
+		    k.vBlank == t.vBlank && k.interlaced == t.interlaced)
+			return static_cast<int>(i);
+	}
+
 	return -1;
 }
 

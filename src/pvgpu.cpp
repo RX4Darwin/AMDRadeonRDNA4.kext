@@ -443,6 +443,7 @@ private:
 		uint64_t phys, bytes, handle, gpu, fence;
 		uint64_t back[2], mc[3], va[3], flipFence;
 		uint8_t hubp, queued, mode;   // mode: rdna4_pvpresent when it was set up
+		uint32_t triedW, triedH;      // the frame size a mode switch was last tried for
 		bool flips;
 	};
 	static constexpr uint32_t kScanoutPorts = 8;
@@ -5317,6 +5318,18 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 
 	void *s = retainSurface(sid);
 	IOMemoryDescriptor *md = s ? gSurfaceFns.memory(s) : nullptr;
+
+	// A frame of another size than the head: macOS was told to use another of its modes. The head goes to it (once a size).
+	const uint32_t frameW = md ? gSurfaceFns.width(s) : 0, frameH = md ? gSurfaceFns.height(s) : 0;
+
+	if (frameW && frameH && (frameW != h.width || frameH != h.height) && (frameW != sm.triedW || frameH != sm.triedH)) {
+		sm.triedW = frameW;
+		sm.triedH = frameH;
+
+		if (PvScanout::setMode(port, frameW, frameH) && PvScanout::head(port, h))
+			pvlog("host: present: port %u now %ux%u for frames of that size", port, h.width, h.height);
+	}
+
 	const uint64_t base = md ? gSurfaceFns.baseOffset(s) : 0, bpr = md ? gSurfaceFns.bytesPerRow(s) : 0;
 	const uint32_t width = bpr && h.width < bpr / 4 ? h.width : static_cast<uint32_t>(bpr / 4);
 	const uint32_t height = md && h.height < gSurfaceFns.height(s) ? h.height : md ? gSurfaceFns.height(s) : 0;
@@ -5697,6 +5710,20 @@ void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const
 		if (PvScanout::enabled() && PvScanout::mode(port, width, height) && width <= 0xffff && height <= 0xffff) {
 			info.width = info.modes[0].width = static_cast<uint16_t>(width);
 			info.height = info.modes[0].height = static_cast<uint16_t>(height);
+		}
+
+		// the modes of the monitor its head can run, the one it is lit in first: macOS presents in the one chosen (presentOnCard)
+		PvScanout::Mode modes[pvstream::disp::kMaxModes];
+		const uint32_t count = PvScanout::enabled() ? PvScanout::modes(port, modes, pvstream::disp::kMaxModes) : 0;
+
+		for (uint32_t i = 0; i < count; i++)
+			info.modes[i] = { static_cast<uint16_t>(modes[i].width), static_cast<uint16_t>(modes[i].height),
+			                  static_cast<uint32_t>(static_cast<uint64_t>(modes[i].milliHz) * 65536 / 1000) };
+
+		if (count) {
+			info.modeCount = count;
+			info.width = info.modes[0].width;
+			info.height = info.modes[0].height;
 		}
 
 		// IOPresentment takes only a plane with gamma, which the guest announces when transactions carry the table (FIFO 0x07)

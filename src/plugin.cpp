@@ -1575,6 +1575,133 @@ bool PvScanout::mode(uint32_t port, uint32_t &width, uint32_t &height)
 	return true;
 }
 
+// A head's paravirtual display port: 0 the boot display's (pvBootHead when it took the boot display over), then the extra heads.
+Head2 *pvHead(uint32_t port)
+{
+	if (port == 0)
+		return pvBootHead;
+
+	return port <= pvPortCount ? const_cast<Head2 *>(pvPorts[port - 1]) : nullptr;
+}
+
+// The mode of a size nearest 60 Hz in `table`.
+const Modes::Mode *nearest60(const Modes::Mode *table, size_t n, uint32_t width, uint32_t height)
+{
+	const Modes::Mode *best = nullptr;
+
+	for (size_t i = 0; i < n; i++) {
+		const Modes::Mode &m = table[i];
+		const uint32_t off = m.refreshMilliHz > 60000 ? m.refreshMilliHz - 60000 : 60000 - m.refreshMilliHz;
+
+		if (m.t.hActive != width || m.t.vActive != height)
+			continue;
+
+		if (!best || off < (best->refreshMilliHz > 60000 ? best->refreshMilliHz - 60000 : 60000 - best->refreshMilliHz))
+			best = &m;
+	}
+
+	return best;
+}
+
+uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
+{
+	Head2 *h = pvHead(port);
+	static Modes::Mode built[Modes::MaxModes];
+	const Modes::Mode *table = nullptr;
+	size_t n = 0;
+	uint32_t litW = 0, litH = 0, count = 0;
+
+	if (!h || !bootState || !cap)
+		return 0;
+
+	if (h->connected && h->ndrv.modeCount() > 1) {
+		table = h->table;
+		n = h->ndrv.modeCount();
+		litW = h->surface.width;
+		litH = h->surface.height;
+	} else if (h == pvBootHead || h->waitClocks) {   // not lit yet: its monitor's, as a head's pipe can run them, from 3840x2160
+		const uint8_t *edid = h->edidLen ? h->edid : nullptr;
+		size_t len = h->edidLen;
+
+		if (!edid && !PvScanout::edid(port, edid, len))
+			return 0;
+
+		// what a head lit at 3840x2160 takes (the limits of whichever table is chosen now may be another connector's)
+		Modes::Limits lim {};
+
+		lim.maxHActive = 3840;
+		lim.maxVActive = 2160;
+		lim.maxPixelClockKHz = ModeSet::kMaxTmdsKHz;
+		n = Modes::build(edid, len, lim, built, Modes::MaxModes);
+		table = built;
+		litW = 3840;
+		litH = 2160;
+	}
+
+	// The size it is lit in, then the others from the largest down, each once, as many as fit; a pipe not lit yet is lit at
+	// 3840x2160@60 (through a DP++ adapter in 4:2:0, which the limits for the other modes leave out).
+	Mode all[Modes::MaxModes + 1];
+	uint32_t total = 0;
+
+	if (!nearest60(table, n, litW, litH))
+		all[total++] = { litW, litH, 60000 };
+
+	for (size_t i = 0; i < n && total < Modes::MaxModes + 1; i++) {
+		const Modes::Mode *best = nearest60(table, n, table[i].t.hActive, table[i].t.vActive);
+		bool seen = false;
+
+		for (uint32_t k = 0; k < total; k++)
+			seen = seen || (all[k].width == best->t.hActive && all[k].height == best->t.vActive);
+
+		if (!seen)
+			all[total++] = { best->t.hActive, best->t.vActive, best->refreshMilliHz };
+	}
+
+	for (uint32_t i = 0; i < total; i++)
+		for (uint32_t k = i + 1; k < total; k++) {
+			const bool kLit = all[k].width == litW && all[k].height == litH, iLit = all[i].width == litW && all[i].height == litH;
+			const bool larger = static_cast<uint64_t>(all[k].width) * all[k].height > static_cast<uint64_t>(all[i].width) * all[i].height;
+
+			if (!iLit && (kLit || larger)) {
+				const Mode t = all[i];
+
+				all[i] = all[k];
+				all[k] = t;
+			}
+		}
+
+	for (uint32_t i = 0; i < total && count < cap; i++)
+		out[count++] = all[i];
+
+	return count;
+}
+
+bool PvScanout::setMode(uint32_t port, uint32_t width, uint32_t height)
+{
+	Head2 *h = pvHead(port);
+	const Modes::Mode *m = h && h->connected ? nearest60(h->table, h->ndrv.modeCount(), width, height) : nullptr;
+
+	if (!m) {
+		FBLOG("pvgpu: port %u: no mode of %ux%u to switch its head to", port, width, height);
+		return false;
+	}
+
+	h->dev->selectExtra(h->slot);
+
+	const IOReturn r = h->dev->applySecondPipeMode(*m);
+
+	HLOG(h, "port %u: switched to %ux%u@%u.%03u for macOS's mode: %s", port, width, height, m->refreshMilliHz / 1000,
+	     m->refreshMilliHz % 1000, r == kIOReturnSuccess ? "done" : "FAILED");
+
+	if (r != kIOReturnSuccess)
+		return false;
+
+	h->surface.width = width;
+	h->surface.height = height;
+
+	return true;
+}
+
 bool PvScanout::edid(uint32_t port, const uint8_t *&data, size_t &len)
 {
 	if (port == 0 && pvBootHead && pvBootHead->edidLen) {
