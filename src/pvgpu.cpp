@@ -462,6 +462,7 @@ private:
 	// open (it goes first). Taken by a draw that is put into the batch after all, they wait a submit longer than needed.
 	uint64_t nextSubmit() const { return mSubmits + 1 + (mBatchDraws ? 1 : 0); }
 	uint64_t nextSerial() const { return mDrawSerial + 1 + (mBatchDraws ? 1 : 0); }
+
 	bool batchDraw(const uint32_t *ib, uint32_t dwords, uint32_t task, uint32_t target);
 	void flushBatch();
 	uint32_t takeSlot();
@@ -487,12 +488,16 @@ private:
 	GfxBuffers mIdle {};
 	uint32_t mIdleSeq { 0 };
 	uint32_t idleBarrier(uint32_t *out);
-	// Staging for one draw or dispatch at a time (they run one after the other and are waited for): host memory written by the CPU in place,
-	// taken from the start again by each. A target or texture staged in a runtime buffer of its own cost an allocation, two SDMA copies and a
-	// free a draw, each with its page-table syncs.
+	// Staging for draws and dispatches: host memory written by the CPU in place, taken in turn (poolTake). A target or texture staged in a
+	// runtime buffer of its own cost an allocation, two SDMA copies and a free a draw, each with its page-table syncs.
 	static constexpr uint64_t kPoolBytes = 96ull << 20;
 	GfxBuffers mGfxPool {};
 	uint64_t mPoolUsed { 0 };
+	// The pool in kPoolChunks pieces taken in turn: a piece is used again once the submit that used it last is done (it was used from the
+	// start again only when nothing was in flight, and with draws in batches that was seldom: the host drained the card each 24 MiB).
+	static constexpr uint32_t kPoolChunks = 8;
+	uint64_t mPoolChunkSubmit[kPoolChunks] {};
+	uint32_t mUsedChunks { 0 };   // the pieces the draw being put together takes from (a bit each)
 	bool poolTake(uint64_t bytes, uint64_t &gpu, uint8_t *&cpu);
 	uint32_t mGfxHangLines { 0 };          // M4: draws whose IB did not finish, described so far
 	uint32_t mBigCmdLines { 0 };           // ExecIndirect commands too large to decode, reported so far
@@ -566,11 +571,12 @@ private:
 		uint64_t serial { 0 };           // the last draw that read it (mDrawSerial)
 		uint8_t *cpu { nullptr };
 		bool valid { false };
+		bool readOnly { false };         // of a texture shaders only read (type 3): held longer (kShadowAgeReadOnly)
 	};
 	// A frame's icons and glyphs alone are hundreds of small textures: with 32 shadows they pushed each other out, and each was copied
 	// again. Large ones are kept within kShadowBudget.
 	static constexpr uint32_t kShadows = 256;
-	static constexpr uint64_t kShadowBudget = 128ull << 20, kShadowMax = 64ull << 20;   // the client has 1 GiB of VA for all
+	static constexpr uint64_t kShadowBudget = 256ull << 20, kShadowMax = 96ull << 20;   // the client has 1 GiB of VA for all
 	uint64_t mShadowBytes { 0 };
 	uint32_t mShadowsFreed { 0 }, mShadowsMade { 0 };   // for the draw stats
 	uint32_t mStagedLines { 0 };                         // textures copied for one draw, described in this stats period
@@ -593,10 +599,22 @@ private:
 	uint32_t mStale[3] {};                               // shadows filled again: dropped, too old, the surface locked since
 	uint64_t mDrawSerial { 0 };          // draws submitted
 	bool shadowIdle(const Shadow &s) const;
+	// What the draw being put together uses, noted again with the submit it went out with once it has: a copy the draw itself needed (a
+	// shadow filled) goes out before it, and a batch is closed by it, so the draw can go out later than nextSubmit() said.
+	static constexpr uint32_t kUsedMax = 64;
+	bool mBuilding { false };
+	Mapping *mUsedMaps[kUsedMax] {};
+	Shadow *mUsedShadows[kUsedMax] {};
+	uint32_t mUsedMapCount { 0 }, mUsedShadowCount { 0 }, mBuildSlot { ~0u };
+	void noteUsed(Mapping *m);
+	void markUsed(uint64_t submit, uint64_t serial);
 	// Held, or read by a draw not submitted yet (being put together, or batched): its address is in that draw's tables already.
 	bool shadowBusy(const Shadow &s) const { return (mHeld.active && mHeld.shadow == &s) || (s.serial > mDrawSerial && s.serial != ~0ull); }
 	void freeShadow(Shadow &s);
 	static constexpr uint64_t kShadowAge = 250000000;   // ns
+	// A read-only texture's shadow: what writes it are blits and the CPU before its first use (a desktop picture: 59 MB, read across the bus
+	// each frame of Mission Control, 1.5 ms a draw, when sampled in place).
+	static constexpr uint64_t kShadowAgeReadOnly = 5000000000ull;   // ns
 	Shadow mShadows[kShadows];
 	uint64_t mShadowClock { 0 };
 	uint32_t mCopiesReused { 0 };
@@ -824,10 +842,11 @@ void RDNA4PvHost::tick() {
 	if (!mTimer)
 		return;
 
+	// Idle every 1 ms: the first frame of an animation started up to a 5 ms tick late, its VBL events as late (they are set by the tick).
 	if (now - mBusySince < kBusyNs)
 		mTimer->setTimeoutUS(250);
 	else
-		mTimer->setTimeoutMS(mStep == kStepIdle || mStep == kStepDone ? 5 : 2);
+		mTimer->setTimeoutMS(1);
 }
 
 void RDNA4PvHost::pollRegisters() {
@@ -1457,17 +1476,11 @@ void RDNA4PvHost::completeLate()
 		waitDraws();
 }
 
-// Before a draw or dispatch is put together: slots and pool from the start when nothing is in flight; waited for first when they run low.
+// Before a draw or dispatch is put together: the slots from the start again at their end.
 void RDNA4PvHost::readyDraws()
 {
 	if (mSlot >= kSlots)   // a ring: takeSlot waits for the submit that used a slot last
 		mSlot = 0;
-
-	if (mPoolUsed > kPoolBytes / 4)
-		waitDraws();
-
-	if (!mPending && !mBatchDraws)   // nothing in flight or put together reads it
-		mPoolUsed = 0;
 }
 
 // Whether a draw in flight draws into texture `id`: the CPU must not read it before they are done.
@@ -1484,6 +1497,33 @@ bool RDNA4PvHost::drawing(uint32_t task, uint32_t id) const
 			return true;
 
 	return false;
+}
+
+// A mapping the draw being put together uses.
+void RDNA4PvHost::noteUsed(Mapping *m)
+{
+	if (mBuilding && mUsedMapCount < kUsedMax)
+		mUsedMaps[mUsedMapCount++] = m;
+}
+
+// What the draw put together used, noted with the submit and serial it went out with (only ever later than noted while it was built).
+void RDNA4PvHost::markUsed(uint64_t submit, uint64_t serial)
+{
+	for (uint32_t i = 0; i < mUsedMapCount; i++)
+		mUsedMaps[i]->submit = mUsedMaps[i]->submit > submit ? mUsedMaps[i]->submit : submit;
+
+	for (uint32_t i = 0; i < mUsedShadowCount; i++)
+		if (mUsedShadows[i]->serial != ~0ull && mUsedShadows[i]->serial < serial)
+			mUsedShadows[i]->serial = serial;
+
+	if (mBuildSlot < kSlots && mSlotSubmit[mBuildSlot] < submit)
+		mSlotSubmit[mBuildSlot] = submit;
+
+	for (uint32_t i = 0; i < kPoolChunks; i++)
+		if ((mUsedChunks & 1u << i) && mPoolChunkSubmit[i] < submit)
+			mPoolChunkSubmit[i] = submit;
+
+	mBuilding = false;
 }
 
 // A misc and IB slot for a submit: in turn, and once the submit that used it last is done.
@@ -1838,7 +1878,8 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 // M1: one command buffer of an ExecIndirect, decoded: segments {u32 length, u8 type, u8 continuation, u8 flags, u8 0}, in them stream commands
 // {u32 id, u32 size} + payload (docs/m1-stream.md section 4; the framing and the ids measured against tools/metal/m1/mtlprobe.m on the rig, 2026-10-21).
 void RDNA4PvHost::decodeExec(uint32_t task, uint64_t va, uint64_t len) {
-	const uint32_t n = len < 0x10000 ? static_cast<uint32_t>(len) : 0x10000;
+	static constexpr uint32_t kMaxRead = 1u << 20;   // 64 KiB dropped one of Maps' command buffers (72 KiB) whole
+	const uint32_t n = len < kMaxRead ? static_cast<uint32_t>(len) : kMaxRead;
 	auto *buf = static_cast<uint8_t *>(IOMalloc(n ? n : 1));
 	if (!buf)
 		return;
@@ -1871,7 +1912,7 @@ void RDNA4PvHost::decodeExec(uint32_t task, uint64_t va, uint64_t len) {
 	}
 	flushHeld();   // the guest reads what the command buffer drew once its stamp completes
 	pvlog("host: stream: task %u command buffer at 0x%llx, %llu bytes: %u segment(s), %u command(s), %u unknown, %u byte(s) undecoded%s", task, va, len,
-	      segments, t.commands, t.unknown, undecoded, len > n ? " (only the first 64 KiB read)" : "");
+	      segments, t.commands, t.unknown, undecoded, len > n ? " (only the first 1 MiB read)" : "");
 	IOFree(buf, n ? n : 1);
 }
 
@@ -2787,7 +2828,12 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		const bool pitched = h == 1 || (!(rowBytes % 128) && !(rowBytes % fm->bpp));
 		const bool based = src.surface.memory || !(src.va & 0xff);
 		const bool kind = src.surface.memory ? !(gInPlace & 4) : !(gInPlace & 8);
-		const bool inPlace = (gInPlace & 1) && kind && depth == 1 && pitched && based;
+		const bool shaderWrites = writes && (usage & 2) && src.type == 2;
+		uint32_t shadowPitch = 0;
+		// a large read-only texture through a shadow on the card first (read across the bus each draw in place), in place when it gets none
+		const bool large = src.type == 3 && used >= (4u << 20) && used <= kShadowMax && !(gInPlace & 1024);
+		const bool shadowed = large && !(gInPlace & 16) && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch);
+		const bool inPlace = !shadowed && (gInPlace & 1) && kind && depth == 1 && pitched && based;
 
 		if (inPlace && (src.surface.memory ? onCard(src.surface, used, gpu) || mapMemory(src.surface.memory, src.surface.base, used, out[k].handle, gpu)
 		                                   : mapGuest(task, src.va, used, out[k].handle, gpu))) {
@@ -2799,10 +2845,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		}
 
 		// Through a shadow; not one the shader writes (copied back after the draw as before).
-		const bool shaderWrites = writes && (usage & 2) && src.type == 2;
-		uint32_t shadowPitch = 0;
-
-		if (!shaderWrites && !(gInPlace & 16) && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch)) {
+		if (shadowed || (!shaderWrites && !(gInPlace & 16) && !large && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch))) {
 			uint32_t *t = table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4;
 
 			if (array1d)
@@ -2931,7 +2974,7 @@ bool RDNA4PvHost::shadowCurrent(const Shadow &s) const
 		return true;
 
 	const bool locked = s.surface && (gSurfaceFns.lockSeed(s.surface) != s.lockSeed || gSurfaceFns.unlockSeed(s.surface) != s.unlockSeed);
-	const int stale = !s.valid ? 0 : nowNs() - s.when >= kShadowAge ? 1 : locked ? 2 : -1;
+	const int stale = !s.valid ? 0 : nowNs() - s.when >= (s.readOnly ? kShadowAgeReadOnly : kShadowAge) ? 1 : locked ? 2 : -1;
 
 	if (stale >= 0)
 		const_cast<uint32_t &>(mStale[stale])++;
@@ -2963,7 +3006,8 @@ RDNA4PvHost::Shadow *RDNA4PvHost::makeShadow(const ShadowKey &k)
 		return nullptr;
 
 	// on the card when the card can fill it and write it back (a 2D texture, a DMA packet a row), else in host memory for the CPU
-	const bool onCard = k.depth == 1 && k.height <= kDmaRows && !(gInPlace & 64);
+	const bool contiguous = pitch == k.rowBytes && pitch == k.width * k.bpp;   // copied in 1 MiB pieces, not a packet a row
+	const bool onCard = k.depth == 1 && (k.height <= kDmaRows || contiguous) && !(gInPlace & 64);
 
 	if (s->handle && (s->bytes < bytes || onCard != !s->cpu))
 		freeShadow(*s);
@@ -3125,6 +3169,10 @@ bool RDNA4PvHost::shadowTexture(uint32_t task, uint32_t id, const TextureSource 
 
 	s->used = ++mShadowClock;
 	s->serial = nextSerial();
+	s->readOnly = src.type == 3;
+
+	if (mBuilding && mUsedShadowCount < kUsedMax)
+		mUsedShadows[mUsedShadowCount++] = s;
 	gpu = s->gpu;
 	pitch = s->pitch;
 
@@ -3391,6 +3439,7 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 		if (m.count == count && !memcmp(m.pages, pages, count * 8)) {
 			m.used = mMapClock;
 			m.submit = nextSubmit();
+			noteUsed(&m);
 			gpu = m.gpu;
 			if (entry)
 				*entry = &m;
@@ -3417,6 +3466,19 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 		ok = gCompute->rtMapPages(this, pages, count, h, gpu) == kIOReturnSuccess;
 	}
 
+	// Then the shadows least recently used, which share the VA: a mapping a draw needs now counts more than a copy kept for later (Mission
+	// Control's desktop picture was not drawn: no VA left to sample it in place).
+	for (uint32_t tries = 0; copy && !ok && tries < kShadows; tries++) {
+		Shadow *oldest = nullptr;
+
+		for (Shadow &e : mShadows)
+			oldest = e.handle && !shadowBusy(e) && (!oldest || e.used < oldest->used) ? &e : oldest;
+		if (!oldest)
+			break;
+		freeShadow(*oldest);
+		ok = gCompute->rtMapPages(this, pages, count, h, gpu) == kIOReturnSuccess;
+	}
+
 	mMapNs += nowNs() - from;
 	mMapMisses++;
 	mMapPages += count;
@@ -3440,6 +3502,7 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 	dropMapping(*lru);
 	memcpy(copy, pages, count * 8);
 	*lru = {copy, count, h, gpu, mMapClock, nextSubmit()};
+	noteUsed(lru);
 	if (entry)
 		*entry = lru;
 
@@ -3468,6 +3531,7 @@ RDNA4PvHost::Mapping *RDNA4PvHost::keyedMapping(const void *memory, uint32_t tas
 		if (memory || (m.task == task && m.gen == gen)) {
 			m.used = ++mMapClock;
 			m.submit = nextSubmit();
+			noteUsed(&m);
 
 			return &m;
 		}
@@ -3556,14 +3620,26 @@ uint32_t bufferSlot(unsigned st, unsigned k)
 
 bool RDNA4PvHost::poolTake(uint64_t bytes, uint64_t &gpu, uint8_t *&cpu)
 {
-	const uint64_t at = (mPoolUsed + 0xff) & ~0xffull;
-	uint64_t user = 0;
+	static constexpr uint64_t kChunk = kPoolBytes / kPoolChunks;
+	uint64_t at = (mPoolUsed + 0xff) & ~0xffull, user = 0;
 
 	if (!mGfxPool.handle && gCompute->rtAllocHost(this, kernel_task, kPoolBytes, 0, mGfxPool.handle, mGfxPool.gpu, user) == kIOReturnSuccess)
 		mGfxPool.cpu = reinterpret_cast<uint8_t *>(user);
 
-	if (!mGfxPool.cpu || at > kPoolBytes || bytes > kPoolBytes - at)
+	if (!mGfxPool.cpu || !bytes || bytes > kChunk)
 		return false;
+
+	if (at >= kPoolBytes || at / kChunk != (at + bytes - 1) / kChunk) {   // into the next piece, from its start
+		const uint32_t next = at >= kPoolBytes ? 0 : static_cast<uint32_t>((at / kChunk + 1) % kPoolChunks);
+
+		at = next * kChunk;
+		waitSubmit(mPoolChunkSubmit[next]);   // a draw in flight may read it
+	}
+
+	mPoolChunkSubmit[at / kChunk] = nextSubmit();
+
+	if (mBuilding)
+		mUsedChunks |= 1u << (at / kChunk);
 
 	mPoolUsed = at + bytes;
 	gpu = mGfxPool.gpu + at;
@@ -3763,6 +3839,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint64_t drawFrom = nowNs();
 
 	mMapFloor = mMapClock;
+	mBuilding = true;
+	mUsedMapCount = mUsedShadowCount = 0;
+	mUsedChunks = 0;
+	mBuildSlot = ~0u;
+
 	const uint32_t count = draw.count;
 	const bool talk = (mDrawLines[task & 63] < 40 && ++mDrawLines[task & 63]) || gTalk;
 	const PipelineInfo &pi = pipelineInfo(task, pipeline);
@@ -3931,6 +4012,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 	// this draw's state page and IB
 	const uint32_t slot = takeSlot();
+
+	mBuildSlot = slot;
 	const uint64_t slotAt = static_cast<uint64_t>(slot) * RDNA4_TRIRUN_PAGE;
 
 	const bool staged = !inPlace && !held;
@@ -4319,6 +4402,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		if (r == kIOReturnSuccess && !sync) {
 			mPhaseNs[1] += nowNs() - targetFrom;
+
+			// in the open batch, or the submit just made: either way the next of flying()'s count; the serial is counted at the submit
+			markUsed(mSubmits + 1, batched ? mDrawSerial + 1 : mDrawSerial);
 
 			if (!batched) {
 				flying(fence, name[2]);
