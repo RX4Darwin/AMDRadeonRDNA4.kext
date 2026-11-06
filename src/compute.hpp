@@ -1076,6 +1076,7 @@ private:
 	void logClientFault(RtClient &client, const char *tag);
 	void scrubFaultPage();
 	void releaseHost(RtBuffer &buffer);
+	void leakHost(RtBuffer &buffer);
 	void retireIbFences(RtClient &client);
 	IOReturn submitIbLocked(RtClient &client, uint64_t ibVa, uint64_t dwords, uint64_t &fence);
 	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the

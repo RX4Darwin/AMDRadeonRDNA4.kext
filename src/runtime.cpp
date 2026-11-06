@@ -902,6 +902,23 @@ void RDNA4Compute::releaseHost(RtBuffer &b) {
 	b.host = false;
 }
 
+/* As releaseHost, for a buffer whose unmap the GPU did not confirm: a translation it still caches may reach the pages,
+ * so they and their bus mapping stay wired for the rest of the boot. Only the process loses its view of them. */
+void RDNA4Compute::leakHost(RtBuffer &b) {
+	if (!b.host)
+		return;
+
+	if (b.hostMap) {
+		b.hostMap->release();
+		b.hostMap = nullptr;
+	}
+
+	b.hostDma = nullptr;
+	b.hostMemory = nullptr;
+	b.hostUser = 0;
+	b.host = false;
+}
+
 void RDNA4Compute::retireIbFences(RtClient &c) {
 	if (!c.fenceCpu)
 		return;
@@ -2718,11 +2735,14 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	 * (amdgpu sets tlb_seq on a cleared PTE and flushes before the VMID's next job,
 	 * amdgpu_vm.c:1272). Device buffers used to skip it: a cached translation could then
 	 * still reach VRAM that the heap hands to another client. Inferred from the code, not
-	 * measured on the card. Failure handling is the host path's: log and go on. */
-	if (c && (b->va || host) && !vmInvalidateOwned(*c, host ? "host unmap" : "device unmap"))
-		RLOG("vmid %u: %s buffer unmap invalidation timed out", c->vmid, host ? "host" : "device");
+	 * measured on the card. When the invalidation times out the memory is never reused: the
+	 * GPU may still reach it, and host pages handed back to the kernel would take its writes. */
+	const bool forgotten = !c || !(b->va || host) || vmInvalidateOwned(*c, host ? "host unmap" : "device unmap");
 
-	if (c && b->va)
+	if (!forgotten)
+		RLOG("vmid %u: %s buffer unmap invalidation timed out: its memory is kept, not reused", c->vmid, host ? "host" : "device");
+
+	if (c && b->va && forgotten)
 		vaGive(*c, b->va, b->bytes);   // after the invalidation: nothing cached reaches the range when it is mapped again
 	if (host) {
 		if (c) {
@@ -2735,8 +2755,11 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 		}
 		if (b->hostMemory)   // rtMapPages' mappings come and go with every paravirtual draw
 			RLOG("vmid %u: host buffer handle 0x%llx unmapped", c ? c->vmid : 0, handle);
-		releaseHost(*b);
-	} else if (!b->foreign) {
+		if (forgotten)
+			releaseHost(*b);
+		else
+			leakHost(*b);
+	} else if (!b->foreign && forgotten) {
 		(b->device ? devHeap : heap).free(b->offset);
 	}
 	b->owner = nullptr;
@@ -3898,8 +3921,11 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			np++;
 		}
 	}
-	if (c && hostUnmapped && !vmInvalidateOwned(*c, "host unmap"))
-		RLOG("vmid %u: host buffer cleanup invalidation timed out", c->vmid);
+	const bool hostForgotten = !c || !hostUnmapped || vmInvalidateOwned(*c, "host unmap");
+
+	if (!hostForgotten)
+		RLOG("vmid %u: host buffer cleanup invalidation timed out: their pages are kept, not reused", c->vmid);
+
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner && b.host) {
 			const uint64_t rounded = (b.bytes + GpuVm::kPageBytes - 1) &
@@ -3909,7 +3935,10 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			if (hostBytesTotal >= rounded)
 				hostBytesTotal -= rounded;
 			RLOG("vmid %u: host buffer unmapped during client close", c ? c->vmid : 0);
-			releaseHost(b);
+			if (hostForgotten)
+				releaseHost(b);
+			else
+				leakHost(b);
 			b.owner = nullptr;
 		}
 	}
