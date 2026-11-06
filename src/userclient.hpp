@@ -42,6 +42,7 @@ public:
 	bool initWithTask(task_t owningTask, void *securityToken, UInt32 type,
 	                  OSDictionary *properties) APPLE_KEXT_OVERRIDE;
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+	void free() APPLE_KEXT_OVERRIDE;
 	IOReturn clientClose() APPLE_KEXT_OVERRIDE;
 	IOReturn clientDied() APPLE_KEXT_OVERRIDE;
 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
@@ -51,6 +52,11 @@ public:
 private:
 	task_t        task;
 	RDNA4Compute *compute;
+	IOLock       *gate;     // guards calls and closed
+	uint32_t      calls;    // externalMethod calls in flight
+	bool          closed;   // released: no more calls
+
+	void release();
 
 	static const IOExternalMethodDispatch kMethods[kRDNA4MethodCount];
 	static IOReturn sInfo(OSObject *t, void *, IOExternalMethodArguments *a);
