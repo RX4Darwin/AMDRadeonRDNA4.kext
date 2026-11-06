@@ -18,10 +18,12 @@
 #include "mtlkernels.h"
 #include "nggfill_kernel.h"
 #include "psfill_kernel.h"
+#include "scale_codeobj.h"
 #include "../userspace/rdna4-run/gfx12tri.h"     // M4: the triangle streams the host's draws are built from (plain, one attribute)
 #include "../userspace/rdna4-run/gfx12tricol.h"
 static_assert(Gfx12Draw::kRingBytes == Gfx12DrawCol::kColRingBytes, "one ring block serves both streams");
 #include "../userspace/rdna4-run/gfx12trirun.h"
+#include "../userspace/rdna4-run/pm4build.h"   // the COMPUTE_* registers of a dispatch
 #include "rdna4compute.h"
 #include "rdna4mtlc.h"
 
@@ -451,6 +453,14 @@ private:
 	ScanoutMap mScanout[kScanoutPorts] {};
 	GfxBuffers mPresentIb {};
 	bool presentOnCard(uint32_t port, uint32_t sid);
+	// A frame of macOS's scaled modes, larger than any mode of the head ("looks like 2560x1440" draws 5120x2880 on a 3840x2160
+	// monitor): scale.cl puts it into the scanout, dispatched in the frame's IB. Its kernargs a slot per port.
+	struct ScaleKernel { uint64_t code, argsHandle, argsGpu; uint8_t *argsCpu; uint32_t rsrc[3]; bool wave32, tried; };
+	static constexpr uint32_t kScaleArgs = 256;
+	ScaleKernel mScale {};
+	bool scaleKernel();
+	uint32_t scaleFrame(uint32_t *ib, uint32_t port, uint64_t src, uint32_t srcPitch, uint32_t srcW, uint32_t srcH, uint64_t dst,
+	                    const PvScanout::Head &h, bool tenBit);
 	// debug.rdna4_pvframe: a frame copied into host memory with its present (port + 1 asked for), done once its fence is
 	struct FrameGrab { uint64_t handle, gpu, bytes, fence; uint8_t *cpu; uint32_t width, height, pitch; };
 	FrameGrab mGrab {};
@@ -5300,15 +5310,45 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	if (port >= kScanoutPorts || !mRtOpen || !PvScanout::head(port, h) || !h.pitch || !h.height)
 		return false;
 
-	// the scanout at a VA of ours, mapped again when the head moved
 	ScanoutMap &sm = mScanout[port];
+	void *s = retainSurface(sid);
+	IOMemoryDescriptor *md = s ? gSurfaceFns.memory(s) : nullptr;
+
+	// A frame of another size than the head: macOS was told to use another of its modes. The head goes to it (once a size), or for a
+	// size no mode has that is larger than the head's largest (a scaled mode's), to the largest.
+	const uint32_t frameW = md ? gSurfaceFns.width(s) : 0, frameH = md ? gSurfaceFns.height(s) : 0;
+	const uint32_t format = md ? gSurfaceFns.pixelFormat(s) : 0;
+
+	if (frameW && frameH && (frameW != h.width || frameH != h.height) && (frameW != sm.triedW || frameH != sm.triedH)) {
+		uint32_t bigW = 0, bigH = 0;
+		const bool larger = PvScanout::largest(port, bigW, bigH) && frameW > bigW && frameH > bigH;
+
+		sm.triedW = frameW;
+		sm.triedH = frameH;
+
+		if (!larger && PvScanout::setMode(port, frameW, frameH) && PvScanout::head(port, h))
+			pvlog("host: present: port %u now %ux%u for frames of that size", port, h.width, h.height);
+		else if (larger && (h.width != bigW || h.height != bigH) && PvScanout::setMode(port, bigW, bigH) && PvScanout::head(port, h))
+			pvlog("host: present: port %u now %ux%u for frames of %ux%u (format 0x%08x), scaled down", port, h.width, h.height, frameW, frameH,
+			      format);
+	}
+
+	// the scanout at a VA of ours, mapped again when the head moved
 	const uint64_t scanBytes = static_cast<uint64_t>(h.pitch) * h.height;
 
 	if (sm.phys != h.phys || sm.bytes != scanBytes || sm.mode != gPresentOnCard) {   // set up again when rdna4_pvpresent changed too
-		dropScanout(sm);
+		const uint32_t triedW = sm.triedW, triedH = sm.triedH;
 
-		if (gCompute->rtMapVram(this, h.phys, scanBytes, sm.handle, sm.gpu) != kIOReturnSuccess)
+		dropScanout(sm);
+		sm.triedW = triedW;
+		sm.triedH = triedH;
+
+		if (gCompute->rtMapVram(this, h.phys, scanBytes, sm.handle, sm.gpu) != kIOReturnSuccess) {
+			if (s)
+				static_cast<OSObject *>(s)->release();
+
 			return false;
+		}
 
 		sm.phys = h.phys;
 		sm.bytes = scanBytes;
@@ -5316,23 +5356,12 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 		setUpFlips(sm, port);
 	}
 
-	void *s = retainSurface(sid);
-	IOMemoryDescriptor *md = s ? gSurfaceFns.memory(s) : nullptr;
-
-	// A frame of another size than the head: macOS was told to use another of its modes. The head goes to it (once a size).
-	const uint32_t frameW = md ? gSurfaceFns.width(s) : 0, frameH = md ? gSurfaceFns.height(s) : 0;
-
-	if (frameW && frameH && (frameW != h.width || frameH != h.height) && (frameW != sm.triedW || frameH != sm.triedH)) {
-		sm.triedW = frameW;
-		sm.triedH = frameH;
-
-		if (PvScanout::setMode(port, frameW, frameH) && PvScanout::head(port, h))
-			pvlog("host: present: port %u now %ux%u for frames of that size", port, h.width, h.height);
-	}
-
 	const uint64_t base = md ? gSurfaceFns.baseOffset(s) : 0, bpr = md ? gSurfaceFns.bytesPerRow(s) : 0;
 	const uint32_t width = bpr && h.width < bpr / 4 ? h.width : static_cast<uint32_t>(bpr / 4);
-	const uint32_t height = md && h.height < gSurfaceFns.height(s) ? h.height : md ? gSurfaceFns.height(s) : 0;
+
+	// larger than the head both ways: a scaled mode's frame, scaled down into the scanout (else the head's part of it is copied)
+	const bool scaled = frameW > h.width && frameH > h.height && bpr / 4 >= frameW && scaleKernel();
+	const uint32_t height = scaled ? frameH : md && h.height < gSurfaceFns.height(s) ? h.height : md ? gSurfaceFns.height(s) : 0;
 	uint64_t handle = 0, src = 0;
 	const CardSurface *card = cardSurface(s);
 	bool ok = md && width && height && base + bpr * height <= md->getLength();
@@ -5387,7 +5416,17 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	const uint32_t target = sm.flips ? flipTarget(sm) : 0;
 	const uint64_t dst = sm.flips ? sm.va[target] : sm.gpu;
 
-	for (uint64_t i = 0; i < total && n + 7 + 8 <= maxDw;) {
+	if (scaled) {
+		const uint32_t k = scaleFrame(ib + n, port, src, static_cast<uint32_t>(bpr / 4), frameW, frameH, dst, h, format == 0x6c313072);   // 'l10r'
+		const uint32_t idle = k ? idleBarrier(ib + n + k) : 0;   // its writes in memory before the flip
+
+		if (!k || !idle)
+			return false;
+
+		n += k + idle;
+	}
+
+	for (uint64_t i = 0; !scaled && i < total && n + 7 + 8 <= maxDw;) {
 		const uint64_t at = whole ? i : i * bpr, to = whole ? i : i * h.pitch;
 		const uint32_t len = whole ? static_cast<uint32_t>(total - i < kChunk ? total - i : kChunk) : width * 4;
 
@@ -5398,20 +5437,22 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	if (n + 7 + 8 > maxDw)   // too many rows for the IB
 		return false;
 
-	// debug.rdna4_pvframe: the frame as it is, into host memory too
-	const bool grab = mGrabWant == port + 1 && !mGrabFlying && !mGrabReady && grabBuffer(bpr * height);
+	// debug.rdna4_pvframe: the frame as it is, into host memory too; a scaled one as it went into the scanout
+	const uint64_t grabFrom = scaled ? dst : src, grabPitch = scaled ? h.pitch : bpr;
+	const uint32_t grabH = scaled ? h.height : height;
+	const bool grab = mGrabWant == port + 1 && !mGrabFlying && !mGrabReady && grabBuffer(grabPitch * grabH);
 
 	if (grab) {
-		for (uint64_t i = 0, total2 = bpr * height; i < total2 && n + 7 + 8 <= maxDw;) {
+		for (uint64_t i = 0, total2 = grabPitch * grabH; i < total2 && n + 7 + 8 <= maxDw;) {
 			const uint32_t len = static_cast<uint32_t>(total2 - i < kChunk ? total2 - i : kChunk);
 
-			n += dmaData(ib + n, src + i, mGrab.gpu + i, len, i + len >= total2);
+			n += dmaData(ib + n, grabFrom + i, mGrab.gpu + i, len, i + len >= total2);
 			i += len;
 		}
 
-		mGrab.width = width;
-		mGrab.height = height;
-		mGrab.pitch = static_cast<uint32_t>(bpr);
+		mGrab.width = scaled ? h.width : width;
+		mGrab.height = grabH;
+		mGrab.pitch = static_cast<uint32_t>(grabPitch);
 	}
 
 	if (n + 7 + 8 > maxDw)
@@ -5440,6 +5481,68 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	}
 
 	return true;
+}
+
+// scale.cl loaded into the runtime with a page for its kernargs, once: false (and not tried again) if it could not be.
+bool RDNA4PvHost::scaleKernel()
+{
+	if (mScale.code || mScale.tried)
+		return mScale.code != 0;
+
+	mScale.tried = true;
+
+	uint64_t out[9] = {}, cpu = 0;
+
+	if (gCompute->rtLoad(this, kernel_task, reinterpret_cast<mach_vm_address_t>(kScaleCodeObject), sizeof(kScaleCodeObject), "scale", out) !=
+	    kIOReturnSuccess || gCompute->rtAllocHost(this, kernel_task, kScaleArgs * kScanoutPorts, 0, mScale.argsHandle, mScale.argsGpu, cpu) !=
+	    kIOReturnSuccess) {
+		pvlog("host: present: the scale kernel did NOT load: frames of scaled modes are cropped");
+
+		return false;
+	}
+
+	mScale.argsCpu = reinterpret_cast<uint8_t *>(cpu);
+	mScale.rsrc[0] = static_cast<uint32_t>(out[3]);
+	mScale.rsrc[1] = static_cast<uint32_t>(out[4]);
+	mScale.rsrc[2] = static_cast<uint32_t>(out[5]);
+	mScale.wave32 = out[6] & (1u << 10);
+	mScale.code = out[8];
+
+	return true;
+}
+
+// The dispatch of scale.cl from `src` (`srcW` x `srcH`, `srcPitch` pixels a row) into the head's scanout at `dst`, into `ib`; its
+// kernargs in the port's slot (free: the port's IB before waited for). Returns the dwords written.
+uint32_t RDNA4PvHost::scaleFrame(uint32_t *ib, uint32_t port, uint64_t src, uint32_t srcPitch, uint32_t srcW, uint32_t srcH, uint64_t dst,
+                                 const PvScanout::Head &h, bool tenBit)
+{
+	struct Args { uint64_t src, dst; uint32_t srcPitch, dstPitch, srcW, srcH, dstW, dstH, tenBit; } args = {
+		src, dst, srcPitch, h.pitch / 4, srcW, srcH, h.width, h.height, tenBit };
+	const uint64_t at = mScale.argsGpu + port * kScaleArgs;
+	const uint32_t zero = 0, all[2] = {0xffffffffu, 0xffffffffu}, none4[4] = {}, start[3] = {}, threads[3] = {64, 1, 1};
+	const uint32_t pgm[2] = {static_cast<uint32_t>(mScale.code >> 8), static_cast<uint32_t>(mScale.code >> 40)};
+	const uint32_t user[2] = {static_cast<uint32_t>(at), static_cast<uint32_t>(at >> 32)};
+	uint32_t n = 0;
+
+	memcpy(mScale.argsCpu + port * kScaleArgs, &args, sizeof(args));
+	__sync_synchronize();
+
+	n += Pm4::acquireMem(ib + n, Pm4::kGcrMemSync);   // the kernargs not the last frame's in the scalar cache
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_PGM_LO, pgm, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_PGM_RSRC1, mScale.rsrc, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_PGM_RSRC3, &mScale.rsrc[2], 1);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_RESOURCE_LIM, &zero, 1);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_TMPRING, &zero, 1);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE0, all, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE2, all, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE4, none4, 4);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_START_X, start, 3);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_NUM_THREAD_X, threads, 3);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_USER_DATA0, user, 2);
+	n += Pm4::dispatchDirect(ib + n, (h.width + 63) / 64, h.height, 1,
+	                         Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 | (mScale.wave32 ? Pm4::kDispatchWave32 : 0));
+
+	return n;
 }
 
 // The port's two buffers of its own for flipping, and the HUBP that reads its scanout; flipping stays off without them.

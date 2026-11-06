@@ -68,6 +68,12 @@ struct Mode {
 uint32_t modes(uint32_t port, Mode *out, uint32_t cap);
 
 /*
+ * The largest mode head `port`'s pipe runs (plugin.cpp): what a frame larger
+ * than any of them, of a scaled mode, is scaled down to.
+ */
+bool largest(uint32_t port, uint32_t &width, uint32_t &height);
+
+/*
  * Head `port` switched to its mode of `width` x `height` (plugin.cpp): what
  * macOS presents in after the mode was chosen in the Displays settings.
  */

@@ -179,6 +179,7 @@ uint32_t accelCensus { 0 };     // rdna4-accelcensus=1|2: the E1 impostor-IOAcce
 // rdna4-pvgpu-disp bit 2 (with rdna4-pvgpu): the heads are the paravirtual GPU's displays (pvscanout.hpp), and macOS is told
 // that none of our framebuffers has one
 bool pvHeads { false };
+bool pvScaledModes { true };   // rdna4-pvscaled=0: no scaled modes above a head's 3840x2160
 
 // What we keep for one of our framebuffers.
 struct FbState {
@@ -1110,6 +1111,12 @@ void attach(FbEntry &e) {
 		pvGpu = pvTrial;
 
 	pvHeads = pvGpu && dev.isAmd && Trial::option("rdna4-pvgpu-disp", pvDisp) && (pvDisp & 4);
+
+	uint32_t scaled = 1;
+
+	(void)Trial::option("rdna4-pvscaled", scaled);
+	pvScaledModes = scaled != 0;
+
 	if (pvHeads) {
 		st->ndrv.setConnected(false);
 		FBLOG("ndrv: the heads are the paravirtual displays: no display on our framebuffers for macOS");
@@ -1640,13 +1647,28 @@ uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
 
 	// The size it is lit in, then the others from the largest down, each once, as many as fit; a pipe not lit yet is lit at
 	// 3840x2160@60 (through a DP++ adapter in 4:2:0, which the limits for the other modes leave out).
-	Mode all[Modes::MaxModes + 1];
+	Mode all[Modes::MaxModes + 7];
 	uint32_t total = 0;
 
 	if (!nearest60(table, n, litW, litH))
 		all[total++] = { litW, litH, 60000 };
 
-	for (size_t i = 0; i < n && total < Modes::MaxModes + 1; i++) {
+	// Above 3840x2160, sizes no pipe runs: macOS's HiDPI "looks like 2048x1152" to "3360x1890" draw in twice those, which the host
+	// scales down to the largest mode (presentOnCard). The steps macOS offers a 4K monitor on Apple's framebuffer of a 6600 XT, which
+	// it makes from that framebuffer's scaler; the paravirtual one's modes are only those of this list.
+	static constexpr uint32_t kSteps[][2] = { {8, 15}, {3, 5}, {2, 3}, {47, 60}, {5, 6}, {7, 8} };   // of the width and height
+	uint32_t bigW = litW, bigH = litH;
+
+	for (size_t i = 0; i < n; i++)
+		if (static_cast<uint64_t>(table[i].t.hActive) * table[i].t.vActive > static_cast<uint64_t>(bigW) * bigH) {
+			bigW = table[i].t.hActive;
+			bigH = table[i].t.vActive;
+		}
+
+	for (size_t i = 0; bigW >= 3840 && pvScaledModes && i < sizeof(kSteps) / sizeof(kSteps[0]); i++)
+		all[total++] = { 2 * bigW * kSteps[i][0] / kSteps[i][1], 2 * bigH * kSteps[i][0] / kSteps[i][1], 60000 };
+
+	for (size_t i = 0; i < n && total < Modes::MaxModes + 7; i++) {
 		const Modes::Mode *best = nearest60(table, n, table[i].t.hActive, table[i].t.vActive);
 		bool seen = false;
 
@@ -1674,6 +1696,25 @@ uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
 		out[count++] = all[i];
 
 	return count;
+}
+
+bool PvScanout::largest(uint32_t port, uint32_t &width, uint32_t &height)
+{
+	Head2 *h = pvHead(port);
+	const size_t n = h && h->connected ? h->ndrv.modeCount() : 0;
+
+	width = height = 0;
+
+	for (size_t i = 0; i < n; i++) {
+		const Edid::DetailedTiming &t = h->table[i].t;
+
+		if (static_cast<uint64_t>(t.hActive) * t.vActive > static_cast<uint64_t>(width) * height) {
+			width = t.hActive;
+			height = t.vActive;
+		}
+	}
+
+	return width && height;
 }
 
 bool PvScanout::setMode(uint32_t port, uint32_t width, uint32_t height)
