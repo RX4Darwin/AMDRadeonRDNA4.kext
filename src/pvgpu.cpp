@@ -374,6 +374,7 @@ private:
 	bool drawing(uint32_t task, uint32_t id) const;
 	struct BlitRegion;
 	bool copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex, uint32_t buf, const BlitRegion &r);
+	bool copyTexture(uint32_t task, uint32_t from, const uint64_t at[3], uint32_t to, const uint64_t into[3], const uint64_t size[3]);
 	void presentTransaction(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
@@ -1844,7 +1845,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		memcpy(w, payload, bytes < sizeof(w) ? bytes : sizeof(w));
 		pvlog("host:   stream: task %u %s cmd 0x%03x %s, %u bytes: %08x %08x %08x %08x", t->task, t->segment, id, name ? name : "?", bytes, w[0], w[1], w[2], w[3]);
 	}
-	if (id == 0x132 || id == 0x12c || id == 0x12d || id == 0x12e)
+	if (id == 0x132 || (id >= 0x12c && id <= 0x12f))
 		t->host->runBlit(t->task, id, payload, bytes);
 	else if (id == 0x01a) {
 		t->target = t->host->runRenderPass(t->task, payload, bytes);
@@ -4736,6 +4737,34 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 		      r.origin[2], r.slice, r.level, ok ? "done" : "NOT done");
 		if (!ok || gTalk)
 			dumpTexture(task, tex);
+	} else if (id == 0x12f && bytes >= 88) {
+		// Blit.copyFromTexture into a texture {u32 source, u32 destination, u64 source origin[3], u64 size[3], u64 destination origin[3], u32,
+		// u32: 0 for level 0 of 2D textures} (WindowServer's and CoreImage's, read from the rig's log, 2026-11-06). Not carried out, CoreImage's
+		// source images stayed empty: Preview showed nothing, or with the race of the shadows other images' pixels.
+		uint32_t from, to, rest[2];
+		uint64_t at[3], size[3], into[3];
+
+		memcpy(&from, p, 4);
+		memcpy(&to, p + 4, 4);
+		memcpy(at, p + 8, 24);
+		memcpy(size, p + 32, 24);
+		memcpy(into, p + 56, 24);
+		memcpy(rest, p + 80, 8);
+
+		const bool ok = !rest[0] && !rest[1] && size[2] == 1 && !at[2] && !into[2] && copyTexture(task, from, at, to, into, size);
+
+		pvlog("host: blit: copyFromTexture %u (%llux%llu at %llu, %llu) -> texture %u at %llu, %llu (%08x %08x) by rows: %s", from, size[0], size[1],
+		      at[0], at[1], to, into[0], into[1], rest[0], rest[1], ok ? "done" : "NOT done");
+	} else {   // not carried out: its bytes in full, once a command, to learn its layout
+		static uint32_t told[8];
+		uint32_t w[22] = {};
+
+		memcpy(w, p, bytes < sizeof(w) ? bytes : sizeof(w));
+
+		if (told[id & 7]++ < 4)
+			pvstat("host: blit: cmd 0x%03x (%u bytes) not carried out: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x "
+			       "%08x %08x %08x %08x %08x %08x", id, bytes, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13],
+			       w[14], w[15], w[16], w[17], w[18], w[19], w[20], w[21]);
 	}
 }
 
@@ -4753,6 +4782,49 @@ void RDNA4PvHost::dumpTexture(uint32_t task, uint32_t id)
 	for (uint32_t i = 0; i < 32; i += 8)
 		pvlog("host: blit: texture %u (heap record %08x) [%u]: %08x %08x %08x %08x %08x %08x %08x %08x", id, rec[0], i, td[i], td[i + 1], td[i + 2],
 		      td[i + 3], td[i + 4], td[i + 5], td[i + 6], td[i + 7]);
+}
+
+// A region of level 0 of 2D texture `from` at `at` into texture `to` at `into`, `size` pixels, row by row with the CPU; IOSurfaces through
+// their memory. False when the formats' pixels differ in size or the region is not within both.
+bool RDNA4PvHost::copyTexture(uint32_t task, uint32_t from, const uint64_t at[3], uint32_t to, const uint64_t into[3], const uint64_t size[3])
+{
+	TextureSource s, d;
+
+	if (!textureSource(task, from, s) || !textureSource(task, to, d))
+		return false;
+
+	const TextureFormat *fs = textureFormat(s.format), *fd = textureFormat(d.format);
+
+	// Each sum checked without forming it: the guest's u64s would wrap around.
+	if (!fs || !fd || fs->bpp != fd->bpp || !size[0] || !size[1] || size[0] > s.width || at[0] > s.width - size[0] ||
+	    size[1] > s.height || at[1] > s.height - size[1] || size[0] > d.width || into[0] > d.width - size[0] ||
+	    size[1] > d.height || into[1] > d.height - size[1] || size[0] * fs->bpp > 0x10000)
+		return false;
+
+	const uint32_t n = static_cast<uint32_t>(size[0] * fs->bpp);
+	auto *row = static_cast<uint8_t *>(IOMalloc(n));
+	bool ok = row != nullptr;
+
+	cardToMemory(s.surface.surface);   // read and written by the CPU
+	cardToMemory(d.surface.surface);
+
+	for (uint64_t y = 0; y < size[1] && ok; y++) {
+		const uint64_t src = (at[1] + y) * s.rowBytes + at[0] * fs->bpp, dst = (into[1] + y) * d.rowBytes + into[0] * fd->bpp;
+
+		ok = s.surface.memory ? s.surface.memory->readBytes(s.surface.base + src, row, n) == n : readGuest(task, s.va + src, row, n);
+		ok = ok && (d.surface.memory ? d.surface.memory->writeBytes(d.surface.base + dst, row, n) == n : copyGuest(task, d.va + dst, row, n, true));
+	}
+
+	if (row)
+		IOFree(row, n);
+
+	// what shadows of the destination hold is not what it has now
+	if (d.surface.memory)
+		dropShadows(d.surface.surface, 0, d.surface.base, false);
+	else
+		dropShadowRange(task, d.va, d.length);
+
+	return ok;
 }
 
 // A region of level 0 of a texture from or into a buffer (rows bytesPerRow, images bytesPerImage apart from offset), row by row with the
