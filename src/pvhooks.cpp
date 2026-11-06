@@ -163,7 +163,9 @@ IOReturn wrapNewUserClient(void *fb, void *task, void *security, uint32_t type, 
  * of 0xaaaaaaaa, kIOConnectionBuiltIn (0x800) among them: macOS took the
  * monitors for built-in displays ("Integrierter Monitor") and made colour
  * profiles of the guest's names. The EDID's identity is made the monitor's:
- * vendor, product, serial, date, chromaticities and name from its own EDID;
+ * vendor, product, serial, date, screen size, chromaticities and name from
+ * its own EDID (the guest says 255 x 216 cm, which gives macOS a wrong pixel
+ * density for picking the default scale);
  * the guest's timings stay, since CoreDisplay checks a display's modes
  * against its EDID (with the monitor's whole EDID it set none and showed
  * nothing). The built-in flag is cleared from the connection flags; with
@@ -191,6 +193,7 @@ void realEdid(IOService *display)
 
 	memcpy(out, b, outLen);           // the base block changed below; the extension (the timings) stays as it is
 	memcpy(out + 8, edid + 8, 10);    // vendor, product, serial, week and year
+	memcpy(out + 21, edid + 21, 2);   // screen size in cm
 	memcpy(out + 25, edid + 25, 10);  // chromaticities
 
 	// the monitor's name in the guest's name descriptor
