@@ -382,6 +382,53 @@ bool underflowed(RDNA4Compute &compute, uint8_t hubp) {
 	return true;
 }
 
+uint8_t otgOf(RDNA4Compute &compute, uint8_t hubp) {
+	auto dmuRead = [&](uint8_t segment, uint32_t dword) {
+		return compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { segment, dword });
+	};
+	uint8_t opp = kNone;
+
+	for (uint8_t i = 0; i < Pipe::kMaxOtg && opp == kNone; i++) {
+		const uint32_t top = dmuRead(3, kMpccTopSel + i * Pipe::Reg::kMpccStride);
+		const uint32_t id = dmuRead(3, kMpccOppId + i * Pipe::Reg::kMpccStride);
+
+		if (top != kBad && id != kBad && (top & 0xf) == hubp)
+			opp = static_cast<uint8_t>(id & 0xf);
+	}
+
+	for (uint8_t i = 0; i < Pipe::kMaxOtg && opp != kNone; i++) {
+		const uint32_t control = dmuRead(2, Pipe::Reg::kOtgControl + i * Pipe::Reg::kOtgStride);
+		const uint32_t source = dmuRead(2, Pipe::Reg::kOptcDataSource + i * Pipe::Reg::kOdmStride);
+
+		if (control != kBad && (control & 1) && source != kBad && ((source >> 16) & 0xf) == opp)
+			return i;
+	}
+
+	return kNone;
+}
+
+bool scan(RDNA4Compute &compute, uint8_t otg, uint32_t &line, uint32_t &lines, uint32_t &blankStart) {
+	auto dmuRead2 = [&](uint32_t dword) {
+		return compute.rd(IpDiscovery::HwDmu, GfxReg::Reg { 2, dword + static_cast<uint32_t>(otg) * Pipe::Reg::kOtgStride });
+	};
+
+	if (otg >= Pipe::kMaxOtg)
+		return false;
+
+	const uint32_t position = dmuRead2(kOtgStatusPosition);   // OTG_VERT_COUNT [30:16]
+	const uint32_t total = dmuRead2(Pipe::Reg::kOtgVTotal);     // lines - 1
+	const uint32_t blank = dmuRead2(Pipe::Reg::kOtgVBlank);     // OTG_V_BLANK_START [14:0]
+
+	if (position == kBad || total == kBad || blank == kBad)
+		return false;
+
+	line = position >> 16 & 0x7fff;
+	lines = (total & 0x7fff) + 1;
+	blankStart = blank & 0x7fff;
+
+	return line < lines && blankStart < lines;
+}
+
 bool run(RDNA4Compute &compute) {
 	uint32_t mode = 0;
 	if (!PE_parse_boot_argn("rdna4-flip", &mode, sizeof(mode)) || !mode)

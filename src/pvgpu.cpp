@@ -452,7 +452,7 @@ private:
 	struct ScanoutMap {
 		uint64_t phys, bytes, handle, gpu, fence;
 		uint64_t back[2], mc[3], va[3], flipFence;
-		uint8_t hubp, queued, mode;   // mode: rdna4_pvpresent when it was set up
+		uint8_t hubp, otg, queued, mode;   // otg: the one hubp feeds; mode: rdna4_pvpresent when it was set up
 		uint32_t triedW, triedH;      // the frame size a mode switch was last tried for
 		bool flips;
 	};
@@ -589,11 +589,12 @@ private:
 	uint32_t mPresents { 0 };            // frames presented meanwhile
 	// Frame timing, per port: frames, frames later than one period after the one before (a frame missed), the time from the VBL to the
 	// present (sum and most); and how long the stamps queued behind draws in flight waited (sum, most, count).
-	// gaps: frames 1, 2, 3 and 4 to 8 VBLs after the one before; underflows: frames before which the head's HUBP had run out of data
-	struct PortTiming { uint64_t last, vblNs, vblMaxNs; uint32_t frames, missed, gaps[4], underflows; };
+	// gaps: frames 1, 2, 3 and 4 to 8 VBLs after the one before; underflows: frames before which the head's HUBP had run out of data;
+	// shown: vblanks after which the head showed another buffer (a port flipping its frames: each frame shown, none dropped, if as many)
+	struct PortTiming { uint64_t last, vblNs, vblMaxNs; uint32_t frames, missed, gaps[4], underflows, shown; uint64_t vblAt, inUse; };
 	PortTiming mPortTiming[8] {};
 	void timePresent(PortTiming &t);
-	uint64_t mVblAt { 0 }, mLateNs { 0 }, mLateMaxNs { 0 };
+	uint64_t mLateNs { 0 }, mLateMaxNs { 0 };
 	uint64_t mVblLateNs { 0 }, mVblLateMaxNs { 0 };   // how late the VBL events fired (the host's tick was busy)
 	uint32_t mVbls { 0 }, mVblsLate { 0 };            // VBL events, those 2 ms or more late
 	uint64_t mClocksAt { 0 };   // when the GFX clocks were last counted
@@ -722,6 +723,12 @@ private:
 	pvstream::disp::Info mDispInfo;
 	uint32_t mDispBits { 0 };           // INTR_STATUS_DISP bits asserted: level-triggered, dropped once the guest took the pending event
 	uint64_t mNextVblNs { 0 };
+	// A port flipping its frames: its VBL event when its head's vblank starts, not on the shared tick. Running free, the tick had any
+	// phase against the heads' vblanks (and drifted: 60.000 Hz against 59.997 and 60.001), and frames copied close to a vblank were shown
+	// one or two vblanks later in turn.
+	uint64_t mPortVblNs[8] {};
+	uint64_t mVblSoonest { 0 };          // the earliest VBL event due, shared or a port's
+	bool vblDue(uint32_t port, uint64_t now, bool tick);
 	uint64_t mLastDispIrqNs { 0 };
 	uint32_t mVblFrames { 0 };          // VBL events set (frames due while some pipe had VBL enabled)
 	uint32_t mOnlineEvents { 0 }, mOnlineAcks { 0 };
@@ -1191,7 +1198,7 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 
 		// A VBL due while a long run of commands is worked through raised now, not after them (Safari's live resize: some 30 a second
 		// came 2 to 5 ms late)
-		if (mNextVblNs && nowNs() >= mNextVblNs)
+		if (mVblSoonest && nowNs() >= mVblSoonest)
 			pollDisplay();
 	}
 	if (haveSignal && gTalk)
@@ -5493,7 +5500,7 @@ static uint32_t dmaData(uint32_t *out, uint64_t src, uint64_t dst, uint32_t byte
 void RDNA4PvHost::timePresent(PortTiming &t)
 {
 	const uint64_t now = nowNs();
-	const uint64_t sinceVbl = now - mVblAt;
+	const uint64_t sinceVbl = now - t.vblAt;
 
 	if (t.last && now - t.last > kVblPeriodNs * 3 / 2 && now - t.last < 4 * kVblPeriodNs)   // an animation, one frame or more missed
 		t.missed++;
@@ -5507,7 +5514,7 @@ void RDNA4PvHost::timePresent(PortTiming &t)
 	t.last = now;
 	t.frames++;
 
-	if (mVblAt && sinceVbl < 4 * kVblPeriodNs) {
+	if (t.vblAt && sinceVbl < 4 * kVblPeriodNs) {
 		t.vblNs += sinceVbl;
 		t.vblMaxNs = sinceVbl > t.vblMaxNs ? sinceVbl : t.vblMaxNs;
 	}
@@ -5769,6 +5776,7 @@ void RDNA4PvHost::setUpFlips(ScanoutMap &sm, uint32_t port)
 		return;
 
 	sm.hubp = hubp;
+	sm.otg = gCompute->rtScanoutOtg(hubp);
 	sm.mc[0] = mc;
 	sm.va[0] = sm.gpu;
 
@@ -5787,7 +5795,7 @@ void RDNA4PvHost::setUpFlips(ScanoutMap &sm, uint32_t port)
 	}
 
 	sm.flips = sm.mc[1] && sm.mc[2];
-	pvlog("host: present: port %u: HUBP%u reads its scanout at MC 0x%llx; frames %s", port, hubp, mc,
+	pvlog("host: present: port %u: HUBP%u (OTG%u) reads its scanout at MC 0x%llx; frames %s", port, hubp, sm.otg, mc,
 	      sm.flips ? "flipped at vblank between it and two buffers of ours" : "copied into it (no VRAM for flipping)");
 }
 
@@ -6183,8 +6191,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		if (!t.frames)
 			continue;
 
-		at += snprintf(ports + at, sizeof(ports) - at, " port %u: %u (%u missed, %u underflows, VBL to present %llu us, most %llu us);", p,
-		               t.frames, t.missed, t.underflows, t.vblNs / t.frames / 1000, t.vblMaxNs / 1000);
+		at += snprintf(ports + at, sizeof(ports) - at, " port %u: %u (%u shown, %u missed, %u underflows, VBL to present %llu us, most %llu us);",
+		               p, t.frames, t.shown, t.missed, t.underflows, t.vblNs / t.frames / 1000, t.vblMaxNs / 1000);
 		gat += snprintf(gaps + gat, sizeof(gaps) - gat, " port %u: %u/%u/%u/%u;", p, t.gaps[0], t.gaps[1], t.gaps[2], t.gaps[3]);
 	}
 	if (ports[0] || mLateDone)
@@ -6258,7 +6266,7 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mCardLoads = mCardBacks = mCardFills = mCardFlushes = 0;
 
 	for (PortTiming &t : mPortTiming)
-		t = { t.last, 0, 0, 0, 0 };
+		t = { t.last, 0, 0, 0, 0, {}, 0, 0, t.vblAt, t.inUse };
 	mLateNs = mLateMaxNs = 0;
 	mLateDone = 0;
 
@@ -6300,7 +6308,6 @@ void RDNA4PvHost::pollDisplay() {
 			const uint64_t late = now - mNextVblNs;
 
 			frame = true;
-			mVblAt = now;
 			mVbls++;
 			mVblLateNs += late < 4 * kVblPeriodNs ? late : 0;
 			mVblLateMaxNs = late < 4 * kVblPeriodNs && late > mVblLateMaxNs ? late : mVblLateMaxNs;
@@ -6326,7 +6333,7 @@ void RDNA4PvHost::pollDisplay() {
 			      (enabled & pvstream::disp::kEventOnline) && !(p.lastEnabled & pvstream::disp::kEventOnline) ? " (enable())" : "");
 			p.lastEnabled = enabled;
 		}
-		if (frame && (enabled & pvstream::disp::kEventVbl)) {
+		if (vblDue(port, now, frame) && (enabled & pvstream::disp::kEventVbl)) {
 			__atomic_fetch_or(pending, pvstream::disp::kEventVbl, __ATOMIC_SEQ_CST);
 			if (mVblFrames++ < 3 || mVblFrames % 600 == 0)
 				pvlog("host: VBL event %u on display pipe %u (+0x100 bit 0)", mVblFrames, port);
@@ -6342,6 +6349,10 @@ void RDNA4PvHost::pollDisplay() {
 		p.cursorPos = pos;
 		p.cursorVisible = visible;
 	}
+	mVblSoonest = mNextVblNs;
+	for (const uint64_t due : mPortVblNs)
+		mVblSoonest = due && (!mVblSoonest || due < mVblSoonest) ? due : mVblSoonest;
+
 	const uint32_t fresh = want & ~mDispBits;
 	if (want != mDispBits)
 		c[kRegIntrStatusDisp / 4] = (c[kRegIntrStatusDisp / 4] & ~mDispBits) | want;
@@ -6350,6 +6361,44 @@ void RDNA4PvHost::pollDisplay() {
 		mLastDispIrqNs = now;
 		mNub->raiseInterrupt(0, true);   // with the line off as well, as the stamps (completeStamp)
 	}
+}
+
+// Whether port `port`'s VBL event is due now: on the shared tick (`tick`), or for a port flipping its frames when its head's vblank
+// starts. WindowServer composes the next frame then, which leaves it most of a period to be copied before the vblank after.
+bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
+{
+	const ScanoutMap *sm = port < kScanoutPorts ? &mScanout[port] : nullptr;
+	uint64_t *due = port < 8 ? &mPortVblNs[port] : nullptr;
+	uint32_t line = 0, lines = 0, blankStart = 0;
+	bool fire = tick;
+
+	if (!due)
+		return tick;
+
+	if (sm && sm->flips && *due && now < *due)
+		return false;
+
+	if (!sm || !sm->flips || sm->otg >= 8 || !gCompute->rtScanoutScan(sm->otg, line, lines, blankStart) || !lines) {
+		*due = 0;
+	} else {
+		const uint64_t toBlank = static_cast<uint64_t>((blankStart + lines - line) % lines) * kVblPeriodNs / lines;
+
+		uint64_t requested = 0, inUse = 0;
+
+		// an early wake-up (the tick runs every 250 us to 1 ms): the vblank is still to come
+		fire = *due && toBlank > kVblPeriodNs / 8;
+		*due = now + toBlank;
+
+		if (fire && gCompute->rtScanoutShown(sm->hubp, requested, inUse) && inUse != mPortTiming[port].inUse) {
+			mPortTiming[port].shown++;
+			mPortTiming[port].inUse = inUse;
+		}
+	}
+
+	if (fire)
+		mPortTiming[port].vblAt = now;
+
+	return fire;
 }
 
 // Completion of a command that asked for a stamp: the driver's event machine tests `*stampPtr[index] >= value` with stampPtr[index] = (FIFO buffer page)+4*index

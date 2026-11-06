@@ -76,6 +76,12 @@ bool shown(RDNA4Compute &compute, uint8_t hubp, uint64_t &requested, uint64_t &i
 // shows lines of garbage or of the frame before.
 bool underflowed(RDNA4Compute &compute, uint8_t hubp);
 
+// The OTG whose picture HUBP `hubp` feeds (MPCC_TOP_SEL, its MPCC_OPP_ID, the OTG's OPTC_SEG0_SRC_SEL), or kNone.
+uint8_t otgOf(RDNA4Compute &compute, uint8_t hubp);
+
+// Where OTG `otg` scans: its line now, its lines a frame and the first line of its vertical blank. False when they cannot be read.
+bool scan(RDNA4Compute &compute, uint8_t otg, uint32_t &line, uint32_t &lines, uint32_t &blankStart);
+
 // Run the rdna4-flip=<mode> test once. False means the requested test failed
 // and the feature has been disabled after attempting to restore the desktop.
 bool run(RDNA4Compute &compute);
