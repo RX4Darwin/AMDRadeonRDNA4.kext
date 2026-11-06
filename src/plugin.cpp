@@ -1692,8 +1692,17 @@ uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
 			}
 		}
 
-	for (uint32_t i = 0; i < total && count < cap; i++)
-		out[count++] = all[i];
+	// From the largest down, not a size that is half of one kept: macOS offers that size as the HiDPI mode of the larger one already and
+	// listed this one again as "(niedrige Auflösung)" (1920x1080 beside 3840x2160's, 2560x1440 beside 5120x2880's). The lit one stays.
+	for (uint32_t i = 0; i < total && count < cap; i++) {
+		bool half = false;
+
+		for (uint32_t k = 0; k < count && !half; k++)
+			half = out[k].width == 2 * all[i].width && out[k].height == 2 * all[i].height;
+
+		if (!half || (all[i].width == litW && all[i].height == litH))
+			out[count++] = all[i];
+	}
 
 	return count;
 }
