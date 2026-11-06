@@ -117,7 +117,7 @@ struct Translation {
 	uint32_t libLen;
 	char name[64];
 	uint8_t *elf;                 // IOMalloc'd by kMtlcDeliver, freed by the host
-	uint32_t elfLen, buffers, written;
+	uint32_t elfLen, buffers, written, texturesWritten;
 } gTr;
 
 void pvlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -260,6 +260,7 @@ private:
 		char name[64];
 		uint64_t lib;
 		uint32_t program, buffers, written;   // a compute kernel loaded into the runtime
+		uint32_t texturesWritten;             // bit i: it writes texture index i (include/rdna4mtlc.h)
 		uint8_t *gfx;                         // or a vertex or fragment shader: the helper's RGFX blob (air2amdgpu.cpp translateShader)
 		uint32_t gfxLen;
 		uint32_t helper;                      // gTr.helpers when it was translated (or failed)
@@ -285,13 +286,15 @@ public:
 	              uint64_t scissor[4]; bool scissorSet; };
 	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *stage);
 	void runCompute(uint32_t task, uint32_t pipeline, const Bindings &bound, const uint64_t *size);
-	struct StagedTexture { uint64_t handle, va; uint8_t *cpu; uint32_t rowBytes, pitch, rowLen, height; bool writable; };   // staged: a runtime buffer or the pool
+	// staged: a runtime buffer or the pool; an IOSurface the kernel writes held (prepared) until its rows are written back into it
+	struct StagedTexture { uint64_t handle, va; uint8_t *cpu; uint32_t rowBytes, pitch, rowLen, height; bool writable; OSObject *surface;
+	                       IOMemoryDescriptor *memory; uint64_t base; };
 	struct TextureSource;
 	bool textureSource(uint32_t task, uint32_t id, TextureSource &out);
 	bool readTextureRow(uint32_t task, const TextureSource &src, uint32_t y, uint8_t *dst, uint32_t bytes);
 	int inkedBytes(uint32_t task, const TextureSource &src, uint32_t bpp);
 	bool stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName,
-	                   bool writes);
+	                   bool writes, uint32_t texturesWritten = 0);
 	bool releaseTextures(uint32_t task, StagedTexture (&staged)[16], bool copyBack);
 	bool mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	bool mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
@@ -2851,7 +2854,7 @@ int RDNA4PvHost::inkedBytes(uint32_t task, const TextureSource &src, uint32_t bp
 // `writes`: the shader may write its textures (a kernel, or a fragment shader without a colour output); those with
 // MTLTextureUsageShaderWrite are then copied back after it. CoreAnimation makes its textures with that usage and draws only read them.
 bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName,
-                                bool writes) {
+                                bool writes, uint32_t texturesWritten) {
 	bool ok = true;
 	for (unsigned k = 0; k < 16 && ok; k++) {
 		const uint32_t id = bound.texture[k];
@@ -2909,6 +2912,9 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		const bool based = src.surface.memory || !(src.va & 0xff);
 		const bool kind = src.surface.memory ? !(gInPlace & 4) : !(gInPlace & 8);
 		const bool shaderWrites = writes && (usage & 2) && src.type == 2;
+		// An IOSurface the kernel writes (texturesWritten, from the helper) where it cannot be in place, a plane off a 256-byte boundary
+		// (a 420v pixel buffer's at +0x20: VideoToolbox's conversions came out all 0): copied, and its rows written back after.
+		const bool surfaceWrites = writes && src.type == 5 && (texturesWritten & (1u << k)) && depth == 1;
 		uint32_t shadowPitch = 0;
 		// a large read-only texture through a shadow on the card first (read across the bus each draw in place), in place when it gets none
 		const bool large = src.type == 3 && used >= (4u << 20) && used <= kShadowMax && !(gInPlace & 1024);
@@ -2925,7 +2931,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		}
 
 		// Through a shadow; not one the shader writes (copied back after the draw as before).
-		if (shadowed || (!shaderWrites && !(gInPlace & 16) && !large && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch))) {
+		if (shadowed || (!shaderWrites && !surfaceWrites && !(gInPlace & 16) && !large && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch))) {
 			uint32_t *t = table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4;
 
 			if (array1d)
@@ -2999,7 +3005,20 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		out[k].pitch = texPitch;
 		out[k].rowLen = w * fm->bpp;
 		out[k].height = h;
-		out[k].writable = writes && (usage & 2) && src.type == 2 && depth == 1;   // MTLTextureUsageShaderWrite; not read-only (type 3), IOSurface or 3D
+		out[k].writable = (writes && (usage & 2) && src.type == 2 && depth == 1) || surfaceWrites;   // MTLTextureUsageShaderWrite; not read-only (type 3) or 3D
+
+		if (surfaceWrites && talk)
+			pvlog("host: render:   %s texture %u: IOSurface written by the kernel, not in place: copied, its rows written back after", stageName, k);
+
+		if (surfaceWrites && src.surface.memory->prepare() == kIOReturnSuccess) {   // held past src: written back by releaseTextures
+			src.surface.surface->retain();
+			src.surface.memory->retain();
+			out[k].surface = src.surface.surface;
+			out[k].memory = src.surface.memory;
+			out[k].base = src.surface.base;
+		} else if (surfaceWrites) {
+			out[k].writable = false;
+		}
 		if (array1d)
 			linearArray1d(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, depth);
 		else if (depth > 1)
@@ -3653,10 +3672,17 @@ bool RDNA4PvHost::releaseTextures(uint32_t task, StagedTexture (&staged)[16], bo
 			if (ok && !st.cpu)
 				ok = gCompute->rtCopy(this, st.handle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(copy), bytes, false) == kIOReturnSuccess;
 
-			for (uint32_t y = 0; y < st.height && ok; y++)
-				ok = copyGuest(task, st.va + static_cast<uint64_t>(y) * st.rowBytes, copy + static_cast<uint64_t>(y) * st.pitch, st.rowLen, true);
+			for (uint32_t y = 0; y < st.height && ok; y++) {
+				const uint64_t at = static_cast<uint64_t>(y) * st.rowBytes;
+				uint8_t *row = copy + static_cast<uint64_t>(y) * st.pitch;
 
-			dropShadowRange(task, st.va, static_cast<uint64_t>(st.rowBytes) * st.height);
+				ok = st.memory ? st.memory->writeBytes(st.base + at, row, st.rowLen) == st.rowLen : copyGuest(task, st.va + at, row, st.rowLen, true);
+			}
+
+			if (st.memory)   // the plane's shadows hold what it held before (the next kernel read its 420v planes so)
+				dropShadows(st.surface, 0, st.base, false);
+			else
+				dropShadowRange(task, st.va, static_cast<uint64_t>(st.rowBytes) * st.height);
 			if (copy && !st.cpu)
 				IOFree(copy, bytes);
 
@@ -3665,6 +3691,14 @@ bool RDNA4PvHost::releaseTextures(uint32_t task, StagedTexture (&staged)[16], bo
 
 		if (st.handle)
 			gCompute->rtFree(this, st.handle);
+
+		if (st.memory) {
+			st.memory->complete();
+			st.memory->release();
+		}
+
+		if (st.surface)
+			st.surface->release();
 
 		st = {};
 	}
@@ -5004,7 +5038,7 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	}
 	const bool done = gTr.done;
 	uint8_t *elf = gTr.elf;
-	const uint32_t elfLen = gTr.elfLen, buffers = gTr.buffers, written = gTr.written;
+	const uint32_t elfLen = gTr.elfLen, buffers = gTr.buffers, written = gTr.written, texturesWritten = gTr.texturesWritten;
 	gTr.id = 0;
 	gTr.lib = nullptr;
 	gTr.elf = nullptr;
@@ -5029,6 +5063,7 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	j.program = elf && !shader && buffers <= 8 ? load(elf, elfLen, name) : 0;
 	j.buffers = buffers;
 	j.written = written;
+	j.texturesWritten = texturesWritten;
 	j.gfx = shader ? elf : nullptr;   // kept: the host places it into its code buffer for each draw
 	j.gfxLen = shader ? elfLen : 0;
 	if (elf && !shader)
@@ -5099,12 +5134,16 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	pvlog("host: compute: task %u dispatches \"%s\" (hash %02x%02x%02x%02x%02x%02x%02x%02x...), %llu x %llu x %llu threads in groups of %llu x %llu x %llu",
 	      task, name, hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], size[0], size[1], size[2], size[3], size[4], size[5]);
 	// The kernel: translated now by the helper, else (no helper) from the table of src/mtlkernels.h by name.
-	uint32_t prog = 0, nb = 0, written = 0;
+	uint32_t prog = 0, nb = 0, written = 0, texturesWritten = 0;
 	const char *from = "translated at run time";
 	if (const Jit *j = translated(task, lib, name, hash)) {
 		prog = j->program;
 		nb = j->buffers;
 		written = j->written;
+		texturesWritten = j->texturesWritten;
+
+		if (texturesWritten)
+			pvlog("host: compute: \"%s\" writes textures 0x%x", name, texturesWritten);
 	} else {
 		for (unsigned i = 0; i < kMtlKernelCount && !prog; i++)
 			if (!strcmp(name, kMtlKernels[i].name)) {
@@ -5145,7 +5184,7 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		memset(table, 0, sizeof(table));
 		waitDraws();   // dispatches run alone
 		readyDraws();
-		ok = stageTextures(task, bound, table, staged, true, "kernel", true) && gCompute->rtAlloc(this, sizeof(table), tableHandle, tableGpu) == kIOReturnSuccess &&
+		ok = stageTextures(task, bound, table, staged, true, "kernel", true, texturesWritten) && gCompute->rtAlloc(this, sizeof(table), tableHandle, tableGpu) == kIOReturnSuccess &&
 		     gCompute->rtCopy(this, tableHandle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(table), sizeof(table), true) == kIOReturnSuccess;
 	}
 	uint64_t micros = 0;
@@ -7423,7 +7462,7 @@ IOReturn RDNA4MtlcClient::externalMethod(uint32_t selector, IOExternalMethodArgu
 	if (selector == kMtlcNext && a->scalarInputCount == 2 && a->scalarOutputCount == 2 && a->structureOutput &&
 	    a->structureOutputSize == sizeof(gTr.name))
 		return next(a);
-	if (selector == kMtlcDeliver && a->scalarInputCount == 5 && a->scalarInput[2] <= RDNA4_MTLC_MAX_ELF)
+	if (selector == kMtlcDeliver && (a->scalarInputCount == 5 || a->scalarInputCount == 6) && a->scalarInput[2] <= RDNA4_MTLC_MAX_ELF)
 		return deliver(a);
 	return kIOReturnBadArgument;
 }
@@ -7480,6 +7519,7 @@ IOReturn RDNA4MtlcClient::deliver(IOExternalMethodArguments *a) {
 		gTr.elfLen = len;
 		gTr.buffers = static_cast<uint32_t>(in[3]);
 		gTr.written = static_cast<uint32_t>(in[4]);
+		gTr.texturesWritten = a->scalarInputCount > 5 ? static_cast<uint32_t>(in[5]) : 0;
 		gTr.done = true;
 		IOLockWakeup(gTr.lock, &gTr.done, false);
 	}

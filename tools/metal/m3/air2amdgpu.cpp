@@ -742,6 +742,7 @@ struct Kernel {
 	std::string hsaco;   // the linked code object
 	unsigned buffers;
 	uint32_t written;
+	uint32_t texturesWritten;   // bit i: texture index i is written (or read and written)
 };
 
 // A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
@@ -1209,6 +1210,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	}
 	out.buffers = 0;
 	out.written = 0;
+	out.texturesWritten = 0;
 	return "";
 }
 
@@ -1244,7 +1246,7 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 	struct Arg { Role role; int location; };
 	std::map<unsigned, Arg> roles;
 	int maxLocation = -1;
-	uint32_t written = 0;
+	uint32_t written = 0, texturesWritten = 0;
 	for (const MDOperand &op : args->operands()) {
 		const auto *a = cast<MDNode>(op);
 		const unsigned index = static_cast<unsigned>(mdInt(a, 0));
@@ -1265,12 +1267,16 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 			maxLocation = location > maxLocation ? location : maxLocation;
 		} else if (kind == "air.texture" || kind == "air.sampler") {
 			int location = -1;
-			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
-				if (mdString(a, k) == "air.location_index")
+			bool writes = false;
+			for (unsigned k = 2; k < a->getNumOperands(); k++) {
+				if (k + 1 < a->getNumOperands() && mdString(a, k) == "air.location_index")
 					location = static_cast<int>(mdInt(a, k + 1));
+				writes |= mdString(a, k) == "air.read_write" || mdString(a, k) == "air.write";
+			}
 			if (location < 0 || location > 15)
 				return "argument " + std::to_string(index) + ": " + kind + " only at indices 0-15 so far";
 			roles[index] = {kind == "air.texture" ? Texture : Sampler, location};
+			texturesWritten |= kind == "air.texture" && writes ? 1u << location : 0;
 		} else if (kind == "air.thread_position_in_grid") {
 			roles[index] = {PosInGrid, -1};
 		} else if (kind == "air.thread_position_in_threadgroup") {
@@ -1397,6 +1403,7 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 	out.hsaco = (*elf)->getBuffer().str();
 	out.buffers = nBuffers;
 	out.written = written;
+	out.texturesWritten = texturesWritten;
 	return "";
 }
 
@@ -1415,7 +1422,8 @@ static void dump(uint64_t req, const char *name, StringRef lib, const std::strin
 }
 
 // The translations of earlier runs, by library, function and this build of the translator: WindowServer asks for its 70-odd shaders on every
-// boot, and each held the desktop for up to seconds while it was translated again. A file is {u32 buffers, u32 written, code object}.
+// boot, and each held the desktop for up to seconds while it was translated again. A file is {u32 buffers, u32 written, u32 textures
+// written, code object}.
 static const char *const kCacheDir = "/var/db/rdna4-air2amdgpu";
 
 static std::string cachePath(StringRef lib, const char *name) {
@@ -1428,7 +1436,7 @@ static std::string cachePath(StringRef lib, const char *name) {
 
 static bool cached(StringRef lib, const char *name, Kernel &out) {
 	auto file = MemoryBuffer::getFile(cachePath(lib, name));
-	uint32_t head[2];
+	uint32_t head[3];
 
 	if (!file || (*file)->getBufferSize() <= sizeof(head))
 		return false;
@@ -1436,6 +1444,7 @@ static bool cached(StringRef lib, const char *name, Kernel &out) {
 	memcpy(head, (*file)->getBufferStart(), sizeof(head));
 	out.buffers = head[0];
 	out.written = head[1];
+	out.texturesWritten = head[2];
 	out.hsaco = (*file)->getBuffer().drop_front(sizeof(head)).str();
 
 	return true;
@@ -1443,7 +1452,7 @@ static bool cached(StringRef lib, const char *name, Kernel &out) {
 
 static void keep(StringRef lib, const char *name, const Kernel &k) {
 	const std::string path = cachePath(lib, name), tmp = path + ".tmp";
-	const uint32_t head[2] = {k.buffers, k.written};
+	const uint32_t head[3] = {k.buffers, k.written, k.texturesWritten};
 	std::error_code ec;
 
 	sys::fs::create_directories(kCacheDir);
@@ -1499,8 +1508,9 @@ static int serve() {
 
 		errs() << "air2amdgpu: request " << req[0] << ": " << name << ": " << (why.empty() ? what : why) << "\n";
 		dump(req[0], name, StringRef(lib.data(), req[1]), k.hsaco);
-		const uint64_t reply[5] = {req[0], reinterpret_cast<uint64_t>(k.hsaco.data()), why.empty() ? k.hsaco.size() : 0, k.buffers, k.written};
-		IOConnectCallScalarMethod(conn, kMtlcDeliver, reply, 5, nullptr, nullptr);
+		const uint64_t reply[6] = {req[0], reinterpret_cast<uint64_t>(k.hsaco.data()), why.empty() ? k.hsaco.size() : 0, k.buffers, k.written,
+		                           k.texturesWritten};
+		IOConnectCallScalarMethod(conn, kMtlcDeliver, reply, 6, nullptr, nullptr);
 		if (gLldSpent)
 			return fail("lld cannot run again in this process; exiting");
 	}
