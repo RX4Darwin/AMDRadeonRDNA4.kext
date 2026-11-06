@@ -2351,8 +2351,11 @@ static int testN48N() {
 	                  info.reserved[2] == N48N_ABI_MINOR, "n48n: QueryInfo");
 	uint32_t regs[4] {};
 	const uint64_t reg[3] = { 0x263e, 1, 0xffffffff }, other[3] = { 0x1000, 1, 0xffffffff };
+	const uint64_t wrap[3] = { ~0ull, 2, 0xffffffff }, past[3] = { 0x2641, 2, 0xffffffff };
 	failures += check(call(N48N_SEL_READREGS, reg, 3, nullptr, 0, 0, regs, 4) == N48N::kSuccess && regs[0] == 0x08200545 &&
-	                  call(N48N_SEL_READREGS, other, 3, nullptr, 0, 0, regs, 4) == N48N::kBadArgument,
+	                  call(N48N_SEL_READREGS, other, 3, nullptr, 0, 0, regs, 4) == N48N::kBadArgument &&
+	                  call(N48N_SEL_READREGS, wrap, 3, nullptr, 0, 0, regs, 8) == N48N::kBadArgument &&
+	                  call(N48N_SEL_READREGS, past, 3, nullptr, 0, 0, regs, 8) == N48N::kBadArgument,
 	                  "n48n: ReadRegs reads GB_ADDR_CONFIG and nothing else");
 
 	// Buffers: VRAM the CPU can reach, then the pool it cannot once that is full, system memory within its caps.
