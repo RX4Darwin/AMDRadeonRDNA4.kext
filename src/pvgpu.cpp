@@ -4468,6 +4468,38 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		t[2] = nowNs();
 
+		// No address 0 in the stages' tables: a shader reading through one faulted the address space, and the ring stopped for good (the
+		// lock screen's first CoreAnimation shaders, 2026-11-06). The spare buffer in its place, and the draw named.
+		static uint32_t zeroLines;
+
+		for (unsigned st = 0; st < 2; st++) {
+			for (unsigned k = 0; k < RDNA4_MTLC_MAX_BUFFERS; k++) {
+				uint64_t &at = misc[bufferSlot(st, k)];
+
+				if (at)
+					continue;
+
+				if (zeroLines++ < 16)
+					pvstat("host: render: \"%s\" / \"%s\": %s buffer %u (resource %u) at address 0: the spare buffer instead", name[1], name[2],
+					       st ? "fragment" : "vertex", k, bound[st].buffer[k]);
+
+				at = mGfxSpare.gpu;
+			}
+
+			for (unsigned k = 0; k < 16; k++) {
+				auto *t = reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st + RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 8]);
+
+				if (t[0] || (t[1] & 0xff))
+					continue;
+
+				if (zeroLines++ < 16)
+					pvstat("host: render: \"%s\" / \"%s\": %s texture %u (resource %u) at address 0: the spare texel instead", name[1], name[2],
+					       st ? "fragment" : "vertex", k, bound[st].texture[k]);
+
+				linearImage(t, mGfxSpare.gpu, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 1, 1, 64);
+			}
+		}
+
 		if (r == kIOReturnSuccess) {
 			step = "state in";
 			r = upload(mGfxMisc, misc, sizeof(misc));
