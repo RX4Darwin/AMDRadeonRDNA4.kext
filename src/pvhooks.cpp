@@ -8,11 +8,14 @@
 #include "pvhooks.hpp"
 #include "klog.hpp"
 #include "pvscanout.hpp"
+#include "trial.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <IOKit/IOReturn.h>
 #include <IOKit/IOService.h>
+#include <libkern/c++/OSData.h>
 #include <libkern/c++/OSMetaClass.h>
+#include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSObject.h>
 
 #define PLOG(fmt, ...) \
@@ -42,6 +45,7 @@ constexpr const char kNdrvFramebuffer[] = "IONDRVFramebuffer";
 mach_vm_address_t orgDisable;
 mach_vm_address_t orgWait;
 mach_vm_address_t orgNewUserClient;
+mach_vm_address_t orgReadEdid;   /* IODisplay::readFramebufferEDID() */
 mach_vm_address_t fbOpen;   /* IOFramebuffer::open() */
 mach_vm_address_t enable;
 uint32_t skipped;
@@ -151,6 +155,102 @@ IOReturn wrapNewUserClient(void *fb, void *task, void *security, uint32_t type, 
 		fb, task, security, type, handler);
 }
 
+/*
+ * The guest makes up an EDID for each paravirtual display from the name and
+ * modes the host gives it: Apple's vendor (APP, 0x1006), product 0, the
+ * display's id (port + 1) as its serial, and a DisplayID extension with the
+ * modes' timings. And the paravirtual framebuffer reports connection flags
+ * of 0xaaaaaaaa, kIOConnectionBuiltIn (0x800) among them: macOS took the
+ * monitors for built-in displays ("Integrierter Monitor") and made colour
+ * profiles of the guest's names. The EDID's identity is made the monitor's:
+ * vendor, product, serial, date, chromaticities and name from its own EDID;
+ * the guest's timings stay, since CoreDisplay checks a display's modes
+ * against its EDID (with the monitor's whole EDID it set none and showed
+ * nothing). The built-in flag is cleared from the connection flags; with
+ * them all cleared, every app's first Metal device open waited 15 s.
+ */
+void realEdid(IOService *display)
+{
+	OSData *made = OSDynamicCast(OSData, display->getProperty("IODisplayEDID"));
+	const auto *b = made && made->getLength() >= 128 ? static_cast<const uint8_t *>(made->getBytesNoCopy()) : nullptr;
+
+	if (!b || ((b[8] << 8) | b[9]) != 0x1006 || (b[10] | b[11] << 8))
+		return;
+
+	const uint32_t serial = b[12] | b[13] << 8 | b[14] << 16 | static_cast<uint32_t>(b[15]) << 24;
+	const uint8_t *edid = nullptr;
+	size_t len = 0;
+
+	if (!serial || !PvScanout::edid(serial - 1, edid, len) || len < 128) {
+		PLOG("paravirtual display %u: no EDID of its monitor: the guest's stays", serial);
+		return;
+	}
+
+	uint8_t out[512];
+	const size_t outLen = made->getLength() < sizeof(out) ? made->getLength() : sizeof(out);
+
+	memcpy(out, b, outLen);           // the base block changed below; the extension (the timings) stays as it is
+	memcpy(out + 8, edid + 8, 10);    // vendor, product, serial, week and year
+	memcpy(out + 25, edid + 25, 10);  // chromaticities
+
+	// the monitor's name in the guest's name descriptor
+	for (size_t from = 54; from <= 108; from += 18) {
+		if (edid[from] || edid[from + 1] || edid[from + 2] || edid[from + 3] != 0xfc)
+			continue;
+
+		for (size_t to = 54; to <= 108; to += 18)
+			if (!out[to] && !out[to + 1] && !out[to + 2] && out[to + 3] == 0xfc)
+				memcpy(out + to + 5, edid + from + 5, 13);
+	}
+
+	uint8_t sum = 0;
+
+	for (size_t i = 0; i < 127; i++)
+		sum = static_cast<uint8_t>(sum + out[i]);
+
+	out[127] = static_cast<uint8_t>(-sum);
+
+	OSData *made2 = OSData::withBytes(out, static_cast<unsigned int>(outLen));
+	OSNumber *vendor = OSNumber::withNumber((out[8] << 8) | out[9], 32);
+	OSNumber *product = OSNumber::withNumber(out[10] | out[11] << 8, 32);
+	OSNumber *number = OSNumber::withNumber(out[12] | out[13] << 8 | out[14] << 16 | static_cast<uint32_t>(out[15]) << 24, 32);
+
+	if (made2 && vendor && product && number) {
+		OSData *was = OSDynamicCast(OSData, display->getProperty("IODisplayConnectFlags"));
+		uint32_t flags = 0;
+
+		if (was && was->getLength() >= sizeof(flags)) {
+			memcpy(&flags, was->getBytesNoCopy(), sizeof(flags));
+			flags &= ~0x800u;   // kIOConnectionBuiltIn
+			display->setProperty("IODisplayConnectFlags", static_cast<void *>(&flags), sizeof(flags));
+		}
+		display->setProperty("IODisplayEDID", made2);
+		display->setProperty("DisplayVendorID", vendor);
+		display->setProperty("DisplayProductID", product);
+		display->setProperty("DisplaySerialNumber", number);
+		PLOG("paravirtual display %u: the guest's EDID with its monitor's identity (vendor 0x%04x product 0x%04x), not built in",
+		     serial, vendor->unsigned32BitValue(), product->unsigned32BitValue());
+	}
+
+	OSSafeReleaseNULL(made2);
+	OSSafeReleaseNULL(vendor);
+	OSSafeReleaseNULL(product);
+	OSSafeReleaseNULL(number);
+}
+
+IOReturn wrapReadEdid(void *display)
+{
+	const IOReturn r = reinterpret_cast<IOReturn (*)(void *)>(orgReadEdid)(display);
+	uint32_t identity = 1;   // rdna4-pvedid=0: the guest's EDID as it made it
+
+	(void)Trial::option("rdna4-pvedid", identity);
+
+	if (PvScanout::enabled() && identity)
+		realEdid(static_cast<IOService *>(display));
+
+	return r;
+}
+
 void route(KernelPatcher &patcher, size_t index, mach_vm_address_t address,
 	   size_t size, KernelPatcher::RouteRequest &request)
 {
@@ -195,6 +295,9 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index,
 		"__ZN13IOFramebuffer13newUserClientEP4taskPvjPP12IOUserClient",
 		wrapNewUserClient, orgNewUserClient,
 	};
+	KernelPatcher::RouteRequest readEdid {
+		"__ZN9IODisplay19readFramebufferEDIDEv", wrapReadEdid, orgReadEdid,
+	};
 
 	if (index != kextGraphics.loadIndex)
 		return;
@@ -205,6 +308,7 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index,
 
 	patcher.clearError();
 	route(patcher, index, address, size, newUserClient);
+	route(patcher, index, address, size, readEdid);
 }
 
 } /* namespace */

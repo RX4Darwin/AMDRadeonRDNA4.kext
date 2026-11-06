@@ -1513,6 +1513,40 @@ bool PvScanout::mode(uint32_t port, uint32_t &width, uint32_t &height)
 	return true;
 }
 
+bool PvScanout::edid(uint32_t port, const uint8_t *&data, size_t &len)
+{
+	if (port == 0) {
+		if (!bootState || !bootState->dev.edidLen)
+			return false;
+
+		data = bootState->dev.edidData;
+		len = bootState->dev.edidLen;
+
+		return true;
+	}
+
+	if (port > pvPortCount)
+		return false;
+
+	const Head2 *h = pvPorts[port - 1];
+
+	if (h->edidLen) {
+		data = h->edid;
+		len = h->edidLen;
+
+		return true;
+	}
+
+	// a head waiting for the display clocks carries no EDID of its own: its extra pipe read the sink's
+	if (!bootState || h->slot >= RDNA4Device::kMaxExtra || !bootState->dev.extra[h->slot].edidLen)
+		return false;
+
+	data = bootState->dev.extra[h->slot].edid;
+	len = bootState->dev.extra[h->slot].edidLen;
+
+	return true;
+}
+
 bool PvScanout::head(uint32_t port, Head &out)
 {
 	if (port == 0) {

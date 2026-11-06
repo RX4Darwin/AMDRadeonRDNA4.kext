@@ -16,6 +16,7 @@
 #ifndef PvScanout_hpp
 #define PvScanout_hpp
 
+#include <stddef.h>
 #include <stdint.h>
 
 namespace PvScanout
@@ -49,6 +50,9 @@ uint32_t count();
 
 /* The mode head `port` is lit in, or will be once it can (plugin.cpp). */
 bool mode(uint32_t port, uint32_t &width, uint32_t &height);
+
+/* The EDID of what is on head `port` (plugin.cpp); false when there is none. */
+bool edid(uint32_t port, const uint8_t *&data, size_t &len);
 
 /* The scanout of head `port` (plugin.cpp); false while it is not lit. */
 bool head(uint32_t port, Head &out);
