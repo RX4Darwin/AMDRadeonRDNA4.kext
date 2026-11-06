@@ -450,9 +450,20 @@ private:
 	ScanoutMap mScanout[kScanoutPorts] {};
 	GfxBuffers mPresentIb {};
 	bool presentOnCard(uint32_t port, uint32_t sid);
+	// debug.rdna4_pvframe: a frame copied into host memory with its present (port + 1 asked for), done once its fence is
+	struct FrameGrab { uint64_t handle, gpu, bytes, fence; uint8_t *cpu; uint32_t width, height, pitch; };
+	FrameGrab mGrab {};
+	volatile uint32_t mGrabWant { 0 };
+	volatile bool mGrabReady { false };
+	bool mGrabFlying { false };
+public:
+	int grabFrame(uint32_t port, struct sysctl_req *req);
+private:
+	int grabFrameOnce(uint32_t port, struct sysctl_req *req);
 	void setUpFlips(ScanoutMap &sm, uint32_t port);
 	uint32_t flipTarget(ScanoutMap &sm);
 	void flipDone();
+	bool grabBuffer(uint64_t bytes);
 	void scanoutHome(ScanoutMap &sm, uint64_t mc);
 	void dropScanout(ScanoutMap &sm);
 	bool clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_t bytes, uint32_t pattern);
@@ -775,6 +786,22 @@ static int texSysctl SYSCTL_HANDLER_ARGS
 
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvtex, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, texSysctl, "S",
 	    "AMDRadeonRDNA4: a guest texture's pixels");
+
+// debug.rdna4_pvframe: the next frame presented on port debug.rdna4_pvframeport as WindowServer composed it, at half size: {u32 width,
+// u32 height}, then BGRA rows. The scanout (rdna4_pvshot) changes while it is read; this is copied by the card with the frame.
+static int gFramePort;
+
+SYSCTL_INT(_debug, OID_AUTO, rdna4_pvframeport, CTLFLAG_RW | CTLFLAG_LOCKED, &gFramePort, 0,
+	   "AMDRadeonRDNA4: the port debug.rdna4_pvframe reads");
+
+static int frameSysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	return gHost ? gHost->grabFrame(static_cast<uint32_t>(gFramePort), req) : ENOENT;
+}
+
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvframe, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, frameSysctl, "S",
+	    "AMDRadeonRDNA4: the next presented frame at half size");
 
 
 RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
@@ -5358,6 +5385,25 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	if (n + 7 + 8 > maxDw)   // too many rows for the IB
 		return false;
 
+	// debug.rdna4_pvframe: the frame as it is, into host memory too
+	const bool grab = mGrabWant == port + 1 && !mGrabFlying && !mGrabReady && grabBuffer(bpr * height);
+
+	if (grab) {
+		for (uint64_t i = 0, total2 = bpr * height; i < total2 && n + 7 + 8 <= maxDw;) {
+			const uint32_t len = static_cast<uint32_t>(total2 - i < kChunk ? total2 - i : kChunk);
+
+			n += dmaData(ib + n, src + i, mGrab.gpu + i, len, i + len >= total2);
+			i += len;
+		}
+
+		mGrab.width = width;
+		mGrab.height = height;
+		mGrab.pitch = static_cast<uint32_t>(bpr);
+	}
+
+	if (n + 7 + 8 > maxDw)
+		return false;
+
 	n += timed ? timeStamp(ib + n, true) : 0;
 
 	__sync_synchronize();   // seen by the card (snooped) before the submit
@@ -5369,6 +5415,11 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 
 	flying(fence, "present");
 	sm.fence = fence;
+
+	if (grab) {
+		mGrab.fence = fence;
+		mGrabFlying = true;
+	}
 
 	if (sm.flips) {   // shown once the copy is done (flipDone)
 		sm.queued = static_cast<uint8_t>(target + 1);
@@ -5433,9 +5484,90 @@ uint32_t RDNA4PvHost::flipTarget(ScanoutMap &sm)
 	return 0;   // not reached: three buffers, two of them taken at most
 }
 
+// Host memory for debug.rdna4_pvframe's copy of a frame of `bytes`.
+bool RDNA4PvHost::grabBuffer(uint64_t bytes)
+{
+	uint64_t cpu = 0;
+
+	if (mGrab.handle && mGrab.bytes >= bytes)
+		return true;
+
+	if (mGrab.handle) {
+		waitDraws();
+		gCompute->rtFree(this, mGrab.handle);
+	}
+
+	mGrab = {};
+
+	if (gCompute->rtAllocHost(this, kernel_task, bytes, 0, mGrab.handle, mGrab.gpu, cpu) != kIOReturnSuccess) {
+		mGrab = {};
+		return false;
+	}
+
+	mGrab.cpu = reinterpret_cast<uint8_t *>(cpu);
+	mGrab.bytes = bytes;
+
+	return true;
+}
+
+// debug.rdna4_pvframe: asks the host thread for port `port`'s next frame and waits for it (2 s at most), then writes it at half size.
+// One reader at a time: a second one's request had the host thread allocate the buffer anew while the first still copied out of it.
+int RDNA4PvHost::grabFrame(uint32_t port, struct sysctl_req *req)
+{
+	static uint32_t busy;
+
+	if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE))
+		return EBUSY;
+
+	const int err = grabFrameOnce(port, req);
+
+	__atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
+
+	return err;
+}
+
+int RDNA4PvHost::grabFrameOnce(uint32_t port, struct sysctl_req *req)
+{
+	mGrabReady = false;
+	mGrabWant = port + 1;
+
+	for (uint32_t i = 0; i < 2000 && !mGrabReady; i++)
+		IOSleep(1);
+
+	mGrabWant = 0;
+
+	if (!mGrabReady)
+		return ETIMEDOUT;
+
+	const uint32_t size[2] = {mGrab.width / 2, mGrab.height / 2};
+	auto *row = static_cast<uint32_t *>(IOMalloc(size[0] * 4));
+	int err = row ? SYSCTL_OUT(req, size, sizeof(size)) : ENOMEM;
+
+	for (uint32_t y = 0; y < size[1] && !err; y++) {
+		const auto *line = reinterpret_cast<const uint32_t *>(mGrab.cpu + static_cast<uint64_t>(2 * y) * mGrab.pitch);
+
+		for (uint32_t x = 0; x < size[0]; x++)
+			row[x] = line[2 * x];
+
+		err = SYSCTL_OUT(req, row, size[0] * 4);
+	}
+
+	if (row)
+		IOFree(row, size[0] * 4);
+
+	mGrabReady = false;
+
+	return err;
+}
+
 // The frames whose copy is done asked for at the next vblank.
 void RDNA4PvHost::flipDone()
 {
+	if (mGrabFlying && gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(mGrab.fence))) {
+		mGrabFlying = false;
+		mGrabReady = true;
+	}
+
 	for (ScanoutMap &sm : mScanout) {
 		if (!sm.flips || !sm.queued || !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(sm.flipFence)))
 			continue;
@@ -6567,6 +6699,8 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 	sysctl_register_oid(&sysctl__debug_rdna4_pvprofile);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtexid);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtex);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvframeport);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvframe);
 	// publish() is reached from two threads (the GPU path in attach() and RDNA4PvLate's work loop): claim the single slot atomically before building
 	// anything, give it back on the paths that can be retried.
 	static bool claimed = false;
