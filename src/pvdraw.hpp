@@ -20,6 +20,21 @@ static inline uint32_t unorm8(uint64_t bits) {
 	return static_cast<uint32_t>((m * 255 + (1ull << (shift - 1))) >> shift);
 }
 
+// A double (its bits) as an IEEE-754 single's bits, its significand cut short (rounded toward zero), with integers only: below the
+// single's normal range 0 of its sign, above it infinity of its sign, NaN a quiet NaN.
+static inline uint32_t doubleAsFloat(uint64_t bits) {
+	const uint32_t sign = static_cast<uint32_t>(bits >> 32) & 0x80000000u;
+	const int32_t e = static_cast<int32_t>(bits >> 52 & 0x7ff);
+	if (e == 0x7ff)
+		return sign | (bits & ((1ull << 52) - 1) ? 0x7fc00000u : 0x7f800000u);
+	const int32_t f = e - 1023 + 127;
+	if (f <= 0)
+		return sign;
+	if (f >= 0xff)
+		return sign | 0x7f800000u;
+	return sign | static_cast<uint32_t>(f) << 23 | static_cast<uint32_t>(bits >> 29 & 0x7fffff);
+}
+
 // A double (its bits) as a whole number of magnitude below 2^30; false if it has a fraction or is larger (no floating point in the kernel).
 static inline bool wholeDouble(uint64_t bits, int64_t &out) {
 	out = 0;

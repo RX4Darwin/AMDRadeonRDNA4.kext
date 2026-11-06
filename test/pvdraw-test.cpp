@@ -33,6 +33,18 @@ int main() {
 		CHECK(halfAsFloat(n, true) == (n ? bitsOf(-(n / 2.0f)) : 0u));
 		CHECK(halfAsFloat(-static_cast<int64_t>(n)) == (n ? bitsOf(-(n / 2.0f)) : 0u));
 	}
+	// doubleAsFloat: the single nearest toward zero, as a float cast truncating; the ends: 0, infinity, NaN.
+	for (int i = -100000; i <= 100000; i++) {
+		const double v = i / 25000.0;
+		float want = static_cast<float>(v);
+
+		if (std::fabs(static_cast<double>(want)) > std::fabs(v))
+			want = std::nextafter(want, 0.0f);
+		CHECK(doubleAsFloat(bitsOf(v)) == bitsOf(want));
+	}
+	CHECK(doubleAsFloat(bitsOf(0.0)) == 0 && doubleAsFloat(bitsOf(-0.0)) == 0x80000000u && doubleAsFloat(bitsOf(1e-50)) == 0);
+	CHECK(doubleAsFloat(bitsOf(1e50)) == 0x7f800000u && doubleAsFloat(bitsOf(-static_cast<double>(INFINITY))) == 0xff800000u &&
+	      doubleAsFloat(bitsOf(static_cast<double>(NAN))) == 0x7fc00000u);
 	// unorm8: round(v * 255) of the exact product, clamped; NaN 0. A double product rounds 0.3 * 255 up to 76.5; fma gives the rounding error.
 	for (int i = 0; i <= 100000; i++) {
 		const double v = i / 100000.0, p = v * 255;
