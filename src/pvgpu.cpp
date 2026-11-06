@@ -4055,7 +4055,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const bool noColour = ps && ps[7] >> 31;   // the fragment shader writes no colour (air2amdgpu.cpp: textures, say)
 	uint32_t inputCntl[16] = {};
 	bool sprite = false;
-	if (!why && (outs > 16 || ins > 16 || 32 + vs[2] + 8 * outs > shader[1]->gfxLen || 32 + ps[2] + 8 * ins > shader[2]->gfxLen))
+	// in 64 bits: the code's length is the helper's, which translated what an app sent (a length near 4 GiB wrapped past the check)
+	if (!why && (outs > 16 || ins > 16 || 32ull + vs[2] + 8 * outs > shader[1]->gfxLen || 32ull + ps[2] + 8 * ins > shader[2]->gfxLen))
 		why = "more than 16 values between the stages, or a shader without its table of them";
 	for (uint32_t k = 0; k < ins && !why; k++) {
 		const uint32_t *out = vs + 8 + vs[2] / 4, *in = ps + 8 + ps[2] / 4 + 2 * k;   // the tables after the code (whole instructions)
@@ -4359,7 +4360,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		uint64_t iva = 0, ilen = 0;
 		uint8_t *pooledIndices = nullptr;
 
-		ok = bufferRange(task, draw.indexBuffer, &iva, &ilen) && draw.indexOffset <= ilen && bytes <= ilen - draw.indexOffset;
+		// as much as a bound buffer at most: the count is the app's, and a copy of gigabytes took the kernel's memory
+		ok = bufferRange(task, draw.indexBuffer, &iva, &ilen) && draw.indexOffset <= ilen && bytes <= ilen - draw.indexOffset &&
+		     bytes <= kMaxBuffer;
 
 		if (ok && poolTake(bytes, indexGpu, pooledIndices)) {
 			ok = readGuest(task, iva + draw.indexOffset, pooledIndices, static_cast<uint32_t>(bytes));
