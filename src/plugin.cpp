@@ -669,9 +669,62 @@ void fillHead(Head2 *h, RDNA4Device &dev) {
 	              : "EDID of the boot display (no second sink)");
 }
 
+// With the heads as the paravirtual displays (rdna4-boot4k=0 turns it off): the boot display, which the firmware lit behind a passive DP++
+// adapter at what it carries (2560x1440), is taken over by the first head with no display of its own whose pipe has a table
+// for its connector: once the display clocks are up the firmware's stream goes down (RDNA4Device::releaseBootPipe) and that
+// head lights the connector at 3840x2160, as the port-0 paravirtual display. The head on the second connector does the same.
+Head2 *pvBootHead { nullptr };
+
+void pickBootHead(RDNA4Device &dev) {
+	uint32_t on = 1;
+
+	(void)Trial::option("rdna4-boot4k", on);
+
+	if (!pvHeads || head2Level < 2 || hotplugLevel < 2 || !on)
+		return;
+
+	for (size_t i = 0; i < headCount; i++) {
+		Head2 *h = heads[i];
+
+		if (h->connected || h->waitClocks || h->slot >= RDNA4Device::kMaxExtra ||   // a free head may serve a placeholder
+		    !dev.bootUhdPipe(dev.extra[h->slot].pipe))
+			continue;
+
+		h->waitClocks = true;
+		pvBootHead = h;
+		HLOG(h, "boot4k: takes the boot display over at 3840x2160 once the display clocks are up");
+		return;
+	}
+
+	FBLOG("boot4k: no head can take the boot display over (no free head with a 3840x2160 table for its connector, or "
+	      "the sink does not take it through the adapter)");
+}
+
+void head2Plugged(Head2 *h, uint8_t hpd);
+
+// The boot display's connector to pvBootHead: the firmware's stream down, then the head plugged in on it.
+void takeBootDisplay(Head2 *h, RDNA4Device &dev) {
+	if (!dev.releaseBootPipe()) {
+		HLOG(h, "boot4k: the boot display stays the firmware's");
+		return;
+	}
+
+	const uint8_t hpd = dev.secondSinkHpd(true);
+
+	if (!hpd) {
+		HLOG(h, "boot4k: the boot display's pin is not offered to the head");
+		return;
+	}
+
+	head2Plugged(h, hpd);
+	h->ready = h->connected;
+	HLOG(h, "boot4k: the boot display %s", h->connected ? "is the head's now" : "did NOT come up on the head");
+}
+
 void fillHeads(RDNA4Device &dev) {
 	for (size_t i = 0; i < headCount; i++)
 		fillHead(heads[i], dev);
+	pickBootHead(dev);
 	dev.selectExtra(0);
 }
 
@@ -809,7 +862,9 @@ void hotplugPoll(OSObject *owner, IOTimerEventSource *timer) {
 	h->hpdGone = present || !dev.xp().on ? 0 : h->hpdGone + 1;
 	if (h->waitClocks && clocksSettled(h, dev)) {
 		h->waitClocks = false;
-		if (present && !h->connected)
+		if (h == pvBootHead)
+			takeBootDisplay(h, dev);
+		else if (present && !h->connected)
 			head2Plugged(h, hpd);
 	}
 	if (hotplugLevel >= 2) {
@@ -1478,7 +1533,7 @@ uint32_t PvScanout::count()
 		for (size_t i = 0; i < headCount; i++) {
 			const Head2 *h = heads[i];
 
-			if (!h->connected && !h->waitClocks)
+			if ((!h->connected && !h->waitClocks) || h == pvBootHead)   // the boot head's port is 0
 				continue;
 
 			// a head waiting for the display clocks is lit at 3840x2160 once they are up (fillHead)
@@ -1496,6 +1551,13 @@ uint32_t PvScanout::count()
 bool PvScanout::mode(uint32_t port, uint32_t &width, uint32_t &height)
 {
 	Head head;
+
+	if (port == 0 && pvBootHead && !pvBootHead->connected) {   // lit at 3840x2160 once the display clocks are up
+		width = 3840;
+		height = 2160;
+
+		return true;
+	}
 
 	if (PvScanout::head(port, head)) {
 		width = head.width;
@@ -1515,6 +1577,13 @@ bool PvScanout::mode(uint32_t port, uint32_t &width, uint32_t &height)
 
 bool PvScanout::edid(uint32_t port, const uint8_t *&data, size_t &len)
 {
+	if (port == 0 && pvBootHead && pvBootHead->edidLen) {
+		data = pvBootHead->edid;
+		len = pvBootHead->edidLen;
+
+		return true;
+	}
+
 	if (port == 0) {
 		if (!bootState || !bootState->dev.edidLen)
 			return false;
@@ -1549,6 +1618,17 @@ bool PvScanout::edid(uint32_t port, const uint8_t *&data, size_t &len)
 
 bool PvScanout::head(uint32_t port, Head &out)
 {
+	if (port == 0 && pvBootHead) {
+		const Head2 *h = pvBootHead;
+
+		if (!h->connected)
+			return false;
+
+		out = { h->surface.physBase, h->surface.rowBytes, h->surface.width, h->surface.height };
+
+		return true;
+	}
+
 	if (port == 0) {
 		if (!bootState)
 			return false;

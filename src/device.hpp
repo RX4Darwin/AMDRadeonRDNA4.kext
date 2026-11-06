@@ -144,6 +144,17 @@ public:
 	// Program mode `m` on the lit HDMI pipe (modeset.hpp). On failure the
 	// previous timing is programmed back and an error returned.
 	IOReturn applyMode(const Modes::Mode &m);
+	// rdna4-boot4k: the boot display behind a passive DP++ adapter, which the
+	// firmware lights at what the adapter carries (2560x1440), taken over by a
+	// head's pipe that lights its connector at 3840x2160 in YCbCr 4:2:0, as
+	// the heads do. bootUhdPipe: whether the head on extra pipe `pipeIndex`
+	// can (a table for the boot connector on that pipe, and a sink that takes
+	// it). releaseBootPipe: the firmware's stream taken down (stream and link
+	// encoder, transmitter; its plane and timing generator run on); the boot
+	// pipe has no connector from then on.
+	bool bootUhdPipe(uint8_t pipeIndex) const;
+	bool releaseBootPipe();
+	bool bootReleased { false };
 
 	// The second pipe (pipe2.hpp), for a head whose surface is at CPU
 	// address `surfacePhys` in the console's memory range. `level` is

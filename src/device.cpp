@@ -1854,6 +1854,10 @@ void RDNA4Device::displayPowerNote(bool on, const char *path, const char *result
 }
 
 void RDNA4Device::setDisplayPower(bool on) {
+	if (bootReleased) {   // its connector is a head's now (releaseBootPipe)
+		displayPowerNote(on, "request", "ignored: the boot pipe is released");
+		return;
+	}
 	if (!displaySleepEnabled) {
 		displayPowerNote(on, "request", "ignored: rdna4-nosleep=1");
 		return;
@@ -2690,6 +2694,10 @@ bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
 }
 
 IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
+	if (bootReleased) {
+		FBLOG("modes: switch to id %u refused: the boot pipe is released, its connector is a head's", m.id);
+		return kIOReturnUnsupported;
+	}
 	const bool dp = pipe.signal == Pipe::Signal::DpSst;
 	if (!pipe.valid() || !(pipe.isTmds() || dp) || !liveTimingValid || !rmmio || !ipDiscovery.isValid()) {
 		FBLOG("modes: switch to id %u refused: no programmable HDMI or DisplayPort pipe", m.id);
@@ -2780,6 +2788,90 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 	return kIOReturnIOError;
 }
 
+
+bool RDNA4Device::bootUhdPipe(uint8_t pipeIndex) const
+{
+	Edid::DetailedTiming uhd {};
+
+	if (!pipe.valid() || !pipe.isTmds() || !edidLen || !Edid::vicTiming(97, uhd) || !Edid::hdmi2Caps(edidData, edidLen).scdc) {
+		FBLOG("boot4k: pipe %u: no HDMI boot display that announces SCDC (TMDS %d, EDID %zu bytes)", pipeIndex, pipe.isTmds(),
+		      static_cast<size_t>(edidLen));
+		return false;
+	}
+
+	// What the adapter carries: in RGB, or in 4:2:0 at half the clock if the sink takes 3840x2160 so.
+	const uint32_t adaptorKHz = dpDualMaxKHz(pipe.hpd);
+	const bool y420 = adaptorKHz && adaptorKHz < uhd.pixelClockKHz;
+
+	if (y420 ? adaptorKHz < ModeSet::tmdsKHz(uhd.pixelClockKHz, true) || !Edid::takesY420(edidData, edidLen, 97)
+	         : !Edid::hasVic(edidData, edidLen, 97)) {
+		FBLOG("boot4k: pipe %u: the sink does not take 3840x2160 through the adapter (%u kHz, %s)", pipeIndex, adaptorKHz,
+		      y420 ? "4:2:0" : "RGB");
+		return false;
+	}
+
+	for (size_t i = 0; i < Pipe2::configCount(); i++) {
+		const Pipe2::Config &c = Pipe2::configAt(i);
+
+		if (c.hpd == pipe.hpd && c.pipe == pipeIndex && !c.dp && Pipe2::isUhd(c) && c.y420 == y420)
+			return true;
+	}
+
+	FBLOG("boot4k: pipe %u: no 3840x2160 HDMI table (%s) for HPD%u on it (DP++ %d)", pipeIndex, y420 ? "4:2:0" : "RGB", pipe.hpd,
+	      dpDual(pipe.hpd));
+	return false;
+}
+
+bool RDNA4Device::releaseBootPipe()
+{
+	AtomBios::DisplayPath path {};
+	uint8_t ddcLine = 0;
+
+	if (bootReleased)
+		return true;
+
+	if (!pipe.valid() || !pipe.isTmds() || pipe.dig >= Pipe::kMaxDig || !pathForHpd(pipe.hpd, path, &ddcLine)) {
+		FBLOG("boot4k: the boot pipe is not released: no HDMI stream of the firmware's to take down");
+		return false;
+	}
+
+	constexpr uint32_t kDigFifoCtrl0 = 0x209b;   // DIGn_DIG_FIFO_CTRL0
+	const uint32_t dig = pipe.dig * Pipe::Reg::kDigStride;
+	Dmub::Cmd cmd;
+
+	DpPhy::buildDisable(cmd, pipe.link, pipe.hpd, static_cast<uint8_t>(path.connectorObjId & 0xff));
+
+	// The stream alone goes down: the plane and its timing generator run on and keep their DET segments. With them
+	// stopped and their segments given to the head's plane, both 4K planes underflowed for good (HUBP_SEG_ALLOC_ERR on the
+	// new one: the monitors showed green, card, 2026-11-06).
+	const ModeSet::Step steps[] = {
+		{ ModeSet::Op::Update, 2, false, kDigFifoCtrl0 + dig, 0x1, 0x0, 0, "DIG_FIFO_ENABLE off" },
+		{ ModeSet::Op::Update, 2, false, Pipe::Reg::kDigFeEnCntl + dig, 0x1, 0x0, 0, "DIG_FE_ENABLE: the stream encoder off" },
+		{ ModeSet::Op::Dmub, 0, false, 0, 0, 0, 0, "DIG1_TRANSMITTER_CONTROL disable" },
+		{ ModeSet::Op::Update, 2, false, Pipe::Reg::kDigBeEnCntl + dig, 0x1, 0x0, 0, "DIG_BE_ENABLE: the link encoder off" },
+	};
+
+	FBLOG("boot4k: taking the firmware's stream down: DIG%u link %u HPD%u (OTG%u and HUBP%u run on)", pipe.dig, pipe.link,
+	      pipe.hpd, pipe.otg, pipe.hubp);
+
+	if (!runSteps(steps, sizeof(steps) / sizeof(steps[0]), &cmd, 1, "boot4k", otgOff())) {
+		FBLOG("boot4k: the firmware's stream did not go down cleanly");
+		return false;
+	}
+
+	FBLOG("boot4k: released; DIG%u_DIG_FE_EN_CNTL=0x%08x DIG_BE_EN_CNTL=0x%08x OTG%u_OTG_CONTROL=0x%08x", pipe.dig,
+	      regReadDmu(2, Pipe::Reg::kDigFeEnCntl + dig), regReadDmu(2, Pipe::Reg::kDigBeEnCntl + dig), pipe.otg,
+	      regReadDmu(2, Pipe::Reg::kOtgControl + otgOff()));
+
+	// Its connector is free for a head: no DIG, link or pin of the boot pipe's any more (its OTG and HUBP stay
+	// known: a head's plane copies the HUBP's VM aperture)
+	pipe.dig = Pipe::kNone;
+	pipe.link = Pipe::kNone;
+	pipe.hpd = 0;
+	bootReleased = true;
+
+	return true;
+}
 
 // ---------------------------------------------------------------------------
 // The second pipe
@@ -3212,7 +3304,7 @@ bool RDNA4Device::sinkTakesUhd(uint8_t hpd, bool *y420) const
 /* Whether a pipe scans out: the boot pipe, or an extra one that is lit. */
 bool RDNA4Device::pipeInUse(uint32_t p) const
 {
-	if (p == pipe.otg)
+	if (p == pipe.otg)   // released too, its timing generator runs on and its plane keeps its DET (releaseBootPipe)
 		return true;
 
 	for (const ExtraPipe &x : extra) {
