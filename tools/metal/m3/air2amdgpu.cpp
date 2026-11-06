@@ -391,7 +391,8 @@ static std::string legalize(Function &k) {
 		if (const size_t i16 = texName.find("_2d.i16."); i16 != std::string::npos)
 			texName.erase(i16 + 3, 4);
 		const StringRef tex = texName;
-		if (tex.starts_with("sample_texture_2d.v4f") || tex.starts_with("sample_texture_3d.v4f") || tex.starts_with("read_texture_2d.v4f")) {
+		const bool readInt = tex.starts_with("read_texture_2d.u.v4i") || tex.starts_with("read_texture_2d.s.v4i");
+		if (tex.starts_with("sample_texture_2d.v4f") || tex.starts_with("sample_texture_3d.v4f") || tex.starts_with("read_texture_2d.v4f") || readInt) {
 			// sample (texture, sampler, float2 coord, i1, int2 offset, i1 level, float bias or LOD, float min LOD, i32) / read (texture,
 			// sampler, uint2, int2, lod, i32), or without the sampler and the offset (texture, uint2, lod, i32: WindowServer's). A sample's
 			// level false: the float is a bias (0: none); true: an explicit LOD. Float or half texels. A 3D texture's sample: float3, int3.
@@ -464,6 +465,10 @@ static std::string legalize(Function &k) {
 			}
 			if (half)
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			// an integer texture's uint4 / int4 (or ushort4 / short4): the loaded float4's bits, as integer texels are stored
+			if (readInt)
+				texel = b.CreateIntCast(b.CreateBitCast(texel, FixedVectorType::get(b.getInt32Ty(), 4)),
+				                        cast<StructType>(c->getType())->getElementType(0), tex.starts_with("read_texture_2d.s"));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
 		} else if (tex.starts_with("sample_texture_1d_array.v4f")) {
 			// (texture, sampler, float x, uint slice, i1, int offset, i1 level, float bias or LOD, float min LOD, i32): WindowServer's colour
@@ -480,12 +485,17 @@ static std::string legalize(Function &k) {
 			if (half)
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
-		} else if (tex.starts_with("write_texture_2d.v4f")) {   // (texture, uint2 or ushort2 coord, float4 or half4 value, i32 lod, i32 access)
+		} else if (tex.starts_with("write_texture_2d.v4f") || tex.starts_with("write_texture_2d.u.v4i") || tex.starts_with("write_texture_2d.s.v4i")) {
+			// (texture, uint2 or ushort2 coord, float4 or half4 value, i32 lod, i32 access); or an integer texture's uint4 / int4 (or
+			// ushort4 / short4) value (VideoToolbox's VTMTSComputeFunction), stored as the bits of a float4 as Mesa does: the intrinsic
+			// takes float data only, and the T#'s integer format writes the bits
 			if (c->arg_size() < 4 || !match(c->getArgOperand(3), m_Zero()))
 				return f->getName().str() + " to a level other than 0 is not supported yet";
 			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(1), *value = c->getArgOperand(2);
-			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
-			if (value->getType() != v4f)
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4), *v4i = FixedVectorType::get(b.getInt32Ty(), 4);
+			if (!tex.starts_with("write_texture_2d.v4f"))
+				value = b.CreateBitCast(b.CreateIntCast(value, v4i, tex.starts_with("write_texture_2d.s")), v4f);
+			else if (value->getType() != v4f)
 				value = b.CreateFPExt(value, v4f);
 			Value *x = b.CreateZExt(b.CreateExtractElement(xy, uint64_t(0)), b.getInt32Ty()), *y = b.CreateZExt(b.CreateExtractElement(xy, 1), b.getInt32Ty());
 			b.CreateIntrinsic(Intrinsic::amdgcn_image_store_2d, {v4f, b.getInt32Ty(), t->getType()}, {value, b.getInt32(15), x, y, t, b.getInt32(0), b.getInt32(0)});

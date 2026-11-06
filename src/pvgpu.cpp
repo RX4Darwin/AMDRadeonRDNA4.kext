@@ -2111,7 +2111,15 @@ static const TextureFormat *textureFormat(uint32_t metal) {
 	                                     {20, 7, 4 | 1 << 9, 2}, {25, 13, 4 | 1 << 9, 2},                                          // R16 unorm, float
 	                                     {60, 23, 4 | 5 << 3 | 1 << 9, 4}, {65, 29, 4 | 5 << 3 | 1 << 9, 4},                       // RG16 unorm, float
 	                                     {90, 36, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4}, {94, 36, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // RGB10A2, BGR10A2
-	                                     {92, 30, 4 | 5 << 3 | 6 << 6 | 1 << 9, 4}, {110, 51, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8}};  // RG11B10Float, RGBA16
+	                                     {92, 30, 4 | 5 << 3 | 6 << 6 | 1 << 9, 4}, {110, 51, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // RG11B10Float, RGBA16
+	                                     // integer formats (VideoToolbox's scaler writes RGBA32Uint and reads HEIC tiles' chroma as RG8Uint):
+	                                     // gfx11/12 IMG_FORMAT 8_UINT 5, 16_UINT 11, 8_8_UINT 18, 32_UINT 20, 16_16_UINT 27, 8_8_8_8_UINT 46,
+	                                     // 32_32_UINT 48, 16_16_16_16_UINT 55, 32_32_32_32_UINT 61
+	                                     {13, 5, 4 | 1 << 9, 1}, {23, 11, 4 | 1 << 9, 2}, {53, 20, 4 | 1 << 9, 4},                 // R8, R16, R32 uint
+	                                     {33, 18, 4 | 5 << 3 | 1 << 9, 2},                                                         // RG8 uint
+	                                     {63, 27, 4 | 5 << 3 | 1 << 9, 4}, {73, 46, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},              // RG16, RGBA8 uint
+	                                     {103, 48, 4 | 5 << 3 | 1 << 9, 8}, {113, 55, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},            // RG32, RGBA16 uint
+	                                     {123, 61, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16}};                                           // RGBA32 uint
 	for (const TextureFormat &e : fmts)
 		if (e.metal == metal)
 			return &e;
