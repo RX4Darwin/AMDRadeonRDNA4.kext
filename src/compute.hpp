@@ -756,6 +756,11 @@ private:
 	struct N48nState;
 	N48nState *n48n { nullptr };
 	void     n48nDiscard();        // the card lost its memory under the client (sleep): forget it, write nothing
+	struct N48nView;
+	N48nView *n48nViews { nullptr };   // what processes map of the pool heap's buffers (n48nMemory), kept for the boot
+	bool     n48nRetire(uint64_t offset);   // a freed buffer's memory waits for its mappings: true if it has a view
+	void     n48nSweep();          // memory whose mappings are all gone back to the heap
+	void     n48nKeep();           // a heap made anew: memory still mapped is taken out of it again
 	IOReturn n48nCopyTest(uint64_t source, uint64_t destination, uint64_t bytes);
 	// The pool past kHeapOffset is the CPU-visible heap (code, and buffers
 	// when there is no DMA). With DMA, buffers come from the device heap:

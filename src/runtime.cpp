@@ -728,6 +728,7 @@ bool RDNA4Compute::initRuntimeHeap() {
 			ihInit();
 	}
 	heap.init(kHeapOffset, pool.size - kHeapOffset, 4096, heapMap, sizeof(heapMap));
+	n48nKeep();   // after a sleep: pool memory a process still maps stays out of the new heap
 	return heap.size() != 0;
 }
 
