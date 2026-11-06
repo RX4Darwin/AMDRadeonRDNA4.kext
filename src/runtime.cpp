@@ -675,6 +675,8 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	 * reach VRAM before the queue can walk this mapping. */
 	/* The root and directory pages when a PDE was written (the first mapping in a 2 MiB range: once written, a PDE stays), then the leaf
 	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
+	if (c.tableCpu)
+		return span.firstPt != ~0ull && vmSyncCpu(c, va, end);
 	return span.firstPt != ~0ull && (!span.directories || vmTableSync(c, 0, 0x3000)) &&
 	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
 }
@@ -700,6 +702,8 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 		return false;
 	/* The root and directory pages when a PDE was written (the first mapping in a 2 MiB range: once written, a PDE stays), then the leaf
 	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
+	if (c.tableCpu)
+		return span.firstPt != ~0ull && vmSyncCpu(c, va, end);
 	return span.firstPt != ~0ull && (!span.directories || vmTableSync(c, 0, 0x3000)) &&
 	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
 }
@@ -739,8 +743,27 @@ void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	GpuVmTable::unmap(access, kVmTableBytes, va, end, span);
-	if (span.firstPt != ~0ull && !vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000)))
+	if (span.firstPt != ~0ull && c.tableCpu)
+		(void)vmSyncCpu(c, va, end);
+	else if (span.firstPt != ~0ull && !vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000)))
 		RLOG("vmid %u: page-table unmap sync failed", c.vmid);   // one SDMA job for the span, as vmMapHost
+}
+
+/* Tables in the pool (rtPreferCpuTables): only the entries of [va, end) copied through the BAR, its PDB0 entries and its PTEs (the dense
+ * layout keeps both in VA order), then HDP flushed. Whole pages were 16 KiB of uncached BAR writes for a mapping of a few dozen pages. */
+bool RDNA4Compute::vmSyncCpu(RtClient &c, uint64_t va, uint64_t end) {
+	const uint64_t pde = 0x2000 + static_cast<uint64_t>(GpuVm::index(va, 2)) * 8, pdeEnd = 0x2000 + static_cast<uint64_t>(GpuVm::index(end - 1, 2)) * 8 + 8;
+	const uint64_t pte = 0x3000 + ((va - GpuVm::kVaStart) >> 12) * 8, pteEnd = 0x3000 + ((end - GpuVm::kVaStart) >> 12) * 8;
+	const auto *shadow = reinterpret_cast<const uint8_t *>(c.tableShadow);
+
+	if (va < GpuVm::kVaStart || end <= va || pdeEnd > 0x3000 || pteEnd > kVmTableBytes)
+		return false;
+
+	memcpy(poolCpu + c.tableOffset + pde, shadow + pde, pdeEnd - pde);
+	memcpy(poolCpu + c.tableOffset + pte, shadow + pte, pteEnd - pte);
+	(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + c.tableOffset + pte);
+	flushHdp();
+	return true;
 }
 
 bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
@@ -751,6 +774,12 @@ bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
 		RLOG("vmid %u: page-table sync arguments rejected (offset 0x%x bytes 0x%x)",
 		     c.vmid, offset, bytes);
 		return false;
+	}
+	if (c.tableCpu) {   // rtPreferCpuTables: written through the BAR, no SDMA job
+		memcpy(poolCpu + c.tableOffset + offset, reinterpret_cast<uint8_t *>(c.tableShadow) + offset, bytes);
+		(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + c.tableOffset + offset);
+		flushHdp();
+		return true;
 	}
 	if (vmTableCpu) {
 		/* W22 variant T: the table lives in the CPU-visible pool and is written
@@ -1838,29 +1867,36 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 	if (sharedQ[sq].wedged || !sharedQ[sq].up)
 		return kIOReturnNotResponding;
 	uint64_t table = 0;
-	if (!devHeap.size() || !devHeap.alloc(kVmTableBytes, table))
+	const bool cpu = owner == cpuTableOwner && heap.alloc(kVmTableBytes, table);
+	if (!cpu && (!devHeap.size() || !devHeap.alloc(kVmTableBytes, table)))
 		return kIOReturnNoMemory;
+	auto freeTable = [&]() { cpu ? heap.free(table) : devHeap.free(table); };
 	if (kVmQueueBase + slot * kVmQueueStride + kVmIb + 0x1000 > pool.size) {
-		devHeap.free(table);
+		freeTable();
 		return kIOReturnNoMemory;
 	}
 	*c = RtClient {};
 	c->owner = owner; c->vmid = vmid; c->shared = true; c->sq = static_cast<uint8_t>(sq);
 	c->pipe = sharedQ[sq].pipe; c->queue = sharedQ[sq].queue;   // for reporting; the client owns no HQD
-	c->tableOffset = table; c->rootMc = vramMc(table);
+	c->tableOffset = table; c->rootMc = cpu ? poolMc(table) : vramMc(table);
+	c->tableCpu = cpu;
 	if (!gpuPhysical(c->rootMc, c->rootPhys)) {
-		devHeap.free(table); *c = RtClient {};
+		freeTable(); *c = RtClient {};
 		return kIOReturnNoMemory;
 	}
 	c->tableShadow = reinterpret_cast<uint64_t *>(IOMalloc(kVmTableBytes));
 	if (!c->tableShadow) {
-		devHeap.free(table); *c = RtClient {};
+		freeTable(); *c = RtClient {};
 		return kIOReturnNoMemory;
 	}
 	bzero(c->tableShadow, kVmTableBytes);
 	c->tableShadow[0] = GpuVm::encodePde(c->rootPhys + 0x1000, GpuVm::kValid, 2);
 	c->tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
 		GpuVm::encodePde(c->rootPhys + 0x2000, GpuVm::kValid, 1);
+	if (cpu) {   // the whole table once (the pool's heap holds whatever was there): later syncs copy only the entries they change
+		memcpy(poolCpu + table, c->tableShadow, kVmTableBytes);
+		flushHdp();
+	}
 	const uint32_t qoff = kVmQueueBase + slot * kVmQueueStride;
 	c->poolOff = qoff;
 	rdna4Step("rtOpenShared: zeroing the client's pool pages (CPU writes to VRAM)");
@@ -1883,7 +1919,7 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 	if (!vmMap(*c, c->fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
 	    !vmMap(*c, c->kernargVa, poolMc(qoff + kVmKernarg), 0x1000, false) ||
 	    !vmMap(*c, c->ibVa, poolMc(qoff + kVmIb), 0x1000, true) || (rdna4Step("rtOpenShared: VM context"), !vmContextInit(*c))) {
-		IOFree(c->tableShadow, kVmTableBytes); devHeap.free(table); *c = RtClient {};
+		IOFree(c->tableShadow, kVmTableBytes); freeTable(); *c = RtClient {};
 		return kIOReturnNoMemory;
 	}
 	c->doorbell = sharedQ[sq].doorbell;
@@ -2640,7 +2676,7 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	if (presentActive && presentOwner == owner && presentHandle == handle)
 		restore = restorePresentationLocked("buffer free");
 	RtClient *c = vmClientFor(owner);
-	if (c && c->gfxOutstanding)
+	if (c && c->gfxOutstanding && owner != idleFreeOwner)
 		gfxClientDrain(*c, "buffer free");   // W12k: an outstanding gfx IB may still use it
 	const bool host = b->host;
 	if (c && b->va)
@@ -3400,8 +3436,7 @@ IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords
 		vmPool.noteSubmit(ibVmid, kGfxDomain, domainSeq);
 	}
 	c.gfxFence = value;
-	flushHdp();                                      // CPU-written IB/data through the BAR are visible to the CP (amdgpu #9, done from the CPU side)
-	gfxKick(gfxRing.wptr());
+	gfxKick(gfxRing.wptr());   // its HDP flush makes the ring's packets visible to the CP too (amdgpu #9, done from the CPU side)
 	c.gfxFences[c.gfxOutstanding++] = value;
 	gfxClientPending++;
 	fence = value;
@@ -3872,7 +3907,10 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		if (!c->shared)
 			queueUsed[c->pipe][c->queue] = false;
 		IOFree(c->tableShadow, kVmTableBytes);
-		devHeap.free(c->tableOffset);
+		if (c->tableCpu)
+			heap.free(c->tableOffset);
+		else
+			devHeap.free(c->tableOffset);
 		if (c->shared)
 			RLOG("vmid %u: shared-queue client closed, freed its page tables", c->vmid);
 		else

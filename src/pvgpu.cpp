@@ -309,7 +309,7 @@ private:
 	// Draws in flight: submitted without a wait, each with its own state page and IB (slot n of mGfxMisc and mGfxIb, taken in turn), waited
 	// for together by waitDraws before anything reads or reuses what they use (a stamp completed, a blit, new shader code, a mapping
 	// dropped); only the oldest by roomForDraw when kInFlight are.
-	static constexpr uint32_t kSlots = 64;
+	static constexpr uint32_t kSlots = 512;   // batches of kBatchDraws draws, kInFlight of them, each draw a slot
 	// At most this many in flight. With three a hang once halted the ring for good; the runtime now ends all of a client's IBs on the ring
 	// together (gfxRingRelease waits for its newest fence), and with one each draw waited for the one before: most of a draw's time.
 	static constexpr uint32_t kInFlight = 16;
@@ -449,6 +449,22 @@ private:
 	static constexpr uint32_t kDmaSlots = 8, kDmaIbBytes = 64 * 1024;
 	static constexpr uint32_t kDmaRows = kDmaIbBytes / 28 - 8;   // DMA_DATA packets an IB holds, the idle barrier besides
 	GfxBuffers mDmaIb {};
+	// Draws put together into one IB and submitted at once (rdna4_pvinplace bit 512 off): Safari's live resize drew 26000 times a second,
+	// each draw its own submit. The batch goes before any other submit, a wait, a stamp, and at the end of each tick; a misc slot is taken
+	// again only once the submit that used it is done (mSlotSubmit).
+	static constexpr uint32_t kBatchSlots = 8, kBatchBytes = 128 * 1024, kBatchDraws = 32;
+	GfxBuffers mBatchIb {};
+	uint64_t mBatchFence[kBatchSlots] {};
+	uint32_t mBatchSlot { 0 }, mBatchDwords { 0 }, mBatchDraws { 0 }, mBatchDirty[kBatchDraws] {};
+	bool mFlushing { false };
+	uint64_t mSlotSubmit[kSlots] {};
+	// The submit (of flying()'s count) and the draw serial that what is being put together will go out with: one later while a batch is
+	// open (it goes first). Taken by a draw that is put into the batch after all, they wait a submit longer than needed.
+	uint64_t nextSubmit() const { return mSubmits + 1 + (mBatchDraws ? 1 : 0); }
+	uint64_t nextSerial() const { return mDrawSerial + 1 + (mBatchDraws ? 1 : 0); }
+	bool batchDraw(const uint32_t *ib, uint32_t dwords, uint32_t task, uint32_t target);
+	void flushBatch();
+	uint32_t takeSlot();
 	GfxBuffers mTimes {};   // rdna4_pvprofile's slots
 	uint64_t mDmaFence[kDmaSlots] {};
 	uint32_t mDmaSlot { 0 };
@@ -577,8 +593,8 @@ private:
 	uint32_t mStale[3] {};                               // shadows filled again: dropped, too old, the surface locked since
 	uint64_t mDrawSerial { 0 };          // draws submitted
 	bool shadowIdle(const Shadow &s) const;
-	// Held, or read by the draw being put together: its address is in that draw's tables already, waiting would not help.
-	bool shadowBusy(const Shadow &s) const { return (mHeld.active && mHeld.shadow == &s) || s.serial == mDrawSerial + 1; }
+	// Held, or read by a draw not submitted yet (being put together, or batched): its address is in that draw's tables already.
+	bool shadowBusy(const Shadow &s) const { return (mHeld.active && mHeld.shadow == &s) || (s.serial > mDrawSerial && s.serial != ~0ull); }
 	void freeShadow(Shadow &s);
 	static constexpr uint64_t kShadowAge = 250000000;   // ns
 	Shadow mShadows[kShadows];
@@ -791,6 +807,7 @@ void RDNA4PvHost::tick() {
 	mapRoot();
 	pollFifo();
 	pollChannels();
+	flushBatch();   // what the commands drew, on the card while the host waits for more
 	pollDisplay();
 	if (mLevel >= 2)
 		selfTest();
@@ -1155,6 +1172,9 @@ void RDNA4PvHost::answerComputePipeline(const pvstream::FifoCommand &c, const ui
 // brings the ring up, and a draw left out is not drawn again until its region changes.
 IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 {
+	if (!mFlushing)
+		flushBatch();   // the draws put together go first: the ring runs in order
+
 	static constexpr uint32_t kGfxWait = 10000;   // ms
 	static constexpr uint32_t kGfxPoll = 20;      // ms
 	static constexpr uint32_t kBusyPolls = 20000; // of 10 us: the ring full of draws in flight drains in well under 200 ms
@@ -1176,6 +1196,8 @@ IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 // The draws in flight waited for: what they read and write is the guest's again, their slots and the pool free once readyDraws runs.
 void RDNA4PvHost::waitDraws(uint32_t line)
 {
+	flushBatch();
+
 	static constexpr uint32_t kBatchWait = 50;    // ms: a draw takes the card 6 ms at most
 	uint64_t ns = 0;
 
@@ -1360,6 +1382,15 @@ void RDNA4PvHost::waitSubmit(uint64_t submit, uint32_t line)
 // Target `id` drawn into by the submit with `fence`: dirty until it is done.
 void RDNA4PvHost::dirtied(uint32_t task, uint32_t id, uint64_t fence)
 {
+	const uint32_t key = task << 16 | (id & 0xffff);
+
+	for (uint32_t i = 0; i < mDirtyCount; i++) {   // dirty already: until this later submit is done
+		if (mDirty[i].key == key) {
+			mDirty[i].fence = fence;
+			return;
+		}
+	}
+
 	if (mDirtyCount == 32)
 		landed();
 
@@ -1368,11 +1399,13 @@ void RDNA4PvHost::dirtied(uint32_t task, uint32_t id, uint64_t fence)
 		return;
 	}
 
-	mDirty[mDirtyCount++] = { task << 16 | (id & 0xffff), fence };
+	mDirty[mDirtyCount++] = { key, fence };
 }
 
 void RDNA4PvHost::stampLater(uint32_t index, uint32_t value)
 {
+	flushBatch();   // the stamp comes after its command buffer's draws
+
 	if (!mPending && !mLateCount) {
 		completeStamp(index, value);
 		return;
@@ -1427,13 +1460,13 @@ void RDNA4PvHost::completeLate()
 // Before a draw or dispatch is put together: slots and pool from the start when nothing is in flight; waited for first when they run low.
 void RDNA4PvHost::readyDraws()
 {
-	if (mSlot >= kSlots)   // a ring: the draw that used slot 0 is done, with kSlots > kInFlight
+	if (mSlot >= kSlots)   // a ring: takeSlot waits for the submit that used a slot last
 		mSlot = 0;
 
 	if (mPoolUsed > kPoolBytes / 4)
 		waitDraws();
 
-	if (!mPending)
+	if (!mPending && !mBatchDraws)   // nothing in flight or put together reads it
 		mPoolUsed = 0;
 }
 
@@ -1446,7 +1479,91 @@ bool RDNA4PvHost::drawing(uint32_t task, uint32_t id) const
 		if (mDirty[i].key == key)
 			return true;
 
+	for (uint32_t i = 0; i < mBatchDraws; i++)   // put together, not submitted yet: waitDraws submits them first
+		if (mBatchDirty[i] == key)
+			return true;
+
 	return false;
+}
+
+// A misc and IB slot for a submit: in turn, and once the submit that used it last is done.
+uint32_t RDNA4PvHost::takeSlot()
+{
+	readyDraws();
+
+	const uint32_t slot = mSlot++;
+
+	waitSubmit(mSlotSubmit[slot]);
+	mSlotSubmit[slot] = nextSubmit();
+
+	return slot;
+}
+
+// A draw's stream added to the batch (false: submit it alone). Its target is dirty from now on (drawing()).
+bool RDNA4PvHost::batchDraw(const uint32_t *ib, uint32_t dwords, uint32_t task, uint32_t target)
+{
+	uint64_t cpu = 0;
+
+	if ((gInPlace & 512) || profiling() || dwords * 4 > kBatchBytes)
+		return false;
+
+	if (!mBatchIb.handle && gCompute->rtAllocHost(this, kernel_task, kBatchBytes * kBatchSlots, RDNA4_HOST_EXECUTABLE, mBatchIb.handle, mBatchIb.gpu,
+	                                              cpu) == kIOReturnSuccess)
+		mBatchIb.cpu = reinterpret_cast<uint8_t *>(cpu);
+
+	if (!mBatchIb.cpu)
+		return false;
+
+	if (mBatchDraws == kBatchDraws || (mBatchDwords + dwords) * 4 > kBatchBytes)
+		flushBatch();
+
+	const uint32_t slot = mBatchSlot % kBatchSlots;
+
+	if (!mBatchDraws && mBatchFence[slot] && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(mBatchFence[slot])))
+		waitFor(mBatchFence[slot]);   // the slot's IB still read by the card
+
+	memcpy(mBatchIb.cpu + static_cast<uint64_t>(slot) * kBatchBytes + mBatchDwords * 4, ib, dwords * 4);
+	mBatchDwords += dwords;
+	mBatchDirty[mBatchDraws++] = task << 16 | (target & 0xffff);
+
+	return true;
+}
+
+// The draws put together submitted as one IB, left in flight; their targets dirty until it is done.
+void RDNA4PvHost::flushBatch()
+{
+	const uint32_t slot = mBatchSlot % kBatchSlots, draws = mBatchDraws, dwords = mBatchDwords;
+	uint32_t dirty[kBatchDraws];
+	uint64_t fence = 0;
+
+	if (!draws || mFlushing)
+		return;
+
+	// closed before anything below can wait (and so flush again)
+	memcpy(dirty, mBatchDirty, draws * 4);
+	mBatchSlot++;
+	mBatchDwords = 0;
+	mBatchDraws = 0;
+	mFlushing = true;
+	__sync_synchronize();   // seen by the card (snooped) before the submit
+	roomForDraw();
+
+	const IOReturn r = submitGfx(mBatchIb.gpu + static_cast<uint64_t>(slot) * kBatchBytes, dwords, fence);
+
+	mFlushing = false;
+
+	if (r != kIOReturnSuccess) {
+		if (mGfxHangLines++ < 12)
+			pvstat("host: render: a batch of %u draws not submitted (0x%x)", draws, r);
+		return;
+	}
+
+	mDrawSerial++;
+	flying(fence, "batch");
+	mBatchFence[slot] = fence;
+
+	for (uint32_t i = 0; i < draws; i++)
+		dirtied(dirty[i] >> 16, dirty[i] & 0xffff, fence);
 }
 
 // M1: a command's payload as dwords (up to 32), to work its layout out against what the guest asked for (tools/metal/m1/mtlprobe.m).
@@ -2158,9 +2275,7 @@ bool RDNA4PvHost::clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_
 
 	n += timed ? timeStamp(ib + n, true) : 0;
 
-	readyDraws();
-
-	const uint64_t slotAt = static_cast<uint64_t>(mSlot++) * RDNA4_TRIRUN_PAGE;
+	const uint64_t slotAt = static_cast<uint64_t>(takeSlot()) * RDNA4_TRIRUN_PAGE;
 	uint64_t fence = 0;
 
 	memcpy(mGfxIb.cpu + slotAt, ib, n * 4);
@@ -2218,9 +2333,7 @@ bool RDNA4PvHost::clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_
 		}
 	}
 
-	readyDraws();
-
-	const uint64_t slotAt = static_cast<uint64_t>(mSlot++) * RDNA4_TRIRUN_PAGE;
+	const uint64_t slotAt = static_cast<uint64_t>(takeSlot()) * RDNA4_TRIRUN_PAGE;
 	const rdna4_tri_va where = {mFillCode.gpu, gpu, rdna4_trirun_rings_va(mGfxRings.gpu), mGfxMisc.gpu + slotAt};
 	uint32_t n = rdna4_tri_record(ib, &where);
 	uint64_t fence = 0;
@@ -3011,7 +3124,7 @@ bool RDNA4PvHost::shadowTexture(uint32_t task, uint32_t id, const TextureSource 
 	}
 
 	s->used = ++mShadowClock;
-	s->serial = mDrawSerial + 1;
+	s->serial = nextSerial();
 	gpu = s->gpu;
 	pitch = s->pitch;
 
@@ -3058,7 +3171,7 @@ void RDNA4PvHost::dropShadowRange(uint32_t task, uint64_t va, uint64_t bytes)
 // on the way: never more than kInFlight are in flight).
 bool RDNA4PvHost::shadowIdle(const Shadow &s) const
 {
-	return !mPending || (s.serial <= mDrawSerial && mDrawSerial - s.serial >= kInFlight);
+	return (!mPending && !mBatchDraws) || (s.serial <= mDrawSerial && mDrawSerial - s.serial >= kInFlight);
 }
 
 // A shadow's memory given back (after the draws that read it).
@@ -3277,7 +3390,7 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 	for (Mapping &m : mMap) {
 		if (m.count == count && !memcmp(m.pages, pages, count * 8)) {
 			m.used = mMapClock;
-			m.submit = mSubmits + 1;
+			m.submit = nextSubmit();
 			gpu = m.gpu;
 			if (entry)
 				*entry = &m;
@@ -3326,7 +3439,7 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 		waitSubmit(lru->submit);   // a draw in flight may use it
 	dropMapping(*lru);
 	memcpy(copy, pages, count * 8);
-	*lru = {copy, count, h, gpu, mMapClock, mSubmits + 1};
+	*lru = {copy, count, h, gpu, mMapClock, nextSubmit()};
 	if (entry)
 		*entry = lru;
 
@@ -3354,7 +3467,7 @@ RDNA4PvHost::Mapping *RDNA4PvHost::keyedMapping(const void *memory, uint32_t tas
 
 		if (memory || (m.task == task && m.gen == gen)) {
 			m.used = ++mMapClock;
-			m.submit = mSubmits + 1;
+			m.submit = nextSubmit();
 
 			return &m;
 		}
@@ -3800,8 +3913,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		return true;
 	};
-	if (!mRtOpen)
+	if (!mRtOpen) {
+		gCompute->rtPreferCpuTables(this);
+		gCompute->rtFreesWhenIdle(this);
 		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;
+	}
 	GfxBuffers tgt {};
 	uint8_t *pooledTarget = nullptr;
 
@@ -3813,10 +3929,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	if (!held)   // drawn otherwise: no shadow of it holds what the guest will have
 		dropShadows(surface.surface, task, surface.memory ? surface.base : va);
 
-	readyDraws();
-
 	// this draw's state page and IB
-	const uint32_t slot = mSlot++;
+	const uint32_t slot = takeSlot();
 	const uint64_t slotAt = static_cast<uint64_t>(slot) * RDNA4_TRIRUN_PAGE;
 
 	const bool staged = !inPlace && !held;
@@ -3901,9 +4015,25 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		// test (LATE_Z; RADV's for writes_memory, gfx12.json); else the template's EARLY_Z_THEN_LATE_Z
 		{0x69, 0x1b, noColour ? 0x600u : 0x10u},
 	};
-	for (const Patch &pt : patch)
-		if (uint32_t *d = n ? streamReg(ib, n, pt.opcode, pt.reg) : nullptr)
-			*d = pt.value;
+	// Where each patched register is in the stream: the same for every draw of a template (plain or colour), found once (streamReg walks
+	// the stream's packets for each: most of the time a draw's stream took).
+	static constexpr uint32_t kPatches = sizeof(patch) / sizeof(patch[0]);
+	static uint32_t patchAt[2][kPatches];
+	static bool patchFound[2];
+
+	if (n && !patchFound[outs != 0]) {
+		for (uint32_t i = 0; i < kPatches; i++) {
+			const uint32_t *d = streamReg(ib, n, patch[i].opcode, patch[i].reg);
+
+			patchAt[outs != 0][i] = d ? static_cast<uint32_t>(d - ib) : 0;
+		}
+
+		patchFound[outs != 0] = true;
+	}
+
+	for (uint32_t i = 0; i < kPatches; i++)
+		if (n && patchAt[outs != 0][i])
+			ib[patchAt[outs != 0][i]] = patch[i].value;
 		else
 			ok = false;
 	// The stages' buffers, in place (each mapped once a draw, whole), and their tables at +0x400 (vertex) and +0x800 (fragment) of the misc page
@@ -4148,19 +4278,24 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			total += timeStamp(ib + total, true);
 		}
 
-		if (r == kIOReturnSuccess) {
+		// Waited for now when the CPU has to finish the draw (a staged target or texture to copy back, a runtime buffer to free), else left
+		// in flight with those before it, put together with the next ones when it can be.
+		const bool sync = staged || indexHandle || ownsMemory(stagedTextures, handle);
+		const bool batched = r == kIOReturnSuccess && !sync && batchDraw(ib, total, task, target);
+
+		if (r == kIOReturnSuccess && !batched) {
 			step = "IB in";
 			r = upload(mGfxIb, ib, total * 4);
 		}
 
 		t[3] = nowNs();
 
-		if (r == kIOReturnSuccess)
+		if (r == kIOReturnSuccess && !batched)
 			roomForDraw();
 
 		t[4] = nowNs();
 
-		if (r == kIOReturnSuccess) {
+		if (r == kIOReturnSuccess && !batched) {
 			step = "submit";
 			r = submitGfx(ibGpu, total, fence);
 			mDrawSerial += r == kIOReturnSuccess;
@@ -4174,10 +4309,6 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			       (t[0] - targetFrom) / 1000, (t[1] - t[0]) / 1000, (t[2] - t[1]) / 1000, (t[3] - t[2]) / 1000, (t[4] - t[3]) / 1000, (t[5] - t[4]) / 1000,
 			       name[2], staged, newCode);
 
-		// Waited for now when the CPU has to finish the draw (a staged target or texture to copy back, a runtime buffer to free), else left
-		// in flight with those before it.
-		const bool sync = staged || indexHandle || ownsMemory(stagedTextures, handle);
-
 		if (r == kIOReturnSuccess) {   // described for a hang
 			snprintf(mRecent[mRecentAt], sizeof(mRecent[0]), "fence %llu: task %u, target %u (%ux%u, %s), \"%s\" / \"%s\", %u x %u, "
 			         "fragment textures %u %u %u %u", static_cast<unsigned long long>(fence), task, target, width, height,
@@ -4188,8 +4319,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		if (r == kIOReturnSuccess && !sync) {
 			mPhaseNs[1] += nowNs() - targetFrom;
-			flying(fence, name[2]);
-			dirtied(task, target, fence);
+
+			if (!batched) {
+				flying(fence, name[2]);
+				dirtied(task, target, fence);
+			}
 		}
 
 		if (r == kIOReturnSuccess && sync) {
@@ -4604,6 +4738,8 @@ uint32_t RDNA4PvHost::load(const uint8_t *elf, uint32_t size, const char *name) 
 	if (!gCompute)
 		return 0;
 	if (!mRtOpen)
+		gCompute->rtPreferCpuTables(this);
+		gCompute->rtFreesWhenIdle(this);
 		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;   // ponytail: never closed, the host lives as long as the boot
 	uint64_t out[9] = {};
 	const bool ok = mRtOpen && gCompute->rtLoad(this, kernel_task, reinterpret_cast<mach_vm_address_t>(elf), size, name, out) == kIOReturnSuccess;

@@ -658,6 +658,14 @@ public:
 	// `owner` is the client: its buffers and programs are only its own, and
 	// rtRelease frees them all. Every call takes rtLock.
 	IOReturn rtOpen(const void *owner);
+	// The client `owner` opens next gets its page tables in the CPU-visible pool, written by the CPU through the BAR (amdgpu_vm_cpu style)
+	// instead of copied into VRAM by an SDMA job for each mapping: the paravirtual host maps and unmaps surfaces all the time.
+	void rtPreferCpuTables(const void *owner) { cpuTableOwner = owner; }
+	const void *cpuTableOwner { nullptr };
+	// `owner` frees only what none of its gfx IBs in flight use (it waits for those itself): rtFree does not wait for all of them first.
+	// The paravirtual host drops mappings all the time, and each free drained the card.
+	void rtFreesWhenIdle(const void *owner) { idleFreeOwner = owner; }
+	const void *idleFreeOwner { nullptr };
 	bool runtimeReady() const { return rtReady; }   // the bring-up reached a dispatching stage
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
 	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
@@ -811,6 +819,7 @@ private:
 		const void *owner { nullptr };
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
 		uint64_t tableOffset { 0 }, rootMc { 0 }, rootPhys { 0 }, nextVa { GpuVm::kVaStart };
+		bool tableCpu { false };   // its tables at tableOffset of the pool (rtPreferCpuTables), else of the device heap
 		uint64_t kernargVa { 0 }, fenceVa { 0 };
 		uint64_t queueVa { 0 }, mqdMc { 0 }, eopVa { 0 }, rptrVa { 0 }, wpollVa { 0 };
 		volatile uint32_t *queueCpu { nullptr };
@@ -1045,6 +1054,7 @@ private:
 	IOReturn ownerStateLocked(const void *owner) const;
 	bool vmTableSync(RtClient &client, uint32_t offset, uint32_t bytes);
 	bool vmMap(RtClient &client, uint64_t va, uint64_t mc, uint64_t bytes, bool executable);
+	bool vmSyncCpu(RtClient &client, uint64_t va, uint64_t end);
 	bool vmMapHost(RtClient &client, uint64_t va, const uint64_t *pageBuses,
 	               uint64_t bytes, bool executable);
 	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
