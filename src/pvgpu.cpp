@@ -807,6 +807,9 @@ SYSCTL_INT(_debug, OID_AUTO, rdna4_pvtexid, CTLFLAG_RW | CTLFLAG_LOCKED, &gTexId
 static int texSysctl SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
+	if (!rdna4Root())
+		return EPERM;
+
 	if (!gHost)
 		return ENOENT;
 
@@ -826,6 +829,9 @@ SYSCTL_INT(_debug, OID_AUTO, rdna4_pvframeport, CTLFLAG_RW | CTLFLAG_LOCKED, &gF
 static int frameSysctl SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
+	if (!rdna4Root())
+		return EPERM;
+
 	return gHost ? gHost->grabFrame(static_cast<uint32_t>(gFramePort), req) : ENOENT;
 }
 

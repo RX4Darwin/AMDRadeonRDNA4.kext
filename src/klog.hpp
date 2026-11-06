@@ -29,4 +29,11 @@ void rdna4Log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /* Once, from pluginStart: the lock and the sysctl. */
 void rdna4LogInit();
 
+/*
+ * Whether the process a sysctl handler runs for is root. The debug sysctls
+ * that read the log (kernel addresses) or what the screen and other
+ * processes' textures show refuse anyone else.
+ */
+bool rdna4Root();
+
 #endif /* KLog_hpp */

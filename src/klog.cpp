@@ -11,6 +11,8 @@
 #include <IOKit/IOLib.h>
 #include <libkern/libkern.h>
 #include <stdarg.h>
+#include <sys/errno.h>
+#include <sys/kauth.h>
 #include <sys/sysctl.h>
 
 namespace
@@ -59,6 +61,9 @@ int logSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 	size_t n;
 	int err;
 
+	if (!rdna4Root())
+		return EPERM;
+
 	if (!gLock)
 		return SYSCTL_OUT(req, "", 1);
 
@@ -93,6 +98,9 @@ int readSysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 	char *buf;
 	size_t n;
 	int err;
+
+	if (!rdna4Root())
+		return EPERM;
 
 	if (req->newptr) {
 		err = SYSCTL_IN(req, &from, sizeof(from));
@@ -135,6 +143,11 @@ SYSCTL_PROC(_debug, OID_AUTO, rdna4_log_read,
 	    "S", "AMDRadeonRDNA4 log from an offset (rdna4-logd)");
 
 } /* namespace */
+
+bool rdna4Root()
+{
+	return kauth_cred_issuser(kauth_cred_get());
+}
 
 void rdna4Log(const char *fmt, ...)
 {

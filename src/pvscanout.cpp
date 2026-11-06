@@ -58,6 +58,9 @@ int shot SYSCTL_HANDLER_ARGS
 	const uint32_t port = static_cast<uint32_t>(gShotPort);
 	const Mapping *m = port < kMaxPorts ? &gMap[port] : nullptr;
 
+	if (!rdna4Root())
+		return EPERM;
+
 	if (!m || !m->map)
 		return ENOENT;
 
