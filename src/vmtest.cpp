@@ -342,9 +342,7 @@ void RDNA4Compute::vmIdTest(bool late) {
 		return;
 	}
 	bzero(c.tableShadow, kVmTableBytes);
-	c.tableShadow[0] = GpuVm::encodePde(c.rootPhys + 0x1000, GpuVm::kValid, 2);
-	c.tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
-		GpuVm::encodePde(c.rootPhys + 0x2000, GpuVm::kValid, 1);
+	GpuVmTable::denseRoot(c.tableShadow, c.rootPhys);
 
 	/* Data the probes use (CPU writes through the BAR, HDP flushed). */
 	for (uint32_t off = 0; off < 0xa000; off += 4)

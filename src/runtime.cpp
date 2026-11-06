@@ -677,7 +677,9 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
 	if (c.tableCpu)
 		return span.firstPt != ~0ull && vmSyncCpu(c, va, end);
-	return span.firstPt != ~0ull && (!span.directories || vmTableSync(c, 0, 0x3000)) &&
+	return span.firstPt != ~0ull &&
+	       (!span.directories || (vmTableSync(c, 0, 0x3000) &&
+	                              vmTableSync(c, GpuVmTable::kDenseUpperPdb0, GpuVmTable::kDenseUpperPt - GpuVmTable::kDenseUpperPdb0))) &&
 	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
 }
 
@@ -704,7 +706,9 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
 	if (c.tableCpu)
 		return span.firstPt != ~0ull && vmSyncCpu(c, va, end);
-	return span.firstPt != ~0ull && (!span.directories || vmTableSync(c, 0, 0x3000)) &&
+	return span.firstPt != ~0ull &&
+	       (!span.directories || (vmTableSync(c, 0, 0x3000) &&
+	                              vmTableSync(c, GpuVmTable::kDenseUpperPdb0, GpuVmTable::kDenseUpperPt - GpuVmTable::kDenseUpperPdb0))) &&
 	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
 }
 
@@ -750,18 +754,28 @@ void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 }
 
 /* Tables in the pool (rtPreferCpuTables): only the entries of [va, end) copied through the BAR, its PDB0 entries and its PTEs (the dense
- * layout keeps both in VA order), then HDP flushed. Whole pages were 16 KiB of uncached BAR writes for a mapping of a few dozen pages. */
+ * layout keeps both in VA order within a GiB), then HDP flushed. Whole pages were 16 KiB of uncached BAR writes for a mapping of a few dozen pages. */
 bool RDNA4Compute::vmSyncCpu(RtClient &c, uint64_t va, uint64_t end) {
-	const uint64_t pde = 0x2000 + static_cast<uint64_t>(GpuVm::index(va, 2)) * 8, pdeEnd = 0x2000 + static_cast<uint64_t>(GpuVm::index(end - 1, 2)) * 8 + 8;
-	const uint64_t pte = 0x3000 + ((va - GpuVm::kVaStart) >> 12) * 8, pteEnd = 0x3000 + ((end - GpuVm::kVaStart) >> 12) * 8;
 	const auto *shadow = reinterpret_cast<const uint8_t *>(c.tableShadow);
 
-	if (va < GpuVm::kVaStart || end <= va || pdeEnd > 0x3000 || pteEnd > kVmTableBytes)
+	if (va < GpuVm::kVaStart || end <= va || end > GpuVm::kVaStart + GpuVmTable::kDenseVaBytes)
 		return false;
 
-	memcpy(poolCpu + c.tableOffset + pde, shadow + pde, pdeEnd - pde);
-	memcpy(poolCpu + c.tableOffset + pte, shadow + pte, pteEnd - pte);
-	(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + c.tableOffset + pte);
+	// a GiB at a time: each has its PDB0 page, and its PT pages follow on from the GiB before only from the second on
+	for (uint64_t at = va; at < end;) {
+		const uint64_t gibEnd = GpuVm::kVaStart + ((((at - GpuVm::kVaStart) >> 30) + 1) << 30), to = end < gibEnd ? end : gibEnd;
+		const uint64_t pde = GpuVmTable::densePde(at), pdeEnd = GpuVmTable::densePde(to - 1) + 8;
+		const uint64_t pte = GpuVmTable::densePte(at), pteEnd = GpuVmTable::densePte(to - 1) + 8;
+
+		if (pteEnd > kVmTableBytes)
+			return false;
+
+		memcpy(poolCpu + c.tableOffset + pde, shadow + pde, pdeEnd - pde);
+		memcpy(poolCpu + c.tableOffset + pte, shadow + pte, pteEnd - pte);
+		at = to;
+	}
+
+	(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + c.tableOffset);
 	flushHdp();
 	return true;
 }
@@ -789,18 +803,23 @@ bool RDNA4Compute::vmTableSync(RtClient &c, uint32_t offset, uint32_t bytes) {
 		flushHdp();
 		return true;
 	}
-	memcpy(poolCpu + kVmTableStage, reinterpret_cast<uint8_t *>(c.tableShadow) + offset, bytes);
-	(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + kVmTableStage);
-	flushHdp();
-	uint32_t pkt[Sdma::kCopyDwords];
-	if (!Sdma::copyLinear(pkt, poolMc(kVmTableStage), c.rootMc + offset, bytes)) {
-		RLOG("vmid %u: page-table COPY_LINEAR encoding failed", c.vmid);
-		return false;
-	}
-	if (!sdmaRun(pkt, Sdma::kCopyDwords, 2000)) {
-		RLOG("vmid %u: page-table SDMA sync failed (offset 0x%x bytes 0x%x)",
-		     c.vmid, offset, bytes);
-		return false;
+	/* Through the staging area 2 MiB at a time: it is 4 MiB, the table larger (the client's queue pages follow it). */
+	for (uint32_t at = offset; at < offset + bytes;) {
+		const uint32_t n = offset + bytes - at < (2u << 20) ? offset + bytes - at : 2u << 20;
+		memcpy(poolCpu + kVmTableStage, reinterpret_cast<uint8_t *>(c.tableShadow) + at, n);
+		(void)*reinterpret_cast<volatile uint32_t *>(poolCpu + kVmTableStage);
+		flushHdp();
+		uint32_t pkt[Sdma::kCopyDwords];
+		if (!Sdma::copyLinear(pkt, poolMc(kVmTableStage), c.rootMc + at, n)) {
+			RLOG("vmid %u: page-table COPY_LINEAR encoding failed", c.vmid);
+			return false;
+		}
+		if (!sdmaRun(pkt, Sdma::kCopyDwords, 2000)) {
+			RLOG("vmid %u: page-table SDMA sync failed (offset 0x%x bytes 0x%x)",
+			     c.vmid, at, n);
+			return false;
+		}
+		at += n;
 	}
 	return true;
 }
@@ -943,10 +962,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 		return false;
 	}
 	bzero(c.tableShadow, kVmTableBytes);
-	c.tableShadow[0] =
-		GpuVm::encodePde(c.rootPhys + 0x1000, GpuVm::kValid, 2);
-	c.tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
-		GpuVm::encodePde(c.rootPhys + 0x2000, GpuVm::kValid, 1);
+	GpuVmTable::denseRoot(c.tableShadow, c.rootPhys);
 	for (uint32_t off = 0; off < 0x7000; off += 4)
 		*poolDw(qoff + off) = 0;
 	c.kernargCpu = nullptr;
@@ -1084,9 +1100,7 @@ bool RDNA4Compute::vmBootSelfTest() {
 	const uint32_t ibOff = dataOff;           /* same physical page as the data word, IB at +0x100 */
 	auto buildTables = [&]() -> bool {
 		bzero(c.tableShadow, kVmTableBytes);
-		c.tableShadow[0] = GpuVm::encodePde(c.rootPhys + 0x1000, GpuVm::kValid, 2);
-		c.tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
-			GpuVm::encodePde(c.rootPhys + 0x2000, GpuVm::kValid, 1);
+		GpuVmTable::denseRoot(c.tableShadow, c.rootPhys);
 		return vmMap(c, qva, poolMc(qoff + kVmPq), kPqSize, true) &&
 		       vmMap(c, eva, poolMc(qoff + kVmEop), 0x1000, false) &&
 		       vmMap(c, rva, poolMc(qoff + kVmRptr), 0x1000, false) &&
@@ -1793,10 +1807,7 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 		return kIOReturnNoMemory;
 	}
 	bzero(c->tableShadow, kVmTableBytes);
-	c->tableShadow[0] =
-		GpuVm::encodePde(c->rootPhys + 0x1000, GpuVm::kValid, 2);
-	c->tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
-		GpuVm::encodePde(c->rootPhys + 0x2000, GpuVm::kValid, 1);
+	GpuVmTable::denseRoot(c->tableShadow, c->rootPhys);
 	const uint32_t qoff = kVmQueueBase + slot * kVmQueueStride;
 	for (uint32_t off = 0; off < 0x7000; off += 4)
 		*poolDw(qoff + off) = 0;
@@ -1890,11 +1901,15 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 		return kIOReturnNoMemory;
 	}
 	bzero(c->tableShadow, kVmTableBytes);
-	c->tableShadow[0] = GpuVm::encodePde(c->rootPhys + 0x1000, GpuVm::kValid, 2);
-	c->tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
-		GpuVm::encodePde(c->rootPhys + 0x2000, GpuVm::kValid, 1);
+	GpuVmTable::denseRoot(c->tableShadow, c->rootPhys);
 	if (cpu) {   // the whole table once (the pool's heap holds whatever was there): later syncs copy only the entries they change
-		memcpy(poolCpu + table, c->tableShadow, kVmTableBytes);
+		/* Zeroed by SDMA and only the root's and directories' pages written through the BAR: CPU writes to the pool make some
+		 * 12 MB/s, the whole table a stall of 650 ms in the client's first draw (the boot's progress bar stopped). */
+		uint32_t fill[Sdma::kFillDwords];
+		Sdma::constFill(fill, poolMc(table), 0, kVmTableBytes);
+		const bool zeroed = sdmaRun(fill, Sdma::kFillDwords, 2000);
+
+		memcpy(poolCpu + table, c->tableShadow, zeroed ? 0x3000 : kVmTableBytes);
 		flushHdp();
 	}
 	const uint32_t qoff = kVmQueueBase + slot * kVmQueueStride;
@@ -2333,18 +2348,24 @@ IOReturn RDNA4Compute::rtAlloc(const void *owner, uint64_t bytes, uint64_t &hand
 	return allocLocked(owner, bytes, handle, gpu);
 }
 
-// The dense tables' VA (1 GiB from kVaStart) in 64 KiB granules, one bit each, per client slot: taken first fit, given back exactly.
+// The dense tables' VA (4 GiB from kVaStart) in 64 KiB granules, one bit each, per client slot: taken first fit, given back exactly.
 // The list of holes it replaces held 32: a range freed with them all taken was lost, and the paravirtual host's churn of mappings and
 // shadows filled the client's VA within minutes (Mission Control: every draw then failed to map). The VA below nextVa when the bitmap is
 // first used (the client's queue, fence and kernarg pages, taken by bumping nextVa) is marked taken. Sparse tables keep the list.
 uint64_t *RDNA4Compute::vaBitsOf(RtClient &c)
 {
-	uint64_t *bits = vaBits[&c - clients];
+	uint64_t *&bits = vaBits[&c - clients];
+
+	if (!bits)   // kept for the slot once made (8 KiB)
+		bits = static_cast<uint64_t *>(IOMalloc(kVaGranules / 8));
+
+	if (!bits)
+		return nullptr;
 
 	if (!c.vaBitsReady) {
 		const uint64_t below = c.nextVa > GpuVm::kVaStart ? (c.nextVa - GpuVm::kVaStart + 0xffff) >> 16 : 0;
 
-		memset(vaBits[&c - clients], 0, sizeof(vaBits[0]));
+		memset(bits, 0, kVaGranules / 8);
 
 		for (uint64_t g = 0; g < below && g < kVaGranules; g++)
 			bits[g / 64] |= 1ull << (g % 64);
@@ -2363,6 +2384,9 @@ uint64_t RDNA4Compute::vaTake(RtClient &c, uint64_t bytes)
 	if (!c.sp) {
 		uint64_t *bits = vaBitsOf(c);
 		const uint64_t n = size >> 16;
+
+		if (!bits)
+			return 0;
 
 		for (uint64_t g = 0; g + n <= kVaGranules;) {
 			if (!(g % 64) && bits[g / 64] == ~0ull) {   // a word all taken
@@ -2426,6 +2450,9 @@ void RDNA4Compute::vaGive(RtClient &c, uint64_t va, uint64_t bytes)
 
 	if (!c.sp) {
 		uint64_t *bits = vaBitsOf(c);
+
+		if (!bits)
+			return;
 
 		for (uint64_t g = (va - GpuVm::kVaStart) >> 16; va >= GpuVm::kVaStart && g < kVaGranules && size; g++, size -= 0x10000)
 			bits[g / 64] &= ~(1ull << (g % 64));

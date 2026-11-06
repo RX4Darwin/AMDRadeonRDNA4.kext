@@ -4626,6 +4626,50 @@ bool treeResolves(TreeEnv &e, uint64_t va, uint64_t mc, uint64_t bytes) {
 }
 } // namespace
 
+// The dense image of kDenseTableBytes: 4 GiB from kVaStart, the first GiB laid out as before (the differential test's 4 MiB image is that
+// GiB alone), maps across the 1 GiB lines and in the last GiB translate, and nothing past 4 GiB is taken.
+static int testDense4GiB() {
+	int f = 0;
+	const uint64_t V = GpuVm::kVaStart, G = 1ull << 30, MC = kFbMcBase + 0x1000000;
+	static std::vector<uint64_t> words;
+	words.assign(GpuVmTable::kDenseTableBytes / 8, 0);
+	GpuVmTable::denseRoot(words.data(), kRootPhys);
+	auto entry = [](void *, uint64_t off) -> uint64_t * { return off < GpuVmTable::kDenseTableBytes ? &words[off / 8] : nullptr; };
+	auto phys = [](void *, uint64_t off, uint64_t &out) { out = kRootPhys + off; return true; };
+	auto read = [](void *, uint64_t address, uint64_t &out) {
+		const uint64_t off = address - kRootPhys;
+		if (off >= GpuVmTable::kDenseTableBytes)
+			return false;
+		out = words[off / 8];
+		return true;
+	};
+	const GpuVmTable::Access access { entry, phys, nullptr };
+	auto map = [&](uint64_t va, uint64_t mc, uint64_t bytes) {
+		GpuVmTable::Span span;
+		return GpuVmTable::mapVram(access, GpuVmTable::Policy {}, GpuVmTable::kDenseTableBytes, va, va + bytes, mc - kFbMcBase, false, span);
+	};
+	auto resolves = [&](uint64_t va, uint64_t mc, uint64_t bytes) {
+		for (uint64_t at = 0; at < bytes; at += 0x1000) {
+			uint64_t pa = 0, flags = 0;
+			if (!GpuVm::walk(kRootPhys, va + at, read, nullptr, pa, flags) || pa != mc - kFbMcBase + at)
+				return false;
+		}
+		return true;
+	};
+
+	f += check(GpuVmTable::densePt(V + G - 0x1000) == 0x3000 + 511 * 0x1000 && GpuVmTable::densePde(V) == 0x2000,
+	           "dense: the first GiB keeps the old layout (PDB0 at 0x2000, PT pages from 0x3000)");
+	f += check(map(V + 0x1000, MC, 0x3000) && resolves(V + 0x1000, MC, 0x3000), "dense: a map in the first GiB translates");
+	f += check(map(V + G - 0x10000, MC + 0x100000, 0x20000) && resolves(V + G - 0x10000, MC + 0x100000, 0x20000),
+	           "dense: a map across the 1 GiB line translates on both sides");
+	f += check(map(V + 3 * G + 0x200000, MC + 0x400000, 0x10000) && resolves(V + 3 * G + 0x200000, MC + 0x400000, 0x10000),
+	           "dense: a map in the last GiB translates");
+	f += check(resolves(V + 0x1000, MC, 0x3000) && resolves(V + G - 0x10000, MC + 0x100000, 0x20000), "dense: the earlier maps are undisturbed");
+	f += check(!map(V + 4 * G - 0x1000, MC, 0x2000), "dense: a map past 4 GiB is refused");
+	f += check(GpuVmTable::denseVa(4u << 20) == G, "dense: a 4 MiB image still covers only the first GiB");
+	return f;
+}
+
 static int testSparseTree() {
 	int f = 0;
 	const uint64_t V = GpuVm::kVaStart, G = 1ull << 30;
@@ -5057,6 +5101,7 @@ int main(int argc, char **argv) {
 	failures += testPtPages();
 	failures += testVmTableDifferential();
 	failures += testSparseTree();
+	failures += testDense4GiB();
 	failures += testLinuxRefFormat();
 	failures += testTrial();
 

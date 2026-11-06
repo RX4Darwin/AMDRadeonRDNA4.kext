@@ -53,6 +53,7 @@
 #include "flip.hpp"
 #include "gfxregs.hpp"
 #include "gpuheap.hpp"
+#include "gpuvmtable.hpp"
 #include "ih.hpp"
 #include "gpuvm.hpp"
 #include "ipdiscovery.hpp"
@@ -769,7 +770,7 @@ private:
 	static constexpr uint32_t kMaxClients = 8;              // the per-client-HQD path and rdna4-vmshared=1 (static VMIDs 8-15)
 	static constexpr uint32_t kClientSlots = 64;            // rdna4-vmshared=2 (VMIDs from the pool): the array size, bounded by memory not hardware
 	uint32_t clientCap() const { return vmShared == 2 ? kClientSlots : kMaxClients; }
-	static constexpr uint32_t kVmTableBytes = 4u << 20;
+	static constexpr uint32_t kVmTableBytes = GpuVmTable::kDenseTableBytes;   // 4 GiB of VA (1 GiB with 4 MiB)
 	static constexpr uint32_t kVmTableStage = 20u << 20;
 	static constexpr uint32_t kVmTableCpu = 28u << 20;    // W22 variant T: CPU-written tables (0x4000)
 	uint64_t vmPteSet { 0 }, vmPteClear { 0 };            // W22 diagnostics: extra/removed leaf PTE bits
@@ -874,8 +875,8 @@ private:
 	bool           vmidUsed[16] {};
 	bool           queueUsed[4][8] {};
 	RtClient       clients[kClientSlots] {};
-	static constexpr uint32_t kVaGranules = (1u << 30) >> 16;   // the dense tables' 1 GiB, 64 KiB each
-	uint64_t       vaBits[kClientSlots][kVaGranules / 64] {};
+	static constexpr uint32_t kVaGranules = GpuVmTable::kDenseVaBytes >> 16;   // the dense tables' 4 GiB, 64 KiB each
+	uint64_t      *vaBits[kClientSlots] {};   // kVaGranules bits each, made on first use
 	GpuHeap::Heap  heap;
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
 	RtBuffer       buffers[kBufferSlots] {};
