@@ -3487,8 +3487,22 @@ void RDNA4Compute::gfxClientReset() {
 bool RDNA4Compute::gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why) {
 	if (vmid < 1 || vmid > 15)
 		return false;
-	RLOG("gfx: %s: work in address space %u did not finish (fence %u of %u): hub fault 0x%08x at 0x%llx, GRBM 0x%08x, CP_STAT 0x%08x",
-	     why, vmid, *fenceWord, fence, rdGc(GcL2FaultStatusLo), gcFaultVa(), rdGc(GrbmStatus), rdGc(CpStat));
+	RLOG("gfx: %s: work in address space %u did not finish (fence %u of %u): hub fault 0x%08x at 0x%llx, GRBM 0x%08x, CP_STAT 0x%08x; "
+	     "the CP in the IB at 0x%08x%08x (%u dwords, %u left, offset 0x%x)", why, vmid, *fenceWord, fence, rdGc(GcL2FaultStatusLo), gcFaultVa(),
+	     rdGc(GrbmStatus), rdGc(CpStat), rdGc(CpIb1BaseHi), rdGc(CpIb1BaseLo), rdGc(CpIb1CmdBufsz), rdGc(CpIb1Bufsz), rdGc(CpIb1Offset));
+
+	// The status keeps the first fault until it is cleared, and the CP's read of VA 0 since the bring-up (gfxFaultMark) holds it: cleared
+	// and read again a moment later, it shows what the hung work retries now, if it waits on a fault.
+	for (uint32_t i = 0; i < 3; i++) {
+		gcFaultClear();
+		IODelay(2000);
+
+		const uint32_t st = rdGc(GcL2FaultStatusLo);
+
+		RLOG("gfx: %s: fault status 2 ms after a clear (%u): 0x%08x (VMID %u, CID 0x%x, %s) at 0x%llx", why, i, st, (st >> 20) & 0xf,
+		     (st >> 9) & 0x1ff, (st >> 18) & 1 ? "write" : "read", gcFaultVa());
+	}
+
 	bool back = false;
 	for (uint32_t attempt = 1; attempt <= 2 && !back; attempt++) {
 		const uint32_t index = rdGc(GrbmGfxIndex);

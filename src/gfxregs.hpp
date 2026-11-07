@@ -58,6 +58,11 @@ constexpr Reg CpMeIcBaseCntl      { 1, 0x5846 };
 constexpr Reg CpGfxRs64InstrPntr0 { 1, 0x2a44 };
 constexpr Reg CpGfxRs64InstrPntr1 { 1, 0x2a45 };
 constexpr Reg CpStat              { 0, 0x0f40 };
+constexpr Reg CpIb1Offset         { 1, 0x2092 };   // the IB1 the CP runs (gc_12_0_0_offset.h): where in it, its size, what is left
+constexpr Reg CpIb1CmdBufsz       { 1, 0x20c0 };
+constexpr Reg CpIb1BaseLo         { 1, 0x20cc };
+constexpr Reg CpIb1BaseHi         { 1, 0x20cd };
+constexpr Reg CpIb1Bufsz          { 1, 0x20ce };
 constexpr Reg CpCpcStatus         { 0, 0x0e24 };
 constexpr Reg CpCpfStatus         { 0, 0x0e27 };
 constexpr Reg CpPfpInstrPntr      { 0, 0x0f45 };
