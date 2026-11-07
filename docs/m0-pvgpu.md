@@ -334,6 +334,23 @@ gamma-capable plane (`txnProtocol` 0x07 may be what announces one).
 - **Open:** occasional hangs of draws whose fragment shader reads a texture at the pixel (`TcimBltnXc_Icir`, `Tc3sXc_Idst`; the ring
   recovers); the menu bar's titles are cut where the first layout's were; draws whose target is not 128-byte aligned are still staged.
 
+### 2026-11-07: Vision has no heap, and mediaanalysisd runs out of command queues
+
+**Measured**, card, Sequoia 24H232, the options above as boot-args:
+
+- **Apps took 15-20 s to start, then got no device:** `MTLCreateSystemDefaultDevice` waited in the kernel in `IOServiceOpen` of the
+  accelerator (IOAcceleratorFamily2). The accelerator held 988 `AppleParavirtCommandQueue`s, 987 of them mediaanalysisd's, after 5 h of
+  uptime; mediaanalysisd itself waited uninterruptibly (`U`) creating the next one, in `Espresso::context_metal::setup`.
+- **Why:** `-[AppleParavirtDevice newHeapWithDescriptor:]` is `xor eax, eax; ret` in Apple's AppleParavirtGPUMetal, and
+  `heapBufferSizeAndAlignWithLength:options:` returns {0, 0}: the paravirtual device makes no MTLHeap of any size or storage mode
+  (`makeHeap` of 64 KiB to 256 MiB, private, shared and managed, automatic and placement: all nil). Espresso's MPS engine needs one (`Cannot
+  create %zu-byte metal heap.`, `Espresso::context_exceeded` from `MPSEngine::blob_container::resize`), so every Vision network fails to
+  load (`espresso error: -13`), and each failure leaves the context's command queue behind: a `VNClassifyImageRequest` per run left 2 more
+  user clients each time. Queues an app releases itself are freed (200 made and released left none, with or without a command buffer on
+  each).
+- **On the rig** mediaanalysisd, which retries for every file, is disabled (`launchctl disable gui/501/com.apple.mediaanalysisd`; `enable`
+  undoes it). Other Vision users (Live Text in Preview, Photos) leak the same way until they quit.
+
 ## The GetDeviceInfo reply (hub-task-446) [measured in the kext and the bundle unless marked]
 
 **The wait.** `AppleParavirtAccelerator::setupDeviceInfo` (the last step of `Accelerator::start`) wires a 4 KiB `IOBufferMemoryDescriptor`, builds FIFO command `0x3a` with one record `{u32 0x2d, u32 bytes/8 (0x200), u32 physical page}`, submits it on the root channel through the generic `IOAccelChannel2` path, and then **`IOAccelEventMachineFast2::finishEvent`** waits for the event of that submission. After the wait it calls `parseDeviceInfo(buffer, 0x200, &accelerator->deviceInfo)` and returns true whatever the content (no validation: even an all-zero buffer passes). Then `Accelerator::start` releases its lock and `registerService()`.
