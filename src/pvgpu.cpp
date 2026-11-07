@@ -2092,7 +2092,9 @@ struct RDNA4PvHost::Surface {
 };
 
 // The IOSurface with id `sid`, retained, or nullptr (the root's table; the layout above, the same on Sequoia 24H232: its find_surface reads the
-// owner at +0x170 too).
+// owner at +0x170 too). Looked up as its owner, not as the app that draws: the ids come from resource records the guest's kernel writes
+// (AppleParavirtResource::allocateRefTextureHandle puts IOSurface::getSurfaceID() of the resource's own surface first, after IOGPUFamily
+// checked the app may use it) into a heap no process maps, so an app cannot name another app's surface here.
 static void *retainSurface(uint32_t sid) {
 	static IOService *root;   // ponytail: kept for the boot
 	if (!gSurfaceFns.lookup || !sid)
