@@ -4044,7 +4044,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	                : draw.type > 4 ? "an unknown primitive type"
 	                : !draw.instances ? "no instances"
 	                : draw.indexBytes && draw.start ? "a base vertex in an indexed draw (so far)"
-	                : !count || count > 0xffff ? "no vertices" : nullptr;
+	                : !count ? "no vertices"
+	                // GE_MAX_VTX_INDX is 0xffffffff: 2^24 is what 64 MiB of staged 32-bit indices hold (65535 was the first triangle's)
+	                : count > (1u << 24) ? "more than 2^24 vertices" : nullptr;
 	const Jit *shader[3] = {};
 	char name[3][64] = {};
 	for (unsigned k = 1; k <= 2 && !why; k++) {
