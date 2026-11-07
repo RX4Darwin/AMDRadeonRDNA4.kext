@@ -35,6 +35,7 @@ static_assert(Gfx12Draw::kRingBytes == Gfx12DrawCol::kColRingBytes, "one ring bl
 #include <IOKit/IOUserClient.h>
 #include <sys/sysctl.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
@@ -397,6 +398,7 @@ private:
 	uint32_t mLevel { 0 };
 	IOWorkLoop *mLoop { nullptr };
 	IOTimerEventSource *mTimer { nullptr };
+	IOPMDriverAssertionID mNoSleep { 0 };   // held while the heads are the displays without a wake path (start)
 	uint64_t mBusySince { 0 };           // when the guest last gave the host work (tick: the timer's pace)
 	uint32_t mPrev[24] {};
 	uint32_t mRegLines { 0 };
@@ -880,6 +882,17 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 		return nullptr;
 	}
 	h->mTimer->setTimeoutMS(500);   // first tick after the nub had time to register and match
+
+	// The card has no wake path unless rdna4-pm (docs/power-gfx.md: a sleep left both displays dark until a restart), and macOS sleeps
+	// after a minute idle here: while the heads are the displays, system idle sleep is held off. Display sleep goes on as before.
+	IOPMrootDomain *root = IOService::getPMRootDomain();
+
+	if (PvScanout::enabled() && !RDNA4Compute::requestedPowerManagement() && root) {
+		h->mNoSleep = root->createPMAssertion(kIOPMDriverAssertionPreventSystemIdleSleepBit, kIOPMDriverAssertionLevelOn, nub,
+		                                      "AMDRadeonRDNA4: the card has no wake path yet");
+		pvlog("host: system sleep held off (assertion %llu): the card has no wake path without rdna4-pm", h->mNoSleep);
+	}
+
 	return h;
 }
 
