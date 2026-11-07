@@ -503,6 +503,7 @@ private:
 	GfxBuffers mBatchIb {};
 	uint64_t mBatchFence[kBatchSlots] {};
 	uint32_t mBatchSlot { 0 }, mBatchDwords { 0 }, mBatchDraws { 0 }, mBatchDirty[kBatchDraws] {};
+	uint32_t mDrawTarget { 0 };   // the target of the draw whose textures are staged (stageTextures: one it samples is read from a copy)
 	uint64_t mBatchedAt { 0 };   // the GPU address the last draw put into the batch went to (named for a hang: CP_IB1_BASE + offset)
 	bool mFlushing { false };
 	uint64_t mSlotSubmit[kSlots] {};
@@ -2969,8 +2970,15 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		uint32_t shadowPitch = 0;
 		// a large read-only texture through a shadow on the card first (read across the bus each draw in place), in place when it gets none
 		const bool large = src.type == 3 && used >= (4u << 20) && used <= kShadowMax && !(gInPlace & 1024);
-		const bool shadowed = large && !(gInPlace & 16) && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch);
-		const bool inPlace = !shadowed && (gInPlace & 1) && kind && depth == 1 && pitched && based;
+		// The draw's own target in the guest's memory, read by its shader (CoreAnimation's backdrop materials read what the draws before
+		// left through a texture of the target): a copy as those draws left it, made after them (on the card, in the ring), not the memory
+		// the draw writes. Read in place while the draw wrote it, the ring hung now and then on the lock screen: no fault, SPI, SC and DB
+		// busy (2026-11-07). A surface on the card is read in place as before (hours of the desktop's vibrancy so; copied, each such draw
+		// wrote it back and loaded it again).
+		const CardSurface *card = src.surface.memory ? cardSurface(src.surface.surface) : nullptr;
+		const bool feedback = mDrawTarget && id == mDrawTarget && depth == 1 && used <= kShadowMax && !(card && card->loaded);
+		const bool shadowed = (large || feedback) && !(gInPlace & 16) && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch);
+		const bool inPlace = !shadowed && !feedback && (gInPlace & 1) && kind && depth == 1 && pitched && based;   // a copy at least
 
 		if (inPlace && (src.surface.memory ? onCard(src.surface, used, gpu) || mapMemory(src.surface.memory, src.surface.base, used, out[k].handle, gpu)
 		                                   : mapGuest(task, src.va, used, out[k].handle, gpu, shaderWrites))) {
@@ -4426,13 +4434,15 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	mPhaseNs[5] += nowNs() - targetAt;
 	StagedTexture stagedTextures[2][16] = {};
 	const uint64_t texturesFrom = nowNs();
+	mDrawTarget = target;
 	for (unsigned st = 0; st < 2 && ok; st++)
 		ok = stageTextures(task, bound[st], reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]), stagedTextures[st], talk, st ? "fragment" : "vertex",
 		                   st && noColour);
+	mDrawTarget = 0;
 	mPhaseNs[0] += nowNs() - texturesFrom;
 
 	// Drawn otherwise than held: its shadows are refreshed where it draws before they are read again. Marked after its own textures were
-	// staged, so that a shadow of it this draw reads (refreshed just now, before the draw in the ring) is refreshed again after it.
+	// staged, so that a copy of it this draw reads (refreshed just now, before the draw in the ring) is refreshed again after it.
 	if (!held)
 		drewInto(surface.surface, task, surface.memory ? surface.base : va, draw, width, height, tp);
 
