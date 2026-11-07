@@ -625,6 +625,7 @@ private:
 		bool valid { false };
 		bool readOnly { false };         // of a texture shaders only read (type 3): held longer (kShadowAgeReadOnly)
 		uint64_t print { 0 };            // a read-only texture's texturePrint when filled
+		uint32_t dirty[4] {};            // drawn into since it was filled: x0, y0, x1, y1 in pixels (none while x1 <= x0); refreshShadow
 	};
 	// A frame's icons and glyphs alone are hundreds of small textures: with 32 shadows they pushed each other out, and each was copied
 	// again. Large ones are kept within kShadowBudget.
@@ -683,6 +684,8 @@ private:
 	Shadow *makeShadow(const ShadowKey &k);
 	bool fillShadow(Shadow &s, IOMemoryDescriptor *memory, bool written);
 	bool fillShadowOnCard(Shadow &s, IOMemoryDescriptor *memory);
+	bool refreshShadow(Shadow &s, IOMemoryDescriptor *memory);
+	void drewInto(const OSObject *surface, uint32_t task, uint64_t at, const Draw &draw, uint32_t width, uint32_t height, uint32_t bpp);
 	uint32_t mCardFills { 0 }, mCardFlushes { 0 };   // shadows on the card filled and written back by the card, for the draw stats
 	bool shadowTexture(uint32_t task, uint32_t id, const TextureSource &src, uint32_t bpp, uint64_t &gpu, uint32_t &pitch);
 	uint64_t texturePrint(uint32_t task, const TextureSource &src, uint32_t bpp);
@@ -3262,6 +3265,7 @@ bool RDNA4PvHost::fillShadow(Shadow &s, IOMemoryDescriptor *memory, bool written
 
 	s.valid = ok;
 	s.when = nowNs();
+	memset(s.dirty, 0, sizeof(s.dirty));
 
 	return ok;
 }
@@ -3292,8 +3296,74 @@ bool RDNA4PvHost::fillShadowOnCard(Shadow &s, IOMemoryDescriptor *memory)
 	s.valid = ok;
 	s.when = nowNs();
 	s.serial = mDrawSerial;   // the fill in flight writes it
+	memset(s.dirty, 0, sizeof(s.dirty));
 
 	return ok;
+}
+
+// What draws since the fill drew into a shadow's texture (dirty) copied into it, on the card after them; true when it holds what the
+// texture has (nothing was drawn, or the rows came), false when it must be filled whole. A draw into a texture dropped its shadows, and
+// each was filled whole again for the next draw that read it: a 4K target 33 MB for a draw that touched a corner.
+bool RDNA4PvHost::refreshShadow(Shadow &s, IOMemoryDescriptor *memory)
+{
+	const uint32_t x0 = s.dirty[0], y0 = s.dirty[1], x1 = s.dirty[2], y1 = s.dirty[3];
+	const uint64_t span = static_cast<uint64_t>(s.rowBytes) * (s.height - 1) + s.width * s.bpp;
+	uint64_t handle = 0, src = 0;
+
+	if (x1 <= x0 || y1 <= y0)
+		return true;
+
+	if (s.depth > 1 || x1 > s.width || y1 > s.height || (memory && memory->prepare() != kIOReturnSuccess))
+		return false;
+
+	bool ok = memory ? mapMemory(memory, s.at & ~0xffull, span + (s.at & 0xff), handle, src) : mapGuest(s.task, s.at, span, handle, src);
+
+	if (memory)
+		memory->complete();
+
+	src += memory ? s.at & 0xff : 0;
+	ok = ok && rowsOnCard(src + static_cast<uint64_t>(y0) * s.rowBytes + x0 * s.bpp, s.rowBytes,
+	                      s.gpu + static_cast<uint64_t>(y0) * s.pitch + x0 * s.bpp, s.pitch, (x1 - x0) * s.bpp, y1 - y0);
+
+	if (ok) {
+		memset(s.dirty, 0, sizeof(s.dirty));
+		s.serial = mDrawSerial;   // the copy in flight writes it
+		mCardFills++;
+	}
+
+	return ok;
+}
+
+// A draw into a target (its scissor, else all of it): the shadows of the target keep what they hold elsewhere and are refreshed where it
+// drew before they are read again (refreshShadow). One of another size or pixel (a view of it) is dropped as before.
+void RDNA4PvHost::drewInto(const OSObject *surface, uint32_t task, uint64_t at, const Draw &draw, uint32_t width, uint32_t height,
+                           uint32_t bpp)
+{
+	uint32_t x0 = 0, y0 = 0, x1 = width, y1 = height;
+
+	if (draw.scissorSet) {
+		x0 = draw.scissor[0] < width ? static_cast<uint32_t>(draw.scissor[0]) : width;
+		y0 = draw.scissor[1] < height ? static_cast<uint32_t>(draw.scissor[1]) : height;
+		x1 = draw.scissor[2] < width - x0 ? x0 + static_cast<uint32_t>(draw.scissor[2]) : width;
+		y1 = draw.scissor[3] < height - y0 ? y0 + static_cast<uint32_t>(draw.scissor[3]) : height;
+	}
+
+	for (Shadow &s : mShadows) {
+		if (s.surface != surface || (!surface && s.task != task) || s.at != at || (mHeld.active && mHeld.shadow == &s))
+			continue;
+
+		if (!s.valid || s.width != width || s.height != height || s.bpp != bpp || s.depth > 1) {
+			s.valid = false;
+			continue;
+		}
+
+		const bool none = s.dirty[2] <= s.dirty[0] || s.dirty[3] <= s.dirty[1];
+
+		s.dirty[0] = none || x0 < s.dirty[0] ? x0 : s.dirty[0];
+		s.dirty[1] = none || y0 < s.dirty[1] ? y0 : s.dirty[1];
+		s.dirty[2] = none || x1 > s.dirty[2] ? x1 : s.dirty[2];
+		s.dirty[3] = none || y1 > s.dirty[3] ? y1 : s.dirty[3];
+	}
 }
 
 // A texture the card cannot read in place, read from its shadow: the one kept while it holds what the guest has, else filled anew.
@@ -3312,7 +3382,7 @@ bool RDNA4PvHost::shadowTexture(uint32_t task, uint32_t id, const TextureSource 
 	if (current && s->readOnly && s->print != print)
 		mStale[3]++;
 
-	if (current && (!s->readOnly || s->print == print)) {
+	if (current && (!s->readOnly || s->print == print) && refreshShadow(*s, sf.memory)) {
 		mCopiesReused++;
 	} else {
 		s = s ? s : makeShadow(key);
@@ -4210,9 +4280,6 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 	const bool held = !inPlace && mRtOpen && !(gInPlace & 16) && holdTarget(task, target, va, surface, width, height, bpr, tp);
 
-	if (!held)   // drawn otherwise: no shadow of it holds what the guest will have
-		dropShadows(surface.surface, task, surface.memory ? surface.base : va);
-
 	// this draw's state page and IB
 	const uint32_t slot = takeSlot();
 
@@ -4363,6 +4430,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		ok = stageTextures(task, bound[st], reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]), stagedTextures[st], talk, st ? "fragment" : "vertex",
 		                   st && noColour);
 	mPhaseNs[0] += nowNs() - texturesFrom;
+
+	// Drawn otherwise than held: its shadows are refreshed where it draws before they are read again. Marked after its own textures were
+	// staged, so that a shadow of it this draw reads (refreshed just now, before the draw in the ring) is refreshed again after it.
+	if (!held)
+		drewInto(surface.surface, task, surface.memory ? surface.base : va, draw, width, height, tp);
 
 	// The colour attachment bound as a texture too (CoreAnimation reads the layer it draws into): its copy holds the attachment from
 	// before the draw. Copied back after the attachment, it put the old pixels over the draw's: the Dock's menus lost their text.
