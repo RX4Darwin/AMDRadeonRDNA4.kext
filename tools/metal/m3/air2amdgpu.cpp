@@ -780,6 +780,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	// A value between the stages (index: its argument or member); sprite: the point's coordinate, which the hardware makes (no name)
 	struct Var { unsigned index; uint32_t hash; bool flat; unsigned bary; bool sprite = false; };
 	std::vector<Var> vars;
+	uint32_t written = 0;   // bit n: buffer n is device memory the shader may write (the host maps it for writing)
 	auto fnv = [](const std::string &name) {
 		uint32_t h = 2166136261u;
 		for (unsigned char c : name)
@@ -835,13 +836,17 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			from[index] = 4;   // colour attachment 0 as it is (programmable blending): read at the pixel from the host's staged target
 		else if (kind == "air.buffer" && !unused) {
 			int location = -1;
-			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
-				if (mdString(a, k) == "air.location_index")
+			bool writes = false;
+			for (unsigned k = 2; k < a->getNumOperands(); k++) {
+				if (k + 1 < a->getNumOperands() && mdString(a, k) == "air.location_index")
 					location = static_cast<int>(mdInt(a, k + 1));
+				writes |= mdString(a, k) == "air.read_write" || mdString(a, k) == "air.write";
+			}
 			if (location < 0 || location >= static_cast<int>(RDNA4_MTLC_MAX_BUFFERS) || index >= air->arg_size() ||
 			    (air->getArg(index)->getType() != PointerType::get(ctx, 1) && air->getArg(index)->getType() != PointerType::get(ctx, 2)))
 				return "buffer argument " + std::to_string(index) + ": only device and constant buffers at indices 0-27 so far";
 			from[index] = 100 + location;
+			written |= writes ? 1u << location : 0;
 		} else if ((kind == "air.texture" || kind == "air.sampler") && !unused) {
 			int location = -1;
 			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
@@ -1209,7 +1214,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		out.hsaco.append(reinterpret_cast<const char *>(entry), sizeof(entry));
 	}
 	out.buffers = 0;
-	out.written = 0;
+	out.written = written;
 	out.texturesWritten = 0;
 	return "";
 }

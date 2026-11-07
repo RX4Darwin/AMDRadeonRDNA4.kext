@@ -4319,11 +4319,14 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 				continue;
 			}
 
+			// a buffer the shader may write (device, not const): only memory the guest's table lets the GPU write
+			const bool writes = shader[st + 1] && (shader[st + 1]->written >> k & 1);
+
 			ok = bufferRange(task, id, &bva, &blen) && bound[st].offset[k] < blen && blen <= kMaxBuffer;
 			for (unsigned s2 = 0; s2 <= st && ok && !base[st][k]; s2++)   // the same buffer in an earlier slot: its mapping
 				for (unsigned k2 = 0; k2 < (s2 == st ? k : RDNA4_MTLC_MAX_BUFFERS) && !base[st][k]; k2++)
 					base[st][k] = bound[s2].buffer[k2] == id ? base[s2][k2] : 0;
-			ok = ok && (base[st][k] || mapGuest(task, bva, blen, handle[st][k], base[st][k]));
+			ok = ok && ((base[st][k] && !writes) || mapGuest(task, bva, blen, handle[st][k], base[st][k], writes));
 			if (talk && ok) {   // what the draw reads (the first 8 dwords of each buffer)
 				uint32_t w[8] = {};
 				readGuest(task, bva + bound[st].offset[k], reinterpret_cast<uint8_t *>(w), blen - bound[st].offset[k] < sizeof(w) ?

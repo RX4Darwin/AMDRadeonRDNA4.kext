@@ -10,7 +10,9 @@
  *    kMtlcDeliver  scalars in {request id, code object address, code object bytes (0 = could not translate), buffers, written mask
  *                  [, textures written mask]}: the linked gfx1201 code object and its interface as air2amdgpu describes it (8-byte buffer
  *                  addresses for indices 0 .. buffers - 1, then u32 threads per threadgroup[3], u32 threads in the grid[3]); bit i of the
- *                  textures mask: texture index i is written (an older helper sends five scalars: none known).
+ *                  written mask: buffer index i is device memory the function may write (a vertex or fragment shader's too, which the
+ *                  host then maps only where the guest lets the GPU write); bit i of the textures mask: texture index i is written (an older
+ *                  helper sends five scalars: none known).
  */
 #pragma once
 
