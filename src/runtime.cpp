@@ -3600,15 +3600,36 @@ bool RDNA4Compute::pauseUnlocked(const RtClient &c, const void *owner) {
 /* `pause`: the caller holds rtLock and nothing of the client's but the client itself; the lock is let go between the polls after the first
  * 2 ms (pauseUnlocked). */
 bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why, bool pause) {
+	// Slow is not hung: past the timeout the wait goes on while the CP still moves (another IB, less of it left, or fences coming), up to
+	// kMovingMs in all, and ends only once nothing moved for kStillMs. Copies of 4K targets from the guest's memory took longer than the
+	// host's 50 ms in a batch, and the ring was ended under them (2026-11-07).
+	static constexpr uint32_t kMovingMs = 2000, kStillMs = 30;
 	const void *owner = c.owner;
 	const uint64_t t0 = mach_absolute_time();
-	uint64_t span = 0;
+	uint64_t span = 0, moving = 0, still = 0, movedAt = 0, where = 0;
+	uint32_t seen = *c.gfxFenceCpu;
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000, &span);
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(kMovingMs) * 1000000, &moving);
+	nanoseconds_to_absolutetime(static_cast<uint64_t>(kStillMs) * 1000000, &still);
 	bool done = false;
 	for (uint32_t polls = 0;; polls++) {
 		done = fenceReached(*c.gfxFenceCpu, fence);
-		if (done || mach_absolute_time() - t0 > span)
+		const uint64_t now = mach_absolute_time();
+
+		if (done || now - t0 > moving)
 			break;
+
+		if (now - t0 > span) {
+			const uint64_t at = static_cast<uint64_t>(rdGc(CpIb1BaseLo)) << 32 | rdGc(CpIb1Bufsz);
+
+			if (at != where || *c.gfxFenceCpu != seen || !movedAt) {
+				where = at;
+				seen = *c.gfxFenceCpu;
+				movedAt = now;
+			} else if (now - movedAt > still) {
+				break;
+			}
+		}
 		if (sleepAbortWanted()) {              // P7: a sleep was requested: end the wait WITHOUT wedging the ring (a timeout would halt PFP/ME)
 			waitAborted = true;
 			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
@@ -3629,7 +3650,8 @@ bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs
 		gfxClientRetire(c);
 		return true;
 	}
-	RLOG("vmid %u: gfx fence %u not reached after %u ms (%s)", c.vmid, fence, timeoutMs, why);
+	RLOG("vmid %u: gfx fence %u not reached after %u ms, the CP still for %u ms (%s)", c.vmid, fence, static_cast<uint32_t>(ns / 1000000),
+	     kStillMs, why);
 	/* The wait is over for the caller either way. Everything of this client's on the ring is ended with it: its newest fence coming
 	 * through is what says the ring runs again. */
 	const uint32_t newest = c.gfxOutstanding ? c.gfxFences[c.gfxOutstanding - 1] : fence;
