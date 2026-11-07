@@ -503,6 +503,7 @@ private:
 	GfxBuffers mBatchIb {};
 	uint64_t mBatchFence[kBatchSlots] {};
 	uint32_t mBatchSlot { 0 }, mBatchDwords { 0 }, mBatchDraws { 0 }, mBatchDirty[kBatchDraws] {};
+	uint64_t mBatchedAt { 0 };   // the GPU address the last draw put into the batch went to (named for a hang: CP_IB1_BASE + offset)
 	bool mFlushing { false };
 	uint64_t mSlotSubmit[kSlots] {};
 	// The submit (of flying()'s count) and the draw serial that what is being put together will go out with: one later while a batch is
@@ -632,7 +633,7 @@ private:
 	uint64_t mShadowBytes { 0 };
 	uint32_t mShadowsFreed { 0 }, mShadowsMade { 0 };   // for the draw stats
 	uint32_t mStagedLines { 0 };                         // textures copied for one draw, described in this stats period
-	static constexpr uint32_t kRecent = 16;              // the draws submitted last, logged when the card does not finish them
+	static constexpr uint32_t kRecent = 64;              // the draws submitted last (two batches), logged when the card does not finish them
 	char mRecent[kRecent][192] {};
 	uint32_t mRecentAt { 0 };
 	// Draws not run in this stats period, and the first one's reason and fragment function: what is missing on screen.
@@ -1661,6 +1662,7 @@ bool RDNA4PvHost::batchDraw(const uint32_t *ib, uint32_t dwords, uint32_t task, 
 	if (!mBatchDraws && mBatchFence[slot] && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(mBatchFence[slot])))
 		waitFor(mBatchFence[slot]);   // the slot's IB still read by the card
 
+	mBatchedAt = mBatchIb.gpu + static_cast<uint64_t>(slot) * kBatchBytes + mBatchDwords * 4;
 	memcpy(mBatchIb.cpu + static_cast<uint64_t>(slot) * kBatchBytes + mBatchDwords * 4, ib, dwords * 4);
 	mBatchDwords += dwords;
 	mBatchDirty[mBatchDraws++] = task << 16 | (target & 0xffff);
@@ -4631,8 +4633,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			       name[2], staged, newCode);
 
 		if (r == kIOReturnSuccess) {   // described for a hang
-			snprintf(mRecent[mRecentAt], sizeof(mRecent[0]), "fence %llu: task %u, target %u (%ux%u, %s), \"%s\" / \"%s\", %u x %u, "
-			         "fragment textures %u %u %u %u", static_cast<unsigned long long>(fence), task, target, width, height,
+			snprintf(mRecent[mRecentAt], sizeof(mRecent[0]), "%s %llx: code %u%s, task %u, target %u (%ux%u, %s), \"%s\" / \"%s\", %u x %u, "
+			         "fragment textures %u %u %u %u", batched ? "batched at" : "fence", static_cast<unsigned long long>(batched ? mBatchedAt : fence),
+			         pair, newCode ? " (new)" : "", task, target, width, height,
 			         inPlace ? "in place" : held ? "held" : "staged", name[1], name[2], count, draw.instances, bound[1].texture[0],
 			         bound[1].texture[1], bound[1].texture[2], bound[1].texture[3]);
 			mRecentAt = (mRecentAt + 1) % kRecent;
