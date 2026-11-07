@@ -3929,8 +3929,30 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			slot = PresentSlot {};
 	RtClient *c = clientFor(owner);
 	rdna4Step("rtRelease: draining gfx work, unmapping buffers");
-	if (c && c->gfxOutstanding)
+	const bool gfxBusy = c && c->gfxOutstanding;
+
+	if (gfxBusy)
 		gfxClientDrain(*c, "client close");   // W12k: before its buffers and page tables go away
+
+	// The jobs on a shared compute queue too, before the buffers they use go (they were waited for after it, and a job still running
+	// wrote memory given to the next owner)
+	bool computeDone = true;
+
+	if (c && vmEnabled && c->shared && c->ibOutstanding) {
+		const uint32_t want = c->fence;
+
+		for (uint32_t ms = 0; ms < 500 && !fenceReached(*c->fenceCpu, want); ms++)
+			IOSleep(1);
+		computeDone = fenceReached(*c->fenceCpu, want) || recoverSharedQueue(c->sq, c->vmid, "client close");
+	}
+
+	// Work that could not be ended may still read and write the client's memory: it is left allocated (and its VMID taken) rather than
+	// handed to someone else. A wedged gfx ring halted the CP, but a wave stuck in a shader still runs.
+	if (c && ((gfxBusy && gfxWedged) || !computeDone)) {
+		quarantineLocked(owner, *c);
+		return;
+	}
+
 	uint32_t nb = 0, np = 0;
 	bool hostUnmapped = false;
 	for (RtBuffer &b : buffers) {
@@ -3982,14 +4004,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		if (c->shared) {
 			/* No HQD to dequeue. Jobs still in flight on the shared queue must finish before the tables go: wait (bounded) for
 			 * the client's fence, and recover the queue (kill this VMID's waves) if they do not. */
-			vmOpTrace("release (shared)", c->vmid, c->pipe, c->queue);
-			if (c->ibOutstanding) {
-				const uint32_t want = c->fence;
-				for (uint32_t ms = 0; ms < 500 && !fenceReached(*c->fenceCpu, want); ms++)
-					IOSleep(1);
-				if (!fenceReached(*c->fenceCpu, want))
-					(void)recoverSharedQueue(c->sq, c->vmid, "client close");
-			}
+			vmOpTrace("release (shared)", c->vmid, c->pipe, c->queue);   // its jobs were waited for before its buffers went
 			rdna4Step("rtRelease: shared client, VM context off");
 			if (vmShared == 2)
 				vmReleaseVmids(*c);    // every VMID the client owns: context off, IH LUT cleared, flushed, back to the pool
@@ -4047,6 +4062,30 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	} else if (c) {
 		*c = RtClient {};
 	}
+}
+
+/* A closing client whose GPU work could not be ended: its buffers and programs kept allocated under a sentinel owner no client has, its slot
+ * and VMID kept taken, so nothing of it is handed out again while the work may still touch it. Leaked until the next bring-up. */
+void RDNA4Compute::quarantineLocked(const void *owner, RtClient &c) {
+	static const char kQuarantined = 0;
+	uint32_t nb = 0, np = 0;
+
+	for (RtBuffer &b : buffers) {
+		if (b.owner == owner) {
+			b.owner = &kQuarantined;
+			nb++;
+		}
+	}
+
+	for (RtProgram &p : programs) {
+		if (p.owner == owner) {
+			p.owner = &kQuarantined;
+			np++;
+		}
+	}
+
+	c.owner = &kQuarantined;
+	RLOG("vmid %u: client closed with GPU work that did not end: %u buffer(s), %u program(s) and the VMID kept, not reused", c.vmid, nb, np);
 }
 
 void RDNA4Compute::powerWillSleep() {

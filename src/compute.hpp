@@ -1105,6 +1105,7 @@ private:
 	void     gfxClientWedge(const char *why);
 	bool     gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why);   // end one address space's hung work
 	void     gfxClientDrain(RtClient &client, const char *why);
+	void     quarantineLocked(const void *owner, RtClient &client);
 	void     gfxClientReset();                             // a fresh gfx ring: nothing is pending
 	bool     gfxClientSelfTest();                          // rdna4-gfxclient=1 (bring-up thread)
 	static bool requestedGfxClient();
