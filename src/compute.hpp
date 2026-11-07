@@ -1101,7 +1101,8 @@ private:
 	IOReturn gfxClientReady() const;                       // kIOReturnSuccess when a client may use the ring now
 	void     gfxClientRetire(RtClient &client);
 	IOReturn gfxClientEmit(RtClient &client, uint64_t ibVa, uint32_t dwords, uint32_t &fence);
-	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why);
+	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why, bool pause = false);
+	bool     pauseUnlocked(const RtClient &client, const void *owner);
 	void     gfxClientWedge(const char *why);
 	bool     gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why);   // end one address space's hung work
 	void     gfxClientDrain(RtClient &client, const char *why);

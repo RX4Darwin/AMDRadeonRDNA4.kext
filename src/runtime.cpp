@@ -3345,8 +3345,10 @@ IOReturn RDNA4Compute::rtWaitFence(const void *owner, uint32_t fence, uint32_t t
 			}
 			if (polls < 200)
 				IODelay(10);
-			else
-				IOSleep(1);
+			else if (!pauseUnlocked(*c, owner) && c->owner != owner)
+				return kIOReturnNotOpen;   // closed while it waited: its jobs went with it
+			else if (waitAborted)
+				break;                     // asleep meanwhile: ended as a requested sleep ends it
 		}
 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	}
@@ -3567,7 +3569,24 @@ IOReturn RDNA4Compute::gfxClientEmit(RtClient &c, uint64_t ibVa, uint32_t dwords
 }
 
 /* Poll `c`'s gfx fence dword; on a timeout the ring is wedged (see above). rtLock is held for the wait, like rtWaitFence's. */
-bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why) {
+/* A millisecond of a long wait without rtLock, so other clients, the displays' flips and power management are not held up by it. False
+ * when the waiting client was closed meanwhile (its slot is free or another owner's: what the caller held of it is stale), or when the
+ * hardware went to sleep in it (waitAborted set, as a requested sleep ends a wait). */
+bool RDNA4Compute::pauseUnlocked(const RtClient &c, const void *owner) {
+	IOLockUnlock(rtLock);
+	IOSleep(1);
+	IOLockLock(rtLock);
+
+	if (powerSleeping)
+		waitAborted = true;
+
+	return c.owner == owner && !powerSleeping;
+}
+
+/* `pause`: the caller holds rtLock and nothing of the client's but the client itself; the lock is let go between the polls after the first
+ * 2 ms (pauseUnlocked). */
+bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why, bool pause) {
+	const void *owner = c.owner;
 	const uint64_t t0 = mach_absolute_time();
 	uint64_t span = 0;
 	nanoseconds_to_absolutetime(static_cast<uint64_t>(timeoutMs) * 1000000, &span);
@@ -3582,10 +3601,14 @@ bool RDNA4Compute::gfxClientWait(RtClient &c, uint32_t fence, uint32_t timeoutMs
 			RLOG("vmid %u: gfx fence %u wait aborted: a sleep was requested (%s)", c.vmid, fence, why);
 			return false;
 		}
-		if (polls < 200)
+		if (polls < 200) {
 			IODelay(10);
-		else
+		} else if (!pause) {
 			IOSleep(1);
+		} else if (!pauseUnlocked(c, owner)) {
+			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+			return false;   // closed or asleep while it waited: nothing to recover
+		}
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
 	if (done) {
@@ -3682,8 +3705,10 @@ IOReturn RDNA4Compute::rtWaitGfxFence(const void *owner, uint32_t fence, uint32_
 	if (gfxWedged)
 		return kIOReturnNotResponding;
 	waitAborted = false;
-	if (gfxClientWait(*c, fence, timeoutMs ? timeoutMs : 1000, ns, "IB wait"))
+	if (gfxClientWait(*c, fence, timeoutMs ? timeoutMs : 1000, ns, "IB wait", true))
 		return kIOReturnSuccess;
+	if (c->owner != owner)
+		return kIOReturnNotOpen;
 	if (waitAborted) {                               // P7
 		waitAborted = false;
 		return kIOReturnAborted;
