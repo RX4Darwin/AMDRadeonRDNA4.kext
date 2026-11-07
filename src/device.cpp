@@ -11,6 +11,7 @@
 #include "dpphy.hpp"
 #include "edid.hpp"
 #include "dmub.hpp"
+#include "sku.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <kern/clock.h>
@@ -1996,8 +1997,11 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	hwCursorRequested = PE_parse_boot_argn("rdna4-cursor", &cursor, sizeof(cursor)) && cursor != 0;
 	if (hwCursorRequested)
 		FBLOG("cursor: hardware cursor requested by rdna4-cursor=1");
-	const char *model = (vd >> 16) == 0x7551 ? "AMD Radeon AI PRO R9700"
-	                                         : "AMD Radeon RX 9070 XT";
+
+	const uint16_t device = static_cast<uint16_t>(vd >> 16);
+	const uint8_t revision = pciDevice->configRead8(kIOPCIConfigRevisionID);
+	const char *model = Sku::modelName(device, revision);
+
 	if (!isAmd)
 		model = "VM test (vmware-svga)";
 	else
