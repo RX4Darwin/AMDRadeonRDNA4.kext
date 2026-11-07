@@ -47,6 +47,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <IOKit/IOKitLib.h>
 #include <array>
+#include <grp.h>
 #include <map>
 #include <string>
 #include <unistd.h>
@@ -1412,6 +1413,19 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 	return "";
 }
 
+// A stream that could not be opened writes to fd -1 and aborts the helper in its destructor; nobody may not write a directory root made.
+static void dumpFile(const std::string &path, StringRef bytes) {
+	std::error_code ec;
+	raw_fd_ostream out(path, ec, sys::fs::OF_None);
+
+	if (ec)
+		return;
+
+	out << bytes;
+	out.close();
+	out.clear_error();
+}
+
 // With AIR2AMDGPU_DUMP set to a directory: each request's library and what became of it, <request>-<name>.metallib and .rgfx, for
 // translating them again by hand (air2amdgpu <lib> <name> <out>) and disassembling them.
 static void dump(uint64_t req, const char *name, StringRef lib, const std::string &out) {
@@ -1421,9 +1435,9 @@ static void dump(uint64_t req, const char *name, StringRef lib, const std::strin
 		return;
 
 	const std::string base = std::string(dir) + "/" + std::to_string(req) + "-" + name;
-	std::error_code ec;
-	raw_fd_ostream(base + ".metallib", ec, sys::fs::OF_None) << lib;
-	raw_fd_ostream(base + ".rgfx", ec, sys::fs::OF_None) << out;
+
+	dumpFile(base + ".metallib", lib);
+	dumpFile(base + ".rgfx", out);
 }
 
 // The translations of earlier runs, by library, function and this build of the translator: WindowServer asks for its 70-odd shaders on every
@@ -1469,6 +1483,14 @@ static void keep(StringRef lib, const char *name, const Kernel &k) {
 
 		out.write(reinterpret_cast<const char *>(head), sizeof(head));
 		out << k.hsaco;
+		out.close();
+
+		if (out.has_error()) {   // a full disk: no cache entry, and no abort in the stream's destructor
+			out.clear_error();
+			sys::fs::remove(tmp);
+
+			return;
+		}
 	}
 
 	sys::fs::rename(tmp, path);   // whole files only: a reader never sees half of one
@@ -1490,6 +1512,16 @@ static int serve() {
 		sleep(1);   // the host holds WindowServer's first draws until the helper is there
 	}
 	errs() << "air2amdgpu: connected\n";
+
+	// Root only opens the door (the kext lets no one else): the metallibs any app sends are parsed and compiled as nobody, who may write
+	// the cache and nothing else of the system's.
+	constexpr uid_t kNobody = static_cast<uid_t>(-2);
+	sys::fs::create_directories(kCacheDir);
+	if (chown(kCacheDir, kNobody, static_cast<gid_t>(-2)) || setgroups(0, nullptr) || setgid(static_cast<gid_t>(-2)) || setuid(kNobody) ||
+	    !setuid(0))
+		return fail("could not drop root after connecting");
+	errs() << "air2amdgpu: running as nobody\n";
+
 	std::vector<char> lib(RDNA4_MTLC_MAX_LIB);
 	for (;;) {
 		const uint64_t in[2] = {reinterpret_cast<uint64_t>(lib.data()), lib.size()};
