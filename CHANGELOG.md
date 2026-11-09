@@ -5,6 +5,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.1.0 (on `next`, no number yet)
 
+**Cards**
+- The RX 9070 (device 0x7550, PCI revision 0xC3) is told apart from the RX 9070 XT (0xC0): System Report and
+  ioreg name it "AMD Radeon RX 9070", and the fake paravirtual GPU reports its 56 compute units instead of 64
+  (`src/sku.hpp`). The display paths of a Sapphire RX 9070 (1DA2:E489, VBIOS `2E489 Navi48 XT`) were read from its
+  ROM and are the XT board's four (DP on HPD1/2, HDMI on HPD3/4), so the second-display tables apply unchanged; it
+  uses the same firmware as the XT (the kicker variants are for revision 0xC8). Runs on a Sapphire RX 9070 under
+  macOS Sequoia 15.8.2.
+
 **Compute runtime**
 - Address spaces lent per job (`rdna4-vmshared=2`), which lifts the 1 GiB limit of a client's address space, ran
   on the card for the first time on 2026-10-12: the diagnostic script's table all PASS, and the full benchmark in a

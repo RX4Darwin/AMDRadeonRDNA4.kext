@@ -16,6 +16,7 @@ static_assert(Gfx12Draw::kRingBytes == Gfx12DrawCol::kColRingBytes, "one ring bl
 #include "../userspace/rdna4-run/gfx12trirun.h"
 #include "rdna4compute.h"
 #include "rdna4mtlc.h"
+#include "sku.hpp"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOInterruptEventSource.h>
@@ -41,9 +42,12 @@ namespace {
 
 constexpr uint32_t kLoggedCmds = 1500;    // FIFO commands logged one by one
 constexpr uint32_t kMaxLogLines = 30000;   // M1 reads the protocol from this log (docs/m1-stream.md)
-// Compute units of the card behind GpuCoreCount: RX 9070 XT (Navi 48) has 64. From the product specification, not read from the card (the kext's IP discovery
-// exposes shader-engine and render-backend counts only).
-constexpr uint32_t kGpuCoreCount = 64;
+// GpuCoreCount: the compute units of the card, 64 on the RX 9070 XT and 56 on
+// the RX 9070 (sku.hpp). From the product specification, not read from the
+// card: the kext's IP discovery has shader-engine and render-backend counts
+// only. publish() sets it from the GPU the nub hangs under; a VM without the
+// card keeps the XT's.
+uint32_t gGpuCoreCount { Sku::computeUnits(Sku::kNavi48, Sku::kRevRx9070Xt) };
 uint32_t gLogLines { 0 };
 RDNA4PvNub *gNub { nullptr };
 IOService *gLateParent { nullptr };   // RDNA4PvNub::setLateParent
@@ -1875,13 +1879,13 @@ void RDNA4PvHost::answerDeviceInfo(const pvstream::FifoCommand &c, const uint8_t
 		OSSafeReleaseNULL(desc);
 		return;
 	}
-	const size_t pairs = pvstream::buildDeviceInfoReply(reinterpret_cast<uint8_t *>(map->getVirtualAddress()), bytes, kGpuCoreCount);
+	const size_t pairs = pvstream::buildDeviceInfoReply(reinterpret_cast<uint8_t *>(map->getVirtualAddress()), bytes, gGpuCoreCount);
 	__sync_synchronize();
 	map->release();
 	desc->release();
 	mReplies++;
 	pvlog("host: GetDeviceInfo answered: reply buffer page 0x%x (%u bytes, %u pair slots), %u pairs written, GpuCoreCount %u", page, bytes, bytes / 8,
-	      static_cast<unsigned>(pairs), kGpuCoreCount);
+	      static_cast<unsigned>(pairs), gGpuCoreCount);
 }
 
 // DisplaySetupSharedState (FIFO 0x01, AppleParavirtDisplayPipe::setupSharedState): {u32 port, u32 page}. After its wait the driver asserts that the host wrote the
@@ -2403,7 +2407,7 @@ void RDNA4PvHost::selfTest() {
 		testCheck(mReplies == 1, "host answered GetDeviceInfo once");
 		// the reply: exactly what buildDeviceInfoReply gives, and Apple's parser (mirror) reads it into the struct the Metal bundle will see
 		uint8_t expect[0x1000];
-		pvstream::buildDeviceInfoReply(expect, sizeof(expect), kGpuCoreCount);
+		pvstream::buildDeviceInfoReply(expect, sizeof(expect), gGpuCoreCount);
 		const uint8_t *reply = static_cast<const uint8_t *>(mTestReply->getBytesNoCopy());
 		testCheck(memcmp(reply, expect, sizeof(expect)) == 0, "GetDeviceInfo reply buffer holds the documented key/value pairs");
 		uint8_t info[pvstream::kDeviceInfoBytes] = {};
@@ -2412,8 +2416,8 @@ void RDNA4PvHost::selfTest() {
 		memcpy(&msaa, info + 0x00, 4);
 		memcpy(&gpuCores, info + 0x84, 4);
 		memcpy(&shaderVersion, info + 0x44, 4);
-		testCheck(msaa == 4 && info[0xac] == 1 && gpuCores == kGpuCoreCount && info[0xcd] == 1 && info[0xb5] == 0 && shaderVersion == 0x20002,
-		          "parseDeviceInfo (mirror): MSAASamples 4, GpuCoreCount 64, DeserializerVersion undefined, shader version defaulted to 2.2");
+		testCheck(msaa == 4 && info[0xac] == 1 && gpuCores == gGpuCoreCount && info[0xcd] == 1 && info[0xb5] == 0 && shaderVersion == 0x20002,
+		          "parseDeviceInfo (mirror): MSAASamples 4, GpuCoreCount of the card, DeserializerVersion undefined, shader version defaulted to 2.2");
 		// the completion: stamp 0 = the command's signal, the way IOAccelEventMachine2 tests it
 		testCheck(*reinterpret_cast<const volatile uint32_t *>(fifo) == 2, "stamp[0] == 2 in the FIFO page (the last signal of the batch: GetDeviceInfo 1, display 2)");
 		uint16_t port16;
@@ -2778,6 +2782,15 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 		return false;
 	}
 	gNub = nub;   // keeps the creation reference: never released
+
+	IOPCIDevice *gpu = OSDynamicCast(IOPCIDevice, parent);
+	if (gpu && gpu->configRead16(kIOPCIConfigVendorID) == 0x1002) {
+		const uint16_t device = gpu->configRead16(kIOPCIConfigDeviceID);
+		const uint8_t revision = gpu->configRead8(kIOPCIConfigRevisionID);
+
+		gGpuCoreCount = Sku::computeUnits(device, revision);
+	}
+
 	nub->registerService();
 	pvlog("registerService returned");
 	pvPause();

@@ -808,20 +808,42 @@ IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSOb
 	return ret;
 }
 
+// Head 0's framebuffer: on the GPU itself, or on a "display" nub IONDRVSupport hangs under it (the B550 board of 2026-11:
+// there, missing it left the head refused for good, its pipe scanning stale VRAM). The head's own nub is skipped; of
+// several, the oldest: the boot display's comes first, other "display" nubs' framebuffers only once the device is up.
+IOService *bootFramebuffer(IOPCIDevice *pci, IOService *headNub) {
+	IOService *best = nullptr;
+	auto consider = [&](OSObject *o) {
+		auto *fb = OSDynamicCast(IOService, o);
+		if (fb && fb->metaCast("IONDRVFramebuffer") && (!best || fb->getRegistryEntryID() < best->getRegistryEntryID()))
+			best = fb;
+	};
+	if (OSIterator *clients = pci->getClientIterator()) {
+		while (OSObject *client = clients->getNextObject()) {
+			consider(client);
+			auto *nub = OSDynamicCast(IOService, client);
+			if (!nub || nub == headNub)
+				continue;
+			if (OSIterator *fbs = nub->getClientIterator()) {
+				while (OSObject *fb = fbs->getNextObject())
+					consider(fb);
+				fbs->release();
+			}
+		}
+		clients->release();
+	}
+	return best;
+}
+
 // The stand-in for IOBootNDRV::doDriverIO.
 IOReturn head2DriverIO(void *contents, UInt32 commandCode, uint16_t &code) {
 	if (!head2->ready) {
 		// macOS opened this head before head 0: build head 0's device, which
 		// is where the EDID and the console geometry come from, now.
-		IOService *fb0 = nullptr;
-		if (OSIterator *clients = head2->pci->getClientIterator()) {
-			while (OSObject *client = clients->getNextObject())
-				if (client->metaCast("IONDRVFramebuffer")) {
-					fb0 = static_cast<IOService *>(client);
-					break;
-				}
-			clients->release();
-		}
+		IOService *fb0 = bootFramebuffer(head2->pci, head2->nub);
+		if (fb0)
+			FBLOG("head2: opened before head 0: building head 0's device through framebuffer %p on %s", fb0,
+			     fb0->getProvider() ? fb0->getProvider()->getName() : "-");
 		FbEntry *e0 = fb0 ? fbEntry(fb0) : nullptr;
 		if (e0 && e0->ours && !e0->tried)
 			attach(*e0);
