@@ -4320,7 +4320,7 @@ static int testVmTableDifferential() {
 			P.setFailSync(false);
 
 			// 6. fuzz: random histories, seeded
-			Rng r { 0x9e3779b97f4a7c15ull ^ (static_cast<uint64_t>(fbOffset) << 7) ^ reinterpret_cast<uintptr_t>(pol.name) };
+			Rng r { 0x9e3779b97f4a7c15ull ^ (static_cast<uint64_t>(fbOffset) << 7) ^ static_cast<uint64_t>(&pol - kPolicies) };   // the same histories every run
 			P.reopen();
 			for (uint32_t op = 0; op < 160; op++) {
 				const uint64_t kind = r.below(100);
