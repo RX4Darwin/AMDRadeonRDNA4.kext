@@ -458,6 +458,7 @@ private:
 		uint8_t hubp, otg, queued, mode;   // otg: the one hubp feeds; mode: rdna4_pvpresent when it was set up
 		uint32_t triedW, triedH;      // the frame size a mode switch was last tried for
 		bool flips;
+		bool paused;                  // flipping stopped while a frame went by the CPU; the next frame on the card resumes it
 	};
 	static constexpr uint32_t kScanoutPorts = 8;
 	static constexpr uint32_t kPresentIbBytes = 64 * 1024;
@@ -488,6 +489,7 @@ private:
 	bool grabBuffer(uint64_t bytes);
 	void scanoutHome(ScanoutMap &sm, uint64_t mc);
 	void dropScanout(ScanoutMap &sm);
+	void pauseFlips(ScanoutMap &sm);
 	bool clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_t bytes, uint32_t pattern);
 	GfxBuffers mFillCode {};   // nggfill.s and psfill.s, as a shader pair's slot
 	bool clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_t pitch, uint32_t width, uint32_t height, bool half, bool bgra,
@@ -5618,7 +5620,7 @@ void RDNA4PvHost::presentTransaction(const pvstream::FifoCommand &c, const uint8
 		void *s = retainSurface(surface);
 
 		if (port < kScanoutPorts && mScanout[port].flips)   // into the head's own surface, which the HUBP must read then
-			dropScanout(mScanout[port]);
+			pauseFlips(mScanout[port]);
 
 		cardToMemory(s);
 		if (s)
@@ -5725,6 +5727,11 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 		sm.bytes = scanBytes;
 		sm.mode = static_cast<uint8_t>(gPresentOnCard);
 		setUpFlips(sm, port);
+	}
+
+	if (sm.paused) {   // the frame before went by the CPU: this one is flipped again
+		sm.paused = false;
+		sm.flips = sm.mc[1] && sm.mc[2];
 	}
 
 	const uint64_t base = md ? gSurfaceFns.baseOffset(s) : 0, bpr = md ? gSurfaceFns.bytesPerRow(s) : 0;
@@ -6087,7 +6094,23 @@ void RDNA4PvHost::scanoutHome(ScanoutMap &sm, uint64_t mc)
 		IOSleep(1);
 }
 
-// A port's scanout given up (the head moved, or frames go by the CPU): what the HUBP reads is the head's own surface again.
+// Flipping stopped while a frame goes by the CPU into the head's own surface: the HUBP reads that again, the mapping and the two buffers
+// stay for the next frame on the card. Giving them up here set them up anew for every frame when the two paths alternated (511 times in
+// a boot on Tahoe, each with two scanout-sized buffers filled).
+void RDNA4PvHost::pauseFlips(ScanoutMap &sm)
+{
+	PvScanout::Head h;
+	uint8_t hubp = 0;
+	uint64_t mc = 0;
+	const uint32_t port = static_cast<uint32_t>(&sm - mScanout);
+
+	// where the head is now, if it moved: the HUBP the display code set up reads that
+	scanoutHome(sm, PvScanout::head(port, h) && gCompute->rtScanoutHubp(h.phys, hubp, mc) ? mc : sm.mc[0]);
+	sm.flips = false;
+	sm.paused = true;
+}
+
+// A port's scanout given up (the head moved): what the HUBP reads is the head's own surface again.
 void RDNA4PvHost::dropScanout(ScanoutMap &sm)
 {
 	PvScanout::Head h;
