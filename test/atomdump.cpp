@@ -4426,8 +4426,13 @@ struct Pair {
 		(a ? okHost : failedHost)++;
 		compare("mapHost", a, b);
 	}
+	// The new code stops unmapping at the end of the dense image, as map() refuses past it; the pre-S8 code clears and syncs
+	// table pages beyond (0x203000 and up), so it is given only the part of the range below the end.
 	void unmap(uint64_t va, uint64_t bytes) {
-		legacyVmUnmap(ref, va, bytes);
+		const uint64_t limit = GpuVm::kVaStart + GpuVmTable::denseVa(kTableBytes);
+
+		if (va < limit)
+			legacyVmUnmap(ref, va, bytes < limit - va ? bytes : limit - va);
 		newVmUnmap(nw, va, bytes);
 		unmaps++;
 		compare("unmap", true, true);
