@@ -1259,6 +1259,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x1d8, blend[2] ? first.opt : 0x06000600u},                 // SX_MRT0_BLEND_OPT: else BLEND_DISABLED
 		{0x69, 0x214, noColour ? 0 : split ? mask & 7 : mask},             // CB_TARGET_MASK
 		{0x69, 0x195, noColour ? 0u : 9u},                                 // SPI_SHADER_COL_FORMAT: 32_ABGR, or none
+		// DB_SHADER_CONTROL: a shader without a colour writes memory, which runs only with EXEC_ON_HIER_FAIL and EXEC_ON_NOOP, after the depth
+		// test (LATE_Z; RADV's for writes_memory, gfx12.json); else the template's EARLY_Z_THEN_LATE_Z
+		{0x69, 0x1b, noColour ? 0x600u : 0x10u},
 	};
 	for (const Patch &pt : patch)
 		if (uint32_t *d = n ? streamReg(ib, n, pt.opcode, pt.reg) : nullptr)
