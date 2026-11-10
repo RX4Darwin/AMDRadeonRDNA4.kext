@@ -1928,8 +1928,17 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			d = {w[1] >> 16, w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, 0, 0, 0, 0, {}};
 		else if (id == 0x005)
 			d = {w[2], w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, w[1] >> 16, 0, 0, 0, {}};
-		else if (id == 0x007 || id == 0x009)
-			d = {type, 0, w[2] & 0xffff, id == 0x009 ? w[3] : 1, 0, w[1], w[2] >> 16, indexBytes, {}};
+		else if (id == 0x007 || id == 0x009) {
+			// 0x009's instances are a u16 as 0x003's and 0x005's: RenderBox's plane draws on Tahoe carry 0x0202 above them (0x02020001), and
+			// taken whole 33685505 instances of a quad held the ring until it was given up (2026-11-10). What the upper half is: logged.
+			d = {type, 0, w[2] & 0xffff, id == 0x009 ? w[3] & 0xffff : 1, 0, w[1], w[2] >> 16, indexBytes, {}};
+
+			static uint32_t upperLines;
+
+			if (id == 0x009 && (w[3] >> 16) && upperLines++ < 8)
+				pvstat("host: render: task %u pipeline %u: drawIndexedPrimitives with 0x%04x above its %u instance(s) (%08x %08x %08x %08x)",
+				       t->task, t->renderPipeline, w[3] >> 16, w[3] & 0xffff, w[0], w[1], w[2], w[3]);
+		}
 		else if (id == 0x006)
 			d = {type, 0, w[2], 1, 0, w[1], w[4], indexBytes, {}};
 		if ((id == 0x000 && (w[2] || w[4])) || (id == 0x006 && (w[3] || w[5])))
@@ -4194,7 +4203,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	                : draw.indexBytes && draw.start ? "a base vertex in an indexed draw (so far)"
 	                : !count ? "no vertices"
 	                // GE_MAX_VTX_INDX is 0xffffffff: 2^24 is what 64 MiB of staged 32-bit indices hold (65535 was the first triangle's)
-	                : count > (1u << 24) ? "more than 2^24 vertices" : nullptr;
+	                : count > (1u << 24) ? "more than 2^24 vertices"
+	                // as many vertices over all instances: more holds the ring until the wait gives it up, and a gfx ring here cannot be reset
+	                : static_cast<uint64_t>(count) * draw.instances > (1u << 24) ? "more than 2^24 vertices over its instances" : nullptr;
 	const Jit *shader[3] = {};
 	char name[3][64] = {};
 	for (unsigned k = 1; k <= 2 && !why; k++) {
