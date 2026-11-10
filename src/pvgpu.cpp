@@ -691,6 +691,7 @@ private:
 	void drewInto(const OSObject *surface, uint32_t task, uint64_t at, const Draw &draw, uint32_t width, uint32_t height, uint32_t bpp);
 	uint32_t mCardFills { 0 }, mCardFlushes { 0 };   // shadows on the card filled and written back by the card, for the draw stats
 	bool shadowTexture(uint32_t task, uint32_t id, const TextureSource &src, uint32_t bpp, uint64_t &gpu, uint32_t &pitch);
+	bool copyHeld(uint32_t width, uint32_t height, uint32_t bpp, uint64_t &gpu, uint32_t &pitch);
 	uint64_t texturePrint(uint32_t task, const TextureSource &src, uint32_t bpp);
 	void dropShadows(const OSObject *surface, uint32_t task, uint64_t at, bool all = false);
 	void clearShadows(const OSObject *surface, uint32_t task, uint64_t at, uint32_t tex, uint32_t pattern);
@@ -2989,7 +2990,12 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		// wrote it back and loaded it again).
 		const CardSurface *card = src.surface.memory ? cardSurface(src.surface.surface) : nullptr;
 		const bool feedback = mDrawTarget && id == mDrawTarget && depth == 1 && used <= kShadowMax && !(card && card->loaded);
-		const bool shadowed = (large || feedback) && !(gInPlace & 16) && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch);
+		// The held target itself: its shadow on the card holds what the draws before wrote, part of it still in the colour block's caches.
+		// Sampled in place it read what was not written back yet: CoreAnimation's menus came up opaque and turned translucent a part
+		// at a time (2026-11-10). A copy made after them instead, as for any other feedback read.
+		const bool heldCopy = feedback && mHeld.active && mHeld.task == task && mHeld.target == id && !(gInPlace & 16) &&
+		                      copyHeld(w, h, fm->bpp, gpu, shadowPitch);
+		const bool shadowed = heldCopy || ((large || feedback) && !(gInPlace & 16) && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch));
 		const bool inPlace = !shadowed && !feedback && (gInPlace & 1) && kind && depth == 1 && pitched && based;   // a copy at least
 
 		if (inPlace && (src.surface.memory ? onCard(src.surface, used, gpu) || mapMemory(src.surface.memory, src.surface.base, used, out[k].handle, gpu)
@@ -3384,6 +3390,28 @@ void RDNA4PvHost::drewInto(const OSObject *surface, uint32_t task, uint64_t at, 
 		s.dirty[2] = none || x1 > s.dirty[2] ? x1 : s.dirty[2];
 		s.dirty[3] = none || y1 > s.dirty[3] ? y1 : s.dirty[3];
 	}
+}
+
+// The held target as the draws before left it, for a draw that samples it: copied from its shadow by the card in the ring after them
+// (the idle barrier writes their colour caches back), into the staging pool. False when it is not of that size and pixel, or too
+// large for a piece of the pool: the held shadow is then read in place, as before.
+bool RDNA4PvHost::copyHeld(uint32_t width, uint32_t height, uint32_t bpp, uint64_t &gpu, uint32_t &pitch)
+{
+	const Shadow &s = *mHeld.shadow;
+	const uint64_t bytes = static_cast<uint64_t>(s.pitch) * s.height;
+	uint64_t copy = 0;
+	uint8_t *cpu = nullptr;
+
+	if (s.width != width || s.height != height || s.bpp != bpp || s.depth > 1)
+		return false;
+
+	if (!poolTake(bytes, copy, cpu) || !rowsOnCard(s.gpu, s.pitch, copy, s.pitch, s.pitch, s.height))
+		return false;
+
+	gpu = copy;
+	pitch = s.pitch;
+
+	return true;
 }
 
 // A texture the card cannot read in place, read from its shadow: the one kept while it holds what the guest has, else filled anew.
