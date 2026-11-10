@@ -748,7 +748,8 @@ struct Kernel {
 
 // A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
 // (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
-// u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes (bit 31: a fragment shader without a colour)}, then the code
+// u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes (bits 0-15 the values between the stages; bits 20-27 the colour attachments
+// written when several, chosen by the host; bits 28-30 the one attachment other than 0 written; bit 31: a fragment shader without a colour)}, then the code
 // (relocation-free, the entry at its start), then per attribute
 // {u32 hash of its AIR name (FNV-1a), u32 flags: bit 0 flat, bit 1 the point's coordinate (no name)}: the vertex function's outputs in ring-slot order, the fragment function's
 // inputs in hardware-input order; the host matches them by name (SPI_PS_INPUT_CNTL_n).
@@ -885,6 +886,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	// coverage and a CoreAnimation mask write a half2 to attachment 1 only, Tahoe 26.6.2): the host draws into that attachment's texture.
 	int attachment = -1, other = -1, otherIndex = 0;
 	unsigned others = 0;
+	int memberOf[8] = {-1, -1, -1, -1, -1, -1, -1, -1};   // the struct member of each colour attachment it writes
 	for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
 		const auto *o = cast<MDNode>(outputs->getOperand(k));
 		const std::string kind = mdString(o, 0);
@@ -895,11 +897,13 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		else if (vertex && kind == "air.point_size")
 			continue;   // only triangles are drawn: a point's size is not used
 		else if (!vertex && kind == "air.render_target" && mdInt(o, 1) == 0) {
+			memberOf[0] = static_cast<int>(k);
 			colourMember = k;
 			colourZero = colourType(air->getReturnType());
 			attachment = 0;
 		} else if (!vertex && kind == "air.render_target" && mdInt(o, 1) > 0 && mdInt(o, 1) < 8) {
 			others++;
+			memberOf[mdInt(o, 1)] = static_cast<int>(k);
 			other = static_cast<int>(k);
 			otherIndex = static_cast<int>(mdInt(o, 1));
 		} else if (!(!vertex && kind == "air.render_target")) {
@@ -910,6 +914,18 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		colourMember = static_cast<unsigned>(other);
 		colourZero = colourType(air->getReturnType());
 		attachment = otherIndex;
+	}
+	// Several attachments of colour types (RenderBox's paint shaders on Tahoe write a colour and a coverage; the pipeline may mask either
+	// off): each exported as the host says (RDNA4_MTLC_TABLE_ATTACHMENT), into that attachment's texture; header bits 20-27.
+	uint32_t writes = 0;
+	if (!vertex && !noColour && air->getReturnType()->isStructTy()) {
+		const unsigned chosen = colourMember;
+		for (unsigned n = 0; n < 8; n++) {
+			colourMember = memberOf[n] < 0 ? ~0u : static_cast<unsigned>(memberOf[n]);
+			writes |= memberOf[n] >= 0 && colourType(air->getReturnType()) ? 1u << n : 0;
+		}
+		colourMember = chosen;
+		writes = __builtin_popcount(writes) > 1 ? writes : 0;
 	}
 	if (!vertex && !noColour && !colourZero) {
 		// what the function returns and each output's kind and index, for adding the case
@@ -1180,9 +1196,15 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			Value *undef = PoisonValue::get(f32);   // has no null target; the host sets SPI_SHADER_COL_FORMAT to none)
 			b.CreateIntrinsic(Intrinsic::amdgcn_exp, {f32}, {b.getInt32(0), b.getInt32(0), undef, undef, undef, undef, b.getTrue(), b.getTrue()});
 		} else {
-			if (colour->getType()->isStructTy())
-				colour = b.CreateExtractValue(colour, colourMember);
-			exportF32(0, toVec4(colour), true);   // mrt0: as four floats (half widened; missing components 0, alpha 1)
+			Value *out = toVec4(colour->getType()->isStructTy() ? b.CreateExtractValue(colour, colourMember) : colour);
+			if (writes) {   // the attachment the host draws into, from the table
+				Value *at = b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(RDNA4_MTLC_TABLE_ATTACHMENT)), PointerType::get(ctx, 4));
+				Value *sel = b.CreateAlignedLoad(i32, at, Align(4));
+				for (unsigned n = 0; n < 8; n++)
+					if ((writes >> n & 1) && static_cast<unsigned>(memberOf[n]) != colourMember)
+						out = b.CreateSelect(b.CreateICmpEQ(sel, b.getInt32(n)), toVec4(b.CreateExtractValue(colour, static_cast<unsigned>(memberOf[n]))), out);
+			}
+			exportF32(0, out, true);   // mrt0: as four floats (half widened; missing components 0, alpha 1)
 		}
 	}
 	b.CreateRetVoid();
@@ -1237,7 +1259,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (code.empty() || !regs[0])
 		return "no code or no register values in the shader object";
 	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3],
-	                          static_cast<uint32_t>(vars.size()) | (attachment > 0 ? static_cast<uint32_t>(attachment) << 28 : 0) | (noColour ? 1u << 31 : 0)};
+	                          static_cast<uint32_t>(vars.size()) | writes << 20 | (attachment > 0 ? static_cast<uint32_t>(attachment) << 28 : 0) |
+	                          (noColour ? 1u << 31 : 0)};
 	out.hsaco.assign(reinterpret_cast<const char *>(head), sizeof(head));
 	out.hsaco += code.str();
 	for (const Var &v : vars) {

@@ -38,4 +38,7 @@ enum { kMtlcNext = 0, kMtlcDeliver = 1 };
  * 0 float, 1 half, 2 unorm8, 3 snorm8, 4 uint8, 5 sint8, 6 unorm16, 7 snorm16, 8 uint16, 9 sint16, 10 int, 11 uint (the host's
  * vertexFormat). Metal keeps offsets and strides multiples of 4. */
 #define RDNA4_MTLC_TABLE_ATTRIBUTES 0x800u
+/* The fragment stage's u32 colour attachment the draw goes into, for a shader that writes several (its RGFX header's bits 20-27): the value
+ * of that attachment is the one exported. */
+#define RDNA4_MTLC_TABLE_ATTACHMENT 0x500u
 #define RDNA4_MTLC_MAX_ATTRIBUTES 16u

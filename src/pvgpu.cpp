@@ -456,6 +456,7 @@ private:
 	bool readRec(uint32_t task, uint32_t id, uint32_t rec[3]);
 	bool readDesc(uint32_t task, const uint32_t rec[3], void *dst, uint32_t bytes);
 	void keepResource(uint32_t task, uint32_t id, const uint32_t rec[3]);
+	bool findFreedTexture(uint32_t task, uint32_t id, uint32_t rec[3]);
 	// A function's name, hash and library as the scan read them when it appeared, its translation asked for then: a library the app frees
 	// before its draws (Tahoe) is gone when pipelineInfo looks (task 14: "no metallib", 2026-11-10).
 	struct FnInfo { uint32_t task, id; char name[64]; uint8_t hash[32]; uint64_t lib; bool valid; };
@@ -999,6 +1000,61 @@ void RDNA4PvHost::tick() {
 		mTimer->setTimeoutUS(250);
 	else
 		mTimer->setTimeoutMS(1);
+}
+
+// A texture whose heap slot the guest freed before the host read the draw that samples it, and that no scan kept (the icon service on Tahoe
+// creates, draws with and releases a legacy icon's bitmap within one tick: the icon came out an empty tile). Freeing overwrites the 12-byte
+// record only; the descriptor stays in the task's descriptor area (from 0xd000, after the records) until reused, and names its texture
+// ({..., 0x2c, id, format << 16 | usage} at dwords 19-21, later for mipmaps). Its record made again: {(116 << 8) | 2, its address}.
+// ponytail: the last plausible match from a linear search of up to 512 KiB; an older descriptor of a reused id can win if its pages
+// are still mapped.
+bool RDNA4PvHost::findFreedTexture(uint32_t task, uint32_t id, uint32_t rec[3])
+{
+	static constexpr uint64_t kFrom = 0xd000, kMax = 512 * 1024;
+	static struct { uint32_t task, id; uint64_t ns; } misses[16];   // not searched again for a second
+	static uint32_t missAt;
+	const uint64_t now = nowNs();
+
+	for (const auto &m : misses)
+		if (m.ns && m.task == task && m.id == id && now - m.ns < 1000000000)
+			return false;
+
+	auto *d = static_cast<uint32_t *>(IOMalloc(kMax));
+	uint64_t got = 0;
+	bool found = false;
+
+	if (!d)
+		return false;
+	while (got < kMax && readGuest(task, kFrom + got, reinterpret_cast<uint8_t *>(d) + got, 4096))
+		got += 4096;
+
+	for (uint32_t p = 20; p + 1 < got / 4; p++) {
+		if (d[p - 1] != 0x2c || d[p] != id)
+			continue;
+		for (uint32_t k = 0; k <= 48 && k + 20 <= p; k++) {   // the start: 20 dwords before the id, more for a mipmapped texture's levels
+			const uint32_t *s = d + p - 20 - k;
+			const uint64_t len = s[0] | static_cast<uint64_t>(s[1]) << 32, va = static_cast<uint64_t>(s[2]) << 12;
+
+			if (!len || len > (1ull << 30) || !va || !s[15] || !s[16] || s[15] > 16384 || s[16] > 16384 || s[13] < s[15] || !guestPfn(task, va))
+				continue;
+			const uint64_t at = kFrom + 4ull * (p - 20 - k);
+
+			rec[0] = (4 * (20 + k + 9)) << 8 | 2;
+			rec[1] = static_cast<uint32_t>(at);
+			rec[2] = static_cast<uint32_t>(at >> 32);
+			found = true;
+			break;
+		}
+	}
+	IOFree(d, kMax);
+	if (!found)
+		misses[missAt++ % 16] = {task, id, now};
+
+	static uint32_t lines;
+	if (lines++ < 16)
+		pvstat("host: task %u texture %u: freed in the guest's heap before the draw was read, not kept: %s", task, id,
+		       found ? "its descriptor found again" : "its descriptor not found (the spare texel instead)");
+	return found;
 }
 
 void RDNA4PvHost::keepResource(uint32_t task, uint32_t id, const uint32_t rec[3])
@@ -3232,8 +3288,21 @@ struct RDNA4PvHost::TextureSource {
 	uint64_t va = 0, length = 0, imageBytes = 0;   // imageBytes: a 3D texture's slices apart
 	uint32_t slices = 1;                            // an array's, sliceBytes apart
 	uint64_t sliceBytes = 0;
+	uint32_t swizzle = 0;                           // a view's MTLTextureSwizzleChannels (red .. alpha a byte each), 0: none
 	Surface surface;
 };
+
+// A view's swizzle over its format's DST_SEL (x bits 0-2 .. w 9-11): Metal's zero 0, one 1, red 2 .. alpha 5 per channel.
+static uint32_t viewSel(uint32_t sel, uint32_t swizzle) {
+	if (!swizzle)
+		return sel;
+	uint32_t out = 0;
+	for (uint32_t c = 0; c < 4; c++) {
+		const uint32_t s = swizzle >> (8 * c) & 0xff;
+		out |= (s == 0 ? 0 : s == 1 ? 1 : s <= 5 ? sel >> (3 * (s - 2)) & 7 : sel >> (3 * c) & 7) << (3 * c);
+	}
+	return out;
+}
 
 bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out)
 {
@@ -3241,8 +3310,84 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out)
 
 	if (!readRec(task, id, rec))
 		return false;
+	if (!rec[0] && rec[1] == 0xffffffffu && rec[2] == 0xffffffffu && findFreedTexture(task, id, rec)) {   // freed, kept from now on
+		keepResource(task, id, rec);
+		if (!readRec(task, id, rec))
+			return false;
+	}
 
 	out.type = rec[0] & 0xff;
+
+	// Textures of another's memory (heap types 8 and 27; AppleParavirtGPUMetal's PGSerializer, Tahoe 26.6.2), by their record's kind (its
+	// first dword). Legacy icons' bitmaps reach the icon service's shader as the first.
+	if (out.type == 8 || out.type == 27) {
+		static uint32_t nesting;   // ponytail: one host, its work loop only
+		uint32_t v[18] = {};
+		const uint32_t have = (rec[0] >> 8) < sizeof(v) ? rec[0] >> 8 : sizeof(v);
+		const bool read = have >= 52 && readDesc(task, rec, v, have);
+		const bool view = read && (v[0] == 8 || v[0] == 0x1b);
+
+		// Kind 9, made from a buffer (newTextureWithBuffer:descriptor:offset:bytesPerRow:): {9, 64, id, the buffer's id, u64 offset, u64 bytes
+		// per row, then serializeTextureDescriptor's {u32 type 0-3 | flags 4-6 | pixel format 16-31, u32 width, height, depth, ...}}; 0x37
+		// has serializeTextureDescriptor2's layout, not handled yet: logged.
+		if (read && (v[0] == 9 || v[0] == 0x37)) {
+			uint64_t bva = 0, blen = 0;
+			const uint64_t offset = v[4] | static_cast<uint64_t>(v[5]) << 32, bpr = v[6] | static_cast<uint64_t>(v[7]) << 32;
+			static uint32_t bufLines;
+
+			if (v[0] == 0x37 || !bufferRange(task, v[3], &bva, &blen) || offset >= blen || !bpr || bpr > 0xffffffffu) {
+				if (bufLines++ < 8)
+					pvstat("host: render: texture %u from buffer %u (kind 0x%x, offset %llu, %llu bytes per row, %08x %u x %u): not handled", id, v[3],
+					       v[0], static_cast<unsigned long long>(offset), static_cast<unsigned long long>(bpr), v[8], v[9], v[10]);
+				return false;
+			}
+			out.type = 2;
+			out.format = v[8] >> 16;
+			out.width = v[9];
+			out.height = v[10];
+			out.depth = 1;
+			out.rowBytes = static_cast<uint32_t>(bpr);
+			out.va = bva + offset;
+			out.length = blen - offset;
+			out.imageBytes = out.length;
+
+			return true;
+		}
+		// Kind 8, a view (newTextureViewWithPixelFormat:textureType:levels:slices:[swizzle:]baseTexture:): {8 (0x1b with a swizzle), size, id,
+		// the texture's id, u16 pixel format, u16 texture type, u64 level, u64 levels, u64 slice, u64 slices[, u8 swizzle x 4]}. Its texture
+		// with the view's format (as many bytes a pixel), first slice and swizzle; ponytail: level 0 only, a view of a later level is refused.
+		const uint32_t parent = v[3], format = v[4] & 0xffff;
+		const uint64_t level = v[5] | static_cast<uint64_t>(v[6]) << 32, slice = v[9] | static_cast<uint64_t>(v[10]) << 32;
+		const uint32_t swizzle = v[0] == 0x1b && have >= 56 ? v[13] : 0;
+
+		static uint32_t levelLines;
+		if (view && level && levelLines++ < 6) {   // where the levels are: the view and its texture's whole descriptor
+			uint32_t prec[3] = {}, pd[64] = {};
+			const uint32_t pbytes = readRec(task, parent, prec) ? ((prec[0] >> 8) < sizeof(pd) ? prec[0] >> 8 : sizeof(pd)) : 0;
+			pvstat("host: render: texture %u: a view of level %llu (of %u) of texture %u (record %08x), format %u, type %u, slice %u", id,
+			       static_cast<unsigned long long>(level), v[7], parent, prec[0], format, v[4] >> 16, v[9]);
+			if (pbytes && readDesc(task, prec, pd, pbytes))
+				for (uint32_t i = 0; i < pbytes / 4; i += 12)
+					pvstat("host: render:   its texture +%03x: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", 4 * i, pd[i], pd[i + 1],
+					       pd[i + 2], pd[i + 3], pd[i + 4], pd[i + 5], pd[i + 6], pd[i + 7], pd[i + 8], pd[i + 9], pd[i + 10], pd[i + 11]);
+		}
+		if (!view || !parent || parent == id || level || nesting > 1)
+			return false;
+		nesting++;
+		const bool ok = textureSource(task, parent, out);
+		nesting--;
+		const TextureFormat *was = textureFormat(out.format), *now = textureFormat(format);
+		if (!ok || (format && format != out.format && (!was || !now || was->bpp != now->bpp)) || slice >= out.slices)
+			return false;
+		if (format)
+			out.format = format;
+		out.va += slice * out.sliceBytes;
+		out.length -= slice * out.sliceBytes;
+		out.slices -= static_cast<uint32_t>(slice);
+		out.swizzle = swizzle;
+
+		return true;
+	}
 	if (out.type == 5) {
 		if (!surfaceRange(task, id, out.surface))
 			return false;
@@ -3432,7 +3577,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		                                   : mapGuest(task, src.va, used, out[k].handle, gpu, shaderWrites))) {
 			out[k].va = 0;   // nothing to copy back: the card writes the guest's memory itself
 			out[k].writable = false;
-			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, h, h == 1 ? w : rowBytes / fm->bpp);
+			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, h == 1 ? w : rowBytes / fm->bpp);
 			mInPlace++;
 			continue;
 		}
@@ -3442,11 +3587,11 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			uint32_t *t = table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4;
 
 			if (array1d)
-				linearArray1d(t, gpu, fm->gfx, fm->sel, w, depth);
+				linearArray1d(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, depth);
 			else if (depth > 1)
-				linearVolume(t, gpu, fm->gfx, fm->sel, w, h, depth);
+				linearVolume(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 			else
-				linearImage(t, gpu, fm->gfx, fm->sel, w, h, shadowPitch / fm->bpp);
+				linearImage(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, shadowPitch / fm->bpp);
 
 			mCopied++;
 			continue;
@@ -3527,11 +3672,11 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			out[k].writable = false;
 		}
 		if (array1d)
-			linearArray1d(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, depth);
+			linearArray1d(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, depth);
 		else if (depth > 1)
-			linearVolume(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, h, depth);
+			linearVolume(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 		else
-			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, fm->sel, w, h, pitchPx);
+			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, pitchPx);
 	}
 	for (unsigned k = 0; k < 16 && ok; k++) {
 		const uint32_t id = bound.sampler[k];
@@ -4773,7 +4918,16 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const bool noColour = ps && ps[7] >> 31;   // the fragment shader writes no colour (air2amdgpu.cpp: textures, say)
 	// the one attachment other than 0 it writes (air2amdgpu.cpp, bits 28-30: CoreGraphics' path coverage into attachment 1): drawn into
 	// that attachment's texture
-	const uint32_t attachment = ps ? (ps[7] >> 28) & 7 : 0;
+	// a shader that writes several (bits 20-27): the first of them the pipeline writes (its mask) and the pass has a texture for, told to it
+	// in its table (RDNA4_MTLC_TABLE_ATTACHMENT; RenderBox's paint shaders write a colour and a coverage, the pipeline masks one off)
+	uint32_t attachment = ps ? (ps[7] >> 28) & 7 : 0;
+	const uint32_t writes = ps ? (ps[7] >> 20) & 0xff : 0;
+
+	for (uint32_t k = 0; k < 8; k++)
+		if ((writes >> k & 1) && pi.blend[k][9] && draw.attachments[k]) {
+			attachment = k;
+			break;
+		}
 	const uint32_t (&blend)[10] = pi.blend[attachment];   // that attachment's blending and write mask (RenderBox's differ per attachment)
 
 	if (attachment)
@@ -5099,6 +5253,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 	// Colour attachment 0 as the draw finds it, for fragment shaders that read it (Metal's [[color(0)]]; RDNA4_MTLC_TABLE_FRAMEBUFFER): a T# of
 	// the staged RGBA8 target. ponytail: a pixel the same draw covers twice reads the value from before the draw, not its first write.
+	reinterpret_cast<uint32_t *>(misc)[(0x800 + RDNA4_MTLC_TABLE_ATTACHMENT) / 4] = attachment;
 	// the target as an image (framebuffer fetch): 8_8_8_8 unorm, RGBA (BGRA8 swapped in place), else as its format
 	const TextureFormat *fbFormat = bgra || !targetFormat || targetFormat == 71 ? nullptr : textureFormat(targetFormat);
 	linearImage(reinterpret_cast<uint32_t *>(&misc[(0x800 + RDNA4_MTLC_TABLE_FRAMEBUFFER) / 8]), tgt.gpu, fbFormat ? fbFormat->gfx : 42,
