@@ -58,12 +58,13 @@ static int current(void)
 	return r;
 }
 
-/* The user logged in on the console, or 0 at the login window (the console then belongs to root). */
+/* The user logged in on the console, or 0 at the login window: the console then belongs to root or to _windowserver (88, Tahoe
+ * 26.6.2 at boot), so only a regular user's id (501 and up) counts. */
 static uid_t consoleUser(void)
 {
 	struct stat st;
 
-	return stat("/dev/console", &st) ? 0 : st.st_uid;
+	return stat("/dev/console", &st) || st.st_uid < 501 ? 0 : st.st_uid;
 }
 
 int main(int argc, char **argv)
