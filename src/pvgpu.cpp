@@ -3782,8 +3782,10 @@ void RDNA4PvHost::dropMapping(Mapping &m) {
 		gCompute->rtFree(this, m.handle);
 	if (m.pages)
 		IOFree(m.pages, m.count * 8);
-	if (m.memory)
+	if (m.memory) {
+		m.memory->complete();
 		m.memory->release();
+	}
 	m = {};
 }
 
@@ -3813,11 +3815,24 @@ void RDNA4PvHost::keyMapping(Mapping *m, IOMemoryDescriptor *memory, uint32_t ta
 	if (!m)
 		return;
 
-	if (memory)
+	// Prepared while cached: the GPU keeps reaching the pages through the mapping, so they must stay wired where they are. Not
+	// kept (nor found again) when that fails.
+	const bool wired = !memory || memory->prepare() == kIOReturnSuccess;
+
+	if (memory && wired)
 		memory->retain();
 
-	if (m->memory)
+	if (m->memory) {
+		m->memory->complete();
 		m->memory->release();
+	}
+
+	if (!wired) {
+		m->memory = nullptr;
+		m->keyed = false;
+
+		return;
+	}
 
 	m->memory = memory;
 	m->task = task;
