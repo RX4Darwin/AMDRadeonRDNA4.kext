@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
@@ -57,6 +58,14 @@ static int current(void)
 	return r;
 }
 
+/* The user logged in on the console, or 0 at the login window (the console then belongs to root). */
+static uid_t consoleUser(void)
+{
+	struct stat st;
+
+	return stat("/dev/console", &st) ? 0 : st.st_uid;
+}
+
 int main(int argc, char **argv)
 {
 	const int dryRun = argc > 1 && !strcmp(argv[1], "-n");
@@ -80,6 +89,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* WindowServer read the other value when it started */
+	/* WindowServer read the other value when it started. Restarting it ends a logged-in user's session: then only
+	 * the next start (a logout, a reboot) takes the new value. */
+	if (consoleUser()) {
+		fprintf(stderr, "rdna4-iop: NOT restarting WindowServer: user %u is logged in; useIOP takes effect at the next "
+		        "logout or reboot\n", (unsigned)consoleUser());
+		return 1;
+	}
+
 	return system("/usr/bin/killall -9 WindowServer") ? 1 : 0;
 }
