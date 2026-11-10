@@ -138,15 +138,18 @@ static inline void pipelineKeys(const uint8_t *pb, uint32_t len, uint32_t top[16
 		(void)entryList(pb, len, 16, top, 16);
 }
 
-// Colour attachment 0's blend state from a render pipeline's descriptor (pb, len bytes; measured with mtlprobe's blendinfo, docs/m1-stream.md
+// The colour attachments' blend states from a render pipeline's descriptor (pb, len bytes; measured with mtlprobe's blendinfo, docs/m1-stream.md
 // s.5b): a 16-byte header, the function list {u8 n, n x {u8 key, u8 size, value}}, the pipeline's label (a C string, then 4-aligned; empty: one
 // zero byte; iTerm2's: "Pipeline for iTermMetalCellRenderer"), u32 colour attachments, u32 ?, then per attachment {u8 n, n x {u8 key, u8 size,
 // value}}: 0 index, 1 pixel format, 2 blending, 3 / 4 / 5 colour source factor, destination factor, operation, 6 / 7 / 8 the same for alpha,
 // 9 write mask. Keys not given keep Metal's defaults (off, One, Zero, Add, One, Zero, Add, 0xf); so does everything for a short descriptor.
 // Where the list's key 8 says, the attachments are there (a vertex descriptor lies between the label and them).
-static inline void readBlendState(const uint8_t *pb, uint32_t len, uint32_t blend[10]) {
+static inline void readBlendStates(const uint8_t *pb, uint32_t len, uint32_t blend[8][10]) {
 	static const uint32_t defaults[10] = {0, 0, 0, 1, 0, 0, 1, 0, 0, 0xf};
-	memcpy(blend, defaults, sizeof(defaults));
+	for (uint32_t k = 0; k < 8; k++) {
+		memcpy(blend[k], defaults, sizeof(defaults));
+		blend[k][0] = k;
+	}
 	if (len < 17)
 		return;
 	uint32_t top[16], at = 17;
@@ -160,13 +163,26 @@ static inline void readBlendState(const uint8_t *pb, uint32_t len, uint32_t blen
 			at++;
 		at = (at + 1 + 3) & ~3u;
 	}
-	uint32_t attachments = 0;
-	if (at + 9 <= len)
-		memcpy(&attachments, pb + at, 4);
-	at += 8;
-	for (uint32_t k = 0, n = attachments && at < len ? pb[at++] : 0; k < n && at + 2 <= len; k++, at += 2 + pb[at + 1])
-		if (pb[at] < 10 && pb[at + 1] == 4 && at + 6 <= len)
-			memcpy(&blend[pb[at]], pb + at + 2, 4);
+	// a table as the vertex descriptor's {u32 n, u32 offset of each attachment's list from the count}: {1, 8} for one; key 0 its index
+	uint32_t n = 0;
+	if (at + 4 <= len)
+		memcpy(&n, pb + at, 4);
+	if (n > 8 || at + 4 + 4 * n > len)
+		return;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t off, v[10];
+		memcpy(&off, pb + at + 4 + 4 * i, 4);
+		memcpy(v, defaults, sizeof(v));
+		if (entryList(pb, len, at + off, v, 10) && v[0] < 8)
+			memcpy(blend[v[0]], v, sizeof(v));
+	}
+}
+
+// Colour attachment 0's.
+static inline void readBlendState(const uint8_t *pb, uint32_t len, uint32_t blend[10]) {
+	uint32_t all[8][10];
+	readBlendStates(pb, len, all);
+	memcpy(blend, all[0], sizeof(all[0]));
 }
 
 // A MTLVertexFormat as the translator's attribute kind (include/rdna4mtlc.h) | components << 4 | BGRA << 7; 0 for formats not handled.

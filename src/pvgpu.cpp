@@ -284,11 +284,22 @@ private:
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
 	uint32_t runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
+	uint32_t clearAttachment(uint32_t task, const uint8_t *p);
 	struct Bindings { uint32_t buffer[RDNA4_MTLC_MAX_BUFFERS]; uint64_t offset[RDNA4_MTLC_MAX_BUFFERS]; uint32_t texture[16], sampler[16]; };   // by Metal index (0 = none)
 	// A draw: Metal's primitive type, first vertex, vertices (indices), instances, base instance, and for an indexed draw the index buffer's
 	// resource id, offset and index size (bytes; 0: not indexed).
 	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes, blendColor[4]; uint64_t viewport[4]; bool viewportSet;
-	              uint64_t scissor[4]; bool scissorSet; };
+	              uint64_t scissor[4]; bool scissorSet; uint32_t attachments[8];   // the pass's colour attachments' textures
+	              uint32_t stencil, stencilState, stencilRef[2]; };   // the pass's stencil texture, setDepthStencilState, the front and back references
+	// Stencil attachments: on the card only (Metal's are private), 8 bits a pixel in the depth block's 64 KiB tiles (gfx12 addrlib: depth and
+	// stencil only SW_64KB_2D or SW_256KB_2D), one per task and texture. ponytail: 16 kept, the least used given up; a pass that loads one
+	// given up finds it cleared to 0.
+	struct StencilBuf { uint32_t task, tex, width, height; uint64_t handle, gpu, bytes, used; int32_t clear; };   // clear: pending value, or -1
+	StencilBuf mStencil[16] = {};
+	uint64_t mStencilClock = 0;
+	void stencilPass(uint32_t task, uint32_t tex, uint32_t load, uint32_t value);
+	StencilBuf &stencilSlot(uint32_t task, uint32_t tex);
+	const StencilBuf *stencilFor(uint32_t task, uint32_t tex, uint32_t width, uint32_t height);
 	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *stage);
 	void runCompute(uint32_t task, uint32_t pipeline, const Bindings &bound, const uint64_t *size);
 	// staged: a runtime buffer or the pool; an IOSurface the kernel writes held (prepared) until its rows are written back into it
@@ -416,6 +427,45 @@ private:
 	uint64_t mBarrierSince[17] {};   // per source (0 the root FIFO, n channel n): when its first unmet barrier was seen, 0 none
 	uint8_t mDumped[256] {};            // M1: payload dumps per FIFO id so far
 	uint32_t mTaskRoot[64] {};          // M1: page-table root PFN per task id (DefineHostTask), for the dumps after a commit
+	uint32_t mTaskDefs[64] {};          // DefineHostTasks per task id, and when the last came (an empty resource record's log)
+	uint64_t mTaskDefinedNs[64] {};
+	uint32_t mExecSignal { 0 }, mExecStampIndex { 0 };   // the ExecIndirect being decoded: its signal and the stamp slot it completes
+	const char *mExecTag { "" };
+	uint32_t mExecPayload[128] {}, mExecPayloadDwords { 0 };   // its payload, for an empty resource record's log
+	uint32_t *mSeenRec { nullptr };      // scanPipelines: each task's first kScanIds resource records as last read
+	uint64_t mTaskActiveNs[64] {};       // when the task was last defined or sent a command buffer
+	static constexpr uint32_t kScanIds = 256;
+	void scanPipelines();
+	struct Deleted { uint32_t task, id; uint64_t at; };            // the last DeleteHostResourceIDs, for an empty resource record's log
+	// Page lifetime of freed textures (a diagnostic): each texture's range as the scan last saw it valid, and the last ReleaseFromGPUPageTables
+	struct TexSnap { uint32_t task, id; uint64_t va, len, at; bool valid; };
+	TexSnap mTexSnap[512] {};
+	uint32_t mTexSnapAt { 0 };
+	struct Released { uint32_t task; uint64_t va, len, at; };
+	Released mReleased[512] {};
+	uint32_t mReleasedAt { 0 };
+	void logFreedTexture(uint32_t task, uint32_t id);
+	// Resources the guest freed in its heap before the host read the draws that use them (an app's unretained command buffer): the record and
+	// the descriptor's first bytes as the scan last read them valid, until DeleteHostResourceID or DefineHostTask; their pages stay mapped
+	// until then (page-lifetime log, 2026-11-10). Buffers, textures, IOSurfaces, functions; pipelines are PipelineInfo's.
+	struct ResShadow { uint32_t task, id, rec[3], descBytes; uint8_t desc[128]; bool valid; };
+	static constexpr uint32_t kResShadows = 1024;
+	ResShadow *mRes { nullptr };
+	uint32_t mResAt { 0 };
+	const ResShadow *mLastShadow { nullptr };   // what readRec answered from, for the readDesc after it
+	bool readRec(uint32_t task, uint32_t id, uint32_t rec[3]);
+	bool readDesc(uint32_t task, const uint32_t rec[3], void *dst, uint32_t bytes);
+	void keepResource(uint32_t task, uint32_t id, const uint32_t rec[3]);
+	// A function's name, hash and library as the scan read them when it appeared, its translation asked for then: a library the app frees
+	// before its draws (Tahoe) is gone when pipelineInfo looks (task 14: "no metallib", 2026-11-10).
+	struct FnInfo { uint32_t task, id; char name[64]; uint8_t hash[32]; uint64_t lib; bool valid; };
+	FnInfo mFns[512] {};
+	uint32_t mFnsAt { 0 };
+	void keepFunction(uint32_t task, uint32_t id);
+	const FnInfo *keptFunction(uint32_t task, uint32_t id) const;
+	void dropResource(uint32_t task, uint32_t id);
+	Deleted mDeleted[256] {};
+	uint32_t mDeletedAt { 0 };
 	bool mRtOpen { false };              // M2: this host is a client of the card's runtime
 	// mapPages' mappings kept from draw to draw, by their page list: WindowServer draws with the same textures, buffers and targets every
 	// frame, and each mapping costs SDMA jobs (page tables) of about 2 ms.
@@ -719,13 +769,13 @@ private:
 	struct PipelineInfo {
 		uint32_t task { 0 }, pipeline { 0 }, rec[3] {}, fnRec[3][3] {};
 		uint64_t pd[8] {};
-		uint32_t fn[3] {}, blend[10] {}, attributes[RDNA4_MTLC_MAX_ATTRIBUTES][4] {}, skipped[RDNA4_MTLC_MAX_ATTRIBUTES] {};
+		uint32_t fn[3] {}, blend[8][10] {}, attributes[RDNA4_MTLC_MAX_ATTRIBUTES][4] {}, skipped[RDNA4_MTLC_MAX_ATTRIBUTES] {};
 		bool valid { false }, attributesKnown { false }, named[3] {};
 		char name[3][64] {};
 		uint8_t hash[3][32] {};
 		uint64_t lib[3] {}, used { 0 };
 	};
-	static constexpr uint32_t kPipelines = 128;
+	static constexpr uint32_t kPipelines = 256;   // also those scanPipelines reads ahead for the other clients
 	PipelineInfo mPipelines[kPipelines];
 	uint64_t mPipelineClock { 0 };
 	const PipelineInfo &pipelineInfo(uint32_t task, uint32_t pipeline);
@@ -924,6 +974,7 @@ void RDNA4PvHost::tick() {
 	pollRegisters();
 	mapRoot();
 	pollFifo();
+	scanPipelines();   // before the command buffers that may draw with them
 	pollChannels();
 	flushBatch();   // what the commands drew, on the card while the host waits for more
 	flipDone();
@@ -948,6 +999,210 @@ void RDNA4PvHost::tick() {
 		mTimer->setTimeoutUS(250);
 	else
 		mTimer->setTimeoutMS(1);
+}
+
+void RDNA4PvHost::keepResource(uint32_t task, uint32_t id, const uint32_t rec[3])
+{
+	if (!mRes && !(mRes = static_cast<ResShadow *>(IOMallocZero(kResShadows * sizeof(ResShadow)))))   // kept for the boot, as the host is
+		return;
+
+	ResShadow *slot = nullptr;
+
+	for (uint32_t k = 0; k < kResShadows && !slot; k++)
+		if (mRes[k].valid && mRes[k].task == task && mRes[k].id == id)
+			slot = &mRes[k];
+	if (!slot)
+		slot = &mRes[mResAt++ % kResShadows];
+
+	const uint32_t n = (rec[0] >> 8) < sizeof(slot->desc) ? rec[0] >> 8 : sizeof(slot->desc);
+
+	slot->valid = false;
+	if (!n || !readGuest(task, rec[1] | static_cast<uint64_t>(rec[2]) << 32, slot->desc, n))
+		return;
+	slot->task = task;
+	slot->id = id;
+	memcpy(slot->rec, rec, sizeof(slot->rec));
+	slot->descBytes = n;
+	slot->valid = true;
+}
+
+void RDNA4PvHost::keepFunction(uint32_t task, uint32_t id)
+{
+	FnInfo f {};
+
+	if (!functionName(task, id, f.name, sizeof(f.name), f.hash, &f.lib))
+		return;
+
+	f.task = task;
+	f.id = id;
+	f.valid = true;
+
+	FnInfo *slot = nullptr;
+
+	for (FnInfo &o : mFns)
+		if (o.valid && o.task == task && o.id == id)
+			slot = &o;
+
+	*(slot ? slot : &mFns[mFnsAt++ % 512]) = f;
+	(void)translated(task, f.lib, f.name, f.hash);   // now, while the library is the app's
+}
+
+const RDNA4PvHost::FnInfo *RDNA4PvHost::keptFunction(uint32_t task, uint32_t id) const
+{
+	for (const FnInfo &f : mFns)
+		if (f.valid && f.task == (task & 63) && f.id == id)
+			return &f;
+
+	return nullptr;
+}
+
+void RDNA4PvHost::dropResource(uint32_t task, uint32_t id)
+{
+	for (FnInfo &f : mFns)
+		if (f.valid && f.task == task && f.id == id)
+			f.valid = false;
+	for (uint32_t k = 0; mRes && k < kResShadows; k++)
+		if (mRes[k].valid && mRes[k].task == task && mRes[k].id == id)
+			mRes[k].valid = false;
+}
+
+// A resource's heap record: the guest's, or for a free slot ({0, ~0, ~0}) the copy keepResource made while it was valid.
+bool RDNA4PvHost::readRec(uint32_t task, uint32_t id, uint32_t rec[3])
+{
+	mLastShadow = nullptr;
+
+	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), 12))
+		return false;
+
+	if (rec[0] || rec[1] != 0xffffffffu || rec[2] != 0xffffffffu || !mRes)
+		return true;
+
+	for (uint32_t k = 0; k < kResShadows; k++) {
+		if (!mRes[k].valid || mRes[k].task != (task & 63) || mRes[k].id != id)
+			continue;
+
+		static uint32_t keptLines;
+
+		if (keptLines++ < 8)
+			pvstat("host: task %u resource %u (type %u): freed in the guest's heap, not deleted yet: as read before", task, id, mRes[k].rec[0] & 0xff);
+		memcpy(rec, mRes[k].rec, 12);
+		mLastShadow = &mRes[k];
+
+		return true;
+	}
+
+	return true;   // the free slot itself: no resource
+}
+
+// The first `bytes` of the descriptor of the record readRec just gave: from its copy when it came from one (if that holds as many), else the
+// guest's memory.
+bool RDNA4PvHost::readDesc(uint32_t task, const uint32_t rec[3], void *dst, uint32_t bytes)
+{
+	if (mLastShadow && !memcmp(mLastShadow->rec, rec, 12) && bytes <= mLastShadow->descBytes) {
+		memcpy(dst, mLastShadow->desc, bytes);
+
+		return true;
+	}
+
+	return readGuest(task, rec[1] | static_cast<uint64_t>(rec[2]) << 32, static_cast<uint8_t *>(dst), bytes);
+}
+
+// Render pipelines have no creation command, and an app's unretained command buffer can free one in its heap before the host reads the draw
+// (CoreGraphics on Tahoe): each tick the records of the tasks that were busy in the last 2 s are compared with their last reading, and those
+// that became a pipeline are read into pipelineInfo's cache while valid. It keeps them until DeleteHostResourceID or DefineHostTask.
+void RDNA4PvHost::scanPipelines() {
+	static constexpr uint64_t kActiveNs = 2000000000;
+	static uint32_t rec[kScanIds * 3];   // ponytail: one host, its work loop only
+	const uint64_t now = nowNs();
+
+	if (!mSeenRec && !(mSeenRec = static_cast<uint32_t *>(IOMallocZero(64 * kScanIds * 12))))   // kept for the boot, as the host is
+		return;
+
+	for (uint32_t t = 0; t < 64; t++) {
+		if (!mTaskRoot[t] || now - mTaskActiveNs[t] > kActiveNs || !readGuest(t, 0x1000, reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
+			continue;
+
+		uint32_t *seen = mSeenRec + t * kScanIds * 3;
+
+		for (uint32_t id = 1; id < kScanIds; id++) {
+			const uint32_t *r = rec + id * 3;
+
+			if (!memcmp(r, seen + id * 3, 12))
+				continue;
+
+			memcpy(seen + id * 3, r, 12);
+
+			const uint32_t type = r[0] & 0xff;
+
+			if (type == 1 || type == 2 || type == 3 || type == 5 || type == 6)
+				keepResource(t, id, r);
+			if (type == 6)
+				keepFunction(t, id);
+
+			uint64_t tva = 0, tlen = 0;
+
+			if ((r[0] & 0xff) == 2 && textureRange(t, id, &tva, &tlen)) {   // a texture's range while valid (the page-lifetime diagnostic)
+				TexSnap *slot = nullptr;
+
+				for (TexSnap &s : mTexSnap)
+					if (s.valid && s.task == t && s.id == id)
+						slot = &s;
+				if (!slot)
+					slot = &mTexSnap[mTexSnapAt++ % 512];
+				*slot = { t, id, tva, tlen, now, true };
+			}
+
+			if ((r[0] & 0xff) != 7)
+				continue;
+
+			// its functions translated now too, while their libraries are still the app's (a draw may come after they are freed)
+			const PipelineInfo &p = pipelineInfo(t, id);
+
+			for (unsigned k = 1; k <= 2; k++)
+				if (p.named[k])
+					(void)translated(t, p.lib[k], p.name[k], p.hash[k]);
+		}
+	}
+}
+
+// A draw's target whose record is a free slot: was the texture deleted or unmapped yet, and are its pages still in the task's page table?
+void RDNA4PvHost::logFreedTexture(uint32_t task, uint32_t id)
+{
+	static uint32_t lines;
+
+	if (lines >= 24)
+		return;
+
+	const TexSnap *snap = nullptr;
+
+	for (const TexSnap &s : mTexSnap)
+		if (s.valid && s.task == (task & 63) && s.id == id && (!snap || s.at > snap->at))
+			snap = &s;
+
+	const uint64_t now = nowNs();
+
+	if (!snap) {
+		lines++;
+		pvstat("host: render: freed target: task %u texture %u was never seen valid by the scan", task, id);
+
+		return;
+	}
+
+	uint64_t deleted = 0, released = 0;
+
+	for (const Deleted &d : mDeleted)
+		if (d.task == (task & 63) && d.id == id && d.at > snap->at && d.at > deleted)
+			deleted = d.at;
+	for (const Released &r : mReleased)
+		if (r.task == (task & 63) && r.at > snap->at && r.va < snap->va + snap->len && snap->va < r.va + r.len && r.at > released)
+			released = r.at;
+
+	const uint32_t first = guestPfn(task, snap->va), last = guestPfn(task, snap->va + snap->len - 1);
+
+	lines++;
+	pvstat("host: render: freed target: task %u texture %u (0x%llx, 0x%llx bytes, seen %llu ms ago): %s, %s; its first and last pages %s (0x%x, 0x%x)",
+	       task, id, snap->va, snap->len, (now - snap->at) / 1000000, deleted ? "DELETED" : "not deleted", released ? "UNMAPPED" : "not unmapped",
+	       first && last ? "still mapped" : "NOT mapped", first, last);
 }
 
 void RDNA4PvHost::pollRegisters() {
@@ -1119,6 +1374,49 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			pvlog("host: %s @0x%x: %s", src.tag, (read + at) % src.ringLen, line);
 		}
 		// M1: the payloads of the commands whose layout is still being worked out.
+		// DeleteHostResourceID {u32 task, u32 id}, run after the command buffers that use it (its barriers): from now on the resource is gone.
+		// Until then a pipeline the guest already freed in its heap (an app's unretained command buffer, CoreGraphics') is drawn from the copy
+		// pipelineInfo keeps.
+		if (c.id == 0x25 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 8) {
+			uint32_t d[2];
+
+			copy(at, mWin, c.length);
+			memcpy(d, mWin + c.payloadOffset, sizeof(d));
+			for (PipelineInfo &e : mPipelines)
+				if (e.valid && e.task == d[0] && e.pipeline == d[1])
+					e.valid = false;
+			dropResource(d[0], d[1]);
+			mDeleted[mDeletedAt++ % 256] = { d[0], d[1], nowNs() };
+		}
+		// ReleaseFromGPUPageTable {u32 task, u64 gpu address, u64 length} as CommitIntoGPUPageTable (docs/m1-stream.md): when a range was unmapped
+		if (c.id == 0x22 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 20) {
+			static uint32_t releaseLines;
+			uint32_t rt;
+			uint64_t rva, rlen;
+
+			copy(at, mWin, c.length);
+			memcpy(&rt, mWin + c.payloadOffset, 4);
+			memcpy(&rva, mWin + c.payloadOffset + 4, 8);
+			memcpy(&rlen, mWin + c.payloadOffset + 12, 8);
+			mReleased[mReleasedAt++ % 512] = { rt, rva, rlen, nowNs() };
+			if (releaseLines++ < 4)
+				pvstat("host: %s: ReleaseFromGPUPageTable task %u, gpu va 0x%llx, length 0x%llx", src.tag, rt, rva, rlen);
+		}
+		// which task the guest frees, and when (an empty resource record's log)
+		if (c.id == 0x20 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4) {
+			static uint32_t freeLines;
+			uint32_t task;
+
+			copy(at, mWin, c.length);
+			memcpy(&task, mWin + c.payloadOffset, 4);
+			uint32_t b[2] = {};
+
+			if (c.barriers)
+				memcpy(b, mWin + pvstream::kFifoHeaderBytes, sizeof(b));
+			if (freeLines++ < 40)
+				pvstat("host: %s: FreeTask payload 0x%x; %u barrier(s), the first stamp[%u] >= %u (it is %u)", src.tag, task, c.barriers, b[0], b[1],
+				       b[0] < 0x1000 / 4 && mFifoMap ? reinterpret_cast<volatile uint32_t *>(mFifoMap->getVirtualAddress())[b[0]] : 0);
+		}
 		if (c.length <= sizeof(mWin) && (c.id == 0x33 || c.id == 0x37 || c.id == 0x3b || c.id == 0x25 || c.id == 0x28 || c.id == 0x22 || c.id == 0x38) &&
 		    mDumped[c.id] < 40) {
 			mDumped[c.id]++;
@@ -1132,6 +1430,19 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			memcpy(&mTaskRoot[(task >> 1) & 63], mWin + c.payloadOffset + 12, 4);
 			mDrawLines[(task >> 1) & 63] = 0;
 			mListed[(task >> 1) & 63] = 0;
+			// a process that starts after the boot's log budget is used up: 2000 lines for its first draws and command buffers
+			if (__atomic_load_n(&gLogLines, __ATOMIC_RELAXED) >= kMaxLogLines)
+				__atomic_store_n(&gLogLines, kMaxLogLines - 2000, __ATOMIC_RELAXED);
+			mTaskDefs[(task >> 1) & 63]++;
+			mTaskDefinedNs[(task >> 1) & 63] = mTaskActiveNs[(task >> 1) & 63] = nowNs();
+			if (mSeenRec)   // a new process: its records are read anew
+				memset(mSeenRec + ((task >> 1) & 63) * kScanIds * 3, 0, kScanIds * 12);
+			for (uint32_t k = 0; mRes && k < kResShadows; k++)
+				if (mRes[k].valid && mRes[k].task == ((task >> 1) & 63))
+					mRes[k].valid = false;
+			for (FnInfo &f : mFns)
+				if (f.valid && f.task == ((task >> 1) & 63))
+					f.valid = false;
 			// A new process in a task number another had: its pipelines may sit at the same addresses with the same ids, so the cached
 			// ones are not its (mtlprobe's processes drew with each other's shaders, 2026-11-10)
 			for (PipelineInfo &e : mPipelines)
@@ -1178,6 +1489,12 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 				if (gTalk)
 					pvlog("host: %s: command buffer of task %u, signal %u", src.tag, task, c.signal);
 
+				mTaskActiveNs[task & 63] = nowNs();
+				mExecSignal = c.signal;   // an empty resource record's log: had the guest been told this one was done?
+				mExecStampIndex = src.stampIndex;
+				mExecTag = src.tag;
+				mExecPayloadDwords = plen / 4 < 128 ? plen / 4 : 128;
+				memcpy(mExecPayload, mWin + c.payloadOffset, mExecPayloadDwords * 4);
 				decodeExec(task, va, len);
 			}
 		}
@@ -1873,12 +2190,14 @@ struct ExecTally {
 	uint32_t task;
 	uint32_t pipeline;                  // Compute.setComputePipelineState
 	uint32_t target, renderPipeline;    // Render: colour attachment 0's texture (writeDescriptor), setRenderPipelineState
+	uint32_t attachments[8];            // Render: all eight colour attachments' textures (writeDescriptor; 0 = none)
 	RDNA4PvHost::Bindings stage[2];     // Render.setVertexBuffers, setFragmentBuffers
 	uint32_t blendColor[4];             // Render.setBlendColorRed: four floats' bits
 	uint64_t viewport[4];               // Render.setViewport: originX, originY, width, height as doubles' bits (znear, zfar not used)
 	bool viewportSet;                   // since the encoder began (writeDescriptor); else the whole target
 	uint64_t scissor[4];                // Render.setScissorRect: x, y, width, height in pixels
 	bool scissorSet;                    // as viewportSet
+	uint32_t stencil, stencilState, stencilRef[2];   // Render: the pass's stencil texture, setDepthStencilState, setStencilFrontReferenceValue
 	RDNA4PvHost::Bindings compute;      // Compute.setBuffers
 };
 // The bytes of the draws execSink runs, by command (0: not a draw it runs).
@@ -1907,9 +2226,33 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		t->host->runBlit(t->task, id, payload, bytes);
 	else if (id == 0x01a) {
 		t->target = t->host->runRenderPass(t->task, payload, bytes);
+		for (uint32_t k = 0; k < 8; k++)   // {u32 texture, ...} 0x3c apart from 0x4c (logPassDescriptor)
+			if (0x4c + 0x3c * k + 4 <= bytes)
+				memcpy(&t->attachments[k], payload + 0x4c + 0x3c * k, 4);
+			else
+				t->attachments[k] = 0;
 		t->viewportSet = false;
 		t->scissorSet = false;
+
+		// the stencil attachment {u32 texture at +0x28, u16 load action at +0x3c, u32 clear value at +0x44} (AppleParavirtGPUMetal's
+		// PGSerializerRenderCommandEncoder, Tahoe 26.6.2: the depth attachment the same from +0 with a double clear value)
+		uint16_t load = 0;
+		uint32_t clear = 0;
+		t->stencil = 0;
+		if (bytes >= 0x48) {
+			memcpy(&t->stencil, payload + 0x28, 4);
+			memcpy(&load, payload + 0x3c, 2);
+			memcpy(&clear, payload + 0x44, 4);
+		}
+		t->stencilState = 0;
+		t->stencilRef[0] = t->stencilRef[1] = 0;
+		if (t->stencil)
+			t->host->stencilPass(t->task, t->stencil, load, clear);
 	}
+	else if (id == 0x068 && bytes >= 4)   // Render.setDepthStencilState {u32 state id}
+		memcpy(&t->stencilState, payload, 4);
+	else if (id == 0x077 && bytes >= 8)   // Render.setStencilFrontReferenceValue {u32 front, u32 back}
+		memcpy(t->stencilRef, payload, 8);
 	else if (id == 0x074 && bytes >= 4) {   // Render.setRenderPipelineState {u32 pipeline id}
 		memcpy(&t->renderPipeline, payload, 4);
 		t->host->describeRenderPipeline(t->task, t->renderPipeline);
@@ -1944,10 +2287,14 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		if ((id == 0x000 && (w[2] || w[4])) || (id == 0x006 && (w[3] || w[5])))
 			d.type = ~0u;   // a start, count or offset beyond 32 bits: refused as an unknown primitive
 		memcpy(d.blendColor, t->blendColor, sizeof(d.blendColor));
+		memcpy(d.attachments, t->attachments, sizeof(d.attachments));
 		memcpy(d.viewport, t->viewport, sizeof(d.viewport));
 		d.viewportSet = t->viewportSet;
 		memcpy(d.scissor, t->scissor, sizeof(d.scissor));
 		d.scissorSet = t->scissorSet;
+		d.stencil = t->stencil;
+		d.stencilState = t->stencilState;
+		memcpy(d.stencilRef, t->stencilRef, sizeof(d.stencilRef));
 		const uint64_t start = nowNs();
 		t->host->runDraw(t->task, t->target, t->renderPipeline, d, t->stage);
 		t->host->noteDraw(nowNs() - start);
@@ -2059,8 +2406,7 @@ void RDNA4PvHost::decodeExec(uint32_t task, uint64_t va, uint64_t len) {
 bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len) {
 	uint32_t rec[3];
 	uint64_t desc[2];
-	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) || (rec[0] & 0xff) != 1 ||
-	    !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(desc), sizeof(desc))) {
+	if (!readRec(task, id, rec) || (rec[0] & 0xff) != 1 || !readDesc(task, rec, desc, sizeof(desc))) {
 		pvlog("host: blit: task %u resource %u: no buffer", task, id);
 		return false;
 	}
@@ -2075,8 +2421,8 @@ bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t
 bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow, uint32_t *width, uint32_t *height,
                                uint32_t *format, uint32_t *storage) {
 	uint32_t rec[3] = {}, desc[29];
-	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) ||
-	    ((rec[0] & 0xff) != 2 && (rec[0] & 0xff) != 3) || (rec[0] >> 8) < sizeof(desc) || !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(desc), sizeof(desc))) {
+	if (!readRec(task, id, rec) || ((rec[0] & 0xff) != 2 && (rec[0] & 0xff) != 3) || (rec[0] >> 8) < sizeof(desc) ||
+	    !readDesc(task, rec, desc, sizeof(desc))) {
 		if (mRenderLines++ < 24)
 			pvlog("host: task %u resource %u: no texture (heap record %08x)", task, id, rec[0]);
 		return false;
@@ -2212,8 +2558,7 @@ bool RDNA4PvHost::surfaceRange(uint32_t task, uint32_t id, Surface &out) {
 	uint32_t rec[3], d[14];
 	static uint32_t refused;
 
-	if (!gSurfaceFns.lookup || !id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) ||
-	    (rec[0] & 0xff) != 5 || (rec[0] >> 8) < sizeof(d) || !readGuest(task, rec[1], reinterpret_cast<uint8_t *>(d), sizeof(d)))
+	if (!gSurfaceFns.lookup || !readRec(task, id, rec) || (rec[0] & 0xff) != 5 || (rec[0] >> 8) < sizeof(d) || !readDesc(task, rec, d, sizeof(d)))
 		return false;   // not a type-5 texture (or no IOSurface functions)
 
 	const TextureFormat *fm = textureFormat(d[5] >> 16);
@@ -2301,17 +2646,15 @@ static void logPassDescriptor(const uint8_t *p, uint32_t bytes)
 		pvlog("host: render: pass descriptor%s", line);
 }
 
-uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes) {
-	if (!gCompute || bytes < 0x88)
+// One colour attachment of a pass (p: the descriptor, offset by 0x3c per attachment): its load action carried out. Its texture.
+uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
+	if (!gCompute)
 		return 0;
 	uint32_t tex, actions;
 	uint64_t rgba[4];   // the clear colour as IEEE-754 doubles, converted with integers only (no floating point in the kernel)
 	memcpy(&tex, p + 0x4c, 4);
 	memcpy(&actions, p + 0x60, 4);
 	memcpy(rgba, p + 0x68, sizeof(rgba));
-
-	if (gTalk)
-		logPassDescriptor(p, bytes);
 
 	if ((actions & 0xffff) != 2 || !tex)   // MTLLoadActionClear
 		return tex;
@@ -2326,7 +2669,8 @@ uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t by
 	// RGBA16Float: only to zero so far (a 32-bit pattern cannot hold four halves; transparent black is what CoreAnimation clears to)
 	const bool half = format == 115;
 	const bool zero = !(rgba[0] | rgba[1] | rgba[2] | rgba[3]);
-	bool ok = found && (!half || zero);
+	// RG16Float (65), R8 (10), R16Float (25), RGB10A2 (90): to zero only too
+	bool ok = found && ((!half && format != 65 && format != 10 && format != 25 && format != 90) || zero);
 	uint64_t handle = 0, gpu = 0;
 	Surface surface;
 
@@ -2378,20 +2722,41 @@ uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t by
 	if (found)
 		dropShadows(nullptr, task, va);
 
-	if (!ok && (surface.memory || surfaceRange(task, tex, surface)) && surface.format == 80 && surface.width <= 16384) {   // a BGRA8 IOSurface: row by row
+	// an IOSurface, row by row: BGRA8 to the colour, or any format to zero (RenderBox's RGBA16Float targets on Tahoe: transparent black)
+	const TextureFormat *sf = !ok && (surface.memory || surfaceRange(task, tex, surface)) ? textureFormat(surface.format) : nullptr;
+	if (sf && (surface.format == 80 || zero) && surface.width <= 16384) {
+		const uint32_t rowBytes = surface.width * sf->bpp;
+
 		cardToMemory(surface.surface);
 		dropShadows(surface.surface, task, surface.base);
-		auto *line = static_cast<uint32_t *>(IOMalloc(surface.width * 4));
+		auto *line = static_cast<uint32_t *>(IOMallocZero(rowBytes));
 		ok = line;
-		for (uint32_t x = 0; line && x < surface.width; x++)
+		for (uint32_t x = 0; line && surface.format == 80 && x < surface.width; x++)
 			line[x] = pixel;
 		for (uint32_t y = 0; ok && y < surface.height; y++)
-			ok = surface.memory->writeBytes(surface.base + static_cast<uint64_t>(y) * surface.bytesPerRow, line, surface.width * 4) == surface.width * 4;
+			ok = surface.memory->writeBytes(surface.base + static_cast<uint64_t>(y) * surface.bytesPerRow, line, rowBytes) == rowBytes;
 		if (line)
-			IOFree(line, surface.width * 4);
+			IOFree(line, rowBytes);
 	}
 	if (mDrawLines[task & 63] < 40 && ++mDrawLines[task & 63])
 		pvlog("host: render: clear texture %u to RGBA8 (%u, %u, %u, %u) = BGRA8 pixel 0x%08x on the card: %s", tex, r, g, b, a, pixel, ok ? "done" : "NOT done");
+	return tex;
+}
+
+// A render pass: each colour attachment's load action (attachment 1 is CoreGraphics' path coverage, which its shaders draw into alone), and
+// attachment 0's texture, the target of the pass's draws unless their shader writes another.
+uint32_t RDNA4PvHost::runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes) {
+	if (!gCompute || bytes < 0x88)
+		return 0;
+
+	if (gTalk)
+		logPassDescriptor(p, bytes);
+
+	const uint32_t tex = clearAttachment(task, p);
+
+	for (uint32_t k = 1; k < 8 && 0x88 + 0x3c * k <= bytes; k++)
+		(void)clearAttachment(task, p + 0x3c * k);
+
 	return tex;
 }
 
@@ -2437,6 +2802,62 @@ uint32_t RDNA4PvHost::idleBarrier(uint32_t *out)
 
 // A texture's `bytes` at `gpu` filled with `pattern` by the card, left in flight like a draw into it (task << 16 | tex among the draws
 // in flight: a CPU copy of it waits). False if the IB does not hold it or the buffers are not made yet.
+// A render pass with a stencil attachment: its load action (0 don't care, 1 load, 2 clear) noted for its buffer on the card, filled with
+// the value before the pass's first draw (stencilFor: its size is the target's, known then). Don't care: cleared to 0 as well.
+void RDNA4PvHost::stencilPass(uint32_t task, uint32_t tex, uint32_t load, uint32_t value) {
+	if (load != 1)
+		stencilSlot(task, tex).clear = load == 2 ? static_cast<int32_t>(value & 0xff) : 0;
+}
+
+// A task's texture's slot: its own, else the least used given up for it, without memory until a draw gives it a size, to be cleared to 0
+// (what a pass that loads finds in a buffer it never had).
+RDNA4PvHost::StencilBuf &RDNA4PvHost::stencilSlot(uint32_t task, uint32_t tex) {
+	StencilBuf *slot = &mStencil[0];
+
+	for (StencilBuf &s : mStencil)
+		if (s.task == task && s.tex == tex && (s.handle || s.clear >= 0))
+			return s;
+	for (StencilBuf &s : mStencil)
+		slot = s.used < slot->used ? &s : slot;
+	if (slot->handle) {
+		waitDraws();   // draws in flight may use it
+		gCompute->rtFree(this, slot->handle);
+	}
+	*slot = {task, tex, 0, 0, 0, 0, 0, ++mStencilClock, 0};
+
+	return *slot;
+}
+
+// The stencil buffer of a task's texture for a target of width x height: made (or remade larger) on the card, its pending clear done.
+const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t tex, uint32_t width, uint32_t height) {
+	StencilBuf *slot = &stencilSlot(task, tex);
+
+	slot->used = ++mStencilClock;
+
+	if (!slot->handle || width > slot->width || height > slot->height) {
+		if (slot->handle) {
+			waitDraws();
+			gCompute->rtFree(this, slot->handle);
+			slot->clear = slot->clear >= 0 ? slot->clear : 0;   // its contents are lost with it
+		}
+		slot->width = width > slot->width ? width : slot->width;
+		slot->height = height > slot->height ? height : slot->height;
+		slot->bytes = static_cast<uint64_t>((slot->width + 255) & ~255u) * ((slot->height + 255) & ~255u);   // whole 256x256 tiles
+		slot->handle = 0;
+		if (gCompute->rtAlloc(this, slot->bytes, slot->handle, slot->gpu) != kIOReturnSuccess) {
+			*slot = {};
+			return nullptr;
+		}
+	}
+	if (slot->clear >= 0) {   // one value everywhere: the tiling does not matter
+		if (!clearOnCard(task, tex, slot->gpu, slot->bytes, static_cast<uint32_t>(slot->clear) * 0x01010101u))
+			return nullptr;
+		slot->clear = -1;
+	}
+
+	return slot;
+}
+
 bool RDNA4PvHost::clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_t bytes, uint32_t pattern)
 {
 	static constexpr uint32_t kChunk = 1u << 20;
@@ -2818,7 +3239,7 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out)
 {
 	uint32_t rec[3], td[160] = {};   // a mipmapped texture's levels come before its format (6 levels: 29 dwords more)
 
-	if (!readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
+	if (!readRec(task, id, rec))
 		return false;
 
 	out.type = rec[0] & 0xff;
@@ -2836,7 +3257,7 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out)
 	}
 
 	const uint32_t bytes = (rec[0] >> 8) < sizeof(td) ? rec[0] >> 8 : sizeof(td);
-	const bool read = readGuest(task, rec[1], reinterpret_cast<uint8_t *>(td), bytes);
+	const bool read = readDesc(task, rec, td, bytes);
 	static uint32_t dumped[16];
 
 	if (read && out.type != 2 && dumped[out.type & 15]++ < 4)
@@ -4116,16 +4537,37 @@ const RDNA4PvHost::PipelineInfo &RDNA4PvHost::pipelineInfo(uint32_t task, uint32
 	uint64_t pd[8] = {};
 	uint32_t pbytes = 0, fn[3] = {};
 
-	readGuest(task, 0x1000 + 12ull * pipeline, reinterpret_cast<uint8_t *>(rec), sizeof(rec));
+	const bool recOk = readGuest(task, 0x1000 + 12ull * pipeline, reinterpret_cast<uint8_t *>(rec), sizeof(rec));
 
-	// The pipeline: {16-byte header, u8 n, n x {u8 key, u8 size, value}}: key 1 the vertex function, key 2 the fragment function (measured).
-	if (resourceType(task, pipeline, pd, &pbytes) == 7 && pbytes >= 17) {
-		const auto *pb = reinterpret_cast<const uint8_t *>(pd);
+	// A free slot ({0, ~0, ~0}) the guest has not deleted yet (DeleteHostResourceID drops the copy): the pipeline as it was read before.
+	if (!rec[0] && rec[1] == 0xffffffffu && rec[2] == 0xffffffffu) {
+		for (PipelineInfo &e : mPipelines) {
+			if (!e.valid || e.task != task || e.pipeline != pipeline)
+				continue;
 
-		for (uint32_t k = 0, at = 17; k < pb[16] && at + 2 <= pbytes; k++, at += 2 + pb[at + 1])
-			if (pb[at] >= 1 && pb[at] <= 2 && pb[at + 1] == 4 && at + 6 <= pbytes)
-				memcpy(&fn[pb[at]], pb + at + 2, 4);
+			static uint32_t keptLines;
+
+			if (keptLines++ < 8)
+				pvstat("host: render: task %u pipeline %u: freed in the guest's heap, not deleted yet: drawn as read before", task, pipeline);
+			e.used = ++mPipelineClock;
+
+			return e;
+		}
 	}
+
+	// The whole descriptor (its first 64 bytes, pd, are part of the key): {16-byte header, u8 n, n x {u8 key, u8 size, value}}, key 1 the
+	// vertex function, key 2 the fragment function (pipelineKeys). Read from the first 64 bytes only, a pipeline with more entries before
+	// them had none (Tahoe's WindowServer, 2026-11-10).
+	static uint8_t pb[1024];   // ponytail: one host, draws run one at a time on its work loop
+	const uint32_t len = rec[0] >> 8;
+	const bool isPipeline = resourceType(task, pipeline, pd, &pbytes) == 7;
+	const uint32_t got = isPipeline && len >= 17 && len <= sizeof(pb) &&
+	                     readGuest(task, rec[1] | static_cast<uint64_t>(rec[2]) << 32, pb, len) ? len : 0;
+	uint32_t top[16];
+
+	pipelineKeys(pb, got, top);
+	fn[1] = top[1];
+	fn[2] = top[2];
 
 	for (unsigned k = 1; k <= 2; k++)
 		if (fn[k] && fn[k] <= 0x10000)
@@ -4146,6 +4588,11 @@ const RDNA4PvHost::PipelineInfo &RDNA4PvHost::pipelineInfo(uint32_t task, uint32
 		lru = e.used < lru->used ? &e : lru;
 	}
 
+	// one entry per pipeline: a slot the guest reused holds a new one, and the fallback above must not find the old
+	for (PipelineInfo &o : mPipelines)
+		if (o.valid && o.task == task && o.pipeline == pipeline)
+			o.valid = false;
+
 	PipelineInfo &e = *lru;
 
 	e = {};
@@ -4156,17 +4603,97 @@ const RDNA4PvHost::PipelineInfo &RDNA4PvHost::pipelineInfo(uint32_t task, uint32
 	memcpy(e.fnRec, fnRec, sizeof(fnRec));
 	memcpy(e.fn, fn, sizeof(fn));
 
-	// Colour attachment 0's blend state, from the pipeline's descriptor (readBlendState, pvdraw.hpp), and its vertex descriptor as the
-	// vertex stage's attribute records (pvdraw.hpp, include/rdna4mtlc.h).
-	static uint8_t pb[1024];   // ponytail: one host, draws run one at a time on its work loop
-	const uint32_t len = rec[0] >> 8;
-	const uint32_t got = len >= 17 && len <= sizeof(pb) && readGuest(task, rec[1], pb, len) ? len : 0;
+	static uint32_t keyLines;
 
-	readBlendState(pb, got, e.blend);
+	if ((!fn[1] || !fn[2]) && keyLines++ < 24) {
+		const uint64_t recVa = 0x1000 + 12ull * pipeline;
+
+		pvstat("host: render: task %u pipeline %u: type %u, %u-byte descriptor (%u read): %u entries, keys 0-3 0x%x 0x%x 0x%x 0x%x, 8 0x%x: "
+		       "no %s function", task, pipeline, rec[0] & 0xff, len, got, got ? pb[16] : 0, top[0], top[1], top[2], top[3], top[8],
+		       fn[1] ? "fragment" : "vertex");
+		for (uint32_t i = 0; i < got && i < 64; i += 32) {   // the descriptor itself (the short ones: Tahoe's RenderBox)
+			char line[120];
+			size_t lat = 0;
+
+			for (uint32_t j = i; j < i + 32 && j < got; j += 4)
+				lat += static_cast<size_t>(snprintf(line + lat, sizeof(line) - lat, " %08x", static_cast<uint32_t>(pb[j] | pb[j + 1] << 8 | pb[j + 2] << 16) | static_cast<uint32_t>(pb[j + 3]) << 24));
+			pvstat("host: render:   descriptor +%u:%s", i, line);
+		}
+		pvstat("host: render:   its record at 0x%llx %s: %08x %08x %08x; root page 0x%x, the record's page 0x%x; the task defined %u time(s), "
+		       "the last %llu ms ago", recVa, recOk ? "read" : "NOT read (not mapped)", rec[0], rec[1], rec[2], mTaskRoot[task & 63],
+		       guestPfn(task, recVa, false), mTaskDefs[task & 63], (nowNs() - mTaskDefinedNs[task & 63]) / 1000000);
+
+		const uint32_t seen = mFifoMap && mExecStampIndex < 0x1000 / 4
+		                      ? reinterpret_cast<volatile uint32_t *>(mFifoMap->getVirtualAddress())[mExecStampIndex] : 0;
+
+		pvstat("host: render:   in a command buffer from %s with signal %u; stamp[%u] the guest sees is %u: %s; %u draws in flight, %u stamps "
+		       "held back", mExecTag, mExecSignal, mExecStampIndex, seen,
+		       static_cast<int32_t>(seen - mExecSignal) >= 0 ? "ALREADY told it is done" : "not told it is done yet", mPending, mLateCount);
+
+		// whose heap has a pipeline (type 7) at this id: another task's, if any
+		char others[160] = "";
+		size_t at = 0;
+
+		for (uint32_t t = 0; t < 64 && at + 24 < sizeof(others); t++) {
+			uint32_t r[3] = {};
+
+			if (t != (task & 63) && mTaskRoot[t] && readGuest(t, recVa, reinterpret_cast<uint8_t *>(r), sizeof(r)) && (r[0] & 0xff) == 7)
+				at += snprintf(others + at, sizeof(others) - at, " %u (%u bytes)", t, r[0] >> 8);
+		}
+
+		pvstat("host: render:   pipeline %u as a type-7 record in the heaps of tasks:%s", pipeline, at ? others : " none");
+
+		// the ExecIndirect's whole payload {task, n, n resource entries, u64 command buffer, u64 length}, 8 dwords a line, and where the pipeline's
+		// id appears in it
+		static uint32_t payloadDumps;
+
+		if (payloadDumps++ < 6) {
+			for (uint32_t i = 0; i < mExecPayloadDwords; i += 8) {
+				char line[120];
+				size_t lat = 0;
+
+				for (uint32_t j = i; j < i + 8 && j < mExecPayloadDwords; j++)
+					lat += snprintf(line + lat, sizeof(line) - lat, " %08x", mExecPayload[j]);
+				pvstat("host: render:   payload +%u:%s", i * 4, line);
+			}
+		}
+
+		char where[80] = "";
+		size_t wat = 0;
+
+		for (uint32_t j = 2; j < mExecPayloadDwords && wat + 8 < sizeof(where); j++)
+			if (mExecPayload[j] == pipeline)
+				wat += snprintf(where + wat, sizeof(where) - wat, " +%u", j * 4);
+		pvstat("host: render:   pipeline %u in its command buffer's payload (%u dwords) at:%s", pipeline, mExecPayloadDwords, wat ? where : " nowhere");
+
+		uint64_t deletedAt = 0;
+
+		for (const Deleted &d : mDeleted)
+			if (d.task == (task & 63) && d.id == pipeline && d.at > deletedAt)
+				deletedAt = d.at;
+		if (deletedAt)
+			pvstat("host: render:   pipeline %u of task %u was deleted %llu ms ago (DeleteHostResourceID)", pipeline, task, (nowNs() - deletedAt) / 1000000);
+		else
+			pvstat("host: render:   pipeline %u of task %u: no DeleteHostResourceID for it among the last 256 (never read while valid?)", pipeline, task);
+	}
+
+	// The colour attachments' blend states, from the pipeline's descriptor (readBlendStates, pvdraw.hpp), and its vertex descriptor as the
+	// vertex stage's attribute records (pvdraw.hpp, include/rdna4mtlc.h).
+	readBlendStates(pb, got, e.blend);
 	e.attributesKnown = readVertexDescriptor(pb, got, e.attributes, e.skipped);
 
-	for (unsigned k = 1; k <= 2; k++)
+	for (unsigned k = 1; k <= 2; k++) {
 		e.named[k] = fn[k] && functionName(task, fn[k], e.name[k], sizeof(e.name[k]), e.hash[k], &e.lib[k]);
+
+		const FnInfo *kept = !e.named[k] && fn[k] ? keptFunction(task, fn[k]) : nullptr;
+
+		if (kept) {   // its library already freed: as the scan read it
+			memcpy(e.name[k], kept->name, sizeof(e.name[k]));
+			memcpy(e.hash[k], kept->hash, sizeof(e.hash[k]));
+			e.lib[k] = kept->lib;
+			e.named[k] = true;
+		}
+	}
 
 	e.valid = true;
 	e.used = ++mPipelineClock;
@@ -4189,14 +4716,28 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint32_t count = draw.count;
 	const bool talk = (mDrawLines[task & 63] < 40 && ++mDrawLines[task & 63]) || gTalk;
 	const PipelineInfo &pi = pipelineInfo(task, pipeline);
-	const uint32_t (&fn)[3] = pi.fn, (&blend)[10] = pi.blend;
+	const uint32_t (&fn)[3] = pi.fn;
 	uint32_t attributes[RDNA4_MTLC_MAX_ATTRIBUTES][4];
 	const uint32_t (&skippedAttributes)[RDNA4_MTLC_MAX_ATTRIBUTES] = pi.skipped;
 	const bool attributesKnown = pi.attributesKnown;
 
 	memcpy(attributes, pi.attributes, sizeof(attributes));
 
-	const char *why = !fn[1] || !fn[2] ? "the pipeline has no vertex or no fragment function"
+	// A pipeline without a fragment function (Metal's stencil-only passes: RenderBox's path fills on Tahoe) draws with an empty one:
+	// air2amdgpu's `fragment void f() {}` for gfx1201, a null export and s_endpgm, writing no colour (RGFX header bit 31).
+	static uint32_t nullPsBlob[8 + 64];
+	static Jit nullPs;
+
+	if (!nullPs.gfx) {
+		const uint32_t head[8] = {0x58464752, 2, 64 * 4, 0x020f0000, 0, 1, 1, 0x80000000u}, code[3] = {0xf8000800, 0, 0xbfb00000};
+
+		memcpy(nullPsBlob, head, sizeof(head));
+		for (uint32_t i = 0; i < 64; i++)
+			nullPsBlob[8 + i] = i < 3 ? code[i] : 0xbf9f0000;   // then s_code_end
+		nullPs.gfx = reinterpret_cast<uint8_t *>(nullPsBlob);
+		nullPs.gfxLen = sizeof(nullPsBlob);
+	}
+	const char *why = !fn[1] ? "the pipeline has no vertex function"
 	                : !attributesKnown ? "the pipeline's vertex descriptor is not understood"
 	                : draw.type > 4 ? "an unknown primitive type"
 	                : !draw.instances ? "no instances"
@@ -4210,7 +4751,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	char name[3][64] = {};
 	for (unsigned k = 1; k <= 2 && !why; k++) {
 		memcpy(name[k], pi.name[k], sizeof(name[k]));
-		shader[k] = pi.named[k] ? translated(task, pi.lib[k], name[k], pi.hash[k]) : nullptr;
+		shader[k] = k == 2 && !fn[2] ? &nullPs : pi.named[k] ? translated(task, pi.lib[k], name[k], pi.hash[k]) : nullptr;
 		// The RGFX header: {"RGFX", u32 stage, u32 code bytes, ...}; the code must fit its slot with room for the prefetch.
 		const auto *head = shader[k] && shader[k]->gfx && shader[k]->gfxLen >= 32 ? reinterpret_cast<const uint32_t *>(shader[k]->gfx) : nullptr;
 		const uint32_t room = (k == 1 ? RDNA4_TRI_PS_OFFSET : RDNA4_TRI_CODE_BYTES - RDNA4_TRI_PS_OFFSET) - 4 * RDNA4_TRI_SHADER_PAD;
@@ -4218,8 +4759,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		if (!head || head[1] != k || head[2] > room || head[2] + 32 > shader[k]->gfxLen) {
 			why = k == 1 ? "no translated vertex shader" : "no translated fragment shader";
 
-			if (mShaderLines++ < 8)
-				pvstat("host: render: pipeline %u's %s function \"%s\" (named %u, hash %02x%02x%02x%02x): %s", pipeline, k == 1 ? "vertex" : "fragment",
+			if (mShaderLines++ < 32)
+				pvstat("host: render: task %u pipeline %u's %s function \"%s\" (named %u, hash %02x%02x%02x%02x): %s", task, pipeline, k == 1 ? "vertex" : "fragment",
 				       name[k], pi.named[k], pi.hash[k][0], pi.hash[k][1], pi.hash[k][2], pi.hash[k][3],
 				       !shader[k] ? "no translation" : !head ? "a kernel, not a shader" : "its RGFX header does not fit");
 		}
@@ -4230,6 +4771,13 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint32_t *vs = why ? nullptr : reinterpret_cast<const uint32_t *>(shader[1]->gfx), *ps = why ? nullptr : reinterpret_cast<const uint32_t *>(shader[2]->gfx);
 	const uint32_t outs = vs ? vs[7] : 0, ins = ps ? ps[7] & 0xffff : 0;
 	const bool noColour = ps && ps[7] >> 31;   // the fragment shader writes no colour (air2amdgpu.cpp: textures, say)
+	// the one attachment other than 0 it writes (air2amdgpu.cpp, bits 28-30: CoreGraphics' path coverage into attachment 1): drawn into
+	// that attachment's texture
+	const uint32_t attachment = ps ? (ps[7] >> 28) & 7 : 0;
+	const uint32_t (&blend)[10] = pi.blend[attachment];   // that attachment's blending and write mask (RenderBox's differ per attachment)
+
+	if (attachment)
+		target = draw.attachments[attachment];
 	uint32_t inputCntl[16] = {};
 	bool sprite = false;
 	// in 64 bits: the code's length is the helper's, which translated what an app sent (a length near 4 GiB wrapped past the check)
@@ -4263,28 +4811,54 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	bool bgra = true;   // swapped into and out of the staged RGBA8 target
 	// RGBA8 (70, 71) as BGRA8, but already in the staged target's order; RGBA16Float (115: CoreAnimation renders symbols into it) as
 	// itself, 8 bytes a pixel.
-	const auto known = [](uint32_t f) { return f == 70 || f == 71 || f == 80 || f == 81 || f == 115; };
+	// 65: RG16Float; 10: R8Unorm, 25: R16Float, 90: RGB10A2Unorm (CoreAnimation's masks and icons on Tahoe)
+	const auto known = [](uint32_t f) { return f == 10 || f == 25 || f == 65 || f == 70 || f == 71 || f == 80 || f == 81 || f == 90 || f == 115; };
+	const auto pixelBytes = [](uint32_t f) { const TextureFormat *fm = textureFormat(f); return fm ? fm->bpp : 4; };
 	uint32_t storage = 0;
 	const bool found = !why && textureRange(task, target, &va, &len, &bpr, &width, &texHeight, &targetFormat, &storage) && width;
 	const bool fitsKnown = known(targetFormat) && texHeight && static_cast<uint64_t>(bpr) * texHeight <= len;
-	const bool fitsPlain = !targetFormat && bpr == width * 4 && bpr && len % bpr == 0;   // of unknown format: unpadded 32-bit rows
+	// of unknown format: unpadded 32-bit rows, as many as the descriptor says (its allocation may hold mipmaps after them: 1792x128 on
+	// Tahoe's Dock), else as many as fill it
+	const bool fitsPlain = !targetFormat && bpr == width * 4 && bpr && (texHeight ? static_cast<uint64_t>(bpr) * texHeight <= len : len % bpr == 0);
 
-	if (found && bpr >= width * (targetFormat == 115 ? 8 : 4) && (fitsKnown || fitsPlain)) {
-		height = targetFormat ? texHeight : static_cast<uint32_t>(len / bpr);
-		bgra = targetFormat != 70 && targetFormat != 71 && targetFormat != 115;
+	if (found && bpr >= width * pixelBytes(targetFormat) && (fitsKnown || fitsPlain)) {
+		height = targetFormat || texHeight ? texHeight : static_cast<uint32_t>(len / bpr);
+		bgra = !targetFormat || targetFormat == 80 || targetFormat == 81;
 	}
-	else if (!why && surfaceRange(task, target, surface) && surface.format == 80) {
+	else if (!why && surfaceRange(task, target, surface) && known(surface.format) && surface.format != 70 && surface.format != 71 &&
+	         surface.format != 81) {   // BGRA8, or as the texture of that format (115: CoreAnimation's extended-range layers on Tahoe)
 		bpr = surface.bytesPerRow;
 		width = surface.width;
 		height = surface.height;
+
+		if (surface.format != 80) {
+			targetFormat = surface.format;
+			bgra = false;
+		}
 	}
 	if (!why && !(width && height && width <= 16384 && height <= 16384)) {
 		static uint32_t refusedTargets;
 
 		why = "the colour attachment is neither a linear 32-bit or RGBA16Float texture nor a BGRA8 IOSurface";
-		if (refusedTargets++ < 8)
-			pvlog("host: render: colour attachment %u: format %u, %ux%u, %u bytes per row, %llu bytes: not supported yet", target, targetFormat,
+		if (!resourceType(task, target))
+			logFreedTexture(task, target);
+
+		if (refusedTargets++ < 8) {
+			Surface seen;   // its own: surfaceRange retains what it finds, and `surface` may hold one already
+
+			pvlog("host: render: colour attachment %u (resource type %u, IOSurface format %u): format %u, %ux%u, %u bytes per row, %llu bytes: "
+			      "not supported yet", target, resourceType(task, target), surfaceRange(task, target, seen) ? seen.format : 0, targetFormat,
 			      width, texHeight, bpr, static_cast<unsigned long long>(len));
+
+			// its whole descriptor, to find what it is (the format is not where textureRange looks)
+			uint32_t rec[3] = {}, d[64] = {};
+			const uint32_t bytes = readRec(task, target, rec) ? (rec[0] >> 8 < sizeof(d) ? rec[0] >> 8 : static_cast<uint32_t>(sizeof(d))) : 0;
+			if (bytes && readGuest(task, rec[1] | static_cast<uint64_t>(rec[2]) << 32, reinterpret_cast<uint8_t *>(d), bytes))
+				for (uint32_t i = 0; i < bytes / 4; i += 16)
+					pvlog("host: render:   its descriptor (%u bytes) +%02x: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+					      bytes, i * 4, d[i], d[i + 1], d[i + 2], d[i + 3], d[i + 4], d[i + 5], d[i + 6], d[i + 7], d[i + 8], d[i + 9], d[i + 10],
+					      d[i + 11], d[i + 12], d[i + 13], d[i + 14], d[i + 15]);
+		}
 	}
 	// The viewport: Render.setViewport's, else the whole target; whole pixels only so far (window = origin + (ndc + 1) * size / 2, y down).
 	int64_t vx = 0, vy = 0, vw = width, vh = height;
@@ -4306,7 +4880,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// The target in place when the colour block can write it as the guest has it (its rows a multiple of 128 bytes apart, its base 256-byte
 	// aligned): no staging, no copies, and BGRA8 swapped by the colour block (COMP_SWAP) instead of the CPU. Else staged at a pitch of its own.
 	const bool half = targetFormat == 115;
-	const uint32_t tp = half ? 8 : 4;   // bytes a pixel
+	const uint32_t tp = pixelBytes(targetFormat);   // bytes a pixel
 	const bool inPlace = (gInPlace & 2) && !(bpr % 128) && !((surface.memory ? surface.base : va) & 0xff);
 	const uint32_t pitch = inPlace ? bpr / tp : (width * tp + 127) / 128 * 128 / tp;   // pixels; staged: a multiple of 128 bytes
 
@@ -4417,12 +4991,16 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// Metal's point, line, line strip, triangle and triangle strip: DI_PT_POINTLIST .. DI_PT_TRISTRIP, and the NGG stage's output points,
 	// lines or triangles (the hardware passes the primitive's vertices to the shader, which exports it as given).
 	static const uint32_t kPrimitive[5][2] = {{1, 0}, {2, 1}, {3, 1}, {4, 2}, {6, 2}};
+	// CB_COLOR0_INFO (gfx12.json: FORMAT 0-4, NUMBER_TYPE 8-10, COMP_SWAP 11-12, BLEND_CLAMP 15, SIMPLE_FLOAT 17): 8_8_8_8 unorm (COMP_SWAP
+	// ALT: BGRA8); else by the target's format, as Mesa's ac_formats.c maps it: 16_16_16_16 float, 16_16 float, 8 unorm, 16 float, 2_10_10_10 unorm
+	const uint32_t cbInfo = half ? 0x0002070cu : targetFormat == 65 ? 0x00020705u : targetFormat == 10 ? 0x00020001u : targetFormat == 25 ? 0x00020702u
+	                      : targetFormat == 90 ? 0x00020009u : (inPlace || held) && bgra ? 0x0002880au : 0x0002800au;
 	struct Patch { uint32_t opcode, reg, value; } patch[] = {
 		{0x76, 0x8a, vs[3]}, {0x76, 0x8b, vs[4]},                          // SPI_SHADER_PGM_RSRC1_GS, RSRC2_GS: as LLVM compiled the vertex shader
 		{0x76, 0x0a, ps[3]}, {0x76, 0x0b, ps[4]},                          // SPI_SHADER_PGM_RSRC1_PS, RSRC2_PS
 		{0x69, 0x197, ps[5]}, {0x69, 0x198, ps[6]},                        // SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR
 		{0x69, 0x31e, (pitch - 1) << 16 | (height - 1)},                    // CB_COLOR0_ATTRIB2: MIP0_WIDTH (the pitch), MIP0_HEIGHT
-		{0x69, 0x3b0, half ? 0x0002070cu : (inPlace || held) && bgra ? 0x0002880au : 0x0002800au},   // CB_COLOR0_INFO: 8_8_8_8 unorm (COMP_SWAP ALT: BGRA8), or 16_16_16_16 float
+		{0x69, 0x3b0, cbInfo},                                              // CB_COLOR0_INFO
 		{0x69, 0x82, (width - 1) | (height - 1) << 16},                    // PA_SC_WINDOW_SCISSOR_BR: inclusive on gfx12
 		{0x69, 0x94, sx | sy << 16},                                       // PA_SC_VPORT_SCISSOR_0_TL, _BR: Metal's scissor rectangle, BR inclusive
 		{0x69, 0x95, (sx2 - 1) | (sy2 - 1) << 16},
@@ -4433,7 +5011,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x79, 0x242, kPrimitive[draw.type][0]},                           // VGT_PRIMITIVE_TYPE
 		{0x79, 0x266, kPrimitive[draw.type][1]},                           // VGT_GS_OUT_PRIM_TYPE
 		{0x76, 0x31, outs ? (outs - 1) | ins << 11 : 0x400u},              // SPI_SHADER_GS_OUT_CONFIG_PS: VS_EXPORT_COUNT, NUM_INTERP; NO_PC_EXPORT
-		{0x69, 0x207, 0x00000240u},                                        // PA_SU_SC_MODE_CNTL: the template's, without PROVOKING_VTX_LAST (Metal's is the first)
+		{0x69, 0x207, 0x00000244u},                                        // PA_SU_SC_MODE_CNTL: the template's, without PROVOKING_VTX_LAST (Metal's is the first); FACE: clockwise is the front (Metal's default winding; only front_facing reads it, nothing is culled)
 		{0x69, 0x1e0, blend[2] ? first.control : 0},                       // CB_BLEND0_CONTROL
 		{0x69, 0x1d8, blend[2] ? first.opt : 0x06000600u},                 // SX_MRT0_BLEND_OPT: else BLEND_DISABLED
 		{0x69, 0x214, noColour ? 0 : split ? mask & 7 : mask},             // CB_TARGET_MASK
@@ -4521,8 +5099,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 	// Colour attachment 0 as the draw finds it, for fragment shaders that read it (Metal's [[color(0)]]; RDNA4_MTLC_TABLE_FRAMEBUFFER): a T# of
 	// the staged RGBA8 target. ponytail: a pixel the same draw covers twice reads the value from before the draw, not its first write.
-	linearImage(reinterpret_cast<uint32_t *>(&misc[(0x800 + RDNA4_MTLC_TABLE_FRAMEBUFFER) / 8]), tgt.gpu, half ? 57 : 42,
-	            (inPlace || held) && bgra ? 6 | 5 << 3 | 4 << 6 | 7 << 9 : 4 | 5 << 3 | 6 << 6 | 7 << 9, width, height, pitch);   // 8_8_8_8 unorm: RGBA
+	// the target as an image (framebuffer fetch): 8_8_8_8 unorm, RGBA (BGRA8 swapped in place), else as its format
+	const TextureFormat *fbFormat = bgra || !targetFormat || targetFormat == 71 ? nullptr : textureFormat(targetFormat);
+	linearImage(reinterpret_cast<uint32_t *>(&misc[(0x800 + RDNA4_MTLC_TABLE_FRAMEBUFFER) / 8]), tgt.gpu, fbFormat ? fbFormat->gfx : 42,
+	            fbFormat ? fbFormat->sel : (inPlace || held) && bgra ? 6 | 5 << 3 | 4 << 6 | 7 << 9 : 4 | 5 << 3 | 6 << 6 | 7 << 9, width, height, pitch);
 	if (!ok && talk)
 		pvlog("host: render: draw with pipeline %u: a texture or sampler could not be set up: not run", pipeline);
 
@@ -4569,8 +5149,59 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// draw VGT_INDEX_TYPE (SET_UCONFIG_REG_INDEX, as RADV on gfx9+); per instance the first vertex and the instance id (USER_DATA_GS_2/3, the
 	// vertex shader's s10-s11) and the draw: DRAW_INDEX_AUTO, or DRAW_INDEX_2 from the staged indices (DI_SRC_SEL_DMA).
 	const uint64_t table[2] = {miscGpu + 0x400, miscGpu + 0x800};
-	uint32_t seq[8 + 6 + 2 + 16 + 3 + 3 + 9 + 2 * 12], m = 0;
+	uint32_t seq[8 + 6 + 2 + 16 + 3 + 3 + 9 + 2 * 12 + 28], m = 0;
 	auto put = [&](uint32_t v) { seq[m++] = v; };
+
+	// The stencil test: the pass's stencil attachment, the depth-stencil state's front and back {u32 compare | ops, u32 read mask, u32 write
+	// mask} (AppleParavirtGPUMetal's PGSerializer newDepthStencilStateWithDescriptor: a type-7 record {4, 40, id, flags: depth compare 0-2,
+	// depth write 3, front 4, back 5, front, back}; the dword: compare 0-2, stencil fail 3-5, depth fail 6-8, pass 9-11, as Metal's
+	// MTLStencilDescriptor). Metal's compare functions are the hardware's; its operations keep, zero, replace, increment clamp, decrement
+	// clamp, invert, increment wrap, decrement wrap are STENCIL_KEEP, ZERO, REPLACE_TEST, ADD_CLAMP, SUB_CLAMP, INVERT, ADD_WRAP, SUB_WRAP
+	// (gfx12.json; DB_STENCIL_OPVAL 1 from the template). Depth is not drawn (Z_INVALID).
+	uint32_t ds[10] = {}, dsRec[3] = {};
+	const bool stencilled = ok && draw.stencil && draw.stencilState && readRec(task, draw.stencilState, dsRec) && (dsRec[0] & 0xff) == 7 &&
+	                        (dsRec[0] >> 8) >= sizeof(ds) && readDesc(task, dsRec, ds, sizeof(ds)) && ds[0] == 4 && (ds[3] & 0x30);
+	const StencilBuf *sb = stencilled ? stencilFor(task, draw.stencil, width, height) : nullptr;
+
+	if (sb) {
+		static const uint8_t kOp[8] = {0, 1, 3, 5, 6, 7, 8, 9};
+		const uint32_t keep[3] = {7, 0xff, 0xff};   // a face without a descriptor: always passes, keeps
+		const uint32_t *face[2] = {ds[3] & 0x10 ? &ds[4] : keep, ds[3] & 0x20 ? &ds[7] : keep};
+		auto ops = [&](uint32_t d) { return kOp[d >> 3 & 7] | kOp[d >> 9 & 7] << 4 | kOp[d >> 6 & 7] << 8; };   // FAIL, ZPASS, ZFAIL
+
+		put(0xc0026900u);   // DB_DEPTH_VIEW, DB_DEPTH_VIEW1: slice 0, mip 0
+		put(0x001);
+		put(0);
+		put(0);
+		put(0xc00b6900u);   // DB_DEPTH_SIZE_XY, DB_Z_INFO, DB_STENCIL_INFO, the Z and stencil read and write bases (256-byte units)
+		put(0x005);
+		put((width - 1) | (height - 1) << 16);
+		put(0);                                   // Z_INVALID
+		put(1 | 3u << 4 | 1u << 29);              // STENCIL_8, SW_64KB_2D, TILE_STENCIL_DISABLE
+		for (uint32_t k = 0; k < 2; k++) {
+			put(0);
+			put(0);
+		}
+		for (uint32_t k = 0; k < 2; k++) {
+			put(static_cast<uint32_t>(sb->gpu >> 8));
+			put(static_cast<uint32_t>(sb->gpu >> 40));
+		}
+		put(0xc0026900u);   // DB_DEPTH_CONTROL: STENCIL_ENABLE, BACKFACE_ENABLE, the functions; DB_STENCIL_CONTROL: the operations
+		put(0x01c);
+		put(1 | 1u << 7 | (face[0][0] & 7) << 8 | (face[1][0] & 7) << 20);
+		put(ops(face[0][0]) | ops(face[1][0]) << 12);
+		put(0xc0046900u);   // DB_STENCIL_REF, DB_STENCIL_OPVAL, DB_STENCIL_READ_MASK, DB_STENCIL_WRITE_MASK: front in 0-7, back in 8-15
+		put(0x022);
+		put((draw.stencilRef[0] & 0xff) | (draw.stencilRef[1] & 0xff) << 8);
+		put(0x101);
+		put((face[0][1] & 0xff) | (face[1][1] & 0xff) << 8);
+		put((face[0][2] & 0xff) | (face[1][2] & 0xff) << 8);
+	}
+	static uint32_t stencilLines;
+	if (draw.stencil && stencilLines++ < 24)
+		pvstat("host: render: task %u pipeline %u: stencil texture %u, state %u (%08x %08x %08x %08x %08x %08x %08x), references %u %u: %s",
+		       task, pipeline, draw.stencil, draw.stencilState, ds[0], ds[3], ds[4], ds[5], ds[6], ds[7], ds[8], draw.stencilRef[0],
+		       draw.stencilRef[1], sb ? "tested" : stencilled ? "NO stencil buffer" : "not tested (no state, or no stencil in it)");
 	put(0xc0046900u);   // CB_BLEND_RED .. ALPHA: Render.setBlendColor's floats
 	put(0x105);
 	for (uint32_t c : draw.blendColor)
@@ -4670,7 +5301,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		cardToMemory(surface.surface);
 
 	for (uint32_t y = sy; y < sy2 && ok && staged; y++)
-		ok = surface.memory ? surface.memory->readBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
+		ok = surface.memory ? surface.memory->readBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * tp) == width * tp
 		                    : readGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * tp);
 	uint64_t fence = 0, ns = 0;
 
@@ -4842,7 +5473,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		}
 
 		for (uint32_t y = sy; y < sy2 && ok && staged; y++)
-			ok = surface.memory ? surface.memory->writeBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * 4) == width * 4
+			ok = surface.memory ? surface.memory->writeBytes(surface.base + static_cast<uint64_t>(y) * bpr, row(y), width * tp) == width * tp
 			                    : copyGuest(task, va + static_cast<uint64_t>(y) * bpr, row(y), width * tp, true);
 	}
 	if (tgt.handle)
@@ -4864,9 +5495,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		           : failedStep ? failedStep : "its colour attachment's rows", name[2]);
 	if (talk)
 		pvlog("host: render: draw of %u %s x %u (type %u) into texture %u (%ux%u) with \"%s\" and \"%s\" on the card: %s (%llu us); blending %u, "
-		      "colour %u %u %u, alpha %u %u %u, mask 0x%x", count, draw.indexBytes ? "indices" : "vertices", draw.instances, draw.type, target,
-		      width, height, name[1], name[2], ok ? "done" : "NOT done", ns / 1000, blend[2], blend[3], blend[4], blend[5], blend[6], blend[7],
-		      blend[8], blend[9]);
+		      "colour %u %u %u, alpha %u %u %u, mask 0x%x; attachment %u, the pipeline's masks %x %x %x %x, formats %u %u %u %u", count,
+		      draw.indexBytes ? "indices" : "vertices", draw.instances, draw.type, target, width, height, name[1], name[2], ok ? "done" : "NOT done",
+		      ns / 1000, blend[2], blend[3], blend[4], blend[5], blend[6], blend[7], blend[8], blend[9], attachment, pi.blend[0][9], pi.blend[1][9],
+		      pi.blend[2][9], pi.blend[3][9], pi.blend[0][1], pi.blend[1][1], pi.blend[2][1], pi.blend[3][1]);
 }
 
 // M2: an SDMA fill (srcVa 0: `pattern`) or copy (from srcVa) over `bytes` of a task's GPU address space, page by page through its page table, the CPU
@@ -5173,10 +5805,10 @@ bool RDNA4PvHost::copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex,
 // none; with desc, its descriptor's first 64 bytes (and their count in bytes).
 uint32_t RDNA4PvHost::resourceType(uint32_t task, uint32_t id, uint64_t *desc, uint32_t *bytes) {
 	uint32_t rec[3];
-	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
+	if (!readRec(task, id, rec))
 		return 0;
 	const uint32_t n = (rec[0] >> 8) < 64 ? rec[0] >> 8 : 64;
-	if (desc && (!n || !readGuest(task, rec[1] | static_cast<uint64_t>(rec[2]) << 32, reinterpret_cast<uint8_t *>(desc), n)))
+	if (desc && (!n || !readDesc(task, rec, desc, n)))
 		return 0;
 	if (bytes)
 		*bytes = n;

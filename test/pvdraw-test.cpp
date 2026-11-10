@@ -92,6 +92,24 @@ int main() {
 		const uint32_t defaults[10] = {0, 0, 0, 1, 0, 0, 1, 0, 0, 0xf};
 		CHECK(!std::memcmp(blend, defaults, sizeof(defaults)));
 	}
+	// readBlendStates: two attachments as RenderBox's on Tahoe ({2, 12, 33}: the lists after the offsets), attachment 1 alpha only, blending.
+	{
+		uint8_t pb[96] = {};
+		pb[16] = 1;   // the function list: key 8 = 0x10, the attachments at 32
+		const uint8_t fns[6] = {8, 4, 0x10, 0, 0, 0};
+		std::memcpy(pb + 17, fns, sizeof(fns));
+		const uint32_t table[3] = {2, 12, 33};
+		std::memcpy(pb + 32, table, sizeof(table));
+		const uint8_t first[21] = {3, 0, 4, 0, 0, 0, 0, 1, 4, 115, 0, 0, 0, 9, 4, 0, 0, 0, 0, 0, 0};
+		const uint8_t second[25] = {4, 0, 4, 1, 0, 0, 0, 1, 4, 10, 0, 0, 0, 2, 4, 1, 0, 0, 0, 9, 4, 1, 0, 0, 0};
+		std::memcpy(pb + 44, first, sizeof(first));
+		std::memcpy(pb + 65, second, sizeof(second));
+		uint32_t all[8][10];
+		readBlendStates(pb, sizeof(pb), all);
+		CHECK(all[0][1] == 115 && all[0][9] == 0 && all[0][2] == 0);
+		CHECK(all[1][0] == 1 && all[1][1] == 10 && all[1][2] == 1 && all[1][9] == 1);
+		CHECK(all[2][0] == 2 && all[2][9] == 0xf);   // not in the descriptor: Metal's defaults
+	}
 	// linearImage: a 64x32 RGBA8 image at a 64-pixel pitch.
 	{
 		uint32_t t[8];

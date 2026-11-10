@@ -775,7 +775,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (!outputs || !inputs)
 		return "the AIR shader's metadata is not as expected";
 	// The inputs: index -> where its value comes from (-1: unused, poison).
-	// 0 vertex id, 1 instance id, 3 the fragment's position, 4 colour attachment 0, 100 + n buffer n, 200 + n texture n, 300 + n sampler n,
+	// 0 vertex id, 1 instance id, 3 the fragment's position, 4 colour attachment 0, 5 front facing, 100 + n buffer n, 200 + n texture n, 300 + n sampler n,
 	// 400 + n input n
 	std::map<unsigned, int> from;
 	// A value between the stages (index: its argument or member); sprite: the point's coordinate, which the hardware makes (no name)
@@ -833,6 +833,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		}
 		else if (!vertex && kind == "air.position" && !unused)
 			from[index] = 3;
+		else if (!vertex && kind == "air.front_facing" && !unused)
+			from[index] = 5;   // FRONT_FACE: > 0 for a front-facing primitive (Mesa's ac_nir_lower_intrinsics_to_args)
 		else if (!vertex && kind == "air.render_target" && !unused && mdInt(a, 2) == 0)
 			from[index] = 4;   // colour attachment 0 as it is (programmable blending): read at the pixel from the host's staged target
 		else if (kind == "air.buffer" && !unused) {
@@ -864,8 +866,9 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	}
 	if (from.size() != air->arg_size())
 		return "not every argument of the AIR shader is described";
-	// A fragment function's colour: float or half, scalar or up to four, alone or as the struct member that is colour attachment 0. The host
-	// draws into attachment 0 only: other attachments' values are dropped (CoreAnimation's mask blit writes the same value to two).
+	// A fragment function's colour: float or half, scalar or up to four, alone or as the struct member that is colour attachment 0, or the
+	// one other attachment it writes (below). The host draws into one attachment: other attachments' values are dropped (CoreAnimation's mask
+	// blit writes the same value to two).
 	unsigned colourMember = 0;
 	auto colourType = [&](Type *t) {
 		if (auto *st = dyn_cast<StructType>(t))
@@ -878,6 +881,10 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	const bool noColour = !vertex && air->getReturnType()->isVoidTy();
 	int position = -1;
 	bool colourZero = false;
+	// Its colour attachment: 0 when it writes that one (the others' values are dropped), else the one other it writes (CoreGraphics' path
+	// coverage and a CoreAnimation mask write a half2 to attachment 1 only, Tahoe 26.6.2): the host draws into that attachment's texture.
+	int attachment = -1, other = -1, otherIndex = 0;
+	unsigned others = 0;
 	for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
 		const auto *o = cast<MDNode>(outputs->getOperand(k));
 		const std::string kind = mdString(o, 0);
@@ -890,12 +897,34 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		else if (!vertex && kind == "air.render_target" && mdInt(o, 1) == 0) {
 			colourMember = k;
 			colourZero = colourType(air->getReturnType());
+			attachment = 0;
+		} else if (!vertex && kind == "air.render_target" && mdInt(o, 1) > 0 && mdInt(o, 1) < 8) {
+			others++;
+			other = static_cast<int>(k);
+			otherIndex = static_cast<int>(mdInt(o, 1));
 		} else if (!(!vertex && kind == "air.render_target")) {
 			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet";
 		}
 	}
-	if (!vertex && !noColour && !colourZero)
-		return "fragment output: colour attachment 0 missing, or not up to four floats or halves";
+	if (!vertex && !noColour && attachment < 0 && others == 1) {
+		colourMember = static_cast<unsigned>(other);
+		colourZero = colourType(air->getReturnType());
+		attachment = otherIndex;
+	}
+	if (!vertex && !noColour && !colourZero) {
+		// what the function returns and each output's kind and index, for adding the case
+		std::string what, type;
+		raw_string_ostream ts(type);
+
+		air->getReturnType()->print(ts);
+		for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
+			const auto *o = cast<MDNode>(outputs->getOperand(k));
+
+			what += " " + mdString(o, 0) + (o->getNumOperands() > 1 && isa<ConstantAsMetadata>(o->getOperand(1)) ? "(" + std::to_string(mdInt(o, 1)) + ")" : "");
+		}
+
+		return "fragment output: colour attachment 0 missing, or not up to four floats or halves; it returns " + ts.str() + ", outputs:" + what;
+	}
 	if (vertex && position < 0)
 		return "the vertex function has no position";
 	if (vars.size() > 16)
@@ -914,13 +943,13 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	// The shader.
 	// vertex: s0-s5, v0-v3; fragment: PrimMask (s0), then the hardware's pixel inputs in their order up to the position (one argument each:
 	// PERSP_SAMPLE, PERSP_CENTER, PERSP_CENTROID, PERSP_PULL_MODEL, LINEAR_SAMPLE, LINEAR_CENTER, LINEAR_CENTROID, LINE_STIPPLE, POS_X, POS_Y,
-	// POS_Z, POS_W); LLVM enables the ones used and reports them (SPI_PS_INPUT_ENA/ADDR).
+	// POS_Z, POS_W, FRONT_FACE); LLVM enables the ones used and reports them (SPI_PS_INPUT_ENA/ADDR).
 	Type *v2f32 = FixedVectorType::get(f32, 2), *v3f32 = FixedVectorType::get(f32, 3), *v4f32 = FixedVectorType::get(f32, 4);
 	SmallVector<Type *, 17> params = vertex ? SmallVector<Type *, 17>(17, i32)   // s0-s7, s8-s11, v0-v4
-	                                        : SmallVector<Type *, 17>{i32, i32, i32, v2f32, v2f32, v2f32, v3f32, v2f32, v2f32, v2f32, f32, f32, f32, f32, f32};
+	                                        : SmallVector<Type *, 17>{i32, i32, i32, v2f32, v2f32, v2f32, v3f32, v2f32, v2f32, v2f32, f32, f32, f32, f32, f32, f32};
 	// The arguments by name: vertex s3, s5, s8-s9, s10, s11, v0, v3; fragment s0-s1, s2, POS_X (the barycentrics: Var::bary).
 	const unsigned kInfo = 3, kAttrOffset = 5, kFirstVertex = 10, kBaseInstance = 11, kPrim = 12, kVertexId = 15, kInstanceId = 16, kPrimMask = 2,
-	               kPosX = 11;
+	               kPosX = 11, kFrontFace = 15;
 	const unsigned kTable = vertex ? 8 : 0;
 	Function *f = Function::Create(FunctionType::get(Type::getVoidTy(ctx), params, false), GlobalValue::ExternalLinkage, vertex ? "vs" : "ps", &m);
 	f->setCallingConv(vertex ? CallingConv::AMDGPU_GS : CallingConv::AMDGPU_PS);
@@ -1065,6 +1094,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			               : from[k] >= 400 ? fromVec4(inValues[static_cast<unsigned>(from[k] - 400)], air->getArg(k)->getType())
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
 			               : from[k] == 4 ? fromVec4(framebuffer(), air->getArg(k)->getType())
+			               : from[k] == 5 ? b.CreateZExtOrTrunc(b.CreateFCmpOGT(f->getArg(kFrontFace), ConstantFP::get(f32, 0.0)), air->getArg(k)->getType())
 			               : from[k] >= 300 ? handle(RDNA4_MTLC_TABLE_SAMPLERS + 16 * static_cast<unsigned>(from[k] - 300), air->getArg(k)->getType())
 			               : from[k] >= 200 ? handle(RDNA4_MTLC_TABLE_TEXTURES + 32 * static_cast<unsigned>(from[k] - 200), air->getArg(k)->getType())
 			               : from[k] >= 100 ? buffer(static_cast<unsigned>(from[k] - 100), air->getArg(k)->getType())
@@ -1207,7 +1237,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (code.empty() || !regs[0])
 		return "no code or no register values in the shader object";
 	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3],
-	                          static_cast<uint32_t>(vars.size()) | (noColour ? 1u << 31 : 0)};
+	                          static_cast<uint32_t>(vars.size()) | (attachment > 0 ? static_cast<uint32_t>(attachment) << 28 : 0) | (noColour ? 1u << 31 : 0)};
 	out.hsaco.assign(reinterpret_cast<const char *>(head), sizeof(head));
 	out.hsaco += code.str();
 	for (const Var &v : vars) {

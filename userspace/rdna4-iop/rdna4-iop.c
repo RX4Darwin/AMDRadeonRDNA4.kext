@@ -67,11 +67,39 @@ static uid_t consoleUser(void)
 	return stat("/dev/console", &st) || st.st_uid < 501 ? 0 : st.st_uid;
 }
 
+/* Metal on Tahoe x86_64 aborts every process that loads a binary archive on the paravirtual device: +[MTLLoader
+ * sliceIDForDevice:legacyDriverVersion:airntDriverVersion:] asserts when the device has no targetDeviceArchitecture, which
+ * AppleParavirtGPUMetal's device does not implement (RenderBox: the Dock's icons, Spotlight; 2026-11-10). With the paravirtual
+ * displays Metal's failures are ignored instead (METAL_ERROR_MODE 4, read by Metal from the global domain), and the archive is not
+ * used; in any other boot the setting is removed. */
+static void metalErrorMode(int heads, int dryRun)
+{
+	const CFStringRef key = CFSTR("METAL_ERROR_MODE");
+	const int ignore = 4;
+	CFNumberRef want = heads ? CFNumberCreate(NULL, kCFNumberIntType, &ignore) : NULL;
+	CFPropertyListRef now = CFPreferencesCopyValue(key, kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+	const int same = (!now && !want) || (now && want && CFEqual(now, want));
+
+	if (!same && !dryRun) {
+		CFPreferencesSetValue(key, want, kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+		if (!CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost))
+			fprintf(stderr, "rdna4-iop: METAL_ERROR_MODE could not be written\n");
+	}
+	printf("rdna4-iop: METAL_ERROR_MODE %s%s\n", heads ? "4 (ignore)" : "unset", same ? ", as this boot needs" : dryRun ? " (not changed: -n)" : "");
+
+	if (want)
+		CFRelease(want);
+	if (now)
+		CFRelease(now);
+}
+
 int main(int argc, char **argv)
 {
 	const int dryRun = argc > 1 && !strcmp(argv[1], "-n");
 	const int heads = pvHeads();
 	const int now = current();
+
+	metalErrorMode(heads, dryRun);
 
 	/* the paravirtual displays need it on; every other boot the default (unset) */
 	if ((heads && now == 1) || (!heads && now == -1)) {
