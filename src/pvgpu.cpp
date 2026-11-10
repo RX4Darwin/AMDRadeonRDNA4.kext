@@ -719,7 +719,7 @@ private:
 	void noteUsed(Mapping *m);
 	void markUsed(uint64_t submit, uint64_t serial);
 	// Held, or read by a draw not submitted yet (being put together, or batched): its address is in that draw's tables already.
-	bool shadowBusy(const Shadow &s) const { return (mHeld.active && mHeld.shadow == &s) || (s.serial > mDrawSerial && s.serial != ~0ull); }
+	bool shadowBusy(const Shadow &s) const { return isHeld(s) || (s.serial > mDrawSerial && s.serial != ~0ull); }
 	void freeShadow(Shadow &s);
 	static constexpr uint64_t kShadowAge = 250000000;   // ns
 	// A read-only texture's shadow: what writes it are blits and the CPU before its first use (a desktop picture: 59 MB, read across the bus
@@ -744,22 +744,41 @@ private:
 	void drewInto(const OSObject *surface, uint32_t task, uint64_t at, const Draw &draw, uint32_t width, uint32_t height, uint32_t bpp);
 	uint32_t mCardFills { 0 }, mCardFlushes { 0 };   // shadows on the card filled and written back by the card, for the draw stats
 	bool shadowTexture(uint32_t task, uint32_t id, const TextureSource &src, uint32_t bpp, uint64_t &gpu, uint32_t &pitch);
-	bool copyHeld(uint32_t width, uint32_t height, uint32_t bpp, uint64_t &gpu, uint32_t &pitch);
 	uint64_t texturePrint(uint32_t task, const TextureSource &src, uint32_t bpp);
 	void dropShadows(const OSObject *surface, uint32_t task, uint64_t at, bool all = false);
 	void clearShadows(const OSObject *surface, uint32_t task, uint64_t at, uint32_t tex, uint32_t pattern);
 	void dropShadowRange(uint32_t task, uint64_t va, uint64_t bytes);
-	// A colour target the card cannot write in place, drawn into its shadow from the first draw into it until another target, the end of
-	// the command buffer, a blit, a dispatch or a clear (flushHeld: its drawn rows written back), its draws left in flight; instead of each
-	// draw copying its rows in and out and waiting for the card. The colour block swaps BGRA8 as for a target in place.
+	// A colour target the card cannot write in place, drawn into its shadow from the first draw into it until something reads or writes its
+	// memory otherwise (flushHeld: its drawn rows written back): the end of the command buffer, a blit, a dispatch, a draw sampling it or
+	// drawing over its memory in place, a clear of its memory; its draws left in flight, instead of each draw copying its rows in and out
+	// and waiting for the card. The colour block swaps BGRA8 as for a target in place. Up to kHelds at once: with one, WindowServer's
+	// passes, which draw into several such targets in turn, wrote one back at each switch (some 450 a second while a translucent window was
+	// dragged across the displays' edge, 2026-11-10), each after the card had drained.
 	struct HeldTarget {
 		bool active { false };
 		uint32_t task { 0 }, target { 0 };
 		Shadow *shadow { nullptr };
 		IOMemoryDescriptor *memory { nullptr };   // a surface's, held and prepared while active
 		uint32_t top { 0 }, bottom { 0 };         // the rows drawn
+		uint64_t used { 0 };                      // mHeldClock when last held for a draw: the least recently used one goes first
 	};
-	HeldTarget mHeld;
+	static constexpr uint32_t kHelds = 8;
+	HeldTarget mHelds[kHelds] {};
+	HeldTarget *mHeld { nullptr };                // the one holdTarget or clearHeld held last: the current draw's target
+	uint64_t mHeldClock { 0 };
+	bool isHeld(const Shadow &s) const
+	{
+		for (const HeldTarget &h : mHelds)
+			if (h.active && h.shadow == &s)
+				return true;
+
+		return false;
+	}
+	HeldTarget *heldFor(uint32_t task, uint32_t target);
+	HeldTarget &heldSlot();
+	void flushHeld(HeldTarget &h);
+	void flushHeldIn(const OSObject *surface, uint32_t task, uint64_t at, uint64_t bytes, const HeldTarget *except = nullptr);
+	bool copyHeld(const HeldTarget &h, uint32_t width, uint32_t height, uint32_t bpp, uint64_t &gpu, uint32_t &pitch);
 	bool clearHeld(uint32_t task, uint32_t tex, uint64_t va, uint32_t width, uint32_t height, uint32_t bpr, uint32_t format, bool swap, const uint64_t rgba[4]);
 	bool holdTarget(uint32_t task, uint32_t target, uint64_t va, const Surface &surface, uint32_t width, uint32_t height, uint32_t bpr,
 	                uint32_t tp);
@@ -1509,7 +1528,7 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			// The same for its textures' shadows, found by task and guest address: the earlier process's pixels must not be sampled
 			// as the new one's. Those of IOSurfaces are found by the surface and stay.
 			for (Shadow &sh : mShadows)
-				if (!sh.surface && sh.task == task >> 1 && !(mHeld.active && mHeld.shadow == &sh))
+				if (!sh.surface && sh.task == task >> 1 && !isHeld(sh))
 					sh.valid = false;
 		}
 		// The guest changed a task's page table: the mappings found by that task's VAs are found by their pages again. A release's layout is
@@ -2760,7 +2779,6 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 	if ((actions & 0xffff) != 2 || !tex)   // MTLLoadActionClear
 		return tex;
 
-	flushHeld();
 	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
 	uint64_t va, len;
 	uint32_t bpr = 0, w = 0, h = 0, format = 0;
@@ -2785,6 +2803,11 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 	                      (format == 70 || format == 71 || format == 80 || format == 81 || format == 115 || format == 65 || format == 10 ||
 	                       format == 25 || format == 90 || (!format && w * 4 == bpr));
 	const bool swap = format != 70 && format != 71;   // BGRA8 (and of unknown format, as before)
+	const bool byHeld = drawable && (bpr % 128);   // cleared in a held shadow: the texture's own held target stays, cleared
+
+	// Held targets over the cleared memory written back first: their write-back would otherwise go over the clear.
+	if (found)
+		flushHeldIn(nullptr, task, va, len, byHeld ? heldFor(task, tex) : nullptr);
 
 	if (drawable && mapGuest(task, va, len, handle, gpu, true) && clearByDraw(task, tex, gpu, bpr / tp, w, h, format, swap, rgba)) {
 		dropShadows(nullptr, task, va);
@@ -2792,8 +2815,11 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 		return tex;
 	}
 
-	if (drawable && (bpr % 128) && clearHeld(task, tex, va, w, h, bpr, format, swap, rgba))
+	if (byHeld && clearHeld(task, tex, va, w, h, bpr, format, swap, rgba))
 		return tex;
+
+	if (found)
+		flushHeldIn(nullptr, task, va, len);   // its own held target too: cleared in the guest's memory from here on
 
 	if (ok && mapGuest(task, va, len, handle, gpu, true) && clearOnCard(task, tex, gpu, len, pattern)) {
 		clearShadows(nullptr, task, va, tex, pattern);
@@ -2803,6 +2829,8 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 
 	if (!found && surfaceRange(task, tex, surface) && surface.format == 80 && surface.width <= 16384) {
 		const uint64_t bytes = static_cast<uint64_t>(surface.bytesPerRow) * surface.height;
+
+		flushHeldIn(surface.surface, task, surface.base, bytes);
 
 		const bool mapped = onCard(surface, bytes, gpu) || mapMemory(surface.memory, surface.base, bytes, handle, gpu);
 
@@ -2820,6 +2848,7 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 		}
 	}
 
+	flushHeld();
 	waitDraws();   // cleared with SDMA or the CPU, after the draws before
 	ok = ok && dmaGuest(task, va, 0, pattern, len);
 	if (found)
@@ -3556,6 +3585,12 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 
 		ok = textureSource(task, id, src);
 
+		// Over a held target's memory: what was drawn into it written back first. The draw's own held target is read from a copy instead
+		// (copyHeld).
+		if (ok)
+			flushHeldIn(src.surface.surface, task, src.surface.memory ? src.surface.base : src.va,
+			            src.surface.memory ? static_cast<uint64_t>(src.rowBytes) * src.height : src.length, heldFor(task, mDrawTarget));
+
 		// Not a texture at all: a binding left from an earlier encoder whose id was used again (Xgc's slot 3 named a function), which the
 		// shader does not sample. The spare texel as for no binding; refused, it took the whole draw with it.
 		if (!ok && src.type != 2 && src.type != 3 && src.type != 5) {
@@ -3612,8 +3647,8 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		// The held target itself: its shadow on the card holds what the draws before wrote, part of it still in the colour block's caches.
 		// Sampled in place it read what was not written back yet: CoreAnimation's menus came up opaque and turned translucent a part
 		// at a time (2026-11-10). A copy made after them instead, as for any other feedback read.
-		const bool heldCopy = feedback && mHeld.active && mHeld.task == task && mHeld.target == id && !(gInPlace & 16) &&
-		                      copyHeld(w, h, fm->bpp, gpu, shadowPitch);
+		const HeldTarget *own = feedback ? heldFor(task, id) : nullptr;
+		const bool heldCopy = own && !(gInPlace & 16) && copyHeld(*own, w, h, fm->bpp, gpu, shadowPitch);
 		const bool shadowed = heldCopy || ((large || feedback) && !(gInPlace & 16) && shadowTexture(task, id, src, fm->bpp, gpu, shadowPitch));
 		const bool inPlace = !shadowed && !feedback && (gInPlace & 1) && kind && depth == 1 && pitched && based;   // a copy at least
 
@@ -3765,7 +3800,7 @@ RDNA4PvHost::Shadow *RDNA4PvHost::findShadow(const ShadowKey &k)
 // has them, and not older than kShadowAge (a write the host does not see: a guest texture the CPU wrote, a surface written without a lock).
 bool RDNA4PvHost::shadowCurrent(const Shadow &s) const
 {
-	if (mHeld.active && mHeld.shadow == &s)
+	if (isHeld(s))
 		return true;
 
 	const bool locked = s.surface && (gSurfaceFns.lockSeed(s.surface) != s.lockSeed || gSurfaceFns.unlockSeed(s.surface) != s.unlockSeed);
@@ -3994,7 +4029,7 @@ void RDNA4PvHost::drewInto(const OSObject *surface, uint32_t task, uint64_t at, 
 	}
 
 	for (Shadow &s : mShadows) {
-		if (s.surface != surface || (!surface && s.task != task) || s.at != at || (mHeld.active && mHeld.shadow == &s))
+		if (s.surface != surface || (!surface && s.task != task) || s.at != at || isHeld(s))
 			continue;
 
 		if (!s.valid || s.width != width || s.height != height || s.bpp != bpp || s.depth > 1) {
@@ -4016,9 +4051,9 @@ void RDNA4PvHost::drewInto(const OSObject *surface, uint32_t task, uint64_t at, 
 // that read the copy before: the host never waits for it. In the staging pool instead, each piece taken waited for the card: a
 // window dragged translucent across the displays' edge spent 3 s of every 5 waiting (2026-11-10). False when the target is not of
 // that size and pixel, or larger than a shadow may be: the held shadow is then read in place, as before.
-bool RDNA4PvHost::copyHeld(uint32_t width, uint32_t height, uint32_t bpp, uint64_t &gpu, uint32_t &pitch)
+bool RDNA4PvHost::copyHeld(const HeldTarget &h, uint32_t width, uint32_t height, uint32_t bpp, uint64_t &gpu, uint32_t &pitch)
 {
-	const Shadow &s = *mHeld.shadow;
+	const Shadow &s = *h.shadow;
 	const uint64_t bytes = static_cast<uint64_t>(s.pitch) * s.height;
 
 	if (s.width != width || s.height != height || s.bpp != bpp || s.depth > 1 || bytes > kShadowMax)
@@ -4131,7 +4166,7 @@ uint64_t RDNA4PvHost::texturePrint(uint32_t task, const TextureSource &src, uint
 void RDNA4PvHost::dropShadows(const OSObject *surface, uint32_t task, uint64_t at, bool all)
 {
 	for (Shadow &s : mShadows) {
-		if (mHeld.active && mHeld.shadow == &s)
+		if (isHeld(s))
 			continue;
 
 		if (all || (s.surface == surface && (surface || s.task == task) && s.at == at))
@@ -4144,7 +4179,7 @@ void RDNA4PvHost::dropShadows(const OSObject *surface, uint32_t task, uint64_t a
 void RDNA4PvHost::clearShadows(const OSObject *surface, uint32_t task, uint64_t at, uint32_t tex, uint32_t pattern)
 {
 	for (Shadow &s : mShadows) {
-		if (s.surface != surface || (!surface && s.task != task) || s.at != at || (mHeld.active && mHeld.shadow == &s))
+		if (s.surface != surface || (!surface && s.task != task) || s.at != at || isHeld(s))
 			continue;
 
 		s.valid = s.handle && !s.cpu && (!pattern || s.bpp == 4) && clearOnCard(task, tex, s.gpu, s.bytes, pattern);
@@ -4158,7 +4193,7 @@ void RDNA4PvHost::dropShadowRange(uint32_t task, uint64_t va, uint64_t bytes)
 	for (Shadow &s : mShadows) {
 		const uint64_t end = s.at + s.imageBytes * s.depth;
 
-		if (!s.surface && s.task == task && s.at < va + bytes && va < end && !(mHeld.active && mHeld.shadow == &s))
+		if (!s.surface && s.task == task && s.at < va + bytes && va < end && !isHeld(s))
 			s.valid = false;
 	}
 }
@@ -4188,20 +4223,27 @@ void RDNA4PvHost::freeShadow(Shadow &s)
 	s.valid = false;
 }
 
-// The target held for this draw (true): its shadow, filled when it does not hold what the guest has; whatever was held before written
-// back first.
+// The target held for this draw (true, mHeld): its shadow, filled when it does not hold what the guest has. Held targets over the same
+// memory are written back first, and the least recently used one when all are taken.
 bool RDNA4PvHost::holdTarget(uint32_t task, uint32_t target, uint64_t va, const Surface &surface, uint32_t width, uint32_t height,
                              uint32_t bpr, uint32_t tp)
 {
-	HeldTarget &h = mHeld;
 	const uint64_t at = surface.memory ? surface.base : va;
 
 	const ShadowKey key = {surface.surface, task, at, bpr, width, height, 1, tp, static_cast<uint64_t>(bpr) * height};
+	HeldTarget *held = heldFor(task, target);
 
-	if (h.active && h.task == task && h.target == target && h.shadow == findShadow(key))
+	if (held && held->shadow == findShadow(key)) {
+		held->used = ++mHeldClock;
+		mHeld = held;
+
 		return true;
+	}
 
-	flushHeld();
+	flushHeldIn(surface.surface, task, at, static_cast<uint64_t>(bpr) * height);
+
+	HeldTarget &h = heldSlot();
+
 	cardToMemory(surface.surface);
 
 	Shadow *s = findShadow(key);
@@ -4221,7 +4263,8 @@ bool RDNA4PvHost::holdTarget(uint32_t task, uint32_t target, uint64_t va, const 
 
 	s->used = ++mShadowClock;
 	s->serial = ~0ull;   // read and written by draws until written back
-	h = {true, task, target, s, surface.memory, height, 0};
+	h = {true, task, target, s, surface.memory, height, 0, ++mHeldClock};
+	mHeld = &h;
 
 	return true;
 }
@@ -4239,9 +4282,17 @@ bool RDNA4PvHost::clearHeld(uint32_t task, uint32_t tex, uint64_t va, uint32_t w
 	if ((gInPlace & (16 | 256)) || !mRtOpen)
 		return false;
 
-	flushHeld();
-
 	Shadow *s = findShadow(key);
+	HeldTarget *held = heldFor(task, tex);
+
+	if (held && held->shadow != s) {   // held as another view
+		flushHeld(*held);
+		held = nullptr;
+	}
+
+	flushHeldIn(nullptr, task, va, static_cast<uint64_t>(bpr) * height, held);   // the others over its memory
+
+	HeldTarget &h = held ? *held : heldSlot();   // held already: cleared whole, it is written back whole
 
 	s = s ? s : makeShadow(key);
 
@@ -4252,17 +4303,65 @@ bool RDNA4PvHost::clearHeld(uint32_t task, uint32_t tex, uint64_t va, uint32_t w
 	s->when = nowNs();
 	s->used = ++mShadowClock;
 	s->serial = ~0ull;   // read and written by draws until written back
-	mHeld = {true, task, tex, s, nullptr, 0, height};
+	h = {true, task, tex, s, nullptr, 0, height, ++mHeldClock};
+	mHeld = &h;
 	dropShadows(nullptr, task, va);   // other views of it (the held one stays)
 
 	return true;
 }
 
-// The held target's drawn rows written back, after the draws into it; its shadow then holds what the guest has, and nothing is held.
+// The held target that draws into `target` of `task` go to, or nullptr.
+RDNA4PvHost::HeldTarget *RDNA4PvHost::heldFor(uint32_t task, uint32_t target)
+{
+	for (HeldTarget &h : mHelds)
+		if (h.active && h.task == task && h.target == target)
+			return &h;
+
+	return nullptr;
+}
+
+// A slot for a target to hold: a free one, else the least recently used one written back.
+RDNA4PvHost::HeldTarget &RDNA4PvHost::heldSlot()
+{
+	HeldTarget *lru = &mHelds[0];
+
+	for (HeldTarget &h : mHelds) {
+		if (!h.active)
+			return h;
+
+		lru = h.used < lru->used ? &h : lru;
+	}
+
+	flushHeld(*lru);
+
+	return *lru;
+}
+
+// Every held target written back (the command buffer's end, a blit, a dispatch).
 void RDNA4PvHost::flushHeld()
 {
-	HeldTarget &h = mHeld;
+	for (HeldTarget &h : mHelds)
+		flushHeld(h);
+}
 
+// The held targets over [at, at + bytes) of this surface (or of this task's memory) written back, but `except`.
+void RDNA4PvHost::flushHeldIn(const OSObject *surface, uint32_t task, uint64_t at, uint64_t bytes, const HeldTarget *except)
+{
+	for (HeldTarget &h : mHelds) {
+		if (!h.active || &h == except)
+			continue;
+
+		const Shadow &s = *h.shadow;
+		const uint64_t end = s.at + static_cast<uint64_t>(s.rowBytes) * s.height;
+
+		if (s.surface == surface && (surface || s.task == task) && at < end && s.at < at + bytes)
+			flushHeld(h);
+	}
+}
+
+// The held target's drawn rows written back, after the draws into it; its shadow then holds what the guest has, and it is held no longer.
+void RDNA4PvHost::flushHeld(HeldTarget &h)
+{
 	if (!h.active)
 		return;
 
@@ -5150,8 +5249,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	GfxBuffers tgt {};
 	uint8_t *pooledTarget = nullptr;
 
-	if (inPlace)
-		flushHeld();   // another target: what was held is written back for the draws that read it
+	if (inPlace)   // a target in place over a held one's memory: that one written back first, the draw's rows then go over it
+		flushHeldIn(surface.surface, task, surface.memory ? surface.base : va, static_cast<uint64_t>(bpr) * height);
 
 	const bool held = !inPlace && mRtOpen && !(gInPlace & 16) && holdTarget(task, target, va, surface, width, height, bpr, tp);
 
@@ -5171,7 +5270,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		stage = static_cast<uint32_t *>(IOMalloc(regionBytes));
 
 	if (held)
-		tgt.gpu = mHeld.shadow->gpu;
+		tgt.gpu = mHeld->shadow->gpu;
 
 	// The target for the card: the guest's memory mapped (in place), the pool, or a runtime buffer of its own.
 	auto placeTarget = [&]() {
@@ -5710,8 +5809,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	if (ok) {
 		swap();
 		if (held) {
-			mHeld.top = sy < mHeld.top ? sy : mHeld.top;
-			mHeld.bottom = sy2 > mHeld.bottom ? sy2 : mHeld.bottom;
+			mHeld->top = sy < mHeld->top ? sy : mHeld->top;
+			mHeld->bottom = sy2 > mHeld->bottom ? sy2 : mHeld->bottom;
 		}
 
 		for (uint32_t y = sy; y < sy2 && ok && staged; y++)
