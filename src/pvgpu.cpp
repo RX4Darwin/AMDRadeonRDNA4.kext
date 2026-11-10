@@ -1134,6 +1134,11 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			for (PipelineInfo &e : mPipelines)
 				if (e.task == task >> 1)
 					e.valid = false;
+			// The same for its textures' shadows, found by task and guest address: the earlier process's pixels must not be sampled
+			// as the new one's. Those of IOSurfaces are found by the surface and stay.
+			for (Shadow &sh : mShadows)
+				if (!sh.surface && sh.task == task >> 1 && !(mHeld.active && mHeld.shadow == &sh))
+					sh.valid = false;
 		}
 		// The guest changed a task's page table: the mappings found by that task's VAs are found by their pages again. A release's layout is
 		// not known: all tasks then.
