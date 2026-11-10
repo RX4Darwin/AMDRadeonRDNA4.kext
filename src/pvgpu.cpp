@@ -1794,7 +1794,7 @@ bool RDNA4PvHost::guestPages(uint32_t task, uint64_t va, uint64_t count, uint64_
 		for (uint32_t e = static_cast<uint32_t>(at >> 12) & 1023; e < 1024 && i < count && ok; e++, i++) {
 			const uint32_t pte = entry[e];
 
-			pages[i] = static_cast<uint64_t>(pte & 0x0fffffffu) << 12;
+			pages[i] = static_cast<uint64_t>(pte & 0x0fffffffu) << 12;   // a 28-bit page number: 1 TiB of physical memory
 			ok = pages[i] != 0;
 
 			if (writable && !(pte & 0x80000000u))
