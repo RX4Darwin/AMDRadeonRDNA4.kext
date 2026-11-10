@@ -1129,6 +1129,11 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			memcpy(&mTaskRoot[(task >> 1) & 63], mWin + c.payloadOffset + 12, 4);
 			mDrawLines[(task >> 1) & 63] = 0;
 			mListed[(task >> 1) & 63] = 0;
+			// A new process in a task number another had: its pipelines may sit at the same addresses with the same ids, so the cached
+			// ones are not its (mtlprobe's processes drew with each other's shaders, 2026-11-10)
+			for (PipelineInfo &e : mPipelines)
+				if (e.task == task >> 1)
+					e.valid = false;
 		}
 		// The guest changed a task's page table: the mappings found by that task's VAs are found by their pages again. A release's layout is
 		// not known: all tasks then.
