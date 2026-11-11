@@ -428,6 +428,13 @@ private:
 	uint8_t mDumped[256] {};            // M1: payload dumps per FIFO id so far
 	uint32_t mTaskRoot[64] {};          // M1: page-table root PFN per task id (DefineHostTask), for the dumps after a commit
 	uint32_t mTaskDefs[64] {};          // DefineHostTasks per task id, and when the last came (an empty resource record's log)
+	uint32_t mHeapPage[64] {};          // the task's resource heap's GPU page (SetResourceHeap), 0: page 1 as before one
+	uint64_t heapRecord(uint32_t task, uint32_t id) const
+	{
+		const uint32_t page = mHeapPage[task & 63];
+
+		return (page ? static_cast<uint64_t>(page) << 12 : 0x1000) + 12ull * id;
+	}
 	uint64_t mTaskDefinedNs[64] {};
 	uint32_t mExecSignal { 0 }, mExecStampIndex { 0 };   // the ExecIndirect being decoded: its signal and the stamp slot it completes
 	const char *mExecTag { "" };
@@ -1148,7 +1155,7 @@ bool RDNA4PvHost::readRec(uint32_t task, uint32_t id, uint32_t rec[3])
 {
 	mLastShadow = nullptr;
 
-	if (!id || id > 0x10000 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), 12))
+	if (!id || id > 0x10000 || !readGuest(task, heapRecord(task, id), reinterpret_cast<uint8_t *>(rec), 12))
 		return false;
 
 	if (rec[0] || rec[1] != 0xffffffffu || rec[2] != 0xffffffffu || !mRes)
@@ -1196,7 +1203,7 @@ void RDNA4PvHost::scanPipelines() {
 		return;
 
 	for (uint32_t t = 0; t < 64; t++) {
-		if (!mTaskRoot[t] || now - mTaskActiveNs[t] > kActiveNs || !readGuest(t, 0x1000, reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
+		if (!mTaskRoot[t] || now - mTaskActiveNs[t] > kActiveNs || !readGuest(t, heapRecord(t, 0), reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
 			continue;
 
 		uint32_t *seen = mSeenRec + t * kScanIds * 3;
@@ -1499,6 +1506,18 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			mDumped[c.id]++;
 			copy(at, mWin, c.length);
 			dumpPayload(src.tag, c, mWin);
+		}
+		// SetResourceHeap {u32 task, u32 heap GPU page, u32 bytes}: each task's first is 1 MiB at page 1. A process that fills it gets a
+		// larger heap elsewhere (Maps panned and zoomed for a while): its records are read there from then on.
+		if (c.id == 0x33 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 12) {
+			static uint32_t heapLines;
+			uint32_t h[3];
+
+			copy(at, mWin, c.length);
+			memcpy(h, mWin + c.payloadOffset, sizeof(h));
+			if (h[1] != (mHeapPage[h[0] & 63] ? mHeapPage[h[0] & 63] : 1) && heapLines++ < 64)
+				pvstat("host: %s: SetResourceHeap task %u: page 0x%x (was 0x%x), %u bytes", src.tag, h[0], h[1], mHeapPage[h[0] & 63], h[2]);
+			mHeapPage[h[0] & 63] = h[1];
 		}
 		if (c.id == 0x38 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 16) {
 			copy(at, mWin, c.length);
@@ -2520,7 +2539,7 @@ void RDNA4PvHost::decodeExec(uint32_t task, uint64_t va, uint64_t len) {
 	IOFree(buf, n ? n : 1);
 }
 
-// M2: a buffer's GPU range, from the task's resource heap (SetResourceHeap: 1 MiB at VA 0x1000; measured on the rig, 2026-10-21): 12-byte records
+// M2: a buffer's GPU range, from the task's resource heap (SetResourceHeap: first 1 MiB at VA 0x1000; measured on the rig, 2026-10-21): 12-byte records
 // indexed by resource id, {u32 (descriptor bytes << 8) | type, u32 descriptor address, u32 0}; a buffer (type 1) has a 16-byte descriptor
 // {u64 length, u64 page number of its start} (mtlprobe's two 4 KiB buffers: {0x1000, 0x101}, {0x1000, 0x102}).
 bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len) {
@@ -3762,7 +3781,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		uint32_t rec[3] = {}, sd[9] = {};
 		if (!id)
 			continue;
-		ok = readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)) && (rec[0] & 0xff) == 7 && (rec[0] >> 8) >= 16 &&
+		ok = readGuest(task, heapRecord(task, id), reinterpret_cast<uint8_t *>(rec), sizeof(rec)) && (rec[0] & 0xff) == 7 && (rec[0] >> 8) >= 16 &&
 		     readGuest(task, rec[1], reinterpret_cast<uint8_t *>(sd), 16) && sd[0] == 3;
 		if (!ok) {
 			if (talk || mTexLines++ < 2)
@@ -4856,7 +4875,7 @@ const RDNA4PvHost::PipelineInfo &RDNA4PvHost::pipelineInfo(uint32_t task, uint32
 	uint64_t pd[8] = {};
 	uint32_t pbytes = 0, fn[3] = {};
 
-	const bool recOk = readGuest(task, 0x1000 + 12ull * pipeline, reinterpret_cast<uint8_t *>(rec), sizeof(rec));
+	const bool recOk = readGuest(task, heapRecord(task, pipeline), reinterpret_cast<uint8_t *>(rec), sizeof(rec));
 
 	// A free slot ({0, ~0, ~0}) the guest has not deleted yet (DeleteHostResourceID drops the copy): the pipeline as it was read before.
 	if (!rec[0] && rec[1] == 0xffffffffu && rec[2] == 0xffffffffu) {
@@ -4890,7 +4909,7 @@ const RDNA4PvHost::PipelineInfo &RDNA4PvHost::pipelineInfo(uint32_t task, uint32
 
 	for (unsigned k = 1; k <= 2; k++)
 		if (fn[k] && fn[k] <= 0x10000)
-			readGuest(task, 0x1000 + 12ull * fn[k], reinterpret_cast<uint8_t *>(fnRec[k]), sizeof(fnRec[k]));
+			readGuest(task, heapRecord(task, fn[k]), reinterpret_cast<uint8_t *>(fnRec[k]), sizeof(fnRec[k]));
 
 	PipelineInfo *lru = &mPipelines[0];
 
@@ -4925,7 +4944,7 @@ const RDNA4PvHost::PipelineInfo &RDNA4PvHost::pipelineInfo(uint32_t task, uint32
 	static uint32_t keyLines;
 
 	if ((!fn[1] || !fn[2]) && keyLines++ < 24) {
-		const uint64_t recVa = 0x1000 + 12ull * pipeline;
+		const uint64_t recVa = heapRecord(task, pipeline);
 
 		pvstat("host: render: task %u pipeline %u: type %u, %u-byte descriptor (%u read): %u entries, keys 0-3 0x%x 0x%x 0x%x 0x%x, 8 0x%x: "
 		       "no %s function", task, pipeline, rec[0] & 0xff, len, got, got ? pb[16] : 0, top[0], top[1], top[2], top[3], top[8],
@@ -6031,7 +6050,7 @@ void RDNA4PvHost::dumpTexture(uint32_t task, uint32_t id)
 	static uint32_t dumped;
 	uint32_t rec[3] = {}, td[32] = {};
 
-	if (dumped >= 16 || !readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
+	if (dumped >= 16 || !readGuest(task, heapRecord(task, id), reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
 		return;
 
 	dumped++;
@@ -6156,7 +6175,7 @@ bool RDNA4PvHost::copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex,
 
 // M2: the task's function: its one type-6 resource (several are not told apart yet), whose 32-byte descriptor starts with the GPU address of a
 // metallib ('MTLB', measured 2026-10-21); the function's NAME and HASH tags from that library's first KiB.
-// A resource's type from the task's heap (records at 0x1000 + 12 * id: {(descriptor bytes << 8) | type, u64 descriptor address}), 0 if
+// A resource's type from the task's heap (records at heapRecord: {(descriptor bytes << 8) | type, u64 descriptor address}), 0 if
 // none; with desc, its descriptor's first 64 bytes (and their count in bytes).
 uint32_t RDNA4PvHost::resourceType(uint32_t task, uint32_t id, uint64_t *desc, uint32_t *bytes) {
 	uint32_t rec[3];
@@ -6417,7 +6436,7 @@ void RDNA4PvHost::describeRenderPipeline(uint32_t task, uint32_t pipeline) {
 		return;
 	mRenderPipeSeen[slot] = key;
 	uint32_t rec[3];
-	if (pipeline && pipeline <= 0x10000 && readGuest(task, 0x1000 + 12ull * pipeline, reinterpret_cast<uint8_t *>(rec), sizeof(rec))) {
+	if (pipeline && pipeline <= 0x10000 && readGuest(task, heapRecord(task, pipeline), reinterpret_cast<uint8_t *>(rec), sizeof(rec))) {
 		pvlog("host: render: task %u pipeline %u: type %u, %u-byte descriptor at 0x%x", task, pipeline, rec[0] & 0xff, rec[0] >> 8, rec[1]);
 		dumpGuest(task, rec[1], (rec[0] >> 8) < 256 ? rec[0] >> 8 : 256);
 	}
@@ -6444,7 +6463,7 @@ void RDNA4PvHost::describeRenderPipeline(uint32_t task, uint32_t pipeline) {
 		pvlog("host: render: task %u resource %u: type %u, %u bytes: %08x %08x %08x %08x %08x %08x %08x %08x %s", task, id, type, bytes, dw[0], dw[1], dw[2],
 		      dw[3], dw[4], dw[5], dw[6], dw[7], name);
 		uint32_t r[3];
-		if (type != 6 && type != 7 && readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(r), sizeof(r)) && (r[0] >> 8) > 32)
+		if (type != 6 && type != 7 && readGuest(task, heapRecord(task, id), reinterpret_cast<uint8_t *>(r), sizeof(r)) && (r[0] >> 8) > 32)
 			dumpGuest(task, r[1], (r[0] >> 8) < 256 ? r[0] >> 8 : 256);   // M4: textures and samplers in full, to read their formats
 	}
 }
@@ -8444,7 +8463,7 @@ int RDNA4PvHost::dumpTexture(uint32_t task, uint32_t id, struct sysctl_req *req)
 	const uint32_t rowBytes = found ? t.width * bpp : 0;
 	uint32_t rec[3] = {}, desc[29] = {};
 
-	readGuest(task, 0x1000 + 12ull * id, reinterpret_cast<uint8_t *>(rec), sizeof(rec));
+	readGuest(task, heapRecord(task, id), reinterpret_cast<uint8_t *>(rec), sizeof(rec));
 	readGuest(task, rec[1], reinterpret_cast<uint8_t *>(desc), sizeof(desc));
 
 	if (rowBytes > 0x10000)
