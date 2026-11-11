@@ -6310,7 +6310,14 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	uint64_t handle[8] = {}, gpu[8] = {}, va[8] = {}, bytes[8] = {}, most = 0;
 	for (unsigned b = 0; b < nb && ok; b++) {
 		uint64_t len = 0;
-		ok = buffer[b] && bufferRange(task, buffer[b], &va[b], &len) && offset[b] < len && len - offset[b] <= kMaxBuffer;
+
+		// an index below the highest the kernel uses that it does not use (WindowServer's compute_average_luma: buffers 0 and 2): the
+		// spare buffer's address, as a draw's unbound buffers have; it was refused, and the dispatch with it
+		if (!buffer[b]) {
+			gpu[b] = mGfxSpare.gpu;
+			continue;
+		}
+		ok = bufferRange(task, buffer[b], &va[b], &len) && offset[b] < len && len - offset[b] <= kMaxBuffer;
 		va[b] += offset[b];
 		bytes[b] = len - offset[b];
 		most = bytes[b] > most ? bytes[b] : most;
@@ -6318,8 +6325,8 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	auto *stage = ok && most ? static_cast<uint8_t *>(IOMalloc(most)) : nullptr;
 	ok = ok && (!most || stage);   // a kernel of textures only has no buffers to stage
 	for (unsigned b = 0; b < nb && ok; b++)
-		ok = gCompute->rtAlloc(this, bytes[b], handle[b], gpu[b]) == kIOReturnSuccess && readGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b])) &&
-		     gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], true) == kIOReturnSuccess;
+		ok = !buffer[b] || (gCompute->rtAlloc(this, bytes[b], handle[b], gpu[b]) == kIOReturnSuccess && readGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b])) &&
+		     gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], true) == kIOReturnSuccess);
 	// The kernel's textures and samplers in a table of their own (air2amdgpu.cpp: its address follows the dimensions in the kernargs).
 	StagedTexture staged[16] = {};
 	uint64_t tableHandle = 0, tableGpu = 0;
@@ -6372,7 +6379,7 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		}
 	}
 	for (unsigned b = 0; b < nb && ok; b++) {
-		if (!(written & (1u << b)))
+		if (!(written & (1u << b)) || !buffer[b])
 			continue;
 
 		ok = gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], false) == kIOReturnSuccess &&

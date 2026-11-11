@@ -17,7 +17,8 @@
 // It computes the AIR function's position arguments from the work-group and work-item ids and calls the AIR function, inlined.
 // Supported so far: device and constant buffers, the arguments thread_position_in_grid, thread_position_in_threadgroup,
 // threadgroup_position_in_grid, threads_per_threadgroup, threads_per_grid and threadgroups_per_grid (uint, uint2 or uint3; ushort too), thread_index_in_threadgroup and the
-// SIMD-group indices (a SIMD group is a wave of 32), SIMD-group functions (simdOp() below), threadgroup memory and barriers, local
+// SIMD-group indices (a SIMD group is a wave of 32), SIMD-group functions (simdOp() below), threadgroup memory (declared, or buffer
+// arguments: LDS of the kernel's own) and barriers, local
 // arrays (as long as LLVM keeps them out of scratch memory, which the kext's runtime does not give kernels), device and threadgroup atomic
 // read-modify-writes, textures and samplers (2D: read, write, sample at level 0), and the math and integer functions of legalize() below.
 // Anything else is reported and refused.
@@ -1304,16 +1305,20 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 		return "no AIR kernel named " + fname.str();
 
 	// What each argument of the AIR function is.
-	enum Role { Buffer, PosInGrid, PosInGroup, GroupInGrid, GroupSize, GridSize, IndexInGroup, Lane, SimdInGroup, SimdWidth, SimdsInGroup, Texture, Sampler, GroupsInGrid };
+	enum Role { Buffer, PosInGrid, PosInGroup, GroupInGrid, GroupSize, GridSize, IndexInGroup, Lane, SimdInGroup, SimdWidth, SimdsInGroup, Texture, Sampler, GroupsInGrid,
+	            GroupBuffer };
 	struct Arg { Role role; int location; };
 	std::map<unsigned, Arg> roles;
 	int maxLocation = -1;
-	uint32_t written = 0, texturesWritten = 0;
+	uint32_t written = 0, texturesWritten = 0, groupBuffers = 0;
 	for (const MDOperand &op : args->operands()) {
 		const auto *a = cast<MDNode>(op);
 		const unsigned index = static_cast<unsigned>(mdInt(a, 0));
 		const std::string kind = mdString(a, 1);
-		if (kind == "air.buffer") {
+		if (kind == "air.buffer" && index < air->arg_size() && air->getArg(index)->getType() == PointerType::get(ctx, 3)) {
+			roles[index] = {GroupBuffer, -1};   // threadgroup memory the app sizes at dispatch (setThreadgroupMemoryLength): LDS below
+			groupBuffers++;
+		} else if (kind == "air.buffer") {
 			int location = -1;
 			bool writes = false;
 			for (unsigned k = 2; k < a->getNumOperands(); k++) {
@@ -1404,8 +1409,20 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 	b.CreateCondBr(inside, run, done);
 	b.SetInsertPoint(run);
 	SmallVector<Value *, 16> callArgs;
+	// Threadgroup buffers (WindowServer's glass luminance kernels on Tahoe: a float4 a thread, 16 KiB for 1024): each a block of LDS of the
+	// kernel's own, 32 KiB shared out among them. ponytail: a fixed size, not the dispatch's length; a kernel asking for more overruns it,
+	// and the length would have to reach the host's dispatch (Compute.setThreadgroupMemoryLength) as LDS beyond the code object's.
+	const uint64_t groupBufferBytes = groupBuffers ? (32768 / groupBuffers) & ~15ull : 0;
 	for (unsigned i = 0; i < air->arg_size(); i++) {
 		const Arg &a = roles[i];
+		if (a.role == GroupBuffer) {
+			auto *type = ArrayType::get(b.getInt8Ty(), groupBufferBytes);
+			auto *lds = new GlobalVariable(*m, type, false, GlobalValue::InternalLinkage, PoisonValue::get(type), "threadgroup_buffer", nullptr,
+			                               GlobalValue::NotThreadLocal, 3);
+			lds->setAlignment(Align(16));
+			callArgs.push_back(lds);
+			continue;
+		}
 		// A constant buffer (AIR's address space 2) is cast here and made global memory again by legalize().
 		Value *table = kernel->getArg(nBuffers + 6);
 		const unsigned slot = static_cast<unsigned>(a.location);   // a texture's or sampler's index (0-15)
