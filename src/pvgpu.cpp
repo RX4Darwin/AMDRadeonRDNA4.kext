@@ -543,7 +543,7 @@ private:
 	void pauseFlips(ScanoutMap &sm);
 	bool clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_t bytes, uint32_t pattern);
 	GfxBuffers mFillCode {};   // nggfill.s and psfill.s, as a shader pair's slot
-	bool clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_t pitch, uint32_t width, uint32_t height, bool half, bool bgra,
+	bool clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_t pitch, uint32_t width, uint32_t height, uint32_t format, bool swap,
 	                 const uint64_t rgba[4]);
 	// Copies by the card (CP DMA in the graphics ring, after the work before them), each with an IB of its own of kDmaIbBytes, taken in turn.
 	static constexpr uint32_t kDmaSlots = 8, kDmaIbBytes = 64 * 1024;
@@ -758,7 +758,7 @@ private:
 		uint32_t top { 0 }, bottom { 0 };         // the rows drawn
 	};
 	HeldTarget mHeld;
-	bool clearHeld(uint32_t task, uint32_t tex, uint64_t va, uint32_t width, uint32_t height, uint32_t bpr, bool half, bool bgra, const uint64_t rgba[4]);
+	bool clearHeld(uint32_t task, uint32_t tex, uint64_t va, uint32_t width, uint32_t height, uint32_t bpr, uint32_t format, bool swap, const uint64_t rgba[4]);
 	bool holdTarget(uint32_t task, uint32_t target, uint64_t va, const Surface &surface, uint32_t width, uint32_t height, uint32_t bpr,
 	                uint32_t tp);
 public:
@@ -2720,13 +2720,12 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 	uint64_t va, len;
 	uint32_t bpr = 0, w = 0, h = 0, format = 0;
 	const bool found = textureRange(task, tex, &va, &len, &bpr, &w, &h, &format) && !(len & 3);
-	// R, G, B, A in memory for RGBA8 (70, 71), else B, G, R, A
-	const uint32_t pixel = format == 70 || format == 71 ? r | g << 8 | b << 16 | a << 24 : b | g << 8 | r << 16 | a << 24;
-	// RGBA16Float: only to zero so far (a 32-bit pattern cannot hold four halves; transparent black is what CoreAnimation clears to)
-	const bool half = format == 115;
-	const bool zero = !(rgba[0] | rgba[1] | rgba[2] | rgba[3]);
-	// RG16Float (65), R8 (10), R16Float (25), RGB10A2 (90): to zero only too
-	bool ok = found && ((!half && format != 65 && format != 10 && format != 25 && format != 90) || zero);
+	// the colour as a pixel of its format, filled across the texture where it is not drawn (a 32-bit pattern; RGBA16Float to zero only:
+	// four halves do not fit). RenderBox clears its distance fields (RG16Float) to other values than 0: left as they were, the next pass's
+	// glyphs were drawn over a box of old rows (Tahoe's App Store and Font Book icons, 2026-11-10).
+	uint32_t pattern = 0;
+	bool ok = found && clearPattern(format, rgba, pattern);
+	const uint32_t pixel = b | g << 8 | r << 16 | a << 24;   // BGRA8, for the log and a BGRA8 IOSurface
 	uint64_t handle = 0, gpu = 0;
 	Surface surface;
 
@@ -2735,21 +2734,24 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 	// On the card in the graphics ring, after the draws before: the host does not wait for them (the clears of WindowServer's passes were
 	// most of its waits with two displays). By a draw when the colour block can write the texture (its rows 128 bytes apart: any colour of
 	// RGBA16Float too), else by CP DMA.
-	const uint32_t tp = half ? 8 : 4;
+	const TextureFormat *fm = textureFormat(format);
+	const uint32_t tp = fm ? fm->bpp : 4;
 	const bool drawable = found && bpr && !(bpr % tp) && h && static_cast<uint64_t>(bpr) * h <= len &&
-	                      (format == 70 || format == 71 || format == 80 || format == 81 || half || (!format && w * 4 == bpr));
+	                      (format == 70 || format == 71 || format == 80 || format == 81 || format == 115 || format == 65 || format == 10 ||
+	                       format == 25 || format == 90 || (!format && w * 4 == bpr));
+	const bool swap = format != 70 && format != 71;   // BGRA8 (and of unknown format, as before)
 
-	if (drawable && mapGuest(task, va, len, handle, gpu, true) && clearByDraw(task, tex, gpu, bpr / tp, w, h, half, format != 70 && format != 71, rgba)) {
+	if (drawable && mapGuest(task, va, len, handle, gpu, true) && clearByDraw(task, tex, gpu, bpr / tp, w, h, format, swap, rgba)) {
 		dropShadows(nullptr, task, va);
 
 		return tex;
 	}
 
-	if (drawable && (bpr % 128) && clearHeld(task, tex, va, w, h, bpr, half, format != 70 && format != 71, rgba))
+	if (drawable && (bpr % 128) && clearHeld(task, tex, va, w, h, bpr, format, swap, rgba))
 		return tex;
 
-	if (ok && mapGuest(task, va, len, handle, gpu, true) && clearOnCard(task, tex, gpu, len, half ? 0 : pixel)) {
-		clearShadows(nullptr, task, va, tex, half ? 0 : pixel);
+	if (ok && mapGuest(task, va, len, handle, gpu, true) && clearOnCard(task, tex, gpu, len, pattern)) {
+		clearShadows(nullptr, task, va, tex, pattern);
 
 		return tex;
 	}
@@ -2760,7 +2762,7 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 		const bool mapped = onCard(surface, bytes, gpu) || mapMemory(surface.memory, surface.base, bytes, handle, gpu);
 
 		if (mapped && !(surface.bytesPerRow % 4) &&
-		    clearByDraw(task, tex, gpu, surface.bytesPerRow / 4, surface.width, surface.height, false, true, rgba)) {
+		    clearByDraw(task, tex, gpu, surface.bytesPerRow / 4, surface.width, surface.height, 80, true, rgba)) {
 			dropShadows(surface.surface, task, surface.base);
 
 			return tex;
@@ -2774,21 +2776,22 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 	}
 
 	waitDraws();   // cleared with SDMA or the CPU, after the draws before
-	ok = ok && dmaGuest(task, va, 0, half ? 0 : pixel, len);
+	ok = ok && dmaGuest(task, va, 0, pattern, len);
 	if (found)
 		dropShadows(nullptr, task, va);
 
-	// an IOSurface, row by row: BGRA8 to the colour, or any format to zero (RenderBox's RGBA16Float targets on Tahoe: transparent black)
+	// an IOSurface, row by row, as its format's pattern (RenderBox's RGBA16Float targets on Tahoe: transparent black)
 	const TextureFormat *sf = !ok && (surface.memory || surfaceRange(task, tex, surface)) ? textureFormat(surface.format) : nullptr;
-	if (sf && (surface.format == 80 || zero) && surface.width <= 16384) {
+	uint32_t surfacePattern = 0;
+	if (sf && clearPattern(surface.format, rgba, surfacePattern) && surface.width <= 16384) {
 		const uint32_t rowBytes = surface.width * sf->bpp;
 
 		cardToMemory(surface.surface);
 		dropShadows(surface.surface, task, surface.base);
-		auto *line = static_cast<uint32_t *>(IOMallocZero(rowBytes));
+		auto *line = static_cast<uint8_t *>(IOMallocZero(rowBytes));
 		ok = line;
-		for (uint32_t x = 0; line && surface.format == 80 && x < surface.width; x++)
-			line[x] = pixel;
+		for (uint32_t x = 0; line && x < rowBytes; x++)   // the pattern's bytes in turn: pixels of 1, 2 or 4 bytes repeat in it
+			line[x] = static_cast<uint8_t>(surfacePattern >> (8 * (x & 3)));
 		for (uint32_t y = 0; ok && y < surface.height; y++)
 			ok = surface.memory->writeBytes(surface.base + static_cast<uint64_t>(y) * surface.bytesPerRow, line, rowBytes) == rowBytes;
 		if (line)
@@ -2966,11 +2969,12 @@ static uint32_t *streamReg(uint32_t *ib, uint32_t n, uint32_t opcode, uint32_t r
 // the host's draws, drawn by nggfill.s and psfill.s with the colour (Metal's doubles, as floats) in the pixel shader's user SGPRs, the colour
 // block converting it to the target's format. CP DMA filled 23 GB/s, and WindowServer clears each frame's 4K target and its intermediate
 // textures: 9.8 GB in five seconds of a window drag. Left in flight like a draw. False when the target is not one the colour block writes.
-bool RDNA4PvHost::clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_t pitch, uint32_t width, uint32_t height, bool half,
-                              bool bgra, const uint64_t rgba[4])
+bool RDNA4PvHost::clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_t pitch, uint32_t width, uint32_t height, uint32_t format,
+                              bool swap, const uint64_t rgba[4])
 {
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];   // ponytail: one host, draws run one at a time on its work loop
-	const uint32_t bpp = half ? 8 : 4;
+	const TextureFormat *fm = textureFormat(format);
+	const uint32_t bpp = fm ? fm->bpp : 4;   // of unknown format: 32-bit
 
 	if ((gInPlace & 256) || !mGfxIb.cpu || !mGfxMisc.cpu || !mGfxRings.handle || !width || !height || width > 16384 || height > 16384 ||
 	    pitch < width || (gpu & 0xff) || (pitch * bpp) % 128)
@@ -3005,7 +3009,7 @@ bool RDNA4PvHost::clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_
 
 	struct Patch { uint32_t opcode, reg, value; } patch[] = {
 		{0x69, 0x31e, (pitch - 1) << 16 | (height - 1)},                     // CB_COLOR0_ATTRIB2: MIP0_WIDTH (the pitch), MIP0_HEIGHT
-		{0x69, 0x3b0, half ? 0x0002070cu : bgra ? 0x0002880au : 0x0002800au},   // CB_COLOR0_INFO: 16_16_16_16 float, 8_8_8_8 unorm (COMP_SWAP ALT: BGRA8)
+		{0x69, 0x3b0, colourInfo(format, swap)},                         // CB_COLOR0_INFO by the target's format
 		{0x69, 0x82, (width - 1) | (height - 1) << 16},                     // PA_SC_WINDOW_SCISSOR_BR: inclusive on gfx12
 		{0x69, 0x94, 0},                                                    // PA_SC_VPORT_SCISSOR_0_TL, _BR: the whole target
 		{0x69, 0x95, (width - 1) | (height - 1) << 16},
@@ -4155,10 +4159,11 @@ bool RDNA4PvHost::holdTarget(uint32_t task, uint32_t target, uint64_t va, const 
 // A guest texture the colour block cannot write in place (rows not 128 bytes apart) cleared in its shadow on the card by a draw, and held: the
 // pass's draws go into it after, and its rows are written back once, at the end of the command buffer. Its memory filled across the bus by
 // CP DMA and its shadow with it took a 1588x1200 backdrop of WindowServer's twice the time of a frame's draws.
-bool RDNA4PvHost::clearHeld(uint32_t task, uint32_t tex, uint64_t va, uint32_t width, uint32_t height, uint32_t bpr, bool half, bool bgra,
+bool RDNA4PvHost::clearHeld(uint32_t task, uint32_t tex, uint64_t va, uint32_t width, uint32_t height, uint32_t bpr, uint32_t format, bool swap,
                             const uint64_t rgba[4])
 {
-	const uint32_t tp = half ? 8 : 4;
+	const TextureFormat *fm = textureFormat(format);
+	const uint32_t tp = fm ? fm->bpp : 4;
 	const ShadowKey key = {nullptr, task, va, bpr, width, height, 1, tp, static_cast<uint64_t>(bpr) * height};
 
 	if ((gInPlace & (16 | 256)) || !mRtOpen)
@@ -4170,7 +4175,7 @@ bool RDNA4PvHost::clearHeld(uint32_t task, uint32_t tex, uint64_t va, uint32_t w
 
 	s = s ? s : makeShadow(key);
 
-	if (!s || s->cpu || !clearByDraw(task, tex, s->gpu, s->pitch / tp, width, height, half, bgra, rgba))
+	if (!s || s->cpu || !clearByDraw(task, tex, s->gpu, s->pitch / tp, width, height, format, swap, rgba))
 		return false;
 
 	s->valid = true;
@@ -5033,7 +5038,6 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint32_t sy2 = draw.scissorSet ? clampTo(draw.scissor[1] + draw.scissor[3], height) : height;
 	// The target in place when the colour block can write it as the guest has it (its rows a multiple of 128 bytes apart, its base 256-byte
 	// aligned): no staging, no copies, and BGRA8 swapped by the colour block (COMP_SWAP) instead of the CPU. Else staged at a pitch of its own.
-	const bool half = targetFormat == 115;
 	const uint32_t tp = pixelBytes(targetFormat);   // bytes a pixel
 	const bool inPlace = (gInPlace & 2) && !(bpr % 128) && !((surface.memory ? surface.base : va) & 0xff);
 	const uint32_t pitch = inPlace ? bpr / tp : (width * tp + 127) / 128 * 128 / tp;   // pixels; staged: a multiple of 128 bytes
@@ -5147,8 +5151,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	static const uint32_t kPrimitive[5][2] = {{1, 0}, {2, 1}, {3, 1}, {4, 2}, {6, 2}};
 	// CB_COLOR0_INFO (gfx12.json: FORMAT 0-4, NUMBER_TYPE 8-10, COMP_SWAP 11-12, BLEND_CLAMP 15, SIMPLE_FLOAT 17): 8_8_8_8 unorm (COMP_SWAP
 	// ALT: BGRA8); else by the target's format, as Mesa's ac_formats.c maps it: 16_16_16_16 float, 16_16 float, 8 unorm, 16 float, 2_10_10_10 unorm
-	const uint32_t cbInfo = half ? 0x0002070cu : targetFormat == 65 ? 0x00020705u : targetFormat == 10 ? 0x00020001u : targetFormat == 25 ? 0x00020702u
-	                      : targetFormat == 90 ? 0x00020009u : (inPlace || held) && bgra ? 0x0002880au : 0x0002800au;
+	const uint32_t cbInfo = colourInfo(targetFormat, (inPlace || held) && bgra);
 	struct Patch { uint32_t opcode, reg, value; } patch[] = {
 		{0x76, 0x8a, vs[3]}, {0x76, 0x8b, vs[4]},                          // SPI_SHADER_PGM_RSRC1_GS, RSRC2_GS: as LLVM compiled the vertex shader
 		{0x76, 0x0a, ps[3]}, {0x76, 0x0b, ps[4]},                          // SPI_SHADER_PGM_RSRC1_PS, RSRC2_PS

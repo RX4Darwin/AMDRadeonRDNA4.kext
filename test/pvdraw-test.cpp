@@ -110,6 +110,22 @@ int main() {
 		CHECK(all[1][0] == 1 && all[1][1] == 10 && all[1][2] == 1 && all[1][9] == 1);
 		CHECK(all[2][0] == 2 && all[2][9] == 0xf);   // not in the descriptor: Metal's defaults
 	}
+	// unormN, doubleAsHalf, clearPattern: RenderBox's distance-field clears (RG16Float to 0.5, 1.0) and the other target formats.
+	{
+		auto bitsOf = [](double v) { uint64_t u; std::memcpy(&u, &v, 8); return u; };
+		CHECK(unormN(bitsOf(1.0), 10) == 1023 && unormN(bitsOf(0.5), 10) == 512 && unormN(bitsOf(1.0), 2) == 3 && unorm8(bitsOf(0.5)) == 128);
+		CHECK(doubleAsHalf(bitsOf(1.0)) == 0x3c00 && doubleAsHalf(bitsOf(0.5)) == 0x3800 && doubleAsHalf(bitsOf(-2.0)) == 0xc000);
+		CHECK(doubleAsHalf(bitsOf(65536.0)) == 0x7c00 && doubleAsHalf(bitsOf(1e-9)) == 0);
+		const uint64_t c[4] = {bitsOf(0.5), bitsOf(1.0), bitsOf(0.0), bitsOf(1.0)}, zero[4] = {};
+		uint32_t p = 0;
+		CHECK(clearPattern(65, c, p) && p == (0x3800u | 0x3c00u << 16));
+		CHECK(clearPattern(25, c, p) && p == 0x38003800u);
+		CHECK(clearPattern(10, c, p) && p == 0x80808080u);
+		CHECK(clearPattern(90, c, p) && p == (512u | 1023u << 10 | 3u << 30));
+		CHECK(clearPattern(80, c, p) && p == (0u | 255u << 8 | 128u << 16 | 255u << 24));
+		CHECK(!clearPattern(115, c, p) && clearPattern(115, zero, p) && p == 0 && !clearPattern(125, c, p) && clearPattern(55, zero, p) && p == 0);
+		CHECK(colourInfo(65, true) == 0x00020705u && colourInfo(80, true) == 0x0002880au && colourInfo(0, false) == 0x0002800au);
+	}
 	// linearImage: a 64x32 RGBA8 image at a 64-pixel pitch.
 	{
 		uint32_t t[8];

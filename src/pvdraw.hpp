@@ -8,16 +8,65 @@
 #include <stdint.h>
 #include <string.h>
 
-// A double in [0, 1] (its bits) as an 8-bit unorm, round(v * 255), with integers only; below 0 (or NaN) 0, from 1 up 255.
-static inline uint32_t unorm8(uint64_t bits) {
-	const uint32_t e = static_cast<uint32_t>(bits >> 52) & 0x7ff;
-	if (bits >> 63 || e < 1023 - 9)
-		return 0;   // negative, zero, below 2^-9 (rounds to 0; also keeps the shift below 64) or NaN with the sign set
+// A double in [0, 1] (its bits) as an n-bit unorm (n 1-10), round(v * (2^n - 1)), with integers only; below 0 (or NaN) 0, from 1 up the most.
+static inline uint32_t unormN(uint64_t bits, uint32_t n) {
+	const uint32_t e = static_cast<uint32_t>(bits >> 52) & 0x7ff, most = (1u << n) - 1;
+	if (bits >> 63 || e < 1023 - (n + 1))
+		return 0;   // negative, zero, below 2^-(n+1) (rounds to 0; also keeps the shift below 64) or NaN with the sign set
 	if (e >= 1023)
-		return e == 0x7ff && (bits & ((1ull << 52) - 1)) ? 0 : 255;   // 1 and up (NaN: 0)
+		return e == 0x7ff && (bits & ((1ull << 52) - 1)) ? 0 : most;   // 1 and up (NaN: 0)
 	const uint64_t m = (bits & ((1ull << 52) - 1)) | (1ull << 52);    // 53-bit significand, v = m * 2^(e - 1075)
 	const uint32_t shift = 52 + (1023 - e);
-	return static_cast<uint32_t>((m * 255 + (1ull << (shift - 1))) >> shift);
+	return static_cast<uint32_t>((m * most + (1ull << (shift - 1))) >> shift);
+}
+
+// The same, 8 bits.
+static inline uint32_t unorm8(uint64_t bits) {
+	return unormN(bits, 8);
+}
+
+// A double (its bits) as an IEEE-754 half's bits, its significand cut short (rounded toward zero), with integers only: below the half's
+// normal range 0 of its sign, above it infinity of its sign, NaN a quiet NaN.
+static inline uint32_t doubleAsHalf(uint64_t bits) {
+	const uint32_t sign = static_cast<uint32_t>(bits >> 48) & 0x8000u;
+	const int32_t e = static_cast<int32_t>(bits >> 52 & 0x7ff);
+	if (e == 0x7ff)
+		return sign | (bits & ((1ull << 52) - 1) ? 0x7e00u : 0x7c00u);
+	const int32_t f = e - 1023 + 15;
+	if (f >= 31)
+		return sign | 0x7c00u;
+	if (f <= 0)
+		return sign;
+	return sign | static_cast<uint32_t>(f) << 10 | static_cast<uint32_t>(bits >> 42 & 0x3ff);
+}
+
+// A colour target's CB_COLOR0_INFO by its Metal pixel format (gfx12.json: FORMAT 0-4, NUMBER_TYPE 8-10, COMP_SWAP 11-12, BLEND_CLAMP 15,
+// SIMPLE_FLOAT 17; as Mesa's ac_formats.c maps them): 16_16_16_16 float, 16_16 float, 8 unorm, 16 float, 2_10_10_10 unorm; else
+// 8_8_8_8 unorm, with COMP_SWAP ALT when BGRA8 is drawn as the guest has it (`swap`).
+static inline uint32_t colourInfo(uint32_t format, bool swap) {
+	switch (format) {
+	case 115: return 0x0002070cu;   // RGBA16Float
+	case 65: return 0x00020705u;    // RG16Float
+	case 10: return 0x00020001u;    // R8Unorm
+	case 25: return 0x00020702u;    // R16Float
+	case 90: return 0x00020009u;    // RGB10A2Unorm
+	default: return swap ? 0x0002880au : 0x0002800au;
+	}
+}
+
+// A clear colour (doubles' bits, R G B A) as a 32-bit pattern that fills a target of Metal pixel format `format` (0: unknown 32-bit, as
+// BGRA8) pixel by pixel; any format to zero, others false.
+static inline bool clearPattern(uint32_t format, const uint64_t rgba[4], uint32_t &pattern) {
+	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
+	switch (format) {
+	case 70: case 71: pattern = r | g << 8 | b << 16 | a << 24; return true;   // RGBA8: R, G, B, A in memory
+	case 0: case 80: case 81: pattern = b | g << 8 | r << 16 | a << 24; return true;
+	case 10: pattern = r * 0x01010101u; return true;
+	case 25: pattern = doubleAsHalf(rgba[0]) * 0x00010001u; return true;
+	case 65: pattern = doubleAsHalf(rgba[0]) | doubleAsHalf(rgba[1]) << 16; return true;
+	case 90: pattern = unormN(rgba[0], 10) | unormN(rgba[1], 10) << 10 | unormN(rgba[2], 10) << 20 | unormN(rgba[3], 2) << 30; return true;
+	default: pattern = 0; return !(rgba[0] | rgba[1] | rgba[2] | rgba[3]);   // RGBA16Float's four halves do not fit in 32 bits
+	}
 }
 
 // A double (its bits) as an IEEE-754 single's bits, its significand cut short (rounded toward zero), with integers only: below the
