@@ -2449,11 +2449,14 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			memcpy(&g.buffer[first + k], payload + 8 + 12 * k, 4);
 			memcpy(&g.offset[first + k], payload + 12 + 12 * k, 8);
 		}
-	} else if (id == 0x082 && bytes >= 32) {   // Render.setViewport {double originX, originY, width, height, znear, zfar}
-		memcpy(t->viewport, payload, sizeof(t->viewport));
+	} else if ((id == 0x082 && bytes >= 32) || (id == 0x083 && bytes >= 4 + 32 && payload[0])) {
+		// Render.setViewport {double originX, originY, width, height, znear, zfar}; setViewports {u32 count, count x the same}: its first
+		// (AppleMetalOpenGLRenderer's, height negative: GL's y up)
+		memcpy(t->viewport, payload + (id == 0x083 ? 4 : 0), sizeof(t->viewport));
 		t->viewportSet = true;
-	} else if (id == 0x075 && bytes >= 32) {   // Render.setScissorRect {u64 x, y, width, height}
-		memcpy(t->scissor, payload, sizeof(t->scissor));
+	} else if ((id == 0x075 && bytes >= 32) || (id == 0x076 && bytes >= 8 + 32 && payload[0])) {
+		// Render.setScissorRect {u64 x, y, width, height}; setScissorRects {u64 count, count x the same}: its first
+		memcpy(t->scissor, payload + (id == 0x076 ? 8 : 0), sizeof(t->scissor));
 		t->scissorSet = true;
 	} else if (id == 0x065 && bytes >= 16) {   // Render.setBlendColorRed {float red, green, blue, alpha}
 		memcpy(t->blendColor, payload, 16);
@@ -5196,11 +5199,12 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 					      d[i + 11], d[i + 12], d[i + 13], d[i + 14], d[i + 15]);
 		}
 	}
-	// The viewport: Render.setViewport's, else the whole target; whole pixels only so far (window = origin + (ndc + 1) * size / 2, y down).
+	// The viewport: Render.setViewport's, else the whole target; whole pixels only so far (window = origin + (ndc + 1) * size / 2, y down;
+	// a negative height flips y).
 	int64_t vx = 0, vy = 0, vw = width, vh = height;
 	if (!why && draw.viewportSet &&
 	    !(wholeDouble(draw.viewport[0], vx) && wholeDouble(draw.viewport[1], vy) && wholeDouble(draw.viewport[2], vw) && wholeDouble(draw.viewport[3], vh) &&
-	      vw > 0 && vh > 0 && vw <= 32768 && vh <= 32768 && vx > -32768 && vx < 32768 && vy > -32768 && vy < 32768))
+	      vw > 0 && vh != 0 && vw <= 32768 && vh >= -32768 && vh <= 32768 && vx > -32768 && vx < 32768 && vy > -32768 && vy < 32768))
 		why = "a viewport not in whole pixels, or too large (so far)";
 	if (why) {
 		noteNotRun(why, name[2]);
@@ -5346,7 +5350,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x95, (sx2 - 1) | (sy2 - 1) << 16},
 		{0x69, 0x10f, halfAsFloat(static_cast<uint32_t>(vw), false)},     // PA_CL_VPORT_XSCALE: width / 2
 		{0x69, 0x110, halfAsFloat(2 * vx + vw)},                            // XOFFSET: originX + width / 2
-		{0x69, 0x111, halfAsFloat(static_cast<uint32_t>(vh), true)},      // YSCALE: -height / 2 (Metal's y points up)
+		{0x69, 0x111, halfAsFloat(-vh)},                                    // YSCALE: -height / 2 (Metal's y points up)
 		{0x69, 0x112, halfAsFloat(2 * vy + vh)},                            // YOFFSET: originY + height / 2
 		{0x79, 0x242, kPrimitive[draw.type][0]},                           // VGT_PRIMITIVE_TYPE
 		{0x79, 0x266, kPrimitive[draw.type][1]},                           // VGT_GS_OUT_PRIM_TYPE
