@@ -2827,7 +2827,7 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 		return tex;
 	}
 
-	if (!found && surfaceRange(task, tex, surface) && surface.format == 80 && surface.width <= 16384) {
+	if (!found && surfaceRange(task, tex, surface) && (surface.format == 80 || surface.format == 81) && surface.width <= 16384) {
 		const uint64_t bytes = static_cast<uint64_t>(surface.bytesPerRow) * surface.height;
 
 		flushHeldIn(surface.surface, task, surface.base, bytes);
@@ -5152,13 +5152,14 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		height = targetFormat || texHeight ? texHeight : static_cast<uint32_t>(len / bpr);
 		bgra = !targetFormat || targetFormat == 80 || targetFormat == 81;
 	}
-	else if (!why && surfaceRange(task, target, surface) && known(surface.format) && surface.format != 70 && surface.format != 71 &&
-	         surface.format != 81) {   // BGRA8, or as the texture of that format (115: CoreAnimation's extended-range layers on Tahoe)
+	else if (!why && surfaceRange(task, target, surface) && known(surface.format) && surface.format != 70 && surface.format != 71) {
+		// BGRA8 (sRGB as unorm, as a texture of it: CAMetalLayer's drawables of Maps), or as the texture of that format (115:
+		// CoreAnimation's extended-range layers on Tahoe)
 		bpr = surface.bytesPerRow;
 		width = surface.width;
 		height = surface.height;
 
-		if (surface.format != 80) {
+		if (surface.format != 80 && surface.format != 81) {
 			targetFormat = surface.format;
 			bgra = false;
 		}
