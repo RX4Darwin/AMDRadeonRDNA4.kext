@@ -289,18 +289,20 @@ public:
 	struct Bindings { uint32_t buffer[RDNA4_MTLC_MAX_BUFFERS]; uint64_t offset[RDNA4_MTLC_MAX_BUFFERS]; uint32_t texture[16], sampler[16]; };   // by Metal index (0 = none)
 	// A draw: Metal's primitive type, first vertex, vertices (indices), instances, base instance, and for an indexed draw the index buffer's
 	// resource id, offset and index size (bytes; 0: not indexed).
-	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes, blendColor[4]; uint64_t viewport[4]; bool viewportSet;
+	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes, blendColor[4]; uint64_t viewport[6]; bool viewportSet;
 	              uint64_t scissor[4]; bool scissorSet; uint32_t attachments[8];   // the pass's colour attachments' textures
-	              uint32_t stencil, stencilState, stencilRef[2]; };   // the pass's stencil texture, setDepthStencilState, the front and back references
-	// Stencil attachments: on the card only (Metal's are private), 8 bits a pixel in the depth block's 64 KiB tiles (gfx12 addrlib: depth and
-	// stencil only SW_64KB_2D or SW_256KB_2D), one per task and texture. ponytail: 16 kept, the least used given up; a pass that loads one
-	// given up finds it cleared to 0.
-	struct StencilBuf { uint32_t task, tex, width, height; uint64_t handle, gpu, bytes, used; int32_t clear; };   // clear: pending value, or -1
+	              uint32_t stencil, stencilState, stencilRef[2], depth; };   // the pass's stencil texture, setDepthStencilState, the front and
+	                                                                        // back references, the pass's depth texture
+	// Stencil and depth attachments: on the card only (Metal's are private), 8 (stencil) or 32 (Depth32Float) bits a pixel in the depth
+	// block's 64 KiB tiles (gfx12 addrlib: depth and stencil only SW_64KB_2D or SW_256KB_2D), one per task, texture and kind (bytes a pixel:
+	// a Depth32Float_Stencil8 texture has both). ponytail: 16 kept, the least used given up; a pass that loads one given up finds it 0.
+	struct StencilBuf { uint32_t task, tex, bpp, width, height; uint64_t handle, gpu, bytes, used; int64_t clear; };   // clear: a pending
+	                                                                                                                    // 32-bit pattern, or -1
 	StencilBuf mStencil[16] = {};
 	uint64_t mStencilClock = 0;
-	void stencilPass(uint32_t task, uint32_t tex, uint32_t load, uint32_t value);
-	StencilBuf &stencilSlot(uint32_t task, uint32_t tex);
-	const StencilBuf *stencilFor(uint32_t task, uint32_t tex, uint32_t width, uint32_t height);
+	void stencilPass(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t load, uint32_t pattern);
+	StencilBuf &stencilSlot(uint32_t task, uint32_t tex, uint32_t bpp);
+	const StencilBuf *stencilFor(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t width, uint32_t height);
 	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *stage);
 	void runCompute(uint32_t task, uint32_t pipeline, const Bindings &bound, const uint64_t *size);
 	// staged: a runtime buffer or the pool; an IOSurface the kernel writes held (prepared) until its rows are written back into it
@@ -2290,11 +2292,12 @@ struct ExecTally {
 	uint32_t attachments[8];            // Render: all eight colour attachments' textures (writeDescriptor; 0 = none)
 	RDNA4PvHost::Bindings stage[2];     // Render.setVertexBuffers, setFragmentBuffers
 	uint32_t blendColor[4];             // Render.setBlendColorRed: four floats' bits
-	uint64_t viewport[4];               // Render.setViewport: originX, originY, width, height as doubles' bits (znear, zfar not used)
+	uint64_t viewport[6];               // Render.setViewport: originX, originY, width, height, znear, zfar as doubles' bits
 	bool viewportSet;                   // since the encoder began (writeDescriptor); else the whole target
 	uint64_t scissor[4];                // Render.setScissorRect: x, y, width, height in pixels
 	bool scissorSet;                    // as viewportSet
 	uint32_t stencil, stencilState, stencilRef[2];   // Render: the pass's stencil texture, setDepthStencilState, setStencilFrontReferenceValue
+	uint32_t depth;                     // Render: the pass's depth texture
 	RDNA4PvHost::Bindings compute;      // Compute.setBuffers
 };
 // The bytes of the draws execSink runs, by command (0: not a draw it runs).
@@ -2336,11 +2339,15 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		t->scissorSet = false;
 
 		// the stencil attachment {u32 texture at +0x28, u16 load action at +0x3c, u32 clear value at +0x44} (AppleParavirtGPUMetal's
-		// PGSerializerRenderCommandEncoder, Tahoe 26.6.2: the depth attachment the same from +0 with a double clear value)
-		uint16_t load = 0;
+		// PGSerializerRenderCommandEncoder, Tahoe 26.6.2), the depth attachment the same from +0 with a double clear value
+		uint16_t load = 0, depthLoad = 0;
 		uint32_t clear = 0;
-		t->stencil = 0;
+		uint64_t depthClear = 0;
+		t->stencil = t->depth = 0;
 		if (bytes >= 0x48) {
+			memcpy(&t->depth, payload, 4);
+			memcpy(&depthLoad, payload + 0x14, 2);
+			memcpy(&depthClear, payload + 0x1c, 8);
 			memcpy(&t->stencil, payload + 0x28, 4);
 			memcpy(&load, payload + 0x3c, 2);
 			memcpy(&clear, payload + 0x44, 4);
@@ -2348,7 +2355,15 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		t->stencilState = 0;
 		t->stencilRef[0] = t->stencilRef[1] = 0;
 		if (t->stencil)
-			t->host->stencilPass(t->task, t->stencil, load, clear);
+			t->host->stencilPass(t->task, t->stencil, 1, load, (clear & 0xff) * 0x01010101u);
+		if (t->depth)
+			t->host->stencilPass(t->task, t->depth, 4, depthLoad, doubleAsFloat(depthClear));
+
+		static uint32_t depthLines;
+
+		if (t->depth && depthLines++ < 8)
+			pvstat("host: render: task %u: a pass with depth texture %u, load action %u, clear 0x%08x", t->task, t->depth, depthLoad,
+			       doubleAsFloat(depthClear));
 	}
 	else if (id == 0x068 && bytes >= 4)   // Render.setDepthStencilState {u32 state id}
 		memcpy(&t->stencilState, payload, 4);
@@ -2434,6 +2449,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		d.scissorSet = t->scissorSet;
 		d.stencil = t->stencil;
 		d.stencilState = t->stencilState;
+		d.depth = t->depth;
 		memcpy(d.stencilRef, t->stencilRef, sizeof(d.stencilRef));
 		const uint64_t start = nowNs();
 		t->host->runDraw(t->task, t->target, t->renderPipeline, d, t->stage);
@@ -2449,7 +2465,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			memcpy(&g.buffer[first + k], payload + 8 + 12 * k, 4);
 			memcpy(&g.offset[first + k], payload + 12 + 12 * k, 8);
 		}
-	} else if ((id == 0x082 && bytes >= 32) || (id == 0x083 && bytes >= 4 + 32 && payload[0])) {
+	} else if ((id == 0x082 && bytes >= 48) || (id == 0x083 && bytes >= 4 + 48 && payload[0])) {
 		// Render.setViewport {double originX, originY, width, height, znear, zfar}; setViewports {u32 count, count x the same}: its first
 		// (AppleMetalOpenGLRenderer's, height negative: GL's y up)
 		memcpy(t->viewport, payload + (id == 0x083 ? 4 : 0), sizeof(t->viewport));
@@ -2958,20 +2974,20 @@ uint32_t RDNA4PvHost::idleBarrier(uint32_t *out)
 
 // A texture's `bytes` at `gpu` filled with `pattern` by the card, left in flight like a draw into it (task << 16 | tex among the draws
 // in flight: a CPU copy of it waits). False if the IB does not hold it or the buffers are not made yet.
-// A render pass with a stencil attachment: its load action (0 don't care, 1 load, 2 clear) noted for its buffer on the card, filled with
-// the value before the pass's first draw (stencilFor: its size is the target's, known then). Don't care: cleared to 0 as well.
-void RDNA4PvHost::stencilPass(uint32_t task, uint32_t tex, uint32_t load, uint32_t value) {
+// A render pass with a stencil or depth attachment: its load action (0 don't care, 1 load, 2 clear) noted for its buffer on the card, filled
+// with the clear value's pattern before the pass's first draw (stencilFor: its size is the target's, known then). Don't care: 0 as well.
+void RDNA4PvHost::stencilPass(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t load, uint32_t pattern) {
 	if (load != 1)
-		stencilSlot(task, tex).clear = load == 2 ? static_cast<int32_t>(value & 0xff) : 0;
+		stencilSlot(task, tex, bpp).clear = load == 2 ? pattern : 0;
 }
 
 // A task's texture's slot: its own, else the least used given up for it, without memory until a draw gives it a size, to be cleared to 0
 // (what a pass that loads finds in a buffer it never had).
-RDNA4PvHost::StencilBuf &RDNA4PvHost::stencilSlot(uint32_t task, uint32_t tex) {
+RDNA4PvHost::StencilBuf &RDNA4PvHost::stencilSlot(uint32_t task, uint32_t tex, uint32_t bpp) {
 	StencilBuf *slot = &mStencil[0];
 
 	for (StencilBuf &s : mStencil)
-		if (s.task == task && s.tex == tex && (s.handle || s.clear >= 0))
+		if (s.task == task && s.tex == tex && s.bpp == bpp && (s.handle || s.clear >= 0))
 			return s;
 	for (StencilBuf &s : mStencil)
 		slot = s.used < slot->used ? &s : slot;
@@ -2979,14 +2995,15 @@ RDNA4PvHost::StencilBuf &RDNA4PvHost::stencilSlot(uint32_t task, uint32_t tex) {
 		waitDraws();   // draws in flight may use it
 		gCompute->rtFree(this, slot->handle);
 	}
-	*slot = {task, tex, 0, 0, 0, 0, 0, ++mStencilClock, 0};
+	*slot = {task, tex, bpp, 0, 0, 0, 0, 0, ++mStencilClock, 0};
 
 	return *slot;
 }
 
-// The stencil buffer of a task's texture for a target of width x height: made (or remade larger) on the card, its pending clear done.
-const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t tex, uint32_t width, uint32_t height) {
-	StencilBuf *slot = &stencilSlot(task, tex);
+// The stencil or depth buffer of a task's texture for a target of width x height: made (or remade larger) on the card, its pending clear
+// done.
+const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t width, uint32_t height) {
+	StencilBuf *slot = &stencilSlot(task, tex, bpp);
 
 	slot->used = ++mStencilClock;
 
@@ -2998,7 +3015,7 @@ const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t t
 		}
 		slot->width = width > slot->width ? width : slot->width;
 		slot->height = height > slot->height ? height : slot->height;
-		slot->bytes = static_cast<uint64_t>((slot->width + 255) & ~255u) * ((slot->height + 255) & ~255u);   // whole 256x256 tiles
+		slot->bytes = static_cast<uint64_t>((slot->width + 255) & ~255u) * ((slot->height + 255) & ~255u) * bpp;   // whole 256x256 pixels
 		slot->handle = 0;
 		if (gCompute->rtAlloc(this, slot->bytes, slot->handle, slot->gpu) != kIOReturnSuccess) {
 			*slot = {};
@@ -3006,7 +3023,7 @@ const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t t
 		}
 	}
 	if (slot->clear >= 0) {   // one value everywhere: the tiling does not matter
-		if (!clearOnCard(task, tex, slot->gpu, slot->bytes, static_cast<uint32_t>(slot->clear) * 0x01010101u))
+		if (!clearOnCard(task, tex, slot->gpu, slot->bytes, static_cast<uint32_t>(slot->clear)))
 			return nullptr;
 		slot->clear = -1;
 	}
@@ -5502,7 +5519,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// draw VGT_INDEX_TYPE (SET_UCONFIG_REG_INDEX, as RADV on gfx9+); per instance the first vertex and the instance id (USER_DATA_GS_2/3, the
 	// vertex shader's s10-s11) and the draw: DRAW_INDEX_AUTO, or DRAW_INDEX_2 from the staged indices (DI_SRC_SEL_DMA).
 	const uint64_t table[2] = {miscGpu + 0x400, miscGpu + 0x800};
-	uint32_t seq[8 + 6 + 2 + 16 + 3 + 3 + 9 + 2 * 12 + 28], m = 0;
+	uint32_t seq[8 + 6 + 2 + 16 + 3 + 3 + 9 + 2 * 12 + 28 + 11], m = 0;
 	auto put = [&](uint32_t v) { seq[m++] = v; };
 
 	// The stencil test: the pass's stencil attachment, the depth-stencil state's front and back {u32 compare | ops, u32 read mask, u32 write
@@ -5510,13 +5527,18 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// depth write 3, front 4, back 5, front, back}; the dword: compare 0-2, stencil fail 3-5, depth fail 6-8, pass 9-11, as Metal's
 	// MTLStencilDescriptor). Metal's compare functions are the hardware's; its operations keep, zero, replace, increment clamp, decrement
 	// clamp, invert, increment wrap, decrement wrap are STENCIL_KEEP, ZERO, REPLACE_TEST, ADD_CLAMP, SUB_CLAMP, INVERT, ADD_WRAP, SUB_WRAP
-	// (gfx12.json; DB_STENCIL_OPVAL 1 from the template). Depth is not drawn (Z_INVALID).
+	// (gfx12.json; DB_STENCIL_OPVAL 1 from the template). The depth test: the pass's depth attachment (Depth32Float: Z_32_FLOAT), the
+	// state's compare function (ZFUNC, the hardware's too) and write; then Metal's depth range: clip space z in 0..w (DX_CLIP_SPACE_DEF),
+	// z = znear + ndc z * (zfar - znear) (the template's is GL's 0.5 + 0.5 z), clamped to 0..1 (PA_SC_VPORT_ZMIN_0, ZMAX_0).
 	uint32_t ds[10] = {}, dsRec[3] = {};
-	const bool stencilled = ok && draw.stencil && draw.stencilState && readRec(task, draw.stencilState, dsRec) && (dsRec[0] & 0xff) == 7 &&
-	                        (dsRec[0] >> 8) >= sizeof(ds) && readDesc(task, dsRec, ds, sizeof(ds)) && ds[0] == 4 && (ds[3] & 0x30);
-	const StencilBuf *sb = stencilled ? stencilFor(task, draw.stencil, width, height) : nullptr;
+	const bool dsKnown = ok && (draw.stencil || draw.depth) && draw.stencilState && readRec(task, draw.stencilState, dsRec) &&
+	                     (dsRec[0] & 0xff) == 7 && (dsRec[0] >> 8) >= sizeof(ds) && readDesc(task, dsRec, ds, sizeof(ds)) && ds[0] == 4;
+	const bool stencilled = dsKnown && draw.stencil && (ds[3] & 0x30);
+	const bool depthTested = dsKnown && draw.depth && ((ds[3] & 7) != 7 || (ds[3] & 8));   // compare always, no write: nothing to do
+	const StencilBuf *sb = stencilled ? stencilFor(task, draw.stencil, 1, width, height) : nullptr;
+	const StencilBuf *zb = depthTested ? stencilFor(task, draw.depth, 4, width, height) : nullptr;
 
-	if (sb) {
+	if (sb || zb) {
 		static const uint8_t kOp[8] = {0, 1, 3, 5, 6, 7, 8, 9};
 		const uint32_t keep[3] = {7, 0xff, 0xff};   // a face without a descriptor: always passes, keeps
 		const uint32_t *face[2] = {ds[3] & 0x10 ? &ds[4] : keep, ds[3] & 0x20 ? &ds[7] : keep};
@@ -5529,28 +5551,48 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		put(0xc00b6900u);   // DB_DEPTH_SIZE_XY, DB_Z_INFO, DB_STENCIL_INFO, the Z and stencil read and write bases (256-byte units)
 		put(0x005);
 		put((width - 1) | (height - 1) << 16);
-		put(0);                                   // Z_INVALID
-		put(1 | 3u << 4 | 1u << 29);              // STENCIL_8, SW_64KB_2D, TILE_STENCIL_DISABLE
-		for (uint32_t k = 0; k < 2; k++) {
-			put(0);
-			put(0);
+		put(zb ? 3 | 3u << 4 : 0);                // Z_32_FLOAT, SW_64KB_2D; else Z_INVALID
+		put(sb ? 1 | 3u << 4 | 1u << 29 : 0);     // STENCIL_8, SW_64KB_2D, TILE_STENCIL_DISABLE; else STENCIL_INVALID
+		const StencilBuf *bases[4] = {zb, zb, sb, sb};   // Z read and write bases, stencil read and write bases
+		for (const StencilBuf *b : bases) {
+			put(b ? static_cast<uint32_t>(b->gpu >> 8) : 0);
+			put(b ? static_cast<uint32_t>(b->gpu >> 40) : 0);
 		}
-		for (uint32_t k = 0; k < 2; k++) {
-			put(static_cast<uint32_t>(sb->gpu >> 8));
-			put(static_cast<uint32_t>(sb->gpu >> 40));
-		}
-		put(0xc0026900u);   // DB_DEPTH_CONTROL: STENCIL_ENABLE, BACKFACE_ENABLE, the functions; DB_STENCIL_CONTROL: the operations
+		put(0xc0026900u);   // DB_DEPTH_CONTROL: STENCIL_ENABLE, BACKFACE_ENABLE, the functions, Z_ENABLE, Z_WRITE_ENABLE, ZFUNC; DB_STENCIL_CONTROL
 		put(0x01c);
-		put(1 | 1u << 7 | (face[0][0] & 7) << 8 | (face[1][0] & 7) << 20);
-		put(ops(face[0][0]) | ops(face[1][0]) << 12);
-		put(0xc0046900u);   // DB_STENCIL_REF, DB_STENCIL_OPVAL, DB_STENCIL_READ_MASK, DB_STENCIL_WRITE_MASK: front in 0-7, back in 8-15
-		put(0x022);
-		put((draw.stencilRef[0] & 0xff) | (draw.stencilRef[1] & 0xff) << 8);
-		put(0x101);
-		put((face[0][1] & 0xff) | (face[1][1] & 0xff) << 8);
-		put((face[0][2] & 0xff) | (face[1][2] & 0xff) << 8);
+		put((sb ? 1 | 1u << 7 | (face[0][0] & 7) << 8 | (face[1][0] & 7) << 20 : 0) | (zb ? 2u | (ds[3] & 8 ? 4u : 0u) | (ds[3] & 7) << 4 : 0u));
+		put(sb ? ops(face[0][0]) | ops(face[1][0]) << 12 : 0u);
+		if (sb) {
+			put(0xc0046900u);   // DB_STENCIL_REF, DB_STENCIL_OPVAL, DB_STENCIL_READ_MASK, DB_STENCIL_WRITE_MASK: front in 0-7, back in 8-15
+			put(0x022);
+			put((draw.stencilRef[0] & 0xff) | (draw.stencilRef[1] & 0xff) << 8);
+			put(0x101);
+			put((face[0][1] & 0xff) | (face[1][1] & 0xff) << 8);
+			put((face[0][2] & 0xff) | (face[1][2] & 0xff) << 8);
+		}
 	}
-	static uint32_t stencilLines;
+	if (zb) {
+		// znear 0 or zfar 0 (Metal's default 0..1 and its reverse); ponytail: other ranges as 0..1 (no floating point here to subtract)
+		const uint64_t zn = draw.viewportSet ? draw.viewport[4] : 0, zf = draw.viewportSet ? draw.viewport[5] : 0x3ff0000000000000ull;
+		const bool nearZero = !(zn << 1), farZero = !(zf << 1);
+
+		put(0xc0026900u);   // PA_CL_VPORT_ZSCALE, ZOFFSET
+		put(0x113);
+		put(nearZero ? doubleAsFloat(zf) : farZero ? doubleAsFloat(zn) ^ 0x80000000u : 0x3f800000u);
+		put(nearZero || farZero ? doubleAsFloat(zn) : 0);
+		put(0xc0026900u);   // PA_SC_VPORT_ZMIN_0, ZMAX_0
+		put(0x115);
+		put(0);
+		put(0x3f800000u);
+		put(0xc0016900u);   // PA_CL_CLIP_CNTL: the template's DX_LINEAR_ATTR_CLIP_ENA, and DX_CLIP_SPACE_DEF
+		put(0x204);
+		put(1u << 24 | 1u << 19);
+	}
+	static uint32_t stencilLines, depthLines;
+	if (draw.depth && depthLines++ < 12)
+		pvstat("host: render: task %u pipeline %u: depth texture %u, state %u (%08x %08x), viewport z 0x%llx 0x%llx: %s", task, pipeline,
+		       draw.depth, draw.stencilState, ds[0], ds[3], static_cast<unsigned long long>(draw.viewport[4]),
+		       static_cast<unsigned long long>(draw.viewport[5]), zb ? "tested" : depthTested ? "NO depth buffer" : "not tested");
 	if (draw.stencil && stencilLines++ < 24)
 		pvstat("host: render: task %u pipeline %u: stencil texture %u, state %u (%08x %08x %08x %08x %08x %08x %08x), references %u %u: %s",
 		       task, pipeline, draw.stencil, draw.stencilState, ds[0], ds[3], ds[4], ds[5], ds[6], ds[7], ds[8], draw.stencilRef[0],
