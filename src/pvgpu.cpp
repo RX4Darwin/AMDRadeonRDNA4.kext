@@ -2303,7 +2303,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		memcpy(w, payload, bytes < sizeof(w) ? bytes : sizeof(w));
 		pvlog("host:   stream: task %u %s cmd 0x%03x %s, %u bytes: %08x %08x %08x %08x", t->task, t->segment, id, name ? name : "?", bytes, w[0], w[1], w[2], w[3]);
 	}
-	if (id == 0x132 || (id >= 0x12c && id <= 0x12f))
+	if (id == 0x132 || id == 0x13e || (id >= 0x12c && id <= 0x12f))
 		t->host->runBlit(t->task, id, payload, bytes);
 	else if (id == 0x01a) {
 		t->target = t->host->runRenderPass(t->task, payload, bytes);
@@ -5999,6 +5999,19 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 
 		pvlog("host: blit: copyFromTexture %u (%llux%llu at %llu, %llu) -> texture %u at %llu, %llu (%08x %08x) by rows: %s", from, size[0], size[1],
 		      at[0], at[1], to, into[0], into[1], rest[0], rest[1], ok ? "done" : "NOT done");
+	} else if (id == 0x13e && bytes >= 20) {
+		// Blit.copyFromTexture:toTexture:, whole textures {u32 source, u32 destination, u32 source slice and level, u32 destination slice and
+		// level, u32 slices and levels: u16 each} (Maps copies its map into its CAMetalLayer's drawable, 2026-11-11). One slice of level 0 only.
+		uint32_t w[5];
+		TextureSource s;
+
+		memcpy(w, p, sizeof(w));
+
+		const bool one = !w[2] && !w[3] && w[4] == 0x00010001 && textureSource(task, w[0], s);
+		const uint64_t origin[3] = {}, size[3] = {s.width, s.height, 1};
+		const bool ok = one && copyTexture(task, w[0], origin, w[1], origin, size);
+
+		pvlog("host: blit: copyFromTexture %u -> texture %u, whole (%08x %08x %08x) by rows: %s", w[0], w[1], w[2], w[3], w[4], ok ? "done" : "NOT done");
 	} else {   // not carried out: its bytes in full, once a command, to learn its layout
 		static uint32_t told[8];
 		uint32_t w[22] = {};
