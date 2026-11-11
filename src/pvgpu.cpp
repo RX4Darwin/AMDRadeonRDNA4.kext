@@ -306,7 +306,7 @@ public:
 	struct StagedTexture { uint64_t handle, va; uint8_t *cpu; uint32_t rowBytes, pitch, rowLen, height; bool writable; OSObject *surface;
 	                       IOMemoryDescriptor *memory; uint64_t base; };
 	struct TextureSource;
-	bool textureSource(uint32_t task, uint32_t id, TextureSource &out);
+	bool textureSource(uint32_t task, uint32_t id, TextureSource &out, uint32_t level = 0);
 	bool readTextureRow(uint32_t task, const TextureSource &src, uint32_t y, uint8_t *dst, uint32_t bytes);
 	int inkedBytes(uint32_t task, const TextureSource &src, uint32_t bpp);
 	bool stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName,
@@ -2259,11 +2259,15 @@ struct ExecTally {
 // The bytes of the draws execSink runs, by command (0: not a draw it runs).
 uint32_t drawBytes(uint32_t id) {
 	switch (id) {
-	case 0x000: return 20;
 	case 0x001: case 0x003: return 8;
 	case 0x005: case 0x007: return 12;
 	case 0x009: return 16;
+	case 0x000: case 0x00b: case 0x01d: return 20;
 	case 0x006: return 24;
+	case 0x002: return 28;
+	case 0x008: return 32;
+	case 0x004: return 36;
+	case 0x00a: case 0x01c: return 48;
 	default: return 0;
 	}
 }
@@ -2313,35 +2317,74 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		memcpy(&t->renderPipeline, payload, 4);
 		t->host->describeRenderPipeline(t->task, t->renderPipeline);
 	} else if (drawBytes(id) && bytes >= drawBytes(id)) {
-		// The draws (measured, docs/m1-stream.md s.5b; rdna4-mtlindexed 2026-11-05): 0x001 drawPrimitives {u32 type, u16 start, u16 count}; 0x000
-		// {u32 type, u64 start, u64 count}; 0x003 {u16 start, u16 count, u16 instances, u16 type}; 0x005 {u16 start, u16 count, u16 instances,
-		// u16 base instance, u32 type}; drawIndexedPrimitives {u16 type, u16 index type (1: 32-bit), u32 index buffer, ...}: 0x007 {..., u16 count,
-		// u16 offset}, 0x009 {..., u16 count, u16 offset, u32 instances}, 0x006 {..., u64 count, u64 offset}.
-		uint32_t w[6] = {};
-		memcpy(w, payload, drawBytes(id));
-		const uint32_t type = w[0] & 0xffff, indexBytes = w[0] >> 16 ? 4 : 2;
-		RDNA4PvHost::Draw d = {w[0], w[1] & 0xffff, w[1] >> 16, 1, 0, 0, 0, 0, {}};
-		if (id == 0x000)
-			d = {w[0], w[1], w[3], 1, 0, 0, 0, 0, {}};
-		else if (id == 0x003)
-			d = {w[1] >> 16, w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, 0, 0, 0, 0, {}};
-		else if (id == 0x005)
-			d = {w[2], w[0] & 0xffff, w[0] >> 16, w[1] & 0xffff, w[1] >> 16, 0, 0, 0, {}};
-		else if (id == 0x007 || id == 0x009) {
+		// The draws (measured, docs/m1-stream.md s.5b; rdna4-mtlindexed 2026-11-05; the rest from AppleParavirtGPUMetal's
+		// PGSerializerRenderCommandEncoder, Tahoe 26.6.2, 2026-11-11). drawPrimitives: 0x001 {u32 type, u16 start, u16 count}, 0x000 {u32 type,
+		// u64 start, u64 count}; with instances 0x003 {u16 start, count, instances, type}, 0x002 {u64 start, count, instances, u16 type}; with
+		// a base instance 0x005 {u16 start, count, instances, base instance, u32 type}, 0x004 {u64 start, count, instances, base instance,
+		// u16 type}. drawIndexedPrimitives {u16 type, u16 index type (1: 32-bit), u32 index buffer, ...}: 0x007 {u16 count, u16 offset}, 0x006
+		// {u64 count, u64 offset}; with instances 0x009 {u16 count, offset, instances}, 0x008 {u64 count, offset, instances}; with a base vertex
+		// and base instance 0x00b and 0x01d {u16 offset, count, instances, i16 base vertex, u16 base instance}, 0x00a and 0x01c {u64 offset,
+		// count, instances, i64 base vertex, u64 base instance}. The offsets include the index buffer's offset in its parent resource.
+		uint64_t wide = 0;   // the upper halves of the 64-bit fields
+		auto field = [&](uint32_t at, uint32_t size) {
+			uint64_t v = 0;
+			memcpy(&v, payload + at, size);
+			wide |= v >> 32;
+			return static_cast<uint32_t>(v);
+		};
+		auto signedField = [&](uint32_t at, uint32_t size) {   // the base vertex: within 32 bits as a signed value
+			int64_t v = 0;
+			memcpy(&v, payload + at, size);
+			if (size == 2)
+				v = static_cast<int16_t>(v);
+			wide |= v < INT32_MIN || v > INT32_MAX;
+			return static_cast<uint32_t>(v);
+		};
+		RDNA4PvHost::Draw d = {};
+		d.instances = 1;
+		if (id <= 0x005) {
+			const uint32_t w = id & 1 ? 2 : 8;   // the odd ones carry u16 fields
+			if (id <= 0x001) {
+				d.type = field(0, 4);
+				d.start = field(4, w);
+				d.count = field(4 + w, w);
+			} else {
+				d.start = field(0, w);
+				d.count = field(w, w);
+				d.instances = field(2 * w, w);
+				if (id >= 0x004)
+					d.baseInstance = field(3 * w, w);
+				d.type = field((id >= 0x004 ? 4 : 3) * w, id == 0x005 ? 4 : 2);
+			}
+		} else {
+			d.type = field(0, 2);
+			d.indexBytes = field(2, 2) ? 4 : 2;
+			d.indexBuffer = field(4, 4);
+			if (id == 0x00b || id == 0x01d || id == 0x00a || id == 0x01c) {
+				const uint32_t w = id == 0x00b || id == 0x01d ? 2 : 8;
+				d.indexOffset = field(8, w);
+				d.count = field(8 + w, w);
+				d.instances = field(8 + 2 * w, w);
+				d.start = signedField(8 + 3 * w, w);
+				d.baseInstance = field(8 + 4 * w, w);
+			} else {
+				const uint32_t w = id & 1 ? 2 : 8;
+				d.count = field(8, w);
+				d.indexOffset = field(8 + w, w);
+				if (id >= 0x008)
+					d.instances = field(8 + 2 * w, w);
+			}
+
 			// 0x009's instances are a u16 as 0x003's and 0x005's: RenderBox's plane draws on Tahoe carry 0x0202 above them (0x02020001), and
 			// taken whole 33685505 instances of a quad held the ring until it was given up (2026-11-10). What the upper half is: logged.
-			d = {type, 0, w[2] & 0xffff, id == 0x009 ? w[3] & 0xffff : 1, 0, w[1], w[2] >> 16, indexBytes, {}};
-
 			static uint32_t upperLines;
 
-			if (id == 0x009 && (w[3] >> 16) && upperLines++ < 8)
-				pvstat("host: render: task %u pipeline %u: drawIndexedPrimitives with 0x%04x above its %u instance(s) (%08x %08x %08x %08x)",
-				       t->task, t->renderPipeline, w[3] >> 16, w[3] & 0xffff, w[0], w[1], w[2], w[3]);
+			if (id == 0x009 && field(14, 2) && upperLines++ < 8)
+				pvstat("host: render: task %u pipeline %u: drawIndexedPrimitives with 0x%04x above its %u instance(s)", t->task,
+				       t->renderPipeline, field(14, 2), d.instances);
 		}
-		else if (id == 0x006)
-			d = {type, 0, w[2], 1, 0, w[1], w[4], indexBytes, {}};
-		if ((id == 0x000 && (w[2] || w[4])) || (id == 0x006 && (w[3] || w[5])))
-			d.type = ~0u;   // a start, count or offset beyond 32 bits: refused as an unknown primitive
+		if (wide)
+			d.type = ~0u;   // beyond 32 bits: refused as an unknown primitive
 		memcpy(d.blendColor, t->blendColor, sizeof(d.blendColor));
 		memcpy(d.attachments, t->attachments, sizeof(d.attachments));
 		memcpy(d.viewport, t->viewport, sizeof(d.viewport));
@@ -3308,7 +3351,7 @@ static uint32_t viewSel(uint32_t sel, uint32_t swizzle) {
 	return out;
 }
 
-bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out)
+bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, uint32_t level)
 {
 	uint32_t rec[3], td[160] = {};   // a mipmapped texture's levels come before its format (6 levels: 29 dwords more)
 
@@ -3359,26 +3402,15 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out)
 		}
 		// Kind 8, a view (newTextureViewWithPixelFormat:textureType:levels:slices:[swizzle:]baseTexture:): {8 (0x1b with a swizzle), size, id,
 		// the texture's id, u16 pixel format, u16 texture type, u64 level, u64 levels, u64 slice, u64 slices[, u8 swizzle x 4]}. Its texture
-		// with the view's format (as many bytes a pixel), first slice and swizzle; ponytail: level 0 only, a view of a later level is refused.
+		// with the view's format (as many bytes a pixel), first level, first slice and swizzle.
 		const uint32_t parent = v[3], format = v[4] & 0xffff;
-		const uint64_t level = v[5] | static_cast<uint64_t>(v[6]) << 32, slice = v[9] | static_cast<uint64_t>(v[10]) << 32;
+		const uint64_t first = v[5] | static_cast<uint64_t>(v[6]) << 32, slice = v[9] | static_cast<uint64_t>(v[10]) << 32;
 		const uint32_t swizzle = v[0] == 0x1b && have >= 56 ? v[13] : 0;
 
-		static uint32_t levelLines;
-		if (view && level && levelLines++ < 6) {   // where the levels are: the view and its texture's whole descriptor
-			uint32_t prec[3] = {}, pd[64] = {};
-			const uint32_t pbytes = readRec(task, parent, prec) ? ((prec[0] >> 8) < sizeof(pd) ? prec[0] >> 8 : sizeof(pd)) : 0;
-			pvstat("host: render: texture %u: a view of level %llu (of %u) of texture %u (record %08x), format %u, type %u, slice %u", id,
-			       static_cast<unsigned long long>(level), v[7], parent, prec[0], format, v[4] >> 16, v[9]);
-			if (pbytes && readDesc(task, prec, pd, pbytes))
-				for (uint32_t i = 0; i < pbytes / 4; i += 12)
-					pvstat("host: render:   its texture +%03x: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", 4 * i, pd[i], pd[i + 1],
-					       pd[i + 2], pd[i + 3], pd[i + 4], pd[i + 5], pd[i + 6], pd[i + 7], pd[i + 8], pd[i + 9], pd[i + 10], pd[i + 11]);
-		}
-		if (!view || !parent || parent == id || level || nesting > 1)
+		if (!view || !parent || parent == id || first + level > 15 || nesting > 1)
 			return false;
 		nesting++;
-		const bool ok = textureSource(task, parent, out);
+		const bool ok = textureSource(task, parent, out, level + static_cast<uint32_t>(first));
 		nesting--;
 		const TextureFormat *was = textureFormat(out.format), *now = textureFormat(format);
 		if (!ok || (format && format != out.format && (!was || !now || was->bpp != now->bpp)) || slice >= out.slices)
@@ -3423,17 +3455,23 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out)
 			out.usage = td[j + 1] & 0xffff;
 		}
 
-	out.width = td[15];
-	out.height = td[16];
-	out.depth = td[17] > 1 ? td[17] : 1;
-	out.rowBytes = td[13];
+	// the level's {u64 offset, u64 bytes, u64 bytes per row, u32 width, height, depth} (dword 3's low half: the levels; a 64x64 RGBA8 texture's
+	// level 1 at +0x4000 of 0x1000 bytes, 0x80 per row, texprobe 2026-11-11); its offset from the texture's start, as level 0's is 0 there
+	const uint32_t *lv = td + 9 + 9 * level;
+
+	if ((level && level >= (td[3] & 0xffff)) || 9 + 9 * (level + 1) > bytes / 4)
+		return false;
+	out.width = lv[6];
+	out.height = lv[7];
+	out.depth = lv[8] > 1 ? lv[8] : 1;
+	out.rowBytes = lv[4];
 	out.va = static_cast<uint64_t>(td[2]) << 12;
 	out.length = td[0] | static_cast<uint64_t>(td[1]) << 32;
-	out.imageBytes = (td[11] | static_cast<uint64_t>(td[12]) << 32) / out.depth;   // level 0's bytes
+	out.imageBytes = (lv[2] | static_cast<uint64_t>(lv[3]) << 32) / out.depth;
 
 	// Where in its allocation the texture starts: dwords 4-5 (CoreAnimation's text images start 0x100 into theirs). Read from the
 	// allocation's start, text came out shifted by a row and a bit, its end at its start (rdna4_pvtex, 2026-11-05).
-	const uint64_t start = td[4] | static_cast<uint64_t>(td[5]) << 32;
+	const uint64_t start = (td[4] | static_cast<uint64_t>(td[5]) << 32) + (lv[0] | static_cast<uint64_t>(lv[1]) << 32);
 
 	if (start >= out.length)
 		return false;
@@ -4891,7 +4929,6 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	                : !attributesKnown ? "the pipeline's vertex descriptor is not understood"
 	                : draw.type > 4 ? "an unknown primitive type"
 	                : !draw.instances ? "no instances"
-	                : draw.indexBytes && draw.start ? "a base vertex in an indexed draw (so far)"
 	                : !count ? "no vertices"
 	                // GE_MAX_VTX_INDX is 0xffffffff: 2^24 is what 64 MiB of staged 32-bit indices hold (65535 was the first triangle's)
 	                : count > (1u << 24) ? "more than 2^24 vertices"
