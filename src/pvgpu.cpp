@@ -162,6 +162,31 @@ void pvPause() {
 }
 #define PVCALL(name) do { static uint32_t calls_; if (__atomic_fetch_add(&calls_, 1u, __ATOMIC_RELAXED) < 3) { pvlog("call: %s", name); pvPause(); } } while (0)
 
+// rdna4-pvgl=1: OpenGL.framework (libGFXShared) loads a renderer for an accelerator only if it names one in IOGLBundleName, which Apple's
+// paravirtual accelerator does not: GL then has its software renderer alone. This names Apple's GL-on-Metal renderer
+// (AppleMetalOpenGLRenderer.bundle) on the accelerator when it is published. Off by default: on its own it aborts every GL process (the
+// renderer asserts in GLDDeviceRec::initWithDisplayMask: the device's vendor "Apple" is none it knows on Intel), and every GL render pass
+// is refused by the guest (no supportsDefaultRasterSampleCount); both still to be lifted (2026-11-11).
+static bool nameGlBundle(void *, void *, IOService *accel, IONotifier *) {
+	accel->setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer");
+	pvlog("OpenGL: IOGLBundleName AppleMetalOpenGLRenderer on %s (rdna4-pvgl)", accel->getName());
+	return true;
+}
+
+static void watchForGlAccelerator() {
+	uint32_t gl = 0;
+
+	if (!PE_parse_boot_argn("rdna4-pvgl", &gl, sizeof(gl)) || !gl)
+		return;
+
+	OSDictionary *match = IOService::serviceMatching("AppleParavirtAccelerator");
+	IONotifier *notifier = match ? IOService::addMatchingNotification(gIOFirstPublishNotification, match, nameGlBundle, nullptr) : nullptr;
+
+	OSSafeReleaseNULL(match);
+	if (!notifier)
+		pvlog("OpenGL: no notification for the paravirtual accelerator: IOGLBundleName not set");
+}
+
 // The PCI class code the nub reports (rdna4-pvgpu-class=<24 bits>, default 0x030000 = display controller). Apple's driver matches by IOPCIMatch alone.
 // On the rig AppleGPUWrangler took the nub with 0x030000 and with 0xff0000 alike (it follows the accelerator, not the class).
 uint32_t pvClass() {
@@ -8463,6 +8488,7 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 
 	nub->registerService();
 	pvlog("registerService returned");
+	watchForGlAccelerator();
 	pvPause();
 	pvlog("fake Apple paravirtual GPU published under %s: PCI %04x:%04x, BAR0 %u bytes of RAM (control block at +0x%x), level %u; IOPCIDevice is %zu bytes here (header %zu)",
 	      parent->getName(), kVendor, kDevice, kBar0Size, kCtrl, level, realSize, sizeof(IOPCIDevice));
