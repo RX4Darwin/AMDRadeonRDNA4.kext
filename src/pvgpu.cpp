@@ -8215,14 +8215,19 @@ private:
 		// AppleGPUWrangler panicking 1.5-2 s after the publish under the platform expert; in the two whose log could be read, the kext's
 		// IONDRVSupport hook had never run (no bring-up, only the firmware's picture on the DP display).
 		IOService *parent = gLateParent;
-		if (!parent) {
-			pvlog("not publishing after the delay: the GPU has not attached");
-			return;
-		}
 		// Nor one whose work cannot run: Metal would see a device whose every command buffer "completes" without the card (rig, 2026-10-22:
 		// stage 2 failed, all mtlprobe checks wrong).
-		if (!gCompute || !gCompute->runtimeReady()) {
-			pvlog("not publishing after the delay: the compute runtime is not up");
+		const char *why = !parent ? "the GPU has not attached" : !gCompute || !gCompute->runtimeReady() ? "the compute runtime is not up" : nullptr;
+		// Not yet: looked at again every 500 ms for 2 minutes (with rdna4-pvgpu-delay=5 the GPU had not attached when the delay ran out, and
+		// the boot came up without displays, 2026-11-10)
+		if (why) {
+			static constexpr uint64_t kWaitMs = 120000;
+			const bool waiting = nowMs() < mDeadline + kWaitMs;
+			if (!mSaid || !waiting)
+				pvlog("not publishing after the delay yet: %s%s", why, waiting ? ": waiting" : ": giving up");
+			mSaid = true;
+			if (waiting)
+				mTimer->setTimeoutMS(500);
 			return;
 		}
 #endif
@@ -8231,6 +8236,7 @@ private:
 	}
 	uint32_t mLevel { 0 };
 	uint64_t mDeadline { 0 };
+	bool mSaid { false };
 	IOWorkLoop *mLoop { nullptr };
 	IOTimerEventSource *mTimer { nullptr };
 };
