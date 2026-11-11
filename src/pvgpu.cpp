@@ -66,7 +66,7 @@ SYSCTL_INT(_debug, OID_AUTO, rdna4_pvprofile, CTLFLAG_RW | CTLFLAG_LOCKED, &gPro
 static int gInPlace = 3;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvinplace, CTLFLAG_RW | CTLFLAG_LOCKED, &gInPlace, 0,
 	   "AMDRadeonRDNA4: what draws use in place (1 textures, 2 colour targets; 4 not IOSurface textures, 8 not Metal's); the rest is staged "
-	   "(16: without shadows, each draw's own copy; 32: the displays' frames not kept on the card)");
+	   "(16: without shadows, each draw's own copy; 32: the displays' frames not kept on the card; 2048: indices staged)");
 
 namespace {
 
@@ -5479,9 +5479,17 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		ok = bufferRange(task, draw.indexBuffer, &iva, &ilen) && draw.indexOffset <= ilen && bytes <= ilen - draw.indexOffset &&
 		     bytes <= kMaxBuffer;
 
-		if (ok && poolTake(bytes, indexGpu, pooledIndices)) {
+		// In place: the guest's index buffer read by the card as it is, the whole buffer mapped (and kept) for all draws from it. Staged, a
+		// draw whose indices did not fit the pool got a runtime buffer of its own and was waited for: Maps' 12000 indexed draws a second
+		// were most of the host's time.
+		uint64_t mapped = 0;   // 0 always: the cache owns its mappings
+		const bool inPlace = ok && !(gInPlace & 2048) && !((iva + draw.indexOffset) % draw.indexBytes) && mapGuest(task, iva, ilen, mapped, indexGpu);
+
+		indexGpu += inPlace ? draw.indexOffset : 0;
+
+		if (!inPlace && ok && poolTake(bytes, indexGpu, pooledIndices)) {
 			ok = readGuest(task, iva + draw.indexOffset, pooledIndices, static_cast<uint32_t>(bytes));
-		} else if (ok) {   // a runtime buffer of its own
+		} else if (!inPlace && ok) {   // a runtime buffer of its own
 			auto *copy = static_cast<uint8_t *>(IOMalloc(bytes));
 
 			ok = copy && readGuest(task, iva + draw.indexOffset, copy, static_cast<uint32_t>(bytes)) &&
