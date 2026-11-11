@@ -387,6 +387,7 @@ private:
 	struct BlitRegion;
 	bool copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex, uint32_t buf, const BlitRegion &r);
 	bool copyTexture(uint32_t task, uint32_t from, const uint64_t at[3], uint32_t to, const uint64_t into[3], const uint64_t size[3]);
+	bool copyTextureOnCard(uint32_t task, const TextureSource &s, const TextureSource &d);
 	void presentTransaction(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
@@ -5919,7 +5920,9 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 		return;
 
 	flushHeld();
-	waitDraws();   // blits read and write with the CPU and SDMA, after the draws before them
+
+	if (id != 0x13e)   // the whole-texture copy waits only when the CPU does it
+		waitDraws();   // blits read and write with the CPU and SDMA, after the draws before them
 	uint64_t va = 0, len = 0, va2 = 0, len2 = 0;
 	if (id == 0x132 && bytes >= 24) {
 		uint32_t buf, value;
@@ -6022,15 +6025,21 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 		// Blit.copyFromTexture:toTexture:, whole textures {u32 source, u32 destination, u32 source slice and level, u32 destination slice and
 		// level, u32 slices and levels: u16 each} (Maps copies its map into its CAMetalLayer's drawable, 2026-11-11). One slice of level 0 only.
 		uint32_t w[5];
-		TextureSource s;
+		TextureSource s, d;
 
 		memcpy(w, p, sizeof(w));
 
 		const bool one = !w[2] && !w[3] && w[4] == 0x00010001 && textureSource(task, w[0], s);
+		const bool onCard = one && textureSource(task, w[1], d) && copyTextureOnCard(task, s, d);
 		const uint64_t origin[3] = {}, size[3] = {s.width, s.height, 1};
-		const bool ok = one && copyTexture(task, w[0], origin, w[1], origin, size);
 
-		pvlog("host: blit: copyFromTexture %u -> texture %u, whole (%08x %08x %08x) by rows: %s", w[0], w[1], w[2], w[3], w[4], ok ? "done" : "NOT done");
+		if (one && !onCard)
+			waitDraws();
+
+		const bool ok = onCard || (one && copyTexture(task, w[0], origin, w[1], origin, size));
+
+		pvlog("host: blit: copyFromTexture %u -> texture %u, whole (%08x %08x %08x) %s: %s", w[0], w[1], w[2], w[3], w[4],
+		      onCard ? "on the card" : "by rows", ok ? "done" : "NOT done");
 	} else {   // not carried out: its bytes in full, once a command, to learn its layout
 		static uint32_t told[8];
 		uint32_t w[22] = {};
@@ -6058,6 +6067,45 @@ void RDNA4PvHost::dumpTexture(uint32_t task, uint32_t id)
 	for (uint32_t i = 0; i < 32; i += 8)
 		pvlog("host: blit: texture %u (heap record %08x) [%u]: %08x %08x %08x %08x %08x %08x %08x %08x", id, rec[0], i, td[i], td[i + 1], td[i + 2],
 		      td[i + 3], td[i + 4], td[i + 5], td[i + 6], td[i + 7]);
+}
+
+// Level 0 of texture `s` into `d` of the same size and pixel size, whole, by the card in the graphics ring after the draws before it, left
+// in flight. Maps copies its 2048x1536 map into its drawable so each frame: row by row with the CPU, after waiting for the card, that took
+// most of a frame. False when it cannot: copyTexture does it then.
+bool RDNA4PvHost::copyTextureOnCard(uint32_t task, const TextureSource &s, const TextureSource &d)
+{
+	const TextureFormat *fs = textureFormat(s.format), *fd = textureFormat(d.format);
+
+	if (!fs || !fd || fs->bpp != fd->bpp || s.width != d.width || s.height != d.height || !s.height || s.depth > 1 || d.depth > 1)
+		return false;
+
+	const uint32_t rowLen = s.width * fs->bpp;
+	const uint64_t sBytes = static_cast<uint64_t>(s.height - 1) * s.rowBytes + rowLen, dBytes = static_cast<uint64_t>(d.height - 1) * d.rowBytes + rowLen;
+
+	if (s.rowBytes < rowLen || d.rowBytes < rowLen || sBytes > s.length || dBytes > d.length)
+		return false;
+
+	if (d.surface.memory)
+		flushHeldIn(d.surface.surface, task, d.surface.base, dBytes);
+	else
+		flushHeldIn(nullptr, task, d.va, dBytes);
+
+	uint64_t handle = 0, src = 0, dst = 0;
+	const bool from = s.surface.memory ? onCard(s.surface, sBytes, src) || mapMemory(s.surface.memory, s.surface.base, sBytes, handle, src)
+	                                   : mapGuest(task, s.va, sBytes, handle, src);
+	const bool to = d.surface.memory ? onCard(d.surface, dBytes, dst) || mapMemory(d.surface.memory, d.surface.base, dBytes, handle, dst)
+	                                 : mapGuest(task, d.va, dBytes, handle, dst, true);
+
+	if (!from || !to || !rowsOnCard(src, s.rowBytes, dst, d.rowBytes, rowLen, s.height))
+		return false;
+
+	// what shadows of the destination hold is not what it has now
+	if (d.surface.memory)
+		dropShadows(d.surface.surface, 0, d.surface.base, false);
+	else
+		dropShadowRange(task, d.va, d.length);
+
+	return true;
 }
 
 // A region of level 0 of 2D texture `from` at `at` into texture `to` at `into`, `size` pixels, row by row with the CPU; IOSurfaces through
