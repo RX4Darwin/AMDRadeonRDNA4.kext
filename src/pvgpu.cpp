@@ -5384,6 +5384,17 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		put(0x243 | 2u << 28);                // VGT_INDEX_TYPE, index 2
 		put(draw.indexBytes == 4 ? 1 : 0);    // 32- or 16-bit
 	}
+	// Metal's primitive restart, always on for indexed line and triangle strips: the index of all ones ends a strip (RenderBox's path
+	// distance strips on Tahoe; drawn as vertex 65535 they stitched the strips together). GE_MULTI_PRIM_IB_RESET_EN: RESET_EN,
+	// DISABLE_FOR_AUTO_INDEX (the template's 4 otherwise, as RADV); VGT_MULTI_PRIM_IB_RESET_INDX: the index (gfx12.json).
+	if (draw.indexBytes && (draw.type == 2 || draw.type == 4)) {
+		put(0xc0017900u);   // SET_UCONFIG_REG
+		put(0x24b);
+		put(5);
+		put(0xc0016900u);   // SET_CONTEXT_REG
+		put(0x103);
+		put(draw.indexBytes == 4 ? 0xffffffffu : 0xffffu);
+	}
 	for (uint32_t pass = 0; pass < (split ? 2u : 1u); pass++) {
 		if (pass) {   // the alpha pass
 			const uint32_t regs[3][2] = {{0x1e0, alphaPass.control}, {0x1d8, alphaPass.opt}, {0x214, mask & 8}};

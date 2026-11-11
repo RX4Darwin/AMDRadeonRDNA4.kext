@@ -525,7 +525,10 @@ static std::string legalize(Function &k) {
 				return f->getName().str() + " is not supported yet";
 			Value *v = c->getArgOperand(0);
 			Type *to = c->getType();
-			if (k[1] == "f" && k[3] == "f")
+			// to bool: x != 0, as Metal's bool(x) (RenderBox's even-odd resolve converts a winding of -1: saturated, it was false)
+			if (to->isIntOrIntVectorTy(1) && k[1] != "f")
+				r = k[3] == "f" ? b.CreateFCmpUNE(v, Constant::getNullValue(v->getType())) : b.CreateICmpNE(v, Constant::getNullValue(v->getType()));
+			else if (k[1] == "f" && k[3] == "f")
 				r = b.CreateFPCast(v, to);
 			else if (k[3] == "f")   // float to integer: saturating
 				r = b.CreateIntrinsic(k[1] == "s" ? Intrinsic::fptosi_sat : Intrinsic::fptoui_sat, {to, v->getType()}, {v});
