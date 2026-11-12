@@ -566,7 +566,6 @@ private:
 	uint64_t mBatchFence[kBatchSlots] {};
 	uint32_t mBatchSlot { 0 }, mBatchDwords { 0 }, mBatchDraws { 0 }, mBatchDirty[kBatchDraws] {};
 	uint32_t mDrawTarget { 0 };   // the target of the draw whose textures are staged (stageTextures: one it samples is read from a copy)
-	uint32_t mDrawRect[4] {};     // the pixels that draw can write, x0, y0, x1, y1 (scissor within viewport): what copyHeld copies
 	uint64_t mBatchedAt { 0 };   // the GPU address the last draw put into the batch went to (named for a hang: CP_IB1_BASE + offset)
 	bool mFlushing { false };
 	uint64_t mSlotSubmit[kSlots] {};
@@ -4095,22 +4094,10 @@ bool RDNA4PvHost::copyHeld(const HeldTarget &h, uint32_t width, uint32_t height,
 		mHeldCopy.bytes = bytes;
 	}
 
-	// Only what the draw can write, with a margin: these draws read the target where they draw (blend modes that need what is there),
-	// and the rest of the copy is not looked at. The whole target each time kept the card busy with copies (2026-11-10).
-	static constexpr uint32_t kMargin = 16;
-	const uint32_t x0 = mDrawRect[0] > kMargin ? mDrawRect[0] - kMargin : 0, y0 = mDrawRect[1] > kMargin ? mDrawRect[1] - kMargin : 0;
-	const uint32_t x1 = mDrawRect[2] + kMargin < s.width ? mDrawRect[2] + kMargin : s.width;
-	const uint32_t y1 = mDrawRect[3] + kMargin < s.height ? mDrawRect[3] + kMargin : s.height;
-
-	if (x1 <= x0 || y1 <= y0)
-		return false;
-
-	const uint64_t at = static_cast<uint64_t>(y0) * s.pitch;
-	const bool rect = y1 - y0 <= kDmaRows;   // a DMA packet a row; else whole rows in one piece
-	const uint64_t col = rect ? static_cast<uint64_t>(x0) * s.bpp : 0;
-	const uint32_t rowLen = rect ? (x1 - x0) * s.bpp : s.pitch;
-
-	if (!rowsOnCard(s.gpu + at + col, s.pitch, mHeldCopy.gpu + at + col, s.pitch, rowLen, y1 - y0))
+	// The whole target: a draw may sample it anywhere, not only where it draws. Tahoe's Liquid Glass reads the backdrop around its
+	// shape (blur, refraction): with only the pixels the draw could write (and 16 more) copied, the rest of the copy was an earlier
+	// draw's, and Finder's toolbar buttons and sidebar showed stale blocks with hard edges (2026-11-12). Sequoia draws no such glass.
+	if (!rowsOnCard(s.gpu, s.pitch, mHeldCopy.gpu, s.pitch, s.pitch, s.height))
 		return false;
 
 	gpu = mHeldCopy.gpu;
@@ -5432,10 +5419,6 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	StagedTexture stagedTextures[2][16] = {};
 	const uint64_t texturesFrom = nowNs();
 	mDrawTarget = target;
-	mDrawRect[0] = static_cast<uint32_t>(vx > sx ? (vx < sx2 ? vx : sx2) : sx);
-	mDrawRect[1] = static_cast<uint32_t>(vy > sy ? (vy < sy2 ? vy : sy2) : sy);
-	mDrawRect[2] = static_cast<uint32_t>(vx + vw < sx2 ? (vx + vw > mDrawRect[0] ? vx + vw : mDrawRect[0]) : sx2);
-	mDrawRect[3] = static_cast<uint32_t>(vy + vh < sy2 ? (vy + vh > mDrawRect[1] ? vy + vh : mDrawRect[1]) : sy2);
 	for (unsigned st = 0; st < 2 && ok; st++)
 		ok = stageTextures(task, bound[st], reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]), stagedTextures[st], talk, st ? "fragment" : "vertex",
 		                   st && noColour);
