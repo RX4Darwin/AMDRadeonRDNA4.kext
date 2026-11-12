@@ -66,7 +66,8 @@ SYSCTL_INT(_debug, OID_AUTO, rdna4_pvprofile, CTLFLAG_RW | CTLFLAG_LOCKED, &gPro
 static int gInPlace = 3;
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvinplace, CTLFLAG_RW | CTLFLAG_LOCKED, &gInPlace, 0,
 	   "AMDRadeonRDNA4: what draws use in place (1 textures, 2 colour targets; 4 not IOSurface textures, 8 not Metal's); the rest is staged "
-	   "(16: without shadows, each draw's own copy; 32: the displays' frames not kept on the card; 2048: indices staged)");
+	   "(16: without shadows, each draw's own copy; 32: the displays' frames not kept on the card; 2048: indices staged; 8192: Metal's textures "
+	   "drawn in place, not held on the card)");
 
 namespace {
 
@@ -5226,14 +5227,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint32_t sx2 = draw.scissorSet ? clampTo(draw.scissor[0] + draw.scissor[2], width) : width;
 	const uint32_t sy2 = draw.scissorSet ? clampTo(draw.scissor[1] + draw.scissor[3], height) : height;
 	// The target in place when the colour block can write it as the guest has it (its rows a multiple of 128 bytes apart, its base 256-byte
-	// aligned): no staging, no copies, and BGRA8 swapped by the colour block (COMP_SWAP) instead of the CPU. Else staged at a pitch of its own.
+	// aligned): no staging, no copies, and BGRA8 swapped by the colour block (COMP_SWAP) instead of the CPU. Else held or staged at a pitch
+	// of its own.
 	const uint32_t tp = pixelBytes(targetFormat);   // bytes a pixel
-	const bool inPlace = (gInPlace & 2) && !(bpr % 128) && !((surface.memory ? surface.base : va) & 0xff);
-	const uint32_t pitch = inPlace ? bpr / tp : (width * tp + 127) / 128 * 128 / tp;   // pixels; staged: a multiple of 128 bytes
-
-	const uint64_t targetBytes = static_cast<uint64_t>(pitch) * height * tp;
-	// Only the scissor rectangle's rows are staged in and out (WindowServer limits most draws to what changed): nothing outside it is drawn.
-	const uint64_t regionAt = static_cast<uint64_t>(pitch) * sy * tp, regionBytes = static_cast<uint64_t>(pitch) * (sy2 - sy) * tp;
+	const bool placeable = (gInPlace & 2) && !(bpr % 128) && !((surface.memory ? surface.base : va) & 0xff);
 
 	if (sx2 <= sx || sy2 <= sy) {
 		if (talk)
@@ -5270,10 +5267,20 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	GfxBuffers tgt {};
 	uint8_t *pooledTarget = nullptr;
 
+	// A texture in the guest's memory (not an IOSurface) held even where it could be drawn in place: in place, each draw went across the bus
+	// to the guest's memory, and Maps' (its whole map, blended) kept the card busy at 25 frames a second while it scrolled; held, 50. Its
+	// rows are written back once, at the end of the command buffer.
+	const bool hold = mRtOpen && !(gInPlace & 16) && (!placeable || (!surface.memory && !(gInPlace & 8192)));
+	const bool held = hold && holdTarget(task, target, va, surface, width, height, bpr, tp);
+	const bool inPlace = placeable && !held;
+
 	if (inPlace)   // a target in place over a held one's memory: that one written back first, the draw's rows then go over it
 		flushHeldIn(surface.surface, task, surface.memory ? surface.base : va, static_cast<uint64_t>(bpr) * height);
 
-	const bool held = !inPlace && mRtOpen && !(gInPlace & 16) && holdTarget(task, target, va, surface, width, height, bpr, tp);
+	const uint32_t pitch = inPlace ? bpr / tp : (width * tp + 127) / 128 * 128 / tp;   // pixels; else a multiple of 128 bytes
+	const uint64_t targetBytes = static_cast<uint64_t>(pitch) * height * tp;
+	// Only the scissor rectangle's rows are staged in and out (WindowServer limits most draws to what changed): nothing outside it is drawn.
+	const uint64_t regionAt = static_cast<uint64_t>(pitch) * sy * tp, regionBytes = static_cast<uint64_t>(pitch) * (sy2 - sy) * tp;
 
 	// this draw's state page and IB
 	const uint32_t slot = takeSlot();
