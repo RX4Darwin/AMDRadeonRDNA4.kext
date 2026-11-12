@@ -2800,6 +2800,7 @@ static const TextureFormat *textureFormat(uint32_t metal) {
 	                                     {80, 42, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4}, {81, 66, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // BGRA8 unorm, sRGB
 	                                     {55, 22, 4 | 0 << 3 | 0 << 6 | 1 << 9, 4}, {115, 57, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // R32Float, RGBA16Float
 	                                     {125, 63, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16},                                             // RGBA32Float
+	                                     {110, 51, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},                                              // RGBA16 unorm
 	                                     {1, 1, 4 << 9, 1}, {10, 1, 4 | 1 << 9, 1}, {11, 64, 4 | 1 << 9, 1},         // A8, R8 unorm, sRGB
 	                                     {30, 14, 4 | 5 << 3 | 1 << 9, 2}, {31, 65, 4 | 5 << 3 | 1 << 9, 2},                      // RG8 unorm, sRGB
 	                                     {20, 7, 4 | 1 << 9, 2}, {25, 13, 4 | 1 << 9, 2},                                          // R16 unorm, float
@@ -2988,7 +2989,7 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 	const TextureFormat *fm = textureFormat(format);
 	const uint32_t tp = fm ? fm->bpp : 4;
 	const bool drawable = found && bpr && !(bpr % tp) && h && static_cast<uint64_t>(bpr) * h <= len &&
-	                      (format == 70 || format == 71 || format == 80 || format == 81 || format == 115 || format == 65 || format == 10 ||
+	                      (format == 70 || format == 71 || format == 80 || format == 81 || format == 115 || format == 110 || format == 65 || format == 10 ||
 	                       format == 25 || format == 90 || (!format && w * 4 == bpr));
 	const bool swap = format != 70 && format != 71;   // BGRA8 (and of unknown format, as before)
 	const bool byHeld = drawable && (bpr % 128);   // cleared in a held shadow: the texture's own held target stays, cleared
@@ -5342,7 +5343,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// RGBA8 (70, 71) as BGRA8, but already in the staged target's order; RGBA16Float (115: CoreAnimation renders symbols into it) as
 	// itself, 8 bytes a pixel.
 	// 65: RG16Float; 10: R8Unorm, 25: R16Float, 90: RGB10A2Unorm (CoreAnimation's masks and icons on Tahoe)
-	const auto known = [](uint32_t f) { return f == 10 || f == 25 || f == 65 || f == 70 || f == 71 || f == 80 || f == 81 || f == 90 || f == 115; };
+	// 110: RGBA16Unorm (kitty's offscreen target through AppleMetalOpenGLRenderer, 2026-11-12)
+	const auto known = [](uint32_t f) { return f == 10 || f == 25 || f == 65 || f == 70 || f == 71 || f == 80 || f == 81 || f == 90 || f == 110 || f == 115; };
 	const auto pixelBytes = [](uint32_t f) { const TextureFormat *fm = textureFormat(f); return fm ? fm->bpp : 4; };
 	uint32_t storage = 0;
 	const bool found = !why && textureRange(task, target, &va, &len, &bpr, &width, &texHeight, &targetFormat, &storage) && width;

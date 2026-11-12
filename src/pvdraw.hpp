@@ -46,6 +46,7 @@ static inline uint32_t doubleAsHalf(uint64_t bits) {
 static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	switch (format) {
 	case 115: return 0x0002070cu;   // RGBA16Float
+	case 110: return 0x0002000cu;   // RGBA16Unorm
 	case 65: return 0x00020705u;    // RG16Float
 	case 10: return 0x00020001u;    // R8Unorm
 	case 25: return 0x00020702u;    // R16Float
