@@ -557,6 +557,7 @@ private:
 	uint64_t mBatchFence[kBatchSlots] {};
 	uint32_t mBatchSlot { 0 }, mBatchDwords { 0 }, mBatchDraws { 0 }, mBatchDirty[kBatchDraws] {};
 	uint32_t mDrawTarget { 0 };   // the target of the draw whose textures are staged (stageTextures: one it samples is read from a copy)
+	uint32_t mDrawRect[4] {};     // the pixels that draw can write, x0, y0, x1, y1 (scissor within viewport): what copyHeld copies
 	uint64_t mBatchedAt { 0 };   // the GPU address the last draw put into the batch went to (named for a hang: CP_IB1_BASE + offset)
 	bool mFlushing { false };
 	uint64_t mSlotSubmit[kSlots] {};
@@ -594,6 +595,7 @@ private:
 	// runtime buffer of its own cost an allocation, two SDMA copies and a free a draw, each with its page-table syncs.
 	static constexpr uint64_t kPoolBytes = 96ull << 20;
 	GfxBuffers mGfxPool {};
+	struct { uint64_t handle, gpu, bytes; } mHeldCopy {};   // copyHeld's buffer on the card: kept for the boot, grown as needed
 	uint64_t mPoolUsed { 0 };
 	// The pool in kPoolChunks pieces taken in turn: a piece is used again once the submit that used it last is done (it was used from the
 	// start again only when nothing was in flight, and with draws in batches that was seldom: the host drained the card each 24 MiB).
@@ -4010,22 +4012,52 @@ void RDNA4PvHost::drewInto(const OSObject *surface, uint32_t task, uint64_t at, 
 }
 
 // The held target as the draws before left it, for a draw that samples it: copied from its shadow by the card in the ring after them
-// (the idle barrier writes their colour caches back), into the staging pool. False when it is not of that size and pixel, or too
-// large for a piece of the pool: the held shadow is then read in place, as before.
+// (the idle barrier writes their colour caches back) into a buffer of the card's. Only the card writes that buffer, after the draws
+// that read the copy before: the host never waits for it. In the staging pool instead, each piece taken waited for the card: a
+// window dragged translucent across the displays' edge spent 3 s of every 5 waiting (2026-11-10). False when the target is not of
+// that size and pixel, or larger than a shadow may be: the held shadow is then read in place, as before.
 bool RDNA4PvHost::copyHeld(uint32_t width, uint32_t height, uint32_t bpp, uint64_t &gpu, uint32_t &pitch)
 {
 	const Shadow &s = *mHeld.shadow;
 	const uint64_t bytes = static_cast<uint64_t>(s.pitch) * s.height;
-	uint64_t copy = 0;
-	uint8_t *cpu = nullptr;
 
-	if (s.width != width || s.height != height || s.bpp != bpp || s.depth > 1)
+	if (s.width != width || s.height != height || s.bpp != bpp || s.depth > 1 || bytes > kShadowMax)
 		return false;
 
-	if (!poolTake(bytes, copy, cpu) || !rowsOnCard(s.gpu, s.pitch, copy, s.pitch, s.pitch, s.height))
+	if (bytes > mHeldCopy.bytes) {   // grown: the smaller one may still be read by draws in flight
+		if (mHeldCopy.handle) {
+			waitDraws();
+			gCompute->rtFree(this, mHeldCopy.handle);
+			mHeldCopy = {};
+		}
+
+		if (gCompute->rtAlloc(this, bytes, mHeldCopy.handle, mHeldCopy.gpu) != kIOReturnSuccess) {
+			mHeldCopy = {};
+			return false;
+		}
+
+		mHeldCopy.bytes = bytes;
+	}
+
+	// Only what the draw can write, with a margin: these draws read the target where they draw (blend modes that need what is there),
+	// and the rest of the copy is not looked at. The whole target each time kept the card busy with copies (2026-11-10).
+	static constexpr uint32_t kMargin = 16;
+	const uint32_t x0 = mDrawRect[0] > kMargin ? mDrawRect[0] - kMargin : 0, y0 = mDrawRect[1] > kMargin ? mDrawRect[1] - kMargin : 0;
+	const uint32_t x1 = mDrawRect[2] + kMargin < s.width ? mDrawRect[2] + kMargin : s.width;
+	const uint32_t y1 = mDrawRect[3] + kMargin < s.height ? mDrawRect[3] + kMargin : s.height;
+
+	if (x1 <= x0 || y1 <= y0)
 		return false;
 
-	gpu = copy;
+	const uint64_t at = static_cast<uint64_t>(y0) * s.pitch;
+	const bool rect = y1 - y0 <= kDmaRows;   // a DMA packet a row; else whole rows in one piece
+	const uint64_t col = rect ? static_cast<uint64_t>(x0) * s.bpp : 0;
+	const uint32_t rowLen = rect ? (x1 - x0) * s.bpp : s.pitch;
+
+	if (!rowsOnCard(s.gpu + at + col, s.pitch, mHeldCopy.gpu + at + col, s.pitch, rowLen, y1 - y0))
+		return false;
+
+	gpu = mHeldCopy.gpu;
 	pitch = s.pitch;
 
 	return true;
@@ -5273,6 +5305,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	StagedTexture stagedTextures[2][16] = {};
 	const uint64_t texturesFrom = nowNs();
 	mDrawTarget = target;
+	mDrawRect[0] = static_cast<uint32_t>(vx > sx ? (vx < sx2 ? vx : sx2) : sx);
+	mDrawRect[1] = static_cast<uint32_t>(vy > sy ? (vy < sy2 ? vy : sy2) : sy);
+	mDrawRect[2] = static_cast<uint32_t>(vx + vw < sx2 ? (vx + vw > mDrawRect[0] ? vx + vw : mDrawRect[0]) : sx2);
+	mDrawRect[3] = static_cast<uint32_t>(vy + vh < sy2 ? (vy + vh > mDrawRect[1] ? vy + vh : mDrawRect[1]) : sy2);
 	for (unsigned st = 0; st < 2 && ok; st++)
 		ok = stageTextures(task, bound[st], reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]), stagedTextures[st], talk, st ? "fragment" : "vertex",
 		                   st && noColour);
