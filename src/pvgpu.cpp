@@ -9,6 +9,7 @@
 #include "trial.hpp"
 #include "klog.hpp"
 #include "pvstream.hpp"
+#include <Headers/kern_patcher.hpp>
 #include "pvdraw.hpp"
 #include "pm4.hpp"
 #include "pvscanout.hpp"
@@ -164,9 +165,9 @@ void pvPause() {
 
 // rdna4-pvgl=1: OpenGL.framework (libGFXShared) loads a renderer for an accelerator only if it names one in IOGLBundleName, which Apple's
 // paravirtual accelerator does not: GL then has its software renderer alone. This names Apple's GL-on-Metal renderer
-// (AppleMetalOpenGLRenderer.bundle) on the accelerator when it is published. Off by default: on its own it aborts every GL process (the
-// renderer asserts in GLDDeviceRec::initWithDisplayMask: the device's vendor "Apple" is none it knows on Intel), and every GL render pass
-// is refused by the guest (no supportsDefaultRasterSampleCount); both still to be lifted (2026-11-11).
+// (AppleMetalOpenGLRenderer.bundle) on the accelerator when it is published. On its own it would abort every GL process (the renderer
+// asserts in GLDDeviceRec::initWithDisplayMask: the device's vendor "Apple" is none it knows on Intel) and the guest would refuse every
+// GL render pass (no supportsDefaultRasterSampleCount): routeGlPages patches the renderer for both, under the same boot-arg.
 static bool nameGlBundle(void *, void *, IOService *accel, IONotifier *) {
 	accel->setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer");
 	pvlog("OpenGL: IOGLBundleName AppleMetalOpenGLRenderer on %s (rdna4-pvgl)", accel->getName());
@@ -185,6 +186,72 @@ static void watchForGlAccelerator() {
 	OSSafeReleaseNULL(match);
 	if (!notifier)
 		pvlog("OpenGL: no notification for the paravirtual accelerator: IOGLBundleName not set");
+}
+
+// rdna4-pvgl=1, user space: AppleMetalOpenGLRenderer itself patched where its pages come in from disk (Lilu's user patcher does this no
+// more from Big Sur on: its isUserDisabled). The kernel's cs_validate_page (Tahoe 26.6.2: void (vnode, pager, page offset in the file,
+// data, int *validated, int *tainted, int *nx), the last on the stack) is wrapped; a page it validated at one of these offsets of the
+// renderer's universal file (x86_64 slice at 0x4000) whose bytes are exactly these gets the replacement, in the page every process maps.
+// - its vendor test (GLDDeviceRec::initWithDisplayMask: strstr(vendorName, "AMD" / "ATI" / "NVIDIA" / "Intel"), else "Unknown GPU!!"
+//   and an assertion): its "AMD" becomes "App", so the paravirtual device's "Apple" takes the AMD branch (in-process tests with the vendor
+//   renamed to "AMD" drew as the M5, 2026-11-11);
+// - its one setDefaultRasterSampleCount: call (GLDContextRec::buildRenderPassDescriptor) becomes a nop: the guest's serializer refuses
+//   every pass with one ("Does not support default raster sample count": Tahoe x86's AppleParavirtGPUMetal sets none of PGSerializer's
+//   features), and the renderer's passes always have a colour attachment.
+namespace {
+
+struct GlPagePatch {
+	uint64_t page;   // the page's offset in the file
+	uint32_t at, size;
+	const uint8_t *find, *replace;
+	const char *what;
+};
+
+const uint8_t kGlVendorFind[16] = {'E', 'R', '_', 'S', 'I', 'Z', 'E', 0, 'A', 'M', 'D', 0, 'A', 'T', 'I', 0};
+const uint8_t kGlVendorReplace[16] = {'E', 'R', '_', 'S', 'I', 'Z', 'E', 0, 'A', 'p', 'p', 0, 'A', 'T', 'I', 0};
+const uint8_t kGlRasterFind[10] = {0x48, 0x8b, 0x35, 0x4f, 0x54, 0x04, 0x00, 0x41, 0xff, 0xd6};      // movq sel(%rip), %rsi; callq *%r14
+const uint8_t kGlRasterReplace[10] = {0x48, 0x8b, 0x35, 0x4f, 0x54, 0x04, 0x00, 0x0f, 0x1f, 0x00};   // ...; nopl (%rax)
+
+const GlPagePatch kGlPagePatches[] = {
+	{0x5c000, 0x698, sizeof(kGlVendorFind), kGlVendorFind, kGlVendorReplace, "vendor test: \"AMD\" now \"App\""},
+	{0x2c000, 0x492, sizeof(kGlRasterFind), kGlRasterFind, kGlRasterReplace, "setDefaultRasterSampleCount: call now a nop"},
+};
+
+using ValidatePage = void (*)(void *vnode, void *pager, uint64_t offset, const void *data, int *validated, int *tainted, int *nx);
+mach_vm_address_t orgValidatePage;
+uint32_t glPagesPatched;
+
+// In the page-fault path: two compares for every other page; IOLog (the kernel's own) for the first few patches only.
+void wrapValidatePage(void *vnode, void *pager, uint64_t offset, const void *data, int *validated, int *tainted, int *nx) {
+	reinterpret_cast<ValidatePage>(orgValidatePage)(vnode, pager, offset, data, validated, tainted, nx);
+	if (!data || !validated || !*validated)
+		return;
+	for (const GlPagePatch &p : kGlPagePatches) {
+		auto *page = const_cast<uint8_t *>(static_cast<const uint8_t *>(data));
+
+		if (offset == p.page && !memcmp(page + p.at, p.find, p.size)) {
+			memcpy(page + p.at, p.replace, p.size);
+			if (__atomic_fetch_add(&glPagesPatched, 1u, __ATOMIC_RELAXED) < 8)
+				IOLog("AMDRadeonRDNA4: pvgpu: OpenGL: AppleMetalOpenGLRenderer page +0x%llx: %s\n", offset, p.what);
+		}
+	}
+}
+
+} // namespace
+
+void routeGlPagesNow(KernelPatcher &patcher) {
+	uint32_t gl = 0;
+
+	if (!PE_parse_boot_argn("rdna4-pvgl", &gl, sizeof(gl)) || !gl)
+		return;
+
+	KernelPatcher::RouteRequest request {"_cs_validate_page", wrapValidatePage, orgValidatePage};
+	const bool ok = patcher.routeMultiple(KernelPatcher::KernelID, &request, 1);
+
+	if (!ok)
+		patcher.clearError();
+	pvlog("OpenGL: cs_validate_page %s (rdna4-pvgl): AppleMetalOpenGLRenderer %s", ok ? "wrapped" : "NOT wrapped",
+	      ok ? "is patched where its pages come in" : "stays as it is");
 }
 
 // The PCI class code the nub reports (rdna4-pvgpu-class=<24 bits>, default 0x030000 = display controller). Apple's driver matches by IOPCIMatch alone.
@@ -9118,3 +9185,5 @@ IOReturn pvTranslatorClient(IOService *service, task_t owningTask, void *securit
 	*handler = client;
 	return kIOReturnSuccess;
 }
+
+void pvgpu::routeGlPages(KernelPatcher &patcher) { routeGlPagesNow(patcher); }
