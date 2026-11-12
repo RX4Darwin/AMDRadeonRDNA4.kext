@@ -141,6 +141,13 @@ static inline void linearArray1d(uint32_t *t, uint64_t gpu, uint32_t format, uin
 	t[4] = (layers - 1) & 0x3fff;
 }
 
+// A linear 2D array's T#: `layers` slices of w x h, laid out as a 3D image's (linearVolume: the hardware's own pitches).
+static inline void linearArray2d(uint32_t *t, uint64_t gpu, uint32_t format, uint32_t sel, uint32_t w, uint32_t h, uint32_t layers) {
+	linearImage(t, gpu, format, sel, w, h, 1);
+	t[3] = sel | 13u << 28;   // TYPE 2D_ARRAY
+	t[4] = (layers - 1) & 0x3fff;
+}
+
 // One pass of colour attachment 0's Metal blend state: {source factor, destination factor, operation} -> CB_BLEND0_CONTROL and
 // SX_MRT0_BLEND_OPT. The card ignores SEPARATE_ALPHA_BLEND here (rig 2026-10-22, mtlprobe blendx: alpha always takes the colour
 // equation), so a pass has one equation for all four channels and differing alpha is a second pass (runDraw).

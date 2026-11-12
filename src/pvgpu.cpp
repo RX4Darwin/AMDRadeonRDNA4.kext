@@ -344,7 +344,7 @@ private:
 	void dumpGuest(uint32_t task, uint64_t va, uint32_t len);
 	bool copyGuest(uint32_t task, uint64_t va, uint8_t *buf, uint32_t len, bool toGuest);
 	bool readGuest(uint32_t task, uint64_t va, uint8_t *dst, uint32_t len) { return copyGuest(task, va, dst, len, false); }
-	void decodeExec(uint32_t task, uint64_t va, uint64_t len);
+	void decodeExec(uint32_t task, const uint64_t (*chunks)[2], uint32_t count);
 	void dmaSelfTest();
 	bool functionOf(uint32_t task, uint32_t pipeline, char *name, size_t nameCap, uint8_t hash[32], uint64_t *lib);
 	bool functionName(uint32_t task, uint32_t fn, char *name, size_t nameCap, uint8_t hash[32], uint64_t *lib);
@@ -1670,13 +1670,28 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 		if (c.id == 0x37 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4) {
 			copy(at, mWin, c.length);
 			uint32_t task;
-			memcpy(&task, mWin + c.payloadOffset, 4);   // ExecIndirect {u32 task, u32 n, n resource entries, u64 gpu va, u64 length} (measured 2026-10-21)
-			// the command buffer: the last two qwords of the payload, {u64 gpu va, u64 length}
+			memcpy(&task, mWin + c.payloadOffset, 4);
+			// ExecIndirect {u32 task, u32 invalidates, u32 chunks, invalidates x 24 bytes, chunks x {u64 gpu va, u64 length}}
+			// (AppleParavirtCommandQueue::processExecIndirect, Tahoe 26.6.2): a command buffer the guest's AppleParavirtCommandBuffer split
+			// ("adding another exec": kitty's, 2026-11-12) comes in several chunks, decoded in order as one. If the counts do not
+			// account for the payload, the last two qwords, as measured with one chunk on 2026-10-21.
 			const uint32_t plen = c.length - c.payloadOffset;
 			if (plen >= 24) {
-				uint64_t va, len;
-				memcpy(&va, mWin + c.payloadOffset + plen - 16, 8);
-				memcpy(&len, mWin + c.payloadOffset + plen - 8, 8);
+				static constexpr uint32_t kMaxChunks = 64;
+				uint32_t counts[2] = {};
+				uint64_t chunks[kMaxChunks][2];
+				uint32_t n = 0;
+
+				memcpy(counts, mWin + c.payloadOffset + 4, 8);
+				if (counts[1] && counts[1] <= kMaxChunks && counts[0] <= 1024 && 12 + 24ull * counts[0] + 16ull * counts[1] == plen) {
+					memcpy(chunks, mWin + c.payloadOffset + 12 + 24 * counts[0], 16 * counts[1]);
+					n = counts[1];
+				} else {
+					memcpy(chunks[0], mWin + c.payloadOffset + plen - 16, 16);
+					n = 1;
+				}
+				if (gTalk && n > 1)
+					pvlog("host: %s: command buffer of task %u in %u chunks", src.tag, task, n);
 
 				if (gTalk)
 					pvlog("host: %s: command buffer of task %u, signal %u", src.tag, task, c.signal);
@@ -1687,7 +1702,7 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 				mExecTag = src.tag;
 				mExecPayloadDwords = plen / 4 < 128 ? plen / 4 : 128;
 				memcpy(mExecPayload, mWin + c.payloadOffset, mExecPayloadDwords * 4);
-				decodeExec(task, va, len);
+				decodeExec(task, chunks, n);
 			}
 		}
 		if (c.id == 0x39 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4 && mDumped[0x39] < 16) {
@@ -2614,43 +2629,46 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 
 // M1: one command buffer of an ExecIndirect, decoded: segments {u32 length, u8 type, u8 continuation, u8 flags, u8 0}, in them stream commands
 // {u32 id, u32 size} + payload (docs/m1-stream.md section 4; the framing and the ids measured against tools/metal/m1/mtlprobe.m on the rig, 2026-10-21).
-void RDNA4PvHost::decodeExec(uint32_t task, uint64_t va, uint64_t len) {
-	static constexpr uint32_t kMaxRead = 1u << 20;   // 64 KiB dropped one of Maps' command buffers (72 KiB) whole
-	const uint32_t n = len < kMaxRead ? static_cast<uint32_t>(len) : kMaxRead;
-	auto *buf = static_cast<uint8_t *>(IOMalloc(n ? n : 1));
-	if (!buf)
-		return;
-	if (!readGuest(task, va, buf, n)) {
-		pvlog("host: stream: task %u command buffer at 0x%llx (%llu bytes) is not mapped", task, va, len);
-		IOFree(buf, n ? n : 1);
-		return;
-	}
-	ExecTally t {};
+void RDNA4PvHost::decodeExec(uint32_t task, const uint64_t (*chunks)[2], uint32_t count) {
+	ExecTally t {};   // one for all the chunks: an encoder may go on in the next
 	t.host = this;
 	t.task = task;
 	t.listing = mListed[task & 63] < 2 && ++mListed[task & 63];
-	uint32_t at = 0, segments = 0, undecoded = 0;
-	while (at + 8 <= n) {
-		uint32_t slen;
-		memcpy(&slen, buf + at, 4);
-		const uint8_t type = buf[at + 4];
-		if (slen < 8 || slen > n - at) {
-			undecoded = n - at;
-			pvlog("host:   stream: segment framing breaks at +0x%x (length %u)", at, slen);
-			break;
+	for (uint32_t c = 0; c < count; c++) {
+		const uint64_t va = chunks[c][0], len = chunks[c][1];
+		static constexpr uint32_t kMaxRead = 1u << 20;   // 64 KiB dropped one of Maps' command buffers (72 KiB) whole
+		const uint32_t n = len < kMaxRead ? static_cast<uint32_t>(len) : kMaxRead;
+		auto *buf = static_cast<uint8_t *>(IOMalloc(n ? n : 1));
+		if (!buf)
+			return;
+		if (!readGuest(task, va, buf, n)) {
+			pvlog("host: stream: task %u command buffer at 0x%llx (%llu bytes) is not mapped", task, va, len);
+			IOFree(buf, n ? n : 1);
+			return;
 		}
-		segments++;
-		t.segment = pvstream::segmentTypeName(type);
-		if (type != 5) {   // 5: the protection-options envelope, a raw u64
-			const size_t ok = pvstream::walkCommands(buf + at + 8, slen - 8, false, execSink, &t);
-			undecoded += slen - 8 - static_cast<uint32_t>(ok);
+		uint32_t at = 0, segments = 0, undecoded = 0;
+		while (at + 8 <= n) {
+			uint32_t slen;
+			memcpy(&slen, buf + at, 4);
+			const uint8_t type = buf[at + 4];
+			if (slen < 8 || slen > n - at) {
+				undecoded = n - at;
+				pvlog("host:   stream: segment framing breaks at +0x%x (length %u)", at, slen);
+				break;
+			}
+			segments++;
+			t.segment = pvstream::segmentTypeName(type);
+			if (type != 5) {   // 5: the protection-options envelope, a raw u64
+				const size_t ok = pvstream::walkCommands(buf + at + 8, slen - 8, false, execSink, &t);
+				undecoded += slen - 8 - static_cast<uint32_t>(ok);
+			}
+			at += slen;
 		}
-		at += slen;
+		pvlog("host: stream: task %u command buffer at 0x%llx, %llu bytes: %u segment(s), %u command(s), %u unknown, %u byte(s) undecoded%s", task, va, len,
+		      segments, t.commands, t.unknown, undecoded, len > n ? " (only the first 1 MiB read)" : "");
+		IOFree(buf, n ? n : 1);
 	}
 	flushHeld();   // the guest reads what the command buffer drew once its stamp completes
-	pvlog("host: stream: task %u command buffer at 0x%llx, %llu bytes: %u segment(s), %u command(s), %u unknown, %u byte(s) undecoded%s", task, va, len,
-	      segments, t.commands, t.unknown, undecoded, len > n ? " (only the first 1 MiB read)" : "");
-	IOFree(buf, n ? n : 1);
 }
 
 // M2: a buffer's GPU range, from the task's resource heap (SetResourceHeap: first 1 MiB at VA 0x1000; measured on the rig, 2026-10-21): 12-byte records
@@ -3770,10 +3788,12 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			continue;
 		}
 
-		// A 1D array (WindowServer's colour lookup tables) staged as a 3D image's slices are, sampled through a 1D-array T#.
+		// A 1D array (WindowServer's colour lookup tables) staged as a 3D image's slices are, sampled through a 1D-array T#; a 2D array
+		// (kitty's glyph atlas, through AppleMetalOpenGLRenderer) the same way through a 2D-array T#.
 		const bool array1d = ok && src.slices > 1 && src.depth == 1 && src.height == 1 && src.sliceBytes;
+		const bool array2d = ok && src.slices > 1 && src.depth == 1 && src.height > 1 && src.sliceBytes;
 
-		if (array1d) {
+		if (array1d || array2d) {
 			src.depth = src.slices;
 			src.imageBytes = src.sliceBytes;
 		}
@@ -3838,6 +3858,8 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 
 			if (array1d)
 				linearArray1d(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, depth);
+			else if (array2d)
+				linearArray2d(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 			else if (depth > 1)
 				linearVolume(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 			else
@@ -3923,6 +3945,8 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		}
 		if (array1d)
 			linearArray1d(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, depth);
+		else if (array2d)
+			linearArray2d(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 		else if (depth > 1)
 			linearVolume(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 		else
