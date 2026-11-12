@@ -46,23 +46,37 @@ static uint64_t hostLeaf(const Policy &pol, uint64_t bus, bool executable) {
 	return GpuVm::encodePte(bus, flags, false);
 }
 
+/* A mapping past the dense image would land in a PT page no directory reaches, and the GPU stalls on it: refused whole, before anything
+ * is written. */
+void denseRoot(uint64_t *shadow, uint64_t rootPhys) {
+	shadow[0] = GpuVm::encodePde(rootPhys + 0x1000, GpuVm::kValid, 2);
+	for (uint64_t gib = 0; gib < kDenseGiBs; gib++)
+		shadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart + (gib << 30), 1)] =
+			GpuVm::encodePde(rootPhys + densePdb0(gib), GpuVm::kValid, 1);
+}
+
 bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, uint64_t physical, bool executable, Span &out) {
 	out = Span {};
+	if (end > GpuVm::kVaStart + denseVa(tableBytes))
+		return false;
+
 	for (uint64_t at = va, phys = physical; at < end;
 	     at += GpuVm::kPageBytes, phys += GpuVm::kPageBytes) {
-		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
-		const uint64_t ptOff = 0x3000 + relative * 0x1000;
-		if (at < GpuVm::kVaStart || ptOff + 0x1000 > tableBytes)
+		if (at < GpuVm::kVaStart || at >= GpuVm::kVaStart + denseVa(tableBytes))
 			return false;
-		const uint32_t pdeIndex = GpuVm::index(at, 2);
-		const uint64_t pdeOff = 0x2000 + static_cast<uint64_t>(pdeIndex) * 8;
+		const uint64_t ptOff = densePt(at);
+		if (ptOff + 0x1000 > tableBytes)
+			return false;
+		const uint64_t pdeOff = densePde(at);
 		const uint64_t pteOff = ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8;
 		uint64_t *pde = a.entry(a.context, pdeOff), *pte = a.entry(a.context, pteOff);
 		uint64_t ptPhysical = 0;
 		if (!pde || !pte || !a.phys(a.context, ptOff, ptPhysical))
 			return false;
-		if (!*pde)
+		if (!*pde) {
 			*pde = GpuVm::encodePde(ptPhysical, GpuVm::kValid, 0);
+			out.directories = true;
+		}
 		if (out.firstPt == ~0ull)
 			out.firstPt = ptOff;
 		out.lastPt = ptOff;
@@ -73,23 +87,28 @@ bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 
 bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, Span &out) {
 	out = Span {};
+	if (end > GpuVm::kVaStart + denseVa(tableBytes))
+		return false;
+
 	uint64_t page = 0;
 	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes, page++) {
 		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
 			return false;
-		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
-		const uint64_t ptOff = 0x3000 + relative * 0x1000;
-		if (at < GpuVm::kVaStart || ptOff + 0x1000 > tableBytes)
+		if (at < GpuVm::kVaStart || at >= GpuVm::kVaStart + denseVa(tableBytes))
 			return false;
-		const uint32_t pdeIndex = GpuVm::index(at, 2);
-		const uint64_t pdeOff = 0x2000 + static_cast<uint64_t>(pdeIndex) * 8;
+		const uint64_t ptOff = densePt(at);
+		if (ptOff + 0x1000 > tableBytes)
+			return false;
+		const uint64_t pdeOff = densePde(at);
 		const uint64_t pteOff = ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8;
 		uint64_t *pde = a.entry(a.context, pdeOff), *pte = a.entry(a.context, pteOff);
 		uint64_t ptPhysical = 0;
 		if (!pde || !pte || !a.phys(a.context, ptOff, ptPhysical))
 			return false;
-		if (!*pde)
+		if (!*pde) {
 			*pde = GpuVm::encodePde(ptPhysical, GpuVm::kValid, 0);
+			out.directories = true;
+		}
 		if (out.firstPt == ~0ull)
 			out.firstPt = ptOff;
 		out.lastPt = ptOff;
@@ -101,9 +120,10 @@ bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 void unmap(const Access &a, uint64_t tableBytes, uint64_t va, uint64_t end, Span &out) {
 	out = Span {};
 	for (uint64_t at = va; at < end && at >= va; at += GpuVm::kPageBytes) {
-		const uint64_t relative = (at - GpuVm::kVaStart) >> 21;
-		const uint64_t ptOff = 0x3000 + relative * 0x1000;
-		if (at < GpuVm::kVaStart || ptOff + 0x1000 > tableBytes)
+		if (at < GpuVm::kVaStart || at >= GpuVm::kVaStart + denseVa(tableBytes))
+			break;
+		const uint64_t ptOff = densePt(at);
+		if (ptOff + 0x1000 > tableBytes)
 			break;
 		const uint64_t pteOff = ptOff + static_cast<uint64_t>(GpuVm::index(at, 3)) * 8;
 		if (uint64_t *pte = a.entry(a.context, pteOff))   // sparse: a page that was never backed holds no PTE to clear

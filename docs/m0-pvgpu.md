@@ -140,6 +140,217 @@ Between them `host: ctrl+0x... a -> b` lines show the register writes the host s
 3. Our log: `host: ctrl+0x034 0x00000000 -> 0x00000006` (version handshake), `host: FIFO announced: ...` (setupFIFO), `host: fifo @0x...: cmd 0x.. <name>, N bytes ...` (the commands by name). Which of these appear is the M0 result.
 4. `host: GetDeviceInfo answered` in our log and `ioreg -c AppleParavirtAccelerator` / `ioreg -c IOAccelerator` showing the accelerator with `MetalPluginName AppleParavirtGPUMetal`: `setupDeviceInfo` completed; what to expect after that is under "What the kext does next".
 
+## On the card under Sequoia (2026-11-03): M0 passes
+
+**Measured**, card (RX 9070, Sequoia 15.8.2 24H232, the kext as a one-shot test boot `rdna4-pvgpu=1`, `src/trial.hpp`):
+
+- Sequoia ships the x86 `AppleParavirtGPU.kext` (15.0.0) with the same personality as Tahoe's (`IOPCIMatch 0xEEEE106B`). Its IOPCIDevice vtable has the
+  same 11 differences from MacKernelSDK's header as Tahoe's (`tools/metal/m0/check-vtable.py` against Sequoia's BootKernelExtensions.kc).
+- First run: kernel panic 20 s into the boot, in `IOPCIDevice::detachFromChild` on the nub (a driver that probed it and failed was detached). Sequoia's
+  IOPCIDevice overrides `detachFromChild`, `setProperty`/`getProperty` and the power-child calls with code that reads its private state; the nub now routes
+  them to the registry's and IOService's versions, and its vtable copy stubs slot 313 (`powerStateWillChangeToGated`), past the header's vtable.
+- Second run: `AppleParavirtGPUControl` matched, `AppleParavirtFramebuffer` and `AppleParavirtAccelerator` started, and `MTLCopyAllDevices()` returned
+  **"Apple Paravirtual device" as the system default Metal device**, next to the card's IONDRV displays. WindowServer opened the accelerator (shared user
+  client and a 2D context); SecurityAgent made a command queue and sent 16 `ExecIndirect` command buffers on channel 1 with page-table commits on channel 2;
+  loginwindow opened it too. So the pairing question of M4 has a first answer: macOS takes the paravirt device as its GPU while our framebuffers drive the
+  displays.
+- Two host bugs showed: the driver's `GetDeviceInfo` record is `0x2a` on Sequoia (`0x2d` on Tahoe; its parser takes keys 1-0x29, the same keys), so the
+  device's capabilities stayed zero and apps (Safari, the Displays settings) crashed; and a completion raised while the event source had the line
+  disabled was dropped, which stalled the driver after 16 command buffers. Both fixed, not yet run.
+- Nothing executes the decoded work yet: the host completes every command at once. The desktop felt fast in that boot for that reason, not because
+  anything ran on the card.
+
+### Third and fourth runs (2026-11-03, both fixes in): where Metal stops now
+
+- `GetDeviceInfo` is answered (31 pairs, GpuCoreCount 56) and no more command buffers arrive at boot. A minimal Metal client (one shared buffer, one blit
+  fill, run over ssh) **blocks in `makeBuffer`**: `IOAccelResourceCreate` -> `IOAccelSharedUserClient2::new_resource` ->
+  `IOGraphicsAccelerator2::acceleratorWaitEnabled` (symbolised against Sequoia's SystemKernelExtensions.kc). The accelerator is disabled.
+- `IOGraphicsAccelerator2::disableAccelerator` is only called from `IOAccelDisplayMachine::display_mode_will_change`, `enableAccelerator` only from
+  `display_mode_did_change`: a mode change of the paravirt framebuffer started and never finished. That held with the display reported offline
+  (default) and online (`rdna4-pvgpu-disp=3`).
+- With the display online it is worse: WindowServer, while starting, creates a Metal device for that display (`CoreDisplay::CreateMetalDevice`), compiles a
+  pipeline, allocates a heap and blocks in the same wait. WindowServer hangs at startup and no screen updates. **Do not boot with `rdna4-pvgpu-disp` bit 0 on
+  the card** until the mode change completes.
+- Next: find what completes the mode change on a real paravirt host. The handlers are reached through a pointer (no direct callers), most likely from
+  IOFramebuffer's notifications; the paravirt side has `AppleParavirtDisplayPipe::displayModeWillChange/DidChange`, `beginTransaction`,
+  `submitTransaction`, `isTransactionComplete` and `signalTransactionComplete`, which point at display-pipe transactions the host has to complete
+  (the display info says "transactions via FIFO 0x06").
+
+### Fifth to eleventh runs (2026-11-04): a Metal client's blit runs on the host
+
+**Measured**, card, Sequoia 24H232, `rdna4-pvgpu=1`, display offline:
+
+- **Accelerator enable.** `IOGraphicsAccelerator2` starts disabled, is enabled by `display_mode_did_change` and disabled by `display_mode_will_change` of
+  its framebuffer. `src/pvhooks.cpp` (Lilu, PVGPU builds) enables the paravirt accelerator for the first client that waits and skips its disables.
+  A Metal client then runs to completion: buffer, blit, `ExecIndirect`, page-table commits, status *completed*.
+- **Page table.** Four levels of 4 KiB nodes with 1024 u32 entries, 10 bits of the page number per level, root first; entry = page number, bit 31 a
+  flag. `AppleParavirtTask::init` passes 3 to `PageTable::init`, yet the walk needs four for a 16 GiB task (`src/pvexec.hpp`).
+- **`SetResourceHeap`** `{u32 task, u32 heap GPU page, u32 bytes}`: the heap is in the task's GPU space (page 1, 1 MiB). Heap entry `i` (12 bytes) is
+  `{u32 kind | descriptor bytes << 8, u32 descriptor GPU address, u32 0}`; descriptors are packed one after the other. A buffer (kind 1) has the 16-byte
+  descriptor `{u64 length, u64 GPU page}`.
+- **`ExecIndirect`** `{u32 task, u32 count, u32 flags}`, `count` x `{u32 resource, u32 usage, u64, u64}`, then `{u64 command buffer GPU address,
+  u64 length}`. Task ids here and in `CommitIntoGPUPageTable` are `DefineHostTask`'s id >> 1.
+- **Command buffer.** Segments `{u32 length incl. header, u8 type (0 render, 1 compute, 2 blit, 4 info), u8, u8, u8}`, commands `{u32 id, u32 size incl.
+  header}`. A blit `fillBuffer` is `0x132 {u32 buffer ref, u64 offset, u64 length, u8 value}`; the ref is the heap entry index.
+- **First execution:** `src/pvrun.cpp` runs blit fills and buffer copies with the CPU on the client's memory. A one-blit client reads back 0xab over
+  4 KiB (it read its old contents before).
+- **Compute:** `makeLibrary(source:)` compiles inside the guest; `makeComputePipelineState` sends `CreateComputePipeline` (0x3b)
+  `{u32 task, u32 2, u32 5, u32 6, u64 GPU address}`: 5 and 6 are not heap refs (another namespace: the bundle's serializer objects), the address is
+  zeroed memory the host is presumably to fill (the client reads `threadExecutionWidth` 0). Objects reach the host another way:
+  `AppleParavirtShared::createObject`/`createFunction` do not use the FIFO command allocator. Next to find.
+
+### Twelfth and thirteenth runs (2026-11-04): where a compute function reaches the host
+
+**Measured**, card, Sequoia 24H232, `rdna4-pvgpu=1`, `rdna4-mtlcompute` (`b[i] = i * 3 + 1` over 1024 threads):
+
+- **Objects live in the resource heap.** `AppleParavirtShared::createObjectLocked` calls `AppleParavirtResourceHeap::addObject(7, index, size,
+  bytes)`, which copies the bytes into the heap's descriptor area and writes entry `index` as `{u32 kind | size << 8, u64 descriptor GPU address}`;
+  the handle the guest gets back (`AppleParavirtResourceHeapNamespace::addHandle`) is kernel-only. Kinds seen: 1 buffer, 2 (116 bytes; a texture
+  [INFER]), 6 function, 7 object (`createObject`; its first dword is the object type).
+- **A function (kind 6)** has the descriptor `{u64 code GPU address, u32 length, u32 0xf, u32 0x14, u32 index?, ...}`; the code is a **metallib**
+  (`MTLB`, one AIR 2.2 module, Metal language 2.2: the device's MaxMetalShaderVersion default). The test kernel's is 3309 bytes and
+  `tools/metal/air` compiles it to gfx1201 unchanged (`air2amdgcn` takes a buffer's address space from its pointer type in AIR 2.2).
+- **`CreateComputePipeline` (0x3b)** is `{u32 task, u32 heap index of the pipeline object, u32 args+0x18, u32 args+0x10, u64 address}`
+  (`AppleParavirtShared::createComputePipeline`). The pipeline object (kind 7, 24 bytes) is `{u32 0xb, u32 0x18, u32 own index, u32 7,
+  u8 function heap index, u8 4, u8 0, u8 1, u32 0}`. The address is in the function's code memory right behind the metallib (`0x101cf0` for
+  3309 bytes at `0x101000`), zeroed: the reflection the host is to write there (the client reads `threadExecutionWidth` 0 without it).
+- **A compute segment** (type 1) of the test: `0xd0 {u32 pipeline index}`, `0xcb {u32 buffer index, ...}` (set buffer), `0xca {u32 grid w, h, d,
+  u32 threadgroup w, h, d}` (dispatchThreads 1024x1x1 in groups of 64).
+
+### Fourteenth run (2026-11-04): the first Metal compute kernel runs on the card
+
+**Measured**, card, Sequoia 24H232, trial `rdna4-pvgpu=1 rdna4-compute=7`, `rdna4-pvexec -v` running as root, `rdna4-mtlcompute`:
+`pipeline made, thread execution width 32` and `status 4; b[0] = 1, b[5] = 16, b[1023] = 3070` (the expected values): the guest's own AIR,
+compiled for gfx1201 on the Mac (`air2amdgcn` and LLVM 23.1.4 in `~/opt/llvm`), dispatched through the compute runtime in 16 us.
+
+- **The reply to `CreateComputePipeline`** is up to six pairs `{u32 key, u32 value}` that the bundle's `_parseComputeInfo` reads: 1
+  maxTotalThreadsPerThreadgroup, 2 (a field no accessor reads), 3 threadExecutionWidth, 4 staticThreadgroupMemoryLength; key 0 is skipped.
+- **The path of a dispatch:** the host decodes the compute segment (`0xd0` pipeline, `0xcb` buffers by slot, `0xcf` offsets, `0xca`/`0xc8`
+  dispatch), resolves the pipeline to its metallib through the heap and posts a job (`include/rdna4pvjob.h`); `rdna4-pvexec` takes it through
+  `RDNA4ComputeClient` (PvNext, PvAccess, PvDone), compiles and caches the function per threadgroup size (`tools/metal/air/compile-metallib.sh`,
+  `/var/tmp/rdna4-pvexec`), copies the bound buffers into VRAM, dispatches, copies them back into the client's memory and ends the job; the host
+  then completes the command buffer. Without the service a dispatch is skipped at once, as before.
+- A system process's compute segment uses `0xce` (setTextures): not run yet.
+
+### Fifteenth to eighteenth runs (2026-11-04): render passes, textures and drawables
+
+**Measured**, card, Sequoia 24H232, trial `rdna4-pvgpu=1 rdna4-compute=7`; `rdna4-mtlclear` (a 64x64 BGRA8 private texture cleared to
+(1, 0.5, 0.25, 1) and copied into a buffer) reads back `0xffff8040` in every pixel, the colour asked for; `rdna4-mtlwindow` (a CAMetalLayer
+cleared every frame) runs its passes without failures.
+
+- **A texture (kind 2, 116 bytes)** is laid out by the guest, linearly in its own memory: `{u64 bytes, u32 GPU page, ..., u64 bytes per row
+  at 0x34, u32 width, height, depth at 0x3c, u16 MTLPixelFormat at 0x56}` (0x50 = BGRA8Unorm).
+- **A drawable (kind 5, 56 bytes)** has no memory of its own: `{u64 IOSurface ID, ..., u16 MTLPixelFormat at 0x16, u32 width, height at 0x18}`.
+  The host writes the surface through its memory descriptor (`src/pvsurface.cpp`): `IOSurfaceRoot::lookupSurface` only finds surfaces of the
+  asking task, so the host reads the root's table of surfaces by ID itself (`+0xd0` table, `+0xd8` count, `+0x138` lock, IOSurface ID at
+  `+0x10`; Sequoia only, each entry checked).
+- **A render pass** is one command `0x1a` (584 bytes) in a render segment: colour attachments of 0x3c bytes from 0x4c, `{u32 texture ref,
+  u32 resolve ref, u16 level, slice, depth plane, resolve level, slice, depth plane, u16 load action, u16 store action, u32 options, double
+  clear colour[4]}`; before them the depth and stencil attachments.
+- **`0x12e` copyFromTexture:...toBuffer:** is `{u32 texture, u32 buffer, u64 origin[3], u64 size[3], u64 destination offset, bytes per
+  row, bytes per image, u64 options}` (88 bytes).
+- **Windows stay invisible in a paravirtual boot.** The paravirtual device is the system's default Metal device, so Core Animation in each
+  app renders the window's contents with it; those are draws (textured quads) the host does not run yet, and the window server shows
+  transparent windows: a desktop with wallpaper and menu bar and no Dock or windows, the window of `rdna4-mtlwindow` listed on screen and
+  not visible. Visible results need draws with vertex and fragment functions and texture sampling.
+
+### Nineteenth to twenty-first runs (2026-11-04): the first draw
+
+**Measured**, card, Sequoia 24H232, trial `rdna4-pvgpu=1 rdna4-compute=7`: `rdna4-mtldraw` (a triangle with a colour per vertex into a 64x64
+BGRA8 texture, read back) shows the triangle with its three colours interpolated, drawn on the card in 15 us.
+
+- **A render pipeline has no FIFO command**: it is a heap object (kind 7) of type `0xe`, `{u32 0xe, u32 size, u32 own ref, u32 length, the
+  serialized descriptor}`; the descriptor starts with a count of entries `{u8 key, u8 size, value}`, key 1 the vertex function's ref and key 2
+  the fragment function's (both kind 6, metallibs), followed by the colour attachments (pixel format `0x50` in the triangle's).
+- **The draw's commands** in a render segment, after the pass `0x1a`: `0x74 {u32 pipeline}`, `0x7d` vertex buffers and `0x6e` fragment buffers
+  (as `0xcb`: `{u32 first, u32 count, {u32 ref, u64 offset}...}`), `0x001 {u32 MTLPrimitiveType, u16 start, u16 count}` (and the long and
+  instanced forms `0x000`, `0x002`, `0x003`).
+- **How it runs**: the host posts a draw job (`include/rdna4pvjob.h`) with both functions, the buffers of both stages, the vertices and colour
+  attachment 0 (a texture in the client's memory or an IOSurface the service reaches through `PvAccess`). `rdna4-pvexec` compiles the pair
+  (`tools/metal/air/compile-pipeline.sh`: the vertex function as a kernel that writes a record per vertex, the fragment function inside a
+  kernel of one thread per pixel that rasterizes the triangles with `rdna4raster.c`), copies buffers and target into VRAM by the copy engine,
+  runs both kernels and copies the target back. No hardware graphics pipeline is involved.
+- Not yet: textures and samplers in the shaders, blending from the pipeline's descriptor, viewports and scissors, depth, indexed draws.
+
+### Twenty-second run (2026-11-04): textures, and why windows stay invisible
+
+**Measured**, card, trial `rdna4-pvgpu=1 rdna4-compute=7`: `rdna4-mtltex` (a 4x4 checkerboard sampled with a nearest sampler over a quad)
+comes out as 16x16-pixel blocks in the right order, 29 us. Fragment textures are `0x72 {u32 first, u32 count, u32 ref...}`, samplers `0x70`
+the same; a sampler is an object of type 3 whose word at 0xc packs MTLSamplerDescriptor (min filter bits 0-1, mag 2-3, s/t address
+5-7/8-10, max anisotropy from bit 26, normalised coordinates bit 31: `0x84000000` for nearest/clamp).
+
+**Screenshots do not show windows.** `screencapture` run over ssh (root, without the Screen Recording permission) leaves out every
+window whose sharing state is none, which is every application window: a normal boot's capture also shows only wallpaper and menu bar, with
+TextEdit's window listed on screen. Judging the paravirtual boots by such captures was wrong; their windows have to be looked at on the
+display. Measured meanwhile: WindowServer composites in software in a paravirtual boot (`CA::OGL::SW`), holding a Metal device, an
+`AppleParavirt2DContext` and a display pipe client of the paravirtual accelerator.
+
+### Twenty-third to twenty-fifth runs (2026-11-04): WindowServer's shaders, and why it composites in software
+
+**Measured**, card, trial `rdna4-pvgpu=1 rdna4-compute=7 rdna4-pvgpu-disp=3`: with vertex descriptors, indexed draws, buffer offsets,
+the state commands 0x6b/0x73/0x7c/0x17 and derivatives, every pipeline WindowServer's compositor creates compiles and its draws run (about
+700 into window surfaces after a restart, none failing). The paravirtual display (0x01800009) is accelerated in CoreDisplay's dump
+(`isAcc=YES`, an accelerator port); the Dells on the real framebuffer are not. Still, with a window animating on the unmirrored paravirtual
+display, WindowServer composites with `CompositorSW` and no `DisplaySubmitTransaction` (0x06) ever comes.
+
+**Why (read in SkyLight and CoreDisplay, `dyld_info -disassemble` of the shared cache).** SkyLight picks a compositor per accelerator
+(`WSGetCompositorForAccelerator`): Metal when a Metal device is not headless and one device's `acceleratorPort` equals the display's
+accelerator (the paravirtual device's does: `AppleParavirtAccelerator`, checked from a client). The frame reaches the paravirtual display
+only through its display pipe (`AppleParavirtDisplayPipe::submitTransaction`, an IOAccelDisplayPipe transaction), and CoreDisplay drives
+display pipes only through IOPresentment: `CoreDisplay::UseIOPresentment()` needs the preference `useIOP` (domain `com.apple.CoreDisplay`,
+any user, current host; its default is a hardware flag, off on this Mac) and every GPU vendor of the system enabled for it (APV is).
+Without it the paravirtual display gets the legacy framebuffer flush, which the paravirtual framebuffer has no memory for.
+
+**`useIOP` on** (set as root through CFPreferences, WindowServer restarted): CoreDisplay looks for a display pipe for every framebuffer,
+finds none for the Dells' (`Unable to find display pipe for IOFB service`, thousands a minute), logs `Attempting to get capabilities from
+plane with no gamma` for the paravirtual one, and ends with no display online at all. Removing the preference needed a reboot. So
+IOPresentment takes a system whose displays all have display pipes: the Dells would have to be displays of the paravirtual GPU (its display
+pipes, their transactions scanned out by the real display engine) with the real framebuffers hidden from WindowServer, and the pipe needs a
+gamma-capable plane (`txnProtocol` 0x07 may be what announces one).
+
+### Runs of 2026-11-04/05: the desktop composited on the card
+
+**Measured**, card, Sequoia 24H232, trial `rdna4-pvgpu=1 rdna4-compute=7 rdna4-gfx=2 rdna4-vm=1 rdna4-pvgpu-disp=7`, `useIOP` on (rdna4-iop):
+
+- **WindowServer must not open our framebuffers' offline mode:** it copied its 4K boot screen into their 1x1 mapping (SIGBUS in
+  `CGXReleaseDisplayDeviceSurface`). The extra heads' framebuffers refuse user clients (`src/pvhooks.cpp`); the boot framebuffer is opened
+  before the plugin decides and must stay openable: CoreDisplay asserts in `CGXMappedDisplayStart` when none of a GPU's framebuffers opens.
+- **`CreateComputePipeline` (0x3b) wants an answer:** without the reflection pairs `threadExecutionWidth` is 0, and MetalPerformanceShaders
+  divides by it (SIGFPE in MPSImage at the first desktop blur after login; loginwindow then logged out again and again).
+- **Guest page-table leaf entries:** bit 31 is "the GPU may write", not "mapped": WindowServer's read-only textures (resource type 3:
+  wallpaper, icons, menu-bar text) have entries without it. Resource type 8 is a texture over another resource (a buffer, `{9, size, id,
+  buffer, u64 offset, u64 bytes per row, format << 16 | usage, w, h, ...}`, or a view, `{8, size, id, parent, format, ...}`); not run yet.
+- **Draw commands:** `drawIndexedPrimitives` is `{u16 type, u16 index type (1: 32-bit), u32 index buffer, ...}`: 0x007 `{u16 count, u16
+  offset}`, 0x009 `{u16 count, u16 offset, u32 instances}`, 0x006 `{u64 count, u64 offset}` (apps draw their windows with 0x006). Scissor
+  0x075 `{u64 x, y, w, h}`. `Blit.copyFromBuffer` into a texture (0x12c) mirrors 0x12e's layout.
+- **A linear 3D image** reads rows of the row's bytes aligned to 128, slices of `height` rows of the row's bytes aligned to 256
+  (`rdna4-mtltex3d`).
+- **Speed:** copying every draw's target, textures and buffers through the CPU took nearly all of WindowServer's frame time, and it never
+  finished a frame. They are now mapped in place (`rtMapPages`; no IOMMU on the rig), the mappings kept by page list; the card's own share is
+  about 1 ms in 5 s. Each page-table sync is an SDMA job of about a millisecond, which is what a mapping costs.
+- **With both Dells on** (two display pipes) WindowServer composites with Metal and presents on both pipes, the login window included.
+  **With one display it composites in software** (`Unsupported sw composite destination`, thousands a minute) and never presents; a second
+  pipe without a head is enough to make it present. Not understood yet.
+- **Open:** occasional hangs of draws whose fragment shader reads a texture at the pixel (`TcimBltnXc_Icir`, `Tc3sXc_Idst`; the ring
+  recovers); the menu bar's titles are cut where the first layout's were; draws whose target is not 128-byte aligned are still staged.
+
+### 2026-11-07: Vision has no heap, and mediaanalysisd runs out of command queues
+
+**Measured**, card, Sequoia 24H232, the options above as boot-args:
+
+- **Apps took 15-20 s to start, then got no device:** `MTLCreateSystemDefaultDevice` waited in the kernel in `IOServiceOpen` of the
+  accelerator (IOAcceleratorFamily2). The accelerator held 988 `AppleParavirtCommandQueue`s, 987 of them mediaanalysisd's, after 5 h of
+  uptime; mediaanalysisd itself waited uninterruptibly (`U`) creating the next one, in `Espresso::context_metal::setup`.
+- **Why:** `-[AppleParavirtDevice newHeapWithDescriptor:]` is `xor eax, eax; ret` in Apple's AppleParavirtGPUMetal, and
+  `heapBufferSizeAndAlignWithLength:options:` returns {0, 0}: the paravirtual device makes no MTLHeap of any size or storage mode
+  (`makeHeap` of 64 KiB to 256 MiB, private, shared and managed, automatic and placement: all nil). Espresso's MPS engine needs one (`Cannot
+  create %zu-byte metal heap.`, `Espresso::context_exceeded` from `MPSEngine::blob_container::resize`), so every Vision network fails to
+  load (`espresso error: -13`), and each failure leaves the context's command queue behind: a `VNClassifyImageRequest` per run left 2 more
+  user clients each time. Queues an app releases itself are freed (200 made and released left none, with or without a command buffer on
+  each).
+- **On the rig** mediaanalysisd, which retries for every file, is disabled (`launchctl disable gui/501/com.apple.mediaanalysisd`; `enable`
+  undoes it). Other Vision users (Live Text in Preview, Photos) leak the same way until they quit.
+
 ## The GetDeviceInfo reply (hub-task-446) [measured in the kext and the bundle unless marked]
 
 **The wait.** `AppleParavirtAccelerator::setupDeviceInfo` (the last step of `Accelerator::start`) wires a 4 KiB `IOBufferMemoryDescriptor`, builds FIFO command `0x3a` with one record `{u32 0x2d, u32 bytes/8 (0x200), u32 physical page}`, submits it on the root channel through the generic `IOAccelChannel2` path, and then **`IOAccelEventMachineFast2::finishEvent`** waits for the event of that submission. After the wait it calls `parseDeviceInfo(buffer, 0x200, &accelerator->deviceInfo)` and returns true whatever the content (no validation: even an all-zero buffer passes). Then `Accelerator::start` releases its lock and `registerService()`.

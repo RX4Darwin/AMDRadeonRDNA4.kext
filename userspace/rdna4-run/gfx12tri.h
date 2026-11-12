@@ -30,8 +30,8 @@
 #define RDNA4_TRI(x) x
 #endif
 
-#define RDNA4_TRI_CODE_BYTES   0x2000u
-#define RDNA4_TRI_PS_OFFSET    0x1000u
+#define RDNA4_TRI_CODE_BYTES   0xa0000u   /* 128 KiB VS, 512 KiB PS: the pvgpu host runs translated Metal shaders in them */
+#define RDNA4_TRI_PS_OFFSET    0x20000u
 #define RDNA4_TRI_SHADER_PAD   0x100u     /* dwords per shader slot, s_code_end after the code */
 #define RDNA4_TRI_TARGET_BYTES (256u * 256u * 4u)
 #define RDNA4_TRI_RING_ALIGN   0x200000u

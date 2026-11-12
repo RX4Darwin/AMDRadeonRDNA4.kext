@@ -65,12 +65,15 @@ public:
 	static void setLateParent(IOService *gpu);
 	// The card's runtime, for running the guest's blits on it (M2; plugin.cpp sets it where the GPU attaches).
 	static void setCompute(RDNA4Compute *compute);
-	static void setSurfaceFunctions(const mach_vm_address_t fn[8]);   // IOSurface kext functions for type-5 render targets (pvgpu.cpp)
+	static constexpr unsigned kSurfaceFunctions = 15;
+	static void setSurfaceFunctions(const mach_vm_address_t fn[kSurfaceFunctions]);   // IOSurface kext functions for type-5 textures (pvgpu.cpp)
+	static void setPhysmap(uint8_t *base, uint8_t *max);               // the kernel's map of all physical memory, for the guest's pages
 
 	// Host side: the control block of BAR0 as dwords, valid while the nub lives (the nub is never released once published).
 	volatile uint32_t *ctrl() const { return mBar0 ? reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(mBar0) + pvgpu::kCtrl) : nullptr; }
 	// Run the registered handler of interrupt `source`, as the interrupt controller would. false when none is registered and enabled.
-	bool raiseInterrupt(int source);
+	bool raiseInterrupt(int source, bool offToo = false);   // offToo: delivered while the driver has the line off as well
+	bool interruptBusy(int source);   // the driver has the line disabled (handling it), or a raise waits for it
 	bool configTest();      // used by the self-test: config space, capabilities, matching
 
 	bool init(OSDictionary *propTable) APPLE_KEXT_OVERRIDE;
@@ -183,6 +186,7 @@ private:
 		void *refCon { nullptr };
 		bool registered { false };
 		bool enabled { false };
+		bool pending { false };   // raised while disabled: delivered when enabled again
 	};
 	IOBufferMemoryDescriptor *mBar0Desc { nullptr };
 	void *mBar0 { nullptr };                         // kernel VA of the BAR0 RAM (the buffer's own mapping; Apple's driver gets an alias)

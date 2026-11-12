@@ -32,6 +32,7 @@
 //    T7  negative control: the IB packet names a VMID whose context is off: must fault with that VMID
 //
 #include "compute.hpp"
+#include "klog.hpp"
 #include "codeobj.hpp"
 #include "isa.hpp"
 #include "vadd_codeobj.h"
@@ -40,7 +41,7 @@
 #include <IOKit/IOLib.h>
 
 static const char *gVtPhase = "";     // "" for the early probes, " late" for the ones repeated after clock gating
-#define VLOG(fmt, ...) IOLog("AMDRadeonRDNA4: vmidtest%s: " fmt "\n", gVtPhase, ## __VA_ARGS__)
+#define VLOG(fmt, ...) rdna4Log("AMDRadeonRDNA4: vmidtest%s: " fmt "\n", gVtPhase, ## __VA_ARGS__)
 
 using namespace GfxReg;
 
@@ -341,9 +342,7 @@ void RDNA4Compute::vmIdTest(bool late) {
 		return;
 	}
 	bzero(c.tableShadow, kVmTableBytes);
-	c.tableShadow[0] = GpuVm::encodePde(c.rootPhys + 0x1000, GpuVm::kValid, 2);
-	c.tableShadow[0x1000 / sizeof(uint64_t) + GpuVm::index(GpuVm::kVaStart, 1)] =
-		GpuVm::encodePde(c.rootPhys + 0x2000, GpuVm::kValid, 1);
+	GpuVmTable::denseRoot(c.tableShadow, c.rootPhys);
 
 	/* Data the probes use (CPU writes through the BAR, HDP flushed). */
 	for (uint32_t off = 0; off < 0xa000; off += 4)

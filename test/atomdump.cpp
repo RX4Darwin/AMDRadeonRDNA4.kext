@@ -29,6 +29,7 @@
 #include "../src/pipe2.hpp"
 #include "../src/dptrain.hpp"
 #include "../src/dpphy.hpp"
+#include "../src/dpdual.hpp"
 #include "../src/amdfw.hpp"
 #include "../src/psp.hpp"
 #include "../src/sdma.hpp"
@@ -49,6 +50,7 @@
 #include "../src/bench_codeobj.h"
 #include "../src/gfxregs.hpp"
 #include "../src/linuxref.hpp"
+#include "../src/trial.hpp"
 #include "rdna4compute.h"
 
 #include <cstdarg>
@@ -82,6 +84,19 @@ static const char kLenovoEdidHex[] =
 	"135054a10800d1c0b30081c081809500a9c001010101023a801871382d40582c"
 	"4500202f2100001e000000fd0030901eaa22000a202020202020000000fc004c"
 	"454e204732352d31300a2020000000ff005534423433304e390a202020200171";
+
+// The test rig's Dell P2723QE on HDMI, behind a DP++ adapter (2026-11-04): a
+// Y420 Capability Map that takes VIC 97 and 96 (its first two SVDs) in
+// YCbCr 4:2:0.
+static const char kDellHdmiEdidHex[] =
+	"00ffffffffffff0010ac3df14c4a4c4118200103803c2278ea5095a8544ea526"
+	"0f5054a54b00714f8180a9c0d1c001010101010101014dd000a0f0703e803020"
+	"350055502100001a000000ff00424437375a50330a2020202020000000fc0044"
+	"454c4c20503237323351450a000000fd0018560f873c000a2020202020200160"
+	"020331b15161605f5e5d101f222120041312110302016d030c001000383c2000"
+	"6001020367d85dc401788003e40f03000008e80030f2705a80b0588a00555021"
+	"00001c565e00a0a0a029503020350055502100001c114400a080002550302036"
+	"0055502100001c000000000000000000000000000000000000000000000000ad";
 
 // Synthetic 1080p 60/75 Hz HDMI monitor — the target user's class of sink.
 // Hand-assembled so every field the mode table depends on is known; the
@@ -586,6 +601,20 @@ static int testModes() {
 	for (size_t i = 0; i < hn; i++)
 		has594 = has594 || hfModes[i].t.pixelClockKHz == 594000;
 	failures += check(has594, "HDMI Forum block: the 594 MHz mode is not offered (%zu modes)", hn);
+	// The EDID's own list of formats, whatever the mode table kept of it.
+	failures += check(Edid::hasVic(hf, sizeof(hf), 97) && !Edid::hasVic(hf, sizeof(hf), 16) &&
+	                  Edid::hasVic(syn, sizeof(syn), 16) && !Edid::hasVic(syn, sizeof(syn), 97) &&
+	                  !Edid::hasVic(hf, 128, 97) && !Edid::hasVic(hf, sizeof(hf), 0),
+	                  "Edid::hasVic");
+
+	// YCbCr 4:2:0: the Dell's map names its first two SVDs (VIC 97, 96); the
+	// synthetic monitors have none.
+	uint8_t dell[256];
+	failures += check(hexToBytes(kDellHdmiEdidHex, dell, sizeof(dell)) && Edid::takesY420(dell, sizeof(dell), 97) &&
+	                  Edid::takesY420(dell, sizeof(dell), 96) && !Edid::takesY420(dell, sizeof(dell), 95) &&
+	                  !Edid::takesY420(dell, sizeof(dell), 16) && !Edid::takesY420(hf, sizeof(hf), 97) &&
+	                  !Edid::takesY420(dell, 128, 97),
+	                  "Edid::takesY420");
 
 	// The 75 Hz DTD is `cvt -r 1920 1080 75`: 1080/3/5/31, i.e. 74.97 Hz.
 	const Edid::DetailedTiming &t75 = yb.dtds[1];
@@ -1562,6 +1591,10 @@ static int testPipe2Table() {
 	const uint32_t kBeFromFe = 1u << (8 + c.dig), kMapper = 0x1f0du + c.dig;
 	const uint8_t  kDdcLine = static_cast<uint8_t>(c.hpd - 1);
 	const uint16_t kEncoderObj = encoderObjOf(c);
+	// The plan's pipe's own registers, from pipe 1's by the blocks' strides
+	// (the families below): OTG, HUBP, DSCL, DPG, ODM, MPCC, MPC out mux, DET.
+	const uint32_t dp1 = c.pipe - 1u;
+	const uint32_t kOtgCtl = 0x1bc3 + dp1 * 0x80, kSurfLo = 0x06e6 + dp1 * 0xdc, kPitch = 0x06e3 + dp1 * 0xdc;
 	failures += check(Pipe2::linkOfEncoder(kEncoderObj) == c.link, "pipe2: encoder object 0x%04x is not link %u",
 	                  kEncoderObj, c.link);
 	enum Who { ThePipe, TheDig, TheLink };
@@ -1670,62 +1703,78 @@ static int testPipe2Table() {
 	failures += check(requires == 5, "pipe2: %zu requirements, expected 5", requires);
 
 	if (!c.dp) {
-	// A sink with SCDC is told the link is not scrambled (148.5 MHz), before
-	// the transmitter is enabled; one without is left alone (above).
+	// A sink with SCDC is told whether the link is scrambled (above 340 MHz:
+	// scrambling and the 1/40 clock ratio, 3), last before the transmitter is
+	// enabled; one without is left alone (above).
+	const uint32_t scrambled = ModeSet::tmdsKHz(c.timing.pixelClockKHz, c.y420) > ModeSet::kScrambleFromKHz ? 3 : 0;
 	Pipe2::Target scdc = t;
 	scdc.sinkScdc = true;
 	scdc.ddcLine = kDdcLine;
 	bool told = false, before = false;
+	size_t scdcSteps = 0;
 	if (Pipe2::build(scdc, stream, &why))
 		for (size_t i = 0; i < stream.count; i++) {
 			const ModeSet::Step &s = stream.steps[i];
-			if (s.op == ModeSet::Op::Scdc)
-				told = s.value == 0 && s.arg == kDdcLine && !before;
+			if (s.op == ModeSet::Op::Scdc) {
+				scdcSteps++;
+				told = s.value == scrambled && s.arg == kDdcLine && !before;
+			}
 			before = before || (s.op == ModeSet::Op::Dmub && s.arg == 2);
 		}
-	failures += check(told && stream.count == plan.count + 1, "pipe2: SCDC step for a sink with SCDC: %d, %zu steps",
-	                  told, stream.count);
+	failures += check(told && scdcSteps >= 1 && stream.count == plan.count + scdcSteps,
+	                  "pipe2: SCDC step for a sink with SCDC: %d, %zu steps", told, stream.count);
 
-	// The three kinds of DMUB command, as amdgpu sends them for OTG1 on PLL 2.
+	// The three kinds of DMUB command, as amdgpu sends them for OTG1 on the link's PLL, with its UNIPHY encoder object.
 	failures += check(plan.ncmds == 4, "pipe2: %zu DMUB commands, expected 4", plan.ncmds);
 	if (plan.ncmds == 4) {
 		const Dmub::Cmd &pll = plan.cmds[0], &enc = plan.cmds[1], &on = plan.cmds[2], &enc2 = plan.cmds[3];
-		failures += check(pll[0] == 0x10000280 && pll[1] == 1485000 && pll[2] == (0x00032014u + c.link) &&
+		// In YCbCr 4:2:0 the link runs at half the pixel clock, the PLL told so (YUV420 in miscinfo).
+		const uint32_t khz = ModeSet::tmdsKHz(c.timing.pixelClockKHz, c.y420);
+		const uint32_t misc = c.y420 ? uint32_t(Dmub::kPixelClockMiscYuv420) << 24 : 0;
+		failures += check(pll[0] == 0x10000280 && pll[1] == khz * 10 &&
+		                  pll[2] == (0x00030014u + c.link + ((kEncoderObj & 0xffu) << 8) + misc) &&
 		                  (pll[3] & 0xffff) == c.pipe,
 		                  "pipe2: set pixel clock %08x %08x %08x %08x", pll[0], pll[1], pll[2], pll[3]);
-		failures += check(enc[0] == 0x0c000080 && enc[1] == (0x04030f00u | c.dig) && enc[2] == 14850 &&
+		failures += check(enc[0] == 0x0c000080 && enc[1] == (0x04030f00u | c.dig) && enc[2] == khz / 10 &&
 		                  memcmp(enc, enc2, sizeof(Dmub::Cmd)) == 0,
 		                  "pipe2: stream setup %08x %08x %08x", enc[0], enc[1], enc[2]);
-		failures += check(on[0] == 0x3c000180 && on[1] == (0x04030100u | c.link) && on[2] == 14850 && (on[3] & 0xff) == c.hpd,
+		failures += check(on[0] == 0x3c000180 && on[1] == (0x04030100u | c.link) && on[2] == khz / 10 && (on[3] & 0xff) == c.hpd,
 		                  "pipe2: transmitter enable %08x %08x %08x %08x", on[0], on[1], on[2], on[3]);
 	}
 	}
 
-	// What the registers hold afterwards: timing of VIC 16, the surface, the
-	// blender feeding OPP1 from DPP1, the OTG enabled and the lock released.
+	// What the registers hold afterwards: the plan's timing (VIC 16 or 97), the
+	// surface, the blender feeding the pipe's OPP from its DPP, the OTG enabled
+	// and the lock released (names are pipe 1's, addresses the plan's pipe's).
+	// Blank is end << 16 | start: sync and back porch, total less front porch.
 	PlanRegs regs;
 	regs.run(plan);
+	const Edid::DetailedTiming &pt = c.timing;
+	const uint32_t hBlank = uint32_t(pt.hBlank - pt.hSyncOffset) << 16 | (pt.hTotal() - pt.hSyncOffset);
+	const uint32_t vBlank = uint32_t(pt.vBlank - pt.vSyncOffset) << 16 | (pt.vTotal() - pt.vSyncOffset);
+	const uint32_t size = uint32_t(pt.vActive) << 16 | pt.hActive;
 	struct { uint8_t seg; uint32_t dw, mask, want; const char *name; } after[] = {
-		{ 2, 0x1baa, 0xffffffff, 2199, "OTG1 h total" },         { 2, 0x1baf, 0xffffffff, 1124, "OTG1 v total" },
-		{ 2, 0x1bab, 0x7fff7fff, 0x00c00840, "OTG1 h blank" },   { 2, 0x1bb8, 0x7fff7fff, 0x00290461, "OTG1 v blank" },
-		{ 2, 0x1c05, 0x3ff, c.vstartup, "OTG1 vstartup" },       { 2, 0x1bc3, 0x1, 0x1, "OTG1 master enable" },
-		{ 2, 0x1c09, 0x1, 0x0, "OTG1 update lock released" },    { 2, 0x1adb, 0xf0000, 0x10000, "ODM1 source OPP1" },
-		{ 2, 0x06e6, 0xffffffff, 0x02100000, "surface low" },    { 2, 0x06e7, 0xffffffff, 0x80, "surface high" },
-		{ 2, 0x06e3, 0xffff, 1919, "pitch" },                    { 2, 0x06c7, 0xffffffff, 0x04380780, "viewport" },
+		{ 2, 0x1baa + dp1 * 0x80, 0xffffffff, pt.hTotal() - 1, "OTG1 h total" }, { 2, 0x1baf + dp1 * 0x80, 0xffffffff, pt.vTotal() - 1, "OTG1 v total" },
+		{ 2, 0x1bab + dp1 * 0x80, 0x7fff7fff, hBlank, "OTG1 h blank" },         { 2, 0x1bb8 + dp1 * 0x80, 0x7fff7fff, vBlank, "OTG1 v blank" },
+		{ 2, 0x1c05 + dp1 * 0x80, 0x3ff, c.vstartup, "OTG1 vstartup" },       { 2, kOtgCtl, 0x1, 0x1, "OTG1 master enable" },
+		{ 2, 0x1c09 + dp1 * 0x80, 0x1, 0x0, "OTG1 update lock released" },    { 2, 0x1adb + dp1 * 0x10, 0xf0000, uint32_t(c.pipe) << 16, "ODM1 source OPP1" },
+		{ 2, kSurfLo, 0xffffffff, 0x02100000, "surface low" },    { 2, 0x06e7 + dp1 * 0xdc, 0xffffffff, 0x80, "surface high" },
+		{ 2, kPitch, 0xffff, pt.hActive - 1u, "pitch" },         { 2, 0x06c7 + dp1 * 0xdc, 0xffffffff, size, "viewport" },
 		// The scaler's output rectangle and the blender's size: 0x0 (a table generated
 		// without Linux's scaler library) lights the plane and shows black, as on the
 		// card on 2026-10-04.
-		{ 2, 0x0e8a, 0xffffffff, 0x04380780, "DSCL1 recout size" }, { 2, 0x0e8b, 0xffffffff, 0x04380780, "DSCL1 MPC size" },
-		{ 3, 0x0015, 0xf, 1, "MPCC1 top = DPP1" },               { 3, 0x0017, 0xf, 1, "MPCC1 OPP id" },
-		{ 3, 0x02f6, 0xf, 1, "OPP1 out mux = MPCC1" },           { 2, 0x18ae, 0x1, 0, "DPG1 off (video)" },
+		{ 2, 0x0e8a + dp1 * 0x16b, 0xffffffff, size, "DSCL1 recout size" }, { 2, 0x0e8b + dp1 * 0x16b, 0xffffffff, size, "DSCL1 MPC size" },
+		{ 3, 0x0015 + dp1 * 0x15, 0xf, uint32_t(c.pipe), "MPCC1 top = DPP1" },               { 3, 0x0017 + dp1 * 0x15, 0xf, uint32_t(c.pipe), "MPCC1 OPP id" },
+		{ 3, 0x02f6 + dp1 * 0x4, 0xf, uint32_t(c.pipe), "OPP1 out mux = MPCC1" },           { 2, 0x18ae + dp1 * 0x5a, 0x1, 0, "DPG1 off (video)" },
 		{ 2, kFeEn, 0x1, 1, "DIG front-end enabled" },           { 2, kBeEn, 0x1, 1, "DIG back-end enabled" },
 		{ 2, kMapper, 0x7, c.link, "DIG mapped to its link" },   { 2, kFeCntl, 0x7, c.pipe, "DIG sourced by the OTG" },
-		{ 2, 0x04bc, 0x1f, c.detSegments, "DET1 segments" },
+		{ 2, 0x04bc + dp1, 0x1f, c.detSegments, "DET1 segments" },
 		// HDMI: the PHY's clock / 4. DisplayPort: the pixel-rate DTO, in Hz against the 720 MHz reference
 		// (how the firmware programs the boot display's), with no integer part.
-		{ 1, 0x006f, c.dp ? 0x3c0u : 0x20u, c.dp ? 0 : 0x20u, "OTG1 pixel rate divider" },
-		{ 1, 0x0085, c.dp ? 0xffffffffu : 0, c.dp ? 148500000u : 0, "DP_DTO1 phase" },
-		{ 1, 0x0086, c.dp ? 0xffffffffu : 0, c.dp ? 720000000u : 0, "DP_DTO1 modulo" },
+		// OTGn_TMDS_PIXEL_RATE_DIV: Linux leaves it alone in 4:2:0
+		{ 1, 0x006f, c.dp ? 0xfu << (1 + 5 * c.pipe) : 1u << (5 * c.pipe), c.dp || c.y420 ? 0 : 1u << (5 * c.pipe), "OTG1 pixel rate divider" },
+		{ 1, 0x0085 + dp1 * 4, c.dp ? 0xffffffffu : 0, c.dp ? pt.pixelClockKHz * 1000 : 0, "DP_DTO1 phase" },
+		{ 1, 0x0086 + dp1 * 4, c.dp ? 0xffffffffu : 0, c.dp ? 720000000u : 0, "DP_DTO1 modulo" },
 	};
 	for (const auto &e : after)
 		failures += check((regs.get(e.seg, e.dw) & e.mask) == e.want, "pipe2: %s: %u:0x%04x = 0x%08x, want 0x%08x "
@@ -1759,6 +1808,10 @@ static int testPipe2Table() {
 	mt.encoderObjId = kEncoderObj;
 	mt.connectorObjId = 0x330c;
 	mt.extra = extra;
+	// A sink a pipe is lit at 3840x2160 for has SCDC.
+	mt.sinkScdc = Pipe2::isUhd(c) && !c.dp;
+	mt.y420 = c.y420;
+	mt.ddcLine = kDdcLine;
 	size_t nmodes = 0;
 	const Edid::DetailedTiming *known = Pipe2::knownModes(nmodes);
 	// From `from` (the registers in `r`) to `to`; the number of registers that do not end as Linux has them.
@@ -1818,15 +1871,21 @@ static int testPipe2Table() {
 		PlanRegs direct = lit;                         // straight from the lit state
 		modeMismatch += switchTo(direct, c.timing, known[i]);
 		modeMismatch += switchTo(chain, i ? known[i - 1] : c.timing, known[i]);
-		failures += check((direct.get(2, kFeEn) & 1) == 1 && (direct.get(2, 0x1bc3) & 1) == 1 &&
-		                  direct.get(2, 0x06e6) == lit.get(2, 0x06e6) && direct.get(2, 0x06e3) == lit.get(2, 0x06e3),
+		failures += check((direct.get(2, kFeEn) & 1) == 1 && (direct.get(2, kOtgCtl) & 1) == 1 &&
+		                  direct.get(2, kSurfLo) == lit.get(2, kSurfLo) && direct.get(2, kPitch) == lit.get(2, kPitch),
 		                  "pipe2: after a switch to mode %zu the stream is off or the surface moved", i);
 	}
 	modeMismatch += switchTo(chain, known[nmodes - 1], c.timing);       // and back to the lit mode
 	// A timing Linux was not asked about keeps the lit mode's request timing
 	// and gets the engine's rule for the rest.
 	Edid::DetailedTiming other = c.timing;
-	other.hSyncOffset += 8;
+	other.hBlank += 8;
+	// One whose syncs alone sit elsewhere is the same mode for the request timing.
+	Edid::DetailedTiming moved = known[1];
+	moved.hSyncOffset += 8;
+	moved.vSyncPositive = !moved.vSyncPositive;
+	failures += check(Pipe2::modeKnown(moved) && Pipe2::modeDetSegments(moved) == Pipe2::modeDetSegments(known[1]),
+	                  "pipe2: a known mode with its syncs elsewhere is not found");
 	const size_t nOther = Pipe2::modeSteps(other, extra, Pipe2::kMaxModeSteps);
 	const size_t nKnown = Pipe2::modeSteps(known[1], want, Pipe2::kMaxModeSteps);
 	bool otherIsLit = !Pipe2::modeKnown(other) && nOther > 0 && nOther < nKnown &&
@@ -1903,7 +1962,7 @@ static int testPipe2Table() {
 		failures += check(slept && dpms.naux == 1 && dpms.aux[0].address == 0x600 && dpms.aux[0].len == 1 &&
 		                  dpms.aux[0].data[0] == 0x02 && dpms.ncmds == 1 && memcmp(dpms.cmds[0], off, sizeof(off)) == 0 &&
 		                  count(dpms, ModeSet::Op::Train) == 0 && (regs.get(2, kFeEn) & 1) == 0 &&
-		                  (regs.get(2, 0x1bc3) & 1) == 1 && regs.get(2, 0x06e6) == lit.get(2, 0x06e6),
+		                  (regs.get(2, kOtgCtl) & 1) == 1 && regs.get(2, kSurfLo) == lit.get(2, kSurfLo),
 		                  "pipe2: DisplayPort sleep: %s, %zu AUX writes, %zu DMUB commands, DIG FE %08x",
 		                  slept ? "built" : why, dpms.naux, dpms.ncmds, regs.get(2, kFeEn));
 		power.part = Pipe2::Part::Wake;
@@ -1955,9 +2014,18 @@ static int testPipe2Table() {
 					v = p.steps[i].value;
 			return v;
 		};
-		static const struct { uint8_t rate; uint32_t m; } mvid[] = {
-			{ DpTrain::kRbr, 0x7555 }, { DpTrain::kHbr, 0x4666 }, { DpTrain::kHbr2, 0x2333 }, { DpTrain::kHbr3, 0x1777 } };
+		// The 1080p tables, and the 3840x2160 ones (533.25 MHz).
+		static const struct { uint32_t khz; uint8_t rate; uint32_t m; } mvid[] = {
+			{ 148500, DpTrain::kRbr, 0x7555 }, { 148500, DpTrain::kHbr, 0x4666 },
+			{ 148500, DpTrain::kHbr2, 0x2333 }, { 148500, DpTrain::kHbr3, 0x1777 },
+			{ 533250, DpTrain::kRbr, 0x1a555 }, { 533250, DpTrain::kHbr, 0xfccc },
+			{ 533250, DpTrain::kHbr2, 0x7e66 }, { 533250, DpTrain::kHbr3, 0x5444 } };
+
 		for (const auto &e : mvid) {
+			if (e.khz != c.timing.pixelClockKHz)
+				continue;
+
+
 			Pipe2::Target at = t;
 			at.linkRate = e.rate;
 			failures += check(Pipe2::build(at, stream, &why) && vidM(stream) == e.m,
@@ -2027,13 +2095,14 @@ static int testPipe2Table() {
 	regs.run(dpms);
 	const size_t sleepSteps = dpms.count;
 	failures += check((regs.get(2, kFeEn) & 1) == 0 && (regs.get(2, kBeCntl) & kBeFromFe) == 0 &&
-	                  (regs.get(2, kHdmiGc) & 1) == 1 && (regs.get(2, 0x1bc3) & 1) == 1 &&
-	                  regs.get(2, 0x06e6) == lit.get(2, 0x06e6),
+	                  (regs.get(2, kHdmiGc) & 1) == 1 && (regs.get(2, kOtgCtl) & 1) == 1 &&
+	                  regs.get(2, kSurfLo) == lit.get(2, kSurfLo),
 	                  "pipe2: asleep: DIG FE %08x, BE %08x, HDMI_GC %08x, OTG1 %08x", regs.get(2, kFeEn),
-	                  regs.get(2, kBeCntl), regs.get(2, kHdmiGc), regs.get(2, 0x1bc3));
+	                  regs.get(2, kBeCntl), regs.get(2, kHdmiGc), regs.get(2, kOtgCtl));
 	power.part = Pipe2::Part::Wake;
 	bool woke = Pipe2::build(power, dpms, &why);
-	failures += check(woke && dpms.ncmds == 3 && memcmp(dpms.cmds, plan.cmds + 1, 3 * sizeof(Dmub::Cmd)) == 0,
+	// HDMI: the PHY PLL first, then lighting's encoder and transmitter commands.
+	failures += check(woke && dpms.ncmds == 4 && memcmp(dpms.cmds, plan.cmds, 4 * sizeof(Dmub::Cmd)) == 0,
 	                  "pipe2: wake plan: %s, %zu DMUB commands", woke ? "built" : why, dpms.ncmds);
 	inBlocks(dpms);
 	regs.run(dpms);
@@ -2053,8 +2122,11 @@ static int testPipe2Table() {
 				w[n++ % 9] = p.steps[i].value;     // the last infoframe of the plan
 		return n;
 	};
+	const bool uhd = Pipe2::isUhd(c);
+	// In YCbCr 4:2:0 Linux sends Y = 3 and BT.709 instead of the RGB range.
+	const uint32_t avi1 = c.y420 ? 0x80a87e53 : uhd ? 0x88281e2b : 0x88281e86;
 	struct { Edid::DetailedTiming t; uint32_t w[4]; } avi[] = {
-		{ c.timing,                                                           { 0x88281e86, 0x10, 0x466, 0x899 } },
+		{ c.timing, { avi1, uhd ? 0x61u : 0x10u, uhd ? 0x8cbu : 0x466u, uhd ? 0x1131u : 0x899u } },
 		{ { 108000, 1600, 200, 24, 80, 900, 100, 1, 3, true, true, false },   { 0x88281ea5, 0x00, 0x3e9, 0x709 } },
 		{ { 74250, 1280, 370, 110, 40, 720, 30, 5, 5, true, true, false },    { 0x88281e33, 0x04, 0x2ef, 0x673 } },
 		{ { 108000, 1280, 408, 48, 112, 1024, 42, 1, 3, true, true, false },  { 0x88081ef3, 0x00, 0x42b, 0x699 } },
@@ -2066,6 +2138,10 @@ static int testPipe2Table() {
 	failures += check(aviWords(plan, w) == 18 && w[0] == 0x000d0282 && memcmp(w + 1, avi[0].w, sizeof(avi[0].w)) == 0,
 	                  "pipe2: the lighting plan's AVI infoframe is %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3], w[4]);
 	for (const auto &a : avi) {
+		// A pipe in 4:2:0 runs only formats the sink takes so: the plan's.
+		if (c.y420 && &a != &avi[0])
+			continue;
+
 		power.part = Pipe2::Part::Avi;
 		power.now = a.t;
 		const bool built = Pipe2::build(power, dpms, &why);
@@ -2076,15 +2152,25 @@ static int testPipe2Table() {
 		                  "pipe2: AVI infoframe for %ux%u at %u kHz: %08x %08x %08x %08x, Linux sends %08x %08x %08x %08x",
 		                  a.t.hActive, a.t.vActive, a.t.pixelClockKHz, w[1], w[2], w[3], w[4], a.w[0], a.w[1], a.w[2], a.w[3]);
 	}
-	// Sleep and wake after a switch carry the running pixel clock, not the plan's.
+	// Sleep and wake after a switch carry the running pixel clock, not the
+	// plan's; on the plan's side of 340 MHz only (the scrambler is the plan's).
 	power.now = avi[1].t;
 	power.part = Pipe2::Part::Sleep;
-	failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 1 && dpms.cmds[0][1] == 1080000,
-	                  "pipe2: sleep at 108 MHz sets the pixel clock to %u x 100 Hz", dpms.cmds[0][1]);
-	power.part = Pipe2::Part::Wake;
-	failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 3 && dpms.cmds[0][2] == 10800 &&
-	                  dpms.cmds[1][2] == 10800, "pipe2: wake at 108 MHz: encoder %u, transmitter %u x 10 kHz",
-	                  dpms.cmds[0][2], dpms.cmds[1][2]);
+	if (uhd && !c.y420) {
+		failures += check(!Pipe2::build(power, dpms, &why),
+		                  "pipe2: a 3840x2160 plan builds sleep for 108 MHz, below the scrambling threshold");
+	} else if (c.y420) {
+		failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 1 && dpms.cmds[0][1] == 540000,
+		                  "pipe2: a 4:2:0 plan sleeps at 108 MHz with the PLL at 54 MHz: %u x 100 Hz", dpms.cmds[0][1]);
+	} else {
+		failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 1 && dpms.cmds[0][1] == 1080000,
+		                  "pipe2: sleep at 108 MHz sets the pixel clock to %u x 100 Hz", dpms.cmds[0][1]);
+		power.part = Pipe2::Part::Wake;
+		failures += check(Pipe2::build(power, dpms, &why) && dpms.ncmds == 4 && dpms.cmds[0][1] == 1080000 &&
+		                  dpms.cmds[1][2] == 10800 && dpms.cmds[2][2] == 10800,
+		                  "pipe2: wake at 108 MHz: pixel clock %u x 100 Hz, encoder %u, transmitter %u x 10 kHz",
+		                  dpms.cmds[0][1], dpms.cmds[1][2], dpms.cmds[2][2]);
+	}
 	const size_t modeMismatch = modeSwitches(lit);
 	failures += static_cast<int>(modeMismatch);
 
@@ -2113,13 +2199,13 @@ static int testPipe2Table() {
 				differ += ours.get(sl.steps[i].seg, sl.steps[i].dword) != theirs.get(sl.steps[i].seg, sl.steps[i].dword);
 		failures += check(ok && sl.ncmds == 1 && linuxSleep.ncmds == 1 &&
 		                  memcmp(sl.cmds[0], linuxSleep.cmds[0], sizeof(Dmub::Cmd)) == 0 && differ == 0 &&
-		                  outside == before && (ours.get(2, kFeEn) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
+		                  outside == before && (ours.get(2, kFeEn) & 1) == 0 && (ours.get(2, kOtgCtl) & 1) == 1,
 		                  "modeset: HDMI sleep: %s, %zu registers not as Linux's sleep leaves them", ok ? "built" : why,
 		                  differ);
 		const bool back = ModeSet::build(st, ms, &why);
 		ours.run(ms);
 		failures += check(back && (ours.get(2, kFeEn) & 1) == 1 && (ours.get(2, kBeCntl) & kBeFromFe) == kBeFromFe &&
-		                  (ours.get(2, kHdmiGc) & 1) == 0 && (ours.get(2, 0x1bc3) & 1) == 1,
+		                  (ours.get(2, kHdmiGc) & 1) == 0 && (ours.get(2, kOtgCtl) & 1) == 1,
 		                  "modeset: HDMI wake by mode set: FE %08x BE %08x GC %08x", ours.get(2, kFeEn),
 		                  ours.get(2, kBeCntl), ours.get(2, kHdmiGc));
 		Edid::DetailedTiming none = c.timing;
@@ -2142,7 +2228,7 @@ static int testPipe2Table() {
 		if (s.op != ModeSet::Op::Dmub && s.op != ModeSet::Op::Delay && instanceOf(s.seg, s.dword, &fam) >= 0 &&
 		    fam == &families[0])
 			hubp = true;
-		if (s.op == ModeSet::Op::Write && s.dword == 0x18b2)      // DPG1_DPG_COLOUR_G_Y
+		if (s.op == ModeSet::Op::Write && s.dword == 0x18b2 + dp1 * 0x5a)   // DPGn_DPG_COLOUR_G_Y
 			colour = s.value == ((static_cast<uint32_t>(Pipe2::kPatternColour[1]) << 16) | Pipe2::kPatternColour[1]);
 	}
 	failures += check(!hubp && colour, "pipe2: stream-only plan: HUBP touched %d, pattern colour %d", hubp, colour);
@@ -2265,8 +2351,11 @@ static int testN48N() {
 	                  info.reserved[2] == N48N_ABI_MINOR, "n48n: QueryInfo");
 	uint32_t regs[4] {};
 	const uint64_t reg[3] = { 0x263e, 1, 0xffffffff }, other[3] = { 0x1000, 1, 0xffffffff };
+	const uint64_t wrap[3] = { ~0ull, 2, 0xffffffff }, past[3] = { 0x2641, 2, 0xffffffff };
 	failures += check(call(N48N_SEL_READREGS, reg, 3, nullptr, 0, 0, regs, 4) == N48N::kSuccess && regs[0] == 0x08200545 &&
-	                  call(N48N_SEL_READREGS, other, 3, nullptr, 0, 0, regs, 4) == N48N::kBadArgument,
+	                  call(N48N_SEL_READREGS, other, 3, nullptr, 0, 0, regs, 4) == N48N::kBadArgument &&
+	                  call(N48N_SEL_READREGS, wrap, 3, nullptr, 0, 0, regs, 8) == N48N::kBadArgument &&
+	                  call(N48N_SEL_READREGS, past, 3, nullptr, 0, 0, regs, 8) == N48N::kBadArgument,
 	                  "n48n: ReadRegs reads GB_ADDR_CONFIG and nothing else");
 
 	// Buffers: VRAM the CPU can reach, then the pool it cannot once that is full, system memory within its caps.
@@ -2556,11 +2645,60 @@ static int testN48N() {
 static int testPipe2() {
 	int failures = 0;
 	const uint8_t first = Pipe2::config().hpd;
-	failures += check(Pipe2::configCount() == 4 && !Pipe2::use(5) && Pipe2::config().hpd == first,
+	failures += check(Pipe2::configCount() == 42 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
+	                  Pipe2::config().hpd == first,
 	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
+	// A DisplayPort connector has its DisplayPort table and an HDMI one (a passive DP++ adapter); an HDMI
+	// connector's only table is taken whatever is asked for.
+	failures += check(Pipe2::use(2) && Pipe2::config().dp &&
+	                  Pipe2::use(2, true) && !Pipe2::config().dp && Pipe2::config().link == 1 &&
+	                  Pipe2::use(3, false) && !Pipe2::config().dp,
+	                  "pipe2: HPD2 has a DisplayPort and an HDMI table, HPD3 its HDMI one");
+	// Each set is for its own pipe, on the connector's own stream encoder and link.
+	failures += check(Pipe2::use(3, false, 2) && Pipe2::config().pipe == 2 && Pipe2::config().dig == 2 &&
+	                  Pipe2::config().link == 2 && Pipe2::use(1, true, 3) && Pipe2::config().pipe == 3 &&
+	                  !Pipe2::config().dp && Pipe2::config().link == 0,
+	                  "pipe2: the tables of pipes 2 and 3");
+	failures += check(Pipe2::hasDpTable(1) && Pipe2::hasDpTable(2) && !Pipe2::hasDpTable(3) &&
+	                  !Pipe2::hasDpTable(4) && !Pipe2::hasDpTable(5),
+	                  "pipe2: DisplayPort connectors on HPD1 and HPD2 only");
+	// Every connector has a table lit at CEA 3840x2160@60 on each pipe (on DisplayPort for an HDMI sink behind
+	// a DP++ adapter), taken only when asked for.
+	// A switch down from 3840x2160 leaves the scrambler to the mode set: a mode
+	// table row of the lit mode must not turn it on again (the TV, 2026-11-03).
+	{
+		static ModeSet::Step steps[Pipe2::kMaxModeSteps];
+		const Edid::DetailedTiming fhd { 148500, 1920, 280, 88, 44, 1080, 45, 4, 5, true, true, false };
+		size_t scramblerWrites = 0;
+		Pipe2::use(3, false, 2, true);
+		const size_t n = Pipe2::modeSteps(fhd, steps, Pipe2::kMaxModeSteps);
+		for (size_t i = 0; i < n; i++)
+			scramblerWrites += steps[i].seg == 2 && steps[i].dword == 0x209e + 2 * 0x124u && (steps[i].mask & 0x6);
+		failures += check(n > 0 && scramblerWrites == 0, "pipe2: a switch from 3840x2160 to 1080p writes the "
+		                  "scrambler bits %zu time(s)", scramblerWrites);
+	}
+	failures += check(Pipe2::hasUhdTable(3) && Pipe2::hasUhdTable(4) && Pipe2::hasUhdTable(1) &&
+	                  Pipe2::hasUhdTable(2) && !Pipe2::hasUhdTable(5) && Pipe2::use(3, false, 2) &&
+	                  !Pipe2::isUhd(Pipe2::config()) &&
+	                  Pipe2::use(3, false, 2, true) && Pipe2::config().pipe == 2 && Pipe2::config().dig == 2 &&
+	                  Pipe2::config().timing.hActive == 3840 && Pipe2::config().timing.vActive == 2160 &&
+	                  Pipe2::config().timing.pixelClockKHz == 594000 && Edid::vicOf(Pipe2::config().timing) == 97 &&
+	                  Pipe2::config().detSegments == 10 && Pipe2::use(4, false, 3, true) &&
+	                  Pipe2::config().link == 3 && Pipe2::use(2, true, 1, true) && !Pipe2::config().dp &&
+	                  Pipe2::config().link == 1 && Pipe2::config().timing.pixelClockKHz == 594000,
+	                  "pipe2: 3840x2160@60 tables for the HDMI connectors and DP++");
+	// The DisplayPort connectors again for a DisplayPort sink, at CVT-RB 3840x2160@60.
+	failures += check(Pipe2::use(2, false, 1, true) && Pipe2::config().dp && Pipe2::config().link == 1 &&
+	                  Pipe2::config().timing.pixelClockKHz == 533250 && Edid::vicOf(Pipe2::config().timing) == 0 &&
+	                  Pipe2::use(1, false, 3, true) && Pipe2::config().dp && Pipe2::config().pipe == 3,
+	                  "pipe2: 3840x2160@60 tables for DisplayPort sinks");
+
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
-		const uint8_t hpd = Pipe2::configAt(i).hpd;
-		failures += check(Pipe2::use(hpd) && Pipe2::config().hpd == hpd, "pipe2: no table for HPD%u", hpd);
+		const Pipe2::Config &c = Pipe2::configAt(i);
+		failures += check(Pipe2::use(c.hpd, !c.dp, c.pipe, Pipe2::isUhd(c), c.y420) && Pipe2::config().hpd == c.hpd &&
+		                  Pipe2::config().dp == c.dp && Pipe2::config().pipe == c.pipe &&
+		                  Pipe2::config().timing.pixelClockKHz == c.timing.pixelClockKHz,
+		                  "pipe2: no %s table for HPD%u on pipe %u", c.dp ? "DisplayPort" : "HDMI", c.hpd, c.pipe);
 		failures += testPipe2Table();
 	}
 	failures += testPipe2Move(3, 4);
@@ -3493,6 +3631,15 @@ static int testGpuHeap() {
 	h.free(d);
 	failures += check(h.freeBytes() == h.size() && h.alloc(64 * G, a) && a == base,
 	                  "heap: everything back in one piece");
+	h.free(a);
+	// take: exactly the range asked for, only when all of it is free.
+	ok = h.take(base + 8 * G, 2 * G + 1) && h.lengthOf(base + 8 * G) == 3 * G && h.freeBytes() == 61 * G &&
+	     !h.take(base + 10 * G, G) && !h.take(base + 7 * G, 2 * G) && !h.take(base + 63 * G, 2 * G) &&
+	     !h.take(base + 100, G) && !h.take(base, 0) && h.alloc(8 * G, b) && b == base && h.alloc(G, c) && c == base + 11 * G;
+	failures += check(ok, "heap: take (b 0x%llx c 0x%llx)", (unsigned long long)b, (unsigned long long)c);
+	h.free(b);
+	h.free(c);
+	failures += check(h.free(base + 8 * G) && h.freeBytes() == h.size(), "heap: a taken range is freed like an allocation");
 
 	// The device heap's shape: gigabytes in 64 KiB granules, the map cut
 	// short by its capacity, and allocations far from the base.
@@ -3521,6 +3668,26 @@ static int testGpuHeap() {
 
 // W43: the `linux diff:` formatter is bounded. Worst-case 'why' strings and every capacity from 1 up must leave the canary bytes
 // after the buffer untouched, keep the string NUL-terminated inside the capacity, and never report a length past it.
+// The options of one test boot (trial.hpp): what arms one and how its words are read.
+static int testTrial() {
+	int failures = 0;
+	uint32_t v = 0;
+	failures += check(Trial::armed("armed rdna4-heads=3") && Trial::armed("  armed") && !Trial::armed("used rdna4-heads=3") &&
+	                  !Trial::armed("armedx") && !Trial::armed("") && !Trial::armed(nullptr),
+	                  "trial: armed only by a first word \"armed\"");
+	failures += check(Trial::find("armed rdna4-heads=3 rdna4-x=0x1F", "rdna4-heads", v) && v == 3 &&
+	                  Trial::find("armed rdna4-heads=3 rdna4-x=0x1F", "rdna4-x", v) && v == 0x1f,
+	                  "trial: decimal and hex values");
+	failures += check(!Trial::find("armed rdna4-heads2=3", "rdna4-heads", v) && !Trial::find("armed rdna4-heads", "rdna4-heads", v) &&
+	                  !Trial::find("armed rdna4-heads=", "rdna4-heads", v) && !Trial::find("armed rdna4-heads=3x", "rdna4-heads", v) &&
+	                  !Trial::find("armed rdna4-heads=99999999999", "rdna4-heads", v) && !Trial::find("armed", "", v),
+	                  "trial: a longer key, no value, junk and overflow are not a value");
+	failures += check(Trial::find("armed a=1 rdna4-heads=4", "rdna4-heads", v) && v == 4 && !Trial::find(nullptr, "a", v),
+	                  "trial: a key after other words");
+	printf("trial: test-boot options %s\n", failures ? "MISMATCH" : "ok");
+	return failures;
+}
+
 static int testLinuxRefFormat() {
 	int failures = 0;
 	static char longWhy[4096];
@@ -4241,18 +4408,31 @@ struct Pair {
 		nw.syncs.clear();
 	}
 
+	// The pre-S8 code mapped up to 2 GiB above kVaStart, the second GiB into PT pages no directory reaches; the new code refuses
+	// anything past the first GiB, and so is expected to.
+	static bool beyondDense(uint64_t va, uint64_t bytes) {
+		const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
+
+		return end >= va && end > GpuVm::kVaStart + (1ull << 30);
+	}
 	void map(uint64_t va, uint64_t mc, uint64_t bytes, bool exec) {
-		const bool a = legacyVmMap(ref, va, mc, bytes, exec), b = newVmMap(nw, va, mc, bytes, exec);
+		const bool a = !beyondDense(va, bytes) && legacyVmMap(ref, va, mc, bytes, exec), b = newVmMap(nw, va, mc, bytes, exec);
 		(a ? okMaps : failedMaps)++;
 		compare("map", a, b);
 	}
 	void mapHost(uint64_t va, const std::vector<uint64_t> &buses, uint64_t bytes, bool exec) {
-		const bool a = legacyVmMapHost(ref, va, buses.data(), bytes, exec), b = newVmMapHost(nw, va, buses.data(), bytes, exec);
+		const bool a = !beyondDense(va, bytes) && legacyVmMapHost(ref, va, buses.data(), bytes, exec),
+		           b = newVmMapHost(nw, va, buses.data(), bytes, exec);
 		(a ? okHost : failedHost)++;
 		compare("mapHost", a, b);
 	}
+	// The new code stops unmapping at the end of the dense image, as map() refuses past it; the pre-S8 code clears and syncs
+	// table pages beyond (0x203000 and up), so it is given only the part of the range below the end.
 	void unmap(uint64_t va, uint64_t bytes) {
-		legacyVmUnmap(ref, va, bytes);
+		const uint64_t limit = GpuVm::kVaStart + GpuVmTable::denseVa(kTableBytes);
+
+		if (va < limit)
+			legacyVmUnmap(ref, va, bytes < limit - va ? bytes : limit - va);
 		newVmUnmap(nw, va, bytes);
 		unmaps++;
 		compare("unmap", true, true);
@@ -4299,7 +4479,7 @@ static int testVmTableDifferential() {
 			// 3. across a 2 MiB boundary (two PT pages) and a large device buffer
 			P.map(V + 0x1ff000, MC + 0x40000000, 0x3000, false);
 			P.map(V + 0x400000, MC + 0x50000000, 0x600000, false);
-			// 3b. the legacy layout's first-writer-wins quirk: PT pages 88 and 88 + 512 (1.2 GiB up) share PDB0[88]; whichever is mapped first owns the PDE
+			// 3b. the legacy layout's first-writer-wins quirk: PT pages 88 and 88 + 512 (1.2 GiB up) share PDB0[88]; the one 1.2 GiB up is now refused
 			P.map(V + 600ull * 0x200000, MC + 0x60000000, 0x1000, false);
 			P.map(V + 88ull * 0x200000, MC + 0x61000000, 0x1000, false);
 			// 4. client close and reopen on the same tables
@@ -4469,6 +4649,50 @@ bool treeResolves(TreeEnv &e, uint64_t va, uint64_t mc, uint64_t bytes) {
 }
 } // namespace
 
+// The dense image of kDenseTableBytes: 4 GiB from kVaStart, the first GiB laid out as before (the differential test's 4 MiB image is that
+// GiB alone), maps across the 1 GiB lines and in the last GiB translate, and nothing past 4 GiB is taken.
+static int testDense4GiB() {
+	int f = 0;
+	const uint64_t V = GpuVm::kVaStart, G = 1ull << 30, MC = kFbMcBase + 0x1000000;
+	static std::vector<uint64_t> words;
+	words.assign(GpuVmTable::kDenseTableBytes / 8, 0);
+	GpuVmTable::denseRoot(words.data(), kRootPhys);
+	auto entry = [](void *, uint64_t off) -> uint64_t * { return off < GpuVmTable::kDenseTableBytes ? &words[off / 8] : nullptr; };
+	auto phys = [](void *, uint64_t off, uint64_t &out) { out = kRootPhys + off; return true; };
+	auto read = [](void *, uint64_t address, uint64_t &out) {
+		const uint64_t off = address - kRootPhys;
+		if (off >= GpuVmTable::kDenseTableBytes)
+			return false;
+		out = words[off / 8];
+		return true;
+	};
+	const GpuVmTable::Access access { entry, phys, nullptr };
+	auto map = [&](uint64_t va, uint64_t mc, uint64_t bytes) {
+		GpuVmTable::Span span;
+		return GpuVmTable::mapVram(access, GpuVmTable::Policy {}, GpuVmTable::kDenseTableBytes, va, va + bytes, mc - kFbMcBase, false, span);
+	};
+	auto resolves = [&](uint64_t va, uint64_t mc, uint64_t bytes) {
+		for (uint64_t at = 0; at < bytes; at += 0x1000) {
+			uint64_t pa = 0, flags = 0;
+			if (!GpuVm::walk(kRootPhys, va + at, read, nullptr, pa, flags) || pa != mc - kFbMcBase + at)
+				return false;
+		}
+		return true;
+	};
+
+	f += check(GpuVmTable::densePt(V + G - 0x1000) == 0x3000 + 511 * 0x1000 && GpuVmTable::densePde(V) == 0x2000,
+	           "dense: the first GiB keeps the old layout (PDB0 at 0x2000, PT pages from 0x3000)");
+	f += check(map(V + 0x1000, MC, 0x3000) && resolves(V + 0x1000, MC, 0x3000), "dense: a map in the first GiB translates");
+	f += check(map(V + G - 0x10000, MC + 0x100000, 0x20000) && resolves(V + G - 0x10000, MC + 0x100000, 0x20000),
+	           "dense: a map across the 1 GiB line translates on both sides");
+	f += check(map(V + 3 * G + 0x200000, MC + 0x400000, 0x10000) && resolves(V + 3 * G + 0x200000, MC + 0x400000, 0x10000),
+	           "dense: a map in the last GiB translates");
+	f += check(resolves(V + 0x1000, MC, 0x3000) && resolves(V + G - 0x10000, MC + 0x100000, 0x20000), "dense: the earlier maps are undisturbed");
+	f += check(!map(V + 4 * G - 0x1000, MC, 0x2000), "dense: a map past 4 GiB is refused");
+	f += check(GpuVmTable::denseVa(4u << 20) == G, "dense: a 4 MiB image still covers only the first GiB");
+	return f;
+}
+
 static int testSparseTree() {
 	int f = 0;
 	const uint64_t V = GpuVm::kVaStart, G = 1ull << 30;
@@ -4503,8 +4727,8 @@ static int testSparseTree() {
 		           "tree: PDB1 entries 4 and 5 name two different PDB0 pages");
 	}
 
-	// NEGATIVE CONTROL: the contiguous layout of modes 0/1 accepts the same map and then cannot reach the far side. This is the defect being fixed;
-	// without it the test above would pass for a walker that never reads PDB1.
+	// NEGATIVE CONTROL: the contiguous layout of modes 0/1 cannot reach the far side of the same map, so it refuses it (it used to take it,
+	// and the GPU stalled on the far side); without this the test above would pass for a walker that never reads PDB1.
 	{
 		NewImage n;
 		n.words.assign(kTableBytes / 8, 0);
@@ -4521,7 +4745,7 @@ static int testSparseTree() {
 		uint64_t pa = 0, fl = 0;
 		const bool nearOk = GpuVm::walk(kRootPhys, cross, legacyRead, &n, pa, fl);
 		const bool farOk = GpuVm::walk(kRootPhys, cross + 0x10000, legacyRead, &n, pa, fl);
-		f += check(mapped && nearOk && !farOk, "negative control: the contiguous layout takes a map across 1 GiB but the far side does not translate (PDB1 entry 5 is empty)");
+		f += check(!mapped && !nearOk && !farOk, "negative control: the contiguous layout refuses a map across 1 GiB, whose far side it cannot translate (PDB1 entry 5 is empty)");
 	}
 
 	// Far apart: another PDB1 page (512 GiB up), and the top of the 48-bit space.
@@ -4813,6 +5037,54 @@ static int testRom(const char *path) {
 	return failures;
 }
 
+// A passive DP++ adapter's ID block: the TMDS clock it carries, as amdgpu reads it.
+static int testDpDual() {
+	int failures = 0;
+
+	// A Sapphire RX 9070's DP connector through a DP-to-HDMI cable (i2cdump under Linux, 2026-11-03).
+	uint8_t id[DpDual::kIdBytes] = {
+		0x44, 0x50, 0x2d, 0x48, 0x44, 0x4d, 0x49, 0x20, 0x41, 0x44, 0x41, 0x50, 0x54, 0x4f, 0x52, 0x04,
+		0xa0, 0x00, 0x1b, 0xc5, 0x43, 0x53, 0x35, 0x32, 0x31, 0x36, 0x00, 0x00, 0x00, 0x78, 0x0f, 0x00,
+	};
+	DpDual::Adaptor a = DpDual::parse(id, sizeof(id));
+	failures += check(a.type2 && a.maxTmdsKHz == 300000 && !strcmp(a.deviceId, "CS5216"),
+	                  "dp++: type 2 CS5216 at 300 MHz: type2 %d, %u kHz, \"%s\"", a.type2, a.maxTmdsKHz,
+	                  a.deviceId);
+
+	a = DpDual::parse(nullptr, 0);
+	failures += check(!a.type2 && a.maxTmdsKHz == 165000, "dp++: no ID block: %u kHz, expected 165000",
+	                  a.maxTmdsKHz);
+
+	uint8_t type1[DpDual::kIdBytes];
+	memcpy(type1, id, sizeof(type1));
+	type1[DpDual::kRegId] = 0x00;
+	a = DpDual::parse(type1, sizeof(type1));
+	failures += check(!a.type2 && a.maxTmdsKHz == 165000, "dp++: type 1 adapter: %u kHz, expected 165000",
+	                  a.maxTmdsKHz);
+
+	uint8_t bad[DpDual::kIdBytes];
+	memcpy(bad, id, sizeof(bad));
+	bad[0] = 'X';
+	a = DpDual::parse(bad, sizeof(bad));
+	failures += check(!a.type2 && a.maxTmdsKHz == 165000, "dp++: wrong signature: %u kHz, expected 165000",
+	                  a.maxTmdsKHz);
+
+	memcpy(bad, id, sizeof(bad));
+	bad[DpDual::kRegMaxTmds] = 0xff;   // 637.5 MHz, beyond what amdgpu accepts
+	a = DpDual::parse(bad, sizeof(bad));
+	failures += check(!a.type2 && a.maxTmdsKHz == 165000, "dp++: clock out of range: %u kHz, expected 165000",
+	                  a.maxTmdsKHz);
+
+	a = DpDual::parse(id, DpDual::kIdBytes - 1);
+	failures += check(!a.type2 && a.maxTmdsKHz == 165000, "dp++: short read: %u kHz, expected 165000",
+	                  a.maxTmdsKHz);
+
+	if (!failures)
+		printf("dp++: adapter ID blocks ok\n");
+
+	return failures;
+}
+
 int main(int argc, char **argv) {
 	if (argc > 2) {
 		fprintf(stderr, "usage: %s [vbios.rom]\n", argv[0]);
@@ -4835,6 +5107,7 @@ int main(int argc, char **argv) {
 	failures += testDpRetime();
 	failures += testPipe2();
 	failures += testDpTrain();
+	failures += testDpDual();
 	failures += testN48N();
 	failures += testPsp();
 	failures += testGfxImages();
@@ -4851,7 +5124,9 @@ int main(int argc, char **argv) {
 	failures += testPtPages();
 	failures += testVmTableDifferential();
 	failures += testSparseTree();
+	failures += testDense4GiB();
 	failures += testLinuxRefFormat();
+	failures += testTrial();
 
 	if (failures) {
 		fprintf(stderr, "\n%d check(s) failed\n", failures);

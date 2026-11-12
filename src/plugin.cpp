@@ -19,6 +19,9 @@
 //
 
 #include <Headers/plugin_start.hpp>
+#include "klog.hpp"
+#include "trial.hpp"
+#include "vrambench.hpp"
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLib.h>
@@ -36,6 +39,8 @@
 #include "accelcensus.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
 #include "pvgpu.hpp"
+#include "pvhooks.hpp"
+#include "pvscanout.hpp"
 #endif
 #include "compute.hpp"
 #include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
@@ -48,7 +53,7 @@ uint32_t rdna4TraceLevel { 0 };
 #include "bochsvbe.hpp"
 #endif
 
-#define FBLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
+#define FBLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
 
 // The local csc record mirrors (ndrv.hpp) must match the SDK exactly.
 #define NDRV_SAME_SIZE(T) \
@@ -171,6 +176,10 @@ uint32_t computeStage { 0 };    // rdna4-compute=<stage>, see compute.hpp
 uint32_t pvGpu { 0 };           // rdna4-pvgpu=1|2: M0 of docs/metal-phase-plan.md, the fake Apple paravirtual GPU nub (pvgpu.hpp); VM/emulator only
 uint32_t pvDelay { 0 };         // rdna4-pvgpu-delay=<s>: publish the nub this long after plugin start instead (no GPU-side publish)
 uint32_t accelCensus { 0 };     // rdna4-accelcensus=1|2: the E1 impostor-IOAccelerator census (accelcensus.hpp), emulator only
+// rdna4-pvgpu-disp bit 2 (with rdna4-pvgpu): the heads are the paravirtual GPU's displays (pvscanout.hpp), and macOS is told
+// that none of our framebuffers has one
+bool pvHeads { false };
+bool pvScaledModes { true };   // rdna4-pvscaled=0: no scaled modes above a head's 3840x2160
 
 // What we keep for one of our framebuffers.
 struct FbState {
@@ -188,6 +197,8 @@ struct FbEntry {
 	FbState *state;
 };
 FbEntry fbTable[8] {};
+// The boot head's state, once attach made it (port 0 of the paravirtual displays).
+FbState *bootState { nullptr };
 
 // Forward declaration: the explicit open-time VBL service creation below
 // goes through the same wrapper as a legacy NDRV call.
@@ -252,6 +263,10 @@ int32_t deviceSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 }
 
 void deviceSetPower(void *ctx, bool on) {
+	// a framebuffer macOS has no display on for must not blank the paravirtual display it scans out
+	if (pvHeads && !on)
+		return;
+
 	static_cast<RDNA4Device *>(ctx)->setDisplayPower(on);
 }
 
@@ -289,6 +304,10 @@ int32_t deviceDrawHardwareCursor(void *ctx, int32_t x, int32_t y, uint32_t visib
 
 void deviceCursorProbe(void *ctx, const char *why) {
 	static_cast<RDNA4Device *>(ctx)->cursorRegProbe(why);
+}
+
+void deviceSmuReady(void *ctx) {
+	static_cast<RDNA4Device *>(ctx)->smuStarted();
 }
 
 int32_t deviceGetHardwareCursorDrawState(void *ctx,
@@ -337,6 +356,7 @@ int32_t vbeSwitchTo(void *ctx, const Modes::Mode &m, bool) {
 // head then opens the other.
 struct Head2 {
 	IOPCIDevice     *pci { nullptr };
+	size_t           slot { 0 };            // its extra pipe (RDNA4Device::extra); head slot + 2 in the log
 	IOService       *nub { nullptr };
 	RDNA4Device     *dev { nullptr };       // once the second pipe is lit: display power goes to it
 	bool             ready { false };       // fillHead2 set the mode, surface and EDID
@@ -361,8 +381,15 @@ struct Head2 {
 	uint32_t         hpdSame { 0 };         // polls it has read that way
 	uint32_t         hpdGone { 0 };         // polls it has been low with the link up
 	bool             hpdBack { false };     // it came back from a second or more of low with the head connected
+	// Its display can be lit at 3840x2160 once the compute bring-up has raised the display clocks: it waits
+	// offline for that, then is plugged in (or after kClockWaitPolls at the size it can have).
+	bool             waitClocks { false };
+	uint32_t         waitPolls { 0 };
 };
-Head2 *head2 { nullptr };
+#define HLOG(h, fmt, ...)  FBLOG("head%u: " fmt, static_cast<unsigned>((h)->slot + 2), ## __VA_ARGS__)
+// One per display beside the boot one (rdna4-heads): heads 2, 3 and 4.
+Head2 *heads[RDNA4Device::kMaxExtra] {};
+size_t headCount { 0 };
 // rdna4-head2: 0 none, 1 phantom, 2..4 see RDNA4Device::lightSecondPipe. 4 unless
 // the boot-arg says otherwise: a second display on HDMI ran on the card.
 uint32_t head2Level { 0 };
@@ -376,8 +403,11 @@ mach_vm_address_t orgRegisterForInterruptType { 0 };
 
 void attach(FbEntry &e);
 
-bool isHead2(void *fb) {
-	return head2 && static_cast<IOService *>(fb)->getProvider() == head2->nub;
+Head2 *headFor(void *fb) {
+	for (size_t i = 0; i < headCount; i++)
+		if (static_cast<IOService *>(fb)->getProvider() == heads[i]->nub)
+			return heads[i];
+	return nullptr;
 }
 
 // Every mode scans the one surface, from its first pixel and with its pitch.
@@ -390,23 +420,30 @@ bool head2SurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) 
 }
 
 int32_t head2SwitchTo(void *ctx, const Modes::Mode &m, bool) {
-	return static_cast<Head2 *>(ctx)->dev->applySecondPipeMode(m);
+	auto *h = static_cast<Head2 *>(ctx);
+	h->dev->selectExtra(h->slot);
+	return h->dev->applySecondPipeMode(m);
 }
 
 void head2SetPower(void *ctx, bool on) {
 	auto *h = static_cast<Head2 *>(ctx);
+
+	if (pvHeads && !on)
+		return;
+
+	h->dev->selectExtra(h->slot);
 	if (h->connected || !on)             // the link of an unplugged display stays off
 		h->dev->setSecondPipePower(on);
 }
 
 // From wrapStart, before IONDRVFramebuffer starts on the PCI device.
-void createHead2(IOPCIDevice *pci) {
+void createHead(IOPCIDevice *pci, size_t slot) {
 	auto *h = new Head2;
 	// IONDRVDevice is private to IONDRVSupport: made by name, driven as an IOService.
 	IOService *nub = h ? OSDynamicCast(IOService, OSMetaClass::allocClassWithName("IONDRVDevice"))
 	                   : nullptr;
 	if (!nub || !nub->init()) {
-		FBLOG("head2: not created: IONDRVSupport gave no IONDRVDevice");
+		FBLOG("head%zu: not created: IONDRVSupport gave no IONDRVDevice", slot + 2);
 		OSSafeReleaseNULL(nub);
 		delete h;
 		return;
@@ -419,15 +456,17 @@ void createHead2(IOPCIDevice *pci) {
 	nub->setProperty("name", const_cast<char *>(kDisplay), sizeof(kDisplay));
 	nub->setProperty("device_type", const_cast<char *>(kDisplay), sizeof(kDisplay));
 	nub->setProperty("IOFBDependentID", id, 64);
-	nub->setProperty("IOFBDependentIndex", 1ull, 32);
-	nub->setLocation("1");
+	nub->setProperty("IOFBDependentIndex", static_cast<unsigned long long>(slot + 1), 32);
+	char location[4];
+	snprintf(location, sizeof(location), "%zu", slot + 1);
+	nub->setLocation(location);
 	if (OSArray *memory = pci->getDeviceMemory())
 		nub->setDeviceMemory(memory);   // getApertureRange maps the surface out of these
 	// IONDRVFramebuffer takes its device, and IONDRVDevice its power parent,
 	// from the device-tree plane.
 	nub->attachToParent(pci, gIODTPlane);
 	if (!nub->attach(pci)) {
-		FBLOG("head2: not created: the nub did not attach");
+		FBLOG("head%zu: not created: the nub did not attach", slot + 2);
 		nub->detachFromParent(pci, gIODTPlane);
 		nub->release();
 		delete h;
@@ -438,9 +477,25 @@ void createHead2(IOPCIDevice *pci) {
 	pci->setProperty("IOFBDependentIndex", 0ull, 32);
 	h->pci = pci;
 	h->nub = nub;
-	head2 = h;   // before registerService: the framebuffer may start at once
+	h->slot = slot;
+	heads[headCount++] = h;   // before registerService: the framebuffer may start at once
 	nub->registerService();
-	FBLOG("head2: nub registered, dependent 1 of 0x%llx", id);
+	HLOG(h, "nub registered, dependent %zu of 0x%llx", slot + 1, id);
+}
+
+void createHeads(IOPCIDevice *pci) {
+	const size_t n = RDNA4Device::extraHeads();
+	for (size_t i = 0; i < n; i++)
+		createHead(pci, i);
+}
+
+// Where head h's surface may start: behind the console, in a slot of its own
+// that holds the largest mode a pipe is lit at (3840x2160, 31.6 MiB) and the
+// gap Ndrv::spareSurface leaves, so a head can grow without moving another.
+constexpr uint64_t kHeadSlotBytes = 34ull << 20;
+
+uint64_t surfaceFloor(const Head2 *h, const RDNA4Device &dev) {
+	return dev.fbPhysBase + dev.fbLength + h->slot * kHeadSlotBytes;
 }
 
 // Once head 0's device exists: what head 2 serves.
@@ -459,16 +514,41 @@ const Modes::Mode *head2BuildTable(Head2 *h, RDNA4Device &dev, size_t &n) {
 			if (dev.secondPipeModeOk(h->table[i].t))
 				h->table[kept++] = h->table[i];
 		n = kept;
+		// A sink whose own timing of that size and rate won (a monitor's
+		// CVT-RB 4K60 over CEA VIC 97) gets the plan's, which it lists too.
+		const uint8_t vic = Edid::vicOf(lit);
+		if (vic && Edid::hasVic(h->edid, h->edidLen, vic))
+			Modes::ensure(h->table, n, Modes::MaxModes, lit, Modes::SourceVic);
 	}
 	for (size_t i = 0; i < n; i++) {
 		const Edid::DetailedTiming &t = h->table[i].t;
 		if (head2Level >= 2 && !Edid::sameTiming(t, lit))
 			continue;
-		if (Ndrv::spareSurface(dev.fbPhysBase, dev.fbLength, h->rangeBase, h->rangeLen, t.hActive, t.vActive,
-		                       h->surface))
+		if (Ndrv::spareSurface(dev.fbPhysBase, surfaceFloor(h, dev) - dev.fbPhysBase, h->rangeBase, h->rangeLen,
+		                       t.hActive, t.vActive, h->surface))
 			return &h->table[i];
 	}
 	return nullptr;
+}
+
+// WindowServer maps a framebuffer through getVRAMRange, which IONDRVFramebuffer
+// only has for an IOBootNDRV: without this it gives up on the head with
+// "Failed to map VRAM" (card boot of 2026-10-03, 19:46). The range is the
+// largest surface the head's slot holds: the framebuffer maps it once, so a
+// head lit at 3840x2160 after waiting offline with a 1080p surface showed
+// only the top of the picture (the TV, 2026-11-03).
+constexpr uint64_t kHeadSurfaceMaxBytes = 3840ull * 4 * 2160;
+static_assert(kHeadSurfaceMaxBytes + (2ull << 20) <= kHeadSlotBytes, "a 3840x2160 surface fits a head's slot");
+
+void head2MapSurface(Head2 *h) {
+	const uint64_t bytes = static_cast<uint64_t>(h->surface.rowBytes) * h->surface.height;
+	IODeviceMemory *old = h->vram;
+
+	h->vram = IODeviceMemory::withSubRange(h->range, h->surface.physBase - h->rangeBase,
+	                                       bytes > kHeadSurfaceMaxBytes ? bytes : kHeadSurfaceMaxBytes);
+	OSSafeReleaseNULL(old);
+	if (!h->vram)
+		HLOG(h, "no VRAM range for the surface: WindowServer will not map it");
 }
 
 // Hand the table to the translator, with `mode` as the one the head is in.
@@ -478,27 +558,32 @@ void head2Init(Head2 *h, RDNA4Device &dev, const Modes::Mode *mode, size_t n) {
 	be.surfaceFor = head2SurfaceFor;
 	// Only a lit pipe answers cscGetSync, so only then does macOS send this
 	// head display sleep (a phantom head has nothing to put to sleep).
-	if (dev.pipe2Lit)
+	if (dev.xp().lit)
 		be.setPower = head2SetPower;
 	// Like the boot display, the other modes are offered with rdna4-modeset=1.
-	const bool switching = dev.pipe2Lit && dev.modesetRequested;
+	const bool switching = dev.xp().lit && dev.modesetRequested;
 	if (switching)
 		be.switchTo = head2SwitchTo;
 	h->ndrv.init(switching ? h->table : mode, switching ? n : 1, mode->id, h->edid, h->edidLen, be);
 	for (size_t i = 0; switching && i < n; i++) {
 		const Modes::Mode &m = h->table[i];
-		FBLOG("head2: mode id %u %ux%u@%u.%03u %u kHz%s%s", m.id, m.t.hActive, m.t.vActive,
+		HLOG(h, "mode id %u %ux%u@%u.%03u %u kHz%s%s", m.id, m.t.hActive, m.t.vActive,
 		      m.refreshMilliHz / 1000, m.refreshMilliHz % 1000, m.t.pixelClockKHz, &m == mode ? " (lit)" : "",
 		      Pipe2::modeKnown(m.t) ? "" : " (on the lit mode's request timing)");
 	}
 }
 
-void fillHead2(RDNA4Device &dev) {
-	Head2 *h = head2;
-	if (!h || h->ready)
+// What macOS is told of a head's display: none while the heads are the paravirtual displays.
+void tellConnected(Head2 *h, bool on) {
+	h->ndrv.setConnected(on && !pvHeads);
+}
+
+void fillHead(Head2 *h, RDNA4Device &dev) {
+	if (h->ready)
 		return;
+	dev.selectExtra(h->slot);
 	IOService *client = h->nub->getClient();
-	FBLOG("head2: framebuffer on the nub: %s", client ? client->getName() : "none started");
+	HLOG(h, "framebuffer on the nub: %s", client ? client->getName() : "none started");
 	h->dev = &dev;
 	for (UInt32 i = 0; i < h->pci->getDeviceMemoryCount(); i++) {
 		IODeviceMemory *mem = h->pci->getDeviceMemoryWithIndex(i);
@@ -521,26 +606,31 @@ void fillHead2(RDNA4Device &dev) {
 	// head is there but offline (rdna4-hotplug=2): macOS shows no display.
 	// For a pipe to light, a second display counts if it is on a connector
 	// there is a plan for.
-	const bool sink = dev.edid2Len && (head2Level < 2 || dev.usePlanFor(dev.edid2Hpd));
-	const bool offline = head2Level >= 2 && !sink && hotplugLevel >= 2;
+	const bool sink = dev.xp().edidLen && (head2Level < 2 || dev.usePlanFor(dev.xp().hpd));
+	h->waitClocks = head2Level >= 2 && sink && hotplugLevel >= 2 && computeStage >= RDNA4Compute::StageGfx &&
+	                !dev.uhdClocks && dev.sinkTakesUhd(dev.xp().hpd);
+	const bool offline = (head2Level >= 2 && !sink && hotplugLevel >= 2) || h->waitClocks;
 	const Modes::Mode *mode = nullptr;
 	size_t n = 0;
 	if (offline) {
-		if (dev.edid2Len)
-			FBLOG("head2: the display on HPD%u is not served: no second-pipe plan for that connector (a "
-			      "DisplayPort one needs rdna4-head2dp=1); the head waits offline", dev.edid2Hpd);
+		if (h->waitClocks)
+			HLOG(h, "the display on HPD%u takes 3840x2160: the head waits offline for the display clocks",
+			      dev.xp().hpd);
+		else if (dev.xp().edidLen)
+			HLOG(h, "the display on HPD%u is not served: no second-pipe plan for that connector (a "
+			      "DisplayPort one is off with rdna4-head2dp=0); the head waits offline", dev.xp().hpd);
 		// The one mode the pipe will be lit in, on its surface; no EDID.
 		h->table[0] = Modes::Mode { 1, lit, lit.refreshMilliHz(), true, Modes::SourceBoot };
 		n = 1;
-		if (Ndrv::spareSurface(dev.fbPhysBase, dev.fbLength, h->rangeBase, h->rangeLen, lit.hActive, lit.vActive,
-		                       h->surface))
+		if (Ndrv::spareSurface(dev.fbPhysBase, surfaceFloor(h, dev) - dev.fbPhysBase, h->rangeBase, h->rangeLen,
+		                       lit.hActive, lit.vActive, h->surface))
 			mode = &h->table[0];
 	} else {
 		// The second sink if one answered, else a copy of the boot display's.
-		const uint8_t *edid = dev.edid2Len ? dev.edid2Data : dev.edidData;
-		h->edidLen = min(static_cast<size_t>(dev.edid2Len ? dev.edid2Len : dev.edidLen), sizeof(h->edid));
+		const uint8_t *edid = dev.xp().edidLen ? dev.xp().edid : dev.edidData;
+		h->edidLen = min(static_cast<size_t>(dev.xp().edidLen ? dev.xp().edidLen : dev.edidLen), sizeof(h->edid));
 		if (h->edidLen < 128) {
-			FBLOG("head2: nothing to serve: no EDID");
+			HLOG(h, "nothing to serve: no EDID");
 			return;
 		}
 		memcpy(h->edid, edid, h->edidLen);
@@ -548,11 +638,11 @@ void fillHead2(RDNA4Device &dev) {
 		// invisible display for windows to get lost on: that is rdna4-head2=1,
 		// asked for by name.
 		if (head2Level >= 2 && !sink) {
-			if (dev.edid2Len)
-				FBLOG("head2: nothing to serve: the second display is on HPD%u, a connector there is no "
-				      "second-pipe plan for (a DisplayPort one needs rdna4-head2dp=1)", dev.edid2Hpd);
+			if (dev.xp().edidLen)
+				HLOG(h, "nothing to serve: the second display is on HPD%u, a connector there is no "
+				      "second-pipe plan for (a DisplayPort one is off with rdna4-head2dp=0)", dev.xp().hpd);
 			else
-				FBLOG("head2: nothing to serve: no second sink answered on DDC (hot-plug is off: rdna4-hotplug=2 "
+				HLOG(h, "nothing to serve: no second sink answered on DDC (hot-plug is off: rdna4-hotplug=2 "
 				      "waits for one, rdna4-head2=1 makes a phantom head)");
 			return;
 		}
@@ -560,30 +650,83 @@ void fillHead2(RDNA4Device &dev) {
 	}
 	if (!mode) {
 		if (head2Level >= 2)
-			FBLOG("head2: nothing to serve: the sink has no %ux%u mode at %u kHz, the one the "
+			HLOG(h, "nothing to serve: the sink has no %ux%u mode at %u kHz, the one the "
 			      "second-pipe plan is for, or it does not fit behind the console", lit.hActive,
 			      lit.vActive, lit.pixelClockKHz);
 		else
-			FBLOG("head2: nothing to serve: no mode of the sink fits behind the console");
+			HLOG(h, "nothing to serve: no mode of the sink fits behind the console");
 		return;
 	}
 	if (!offline && head2Level >= 2 && dev.isAmd)
 		dev.lightSecondPipe(head2Level, h->surface.physBase);
 	head2Init(h, dev, mode, n);
 	h->connected = !offline;
-	h->ndrv.setConnected(h->connected);
-	// WindowServer maps a framebuffer through getVRAMRange, which IONDRVFramebuffer
-	// only has for an IOBootNDRV: without this it gives up on the head with
-	// "Failed to map VRAM" (card boot of 2026-10-03, 19:46).
-	h->vram = IODeviceMemory::withSubRange(h->range, h->surface.physBase - h->rangeBase,
-	                                       static_cast<uint64_t>(h->surface.rowBytes) * h->surface.height);
-	if (!h->vram)
-		FBLOG("head2: no VRAM range for the surface: WindowServer will not map it");
+	tellConnected(h, h->connected);
+	head2MapSurface(h);
 	h->ready = true;
-	FBLOG("head2: serving %ux%u@%u.%03u on surface 0x%llx, %s", mode->t.hActive,
+	HLOG(h, "serving %ux%u@%u.%03u on surface 0x%llx, %s", mode->t.hActive,
 	      mode->t.vActive, mode->refreshMilliHz / 1000, mode->refreshMilliHz % 1000, h->surface.physBase,
-	      offline ? "offline until a display is plugged in" : dev.edid2Len ? "EDID of the second sink"
+	      offline ? "offline until a display is plugged in" : dev.xp().edidLen ? "EDID of the second sink"
 	              : "EDID of the boot display (no second sink)");
+}
+
+// With the heads as the paravirtual displays (rdna4-boot4k=0 turns it off): the boot display, which the firmware lit behind a passive DP++
+// adapter at what it carries (2560x1440), is taken over by the first head with no display of its own whose pipe has a table
+// for its connector: once the display clocks are up the firmware's stream goes down (RDNA4Device::releaseBootPipe) and that
+// head lights the connector at 3840x2160, as the port-0 paravirtual display. The head on the second connector does the same.
+Head2 *pvBootHead { nullptr };
+
+void pickBootHead(RDNA4Device &dev) {
+	uint32_t on = 1;
+
+	(void)Trial::option("rdna4-boot4k", on);
+
+	if (!pvHeads || head2Level < 2 || hotplugLevel < 2 || !on)
+		return;
+
+	for (size_t i = 0; i < headCount; i++) {
+		Head2 *h = heads[i];
+
+		if (h->connected || h->waitClocks || h->slot >= RDNA4Device::kMaxExtra ||   // a free head may serve a placeholder
+		    !dev.bootUhdPipe(dev.extra[h->slot].pipe))
+			continue;
+
+		h->waitClocks = true;
+		pvBootHead = h;
+		HLOG(h, "boot4k: takes the boot display over at 3840x2160 once the display clocks are up");
+		return;
+	}
+
+	FBLOG("boot4k: no head can take the boot display over (no free head with a 3840x2160 table for its connector, or "
+	      "the sink does not take it through the adapter)");
+}
+
+void head2Plugged(Head2 *h, uint8_t hpd);
+
+// The boot display's connector to pvBootHead: the firmware's stream down, then the head plugged in on it.
+void takeBootDisplay(Head2 *h, RDNA4Device &dev) {
+	if (!dev.releaseBootPipe()) {
+		HLOG(h, "boot4k: the boot display stays the firmware's");
+		return;
+	}
+
+	const uint8_t hpd = dev.secondSinkHpd(true);
+
+	if (!hpd) {
+		HLOG(h, "boot4k: the boot display's pin is not offered to the head");
+		return;
+	}
+
+	head2Plugged(h, hpd);
+	h->ready = h->connected;
+	HLOG(h, "boot4k: the boot display %s", h->connected ? "is the head's now" : "did NOT come up on the head");
+}
+
+void fillHeads(RDNA4Device &dev) {
+	for (size_t i = 0; i < headCount; i++)
+		fillHead(heads[i], dev);
+	pickBootHead(dev);
+	dev.selectExtra(0);
 }
 
 // --- hot-plug of the second pipe's connector ---------------------------------
@@ -596,7 +739,7 @@ void head2ConnectChanged(Head2 *h) {
 	if (h->connectProc)
 		h->connectProc(h->connectTarget, h->connectRef);
 	else
-		FBLOG("hotplug: macOS registered no connect handler on head 2: it is not told");
+		HLOG(h, "hotplug: macOS registered no connect handler: it is not told");
 }
 
 // A display on the connector: read what it is and let macOS find it. For
@@ -605,72 +748,103 @@ void head2ConnectChanged(Head2 *h) {
 // starts.
 void head2Plugged(Head2 *h, uint8_t hpd) {
 	RDNA4Device &dev = *h->dev;
+	dev.selectExtra(h->slot);
 	if (!dev.readSecondEdid(hpd)) {
-		FBLOG("hotplug: HPD%u is high but there is no EDID on DDC (yet)", hpd);
+		HLOG(h, "hotplug: HPD%u is high but there is no EDID on DDC (yet)", hpd);
 		return;
 	}
+	// A lit pipe whose connector has another kind of sink now changes table:
+	// another display than before, whatever its EDID.
+	if (dev.adoptSinkKind(hpd))
+		h->edidLen = 0;
+
 	// A pipe that is not lit yet takes the plan for this connector.
-	if (!dev.pipe2Lit && !dev.usePlanFor(hpd)) {
-		FBLOG("hotplug: no second-pipe plan for HPD%u", hpd);
+	if (!dev.xp().lit && !dev.usePlanFor(hpd)) {
+		HLOG(h, "hotplug: no second-pipe plan for HPD%u", hpd);
 		return;
 	}
 	const Edid::DetailedTiming &lit = Pipe2::config().timing;
-	const size_t len = min(static_cast<size_t>(dev.edid2Len), sizeof(h->edid));
+	const size_t len = min(static_cast<size_t>(dev.xp().edidLen), sizeof(h->edid));
 	// The display that was there before: the link comes back in the mode it
 	// was in, and macOS finds the head, its modes and their IDs as it left them.
-	if (dev.pipe2Lit && len == h->edidLen && memcmp(h->edid, dev.edid2Data, len) == 0) {
+	if (dev.xp().lit && len == h->edidLen && memcmp(h->edid, dev.xp().edid, len) == 0) {
 		dev.secondPipeTo(hpd);
-		if (!dev.pipe2On) {
-			FBLOG("hotplug: the link did not come back: the display stays offline");
+		if (!dev.xp().on) {
+			HLOG(h, "hotplug: the link did not come back: the display stays offline");
 			return;
 		}
 		h->connected = true;
-		h->ndrv.setConnected(true);
-		FBLOG("hotplug: the same display is back on HPD%u", Pipe2::config().hpd);
+		tellConnected(h, true);
+		HLOG(h, "hotplug: the same display is back on HPD%u", Pipe2::config().hpd);
 		head2ConnectChanged(h);
 		return;
 	}
 	h->edidLen = len;
-	memcpy(h->edid, dev.edid2Data, h->edidLen);
+	memcpy(h->edid, dev.xp().edid, h->edidLen);
 	size_t n = 0;
 	const Modes::Mode *mode = head2BuildTable(h, dev, n);
 	if (!mode) {
-		FBLOG("hotplug: the display has no %ux%u mode at %u kHz, the one the pipe is lit in: left off",
+		HLOG(h, "hotplug: the display has no %ux%u mode at %u kHz, the one the pipe is lit in: left off",
 		      lit.hActive, lit.vActive, lit.pixelClockKHz);
+		// Not served: the next plug is not "the same display" for it.
+		h->edidLen = 0;
 		return;
 	}
-	if (!dev.pipe2Lit) {
+	if (!dev.xp().lit) {
 		dev.lightSecondPipe(head2Level, h->surface.physBase);
 	} else {
 		dev.secondPipeTo(hpd);
-		if (dev.pipe2On && !Edid::sameTiming(dev.pipe2Target.now, lit))
+		if (dev.xp().on && !Edid::sameTiming(dev.xp().target.now, lit))
 			dev.applySecondPipeMode(*mode);
 	}
-	if (!dev.pipe2Lit || !dev.pipe2On) {
-		FBLOG("hotplug: the pipe did not come up: the display stays offline");
+	if (!dev.xp().lit || !dev.xp().on) {
+		HLOG(h, "hotplug: the pipe did not come up: the display stays offline");
 		return;
 	}
+	head2MapSurface(h);
 	head2Init(h, dev, mode, n);
 	h->connected = true;
-	h->ndrv.setConnected(true);
-	FBLOG("hotplug: display connected on HPD%u: %lu mode(s), EDID %lu bytes", Pipe2::config().hpd,
+	tellConnected(h, true);
+	HLOG(h, "hotplug: display connected on HPD%u: %lu mode(s), EDID %lu bytes", Pipe2::config().hpd,
 	      static_cast<unsigned long>(n), static_cast<unsigned long>(h->edidLen));
 	head2ConnectChanged(h);
 }
 
 void head2Unplugged(Head2 *h) {
+	h->dev->selectExtra(h->slot);
 	h->dev->setSecondPipePower(false);
 	h->connected = false;
-	h->ndrv.setConnected(false);
-	FBLOG("hotplug: display gone from HPD%u: link off", Pipe2::config().hpd);
+	tellConnected(h, false);
+	HLOG(h, "hotplug: display gone from HPD%u: link off", Pipe2::config().hpd);
 	head2ConnectChanged(h);
 }
 
 constexpr uint32_t kHpdPollMs = 500;
 
-void hotplugPoll(OSObject *, IOTimerEventSource *timer) {
-	Head2 *h = head2;
+// A minute for the compute bring-up to raise the display clocks.
+constexpr uint32_t kClockWaitPolls = 60000 / kHpdPollMs;
+
+// Whether a head waiting for the display clocks can be plugged in now.
+bool clocksSettled(Head2 *h, const RDNA4Device &dev) {
+	if (dev.uhdClocks) {
+		HLOG(h, "display clocks raised: lighting the display");
+		return true;
+	}
+
+	if (++h->waitPolls < kClockWaitPolls)
+		return false;
+
+	HLOG(h, "display clocks not raised after a minute: lighting the display at the size it can have");
+
+	return true;
+}
+
+void hotplugPoll(OSObject *owner, IOTimerEventSource *timer) {
+	Head2 *h = headFor(owner);
+	if (!h)
+		return;
 	RDNA4Device &dev = *h->dev;
+	dev.selectExtra(h->slot);
 	// A display that is gone may come back on another connector.
 	const uint8_t hpd = dev.secondSinkHpd(!h->connected);
 	const bool present = hpd != 0;
@@ -678,7 +852,7 @@ void hotplugPoll(OSObject *, IOTimerEventSource *timer) {
 		if (present)
 			h->hpdPin = hpd;
 		h->hpdBack = present && h->connected && h->hpdSame >= 1;
-		FBLOG("hotplug: HPD%u went %s", h->hpdPin, present ? "high" : "low");
+		HLOG(h, "hotplug: HPD%u went %s", h->hpdPin, present ? "high" : "low");
 		h->hpdSeen = present;
 		h->hpdSame = 0;
 	} else {
@@ -686,11 +860,19 @@ void hotplugPoll(OSObject *, IOTimerEventSource *timer) {
 	}
 	// Low only counts while the link is up: a monitor that macOS has put to
 	// sleep may drop the pin, and takes a while to raise it again on waking.
-	h->hpdGone = present || !dev.pipe2On ? 0 : h->hpdGone + 1;
+	h->hpdGone = present || !dev.xp().on ? 0 : h->hpdGone + 1;
+	if (h->waitClocks && clocksSettled(h, dev)) {
+		h->waitClocks = false;
+		if (h == pvBootHead)
+			takeBootDisplay(h, dev);
+		else if (present && !h->connected)
+			head2Plugged(h, hpd);
+	}
 	if (hotplugLevel >= 2) {
 		// A second of high, and again after 3 and 7 s if the display's EDID
 		// was not there yet; three seconds of low.
-		if (!h->connected && present && (h->hpdSame == 2 || h->hpdSame == 6 || h->hpdSame == 14))
+		if (!h->connected && !h->waitClocks && present &&
+		    (h->hpdSame == 2 || h->hpdSame == 6 || h->hpdSame == 14))
 			head2Plugged(h, hpd);
 		// Six seconds on DisplayPort: the test monitor drops its pin for up to
 		// 3.7 s on waking from display sleep (card, 2026-10-06). A shorter
@@ -763,12 +945,12 @@ void startBootDpPoll(IOService *fb, RDNA4Device &dev) {
 	bootDp.timer->setTimeoutMS(kHpdPollMs);
 }
 
-void startHead2Hotplug(IOService *fb, void (*proc)(OSObject *, void *), OSObject *target, void *ref) {
-	Head2 *h = head2;
+void startHead2Hotplug(Head2 *h, IOService *fb, void (*proc)(OSObject *, void *), OSObject *target, void *ref) {
+	h->dev->selectExtra(h->slot);
 	IOWorkLoop *loop = fb->getWorkLoop();
 	h->hpdTimer = loop ? IOTimerEventSource::timerEventSource(fb, hotplugPoll) : nullptr;
 	if (!h->hpdTimer || loop->addEventSource(h->hpdTimer) != kIOReturnSuccess) {
-		FBLOG("hotplug: no timer on head 2's work loop: off");
+		HLOG(h, "hotplug: no timer on the head's work loop: off");
 		OSSafeReleaseNULL(h->hpdTimer);
 		return;
 	}
@@ -779,7 +961,7 @@ void startHead2Hotplug(IOService *fb, void (*proc)(OSObject *, void *), OSObject
 	h->hpdSeen = h->hpdPin != 0;
 	if (!h->hpdSeen)
 		h->hpdPin = Pipe2::config().hpd;
-	FBLOG("hotplug: polling HPD%u (now %s), %s; head 2 is %s", h->hpdPin, h->hpdSeen ? "high" : "low",
+	HLOG(h, "hotplug: polling HPD%u (now %s), %s; the head is %s", h->hpdPin, h->hpdSeen ? "high" : "low",
 	      hotplugLevel >= 2 ? "acting on it" : "logging only (rdna4-hotplug=2 acts)",
 	      h->connected ? "connected" : "offline");
 	h->hpdTimer->setTimeoutMS(kHpdPollMs);
@@ -796,10 +978,9 @@ IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSOb
 	if (type != kIOFBConnectInterruptType)
 		return ret;
 	auto *service = static_cast<IOService *>(fb);
-	if (isHead2(fb)) {
-		Head2 *h = head2;
+	if (Head2 *h = headFor(fb)) {
 		if (hotplugLevel && h->ready && h->dev && !h->hpdTimer && head2Level >= 2 && h->dev->isAmd)
-			startHead2Hotplug(service, proc, target, ref);
+			startHead2Hotplug(h, service, proc, target, ref);
 		return ret;
 	}
 	FbEntry *e = fbEntry(fb);
@@ -809,9 +990,9 @@ IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSOb
 }
 
 // Head 0's framebuffer: on the GPU itself, or on a "display" nub IONDRVSupport hangs under it (the B550 board of 2026-11:
-// there, missing it left the head refused for good, its pipe scanning stale VRAM). The head's own nub is skipped; of
+// there, missing it left the head refused for good, its pipe scanning stale VRAM). The heads' own nubs are skipped; of
 // several, the oldest: the boot display's comes first, other "display" nubs' framebuffers only once the device is up.
-IOService *bootFramebuffer(IOPCIDevice *pci, IOService *headNub) {
+IOService *bootFramebuffer(IOPCIDevice *pci) {
 	IOService *best = nullptr;
 	auto consider = [&](OSObject *o) {
 		auto *fb = OSDynamicCast(IOService, o);
@@ -822,7 +1003,10 @@ IOService *bootFramebuffer(IOPCIDevice *pci, IOService *headNub) {
 		while (OSObject *client = clients->getNextObject()) {
 			consider(client);
 			auto *nub = OSDynamicCast(IOService, client);
-			if (!nub || nub == headNub)
+			bool head = false;
+			for (size_t i = 0; i < headCount; i++)
+				head |= nub == heads[i]->nub;
+			if (!nub || head)
 				continue;
 			if (OSIterator *fbs = nub->getClientIterator()) {
 				while (OSObject *fb = fbs->getNextObject())
@@ -836,18 +1020,18 @@ IOService *bootFramebuffer(IOPCIDevice *pci, IOService *headNub) {
 }
 
 // The stand-in for IOBootNDRV::doDriverIO.
-IOReturn head2DriverIO(void *contents, UInt32 commandCode, uint16_t &code) {
-	if (!head2->ready) {
+IOReturn head2DriverIO(Head2 *h, void *contents, UInt32 commandCode, uint16_t &code) {
+	if (!h->ready) {
 		// macOS opened this head before head 0: build head 0's device, which
 		// is where the EDID and the console geometry come from, now.
-		IOService *fb0 = bootFramebuffer(head2->pci, head2->nub);
+		IOService *fb0 = bootFramebuffer(h->pci);
 		if (fb0)
-			FBLOG("head2: opened before head 0: building head 0's device through framebuffer %p on %s", fb0,
+			HLOG(h, "opened before head 0: building head 0's device through framebuffer %p on %s", fb0,
 			     fb0->getProvider() ? fb0->getProvider()->getName() : "-");
 		FbEntry *e0 = fb0 ? fbEntry(fb0) : nullptr;
 		if (e0 && e0->ours && !e0->tried)
 			attach(*e0);
-		if (!head2->ready)
+		if (!h->ready)
 			return kIOReturnNotReady;
 	}
 	if (commandCode == kIONDRVInitializeCommand || commandCode == kIONDRVOpenCommand)
@@ -858,7 +1042,7 @@ IOReturn head2DriverIO(void *contents, UInt32 commandCode, uint16_t &code) {
 	auto *pb = static_cast<NdrvControlParameters *>(contents);
 	code = pb->code;
 	int32_t r = 0;
-	if (isStatus ? head2->ndrv.status(code, pb->params, r) : head2->ndrv.control(code, pb->params, r))
+	if (isStatus ? h->ndrv.status(code, pb->params, r) : h->ndrv.control(code, pb->params, r))
 		return static_cast<IOReturn>(r);
 	return static_cast<IOReturn>(Ndrv::bootReply(isStatus, code));
 }
@@ -867,17 +1051,18 @@ IOReturn head2DriverIO(void *contents, UInt32 commandCode, uint16_t &code) {
 // nothing for head 2: hand out its surface instead (retained, as the original
 // does).
 IODeviceMemory *wrapGetVRAMRange(void *fb) {
-	if (isHead2(fb) && head2->vram) {
-		head2->vram->retain();
-		return head2->vram;
+	Head2 *h = headFor(fb);
+	if (h && h->vram) {
+		h->vram->retain();
+		return h->vram;
 	}
 	return FunctionCast(wrapGetVRAMRange, orgGetVRAMRange)(fb);
 }
 
 bool wrapStart(void *fb, IOService *provider) {
 	auto *pci = OSDynamicCast(IOPCIDevice, provider);
-	if (!head2 && pci && isOurDevice(pci))
-		createHead2(pci);
+	if (!headCount && pci && isOurDevice(pci))
+		createHeads(pci);
 	return FunctionCast(wrapStart, orgStart)(fb, provider);
 }
 
@@ -899,6 +1084,8 @@ void attach(FbEntry &e) {
 		delete st;
 		return;
 	}
+	// A test boot's stage (rdna4-trial) is only known once NVRAM is.
+	computeStage = RDNA4Compute::requestedStage();
 	Ndrv::Backend be { &dev, deviceSurfaceFor, deviceSwitchTo, deviceSetPower,
 	                   deviceSupportsHardwareCursor, deviceSetHardwareCursor,
 	                   deviceDrawHardwareCursor, deviceGetHardwareCursorDrawState };
@@ -916,15 +1103,43 @@ void attach(FbEntry &e) {
 	}
 #endif
 	st->ndrv.init(dev.modeTable, dev.modeCount, dev.defaultModeId, dev.edidData, dev.edidLen, be);
+#ifdef AMDRadeonRDNA4_PVGPU
+	// A test boot's level (rdna4-trial) is only known once NVRAM is; the heads' framebuffers are told before macOS asks.
+	uint32_t pvTrial = 0, pvDisp = 0;
+
+	if (!pvGpu && Trial::option("rdna4-pvgpu", pvTrial) && pvTrial <= 2)
+		pvGpu = pvTrial;
+
+	pvHeads = pvGpu && dev.isAmd && Trial::option("rdna4-pvgpu-disp", pvDisp) && (pvDisp & 4);
+
+	uint32_t scaled = 1;
+
+	(void)Trial::option("rdna4-pvscaled", scaled);
+	pvScaledModes = scaled != 0;
+
+	if (pvHeads) {
+		st->ndrv.setConnected(false);
+		FBLOG("ndrv: the heads are the paravirtual displays: no display on our framebuffers for macOS");
+	}
+
+	// Before NVRAM is up a test boot looks like a normal one: decided only once the variable could be read (or boot-args set it),
+	// or the first WindowServer opened the boot framebuffer as macOS's display and died in its first frame (pvhooks.cpp).
+	if (dev.isAmd && (Trial::loaded() || pvGpu))
+		PvScanout::decided(pvHeads);
+#endif
 	e.state = st;
+	bootState = st;
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
-	fillHead2(dev);
+	fillHeads(dev);
+	// Behind the extra heads' slots, below the compute pool (128 MiB).
+	VramBench::run(dev.fbPhysBase, ((dev.fbLength + (1ull << 20) - 1) & ~((1ull << 20) - 1)) +
+	                               RDNA4Device::kMaxExtra * kHeadSlotBytes + (2ull << 20));
 
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
 	if (accelCensus && dev.isAmd)
 		RDNA4AccelCensus::publish(pci, accelCensus);
-	// M0: the fake paravirtual GPU, independent of everything else here.
+	// M0: the fake paravirtual GPU, independent of everything else here, after the heads it may drive.
 #ifdef AMDRadeonRDNA4_PVGPU
 	if (pvGpu && dev.isAmd && !pvDelay)
 		RDNA4PvNub::publish(pci, pvGpu);
@@ -940,6 +1155,7 @@ void attach(FbEntry &e) {
 		RDNA4Compute::Env env { pci, svc, dev.mmioBase(), dev.mmioSize(), dev.discovery(),
 		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
 		                        createVblankService, deviceCursorProbe, &dev };
+		env.smuReady = deviceSmuReady;
 		st->compute.start(env, computeStage);
 	}
 }
@@ -964,15 +1180,15 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 		return org(fb, commandID, contents, commandCode, commandKind);
 
 	// The phantom head has no NDRV: the original would refuse every command.
-	if (isHead2(fb)) {
+	if (Head2 *h = headFor(fb)) {
 		uint16_t code = 0;
-		const IOReturn ret = head2DriverIO(contents, commandCode, code);
+		const IOReturn ret = head2DriverIO(h, contents, commandCode, code);
 		const bool lifecycle = commandCode != kIONDRVControlCommand && commandCode != kIONDRVStatusCommand;
-		const bool traced = !lifecycle && traceEnabled && head2->traceBudget;
+		const bool traced = !lifecycle && traceEnabled && h->traceBudget;
 		if (traced)
-			head2->traceBudget--;
+			h->traceBudget--;
 		if (lifecycle || traced)
-			FBLOG("head2: %s csc %u -> 0x%x", commandName(commandCode), code, ret);
+			HLOG(h, "%s csc %u -> 0x%x", commandName(commandCode), code, ret);
 		return ret;
 	}
 
@@ -1209,6 +1425,7 @@ void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
 }
 
 void pluginStart() {
+	rdna4LogInit();
 	FBLOG("version " AMDRADEONRDNA4_BUILD);
 	uint32_t off = 0;
 	if (PE_parse_boot_argn("rdna4-off", &off, sizeof(off)) && off) {
@@ -1243,25 +1460,42 @@ void pluginStart() {
 	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "", pvGpu ? ", FAKE PARAVIRT GPU (VM only)" : "");
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
 #ifdef AMDRadeonRDNA4_PVGPU
-	if (pvGpu)
-		lilu.onKextLoadForce(&kextIOSurface, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-			if (index != kextIOSurface.loadIndex)
-				return;
-			// In the order of pvgpu.cpp's gSurfaceFns.
-			static const char *const names[8] = {"__ZN13IOSurfaceRoot13lookupSurfaceEjP4task", "__ZNK9IOSurface19getMemoryDescriptorEv",
-			                                     "__ZNK9IOSurface14getBytesPerRowEv", "__ZNK9IOSurface8getWidthEv", "__ZNK9IOSurface9getHeightEv",
-			                                     "__ZNK9IOSurface14getPixelFormatEv", "__ZNK9IOSurface13getBaseOffsetEv", "__ZNK9IOSurface12getSurfaceIDEv"};
-			mach_vm_address_t fn[8];
-			unsigned found = 0;
-			for (unsigned k = 0; k < 8; k++)
-				found += (fn[k] = patcher.solveSymbol(index, names[k], address, size)) != 0;
-			patcher.clearError();
-			if (found == 8)
-				RDNA4PvNub::setSurfaceFunctions(fn);
-			FBLOG("pvgpu: IOSurface: %u of 8 functions found%s", found, found == 8 ? "" : ": no IOSurface render targets");
-		}, nullptr);
+	// whether this boot has the fake GPU is only known once NVRAM is (rdna4-trial): the functions are resolved in any case
+	lilu.onKextLoadForce(&kextIOSurface, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+		if (index != kextIOSurface.loadIndex)
+			return;
+		// In the order of pvgpu.cpp's gSurfaceFns.
+		static const char *const names[RDNA4PvNub::kSurfaceFunctions] = {
+			"__ZN13IOSurfaceRoot13lookupSurfaceEjP4task", "__ZNK9IOSurface19getMemoryDescriptorEv", "__ZNK9IOSurface14getBytesPerRowEv",
+			"__ZNK9IOSurface8getWidthEv", "__ZNK9IOSurface9getHeightEv", "__ZNK9IOSurface14getPixelFormatEv", "__ZNK9IOSurface13getBaseOffsetEv",
+			"__ZNK9IOSurface12getSurfaceIDEv", "__ZNK9IOSurface13getPlaneCountEv", "__ZNK9IOSurface14getPlaneOffsetEj",
+			"__ZNK9IOSurface19getPlaneBytesPerRowEj", "__ZNK9IOSurface13getPlaneWidthEj", "__ZNK9IOSurface14getPlaneHeightEj",
+			"__ZNK9IOSurface11getLockSeedEv", "__ZNK9IOSurface13getUnlockSeedEv"};
+		mach_vm_address_t fn[RDNA4PvNub::kSurfaceFunctions];
+		unsigned found = 0;
+		for (unsigned k = 0; k < RDNA4PvNub::kSurfaceFunctions; k++)
+			found += (fn[k] = patcher.solveSymbol(index, names[k], address, size)) != 0;
+		patcher.clearError();
+		if (found == RDNA4PvNub::kSurfaceFunctions)
+			RDNA4PvNub::setSurfaceFunctions(fn);
+		FBLOG("pvgpu: IOSurface: %u of %u functions found%s", found, RDNA4PvNub::kSurfaceFunctions,
+		      found == RDNA4PvNub::kSurfaceFunctions ? "" : ": no IOSurface textures");
+	}, nullptr);
+	PvHooks::start();
+	PvScanout::start();
 #endif
-	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) { gPatcher = &patcher; });
+	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
+		gPatcher = &patcher;
+#ifdef AMDRadeonRDNA4_PVGPU
+		auto **base = reinterpret_cast<uint8_t **>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_base"));
+		auto **max = reinterpret_cast<uint8_t **>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_max"));
+
+		patcher.clearError();
+		if (base && max)
+			RDNA4PvNub::setPhysmap(*base, *max);
+		FBLOG("pvgpu: physmap %s", base && max ? "found" : "NOT found: guest memory through mappings of each page");
+#endif
+	});
 	if ((gLateNdrv = thread_call_allocate(lateNdrvCheck, nullptr))) {   // ponytail: never freed, it lives for the boot
 		uint64_t deadline;
 		clock_interval_to_deadline(30, kSecondScale, &deadline);
@@ -1284,3 +1518,315 @@ PluginConfiguration ADDPR(config) {
 	KernelVersion::Tahoe,
 	pluginStart,
 };
+
+#ifdef AMDRadeonRDNA4_PVGPU
+// --- the heads as the paravirtual displays (pvscanout.hpp) ---------------------
+
+bool PvScanout::enabled()
+{
+	return pvHeads;
+}
+
+// The extra heads by port (port - 1), numbered by the first count().
+const Head2 *pvPorts[RDNA4Device::kMaxExtra] {};
+// The size each of them is lit in, or will be: what its paravirtual display is announced with.
+uint32_t pvPortWidth[RDNA4Device::kMaxExtra] {}, pvPortHeight[RDNA4Device::kMaxExtra] {};
+uint32_t pvPortCount { 0 };
+bool pvPortsNumbered { false };
+
+uint32_t PvScanout::count()
+{
+	if (!pvPortsNumbered) {
+		for (size_t i = 0; i < headCount; i++) {
+			const Head2 *h = heads[i];
+
+			if ((!h->connected && !h->waitClocks) || h == pvBootHead)   // the boot head's port is 0
+				continue;
+
+			// a head waiting for the display clocks is lit at 3840x2160 once they are up (fillHead)
+			pvPortWidth[pvPortCount] = h->waitClocks ? 3840 : h->surface.width;
+			pvPortHeight[pvPortCount] = h->waitClocks ? 2160 : h->surface.height;
+			pvPorts[pvPortCount++] = h;
+		}
+
+		pvPortsNumbered = true;
+	}
+
+	return 1 + pvPortCount;
+}
+
+bool PvScanout::mode(uint32_t port, uint32_t &width, uint32_t &height)
+{
+	Head head;
+
+	if (port == 0 && pvBootHead && !pvBootHead->connected) {   // lit at 3840x2160 once the display clocks are up
+		width = 3840;
+		height = 2160;
+
+		return true;
+	}
+
+	if (PvScanout::head(port, head)) {
+		width = head.width;
+		height = head.height;
+
+		return true;
+	}
+
+	if (port == 0 || port > pvPortCount)
+		return false;
+
+	width = pvPortWidth[port - 1];
+	height = pvPortHeight[port - 1];
+
+	return true;
+}
+
+// A head's paravirtual display port: 0 the boot display's (pvBootHead when it took the boot display over), then the extra heads.
+Head2 *pvHead(uint32_t port)
+{
+	if (port == 0)
+		return pvBootHead;
+
+	return port <= pvPortCount ? const_cast<Head2 *>(pvPorts[port - 1]) : nullptr;
+}
+
+// The mode of a size nearest 60 Hz in `table`.
+const Modes::Mode *nearest60(const Modes::Mode *table, size_t n, uint32_t width, uint32_t height)
+{
+	const Modes::Mode *best = nullptr;
+
+	for (size_t i = 0; i < n; i++) {
+		const Modes::Mode &m = table[i];
+		const uint32_t off = m.refreshMilliHz > 60000 ? m.refreshMilliHz - 60000 : 60000 - m.refreshMilliHz;
+
+		if (m.t.hActive != width || m.t.vActive != height)
+			continue;
+
+		if (!best || off < (best->refreshMilliHz > 60000 ? best->refreshMilliHz - 60000 : 60000 - best->refreshMilliHz))
+			best = &m;
+	}
+
+	return best;
+}
+
+uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
+{
+	Head2 *h = pvHead(port);
+	static Modes::Mode built[Modes::MaxModes];
+	const Modes::Mode *table = nullptr;
+	size_t n = 0;
+	uint32_t litW = 0, litH = 0, count = 0;
+
+	if (!h || !bootState || !cap)
+		return 0;
+
+	if (h->connected && h->ndrv.modeCount() > 1) {
+		table = h->table;
+		n = h->ndrv.modeCount();
+		litW = h->surface.width;
+		litH = h->surface.height;
+	} else if (h == pvBootHead || h->waitClocks) {   // not lit yet: its monitor's, as a head's pipe can run them, from 3840x2160
+		const uint8_t *edid = h->edidLen ? h->edid : nullptr;
+		size_t len = h->edidLen;
+
+		if (!edid && !PvScanout::edid(port, edid, len))
+			return 0;
+
+		// what a head lit at 3840x2160 takes (the limits of whichever table is chosen now may be another connector's)
+		Modes::Limits lim {};
+
+		lim.maxHActive = 3840;
+		lim.maxVActive = 2160;
+		lim.maxPixelClockKHz = ModeSet::kMaxTmdsKHz;
+		n = Modes::build(edid, len, lim, built, Modes::MaxModes);
+		table = built;
+		litW = 3840;
+		litH = 2160;
+	}
+
+	// The size it is lit in, then the others from the largest down, each once, as many as fit; a pipe not lit yet is lit at
+	// 3840x2160@60 (through a DP++ adapter in 4:2:0, which the limits for the other modes leave out).
+	Mode all[Modes::MaxModes + 7];
+	uint32_t total = 0;
+
+	if (!nearest60(table, n, litW, litH))
+		all[total++] = { litW, litH, 60000 };
+
+	// Above 3840x2160, sizes no pipe runs: macOS's HiDPI "looks like 2048x1152" to "3360x1890" draw in twice those, which the host
+	// scales down to the largest mode (presentOnCard). The steps macOS offers a 4K monitor on Apple's framebuffer of a 6600 XT, which
+	// it makes from that framebuffer's scaler; the paravirtual one's modes are only those of this list.
+	static constexpr uint32_t kSteps[][2] = { {8, 15}, {3, 5}, {2, 3}, {47, 60}, {5, 6}, {7, 8} };   // of the width and height
+	uint32_t bigW = litW, bigH = litH;
+
+	for (size_t i = 0; i < n; i++)
+		if (static_cast<uint64_t>(table[i].t.hActive) * table[i].t.vActive > static_cast<uint64_t>(bigW) * bigH) {
+			bigW = table[i].t.hActive;
+			bigH = table[i].t.vActive;
+		}
+
+	for (size_t i = 0; bigW >= 3840 && pvScaledModes && i < sizeof(kSteps) / sizeof(kSteps[0]); i++)
+		all[total++] = { 2 * bigW * kSteps[i][0] / kSteps[i][1], 2 * bigH * kSteps[i][0] / kSteps[i][1], 60000 };
+
+	for (size_t i = 0; i < n && total < Modes::MaxModes + 7; i++) {
+		const Modes::Mode *best = nearest60(table, n, table[i].t.hActive, table[i].t.vActive);
+		bool seen = false;
+
+		for (uint32_t k = 0; k < total; k++)
+			seen = seen || (all[k].width == best->t.hActive && all[k].height == best->t.vActive);
+
+		if (!seen)
+			all[total++] = { best->t.hActive, best->t.vActive, best->refreshMilliHz };
+	}
+
+	for (uint32_t i = 0; i < total; i++)
+		for (uint32_t k = i + 1; k < total; k++) {
+			const bool kLit = all[k].width == litW && all[k].height == litH, iLit = all[i].width == litW && all[i].height == litH;
+			const bool larger = static_cast<uint64_t>(all[k].width) * all[k].height > static_cast<uint64_t>(all[i].width) * all[i].height;
+
+			if (!iLit && (kLit || larger)) {
+				const Mode t = all[i];
+
+				all[i] = all[k];
+				all[k] = t;
+			}
+		}
+
+	// From the largest down, not a size that is half of one kept: macOS offers that size as the HiDPI mode of the larger one already and
+	// listed this one again as "(niedrige Auflösung)" (1920x1080 beside 3840x2160's, 2560x1440 beside 5120x2880's). The lit one stays.
+	for (uint32_t i = 0; i < total && count < cap; i++) {
+		bool half = false;
+
+		for (uint32_t k = 0; k < count && !half; k++)
+			half = out[k].width == 2 * all[i].width && out[k].height == 2 * all[i].height;
+
+		if (!half || (all[i].width == litW && all[i].height == litH))
+			out[count++] = all[i];
+	}
+
+	return count;
+}
+
+bool PvScanout::largest(uint32_t port, uint32_t &width, uint32_t &height)
+{
+	Head2 *h = pvHead(port);
+	const size_t n = h && h->connected ? h->ndrv.modeCount() : 0;
+
+	width = height = 0;
+
+	for (size_t i = 0; i < n; i++) {
+		const Edid::DetailedTiming &t = h->table[i].t;
+
+		if (static_cast<uint64_t>(t.hActive) * t.vActive > static_cast<uint64_t>(width) * height) {
+			width = t.hActive;
+			height = t.vActive;
+		}
+	}
+
+	return width && height;
+}
+
+bool PvScanout::setMode(uint32_t port, uint32_t width, uint32_t height)
+{
+	Head2 *h = pvHead(port);
+	const Modes::Mode *m = h && h->connected ? nearest60(h->table, h->ndrv.modeCount(), width, height) : nullptr;
+
+	if (!m) {
+		FBLOG("pvgpu: port %u: no mode of %ux%u to switch its head to", port, width, height);
+		return false;
+	}
+
+	h->dev->selectExtra(h->slot);
+
+	const IOReturn r = h->dev->applySecondPipeMode(*m);
+
+	HLOG(h, "port %u: switched to %ux%u@%u.%03u for macOS's mode: %s", port, width, height, m->refreshMilliHz / 1000,
+	     m->refreshMilliHz % 1000, r == kIOReturnSuccess ? "done" : "FAILED");
+
+	if (r != kIOReturnSuccess)
+		return false;
+
+	h->surface.width = width;
+	h->surface.height = height;
+
+	return true;
+}
+
+bool PvScanout::edid(uint32_t port, const uint8_t *&data, size_t &len)
+{
+	if (port == 0 && pvBootHead && pvBootHead->edidLen) {
+		data = pvBootHead->edid;
+		len = pvBootHead->edidLen;
+
+		return true;
+	}
+
+	if (port == 0) {
+		if (!bootState || !bootState->dev.edidLen)
+			return false;
+
+		data = bootState->dev.edidData;
+		len = bootState->dev.edidLen;
+
+		return true;
+	}
+
+	if (port > pvPortCount)
+		return false;
+
+	const Head2 *h = pvPorts[port - 1];
+
+	if (h->edidLen) {
+		data = h->edid;
+		len = h->edidLen;
+
+		return true;
+	}
+
+	// a head waiting for the display clocks carries no EDID of its own: its extra pipe read the sink's
+	if (!bootState || h->slot >= RDNA4Device::kMaxExtra || !bootState->dev.extra[h->slot].edidLen)
+		return false;
+
+	data = bootState->dev.extra[h->slot].edid;
+	len = bootState->dev.extra[h->slot].edidLen;
+
+	return true;
+}
+
+bool PvScanout::head(uint32_t port, Head &out)
+{
+	if (port == 0 && pvBootHead) {
+		const Head2 *h = pvBootHead;
+
+		if (!h->connected)
+			return false;
+
+		out = { h->surface.physBase, h->surface.rowBytes, h->surface.width, h->surface.height };
+
+		return true;
+	}
+
+	if (port == 0) {
+		if (!bootState)
+			return false;
+
+		const RDNA4Device &dev = bootState->dev;
+
+		out = { dev.fbPhysBase, dev.fbRowBytes, dev.fbWidth, dev.fbHeight };
+
+		return true;
+	}
+
+	if (port > pvPortCount)
+		return false;
+
+	const Head2 *h = pvPorts[port - 1];
+
+	if (!h->ready || !h->connected)
+		return false;
+
+	out = { h->surface.physBase, h->surface.rowBytes, h->surface.width, h->surface.height };
+
+	return true;
+}
+#endif

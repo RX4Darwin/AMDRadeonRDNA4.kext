@@ -165,7 +165,19 @@ $(BIN)/rdna4-run: $(RUN)/rdna4-run.c $(RUN)/librdna4.c $(RUN)/librdna4.h $(RUN)/
 	$(CXX) -x c $(USER_FLAGS) $(RUN)/rdna4-run.c $(RUN)/librdna4.c \
 		-framework IOKit -framework CoreFoundation -weak_framework Accelerate -o $@
 
-userspace: $(BIN)/rdna4-run
+# The kext's log of each boot into /var/log/rdna4 (userspace/rdna4-logd/install.sh).
+LOGD         = userspace/rdna4-logd
+$(BIN)/rdna4-logd: $(LOGD)/rdna4-logd.c
+	@mkdir -p $(BIN)
+	$(CXX) -x c $(USER_FLAGS) $(LOGD)/rdna4-logd.c -o $@
+
+# CoreDisplay's IOPresentment switched for the boot (userspace/rdna4-iop/install.sh).
+IOP          = userspace/rdna4-iop
+$(BIN)/rdna4-iop: $(IOP)/rdna4-iop.c
+	@mkdir -p $(BIN)
+	$(CXX) -x c $(USER_FLAGS) $(IOP)/rdna4-iop.c -framework CoreFoundation -o $@
+
+userspace: $(BIN)/rdna4-run $(BIN)/rdna4-logd $(BIN)/rdna4-iop
 
 # The card test of the Vulkan interface's memory half (docs/vulkan-port.md): runs on the test machine, as root.
 $(BIN)/n48nprobe: $(VULKAN)/n48nprobe.c $(VULKAN)/navi48_native_abi.h include/rdna4vulkan.h

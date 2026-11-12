@@ -15,6 +15,8 @@
 
 #include <stdint.h>
 
+#include "gpuvm.hpp"
+
 namespace GpuVmTable {
 
 struct Access {
@@ -35,10 +37,30 @@ struct Policy {
 // The PT pages a call touched: the caller syncs the top three pages and [firstPt, lastPt] step 0x1000. firstPt == ~0 when none.
 struct Span {
 	uint64_t firstPt { ~0ull }, lastPt { 0 };
+	bool directories { false };   // a PDE was written: the root and directory pages changed too
 };
 
 // The contiguous image of modes 0 and 1: entries live in one shadow array, PT pages at rootPhys + their logical offset. runtime.cpp's ptEntry/ptPhys use
 // exactly these, so the differential test covers them too.
+//
+// Its layout, 4 GiB of VA from kVaStart: the root at 0, the PDB1 page at 0x1000 (four entries, one a GiB), the first GiB's PDB0 page at 0x2000 and its
+// 512 PT pages from 0x3000 (as when the image held only that GiB), then the other three GiBs' PDB0 pages from 0x203000 and their PT pages from 0x206000.
+// With 1 GiB, the paravirtual host's mappings, shadows and the displays' frames pushed each other out.
+constexpr uint64_t kDenseGiBs = 4;
+constexpr uint64_t kDenseVaBytes = kDenseGiBs << 30;
+constexpr uint64_t kDenseUpperPdb0 = 0x203000, kDenseUpperPt = kDenseUpperPdb0 + (kDenseGiBs - 1) * 0x1000;
+constexpr uint64_t kDenseTableBytes = kDenseUpperPt + (kDenseGiBs - 1) * 512 * 0x1000;
+// GiB `gib`'s PDB0 page; the PT page of `va`; `va`'s PDE (in its PDB0 page) and PTE (in its PT page). `va` within the image.
+constexpr uint64_t densePdb0(uint64_t gib) { return gib ? kDenseUpperPdb0 + (gib - 1) * 0x1000 : 0x2000; }
+constexpr uint64_t densePt(uint64_t va) {
+	return (va - GpuVm::kVaStart) >> 30 ? kDenseUpperPt + (((va - GpuVm::kVaStart) >> 21) - 512) * 0x1000 : 0x3000 + ((va - GpuVm::kVaStart) >> 21) * 0x1000;
+}
+constexpr uint64_t densePde(uint64_t va) { return densePdb0((va - GpuVm::kVaStart) >> 30) + ((va >> 21) & 511) * 8; }
+constexpr uint64_t densePte(uint64_t va) { return densePt(va) + ((va >> 12) & 511) * 8; }
+// The VA an image of `tableBytes` covers: all 4 GiB with kDenseTableBytes, else the first GiB (a 4 MiB image, as it was).
+constexpr uint64_t denseVa(uint64_t tableBytes) { return tableBytes >= kDenseTableBytes ? kDenseVaBytes : 1ull << 30; }
+// The root's PDB1 entry and the PDB1 page's entries for the image, in a zeroed shadow whose root is at `rootPhys`.
+void denseRoot(uint64_t *shadow, uint64_t rootPhys);
 inline uint64_t *legacyEntry(uint64_t *shadow, uint64_t off) { return shadow ? shadow + off / sizeof(uint64_t) : nullptr; }
 inline uint64_t legacyPhys(uint64_t rootPhys, uint64_t off) { return rootPhys + off; }
 

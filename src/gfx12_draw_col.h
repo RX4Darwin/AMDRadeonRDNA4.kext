@@ -36,8 +36,8 @@ static const uint32_t kColStream[492] = {
 	// PHASE 0: CONTEXT_CONTROL (no load/shadow), initial cache invalidation
 	/* CONTEXT_CONTROL: UPDATE_LOAD_ENABLES=1 (nothing loaded), UPDATE_SHADOW_ENABLES=1 (nothing shadowed) */
 	0xc0012800, 0x80000000, 0x80000000,
-	/* ACQUIRE_MEM (engine=PFP, full range): GCR_CNTL=0xC181 = GLI_INV|GLK_INV|GLV_INV|GL2_INV|GL2_WB */
-	0xc0065800, 0x00000000, 0xffffffff, 0x00ffffff, 0x00000000, 0x00000000, 0x0000000a, 0x0000c181,
+	/* ACQUIRE_MEM (engine=PFP, full range): GCR_CNTL=0xC3B1 = GLI_INV|GLM_WB|GLM_INV|GLK_INV|GLV_INV|GL1_INV|GL2_INV|GL2_WB */
+	0xc0065800, 0x00000000, 0xffffffff, 0x00ffffff, 0x00000000, 0x00000000, 0x0000000a, 0x0000c3b1,
 	// PHASE 1: gfx12 graphics preamble (ac_cmdbuf.c:629-845 + si_state.c:5079-5101)
 	/* SET_SH_REG SPI_SHADER_PGM_RSRC3_PS */
 	0xc0017600, 0x00000006, 0x0000ffff,

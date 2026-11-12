@@ -31,6 +31,10 @@ public:
 	// Granule-aligned offset of a new allocation of at least `bytes` (> 0).
 	bool alloc(uint64_t bytes, uint64_t &offset);
 
+	// Allocate exactly [offset, offset + bytes) (granule-aligned offset, bytes > 0); false if any of it is taken
+	// or outside the heap. For memory that must stay out of a heap made anew.
+	bool take(uint64_t offset, uint64_t bytes);
+
 	// Release the allocation starting at `offset`; false if none does.
 	bool free(uint64_t offset);
 

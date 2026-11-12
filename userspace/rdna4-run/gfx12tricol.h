@@ -26,8 +26,8 @@
 #define RDNA4_TRICOL(x) x
 #endif
 
-#define RDNA4_TRICOL_CODE_BYTES   0x2000u
-#define RDNA4_TRICOL_PS_OFFSET    0x1000u
+#define RDNA4_TRICOL_CODE_BYTES   0x40000u   /* as gfx12tri.h: 128 KiB a shader */
+#define RDNA4_TRICOL_PS_OFFSET    0x20000u
 #define RDNA4_TRICOL_SHADER_PAD   0x100u     /* dwords per shader slot, s_code_end after the code */
 #define RDNA4_TRICOL_TARGET_BYTES (256u * 256u * 4u)
 #define RDNA4_TRICOL_RING_ALIGN   0x200000u

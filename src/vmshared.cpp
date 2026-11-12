@@ -17,10 +17,11 @@
 //  fences stay in order. Default off; the per-client-HQD path is untouched when off.
 //
 #include "compute.hpp"
+#include "klog.hpp"
 
 #include <IOKit/IOLib.h>
 
-#define SLOG(fmt, ...) IOLog("AMDRadeonRDNA4: vmshared: " fmt "\n", ## __VA_ARGS__)
+#define SLOG(fmt, ...) rdna4Log("AMDRadeonRDNA4: vmshared: " fmt "\n", ## __VA_ARGS__)
 
 using namespace GfxReg;
 
