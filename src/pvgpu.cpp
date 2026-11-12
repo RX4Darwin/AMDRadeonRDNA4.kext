@@ -378,6 +378,7 @@ public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
 	uint32_t runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
 	uint32_t clearAttachment(uint32_t task, const uint8_t *p);
+	uint32_t viewParent(uint32_t task, uint32_t id);
 	struct Bindings { uint32_t buffer[RDNA4_MTLC_MAX_BUFFERS]; uint64_t offset[RDNA4_MTLC_MAX_BUFFERS]; uint32_t texture[16], sampler[16]; };   // by Metal index (0 = none)
 	// A draw: Metal's primitive type, first vertex, vertices (indices), instances, base instance, and for an indexed draw the index buffer's
 	// resource id, offset and index size (bytes; 0: not indexed).
@@ -2422,10 +2423,11 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		t->host->runBlit(t->task, id, payload, bytes);
 	else if (id == 0x01a) {
 		t->target = t->host->runRenderPass(t->task, payload, bytes);
-		for (uint32_t k = 0; k < 8; k++)   // {u32 texture, ...} 0x3c apart from 0x4c (logPassDescriptor)
-			if (0x4c + 0x3c * k + 4 <= bytes)
+		for (uint32_t k = 0; k < 8; k++)   // {u32 texture, ...} 0x3c apart from 0x4c (logPassDescriptor); a plain view's own texture
+			if (0x4c + 0x3c * k + 4 <= bytes) {
 				memcpy(&t->attachments[k], payload + 0x4c + 0x3c * k, 4);
-			else
+				t->attachments[k] = t->host->viewParent(t->task, t->attachments[k]);
+			} else
 				t->attachments[k] = 0;
 		t->viewportSet = false;
 		t->scissorSet = false;
@@ -2897,13 +2899,50 @@ static void logPassDescriptor(const uint8_t *p, uint32_t bytes)
 		pvlog("host: render: pass descriptor%s", line);
 }
 
-// One colour attachment of a pass (p: the descriptor, offset by 0x3c per attachment): its load action carried out. Its texture.
+// A render target that is a plain view of another texture (a heap type 8 or 27 record of kind 8, textureSource: level 0, slice 0, no
+// swizzle, the format its texture has): that texture, which the draws and clears then write; else the target itself. AppleMetalOpenGLRenderer
+// draws into a BGRA8 view of its drawable's IOSurface (Mixxx's waveforms, 2026-11-12).
+uint32_t RDNA4PvHost::viewParent(uint32_t task, uint32_t id) {
+	uint32_t rec[3], v[11] = {}, prec[3], d[14] = {};
+
+	if (!id || !readRec(task, id, rec) || ((rec[0] & 0xff) != 8 && (rec[0] & 0xff) != 27) || (rec[0] >> 8) < sizeof(v) ||
+	    !readDesc(task, rec, v, sizeof(v)) || v[0] != 8 || v[5] || v[6] || v[9] || v[10] || !v[3] || v[3] == id || !readRec(task, v[3], prec))
+		return id;
+
+	const uint32_t parent = v[3], format = v[4] & 0xffff;
+	uint32_t parentFormat = 0;
+
+	if ((prec[0] & 0xff) == 5 && (prec[0] >> 8) >= sizeof(d) && readDesc(task, prec, d, sizeof(d)))
+		parentFormat = d[5] >> 16;
+	else if ((prec[0] & 0xff) == 2 || (prec[0] & 0xff) == 3) {
+		uint64_t va = 0, len = 0;
+		uint32_t bpr = 0, w = 0, h = 0;
+
+		(void)textureRange(task, parent, &va, &len, &bpr, &w, &h, &parentFormat);
+	}
+
+	// the same bytes: the format itself, or BGRA8 over its sRGB form (80, 81)
+	const bool same = format && (format == parentFormat || (format == 80 && parentFormat == 81) || (format == 81 && parentFormat == 80));
+
+	if (!same && gTalk) {
+		static uint32_t lines;
+
+		if (lines++ < 8)
+			pvlog("host: render: target %u, a view of %u (format %u): its texture is of type %u, %u bytes, format %u: not drawn into", id, parent,
+			      format, prec[0] & 0xff, prec[0] >> 8, parentFormat);
+	}
+	return same ? parent : id;
+}
+
+// One colour attachment of a pass (p: the descriptor, offset by 0x3c per attachment): its load action carried out. Its texture (a plain
+// view's own: viewParent).
 uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 	if (!gCompute)
 		return 0;
 	uint32_t tex, actions;
 	uint64_t rgba[4];   // the clear colour as IEEE-754 doubles, converted with integers only (no floating point in the kernel)
 	memcpy(&tex, p + 0x4c, 4);
+	tex = viewParent(task, tex);
 	memcpy(&actions, p + 0x60, 4);
 	memcpy(rgba, p + 0x68, sizeof(rgba));
 
@@ -5197,10 +5236,30 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		if (!head || head[1] != k || head[2] > room || head[2] + 32 > shader[k]->gfxLen) {
 			why = k == 1 ? "no translated vertex shader" : "no translated fragment shader";
 
-			if (mShaderLines++ < 32)
-				pvstat("host: render: task %u pipeline %u's %s function \"%s\" (named %u, hash %02x%02x%02x%02x): %s", task, pipeline, k == 1 ? "vertex" : "fragment",
-				       name[k], pi.named[k], pi.hash[k][0], pi.hash[k][1], pi.hash[k][2], pi.hash[k][3],
+			if (mShaderLines++ < 32 || gTalk)   // also while every draw is logged (debug.rdna4_pvtalk): the boot's 32 go early
+			{
+				uint64_t fd[8] = {};
+				uint32_t fbytes = 0;
+				const uint32_t ftype = pi.named[k] ? 6 : resourceType(task, fn[k], fd, &fbytes);   // unnamed: what its resource is
+				// and the resource its third dword names (Op.newFunctionWithIR's: {u64 ?, u32 resource, {0xf, 0x14, id}}, 2026-11-12)
+				uint64_t od[8] = {};
+				uint32_t obytes = 0, magic = 0;
+				const uint32_t other = static_cast<uint32_t>(fd[1]);
+				const uint32_t otype = !pi.named[k] && other ? resourceType(task, other, od, &obytes) : 0;
+
+				if (otype)
+					(void)readGuest(task, od[0], reinterpret_cast<uint8_t *>(&magic), 4);
+				if (!pi.named[k])
+					pvstat("host: render:   its resource's dword 2 names resource %u: type %u, %u bytes: %016llx %016llx %016llx %016llx; at its "
+					       "first quadword's address: %08x", other, otype, obytes, static_cast<unsigned long long>(od[0]),
+					       static_cast<unsigned long long>(od[1]), static_cast<unsigned long long>(od[2]), static_cast<unsigned long long>(od[3]), magic);
+
+				pvstat("host: render: task %u pipeline %u's %s function \"%s\" (named %u, hash %02x%02x%02x%02x; resource %u of type %u, %u bytes: "
+				       "%016llx %016llx %016llx %016llx): %s", task, pipeline, k == 1 ? "vertex" : "fragment", name[k], pi.named[k], pi.hash[k][0],
+				       pi.hash[k][1], pi.hash[k][2], pi.hash[k][3], fn[k], ftype, fbytes, static_cast<unsigned long long>(fd[0]),
+				       static_cast<unsigned long long>(fd[1]), static_cast<unsigned long long>(fd[2]), static_cast<unsigned long long>(fd[3]),
 				       !shader[k] ? "no translation" : !head ? "a kernel, not a shader" : "its RGFX header does not fit");
+			}
 		}
 	}
 	// The values between the stages: after each shader's code its table {u32 name hash, u32 flags (bit 0 flat)}, the vertex function's
@@ -5291,7 +5350,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		if (!resourceType(task, target))
 			logFreedTexture(task, target);
 
-		if (refusedTargets++ < 8) {
+		if (refusedTargets++ < 8 || gTalk) {   // the same
 			Surface seen;   // its own: surfaceRange retains what it finds, and `surface` may hold one already
 
 			pvlog("host: render: colour attachment %u (resource type %u, IOSurface format %u): format %u, %ux%u, %u bytes per row, %llu bytes: "
