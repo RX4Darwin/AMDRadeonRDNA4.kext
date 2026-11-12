@@ -3,7 +3,7 @@
  * Pure arithmetic, so it is checked on any host (test/test-gfx12tri.c).
  *
  * The app allocates five device buffers with rdna4_alloc (GPU VAs are 64 KiB aligned, which is all the stream needs except for the rings):
- *   code    RDNA4_TRI_CODE_BYTES   (VS at +0, PS at +0x1000; 256-byte aligned)
+ *   code    RDNA4_TRI_CODE_BYTES   (VS at +0, PS at +RDNA4_TRI_PS_OFFSET; 256-byte aligned)
  *   target  RDNA4_TRI_TARGET_BYTES (256x256 RGBA8, zeroed by the app)
  *   rings   kRingBytes + RDNA4_TRIRUN_RING_SLACK, and the stream's ring block starts at the next 2 MiB boundary inside it
  *           (the GE ring bases are in 64 KiB units and Mesa aligns the block to 2 MiB: gfx12tri.h refuses anything else)

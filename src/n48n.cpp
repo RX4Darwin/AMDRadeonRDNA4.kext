@@ -550,7 +550,7 @@ uint32_t Client::call(uint32_t selector, const uint64_t *in, uint32_t nIn, const
 	case N48N_SEL_READREGS:
 		// GB_ADDR_CONFIG and its three neighbours, nothing else of the card.
 		if (nIn != 3 || !in || in[1] < 1 || in[1] > 16 || in[2] != 0xffffffffull || !shape(3, 0, 0, in[1] * 4) ||
-		    in[0] < 0x263e || in[0] + in[1] - 1 > 0x2641)
+		    in[0] < 0x263e || in[0] > 0x2641 || in[1] - 1 > 0x2641 - in[0])
 			return kBadArgument;
 		return be.readRegs(be.context, static_cast<uint32_t>(in[0]), static_cast<uint32_t>(in[1]),
 		                   static_cast<uint32_t *>(structOut)) ? kSuccess : kNotReady;

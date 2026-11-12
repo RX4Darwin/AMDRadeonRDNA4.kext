@@ -66,6 +66,8 @@ struct cfg {
 	int hpd;       /* 0-based HPD source */
 	bool dp;       /* the "dp" scenario: retime a DisplayPort stream that is already lit (sequence_dp) */
 	bool train;    /* the "dplink" scenario: light a DisplayPort stream on a dark pipe, training its link */
+	bool dual;     /* the "dpdual" scenario: an HDMI stream on a DisplayPort connector, through a passive DP++ adapter */
+	bool y420;     /* "y420": the HDMI stream in YCbCr 4:2:0, half the TMDS clock (amdgpu's force_yuv420_output) */
 	int sink_swing, sink_pre;     /* the drive the simulated sink asks for before it reports lock */
 	char sink_kind;               /* its capabilities: sink_reset() */
 	struct dc_crtc_timing t;      /* the new stream */
@@ -103,7 +105,7 @@ static void dml_stream(struct dml2_display_cfg *d, int i, const struct dc_crtc_t
 	s->timing.vblank_nom = t->v_total - h;
 	s->output.output_dp_lane_count = 4;
 	s->output.output_encoder = hdmi ? dml2_hdmi : dml2_dp;
-	s->output.output_format = dml2_444;
+	s->output.output_format = t->pixel_encoding == PIXEL_ENCODING_YCBCR420 ? dml2_420 : dml2_444;
 	s->output.output_dp_link_rate = dml2_dp_rate_na;
 	s->output.output_disabled = true;
 	s->overrides.odm_mode = dml2_odm_mode_auto;
@@ -305,7 +307,7 @@ static void make_state(const struct cfg *c)
 	eid.encoder.id = ENCODER_ID_INTERNAL_UNIPHY + c->link / 2;   /* UNIPHY, UNIPHY1, ...: two links each */
 	eid.encoder.enum_id = ENUM_ID_1 + (c->link & 1);
 	eid.connector.type = OBJECT_TYPE_CONNECTOR;
-	eid.connector.id = c->dp ? CONNECTOR_ID_DISPLAY_PORT : CONNECTOR_ID_HDMI_TYPE_A;
+	eid.connector.id = c->dp || c->dual ? CONNECTOR_ID_DISPLAY_PORT : CONNECTOR_ID_HDMI_TYPE_A;
 	eid.connector.enum_id = ENUM_ID_1;
 	eid.ctx = &g_ctx;
 
@@ -313,7 +315,9 @@ static void make_state(const struct cfg *c)
 	dc->link_srv = &g_link_srv;
 	dc->links[0] = link; dc->link_count = 1;
 	const enum signal_type signal = c->dp ? SIGNAL_TYPE_DISPLAY_PORT : SIGNAL_TYPE_HDMI_TYPE_A;
-	link->dc = dc; link->ctx = &g_ctx; link->connector_signal = signal;
+	/* Behind a DP++ adapter the connector stays DisplayPort and the stream and sink are HDMI, as detection leaves a
+	 * link with a DP-HDMI dongle. */
+	link->dc = dc; link->ctx = &g_ctx; link->connector_signal = c->dual ? SIGNAL_TYPE_DISPLAY_PORT : signal;
 	if (c->train) {         /* a link to train: the sink of sink_reset(), as detection would have read it */
 		struct dc_link_settings want = { LANE_COUNT_FOUR, LINK_RATE_HIGH2, LINK_SPREAD_DISABLED };
 		const char *other = getenv("PIPEGEN_DP_LINK");          /* "lanes rate", rate as LINK_BW_SET has it */
@@ -346,12 +350,12 @@ static void make_state(const struct cfg *c)
 
 	stream->ctx = &g_ctx; stream->link = link; stream->sink = sink; stream->signal = signal;
 	stream->timing = c->t;
-	stream->phy_pix_clk = c->t.pix_clk_100hz / 10;
+	stream->phy_pix_clk = c->t.pix_clk_100hz / 10 / (c->y420 ? 2 : 1);
 	stream->src = (struct rect){ 0, 0, w, h }; stream->dst = stream->src;
-	stream->output_color_space = COLOR_SPACE_SRGB;
+	stream->output_color_space = c->y420 ? COLOR_SPACE_YCBCR709 : COLOR_SPACE_SRGB;
 	stream->qs_bit = 1;                      /* send "full range" in the AVI infoframe: a desktop */
 	stream->content_type = DISPLAY_CONTENT_TYPE_GRAPHICS;
-	stream->clamping.c_depth = COLOR_DEPTH_888; stream->clamping.pixel_encoding = PIXEL_ENCODING_RGB;
+	stream->clamping.c_depth = COLOR_DEPTH_888; stream->clamping.pixel_encoding = c->t.pixel_encoding;
 	stream->clamping.clamping_level = CLAMPING_FULL_RANGE;
 	stream->out_transfer_func.type = TF_TYPE_BYPASS;
 	stream->test_pattern.type = DP_TEST_PATTERN_VIDEO_MODE;
@@ -390,16 +394,19 @@ static void make_state(const struct cfg *c)
 	if (c->train)           /* a DisplayPort stream's pixel clock is the DTO, as resource assignment has it */
 		pipe->clock_source = g_pool.dp_clock_source =
 			dcn401_clock_source_create(&g_ctx, &g_bios, CLOCK_SOURCE_ID_DP_DTO, &clk_src_regs[0], true);
-	pipe->stream_res.pix_clk_params.requested_pix_clk_100hz = c->t.pix_clk_100hz;
+	/* dce110_resource_build_pipe_hw_param: a 4:2:0 stream asks its PLL for half the pixel clock */
+	pipe->stream_res.pix_clk_params.requested_pix_clk_100hz = c->t.pix_clk_100hz / (c->y420 ? 2 : 1);
+	pipe->stream_res.pix_clk_params.flags.SUPPORT_YCBCR420 = c->y420;
 	pipe->stream_res.pix_clk_params.encoder_object_id = eid.encoder;
 	pipe->stream_res.pix_clk_params.signal_type = signal;
 	pipe->stream_res.pix_clk_params.controller_id = CONTROLLER_ID_D0 + c->pipe;
 	pipe->stream_res.pix_clk_params.color_depth = COLOR_DEPTH_888;
-	pipe->stream_res.pix_clk_params.pixel_encoding = PIXEL_ENCODING_RGB;
-	pipe->stream_res.pix_clk_params.dio_se_pix_per_cycle = 1;
-	pipe->pll_settings.actual_pix_clk_100hz = c->t.pix_clk_100hz;
-	pipe->pll_settings.adjusted_pix_clk_100hz = c->t.pix_clk_100hz;
-	pipe->pll_settings.calculated_pix_clk_100hz = c->t.pix_clk_100hz;
+	pipe->stream_res.pix_clk_params.pixel_encoding = c->t.pixel_encoding;
+	/* dcn401_build_pipe_pix_clk_params: a 4:2:0 TMDS stream enters the DIG two pixels a cycle */
+	pipe->stream_res.pix_clk_params.dio_se_pix_per_cycle = c->y420 ? 2 : 1;
+	pipe->pll_settings.actual_pix_clk_100hz = pipe->stream_res.pix_clk_params.requested_pix_clk_100hz;
+	pipe->pll_settings.adjusted_pix_clk_100hz = pipe->stream_res.pix_clk_params.requested_pix_clk_100hz;
+	pipe->pll_settings.calculated_pix_clk_100hz = pipe->stream_res.pix_clk_params.requested_pix_clk_100hz;
 
 	pipe->global_sync = g_prog->stream_programming[1].global_sync;
 	pipe->hubp_regs = *pp->pipe_regs[0];
@@ -426,9 +433,11 @@ static void sequence(const struct cfg *c)
 	struct pipe_ctx *pipe = g_pipe;
 	struct hubp *hubp = pipe->plane_res.hubp;
 
-	/* Linux skips the TMDS divider write when the register already holds /4. Take the write path: it is
-	 * the same end state either way. */
-	rec_poke_field(dccg_regs.OTG_PIXEL_RATE_DIV, OTG_PIXEL_RATE_DIV__OTG0_TMDS_PIXEL_RATE_DIV_MASK << (c->pipe * 5), 0);
+	/* Linux skips the TMDS divider write when the register already holds the divider it wants: /4 for RGB,
+	 * /2 (field 0) for 4:2:0. Take the write path: the pipe may last have run the other one (a 4:2:0 Dell
+	 * ran at 30 Hz on a divider RGB had left, card, 2026-11-04). */
+	rec_poke_field(dccg_regs.OTG_PIXEL_RATE_DIV, OTG_PIXEL_RATE_DIV__OTG0_TMDS_PIXEL_RATE_DIV_MASK << (c->pipe * 5),
+		       c->y420 ? OTG_PIXEL_RATE_DIV__OTG0_TMDS_PIXEL_RATE_DIV_MASK << (c->pipe * 5) : 0);
 
 	{	/* Status the code reads back. Each is settled to the state the block is in once the step before it
 		 * has taken effect; the plan waits for that state where Linux polls for it. */
@@ -621,6 +630,8 @@ int main(int argc, char **argv)
 	bool verbose;
 
 	if (argc > 1 && !strcmp(argv[1], "dp")) { c.dp = true; argv++; argc--; }
+	else if (argc > 1 && !strcmp(argv[1], "dpdual")) { c.dual = true; argv++; argc--; }
+	if (argc > 1 && !strcmp(argv[1], "y420")) { c.y420 = true; argv++; argc--; }
 	if (argc > 4 && !strcmp(argv[1], "dplink")) {
 		c.dp = c.train = g_link_detail = true;
 		c.sink_kind = argv[2][0]; c.sink_swing = atoi(argv[3]); c.sink_pre = atoi(argv[4]);
@@ -632,9 +643,11 @@ int main(int argc, char **argv)
 	}
 	verbose = argc > 17;
 	if (argc < 17) {
-		fprintf(stderr, "usage: pipegen [dp | dplink K S P] [on W H] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync "
+		fprintf(stderr, "usage: pipegen [dp | dpdual | dplink K S P] [on W H] pipe dig link hpd  hactive hfront hsync hback  vactive vfront vsync "
 				"vback  khz hpositive vpositive vic [verbose]\n  hpd counts from 1, as the VBIOS path records do\n"
 				"  dp: the reference for retiming a lit DisplayPort stream instead of the second-pipe plan\n"
+				"  dpdual: an HDMI stream on a DisplayPort connector (a passive DP++ adapter)\n"
+				"  y420: (after dpdual, or alone for HDMI) the HDMI stream in YCbCr 4:2:0\n"
 				"  dplink K S P: light a DisplayPort stream, training its link against a simulated sink of kind\n"
 				"                K (a, b, c) that wants voltage swing S and pre-emphasis P\n"
 				"  on W H: the plane shows the top-left of a W x H surface, as after a mode switch\n");
@@ -648,7 +661,8 @@ int main(int argc, char **argv)
 	c.t.flags.HSYNC_POSITIVE_POLARITY = v[13] != 0; c.t.flags.VSYNC_POSITIVE_POLARITY = v[14] != 0;
 	c.t.vic = v[15];
 	c.t.aspect_ratio = v[4] * 9 == v[8] * 16 ? ASPECT_RATIO_16_9 : v[4] * 3 == v[8] * 4 ? ASPECT_RATIO_4_3 : ASPECT_RATIO_NO_DATA;
-	c.t.pixel_encoding = PIXEL_ENCODING_RGB; c.t.display_color_depth = COLOR_DEPTH_888;
+	c.t.pixel_encoding = c.y420 ? PIXEL_ENCODING_YCBCR420 : PIXEL_ENCODING_RGB;
+	c.t.display_color_depth = COLOR_DEPTH_888;
 	if (c.pipe < (c.dp ? 0 : 1) || c.pipe > 3 || c.dig > 3 || c.link > 3 || c.hpd > 5 || !v[12]) { fprintf(stderr, "bad configuration\n"); return 2; }
 
 	/* The display the firmware lit: the 3840x2160@60 CVT-RB raster the GOP uses on a 4K sink, the heaviest
@@ -666,9 +680,9 @@ int main(int argc, char **argv)
 		if (c.dp && !c.train) sequence_dp(&c); else sequence(&c);
 		if (run == 0) { memcpy(run0, evs, sizeof(struct ev) * nev); n0 = nev; }
 	}
-	printf("CONFIG %d %d %d %d  %u %u %u %u  %u %u %u %u  %u %d %d  %d %u\n", c.pipe, c.dig, c.link, c.hpd + 1,
+	printf("CONFIG %d %d %d %d  %u %u %u %u  %u %u %u %u  %u %d %d  %d %u  %d\n", c.pipe, c.dig, c.link, c.hpd + 1,
 	       v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13] != 0, v[14] != 0,
-	       c.vstartup, g_prog->plane_programming[1].pipe_regs[0]->det_size);
+	       c.vstartup, g_prog->plane_programming[1].pipe_regs[0]->det_size, c.y420);
 	emit();
 	return 0;
 }

@@ -53,6 +53,29 @@ bool Heap::alloc(uint64_t bytes, uint64_t &offset) {
 	return false;
 }
 
+bool Heap::take(uint64_t offset, uint64_t bytes) {
+	uint32_t first;
+
+	if (!bytes || !granuleOf(offset, first))
+		return false;
+
+	const uint64_t need = (bytes + gran - 1) / gran;
+
+	if (need > count - first)
+		return false;
+
+	for (uint32_t g = first; g < first + need; g++)
+		if (map[g] != Free)
+			return false;
+
+	map[first] = Head;
+	for (uint32_t g = first + 1; g < first + need; g++)
+		map[g] = Body;
+	freeCount -= static_cast<uint32_t>(need);
+
+	return true;
+}
+
 bool Heap::free(uint64_t offset) {
 	uint32_t g;
 	if (!granuleOf(offset, g) || map[g] != Head)

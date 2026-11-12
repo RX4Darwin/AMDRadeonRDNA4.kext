@@ -9,6 +9,7 @@
 //
 
 #include "userclient.hpp"
+#include "klog.hpp"
 #include "compute.hpp"
 
 #include <IOKit/IOLib.h>
@@ -26,7 +27,7 @@ IOReturn RDNA4ComputeService::setPowerState(unsigned long powerStateOrdinal,
                                              IOService *) {
 	uint64_t nowNs = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time(), &nowNs);
-	IOLog("AMDRadeonRDNA4: power: setPowerState ordinal %lu at %llu ns\n",
+	rdna4Log("AMDRadeonRDNA4: power: setPowerState ordinal %lu at %llu ns\n",
 	      powerStateOrdinal, nowNs);
 	if (!compute)
 		return kIOPMAckImplied;
@@ -52,8 +53,16 @@ bool RDNA4ComputeClient::initWithTask(task_t owningTask, void *securityToken, UI
 		return false;
 	if (clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
 		return false;
+	gate = IOLockAlloc();
 	task = owningTask;
-	return true;
+
+	return gate != nullptr;
+}
+
+void RDNA4ComputeClient::free() {
+	if (gate)
+		IOLockFree(gate);
+	IOUserClient::free();
 }
 
 bool RDNA4ComputeClient::start(IOService *provider) {
@@ -65,18 +74,33 @@ bool RDNA4ComputeClient::start(IOService *provider) {
 	return compute->rtOpen(this) == kIOReturnSuccess;
 }
 
-IOReturn RDNA4ComputeClient::clientClose() {
+// Once, after the calls in flight: they use the client's buffers, and compute stays set for them.
+void RDNA4ComputeClient::release() {
+	IOLockLock(gate);
+	if (closed) {
+		IOLockUnlock(gate);
+		return;
+	}
+
+	closed = true;
+	while (calls)
+		IOLockSleep(gate, &calls, THREAD_UNINT);
+	IOLockUnlock(gate);
+
 	if (compute)
 		compute->rtRelease(this);
-	compute = nullptr;
+}
+
+IOReturn RDNA4ComputeClient::clientClose() {
+	release();
 	terminate();
+
 	return kIOReturnSuccess;
 }
 
 IOReturn RDNA4ComputeClient::clientDied() {
-	if (compute)
-		compute->rtRelease(this);
-	compute = nullptr;
+	release();
+
 	return IOUserClient::clientDied();
 }
 
@@ -111,9 +135,25 @@ IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodA
                                             IOExternalMethodDispatch *, OSObject *, void *) {
 	if (selector >= kRDNA4MethodCount || !compute)
 		return kIOReturnUnsupported;
-	return IOUserClient::externalMethod(selector, args,
-	                                    const_cast<IOExternalMethodDispatch *>(&kMethods[selector]),
-	                                    this, nullptr);
+
+	IOLockLock(gate);
+	if (closed) {
+		IOLockUnlock(gate);
+		return kIOReturnNotOpen;
+	}
+	calls++;
+	IOLockUnlock(gate);
+
+	const IOReturn r = IOUserClient::externalMethod(selector, args,
+	                                                const_cast<IOExternalMethodDispatch *>(&kMethods[selector]),
+	                                                this, nullptr);
+
+	IOLockLock(gate);
+	if (!--calls && closed)
+		IOLockWakeup(gate, &calls, false);
+	IOLockUnlock(gate);
+
+	return r;
 }
 
 static RDNA4ComputeClient *self(OSObject *t) { return static_cast<RDNA4ComputeClient *>(t); }

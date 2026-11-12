@@ -60,6 +60,135 @@ namespace Hpd1 {
 namespace Hpd2 {
 #include "pipe2_linux_dp2.inc"
 }
+// ... and those again for an HDMI monitor behind a passive DP++ adapter: the
+// connector is DisplayPort, the stream HDMI.
+namespace Hpd1Tmds {
+#include "pipe2_linux_dp1_tmds.inc"
+}
+namespace Hpd2Tmds {
+#include "pipe2_linux_dp2_tmds.inc"
+}
+// ... and all six again for pipe 2, the third display.
+namespace P2Hpd3 {
+#include "pipe2_linux_p2_hpd3.inc"
+}
+namespace P2Hpd4 {
+#include "pipe2_linux_p2_hpd4.inc"
+}
+namespace P2Hpd1 {
+#include "pipe2_linux_p2_dp1.inc"
+}
+namespace P2Hpd2 {
+#include "pipe2_linux_p2_dp2.inc"
+}
+namespace P2Hpd1Tmds {
+#include "pipe2_linux_p2_dp1_tmds.inc"
+}
+namespace P2Hpd2Tmds {
+#include "pipe2_linux_p2_dp2_tmds.inc"
+}
+// ... and all six again for pipe 3, the fourth display.
+namespace P3Hpd3 {
+#include "pipe2_linux_p3_hpd3.inc"
+}
+namespace P3Hpd4 {
+#include "pipe2_linux_p3_hpd4.inc"
+}
+namespace P3Hpd1 {
+#include "pipe2_linux_p3_dp1.inc"
+}
+namespace P3Hpd2 {
+#include "pipe2_linux_p3_dp2.inc"
+}
+namespace P3Hpd1Tmds {
+#include "pipe2_linux_p3_dp1_tmds.inc"
+}
+namespace P3Hpd2Tmds {
+#include "pipe2_linux_p3_dp2_tmds.inc"
+}
+
+// The HDMI connectors lit at 3840x2160@60, for each pipe.
+namespace P1Hpd3Uhd {
+#include "pipe2_linux_p1_hpd3_uhd.inc"
+}
+namespace P1Hpd4Uhd {
+#include "pipe2_linux_p1_hpd4_uhd.inc"
+}
+namespace P2Hpd3Uhd {
+#include "pipe2_linux_p2_hpd3_uhd.inc"
+}
+namespace P2Hpd4Uhd {
+#include "pipe2_linux_p2_hpd4_uhd.inc"
+}
+namespace P3Hpd3Uhd {
+#include "pipe2_linux_p3_hpd3_uhd.inc"
+}
+namespace P3Hpd4Uhd {
+#include "pipe2_linux_p3_hpd4_uhd.inc"
+}
+
+// The DisplayPort connectors lit at 3840x2160@60 for an HDMI sink behind a
+// passive DP++ adapter, for each pipe.
+namespace P1Hpd1TmdsUhd {
+#include "pipe2_linux_p1_dp1_tmds_uhd.inc"
+}
+namespace P1Hpd2TmdsUhd {
+#include "pipe2_linux_p1_dp2_tmds_uhd.inc"
+}
+namespace P2Hpd1TmdsUhd {
+#include "pipe2_linux_p2_dp1_tmds_uhd.inc"
+}
+namespace P2Hpd2TmdsUhd {
+#include "pipe2_linux_p2_dp2_tmds_uhd.inc"
+}
+namespace P3Hpd1TmdsUhd {
+#include "pipe2_linux_p3_dp1_tmds_uhd.inc"
+}
+namespace P3Hpd2TmdsUhd {
+#include "pipe2_linux_p3_dp2_tmds_uhd.inc"
+}
+
+// The DisplayPort connectors lit at 3840x2160@60 in YCbCr 4:2:0 for an HDMI
+// sink behind a passive DP++ adapter that carries no more than 300 MHz.
+namespace P1Hpd1TmdsY420 {
+#include "pipe2_linux_p1_dp1_tmds_y420.inc"
+}
+namespace P1Hpd2TmdsY420 {
+#include "pipe2_linux_p1_dp2_tmds_y420.inc"
+}
+namespace P2Hpd1TmdsY420 {
+#include "pipe2_linux_p2_dp1_tmds_y420.inc"
+}
+namespace P2Hpd2TmdsY420 {
+#include "pipe2_linux_p2_dp2_tmds_y420.inc"
+}
+namespace P3Hpd1TmdsY420 {
+#include "pipe2_linux_p3_dp1_tmds_y420.inc"
+}
+namespace P3Hpd2TmdsY420 {
+#include "pipe2_linux_p3_dp2_tmds_y420.inc"
+}
+
+// The DisplayPort connectors lit at 3840x2160@60 (CVT reduced blanking) for a
+// DisplayPort sink, for each pipe.
+namespace P1Hpd1Uhd {
+#include "pipe2_linux_p1_dp1_uhd.inc"
+}
+namespace P1Hpd2Uhd {
+#include "pipe2_linux_p1_dp2_uhd.inc"
+}
+namespace P2Hpd1Uhd {
+#include "pipe2_linux_p2_dp1_uhd.inc"
+}
+namespace P2Hpd2Uhd {
+#include "pipe2_linux_p2_dp2_uhd.inc"
+}
+namespace P3Hpd1Uhd {
+#include "pipe2_linux_p3_dp1_uhd.inc"
+}
+namespace P3Hpd2Uhd {
+#include "pipe2_linux_p3_dp2_uhd.inc"
+}
 
 struct Table {
 	const Config               &config;
@@ -72,6 +201,8 @@ struct Table {
 	const uint32_t             *values;     // ... one row of nregs values per mode
 	const AuxWrite             *aux;        // DisplayPort: what 'a' entries write
 	size_t                      naux;
+	const EncodingReg          *enc;        // 4:2:0: what differs in RGB
+	size_t                      nenc;
 };
 
 template <size_t G, size_t R, size_t M>
@@ -79,7 +210,15 @@ constexpr Table table(const Config &config, const Gen (&gen)[G], const ModeReg (
                       const Edid::DetailedTiming (&timings)[M], const uint32_t (&values)[M][R],
                       const AuxWrite *aux = nullptr, size_t naux = 0) {
 	static_assert(R <= kMaxModeSteps, "the mode table");
-	return { config, gen, G, regs, R, timings, M, &values[0][0], aux, naux };
+	return { config, gen, G, regs, R, timings, M, &values[0][0], aux, naux, nullptr, 0 };
+}
+
+template <size_t G, size_t R, size_t M, size_t E>
+constexpr Table table(const Config &config, const Gen (&gen)[G], const ModeReg (&regs)[R],
+                      const Edid::DetailedTiming (&timings)[M], const uint32_t (&values)[M][R],
+                      const EncodingReg (&enc)[E]) {
+	static_assert(R + E <= kMaxModeSteps, "the mode table");
+	return { config, gen, G, regs, R, timings, M, &values[0][0], nullptr, 0, enc, E };
 }
 template <size_t N> constexpr size_t countOf(const AuxWrite (&)[N]) { return N; }
 
@@ -90,27 +229,102 @@ constexpr Table kTables[] = {
 	      countOf(Hpd1::kAux)),
 	table(Hpd2::kConfig, Hpd2::kGen, Hpd2::kModeRegs, Hpd2::kModeTimings, Hpd2::kModeValues, Hpd2::kAux,
 	      countOf(Hpd2::kAux)),
+	table(Hpd1Tmds::kConfig, Hpd1Tmds::kGen, Hpd1Tmds::kModeRegs, Hpd1Tmds::kModeTimings, Hpd1Tmds::kModeValues),
+	table(Hpd2Tmds::kConfig, Hpd2Tmds::kGen, Hpd2Tmds::kModeRegs, Hpd2Tmds::kModeTimings, Hpd2Tmds::kModeValues),
+	table(P2Hpd3::kConfig, P2Hpd3::kGen, P2Hpd3::kModeRegs, P2Hpd3::kModeTimings, P2Hpd3::kModeValues),
+	table(P2Hpd4::kConfig, P2Hpd4::kGen, P2Hpd4::kModeRegs, P2Hpd4::kModeTimings, P2Hpd4::kModeValues),
+	table(P2Hpd1::kConfig, P2Hpd1::kGen, P2Hpd1::kModeRegs, P2Hpd1::kModeTimings, P2Hpd1::kModeValues, P2Hpd1::kAux,
+	      countOf(P2Hpd1::kAux)),
+	table(P2Hpd2::kConfig, P2Hpd2::kGen, P2Hpd2::kModeRegs, P2Hpd2::kModeTimings, P2Hpd2::kModeValues, P2Hpd2::kAux,
+	      countOf(P2Hpd2::kAux)),
+	table(P2Hpd1Tmds::kConfig, P2Hpd1Tmds::kGen, P2Hpd1Tmds::kModeRegs, P2Hpd1Tmds::kModeTimings, P2Hpd1Tmds::kModeValues),
+	table(P2Hpd2Tmds::kConfig, P2Hpd2Tmds::kGen, P2Hpd2Tmds::kModeRegs, P2Hpd2Tmds::kModeTimings, P2Hpd2Tmds::kModeValues),
+	table(P3Hpd3::kConfig, P3Hpd3::kGen, P3Hpd3::kModeRegs, P3Hpd3::kModeTimings, P3Hpd3::kModeValues),
+	table(P3Hpd4::kConfig, P3Hpd4::kGen, P3Hpd4::kModeRegs, P3Hpd4::kModeTimings, P3Hpd4::kModeValues),
+	table(P3Hpd1::kConfig, P3Hpd1::kGen, P3Hpd1::kModeRegs, P3Hpd1::kModeTimings, P3Hpd1::kModeValues, P3Hpd1::kAux,
+	      countOf(P3Hpd1::kAux)),
+	table(P3Hpd2::kConfig, P3Hpd2::kGen, P3Hpd2::kModeRegs, P3Hpd2::kModeTimings, P3Hpd2::kModeValues, P3Hpd2::kAux,
+	      countOf(P3Hpd2::kAux)),
+	table(P3Hpd1Tmds::kConfig, P3Hpd1Tmds::kGen, P3Hpd1Tmds::kModeRegs, P3Hpd1Tmds::kModeTimings, P3Hpd1Tmds::kModeValues),
+	table(P3Hpd2Tmds::kConfig, P3Hpd2Tmds::kGen, P3Hpd2Tmds::kModeRegs, P3Hpd2Tmds::kModeTimings, P3Hpd2Tmds::kModeValues),
+	table(P1Hpd3Uhd::kConfig, P1Hpd3Uhd::kGen, P1Hpd3Uhd::kModeRegs, P1Hpd3Uhd::kModeTimings, P1Hpd3Uhd::kModeValues),
+	table(P1Hpd4Uhd::kConfig, P1Hpd4Uhd::kGen, P1Hpd4Uhd::kModeRegs, P1Hpd4Uhd::kModeTimings, P1Hpd4Uhd::kModeValues),
+	table(P2Hpd3Uhd::kConfig, P2Hpd3Uhd::kGen, P2Hpd3Uhd::kModeRegs, P2Hpd3Uhd::kModeTimings, P2Hpd3Uhd::kModeValues),
+	table(P2Hpd4Uhd::kConfig, P2Hpd4Uhd::kGen, P2Hpd4Uhd::kModeRegs, P2Hpd4Uhd::kModeTimings, P2Hpd4Uhd::kModeValues),
+	table(P3Hpd3Uhd::kConfig, P3Hpd3Uhd::kGen, P3Hpd3Uhd::kModeRegs, P3Hpd3Uhd::kModeTimings, P3Hpd3Uhd::kModeValues),
+	table(P3Hpd4Uhd::kConfig, P3Hpd4Uhd::kGen, P3Hpd4Uhd::kModeRegs, P3Hpd4Uhd::kModeTimings, P3Hpd4Uhd::kModeValues),
+	table(P1Hpd1TmdsUhd::kConfig, P1Hpd1TmdsUhd::kGen, P1Hpd1TmdsUhd::kModeRegs, P1Hpd1TmdsUhd::kModeTimings, P1Hpd1TmdsUhd::kModeValues),
+	table(P1Hpd2TmdsUhd::kConfig, P1Hpd2TmdsUhd::kGen, P1Hpd2TmdsUhd::kModeRegs, P1Hpd2TmdsUhd::kModeTimings, P1Hpd2TmdsUhd::kModeValues),
+	table(P2Hpd1TmdsUhd::kConfig, P2Hpd1TmdsUhd::kGen, P2Hpd1TmdsUhd::kModeRegs, P2Hpd1TmdsUhd::kModeTimings, P2Hpd1TmdsUhd::kModeValues),
+	table(P2Hpd2TmdsUhd::kConfig, P2Hpd2TmdsUhd::kGen, P2Hpd2TmdsUhd::kModeRegs, P2Hpd2TmdsUhd::kModeTimings, P2Hpd2TmdsUhd::kModeValues),
+	table(P3Hpd1TmdsUhd::kConfig, P3Hpd1TmdsUhd::kGen, P3Hpd1TmdsUhd::kModeRegs, P3Hpd1TmdsUhd::kModeTimings, P3Hpd1TmdsUhd::kModeValues),
+	table(P3Hpd2TmdsUhd::kConfig, P3Hpd2TmdsUhd::kGen, P3Hpd2TmdsUhd::kModeRegs, P3Hpd2TmdsUhd::kModeTimings, P3Hpd2TmdsUhd::kModeValues),
+	table(P1Hpd1Uhd::kConfig, P1Hpd1Uhd::kGen, P1Hpd1Uhd::kModeRegs, P1Hpd1Uhd::kModeTimings, P1Hpd1Uhd::kModeValues, P1Hpd1Uhd::kAux,
+	      countOf(P1Hpd1Uhd::kAux)),
+	table(P1Hpd2Uhd::kConfig, P1Hpd2Uhd::kGen, P1Hpd2Uhd::kModeRegs, P1Hpd2Uhd::kModeTimings, P1Hpd2Uhd::kModeValues, P1Hpd2Uhd::kAux,
+	      countOf(P1Hpd2Uhd::kAux)),
+	table(P2Hpd1Uhd::kConfig, P2Hpd1Uhd::kGen, P2Hpd1Uhd::kModeRegs, P2Hpd1Uhd::kModeTimings, P2Hpd1Uhd::kModeValues, P2Hpd1Uhd::kAux,
+	      countOf(P2Hpd1Uhd::kAux)),
+	table(P2Hpd2Uhd::kConfig, P2Hpd2Uhd::kGen, P2Hpd2Uhd::kModeRegs, P2Hpd2Uhd::kModeTimings, P2Hpd2Uhd::kModeValues, P2Hpd2Uhd::kAux,
+	      countOf(P2Hpd2Uhd::kAux)),
+	table(P3Hpd1Uhd::kConfig, P3Hpd1Uhd::kGen, P3Hpd1Uhd::kModeRegs, P3Hpd1Uhd::kModeTimings, P3Hpd1Uhd::kModeValues, P3Hpd1Uhd::kAux,
+	      countOf(P3Hpd1Uhd::kAux)),
+	table(P3Hpd2Uhd::kConfig, P3Hpd2Uhd::kGen, P3Hpd2Uhd::kModeRegs, P3Hpd2Uhd::kModeTimings, P3Hpd2Uhd::kModeValues, P3Hpd2Uhd::kAux,
+	      countOf(P3Hpd2Uhd::kAux)),
+	table(P1Hpd1TmdsY420::kConfig, P1Hpd1TmdsY420::kGen, P1Hpd1TmdsY420::kModeRegs, P1Hpd1TmdsY420::kModeTimings, P1Hpd1TmdsY420::kModeValues, P1Hpd1TmdsY420::kEncoding),
+	table(P1Hpd2TmdsY420::kConfig, P1Hpd2TmdsY420::kGen, P1Hpd2TmdsY420::kModeRegs, P1Hpd2TmdsY420::kModeTimings, P1Hpd2TmdsY420::kModeValues, P1Hpd2TmdsY420::kEncoding),
+	table(P2Hpd1TmdsY420::kConfig, P2Hpd1TmdsY420::kGen, P2Hpd1TmdsY420::kModeRegs, P2Hpd1TmdsY420::kModeTimings, P2Hpd1TmdsY420::kModeValues, P2Hpd1TmdsY420::kEncoding),
+	table(P2Hpd2TmdsY420::kConfig, P2Hpd2TmdsY420::kGen, P2Hpd2TmdsY420::kModeRegs, P2Hpd2TmdsY420::kModeTimings, P2Hpd2TmdsY420::kModeValues, P2Hpd2TmdsY420::kEncoding),
+	table(P3Hpd1TmdsY420::kConfig, P3Hpd1TmdsY420::kGen, P3Hpd1TmdsY420::kModeRegs, P3Hpd1TmdsY420::kModeTimings, P3Hpd1TmdsY420::kModeValues, P3Hpd1TmdsY420::kEncoding),
+	table(P3Hpd2TmdsY420::kConfig, P3Hpd2TmdsY420::kGen, P3Hpd2TmdsY420::kModeRegs, P3Hpd2TmdsY420::kModeTimings, P3Hpd2TmdsY420::kModeValues, P3Hpd2TmdsY420::kEncoding),
 };
 constexpr size_t kTableCount = sizeof(kTables) / sizeof(kTables[0]);
 
 const Table *cur = &kTables[0];   // the table in use (use())
+
+// DIGn_HDMI_CONTROL: DATA_SCRAMBLE_EN and CLOCK_CHANNEL_RATE are the mode
+// set's to write for the mode it switches to (ModeSet, "hdmi scrambler").
+constexpr uint32_t kHdmiControl = 0x209e, kDigStride = 0x124, kHdmiScrambler = 0x6;
+
+// What a mode-table register may write for a switch: all of its mask but the
+// scrambler bits, which a row of another mode would set for that mode.
+uint32_t applyMask(const ModeReg &r) {
+	if (r.seg == 2 && r.dword == kHdmiControl + cur->config.dig * kDigStride)
+		return r.mask & ~kHdmiScrambler;
+
+	return r.mask;
+}
 
 // Row of a timing in the mode table, or -1.
 int modeRow(const Edid::DetailedTiming &t) {
 	for (size_t i = 0; i < cur->nmodes; i++)
 		if (Edid::sameTiming(cur->timings[i], t))
 			return static_cast<int>(i);
+
+	// The request timing and the DET a mode needs follow from its clock and totals: a sink's timing that differs only in
+	// where its syncs sit or which way they go (a Dell's 2560x1440 against Linux's CVT-RB one) takes that row.
+	for (size_t i = 0; i < cur->nmodes; i++) {
+		const Edid::DetailedTiming &k = cur->timings[i];
+
+		if (k.pixelClockKHz == t.pixelClockKHz && k.hActive == t.hActive && k.hBlank == t.hBlank && k.vActive == t.vActive &&
+		    k.vBlank == t.vBlank && k.interlaced == t.interlaced)
+			return static_cast<int>(i);
+	}
+
 	return -1;
 }
 
 // The words of the AVI infoframe (version 2, 13 bytes) that depend on the
-// timing, as amdgpu's set_avi_info_frame fills them for 8 bpc full-range RGB:
+// timing, as amdgpu's set_avi_info_frame fills them for 8 bpc full-range RGB,
+// or YCbCr 4:2:0 (Y = 3, BT.709 colorimetry, no RGB quantization range):
 // word 1 is the checksum and PB1..3 (PB2 holds the picture aspect), 2 the VIC,
 // 3 and 4 the bottom and right bar ends (v total + 1, h total + 1).
-uint32_t aviWord(const Edid::DetailedTiming &t, uint32_t word) {
+uint32_t aviWord(const Edid::DetailedTiming &t, uint32_t word, bool y420) {
 	const uint32_t aspect = t.hActive * 9 == t.vActive * 16 ? 2 : t.hActive * 3 == t.vActive * 4 ? 1 : 0;
-	const uint32_t pb[4] = { 0x1e | (((aspect << 4) | 8) << 8) | (0x88u << 16), Edid::vicOf(t),
-	                         t.vTotal() + 1, t.hTotal() + 1 };
+	const uint32_t pb1 = y420 ? 0x7e : 0x1e;
+	const uint32_t pb2 = (aspect << 4) | 8 | (y420 ? 0x80 : 0);
+	const uint32_t pb3 = y420 ? 0x80 : 0x88;
+	const uint32_t pb[4] = { pb1 | (pb2 << 8) | (pb3 << 16), Edid::vicOf(t), t.vTotal() + 1, t.hTotal() + 1 };
 	if (word != 1)
 		return pb[word - 1];
 	uint32_t sum = 0x82 + 0x02 + 0x0d;   // the header: type, version, length
@@ -125,12 +339,46 @@ const Config &config() { return cur->config; }
 size_t configCount() { return kTableCount; }
 const Config &configAt(size_t i) { return kTables[i].config; }
 
-bool use(uint8_t hpd) {
-	for (const Table &t : kTables)
-		if (t.config.hpd == hpd) {
+bool use(uint8_t hpd, bool tmds, uint8_t pipe, bool uhd, bool y420) {
+	const Table *fallback = nullptr;
+
+	for (const Table &t : kTables) {
+		if (t.config.hpd != hpd || t.config.pipe != pipe || isUhd(t.config) != uhd || t.config.y420 != y420)
+			continue;
+
+		if (t.config.dp != tmds) {
 			cur = &t;
 			return true;
 		}
+
+		if (!fallback)
+			fallback = &t;   // an HDMI connector's only table
+	}
+
+	if (!fallback)
+		return false;
+
+	cur = fallback;
+	return true;
+}
+
+bool isUhd(const Config &c) { return c.timing.hActive >= kUhdWidth; }
+
+bool hasUhdTable(uint8_t hpd) {
+	for (const Table &t : kTables) {
+		if (t.config.hpd == hpd && isUhd(t.config))
+			return true;
+	}
+
+	return false;
+}
+
+bool hasDpTable(uint8_t hpd) {
+	for (const Table &t : kTables) {
+		if (t.config.hpd == hpd && t.config.dp)
+			return true;
+	}
+
 	return false;
 }
 
@@ -158,11 +406,52 @@ size_t modeSteps(const Edid::DetailedTiming &to, ModeSet::Step *out, size_t cap,
 	for (size_t i = 0; i < cur->nregs && n < cap; i++) {
 		const ModeReg &r = cur->regs[i];
 		// Row 0 is the mode the pipe was lit in.
-		if (which == ModeRegs::All || r.who == 'D' || (r.who == 'S' && row >= 0))
-			out[n++] = ModeSet::Step { ModeSet::Op::Update, r.seg, false, r.dword, r.mask,
-			                           cur->values[(row < 0 ? 0 : row) * cur->nregs + i], 0, r.name };
+		if (which == ModeRegs::All || r.who == 'D' || (r.who == 'S' && row >= 0)) {
+			const uint32_t mask = which == ModeRegs::All ? r.mask : applyMask(r);
+			const uint32_t value = cur->values[(row < 0 ? 0 : row) * cur->nregs + i];
+			out[n++] = ModeSet::Step { ModeSet::Op::Update, r.seg, false, r.dword, mask, value & mask, 0, r.name };
+		}
 	}
 	return n;
+}
+
+size_t encodingSteps(bool y420, ModeSet::Step *out, size_t cap) {
+	size_t n = 0;
+
+	for (size_t i = 0; i < cur->nenc && n < cap; i++) {
+		const EncodingReg &r = cur->enc[i];
+
+		out[n++] = ModeSet::Step { ModeSet::Op::Update, r.seg, false, r.dword, r.mask, y420 ? r.y420 : r.rgb, 0,
+		                           r.what };
+	}
+
+	return n;
+}
+
+// DIGn_DIG_FIFO_CTRL0: OUTPUT_PIXEL_PER_CYCLE, two in 4:2:0
+// (enc401_set_dig_input_mode).
+constexpr uint32_t kDigFifoCtrl0 = 0x209b, kDigPixelsPerCycle = 0x300;
+
+// What a plan step writes, but with the DIG's pixels a cycle of the encoding
+// the pipe runs.
+static uint32_t digInputMode(const Gen &g, uint32_t value, bool y420) {
+	const Config &c = cur->config;
+
+	if (g.seg != 2 || g.dword != kDigFifoCtrl0 + c.dig * kDigStride || !(g.mask & kDigPixelsPerCycle))
+		return value;
+
+	return (value & ~kDigPixelsPerCycle) | (y420 ? 0x100 : 0);
+}
+
+// What a plan step writes, but for this pipe's DET size when the target
+// asks for another one.
+static uint32_t detValue(const Target &t, const Gen &g) {
+	const Config &c = cur->config;
+
+	if (!t.detSegments || g.seg != c.detSeg || g.dword != c.detCtrl[c.pipe])
+		return g.value;
+
+	return (g.value & ~g.mask) | (t.detSegments & g.mask);
 }
 
 bool build(const Target &t, Plan &out, const char **why) {
@@ -185,9 +474,15 @@ bool build(const Target &t, Plan &out, const char **why) {
 	}
 	const bool moved = t.part != Part::Light && t.now.pixelClockKHz;
 	const Edid::DetailedTiming &timing = moved ? t.now : c.timing;
-	const uint32_t khz = timing.pixelClockKHz;
-	// The scrambler setting in these parts is the plan's.
-	if (!c.dp && (khz > ModeSet::kScrambleFromKHz) != (c.timing.pixelClockKHz > ModeSet::kScrambleFromKHz)) {
+	// What the HDMI link carries: in YCbCr 4:2:0 half the pixel clock. A 4:2:0
+	// table's pipe may run a smaller mode in RGB.
+	const bool y420 = c.y420 && !(moved && t.rgb);
+	const uint32_t khz = ModeSet::tmdsKHz(timing.pixelClockKHz, y420);
+	const uint32_t planKHz = ModeSet::tmdsKHz(c.timing.pixelClockKHz, c.y420);
+
+	// The scrambler setting in sleep and wake is the plan's (the infoframe has none).
+	if (!c.dp && t.part != Part::Avi &&
+	    (khz > ModeSet::kScrambleFromKHz) != (planKHz > ModeSet::kScrambleFromKHz)) {
 		err = "sleep and wake are generated for the plan's side of 340 MHz";
 		return false;
 	}
@@ -211,6 +506,17 @@ bool build(const Target &t, Plan &out, const char **why) {
 		return &out.cmds[out.ncmds++];
 	};
 
+	// SET_PIXEL_CLOCK: the link's PHY PLL at the pixel clock.
+	auto pixelClock = [&](Dmub::Cmd &cmd) {
+		Dmub::SetPixelClock pc {};
+		pc.pixclk100Hz = khz * 10;
+		pc.pllId = static_cast<uint8_t>(0x14 + c.link);   // ATOM_COMBOPHY_PLL0 + the link's PHY
+		pc.encoderObjId = static_cast<uint8_t>(t.encoderObjId & 0xff);
+		pc.encoderMode = Dmub::EncoderModeHdmi;
+		pc.miscInfo = y420 ? Dmub::kPixelClockMiscYuv420 : 0;
+		pc.crtcId = c.pipe;
+		Dmub::buildSetPixelClock(cmd, pc);
+	};
 	Part part = Part::Light;   // of the entry: the requirements at the top belong to lighting
 	for (size_t i = 0; i < cur->ngen; i++) {
 		const Gen &g = cur->gen[i];
@@ -220,7 +526,19 @@ bool build(const Target &t, Plan &out, const char **why) {
 			continue;
 		bool ok = true;
 		switch (g.kind) {
-		case '1': case '2': case '4': case '5': case '6':
+		case '1': case '2': case '4': case '6':
+			break;
+		case '5':
+			// HDMI: the PHY PLL first, as lighting does. The generated table
+			// has the command at the end of the sleep part only, and a wake
+			// at 594 MHz left the display dark after the transmitter was off
+			// (both 4K displays, card, 2026-11-04).
+			if (!c.dp) {
+				Dmub::Cmd *cmd = dmub(g);
+				if (cmd)
+					pixelClock(*cmd);
+				ok = cmd != nullptr;
+			}
 			break;
 		case '3':
 			if (t.depth == Depth::Stream)
@@ -228,11 +546,11 @@ bool build(const Target &t, Plan &out, const char **why) {
 			break;
 		case 'R': ok = step(ModeSet::Op::Require, g, g.mask, g.value, 0); break;
 		case 'W': ok = step(ModeSet::Op::Write, g, 0, g.value, 0); break;
-		case 'U': ok = step(ModeSet::Op::Update, g, g.mask, g.value, 0); break;
+		case 'U': ok = step(ModeSet::Op::Update, g, g.mask, digInputMode(g, detValue(t, g), y420), 0); break;
 		// Linux carries on past a wait that times out, with a warning.
 		case 'T': ok = step(ModeSet::Op::WaitValue, g, g.mask, g.value, g.arg, true); break;
 		case 'D': ok = step(ModeSet::Op::Delay, g, 0, 0, g.arg); break;
-		case 'A': ok = step(ModeSet::Op::Write, g, 0, aviWord(timing, g.arg), 0); break;
+		case 'A': ok = step(ModeSet::Op::Write, g, 0, aviWord(timing, g.arg, y420), 0); break;
 		case 'K': {
 			// The register holds the 16-bit colour twice (DPG_COLOUR0 and 1).
 			const uint32_t v = t.depth == Depth::Stream ? kPatternColour[g.arg] * 0x10001u : g.value;
@@ -270,13 +588,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 			if (!cmd) {
 				ok = false;
 			} else if (g.kind == 'P') {
-				Dmub::SetPixelClock pc {};
-				pc.pixclk100Hz = khz * 10;
-				pc.pllId = static_cast<uint8_t>(0x14 + c.link);   // ATOM_COMBOPHY_PLL0 + the link's PHY
-				pc.encoderObjId = static_cast<uint8_t>(t.encoderObjId & 0xff);
-				pc.encoderMode = Dmub::EncoderModeHdmi;
-				pc.crtcId = c.pipe;
-				Dmub::buildSetPixelClock(*cmd, pc);
+				pixelClock(*cmd);
 			} else if (g.kind == 'E') {
 				Dmub::DigEncoderStreamSetup es {};
 				es.digId = c.dig;

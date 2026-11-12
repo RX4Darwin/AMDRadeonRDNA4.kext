@@ -122,9 +122,11 @@ W, H = 256, 256
 comment('PHASE 0: CONTEXT_CONTROL (no load/shadow), initial cache invalidation')
 raw([PKT3(0x28, 1), 0x80000000, 0x80000000], 'CONTEXT_CONTROL: UPDATE_LOAD_ENABLES=1 (nothing loaded), UPDATE_SHADOW_ENABLES=1 (nothing shadowed)',
     'si_state.c:5060-5063; gfx_v12_0.c:4655-4673')
-gcr = (1 << 0) | (1 << 7) | (1 << 8) | (1 << 14) | (1 << 15)   # GLI_INV=ALL, GLK_INV, GLV_INV, GL2_INV, GL2_WB (pkt3.json GCR_CNTL)
+# gfx_v12_0_emit_mem_sync's: GL1 too, which a texture read goes through and colour writes do not (without it a surface drawn to and read
+# again as a texture gave the read its older lines: WindowServer copied stale content over what it had just drawn)
+gcr = (1 << 0) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 14) | (1 << 15)   # pkt3.json GCR_CNTL
 raw([PKT3(0x58, 6), 0x00000000, 0xffffffff, 0x00ffffff, 0, 0, 0x0000000A, gcr],
-    'ACQUIRE_MEM (engine=PFP, full range): GCR_CNTL=0x%X = GLI_INV|GLK_INV|GLV_INV|GL2_INV|GL2_WB' % gcr,
+    'ACQUIRE_MEM (engine=PFP, full range): GCR_CNTL=0x%X = GLI_INV|GLM_WB|GLM_INV|GLK_INV|GLV_INV|GL1_INV|GL2_INV|GL2_WB' % gcr,
     'si_gfx_cs.c:388-391 -> ac_barrier.c:67-116 -> ac_cmdbuf_cp.c:403-429; gfx_v12_0.c:5129-5150')
 
 # ================= PHASE 1: gfx12 preamble =================

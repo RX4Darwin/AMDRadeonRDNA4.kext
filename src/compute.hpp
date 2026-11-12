@@ -29,10 +29,11 @@
 //    stage 6  dispatch  a hand-written gfx1201 kernel on the compute units.
 //    stage 7  kernel    a clang-built kernel launched from its code object.
 //
-//  Selected with the boot-arg rdna4-compute=<stage>; absent/0 = off, and the
-//  plugin behaves exactly as without this file. Each stage runs the ones
-//  before it. Stage 1 runs inline; stages 2+ run on their own kernel thread
-//  a few seconds later, so the desktop never waits on (or for) them.
+//  Selected with rdna4-compute=<stage>, a boot-arg or a test boot's option
+//  (trial.hpp); absent = stage 3 (the firmware the display clocks need),
+//  0 = off, and the plugin behaves exactly as without this file. Each stage runs the ones before it. Stage 1 runs inline;
+//  stages 2+ run on their own kernel thread a few seconds later, so the
+//  desktop never waits on (or for) them.
 //
 //  Once stage 6 or 7 finished, the runtime (runtime.cpp) is published for
 //  user space as RDNA4ComputeService (userclient.cpp, include/rdna4compute.h).
@@ -52,6 +53,7 @@
 #include "flip.hpp"
 #include "gfxregs.hpp"
 #include "gpuheap.hpp"
+#include "gpuvmtable.hpp"
 #include "ih.hpp"
 #include "gpuvm.hpp"
 #include "ipdiscovery.hpp"
@@ -95,6 +97,10 @@ extern uint32_t rdna4TraceLevel;
 class RDNA4Compute {
 public:
 	~RDNA4Compute();
+	// The copy engine on system memory named by bus address (M2 of docs/metal-phase-plan.md: the blits of the fake paravirtual GPU, pvgpu.cpp). Under the
+	// runtime lock; false when DMA is not up, the system has an IOMMU (a bus address would then not be the physical one), or the engine did not answer.
+	bool sysFill(uint64_t bus, uint32_t pattern, uint32_t bytes);
+	bool sysCopy(uint64_t srcBus, uint64_t dstBus, uint32_t bytes);
 	// Called by the IOKit filter/action callbacks; they only inspect the
 	// writeback pointer and drain the already-programmed ring.
 	bool ihHasWork() const;
@@ -121,6 +127,9 @@ public:
 		// W32: read-only cursor register dump the display device offers (flip.cpp calls it after each flip).
 		void (*cursorProbe)(void *ctx, const char *why) { nullptr };
 		void *cursorProbeCtx { nullptr };
+		// Once the power-management firmware runs its features (stage 3), on the bring-up thread before
+		// it sends anything else: the display device may talk to the firmware (ctx: cursorProbeCtx).
+		void (*smuReady)(void *ctx) { nullptr };
 	};
 
 	enum Stage : uint32_t {
@@ -134,7 +143,7 @@ public:
 		StageKernel   = 7,
 	};
 
-	// rdna4-compute=<stage>, clamped to StageKernel. 0 when absent.
+	// rdna4-compute=<stage>, clamped to StageKernel. StageGfx when absent.
 	static uint32_t requestedStage();
 	static bool requestedVm();
 	static bool requestedPowerManagement();
@@ -196,6 +205,12 @@ private:
 	friend bool Flip::flipTo(RDNA4Compute &compute, const Flip::Surface &surface,
 	                         uint64_t target, const char *name, uint64_t *latencyUs,
 	                         bool async);
+	friend uint8_t Flip::hubpShowing(RDNA4Compute &compute, uint64_t mc);
+	friend bool Flip::request(RDNA4Compute &compute, uint8_t hubp, uint64_t mc);
+	friend bool Flip::shown(RDNA4Compute &compute, uint8_t hubp, uint64_t &requested, uint64_t &inUse);
+	friend bool Flip::underflowed(RDNA4Compute &compute, uint8_t hubp);
+	friend uint8_t Flip::otgOf(RDNA4Compute &compute, uint8_t hubp);
+	friend bool Flip::scan(RDNA4Compute &compute, uint8_t otg, uint32_t &line, uint32_t &lines, uint32_t &blankStart);
 
 	Env    env {};
 	Survey sv {};
@@ -244,9 +259,10 @@ private:
 	// in the middle of a step rather than ending the bring-up itself.
 	bool logPreviousTrail(char *text, size_t size);
 
-	// The compute pool, mapped uncached through BAR0.
-	IOMemoryMap *poolMap { nullptr };
-	uint8_t     *poolCpu { nullptr };
+	// The compute pool, mapped uncached through BAR0; and write-combined for bulk writes (page tables): uncached, memcpy wrote
+	// some 12 MB/s, a large surface's PTEs took a draw 14 ms. Writes there are fenced (sfence) before the HDP flush.
+	IOMemoryMap *poolMap { nullptr }, *poolWcMap { nullptr };
+	uint8_t     *poolCpu { nullptr }, *poolWc { nullptr };
 	bool mapPool();
 	void flushHdp();
 
@@ -351,6 +367,8 @@ private:
 		bool            wave32;
 		uint32_t        timeoutUs;
 		uint32_t        ldsBytes;           // per work-group (RSRC2.LDS_SIZE)
+		uint64_t        scratchVa;          // the kernel's scratch (COMPUTE_DISPATCH_SCRATCH_BASE), 0 for none
+		uint32_t        tmpring;            // COMPUTE_TMPRING_SIZE for it
 		bool            useInterrupt;       // runtime only; the fence remains authoritative
 		bool            preserveFence;      // another client IB may still be outstanding
 		Pm4::Queue     *queue;
@@ -601,6 +619,7 @@ private:
 	uint64_t ihLastInterruptLog { 0 };
 	uint32_t ihInterruptLogCount { 0 };   // lines allowed so far (see ihInterruptLogAllowed)
 	uint32_t ihFaultCount { 0 };
+	uint32_t ihClientFaultCount { 0 };   // VM faults of address spaces other than 0
 	uint32_t ihUnknownCount { 0 };
 	uint8_t ihUnknownSeen[256][32] {};
 	bool ihDcnRequested { false };
@@ -647,19 +666,72 @@ public:
 	// `owner` is the client: its buffers and programs are only its own, and
 	// rtRelease frees them all. Every call takes rtLock.
 	IOReturn rtOpen(const void *owner);
+	// The client `owner` opens next gets its page tables in the CPU-visible pool, written by the CPU through the BAR (amdgpu_vm_cpu style)
+	// instead of copied into VRAM by an SDMA job for each mapping: the paravirtual host maps and unmaps surfaces all the time.
+	void rtPreferCpuTables(const void *owner) { cpuTableOwner = owner; }
+	const void *cpuTableOwner { nullptr };
+	// `owner` frees only what none of its gfx IBs in flight use (it waits for those itself): rtFree does not wait for all of them first.
+	// The paravirtual host drops mappings all the time, and each free drained the card.
+	void rtFreesWhenIdle(const void *owner) { idleFreeOwner = owner; }
+	const void *idleFreeOwner { nullptr };
+	bool runtimeReady() const { return rtReady; }   // the bring-up reached a dispatching stage
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
 	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
 	IOReturn rtSensorsEx(const void *owner, RDNA4SensorsEx &out);
+	// GRBM perf counters 0 and 1 counting GFX clocks (GRBM_PERF_SEL_COUNT) and busy clocks (GUI_ACTIVE): the counts since the call
+	// before (stopped and sampled, read, started again from zero).
+	bool rtGfxClocks(uint64_t &clocks, uint64_t &active)
+	{
+		static constexpr GfxReg::Reg kPerfmonCntl { 1, 0x3808 }, kSel0 { 1, 0x3840 }, kSel1 { 1, 0x3841 };
+		static constexpr GfxReg::Reg kLo0 { 1, 0x3040 }, kHi0 { 1, 0x3041 }, kLo1 { 1, 0x3043 }, kHi1 { 1, 0x3044 };
+
+		if (!rtReady)
+			return false;
+
+		if (!perfStarted) {
+			// RLC_CGTT_MGCG_OVERRIDE.PERFMON_CLOCK_STATE: the counters' clock not gated (gfx_v12_0_update_perf_clk)
+			wr(IpDiscovery::HwGc, GfxReg::RlcCgttMgcgOverride, rdGc(GfxReg::RlcCgttMgcgOverride) | 0x400);
+			wr(IpDiscovery::HwGc, kPerfmonCntl, 0);   // PERFMON_STATE: disable and reset
+			wr(IpDiscovery::HwGc, kSel0, 0);
+			wr(IpDiscovery::HwGc, kSel1, 2);
+			wr(IpDiscovery::HwGc, kPerfmonCntl, 1);   // start counting
+			perfStarted = true;
+		}
+
+		wr(IpDiscovery::HwGc, kPerfmonCntl, 2 | 1u << 10);   // STOP_COUNTING, PERFMON_SAMPLE_ENABLE
+		clocks = rdGc(kLo0) | static_cast<uint64_t>(rdGc(kHi0)) << 32;
+		active = rdGc(kLo1) | static_cast<uint64_t>(rdGc(kHi1)) << 32;
+		wr(IpDiscovery::HwGc, kPerfmonCntl, 0);
+		wr(IpDiscovery::HwGc, kPerfmonCntl, 1);
+
+		return true;
+	}
+	bool perfStarted { false };
 	IOReturn rtSleepTest(const void *owner, uint32_t phase);
 	IOReturn rtQuiesce(const void *owner);
 	IOReturn rtAlloc(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
+	IOReturn allocLocked(const void *owner, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtAllocHost(const void *owner, task_t task, uint64_t bytes, uint64_t flags,
 	                     uint64_t &handle, uint64_t &gpu, uint64_t &user);
+	// Pages that are not the runtime's (the paravirtual host's guest memory, pvgpu.cpp) at a fresh GPU VA of the client, by bus address; rtFree
+	// unmaps them. The caller keeps the pages alive meanwhile.
+	IOReturn rtMapPages(const void *owner, const uint64_t *pageBuses, uint64_t pages, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtFree(const void *owner, uint64_t handle);
+	IOReturn rtMapVram(const void *owner, uint64_t barPhys, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
+	// The paravirtual displays' frames flipped at vblank (pvgpu.cpp, presentOnCard): the HUBP showing a head's scanout at `barPhys` and
+	// the scanout's MC address; a VRAM runtime buffer's MC address (0 for another); a flip requested; what the HUBP was asked to show
+	// and what it reads now (Flip::shown).
+	bool rtScanoutHubp(uint64_t barPhys, uint8_t &hubp, uint64_t &mc);
+	uint64_t rtBufferMc(const void *owner, uint64_t handle);
+	bool rtScanoutFlip(uint8_t hubp, uint64_t mc);
+	bool rtScanoutShown(uint8_t hubp, uint64_t &requested, uint64_t &inUse);
+	bool rtScanoutUnderflowed(uint8_t hubp);
+	uint8_t rtScanoutOtg(uint8_t hubp);
+	bool rtScanoutScan(uint8_t otg, uint32_t &line, uint32_t &lines, uint32_t &blankStart);
 	IOReturn rtCopy(const void *owner, uint64_t handle, uint64_t offset, task_t task,
 	                mach_vm_address_t user, uint64_t length, bool toGpu);
 	IOReturn rtLoad(const void *owner, task_t task, mach_vm_address_t elf, uint64_t length,
-	                const char *name, uint64_t out[8]);
+	                const char *name, uint64_t out[9]);
 	IOReturn rtUnload(const void *owner, uint64_t program);
 	IOReturn rtDispatch(const void *owner, const RDNA4Dispatch &d, uint64_t &micros);
 	IOReturn rtSubmitIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags,
@@ -668,6 +740,7 @@ public:
 	// W12k: a client's own gfx IB on the kernel's gfx ring (runtime.cpp, docs/w12k-gfx-submit.md)
 	IOReturn rtSubmitGfxIb(const void *owner, uint64_t ibVa, uint64_t dwords, uint64_t flags, uint64_t &fence);
 	IOReturn rtWaitGfxFence(const void *owner, uint32_t fence, uint32_t timeoutMs, uint64_t &ns);
+	bool rtGfxFenceDone(const void *owner, uint32_t fence);   // without waiting: whether the card has written `fence` yet
 	IOReturn rtPresent(const void *owner, uint64_t handle, uint64_t offset,
 	                   uint64_t &geometry, uint64_t &pitch);
 	IOReturn rtPresentAsync(const void *owner, uint64_t handle, uint64_t offset,
@@ -689,24 +762,37 @@ private:
 	struct N48nState;
 	N48nState *n48n { nullptr };
 	void     n48nDiscard();        // the card lost its memory under the client (sleep): forget it, write nothing
+	struct N48nView;
+	N48nView *n48nViews { nullptr };   // what processes map of the pool heap's buffers (n48nMemory), kept for the boot
+	bool     n48nRetire(uint64_t offset);   // a freed buffer's memory waits for its mappings: true if it has a view
+	void     n48nSweep();          // memory whose mappings are all gone back to the heap
+	void     n48nKeep();           // a heap made anew: memory still mapped is taken out of it again
 	IOReturn n48nCopyTest(uint64_t source, uint64_t destination, uint64_t bytes);
 	// The pool past kHeapOffset is the CPU-visible heap (code, and buffers
 	// when there is no DMA). With DMA, buffers come from the device heap:
 	// VRAM past the BAR, which the CPU never touches.
 	static constexpr uint32_t kHeapOffset  = 32u << 20;
-	static constexpr uint32_t kMaxBuffers  = 256;          // the legacy global caps (modes 0 and 1)
+	// The legacy global caps (modes 0 and 1). Buffers as many as there are slots: the paravirtual host alone keeps hundreds (mappings,
+	// shadows), and with 256 its allocations failed once those were made.
+	static constexpr uint32_t kMaxBuffers  = 1024;
 	static constexpr uint32_t kMaxPrograms = 32;
 	static constexpr uint32_t kBufferSlots  = 1024;        // rdna4-vmshared=2: array sizes; the cap is per client (accounting), not global
 	static constexpr uint32_t kProgramSlots = 256;
 	static constexpr uint32_t kClientBuffers  = 128;
 	static constexpr uint32_t kClientPrograms = 16;
 	uint32_t bufferCap() const { return vmShared == 2 ? kBufferSlots : kMaxBuffers; }
+	// The paravirtual host's compiler service (PVGPU builds) loads a vertex and a fragment kernel for every render pipeline WindowServer
+	// makes: dozens. Its code takes heap space, which is checked on its own.
+#ifdef AMDRadeonRDNA4_PVGPU
+	uint32_t programCap() const { return kProgramSlots; }
+#else
 	uint32_t programCap() const { return vmShared == 2 ? kProgramSlots : kMaxPrograms; }
+#endif
 	bool clientOverQuota(const void *owner, bool program) const;   // rdna4-vmshared=2: per-client buffer/program counts
 	static constexpr uint32_t kMaxClients = 8;              // the per-client-HQD path and rdna4-vmshared=1 (static VMIDs 8-15)
 	static constexpr uint32_t kClientSlots = 64;            // rdna4-vmshared=2 (VMIDs from the pool): the array size, bounded by memory not hardware
 	uint32_t clientCap() const { return vmShared == 2 ? kClientSlots : kMaxClients; }
-	static constexpr uint32_t kVmTableBytes = 4u << 20;
+	static constexpr uint32_t kVmTableBytes = GpuVmTable::kDenseTableBytes;   // 4 GiB of VA (1 GiB with 4 MiB)
 	static constexpr uint32_t kVmTableStage = 20u << 20;
 	static constexpr uint32_t kVmTableCpu = 28u << 20;    // W22 variant T: CPU-written tables (0x4000)
 	uint64_t vmPteSet { 0 }, vmPteClear { 0 };            // W22 diagnostics: extra/removed leaf PTE bits
@@ -731,6 +817,7 @@ private:
 	static constexpr uint64_t kHostMaxClient = 1ull << 30;
 	static constexpr uint64_t kHostMaxTotal = 4ull << 30;
 	static constexpr uint32_t kMaxIbOutstanding = 16;
+	static constexpr uint32_t kMaxGfxIbOutstanding = 64;   // a client's gfx IBs in flight: the paravirtual host submits draws without waiting
 	struct RtBuffer  {
 		const void *owner { nullptr };
 		uint64_t    offset { 0 }, bytes { 0 }; // heap offset (pool or VRAM), size
@@ -738,21 +825,24 @@ private:
 		uint16_t    gen { 0 };
 		bool        device { false };          // from the device heap
 		bool        host { false };
+		bool        foreign { false };         // VRAM that is not the runtime's (rtMapVram): only the VA is given back
 		IOBufferMemoryDescriptor *hostMemory { nullptr };
 		IODMACommand *hostDma { nullptr };
 		IOMemoryMap *hostMap { nullptr };
 		uint64_t    hostUser { 0 };
 	};
-	struct RtProgram { const void *owner; uint64_t offset, va; CodeObj::Kernel k; uint16_t gen; };
+	struct RtProgram { const void *owner; uint64_t offset, va; CodeObj::Kernel k; uint16_t gen; uint64_t vaBytes; };
 	// Sparse page tables (rdna4-vmshared=2; ptpages.hpp, gpuvmtable.hpp): root, PDB1, PDB0 and PT pages exist only where VA is mapped, so a client's VA
 	// reaches as far as its page quota allows (the contiguous image of modes 0/1 stops at 1 GiB above kVaStart).
 	struct SparseTables {
 		PtPages::Sparse s;
 	};
+	static constexpr uint32_t kVaHoles = 32;
 	struct RtClient {
 		const void *owner { nullptr };
 		uint32_t vmid { 0 }, pipe { 0 }, queue { 0 };
 		uint64_t tableOffset { 0 }, rootMc { 0 }, rootPhys { 0 }, nextVa { GpuVm::kVaStart };
+		bool tableCpu { false };   // its tables at tableOffset of the pool (rtPreferCpuTables), else of the device heap
 		uint64_t kernargVa { 0 }, fenceVa { 0 };
 		uint64_t queueVa { 0 }, mqdMc { 0 }, eopVa { 0 }, rptrVa { 0 }, wpollVa { 0 };
 		volatile uint32_t *queueCpu { nullptr };
@@ -762,6 +852,7 @@ private:
 		uint32_t fence { 0 }, doorbell { 0 };
 		SparseTables *sp { nullptr };   // rdna4-vmshared=2: demand-allocated page tables (ptpages.hpp) instead of tableShadow
 		uint64_t tlbSeq { 0 };            // bumped whenever a PTE is removed: the next job on a VMID owned by this client flushes (amdgpu's tlb_seq)
+		uint64_t scratchVa { 0 }, scratchBytes { 0 };   // scratch for kernels with a private segment, made at the first (a buffer of the client's)
 		uint32_t pasid { 0 };             // what the IH_VMID_LUT of this client's VMID holds, so a fault names the client (slot + 1)
 		bool     shared { false };        // rdna4-vmshared: no HQD of its own; its jobs run on a shared VMID-0 queue
 		uint8_t  sq { 0 };                // which shared queue (fixed at open: a client's jobs stay in order)
@@ -774,13 +865,23 @@ private:
 		volatile uint32_t *gfxFenceCpu { nullptr };
 		uint64_t gfxFenceMc { 0 };
 		uint32_t gfxFence { 0 };
-		uint32_t gfxFences[kMaxIbOutstanding] {};
+		uint32_t gfxFences[kMaxGfxIbOutstanding] {};
 		uint32_t gfxOutstanding { 0 };
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
 		bool active { false };
 		bool aborted { false };
+		// VA given back by freed buffers, 64 KiB granules, reused before nextVa grows: the dense tables reach only 1 GiB above
+		// kVaStart, which a buffer a draw passes through without reuse.
+		struct VaHole { uint64_t va, bytes; } vaHoles[kVaHoles] {};
+		uint32_t vaHoleCount { 0 };
+		bool vaBitsReady { false };   // vaBits[this slot] set up (vaBitsOf)
+		uint32_t ibSlot { kBufferSlots };   // rtSubmitGfxIb: the buffer that held the last IB
 	};
+	uint64_t vaTake(RtClient &c, uint64_t bytes);
+	uint64_t *vaBitsOf(RtClient &c);
+	void vaGive(RtClient &c, uint64_t va, uint64_t bytes);
+	bool scratchFor(RtClient &c, const void *owner, const CodeObj::Kernel &k, Launch &l);
         IOLock        *rtLock { nullptr };
         IONotifier   *shutdownInterest { nullptr };
         bool           shutdownQuiesced { false };
@@ -796,6 +897,8 @@ private:
 	bool           vmidUsed[16] {};
 	bool           queueUsed[4][8] {};
 	RtClient       clients[kClientSlots] {};
+	static constexpr uint32_t kVaGranules = GpuVmTable::kDenseVaBytes >> 16;   // the dense tables' 4 GiB, 64 KiB each
+	uint64_t      *vaBits[kClientSlots] {};   // kVaGranules bits each, made on first use
 	GpuHeap::Heap  heap;
 	uint8_t        heapMap[(128u << 20) / 4096] {};   // pool heap: 4 KiB granules
 	RtBuffer       buffers[kBufferSlots] {};
@@ -974,6 +1077,7 @@ private:
 	IOReturn ownerStateLocked(const void *owner) const;
 	bool vmTableSync(RtClient &client, uint32_t offset, uint32_t bytes);
 	bool vmMap(RtClient &client, uint64_t va, uint64_t mc, uint64_t bytes, bool executable);
+	bool vmSyncCpu(RtClient &client, uint64_t va, uint64_t end);
 	bool vmMapHost(RtClient &client, uint64_t va, const uint64_t *pageBuses,
 	               uint64_t bytes, bool executable);
 	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
@@ -983,12 +1087,13 @@ private:
 	void logClientFault(RtClient &client, const char *tag);
 	void scrubFaultPage();
 	void releaseHost(RtBuffer &buffer);
+	void leakHost(RtBuffer &buffer);
 	void retireIbFences(RtClient &client);
 	IOReturn submitIbLocked(RtClient &client, uint64_t ibVa, uint64_t dwords, uint64_t &fence);
 	// W12k (runtime.cpp): the client side of the gfx ring. The kernel's own gfx users (stageGfxRing/stageGfxDraw, gfxPark) run on the
 	// bring-up thread with bringupRunning set and do NOT take rtLock; client submissions take rtLock and refuse while bringupRunning,
 	// so the two never use the ring at the same time. Everything below runs under rtLock.
-	static constexpr uint32_t kMaxGfxOutstanding = 16;     // submissions in the ring across all clients (15 dwords each, 22 with the pool's ring fence: 352 of 4096)
+	static constexpr uint32_t kMaxGfxOutstanding = 64;     // submissions in the ring across all clients (15 dwords each, 22 with the pool's ring fence: 1408 of 4096)
 	static constexpr uint32_t kGfxFenceSlot = 0x40;        // bytes into the client's fence page
 	bool     gfxWedged { false };                          // a client gfx IB timed out: the gfx ring is given up until the next bring-up
 	bool     gfxParked { false };                          // gfxPark halted PFP/ME (probe boots)
@@ -996,10 +1101,12 @@ private:
 	IOReturn gfxClientReady() const;                       // kIOReturnSuccess when a client may use the ring now
 	void     gfxClientRetire(RtClient &client);
 	IOReturn gfxClientEmit(RtClient &client, uint64_t ibVa, uint32_t dwords, uint32_t &fence);
-	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why);
+	bool     gfxClientWait(RtClient &client, uint32_t fence, uint32_t timeoutMs, uint64_t &ns, const char *why, bool pause = false);
+	bool     pauseUnlocked(const RtClient &client, const void *owner);
 	void     gfxClientWedge(const char *why);
 	bool     gfxRingRelease(uint32_t vmid, const volatile uint32_t *fenceWord, uint32_t fence, const char *why);   // end one address space's hung work
 	void     gfxClientDrain(RtClient &client, const char *why);
+	void     quarantineLocked(const void *owner, RtClient &client);
 	void     gfxClientReset();                             // a fresh gfx ring: nothing is pending
 	bool     gfxClientSelfTest();                          // rdna4-gfxclient=1 (bring-up thread)
 	static bool requestedGfxClient();
@@ -1016,6 +1123,9 @@ private:
 	uint8_t       *bounceVa { nullptr };
 	uint64_t       bounceBus { 0 };           // the device's address for it
 	uint64_t       agpStart { 0 };            // MC address of bus address 0
+	uint64_t       agpEnd { 0 };              // last MC address the AGP aperture reaches (agpReach extends it)
+	bool agpReach(uint64_t busEnd);            // make the aperture reach bus address busEnd - 1
+	bool vramZero(uint64_t mc, uint64_t bytes); // the copy engine fills [mc, mc + bytes) with 0; caller holds rtLock
 	bool           dmaReady { false };
 	bool           busMasterSet { false }, busMasterWas { false };
 	GpuHeap::Heap  devHeap;                   // VRAM offsets

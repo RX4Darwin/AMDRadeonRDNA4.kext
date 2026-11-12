@@ -105,7 +105,7 @@ RUN          = userspace/rdna4-run
 VULKAN       = userspace/vulkan
 CENSUS       = tools/metal/accelcensus
 
-.PHONY: all kext tools userspace n48nprobe mesa vulkan-products vkcube census-tool census-stub census-pathlog \
+.PHONY: all kext tools userspace n48nprobe mesa metal-helper vulkan-products vkcube census-tool census-stub census-pathlog \
         test atomdump check-isa check-config product-dir clean distclean
 
 all: check-config kext tools
@@ -165,7 +165,19 @@ $(BIN)/rdna4-run: $(RUN)/rdna4-run.c $(RUN)/librdna4.c $(RUN)/librdna4.h $(RUN)/
 	$(CXX) -x c $(USER_FLAGS) $(RUN)/rdna4-run.c $(RUN)/librdna4.c \
 		-framework IOKit -framework CoreFoundation -weak_framework Accelerate -o $@
 
-userspace: $(BIN)/rdna4-run
+# The kext's log of each boot into /var/log/rdna4 (userspace/rdna4-logd/install.sh).
+LOGD         = userspace/rdna4-logd
+$(BIN)/rdna4-logd: $(LOGD)/rdna4-logd.c
+	@mkdir -p $(BIN)
+	$(CXX) -x c $(USER_FLAGS) $(LOGD)/rdna4-logd.c -o $@
+
+# CoreDisplay's IOPresentment switched for the boot (userspace/rdna4-iop/install.sh).
+IOP          = userspace/rdna4-iop
+$(BIN)/rdna4-iop: $(IOP)/rdna4-iop.c
+	@mkdir -p $(BIN)
+	$(CXX) -x c $(USER_FLAGS) $(IOP)/rdna4-iop.c -framework CoreFoundation -o $@
+
+userspace: $(BIN)/rdna4-run $(BIN)/rdna4-logd $(BIN)/rdna4-iop
 
 # The card test of the Vulkan interface's memory half (docs/vulkan-port.md): runs on the test machine, as root.
 $(BIN)/n48nprobe: $(VULKAN)/n48nprobe.c $(VULKAN)/navi48_native_abi.h include/rdna4vulkan.h
@@ -219,6 +231,10 @@ vulkan-products:
 		fi; \
 	done
 
+# The Metal kernel translator's run-time helper for the rig (M3, docs/m1-stream.md s.5b); builds LLVM for x86_64 the first time.
+metal-helper:
+	tools/metal/m3/build.sh helper
+
 # A Vulkan application that is not ours: Khronos's vkcube with their loader and the manifest that tells the loader
 # where the driver of `make mesa` is (bin/vulkan/icd.d/), beside that driver in bin/ (userspace/vulkan/build-app.sh; fetches about 65 MB
 # into $(BUILD)/vk-app the first time; needs cmake). docs/todo-vulkantest.md has the commands.
@@ -262,6 +278,10 @@ $(ATOMDUMP): test/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery
 atomdump: $(ATOMDUMP)
 
 PVSTREAM_TEST = $(HOST)/pvstream-test
+PVDRAW_TEST   = $(HOST)/pvdraw-test
+$(PVDRAW_TEST): test/pvdraw-test.cpp src/pvdraw.hpp
+	@mkdir -p $(HOST)
+	$(CXX) -std=c++17 -Wall -O1 -o $@ test/pvdraw-test.cpp
 $(PVSTREAM_TEST): test/pvstream-test.cpp src/pvstream.cpp src/pvstream.hpp src/pvopcodes.inc src/pvdevinfo.inc
 	@mkdir -p $(HOST)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ test/pvstream-test.cpp src/pvstream.cpp
@@ -283,9 +303,10 @@ $(HOST)/test-w12k-pm4: test/test-w12k-pm4.cpp src/pm4.cpp src/pm4.hpp
 check-isa:
 	bash test/check-isa.sh
 
-test: $(ATOMDUMP) $(PVSTREAM_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
+test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
 	@if [ -f $(ROM) ]; then echo "$(ATOMDUMP) $(ROM)"; $(ATOMDUMP) $(ROM); else echo "$(ATOMDUMP)   (no $(ROM))"; $(ATOMDUMP); fi
 	$(PVSTREAM_TEST)
+	$(PVDRAW_TEST)
 	$(HOST)/test-gfx12tri
 	$(HOST)/test-gfx12tricol
 	$(HOST)/test-w12k-pm4

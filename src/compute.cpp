@@ -8,6 +8,8 @@
 //
 
 #include "codeobj.hpp"
+#include "trial.hpp"
+#include "klog.hpp"
 #include "compute.hpp"
 #include "flip.hpp"
 #include "pm4.hpp"
@@ -27,7 +29,7 @@
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
 
-#define CLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: compute: " fmt "\n", ## __VA_ARGS__)
+#define CLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: compute: " fmt "\n", ## __VA_ARGS__)
 
 // Lilu's vendor GUID; `nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail`
 // reads it back.
@@ -108,9 +110,12 @@ void RDNA4Compute::publishResult(const char *feature, const char *value) {
 }
 
 uint32_t RDNA4Compute::requestedStage() {
-	uint32_t stage = 0;
-	if (!PE_parse_boot_argn("rdna4-compute", &stage, sizeof(stage)))
-		return StageOff;
+	// Stage 3 runs the power-management firmware, which the display clocks of
+	// a 3840x2160 pipe need (clk.cpp).
+	uint32_t stage = StageGfx;
+
+	(void)Trial::option("rdna4-compute", stage);
+
 	return stage > StageKernel ? StageKernel : stage;
 }
 
@@ -126,7 +131,7 @@ uint32_t RDNA4Compute::requestedVmShared() {
 
 bool RDNA4Compute::requestedVm() {
 	uint32_t enabled = 0;
-	return PE_parse_boot_argn("rdna4-vm", &enabled, sizeof(enabled)) && enabled != 0;
+	return Trial::option("rdna4-vm", enabled) && enabled != 0;
 }
 
 bool RDNA4Compute::requestedPowerManagement() {
@@ -553,8 +558,13 @@ bool RDNA4Compute::logPreviousTrail(char *text, size_t size) {
 // ---------------------------------------------------------------------------
 
 void RDNA4Compute::threadMain(void *arg, wait_result_t) {
-	// Let the desktop come up first: nothing below is on its path.
-	IOSleep(5000);
+	uint32_t pvgpu = 0;
+
+	// Let the desktop come up first: nothing below is on its path. With the paravirtual GPU it is: WindowServer's first frames (the boot's
+	// progress bar) waited for the graphics ring, a second and more. Its test boot is known once NVRAM is (asked again meanwhile).
+	for (uint32_t ms = 0; ms < 5000 && !(Trial::option("rdna4-pvgpu", pvgpu) && pvgpu); ms += 100)
+		IOSleep(100);
+
 	static_cast<RDNA4Compute *>(arg)->runStages();
 	thread_terminate(current_thread());
 }
@@ -898,10 +908,12 @@ bool RDNA4Compute::mapPool() {
 	if (!sub)
 		return false;
 	poolMap = sub->map(kIOMapInhibitCache);
+	poolWcMap = sub->map(kIOMapWriteCombineCache);
 	sub->release();
 	if (!poolMap)
 		return false;
 	poolCpu = reinterpret_cast<uint8_t *>(poolMap->getVirtualAddress());
+	poolWc = poolWcMap ? reinterpret_cast<uint8_t *>(poolWcMap->getVirtualAddress()) : poolCpu;
 	return poolCpu != nullptr;
 }
 
@@ -1684,12 +1696,12 @@ void RDNA4Compute::gfxCgGuiIdle(bool enable) {
 // steps, rdna4-gfxcg=0 writes amdgpu's disable branch.
 bool RDNA4Compute::gfxCgIsDefault() {
 	uint32_t v = 0;
-	return !PE_parse_boot_argn("rdna4-gfxcg", &v, sizeof(v));
+	return !Trial::option("rdna4-gfxcg", v);
 }
 
 bool RDNA4Compute::requestedGfxCg(uint32_t &mask) {
 	uint32_t v = 0;
-	if (!PE_parse_boot_argn("rdna4-gfxcg", &v, sizeof(v))) {
+	if (!Trial::option("rdna4-gfxcg", v)) {   // boot-args, else a test boot's (rdna4-trial)
 		mask = kCgStepCoarse | kCgStepMedium | kCgStepFine | kCgStepGuiIdle;
 		return true;
 	}
@@ -2128,6 +2140,8 @@ bool RDNA4Compute::stageGfx() {
 	trail("s3: SMU features (display-safe mask)");
 	uint64_t running = smuEnableFeatures(displaySafe, 0);
 	put("SmuFeatures", running);
+	if (env.smuReady)
+		env.smuReady(env.cursorProbeCtx);
 
 	// 4. gfx_v12_0_wait_for_rlc_autoload_complete: CP idle and the RLC
 	//    reports its bootload complete.
@@ -3206,7 +3220,12 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 	put(Pm4::setShReg(pkt, shAbs(ComputePgmRsrc1), rsrc, 2));
 	put(Pm4::setShReg(pkt, shAbs(ComputePgmRsrc3), &l.rsrc3, 1));
 	put(Pm4::setShReg(pkt, shAbs(ComputeResourceLim), &zero, 1));
-	put(Pm4::setShReg(pkt, shAbs(ComputeTmpringSize), &zero, 1));
+	put(Pm4::setShReg(pkt, shAbs(ComputeTmpringSize), &l.tmpring, 1));
+	if (l.scratchVa) {
+		const uint32_t base[2] = { static_cast<uint32_t>(l.scratchVa >> 8), static_cast<uint32_t>(l.scratchVa >> 40) };
+
+		put(Pm4::setShReg(pkt, shAbs(ComputeDispatchScratchBase), base, 2));
+	}
 	put(Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe0), all, 2));
 	put(Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe2), all, 2));
 	put(Pm4::setShReg(pkt, shAbs(ComputeThreadMgmtSe4), none4, 4));
@@ -3316,8 +3335,8 @@ bool RDNA4Compute::kernelFits(const CodeObj::Kernel &k, const char **why) {
 		w = "it asks for dispatch/queue pointers, a dispatch id or scratch setup";
 	else if (k.userSgprCount() != (k.wantsKernargPtr() ? 2u : 0u))
 		w = "its user SGPR count does not match its requests";
-	else if (k.privateSegmentSize)
-		w = "it needs scratch memory";
+	else if (k.privateSegmentSize > kMaxPrivatePerLane)
+		w = "it needs more scratch memory than a lane gets";
 	else if (k.groupSegmentSize > kMaxLdsPerGroup)
 		w = "it needs more than 64 KiB of LDS";
 	else if (k.kernargSize > kKernargMax)

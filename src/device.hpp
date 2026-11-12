@@ -30,8 +30,10 @@
 #include "pipe.hpp"
 #include "pipe2.hpp"
 #include "dptrain.hpp"
+#include "regsnap.hpp"
 
 class IOMemoryMap;
+struct SmuMailbox;
 
 class RDNA4Device {
 public:
@@ -57,11 +59,73 @@ public:
 	// present. 0 length = no DDC sink found.
 	uint8_t edidData[256] {};
 	size_t  edidLen { 0 };
-	// The next sink that answered on another connector, for the second head
-	// (rdna4-head2, plugin.cpp): base block plus one extension. 0 length = none.
-	uint8_t edid2Data[256] {};
-	size_t  edid2Len { 0 };
-	uint8_t edid2Hpd { 0 };   // the HPD pin of the connector it is on
+	// A display beyond the boot one (rdna4-head2, plugin.cpp): the sink on
+	// another connector, the pipe it is lit on and what the kext lit for it.
+	// The second-pipe functions below act on the selected one (selectExtra).
+	struct ExtraPipe {
+		uint8_t       pipe { 1 };          // OTG = HUBP = DPP = MPCC = OPP instance, 1 to 3
+		uint8_t       edid[256] {};        // base block plus one extension
+		size_t        edidLen { 0 };       // 0: no sink
+		uint8_t       hpd { 0 };           // the HPD pin of the connector it is on
+		Pipe2::Target target {};           // .now: the timing the pipe runs
+		uint16_t      connectorObjId { 0 };
+		bool          lit { false }, on { false };
+		bool          moveOwed { false };  // secondPipeTo: the move to the connector in use has not completed
+		bool          uhd { false };       // its table lights it at 3840x2160 (Pipe2::isUhd)
+		bool          hdmi { false };      // its table is for an HDMI stream (on a DisplayPort connector: DP++)
+		bool          y420 { false };      // ... in YCbCr 4:2:0 (Pipe2::Config::y420)
+		bool          moveToPlan { false };   // the move owed goes to the table's own timing (adoptSinkKind)
+		// On DisplayPort: the sink's AUX channel and capabilities (read with
+		// its EDID), and the link picked for the mode it is to carry.
+		uint8_t       aux { 0 };
+		DpTrain::Sink sink {};
+		DpTrain::Link link {};
+		RegSnap::Snap *snap { nullptr };   // rdna4-wakediff=1: what lighting left (regsnap.hpp)
+	};
+	static constexpr size_t kMaxExtra = 3;
+	ExtraPipe extra[kMaxExtra] { { 1 }, { 2 }, { 3 } };
+	size_t extraSlot { 0 };
+	ExtraPipe &xp() { return extra[extraSlot]; }
+	const ExtraPipe &xp() const { return extra[extraSlot]; }
+	// The one the second-pipe functions act on, and its connector's table
+	// (Pipe2::use) once it has a sink.
+	void selectExtra(size_t slot);
+	// How many displays beside the boot one this boot may light (1 to 3,
+	// rdna4-heads); the first extra pipe without a sink (kMaxExtra if none);
+	// whether another extra pipe than the selected one has that connector.
+	static size_t extraHeads();
+	size_t freeExtraSlot() const;
+	bool hpdTakenByOther(uint8_t hpd) const;
+
+	// Bit (pin - 1): a DisplayPort connector whose sink answered on DDC,
+	// i.e. an HDMI monitor behind a passive DP++ adapter.
+	uint8_t dpDualHpds { 0 };
+
+	bool dpDual(uint8_t hpd) const {
+		return hpd >= 1 && hpd <= 8 && (dpDualHpds & (1u << (hpd - 1)));
+	}
+
+	void setDpDual(uint8_t hpd, bool on) {
+		if (hpd < 1 || hpd > 8)
+			return;
+
+		const uint8_t bit = static_cast<uint8_t>(1u << (hpd - 1));
+		if (on) {
+			dpDualHpds |= bit;
+		} else {
+			dpDualHpds &= static_cast<uint8_t>(~bit);
+			dpDualKHz[hpd - 1] = 0;
+		}
+	}
+
+	// The TMDS clock the DP++ adapter on that pin carries (dpdual.hpp); 0
+	// while its ID block has not been read.
+	uint32_t dpDualKHz[8] {};
+
+	void overrideDpDual(uint8_t hpd);
+	uint32_t dpDualMaxKHz(uint8_t hpd) const {
+		return dpDual(hpd) ? dpDualKHz[hpd - 1] : 0;
+	}
 
 	// Display mode table (modes.hpp). By default it holds only the boot mode;
 	// with boot-arg "rdna4-modeset=1" it also carries the sink's EDID modes.
@@ -80,6 +144,17 @@ public:
 	// Program mode `m` on the lit HDMI pipe (modeset.hpp). On failure the
 	// previous timing is programmed back and an error returned.
 	IOReturn applyMode(const Modes::Mode &m);
+	// rdna4-boot4k: the boot display behind a passive DP++ adapter, which the
+	// firmware lights at what the adapter carries (2560x1440), taken over by a
+	// head's pipe that lights its connector at 3840x2160 in YCbCr 4:2:0, as
+	// the heads do. bootUhdPipe: whether the head on extra pipe `pipeIndex`
+	// can (a table for the boot connector on that pipe, and a sink that takes
+	// it). releaseBootPipe: the firmware's stream taken down (stream and link
+	// encoder, transmitter; its plane and timing generator run on); the boot
+	// pipe has no connector from then on.
+	bool bootUhdPipe(uint8_t pipeIndex) const;
+	bool releaseBootPipe();
+	bool bootReleased { false };
 
 	// The second pipe (pipe2.hpp), for a head whose surface is at CPU
 	// address `surfacePhys` in the console's memory range. `level` is
@@ -93,14 +168,33 @@ public:
 	// Hot-plug (plugin.cpp polls). secondSinkHpd: the HPD pin of the lit second
 	// pipe's connector if it is high; before the pipe is lit, of the first
 	// connector a plan exists for that is high and not the boot display's; else
-	// 0. readSecondEdid: the EDID of what is on that connector, into edid2Data.
+	// 0. readSecondEdid: the EDID of what is on that connector, into xp().edid.
 	// `orAnother`, for a lit pipe whose display is gone: if its own connector is
 	// empty, another connector the pipe can be moved to (secondPipeTo).
 	uint8_t secondSinkHpd(bool orAnother = false);
 	// Take the second-pipe plan for a connector. A DisplayPort one only with
 	// rdna4-head2dp=1: lighting a second display over DisplayPort has not run
 	// on the card yet (docs/todo-dptest.md), the HDMI plans have.
+	// An HDMI connector's 3840x2160 plan is taken once the display clocks are
+	// raised for it (uhdClocks), if the sink has SCDC and the plan's mode.
 	bool usePlanFor(uint8_t hpd);
+	bool dpSinkTakes(const Edid::DetailedTiming &t) const;
+	bool sinkTakesUhd(uint8_t hpd, bool *y420 = nullptr) const;
+	bool adoptSinkKind(uint8_t hpd);
+	bool secondPipeY420(const Edid::DetailedTiming &t) const;
+	// DET buffer shares when a pipe is lit (lightSecondPipe).
+	static constexpr uint32_t kMinDetSegments = 6;
+	bool pipeInUse(uint32_t p) const;
+	void freeIdleDet(const Pipe2::Config &c);
+	uint32_t detShare(uint32_t plan, uint32_t others) const;
+	uint32_t shrinkCompbuf(const Pipe2::Config &c, uint32_t others);
+	void logUnderflow(const char *when);
+	// rdna4-wakediff=1: snapshot after lighting, compared after each wake.
+	void snapAfterLight(const Pipe2::Plan &plan);
+	void diffAfterWake();
+	static uint32_t snapRead(void *ctx, uint8_t seg, uint32_t dword);
+	static void snapDiff(void *ctx, const RegSnap::Reg &was, uint32_t now);
+	volatile bool uhdClocks { false };   // set by smuStarted, on the compute thread
 	bool pipe2DpAllowed { false };
 	bool readSecondEdid(uint8_t hpd);
 	// Display sleep and wake of the pipe lightSecondPipe lit, as amdgpu does
@@ -122,14 +216,12 @@ public:
 	// values for it are in the table or it is near the lit mode's pixel
 	// clock, and the DET buffer has the segments it needs.
 	bool secondPipeModeOk(const Edid::DetailedTiming &t, const char **why = nullptr);
-	Pipe2::Target pipe2Target {};          // .now: the timing the pipe runs
-	uint16_t pipe2ConnectorObjId { 0 };
-	bool pipe2Lit { false }, pipe2On { false };
+	uint32_t secondPipeDet(const Edid::DetailedTiming &t) const;
+	void clampDet(ModeSet::Step *steps, size_t n, uint32_t segments) const;
 	// A DisplayPort second display whose HPD pin dropped and came back without
 	// counting as unplugged: its link is trained again if the sink says it is
 	// down. Nothing else maintains a link the kext trained.
 	void secondLinkBack();
-	bool pipe2MoveOwed { false };   // secondPipeTo: the move to the connector in use has not completed
 	bool runSecondPipePart(Pipe2::Part part, size_t *steps = nullptr);
 
 	// The boot display's DisplayPort link (rdna4-dptrain, a diagnostic). The
@@ -166,6 +258,10 @@ public:
 	bool supportsHardwareCursor() const { return hwCursorReady; }
 	IOReturn setHardwareCursor(void *cursorRef);
 	IOReturn drawHardwareCursor(int32_t x, int32_t y, uint32_t visible);
+	// Once the power-management firmware runs its features (compute stage
+	// 3's thread calls it): the display clocks, logged with rdna4-clocks=1,
+	// raised for a 3840x2160 pipe (rdna4-dispclk=<MHz> overrides, 0 = off).
+	void smuStarted();
 	void cursorRegProbe(const char *why);   // W32: read-only cursor plane dump (also called from the compute thread after a flip)
 	IOReturn getHardwareCursorDrawState(Ndrv::VDHardwareCursorDrawStateRec &state) const;
 
@@ -195,6 +291,7 @@ private:
 	// Register bases from the IP discovery binary (full flash dump injected
 	// as ATY,bin_image, or the PSP's on-die copy).
 	IpDiscovery ipDiscovery;
+	const SmuMailbox *smu { nullptr };   // the firmware mailbox that answers (clk.cpp), once it runs
 	uint8_t *onDieDisc { nullptr };
 	bool loadOnDieDiscovery();
 
@@ -222,11 +319,20 @@ private:
 	                   uint8_t *reply, uint8_t replyCap, uint8_t *replyBytes);
 	bool readEDID(uint8_t inst, uint8_t *edid, size_t count, uint8_t start);
 	bool readEDIDI2C(uint8_t line, uint8_t *edid, size_t count, uint8_t start);
+	// A DisplayPort connector's DDC pads in I2C (true) or AUX (false) mode.
+	// A passive DP++ (DP-to-HDMI) adapter carries the sink's DDC on them,
+	// which the DC_I2C engine reaches in I2C mode only (hw_ddc.c set_config).
+	void ddcPadMode(uint8_t line, bool i2c);
+	bool readEDIDDpDual(uint8_t line, uint8_t *edid, size_t count);
+	// The DP++ adapter's ID block on that pin's DDC line, pads in I2C mode.
+	void readDpDualAdaptor(uint8_t hpd, uint8_t line);
 	// The sink's DPCD over native AUX, any length (16 bytes a transfer).
 	bool dpcdRead(uint8_t aux, uint32_t address, uint8_t *data, size_t len);
 	bool dpcdWrite(uint8_t aux, uint32_t address, const uint8_t *data, size_t len);
 	bool i2cTransfer(uint8_t line, uint8_t addr, const uint8_t *wr, size_t wlen, uint8_t *rd, size_t rlen);
-	void scdcConfigure(uint8_t line, uint8_t tmdsConfig);
+	bool scdcConfigure(uint8_t line, uint8_t tmdsConfig);
+	bool scdcConfigureWait(uint8_t line, uint8_t tmdsConfig);
+	void scdcRefresh();
 	void probeEDID();
 	// AUX engine of the sink whose EDID we cached — the target for DPCD
 	// power writes.
@@ -238,6 +344,22 @@ private:
 	void dmubHistory();
 	void dumpDmubVersion();
 	void smuPing();
+	// The power-management firmware's mailboxes (clk.cpp).
+	bool smuRegs(const SmuMailbox &mb, uint32_t &msg, uint32_t &arg,
+		     uint32_t &resp) const;
+	uint32_t smuWait(uint32_t resp) const;
+	bool smuSend(const SmuMailbox &mb, uint32_t id, uint32_t param,
+		     uint32_t *out);
+	bool smuProbe(const SmuMailbox &mb);
+	const SmuMailbox *smuFind();
+	bool smuHardMinMet(uint32_t clk);
+	bool smuSetHardMin(uint32_t clk, const char *name, uint32_t mhz);
+	bool raiseDisplayClocks();
+	uint32_t topDpmLevel(uint32_t clk);
+	void logDisplayClocks();
+	uint32_t dpmLevelCount(const SmuMailbox &mb, uint32_t clk);
+	void logDpmLevels(const SmuMailbox &mb, uint32_t clk, const char *name);
+	void logDispclkDivider();
 	void dumpIH();
 	void dumpPSP();
 	void dumpModeState();
@@ -295,17 +417,14 @@ private:
 	              const char *tag, uint32_t otgOffset, const Pipe2::AuxWrite *aux = nullptr);
 	DpTrain::Result trainLink(uint8_t aux, uint8_t link, uint8_t hpd, uint8_t conn, const DpTrain::Sink &sink,
 	                          const DpTrain::Link &settings, bool offFirst, DpTrain::Report &rep);
-	// The second pipe on DisplayPort: its sink's AUX channel and capabilities
-	// (read with its EDID), and the link picked for the mode it is to carry.
+	// The second pipe on DisplayPort: its sink's capabilities (with its EDID),
+	// and the link for the mode it is to carry (xp().aux, .sink, .link).
 	bool readSecondDpSink(uint8_t aux);
 	bool pickSecondLink(uint32_t pixelClockKHz);
 	bool relinkSecondPipe(uint32_t pixelClockKHz);
 	bool trainSecondLink();
 	// The pixel-rate DTO an OTG runs on; false if its pixel clock is not that DTO.
 	bool readDpDto(uint8_t otg, ModeSet::DpDto &out, uint32_t *cntl = nullptr);
-	uint8_t       pipe2Aux { 0 };
-	DpTrain::Sink pipe2Sink {};
-	DpTrain::Link pipe2Link {};
 	void surveySteps(const ModeSet::Step *steps, size_t count, const Dmub::Cmd *cmds);
 	bool waitFrames(uint32_t frames, uint32_t otgOffset);
 

@@ -61,6 +61,9 @@ Inputs (radv_shader_args.c:784-800, merged GS): `s[0:1]` = the pointer to RADV's
 
 Layout (swizzled, index stride 32): a subgroup's region starts at `gs_attr_offset * 512`; within it, parameter p of vertex i (i < 32) is at
 `p * 16 * 32 + i * 16`. With one parameter a group of 32 vertices is 512 B, which is why gs_attr_offset counts 512 B units.
+**Correction (2026-10-22, docs/m1-stream.md s.5b, M4 eighth step):** the descriptor's stride has to be `16 * parameters` (RADV ORs it in,
+radv_nir_lower_abi.c); with 16 and two or more parameters every parameter past the first read back zeros or garbage on the card, so the
+layout above holds for one parameter only.
 
 ### 2.2 The PS (RADV-G4:63-76; ACO pseudo code 37-56)
 

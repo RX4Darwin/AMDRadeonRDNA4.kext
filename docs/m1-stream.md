@@ -45,9 +45,9 @@ The host sees FIFO commands directly in guest RAM; to see operations and the str
 | 0x34 | PageBacking | `AppleParavirtResource::pageBacking` | |
 | 0x35 | SynchronizeForUnwire | `Resource::synchronizeForUnwire` | |
 | 0x36 | DeleteHostIOSurfaceBacking | `Resource::deleteHostIOSurfaceBacking` | |
-| **0x37** | **ExecIndirect** | `AppleParavirtCommandQueue::processExecIndirect` | chunks `{u32 resource id, u32 length}` (copied from the kernel command, below) |
+| **0x37** | **ExecIndirect** | `AppleParavirtCommandQueue::processExecIndirect` | `{u32 task, u32 n, n resource entries, u64 command-buffer gpu address, u64 length}` [measured on the rig, s.5b]; the resource entries are 6-7 dwords, the first the resource id |
 | **0x38** | **DefineHostTask** | `AppleParavirtTask::defineHostTask` | `{u32 task << 1, u64 address-space size, u32 page-table root PFN}` (16 bytes) |
-| **0x39** | **CommitIntoGPUPageTable** | `AppleParavirtMemoryMap::commitIntoGPUPageTable` | `{u32 task, u64 gpu address, u64 length}` (20 bytes) [field meanings INFER from the sources: task id, resource GPU address and length] |
+| **0x39** | **CommitIntoGPUPageTable** | `AppleParavirtMemoryMap::commitIntoGPUPageTable` | `{u32 task, u64 gpu address, u64 length}` (20 bytes) [measured on the rig, s.5b] |
 | **0x3a** | **GetDeviceInfo** | `AppleParavirtAccelerator::setupDeviceInfo` | record `0x2d`: `{u32 0x2d, u32 bytes/8, u32 page}` (12 bytes): *the 4 KiB buffer the host fills with the device-info blob*, then the command's signal/barrier completes it |
 | 0x3b | CreateComputePipeline | `AppleParavirtShared::createComputePipeline` | |
 | 0x3c | ReplacePhysical | `AppleParavirtResource::replacePhysical` | |
@@ -161,9 +161,314 @@ Not found as simple immediates (variable, built by helpers): render/compute **pi
 - **Shaders**: Metal asks `MTLCompiler` (plug-in path chosen by the bundle: `libAppleParavirtCompilerPlugin.dylib`, in the OS cryptex we could not obtain) for the "compiler output". `-[AppleParavirtFunctionVariant initWithCompilerOutput:device:functionType:]` **copies that blob** (`dispatch_data`) into a new *descriptor buffer* resource (`AppleParavirtDescriptorBuffer`, `newDescriptorBuffer:size`), then builds a 24-byte record `{u32 functionRef, u32 descriptor-buffer resource id, u64 resource address, u64 size}` and sends operation 0x0f (`newFunctionWithIR`). Pipeline states reference function refs; their descriptors are serialised into descriptor buffers likewise (`AppleParavirtRenderPipelineState` holds two). **The shader that reaches the host is a blob in guest memory named by a resource id; what the blob is (AIR bitcode wrapped by the plug-in?) is [INFER: AIR, as reims-vgpu's `metal2vulkan` host translates it; to be verified by capturing one with the stub bundle of `docs/metal-spike.md` s.12 or from a VM run].**
 - **Textures**: `serializeTextureDescriptor:`/`...2:` write the descriptor into the creation op; texture data moves through blit commands (`copyFromBuffer:...toTexture`) and the Uploads/Downloads channels [INFER].
 
+## 5b. Measured on the rig (Tahoe 26.6.2, RX 9070 XT, 2026-10-21) [measured]
+
+M0 runs on the real machine (`make PVGPU=1`, `rdna4-pvgpu=1 rdna4-pvgpu-class=0xff0000 rdna4-pvgpu-delay=120`): Apple's driver talks to our host and
+Metal apps submit work. `tools/metal/m1/mtlprobe.m` issues known work (a blit, a compute dispatch, a render pass) and the host's log shows it:
+
+- **A task's GPU page table.** `DefineHostTask` names a root page: a header whose first dword is the page number of the top table (then 3, ...; the
+  dword at +0x18 is 4, the top table's entries for the 16 GiB space). Below it three tables of **dword** entries: top `[va >> 32]`, middle
+  `[(va >> 22) & 1023]`, leaf `[(va >> 12) & 1023]`. Leaf entries are `0x80000000 | page number` (bit 31 = mapped), upper entries bare page numbers.
+  The leaf counts match the commits exactly (a 1 MiB heap at VA 0x1000, a 128 KiB command-buffer region, one page per small buffer).
+- **Resources.** Each resource id has a fixed GPU range: `DeleteHostResourceID {task, id}` comes paired with `ReleaseFromGPUPageTable {task, va,
+  length}` (buffer 1 at 0x101000, 4 KiB). `SetResourceHeap` is `{task, 1, 0x100000}`; every task commits VA 0x1000, 1 MiB.
+- **`ExecIndirect`** carries the task, its resource list and the command buffer's GPU address and length (table in s.1). The command buffer, read
+  through the page table, is the stream of s.4 with the framing as written there: segment `{u32 length, u8 type, ...}`, commands `{u32 id, u32 size}`.
+  The probe's work decodes with **zero unknown ids and zero undecoded bytes** against `src/pvopcodes.inc`: `Blit.fillBuffer {buffer 1, offset 0,
+  length 0x1000, value 0x5a}` + `Blit.copyFromBuffer {1 -> 2, 0x1000}`; `Compute.setComputePipelineState {2}` + 3x `Compute.setBuffers {index, 1,
+  buffer, u64 offset}` + `Compute.dispatchThreads {u64 threads[3], u64 per group[3]}` (64/64); `Render.writeDescriptor` (584 bytes, the clear colour
+  as doubles) and `Blit.copyFromTexture`.
+- **`CreateComputePipeline` (FIFO 0x3b)** is `{task, pipeline ref (2, the one setComputePipelineState names), 5, 6, u64 gpu address}`; the address
+  lies in a 1 MiB region committed just before, and read as zeros at that moment (where the compiled function lives is still open).
+- **The resource heap** (VA 0x1000, 1 MiB) starts with 12-byte records indexed by resource id: `{u32 (descriptor bytes << 8) | type, u32 descriptor
+  address, u32 0}`. Types seen: 1 buffer (16-byte descriptor), 6 (32 bytes, probably the function), 7 compute pipeline (24 bytes; the stream's
+  pipeline ref). A buffer's descriptor is `{u64 length, u64 page number of its start}` (mtlprobe's two 4 KiB buffers: `{0x1000, 0x101}`,
+  `{0x1000, 0x102}`). The stream names buffers by these resource ids.
+- **M2, first step: blits run on the card.** `Blit.fillBuffer` and `Blit.copyFromBuffer` are carried out with SDMA on the guest's pages, found through
+  the resource heap and the page table, reached through the GC hub's AGP aperture (grown on demand to the highest bus address needed) by
+  `RDNA4Compute::sysFill/sysCopy`. The engine does not snoop the CPU's caches: without `kIOMemoryIncoherentIOFlush` around each transfer the CPU
+  reads its stale lines (a kernel-page self-test read 0/1024 written dwords; with the flushes 1024/1024). mtlprobe's blit now reads
+  `0x5a 0x5a .. 0x5a` in its destination buffer.
+- **The compiled function is a metallib.** A function resource (type 6) has a 32-byte descriptor whose first qword is the GPU address of a
+  standard Metal library (magic `MTLB`, 0xe20 bytes for mtlprobe's vadd), with the function's `NAME`, `TYPE` and a 32-byte `HASH` tag (vadd:
+  `552cf258b072b59d...`): the AIR reaches the host in the clear, no compiler plug-in is involved. `CreateComputePipeline`'s address is the end of
+  that library. A compute pipeline is type 7 (24 bytes, not decoded), a texture type 2 (116 bytes; the first qword is its size, 0x4000 = 64x64x4).
+- **M2, second step: a compute dispatch runs on the card** with a precompiled stand-in for the function (the plan's bootstrap before the AIR
+  compiler): `src/shaders/mtlvadd.cl`, chosen by the function's name and its three bound buffers. The host follows `setComputePipelineState`,
+  `setBuffers {u32 first index, u32 count, count x {u32 resource id, u64 offset}}` and `dispatchThreads`, copies the bound buffers into runtime
+  buffers, dispatches through the runtime as one of its clients, and writes `c` back into the guest's pages: mtlprobe's compute reads
+  `c[0] 1000 c[1] 1001 c[63] 1063` (64 threads, 30 us on the card).
+- **M2, third step: a render pass that only clears.** `Render.writeDescriptor` (584 bytes) carries colour attachment 0 as `{u32 texture at
+  +0x4c, u32 (store action << 16) | load action at +0x60, double clear colour[4] at +0x68}` (mtlprobe: texture 1, 0x00010002 = clear + store,
+  0.25 0.5 0.75 1). A texture (type 2, 116-byte descriptor) is dwords `{u64 size, u32 start page, ..., [13] bytes per row, [15] width}`, linear
+  (mtlprobe: 0x4000 bytes at page 0x101, 0x100 per row). The host fills the texture with the colour as a BGRA8 pixel (the format is assumed
+  until found in the descriptor; the colour is converted from the doubles' bits with integers, no floating point in the kernel) and carries out
+  `Blit.copyFromTexture {u32 texture, u32 buffer, u64 origin[3], u64 size[3], u64 destination offset, u64 bytes per row, u64 bytes per image,
+  u32 slice, u32 level}` for a whole linear texture: mtlprobe's render reads `B 191 G 128 R 64 A 255`. **All three mtlprobe checks now pass on
+  the card.** Other processes (system UI) also send render passes to the device now; theirs carry other values at +0x4c (no texture resources
+  there) and are refused, and nothing they draw is executed.
+- **M3, first step: kernels translated from AIR.** `tools/metal/m3/air2amdgpu.cpp` reads a kernel's AIR with upstream LLVM (23 reads
+  `air64_v28` as it is: buffers are `ptr addrspace(1)` as on AMDGPU, the roles are `!air.kernel` metadata), wraps it in an `amdgpu_kernel`
+  that computes the position arguments from the work-group and work-item ids and bounds-checks them against the grid (dispatchThreads need not
+  fill whole groups), and emits a gfx1201 object. Its kernargs: a 64-bit address per buffer index, then u32 threads per threadgroup[3] and
+  u32 threads in the grid[3]. `tools/metal/m3/build.sh` translates `tools/metal/m3/kernels.metal` (mtlprobe's `vadd` and the 2D `grid2d`)
+  into the committed table `src/mtlkernels.h` (with each kernel's written buffers, from `air.read` / `air.read_write`); the host picks the
+  entry by the function's name, copies every bound buffer from its offset to its end into the runtime, dispatches `ceil(threads / per group)`
+  groups and copies back the written ones (`src/shaders/mtlvadd.cl` is gone). **On the card (2026-10-21): mtlprobe's `compute` reads
+  `c[0] 1000 c[1] 1001 c[63] 1063` (vadd, 23 us) and the new `grid` (50 x 20 threads in groups of 16 x 4, partial groups at the edges)
+  `0 of 1000 wrong` (grid2d, 28 us), both through the translated kernels; blit and render still pass.**
+- **M3, second step: translated at run time.** A root helper (`air2amdgpu --serve`, installed as a LaunchDaemon by
+  `tools/metal/m3/install-helper.sh`) opens a user client of type `'MTLC'` on `RDNA4ComputeService` (`include/rdna4mtlc.h`). A function the
+  host has not seen (by its metallib `HASH`) is handed to it whole: the metallib's file size is the header u64 at 0x10; the helper finds
+  the function's bitcode by its `NAME`, `OFFT` (third u64: offset in the bitcode section, whose offset is the header u64 at 0x48) and `MDSZ`
+  (bytes), translates it, links it with lld in the same process and returns the code object with its buffer count and written mask. The host
+  waits at most 3 s, loads it into the runtime and caches it by hash (32 entries). Without a helper it falls back to `src/mtlkernels.h`.
+  The helper for the rig is x86_64 with LLVM/lld 23.1.1 built from source for x86_64, AMDGPU only, linked in statically (`build.sh
+  helper`, 58 MB); its code objects match Homebrew LLVM's byte for byte except the linker's name in `.comment`; one translation takes about
+  30 ms on the rig. A partial threadgroup's `threads_per_threadgroup` is its own size in Metal (measured on Apple's GPU), not the requested
+  one. **On the card (2026-10-21): vadd, grid2d and mtlprobe's new `mix` (a kernel only the guest has: read and written buffers, threadgroup
+  position, position in the threadgroup, a partial last group) were each translated at run time and are correct (`0 of 100 wrong`), 27 us
+  each on the card.** Open: one boot before that run froze with a panic in `AppleGPUWrangler` (null pointer in its work loop, 2 s after the
+  host publishes the fake GPU at `rdna4-pvgpu-delay`); the next boot with the same kext did not; that boot also lit only the DP display, at
+  another resolution, before the host started. The helper parses data from Metal clients as root: sandbox it before it is on by default.
+- **M3, third step: several pipelines per process.** A compute pipeline's resource (type 7) has a 24-byte descriptor `{u32 0xb, u32 24, u32
+  its own id, u32 7, u32 (function id << 24) | 0x040001, u32 0}` (pipelines 2 and 4 of one process: 0x01040001 and 0x03040001, their
+  functions are resources 1 and 3; ids above 255 not seen). A function's descriptor is `{u64 metallib address, u32 metallib bytes, u32 0xf,
+  u32 0x14, u32 its own id, ...}`, and each function has a metallib of its own even when the source library has several kernels (add1 at
+  0x101000, 0xd70 bytes, mul3 right after it at 0x101d70). `CreateComputePipeline {u32 task, u32 pipeline id, u32 5, u32 6, u64 address}`
+  does not name the function (5 and 6 for every pipeline). **On the card (2026-10-21): mtlprobe's `two` (two kernels of one library) and
+  `twolib` (two libraries) each run two pipelines back to back in one command buffer, all four kernels translated at run time: both
+  `0 of 64 wrong`.**
+- **M3, fourth step: the common parts of the language.** Before code generation the translator inlines the AIR function into the
+  kernel, drops the module's other kernels (one unsupported kernel no longer sinks the rest) and legalises the body (`legalize()` in
+  `tools/metal/m3/air2amdgpu.cpp`): AIR's constant address space (2) is AMDGPU's GDS, so constant buffers become global memory again; local
+  arrays move to address space 5 (they must stay out of scratch, which the runtime does not give kernels: LLVM keeps small ones in
+  registers); `air.*` calls (Metal compiles with fast math, so `air.fast_sqrt.f32` and the like) become LLVM intrinsics, `pow` becomes
+  `exp2(y log2 x)`, `rsqrt` `1 / sqrt`; `air.wg.barrier(flags, scope)` becomes fence, `s_barrier`, fence; `air.atomic.{global,local}.<op>`
+  becomes `atomicrmw` (relaxed, device or workgroup scope). Threadgroup memory is address space 3 on both sides. Refused by name for now:
+  SIMD-group functions (`air.simd_sum`...), constant tables in AIR's constant address space, anything else unmapped. **On the card
+  (2026-10-21): mtlprobe's `feat`, nine kernels (constant reference, struct and array, math, a threadgroup reduction with barriers, device
+  atomics, a local array indexed by data, integer functions, half), all translated at run time and equal to the CPU's results.** Not
+  decoded yet: `setBytes` (inline constants), a common way to pass small constants.
+- **M3, fifth step: the rest of the usual compute encoder.** `setBytes` needs nothing of its own: the driver copies the bytes into a buffer
+  of its own and binds it with `setBuffers` (resource 4, offsets 0 and 0x20 in mtlprobe's `bytes`). `Compute.dispatchThreadgroups` (0x0c8)
+  is `{u64 groups[3], u64 threads per group[3]}` and was skipped until now; `Compute.setBufferOffset` (0x0cf) is `{u32 index, u64 offset}`.
+  **On the card (2026-10-21): mtlprobe's `bytes` (setBytes, dispatchThreadgroups, setBufferOffset) `0 of 64 wrong`; all other probes pass.**
+- **M3, sixth step: SIMD-group functions and conversions.** A Metal SIMD group is a wave of 32 (Metal's width; the kernels are wave32):
+  `thread_index_in_simdgroup`, `simdgroup_index_in_threadgroup` and `simdgroups_per_threadgroup` come from the thread's linear index in its
+  group (x fastest, the order the hardware packs waves); reductions are `llvm.amdgcn.wave.reduce.*` (active lanes only, as on Apple's GPU),
+  shuffles and broadcast `llvm.amdgcn.wave.shuffle`, ballot/any/all `llvm.amdgcn.ballot`, prefix sums five upward shuffles (right when the
+  inactive lanes are the top ones, as at the grid's edge). Measured on Apple's GPU first: a shuffle up or down past the group's edge keeps
+  the lane's own value. `air.convert.<to kind>.<to type>.<from kind>.<from type>` (kinds f, s, u) become LLVM casts, float to integer
+  saturating; every kernel mixing integers and floats needs them. **On the card (2026-10-21): mtlprobe's `simd` (40 threads: a full SIMD
+  group and one of 8 lanes; reductions, prefix sums, shuffles, broadcast, ballot, any/all, the indices) 0 of 432 results wrong.**
+- **M4, first look at draws (2026-10-21, measured with mtlprobe's `tri` and `drawargs`).** A render pipeline has no FIFO command of its
+  own: it is a resource (type 7, like a compute pipeline) whose descriptor starts with the same 16-byte header `{u32 tag (0xe render, 0xb
+  compute), u32 bytes, u32 its own id, u32 ?}` and continues with a list `{u8 count, count x {u8 key, u8 size, value}}`: render key 1 =
+  the vertex function's resource id, key 2 = the fragment function's, key 8 = 0x14 (not known); compute key 0 = the function (so the
+  compute rule "top byte of the fifth dword" is this list for small ids). After the list come the attachment states: 0x50 = 80 =
+  MTLPixelFormatBGRA8Unorm for colour attachment 0. `Render.setRenderPipelineState {u32 id}`. The draws are one opcode per encoding,
+  odd = compact 16-bit fields: 0x001 `{u32 primitive type, u16 vertex start, u16 count}`; 0x003 `{u16 start, u16 count, u16 instances, u16
+  type}`; 0x005 `{u16 start, u16 count, u16 instances, u16 base instance, u32 type}`; 0x007 drawIndexed `{u32 type, u32 index buffer, u16
+  count, u16 offset}` (uint16 indices; the even opcodes are the wide forms, not seen yet). Executing a draw needs the vertex function as an
+  NGG shader and the fragment function as a pixel shader: LLVM compiles an `amdgpu_gs` function with the ABI of `src/shaders/nggcol.s`
+  (`llvm.amdgcn.init.exec`, position and primitive exports) to almost the same code as the hand-written shader, and its PAL metadata gives
+  RSRC1 and the VGPR count; the draw itself can be the template stream of `src/gfx12_draw.h` with its target, viewport and draw patched.
+- **M4, second step: a Metal triangle drawn on the card (2026-10-21).** The helper translates vertex and fragment functions too
+  (`translateShader()` in `tools/metal/m3/air2amdgpu.cpp`): a vertex function becomes an `amdgpu_gs` NGG shader with the ABI of
+  `src/shaders/nggcol.s` (s3 = merged_wave_info, v0 = the packed primitive, v3 = VertexID; `llvm.amdgcn.init.exec`, pos0 and prim
+  exports; no GS_ALLOC_REQ: the stream sets PRIMGEN_PASSTHRU_NO_MSG), a fragment function an `amdgpu_ps` exporting MRT0 as 4 x fp32; both
+  are compiled for `amdgcn-amd-amdpal`, whose metadata note gives RSRC1/RSRC2 and SPI_PS_INPUT_ENA/ADDR, and handed back as an `RGFX` blob
+  `{"RGFX", u32 stage, u32 code bytes, u32 RSRC1, u32 RSRC2, u32 PS_INPUT_ENA, u32 PS_INPUT_ADDR, u32 0}` + code. The host
+  (`runDraw()` in `src/pvgpu.cpp`) takes the pipeline's functions from its descriptor (keys 1 and 2), the target from the render pass's
+  colour attachment, and draws with the stream of `src/gfx12_draw.h` (built by `userspace/rdna4-run/gfx12tri.h`, the triangle every gfx
+  test draws) with the translated shaders, their registers, the target's size (CB_COLOR0_ATTRIB2 = pitch - 1 << 16 | height - 1, the
+  window and viewport scissors), the viewport (Y scale -h/2: Metal's y points up) and the vertex count patched; the BGRA8 texture is
+  staged through a linear RGBA8 target (pitch a multiple of 32 pixels) and swapped on the way in and out. **On the card: mtlprobe's
+  `tri` (vertices from vertex_id, a constant colour, 64x64 BGRA8) equals Apple's GPU: centre 64 128 255 255, upright, 512 pixels lit;
+  16 us for the draw.** So far: triangle lists from vertex 0, one instance, no vertex buffers, no vertex outputs but the position, no
+  fragment inputs; anything else is refused by name. The rig once failed the compute bring-up at stage 4 (SDMA's test write did not land)
+  after a warm restart; a cold boot cleared it.
+- **M4, third step: a value from the vertex to the fragment shader (2026-10-22).** One `vertex_output` (float to float4, padded to a vec4)
+  goes to the attribute ring as `src/shaders/nggcol.s` stores it: `buffer_store_b128` at index = thread in the subgroup
+  (`mbcnt(merged_wave_info[27:24] << 5)`), soffset = `gs_attr_offset << 9`, scope device, lanes up to the vertex count rounded to 8 (zeros
+  in the padding lanes); the ring's descriptor is three `s_mov_b32` literals 0xc01a0001-3 written as inline asm (so they stay literals) and
+  patched by the host as for nggcol.s. The fragment shader reads one interpolated `fragment_input` (centre, perspective) with
+  `llvm.amdgcn.lds.param.load` + `interp.inreg.p10/p2` (PrimMask in s0: RSRC2_PS.USER_SGPR = 0) and gets `[[position]]` from POS_X..W
+  (its arguments follow the hardware's pixel inputs in order; LLVM enables what is used). With one attribute the host draws with the
+  colour triangle's stream (`src/gfx12_draw_col.h`, one parameter). The rig's Metal compiler marks a stage_in `[[position]]` used where
+  the local one marks it unused: handle both. A failed translation is now asked again once a newer helper connects. **On the card:
+  mtlprobe's `tricol` (red, green, blue vertices, 64x64) is exact against the CPU's barycentric colours, worst error 0 over 512 pixels,
+  the same pixels as Apple's GPU; `tri` and every other probe still pass.**
+- **M4, fourth step: buffers in vertex and fragment shaders (2026-10-22).** `Render.setVertexBuffers` (0x07d) and `setFragmentBuffers`
+  (0x06e) are `{u32 first, u32 count, count x {u32 resource id, u64 offset}}` like Compute.setBuffers (measured: the probe's vertex buffer
+  as resource 6, setVertexBytes / setFragmentBytes as resource 7 at offsets 0 and 0x20); `setVertexBufferOffset` (0x07e) and
+  `setFragmentBufferOffset` (0x06f) `{u32 index, u64 offset}` (assumed like Compute's, not yet seen). Both stages take two user SGPRs, the
+  address of a table of 64-bit buffer addresses by Metal index: the merged NGG stage has eight system SGPRs, so its user SGPRs are s8-s9
+  (RADV's dump on the card: USER_SGPR = 3, merged_wave_info still s3, its first user value s8), the pixel shader's s0-s1 (PrimMask then
+  s2). The translated shaders load their addresses from the table with scalar loads; the host stages each stage's bound buffers into the
+  runtime per draw (read-only), writes the tables into the misc page (+0x100 vertex, +0x200 fragment), adds `SET_SH_REG
+  SPI_SHADER_USER_DATA_GS_0/1` and `_PS_0/1` before the draw and sets USER_SGPR = 2 in both RSRC2s. **On the card: mtlprobe's `vbuf`
+  (corners from a vertex buffer, a scale from setVertexBytes, the colour from setFragmentBytes) equals Apple's GPU: 496 pixels, colour and
+  half right; tri and tricol (now with this ABI) still exact.**
+- **M4, fifth step: strips, a first vertex, instances, indexed draws (2026-10-22).** The vertex stage gets two more user SGPRs: s10 the
+  first vertex (added to VertexID, as RADV's base vertex), s11 the instance id (USER_SGPR = 4). The host runs the four compact draws
+  (0x001, 0x003, 0x005, 0x007): VGT_PRIMITIVE_TYPE 4 (list) or 6 (strip); instances as repeated draws in the one IB with USER_DATA_GS_2/3
+  set before each (up to 32); an indexed draw stages its 16-bit indices and sets VGT_INDEX_TYPE with SET_UCONFIG_REG_INDEX (0x7a, reg
+  0x243, index 2, as RADV on gfx9+), then DRAW_INDEX_2 `{max indices, address, count, DI_SRC_SEL_DMA}`, all in place of the template's
+  DRAW_INDEX_AUTO. **On the card: mtlprobe's `drawmodes` (a strip from vertex 3, 3 instances, base instance 3, an indexed quad from
+  offset 4) equals Apple's GPU pixel for pixel per colour (361, 135, 45, 361).** Not yet: lines, points, a base vertex in indexed draws,
+  32-bit indices, more than 32 instances.
+- **M4, sixth step: textures and samplers in fragment shaders (2026-10-22).** Measured (mtlprobe's `texinfo`, the kext dumping each
+  resource): a texture resource (type 2) is `{u64 bytes, u32 start page, u32 (array << 16) | mips, ..., from dword 9 one record per level
+  {u64 offset, u64 bytes, u64 bytes per row, u32 width, height, depth}, then ..., 0x2c, its own id, (Metal pixel format << 16) | usage,
+  ...}` (29 dwords with one level); a sampler resource is type 7 tagged 3, 36 bytes, dword 3 = mag [1:0], min [3:2], address s [10:8], t
+  [14:12], r [18:16], mip [25:24], anisotropy [30:26], normalized [31] (Metal's enums), dword 6 the max LOD (float);
+  `Render.setFragmentTextures` (0x072) and `setFragmentSamplerStates` (0x070) are `{u32 first, u32 count, count x u32 id}`. A constexpr
+  sampler is a global `[2 x i64]` in AIR's constant address space: address s [2:0], t [5:3], r [8:6] (0 zero/border, 1 edge, 2 repeat, 3
+  mirror), mag [9] / min [11] linear, mip [14:13], pixel coordinates [15], compare [18:16], anisotropy [23:19] = 2n - 1, min / max LOD
+  halves at [39:24] / [55:40], border colour [57:56] (decoded against the Metal compiler). The translator gives the fragment stage its
+  textures and samplers as the addresses of their descriptors in its table (T# at +64 + 32 n, S# at +320 + 16 n) and maps
+  `air.sample_texture_2d` to `llvm.amdgcn.image.sample.2d` and `air.read_texture_2d` to `image.load.2d` (descriptors loaded through the
+  constant address space so they are SGPRs; their types are overloads of the intrinsics in LLVM 23); a constexpr sampler becomes an S#
+  constant. The host stages mip level 0 of each bound texture at a pitch of a multiple of 128 bytes and writes its gfx12 T# (linear,
+  custom pitch in DEPTH, Mesa's ac_build_gfx12_texture_descriptor) and each sampler's S#: formats RGBA8/BGRA8 (unorm, sRGB), R32F,
+  RGBA16F, RGBA32F. **On the card: mtlprobe's `texdraw` (a 4x4 RGBA8 texture, nearest, over a 64x64 quad) 0 of 4096 pixels wrong;
+  every other probe still passes.** A managed texture's replaceRegion lands in the guest's pages directly. Not yet: mip levels past 0,
+  anisotropy, LOD clamps, border colours, vertex-stage textures, other sample variants (LOD, bias, offset, gradients).
+- **M4, seventh step: blending, write masks and the blend colour (2026-10-22).** Measured (mtlprobe's `blendinfo`): after a render
+  pipeline's function list come a second list (empty so far), u32 colour attachments, u32 ?, then per attachment `{u8 n, n x {u8 key,
+  u8 size, value}}`: 0 index, 1 pixel format, 2 blending, 3 / 4 / 5 colour source factor, destination factor, operation, 6 / 7 / 8 the
+  same for alpha, 9 write mask (Metal's enums; defaults off, One, Zero, Add, One, Zero, Add, 0xf); `Render.setBlendColorRed` (0x065) is
+  four floats. The host sets CB_BLEND0_CONTROL (Metal's factors are AMD's BlendOp in another order; min and max want both factors One),
+  SX_MRT0_BLEND_OPT (no optimisation, the operation's OPT_COMB; 0 there would say the source is ignored), CB_TARGET_MASK and CB_BLEND_RED
+  .. ALPHA. **The card ignores SEPARATE_ALPHA_BLEND in our state:** mtlprobe's `blendx` (blend colour alpha 0.25 against RGB 0.5) showed
+  alpha always taking the colour equation; RADV sets the bit the same way, and DISABLE_DUAL_QUAD, SX_BLEND_OPT_CONTROL (both opt
+  disables: blending is skipped altogether) and SX_PS_DOWNCONVERT_CONTROL changed nothing (one boot, the kext cycling through them).
+  Untested difference from RADV: our fragment shaders export 32_ABGR into an 8-bit target (RADV exports FP16 with an 8_8_8_8
+  down-conversion). So each pass has one equation for all four channels, and when alpha's differs the draw runs twice in the same IB:
+  colour only, then alpha only with its own equation (a colour factor reading destination alpha sees the alpha from before the draw;
+  exact unless such a draw overlaps itself). **On the card: `blend` (source-over, additive, blend colour with alpha One, write mask red +
+  alpha) and `blendx` (blend colour on colour only, keep alpha, keep colour, blend colour on all) 0 of 32 channels off; every other probe
+  still passes.** The host also no longer publishes the fake GPU when the compute runtime is not up (a boot where stage 2 failed had
+  published it, and every probe "completed" with nothing run). Seen in passing: iTerm2 on the rig draws through Metal on our device
+  (several of its functions translated; its draws not run yet: render targets that are not linear 32-bit textures, a vertex function
+  not translated, no or more than 32 instances).
+- **M4, eighth step: several values between the stages (2026-10-22).** AIR names each vertex output and fragment input
+  (`generated(...)` or the `user(...)` name: operand 1 of an `air.vertex_output`, operand 2 of an `air.fragment_input`, which also lists
+  `air.flat` / `air.center` / `air.centroid` and `air.perspective` / `air.no_perspective`); the stages are linked by those names. The
+  translator gives the vertex function's outputs ring slots in declaration order (slot n stored at offset 16 n, as Mesa's
+  ac_nir_store_parameters_to_attr_ring) and the fragment function's inputs hardware inputs in argument order, and appends to each RGFX blob
+  a table {FNV-1a hash of the name, flat}; the host sets SPI_PS_INPUT_CNTL_k (OFFSET = the vertex slot with input k's name, FLAT_SHADE)
+  and SPI_SHADER_GS_OUT_CONFIG_PS (VS_EXPORT_COUNT, NUM_INTERP). Values: up to four floats, halves (widened to float) or integers up to 32
+  bits (bool included; zero-extended), at most 16 per stage; interpolated values from LLVM's `lds.param.load` + `interp.inreg.p10/p2` with
+  the perspective or linear centre barycentrics, flat ones from quad lane 0 of `lds.param.load` (DPP quad_perm 0,0,0,0, as ACO).
+  `air.discard_fragment` is `llvm.amdgcn.kill`. **Found on the card (one-value cases, 2026-10-22):** (1) the attribute ring descriptor's
+  stride must be 16 bytes per value (RADV's radv_nir_lower_abi ORs `16 * params` in); with 16 every value past the first read back zeros
+  or garbage; (2) the draw templates carry PA_SU_SC_MODE_CNTL.PROVOKING_VTX_LAST from the Linux capture, so flat values came from each
+  triangle's last vertex: the host clears it (Metal's provoking vertex is the first); (3) PERSP_CENTROID barycentrics are wrong when
+  PERSP_CENTER is also enabled (each alone, and linear centre with perspective centroid, are right): centroid inputs are read at the centre,
+  exact for our single-sample targets (radeonsi also forces the centre without MSAA). **On the card: mtlprobe's `varyings` (float3
+  perspective, float without perspective, half2 centroid, uint and bool flat) 0 of 3660 pixels off, worst 0; every other probe still
+  passes.** iTerm2's background-colour shaders (a float4 and a flat bool, a discard) now translate; still missing for it: constant tables
+  in the fragment shader (`iTermTextureCursorFragmentShader`) and render targets other than linear 32-bit textures.
+- **M4, ninth step: every function in iTerm2's Metal library translates (2026-10-22).** Running all 63 functions of iTerm2's
+  `default.metallib` through the translator on the Mac (39 translated) found: constexpr samplers stored as one `i64` (23 functions; the
+  "constant table" refusal was never a table; the Metal compiler also emits `[2 x i64]`, both decode the same), `fmod` (LLVM `frem`, C's
+  fmod), `clamp` (float, signed, unsigned: min(max())), `dot`, `mix` (x + (y - x) a), `get_width` / `get_height_texture_2d` (from the T#
+  the host writes: width - 1 in word1 [31:30] and word2 [13:0] << 2, height - 1 in word2 [27:14]; >> lod, at least 1), and helper functions
+  left in the module after inlining (never legalised, so a private array in one failed verification: unused functions now go before the
+  module is checked). **63 of 63 translate; on the card mtlprobe's `texsize` (a constexpr sampler, a 4x2 texture's width and height,
+  `discard_fragment` on the right quarter) 0 of 4096 pixels wrong and `feat`'s `vecmath` (fmod, clamp, dot, mix) right; every other probe
+  still passes.** The rig's Metal compiler emits the two-word sampler for the probe, so the one-word form is checked only through iTerm2's
+  shaders translating. iTerm2's draws still need render targets other than linear 32-bit textures.
+- **M4, tenth step: iTerm2 draws correctly through the card (2026-10-22).** What it took, each found on the card and each with a probe:
+  - **IOSurface render targets.** A window's drawable is a type-5 resource (56 bytes: dword 0 the IOSurface id, dword 5 Metal pixel format
+    << 16, dwords 6 and 7 width and height). The host is the guest's own kernel, so it looks the surface up: IOSurfaceRoot::lookupSurface(root,
+    id, task) returns it retained (IOSurface::tryRetain), but only for the owner's task (find_surface), which the host reads from the root's
+    id table first (Tahoe 25G83: root +0xd0 table, +0xd8 count; surface +0x10 id, +0x170 owner task; checked against the id twice); then
+    getMemoryDescriptor / getBytesPerRow / getWidth / getHeight / getPixelFormat / getBaseOffset. The plugin resolves the eight functions
+    through Lilu when the IOSurface kext loads. Draws and clears go row by row through the surface's memory (padded rows allowed).
+    `surfdraw`: a padded IOSurface target, every pixel and the padding checked.
+  - **Instancing in hardware.** iTerm2's text is one instance per character cell (64 and more per draw; the host's repeated draws stopped
+    at 32): NUM_INSTANCES (PM4 0x2F) and one draw per pass; the vertex shader takes InstanceID from v4 (gfx12 NGG: v0-v2 the GS's, v3
+    VertexID, v4 InstanceID, loaded with RSRC2_GS.ES_VGPR_COMP_CNT = 1 as RADV) plus the base instance in s11. `manyinst`: 1024 instances.
+  - **Whole-quad mode for fragment inputs.** A flat input's DPP broadcast from quad lane 0 ran in exact mode, so quads whose lane 0 the
+    triangle does not cover got garbage (tiny triangles: every glyph). The broadcast and the interpolation now run in WQM (llvm.amdgcn.wqm),
+    as ACO. Found by `manyinst` (each 2x2 square only its first pixel right).
+  - **setViewport.** iTerm2 sets {-width, 0, 2 width, 2 height} and its vertex shader relies on it; the host used the whole target. Now
+    PA_CL_VPORT_X/YSCALE and OFFSET come from Render.setViewport (0x082, six doubles; reset by each encoder), converted with integer
+    operations, whole pixels only so far. `viewport`.
+  - **The pipeline's label.** A render pipeline descriptor carries its label as a C string between the function list and the colour
+    attachments (then 4-aligned; "the second list, empty so far" was the empty label's zero byte). With iTerm2's label the blend state was
+    misread as off, so each glyph's 22x20 quad (cells are 7x17) painted its transparent part over its neighbours: letters cut on the right.
+    `blend` and `glyphs2` now name their pipelines.
+  - **Checks that ruled things out:** `texlinear` (linear filtering), `fragpos` ([[position]] in the fragment shader), `glyphs` (64 instanced
+    quads with three values), `glyphs2` (iTerm2's text draw copied: branches, uint2 viewport size, a 4-channel atlas, blending, the 2x viewport;
+    its raw output compared byte for byte with Apple's GPU's).
+  - **Also:** BGRA8 texture targets may have padded rows (height from the descriptor; small targets have them); `pvlog`'s budget is 30000
+    lines (4000 ran out by 218 s); draw lines are counted per task (40 each, again for each new task) and log each draw's buffers (first
+    8 dwords) and textures; the first two command buffers of each task are listed command by command.
+  **On the card: iTerm2's window draws correctly; every mtlprobe check passes, and `glyphs2` matches Apple's GPU pixel for pixel.** iTerm2
+  starts at login, before the fake GPU is published (121 s), and then draws on the CPU; reopened later it uses the card. Seen in passing:
+  macOS's screenshot tool sends Blit.copyFromTexture and a compute pass with textures, neither run by the host yet.
+- **Translator coverage of macOS's own shaders (2026-10-26, on this Mac only: the rig is down).** Core Animation's
+  `QuartzCore.framework/.../default.metallib` is a fat file (`cafebabe`): slice 0 (CPU type 0x01000017) is the AIR library (180 functions),
+  the other 18 are precompiled Apple-GPU Mach-Os; WindowServer's is `SkyLight.framework/.../SkyLightShaders.air64.metallib` (31). Translating
+  every function: Core Animation 15 -> 81 of 180, SkyLight 8 -> 11 of 31, iTerm2 still 63 of 63, after adding a fragment colour of float or
+  half, scalar to four (or a one-member struct), to attachment 0; `saturate`, `sign`, `any`, `all`; `dfdx`, `dfdy`, `fwidth` (fine
+  derivatives: DPP quad_perm differences inside the pixel quad, in whole-quad mode); samples with a bias (`image.sample.b`), an explicit LOD
+  (`.l`, `.lz` for 0) and constant texel offsets (`.o`, packed x [5:0], y [13:8]), and half texels (LLVM makes them d16); `ushort` vertex
+  and instance ids (and ushort compute positions), which had produced invalid IR (an i32 passed for an i16). Still refused: several or
+  integer render targets (22), vertex descriptors (`air.vertex_input`: 18 + SkyLight 7; needs the paravirtual descriptor's layout, measured
+  on the rig), Apple's `imageblock` tile memory (16; not for this device), textures past index 7 (12), integer texture reads (7), vertex-stage
+  textures (6), function constants (5 + SkyLight 7). Not run on the card yet; `mtlprobe coverage2` checks most of it (passes on this Mac's GPU).
+  The host stages only mip level 0, so LOD and bias samples of a mipmapped texture will differ from Apple's until mip levels are staged.
+- **Textures: 16 per stage, and in vertex shaders (2026-10-26, not run on the card).** Each stage's table (the host's misc page: vertex at
+  +0x400, fragment at +0x800, the fence still at +0) has the buffers at +0, T# n at +64 + 32 n and S# n at +576 + 16 n for n 0-15
+  (`RDNA4_MTLC_TABLE_TEXTURES` / `_SAMPLERS` in `include/rdna4mtlc.h`, shared by the host and the translator). The host takes
+  `Render.setVertexTextures` (0x081) and `setVertexSamplerStates` (0x07f) with the fragment ones' layout (assumed, not measured). A vertex
+  shader has no pixel quads, so its implicit-LOD and bias samples read level 0 (`image.sample.lz`). Mip levels are still not staged: a
+  linear image's mip chain has to be laid out as the hardware addresses it, which wants the card to check. `mtlprobe coverage2` now also
+  samples vertex texture 9 and fragment texture 12. Core Animation 83 of 180; the rest of its texture refusals are compute kernels with
+  textures (not supported yet).
+- **Compute kernels with textures (2026-10-26, not run on the card).** Every translated kernel now takes one more kernarg after the six
+  dimensions: the address of a texture and sampler table of the shader tables' layout (0 without textures; the table's precompiled kernels
+  ignore it). The host binds `Compute.setTextures` (0x0ce) and `setSamplerStates` (0x0cc) (`{first, count, ids}`, as seen in the rig's log
+  for the screenshot tool), stages them with the draws' code (`stageTextures`, shared now), and after the dispatch copies back the textures
+  whose Metal usage has ShaderWrite (`releaseTextures`). The translator maps `write_texture_2d` to `image.store`, samples at level 0 outside
+  fragment shaders, and gives `threadgroups_per_grid` (grid / group size, rounded up). Core Animation 86 of 180 (3 of its 6 texture kernels;
+  the other 3 take threadgroup memory as an argument, sized at dispatch: not supported yet). `mtlprobe ctex` (read, sample, write,
+  threadgroups_per_grid) passes on this Mac's GPU.
+- **Reading the render target in a fragment shader, and fragment shaders without a colour (2026-10-26, not run on the card).** Metal's
+  `[[color(0)]]` input (programmable blending; WindowServer's in-place shaders `InPlaceSover`, `InPlaceAlphaUnpremultiply`,
+  `InPlaceColorOrClampEDR` use it): AMD has no framebuffer fetch, but the host stages the target for each draw anyway, so every draw's
+  fragment table gets a T# of that staged RGBA8 copy at `RDNA4_MTLC_TABLE_FRAMEBUFFER` (+832), and the translator turns the input into an
+  `image.load` at the pixel's position. A pixel the same draw covers twice reads the value from before the draw. A fragment function that
+  returns nothing (it writes textures) ends with an mrt0 export with no channels (gfx11+ has no null export target) and is flagged (bit 31
+  of the RGFX attributes word); the host then sets SPI_SHADER_COL_FORMAT and CB_TARGET_MASK to 0. Textures the shaders may write
+  (ShaderWrite) are copied back after draws too, and texture reads and writes take ushort coordinates. Core Animation 90 of 180, SkyLight
+  (WindowServer) 14 of 31, iTerm2 63 of 63. `mtlprobe fbfetch` passes on this Mac's GPU.
+- **The freezes at the fake GPU's publish (solved, 2026-10-21).** Three boots froze: `AppleGPUWrangler` (null pointer in its work loop)
+  1.5-2 s after the delayed publish. In the two with a readable log the kext's `IONDRVSupport` hook had never run, so the card was never
+  brought up (only the firmware's picture, on the DP display) and the delayed publish fell back to the platform expert, the emulator's
+  case: Apple's driver came up on a GPU with nothing behind it. On real hardware the host no longer publishes without the card
+  (`rdna4-pvgpu` builds without `VMTEST`); the next such boot logs `not publishing after the delay` (seen twice on 2026-10-22, no freeze).
+  **Why the hook did not run (2026-10-22):** SimpleHDA (restores AppleHDA on Tahoe) loads `IONDRVSupport` itself the moment the system kext
+  collection is ready; on the bad boots that was at 18 s and Lilu, whose load notice our hook depends on, reported no load before 21 s; on
+  a good boot it was at 24 s and our hook ran in the same millisecond. All four 2026-10-17 freezes (the day after SimpleHDA was installed)
+  are this crash at 121 s. The kext now checks from 30 s on whether its hook ran, and if not routes IONDRVSupport itself (its kmod, as
+  Lilu finds kexts) and registers the GPU again so IONDRVFramebuffer starts once more through the routes (`lateNdrvCheck` in
+  `src/plugin.cpp`). First run on a bad boot: routing failed with "no loaded symbols buffer found": Lilu loads a kext's running symbols
+  (`updateRunningInfo`) before its load callbacks, which the late check now does too. **Second bad boot (2026-10-22): the late check
+  routed at 31 s and the kext took the boot display at 34 s ("ours"), but the second display stayed dark:** the head-2 nub is made in the
+  routed `IONDRVFramebuffer::start`, and the existing framebuffer had started before the routes (registering the GPU again does not start
+  a second one). Compute stopped at stage 2 (PSP) on that boot, cause not known (late attach, or not a cold start).
+
 ## 6. What is implemented now (code)
 
 - `src/pvstream.{hpp,cpp}` + generated `src/pvopcodes.inc`: names/lengths of the three layers (binary-searched), `fifoHeader`/`describeFifo` (FIFO framing validation and per-command description), `streamHeader`/`walkCommands` (stream and operation framing), `segmentTypeName`. Host test `test/pvstream-test.cpp` (in `make test`): framing across a ring wrap, barriers, malformed headers, unknown ids, truncation, table spot checks against the values read above.
+- `src/pvdraw.hpp`: the host's pure draw helpers (`unorm8`, `wholeDouble`, `halfAsFloat`, `linearImage`, `BlendPass`, `readBlendState`). Host test `test/pvdraw-test.cpp` (in `make test`): the integer-only conversions against the host's floating point, blend registers, the blend state from iTerm2's labelled pipeline descriptor (rig log 2026-10-22) and an unlabelled one, a linear T#. It found `unorm8` shifting by 64 or more for values below 2^-11 (undefined; now 0 below 2^-9, which rounds to 0 anyway).
 - `src/pvgpu.cpp` polling host: every new FIFO span is walked as commands and logged as `host: fifo @0x...: cmd 0x3a GetDeviceInfo, 24 bytes (12 payload), 0 barrier(s), signal 0x7: reply buffer page 0x1234, 4096 bytes`; a span that does not start with a command header is hex-dumped (12 times) and abandoned; everything is acknowledged (`FIFO_READ = FIFO_WRITTEN`). The self-test sends two valid commands, one across the ring wrap. Still log-and-consume, default off.
 - Child channels (`DefineChannel` -> record in the root page -> page-list ring, polled every tick, commands decoded and answered, per-channel stamp and interrupt bit): implemented in the M0 host and self-tested (`docs/m0-pvgpu.md`, hub-task-447). The page list has no length field: the host takes the entries up to the first zero (the driver zeroes the page first).
 - Display pipe (hub-task-451, `src/pvgpu.cpp` + `pvstream::disp`): the shared-state page stays mapped; optional *online* event with the display info (`rdna4-pvgpu-disp` bit 0), ~60 Hz VBL events for pipes whose guest enabled VBL (bit 1, default), level-triggered `INTR_STATUS_DISP`, the 0x02/0x04-0x07/0x1e commands decoded and counted (their completion is the generic stamp), cursor fields and the `ctrl+0x220` kick logged; self-tested (`docs/m0-pvgpu.md` Test A).

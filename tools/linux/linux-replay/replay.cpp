@@ -145,7 +145,7 @@ int main() {
 	CHECK(amdgpu_cs_ctx_create(dev, &ctx));
 
 	const uint64_t vramCpu = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
-	Buf code = alloc(0x2000, 0x1000, AMDGPU_GEM_DOMAIN_VRAM, vramCpu);                 // VS at 0, PS at 0x1000
+	Buf code = alloc(RDNA4_TRI_CODE_BYTES, 0x1000, AMDGPU_GEM_DOMAIN_VRAM, vramCpu);   // VS at 0, PS at RDNA4_TRI_PS_OFFSET
 	Buf target = alloc(kWidth * kHeight * 4, 0x1000, AMDGPU_GEM_DOMAIN_VRAM, vramCpu);
 	if (col && rdna4_tricol_ring_bytes() != kRingBytes) { fprintf(stderr, "G4 ring size differs from G3\n"); return 1; }
 	// G4: the ring is CPU-visible and pre-filled with a pattern so that what the NGG stage stored can be listed afterwards.

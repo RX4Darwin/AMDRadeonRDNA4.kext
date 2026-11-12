@@ -71,6 +71,9 @@ const char *segmentTypeName(uint8_t type);
 // and parses `bytes/8` pairs {u32 key, u32 value} into a 224-byte APVDeviceInfoStruct (parseDeviceInfo). Keys 0 and 0x2b and anything above 0x2c are ignored.
 constexpr uint32_t kDeviceInfoBytes = 224;
 constexpr uint32_t kDeviceInfoRecord = 0x2d;
+// Sequoia's (24H232) driver names the same buffer in record 0x2a and parses keys 1-0x29 only, the same keys as Tahoe's up to there (its key 0x12
+// is MaxMetalShaderVersion too): the reply needs no change.
+constexpr uint32_t kDeviceInfoRecordSequoia = 0x2a;
 struct DeviceInfoKey {
 	uint8_t key;
 	uint8_t value;      // offset of the u32 value in the struct
@@ -97,7 +100,7 @@ constexpr uint32_t kId = 0x00, kName = 0x04, kNameBytes = 14, kPort = 0x12, kWid
 constexpr uint32_t kCursorWidth = 0x18, kCursorHeight = 0x1a, kTxnProtocol = 0x1c, kFlags = 0x20;
 constexpr uint32_t kOriginX = 0x4c, kOriginY = 0x4e, kScale = 0x50;
 constexpr uint32_t kPending = 0x100, kEnabled = 0x104;      // host sets bits in kPending; the guest enables them in kEnabled
-constexpr uint32_t kCookie = 0x200, kModeCount = 0x208, kModes = 0x210, kModeStride = 16, kMaxModes = 8;
+constexpr uint32_t kCookie = 0x200, kModeCount = 0x208, kModes = 0x210, kModeStride = 16, kMaxModes = 16;
 constexpr uint32_t kCursorPos = 0xe00, kCursorVisible = 0xe04;
 constexpr uint32_t kEventVbl = 1, kEventOnline = 4, kEventOffline = 8;   // bits of kPending / kEnabled (enable() stores 0xc; enableVBLInterrupt ORs 1)
 constexpr uint32_t kFlagCursorVisibleKick = 1, kFlagCursorMoveKick = 2;  // kFlags: tell the host (ctrl+0x220 = port) when the cursor appears / moves
