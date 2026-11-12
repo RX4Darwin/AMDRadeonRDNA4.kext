@@ -3,7 +3,9 @@
 A **display driver** for the AMD Radeon **RX 9070 XT** (Navi 48 / RDNA 4,
 PCI `0x1002:0x7550`) on x86_64 Hackintosh, built as a **Lilu plugin** against
 MacKernelSDK and injected by OpenCore. Cross-compiles on Apple Silicon and on
-Linux/WSL. No 3D/Metal acceleration (see Scope below); rendering is software.
+Linux/WSL. Metal on macOS Tahoe and Sequoia runs through Apple's paravirtual GPU, served on the card by the
+kext (experimental, built only with `make PVGPU=1`: [Metal](#metal-on-macos-tahoe-and-sequoia-experimental)); without
+it rendering is software.
 
 Until October 2026 the driver was called RDNA4FB; log files written before then carry that name. Versions are in
 [CHANGELOG.md](CHANGELOG.md); branches, version numbers and how a build names its commit are in
@@ -23,7 +25,10 @@ boot display plus a second desktop on a 1080p HDMI monitor whose pipe the
 kext lights itself (`docs/second-pipe.md`). Since 2026-10-06 that needs no
 boot-arg: a second display on either HDMI connector, mode switching on
 both displays and hot-plug of the second are on by default, each with a
-boot-arg to turn it off (below).
+boot-arg to turn it off (below). Since 2026-11-10 a `make PVGPU=1` build gives
+macOS Tahoe 26.6.2 a Metal desktop on the card: WindowServer composites through
+the card, and the Dock and apps draw with Metal; Liquid Glass's kernels run
+since 2026-11-11 (Sequoia 15 tested by Jan Claußen). See [Metal](#metal-on-macos-tahoe-and-sequoia-experimental).
 
 > **Why a Lilu plugin?** The earlier build was a standalone `IOFramebuffer`
 > subclass. That links against `com.apple.iokit.IOGraphicsFamily`, whose code
@@ -47,10 +52,12 @@ boot-arg to turn it off (below).
 > addressing — all ported piecewise from `amdgpu`'s display core (DC), which
 > is this project's reference and upstream in spirit. Think of it as an
 > early, hand-rolled KMS driver growing toward native mode setting.
-> **What it still is not:** a GPU accelerator. 3D/Metal needs the GFX12
-> command processor, ring buffers, memory management and a Metal userland —
-> a much larger project, acknowledged as the long-term goal rather than
-> disclaimed. Much of the groundwork here (IP-discovery-driven registers,
+> **What it is not yet:** a native GPU accelerator. The GFX12 command
+> processor, rings, memory management and a compute runtime are here, and
+> Metal works through Apple's paravirtual GPU (the kext plays its host), but
+> macOS's Metal is still Apple's paravirtual one, with its limits. Supporting
+> every feature of the card, native Metal and 3D acceleration included, is the
+> goal. Much of the groundwork here (IP-discovery-driven registers,
 > AtomBIOS/EDID/timing parsers with host-side tests) is deliberately
 > ASIC-portable and would carry over to other RDNA 4 cards with little more
 > than wider PCI matching.
@@ -166,6 +173,8 @@ monitor really sleeps, and wakes it with a mode set to the running timing
 | `src/pm4.{hpp,cpp}` | PM4 type-3 packet builders (SET_UCONFIG_REG, SET_SH_REG, WRITE_DATA, ACQUIRE/RELEASE_MEM, DISPATCH_DIRECT) and compute queue writer. Host-tested. |
 | `src/codeobj.{hpp,cpp}` | Freestanding AMDGPU code-object reader: a kernel's descriptor (RSRC1/2/3, kernarg size, SGPR requests) and the loadable image (PT_LOAD segments at their virtual addresses). Host-tested against clang's output. |
 | `src/runtime.cpp`, `src/gpuheap.{hpp,cpp}` | The user-space compute runtime: a 4 KiB-granule VRAM heap, buffers and programs per connection, synchronous dispatches on the MEC queue, hung-queue detection. The heap is host-tested. |
+| `src/pvgpu.{hpp,cpp}`, `src/pvstream.*`, `src/pvdraw.hpp`, `src/pvopcodes.inc`, `src/pvdevinfo.inc` | `make PVGPU=1` only: the paravirtual GPU, a PCI device on the card for Apple's `AppleParavirtGPU`, and its host, which carries out the Metal command stream on the card (blits, compute, draws, textures, IOSurfaces). |
+| `src/pvscanout.{hpp,cpp}`, `src/pvhooks.{hpp,cpp}` | `make PVGPU=1` only: the heads as the paravirtual GPU's displays (`rdna4-pvgpu-disp` bit 2), their frames scanned out by the card; the hooks that keep WindowServer off the real framebuffers then. |
 | `src/userclient.{hpp,cpp}` | `RDNA4ComputeService` (published once stage 6/7 finished) and `RDNA4ComputeClient`, the IOUserClient that checks each call and hands it to the runtime. Root only. |
 | `include/rdna4compute.h` | The user-space ABI: selectors, scalar/struct shapes, the dispatch struct. Shared by the kext and user space. |
 | `src/shaders/bench.cl`, `src/bench_codeobj.h` | `lds_reverse` (LDS + barrier test), `copy` (VRAM bandwidth), a tiled `sgemm` (64x64 tiles through LDS), the matrix units (`wmma16`, `hgemm`, `bf16gemm`), and the affine/scaled `mandelbrot` and `mandelbrot_zoom` kernels, one clang-built code object used by `rdna4-run`. |
@@ -264,6 +273,72 @@ Limits for now:
 - Every kernel runs in VMID0: it can reach all of VRAM, hence root only.
 - A dispatch that misses its timeout marks the runtime wedged until reboot,
   because there is no queue reset yet.
+
+## Metal on macOS Tahoe and Sequoia (experimental)
+
+macOS has a Metal driver for one GPU it does not make itself: the paravirtual GPU of Apple's virtual machines
+(`AppleParavirtGPU`, `AppleParavirtGPUMetal.bundle`). With `make PVGPU=1` the kext publishes such a device on the
+card and plays its host: Apple's driver and Metal run unchanged, and the kext carries out their command stream on
+the RX 9070 XT (`src/pvgpu.cpp`). Shaders arrive as Apple's AIR and are translated to gfx1201 at run time by a root
+helper (`tools/metal/m3/air2amdgpu.cpp`, LLVM). With `rdna4-pvgpu-disp=7` the displays are the paravirtual GPU's
+displays, so WindowServer composites with Metal and its frames are scanned out by the card's own display engine
+(`src/pvscanout.hpp`). Written by Jan Claußen (PR 6), reviewed and card-tested on Tahoe.
+
+What runs (card, macOS Tahoe 26.6.2, 2026-11-10 to 2026-11-12; Sequoia 15 by Jan Claußen): the login window and the
+desktop composited on the card, the Dock with every icon, apps' windows (Finder, iTerm2, ...), Liquid Glass, Metal
+compute, blits and draws of every form with vertex descriptors, textures, mip-level views, blending, stencil, up to
+eight colour attachments. `tools/metal/m1/mtlprobe.m` (`mtlprobe all`) checks blits, compute and drawing.
+
+**Setting it up.** On the build machine, from the top of the repository: the kext with the paravirtual GPU, the
+user-space programs, and the shader translator (which builds LLVM for x86_64 in `Build/llvm` the first time, which
+takes a while):
+
+```bash
+make PVGPU=1 all userspace metal-helper
+```
+
+Install the kext as usual (*Installing*). Then, on the Mac that has the card, from a copy of the repository with
+that build in it, install the shader translator (a LaunchDaemon, log in `/var/log/rdna4-air2amdgpu.log`):
+
+```bash
+sudo tools/metal/m3/install-helper.sh Build/m3/x86_64/air2amdgpu
+```
+
+Install the switch that sets CoreDisplay's IOPresentment to what each boot needs, and on Tahoe Metal's error mode
+(log in `/var/log/rdna4-iop.log`):
+
+```bash
+sudo userspace/rdna4-iop/install.sh
+```
+
+Optionally, keep each boot's kernel log in `/var/log/rdna4`:
+
+```bash
+sudo userspace/rdna4-logd/install.sh
+```
+
+Then boot with these boot-args (in OpenCore's `boot-args`, next to the others). `rdna4-pvgpu-delay=5` publishes the
+device early; it waits for the card, up to 2 minutes after the delay:
+
+```
+rdna4-compute=7 rdna4-gfx=2 rdna4-vm=1 rdna4-pvgpu=1 rdna4-pvgpu-disp=7 rdna4-pvgpu-delay=5
+```
+
+| Boot-arg | Effect |
+|----------|--------|
+| `rdna4-pvgpu=1` | Publish the paravirtual GPU on the card (only in `make PVGPU=1` builds). Needs the compute runtime up (`rdna4-compute=7`, `rdna4-gfx=2`, `rdna4-vm=1`); without it no device is published. |
+| `rdna4-pvgpu-disp=<bits>` | The display side. `7`: the heads are the paravirtual GPU's displays (bit 2), reported online (bit 0) with ~60 Hz vertical blanks (bit 1). |
+| `rdna4-pvgpu-delay=<s>` | Publish this many seconds after the plugin starts (default 25), then as soon as the card and its runtime are up. |
+| `rdna4-pvgpu-class=<24 bits>` | The PCI class code the device reports (default `0x030000`). |
+| `rdna4-pvgpu-match=0` | The device is published but no driver may take it (diagnostics). |
+| `rdna4-pvscaled=0` | No scaled modes above a head's 3840x2160. |
+
+**Limits.** It is Apple's paravirtual Metal, with that device's limits and the features the host does not offer
+yet: no Metal heaps, no argument buffers, no indirect command buffers, no texture swizzles (the Intel build of the
+guest driver drops them); OpenGL stays in software. Apps started before the device is published draw on the CPU until
+they are restarted. The IOSurface lookup depends on Tahoe 25G83's IOSurface internals. Without the card's firmware in the
+build (`firmware/amdgpu/`) the runtime does not come up and no device is published. The design notes and every
+measurement are in `docs/m0-pvgpu.md` and `docs/m1-stream.md`.
 
 ## Where things are
 
@@ -484,10 +559,13 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    display pipe cannot be reprogrammed until native mode setting exists.
 6. **Power / clocks** — SMU firmware handshake so the card is stable, not
    stuck at boot clocks.
-7. **Acceleration (huge)** — a real accelerator: GFX12 command processor, ring
-   buffers, memory controller, and a Metal driver. This is effectively
-   reimplementing Apple's `AMDRadeonX6000` family for a new architecture and is
-   out of scope for this repo's near term.
+7. **Acceleration** — the GFX12 command processor, rings, memory management
+   and a compute runtime run on the card (*User-space compute*), and Vulkan
+   through RADV. Metal runs through Apple's paravirtual GPU, served on the card
+   by the kext (*Metal*, experimental, since 2026-11-10 on Tahoe). The goal is
+   every feature of the card, native Metal and 3D acceleration included: a
+   driver of our own in the place of Apple's `AMDRadeonX6000` family, for a new
+   architecture.
 
 ## Status
 
@@ -619,4 +697,8 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       (`test/ref/dp_retime_linux.inc`).
 - [x] Hardware cursor through the NDRV cursor path (`rdna4-cursor=1`,
       off by default; `docs/HANDOFF-linux.md`)
-- [ ] Acceleration / Metal
+- [x] Metal through Apple's paravirtual GPU, served on the card (`make PVGPU=1`;
+      verified on hardware 2026-11-10 to 2026-11-12, Tahoe 26.6.2): a Metal
+      desktop, the Dock, Liquid Glass and apps' windows; Sequoia 15 tested by
+      Jan Claußen. Experimental (*Metal* above)
+- [ ] Native Metal and 3D acceleration (the goal: every feature of the card)
