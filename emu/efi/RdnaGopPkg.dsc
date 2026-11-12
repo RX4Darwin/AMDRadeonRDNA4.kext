@@ -1,5 +1,5 @@
 ## @file
-#  Minimal edk2 platform that builds RdnaGopDxe (tools/emu-build.sh links
+#  Minimal edk2 platform that builds RdnaGopDxe (tools/vm/emu-build.sh links
 #  emu/efi into the edk2 tree as RdnaGopPkg).
 #
 #  SPDX-License-Identifier: BSD-2-Clause-Patent

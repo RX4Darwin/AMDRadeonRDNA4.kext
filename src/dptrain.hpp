@@ -12,10 +12,10 @@
 //  on, the sink woken and told the rate and lane count, clock recovery on
 //  TPS1, channel equalisation on TPS4, TPS3 or TPS2, each with the lanes'
 //  voltage swing and pre-emphasis raised as the sink asks, then the pattern
-//  off and one look at the link status. tools/pipegen runs Linux's own code
-//  against simulated sinks (its "dplink" scenario) and tools/atomdump.cpp
+//  off and one look at the link status. tools/gen/pipegen runs Linux's own code
+//  against simulated sinks (its "dplink" scenario) and test/atomdump.cpp
 //  holds this one's sequence of DPCD transfers, patterns, drive settings and
-//  delays against Linux's, sink by sink (tools/dp_train_linux.inc).
+//  delays against Linux's, sink by sink (test/ref/dp_train_linux.inc).
 //
 //  Left out, unlike amdgpu: link training tunable PHY repeaters (LTTPR), FEC,
 //  128b/132b (UHBR) links, granting POST_LT_ADJ_REQ, and falling back to a

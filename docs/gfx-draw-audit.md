@@ -56,12 +56,12 @@ a value different from `gfx12_draw.h` is a write that did not take, a register t
 - `INST_PREF_SIZE = 0` in `RSRC4_GS/PS` (Mesa always sets it from the code size, `ac_binary.c:146-165`; open question 5).
 - `PRIMGEN_PASSTHRU_NO_MSG = 1` (RADV uses it whenever culling is off, but radeonsi usually sends `GS_ALLOC_REQ`, notes 3.4).
 
-Each is one register in the IB copy (the `rdna4-gfxdiag` ladder patches it; the shader variant `shaders/nggmsg.s` is notes 3.7).
+Each is one register in the IB copy (the `rdna4-gfxdiag` ladder patches it; the shader variant `src/shaders/nggmsg.s` is notes 3.7).
 
 ### 4. The colour write does not reach memory although the pipeline runs (variant 8)
 
 Notes open questions 8 and 9: the fence writes back GL2 only (as amdgpu's does); the CB writes through GL2. The ladder's
-pixel-shader variant (`shaders/psstore.s`) stores a marker (`0xC0DE0001`) to memory from the PS before exporting: marker present
+pixel-shader variant (`src/shaders/psstore.s`) stores a marker (`0xC0DE0001`) to memory from the PS before exporting: marker present
 and target empty means everything up to the pixel shader works and only the colour-buffer write is lost; marker missing means
 no pixel wave ran. Independently, when the target is empty the code looks again after 2 ms, then issues a full
 `ACQUIRE_MEM` GL2 write-back (`gfx_v12_0_emit_mem_sync` bits) plus a fresh end-of-pipe fence and looks a third time

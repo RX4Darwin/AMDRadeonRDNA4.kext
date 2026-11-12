@@ -2,9 +2,9 @@
 //  isa.hpp
 //  AMDRadeonRDNA4
 //
-//  The few shader instruction words the kext writes by hand (everything else comes from shaders/*.s through tools/build-shaders.sh). gfx12 (RDNA4) shares
+//  The few shader instruction words the kext writes by hand (everything else comes from src/shaders/*.s through tools/gen/build-shaders.sh). gfx12 (RDNA4) shares
 //  the SOPP encodings of gfx11, NOT gfx6-10's: s_endpgm is SOPP opcode 48, and the old 0xbf810000 is s_setkill on this ISA (hub-task-347: vmtest.cpp's T5c
-//  kernel used it). tools/check-isa.sh (make check-isa, part of make test) assembles and disassembles these with llvm-mc -mcpu=gfx1201 and fails if a
+//  kernel used it). test/check-isa.sh (make check-isa, part of make test) assembles and disassembles these with llvm-mc -mcpu=gfx1201 and fails if a
 //  constant here does not mean what its name says, and if any other raw 0xbf.. instruction literal shows up in src/*.cpp.
 //
 

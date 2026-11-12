@@ -104,7 +104,7 @@ The same holds for the PQ page (13 ring dwords written, so +0x40 is 0) and for E
    Variant d (runtime.cpp:1263) becomes the default.
 6. Emulator (so it can fail like the card): emu/qemu/rdna4.c:2155. At `level == 3`, a valid entry without `RDNA4_VM_PDE_PTE`
    (bit 63) must `goto fault` (umr access_vram_ai.c:1067-1069 walks further into the data page). Also require EXECUTABLE for CPF
-   PQ/IB fetches (IV EXE). Update `GpuVm::walk` (gpuvm.cpp:47-68) and its host test (tools/atomdump.cpp:2102-2105) the same way.
+   PQ/IB fetches (IV EXE). Update `GpuVm::walk` (gpuvm.cpp:47-68) and its host test (test/atomdump.cpp:2102-2105) the same way.
    The pre-fix kext must then fail in QEMU; that is the negative control.
 7. Nothing else changes: CONTEXT8, L2, windows and the invalidate path stay as they are (all amdgpu-equal, s.4).
 

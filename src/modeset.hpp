@@ -33,8 +33,8 @@
 //    (enc401_stream_encoder_dp_set_stream_attribute) -> FIFO reset ->
 //    enc401_stream_encoder_dp_unblank.
 //
-//  The link encoder, the PHY and DMUB are not touched. tools/pipegen's "dp"
-//  scenario runs those Linux functions; tools/atomdump.cpp holds this plan
+//  The link encoder, the PHY and DMUB are not touched. tools/gen/pipegen's "dp"
+//  scenario runs those Linux functions; test/atomdump.cpp holds this plan
 //  against its output.
 //
 //  Not programmed (kept as the GOP left them): DCHUBBUB watermarks and the
@@ -108,6 +108,7 @@ struct Target {
 	uint16_t connectorObjId;  // e.g. 0x330c (HDMI type A)
 	Edid::DetailedTiming from, to;
 	bool     sinkScdc;        // the sink's EDID announces SCDC (Edid::hdmi2Caps)
+	bool     y420;            // HDMI in YCbCr 4:2:0: the link carries half the pixel clock
 	uint8_t  ddcLine;         // the connector's DDC line, for the SCDC write
 	// DisplayPort instead of TMDS: the pixel-rate DTO for `to` (scaleDpDto)
 	// and the first DP_VID_M, before the hardware measures it.
@@ -161,6 +162,9 @@ bool scaleDpDto(const DpDto &now, uint32_t fromKHz, uint32_t toKHz, DpDto &out);
 constexpr uint32_t kMaxTmdsKHz      = 600000;
 constexpr uint32_t kScrambleFromKHz = 340000;
 constexpr uint32_t scdcTmdsConfig(uint32_t pixelClockKHz) { return pixelClockKHz > kScrambleFromKHz ? 3 : 0; }
+// The TMDS clock of an HDMI stream at 8 bpc: the pixel clock, or half of it in
+// YCbCr 4:2:0 (dce110_resource_build_pipe_hw_param).
+constexpr uint32_t tmdsKHz(uint32_t pixelClockKHz, bool y420) { return y420 ? pixelClockKHz / 2 : pixelClockKHz; }
 
 // Build the plan for `t`. Returns false (and `why`) if the target or the
 // timings cannot be expressed.

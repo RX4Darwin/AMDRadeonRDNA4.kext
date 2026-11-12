@@ -7,7 +7,7 @@
 //  CP_MQD_CONTROL.VMID 0, PRIV_STATE | KMD_QUEUE, every address an MC address in the compute pool. A job is
 //  INDIRECT_BUFFER(vmid = the client's VMID, VA of the IB in the client's VM) followed by a ring-level RELEASE_MEM to the client's fence word,
 //  the VMID coming from the IB packet (gfx_v12_0_ring_emit_ib_compute). Assumption U1 of the design: proven on this card for amdgpu's own compute
-//  ring by tools/linux-replay/replay-compute.cpp (2026-10-01); the kext's own queues like this are what this mode tests.
+//  ring by tools/linux/linux-replay/replay-compute.cpp (2026-10-01); the kext's own queues like this are what this mode tests.
 //
 //  Why: on the real card every client HQD with a non-zero VMID is never serviced (docs/w13-vmid.md s.1.1, docs/vm-client-rootcause.md), and
 //  amdgpu has no gfx12 precedent for MMIO-loaded HQDs with a non-zero VMID (KFD needs MES). VMID-0 kernel queues + the IB's VMID is the model
@@ -17,10 +17,11 @@
 //  fences stay in order. Default off; the per-client-HQD path is untouched when off.
 //
 #include "compute.hpp"
+#include "klog.hpp"
 
 #include <IOKit/IOLib.h>
 
-#define SLOG(fmt, ...) IOLog("AMDRadeonRDNA4: vmshared: " fmt "\n", ## __VA_ARGS__)
+#define SLOG(fmt, ...) rdna4Log("AMDRadeonRDNA4: vmshared: " fmt "\n", ## __VA_ARGS__)
 
 using namespace GfxReg;
 
@@ -50,9 +51,11 @@ bool RDNA4Compute::sharedStart(uint32_t k) {
 	s.wedged = false;
 	if (s.area + 0x7000 > pool.size)
 		return false;
+	rdna4Step(k ? "sharedStart 1: zeroing its pool area" : "sharedStart 0: zeroing its pool area");
 	for (uint32_t off = 0; off < 0x7000; off += 4)
 		*poolDw(s.area + off) = 0;
 	flushHdp();
+	rdna4Step(k ? "sharedStart 1: HQD init" : "sharedStart 0: HQD init");
 	s.fenceCpu = poolDw(s.area + kVmFence);      // the queue's own fence word (vmshared=2), zero with the area
 	s.fenceMc = poolMc(s.area + kVmFence);
 	s.seq = 0;
@@ -72,8 +75,10 @@ bool RDNA4Compute::sharedStart(uint32_t k) {
 bool RDNA4Compute::vmSharedEnsure() {
 	if (sharedInit)
 		return true;
+	rdna4Step("vmSharedEnsure: GC awake (gcEnsureAwake)");
 	if (!poolCpu || !gcEnsureAwake(0xfffffff0u))
 		return false;
+	rdna4Step("vmSharedEnsure: SH_MEM_CONFIG/BASES for VMIDs 1-15");
 	for (uint32_t v = 1; v <= 15; v++) {
 		grbmSelect(0, 0, 0, v);
 		wr(IpDiscovery::HwGc, ShMemConfig, kShMemConfigDefault);

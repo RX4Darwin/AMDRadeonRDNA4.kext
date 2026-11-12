@@ -118,6 +118,57 @@ bool parseImage(const uint8_t *d, size_t n, Image &out, const char **why) {
 	return true;
 }
 
+// The name of the code object's only kernel (the one OBJECT symbol <name>.kd) into `buf`; false if there is not exactly one or it does not fit.
+static bool onlyKernel(const uint8_t *d, size_t n, const Elf &e, char *buf, size_t cap) {
+	uint32_t found = 0;
+
+	for (uint32_t i = 1; i < e.shnum; i++) {
+		const uint8_t *s = e.sh(i);
+		const uint32_t type = u32(s + 4);
+		const uint64_t symOff = u64(s + 24), symSize = u64(s + 32), entSize = u64(s + 56);
+		const uint32_t link = u32(s + 40);
+
+		if ((type != kShtSymtab && type != kShtDynsym) || entSize < 24 || link >= e.shnum || !inside(n, symOff, symSize))
+			continue;
+
+		const uint8_t *strSh = e.sh(link);
+		const uint64_t strOff = u64(strSh + 24), strSize = u64(strSh + 32);
+
+		if (!inside(n, strOff, strSize))
+			continue;
+
+		for (uint64_t k = 1; k < symSize / entSize; k++) {
+			const uint8_t *sym = d + symOff + k * entSize;
+			const uint32_t nameOff = u32(sym);
+
+			if (nameOff >= strSize || (sym[4] & 0xf) != 1 /* OBJECT */)
+				continue;
+
+			const uint8_t *nm = d + strOff + nameOff;
+			const size_t max = static_cast<size_t>(strSize - nameOff);
+			size_t len = 0;
+
+			while (len < max && nm[len])
+				len++;
+
+			const bool kd = len > 3 && len < max && nm[len - 3] == '.' && nm[len - 2] == 'k' && nm[len - 1] == 'd';
+
+			if (!kd || len - 3 >= cap)
+				continue;
+
+			for (size_t c = 0; c < len - 3; c++)
+				buf[c] = static_cast<char>(nm[c]);
+
+			buf[len - 3] = 0;
+			found++;
+		}
+
+		break;   // one symbol table
+	}
+
+	return found == 1;
+}
+
 bool findKernel(const uint8_t *d, size_t n, const char *name, Kernel &out, const char **why) {
 	auto fail = [why](const char *w) {
 		if (why)
@@ -128,6 +179,13 @@ bool findKernel(const uint8_t *d, size_t n, const char *name, Kernel &out, const
 	Elf e {};
 	if (const char *w = checkHeader(d, n, e))
 		return fail(w);
+
+	// An empty name: the only kernel (the paravirtual host's for functions whose names it cannot pass: CoreImage's stitched kernels).
+	static char only[1024];
+	if (!name[0] && !onlyKernel(d, n, e, only, sizeof(only)))
+		return fail("no single kernel in the code object");
+	if (!name[0])
+		name = only;
 
 	uint64_t codeVa = 0, kdVa = 0;
 	bool haveCode = false, haveKd = false;

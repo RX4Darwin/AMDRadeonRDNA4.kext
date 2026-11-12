@@ -11,7 +11,7 @@
  *    MM_INDEX/MM_DATA, with the top 64 MiB modelled (the IP discovery copy
  *    the PSP leaves at VRAM top - 64 KiB lives there).
  *  - Registers: a flat BAR5 image, loaded at reset from a register image in
- *    tools/linux-capture.sh's format (state=), i.e. the state the GOP leaves.
+ *    tools/linux/linux-capture.sh's format (state=), i.e. the state the GOP leaves.
  *  - Live engines: OTG frame counter and vblank status, DC_I2C (EDID from a
  *    DDC slave on one line), DP AUX (no sink attached), RCC_CONFIG_MEMSIZE,
  *    the DMUB inbox1 ring (QUERY_FEATURE_CAPS answered; the VBIOS-family
@@ -503,7 +503,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RDNA4State, RDNA4)
 
 /*
  * Lenovo G25-10 base block, read from the card's HDMI port over DC_I2C
- * (tools/atomdump.cpp fixture). The captured block announces one extension
+ * (test/atomdump.cpp fixture). The captured block announces one extension
  * that was never read; rdna4_load_edid() trims the count to what exists.
  */
 static const uint8_t lenovo_g25_10_edid[128] = {
@@ -3271,8 +3271,8 @@ static const MemoryRegionOps rdna4_inert_ops = {
 /*
  * Compute dispatch. The model has no shader cores; it runs each work-item
  * of a DISPATCH_DIRECT through a small GFX12 interpreter that knows the
- * instructions of the kext's test kernels (shaders/probe.s, and clang's
- * code for shaders/vadd.cl and shaders/bench.cl): SOPP (endpgm, branches,
+ * instructions of the kext's test kernels (src/shaders/probe.s, and clang's
+ * code for src/shaders/vadd.cl and src/shaders/bench.cl): SOPP (endpgm, branches,
  * nop/clause/delay/wait/sendmsg, barrier wait), SOP1 s_mov_b32 /
  * s_barrier_signal, SOPC unsigned compares, SMEM s_load_b32..b512, SOP2
  * s_add_co / s_lshl_b32, VOP1 moves/conversions, VOP2 integer/f32 ops,
@@ -4876,7 +4876,7 @@ static bool rdna4_gfx_read_code(RDNA4State *s, uint64_t pc, uint32_t vmid,
     return true;
 }
 
-/* Execute the exact subset emitted by shaders/ngg.s and shaders/psred.s.
+/* Execute the exact subset emitted by src/shaders/ngg.s and src/shaders/psred.s.
  * SALU runs once, VALU runs only on EXEC lanes, and exports are captured as
  * the stage boundary.  This is intentionally not a native shader shortcut. */
 static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
@@ -4936,7 +4936,7 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
             } else if (op == 0) {                            /* s_mov_b32 */
                 if (!rdna4_gfx_set_sreg(w, dst, value))
                     goto unknown;
-                if ((dw & 0xffu) == 0xffu)                   /* a literal follows (shaders/nggstore.s) */
+                if ((dw & 0xffu) == 0xffu)                   /* a literal follows (src/shaders/nggstore.s) */
                     n = 2;
             } else {
                 goto unknown;
@@ -5006,7 +5006,7 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
                 }
                 if (dst >= 106 || !rdna4_gfx_set_sreg(w, dst, mask))
                     goto unknown;
-            } else if (op == 0x31f) {                        /* v_mbcnt_lo_u32_b32 (shaders/nggvgpr.s: the lane id) */
+            } else if (op == 0x31f) {                        /* v_mbcnt_lo_u32_b32 (src/shaders/nggvgpr.s: the lane id) */
                 for (unsigned lane = 0; lane < 32; lane++) {
                     if ((w->exec >> lane) & 1u) {
                         uint32_t mask = rdna4_gfx_vsrc(w, s0, lane, dw2);
@@ -5051,7 +5051,7 @@ static bool rdna4_gfx_wave_run(RDNA4State *s, RDNA4GfxWave *w, bool ngg,
             /* VGLOBAL global_store_b32 vaddr, vdata, saddr (96-bit form, encodings
              * taken from llvm-mc -mcpu=gfx1201): dw0 [6:0] saddr, dw1 [30:23] vdata,
              * dw2 [7:0] vaddr (32-bit offset added to the SGPR-pair base). The PS
-             * diagnostic variant (shaders/psstore.s) stores a marker with it. */
+             * diagnostic variant (src/shaders/psstore.s) stores a marker with it. */
             uint32_t saddr = dw & 0x7f, vdata = (dw1 >> 23) & 0xff, vaddr = dw2 & 0xff;
             uint64_t base;
 
@@ -5538,7 +5538,7 @@ static bool rdna4_gfx_draw(RDNA4State *s, uint32_t count, uint32_t vmid)
     pgm = ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_LO_ES) << 8) |
           ((uint64_t)reg_get(s, REG_GFX_SPI_SHADER_PGM_HI_ES) << 40);
     /* An NGG (merged ES/GS) wave starts with EXEC = lane 0 only, whatever merged_wave_info says: measured on the
-     * RX 9070 XT under Linux (tools/linux-replay, docs/linux-replay.md: exec_lo 0x00000001, exec_hi 0 with 3
+     * RX 9070 XT under Linux (tools/linux/linux-replay, docs/linux-replay.md: exec_lo 0x00000001, exec_hi 0 with 3
      * vertices / 1 primitive). The shader must set exec itself (ACO: s_bfe_u64 exec, -1, merged_wave_info);
      * the all-ones this model used before hid the kext's s_and_saveexec bug for rounds 4-6. */
     ngg.exec = 0x1;
@@ -7142,7 +7142,7 @@ static const GraphicHwOps rdna4_gfx_ops = {
 /* ---- state and firmware images ------------------------------------------ */
 
 /*
- * Register image lines, as tools/linux-capture.sh writes them:
+ * Register image lines, as tools/linux/linux-capture.sh writes them:
  *   NAME base_idx dword_off byte_addr 0xVALUE
  * '#' starts a comment; SKIP:/ERR: values are ignored.
  */
@@ -7422,7 +7422,7 @@ static void rdna4_reset(DeviceState *dev)
     s->gfx_num_instances = 0;
     s->gfx_draw_refused = false;
     if (s->test_gfx_booted) {
-        /* Unit-test shortcut (tools/emu-qtest-vm.py drives the device over qtest with no guest): take the
+        /* Unit-test shortcut (tools/vm/emu-qtest-vm.py drives the device over qtest with no guest): take the
          * PSP AUTOLOAD_RLC + PMFW GFX_IMU route's end state, so the CP queues accept work. Not a model
          * of anything: the kext's own bring-up still runs the real sequence. */
         s->autoload_armed = true;

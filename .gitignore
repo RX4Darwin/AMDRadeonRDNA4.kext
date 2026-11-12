@@ -42,10 +42,10 @@
 *.out
 *.app
 
-# Build directories
-build/
-Build/
-build-*/
+# Build directory (at the top only: tools/build/ is a directory of scripts)
+/Build/
+/build/
+/build-*/
 
 # CMake generated files
 CMakeFiles/
@@ -70,9 +70,14 @@ vcpkg_installed/
 Testing/
 .cache/
 
-# R&D & reference files
+# Firmware is fetched or supplied, never committed (firmware/README.md)
 firmware/amd-ucode/*
 firmware/amdgpu/*
+firmware/*.rom
+
+# Xcode's per-user state
+xcuserdata/
+*.xcuserstate
 
 # Python
 __pycache__/

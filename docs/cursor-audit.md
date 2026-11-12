@@ -10,7 +10,7 @@ amdgpu paths below are under `drivers/gpu/drm/amd/display/dc/` (`hubp/...`, `dpp
 ## History that bounds the search
 
 The standalone build fought the same invisible cursor for eight hardware rounds (commits `d0a884a` .. `d5750c1`):
-every cursor register matched a working Linux/amdgpu register dump (`tools/cursor-test.py`), the sprite data
+every cursor register matched a working Linux/amdgpu register dump (`tools/linux/cursor-test.py`), the sprite data
 read back from VRAM, `CUR0_UPDATE_PENDING` cleared (writes latched), `DCN_VM_FB_LOCATION` covered all of
 VRAM, and even a sprite fetched from the scanout base itself (`rdna4-curtest`) was invisible. That
 eliminated fetch-address and latch theories and left the composition stage (and the DMUB firmware, which owns
@@ -57,7 +57,7 @@ CM_CUR0 bits 2 and 7, `3c713b7`). The W14 port kept those register values; nobod
 ## Evidence that survives (W21 part 1)
 
 - Every `cursor:` line is also appended to the registry property `AMDRadeonRDNA4,Cursor` (first ~2 KiB, `cursor.cpp:474-500`).
-  `tools/diagnostic-log.sh` prints it (`ioreg -l -w0 | grep AMDRadeonRDNA4,Cursor`) and falls back to `log show --last boot`
+  `tools/rig/diagnostic-log.sh` prints it (`ioreg -l -w0 | grep AMDRadeonRDNA4,Cursor`) and falls back to `log show --last boot`
   when dmesg lost the early lines (also for `compute:`).
 - Per-interrupt IH lines (`CP EOP interrupt`, `SDMA trap interrupt`) are limited to the first three unless
   `rdna4-trace=2` (`ih.cpp:731`). Vblank and page-flip lines were already thinned to 1, 60 and then once a minute.

@@ -10,8 +10,8 @@
 //  link_encoder_disable, and the bp_transmitter_control it fills for
 //  transmitter_control_v1_7).
 //
-//  tools/atomdump.cpp holds the register steps against what Linux writes
-//  while it trains (tools/dp_train_linux.inc, kTrainRegs_*).
+//  test/atomdump.cpp holds the register steps against what Linux writes
+//  while it trains (test/ref/dp_train_linux.inc, kTrainRegs_*).
 //
 //  Freestanding; shared by the kext and the host test.
 //
@@ -48,7 +48,7 @@ size_t offSteps(uint8_t link, ModeSet::Step *out);
 // from this link's PHY, connected to the back end, on and mapped to the link
 // (what link_set_dpms_on does there: dcn401_link_encoder_setup,
 // dccg401_enable_symclk_se, connect_dig_be_to_fe, enc401_stream_encoder_enable
-// and _map_to_link). tools/atomdump.cpp finds each step in the generated
+// and _map_to_link). test/atomdump.cpp finds each step in the generated
 // DisplayPort tables' wake part.
 size_t streamSteps(uint8_t dig, uint8_t link, ModeSet::Step *out);
 

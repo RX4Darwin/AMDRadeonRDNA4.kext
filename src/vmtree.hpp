@@ -10,7 +10,7 @@
 //  owns the memory. Entries are GpuVm's.
 //
 //  Freestanding and not thread-safe: the caller holds its lock. Shared by
-//  the kext and the host test (tools/atomdump.cpp).
+//  the kext and the host test (test/atomdump.cpp).
 //
 
 #ifndef RDNA4VmTree_hpp

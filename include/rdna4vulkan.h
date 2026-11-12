@@ -3,9 +3,9 @@
  *  AMDRadeonRDNA4
  *
  *  What this kext adds to the interface the RADV Darwin port speaks
- *  (vulkan/navi48_native_abi.h; docs/vulkan-port.md): where the interface is
+ *  (userspace/vulkan/navi48_native_abi.h; docs/vulkan-port.md): where the interface is
  *  found, and one call of its own for testing. Plain C, shared by the kext
- *  (src/n48nkext.cpp) and user space (vulkan/n48nprobe.c).
+ *  (src/n48nkext.cpp) and user space (userspace/vulkan/n48nprobe.c).
  *
  *  The interface is a user client of type N48N_UC_TYPE on the service the
  *  compute bring-up publishes (rdna4-compute=6 or 7). Root only.

@@ -57,7 +57,7 @@ Each is gated off by the stream's own state (verify-draw.md), but "gated off" is
 - **Ladder variants** (auto-added to a probe boot's ladder, order 32, 128, 256, 512, 64, 8, 2, 1, 4; each summary entry gets `/cprim N`, the C_PRIMITIVES delta of that draw):
   - **128**: `PA_CL_CLIP_CNTL.CLIP_DISABLE = 1`. If `cprim` becomes 1 the clipper was dropping the primitive.
   - **256**: the primitive filters off (`PA_SU_PRIM_FILTER_CNTL` disable bits, `SMALL_PRIM_FILTER_ENABLE = 0`). If `cprim` becomes 1 a setup filter was dropping it.
-  - **512** (`shaders/nggvgpr.s`): `ngg.s` plus per-lane stores of `v0` (the packed primitive), `v3` (VertexID) and the exported `x`/`y` (`draw: NGG VGPRs per lane: ...`,
+  - **512** (`src/shaders/nggvgpr.s`): `ngg.s` plus per-lane stores of `v0` (the packed primitive), `v3` (VertexID) and the exported `x`/`y` (`draw: NGG VGPRs per lane: ...`,
     `NGG inputs say: VertexID IS/is NOT the lane index, the exported positions are/are NOT what ngg.s intends`). The wave runs (marker), but the shader's inputs (`v3` as the VertexID, `v0`) are an ABI assumption
     (verified in the emulator only): a wrong VertexID makes all three vertices identical = a degenerate triangle, which the clipper drops (C_INVOCATIONS 1, C_PRIMITIVES 0).
 - Emulator: `v_mbcnt_lo_u32_b32` and `v_lshlrev_b32` decoded for `nggvgpr.s`.

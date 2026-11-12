@@ -48,6 +48,8 @@ constexpr uint32_t kRegCursorKick = 0x220;  // written with the port number by D
 constexpr uint32_t kRegNumDisplays = 0x22c;  // read once by AppleParavirtGPUControl::start; 0 means one, more than 8 is clamped
 } // namespace pvgpu
 
+class RDNA4Compute;
+
 class RDNA4PvNub : public IOPCIDevice {
 	OSDeclareDefaultStructors(RDNA4PvNub)
 public:
@@ -57,11 +59,21 @@ public:
 	// For machines where the GPU path never runs (a VM without the emulated RDNA4 device): if nothing published the nub within `delayMs`, publish it under
 	// the platform expert. Starts a work loop and a timer; call once from plugin start.
 	static void publishLater(uint32_t level, uint32_t delayMs);
+	// The parent for publishLater when the delay runs out: the GPU's IOPCIDevice once its attach has run (plugin.cpp), else the platform expert. Under the
+	// GPU the nub has a PCI bridge above it, which AppleGPUWrangler requires of every GPU (it walks the providers up to an IOPCIBridge and panicked on
+	// the rig, 26.6.2, when there was none: 2026-10-17).
+	static void setLateParent(IOService *gpu);
+	// The card's runtime, for running the guest's blits on it (M2; plugin.cpp sets it where the GPU attaches).
+	static void setCompute(RDNA4Compute *compute);
+	static constexpr unsigned kSurfaceFunctions = 15;
+	static void setSurfaceFunctions(const mach_vm_address_t fn[kSurfaceFunctions]);   // IOSurface kext functions for type-5 textures (pvgpu.cpp)
+	static void setPhysmap(uint8_t *base, uint8_t *max);               // the kernel's map of all physical memory, for the guest's pages
 
 	// Host side: the control block of BAR0 as dwords, valid while the nub lives (the nub is never released once published).
 	volatile uint32_t *ctrl() const { return mBar0 ? reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(mBar0) + pvgpu::kCtrl) : nullptr; }
 	// Run the registered handler of interrupt `source`, as the interrupt controller would. false when none is registered and enabled.
-	bool raiseInterrupt(int source);
+	bool raiseInterrupt(int source, bool offToo = false);   // offToo: delivered while the driver has the line off as well
+	bool interruptBusy(int source);   // the driver has the line disabled (handling it), or a raise waits for it
 	bool configTest();      // used by the self-test: config space, capabilities, matching
 
 	bool init(OSDictionary *propTable) APPLE_KEXT_OVERRIDE;
@@ -70,6 +82,23 @@ public:
 	bool attach(IOService *provider) APPLE_KEXT_OVERRIDE;
 	void detach(IOService *provider) APPLE_KEXT_OVERRIDE;
 	void detachAbove(const IORegistryPlane *plane) APPLE_KEXT_OVERRIDE;
+	// Every method that Tahoe's IOPCIDevice overrides but MacKernelSDK's header does not know about MUST be overridden here. Otherwise the kext linker
+	// fills our vtable slot by redirecting the base-class symbol (IORegistryEntry::setProperty, ...) to IOPCIDevice's method for the WHOLE kext: every
+	// IOService of ours then runs IOPCIDevice code on an object that is not one. On the rig (macOS 26.6.2) that panicked systemstats reading the Lilu
+	// service's interrupt keys (the Apple-menu Restart "freeze"), and our nub when a probing driver let go (2026-10-15). The list is the slots where
+	// 25G83's IOPCIDevice vtable names IOPCIDevice and ours a base class (tools/metal/m0/check-vtable.py). The bodies call the base versions: the
+	// nub has no bridge (`parent`), which IOPCIDevice's versions use.
+	bool setProperty(const OSSymbol *aKey, OSObject *anObject) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const OSString *aKey, OSObject *anObject) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *aKey, OSObject *anObject) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *aKey, const char *aString) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *aKey, bool aBoolean) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *aKey, unsigned long long aValue, unsigned int aNumberOfBits) APPLE_KEXT_OVERRIDE;
+	bool setProperty(const char *aKey, void *bytes, unsigned int length) APPLE_KEXT_OVERRIDE;
+	OSObject *getProperty(const OSSymbol *aKey) const APPLE_KEXT_OVERRIDE;
+	void detachFromChild(IORegistryEntry *child, const IORegistryPlane *plane) APPLE_KEXT_OVERRIDE;
+	IOReturn addPowerChild(IOService *theChild) APPLE_KEXT_OVERRIDE;
+	IOReturn removePowerChild(IOPowerConnection *theChild) APPLE_KEXT_OVERRIDE;
 	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
 	                       IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 	bool handleOpen(IOService *forClient, IOOptionBits options, void *arg) APPLE_KEXT_OVERRIDE;
@@ -139,7 +168,7 @@ public:
 	void _RESERVEDIOPCIDevice20() APPLE_KEXT_OVERRIDE {}
 	void _RESERVEDIOPCIDevice21() APPLE_KEXT_OVERRIDE {}
 
-	// The slots Tahoe's IOPCIDevice has beyond MacKernelSDK's header (the header calls them reserved): see patchVtable() and tools/m0/check-vtable.py.
+	// The slots Tahoe's IOPCIDevice has beyond MacKernelSDK's header (the header calls them reserved): see patchVtable() and tools/metal/m0/check-vtable.py.
 	UInt32 tahoeConfigRead(UInt32 width, UInt8 offset);
 	void tahoeConfigWrite(UInt32 width, UInt8 offset, UInt32 data);
 	IOReturn tahoeDeviceMemoryRead(UInt8 bar, UInt64 offset, void *data, UInt8 size);
@@ -157,6 +186,7 @@ private:
 		void *refCon { nullptr };
 		bool registered { false };
 		bool enabled { false };
+		bool pending { false };   // raised while disabled: delivered when enabled again
 	};
 	IOBufferMemoryDescriptor *mBar0Desc { nullptr };
 	void *mBar0 { nullptr };                         // kernel VA of the BAR0 RAM (the buffer's own mapping; Apple's driver gets an alias)
@@ -164,5 +194,8 @@ private:
 	Interrupt mInt[kMaxInterrupts] {};
 	IOLock *mLock { nullptr };
 };
+
+// M3: the Metal kernel translator's user client (include/rdna4mtlc.h), handed out by RDNA4ComputeService::newUserClient.
+IOReturn pvTranslatorClient(IOService *service, task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler);
 
 #endif /* RDNA4PvGpu_hpp */

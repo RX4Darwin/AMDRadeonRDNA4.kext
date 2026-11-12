@@ -148,6 +148,9 @@ inline void buildTransmitterControl(Cmd cmd, const TransmitterControl &p) {
 // DMUB_CMD__VBIOS / SET_PIXEL_CLOCK, payload set_pixel_clock_parameter_v1_7
 // (16 bytes). pll_id ATOM_COMBOPHY_PLL0..5 = 20..25; crtc_id = OTG instance;
 // deep_color_ratio 0 = 8 bpc.
+// SET_PIXEL_CLOCK miscinfo: an HDMI stream in YCbCr 4:2:0 (PIXEL_CLOCK_V7_MISC_YUV420_MODE).
+constexpr uint8_t kPixelClockMiscYuv420 = 0x04;
+
 struct SetPixelClock {
 	uint32_t pixclk100Hz;
 	uint8_t  pllId;

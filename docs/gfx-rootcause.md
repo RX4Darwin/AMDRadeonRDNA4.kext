@@ -30,7 +30,7 @@ The round-4 readback `VGT_SHADER_STAGES_EN=0xfd1ffe88` has bits where gfx12 defi
 - **Pipeline statistics** (`rdna4-gfxprobe=1`): `PIPELINESTAT_START` and a `SAMPLE_PIPELINESTAT` before and after the draw (`si_query.c:854-857`; PS_INVOCATIONS, C_PRIMITIVES, C_INVOCATIONS, VS, GS,
   IA_PRIMITIVES, IA_VERTICES). `draw: pipeline statistics say: ...` applies the rule: IA = 0 the GE dropped the draw (queue/VA 0); IA > 0 and C_INV = 0 the NGG/export path;
   C_INV > 0 and C_PRIM = 0 clip/cull; C_PRIM > 0 and PS = 0 SC/raster state (#1); PS > 0 the pixel shaders ran. Sentinel-filled buffers: `wrote nothing` means the events are not available on this path.
-- **NGG marker variant** (ladder bit 32, added automatically to a probe boot's ladder, order 32, 8, 2, 1, 4): `shaders/nggstore.s` is `ngg.s` preceded by three stores (`0xC0DE0002`, `s2`, `s3`) to the marker address
+- **NGG marker variant** (ladder bit 32, added automatically to a probe boot's ladder, order 32, 8, 2, 1, 4): `src/shaders/nggstore.s` is `ngg.s` preceded by three stores (`0xC0DE0002`, `s2`, `s3`) to the marker address
   (patched into two `s_mov_b32` literals; `RSRC1_GS.VGPRS=1`). `draw: NGG marker 0x..` says whether the NGG wave launched at all.
 
 ## 4. Emulator

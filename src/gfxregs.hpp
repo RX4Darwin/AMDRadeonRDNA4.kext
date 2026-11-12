@@ -58,6 +58,11 @@ constexpr Reg CpMeIcBaseCntl      { 1, 0x5846 };
 constexpr Reg CpGfxRs64InstrPntr0 { 1, 0x2a44 };
 constexpr Reg CpGfxRs64InstrPntr1 { 1, 0x2a45 };
 constexpr Reg CpStat              { 0, 0x0f40 };
+constexpr Reg CpIb1Offset         { 1, 0x2092 };   // the IB1 the CP runs (gc_12_0_0_offset.h): where in it, its size, what is left
+constexpr Reg CpIb1CmdBufsz       { 1, 0x20c0 };
+constexpr Reg CpIb1BaseLo         { 1, 0x20cc };
+constexpr Reg CpIb1BaseHi         { 1, 0x20cd };
+constexpr Reg CpIb1Bufsz          { 1, 0x20ce };
 constexpr Reg CpCpcStatus         { 0, 0x0e24 };
 constexpr Reg CpCpfStatus         { 0, 0x0e27 };
 constexpr Reg CpPfpInstrPntr      { 0, 0x0f45 };
@@ -166,6 +171,11 @@ constexpr uint32_t SdmaQ0DoorbellOffset = 0x0091;   // OFFSET [27:2]: doorbell d
 constexpr uint32_t SdmaQ0WptrPollLo  = 0x0098;
 constexpr uint32_t SdmaQ0WptrPollHi  = 0x0099;
 constexpr uint32_t SdmaQ0MinorPtrUpd = 0x009b;
+// SDMA0_DCC_CNTL (gc_12_0_0_offset.h; SDMA1's is 0x600 further on, as the engine's other registers): what the engine does
+// with data it reaches by physical address. DCC_FORCE_BYPASS [0]; then for n = 0..3 RD_NOPTE_OVERRIDE_n [1+4n],
+// RD_NOPTE_COMP_EN_n [2+4n], WR_NOPTE_OVERRIDE_n [3+4n], WR_NOPTE_COMP_EN_n [4+4n] (gc_12_0_0_sh_mask.h).
+constexpr uint32_t SdmaDccCntl       = 0x0034;
+constexpr uint32_t kSdmaDccCompEn    = 0x00015554;   // the eight *_COMP_EN_n bits
 
 // SDMA0_QUEUE0_RB_CNTL fields
 constexpr uint32_t kSdmaRbSizeShift       = 1;          // [5:1] log2(dwords)
@@ -398,6 +408,7 @@ constexpr uint32_t kComputeDoorbellDword    = 3 * 2;
 constexpr Reg ComputeStartX       { 0, 0x1ba4 };   // START_X/Y/Z
 constexpr Reg ComputeNumThreadX   { 0, 0x1ba7 };   // NUM_THREAD_X/Y/Z
 constexpr Reg ComputePgmLo        { 0, 0x1bac };   // address >> 8
+constexpr Reg ComputeDispatchScratchBase { 0, 0x1bb0 };   // LO, HI (R_00B840): scratch address >> 8 (gfx11+)
 constexpr Reg ComputePgmRsrc1     { 0, 0x1bb2 };   // RSRC1, RSRC2
 constexpr Reg ComputeResourceLim  { 0, 0x1bb5 };
 constexpr Reg ComputeThreadMgmtSe0{ 0, 0x1bb6 };   // SE0, SE1 (0x1bb7)
@@ -428,6 +439,8 @@ constexpr uint32_t kRsrc2TgidXEn       = 1u << 7;
 constexpr uint32_t kRsrc2LdsShift = 15, kRsrc2LdsMask = 0x1ffu << 15;
 constexpr uint32_t kLdsAllocGranule = 1024, kLdsEncodeGranule = 512;
 constexpr uint32_t kMaxLdsPerGroup = 65536;
+// A lane's scratch (private segment) at most: what the runtime's scratch is sized for (runtime.cpp, scratchFor).
+constexpr uint32_t kMaxPrivatePerLane = 16384;
 constexpr uint32_t ldsSizeField(uint32_t bytes) {
 	return ((bytes + kLdsAllocGranule - 1) / kLdsAllocGranule * kLdsAllocGranule / kLdsEncodeGranule)
 	       << kRsrc2LdsShift;

@@ -18,7 +18,7 @@ Apple already ships, for x86, a virtual GPU stack: `AppleParavirtGPU.kext` (bind
 | G4 NGG + attribute-ring draw from a client | M3, M4 | card (Linux) exact; kext path pending boot 3 |
 | Flip/present, IOSurface-backed scanout | M4 | card (flip); IOSurface path not built |
 | Hang recovery per client | M2+ | compute W6 card non-VM; gfx code |
-| Test loops: `tools/emu-linux.sh`, `tools/linux-replay`, `tools/radv-triangle` | all | exist |
+| Test loops: `tools/vm/emu-linux.sh`, `tools/linux/linux-replay`, `tools/linux/radv-triangle` | all | exist |
 
 If the card's client-VM failure is not root-caused, **M2 and later are blocked whatever the route** (B has the same dependency). M0 and M1 do not touch the card.
 
@@ -50,7 +50,7 @@ If the card's client-VM failure is not root-caused, **M2 and later are blocked w
 - **Fallback:** none route-specific: a missing card client-VM result blocks B equally. If only the non-VM legacy path works, M2 can run with <= 8 clients as a demo.
 
 ### M3: the AIR compiler
-- **Do:** two tracks, about two weeks each, then pick: (a) `metal2vulkan` (AIR -> SPIR-V) + Mesa NIR/ACO built for macOS; (b) AIR -> LLVM AMDGPU (upstream LLVM supports gfx1201). Start with the **two SkyLight composite shaders** (obtained from the M1 stream) and the conformance compute kernels; compile and test them **off macOS first** with `tools/linux-replay` on the card (ISA correctness without the whole stack).
+- **Do:** two tracks, about two weeks each, then pick: (a) `metal2vulkan` (AIR -> SPIR-V) + Mesa NIR/ACO built for macOS; (b) AIR -> LLVM AMDGPU (upstream LLVM supports gfx1201). Start with the **two SkyLight composite shaders** (obtained from the M1 stream) and the conformance compute kernels; compile and test them **off macOS first** with `tools/linux/linux-replay` on the card (ISA correctness without the whole stack).
 - **Gate (go):** both shaders compile to gfx12 NGG/PS code that draws the expected pixels through linux-replay (attribute ring, EXEC set from `merged_wave_info`, VGPR granules per metal-readiness s.2), and the compute kernels match a CPU reference.
 - **Evidence:** linux-replay outputs (pixels, PS invocations), a coverage list of AIR features supported.
 - **Needs (card (Linux)):** the G4 facts (have). **Effort:** 3-6 months, partly parallel with M2 [INFER].

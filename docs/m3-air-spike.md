@@ -17,7 +17,7 @@ file that ships with macOS); no code was copied from LGPL or TSNPL projects.
    `opt` refuses the triple `air64_v28-apple-macosx26.6.0` (the lowering tool re-triples before verifying).
 3. **What the two shader sets need is small** (section 4): SkyLight uses **22** `air.*` intrinsic families, all `float` (no `half`), address spaces 1 and 2 only, no
    threadgroup memory, no atomics; QuartzCore uses 66 families, adds `half`, imageblocks (16 of 180 modules) and `air.fwidth`/`discard`.
-4. **A real Apple compute kernel runs on the card after a ~600-line lowering** (`tools/air/air2amdgcn.cpp`, section 5): Apple's own `group_uniform_add_float`
+4. **A real Apple compute kernel runs on the card after a ~600-line lowering** (`tools/metal/air/air2amdgcn.cpp`, section 5): Apple's own `group_uniform_add_float`
    (CorePhotogrammetry) and `ReduceSumKernel_uint` (CoreRE3DGSFoundation; 1024-thread groups, 4 KiB LDS, barrier, `simd_sum`) were lowered to gfx1201 wave32 code
    objects and **both produced exactly the CPU reference on the card** (section 6; amdgpu compute ring, reset state 0, no kernel log lines). [card]
 5. **Coverage today** (section 7): of 10,720 unique compute kernels in the corpus, **2,281 (21.3 %)** lower and compile for gfx1201 with this prototype
@@ -34,11 +34,11 @@ file that ships with macOS); no code was copied from LGPL or TSNPL projects.
 ## 1. Samples: extraction (step 1)
 
 Source: the 18.4 GB universal installer asset already on disk (`~/work/tools/macos-full/25G83/asset/*.zip`, `payloadv2/payload.000-052`, section 9 of
-`docs/metal-spike.md`). `zpay` (Forge's `tools/e2/zpay-main.go.txt`, already built) listed `metallib` over all 53 payload chunks (97 s) and extracted every match
+`docs/metal-spike.md`). `zpay` (Forge's `tools/metal/e2/zpay-main.go.txt`, already built) listed `metallib` over all 53 payload chunks (97 s) and extracted every match
 (80 s) to `~/work/tools/macos-full/25G83/metallib/tree/`. 213 matches: 212 regular files (858 MB; each size equals the listing) and one symlink
 (`CoreImage.framework/CoreImage.metallib`). One of the 212 is not a metallib (`usr/share/file/magic/metallib`, the `file(1)` magic: it documents the header). **Nothing was downloaded.**
 
-| container (what `tools/air/metallib.py` calls it) | files | functions | what it is |
+| container (what `tools/metal/air/metallib.py` calls it) | files | functions | what it is |
 |---|---:|---:|---|
 | `MTLB` | 180 | 25,354 | the metallib proper; AIR bitcode per function |
 | `FAT` with an MTLB slice | 1 | 180 | **QuartzCore `default.metallib`**: a big-endian fat archive (`0xcafebabe`, 19 slices): slice 0 = MTLB (AIR, 1.6 MB), slices 1-18 = Mach-O images of **precompiled Apple-GPU code** (cputype `0x01000013`, one per AGX generation, ~9 MB each) |
@@ -47,11 +47,11 @@ Source: the 18.4 GB universal installer asset already on disk (`~/work/tools/mac
 | (one MTLB with zero functions) | 1 | 0 | |
 
 Owners of the AIR (functions): MetalPerformanceShaders 7,823 (7 libraries), CoreImage 3,322, ShaderGraph 2,040, Espresso 1,988, AvatarKit 1,510, VFX 1,170, CoreRE 885, SceneKit 678,
-GPUToolsReplay 599, CorePhotogrammetry 559, ... 126 owners in all (list: `tools/air/disall.py` results). The ones WindowServer needs: **SkyLight** (`SkyLightShaders.air64.metallib`: 7 vertex + 24 fragment,
+GPUToolsReplay 599, CorePhotogrammetry 559, ... 126 owners in all (list: `tools/metal/air/disall.py` results). The ones WindowServer needs: **SkyLight** (`SkyLightShaders.air64.metallib`: 7 vertex + 24 fragment,
 557 KB) and **QuartzCore** (180: 37 vertex, 119 fragment, 24 kernel). CoreImage ships 15 files (3 are native-only archives; `ci_*_stitchable*.metallib` are "visible" functions linked at run time).
 A `visible` entry (8,985 functions) is a stitchable function, not a dispatchable one.
 
-## 2. The container, as parsed (step 2): `tools/air/metallib.py`
+## 2. The container, as parsed (step 2): `tools/metal/air/metallib.py`
 
 MTLB, little endian (the meaning of the first fields follows the `file(1)` magic that ships in the same payload):
 
@@ -68,7 +68,7 @@ MTLB, little endian (the meaning of the first fields follows the `file(1)` magic
 `metallib.py list FILE [--json]` prints the function list; `extract FILE OUTDIR [--name REGEX] [--wrapped]` writes each module as `NNNN_<name>.bc` (raw bitcode, `llvm-dis`-ready).
 Public/private metadata (reflection) were not decoded: nothing below needed them, the `air.*` metadata inside each module carries the argument ABI. [host]
 
-## 3. llvm-dis over everything (step 3): `tools/air/disall.py`
+## 3. llvm-dis over everything (step 3): `tools/metal/air/disall.py`
 
 `llvm-dis` 22.1.8, 16 threads, 60 s: **28,683 modules (25,354 MTLB + 180 QuartzCore + 3,149 AGX builtin) -> 28,683 disassembled, 0 failures** (26,543 distinct by SHA-256).
 No bitcode-version, unknown-attribute or unknown-record error occurred. The modules carry:
@@ -78,7 +78,7 @@ opaque pointers, current-LLVM attributes (`captures(none)`, `memory(argmem: read
 `air.compile.framebuffer_fetch_enable|disable`. [host] So the Apple front end is a recent LLVM, and LLVM 22 is new enough to read it: **no bitcode reader work is needed.**
 Not established: that the IR *verifies* (the LLVM verifier rejects the triple only because `opt` does not know `air64`; the lowering tool verifies after re-triple, and passed for every module it lowered).
 
-## 4. Census (step 4): `tools/air/census.py`, full tables in `docs/m3-air-census.md`
+## 4. Census (step 4): `tools/metal/air/census.py`, full tables in `docs/m3-air-census.md`
 
 24,247 unique non-builtin modules; instruction counts: median 78, p90 813. [host] Entry types (unique modules): kernel 10,720, visible 8,950, fragment 2,872, vertex 1,677, intersection 15, extern 8, mesh 2.
 
@@ -146,10 +146,10 @@ Entry points (instruction counts in `docs/m3-air-census.md`): vertex `SimpleVert
 programming that exists only on Apple's tile-based GPUs). 7 modules use function constants; 8 use threadgroup memory; the 24 kernels are blur/downsample/glass helpers.
 Arguments are mostly `float4`/`half4` structs of uniforms (`NarrowBlurUniforms`, `GlassBackgroundUniforms`, `CA::OGL::Metal::GammaLUTs`, ...).
 
-## 5. The lowering (step 5): `tools/air/air2amdgcn.cpp`
+## 5. The lowering (step 5): `tools/metal/air/air2amdgcn.cpp`
 
-A C++ tool against the system LLVM 22 (`tools/air/build-tools.sh`; `llvm-config --link-shared`), reading `.bc` or `.ll`. Two modes:
-`kernel IN --tg X,Y,Z -o OUT.ll [--entry NAME]` produces an `amdgpu_kernel` for gfx1201 (then `llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1201 -O2 -filetype=obj` and `ld.lld -shared`, `tools/air/build-kernel.sh`),
+A C++ tool against the system LLVM 22 (`tools/metal/air/build-tools.sh`; `llvm-config --link-shared`), reading `.bc` or `.ll`. Two modes:
+`kernel IN --tg X,Y,Z -o OUT.ll [--entry NAME]` produces an `amdgpu_kernel` for gfx1201 (then `llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1201 -O2 -filetype=obj` and `ld.lld -shared`, `tools/metal/air/build-kernel.sh`),
 and `coverage [--codegen] IN...` lowers every `air.*` call of every function in place and reports what lowered, what has no rule, and whether the AMDGPU back end compiles it (one JSON line per module).
 
 ### 5.1 Compute ABI the tool produces (the contract with the runtime) [code, host-compiled; the first two kernels also card-run]
@@ -192,7 +192,7 @@ and `coverage [--codegen] IN...` lowers every `air.*` call of every function in 
 
 ### 6.1 Results [card, 2026-10-01 19:14-19:15 local; REPLAY_COMPUTE_OK=1 with the lead's go-ahead hub-task-443, one run, no retry]
 
-`tools/air/run-spike.sh run` builds everything, then `tools/air/test-kernels.py` launches each kernel with `tools/air/air-run.cpp` (a generalisation of `tools/linux-replay/replay-compute.cpp`: the same
+`tools/metal/air/run-spike.sh run` builds everything, then `tools/metal/air/test-kernels.py` launches each kernel with `tools/metal/air/air-run.cpp` (a generalisation of `tools/linux/linux-replay/replay-compute.cpp`: the same
 `amdgpu_cs_submit` on the compute ring, same `pm4build.h` IB, same code-object reader; kernel name, grid, work-group size, kernargs and `COMPUTE_PGM_RSRC2.LDS_SIZE` are parameters) and compares with a CPU reference.
 
 | kernel (Apple's, unmodified AIR) | launch | lowered object | result |
@@ -203,20 +203,20 @@ and `coverage [--codegen] IN...` lowers every `air.*` call of every function in 
 Both: fence signalled, `amdgpu_cs_query_reset_state` 0, `journalctl -k` for the window empty. The two kernels are the *first lowered by this tool*; the tool was extended afterwards (alloca/address-space
 fixes, atomics, more rules): re-lowering gives the same line counts (45 and 73 ISA lines), but the ISA was not byte-compared with the object that ran.
 
-**Not run: `grid3d`.** `tools/air/samples/grid3d.ll` is hand-written, AIR-shaped (same metadata conventions; no Apple code): a `uint3` grid (30,10,5) with work-group (8,4,2), each thread writes its
+**Not run: `grid3d`.** `tools/metal/air/samples/grid3d.ll` is hand-written, AIR-shaped (same metadata conventions; no Apple code): a `uint3` grid (30,10,5) with work-group (8,4,2), each thread writes its
 `thread_position_in_grid`, `threadgroup_position_in_grid` and `thread_position_in_threadgroup`. It exercises exactly what the two runs above did not: Y/Z work-group IDs (`ttmp7`), the packed local IDs
-(`v0`, `TIDIG_COMP_CNT` = 2, RSRC2 = 0x1384) and the grid guard in 3-D. It lowers and assembles on the host [host]. The lead approved one run (`REPLAY_COMPUTE_OK=1 python3 tools/air/test-kernels.py --only grid3d`), but the Claude Code permission
+(`v0`, `TIDIG_COMP_CNT` = 2, RSRC2 = 0x1384) and the grid guard in 3-D. It lowers and assembles on the host [host]. The lead approved one run (`REPLAY_COMPUTE_OK=1 python3 tools/metal/air/test-kernels.py --only grid3d`), but the Claude Code permission
 classifier refused the command (it treats the `REPLAY_COMPUTE_OK` gate as a "safety bypass flag") and I did not work around it. **Status: code, not run**; whoever has the go can run that one line.
 
 ### 6.2 ttmp9 / ttmp7: the work-group ID on gfx12, and what the kext must do
 
 - LLVM's gfx12 code takes the work-group ID from **`ttmp9` (x) and `ttmp7` (y in bits 15:0, z in 31:16)**, not from system SGPRs after the user SGPRs as gfx10 does: `v_lshl_or_b32 v0, ttmp9, 6, v0`, `s_and_b32 s3, ttmp7, 0xffff`,
-  `s_lshr_b32 s1, ttmp7, 16` (all three kernels, [host] disassembly in `build/air/k/*.dis`). [card] for X (all runs) and for "y = z = 0" (the guard compares them with the grid size and the results are right).
+  `s_lshr_b32 s1, ttmp7, 16` (all three kernels, [host] disassembly in `Build/air/k/*.dis`). [card] for X (all runs) and for "y = z = 0" (the guard compares them with the grid size and the results are right).
 - **The enable is `COMPUTE_PGM_RSRC2.TGID_X_EN` [7], `TGID_Y_EN` [8], `TGID_Z_EN` [9]** (`gc_12_0_0_sh_mask.h`: `TG_SIZE_EN` [10], `TIDIG_COMP_CNT` [12:11], `LDS_SIZE` [23:15]); the code object's kernel descriptor
   already sets them (`.amdhsa_system_sgpr_workgroup_id_x/y/z`), and the IB adds **no other register**: `air-run` writes exactly `PGM_LO`, `PGM_RSRC1`, `PGM_RSRC2` (descriptor value, LDS field patched), `PGM_RSRC3`, resource limits, thread-per-SE masks, `START_*`, `NUM_THREAD_*`, `USER_DATA0..1`,
   `DISPATCH_DIRECT`, as the kext's own `rdna4-run` does. The Linux amdgpu `gfx_v12_0.c` has no TTMP set-up of its own (grep: none). Which hardware block writes the TTMPs when the bit is set is **INFER** (the architected-SGPR scheme of RDNA4;
   RDNA4 ISA pp. 43-44 per `docs/metal-spike.md` s.3.1, not re-read here).
-- **Correction to the premise "our hand-written kernels use TGID system SGPRs":** the repo's clang-built `vadd.cl` (`shaders/vadd.cl` -> `src/vadd_codeobj.h`, the kernel the kext runs on the card) *also* reads `ttmp9` (`v_lshl_or_b32 v0, ttmp9, 6, v0` at +0xc) with RSRC2 = 0x84 (USER_SGPR = 2, TGID_X_EN). [host: disassembly of a fresh clang build; the embedded header
+- **Correction to the premise "our hand-written kernels use TGID system SGPRs":** the repo's clang-built `vadd.cl` (`src/shaders/vadd.cl` -> `src/vadd_codeobj.h`, the kernel the kext runs on the card) *also* reads `ttmp9` (`v_lshl_or_b32 v0, ttmp9, 6, v0` at +0xc) with RSRC2 = 0x84 (USER_SGPR = 2, TGID_X_EN). [host: disassembly of a fresh clang build; the embedded header
   is generated from the same source] So **the kext already provides `ttmp9` for LLVM-compiled kernels, by honouring the descriptor's RSRC2**; the only open items are Y/Z (`grid3d`), and that the kext does not mask `TGID_Y_EN/TGID_Z_EN` or `TIDIG_COMP_CNT` when it copies RSRC2
   (it patches only `LDS_SIZE`: `src/compute.cpp:3142`).
 - Also required of any runtime: **`LDS_SIZE` is not in the code object's RSRC2** (it is 0): the dispatch must OR in `ldsSizeField(group_segment_fixed_size + dynamic)` (1 KiB granule, 512-byte units) or the kernel's LDS accesses fault (the kext does; `air-run` does).
@@ -225,7 +225,7 @@ classifier refused the command (it treats the `REPLAY_COMPUTE_OK` gate as a "saf
 ## 7. Coverage (the "coverage list of AIR features supported")
 
 Host only; nothing here ran on the card. "Lowered + llc ok" = every `air.*` call has a rule above AND the AMDGPU back end (`gfx1201`, `-O2`) compiles the whole module as plain callable functions
-(`tools/air/coverage-all.sh` + `coverage-report.py`; one process per module). "Refused/crash" = the tool refuses the module (imageblock address space) or LLVM aborts (`LLVM ERROR: Do not know how to promote this operator`, in a few modules).
+(`tools/metal/air/coverage-all.sh` + `coverage-report.py`; one process per module). "Refused/crash" = the tool refuses the module (imageblock address space) or LLVM aborts (`LLVM ERROR: Do not know how to promote this operator`, in a few modules).
 
 | group | entry type | modules | lowered + llc ok | blocked by a missing air.* rule | codegen fail | refused / crash |
 |---|---|---:|---:|---:|---:|---:|
@@ -247,7 +247,7 @@ Blockers by number of modules, SkyLight: `air.sample_texture_2d.v4f32` 18, `air.
 QuartzCore: `sample_texture_2d` (v4f16 50, v4f32 45), `get_read_sampler` 27, `fwidth` 17, `discard_fragment` 11, `read_texture_2d` 11+9+8+7, imageblock ops 16, function constants 7, `simd_shuffle_and_fill_down` 7, `fast_atan2` 5. Whole corpus (top): `sample_texture_2d` 8,600,
 `write_texture_2d` 5,400, function constants 1,500+870, `get_read_sampler` 1,470, `get_width/height_texture_2d` 2,300, `fast_atan2` 1,070, `gather_texture_2d` 1,340, `fast_sincos`, `fast_atan`, `fast_fmod`.
 
-**Compute kernels end to end** (`tools/air/kernels-all.py`: `air2amdgcn kernel` with a fixed 64-thread group + `llc`, every unique kernel): **2,281 of 10,720 unique kernels (21.3 %) reach a gfx1201 code object**, 8,438 stop in the lowering, 1 fails in `llc`. [host; fixed 64-thread groups, never run beyond the two kernels of section 6] Why the others stop (kernels): texture arguments 1,628 (`air.texture`), `air.sample_texture_2d` f16/f32 2,660, `get_height/array_size_texture` 894, `sample_texture_2d_array` 239, `get_read_sampler` 483, visible-function tables 300, function constants 509 (argument kind or `is_function_constant_defined`), `get_null_texture` 177, AIR address space 4 (imageblock) 162, indirect-buffer arguments 150, acceleration-structure arguments 132, simdgroup matrix multiply 72, `stage_in` 69, `gather` 83, `write_texture` 119; 60 modules do not verify after lowering (not investigated: the earlier class, lifetime markers on re-addressed allocas, is fixed) and 1 is an `llc` selection failure on a 512-bit store to a constant-space global. The 2,281 that do compile are the buffer-and-threadgroup-memory kernels: reductions, scans, histograms, sorts, clears, copies, small image-less ML/Photogrammetry/VFX helpers. The tool reports the first reason a kernel stops, so the reasons are exclusive: about 6,300 of the 8,438 stops are texture/sampler arguments or calls, i.e. texture support is what would move this number.
+**Compute kernels end to end** (`tools/metal/air/kernels-all.py`: `air2amdgcn kernel` with a fixed 64-thread group + `llc`, every unique kernel): **2,281 of 10,720 unique kernels (21.3 %) reach a gfx1201 code object**, 8,438 stop in the lowering, 1 fails in `llc`. [host; fixed 64-thread groups, never run beyond the two kernels of section 6] Why the others stop (kernels): texture arguments 1,628 (`air.texture`), `air.sample_texture_2d` f16/f32 2,660, `get_height/array_size_texture` 894, `sample_texture_2d_array` 239, `get_read_sampler` 483, visible-function tables 300, function constants 509 (argument kind or `is_function_constant_defined`), `get_null_texture` 177, AIR address space 4 (imageblock) 162, indirect-buffer arguments 150, acceleration-structure arguments 132, simdgroup matrix multiply 72, `stage_in` 69, `gather` 83, `write_texture` 119; 60 modules do not verify after lowering (not investigated: the earlier class, lifetime markers on re-addressed allocas, is fixed) and 1 is an `llc` selection failure on a 512-bit store to a constant-space global. The 2,281 that do compile are the buffer-and-threadgroup-memory kernels: reductions, scans, histograms, sorts, clears, copies, small image-less ML/Photogrammetry/VFX helpers. The tool reports the first reason a kernel stops, so the reasons are exclusive: about 6,300 of the 8,438 stops are texture/sampler arguments or calls, i.e. texture support is what would move this number.
 
 ## 8. What is missing for vertex/fragment shaders, i.e. the path to the SkyLight composite shaders
 
@@ -278,11 +278,11 @@ plus 1-2 weeks for `UberComposite*` (function constants, 1-D-array LUT sampling,
 
     cd ~/work/rx4darwin/RDNA4FB-air
     ~/work/tools/macos-full/zpay ~/work/tools/macos-full/25G83/asset/*.zip metallib ~/work/tools/macos-full/25G83/metallib/tree     # step 1 (80 s)
-    python3 tools/air/disall.py  ~/work/tools/macos-full/25G83/metallib/tree ~/work/tools/macos-full/25G83/metallib/air              # steps 2-3 (60 s, 4 GB of .bc/.ll)
-    python3 tools/air/census.py  ~/work/tools/macos-full/25G83/metallib/air census.json && python3 tools/air/census.py x census.json --report > docs/m3-air-census.md   # step 4
-    tools/air/run-spike.sh                           # host only: build tools, lower three kernels, show descriptors
-    REPLAY_COMPUTE_OK=1 tools/air/run-spike.sh run   # on the card (after the reviewer's go)
-    tools/air/coverage-all.sh ~/work/tools/macos-full/25G83/metallib/air -not -path '*AGXMetal*' > cov.jsonl && python3 tools/air/coverage-report.py ~/work/tools/macos-full/25G83/metallib/air/results.jsonl cov.jsonl
-    python3 tools/air/kernels-all.py ~/work/tools/macos-full/25G83/metallib/air/results.jsonl
+    python3 tools/metal/air/disall.py  ~/work/tools/macos-full/25G83/metallib/tree ~/work/tools/macos-full/25G83/metallib/air              # steps 2-3 (60 s, 4 GB of .bc/.ll)
+    python3 tools/metal/air/census.py  ~/work/tools/macos-full/25G83/metallib/air census.json && python3 tools/metal/air/census.py x census.json --report > docs/m3-air-census.md   # step 4
+    tools/metal/air/run-spike.sh                           # host only: build tools, lower three kernels, show descriptors
+    REPLAY_COMPUTE_OK=1 tools/metal/air/run-spike.sh run   # on the card (after the reviewer's go)
+    tools/metal/air/coverage-all.sh ~/work/tools/macos-full/25G83/metallib/air -not -path '*AGXMetal*' > cov.jsonl && python3 tools/metal/air/coverage-report.py ~/work/tools/macos-full/25G83/metallib/air/results.jsonl cov.jsonl
+    python3 tools/metal/air/kernels-all.py ~/work/tools/macos-full/25G83/metallib/air/results.jsonl
 
-Files: `tools/air/{metallib.py, disall.py, census.py, air2amdgcn.cpp, build-tools.sh, build-kernel.sh, air-run.cpp, test-kernels.py, run-spike.sh, coverage-all.sh, coverage-report.py, kernels-all.py, samples/grid3d.ll}`, `docs/m3-air-census.md`.
+Files: `tools/metal/air/{metallib.py, disall.py, census.py, air2amdgcn.cpp, build-tools.sh, build-kernel.sh, air-run.cpp, test-kernels.py, run-spike.sh, coverage-all.sh, coverage-report.py, kernels-all.py, samples/grid3d.ll}`, `docs/m3-air-census.md`.

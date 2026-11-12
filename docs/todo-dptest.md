@@ -12,7 +12,7 @@ rdna4-modeset=1 rdna4-hotplug=2` are the defaults). A second display on **Displa
 
 For every boot:
 
-- Run `sudo bash tools/diagnostic-log.sh` before rebooting, and check the `active:` line near the top of the log:
+- Run `sudo bash tools/rig/diagnostic-log.sh` before rebooting, and check the `active:` line near the top of the log:
   it must show the boot-args the test asks for.
 - If a display stays dark, take the log from the other display or over SSH, then reboot. A reboot restores the
   firmware's state; nothing here is persistent.
@@ -105,7 +105,7 @@ than a second is not noticed.
 ## Test 2: mode switching on the DisplayPort second display
 
 Only if test 1 lit the second monitor. Same boot, or the same boot-args again. Do this with the Lenovo as the
-second display: its modes are the ones Linux was asked about (`tools/pipegen/modes.txt`). With the Samsung as the
+second display: its modes are the ones Linux was asked about (`tools/gen/pipegen/modes.txt`). With the Samsung as the
 second display only modes within 25 % of 148.5 MHz are offered besides those.
 
 1. Switch the second monitor to 1600x900, then to 1280x720, then back to 1920x1080. Does the picture follow each
@@ -177,5 +177,5 @@ Kept here because they explain what the tests above no longer need to cover; the
 - **The top of the picture cut off in the boot display's smaller modes**: fixed (the plane's blank-end register
   is written with the mode switch); 2560x1440, 1920x1080 and 1280x720 confirmed whole.
 - **The HDMI display moved to the other HDMI port**: works in both directions, also at 144 Hz.
-- `tools/cgmode.py` reaches the modes Displays preferences does not list: `/usr/bin/python tools/cgmode.py`
-  shows them, `/usr/bin/python tools/cgmode.py 2560x1440` switches for the login session.
+- `tools/rig/cgmode.py` reaches the modes Displays preferences does not list: `/usr/bin/python tools/rig/cgmode.py`
+  shows them, `/usr/bin/python tools/rig/cgmode.py 2560x1440` switches for the login session.

@@ -70,8 +70,8 @@ Sources: `hdr sh_mask` lines as cited; values from `log:082237.txt:245` (boot 9)
    - [I] The cursor has its own degamma ROM, FP scale and matrix: the exact counterparts of GAMCOR, HDR_MULT and POST_CSC. That points to a blend at or near the end of the CM chain.
 4. **[G] What follows.** If `CM_BYPASS` routes the pixel stream around the whole CM, it routes it around the cursor blend too.
    - Every cursor register would then read back right and latch, and zero cursor pixels would come out, for any image, position and address.
-   - That is exactly all three rounds. It is also why the July "all registers match Linux" diff found nothing: `CM_CONTROL` was never in it (`AMDRadeonRDNA4/tools/cursor-test.py:10-42`).
-   - The new Linux ground-truth list would miss it too: its CM entries are only `CM_CUR0_*` (`AMDRadeonRDNA4-int/tools/linux-groundtruth.sh:464-481`).
+   - That is exactly all three rounds. It is also why the July "all registers match Linux" diff found nothing: `CM_CONTROL` was never in it (`AMDRadeonRDNA4/tools/linux/cursor-test.py:10-42`).
+   - The new Linux ground-truth list would miss it too: its CM entries are only `CM_CUR0_*` (`AMDRadeonRDNA4-int/tools/linux/linux-groundtruth.sh:464-481`).
 5. **Why the earlier analyses passed over it.** `cursor-invisible-analysis.md:39` labelled `CM_BYPASS = 1` "normal for no color management", with no source cited. That inference is contradicted by the amdgpu chain in point 1.
 6. **Against this theory.** [G] The bypass mux could sit *before* the cursor stage, in which case CM_BYPASS is irrelevant. No public document settles this. It is decided in one boot by the CRC A/B (section 7).
 7. **The emulator cannot catch it.** [F] `rdna4_get_cursor` ignores `CM_CONTROL` (`AMDRadeonRDNA4-int/emu/qemu/rdna4.c:6488-6560`), so every VM pass is silent on it.
@@ -160,5 +160,5 @@ All registers are base idx 2 unless noted. DPP registers take `+ dppOff()` (stri
 ## 8. Cheap additions before or with round 5
 
 1. **Read-only, zero risk.** Add the ten CM0 registers of 7.1 to `cursorDsclDump` (`k:cursor.cpp:756-776`). `CM_HDR_MULT_COEF` and `GAMCOR_CONTROL` also bound the risk of 7.1 before it is ever written.
-2. **Linux capture.** Add `CM0_CM_CONTROL 2 0x0d67`, `0x0d68`, `0x0d75-0x0d77`, `0x0dc1-0x0dc6`, `DCHUBBUB_SDPIF_PIPE_SEC_LVL 0x047e`, `_CURSOR0_SEC_LVL 0x0481` and `MPCC0_*` (base 3, `0x0000-0x0005`) to the `dcn-list` in `tools/linux-groundtruth.sh:287+`. **[I] Expect `CM_CONTROL=0x00000000` on Linux**, which would confirm the premise of #1 without the card.
+2. **Linux capture.** Add `CM0_CM_CONTROL 2 0x0d67`, `0x0d68`, `0x0d75-0x0d77`, `0x0dc1-0x0dc6`, `DCHUBBUB_SDPIF_PIPE_SEC_LVL 0x047e`, `_CURSOR0_SEC_LVL 0x0481` and `MPCC0_*` (base 3, `0x0000-0x0005`) to the `dcn-list` in `tools/linux/linux-groundtruth.sh:287+`. **[I] Expect `CM_CONTROL=0x00000000` on Linux**, which would confirm the premise of #1 without the card.
 3. **Order in boot 4.** Keep the round-5 diagnostics. Add 7.1 as the last step of `cursorSelfTest`, after the first CRC, so that one boot yields: GOP DSCL/CM/DLG state, CRC with the GOP CM state, and CRC with the CM enabled.

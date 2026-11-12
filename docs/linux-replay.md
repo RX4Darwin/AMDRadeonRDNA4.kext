@@ -31,9 +31,9 @@ and PS_INVOCATIONS.
 The emulator launched NGG waves with EXEC = all ones, which hid the bug. It now starts them with `0x1` like
 the card, so the old shaders fail there too (negative control).
 
-## How it was found (tools/linux-replay)
+## How it was found (tools/linux/linux-replay)
 
-`tools/linux-replay/replay.cpp` submits the kext's `gfx12_draw.h` stream through amdgpu's CS ioctl
+`tools/linux/linux-replay/replay.cpp` submits the kext's `gfx12_draw.h` stream through amdgpu's CS ioctl
 (libdrm_amdgpu), in a normal per-process VMID, with the kext's shaders placed and relocated the same way
 `gfxDrawRun` does. It adds SAMPLE_PIPELINESTAT around the draw and counts the target. `REPLAY_SET` inserts
 SET_*_REG writes before the draw, and `REPLAY_VS` picks the VS binary.
@@ -59,13 +59,13 @@ Ruled out along the way (all on the card): the export order (`linux-radv-triangl
 
 ## Reproduce
 
-    tools/linux-replay/run.sh                                 # the committed ngg.s: 8192 px
-    REPLAY_VS=old tools/linux-replay/run.sh                   # the round-6 ngg.s (edc5f81): 0 px
-    REPLAY_SET="c:0x10b=0x43800000" tools/linux-replay/run.sh # any register override
+    tools/linux/linux-replay/run.sh                                 # the committed ngg.s: 8192 px
+    REPLAY_VS=old tools/linux/linux-replay/run.sh                   # the round-6 ngg.s (edc5f81): 0 px
+    REPLAY_SET="c:0x10b=0x43800000" tools/linux/linux-replay/run.sh # any register override
 
 ## W12k groundwork: the app-side triangle IB
 
-`userspace/gfx12tri.h` is the triangle as an application records it: `rdna4_tri_place_shaders`,
+`userspace/rdna4-run/gfx12tri.h` is the triangle as an application records it: `rdna4_tri_place_shaders`,
 `rdna4_tri_record` (the stream with the app's code/target/ring/fence addresses) and `rdna4_tri_count`.
 It is plain C (rdna4-run) and C++ (the replay), over `src/gfx12_draw.h`, which the generator now emits
 for both languages. The regenerated stream and relocations are byte-identical and the kext's code is
@@ -76,13 +76,13 @@ writes the fence the app waits on.
 The emulator (W12e) agrees for this stream in a client VMID: every opcode is modelled (none takes the
 OPCODE_ERROR fault) and all its SET_UCONFIG_REG writes are in the unprivileged range.
 
-`tools/linux-replay/ring-capture.sh` (needs sudo, read-only) dumps amdgpu's gfx rings right after a
+`tools/linux/linux-replay/ring-capture.sh` (needs sudo, read-only) dumps amdgpu's gfx rings right after a
 replay and decodes the packets around our INDIRECT_BUFFER. That shows what the kernel wraps a user gfx IB
 with on this card, which is the reference for the kext side of W12k.
 
 ## The wave64 fallback (ladder variant 4096)
 
-`shaders/ngg64.s` is `ngg.s` as a wave64 NGG shader (64-bit EXEC and compare masks; `tools/build-shaders.sh`
+`src/shaders/ngg64.s` is `ngg.s` as a wave64 NGG shader (64-bit EXEC and compare masks; `tools/gen/build-shaders.sh`
 assembles `*64.s` with `+wavefrontsize64`). It is RADV's NGG (GS) half only: RADV also runs the pixel shader as wave64
 (`PS_W32_EN = 0`, `hw-logs/2026-09-30-linux-radv-triangle/radv-shaders-and-ibs.txt:882`), while variant 4096 keeps the PS wave32. Variant 4096 places it, clears `VGT_SHADER_STAGES_EN.GS_W32_EN`
 and sets `SPI_SHADER_PGM_RSRC1_GS.VGPRS = 2`. On the card (`REPLAY_VARIANT=4096`) it draws **8192 px**, with
@@ -90,10 +90,10 @@ the same counters as the wave32 baseline.
 
 Proof that it runs as wave64: the same `ngg64` binary with the same `VGPRS = 0` (8 VGPRs in wave32, 4 in wave64)
 and only `GS_W32_EN` differing. Wave32 mode draws 8192 px; wave64 mode draws 0 px (PS 0, C_INV 1; C_PRIM read 0, 4 or 8 over six runs, so the pixel count is the signal, not C_PRIM).
-With `VGPRS = 1` (8 VGPRs in wave64) it draws again. Reproduce, after `run.sh` has built `tools/linux-replay/build/replay`:
+With `VGPRS = 1` (8 VGPRs in wave64) it draws again. Reproduce, after `run.sh` has built `tools/linux/linux-replay/build/replay`:
 
-    REPLAY_VARIANT=4096 REPLAY_SET="c:0x2a6=0x04400000;s:0x8a=0x000c0000" tools/linux-replay/build/replay   # wave32: 8192 px
-    REPLAY_VARIANT=4096 REPLAY_SET="s:0x8a=0x000c0000" tools/linux-replay/build/replay                      # wave64: 0 px
+    REPLAY_VARIANT=4096 REPLAY_SET="c:0x2a6=0x04400000;s:0x8a=0x000c0000" tools/linux/linux-replay/build/replay   # wave32: 8192 px
+    REPLAY_VARIANT=4096 REPLAY_SET="s:0x8a=0x000c0000" tools/linux/linux-replay/build/replay                      # wave64: 0 px
 
 It joins every probe boot's ladder right after the NGG marker. The ladder only runs when the baseline draw
 is not right. If boot 3's wave32 baseline were still empty on macOS, `diag 4096` says whether the wave size

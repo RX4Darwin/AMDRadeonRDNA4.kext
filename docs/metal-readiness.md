@@ -3,8 +3,8 @@
 Written 2026-09-30 by the lead as the closing document of the pre-Metal phase. Status words, used strictly:
 
 - **card**: measured on the RX 9070 XT under macOS with the kext (a `amdradeonrdna4-diag-*` log on the stick or in `docs/hw-logs/`).
-- **card (Linux)**: measured on the same card under Linux with the kext's own bytes (tools/linux-replay, tools/radv-triangle).
-- **emulator**: passes in the QEMU model (`emu/qemu/rdna4.c`, `tools/emu-linux.sh`). The emulator has passed things the card then
+- **card (Linux)**: measured on the same card under Linux with the kext's own bytes (tools/linux/linux-replay, tools/linux/radv-triangle).
+- **emulator**: passes in the QEMU model (`emu/qemu/rdna4.c`, `tools/vm/emu-linux.sh`). The emulator has passed things the card then
   failed (VM clients, the G3 EXEC bug), so it is not evidence for the card.
 - **code**: written and reviewed, never executed.
 
@@ -43,7 +43,7 @@ These cost real-card rounds. Every one is measured unless marked.
 - **User gfx IBs**: amdgpu wraps a user gfx IB with pipeline sync, VM flush (PT base + ENG0 invalidate), PFP_SYNC_ME, IH VMID LUT,
   CONTEXT_CONTROL, IB (VMID in [27:24], no VALID, no PRIV), user + ring fences (`docs/w12k-gfx-submit.md`, captured on the card).
 - **Compute in a VMID**: a VMID-0 kernel queue taking the VMID from the IB packet runs our code correctly in a per-process VMID
-  (card (Linux), `tools/linux-replay` compute). amdgpu has no gfx12 precedent for MMIO-loaded HQDs with a non-zero VMID (KFD needs
+  (card (Linux), `tools/linux/linux-replay` compute). amdgpu has no gfx12 precedent for MMIO-loaded HQDs with a non-zero VMID (KFD needs
   MES).
 - **Unmap needs an invalidate before memory reuse** (code: W13 S0 fixed `rtFree`/`rtUnload`).
 - **Per-client VA is limited to 1 GiB** above `kVaStart` in the fixed-VMID layouts (one PDB1 entry; found by W13's differential
@@ -56,11 +56,11 @@ These cost real-card rounds. Every one is measured unless marked.
 
 | Loop | What it proves | Cost |
 |---|---|---|
-| `tools/linux-replay` | any gfx/compute stream + shaders on the real card through amdgpu | seconds, no reboot (GPU hangs possible: warn the user) |
-| `tools/radv-triangle` + patched Mesa | RADV ground truth; hypothesis tests by patching RADV | seconds (+ one Mesa build) |
-| `tools/linux-replay/ring-capture.sh` | what amdgpu puts on the ring (sudo) | one run |
-| `tools/emu-linux.sh <boot> --diag` | the kext + diagnostic script in macOS Recovery on the QEMU model | ~2 min per boot |
-| real-card boots (`tools/set-boot.sh`, `tools/diagnostic-log.sh`) | the truth | a reboot per boot, the user's time |
+| `tools/linux/linux-replay` | any gfx/compute stream + shaders on the real card through amdgpu | seconds, no reboot (GPU hangs possible: warn the user) |
+| `tools/linux/radv-triangle` + patched Mesa | RADV ground truth; hypothesis tests by patching RADV | seconds (+ one Mesa build) |
+| `tools/linux/linux-replay/ring-capture.sh` | what amdgpu puts on the ring (sudo) | one run |
+| `tools/vm/emu-linux.sh <boot> --diag` | the kext + diagnostic script in macOS Recovery on the QEMU model | ~2 min per boot |
+| real-card boots (`tools/rig/set-boot.sh`, `tools/rig/diagnostic-log.sh`) | the truth | a reboot per boot, the user's time |
 
 ## 4. The open blocker: applications' GPU work in their own VM
 

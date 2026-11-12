@@ -6,7 +6,7 @@
 //  timing generator and encoder, then one plane scanning a 32-bit linear
 //  surface. This is what a second monitor needs; the lit pipe is not touched.
 //
-//  The register sequence is not written here. It is Linux's: tools/pipegen
+//  The register sequence is not written here. It is Linux's: tools/gen/pipegen
 //  runs amdgpu DC's own DCN 4.01 functions (dce110_apply_single_controller_
 //  ctx_to_hw, link_set_dpms_on, dcn401_program_pipe, with the HUBP timing
 //  values from DML 2.1) against a recorder and writes the result to
@@ -20,7 +20,7 @@
 //  plan runs), and the plan's writes to the sink's DPCD as Op::Aux steps.
 //  Nothing else in it depends on the link's rate or lane count.
 //
-//  Freestanding; shared by the kext and tools/atomdump.cpp.
+//  Freestanding; shared by the kext and test/atomdump.cpp.
 //
 
 #ifndef Pipe2_hpp
@@ -47,13 +47,40 @@ struct Config {
 	uint8_t  detSeg;          // DCHUBBUB_DET0..3_CTRL: segment and dwords
 	uint16_t detCtrl[4];
 	bool     dp;              // DisplayPort: the plan trains the link (Op::Train) and talks to the sink over AUX
+	bool     y420;            // HDMI in YCbCr 4:2:0, the link at half the pixel clock (an adapter's 300 MHz)
+};
+
+// A register a 4:2:0 table's pipe holds differently in RGB (kEncoding).
+struct EncodingReg {
+	uint8_t     seg;
+	uint32_t    dword;
+	uint32_t    mask;
+	uint32_t    rgb, y420;
+	const char *what;
 };
 // There is one table per connector a second display can be on. use() picks
 // the one for a display on that HPD pin, for everything below (false, and no
-// change, if there is none); until then it is the first.
+// change, if there is none); until then it is the first. A DisplayPort
+// connector has two: `tmds` picks the HDMI one, for a monitor behind a passive
+// DP++ adapter (the HDMI connectors' only table is taken either way). There
+// is a set of them for each pipe a display beyond the boot one can be on
+// (1 to 3): `pipe` picks the set. An HDMI connector, and a DisplayPort one
+// for an HDMI sink behind a DP++ adapter, has a second table that lights the
+// pipe at 3840x2160@60 (scrambled, and DISPCLK raised first): `uhd` picks it.
+// A DisplayPort connector has a third, at 3840x2160@60 in YCbCr 4:2:0 for an
+// HDMI sink behind an adapter that carries no more than 300 MHz: `uhd` and
+// `y420` pick it.
 size_t configCount();
 const Config &configAt(size_t i);
-bool use(uint8_t hpd);
+bool use(uint8_t hpd, bool tmds = false, uint8_t pipe = 1, bool uhd = false, bool y420 = false);
+// Whether a table lights its pipe at 3840x2160; whether the connector on that
+// HPD pin has one.
+constexpr uint16_t kUhdWidth = 3840;
+bool isUhd(const Config &c);
+bool hasUhdTable(uint8_t hpd);
+// Whether the connector on that HPD pin is a DisplayPort one (it has a
+// DisplayPort table besides its HDMI one).
+bool hasDpTable(uint8_t hpd);
 const Config &config();   // of the table in use
 
 // The DET buffer is 1344 KiB in 64 KiB segments, shared by all planes
@@ -92,6 +119,13 @@ struct Target {
 	// pixel clock in the DMUB commands, the infoframe's VIC and bars, and for
 	// DisplayPort the MSA and the first Mvid.
 	Edid::DetailedTiming now;
+	// A 4:2:0 table's pipe running a mode in RGB, one the adapter carries so
+	// (encodingSteps): the DMUB clocks, the infoframe and the DIG's pixels a
+	// cycle of the sleep and wake parts follow it.
+	bool rgb;
+	// Light: the DET segments to give the plane, when the plan's (DML's for
+	// this pipe alone) do not fit next to the other pipes; 0 = the plan's.
+	uint8_t detSegments;
 };
 
 constexpr size_t kMaxSteps = 448;
@@ -121,8 +155,8 @@ bool build(const Target &t, Plan &out, const char **why);
 
 // What changes with the mode on the lit pipe besides the timing itself: the
 // HUBP's request timing (DLG, TTU), the DET size and the timing generator's
-// global sync, all of which Linux takes from DML. tools/pipegen ran it for
-// the timings of tools/pipegen/modes.txt with the plane on the plan's
+// global sync, all of which Linux takes from DML. tools/gen/pipegen ran it for
+// the timings of tools/gen/pipegen/modes.txt with the plane on the plan's
 // surface, and the table holds what differs.
 //
 // modeSteps gives the updates for a switch to `to`, for the OTG update lock
@@ -141,6 +175,10 @@ const Edid::DetailedTiming *knownModes(size_t &count);   // the table's timings,
 size_t modeSteps(const Edid::DetailedTiming &to, ModeSet::Step *out, size_t cap, ModeRegs which = ModeRegs::Apply);
 // The DET segments the pipe holds after a switch to `to`.
 uint32_t modeDetSegments(const Edid::DetailedTiming &to);
+// A 4:2:0 table's updates for its pipe to run in that encoding, for the OTG
+// update lock before modeSteps': what Linux leaves different between lighting
+// the plan's timing in RGB and in 4:2:0. None for other tables.
+size_t encodingSteps(bool y420, ModeSet::Step *out, size_t cap);
 
 // The link (0 = UNIPHY A) a VBIOS encoder object drives, or -1: object ids
 // 0x1e, 0x20, 0x21 are UNIPHY, UNIPHY1, UNIPHY2 with two links each, picked

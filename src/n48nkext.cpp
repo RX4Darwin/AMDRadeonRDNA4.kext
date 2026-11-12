@@ -3,7 +3,7 @@
 //  AMDRadeonRDNA4
 //
 //  The Vulkan interface on the card (docs/vulkan-port.md, step 1): the user
-//  client that carries the calls of vulkan/navi48_native_abi.h, and what
+//  client that carries the calls of userspace/vulkan/navi48_native_abi.h, and what
 //  stands behind the client engine of n48n.cpp here, the runtime's own
 //  pieces:
 //
@@ -36,11 +36,16 @@
 //
 
 #include "compute.hpp"
+#include "klog.hpp"
 #include "flip.hpp"
 #include "n48n.hpp"
 #include "pipe.hpp"
 #include "rdna4vulkan.h"
 #include "userclient.hpp"
+#ifdef AMDRadeonRDNA4_PVGPU
+#include "pvgpu.hpp"
+#include "rdna4mtlc.h"
+#endif
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODMACommand.h>
@@ -50,7 +55,7 @@
 
 using namespace GfxReg;
 
-#define VLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: vulkan: " fmt "\n", ## __VA_ARGS__)
+#define VLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: vulkan: " fmt "\n", ## __VA_ARGS__)
 
 namespace {
 
@@ -112,6 +117,18 @@ bool mapForCard(SystemMemory *s) {
 
 } // namespace
 
+// What a process maps of a buffer in the pool heap (n48nMemory): a descriptor of its own, whose retain count tells whether
+// a mapping still holds it. A process keeps such a mapping as long as it likes, so a freed buffer's memory stays out of the
+// heap until none does: the heap also holds page tables and the next client's buffers.
+struct RDNA4Compute::N48nView {
+	IOMemoryDescriptor *memory;   // nullptr: a free entry
+	uint64_t            offset;   // in the pool heap
+	uint64_t            bytes;
+	bool                freed;    // the buffer is gone; its memory waits for the mappings
+};
+
+constexpr uint32_t kViews = N48N_MAX_BOS;
+
 struct RDNA4Compute::N48nState {
 	const void  *owner;
 	uint32_t     vmid;           // its address space: the lowest of 8 to 15 no client of the runtime holds (vmidUsed)
@@ -151,9 +168,10 @@ struct N48nBackend {
 	static bool allocVram(void *context, uint64_t bytes, uint64_t, bool highAllowed, N48N::Memory &out) {
 		RDNA4Compute &c = of(context);
 		uint64_t offset = 0, physical = 0;
-		// The pool the CPU reaches is small: a buffer that does not need it goes past the BAR when it can.
+		// The pool the CPU reaches is small: a buffer that does not need it goes past the BAR when it can. Zeroed by the
+		// copy engine, as the CPU cannot reach it: it may hold what another client left.
 		if (highAllowed && c.devHeap.size() && c.devHeap.alloc(bytes, offset)) {
-			if (c.gpuPhysical(c.vramMc(offset), physical)) {
+			if (c.vramZero(c.vramMc(offset), c.devHeap.lengthOf(offset)) && c.gpuPhysical(c.vramMc(offset), physical)) {
 				out = N48N::Memory { offset, physical, false, false, true, c.vramMc(offset) };
 				return true;
 			}
@@ -186,7 +204,7 @@ struct N48nBackend {
 		RDNA4Compute &c = of(context);
 		if (m.system)
 			release(reinterpret_cast<SystemMemory *>(m.token));
-		else
+		else if (m.high || !c.n48nRetire(m.token))
 			(m.high ? c.devHeap : c.heap).free(m.token);
 	}
 
@@ -419,6 +437,52 @@ struct N48nBackend {
 	}
 };
 
+bool RDNA4Compute::n48nRetire(uint64_t offset) {
+	for (uint32_t i = 0; n48nViews && i < kViews; i++) {
+		N48nView &v = n48nViews[i];
+
+		if (v.memory && !v.freed && v.offset == offset) {
+			v.freed = true;
+			n48nSweep();
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void RDNA4Compute::n48nSweep() {
+	for (uint32_t i = 0; n48nViews && i < kViews; i++) {
+		N48nView &v = n48nViews[i];
+
+		if (!v.memory || !v.freed || v.memory->getRetainCount() > 1)
+			continue;
+
+		v.memory->release();
+		heap.free(v.offset);
+		v = N48nView {};
+	}
+}
+
+// Called with the pool heap just made anew after a sleep: every buffer is gone, and memory a process still maps stays its.
+void RDNA4Compute::n48nKeep() {
+	for (uint32_t i = 0; n48nViews && i < kViews; i++) {
+		N48nView &v = n48nViews[i];
+
+		if (!v.memory)
+			continue;
+
+		v.freed = true;
+		if (v.memory->getRetainCount() > 1 && heap.take(v.offset, v.bytes))
+			continue;
+
+		if (v.memory->getRetainCount() > 1)
+			VLOG("pool memory at +0x%llx (%llu bytes) is still mapped by a process but could not be kept", v.offset, v.bytes);
+		v.memory->release();
+		v = N48nView {};
+	}
+}
+
 IOReturn RDNA4Compute::n48nOpen(const void *owner) {
 	if (!rtLock)
 		return kIOReturnNotReady;
@@ -428,6 +492,13 @@ IOReturn RDNA4Compute::n48nOpen(const void *owner) {
 		return kIOReturnNotReady;
 	if (n48n)
 		return kIOReturnExclusiveAccess;
+	if (!n48nViews) {
+		n48nViews = static_cast<N48nView *>(IOMalloc(kViews * sizeof(N48nView)));
+		if (!n48nViews)
+			return kIOReturnNoMemory;
+		bzero(n48nViews, kViews * sizeof(N48nView));
+	}
+	n48nSweep();
 	// ponytail: with rdna4-vmshared=2 the runtime hands address spaces out per job from a pool of its own (vmPool), which this does not
 	// know; the interface stays shut there. Take one from that pool when both are wanted.
 	if (vmShared == 2) {
@@ -491,6 +562,7 @@ void RDNA4Compute::n48nClose(const void *owner) {
 	heap.free(n48n->fencePage);
 	IOFree(n48n, sizeof(N48nState));
 	n48n = nullptr;
+	n48nSweep();
 	VLOG("client closed: %llu MiB free behind the BAR, %llu MiB past it", heap.freeBytes() >> 20, devHeap.freeBytes() >> 20);
 }
 
@@ -525,14 +597,16 @@ IOReturn RDNA4Compute::n48nCall(const void *owner, uint32_t selector, IOExternal
 		size_t bytes = a->structureOutputSize;
 		r = static_cast<IOReturn>(n48n->client.call(selector, a->scalarInput, a->scalarInputCount, a->structureInput, a->structureInputSize,
 		                                            a->scalarOutput, &scalars, a->structureOutput, &bytes));
+		n48nSweep();
 	}
 	if (r != kIOReturnSuccess)
 		a->scalarOutputCount = a->structureOutputSize = 0;
 	return r;
 }
 
-// What IOConnectMapMemory64 maps for a buffer's handle. A process keeps such a mapping for as long as it likes,
-// also after it freed the buffer: one reason this interface is root only for now.
+// What IOConnectMapMemory64 maps for a buffer's handle. A process keeps such a mapping for as long as it likes, also
+// after it freed the buffer: VRAM is mapped through a view (N48nView), whose memory goes back to the heap only once no
+// mapping holds it. System memory stays wired while a mapping holds its descriptor, and the card no longer reaches it.
 IOReturn RDNA4Compute::n48nMemory(const void *owner, uint32_t handle, IOMemoryDescriptor **memory) {
 	Locked g(rtLock);
 	if (!n48n || n48n->owner != owner || !rtReady || powerSleeping)
@@ -547,9 +621,33 @@ IOReturn RDNA4Compute::n48nMemory(const void *owner, uint32_t handle, IOMemoryDe
 		(*memory)->retain();
 		return kIOReturnSuccess;
 	}
-	IODeviceMemory *bar0 = env.pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
-	*memory = bar0 ? IODeviceMemory::withSubRange(bar0, pool.offset + b->memory.token, b->bytes) : nullptr;
-	return *memory ? kIOReturnSuccess : kIOReturnNoMemory;
+	N48nView *view = nullptr;
+
+	for (uint32_t i = 0; i < kViews && !view; i++)
+		if (n48nViews[i].memory && !n48nViews[i].freed && n48nViews[i].offset == b->memory.token)
+			view = &n48nViews[i];
+
+	for (uint32_t i = 0; i < kViews && !view; i++) {
+		if (n48nViews[i].memory)
+			continue;
+
+		// A range of its own, not a subrange of BAR0: a subrange's mappings are made of BAR0 and leave its count alone.
+		IODeviceMemory *range = IODeviceMemory::withRange(sv.bar0Phys + pool.offset + b->memory.token, b->bytes);
+
+		if (!range)
+			return kIOReturnNoMemory;
+
+		view = &n48nViews[i];
+		*view = N48nView { range, b->memory.token, b->bytes, false };
+	}
+
+	if (!view)
+		return kIOReturnNoResources;
+
+	*memory = view->memory;
+	(*memory)->retain();
+
+	return kIOReturnSuccess;
 }
 
 // RDNA4_VULKAN_SEL_COPY_TEST. The kernel's copy queue stays in address space 0; the packet that starts a command
@@ -647,6 +745,10 @@ IOReturn RDNA4VulkanClient::clientMemoryForType(UInt32 type, IOOptionBits *, IOM
 
 IOReturn RDNA4ComputeService::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
                                             IOUserClient **handler) {
+#ifdef AMDRadeonRDNA4_PVGPU
+	if (type == RDNA4_MTLC_TYPE)   // the Metal kernel translator (src/pvgpu.cpp)
+		return pvTranslatorClient(this, owningTask, securityID, type, properties, handler);
+#endif
 	if (type != N48N_UC_TYPE)
 		return IOService::newUserClient(owningTask, securityID, type, properties, handler);
 	// Root only until there is a policy for who may have the GPU (docs/vulkan-port.md, "What a client may reach").

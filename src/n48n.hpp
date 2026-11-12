@@ -3,7 +3,7 @@
 //  AMDRadeonRDNA4
 //
 //  The kernel half of the interface the RADV Darwin port speaks
-//  (vulkan/navi48_native_abi.h, "N48N"; docs/vulkan-port.md): one client's
+//  (userspace/vulkan/navi48_native_abi.h, "N48N"; docs/vulkan-port.md): one client's
 //  buffers, its GPU address space, its contexts, its work and the display it
 //  may show pictures on, behind the calls IOConnectCallMethod carries:
 //  selectors 0 to 14. What a command buffer may be, when work counts as
@@ -17,8 +17,8 @@
 //  mapping may sit, which flags mean what in a page-table entry.
 //
 //  Freestanding: memory and registers come through Backend, so the same code
-//  runs in the kext, in tools/atomdump.cpp's checks, and under the real RADV
-//  driver on a host (tools/n48n-host).
+//  runs in the kext, in test/atomdump.cpp's checks, and under the real RADV
+//  driver on a host (test/n48n-host).
 //
 
 #ifndef RDNA4N48N_hpp
@@ -27,7 +27,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "../vulkan/navi48_native_abi.h"
+#include "../userspace/vulkan/navi48_native_abi.h"
 #include "vmtree.hpp"
 
 namespace N48N {

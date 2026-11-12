@@ -11,7 +11,7 @@
 //    * this file defines _realmain / _antimain and the kmod_info struct.
 //
 //  The kext is a Lilu plugin: _realmain / _antimain are Lilu's plugin entry
-//  points from Lilu/Library/plugin_start.cpp (ADDPR(kern_start) /
+//  points from lib/Lilu/Lilu/Library/plugin_start.cpp (ADDPR(kern_start) /
 //  ADDPR(kern_stop), i.e. AMDRadeonRDNA4_kern_start / AMDRadeonRDNA4_kern_stop) — what
 //  Xcode's MODULE_START / MODULE_STOP settings point at for other plugins.
 //

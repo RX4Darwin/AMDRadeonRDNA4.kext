@@ -8,16 +8,20 @@
 //
 
 #include "device.hpp"
+#include "klog.hpp"
 #include "dpphy.hpp"
 #include "edid.hpp"
 #include "dmub.hpp"
+#include "sku.hpp"
+#include "trial.hpp"
+#include "dpdual.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <kern/clock.h>
 
 #include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
 
-#define FBLOG(fmt, ...)  IOLog("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
+#define FBLOG(fmt, ...)  rdna4Log("AMDRadeonRDNA4: " fmt "\n", ## __VA_ARGS__)
 
 // ---------------------------------------------------------------------------
 // Console framebuffer discovery
@@ -723,6 +727,9 @@ void RDNA4Device::probeEDID() {
 	uint32_t hpdY = regReadDmu(2, 0x28f7);
 	FBLOG("edid: HPD_Y=0x%08x (hpd1=%u hpd2=%u hpd3=%u hpd4=%u)", hpdY,
 	      (hpdY >> 0) & 1, (hpdY >> 8) & 1, (hpdY >> 16) & 1, (hpdY >> 24) & 1);
+	auto hpdHigh = [&](uint8_t pin) {
+		return pin >= 1 && pin <= 4 && ((hpdY >> (8 * (pin - 1))) & 1);
+	};
 
 	AtomBios::DisplayPath paths[AtomBios::MaxDisplayPaths];
 	size_t n = atomBios.getDisplayPaths(paths, AtomBios::MaxDisplayPaths);
@@ -740,15 +747,46 @@ void RDNA4Device::probeEDID() {
 		AtomBios::PathRecords rec {};
 		atomBios.getPathRecords(paths[i], rec);
 		uint8_t inst = rec.ddcLine;  // AUX engine / DDC line index
-		const char *bus = viaAux ? "AUX" : "DDC";
 
+		// A DisplayPort connector behind a passive DP++ (DP-to-HDMI)
+		// adapter carries TMDS, and the sink's DDC is on the AUX pads in
+		// I2C mode. For the boot display the lit pipe says so.
+		const bool bootDpDual = viaAux && pipe.valid() && pipe.isTmds() &&
+		                        rec.hasHpd && rec.hpdPin == pipe.hpd;
+
+		if (bootDpDual) {
+			FBLOG("edid: connector %zu: TMDS on a DisplayPort connector "
+			      "(DP++ adapter): DDC%u in I2C mode", i, inst);
+			ddcPadMode(inst, true);
+			viaAux = false;
+			setDpDual(rec.hpdPin, true);
+		}
+
+		const char *bus = viaAux ? "AUX" : "DDC";
 		uint8_t edid[128] {};
 		bool got = viaAux ? readEDID(inst, edid, sizeof(edid), 0)
 		                  : readEDIDI2C(inst, edid, sizeof(edid), 0);
+
+		// Another DP connector with a sink that is silent on AUX gets the
+		// same try on DDC.
+		if (!got && viaAux && rec.hasHpd && hpdHigh(rec.hpdPin)) {
+			got = readEDIDDpDual(inst, edid, sizeof(edid));
+			if (got) {
+				FBLOG("edid: connector %zu: no AUX reply, the sink "
+				      "answers on DDC%u (DP++ adapter)", i, inst);
+				viaAux = false;
+				bus = "DDC";
+				setDpDual(rec.hpdPin, true);
+			}
+		}
+
 		if (!got) {
 			FBLOG("edid: connector %zu (%s%u): no reply", i, bus, inst);
 			continue;
 		}
+
+		if (rec.hasHpd && dpDual(rec.hpdPin))
+			readDpDualAdaptor(rec.hpdPin, inst);
 
 		static const uint8_t sig[8] = { 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0 };
 		if (memcmp(edid, sig, sizeof(sig)) != 0) {
@@ -809,31 +847,33 @@ void RDNA4Device::probeEDID() {
 				FBLOG("edid: connector %zu (%s%u): read extension block "
 				      "(tag 0x%02x)", i, bus, inst, edidData[128]);
 			}
-		} else if (!boot && edid2Len == 0) {
-			memcpy(edid2Data, edid, 128);
-			edid2Len = 128;
-			edid2Hpd = rec.hasHpd ? rec.hpdPin : 0;
+		} else if (!boot && freeExtraSlot() < extraHeads()) {
+			selectExtra(freeExtraSlot());
+			memcpy(xp().edid, edid, 128);
+			xp().edidLen = 128;
+			xp().hpd = rec.hasHpd ? rec.hpdPin : 0;
 			if (viaAux)
 				readSecondDpSink(inst);
 			// The extension says whether the sink has SCDC (Edid::hdmi2Caps).
-			if (edid[126] > 0 && (viaAux ? readEDID(inst, edid2Data + 128, 128, 128)
-			                             : readEDIDI2C(inst, edid2Data + 128, 128, 128)))
-				edid2Len = 256;
+			if (edid[126] > 0 && (viaAux ? readEDID(inst, xp().edid + 128, 128, 128)
+			                             : readEDIDI2C(inst, xp().edid + 128, 128, 128)))
+				xp().edidLen = 256;
 		}
 	}
+	selectExtra(0);
 	if (!any)
 		FBLOG("edid: no sink EDID read on any connector");
 	// The lit pipe's connector gave nothing but another did: the pipe's HPD
 	// pin was read wrong, or its sink does not answer. As before the pipe was
 	// consulted, the sink that answered is taken for the boot display.
-	if (edidLen == 0 && edid2Len != 0) {
+	if (edidLen == 0 && xp().edidLen != 0) {
 		FBLOG("edid: no EDID on the lit pipe's connector (HPD%u): taking the sink on HPD%u for the boot display",
-		      pipe.hpd, edid2Hpd);
-		memcpy(edidData, edid2Data, sizeof(edidData));
-		edidLen = edid2Len;
-		edid2Len = 0;
-		edid2Hpd = 0;
-		pipe2Sink = {};
+		      pipe.hpd, xp().hpd);
+		memcpy(edidData, xp().edid, sizeof(edidData));
+		edidLen = xp().edidLen;
+		xp().edidLen = 0;
+		xp().hpd = 0;
+		xp().sink = {};
 	}
 }
 
@@ -891,7 +931,117 @@ constexpr uint32_t kI2cIndexWrite     = 1u << 31;
 
 // MICROSECOND_TIME_BASE_DIV (DMU base_idx 1): reference for SCL prescale.
 constexpr uint32_t kMicrosecondTimeBaseDiv = 0x007b;
+
+// The DDC pads of DDC line N (dcn_4_1_0_offset.h / _sh_mask.h, base_idx 2),
+// which hw_ddc.c set_config switches between AUX and I2C mode with DCN401's
+// DDC_REG_LIST_DCN2.
+constexpr uint32_t kGpioDdcMask       = 0x28d0;  // DC_GPIO_DDC1_MASK; DDCn at + 4 * line
+constexpr uint32_t kGpioDdcClkPdEn    = 1u << 4;
+constexpr uint32_t kGpioDdcDataPdEn   = 1u << 12;
+constexpr uint32_t kGpioDdcPdEn       = kGpioDdcClkPdEn | kGpioDdcDataPdEn;
+constexpr uint32_t kGpioDdcAuxPadMode = 1u << 16;
+constexpr uint32_t kGpioAuxCtrl5      = 0x291d;  // DDC_PADn_I2CMODE at bit 12 + line
+constexpr uint32_t kPhyAuxCntl        = 0x28ff;  // AUXn_PAD_RXSEL at [11:10] + 2 * line
+
+constexpr uint32_t ddcI2cModeBit(uint8_t line) { return 1u << (12 + line); }
+constexpr uint32_t auxRxselShift(uint8_t line) { return 10 + 2u * line; }
 } // namespace
+
+void RDNA4Device::ddcPadMode(uint8_t line, bool i2c) {
+	if (line > 3 || !ipDiscovery.isValid() || !rmmio)
+		return;
+
+	const uint32_t rMask = kGpioDdcMask + 4u * line;
+	const uint32_t was = regReadDmu(2, rMask);
+	if (was == 0xFFFFFFFF)
+		return;
+
+	if (!i2c) {
+		if (!(was & kGpioDdcAuxPadMode))
+			regWriteDmu(2, rMask, was | kGpioDdcAuxPadMode);
+
+		const uint32_t ctrl5 = regReadDmu(2, kGpioAuxCtrl5);
+		regWriteDmu(2, kGpioAuxCtrl5, ctrl5 & ~ddcI2cModeBit(line));
+		return;
+	}
+
+	// The pull-downs discharge what a plug-in left on the pads (2.5 ms),
+	// then the pads leave AUX mode.
+	if ((was & kGpioDdcPdEn) != kGpioDdcPdEn) {
+		regWriteDmu(2, rMask, was | kGpioDdcPdEn);
+		IOSleep(3);
+	}
+
+	if (regReadDmu(2, rMask) & kGpioDdcAuxPadMode) {
+		IOSleep(2);
+		regWriteDmu(2, rMask, regReadDmu(2, rMask) & ~kGpioDdcAuxPadMode);
+	}
+
+	const uint32_t ctrl5 = regReadDmu(2, kGpioAuxCtrl5);
+	regWriteDmu(2, kGpioAuxCtrl5, ctrl5 | ddcI2cModeBit(line));
+
+	// AUXn_PAD_RXSEL = 1: the pad receiver for I2C.
+	const uint32_t shift = auxRxselShift(line);
+	const uint32_t cntl = regReadDmu(2, kPhyAuxCntl);
+	regWriteDmu(2, kPhyAuxCntl, (cntl & ~(3u << shift)) | (1u << shift));
+
+	FBLOG("ddc: line %u in I2C mode: DDC%u_MASK 0x%08x -> 0x%08x, "
+	      "AUX_CTRL_5 0x%08x, PHY_AUX_CNTL 0x%08x", line, line + 1u, was,
+	      regReadDmu(2, rMask), regReadDmu(2, kGpioAuxCtrl5),
+	      regReadDmu(2, kPhyAuxCntl));
+}
+
+// A passive DP++ adapter's ID block (dpdual.hpp): the TMDS clock it carries
+// caps the modes of the display on that pin.
+void RDNA4Device::readDpDualAdaptor(uint8_t hpd, uint8_t line) {
+	if (hpd < 1 || hpd > 8)
+		return;
+
+	uint8_t id[DpDual::kIdBytes] {};
+	const uint8_t start = 0;
+	const uint8_t addr = static_cast<uint8_t>(DpDual::kI2cAddress << 1);
+	const bool got = i2cTransfer(line, addr, &start, 1, id, sizeof(id));
+	const DpDual::Adaptor a = DpDual::parse(id, got ? sizeof(id) : 0);
+
+	dpDualKHz[hpd - 1] = a.maxTmdsKHz;
+
+	if (a.type2)
+		FBLOG("dp++: HPD%u: type 2 adapter %s, TMDS up to %u kHz", hpd,
+		      a.deviceId, a.maxTmdsKHz);
+	else
+		FBLOG("dp++: HPD%u: %s, TMDS up to %u kHz", hpd,
+		      got ? "type 1 adapter" : "no adapter ID", a.maxTmdsKHz);
+
+	overrideDpDual(hpd);
+}
+
+// rdna4-dpdual-khz=<kHz>: what the DP++ adapters are taken to carry instead
+// of what their ID block says. The test rig's CS5216 adapters report 300 MHz,
+// and that is what they carry: a Dell lit at 3840x2160@60 (594 MHz) through
+// one showed a broken picture (2026-11-04), so the default is the adapter's.
+void RDNA4Device::overrideDpDual(uint8_t hpd) {
+	uint32_t khz = 0;
+
+	if (!Trial::option("rdna4-dpdual-khz", khz) || !khz)
+		return;
+
+	if (khz > DpDual::kType2MaxKHz)
+		khz = DpDual::kType2MaxKHz;
+
+	FBLOG("dp++: HPD%u: taken to carry %u kHz", hpd, khz);
+	dpDualKHz[hpd - 1] = khz;
+}
+
+// The EDID of a sink behind a passive DP++ adapter: over DDC, with the
+// connector's pads in I2C mode. They go back to AUX mode if it is silent.
+bool RDNA4Device::readEDIDDpDual(uint8_t line, uint8_t *edid, size_t count) {
+	ddcPadMode(line, true);
+	if (readEDIDI2C(line, edid, count, 0))
+		return true;
+
+	ddcPadMode(line, false);
+	return false;
+}
 
 bool RDNA4Device::readEDIDI2C(uint8_t line, uint8_t *edid, size_t count,
                              uint8_t start) {
@@ -1021,7 +1171,7 @@ bool RDNA4Device::i2cTransfer(uint8_t line, uint8_t addr, const uint8_t *wr, siz
 
 // What amdgpu's write_scdc_data does for a sink that has SCDC: answer its
 // version, then say whether the link is scrambled (TMDS_CONFIG).
-void RDNA4Device::scdcConfigure(uint8_t line, uint8_t tmdsConfig) {
+bool RDNA4Device::scdcConfigure(uint8_t line, uint8_t tmdsConfig) {
 	constexpr uint8_t kScdc = 0x54 << 1;                       // HDMI_SCDC_ADDRESS
 	constexpr uint8_t kSinkVersion = 0x01, kSourceVersion = 0x02, kTmdsConfig = 0x20;
 	uint8_t version = 0;
@@ -1033,6 +1183,30 @@ void RDNA4Device::scdcConfigure(uint8_t line, uint8_t tmdsConfig) {
 	const bool ok = i2cTransfer(line, kScdc, config, sizeof(config), nullptr, 0);
 	FBLOG("scdc: DDC%u: sink version %u, TMDS_CONFIG = %u %s", line, version, tmdsConfig,
 	      ok ? "written" : "NOT written");
+	return ok;
+}
+
+/*
+ * TMDS_CONFIG, written until the sink answers: a display waking from sleep
+ * may take a while to (the TV did not answer at the wake's first write and
+ * stayed dark on a scrambled link it was not told about, 2026-11-04). A
+ * sink that does not answer within 2 s is left as amdgpu leaves it.
+ */
+bool RDNA4Device::scdcConfigureWait(uint8_t line, uint8_t tmdsConfig)
+{
+	constexpr int kTries = 20;
+
+	for (int i = 0; i < kTries; i++) {
+		if (scdcConfigure(line, tmdsConfig))
+			return true;
+
+		if (!tmdsConfig)
+			return false;
+
+		IOSleep(100);
+	}
+
+	return false;
 }
 
 void RDNA4Device::dumpModeState() {
@@ -1680,6 +1854,10 @@ void RDNA4Device::displayPowerNote(bool on, const char *path, const char *result
 }
 
 void RDNA4Device::setDisplayPower(bool on) {
+	if (bootReleased) {   // its connector is a head's now (releaseBootPipe)
+		displayPowerNote(on, "request", "ignored: the boot pipe is released");
+		return;
+	}
 	if (!displaySleepEnabled) {
 		displayPowerNote(on, "request", "ignored: rdna4-nosleep=1");
 		return;
@@ -1996,8 +2174,11 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	hwCursorRequested = PE_parse_boot_argn("rdna4-cursor", &cursor, sizeof(cursor)) && cursor != 0;
 	if (hwCursorRequested)
 		FBLOG("cursor: hardware cursor requested by rdna4-cursor=1");
-	const char *model = (vd >> 16) == 0x7551 ? "AMD Radeon AI PRO R9700"
-	                                         : "AMD Radeon RX 9070 XT";
+
+	const uint16_t device = static_cast<uint16_t>(vd >> 16);
+	const uint8_t revision = pciDevice->configRead8(kIOPCIConfigRevisionID);
+	const char *model = Sku::modelName(device, revision);
+
 	if (!isAmd)
 		model = "VM test (vmware-svga)";
 	else
@@ -2037,8 +2218,12 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 		}
 	}
 
-	uint32_t head2dp = 0;
-	pipe2DpAllowed = PE_parse_boot_argn("rdna4-head2dp", &head2dp, sizeof(head2dp)) && head2dp != 0;
+	// The extra pipes drive DisplayPort sinks (trained on the card, two
+	// Dells, 2026-11-04); rdna4-head2dp=0 leaves those connectors to HDMI.
+	uint32_t head2dp = 1;
+
+	(void)Trial::option("rdna4-head2dp", head2dp);
+	pipe2DpAllowed = head2dp != 0;
 
 	// Needs the lit pipe (discoverPipe) and the sink's AUX channel (probeEDID).
 	if (PE_parse_boot_argn("rdna4-dptrain", &dpTrainLevel, sizeof(dpTrainLevel)) && dpTrainLevel)
@@ -2050,6 +2235,8 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	      static_cast<unsigned long>(modeCount));
 	return true;
 }
+
+static uint32_t gSnapLines;   // wakediff lines of the current comparison
 
 RDNA4Device::~RDNA4Device() {
 	freeHardwareCursor();
@@ -2070,7 +2257,7 @@ RDNA4Device::~RDNA4Device() {
 // ---------------------------------------------------------------------------
 
 #ifdef AMDRadeonRDNA4_VM_TEST
-// Lenovo G25-10 base block (the tools/atomdump.cpp fixture). With boot-arg
+// Lenovo G25-10 base block (the test/atomdump.cpp fixture). With boot-arg
 // "rdna4-fakeedid=1" the VM test build serves it as the sink's EDID, so the
 // mode table and how a given macOS release presents it can be checked
 // without RDNA 4 hardware.
@@ -2124,6 +2311,17 @@ void RDNA4Device::buildModeTable() {
 		lim.maxPixelClockKHz = hdmi2.maxTmdsKHz < ModeSet::kMaxTmdsKHz ? hdmi2.maxTmdsKHz : ModeSet::kMaxTmdsKHz;
 	if (bootTimingValid && bootTiming.pixelClockKHz && bootTiming.pixelClockKHz * 5 / 4 < lim.maxPixelClockKHz)
 		lim.maxPixelClockKHz = bootTiming.pixelClockKHz * 5 / 4;
+	// A passive DP++ adapter carries no more than its ID block says; the
+	// boot mode stays, the firmware has shown that it gets through.
+	const uint32_t adaptorKHz = pipe.valid() ? dpDualMaxKHz(pipe.hpd) : 0;
+	if (adaptorKHz) {
+		const uint32_t bootKHz = bootTimingValid ? bootTiming.pixelClockKHz : 0;
+		const uint32_t capKHz = adaptorKHz > bootKHz ? adaptorKHz : bootKHz;
+
+		if (capKHz < lim.maxPixelClockKHz)
+			lim.maxPixelClockKHz = capKHz;
+	}
+
 	// DisplayPort has no TMDS limit, but its link is not retrained: nothing
 	// above the pixel clock it was brought up for (ModeSet::build).
 	if (pipe.valid() && pipe.signal == Pipe::Signal::DpSst && bootTimingValid && bootTiming.pixelClockKHz)
@@ -2246,8 +2444,8 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 			IODelay(s.arg);
 			break;
 		case ModeSet::Op::Scdc:
-			// Like amdgpu, carry on if the sink does not answer.
-			scdcConfigure(static_cast<uint8_t>(s.arg), static_cast<uint8_t>(s.value));
+			// Like amdgpu, carry on if the sink does not answer (in time).
+			scdcConfigureWait(static_cast<uint8_t>(s.arg), static_cast<uint8_t>(s.value));
 			break;
 		case ModeSet::Op::Require: {
 			const uint32_t v = regReadDmu(s.seg, s.dword);
@@ -2289,7 +2487,7 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 			break;
 		case ModeSet::Op::Aux:
 			// Like amdgpu, carry on if the sink does not take it.
-			if (!aux || !dpcdWrite(pipe2Aux, aux[s.arg].address, aux[s.arg].data, aux[s.arg].len))
+			if (!aux || !dpcdWrite(xp().aux, aux[s.arg].address, aux[s.arg].data, aux[s.arg].len))
 				FBLOG("%s: step %lu (%s): the sink did not take the AUX write, continuing", tag,
 				      static_cast<unsigned long>(i), s.what);
 			break;
@@ -2496,6 +2694,10 @@ bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
 }
 
 IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
+	if (bootReleased) {
+		FBLOG("modes: switch to id %u refused: the boot pipe is released, its connector is a head's", m.id);
+		return kIOReturnUnsupported;
+	}
 	const bool dp = pipe.signal == Pipe::Signal::DpSst;
 	if (!pipe.valid() || !(pipe.isTmds() || dp) || !liveTimingValid || !rmmio || !ipDiscovery.isValid()) {
 		FBLOG("modes: switch to id %u refused: no programmable HDMI or DisplayPort pipe", m.id);
@@ -2587,6 +2789,90 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 }
 
 
+bool RDNA4Device::bootUhdPipe(uint8_t pipeIndex) const
+{
+	Edid::DetailedTiming uhd {};
+
+	if (!pipe.valid() || !pipe.isTmds() || !edidLen || !Edid::vicTiming(97, uhd) || !Edid::hdmi2Caps(edidData, edidLen).scdc) {
+		FBLOG("boot4k: pipe %u: no HDMI boot display that announces SCDC (TMDS %d, EDID %zu bytes)", pipeIndex, pipe.isTmds(),
+		      static_cast<size_t>(edidLen));
+		return false;
+	}
+
+	// What the adapter carries: in RGB, or in 4:2:0 at half the clock if the sink takes 3840x2160 so.
+	const uint32_t adaptorKHz = dpDualMaxKHz(pipe.hpd);
+	const bool y420 = adaptorKHz && adaptorKHz < uhd.pixelClockKHz;
+
+	if (y420 ? adaptorKHz < ModeSet::tmdsKHz(uhd.pixelClockKHz, true) || !Edid::takesY420(edidData, edidLen, 97)
+	         : !Edid::hasVic(edidData, edidLen, 97)) {
+		FBLOG("boot4k: pipe %u: the sink does not take 3840x2160 through the adapter (%u kHz, %s)", pipeIndex, adaptorKHz,
+		      y420 ? "4:2:0" : "RGB");
+		return false;
+	}
+
+	for (size_t i = 0; i < Pipe2::configCount(); i++) {
+		const Pipe2::Config &c = Pipe2::configAt(i);
+
+		if (c.hpd == pipe.hpd && c.pipe == pipeIndex && !c.dp && Pipe2::isUhd(c) && c.y420 == y420)
+			return true;
+	}
+
+	FBLOG("boot4k: pipe %u: no 3840x2160 HDMI table (%s) for HPD%u on it (DP++ %d)", pipeIndex, y420 ? "4:2:0" : "RGB", pipe.hpd,
+	      dpDual(pipe.hpd));
+	return false;
+}
+
+bool RDNA4Device::releaseBootPipe()
+{
+	AtomBios::DisplayPath path {};
+	uint8_t ddcLine = 0;
+
+	if (bootReleased)
+		return true;
+
+	if (!pipe.valid() || !pipe.isTmds() || pipe.dig >= Pipe::kMaxDig || !pathForHpd(pipe.hpd, path, &ddcLine)) {
+		FBLOG("boot4k: the boot pipe is not released: no HDMI stream of the firmware's to take down");
+		return false;
+	}
+
+	constexpr uint32_t kDigFifoCtrl0 = 0x209b;   // DIGn_DIG_FIFO_CTRL0
+	const uint32_t dig = pipe.dig * Pipe::Reg::kDigStride;
+	Dmub::Cmd cmd;
+
+	DpPhy::buildDisable(cmd, pipe.link, pipe.hpd, static_cast<uint8_t>(path.connectorObjId & 0xff));
+
+	// The stream alone goes down: the plane and its timing generator run on and keep their DET segments. With them
+	// stopped and their segments given to the head's plane, both 4K planes underflowed for good (HUBP_SEG_ALLOC_ERR on the
+	// new one: the monitors showed green, card, 2026-11-06).
+	const ModeSet::Step steps[] = {
+		{ ModeSet::Op::Update, 2, false, kDigFifoCtrl0 + dig, 0x1, 0x0, 0, "DIG_FIFO_ENABLE off" },
+		{ ModeSet::Op::Update, 2, false, Pipe::Reg::kDigFeEnCntl + dig, 0x1, 0x0, 0, "DIG_FE_ENABLE: the stream encoder off" },
+		{ ModeSet::Op::Dmub, 0, false, 0, 0, 0, 0, "DIG1_TRANSMITTER_CONTROL disable" },
+		{ ModeSet::Op::Update, 2, false, Pipe::Reg::kDigBeEnCntl + dig, 0x1, 0x0, 0, "DIG_BE_ENABLE: the link encoder off" },
+	};
+
+	FBLOG("boot4k: taking the firmware's stream down: DIG%u link %u HPD%u (OTG%u and HUBP%u run on)", pipe.dig, pipe.link,
+	      pipe.hpd, pipe.otg, pipe.hubp);
+
+	if (!runSteps(steps, sizeof(steps) / sizeof(steps[0]), &cmd, 1, "boot4k", otgOff())) {
+		FBLOG("boot4k: the firmware's stream did not go down cleanly");
+		return false;
+	}
+
+	FBLOG("boot4k: released; DIG%u_DIG_FE_EN_CNTL=0x%08x DIG_BE_EN_CNTL=0x%08x OTG%u_OTG_CONTROL=0x%08x", pipe.dig,
+	      regReadDmu(2, Pipe::Reg::kDigFeEnCntl + dig), regReadDmu(2, Pipe::Reg::kDigBeEnCntl + dig), pipe.otg,
+	      regReadDmu(2, Pipe::Reg::kOtgControl + otgOff()));
+
+	// Its connector is free for a head: no DIG, link or pin of the boot pipe's any more (its OTG and HUBP stay
+	// known: a head's plane copies the HUBP's VM aperture)
+	pipe.dig = Pipe::kNone;
+	pipe.link = Pipe::kNone;
+	pipe.hpd = 0;
+	bootReleased = true;
+
+	return true;
+}
+
 // ---------------------------------------------------------------------------
 // The second pipe
 // ---------------------------------------------------------------------------
@@ -2660,9 +2946,9 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		return false;
 	}
 	// The plan for the connector the second display is on.
-	if (!usePlanFor(edid2Hpd)) {
+	if (!usePlanFor(xp().hpd)) {
 		FBLOG("pipe2: not lit: the second display is on HPD%u, a connector there is no plan for (a DisplayPort "
-		      "one needs rdna4-head2dp=1)", edid2Hpd);
+		      "one is off with rdna4-head2dp=0)", xp().hpd);
 		return false;
 	}
 	const Pipe2::Config &c = Pipe2::config();
@@ -2681,7 +2967,7 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		return false;
 	}
 
-	if (c.dp && ((!pipe2Sink.maxRate && !readSecondDpSink(ddcLine)) || !pickSecondLink(c.timing.pixelClockKHz))) {
+	if (c.dp && ((!xp().sink.maxRate && !readSecondDpSink(ddcLine)) || !pickSecondLink(c.timing.pixelClockKHz))) {
 		FBLOG("pipe2: not lit: no DisplayPort sink with a link for the mode on AUX%u", ddcLine);
 		return false;
 	}
@@ -2690,10 +2976,10 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 	t.litHubp = pipe.hubp;
 	t.encoderObjId = path.encoderObjId;
 	t.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
-	t.linkRate = pipe2Link.rate;
+	t.linkRate = xp().link.rate;
 	// Only level 3 stops at the stream; the survey (2) covers the whole plan.
 	t.depth = level == 3 ? Pipe2::Depth::Stream : Pipe2::Depth::Plane;
-	t.sinkScdc = Edid::hdmi2Caps(edid2Data, edid2Len).scdc;
+	t.sinkScdc = Edid::hdmi2Caps(xp().edid, xp().edidLen).scdc;
 	t.ddcLine = ddcLine;
 	// The lit pipe scans the console from the address in its HUBP; the second
 	// surface lies in the same memory, so the same distance further on.
@@ -2707,17 +2993,21 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 	}
 	t.surface = lit + (surfacePhys - fbPhysBase);
 
-	// The plane needs its share of the DET buffer; what the others hold is
-	// theirs (taking it back means reprogramming the lit pipe).
+	// The plane needs its share of the DET buffer; what the lit pipes hold is
+	// theirs (taking it back means reprogramming them), an idle pipe's is
+	// given back first.
+	freeIdleDet(c);
 	uint32_t det[4] {}, others = 0;
 	for (uint32_t i = 0; i < 4; i++) {
 		det[i] = regReadDmu(c.detSeg, c.detCtrl[i]) & 0x1f;
 		if (i != c.pipe)
 			others += det[i];
 	}
-	const bool detFits = others + c.detSegments <= Pipe2::kDetSegmentsTotal;
-	FBLOG("pipe2: DET segments %u %u %u %u of %u: %u for the plane %s", det[0], det[1], det[2], det[3],
-	      Pipe2::kDetSegmentsTotal, c.detSegments, detFits ? "fit" : "do NOT fit");
+	others += shrinkCompbuf(c, others);
+	t.detSegments = static_cast<uint8_t>(detShare(c.detSegments, others));
+	const bool detFits = t.detSegments != 0;
+	FBLOG("pipe2: DET segments %u %u %u %u of %u: %u for the plane (plan %u) %s", det[0], det[1], det[2], det[3],
+	      Pipe2::kDetSegmentsTotal, t.detSegments, c.detSegments, detFits ? "fit" : "do NOT fit");
 
 	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
 	if (!plan)
@@ -2741,12 +3031,13 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		      c.timing.pixelClockKHz, t.depth == Pipe2::Depth::Plane ? "stream and plane" : "stream only",
 		      static_cast<unsigned long>(plan->count), static_cast<unsigned long>(plan->ncmds));
 		// Before the plan runs: its training step reads the connector from here.
-		pipe2Target = t;
-		pipe2Target.now = c.timing;
-		pipe2ConnectorObjId = path.connectorObjId;
+		xp().target = t;
+		xp().target.now = c.timing;
+		xp().connectorObjId = path.connectorObjId;
 		ok = runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", c.pipe * Pipe::Reg::kOtgStride,
 		              plan->aux);
-		pipe2Lit = pipe2On = ok;
+		xp().lit = xp().on = ok;
+		xp().target.rgb = false;
 		// Whether it runs: the frame rate of its timing generator, and the
 		// underflow flags of the plane and the OPTC (HUBPn_DCHUBP_CNTL,
 		// ODMn_OPTC_INPUT_GLOBAL_CONTROL), raw.
@@ -2760,6 +3051,10 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 		      regReadDmu(2, 0x1aca + c.pipe * Pipe::Reg::kOdmStride));
 		if (ok && level >= 4)
 			comparePipeColour(*plan);
+		if (ok) {
+			logUnderflow("pipe2: after lighting");
+			snapAfterLight(*plan);
+		}
 		// With the stream lit, what the plane would still change.
 		t.depth = Pipe2::Depth::Plane;
 		if (ok && level == 3 && Pipe2::build(t, *plan, &why))
@@ -2767,6 +3062,39 @@ bool RDNA4Device::lightSecondPipe(uint32_t level, IOPhysicalAddress64 surfacePhy
 	}
 	IOFree(plan, sizeof(Pipe2::Plan));
 	return ok;
+}
+
+/*
+ * The planes' underflow flags (HUBPn_DCHUBP_CNTL.HUBP_UNDERFLOW_STATUS,
+ * bits 30:28), sticky: what lighting itself caused, then, cleared
+ * (HUBP_UNDERFLOW_CLEAR, bit 31), what half a second of scanout adds. A
+ * plane whose DET share or clocks are too small for its mode keeps
+ * underflowing.
+ */
+void RDNA4Device::logUnderflow(const char *when)
+{
+	constexpr uint32_t kDchubpCntl = 0x05f4;
+	constexpr uint32_t kClear = 1u << 31;
+	uint32_t before[4], after[4];
+
+	IOSleep(200);
+
+	for (uint32_t i = 0; i < 4; i++) {
+		const uint32_t reg = kDchubpCntl + i * Pipe::Reg::kHubpStride;
+		const uint32_t v = regReadDmu(2, reg);
+
+		before[i] = v >> 28 & 0x7;
+		regWriteDmu(2, reg, v | kClear);
+		regWriteDmu(2, reg, v & ~kClear);
+	}
+
+	IOSleep(500);
+
+	for (uint32_t i = 0; i < 4; i++)
+		after[i] = regReadDmu(2, kDchubpCntl + i * Pipe::Reg::kHubpStride) >> 28 & 0x7;
+
+	FBLOG("%s: underflow HUBP0..3 %u %u %u %u, then in 0.5 s %u %u %u %u", when, before[0], before[1],
+	      before[2], before[3], after[0], after[1], after[2], after[3]);
 }
 
 // One pipe was programmed by the firmware and one by Linux's code: where the
@@ -2816,27 +3144,27 @@ void RDNA4Device::comparePipeColour(const Pipe2::Plan &plan) {
 // receiver capability, read where the sink's EDID is.
 bool RDNA4Device::readSecondDpSink(uint8_t aux) {
 	uint8_t caps[16] {};
-	pipe2Aux = aux;
-	pipe2Sink = {};
-	if (!dpcdRead(aux, 0x000, caps, sizeof(caps)) || !DpTrain::parseCaps(caps, sizeof(caps), pipe2Sink)) {
-		pipe2Sink = {};
+	xp().aux = aux;
+	xp().sink = {};
+	if (!dpcdRead(aux, 0x000, caps, sizeof(caps)) || !DpTrain::parseCaps(caps, sizeof(caps), xp().sink)) {
+		xp().sink = {};
 		FBLOG("pipe2: no DisplayPort receiver capability on AUX%u", aux);
 		return false;
 	}
 	FBLOG("pipe2: DisplayPort sink on AUX%u: DPCD %u.%u, up to %u lane(s) at rate 0x%02x%s%s", aux, caps[0] >> 4,
-	      caps[0] & 0xf, pipe2Sink.maxLanes, pipe2Sink.maxRate, pipe2Sink.tps3 ? ", TPS3" : "",
-	      pipe2Sink.tps4 ? ", TPS4" : "");
+	      caps[0] & 0xf, xp().sink.maxLanes, xp().sink.maxRate, xp().sink.tps3 ? ", TPS3" : "",
+	      xp().sink.tps4 ? ", TPS4" : "");
 	return true;
 }
 
 // The smallest link of the sink's that carries a mode at 8 bpc: what the next
 // training step brings up.
 bool RDNA4Device::pickSecondLink(uint32_t pixelClockKHz) {
-	if (!pipe2Sink.maxRate || !DpTrain::pickLink(pipe2Sink, pixelClockKHz, 24, pipe2Link)) {
+	if (!xp().sink.maxRate || !DpTrain::pickLink(xp().sink, pixelClockKHz, 24, xp().link)) {
 		FBLOG("pipe2: the DisplayPort sink has no link for %u kHz", pixelClockKHz);
 		return false;
 	}
-	FBLOG("pipe2: %u lane(s) at rate 0x%02x for %u kHz", pipe2Link.lanes, pipe2Link.rate, pixelClockKHz);
+	FBLOG("pipe2: %u lane(s) at rate 0x%02x for %u kHz", xp().link.lanes, xp().link.rate, pixelClockKHz);
 	return true;
 }
 
@@ -2859,41 +3187,269 @@ bool RDNA4Device::readDpDto(uint8_t otg, ModeSet::DpDto &out, uint32_t *cntlOut)
 bool RDNA4Device::trainSecondLink() {
 	const Pipe2::Config &c = Pipe2::config();
 	DpTrain::Report rep {};
-	const DpTrain::Result r = trainLink(pipe2Aux, c.link, c.hpd, pipe2Target.connectorObjId, pipe2Sink, pipe2Link,
+	const DpTrain::Result r = trainLink(xp().aux, c.link, c.hpd, xp().target.connectorObjId, xp().sink, xp().link,
 	                                    false, rep);
 	char tries[160];
 	FBLOG("pipe2: link %u, %u lane(s) at rate 0x%02x: %s after %u attempt(s) (%s): swing %u, pre-emphasis %u, lanes "
-	      "%02x %02x, aligned %u", c.link, pipe2Link.lanes, pipe2Link.rate, DpTrain::resultName(r), rep.attempts,
+	      "%02x %02x, aligned %u", c.link, xp().link.lanes, xp().link.rate, DpTrain::resultName(r), rep.attempts,
 	      triesText(rep, tries, sizeof(tries)), rep.swing, rep.preEmphasis, rep.status[0], rep.status[1],
 	      rep.status[2] & 1);
 	return r == DpTrain::Result::Ok;
 }
 
+size_t RDNA4Device::extraHeads() {
+	// Every connector beside the boot one's unless asked for fewer: three
+	// displays ran on the card, a head without a monitor waits offline.
+	static uint32_t heads = 0;
+	if (!heads) {
+		uint32_t want = kMaxExtra;
+		Trial::option("rdna4-heads", want);
+		heads = want < 1 ? 1 : want > kMaxExtra ? kMaxExtra : want;
+		FBLOG("pipe2: up to %u display(s) beside the boot one (rdna4-heads)", heads);
+	}
+	return heads;
+}
+
+size_t RDNA4Device::freeExtraSlot() const {
+	size_t slot = 0;
+	while (slot < kMaxExtra && (extra[slot].edidLen || extra[slot].lit))
+		slot++;
+	return slot;
+}
+
+bool RDNA4Device::hpdTakenByOther(uint8_t hpd) const {
+	for (size_t i = 0; i < kMaxExtra; i++)
+		if (i != extraSlot && extra[i].hpd == hpd && (extra[i].edidLen || extra[i].lit))
+			return true;
+	return false;
+}
+
+void RDNA4Device::selectExtra(size_t slot) {
+	if (slot >= kMaxExtra || slot == extraSlot)
+		return;
+	extraSlot = slot;
+	// Its connector's table, or until it has a sink its pipe's first.
+	const ExtraPipe &x = xp();
+	if (!x.hpd || !Pipe2::use(x.hpd, x.lit ? x.hdmi : dpDual(x.hpd), x.pipe, x.uhd, x.y420))
+		Pipe2::use(3, false, x.pipe);
+}
+
+/* The 3840x2160 table of the connector on that pin for that stream, or nullptr. */
+static const Pipe2::Config *uhdConfigFor(uint8_t hpd, bool dp, bool y420 = false)
+{
+	for (size_t i = 0; i < Pipe2::configCount(); i++) {
+		const Pipe2::Config &c = Pipe2::configAt(i);
+
+		if (c.hpd == hpd && c.dp == dp && c.y420 == y420 && Pipe2::isUhd(c))
+			return &c;
+	}
+
+	return nullptr;
+}
+
+/*
+ * Whether a DisplayPort sink takes the plan's timing: its preferred one (a 4K
+ * monitor's CVT-RB 3840x2160@60), on a link it can train.
+ */
+bool RDNA4Device::dpSinkTakes(const Edid::DetailedTiming &t) const
+{
+	Edid::DetailedTiming pref {};
+	DpTrain::Link link {};
+
+	if (!Edid::preferredTiming(xp().edid, xp().edidLen, pref) || !Edid::sameTiming(pref, t))
+		return false;
+
+	return xp().sink.maxRate && DpTrain::pickLink(xp().sink, t.pixelClockKHz, 24, link);
+}
+
+/*
+ * Whether the pipe's sink, on that pin, can be lit at 3840x2160; `y420` says
+ * whether in YCbCr 4:2:0. That is for a DP++ adapter that carries no more than
+ * 300 MHz: the TMDS clock is then half the pixel clock, as amdgpu runs it
+ * (a Dell at 3840x2160@60 through the test rig's adapters, 2026-11-04).
+ */
+bool RDNA4Device::sinkTakesUhd(uint8_t hpd, bool *y420) const
+{
+	const bool dp = Pipe2::hasDpTable(hpd) && !dpDual(hpd);
+	const Pipe2::Config *c = uhdConfigFor(hpd, dp);
+	const Pipe2::Config *half = dpDual(hpd) ? uhdConfigFor(hpd, false, true) : nullptr;
+	const uint32_t adaptorKHz = dpDual(hpd) ? dpDualMaxKHz(hpd) : 0;
+	bool dummy;
+	bool &y = y420 ? *y420 : dummy;
+
+	y = false;
+
+	if (!c)
+		return false;
+
+	if (dp)
+		return dpSinkTakes(c->timing);
+
+	if (!Edid::hdmi2Caps(xp().edid, xp().edidLen).scdc)
+		return false;
+
+	const uint8_t vic = Edid::vicOf(c->timing);
+
+	if (!adaptorKHz || adaptorKHz >= c->timing.pixelClockKHz)
+		return Edid::hasVic(xp().edid, xp().edidLen, vic);
+
+	// Behind a DP++ adapter that does not carry the table's clock: in 4:2:0
+	// at half of it, if the sink takes the format so.
+	y = half && adaptorKHz >= ModeSet::tmdsKHz(half->timing.pixelClockKHz, true) &&
+	    Edid::takesY420(xp().edid, xp().edidLen, Edid::vicOf(half->timing));
+
+	return y;
+}
+
+/* Whether a pipe scans out: the boot pipe, or an extra one that is lit. */
+bool RDNA4Device::pipeInUse(uint32_t p) const
+{
+	if (p == pipe.otg)   // released too, its timing generator runs on and its plane keeps its DET (releaseBootPipe)
+		return true;
+
+	for (const ExtraPipe &x : extra) {
+		if (x.pipe == p && x.lit)
+			return true;
+	}
+
+	return false;
+}
+
+/* Give the DET segments of pipes nothing scans out from back to the pool. */
+void RDNA4Device::freeIdleDet(const Pipe2::Config &c)
+{
+	for (uint32_t i = 0; i < 4; i++) {
+		const uint32_t v = regReadDmu(c.detSeg, c.detCtrl[i]);
+
+		if (i == c.pipe || pipeInUse(i) || !(v & 0x1f))
+			continue;
+
+		regWriteDmu(c.detSeg, c.detCtrl[i], v & ~0x1fu);
+		FBLOG("pipe2: DET of idle pipe %u (%u segments) given back", i, v & 0x1f);
+	}
+}
+
+/*
+ * The DET buffers and the compressed buffer share the 21 segments
+ * (dcn401_program_compbuf_segments). The firmware leaves the compressed
+ * buffer some; when the plan's DET would not fit next to the other pipes'
+ * and it, it shrinks (shrinking is always allowed): the scanout surfaces
+ * here are linear, nothing uses it. With it overcommitted every plane
+ * underflowed (two 4K pipes, card, 2026-11-04). Returns what it keeps.
+ */
+uint32_t RDNA4Device::shrinkCompbuf(const Pipe2::Config &c, uint32_t others)
+{
+	constexpr uint32_t kCompbufCtrl = 0x04ba;
+	const uint32_t v = regReadDmu(c.detSeg, kCompbufCtrl);
+	const uint32_t now = v >> 8 & 0x1f;
+	const uint32_t room = others + c.detSegments < Pipe2::kDetSegmentsTotal ?
+			      Pipe2::kDetSegmentsTotal - others - c.detSegments : 0;
+	uint32_t got = now;
+
+	if (now <= room)
+		return now;
+
+	regWriteDmu(c.detSeg, kCompbufCtrl, (v & ~0x1fu) | room);
+
+	for (int i = 0; i < 100 && got != room; i++) {
+		IOSleep(1);
+		got = regReadDmu(c.detSeg, kCompbufCtrl) >> 8 & 0x1f;
+	}
+
+	FBLOG("pipe2: compressed buffer %u -> %u segments%s", now, room,
+	      got == room ? "" : " (not taken yet)");
+
+	return got;
+}
+
+/*
+ * The DET segments a plane gets next to `others`: the plan's if they fit,
+ * else what is left down to kMinDetSegments, else 0. DML gave the plan's
+ * for the pipe alone; with more displays it would give each less too.
+ */
+uint32_t RDNA4Device::detShare(uint32_t plan, uint32_t others) const
+{
+	const uint32_t left = others < Pipe2::kDetSegmentsTotal ? Pipe2::kDetSegmentsTotal - others : 0;
+
+	if (plan <= left)
+		return plan;
+
+	return left >= kMinDetSegments ? left : 0;
+}
+
 bool RDNA4Device::usePlanFor(uint8_t hpd) {
-	const uint8_t was = Pipe2::config().hpd;
-	if (!Pipe2::use(hpd))
+	const Pipe2::Config was = Pipe2::config();
+	// A lit pipe keeps the size and the kind of stream it is lit with.
+	bool y420 = xp().y420;
+	const bool uhd = xp().lit ? xp().uhd : uhdClocks && sinkTakesUhd(hpd, &y420);
+	const bool hdmi = xp().lit ? xp().hdmi : dpDual(hpd);
+	if (!Pipe2::use(hpd, hdmi, xp().pipe, uhd, y420))
 		return false;
 	if (Pipe2::config().dp && !pipe2DpAllowed) {
-		Pipe2::use(was);
+		Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was), was.y420);
 		return false;
 	}
+	xp().uhd = uhd;
+	xp().y420 = Pipe2::config().y420;
+	xp().hdmi = !Pipe2::config().dp;
+	return true;
+}
+
+/*
+ * A lit pipe whose DisplayPort connector now has the other kind of sink: a
+ * DisplayPort monitor in place of an HDMI one behind a DP++ adapter, or the
+ * other way round. The pipe takes the connector's table for that kind, at
+ * the size the new sink takes, and its stream moves there at the next
+ * secondPipeTo, as between connectors. Until then a wake by the old table
+ * would drive the new sink with the wrong kind of stream.
+ */
+bool RDNA4Device::adoptSinkKind(uint8_t hpd)
+{
+	const Pipe2::Config was = Pipe2::config();
+	const bool hdmi = dpDual(hpd);
+	bool y420 = false;
+	const bool uhd = uhdClocks && sinkTakesUhd(hpd, &y420);
+
+	if (!xp().lit || hpd != was.hpd || !Pipe2::hasDpTable(hpd) || hdmi == xp().hdmi)
+		return false;
+
+	if (xp().on) {
+		runSecondPipePart(Pipe2::Part::Sleep);
+		xp().on = false;
+	}
+
+	if (!Pipe2::use(hpd, hdmi, xp().pipe, uhd, y420) || (Pipe2::config().dp && !pipe2DpAllowed)) {
+		Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was), was.y420);
+		FBLOG("pipe2: HPD%u has another kind of sink, and no table for it: the pipe stays off", hpd);
+		return false;
+	}
+
+	xp().hdmi = hdmi;
+	xp().uhd = uhd;
+	xp().y420 = Pipe2::config().y420;
+	xp().moveOwed = true;
+	xp().moveToPlan = true;
+	FBLOG("pipe2: HPD%u now has %s: the pipe moves to its %ux%u table", hpd,
+	      hdmi ? "an HDMI sink behind a DP++ adapter" : "a DisplayPort sink",
+	      Pipe2::config().timing.hActive, Pipe2::config().timing.vActive);
+
 	return true;
 }
 
 void RDNA4Device::secondLinkBack() {
-	if (!pipe2Lit || !pipe2On || !Pipe2::config().dp)
+	if (!xp().lit || !xp().on || !Pipe2::config().dp)
 		return;
 	uint8_t status[3] {};
-	if (!dpcdRead(pipe2Aux, 0x202, status, sizeof(status))) {
-		FBLOG("pipe2: the display's pin is back but its DPCD does not answer on AUX%u: link left alone", pipe2Aux);
-	} else if (DpTrain::linkUp(status, pipe2Link.lanes)) {
+	if (!dpcdRead(xp().aux, 0x202, status, sizeof(status))) {
+		FBLOG("pipe2: the display's pin is back but its DPCD does not answer on AUX%u: link left alone", xp().aux);
+	} else if (DpTrain::linkUp(status, xp().link.lanes)) {
 		FBLOG("pipe2: the display's pin is back and its link is up (lanes %02x %02x, aligned %u)", status[0],
 		      status[1], status[2] & 1);
 	} else {
 		FBLOG("pipe2: the display's pin is back and its link is down (lanes %02x %02x, aligned %u): training it "
 		      "again", status[0], status[1], status[2] & 1);
 		runSecondPipePart(Pipe2::Part::Sleep);
-		pipe2On = pickSecondLink(pipe2Target.now.pixelClockKHz) && runSecondPipePart(Pipe2::Part::Wake);
+		xp().on = pickSecondLink(xp().target.now.pixelClockKHz) && runSecondPipePart(Pipe2::Part::Wake);
 	}
 }
 
@@ -2904,21 +3460,34 @@ uint8_t RDNA4Device::secondSinkHpd(bool orAnother) {
 		return 0;
 	auto high = [&](uint8_t hpd) { return hpd && ((hpdY >> (8 * (hpd - 1))) & 1); };
 	const Pipe2::Config &now = Pipe2::config();
-	if (pipe2Lit && (high(now.hpd) || !orAnother))   // its own connector first
+	if (xp().lit && (high(now.hpd) || !orAnother))   // its own connector first
 		return high(now.hpd) ? now.hpd : 0;
 	for (size_t i = 0; i < Pipe2::configCount(); i++) {
 		const Pipe2::Config &c = Pipe2::configAt(i);
-		if (c.hpd == pipe.hpd || !high(c.hpd) || (c.dp && !pipe2DpAllowed))
+		if (c.pipe != xp().pipe || c.hpd == pipe.hpd || hpdTakenByOther(c.hpd) || !high(c.hpd) ||
+		    (c.dp && !pipe2DpAllowed))
 			continue;
-		// A lit pipe moves between HDMI connectors only (secondPipeTo).
-		if (!pipe2Lit || (!c.dp && !now.dp))
+
+		// A DisplayPort connector has a DisplayPort and an HDMI table. The
+		// HDMI one stands for it when its sink is behind a DP++ adapter,
+		// and while the second pipe may not drive DisplayPort: a sink not
+		// read yet is offered, and readSecondEdid finds its bus.
+		if (Pipe2::hasDpTable(c.hpd)) {
+			const bool hdmi = dpDual(c.hpd) || !pipe2DpAllowed;
+			if (c.dp == hdmi)
+				continue;
+		}
+
+		// A lit pipe moves only between connectors with an HDMI stream
+		// (secondPipeTo).
+		if (!xp().lit || (!c.dp && !now.dp))
 			return c.hpd;
 	}
 	return 0;
 }
 
 bool RDNA4Device::secondPipeTo(uint8_t hpd) {
-	if (!pipe2Lit)
+	if (!xp().lit)
 		return false;
 	const Pipe2::Config was = Pipe2::config();
 	if (hpd != was.hpd) {
@@ -2929,45 +3498,49 @@ bool RDNA4Device::secondPipeTo(uint8_t hpd) {
 		ok = ok && !to.dp && pipe.dig != to.dig && pipe.link != to.link && pathForHpd(hpd, path, &ddcLine) &&
 		     Pipe2::linkOfEncoder(path.encoderObjId) == to.link;
 		if (!ok) {
-			FBLOG("pipe2: not moved from HPD%u to HPD%u: only between HDMI connectors the boot display does not "
-			      "use", was.hpd, hpd);
-			Pipe2::use(was.hpd);
+			FBLOG("pipe2: not moved from HPD%u to HPD%u: only between connectors with an HDMI "
+			      "stream the boot display does not use", was.hpd, hpd);
+			Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was), was.y420);
 			return false;
 		}
 		FBLOG("pipe2: moving from HPD%u (DIG%u, link %u) to HPD%u (DIG%u, link %u) at %ux%u, %u kHz", was.hpd,
-		      was.dig, was.link, to.hpd, to.dig, to.link, pipe2Target.now.hActive, pipe2Target.now.vActive,
-		      pipe2Target.now.pixelClockKHz);
-		if (pipe2On) {   // the old link down first, by its own table
-			Pipe2::use(was.hpd);
+		      was.dig, was.link, to.hpd, to.dig, to.link, xp().target.now.hActive, xp().target.now.vActive,
+		      xp().target.now.pixelClockKHz);
+		if (xp().on) {   // the old link down first, by its own table
+			Pipe2::use(was.hpd, !was.dp, xp().pipe, Pipe2::isUhd(was), was.y420);
 			runSecondPipePart(Pipe2::Part::Sleep);
-			Pipe2::use(hpd);
-			pipe2On = false;
+			Pipe2::use(hpd, !to.dp, xp().pipe, Pipe2::isUhd(to), to.y420);
+			xp().on = false;
 		}
-		pipe2Target.encoderObjId = path.encoderObjId;
-		pipe2Target.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
-		pipe2Target.ddcLine = ddcLine;
-		pipe2ConnectorObjId = path.connectorObjId;
-		pipe2MoveOwed = true;
+		xp().target.encoderObjId = path.encoderObjId;
+		xp().target.connectorObjId = static_cast<uint8_t>(path.connectorObjId & 0xff);
+		xp().target.ddcLine = ddcLine;
+		xp().connectorObjId = path.connectorObjId;
+		xp().moveOwed = true;
 	}
-	if (!pipe2MoveOwed) {
+	if (!xp().moveOwed) {
 		setSecondPipePower(true);
-		return pipe2On;
+		return xp().on;
 	}
 	// The pipe belongs to this connector now, whatever happens next: a move
 	// that stops part-way is done again from here at the next plug.
 	// The mode set to the running timing: the pipe's clock from this
 	// connector's PLL, its encoder and transmitter. Then this connector's sleep
 	// and wake, which leave its encoder and link as lighting here would
-	// (tools/atomdump.cpp, testPipe2Move).
+	// (test/atomdump.cpp, testPipe2Move).
 	const Pipe2::Config &c = Pipe2::config();
-	const Modes::Mode same { 0, pipe2Target.now, pipe2Target.now.refreshMilliHz(), false, Modes::SourceBoot };
+	const Edid::DetailedTiming at = xp().moveToPlan ? c.timing : xp().target.now;
+	const Modes::Mode same { 0, at, at.refreshMilliHz(), false, Modes::SourceBoot };
+
 	if (applySecondPipeMode(same) != kIOReturnSuccess || !runSecondPipePart(Pipe2::Part::Sleep) ||
 	    !runSecondPipePart(Pipe2::Part::Wake)) {
 		FBLOG("pipe2: the move to HPD%u did not complete: the display stays off until it is plugged in again", hpd);
 		return false;
 	}
-	pipe2MoveOwed = false;
-	pipe2On = true;
+
+	xp().moveOwed = false;
+	xp().moveToPlan = false;
+	xp().on = true;
 	FBLOG("pipe2: now on HPD%u; DIG%u_DIG_FE_EN_CNTL=0x%08x SYMCLK%c_CLOCK_ENABLE=0x%08x", c.hpd, c.dig,
 	      regReadDmu(2, Pipe::Reg::kDigFeEnCntl + c.dig * Pipe::Reg::kDigStride), 'A' + c.dig,
 	      regReadDmu(1, 0x00a0 + c.dig));
@@ -2982,20 +3555,52 @@ bool RDNA4Device::readSecondEdid(uint8_t hpd) {
 	if (!pathForHpd(hpd, path, &ddcLine))
 		return false;
 	// A DisplayPort sink's EDID comes over its AUX channel, and with it what
-	// its receiver can do: it may be another monitor than before.
+	// its receiver can do: it may be another monitor than before. Behind a
+	// passive DP++ adapter the sink has no AUX channel: its EDID is on the
+	// connector's DDC pads in I2C mode (probeEDID), and the second pipe
+	// lights it with the connector's HDMI table.
 	const AtomBios::ConnectorType type = AtomBios::connectorType(path.connectorObjId);
-	const bool viaAux = type == AtomBios::ConnectorDP || type == AtomBios::ConnectorUSBC;
+	const bool dpConnector = type == AtomBios::ConnectorDP ||
+	                         type == AtomBios::ConnectorUSBC;
+	bool viaAux = dpConnector && !dpDual(hpd);
 	auto read = [&](uint8_t *to, uint8_t start) {
-		return viaAux ? readEDID(ddcLine, to, 128, start) : readEDIDI2C(ddcLine, to, 128, start);
+		return viaAux ? readEDID(ddcLine, to, 128, start)
+		              : readEDIDI2C(ddcLine, to, 128, start);
 	};
-	if (!read(edid, 0) || memcmp(edid, sig, sizeof(sig)) != 0 || (viaAux && !readSecondDpSink(ddcLine)))
+
+	bool got = read(edid, 0);
+
+	// Another kind of sink than before on this connector: the other bus.
+	if (!got && dpConnector) {
+		viaAux = !viaAux;
+		ddcPadMode(ddcLine, !viaAux);
+		got = read(edid, 0);
+
+		if (got)
+			FBLOG("pipe2: HPD%u answers on %s: %s", hpd, viaAux ? "AUX" : "DDC",
+			      viaAux ? "a DisplayPort sink" : "an HDMI sink behind a DP++ adapter");
+	}
+
+	// Silent on both buses: the pads back in the mode dpDual says, which
+	// the next read starts from.
+	if (dpConnector) {
+		if (got)
+			setDpDual(hpd, !viaAux);
+		else
+			ddcPadMode(ddcLine, dpDual(hpd));
+	}
+
+	if (got && dpDual(hpd))
+		readDpDualAdaptor(hpd, ddcLine);
+
+	if (!got || memcmp(edid, sig, sizeof(sig)) != 0 || (viaAux && !readSecondDpSink(ddcLine)))
 		return false;
 	// The extension says whether the sink has SCDC and carries more modes.
 	const bool ext = edid[126] > 0 && read(edid + 128, 128);
-	edid2Len = ext ? 256 : 128;
-	edid2Hpd = hpd;
-	memcpy(edid2Data, edid, sizeof(edid));
-	pipe2Target.sinkScdc = Edid::hdmi2Caps(edid2Data, edid2Len).scdc;   // it may be another monitor
+	xp().edidLen = ext ? 256 : 128;
+	xp().hpd = hpd;
+	memcpy(xp().edid, edid, sizeof(edid));
+	xp().target.sinkScdc = Edid::hdmi2Caps(xp().edid, xp().edidLen).scdc;   // it may be another monitor
 	return true;
 }
 
@@ -3004,9 +3609,9 @@ bool RDNA4Device::runSecondPipePart(Pipe2::Part part, size_t *steps) {
 	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
 	if (!plan)
 		return false;
-	Pipe2::Target t = pipe2Target;
+	Pipe2::Target t = xp().target;
 	t.part = part;
-	t.linkRate = pipe2Link.rate;
+	t.linkRate = xp().link.rate;
 	const char *why = "";
 	bool ok = Pipe2::build(t, *plan, &why);
 	if (!ok)
@@ -3021,7 +3626,7 @@ bool RDNA4Device::runSecondPipePart(Pipe2::Part part, size_t *steps) {
 }
 
 void RDNA4Device::setSecondPipePower(bool on) {
-	if (!pipe2Lit || on == pipe2On)
+	if (!xp().lit || on == xp().on)
 		return;
 	if (!displaySleepEnabled) {
 		displayPowerNote(on, "pipe2", "ignored: rdna4-nosleep=1");
@@ -3030,7 +3635,7 @@ void RDNA4Device::setSecondPipePower(bool on) {
 	const Pipe2::Config &c = Pipe2::config();
 	// The wake part trains the link: the smallest for the mode the pipe runs,
 	// of the sink that is there now.
-	if (on && c.dp && !pickSecondLink(pipe2Target.now.pixelClockKHz)) {
+	if (on && c.dp && !pickSecondLink(xp().target.now.pixelClockKHz)) {
 		displayPowerNote(on, "pipe2", "no DisplayPort link for the mode");
 		return;
 	}
@@ -3048,7 +3653,72 @@ void RDNA4Device::setSecondPipePower(bool on) {
 	displayPowerNote(on, "pipe2", res);
 	// A wake that stopped did not bring the display up: the next request to
 	// turn it on, or the next plug, runs the wake again.
-	pipe2On = on && ok;
+	xp().on = on && ok;
+	if (xp().on) {
+		scdcRefresh();
+		diffAfterWake();
+	}
+}
+
+void RDNA4Device::snapAfterLight(const Pipe2::Plan &plan)
+{
+	uint32_t on = 0;
+
+	if (!Trial::option("rdna4-wakediff", on) || !on)
+		return;
+
+	if (!xp().snap)
+		xp().snap = static_cast<RegSnap::Snap *>(IOMalloc(sizeof(RegSnap::Snap)));
+
+	if (!xp().snap)
+		return;
+
+	RegSnap::take(*xp().snap, plan.steps, plan.count, snapRead, this);
+	FBLOG("wakediff: %zu registers of pipe %u taken after lighting", xp().snap->count, xp().pipe);
+}
+
+void RDNA4Device::diffAfterWake()
+{
+	size_t differ;
+
+	if (!xp().snap)
+		return;
+
+	gSnapLines = 0;
+	differ = RegSnap::compare(*xp().snap, snapRead, snapDiff, this);
+	FBLOG("wakediff: pipe %u after wake: %zu of %zu registers differ from after lighting", xp().pipe,
+	      differ, xp().snap->count);
+}
+
+uint32_t RDNA4Device::snapRead(void *ctx, uint8_t seg, uint32_t dword)
+{
+	return static_cast<RDNA4Device *>(ctx)->regReadDmu(seg, dword);
+}
+
+void RDNA4Device::snapDiff(void *, const RegSnap::Reg &was, uint32_t now)
+{
+	if (gSnapLines++ < 60)
+		FBLOG("wakediff:   %u:0x%04x %s: lit 0x%08x, now 0x%08x", was.seg, was.dword, was.what,
+		      was.value, now);
+}
+
+/*
+ * A scrambled link's TMDS_CONFIG once more, with the TMDS clock running: an
+ * HDMI 2.0 sink forgets it while the clock is gone, and the wake wrote it
+ * before the transmitter was on (the second Dell stayed dark after a wake
+ * that had written it, 2026-11-04).
+ */
+void RDNA4Device::scdcRefresh()
+{
+	const uint32_t pixelKHz = xp().target.now.pixelClockKHz ? xp().target.now.pixelClockKHz :
+								    Pipe2::config().timing.pixelClockKHz;
+	const uint32_t khz = ModeSet::tmdsKHz(pixelKHz, Pipe2::config().y420 && !xp().target.rgb);
+
+	if (Pipe2::config().dp || !xp().target.sinkScdc || khz <= ModeSet::kScrambleFromKHz)
+		return;
+
+	IOSleep(100);
+	scdcConfigureWait(xp().target.ddcLine, static_cast<uint8_t>(ModeSet::scdcTmdsConfig(khz)));
 }
 
 // The modes the second pipe can be switched to scan the surface it was lit
@@ -3060,10 +3730,44 @@ Modes::Limits RDNA4Device::secondPipeModeLimits() const {
 	lim.maxHActive = plan.hActive;
 	lim.maxVActive = plan.vActive;
 	// On DisplayPort, what the sink's largest link carries at 8 bpc.
+	// On HDMI, TMDS without scrambling, or HDMI 2.0's 600 MHz for a pipe lit at
+	// 3840x2160 (its sink has SCDC).
 	lim.maxPixelClockKHz = Pipe2::config().dp
-		? DpTrain::bandwidthKbps(DpTrain::Link { pipe2Sink.maxLanes, pipe2Sink.maxRate }) / 24
-		: ModeSet::kScrambleFromKHz;
+		? DpTrain::bandwidthKbps(DpTrain::Link { xp().sink.maxLanes, xp().sink.maxRate }) / 24
+		: Pipe2::isUhd(Pipe2::config()) ? ModeSet::kMaxTmdsKHz : ModeSet::kScrambleFromKHz;
+
+	// Behind a passive DP++ adapter, what the adapter carries: in 4:2:0
+	// twice that in pixels.
+	const uint32_t adaptorKHz = dpDualMaxKHz(Pipe2::config().hpd) * (Pipe2::config().y420 ? 2 : 1);
+	if (adaptorKHz && adaptorKHz < lim.maxPixelClockKHz)
+		lim.maxPixelClockKHz = adaptorKHz;
+
 	return lim;
+}
+
+// Whether the pipe runs `t` in YCbCr 4:2:0: on a 4:2:0 table, a mode the
+// adapter does not carry in RGB (amdgpu's force_yuv420_output).
+bool RDNA4Device::secondPipeY420(const Edid::DetailedTiming &t) const
+{
+	const Pipe2::Config &c = Pipe2::config();
+
+	return c.y420 && t.pixelClockKHz > dpDualMaxKHz(c.hpd);
+}
+
+// The mode's DET step held to `segments`, the pipe's share.
+void RDNA4Device::clampDet(ModeSet::Step *steps, size_t n, uint32_t segments) const
+{
+	const Pipe2::Config &c = Pipe2::config();
+
+	for (size_t i = 0; i < n; i++) {
+		ModeSet::Step &s = steps[i];
+
+		if (s.seg != c.detSeg || s.dword != c.detCtrl[c.pipe] || (s.value & 0x1f) <= segments)
+			continue;
+
+		s.value = (s.value & ~0x1fu) | segments;
+		s.mask |= 0x1f;
+	}
 }
 
 bool RDNA4Device::secondPipeModeOk(const Edid::DetailedTiming &t, const char **why) {
@@ -3077,39 +3781,64 @@ bool RDNA4Device::secondPipeModeOk(const Edid::DetailedTiming &t, const char **w
 		err = "no request timing for a pixel clock this far above the lit mode's";
 		return false;
 	}
-	// The DET segments the mode needs, next to what the other pipes hold.
-	uint32_t segments = Pipe2::modeDetSegments(t);
-	for (uint32_t i = 0; i < 4; i++)
-		if (i != c.pipe)
-			segments += regReadDmu(c.detSeg, c.detCtrl[i]) & 0x1f;
-	if (segments > Pipe2::kDetSegmentsTotal) {
+
+	// A pipe lit in YCbCr 4:2:0 runs in RGB what the adapter carries so, and
+	// in 4:2:0 only formats the sink takes that way.
+	if (secondPipeY420(t) && !Edid::takesY420(xp().edid, xp().edidLen, Edid::vicOf(t))) {
+		err = "the adapter does not carry it in RGB, and the sink does not take it in YCbCr 4:2:0";
+		return false;
+	}
+
+	// The DET segments the mode needs, or a smaller share as it is lit with.
+	if (!secondPipeDet(t)) {
 		err = "the DET buffer is too small for it next to the other pipes";
 		return false;
 	}
 	return true;
 }
 
+/*
+ * The DET segments the second pipe gets for `t` next to what the other pipes
+ * and the compressed buffer hold: Linux's for the mode, or less as when it
+ * is lit (detShare). With the boot display's plane still holding its 3
+ * segments, Linux's 10 for 3840x2160 did not fit next to the other head's
+ * 10, and a head lit at 3840x2160 with 7 could not be switched back to it
+ * from a smaller mode.
+ */
+uint32_t RDNA4Device::secondPipeDet(const Edid::DetailedTiming &t) const
+{
+	constexpr uint32_t kCompbufCtrl = 0x04ba;   // as shrinkCompbuf: the compressed buffer's segments count too
+	const Pipe2::Config &c = Pipe2::config();
+	uint32_t others = regReadDmu(c.detSeg, kCompbufCtrl) >> 8 & 0x1f;
+
+	for (uint32_t i = 0; i < 4; i++)
+		if (i != c.pipe)
+			others += regReadDmu(c.detSeg, c.detCtrl[i]) & 0x1f;
+
+	return detShare(Pipe2::modeDetSegments(t), others);
+}
+
 // A mode that needs more of a DisplayPort link than it has: the link goes
 // down and comes up larger, as for sleep and wake, with the stream still in
 // the mode it runs. A link that is large enough stays.
 bool RDNA4Device::relinkSecondPipe(uint32_t pixelClockKHz) {
-	if (DpTrain::bandwidthKbps(pipe2Link) >= static_cast<uint64_t>(pixelClockKHz) * 24)
+	if (DpTrain::bandwidthKbps(xp().link) >= static_cast<uint64_t>(pixelClockKHz) * 24)
 		return true;
-	const DpTrain::Link had = pipe2Link;
+	const DpTrain::Link had = xp().link;
 	if (!pickSecondLink(pixelClockKHz))
 		return false;
 	const bool ok = runSecondPipePart(Pipe2::Part::Sleep) && runSecondPipePart(Pipe2::Part::Wake);
 	if (!ok) {
 		FBLOG("pipe2: the larger link did not come up: back to %u lane(s) at rate 0x%02x", had.lanes, had.rate);
-		pipe2Link = had;
+		xp().link = had;
 		runSecondPipePart(Pipe2::Part::Sleep);
-		pipe2On = runSecondPipePart(Pipe2::Part::Wake);
+		xp().on = runSecondPipePart(Pipe2::Part::Wake);
 	}
 	return ok;
 }
 
 IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
-	if (!pipe2Lit)
+	if (!xp().lit)
 		return kIOReturnUnsupported;
 	const Pipe2::Config &c = Pipe2::config();
 	const uint32_t otgOffset = c.pipe * Pipe::Reg::kOtgStride;
@@ -3132,13 +3861,13 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 	t.dig = c.dig;
 	t.link = c.link;
 	t.hpd = c.hpd;
-	t.encoderObjId = pipe2Target.encoderObjId;
-	t.connectorObjId = pipe2ConnectorObjId;
-	t.sinkScdc = pipe2Target.sinkScdc;
-	t.ddcLine = pipe2Target.ddcLine;
+	t.encoderObjId = xp().target.encoderObjId;
+	t.connectorObjId = xp().connectorObjId;
+	t.sinkScdc = xp().target.sinkScdc;
+	t.ddcLine = xp().target.ddcLine;
 	// DisplayPort: the stream is retimed on the link as it is, like the boot
 	// display's, after the link was made large enough for the mode.
-	const Edid::DetailedTiming was = pipe2Target.now;
+	const Edid::DetailedTiming was = xp().target.now;
 	ModeSet::DpDto dtoNow {};
 	if (c.dp && (!relinkSecondPipe(m.t.pixelClockKHz) || !readDpDto(c.pipe, dtoNow))) {
 		FBLOG("pipe2: switch to id %u refused: no DisplayPort link or pixel-rate DTO for it", m.id);
@@ -3146,25 +3875,30 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 		return kIOReturnUnsupported;
 	}
 	t.dp = c.dp;
-	t.dpMaxKHz = DpTrain::bandwidthKbps(pipe2Link) / 24;
+	t.dpMaxKHz = DpTrain::bandwidthKbps(xp().link) / 24;
 	// From the timing the pipe runs to `to`, then the infoframe for it.
 	bool touched = false;   // a refused plan changes nothing; one that stops half-way does
 	auto retime = [&](const Edid::DetailedTiming &to) {
-		t.from = pipe2Target.now;
+		t.from = xp().target.now;
 		t.to = to;
 		if (c.dp) {
 			if (!ModeSet::scaleDpDto(dtoNow, was.pixelClockKHz, to.pixelClockKHz, t.dto))
 				t.dto = {};
-			t.vidM = ModeSet::dpVidM(to.pixelClockKHz, DpTrain::symbolClockKHz(pipe2Link.rate));
+			t.vidM = ModeSet::dpVidM(to.pixelClockKHz, DpTrain::symbolClockKHz(xp().link.rate));
 		}
-		t.nextra = Pipe2::modeSteps(to, work->extra, Pipe2::kMaxModeSteps);
+		// A 4:2:0 table's encoding first, then the mode's registers.
+		t.y420 = secondPipeY420(to);
+		t.nextra = Pipe2::encodingSteps(t.y420, work->extra, Pipe2::kMaxModeSteps);
+		t.nextra += Pipe2::modeSteps(to, work->extra + t.nextra, Pipe2::kMaxModeSteps - t.nextra);
+		clampDet(work->extra, t.nextra, secondPipeDet(to));
 		if (!ModeSet::build(t, *plan, &why))
 			return false;
 		why = "a step failed";
 		touched = true;
 		if (!runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "pipe2", otgOffset))
 			return false;
-		pipe2Target.now = to;
+		xp().target.now = to;
+		xp().target.rgb = c.y420 && !t.y420;
 		return c.dp || runSecondPipePart(Pipe2::Part::Avi);
 	};
 	FBLOG("pipe2: switching to id %u %ux%u@%u.%03u (%u kHz), request timing %s", m.id, m.t.hActive, m.t.vActive,
@@ -3179,10 +3913,19 @@ IOReturn RDNA4Device::applySecondPipeMode(const Modes::Mode &m) {
 	const uint64_t periodNs = measureFramePeriodNs(otgOffset);
 	const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
 	FBLOG("pipe2: now %ux%u at %u kHz, OTG%u measured %u.%03u Hz; HUBP%u_DCHUBP_CNTL=0x%08x "
-	      "ODM%u_OPTC_INPUT_GLOBAL_CONTROL=0x%08x DET %u", pipe2Target.now.hActive, pipe2Target.now.vActive,
-	      pipe2Target.now.pixelClockKHz, c.pipe, mHz / 1000, mHz % 1000, c.pipe,
+	      "ODM%u_OPTC_INPUT_GLOBAL_CONTROL=0x%08x DET %u", xp().target.now.hActive, xp().target.now.vActive,
+	      xp().target.now.pixelClockKHz, c.pipe, mHz / 1000, mHz % 1000, c.pipe,
 	      regReadDmu(2, 0x05f4 + c.pipe * Pipe::Reg::kHubpStride), c.pipe,
 	      regReadDmu(2, 0x1aca + c.pipe * Pipe::Reg::kOdmStride), regReadDmu(c.detSeg, c.detCtrl[c.pipe]) & 0x1f);
 	IOFree(work, sizeof(Work));
+
+	if (ok) {
+		// The sink's side of a scrambled link once more, with its clock
+		// running, as after a wake.
+		scdcRefresh();
+		logUnderflow("pipe2: after the switch");
+		diffAfterWake();
+	}
+
 	return ok ? kIOReturnSuccess : kIOReturnIOError;
 }
