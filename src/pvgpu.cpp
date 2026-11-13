@@ -919,6 +919,7 @@ private:
 		char name[3][64] {};
 		uint8_t hash[3][32] {};
 		uint64_t lib[3] {}, used { 0 };
+		uint64_t gen { 0 };   // the task's page table (mPtGen) when its functions were last looked for
 	};
 	static constexpr uint32_t kPipelines = 256;   // also those scanPipelines reads ahead for the other clients
 	PipelineInfo mPipelines[kPipelines];
@@ -5290,6 +5291,19 @@ const RDNA4PvHost::PipelineInfo &RDNA4PvHost::pipelineInfo(uint32_t task, uint32
 		if (same) {
 			e.used = ++mPipelineClock;
 
+			// a function not named when the pipeline was first read looked for again once the task's page table has changed: kitty's
+			// first (Op.newFunctionWithIR's metallib) was not mapped yet when its first draw came, and every draw of the pipeline after
+			// was refused, the window dark until others drew over it
+			if (e.gen != mPtGen[task & 63]) {
+				for (unsigned k = 1; k <= 2; k++)
+					if (e.fn[k] && !e.named[k] && functionName(task, e.fn[k], e.name[k], sizeof(e.name[k]), e.hash[k], &e.lib[k])) {
+						e.named[k] = true;
+						pvstat("host: render: task %u pipeline %u's %s function %u named on a later look: \"%s\"", task, pipeline,
+						       k == 1 ? "vertex" : "fragment", e.fn[k], e.name[k]);
+					}
+
+				e.gen = mPtGen[task & 63];
+			}
 			return e;
 		}
 
@@ -5310,6 +5324,7 @@ const RDNA4PvHost::PipelineInfo &RDNA4PvHost::pipelineInfo(uint32_t task, uint32
 	memcpy(e.pd, pd, sizeof(pd));
 	memcpy(e.fnRec, fnRec, sizeof(fnRec));
 	memcpy(e.fn, fn, sizeof(fn));
+	e.gen = mPtGen[task & 63];
 
 	static uint32_t keyLines;
 
@@ -5471,18 +5486,15 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 				uint64_t fd[8] = {};
 				uint32_t fbytes = 0;
 				const uint32_t ftype = pi.named[k] ? 6 : resourceType(task, fn[k], fd, &fbytes);   // unnamed: what its resource is
-				// and the resource its third dword names (Op.newFunctionWithIR's: {u64 ?, u32 resource, {0xf, 0x14, id}}, 2026-11-12)
-				uint64_t od[8] = {};
-				uint32_t obytes = 0, magic = 0;
-				const uint32_t other = static_cast<uint32_t>(fd[1]);
-				const uint32_t otype = !pi.named[k] && other ? resourceType(task, other, od, &obytes) : 0;
+				// Apple's host (ParavirtualizedGraphics, PGResourceManager::createObject<MTLFunction>) reads a function's record as {u64 data
+				// address, u32 bytes, operation header {u32 0xf, u32 size}, ...} and makes a library of the data (newLibraryWithData): what is there
+				uint32_t w[8] = {};
+				const uint32_t len = static_cast<uint32_t>(fd[1]);
+				const bool read = !pi.named[k] && readGuest(task, fd[0], reinterpret_cast<uint8_t *>(w), sizeof(w));
 
-				if (otype)
-					(void)readGuest(task, od[0], reinterpret_cast<uint8_t *>(&magic), 4);
 				if (!pi.named[k])
-					pvstat("host: render:   its resource's dword 2 names resource %u: type %u, %u bytes: %016llx %016llx %016llx %016llx; at its "
-					       "first quadword's address: %08x", other, otype, obytes, static_cast<unsigned long long>(od[0]),
-					       static_cast<unsigned long long>(od[1]), static_cast<unsigned long long>(od[2]), static_cast<unsigned long long>(od[3]), magic);
+					pvstat("host: render:   its data at 0x%llx, %u bytes: %s %08x %08x %08x %08x %08x %08x %08x %08x; pages %x %x", static_cast<unsigned long long>(fd[0]),
+					       len, read ? "read" : "NOT readable", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], guestPfn(task, fd[0]), guestPfn(task, fd[0] + len - 1));
 
 				pvstat("host: render: task %u pipeline %u's %s function \"%s\" (named %u, hash %02x%02x%02x%02x; resource %u of type %u, %u bytes: "
 				       "%016llx %016llx %016llx %016llx): %s", task, pipeline, k == 1 ? "vertex" : "fragment", name[k], pi.named[k], pi.hash[k][0],
