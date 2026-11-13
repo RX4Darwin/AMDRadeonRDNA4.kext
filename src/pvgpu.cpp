@@ -349,7 +349,7 @@ private:
 	bool functionOf(uint32_t task, uint32_t pipeline, char *name, size_t nameCap, uint8_t hash[32], uint64_t *lib);
 	bool functionName(uint32_t task, uint32_t fn, char *name, size_t nameCap, uint8_t hash[32], uint64_t *lib);
 	uint32_t resourceType(uint32_t task, uint32_t id, uint64_t *desc = nullptr, uint32_t *bytes = nullptr);
-	uint32_t load(const uint8_t *elf, uint32_t size, const char *name);
+	uint32_t load(const uint8_t *elf, uint32_t size, const char *name, uint64_t *launch = nullptr);
 	uint32_t program(unsigned kernel);
 	// Found by hash, name and, for a name not passed (empty), metallib: functions without a HASH tag share the all-zero hash, and once
 	// kernels were loaded a vertex function found a kernel's entry (windows were not drawn).
@@ -358,6 +358,7 @@ private:
 		char name[64];
 		uint64_t lib;
 		uint32_t program, buffers, written;   // a compute kernel loaded into the runtime
+		uint64_t launch[9];                   // and rtLoad's facts of it: [1] kernarg bytes, [3-5] rsrc1-3, [6] properties, [7] LDS, [8] code
 		uint32_t texturesWritten;             // bit i: it writes texture index i (include/rdna4mtlc.h)
 		uint8_t *gfx;                         // or a vertex or fragment shader: the helper's RGFX blob (air2amdgpu.cpp translateShader)
 		uint32_t gfxLen;
@@ -671,6 +672,18 @@ private:
 
 	bool batchDraw(const uint32_t *ib, uint32_t dwords, uint32_t task, uint32_t target);
 	void flushBatch();
+	// Dispatches put into the batch too (GL's fixIndexBuffer before nearly every draw of kitty's: each its own submit and wait on the compute
+	// queue took 42 us of the host's thread). Their kernargs in a slot per batch entry, free again with the batch's fence; what they write
+	// noted until the batch is waited for, so that the CPU (copyGuest) and the compute queue do not read or write it before.
+	static constexpr uint32_t kDispatchArgs = 256;
+	GfxBuffers mDispatchArgs {};
+	struct RingWrite { uint32_t task; uint64_t va, len; };
+	static constexpr uint32_t kRingWrites = 32;
+	RingWrite mRingWrites[kRingWrites] {};
+	uint32_t mRingWriteCount { 0 };
+	bool batchDispatch(const Jit &j, const uint8_t *args, uint32_t argBytes, const uint32_t groups[3], const uint32_t groupSize[3]);
+	void noteRingWrite(uint32_t task, uint64_t va, uint64_t len);
+	bool ringWritten(uint32_t task, uint64_t va, uint64_t len) const;
 	uint32_t takeSlot();
 	GfxBuffers mTimes {};   // rdna4_pvprofile's slots
 	uint64_t mDmaFence[kDmaSlots] {};
@@ -1855,6 +1868,7 @@ IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 // The draws in flight waited for: what they read and write is the guest's again, their slots and the pool free once readyDraws runs.
 void RDNA4PvHost::waitDraws(uint32_t line)
 {
+	mRingWriteCount = 0;   // waited for below (a failed wait too: ponytail)
 	flushBatch();
 
 	static constexpr uint32_t kBatchWait = 50;    // ms: a draw takes the card 6 ms at most
@@ -2249,6 +2263,93 @@ void RDNA4PvHost::flushBatch()
 			dirtied(dirty[i] >> 16, dirty[i] & 0xffff, fence);
 }
 
+// A dispatch of a translated kernel put into the batch (false: the runtime's own dispatch takes it). After it the compute work is waited
+// for and the shader caches dropped, so that the draws after it read what it wrote (GL's fixed indices).
+bool RDNA4PvHost::batchDispatch(const Jit &j, const uint8_t *args, uint32_t argBytes, const uint32_t groups[3], const uint32_t groupSize[3])
+{
+	static constexpr uint32_t kMaxDwords = 64;
+	static constexpr uint32_t kCsPartialFlush = 7 | 4u << 8;   // EVENT_WRITE CS_PARTIAL_FLUSH, EVENT_INDEX 4
+	static constexpr uint32_t kGcrShaderCaches = 1u << 7 | 1u << 8 | 1u << 9;   // GCR_CNTL: GLK, GLV and GL1 invalidated
+	const uint64_t *l = j.launch;
+	const uint32_t rsrc2 = static_cast<uint32_t>(l[4]);
+	const uint32_t bytes = (static_cast<uint32_t>(l[1] > argBytes ? l[1] : argBytes) + 3) & ~3u;
+	uint64_t cpu = 0;
+
+	// what only the runtime's dispatch does goes to it: scratch (RSRC2 bit 0), user SGPRs other than the kernarg pointer, LDS beyond a group's
+	if ((gInPlace & 512) || profiling() || !mBatchIb.cpu || !l[8] || (rsrc2 & 1) || (rsrc2 >> 1 & 31) != 2 || bytes > kDispatchArgs || l[7] > 65536)
+		return false;
+
+	if (!mDispatchArgs.handle && gCompute->rtAllocHost(this, kernel_task, kDispatchArgs * kBatchDraws * kBatchSlots, 0, mDispatchArgs.handle,
+	                                                   mDispatchArgs.gpu, cpu) == kIOReturnSuccess)
+		mDispatchArgs.cpu = reinterpret_cast<uint8_t *>(cpu);
+
+	if (!mDispatchArgs.cpu)
+		return false;
+
+	if (mBatchDraws == kBatchDraws || (mBatchDwords + kMaxDwords) * 4 > kBatchBytes)
+		flushBatch();
+
+	const uint32_t slot = mBatchSlot % kBatchSlots;
+
+	if (!mBatchDraws && mBatchFence[slot] && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(mBatchFence[slot])))
+		waitFor(mBatchFence[slot]);   // the slot's IB and kernargs still read by the card
+
+	const uint64_t at = static_cast<uint64_t>(slot * kBatchDraws + mBatchDraws) * kDispatchArgs;
+
+	memset(mDispatchArgs.cpu + at, 0, bytes);   // zero up to the kernel's size (hidden arguments), as the runtime's dispatch
+	memcpy(mDispatchArgs.cpu + at, args, argBytes);
+
+	const uint64_t argsGpu = mDispatchArgs.gpu + at;
+	const uint32_t zero = 0, all[2] = {0xffffffffu, 0xffffffffu}, none4[4] = {}, start[3] = {};
+	const uint32_t pgm[2] = {static_cast<uint32_t>(l[8] >> 8), static_cast<uint32_t>(l[8] >> 40)};
+	const uint32_t rsrc[3] = {static_cast<uint32_t>(l[3]), (rsrc2 & ~GfxReg::kRsrc2LdsMask) | GfxReg::ldsSizeField(static_cast<uint32_t>(l[7])),
+	                          static_cast<uint32_t>(l[5])};
+	const uint32_t user[2] = {static_cast<uint32_t>(argsGpu), static_cast<uint32_t>(argsGpu >> 32)};
+	uint32_t ib[kMaxDwords], n = 0;
+
+	// as scaleFrame's (the runtime's launch's), with its end
+	n += Pm4::acquireMem(ib + n, Pm4::kGcrMemSync);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_PGM_LO, pgm, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_PGM_RSRC1, rsrc, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_PGM_RSRC3, &rsrc[2], 1);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_RESOURCE_LIM, &zero, 1);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_TMPRING, &zero, 1);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE0, all, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE2, all, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE4, none4, 4);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_START_X, start, 3);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_NUM_THREAD_X, groupSize, 3);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_USER_DATA0, user, 2);
+	n += Pm4::dispatchDirect(ib + n, groups[0], groups[1], groups[2],
+	                         Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 | (l[6] & (1u << 10) ? Pm4::kDispatchWave32 : 0));
+	n += Pm4::eventWrite(ib + n, kCsPartialFlush);
+	n += Pm4::acquireMem(ib + n, kGcrShaderCaches);
+
+	return batchDraw(ib, n, 0, 0);
+}
+
+// A range a dispatch in the batch writes (a buffer whole: GL's index ring is written at another offset by each).
+void RDNA4PvHost::noteRingWrite(uint32_t task, uint64_t va, uint64_t len)
+{
+	for (uint32_t i = 0; i < mRingWriteCount; i++)
+		if (mRingWrites[i].task == task && mRingWrites[i].va == va && mRingWrites[i].len == len)
+			return;
+
+	if (mRingWriteCount == kRingWrites)
+		waitDraws();   // clears them
+
+	mRingWrites[mRingWriteCount++] = {task, va, len};
+}
+
+bool RDNA4PvHost::ringWritten(uint32_t task, uint64_t va, uint64_t len) const
+{
+	for (uint32_t i = 0; i < mRingWriteCount; i++)
+		if (mRingWrites[i].task == task && va < mRingWrites[i].va + mRingWrites[i].len && mRingWrites[i].va < va + len)
+			return true;
+
+	return false;
+}
+
 // M1: a command's payload as dwords (up to 32), to work its layout out against what the guest asked for (tools/metal/m1/mtlprobe.m).
 void RDNA4PvHost::dumpPayload(const char *tag, const pvstream::FifoCommand &c, const uint8_t *cmd) {
 	const uint32_t bytes = c.length - c.payloadOffset, words = bytes / 4 < 32 ? bytes / 4 : 32;
@@ -2364,6 +2465,9 @@ void RDNA4PvHost::dumpGuest(uint32_t task, uint64_t va, uint32_t len) {
 // M1: [va, va + len) of a task's GPU address space, page by page through its page table, copied out (or, for writeGuest, in); false at the first
 // page that is not mapped.
 bool RDNA4PvHost::copyGuest(uint32_t task, uint64_t va, uint8_t *buf, uint32_t len, bool toGuest) {
+	if (mRingWriteCount && ringWritten(task, va, len))   // a dispatch in the batch writes it: done first
+		waitDraws();
+
 	while (len) {
 		const uint32_t off = static_cast<uint32_t>(va & 0xfff);
 		const uint32_t take = len < 0x1000 - off ? len : 0x1000 - off;
@@ -6087,6 +6191,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 // M2: an SDMA fill (srcVa 0: `pattern`) or copy (from srcVa) over `bytes` of a task's GPU address space, page by page through its page table, the CPU
 // caches flushed before and after each piece (the engine does not snoop them).
 bool RDNA4PvHost::dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes) {
+	if (mRingWriteCount)   // another engine: not after what dispatches in the batch write
+		waitDraws();
+
 	while (bytes) {
 		uint64_t n = 0x1000 - (dstVa & 0xfff);
 		if (srcVa && 0x1000 - (srcVa & 0xfff) < n)
@@ -6555,7 +6662,7 @@ bool RDNA4PvHost::functionName(uint32_t task, uint32_t fn, char *name, size_t na
 }
 
 // A code object loaded into the card's runtime: its program, or 0.
-uint32_t RDNA4PvHost::load(const uint8_t *elf, uint32_t size, const char *name) {
+uint32_t RDNA4PvHost::load(const uint8_t *elf, uint32_t size, const char *name, uint64_t *launch) {
 	if (!gCompute)
 		return 0;
 	if (!mRtOpen)
@@ -6565,6 +6672,8 @@ uint32_t RDNA4PvHost::load(const uint8_t *elf, uint32_t size, const char *name) 
 	uint64_t out[9] = {};
 	const bool ok = mRtOpen && gCompute->rtLoad(this, kernel_task, reinterpret_cast<mach_vm_address_t>(elf), size, name, out) == kIOReturnSuccess;
 	pvlog("host: compute: %s %s (program 0x%llx)", name, ok ? "loaded into the runtime" : "did NOT load", out[0]);
+	if (launch)
+		memcpy(launch, out, sizeof(out));
 	return ok ? static_cast<uint32_t>(out[0]) : 0;
 }
 
@@ -6681,7 +6790,8 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	j.helper = gTr.helpers;
 	j.used = mJitClock;
 	const bool shader = elf && elfLen >= 32 && !memcmp(elf, "RGFX", 4);
-	j.program = elf && !shader && buffers <= 8 ? load(elf, elfLen, name) : 0;
+	memset(j.launch, 0, sizeof(j.launch));
+	j.program = elf && !shader && buffers <= 8 ? load(elf, elfLen, name, j.launch) : 0;
 	j.buffers = buffers;
 	j.written = written;
 	j.texturesWritten = texturesWritten;
@@ -6759,7 +6869,8 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	// The kernel: translated now by the helper, else (no helper) from the table of src/mtlkernels.h by name.
 	uint32_t prog = 0, nb = 0, written = 0, texturesWritten = 0;
 	const char *from = "translated at run time";
-	if (const Jit *j = translated(task, lib, name, hash)) {
+	const Jit *j = translated(task, lib, name, hash);
+	if (j) {
 		prog = j->program;
 		nb = j->buffers;
 		written = j->written;
@@ -6783,6 +6894,10 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		pvlog("host: compute: no kernel for it (or the dispatch is out of range): not run");
 		return;
 	}
+	mBuilding = true;   // the mappings it uses, kept until the batch it may go into is done (markUsed)
+	mUsedMapCount = mUsedShadowCount = 0;
+	mUsedChunks = 0;
+	mBuildSlot = ~0u;
 	uint64_t handle[8] = {}, gpu[8] = {}, va[8] = {}, bytes[8] = {};
 	for (unsigned b = 0; b < nb && ok; b++) {
 		uint64_t len = 0;
@@ -6819,6 +6934,7 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		waitDraws();
 	}
 	uint64_t micros = 0;
+	bool batched = false;
 
 	// A kernel that faulted once is not run again: each fault resets the address space's waves, and the draws after it hung one by one
 	// (VideoToolbox's VTMTSComputeFunction for System Settings' thumbnails: the mouse stood still).
@@ -6843,16 +6959,29 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		memcpy(d.kernargs + 8 * nb, dims, sizeof(dims));
 		memcpy(d.kernargs + 8 * nb + sizeof(dims), &tableGpu, 8);   // 0 without textures (the table's kernels ignore it)
 		d.kernargBytes = 8 * nb + sizeof(dims) + 8;
-		ok = gCompute->rtDispatch(this, d, micros) == kIOReturnSuccess;
+		batched = !textures && j && batchDispatch(*j, d.kernargs, d.kernargBytes, d.groups, d.groupSize);
+
+		if (batched) {
+			markUsed(mSubmits + 1, mDrawSerial + 1);
+		} else {
+			if (mRingWriteCount)   // the compute queue does not wait for the batch
+				waitDraws();
+			ok = gCompute->rtDispatch(this, d, micros) == kIOReturnSuccess;
+		}
 
 		if (!ok && prog && mFaultedCount < kFaulted) {
 			mFaulted[mFaultedCount++] = prog;
 			pvstat("host: compute: \"%s\" did not finish: not run again this boot", name);
 		}
 	}
+	if (!batched)
+		mBuilding = false;
 	for (unsigned b = 0; b < nb && ok; b++)
-		if (written >> b & 1 && buffer[b])
+		if (written >> b & 1 && buffer[b]) {
+			if (batched)
+				noteRingWrite(task, va[b] - offset[b], bytes[b] + offset[b]);
 			dropShadowRange(task, va[b], bytes[b]);
+		}
 	for (unsigned b = 0; b < nb; b++)
 		if (handle[b])
 			gCompute->rtFree(this, handle[b]);
