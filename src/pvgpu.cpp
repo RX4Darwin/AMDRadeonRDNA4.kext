@@ -2763,7 +2763,15 @@ void RDNA4PvHost::decodeExec(uint32_t task, const uint64_t (*chunks)[2], uint32_
 			segments++;
 			t.segment = pvstream::segmentTypeName(type);
 			if (type != 5) {   // 5: the protection-options envelope, a raw u64
-				const size_t ok = pvstream::walkCommands(buf + at + 8, slen - 8, false, execSink, &t);
+				const size_t ok = pvstream::walkCommands(buf + at + 8, slen - 8, false,
+				    [](void *user, uint32_t id, const char *name, const uint8_t *p, uint32_t bytes, size_t offset) {
+					    execSink(user, id, name, p, bytes, offset);
+					    RDNA4PvHost *host = static_cast<ExecTally *>(user)->host;
+					    // a VBL due while a long command buffer is worked through raised now, as between FIFO commands (consume): kitty's
+					    // ran 50 ms, and the VBLs came 11 ms late on average while it scrolled, WindowServer's frames with them
+					    if (host->mVblSoonest && nowNs() >= host->mVblSoonest)
+						    host->pollDisplay();
+				    }, &t);
 				undecoded += slen - 8 - static_cast<uint32_t>(ok);
 			}
 			at += slen;
