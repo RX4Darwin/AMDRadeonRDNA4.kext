@@ -6739,13 +6739,15 @@ void RDNA4PvHost::describeRenderPipeline(uint32_t task, uint32_t pipeline) {
 
 // M3: Compute.dispatchThreads (size: threads in the grid[3], threads per threadgroup[3]), run on the card with the function translated
 // AIR -> gfx1201 (at run time by the helper, or ahead of time into src/mtlkernels.h by tools/metal/m3). Each bound buffer, from its offset
-// to its end, is copied into a runtime buffer, the kernel dispatched, and the buffers it writes copied back into the guest's pages.
+// to its end, is mapped for the card in place (as a draw's: mapGuest, the whole buffer, found again in the cache), the ones it writes only
+// where the guest's table lets the GPU write. Copied into runtime buffers and the written ones back, GL's fixIndexBuffer (before nearly every
+// draw of kitty's) took 0.17 ms a dispatch; mapped from the offset on, nearly every dispatch made a new mapping.
 void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &bound, const uint64_t *size) {
 	mMapFloor = mMapClock;
 
 	const uint32_t *buffer = bound.buffer;
 	const uint64_t *offset = bound.offset;
-	static constexpr uint64_t kMaxBuffer = 64ull << 20;   // ponytail: staged through one kernel allocation; map the guest pages if bigger is needed
+	static constexpr uint64_t kMaxBuffer = 64ull << 20;   // as a draw's buffers
 	char name[64];
 	uint8_t hash[32];
 	uint64_t lib = 0;
@@ -6781,7 +6783,7 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		pvlog("host: compute: no kernel for it (or the dispatch is out of range): not run");
 		return;
 	}
-	uint64_t handle[8] = {}, gpu[8] = {}, va[8] = {}, bytes[8] = {}, most = 0;
+	uint64_t handle[8] = {}, gpu[8] = {}, va[8] = {}, bytes[8] = {};
 	for (unsigned b = 0; b < nb && ok; b++) {
 		uint64_t len = 0;
 
@@ -6791,16 +6793,12 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 			gpu[b] = mGfxSpare.gpu;
 			continue;
 		}
-		ok = bufferRange(task, buffer[b], &va[b], &len) && offset[b] < len && len - offset[b] <= kMaxBuffer;
+		ok = bufferRange(task, buffer[b], &va[b], &len) && offset[b] < len && len <= kMaxBuffer &&
+		     mapGuest(task, va[b], len, handle[b], gpu[b], written >> b & 1);
 		va[b] += offset[b];
+		gpu[b] += offset[b];
 		bytes[b] = len - offset[b];
-		most = bytes[b] > most ? bytes[b] : most;
 	}
-	auto *stage = ok && most ? static_cast<uint8_t *>(IOMalloc(most)) : nullptr;
-	ok = ok && (!most || stage);   // a kernel of textures only has no buffers to stage
-	for (unsigned b = 0; b < nb && ok; b++)
-		ok = !buffer[b] || (gCompute->rtAlloc(this, bytes[b], handle[b], gpu[b]) == kIOReturnSuccess && readGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b])) &&
-		     gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], true) == kIOReturnSuccess);
 	// The kernel's textures and samplers in a table of their own (air2amdgpu.cpp: its address follows the dimensions in the kernargs).
 	StagedTexture staged[16] = {};
 	uint64_t tableHandle = 0, tableGpu = 0;
@@ -6852,14 +6850,9 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 			pvstat("host: compute: \"%s\" did not finish: not run again this boot", name);
 		}
 	}
-	for (unsigned b = 0; b < nb && ok; b++) {
-		if (!(written & (1u << b)) || !buffer[b])
-			continue;
-
-		ok = gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], false) == kIOReturnSuccess &&
-		     copyGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b]), true);
-		dropShadowRange(task, va[b], bytes[b]);
-	}
+	for (unsigned b = 0; b < nb && ok; b++)
+		if (written >> b & 1 && buffer[b])
+			dropShadowRange(task, va[b], bytes[b]);
 	for (unsigned b = 0; b < nb; b++)
 		if (handle[b])
 			gCompute->rtFree(this, handle[b]);
@@ -6880,8 +6873,6 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	}
 	if (tableHandle)
 		gCompute->rtFree(this, tableHandle);
-	if (stage)
-		IOFree(stage, most);
 	pvlog("host: compute: %s on the card (%s): %s (%llu us)", name, from, ok ? "done" : "NOT done", micros);
 }
 
