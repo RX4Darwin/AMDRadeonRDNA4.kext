@@ -410,9 +410,14 @@ public:
 	                   bool writes, uint32_t texturesWritten = 0);
 	bool releaseTextures(uint32_t task, StagedTexture (&staged)[16], bool copyBack);
 	bool mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t &handle, uint64_t &gpu, bool write = false);
+	bool mapGuestPages(uint32_t task, uint64_t first, uint64_t count, bool write, uint64_t &handle, uint64_t &gpu);
+	IOBufferMemoryDescriptor *mHolePage { nullptr };   // what a window's pages that are not there are mapped to
+	uint64_t mHolePhys { 0 };
+	uint64_t mWindowPages[512] {};
 	bool mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 private:
 	struct Mapping;
+	Mapping *mapWindow(uint32_t task, uint64_t window);
 public:
 	bool mapPages(const uint64_t *pages, uint64_t count, uint64_t &handle, uint64_t &gpu, Mapping **entry = nullptr);
 	Mapping *keyedMapping(const void *memory, uint32_t task, uint64_t first, uint64_t count);
@@ -586,6 +591,8 @@ private:
 		uint64_t first { 0 }, gen { 0 };
 		bool keyed { false };
 		bool writable { false };   // a guest range whose pages the guest's table all lets the GPU write
+		bool window { false };     // mapWindow's: only the pages of `present` (and of `writes`, writable) are the guest's
+		uint64_t present[8] {}, writes[8] {};
 	};
 	// WindowServer uses well over 64 textures, targets and buffers a frame: the small ones pushed the large ones out, and each came back
 	// as thousands of pages mapped anew.
@@ -4713,11 +4720,98 @@ void RDNA4PvHost::flushHeld(HeldTarget &h)
 // With `write`, only a range the guest's table lets the GPU write: the card writes what is mapped so (a render target, a clear), and an
 // app could otherwise have it write a file it may only read, mapped into a buffer without a copy.
 bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t &handle, uint64_t &gpu, bool write) {
-	const uint64_t first = va & ~0xfffull, count = (va + bytes + 0xfff - first) >> 12;
+	// A small buffer found in the mapping of its 2 MiB window of the guest's space, made once for all buffers in it (mapWindow): GL gives
+	// each of kitty's draws an index buffer of its own, 4 KiB at a new address, and those were 91000 new mappings in 5 s of scrolling,
+	// the cache (256) finding none of them again.
+	static constexpr uint64_t kWindow = 2ull << 20;
+	const uint64_t window = va & ~(kWindow - 1);
 
+	if (bytes && bytes <= kWindow / 4 && va + bytes <= window + kWindow) {
+		Mapping *m = keyedMapping(nullptr, task, window, kWindow >> 12);
+
+		if (!m)
+			m = mapWindow(task, window);
+
+		bool covered = m != nullptr;
+
+		for (uint64_t p = (va - window) >> 12; covered && p <= (va + bytes - 1 - window) >> 12; p++)
+			covered = m->window ? (m->present[p / 64] >> (p % 64) & 1) && (!write || (m->writes[p / 64] >> (p % 64) & 1))
+			                    : !write || m->writable;
+
+		if (covered) {
+			handle = 0;
+			gpu = m->gpu + (va - window);
+			return true;
+		}
+	}
+
+	const uint64_t first = va & ~0xfffull;
+
+	if (!mapGuestPages(task, first, (va + bytes + 0xfff - first) >> 12, write, handle, gpu))
+		return false;
+
+	gpu += va & 0xfff;
+	return true;
+}
+
+// The 512 pages of a task's 2 MiB window mapped and cached, those the guest's table does not hold mapped to a spare page; which are the
+// guest's (and writable) noted. A page that comes later is a change of the table: the mapping is not found again then (mPtGen).
+RDNA4PvHost::Mapping *RDNA4PvHost::mapWindow(uint32_t task, uint64_t window)
+{
+	static constexpr uint32_t kPages = 512;
+
+	if (!mHolePage) {   // ponytail: kept for the boot, as the host
+		mHolePage = IOBufferMemoryDescriptor::withCapacity(4096, kIODirectionInOut, true);
+		if (mHolePage && mHolePage->prepare() == kIOReturnSuccess)
+			mHolePhys = mHolePage->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+	}
+
+	// a window lies in one leaf table (1024 pages: 4 MiB)
+	const unsigned index[3] = {0, static_cast<unsigned>(window >> 32) & 1023, static_cast<unsigned>(window >> 22) & 1023};
+	uint32_t pfn = mTaskRoot[task & 63];
+
+	for (unsigned level = 0; level < 3 && pfn; level++)
+		pfn = tableEntry(pfn, index[level]);
+
+	if (!mHolePhys || !pfn || pfn >= (1u << 28))
+		return nullptr;
+
+	IOMemoryMap *map;
+	const auto *entry = reinterpret_cast<const volatile uint32_t *>(physBytes(static_cast<uint64_t>(pfn) << 12, 0x1000, false, map));
+	uint64_t present[8] = {}, writes[8] = {};
+	uint32_t there = 0;
+
+	for (uint32_t i = 0; entry && i < kPages; i++) {
+		const uint32_t pte = entry[((window >> 12) & 1023) + i];
+		const uint64_t page = static_cast<uint64_t>(pte & 0x0fffffffu) << 12;
+
+		mWindowPages[i] = page ? page : mHolePhys;
+		present[i / 64] |= static_cast<uint64_t>(page != 0) << (i % 64);
+		writes[i / 64] |= static_cast<uint64_t>(page && (pte & 0x80000000u)) << (i % 64);
+		there += page != 0;
+	}
+
+	OSSafeReleaseNULL(map);
+
+	uint64_t handle = 0, gpu = 0;
+	Mapping *m = nullptr;
+
+	if (!there || !mapPages(mWindowPages, kPages, handle, gpu, &m) || !m)
+		return nullptr;
+
+	keyMapping(m, nullptr, task, window);
+	m->window = true;
+	memcpy(m->present, present, sizeof(present));
+	memcpy(m->writes, writes, sizeof(writes));
+
+	return m->keyed ? m : nullptr;
+}
+
+// `count` pages of a task's space from `first`, from the cache or mapped and cached; `gpu` the first page's address.
+bool RDNA4PvHost::mapGuestPages(uint32_t task, uint64_t first, uint64_t count, bool write, uint64_t &handle, uint64_t &gpu) {
 	if (const Mapping *m = keyedMapping(nullptr, task, first, count)) {
 		handle = 0;
-		gpu = m->gpu + (va & 0xfff);
+		gpu = m->gpu;
 
 		return !write || m->writable;
 	}
@@ -4733,7 +4827,6 @@ bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t 
 		entry->writable = writable;
 	if (pages)
 		IOFree(pages, count * 8);
-	gpu += ok ? va & 0xfff : 0;
 
 	return ok;
 }
