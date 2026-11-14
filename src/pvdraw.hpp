@@ -46,6 +46,7 @@ static inline uint32_t doubleAsHalf(uint64_t bits) {
 static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	switch (format) {
 	case 115: return 0x0002070cu;   // RGBA16Float
+	case 110: return 0x0002000cu;   // RGBA16Unorm
 	case 65: return 0x00020705u;    // RG16Float
 	case 10: return 0x00020001u;    // R8Unorm
 	case 25: return 0x00020702u;    // R16Float
@@ -138,6 +139,13 @@ static inline void linearVolume(uint32_t *t, uint64_t gpu, uint32_t format, uint
 static inline void linearArray1d(uint32_t *t, uint64_t gpu, uint32_t format, uint32_t sel, uint32_t w, uint32_t layers) {
 	linearImage(t, gpu, format, sel, w, 1, 1);
 	t[3] = sel | 12u << 28;   // TYPE 1D_ARRAY
+	t[4] = (layers - 1) & 0x3fff;
+}
+
+// A linear 2D array's T#: `layers` slices of w x h, laid out as a 3D image's (linearVolume: the hardware's own pitches).
+static inline void linearArray2d(uint32_t *t, uint64_t gpu, uint32_t format, uint32_t sel, uint32_t w, uint32_t h, uint32_t layers) {
+	linearImage(t, gpu, format, sel, w, h, 1);
+	t[3] = sel | 13u << 28;   // TYPE 2D_ARRAY
 	t[4] = (layers - 1) & 0x3fff;
 }
 

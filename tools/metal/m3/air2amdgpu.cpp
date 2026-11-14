@@ -23,11 +23,13 @@
 // read-modify-writes, textures and samplers (2D: read, write, sample at level 0), and the math and integer functions of legalize() below.
 // Anything else is reported and refused.
 #include "lld/Common/Driver.h"
+#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/BinaryFormat/MsgPackDocument.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/PatternMatch.h"
+#include "llvm/IR/ReplaceConstant.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -300,6 +302,102 @@ static Type *globalType(Type *t, std::map<Type *, Type *> &done) {
 	return r;
 }
 
+// Constant tables (an initialized global in AIR's constant address space: kitty's quad corners through AppleMetalOpenGLRenderer,
+// 2026-11-12): each load from one becomes the value, chosen by the index with selects when one index is not constant. A graphics
+// shader's code is copied out of its object without data or relocations, so a table cannot stay in memory. Up to 64 entries; any other
+// use stays and is refused below.
+static void lowerTables(Function &k) {
+	const DataLayout &dl = k.getParent()->getDataLayout();
+	SmallVector<GlobalVariable *, 4> tables;
+
+	for (GlobalVariable &g : k.getParent()->globals())
+		if (g.getAddressSpace() == 2 && g.isConstant() && g.hasInitializer())
+			tables.push_back(&g);
+	for (GlobalVariable *g : tables) {
+		convertUsersOfConstantsToInstructions({g}, &k);
+
+		SmallVector<Instruction *, 8> gone;
+		const SmallVector<User *, 8> users(g->users());
+
+		for (User *u : users) {
+			auto *gep = dyn_cast<GetElementPtrInst>(u);
+			auto *direct = dyn_cast<LoadInst>(u);
+
+			if ((gep ? gep->getFunction() : direct ? direct->getFunction() : nullptr) != &k)
+				continue;
+
+			// the dynamic index, if any: one at most
+			int dynamicAt = -1;
+			bool ok = true;
+
+			if (gep)
+				for (unsigned i = 1; i < gep->getNumOperands() && ok; i++)
+					if (!isa<ConstantInt>(gep->getOperand(i))) {
+						ok = dynamicAt < 0;
+						dynamicAt = static_cast<int>(i);
+					}
+
+			const SmallVector<User *, 8> loads(gep ? SmallVector<User *, 8>(gep->users()) : SmallVector<User *, 8>{direct});
+
+			for (User *lu : loads)
+				ok = ok && isa<LoadInst>(lu) && cast<LoadInst>(lu)->getPointerOperand() == (gep ? static_cast<Value *>(gep) : g);
+
+			// the elements the dynamic index chooses among: the array it indexes
+			uint64_t n = 1;
+
+			if (ok && dynamicAt > 0) {
+				SmallVector<Value *, 4> head(gep->idx_begin(), gep->idx_begin() + (dynamicAt - 1));
+				auto *at = dyn_cast<ArrayType>(GetElementPtrInst::getIndexedType(gep->getSourceElementType(), head));
+
+				n = at ? at->getNumElements() : 0;
+				ok = n && n <= 64;
+			}
+			if (!ok)
+				continue;
+
+			for (User *lu : loads) {
+				auto *l = cast<LoadInst>(lu);
+				auto element = [&](uint64_t i) -> Constant * {
+					if (!gep)
+						return ConstantFoldLoadFromConstPtr(g, l->getType(), dl);
+
+					SmallVector<Constant *, 4> idx;
+
+					for (unsigned o = 1; o < gep->getNumOperands(); o++)
+						idx.push_back(static_cast<int>(o) == dynamicAt ? ConstantInt::get(gep->getOperand(o)->getType(), i)
+						                                               : cast<Constant>(gep->getOperand(o)));
+					return ConstantFoldLoadFromConstPtr(ConstantExpr::getGetElementPtr(gep->getSourceElementType(), g, idx), l->getType(), dl);
+				};
+				Value *v = element(dynamicAt > 0 ? n - 1 : 0);
+
+				if (dynamicAt > 0 && v) {
+					IRBuilder<> b(l);
+					Value *index = gep->getOperand(static_cast<unsigned>(dynamicAt));
+
+					for (uint64_t i = n - 1; i-- > 0 && v;) {
+						Constant *e = element(i);
+
+						v = e ? b.CreateSelect(b.CreateICmpEQ(index, ConstantInt::get(index->getType(), i)), e, v) : nullptr;
+					}
+				}
+				if (!v)
+					continue;
+				l->replaceAllUsesWith(v);
+				gone.push_back(l);
+			}
+		}
+		for (Instruction *i : gone)
+			i->eraseFromParent();
+
+		SmallVector<Instruction *, 8> deadGeps;   // the loads were all they had
+		for (User *u : SmallVector<User *, 8>(g->users()))
+			if (auto *gep = dyn_cast<GetElementPtrInst>(u); gep && gep->use_empty() && gep->getFunction() == &k)
+				deadGeps.push_back(gep);
+		for (Instruction *i : deadGeps)
+			i->eraseFromParent();
+	}
+}
+
 static std::string legalize(Function &k) {
 	LLVMContext &ctx = k.getContext();
 	PointerType *global = PointerType::get(ctx, 1);
@@ -318,6 +416,7 @@ static std::string legalize(Function &k) {
 					c->setArgOperand(1, ConstantPointerNull::get(cast<PointerType>(c->getArgOperand(1)->getType())));
 				}
 			}
+	lowerTables(k);   // after the samplers: theirs are constant globals too
 	std::map<Type *, Type *> globalTypes;
 	for (Instruction &i : instructions(k)) {
 		for (Use &u : i.operands()) {
@@ -471,6 +570,54 @@ static std::string legalize(Function &k) {
 			if (readInt)
 				texel = b.CreateIntCast(b.CreateBitCast(texel, FixedVectorType::get(b.getInt32Ty(), 4)),
 				                        cast<StructType>(c->getType())->getElementType(0), tex.starts_with("read_texture_2d.s"));
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (tex.starts_with("sample_texture_2d_array.v4f")) {
+			// (texture, sampler, float2 coord, uint slice, i1, int2 offset, i1 level, float bias or LOD, float min LOD, i32): kitty's glyph
+			// atlas through AppleMetalOpenGLRenderer (2026-11-12). The slice is the T#'s array layer, given as a float. An explicit LOD as
+			// given; else, in a fragment shader, from its quads (with the bias), elsewhere level 0.
+			const bool half = tex.starts_with("sample_texture_2d_array.v4f16");
+			auto *level = c->arg_size() >= 10 ? dyn_cast<ConstantInt>(c->getArgOperand(6)) : nullptr;
+			if (!level || !match(c->getArgOperand(5), m_Zero()) || !match(c->getArgOperand(8), m_AnyZeroFP()))
+				return f->getName().str() + " with an offset, a minimum LOD or a run-time level flag is not supported yet";
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(2), *value = c->getArgOperand(7);
+			Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
+			Value *x = b.CreateExtractElement(xy, uint64_t(0)), *y = b.CreateExtractElement(xy, 1);
+			Value *slice = b.CreateUIToFP(c->getArgOperand(3), b.getFloatTy());
+			const bool zero = match(value, m_AnyZeroFP()), lod = level->isOne(), quads = k.getCallingConv() == CallingConv::AMDGPU_PS;
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4), *fl = b.getFloatTy();
+			Value *texel;
+			if (lod && !zero)
+				texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_sample_l_2darray, {v4f, fl, t->getType(), sm->getType()},
+				                          {b.getInt32(15), x, y, slice, value, t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			else if (!lod && !zero && quads)
+				texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_sample_b_2darray, {v4f, fl, fl, t->getType(), sm->getType()},
+				                          {b.getInt32(15), value, x, y, slice, t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			else if (!lod && quads)
+				texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_sample_2darray, {v4f, fl, t->getType(), sm->getType()},
+				                          {b.getInt32(15), x, y, slice, t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			else
+				texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_sample_lz_2darray, {v4f, fl, t->getType(), sm->getType()},
+				                          {b.getInt32(15), x, y, slice, t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			if (half)
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (tex.starts_with("read_texture_2d_array.v4f")) {
+			// (texture, uint2 or int2 coord, uint slice, uint lod, i32): kitty's glyph atlas read at the texel (2026-11-12).
+			const bool half = tex.starts_with("read_texture_2d_array.v4f16");
+			if (c->arg_size() < 4)
+				return f->getName().str() + " without a slice and a LOD is not known";
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(1), *lod = c->getArgOperand(3);
+			Value *x = b.CreateZExtOrTrunc(b.CreateExtractElement(xy, uint64_t(0)), b.getInt32Ty());
+			Value *y = b.CreateZExtOrTrunc(b.CreateExtractElement(xy, 1), b.getInt32Ty());
+			Value *slice = b.CreateZExtOrTrunc(c->getArgOperand(2), b.getInt32Ty());
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
+			Value *texel = match(lod, m_Zero())
+			                   ? b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2darray, {v4f, b.getInt32Ty(), t->getType()},
+			                                       {b.getInt32(15), x, y, slice, t, b.getInt32(0), b.getInt32(0)})
+			                   : b.CreateIntrinsic(Intrinsic::amdgcn_image_load_mip_2darray, {v4f, b.getInt32Ty(), t->getType()},
+			                                       {b.getInt32(15), x, y, slice, b.CreateZExtOrTrunc(lod, b.getInt32Ty()), t, b.getInt32(0), b.getInt32(0)});
+			if (half)
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
 		} else if (tex.starts_with("sample_texture_1d_array.v4f")) {
 			// (texture, sampler, float x, uint slice, i1, int offset, i1 level, float bias or LOD, float min LOD, i32): WindowServer's colour

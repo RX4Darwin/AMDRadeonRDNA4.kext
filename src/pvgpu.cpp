@@ -9,6 +9,7 @@
 #include "trial.hpp"
 #include "klog.hpp"
 #include "pvstream.hpp"
+#include <Headers/kern_patcher.hpp>
 #include "pvdraw.hpp"
 #include "pm4.hpp"
 #include "pvscanout.hpp"
@@ -162,6 +163,97 @@ void pvPause() {
 }
 #define PVCALL(name) do { static uint32_t calls_; if (__atomic_fetch_add(&calls_, 1u, __ATOMIC_RELAXED) < 3) { pvlog("call: %s", name); pvPause(); } } while (0)
 
+// rdna4-pvgl=1: OpenGL.framework (libGFXShared) loads a renderer for an accelerator only if it names one in IOGLBundleName, which Apple's
+// paravirtual accelerator does not: GL then has its software renderer alone. This names Apple's GL-on-Metal renderer
+// (AppleMetalOpenGLRenderer.bundle) on the accelerator when it is published. On its own it would abort every GL process (the renderer
+// asserts in GLDDeviceRec::initWithDisplayMask: the device's vendor "Apple" is none it knows on Intel) and the guest would refuse every
+// GL render pass (no supportsDefaultRasterSampleCount): routeGlPages patches the renderer for both, under the same boot-arg.
+static bool nameGlBundle(void *, void *, IOService *accel, IONotifier *) {
+	accel->setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer");
+	pvlog("OpenGL: IOGLBundleName AppleMetalOpenGLRenderer on %s (rdna4-pvgl)", accel->getName());
+	return true;
+}
+
+static void watchForGlAccelerator() {
+	uint32_t gl = 0;
+
+	if (!PE_parse_boot_argn("rdna4-pvgl", &gl, sizeof(gl)) || !gl)
+		return;
+
+	OSDictionary *match = IOService::serviceMatching("AppleParavirtAccelerator");
+	IONotifier *notifier = match ? IOService::addMatchingNotification(gIOFirstPublishNotification, match, nameGlBundle, nullptr) : nullptr;
+
+	OSSafeReleaseNULL(match);
+	if (!notifier)
+		pvlog("OpenGL: no notification for the paravirtual accelerator: IOGLBundleName not set");
+}
+
+// rdna4-pvgl=1, user space: AppleMetalOpenGLRenderer itself patched where its pages come in from disk (Lilu's user patcher does this no
+// more from Big Sur on: its isUserDisabled). The kernel's cs_validate_page (Tahoe 26.6.2: void (vnode, pager, page offset in the file,
+// data, int *validated, int *tainted, int *nx), the last on the stack) is wrapped; a page it validated at one of these offsets of the
+// renderer's universal file (x86_64 slice at 0x4000) whose bytes are exactly these gets the replacement, in the page every process maps.
+// - its vendor test (GLDDeviceRec::initWithDisplayMask: strstr(vendorName, "AMD" / "ATI" / "NVIDIA" / "Intel"), else "Unknown GPU!!"
+//   and an assertion): its "AMD" becomes "App", so the paravirtual device's "Apple" takes the AMD branch (in-process tests with the vendor
+//   renamed to "AMD" drew as the M5, 2026-11-11);
+// - its one setDefaultRasterSampleCount: call (GLDContextRec::buildRenderPassDescriptor) becomes a nop: the guest's serializer refuses
+//   every pass with one ("Does not support default raster sample count": Tahoe x86's AppleParavirtGPUMetal sets none of PGSerializer's
+//   features), and the renderer's passes always have a colour attachment.
+namespace {
+
+struct GlPagePatch {
+	uint64_t page;   // the page's offset in the file
+	uint32_t at, size;
+	const uint8_t *find, *replace;
+	const char *what;
+};
+
+const uint8_t kGlVendorFind[16] = {'E', 'R', '_', 'S', 'I', 'Z', 'E', 0, 'A', 'M', 'D', 0, 'A', 'T', 'I', 0};
+const uint8_t kGlVendorReplace[16] = {'E', 'R', '_', 'S', 'I', 'Z', 'E', 0, 'A', 'p', 'p', 0, 'A', 'T', 'I', 0};
+const uint8_t kGlRasterFind[10] = {0x48, 0x8b, 0x35, 0x4f, 0x54, 0x04, 0x00, 0x41, 0xff, 0xd6};      // movq sel(%rip), %rsi; callq *%r14
+const uint8_t kGlRasterReplace[10] = {0x48, 0x8b, 0x35, 0x4f, 0x54, 0x04, 0x00, 0x0f, 0x1f, 0x00};   // ...; nopl (%rax)
+
+const GlPagePatch kGlPagePatches[] = {
+	{0x5c000, 0x698, sizeof(kGlVendorFind), kGlVendorFind, kGlVendorReplace, "vendor test: \"AMD\" now \"App\""},
+	{0x2c000, 0x492, sizeof(kGlRasterFind), kGlRasterFind, kGlRasterReplace, "setDefaultRasterSampleCount: call now a nop"},
+};
+
+using ValidatePage = void (*)(void *vnode, void *pager, uint64_t offset, const void *data, int *validated, int *tainted, int *nx);
+mach_vm_address_t orgValidatePage;
+uint32_t glPagesPatched;
+
+// In the page-fault path: two compares for every other page; IOLog (the kernel's own) for the first few patches only.
+void wrapValidatePage(void *vnode, void *pager, uint64_t offset, const void *data, int *validated, int *tainted, int *nx) {
+	reinterpret_cast<ValidatePage>(orgValidatePage)(vnode, pager, offset, data, validated, tainted, nx);
+	if (!data || !validated || !*validated)
+		return;
+	for (const GlPagePatch &p : kGlPagePatches) {
+		auto *page = const_cast<uint8_t *>(static_cast<const uint8_t *>(data));
+
+		if (offset == p.page && !memcmp(page + p.at, p.find, p.size)) {
+			memcpy(page + p.at, p.replace, p.size);
+			if (__atomic_fetch_add(&glPagesPatched, 1u, __ATOMIC_RELAXED) < 8)
+				IOLog("AMDRadeonRDNA4: pvgpu: OpenGL: AppleMetalOpenGLRenderer page +0x%llx: %s\n", offset, p.what);
+		}
+	}
+}
+
+} // namespace
+
+void routeGlPagesNow(KernelPatcher &patcher) {
+	uint32_t gl = 0;
+
+	if (!PE_parse_boot_argn("rdna4-pvgl", &gl, sizeof(gl)) || !gl)
+		return;
+
+	KernelPatcher::RouteRequest request {"_cs_validate_page", wrapValidatePage, orgValidatePage};
+	const bool ok = patcher.routeMultiple(KernelPatcher::KernelID, &request, 1);
+
+	if (!ok)
+		patcher.clearError();
+	pvlog("OpenGL: cs_validate_page %s (rdna4-pvgl): AppleMetalOpenGLRenderer %s", ok ? "wrapped" : "NOT wrapped",
+	      ok ? "is patched where its pages come in" : "stays as it is");
+}
+
 // The PCI class code the nub reports (rdna4-pvgpu-class=<24 bits>, default 0x030000 = display controller). Apple's driver matches by IOPCIMatch alone.
 // On the rig AppleGPUWrangler took the nub with 0x030000 and with 0xff0000 alike (it follows the accelerator, not the class).
 uint32_t pvClass() {
@@ -252,12 +344,12 @@ private:
 	void dumpGuest(uint32_t task, uint64_t va, uint32_t len);
 	bool copyGuest(uint32_t task, uint64_t va, uint8_t *buf, uint32_t len, bool toGuest);
 	bool readGuest(uint32_t task, uint64_t va, uint8_t *dst, uint32_t len) { return copyGuest(task, va, dst, len, false); }
-	void decodeExec(uint32_t task, uint64_t va, uint64_t len);
+	void decodeExec(uint32_t task, const uint64_t (*chunks)[2], uint32_t count);
 	void dmaSelfTest();
 	bool functionOf(uint32_t task, uint32_t pipeline, char *name, size_t nameCap, uint8_t hash[32], uint64_t *lib);
 	bool functionName(uint32_t task, uint32_t fn, char *name, size_t nameCap, uint8_t hash[32], uint64_t *lib);
 	uint32_t resourceType(uint32_t task, uint32_t id, uint64_t *desc = nullptr, uint32_t *bytes = nullptr);
-	uint32_t load(const uint8_t *elf, uint32_t size, const char *name);
+	uint32_t load(const uint8_t *elf, uint32_t size, const char *name, uint64_t *launch = nullptr);
 	uint32_t program(unsigned kernel);
 	// Found by hash, name and, for a name not passed (empty), metallib: functions without a HASH tag share the all-zero hash, and once
 	// kernels were loaded a vertex function found a kernel's entry (windows were not drawn).
@@ -266,6 +358,7 @@ private:
 		char name[64];
 		uint64_t lib;
 		uint32_t program, buffers, written;   // a compute kernel loaded into the runtime
+		uint64_t launch[9];                   // and rtLoad's facts of it: [1] kernarg bytes, [3-5] rsrc1-3, [6] properties, [7] LDS, [8] code
 		uint32_t texturesWritten;             // bit i: it writes texture index i (include/rdna4mtlc.h)
 		uint8_t *gfx;                         // or a vertex or fragment shader: the helper's RGFX blob (air2amdgpu.cpp translateShader)
 		uint32_t gfxLen;
@@ -286,21 +379,24 @@ public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
 	uint32_t runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
 	uint32_t clearAttachment(uint32_t task, const uint8_t *p);
+	uint32_t viewParent(uint32_t task, uint32_t id);
 	struct Bindings { uint32_t buffer[RDNA4_MTLC_MAX_BUFFERS]; uint64_t offset[RDNA4_MTLC_MAX_BUFFERS]; uint32_t texture[16], sampler[16]; };   // by Metal index (0 = none)
 	// A draw: Metal's primitive type, first vertex, vertices (indices), instances, base instance, and for an indexed draw the index buffer's
 	// resource id, offset and index size (bytes; 0: not indexed).
-	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes, blendColor[4]; uint64_t viewport[4]; bool viewportSet;
+	struct Draw { uint32_t type, start, count, instances, baseInstance, indexBuffer, indexOffset, indexBytes, blendColor[4]; uint64_t viewport[6]; bool viewportSet;
 	              uint64_t scissor[4]; bool scissorSet; uint32_t attachments[8];   // the pass's colour attachments' textures
-	              uint32_t stencil, stencilState, stencilRef[2]; };   // the pass's stencil texture, setDepthStencilState, the front and back references
-	// Stencil attachments: on the card only (Metal's are private), 8 bits a pixel in the depth block's 64 KiB tiles (gfx12 addrlib: depth and
-	// stencil only SW_64KB_2D or SW_256KB_2D), one per task and texture. ponytail: 16 kept, the least used given up; a pass that loads one
-	// given up finds it cleared to 0.
-	struct StencilBuf { uint32_t task, tex, width, height; uint64_t handle, gpu, bytes, used; int32_t clear; };   // clear: pending value, or -1
+	              uint32_t stencil, stencilState, stencilRef[2], depth; };   // the pass's stencil texture, setDepthStencilState, the front and
+	                                                                        // back references, the pass's depth texture
+	// Stencil and depth attachments: on the card only (Metal's are private), 8 (stencil) or 32 (Depth32Float) bits a pixel in the depth
+	// block's 64 KiB tiles (gfx12 addrlib: depth and stencil only SW_64KB_2D or SW_256KB_2D), one per task, texture and kind (bytes a pixel:
+	// a Depth32Float_Stencil8 texture has both). ponytail: 16 kept, the least used given up; a pass that loads one given up finds it 0.
+	struct StencilBuf { uint32_t task, tex, bpp, width, height; uint64_t handle, gpu, bytes, used; int64_t clear; };   // clear: a pending
+	                                                                                                                    // 32-bit pattern, or -1
 	StencilBuf mStencil[16] = {};
 	uint64_t mStencilClock = 0;
-	void stencilPass(uint32_t task, uint32_t tex, uint32_t load, uint32_t value);
-	StencilBuf &stencilSlot(uint32_t task, uint32_t tex);
-	const StencilBuf *stencilFor(uint32_t task, uint32_t tex, uint32_t width, uint32_t height);
+	void stencilPass(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t load, uint32_t pattern);
+	StencilBuf &stencilSlot(uint32_t task, uint32_t tex, uint32_t bpp);
+	const StencilBuf *stencilFor(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t width, uint32_t height);
 	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *stage);
 	void runCompute(uint32_t task, uint32_t pipeline, const Bindings &bound, const uint64_t *size);
 	// staged: a runtime buffer or the pool; an IOSurface the kernel writes held (prepared) until its rows are written back into it
@@ -314,9 +410,14 @@ public:
 	                   bool writes, uint32_t texturesWritten = 0);
 	bool releaseTextures(uint32_t task, StagedTexture (&staged)[16], bool copyBack);
 	bool mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t &handle, uint64_t &gpu, bool write = false);
+	bool mapGuestPages(uint32_t task, uint64_t first, uint64_t count, bool write, uint64_t &handle, uint64_t &gpu);
+	IOBufferMemoryDescriptor *mHolePage { nullptr };   // what a window's pages that are not there are mapped to
+	uint64_t mHolePhys { 0 };
+	uint64_t mWindowPages[512] {};
 	bool mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 private:
 	struct Mapping;
+	Mapping *mapWindow(uint32_t task, uint64_t window);
 public:
 	bool mapPages(const uint64_t *pages, uint64_t count, uint64_t &handle, uint64_t &gpu, Mapping **entry = nullptr);
 	Mapping *keyedMapping(const void *memory, uint32_t task, uint64_t first, uint64_t count);
@@ -490,6 +591,8 @@ private:
 		uint64_t first { 0 }, gen { 0 };
 		bool keyed { false };
 		bool writable { false };   // a guest range whose pages the guest's table all lets the GPU write
+		bool window { false };     // mapWindow's: only the pages of `present` (and of `writes`, writable) are the guest's
+		uint64_t present[8] {}, writes[8] {};
 	};
 	// WindowServer uses well over 64 textures, targets and buffers a frame: the small ones pushed the large ones out, and each came back
 	// as thousands of pages mapped anew.
@@ -576,6 +679,18 @@ private:
 
 	bool batchDraw(const uint32_t *ib, uint32_t dwords, uint32_t task, uint32_t target);
 	void flushBatch();
+	// Dispatches put into the batch too (GL's fixIndexBuffer before nearly every draw of kitty's: each its own submit and wait on the compute
+	// queue took 42 us of the host's thread). Their kernargs in a slot per batch entry, free again with the batch's fence; what they write
+	// noted until the batch is waited for, so that the CPU (copyGuest) and the compute queue do not read or write it before.
+	static constexpr uint32_t kDispatchArgs = 256;
+	GfxBuffers mDispatchArgs {};
+	struct RingWrite { uint32_t task; uint64_t va, len; };
+	static constexpr uint32_t kRingWrites = 32;
+	RingWrite mRingWrites[kRingWrites] {};
+	uint32_t mRingWriteCount { 0 };
+	bool batchDispatch(const Jit &j, const uint8_t *args, uint32_t argBytes, const uint32_t groups[3], const uint32_t groupSize[3]);
+	void noteRingWrite(uint32_t task, uint64_t va, uint64_t len);
+	bool ringWritten(uint32_t task, uint64_t va, uint64_t len) const;
 	uint32_t takeSlot();
 	GfxBuffers mTimes {};   // rdna4_pvprofile's slots
 	uint64_t mDmaFence[kDmaSlots] {};
@@ -804,6 +919,7 @@ private:
 		char name[3][64] {};
 		uint8_t hash[3][32] {};
 		uint64_t lib[3] {}, used { 0 };
+		uint64_t gen { 0 };   // the task's page table (mPtGen) when its functions were last looked for
 	};
 	static constexpr uint32_t kPipelines = 256;   // also those scanPipelines reads ahead for the other clients
 	PipelineInfo mPipelines[kPipelines];
@@ -1575,13 +1691,28 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 		if (c.id == 0x37 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4) {
 			copy(at, mWin, c.length);
 			uint32_t task;
-			memcpy(&task, mWin + c.payloadOffset, 4);   // ExecIndirect {u32 task, u32 n, n resource entries, u64 gpu va, u64 length} (measured 2026-10-21)
-			// the command buffer: the last two qwords of the payload, {u64 gpu va, u64 length}
+			memcpy(&task, mWin + c.payloadOffset, 4);
+			// ExecIndirect {u32 task, u32 invalidates, u32 chunks, invalidates x 24 bytes, chunks x {u64 gpu va, u64 length}}
+			// (AppleParavirtCommandQueue::processExecIndirect, Tahoe 26.6.2): a command buffer the guest's AppleParavirtCommandBuffer split
+			// ("adding another exec": kitty's, 2026-11-12) comes in several chunks, decoded in order as one. If the counts do not
+			// account for the payload, the last two qwords, as measured with one chunk on 2026-10-21.
 			const uint32_t plen = c.length - c.payloadOffset;
 			if (plen >= 24) {
-				uint64_t va, len;
-				memcpy(&va, mWin + c.payloadOffset + plen - 16, 8);
-				memcpy(&len, mWin + c.payloadOffset + plen - 8, 8);
+				static constexpr uint32_t kMaxChunks = 64;
+				uint32_t counts[2] = {};
+				uint64_t chunks[kMaxChunks][2];
+				uint32_t n = 0;
+
+				memcpy(counts, mWin + c.payloadOffset + 4, 8);
+				if (counts[1] && counts[1] <= kMaxChunks && counts[0] <= 1024 && 12 + 24ull * counts[0] + 16ull * counts[1] == plen) {
+					memcpy(chunks, mWin + c.payloadOffset + 12 + 24 * counts[0], 16 * counts[1]);
+					n = counts[1];
+				} else {
+					memcpy(chunks[0], mWin + c.payloadOffset + plen - 16, 16);
+					n = 1;
+				}
+				if (gTalk && n > 1)
+					pvlog("host: %s: command buffer of task %u in %u chunks", src.tag, task, n);
 
 				if (gTalk)
 					pvlog("host: %s: command buffer of task %u, signal %u", src.tag, task, c.signal);
@@ -1592,7 +1723,7 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 				mExecTag = src.tag;
 				mExecPayloadDwords = plen / 4 < 128 ? plen / 4 : 128;
 				memcpy(mExecPayload, mWin + c.payloadOffset, mExecPayloadDwords * 4);
-				decodeExec(task, va, len);
+				decodeExec(task, chunks, n);
 			}
 		}
 		if (c.id == 0x39 && c.length <= sizeof(mWin) && c.length - c.payloadOffset >= 4 && mDumped[0x39] < 16) {
@@ -1745,6 +1876,7 @@ IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 // The draws in flight waited for: what they read and write is the guest's again, their slots and the pool free once readyDraws runs.
 void RDNA4PvHost::waitDraws(uint32_t line)
 {
+	mRingWriteCount = 0;   // waited for below (a failed wait too: ponytail)
 	flushBatch();
 
 	static constexpr uint32_t kBatchWait = 50;    // ms: a draw takes the card 6 ms at most
@@ -2139,6 +2271,93 @@ void RDNA4PvHost::flushBatch()
 			dirtied(dirty[i] >> 16, dirty[i] & 0xffff, fence);
 }
 
+// A dispatch of a translated kernel put into the batch (false: the runtime's own dispatch takes it). After it the compute work is waited
+// for and the shader caches dropped, so that the draws after it read what it wrote (GL's fixed indices).
+bool RDNA4PvHost::batchDispatch(const Jit &j, const uint8_t *args, uint32_t argBytes, const uint32_t groups[3], const uint32_t groupSize[3])
+{
+	static constexpr uint32_t kMaxDwords = 64;
+	static constexpr uint32_t kCsPartialFlush = 7 | 4u << 8;   // EVENT_WRITE CS_PARTIAL_FLUSH, EVENT_INDEX 4
+	static constexpr uint32_t kGcrShaderCaches = 1u << 7 | 1u << 8 | 1u << 9;   // GCR_CNTL: GLK, GLV and GL1 invalidated
+	const uint64_t *l = j.launch;
+	const uint32_t rsrc2 = static_cast<uint32_t>(l[4]);
+	const uint32_t bytes = (static_cast<uint32_t>(l[1] > argBytes ? l[1] : argBytes) + 3) & ~3u;
+	uint64_t cpu = 0;
+
+	// what only the runtime's dispatch does goes to it: scratch (RSRC2 bit 0), user SGPRs other than the kernarg pointer, LDS beyond a group's
+	if ((gInPlace & 512) || profiling() || !mBatchIb.cpu || !l[8] || (rsrc2 & 1) || (rsrc2 >> 1 & 31) != 2 || bytes > kDispatchArgs || l[7] > 65536)
+		return false;
+
+	if (!mDispatchArgs.handle && gCompute->rtAllocHost(this, kernel_task, kDispatchArgs * kBatchDraws * kBatchSlots, 0, mDispatchArgs.handle,
+	                                                   mDispatchArgs.gpu, cpu) == kIOReturnSuccess)
+		mDispatchArgs.cpu = reinterpret_cast<uint8_t *>(cpu);
+
+	if (!mDispatchArgs.cpu)
+		return false;
+
+	if (mBatchDraws == kBatchDraws || (mBatchDwords + kMaxDwords) * 4 > kBatchBytes)
+		flushBatch();
+
+	const uint32_t slot = mBatchSlot % kBatchSlots;
+
+	if (!mBatchDraws && mBatchFence[slot] && !gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(mBatchFence[slot])))
+		waitFor(mBatchFence[slot]);   // the slot's IB and kernargs still read by the card
+
+	const uint64_t at = static_cast<uint64_t>(slot * kBatchDraws + mBatchDraws) * kDispatchArgs;
+
+	memset(mDispatchArgs.cpu + at, 0, bytes);   // zero up to the kernel's size (hidden arguments), as the runtime's dispatch
+	memcpy(mDispatchArgs.cpu + at, args, argBytes);
+
+	const uint64_t argsGpu = mDispatchArgs.gpu + at;
+	const uint32_t zero = 0, all[2] = {0xffffffffu, 0xffffffffu}, none4[4] = {}, start[3] = {};
+	const uint32_t pgm[2] = {static_cast<uint32_t>(l[8] >> 8), static_cast<uint32_t>(l[8] >> 40)};
+	const uint32_t rsrc[3] = {static_cast<uint32_t>(l[3]), (rsrc2 & ~GfxReg::kRsrc2LdsMask) | GfxReg::ldsSizeField(static_cast<uint32_t>(l[7])),
+	                          static_cast<uint32_t>(l[5])};
+	const uint32_t user[2] = {static_cast<uint32_t>(argsGpu), static_cast<uint32_t>(argsGpu >> 32)};
+	uint32_t ib[kMaxDwords], n = 0;
+
+	// as scaleFrame's (the runtime's launch's), with its end
+	n += Pm4::acquireMem(ib + n, Pm4::kGcrMemSync);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_PGM_LO, pgm, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_PGM_RSRC1, rsrc, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_PGM_RSRC3, &rsrc[2], 1);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_RESOURCE_LIM, &zero, 1);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_TMPRING, &zero, 1);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE0, all, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE2, all, 2);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_THREAD_SE4, none4, 4);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_START_X, start, 3);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_NUM_THREAD_X, groupSize, 3);
+	n += Pm4::setShReg(ib + n, RDNA4_PM4_COMPUTE_USER_DATA0, user, 2);
+	n += Pm4::dispatchDirect(ib + n, groups[0], groups[1], groups[2],
+	                         Pm4::kDispatchShaderEn | Pm4::kDispatchForceStart0 | (l[6] & (1u << 10) ? Pm4::kDispatchWave32 : 0));
+	n += Pm4::eventWrite(ib + n, kCsPartialFlush);
+	n += Pm4::acquireMem(ib + n, kGcrShaderCaches);
+
+	return batchDraw(ib, n, 0, 0);
+}
+
+// A range a dispatch in the batch writes (a buffer whole: GL's index ring is written at another offset by each).
+void RDNA4PvHost::noteRingWrite(uint32_t task, uint64_t va, uint64_t len)
+{
+	for (uint32_t i = 0; i < mRingWriteCount; i++)
+		if (mRingWrites[i].task == task && mRingWrites[i].va == va && mRingWrites[i].len == len)
+			return;
+
+	if (mRingWriteCount == kRingWrites)
+		waitDraws();   // clears them
+
+	mRingWrites[mRingWriteCount++] = {task, va, len};
+}
+
+bool RDNA4PvHost::ringWritten(uint32_t task, uint64_t va, uint64_t len) const
+{
+	for (uint32_t i = 0; i < mRingWriteCount; i++)
+		if (mRingWrites[i].task == task && va < mRingWrites[i].va + mRingWrites[i].len && mRingWrites[i].va < va + len)
+			return true;
+
+	return false;
+}
+
 // M1: a command's payload as dwords (up to 32), to work its layout out against what the guest asked for (tools/metal/m1/mtlprobe.m).
 void RDNA4PvHost::dumpPayload(const char *tag, const pvstream::FifoCommand &c, const uint8_t *cmd) {
 	const uint32_t bytes = c.length - c.payloadOffset, words = bytes / 4 < 32 ? bytes / 4 : 32;
@@ -2254,6 +2473,9 @@ void RDNA4PvHost::dumpGuest(uint32_t task, uint64_t va, uint32_t len) {
 // M1: [va, va + len) of a task's GPU address space, page by page through its page table, copied out (or, for writeGuest, in); false at the first
 // page that is not mapped.
 bool RDNA4PvHost::copyGuest(uint32_t task, uint64_t va, uint8_t *buf, uint32_t len, bool toGuest) {
+	if (mRingWriteCount && ringWritten(task, va, len))   // a dispatch in the batch writes it: done first
+		waitDraws();
+
 	while (len) {
 		const uint32_t off = static_cast<uint32_t>(va & 0xfff);
 		const uint32_t take = len < 0x1000 - off ? len : 0x1000 - off;
@@ -2290,11 +2512,12 @@ struct ExecTally {
 	uint32_t attachments[8];            // Render: all eight colour attachments' textures (writeDescriptor; 0 = none)
 	RDNA4PvHost::Bindings stage[2];     // Render.setVertexBuffers, setFragmentBuffers
 	uint32_t blendColor[4];             // Render.setBlendColorRed: four floats' bits
-	uint64_t viewport[4];               // Render.setViewport: originX, originY, width, height as doubles' bits (znear, zfar not used)
+	uint64_t viewport[6];               // Render.setViewport: originX, originY, width, height, znear, zfar as doubles' bits
 	bool viewportSet;                   // since the encoder began (writeDescriptor); else the whole target
 	uint64_t scissor[4];                // Render.setScissorRect: x, y, width, height in pixels
 	bool scissorSet;                    // as viewportSet
 	uint32_t stencil, stencilState, stencilRef[2];   // Render: the pass's stencil texture, setDepthStencilState, setStencilFrontReferenceValue
+	uint32_t depth;                     // Render: the pass's depth texture
 	RDNA4PvHost::Bindings compute;      // Compute.setBuffers
 };
 // The bytes of the draws execSink runs, by command (0: not a draw it runs).
@@ -2327,20 +2550,25 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		t->host->runBlit(t->task, id, payload, bytes);
 	else if (id == 0x01a) {
 		t->target = t->host->runRenderPass(t->task, payload, bytes);
-		for (uint32_t k = 0; k < 8; k++)   // {u32 texture, ...} 0x3c apart from 0x4c (logPassDescriptor)
-			if (0x4c + 0x3c * k + 4 <= bytes)
+		for (uint32_t k = 0; k < 8; k++)   // {u32 texture, ...} 0x3c apart from 0x4c (logPassDescriptor); a plain view's own texture
+			if (0x4c + 0x3c * k + 4 <= bytes) {
 				memcpy(&t->attachments[k], payload + 0x4c + 0x3c * k, 4);
-			else
+				t->attachments[k] = t->host->viewParent(t->task, t->attachments[k]);
+			} else
 				t->attachments[k] = 0;
 		t->viewportSet = false;
 		t->scissorSet = false;
 
 		// the stencil attachment {u32 texture at +0x28, u16 load action at +0x3c, u32 clear value at +0x44} (AppleParavirtGPUMetal's
-		// PGSerializerRenderCommandEncoder, Tahoe 26.6.2: the depth attachment the same from +0 with a double clear value)
-		uint16_t load = 0;
+		// PGSerializerRenderCommandEncoder, Tahoe 26.6.2), the depth attachment the same from +0 with a double clear value
+		uint16_t load = 0, depthLoad = 0;
 		uint32_t clear = 0;
-		t->stencil = 0;
+		uint64_t depthClear = 0;
+		t->stencil = t->depth = 0;
 		if (bytes >= 0x48) {
+			memcpy(&t->depth, payload, 4);
+			memcpy(&depthLoad, payload + 0x14, 2);
+			memcpy(&depthClear, payload + 0x1c, 8);
 			memcpy(&t->stencil, payload + 0x28, 4);
 			memcpy(&load, payload + 0x3c, 2);
 			memcpy(&clear, payload + 0x44, 4);
@@ -2348,7 +2576,15 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		t->stencilState = 0;
 		t->stencilRef[0] = t->stencilRef[1] = 0;
 		if (t->stencil)
-			t->host->stencilPass(t->task, t->stencil, load, clear);
+			t->host->stencilPass(t->task, t->stencil, 1, load, (clear & 0xff) * 0x01010101u);
+		if (t->depth)
+			t->host->stencilPass(t->task, t->depth, 4, depthLoad, doubleAsFloat(depthClear));
+
+		static uint32_t depthLines;
+
+		if (t->depth && depthLines++ < 8)
+			pvstat("host: render: task %u: a pass with depth texture %u, load action %u, clear 0x%08x", t->task, t->depth, depthLoad,
+			       doubleAsFloat(depthClear));
 	}
 	else if (id == 0x068 && bytes >= 4)   // Render.setDepthStencilState {u32 state id}
 		memcpy(&t->stencilState, payload, 4);
@@ -2434,6 +2670,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		d.scissorSet = t->scissorSet;
 		d.stencil = t->stencil;
 		d.stencilState = t->stencilState;
+		d.depth = t->depth;
 		memcpy(d.stencilRef, t->stencilRef, sizeof(d.stencilRef));
 		const uint64_t start = nowNs();
 		t->host->runDraw(t->task, t->target, t->renderPipeline, d, t->stage);
@@ -2449,11 +2686,14 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			memcpy(&g.buffer[first + k], payload + 8 + 12 * k, 4);
 			memcpy(&g.offset[first + k], payload + 12 + 12 * k, 8);
 		}
-	} else if (id == 0x082 && bytes >= 32) {   // Render.setViewport {double originX, originY, width, height, znear, zfar}
-		memcpy(t->viewport, payload, sizeof(t->viewport));
+	} else if ((id == 0x082 && bytes >= 48) || (id == 0x083 && bytes >= 4 + 48 && payload[0])) {
+		// Render.setViewport {double originX, originY, width, height, znear, zfar}; setViewports {u32 count, count x the same}: its first
+		// (AppleMetalOpenGLRenderer's, height negative: GL's y up)
+		memcpy(t->viewport, payload + (id == 0x083 ? 4 : 0), sizeof(t->viewport));
 		t->viewportSet = true;
-	} else if (id == 0x075 && bytes >= 32) {   // Render.setScissorRect {u64 x, y, width, height}
-		memcpy(t->scissor, payload, sizeof(t->scissor));
+	} else if ((id == 0x075 && bytes >= 32) || (id == 0x076 && bytes >= 8 + 32 && payload[0])) {
+		// Render.setScissorRect {u64 x, y, width, height}; setScissorRects {u64 count, count x the same}: its first
+		memcpy(t->scissor, payload + (id == 0x076 ? 8 : 0), sizeof(t->scissor));
 		t->scissorSet = true;
 	} else if (id == 0x065 && bytes >= 16) {   // Render.setBlendColorRed {float red, green, blue, alpha}
 		memcpy(t->blendColor, payload, 16);
@@ -2501,43 +2741,54 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 
 // M1: one command buffer of an ExecIndirect, decoded: segments {u32 length, u8 type, u8 continuation, u8 flags, u8 0}, in them stream commands
 // {u32 id, u32 size} + payload (docs/m1-stream.md section 4; the framing and the ids measured against tools/metal/m1/mtlprobe.m on the rig, 2026-10-21).
-void RDNA4PvHost::decodeExec(uint32_t task, uint64_t va, uint64_t len) {
-	static constexpr uint32_t kMaxRead = 1u << 20;   // 64 KiB dropped one of Maps' command buffers (72 KiB) whole
-	const uint32_t n = len < kMaxRead ? static_cast<uint32_t>(len) : kMaxRead;
-	auto *buf = static_cast<uint8_t *>(IOMalloc(n ? n : 1));
-	if (!buf)
-		return;
-	if (!readGuest(task, va, buf, n)) {
-		pvlog("host: stream: task %u command buffer at 0x%llx (%llu bytes) is not mapped", task, va, len);
-		IOFree(buf, n ? n : 1);
-		return;
-	}
-	ExecTally t {};
+void RDNA4PvHost::decodeExec(uint32_t task, const uint64_t (*chunks)[2], uint32_t count) {
+	ExecTally t {};   // one for all the chunks: an encoder may go on in the next
 	t.host = this;
 	t.task = task;
 	t.listing = mListed[task & 63] < 2 && ++mListed[task & 63];
-	uint32_t at = 0, segments = 0, undecoded = 0;
-	while (at + 8 <= n) {
-		uint32_t slen;
-		memcpy(&slen, buf + at, 4);
-		const uint8_t type = buf[at + 4];
-		if (slen < 8 || slen > n - at) {
-			undecoded = n - at;
-			pvlog("host:   stream: segment framing breaks at +0x%x (length %u)", at, slen);
-			break;
+	for (uint32_t c = 0; c < count; c++) {
+		const uint64_t va = chunks[c][0], len = chunks[c][1];
+		static constexpr uint32_t kMaxRead = 1u << 20;   // 64 KiB dropped one of Maps' command buffers (72 KiB) whole
+		const uint32_t n = len < kMaxRead ? static_cast<uint32_t>(len) : kMaxRead;
+		auto *buf = static_cast<uint8_t *>(IOMalloc(n ? n : 1));
+		if (!buf)
+			return;
+		if (!readGuest(task, va, buf, n)) {
+			pvlog("host: stream: task %u command buffer at 0x%llx (%llu bytes) is not mapped", task, va, len);
+			IOFree(buf, n ? n : 1);
+			return;
 		}
-		segments++;
-		t.segment = pvstream::segmentTypeName(type);
-		if (type != 5) {   // 5: the protection-options envelope, a raw u64
-			const size_t ok = pvstream::walkCommands(buf + at + 8, slen - 8, false, execSink, &t);
-			undecoded += slen - 8 - static_cast<uint32_t>(ok);
+		uint32_t at = 0, segments = 0, undecoded = 0;
+		while (at + 8 <= n) {
+			uint32_t slen;
+			memcpy(&slen, buf + at, 4);
+			const uint8_t type = buf[at + 4];
+			if (slen < 8 || slen > n - at) {
+				undecoded = n - at;
+				pvlog("host:   stream: segment framing breaks at +0x%x (length %u)", at, slen);
+				break;
+			}
+			segments++;
+			t.segment = pvstream::segmentTypeName(type);
+			if (type != 5) {   // 5: the protection-options envelope, a raw u64
+				const size_t ok = pvstream::walkCommands(buf + at + 8, slen - 8, false,
+				    [](void *user, uint32_t id, const char *name, const uint8_t *p, uint32_t bytes, size_t offset) {
+					    execSink(user, id, name, p, bytes, offset);
+					    RDNA4PvHost *host = static_cast<ExecTally *>(user)->host;
+					    // a VBL due while a long command buffer is worked through raised now, as between FIFO commands (consume): kitty's
+					    // ran 50 ms, and the VBLs came 11 ms late on average while it scrolled, WindowServer's frames with them
+					    if (host->mVblSoonest && nowNs() >= host->mVblSoonest)
+						    host->pollDisplay();
+				    }, &t);
+				undecoded += slen - 8 - static_cast<uint32_t>(ok);
+			}
+			at += slen;
 		}
-		at += slen;
+		pvlog("host: stream: task %u command buffer at 0x%llx, %llu bytes: %u segment(s), %u command(s), %u unknown, %u byte(s) undecoded%s", task, va, len,
+		      segments, t.commands, t.unknown, undecoded, len > n ? " (only the first 1 MiB read)" : "");
+		IOFree(buf, n ? n : 1);
 	}
 	flushHeld();   // the guest reads what the command buffer drew once its stamp completes
-	pvlog("host: stream: task %u command buffer at 0x%llx, %llu bytes: %u segment(s), %u command(s), %u unknown, %u byte(s) undecoded%s", task, va, len,
-	      segments, t.commands, t.unknown, undecoded, len > n ? " (only the first 1 MiB read)" : "");
-	IOFree(buf, n ? n : 1);
 }
 
 // M2: a buffer's GPU range, from the task's resource heap (SetResourceHeap: first 1 MiB at VA 0x1000; measured on the rig, 2026-10-21): 12-byte records
@@ -2669,6 +2920,7 @@ static const TextureFormat *textureFormat(uint32_t metal) {
 	                                     {80, 42, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4}, {81, 66, 6 | 5 << 3 | 4 << 6 | 7 << 9, 4},    // BGRA8 unorm, sRGB
 	                                     {55, 22, 4 | 0 << 3 | 0 << 6 | 1 << 9, 4}, {115, 57, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},   // R32Float, RGBA16Float
 	                                     {125, 63, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16},                                             // RGBA32Float
+	                                     {110, 51, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},                                              // RGBA16 unorm
 	                                     {1, 1, 4 << 9, 1}, {10, 1, 4 | 1 << 9, 1}, {11, 64, 4 | 1 << 9, 1},         // A8, R8 unorm, sRGB
 	                                     {30, 14, 4 | 5 << 3 | 1 << 9, 2}, {31, 65, 4 | 5 << 3 | 1 << 9, 2},                      // RG8 unorm, sRGB
 	                                     {20, 7, 4 | 1 << 9, 2}, {25, 13, 4 | 1 << 9, 2},                                          // R16 unorm, float
@@ -2786,13 +3038,50 @@ static void logPassDescriptor(const uint8_t *p, uint32_t bytes)
 		pvlog("host: render: pass descriptor%s", line);
 }
 
-// One colour attachment of a pass (p: the descriptor, offset by 0x3c per attachment): its load action carried out. Its texture.
+// A render target that is a plain view of another texture (a heap type 8 or 27 record of kind 8, textureSource: level 0, slice 0, no
+// swizzle, the format its texture has): that texture, which the draws and clears then write; else the target itself. AppleMetalOpenGLRenderer
+// draws into a BGRA8 view of its drawable's IOSurface (Mixxx's waveforms, 2026-11-12).
+uint32_t RDNA4PvHost::viewParent(uint32_t task, uint32_t id) {
+	uint32_t rec[3], v[11] = {}, prec[3], d[14] = {};
+
+	if (!id || !readRec(task, id, rec) || ((rec[0] & 0xff) != 8 && (rec[0] & 0xff) != 27) || (rec[0] >> 8) < sizeof(v) ||
+	    !readDesc(task, rec, v, sizeof(v)) || v[0] != 8 || v[5] || v[6] || v[9] || v[10] || !v[3] || v[3] == id || !readRec(task, v[3], prec))
+		return id;
+
+	const uint32_t parent = v[3], format = v[4] & 0xffff;
+	uint32_t parentFormat = 0;
+
+	if ((prec[0] & 0xff) == 5 && (prec[0] >> 8) >= sizeof(d) && readDesc(task, prec, d, sizeof(d)))
+		parentFormat = d[5] >> 16;
+	else if ((prec[0] & 0xff) == 2 || (prec[0] & 0xff) == 3) {
+		uint64_t va = 0, len = 0;
+		uint32_t bpr = 0, w = 0, h = 0;
+
+		(void)textureRange(task, parent, &va, &len, &bpr, &w, &h, &parentFormat);
+	}
+
+	// the same bytes: the format itself, or BGRA8 over its sRGB form (80, 81)
+	const bool same = format && (format == parentFormat || (format == 80 && parentFormat == 81) || (format == 81 && parentFormat == 80));
+
+	if (!same && gTalk) {
+		static uint32_t lines;
+
+		if (lines++ < 8)
+			pvlog("host: render: target %u, a view of %u (format %u): its texture is of type %u, %u bytes, format %u: not drawn into", id, parent,
+			      format, prec[0] & 0xff, prec[0] >> 8, parentFormat);
+	}
+	return same ? parent : id;
+}
+
+// One colour attachment of a pass (p: the descriptor, offset by 0x3c per attachment): its load action carried out. Its texture (a plain
+// view's own: viewParent).
 uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 	if (!gCompute)
 		return 0;
 	uint32_t tex, actions;
 	uint64_t rgba[4];   // the clear colour as IEEE-754 doubles, converted with integers only (no floating point in the kernel)
 	memcpy(&tex, p + 0x4c, 4);
+	tex = viewParent(task, tex);
 	memcpy(&actions, p + 0x60, 4);
 	memcpy(rgba, p + 0x68, sizeof(rgba));
 
@@ -2820,7 +3109,7 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 	const TextureFormat *fm = textureFormat(format);
 	const uint32_t tp = fm ? fm->bpp : 4;
 	const bool drawable = found && bpr && !(bpr % tp) && h && static_cast<uint64_t>(bpr) * h <= len &&
-	                      (format == 70 || format == 71 || format == 80 || format == 81 || format == 115 || format == 65 || format == 10 ||
+	                      (format == 70 || format == 71 || format == 80 || format == 81 || format == 115 || format == 110 || format == 65 || format == 10 ||
 	                       format == 25 || format == 90 || (!format && w * 4 == bpr));
 	const bool swap = format != 70 && format != 71;   // BGRA8 (and of unknown format, as before)
 	const bool byHeld = drawable && (bpr % 128);   // cleared in a held shadow: the texture's own held target stays, cleared
@@ -2955,20 +3244,20 @@ uint32_t RDNA4PvHost::idleBarrier(uint32_t *out)
 
 // A texture's `bytes` at `gpu` filled with `pattern` by the card, left in flight like a draw into it (task << 16 | tex among the draws
 // in flight: a CPU copy of it waits). False if the IB does not hold it or the buffers are not made yet.
-// A render pass with a stencil attachment: its load action (0 don't care, 1 load, 2 clear) noted for its buffer on the card, filled with
-// the value before the pass's first draw (stencilFor: its size is the target's, known then). Don't care: cleared to 0 as well.
-void RDNA4PvHost::stencilPass(uint32_t task, uint32_t tex, uint32_t load, uint32_t value) {
+// A render pass with a stencil or depth attachment: its load action (0 don't care, 1 load, 2 clear) noted for its buffer on the card, filled
+// with the clear value's pattern before the pass's first draw (stencilFor: its size is the target's, known then). Don't care: 0 as well.
+void RDNA4PvHost::stencilPass(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t load, uint32_t pattern) {
 	if (load != 1)
-		stencilSlot(task, tex).clear = load == 2 ? static_cast<int32_t>(value & 0xff) : 0;
+		stencilSlot(task, tex, bpp).clear = load == 2 ? pattern : 0;
 }
 
 // A task's texture's slot: its own, else the least used given up for it, without memory until a draw gives it a size, to be cleared to 0
 // (what a pass that loads finds in a buffer it never had).
-RDNA4PvHost::StencilBuf &RDNA4PvHost::stencilSlot(uint32_t task, uint32_t tex) {
+RDNA4PvHost::StencilBuf &RDNA4PvHost::stencilSlot(uint32_t task, uint32_t tex, uint32_t bpp) {
 	StencilBuf *slot = &mStencil[0];
 
 	for (StencilBuf &s : mStencil)
-		if (s.task == task && s.tex == tex && (s.handle || s.clear >= 0))
+		if (s.task == task && s.tex == tex && s.bpp == bpp && (s.handle || s.clear >= 0))
 			return s;
 	for (StencilBuf &s : mStencil)
 		slot = s.used < slot->used ? &s : slot;
@@ -2976,14 +3265,15 @@ RDNA4PvHost::StencilBuf &RDNA4PvHost::stencilSlot(uint32_t task, uint32_t tex) {
 		waitDraws();   // draws in flight may use it
 		gCompute->rtFree(this, slot->handle);
 	}
-	*slot = {task, tex, 0, 0, 0, 0, 0, ++mStencilClock, 0};
+	*slot = {task, tex, bpp, 0, 0, 0, 0, 0, ++mStencilClock, 0};
 
 	return *slot;
 }
 
-// The stencil buffer of a task's texture for a target of width x height: made (or remade larger) on the card, its pending clear done.
-const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t tex, uint32_t width, uint32_t height) {
-	StencilBuf *slot = &stencilSlot(task, tex);
+// The stencil or depth buffer of a task's texture for a target of width x height: made (or remade larger) on the card, its pending clear
+// done.
+const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t width, uint32_t height) {
+	StencilBuf *slot = &stencilSlot(task, tex, bpp);
 
 	slot->used = ++mStencilClock;
 
@@ -2995,7 +3285,7 @@ const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t t
 		}
 		slot->width = width > slot->width ? width : slot->width;
 		slot->height = height > slot->height ? height : slot->height;
-		slot->bytes = static_cast<uint64_t>((slot->width + 255) & ~255u) * ((slot->height + 255) & ~255u);   // whole 256x256 tiles
+		slot->bytes = static_cast<uint64_t>((slot->width + 255) & ~255u) * ((slot->height + 255) & ~255u) * bpp;   // whole 256x256 pixels
 		slot->handle = 0;
 		if (gCompute->rtAlloc(this, slot->bytes, slot->handle, slot->gpu) != kIOReturnSuccess) {
 			*slot = {};
@@ -3003,7 +3293,7 @@ const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t t
 		}
 	}
 	if (slot->clear >= 0) {   // one value everywhere: the tiling does not matter
-		if (!clearOnCard(task, tex, slot->gpu, slot->bytes, static_cast<uint32_t>(slot->clear) * 0x01010101u))
+		if (!clearOnCard(task, tex, slot->gpu, slot->bytes, static_cast<uint32_t>(slot->clear)))
 			return nullptr;
 		slot->clear = -1;
 	}
@@ -3619,10 +3909,12 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			continue;
 		}
 
-		// A 1D array (WindowServer's colour lookup tables) staged as a 3D image's slices are, sampled through a 1D-array T#.
+		// A 1D array (WindowServer's colour lookup tables) staged as a 3D image's slices are, sampled through a 1D-array T#; a 2D array
+		// (kitty's glyph atlas, through AppleMetalOpenGLRenderer) the same way through a 2D-array T#.
 		const bool array1d = ok && src.slices > 1 && src.depth == 1 && src.height == 1 && src.sliceBytes;
+		const bool array2d = ok && src.slices > 1 && src.depth == 1 && src.height > 1 && src.sliceBytes;
 
-		if (array1d) {
+		if (array1d || array2d) {
 			src.depth = src.slices;
 			src.imageBytes = src.sliceBytes;
 		}
@@ -3687,6 +3979,8 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 
 			if (array1d)
 				linearArray1d(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, depth);
+			else if (array2d)
+				linearArray2d(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 			else if (depth > 1)
 				linearVolume(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 			else
@@ -3772,6 +4066,8 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		}
 		if (array1d)
 			linearArray1d(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, depth);
+		else if (array2d)
+			linearArray2d(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 		else if (depth > 1)
 			linearVolume(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 		else
@@ -4425,11 +4721,98 @@ void RDNA4PvHost::flushHeld(HeldTarget &h)
 // With `write`, only a range the guest's table lets the GPU write: the card writes what is mapped so (a render target, a clear), and an
 // app could otherwise have it write a file it may only read, mapped into a buffer without a copy.
 bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t &handle, uint64_t &gpu, bool write) {
-	const uint64_t first = va & ~0xfffull, count = (va + bytes + 0xfff - first) >> 12;
+	// A small buffer found in the mapping of its 2 MiB window of the guest's space, made once for all buffers in it (mapWindow): GL gives
+	// each of kitty's draws an index buffer of its own, 4 KiB at a new address, and those were 91000 new mappings in 5 s of scrolling,
+	// the cache (256) finding none of them again.
+	static constexpr uint64_t kWindow = 2ull << 20;
+	const uint64_t window = va & ~(kWindow - 1);
 
+	if (bytes && bytes <= kWindow / 4 && va + bytes <= window + kWindow) {
+		Mapping *m = keyedMapping(nullptr, task, window, kWindow >> 12);
+
+		if (!m)
+			m = mapWindow(task, window);
+
+		bool covered = m != nullptr;
+
+		for (uint64_t p = (va - window) >> 12; covered && p <= (va + bytes - 1 - window) >> 12; p++)
+			covered = m->window ? (m->present[p / 64] >> (p % 64) & 1) && (!write || (m->writes[p / 64] >> (p % 64) & 1))
+			                    : !write || m->writable;
+
+		if (covered) {
+			handle = 0;
+			gpu = m->gpu + (va - window);
+			return true;
+		}
+	}
+
+	const uint64_t first = va & ~0xfffull;
+
+	if (!mapGuestPages(task, first, (va + bytes + 0xfff - first) >> 12, write, handle, gpu))
+		return false;
+
+	gpu += va & 0xfff;
+	return true;
+}
+
+// The 512 pages of a task's 2 MiB window mapped and cached, those the guest's table does not hold mapped to a spare page; which are the
+// guest's (and writable) noted. A page that comes later is a change of the table: the mapping is not found again then (mPtGen).
+RDNA4PvHost::Mapping *RDNA4PvHost::mapWindow(uint32_t task, uint64_t window)
+{
+	static constexpr uint32_t kPages = 512;
+
+	if (!mHolePage) {   // ponytail: kept for the boot, as the host
+		mHolePage = IOBufferMemoryDescriptor::withCapacity(4096, kIODirectionInOut, true);
+		if (mHolePage && mHolePage->prepare() == kIOReturnSuccess)
+			mHolePhys = mHolePage->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+	}
+
+	// a window lies in one leaf table (1024 pages: 4 MiB)
+	const unsigned index[3] = {0, static_cast<unsigned>(window >> 32) & 1023, static_cast<unsigned>(window >> 22) & 1023};
+	uint32_t pfn = mTaskRoot[task & 63];
+
+	for (unsigned level = 0; level < 3 && pfn; level++)
+		pfn = tableEntry(pfn, index[level]);
+
+	if (!mHolePhys || !pfn || pfn >= (1u << 28))
+		return nullptr;
+
+	IOMemoryMap *map;
+	const auto *entry = reinterpret_cast<const volatile uint32_t *>(physBytes(static_cast<uint64_t>(pfn) << 12, 0x1000, false, map));
+	uint64_t present[8] = {}, writes[8] = {};
+	uint32_t there = 0;
+
+	for (uint32_t i = 0; entry && i < kPages; i++) {
+		const uint32_t pte = entry[((window >> 12) & 1023) + i];
+		const uint64_t page = static_cast<uint64_t>(pte & 0x0fffffffu) << 12;
+
+		mWindowPages[i] = page ? page : mHolePhys;
+		present[i / 64] |= static_cast<uint64_t>(page != 0) << (i % 64);
+		writes[i / 64] |= static_cast<uint64_t>(page && (pte & 0x80000000u)) << (i % 64);
+		there += page != 0;
+	}
+
+	OSSafeReleaseNULL(map);
+
+	uint64_t handle = 0, gpu = 0;
+	Mapping *m = nullptr;
+
+	if (!there || !mapPages(mWindowPages, kPages, handle, gpu, &m) || !m)
+		return nullptr;
+
+	keyMapping(m, nullptr, task, window);
+	m->window = true;
+	memcpy(m->present, present, sizeof(present));
+	memcpy(m->writes, writes, sizeof(writes));
+
+	return m->keyed ? m : nullptr;
+}
+
+// `count` pages of a task's space from `first`, from the cache or mapped and cached; `gpu` the first page's address.
+bool RDNA4PvHost::mapGuestPages(uint32_t task, uint64_t first, uint64_t count, bool write, uint64_t &handle, uint64_t &gpu) {
 	if (const Mapping *m = keyedMapping(nullptr, task, first, count)) {
 		handle = 0;
-		gpu = m->gpu + (va & 0xfff);
+		gpu = m->gpu;
 
 		return !write || m->writable;
 	}
@@ -4445,7 +4828,6 @@ bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t 
 		entry->writable = writable;
 	if (pages)
 		IOFree(pages, count * 8);
-	gpu += ok ? va & 0xfff : 0;
 
 	return ok;
 }
@@ -4909,6 +5291,19 @@ const RDNA4PvHost::PipelineInfo &RDNA4PvHost::pipelineInfo(uint32_t task, uint32
 		if (same) {
 			e.used = ++mPipelineClock;
 
+			// a function not named when the pipeline was first read looked for again once the task's page table has changed: kitty's
+			// first (Op.newFunctionWithIR's metallib) was not mapped yet when its first draw came, and every draw of the pipeline after
+			// was refused, the window dark until others drew over it
+			if (e.gen != mPtGen[task & 63]) {
+				for (unsigned k = 1; k <= 2; k++)
+					if (e.fn[k] && !e.named[k] && functionName(task, e.fn[k], e.name[k], sizeof(e.name[k]), e.hash[k], &e.lib[k])) {
+						e.named[k] = true;
+						pvstat("host: render: task %u pipeline %u's %s function %u named on a later look: \"%s\"", task, pipeline,
+						       k == 1 ? "vertex" : "fragment", e.fn[k], e.name[k]);
+					}
+
+				e.gen = mPtGen[task & 63];
+			}
 			return e;
 		}
 
@@ -4929,6 +5324,7 @@ const RDNA4PvHost::PipelineInfo &RDNA4PvHost::pipelineInfo(uint32_t task, uint32
 	memcpy(e.pd, pd, sizeof(pd));
 	memcpy(e.fnRec, fnRec, sizeof(fnRec));
 	memcpy(e.fn, fn, sizeof(fn));
+	e.gen = mPtGen[task & 63];
 
 	static uint32_t keyLines;
 
@@ -5085,10 +5481,27 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		if (!head || head[1] != k || head[2] > room || head[2] + 32 > shader[k]->gfxLen) {
 			why = k == 1 ? "no translated vertex shader" : "no translated fragment shader";
 
-			if (mShaderLines++ < 32)
-				pvstat("host: render: task %u pipeline %u's %s function \"%s\" (named %u, hash %02x%02x%02x%02x): %s", task, pipeline, k == 1 ? "vertex" : "fragment",
-				       name[k], pi.named[k], pi.hash[k][0], pi.hash[k][1], pi.hash[k][2], pi.hash[k][3],
+			if (mShaderLines++ < 32 || gTalk)   // also while every draw is logged (debug.rdna4_pvtalk): the boot's 32 go early
+			{
+				uint64_t fd[8] = {};
+				uint32_t fbytes = 0;
+				const uint32_t ftype = pi.named[k] ? 6 : resourceType(task, fn[k], fd, &fbytes);   // unnamed: what its resource is
+				// Apple's host (ParavirtualizedGraphics, PGResourceManager::createObject<MTLFunction>) reads a function's record as {u64 data
+				// address, u32 bytes, operation header {u32 0xf, u32 size}, ...} and makes a library of the data (newLibraryWithData): what is there
+				uint32_t w[8] = {};
+				const uint32_t len = static_cast<uint32_t>(fd[1]);
+				const bool read = !pi.named[k] && readGuest(task, fd[0], reinterpret_cast<uint8_t *>(w), sizeof(w));
+
+				if (!pi.named[k])
+					pvstat("host: render:   its data at 0x%llx, %u bytes: %s %08x %08x %08x %08x %08x %08x %08x %08x; pages %x %x", static_cast<unsigned long long>(fd[0]),
+					       len, read ? "read" : "NOT readable", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], guestPfn(task, fd[0]), guestPfn(task, fd[0] + len - 1));
+
+				pvstat("host: render: task %u pipeline %u's %s function \"%s\" (named %u, hash %02x%02x%02x%02x; resource %u of type %u, %u bytes: "
+				       "%016llx %016llx %016llx %016llx): %s", task, pipeline, k == 1 ? "vertex" : "fragment", name[k], pi.named[k], pi.hash[k][0],
+				       pi.hash[k][1], pi.hash[k][2], pi.hash[k][3], fn[k], ftype, fbytes, static_cast<unsigned long long>(fd[0]),
+				       static_cast<unsigned long long>(fd[1]), static_cast<unsigned long long>(fd[2]), static_cast<unsigned long long>(fd[3]),
 				       !shader[k] ? "no translation" : !head ? "a kernel, not a shader" : "its RGFX header does not fit");
+			}
 		}
 	}
 	// The values between the stages: after each shader's code its table {u32 name hash, u32 flags (bit 0 flat)}, the vertex function's
@@ -5147,7 +5560,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// RGBA8 (70, 71) as BGRA8, but already in the staged target's order; RGBA16Float (115: CoreAnimation renders symbols into it) as
 	// itself, 8 bytes a pixel.
 	// 65: RG16Float; 10: R8Unorm, 25: R16Float, 90: RGB10A2Unorm (CoreAnimation's masks and icons on Tahoe)
-	const auto known = [](uint32_t f) { return f == 10 || f == 25 || f == 65 || f == 70 || f == 71 || f == 80 || f == 81 || f == 90 || f == 115; };
+	// 110: RGBA16Unorm (kitty's offscreen target through AppleMetalOpenGLRenderer, 2026-11-12)
+	const auto known = [](uint32_t f) { return f == 10 || f == 25 || f == 65 || f == 70 || f == 71 || f == 80 || f == 81 || f == 90 || f == 110 || f == 115; };
 	const auto pixelBytes = [](uint32_t f) { const TextureFormat *fm = textureFormat(f); return fm ? fm->bpp : 4; };
 	uint32_t storage = 0;
 	const bool found = !why && textureRange(task, target, &va, &len, &bpr, &width, &texHeight, &targetFormat, &storage) && width;
@@ -5179,7 +5593,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		if (!resourceType(task, target))
 			logFreedTexture(task, target);
 
-		if (refusedTargets++ < 8) {
+		if (refusedTargets++ < 8 || gTalk) {   // the same
 			Surface seen;   // its own: surfaceRange retains what it finds, and `surface` may hold one already
 
 			pvlog("host: render: colour attachment %u (resource type %u, IOSurface format %u): format %u, %ux%u, %u bytes per row, %llu bytes: "
@@ -5196,11 +5610,12 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 					      d[i + 11], d[i + 12], d[i + 13], d[i + 14], d[i + 15]);
 		}
 	}
-	// The viewport: Render.setViewport's, else the whole target; whole pixels only so far (window = origin + (ndc + 1) * size / 2, y down).
+	// The viewport: Render.setViewport's, else the whole target; whole pixels only so far (window = origin + (ndc + 1) * size / 2, y down;
+	// a negative height flips y).
 	int64_t vx = 0, vy = 0, vw = width, vh = height;
 	if (!why && draw.viewportSet &&
 	    !(wholeDouble(draw.viewport[0], vx) && wholeDouble(draw.viewport[1], vy) && wholeDouble(draw.viewport[2], vw) && wholeDouble(draw.viewport[3], vh) &&
-	      vw > 0 && vh > 0 && vw <= 32768 && vh <= 32768 && vx > -32768 && vx < 32768 && vy > -32768 && vy < 32768))
+	      vw > 0 && vh != 0 && vw <= 32768 && vh >= -32768 && vh <= 32768 && vx > -32768 && vx < 32768 && vy > -32768 && vy < 32768))
 		why = "a viewport not in whole pixels, or too large (so far)";
 	if (why) {
 		noteNotRun(why, name[2]);
@@ -5346,7 +5761,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x95, (sx2 - 1) | (sy2 - 1) << 16},
 		{0x69, 0x10f, halfAsFloat(static_cast<uint32_t>(vw), false)},     // PA_CL_VPORT_XSCALE: width / 2
 		{0x69, 0x110, halfAsFloat(2 * vx + vw)},                            // XOFFSET: originX + width / 2
-		{0x69, 0x111, halfAsFloat(static_cast<uint32_t>(vh), true)},      // YSCALE: -height / 2 (Metal's y points up)
+		{0x69, 0x111, halfAsFloat(-vh)},                                    // YSCALE: -height / 2 (Metal's y points up)
 		{0x69, 0x112, halfAsFloat(2 * vy + vh)},                            // YOFFSET: originY + height / 2
 		{0x79, 0x242, kPrimitive[draw.type][0]},                           // VGT_PRIMITIVE_TYPE
 		{0x79, 0x266, kPrimitive[draw.type][1]},                           // VGT_GS_OUT_PRIM_TYPE
@@ -5498,7 +5913,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// draw VGT_INDEX_TYPE (SET_UCONFIG_REG_INDEX, as RADV on gfx9+); per instance the first vertex and the instance id (USER_DATA_GS_2/3, the
 	// vertex shader's s10-s11) and the draw: DRAW_INDEX_AUTO, or DRAW_INDEX_2 from the staged indices (DI_SRC_SEL_DMA).
 	const uint64_t table[2] = {miscGpu + 0x400, miscGpu + 0x800};
-	uint32_t seq[8 + 6 + 2 + 16 + 3 + 3 + 9 + 2 * 12 + 28], m = 0;
+	uint32_t seq[8 + 6 + 2 + 16 + 3 + 3 + 9 + 2 * 12 + 28 + 11], m = 0;
 	auto put = [&](uint32_t v) { seq[m++] = v; };
 
 	// The stencil test: the pass's stencil attachment, the depth-stencil state's front and back {u32 compare | ops, u32 read mask, u32 write
@@ -5506,13 +5921,18 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// depth write 3, front 4, back 5, front, back}; the dword: compare 0-2, stencil fail 3-5, depth fail 6-8, pass 9-11, as Metal's
 	// MTLStencilDescriptor). Metal's compare functions are the hardware's; its operations keep, zero, replace, increment clamp, decrement
 	// clamp, invert, increment wrap, decrement wrap are STENCIL_KEEP, ZERO, REPLACE_TEST, ADD_CLAMP, SUB_CLAMP, INVERT, ADD_WRAP, SUB_WRAP
-	// (gfx12.json; DB_STENCIL_OPVAL 1 from the template). Depth is not drawn (Z_INVALID).
+	// (gfx12.json; DB_STENCIL_OPVAL 1 from the template). The depth test: the pass's depth attachment (Depth32Float: Z_32_FLOAT), the
+	// state's compare function (ZFUNC, the hardware's too) and write; then Metal's depth range: clip space z in 0..w (DX_CLIP_SPACE_DEF),
+	// z = znear + ndc z * (zfar - znear) (the template's is GL's 0.5 + 0.5 z), clamped to 0..1 (PA_SC_VPORT_ZMIN_0, ZMAX_0).
 	uint32_t ds[10] = {}, dsRec[3] = {};
-	const bool stencilled = ok && draw.stencil && draw.stencilState && readRec(task, draw.stencilState, dsRec) && (dsRec[0] & 0xff) == 7 &&
-	                        (dsRec[0] >> 8) >= sizeof(ds) && readDesc(task, dsRec, ds, sizeof(ds)) && ds[0] == 4 && (ds[3] & 0x30);
-	const StencilBuf *sb = stencilled ? stencilFor(task, draw.stencil, width, height) : nullptr;
+	const bool dsKnown = ok && (draw.stencil || draw.depth) && draw.stencilState && readRec(task, draw.stencilState, dsRec) &&
+	                     (dsRec[0] & 0xff) == 7 && (dsRec[0] >> 8) >= sizeof(ds) && readDesc(task, dsRec, ds, sizeof(ds)) && ds[0] == 4;
+	const bool stencilled = dsKnown && draw.stencil && (ds[3] & 0x30);
+	const bool depthTested = dsKnown && draw.depth && ((ds[3] & 7) != 7 || (ds[3] & 8));   // compare always, no write: nothing to do
+	const StencilBuf *sb = stencilled ? stencilFor(task, draw.stencil, 1, width, height) : nullptr;
+	const StencilBuf *zb = depthTested ? stencilFor(task, draw.depth, 4, width, height) : nullptr;
 
-	if (sb) {
+	if (sb || zb) {
 		static const uint8_t kOp[8] = {0, 1, 3, 5, 6, 7, 8, 9};
 		const uint32_t keep[3] = {7, 0xff, 0xff};   // a face without a descriptor: always passes, keeps
 		const uint32_t *face[2] = {ds[3] & 0x10 ? &ds[4] : keep, ds[3] & 0x20 ? &ds[7] : keep};
@@ -5525,28 +5945,48 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		put(0xc00b6900u);   // DB_DEPTH_SIZE_XY, DB_Z_INFO, DB_STENCIL_INFO, the Z and stencil read and write bases (256-byte units)
 		put(0x005);
 		put((width - 1) | (height - 1) << 16);
-		put(0);                                   // Z_INVALID
-		put(1 | 3u << 4 | 1u << 29);              // STENCIL_8, SW_64KB_2D, TILE_STENCIL_DISABLE
-		for (uint32_t k = 0; k < 2; k++) {
-			put(0);
-			put(0);
+		put(zb ? 3 | 3u << 4 : 0);                // Z_32_FLOAT, SW_64KB_2D; else Z_INVALID
+		put(sb ? 1 | 3u << 4 | 1u << 29 : 0);     // STENCIL_8, SW_64KB_2D, TILE_STENCIL_DISABLE; else STENCIL_INVALID
+		const StencilBuf *bases[4] = {zb, zb, sb, sb};   // Z read and write bases, stencil read and write bases
+		for (const StencilBuf *b : bases) {
+			put(b ? static_cast<uint32_t>(b->gpu >> 8) : 0);
+			put(b ? static_cast<uint32_t>(b->gpu >> 40) : 0);
 		}
-		for (uint32_t k = 0; k < 2; k++) {
-			put(static_cast<uint32_t>(sb->gpu >> 8));
-			put(static_cast<uint32_t>(sb->gpu >> 40));
-		}
-		put(0xc0026900u);   // DB_DEPTH_CONTROL: STENCIL_ENABLE, BACKFACE_ENABLE, the functions; DB_STENCIL_CONTROL: the operations
+		put(0xc0026900u);   // DB_DEPTH_CONTROL: STENCIL_ENABLE, BACKFACE_ENABLE, the functions, Z_ENABLE, Z_WRITE_ENABLE, ZFUNC; DB_STENCIL_CONTROL
 		put(0x01c);
-		put(1 | 1u << 7 | (face[0][0] & 7) << 8 | (face[1][0] & 7) << 20);
-		put(ops(face[0][0]) | ops(face[1][0]) << 12);
-		put(0xc0046900u);   // DB_STENCIL_REF, DB_STENCIL_OPVAL, DB_STENCIL_READ_MASK, DB_STENCIL_WRITE_MASK: front in 0-7, back in 8-15
-		put(0x022);
-		put((draw.stencilRef[0] & 0xff) | (draw.stencilRef[1] & 0xff) << 8);
-		put(0x101);
-		put((face[0][1] & 0xff) | (face[1][1] & 0xff) << 8);
-		put((face[0][2] & 0xff) | (face[1][2] & 0xff) << 8);
+		put((sb ? 1 | 1u << 7 | (face[0][0] & 7) << 8 | (face[1][0] & 7) << 20 : 0) | (zb ? 2u | (ds[3] & 8 ? 4u : 0u) | (ds[3] & 7) << 4 : 0u));
+		put(sb ? ops(face[0][0]) | ops(face[1][0]) << 12 : 0u);
+		if (sb) {
+			put(0xc0046900u);   // DB_STENCIL_REF, DB_STENCIL_OPVAL, DB_STENCIL_READ_MASK, DB_STENCIL_WRITE_MASK: front in 0-7, back in 8-15
+			put(0x022);
+			put((draw.stencilRef[0] & 0xff) | (draw.stencilRef[1] & 0xff) << 8);
+			put(0x101);
+			put((face[0][1] & 0xff) | (face[1][1] & 0xff) << 8);
+			put((face[0][2] & 0xff) | (face[1][2] & 0xff) << 8);
+		}
 	}
-	static uint32_t stencilLines;
+	if (zb) {
+		// znear 0 or zfar 0 (Metal's default 0..1 and its reverse); ponytail: other ranges as 0..1 (no floating point here to subtract)
+		const uint64_t zn = draw.viewportSet ? draw.viewport[4] : 0, zf = draw.viewportSet ? draw.viewport[5] : 0x3ff0000000000000ull;
+		const bool nearZero = !(zn << 1), farZero = !(zf << 1);
+
+		put(0xc0026900u);   // PA_CL_VPORT_ZSCALE, ZOFFSET
+		put(0x113);
+		put(nearZero ? doubleAsFloat(zf) : farZero ? doubleAsFloat(zn) ^ 0x80000000u : 0x3f800000u);
+		put(nearZero || farZero ? doubleAsFloat(zn) : 0);
+		put(0xc0026900u);   // PA_SC_VPORT_ZMIN_0, ZMAX_0
+		put(0x115);
+		put(0);
+		put(0x3f800000u);
+		put(0xc0016900u);   // PA_CL_CLIP_CNTL: the template's DX_LINEAR_ATTR_CLIP_ENA, and DX_CLIP_SPACE_DEF
+		put(0x204);
+		put(1u << 24 | 1u << 19);
+	}
+	static uint32_t stencilLines, depthLines;
+	if (draw.depth && depthLines++ < 12)
+		pvstat("host: render: task %u pipeline %u: depth texture %u, state %u (%08x %08x), viewport z 0x%llx 0x%llx: %s", task, pipeline,
+		       draw.depth, draw.stencilState, ds[0], ds[3], static_cast<unsigned long long>(draw.viewport[4]),
+		       static_cast<unsigned long long>(draw.viewport[5]), zb ? "tested" : depthTested ? "NO depth buffer" : "not tested");
 	if (draw.stencil && stencilLines++ < 24)
 		pvstat("host: render: task %u pipeline %u: stencil texture %u, state %u (%08x %08x %08x %08x %08x %08x %08x), references %u %u: %s",
 		       task, pipeline, draw.stencil, draw.stencilState, ds[0], ds[3], ds[4], ds[5], ds[6], ds[7], ds[8], draw.stencilRef[0],
@@ -5864,6 +6304,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 // M2: an SDMA fill (srcVa 0: `pattern`) or copy (from srcVa) over `bytes` of a task's GPU address space, page by page through its page table, the CPU
 // caches flushed before and after each piece (the engine does not snoop them).
 bool RDNA4PvHost::dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes) {
+	if (mRingWriteCount)   // another engine: not after what dispatches in the batch write
+		waitDraws();
+
 	while (bytes) {
 		uint64_t n = 0x1000 - (dstVa & 0xfff);
 		if (srcVa && 0x1000 - (srcVa & 0xfff) < n)
@@ -6332,7 +6775,7 @@ bool RDNA4PvHost::functionName(uint32_t task, uint32_t fn, char *name, size_t na
 }
 
 // A code object loaded into the card's runtime: its program, or 0.
-uint32_t RDNA4PvHost::load(const uint8_t *elf, uint32_t size, const char *name) {
+uint32_t RDNA4PvHost::load(const uint8_t *elf, uint32_t size, const char *name, uint64_t *launch) {
 	if (!gCompute)
 		return 0;
 	if (!mRtOpen)
@@ -6342,6 +6785,8 @@ uint32_t RDNA4PvHost::load(const uint8_t *elf, uint32_t size, const char *name) 
 	uint64_t out[9] = {};
 	const bool ok = mRtOpen && gCompute->rtLoad(this, kernel_task, reinterpret_cast<mach_vm_address_t>(elf), size, name, out) == kIOReturnSuccess;
 	pvlog("host: compute: %s %s (program 0x%llx)", name, ok ? "loaded into the runtime" : "did NOT load", out[0]);
+	if (launch)
+		memcpy(launch, out, sizeof(out));
 	return ok ? static_cast<uint32_t>(out[0]) : 0;
 }
 
@@ -6458,7 +6903,8 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	j.helper = gTr.helpers;
 	j.used = mJitClock;
 	const bool shader = elf && elfLen >= 32 && !memcmp(elf, "RGFX", 4);
-	j.program = elf && !shader && buffers <= 8 ? load(elf, elfLen, name) : 0;
+	memset(j.launch, 0, sizeof(j.launch));
+	j.program = elf && !shader && buffers <= 8 ? load(elf, elfLen, name, j.launch) : 0;
 	j.buffers = buffers;
 	j.written = written;
 	j.texturesWritten = texturesWritten;
@@ -6516,13 +6962,15 @@ void RDNA4PvHost::describeRenderPipeline(uint32_t task, uint32_t pipeline) {
 
 // M3: Compute.dispatchThreads (size: threads in the grid[3], threads per threadgroup[3]), run on the card with the function translated
 // AIR -> gfx1201 (at run time by the helper, or ahead of time into src/mtlkernels.h by tools/metal/m3). Each bound buffer, from its offset
-// to its end, is copied into a runtime buffer, the kernel dispatched, and the buffers it writes copied back into the guest's pages.
+// to its end, is mapped for the card in place (as a draw's: mapGuest, the whole buffer, found again in the cache), the ones it writes only
+// where the guest's table lets the GPU write. Copied into runtime buffers and the written ones back, GL's fixIndexBuffer (before nearly every
+// draw of kitty's) took 0.17 ms a dispatch; mapped from the offset on, nearly every dispatch made a new mapping.
 void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &bound, const uint64_t *size) {
 	mMapFloor = mMapClock;
 
 	const uint32_t *buffer = bound.buffer;
 	const uint64_t *offset = bound.offset;
-	static constexpr uint64_t kMaxBuffer = 64ull << 20;   // ponytail: staged through one kernel allocation; map the guest pages if bigger is needed
+	static constexpr uint64_t kMaxBuffer = 64ull << 20;   // as a draw's buffers
 	char name[64];
 	uint8_t hash[32];
 	uint64_t lib = 0;
@@ -6534,7 +6982,8 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	// The kernel: translated now by the helper, else (no helper) from the table of src/mtlkernels.h by name.
 	uint32_t prog = 0, nb = 0, written = 0, texturesWritten = 0;
 	const char *from = "translated at run time";
-	if (const Jit *j = translated(task, lib, name, hash)) {
+	const Jit *j = translated(task, lib, name, hash);
+	if (j) {
 		prog = j->program;
 		nb = j->buffers;
 		written = j->written;
@@ -6558,7 +7007,11 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		pvlog("host: compute: no kernel for it (or the dispatch is out of range): not run");
 		return;
 	}
-	uint64_t handle[8] = {}, gpu[8] = {}, va[8] = {}, bytes[8] = {}, most = 0;
+	mBuilding = true;   // the mappings it uses, kept until the batch it may go into is done (markUsed)
+	mUsedMapCount = mUsedShadowCount = 0;
+	mUsedChunks = 0;
+	mBuildSlot = ~0u;
+	uint64_t handle[8] = {}, gpu[8] = {}, va[8] = {}, bytes[8] = {};
 	for (unsigned b = 0; b < nb && ok; b++) {
 		uint64_t len = 0;
 
@@ -6568,16 +7021,12 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 			gpu[b] = mGfxSpare.gpu;
 			continue;
 		}
-		ok = bufferRange(task, buffer[b], &va[b], &len) && offset[b] < len && len - offset[b] <= kMaxBuffer;
+		ok = bufferRange(task, buffer[b], &va[b], &len) && offset[b] < len && len <= kMaxBuffer &&
+		     mapGuest(task, va[b], len, handle[b], gpu[b], written >> b & 1);
 		va[b] += offset[b];
+		gpu[b] += offset[b];
 		bytes[b] = len - offset[b];
-		most = bytes[b] > most ? bytes[b] : most;
 	}
-	auto *stage = ok && most ? static_cast<uint8_t *>(IOMalloc(most)) : nullptr;
-	ok = ok && (!most || stage);   // a kernel of textures only has no buffers to stage
-	for (unsigned b = 0; b < nb && ok; b++)
-		ok = !buffer[b] || (gCompute->rtAlloc(this, bytes[b], handle[b], gpu[b]) == kIOReturnSuccess && readGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b])) &&
-		     gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], true) == kIOReturnSuccess);
 	// The kernel's textures and samplers in a table of their own (air2amdgpu.cpp: its address follows the dimensions in the kernargs).
 	StagedTexture staged[16] = {};
 	uint64_t tableHandle = 0, tableGpu = 0;
@@ -6598,6 +7047,7 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		waitDraws();
 	}
 	uint64_t micros = 0;
+	bool batched = false;
 
 	// A kernel that faulted once is not run again: each fault resets the address space's waves, and the draws after it hung one by one
 	// (VideoToolbox's VTMTSComputeFunction for System Settings' thumbnails: the mouse stood still).
@@ -6622,21 +7072,29 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 		memcpy(d.kernargs + 8 * nb, dims, sizeof(dims));
 		memcpy(d.kernargs + 8 * nb + sizeof(dims), &tableGpu, 8);   // 0 without textures (the table's kernels ignore it)
 		d.kernargBytes = 8 * nb + sizeof(dims) + 8;
-		ok = gCompute->rtDispatch(this, d, micros) == kIOReturnSuccess;
+		batched = !textures && j && batchDispatch(*j, d.kernargs, d.kernargBytes, d.groups, d.groupSize);
+
+		if (batched) {
+			markUsed(mSubmits + 1, mDrawSerial + 1);
+		} else {
+			if (mRingWriteCount)   // the compute queue does not wait for the batch
+				waitDraws();
+			ok = gCompute->rtDispatch(this, d, micros) == kIOReturnSuccess;
+		}
 
 		if (!ok && prog && mFaultedCount < kFaulted) {
 			mFaulted[mFaultedCount++] = prog;
 			pvstat("host: compute: \"%s\" did not finish: not run again this boot", name);
 		}
 	}
-	for (unsigned b = 0; b < nb && ok; b++) {
-		if (!(written & (1u << b)) || !buffer[b])
-			continue;
-
-		ok = gCompute->rtCopy(this, handle[b], 0, kernel_task, reinterpret_cast<mach_vm_address_t>(stage), bytes[b], false) == kIOReturnSuccess &&
-		     copyGuest(task, va[b], stage, static_cast<uint32_t>(bytes[b]), true);
-		dropShadowRange(task, va[b], bytes[b]);
-	}
+	if (!batched)
+		mBuilding = false;
+	for (unsigned b = 0; b < nb && ok; b++)
+		if (written >> b & 1 && buffer[b]) {
+			if (batched)
+				noteRingWrite(task, va[b] - offset[b], bytes[b] + offset[b]);
+			dropShadowRange(task, va[b], bytes[b]);
+		}
 	for (unsigned b = 0; b < nb; b++)
 		if (handle[b])
 			gCompute->rtFree(this, handle[b]);
@@ -6657,8 +7115,6 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	}
 	if (tableHandle)
 		gCompute->rtFree(this, tableHandle);
-	if (stage)
-		IOFree(stage, most);
 	pvlog("host: compute: %s on the card (%s): %s (%llu us)", name, from, ok ? "done" : "NOT done", micros);
 }
 
@@ -8417,6 +8873,7 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 
 	nub->registerService();
 	pvlog("registerService returned");
+	watchForGlAccelerator();
 	pvPause();
 	pvlog("fake Apple paravirtual GPU published under %s: PCI %04x:%04x, BAR0 %u bytes of RAM (control block at +0x%x), level %u; IOPCIDevice is %zu bytes here (header %zu)",
 	      parent->getName(), kVendor, kDevice, kBar0Size, kCtrl, level, realSize, sizeof(IOPCIDevice));
@@ -9046,3 +9503,5 @@ IOReturn pvTranslatorClient(IOService *service, task_t owningTask, void *securit
 	*handler = client;
 	return kIOReturnSuccess;
 }
+
+void pvgpu::routeGlPages(KernelPatcher &patcher) { routeGlPagesNow(patcher); }

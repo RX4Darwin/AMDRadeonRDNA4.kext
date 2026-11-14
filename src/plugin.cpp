@@ -1494,6 +1494,7 @@ void pluginStart() {
 		if (base && max)
 			RDNA4PvNub::setPhysmap(*base, *max);
 		FBLOG("pvgpu: physmap %s", base && max ? "found" : "NOT found: guest memory through mappings of each page");
+		pvgpu::routeGlPages(patcher);
 #endif
 	});
 	if ((gLateNdrv = thread_call_allocate(lateNdrvCheck, nullptr))) {   // ponytail: never freed, it lives for the boot
