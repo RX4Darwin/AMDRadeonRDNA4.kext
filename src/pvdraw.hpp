@@ -43,7 +43,8 @@ static inline uint32_t doubleAsHalf(uint64_t bits) {
 // A colour target's CB_COLOR0_INFO by its Metal pixel format (gfx12.json: FORMAT 0-4, NUMBER_TYPE 8-10, COMP_SWAP 11-12, BLEND_CLAMP 15,
 // BLEND_BYPASS 16, SIMPLE_FLOAT 17; as Mesa's ac_formats.c maps them): 16_16_16_16 float, 16_16 float, 8 unorm, 16 float, 2_10_10_10 unorm,
 // 32_32 uint and sint; else
-// 8_8_8_8 unorm, with COMP_SWAP ALT when BGRA8 is drawn as the guest has it (`swap`).
+// 8_8_8_8 unorm, with COMP_SWAP ALT when BGRA8 is drawn as the guest has it (`swap`), and NUMBER_SRGB (6) for RGBA8 and BGRA8 sRGB: the
+// hardware encodes the shader's linear colour as Metal does (unencoded, the Sequoia wallpaper came out dark and dull, 2026-11-14).
 static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	switch (format) {
 	case 115: return 0x0002070cu;   // RGBA16Float
@@ -54,7 +55,7 @@ static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	case 90: return 0x00020009u;    // RGB10A2Unorm
 	case 103: return 0x0003040bu;   // RG32Uint: 32_32 UINT, BLEND_BYPASS as Mesa's for integers (WindowServer's brim_init_lpf, Tahoe)
 	case 104: return 0x0003050bu;   // RG32Sint
-	default: return swap ? 0x0002880au : 0x0002800au;
+	default: return (swap ? 0x0002880au : 0x0002800au) | (format == 71 || format == 81 ? 6u << 8 : 0u);
 	}
 }
 

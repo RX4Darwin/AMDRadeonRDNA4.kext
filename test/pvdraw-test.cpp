@@ -128,6 +128,7 @@ int main() {
 		CHECK(clearPattern(103, seven, p) && p == 7 && clearPattern(104, minus, p) && p == 0xfffffffdu && !clearPattern(103, minus, p) && !clearPattern(103, c, p));
 		CHECK(colourInfo(65, true) == 0x00020705u && colourInfo(80, true) == 0x0002880au && colourInfo(0, false) == 0x0002800au);
 		CHECK(colourInfo(103, false) == 0x0003040bu && colourInfo(104, true) == 0x0003050bu);   // RG32Uint, RG32Sint: 32_32, BLEND_BYPASS
+		CHECK(colourInfo(81, true) == 0x00028e0au && colourInfo(71, false) == 0x0002860au);   // BGRA8 and RGBA8 sRGB: NUMBER_SRGB
 	}
 	// linearImage: a 64x32 RGBA8 image at a 64-pixel pitch.
 	{

@@ -44,6 +44,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - The translator takes `air.simdgroup.barrier` (a SIMD group is one wave: a fence at the wave's scope); CoreImage's
   4:2:0 kernels were not translated without it. Card (2026-11-14): a kernel reading its neighbour's threadgroup memory
   after the barrier, 4096 of 4096 right.
+- sRGB colour targets (BGRA8 and RGBA8 sRGB) are written as sRGB: the hardware encodes the shader's linear colour, as
+  Metal does; unencoded, the Sequoia wallpaper came out dark and dull. Card (2026-11-14): its colours as Apple's.
 
 ## 0.2.1 (2026-11-14)
 
