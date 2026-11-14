@@ -18,6 +18,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
   A monitor's mode that is half of a scaled size above it is kept: 2560x1440 had gone beside 5120x2880, and macOS's
   1280x720 HiDPI with it. Card (Tahoe 26.6.2, 2026-11-14, Samsung 4K on DP): 2560x1440 and 1280x720 HiDPI listed,
   switched to 2560x1440 (measured 59.955 Hz) and back to 3840x2160.
+- At most 15 modes are offered: macOS reads 4 blocks of the EDID the guest makes from them (5 modes a block) and lists
+  only those; 17 were sent on the card and the last two (720x480, 640x480) never listed.
+
+**Metal (`make PVGPU=1`)**
+- A mip level whose rows are not 128 bytes apart is sampled from its copy on the card (the one the pass that drew it
+  left) instead of the level before: on most sizes WindowServer's glass blurs read level 0, and with Liquid Glass
+  tinted the sidebar's colour flickered as a window was dragged. Card (Tahoe 26.6.2, 2026-11-14): mipprobe at 200x200
+  and 100x100 matches 256x256, Finder dragged with the tint on does not flicker.
 
 ## 0.2.1 (2026-11-14)
 

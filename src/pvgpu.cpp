@@ -3920,10 +3920,12 @@ bool RDNA4PvHost::levelRange(uint32_t task, uint32_t id, uint32_t level, uint64_
 }
 
 // A stage's textures' levels 1-7 for a shader that samples at explicit LODs (RDNA4_MTLC_LEVEL_FIRST): each level of the guest's memory in
-// place as a level-0 image of its own, into `levels` (level L's T#s at RDNA4_MTLC_LEVEL_STRIDE (L - 1)). Past its last level, or where a
-// level cannot be in place (rows not 128 bytes apart, an IOSurface, an array, a 3D texture), the one before (level 0: the T# stageTextures
-// wrote). The draw's own target level is not read by its shader (the glass's blurs read the level before); the others were written back
-// by stageTextures (flushHeldIn over the whole texture).
+// place as a level-0 image of its own, into `levels` (level L's T#s at RDNA4_MTLC_LEVEL_STRIDE (L - 1)); a level whose rows are not 128
+// bytes apart through its shadow on the card (the held one the pass that drew it left: most sizes' levels, a 200x200 one's all; with the
+// level before in their place, WindowServer's glass blurs read level 0 and its tint flickered as a window moved, 2026-11-14). Past its last
+// level, or for an IOSurface, an array or a 3D texture, the one before (level 0: the T# stageTextures wrote). The draw's own target level
+// is not read by its shader (the glass's blurs read the level before); the others were written back by stageTextures (flushHeldIn over
+// the whole texture).
 void RDNA4PvHost::levelImages(uint32_t task, const Bindings &bound, const uint32_t *table, uint32_t *levels)
 {
 	for (uint32_t k = 0; k < 16; k++) {
@@ -3935,11 +3937,18 @@ void RDNA4PvHost::levelImages(uint32_t task, const Bindings &bound, const uint32
 			TextureSource src;
 			const TextureFormat *fm = id && textureSource(task, id, src, level) ? textureFormat(src.format) : nullptr;
 			const uint64_t bytes = fm ? static_cast<uint64_t>(src.rowBytes) * src.height : 0;
+			const bool plain = fm && !src.surface.memory && src.depth == 1 && src.slices == 1 && src.width && src.height && bytes <= src.length;
 			uint64_t handle = 0, gpu = 0;
+			uint32_t pitch = 0;
 
-			if (fm && !src.surface.memory && src.depth == 1 && src.slices == 1 && src.width && src.height && !(src.rowBytes % 128) &&
-			    !(src.rowBytes % fm->bpp) && !(src.va & 0xff) && bytes <= src.length && mapGuest(task, src.va, bytes, handle, gpu)) {
-				linearImage(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), src.width, src.height, src.rowBytes / fm->bpp);
+			const bool inPlace = plain && !(src.rowBytes % 128) && !(src.rowBytes % fm->bpp) && !(src.va & 0xff) &&
+			                     mapGuest(task, src.va, bytes, handle, gpu);
+
+			if (inPlace)
+				pitch = src.rowBytes;
+
+			if (inPlace || (plain && !(gInPlace & 16) && shadowTexture(task, id, src, fm->bpp, gpu, pitch))) {
+				linearImage(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), src.width, src.height, pitch / fm->bpp);
 				before = t;
 				continue;
 			}
