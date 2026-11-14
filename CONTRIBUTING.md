@@ -25,8 +25,10 @@ Work moves one way: `devel/*` or `premetal/*` into `next`, `next` into `main`.
 The version is written in one place, `VERSION` in the `Makefile`. It goes into the bundle's `Info.plist` and the
 kext's own version record, which have to agree for the kext to load.
 
-- `0.MINOR.0`: `next` merged into `main`. `MINOR` goes up by one.
-- `0.MINOR.PATCH`: a fix made on `main` between two such merges.
+- `0.MINOR.0`: `next` merged into `main` with new features. `MINOR` goes up by one.
+- `0.MINOR.PATCH`: `next` merged into `main` with fixes and small changes only, or a fix made on `main`. `PATCH`
+  goes up by one, and `next` keeps the `MINOR` version it was heading for (0.2.1 was released from `next` while
+  `next` stayed 0.3.0).
 - `1.0.0` is not planned yet.
 
 `CHANGELOG.md` has a section for the version `next` will become. Add to it when something is finished, and say what
@@ -53,7 +55,8 @@ git tag -a v0.1.0 -m "AMDRadeonRDNA4 0.1.0"
 git push origin main v0.1.0
 ```
 
-Then, on `next`, raise `VERSION` to the following one and open its section in `CHANGELOG.md`.
+Then, on `next`, raise `VERSION` to the following one and open its section in `CHANGELOG.md`. After a `PATCH`
+release `VERSION` goes back to the `MINOR` version `next` was heading for, and its section starts with "After 0.x.y".
 
 ## Which build is this?
 

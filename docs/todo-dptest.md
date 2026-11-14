@@ -160,6 +160,11 @@ it onto its 3840x2160 timing`, then `modes: switching to id N ...` and `modes: n
 In this state the Samsung has no 3840x2160 mode: the kext offers nothing larger than the console. That is a
 known limit, not part of this test.
 
+**Passed on the card, 2026-11-14** (Tahoe 26.6.2, kext of next 84652db, the boot display a paravirtual one): console
+1920x1080 stretched onto 3840x2160; the whole desktop at 1920x1080, at 1600x900 and back. The first switch turned the
+scaler off (`scaler mode 0x00000000 autocal 0x00000000 (turned off: stretched console)`), viewport, recout and MPC each
+the mode's size; measured 59.999 Hz both times. `Resolution` back to `Max` afterwards.
+
 ## After the tests
 
 For each test that passes, the README's status list and `docs/second-pipe.md` get the date and what ran, as for

@@ -1126,6 +1126,9 @@ void attach(FbEntry &e) {
 	// or the first WindowServer opened the boot framebuffer as macOS's display and died in its first frame (pvhooks.cpp).
 	if (dev.isAmd && (Trial::loaded() || pvGpu))
 		PvScanout::decided(pvHeads);
+
+	if (pvHeads)
+		PvHooks::hideFramebuffers(e.fb);
 #endif
 	e.state = st;
 	bootState = st;
@@ -1611,6 +1614,26 @@ const Modes::Mode *nearest60(const Modes::Mode *table, size_t n, uint32_t width,
 	return best;
 }
 
+// Port 0 when no head took the boot display over (a DisplayPort boot display: boot4k takes only an HDMI one behind an adapter): the boot
+// framebuffer's own modes (its NDRV table, at most the console's size, scanned from the console's memory at its pitch) and the size it
+// runs in now; its mode switches go through its mode-set engine (RDNA4Device::applyMode: on DisplayPort the stream retimed, the link as
+// trained).
+bool bootModes(const Modes::Mode *&table, size_t &n, uint32_t &width, uint32_t &height)
+{
+	if (pvBootHead || !bootState || !bootState->dev.modeCount)
+		return false;
+
+	const RDNA4Device &dev = bootState->dev;
+	uint32_t liveW, liveH;
+	const bool live = dev.liveSize(liveW, liveH) && liveW && liveW <= dev.fbWidth && liveH && liveH <= dev.fbHeight;
+
+	table = dev.modeTable;
+	n = dev.modeCount;
+	width = live ? liveW : dev.fbWidth;
+	height = live ? liveH : dev.fbHeight;
+	return true;
+}
+
 uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
 {
 	Head2 *h = pvHead(port);
@@ -1619,10 +1642,12 @@ uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
 	size_t n = 0;
 	uint32_t litW = 0, litH = 0, count = 0;
 
-	if (!h || !bootState || !cap)
+	if (!cap || (port == 0 && !h && !bootModes(table, n, litW, litH)) || (port && !h) || !bootState)
 		return 0;
 
-	if (h->connected && h->ndrv.modeCount() > 1) {
+	if (!h) {
+		// the boot framebuffer's (bootModes)
+	} else if (h->connected && h->ndrv.modeCount() > 1) {
 		table = h->table;
 		n = h->ndrv.modeCount();
 		litW = h->surface.width;
@@ -1693,13 +1718,14 @@ uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
 			}
 		}
 
-	// From the largest down, not a size that is half of one kept: macOS offers that size as the HiDPI mode of the larger one already and
-	// listed this one again as "(niedrige Auflösung)" (1920x1080 beside 3840x2160's, 2560x1440 beside 5120x2880's). The lit one stays.
+	// From the largest down, not a size that is half of a monitor's mode kept: macOS offers that size as the HiDPI mode of the larger one
+	// already and listed this one again as "(niedrige Auflösung)" (1920x1080 beside 3840x2160). Half of a scaled size above the monitor's
+	// stays: it is a mode of the monitor's own (2560x1440 beside 5120x2880 went, and with it macOS's 1280x720 HiDPI). The lit one stays.
 	for (uint32_t i = 0; i < total && count < cap; i++) {
 		bool half = false;
 
 		for (uint32_t k = 0; k < count && !half; k++)
-			half = out[k].width == 2 * all[i].width && out[k].height == 2 * all[i].height;
+			half = out[k].width <= bigW && out[k].height <= bigH && out[k].width == 2 * all[i].width && out[k].height == 2 * all[i].height;
 
 		if (!half || (all[i].width == litW && all[i].height == litH))
 			out[count++] = all[i];
@@ -1711,12 +1737,17 @@ uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
 bool PvScanout::largest(uint32_t port, uint32_t &width, uint32_t &height)
 {
 	Head2 *h = pvHead(port);
-	const size_t n = h && h->connected ? h->ndrv.modeCount() : 0;
+	const Modes::Mode *table = h ? h->table : nullptr;
+	size_t n = h && h->connected ? h->ndrv.modeCount() : 0;
+	uint32_t liveW, liveH;
+
+	if (port == 0 && !h && !bootModes(table, n, liveW, liveH))
+		n = 0;
 
 	width = height = 0;
 
 	for (size_t i = 0; i < n; i++) {
-		const Edid::DetailedTiming &t = h->table[i].t;
+		const Edid::DetailedTiming &t = table[i].t;
 
 		if (static_cast<uint64_t>(t.hActive) * t.vActive > static_cast<uint64_t>(width) * height) {
 			width = t.hActive;
@@ -1730,6 +1761,19 @@ bool PvScanout::largest(uint32_t port, uint32_t &width, uint32_t &height)
 bool PvScanout::setMode(uint32_t port, uint32_t width, uint32_t height)
 {
 	Head2 *h = pvHead(port);
+	const Modes::Mode *table = nullptr;
+	size_t n = 0;
+	uint32_t liveW, liveH;
+
+	if (port == 0 && !h && bootModes(table, n, liveW, liveH)) {
+		const Modes::Mode *m = nearest60(table, n, width, height);
+		const IOReturn r = m ? bootState->dev.applyMode(*m) : kIOReturnUnsupported;
+
+		FBLOG("pvgpu: port 0: the boot display switched to %ux%u for macOS's mode: %s", width, height,
+		      !m ? "no such mode" : r == kIOReturnSuccess ? "done" : "FAILED");
+		return r == kIOReturnSuccess;
+	}
+
 	const Modes::Mode *m = h && h->connected ? nearest60(h->table, h->ndrv.modeCount(), width, height) : nullptr;
 
 	if (!m) {
@@ -1811,9 +1855,14 @@ bool PvScanout::head(uint32_t port, Head &out)
 		if (!bootState)
 			return false;
 
+		// the mode it runs in now (bootModes), from the console's start at its pitch (deviceSurfaceFor); else the console's size
 		const RDNA4Device &dev = bootState->dev;
+		const Modes::Mode *table;
+		size_t n;
+		uint32_t width = dev.fbWidth, height = dev.fbHeight;
 
-		out = { dev.fbPhysBase, dev.fbRowBytes, dev.fbWidth, dev.fbHeight };
+		(void)bootModes(table, n, width, height);
+		out = { dev.fbPhysBase, dev.fbRowBytes, width, height };
 
 		return true;
 	}

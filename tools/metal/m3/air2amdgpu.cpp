@@ -693,6 +693,11 @@ static std::string legalize(Function &k) {
 			b.CreateFence(AtomicOrdering::Release, scope);
 			b.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {});
 			b.CreateFence(AtomicOrdering::Acquire, scope);
+		} else if (name == "simdgroup.barrier") {
+			// (the same): a SIMD group is one wave, which runs in step: only the fence, at the wave's scope (device memory: the agent's).
+			// CoreImage's 4:2:0 kernels (ci_writeTG_420_*) were not translated without it.
+			const bool device = cast<ConstantInt>(c->getArgOperand(0))->getZExtValue() & 1;
+			b.CreateFence(AtomicOrdering::AcquireRelease, ctx.getOrInsertSyncScopeID(device ? "agent" : "wavefront"));
 		} else if (name.starts_with("convert.")) {   // convert.<to kind>.<to type>.<from kind>.<from type>; kinds f, s, u
 			SmallVector<StringRef, 5> k;
 			name.split(k, '.');
@@ -735,7 +740,25 @@ static std::string legalize(Function &k) {
 			Value *t = descriptor(c->getArgOperand(0), 8), *w1 = b.CreateExtractElement(t, 1), *w2 = b.CreateExtractElement(t, 2);
 			Value *size = name.starts_with("get_width") ? b.CreateOr(b.CreateLShr(w1, 30), b.CreateShl(b.CreateAnd(w2, 0x3fff), 2))
 			                                            : b.CreateAnd(b.CreateLShr(w2, 14), 0x3fff);
-			r = b.CreateIntrinsic(Intrinsic::umax, {b.getInt32Ty()}, {b.CreateLShr(b.CreateAdd(size, b.getInt32(1)), c->getArgOperand(1)), b.getInt32(1)});
+			// a multisampled texture's (get_width_texture_2d_ms) has no LOD: level 0
+			Value *lod = c->arg_size() > 1 ? c->getArgOperand(1) : b.getInt32(0);
+			r = b.CreateIntrinsic(Intrinsic::umax, {b.getInt32Ty()}, {b.CreateLShr(b.CreateAdd(size, b.getInt32(1)), lod), b.getInt32(1)});
+		} else if (name.starts_with("get_num_samples_texture_2d_ms")) {
+			// (texture): 1 << LAST_LEVEL, which holds a multisampled image's log2 of its samples (word3 [19:15], as Mesa's
+			// ac_build_gfx12_texture_descriptor)
+			Value *w3 = b.CreateExtractElement(descriptor(c->getArgOperand(0), 8), 3);
+			r = b.CreateShl(b.getInt32(1), b.CreateAnd(b.CreateLShr(w3, 15), 0x1f));
+		} else if (tex.starts_with("read_texture_2d_ms.v4f")) {
+			// (texture, sampler, uint2 coord, uint sample, i32): that sample of the texel, float or half (the resolve the host runs for a
+			// pass's multisampled attachment, and shaders reading a texture2d_ms)
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(2);
+			Value *x = b.CreateZExt(b.CreateExtractElement(xy, uint64_t(0)), b.getInt32Ty()), *y = b.CreateZExt(b.CreateExtractElement(xy, 1), b.getInt32Ty());
+			Value *texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2dmsaa, {v4f, b.getInt32Ty(), t->getType()},
+			                                 {b.getInt32(15), x, y, b.CreateZExtOrTrunc(c->getArgOperand(3), b.getInt32Ty()), t, b.getInt32(0), b.getInt32(0)});
+			if (tex.starts_with("read_texture_2d_ms.v4f16"))
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
 		} else if (auto cl = clampOps.find(op.str()); cl != clampOps.end()) {   // (x, low, high): min(max(x, low), high)
 			Value *lo = b.CreateIntrinsic(cl->second.first, {c->getType()}, {c->getArgOperand(0), c->getArgOperand(1)});
 			r = b.CreateIntrinsic(cl->second.second, {c->getType()}, {lo, c->getArgOperand(2)});
@@ -788,6 +811,9 @@ static std::string legalize(Function &k) {
 			r = b.CreateFRem(c->getArgOperand(0), c->getArgOperand(1));
 		} else if (op == "rsqrt") {
 			r = b.CreateFDiv(ConstantFP::get(c->getType(), 1.0), b.CreateIntrinsic(Intrinsic::sqrt, {c->getType()}, {c->getArgOperand(0)}));
+		} else if (op == "sincos") {   // (x, ptr cos): the sine returned, the cosine stored (the Sequoia wallpaper's drawVertex)
+			b.CreateStore(b.CreateIntrinsic(Intrinsic::cos, {c->getType()}, {c->getArgOperand(0)}), c->getArgOperand(1));
+			r = b.CreateIntrinsic(Intrinsic::sin, {c->getType()}, {c->getArgOperand(0)});
 		} else if (op == "pow" || op == "powr") {   // fast math's x^y = 2^(y log2 x)
 			r = b.CreateIntrinsic(Intrinsic::exp2, {c->getType()},
 			                      {b.CreateFMul(c->getArgOperand(1), b.CreateIntrinsic(Intrinsic::log2, {c->getType()}, {c->getArgOperand(0)}))});

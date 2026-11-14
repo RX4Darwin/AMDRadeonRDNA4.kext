@@ -3,6 +3,58 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
+## 0.2.2 (2026-11-14)
+
+**OpenGL (`make PVGPU=1`)**
+- On the card by default (`rdna4-pvgl=0` turns it off): the renderer is named on the accelerator only when its file
+  on disk has the bytes the kext patches (Tahoe 26.6.2's); another renderer keeps OpenGL in software instead of
+  aborting every GL app. Card (Tahoe 26.6.2, 2026-11-14, no `rdna4-pvgl` in the boot-args): the renderer named and
+  patched, kitty draws on the card.
+
+**Displays (`make PVGPU=1`, `rdna4-pvgpu-disp=7`)**
+- A DisplayPort boot display has its modes as a paravirtual display: macOS was offered only 3840x2160 for it (the
+  heads' mode lists only knew heads, and only an HDMI boot display behind an adapter becomes one). Port 0 now offers the
+  boot framebuffer's own modes and switches through its mode-set engine (the stream retimed, the link as trained).
+  A monitor's mode that is half of a scaled size above it is kept: 2560x1440 had gone beside 5120x2880, and macOS's
+  1280x720 HiDPI with it. Card (Tahoe 26.6.2, 2026-11-14, Samsung 4K on DP): 2560x1440 and 1280x720 HiDPI listed,
+  switched to 2560x1440 (measured 59.955 Hz) and back to 3840x2160.
+- At most 15 modes are offered: macOS reads 4 blocks of the EDID the guest makes from them (5 modes a block) and lists
+  only those; 17 were sent on the card and the last two (720x480, 640x480) never listed.
+- The first WindowServer of a boot no longer dies: it opened 2 of the 8 framebuffers (ours refuse) and CoreDisplay
+  asserted on that, every boot, so the desktop came about 10 s later from its restart. Our framebuffers are left out of
+  user-space matching while the heads are the paravirtual displays, and WindowServer's first open of the GPU wrangler
+  waits (about 2.5 s) until the paravirtual GPU and its accelerator are published, so that CoreDisplay opens their
+  framebuffers with their display pipes. Card (Tahoe 26.6.2, 2026-11-14, two boots): the first WindowServer lives, both
+  displays accelerated, no crash report.
+
+**Metal (`make PVGPU=1`)**
+- A mip level whose rows are not 128 bytes apart is sampled from its copy on the card (the one the pass that drew it
+  left) instead of the level before: on most sizes WindowServer's glass blurs read level 0, and with Liquid Glass
+  tinted the sidebar's colour flickered as a window was dragged. Card (Tahoe 26.6.2, 2026-11-14): mipprobe at 200x200
+  and 100x100 matches 256x256, Finder dragged with the tint on does not flicker.
+- The ranges dispatches in the draw batch write are kept for every batch that may be in flight (512), and those of
+  finished batches dropped: 32, emptied only by waiting for all draws, made kitty's scrolling wait for the card 3158
+  times in 5 s (each of GL's draws writes a new index buffer). Card (Tahoe 26.6.2, 2026-11-14, `seq 1 3000000` in
+  kitty): those waits gone, time waiting for the card 635 -> 218 ms in 5 s, 5.1 us of the host's a draw as before.
+- A render pass's multisample resolve is carried out: at the end of its encoder the multisampled texture (its samples
+  averaged, next entry) is copied into the resolve texture (store action resolve, or store and resolve; level 0). The Sequoia and
+  Macintosh wallpapers draw into a multisampled texture and resolve into their drawable, which stayed black. The
+  translator (air2amdgpu) also takes `air.[fast_]sincos` (Sequoia's vertex shader). Card (Tahoe 26.6.2, 2026-11-14):
+  both wallpapers show.
+- The translator takes `air.simdgroup.barrier` (a SIMD group is one wave: a fence at the wave's scope); CoreImage's
+  4:2:0 kernels were not translated without it. Card (2026-11-14): a kernel reading its neighbour's threadgroup memory
+  after the barrier, 4096 of 4096 right.
+- sRGB colour targets (BGRA8 and RGBA8 sRGB) are written as sRGB: the hardware encodes the shader's linear colour, as
+  Metal does; unencoded, the Sequoia wallpaper came out dark and dull. Card (2026-11-14): its colours as Apple's.
+- Multisampled colour attachments (2x and 4x, 4 or 8 bytes a pixel) are drawn with all their samples: into a 64KB_2D
+  surface of the samples on the card (cleared there, with depth and stencil of as many samples), which the host's own
+  kernel (`rdna4_resolve`, translated like a guest's; `rdna4_resolve_srgb` averages an sRGB target's in linear light)
+  averages into the texture at the end of the pass, before the resolve copy. The translator reads `texture2d_ms`
+  (`read`, `get_num_samples`, `get_width`/`get_height`). Clears of sRGB targets are encoded. Drawn as one sample, the
+  Sequoia wallpaper's edges were rough; with the samples' spread left at 0 (`PA_SC_SAMPLE_PROPERTIES`) the rasterizer
+  missed edge samples and lines of dots crossed it. Card (Tahoe 26.6.2, 2026-11-14): Sequoia's edges smooth, on the 4K
+  DisplayPort display and the 1080p HDMI one.
+
 ## 0.2.1 (2026-11-14)
 
 **OpenGL (`make PVGPU=1`, `rdna4-pvgl=1`)**

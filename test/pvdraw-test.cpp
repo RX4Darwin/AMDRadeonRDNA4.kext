@@ -128,6 +128,18 @@ int main() {
 		CHECK(clearPattern(103, seven, p) && p == 7 && clearPattern(104, minus, p) && p == 0xfffffffdu && !clearPattern(103, minus, p) && !clearPattern(103, c, p));
 		CHECK(colourInfo(65, true) == 0x00020705u && colourInfo(80, true) == 0x0002880au && colourInfo(0, false) == 0x0002800au);
 		CHECK(colourInfo(103, false) == 0x0003040bu && colourInfo(104, true) == 0x0003050bu);   // RG32Uint, RG32Sint: 32_32, BLEND_BYPASS
+		CHECK(colourInfo(81, true) == 0x00028e0au && colourInfo(71, false) == 0x0002860au);   // BGRA8 and RGBA8 sRGB: NUMBER_SRGB
+		{   // sRGB clears: the linear colour encoded (0.5 -> 188 after 128), alpha as it is; 0 and 1 unchanged
+			const uint64_t half[4] = {0x3fe0000000000000ull, 0, 0x3ff0000000000000ull, 0x3fe0000000000000ull};
+			uint32_t p81 = 0, p71 = 0;
+			CHECK(clearPattern(81, half, p81) && p81 == (255u | 0u << 8 | 188u << 16 | 128u << 24));
+			CHECK(clearPattern(71, half, p71) && p71 == (188u | 0u << 8 | 255u << 16 | 128u << 24));
+		}
+		{   // a 4x multisampled image: MAX_MIP and LAST_LEVEL 2, SW_MODE 64KB_2D, TYPE 2D_MSAA, DEPTH 0
+			uint32_t t[8];
+			msaaImage(t, 0x1234500ull, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 3840, 2160, 2);
+			CHECK((t[1] >> 12 & 0x1f) == 2 && (t[3] >> 15 & 0x1f) == 2 && (t[3] >> 20 & 0x1f) == 3 && t[3] >> 28 == 14 && t[4] == 0);
+		}
 	}
 	// linearImage: a 64x32 RGBA8 image at a 64-pixel pitch.
 	{

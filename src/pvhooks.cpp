@@ -17,6 +17,7 @@
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSObject.h>
+#include <sys/proc.h>
 
 #define PLOG(fmt, ...) \
 	rdna4Log("AMDRadeonRDNA4: pvgpu: hooks: " fmt "\n", ##__VA_ARGS__)
@@ -47,10 +48,14 @@ mach_vm_address_t orgWait;
 mach_vm_address_t orgNewUserClient;
 mach_vm_address_t orgReadEdid;   /* IODisplay::readFramebufferEDID() */
 mach_vm_address_t fbOpen;   /* IOFramebuffer::open() */
+mach_vm_address_t orgMatchInternal;   /* IOService::matchInternal(OSDictionary *, UInt32, UInt32 *) */
+mach_vm_address_t orgServiceOpen;   /* is_io_service_open_extended */
+void *ndrvVtable;   /* IONDRVFramebuffer's, once the heads are the paravirtual displays */
 mach_vm_address_t enable;
 uint32_t skipped;
 uint32_t enabled;
 uint32_t refused;
+uint32_t hidden;
 
 bool isClass(void *object, const char *want)
 {
@@ -112,7 +117,9 @@ uint64_t wrapWait(void *accel)
  * no other display yet: the first WindowServer of a boot, refused before the
  * paravirtual display was published, died in CGXMappedDisplayStart (its
  * restart then found it). The first refusal waits for that display, at most
- * kDisplayWait.
+ * kDisplayWait: for its accelerator, published last (0.5 s after the
+ * framebuffers, once the pipes are online), so that the paravirtual GPU is
+ * whole when WindowServer goes on (wrapServiceOpen holds it here too).
  */
 void waitForParavirtDisplay()
 {
@@ -124,10 +131,10 @@ void waitForParavirtDisplay()
 
 	waited = true;
 
-	OSDictionary *match = IOService::serviceMatching("AppleParavirtFramebuffer");
+	OSDictionary *match = IOService::serviceMatching("AppleParavirtAccelerator");
 	IOService *display = match ? IOService::waitForMatchingService(match, kDisplayWait) : nullptr;
 
-	PLOG("paravirtual display %s", display ? "published: refusing our framebuffers" : "NOT published within 30 s");
+	PLOG("paravirtual displays and accelerator %s", display ? "published: refusing our framebuffers" : "NOT published within 30 s");
 	OSSafeReleaseNULL(display);
 	OSSafeReleaseNULL(match);
 }
@@ -153,6 +160,97 @@ IOReturn wrapNewUserClient(void *fb, void *task, void *security, uint32_t type, 
 
 	return reinterpret_cast<IOReturn (*)(void *, void *, void *, uint32_t, void **)>(orgNewUserClient)(
 		fb, task, security, type, handler);
+}
+
+/*
+ * IOService::matchInternal. CoreDisplay opens every IOFramebuffer a user-space
+ * match finds, and the first WindowServer of a boot that opens only some of
+ * them asserts in CGXMappedDisplayStart so that the next one tries again (its
+ * state kept in /tmp/.CoreDisplayIOFBOpenInfo; the next one, seeing the same,
+ * goes on): with our six refused, every boot's first WindowServer died 8.6 s
+ * in and the desktop came 2 s after it (2026-11-14). While the heads are the
+ * paravirtual displays, user space does not find our framebuffers at all.
+ * Not matchPropertyTable, which matchPassive skips when matchInternal took
+ * every key, nor matchPassive, which a match by class alone does not call
+ * (copyExistingServices: instanceMatch calls matchInternal).
+ */
+bool wrapMatchInternal(void *service, OSDictionary *table, uint32_t options, uint32_t *done)
+{
+	if (ndrvVtable && *static_cast<void **>(service) == ndrvVtable && current_task() != kernel_task && PvScanout::enabled()) {
+		if (hidden++ < 4)
+			PLOG("framebuffer %p left out of a user-space match: the heads are the paravirtual displays", service);
+
+		return false;
+	}
+
+	return reinterpret_cast<bool (*)(void *, OSDictionary *, uint32_t, uint32_t *)>(orgMatchInternal)(service, table, options, done);
+}
+
+// The oldest IONDRVFramebuffer, the boot display's (the heads' come later; plugin.cpp's bootFramebuffer needs the GPU, not attached
+// yet when this is needed). Retained.
+IOService *oldestNdrvFramebuffer()
+{
+	OSDictionary *match = IOService::serviceMatching(kNdrvFramebuffer);
+	OSIterator *it = match ? IOService::getMatchingServices(match) : nullptr;
+	IOService *best = nullptr;
+
+	while (OSObject *o = it ? it->getNextObject() : nullptr) {
+		auto *fb = OSDynamicCast(IOService, o);
+
+		if (fb && (!best || fb->getRegistryEntryID() < best->getRegistryEntryID()))
+			best = fb;
+	}
+
+	if (best)
+		best->retain();
+
+	OSSafeReleaseNULL(it);
+	OSSafeReleaseNULL(match);
+
+	return best;
+}
+
+/*
+ * is_io_service_open_extended, for WindowServer's first open of
+ * AppleGPUWrangler: held until the paravirtual accelerator is published.
+ * CoreDisplay's per-GPU path, which opens a GPU's framebuffers with their
+ * display pipes, lists the GPUs when it opens the wrangler; the first
+ * WindowServer of a boot starts before the paravirtual GPU is published, so
+ * its list had only the card, and its other path opened the paravirtual
+ * framebuffers without their pipes: software compositing, and an assert in
+ * QuartzCore (2026-11-14). Held here, no IOKit lock is taken yet. With it,
+ * the first WindowServer of the boot lives (the rig, 2026-11-14).
+ */
+int wrapServiceOpen(void *service, void *task, uint32_t type, uint64_t ndr, void *properties, uint32_t propertiesCnt, int *result,
+                    void *connection)
+{
+	static bool held;
+	char name[32] = "";
+
+	if (!held && service && isClass(service, "AppleGPUWrangler")) {
+		proc_selfname(name, sizeof(name));
+
+		if (!strcmp(name, "WindowServer")) {
+			held = true;
+
+			// The heads are decided, and the card brought up, when the boot framebuffer is first opened: by WindowServer just after
+			// this. Opened ahead here as wrapNewUserClient does for an undecided one, or the wait below would wait for itself.
+			if (!PvScanout::known() && fbOpen)
+				if (IOService *boot = oldestNdrvFramebuffer()) {
+					const IOReturn r = reinterpret_cast<IOReturn (*)(void *)>(fbOpen)(boot);
+					PLOG("opened the boot framebuffer %p ahead of WindowServer's GPU wrangler (0x%x)", boot, r);
+					boot->release();
+				}
+
+			if (PvScanout::enabled()) {
+				PLOG("WindowServer opens the GPU wrangler: held for the paravirtual GPU");
+				waitForParavirtDisplay();
+			}
+		}
+	}
+
+	return reinterpret_cast<int (*)(void *, void *, uint32_t, uint64_t, void *, uint32_t, int *, void *)>(orgServiceOpen)(
+		service, task, type, ndr, properties, propertiesCnt, result, connection);
 }
 
 /*
@@ -305,6 +403,21 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index,
 	if (index != kextGraphics.loadIndex)
 		return;
 
+	KernelPatcher::RouteRequest matchInternal {
+		"__ZN9IOService13matchInternalEP12OSDictionaryjPj", wrapMatchInternal, orgMatchInternal,
+	};
+
+	KernelPatcher::RouteRequest serviceOpen {"_is_io_service_open_extended", wrapServiceOpen, orgServiceOpen};
+
+	if (!patcher.routeMultiple(KernelPatcher::KernelID, &serviceOpen, 1))
+		PLOG("is_io_service_open_extended not routed (error %d): WindowServer is not held for the paravirtual GPU", patcher.getError());
+
+	patcher.clearError();
+
+	if (!patcher.routeMultiple(KernelPatcher::KernelID, &matchInternal, 1))
+		PLOG("IOService::matchInternal not routed (error %d): our framebuffers stay visible to WindowServer", patcher.getError());
+
+	patcher.clearError();
 	fbOpen = patcher.solveSymbol(index, "__ZN13IOFramebuffer4openEv", address, size);
 	if (!fbOpen)
 		PLOG("no IOFramebuffer::open (error %d): an undecided framebuffer is not opened ahead", patcher.getError());
@@ -315,6 +428,14 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index,
 }
 
 } /* namespace */
+
+void PvHooks::hideFramebuffers(void *fb)
+{
+	if (fb && !ndrvVtable) {
+		ndrvVtable = *static_cast<void **>(fb);
+		PLOG("IONDRVFramebuffer left out of user-space matching%s", orgMatchInternal ? "" : " (NOT: matchInternal not routed)");
+	}
+}
 
 void PvHooks::start()
 {

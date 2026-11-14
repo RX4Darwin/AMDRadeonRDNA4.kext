@@ -52,6 +52,12 @@ public:
 	uint64_t            fbLength   { 0 };
 	uint32_t            fbWidth    { 0 };
 	uint32_t            fbHeight   { 0 };
+	// The size of the boot pipe's running mode (applyMode keeps it), false before it is known.
+	bool liveSize(uint32_t &width, uint32_t &height) const {
+		width = liveTiming.hActive;
+		height = liveTiming.vActive;
+		return liveTimingValid;
+	}
 	uint32_t            fbRowBytes { 0 };
 	uint32_t            fbDepth    { 32 };
 

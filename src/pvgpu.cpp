@@ -9,6 +9,7 @@
 #include "trial.hpp"
 #include "klog.hpp"
 #include "pvstream.hpp"
+#include <Headers/kern_file.hpp>
 #include <Headers/kern_patcher.hpp>
 #include "pvdraw.hpp"
 #include "pm4.hpp"
@@ -170,21 +171,34 @@ void pvPause() {
 }
 #define PVCALL(name) do { static uint32_t calls_; if (__atomic_fetch_add(&calls_, 1u, __ATOMIC_RELAXED) < 3) { pvlog("call: %s", name); pvPause(); } } while (0)
 
-// rdna4-pvgl=1: OpenGL.framework (libGFXShared) loads a renderer for an accelerator only if it names one in IOGLBundleName, which Apple's
-// paravirtual accelerator does not: GL then has its software renderer alone. This names Apple's GL-on-Metal renderer
-// (AppleMetalOpenGLRenderer.bundle) on the accelerator when it is published. On its own it would abort every GL process (the renderer
-// asserts in GLDDeviceRec::initWithDisplayMask: the device's vendor "Apple" is none it knows on Intel) and the guest would refuse every
-// GL render pass (no supportsDefaultRasterSampleCount): routeGlPages patches the renderer for both, under the same boot-arg.
+// OpenGL on the card, on unless rdna4-pvgl=0.
+static bool glWanted() {
+	uint32_t gl = 1;
+
+	(void)PE_parse_boot_argn("rdna4-pvgl", &gl, sizeof(gl));
+	return gl != 0;
+}
+
+static bool glRendererPatchable();
+
+// OpenGL.framework (libGFXShared) loads a renderer for an accelerator only if it names one in IOGLBundleName, which Apple's paravirtual
+// accelerator does not: GL then has its software renderer alone. This names Apple's GL-on-Metal renderer (AppleMetalOpenGLRenderer.bundle)
+// on the accelerator when it is published. On its own it would abort every GL process (the renderer asserts in
+// GLDDeviceRec::initWithDisplayMask: the device's vendor "Apple" is none it knows on Intel) and the guest would refuse every GL render pass
+// (no supportsDefaultRasterSampleCount): routeGlPages patches the renderer for both. So only when the renderer on disk has the bytes those
+// patches replace (Tahoe 26.6.2's): another one (an update, Sequoia) keeps GL in software instead of aborting its apps.
 static bool nameGlBundle(void *, void *, IOService *accel, IONotifier *) {
+	if (!glRendererPatchable()) {
+		pvlog("OpenGL: AppleMetalOpenGLRenderer is not the one patched (Tahoe 26.6.2's): OpenGL stays in software");
+		return true;
+	}
 	accel->setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer");
-	pvlog("OpenGL: IOGLBundleName AppleMetalOpenGLRenderer on %s (rdna4-pvgl)", accel->getName());
+	pvlog("OpenGL: IOGLBundleName AppleMetalOpenGLRenderer on %s", accel->getName());
 	return true;
 }
 
 static void watchForGlAccelerator() {
-	uint32_t gl = 0;
-
-	if (!PE_parse_boot_argn("rdna4-pvgl", &gl, sizeof(gl)) || !gl)
+	if (!glWanted())
 		return;
 
 	OSDictionary *match = IOService::serviceMatching("AppleParavirtAccelerator");
@@ -195,7 +209,7 @@ static void watchForGlAccelerator() {
 		pvlog("OpenGL: no notification for the paravirtual accelerator: IOGLBundleName not set");
 }
 
-// rdna4-pvgl=1, user space: AppleMetalOpenGLRenderer itself patched where its pages come in from disk (Lilu's user patcher does this no
+// User space: AppleMetalOpenGLRenderer itself patched where its pages come in from disk (Lilu's user patcher does this no
 // more from Big Sur on: its isUserDisabled). The kernel's cs_validate_page (Tahoe 26.6.2: void (vnode, pager, page offset in the file,
 // data, int *validated, int *tainted, int *nx), the last on the stack) is wrapped; a page it validated at one of these offsets of the
 // renderer's universal file (x86_64 slice at 0x4000) whose bytes are exactly these gets the replacement, in the page every process maps.
@@ -244,12 +258,31 @@ void wrapValidatePage(void *vnode, void *pager, uint64_t offset, const void *dat
 	}
 }
 
+const char kGlRenderer[] = "/System/Library/Extensions/AppleMetalOpenGLRenderer.bundle/Contents/MacOS/AppleMetalOpenGLRenderer";
+
 } // namespace
 
-void routeGlPagesNow(KernelPatcher &patcher) {
-	uint32_t gl = 0;
+// Whether the renderer's file has, at each patch's place, the bytes the patch replaces.
+static bool glRendererPatchable() {
+	vfs_context_t ctx = vfs_context_create(nullptr);
+	vnode_t vn = NULLVP;
+	bool ok = ctx && !vnode_lookup(kGlRenderer, 0, &vn, ctx);
 
-	if (!PE_parse_boot_argn("rdna4-pvgl", &gl, sizeof(gl)) || !gl)
+	for (const GlPagePatch &p : kGlPagePatches) {
+		uint8_t bytes[16];
+
+		ok = ok && p.size <= sizeof(bytes) && !FileIO::readFileData(bytes, static_cast<off_t>(p.page + p.at), p.size, vn, ctx) &&
+		     !memcmp(bytes, p.find, p.size);
+	}
+	if (vn != NULLVP)
+		vnode_put(vn);
+	if (ctx)
+		vfs_context_rele(ctx);
+	return ok;
+}
+
+void routeGlPagesNow(KernelPatcher &patcher) {
+	if (!glWanted())
 		return;
 
 	KernelPatcher::RouteRequest request {"_cs_validate_page", wrapValidatePage, orgValidatePage};
@@ -257,7 +290,7 @@ void routeGlPagesNow(KernelPatcher &patcher) {
 
 	if (!ok)
 		patcher.clearError();
-	pvlog("OpenGL: cs_validate_page %s (rdna4-pvgl): AppleMetalOpenGLRenderer %s", ok ? "wrapped" : "NOT wrapped",
+	pvlog("OpenGL: cs_validate_page %s: AppleMetalOpenGLRenderer %s", ok ? "wrapped" : "NOT wrapped",
 	      ok ? "is patched where its pages come in" : "stays as it is");
 }
 
@@ -386,6 +419,8 @@ private:
 	bool dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes);
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
+	bool copyWholeTexture(uint32_t task, uint32_t from, uint32_t to, bool *onCard = nullptr);
+	bool resolveMsaa(uint32_t task, uint32_t tex);
 	uint32_t runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
 	uint32_t clearAttachment(uint32_t task, const uint8_t *p);
 	uint32_t viewParent(uint32_t task, uint32_t id);
@@ -399,13 +434,20 @@ public:
 	// Stencil and depth attachments: on the card only (Metal's are private), 8 (stencil) or 32 (Depth32Float) bits a pixel in the depth
 	// block's 64 KiB tiles (gfx12 addrlib: depth and stencil only SW_64KB_2D or SW_256KB_2D), one per task, texture and kind (bytes a pixel:
 	// a Depth32Float_Stencil8 texture has both). ponytail: 16 kept, the least used given up; a pass that loads one given up finds it 0.
-	struct StencilBuf { uint32_t task, tex, bpp, width, height; uint64_t handle, gpu, bytes, used; int64_t clear; };   // clear: a pending
-	                                                                                                                    // 32-bit pattern, or -1
+	struct StencilBuf { uint32_t task, tex, bpp, width, height, samples; uint64_t handle, gpu, bytes, used; int64_t clear; };   // clear: a
+	                                                                                                                             // pending 32-bit pattern, or -1
 	StencilBuf mStencil[16] = {};
 	uint64_t mStencilClock = 0;
 	void stencilPass(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t load, uint32_t pattern);
 	StencilBuf &stencilSlot(uint32_t task, uint32_t tex, uint32_t bpp);
-	const StencilBuf *stencilFor(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t width, uint32_t height);
+	const StencilBuf *stencilFor(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t width, uint32_t height, uint32_t samples = 1);
+	// A multisampled colour attachment's samples on the card: runDraw draws into them, clearAttachment clears them, resolveMsaa averages them
+	// into the attachment's texture at the pass's end. 64KB_2D, whole 128x128-pixel blocks, samples x bytes a pixel; kept by task and texture.
+	struct MsaaSurface { uint32_t task, tex, width, height, samples, bpp; uint64_t handle, gpu, bytes, used; };
+	MsaaSurface mMsaa[8] = {};
+	uint64_t mMsaaClock = 0;
+	MsaaSurface *msaaSurface(uint32_t task, uint32_t tex, uint32_t width, uint32_t height, uint32_t samples, uint32_t bpp);
+	MsaaSurface *msaaTarget(uint32_t task, uint32_t tex, uint32_t width, uint32_t height, uint32_t bpr, uint32_t bpp);
 	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *stage);
 	void runCompute(uint32_t task, uint32_t pipeline, const Bindings &bound, const uint64_t *size);
 	// staged: a runtime buffer or the pool; an IOSurface the kernel writes held (prepared) until its rows are written back into it
@@ -694,10 +736,11 @@ private:
 	// noted until the batch is waited for, so that the CPU (copyGuest) and the compute queue do not read or write it before.
 	static constexpr uint32_t kDispatchArgs = 256;
 	GfxBuffers mDispatchArgs {};
-	struct RingWrite { uint32_t task; uint64_t va, len; };
-	static constexpr uint32_t kRingWrites = 32;
+	struct RingWrite { uint32_t task; uint64_t va, len, submit; };   // submit: the batch's, which goes out as mSubmits + 1 (markUsed)
+	static constexpr uint32_t kRingWrites = kBatchSlots * kBatchDraws;   // a range each of the batches that may be in flight
 	RingWrite mRingWrites[kRingWrites] {};
 	uint32_t mRingWriteCount { 0 };
+	uint64_t mRingLo { 0 }, mRingHi { 0 };   // all of them within: most reads (copyGuest, per texture row) are not, and skip the list
 	bool batchDispatch(const Jit &j, const uint8_t *args, uint32_t argBytes, const uint32_t groups[3], const uint32_t groupSize[3]);
 	void noteRingWrite(uint32_t task, uint64_t va, uint64_t len);
 	bool ringWritten(uint32_t task, uint64_t va, uint64_t len) const;
@@ -2346,21 +2389,53 @@ bool RDNA4PvHost::batchDispatch(const Jit &j, const uint8_t *args, uint32_t argB
 	return batchDraw(ib, n, 0, 0);
 }
 
-// A range a dispatch in the batch writes (a buffer whole: GL's index ring is written at another offset by each).
+// A range a dispatch in the batch writes (a buffer whole: GL's index ring is written at another offset by each). A full list drops the
+// ranges whose batch is done first. With 32 and emptied only by waiting for all draws, kitty's scrolling waited 3158 times in 5 s for it
+// (each of GL's draws a new index buffer), three quarters of the host's waits (2026-11-14).
 void RDNA4PvHost::noteRingWrite(uint32_t task, uint64_t va, uint64_t len)
 {
+	const uint64_t submit = mSubmits + 1;
+	auto widen = [this](uint64_t at, uint64_t bytes, bool first) {   // the span ringWritten checks first
+		mRingLo = first || at < mRingLo ? at : mRingLo;
+		mRingHi = first || at + bytes > mRingHi ? at + bytes : mRingHi;
+	};
+
 	for (uint32_t i = 0; i < mRingWriteCount; i++)
-		if (mRingWrites[i].task == task && mRingWrites[i].va == va && mRingWrites[i].len == len)
+		if (mRingWrites[i].task == task && mRingWrites[i].va == va && mRingWrites[i].len == len) {
+			mRingWrites[i].submit = submit;
 			return;
+		}
+
+	if (mRingWriteCount == kRingWrites) {
+		uint32_t kept = 0;
+
+		for (uint32_t i = 0; i < mRingWriteCount; i++) {
+			const RingWrite &w = mRingWrites[i];
+			const bool done = w.submit <= mSubmits && (!mPending || mSubmits - w.submit >= kInFlight ||
+			                                           gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(mSubmitFence[w.submit % kSubmitFences])));
+
+			if (done)
+				continue;
+
+			widen(w.va, w.len, !kept);
+			mRingWrites[kept++] = w;
+		}
+
+		mRingWriteCount = kept;
+	}
 
 	if (mRingWriteCount == kRingWrites)
 		waitDraws();   // clears them
 
-	mRingWrites[mRingWriteCount++] = {task, va, len};
+	widen(va, len, !mRingWriteCount);
+	mRingWrites[mRingWriteCount++] = {task, va, len, submit};
 }
 
 bool RDNA4PvHost::ringWritten(uint32_t task, uint64_t va, uint64_t len) const
 {
+	if (va >= mRingHi || va + len <= mRingLo)
+		return false;
+
 	for (uint32_t i = 0; i < mRingWriteCount; i++)
 		if (mRingWrites[i].task == task && va < mRingWrites[i].va + mRingWrites[i].len && mRingWrites[i].va < va + len)
 			return true;
@@ -2520,6 +2595,7 @@ struct ExecTally {
 	uint32_t pipeline;                  // Compute.setComputePipelineState
 	uint32_t target, renderPipeline;    // Render: colour attachment 0's texture (writeDescriptor), setRenderPipelineState
 	uint32_t attachments[8];            // Render: all eight colour attachments' textures (writeDescriptor; 0 = none)
+	uint32_t resolve[8][2];             // Render: {texture, resolve texture} the pass resolves at its end (writeDescriptor; 0 = none)
 	RDNA4PvHost::Bindings stage[2];     // Render.setVertexBuffers, setFragmentBuffers
 	uint32_t blendColor[4];             // Render.setBlendColorRed: four floats' bits
 	uint64_t viewport[6];               // Render.setViewport: originX, originY, width, height, znear, zfar as doubles' bits
@@ -2560,19 +2636,33 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		t->host->runBlit(t->task, id, payload, bytes);
 	else if (id == 0x01a) {
 		t->target = t->host->runRenderPass(t->task, payload, bytes);
-		for (uint32_t k = 0; k < 8; k++)   // {u32 texture, ...} 0x3c apart from 0x4c (logPassDescriptor); a plain view's own texture
-			if (0x4c + 0x3c * k + 4 <= bytes) {
-				uint32_t level = 0;
-				memcpy(&t->attachments[k], payload + 0x4c + 0x3c * k, 4);
-				if (0x54 + 0x3c * k + 4 <= bytes)
-					memcpy(&level, payload + 0x54 + 0x3c * k, 4);
+		// {u32 texture, u32 resolve texture, u16 level, slice, depth plane, resolve level, resolve slice, resolve depth plane, u16 load
+		// action, u16 store action, u16 store options, double clear colour[4]} 0x3c apart from 0x4c (AppleParavirtGPUMetal's writeDescriptor,
+		// Tahoe 26.6.2); a plain view's own texture
+		for (uint32_t k = 0; k < 8; k++)
+			if (0x4c + 0x3c * k + 0x18 <= bytes) {
+				const uint8_t *a = payload + 0x4c + 0x3c * k;
+				uint16_t level, resolveLevel, store;
+				uint32_t resolve;
+				memcpy(&t->attachments[k], a, 4);
+				memcpy(&resolve, a + 4, 4);
+				memcpy(&level, a + 8, 2);
+				memcpy(&resolveLevel, a + 0xe, 2);
+				memcpy(&store, a + 0x16, 2);
+				// MTLStoreActionMultisampleResolve, StoreAndMultisampleResolve: the multisampled texture is drawn as one sample, so its
+				// resolve is a copy (level 0, as Blit.copyFromTexture's); the Sequoia and Macintosh wallpapers' drawables were never written (black)
+				const bool resolves = (store == 2 || store == 3) && resolve && !level && !resolveLevel;
+				t->resolve[k][0] = resolves ? t->attachments[k] : 0;
+				t->resolve[k][1] = resolves ? resolve : 0;
 				t->attachments[k] = t->host->viewParent(t->task, t->attachments[k]);
 				if (level > 15)   // a level past 15: no attachment (its draws refused)
 					t->attachments[k] = 0;
 				else if (t->attachments[k])   // its mip level as bits 24-27 (kTargetId)
-					t->attachments[k] |= level << 24;
-			} else
+					t->attachments[k] |= static_cast<uint32_t>(level) << 24;
+			} else {
 				t->attachments[k] = 0;
+				t->resolve[k][0] = t->resolve[k][1] = 0;
+			}
 		if (t->target == (t->attachments[0] & kTargetId))
 			t->target = t->attachments[0];
 		t->viewportSet = false;
@@ -2756,6 +2846,26 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 	hex[n * 9] = 0;
 	pvlog("host:   stream %s +0x%zx: 0x%03x %s (%u bytes)%s%s", t->segment, offset, id, name ? name : "UNKNOWN", bytes, hex, bytes > 24 ? " ..." : "");
 }
+
+// The multisample resolves a render pass asked for (ExecTally::resolve), at its end.
+void resolvePass(ExecTally &t)
+{
+	for (auto &r : t.resolve) {
+		if (!r[0])
+			continue;
+
+		t.host->flushHeld();   // what the pass drew, out of its held target first
+
+		static uint32_t lines;
+		t.host->resolveMsaa(t.task, r[0]);   // a multisampled attachment's samples into its texture first (none: drawn there as one sample)
+		const bool ok = t.host->copyWholeTexture(t.task, r[0], r[1]);
+
+		if (!ok || lines++ < 4)
+			pvstat("host: render: task %u: texture %u resolved into %u: %s", t.task, r[0], r[1], ok ? "done" : "NOT done");
+
+		r[0] = r[1] = 0;
+	}
+}
 } // namespace
 
 // M1: one command buffer of an ExecIndirect, decoded: segments {u32 length, u8 type, u8 continuation, u8 flags, u8 0}, in them stream commands
@@ -2801,6 +2911,8 @@ void RDNA4PvHost::decodeExec(uint32_t task, const uint64_t (*chunks)[2], uint32_
 				    }, &t);
 				undecoded += slen - 8 - static_cast<uint32_t>(ok);
 			}
+			if (type == 0 && !buf[at + 5])   // a render encoder's last segment (no continuation): its resolves, after its draws
+				resolvePass(t);
 			at += slen;
 		}
 		pvlog("host: stream: task %u command buffer at 0x%llx, %llu bytes: %u segment(s), %u command(s), %u unknown, %u byte(s) undecoded%s", task, va, len,
@@ -3143,6 +3255,11 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 	const bool swap = format != 70 && format != 71;   // BGRA8 (and of unknown format, as before)
 	const bool byHeld = drawable && (bpr % 128);   // cleared in a held shadow: the texture's own held target stays, cleared
 
+	// a multisampled attachment: its samples on the card (msaaTarget), one value everywhere (the tiling does not matter)
+	if (MsaaSurface *ms = ok && !level ? msaaTarget(task, tex, w, h, bpr, tp) : nullptr)
+		if (clearOnCard(task, key, ms->gpu, ms->bytes, pattern))
+			return tex;
+
 	// Held targets over the cleared memory written back first: their write-back would otherwise go over the clear.
 	if (found)
 		flushHeldIn(nullptr, task, va, len, byHeld ? heldFor(task, key) : nullptr);
@@ -3301,12 +3418,50 @@ RDNA4PvHost::StencilBuf &RDNA4PvHost::stencilSlot(uint32_t task, uint32_t tex, u
 
 // The stencil or depth buffer of a task's texture for a target of width x height: made (or remade larger) on the card, its pending clear
 // done.
-const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t width, uint32_t height) {
+// A multisampled attachment's samples (MsaaSurface), made (zeroed) when the texture has none of this shape; the least recently used one
+// goes for it when all are taken.
+RDNA4PvHost::MsaaSurface *RDNA4PvHost::msaaSurface(uint32_t task, uint32_t tex, uint32_t width, uint32_t height, uint32_t samples, uint32_t bpp)
+{
+	MsaaSurface *same = nullptr, *empty = nullptr, *oldest = nullptr;
+
+	for (MsaaSurface &m : mMsaa)
+		if (m.handle && m.task == task && m.tex == tex)
+			same = &m;
+		else if (!m.handle)
+			empty = empty ? empty : &m;
+		else if (!oldest || m.used < oldest->used)
+			oldest = &m;
+
+	if (same && same->width == width && same->height == height && same->samples == samples && same->bpp == bpp) {
+		same->used = ++mMsaaClock;
+		return same;
+	}
+
+	MsaaSurface *slot = same ? same : empty ? empty : oldest;
+
+	if (slot->handle) {
+		waitDraws();   // its draws, before its memory goes
+		gCompute->rtFree(this, slot->handle);
+	}
+
+	*slot = {task, tex, width, height, samples, bpp, 0, 0, static_cast<uint64_t>((width + 127) & ~127u) * ((height + 127) & ~127u) * bpp * samples, ++mMsaaClock};
+
+	if (gCompute->rtAlloc(this, slot->bytes, slot->handle, slot->gpu) != kIOReturnSuccess || !clearOnCard(task, tex, slot->gpu, slot->bytes, 0)) {
+		if (slot->handle)
+			gCompute->rtFree(this, slot->handle);
+		*slot = {};
+		return nullptr;
+	}
+
+	return slot;
+}
+
+const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t tex, uint32_t bpp, uint32_t width, uint32_t height, uint32_t samples) {
 	StencilBuf *slot = &stencilSlot(task, tex, bpp);
 
 	slot->used = ++mStencilClock;
 
-	if (!slot->handle || width > slot->width || height > slot->height) {
+	if (!slot->handle || width > slot->width || height > slot->height || samples != slot->samples) {
 		if (slot->handle) {
 			waitDraws();
 			gCompute->rtFree(this, slot->handle);
@@ -3314,7 +3469,8 @@ const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t t
 		}
 		slot->width = width > slot->width ? width : slot->width;
 		slot->height = height > slot->height ? height : slot->height;
-		slot->bytes = static_cast<uint64_t>((slot->width + 255) & ~255u) * ((slot->height + 255) & ~255u) * bpp;   // whole 256x256 pixels
+		slot->samples = samples;
+		slot->bytes = static_cast<uint64_t>((slot->width + 255) & ~255u) * ((slot->height + 255) & ~255u) * bpp * samples;   // whole 256x256 pixels
 		slot->handle = 0;
 		if (gCompute->rtAlloc(this, slot->bytes, slot->handle, slot->gpu) != kIOReturnSuccess) {
 			*slot = {};
@@ -3707,6 +3863,7 @@ struct RDNA4PvHost::TextureSource {
 	uint32_t slices = 1;                            // an array's, sliceBytes apart
 	uint64_t sliceBytes = 0;
 	uint32_t swizzle = 0;                           // a view's MTLTextureSwizzleChannels (red .. alpha a byte each), 0: none
+	uint32_t samples = 1;                           // a multisampled texture's (2, 4 or 8): its memory holds them side by side in a row
 	Surface surface;
 };
 
@@ -3820,10 +3977,14 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, 
 	if ((out.type != 2 && out.type != 3) || bytes < 4 * 29 || !read)
 		return false;
 
+	// {0x2c, id, format << 16 | usage, width, height, depth, samples << 16 | ...} after the levels (Sequoia's 4x attachment: 0x00040001,
+	// a plain texture's 0x00010001)
 	for (uint32_t j = 19; j + 1 < bytes / 4; j++)
 		if (td[j - 1] == 0x2c && td[j] == id) {
 			out.format = td[j + 1] >> 16;
 			out.usage = td[j + 1] & 0xffff;
+			const uint32_t samples = j + 5 < bytes / 4 ? td[j + 5] >> 16 : 1;
+			out.samples = samples == 2 || samples == 4 || samples == 8 ? samples : 1;
 		}
 
 	// the level's {u64 offset, u64 bytes, u64 bytes per row, u32 width, height, depth} (dword 3's low half: the levels; a 64x64 RGBA8 texture's
@@ -3887,10 +4048,12 @@ bool RDNA4PvHost::levelRange(uint32_t task, uint32_t id, uint32_t level, uint64_
 }
 
 // A stage's textures' levels 1-7 for a shader that samples at explicit LODs (RDNA4_MTLC_LEVEL_FIRST): each level of the guest's memory in
-// place as a level-0 image of its own, into `levels` (level L's T#s at RDNA4_MTLC_LEVEL_STRIDE (L - 1)). Past its last level, or where a
-// level cannot be in place (rows not 128 bytes apart, an IOSurface, an array, a 3D texture), the one before (level 0: the T# stageTextures
-// wrote). The draw's own target level is not read by its shader (the glass's blurs read the level before); the others were written back
-// by stageTextures (flushHeldIn over the whole texture).
+// place as a level-0 image of its own, into `levels` (level L's T#s at RDNA4_MTLC_LEVEL_STRIDE (L - 1)); a level whose rows are not 128
+// bytes apart through its shadow on the card (the held one the pass that drew it left: most sizes' levels, a 200x200 one's all; with the
+// level before in their place, WindowServer's glass blurs read level 0 and its tint flickered as a window moved, 2026-11-14). Past its last
+// level, or for an IOSurface, an array or a 3D texture, the one before (level 0: the T# stageTextures wrote). The draw's own target level
+// is not read by its shader (the glass's blurs read the level before); the others were written back by stageTextures (flushHeldIn over
+// the whole texture).
 void RDNA4PvHost::levelImages(uint32_t task, const Bindings &bound, const uint32_t *table, uint32_t *levels)
 {
 	for (uint32_t k = 0; k < 16; k++) {
@@ -3902,11 +4065,18 @@ void RDNA4PvHost::levelImages(uint32_t task, const Bindings &bound, const uint32
 			TextureSource src;
 			const TextureFormat *fm = id && textureSource(task, id, src, level) ? textureFormat(src.format) : nullptr;
 			const uint64_t bytes = fm ? static_cast<uint64_t>(src.rowBytes) * src.height : 0;
+			const bool plain = fm && !src.surface.memory && src.depth == 1 && src.slices == 1 && src.width && src.height && bytes <= src.length;
 			uint64_t handle = 0, gpu = 0;
+			uint32_t pitch = 0;
 
-			if (fm && !src.surface.memory && src.depth == 1 && src.slices == 1 && src.width && src.height && !(src.rowBytes % 128) &&
-			    !(src.rowBytes % fm->bpp) && !(src.va & 0xff) && bytes <= src.length && mapGuest(task, src.va, bytes, handle, gpu)) {
-				linearImage(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), src.width, src.height, src.rowBytes / fm->bpp);
+			const bool inPlace = plain && !(src.rowBytes % 128) && !(src.rowBytes % fm->bpp) && !(src.va & 0xff) &&
+			                     mapGuest(task, src.va, bytes, handle, gpu);
+
+			if (inPlace)
+				pitch = src.rowBytes;
+
+			if (inPlace || (plain && !(gInPlace & 16) && shadowTexture(task, id, src, fm->bpp, gpu, pitch))) {
+				linearImage(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), src.width, src.height, pitch / fm->bpp);
 				before = t;
 				continue;
 			}
@@ -3914,6 +4084,76 @@ void RDNA4PvHost::levelImages(uint32_t task, const Bindings &bound, const uint32
 			memcpy(t, before, 32);
 		}
 	}
+}
+
+// The samples of a texture drawn into as a multisampled attachment (2x or 4x, 4 or 8 bytes a pixel, its rows at least two pixels' bytes a
+// pixel apart: the guest keeps the samples side by side), else nullptr: drawn as one sample, as before.
+RDNA4PvHost::MsaaSurface *RDNA4PvHost::msaaTarget(uint32_t task, uint32_t tex, uint32_t width, uint32_t height, uint32_t bpr, uint32_t bpp)
+{
+	TextureSource ts;
+
+	if (!mRtOpen || (bpp != 4 && bpp != 8) || bpr < 2 * width * bpp || !textureSource(task, tex, ts) || ts.surface.memory ||
+	    (ts.samples != 2 && ts.samples != 4))
+		return nullptr;
+
+	return msaaSurface(task, tex, width, height, ts.samples, bpp);
+}
+
+// A pass's multisampled attachment resolved: rdna4_resolve (tools/metal/m3/kernels.metal) averages its samples into the texture's memory as
+// one sample, where draws went before multisampling (copyWholeTexture copies it into the resolve texture after). Run on the compute queue
+// once the draws into the samples are done; an sRGB texture's (RGBA8 or BGRA8 sRGB) by rdna4_resolve_srgb, in linear light.
+bool RDNA4PvHost::resolveMsaa(uint32_t task, uint32_t tex)
+{
+	MsaaSurface *ms = nullptr;
+	TextureSource ts;
+
+	for (MsaaSurface &m : mMsaa)
+		if (m.handle && m.task == task && m.tex == tex)
+			ms = &m;
+
+	const uint64_t bytes = ms && textureSource(task, tex, ts) ? static_cast<uint64_t>(ts.rowBytes) * ts.height : 0;
+	const char *kernel = ts.format == 71 || ts.format == 81 ? "rdna4_resolve_srgb" : "rdna4_resolve";
+	uint32_t prog = 0;
+
+	for (unsigned i = 0; bytes && i < kMtlKernelCount && !prog; i++)
+		if (!strcmp(kMtlKernels[i].name, kernel))
+			prog = program(i);
+
+	uint64_t handle = 0, gpu = 0, tableHandle = 0, tableGpu = 0, micros = 0;
+
+	if (!prog || !bytes || bytes > ts.length || ts.width != ms->width || ts.height != ms->height ||
+	    !mapGuest(task, ts.va, bytes, handle, gpu, true))
+		return false;
+
+	static uint32_t table[0x400 / 4];   // ponytail: one host, its work loop only
+	const uint32_t raw = ms->bpp == 8 ? 57 : 42, sel = 4 | 5 << 3 | 6 << 6 | 7 << 9;   // 16_16_16_16 float or 8_8_8_8 unorm, as stored
+
+	memset(table, 0, sizeof(table));
+	msaaImage(table + RDNA4_MTLC_TABLE_TEXTURES / 4, ms->gpu, raw, sel, ms->width, ms->height, ms->samples == 4 ? 2 : 1);
+	linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32) / 4, gpu, raw, sel, ts.width, ts.height, ts.rowBytes / ms->bpp);
+
+	if (gCompute->rtAlloc(this, sizeof(table), tableHandle, tableGpu) != kIOReturnSuccess)
+		return false;
+
+	bool ok = gCompute->rtCopy(this, tableHandle, 0, kernel_task, reinterpret_cast<mach_vm_address_t>(table), sizeof(table), true) == kIOReturnSuccess;
+	RDNA4Dispatch d {};
+	const uint32_t dims[6] = {8, 8, 1, ts.width, ts.height, 1};   // threads per threadgroup, threads in the grid (air2amdgpu.cpp's kernargs)
+
+	d.program = prog;
+	for (unsigned i = 0; i < 3; i++) {
+		d.groupSize[i] = dims[i];
+		d.groups[i] = (dims[i + 3] + dims[i] - 1) / dims[i];
+	}
+	memcpy(d.kernargs, dims, sizeof(dims));
+	memcpy(d.kernargs + sizeof(dims), &tableGpu, 8);
+	d.kernargBytes = sizeof(dims) + 8;
+
+	waitDraws();   // the compute queue does not wait for the draws into the samples
+	ok = ok && gCompute->rtDispatch(this, d, micros) == kIOReturnSuccess;
+	gCompute->rtFree(this, tableHandle);
+	dropShadows(nullptr, task, ts.va);
+
+	return ok;
 }
 
 // Row y's first `bytes` bytes of a texture textureSource found; of a 3D texture, row y % height of slice y / height.
@@ -5769,14 +6009,18 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// A texture in the guest's memory (not an IOSurface) held even where it could be drawn in place: in place, each draw went across the bus
 	// to the guest's memory, and Maps' (its whole map, blended) kept the card busy at 25 frames a second while it scrolled; held, 50. Its
 	// rows are written back once, at the end of the command buffer.
-	const bool hold = mRtOpen && !(gInPlace & 16) && (!placeable || (!surface.memory && !(gInPlace & 8192)));
+	// A multisampled attachment (2x, 4x): drawn with all its samples into their surface on the card, resolved at the pass's end (resolvePass);
+	// drawn as one sample, the Sequoia wallpaper's edges were rough
+	MsaaSurface *ms = !targetLevel && !surface.memory ? msaaTarget(task, targetId, width, height, bpr, tp) : nullptr;
+	const uint32_t logSamples = !ms ? 0 : ms->samples == 4 ? 2 : 1;
+	const bool hold = !ms && mRtOpen && !(gInPlace & 16) && (!placeable || (!surface.memory && !(gInPlace & 8192)));
 	const bool held = hold && holdTarget(task, target, va, surface, width, height, bpr, tp);
-	const bool inPlace = placeable && !held;
+	const bool inPlace = !ms && placeable && !held;
 
 	if (inPlace)   // a target in place over a held one's memory: that one written back first, the draw's rows then go over it
 		flushHeldIn(surface.surface, task, surface.memory ? surface.base : va, static_cast<uint64_t>(bpr) * height);
 
-	const uint32_t pitch = inPlace ? bpr / tp : (width * tp + 127) / 128 * 128 / tp;   // pixels; else a multiple of 128 bytes
+	const uint32_t pitch = ms ? width : inPlace ? bpr / tp : (width * tp + 127) / 128 * 128 / tp;   // pixels; else a multiple of 128 bytes
 	const uint64_t targetBytes = static_cast<uint64_t>(pitch) * height * tp;
 	// Only the scissor rectangle's rows are staged in and out (WindowServer limits most draws to what changed): nothing outside it is drawn.
 	const uint64_t regionAt = static_cast<uint64_t>(pitch) * sy * tp, regionBytes = static_cast<uint64_t>(pitch) * (sy2 - sy) * tp;
@@ -5787,7 +6031,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	mBuildSlot = slot;
 	const uint64_t slotAt = static_cast<uint64_t>(slot) * RDNA4_TRIRUN_PAGE;
 
-	const bool staged = !inPlace && !held;
+	const bool staged = !inPlace && !held && !ms;
 	const bool pooled = staged && mRtOpen && poolTake(targetBytes, tgt.gpu, pooledTarget);
 	uint32_t *stage = nullptr;
 
@@ -5798,6 +6042,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 	if (held)
 		tgt.gpu = mHeld->shadow->gpu;
+	if (ms)
+		tgt.gpu = ms->gpu;
 
 	// The target for the card: the guest's memory mapped (in place), the pool, or a runtime buffer of its own.
 	auto placeTarget = [&]() {
@@ -5809,7 +6055,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		if (inPlace)
 			return mapGuest(task, va, bytes, tgt.handle, tgt.gpu, true);
 
-		return held || pooled || gCompute->rtAlloc(this, targetBytes, tgt.handle, tgt.gpu) == kIOReturnSuccess;
+		return ms || held || pooled || gCompute->rtAlloc(this, targetBytes, tgt.handle, tgt.gpu) == kIOReturnSuccess;
 	};
 	const uint64_t ringBytes = rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK;
 	bool ok = mRtOpen && (!staged || stage) && make(mGfxCode, RDNA4_TRI_CODE_BYTES * kCodeSlots) && make(mGfxRings, ringBytes);
@@ -5846,7 +6092,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	static const uint32_t kPrimitive[5][2] = {{1, 0}, {2, 1}, {3, 1}, {4, 2}, {6, 2}};
 	// CB_COLOR0_INFO (gfx12.json: FORMAT 0-4, NUMBER_TYPE 8-10, COMP_SWAP 11-12, BLEND_CLAMP 15, SIMPLE_FLOAT 17): 8_8_8_8 unorm (COMP_SWAP
 	// ALT: BGRA8); else by the target's format, as Mesa's ac_formats.c maps it: 16_16_16_16 float, 16_16 float, 8 unorm, 16 float, 2_10_10_10 unorm
-	const uint32_t cbInfo = colourInfo(targetFormat, (inPlace || held) && bgra);
+	const uint32_t cbInfo = colourInfo(targetFormat, (inPlace || held || ms) && bgra);
+	// Metal's (and D3D's) standard sample positions in 1/16 pixel from the centre, signed 4-bit x, y per sample, the same for the four pixels
+	// of a quad, and their centroid order (radeonsi's si_state_msaa.c: 1x, 2x (4, 4) (-4, -4), 4x (-2, -6) (6, -2) (-6, 2) (2, 6))
+	// and their largest offset (PA_SC_SAMPLE_PROPERTIES.MAX_SAMPLE_DIST, RADV's defaults: with 0 the rasterizer misses edge samples)
+	static const uint32_t kLocs[3] = {0, 0x0000cc44u, 0x622ae6aeu}, kCentroid[3] = {0, 0x10101010u, 0x32103210u}, kMaxDist[3] = {0, 4, 6};
 	struct Patch { uint32_t opcode, reg, value; } patch[] = {
 		{0x76, 0x8a, vs[3]}, {0x76, 0x8b, vs[4]},                          // SPI_SHADER_PGM_RSRC1_GS, RSRC2_GS: as LLVM compiled the vertex shader
 		{0x76, 0x0a, ps[3]}, {0x76, 0x0b, ps[4]},                          // SPI_SHADER_PGM_RSRC1_PS, RSRC2_PS
@@ -5871,6 +6121,17 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		// DB_SHADER_CONTROL: a shader without a colour writes memory, which runs only with EXEC_ON_HIER_FAIL and EXEC_ON_NOOP, after the depth
 		// test (LATE_Z; RADV's for writes_memory, gfx12.json); else the template's EARLY_Z_THEN_LATE_Z
 		{0x69, 0x1b, noColour ? 0x600u : 0x10u},
+		// Multisampling (ms; else the template's values): CB_COLOR0_ATTRIB NUM_FRAGMENTS, ATTRIB3 COLOR_SW_MODE 64KB_2D (its RESOURCE_TYPE 2D
+		// kept), PA_SC_AA_CONFIG MSAA_NUM_SAMPLES and MSAA_EXPOSED_SAMPLES, PA_SC_MODE_CNTL_0 MSAA_ENABLE, DB_EQAA MASK_EXPORT_NUM_SAMPLES and
+		// ALPHA_TO_MASK_NUM_SAMPLES (radeonsi's gfx12 values), the centroid order and the sample positions of the quad's four pixels
+		{0x69, 0x31b, logSamples},
+		{0x69, 0x31f, 0x01000000u | (ms ? 3u << 15 : 0u)},
+		{0x69, 0x2f8, logSamples | logSamples << 20},
+		{0x69, 0x292, 0x22u | (ms ? 1u : 0u)},
+		{0x69, 0x1e, 0x00110000u | logSamples << 8 | logSamples << 12},
+		{0x69, 0x2fc, kCentroid[logSamples]}, {0x69, 0x2fd, kCentroid[logSamples]},
+		{0x69, 0x2fe, kLocs[logSamples]}, {0x69, 0x302, kLocs[logSamples]}, {0x69, 0x306, kLocs[logSamples]}, {0x69, 0x30a, kLocs[logSamples]},
+		{0x69, 0x317, kMaxDist[logSamples]},
 	};
 	// Where each patched register is in the stream: the same for every draw of a template (plain or colour), found once (streamReg walks
 	// the stream's packets for each: most of the time a draw's stream took).
@@ -6032,8 +6293,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	                     (dsRec[0] & 0xff) == 7 && (dsRec[0] >> 8) >= sizeof(ds) && readDesc(task, dsRec, ds, sizeof(ds)) && ds[0] == 4;
 	const bool stencilled = dsKnown && draw.stencil && (ds[3] & 0x30);
 	const bool depthTested = dsKnown && draw.depth && ((ds[3] & 7) != 7 || (ds[3] & 8));   // compare always, no write: nothing to do
-	const StencilBuf *sb = stencilled ? stencilFor(task, draw.stencil, 1, width, height) : nullptr;
-	const StencilBuf *zb = depthTested ? stencilFor(task, draw.depth, 4, width, height) : nullptr;
+	const StencilBuf *sb = stencilled ? stencilFor(task, draw.stencil, 1, width, height, 1u << logSamples) : nullptr;
+	const StencilBuf *zb = depthTested ? stencilFor(task, draw.depth, 4, width, height, 1u << logSamples) : nullptr;
 
 	if (sb || zb) {
 		static const uint8_t kOp[8] = {0, 1, 3, 5, 6, 7, 8, 9};
@@ -6048,7 +6309,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		put(0xc00b6900u);   // DB_DEPTH_SIZE_XY, DB_Z_INFO, DB_STENCIL_INFO, the Z and stencil read and write bases (256-byte units)
 		put(0x005);
 		put((width - 1) | (height - 1) << 16);
-		put(zb ? 3 | 3u << 4 : 0);                // Z_32_FLOAT, SW_64KB_2D; else Z_INVALID
+		put((zb ? 3 | 3u << 4 : 0) | logSamples << 2);   // Z_32_FLOAT, SW_64KB_2D (else Z_INVALID), NUM_SAMPLES as the colour's
 		put(sb ? 1 | 3u << 4 | 1u << 29 : 0);     // STENCIL_8, SW_64KB_2D, TILE_STENCIL_DISABLE; else STENCIL_INVALID
 		const StencilBuf *bases[4] = {zb, zb, sb, sb};   // Z read and write bases, stencil read and write bases
 		for (const StencilBuf *b : bases) {
@@ -6572,18 +6833,11 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 		// Blit.copyFromTexture:toTexture:, whole textures {u32 source, u32 destination, u32 source slice and level, u32 destination slice and
 		// level, u32 slices and levels: u16 each} (Maps copies its map into its CAMetalLayer's drawable, 2026-11-11). One slice of level 0 only.
 		uint32_t w[5];
-		TextureSource s, d;
+		bool onCard = false;
 
 		memcpy(w, p, sizeof(w));
 
-		const bool one = !w[2] && !w[3] && w[4] == 0x00010001 && textureSource(task, w[0], s);
-		const bool onCard = one && textureSource(task, w[1], d) && copyTextureOnCard(task, s, d);
-		const uint64_t origin[3] = {}, size[3] = {s.width, s.height, 1};
-
-		if (one && !onCard)
-			waitDraws();
-
-		const bool ok = onCard || (one && copyTexture(task, w[0], origin, w[1], origin, size));
+		const bool ok = !w[2] && !w[3] && w[4] == 0x00010001 && copyWholeTexture(task, w[0], w[1], &onCard);
 
 		pvlog("host: blit: copyFromTexture %u -> texture %u, whole (%08x %08x %08x) %s: %s", w[0], w[1], w[2], w[3], w[4],
 		      onCard ? "on the card" : "by rows", ok ? "done" : "NOT done");
@@ -6598,6 +6852,27 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 			       "%08x %08x %08x %08x %08x %08x", id, bytes, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13],
 			       w[14], w[15], w[16], w[17], w[18], w[19], w[20], w[21]);
 	}
+}
+
+// Level 0 of texture `from` into `to`, whole: on the card after the draws before it, else by rows once they are done.
+bool RDNA4PvHost::copyWholeTexture(uint32_t task, uint32_t from, uint32_t to, bool *onCard)
+{
+	TextureSource s, d;
+
+	if (!textureSource(task, from, s))
+		return false;
+
+	const bool card = textureSource(task, to, d) && copyTextureOnCard(task, s, d);
+	const uint64_t origin[3] = {}, size[3] = {s.width, s.height, 1};
+
+	if (onCard)
+		*onCard = card;
+	if (card)
+		return true;
+
+	waitDraws();
+
+	return copyTexture(task, from, origin, to, origin, size);
 }
 
 // A texture's whole heap descriptor, for the blits it failed (the first few of a boot).
