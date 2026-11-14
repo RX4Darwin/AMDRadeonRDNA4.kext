@@ -5,7 +5,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.2.1 (on `next`, no number yet)
 
-Nothing yet.
+**OpenGL (`make PVGPU=1`)**
+- On the card by default (`rdna4-pvgl=0` turns it off): the renderer is named on the accelerator only when its file
+  on disk has the bytes the kext patches (Tahoe 26.6.2's); another renderer keeps OpenGL in software instead of
+  aborting every GL app. Card (Tahoe 26.6.2, 2026-11-14, no `rdna4-pvgl` in the boot-args): the renderer named and
+  patched, kitty draws on the card.
 
 ## 0.2.1 (2026-11-14)
 

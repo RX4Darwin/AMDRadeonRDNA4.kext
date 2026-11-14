@@ -9,6 +9,7 @@
 #include "trial.hpp"
 #include "klog.hpp"
 #include "pvstream.hpp"
+#include <Headers/kern_file.hpp>
 #include <Headers/kern_patcher.hpp>
 #include "pvdraw.hpp"
 #include "pm4.hpp"
@@ -170,21 +171,34 @@ void pvPause() {
 }
 #define PVCALL(name) do { static uint32_t calls_; if (__atomic_fetch_add(&calls_, 1u, __ATOMIC_RELAXED) < 3) { pvlog("call: %s", name); pvPause(); } } while (0)
 
-// rdna4-pvgl=1: OpenGL.framework (libGFXShared) loads a renderer for an accelerator only if it names one in IOGLBundleName, which Apple's
-// paravirtual accelerator does not: GL then has its software renderer alone. This names Apple's GL-on-Metal renderer
-// (AppleMetalOpenGLRenderer.bundle) on the accelerator when it is published. On its own it would abort every GL process (the renderer
-// asserts in GLDDeviceRec::initWithDisplayMask: the device's vendor "Apple" is none it knows on Intel) and the guest would refuse every
-// GL render pass (no supportsDefaultRasterSampleCount): routeGlPages patches the renderer for both, under the same boot-arg.
+// OpenGL on the card, on unless rdna4-pvgl=0.
+static bool glWanted() {
+	uint32_t gl = 1;
+
+	(void)PE_parse_boot_argn("rdna4-pvgl", &gl, sizeof(gl));
+	return gl != 0;
+}
+
+static bool glRendererPatchable();
+
+// OpenGL.framework (libGFXShared) loads a renderer for an accelerator only if it names one in IOGLBundleName, which Apple's paravirtual
+// accelerator does not: GL then has its software renderer alone. This names Apple's GL-on-Metal renderer (AppleMetalOpenGLRenderer.bundle)
+// on the accelerator when it is published. On its own it would abort every GL process (the renderer asserts in
+// GLDDeviceRec::initWithDisplayMask: the device's vendor "Apple" is none it knows on Intel) and the guest would refuse every GL render pass
+// (no supportsDefaultRasterSampleCount): routeGlPages patches the renderer for both. So only when the renderer on disk has the bytes those
+// patches replace (Tahoe 26.6.2's): another one (an update, Sequoia) keeps GL in software instead of aborting its apps.
 static bool nameGlBundle(void *, void *, IOService *accel, IONotifier *) {
+	if (!glRendererPatchable()) {
+		pvlog("OpenGL: AppleMetalOpenGLRenderer is not the one patched (Tahoe 26.6.2's): OpenGL stays in software");
+		return true;
+	}
 	accel->setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer");
-	pvlog("OpenGL: IOGLBundleName AppleMetalOpenGLRenderer on %s (rdna4-pvgl)", accel->getName());
+	pvlog("OpenGL: IOGLBundleName AppleMetalOpenGLRenderer on %s", accel->getName());
 	return true;
 }
 
 static void watchForGlAccelerator() {
-	uint32_t gl = 0;
-
-	if (!PE_parse_boot_argn("rdna4-pvgl", &gl, sizeof(gl)) || !gl)
+	if (!glWanted())
 		return;
 
 	OSDictionary *match = IOService::serviceMatching("AppleParavirtAccelerator");
@@ -195,7 +209,7 @@ static void watchForGlAccelerator() {
 		pvlog("OpenGL: no notification for the paravirtual accelerator: IOGLBundleName not set");
 }
 
-// rdna4-pvgl=1, user space: AppleMetalOpenGLRenderer itself patched where its pages come in from disk (Lilu's user patcher does this no
+// User space: AppleMetalOpenGLRenderer itself patched where its pages come in from disk (Lilu's user patcher does this no
 // more from Big Sur on: its isUserDisabled). The kernel's cs_validate_page (Tahoe 26.6.2: void (vnode, pager, page offset in the file,
 // data, int *validated, int *tainted, int *nx), the last on the stack) is wrapped; a page it validated at one of these offsets of the
 // renderer's universal file (x86_64 slice at 0x4000) whose bytes are exactly these gets the replacement, in the page every process maps.
@@ -244,12 +258,31 @@ void wrapValidatePage(void *vnode, void *pager, uint64_t offset, const void *dat
 	}
 }
 
+const char kGlRenderer[] = "/System/Library/Extensions/AppleMetalOpenGLRenderer.bundle/Contents/MacOS/AppleMetalOpenGLRenderer";
+
 } // namespace
 
-void routeGlPagesNow(KernelPatcher &patcher) {
-	uint32_t gl = 0;
+// Whether the renderer's file has, at each patch's place, the bytes the patch replaces.
+static bool glRendererPatchable() {
+	vfs_context_t ctx = vfs_context_create(nullptr);
+	vnode_t vn = NULLVP;
+	bool ok = ctx && !vnode_lookup(kGlRenderer, 0, &vn, ctx);
 
-	if (!PE_parse_boot_argn("rdna4-pvgl", &gl, sizeof(gl)) || !gl)
+	for (const GlPagePatch &p : kGlPagePatches) {
+		uint8_t bytes[16];
+
+		ok = ok && p.size <= sizeof(bytes) && !FileIO::readFileData(bytes, static_cast<off_t>(p.page + p.at), p.size, vn, ctx) &&
+		     !memcmp(bytes, p.find, p.size);
+	}
+	if (vn != NULLVP)
+		vnode_put(vn);
+	if (ctx)
+		vfs_context_rele(ctx);
+	return ok;
+}
+
+void routeGlPagesNow(KernelPatcher &patcher) {
+	if (!glWanted())
 		return;
 
 	KernelPatcher::RouteRequest request {"_cs_validate_page", wrapValidatePage, orgValidatePage};
@@ -257,7 +290,7 @@ void routeGlPagesNow(KernelPatcher &patcher) {
 
 	if (!ok)
 		patcher.clearError();
-	pvlog("OpenGL: cs_validate_page %s (rdna4-pvgl): AppleMetalOpenGLRenderer %s", ok ? "wrapped" : "NOT wrapped",
+	pvlog("OpenGL: cs_validate_page %s: AppleMetalOpenGLRenderer %s", ok ? "wrapped" : "NOT wrapped",
 	      ok ? "is patched where its pages come in" : "stays as it is");
 }
 
