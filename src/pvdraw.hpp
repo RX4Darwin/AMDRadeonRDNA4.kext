@@ -77,13 +77,35 @@ static inline bool wholeDouble(uint64_t bits, int64_t &out) {
 	return true;
 }
 
+// An 8-bit linear value as 8-bit sRGB (round(255 * encode(i / 255))): a clear colour for an sRGB target, which Metal gives linear.
+static const uint8_t kSrgbOf[256] = {
+	  0,  13,  22,  28,  34,  38,  42,  46,  50,  53,  56,  59,  61,  64,  66,  69,
+	 71,  73,  75,  77,  79,  81,  83,  85,  86,  88,  90,  92,  93,  95,  96,  98,
+	 99, 101, 102, 104, 105, 106, 108, 109, 110, 112, 113, 114, 115, 117, 118, 119,
+	120, 121, 122, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136,
+	137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 148, 149, 150, 151,
+	152, 153, 154, 155, 155, 156, 157, 158, 159, 159, 160, 161, 162, 163, 163, 164,
+	165, 166, 167, 167, 168, 169, 170, 170, 171, 172, 173, 173, 174, 175, 175, 176,
+	177, 178, 178, 179, 180, 180, 181, 182, 182, 183, 184, 185, 185, 186, 187, 187,
+	188, 189, 189, 190, 190, 191, 192, 192, 193, 194, 194, 195, 196, 196, 197, 197,
+	198, 199, 199, 200, 200, 201, 202, 202, 203, 203, 204, 205, 205, 206, 206, 207,
+	208, 208, 209, 209, 210, 210, 211, 212, 212, 213, 213, 214, 214, 215, 215, 216,
+	216, 217, 218, 218, 219, 219, 220, 220, 221, 221, 222, 222, 223, 223, 224, 224,
+	225, 226, 226, 227, 227, 228, 228, 229, 229, 230, 230, 231, 231, 232, 232, 233,
+	233, 234, 234, 235, 235, 236, 236, 237, 237, 238, 238, 238, 239, 239, 240, 240,
+	241, 241, 242, 242, 243, 243, 244, 244, 245, 245, 246, 246, 246, 247, 247, 248,
+	248, 249, 249, 250, 250, 251, 251, 251, 252, 252, 253, 253, 254, 254, 255, 255,
+};
+
 // A clear colour (doubles' bits, R G B A) as a 32-bit pattern that fills a target of Metal pixel format `format` (0: unknown 32-bit, as
 // BGRA8) pixel by pixel; any format to zero, others false.
 static inline bool clearPattern(uint32_t format, const uint64_t rgba[4], uint32_t &pattern) {
 	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
 	switch (format) {
-	case 70: case 71: pattern = r | g << 8 | b << 16 | a << 24; return true;   // RGBA8: R, G, B, A in memory
-	case 0: case 80: case 81: pattern = b | g << 8 | r << 16 | a << 24; return true;
+	case 70: pattern = r | g << 8 | b << 16 | a << 24; return true;   // RGBA8: R, G, B, A in memory
+	case 71: pattern = kSrgbOf[r] | kSrgbOf[g] << 8 | kSrgbOf[b] << 16 | a << 24; return true;
+	case 0: case 80: pattern = b | g << 8 | r << 16 | a << 24; return true;
+	case 81: pattern = kSrgbOf[b] | kSrgbOf[g] << 8 | kSrgbOf[r] << 16 | a << 24; return true;   // sRGB: the colour encoded, alpha as it is
 	case 10: pattern = r * 0x01010101u; return true;
 	case 25: pattern = doubleAsHalf(rgba[0]) * 0x00010001u; return true;
 	case 65: pattern = doubleAsHalf(rgba[0]) | doubleAsHalf(rgba[1]) << 16; return true;
@@ -137,6 +159,15 @@ static inline void linearImage(uint32_t *t, uint64_t gpu, uint32_t format, uint3
 	t[5] = 4u << 20;                                                                        // PERF_MOD 4
 	t[6] = 1u << 15;                                                                        // MAX_UNCOMPRESSED_BLOCK_SIZE 256 B
 	t[7] = 0;
+}
+
+// A multisampled 2D image's T# (as ac_build_gfx12_texture_descriptor for num_samples > 1): log2 of the samples in MAX_MIP and LAST_LEVEL,
+// BASE_LEVEL 0, SW_MODE 64KB_2D (3, the colour surface runDraw draws a multisampled attachment into), TYPE 2D_MSAA (14).
+static inline void msaaImage(uint32_t *t, uint64_t gpu, uint32_t format, uint32_t sel, uint32_t w, uint32_t h, uint32_t logSamples) {
+	linearImage(t, gpu, format, sel, w, h, 1);
+	t[1] |= logSamples << 12;
+	t[3] = sel | logSamples << 15 | 3u << 20 | 14u << 28;
+	t[4] = 0;
 }
 
 // A linear 3D image's T#, as linearImage: its slices `depth` deep, the hardware's own pitches: rows the row's bytes aligned to 128, slices
