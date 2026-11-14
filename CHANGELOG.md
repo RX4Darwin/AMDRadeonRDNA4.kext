@@ -17,7 +17,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
   in 6 ms, the second display's mode switches go through it (1680x1050 measured 59.885 Hz, 1080p 60.003 Hz).
 - The extra displays' pipe selection is held under one lock from selection through use: the hot-plug poll, macOS's
   mode switches (paravirtual host thread or NDRV) and the heads' start-up selected pipes under one another (card
-  2026-11-14: a switch logged another slot's empty mode). Built and host-tested; not yet run on the card.
+  2026-11-14: a switch logged another slot's empty mode). Card (2026-11-14): six switches of the HDMI display, each
+  logged and measured as asked (1024x768, 1280x1024, 1920x1080).
 
 ## 0.2.2 (2026-11-14)
 
