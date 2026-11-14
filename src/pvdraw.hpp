@@ -41,7 +41,8 @@ static inline uint32_t doubleAsHalf(uint64_t bits) {
 }
 
 // A colour target's CB_COLOR0_INFO by its Metal pixel format (gfx12.json: FORMAT 0-4, NUMBER_TYPE 8-10, COMP_SWAP 11-12, BLEND_CLAMP 15,
-// SIMPLE_FLOAT 17; as Mesa's ac_formats.c maps them): 16_16_16_16 float, 16_16 float, 8 unorm, 16 float, 2_10_10_10 unorm; else
+// BLEND_BYPASS 16, SIMPLE_FLOAT 17; as Mesa's ac_formats.c maps them): 16_16_16_16 float, 16_16 float, 8 unorm, 16 float, 2_10_10_10 unorm,
+// 32_32 uint and sint; else
 // 8_8_8_8 unorm, with COMP_SWAP ALT when BGRA8 is drawn as the guest has it (`swap`).
 static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	switch (format) {
@@ -51,38 +52,10 @@ static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	case 10: return 0x00020001u;    // R8Unorm
 	case 25: return 0x00020702u;    // R16Float
 	case 90: return 0x00020009u;    // RGB10A2Unorm
+	case 103: return 0x0003040bu;   // RG32Uint: 32_32 UINT, BLEND_BYPASS as Mesa's for integers (WindowServer's brim_init_lpf, Tahoe)
+	case 104: return 0x0003050bu;   // RG32Sint
 	default: return swap ? 0x0002880au : 0x0002800au;
 	}
-}
-
-// A clear colour (doubles' bits, R G B A) as a 32-bit pattern that fills a target of Metal pixel format `format` (0: unknown 32-bit, as
-// BGRA8) pixel by pixel; any format to zero, others false.
-static inline bool clearPattern(uint32_t format, const uint64_t rgba[4], uint32_t &pattern) {
-	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
-	switch (format) {
-	case 70: case 71: pattern = r | g << 8 | b << 16 | a << 24; return true;   // RGBA8: R, G, B, A in memory
-	case 0: case 80: case 81: pattern = b | g << 8 | r << 16 | a << 24; return true;
-	case 10: pattern = r * 0x01010101u; return true;
-	case 25: pattern = doubleAsHalf(rgba[0]) * 0x00010001u; return true;
-	case 65: pattern = doubleAsHalf(rgba[0]) | doubleAsHalf(rgba[1]) << 16; return true;
-	case 90: pattern = unormN(rgba[0], 10) | unormN(rgba[1], 10) << 10 | unormN(rgba[2], 10) << 20 | unormN(rgba[3], 2) << 30; return true;
-	default: pattern = 0; return !(rgba[0] | rgba[1] | rgba[2] | rgba[3]);   // RGBA16Float's four halves do not fit in 32 bits
-	}
-}
-
-// A double (its bits) as an IEEE-754 single's bits, its significand cut short (rounded toward zero), with integers only: below the
-// single's normal range 0 of its sign, above it infinity of its sign, NaN a quiet NaN.
-static inline uint32_t doubleAsFloat(uint64_t bits) {
-	const uint32_t sign = static_cast<uint32_t>(bits >> 32) & 0x80000000u;
-	const int32_t e = static_cast<int32_t>(bits >> 52 & 0x7ff);
-	if (e == 0x7ff)
-		return sign | (bits & ((1ull << 52) - 1) ? 0x7fc00000u : 0x7f800000u);
-	const int32_t f = e - 1023 + 127;
-	if (f <= 0)
-		return sign;
-	if (f >= 0xff)
-		return sign | 0x7f800000u;
-	return sign | static_cast<uint32_t>(f) << 23 | static_cast<uint32_t>(bits >> 29 & 0x7fffff);
 }
 
 // A double (its bits) as a whole number of magnitude below 2^30; false if it has a fraction or is larger (no floating point in the kernel).
@@ -101,6 +74,44 @@ static inline bool wholeDouble(uint64_t bits, int64_t &out) {
 	if (bits >> 63)
 		out = -out;
 	return true;
+}
+
+// A clear colour (doubles' bits, R G B A) as a 32-bit pattern that fills a target of Metal pixel format `format` (0: unknown 32-bit, as
+// BGRA8) pixel by pixel; any format to zero, others false.
+static inline bool clearPattern(uint32_t format, const uint64_t rgba[4], uint32_t &pattern) {
+	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
+	switch (format) {
+	case 70: case 71: pattern = r | g << 8 | b << 16 | a << 24; return true;   // RGBA8: R, G, B, A in memory
+	case 0: case 80: case 81: pattern = b | g << 8 | r << 16 | a << 24; return true;
+	case 10: pattern = r * 0x01010101u; return true;
+	case 25: pattern = doubleAsHalf(rgba[0]) * 0x00010001u; return true;
+	case 65: pattern = doubleAsHalf(rgba[0]) | doubleAsHalf(rgba[1]) << 16; return true;
+	case 90: pattern = unormN(rgba[0], 10) | unormN(rgba[1], 10) << 10 | unormN(rgba[2], 10) << 20 | unormN(rgba[3], 2) << 30; return true;
+	case 103: case 104: {   // RG32Uint, RG32Sint: both 32-bit halves the same whole number (WindowServer's brim passes, Tahoe)
+		int64_t x, y;
+		pattern = 0;
+		if (!wholeDouble(rgba[0], x) || !wholeDouble(rgba[1], y) || x != y || (format == 103 && x < 0))
+			return false;
+		pattern = static_cast<uint32_t>(x);
+		return true;
+	}
+	default: pattern = 0; return !(rgba[0] | rgba[1] | rgba[2] | rgba[3]);   // RGBA16Float's four halves do not fit in 32 bits
+	}
+}
+
+// A double (its bits) as an IEEE-754 single's bits, its significand cut short (rounded toward zero), with integers only: below the
+// single's normal range 0 of its sign, above it infinity of its sign, NaN a quiet NaN.
+static inline uint32_t doubleAsFloat(uint64_t bits) {
+	const uint32_t sign = static_cast<uint32_t>(bits >> 32) & 0x80000000u;
+	const int32_t e = static_cast<int32_t>(bits >> 52 & 0x7ff);
+	if (e == 0x7ff)
+		return sign | (bits & ((1ull << 52) - 1) ? 0x7fc00000u : 0x7f800000u);
+	const int32_t f = e - 1023 + 127;
+	if (f <= 0)
+		return sign;
+	if (f >= 0xff)
+		return sign | 0x7f800000u;
+	return sign | static_cast<uint32_t>(f) << 23 | static_cast<uint32_t>(bits >> 29 & 0x7fffff);
 }
 
 // n / 2 as an IEEE-754 single's bits, negated if asked, for n < 2^24 (no floating point in the kernel).

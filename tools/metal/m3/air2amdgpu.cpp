@@ -542,7 +542,34 @@ static std::string legalize(Function &k) {
 					args.push_back(value);
 				types.append({t->getType(), sm->getType()});
 				args.append({t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
-				texel = b.CreateIntrinsic(ids[cube][packed != 0][mode], types, args);
+				const CallingConv::ID cc = k.getCallingConv();
+				if (mode == 2 && !cube && (cc == CallingConv::AMDGPU_PS || cc == CallingConv::AMDGPU_GS)) {
+					// An explicit LOD in a draw's shader (WindowServer's glass blurs each level from the one before, Tahoe): levels
+					// floor(lod) and the next as images of their own (RDNA4_MTLC_LEVEL_FIRST), sampled at their level 0, blended by the
+					// LOD's fraction, as a linear mip filter. ponytail: always blended (a nearest mip filter too), the sampler's LOD
+					// clamps ignored; kernels' tables have no levels (their explicit LODs read level 0 as before).
+					k.addFnAttr("rdna4-levels");
+					Type *ft = b.getFloatTy();
+					Value *l = b.CreateBinaryIntrinsic(Intrinsic::minnum, b.CreateBinaryIntrinsic(Intrinsic::maxnum, value, ConstantFP::get(ft, 0.0)),
+					                                   ConstantFP::get(ft, RDNA4_MTLC_LEVELS - 1.0));
+					Value *whole = b.CreateUnaryIntrinsic(Intrinsic::floor, l), *fraction = b.CreateFSub(l, whole);
+					Value *l0 = b.CreateFPToUI(whole, b.getInt32Ty());
+					Value *l1 = b.CreateBinaryIntrinsic(Intrinsic::umin, b.CreateAdd(l0, b.getInt32(1)), b.getInt32(RDNA4_MTLC_LEVELS - 1));
+					auto levelSample = [&](Value *level) {
+						Value *past = b.CreateAdd(b.CreateMul(level, b.getInt32(RDNA4_MTLC_LEVEL_STRIDE)),
+						                          b.getInt32(RDNA4_MTLC_LEVEL_FIRST - RDNA4_MTLC_LEVEL_STRIDE));
+						Value *at = b.CreateSelect(b.CreateICmpEQ(level, b.getInt32(0)), b.getInt32(0), past);
+						Value *lt = descriptor(b.CreateGEP(b.getInt8Ty(), c->getArgOperand(0), b.CreateZExt(at, b.getInt64Ty())), 8);
+						SmallVector<Value *, 10> la = {b.getInt32(15)};
+						if (packed)
+							la.push_back(b.getInt32(packed));
+						la.append({x, y, lt, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+						return b.CreateIntrinsic(ids[0][packed != 0][3], {v4f, ft, lt->getType(), sm->getType()}, la);
+					};
+					Value *s0 = levelSample(l0), *s1 = levelSample(l1);
+					texel = b.CreateFAdd(s0, b.CreateFMul(b.CreateFSub(s1, s0), b.CreateVectorSplat(4, fraction)));
+				} else
+					texel = b.CreateIntrinsic(ids[cube][packed != 0][mode], types, args);
 			} else {
 				// The offset is added to the coordinates; a level other than 0 reads that mip level (image_load_mip).
 				if (!samplerless && c->arg_size() < 5)
@@ -899,7 +926,8 @@ struct Kernel {
 
 // A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
 // (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
-// u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes (bits 0-15 the values between the stages; bits 20-27 the colour attachments
+// u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes (bits 0-15 the values between the stages; bit 16 its textures' levels read
+// (RDNA4_MTLC_LEVEL_FIRST); bits 20-27 the colour attachments
 // written when several, chosen by the host; bits 28-30 the one attachment other than 0 written; bit 31: a fragment shader without a colour)}, then the code
 // (relocation-free, the entry at its start), then per attribute
 // {u32 hash of its AIR name (FNV-1a), u32 flags: bit 0 flat, bit 1 the point's coordinate (no name)}: the vertex function's outputs in ring-slot order, the fragment function's
@@ -1027,7 +1055,9 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			t = colourMember < st->getNumElements() ? st->getElementType(colourMember) : nullptr;
 		auto *vt = t ? dyn_cast<FixedVectorType>(t) : nullptr;
 		Type *e = vt ? vt->getElementType() : t;
-		return e && (e == f32 || e->isHalfTy()) && (!vt || vt->getNumElements() <= 4);
+		// or 32-bit integers (WindowServer's brim_init_lpf/brim_jump_lpf on Tahoe: int2 into an RG32 integer target): their bits exported
+		// as they are, the host's SPI_SHADER_COL_FORMAT and CB format saying integer
+		return e && (e == f32 || e->isHalfTy() || e == i32) && (!vt || vt->getNumElements() <= 4);
 	};
 	// (Read now: compile() below deletes the AIR function once it is inlined.)
 	const bool noColour = !vertex && air->getReturnType()->isVoidTy();
@@ -1411,7 +1441,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		return "no code or no register values in the shader object";
 	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3],
 	                          static_cast<uint32_t>(vars.size()) | writes << 20 | (attachment > 0 ? static_cast<uint32_t>(attachment) << 28 : 0) |
-	                          (noColour ? 1u << 31 : 0)};
+	                          (noColour ? 1u << 31 : 0) | (f->hasFnAttribute("rdna4-levels") ? 1u << 16 : 0)};
 	out.hsaco.assign(reinterpret_cast<const char *>(head), sizeof(head));
 	out.hsaco += code.str();
 	for (const Var &v : vars) {

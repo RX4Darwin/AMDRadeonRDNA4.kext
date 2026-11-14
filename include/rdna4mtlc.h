@@ -42,3 +42,11 @@ enum { kMtlcNext = 0, kMtlcDeliver = 1 };
  * of that attachment is the one exported. */
 #define RDNA4_MTLC_TABLE_ATTACHMENT 0x500u
 #define RDNA4_MTLC_MAX_ATTRIBUTES 16u
+/* A shader that samples at an explicit LOD (its RGFX header's bit 16): level L (1-7) of texture n's T# at RDNA4_MTLC_LEVEL_FIRST
+ * + RDNA4_MTLC_LEVEL_STRIDE (L - 1) past its level 0 T#, in both stages (the host's state page: the vertex stage's table at +0x400, the
+ * fragment stage's at +0x800, level L's T#s from +0x1000 + RDNA4_MTLC_LEVEL_STRIDE (L - 1), the vertex stage's then the fragment stage's
+ * 0x400 on). Each a level-0 image of that level's memory: the guest's levels are largest first, the hardware's linear ones smallest
+ * first, so one T# cannot hold them. Past a texture's last level, its last. */
+#define RDNA4_MTLC_LEVEL_FIRST 0xbc0u
+#define RDNA4_MTLC_LEVEL_STRIDE 0x800u
+#define RDNA4_MTLC_LEVELS 8u

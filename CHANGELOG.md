@@ -5,7 +5,20 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.2.0 (on `next`, no number yet)
 
-Nothing yet.
+**Metal (`make PVGPU=1`)**
+- Mip levels: a render pass draws into the level its attachment names (each level's own memory, size and rows), clears
+  it there, and blits copy any level; a shader that samples at an explicit LOD reads the two levels around it, each
+  a level-0 image of the guest's memory, and blends them (`RDNA4_MTLC_LEVEL_FIRST`: the guest's levels are largest
+  first, the hardware's linear ones smallest first, so one T# cannot hold them). Tahoe's glass blurs its backdrop
+  that way; Finder's sidebar was black, now it is glass. Level 0 of a mipmapped RGBA8 texture was drawn as BGRA8
+  (its format is past where it was looked for). A level whose rows are not 128 bytes apart is read as the level
+  before it. Card (Tahoe 26.6.2, 2026-11-14): Finder's sidebar; `mipprobe` (four levels drawn and sampled at LODs
+  0 to 3, shared and private) gives what an Apple GPU gives.
+- RG32Uint and RG32Sint colour targets, as WindowServer's `brim_init_lpf` and `brim_jump_lpf` use: the translator
+  exports a shader's integers as they are, the host draws them with an integer format, and clears them to a whole
+  value. Card (2026-11-14): `intprobe`, shared, managed and private, drawn and cleared. WindowServer's own brim
+  draws were not seen on the card again after this; a refused colour target now logs its format, size, rows and
+  storage the first time each kind is refused.
 
 ## 0.2.0 (2026-11-12)
 

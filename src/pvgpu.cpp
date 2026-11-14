@@ -74,6 +74,13 @@ namespace {
 
 constexpr uint32_t kLoggedCmds = 1500;    // FIFO commands logged one by one
 constexpr uint32_t kMaxLogLines = 30000;   // M1 reads the protocol from this log (docs/m1-stream.md)
+// A draw's colour target: the texture's id, and the pass's mip level for it in bits 24-27 (held targets and the draws' bookkeeping tell
+// the levels apart by it; the texture's records are found by the id)
+constexpr uint32_t kTargetId = 0xffffff;
+// A draw's state page (mGfxMisc): the stages' tables in its first 0x1000 bytes, then its textures' levels (RDNA4_MTLC_LEVEL_FIRST)
+constexpr uint32_t kLevelsAt = 0x1000, kMiscPage = 0x5000;
+static_assert(kLevelsAt + RDNA4_MTLC_LEVEL_STRIDE * (RDNA4_MTLC_LEVELS - 2) + 0x400 + 32 * 16 <= kMiscPage, "the levels fit the state page");
+static_assert(0x400 + RDNA4_MTLC_TABLE_TEXTURES + RDNA4_MTLC_LEVEL_FIRST == kLevelsAt, "level 1 of the vertex stage's texture 0");
 // GpuCoreCount: the compute units of the card, 64 on the RX 9070 XT and 56 on
 // the RX 9070 (sku.hpp). From the product specification, not read from the
 // card: the kext's IP discovery has shader-engine and render-backend counts
@@ -370,7 +377,9 @@ private:
 	static void placeShaders(uint32_t *code, const Jit *const shader[3], uint64_t rings, uint32_t outs);
 	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
 	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow = nullptr, uint32_t *width = nullptr,
-	                  uint32_t *height = nullptr, uint32_t *format = nullptr, uint32_t *storage = nullptr);
+	                  uint32_t *height = nullptr, uint32_t *format = nullptr, uint32_t *storage = nullptr, uint32_t level = 0);
+	bool levelRange(uint32_t task, uint32_t id, uint32_t level, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow, uint32_t *width,
+	                uint32_t *height, uint32_t *format, uint32_t *storage);
 	struct Surface;
 	bool surfaceRange(uint32_t task, uint32_t id, Surface &out);
 	void dumpTexture(uint32_t task, uint32_t id);
@@ -409,6 +418,7 @@ public:
 	bool stageTextures(uint32_t task, const Bindings &bound, uint32_t *table, StagedTexture (&out)[16], bool talk, const char *stageName,
 	                   bool writes, uint32_t texturesWritten = 0);
 	bool releaseTextures(uint32_t task, StagedTexture (&staged)[16], bool copyBack);
+	void levelImages(uint32_t task, const Bindings &bound, const uint32_t *table, uint32_t *levels);
 	bool mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t &handle, uint64_t &gpu, bool write = false);
 	bool mapGuestPages(uint32_t task, uint64_t first, uint64_t count, bool write, uint64_t &handle, uint64_t &gpu);
 	IOBufferMemoryDescriptor *mHolePage { nullptr };   // what a window's pages that are not there are mapped to
@@ -2552,10 +2562,19 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		t->target = t->host->runRenderPass(t->task, payload, bytes);
 		for (uint32_t k = 0; k < 8; k++)   // {u32 texture, ...} 0x3c apart from 0x4c (logPassDescriptor); a plain view's own texture
 			if (0x4c + 0x3c * k + 4 <= bytes) {
+				uint32_t level = 0;
 				memcpy(&t->attachments[k], payload + 0x4c + 0x3c * k, 4);
+				if (0x54 + 0x3c * k + 4 <= bytes)
+					memcpy(&level, payload + 0x54 + 0x3c * k, 4);
 				t->attachments[k] = t->host->viewParent(t->task, t->attachments[k]);
+				if (level > 15)   // a level past 15: no attachment (its draws refused)
+					t->attachments[k] = 0;
+				else if (t->attachments[k])   // its mip level as bits 24-27 (kTargetId)
+					t->attachments[k] |= level << 24;
 			} else
 				t->attachments[k] = 0;
+		if (t->target == (t->attachments[0] & kTargetId))
+			t->target = t->attachments[0];
 		t->viewportSet = false;
 		t->scissorSet = false;
 
@@ -2810,7 +2829,9 @@ bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t
 // [13] bytes per row, [15] width, ...} (mtlprobe's 64x64 BGRA8 render target: 0x4000 bytes at page 0x101, 0x100 per row: linear; measured
 // 2026-10-21). Where the pixel format is (0x04010101 at [8]?) is still open; the first descriptors of a boot are logged.
 bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow, uint32_t *width, uint32_t *height,
-                               uint32_t *format, uint32_t *storage) {
+                               uint32_t *format, uint32_t *storage, uint32_t level) {
+	if (level)
+		return levelRange(task, id, level, va, len, bytesPerRow, width, height, format, storage);
 	uint32_t rec[3] = {}, desc[29];
 	if (!readRec(task, id, rec) || ((rec[0] & 0xff) != 2 && (rec[0] & 0xff) != 3) || (rec[0] >> 8) < sizeof(desc) ||
 	    !readDesc(task, rec, desc, sizeof(desc))) {
@@ -2818,6 +2839,10 @@ bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_
 			pvlog("host: task %u resource %u: no texture (heap record %08x)", task, id, rec[0]);
 		return false;
 	}
+	// a mipmapped texture's format comes after its levels, past these 29 dwords: textureSource reads them all (level 0 of an RGBA8 one
+	// was drawn as BGRA8, its red and blue swapped)
+	if ((desc[3] & 0xffff) > 1)
+		return levelRange(task, id, 0, va, len, bytesPerRow, width, height, format, storage);
 	if (mRenderLines++ < 24)
 		pvlog("host: task %u texture %u: descriptor %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", task, id, desc[0],
 	      desc[1], desc[2], desc[3], desc[4], desc[5], desc[6], desc[7], desc[8], desc[9], desc[10], desc[11], desc[12], desc[13], desc[14], desc[15]);
@@ -2934,6 +2959,7 @@ static const TextureFormat *textureFormat(uint32_t metal) {
 	                                     {33, 18, 4 | 5 << 3 | 1 << 9, 2},                                                         // RG8 uint
 	                                     {63, 27, 4 | 5 << 3 | 1 << 9, 4}, {73, 46, 4 | 5 << 3 | 6 << 6 | 7 << 9, 4},              // RG16, RGBA8 uint
 	                                     {103, 48, 4 | 5 << 3 | 1 << 9, 8}, {113, 55, 4 | 5 << 3 | 6 << 6 | 7 << 9, 8},            // RG32, RGBA16 uint
+	                                     {104, 49, 4 | 5 << 3 | 1 << 9, 8},                                                         // RG32 sint (32_32_SINT)
 	                                     {123, 61, 4 | 5 << 3 | 6 << 6 | 7 << 9, 16}};                                           // RGBA32 uint
 	for (const TextureFormat &e : fmts)
 		if (e.metal == metal)
@@ -3080,18 +3106,21 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 		return 0;
 	uint32_t tex, actions;
 	uint64_t rgba[4];   // the clear colour as IEEE-754 doubles, converted with integers only (no floating point in the kernel)
+	uint32_t level;   // the attachment's mip level (as the pass's draws: kTargetId)
 	memcpy(&tex, p + 0x4c, 4);
+	memcpy(&level, p + 0x54, 4);
 	tex = viewParent(task, tex);
 	memcpy(&actions, p + 0x60, 4);
 	memcpy(rgba, p + 0x68, sizeof(rgba));
 
-	if ((actions & 0xffff) != 2 || !tex)   // MTLLoadActionClear
+	if ((actions & 0xffff) != 2 || !tex || level > 15)   // MTLLoadActionClear
 		return tex;
 
 	const uint32_t r = unorm8(rgba[0]), g = unorm8(rgba[1]), b = unorm8(rgba[2]), a = unorm8(rgba[3]);
 	uint64_t va, len;
 	uint32_t bpr = 0, w = 0, h = 0, format = 0;
-	const bool found = textureRange(task, tex, &va, &len, &bpr, &w, &h, &format) && !(len & 3);
+	const bool found = textureRange(task, tex, &va, &len, &bpr, &w, &h, &format, nullptr, level) && !(len & 3);
+	const uint32_t key = tex | level << 24;   // as the pass's draws hold it (kTargetId)
 	// the colour as a pixel of its format, filled across the texture where it is not drawn (a 32-bit pattern; RGBA16Float to zero only:
 	// four halves do not fit). RenderBox clears its distance fields (RG16Float) to other values than 0: left as they were, the next pass's
 	// glyphs were drawn over a box of old rows (Tahoe's App Store and Font Book icons, 2026-11-10).
@@ -3116,27 +3145,27 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 
 	// Held targets over the cleared memory written back first: their write-back would otherwise go over the clear.
 	if (found)
-		flushHeldIn(nullptr, task, va, len, byHeld ? heldFor(task, tex) : nullptr);
+		flushHeldIn(nullptr, task, va, len, byHeld ? heldFor(task, key) : nullptr);
 
-	if (drawable && mapGuest(task, va, len, handle, gpu, true) && clearByDraw(task, tex, gpu, bpr / tp, w, h, format, swap, rgba)) {
+	if (drawable && mapGuest(task, va, len, handle, gpu, true) && clearByDraw(task, key, gpu, bpr / tp, w, h, format, swap, rgba)) {
 		dropShadows(nullptr, task, va);
 
 		return tex;
 	}
 
-	if (byHeld && clearHeld(task, tex, va, w, h, bpr, format, swap, rgba))
+	if (byHeld && clearHeld(task, key, va, w, h, bpr, format, swap, rgba))
 		return tex;
 
 	if (found)
 		flushHeldIn(nullptr, task, va, len);   // its own held target too: cleared in the guest's memory from here on
 
-	if (ok && mapGuest(task, va, len, handle, gpu, true) && clearOnCard(task, tex, gpu, len, pattern)) {
-		clearShadows(nullptr, task, va, tex, pattern);
+	if (ok && mapGuest(task, va, len, handle, gpu, true) && clearOnCard(task, key, gpu, len, pattern)) {
+		clearShadows(nullptr, task, va, key, pattern);
 
 		return tex;
 	}
 
-	if (!found && surfaceRange(task, tex, surface) && (surface.format == 80 || surface.format == 81) && surface.width <= 16384) {
+	if (!found && !level && surfaceRange(task, tex, surface) && (surface.format == 80 || surface.format == 81) && surface.width <= 16384) {
 		const uint64_t bytes = static_cast<uint64_t>(surface.bytesPerRow) * surface.height;
 
 		flushHeldIn(surface.surface, task, surface.base, bytes);
@@ -3164,7 +3193,7 @@ uint32_t RDNA4PvHost::clearAttachment(uint32_t task, const uint8_t *p) {
 		dropShadows(nullptr, task, va);
 
 	// an IOSurface, row by row, as its format's pattern (RenderBox's RGBA16Float targets on Tahoe: transparent black)
-	const TextureFormat *sf = !ok && (surface.memory || surfaceRange(task, tex, surface)) ? textureFormat(surface.format) : nullptr;
+	const TextureFormat *sf = !ok && !level && (surface.memory || surfaceRange(task, tex, surface)) ? textureFormat(surface.format) : nullptr;
 	uint32_t surfacePattern = 0;
 	if (sf && clearPattern(surface.format, rgba, surfacePattern) && surface.width <= 16384) {
 		const uint32_t rowBytes = surface.width * sf->bpp;
@@ -3386,8 +3415,9 @@ bool RDNA4PvHost::clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_
 		}
 	}
 
-	const uint64_t slotAt = static_cast<uint64_t>(takeSlot()) * RDNA4_TRIRUN_PAGE;
-	const rdna4_tri_va where = {mFillCode.gpu, gpu, rdna4_trirun_rings_va(mGfxRings.gpu), mGfxMisc.gpu + slotAt};
+	const uint32_t clearSlot = takeSlot();
+	const uint64_t slotAt = static_cast<uint64_t>(clearSlot) * RDNA4_TRIRUN_PAGE;
+	const rdna4_tri_va where = {mFillCode.gpu, gpu, rdna4_trirun_rings_va(mGfxRings.gpu), mGfxMisc.gpu + static_cast<uint64_t>(clearSlot) * kMiscPage};
 	uint32_t n = rdna4_tri_record(ib, &where);
 	uint64_t fence = 0;
 
@@ -3831,6 +3861,59 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, 
 		      static_cast<unsigned long long>(out.length));
 
 	return true;
+}
+
+// textureRange of a mipmapped texture's level (a pass's attachment level: WindowServer's glass blurs each level from the one before, Tahoe):
+// textureSource's level, from its offset to the allocation's end.
+bool RDNA4PvHost::levelRange(uint32_t task, uint32_t id, uint32_t level, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow, uint32_t *width,
+                             uint32_t *height, uint32_t *format, uint32_t *storage)
+{
+	TextureSource s;
+	if (!textureSource(task, id, s, level) || s.surface.memory || s.depth > 1)
+		return false;
+	*va = s.va;
+	*len = s.length;
+	if (bytesPerRow)
+		*bytesPerRow = s.rowBytes;
+	if (width)
+		*width = s.width;
+	if (height)
+		*height = s.height;
+	if (format)
+		*format = s.format;
+	if (storage)
+		*storage = 0;   // ponytail: the stats count a level's draws as shared
+	return *len && *len <= (1ull << 30) && guestPfn(task, *va);
+}
+
+// A stage's textures' levels 1-7 for a shader that samples at explicit LODs (RDNA4_MTLC_LEVEL_FIRST): each level of the guest's memory in
+// place as a level-0 image of its own, into `levels` (level L's T#s at RDNA4_MTLC_LEVEL_STRIDE (L - 1)). Past its last level, or where a
+// level cannot be in place (rows not 128 bytes apart, an IOSurface, an array, a 3D texture), the one before (level 0: the T# stageTextures
+// wrote). The draw's own target level is not read by its shader (the glass's blurs read the level before); the others were written back
+// by stageTextures (flushHeldIn over the whole texture).
+void RDNA4PvHost::levelImages(uint32_t task, const Bindings &bound, const uint32_t *table, uint32_t *levels)
+{
+	for (uint32_t k = 0; k < 16; k++) {
+		const uint32_t *before = table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4;
+		const uint32_t id = bound.texture[k];
+
+		for (uint32_t level = 1; level < RDNA4_MTLC_LEVELS; level++) {
+			uint32_t *t = levels + (RDNA4_MTLC_LEVEL_STRIDE * (level - 1) + 32 * k) / 4;
+			TextureSource src;
+			const TextureFormat *fm = id && textureSource(task, id, src, level) ? textureFormat(src.format) : nullptr;
+			const uint64_t bytes = fm ? static_cast<uint64_t>(src.rowBytes) * src.height : 0;
+			uint64_t handle = 0, gpu = 0;
+
+			if (fm && !src.surface.memory && src.depth == 1 && src.slices == 1 && src.width && src.height && !(src.rowBytes % 128) &&
+			    !(src.rowBytes % fm->bpp) && !(src.va & 0xff) && bytes <= src.length && mapGuest(task, src.va, bytes, handle, gpu)) {
+				linearImage(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), src.width, src.height, src.rowBytes / fm->bpp);
+				before = t;
+				continue;
+			}
+
+			memcpy(t, before, 32);
+		}
+	}
 }
 
 // Row y's first `bytes` bytes of a texture textureSource found; of a 3D texture, row y % height of slice y / height.
@@ -5561,10 +5644,13 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// itself, 8 bytes a pixel.
 	// 65: RG16Float; 10: R8Unorm, 25: R16Float, 90: RGB10A2Unorm (CoreAnimation's masks and icons on Tahoe)
 	// 110: RGBA16Unorm (kitty's offscreen target through AppleMetalOpenGLRenderer, 2026-11-12)
-	const auto known = [](uint32_t f) { return f == 10 || f == 25 || f == 65 || f == 70 || f == 71 || f == 80 || f == 81 || f == 90 || f == 110 || f == 115; };
+	// 103, 104: RG32Uint, RG32Sint (WindowServer's brim_init_lpf and brim_jump_lpf on Tahoe: the shader's integers exported as they are)
+	const auto known = [](uint32_t f) { return f == 10 || f == 25 || f == 65 || f == 70 || f == 71 || f == 80 || f == 81 || f == 90 || f == 103 || f == 104 ||
+	                                           f == 110 || f == 115; };
 	const auto pixelBytes = [](uint32_t f) { const TextureFormat *fm = textureFormat(f); return fm ? fm->bpp : 4; };
 	uint32_t storage = 0;
-	const bool found = !why && textureRange(task, target, &va, &len, &bpr, &width, &texHeight, &targetFormat, &storage) && width;
+	const uint32_t targetId = target & kTargetId, targetLevel = target >> 24;   // the texture, the pass's mip level of it
+	const bool found = !why && textureRange(task, targetId, &va, &len, &bpr, &width, &texHeight, &targetFormat, &storage, targetLevel) && width;
 	const bool fitsKnown = known(targetFormat) && texHeight && static_cast<uint64_t>(bpr) * texHeight <= len;
 	// of unknown format: unpadded 32-bit rows, as many as the descriptor says (its allocation may hold mipmaps after them: 1792x128 on
 	// Tahoe's Dock), else as many as fill it
@@ -5574,7 +5660,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		height = targetFormat || texHeight ? texHeight : static_cast<uint32_t>(len / bpr);
 		bgra = !targetFormat || targetFormat == 80 || targetFormat == 81;
 	}
-	else if (!why && surfaceRange(task, target, surface) && known(surface.format) && surface.format != 70 && surface.format != 71) {
+	else if (!why && !targetLevel && surfaceRange(task, targetId, surface) && known(surface.format) && surface.format != 70 && surface.format != 71) {
 		// BGRA8 (sRGB as unorm, as a texture of it: CAMetalLayer's drawables of Maps), or as the texture of that format (115:
 		// CoreAnimation's extended-range layers on Tahoe)
 		bpr = surface.bytesPerRow;
@@ -5590,22 +5676,33 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		static uint32_t refusedTargets;
 
 		why = "the colour attachment is neither a linear 32-bit or RGBA16Float texture nor a BGRA8 IOSurface";
-		if (!resourceType(task, target))
-			logFreedTexture(task, target);
+		if (!resourceType(task, targetId))
+			logFreedTexture(task, targetId);
 
-		if (refusedTargets++ < 8 || gTalk) {   // the same
+		// the first of each format (and resource type) always: the boot's first eight are taken by others before an app draws
+		static uint32_t seenKinds[16], seenCount;
+		const uint32_t kind = targetFormat << 8 | resourceType(task, targetId);
+		bool newKind = seenCount < 16;
+
+		for (uint32_t i = 0; i < seenCount && newKind; i++)
+			newKind = seenKinds[i] != kind;
+
+		if (newKind)
+			seenKinds[seenCount++] = kind;
+
+		if (refusedTargets++ < 8 || gTalk || newKind) {   // the same
 			Surface seen;   // its own: surfaceRange retains what it finds, and `surface` may hold one already
 
-			pvlog("host: render: colour attachment %u (resource type %u, IOSurface format %u): format %u, %ux%u, %u bytes per row, %llu bytes: "
-			      "not supported yet", target, resourceType(task, target), surfaceRange(task, target, seen) ? seen.format : 0, targetFormat,
-			      width, texHeight, bpr, static_cast<unsigned long long>(len));
+			pvstat("host: render: colour attachment %u of task %u (resource type %u, IOSurface format %u) for \"%s\": format %u, %ux%u, %u bytes per "
+			      "row, %llu bytes, storage %u: not supported yet", targetId, task, resourceType(task, targetId), surfaceRange(task, targetId, seen) ? seen.format : 0,
+			      name[2], targetFormat, width, texHeight, bpr, static_cast<unsigned long long>(len), storage);
 
 			// its whole descriptor, to find what it is (the format is not where textureRange looks)
 			uint32_t rec[3] = {}, d[64] = {};
-			const uint32_t bytes = readRec(task, target, rec) ? (rec[0] >> 8 < sizeof(d) ? rec[0] >> 8 : static_cast<uint32_t>(sizeof(d))) : 0;
+			const uint32_t bytes = readRec(task, targetId, rec) ? (rec[0] >> 8 < sizeof(d) ? rec[0] >> 8 : static_cast<uint32_t>(sizeof(d))) : 0;
 			if (bytes && readGuest(task, rec[1] | static_cast<uint64_t>(rec[2]) << 32, reinterpret_cast<uint8_t *>(d), bytes))
 				for (uint32_t i = 0; i < bytes / 4; i += 16)
-					pvlog("host: render:   its descriptor (%u bytes) +%02x: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+					pvstat("host: render:   its descriptor (%u bytes) +%02x: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
 					      bytes, i * 4, d[i], d[i + 1], d[i + 2], d[i + 3], d[i + 4], d[i + 5], d[i + 6], d[i + 7], d[i + 8], d[i + 9], d[i + 10],
 					      d[i + 11], d[i + 12], d[i + 13], d[i + 14], d[i + 15]);
 		}
@@ -5717,7 +5814,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint64_t ringBytes = rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK;
 	bool ok = mRtOpen && (!staged || stage) && make(mGfxCode, RDNA4_TRI_CODE_BYTES * kCodeSlots) && make(mGfxRings, ringBytes);
 
-	ok = ok && makeHost(mGfxMisc, RDNA4_TRIRUN_PAGE * kSlots) && makeHost(mGfxIb, RDNA4_TRIRUN_PAGE * kSlots) && makeSpare(mGfxSpare);
+	ok = ok && makeHost(mGfxMisc, static_cast<uint64_t>(kMiscPage) * kSlots) && makeHost(mGfxIb, RDNA4_TRIRUN_PAGE * kSlots) && makeSpare(mGfxSpare);
 	ok = ok && rdna4_trirun_rings_fit(mGfxRings.gpu, ringBytes, rdna4_tri_ring_bytes()) && placeTarget();
 	const bool allocated = ok;
 
@@ -5733,7 +5830,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 	// The stream: the triangle's, with this draw's addresses, shaders' registers, target, viewport and vertex count.
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];
-	const uint64_t miscGpu = mGfxMisc.gpu + slotAt, ibGpu = mGfxIb.gpu + slotAt;
+	const uint64_t miscAt = static_cast<uint64_t>(slot) * kMiscPage, miscGpu = mGfxMisc.gpu + miscAt, ibGpu = mGfxIb.gpu + slotAt;
 	const rdna4_tri_va where = {codeGpu, tgt.gpu, rings, miscGpu};
 	const rdna4_tricol_va whereCol = {codeGpu, tgt.gpu, rings, miscGpu};
 	const uint32_t n = !ok ? 0 : outs ? rdna4_tricol_record(ib, &whereCol) : rdna4_tri_record(ib, &where);
@@ -5834,9 +5931,15 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	StagedTexture stagedTextures[2][16] = {};
 	const uint64_t texturesFrom = nowNs();
 	mDrawTarget = target;
-	for (unsigned st = 0; st < 2 && ok; st++)
-		ok = stageTextures(task, bound[st], reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]), stagedTextures[st], talk, st ? "fragment" : "vertex",
-		                   st && noColour);
+	// a stage that samples at explicit LODs (its header's bit 16): its textures' levels (levelImages)
+	static uint32_t levels[(kMiscPage - kLevelsAt) / 4];   // ponytail: one host, its work loop only
+	const uint32_t levelStages = (vs[7] >> 16 & 1) | (ps[7] >> 16 & 1) << 1;
+	for (unsigned st = 0; st < 2 && ok; st++) {
+		uint32_t *table = reinterpret_cast<uint32_t *>(&misc[(0x400 + 0x400 * st) / 8]);
+		ok = stageTextures(task, bound[st], table, stagedTextures[st], talk, st ? "fragment" : "vertex", st && noColour);
+		if (ok && (levelStages >> st & 1))
+			levelImages(task, bound[st], table, levels + 0x400 * st / 4);
+	}
 	mDrawTarget = 0;
 	mPhaseNs[0] += nowNs() - texturesFrom;
 
@@ -6085,11 +6188,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 			stage[i] = (stage[i] & 0xff00ff00u) | (stage[i] >> 16 & 0xff) | (stage[i] & 0xff) << 16;
 	};
 	auto row = [&](uint32_t y) { return reinterpret_cast<uint8_t *>(stage) + static_cast<uint64_t>(y - sy) * pitch * tp; };
-	auto upload = [&](const GfxBuffers &g, const void *from, uint64_t bytes) {
+	auto upload = [&](const GfxBuffers &g, const void *from, uint64_t bytes, uint64_t at) {
 		if (!g.cpu)
-			return gCompute->rtCopy(this, g.handle, slotAt, kernel_task, reinterpret_cast<mach_vm_address_t>(from), bytes, true);
+			return gCompute->rtCopy(this, g.handle, at, kernel_task, reinterpret_cast<mach_vm_address_t>(from), bytes, true);
 
-		memcpy(g.cpu + slotAt, from, bytes);
+		memcpy(g.cpu + at, from, bytes);
 		__sync_synchronize();   // seen by the card (snooped) before the submit
 
 		return kIOReturnSuccess;
@@ -6170,7 +6273,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		if (r == kIOReturnSuccess) {
 			step = "state in";
-			r = upload(mGfxMisc, misc, sizeof(misc));
+			r = upload(mGfxMisc, misc, sizeof(misc), miscAt);
+
+		if (r == kIOReturnSuccess && levelStages)   // the levels' T#s, for a shader that reads them
+			r = upload(mGfxMisc, levels, sizeof(levels), miscAt + kLevelsAt);
 		}
 
 		if (profiling() && total + 16 <= sizeof(ib) / 4) {   // timed: its start and end
@@ -6187,7 +6293,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		if (r == kIOReturnSuccess && !batched) {
 			step = "IB in";
-			r = upload(mGfxIb, ib, total * 4);
+			r = upload(mGfxIb, ib, total * 4, slotAt);
 		}
 
 		t[3] = nowNs();
@@ -6592,7 +6698,7 @@ bool RDNA4PvHost::copyTexture(uint32_t task, uint32_t from, const uint64_t at[3]
 	return ok;
 }
 
-// A region of level 0 of a texture from or into a buffer (rows bytesPerRow, images bytesPerImage apart from offset), row by row with the
+// A region of a texture's level from or into a buffer (rows bytesPerRow, images bytesPerImage apart from offset), row by row with the
 // CPU: the blits the card does not run yet. A 2D texture, an array's slice or a 3D texture's depth slices; the texture's memory as
 // textureSource finds it; not into an IOSurface.
 bool RDNA4PvHost::copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex, uint32_t buf, const BlitRegion &r)
@@ -6600,7 +6706,7 @@ bool RDNA4PvHost::copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex,
 	TextureSource t;
 	uint64_t va, len;
 
-	if (r.level || !textureSource(task, tex, t) || (toTexture && t.surface.memory) || !bufferRange(task, buf, &va, &len))
+	if (r.level > 15 || !textureSource(task, tex, t, r.level) || (toTexture && t.surface.memory) || !bufferRange(task, buf, &va, &len))
 		return false;
 
 	const TextureFormat *fm = textureFormat(t.format);
