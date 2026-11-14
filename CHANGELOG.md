@@ -3,6 +3,40 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
+## 0.2.1 (2026-11-14)
+
+**OpenGL (`make PVGPU=1`, `rdna4-pvgl=1`)**
+- macOS's OpenGL 4.1 on Metal (`AppleMetalOpenGLRenderer.bundle`) runs on the paravirtual GPU, so unmodified OpenGL
+  programs draw on the card. `rdna4-pvgl=1` names the renderer on the accelerator (`IOGLBundleName`) and patches it
+  where its pages come in (`cs_validate_page`): its GPU vendor test and the default raster sample count it sets on
+  every pass, which the paravirtual device does not have. Tahoe 26.6.2's renderer only; off by default. Card
+  (2026-11-12 to 2026-11-14): kitty 0.50.0 (GL 3.3 core) shows its text at once and scrolls smoothly, and Mixxx
+  2.5.6 (GL 2.1) shows its waveforms.
+- What GL needed of the host: `setViewports`/`setScissorRects` and viewports of negative height, the depth test with
+  Depth32Float attachments, draws into a plain view's texture, RGBA16Unorm targets and textures, 2D array textures
+  (and in the translator their samples and reads, and constant tables), every chunk of a split command buffer (only
+  the last one ran), and a pipeline's function made from a metallib Apple's host reads at an address (looked for
+  again once its pages are mapped: kitty's first window was dark).
+
+**Metal (`make PVGPU=1`)**
+- Faster with many small draws (kitty scrolling: the host's loop busy 0.75 s in 5 s at 78000 draws): compute
+  dispatches go into the draw batch on the graphics ring, their buffers mapped in place, and buffers up to 512 KiB
+  mapped by their 2 MiB window. Vertical blanks due inside a long command buffer are raised there (they were up to
+  11 ms late).
+- Mip levels: a render pass draws into the level its attachment names (each level's own memory, size and rows), clears
+  it there, and blits copy any level; a shader that samples at an explicit LOD reads the two levels around it, each
+  a level-0 image of the guest's memory, and blends them (`RDNA4_MTLC_LEVEL_FIRST`: the guest's levels are largest
+  first, the hardware's linear ones smallest first, so one T# cannot hold them). Tahoe's glass blurs its backdrop
+  that way; Finder's sidebar was black, now it is glass. Level 0 of a mipmapped RGBA8 texture was drawn as BGRA8
+  (its format is past where it was looked for). A level whose rows are not 128 bytes apart is read as the level
+  before it. Card (Tahoe 26.6.2, 2026-11-14): Finder's sidebar; `mipprobe` (four levels drawn and sampled at LODs
+  0 to 3, shared and private) gives what an Apple GPU gives.
+- RG32Uint and RG32Sint colour targets, as WindowServer's `brim_init_lpf` and `brim_jump_lpf` use: the translator
+  exports a shader's integers as they are, the host draws them with an integer format, and clears them to a whole
+  value. Card (2026-11-14): `intprobe`, shared, managed and private, drawn and cleared. WindowServer's own brim
+  draws were not seen on the card again after this; a refused colour target now logs its format, size, rows and
+  storage the first time each kind is refused.
+
 ## 0.2.0 (2026-11-12)
 
 **Cards**

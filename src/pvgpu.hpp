@@ -27,6 +27,8 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
+class KernelPatcher;
+
 namespace pvgpu {
 constexpr uint16_t kVendor = 0x106b;
 constexpr uint16_t kDevice = 0xeeee;
@@ -46,6 +48,8 @@ constexpr uint32_t kRegFifoBasePage = 0x030; // physical page number of the 64 K
 constexpr uint32_t kRegVersion = 0x034;      // driver writes 6 and reads back; the host chooses the version by what it returns
 constexpr uint32_t kRegCursorKick = 0x220;  // written with the port number by DisplayPipe::updateCursorState (hardware-cursor mode, docs/m1-stream.md s.1b); the host polls the shared state instead
 constexpr uint32_t kRegNumDisplays = 0x22c;  // read once by AppleParavirtGPUControl::start; 0 means one, more than 8 is clamped
+// rdna4-pvgl=1: AppleMetalOpenGLRenderer patched as its pages come in (pvgpu.cpp); call from Lilu's onPatcherLoad.
+void routeGlPages(KernelPatcher &patcher);
 } // namespace pvgpu
 
 class RDNA4Compute;

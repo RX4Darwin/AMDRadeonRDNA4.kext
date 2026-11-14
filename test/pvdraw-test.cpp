@@ -124,7 +124,10 @@ int main() {
 		CHECK(clearPattern(90, c, p) && p == (512u | 1023u << 10 | 3u << 30));
 		CHECK(clearPattern(80, c, p) && p == (0u | 255u << 8 | 128u << 16 | 255u << 24));
 		CHECK(!clearPattern(115, c, p) && clearPattern(115, zero, p) && p == 0 && !clearPattern(125, c, p) && clearPattern(55, zero, p) && p == 0);
+		const uint64_t seven[4] = {bitsOf(7.0), bitsOf(7.0), 0, 0}, minus[4] = {bitsOf(-3.0), bitsOf(-3.0), 0, 0};
+		CHECK(clearPattern(103, seven, p) && p == 7 && clearPattern(104, minus, p) && p == 0xfffffffdu && !clearPattern(103, minus, p) && !clearPattern(103, c, p));
 		CHECK(colourInfo(65, true) == 0x00020705u && colourInfo(80, true) == 0x0002880au && colourInfo(0, false) == 0x0002800au);
+		CHECK(colourInfo(103, false) == 0x0003040bu && colourInfo(104, true) == 0x0003050bu);   // RG32Uint, RG32Sint: 32_32, BLEND_BYPASS
 	}
 	// linearImage: a 64x32 RGBA8 image at a 64-pixel pitch.
 	{
