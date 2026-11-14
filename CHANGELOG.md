@@ -20,6 +20,12 @@ otherwise). The newest version is on top. How versions and branches work is in `
   switched to 2560x1440 (measured 59.955 Hz) and back to 3840x2160.
 - At most 15 modes are offered: macOS reads 4 blocks of the EDID the guest makes from them (5 modes a block) and lists
   only those; 17 were sent on the card and the last two (720x480, 640x480) never listed.
+- The first WindowServer of a boot no longer dies: it opened 2 of the 8 framebuffers (ours refuse) and CoreDisplay
+  asserted on that, every boot, so the desktop came about 10 s later from its restart. Our framebuffers are left out of
+  user-space matching while the heads are the paravirtual displays, and WindowServer's first open of the GPU wrangler
+  waits (about 2.5 s) until the paravirtual GPU and its accelerator are published, so that CoreDisplay opens their
+  framebuffers with their display pipes. Card (Tahoe 26.6.2, 2026-11-14, two boots): the first WindowServer lives, both
+  displays accelerated, no crash report.
 
 **Metal (`make PVGPU=1`)**
 - A mip level whose rows are not 128 bytes apart is sampled from its copy on the card (the one the pass that drew it

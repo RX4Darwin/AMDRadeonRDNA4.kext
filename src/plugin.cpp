@@ -1126,6 +1126,9 @@ void attach(FbEntry &e) {
 	// or the first WindowServer opened the boot framebuffer as macOS's display and died in its first frame (pvhooks.cpp).
 	if (dev.isAmd && (Trial::loaded() || pvGpu))
 		PvScanout::decided(pvHeads);
+
+	if (pvHeads)
+		PvHooks::hideFramebuffers(e.fb);
 #endif
 	e.state = st;
 	bootState = st;
