@@ -693,6 +693,11 @@ static std::string legalize(Function &k) {
 			b.CreateFence(AtomicOrdering::Release, scope);
 			b.CreateIntrinsic(Intrinsic::amdgcn_s_barrier, {});
 			b.CreateFence(AtomicOrdering::Acquire, scope);
+		} else if (name == "simdgroup.barrier") {
+			// (the same): a SIMD group is one wave, which runs in step: only the fence, at the wave's scope (device memory: the agent's).
+			// CoreImage's 4:2:0 kernels (ci_writeTG_420_*) were not translated without it.
+			const bool device = cast<ConstantInt>(c->getArgOperand(0))->getZExtValue() & 1;
+			b.CreateFence(AtomicOrdering::AcquireRelease, ctx.getOrInsertSyncScopeID(device ? "agent" : "wavefront"));
 		} else if (name.starts_with("convert.")) {   // convert.<to kind>.<to type>.<from kind>.<from type>; kinds f, s, u
 			SmallVector<StringRef, 5> k;
 			name.split(k, '.');

@@ -41,6 +41,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
   Macintosh wallpapers draw into a multisampled texture and resolve into their drawable, which stayed black. The
   translator (air2amdgpu) also takes `air.[fast_]sincos` (Sequoia's vertex shader). Card (Tahoe 26.6.2, 2026-11-14):
   both wallpapers show.
+- The translator takes `air.simdgroup.barrier` (a SIMD group is one wave: a fence at the wave's scope); CoreImage's
+  4:2:0 kernels were not translated without it. Card (2026-11-14): a kernel reading its neighbour's threadgroup memory
+  after the barrier, 4096 of 4096 right.
 
 ## 0.2.1 (2026-11-14)
 
