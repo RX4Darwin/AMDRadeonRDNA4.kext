@@ -3,7 +3,7 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
-## After 0.2.1 (on `next`, no number yet)
+## 0.2.2 (2026-11-14)
 
 **OpenGL (`make PVGPU=1`)**
 - On the card by default (`rdna4-pvgl=0` turns it off): the renderer is named on the accelerator only when its file
@@ -36,8 +36,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
   finished batches dropped: 32, emptied only by waiting for all draws, made kitty's scrolling wait for the card 3158
   times in 5 s (each of GL's draws writes a new index buffer). Card (Tahoe 26.6.2, 2026-11-14, `seq 1 3000000` in
   kitty): those waits gone, time waiting for the card 635 -> 218 ms in 5 s, 5.1 us of the host's a draw as before.
-- A render pass's multisample resolve is carried out: the multisampled texture is drawn as one sample, and at the end of
-  its encoder copied into the resolve texture (store action resolve, or store and resolve; level 0). The Sequoia and
+- A render pass's multisample resolve is carried out: at the end of its encoder the multisampled texture (its samples
+  averaged, next entry) is copied into the resolve texture (store action resolve, or store and resolve; level 0). The Sequoia and
   Macintosh wallpapers draw into a multisampled texture and resolve into their drawable, which stayed black. The
   translator (air2amdgpu) also takes `air.[fast_]sincos` (Sequoia's vertex shader). Card (Tahoe 26.6.2, 2026-11-14):
   both wallpapers show.
@@ -46,6 +46,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
   after the barrier, 4096 of 4096 right.
 - sRGB colour targets (BGRA8 and RGBA8 sRGB) are written as sRGB: the hardware encodes the shader's linear colour, as
   Metal does; unencoded, the Sequoia wallpaper came out dark and dull. Card (2026-11-14): its colours as Apple's.
+- Multisampled colour attachments (2x and 4x, 4 or 8 bytes a pixel) are drawn with all their samples: into a 64KB_2D
+  surface of the samples on the card (cleared there, with depth and stencil of as many samples), which the host's own
+  kernel (`rdna4_resolve`, translated like a guest's; `rdna4_resolve_srgb` averages an sRGB target's in linear light)
+  averages into the texture at the end of the pass, before the resolve copy. The translator reads `texture2d_ms`
+  (`read`, `get_num_samples`, `get_width`/`get_height`). Clears of sRGB targets are encoded. Drawn as one sample, the
+  Sequoia wallpaper's edges were rough; with the samples' spread left at 0 (`PA_SC_SAMPLE_PROPERTIES`) the rasterizer
+  missed edge samples and lines of dots crossed it. Card (Tahoe 26.6.2, 2026-11-14): Sequoia's edges smooth, on the 4K
+  DisplayPort display and the 1080p HDMI one.
 
 ## 0.2.1 (2026-11-14)
 

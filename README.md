@@ -290,7 +290,7 @@ What runs (card, macOS Tahoe 26.6.2, 2026-11-10 to 2026-11-12; Sequoia 15 by Jan
 desktop composited on the card, the Dock with every icon, apps' windows (Finder, iTerm2, ...), Liquid Glass with its
 blurred glass (Finder's sidebar), Metal compute, blits and draws of every form with vertex descriptors, textures, mip
 levels (drawn into, sampled at explicit LODs) and mip-level views, 2D array textures, blending, stencil, the depth
-test (Depth32Float), RG32 integer targets, up to eight colour attachments. `tools/metal/m1/mtlprobe.m` (`mtlprobe all`)
+test (Depth32Float), RG32 integer targets, sRGB targets, 2x and 4x multisampling, up to eight colour attachments. `tools/metal/m1/mtlprobe.m` (`mtlprobe all`)
 checks blits, compute and drawing.
 
 **OpenGL** (on unless `rdna4-pvgl=0`, card 2026-11-12 to 2026-11-14): macOS's OpenGL 4.1 on Metal
