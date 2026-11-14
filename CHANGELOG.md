@@ -3,9 +3,26 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
-## After 0.2.0 (on `next`, no number yet)
+## 0.2.1 (2026-11-14)
+
+**OpenGL (`make PVGPU=1`, `rdna4-pvgl=1`)**
+- macOS's OpenGL 4.1 on Metal (`AppleMetalOpenGLRenderer.bundle`) runs on the paravirtual GPU, so unmodified OpenGL
+  programs draw on the card. `rdna4-pvgl=1` names the renderer on the accelerator (`IOGLBundleName`) and patches it
+  where its pages come in (`cs_validate_page`): its GPU vendor test and the default raster sample count it sets on
+  every pass, which the paravirtual device does not have. Tahoe 26.6.2's renderer only; off by default. Card
+  (2026-11-12 to 2026-11-14): kitty 0.50.0 (GL 3.3 core) shows its text at once and scrolls smoothly, and Mixxx
+  2.5.6 (GL 2.1) shows its waveforms.
+- What GL needed of the host: `setViewports`/`setScissorRects` and viewports of negative height, the depth test with
+  Depth32Float attachments, draws into a plain view's texture, RGBA16Unorm targets and textures, 2D array textures
+  (and in the translator their samples and reads, and constant tables), every chunk of a split command buffer (only
+  the last one ran), and a pipeline's function made from a metallib Apple's host reads at an address (looked for
+  again once its pages are mapped: kitty's first window was dark).
 
 **Metal (`make PVGPU=1`)**
+- Faster with many small draws (kitty scrolling: the host's loop busy 0.75 s in 5 s at 78000 draws): compute
+  dispatches go into the draw batch on the graphics ring, their buffers mapped in place, and buffers up to 512 KiB
+  mapped by their 2 MiB window. Vertical blanks due inside a long command buffer are raised there (they were up to
+  11 ms late).
 - Mip levels: a render pass draws into the level its attachment names (each level's own memory, size and rows), clears
   it there, and blits copy any level; a shader that samples at an explicit LOD reads the two levels around it, each
   a level-0 image of the guest's memory, and blends them (`RDNA4_MTLC_LEVEL_FIRST`: the guest's levels are largest

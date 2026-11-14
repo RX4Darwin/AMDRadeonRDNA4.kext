@@ -36,7 +36,7 @@ PRODUCT      = AMDRadeonRDNA4
 # The one place the version is written (CONTRIBUTING.md says when it changes). It goes into the bundle's Info.plist,
 # the kext's kmod_info and the name of the product directory. The commit a build was made from ("-dirty": with
 # uncommitted changes) goes into the kernel log and the registry (AMDRadeonRDNA4,Build) beside it.
-VERSION      = 0.3.0
+VERSION      = 0.2.1
 
 # RELEASE: -Os, what every card test up to 0.1.0 ran. DEBUG: -O0 and DEBUG defined (Lilu's DBGLOG lines).
 CONFIG       ?= RELEASE
