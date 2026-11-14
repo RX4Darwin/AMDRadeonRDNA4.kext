@@ -130,6 +130,9 @@ public:
 		// Once the power-management firmware runs its features (stage 3), on the bring-up thread before
 		// it sends anything else: the display device may talk to the firmware (ctx: cursorProbeCtx).
 		void (*smuReady)(void *ctx) { nullptr };
+		// The VBIOS image the display device read (rdna4-dmubload: the display firmware gets a copy).
+		const uint8_t *vbios { nullptr };
+		size_t vbiosSize { 0 };
 	};
 
 	enum Stage : uint32_t {
@@ -269,6 +272,11 @@ private:
 	// Stage 2.
 	Psp::Driver psp;
 	bool stagePsp();
+	// rdna4-dmubload=1, after stage 2: the display microcontroller started on the kext's own firmware
+	// (dcn_4_0_1_dmcub.bin through the PSP, src/dmubload.cpp), its windows in the pool at kDmubOffset.
+	void stageDmub();
+	static uint32_t dmubRead(void *ctx, uint32_t reg);
+	static void dmubWrite(void *ctx, uint32_t reg, uint32_t value);
 
 	// Stage 3.
 	bool stageGfx();
@@ -294,6 +302,7 @@ private:
 	static constexpr uint32_t kSdmaFenceOffset = kSdmaTestOffset + 0x40;    // FENCE target
 	static constexpr uint32_t kFillOffset     = 16u << 20;            // CONST_FILL target
 	static constexpr uint32_t kFillBytes      = 1u << 20;
+	static constexpr uint32_t kDmubOffset     = 18u << 20;            // display firmware windows (DmubLoad::kBlockBytes)
 	uint64_t poolMc(uint32_t off) const { return pool.mcAddress + off; }
 	volatile uint32_t *poolDw(uint32_t off) const {
 		return reinterpret_cast<volatile uint32_t *>(poolCpu + off);

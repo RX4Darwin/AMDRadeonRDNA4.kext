@@ -42,3 +42,6 @@ _rdna4_fw_\name\()_end:
 	FWBLOB mes,  "firmware/amdgpu/gc_12_0_1_uni_mes.bin"
 	FWBLOB imu,  "firmware/amdgpu/gc_12_0_1_imu.bin"
 	FWBLOB rlc,  "firmware/amdgpu/gc_12_0_1_rlc.bin"
+
+// The display microcontroller's firmware (DCN 4.0.1), loaded through the PSP with rdna4-dmubload=1.
+	FWBLOB dmcub, "firmware/amdgpu/dcn_4_0_1_dmcub.bin"

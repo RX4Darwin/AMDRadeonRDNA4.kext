@@ -59,6 +59,7 @@ enum Cmd : uint32_t {
 };
 enum FwType : uint32_t {
 	FwSmu = 18,
+	FwDmub = 51,   // GFX_FW_TYPE_DMUB: the display microcontroller's instructions
 };
 
 // Window layout inside the caller's VRAM (offsets from its start). The

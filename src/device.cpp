@@ -1410,6 +1410,10 @@ namespace {
 // DMCUB mailbox registers (dcn_4_1_0_offset.h, base_idx 2).
 constexpr uint32_t kDmcubRegion4Offset     = 0x0196;   // mailbox MC address, low
 constexpr uint32_t kDmcubRegion4OffsetHigh = 0x0197;
+constexpr uint32_t kDmcubCw3Base           = 0x01a8;   // DMCUB_REGION3_CW3..6_BASE_ADDRESS (the firmware's view)
+constexpr uint32_t kDmcubCw3Top            = 0x01b0;   // DMCUB_REGION3_CW3..6_TOP_ADDRESS (bit 31: enabled)
+constexpr uint32_t kDmcubCw3Offset         = 0x01bb;   // DMCUB_REGION3_CW3..6_OFFSET, _HIGH: their MC addresses
+constexpr uint32_t kDmcubInbox1Base        = 0x01d4;
 constexpr uint32_t kDmcubInbox1Size        = 0x01d5;
 constexpr uint32_t kDmcubInbox1Wptr        = 0x01d6;
 constexpr uint32_t kDmcubInbox1Rptr        = 0x01d7;
@@ -1420,14 +1424,33 @@ bool RDNA4Device::dmubRing(DmubRing &ring) {
 	ring = DmubRing {};
 	if (!ipDiscovery.isValid() || !rmmio)
 		return false;
-	// The ring lives in top-of-VRAM firmware memory (REGION4); its VRAM
-	// position is the REGION4 MC address minus the VRAM MC base.
-	uint64_t region4Mc = regReadDmu(2, kDmcubRegion4Offset) |
-	    (static_cast<uint64_t>(regReadDmu(2, kDmcubRegion4OffsetHigh)) << 32);
+	// Inbox 1 is where the firmware sees it (DMCUB_INBOX1_BASE_ADDRESS), in the region that holds that address:
+	// REGION4 from 0x80000000 (the GOP's firmware: the inbox at 0x80000000, REGION4 at its MC address), else the
+	// window 3-6 whose base..top holds it (Linux's start-up, the kext's own firmware with rdna4-dmubload: the
+	// inbox at the start of window 4, REGION4 left as the GOP had it). Bases and tops read back as 29 bits.
+	const uint32_t inbox = regReadDmu(2, kDmcubInbox1Base);
+	uint64_t inboxMc = 0, windowMc = 0;
+	if (inbox >= 0x80000000u) {
+		windowMc = regReadDmu(2, kDmcubRegion4Offset) |
+		    (static_cast<uint64_t>(regReadDmu(2, kDmcubRegion4OffsetHigh)) << 32);
+		inboxMc = windowMc + (inbox - 0x80000000u);
+	} else {
+		const uint32_t at = inbox & 0x1fffffff;
+		for (uint32_t cw = 3; cw <= 6 && !inboxMc; cw++) {
+			const uint32_t base = regReadDmu(2, kDmcubCw3Base + cw - 3) & 0x1fffffff;
+			const uint32_t top = regReadDmu(2, kDmcubCw3Top + cw - 3);
+			if (!(top & 0x80000000u) || at < base || at >= (top & 0x1fffffff))
+				continue;
+			const uint32_t off = kDmcubCw3Offset + 2 * (cw - 3);
+			windowMc = regReadDmu(2, off) | (static_cast<uint64_t>(regReadDmu(2, off + 1)) << 32);
+			inboxMc = windowMc + (at - base);
+		}
+	}
 	uint64_t vramMcBase =
 	    static_cast<uint64_t>(regReadDmu(2, kDcnVmFbLocationBase) & 0xffffff) << 24;
-	if (region4Mc <= vramMcBase) {
-		FBLOG("dmub: region4 mc 0x%llx not above vram base 0x%llx", region4Mc, vramMcBase);
+	if (inboxMc <= vramMcBase) {
+		FBLOG("dmub: inbox 0x%08x in no region or not above vram base 0x%llx (at MC 0x%llx)", inbox, vramMcBase,
+		      inboxMc);
 		return false;
 	}
 	uint32_t size = regReadDmu(2, kDmcubInbox1Size);
@@ -1435,8 +1458,13 @@ bool RDNA4Device::dmubRing(DmubRing &ring) {
 		FBLOG("dmub: inbox1 size 0x%x not sane", size);
 		return false;
 	}
-	ring.base = region4Mc - vramMcBase;
+	ring.base = inboxMc - vramMcBase;
 	ring.size = size;
+	static uint64_t logged;
+	if (logged != inboxMc) {   // once per firmware: the GOP's, then the kext's own (rdna4-dmubload)
+		logged = inboxMc;
+		FBLOG("dmub: inbox 1 (0x%08x) at MC 0x%llx, its region at 0x%llx, 0x%x bytes", inbox, inboxMc, windowMc, size);
+	}
 	return true;
 }
 
@@ -1480,12 +1508,45 @@ bool RDNA4Device::dmubSubmit(const Dmub::Cmd *cmds, uint32_t count, const char *
 	uint32_t nrptr = rptr;
 	for (int i = 0; i < 20000; i++) {          // 200 ms budget
 		nrptr = regReadDmu(2, kDmcubInbox1Rptr);
-		if (nrptr == slot)
+		if (nrptr == slot) {
+			dmubTrace(tag);
 			return true;
+		}
 		IODelay(10);
 	}
 	FBLOG("%s: firmware did not consume (wptr=0x%x rptr stuck at 0x%x)", tag, slot, nrptr);
+	dmubTrace(tag);
 	return false;
+}
+
+// The trace buffer (window 5, Linux's dmub_tracebuffer_show): a 16-byte header whose first dword counts the
+// entries ever written, then a ring of 16-byte entries {trace_code, tick, param0, param1}. Only with
+// rdna4-dmubload, where the window is the kext's (the GOP's firmware has its own layout).
+void RDNA4Device::dmubTrace(const char *tag) {
+	static int on = -1;
+	if (on < 0) {
+		uint32_t v = 0;
+		on = PE_parse_boot_argn("rdna4-dmubload", &v, sizeof(v)) && v;
+	}
+	const uint32_t cw5 = 5 - 3;   // window 5's index in the CW3..6 register runs
+	const uint64_t mc = regReadDmu(2, kDmcubCw3Offset + 2 * cw5) |
+	    static_cast<uint64_t>(regReadDmu(2, kDmcubCw3Offset + 2 * cw5 + 1)) << 32;
+	const uint64_t vramMcBase = static_cast<uint64_t>(regReadDmu(2, kDcnVmFbLocationBase) & 0xffffff) << 24;
+	const uint32_t size = (regReadDmu(2, kDmcubCw3Top + cw5) & 0x1fffffff) - (regReadDmu(2, kDmcubCw3Base + cw5) & 0x1fffffff);
+	if (!on || mc <= vramMcBase || size < 32 || size > 0x100000)
+		return;
+	const uint64_t at = mc - vramMcBase;
+	const uint32_t count = vramRead32(at), ring = (size - 16) / 16;
+	if (count < dmubTraceSeen)   // another firmware's buffer: its count starts again
+		dmubTraceSeen = 0;
+	const uint32_t first = count - dmubTraceSeen > 32 ? count - 32 : dmubTraceSeen;
+	FBLOG("%s: dmub trace: %u entries (%u new)", tag, count, count - dmubTraceSeen);
+	for (uint32_t n = first; n < count; n++) {
+		const uint64_t e = at + 16 + 16ull * (n % ring);
+		FBLOG("%s: dmub trace %u: code 0x%x tick %u params 0x%08x 0x%08x", tag, n, vramRead32(e), vramRead32(e + 4),
+		      vramRead32(e + 8), vramRead32(e + 12));
+	}
+	dmubTraceSeen = count;
 }
 
 // rdna4-smuping=1: first contact with the SMU power-management firmware
@@ -2244,6 +2305,7 @@ RDNA4Device::~RDNA4Device() {
 		IOLockFree(cursorTrailLock);
 		cursorTrailLock = nullptr;
 	}
+
 	if (onDieDisc) {
 		IOFree(onDieDisc, 10 << 10);
 		onDieDisc = nullptr;

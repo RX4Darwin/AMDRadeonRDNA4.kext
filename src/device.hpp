@@ -289,6 +289,9 @@ private:
 	size_t    vbiosSize { 0 };
 	AtomBios  atomBios;
 	bool loadVBIOS();
+public:
+	const uint8_t *vbiosBytes(size_t &size) const { size = vbiosSize; return vbiosData; }
+private:
 	bool copyVBIOSFromProperty();
 	bool copyVBIOSFromExpansionROM();
 	void publishVBIOSInfo();
@@ -382,6 +385,9 @@ private:
 	bool dmubRing(DmubRing &ring);
 	bool dmubSubmit(const Dmub::Cmd *cmds, uint32_t count, const char *tag,
 	                uint64_t *firstSlot = nullptr);
+	// rdna4-dmubload: the entries the kext's own DMUB firmware added to its trace buffer since the last call.
+	void dmubTrace(const char *tag);
+	uint32_t dmubTraceSeen { 0 };
 
 	// The display pipe the GOP lit (see pipe.hpp).
 	Pipe::State pipe;

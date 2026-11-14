@@ -1159,6 +1159,7 @@ void attach(FbEntry &e) {
 		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
 		                        createVblankService, deviceCursorProbe, &dev };
 		env.smuReady = deviceSmuReady;
+		env.vbios = dev.vbiosBytes(env.vbiosSize);
 		st->compute.start(env, computeStage);
 	}
 }

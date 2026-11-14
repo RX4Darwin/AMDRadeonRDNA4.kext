@@ -5,7 +5,16 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.2.2 (on `next`, no number yet)
 
-Nothing yet.
+**Displays**
+- The display microcontroller can run the kext's own firmware (`rdna4-dmubload=1`): the first part of lighting the
+  displays when nothing set them up (after a power loss, what system sleep waits for). After the PSP stage the PSP
+  loads linux-firmware's `dcn_4_0_1_dmcub.bin` (0x0a005000), the GOP's firmware is stopped and the controller started
+  on the new one with its windows in the compute pool, as amdgpu does at load (`src/dmubload.cpp`).
+  `tools/gen/pipegen/dmubgen.sh` runs Linux's own DMUB code on the host and `make test` holds the kext's 101 register
+  steps against it. The kext finds the command inbox from `DMCUB_INBOX1_BASE_ADDRESS` in whichever region holds it
+  (the GOP's firmware: REGION4; Linux's: window 4); with REGION4 alone the new firmware read empty commands. With the
+  boot-arg the firmware's trace is logged after each command. Card (Tahoe 26.6.2, 2026-11-14): the firmware comes up
+  in 6 ms, the second display's mode switches go through it (1680x1050 measured 59.885 Hz, 1080p 60.003 Hz).
 
 ## 0.2.2 (2026-11-14)
 

@@ -87,7 +87,7 @@ FW_BLOBS     = $(FW_DIR)/psp_14_0_3_sos.bin $(FW_DIR)/smu_14_0_3.bin \
                $(FW_DIR)/sdma_7_0_1.bin $(FW_DIR)/gc_12_0_1_pfp.bin \
                $(FW_DIR)/gc_12_0_1_me.bin $(FW_DIR)/gc_12_0_1_mec.bin \
                $(FW_DIR)/gc_12_0_1_uni_mes.bin $(FW_DIR)/gc_12_0_1_imu.bin \
-               $(FW_DIR)/gc_12_0_1_rlc.bin
+               $(FW_DIR)/gc_12_0_1_rlc.bin $(FW_DIR)/dcn_4_0_1_dmcub.bin
 
 # A dump of the card's ROM, which the host tests parse and the emulator's option ROM is made from. It is the card
 # vendor's and not in the repository (firmware/README.md): without it `make test` leaves the ROM checks out.
@@ -282,6 +282,10 @@ PVDRAW_TEST   = $(HOST)/pvdraw-test
 $(PVDRAW_TEST): test/pvdraw-test.cpp src/pvdraw.hpp
 	@mkdir -p $(HOST)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ test/pvdraw-test.cpp
+DMUBLOAD_TEST = $(HOST)/dmubload-test
+$(DMUBLOAD_TEST): test/dmubload-test.cpp src/dmubload.cpp src/dmubload.hpp test/ref/dmub_start_linux.inc
+	@mkdir -p $(HOST)
+	$(CXX) -std=c++17 -Wall -O1 -o $@ test/dmubload-test.cpp src/dmubload.cpp
 $(PVSTREAM_TEST): test/pvstream-test.cpp src/pvstream.cpp src/pvstream.hpp src/pvopcodes.inc src/pvdevinfo.inc
 	@mkdir -p $(HOST)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ test/pvstream-test.cpp src/pvstream.cpp
@@ -303,10 +307,11 @@ $(HOST)/test-w12k-pm4: test/test-w12k-pm4.cpp src/pm4.cpp src/pm4.hpp
 check-isa:
 	bash test/check-isa.sh
 
-test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
+test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(DMUBLOAD_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
 	@if [ -f $(ROM) ]; then echo "$(ATOMDUMP) $(ROM)"; $(ATOMDUMP) $(ROM); else echo "$(ATOMDUMP)   (no $(ROM))"; $(ATOMDUMP); fi
 	$(PVSTREAM_TEST)
 	$(PVDRAW_TEST)
+	$(DMUBLOAD_TEST)
 	$(HOST)/test-gfx12tri
 	$(HOST)/test-gfx12tricol
 	$(HOST)/test-w12k-pm4
