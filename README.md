@@ -538,26 +538,22 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    extending `IONDRVFramebuffer`, injected by OpenCore; mode list, EDID
    identity and (VM) mode switching verified in System Settings → Displays.
    Hardware verification of the plugin build is next.
-4. **Native mode setting (DCN 4.1.0)** — program the pixel clock and
-   transmitter through DMUB, then OTG timing and HUBP viewport, to change
-   resolution and light additional connectors (`RDNA4Device::applyMode`).
-   **Key constraint (verified against this ROM):** the VBIOS carries *no*
-   display command tables — only `asic_init` survives;
-   `setpixelclock`/`dig1transmittercontrol` are absent because DCN 3.1+ moved
-   that work to DMUB firmware mailbox commands. The DMUB payloads are built
-   and host-tested (`src/dmub.hpp`); `tools/linux/linux-capture.sh` records what
-   amdgpu programs on the same card as ground truth. **First run on the
-   card 2026-10-04** (HDMI boot display, 1920x1080 to 1600x900): the GOP's
-   DMUB firmware (version 0x0000e840, read over GPINT) takes the mainline
-   transmitter, pixel-clock and encoder commands although the GOP itself
-   never sends them. HDMI 2.0 scrambling above 340 MHz (encoder scrambler
-   plus the sink's SCDC register) ran on the card 2026-10-05, off and on
-   again (533 MHz). DP mode switching retimes the stream on the trained link
-   (verified 2026-10-04). A pipe the GOP did not set up is lit from a
-   register sequence generated from Linux's own code (verified 2026-10-04
-   for one configuration, `docs/second-pipe.md`). DP link training is written and
-   host-tested against Linux, not yet run on the card; modes above the boot pixel
-   clock on a DP boot display still need it wired into the mode switch.
+4. **Native mode setting (DCN 4.1.0)** — mostly done, on top of what the
+   GOP leaves running. The VBIOS carries *no* display command tables (only
+   `asic_init`): pixel clock, transmitter and encoder go to the DMUB
+   firmware as mailbox commands (`src/dmub.hpp`), which the GOP's DMUB
+   (version 0x0000e840) takes although the GOP never sends them. On the card:
+   HDMI mode switches (2026-10-04) and HDMI 2.0 scrambling at 533 MHz
+   (2026-10-05); DP mode switches retimed on the trained link (2026-10-04);
+   a second pipe lit from a register sequence generated from Linux's own
+   code (2026-10-04, `docs/second-pipe.md`), on either HDMI connector, with
+   its sleep, mode switches and hot-plug; the kext's own DP link training
+   (2026-10-06, 4 lanes at HBR2). Open: lighting the displays when nothing
+   is running (DMUB firmware loaded through PSP, DCCG, HUBBUB and DCHUB set
+   up, a pipe trained and lit: what a power loss leaves, so system sleep
+   waits for it); DP modes above the boot pixel clock (retraining in the
+   mode switch); a second DisplayPort display (written, not yet run on the
+   card).
 5. **Display power management** — display sleep was verified on hardware
    with the standalone build (DP: video stream off + sink D3 over native-AUX
    DPCD `SET_POWER`; HDMI: OPP pattern generator blank). It now runs from
@@ -569,7 +565,7 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    verified on hardware 2026-10-06 at 3840x2160, 533 MHz) and is blanked
    without it.
    System sleep stays vetoed (as `IOBootNDRV` does): after GPU power loss the
-   display pipe cannot be reprogrammed until native mode setting exists.
+   display pipe cannot be lit again until it can be lit from nothing (step 4).
 6. **Power / clocks** — SMU firmware handshake so the card is stable, not
    stuck at boot clocks.
 7. **Acceleration** — the GFX12 command processor, rings, memory management

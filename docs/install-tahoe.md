@@ -107,9 +107,9 @@ VRAM aperture). AMDRadeonRDNA4's register MMIO is unaffected either way.
    from the Apple menu — the one thing Recovery never allowed.
 
 ### 3.4 What to re-measure in the full install that Recovery could not show
-- Resolution change in System Settings → Displays **on the card** (so far only the VM's Bochs
-  backend has done a real switch; on hardware a non-boot mode is still refused until the
-  DCN 4.1.0 mode-set engine lands).
+- Resolution change in System Settings → Displays **on the card** (done: the mode-set engine
+  switches HDMI and DP displays since 2026-10-04, and on Tahoe 26.6.2 through the paravirtual
+  displays, 2026-11-14).
 - Second connector lit.
 - Real S3: `power: quiesce complete` → `power: wake received` → SDMA resuming at the engine's
   own pointers (`sdma: ... the ring resumes at 0x17604`), then PSP `LOAD_IP_FW` + RLC autoload
