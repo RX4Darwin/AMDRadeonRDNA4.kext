@@ -11,6 +11,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
   aborting every GL app. Card (Tahoe 26.6.2, 2026-11-14, no `rdna4-pvgl` in the boot-args): the renderer named and
   patched, kitty draws on the card.
 
+**Displays (`make PVGPU=1`, `rdna4-pvgpu-disp=7`)**
+- A DisplayPort boot display has its modes as a paravirtual display: macOS was offered only 3840x2160 for it (the
+  heads' mode lists only knew heads, and only an HDMI boot display behind an adapter becomes one). Port 0 now offers the
+  boot framebuffer's own modes and switches through its mode-set engine (the stream retimed, the link as trained).
+  A monitor's mode that is half of a scaled size above it is kept: 2560x1440 had gone beside 5120x2880, and macOS's
+  1280x720 HiDPI with it. Card (Tahoe 26.6.2, 2026-11-14, Samsung 4K on DP): 2560x1440 and 1280x720 HiDPI listed,
+  switched to 2560x1440 (measured 59.955 Hz) and back to 3840x2160.
+
 ## 0.2.1 (2026-11-14)
 
 **OpenGL (`make PVGPU=1`, `rdna4-pvgl=1`)**
