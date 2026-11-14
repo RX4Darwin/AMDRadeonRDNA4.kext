@@ -419,6 +419,7 @@ private:
 	bool dmaGuest(uint32_t task, uint64_t dstVa, uint64_t srcVa, uint32_t pattern, uint64_t bytes);
 public:
 	void runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t bytes);
+	bool copyWholeTexture(uint32_t task, uint32_t from, uint32_t to, bool *onCard = nullptr);
 	uint32_t runRenderPass(uint32_t task, const uint8_t *p, uint32_t bytes);
 	uint32_t clearAttachment(uint32_t task, const uint8_t *p);
 	uint32_t viewParent(uint32_t task, uint32_t id);
@@ -2586,6 +2587,7 @@ struct ExecTally {
 	uint32_t pipeline;                  // Compute.setComputePipelineState
 	uint32_t target, renderPipeline;    // Render: colour attachment 0's texture (writeDescriptor), setRenderPipelineState
 	uint32_t attachments[8];            // Render: all eight colour attachments' textures (writeDescriptor; 0 = none)
+	uint32_t resolve[8][2];             // Render: {texture, resolve texture} the pass resolves at its end (writeDescriptor; 0 = none)
 	RDNA4PvHost::Bindings stage[2];     // Render.setVertexBuffers, setFragmentBuffers
 	uint32_t blendColor[4];             // Render.setBlendColorRed: four floats' bits
 	uint64_t viewport[6];               // Render.setViewport: originX, originY, width, height, znear, zfar as doubles' bits
@@ -2626,19 +2628,33 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		t->host->runBlit(t->task, id, payload, bytes);
 	else if (id == 0x01a) {
 		t->target = t->host->runRenderPass(t->task, payload, bytes);
-		for (uint32_t k = 0; k < 8; k++)   // {u32 texture, ...} 0x3c apart from 0x4c (logPassDescriptor); a plain view's own texture
-			if (0x4c + 0x3c * k + 4 <= bytes) {
-				uint32_t level = 0;
-				memcpy(&t->attachments[k], payload + 0x4c + 0x3c * k, 4);
-				if (0x54 + 0x3c * k + 4 <= bytes)
-					memcpy(&level, payload + 0x54 + 0x3c * k, 4);
+		// {u32 texture, u32 resolve texture, u16 level, slice, depth plane, resolve level, resolve slice, resolve depth plane, u16 load
+		// action, u16 store action, u16 store options, double clear colour[4]} 0x3c apart from 0x4c (AppleParavirtGPUMetal's writeDescriptor,
+		// Tahoe 26.6.2); a plain view's own texture
+		for (uint32_t k = 0; k < 8; k++)
+			if (0x4c + 0x3c * k + 0x18 <= bytes) {
+				const uint8_t *a = payload + 0x4c + 0x3c * k;
+				uint16_t level, resolveLevel, store;
+				uint32_t resolve;
+				memcpy(&t->attachments[k], a, 4);
+				memcpy(&resolve, a + 4, 4);
+				memcpy(&level, a + 8, 2);
+				memcpy(&resolveLevel, a + 0xe, 2);
+				memcpy(&store, a + 0x16, 2);
+				// MTLStoreActionMultisampleResolve, StoreAndMultisampleResolve: the multisampled texture is drawn as one sample, so its
+				// resolve is a copy (level 0, as Blit.copyFromTexture's); the Sequoia and Macintosh wallpapers' drawables were never written (black)
+				const bool resolves = (store == 2 || store == 3) && resolve && !level && !resolveLevel;
+				t->resolve[k][0] = resolves ? t->attachments[k] : 0;
+				t->resolve[k][1] = resolves ? resolve : 0;
 				t->attachments[k] = t->host->viewParent(t->task, t->attachments[k]);
 				if (level > 15)   // a level past 15: no attachment (its draws refused)
 					t->attachments[k] = 0;
 				else if (t->attachments[k])   // its mip level as bits 24-27 (kTargetId)
-					t->attachments[k] |= level << 24;
-			} else
+					t->attachments[k] |= static_cast<uint32_t>(level) << 24;
+			} else {
 				t->attachments[k] = 0;
+				t->resolve[k][0] = t->resolve[k][1] = 0;
+			}
 		if (t->target == (t->attachments[0] & kTargetId))
 			t->target = t->attachments[0];
 		t->viewportSet = false;
@@ -2822,6 +2838,25 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 	hex[n * 9] = 0;
 	pvlog("host:   stream %s +0x%zx: 0x%03x %s (%u bytes)%s%s", t->segment, offset, id, name ? name : "UNKNOWN", bytes, hex, bytes > 24 ? " ..." : "");
 }
+
+// The multisample resolves a render pass asked for (ExecTally::resolve), at its end.
+void resolvePass(ExecTally &t)
+{
+	for (auto &r : t.resolve) {
+		if (!r[0])
+			continue;
+
+		t.host->flushHeld();   // what the pass drew, out of its held target first
+
+		static uint32_t lines;
+		const bool ok = t.host->copyWholeTexture(t.task, r[0], r[1]);
+
+		if (!ok || lines++ < 4)
+			pvstat("host: render: task %u: texture %u resolved into %u: %s", t.task, r[0], r[1], ok ? "done" : "NOT done");
+
+		r[0] = r[1] = 0;
+	}
+}
 } // namespace
 
 // M1: one command buffer of an ExecIndirect, decoded: segments {u32 length, u8 type, u8 continuation, u8 flags, u8 0}, in them stream commands
@@ -2867,6 +2902,8 @@ void RDNA4PvHost::decodeExec(uint32_t task, const uint64_t (*chunks)[2], uint32_
 				    }, &t);
 				undecoded += slen - 8 - static_cast<uint32_t>(ok);
 			}
+			if (type == 0 && !buf[at + 5])   // a render encoder's last segment (no continuation): its resolves, after its draws
+				resolvePass(t);
 			at += slen;
 		}
 		pvlog("host: stream: task %u command buffer at 0x%llx, %llu bytes: %u segment(s), %u command(s), %u unknown, %u byte(s) undecoded%s", task, va, len,
@@ -6647,18 +6684,11 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 		// Blit.copyFromTexture:toTexture:, whole textures {u32 source, u32 destination, u32 source slice and level, u32 destination slice and
 		// level, u32 slices and levels: u16 each} (Maps copies its map into its CAMetalLayer's drawable, 2026-11-11). One slice of level 0 only.
 		uint32_t w[5];
-		TextureSource s, d;
+		bool onCard = false;
 
 		memcpy(w, p, sizeof(w));
 
-		const bool one = !w[2] && !w[3] && w[4] == 0x00010001 && textureSource(task, w[0], s);
-		const bool onCard = one && textureSource(task, w[1], d) && copyTextureOnCard(task, s, d);
-		const uint64_t origin[3] = {}, size[3] = {s.width, s.height, 1};
-
-		if (one && !onCard)
-			waitDraws();
-
-		const bool ok = onCard || (one && copyTexture(task, w[0], origin, w[1], origin, size));
+		const bool ok = !w[2] && !w[3] && w[4] == 0x00010001 && copyWholeTexture(task, w[0], w[1], &onCard);
 
 		pvlog("host: blit: copyFromTexture %u -> texture %u, whole (%08x %08x %08x) %s: %s", w[0], w[1], w[2], w[3], w[4],
 		      onCard ? "on the card" : "by rows", ok ? "done" : "NOT done");
@@ -6673,6 +6703,27 @@ void RDNA4PvHost::runBlit(uint32_t task, uint32_t id, const uint8_t *p, uint32_t
 			       "%08x %08x %08x %08x %08x %08x", id, bytes, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13],
 			       w[14], w[15], w[16], w[17], w[18], w[19], w[20], w[21]);
 	}
+}
+
+// Level 0 of texture `from` into `to`, whole: on the card after the draws before it, else by rows once they are done.
+bool RDNA4PvHost::copyWholeTexture(uint32_t task, uint32_t from, uint32_t to, bool *onCard)
+{
+	TextureSource s, d;
+
+	if (!textureSource(task, from, s))
+		return false;
+
+	const bool card = textureSource(task, to, d) && copyTextureOnCard(task, s, d);
+	const uint64_t origin[3] = {}, size[3] = {s.width, s.height, 1};
+
+	if (onCard)
+		*onCard = card;
+	if (card)
+		return true;
+
+	waitDraws();
+
+	return copyTexture(task, from, origin, to, origin, size);
 }
 
 // A texture's whole heap descriptor, for the blits it failed (the first few of a boot).

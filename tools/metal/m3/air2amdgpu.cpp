@@ -788,6 +788,9 @@ static std::string legalize(Function &k) {
 			r = b.CreateFRem(c->getArgOperand(0), c->getArgOperand(1));
 		} else if (op == "rsqrt") {
 			r = b.CreateFDiv(ConstantFP::get(c->getType(), 1.0), b.CreateIntrinsic(Intrinsic::sqrt, {c->getType()}, {c->getArgOperand(0)}));
+		} else if (op == "sincos") {   // (x, ptr cos): the sine returned, the cosine stored (the Sequoia wallpaper's drawVertex)
+			b.CreateStore(b.CreateIntrinsic(Intrinsic::cos, {c->getType()}, {c->getArgOperand(0)}), c->getArgOperand(1));
+			r = b.CreateIntrinsic(Intrinsic::sin, {c->getType()}, {c->getArgOperand(0)});
 		} else if (op == "pow" || op == "powr") {   // fast math's x^y = 2^(y log2 x)
 			r = b.CreateIntrinsic(Intrinsic::exp2, {c->getType()},
 			                      {b.CreateFMul(c->getArgOperand(1), b.CreateIntrinsic(Intrinsic::log2, {c->getType()}, {c->getArgOperand(0)}))});

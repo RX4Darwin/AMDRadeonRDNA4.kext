@@ -36,6 +36,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
   finished batches dropped: 32, emptied only by waiting for all draws, made kitty's scrolling wait for the card 3158
   times in 5 s (each of GL's draws writes a new index buffer). Card (Tahoe 26.6.2, 2026-11-14, `seq 1 3000000` in
   kitty): those waits gone, time waiting for the card 635 -> 218 ms in 5 s, 5.1 us of the host's a draw as before.
+- A render pass's multisample resolve is carried out: the multisampled texture is drawn as one sample, and at the end of
+  its encoder copied into the resolve texture (store action resolve, or store and resolve; level 0). The Sequoia and
+  Macintosh wallpapers draw into a multisampled texture and resolve into their drawable, which stayed black. The
+  translator (air2amdgpu) also takes `air.[fast_]sincos` (Sequoia's vertex shader). Card (Tahoe 26.6.2, 2026-11-14):
+  both wallpapers show.
 
 ## 0.2.1 (2026-11-14)
 
