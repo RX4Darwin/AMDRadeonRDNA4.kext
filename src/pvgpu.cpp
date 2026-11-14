@@ -727,10 +727,11 @@ private:
 	// noted until the batch is waited for, so that the CPU (copyGuest) and the compute queue do not read or write it before.
 	static constexpr uint32_t kDispatchArgs = 256;
 	GfxBuffers mDispatchArgs {};
-	struct RingWrite { uint32_t task; uint64_t va, len; };
-	static constexpr uint32_t kRingWrites = 32;
+	struct RingWrite { uint32_t task; uint64_t va, len, submit; };   // submit: the batch's, which goes out as mSubmits + 1 (markUsed)
+	static constexpr uint32_t kRingWrites = kBatchSlots * kBatchDraws;   // a range each of the batches that may be in flight
 	RingWrite mRingWrites[kRingWrites] {};
 	uint32_t mRingWriteCount { 0 };
+	uint64_t mRingLo { 0 }, mRingHi { 0 };   // all of them within: most reads (copyGuest, per texture row) are not, and skip the list
 	bool batchDispatch(const Jit &j, const uint8_t *args, uint32_t argBytes, const uint32_t groups[3], const uint32_t groupSize[3]);
 	void noteRingWrite(uint32_t task, uint64_t va, uint64_t len);
 	bool ringWritten(uint32_t task, uint64_t va, uint64_t len) const;
@@ -2379,21 +2380,53 @@ bool RDNA4PvHost::batchDispatch(const Jit &j, const uint8_t *args, uint32_t argB
 	return batchDraw(ib, n, 0, 0);
 }
 
-// A range a dispatch in the batch writes (a buffer whole: GL's index ring is written at another offset by each).
+// A range a dispatch in the batch writes (a buffer whole: GL's index ring is written at another offset by each). A full list drops the
+// ranges whose batch is done first. With 32 and emptied only by waiting for all draws, kitty's scrolling waited 3158 times in 5 s for it
+// (each of GL's draws a new index buffer), three quarters of the host's waits (2026-11-14).
 void RDNA4PvHost::noteRingWrite(uint32_t task, uint64_t va, uint64_t len)
 {
+	const uint64_t submit = mSubmits + 1;
+	auto widen = [this](uint64_t at, uint64_t bytes, bool first) {   // the span ringWritten checks first
+		mRingLo = first || at < mRingLo ? at : mRingLo;
+		mRingHi = first || at + bytes > mRingHi ? at + bytes : mRingHi;
+	};
+
 	for (uint32_t i = 0; i < mRingWriteCount; i++)
-		if (mRingWrites[i].task == task && mRingWrites[i].va == va && mRingWrites[i].len == len)
+		if (mRingWrites[i].task == task && mRingWrites[i].va == va && mRingWrites[i].len == len) {
+			mRingWrites[i].submit = submit;
 			return;
+		}
+
+	if (mRingWriteCount == kRingWrites) {
+		uint32_t kept = 0;
+
+		for (uint32_t i = 0; i < mRingWriteCount; i++) {
+			const RingWrite &w = mRingWrites[i];
+			const bool done = w.submit <= mSubmits && (!mPending || mSubmits - w.submit >= kInFlight ||
+			                                           gCompute->rtGfxFenceDone(this, static_cast<uint32_t>(mSubmitFence[w.submit % kSubmitFences])));
+
+			if (done)
+				continue;
+
+			widen(w.va, w.len, !kept);
+			mRingWrites[kept++] = w;
+		}
+
+		mRingWriteCount = kept;
+	}
 
 	if (mRingWriteCount == kRingWrites)
 		waitDraws();   // clears them
 
-	mRingWrites[mRingWriteCount++] = {task, va, len};
+	widen(va, len, !mRingWriteCount);
+	mRingWrites[mRingWriteCount++] = {task, va, len, submit};
 }
 
 bool RDNA4PvHost::ringWritten(uint32_t task, uint64_t va, uint64_t len) const
 {
+	if (va >= mRingHi || va + len <= mRingLo)
+		return false;
+
 	for (uint32_t i = 0; i < mRingWriteCount; i++)
 		if (mRingWrites[i].task == task && va < mRingWrites[i].va + mRingWrites[i].len && mRingWrites[i].va < va + len)
 			return true;
