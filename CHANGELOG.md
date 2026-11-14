@@ -15,6 +15,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
   (the GOP's firmware: REGION4; Linux's: window 4); with REGION4 alone the new firmware read empty commands. With the
   boot-arg the firmware's trace is logged after each command. Card (Tahoe 26.6.2, 2026-11-14): the firmware comes up
   in 6 ms, the second display's mode switches go through it (1680x1050 measured 59.885 Hz, 1080p 60.003 Hz).
+- The extra displays' pipe selection is held under one lock from selection through use: the hot-plug poll, macOS's
+  mode switches (paravirtual host thread or NDRV) and the heads' start-up selected pipes under one another (card
+  2026-11-14: a switch logged another slot's empty mode). Built and host-tested; not yet run on the card.
 
 ## 0.2.2 (2026-11-14)
 

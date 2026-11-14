@@ -2216,6 +2216,8 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	owner = ownerService;
 	if (!pciDevice || !owner)
 		return false;
+	if (!extraLock)
+		extraLock = IORecursiveLockAlloc();
 
 	uint32_t nosleep = 0;
 	if (PE_parse_boot_argn("rdna4-nosleep", &nosleep, sizeof(nosleep)) && nosleep != 0) {
@@ -2305,7 +2307,10 @@ RDNA4Device::~RDNA4Device() {
 		IOLockFree(cursorTrailLock);
 		cursorTrailLock = nullptr;
 	}
-
+	if (extraLock) {
+		IORecursiveLockFree(extraLock);
+		extraLock = nullptr;
+	}
 	if (onDieDisc) {
 		IOFree(onDieDisc, 10 << 10);
 		onDieDisc = nullptr;

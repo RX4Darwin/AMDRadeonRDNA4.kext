@@ -19,6 +19,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IOLocks.h>
 #include <pexpert/pexpert.h>
 
 #include "atombios.hpp"
@@ -96,6 +97,18 @@ public:
 	// The one the second-pipe functions act on, and its connector's table
 	// (Pipe2::use) once it has a sink.
 	void selectExtra(size_t slot);
+	// Held from a selectExtra through everything done with the pipe it selects (ExtraHold): the hot-plug poll
+	// (a timer on each head's work loop), macOS's mode switches (the paravirtual host's thread, or NDRV) and
+	// the heads' start-up each select a pipe and use it, and did so under one another (card, 2026-11-14: a
+	// mode switch logged another slot's empty mode). Recursive: the poll's plug and unplug take it again.
+	IORecursiveLock *extraLock { nullptr };
+	struct ExtraHold {
+		IORecursiveLock *lock;
+		explicit ExtraHold(RDNA4Device &dev) : lock(dev.extraLock) { if (lock) IORecursiveLockLock(lock); }
+		~ExtraHold() { if (lock) IORecursiveLockUnlock(lock); }
+		ExtraHold(const ExtraHold &) = delete;
+		ExtraHold &operator=(const ExtraHold &) = delete;
+	};
 	// How many displays beside the boot one this boot may light (1 to 3,
 	// rdna4-heads); the first extra pipe without a sink (kMaxExtra if none);
 	// whether another extra pipe than the selected one has that connector.

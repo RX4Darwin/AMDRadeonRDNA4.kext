@@ -421,6 +421,7 @@ bool head2SurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) 
 
 int32_t head2SwitchTo(void *ctx, const Modes::Mode &m, bool) {
 	auto *h = static_cast<Head2 *>(ctx);
+	RDNA4Device::ExtraHold hold(*h->dev);
 	h->dev->selectExtra(h->slot);
 	return h->dev->applySecondPipeMode(m);
 }
@@ -431,6 +432,7 @@ void head2SetPower(void *ctx, bool on) {
 	if (pvHeads && !on)
 		return;
 
+	RDNA4Device::ExtraHold hold(*h->dev);
 	h->dev->selectExtra(h->slot);
 	if (h->connected || !on)             // the link of an unplugged display stays off
 		h->dev->setSecondPipePower(on);
@@ -723,6 +725,7 @@ void takeBootDisplay(Head2 *h, RDNA4Device &dev) {
 }
 
 void fillHeads(RDNA4Device &dev) {
+	RDNA4Device::ExtraHold hold(dev);
 	for (size_t i = 0; i < headCount; i++)
 		fillHead(heads[i], dev);
 	pickBootHead(dev);
@@ -748,6 +751,7 @@ void head2ConnectChanged(Head2 *h) {
 // starts.
 void head2Plugged(Head2 *h, uint8_t hpd) {
 	RDNA4Device &dev = *h->dev;
+	RDNA4Device::ExtraHold hold(dev);
 	dev.selectExtra(h->slot);
 	if (!dev.readSecondEdid(hpd)) {
 		HLOG(h, "hotplug: HPD%u is high but there is no EDID on DDC (yet)", hpd);
@@ -811,6 +815,7 @@ void head2Plugged(Head2 *h, uint8_t hpd) {
 }
 
 void head2Unplugged(Head2 *h) {
+	RDNA4Device::ExtraHold hold(*h->dev);
 	h->dev->selectExtra(h->slot);
 	h->dev->setSecondPipePower(false);
 	h->connected = false;
@@ -844,6 +849,7 @@ void hotplugPoll(OSObject *owner, IOTimerEventSource *timer) {
 	if (!h)
 		return;
 	RDNA4Device &dev = *h->dev;
+	RDNA4Device::ExtraHold hold(dev);
 	dev.selectExtra(h->slot);
 	// A display that is gone may come back on another connector.
 	const uint8_t hpd = dev.secondSinkHpd(!h->connected);
@@ -946,6 +952,7 @@ void startBootDpPoll(IOService *fb, RDNA4Device &dev) {
 }
 
 void startHead2Hotplug(Head2 *h, IOService *fb, void (*proc)(OSObject *, void *), OSObject *target, void *ref) {
+	RDNA4Device::ExtraHold hold(*h->dev);
 	h->dev->selectExtra(h->slot);
 	IOWorkLoop *loop = fb->getWorkLoop();
 	h->hpdTimer = loop ? IOTimerEventSource::timerEventSource(fb, hotplugPoll) : nullptr;
@@ -1782,6 +1789,7 @@ bool PvScanout::setMode(uint32_t port, uint32_t width, uint32_t height)
 		return false;
 	}
 
+	RDNA4Device::ExtraHold hold(*h->dev);
 	h->dev->selectExtra(h->slot);
 
 	const IOReturn r = h->dev->applySecondPipeMode(*m);
