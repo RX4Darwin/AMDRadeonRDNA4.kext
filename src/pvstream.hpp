@@ -100,7 +100,10 @@ constexpr uint32_t kId = 0x00, kName = 0x04, kNameBytes = 14, kPort = 0x12, kWid
 constexpr uint32_t kCursorWidth = 0x18, kCursorHeight = 0x1a, kTxnProtocol = 0x1c, kFlags = 0x20;
 constexpr uint32_t kOriginX = 0x4c, kOriginY = 0x4e, kScale = 0x50;
 constexpr uint32_t kPending = 0x100, kEnabled = 0x104;      // host sets bits in kPending; the guest enables them in kEnabled
-constexpr uint32_t kCookie = 0x200, kModeCount = 0x208, kModes = 0x210, kModeStride = 16, kMaxModes = 16;
+// kMaxModes: what macOS uses. The guest takes any count (process_online passes +0x208 on) and puts 5 modes in each block of the EDID
+// it makes, but macOS reads 4 blocks of it (IODisplayEDID is 512 bytes) and offers only the modes in those: the base block and 3
+// DisplayID blocks, 15 modes. More are left out: 17 sent on the rig on 2026-11-14, the last two (720x480, 640x480) never listed.
+constexpr uint32_t kCookie = 0x200, kModeCount = 0x208, kModes = 0x210, kModeStride = 16, kMaxModes = 15;
 constexpr uint32_t kCursorPos = 0xe00, kCursorVisible = 0xe04;
 constexpr uint32_t kEventVbl = 1, kEventOnline = 4, kEventOffline = 8;   // bits of kPending / kEnabled (enable() stores 0xc; enableVBLInterrupt ORs 1)
 constexpr uint32_t kFlagCursorVisibleKick = 1, kFlagCursorMoveKick = 2;  // kFlags: tell the host (ctrl+0x220 = port) when the cursor appears / moves
