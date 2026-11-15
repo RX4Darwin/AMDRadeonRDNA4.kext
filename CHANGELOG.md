@@ -75,6 +75,27 @@ otherwise). The newest version is on top. How versions and branches work is in `
   again once the wake has rebuilt it (`rtGeneration`). Card-verified 2026-11-15: the desktop comes back as it was on both
   displays (without the write-back, the DP display kept a black overlay until things were drawn again). The wake still
   takes about 95 s before the desktop shows (IONDRVFramebuffer's 45 s waits).
+- Sleep and wake without IOGraphics' timeouts (`rdna4-syssleep=1`, IOGraphicsFamily routes in `src/plugin.cpp`,
+  Tahoe 26.6.2 offsets, card-verified 2026-11-15): the wake shows the desktop within seconds instead of about 95 s, and
+  the sleep no longer waits 90 s before the system powers down. Found with a trace of IOFramebuffer's power path:
+  - On a board that names the GPU `VGA` (this one since the rebuild) IONDRVSupport's expander wraps our head nubs again,
+    so six framebuffers shared three `IOFBDependentIndex` slots, and the controller's table, walked as a list that ends
+    at the first empty slot, left some framebuffers without their power changes: a 45 s timeout each, at boot, sleep
+    and wake. Each of our framebuffers now opens into its controller's first free slot, and one whose open fails leaves
+    the table again.
+  - The controller's state is cached, and a framebuffer without a WindowServer port (ours, hidden behind the
+    paravirtual displays) never marked it: the sleep waited for a server that looked on (`gIOGNotifyTO`, 90 s). The
+    controller is now marked after each notification, and our framebuffers' "not up for WindowServer" bits cleared.
+  - In a dark wake (a key press wakes this board through GPE 8) the card powers on before
+    `kIOMessageSystemWillPowerOn`: the card is now known to have lost its power when its PCI device powers on, so the
+    displays are lit again.
+  - A dark wake deadlocked WindowServer on the paravirtual framebuffer (`_extEntry` waiting for it to be on) until the
+    watchdog panicked; it is now let through, and given its wake (`handleEvent(4)`) so its display pipe takes frames
+    again ("Fallback GPU Display Pipe transaction submission failed" before).
+  Still open: a key press brings only the dark wake (the desktop comes with the mouse); USBWakeFixup with an
+  `SSDT-USBW` for this board's XH00 did not change that.
+- With a second DisplayPort display plugged in at boot the boot hangs in the compute bring-up's `smuReady` step (the
+  display clocks or the cold start): finer NVRAM breadcrumbs there name the step (`rdna4-trail`).
 - A real cold start (`rdna4-coldboot=1`): at boot, once the kext has read what the GOP left (the pipes, EDIDs, the
   boot link, the scanout address, the DCHUB timer), the card is reset as Linux resets it on this SMU (mode 1 through
   the SMU's debug mailbox, `amdgpu_device_mode1_reset`), its PCI config space (BARs, Resizable BAR) restored and the

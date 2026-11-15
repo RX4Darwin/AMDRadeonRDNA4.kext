@@ -156,6 +156,12 @@ KernelPatcher::KextInfo kextIONDRVSupport {
 	KernelPatcher::KextInfo::Unloaded,
 };
 
+const char *kPathIOGraphics = "/System/Library/Extensions/IOGraphicsFamily.kext/IOGraphicsFamily";
+KernelPatcher::KextInfo kextIOGraphics {
+	"com.apple.iokit.IOGraphicsFamily", &kPathIOGraphics, 1, {true}, {},
+	KernelPatcher::KextInfo::Unloaded,
+};
+
 #ifdef AMDRadeonRDNA4_PVGPU
 // The IOSurface kext (boot kernel collection, loaded before Lilu): the fake GPU's host draws into IOSurface-backed render targets with it.
 const char *kPathIOSurface = "/System/Library/Extensions/IOSurface.kext/Contents/MacOS/IOSurface";
@@ -1360,6 +1366,166 @@ IOReturn wrapRegisterPowerDriver(IOService *that, IOService *driver, IOPMPowerSt
 	return org(that, driver, copy, n);
 }
 
+// Our framebuffers' slots in their IOFBController. On boards whose BIOS names the card's PCI device VGA rather than display,
+// IONDRVSupport's expander runs (the IONDRVFramebuffer on the PCI device that is not name-matched): it numbers every
+// device-tree child of type display 0, 1, ... (our head nubs, over createHead's index) and wraps each in an IONDRVDevice of its
+// own, so six framebuffers share IOFBDependentIndex 0..2, and some are never opened. IOFramebuffer::open puts a framebuffer
+// into its controller's table at its index (+0x18, a pointer per slot), and IOFBController::checkPowerWork walks that table
+// as a list that ends at the first empty slot (IOGraphicsFamily, Tahoe 26.6.2, disassembled 2026-11-15). A framebuffer that
+// lost its slot, or stands behind an empty one, never has a power change done: each waited out its 45 s acknowledgement
+// timeout, at boot, at every sleep and every wake. So each of our framebuffers opens into the first free slot: the table
+// holds the open framebuffers without a gap. (The never opened ones acknowledge power changes at once.)
+mach_vm_address_t orgFbOpen;
+
+// A framebuffer's IOFBController (IOFramebuffer::__private at +0x1c8, the controller its first field), or null.
+uint8_t *fbController(IOService *fb) {
+	auto *priv = fb ? *reinterpret_cast<uint8_t **>(reinterpret_cast<uint8_t *>(fb) + 0x1c8) : nullptr;
+	return priv ? *reinterpret_cast<uint8_t **>(priv) : nullptr;
+}
+
+// The controller of one of our card's IONDRVFramebuffers, or null for any other framebuffer.
+uint8_t *ourFbController(IOService *fb) {
+	return fb && fb->metaCast("IONDRVFramebuffer") && isOurDevice(fb->getProvider()) ? fbController(fb) : nullptr;
+}
+
+IOReturn wrapFbOpen(IOService *fb) {
+	if (uint8_t *ctl = ourFbController(fb)) {
+		auto *index = OSDynamicCast(OSNumber, fb->getProperty("IOFBDependentIndex"));
+		if (index) {
+			auto *const *table = reinterpret_cast<IOService *const *>(ctl + 0x18);
+			uint32_t slot = 0;
+			while (slot < 32 && table[slot] && table[slot] != fb)
+				slot++;
+			if (slot < 32 && slot != index->unsigned32BitValue()) {
+				FBLOG("ndrv: %s %llx opens as dependent %u, the first free slot (was %u)", fb->getName(),
+				      fb->getRegistryEntryID(), slot, index->unsigned32BitValue());
+				fb->setProperty("IOFBDependentIndex", static_cast<unsigned long long>(slot), 32);
+			}
+		}
+	}
+	const IOReturn r = FunctionCast(wrapFbOpen, orgFbOpen)(fb);
+	// A framebuffer whose open failed (the expander's wrappers of our head nubs: IOBootNDRV refuses a nub index other than
+	// 0, and we do not answer for them) is dead, but open had already put it into its controller's table. It is never in
+	// gAllFramebuffers, so never told a server state: it stays "on" (sent/acked 1/1), the controller's state keeps bit
+	// 0x40, and IOFramebuffer::systemWork then (a) holds the system sleep's acknowledgement until gIOGNotifyTO (90 s) and
+	// (b) at the wake skips telling WindowServer the displays are on: no desktop (card, 2026-11-15, trace of 10000056f).
+	// So it leaves the table again, and the next framebuffer to open takes its slot.
+	uint8_t *ctl = ourFbController(fb);
+	if (r != kIOReturnSuccess && ctl) {
+		auto **table = reinterpret_cast<IOService **>(ctl + 0x18);
+		for (uint32_t slot = 0; slot < 32; slot++)
+			if (table[slot] == fb) {
+				table[slot] = nullptr;
+				if (slot < 8)
+					ctl[0x1b4] &= static_cast<uint8_t>(~(1u << slot));
+				// ponytail: a gap left before live slots would end the controller's walks early; open fills slots in
+				// order, so the failed one is the last taken unless a dependent opened inside it (logged)
+				const bool gap = slot + 1 < 32 && table[slot + 1];
+				FBLOG("ndrv: %s %llx did not open (0x%x): out of its controller's slot %u again%s", fb->getName(),
+				      fb->getRegistryEntryID(), r, slot, gap ? " -- LEAVES A GAP before live slots" : "");
+			}
+	}
+	// The controller's byte at +0x1b4 has a bit per framebuffer opened but not yet told by WindowServer that it is up
+	// (extGetAttribute 'wsup', through the framebuffer's user client; nothing else clears it). While a bit is set, the
+	// controller's state has bit 0x8 and IOFramebuffer::systemWork holds back the servers' notification of a system sleep
+	// until gIOGNotifyTO (90 s) runs out. With the heads as the paravirtual displays our framebuffers are hidden from
+	// WindowServer, which never comes for them: their bits are cleared here (pvHeads is decided while the boot one opens).
+	if (pvHeads && ctl && ctl[0x1b4]) {
+		FBLOG("ndrv: %s %llx: controller's framebuffers 0x%02x marked up for WindowServer (it never opens them)",
+		      fb->getName(), fb->getRegistryEntryID(), ctl[0x1b4]);
+		ctl[0x1b4] = 0;
+	}
+	return r;
+}
+
+// IOFramebuffer::notifyServer(state) tells a framebuffer's server (WindowServer) of a system power change. One without a
+// server port, as ours always are with the heads as the paravirtual displays, has its server state set at once, but its
+// controller is not marked: IOFBController::computeState keeps returning its cached state (recomputed only when +0x1b6 or
+// +0x19c is set), with bit 0x40 (a server still on) from before the sleep. IOFramebuffer::systemWork then holds the system
+// sleep's acknowledgement until gIOGNotifyTO, 90 s (card, 2026-11-15: our controller's state stayed 0x44 for the whole wait
+// while the paravirtual one, marked by WindowServer's acknowledgement, changed within a second). So the controller is
+// marked as didWork(1) marks it (didWork itself wants the controller's gate, which notifyServer has let go of by now) and
+// systemWork is run again, to recompute.
+mach_vm_address_t orgFbNotifyServer, fbStartThread;
+
+void wrapFbNotifyServer(IOService *fb, uint8_t state) {
+	FunctionCast(wrapFbNotifyServer, orgFbNotifyServer)(fb, state);
+	uint8_t *ctl = ourFbController(fb);
+	if (!ctl || !fbStartThread)
+		return;
+	auto *msg = *reinterpret_cast<uint8_t **>(reinterpret_cast<uint8_t *>(fb) + 0x1a0);   // the server message; +0x8 its port
+	if (!(msg && *reinterpret_cast<void **>(msg + 0x8))) {
+		__atomic_fetch_or(ctl + 0x1b6, static_cast<uint8_t>(1), __ATOMIC_SEQ_CST);
+		reinterpret_cast<void (*)(bool)>(fbStartThread)(false);
+	}
+}
+
+// IOFramebuffer::_extEntry, the gate every user-client call of a framebuffer passes, waits (sleepGate) while the framebuffer
+// is not on (this+0x198 bit 13, cleared for every framebuffer at a system sleep and set again by handleEvent(4), the wake a
+// framebuffer's driver delivers on its power-on). In a dark wake WindowServer's main thread asks the paravirtual framebuffer for
+// its mode (extGetCurrentDisplayMode) and waits there; at the full wake it cannot acknowledge the wake's notification, and the
+// watchdog kills WindowServer and then panics (card, 2026-11-15, its spin report and Kernel-...-194833.panic). The paravirtual
+// framebuffer has no hardware a sleep has to keep calls away from (our host answers at any time), so it is let through: marked
+// on before the check (the next sleep clears the bit again).
+// Then the wake is delivered as IONDRVSupport delivers it for its own framebuffers on their power-on: handleEvent(4, 1)
+// (kIOFBNotifyDidWake: restoreFramebuffer, the framebuffer marked on, its waiters woken, notification 4 to its clients).
+// The paravirtual framebuffer has no power states, so nothing else delivers it: its display pipe, powered off at the sleep
+// (IOAccelDisplayPipe::framebuffer_will_power_off), stayed off, and every frame WindowServer submitted was refused
+// ("Fallback GPU Display Pipe transaction submission failed"; card, 2026-11-15). handleEvent wants the controller's gate,
+// which _extEntry has taken when it returns (it is let go in _extExit).
+mach_vm_address_t orgExtEntry, fbHandleEvent;
+
+IOReturn wrapExtEntry(IOService *fb, bool system, bool allowOffline, uint32_t apiBit, const char *where) {
+	bool woken = false;
+	if (fb) {
+		auto *flags = reinterpret_cast<uint8_t *>(fb) + 0x199;   // the high byte of this+0x198
+		const OSMetaClass *meta = fb->getMetaClass();
+		if (!(*flags & 0x20) && meta && !strcmp(meta->getClassName(), "AppleParavirtFramebuffer")) {
+			__atomic_fetch_or(flags, static_cast<uint8_t>(0x20), __ATOMIC_SEQ_CST);
+			woken = true;
+		}
+	}
+	const IOReturn r = FunctionCast(wrapExtEntry, orgExtEntry)(fb, system, allowOffline, apiBit, where);
+	if (woken) {
+		IOReturn w = kIOReturnUnsupported;
+		// handleEvent acts only on the thread its controller has at +0x188 (set by checkPowerWork around a framebuffer's
+		// power work, where IONDRVSupport's calls come from): set here the same way, and put back.
+		uint8_t *ctl = fbController(fb);
+		if (r == kIOReturnSuccess && fbHandleEvent && ctl) {
+			auto *owner = reinterpret_cast<thread_t *>(ctl + 0x188);
+			const thread_t was = *owner;
+			*owner = current_thread();
+			w = reinterpret_cast<IOReturn (*)(IOService *, int32_t, void *)>(fbHandleEvent)(fb, 4, reinterpret_cast<void *>(1));
+			*owner = was;
+		}
+		FBLOG("pvgpu: %s %llx: a call while it is off for a sleep (%s): let through, marked on, the wake delivered (0x%x/0x%x)",
+		      fb->getName(), fb->getRegistryEntryID(), where ? where : "?", r, w);
+	}
+	return r;
+}
+
+void processGraphics(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (index != kextIOGraphics.loadIndex)
+		return;
+	KernelPatcher::RouteRequest open {"__ZN13IOFramebuffer4openEv", wrapFbOpen, orgFbOpen};
+	if (!patcher.routeMultiple(index, &open, 1, address, size))
+		FBLOG("ndrv: IOFramebuffer::open not routed (error %d): framebuffers can lose their power work", patcher.getError());
+	patcher.clearError();
+	fbHandleEvent = patcher.solveSymbol(index, "__ZN13IOFramebuffer11handleEventEiPv", address, size);
+	patcher.clearError();
+	fbStartThread = patcher.solveSymbol(index, "__ZN13IOFramebuffer11startThreadEb", address, size);
+	patcher.clearError();
+	KernelPatcher::RouteRequest extEntry {"__ZN13IOFramebuffer9_extEntryEbbjPKc", wrapExtEntry, orgExtEntry};
+	if (!patcher.routeMultiple(index, &extEntry, 1, address, size))
+		FBLOG("ndrv: IOFramebuffer::_extEntry not routed (error %d): a dark wake can leave WindowServer waiting", patcher.getError());
+	patcher.clearError();
+	KernelPatcher::RouteRequest notify {"__ZN13IOFramebuffer12notifyServerEh", wrapFbNotifyServer, orgFbNotifyServer};
+	if (!fbStartThread || !patcher.routeMultiple(index, &notify, 1, address, size))
+		FBLOG("ndrv: IOFramebuffer::notifyServer not routed (error %d): a system sleep waits 90 s for our framebuffers",
+		      patcher.getError());
+	patcher.clearError();
+}
+
 bool ndrvRouted = false;   // processKext ran: by Lilu's load notice, or by lateNdrvCheck
 
 void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address,
@@ -1551,6 +1717,7 @@ void pluginStart() {
 	FBLOG("Lilu plugin started (trace %s, compute stage %u%s%s)", traceEnabled ? "on" : "off",
 	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "", pvGpu ? ", FAKE PARAVIRT GPU (VM only)" : "");
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
+	lilu.onKextLoadForce(&kextIOGraphics, 1, processGraphics, nullptr);
 #ifdef AMDRadeonRDNA4_PVGPU
 	// whether this boot has the fake GPU is only known once NVRAM is (rdna4-trial): the functions are resolved in any case
 	lilu.onKextLoadForce(&kextIOSurface, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {

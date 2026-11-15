@@ -2484,6 +2484,12 @@ IOReturn RDNA4Device::pciPowerMessage(void *target, void *, UInt32 type, IOServi
 	auto *dev = static_cast<RDNA4Device *>(target);
 	if (type == kIOMessageDeviceHasPoweredOn) {
 		dev->logPciState("pci powered on");
+		// The card powered off with the system (it has no power states of its own): it lost its power. Said here too, not only
+		// at kIOMessageSystemWillPowerOn: in a dark wake (the system woken by a PCIe PME, a USB key press here) the card powers
+		// on long before that message, which only comes with the full wake, and the bring-up below would run warm (no displays).
+		if (!dev->coldBoot)
+			FBLOG("cold: pci powered on: the card lost its power: the next cold start runs as after a reset");
+		dev->coldBoot = true;
 		if (dev->drivesRuntimePower())
 			dev->compute->powerDidWake();
 	}

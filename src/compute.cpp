@@ -2228,8 +2228,10 @@ bool RDNA4Compute::stageGfx() {
 	trail("s3: SMU features (display-safe mask)");
 	uint64_t running = smuEnableFeatures(displaySafe, 0);
 	put("SmuFeatures", running);
-	if (env.smuReady)
+	if (env.smuReady) {
+		trail("s3: smuReady (display clocks, cold start)");
 		env.smuReady(env.cursorProbeCtx);
+	}
 
 	// 4. gfx_v12_0_wait_for_rlc_autoload_complete: CP idle and the RLC
 	//    reports its bootload complete.
@@ -2323,6 +2325,9 @@ uint64_t RDNA4Compute::smuEnableFeatures(uint64_t allowed, uint32_t domain) {
 		return lo | (static_cast<uint64_t>(hi) << 32);
 	};
 
+	// A breadcrumb before each message: with a second DisplayPort display lit by the GOP, a boot hung inside this function
+	// (2026-11-15, trail "s3: SMU features (display-safe mask)"); these name the message.
+	trail("s3: SMU GetDriverIfVersion");
 	resp = smuSend(kSmuMsgGetDriverIfVersion, 0, ret, 100);
 	CLOG("smu: driver interface version 0x%x (resp 0x%02x; amdgpu expects 0x2e)", ret, resp);
 	CLOG("smu: running features before: 0x%016llx", running());
@@ -2335,19 +2340,24 @@ uint64_t RDNA4Compute::smuEnableFeatures(uint64_t allowed, uint32_t domain) {
 	const uint32_t rl = smuSend(kSmuMsgSetDriverDramAddrLow, static_cast<uint32_t>(table), ret, 100);
 	CLOG("smu: driver table at MC 0x%llx (resp 0x%02x/0x%02x)", table, rh, rl);
 
+	trail("s3: SMU RunDcBtc");
 	resp = smuSend(kSmuMsgRunDcBtc, 0, ret, 2000);
 	CLOG("smu: RunDcBtc -> 0x%02x", resp);
 
+	trail("s3: SMU SetAllowedMask");
 	const uint32_t mh = smuSend(kSmuMsgSetAllowedMaskHigh, static_cast<uint32_t>(allowed >> 32), ret, 100);
 	const uint32_t ml = smuSend(kSmuMsgSetAllowedMaskLow, static_cast<uint32_t>(allowed), ret, 100);
 	CLOG("smu: allowed features 0x%016llx -> 0x%02x/0x%02x%s", allowed, mh, ml,
 	     mh == kSmuRespRejectedPrereq ? " (refused: SCPM, the pptable decides)" : "");
 
+	trail("s3: SMU EnableAllSmuFeatures");
 	resp = smuSend(kSmuMsgEnableAllFeatures, domain, ret, 2000);
 	CLOG("smu: EnableAllSmuFeatures(%u) -> 0x%02x", domain, resp);
 	// GFXOFF stays disallowed (amdgpu's initial gfx_off_req_count is 1).
+	trail("s3: SMU DisallowGfxOff");
 	resp = smuSend(kSmuMsgDisallowGfxOff, 0, ret, 100);
 
+	trail("s3: SMU GetRunningFeatures");
 	const uint64_t now = running();
 	auto on = [now](uint32_t bit) { return (now >> bit) & 1 ? "on" : "off"; };
 	CLOG("smu: running features after: 0x%016llx — GFX_IMU %s, GFXCLK DPM %s, UCLK DPM %s, "
