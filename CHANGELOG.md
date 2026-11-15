@@ -70,7 +70,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
   and 2560x1440@120 underflowed on the 4K mode's (its lines are delivered in 5.5 us, not 7.5). pipegen records the
   Samsung's fast modes for that table alone (`modes-boot-dp.txt`: 2560x1440 and 1920x1080 at 120 and 144 Hz); a
   mode without Linux's values that has to deliver its lines faster than the plane's are set for is refused.
-  Card (2026-11-15): 2560x1440@120 in 112 steps, 120.018 Hz, no underflows.
+  Card (2026-11-15): 2560x1440@120 in 112 steps, 120.018 Hz, no underflows; 2560x1440@144 (604.25 MHz, above the
+  533.25 MHz boot mode) measured 143.999 Hz, no underflows, no glitches.
 - Under the paravirtual displays the boot display goes to the mode macOS was given for its size at the first frame,
   also when the size is the one it runs (`PvScanout::wantsMode`): the GOP once lit the Samsung at 3840x2160@30 while
   macOS was told 60 Hz, and it stayed at 30 Hz until a switch to another size. Card (2026-11-15): a boot the GOP lit at
