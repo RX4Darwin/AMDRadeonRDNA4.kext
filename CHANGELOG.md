@@ -55,6 +55,12 @@ otherwise). The newest version is on top. How versions and branches work is in `
   `rdna4-pvfast=1` gives the paravirtual displays the fastest refresh of each size for the boot display (macOS
   picks a size there, not a refresh). Card (2026-11-15, the Samsung booted by the GOP at 3840x2160@30, 297 MHz):
   2560x1440@120 (497.75 MHz) measured 120.003 Hz, then 3840x2160@60 (533.25 MHz) measured 59.994 Hz.
+- The boot DisplayPort display's mode switches take the plane's request timing (HUBP DLG/TTU, DET) from Linux's DML
+  for the mode, from pipe 0's table as the second pipes take theirs; before, every mode ran on the GOP's boot mode's,
+  and 2560x1440@120 underflowed on the 4K mode's (its lines are delivered in 5.5 us, not 7.5). pipegen records the
+  Samsung's fast modes for that table alone (`modes-boot-dp.txt`: 2560x1440 and 1920x1080 at 120 and 144 Hz); a
+  mode without Linux's values that has to deliver its lines faster than the plane's are set for is refused.
+  Card (2026-11-15): 2560x1440@120 in 112 steps, 120.018 Hz, no underflows.
 - The extra displays' pipe selection is held under one lock from selection through use: the hot-plug poll, macOS's
   mode switches (paravirtual host thread or NDRV) and the heads' start-up selected pipes under one another (card
   2026-11-14: a switch logged another slot's empty mode). Card (2026-11-14): six switches of the HDMI display, each

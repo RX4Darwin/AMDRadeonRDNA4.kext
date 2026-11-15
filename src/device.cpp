@@ -3037,9 +3037,40 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		// Above the boot clock only on the kext's DISPCLK (raised when the firmware runs), not the GOP's.
 		t.dpMaxKHz = uhdClocks ? bootDpMaxKHz() : bootTiming.pixelClockKHz;
 	}
+	// The plane's request timing (HUBP DLG/TTU, DET) for the mode: Linux's DML values from the boot display's table
+	// (pipe 0 on the first DisplayPort connector), as the second pipes take theirs. Without them the plane keeps the
+	// request timing it has, which is the GOP's boot mode's until a switch with values replaced it: a mode that has to
+	// deliver its lines faster than that underflows (2560x1440@120 on the 4K mode's, card, 2026-11-15), refused.
+	static ModeSet::Step modeRegs[Pipe2::kMaxModeSteps];
+	ExtraHold hold(*this);
+	struct TableBack {
+		RDNA4Device &dev;
+		bool used;
+		~TableBack() { if (used) dev.useSlotTable(); }
+	} back { *this, dp && pipe.otg == 0 && pipe.hubp == 0 && pipe.dig == 0 && pipe.hpd == 1 && Pipe2::use(1, false, 0, true) };
+	const bool known = back.used && Pipe2::modeKnown(m.t);
+	if (!reqTimingValid) {
+		reqTiming = bootTiming;
+		reqTimingValid = bootTimingValid;
+	}
+	const auto lineFaster = [](const Edid::DetailedTiming &a, const Edid::DetailedTiming &b) {   // a's lines in less time
+		return static_cast<uint64_t>(a.hActive) * b.pixelClockKHz < static_cast<uint64_t>(b.hActive) * a.pixelClockKHz;
+	};
+	if (dp && !known && (!reqTimingValid || lineFaster(m.t, reqTiming))) {
+		FBLOG("modes: switch to id %u refused: no request timing from Linux for %ux%u at %u kHz, and the plane's (of "
+		      "%ux%u at %u kHz) does not deliver its lines fast enough", m.id, m.t.hActive, m.t.vActive,
+		      m.t.pixelClockKHz, reqTiming.hActive, reqTiming.vActive, reqTiming.pixelClockKHz);
+		return kIOReturnUnsupported;
+	}
 	auto aim = [&](const Edid::DetailedTiming &from, const Edid::DetailedTiming &to) {
 		t.from = from;
 		t.to = to;
+		t.extra = modeRegs;
+		t.nextra = 0;
+		if (back.used && Pipe2::modeKnown(to)) {
+			t.nextra = Pipe2::modeSteps(to, modeRegs, Pipe2::kMaxModeSteps);
+			clampDet(modeRegs, t.nextra, secondPipeDet(to));
+		}
 		if (!dp)
 			return;
 		if (!ModeSet::scaleDpDto(dtoNow, dtoFromKHz, to.pixelClockKHz, t.dto))
@@ -3056,15 +3087,18 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		return kIOReturnUnsupported;
 	}
 	FBLOG("modes: switching to id %u %ux%u@%u.%03u (%u kHz, vstartup %u): %lu steps, "
-	      "%lu DMUB commands", m.id, m.t.hActive, m.t.vActive, m.refreshMilliHz / 1000,
+	      "%lu DMUB commands, request timing %s", m.id, m.t.hActive, m.t.vActive, m.refreshMilliHz / 1000,
 	      m.refreshMilliHz % 1000, m.t.pixelClockKHz, ModeSet::vstartupLines(m.t),
-	      static_cast<unsigned long>(modePlan.count), static_cast<unsigned long>(modePlan.ncmds));
+	      static_cast<unsigned long>(modePlan.count), static_cast<unsigned long>(modePlan.ncmds),
+	      t.nextra ? "from Linux for this mode" : "kept");
 	if (dp)
 		FBLOG("modes: DisplayPort, link untouched: DTO %u + %u / %u -> %u + %u / %u, DP_VID_M 0x%x -> 0x%x",
 		      dtoNow.integer, dtoNow.phase, dtoNow.modulo, t.dto.integer, t.dto.phase, t.dto.modulo,
 		      vidMNow, t.vidM);
 	if (runPlan(modePlan)) {
 		liveTiming = m.t;
+		if (t.nextra)
+			reqTiming = m.t;
 		// The firmware taking SET_PIXEL_CLOCK does not show the PLL runs at
 		// the new rate: time the OTG's frames. An unchanged clock would give
 		// the old pixel clock over the new totals, not this refresh.

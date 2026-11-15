@@ -452,6 +452,9 @@ private:
 	// The timing on the pipe now: the boot timing, then each mode applied.
 	Edid::DetailedTiming liveTiming {};
 	bool liveTimingValid { false };
+	// The mode whose request timing (HUBP DLG/TTU) the boot plane has: the GOP's, until a switch with Linux's values.
+	Edid::DetailedTiming reqTiming {};
+	bool reqTimingValid { false };
 	ModeSet::Plan modePlan {};
 	bool pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out, uint8_t *ddcLine = nullptr);
 	// The lit pipe and its connector's wiring as a mode-set target (timings not filled in).

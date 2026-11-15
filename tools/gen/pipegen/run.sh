@@ -130,7 +130,7 @@ table() {
 			grep -q 'DML: mode not supported' "$B/mode.err" || { cat "$B/mode.err" >&2; exit 1; }
 			echo "modes.txt: DML does not support${line##*#}: it stays on the 25 % rule"
 		fi
-	done < "$here/modes.txt"
+	done < <(cat "$here/modes.txt" ${MODES_MORE:+"$here/$MODES_MORE"})
 
 	# A 4:2:0 table also gets what changes with the encoding: the same pipe and timing lit in RGB.
 	rgb=""
@@ -182,7 +182,8 @@ if [ $# -eq 0 ]; then
 	done
 	# Pipe 0 itself on the first DisplayPort connector, at the timing the GOP lights the boot display with: what
 	# lights it again after the display hardware was started from nothing (src/dcninit.cpp, rdna4-dcninit).
-	table pipe2_linux_p0_dp1_uhd.inc   dplink a 0 0  0 0 0 1  3840 48 32 80  2160 3 5 54  533250 1 0 0
+	# Its own monitor's modes besides modes.txt (MODES_MORE): the boot display's mode switches use this table's.
+	MODES_MORE=modes-boot-dp.txt table pipe2_linux_p0_dp1_uhd.inc   dplink a 0 0  0 0 0 1  3840 48 32 80  2160 3 5 54  533250 1 0 0
 else
 	table pipe2_linux.inc "$@"
 fi

@@ -1894,7 +1894,7 @@ static int testPipe2Table() {
 			const ModeSet::DpDto now { (r.get(1, 0x006f) >> (1 + 5 * c.pipe)) & 0xf, r.get(1, 0x0081 + 4 * c.pipe),
 			                           r.get(1, 0x0082 + 4 * c.pipe) };
 			mt.dp = true;
-			mt.dpMaxKHz = 600000;
+			mt.dpMaxKHz = DpTrain::bandwidthKbps(DpTrain::Link { 4, DpTrain::kHbr2 }) / 24;   // as the device, on this link
 			mt.vidM = ModeSet::dpVidM(to.pixelClockKHz, DpTrain::symbolClockKHz(DpTrain::kHbr2));
 			if (!ModeSet::scaleDpDto(now, from.pixelClockKHz, to.pixelClockKHz, mt.dto))
 				return check(false, "pipe2: no DP DTO for %u kHz from %u + %u / %u", to.pixelClockKHz, now.integer,
