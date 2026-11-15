@@ -126,10 +126,10 @@ struct Target {
 	// Light: the DET segments to give the plane, when the plan's (DML's for
 	// this pipe alone) do not fit next to the other pipes; 0 = the plan's.
 	uint8_t detSegments;
-	// Light of pipe 0 itself (rdna4-dcninit): the VM aperture the firmware's pipe 0 held before the display
-	// hardware was started from nothing, in the order of the plan's 'C' entries (HUBPREQ0_DCN_VM_SYSTEM_APERTURE_
-	// LOW_ADDR, _HIGH_ADDR, DCN_VM_MX_L1_TLB_CNTL); null: copied from the lit HUBP.
-	const uint32_t *vm;
+	// Light of a pipe with no lit pipe beside it (pipe 0 after the display hardware was started from nothing,
+	// rdna4-dcninit): the VM aperture is not copied from a lit HUBP but left as the hardware has it, as amdgpu leaves
+	// it on a discrete card (litHubp is then the plan's own pipe).
+	bool alone;
 };
 
 constexpr size_t kMaxSteps = 448;

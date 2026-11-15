@@ -260,6 +260,7 @@ public:
 	// the display hardware started as Linux's dcn401_init_hw does from nothing (src/dcninit.cpp), and pipe 0 lit
 	// again from a Linux-generated table with the kext's own link training. False when not asked or not done.
 	bool coldStart();
+	bool consoleMcAddress(uint64_t &mc);
 	void logBootLink(const char *when);
 	const char *auxWhy { "" };   // why the last AUX transaction gave no reply, and the status it ended with
 	uint32_t    auxSts { 0 };

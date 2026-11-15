@@ -1640,10 +1640,8 @@ static int testPipe2Table() {
 
 	Pipe2::Target t {};
 	t.litHubp = 0;
-	// Pipe 0 lit again (rdna4-dcninit) has no lit pipe beside it: the VM aperture the firmware's held
-	static const uint32_t kVm[3] = { 0x5a5a0001, 0x5a5a0002, 0x5a5a0003 };
-	if (c.pipe == 0)
-		t.vm = kVm;
+	// Pipe 0 lit again (rdna4-dcninit) has no lit pipe beside it: its VM aperture is left alone
+	t.alone = c.pipe == 0;
 	t.encoderObjId = kEncoderObj;
 	t.surface = 0x8002100000ull;
 	t.depth = Pipe2::Depth::Plane;
@@ -1693,7 +1691,8 @@ static int testPipe2Table() {
 				                  "and not an allowed shared bit", i, s.what, s.seg, s.dword, mask);
 			}
 		}
-		if (s.op == ModeSet::Op::Write && t.vm && (s.value == kVm[0] || s.value == kVm[1] || s.value == kVm[2]))
+		if (s.seg == 2 && (s.dword == 0x062c + 0xdcu * c.pipe || s.dword == 0x062d + 0xdcu * c.pipe ||
+		                   s.dword == 0x063a + 0xdcu * c.pipe))   // HUBPREQn_DCN_VM_SYSTEM_APERTURE_*, _MX_L1_TLB_CNTL
 			vmWrites++;
 		if (s.op == ModeSet::Op::Copy) {
 			const Family *src = nullptr;
@@ -1707,7 +1706,8 @@ static int testPipe2Table() {
 	auto inBlocks = [&](const Pipe2::Plan &p) { stepsInBlocks(p.steps, p.count); };
 	inBlocks(plan);
 	const size_t lightWrites = writes;
-	failures += check(!t.vm || vmWrites == 3, "pipe2: pipe 0 writes the saved VM aperture %zu times, expected 3", vmWrites);
+	failures += check(vmWrites == (t.alone ? 0u : 3u), "pipe2: the plan touches the VM aperture %zu times, expected %u",
+	                  vmWrites, t.alone ? 0u : 3u);
 	failures += check(requires == 5, "pipe2: %zu requirements, expected 5", requires);
 
 	if (!c.dp) {

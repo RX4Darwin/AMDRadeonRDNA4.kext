@@ -2740,6 +2740,24 @@ DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 	return r;
 }
 
+// The console's address as the display hub counts it: the memory controller's VRAM base (the MM hub's
+// MC_VM_FB_LOCATION_BASE, [23:0] = MC address >> 24, where amdgpu takes its fb_start) plus the console's place in
+// VRAM (its CPU address less BAR0's). What amdgpu puts in a plane's address register for a buffer in VRAM.
+bool RDNA4Device::consoleMcAddress(uint64_t &mc) {
+	constexpr uint32_t kMmFbLocationBase = 0x0554;   // MMMC_VM_FB_LOCATION_BASE (gfxregs.hpp MmFbLocationBase)
+	uint32_t off = 0;
+	IODeviceMemory *bar0 = pciDevice ? pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0) : nullptr;
+	if (!bar0 || !rmmio || !ipDiscovery.regByteOffset(IpDiscovery::HwMmhub, 0, 0, kMmFbLocationBase, off) ||
+	    off + 4 > rmmioSize)
+		return false;
+	const uint64_t base = static_cast<uint64_t>(rmmio[off / 4] & 0xffffff) << 24;
+	const uint64_t bar = bar0->getPhysicalAddress();
+	if (!base || fbPhysBase < bar || fbPhysBase >= bar + bar0->getLength())
+		return false;
+	mc = base + (fbPhysBase - bar);
+	return true;
+}
+
 bool RDNA4Device::coldStart() {
 	uint32_t on = 0;
 	if (!Trial::option("rdna4-dcninit", on) || !on)
@@ -2748,22 +2766,33 @@ bool RDNA4Device::coldStart() {
 	AtomBios::DisplayPath path {};
 	if (!bootDpLinkKnown)   // read with rdna4-dptrain only: the sink's capabilities and the firmware's link (DPCD reads)
 		noteBootDpLink();
+	// The live pixel clock is measured from the frame period (533246 kHz on one boot, 533250 on the next): the
+	// timing's shape has to be the table's, its clock within 0.05 %.
+	auto nearTiming = [](Edid::DetailedTiming a, const Edid::DetailedTiming &b) {
+		const uint32_t diff = a.pixelClockKHz > b.pixelClockKHz ? a.pixelClockKHz - b.pixelClockKHz
+		                                                        : b.pixelClockKHz - a.pixelClockKHz;
+		a.pixelClockKHz = b.pixelClockKHz;
+		return Edid::sameTiming(a, b) && diff <= b.pixelClockKHz / 2000;
+	};
 	// The one boot pipe there is a table for: the GOP's DisplayPort display on pipe 0 at its 4K timing.
 	if (!pipe.valid() || pipe.otg != 0 || pipe.hubp != 0 || pipe.dig != 0 || pipe.link != 0 || pipe.hpd != 1 ||
 	    !bootDpLinkKnown || !pathForHpd(pipe.hpd, path) || !Pipe2::use(1, false, 0, true) ||
-	    !Edid::sameTiming(Pipe2::config().timing, liveTiming)) {
+	    !nearTiming(liveTiming, Pipe2::config().timing)) {
 		FBLOG("dcninit: not run: the boot pipe is not the DisplayPort one on pipe 0 at the table's 3840x2160 "
 		      "(OTG%u HUBP%u DIG%u link %u HPD%u, %ux%u at %u kHz, link known %d)", pipe.otg, pipe.hubp, pipe.dig,
 		      pipe.link, pipe.hpd, liveTiming.hActive, liveTiming.vActive, liveTiming.pixelClockKHz, bootDpLinkKnown);
 		useSlotTable();   // the slot's own table again
 		return false;
 	}
-	// What the lighting copies from a lit pipe, read while the GOP's still holds it: the VM aperture, the scanout address.
-	static const uint32_t kVm[3] = { 0x062c, 0x062d, 0x063a };   // HUBPREQ0_DCN_VM_SYSTEM_APERTURE_LOW/HIGH_ADDR, MX_L1_TLB_CNTL
-	uint32_t vm[3];
-	for (int i = 0; i < 3; i++)
-		vm[i] = regReadDmu(2, kVm[i]);
-	const uint64_t surface = regReadDmu(2, 0x060a) | static_cast<uint64_t>(regReadDmu(2, 0x060b) & 0xffff) << 32;
+	// The console's address as the display hub counts it, computed (as after a power loss, when no pipe holds it);
+	// on this warm card it has to be the address the GOP's HUBP0 scans.
+	const uint64_t gop = regReadDmu(2, 0x060a) | static_cast<uint64_t>(regReadDmu(2, 0x060b) & 0xffff) << 32;
+	uint64_t surface = 0;
+	if (!consoleMcAddress(surface) || surface != gop) {
+		FBLOG("dcninit: not run: the console's computed address 0x%llx is not the GOP's 0x%llx", surface, gop);
+		useSlotTable();
+		return false;
+	}
 	const uint8_t connector = static_cast<uint8_t>(path.connectorObjId & 0xff);
 
 	ExtraPipe boot {};
@@ -2777,7 +2806,7 @@ bool RDNA4Device::coldStart() {
 
 	Pipe2::Target t {};
 	t.litHubp = 0;
-	t.vm = vm;
+	t.alone = true;   // its VM aperture left as the hardware has it, as amdgpu leaves it on a discrete card
 	t.encoderObjId = path.encoderObjId;
 	t.connectorObjId = connector;
 	t.surface = surface;
@@ -2788,9 +2817,9 @@ bool RDNA4Device::coldStart() {
 	size_t ninit = 0, notg = 0;
 	const char *why = "";
 	bool ok = plan && DcnInit::steps(init, 256, ninit) && DcnInit::steps(otgOff0, 16, notg, DcnInit::Table::OtgOff);
-	FBLOG("dcninit: boot pipe 0 at 0x%llx, VM aperture 0x%08x 0x%08x TLB 0x%08x, link %u lane(s) at 0x%02x on AUX%u: "
-	      "taking it down, %lu steps of dcn401_init_hw, lighting it again", surface, vm[0], vm[1], vm[2],
-	      bootDpLink.lanes, bootDpLink.rate, sinkAuxInst, static_cast<unsigned long>(ninit));
+	FBLOG("dcninit: boot pipe 0 at 0x%llx (computed, as the GOP's), link %u lane(s) at 0x%02x on AUX%u: taking it "
+	      "down, %lu steps of dcn401_init_hw, lighting it again", surface, bootDpLink.lanes, bootDpLink.rate,
+	      sinkAuxInst, static_cast<unsigned long>(ninit));
 	// 1. The stream and the link off, as Linux's link_set_dpms_off (the table's sleep part).
 	t.part = Pipe2::Part::Sleep;
 	ok = ok && Pipe2::build(t, *plan, &why) &&

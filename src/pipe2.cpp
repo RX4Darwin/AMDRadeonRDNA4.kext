@@ -471,7 +471,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 	out.naux = 0;
 
 	if (t.part == Part::Light) {
-		if (t.litHubp >= 4 || (t.litHubp == c.pipe && !t.vm)) {
+		if (t.litHubp >= 4 || (t.litHubp == c.pipe && !t.alone)) {
 			err = "the lit pipe uses the HUBP this plan lights";
 			return false;
 		}
@@ -526,7 +526,6 @@ bool build(const Target &t, Plan &out, const char **why) {
 		Dmub::buildSetPixelClock(cmd, pc);
 	};
 	Part part = Part::Light;   // of the entry: the requirements at the top belong to lighting
-	uint32_t vmCopies = 0;
 	for (size_t i = 0; i < cur->ngen; i++) {
 		const Gen &g = cur->gen[i];
 		if (g.kind >= '4' && g.kind <= '6')
@@ -567,10 +566,8 @@ bool build(const Target &t, Plan &out, const char **why) {
 			break;
 		}
 		case 'C':
-			// The VM aperture as the lit pipe has it; pipe 0 lit again has none beside it: what the firmware's held
-			if (t.vm)
-				ok = vmCopies < 3 && step(ModeSet::Op::Write, g, 0, t.vm[vmCopies++], 0);
-			else
+			// The VM aperture as the lit pipe has it; a pipe alone leaves it as the hardware has it (amdgpu does)
+			if (!t.alone)
 				ok = step(ModeSet::Op::Copy, g, 0, 0, g.dword - (c.pipe - t.litHubp) * g.arg);
 			break;
 		case 'H': ok = step(ModeSet::Op::Write, g, 0, static_cast<uint32_t>(t.surface >> 32), 0); break;
