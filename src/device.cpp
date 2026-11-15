@@ -19,6 +19,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <kern/clock.h>
+#include <sys/sysctl.h>
 
 #include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
 
@@ -2200,6 +2201,193 @@ void RDNA4Device::tryForce8bpc() {
 	      regReadDmu(2, kDpPixelFormat), regReadDmu(2, kDpMsaColorimetry));
 }
 
+namespace {
+RDNA4Device *gColdDev;   // the device debug.rdna4_coldreset acts on (rdna4-coldprobe=1)
+
+int coldResetSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = 0;
+	const int err = sysctl_handle_int(oidp, &value, 0, req);
+	if (err || !req->newptr)
+		return err;
+	if (value == 1 && gColdDev)
+		(void)gColdDev->coldReset();
+	return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_coldreset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, coldResetSysctl, "I",
+	    "AMDRadeonRDNA4: 1 resets the card (mode 1) and brings it back as Linux does before its IP blocks start");
+} // namespace
+
+// A real cold start, stage (a): the state a mode-1 reset (amdgpu_device_mode1_reset: SMU debug mailbox
+// DEBUGSMC_MSG_Mode1Reset on MP1 14.0.2/3) and the VBIOS's asic_init (its bytecode, decoded 2026-11-15) depend on,
+// logged and nothing written. The PSP's bootloader and mailbox words, the SMU's debug mailbox, the registers
+// asic_init reads and writes, the VRAM size, and the PCI config space a reset clears (the BARs, the command
+// register, PCIe link control, Resizable BAR), to compare with after a reset.
+void RDNA4Device::coldProbe() {
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("rdna4-coldprobe", &on, sizeof(on)) || !on || !ipDiscovery.isValid() || !rmmio)
+		return;
+	if (!gColdDev) {
+		gColdDev = this;
+		sysctl_register_oid(&sysctl__debug_rdna4_coldreset);
+	}
+	auto ip = [&](IpDiscovery::HwId hw, uint32_t seg, uint32_t dword) -> uint32_t {
+		uint32_t off;
+		if (!ipDiscovery.regByteOffset(hw, 0, seg, dword, off) || off + 4 > rmmioSize)
+			return 0xFFFFFFFF;
+		return rmmio[off / 4];
+	};
+	auto mm = [&](uint32_t dword) { return dword * 4 + 4 <= rmmioSize ? rmmio[dword] : 0xFFFFFFFFu; };
+	// MP0 C2PMSG_n at dword 0x40 + n (segment 0): 33 VMBX, 35 bootloader, 64 ring, 81 sOS
+	FBLOG("cold: psp C2PMSG_33 0x%08x (asic_init waits for bit 31), _35 0x%08x (bootloader, bit 31), _64 0x%08x, "
+	      "_81 0x%08x (sOS)", ip(IpDiscovery::HwMp0, 0, 0x61), ip(IpDiscovery::HwMp0, 0, 0x63),
+	      ip(IpDiscovery::HwMp0, 0, 0x80), ip(IpDiscovery::HwMp0, 0, 0x91));
+	// MP1 C2PMSG_n at dword 0x40 + n (segment 1): the debug mailbox's param 53, response 54, message 75
+	FBLOG("cold: smu debug mailbox: param(C2PMSG_53) 0x%08x resp(_54) 0x%08x msg(_75) 0x%08x",
+	      ip(IpDiscovery::HwMp1, 1, 0x75), ip(IpDiscovery::HwMp1, 1, 0x76), ip(IpDiscovery::HwMp1, 1, 0x8b));
+	FBLOG("cold: asic_init's registers: [0x0006] 0x%08x [0x004c] 0x%08x [0x004e] 0x%08x [0x0050] 0x%08x "
+	      "[0x0053] 0x%08x [0x0de3] 0x%08x", mm(0x0006), mm(0x004c), mm(0x004e), mm(0x0050), mm(0x0053), mm(0x0de3));
+	if (!pciDevice)
+		return;
+	uint32_t cfg[16];
+	for (uint32_t i = 0; i < 16; i++)
+		cfg[i] = pciDevice->configRead32(static_cast<uint8_t>(i * 4));
+	FBLOG("cold: pci 00-1c: %08x %08x %08x %08x %08x %08x %08x %08x", cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5],
+	      cfg[6], cfg[7]);
+	FBLOG("cold: pci 20-3c: %08x %08x %08x %08x %08x %08x %08x %08x", cfg[8], cfg[9], cfg[10], cfg[11], cfg[12],
+	      cfg[13], cfg[14], cfg[15]);
+	IOByteCount pcie = 0, rebar = 0;
+	if (pciDevice->extendedFindPCICapability(0x10, &pcie) && pcie)   // PCI Express: device and link control/status
+		FBLOG("cold: pcie cap@0x%x: devctl/sta 0x%08x linkcap 0x%08x linkctl/sta 0x%08x devctl2 0x%08x linkctl2 "
+		      "0x%08x", static_cast<uint32_t>(pcie), pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x08)),
+		      pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x0c)),
+		      pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x10)),
+		      pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x28)),
+		      pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x30)));
+	// Resizable BAR (extended capability 0x15): a capability and a control word for each of up to six BARs
+	if (pciDevice->extendedFindPCICapability(-0x15, &rebar) && rebar)
+		for (uint32_t i = 0; i < 6; i++) {
+			const uint32_t cap = pciDevice->extendedConfigRead32(rebar + 4 + 8 * i),
+			               ctl = pciDevice->extendedConfigRead32(rebar + 8 + 8 * i);
+			if (i && !(cap | ctl))
+				break;
+			FBLOG("cold: rebar cap@0x%x entry %u: cap 0x%08x ctl 0x%08x (BAR %u, size 2^%u MiB)",
+			      static_cast<uint32_t>(rebar), i, cap, ctl, ctl & 7, (ctl >> 8) & 0x3f);
+		}
+}
+
+
+// Stage (b): amdgpu_device_mode1_reset as Linux runs it on MP1 14.0.2/3, then the VBIOS's asic_init. Not the
+// IP blocks: the PSP's sOS, the SMU's features, DMUB, the display and the compute runtime are as dead afterwards as
+// after a power loss, and the displays dark: this shows whether the card comes back to where a cold start begins.
+bool RDNA4Device::coldReset() {
+	if (!pciDevice || !rmmio || !ipDiscovery.isValid())
+		return false;
+	auto ipOff = [&](uint16_t hw, uint8_t seg, uint32_t dword) {
+		uint32_t off = 0;
+		return ipDiscovery.regByteOffset(hw, 0, seg, dword, off) && off + 4 <= rmmioSize ? off / 4 : 0u;
+	};
+	const uint32_t c2p33 = ipOff(IpDiscovery::HwMp0, 0, 0x61), c2p35 = ipOff(IpDiscovery::HwMp0, 0, 0x63),
+	               c2p81 = ipOff(IpDiscovery::HwMp0, 0, 0x91);
+	const uint32_t dbgParam = ipOff(IpDiscovery::HwMp1, 1, 0x75), dbgResp = ipOff(IpDiscovery::HwMp1, 1, 0x76),
+	               dbgMsg = ipOff(IpDiscovery::HwMp1, 1, 0x8b);
+	uint32_t memsizeOff = 0;
+	if (!c2p33 || !c2p35 || !dbgParam || !dbgMsg || !dbgResp ||
+	    !ipDiscovery.regByteOffset(IpDiscovery::HwNbif, 0, 2, 0x00c3, memsizeOff)) {
+		FBLOG("cold: reset not done: a register is not in the discovery table");
+		return false;
+	}
+	// VRAM before: a pattern at the console's first page, to see afterwards whether memory kept it.
+	IODeviceMemory *bar0 = pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+	IOMemoryMap *vmap = bar0 ? bar0->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, 0, 4096)
+	                         : nullptr;
+	volatile uint32_t *vram = vmap ? reinterpret_cast<volatile uint32_t *>(vmap->getVirtualAddress()) : nullptr;
+	if (vram)
+		vram[0] = 0x5a5a1234;
+
+	// amdgpu_device_cache_pci_state: the header and capabilities, and Resizable BAR (extended capability 0x15).
+	uint32_t cfg[64];
+	for (uint32_t i = 0; i < 64; i++)
+		cfg[i] = pciDevice->configRead32(static_cast<uint8_t>(i * 4));
+	IOByteCount rebar = 0;
+	uint32_t rebarCtl[6] = {};
+	uint32_t nrebar = 0;
+	if (pciDevice->extendedFindPCICapability(-0x15, &rebar) && rebar)
+		for (; nrebar < 6; nrebar++) {
+			rebarCtl[nrebar] = pciDevice->extendedConfigRead32(rebar + 8 + 8 * nrebar);
+			if (nrebar && !rebarCtl[nrebar])
+				break;
+		}
+	FBLOG("cold: resetting the card (SMU debug mailbox, DEBUGSMC_MSG_Mode1Reset): command 0x%04x, BAR0 0x%08x%08x, "
+	      "%u Resizable BAR control(s)", cfg[1] & 0xffff, cfg[5], cfg[4], nrebar);
+
+	// pci_clear_master, then smu_v14_0_2_mode1_reset: param, message, response cleared; 1 s without the registers.
+	pciDevice->configWrite16(kIOPCIConfigCommand, static_cast<uint16_t>((cfg[1] & 0xffff) & ~0x4u));
+	rmmio[dbgParam] = 0;
+	rmmio[dbgMsg] = 2;   // DEBUGSMC_MSG_Mode1Reset
+	rmmio[dbgResp] = 0;
+	IOSleep(1000);
+
+	// amdgpu_device_load_pci_state: the BAR sizes first, then the header (BARs before the command register).
+	for (uint32_t i = 0; i < nrebar; i++)
+		pciDevice->extendedConfigWrite32(rebar + 8 + 8 * i, rebarCtl[i]);
+	for (uint32_t i = 2; i < 64; i++)   // past the IDs and the command/status word
+		if (i != 1)
+			pciDevice->configWrite32(static_cast<uint8_t>(i * 4), cfg[i]);
+	pciDevice->configWrite16(kIOPCIConfigCommand, static_cast<uint16_t>(cfg[1] & 0xffff));
+
+	// amdgpu_psp_wait_for_bootloader (C2PMSG_35 bit 31), then the VRAM size readable again.
+	auto waitFor = [&](uint32_t dword, uint32_t mask, uint32_t want, uint32_t ms) {
+		for (uint32_t t = 0; t < ms; t++) {
+			if ((rmmio[dword] & mask) == want)
+				return true;
+			IOSleep(1);
+		}
+		return false;
+	};
+	const bool boot = waitFor(c2p35, 0x80000000, 0x80000000, 5000);
+	bool sized = false;
+	for (uint32_t t = 0; t < 5000 && !sized; t++) {
+		const uint32_t v = rmmio[memsizeOff / 4];
+		sized = v && v != 0xffffffff;
+		if (!sized)
+			IOSleep(1);
+	}
+	FBLOG("cold: after the reset: bootloader %s (C2PMSG_35 0x%08x), VRAM size %u MiB, C2PMSG_33 0x%08x, sOS 0x%08x, "
+	      "command 0x%04x, BAR0 0x%08x%08x", boot ? "ready" : "NOT ready", rmmio[c2p35], rmmio[memsizeOff / 4],
+	      rmmio[c2p33], rmmio[c2p81], pciDevice->configRead16(kIOPCIConfigCommand),
+	      pciDevice->configRead32(kIOPCIConfigBaseAddress1), pciDevice->configRead32(kIOPCIConfigBaseAddress0));
+
+	// The VBIOS's asic_init (table 0, decoded): wait for C2PMSG_33 to read 0x80000000 (4 s); if it does not and the
+	// strap (REG 0x50 bits 31:24) is 1, ask the bootloader with 0x70000 in C2PMSG_35 and wait again; then the tail:
+	// REG 6 = (REG 0xde3 - 1) >> 11, REG 0x53 |= 0x200.
+	const uint32_t strap = rmmio[0x50] & 0xff000000;
+	bool vmbx = waitFor(c2p33, 0xffffffff, 0x80000000, 4000);
+	if (!vmbx && strap == 0x01000000) {
+		rmmio[c2p35] = 0x70000;
+		const bool done = waitFor(c2p35, 0xffffffff, 0x80000000, 4000);
+		rmmio[0x50] &= 0x00ffffff;
+		vmbx = done && waitFor(c2p33, 0xffffffff, 0x80000000, 4000);
+	}
+	const uint32_t de3 = rmmio[0x0de3];
+	if (de3) {
+		rmmio[0x0006] = (de3 - 1) >> 11;
+		rmmio[0x0053] |= 0x200;
+	}
+	FBLOG("cold: asic_init: C2PMSG_33 %s (0x%08x, strap 0x%08x); [0x0006] 0x%08x [0x0053] 0x%08x [0x0de3] 0x%08x",
+	      vmbx ? "ready" : "NOT ready", rmmio[c2p33], strap, rmmio[0x0006], rmmio[0x0053], de3);
+
+	// VRAM after: whether the pattern survived, and whether a new one reads back.
+	if (vram) {
+		const uint32_t kept = vram[0];
+		vram[1] = 0xa5a5c3c3;
+		FBLOG("cold: VRAM: the pattern written before %s (0x%08x); a new one reads back %s (0x%08x)",
+		      kept == 0x5a5a1234 ? "kept" : "gone", kept, vram[1] == 0xa5a5c3c3 ? "right" : "WRONG", vram[1]);
+	}
+	if (vmap)
+		vmap->release();
+	return boot && sized && vmbx;
+}
+
 void RDNA4Device::probeMemSize() {
 	// RCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE (NBIF 6.3.1 seg 2, dword 0x00c3):
 	// VRAM size in MiB — amdgpu's nbif_v6_3_1_get_memsize. The byte offset
@@ -2299,6 +2487,7 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 			if (hwCursorRequested)
 				initHardwareCursor();
 			probeMemSize();
+			coldProbe();
 			dumpDCN();
 			tryForce8bpc();   // DP-stream experiment (rdna4-8bpc=1)
 			probeEDID();
@@ -2325,6 +2514,19 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 
 	// Needs the boot timing (discoverPipe) and the sink's EDID (probeEDID).
 	buildModeTable();
+
+	// rdna4-coldboot=1: what the GOP left read while it is there, then the card reset (coldReset).
+	uint32_t coldArg = 0;
+	if (PE_parse_boot_argn("rdna4-coldboot", &coldArg, sizeof(coldArg)) && coldArg && rmmio && pipe.valid()) {
+		if (!bootDpLinkKnown)
+			noteBootDpLink();
+		coldGopSurface = bootScanout();
+		coldGopTimer = regReadDmu(2, DcnInit::kTimerCntl);
+		coldBoot = coldReset();
+		FBLOG("cold: boot: %s (the GOP's scanout 0x%llx, timer 0x%08x)",
+		      coldBoot ? "the card reset; the displays light once the SMU runs" : "the reset FAILED: as a warm boot",
+		      coldGopSurface, coldGopTimer);
+	}
 	FBLOG("init: device ready (%ux%u console, %lu mode(s))", fbWidth, fbHeight,
 	      static_cast<unsigned long>(modeCount));
 	return true;
@@ -2849,7 +3051,7 @@ void RDNA4Device::takeExtraDown() {
 bool RDNA4Device::coldStart(uint32_t &relight) {
 	uint32_t on = 0;
 	relight = 0;
-	if (!Trial::option("rdna4-dcninit", on) || !on)
+	if ((!Trial::option("rdna4-dcninit", on) || !on) && !coldBoot)
 		return false;
 	ExtraHold hold(*this);
 	if (!uhdClocks) {   // a cold start's order: the 4K boot display lit on the kext's clocks, not the GOP's
@@ -2879,7 +3081,7 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	}
 	// The console's address as the display hub counts it, computed (as after a power loss, when no pipe holds it);
 	// on this warm card it has to be the address the GOP's HUBP0 scans.
-	const uint64_t gop = regReadDmu(2, 0x060a) | static_cast<uint64_t>(regReadDmu(2, 0x060b) & 0xffff) << 32;
+	const uint64_t gop = coldBoot ? coldGopSurface : bootScanout();
 	uint64_t surface = 0;
 	if (!consoleMcAddress(surface) || surface != gop) {
 		FBLOG("dcninit: not run: the console's computed address 0x%llx is not the GOP's 0x%llx", surface, gop);
@@ -2889,7 +3091,7 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	// The DCHUB global timer, started by the kext from the VBIOS's reference clock (nothing else starts it after a
 	// power loss); on this warm card the GOP's has to be running with the divider the kext computes.
 	uint32_t refKHz = 0;
-	const uint32_t gopTimer = regReadDmu(2, DcnInit::kTimerCntl);
+	const uint32_t gopTimer = coldBoot ? coldGopTimer : regReadDmu(2, DcnInit::kTimerCntl);
 	ModeSet::Step timerOn[2];
 	size_t ntimer = 0;
 	if (!atomBios.getDceRefClock(refKHz) || !DcnInit::timerSteps(refKHz, timerOn, 2, ntimer) ||
@@ -2940,11 +3142,12 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	FBLOG("dcninit: boot pipe 0 at 0x%llx (computed, as the GOP's), link %u lane(s) at 0x%02x on AUX%u: taking it "
 	      "down, %lu steps of dcn401_init_hw, lighting it again", surface, bootDpLink.lanes, bootDpLink.rate,
 	      sinkAuxInst, static_cast<unsigned long>(ninit));
-	// 1. The stream and the link off, as Linux's link_set_dpms_off (the table's sleep part).
+	// 1. The stream and the link off, as Linux's link_set_dpms_off (the table's sleep part). 2. The firmware's
+	// timing generator stopped. Also after the reset (coldBoot): a mode-1 reset leaves the timing generators
+	// running (card, 2026-11-15: OTG0 at 59.997 Hz, its links dark).
 	t.part = Pipe2::Part::Sleep;
 	ok = ok && Pipe2::build(t, *plan, &why) &&
 	     runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dcninit: down", otgOff(), plan->aux);
-	// 2. The firmware's timing generator stopped (on a card started from nothing it is not running).
 	ok = ok && DcnInit::steps(otgStop, 16, notg, DcnInit::Table::OtgOff) &&
 	     runSteps(otgStop, notg, nullptr, 0, "dcninit: otg off", otgOff());
 	// 2b. The global timer stopped, as after a power loss, and started by the kext.

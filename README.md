@@ -557,10 +557,13 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    training, its scanout address computed and the DCHUB global timer
    started by the kext (`rdna4-dcninit=1`), in a cold start's order: on the
    kext's DMUB firmware and display clocks, the extra displays taken down
-   and lit again after it. Open: a real cold start (power cut, not a warm
-   card); DP modes above the
-   boot pixel clock (retraining in the mode switch); a second DisplayPort
-   display (written, not yet run on the card).
+   and lit again after it. And from a reset card (`rdna4-coldboot=1`,
+   2026-11-15): a mode-1 reset at boot as Linux does it, then both displays
+   and the desktop with nothing of the GOP's left in the hardware. DP modes
+   above the boot pixel clock with Linux's request timing (2026-11-15,
+   2560x1440@120). Open: the cold start after a real power loss (system
+   sleep, which macOS refuses here); DP modes that need a faster link or
+   DSC; a second DisplayPort display (written, not yet run on the card).
 5. **Display power management** — display sleep was verified on hardware
    with the standalone build (DP: video stream off + sink D3 over native-AUX
    DPCD `SET_POWER`; HDMI: OPP pattern generator blank). It now runs from

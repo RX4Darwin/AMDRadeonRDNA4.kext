@@ -55,6 +55,16 @@ otherwise). The newest version is on top. How versions and branches work is in `
   `rdna4-pvfast=1` gives the paravirtual displays the fastest refresh of each size for the boot display (macOS
   picks a size there, not a refresh). Card (2026-11-15, the Samsung booted by the GOP at 3840x2160@30, 297 MHz):
   2560x1440@120 (497.75 MHz) measured 120.003 Hz, then 3840x2160@60 (533.25 MHz) measured 59.994 Hz.
+- A real cold start (`rdna4-coldboot=1`): at boot, once the kext has read what the GOP left (the pipes, EDIDs, the
+  boot link, the scanout address, the DCHUB timer), the card is reset as Linux resets it on this SMU (mode 1 through
+  the SMU's debug mailbox, `amdgpu_device_mode1_reset`), its PCI config space (BARs, Resizable BAR) restored and the
+  VBIOS's asic_init done (decoded: the PSP's mailbox ready at once, two registers). The PSP, the SMU and the kext's
+  DMUB firmware come up as on every boot, then the cold start lights the displays; the extra displays are lit
+  after it and only then set up as lit heads. Found on the card: VRAM survives a mode-1 reset, the timing generators
+  keep running with their links dark. `rdna4-coldprobe=1` logs what the reset depends on and adds
+  `sysctl debug.rdna4_coldreset=1`, the reset alone at run time (the GPU work running then hangs the machine).
+  Card (Tahoe 26.6.2, 2026-11-15): both displays (DP 3840x2160 at 59.995 Hz, HDMI 1920x1080 at 59.997 Hz) and the
+  desktop after the reset.
 - The boot DisplayPort display's mode switches take the plane's request timing (HUBP DLG/TTU, DET) from Linux's DML
   for the mode, from pipe 0's table as the second pipes take theirs; before, every mode ran on the GOP's boot mode's,
   and 2560x1440@120 underflowed on the 4K mode's (its lines are delivered in 5.5 us, not 7.5). pipegen records the

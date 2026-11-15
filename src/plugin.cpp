@@ -392,6 +392,7 @@ struct Head2 {
 	// Its display can be lit at 3840x2160 once the compute bring-up has raised the display clocks: it waits
 	// offline for that, then is plugged in (or after kClockWaitPolls at the size it can have).
 	bool             waitClocks { false };
+	bool             coldPending { false };   // rdna4-coldboot=1: its pipe lit by coldStartHeads, not at start
 	uint32_t         waitPolls { 0 };
 };
 #define HLOG(h, fmt, ...)  FBLOG("head%u: " fmt, static_cast<unsigned>((h)->slot + 2), ## __VA_ARGS__)
@@ -667,7 +668,10 @@ void fillHead(Head2 *h, RDNA4Device &dev) {
 			HLOG(h, "nothing to serve: no mode of the sink fits behind the console");
 		return;
 	}
-	if (!offline && head2Level >= 2 && dev.isAmd)
+	// After the cold-boot reset nothing can light a pipe before the SMU and DMUB run: coldStartHeads does.
+	const bool lights = !offline && head2Level >= 2 && dev.isAmd;
+	h->coldPending = lights && dev.coldBoot;
+	if (lights && !dev.coldBoot)
 		dev.lightSecondPipe(head2Level, h->surface.physBase);
 	head2Init(h, dev, mode, n);
 	h->connected = !offline;
@@ -742,11 +746,19 @@ void coldStartHeads(RDNA4Device &dev) {
 	for (size_t i = 0; i < headCount; i++) {
 		Head2 *h = heads[i];
 
-		if (!(relight & 1u << h->slot))
+		if (!(relight & 1u << h->slot) && !h->coldPending)
 			continue;
+		const bool pending = h->coldPending;
+		h->coldPending = false;
 		dev.selectExtra(h->slot);
 		dev.lightSecondPipe(head2Level, h->surface.physBase);
-		HLOG(h, "dcninit: lit again: %s", dev.xp().lit && dev.xp().on ? "on" : "NOT on");
+		// A head the cold boot left dark at start (fillHead) set up as a lit one: its modes, switching and power.
+		size_t n = 0;
+		const Modes::Mode *mode = pending && dev.xp().lit ? head2BuildTable(h, dev, n) : nullptr;
+		if (mode)
+			head2Init(h, dev, mode, n);
+		HLOG(h, "dcninit: lit again: %s%s; surface %ux%u at 0x%llx", dev.xp().lit && dev.xp().on ? "on" : "NOT on",
+		      mode ? ", its modes set up" : "", h->surface.width, h->surface.height, h->surface.physBase);
 	}
 	dev.selectExtra(0);
 }
@@ -1018,7 +1030,7 @@ IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSOb
 		return ret;
 	}
 	FbEntry *e = fbEntry(fb);
-	if (e && e->ours && e->state && e->state->dev.bootDpLinkKnown && !bootDp.timer)
+	if (e && e->ours && e->state && e->state->dev.bootDpLinkKnown && !e->state->dev.coldBoot && !bootDp.timer)
 		startBootDpPoll(service, e->state->dev);
 	return ret;
 }

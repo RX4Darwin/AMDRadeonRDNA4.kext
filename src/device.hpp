@@ -274,6 +274,17 @@ public:
 	// lit again from a Linux-generated table with the kext's own link training. `relight`: the extra slots that were
 	// lit, now off, for the heads to light again. False when not asked or not done.
 	bool coldStart(uint32_t &relight);
+	// rdna4-coldprobe=1 and `sudo sysctl debug.rdna4_coldreset=1`: the card reset (mode 1) and brought back as far
+	// as Linux does before its IP blocks start (stage (b) of a real cold start). The displays go dark; reboot after.
+	bool coldReset();
+	// rdna4-coldboot=1: a real cold start at boot. What the GOP left is read first (the pipes, EDIDs, the boot link,
+	// the scanout address and the DCHUB timer below), then the card reset; the displays light once the SMU runs
+	// (coldStartHeads), as after a power loss. True from the reset on.
+	bool coldBoot { false };
+	uint64_t coldGopSurface { 0 };
+	// Where HUBP0 scans (HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS and _HIGH): the GOP's console on a warm card.
+	uint64_t bootScanout() const { return regReadDmu(2, 0x060a) | static_cast<uint64_t>(regReadDmu(2, 0x060b) & 0xffff) << 32; }
+	uint32_t coldGopTimer { 0 };
 	void takeExtraDown();
 	bool consoleMcAddress(uint64_t &mc);
 	void logBootLink(const char *when);
@@ -357,6 +368,7 @@ private:
 
 	void tryForce8bpc();
 	void probeMemSize();
+	void coldProbe();   // rdna4-coldprobe=1: what a mode-1 reset and asic_init depend on, read only
 	void dumpDCN();
 
 	// DP AUX software engine and DC_I2C hardware engine (EDID).
