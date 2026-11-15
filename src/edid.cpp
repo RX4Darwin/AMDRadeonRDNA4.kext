@@ -496,4 +496,41 @@ bool takesY420(const uint8_t *edid, size_t len, uint8_t vic) {
 	return false;
 }
 
+size_t displayIdTimings(const uint8_t block[128], DetailedTiming *out, size_t max)
+{
+	// Extension tag, then the section: version, payload bytes, product type, extension count; data blocks follow.
+	if (!block || block[0] != 0x70 || block[2] > 128 - 6)
+		return 0;
+	const size_t end = 5 + block[2];
+	size_t n = 0;
+	for (size_t at = 5; at + 3 <= end && n < max; ) {
+		const uint8_t tag = block[at], len = block[at + 2];
+		const uint8_t *d = block + at + 3;
+		if (at + 3 + len > end)
+			break;
+		if (tag == 0x03 || tag == 0x22) {
+			for (size_t i = 0; i + 20 <= len && n < max; i += 20, d += 20) {
+				auto u16 = [&](size_t o) { return static_cast<uint32_t>(d[o] | d[o + 1] << 8); };
+				const uint32_t clock = (d[0] | d[1] << 8 | static_cast<uint32_t>(d[2]) << 16) + 1;
+				DetailedTiming &t = out[n++];
+				t = DetailedTiming {};
+				t.pixelClockKHz = tag == 0x22 ? clock : clock * 10;
+				t.interlaced = (d[3] >> 4) & 1;
+				t.hActive = static_cast<uint16_t>(u16(4) + 1);
+				t.hBlank = static_cast<uint16_t>(u16(6) + 1);
+				t.hSyncOffset = static_cast<uint16_t>((u16(8) & 0x7fff) + 1);
+				t.hSyncPositive = d[9] >> 7;
+				t.hSyncWidth = static_cast<uint16_t>(u16(10) + 1);
+				t.vActive = static_cast<uint16_t>(u16(12) + 1);
+				t.vBlank = static_cast<uint16_t>(u16(14) + 1);
+				t.vSyncOffset = static_cast<uint16_t>((u16(16) & 0x7fff) + 1);
+				t.vSyncPositive = d[17] >> 7;
+				t.vSyncWidth = static_cast<uint16_t>(u16(18) + 1);
+			}
+		}
+		at += 3 + len;
+	}
+	return n;
+}
+
 } // namespace Edid

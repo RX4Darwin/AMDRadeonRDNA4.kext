@@ -475,6 +475,22 @@ static int testModes() {
 	                  sc.dtds[1].pixelClockKHz == 497750 && sc.dtds[2].pixelClockKHz == 297000,
 	                  "Samsung CTA DTDs (all three)");
 
+	// A DisplayID 1.3 block with one Type I timing: the Samsung's own 4K60 (each field minus one, 10 kHz clock).
+	uint8_t did[128] = { 0x70, 0x13, 23, 0x00, 0x00, 0x03, 0x00, 20,
+	                     0x4c, 0xd0, 0x00, 0x80, 0xff, 0x0e, 0x9f, 0x00, 0x2f, 0x80, 0x1f, 0x00,
+	                     0x6f, 0x08, 0x3d, 0x00, 0x02, 0x00, 0x04, 0x00 };
+	Edid::DetailedTiming dt[2], pref {};
+	const size_t dn = Edid::displayIdTimings(did, dt, 2);
+	failures += check(dn == 1 && Edid::preferredTiming(samsung, 128, pref) && Edid::sameTiming(dt[0], pref) && dt[0].pixelClockKHz == 533250 &&
+	                  dt[0].hSyncPositive && !dt[0].vSyncPositive,
+	                  "DisplayID Type I timing: %zu, %ux%u %u kHz", dn, dn ? dt[0].hActive : 0,
+	                  dn ? dt[0].vActive : 0, dn ? dt[0].pixelClockKHz : 0);
+	did[5] = 0x22;   // the same as Type VII (DisplayID 2.0): 1 kHz units
+	failures += check(Edid::displayIdTimings(did, dt, 2) == 1 && dt[0].pixelClockKHz == 53325,
+	                  "DisplayID Type VII clock %u kHz", dt[0].pixelClockKHz);
+	did[0] = 0x02;
+	failures += check(Edid::displayIdTimings(did, dt, 2) == 0, "a CTA block has no DisplayID timings");
+
 	Mode sm[Modes::MaxModes];
 	size_t sn = Modes::build(samsung, sizeof(samsung), unlimited, sm, Modes::MaxModes);
 	printModes("unlimited", sm, sn);

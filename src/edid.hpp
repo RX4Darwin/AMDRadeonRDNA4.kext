@@ -195,6 +195,14 @@ bool hasVic(const uint8_t *edid, size_t len, uint8_t vic);
 // RGB needs more than a passive DP++ adapter carries.
 bool takesY420(const uint8_t *edid, size_t len, uint8_t vic);
 
+// --- DisplayID extension blocks (tag 0x70) ---------------------------------------
+
+// The detailed timings of a DisplayID extension block, as Linux reads them
+// (drm_mode_displayid_detailed): DisplayID 1.x Type I (data block 0x03, 10 kHz
+// clock units) and 2.x Type VII (0x22, 1 kHz), each field stored minus one.
+// How many were put into `out` (up to `max`); 0 for any other block.
+size_t displayIdTimings(const uint8_t block[128], DetailedTiming *out, size_t max);
+
 } // namespace Edid
 
 #endif /* Edid_hpp */

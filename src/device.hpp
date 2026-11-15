@@ -352,7 +352,8 @@ private:
 	int auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
 	                   const uint8_t *data, uint8_t len,
 	                   uint8_t *reply, uint8_t replyCap, uint8_t *replyBytes);
-	bool readEDID(uint8_t inst, uint8_t *edid, size_t count, uint8_t start);
+	bool readEDID(uint8_t inst, uint8_t *edid, size_t count, uint8_t start, uint8_t segment = 0);
+	void logMoreEdidBlocks(uint8_t inst, uint8_t blocks);
 	bool readEDIDI2C(uint8_t line, uint8_t *edid, size_t count, uint8_t start);
 	// A DisplayPort connector's DDC pads in I2C (true) or AUX (false) mode.
 	// A passive DP++ (DP-to-HDMI) adapter carries the sink's DDC on them,

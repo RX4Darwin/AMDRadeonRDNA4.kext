@@ -43,6 +43,12 @@ otherwise). The newest version is on top. How versions and branches work is in `
   and after the boot display each is lit again by its own plan. The order matters: an HDMI timing generator runs on
   its link's clock and does not stop with the transmitter off. Card (2026-11-15): the Samsung lit again at
   59.996 Hz on the kext's DMUB firmware and clocks, the HDMI display at 59.998 Hz; no step timed out.
+- A DisplayPort boot display's EDID blocks past the first extension are read (the E-DDC segment pointer first, as
+  Linux's `drm_do_probe_ddc_edid` writes it) and logged with their DisplayID timings (Type I and VII, as Linux reads
+  them); macOS's EDID and the modes stay the first two blocks. Card (2026-11-15): the Samsung's block 2 is DisplayID
+  with 3840x2160@120 and @144, 2560x1440@144 (604.25 MHz) and 1920x1080@144. The same boot, the Lenovo through a
+  passive DP-to-HDMI cable (DP++ type 1, 165 MHz) on the second DisplayPort connector: lit from its HDMI table,
+  taken down and lit again by the cold-start test.
 - The extra displays' pipe selection is held under one lock from selection through use: the hot-plug poll, macOS's
   mode switches (paravirtual host thread or NDRV) and the heads' start-up selected pipes under one another (card
   2026-11-14: a switch logged another slot's empty mode). Card (2026-11-14): six switches of the HDMI display, each

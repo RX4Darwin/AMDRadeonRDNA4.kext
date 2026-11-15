@@ -484,6 +484,7 @@ constexpr int kReplyI2CDefer = 0x8;
 constexpr int kAuxNoReply    = -2;   // the transaction ran and the sink did not answer
 
 constexpr uint8_t kDdcSlave  = 0x50; // VESA DDC/EDID I2C address
+constexpr uint8_t kDdcSegment = 0x30; // E-DDC segment pointer
 constexpr uint8_t kAuxRetry  = 7;    // per-transaction defer retries
 // A DPCD transfer waits out a deferring sink for about 50 ms in all, amdgpu's
 // AUX_MAX_DEFER_TIMEOUT_MS: seven tries 500 us apart, the rest 1 ms apart.
@@ -615,8 +616,13 @@ int RDNA4Device::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
 }
 
 bool RDNA4Device::readEDID(uint8_t inst, uint8_t *edid, size_t count,
-                          uint8_t start) {
+                          uint8_t start, uint8_t segment) {
 	uint8_t rb = 0;
+
+	// Blocks past the first two: the E-DDC segment pointer first (I2C 0x30), as Linux's drm_do_probe_ddc_edid
+	// writes it; only for a segment above 0, which some sinks refuse.
+	if (segment && auxTransaction(inst, kActI2CWriteMot, kDdcSegment, &segment, 1, nullptr, 0, &rb) != kReplyAck)
+		return false;
 
 	// Point the sink's read pointer at `start` with an I2C write. MOT keeps
 	// the I2C START asserted across the reads that follow.
@@ -650,6 +656,26 @@ bool RDNA4Device::readEDID(uint8_t inst, uint8_t *edid, size_t count,
 		pos += rb;  // advance by what the sink actually returned
 	}
 	return true;
+}
+
+// The extension blocks past the first (E-DDC segments), logged only: what of the sink macOS is not told, its
+// DisplayID timings among it. The EDID kept for macOS and the mode table stay the base block and the first extension.
+void RDNA4Device::logMoreEdidBlocks(uint8_t inst, uint8_t blocks) {
+	static uint8_t block[128];
+	for (uint8_t b = 2; b <= blocks && b <= 3; b++) {
+		if (!readEDID(inst, block, 128, static_cast<uint8_t>((b & 1) * 128), static_cast<uint8_t>(b / 2))) {
+			FBLOG("edid: AUX%u: extension block %u not read (segment %u)", inst, b, b / 2);
+			continue;
+		}
+		Edid::DetailedTiming t[8];
+		const size_t n = Edid::displayIdTimings(block, t, 8);
+		FBLOG("edid: AUX%u: extension block %u (tag 0x%02x, checksum %s): %lu DisplayID timing(s)", inst, b, block[0],
+		      Edid::blockChecksumOk(block) ? "ok" : "BAD", static_cast<unsigned long>(n));
+		for (size_t i = 0; i < n; i++)
+			FBLOG("edid:   %ux%u@%u.%03u %u kHz h(blank=%u fp=%u sw=%u) v(blank=%u fp=%u sw=%u)", t[i].hActive,
+			      t[i].vActive, t[i].refreshMilliHz() / 1000, t[i].refreshMilliHz() % 1000, t[i].pixelClockKHz,
+			      t[i].hBlank, t[i].hSyncOffset, t[i].hSyncWidth, t[i].vBlank, t[i].vSyncOffset, t[i].vSyncWidth);
+	}
 }
 
 // Native AUX: up to 16 bytes a transfer, a deferred one asked again.
@@ -848,6 +874,8 @@ void RDNA4Device::probeEDID() {
 				FBLOG("edid: connector %zu (%s%u): read extension block "
 				      "(tag 0x%02x)", i, bus, inst, edidData[128]);
 			}
+			if (ext && viaAux && edid[126] > 1)
+				logMoreEdidBlocks(inst, edid[126]);
 		} else if (!boot && freeExtraSlot() < extraHeads()) {
 			selectExtra(freeExtraSlot());
 			memcpy(xp().edid, edid, 128);
