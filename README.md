@@ -518,8 +518,20 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    without it.
    System sleep stays vetoed (as `IOBootNDRV` does): after GPU power loss the
    display pipe cannot be lit again until it can be lit from nothing (step 4).
-6. **Power / clocks** — SMU firmware handshake so the card is stable, not
-   stuck at boot clocks.
+6. **Power / clocks** — done on the card, but for the items below the
+   struck ones.
+   - ~~SMU firmware handshake: the power-management firmware loaded through
+     the PSP, its mailbox answering, its features turned on (GFXCLK and UCLK
+     DPM among them), so the card is not stuck at boot clocks: the graphics
+     clock goes from 3195 MHz under load to 249 MHz idle within a third of a
+     second (2026-11-15)~~
+   - ~~The display clocks held at what a 4K pipe needs (DISPCLK and DPPCLK
+     650 MHz, DCFCLK 600 MHz, UCLK at its top level, through the display
+     mailbox as amdgpu's DCN 4.01 clock manager asks for them)~~
+   - Open: the features held back so that they do not retune clocks under the
+     lit displays (DCN DPM, the memory, fabric and DCEF deep sleeps, GFXOFF;
+     the display then takes part in memory clock switches, with watermarks for
+     the SMU); fan and thermal behaviour.
 7. **Acceleration** — the GFX12 command processor, rings, memory management
    and a compute runtime run on the card (*User-space compute*), and Vulkan
    through RADV. Metal runs through Apple's paravirtual GPU, served on the card
