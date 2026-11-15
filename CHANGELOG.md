@@ -55,6 +55,12 @@ otherwise). The newest version is on top. How versions and branches work is in `
   `rdna4-pvfast=1` gives the paravirtual displays the fastest refresh of each size for the boot display (macOS
   picks a size there, not a refresh). Card (2026-11-15, the Samsung booted by the GOP at 3840x2160@30, 297 MHz):
   2560x1440@120 (497.75 MHz) measured 120.003 Hz, then 3840x2160@60 (533.25 MHz) measured 59.994 Hz.
+- System sleep (`rdna4-syssleep=1`, roadmap item 5, stage 1): IONDRVFramebuffer refuses it for any framebuffer on
+  IOBootNDRV, which ours always are (its `initForPM` sets `kIOPMPreventSystemSleep` in the power states it registers;
+  IONDRVSupport of Tahoe 26.6.2, disassembled). The kext routes `IOService::registerPowerDriver` and takes that flag
+  out for its own framebuffers, and logs the power calls they get. Card (2026-11-15): the machine sleeps (Sleep from
+  the Apple menu, then 30 s without input) and wakes on a key; after the wake the card reads 0xffffffff, a
+  framebuffer's wake times out after 45 s and the displays stay dark: bringing the card back is stage 2.
 - A real cold start (`rdna4-coldboot=1`): at boot, once the kext has read what the GOP left (the pipes, EDIDs, the
   boot link, the scanout address, the DCHUB timer), the card is reset as Linux resets it on this SMU (mode 1 through
   the SMU's debug mailbox, `amdgpu_device_mode1_reset`), its PCI config space (BARs, Resizable BAR) restored and the

@@ -1227,6 +1227,8 @@ const char *commandName(UInt32 code) {
 	}
 }
 
+bool sysSleepLog = false;   // rdna4-syssleep: the framebuffers' power calls logged
+
 IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 commandCode,
                         UInt32 commandKind) {
 	auto org = FunctionCast(wrapDoDriverIO, orgDoDriverIO);
@@ -1279,7 +1281,14 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 		      answered ? "rdna4" : "boot");
 	}
 
-	if (traceEnabled && traceBudget) {
+	// The power calls (cscGetPowerState / cscSetPowerState, 25) and the NDRV's lifecycle, always: what system sleep
+	// asks of the framebuffer (rdna4-syssleep, roadmap item 5).
+	const bool lifecycle = !csc && commandCode != kIONDRVControlCommand && commandCode != kIONDRVStatusCommand;
+	if (sysSleepLog && ((csc && code == 25) || lifecycle)) {
+		const auto *ps = csc ? static_cast<const VDPowerStateRec *>(static_cast<NdrvControlParameters *>(contents)->params) : nullptr;
+		FBLOG("power: %p %s%s -> 0x%x (%s)%s state %u flags 0x%x", fb, commandName(commandCode), csc ? " csc 25 (power state)" : "",
+		      ret, answered ? "rdna4" : "boot", ps ? "," : "", ps ? ps->powerState : 0, ps ? ps->powerFlags : 0);
+	} else if (traceEnabled && traceBudget) {
 		traceBudget--;
 		if (csc)
 			FBLOG("ndrv: %s csc %u -> 0x%x (%s)", commandName(commandCode), code, ret,
@@ -1321,6 +1330,33 @@ int32_t wrapVslDo(void *service) {
 bool wrapVslPrepareCursor(void *cursorRef, void *descriptor, void *info) {
 	auto org = FunctionCast(wrapVslPrepareCursor, orgVslPrepareCursor);
 	return org(cursorRef, descriptor, info);
+}
+
+// rdna4-syssleep=1 (roadmap item 5, stage 1): system sleep no longer refused for the card. IONDRVFramebuffer::initForPM
+// sets kIOPMPreventSystemSleep in its power states whenever its NDRV is IOBootNDRV (as ours always is), or the NDRV's
+// cscGetPowerState fails or lacks kPowerStateSleepCanPowerOff (IONDRVSupport, Tahoe 26.6.2, disassembled 2026-11-15);
+// a service whose power state carries that flag is one of IOPMrootDomain's "system sleep preventers". For our
+// framebuffers the flag is taken out of the table they register; what sleep and wake then do is what stage 1 looks at.
+constexpr IOPMPowerFlags kPreventSystemSleep = 0x0010;   // kIOPMPreventSystemSleep (IOPM.h, private flags)
+mach_vm_address_t orgRegisterPowerDriver;
+
+IOReturn wrapRegisterPowerDriver(IOService *that, IOService *driver, IOPMPowerState *states, unsigned long n) {
+	auto org = FunctionCast(wrapRegisterPowerDriver, orgRegisterPowerDriver);
+	if (!that || !states || !n || n > 8 || !that->metaCast("IONDRVFramebuffer") ||
+	    !(isOurDevice(that->getProvider()) || headFor(that)))
+		return org(that, driver, states, n);
+	IOPMPowerState copy[8];   // registerPowerDriver copies the table itself (an OSData of it)
+	uint32_t cleared = 0;
+	for (unsigned long i = 0; i < n; i++) {
+		copy[i] = states[i];
+		if (copy[i].capabilityFlags & kPreventSystemSleep) {
+			copy[i].capabilityFlags &= ~kPreventSystemSleep;
+			cleared |= 1u << i;
+		}
+	}
+	FBLOG("power: %s %p: %lu power state(s), kIOPMPreventSystemSleep taken out of 0x%x: system sleep allowed",
+	      that->getName(), that, n, cleared);
+	return org(that, driver, copy, n);
 }
 
 bool ndrvRouted = false;   // processKext ran: by Lilu's load notice, or by lateNdrvCheck
@@ -1541,6 +1577,17 @@ void pluginStart() {
 #endif
 	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
 		gPatcher = &patcher;
+		uint32_t sysSleep = 0;
+		if (PE_parse_boot_argn("rdna4-syssleep", &sysSleep, sizeof(sysSleep)) && sysSleep) {
+			KernelPatcher::RouteRequest power {
+				"__ZN9IOService19registerPowerDriverEPS_P14IOPMPowerStatem", wrapRegisterPowerDriver,
+				orgRegisterPowerDriver,
+			};
+			const bool routed = patcher.routeMultiple(KernelPatcher::KernelID, &power, 1);
+			sysSleepLog = true;
+			FBLOG("power: rdna4-syssleep: IOService::registerPowerDriver %s", routed ? "routed" : "NOT routed");
+			patcher.clearError();
+		}
 #ifdef AMDRadeonRDNA4_PVGPU
 		auto **base = reinterpret_cast<uint8_t **>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_base"));
 		auto **max = reinterpret_cast<uint8_t **>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_max"));
