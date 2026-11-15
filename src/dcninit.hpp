@@ -32,14 +32,15 @@ struct Gen {
 	const char *what;
 };
 
-// Init: dcn401_init_hw from nothing. OtgOff: OTG0 stopped as Linux stops a timing generator (optc401_disable_crtc),
-// for a warm card whose firmware left the boot display's running.
+// Init: dcn401_init_hw from nothing. OtgOff: OTG `otg` stopped as Linux stops a timing generator
+// (optc401_disable_crtc), for a warm card where it still runs (the firmware's boot display, a pipe put to sleep).
 enum class Table { Init, OtgOff };
+constexpr uint32_t kOtgs = 4;
 
-// How many steps a table has, and the table as steps (false: `max` is too small or a step is not one of the
-// above).
+// How many steps a table has, and the table as steps (false: `max` is too small, `otg` is not one of the four or
+// a step is not one of the above).
 size_t count(Table table = Table::Init);
-bool steps(ModeSet::Step *out, size_t max, size_t &n, Table table = Table::Init);
+bool steps(ModeSet::Step *out, size_t max, size_t &n, Table table = Table::Init, uint32_t otg = 0);
 
 // The DCHUB global timer (DCHUBBUB_GLOBAL_TIMER_CNTL), which dcn401_init_hw requires running and only reads
 // (hubbub2_get_dchub_ref_freq): nothing in Linux starts it on DCN 4, nor does the VBIOS's asic_init (it waits for the

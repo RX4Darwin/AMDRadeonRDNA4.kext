@@ -13,13 +13,13 @@ namespace DcnInit {
 
 template <size_t N> constexpr size_t countOf(const Gen (&)[N]) { return N; }
 
-size_t count(Table table) { return table == Table::OtgOff ? countOf(kDcnOtgOffLinux) : countOf(kDcnInitLinux); }
+size_t count(Table table) { return table == Table::OtgOff ? countOf(kDcnOtgOffLinux[0]) : countOf(kDcnInitLinux); }
 
-bool steps(ModeSet::Step *out, size_t max, size_t &n, Table table) {
-	const Gen *gen = table == Table::OtgOff ? kDcnOtgOffLinux : kDcnInitLinux;
+bool steps(ModeSet::Step *out, size_t max, size_t &n, Table table, uint32_t otg) {
 	n = 0;
-	if (max < count(table))
+	if (max < count(table) || otg >= kOtgs)
 		return false;
+	const Gen *gen = table == Table::OtgOff ? kDcnOtgOffLinux[otg] : kDcnInitLinux;
 	for (size_t i = 0; i < count(table); i++) {
 		const Gen &g = gen[i];
 		ModeSet::Step &s = out[n++];

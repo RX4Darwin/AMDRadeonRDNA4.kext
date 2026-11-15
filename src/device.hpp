@@ -255,11 +255,14 @@ public:
 	// DpTrain::bringUp, stream encoder tied to the link, video restarted.
 	void noteBootDpLink();
 	DpTrain::Result retrainBootLink(const char *why);
-	// rdna4-dcninit=1, a test of lighting the displays when nothing set them up, on a warm card: before the heads
-	// light, the firmware's boot pipe (DisplayPort, pipe 0, DIG0, link 0, at its 3840x2160 timing) is taken down,
-	// the display hardware started as Linux's dcn401_init_hw does from nothing (src/dcninit.cpp), and pipe 0 lit
-	// again from a Linux-generated table with the kext's own link training. False when not asked or not done.
-	bool coldStart();
+	// rdna4-dcninit=1, a test of lighting the displays when nothing set them up, on a warm card, in a cold start's
+	// order: once the kext's DMUB firmware runs and the display clocks are raised (smuStarted). The lit extra pipes
+	// are put to sleep, the firmware's boot pipe (DisplayPort, pipe 0, DIG0, link 0, at its 3840x2160 timing) taken
+	// down, the display hardware started as Linux's dcn401_init_hw does from nothing (src/dcninit.cpp), and pipe 0
+	// lit again from a Linux-generated table with the kext's own link training. `relight`: the extra slots that were
+	// lit, now off, for the heads to light again. False when not asked or not done.
+	bool coldStart(uint32_t &relight);
+	void takeExtraDown();
 	bool consoleMcAddress(uint64_t &mc);
 	void logBootLink(const char *when);
 	const char *auxWhy { "" };   // why the last AUX transaction gave no reply, and the status it ended with

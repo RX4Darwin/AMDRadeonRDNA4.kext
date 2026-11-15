@@ -5,19 +5,45 @@
 // (DisplayPort on links 0-1, HDMI on 2-3). Left out of the recording as marks: the clock manager's
 // update_clocks (the kext raises the display clocks itself, src/clk.cpp) and dc_allow_idle_optimizations
 // (idle power features this card does not use here). Linux does not program the DCHUB global timer here: it
-// requires it running (src/dcninit.cpp's timerSteps start it). 168 steps; before them, for a warm card, OTG0
-// stopped as Linux stops a timing generator (optc401_disable_crtc), 6 steps.
+// requires it running (src/dcninit.cpp's timerSteps start it). 168 steps; before them, for a warm card, each
+// running timing generator stopped as Linux stops one (optc401_disable_crtc), 6 steps an OTG.
 //
 // { op, segment, dword, mask, value, arg, what }: 'W' reg = value; 'U' reg = (reg & ~mask) | value; 'T' wait
 // until (reg & mask) == value, arg microseconds at most; 'C' reg = the register at dword arg of the segment;
 // 'D' wait arg microseconds.
-static const DcnInit::Gen kDcnOtgOffLinux[] = {
-	{ 'U', 2, 0x1acb, 0xffff0003, 0xffff0000,      0, "optc401_disable_crtc ODM0_OPTC_DATA_SOURCE_SELECT" },
-	{ 'U', 2, 0x1ad1, 0x0000ffff, 0x00000000,      0, "optc401_disable_crtc ODM0_OPTC_MEMORY_CONFIG" },
-	{ 'U', 2, 0x1b43, 0x00000001, 0x00000000,      0, "optc401_disable_crtc OTG0_OTG_CONTROL" },
-	{ 'U', 2, 0x0530, 0x80000000, 0x00000000,      0, "optc401_disable_crtc VTG0_CONTROL" },
-	{ 'T', 2, 0x1b43, 0x00000000, 0x00000000, 150000, "optc401_disable_crtc OTG0_OTG_CONTROL" },
-	{ 'T', 2, 0x1b84, 0x00010000, 0x00000000, 150000, "optc401_disable_crtc OTG0_OTG_CLOCK_CONTROL" },
+static const DcnInit::Gen kDcnOtgOffLinux[4][6] = {
+	{
+		{ 'U', 2, 0x1acb, 0xffff0003, 0xffff0000,      0, "optc401_disable_crtc ODM0_OPTC_DATA_SOURCE_SELECT" },
+		{ 'U', 2, 0x1ad1, 0x0000ffff, 0x00000000,      0, "optc401_disable_crtc ODM0_OPTC_MEMORY_CONFIG" },
+		{ 'U', 2, 0x1b43, 0x00000001, 0x00000000,      0, "optc401_disable_crtc OTG0_OTG_CONTROL" },
+		{ 'U', 2, 0x0530, 0x80000000, 0x00000000,      0, "optc401_disable_crtc VTG0_CONTROL" },
+		{ 'T', 2, 0x1b43, 0x00000000, 0x00000000, 150000, "optc401_disable_crtc OTG0_OTG_CONTROL" },
+		{ 'T', 2, 0x1b84, 0x00010000, 0x00000000, 150000, "optc401_disable_crtc OTG0_OTG_CLOCK_CONTROL" },
+	},
+	{
+		{ 'U', 2, 0x1adb, 0xffff0003, 0xffff0000,      0, "optc401_disable_crtc ODM1_OPTC_DATA_SOURCE_SELECT" },
+		{ 'U', 2, 0x1ae1, 0x0000ffff, 0x00000000,      0, "optc401_disable_crtc ODM1_OPTC_MEMORY_CONFIG" },
+		{ 'U', 2, 0x1bc3, 0x00000001, 0x00000000,      0, "optc401_disable_crtc OTG1_OTG_CONTROL" },
+		{ 'U', 2, 0x0531, 0x80000000, 0x00000000,      0, "optc401_disable_crtc VTG1_CONTROL" },
+		{ 'T', 2, 0x1bc3, 0x00000000, 0x00000000, 150000, "optc401_disable_crtc OTG1_OTG_CONTROL" },
+		{ 'T', 2, 0x1c04, 0x00010000, 0x00000000, 150000, "optc401_disable_crtc OTG1_OTG_CLOCK_CONTROL" },
+	},
+	{
+		{ 'U', 2, 0x1aeb, 0xffff0003, 0xffff0000,      0, "optc401_disable_crtc ODM2_OPTC_DATA_SOURCE_SELECT" },
+		{ 'U', 2, 0x1af1, 0x0000ffff, 0x00000000,      0, "optc401_disable_crtc ODM2_OPTC_MEMORY_CONFIG" },
+		{ 'U', 2, 0x1c43, 0x00000001, 0x00000000,      0, "optc401_disable_crtc OTG2_OTG_CONTROL" },
+		{ 'U', 2, 0x0532, 0x80000000, 0x00000000,      0, "optc401_disable_crtc VTG2_CONTROL" },
+		{ 'T', 2, 0x1c43, 0x00000000, 0x00000000, 150000, "optc401_disable_crtc OTG2_OTG_CONTROL" },
+		{ 'T', 2, 0x1c84, 0x00010000, 0x00000000, 150000, "optc401_disable_crtc OTG2_OTG_CLOCK_CONTROL" },
+	},
+	{
+		{ 'U', 2, 0x1afb, 0xffff0003, 0xffff0000,      0, "optc401_disable_crtc ODM3_OPTC_DATA_SOURCE_SELECT" },
+		{ 'U', 2, 0x1b01, 0x0000ffff, 0x00000000,      0, "optc401_disable_crtc ODM3_OPTC_MEMORY_CONFIG" },
+		{ 'U', 2, 0x1cc3, 0x00000001, 0x00000000,      0, "optc401_disable_crtc OTG3_OTG_CONTROL" },
+		{ 'U', 2, 0x0533, 0x80000000, 0x00000000,      0, "optc401_disable_crtc VTG3_CONTROL" },
+		{ 'T', 2, 0x1cc3, 0x00000000, 0x00000000, 150000, "optc401_disable_crtc OTG3_OTG_CONTROL" },
+		{ 'T', 2, 0x1d04, 0x00010000, 0x00000000, 150000, "optc401_disable_crtc OTG3_OTG_CLOCK_CONTROL" },
+	},
 };
 static const DcnInit::Gen kDcnInitLinux[] = {
 	{ 'U', 2, 0x3000, 0x00001000, 0x00001000,      0, "dsc401_set_fgcg DSC_TOP0_DSC_TOP_CONTROL" },

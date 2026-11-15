@@ -2758,11 +2758,48 @@ bool RDNA4Device::consoleMcAddress(uint64_t &mc) {
 	return true;
 }
 
-bool RDNA4Device::coldStart() {
+// The selected extra pipe down as a power loss leaves it: asleep by its table, its timing generator stopped, an HDMI
+// one's link off. Not lit any more.
+void RDNA4Device::takeExtraDown() {
+	static ModeSet::Step otgStop[16];
+	size_t notg = 0;
+	if (xp().on)
+		runSecondPipePart(Pipe2::Part::Sleep);
+	// Stopped while its link still clocks it: an HDMI timing generator runs on its link's clock, and with the
+	// transmitter off it never reaches the end of its frame to stop (card, 2026-11-15: OTG1_OTG_CLOCK_CONTROL timed
+	// out).
+	if (!DcnInit::steps(otgStop, 16, notg, DcnInit::Table::OtgOff, xp().pipe) ||
+	    !runSteps(otgStop, notg, nullptr, 0, "dcninit: extra otg off", xp().pipe * Pipe::Reg::kOtgStride))
+		FBLOG("dcninit: extra pipe %u's timing generator did not stop", xp().pipe);
+	// HDMI: its sleep leaves the transmitter and the link encoder on. Off as Linux's warm-card init turns an enabled
+	// DIG off (dce110_power_down: disable_output, the transmitter disable), the back end as releaseBootPipe takes it
+	// (the firmware leaves DIG_BE_ENABLE set).
+	const Pipe2::Config &c = Pipe2::config();
+	AtomBios::DisplayPath xpath {};
+	if (!c.dp && pathForHpd(c.hpd, xpath)) {
+		Dmub::Cmd cmd;
+		DpPhy::buildDisable(cmd, c.link, c.hpd, static_cast<uint8_t>(xpath.connectorObjId & 0xff));
+		const ModeSet::Step off[] = {
+			{ ModeSet::Op::Dmub, 0, false, 0, 0, 0, 0, "DIG1_TRANSMITTER_CONTROL disable" },
+			{ ModeSet::Op::Update, 2, false, Pipe::Reg::kDigBeEnCntl + c.dig * Pipe::Reg::kDigStride, 0x1, 0x0, 0,
+			  "DIG_BE_ENABLE: the link encoder off" },
+		};
+		if (!runSteps(off, 2, &cmd, 1, "dcninit: extra off", c.pipe * Pipe::Reg::kOtgStride))
+			FBLOG("dcninit: extra pipe %u's link %u did not go off cleanly", c.pipe, c.link);
+	}
+	xp().lit = xp().on = false;
+}
+
+bool RDNA4Device::coldStart(uint32_t &relight) {
 	uint32_t on = 0;
+	relight = 0;
 	if (!Trial::option("rdna4-dcninit", on) || !on)
 		return false;
 	ExtraHold hold(*this);
+	if (!uhdClocks) {   // a cold start's order: the 4K boot display lit on the kext's clocks, not the GOP's
+		FBLOG("dcninit: not run: the display clocks are not raised (no SMU, or a hard minimum not met)");
+		return false;
+	}
 	AtomBios::DisplayPath path {};
 	if (!bootDpLinkKnown)   // read with rdna4-dptrain only: the sink's capabilities and the firmware's link (DPCD reads)
 		noteBootDpLink();
@@ -2808,6 +2845,20 @@ bool RDNA4Device::coldStart() {
 	}
 	const uint8_t connector = static_cast<uint8_t>(path.connectorObjId & 0xff);
 
+	// 0. The lit extra pipes taken down (the init blanks and gates every pipe), lit again after.
+	for (size_t i = 0; i < kMaxExtra; i++) {
+		selectExtra(i);
+		useSlotTable();
+		if (!xp().lit)
+			continue;
+		takeExtraDown();
+		relight |= 1u << i;
+	}
+	selectExtra(0);
+	(void)Pipe2::use(1, false, 0, true);   // the boot pipe's table again (checked above)
+	if (relight)
+		FBLOG("dcninit: extra pipe(s) 0x%x asleep, to be lit again after", relight);
+
 	ExtraPipe boot {};
 	boot.pipe = 0;
 	boot.hpd = pipe.hpd;
@@ -2826,10 +2877,10 @@ bool RDNA4Device::coldStart() {
 	t.depth = Pipe2::Depth::Plane;
 	t.linkRate = bootDpLink.rate;
 	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
-	static ModeSet::Step init[256], otgOff0[16];
+	static ModeSet::Step init[256], otgStop[16];
 	size_t ninit = 0, notg = 0;
 	const char *why = "";
-	bool ok = plan && DcnInit::steps(init, 256, ninit) && DcnInit::steps(otgOff0, 16, notg, DcnInit::Table::OtgOff);
+	bool ok = plan && DcnInit::steps(init, 256, ninit);
 	FBLOG("dcninit: boot pipe 0 at 0x%llx (computed, as the GOP's), link %u lane(s) at 0x%02x on AUX%u: taking it "
 	      "down, %lu steps of dcn401_init_hw, lighting it again", surface, bootDpLink.lanes, bootDpLink.rate,
 	      sinkAuxInst, static_cast<unsigned long>(ninit));
@@ -2838,7 +2889,8 @@ bool RDNA4Device::coldStart() {
 	ok = ok && Pipe2::build(t, *plan, &why) &&
 	     runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dcninit: down", otgOff(), plan->aux);
 	// 2. The firmware's timing generator stopped (on a card started from nothing it is not running).
-	ok = ok && runSteps(otgOff0, notg, nullptr, 0, "dcninit: otg off", otgOff());
+	ok = ok && DcnInit::steps(otgStop, 16, notg, DcnInit::Table::OtgOff) &&
+	     runSteps(otgStop, notg, nullptr, 0, "dcninit: otg off", otgOff());
 	// 2b. The global timer stopped, as after a power loss, and started by the kext.
 	if (ok)
 		regWriteDmu(2, DcnInit::kTimerCntl, gopTimer & ~DcnInit::kTimerEnable);

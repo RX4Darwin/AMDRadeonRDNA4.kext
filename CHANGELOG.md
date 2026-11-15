@@ -35,6 +35,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
   100 MHz: 2, a 50 MHz hub clock), set as `dcn10_hubbub_global_timer_enable` sets it. The kext's list of VBIOS data
   tables was one off from `dce_info` on (unused until now). Card (2026-11-15): the GOP's 0x00001002 stopped and
   started again as 0x00001002, the Samsung lit again at 59.996 Hz, the HDMI display at 60.004 Hz.
+- The test now runs in a cold start's order: once the kext's DMUB firmware runs and the display clocks are raised
+  (when the SMU is up, `deviceSmuReady`), where it ran before both on the GOP's firmware and clocks. The extra
+  displays are lit by then: each is put to sleep by its table, its timing generator stopped as Linux stops one
+  (pipegen records `optc401_disable_crtc` for all four OTGs now), an HDMI one's link then taken off as Linux's
+  warm-card init does (`dce110_power_down`: the transmitter disable; the DIG back end as `releaseBootPipe` takes it),
+  and after the boot display each is lit again by its own plan. The order matters: an HDMI timing generator runs on
+  its link's clock and does not stop with the transmitter off. Card (2026-11-15): the Samsung lit again at
+  59.996 Hz on the kext's DMUB firmware and clocks, the HDMI display at 59.998 Hz; no step timed out.
 - The extra displays' pipe selection is held under one lock from selection through use: the hot-plug poll, macOS's
   mode switches (paravirtual host thread or NDRV) and the heads' start-up selected pipes under one another (card
   2026-11-14: a switch logged another slot's empty mode). Card (2026-11-14): six switches of the HDMI display, each

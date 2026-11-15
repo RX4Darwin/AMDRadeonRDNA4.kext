@@ -683,10 +683,14 @@ static void sequence_init(void)
 	}
 	g_cold = true;
 
-	/* On a warm card the firmware's timing generator is still running: stopped first the way Linux stops one
-	 * (optc401_disable_crtc), recorded on its own for OTG0, the boot display's. */
-	rec_mark("begin:otgoff", 0);
-	g_pool.timing_generators[0]->funcs->disable_crtc(g_pool.timing_generators[0]);
+	/* On a warm card the timing generators lit before are still running (a pipe put to sleep keeps its own):
+	 * stopped first the way Linux stops one (optc401_disable_crtc), recorded on its own for each OTG. */
+	for (int i = 0; i < 4; i++) {
+		char mark[16];
+		snprintf(mark, sizeof(mark), "begin:otgoff%d", i);
+		rec_mark(mark, 0);
+		g_pool.timing_generators[i]->funcs->disable_crtc(g_pool.timing_generators[i]);
+	}
 
 	rec_mark("begin:init_hw", 0);
 	dc->hwss.init_hw(dc);

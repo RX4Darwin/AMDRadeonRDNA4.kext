@@ -306,8 +306,13 @@ void deviceCursorProbe(void *ctx, const char *why) {
 	static_cast<RDNA4Device *>(ctx)->cursorRegProbe(why);
 }
 
+void coldStartHeads(RDNA4Device &dev);
+
 void deviceSmuReady(void *ctx) {
-	static_cast<RDNA4Device *>(ctx)->smuStarted();
+	RDNA4Device &dev = *static_cast<RDNA4Device *>(ctx);
+
+	dev.smuStarted();
+	coldStartHeads(dev);   // rdna4-dcninit=1 only
 }
 
 int32_t deviceGetHardwareCursorDrawState(void *ctx,
@@ -722,6 +727,25 @@ void takeBootDisplay(Head2 *h, RDNA4Device &dev) {
 	head2Plugged(h, hpd);
 	h->ready = h->connected;
 	HLOG(h, "boot4k: the boot display %s", h->connected ? "is the head's now" : "did NOT come up on the head");
+}
+
+// rdna4-dcninit=1: the cold-start test, once the kext's DMUB firmware runs and the clocks are raised; the extra
+// pipes it put to sleep lit again by their heads' plans, as at boot.
+void coldStartHeads(RDNA4Device &dev) {
+	RDNA4Device::ExtraHold hold(dev);
+	uint32_t relight = 0;
+
+	(void)dev.coldStart(relight);
+	for (size_t i = 0; i < headCount; i++) {
+		Head2 *h = heads[i];
+
+		if (!(relight & 1u << h->slot))
+			continue;
+		dev.selectExtra(h->slot);
+		dev.lightSecondPipe(head2Level, h->surface.physBase);
+		HLOG(h, "dcninit: lit again: %s", dev.xp().lit && dev.xp().on ? "on" : "NOT on");
+	}
+	dev.selectExtra(0);
 }
 
 void fillHeads(RDNA4Device &dev) {
@@ -1141,7 +1165,6 @@ void attach(FbEntry &e) {
 	bootState = st;
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
-	dev.coldStart();   // rdna4-dcninit=1 only
 	fillHeads(dev);
 	// Behind the extra heads' slots, below the compute pool (128 MiB).
 	VramBench::run(dev.fbPhysBase, ((dev.fbLength + (1ull << 20) - 1) & ~((1ull << 20) - 1)) +

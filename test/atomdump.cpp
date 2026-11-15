@@ -5111,9 +5111,14 @@ static int testDcnInit() {
 	size_t n = 0;
 	static ModeSet::Step off[16];
 	size_t noff = 0;
-	if (!DcnInit::steps(off, 16, noff, DcnInit::Table::OtgOff) || noff != DcnInit::count(DcnInit::Table::OtgOff) ||
-	    off[2].dword != 0x1b43 || off[2].mask != 1 || off[2].value != 0) {   // OTG0_OTG_CONTROL.OTG_MASTER_EN = 0
-		printf("FAIL dcninit: the OTG0 stop does not become steps that clear OTG0's master enable\n");
+	for (uint32_t o = 0; o < DcnInit::kOtgs; o++)   // OTGn_OTG_CONTROL.OTG_MASTER_EN = 0
+		if (!DcnInit::steps(off, 16, noff, DcnInit::Table::OtgOff, o) || noff != DcnInit::count(DcnInit::Table::OtgOff) ||
+		    off[2].dword != 0x1b43 + 0x80 * o || off[2].mask != 1 || off[2].value != 0) {
+			printf("FAIL dcninit: the OTG%u stop does not become steps that clear OTG%u's master enable\n", o, o);
+			return 1;
+		}
+	if (DcnInit::steps(off, 16, noff, DcnInit::Table::OtgOff, DcnInit::kOtgs)) {
+		printf("FAIL dcninit: a fifth OTG's stop became steps\n");
 		return 1;
 	}
 	if (!DcnInit::steps(steps, 256, n) || n != DcnInit::count() || n < 100) {
