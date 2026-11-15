@@ -157,6 +157,13 @@ public:
 	void powerWillSleep();
 	void powerSleepRequest();   // P7: setPowerState(0) / the debug sleep selector call this first, without rtLock (src/pmidle.cpp)
 	void powerDidWake();
+	// Run first by powerSleepRequest, while the card has its power, still takes gfx submissions and the runtime's lock is
+	// free: a kernel client that holds the runtime's objects writes back what lives only in VRAM and gives them back (the
+	// paravirtual GPU's host); it opens again once the wake has brought the runtime up (rtGeneration has moved on).
+	void setSleepHook(void (*hook)(void *), void *ctx) { sleepHook = hook; sleepHookCtx = ctx; }
+	void (*sleepHook)(void *) = nullptr;
+	void *sleepHookCtx = nullptr;
+	uint32_t rtGeneration = 0;   // counts the runtime's rebuilds after a sleep (resetRuntimeForResume)
 
 	// Snapshot of the engines, as read by the survey.
 	struct Survey {

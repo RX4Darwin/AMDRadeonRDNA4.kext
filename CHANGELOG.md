@@ -69,6 +69,12 @@ otherwise). The newest version is on top. How versions and branches work is in `
   (2026-11-15): after a real sleep both displays lit again (DP trained at the first attempt, 60.002 Hz; HDMI on);
   VRAM does not survive the sleep; the desktop stays black: the paravirtual GPU's host still holds the runtime's old
   objects.
+- The desktop back after a real system sleep (`rdna4-syssleep=1`): at the sleep request, while the card still takes
+  submissions, the paravirtual GPU's host writes back what lives only in VRAM (held render targets, the surfaces kept on
+  the card), then gives back everything it holds of the runtime and forgets the work in flight; it opens the runtime
+  again once the wake has rebuilt it (`rtGeneration`). Card-verified 2026-11-15: the desktop comes back as it was on both
+  displays (without the write-back, the DP display kept a black overlay until things were drawn again). The wake still
+  takes about 95 s before the desktop shows (IONDRVFramebuffer's 45 s waits).
 - A real cold start (`rdna4-coldboot=1`): at boot, once the kext has read what the GOP left (the pipes, EDIDs, the
   boot link, the scanout address, the DCHUB timer), the card is reset as Linux resets it on this SMU (mode 1 through
   the SMU's debug mailbox, `amdgpu_device_mode1_reset`), its PCI config space (BARs, Resizable BAR) restored and the

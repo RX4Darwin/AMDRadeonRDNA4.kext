@@ -547,6 +547,15 @@ private:
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void completeStamp(uint32_t index, uint32_t value);
+	// A system sleep (RDNA4Compute::powerSleepRequest, the card still powered and taking submissions): what lives only in VRAM
+	// written back to the guest, then everything held of the runtime given back, as the card loses its power and VRAM with it;
+	// it is all made again on use once the wake has brought the runtime up again.
+	static void sleepHook(void *ctx);
+	static IOReturn forgetAction(OSObject *owner, void *, void *, void *, void *);
+	void forgetRuntime();
+	bool openRuntime();   // the host as a client of the runtime (once, and again after a sleep's wake)
+	bool mRtAway { false };        // given back at a sleep (forgetRuntime): not opened again before the wake rebuilt the runtime
+	uint32_t mRtAwayGen { 0 };     // RDNA4Compute::rtGeneration then
 	// display pipes (docs/m1-stream.md s.1b): the shared-state pages the guest announced, the events the host puts into them
 	void dropPipes();
 	void dropPipe(uint32_t port, const char *why);
@@ -1152,6 +1161,8 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 		return nullptr;
 	}
 	h->mTimer->setTimeoutMS(500);   // first tick after the nub had time to register and match
+	if (gCompute)
+		gCompute->setSleepHook(sleepHook, h);
 
 	// The card has no wake path unless rdna4-pm (docs/power-gfx.md: a sleep left both displays dark until a restart), and macOS sleeps
 	// after a minute idle here: while the heads are the displays, system idle sleep is held off. Display sleep goes on as before.
@@ -1164,6 +1175,119 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	}
 
 	return h;
+}
+
+void RDNA4PvHost::sleepHook(void *ctx) {
+	auto *h = static_cast<RDNA4PvHost *>(ctx);
+	if (h && h->mLoop)
+		h->mLoop->runAction(forgetAction, h);   // on the host's work loop: never beside a tick
+}
+
+IOReturn RDNA4PvHost::forgetAction(OSObject *owner, void *, void *, void *, void *) {
+	static_cast<RDNA4PvHost *>(owner)->forgetRuntime();
+	return kIOReturnSuccess;
+}
+
+void RDNA4PvHost::forgetRuntime() {
+	// VRAM does not survive the sleep: what lives only on the card (held targets, kept surfaces) is written back to the guest
+	// first, while the card still takes submissions, so the guest's copies are current after the wake.
+	const uint32_t backs = mCardBacks, flushes = mCardFlushes;
+
+	if (mRtOpen) {
+		flushHeld();
+		for (CardSurface &c : mCardSurface)
+			if (c.surface && c.loaded)
+				cardToMemory(c.surface);
+		waitDraws();
+		completeLate();
+	}
+	// What is still in flight (a failed wait above) is not waited for: the guest is told what it waits for (its stamps), and
+	// the waits in the drops below return at once. The fences start again with the ring the wake's bring-up makes anew.
+	for (uint32_t i = 0; i < mLateCount; i++)
+		completeStamp(mLate[i].index, mLate[i].value);
+	mLateCount = 0;
+	mBatchDraws = mBatchDwords = 0;
+	mPending = mFlightAt = 0;
+	memset(mFlight, 0, sizeof(mFlight));
+	mSubmits = mLastFence = 0;
+	memset(mSubmitFence, 0, sizeof(mSubmitFence));
+	memset(mSlotSubmit, 0, sizeof(mSlotSubmit));
+	memset(mPoolChunkSubmit, 0, sizeof(mPoolChunkSubmit));
+	mSlot = mBatchSlot = mDmaSlot = 0;
+	mRingWriteCount = 0;
+	mPoolUsed = 0;
+	mUsedMapCount = mUsedShadowCount = 0;
+	for (HeldTarget &h : mHelds)   // written back above; their shadows go below
+		h = HeldTarget {};
+	mHeld = nullptr;
+
+	for (Mapping &m : mMap)
+		dropMapping(m);
+	for (Shadow &s : mShadows)
+		freeShadow(s);
+	for (CardSurface &c : mCardSurface)
+		dropCardSurface(c);
+	for (ScanoutMap &sm : mScanout)
+		dropScanout(sm);
+	for (StencilBuf &b : mStencil) {
+		if (b.handle)
+			gCompute->rtFree(this, b.handle);
+		b = StencilBuf {};
+	}
+	for (MsaaSurface &m : mMsaa) {
+		if (m.handle)
+			gCompute->rtFree(this, m.handle);
+		m = MsaaSurface {};
+	}
+	GfxBuffers *const buffers[] = {&mGfxCode, &mGfxRings, &mGfxMisc, &mGfxIb, &mGfxSpare, &mPresentIb, &mFillCode, &mDmaIb,
+	                               &mBatchIb, &mDispatchArgs, &mTimes, &mIdle, &mGfxPool};
+	for (GfxBuffers *g : buffers) {
+		if (g->handle)
+			gCompute->rtFree(this, g->handle);
+		*g = GfxBuffers {};
+	}
+	if (mHeldCopy.handle)
+		gCompute->rtFree(this, mHeldCopy.handle);
+	mHeldCopy = {};
+	if (mGrab.handle)
+		gCompute->rtFree(this, mGrab.handle);
+	mGrab = FrameGrab {};
+	if (mScale.code)
+		gCompute->rtUnload(this, mScale.code);
+	if (mScale.argsHandle)
+		gCompute->rtFree(this, mScale.argsHandle);
+	mScale = ScaleKernel {};
+	for (CodeSlot &c : mCode)   // the shader pairs placed in mGfxCode, which is gone
+		c.valid = false;
+	uint32_t programs = 0;
+	for (uint32_t i = 0; i < mJits; i++) {   // the kernels loaded into the runtime: translated and loaded again on use
+		Jit &j = mJit[i];
+		if (!j.program)
+			continue;
+		gCompute->rtUnload(this, j.program);
+		programs++;
+		if (j.gfx)
+			IOFree(j.gfx, j.gfxLen);
+		j = Jit {};
+	}
+	gCompute->rtRelease(this);   // what is left of ours, and the client itself: rtOpen makes a new one after the wake
+	mRtOpen = false;
+	mRtAway = true;
+	mRtAwayGen = gCompute->rtGeneration;
+	pvstat("host: system sleep: %u kept surface(s) and %u held target(s) written back, everything of the runtime given back "
+	      "(%u kernels to load again); made again on use after the wake", mCardBacks - backs, mCardFlushes - flushes, programs);
+}
+
+bool RDNA4PvHost::openRuntime() {
+	if (mRtOpen)
+		return true;
+	if (mRtAway && gCompute->rtGeneration == mRtAwayGen)   // the sleep's runtime: a client opened now would be lost at the wake
+		return false;
+	mRtAway = false;
+	gCompute->rtPreferCpuTables(this);
+	gCompute->rtFreesWhenIdle(this);
+	mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;   // ponytail: closed only at a sleep, the host lives as long as the boot
+	return mRtOpen;
 }
 
 void RDNA4PvHost::dropIrqBits() {
@@ -6037,11 +6161,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		return true;
 	};
-	if (!mRtOpen) {
-		gCompute->rtPreferCpuTables(this);
-		gCompute->rtFreesWhenIdle(this);
-		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;
-	}
+	(void)openRuntime();
 	GfxBuffers tgt {};
 	uint8_t *pooledTarget = nullptr;
 
@@ -7198,10 +7318,7 @@ bool RDNA4PvHost::functionName(uint32_t task, uint32_t fn, char *name, size_t na
 uint32_t RDNA4PvHost::load(const uint8_t *elf, uint32_t size, const char *name, uint64_t *launch) {
 	if (!gCompute)
 		return 0;
-	if (!mRtOpen)
-		gCompute->rtPreferCpuTables(this);
-		gCompute->rtFreesWhenIdle(this);
-		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;   // ponytail: never closed, the host lives as long as the boot
+	(void)openRuntime();
 	uint64_t out[9] = {};
 	const bool ok = mRtOpen && gCompute->rtLoad(this, kernel_task, reinterpret_cast<mach_vm_address_t>(elf), size, name, out) == kIOReturnSuccess;
 	pvlog("host: compute: %s %s (program 0x%llx)", name, ok ? "loaded into the runtime" : "did NOT load", out[0]);

@@ -4282,6 +4282,7 @@ void RDNA4Compute::resetRuntimeForResume() {
 	presentOwner = nullptr;
 	rtWedged = false;
 	rtReady = false;
+	rtGeneration++;
 	RLOG("power: old runtime buffers, heaps and VM contexts discarded; client objects retained as aborted");
 }
 
