@@ -34,6 +34,16 @@ otherwise). The newest version is on top. How versions and branches work is in `
   2026-11-14: a switch logged another slot's empty mode). Card (2026-11-14): six switches of the HDMI display, each
   logged and measured as asked (1024x768, 1280x1024, 1920x1080).
 
+**Metal (`make PVGPU=1`)**
+- No more GPU resets while shaders are translated: Apple's display pipe resets the GPU when a present is not complete
+  within 300 ms ("IOAccelDisplayPipeTransaction time out after 300ms"), and the host thread waited for the translator
+  (up to 1.8 s a shader after the boot) with the display stopped. Translations now run before a draw or dispatch is
+  built (and for the pipelines found between command buffers), and every 20 ms of the wait the host does a tick's
+  display half: the display channels, stamps, flips, VBLs and the interrupt. A present waits at most 150 ms for its
+  barriers, then shows its surface as it is. Card (Tahoe 26.6.2, 2026-11-15): with every translation moved aside
+  (408 made again after the boot) no reset, two presents ran at 150 and 163 ms; the boot before, with the display
+  channels alone, still reset at 44 s.
+
 ## 0.2.2 (2026-11-14)
 
 **OpenGL (`make PVGPU=1`)**

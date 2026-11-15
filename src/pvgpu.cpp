@@ -407,6 +407,7 @@ private:
 	};
 	Jit &jitSlot();
 	const Jit *translated(uint32_t task, uint64_t lib, const char *name, const uint8_t hash[32]);
+	void translatePipeline(uint32_t task, uint32_t pipeline);
 	static void placeShaders(uint32_t *code, const Jit *const shader[3], uint64_t rings, uint32_t outs);
 	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
 	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow = nullptr, uint32_t *width = nullptr,
@@ -557,7 +558,18 @@ private:
 	void defineChannel(uint32_t n);
 	void freeChannel(uint32_t n);
 	void dropChannels();
-	void pollChannels();
+	void pollChannels(bool displayOnly = false);
+	// A tick's display half between the slices of a translation's wait (translated): the display pipes' channels, the stamps, flips, VBLs
+	// and the interrupt. Apple's display pipe resets the GPU when a transaction is not complete within 300 ms (IOAccelDisplayPipe,
+	// "IOAccelDisplayPipeTransaction time out after 300ms"); with the channels alone it still did (2026-11-15: no VBL or stamp for 1.8 s).
+	void serveDisplay();
+	void dropIrqBits();
+	// Set around translations that run before anything is built (scanPipelines; runDraw and runCompute before their batch): a present may
+	// run meanwhile, mid-command-buffer showing its surface as the draws so far left it.
+	bool mServeDisplay { false };
+	bool mInDisplayPoll { false };
+	uint32_t mConsuming { 0 };   // the channel pollChannels is in: never entered again from inside it
+	uint32_t mBlockingTranslations { 0 };   // translations waited for inside a command buffer, the display channels not served
 	void selfTest();
 
 	RDNA4PvNub *mNub { nullptr };
@@ -1003,6 +1015,7 @@ private:
 	static constexpr uint32_t kRecordOffset = 0x400, kRecordBytes = 20;   // channel n's state record: root page + 0x400 + (n - 1) * 20
 	struct Channel {
 		bool live { false };
+		bool display { false };            // a display pipe's: its commands came in (presents, cursor; consume)
 		uint32_t kind { 0 };               // the record's u16 at +0xc: the channel's stamp index
 		uint32_t ringBytes { 0 };
 		IOMemoryDescriptor *desc { nullptr };
@@ -1153,6 +1166,14 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	return h;
 }
 
+void RDNA4PvHost::dropIrqBits() {
+	if (mIrqBits && !mNub->interruptBusy(0)) {
+		if (volatile uint32_t *c = mNub->ctrl())
+			c[kRegIntrStatusGpu / 4] &= ~mIrqBits;
+		mIrqBits = 0;
+	}
+}
+
 void RDNA4PvHost::tick() {
 	if (mTicks++ < 3)
 		pvlog("host: tick %llu", mTicks);
@@ -1162,11 +1183,7 @@ void RDNA4PvHost::tick() {
 	// the line disabled from the interrupt until its work loop has read the status. Dropped a tick after the raise, a raise that came while the
 	// line was disabled reached the driver with no bits left, and it only saw its stamps and VBLs after IOAccelEventMachine2::waitForStamp's 1 s
 	// timed wait (most raises of a session: animations stood still, frames came late).
-	if (mIrqBits && !mNub->interruptBusy(0)) {
-		if (volatile uint32_t *c = mNub->ctrl())
-			c[kRegIntrStatusGpu / 4] &= ~mIrqBits;
-		mIrqBits = 0;
-	}
+	dropIrqBits();
 	const uint32_t cmds = mCmds;
 
 	completeLate();
@@ -1372,6 +1389,10 @@ void RDNA4PvHost::scanPipelines() {
 	if (!mSeenRec && !(mSeenRec = static_cast<uint32_t *>(IOMallocZero(64 * kScanIds * 12))))   // kept for the boot, as the host is
 		return;
 
+	// Outside any command buffer: while the helper translates what this finds (keepFunction's kernels, the pipelines' functions), the
+	// display channels go on (translated), so that no present outlasts Apple's 300 ms.
+	mServeDisplay = true;
+
 	for (uint32_t t = 0; t < 64; t++) {
 		if (!mTaskRoot[t] || now - mTaskActiveNs[t] > kActiveNs || !readGuest(t, heapRecord(t, 0), reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
 			continue;
@@ -1409,14 +1430,20 @@ void RDNA4PvHost::scanPipelines() {
 			if ((r[0] & 0xff) != 7)
 				continue;
 
-			// its functions translated now too, while their libraries are still the app's (a draw may come after they are freed)
-			const PipelineInfo &p = pipelineInfo(t, id);
-
-			for (unsigned k = 1; k <= 2; k++)
-				if (p.named[k])
-					(void)translated(t, p.lib[k], p.name[k], p.hash[k]);
+			translatePipeline(t, id);   // now too, while its functions' libraries are still the app's (a draw may come after they are freed)
 		}
 	}
+	mServeDisplay = false;
+}
+
+// A render pipeline's vertex and fragment functions translated (translated keeps them).
+void RDNA4PvHost::translatePipeline(uint32_t task, uint32_t pipeline)
+{
+	const PipelineInfo &p = pipelineInfo(task, pipeline);
+
+	for (unsigned k = 1; k <= 2; k++)
+		if (p.named[k])
+			(void)translated(task, p.lib[k], p.name[k], p.hash[k]);
 }
 
 // A draw's target whose record is a free slot: was the texture deleted or unmapped yet, and are its pages still in the task's page table?
@@ -1538,7 +1565,10 @@ void RDNA4PvHost::pollFifo() {
 // value. A present's transaction waits so for the render that drew its surface on another channel; run before that render, it showed the
 // surface's older frame (windows and the cursor jumped back and forth). A barrier still unmet after kBarrierWait is logged and let go.
 bool RDNA4PvHost::barriersMet(const CmdSource &src, const uint8_t *cmd, const pvstream::FifoCommand &c) {
-	static constexpr uint64_t kBarrierWait = 1000000000;   // ns
+	// A display command (a present) runs past its barriers sooner: its transaction must be complete within 300 ms, or Apple's display pipe
+	// resets the GPU (a present of the surface as it is instead: the frame before, at worst).
+	static constexpr uint64_t kBarrierWait = 1000000000, kDisplayBarrierWait = 150000000;   // ns
+	const uint64_t wait = src.channel && src.channel <= kMaxChannels && mCh[src.channel].display ? kDisplayBarrierWait : kBarrierWait;
 	const volatile uint32_t *stamps = reinterpret_cast<const volatile uint32_t *>(mFifoMap->getVirtualAddress());
 	uint64_t &since = mBarrierSince[src.channel];
 	uint64_t now;
@@ -1554,7 +1584,7 @@ bool RDNA4PvHost::barriersMet(const CmdSource &src, const uint8_t *cmd, const pv
 		if (!since)
 			since = now;
 
-		if (now - since < kBarrierWait)
+		if (now - since < wait)
 			return false;
 
 		pvlog("host: %s: cmd 0x%02x waited %llu ms for stamp[%u] to reach %u (it is %u): run anyway", src.tag, c.id, (now - since) / 1000000,
@@ -1600,6 +1630,10 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			break;
 		}
 
+		const bool display = c.id == 0x02 || (c.id >= 0x04 && c.id <= 0x07) || c.id == 0x1e;   // the display pipe's commands keep being shown
+		if (mInDisplayPoll && !display && c.id != 0x01)
+			break;   // from inside a translation's wait (serveDisplay): the rest when the channels are polled next
+
 		if (c.barriers && src.channel && c.payloadOffset <= sizeof(mWin)) {
 			uint32_t b[2];
 
@@ -1616,7 +1650,8 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 		}
 
 		mCmds++;
-		const bool display = c.id == 0x02 || (c.id >= 0x04 && c.id <= 0x07) || c.id == 0x1e;   // the display pipe's commands keep being shown
+		if ((display || c.id == 0x01) && src.channel && src.channel <= kMaxChannels)
+			mCh[src.channel].display = true;
 		if (mCmds <= kLoggedCmds || (display && (mDispCmdLines++ < 60 || gTalk))) {
 			char line[200];
 			if (c.length <= sizeof(mWin)) {
@@ -5753,6 +5788,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	static constexpr uint32_t kDrawWait = 50;   // ms
 	const uint64_t drawFrom = nowNs();
 
+	mServeDisplay = true;   // its functions translated before any of it is built, the display served meanwhile (the lookups below find them)
+	translatePipeline(task, pipeline);
+	mServeDisplay = false;
+
 	mMapFloor = mMapClock;
 	mBuilding = true;
 	mUsedMapCount = mUsedShadowCount = 0;
@@ -7256,9 +7295,24 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	strlcpy(gTr.name, name, sizeof(gTr.name));
 	IOLockWakeup(gTr.lock, &gTr.id, false);
 	static constexpr uint32_t kTranslateWait = 15;   // seconds
+	static constexpr uint32_t kSliceMs = 20;           // the display channels served between slices (mServeDisplay)
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(kTranslateWait, kSecondScale, &deadline);
-	while (!gTr.done && IOLockSleepDeadline(gTr.lock, &gTr.done, deadline, THREAD_UNINT) == THREAD_AWAKENED) {
+	if (!mServeDisplay)
+		mBlockingTranslations++;
+	while (!gTr.done) {
+		uint64_t slice = 0, now = mach_absolute_time();
+		clock_interval_to_deadline(kSliceMs, kMillisecondScale, &slice);
+		if (now >= deadline)
+			break;
+		const wait_result_t w = IOLockSleepDeadline(gTr.lock, &gTr.done, slice < deadline ? slice : deadline, THREAD_UNINT);
+		if (w != THREAD_AWAKENED && w != THREAD_TIMED_OUT)
+			break;
+		if (!gTr.done && mServeDisplay) {
+			IOLockUnlock(gTr.lock);
+			serveDisplay();
+			IOLockLock(gTr.lock);
+		}
 	}
 	const bool done = gTr.done;
 	uint8_t *elf = gTr.elf;
@@ -7357,6 +7411,9 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	uint64_t lib = 0;
 	if (!functionOf(task, pipeline, name, sizeof(name), hash, &lib))
 		return;
+	mServeDisplay = true;   // translated before any of it is built, the display channels served meanwhile (runDraw)
+	(void)translated(task, lib, name, hash);
+	mServeDisplay = false;
 	flushHeld();   // the kernel reads and writes the guest's memory
 	pvlog("host: compute: task %u dispatches \"%s\" (hash %02x%02x%02x%02x%02x%02x%02x%02x...), %llu x %llu x %llu threads in groups of %llu x %llu x %llu",
 	      task, name, hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], size[0], size[1], size[2], size[3], size[4], size[5]);
@@ -8277,6 +8334,9 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	if (mNotRun)
 		pvstat("host: render:   %u draws not run, the first with \"%s\": %s", mNotRun, mNotRunName, mNotRunWhy);
 
+	if (mBlockingTranslations)   // since the boot: each held every channel, the display's too (Apple's 300 ms)
+		pvstat("host: render:   %u translations waited for inside a command buffer, the display channels not served", mBlockingTranslations);
+
 	// where the waits for the card came from (pvgpu.cpp lines), the most first
 	char sites[160] = "";
 	for (uint32_t k = 0, at = 0; k < 6 && at < sizeof(sites) - 16; k++) {
@@ -8656,13 +8716,27 @@ void RDNA4PvHost::defineChannel(uint32_t n) {
 	      rec[0], rec[1]);
 }
 
-void RDNA4PvHost::pollChannels() {
+void RDNA4PvHost::serveDisplay() {
+	if (mInDisplayPoll)
+		return;
+	mInDisplayPoll = true;
+	dropIrqBits();
+	completeLate();
+	pollChannels(true);
+	flushBatch();
+	flipDone();
+	pollDisplay();
+	completeLate();
+	mInDisplayPoll = false;
+}
+
+void RDNA4PvHost::pollChannels(bool displayOnly) {
 	if (!mRootMap)
 		return;
 	uint8_t *root = reinterpret_cast<uint8_t *>(mRootMap->getVirtualAddress());
 	for (uint32_t n = 1; n <= kMaxChannels; n++) {
 		Channel &ch = mCh[n];
-		if (!ch.live)
+		if (!ch.live || (displayOnly && (!ch.display || n == mConsuming)))
 			continue;
 		volatile uint32_t *rec = reinterpret_cast<volatile uint32_t *>(root + kRecordOffset + (n - 1) * kRecordBytes);
 		const uint32_t written = rec[0], read = rec[1];
@@ -8677,8 +8751,11 @@ void RDNA4PvHost::pollChannels() {
 		char tag[12];
 		snprintf(tag, sizeof(tag), "ch%u", n);
 		mChannelPolls++;
+		const uint32_t outer = mConsuming;
+		mConsuming = n;
 		// the guest compares the read counter with the write counter to see that the ring is empty and how much room is left
 		rec[1] = read + consume(CmdSource { tag, reinterpret_cast<const uint8_t *>(ch.map->getVirtualAddress()), ch.ringBytes, ch.kind, n }, read, pending);
+		mConsuming = outer;
 	}
 }
 
