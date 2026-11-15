@@ -3138,8 +3138,15 @@ bool RDNA4Device::consoleMcAddress(uint64_t &mc) {
 void RDNA4Device::takeExtraDown() {
 	static ModeSet::Step otgStop[16];
 	size_t notg = 0;
+	auto crumb = [this](const char *what) {
+		char step[64];
+		snprintf(step, sizeof(step), "cold start: extra pipe %u %s", xp().pipe, what);
+		breadcrumb(step);
+	};
+	crumb(xp().on ? "asleep" : "off");
 	if (xp().on)
 		runSecondPipePart(Pipe2::Part::Sleep);
+	crumb("its OTG stopped");
 	// Stopped while its link still clocks it: an HDMI timing generator runs on its link's clock, and with the
 	// transmitter off it never reaches the end of its frame to stop (card, 2026-11-15: OTG1_OTG_CLOCK_CONTROL timed
 	// out).
@@ -3151,6 +3158,7 @@ void RDNA4Device::takeExtraDown() {
 	// (the firmware leaves DIG_BE_ENABLE set).
 	const Pipe2::Config &c = Pipe2::config();
 	AtomBios::DisplayPath xpath {};
+	crumb("its link off");
 	if (!c.dp && pathForHpd(c.hpd, xpath)) {
 		Dmub::Cmd cmd;
 		DpPhy::buildDisable(cmd, c.link, c.hpd, static_cast<uint8_t>(xpath.connectorObjId & 0xff));
@@ -3163,6 +3171,17 @@ void RDNA4Device::takeExtraDown() {
 			FBLOG("dcninit: extra pipe %u's link %u did not go off cleanly", c.pipe, c.link);
 	}
 	xp().lit = xp().on = false;
+}
+
+void RDNA4Device::breadcrumb(const char *step) {
+	if (!compute || !rmmio)
+		return;
+	uint32_t otgs = 0;
+	for (uint32_t i = 0; i < 4; i++)
+		otgs |= (regReadDmu(2, Pipe::Reg::kOtgControl + i * Pipe::Reg::kOtgStride) & 1u) << i;
+	char text[96];
+	snprintf(text, sizeof(text), "s3: %s (OTGs on 0x%x)", step, otgs);
+	compute->trail(text);
 }
 
 bool RDNA4Device::coldStart(uint32_t &relight) {
@@ -3220,13 +3239,31 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	}
 	const uint8_t connector = static_cast<uint8_t>(path.connectorObjId & 0xff);
 
-	// 0. The lit extra pipes taken down (the init blanks and gates every pipe), lit again after.
+	// A lit DisplayPort extra pipe on a warm card: its sleep sequence (the recorded DP table) has not run on the card before
+	// and hung it here (card, 2026-11-15: the next register access hung the machine, with a second DP display at boot): the
+	// cold start is left out, as for its other preconditions; the boot display keeps the GOP's set-up.
+	for (size_t i = 0; i < kMaxExtra && !coldBoot; i++) {
+		selectExtra(i);
+		useSlotTable();
+		if (xp().lit && Pipe2::config().dp) {
+			FBLOG("dcninit: not run: extra pipe %u is a lit DisplayPort one (its sleep sequence is untested on the card)", xp().pipe);
+			selectExtra(0);
+			useSlotTable();
+			return false;
+		}
+	}
+	// 0. The lit extra pipes taken down (the init blanks and gates every pipe), lit again after. After a power loss a
+	// DisplayPort one has nothing left running: only marked dark (its untested sleep sequence is not run on it).
+	breadcrumb("cold start: extra pipes down");
 	for (size_t i = 0; i < kMaxExtra; i++) {
 		selectExtra(i);
 		useSlotTable();
 		if (!xp().lit)
 			continue;
-		takeExtraDown();
+		if (Pipe2::config().dp)
+			xp().lit = xp().on = false;
+		else
+			takeExtraDown();
 		relight |= 1u << i;
 	}
 	selectExtra(0);
@@ -3263,8 +3300,11 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	// timing generator stopped. Also after the reset (coldBoot): a mode-1 reset leaves the timing generators
 	// running (card, 2026-11-15: OTG0 at 59.997 Hz, its links dark).
 	t.part = Pipe2::Part::Sleep;
+	breadcrumb("cold start: boot pipe down");
 	ok = ok && Pipe2::build(t, *plan, &why) &&
 	     runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dcninit: down", otgOff(), plan->aux);
+	if (ok)
+		breadcrumb("cold start: boot OTG off");
 	ok = ok && DcnInit::steps(otgStop, 16, notg, DcnInit::Table::OtgOff) &&
 	     runSteps(otgStop, notg, nullptr, 0, "dcninit: otg off", otgOff());
 	// 2b. The global timer stopped, as after a power loss, and started by the kext.
@@ -3275,6 +3315,8 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 		FBLOG("dcninit: global timer 0x%08x stopped, started again at %u kHz / %u: 0x%08x", gopTimer, refKHz,
 		      DcnInit::timerRefDiv(refKHz), regReadDmu(2, DcnInit::kTimerCntl));
 	// 3. Every pipe blanked and power gated, and the rest dcn401_init_hw does.
+	if (ok)
+		breadcrumb("cold start: dcn401_init_hw");
 	ok = ok && runSteps(init, ninit, nullptr, 0, "dcninit: init", otgOff());
 	// 4. The IP request window open, as the lighting plans require (as the GOP leaves it).
 	if (ok)
@@ -3288,6 +3330,8 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 		      was, regReadDmu(2, mask), ctrl5, regReadDmu(2, kGpioAuxCtrl5));
 	}
 	// 5. Pipe 0 lit again, its link trained by the kext.
+	if (ok)
+		breadcrumb("cold start: boot pipe light");
 	t.part = Pipe2::Part::Light;
 	ok = ok && Pipe2::build(t, *plan, &why) &&
 	     runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dcninit: light", otgOff(), plan->aux);

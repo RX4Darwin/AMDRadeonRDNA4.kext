@@ -274,6 +274,9 @@ public:
 	// lit again from a Linux-generated table with the kext's own link training. `relight`: the extra slots that were
 	// lit, now off, for the heads to light again. False when not asked or not done.
 	bool coldStart(uint32_t &relight);
+	// An NVRAM breadcrumb (the compute runtime's rdna4-trail) for a step that can hang the machine, with the timing
+	// generators running now (OTG0-3 master enables) after it: the next boot logs where the last one stopped.
+	void breadcrumb(const char *step);
 	// rdna4-coldprobe=1 and `sudo sysctl debug.rdna4_coldreset=1`: the card reset (mode 1) and brought back as far
 	// as Linux does before its IP blocks start (stage (b) of a real cold start). The displays go dark; reboot after.
 	bool coldReset();

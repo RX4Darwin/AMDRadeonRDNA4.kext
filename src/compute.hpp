@@ -157,6 +157,11 @@ public:
 	void powerWillSleep();
 	void powerSleepRequest();   // P7: setPowerState(0) / the debug sleep selector call this first, without rtLock (src/pmidle.cpp)
 	void powerDidWake();
+	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
+	// flushed before each step that could hang the GPU (also the display
+	// side's, RDNA4Device::breadcrumb), so the step a hard
+	// hang stopped at survives the reset. Logged by the next boot's survey.
+	void trail(const char *step);
 	// Run first by powerSleepRequest, while the card has its power, still takes gfx submissions and the runtime's lock is
 	// free: a kernel client that holds the runtime's objects writes back what lives only in VRAM and gives them back (the
 	// paravirtual GPU's host); it opens again once the wake has brought the runtime up (rtGeneration has moved on).
@@ -254,10 +259,6 @@ private:
 	bool bringupStepAllowed(const char *step);
 	void resetRuntimeForResume();
 
-	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
-	// flushed before each step that could hang the GPU, so the step a hard
-	// hang stopped at survives the reset. Logged by the next boot's survey.
-	void trail(const char *step);
 	// The pre-Metal features past the compute stages (W1-W5) name their
 	// trail steps "<feature>: ..." (gfx, ih, vm, flip). If the previous
 	// boot died in one of those, only that feature sits this boot out; the

@@ -97,8 +97,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
     given the two states a framebuffer has; the system then sleeps about 2 s after macOS's own 30 s display-off step.
   Still open: a key press brings only the dark wake (the desktop comes with the mouse); USBWakeFixup with an
   `SSDT-USBW` for this board's XH00 did not change that.
-- With a second DisplayPort display plugged in at boot the boot hangs in the compute bring-up's `smuReady` step (the
-  display clocks or the cold start): finer NVRAM breadcrumbs there name the step (`rdna4-trail`).
+- Two DisplayPort displays from boot (`rdna4-head2dp=1`, card-verified 2026-11-15: Odyssey G70D at 3840x2160 and a
+  Lenovo G25-10 at 1920x1080 on a second DP port, link trained at the first attempt, 60.002 Hz, desktop on both). With
+  the second one plugged in at boot the boot hung in the cold start (`rdna4-dcninit=1`): taking the extra DP pipe down
+  ran its recorded sleep sequence, never run on the card before, and the next register access hung the machine. A warm
+  boot with a lit DP extra pipe now leaves the cold start out (the boot display keeps the GOP's set-up); after a power
+  loss such a pipe is only marked dark and lit again. Found with NVRAM breadcrumbs through `smuReady` and the cold
+  start (`RDNA4Device::breadcrumb`, with the running timing generators), read back from Windows when macOS would not
+  boot. A DP extra pipe's own sleep (its display sleep, the cold start's take-down) is still untested.
 - A real cold start (`rdna4-coldboot=1`): at boot, once the kext has read what the GOP left (the pipes, EDIDs, the
   boot link, the scanout address, the DCHUB timer), the card is reset as Linux resets it on this SMU (mode 1 through
   the SMU's debug mailbox, `amdgpu_device_mode1_reset`), its PCI config space (BARs, Resizable BAR) restored and the

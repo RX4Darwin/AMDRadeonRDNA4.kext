@@ -320,8 +320,11 @@ void coldStartHeads(RDNA4Device &dev);
 void deviceSmuReady(void *ctx) {
 	RDNA4Device &dev = *static_cast<RDNA4Device *>(ctx);
 
+	dev.breadcrumb("smuReady: display clocks");
 	dev.smuStarted();
+	dev.breadcrumb("smuReady: cold start");
 	coldStartHeads(dev);   // rdna4-dcninit=1 only
+	dev.breadcrumb("smuReady: done");
 }
 
 int32_t deviceGetHardwareCursorDrawState(void *ctx,
@@ -757,6 +760,9 @@ void coldStartHeads(RDNA4Device &dev) {
 		const bool pending = h->coldPending;
 		h->coldPending = false;
 		dev.selectExtra(h->slot);
+		char step[48];
+		snprintf(step, sizeof(step), "cold start: head %zu lit again", h->slot + 2);
+		dev.breadcrumb(step);
 		dev.lightSecondPipe(head2Level, h->surface.physBase);
 		// A head the cold boot left dark at start (fillHead) set up as a lit one: its modes, switching and power.
 		size_t n = 0;
