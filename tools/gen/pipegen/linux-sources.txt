@@ -47,6 +47,7 @@ dc/dpp/dcn35/dcn35_dpp.c
 dc/dpp/dcn401/dcn401_dpp.c
 dc/dpp/dcn401/dcn401_dpp_cm.c
 dc/dpp/dcn401/dcn401_dpp_dscl.c
+dc/dsc/dcn401/dcn401_dsc.c
 dc/hubbub/dcn10/dcn10_hubbub.c
 dc/hubbub/dcn20/dcn20_hubbub.c
 dc/hubbub/dcn21/dcn21_hubbub.c

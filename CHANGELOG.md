@@ -15,6 +15,17 @@ otherwise). The newest version is on top. How versions and branches work is in `
   (the GOP's firmware: REGION4; Linux's: window 4); with REGION4 alone the new firmware read empty commands. With the
   boot-arg the firmware's trace is logged after each command. Card (Tahoe 26.6.2, 2026-11-14): the firmware comes up
   in 6 ms, the second display's mode switches go through it (1680x1050 measured 59.885 Hz, 1080p 60.003 Hz).
+- The display hardware started from nothing, as Linux's dcn401_init_hw does it (`rdna4-dcninit=1`, a test on a warm
+  card): the second part of lighting the displays when nothing set them up. `tools/gen/pipegen/run.sh <linux> init`
+  runs Linux's own code on hardware with nothing running (all pipes and DIGs off) and records 168 steps
+  (`src/dcn_init_linux.inc`: DCCG stream clocks off, the link encoders' AUX, plane power gating, every pipe blanked
+  and gated, the DSCs, clock gating, the HPO block, the watermark sets as copies, the CRB). The test takes the
+  GOP's DisplayPort boot display down (its link, then its timing generator as `optc401_disable_crtc` stops one),
+  runs them, and lights pipe 0 again from a new Linux-generated table (`pipe2_linux_p0_dp1_uhd.inc`) with the
+  kext's own link training; the second display then lights next to it as on every boot. Still from the GOP: the
+  scanout address and VM aperture (read before), the DCHUB global timer (the VBIOS's asic_init sets it) and the
+  clocks it starts from. Card (Tahoe 26.6.2, 2026-11-15): the Samsung down and back in 0.35 s, its link trained in
+  one attempt (4 lanes HBR2), 60.001 Hz; the HDMI display lit after it at 60.002 Hz; desktop up.
 - The extra displays' pipe selection is held under one lock from selection through use: the hot-plug poll, macOS's
   mode switches (paravirtual host thread or NDRV) and the heads' start-up selected pipes under one another (card
   2026-11-14: a switch logged another slot's empty mode). Card (2026-11-14): six switches of the HDMI display, each

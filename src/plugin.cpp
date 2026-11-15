@@ -1141,6 +1141,7 @@ void attach(FbEntry &e) {
 	bootState = st;
 	FBLOG("ndrv: answering for %p: %lu mode(s), EDID %lu bytes", e.fb,
 	      static_cast<unsigned long>(st->ndrv.modeCount()), static_cast<unsigned long>(dev.edidLen));
+	dev.coldStart();   // rdna4-dcninit=1 only
 	fillHeads(dev);
 	// Behind the extra heads' slots, below the compute pool (128 MiB).
 	VramBench::run(dev.fbPhysBase, ((dev.fbLength + (1ull << 20) - 1) & ~((1ull << 20) - 1)) +

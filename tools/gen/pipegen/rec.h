@@ -2,7 +2,7 @@
 #ifndef REC_H
 #define REC_H
 #include <stdint.h>
-enum ev_kind { EV_WRITE, EV_UPDATE, EV_WAIT, EV_DELAY, EV_MARK };
+enum ev_kind { EV_WRITE, EV_UPDATE, EV_WAIT, EV_DELAY, EV_MARK, EV_COPY };   /* EV_COPY: arg = the source */
 struct ev { enum ev_kind kind; uint32_t addr, mask, value, arg; const char *label; };
 extern struct ev evs[]; extern int nev;
 void rec_mark(const char *what, uint32_t arg);
@@ -12,4 +12,7 @@ void rec_poke_field(uint32_t addr, uint32_t mask, uint32_t value);   /* settle o
 void rec_reset(uint32_t fill);              /* forget everything; unknown registers read as fill */
 void rec_poll(const char *func, uint32_t addr, uint32_t mask, uint32_t settled, uint32_t timeout_us);
 extern int rec_log_reads;
+/* While set, each write is recorded as a copy of the register last read (EV_COPY): for code that moves values
+ * between registers (hubbub401_init_watermarks), which a recording of written values cannot express. */
+extern int rec_copy_mode;
 #endif

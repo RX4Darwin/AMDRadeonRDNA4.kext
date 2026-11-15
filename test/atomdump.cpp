@@ -51,6 +51,7 @@
 #include "../src/gfxregs.hpp"
 #include "../src/linuxref.hpp"
 #include "../src/trial.hpp"
+#include "../src/dcninit.hpp"
 #include "rdna4compute.h"
 
 #include <cstdarg>
@@ -1639,6 +1640,10 @@ static int testPipe2Table() {
 
 	Pipe2::Target t {};
 	t.litHubp = 0;
+	// Pipe 0 lit again (rdna4-dcninit) has no lit pipe beside it: the VM aperture the firmware's held
+	static const uint32_t kVm[3] = { 0x5a5a0001, 0x5a5a0002, 0x5a5a0003 };
+	if (c.pipe == 0)
+		t.vm = kVm;
 	t.encoderObjId = kEncoderObj;
 	t.surface = 0x8002100000ull;
 	t.depth = Pipe2::Depth::Plane;
@@ -1648,7 +1653,7 @@ static int testPipe2Table() {
 	if (!Pipe2::build(t, plan, &why))
 		return check(false, "pipe2: plan refused: %s", why);
 
-	size_t requires = 0, writes = 0, outside = 0;
+	size_t requires = 0, writes = 0, outside = 0, vmWrites = 0;
 	bool wrote = false;
 	// Every register step of a plan stays in the pipe's blocks.
 	auto stepsInBlocks = [&](const ModeSet::Step *steps, size_t count) {
@@ -1688,6 +1693,8 @@ static int testPipe2Table() {
 				                  "and not an allowed shared bit", i, s.what, s.seg, s.dword, mask);
 			}
 		}
+		if (s.op == ModeSet::Op::Write && t.vm && (s.value == kVm[0] || s.value == kVm[1] || s.value == kVm[2]))
+			vmWrites++;
 		if (s.op == ModeSet::Op::Copy) {
 			const Family *src = nullptr;
 			failures += check(instanceOf(s.seg, s.arg, &src) == t.litHubp && src == &families[0] &&
@@ -1700,6 +1707,7 @@ static int testPipe2Table() {
 	auto inBlocks = [&](const Pipe2::Plan &p) { stepsInBlocks(p.steps, p.count); };
 	inBlocks(plan);
 	const size_t lightWrites = writes;
+	failures += check(!t.vm || vmWrites == 3, "pipe2: pipe 0 writes the saved VM aperture %zu times, expected 3", vmWrites);
 	failures += check(requires == 5, "pipe2: %zu requirements, expected 5", requires);
 
 	if (!c.dp) {
@@ -2645,7 +2653,7 @@ static int testN48N() {
 static int testPipe2() {
 	int failures = 0;
 	const uint8_t first = Pipe2::config().hpd;
-	failures += check(Pipe2::configCount() == 42 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
+	failures += check(Pipe2::configCount() == 43 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
 	                  Pipe2::config().hpd == first,
 	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
 	// A DisplayPort connector has its DisplayPort table and an HDMI one (a passive DP++ adapter); an HDMI
@@ -5085,6 +5093,63 @@ static int testDpDual() {
 	return failures;
 }
 
+// The cold display start-up (src/dcninit.cpp, Linux's dcn401_init_hw from pipegen): the table becomes steps of the
+// display segments only, and run against registers that hold what was written (all 0 before, the waits met) it
+// leaves what Linux leaves: the IP request window closed again, every HUBP blanked, the watermark sets B
+// copied from A.
+static int testDcnInit() {
+	int failures = 0;
+	static ModeSet::Step steps[256];
+	size_t n = 0;
+	static ModeSet::Step off[16];
+	size_t noff = 0;
+	if (!DcnInit::steps(off, 16, noff, DcnInit::Table::OtgOff) || noff != DcnInit::count(DcnInit::Table::OtgOff) ||
+	    off[2].dword != 0x1b43 || off[2].mask != 1 || off[2].value != 0) {   // OTG0_OTG_CONTROL.OTG_MASTER_EN = 0
+		printf("FAIL dcninit: the OTG0 stop does not become steps that clear OTG0's master enable\n");
+		return 1;
+	}
+	if (!DcnInit::steps(steps, 256, n) || n != DcnInit::count() || n < 100) {
+		printf("FAIL dcninit: the table does not become steps (%zu of %zu)\n", n, DcnInit::count());
+		return 1;
+	}
+	static uint32_t reg[4][0x4000];
+	memset(reg, 0, sizeof(reg));
+	reg[2][0x04fe] = 0x1234;   // DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A: what set B is to get
+	size_t waits = 0, copies = 0;
+	for (size_t i = 0; i < n; i++) {
+		const ModeSet::Step &s = steps[i];
+		if (s.seg < 1 || s.seg > 3 || s.dword >= 0x4000) {
+			printf("FAIL dcninit: step %zu (%s) outside the display segments\n", i, s.what);
+			failures++;
+			continue;
+		}
+		uint32_t &r = reg[s.seg][s.dword];
+		switch (s.op) {
+		case ModeSet::Op::Write: r = s.value; break;
+		case ModeSet::Op::Update: r = (r & ~s.mask) | s.value; break;
+		case ModeSet::Op::Copy: r = reg[s.seg][s.arg]; copies++; break;
+		case ModeSet::Op::WaitValue: r = (r & ~s.mask) | s.value; waits++; break;
+		case ModeSet::Op::Delay: break;
+		default: printf("FAIL dcninit: step %zu has an op the table does not make\n", i); failures++;
+		}
+	}
+	const bool closed = (reg[2][0x00a0] & 1) == 0;                         // DC_IP_REQUEST_CNTL.IP_REQUEST_EN
+	bool blanked = true;
+	for (uint32_t p = 0; p < 4; p++)
+		blanked &= (reg[2][0x05f4 + p * 0xdc] & 1) != 0;                    // HUBPn_DCHUBP_CNTL.HUBP_BLANK_EN
+	const bool copied = reg[2][0x0511] == 0x1234;                         // ..._DATA_URGENCY_WATERMARK_B
+	if (!closed || !blanked || !copied || !waits || copies != 25) {
+		printf("FAIL dcninit: window %s, HUBPs %s, watermark B %s (0x%x), %zu waits, %zu copies\n",
+		       closed ? "closed" : "OPEN", blanked ? "blanked" : "NOT all blanked", copied ? "copied" : "NOT copied",
+		       reg[2][0x0511], waits, copies);
+		failures++;
+	}
+	if (!failures)
+		printf("dcninit: %zu steps of Linux's dcn401_init_hw (%zu waits, %zu copies) leave what it leaves\n", n, waits,
+		       copies);
+	return failures;
+}
+
 int main(int argc, char **argv) {
 	if (argc > 2) {
 		fprintf(stderr, "usage: %s [vbios.rom]\n", argv[0]);
@@ -5107,6 +5172,7 @@ int main(int argc, char **argv) {
 	failures += testDpRetime();
 	failures += testPipe2();
 	failures += testDpTrain();
+	failures += testDcnInit();
 	failures += testDpDual();
 	failures += testN48N();
 	failures += testPsp();

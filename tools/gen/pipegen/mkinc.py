@@ -203,10 +203,13 @@ for p in lines[1:]:
     if name == f'HUBPREQ{pipe}_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH':
         assert k == 'W' and value == PLACEHOLDER_HI
         for vm in ('DCN_VM_SYSTEM_APERTURE_LOW_ADDR', 'DCN_VM_SYSTEM_APERTURE_HIGH_ADDR', 'DCN_VM_MX_L1_TLB_CNTL'):
+            # arg: the stride of the HUBPREQ blocks; for pipe 0, which has no lit pipe beside it to copy from,
+            # the kext writes what the firmware's pipe 0 held (Pipe2::Target::vm)
             s, d = addr(f'HUBPREQ{pipe}_{vm}')
             s0, d0 = addr(f'HUBPREQ0_{vm}')
-            assert s == s0 and (d - d0) % pipe == 0
-            emit('C', s, d, 0, 0, (d - d0) // pipe, f'as the lit pipe has it: HUBPREQ{pipe}_{vm}')
+            s1, d1 = addr(f'HUBPREQ1_{vm}')
+            assert s == s0 == s1 and d - d0 == pipe * (d1 - d0)
+            emit('C', s, d, 0, 0, d1 - d0, f'as the lit pipe has it: HUBPREQ{pipe}_{vm}')
         emit('H', seg, dword, what=what)
     elif name == f'HUBPREQ{pipe}_DCSURF_PRIMARY_SURFACE_ADDRESS':
         assert k == 'W' and value == PLACEHOLDER_LO

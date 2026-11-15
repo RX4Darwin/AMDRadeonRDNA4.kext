@@ -108,6 +108,12 @@ namespace P3Hpd2Tmds {
 }
 
 // The HDMI connectors lit at 3840x2160@60, for each pipe.
+// Pipe 0 itself on the first DisplayPort connector at the GOP's boot timing: lit again after the display
+// hardware was started from nothing (rdna4-dcninit, src/dcninit.cpp).
+namespace P0Hpd1Uhd {
+#include "pipe2_linux_p0_dp1_uhd.inc"
+}
+
 namespace P1Hpd3Uhd {
 #include "pipe2_linux_p1_hpd3_uhd.inc"
 }
@@ -247,6 +253,8 @@ constexpr Table kTables[] = {
 	      countOf(P3Hpd2::kAux)),
 	table(P3Hpd1Tmds::kConfig, P3Hpd1Tmds::kGen, P3Hpd1Tmds::kModeRegs, P3Hpd1Tmds::kModeTimings, P3Hpd1Tmds::kModeValues),
 	table(P3Hpd2Tmds::kConfig, P3Hpd2Tmds::kGen, P3Hpd2Tmds::kModeRegs, P3Hpd2Tmds::kModeTimings, P3Hpd2Tmds::kModeValues),
+	table(P0Hpd1Uhd::kConfig, P0Hpd1Uhd::kGen, P0Hpd1Uhd::kModeRegs, P0Hpd1Uhd::kModeTimings, P0Hpd1Uhd::kModeValues, P0Hpd1Uhd::kAux,
+	      countOf(P0Hpd1Uhd::kAux)),
 	table(P1Hpd3Uhd::kConfig, P1Hpd3Uhd::kGen, P1Hpd3Uhd::kModeRegs, P1Hpd3Uhd::kModeTimings, P1Hpd3Uhd::kModeValues),
 	table(P1Hpd4Uhd::kConfig, P1Hpd4Uhd::kGen, P1Hpd4Uhd::kModeRegs, P1Hpd4Uhd::kModeTimings, P1Hpd4Uhd::kModeValues),
 	table(P2Hpd3Uhd::kConfig, P2Hpd3Uhd::kGen, P2Hpd3Uhd::kModeRegs, P2Hpd3Uhd::kModeTimings, P2Hpd3Uhd::kModeValues),
@@ -463,7 +471,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 	out.naux = 0;
 
 	if (t.part == Part::Light) {
-		if (t.litHubp >= 4 || t.litHubp == c.pipe) {
+		if (t.litHubp >= 4 || (t.litHubp == c.pipe && !t.vm)) {
 			err = "the lit pipe uses the HUBP this plan lights";
 			return false;
 		}
@@ -518,6 +526,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 		Dmub::buildSetPixelClock(cmd, pc);
 	};
 	Part part = Part::Light;   // of the entry: the requirements at the top belong to lighting
+	uint32_t vmCopies = 0;
 	for (size_t i = 0; i < cur->ngen; i++) {
 		const Gen &g = cur->gen[i];
 		if (g.kind >= '4' && g.kind <= '6')
@@ -558,7 +567,11 @@ bool build(const Target &t, Plan &out, const char **why) {
 			break;
 		}
 		case 'C':
-			ok = step(ModeSet::Op::Copy, g, 0, 0, g.dword - (c.pipe - t.litHubp) * g.arg);
+			// The VM aperture as the lit pipe has it; pipe 0 lit again has none beside it: what the firmware's held
+			if (t.vm)
+				ok = vmCopies < 3 && step(ModeSet::Op::Write, g, 0, t.vm[vmCopies++], 0);
+			else
+				ok = step(ModeSet::Op::Copy, g, 0, 0, g.dword - (c.pipe - t.litHubp) * g.arg);
 			break;
 		case 'H': ok = step(ModeSet::Op::Write, g, 0, static_cast<uint32_t>(t.surface >> 32), 0); break;
 		case 'L': ok = step(ModeSet::Op::Write, g, 0, static_cast<uint32_t>(t.surface), 0); break;

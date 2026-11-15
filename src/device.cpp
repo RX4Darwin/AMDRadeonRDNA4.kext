@@ -15,6 +15,7 @@
 #include "sku.hpp"
 #include "trial.hpp"
 #include "dpdual.hpp"
+#include "dcninit.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <kern/clock.h>
@@ -2739,6 +2740,83 @@ DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 	return r;
 }
 
+bool RDNA4Device::coldStart() {
+	uint32_t on = 0;
+	if (!Trial::option("rdna4-dcninit", on) || !on)
+		return false;
+	ExtraHold hold(*this);
+	AtomBios::DisplayPath path {};
+	if (!bootDpLinkKnown)   // read with rdna4-dptrain only: the sink's capabilities and the firmware's link (DPCD reads)
+		noteBootDpLink();
+	// The one boot pipe there is a table for: the GOP's DisplayPort display on pipe 0 at its 4K timing.
+	if (!pipe.valid() || pipe.otg != 0 || pipe.hubp != 0 || pipe.dig != 0 || pipe.link != 0 || pipe.hpd != 1 ||
+	    !bootDpLinkKnown || !pathForHpd(pipe.hpd, path) || !Pipe2::use(1, false, 0, true) ||
+	    !Edid::sameTiming(Pipe2::config().timing, liveTiming)) {
+		FBLOG("dcninit: not run: the boot pipe is not the DisplayPort one on pipe 0 at the table's 3840x2160 "
+		      "(OTG%u HUBP%u DIG%u link %u HPD%u, %ux%u at %u kHz, link known %d)", pipe.otg, pipe.hubp, pipe.dig,
+		      pipe.link, pipe.hpd, liveTiming.hActive, liveTiming.vActive, liveTiming.pixelClockKHz, bootDpLinkKnown);
+		useSlotTable();   // the slot's own table again
+		return false;
+	}
+	// What the lighting copies from a lit pipe, read while the GOP's still holds it: the VM aperture, the scanout address.
+	static const uint32_t kVm[3] = { 0x062c, 0x062d, 0x063a };   // HUBPREQ0_DCN_VM_SYSTEM_APERTURE_LOW/HIGH_ADDR, MX_L1_TLB_CNTL
+	uint32_t vm[3];
+	for (int i = 0; i < 3; i++)
+		vm[i] = regReadDmu(2, kVm[i]);
+	const uint64_t surface = regReadDmu(2, 0x060a) | static_cast<uint64_t>(regReadDmu(2, 0x060b) & 0xffff) << 32;
+	const uint8_t connector = static_cast<uint8_t>(path.connectorObjId & 0xff);
+
+	ExtraPipe boot {};
+	boot.pipe = 0;
+	boot.hpd = pipe.hpd;
+	boot.aux = sinkAuxInst;
+	boot.sink = bootDpSink;
+	boot.link = bootDpLink;
+	boot.target.connectorObjId = connector;
+	xpOverride = &boot;
+
+	Pipe2::Target t {};
+	t.litHubp = 0;
+	t.vm = vm;
+	t.encoderObjId = path.encoderObjId;
+	t.connectorObjId = connector;
+	t.surface = surface;
+	t.depth = Pipe2::Depth::Plane;
+	t.linkRate = bootDpLink.rate;
+	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
+	static ModeSet::Step init[256], otgOff0[16];
+	size_t ninit = 0, notg = 0;
+	const char *why = "";
+	bool ok = plan && DcnInit::steps(init, 256, ninit) && DcnInit::steps(otgOff0, 16, notg, DcnInit::Table::OtgOff);
+	FBLOG("dcninit: boot pipe 0 at 0x%llx, VM aperture 0x%08x 0x%08x TLB 0x%08x, link %u lane(s) at 0x%02x on AUX%u: "
+	      "taking it down, %lu steps of dcn401_init_hw, lighting it again", surface, vm[0], vm[1], vm[2],
+	      bootDpLink.lanes, bootDpLink.rate, sinkAuxInst, static_cast<unsigned long>(ninit));
+	// 1. The stream and the link off, as Linux's link_set_dpms_off (the table's sleep part).
+	t.part = Pipe2::Part::Sleep;
+	ok = ok && Pipe2::build(t, *plan, &why) &&
+	     runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dcninit: down", otgOff(), plan->aux);
+	// 2. The firmware's timing generator stopped (on a card started from nothing it is not running).
+	ok = ok && runSteps(otgOff0, notg, nullptr, 0, "dcninit: otg off", otgOff());
+	// 3. Every pipe blanked and power gated, and the rest dcn401_init_hw does.
+	ok = ok && runSteps(init, ninit, nullptr, 0, "dcninit: init", otgOff());
+	// 4. The IP request window open, as the lighting plans require (as the GOP leaves it).
+	if (ok)
+		regWriteDmu(2, 0x00a0, 1);
+	// 5. Pipe 0 lit again, its link trained by the kext.
+	t.part = Pipe2::Part::Light;
+	ok = ok && Pipe2::build(t, *plan, &why) &&
+	     runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dcninit: light", otgOff(), plan->aux);
+	xpOverride = nullptr;
+	if (plan)
+		IOFree(plan, sizeof(Pipe2::Plan));
+	useSlotTable();
+	const uint64_t periodNs = measureFramePeriodNs(otgOff());
+	const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
+	FBLOG("dcninit: %s%s%s; OTG0 measured %u.%03u Hz, HUBP0_DCHUBP_CNTL 0x%08x", ok ? "boot pipe lit again" : "FAILED",
+	      *why ? ": " : "", why, mHz / 1000, mHz % 1000, regReadDmu(2, 0x05f4));
+	return ok;
+}
+
 bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
 	AtomBios::DisplayPath path {};
 	uint8_t ddcLine = 0;
@@ -3295,6 +3373,10 @@ void RDNA4Device::selectExtra(size_t slot) {
 	if (slot >= kMaxExtra || slot == extraSlot)
 		return;
 	extraSlot = slot;
+	useSlotTable();
+}
+
+void RDNA4Device::useSlotTable() {
 	// Its connector's table, or until it has a sink its pipe's first.
 	const ExtraPipe &x = xp();
 	if (!x.hpd || !Pipe2::use(x.hpd, x.lit ? x.hdmi : dpDual(x.hpd), x.pipe, x.uhd, x.y420))

@@ -92,11 +92,15 @@ public:
 	static constexpr size_t kMaxExtra = 3;
 	ExtraPipe extra[kMaxExtra] { { 1 }, { 2 }, { 3 } };
 	size_t extraSlot { 0 };
-	ExtraPipe &xp() { return extra[extraSlot]; }
-	const ExtraPipe &xp() const { return extra[extraSlot]; }
+	// coldStart: while it lights pipe 0 itself from a second-pipe table, the plan's training and AUX writes take
+	// the boot display's sink and link from this entry instead of a slot's (held under extraLock).
+	ExtraPipe *xpOverride { nullptr };
+	ExtraPipe &xp() { return xpOverride ? *xpOverride : extra[extraSlot]; }
+	const ExtraPipe &xp() const { return xpOverride ? *xpOverride : extra[extraSlot]; }
 	// The one the second-pipe functions act on, and its connector's table
 	// (Pipe2::use) once it has a sink.
 	void selectExtra(size_t slot);
+	void useSlotTable();   // the selected slot's connector's table (Pipe2::use)
 	// Held from a selectExtra through everything done with the pipe it selects (ExtraHold): the hot-plug poll
 	// (a timer on each head's work loop), macOS's mode switches (the paravirtual host's thread, or NDRV) and
 	// the heads' start-up each select a pipe and use it, and did so under one another (card, 2026-11-14: a
@@ -251,6 +255,11 @@ public:
 	// DpTrain::bringUp, stream encoder tied to the link, video restarted.
 	void noteBootDpLink();
 	DpTrain::Result retrainBootLink(const char *why);
+	// rdna4-dcninit=1, a test of lighting the displays when nothing set them up, on a warm card: before the heads
+	// light, the firmware's boot pipe (DisplayPort, pipe 0, DIG0, link 0, at its 3840x2160 timing) is taken down,
+	// the display hardware started as Linux's dcn401_init_hw does from nothing (src/dcninit.cpp), and pipe 0 lit
+	// again from a Linux-generated table with the kext's own link training. False when not asked or not done.
+	bool coldStart();
 	void logBootLink(const char *when);
 	const char *auxWhy { "" };   // why the last AUX transaction gave no reply, and the status it ended with
 	uint32_t    auxSts { 0 };
