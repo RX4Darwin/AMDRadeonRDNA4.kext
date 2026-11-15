@@ -548,12 +548,17 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    a second pipe lit from a register sequence generated from Linux's own
    code (2026-10-04, `docs/second-pipe.md`), on either HDMI connector, with
    its sleep, mode switches and hot-plug; the kext's own DP link training
-   (2026-10-06, 4 lanes at HBR2). Open: lighting the displays when nothing
-   is running (DMUB firmware loaded through PSP, DCCG, HUBBUB and DCHUB set
-   up, a pipe trained and lit: what a power loss leaves, so system sleep
-   waits for it); DP modes above the boot pixel clock (retraining in the
-   mode switch); a second DisplayPort display (written, not yet run on the
-   card).
+   (2026-10-06, 4 lanes at HBR2). Lighting the displays when nothing is
+   running (what a power loss leaves, so system sleep waits for it) is under
+   way, both parts tested on a warm card (2026-11-14/15): the DMUB firmware
+   loaded through the PSP and started as amdgpu does (`rdna4-dmubload=1`),
+   and Linux's `dcn401_init_hw` from nothing (168 recorded steps) with the
+   boot DP display relit from a Linux-generated table and the kext's own
+   training, its scanout address computed (`rdna4-dcninit=1`). Open: the
+   DCHUB global timer and the starting display clocks (still the VBIOS's
+   `asic_init` and the GOP's), then a real cold start; DP modes above the
+   boot pixel clock (retraining in the mode switch); a second DisplayPort
+   display (written, not yet run on the card).
 5. **Display power management** — display sleep was verified on hardware
    with the standalone build (DP: video stream off + sink D3 over native-AUX
    DPCD `SET_POWER`; HDMI: OPP pattern generator blank). It now runs from
