@@ -143,7 +143,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-dcninit=1` | The cold-start test on a warm card: once the SMU runs, the extra displays and the DisplayPort boot display (pipe 0 at 3840x2160) are taken down, Linux's `dcn401_init_hw` runs from nothing, the kext starts the DCHUB timer, and the pipes are lit again from Linux-generated tables. Left out on a warm card with a lit DisplayPort extra pipe (its recorded sleep sequence hung the card); after a power loss such a pipe is only lit again. |
 | `rdna4-coldboot=1` | A real cold start: once the kext has read what the GOP left (pipes, EDIDs, boot link, scanout address, DCHUB timer), the card is reset (mode 1, as Linux resets it on this SMU) and the displays are lit from nothing once the SMU runs. Wants `rdna4-compute` at stage 3 or more and `rdna4-dmubload=1`. |
 | `rdna4-coldprobe=1` | Log what a mode-1 reset depends on (the PSP and SMU mailboxes, the registers `asic_init` touches, the PCI config space and Resizable BAR), and add `sudo sysctl debug.rdna4_coldreset=1`, the reset alone at run time (the card comes back; the GPU work running then hangs the machine later). |
-| `rdna4-syssleep=1` | System sleep (IONDRVFramebuffer otherwise refuses it for any framebuffer on IOBootNDRV): the runtime and the paravirtual GPU's host give back what the card holds at sleep (writing back what lives only in VRAM), and the wake brings the runtime up again with both displays lit from nothing. With it IOGraphics' power work runs right for our framebuffers and for the paravirtual one (`src/plugin.cpp`: framebuffer slots, controller state, the dark wake, the paravirtual display's power states). Card-verified 2026-11-15: about 30 s from Sleep to off (macOS's own display-off step), the desktop back within seconds of the wake. On this board a key press brings only a dark wake: the desktop comes with the mouse. |
+| `rdna4-syssleep=1` | System sleep (IONDRVFramebuffer otherwise refuses it for any framebuffer on IOBootNDRV): the runtime and the paravirtual GPU's host give back what the card holds at sleep (writing back what lives only in VRAM), and the wake brings the runtime up again with both displays lit from nothing. With it IOGraphics' power work runs right for our framebuffers and for the paravirtual one (`src/plugin.cpp`: framebuffer slots, controller state, the dark wake, the paravirtual display's power states). Card-verified 2026-11-15, also with two DisplayPort displays: about 30 s from Sleep to off (macOS's own display-off step), the desktop back about 2 s after a key press. A board that wakes from USB through a GPE macOS does not take for a user wake needs USBWakeFixup with an `SSDT-USBW` on that GPE in its OpenCore config (here GPE 8, reported as GPP2). |
 | `rdna4-pm=1` | The compute service joins the power tree and suspends and resumes the runtime itself. Stalls a real system sleep: not with `rdna4-syssleep=1`. |
 | `rdna4-sleeptest=1`, `rdna4-quiesce-test=1`, `rdna4-resume-tests=1`, `rdna4-sleepabort=0` | Power tests and their controls: the runtime's own sleep/wake cycle without a system sleep (`rdna4-run sleeptest`), the shutdown quiesce at boot, the bring-up tests again after a wake; `rdna4-sleepabort=0` lets client waits run on through a sleep request. |
 | `rdna4-clocks=1` | Log the DPM levels of the display and memory clocks the power-management firmware offers. |
@@ -551,11 +551,14 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
      controller's state recomputed for framebuffers without a WindowServer
      port (a 90 s wait before every sleep), no deadlock in a dark wake, and
      power states for the paravirtual display (a 30 s WindowServer wait)~~
-   - Open: a key press wakes this board only to a dark wake (through the GPU
-     port's GPE 8; USBWakeFixup with an `SSDT-USBW` for the keyboard's
-     controller did not change it), so the desktop comes with the mouse;
-     sleep with two DisplayPort displays; `rdna4-syssleep` is not the default
-     yet.
+   - ~~Two DisplayPort displays through sleep and wake (2026-11-15): both
+     back about 2 s after a key press~~
+   - ~~A key press wakes to the desktop (2026-11-15): on this board it wakes
+     the system through GPE 8 (reported as GPP2, shared with the GPU's port),
+     which macOS took for a dark wake; an `SSDT-USBW` on that GPE with
+     USBWakeFixup (in the rig's OpenCore config, not this repository) makes it
+     a user wake~~
+   - Open: `rdna4-syssleep` is not the default yet.
 6. **Power / clocks** — done on the card, but for the items below the
    struck ones.
    - ~~SMU firmware handshake: the power-management firmware loaded through
