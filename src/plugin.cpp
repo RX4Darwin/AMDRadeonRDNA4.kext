@@ -180,6 +180,9 @@ uint32_t accelCensus { 0 };     // rdna4-accelcensus=1|2: the E1 impostor-IOAcce
 // that none of our framebuffers has one
 bool pvHeads { false };
 bool pvScaledModes { true };   // rdna4-pvscaled=0: no scaled modes above a head's 3840x2160
+// rdna4-pvfast=1: the boot display's paravirtual modes at each size's fastest refresh, not the one nearest 60 Hz. macOS
+// picks a size there, not a refresh (its paravirtual display tells the host the size alone): one refresh a size.
+bool pvFastModes { false };
 
 // What we keep for one of our framebuffers.
 struct FbState {
@@ -1148,6 +1151,11 @@ void attach(FbEntry &e) {
 	(void)Trial::option("rdna4-pvscaled", scaled);
 	pvScaledModes = scaled != 0;
 
+	uint32_t fast = 0;
+
+	(void)Trial::option("rdna4-pvfast", fast);
+	pvFastModes = fast != 0;
+
 	if (pvHeads) {
 		st->ndrv.setConnected(false);
 		FBLOG("ndrv: the heads are the paravirtual displays: no display on our framebuffers for macOS");
@@ -1646,6 +1654,19 @@ const Modes::Mode *nearest60(const Modes::Mode *table, size_t n, uint32_t width,
 	return best;
 }
 
+// The mode of that size with the highest refresh (the boot display's, rdna4-pvfast=1), or nullptr.
+const Modes::Mode *fastest(const Modes::Mode *table, size_t n, uint32_t width, uint32_t height)
+{
+	const Modes::Mode *best = nullptr;
+
+	for (size_t i = 0; i < n; i++)
+		if (table[i].t.hActive == width && table[i].t.vActive == height &&
+		    (!best || table[i].refreshMilliHz > best->refreshMilliHz))
+			best = &table[i];
+
+	return best;
+}
+
 // Port 0 when no head took the boot display over (a DisplayPort boot display: boot4k takes only an HDMI one behind an adapter): the boot
 // framebuffer's own modes (its NDRV table, at most the console's size, scanned from the console's memory at its pitch) and the size it
 // runs in now; its mode switches go through its mode-set engine (RDNA4Device::applyMode: on DisplayPort the stream retimed, the link as
@@ -1726,8 +1747,10 @@ uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
 	for (size_t i = 0; bigW >= 3840 && pvScaledModes && i < sizeof(kSteps) / sizeof(kSteps[0]); i++)
 		all[total++] = { 2 * bigW * kSteps[i][0] / kSteps[i][1], 2 * bigH * kSteps[i][0] / kSteps[i][1], 60000 };
 
+	const bool fast = !h && pvFastModes;   // the boot display's (port 0)
+
 	for (size_t i = 0; i < n && total < Modes::MaxModes + 7; i++) {
-		const Modes::Mode *best = nearest60(table, n, table[i].t.hActive, table[i].t.vActive);
+		const Modes::Mode *best = (fast ? fastest : nearest60)(table, n, table[i].t.hActive, table[i].t.vActive);
 		bool seen = false;
 
 		for (uint32_t k = 0; k < total; k++)
@@ -1798,7 +1821,7 @@ bool PvScanout::setMode(uint32_t port, uint32_t width, uint32_t height)
 	uint32_t liveW, liveH;
 
 	if (port == 0 && !h && bootModes(table, n, liveW, liveH)) {
-		const Modes::Mode *m = nearest60(table, n, width, height);
+		const Modes::Mode *m = (pvFastModes ? fastest : nearest60)(table, n, width, height);
 		const IOReturn r = m ? bootState->dev.applyMode(*m) : kIOReturnUnsupported;
 
 		FBLOG("pvgpu: port 0: the boot display switched to %ux%u for macOS's mode: %s", width, height,

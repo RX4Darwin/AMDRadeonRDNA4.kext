@@ -66,6 +66,10 @@ public:
 	// present. 0 length = no DDC sink found.
 	uint8_t edidData[256] {};
 	size_t  edidLen { 0 };
+	// Its blocks 2 and 3 (E-DDC segment 1; DisplayID on a 144 Hz DisplayPort monitor), for the mode table only:
+	// macOS is given the two above.
+	uint8_t edidMore[256] {};
+	size_t  edidMoreLen { 0 };
 	// A display beyond the boot one (rdna4-head2, plugin.cpp): the sink on
 	// another connector, the pipe it is lit on and what the kext lit for it.
 	// The second-pipe functions below act on the selected one (selectExtra).
@@ -254,6 +258,12 @@ public:
 	// the kext's own training on that link: stream off, transmitter off,
 	// DpTrain::bringUp, stream encoder tied to the link, video restarted.
 	void noteBootDpLink();
+	bool readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link);
+	// What a DisplayPort boot display's mode may clock at: what its trained link carries at 8 bpc, and the DISPCLK
+	// the kext holds (dispclkTargetKHz); the boot pixel clock if either is not known. The link is not retrained.
+	uint32_t bootDpMaxKHz();
+	uint32_t bootDpLinkKHz { 0 };   // what the firmware's link carries at 8 bpc, read when the mode table is built
+	uint32_t dispclkTargetKHz();
 	DpTrain::Result retrainBootLink(const char *why);
 	// rdna4-dcninit=1, a test of lighting the displays when nothing set them up, on a warm card, in a cold start's
 	// order: once the kext's DMUB firmware runs and the display clocks are raised (smuStarted). The lit extra pipes
@@ -353,7 +363,7 @@ private:
 	                   const uint8_t *data, uint8_t len,
 	                   uint8_t *reply, uint8_t replyCap, uint8_t *replyBytes);
 	bool readEDID(uint8_t inst, uint8_t *edid, size_t count, uint8_t start, uint8_t segment = 0);
-	void logMoreEdidBlocks(uint8_t inst, uint8_t blocks);
+	void readMoreEdidBlocks(uint8_t inst, uint8_t blocks);
 	bool readEDIDI2C(uint8_t line, uint8_t *edid, size_t count, uint8_t start);
 	// A DisplayPort connector's DDC pads in I2C (true) or AUX (false) mode.
 	// A passive DP++ (DP-to-HDMI) adapter carries the sink's DDC on them,

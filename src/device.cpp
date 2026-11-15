@@ -658,15 +658,17 @@ bool RDNA4Device::readEDID(uint8_t inst, uint8_t *edid, size_t count,
 	return true;
 }
 
-// The extension blocks past the first (E-DDC segments), logged only: what of the sink macOS is not told, its
-// DisplayID timings among it. The EDID kept for macOS and the mode table stay the base block and the first extension.
-void RDNA4Device::logMoreEdidBlocks(uint8_t inst, uint8_t blocks) {
-	static uint8_t block[128];
+// The extension blocks past the first (E-DDC segments) into edidMore, in order, logged with their DisplayID timings:
+// the mode table takes them, macOS's EDID stays the base block and the first extension.
+void RDNA4Device::readMoreEdidBlocks(uint8_t inst, uint8_t blocks) {
+	edidMoreLen = 0;
 	for (uint8_t b = 2; b <= blocks && b <= 3; b++) {
+		uint8_t *block = edidMore + edidMoreLen;
 		if (!readEDID(inst, block, 128, static_cast<uint8_t>((b & 1) * 128), static_cast<uint8_t>(b / 2))) {
 			FBLOG("edid: AUX%u: extension block %u not read (segment %u)", inst, b, b / 2);
-			continue;
+			break;
 		}
+		edidMoreLen += 128;
 		Edid::DetailedTiming t[8];
 		const size_t n = Edid::displayIdTimings(block, t, 8);
 		FBLOG("edid: AUX%u: extension block %u (tag 0x%02x, checksum %s): %lu DisplayID timing(s)", inst, b, block[0],
@@ -875,7 +877,7 @@ void RDNA4Device::probeEDID() {
 				      "(tag 0x%02x)", i, bus, inst, edidData[128]);
 			}
 			if (ext && viaAux && edid[126] > 1)
-				logMoreEdidBlocks(inst, edid[126]);
+				readMoreEdidBlocks(inst, edid[126]);
 		} else if (!boot && freeExtraSlot() < extraHeads()) {
 			selectExtra(freeExtraSlot());
 			memcpy(xp().edid, edid, 128);
@@ -2418,13 +2420,25 @@ void RDNA4Device::buildModeTable() {
 			lim.maxPixelClockKHz = capKHz;
 	}
 
-	// DisplayPort has no TMDS limit, but its link is not retrained: nothing
-	// above the pixel clock it was brought up for (ModeSet::build).
-	if (pipe.valid() && pipe.signal == Pipe::Signal::DpSst && bootTimingValid && bootTiming.pixelClockKHz)
-		lim.maxPixelClockKHz = bootTiming.pixelClockKHz;
+	// DisplayPort has no TMDS limit, but its link is not retrained: what the link carries, and DISPCLK.
+	if (pipe.valid() && pipe.signal == Pipe::Signal::DpSst && bootTimingValid && bootTiming.pixelClockKHz) {
+		DpTrain::Sink sink = bootDpSink;
+		DpTrain::Link link = bootDpLink;
+		const bool known = bootDpLinkKnown || readBootDpLink(sink, link);
+		bootDpLinkKHz = known ? DpTrain::bandwidthKbps(link) / 24 : 0;
+		lim.maxPixelClockKHz = bootDpMaxKHz();
+		FBLOG("modes: DisplayPort modes up to %u kHz (link %u lane(s) at 0x%02x: %u kHz at 8 bpc; DISPCLK %u kHz; boot "
+		      "%u kHz)", lim.maxPixelClockKHz, link.lanes, link.rate, bootDpLinkKHz, dispclkTargetKHz(),
+		      bootTiming.pixelClockKHz);
+	}
 
+	// The EDID with its blocks past the first extension (DisplayID timings), for the table alone.
+	static uint8_t full[512];
+	memcpy(full, edidData, sizeof(edidData));
+	memcpy(full + sizeof(edidData), edidMore, sizeof(edidMore));
+	const size_t fullLen = edidLen == sizeof(edidData) ? edidLen + edidMoreLen : edidLen;
 	if (modesetRequested && edidLen)
-		modeCount = Modes::build(edidData, edidLen, lim, modeTable, Modes::MaxModes);
+		modeCount = Modes::build(full, fullLen, lim, modeTable, Modes::MaxModes);
 
 	Edid::BaseInfo base {};
 	if (edidLen && Edid::parseBaseBlock(edidData, edidLen, base)) {
@@ -2614,11 +2628,24 @@ bool RDNA4Device::bootSinkPresent() {
 	return hpdY != 0xFFFFFFFF && pipe.hpd >= 1 && pipe.hpd <= 4 && ((hpdY >> (8 * (pipe.hpd - 1))) & 1);
 }
 
+uint32_t RDNA4Device::bootDpMaxKHz() {
+	const uint32_t boot = bootTimingValid ? bootTiming.pixelClockKHz : 0, dispclk = dispclkTargetKHz();
+	if (!bootDpLinkKHz || !dispclk)
+		return boot;
+	const uint32_t most = bootDpLinkKHz < dispclk ? bootDpLinkKHz : dispclk;
+	return most > boot ? most : boot;
+}
+
 void RDNA4Device::noteBootDpLink() {
-	bootDpLinkKnown = false;
+	bootDpLinkKnown = readBootDpLink(bootDpSink, bootDpLink);
+}
+
+// The boot display's sink capabilities and the link the firmware trained (DPCD reads): whether that is a link the
+// sink says it has.
+bool RDNA4Device::readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link) {
 	if (!pipe.valid() || pipe.signal != Pipe::Signal::DpSst || !sinkAuxValid) {
 		FBLOG("dptrain: the boot display is not on DisplayPort: nothing to retrain");
-		return;
+		return false;
 	}
 	// Receiver capability, then what the firmware told the sink: LINK_BW_SET,
 	// LANE_COUNT_SET, and from 0x202 on how the lanes are doing.
@@ -2626,20 +2653,21 @@ void RDNA4Device::noteBootDpLink() {
 	if (!dpcdRead(sinkAuxInst, 0x000, caps, sizeof(caps)) || !dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) ||
 	    !dpcdRead(sinkAuxInst, 0x202, status, sizeof(status))) {
 		FBLOG("dptrain: the sink's DPCD did not answer on AUX%u", sinkAuxInst);
-		return;
+		return false;
 	}
-	const bool sink = DpTrain::parseCaps(caps, sizeof(caps), bootDpSink);
-	bootDpLink = DpTrain::Link { static_cast<uint8_t>(set[1] & 0x1f), set[0] };
+	const bool parsed = DpTrain::parseCaps(caps, sizeof(caps), sink);
+	link = DpTrain::Link { static_cast<uint8_t>(set[1] & 0x1f), set[0] };
 	FBLOG("dptrain: sink DPCD %u.%u, up to %u lane(s) at rate 0x%02x%s%s, reading interval 0x%02x; the firmware's "
 	      "link: %u lane(s) at rate 0x%02x (LANE_COUNT_SET 0x%02x); lanes %02x %02x, aligned %u", caps[0] >> 4,
-	      caps[0] & 0xf, bootDpSink.maxLanes, bootDpSink.maxRate, bootDpSink.tps3 ? ", TPS3" : "",
-	      bootDpSink.tps4 ? ", TPS4" : "", caps[0x0e], bootDpLink.lanes, bootDpLink.rate, set[1], status[0],
+	      caps[0] & 0xf, sink.maxLanes, sink.maxRate, sink.tps3 ? ", TPS3" : "",
+	      sink.tps4 ? ", TPS4" : "", caps[0x0e], link.lanes, link.rate, set[1], status[0],
 	      status[1], status[2] & 1);
-	const bool lanes = bootDpLink.lanes == 1 || bootDpLink.lanes == 2 || bootDpLink.lanes == 4;
-	bootDpLinkKnown = sink && lanes && bootDpLink.lanes <= bootDpSink.maxLanes && bootDpLink.rate >= DpTrain::kRbr &&
-	                  bootDpLink.rate <= bootDpSink.maxRate;
-	if (!bootDpLinkKnown)
+	const bool lanes = link.lanes == 1 || link.lanes == 2 || link.lanes == 4;
+	const bool known = parsed && lanes && link.lanes <= sink.maxLanes && link.rate >= DpTrain::kRbr &&
+	                   link.rate <= sink.maxRate;
+	if (!known)
 		FBLOG("dptrain: that is not a link this sink says it has: it will not be retrained");
+	return known;
 }
 
 // DpTrain on one link of this card: the sink's DPCD over AUX channel `aux`,
@@ -3006,7 +3034,8 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		}
 		vidMNow = regReadDmu(2, kDpVidM + digOff()) & 0xffffff;
 		t.dp = true;
-		t.dpMaxKHz = bootTiming.pixelClockKHz;
+		// Above the boot clock only on the kext's DISPCLK (raised when the firmware runs), not the GOP's.
+		t.dpMaxKHz = uhdClocks ? bootDpMaxKHz() : bootTiming.pixelClockKHz;
 	}
 	auto aim = [&](const Edid::DetailedTiming &from, const Edid::DetailedTiming &to) {
 		t.from = from;

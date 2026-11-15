@@ -40,9 +40,10 @@ enum Source : uint8_t {
 	SourceStd    = 3,   // standard timing -> DMT table
 	SourceEst    = 4,   // established timing -> DMT table
 	SourceBoot   = 5,   // read back from the OTG the GOP programmed
+	SourceDisplayId = 6,   // detailed timing in a DisplayID extension (Edid::displayIdTimings)
 };
 
-// Short lowercase tag ("dtd", "cta-dtd", "vic", "std", "est", "boot").
+// Short lowercase tag ("dtd", "cta-dtd", "vic", "std", "est", "boot", "displayid").
 const char *sourceName(uint8_t source);
 
 struct Mode {

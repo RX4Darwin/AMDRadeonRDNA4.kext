@@ -49,6 +49,12 @@ otherwise). The newest version is on top. How versions and branches work is in `
   with 3840x2160@120 and @144, 2560x1440@144 (604.25 MHz) and 1920x1080@144. The same boot, the Lenovo through a
   passive DP-to-HDMI cable (DP++ type 1, 165 MHz) on the second DisplayPort connector: lit from its HDMI table,
   taken down and lit again by the cold-start test.
+- A DisplayPort boot display takes modes above the pixel clock it booted with, up to what its trained link carries
+  at 8 bpc and the DISPCLK the kext holds (650 MHz), with its DisplayID timings in the mode table; the stream is
+  retimed on the link as it is (not retrained), above the boot clock only once the kext's clocks are raised.
+  `rdna4-pvfast=1` gives the paravirtual displays the fastest refresh of each size for the boot display (macOS
+  picks a size there, not a refresh). Card (2026-11-15, the Samsung booted by the GOP at 3840x2160@30, 297 MHz):
+  2560x1440@120 (497.75 MHz) measured 120.003 Hz, then 3840x2160@60 (533.25 MHz) measured 59.994 Hz.
 - The extra displays' pipe selection is held under one lock from selection through use: the hot-plug poll, macOS's
   mode switches (paravirtual host thread or NDRV) and the heads' start-up selected pipes under one another (card
   2026-11-14: a switch logged another slot's empty mode). Card (2026-11-14): six switches of the HDMI display, each

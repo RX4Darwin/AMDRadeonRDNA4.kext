@@ -491,6 +491,53 @@ static int testModes() {
 	did[0] = 0x02;
 	failures += check(Edid::displayIdTimings(did, dt, 2) == 0, "a CTA block has no DisplayID timings");
 
+	// The Samsung's block 2 as the card read it (2026-11-15): five Type I timings. Its modes on the 4-lane HBR2 link
+	// with DISPCLK at 650 MHz: 2560x1440@144 (604.25 MHz) and 1920x1080@144 join, 3840x2160@120 and @144 do not.
+	{
+		static const uint32_t five[5][7] = {   // kHz, h active/blank/fp/sw, v active/blank (v fp/sw below)
+			{ 1188000, 3840, 560, 176, 88, 2160, 90 }, { 1332750, 3840, 160, 48, 32, 2160, 154 },
+			{ 533250, 3840, 160, 48, 32, 2160, 62 }, { 604250, 2560, 160, 48, 32, 1440, 103 },
+			{ 346500, 1920, 160, 48, 32, 1080, 77 } };
+		static const uint32_t vsync[5][2] = { { 8, 10 }, { 3, 5 }, { 3, 5 }, { 3, 5 }, { 3, 5 } };
+		uint8_t full[384] = {};
+		memcpy(full, samsung, 256);
+		uint8_t *b2 = full + 256;
+		b2[0] = 0x70; b2[1] = 0x13; b2[2] = 3 + 5 * 20; b2[5] = 0x03; b2[7] = 5 * 20;
+		for (int i = 0; i < 5; i++) {
+			uint8_t *d = b2 + 8 + 20 * i;
+			const uint32_t f[8] = { five[i][1], five[i][2], five[i][3] | 0x8000u, five[i][4], five[i][5], five[i][6],
+			                        vsync[i][0], vsync[i][1] };
+			const uint32_t clock = five[i][0] / 10 - 1;
+			d[0] = clock & 0xff; d[1] = (clock >> 8) & 0xff; d[2] = clock >> 16;
+			for (int k = 0; k < 8; k++) {
+				const uint32_t v = f[k] - 1;   // the polarity bit survives: fp is at least 1
+				d[4 + 2 * k] = v & 0xff;
+				d[5 + 2 * k] = (v >> 8) & 0xff;
+			}
+		}
+		uint8_t sum = 0;
+		for (int i = 0; i < 127; i++)
+			sum += b2[i];
+		b2[127] = static_cast<uint8_t>(-sum);
+		full[126] = 2;   // the base block announces both extensions
+		uint8_t s0 = 0;
+		for (int i = 0; i < 127; i++)
+			s0 += full[i];
+		full[127] = static_cast<uint8_t>(-s0);
+		Modes::Limits hbr2 { 3840, 2160, 650000 };
+		Mode dm[Modes::MaxModes];
+		const size_t dmn = Modes::build(full, 384, hbr2, dm, Modes::MaxModes);
+		bool q144 = false, f144 = false, uhdFast = false;
+		for (size_t i = 0; i < dmn; i++) {
+			q144 |= dm[i].t.hActive == 2560 && dm[i].t.pixelClockKHz == 604250 && dm[i].source == Modes::SourceDisplayId;
+			f144 |= dm[i].t.hActive == 1920 && dm[i].t.pixelClockKHz == 346500 && dm[i].source == Modes::SourceDisplayId;
+			uhdFast |= dm[i].t.hActive == 3840 && dm[i].t.pixelClockKHz > 533250;
+		}
+		failures += check(q144 && f144 && !uhdFast && dm[0].native && dm[0].t.pixelClockKHz == 533250,
+		                  "Samsung with its DisplayID block on HBR2: 1440p144 %d, 1080p144 %d, a faster 4K %d (%zu modes)",
+		                  q144, f144, uhdFast, dmn);
+	}
+
 	Mode sm[Modes::MaxModes];
 	size_t sn = Modes::build(samsung, sizeof(samsung), unlimited, sm, Modes::MaxModes);
 	printModes("unlimited", sm, sn);

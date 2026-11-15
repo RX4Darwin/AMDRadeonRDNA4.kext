@@ -105,6 +105,7 @@ const char *sourceName(uint8_t source) {
 	case SourceStd:    return "std";
 	case SourceEst:    return "est";
 	case SourceBoot:   return "boot";
+	case SourceDisplayId: return "displayid";
 	default:           return "?";
 	}
 }
@@ -171,6 +172,14 @@ size_t build(const uint8_t *edid, size_t len, const Limits &lim, Mode *out, size
 		size_t nd = cta.dtdCount < Edid::MaxCtaDtds ? cta.dtdCount : Edid::MaxCtaDtds;
 		for (size_t i = 0; i < nd; i++)
 			b.add(cta.dtds[i], SourceCtaDtd, false);
+	}
+	// ... and the DisplayID extensions' detailed timings.
+	for (size_t blk = 1; blk < blocks; blk++) {
+		const uint8_t *ext = edid + blk * Edid::BlockSize;
+		Edid::DetailedTiming dt[Edid::MaxCtaDtds];
+		const size_t nd = Edid::blockChecksumOk(ext) ? Edid::displayIdTimings(ext, dt, Edid::MaxCtaDtds) : 0;
+		for (size_t i = 0; i < nd; i++)
+			b.add(dt[i], SourceDisplayId, false);
 	}
 
 	// 3. SVDs, in the sink's listed order.
