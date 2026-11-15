@@ -1210,6 +1210,7 @@ void attach(FbEntry &e) {
 		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
 		                        createVblankService, deviceCursorProbe, &dev };
 		env.smuReady = deviceSmuReady;
+		dev.compute = &st->compute;   // its sleep and wake from the device's notifiers (rdna4-syssleep without rdna4-pm)
 		env.vbios = dev.vbiosBytes(env.vbiosSize);
 		st->compute.start(env, computeStage);
 	}

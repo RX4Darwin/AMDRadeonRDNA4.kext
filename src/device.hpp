@@ -280,7 +280,10 @@ public:
 	// rdna4-coldboot=1: a real cold start at boot. What the GOP left is read first (the pipes, EDIDs, the boot link,
 	// the scanout address and the DCHUB timer below), then the card reset; the displays light once the SMU runs
 	// (coldStartHeads), as after a power loss. True from the reset on.
-	bool coldBoot { false };
+	class RDNA4Compute *compute { nullptr };   // the runtime beside this device (its sleep and wake: see sleepWakeMessage)
+	bool coldBoot { false };   // also from a wake (rdna4-syssleep): the card lost its power and its state
+	void captureGopState();    // the GOP's scanout address, DCHUB timer and boot link, for a later cold start
+	uint32_t vramMark { 0 };   // what sleepWakeMessage wrote into VRAM before sleep (0: nothing)
 	uint64_t coldGopSurface { 0 };
 	// Where HUBP0 scans (HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS and _HIGH): the GOP's console on a warm card.
 	uint64_t bootScanout() const { return regReadDmu(2, 0x060a) | static_cast<uint64_t>(regReadDmu(2, 0x060b) & 0xffff) << 32; }
@@ -374,6 +377,11 @@ private:
 	void logPciState(const char *when);
 	// rdna4-syssleep=1: logPciState at the system's sleep and wake (roadmap item 5, stage 2).
 	IONotifier *sleepWakeNotifier { nullptr };
+	// Without rdna4-pm the runtime's own sleep and wake are driven from here: powerWillSleep at the system's sleep
+	// notice, powerDidWake once the card's PCI device has powered on again (its config space restored).
+	IONotifier *pciPowerNotifier { nullptr };
+	bool drivesRuntimePower() const;
+	static IOReturn pciPowerMessage(void *target, void *ref, UInt32 type, IOService *provider, void *arg, vm_size_t size);
 	static IOReturn sleepWakeMessage(void *target, void *ref, UInt32 type, IOService *provider, void *arg, vm_size_t size);
 	void dumpDCN();
 

@@ -16,6 +16,7 @@
 #include "trial.hpp"
 #include "dpdual.hpp"
 #include "dcninit.hpp"
+#include "compute.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMessage.h>
@@ -2307,14 +2308,60 @@ void RDNA4Device::logPciState(const char *when) {
 	}
 }
 
+// The runtime's sleep and wake come from this device's notifiers (no rdna4-pm, which puts it in the power tree).
+bool RDNA4Device::drivesRuntimePower() const { return compute && !RDNA4Compute::requestedPowerManagement(); }
+
+void RDNA4Device::captureGopState() {
+	if (!bootDpLinkKnown)
+		noteBootDpLink();
+	coldGopSurface = bootScanout();
+	coldGopTimer = regReadDmu(2, DcnInit::kTimerCntl);
+	FBLOG("cold: the GOP's state kept for a cold start: scanout 0x%llx, DCHUB timer 0x%08x, boot link %s", coldGopSurface,
+	      coldGopTimer, bootDpLinkKnown ? "known" : "NOT known");
+}
+
+// Roadmap item 5, stage 2: a word at the console's start written before sleep and read once woken (whether VRAM
+// kept its contents through the power loss), and from the wake on the card treated as after a cold reset: the
+// compute bring-up runs again (rdna4-pm=1) and its SMU step runs the cold start (coldStartHeads) in cold mode.
 IOReturn RDNA4Device::sleepWakeMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {
 	auto *dev = static_cast<RDNA4Device *>(target);
-	if (type == kIOMessageSystemWillSleep)
+	auto vramWord = [dev](bool write, uint32_t value) -> uint32_t {
+		IODeviceMemory *bar0 = dev->pciDevice ? dev->pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0) : nullptr;
+		IOMemoryMap *map = bar0 ? bar0->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, 0, 4096) : nullptr;
+		volatile uint32_t *w = map ? reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()) : nullptr;
+		uint32_t got = 0xdeadbeef;
+		if (w && write)
+			w[0] = value;
+		if (w)
+			got = w[0];
+		if (map)
+			map->release();
+		return got;
+	};
+	if (type == kIOMessageSystemWillSleep) {
 		dev->logPciState("before sleep");
-	else if (type == kIOMessageSystemWillPowerOn)
+		dev->vramMark = vramWord(true, 0x5a5a1234) == 0x5a5a1234 ? 0x5a5a1234 : 0;
+		if (dev->drivesRuntimePower()) {   // the engines quiesced while the card has power
+			dev->compute->powerSleepRequest();
+			dev->compute->powerWillSleep();
+		}
+	} else if (type == kIOMessageSystemWillPowerOn) {
 		dev->logPciState("waking");
-	else if (type == kIOMessageSystemHasPoweredOn)
+		dev->coldBoot = true;
+		FBLOG("cold: waking: the card lost its power: the next cold start runs as after a reset");
+	} else if (type == kIOMessageSystemWillNotSleep) {   // a sleep called off after the engines were quiesced
+		FBLOG("cold: the sleep was called off: the runtime comes back");
+		if (dev->drivesRuntimePower())
+			dev->compute->powerDidWake();
+	} else if (type == kIOMessageSystemHasPoweredOn) {
 		dev->logPciState("woken");
+		if (dev->drivesRuntimePower())   // if the card's power-on was not seen (it did nothing then)
+			dev->compute->powerDidWake();
+		if (dev->vramMark) {
+			const uint32_t got = vramWord(false, 0);
+			FBLOG("cold: woken: VRAM %s through the sleep (0x%08x)", got == dev->vramMark ? "kept its contents" : "lost its contents", got);
+		}
+	}
 	return kIOReturnSuccess;
 }
 
@@ -2429,6 +2476,18 @@ bool RDNA4Device::coldReset() {
 	if (vmap)
 		vmap->release();
 	return boot && sized && vmbx;
+}
+
+// The card's IOPCIDevice powered on again after a sleep: IOPCIFamily has restored its config space, so its registers
+// answer (unposted). The runtime's wake bring-up (on its own thread) runs from here without rdna4-pm.
+IOReturn RDNA4Device::pciPowerMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {
+	auto *dev = static_cast<RDNA4Device *>(target);
+	if (type == kIOMessageDeviceHasPoweredOn) {
+		dev->logPciState("pci powered on");
+		if (dev->drivesRuntimePower())
+			dev->compute->powerDidWake();
+	}
+	return kIOReturnSuccess;
 }
 
 void RDNA4Device::probeMemSize() {
@@ -2561,10 +2620,7 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	// rdna4-coldboot=1: what the GOP left read while it is there, then the card reset (coldReset).
 	uint32_t coldArg = 0;
 	if (PE_parse_boot_argn("rdna4-coldboot", &coldArg, sizeof(coldArg)) && coldArg && rmmio && pipe.valid()) {
-		if (!bootDpLinkKnown)
-			noteBootDpLink();
-		coldGopSurface = bootScanout();
-		coldGopTimer = regReadDmu(2, DcnInit::kTimerCntl);
+		captureGopState();
 		coldBoot = coldReset();
 		FBLOG("cold: boot: %s (the GOP's scanout 0x%llx, timer 0x%08x)",
 		      coldBoot ? "the card reset; the displays light once the SMU runs" : "the reset FAILED: as a warm boot",
@@ -2572,9 +2628,14 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	}
 	uint32_t sysSleep = 0;
 	if (PE_parse_boot_argn("rdna4-syssleep", &sysSleep, sizeof(sysSleep)) && sysSleep && !sleepWakeNotifier) {
+		if (rmmio && pipe.valid() && !coldBoot)   // what a cold start after the wake compares against
+			captureGopState();
 		if (IOPMrootDomain *root = IOService::getPMRootDomain())
 			sleepWakeNotifier = root->registerInterest(gIOPriorityPowerStateInterest, sleepWakeMessage, this, nullptr);
-		FBLOG("cold: the card's PCI state is logged at sleep and wake: %s", sleepWakeNotifier ? "registered" : "NOT registered");
+		if (pciDevice)
+			pciPowerNotifier = pciDevice->registerInterest(gIOGeneralInterest, pciPowerMessage, this, nullptr);
+		FBLOG("cold: the card's PCI state is logged at sleep and wake: %s, its power-on %s",
+		      sleepWakeNotifier ? "registered" : "NOT registered", pciPowerNotifier ? "watched" : "NOT watched");
 		logPciState("boot");
 	}
 	FBLOG("init: device ready (%ux%u console, %lu mode(s))", fbWidth, fbHeight,
@@ -3212,6 +3273,14 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	// 4. The IP request window open, as the lighting plans require (as the GOP leaves it).
 	if (ok)
 		regWriteDmu(2, 0x00a0, 1);
+	// 4b. After a power loss the boot display's DDC pads are back in their reset mode: AUX mode, as Linux's
+	// hw_ddc.c sets them each time the AUX engine is taken (the GOP had; a mode-1 reset leaves them as they were).
+	if (ok && coldBoot) {
+		const uint32_t mask = kGpioDdcMask + 4u * sinkAuxInst, was = regReadDmu(2, mask), ctrl5 = regReadDmu(2, kGpioAuxCtrl5);
+		ddcPadMode(sinkAuxInst, false);
+		FBLOG("dcninit: AUX%u pads: DDC%u_MASK 0x%08x -> 0x%08x, AUX_CTRL_5 0x%08x -> 0x%08x", sinkAuxInst, sinkAuxInst + 1u,
+		      was, regReadDmu(2, mask), ctrl5, regReadDmu(2, kGpioAuxCtrl5));
+	}
 	// 5. Pipe 0 lit again, its link trained by the kext.
 	t.part = Pipe2::Part::Light;
 	ok = ok && Pipe2::build(t, *plan, &why) &&

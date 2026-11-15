@@ -61,6 +61,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
   out for its own framebuffers, and logs the power calls they get. Card (2026-11-15): the machine sleeps (Sleep from
   the Apple menu, then 30 s without input) and wakes on a key; after the wake the card reads 0xffffffff, a
   framebuffer's wake times out after 45 s and the displays stay dark: bringing the card back is stage 2.
+  Stage 2: the card's PCI state is logged at sleep and wake (it wakes at its power-on defaults, then answers unposted
+  once macOS has restored its config space); without `rdna4-pm` (which stalls the sleep) the runtime is quiesced at
+  the sleep notice and brought up again once the card's PCI device has powered on, the PSP, SMU, DMUB and clocks
+  from nothing, and the cold start relights the displays from the GOP's state kept at boot. After a power loss the
+  DisplayPort pads are out of AUX mode: the cold start puts them back, as Linux does for every AUX transfer. Card
+  (2026-11-15): after a real sleep both displays lit again (DP trained at the first attempt, 60.002 Hz; HDMI on);
+  VRAM does not survive the sleep; the desktop stays black: the paravirtual GPU's host still holds the runtime's old
+  objects.
 - A real cold start (`rdna4-coldboot=1`): at boot, once the kext has read what the GOP left (the pipes, EDIDs, the
   boot link, the scanout address, the DCHUB timer), the card is reset as Linux resets it on this SMU (mode 1 through
   the SMU's debug mailbox, `amdgpu_device_mode1_reset`), its PCI config space (BARs, Resizable BAR) restored and the
