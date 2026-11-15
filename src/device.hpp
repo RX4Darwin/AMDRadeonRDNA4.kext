@@ -59,6 +59,8 @@ public:
 		height = liveTiming.vActive;
 		return liveTimingValid;
 	}
+	// The boot pipe's running mode, or nullptr before it is known.
+	const Edid::DetailedTiming *liveMode() const { return liveTimingValid ? &liveTiming : nullptr; }
 	uint32_t            fbRowBytes { 0 };
 	uint32_t            fbDepth    { 32 };
 

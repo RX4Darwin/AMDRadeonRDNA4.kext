@@ -1813,6 +1813,21 @@ bool PvScanout::largest(uint32_t port, uint32_t &width, uint32_t &height)
 	return width && height;
 }
 
+bool PvScanout::wantsMode(uint32_t port, uint32_t width, uint32_t height)
+{
+	const Modes::Mode *table = nullptr;
+	size_t n = 0;
+	uint32_t liveW, liveH;
+
+	if (port || pvHead(0) || !bootModes(table, n, liveW, liveH))   // the boot display's: the heads light their own
+		return false;
+
+	const Modes::Mode *m = (pvFastModes ? fastest : nearest60)(table, n, width, height);
+	const Edid::DetailedTiming *live = bootState->dev.liveMode();
+
+	return m && live && Modes::match(m, 1, *live) < 0;
+}
+
 bool PvScanout::setMode(uint32_t port, uint32_t width, uint32_t height)
 {
 	Head2 *h = pvHead(port);

@@ -79,6 +79,13 @@ bool largest(uint32_t port, uint32_t &width, uint32_t &height);
  */
 bool setMode(uint32_t port, uint32_t width, uint32_t height);
 
+/*
+ * Whether head `port` runs another mode of `width` x `height` than the one
+ * macOS was given for that size (plugin.cpp): the boot display the GOP lit at
+ * 3840x2160@30 while macOS was told 60 Hz. setMode then switches it.
+ */
+bool wantsMode(uint32_t port, uint32_t width, uint32_t height);
+
 /* The scanout of head `port` (plugin.cpp); false while it is not lit. */
 bool head(uint32_t port, Head &out);
 

@@ -61,6 +61,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
   Samsung's fast modes for that table alone (`modes-boot-dp.txt`: 2560x1440 and 1920x1080 at 120 and 144 Hz); a
   mode without Linux's values that has to deliver its lines faster than the plane's are set for is refused.
   Card (2026-11-15): 2560x1440@120 in 112 steps, 120.018 Hz, no underflows.
+- Under the paravirtual displays the boot display goes to the mode macOS was given for its size at the first frame,
+  also when the size is the one it runs (`PvScanout::wantsMode`): the GOP once lit the Samsung at 3840x2160@30 while
+  macOS was told 60 Hz, and it stayed at 30 Hz until a switch to another size. Card (2026-11-15): a boot the GOP lit at
+  60 Hz switches nothing; with the Samsung put into 2560x1440@60 behind macOS's back (a test-only sysctl), the next
+  frame took it back to macOS's 2560x1440@120 (119.996 Hz).
 - The extra displays' pipe selection is held under one lock from selection through use: the hot-plug poll, macOS's
   mode switches (paravirtual host thread or NDRV) and the heads' start-up selected pipes under one another (card
   2026-11-14: a switch logged another slot's empty mode). Card (2026-11-14): six switches of the HDMI display, each

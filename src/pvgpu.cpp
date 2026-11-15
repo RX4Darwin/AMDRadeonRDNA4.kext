@@ -7684,7 +7684,9 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	const uint32_t frameW = md ? gSurfaceFns.width(s) : 0, frameH = md ? gSurfaceFns.height(s) : 0;
 	const uint32_t format = md ? gSurfaceFns.pixelFormat(s) : 0;
 
-	if (frameW && frameH && (frameW != h.width || frameH != h.height) && (frameW != sm.triedW || frameH != sm.triedH)) {
+	// The same size in another mode than macOS was told (a boot display the GOP lit at 30 Hz) as well. Once a size.
+	if (frameW && frameH && (frameW != sm.triedW || frameH != sm.triedH) &&
+	    (frameW != h.width || frameH != h.height || PvScanout::wantsMode(port, frameW, frameH))) {
 		uint32_t bigW = 0, bigH = 0;
 		const bool larger = PvScanout::largest(port, bigW, bigH) && frameW > bigW && frameH > bigH;
 
@@ -7693,7 +7695,8 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 
 		if (!larger && PvScanout::setMode(port, frameW, frameH) && PvScanout::head(port, h))
 			pvlog("host: present: port %u now %ux%u for frames of that size", port, h.width, h.height);
-		else if (larger && (h.width != bigW || h.height != bigH) && PvScanout::setMode(port, bigW, bigH) && PvScanout::head(port, h))
+		else if (larger && (h.width != bigW || h.height != bigH || PvScanout::wantsMode(port, bigW, bigH)) &&
+		         PvScanout::setMode(port, bigW, bigH) && PvScanout::head(port, h))
 			pvlog("host: present: port %u now %ux%u for frames of %ux%u (format 0x%08x), scaled down", port, h.width, h.height, frameW, frameH,
 			      format);
 	}
