@@ -224,6 +224,17 @@ bool AtomBios::getFirmwareInfo(FirmwareInfo3 &out) const {
 	       readU32(off + 16, out.firmwareCapability);
 }
 
+bool AtomBios::getDceRefClock(uint32_t &khz) const {
+	TableHeader th;
+	uint16_t ref = 0;
+	const size_t off = dataTable(DceInfo, &th);
+	// atom_display_controller_info_v4_x: header, u32 display_caps, u32 bootup_dispclk_10khz, u16 dce_refclk_10khz
+	if (!off || th.formatRev != 4 || th.size < 14 || !readU16(off + 12, ref) || !ref)
+		return false;
+	khz = ref * 10u;
+	return true;
+}
+
 size_t AtomBios::getDisplayPaths(DisplayPath *paths, size_t maxPaths) const {
 	if (!paths || maxPaths == 0)
 		return 0;

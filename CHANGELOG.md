@@ -25,10 +25,16 @@ otherwise). The newest version is on top. How versions and branches work is in `
   kext's own link training; the second display then lights next to it as on every boot. The scanout address is
   computed (the MM hub's VRAM base plus the console's offset, as amdgpu addresses a buffer; the test requires it to
   equal the GOP's), and a pipe lit with nothing beside it leaves its VM aperture as the hardware has it, as amdgpu
-  does on a discrete card (the second pipes go on copying it from the lit pipe). Still from the GOP: the DCHUB global
-  timer (the VBIOS's asic_init sets it) and the clocks it starts from. Card (Tahoe 26.6.2, 2026-11-15): the Samsung down and back in 0.35 s, its link trained in
+  does on a discrete card (the second pipes go on copying it from the lit pipe). Still from the GOP: the clocks it starts
+  from. Card (Tahoe 26.6.2, 2026-11-15): the Samsung down and back in 0.35 s, its link trained in
   one attempt (4 lanes HBR2), 60.001 Hz; the HDMI display lit after it at 60.002 Hz; desktop up. With the computed
   address and no aperture copies (2026-11-15, two boots): the same, 60.001 and 59.998 Hz.
+- The test also stops the DCHUB global timer and starts it again as after a power loss: nothing else would, since
+  Linux only reads it on DCN 4 (and requires it running) and the VBIOS's asic_init touches no display register (it
+  waits for the PSP and the SMU). Its divider follows DC's rule from the VBIOS's display reference clock (`dce_info`,
+  100 MHz: 2, a 50 MHz hub clock), set as `dcn10_hubbub_global_timer_enable` sets it. The kext's list of VBIOS data
+  tables was one off from `dce_info` on (unused until now). Card (2026-11-15): the GOP's 0x00001002 stopped and
+  started again as 0x00001002, the Samsung lit again at 59.996 Hz, the HDMI display at 60.004 Hz.
 - The extra displays' pipe selection is held under one lock from selection through use: the hot-plug poll, macOS's
   mode switches (paravirtual host thread or NDRV) and the heads' start-up selected pipes under one another (card
   2026-11-14: a switch logged another slot's empty mode). Card (2026-11-14): six switches of the HDMI display, each

@@ -554,9 +554,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    loaded through the PSP and started as amdgpu does (`rdna4-dmubload=1`),
    and Linux's `dcn401_init_hw` from nothing (168 recorded steps) with the
    boot DP display relit from a Linux-generated table and the kext's own
-   training, its scanout address computed (`rdna4-dcninit=1`). Open: the
-   DCHUB global timer and the starting display clocks (still the VBIOS's
-   `asic_init` and the GOP's), then a real cold start; DP modes above the
+   training, its scanout address computed and the DCHUB global timer
+   started by the kext (`rdna4-dcninit=1`). Open: the starting display
+   clocks (still the GOP's), then a real cold start; DP modes above the
    boot pixel clock (retraining in the mode switch); a second DisplayPort
    display (written, not yet run on the card).
 5. **Display power management** — display sleep was verified on hardware

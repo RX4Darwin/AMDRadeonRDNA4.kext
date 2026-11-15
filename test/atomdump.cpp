@@ -798,9 +798,9 @@ static const char *tableNames[AtomBios::MaxDataTable] = {
 	"sw_datatable13", "gfx_info", "powerplayinfo", "sw_datatable16",
 	"sw_datatable17", "sw_datatable18", "sw_datatable19", "sw_datatable20",
 	"sw_datatable21", "displayobjectinfo", "indirectioaccess", "umc_info",
-	"sw_datatable24", "dce_info", "vram_info", "sw_datatable27",
+	"sw_datatable25", "sw_datatable26", "dce_info", "vram_info", "sw_datatable29",
 	"integratedsysteminfo", "asic_profiling_info", "voltageobject_info",
-	"sw_datatable32", "sw_datatable33", "sw_datatable34",
+	"sw_datatable33", "sw_datatable34",
 };
 
 // ---------------------------------------------------------------------------
@@ -5026,6 +5026,14 @@ static int testRom(const char *path) {
 		{ AtomBios::CmdDig1TransmitterControl, "dig1transmittercontrol",  false },
 		{ AtomBios::CmdProcessAuxChannel,      "processauxchanneltransaction", false },
 	};
+	uint32_t refKHz = 0;
+	if (!bios.getDceRefClock(refKHz) || refKHz != 100000) {
+		fprintf(stderr, "FAIL: dce_info's reference clock %u kHz, expected 100000 (Linux: 100 MHz expected)\n", refKHz);
+		failures++;
+	} else {
+		printf("dce_info: display reference clock %u kHz\n", refKHz);
+	}
+
 	printf("\ncommand functions (bytecode):\n");
 	for (auto &c : cmds) {
 		AtomBios::CmdTableInfo info;
@@ -5144,9 +5152,23 @@ static int testDcnInit() {
 		       reg[2][0x0511], waits, copies);
 		failures++;
 	}
+	// The global timer from stopped, for this card's 100 MHz reference: divided by 2 (50 MHz), its INIT bits kept.
+	ModeSet::Step timer[2];
+	size_t nt = 0;
+	uint32_t cntl = 0xabcd0000;
+	const bool built = DcnInit::timerSteps(100000, timer, 2, nt);
+	for (size_t i = 0; built && i < nt; i++)
+		cntl = (cntl & ~timer[i].mask) | timer[i].value;
+	if (!built || cntl != (0xabcd0000 | DcnInit::kTimerEnable | 2) || DcnInit::timerRefDiv(48000) != 1 ||
+	    DcnInit::timerRefDiv(150000) != 0) {
+		printf("FAIL dcninit: the global timer's steps leave 0x%08x (want 0x%08x), divider 1 for 48 MHz %u, none for "
+		       "150 MHz %u\n", cntl, 0xabcd0000 | DcnInit::kTimerEnable | 2, DcnInit::timerRefDiv(48000),
+		       DcnInit::timerRefDiv(150000));
+		failures++;
+	}
 	if (!failures)
-		printf("dcninit: %zu steps of Linux's dcn401_init_hw (%zu waits, %zu copies) leave what it leaves\n", n, waits,
-		       copies);
+		printf("dcninit: %zu steps of Linux's dcn401_init_hw (%zu waits, %zu copies) leave what it leaves; the global "
+		       "timer started at 50 MHz\n", n, waits, copies);
 	return failures;
 }
 

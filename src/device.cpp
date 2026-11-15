@@ -2793,6 +2793,19 @@ bool RDNA4Device::coldStart() {
 		useSlotTable();
 		return false;
 	}
+	// The DCHUB global timer, started by the kext from the VBIOS's reference clock (nothing else starts it after a
+	// power loss); on this warm card the GOP's has to be running with the divider the kext computes.
+	uint32_t refKHz = 0;
+	const uint32_t gopTimer = regReadDmu(2, DcnInit::kTimerCntl);
+	ModeSet::Step timerOn[2];
+	size_t ntimer = 0;
+	if (!atomBios.getDceRefClock(refKHz) || !DcnInit::timerSteps(refKHz, timerOn, 2, ntimer) ||
+	    !(gopTimer & DcnInit::kTimerEnable) || (gopTimer & DcnInit::kTimerRefDivMask) != DcnInit::timerRefDiv(refKHz)) {
+		FBLOG("dcninit: not run: the global timer the GOP left (0x%08x) is not the one the kext starts (reference "
+		      "%u kHz, divider %u)", gopTimer, refKHz, DcnInit::timerRefDiv(refKHz));
+		useSlotTable();
+		return false;
+	}
 	const uint8_t connector = static_cast<uint8_t>(path.connectorObjId & 0xff);
 
 	ExtraPipe boot {};
@@ -2826,6 +2839,13 @@ bool RDNA4Device::coldStart() {
 	     runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dcninit: down", otgOff(), plan->aux);
 	// 2. The firmware's timing generator stopped (on a card started from nothing it is not running).
 	ok = ok && runSteps(otgOff0, notg, nullptr, 0, "dcninit: otg off", otgOff());
+	// 2b. The global timer stopped, as after a power loss, and started by the kext.
+	if (ok)
+		regWriteDmu(2, DcnInit::kTimerCntl, gopTimer & ~DcnInit::kTimerEnable);
+	ok = ok && runSteps(timerOn, ntimer, nullptr, 0, "dcninit: timer", otgOff());
+	if (ok)
+		FBLOG("dcninit: global timer 0x%08x stopped, started again at %u kHz / %u: 0x%08x", gopTimer, refKHz,
+		      DcnInit::timerRefDiv(refKHz), regReadDmu(2, DcnInit::kTimerCntl));
 	// 3. Every pipe blanked and power gated, and the rest dcn401_init_hw does.
 	ok = ok && runSteps(init, ninit, nullptr, 0, "dcninit: init", otgOff());
 	// 4. The IP request window open, as the lighting plans require (as the GOP leaves it).
