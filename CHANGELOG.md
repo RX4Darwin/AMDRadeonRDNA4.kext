@@ -92,6 +92,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
   - A dark wake deadlocked WindowServer on the paravirtual framebuffer (`_extEntry` waiting for it to be on) until the
     watchdog panicked; it is now let through, and given its wake (`handleEvent(4)`) so its display pipe takes frames
     again ("Fallback GPU Display Pipe transaction submission failed" before).
+  - The paravirtual framebuffer joined the power tree without power states, so its display could never sleep and
+    WindowServer held back its answer to every system sleep for 30 s ("WindowServer timed out(30000 ms)"). It is now
+    given the two states a framebuffer has; the system then sleeps about 2 s after macOS's own 30 s display-off step.
   Still open: a key press brings only the dark wake (the desktop comes with the mouse); USBWakeFixup with an
   `SSDT-USBW` for this board's XH00 did not change that.
 - With a second DisplayPort display plugged in at boot the boot hangs in the compute bring-up's `smuReady` step (the

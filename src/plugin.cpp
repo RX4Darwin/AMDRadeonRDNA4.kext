@@ -1383,6 +1383,12 @@ uint8_t *fbController(IOService *fb) {
 	return priv ? *reinterpret_cast<uint8_t **>(priv) : nullptr;
 }
 
+// The paravirtual GPU's framebuffer (Apple's driver, on our nub).
+bool isParavirtFb(IOService *fb) {
+	const OSMetaClass *meta = fb ? fb->getMetaClass() : nullptr;
+	return meta && !strcmp(meta->getClassName(), "AppleParavirtFramebuffer");
+}
+
 // The controller of one of our card's IONDRVFramebuffers, or null for any other framebuffer.
 uint8_t *ourFbController(IOService *fb) {
 	return fb && fb->metaCast("IONDRVFramebuffer") && isOurDevice(fb->getProvider()) ? fbController(fb) : nullptr;
@@ -1477,10 +1483,9 @@ mach_vm_address_t orgExtEntry, fbHandleEvent;
 
 IOReturn wrapExtEntry(IOService *fb, bool system, bool allowOffline, uint32_t apiBit, const char *where) {
 	bool woken = false;
-	if (fb) {
+	if (isParavirtFb(fb)) {
 		auto *flags = reinterpret_cast<uint8_t *>(fb) + 0x199;   // the high byte of this+0x198
-		const OSMetaClass *meta = fb->getMetaClass();
-		if (!(*flags & 0x20) && meta && !strcmp(meta->getClassName(), "AppleParavirtFramebuffer")) {
+		if (!(*flags & 0x20)) {
 			__atomic_fetch_or(flags, static_cast<uint8_t>(0x20), __ATOMIC_SEQ_CST);
 			woken = true;
 		}
@@ -1504,9 +1509,36 @@ IOReturn wrapExtEntry(IOService *fb, bool system, bool allowOffline, uint32_t ap
 	return r;
 }
 
+// The paravirtual framebuffer joins the power tree (under the card's PCI device) without power states: its AppleDisplay can
+// never change its power, so WindowServer's display sleep never completes, and WindowServer holds back its answer to the
+// system sleep ("Display sleep not yet completed, defer ack of IOPM sleep") until powerd gives up after 30 s ("WindowServer
+// timed out(30000 ms)"; card, 2026-11-15). With rdna4-syssleep it is given the two states a framebuffer has, as IONDRVSupport
+// gives ours (IONDRVFramebuffer::initForPM): IOFramebuffer::setPowerState then runs its power work as for ours, and
+// AppleParavirtFramebuffer already takes the 'pwrs' attribute that work sets.
+mach_vm_address_t orgFbStart;
+
+bool wrapFbStart(IOService *fb, IOService *provider) {
+	const bool started = FunctionCast(wrapFbStart, orgFbStart)(fb, provider);
+	if (started && sysSleepLog && isParavirtFb(fb)) {
+		static IOPMPowerState states[2] = {
+			{ kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+			{ kIOPMPowerStateVersion1, kIOPMDeviceUsable | kIOPMPowerOn | kIOPMMaxPerformance, kIOPMPowerOn, kIOPMPowerOn,
+			  0, 0, 0, 0, 0, 0, 0, 0 },
+		};
+		const IOReturn r = fb->registerPowerDriver(fb, states, 2);
+		FBLOG("pvgpu: %s %llx: power states registered (0x%x): its display can sleep and wake", fb->getName(),
+		      fb->getRegistryEntryID(), r);
+	}
+	return started;
+}
+
 void processGraphics(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	if (index != kextIOGraphics.loadIndex)
 		return;
+	KernelPatcher::RouteRequest start {"__ZN13IOFramebuffer5startEP9IOService", wrapFbStart, orgFbStart};
+	if (!patcher.routeMultiple(index, &start, 1, address, size))
+		FBLOG("ndrv: IOFramebuffer::start not routed (error %d): the paravirtual display keeps a sleep waiting 30 s", patcher.getError());
+	patcher.clearError();
 	KernelPatcher::RouteRequest open {"__ZN13IOFramebuffer4openEv", wrapFbOpen, orgFbOpen};
 	if (!patcher.routeMultiple(index, &open, 1, address, size))
 		FBLOG("ndrv: IOFramebuffer::open not routed (error %d): framebuffers can lose their power work", patcher.getError());
