@@ -3184,6 +3184,15 @@ void RDNA4Device::breadcrumb(const char *step) {
 	compute->trail(text);
 }
 
+void RDNA4Device::extraAuxPadsAfterPowerLoss() {
+	if (!coldBoot || !rmmio || !Pipe2::config().dp)
+		return;
+	const uint8_t aux = xp().aux;
+	const uint32_t mask = kGpioDdcMask + 4u * aux, was = regReadDmu(2, mask);
+	ddcPadMode(aux, false);
+	FBLOG("dcninit: extra pipe %u: AUX%u pads: DDC%u_MASK 0x%08x -> 0x%08x", xp().pipe, aux, aux + 1u, was, regReadDmu(2, mask));
+}
+
 bool RDNA4Device::coldStart(uint32_t &relight) {
 	uint32_t on = 0;
 	relight = 0;

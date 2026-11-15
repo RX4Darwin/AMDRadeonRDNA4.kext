@@ -277,6 +277,9 @@ public:
 	// An NVRAM breadcrumb (the compute runtime's rdna4-trail) for a step that can hang the machine, with the timing
 	// generators running now (OTG0-3 master enables) after it: the next boot logs where the last one stopped.
 	void breadcrumb(const char *step);
+	// After a power loss, the selected DisplayPort extra pipe's DDC pads in AUX mode again before it is lit (as the cold
+	// start sets the boot display's): a reset leaves them in I2C mode, and no AUX transaction gets a reply.
+	void extraAuxPadsAfterPowerLoss();
 	// rdna4-coldprobe=1 and `sudo sysctl debug.rdna4_coldreset=1`: the card reset (mode 1) and brought back as far
 	// as Linux does before its IP blocks start (stage (b) of a real cold start). The displays go dark; reboot after.
 	bool coldReset();

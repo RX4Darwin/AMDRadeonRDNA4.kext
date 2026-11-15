@@ -94,9 +94,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
     again ("Fallback GPU Display Pipe transaction submission failed" before).
   - The paravirtual framebuffer joined the power tree without power states, so its display could never sleep and
     WindowServer held back its answer to every system sleep for 30 s ("WindowServer timed out(30000 ms)"). It is now
-    given the two states a framebuffer has; the system then sleeps about 2 s after macOS's own 30 s display-off step.
-  Still open: a key press brings only the dark wake (the desktop comes with the mouse); USBWakeFixup with an
-  `SSDT-USBW` for this board's XH00 did not change that.
+    given the two states a framebuffer has, acknowledged at once (with IOFramebuffer's power work, one of two
+    paravirtual framebuffers waited 45 s at each change); the system then sleeps about 2 s after macOS's own 30 s
+    display-off step.
+  - A second DisplayPort display after the wake: a power loss leaves its DDC pads in I2C mode, so no AUX transaction
+    got a reply and its link did not train; set to AUX mode before it is lit again, as the boot display's.
+  Card-verified 2026-11-15 with two DisplayPort displays: about 34 s from Sleep to off, both displays and the desktop
+  back about 2 s after a key press (an `SSDT-USBW` for this board in the rig's OpenCore config, on GPE 8 where the
+  key press wakes it, makes it a full wake; with USBWakeFixup).
 - Two DisplayPort displays from boot (`rdna4-head2dp=1`, card-verified 2026-11-15: Odyssey G70D at 3840x2160 and a
   Lenovo G25-10 at 1920x1080 on a second DP port, link trained at the first attempt, 60.002 Hz, desktop on both). With
   the second one plugged in at boot the boot hung in the cold start (`rdna4-dcninit=1`): taking the extra DP pipe down

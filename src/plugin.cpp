@@ -763,6 +763,7 @@ void coldStartHeads(RDNA4Device &dev) {
 		char step[48];
 		snprintf(step, sizeof(step), "cold start: head %zu lit again", h->slot + 2);
 		dev.breadcrumb(step);
+		dev.extraAuxPadsAfterPowerLoss();
 		dev.lightSecondPipe(head2Level, h->surface.physBase);
 		// A head the cold boot left dark at start (fillHead) set up as a lit one: its modes, switching and power.
 		size_t n = 0;
@@ -1519,8 +1520,8 @@ IOReturn wrapExtEntry(IOService *fb, bool system, bool allowOffline, uint32_t ap
 // never change its power, so WindowServer's display sleep never completes, and WindowServer holds back its answer to the
 // system sleep ("Display sleep not yet completed, defer ack of IOPM sleep") until powerd gives up after 30 s ("WindowServer
 // timed out(30000 ms)"; card, 2026-11-15). With rdna4-syssleep it is given the two states a framebuffer has, as IONDRVSupport
-// gives ours (IONDRVFramebuffer::initForPM): IOFramebuffer::setPowerState then runs its power work as for ours, and
-// AppleParavirtFramebuffer already takes the 'pwrs' attribute that work sets.
+// gives ours (IONDRVFramebuffer::initForPM), for its AppleDisplay to follow; its changes are acknowledged at once
+// (wrapFbSetPowerState).
 mach_vm_address_t orgFbStart;
 
 bool wrapFbStart(IOService *fb, IOService *provider) {
@@ -1538,12 +1539,27 @@ bool wrapFbStart(IOService *fb, IOService *provider) {
 	return started;
 }
 
+// Its power changes are only for its AppleDisplay to follow: acknowledged at once, without IOFramebuffer's power work (which
+// it never had before it had states). With two paravirtual displays that work never ran for one of them, and each of its
+// changes waited out the 45 s acknowledgement timeout, at boot, sleep and wake (card, 2026-11-15).
+mach_vm_address_t orgFbSetPowerState;
+
+IOReturn wrapFbSetPowerState(IOService *fb, unsigned long state, IOService *device) {
+	if (sysSleepLog && isParavirtFb(fb))
+		return kIOPMAckImplied;
+	return FunctionCast(wrapFbSetPowerState, orgFbSetPowerState)(fb, state, device);
+}
+
 void processGraphics(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
 	if (index != kextIOGraphics.loadIndex)
 		return;
-	KernelPatcher::RouteRequest start {"__ZN13IOFramebuffer5startEP9IOService", wrapFbStart, orgFbStart};
-	if (!patcher.routeMultiple(index, &start, 1, address, size))
-		FBLOG("ndrv: IOFramebuffer::start not routed (error %d): the paravirtual display keeps a sleep waiting 30 s", patcher.getError());
+	KernelPatcher::RouteRequest start[] {
+		{"__ZN13IOFramebuffer5startEP9IOService", wrapFbStart, orgFbStart},
+		{"__ZN13IOFramebuffer13setPowerStateEmP9IOService", wrapFbSetPowerState, orgFbSetPowerState},
+	};
+	if (!patcher.routeMultiple(index, start, 2, address, size))
+		FBLOG("ndrv: IOFramebuffer::start/setPowerState not routed (error %d): the paravirtual display keeps a sleep waiting 30 s",
+		      patcher.getError());
 	patcher.clearError();
 	KernelPatcher::RouteRequest open {"__ZN13IOFramebuffer4openEv", wrapFbOpen, orgFbOpen};
 	if (!patcher.routeMultiple(index, &open, 1, address, size))
