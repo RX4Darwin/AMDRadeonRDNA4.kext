@@ -117,7 +117,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-trace=1` | Log every NDRV request for our framebuffer and who answered it (`rdna4` or `boot`), up to 400 lines. On by default in `VMTEST` builds. Mode switches are always logged. |
 | `rdna4-modeset=0` | **Mode switching is on by default; `0` turns it off** (the boot mode alone is offered). On, the kext offers the sink's EDID modes (DTDs, CTA DTDs/VICs, standard and established timings; ≤ boot framebuffer size, TMDS ≤ 340 MHz or, for a sink whose EDID announces SCDC and a higher rate, ≤ 600 MHz, and ≤ 1.25 × boot pixel clock) instead of the boot mode alone. On an HDMI/DVI boot display a switch runs the mode-set engine (verified on the card 2026-10-04: 1920x1080 to 1600x900 on a 1080p HDMI sink, picture confirmed; the log line `modes: now ..., measured ... Hz` gives the refresh the OTG really runs at). On a DP boot display a switch retimes the stream and leaves the link as the firmware trained it, so only modes at or below the boot pixel clock are offered (verified on the card 2026-10-04: 3840x2160 to 2560x1440 on a 4K DP monitor over four HBR2 lanes, picture confirmed; the log shows `modes: DisplayPort, link untouched: DTO ...` and the measured refresh). Until 2026-10-06 a switch left the plane expecting the blank to end where it does in the boot mode, which cut the top of the picture off in modes whose blank ends earlier (the menu bar at 2560x1440, everything at 1280x720); the switch now sets that for the new mode, and 2560x1440, 1920x1080 and 1280x720 were confirmed whole on the 4K monitor that day. From 340 MHz up the link is HDMI 2.0 scrambled: the encoder's scrambler is switched with the mode and the monitor is told over SCDC, in both directions, so a monitor the GOP lit at 4K60 (533 MHz, scrambled) can be switched down as well. The scrambled path ran on the card 2026-10-05: a monitor the GOP lit at 3840x2160 (533 MHz) switched to 1920x1080@60, to 1920x1080@144 (333 MHz, measured 143.996 Hz) and back to 3840x2160 (`scdc: ... TMDS_CONFIG = 3 written`, measured 59.996 Hz), and showed the desktop again at 3840x2160. |
 | `rdna4-head2=0` | **A second display is on by default (level 4, below); `0` turns it off.** `1` is the experiment it grew from: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Next to `rdna4-compute` since 2026-10-06 (its surface is kept below the compute pool; ran together on the card that day). Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. **Higher values also light the pipe (`docs/second-pipe.md`; all verified on the card 2026-10-04):** `2` writes nothing and publishes what every step of the plan would do to the dormant pipe's registers (`AMDRadeonRDNA4,Pipe2`, shown by `tools/rig/diagnostic-log.sh`); `3` lights the stream alone, so the second monitor shows a solid teal-blue; `4` also lights the plane, so it shows the second desktop. There is a plan per connector of the card, all at 1920x1080@60 next to a boot display on another connector: HDMI on HPD3 / link 2 (the one verified), HDMI on HPD4 / link 3 (verified 2026-10-06), and DisplayPort on HPD1 / link 0 or HPD2 / link 1, whose link the kext trains itself (those two host-tested, not yet run on the card, and only used with `rdna4-head2dp=1`). Not in `VMTEST` builds. |
-| `rdna4-head2dp=1` | Also serve a second display on a DisplayPort connector (lighting it, sleep, hot-plug and mode switching as on HDMI). Off by default because it has not run on the card yet: `docs/todo-dptest.md` has the tests. |
+| `rdna4-head2dp=1` | Also serve a second display on a DisplayPort connector (lighting it, sleep, hot-plug and mode switching as on HDMI). Card-verified 2026-11-15 with the second DisplayPort display connected at boot: link trained by the kext at the first attempt, desktop on both displays. Still off by default: its display sleep is untested, and with the paravirtual displays one plugged in after boot is lit but gets no paravirtual display (noise). `docs/todo-dptest.md` has the tests. |
 | `rdna4-hotplug=0` | **Hot-plug of the second display is on by default (level 2); `0` turns it off, `1` only logs what the pin does.** On: The connector's HPD pin is polled; unplugging takes the head offline in macOS, plugging reads the display, lights or wakes the pipe and brings the head back, and the head exists (offline) when no monitor was there at boot. `1` only logs what the pin does. Verified on the card 2026-10-05 (`docs/second-pipe.md`), and on 2026-10-06 on the other HDMI connector and through a 10-minute display sleep. A display unplugged from one HDMI connector and plugged into the other gets the pipe moved to it (verified on the card 2026-10-06, in both directions, at 60 and at 144 Hz). |
 | `rdna4-dptrain=1` | Diagnostic for a DisplayPort boot display: log what the monitor can do and which link the firmware trained, watch its HPD pin, and log the link's state when the monitor comes back. The kext does not retrain that link, because the firmware keeps it itself (card, 2026-10-06: it retrains within two seconds of the pin returning). `2` also runs the kext's own training on that link once, 15 s after the desktop is up (`src/dptrain.cpp`, as amdgpu trains): on the card that day, 4 lanes at HBR2 trained and the video was back 0.57 s after the link was taken down. |
 | `rdna4-cursor=1` | Hardware cursor on the boot display through the NDRV cursor calls (`src/cursor.cpp`, `docs/cursor-audit.md`, `docs/HANDOFF-linux.md`); used with `rdna4-vbl=1`. Off by default. Ran on the test rig 2026-10-06 on the 4K DisplayPort boot display next to the second display, through mode switches, without a fault in the log; it made no noticeable difference to how responsive the unaccelerated desktop feels. |
@@ -140,10 +140,10 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-dpdual-khz=<kHz>` | The TMDS clock a passive DP++ adapter is taken to carry, in place of what its ID block says. |
 | `rdna4-wakediff=1` | After a display wake, compare the registers with what lighting the pipe left in them (`src/regsnap.cpp`): a wake that leaves the display dark differs somewhere. |
 | `rdna4-dmubload=1` | The display microcontroller on the kext's own firmware (`dcn_4_0_1_dmcub.bin`, loaded through the PSP after the compute bring-up's PSP stage) instead of the GOP's. |
-| `rdna4-dcninit=1` | The cold-start test on a warm card: once the SMU runs, the extra displays and the DisplayPort boot display (pipe 0 at 3840x2160) are taken down, Linux's `dcn401_init_hw` runs from nothing, the kext starts the DCHUB timer, and the pipes are lit again from Linux-generated tables. |
+| `rdna4-dcninit=1` | The cold-start test on a warm card: once the SMU runs, the extra displays and the DisplayPort boot display (pipe 0 at 3840x2160) are taken down, Linux's `dcn401_init_hw` runs from nothing, the kext starts the DCHUB timer, and the pipes are lit again from Linux-generated tables. Left out on a warm card with a lit DisplayPort extra pipe (its recorded sleep sequence hung the card); after a power loss such a pipe is only lit again. |
 | `rdna4-coldboot=1` | A real cold start: once the kext has read what the GOP left (pipes, EDIDs, boot link, scanout address, DCHUB timer), the card is reset (mode 1, as Linux resets it on this SMU) and the displays are lit from nothing once the SMU runs. Wants `rdna4-compute` at stage 3 or more and `rdna4-dmubload=1`. |
 | `rdna4-coldprobe=1` | Log what a mode-1 reset depends on (the PSP and SMU mailboxes, the registers `asic_init` touches, the PCI config space and Resizable BAR), and add `sudo sysctl debug.rdna4_coldreset=1`, the reset alone at run time (the card comes back; the GPU work running then hangs the machine later). |
-| `rdna4-syssleep=1` | System sleep allowed (IONDRVFramebuffer otherwise refuses it for any framebuffer on IOBootNDRV): the card's PCI state is logged at sleep and wake, the runtime quiesced at sleep, and brought up again with both displays lit once the card has powered on again. The desktop stays black after the wake for now (the paravirtual GPU's host), and each framebuffer power change waits 45 s. |
+| `rdna4-syssleep=1` | System sleep (IONDRVFramebuffer otherwise refuses it for any framebuffer on IOBootNDRV): the runtime and the paravirtual GPU's host give back what the card holds at sleep (writing back what lives only in VRAM), and the wake brings the runtime up again with both displays lit from nothing. With it IOGraphics' power work runs right for our framebuffers and for the paravirtual one (`src/plugin.cpp`: framebuffer slots, controller state, the dark wake, the paravirtual display's power states). Card-verified 2026-11-15: about 30 s from Sleep to off (macOS's own display-off step), the desktop back within seconds of the wake. On this board a key press brings only a dark wake: the desktop comes with the mouse. |
 | `rdna4-pm=1` | The compute service joins the power tree and suspends and resumes the runtime itself. Stalls a real system sleep: not with `rdna4-syssleep=1`. |
 | `rdna4-sleeptest=1`, `rdna4-quiesce-test=1`, `rdna4-resume-tests=1`, `rdna4-sleepabort=0` | Power tests and their controls: the runtime's own sleep/wake cycle without a system sleep (`rdna4-run sleeptest`), the shutdown quiesce at boot, the bring-up tests again after a wake; `rdna4-sleepabort=0` lets client waits run on through a sleep request. |
 | `rdna4-clocks=1` | Log the DPM levels of the display and memory clocks the power-management firmware offers. |
@@ -523,23 +523,39 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    - ~~DisplayPort modes above the boot pixel clock, with Linux's request
      timing for each (2026-11-15: 2560x1440@144, 604 MHz, above the 533 MHz
      boot mode)~~
-   - **On hold:** a second DisplayPort display (its link training is
-     written, not yet run on the card): needs a second DisplayPort cable.
-   - Open: the cold start after a real power loss (system sleep, which macOS
-     refuses on this rig); DisplayPort modes that need a faster link than the
-     GOP trained, or DSC (3840x2160 at 120 and 144 Hz).
-5. **Display power management** — display sleep was verified on hardware
-   with the standalone build (DP: video stream off + sink D3 over native-AUX
-   DPCD `SET_POWER`; HDMI: OPP pattern generator blank). It now runs from
-   `cscSetSync` (DPMS), verified on hardware 2026-10-05 for the DP boot
-   display and for the HDMI second pipe, which sleeps the way amdgpu does
-   DPMS off (stream encoder and transmitter down, `docs/second-pipe.md`).
-   An HDMI boot display does the same unless `rdna4-modeset=0`
-   (`ModeSet::buildSleep`, then a mode set to the running timing to wake;
-   verified on hardware 2026-10-06 at 3840x2160, 533 MHz) and is blanked
-   without it.
-   System sleep stays vetoed (as `IOBootNDRV` does): after GPU power loss the
-   display pipe cannot be lit again until it can be lit from nothing (step 4).
+   - ~~A second DisplayPort display (2026-11-15, `rdna4-head2dp=1`): connected
+     at boot, its link trained by the kext at the first attempt, the desktop
+     on both DisplayPort displays; plugged in later, lit as well~~
+   - ~~The cold start after a real power loss (2026-11-15): after system
+     sleep both displays are lit from nothing (step 5)~~
+   - Open: a DisplayPort extra pipe's own sleep sequence (the recorded table
+     hung the card in the cold start, which now leaves such a pipe alone);
+     with the paravirtual displays, a display plugged in after boot gets no
+     paravirtual display (they are counted at boot); DisplayPort modes that
+     need a faster link than the GOP trained, or DSC (3840x2160 at 120 and
+     144 Hz).
+5. **Display power management** — done on the card, but for the items below
+   the struck ones.
+   - ~~Display sleep (DPMS through `cscSetSync`, 2026-10-05/06): DP video
+     stream off and sink D3 over native-AUX `SET_POWER`; the HDMI second pipe
+     as amdgpu does DPMS off (`docs/second-pipe.md`); an HDMI boot display
+     through `ModeSet::buildSleep` and a mode set to wake~~
+   - ~~System sleep (`rdna4-syssleep=1`, 2026-11-15): macOS no longer refuses
+     it; the runtime quiesced while the card has power, the paravirtual GPU's
+     host writing back what lives only in VRAM; after the wake the card brought
+     up from nothing (PSP, SMU, DMUB, clocks, cold start) with both displays
+     lit and the desktop back~~
+   - ~~IOGraphics' own power work (2026-11-15, `src/plugin.cpp`): every
+     framebuffer in its controller's table (the expander's wrappers on this
+     board left gaps: 45 s per framebuffer at boot, sleep and wake), the
+     controller's state recomputed for framebuffers without a WindowServer
+     port (a 90 s wait before every sleep), no deadlock in a dark wake, and
+     power states for the paravirtual display (a 30 s WindowServer wait)~~
+   - Open: a key press wakes this board only to a dark wake (through the GPU
+     port's GPE 8; USBWakeFixup with an `SSDT-USBW` for the keyboard's
+     controller did not change it), so the desktop comes with the mouse;
+     sleep with two DisplayPort displays; `rdna4-syssleep` is not the default
+     yet.
 6. **Power / clocks** — done on the card, but for the items below the
    struck ones.
    - ~~SMU firmware handshake: the power-management firmware loaded through
@@ -588,6 +604,8 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       deasserted, RAM out of light sleep, DDC clock enabled — before
       arbitration is requested)
 - [x] Display sleep verified on hardware with the standalone build
+- [x] System sleep and wake with the desktop back (`rdna4-syssleep=1`,
+      verified on hardware 2026-11-15, Tahoe 26.6.2)
 - [x] Plugin build verified on hardware (RX 9070 XT, Tahoe 26.6 recovery, 2026-09-27)
 - [x] **Compute written from scratch, running on the real card** (2026-09-28,
       `docs/hw-logs/2026-09-28-recovery-stage7-runtime-pass.txt`): PSP secure OS
@@ -661,10 +679,11 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       second display on either HDMI connector, mode switching on both
       displays, hot-plug of the second. `rdna4-head2=0`,
       `rdna4-modeset=0` and `rdna4-hotplug=0` turn them off. A second
-      display on DisplayPort stays behind `rdna4-head2dp=1` until it
-      has run on the card.
-- [ ] DisplayPort link training, for a second DisplayPort display and
-      for a boot display that was unplugged. First part done on the
+      display on DisplayPort stays behind `rdna4-head2dp=1` (it ran on
+      the card 2026-11-15; its display sleep has not).
+- [x] DisplayPort link training, for a second DisplayPort display and
+      for a boot display that was unplugged (the second display's trained
+      at the first attempt on the card, 2026-11-15). First part done on the
       host: `src/dptrain.cpp` trains a link through callbacks and
       `make test` holds its DPCD transfers, patterns, lane drive and
       delays against Linux's own code run on ten simulated monitors
@@ -675,10 +694,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       2026-10-06), so `rdna4-dptrain` only watches, and `=2` runs the
       kext's training once as a test. That training completed on the
       card 2026-10-06 (4 lanes at HBR2, all lanes locked), and the
-      video was back 0.57 s after the link was taken down. The second
-      DisplayPort display itself needs a second cable to try:
-      `docs/todo-dptest.md` has the tests still to run. Third part written, not yet run on the card:
-      a second DisplayPort display (`rdna4-head2=4`), lit from tables
+      video was back 0.57 s after the link was taken down. Third part, run
+      on the card 2026-11-15: a second DisplayPort display (`rdna4-head2=4`
+      with `rdna4-head2dp=1`), lit from tables
       generated like the HDMI ones (`src/pipe2_linux_dp1.inc`,
       `_dp2.inc`) whose training step runs `src/dptrain.cpp` on the
       smallest link of the monitor's that carries the mode. With
