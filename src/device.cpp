@@ -18,6 +18,8 @@
 #include "dcninit.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/clock.h>
 #include <sys/sysctl.h>
 
@@ -2246,19 +2248,31 @@ void RDNA4Device::coldProbe() {
 	      ip(IpDiscovery::HwMp1, 1, 0x75), ip(IpDiscovery::HwMp1, 1, 0x76), ip(IpDiscovery::HwMp1, 1, 0x8b));
 	FBLOG("cold: asic_init's registers: [0x0006] 0x%08x [0x004c] 0x%08x [0x004e] 0x%08x [0x0050] 0x%08x "
 	      "[0x0053] 0x%08x [0x0de3] 0x%08x", mm(0x0006), mm(0x004c), mm(0x004e), mm(0x0050), mm(0x0053), mm(0x0de3));
+	logPciState("probe");
+}
+
+void RDNA4Device::logPciState(const char *when) {
+	if (rmmio && ipDiscovery.isValid()) {
+		uint32_t off = 0;
+		auto ip = [&](uint16_t hw, uint8_t seg, uint32_t dword) {
+			return ipDiscovery.regByteOffset(hw, 0, seg, dword, off) && off + 4 <= rmmioSize ? rmmio[off / 4] : 0xdeadbeefu;
+		};
+		FBLOG("cold: %s: mmio: VRAM size 0x%08x, C2PMSG_35 0x%08x (bootloader), C2PMSG_81 0x%08x (sOS)", when,
+		      ip(IpDiscovery::HwNbif, 2, 0x00c3), ip(IpDiscovery::HwMp0, 0, 0x63), ip(IpDiscovery::HwMp0, 0, 0x91));
+	}
 	if (!pciDevice)
 		return;
 	uint32_t cfg[16];
 	for (uint32_t i = 0; i < 16; i++)
 		cfg[i] = pciDevice->configRead32(static_cast<uint8_t>(i * 4));
-	FBLOG("cold: pci 00-1c: %08x %08x %08x %08x %08x %08x %08x %08x", cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5],
+	FBLOG("cold: %s: pci 00-1c: %08x %08x %08x %08x %08x %08x %08x %08x", when, cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5],
 	      cfg[6], cfg[7]);
-	FBLOG("cold: pci 20-3c: %08x %08x %08x %08x %08x %08x %08x %08x", cfg[8], cfg[9], cfg[10], cfg[11], cfg[12],
+	FBLOG("cold: %s: pci 20-3c: %08x %08x %08x %08x %08x %08x %08x %08x", when, cfg[8], cfg[9], cfg[10], cfg[11], cfg[12],
 	      cfg[13], cfg[14], cfg[15]);
 	IOByteCount pcie = 0, rebar = 0;
 	if (pciDevice->extendedFindPCICapability(0x10, &pcie) && pcie)   // PCI Express: device and link control/status
-		FBLOG("cold: pcie cap@0x%x: devctl/sta 0x%08x linkcap 0x%08x linkctl/sta 0x%08x devctl2 0x%08x linkctl2 "
-		      "0x%08x", static_cast<uint32_t>(pcie), pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x08)),
+		FBLOG("cold: %s: pcie cap@0x%x: devctl/sta 0x%08x linkcap 0x%08x linkctl/sta 0x%08x devctl2 0x%08x linkctl2 "
+		      "0x%08x", when, static_cast<uint32_t>(pcie), pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x08)),
 		      pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x0c)),
 		      pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x10)),
 		      pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x28)),
@@ -2270,9 +2284,38 @@ void RDNA4Device::coldProbe() {
 			               ctl = pciDevice->extendedConfigRead32(rebar + 8 + 8 * i);
 			if (i && !(cap | ctl))
 				break;
-			FBLOG("cold: rebar cap@0x%x entry %u: cap 0x%08x ctl 0x%08x (BAR %u, size 2^%u MiB)",
-			      static_cast<uint32_t>(rebar), i, cap, ctl, ctl & 7, (ctl >> 8) & 0x3f);
+			FBLOG("cold: %s: rebar cap@0x%x entry %u: cap 0x%08x ctl 0x%08x (BAR %u, size 2^%u MiB)",
+			      when, static_cast<uint32_t>(rebar), i, cap, ctl, ctl & 7, (ctl >> 8) & 0x3f);
 		}
+	// PCI power management (capability 0x01): PMCSR bits 1:0 are the D state.
+	IOByteCount pm = 0;
+	if (pciDevice->extendedFindPCICapability(0x01, &pm) && pm) {
+		const uint32_t pmcsr = pciDevice->configRead32(static_cast<uint8_t>(pm + 4));
+		FBLOG("cold: %s: pm cap@0x%x: PMCSR 0x%08x (D%u)", when, static_cast<uint32_t>(pm), pmcsr, pmcsr & 3);
+	}
+	// The card's own PCIe switch: its downstream port above the GPU, and the upstream port above that.
+	IOService *up = pciDevice;
+	for (int level = 1; level <= 2; level++) {
+		IOService *bridge = up->getProvider();
+		auto *dev = bridge ? OSDynamicCast(IOPCIDevice, bridge->getProvider()) : nullptr;
+		if (!dev)
+			break;
+		FBLOG("cold: %s: bridge %d (%s): id %08x command/status %08x buses %08x memory %08x prefetch %08x %08x %08x",
+		      when, level, dev->getName(), dev->configRead32(0x00), dev->configRead32(0x04), dev->configRead32(0x18),
+		      dev->configRead32(0x20), dev->configRead32(0x24), dev->configRead32(0x28), dev->configRead32(0x2c));
+		up = dev;
+	}
+}
+
+IOReturn RDNA4Device::sleepWakeMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {
+	auto *dev = static_cast<RDNA4Device *>(target);
+	if (type == kIOMessageSystemWillSleep)
+		dev->logPciState("before sleep");
+	else if (type == kIOMessageSystemWillPowerOn)
+		dev->logPciState("waking");
+	else if (type == kIOMessageSystemHasPoweredOn)
+		dev->logPciState("woken");
+	return kIOReturnSuccess;
 }
 
 
@@ -2526,6 +2569,13 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 		FBLOG("cold: boot: %s (the GOP's scanout 0x%llx, timer 0x%08x)",
 		      coldBoot ? "the card reset; the displays light once the SMU runs" : "the reset FAILED: as a warm boot",
 		      coldGopSurface, coldGopTimer);
+	}
+	uint32_t sysSleep = 0;
+	if (PE_parse_boot_argn("rdna4-syssleep", &sysSleep, sizeof(sysSleep)) && sysSleep && !sleepWakeNotifier) {
+		if (IOPMrootDomain *root = IOService::getPMRootDomain())
+			sleepWakeNotifier = root->registerInterest(gIOPriorityPowerStateInterest, sleepWakeMessage, this, nullptr);
+		FBLOG("cold: the card's PCI state is logged at sleep and wake: %s", sleepWakeNotifier ? "registered" : "NOT registered");
+		logPciState("boot");
 	}
 	FBLOG("init: device ready (%ux%u console, %lu mode(s))", fbWidth, fbHeight,
 	      static_cast<unsigned long>(modeCount));

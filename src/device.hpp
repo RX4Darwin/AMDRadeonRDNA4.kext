@@ -369,6 +369,12 @@ private:
 	void tryForce8bpc();
 	void probeMemSize();
 	void coldProbe();   // rdna4-coldprobe=1: what a mode-1 reset and asic_init depend on, read only
+	// The card's PCI config space (and its PCIe link, power state, Resizable BAR), the two bridges of its own PCIe
+	// switch above it, and three registers over MMIO: what a reset or a sleep leaves (`when` names the moment).
+	void logPciState(const char *when);
+	// rdna4-syssleep=1: logPciState at the system's sleep and wake (roadmap item 5, stage 2).
+	IONotifier *sleepWakeNotifier { nullptr };
+	static IOReturn sleepWakeMessage(void *target, void *ref, UInt32 type, IOService *provider, void *arg, vm_size_t size);
 	void dumpDCN();
 
 	// DP AUX software engine and DC_I2C hardware engine (EDID).
