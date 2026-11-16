@@ -2632,8 +2632,7 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 		      coldBoot ? "the card reset; the displays light once the SMU runs" : "the reset FAILED: as a warm boot",
 		      coldGopSurface, coldGopTimer);
 	}
-	uint32_t sysSleep = 0;
-	if (PE_parse_boot_argn("rdna4-syssleep", &sysSleep, sizeof(sysSleep)) && sysSleep && !sleepWakeNotifier) {
+	if (systemSleepWanted() && !sleepWakeNotifier) {
 		if (rmmio && pipe.valid() && !coldBoot)   // what a cold start after the wake compares against
 			captureGopState();
 		if (IOPMrootDomain *root = IOService::getPMRootDomain())
@@ -3171,6 +3170,17 @@ void RDNA4Device::takeExtraDown() {
 			FBLOG("dcninit: extra pipe %u's link %u did not go off cleanly", c.pipe, c.link);
 	}
 	xp().lit = xp().on = false;
+}
+
+bool RDNA4Device::systemSleepWanted() {
+	// On since 2026-11-15: system sleep and wake ran on the card with one and with two displays, the desktop back each time.
+#ifdef AMDRadeonRDNA4_VM_TEST
+	uint32_t on = 0;
+#else
+	uint32_t on = 1;
+#endif
+	PE_parse_boot_argn("rdna4-syssleep", &on, sizeof(on));
+	return on != 0;
 }
 
 void RDNA4Device::breadcrumb(const char *step) {

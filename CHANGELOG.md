@@ -55,6 +55,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
   `rdna4-pvfast=1` gives the paravirtual displays the fastest refresh of each size for the boot display (macOS
   picks a size there, not a refresh). Card (2026-11-15, the Samsung booted by the GOP at 3840x2160@30, 297 MHz):
   2560x1440@120 (497.75 MHz) measured 120.003 Hz, then 3840x2160@60 (533.25 MHz) measured 59.994 Hz.
+- System sleep is on by default (2026-11-15): `rdna4-syssleep=0` turns it off (macOS then refuses it, as before);
+  off in VM test builds. It ran on the card with one and with two displays, the desktop back each time
+  (`RDNA4Device::systemSleepWanted`, read by the device's sleep notifiers and the plugin's power routes).
 - System sleep (`rdna4-syssleep=1`, roadmap item 5, stage 1): IONDRVFramebuffer refuses it for any framebuffer on
   IOBootNDRV, which ours always are (its `initForPM` sets `kIOPMPreventSystemSleep` in the power states it registers;
   IONDRVSupport of Tahoe 26.6.2, disassembled). The kext routes `IOService::registerPowerDriver` and takes that flag

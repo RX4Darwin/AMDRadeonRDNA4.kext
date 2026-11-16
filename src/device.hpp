@@ -277,6 +277,8 @@ public:
 	// An NVRAM breadcrumb (the compute runtime's rdna4-trail) for a step that can hang the machine, with the timing
 	// generators running now (OTG0-3 master enables) after it: the next boot logs where the last one stopped.
 	void breadcrumb(const char *step);
+	// rdna4-syssleep: system sleep with the card (on unless =0; not in VM test builds, which have no card to sleep).
+	static bool systemSleepWanted();
 	// After a power loss, the selected DisplayPort extra pipe's DDC pads in AUX mode again before it is lit (as the cold
 	// start sets the boot display's): a reset leaves them in I2C mode, and no AUX transaction gets a reply.
 	void extraAuxPadsAfterPowerLoss();

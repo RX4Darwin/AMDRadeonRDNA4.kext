@@ -1799,8 +1799,7 @@ void pluginStart() {
 #endif
 	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
 		gPatcher = &patcher;
-		uint32_t sysSleep = 0;
-		if (PE_parse_boot_argn("rdna4-syssleep", &sysSleep, sizeof(sysSleep)) && sysSleep) {
+		if (RDNA4Device::systemSleepWanted()) {
 			KernelPatcher::RouteRequest power {
 				"__ZN9IOService19registerPowerDriverEPS_P14IOPMPowerStatem", wrapRegisterPowerDriver,
 				orgRegisterPowerDriver,
