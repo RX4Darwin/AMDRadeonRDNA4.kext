@@ -2205,6 +2205,20 @@ void RDNA4Device::tryForce8bpc() {
 }
 
 namespace {
+RDNA4Device *gSleepTestDev;   // the device debug.rdna4_head2sleep acts on
+
+int head2SleepSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = 0;
+	const int err = sysctl_handle_int(oidp, &value, 0, req);
+	if (err || !req->newptr)
+		return err;
+	if ((value == 1 || value == 2) && gSleepTestDev)
+		gSleepTestDev->head2SleepTest(value);
+	return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_head2sleep, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, head2SleepSysctl, "I",
+	    "AMDRadeonRDNA4: 1 puts the second display's pipe to sleep, 2 wakes it, each register step a breadcrumb");
+
 RDNA4Device *gColdDev;   // the device debug.rdna4_coldreset acts on (rdna4-coldprobe=1)
 
 int coldResetSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
@@ -2632,6 +2646,10 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 		      coldBoot ? "the card reset; the displays light once the SMU runs" : "the reset FAILED: as a warm boot",
 		      coldGopSurface, coldGopTimer);
 	}
+	if (!gSleepTestDev && rmmio) {
+		gSleepTestDev = this;
+		sysctl_register_oid(&sysctl__debug_rdna4_head2sleep);
+	}
 	if (systemSleepWanted() && !sleepWakeNotifier) {
 		if (rmmio && pipe.valid() && !coldBoot)   // what a cold start after the wake compares against
 			captureGopState();
@@ -2858,6 +2876,17 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
                            size_t ncmds, const char *tag, uint32_t otgOffset, const Pipe2::AuxWrite *aux) {
 	for (size_t i = 0; i < count; i++) {
 		const ModeSet::Step &s = steps[i];
+		if (stepTrail) {
+			// The boot pipe runs: its OTG0 control register reads 0xffffffff only when the card no longer answers,
+			// and the next accesses can hang the machine. Checked after each step (below), 5 ms on (a DMUB command acts
+			// after it was posted); each step logged and left as a breadcrumb first.
+			char text[96];
+			snprintf(text, sizeof(text), "%s step %lu: %.48s", stepTrail, static_cast<unsigned long>(i), s.what ? s.what : "?");
+			breadcrumb(text);
+			FBLOG("%s: step %lu op %u seg %u dword 0x%04x mask 0x%08x value 0x%08x arg %u: %s", stepTrail,
+			      static_cast<unsigned long>(i), static_cast<unsigned>(s.op), s.seg, s.dword, s.mask, s.value, s.arg,
+			      s.what ? s.what : "?");
+		}
 		switch (s.op) {
 		case ModeSet::Op::Write:
 			regWriteDmu(s.seg, s.dword, s.value);
@@ -2907,6 +2936,9 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 			break;
 		}
 		case ModeSet::Op::Dmub:
+			if (stepTrail && s.arg < ncmds)
+				FBLOG("%s: step %lu dmub %08x %08x %08x %08x %08x %08x", stepTrail, static_cast<unsigned long>(i),
+				      cmds[s.arg][0], cmds[s.arg][1], cmds[s.arg][2], cmds[s.arg][3], cmds[s.arg][4], cmds[s.arg][5]);
 			if (s.arg >= ncmds || !dmubSubmit(&cmds[s.arg], 1, tag)) {
 				FBLOG("%s: step %lu (%s): DMUB did not take the command", tag,
 				      static_cast<unsigned long>(i), s.what);
@@ -2932,6 +2964,17 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 				return false;
 			}
 			break;
+		}
+		if (stepTrail) {
+			IODelay(5000);
+			if (regReadDmu(2, Pipe::Reg::kOtgControl) == 0xFFFFFFFF) {
+				char text[96];
+				snprintf(text, sizeof(text), "%s: the card stopped answering after step %lu", stepTrail,
+				         static_cast<unsigned long>(i));
+				breadcrumb(text);
+				FBLOG("%s: %s (%s); stopped", tag, text, s.what ? s.what : "?");
+				return false;
+			}
 		}
 	}
 	return true;
@@ -3168,6 +3211,14 @@ void RDNA4Device::takeExtraDown() {
 		};
 		if (!runSteps(off, 2, &cmd, 1, "dcninit: extra off", c.pipe * Pipe::Reg::kOtgStride))
 			FBLOG("dcninit: extra pipe %u's link %u did not go off cleanly", c.pipe, c.link);
+	} else if (c.dp) {
+		// DisplayPort: the link encoder off too (lighting requires it), the transmitter left on (pipe2.cpp 'O': its
+		// disable stopped the card on link 1; lighting enables a transmitter that is on, card-verified).
+		const ModeSet::Step off[] = {
+			{ ModeSet::Op::Update, 2, false, Pipe::Reg::kDigBeEnCntl + c.link * Pipe::Reg::kDigStride, 0x1, 0x0, 0,
+			  "DIG_BE_ENABLE: the link encoder off" },
+		};
+		(void)runSteps(off, 1, nullptr, 0, "dcninit: extra off", c.pipe * Pipe::Reg::kOtgStride);
 	}
 	xp().lit = xp().on = false;
 }
@@ -3181,6 +3232,27 @@ bool RDNA4Device::systemSleepWanted() {
 #endif
 	PE_parse_boot_argn("rdna4-syssleep", &on, sizeof(on));
 	return on != 0;
+}
+
+void RDNA4Device::head2SleepTest(int what) {
+	ExtraHold hold(*this);
+	selectExtra(0);
+	useSlotTable();
+	const Pipe2::Config &c = Pipe2::config();
+	FBLOG("head2sleep: %s the second display's pipe %u (%s, lit %d, on %d)", what == 2 ? "waking" : "putting to sleep",
+	      xp().pipe, c.dp ? "DisplayPort" : "HDMI", xp().lit, xp().on);
+	if (!xp().lit)
+		return;
+	stepTrail = what == 2 ? "head2sleep: wake" : "head2sleep: sleep";
+	setSecondPipePower(what == 2);
+	stepTrail = nullptr;
+	// A clean end in the trail ("stopped ..."): a breadcrumb left there would make the next boot think this one hung
+	// and skip its bring-up (no desktop).
+	char text[64];
+	snprintf(text, sizeof(text), "stopped: head2sleep %s done, on %d", what == 2 ? "wake" : "sleep", xp().on);
+	if (compute)
+		compute->trail(text);
+	FBLOG("%s", text);
 }
 
 void RDNA4Device::breadcrumb(const char *step) {
@@ -3258,28 +3330,15 @@ bool RDNA4Device::coldStart(uint32_t &relight) {
 	}
 	const uint8_t connector = static_cast<uint8_t>(path.connectorObjId & 0xff);
 
-	// A lit DisplayPort extra pipe on a warm card: its sleep sequence (the recorded DP table) has not run on the card before
-	// and hung it here (card, 2026-11-15: the next register access hung the machine, with a second DP display at boot): the
-	// cold start is left out, as for its other preconditions; the boot display keeps the GOP's set-up.
-	for (size_t i = 0; i < kMaxExtra && !coldBoot; i++) {
-		selectExtra(i);
-		useSlotTable();
-		if (xp().lit && Pipe2::config().dp) {
-			FBLOG("dcninit: not run: extra pipe %u is a lit DisplayPort one (its sleep sequence is untested on the card)", xp().pipe);
-			selectExtra(0);
-			useSlotTable();
-			return false;
-		}
-	}
 	// 0. The lit extra pipes taken down (the init blanks and gates every pipe), lit again after. After a power loss a
-	// DisplayPort one has nothing left running: only marked dark (its untested sleep sequence is not run on it).
+	// DisplayPort one has nothing left running: only marked dark.
 	breadcrumb("cold start: extra pipes down");
 	for (size_t i = 0; i < kMaxExtra; i++) {
 		selectExtra(i);
 		useSlotTable();
 		if (!xp().lit)
 			continue;
-		if (Pipe2::config().dp)
+		if (Pipe2::config().dp && coldBoot)
 			xp().lit = xp().on = false;
 		else
 			takeExtraDown();

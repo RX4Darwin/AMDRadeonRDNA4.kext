@@ -279,6 +279,11 @@ public:
 	void breadcrumb(const char *step);
 	// rdna4-syssleep: system sleep with the card (on unless =0; not in VM test builds, which have no card to sleep).
 	static bool systemSleepWanted();
+	// debug.rdna4_head2sleep: 1 puts the second display's pipe to sleep (setSecondPipePower(false)), 2 wakes it, with an
+	// NVRAM breadcrumb before each register step and a stop when the card no longer answers (OTG0 reads 0xffffffff):
+	// the test of a DisplayPort extra pipe's sleep sequence, which hung the card in the cold start (2026-11-15).
+	void head2SleepTest(int what);
+	const char *stepTrail { nullptr };   // set while head2SleepTest runs: runSteps' per-step breadcrumbs
 	// After a power loss, the selected DisplayPort extra pipe's DDC pads in AUX mode again before it is lit (as the cold
 	// start sets the boot display's): a reset leaves them in I2C mode, and no AUX transaction gets a reply.
 	void extraAuxPadsAfterPowerLoss();

@@ -588,6 +588,14 @@ bool build(const Target &t, Plan &out, const char **why) {
 			ok = step(ModeSet::Op::Update, g, g.mask, ModeSet::dpVidM(khz, DpTrain::symbolClockKHz(t.linkRate)), 0);
 			break;
 		case 'O':
+			// ponytail: left out on a DisplayPort link other than 0: there DMUB's transmitter disable (Linux's own
+			// step, dcn10_link_encoder_disable_output) stopped the whole card a fraction of a second after it ran
+			// (card, 2026-11-15, link 1: every register 0xffffffff, then a hard hang; the same command on link 0 is
+			// fine). The rest of the sleep (stream blanked, sink in D3, encoder and its symbol clock off) runs, and the
+			// wake trains the link again on a transmitter that was left on (card-verified). Cause unknown: find it if
+			// the PHY must really go off.
+			if (c.dp && c.link != 0)
+				break;
 			if (Dmub::Cmd *cmd = dmub(g))
 				DpPhy::buildDisable(*cmd, c.link, c.hpd, t.connectorObjId);
 			else

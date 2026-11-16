@@ -2031,7 +2031,9 @@ static int testPipe2Table() {
 		regs.run(dpms);
 		const size_t sleepSteps = dpms.count;
 		failures += check(slept && dpms.naux == 1 && dpms.aux[0].address == 0x600 && dpms.aux[0].len == 1 &&
-		                  dpms.aux[0].data[0] == 0x02 && dpms.ncmds == 1 && memcmp(dpms.cmds[0], off, sizeof(off)) == 0 &&
+		                  dpms.aux[0].data[0] == 0x02 &&
+		                  // the transmitter disable only on link 0 (pipe2.cpp 'O': on link 1 it stopped the card)
+		                  (c.link != 0 ? dpms.ncmds == 0 : dpms.ncmds == 1 && memcmp(dpms.cmds[0], off, sizeof(off)) == 0) &&
 		                  count(dpms, ModeSet::Op::Train) == 0 && (regs.get(2, kFeEn) & 1) == 0 &&
 		                  (regs.get(2, kOtgCtl) & 1) == 1 && regs.get(2, kSurfLo) == lit.get(2, kSurfLo),
 		                  "pipe2: DisplayPort sleep: %s, %zu AUX writes, %zu DMUB commands, DIG FE %08x",

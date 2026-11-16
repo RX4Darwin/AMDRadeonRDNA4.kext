@@ -112,7 +112,15 @@ otherwise). The newest version is on top. How versions and branches work is in `
   boot with a lit DP extra pipe now leaves the cold start out (the boot display keeps the GOP's set-up); after a power
   loss such a pipe is only marked dark and lit again. Found with NVRAM breadcrumbs through `smuReady` and the cold
   start (`RDNA4Device::breadcrumb`, with the running timing generators), read back from Windows when macOS would not
-  boot. A DP extra pipe's own sleep (its display sleep, the cold start's take-down) is still untested.
+  boot.
+- A second DisplayPort display's own sleep (2026-11-16): DMUB's transmitter disable for link 1 stopped the whole card a
+  fraction of a second after it ran (every register 0xffffffff, then a hard hang; the same command on link 0 is fine).
+  It is left out on DisplayPort links other than 0 (`src/pipe2.cpp`, cause unknown): the rest of the sleep runs (stream
+  blanked, sink in D3, stream encoder and its symbol clock off) and the wake trains the link again on the transmitter
+  that was left on. The cold start now takes such a pipe down too (with its link encoder off) instead of leaving the
+  cold start out. Found with `debug.rdna4_head2sleep` (1 sleeps the second display's pipe, 2 wakes it, each register
+  step logged and left as an NVRAM breadcrumb, the run stopped when the card no longer answers). Card-verified: both
+  DisplayPort displays through the cold start at boot, the second's sleep and wake.
 - A real cold start (`rdna4-coldboot=1`): at boot, once the kext has read what the GOP left (the pipes, EDIDs, the
   boot link, the scanout address, the DCHUB timer), the card is reset as Linux resets it on this SMU (mode 1 through
   the SMU's debug mailbox, `amdgpu_device_mode1_reset`), its PCI config space (BARs, Resizable BAR) restored and the
