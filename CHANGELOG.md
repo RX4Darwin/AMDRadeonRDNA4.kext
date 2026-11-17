@@ -174,6 +174,15 @@ otherwise). The newest version is on top. How versions and branches work is in `
   textured cubes in a window). Card (Tahoe 26.6.2, 2026-11-17): `cube` passes with the same pixels as Apple's GPU, `spin`
   runs at 60 frames a second (1920x1200), `mtlprobe all` passes but for `blendx` (the blend colour's green, 32 for 64:
   not from this change, its shaders keep no array; it passed in 2026-10).
+- WebGL in Safari (`rdna4-pvmac2=1`, off by default): Tahoe x86's AppleParavirtGPUMetal reports feature profile 0x2710, which
+  Metal gives Common1, Common2 and Mac1 alone, and ANGLE (Safari's and Chrome's WebGL) refuses a device without Mac GPU family 2
+  (the context is lost at creation). With the boot-arg the kext patches that one value to 0x2711 (Common3, Mac2) where the
+  bundle's page comes in from disk, as it patches the OpenGL renderer; the IOGPUFamily variant that takes it from the host's
+  device info is ARM only. The translator takes `[[base_instance]]` (ANGLE's vertex shaders). `tools/metal/webgl/`: the cube
+  check and the spinning cubes as a WebGL page, served with its results reported back. Card (Tahoe 26.6.2, 2026-11-17): in
+  Safari the cube passes with Apple's GPU's pixels and the cubes run at 60 frames a second at 3840x1836. Off by default
+  because Chrome then takes its Dawn path, whose shaders do not translate yet (buffer slots above 27, scratch memory), and
+  WindowServer hung while it ran (the watchdog restarted it twice).
 
 ## 0.2.2 (2026-11-14)
 

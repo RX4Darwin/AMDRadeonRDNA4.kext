@@ -92,8 +92,13 @@ static void info(id<MTLDevice> d) {
 	OUT("info: maxThreadsPerThreadgroup %lux%lux%lu, max buffer %lu MiB, recommended working set %llu MiB", (unsigned long)d.maxThreadsPerThreadgroup.width,
 	    (unsigned long)d.maxThreadsPerThreadgroup.height, (unsigned long)d.maxThreadsPerThreadgroup.depth, (unsigned long)(d.maxBufferLength >> 20),
 	    d.recommendedMaxWorkingSetSize >> 20);
-	for (MTLGPUFamily f = MTLGPUFamilyMac2; f <= MTLGPUFamilyMac2; f++)
-		OUT("info: supports MTLGPUFamilyMac2: %d", [d supportsFamily:f]);
+	const struct { MTLGPUFamily f; const char *name; } families[] = {
+		{MTLGPUFamilyCommon1, "Common1"}, {MTLGPUFamilyCommon2, "Common2"}, {MTLGPUFamilyCommon3, "Common3"}, {MTLGPUFamilyMac2, "Mac2"},
+		{(MTLGPUFamily)5001, "Metal3"}, {MTLGPUFamilyApple5, "Apple5"}, {MTLGPUFamilyApple7, "Apple7"}};
+	char line[256] = "";
+	for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); i++)
+		snprintf(line + strlen(line), sizeof(line) - strlen(line), " %s %d", families[i].name, [d supportsFamily:families[i].f]);
+	OUT("info: families:%s; argument buffers tier %ld, BC formats %d", line, (long)d.argumentBuffersSupport, d.supportsBCTextureCompression);
 }
 
 static void blit(id<MTLDevice> d, id<MTLCommandQueue> q) {

@@ -181,6 +181,16 @@ static bool glWanted() {
 
 static bool glRendererPatchable();
 
+// Mac GPU family 2 claimed by the paravirtual device (rdna4-pvmac2=1, off unless asked): routeGlPagesNow's patch of AppleParavirtGPUMetal.
+// Off by default: with it Chrome takes its Dawn path, whose shaders do not translate yet, and WindowServer hung (watchdog) while it ran
+// (2026-11-17).
+static bool mac2Wanted() {
+	uint32_t mac2 = 0;
+
+	(void)PE_parse_boot_argn("rdna4-pvmac2", &mac2, sizeof(mac2));
+	return mac2 != 0;
+}
+
 // OpenGL.framework (libGFXShared) loads a renderer for an accelerator only if it names one in IOGLBundleName, which Apple's paravirtual
 // accelerator does not: GL then has its software renderer alone. This names Apple's GL-on-Metal renderer (AppleMetalOpenGLRenderer.bundle)
 // on the accelerator when it is published. On its own it would abort every GL process (the renderer asserts in
@@ -226,6 +236,7 @@ struct GlPagePatch {
 	uint32_t at, size;
 	const uint8_t *find, *replace;
 	const char *what;
+	bool mac2;       // AppleParavirtGPUMetal's (rdna4-pvmac2), else the GL renderer's
 };
 
 const uint8_t kGlVendorFind[16] = {'E', 'R', '_', 'S', 'I', 'Z', 'E', 0, 'A', 'M', 'D', 0, 'A', 'T', 'I', 0};
@@ -233,10 +244,19 @@ const uint8_t kGlVendorReplace[16] = {'E', 'R', '_', 'S', 'I', 'Z', 'E', 0, 'A',
 const uint8_t kGlRasterFind[10] = {0x48, 0x8b, 0x35, 0x4f, 0x54, 0x04, 0x00, 0x41, 0xff, 0xd6};      // movq sel(%rip), %rsi; callq *%r14
 const uint8_t kGlRasterReplace[10] = {0x48, 0x8b, 0x35, 0x4f, 0x54, 0x04, 0x00, 0x0f, 0x1f, 0x00};   // ...; nopl (%rax)
 
+// - AppleParavirtGPUMetal's -[AppleParavirtDevice featureProfile] (Tahoe 26.6.2, x86_64 slice at 0x4000, +0xacc3) returns 0x2710, which
+//   Metal (getSupportedFamilies) gives Common1, Common2 and Mac1 alone; 0x2711 adds Common3 and Mac2, which ANGLE (WebGL in Safari and
+//   Chrome) requires: without it the context is lost at creation (2026-11-17). AppleParavirtGPUIOGPUFamily, whose bundle claims it from
+//   the host's device info, is ARM only.
+const uint8_t kMac2Find[11] = {0x55, 0x48, 0x89, 0xe5, 0xb8, 0x10, 0x27, 0x00, 0x00, 0x5d, 0xc3};      // movl $0x2710, %eax; ret
+const uint8_t kMac2Replace[11] = {0x55, 0x48, 0x89, 0xe5, 0xb8, 0x11, 0x27, 0x00, 0x00, 0x5d, 0xc3};   // movl $0x2711, %eax; ret
+
 const GlPagePatch kGlPagePatches[] = {
-	{0x5c000, 0x698, sizeof(kGlVendorFind), kGlVendorFind, kGlVendorReplace, "vendor test: \"AMD\" now \"App\""},
-	{0x2c000, 0x492, sizeof(kGlRasterFind), kGlRasterFind, kGlRasterReplace, "setDefaultRasterSampleCount: call now a nop"},
+	{0x5c000, 0x698, sizeof(kGlVendorFind), kGlVendorFind, kGlVendorReplace, "vendor test: \"AMD\" now \"App\"", false},
+	{0x2c000, 0x492, sizeof(kGlRasterFind), kGlRasterFind, kGlRasterReplace, "setDefaultRasterSampleCount: call now a nop", false},
+	{0xe000, 0xcc3, sizeof(kMac2Find), kMac2Find, kMac2Replace, "AppleParavirtGPUMetal: featureProfile 0x2711 (Mac2)", true},
 };
+bool gGlPatches, gMac2Patch;   // which of them are wanted (routeGlPagesNow)
 
 using ValidatePage = void (*)(void *vnode, void *pager, uint64_t offset, const void *data, int *validated, int *tainted, int *nx);
 mach_vm_address_t orgValidatePage;
@@ -250,10 +270,10 @@ void wrapValidatePage(void *vnode, void *pager, uint64_t offset, const void *dat
 	for (const GlPagePatch &p : kGlPagePatches) {
 		auto *page = const_cast<uint8_t *>(static_cast<const uint8_t *>(data));
 
-		if (offset == p.page && !memcmp(page + p.at, p.find, p.size)) {
+		if (offset == p.page && (p.mac2 ? gMac2Patch : gGlPatches) && !memcmp(page + p.at, p.find, p.size)) {
 			memcpy(page + p.at, p.replace, p.size);
 			if (__atomic_fetch_add(&glPagesPatched, 1u, __ATOMIC_RELAXED) < 8)
-				IOLog("AMDRadeonRDNA4: pvgpu: OpenGL: AppleMetalOpenGLRenderer page +0x%llx: %s\n", offset, p.what);
+				IOLog("AMDRadeonRDNA4: pvgpu: page +0x%llx patched: %s\n", offset, p.what);
 		}
 	}
 }
@@ -271,6 +291,8 @@ static bool glRendererPatchable() {
 	for (const GlPagePatch &p : kGlPagePatches) {
 		uint8_t bytes[16];
 
+		if (p.mac2)
+			continue;
 		ok = ok && p.size <= sizeof(bytes) && !FileIO::readFileData(bytes, static_cast<off_t>(p.page + p.at), p.size, vn, ctx) &&
 		     !memcmp(bytes, p.find, p.size);
 	}
@@ -282,7 +304,9 @@ static bool glRendererPatchable() {
 }
 
 void routeGlPagesNow(KernelPatcher &patcher) {
-	if (!glWanted())
+	gGlPatches = glWanted();
+	gMac2Patch = mac2Wanted();
+	if (!gGlPatches && !gMac2Patch)
 		return;
 
 	KernelPatcher::RouteRequest request {"_cs_validate_page", wrapValidatePage, orgValidatePage};
@@ -290,8 +314,11 @@ void routeGlPagesNow(KernelPatcher &patcher) {
 
 	if (!ok)
 		patcher.clearError();
-	pvlog("OpenGL: cs_validate_page %s: AppleMetalOpenGLRenderer %s", ok ? "wrapped" : "NOT wrapped",
-	      ok ? "is patched where its pages come in" : "stays as it is");
+	if (gGlPatches)
+		pvlog("OpenGL: cs_validate_page %s: AppleMetalOpenGLRenderer %s", ok ? "wrapped" : "NOT wrapped",
+		      ok ? "is patched where its pages come in" : "stays as it is");
+	if (gMac2Patch)
+		pvlog("rdna4-pvmac2: cs_validate_page %s: AppleParavirtGPUMetal %s", ok ? "wrapped" : "NOT wrapped", ok ? "claims Mac2" : "stays as it is");
 }
 
 // The PCI class code the nub reports (rdna4-pvgpu-class=<24 bits>, default 0x030000 = display controller). Apple's driver matches by IOPCIMatch alone.

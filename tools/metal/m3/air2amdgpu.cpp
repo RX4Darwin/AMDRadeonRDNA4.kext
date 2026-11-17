@@ -1000,7 +1000,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (!outputs || !inputs)
 		return "the AIR shader's metadata is not as expected";
 	// The inputs: index -> where its value comes from (-1: unused, poison).
-	// 0 vertex id, 1 instance id, 3 the fragment's position, 4 colour attachment 0, 5 front facing, 100 + n buffer n, 200 + n texture n, 300 + n sampler n,
+	// 0 vertex id, 1 instance id, 2 base instance, 3 the fragment's position, 4 colour attachment 0, 5 front facing, 100 + n buffer n, 200 + n texture n, 300 + n sampler n,
 	// 400 + n input n
 	std::map<unsigned, int> from;
 	// A value between the stages (index: its argument or member); sprite: the point's coordinate, which the hardware makes (no name)
@@ -1033,6 +1033,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		}
 		else if (vertex && kind == "air.instance_id")
 			from[index] = 1;
+		else if (vertex && kind == "air.base_instance")   // ANGLE's vertex shaders (WebGL) read it
+			from[index] = 2;
 		else if (!vertex && kind == "air.fragment_input" && !unused) {
 			// The interpolation: air.flat, or air.center / air.centroid with air.perspective / air.no_perspective; the hardware's
 			// barycentric inputs PERSP_CENTER 4 and LINEAR_CENTER 8 (the arguments below).
@@ -1333,6 +1335,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			                                          air->getArg(k)->getType())
 			               : from[k] == 0 ? b.CreateZExtOrTrunc(vid, air->getArg(k)->getType())   // uint or ushort
 			               : from[k] == 1 ? b.CreateZExtOrTrunc(b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance)), air->getArg(k)->getType())   // with the base instance
+			               : from[k] == 2 ? b.CreateZExtOrTrunc(f->getArg(kBaseInstance), air->getArg(k)->getType())
 			               : from[k] >= 400 ? fromVec4(inValues[static_cast<unsigned>(from[k] - 400)], air->getArg(k)->getType())
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
 			               : from[k] == 4 ? fromVec4(framebuffer(), air->getArg(k)->getType())
