@@ -106,7 +106,7 @@ struct HardMin {
 	bool required;
 };
 
-constexpr HardMin kRaised[] = {
+constexpr HardMin kRaised[] = {   /* DISPCLK first: dispclkTargetKHz */
 	{ kPpclkDispclk, "DISPCLK", "rdna4-dispclk", 650, true },
 	{ kPpclkDppclk, "DPPCLK", "rdna4-dispclk", 650, true },
 	{ kPpclkDcfclk, "DCFCLK", "rdna4-dcfclk", 600, true },
@@ -350,6 +350,17 @@ bool RDNA4Device::smuSetHardMin(uint32_t clk, const char *name, uint32_t mhz)
 	KLOG("%s: hard minimum %u MHz met", name, mhz);
 
 	return true;
+}
+
+/* The DISPCLK the kext holds once the firmware runs (rdna4-dispclk, else
+ * kRaised's), in kHz; 0 with rdna4-dispclk=0, which leaves the clocks alone. */
+uint32_t RDNA4Device::dispclkTargetKHz()
+{
+	uint32_t mhz = kRaised[0].mhz;
+
+	(void)Trial::option(kRaised[0].option, mhz);
+
+	return mhz * 1000;
 }
 
 /* Whether every clock a 3840x2160 pipe needs is held high enough. */

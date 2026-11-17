@@ -39,9 +39,9 @@ public:
 		DisplayObjectInfo    = 22,
 		IndirectIoAccess     = 23,
 		UmcInfo              = 24,
-		DceInfo              = 26,
-		VramInfo             = 27,
-		VoltageObjectInfo    = 31,
+		DceInfo              = 27,
+		VramInfo             = 28,
+		VoltageObjectInfo    = 32,
 		MaxDataTable         = 35,
 	};
 
@@ -135,6 +135,10 @@ public:
 	size_t dataTable(DataTable table, TableHeader *header = nullptr) const;
 
 	bool getFirmwareInfo(FirmwareInfo3 &out) const;
+
+	// The display's reference clock (dce_info v4.x dce_refclk_10khz, Linux's pll_info.crystal_frequency: the DCCG
+	// reference), in kHz.
+	bool getDceRefClock(uint32_t &khz) const;
 
 	// Fills `paths` (up to maxPaths) from displayobjectinfo v1.5; returns the
 	// number of display paths, or 0 when the table is absent/unsupported.

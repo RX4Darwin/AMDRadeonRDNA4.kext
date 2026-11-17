@@ -11,6 +11,8 @@
 #include "trial.hpp"
 #include "klog.hpp"
 #include "compute.hpp"
+#include "dmub.hpp"
+#include "dmubload.hpp"
 #include "flip.hpp"
 #include "pm4.hpp"
 #include "probe_kernel.h"
@@ -52,6 +54,7 @@ extern const uint8_t rdna4_fw_mec[], rdna4_fw_mec_end[];
 extern const uint8_t rdna4_fw_mes[], rdna4_fw_mes_end[];
 extern const uint8_t rdna4_fw_imu[], rdna4_fw_imu_end[];
 extern const uint8_t rdna4_fw_rlc[], rdna4_fw_rlc_end[];
+extern const uint8_t rdna4_fw_dmcub[], rdna4_fw_dmcub_end[];
 }
 #define FW_BLOB(n) AmdFw::Blob { rdna4_fw_##n, static_cast<uint32_t>(rdna4_fw_##n##_end - rdna4_fw_##n) }
 #endif
@@ -755,6 +758,7 @@ void RDNA4Compute::runStages() {
 		if (!stagePsp())
 			return stop("stage 2 (psp)");
 		done = StagePsp;
+		stageDmub();
 	}
 	if (target >= StageGfx) {
 		if (!bringupStepAllowed("stage 3 (gfx)")) return;
@@ -2061,6 +2065,90 @@ bool RDNA4Compute::stagePsp() {
 }
 
 // ---------------------------------------------------------------------------
+// rdna4-dmubload=1: the display microcontroller on the kext's own firmware
+// ---------------------------------------------------------------------------
+
+uint32_t RDNA4Compute::dmubRead(void *ctx, uint32_t reg) {
+	return static_cast<RDNA4Compute *>(ctx)->rd(IpDiscovery::HwDmu, Reg { 2, reg });
+}
+
+void RDNA4Compute::dmubWrite(void *ctx, uint32_t reg, uint32_t value) {
+	static_cast<RDNA4Compute *>(ctx)->wr(IpDiscovery::HwDmu, Reg { 2, reg }, value);
+}
+
+// What amdgpu does at load (dm_dmub_hw_init): the PSP loads dcn_4_0_1_dmcub.bin, then the GOP's firmware is
+// stopped and the controller started on the new one with its windows in the pool (src/dmubload.cpp). The
+// first part of lighting the displays with nothing set up. A failed PSP load leaves the GOP's firmware running;
+// past that the display's own DMUB commands (mode switches, the second pipe) go to the new firmware's mailbox,
+// which dmubRing finds from the window registers.
+void RDNA4Compute::stageDmub() {
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("rdna4-dmubload", &on, sizeof(on)) || !on)
+		return;
+#ifdef AMDRadeonRDNA4_NO_FIRMWARE
+	CLOG("dmub: this build carries no firmware");
+#else
+	using namespace DmubLoad;
+	const size_t len = static_cast<size_t>(rdna4_fw_dmcub_end - rdna4_fw_dmcub);
+	AmdFw::Common hdr;
+	AmdFw::Blob fw;
+	if (!AmdFw::parseCommon(rdna4_fw_dmcub, len, hdr) || !AmdFw::payload(rdna4_fw_dmcub, len, fw) ||
+	    hdr.ucodeVersion != kFwVersion) {
+		CLOG("dmub: embedded firmware does not parse or is not version 0x%08x (the windows are laid out for it)",
+		     kFwVersion);
+		return;
+	}
+	if (!poolCpu || kDmubOffset + kBlockBytes > pool.size || !env.vbios || !env.vbiosSize ||
+	    env.vbiosSize > kVbiosBytes || env.vbiosSize % 4) {
+		CLOG("dmub: no room in the pool or no VBIOS to give it (%lu bytes)", static_cast<unsigned long>(env.vbiosSize));
+		return;
+	}
+	CLOG("dmub: before: CNTL 0x%08x CNTL2 0x%08x SCRATCH0 0x%08x, mailbox window 0x%08x%08x",
+	     dmubRead(this, 0x1f6), dmubRead(this, 0x200), dmubRead(this, 0x1e3), dmubRead(this, 0x1be),
+	     dmubRead(this, 0x1bd));
+
+	// The block as dm_dmub_hw_init leaves it: the VBIOS copied in, the mailboxes, trace, firmware and shared
+	// state zeroed (the whole block here), written back past the HDP before the controller reads it.
+	for (uint32_t off = 0; off < kBlockBytes; off += 4)
+		*poolDw(kDmubOffset + off) = 0;
+	for (uint32_t off = 0; off < env.vbiosSize; off += 4) {
+		uint32_t dw;
+		memcpy(&dw, env.vbios + off, 4);
+		*poolDw(kDmubOffset + kLayout[Vbios].offset + off) = dw;
+	}
+	flushHdp();
+
+	trail("s2: DMUB LOAD_IP_FW");
+	Psp::Response resp;
+	const Psp::Result r = psp.loadIpFw(fw, Psp::FwDmub, resp);
+	CLOG("dmub: LOAD_IP_FW (%u bytes, version 0x%08x): %s, status 0x%x", fw.size, hdr.ucodeVersion, r.what, r.value);
+	if (!r.ok)
+		return;
+
+	trail("s2: DMUB start");
+	const Io io { this, dmubRead, dmubWrite, pspDelay };
+	uint32_t status = 0;
+	const bool up = DmubLoad::start(io, poolMc(kDmubOffset), status);
+	CLOG("dmub: %s: SCRATCH0 0x%08x, CNTL 0x%08x, windows at MC 0x%llx (pool+%u MiB)",
+	     up ? "the firmware runs" : "the firmware did NOT report itself up in 100 ms", status, dmubRead(this, 0x1f6),
+	     poolMc(kDmubOffset), kDmubOffset >> 20);
+
+	// The firmware's own answer (DMUB_GPINT__GET_FW_VERSION), as rdna4-dmubver=2 asks the GOP's.
+	const uint32_t word = Dmub::gpintWord(Dmub::GpintGetFwVersion, 0);
+	dmubWrite(this, 0x1f8, word);
+	uint32_t seen = 0, us = 0;
+	for (; us < 100000 && (seen = dmubRead(this, 0x1f8)) != Dmub::gpintAcked(word); us += 10)
+		IODelay(10);
+	if (seen == Dmub::gpintAcked(word))
+		CLOG("dmub: GPINT GET_FW_VERSION acknowledged after %u us: 0x%08x", us, dmubRead(this, 0x1ea));
+	else
+		CLOG("dmub: GPINT GET_FW_VERSION not acknowledged in 100 ms (DATAIN1 0x%08x)", seen);
+	env.owner->setProperty("Compute,DMUB", up ? "own firmware runs" : "own firmware did not come up");
+	trail("s2: DMUB done");
+#endif
+}
+
+// ---------------------------------------------------------------------------
 // Stage 3: GC firmware into the TMR, RLC autoload
 // ---------------------------------------------------------------------------
 
@@ -2140,8 +2228,10 @@ bool RDNA4Compute::stageGfx() {
 	trail("s3: SMU features (display-safe mask)");
 	uint64_t running = smuEnableFeatures(displaySafe, 0);
 	put("SmuFeatures", running);
-	if (env.smuReady)
+	if (env.smuReady) {
+		trail("s3: smuReady (display clocks, cold start)");
 		env.smuReady(env.cursorProbeCtx);
+	}
 
 	// 4. gfx_v12_0_wait_for_rlc_autoload_complete: CP idle and the RLC
 	//    reports its bootload complete.
@@ -2235,6 +2325,9 @@ uint64_t RDNA4Compute::smuEnableFeatures(uint64_t allowed, uint32_t domain) {
 		return lo | (static_cast<uint64_t>(hi) << 32);
 	};
 
+	// A breadcrumb before each message: with a second DisplayPort display lit by the GOP, a boot hung inside this function
+	// (2026-11-15, trail "s3: SMU features (display-safe mask)"); these name the message.
+	trail("s3: SMU GetDriverIfVersion");
 	resp = smuSend(kSmuMsgGetDriverIfVersion, 0, ret, 100);
 	CLOG("smu: driver interface version 0x%x (resp 0x%02x; amdgpu expects 0x2e)", ret, resp);
 	CLOG("smu: running features before: 0x%016llx", running());
@@ -2247,19 +2340,24 @@ uint64_t RDNA4Compute::smuEnableFeatures(uint64_t allowed, uint32_t domain) {
 	const uint32_t rl = smuSend(kSmuMsgSetDriverDramAddrLow, static_cast<uint32_t>(table), ret, 100);
 	CLOG("smu: driver table at MC 0x%llx (resp 0x%02x/0x%02x)", table, rh, rl);
 
+	trail("s3: SMU RunDcBtc");
 	resp = smuSend(kSmuMsgRunDcBtc, 0, ret, 2000);
 	CLOG("smu: RunDcBtc -> 0x%02x", resp);
 
+	trail("s3: SMU SetAllowedMask");
 	const uint32_t mh = smuSend(kSmuMsgSetAllowedMaskHigh, static_cast<uint32_t>(allowed >> 32), ret, 100);
 	const uint32_t ml = smuSend(kSmuMsgSetAllowedMaskLow, static_cast<uint32_t>(allowed), ret, 100);
 	CLOG("smu: allowed features 0x%016llx -> 0x%02x/0x%02x%s", allowed, mh, ml,
 	     mh == kSmuRespRejectedPrereq ? " (refused: SCPM, the pptable decides)" : "");
 
+	trail("s3: SMU EnableAllSmuFeatures");
 	resp = smuSend(kSmuMsgEnableAllFeatures, domain, ret, 2000);
 	CLOG("smu: EnableAllSmuFeatures(%u) -> 0x%02x", domain, resp);
 	// GFXOFF stays disallowed (amdgpu's initial gfx_off_req_count is 1).
+	trail("s3: SMU DisallowGfxOff");
 	resp = smuSend(kSmuMsgDisallowGfxOff, 0, ret, 100);
 
+	trail("s3: SMU GetRunningFeatures");
 	const uint64_t now = running();
 	auto on = [now](uint32_t bit) { return (now >> bit) & 1 ? "on" : "off"; };
 	CLOG("smu: running features after: 0x%016llx — GFX_IMU %s, GFXCLK DPM %s, UCLK DPM %s, "

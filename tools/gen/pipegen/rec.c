@@ -20,6 +20,8 @@ static const char *caller(void *ra)
 #define MAXEV 8192
 struct ev evs[MAXEV]; int nev;
 int rec_log_reads = 1;
+int rec_copy_mode;
+static uint32_t last_read;
 
 static struct { uint32_t addr, val; } mem[16384]; static int nmem;
 static uint32_t fill;
@@ -60,6 +62,7 @@ uint32_t dm_read_reg_func(const struct dc_context *ctx, uint32_t address, const 
 			return rec_peek(address);
 		}
 	v = rec_peek(address);
+	last_read = address;
 	if (rec_log_reads) fprintf(stderr, "READ  %08x = %08x  in %s\n", address, v, func_name);
 	return v;
 }
@@ -67,6 +70,10 @@ void dm_write_reg_func(const struct dc_context *ctx, uint32_t address, uint32_t 
 {
 	if (address == 0) { fprintf(stderr, "DROP  write to absent register in %s\n", func_name); return; }
 	rec_poke(address, value);
+	if (rec_copy_mode) {
+		add(EV_COPY, address, 0, 0, last_read, func_name);
+		return;
+	}
 	add(EV_WRITE, address, 0xffffffff, value, 0, strcmp(func_name, "REG_SET") ? func_name : set_caller);
 }
 static void gather(uint32_t *mask, uint32_t *value, int n, uint8_t s1, uint32_t m1, uint32_t v1, va_list ap)

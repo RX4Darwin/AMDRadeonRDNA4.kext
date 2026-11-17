@@ -15,9 +15,14 @@
 #include "sku.hpp"
 #include "trial.hpp"
 #include "dpdual.hpp"
+#include "dcninit.hpp"
+#include "compute.hpp"
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/clock.h>
+#include <sys/sysctl.h>
 
 #include "buildrev.h"   // AMDRADEONRDNA4_BUILD, written by the Makefile
 
@@ -483,6 +488,7 @@ constexpr int kReplyI2CDefer = 0x8;
 constexpr int kAuxNoReply    = -2;   // the transaction ran and the sink did not answer
 
 constexpr uint8_t kDdcSlave  = 0x50; // VESA DDC/EDID I2C address
+constexpr uint8_t kDdcSegment = 0x30; // E-DDC segment pointer
 constexpr uint8_t kAuxRetry  = 7;    // per-transaction defer retries
 // A DPCD transfer waits out a deferring sink for about 50 ms in all, amdgpu's
 // AUX_MAX_DEFER_TIMEOUT_MS: seven tries 500 us apart, the rest 1 ms apart.
@@ -614,8 +620,13 @@ int RDNA4Device::auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
 }
 
 bool RDNA4Device::readEDID(uint8_t inst, uint8_t *edid, size_t count,
-                          uint8_t start) {
+                          uint8_t start, uint8_t segment) {
 	uint8_t rb = 0;
+
+	// Blocks past the first two: the E-DDC segment pointer first (I2C 0x30), as Linux's drm_do_probe_ddc_edid
+	// writes it; only for a segment above 0, which some sinks refuse.
+	if (segment && auxTransaction(inst, kActI2CWriteMot, kDdcSegment, &segment, 1, nullptr, 0, &rb) != kReplyAck)
+		return false;
 
 	// Point the sink's read pointer at `start` with an I2C write. MOT keeps
 	// the I2C START asserted across the reads that follow.
@@ -649,6 +660,28 @@ bool RDNA4Device::readEDID(uint8_t inst, uint8_t *edid, size_t count,
 		pos += rb;  // advance by what the sink actually returned
 	}
 	return true;
+}
+
+// The extension blocks past the first (E-DDC segments) into edidMore, in order, logged with their DisplayID timings:
+// the mode table takes them, macOS's EDID stays the base block and the first extension.
+void RDNA4Device::readMoreEdidBlocks(uint8_t inst, uint8_t blocks) {
+	edidMoreLen = 0;
+	for (uint8_t b = 2; b <= blocks && b <= 3; b++) {
+		uint8_t *block = edidMore + edidMoreLen;
+		if (!readEDID(inst, block, 128, static_cast<uint8_t>((b & 1) * 128), static_cast<uint8_t>(b / 2))) {
+			FBLOG("edid: AUX%u: extension block %u not read (segment %u)", inst, b, b / 2);
+			break;
+		}
+		edidMoreLen += 128;
+		Edid::DetailedTiming t[8];
+		const size_t n = Edid::displayIdTimings(block, t, 8);
+		FBLOG("edid: AUX%u: extension block %u (tag 0x%02x, checksum %s): %lu DisplayID timing(s)", inst, b, block[0],
+		      Edid::blockChecksumOk(block) ? "ok" : "BAD", static_cast<unsigned long>(n));
+		for (size_t i = 0; i < n; i++)
+			FBLOG("edid:   %ux%u@%u.%03u %u kHz h(blank=%u fp=%u sw=%u) v(blank=%u fp=%u sw=%u)", t[i].hActive,
+			      t[i].vActive, t[i].refreshMilliHz() / 1000, t[i].refreshMilliHz() % 1000, t[i].pixelClockKHz,
+			      t[i].hBlank, t[i].hSyncOffset, t[i].hSyncWidth, t[i].vBlank, t[i].vSyncOffset, t[i].vSyncWidth);
+	}
 }
 
 // Native AUX: up to 16 bytes a transfer, a deferred one asked again.
@@ -847,6 +880,8 @@ void RDNA4Device::probeEDID() {
 				FBLOG("edid: connector %zu (%s%u): read extension block "
 				      "(tag 0x%02x)", i, bus, inst, edidData[128]);
 			}
+			if (ext && viaAux && edid[126] > 1)
+				readMoreEdidBlocks(inst, edid[126]);
 		} else if (!boot && freeExtraSlot() < extraHeads()) {
 			selectExtra(freeExtraSlot());
 			memcpy(xp().edid, edid, 128);
@@ -1410,6 +1445,10 @@ namespace {
 // DMCUB mailbox registers (dcn_4_1_0_offset.h, base_idx 2).
 constexpr uint32_t kDmcubRegion4Offset     = 0x0196;   // mailbox MC address, low
 constexpr uint32_t kDmcubRegion4OffsetHigh = 0x0197;
+constexpr uint32_t kDmcubCw3Base           = 0x01a8;   // DMCUB_REGION3_CW3..6_BASE_ADDRESS (the firmware's view)
+constexpr uint32_t kDmcubCw3Top            = 0x01b0;   // DMCUB_REGION3_CW3..6_TOP_ADDRESS (bit 31: enabled)
+constexpr uint32_t kDmcubCw3Offset         = 0x01bb;   // DMCUB_REGION3_CW3..6_OFFSET, _HIGH: their MC addresses
+constexpr uint32_t kDmcubInbox1Base        = 0x01d4;
 constexpr uint32_t kDmcubInbox1Size        = 0x01d5;
 constexpr uint32_t kDmcubInbox1Wptr        = 0x01d6;
 constexpr uint32_t kDmcubInbox1Rptr        = 0x01d7;
@@ -1420,14 +1459,33 @@ bool RDNA4Device::dmubRing(DmubRing &ring) {
 	ring = DmubRing {};
 	if (!ipDiscovery.isValid() || !rmmio)
 		return false;
-	// The ring lives in top-of-VRAM firmware memory (REGION4); its VRAM
-	// position is the REGION4 MC address minus the VRAM MC base.
-	uint64_t region4Mc = regReadDmu(2, kDmcubRegion4Offset) |
-	    (static_cast<uint64_t>(regReadDmu(2, kDmcubRegion4OffsetHigh)) << 32);
+	// Inbox 1 is where the firmware sees it (DMCUB_INBOX1_BASE_ADDRESS), in the region that holds that address:
+	// REGION4 from 0x80000000 (the GOP's firmware: the inbox at 0x80000000, REGION4 at its MC address), else the
+	// window 3-6 whose base..top holds it (Linux's start-up, the kext's own firmware with rdna4-dmubload: the
+	// inbox at the start of window 4, REGION4 left as the GOP had it). Bases and tops read back as 29 bits.
+	const uint32_t inbox = regReadDmu(2, kDmcubInbox1Base);
+	uint64_t inboxMc = 0, windowMc = 0;
+	if (inbox >= 0x80000000u) {
+		windowMc = regReadDmu(2, kDmcubRegion4Offset) |
+		    (static_cast<uint64_t>(regReadDmu(2, kDmcubRegion4OffsetHigh)) << 32);
+		inboxMc = windowMc + (inbox - 0x80000000u);
+	} else {
+		const uint32_t at = inbox & 0x1fffffff;
+		for (uint32_t cw = 3; cw <= 6 && !inboxMc; cw++) {
+			const uint32_t base = regReadDmu(2, kDmcubCw3Base + cw - 3) & 0x1fffffff;
+			const uint32_t top = regReadDmu(2, kDmcubCw3Top + cw - 3);
+			if (!(top & 0x80000000u) || at < base || at >= (top & 0x1fffffff))
+				continue;
+			const uint32_t off = kDmcubCw3Offset + 2 * (cw - 3);
+			windowMc = regReadDmu(2, off) | (static_cast<uint64_t>(regReadDmu(2, off + 1)) << 32);
+			inboxMc = windowMc + (at - base);
+		}
+	}
 	uint64_t vramMcBase =
 	    static_cast<uint64_t>(regReadDmu(2, kDcnVmFbLocationBase) & 0xffffff) << 24;
-	if (region4Mc <= vramMcBase) {
-		FBLOG("dmub: region4 mc 0x%llx not above vram base 0x%llx", region4Mc, vramMcBase);
+	if (inboxMc <= vramMcBase) {
+		FBLOG("dmub: inbox 0x%08x in no region or not above vram base 0x%llx (at MC 0x%llx)", inbox, vramMcBase,
+		      inboxMc);
 		return false;
 	}
 	uint32_t size = regReadDmu(2, kDmcubInbox1Size);
@@ -1435,8 +1493,13 @@ bool RDNA4Device::dmubRing(DmubRing &ring) {
 		FBLOG("dmub: inbox1 size 0x%x not sane", size);
 		return false;
 	}
-	ring.base = region4Mc - vramMcBase;
+	ring.base = inboxMc - vramMcBase;
 	ring.size = size;
+	static uint64_t logged;
+	if (logged != inboxMc) {   // once per firmware: the GOP's, then the kext's own (rdna4-dmubload)
+		logged = inboxMc;
+		FBLOG("dmub: inbox 1 (0x%08x) at MC 0x%llx, its region at 0x%llx, 0x%x bytes", inbox, inboxMc, windowMc, size);
+	}
 	return true;
 }
 
@@ -1480,12 +1543,45 @@ bool RDNA4Device::dmubSubmit(const Dmub::Cmd *cmds, uint32_t count, const char *
 	uint32_t nrptr = rptr;
 	for (int i = 0; i < 20000; i++) {          // 200 ms budget
 		nrptr = regReadDmu(2, kDmcubInbox1Rptr);
-		if (nrptr == slot)
+		if (nrptr == slot) {
+			dmubTrace(tag);
 			return true;
+		}
 		IODelay(10);
 	}
 	FBLOG("%s: firmware did not consume (wptr=0x%x rptr stuck at 0x%x)", tag, slot, nrptr);
+	dmubTrace(tag);
 	return false;
+}
+
+// The trace buffer (window 5, Linux's dmub_tracebuffer_show): a 16-byte header whose first dword counts the
+// entries ever written, then a ring of 16-byte entries {trace_code, tick, param0, param1}. Only with
+// rdna4-dmubload, where the window is the kext's (the GOP's firmware has its own layout).
+void RDNA4Device::dmubTrace(const char *tag) {
+	static int on = -1;
+	if (on < 0) {
+		uint32_t v = 0;
+		on = PE_parse_boot_argn("rdna4-dmubload", &v, sizeof(v)) && v;
+	}
+	const uint32_t cw5 = 5 - 3;   // window 5's index in the CW3..6 register runs
+	const uint64_t mc = regReadDmu(2, kDmcubCw3Offset + 2 * cw5) |
+	    static_cast<uint64_t>(regReadDmu(2, kDmcubCw3Offset + 2 * cw5 + 1)) << 32;
+	const uint64_t vramMcBase = static_cast<uint64_t>(regReadDmu(2, kDcnVmFbLocationBase) & 0xffffff) << 24;
+	const uint32_t size = (regReadDmu(2, kDmcubCw3Top + cw5) & 0x1fffffff) - (regReadDmu(2, kDmcubCw3Base + cw5) & 0x1fffffff);
+	if (!on || mc <= vramMcBase || size < 32 || size > 0x100000)
+		return;
+	const uint64_t at = mc - vramMcBase;
+	const uint32_t count = vramRead32(at), ring = (size - 16) / 16;
+	if (count < dmubTraceSeen)   // another firmware's buffer: its count starts again
+		dmubTraceSeen = 0;
+	const uint32_t first = count - dmubTraceSeen > 32 ? count - 32 : dmubTraceSeen;
+	FBLOG("%s: dmub trace: %u entries (%u new)", tag, count, count - dmubTraceSeen);
+	for (uint32_t n = first; n < count; n++) {
+		const uint64_t e = at + 16 + 16ull * (n % ring);
+		FBLOG("%s: dmub trace %u: code 0x%x tick %u params 0x%08x 0x%08x", tag, n, vramRead32(e), vramRead32(e + 4),
+		      vramRead32(e + 8), vramRead32(e + 12));
+	}
+	dmubTraceSeen = count;
 }
 
 // rdna4-smuping=1: first contact with the SMU power-management firmware
@@ -2108,6 +2204,312 @@ void RDNA4Device::tryForce8bpc() {
 	      regReadDmu(2, kDpPixelFormat), regReadDmu(2, kDpMsaColorimetry));
 }
 
+namespace {
+RDNA4Device *gSleepTestDev;   // the device debug.rdna4_head2sleep acts on
+
+int head2SleepSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = 0;
+	const int err = sysctl_handle_int(oidp, &value, 0, req);
+	if (err || !req->newptr)
+		return err;
+	if ((value == 1 || value == 2) && gSleepTestDev)
+		gSleepTestDev->head2SleepTest(value);
+	return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_head2sleep, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, head2SleepSysctl, "I",
+	    "AMDRadeonRDNA4: 1 puts the second display's pipe to sleep, 2 wakes it, each register step a breadcrumb");
+
+RDNA4Device *gColdDev;   // the device debug.rdna4_coldreset acts on (rdna4-coldprobe=1)
+
+int coldResetSysctl(struct sysctl_oid *oidp, void *, int, struct sysctl_req *req) {
+	int value = 0;
+	const int err = sysctl_handle_int(oidp, &value, 0, req);
+	if (err || !req->newptr)
+		return err;
+	if (value == 1 && gColdDev)
+		(void)gColdDev->coldReset();
+	return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_coldreset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, coldResetSysctl, "I",
+	    "AMDRadeonRDNA4: 1 resets the card (mode 1) and brings it back as Linux does before its IP blocks start");
+} // namespace
+
+// A real cold start, stage (a): the state a mode-1 reset (amdgpu_device_mode1_reset: SMU debug mailbox
+// DEBUGSMC_MSG_Mode1Reset on MP1 14.0.2/3) and the VBIOS's asic_init (its bytecode, decoded 2026-11-15) depend on,
+// logged and nothing written. The PSP's bootloader and mailbox words, the SMU's debug mailbox, the registers
+// asic_init reads and writes, the VRAM size, and the PCI config space a reset clears (the BARs, the command
+// register, PCIe link control, Resizable BAR), to compare with after a reset.
+void RDNA4Device::coldProbe() {
+	uint32_t on = 0;
+	if (!PE_parse_boot_argn("rdna4-coldprobe", &on, sizeof(on)) || !on || !ipDiscovery.isValid() || !rmmio)
+		return;
+	if (!gColdDev) {
+		gColdDev = this;
+		sysctl_register_oid(&sysctl__debug_rdna4_coldreset);
+	}
+	auto ip = [&](IpDiscovery::HwId hw, uint32_t seg, uint32_t dword) -> uint32_t {
+		uint32_t off;
+		if (!ipDiscovery.regByteOffset(hw, 0, seg, dword, off) || off + 4 > rmmioSize)
+			return 0xFFFFFFFF;
+		return rmmio[off / 4];
+	};
+	auto mm = [&](uint32_t dword) { return dword * 4 + 4 <= rmmioSize ? rmmio[dword] : 0xFFFFFFFFu; };
+	// MP0 C2PMSG_n at dword 0x40 + n (segment 0): 33 VMBX, 35 bootloader, 64 ring, 81 sOS
+	FBLOG("cold: psp C2PMSG_33 0x%08x (asic_init waits for bit 31), _35 0x%08x (bootloader, bit 31), _64 0x%08x, "
+	      "_81 0x%08x (sOS)", ip(IpDiscovery::HwMp0, 0, 0x61), ip(IpDiscovery::HwMp0, 0, 0x63),
+	      ip(IpDiscovery::HwMp0, 0, 0x80), ip(IpDiscovery::HwMp0, 0, 0x91));
+	// MP1 C2PMSG_n at dword 0x40 + n (segment 1): the debug mailbox's param 53, response 54, message 75
+	FBLOG("cold: smu debug mailbox: param(C2PMSG_53) 0x%08x resp(_54) 0x%08x msg(_75) 0x%08x",
+	      ip(IpDiscovery::HwMp1, 1, 0x75), ip(IpDiscovery::HwMp1, 1, 0x76), ip(IpDiscovery::HwMp1, 1, 0x8b));
+	FBLOG("cold: asic_init's registers: [0x0006] 0x%08x [0x004c] 0x%08x [0x004e] 0x%08x [0x0050] 0x%08x "
+	      "[0x0053] 0x%08x [0x0de3] 0x%08x", mm(0x0006), mm(0x004c), mm(0x004e), mm(0x0050), mm(0x0053), mm(0x0de3));
+	logPciState("probe");
+}
+
+void RDNA4Device::logPciState(const char *when) {
+	if (rmmio && ipDiscovery.isValid()) {
+		uint32_t off = 0;
+		auto ip = [&](uint16_t hw, uint8_t seg, uint32_t dword) {
+			return ipDiscovery.regByteOffset(hw, 0, seg, dword, off) && off + 4 <= rmmioSize ? rmmio[off / 4] : 0xdeadbeefu;
+		};
+		FBLOG("cold: %s: mmio: VRAM size 0x%08x, C2PMSG_35 0x%08x (bootloader), C2PMSG_81 0x%08x (sOS)", when,
+		      ip(IpDiscovery::HwNbif, 2, 0x00c3), ip(IpDiscovery::HwMp0, 0, 0x63), ip(IpDiscovery::HwMp0, 0, 0x91));
+	}
+	if (!pciDevice)
+		return;
+	uint32_t cfg[16];
+	for (uint32_t i = 0; i < 16; i++)
+		cfg[i] = pciDevice->configRead32(static_cast<uint8_t>(i * 4));
+	FBLOG("cold: %s: pci 00-1c: %08x %08x %08x %08x %08x %08x %08x %08x", when, cfg[0], cfg[1], cfg[2], cfg[3], cfg[4], cfg[5],
+	      cfg[6], cfg[7]);
+	FBLOG("cold: %s: pci 20-3c: %08x %08x %08x %08x %08x %08x %08x %08x", when, cfg[8], cfg[9], cfg[10], cfg[11], cfg[12],
+	      cfg[13], cfg[14], cfg[15]);
+	IOByteCount pcie = 0, rebar = 0;
+	if (pciDevice->extendedFindPCICapability(0x10, &pcie) && pcie)   // PCI Express: device and link control/status
+		FBLOG("cold: %s: pcie cap@0x%x: devctl/sta 0x%08x linkcap 0x%08x linkctl/sta 0x%08x devctl2 0x%08x linkctl2 "
+		      "0x%08x", when, static_cast<uint32_t>(pcie), pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x08)),
+		      pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x0c)),
+		      pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x10)),
+		      pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x28)),
+		      pciDevice->configRead32(static_cast<uint8_t>(pcie + 0x30)));
+	// Resizable BAR (extended capability 0x15): a capability and a control word for each of up to six BARs
+	if (pciDevice->extendedFindPCICapability(-0x15, &rebar) && rebar)
+		for (uint32_t i = 0; i < 6; i++) {
+			const uint32_t cap = pciDevice->extendedConfigRead32(rebar + 4 + 8 * i),
+			               ctl = pciDevice->extendedConfigRead32(rebar + 8 + 8 * i);
+			if (i && !(cap | ctl))
+				break;
+			FBLOG("cold: %s: rebar cap@0x%x entry %u: cap 0x%08x ctl 0x%08x (BAR %u, size 2^%u MiB)",
+			      when, static_cast<uint32_t>(rebar), i, cap, ctl, ctl & 7, (ctl >> 8) & 0x3f);
+		}
+	// PCI power management (capability 0x01): PMCSR bits 1:0 are the D state.
+	IOByteCount pm = 0;
+	if (pciDevice->extendedFindPCICapability(0x01, &pm) && pm) {
+		const uint32_t pmcsr = pciDevice->configRead32(static_cast<uint8_t>(pm + 4));
+		FBLOG("cold: %s: pm cap@0x%x: PMCSR 0x%08x (D%u)", when, static_cast<uint32_t>(pm), pmcsr, pmcsr & 3);
+	}
+	// The card's own PCIe switch: its downstream port above the GPU, and the upstream port above that.
+	IOService *up = pciDevice;
+	for (int level = 1; level <= 2; level++) {
+		IOService *bridge = up->getProvider();
+		auto *dev = bridge ? OSDynamicCast(IOPCIDevice, bridge->getProvider()) : nullptr;
+		if (!dev)
+			break;
+		FBLOG("cold: %s: bridge %d (%s): id %08x command/status %08x buses %08x memory %08x prefetch %08x %08x %08x",
+		      when, level, dev->getName(), dev->configRead32(0x00), dev->configRead32(0x04), dev->configRead32(0x18),
+		      dev->configRead32(0x20), dev->configRead32(0x24), dev->configRead32(0x28), dev->configRead32(0x2c));
+		up = dev;
+	}
+}
+
+// The runtime's sleep and wake come from this device's notifiers (no rdna4-pm, which puts it in the power tree).
+bool RDNA4Device::drivesRuntimePower() const { return compute && !RDNA4Compute::requestedPowerManagement(); }
+
+void RDNA4Device::captureGopState() {
+	if (!bootDpLinkKnown)
+		noteBootDpLink();
+	coldGopSurface = bootScanout();
+	coldGopTimer = regReadDmu(2, DcnInit::kTimerCntl);
+	FBLOG("cold: the GOP's state kept for a cold start: scanout 0x%llx, DCHUB timer 0x%08x, boot link %s", coldGopSurface,
+	      coldGopTimer, bootDpLinkKnown ? "known" : "NOT known");
+}
+
+// Roadmap item 5, stage 2: a word at the console's start written before sleep and read once woken (whether VRAM
+// kept its contents through the power loss), and from the wake on the card treated as after a cold reset: the
+// compute bring-up runs again (rdna4-pm=1) and its SMU step runs the cold start (coldStartHeads) in cold mode.
+IOReturn RDNA4Device::sleepWakeMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {
+	auto *dev = static_cast<RDNA4Device *>(target);
+	auto vramWord = [dev](bool write, uint32_t value) -> uint32_t {
+		IODeviceMemory *bar0 = dev->pciDevice ? dev->pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0) : nullptr;
+		IOMemoryMap *map = bar0 ? bar0->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, 0, 4096) : nullptr;
+		volatile uint32_t *w = map ? reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()) : nullptr;
+		uint32_t got = 0xdeadbeef;
+		if (w && write)
+			w[0] = value;
+		if (w)
+			got = w[0];
+		if (map)
+			map->release();
+		return got;
+	};
+	if (type == kIOMessageSystemWillSleep) {
+		dev->logPciState("before sleep");
+		dev->vramMark = vramWord(true, 0x5a5a1234) == 0x5a5a1234 ? 0x5a5a1234 : 0;
+		if (dev->drivesRuntimePower()) {   // the engines quiesced while the card has power
+			dev->compute->powerSleepRequest();
+			dev->compute->powerWillSleep();
+		}
+	} else if (type == kIOMessageSystemWillPowerOn) {
+		dev->logPciState("waking");
+		dev->coldBoot = true;
+		FBLOG("cold: waking: the card lost its power: the next cold start runs as after a reset");
+	} else if (type == kIOMessageSystemWillNotSleep) {   // a sleep called off after the engines were quiesced
+		FBLOG("cold: the sleep was called off: the runtime comes back");
+		if (dev->drivesRuntimePower())
+			dev->compute->powerDidWake();
+	} else if (type == kIOMessageSystemHasPoweredOn) {
+		dev->logPciState("woken");
+		if (dev->drivesRuntimePower())   // if the card's power-on was not seen (it did nothing then)
+			dev->compute->powerDidWake();
+		if (dev->vramMark) {
+			const uint32_t got = vramWord(false, 0);
+			FBLOG("cold: woken: VRAM %s through the sleep (0x%08x)", got == dev->vramMark ? "kept its contents" : "lost its contents", got);
+		}
+	}
+	return kIOReturnSuccess;
+}
+
+
+// Stage (b): amdgpu_device_mode1_reset as Linux runs it on MP1 14.0.2/3, then the VBIOS's asic_init. Not the
+// IP blocks: the PSP's sOS, the SMU's features, DMUB, the display and the compute runtime are as dead afterwards as
+// after a power loss, and the displays dark: this shows whether the card comes back to where a cold start begins.
+bool RDNA4Device::coldReset() {
+	if (!pciDevice || !rmmio || !ipDiscovery.isValid())
+		return false;
+	auto ipOff = [&](uint16_t hw, uint8_t seg, uint32_t dword) {
+		uint32_t off = 0;
+		return ipDiscovery.regByteOffset(hw, 0, seg, dword, off) && off + 4 <= rmmioSize ? off / 4 : 0u;
+	};
+	const uint32_t c2p33 = ipOff(IpDiscovery::HwMp0, 0, 0x61), c2p35 = ipOff(IpDiscovery::HwMp0, 0, 0x63),
+	               c2p81 = ipOff(IpDiscovery::HwMp0, 0, 0x91);
+	const uint32_t dbgParam = ipOff(IpDiscovery::HwMp1, 1, 0x75), dbgResp = ipOff(IpDiscovery::HwMp1, 1, 0x76),
+	               dbgMsg = ipOff(IpDiscovery::HwMp1, 1, 0x8b);
+	uint32_t memsizeOff = 0;
+	if (!c2p33 || !c2p35 || !dbgParam || !dbgMsg || !dbgResp ||
+	    !ipDiscovery.regByteOffset(IpDiscovery::HwNbif, 0, 2, 0x00c3, memsizeOff)) {
+		FBLOG("cold: reset not done: a register is not in the discovery table");
+		return false;
+	}
+	// VRAM before: a pattern at the console's first page, to see afterwards whether memory kept it.
+	IODeviceMemory *bar0 = pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+	IOMemoryMap *vmap = bar0 ? bar0->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, 0, 4096)
+	                         : nullptr;
+	volatile uint32_t *vram = vmap ? reinterpret_cast<volatile uint32_t *>(vmap->getVirtualAddress()) : nullptr;
+	if (vram)
+		vram[0] = 0x5a5a1234;
+
+	// amdgpu_device_cache_pci_state: the header and capabilities, and Resizable BAR (extended capability 0x15).
+	uint32_t cfg[64];
+	for (uint32_t i = 0; i < 64; i++)
+		cfg[i] = pciDevice->configRead32(static_cast<uint8_t>(i * 4));
+	IOByteCount rebar = 0;
+	uint32_t rebarCtl[6] = {};
+	uint32_t nrebar = 0;
+	if (pciDevice->extendedFindPCICapability(-0x15, &rebar) && rebar)
+		for (; nrebar < 6; nrebar++) {
+			rebarCtl[nrebar] = pciDevice->extendedConfigRead32(rebar + 8 + 8 * nrebar);
+			if (nrebar && !rebarCtl[nrebar])
+				break;
+		}
+	FBLOG("cold: resetting the card (SMU debug mailbox, DEBUGSMC_MSG_Mode1Reset): command 0x%04x, BAR0 0x%08x%08x, "
+	      "%u Resizable BAR control(s)", cfg[1] & 0xffff, cfg[5], cfg[4], nrebar);
+
+	// pci_clear_master, then smu_v14_0_2_mode1_reset: param, message, response cleared; 1 s without the registers.
+	pciDevice->configWrite16(kIOPCIConfigCommand, static_cast<uint16_t>((cfg[1] & 0xffff) & ~0x4u));
+	rmmio[dbgParam] = 0;
+	rmmio[dbgMsg] = 2;   // DEBUGSMC_MSG_Mode1Reset
+	rmmio[dbgResp] = 0;
+	IOSleep(1000);
+
+	// amdgpu_device_load_pci_state: the BAR sizes first, then the header (BARs before the command register).
+	for (uint32_t i = 0; i < nrebar; i++)
+		pciDevice->extendedConfigWrite32(rebar + 8 + 8 * i, rebarCtl[i]);
+	for (uint32_t i = 2; i < 64; i++)   // past the IDs and the command/status word
+		if (i != 1)
+			pciDevice->configWrite32(static_cast<uint8_t>(i * 4), cfg[i]);
+	pciDevice->configWrite16(kIOPCIConfigCommand, static_cast<uint16_t>(cfg[1] & 0xffff));
+
+	// amdgpu_psp_wait_for_bootloader (C2PMSG_35 bit 31), then the VRAM size readable again.
+	auto waitFor = [&](uint32_t dword, uint32_t mask, uint32_t want, uint32_t ms) {
+		for (uint32_t t = 0; t < ms; t++) {
+			if ((rmmio[dword] & mask) == want)
+				return true;
+			IOSleep(1);
+		}
+		return false;
+	};
+	const bool boot = waitFor(c2p35, 0x80000000, 0x80000000, 5000);
+	bool sized = false;
+	for (uint32_t t = 0; t < 5000 && !sized; t++) {
+		const uint32_t v = rmmio[memsizeOff / 4];
+		sized = v && v != 0xffffffff;
+		if (!sized)
+			IOSleep(1);
+	}
+	FBLOG("cold: after the reset: bootloader %s (C2PMSG_35 0x%08x), VRAM size %u MiB, C2PMSG_33 0x%08x, sOS 0x%08x, "
+	      "command 0x%04x, BAR0 0x%08x%08x", boot ? "ready" : "NOT ready", rmmio[c2p35], rmmio[memsizeOff / 4],
+	      rmmio[c2p33], rmmio[c2p81], pciDevice->configRead16(kIOPCIConfigCommand),
+	      pciDevice->configRead32(kIOPCIConfigBaseAddress1), pciDevice->configRead32(kIOPCIConfigBaseAddress0));
+
+	// The VBIOS's asic_init (table 0, decoded): wait for C2PMSG_33 to read 0x80000000 (4 s); if it does not and the
+	// strap (REG 0x50 bits 31:24) is 1, ask the bootloader with 0x70000 in C2PMSG_35 and wait again; then the tail:
+	// REG 6 = (REG 0xde3 - 1) >> 11, REG 0x53 |= 0x200.
+	const uint32_t strap = rmmio[0x50] & 0xff000000;
+	bool vmbx = waitFor(c2p33, 0xffffffff, 0x80000000, 4000);
+	if (!vmbx && strap == 0x01000000) {
+		rmmio[c2p35] = 0x70000;
+		const bool done = waitFor(c2p35, 0xffffffff, 0x80000000, 4000);
+		rmmio[0x50] &= 0x00ffffff;
+		vmbx = done && waitFor(c2p33, 0xffffffff, 0x80000000, 4000);
+	}
+	const uint32_t de3 = rmmio[0x0de3];
+	if (de3) {
+		rmmio[0x0006] = (de3 - 1) >> 11;
+		rmmio[0x0053] |= 0x200;
+	}
+	FBLOG("cold: asic_init: C2PMSG_33 %s (0x%08x, strap 0x%08x); [0x0006] 0x%08x [0x0053] 0x%08x [0x0de3] 0x%08x",
+	      vmbx ? "ready" : "NOT ready", rmmio[c2p33], strap, rmmio[0x0006], rmmio[0x0053], de3);
+
+	// VRAM after: whether the pattern survived, and whether a new one reads back.
+	if (vram) {
+		const uint32_t kept = vram[0];
+		vram[1] = 0xa5a5c3c3;
+		FBLOG("cold: VRAM: the pattern written before %s (0x%08x); a new one reads back %s (0x%08x)",
+		      kept == 0x5a5a1234 ? "kept" : "gone", kept, vram[1] == 0xa5a5c3c3 ? "right" : "WRONG", vram[1]);
+	}
+	if (vmap)
+		vmap->release();
+	return boot && sized && vmbx;
+}
+
+// The card's IOPCIDevice powered on again after a sleep: IOPCIFamily has restored its config space, so its registers
+// answer (unposted). The runtime's wake bring-up (on its own thread) runs from here without rdna4-pm.
+IOReturn RDNA4Device::pciPowerMessage(void *target, void *, UInt32 type, IOService *, void *, vm_size_t) {
+	auto *dev = static_cast<RDNA4Device *>(target);
+	if (type == kIOMessageDeviceHasPoweredOn) {
+		dev->logPciState("pci powered on");
+		// The card powered off with the system (it has no power states of its own): it lost its power. Said here too, not only
+		// at kIOMessageSystemWillPowerOn: in a dark wake (the system woken by a PCIe PME, a USB key press here) the card powers
+		// on long before that message, which only comes with the full wake, and the bring-up below would run warm (no displays).
+		if (!dev->coldBoot)
+			FBLOG("cold: pci powered on: the card lost its power: the next cold start runs as after a reset");
+		dev->coldBoot = true;
+		if (dev->drivesRuntimePower())
+			dev->compute->powerDidWake();
+	}
+	return kIOReturnSuccess;
+}
+
 void RDNA4Device::probeMemSize() {
 	// RCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE (NBIF 6.3.1 seg 2, dword 0x00c3):
 	// VRAM size in MiB — amdgpu's nbif_v6_3_1_get_memsize. The byte offset
@@ -2155,6 +2557,8 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	owner = ownerService;
 	if (!pciDevice || !owner)
 		return false;
+	if (!extraLock)
+		extraLock = IORecursiveLockAlloc();
 
 	uint32_t nosleep = 0;
 	if (PE_parse_boot_argn("rdna4-nosleep", &nosleep, sizeof(nosleep)) && nosleep != 0) {
@@ -2205,6 +2609,7 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 			if (hwCursorRequested)
 				initHardwareCursor();
 			probeMemSize();
+			coldProbe();
 			dumpDCN();
 			tryForce8bpc();   // DP-stream experiment (rdna4-8bpc=1)
 			probeEDID();
@@ -2231,6 +2636,31 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 
 	// Needs the boot timing (discoverPipe) and the sink's EDID (probeEDID).
 	buildModeTable();
+
+	// rdna4-coldboot=1: what the GOP left read while it is there, then the card reset (coldReset).
+	uint32_t coldArg = 0;
+	if (PE_parse_boot_argn("rdna4-coldboot", &coldArg, sizeof(coldArg)) && coldArg && rmmio && pipe.valid()) {
+		captureGopState();
+		coldBoot = coldReset();
+		FBLOG("cold: boot: %s (the GOP's scanout 0x%llx, timer 0x%08x)",
+		      coldBoot ? "the card reset; the displays light once the SMU runs" : "the reset FAILED: as a warm boot",
+		      coldGopSurface, coldGopTimer);
+	}
+	if (!gSleepTestDev && rmmio) {
+		gSleepTestDev = this;
+		sysctl_register_oid(&sysctl__debug_rdna4_head2sleep);
+	}
+	if (systemSleepWanted() && !sleepWakeNotifier) {
+		if (rmmio && pipe.valid() && !coldBoot)   // what a cold start after the wake compares against
+			captureGopState();
+		if (IOPMrootDomain *root = IOService::getPMRootDomain())
+			sleepWakeNotifier = root->registerInterest(gIOPriorityPowerStateInterest, sleepWakeMessage, this, nullptr);
+		if (pciDevice)
+			pciPowerNotifier = pciDevice->registerInterest(gIOGeneralInterest, pciPowerMessage, this, nullptr);
+		FBLOG("cold: the card's PCI state is logged at sleep and wake: %s, its power-on %s",
+		      sleepWakeNotifier ? "registered" : "NOT registered", pciPowerNotifier ? "watched" : "NOT watched");
+		logPciState("boot");
+	}
 	FBLOG("init: device ready (%ux%u console, %lu mode(s))", fbWidth, fbHeight,
 	      static_cast<unsigned long>(modeCount));
 	return true;
@@ -2243,6 +2673,10 @@ RDNA4Device::~RDNA4Device() {
 	if (cursorTrailLock) {
 		IOLockFree(cursorTrailLock);
 		cursorTrailLock = nullptr;
+	}
+	if (extraLock) {
+		IORecursiveLockFree(extraLock);
+		extraLock = nullptr;
 	}
 	if (onDieDisc) {
 		IOFree(onDieDisc, 10 << 10);
@@ -2322,13 +2756,25 @@ void RDNA4Device::buildModeTable() {
 			lim.maxPixelClockKHz = capKHz;
 	}
 
-	// DisplayPort has no TMDS limit, but its link is not retrained: nothing
-	// above the pixel clock it was brought up for (ModeSet::build).
-	if (pipe.valid() && pipe.signal == Pipe::Signal::DpSst && bootTimingValid && bootTiming.pixelClockKHz)
-		lim.maxPixelClockKHz = bootTiming.pixelClockKHz;
+	// DisplayPort has no TMDS limit, but its link is not retrained: what the link carries, and DISPCLK.
+	if (pipe.valid() && pipe.signal == Pipe::Signal::DpSst && bootTimingValid && bootTiming.pixelClockKHz) {
+		DpTrain::Sink sink = bootDpSink;
+		DpTrain::Link link = bootDpLink;
+		const bool known = bootDpLinkKnown || readBootDpLink(sink, link);
+		bootDpLinkKHz = known ? DpTrain::bandwidthKbps(link) / 24 : 0;
+		lim.maxPixelClockKHz = bootDpMaxKHz();
+		FBLOG("modes: DisplayPort modes up to %u kHz (link %u lane(s) at 0x%02x: %u kHz at 8 bpc; DISPCLK %u kHz; boot "
+		      "%u kHz)", lim.maxPixelClockKHz, link.lanes, link.rate, bootDpLinkKHz, dispclkTargetKHz(),
+		      bootTiming.pixelClockKHz);
+	}
 
+	// The EDID with its blocks past the first extension (DisplayID timings), for the table alone.
+	static uint8_t full[512];
+	memcpy(full, edidData, sizeof(edidData));
+	memcpy(full + sizeof(edidData), edidMore, sizeof(edidMore));
+	const size_t fullLen = edidLen == sizeof(edidData) ? edidLen + edidMoreLen : edidLen;
 	if (modesetRequested && edidLen)
-		modeCount = Modes::build(edidData, edidLen, lim, modeTable, Modes::MaxModes);
+		modeCount = Modes::build(full, fullLen, lim, modeTable, Modes::MaxModes);
 
 	Edid::BaseInfo base {};
 	if (edidLen && Edid::parseBaseBlock(edidData, edidLen, base)) {
@@ -2430,6 +2876,17 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
                            size_t ncmds, const char *tag, uint32_t otgOffset, const Pipe2::AuxWrite *aux) {
 	for (size_t i = 0; i < count; i++) {
 		const ModeSet::Step &s = steps[i];
+		if (stepTrail) {
+			// The boot pipe runs: its OTG0 control register reads 0xffffffff only when the card no longer answers,
+			// and the next accesses can hang the machine. Checked after each step (below), 5 ms on (a DMUB command acts
+			// after it was posted); each step logged and left as a breadcrumb first.
+			char text[96];
+			snprintf(text, sizeof(text), "%s step %lu: %.48s", stepTrail, static_cast<unsigned long>(i), s.what ? s.what : "?");
+			breadcrumb(text);
+			FBLOG("%s: step %lu op %u seg %u dword 0x%04x mask 0x%08x value 0x%08x arg %u: %s", stepTrail,
+			      static_cast<unsigned long>(i), static_cast<unsigned>(s.op), s.seg, s.dword, s.mask, s.value, s.arg,
+			      s.what ? s.what : "?");
+		}
 		switch (s.op) {
 		case ModeSet::Op::Write:
 			regWriteDmu(s.seg, s.dword, s.value);
@@ -2479,6 +2936,9 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 			break;
 		}
 		case ModeSet::Op::Dmub:
+			if (stepTrail && s.arg < ncmds)
+				FBLOG("%s: step %lu dmub %08x %08x %08x %08x %08x %08x", stepTrail, static_cast<unsigned long>(i),
+				      cmds[s.arg][0], cmds[s.arg][1], cmds[s.arg][2], cmds[s.arg][3], cmds[s.arg][4], cmds[s.arg][5]);
 			if (s.arg >= ncmds || !dmubSubmit(&cmds[s.arg], 1, tag)) {
 				FBLOG("%s: step %lu (%s): DMUB did not take the command", tag,
 				      static_cast<unsigned long>(i), s.what);
@@ -2505,6 +2965,17 @@ bool RDNA4Device::runSteps(const ModeSet::Step *steps, size_t count, const Dmub:
 			}
 			break;
 		}
+		if (stepTrail) {
+			IODelay(5000);
+			if (regReadDmu(2, Pipe::Reg::kOtgControl) == 0xFFFFFFFF) {
+				char text[96];
+				snprintf(text, sizeof(text), "%s: the card stopped answering after step %lu", stepTrail,
+				         static_cast<unsigned long>(i));
+				breadcrumb(text);
+				FBLOG("%s: %s (%s); stopped", tag, text, s.what ? s.what : "?");
+				return false;
+			}
+		}
 	}
 	return true;
 }
@@ -2518,11 +2989,24 @@ bool RDNA4Device::bootSinkPresent() {
 	return hpdY != 0xFFFFFFFF && pipe.hpd >= 1 && pipe.hpd <= 4 && ((hpdY >> (8 * (pipe.hpd - 1))) & 1);
 }
 
+uint32_t RDNA4Device::bootDpMaxKHz() {
+	const uint32_t boot = bootTimingValid ? bootTiming.pixelClockKHz : 0, dispclk = dispclkTargetKHz();
+	if (!bootDpLinkKHz || !dispclk)
+		return boot;
+	const uint32_t most = bootDpLinkKHz < dispclk ? bootDpLinkKHz : dispclk;
+	return most > boot ? most : boot;
+}
+
 void RDNA4Device::noteBootDpLink() {
-	bootDpLinkKnown = false;
+	bootDpLinkKnown = readBootDpLink(bootDpSink, bootDpLink);
+}
+
+// The boot display's sink capabilities and the link the firmware trained (DPCD reads): whether that is a link the
+// sink says it has.
+bool RDNA4Device::readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link) {
 	if (!pipe.valid() || pipe.signal != Pipe::Signal::DpSst || !sinkAuxValid) {
 		FBLOG("dptrain: the boot display is not on DisplayPort: nothing to retrain");
-		return;
+		return false;
 	}
 	// Receiver capability, then what the firmware told the sink: LINK_BW_SET,
 	// LANE_COUNT_SET, and from 0x202 on how the lanes are doing.
@@ -2530,20 +3014,21 @@ void RDNA4Device::noteBootDpLink() {
 	if (!dpcdRead(sinkAuxInst, 0x000, caps, sizeof(caps)) || !dpcdRead(sinkAuxInst, 0x100, set, sizeof(set)) ||
 	    !dpcdRead(sinkAuxInst, 0x202, status, sizeof(status))) {
 		FBLOG("dptrain: the sink's DPCD did not answer on AUX%u", sinkAuxInst);
-		return;
+		return false;
 	}
-	const bool sink = DpTrain::parseCaps(caps, sizeof(caps), bootDpSink);
-	bootDpLink = DpTrain::Link { static_cast<uint8_t>(set[1] & 0x1f), set[0] };
+	const bool parsed = DpTrain::parseCaps(caps, sizeof(caps), sink);
+	link = DpTrain::Link { static_cast<uint8_t>(set[1] & 0x1f), set[0] };
 	FBLOG("dptrain: sink DPCD %u.%u, up to %u lane(s) at rate 0x%02x%s%s, reading interval 0x%02x; the firmware's "
 	      "link: %u lane(s) at rate 0x%02x (LANE_COUNT_SET 0x%02x); lanes %02x %02x, aligned %u", caps[0] >> 4,
-	      caps[0] & 0xf, bootDpSink.maxLanes, bootDpSink.maxRate, bootDpSink.tps3 ? ", TPS3" : "",
-	      bootDpSink.tps4 ? ", TPS4" : "", caps[0x0e], bootDpLink.lanes, bootDpLink.rate, set[1], status[0],
+	      caps[0] & 0xf, sink.maxLanes, sink.maxRate, sink.tps3 ? ", TPS3" : "",
+	      sink.tps4 ? ", TPS4" : "", caps[0x0e], link.lanes, link.rate, set[1], status[0],
 	      status[1], status[2] & 1);
-	const bool lanes = bootDpLink.lanes == 1 || bootDpLink.lanes == 2 || bootDpLink.lanes == 4;
-	bootDpLinkKnown = sink && lanes && bootDpLink.lanes <= bootDpSink.maxLanes && bootDpLink.rate >= DpTrain::kRbr &&
-	                  bootDpLink.rate <= bootDpSink.maxRate;
-	if (!bootDpLinkKnown)
+	const bool lanes = link.lanes == 1 || link.lanes == 2 || link.lanes == 4;
+	const bool known = parsed && lanes && link.lanes <= sink.maxLanes && link.rate >= DpTrain::kRbr &&
+	                   link.rate <= sink.maxRate;
+	if (!known)
 		FBLOG("dptrain: that is not a link this sink says it has: it will not be retrained");
+	return known;
 }
 
 // DpTrain on one link of this card: the sink's DPCD over AUX channel `aux`,
@@ -2672,6 +3157,273 @@ DpTrain::Result RDNA4Device::retrainBootLink(const char *why) {
 	return r;
 }
 
+// The console's address as the display hub counts it: the memory controller's VRAM base (the MM hub's
+// MC_VM_FB_LOCATION_BASE, [23:0] = MC address >> 24, where amdgpu takes its fb_start) plus the console's place in
+// VRAM (its CPU address less BAR0's). What amdgpu puts in a plane's address register for a buffer in VRAM.
+bool RDNA4Device::consoleMcAddress(uint64_t &mc) {
+	constexpr uint32_t kMmFbLocationBase = 0x0554;   // MMMC_VM_FB_LOCATION_BASE (gfxregs.hpp MmFbLocationBase)
+	uint32_t off = 0;
+	IODeviceMemory *bar0 = pciDevice ? pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0) : nullptr;
+	if (!bar0 || !rmmio || !ipDiscovery.regByteOffset(IpDiscovery::HwMmhub, 0, 0, kMmFbLocationBase, off) ||
+	    off + 4 > rmmioSize)
+		return false;
+	const uint64_t base = static_cast<uint64_t>(rmmio[off / 4] & 0xffffff) << 24;
+	const uint64_t bar = bar0->getPhysicalAddress();
+	if (!base || fbPhysBase < bar || fbPhysBase >= bar + bar0->getLength())
+		return false;
+	mc = base + (fbPhysBase - bar);
+	return true;
+}
+
+// The selected extra pipe down as a power loss leaves it: asleep by its table, its timing generator stopped, an HDMI
+// one's link off. Not lit any more.
+void RDNA4Device::takeExtraDown() {
+	static ModeSet::Step otgStop[16];
+	size_t notg = 0;
+	auto crumb = [this](const char *what) {
+		char step[64];
+		snprintf(step, sizeof(step), "cold start: extra pipe %u %s", xp().pipe, what);
+		breadcrumb(step);
+	};
+	crumb(xp().on ? "asleep" : "off");
+	if (xp().on)
+		runSecondPipePart(Pipe2::Part::Sleep);
+	crumb("its OTG stopped");
+	// Stopped while its link still clocks it: an HDMI timing generator runs on its link's clock, and with the
+	// transmitter off it never reaches the end of its frame to stop (card, 2026-11-15: OTG1_OTG_CLOCK_CONTROL timed
+	// out).
+	if (!DcnInit::steps(otgStop, 16, notg, DcnInit::Table::OtgOff, xp().pipe) ||
+	    !runSteps(otgStop, notg, nullptr, 0, "dcninit: extra otg off", xp().pipe * Pipe::Reg::kOtgStride))
+		FBLOG("dcninit: extra pipe %u's timing generator did not stop", xp().pipe);
+	// HDMI: its sleep leaves the transmitter and the link encoder on. Off as Linux's warm-card init turns an enabled
+	// DIG off (dce110_power_down: disable_output, the transmitter disable), the back end as releaseBootPipe takes it
+	// (the firmware leaves DIG_BE_ENABLE set).
+	const Pipe2::Config &c = Pipe2::config();
+	AtomBios::DisplayPath xpath {};
+	crumb("its link off");
+	if (!c.dp && pathForHpd(c.hpd, xpath)) {
+		Dmub::Cmd cmd;
+		DpPhy::buildDisable(cmd, c.link, c.hpd, static_cast<uint8_t>(xpath.connectorObjId & 0xff));
+		const ModeSet::Step off[] = {
+			{ ModeSet::Op::Dmub, 0, false, 0, 0, 0, 0, "DIG1_TRANSMITTER_CONTROL disable" },
+			{ ModeSet::Op::Update, 2, false, Pipe::Reg::kDigBeEnCntl + c.dig * Pipe::Reg::kDigStride, 0x1, 0x0, 0,
+			  "DIG_BE_ENABLE: the link encoder off" },
+		};
+		if (!runSteps(off, 2, &cmd, 1, "dcninit: extra off", c.pipe * Pipe::Reg::kOtgStride))
+			FBLOG("dcninit: extra pipe %u's link %u did not go off cleanly", c.pipe, c.link);
+	} else if (c.dp) {
+		// DisplayPort: the link encoder off too (lighting requires it), the transmitter left on (pipe2.cpp 'O': its
+		// disable stopped the card on link 1; lighting enables a transmitter that is on, card-verified).
+		const ModeSet::Step off[] = {
+			{ ModeSet::Op::Update, 2, false, Pipe::Reg::kDigBeEnCntl + c.link * Pipe::Reg::kDigStride, 0x1, 0x0, 0,
+			  "DIG_BE_ENABLE: the link encoder off" },
+		};
+		(void)runSteps(off, 1, nullptr, 0, "dcninit: extra off", c.pipe * Pipe::Reg::kOtgStride);
+	}
+	xp().lit = xp().on = false;
+}
+
+bool RDNA4Device::systemSleepWanted() {
+	// On since 2026-11-15: system sleep and wake ran on the card with one and with two displays, the desktop back each time.
+#ifdef AMDRadeonRDNA4_VM_TEST
+	uint32_t on = 0;
+#else
+	uint32_t on = 1;
+#endif
+	PE_parse_boot_argn("rdna4-syssleep", &on, sizeof(on));
+	return on != 0;
+}
+
+void RDNA4Device::head2SleepTest(int what) {
+	ExtraHold hold(*this);
+	selectExtra(0);
+	useSlotTable();
+	const Pipe2::Config &c = Pipe2::config();
+	FBLOG("head2sleep: %s the second display's pipe %u (%s, lit %d, on %d)", what == 2 ? "waking" : "putting to sleep",
+	      xp().pipe, c.dp ? "DisplayPort" : "HDMI", xp().lit, xp().on);
+	if (!xp().lit)
+		return;
+	stepTrail = what == 2 ? "head2sleep: wake" : "head2sleep: sleep";
+	setSecondPipePower(what == 2);
+	stepTrail = nullptr;
+	// A clean end in the trail ("stopped ..."): a breadcrumb left there would make the next boot think this one hung
+	// and skip its bring-up (no desktop).
+	char text[64];
+	snprintf(text, sizeof(text), "stopped: head2sleep %s done, on %d", what == 2 ? "wake" : "sleep", xp().on);
+	if (compute)
+		compute->trail(text);
+	FBLOG("%s", text);
+}
+
+void RDNA4Device::breadcrumb(const char *step) {
+	if (!compute || !rmmio)
+		return;
+	uint32_t otgs = 0;
+	for (uint32_t i = 0; i < 4; i++)
+		otgs |= (regReadDmu(2, Pipe::Reg::kOtgControl + i * Pipe::Reg::kOtgStride) & 1u) << i;
+	char text[96];
+	snprintf(text, sizeof(text), "s3: %s (OTGs on 0x%x)", step, otgs);
+	compute->trail(text);
+}
+
+void RDNA4Device::extraAuxPadsAfterPowerLoss() {
+	if (!coldBoot || !rmmio || !Pipe2::config().dp)
+		return;
+	const uint8_t aux = xp().aux;
+	const uint32_t mask = kGpioDdcMask + 4u * aux, was = regReadDmu(2, mask);
+	ddcPadMode(aux, false);
+	FBLOG("dcninit: extra pipe %u: AUX%u pads: DDC%u_MASK 0x%08x -> 0x%08x", xp().pipe, aux, aux + 1u, was, regReadDmu(2, mask));
+}
+
+bool RDNA4Device::coldStart(uint32_t &relight) {
+	uint32_t on = 0;
+	relight = 0;
+	if ((!Trial::option("rdna4-dcninit", on) || !on) && !coldBoot)
+		return false;
+	ExtraHold hold(*this);
+	if (!uhdClocks) {   // a cold start's order: the 4K boot display lit on the kext's clocks, not the GOP's
+		FBLOG("dcninit: not run: the display clocks are not raised (no SMU, or a hard minimum not met)");
+		return false;
+	}
+	AtomBios::DisplayPath path {};
+	if (!bootDpLinkKnown)   // read with rdna4-dptrain only: the sink's capabilities and the firmware's link (DPCD reads)
+		noteBootDpLink();
+	// The live pixel clock is measured from the frame period (533246 kHz on one boot, 533250 on the next): the
+	// timing's shape has to be the table's, its clock within 0.05 %.
+	auto nearTiming = [](Edid::DetailedTiming a, const Edid::DetailedTiming &b) {
+		const uint32_t diff = a.pixelClockKHz > b.pixelClockKHz ? a.pixelClockKHz - b.pixelClockKHz
+		                                                        : b.pixelClockKHz - a.pixelClockKHz;
+		a.pixelClockKHz = b.pixelClockKHz;
+		return Edid::sameTiming(a, b) && diff <= b.pixelClockKHz / 2000;
+	};
+	// The one boot pipe there is a table for: the GOP's DisplayPort display on pipe 0 at its 4K timing.
+	if (!pipe.valid() || pipe.otg != 0 || pipe.hubp != 0 || pipe.dig != 0 || pipe.link != 0 || pipe.hpd != 1 ||
+	    !bootDpLinkKnown || !pathForHpd(pipe.hpd, path) || !Pipe2::use(1, false, 0, true) ||
+	    !nearTiming(liveTiming, Pipe2::config().timing)) {
+		FBLOG("dcninit: not run: the boot pipe is not the DisplayPort one on pipe 0 at the table's 3840x2160 "
+		      "(OTG%u HUBP%u DIG%u link %u HPD%u, %ux%u at %u kHz, link known %d)", pipe.otg, pipe.hubp, pipe.dig,
+		      pipe.link, pipe.hpd, liveTiming.hActive, liveTiming.vActive, liveTiming.pixelClockKHz, bootDpLinkKnown);
+		useSlotTable();   // the slot's own table again
+		return false;
+	}
+	// The console's address as the display hub counts it, computed (as after a power loss, when no pipe holds it);
+	// on this warm card it has to be the address the GOP's HUBP0 scans.
+	const uint64_t gop = coldBoot ? coldGopSurface : bootScanout();
+	uint64_t surface = 0;
+	if (!consoleMcAddress(surface) || surface != gop) {
+		FBLOG("dcninit: not run: the console's computed address 0x%llx is not the GOP's 0x%llx", surface, gop);
+		useSlotTable();
+		return false;
+	}
+	// The DCHUB global timer, started by the kext from the VBIOS's reference clock (nothing else starts it after a
+	// power loss); on this warm card the GOP's has to be running with the divider the kext computes.
+	uint32_t refKHz = 0;
+	const uint32_t gopTimer = coldBoot ? coldGopTimer : regReadDmu(2, DcnInit::kTimerCntl);
+	ModeSet::Step timerOn[2];
+	size_t ntimer = 0;
+	if (!atomBios.getDceRefClock(refKHz) || !DcnInit::timerSteps(refKHz, timerOn, 2, ntimer) ||
+	    !(gopTimer & DcnInit::kTimerEnable) || (gopTimer & DcnInit::kTimerRefDivMask) != DcnInit::timerRefDiv(refKHz)) {
+		FBLOG("dcninit: not run: the global timer the GOP left (0x%08x) is not the one the kext starts (reference "
+		      "%u kHz, divider %u)", gopTimer, refKHz, DcnInit::timerRefDiv(refKHz));
+		useSlotTable();
+		return false;
+	}
+	const uint8_t connector = static_cast<uint8_t>(path.connectorObjId & 0xff);
+
+	// 0. The lit extra pipes taken down (the init blanks and gates every pipe), lit again after. After a power loss a
+	// DisplayPort one has nothing left running: only marked dark.
+	breadcrumb("cold start: extra pipes down");
+	for (size_t i = 0; i < kMaxExtra; i++) {
+		selectExtra(i);
+		useSlotTable();
+		if (!xp().lit)
+			continue;
+		if (Pipe2::config().dp && coldBoot)
+			xp().lit = xp().on = false;
+		else
+			takeExtraDown();
+		relight |= 1u << i;
+	}
+	selectExtra(0);
+	(void)Pipe2::use(1, false, 0, true);   // the boot pipe's table again (checked above)
+	if (relight)
+		FBLOG("dcninit: extra pipe(s) 0x%x asleep, to be lit again after", relight);
+
+	ExtraPipe boot {};
+	boot.pipe = 0;
+	boot.hpd = pipe.hpd;
+	boot.aux = sinkAuxInst;
+	boot.sink = bootDpSink;
+	boot.link = bootDpLink;
+	boot.target.connectorObjId = connector;
+	xpOverride = &boot;
+
+	Pipe2::Target t {};
+	t.litHubp = 0;
+	t.alone = true;   // its VM aperture left as the hardware has it, as amdgpu leaves it on a discrete card
+	t.encoderObjId = path.encoderObjId;
+	t.connectorObjId = connector;
+	t.surface = surface;
+	t.depth = Pipe2::Depth::Plane;
+	t.linkRate = bootDpLink.rate;
+	auto *plan = static_cast<Pipe2::Plan *>(IOMalloc(sizeof(Pipe2::Plan)));
+	static ModeSet::Step init[256], otgStop[16];
+	size_t ninit = 0, notg = 0;
+	const char *why = "";
+	bool ok = plan && DcnInit::steps(init, 256, ninit);
+	FBLOG("dcninit: boot pipe 0 at 0x%llx (computed, as the GOP's), link %u lane(s) at 0x%02x on AUX%u: taking it "
+	      "down, %lu steps of dcn401_init_hw, lighting it again", surface, bootDpLink.lanes, bootDpLink.rate,
+	      sinkAuxInst, static_cast<unsigned long>(ninit));
+	// 1. The stream and the link off, as Linux's link_set_dpms_off (the table's sleep part). 2. The firmware's
+	// timing generator stopped. Also after the reset (coldBoot): a mode-1 reset leaves the timing generators
+	// running (card, 2026-11-15: OTG0 at 59.997 Hz, its links dark).
+	t.part = Pipe2::Part::Sleep;
+	breadcrumb("cold start: boot pipe down");
+	ok = ok && Pipe2::build(t, *plan, &why) &&
+	     runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dcninit: down", otgOff(), plan->aux);
+	if (ok)
+		breadcrumb("cold start: boot OTG off");
+	ok = ok && DcnInit::steps(otgStop, 16, notg, DcnInit::Table::OtgOff) &&
+	     runSteps(otgStop, notg, nullptr, 0, "dcninit: otg off", otgOff());
+	// 2b. The global timer stopped, as after a power loss, and started by the kext.
+	if (ok)
+		regWriteDmu(2, DcnInit::kTimerCntl, gopTimer & ~DcnInit::kTimerEnable);
+	ok = ok && runSteps(timerOn, ntimer, nullptr, 0, "dcninit: timer", otgOff());
+	if (ok)
+		FBLOG("dcninit: global timer 0x%08x stopped, started again at %u kHz / %u: 0x%08x", gopTimer, refKHz,
+		      DcnInit::timerRefDiv(refKHz), regReadDmu(2, DcnInit::kTimerCntl));
+	// 3. Every pipe blanked and power gated, and the rest dcn401_init_hw does.
+	if (ok)
+		breadcrumb("cold start: dcn401_init_hw");
+	ok = ok && runSteps(init, ninit, nullptr, 0, "dcninit: init", otgOff());
+	// 4. The IP request window open, as the lighting plans require (as the GOP leaves it).
+	if (ok)
+		regWriteDmu(2, 0x00a0, 1);
+	// 4b. After a power loss the boot display's DDC pads are back in their reset mode: AUX mode, as Linux's
+	// hw_ddc.c sets them each time the AUX engine is taken (the GOP had; a mode-1 reset leaves them as they were).
+	if (ok && coldBoot) {
+		const uint32_t mask = kGpioDdcMask + 4u * sinkAuxInst, was = regReadDmu(2, mask), ctrl5 = regReadDmu(2, kGpioAuxCtrl5);
+		ddcPadMode(sinkAuxInst, false);
+		FBLOG("dcninit: AUX%u pads: DDC%u_MASK 0x%08x -> 0x%08x, AUX_CTRL_5 0x%08x -> 0x%08x", sinkAuxInst, sinkAuxInst + 1u,
+		      was, regReadDmu(2, mask), ctrl5, regReadDmu(2, kGpioAuxCtrl5));
+	}
+	// 5. Pipe 0 lit again, its link trained by the kext.
+	if (ok)
+		breadcrumb("cold start: boot pipe light");
+	t.part = Pipe2::Part::Light;
+	ok = ok && Pipe2::build(t, *plan, &why) &&
+	     runSteps(plan->steps, plan->count, plan->cmds, plan->ncmds, "dcninit: light", otgOff(), plan->aux);
+	xpOverride = nullptr;
+	if (plan)
+		IOFree(plan, sizeof(Pipe2::Plan));
+	useSlotTable();
+	const uint64_t periodNs = measureFramePeriodNs(otgOff());
+	const uint32_t mHz = periodNs ? static_cast<uint32_t>(1000000000000ULL / periodNs) : 0;
+	FBLOG("dcninit: %s%s%s; OTG0 measured %u.%03u Hz, HUBP0_DCHUBP_CNTL 0x%08x", ok ? "boot pipe lit again" : "FAILED",
+	      *why ? ": " : "", why, mHz / 1000, mHz % 1000, regReadDmu(2, 0x05f4));
+	return ok;
+}
+
 bool RDNA4Device::bootPipeTarget(ModeSet::Target &t) {
 	AtomBios::DisplayPath path {};
 	uint8_t ddcLine = 0;
@@ -2732,11 +3484,43 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		}
 		vidMNow = regReadDmu(2, kDpVidM + digOff()) & 0xffffff;
 		t.dp = true;
-		t.dpMaxKHz = bootTiming.pixelClockKHz;
+		// Above the boot clock only on the kext's DISPCLK (raised when the firmware runs), not the GOP's.
+		t.dpMaxKHz = uhdClocks ? bootDpMaxKHz() : bootTiming.pixelClockKHz;
+	}
+	// The plane's request timing (HUBP DLG/TTU, DET) for the mode: Linux's DML values from the boot display's table
+	// (pipe 0 on the first DisplayPort connector), as the second pipes take theirs. Without them the plane keeps the
+	// request timing it has, which is the GOP's boot mode's until a switch with values replaced it: a mode that has to
+	// deliver its lines faster than that underflows (2560x1440@120 on the 4K mode's, card, 2026-11-15), refused.
+	static ModeSet::Step modeRegs[Pipe2::kMaxModeSteps];
+	ExtraHold hold(*this);
+	struct TableBack {
+		RDNA4Device &dev;
+		bool used;
+		~TableBack() { if (used) dev.useSlotTable(); }
+	} back { *this, dp && pipe.otg == 0 && pipe.hubp == 0 && pipe.dig == 0 && pipe.hpd == 1 && Pipe2::use(1, false, 0, true) };
+	const bool known = back.used && Pipe2::modeKnown(m.t);
+	if (!reqTimingValid) {
+		reqTiming = bootTiming;
+		reqTimingValid = bootTimingValid;
+	}
+	const auto lineFaster = [](const Edid::DetailedTiming &a, const Edid::DetailedTiming &b) {   // a's lines in less time
+		return static_cast<uint64_t>(a.hActive) * b.pixelClockKHz < static_cast<uint64_t>(b.hActive) * a.pixelClockKHz;
+	};
+	if (dp && !known && (!reqTimingValid || lineFaster(m.t, reqTiming))) {
+		FBLOG("modes: switch to id %u refused: no request timing from Linux for %ux%u at %u kHz, and the plane's (of "
+		      "%ux%u at %u kHz) does not deliver its lines fast enough", m.id, m.t.hActive, m.t.vActive,
+		      m.t.pixelClockKHz, reqTiming.hActive, reqTiming.vActive, reqTiming.pixelClockKHz);
+		return kIOReturnUnsupported;
 	}
 	auto aim = [&](const Edid::DetailedTiming &from, const Edid::DetailedTiming &to) {
 		t.from = from;
 		t.to = to;
+		t.extra = modeRegs;
+		t.nextra = 0;
+		if (back.used && Pipe2::modeKnown(to)) {
+			t.nextra = Pipe2::modeSteps(to, modeRegs, Pipe2::kMaxModeSteps);
+			clampDet(modeRegs, t.nextra, secondPipeDet(to));
+		}
 		if (!dp)
 			return;
 		if (!ModeSet::scaleDpDto(dtoNow, dtoFromKHz, to.pixelClockKHz, t.dto))
@@ -2753,15 +3537,18 @@ IOReturn RDNA4Device::applyMode(const Modes::Mode &m) {
 		return kIOReturnUnsupported;
 	}
 	FBLOG("modes: switching to id %u %ux%u@%u.%03u (%u kHz, vstartup %u): %lu steps, "
-	      "%lu DMUB commands", m.id, m.t.hActive, m.t.vActive, m.refreshMilliHz / 1000,
+	      "%lu DMUB commands, request timing %s", m.id, m.t.hActive, m.t.vActive, m.refreshMilliHz / 1000,
 	      m.refreshMilliHz % 1000, m.t.pixelClockKHz, ModeSet::vstartupLines(m.t),
-	      static_cast<unsigned long>(modePlan.count), static_cast<unsigned long>(modePlan.ncmds));
+	      static_cast<unsigned long>(modePlan.count), static_cast<unsigned long>(modePlan.ncmds),
+	      t.nextra ? "from Linux for this mode" : "kept");
 	if (dp)
 		FBLOG("modes: DisplayPort, link untouched: DTO %u + %u / %u -> %u + %u / %u, DP_VID_M 0x%x -> 0x%x",
 		      dtoNow.integer, dtoNow.phase, dtoNow.modulo, t.dto.integer, t.dto.phase, t.dto.modulo,
 		      vidMNow, t.vidM);
 	if (runPlan(modePlan)) {
 		liveTiming = m.t;
+		if (t.nextra)
+			reqTiming = m.t;
 		// The firmware taking SET_PIXEL_CLOCK does not show the PLL runs at
 		// the new rate: time the OTG's frames. An unchanged clock would give
 		// the old pixel clock over the new totals, not this refresh.
@@ -3228,6 +4015,10 @@ void RDNA4Device::selectExtra(size_t slot) {
 	if (slot >= kMaxExtra || slot == extraSlot)
 		return;
 	extraSlot = slot;
+	useSlotTable();
+}
+
+void RDNA4Device::useSlotTable() {
 	// Its connector's table, or until it has a sink its pipe's first.
 	const ExtraPipe &x = xp();
 	if (!x.hpd || !Pipe2::use(x.hpd, x.lit ? x.hdmi : dpDual(x.hpd), x.pipe, x.uhd, x.y420))

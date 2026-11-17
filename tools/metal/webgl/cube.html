@@ -1,0 +1,158 @@
+<!doctype html>
+<!-- WebGL through the card (Safari's and Chrome's WebGL draw with Metal through ANGLE). Served by serve.py, which records what the page reports.
+     1. cube: the cube of mtlprobe cube (perspective, a depth buffer, its hidden faces drawn last) into a 64x64 framebuffer, each pixel's face
+        checked against the same triangles rasterised here (a hidden face's colour must not appear).
+     2. spin: nine lit, textured cubes spinning for 10 s, the frames a second reported every second. -->
+<meta charset="utf-8">
+<title>webgl cube</title>
+<style>body { margin: 0; background: #14181f; color: #ddd; font: 14px system-ui; } canvas { display: block; } #s { position: fixed; top: 8px; left: 8px; }</style>
+<canvas id="c" width="960" height="600"></canvas>
+<div id="s">starting</div>
+<script>
+'use strict';
+const say = (k, v) => { document.getElementById('s').textContent = k + ': ' + v; fetch('/report?' + new URLSearchParams({k, v})).catch(() => {}); };
+const canvas = document.getElementById('c');
+const cssW = innerWidth || 960, cssH = innerHeight || 600;   // a tab opened in the background has no size yet
+canvas.width = cssW * devicePixelRatio; canvas.height = cssH * devicePixelRatio;
+canvas.style.width = cssW + 'px'; canvas.style.height = cssH + 'px';
+say('agent', navigator.userAgent);
+canvas.addEventListener('webglcontextcreationerror', e => say('creation error', e.statusMessage || '(no message)'));
+canvas.addEventListener('webglcontextlost', () => say('error', 'the context was lost'));
+const gl = canvas.getContext('webgl', {antialias: false});
+if (!gl) { say('error', 'no WebGL context'); throw 0; }
+const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+say('renderer', `${dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '(no debug info)'}; ${gl.getParameter(gl.RENDERER)}; ${gl.getParameter(gl.VERSION)}; ` +
+    `lost ${gl.isContextLost()}, error ${gl.getError()}`);
+if (gl.isContextLost()) throw 0;
+
+// The cube's 24 corners (4 a face: +x -x +y -y +z -z) and a column-major matrix: turned (pitch, yaw), set at `at`, 60-degree field of view.
+// GL's clip space: depth -1..1 from near 1 to far 10; y up, as mtlprobe's (its pixels are read bottom row first here).
+const axes = [[0, 1, 2], [0, 1, 2], [1, 2, 0], [1, 2, 0], [2, 0, 1], [2, 0, 1]], corner = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+const pos = [], nrm = [], uv = [];
+for (let f = 0; f < 6; f++) {
+  const sgn = f & 1 ? -1 : 1;
+  for (let k = 0; k < 4; k++) {
+    const v = [0, 0, 0], n = [0, 0, 0];
+    v[axes[f][0]] = sgn * 0.6; v[axes[f][1]] = corner[k][0] * 0.6; v[axes[f][2]] = corner[k][1] * 0.6 * sgn;
+    n[axes[f][0]] = sgn;
+    pos.push(...v); nrm.push(...n); uv.push(k === 1 || k === 2 ? 1 : 0, k >= 2 ? 1 : 0);
+  }
+}
+const mul = (a, b) => { const o = new Array(16).fill(0); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) for (let k = 0; k < 4; k++) o[c * 4 + r] += a[k * 4 + r] * b[c * 4 + k]; return o; };
+const rotation = (p, y) => { const cp = Math.cos(p), sp = Math.sin(p), cy = Math.cos(y), sy = Math.sin(y);
+  return mul([1, 0, 0, 0, 0, cp, sp, 0, 0, -sp, cp, 0, 0, 0, 0, 1], [cy, 0, -sy, 0, 0, 1, 0, 0, sy, 0, cy, 0, 0, 0, 0, 1]); };
+const matrix = (p, y, aspect, at) => { const f = 1 / Math.tan(Math.PI / 6), n = 1, z = 10;
+  const pr = [f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (z + n) / (z - n), 1, 0, 0, -2 * n * z / (z - n), 0];
+  return mul(pr, mul([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, at[0], at[1], at[2], 1], rotation(p, y))); };
+const apply = (m, v) => [0, 1, 2, 3].map(r => m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r]);
+
+function program(vs, fs) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { say('error', gl.getShaderInfoLog(s)); throw 0; }
+    gl.attachShader(p, s);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { say('error', gl.getProgramInfoLog(p)); throw 0; }
+  return p;
+}
+const buffer = (target, data) => { const b = gl.createBuffer(); gl.bindBuffer(target, b); gl.bufferData(target, data, gl.STATIC_DRAW); return b; };
+const attrib = (p, name, b, n) => { const l = gl.getAttribLocation(p, name); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, n, gl.FLOAT, false, 0, 0); };
+const posBuf = buffer(gl.ARRAY_BUFFER, new Float32Array(pos)), nrmBuf = buffer(gl.ARRAY_BUFFER, new Float32Array(nrm)), uvBuf = buffer(gl.ARRAY_BUFFER, new Float32Array(uv));
+const face = new Float32Array(24).map((_, i) => Math.floor(i / 4)), faceBuf = buffer(gl.ARRAY_BUFFER, face);
+
+// 1. The checked cube, its hidden faces last.
+function cube() {
+  const p = program('attribute vec3 p; attribute float f; uniform mat4 m; varying float vf; void main() { vf = f; gl_Position = m * vec4(p, 1.0); }',
+                    'precision mediump float; varying float vf; void main() { int f = int(vf + 0.5);' +
+                    ' gl_FragColor = f == 0 ? vec4(1,0,0,1) : f == 1 ? vec4(0,1,0,1) : f == 2 ? vec4(0,0,1,1) : f == 3 ? vec4(1,1,0,1) : f == 4 ? vec4(1,0,1,1) : vec4(0,1,1,1); }');
+  const m = matrix(0.45, 0.6, 1, [0, 0, 3]);
+  const clip = []; for (let i = 0; i < 24; i++) clip.push(apply(m, pos.slice(i * 3, i * 3 + 3)));
+  const idx = [];
+  for (let pass = 0; pass < 2; pass++)
+    for (let f = 0; f < 6; f++) {
+      const [a, b, c] = [clip[f * 4], clip[f * 4 + 1], clip[f * 4 + 2]];
+      const area = (b[0] / b[3] - a[0] / a[3]) * (c[1] / c[3] - a[1] / a[3]) - (b[1] / b[3] - a[1] / a[3]) * (c[0] / c[3] - a[0] / a[3]);
+      if ((area < 0) === (pass === 0)) for (const k of [0, 1, 2, 0, 2, 3]) idx.push(f * 4 + k);
+    }
+  const fb = gl.createFramebuffer(), tex = gl.createTexture(), rb = gl.createRenderbuffer();
+  gl.bindTexture(gl.TEXTURE_2D, tex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 64, 64, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, 64, 64);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+  gl.viewport(0, 0, 64, 64); gl.clearColor(0, 0, 0, 1); gl.clearDepth(1); gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(p); attrib(p, 'p', posBuf, 3); attrib(p, 'f', faceBuf, 1);
+  gl.uniformMatrix4fv(gl.getUniformLocation(p, 'm'), false, new Float32Array(m));
+  buffer(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx));
+  gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+  const px = new Uint8Array(64 * 64 * 4); gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // The same triangles here: pixel centres, depth (z / w, linear on the screen) tested less; row 0 is the bottom (readPixels).
+  const want = new Int8Array(4096).fill(-1), depth = new Float32Array(4096).fill(1);
+  for (let t = 0; t < 12; t++) {
+    const v = [0, 1, 2].map(k => clip[idx[t * 3 + k]]), sx = v.map(c => (c[0] / c[3] * 0.5 + 0.5) * 64), sy = v.map(c => (c[1] / c[3] * 0.5 + 0.5) * 64), sz = v.map(c => c[2] / c[3]);
+    const area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sy[1] - sy[0]) * (sx[2] - sx[0]);
+    if (Math.abs(area) < 1e-6) continue;
+    for (let y = 0; y < 64; y++) for (let x = 0; x < 64; x++) {
+      const qx = x + 0.5, qy = y + 0.5;
+      const w0 = ((sx[1] - qx) * (sy[2] - qy) - (sy[1] - qy) * (sx[2] - qx)) / area, w1 = ((sx[2] - qx) * (sy[0] - qy) - (sy[2] - qy) * (sx[0] - qx)) / area, w2 = 1 - w0 - w1;
+      if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+      const z = w0 * sz[0] + w1 * sz[1] + w2 * sz[2];
+      if (z < depth[y * 64 + x]) { depth[y * 64 + x] = z; want[y * 64 + x] = Math.floor(idx[t * 3] / 4); }
+    }
+  }
+  const rgb = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [255, 0, 255], [0, 255, 255]];
+  const hidden = new Set(idx.slice(18).map(i => Math.floor(i / 4)));
+  let wrong = 0, covered = 0, hiddenSeen = 0; const per = [0, 0, 0, 0, 0, 0, 0];
+  for (let i = 0; i < 4096; i++) {
+    const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2];
+    let got = !r && !g && !b ? -1 : rgb.findIndex(c => c[0] === r && c[1] === g && c[2] === b);
+    if (got === -1 && (r || g || b)) got = -2;
+    covered += want[i] >= 0; wrong += got !== want[i]; hiddenSeen += got >= 0 && hidden.has(got); per[got < 0 ? 6 : got]++;
+  }
+  say('cube', `${wrong} of 4096 pixels not the CPU's face (${covered} covered), ${hiddenSeen} of a hidden face; faces ${per.slice(0, 6).join(' ')}, none or other ${per[6]}: ` +
+      (!hiddenSeen && covered && wrong * 50 <= covered ? 'PASS' : 'FAIL'));
+}
+
+// 2. Nine lit, textured cubes for 10 s.
+function spin() {
+  const p = program('attribute vec3 p; attribute vec3 n; attribute vec2 t; uniform mat4 m; uniform mat4 r; varying vec3 vn; varying vec2 vt;' +
+                    ' void main() { vn = (r * vec4(n, 0.0)).xyz; vt = t; gl_Position = m * vec4(p, 1.0); }',
+                    'precision mediump float; varying vec3 vn; varying vec2 vt; uniform sampler2D s; uniform vec3 tint;' +
+                    ' void main() { float l = 0.25 + 0.75 * max(dot(normalize(vn), normalize(vec3(-0.4, 0.6, 0.7))), 0.0); gl_FragColor = vec4(texture2D(s, vt).rgb * tint * l, 1.0); }');
+  const tx = new Uint8Array(64 * 64 * 4);
+  for (let y = 0; y < 64; y++) for (let x = 0; x < 64; x++) { const v = x < 3 || y < 3 ? 32 : ((x >> 3) + (y >> 3)) & 1 ? 255 : 176; tx.set([v, v, v, 255], (y * 64 + x) * 4); }
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 64, 64, 0, gl.RGBA, gl.UNSIGNED_BYTE, tx); gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  const idx = []; for (let f = 0; f < 6; f++) for (const k of [0, 1, 2, 0, 2, 3]) idx.push(f * 4 + k);
+  gl.useProgram(p); attrib(p, 'p', posBuf, 3); attrib(p, 'n', nrmBuf, 3); attrib(p, 't', uvBuf, 2);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null); buffer(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx));
+  const um = gl.getUniformLocation(p, 'm'), ur = gl.getUniformLocation(p, 'r'), ut = gl.getUniformLocation(p, 'tint');
+  gl.viewport(0, 0, canvas.width, canvas.height); gl.clearColor(0.08, 0.1, 0.14, 1); gl.enable(gl.DEPTH_TEST);
+  const start = performance.now(); let second = start, frames = 0, total = 0;
+  const frame = now => {
+    const time = (now - start) / 1000, aspect = canvas.width / canvas.height;
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    for (let i = 0; i < 9; i++) {
+      const pitch = time * (0.7 + 0.1 * i), yaw = time * (1.1 - 0.07 * i);
+      gl.uniformMatrix4fv(um, false, new Float32Array(matrix(pitch, yaw, aspect, [(i % 3 - 1) * 1.6, (1 - Math.floor(i / 3)) * 1.6, 5 + (i % 2) * 0.8])));
+      gl.uniformMatrix4fv(ur, false, new Float32Array(rotation(pitch, yaw)));
+      gl.uniform3f(ut, 0.5 + 0.5 * (i % 3 === 0), 0.5 + 0.5 * (i % 3 === 1), 0.5 + 0.5 * (i % 3 === 2));
+      gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+    }
+    frames++; total++;
+    if (now - second >= 1000) { say('spin', `${(frames * 1000 / (now - second)).toFixed(1)} frames a second at ${canvas.width}x${canvas.height}`); frames = 0; second = now; }
+    if (time < 10) requestAnimationFrame(frame); else say('done', `${total} frames in ${time.toFixed(1)} s`);
+  };
+  requestAnimationFrame(frame);
+}
+
+cube();
+spin();
+</script>

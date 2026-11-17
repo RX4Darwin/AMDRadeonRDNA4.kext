@@ -36,7 +36,7 @@ PRODUCT      = AMDRadeonRDNA4
 # The one place the version is written (CONTRIBUTING.md says when it changes). It goes into the bundle's Info.plist,
 # the kext's kmod_info and the name of the product directory. The commit a build was made from ("-dirty": with
 # uncommitted changes) goes into the kernel log and the registry (AMDRadeonRDNA4,Build) beside it.
-VERSION      = 0.2.2
+VERSION      = 0.3.0
 
 # RELEASE: -Os, what every card test up to 0.1.0 ran. DEBUG: -O0 and DEBUG defined (Lilu's DBGLOG lines).
 CONFIG       ?= RELEASE
@@ -87,7 +87,7 @@ FW_BLOBS     = $(FW_DIR)/psp_14_0_3_sos.bin $(FW_DIR)/smu_14_0_3.bin \
                $(FW_DIR)/sdma_7_0_1.bin $(FW_DIR)/gc_12_0_1_pfp.bin \
                $(FW_DIR)/gc_12_0_1_me.bin $(FW_DIR)/gc_12_0_1_mec.bin \
                $(FW_DIR)/gc_12_0_1_uni_mes.bin $(FW_DIR)/gc_12_0_1_imu.bin \
-               $(FW_DIR)/gc_12_0_1_rlc.bin
+               $(FW_DIR)/gc_12_0_1_rlc.bin $(FW_DIR)/dcn_4_0_1_dmcub.bin
 
 # A dump of the card's ROM, which the host tests parse and the emulator's option ROM is made from. It is the card
 # vendor's and not in the repository (firmware/README.md): without it `make test` leaves the ROM checks out.
@@ -271,9 +271,9 @@ census-pathlog: $(BIN)/libpathlog.dylib
 # atomdump compiles the kext's own parsers and engines for the host and runs them against the card's ROM dump and
 # against stand-ins for the hardware: the logic is verified without a GPU.
 ATOMDUMP     = $(HOST)/atomdump
-$(ATOMDUMP): test/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp src/pipe2.cpp src/pipe2.hpp src/pipe2_linux.inc src/pipe2_linux_hpd4.inc src/pipe2_linux_dp1.inc src/pipe2_linux_dp2.inc test/ref/dp_retime_linux.inc src/dptrain.cpp src/dptrain.hpp src/dpphy.cpp src/dpphy.hpp test/ref/dp_train_linux.inc test/ref/legacy-vmtable-ref.inc src/amdfw.cpp src/amdfw.hpp src/psp.cpp src/psp.hpp src/sdma.cpp src/sdma.hpp src/pm4.cpp src/pm4.hpp src/codeobj.cpp src/codeobj.hpp src/vadd_codeobj.h src/bench_codeobj.h src/gfxregs.hpp src/linuxref.hpp src/gpuheap.cpp src/gpuheap.hpp src/flip.hpp include/rdna4compute.h src/ihdecode.cpp src/ih.hpp src/gpuvm.cpp src/vmtree.cpp src/vmtree.hpp src/n48n.cpp src/n48n.hpp test/n48n-host/hostbackend.hpp $(VULKAN)/navi48_native_abi.h src/gpuvm.hpp src/vmid.cpp src/vmid.hpp src/ptpages.cpp src/ptpages.hpp src/gpuvmtable.cpp src/gpuvmtable.hpp
+$(ATOMDUMP): test/atomdump.cpp src/atombios.cpp src/atombios.hpp src/ipdiscovery.cpp src/ipdiscovery.hpp src/edid.cpp src/edid.hpp src/otgtiming.cpp src/otgtiming.hpp src/modes.cpp src/modes.hpp src/dmub.hpp src/pipe.cpp src/pipe.hpp src/ndrv.cpp src/ndrv.hpp src/modeset.cpp src/modeset.hpp src/pipe2.cpp src/pipe2.hpp src/pipe2_linux.inc src/pipe2_linux_hpd4.inc src/pipe2_linux_dp1.inc src/pipe2_linux_dp2.inc test/ref/dp_retime_linux.inc src/dptrain.cpp src/dptrain.hpp src/dpphy.cpp src/dpphy.hpp test/ref/dp_train_linux.inc src/dcninit.cpp src/dcninit.hpp src/dcn_init_linux.inc test/ref/legacy-vmtable-ref.inc src/amdfw.cpp src/amdfw.hpp src/psp.cpp src/psp.hpp src/sdma.cpp src/sdma.hpp src/pm4.cpp src/pm4.hpp src/codeobj.cpp src/codeobj.hpp src/vadd_codeobj.h src/bench_codeobj.h src/gfxregs.hpp src/linuxref.hpp src/gpuheap.cpp src/gpuheap.hpp src/flip.hpp include/rdna4compute.h src/ihdecode.cpp src/ih.hpp src/gpuvm.cpp src/vmtree.cpp src/vmtree.hpp src/n48n.cpp src/n48n.hpp test/n48n-host/hostbackend.hpp $(VULKAN)/navi48_native_abi.h src/gpuvm.hpp src/vmid.cpp src/vmid.hpp src/ptpages.cpp src/ptpages.hpp src/gpuvmtable.cpp src/gpuvmtable.hpp
 	@mkdir -p $(HOST)
-	$(CXX) -std=c++17 -Wall -O2 -Iinclude -Itest -o $@ test/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp src/modeset.cpp src/pipe2.cpp src/dptrain.cpp src/dpphy.cpp src/amdfw.cpp src/psp.cpp src/sdma.cpp src/ihdecode.cpp src/pm4.cpp src/codeobj.cpp src/gpuheap.cpp src/gpuvm.cpp src/vmtree.cpp src/n48n.cpp src/vmid.cpp src/ptpages.cpp src/gpuvmtable.cpp
+	$(CXX) -std=c++17 -Wall -O2 -Iinclude -Itest -o $@ test/atomdump.cpp src/atombios.cpp src/ipdiscovery.cpp src/edid.cpp src/otgtiming.cpp src/modes.cpp src/pipe.cpp src/ndrv.cpp src/modeset.cpp src/pipe2.cpp src/dptrain.cpp src/dpphy.cpp src/dcninit.cpp src/amdfw.cpp src/psp.cpp src/sdma.cpp src/ihdecode.cpp src/pm4.cpp src/codeobj.cpp src/gpuheap.cpp src/gpuvm.cpp src/vmtree.cpp src/n48n.cpp src/vmid.cpp src/ptpages.cpp src/gpuvmtable.cpp
 
 atomdump: $(ATOMDUMP)
 
@@ -282,6 +282,10 @@ PVDRAW_TEST   = $(HOST)/pvdraw-test
 $(PVDRAW_TEST): test/pvdraw-test.cpp src/pvdraw.hpp
 	@mkdir -p $(HOST)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ test/pvdraw-test.cpp
+DMUBLOAD_TEST = $(HOST)/dmubload-test
+$(DMUBLOAD_TEST): test/dmubload-test.cpp src/dmubload.cpp src/dmubload.hpp test/ref/dmub_start_linux.inc
+	@mkdir -p $(HOST)
+	$(CXX) -std=c++17 -Wall -O1 -o $@ test/dmubload-test.cpp src/dmubload.cpp
 $(PVSTREAM_TEST): test/pvstream-test.cpp src/pvstream.cpp src/pvstream.hpp src/pvopcodes.inc src/pvdevinfo.inc
 	@mkdir -p $(HOST)
 	$(CXX) -std=c++17 -Wall -O1 -o $@ test/pvstream-test.cpp src/pvstream.cpp
@@ -303,10 +307,11 @@ $(HOST)/test-w12k-pm4: test/test-w12k-pm4.cpp src/pm4.cpp src/pm4.hpp
 check-isa:
 	bash test/check-isa.sh
 
-test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
+test: $(ATOMDUMP) $(PVSTREAM_TEST) $(PVDRAW_TEST) $(DMUBLOAD_TEST) $(HOST)/test-gfx12tri $(HOST)/test-gfx12tricol $(HOST)/test-w12k-pm4
 	@if [ -f $(ROM) ]; then echo "$(ATOMDUMP) $(ROM)"; $(ATOMDUMP) $(ROM); else echo "$(ATOMDUMP)   (no $(ROM))"; $(ATOMDUMP); fi
 	$(PVSTREAM_TEST)
 	$(PVDRAW_TEST)
+	$(DMUBLOAD_TEST)
 	$(HOST)/test-gfx12tri
 	$(HOST)/test-gfx12tricol
 	$(HOST)/test-w12k-pm4

@@ -3,6 +3,193 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
+## 0.3.0 (2026-11-17)
+
+**Displays**
+- The display microcontroller can run the kext's own firmware (`rdna4-dmubload=1`): the first part of lighting the
+  displays when nothing set them up (after a power loss, what system sleep waits for). After the PSP stage the PSP
+  loads linux-firmware's `dcn_4_0_1_dmcub.bin` (0x0a005000), the GOP's firmware is stopped and the controller started
+  on the new one with its windows in the compute pool, as amdgpu does at load (`src/dmubload.cpp`).
+  `tools/gen/pipegen/dmubgen.sh` runs Linux's own DMUB code on the host and `make test` holds the kext's 101 register
+  steps against it. The kext finds the command inbox from `DMCUB_INBOX1_BASE_ADDRESS` in whichever region holds it
+  (the GOP's firmware: REGION4; Linux's: window 4); with REGION4 alone the new firmware read empty commands. With the
+  boot-arg the firmware's trace is logged after each command. Card (Tahoe 26.6.2, 2026-11-14): the firmware comes up
+  in 6 ms, the second display's mode switches go through it (1680x1050 measured 59.885 Hz, 1080p 60.003 Hz).
+- The display hardware started from nothing, as Linux's dcn401_init_hw does it (`rdna4-dcninit=1`, a test on a warm
+  card): the second part of lighting the displays when nothing set them up. `tools/gen/pipegen/run.sh <linux> init`
+  runs Linux's own code on hardware with nothing running (all pipes and DIGs off) and records 168 steps
+  (`src/dcn_init_linux.inc`: DCCG stream clocks off, the link encoders' AUX, plane power gating, every pipe blanked
+  and gated, the DSCs, clock gating, the HPO block, the watermark sets as copies, the CRB). The test takes the
+  GOP's DisplayPort boot display down (its link, then its timing generator as `optc401_disable_crtc` stops one),
+  runs them, and lights pipe 0 again from a new Linux-generated table (`pipe2_linux_p0_dp1_uhd.inc`) with the
+  kext's own link training; the second display then lights next to it as on every boot. The scanout address is
+  computed (the MM hub's VRAM base plus the console's offset, as amdgpu addresses a buffer; the test requires it to
+  equal the GOP's), and a pipe lit with nothing beside it leaves its VM aperture as the hardware has it, as amdgpu
+  does on a discrete card (the second pipes go on copying it from the lit pipe). Still from the GOP: the clocks it starts
+  from. Card (Tahoe 26.6.2, 2026-11-15): the Samsung down and back in 0.35 s, its link trained in
+  one attempt (4 lanes HBR2), 60.001 Hz; the HDMI display lit after it at 60.002 Hz; desktop up. With the computed
+  address and no aperture copies (2026-11-15, two boots): the same, 60.001 and 59.998 Hz.
+- The test also stops the DCHUB global timer and starts it again as after a power loss: nothing else would, since
+  Linux only reads it on DCN 4 (and requires it running) and the VBIOS's asic_init touches no display register (it
+  waits for the PSP and the SMU). Its divider follows DC's rule from the VBIOS's display reference clock (`dce_info`,
+  100 MHz: 2, a 50 MHz hub clock), set as `dcn10_hubbub_global_timer_enable` sets it. The kext's list of VBIOS data
+  tables was one off from `dce_info` on (unused until now). Card (2026-11-15): the GOP's 0x00001002 stopped and
+  started again as 0x00001002, the Samsung lit again at 59.996 Hz, the HDMI display at 60.004 Hz.
+- The test now runs in a cold start's order: once the kext's DMUB firmware runs and the display clocks are raised
+  (when the SMU is up, `deviceSmuReady`), where it ran before both on the GOP's firmware and clocks. The extra
+  displays are lit by then: each is put to sleep by its table, its timing generator stopped as Linux stops one
+  (pipegen records `optc401_disable_crtc` for all four OTGs now), an HDMI one's link then taken off as Linux's
+  warm-card init does (`dce110_power_down`: the transmitter disable; the DIG back end as `releaseBootPipe` takes it),
+  and after the boot display each is lit again by its own plan. The order matters: an HDMI timing generator runs on
+  its link's clock and does not stop with the transmitter off. Card (2026-11-15): the Samsung lit again at
+  59.996 Hz on the kext's DMUB firmware and clocks, the HDMI display at 59.998 Hz; no step timed out.
+- A DisplayPort boot display's EDID blocks past the first extension are read (the E-DDC segment pointer first, as
+  Linux's `drm_do_probe_ddc_edid` writes it) and logged with their DisplayID timings (Type I and VII, as Linux reads
+  them); macOS's EDID and the modes stay the first two blocks. Card (2026-11-15): the Samsung's block 2 is DisplayID
+  with 3840x2160@120 and @144, 2560x1440@144 (604.25 MHz) and 1920x1080@144. The same boot, the Lenovo through a
+  passive DP-to-HDMI cable (DP++ type 1, 165 MHz) on the second DisplayPort connector: lit from its HDMI table,
+  taken down and lit again by the cold-start test.
+- A DisplayPort boot display takes modes above the pixel clock it booted with, up to what its trained link carries
+  at 8 bpc and the DISPCLK the kext holds (650 MHz), with its DisplayID timings in the mode table; the stream is
+  retimed on the link as it is (not retrained), above the boot clock only once the kext's clocks are raised.
+  `rdna4-pvfast=1` gives the paravirtual displays the fastest refresh of each size for the boot display (macOS
+  picks a size there, not a refresh). Card (2026-11-15, the Samsung booted by the GOP at 3840x2160@30, 297 MHz):
+  2560x1440@120 (497.75 MHz) measured 120.003 Hz, then 3840x2160@60 (533.25 MHz) measured 59.994 Hz.
+- System sleep is on by default (2026-11-15): `rdna4-syssleep=0` turns it off (macOS then refuses it, as before);
+  off in VM test builds. It ran on the card with one and with two displays, the desktop back each time
+  (`RDNA4Device::systemSleepWanted`, read by the device's sleep notifiers and the plugin's power routes).
+- System sleep (`rdna4-syssleep=1`, roadmap item 5, stage 1): IONDRVFramebuffer refuses it for any framebuffer on
+  IOBootNDRV, which ours always are (its `initForPM` sets `kIOPMPreventSystemSleep` in the power states it registers;
+  IONDRVSupport of Tahoe 26.6.2, disassembled). The kext routes `IOService::registerPowerDriver` and takes that flag
+  out for its own framebuffers, and logs the power calls they get. Card (2026-11-15): the machine sleeps (Sleep from
+  the Apple menu, then 30 s without input) and wakes on a key; after the wake the card reads 0xffffffff, a
+  framebuffer's wake times out after 45 s and the displays stay dark: bringing the card back is stage 2.
+  Stage 2: the card's PCI state is logged at sleep and wake (it wakes at its power-on defaults, then answers unposted
+  once macOS has restored its config space); without `rdna4-pm` (which stalls the sleep) the runtime is quiesced at
+  the sleep notice and brought up again once the card's PCI device has powered on, the PSP, SMU, DMUB and clocks
+  from nothing, and the cold start relights the displays from the GOP's state kept at boot. After a power loss the
+  DisplayPort pads are out of AUX mode: the cold start puts them back, as Linux does for every AUX transfer. Card
+  (2026-11-15): after a real sleep both displays lit again (DP trained at the first attempt, 60.002 Hz; HDMI on);
+  VRAM does not survive the sleep; the desktop stays black: the paravirtual GPU's host still holds the runtime's old
+  objects.
+- The desktop back after a real system sleep (`rdna4-syssleep=1`): at the sleep request, while the card still takes
+  submissions, the paravirtual GPU's host writes back what lives only in VRAM (held render targets, the surfaces kept on
+  the card), then gives back everything it holds of the runtime and forgets the work in flight; it opens the runtime
+  again once the wake has rebuilt it (`rtGeneration`). Card-verified 2026-11-15: the desktop comes back as it was on both
+  displays (without the write-back, the DP display kept a black overlay until things were drawn again). The wake still
+  takes about 95 s before the desktop shows (IONDRVFramebuffer's 45 s waits).
+- Sleep and wake without IOGraphics' timeouts (`rdna4-syssleep=1`, IOGraphicsFamily routes in `src/plugin.cpp`,
+  Tahoe 26.6.2 offsets, card-verified 2026-11-15): the wake shows the desktop within seconds instead of about 95 s, and
+  the sleep no longer waits 90 s before the system powers down. Found with a trace of IOFramebuffer's power path:
+  - On a board that names the GPU `VGA` (this one since the rebuild) IONDRVSupport's expander wraps our head nubs again,
+    so six framebuffers shared three `IOFBDependentIndex` slots, and the controller's table, walked as a list that ends
+    at the first empty slot, left some framebuffers without their power changes: a 45 s timeout each, at boot, sleep
+    and wake. Each of our framebuffers now opens into its controller's first free slot, and one whose open fails leaves
+    the table again.
+  - The controller's state is cached, and a framebuffer without a WindowServer port (ours, hidden behind the
+    paravirtual displays) never marked it: the sleep waited for a server that looked on (`gIOGNotifyTO`, 90 s). The
+    controller is now marked after each notification, and our framebuffers' "not up for WindowServer" bits cleared.
+  - In a dark wake (a key press wakes this board through GPE 8) the card powers on before
+    `kIOMessageSystemWillPowerOn`: the card is now known to have lost its power when its PCI device powers on, so the
+    displays are lit again.
+  - A dark wake deadlocked WindowServer on the paravirtual framebuffer (`_extEntry` waiting for it to be on) until the
+    watchdog panicked; it is now let through, and given its wake (`handleEvent(4)`) so its display pipe takes frames
+    again ("Fallback GPU Display Pipe transaction submission failed" before).
+  - The paravirtual framebuffer joined the power tree without power states, so its display could never sleep and
+    WindowServer held back its answer to every system sleep for 30 s ("WindowServer timed out(30000 ms)"). It is now
+    given the two states a framebuffer has, acknowledged at once (with IOFramebuffer's power work, one of two
+    paravirtual framebuffers waited 45 s at each change); the system then sleeps about 2 s after macOS's own 30 s
+    display-off step.
+  - A second DisplayPort display after the wake: a power loss leaves its DDC pads in I2C mode, so no AUX transaction
+    got a reply and its link did not train; set to AUX mode before it is lit again, as the boot display's.
+  Card-verified 2026-11-15 with two DisplayPort displays: about 34 s from Sleep to off, both displays and the desktop
+  back about 2 s after a key press (an `SSDT-USBW` for this board in the rig's OpenCore config, on GPE 8 where the
+  key press wakes it, makes it a full wake; with USBWakeFixup).
+- Two DisplayPort displays from boot (`rdna4-head2dp=1`, card-verified 2026-11-15: Odyssey G70D at 3840x2160 and a
+  Lenovo G25-10 at 1920x1080 on a second DP port, link trained at the first attempt, 60.002 Hz, desktop on both). With
+  the second one plugged in at boot the boot hung in the cold start (`rdna4-dcninit=1`): taking the extra DP pipe down
+  ran its recorded sleep sequence, never run on the card before, and the next register access hung the machine. A warm
+  boot with a lit DP extra pipe now leaves the cold start out (the boot display keeps the GOP's set-up); after a power
+  loss such a pipe is only marked dark and lit again. Found with NVRAM breadcrumbs through `smuReady` and the cold
+  start (`RDNA4Device::breadcrumb`, with the running timing generators), read back from Windows when macOS would not
+  boot.
+- A second DisplayPort display's own sleep (2026-11-16): DMUB's transmitter disable for link 1 stopped the whole card a
+  fraction of a second after it ran (every register 0xffffffff, then a hard hang; the same command on link 0 is fine).
+  It is left out on DisplayPort links other than 0 (`src/pipe2.cpp`, cause unknown): the rest of the sleep runs (stream
+  blanked, sink in D3, stream encoder and its symbol clock off) and the wake trains the link again on the transmitter
+  that was left on. The cold start now takes such a pipe down too (with its link encoder off) instead of leaving the
+  cold start out. Found with `debug.rdna4_head2sleep` (1 sleeps the second display's pipe, 2 wakes it, each register
+  step logged and left as an NVRAM breadcrumb, the run stopped when the card no longer answers). Card-verified: both
+  DisplayPort displays through the cold start at boot, the second's sleep and wake.
+- A real cold start (`rdna4-coldboot=1`): at boot, once the kext has read what the GOP left (the pipes, EDIDs, the
+  boot link, the scanout address, the DCHUB timer), the card is reset as Linux resets it on this SMU (mode 1 through
+  the SMU's debug mailbox, `amdgpu_device_mode1_reset`), its PCI config space (BARs, Resizable BAR) restored and the
+  VBIOS's asic_init done (decoded: the PSP's mailbox ready at once, two registers). The PSP, the SMU and the kext's
+  DMUB firmware come up as on every boot, then the cold start lights the displays; the extra displays are lit
+  after it and only then set up as lit heads. Found on the card: VRAM survives a mode-1 reset, the timing generators
+  keep running with their links dark. `rdna4-coldprobe=1` logs what the reset depends on and adds
+  `sysctl debug.rdna4_coldreset=1`, the reset alone at run time (the GPU work running then hangs the machine).
+  Card (Tahoe 26.6.2, 2026-11-15): both displays (DP 3840x2160 at 59.995 Hz, HDMI 1920x1080 at 59.997 Hz) and the
+  desktop after the reset.
+- The boot DisplayPort display's mode switches take the plane's request timing (HUBP DLG/TTU, DET) from Linux's DML
+  for the mode, from pipe 0's table as the second pipes take theirs; before, every mode ran on the GOP's boot mode's,
+  and 2560x1440@120 underflowed on the 4K mode's (its lines are delivered in 5.5 us, not 7.5). pipegen records the
+  Samsung's fast modes for that table alone (`modes-boot-dp.txt`: 2560x1440 and 1920x1080 at 120 and 144 Hz); a
+  mode without Linux's values that has to deliver its lines faster than the plane's are set for is refused.
+  Card (2026-11-15): 2560x1440@120 in 112 steps, 120.018 Hz, no underflows; 2560x1440@144 (604.25 MHz, above the
+  533.25 MHz boot mode) measured 143.999 Hz, no underflows, no glitches.
+- Under the paravirtual displays the boot display goes to the mode macOS was given for its size at the first frame,
+  also when the size is the one it runs (`PvScanout::wantsMode`): the GOP once lit the Samsung at 3840x2160@30 while
+  macOS was told 60 Hz, and it stayed at 30 Hz until a switch to another size. Card (2026-11-15): a boot the GOP lit at
+  60 Hz switches nothing; with the Samsung put into 2560x1440@60 behind macOS's back (a test-only sysctl), the next
+  frame took it back to macOS's 2560x1440@120 (119.996 Hz).
+- The extra displays' pipe selection is held under one lock from selection through use: the hot-plug poll, macOS's
+  mode switches (paravirtual host thread or NDRV) and the heads' start-up selected pipes under one another (card
+  2026-11-14: a switch logged another slot's empty mode). Card (2026-11-14): six switches of the HDMI display, each
+  logged and measured as asked (1024x768, 1280x1024, 1920x1080).
+
+**Metal (`make PVGPU=1`)**
+- No more GPU resets while shaders are translated: Apple's display pipe resets the GPU when a present is not complete
+  within 300 ms ("IOAccelDisplayPipeTransaction time out after 300ms"), and the host thread waited for the translator
+  (up to 1.8 s a shader after the boot) with the display stopped. Translations now run before a draw or dispatch is
+  built (and for the pipelines found between command buffers), and every 20 ms of the wait the host does a tick's
+  display half: the display channels, stamps, flips, VBLs and the interrupt. A present waits at most 150 ms for its
+  barriers, then shows its surface as it is. Card (Tahoe 26.6.2, 2026-11-15): with every translation moved aside
+  (408 made again after the boot) no reset, two presents ran at 150 and 163 ms; the boot before, with the display
+  channels alone, still reset at 44 s.
+- The animated wallpapers (Tahoe's "Macintosh"; Jan saw the same on Sequoia) no longer slow everything down. Two host
+  costs, found with timers on the draw path: a 4K RGBA16Float surface of 4 samples (255 MiB) was never cleared (the
+  clear's 1 MiB packets did not fit its page), so every draw into it made and freed its memory again, 48 ms each;
+  the clear now uses 32 MiB packets. And mappings of the guest's pages counted against the 1 GiB a client may pin,
+  though nothing is allocated: the wallpaper's 66-130 MiB textures were mapped again every frame (2.5 s of every 5).
+  They now count against the address space only. The 4K wallpaper is now drawn with its 4 samples (before, as one).
+  Card (Tahoe 26.6.2, 2026-11-17): the host's time 4.5 s of every 5 -> 0.6 s, about 42 frames a second (was 6-10),
+  the card 97 % busy at about 1.5 GHz. `debug.rdna4_pvnotrun` lists the draws not run since the boot by reason.
+- 3D: shaders with a small local array read at a run-time index (a table of colours) translate: the array stayed in private
+  memory behind flat pointers, which the translator refused; the pointers are now made private again so that AMDGPU keeps
+  the array in registers (selects), and a shader whose array still needs scratch is refused by its scratch size. Only
+  shaders that kept such an array get this, so those that translated before stay as they were (run on all of them, the
+  passes gave one of WindowServer's 16 bytes of scratch). `mtlprobe cube` (a cube in perspective, a Depth32Float buffer,
+  an indexed draw with its hidden faces last, each pixel's face checked against the CPU) and `mtlprobe spin` (nine lit,
+  textured cubes in a window). Card (Tahoe 26.6.2, 2026-11-17): `cube` passes with the same pixels as Apple's GPU, `spin`
+  runs at 60 frames a second (1920x1200), `mtlprobe all` passes but for `blendx` (the blend colour's green, 32 for 64:
+  not from this change, its shaders keep no array; it passed in 2026-10).
+- WebGL in Safari (`rdna4-pvmac2=1`, off by default): Tahoe x86's AppleParavirtGPUMetal reports feature profile 0x2710, which
+  Metal gives Common1, Common2 and Mac1 alone, and ANGLE (Safari's and Chrome's WebGL) refuses a device without Mac GPU family 2
+  (the context is lost at creation). With the boot-arg the kext patches that one value to 0x2711 (Common3, Mac2) where the
+  bundle's page comes in from disk, as it patches the OpenGL renderer; the IOGPUFamily variant that takes it from the host's
+  device info is ARM only. The translator takes `[[base_instance]]` (ANGLE's vertex shaders). `tools/metal/webgl/`: the cube
+  check and the spinning cubes as a WebGL page, served with its results reported back. Card (Tahoe 26.6.2, 2026-11-17): in
+  Safari the cube passes with Apple's GPU's pixels and the cubes run at 60 frames a second at 3840x1836. Off by default
+  because Chrome then takes its Dawn path, whose shaders do not translate yet (buffer slots above 27, scratch memory), and
+  WindowServer hung while it ran (the watchdog restarted it twice).
+- MetalQuake runs on the card (`tools/metal/metalquake/`: a patch to the game and how to build it for Intel). The
+  translator passes an array of textures or samplers (`array<texture2d, 16>`, AIR's pointer to n handles) as such an
+  array: with the first T#'s address in its place, MetalQuake's UI shader read the T#'s bytes as handles, faulted at 0
+  and hung the graphics ring at the game's first frame. The host's statistics count the draws into targets held on the
+  card, in place, staged and multisampled. Card (Tahoe 26.6.2, 2026-11-17): the demo and e1m1 at 3840x1878 in HDR, 60
+  frames a second on the display, the card at about 2.8 GHz.
+
 ## 0.2.2 (2026-11-14)
 
 **OpenGL (`make PVGPU=1`)**

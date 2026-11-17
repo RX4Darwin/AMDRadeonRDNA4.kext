@@ -25,12 +25,15 @@ boot display plus a second desktop on a 1080p HDMI monitor whose pipe the
 kext lights itself (`docs/second-pipe.md`). Since 2026-10-06 that needs no
 boot-arg: a second display on either HDMI connector, mode switching on
 both displays and hot-plug of the second are on by default, each with a
-boot-arg to turn it off (below). Since 2026-11-10 a `make PVGPU=1` build gives
+boot-arg to turn it off (below); since 2026-11-15 system sleep is too, the
+desktop back on both displays a couple of seconds after a key press. Since 2026-11-10 a `make PVGPU=1` build gives
 macOS Tahoe 26.6.2 a Metal desktop on the card: WindowServer composites through
 the card, and the Dock and apps draw with Metal; Liquid Glass's kernels run
 since 2026-11-11 (Sequoia 15 tested by Jan Claußen), and since 2026-11-14 its blurred
 glass (Finder's sidebar) too. OpenGL apps draw on the card as well
-(Apple's GL-on-Metal renderer; kitty and Mixxx run). See [Metal](#metal-on-macos-tahoe-and-sequoia-experimental).
+(Apple's GL-on-Metal renderer; kitty and Mixxx run). Since 2026-11-17 Metal 3D runs on it too: MetalQuake at
+3840x1878 in HDR at 60 frames a second, and WebGL in Safari (with `rdna4-pvmac2=1`). See
+[Metal](#metal-on-macos-tahoe-and-sequoia-experimental).
 
 > **Why a Lilu plugin?** The earlier build was a standalone `IOFramebuffer`
 > subclass. That links against `com.apple.iokit.IOGraphicsFamily`, whose code
@@ -117,7 +120,7 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-trace=1` | Log every NDRV request for our framebuffer and who answered it (`rdna4` or `boot`), up to 400 lines. On by default in `VMTEST` builds. Mode switches are always logged. |
 | `rdna4-modeset=0` | **Mode switching is on by default; `0` turns it off** (the boot mode alone is offered). On, the kext offers the sink's EDID modes (DTDs, CTA DTDs/VICs, standard and established timings; ≤ boot framebuffer size, TMDS ≤ 340 MHz or, for a sink whose EDID announces SCDC and a higher rate, ≤ 600 MHz, and ≤ 1.25 × boot pixel clock) instead of the boot mode alone. On an HDMI/DVI boot display a switch runs the mode-set engine (verified on the card 2026-10-04: 1920x1080 to 1600x900 on a 1080p HDMI sink, picture confirmed; the log line `modes: now ..., measured ... Hz` gives the refresh the OTG really runs at). On a DP boot display a switch retimes the stream and leaves the link as the firmware trained it, so only modes at or below the boot pixel clock are offered (verified on the card 2026-10-04: 3840x2160 to 2560x1440 on a 4K DP monitor over four HBR2 lanes, picture confirmed; the log shows `modes: DisplayPort, link untouched: DTO ...` and the measured refresh). Until 2026-10-06 a switch left the plane expecting the blank to end where it does in the boot mode, which cut the top of the picture off in modes whose blank ends earlier (the menu bar at 2560x1440, everything at 1280x720); the switch now sets that for the new mode, and 2560x1440, 1920x1080 and 1280x720 were confirmed whole on the 4K monitor that day. From 340 MHz up the link is HDMI 2.0 scrambled: the encoder's scrambler is switched with the mode and the monitor is told over SCDC, in both directions, so a monitor the GOP lit at 4K60 (533 MHz, scrambled) can be switched down as well. The scrambled path ran on the card 2026-10-05: a monitor the GOP lit at 3840x2160 (533 MHz) switched to 1920x1080@60, to 1920x1080@144 (333 MHz, measured 143.996 Hz) and back to 3840x2160 (`scdc: ... TMDS_CONFIG = 3 written`, measured 59.996 Hz), and showed the desktop again at 3840x2160. |
 | `rdna4-head2=0` | **A second display is on by default (level 4, below); `0` turns it off.** `1` is the experiment it grew from: a phantom second head. The plugin creates an `IONDRVDevice` nub just before the framebuffer starts on the GPU, makes the two heads dependents of one controller, stands in for the boot NDRV the second one cannot have, and serves the second sink's EDID with one mode on a spare VRAM surface behind the console. No display register is written and nothing appears on the monitor (its pipe stays dark): it shows whether macOS accepts a second display. Next to `rdna4-compute` since 2026-10-06 (its surface is kept below the compute pool; ran together on the card that day). Verified on the card under Big Sur 11.6.6 (2026-10-04): WindowServer opens both framebuffers and macOS lists the second display. See `docs/second-head-ndrv.md`. **Higher values also light the pipe (`docs/second-pipe.md`; all verified on the card 2026-10-04):** `2` writes nothing and publishes what every step of the plan would do to the dormant pipe's registers (`AMDRadeonRDNA4,Pipe2`, shown by `tools/rig/diagnostic-log.sh`); `3` lights the stream alone, so the second monitor shows a solid teal-blue; `4` also lights the plane, so it shows the second desktop. There is a plan per connector of the card, all at 1920x1080@60 next to a boot display on another connector: HDMI on HPD3 / link 2 (the one verified), HDMI on HPD4 / link 3 (verified 2026-10-06), and DisplayPort on HPD1 / link 0 or HPD2 / link 1, whose link the kext trains itself (those two host-tested, not yet run on the card, and only used with `rdna4-head2dp=1`). Not in `VMTEST` builds. |
-| `rdna4-head2dp=1` | Also serve a second display on a DisplayPort connector (lighting it, sleep, hot-plug and mode switching as on HDMI). Off by default because it has not run on the card yet: `docs/todo-dptest.md` has the tests. |
+| `rdna4-head2dp=1` | Also serve a second display on a DisplayPort connector (lighting it, sleep, hot-plug and mode switching as on HDMI). Card-verified 2026-11-15/16 with the second DisplayPort display connected at boot: link trained by the kext at the first attempt, desktop on both displays, its sleep and wake (`debug.rdna4_head2sleep`). Still off by default: with the paravirtual displays one plugged in after boot is lit but gets no paravirtual display (noise). `docs/todo-dptest.md` has the tests. |
 | `rdna4-hotplug=0` | **Hot-plug of the second display is on by default (level 2); `0` turns it off, `1` only logs what the pin does.** On: The connector's HPD pin is polled; unplugging takes the head offline in macOS, plugging reads the display, lights or wakes the pipe and brings the head back, and the head exists (offline) when no monitor was there at boot. `1` only logs what the pin does. Verified on the card 2026-10-05 (`docs/second-pipe.md`), and on 2026-10-06 on the other HDMI connector and through a 10-minute display sleep. A display unplugged from one HDMI connector and plugged into the other gets the pipe moved to it (verified on the card 2026-10-06, in both directions, at 60 and at 144 Hz). |
 | `rdna4-dptrain=1` | Diagnostic for a DisplayPort boot display: log what the monitor can do and which link the firmware trained, watch its HPD pin, and log the link's state when the monitor comes back. The kext does not retrain that link, because the firmware keeps it itself (card, 2026-10-06: it retrains within two seconds of the pin returning). `2` also runs the kext's own training on that link once, 15 s after the desktop is up (`src/dptrain.cpp`, as amdgpu trains): on the card that day, 4 lanes at HBR2 trained and the video was back 0.57 s after the link was taken down. |
 | `rdna4-cursor=1` | Hardware cursor on the boot display through the NDRV cursor calls (`src/cursor.cpp`, `docs/cursor-audit.md`, `docs/HANDOFF-linux.md`); used with `rdna4-vbl=1`. Off by default. Ran on the test rig 2026-10-06 on the 4K DisplayPort boot display next to the second display, through mode switches, without a fault in the log; it made no noticeable difference to how responsive the unaccelerated desktop feels. |
@@ -135,6 +138,28 @@ All parsed without a leading dash (`name=1`, not `-name=1`):
 | `rdna4-pspdump=1` | Read-only PSP (security processor) survey: bootloader/sOS/GPCOM-ring status from the MPASP scratch registers. Publishes `PSP,Alive` / `PSP,SOSVersion`. Decides whether loading fresh firmware (e.g. a current DMUB) is viable. |
 | `rdna4-compute=<stage>` | Compute bring-up, written from scratch (`src/compute.cpp`), run after the display is answered for and never with a GPU reset. **Stage 3 by default since 2026-11-03**: it starts the power-management firmware, which raises the display clocks a 3840x2160 display needs (`src/clk.cpp`); `0` turns it off. `1` = read-only survey: GFX (IMU/RLC/PFP/ME/MEC/MES), both SDMA engines, GC and MM hub apertures, PSP, HDP flush remap, and the VRAM window chosen for compute; published as the `Compute,Survey` dictionary. `2` = PSP bring-up on a background thread 5 s after the desktop: the secure-OS components through the PSP bootloader, the GPCOM command ring, `LOAD_TOC`, then the SMU firmware via `LOAD_IP_FW`, proven by the SMU answering its mailbox; published as `Compute,PSP` and `Compute,Stage`. `3` = the 19 GC firmware images through the PSP and the RLC autoload (`Compute,GFX`). `4` = GC hub for VMID0, SDMA0 queue, a WRITE and a 1 MiB fill checked by the CPU (`Compute,SDMA`). `5` = a MEC compute queue programmed directly (no MES), fed through its doorbell, running PM4: the scratch-register ring test, WRITE_DATA and a RELEASE_MEM fence (`Compute,MEC`). `6` = a real gfx1201 kernel (`src/shaders/probe.s`) dispatched on the compute units, all 256 results checked (`Compute,Dispatch`). `7` = a clang-built kernel (`src/shaders/vadd.cl`) launched from its AMDGPU code object: the loader (`src/codeobj.cpp`) finds the kernel and its descriptor, the dispatch uses the compiled RSRC1/2/3 and a kernarg buffer, and 4096 results of `c = a + 3b` are checked (`Compute,Kernel`). After stage 6 or 7 the runtime is published for user space (see *User-space compute*). Each step leaves a breadcrumb in NVRAM (`4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:rdna4-trail`) so a hang names the step. Needs the linux-firmware blobs in `firmware/amdgpu/` at build time (`tools/build/fetch-firmware.sh`). |
 | `rdna4-fakeedid=0` | `VMTEST=1` builds only: they serve the Lenovo fixture EDID and enable `rdna4-modeset` by default (so the mode list can be checked in a VM whose OpenCore pins boot-args); `=0` turns either off. |
+| `rdna4-heads=<n>` | How many displays beside the boot one the kext serves (1-3; default: one for every connector, a head without a monitor waits offline). |
+| `rdna4-boot4k=0` | Under the paravirtual displays an HDMI boot display behind a passive DP++ adapter (which the firmware lights at what the adapter carries) is taken over by a head and lit at 3840x2160 once the display clocks are up; `0` turns that off. |
+| `rdna4-dpdual-khz=<kHz>` | The TMDS clock a passive DP++ adapter is taken to carry, in place of what its ID block says. |
+| `rdna4-wakediff=1` | After a display wake, compare the registers with what lighting the pipe left in them (`src/regsnap.cpp`): a wake that leaves the display dark differs somewhere. |
+| `rdna4-dmubload=1` | The display microcontroller on the kext's own firmware (`dcn_4_0_1_dmcub.bin`, loaded through the PSP after the compute bring-up's PSP stage) instead of the GOP's. |
+| `rdna4-dcninit=1` | The cold-start test on a warm card: once the SMU runs, the extra displays and the DisplayPort boot display (pipe 0 at 3840x2160) are taken down, Linux's `dcn401_init_hw` runs from nothing, the kext starts the DCHUB timer, and the pipes are lit again from Linux-generated tables. A DisplayPort extra pipe is taken down without its transmitter disable (`src/pipe2.cpp`: on link 1 it stopped the card); after a power loss such a pipe is only lit again. |
+| `rdna4-coldboot=1` | A real cold start: once the kext has read what the GOP left (pipes, EDIDs, boot link, scanout address, DCHUB timer), the card is reset (mode 1, as Linux resets it on this SMU) and the displays are lit from nothing once the SMU runs. Wants `rdna4-compute` at stage 3 or more and `rdna4-dmubload=1`. |
+| `rdna4-coldprobe=1` | Log what a mode-1 reset depends on (the PSP and SMU mailboxes, the registers `asic_init` touches, the PCI config space and Resizable BAR), and add `sudo sysctl debug.rdna4_coldreset=1`, the reset alone at run time (the card comes back; the GPU work running then hangs the machine later). |
+| `rdna4-syssleep=0` | **System sleep is on by default (since 2026-11-15); `0` turns it off**, and macOS then refuses system sleep, as IONDRVFramebuffer does for any framebuffer on IOBootNDRV. Off in VM test builds. On: the runtime and the paravirtual GPU's host give back what the card holds at sleep (writing back what lives only in VRAM), and the wake brings the runtime up again with both displays lit from nothing. With it IOGraphics' power work runs right for our framebuffers and for the paravirtual one (`src/plugin.cpp`: framebuffer slots, controller state, the dark wake, the paravirtual display's power states). Card-verified 2026-11-15, also with two DisplayPort displays: about 30 s from Sleep to off (macOS's own display-off step), the desktop back about 2 s after a key press. A board that wakes from USB through a GPE macOS does not take for a user wake needs USBWakeFixup with an `SSDT-USBW` on that GPE in its OpenCore config (here GPE 8, reported as GPP2). |
+| `rdna4-pm=1` | The compute service joins the power tree and suspends and resumes the runtime itself. Stalls a real system sleep: not with `rdna4-syssleep=1`. |
+| `rdna4-sleeptest=1`, `rdna4-quiesce-test=1`, `rdna4-resume-tests=1`, `rdna4-sleepabort=0` | Power tests and their controls: the runtime's own sleep/wake cycle without a system sleep (`rdna4-run sleeptest`), the shutdown quiesce at boot, the bring-up tests again after a wake; `rdna4-sleepabort=0` lets client waits run on through a sleep request. |
+| `rdna4-clocks=1` | Log the DPM levels of the display and memory clocks the power-management firmware offers. |
+| `rdna4-dispclk=<MHz>`, `rdna4-dcfclk=<MHz>`, `rdna4-uclk=<MHz>`, `rdna4-fclk=<MHz>` | The hard minimums the kext asks the SMU for, in place of DISPCLK/DPPCLK 650, DCFCLK 600, UCLK at its top level, FCLK left alone. `rdna4-dispclk=0` leaves the clocks alone (and offers no 4K). |
+| `rdna4-gfx=2` | The graphics ring (PFP/ME through its doorbell), after the compute stages; `rdna4-gfxclient=1` adds a client's gfx IB through it, `rdna4-gfxcol=1` a colour test. |
+| `rdna4-gfxcap`, `rdna4-gfxce`, `rdna4-gfxcg`, `rdna4-gfxcsb`, `rdna4-gfxdiag`, `rdna4-gfxgolden`, `rdna4-gfxidle`, `rdna4-gfxoff`, `rdna4-gfxpark`, `rdna4-gfxpm`, `rdna4-gfxprobe`, `rdna4-gfxrbmin`, `rdna4-gfxsane`, `rdna4-gfxsrm`, `rdna4-gfxva0` | Experiments and A/B controls of the GFX bring-up and its power features (clock gating, GFXOFF, idle accounting, golden registers, clear state, ring and clip settings); what each does is at its use in `src/gfxring.cpp`, `src/compute.cpp` and `src/pmidle.cpp` and in `docs/power-gfx.md`. |
+| `rdna4-vm=1` | The runtime's clients each in an address space of their own (a VMID). |
+| `rdna4-vmshared=<0-2>` | Where the clients' compute jobs run: 1 (the default) on two kernel-owned shared queues, 2 the same with pooled VMIDs, 0 the old path, a queue of the client's own. |
+| `rdna4-hang=0` | The shared queues' recovery from a hung job is on by default; `0` turns it off. |
+| `rdna4-vm-diag`, `rdna4-vm-exec`, `rdna4-vm-force-fail`, `rdna4-vm-ispte`, `rdna4-vmid-test`, `rdna4-faultpage` | Diagnostics and negative controls of the GPU page tables and VMIDs (`docs/w13-vmid.md`, `src/vmtest.cpp`). |
+| `rdna4-flip=1`, `rdna4-vrambench=1`, `rdna4-accelcensus=1` | The page-flip smoke test after the compute bring-up; VRAM speed through BAR0 per cache mode; an IOAccelerator-shaped service that logs what Metal asks of it (`docs/metal-spike.md`). |
+| `rdna4-pvgpu=1` | `make PVGPU=1` builds: the paravirtual GPU Apple's `AppleParavirtGPU` drives, its host on the card (Metal, *Metal* below); `rdna4-pvgpu-disp` (bit 2: the heads are its displays), `rdna4-pvgpu-delay=<s>` (publish it later), `rdna4-pvgl=1` (OpenGL on it), `rdna4-pvscaled=0` (no scaled modes above 3840x2160), `rdna4-pvfast=1` (the boot display's modes at each size's fastest refresh, not the one nearest 60 Hz), `rdna4-pvedid=0` (the guest's EDID as it makes it); `rdna4-pvgpu-class`, `rdna4-pvgpu-match`, `rdna4-pvgpu-width`, `rdna4-pvgpu-height` and `rdna4-steptrace` are bring-up diagnostics. |
+| `rdna4-cursorcm`, `rdna4-cursorcrq`, `rdna4-cursordlg`, `rdna4-cursordscl`, `rdna4-cursorlock`, `rdna4-cursormpcc`, `rdna4-cursormpcsel`, `rdna4-cursorpipe`, `rdna4-cursorttu` | A/B controls of the hardware cursor's programming (`rdna4-cursor=1`; `docs/cursor-audit.md`, `docs/cursor-ttu.md`). |
 | `-rdna4dbg` | Lilu debug logging for the plugin (Lilu DEBUG builds). |
 
 The standalone build's `rdna4-hwcursor`, `rdna4-curmode`, `rdna4-curtest`,
@@ -158,58 +183,6 @@ of toggling a DP stream; with mode switching on (the default) it takes the link 
 monitor really sleeps, and wakes it with a mode set to the running timing
 (verified on the card 2026-10-06: a monitor the firmware lit at 3840x2160,
 533 MHz scrambled, went to standby and came back sharp).
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `src/plugin.cpp` | Lilu plugin entry: routes `IONDRVFramebuffer::doDriverIO`, recognises our framebuffers, creates the device state, hands NDRV requests to the translator. Checks the local NDRV record mirrors against the SDK at compile time. |
-| `src/device.{hpp,cpp}` | `RDNA4Device`: scanout adoption, BAR5 MMIO, VBIOS/IP discovery, lit pipe, AUX/DC_I2C engines and EDID, DMUB ring, SMU/PSP/IH diagnostics, display power, mode table. |
-| `src/compute.{hpp,cpp}` | `RDNA4Compute`: staged compute bring-up next to the display path (`rdna4-compute=<stage>`): survey, PSP and SMU firmware, GC firmware and RLC autoload, GC hub and SDMA, a MEC queue, kernel dispatch. |
-| `src/gfxregs.hpp` | Register map of the compute side (GC 12.0.1, SDMA 7, GC/MM hubs, NBIF HDP remap, PSP and SMU mailboxes) as segment + dword offset pairs. |
-| `src/amdfw.{hpp,cpp}` | Freestanding parser for AMD firmware containers: common header, LOAD_IP_FW payloads, the PSP secure-OS package. Host-tested against the real blobs. |
-| `src/psp.{hpp,cpp}` | Freestanding PSP driver: bootloader component loading, GPCOM ring, command submission with fences, LOAD_TOC, LOAD_IP_FW. Host-tested against a simulated PSP. |
-| `src/fwblobs.S` | Embeds the PSP sOS, SMU, SDMA and GC 12.0.1 firmware from `firmware/amdgpu/` (linux-firmware, AMD redistributable license) into the kext. |
-| `src/sdma.{hpp,cpp}` | SDMA 7 packet builders (WRITE, FENCE, CONST_FILL, COPY) and ring writer. Host-tested. |
-| `src/ih.{hpp,cpp}`, `src/ihdecode.cpp` | IH v7 ring setup, PCI MSI filter/action, bounded fence waits, vector decode and source accounting. Host-tested decode and ring arithmetic. |
-| `src/pm4.{hpp,cpp}` | PM4 type-3 packet builders (SET_UCONFIG_REG, SET_SH_REG, WRITE_DATA, ACQUIRE/RELEASE_MEM, DISPATCH_DIRECT) and compute queue writer. Host-tested. |
-| `src/codeobj.{hpp,cpp}` | Freestanding AMDGPU code-object reader: a kernel's descriptor (RSRC1/2/3, kernarg size, SGPR requests) and the loadable image (PT_LOAD segments at their virtual addresses). Host-tested against clang's output. |
-| `src/runtime.cpp`, `src/gpuheap.{hpp,cpp}` | The user-space compute runtime: a 4 KiB-granule VRAM heap, buffers and programs per connection, synchronous dispatches on the MEC queue, hung-queue detection. The heap is host-tested. |
-| `src/pvgpu.{hpp,cpp}`, `src/pvstream.*`, `src/pvdraw.hpp`, `src/pvopcodes.inc`, `src/pvdevinfo.inc` | `make PVGPU=1` only: the paravirtual GPU, a PCI device on the card for Apple's `AppleParavirtGPU`, and its host, which carries out the Metal command stream on the card (blits, compute, draws, textures, IOSurfaces). |
-| `src/pvscanout.{hpp,cpp}`, `src/pvhooks.{hpp,cpp}` | `make PVGPU=1` only: the heads as the paravirtual GPU's displays (`rdna4-pvgpu-disp` bit 2), their frames scanned out by the card; the hooks that keep WindowServer off the real framebuffers then. |
-| `src/userclient.{hpp,cpp}` | `RDNA4ComputeService` (published once stage 6/7 finished) and `RDNA4ComputeClient`, the IOUserClient that checks each call and hands it to the runtime. Root only. |
-| `include/rdna4compute.h` | The user-space ABI: selectors, scalar/struct shapes, the dispatch struct. Shared by the kext and user space. |
-| `src/shaders/bench.cl`, `src/bench_codeobj.h` | `lds_reverse` (LDS + barrier test), `copy` (VRAM bandwidth), a tiled `sgemm` (64x64 tiles through LDS), the matrix units (`wmma16`, `hgemm`, `bf16gemm`), and the affine/scaled `mandelbrot` and `mandelbrot_zoom` kernels, one clang-built code object used by `rdna4-run`. |
-| `userspace/rdna4-run/librdna4.{h,c}`, `userspace/rdna4-run/rdna4-run.c` | C library over the user client, including synchronous and queued Present/Restore display ownership, and `rdna4-run` (`info`, `selftest`, `bench`, `show`, `anim`, `load`). Built with the kext (`Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run`). |
-| `src/shaders/probe.s`, `src/probe_kernel.h` | The stage-6 test kernel (gfx1201 assembly) and its machine code, generated by `tools/gen/build-shaders.sh` with upstream LLVM. |
-| `src/ndrv.{hpp,cpp}` | Freestanding NDRV `csc` translator: mode list, video parameters, timings, current mode, connection, EDID blocks, DPMS, mode switch. Host-tested. |
-| `src/bochsvbe.{hpp,cpp}` | `VMTEST` only: mode switches on QEMU's `vmware-svga` through the Bochs VBE interface (the one OVMF's GOP uses on that card). |
-| `src/cursor.cpp` | The DCN hardware cursor behind the NDRV cursor calls (`rdna4-cursor=1`). |
-| `src/atombios.{hpp,cpp}` | Freestanding, bounds-checked AtomBIOS parser: data tables (connectors, GPIO LUT, firmwareinfo) + command-function directory. |
-| `src/ipdiscovery.{hpp,cpp}` | Parser for AMD's IP discovery binary — per-card IP versions and register segment bases (what amdgpu uses instead of hardcoded offsets; the key to ASIC portability). |
-| `src/edid.{hpp,cpp}` | EDID parsers: base block (all descriptors, range limits, established/standard timings via a DMT table, physical size) and CTA-861 extension (DTDs, VICs via a CEA-861 table, HDMI VSDB). |
-| `src/modes.{hpp,cpp}` | EDID → deduplicated, filtered, deterministically ordered display-mode table with stable IDs. |
-| `src/pipe.{hpp,cpp}` | Lit-pipe discovery (OTG/DIG/link/OPP/HUBP, DP vs HDMI) and OTG-image → timing inversion. |
-| `src/modeset.{hpp,cpp}` | The mode-switch plan for the lit pipe: HDMI (PLL and transmitter through DMUB, scrambling above 340 MHz) and DisplayPort (stream retimed on the trained link). |
-| `src/pipe2.{hpp,cpp}`, `src/pipe2_linux*.inc` | The plan that lights a second pipe for the second head; the register tables are generated, one per connector: two HDMI, two DisplayPort (`docs/second-pipe.md`). |
-| `src/dmub.hpp` | DMUB ring command ABI and builders for the VBIOS-family commands (transmitter control v1.7, set pixel clock v1.7, DIG encoder stream setup v1.5). |
-| `src/otgtiming.{hpp,cpp}` | EDID timing → DCN OTG register images, per amdgpu's `optc1_program_timing` (mode-set groundwork). |
-| `src/kmod_info.c` | kmod glue pointing at Lilu's plugin start/stop. |
-| `lib/Lilu/` | Lilu submodule (v1.7.3), for the plugin headers and `plugin_start.cpp`. |
-| `test/atomdump.cpp` | Host test harness: parsers against the real ROM and captured EDID fixtures, pipe discovery, DMUB payloads, the NDRV translator (`make test`). |
-| `tools/vm/vm-opencore.sh`, `tools/vm/vm-ocplist.py` | Build a development OpenCore disk for an OSX-KVM VM with AMDRadeonRDNA4 injected after Lilu. |
-| `tools/vm/logs-ssh.sh` | Pull the AMDRadeonRDNA4 kernel log and registry properties from a macOS machine over SSH. |
-| `src/dptrain.{hpp,cpp}` | DisplayPort link training (clock recovery, channel equalisation, retries), as amdgpu does it; everything the hardware and the monitor do comes through callbacks. Host-tested against `test/ref/dp_train_linux.inc`. |
-| `src/dpphy.{hpp,cpp}` | What training asks of DCN 4.01: the link encoder registers behind each training pattern and the DMUB transmitter commands (enable, lane drive, disable). Host-tested against the same reference. |
-| `src/n48n.{hpp,cpp}`, `src/vmtree.{hpp,cpp}` | The kernel half of the Vulkan driver's interface: one client's buffers, mappings, contexts, submitted work (what a command buffer may be, sequences, waits, when work counts as lost) and the display it may show pictures on, and its four-level page table. Freestanding. Host-tested, and run under the real driver with `test/n48n-host/`. |
-| `src/n48nkext.cpp`, `include/rdna4vulkan.h` | That engine on the card: a user client of type `'N48N'` on the compute service (root only, one at a time), buffers from the runtime's VRAM heaps and from system memory, the client's page table in VRAM, its address space (number 8), its work on the kernel's graphics ring, its pictures on the boot display through the runtime's flip, and a copy test that has the GPU's copy engine work in that address space. Needs `rdna4-compute=7`, and `rdna4-gfx=2` to submit work; with `rdna4-vm=1` it takes an address space the runtime's clients do not hold (**verified on the card** 2026-10-07: the probes, and a Vulkan program presenting for two minutes beside the runtime's whole self-test, all rows PASS). A program whose shader faults loses its own device after ten seconds and the ring stays in service (`vkprobe <lib> fault`, verified 2026-10-07). **Verified on the card** (2026-10-06): the memory half and the copy test (`userspace/vulkan/n48nprobe.c`: all ok), and the driver's work through submit and wait: two fills by the command processor (the second was taken for a compute shader's until 2026-10-07, when a real one, a 252 KiB fill, first ran) and a triangle rendered into an image and read back (`userspace/vulkan/vkprobe.c`: done, all ok). and a picture on the boot display: a moving triangle for five seconds at 60 frames a second, the desktop back afterwards (`vkprobe ... show`) (`docs/vulkan-port.md` sections 8 to 10, `docs/todo-vulkantest.md`). |
-| `test/n48n-host/` | Runs the real RADV driver, and the card test's program, on that engine on a Mac, with no kext: a library that answers their IOKit calls with it (`run.sh`). |
-| `userspace/vulkan/` | The RADV (Mesa Vulkan) port to macOS for this card, from Navi48-MacOS: five patches and the kernel interface they expect, two small patches of this repository's, a build script, and `n48nprobe.c`, the card test of the interface's memory half (`make n48nprobe`). On the card (2026-10-06) `n48nprobe` passes and the driver creates its device, runs two fills and renders a triangle through the kext, read back right (`vkprobe`: done, all ok). `vkprobe ... show` puts a picture on the boot display, 60 frames a second, and gives the desktop back (`docs/vulkan-port.md`). Since 2026-10-13 an eighth patch gives the driver swapchains on a headless surface, shown on that display, and `make vkcube` builds Khronos's loader and `vkcube` to run on it; **both verified on the card** 2026-10-13: a swapchain program at 60 frames a second and vkcube's cube on the boot display (`docs/vulkan-port.md` section 12). |
-| `tools/rig/cgmode.py` | On the test machine: list a display's modes and switch to any of them for the login session (Displays preferences hides most modes of a monitor it takes for a television). |
-| `tools/gen/pipegen/` | Runs Linux's own DCN 4.01 display code on the host against a recorder: generates `src/pipe2_linux*.inc` and the DisplayPort references `test/ref/dp_retime_linux.inc` (a mode switch) and `test/ref/dp_train_linux.inc` (link training against simulated monitors) (`run.sh <linux tree>`). |
-| `tools/linux/linux-capture.sh` | Ground-truth capture of amdgpu's display programming on Linux, for the mode-set engine. |
-| `Info.plist` | Lilu plugin personality (`IOResources`), OSBundleLibraries (Lilu, IOPCIFamily, KPIs). |
-| `Makefile` | Cross-compiles x86_64 on any host, assembles the `.kext`. |
 
 ## User-space compute (`rdna4-run`, `librdna4`)
 
@@ -290,8 +263,18 @@ What runs (card, macOS Tahoe 26.6.2, 2026-11-10 to 2026-11-12; Sequoia 15 by Jan
 desktop composited on the card, the Dock with every icon, apps' windows (Finder, iTerm2, ...), Liquid Glass with its
 blurred glass (Finder's sidebar), Metal compute, blits and draws of every form with vertex descriptors, textures, mip
 levels (drawn into, sampled at explicit LODs) and mip-level views, 2D array textures, blending, stencil, the depth
-test (Depth32Float), RG32 integer targets, sRGB targets, 2x and 4x multisampling, up to eight colour attachments. `tools/metal/m1/mtlprobe.m` (`mtlprobe all`)
-checks blits, compute and drawing.
+test (Depth32Float), RG32 integer targets, sRGB targets, 2x and 4x multisampling, up to eight colour attachments,
+and the animated wallpapers (Tahoe's "Macintosh") at about 42 frames a second. `tools/metal/m1/mtlprobe.m` (`mtlprobe all`)
+checks blits, compute and drawing; `mtlprobe cube` checks a depth-tested cube in perspective against the CPU, `mtlprobe spin`
+shows nine lit, textured cubes in a window. `sysctl debug.rdna4_pvnotrun` lists the draws the host could not run since
+the boot, by reason.
+
+**3D** (card, 2026-11-17): MetalQuake (`tools/metal/metalquake/`: a patch to the game and how to build it for Intel)
+plays its demo and its levels at 3840x1878 in HDR at 60 frames a second. WebGL runs in Safari with `rdna4-pvmac2=1`:
+Tahoe's Intel build of the paravirtual Metal driver reports a device without Mac GPU family 2, which WebGL (ANGLE)
+requires, and the boot-arg patches that one value as the driver loads. It is off by default: Chrome then takes its
+Dawn path, whose shaders do not translate yet, and WindowServer hung while it ran. `tools/metal/webgl/` has the cube
+check and the spinning cubes as a WebGL page.
 
 **OpenGL** (on unless `rdna4-pvgl=0`, card 2026-11-12 to 2026-11-14): macOS's OpenGL 4.1 on Metal
 (`AppleMetalOpenGLRenderer.bundle`) runs on the paravirtual GPU, so unmodified OpenGL programs draw on the card:
@@ -345,28 +328,22 @@ rdna4-compute=7 rdna4-gfx=2 rdna4-vm=1 rdna4-pvgpu=1 rdna4-pvgpu-disp=7 rdna4-pv
 | `rdna4-pvgpu-match=0` | The device is published but no driver may take it (diagnostics). |
 | `rdna4-pvscaled=0` | No scaled modes above a head's 3840x2160. |
 | `rdna4-pvgl=0` | OpenGL in software. By default OpenGL is on the card: `AppleMetalOpenGLRenderer` named on the accelerator and patched as it loads, when it is Tahoe 26.6.2's. |
+| `rdna4-pvmac2=1` | The paravirtual device reports Mac GPU family 2 and Common3 (`AppleParavirtGPUMetal`'s feature profile patched as it loads, Tahoe 26.6.2): WebGL in Safari. Off by default: Chrome's Dawn path does not run yet, and WindowServer hung while Chrome ran with it. |
 
 **Limits.** It is Apple's paravirtual Metal, with that device's limits and the features the host does not offer
 yet: no Metal heaps, no argument buffers, no indirect command buffers, no texture swizzles (the Intel build of the
-guest driver drops them); OpenGL only with Tahoe 26.6.2's renderer. Apps started before the device is published draw on the CPU until
+guest driver drops them); OpenGL only with Tahoe 26.6.2's renderer. The shader translator takes 16 textures and
+samplers a stage, buffer slots 0-27 and no scratch memory (a local array the compiler cannot keep in registers):
+Chrome's Dawn shaders and MetalQuake's bindless world shader need more. Known open issues: flickering lines and squares
+over Safari's active tab on the display (not in screenshots), and WindowServer's `brim_init_lpf` draws into a format
+the host does not take yet. Apps started before the device is published draw on the CPU until
 they are restarted. The IOSurface lookup depends on Tahoe 25G83's IOSurface internals. Without the card's firmware in the
 build (`firmware/amdgpu/`) the runtime does not come up and no device is published. The design notes and every
 measurement are in `docs/m0-pvgpu.md` and `docs/m1-stream.md`.
 
 ## Where things are
 
-| Directory | What |
-|---|---|
-| `src/` | The kext. `src/shaders/` has the sources of the GPU test kernels whose machine code is committed beside them; `src/kext.mk` builds the objects. |
-| `include/` | The kext's interface to user space, shared by both sides. |
-| `userspace/` | Programs that use that interface: `rdna4-run/` (the compute runtime's client and its library) and `vulkan/` (the RADV port and its test programs). |
-| `test/` | Host tests, run by `make test`; `test/ref/` holds the tables taken from Linux that they compare against. |
-| `tools/` | Development scripts by purpose (`tools/README.md`). |
-| `emu/` | The emulated card: a QEMU device and the EFI driver of its option ROM. |
-| `firmware/` | Where fetched firmware goes; nothing of it is in the repository (`firmware/README.md`). |
-| `lib/` | The submodules: Lilu and MacKernelSDK. |
-| `docs/` | Notes, plans and the records of the card tests. |
-| `Build/` | Everything that is built (not in the repository). |
+What each directory and source file is: [docs/index.md](docs/index.md).
 
 ## Building
 
@@ -538,40 +515,83 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
    extending `IONDRVFramebuffer`, injected by OpenCore; mode list, EDID
    identity and (VM) mode switching verified in System Settings → Displays.
    Hardware verification of the plugin build is next.
-4. **Native mode setting (DCN 4.1.0)** — program the pixel clock and
-   transmitter through DMUB, then OTG timing and HUBP viewport, to change
-   resolution and light additional connectors (`RDNA4Device::applyMode`).
-   **Key constraint (verified against this ROM):** the VBIOS carries *no*
-   display command tables — only `asic_init` survives;
-   `setpixelclock`/`dig1transmittercontrol` are absent because DCN 3.1+ moved
-   that work to DMUB firmware mailbox commands. The DMUB payloads are built
-   and host-tested (`src/dmub.hpp`); `tools/linux/linux-capture.sh` records what
-   amdgpu programs on the same card as ground truth. **First run on the
-   card 2026-10-04** (HDMI boot display, 1920x1080 to 1600x900): the GOP's
-   DMUB firmware (version 0x0000e840, read over GPINT) takes the mainline
-   transmitter, pixel-clock and encoder commands although the GOP itself
-   never sends them. HDMI 2.0 scrambling above 340 MHz (encoder scrambler
-   plus the sink's SCDC register) ran on the card 2026-10-05, off and on
-   again (533 MHz). DP mode switching retimes the stream on the trained link
-   (verified 2026-10-04). A pipe the GOP did not set up is lit from a
-   register sequence generated from Linux's own code (verified 2026-10-04
-   for one configuration, `docs/second-pipe.md`). DP link training is written and
-   host-tested against Linux, not yet run on the card; modes above the boot pixel
-   clock on a DP boot display still need it wired into the mode switch.
-5. **Display power management** — display sleep was verified on hardware
-   with the standalone build (DP: video stream off + sink D3 over native-AUX
-   DPCD `SET_POWER`; HDMI: OPP pattern generator blank). It now runs from
-   `cscSetSync` (DPMS), verified on hardware 2026-10-05 for the DP boot
-   display and for the HDMI second pipe, which sleeps the way amdgpu does
-   DPMS off (stream encoder and transmitter down, `docs/second-pipe.md`).
-   An HDMI boot display does the same unless `rdna4-modeset=0`
-   (`ModeSet::buildSleep`, then a mode set to the running timing to wake;
-   verified on hardware 2026-10-06 at 3840x2160, 533 MHz) and is blanked
-   without it.
-   System sleep stays vetoed (as `IOBootNDRV` does): after GPU power loss the
-   display pipe cannot be reprogrammed until native mode setting exists.
-6. **Power / clocks** — SMU firmware handshake so the card is stable, not
-   stuck at boot clocks.
+4. **Native mode setting (DCN 4.1.0)** — done on the card, but for the
+   items below the struck ones. The VBIOS carries *no* display command
+   tables (only `asic_init`): pixel clock, transmitter and encoder go to the
+   DMUB firmware as mailbox commands (`src/dmub.hpp`).
+   - ~~HDMI mode switches (2026-10-04) and HDMI 2.0 scrambling at 533 MHz
+     (2026-10-05)~~
+   - ~~DisplayPort mode switches retimed on the trained link (2026-10-04)~~
+   - ~~A second pipe lit from a register sequence generated from Linux's own
+     code (2026-10-04, `docs/second-pipe.md`), on either HDMI connector and
+     behind passive DP++ adapters, with its sleep, mode switches and
+     hot-plug~~
+   - ~~The kext's own DisplayPort link training (2026-10-06, 4 lanes at
+     HBR2)~~
+   - ~~Lighting the displays when nothing set them up, on a warm card
+     (2026-11-14/15): the DMUB firmware loaded through the PSP and started as
+     amdgpu does (`rdna4-dmubload=1`), Linux's `dcn401_init_hw` from nothing
+     (168 recorded steps), the boot display relit from a Linux-generated
+     table with the kext's own training, its scanout address computed and
+     the DCHUB global timer started by the kext (`rdna4-dcninit=1`), in a
+     cold start's order~~
+   - ~~A real cold start from a reset card (`rdna4-coldboot=1`, 2026-11-15):
+     a mode-1 reset at boot as Linux does it, then both displays and the
+     desktop with nothing of the GOP's left in the hardware~~
+   - ~~DisplayPort modes above the boot pixel clock, with Linux's request
+     timing for each (2026-11-15: 2560x1440@144, 604 MHz, above the 533 MHz
+     boot mode)~~
+   - ~~A second DisplayPort display (2026-11-15, `rdna4-head2dp=1`): connected
+     at boot, its link trained by the kext at the first attempt, the desktop
+     on both DisplayPort displays; plugged in later, lit as well~~
+   - ~~The cold start after a real power loss (2026-11-15): after system
+     sleep both displays are lit from nothing (step 5)~~
+   - ~~A DisplayPort extra pipe's own sleep (2026-11-16): its transmitter
+     disable (DMUB) stopped the card on link 1, so it is left out there; the
+     rest of the sleep and the wake run on the card, the cold start takes such
+     a pipe down again~~
+   - Open: with the paravirtual displays, a display plugged in after boot gets no
+     paravirtual display (they are counted at boot); DisplayPort modes that
+     need a faster link than the GOP trained, or DSC (3840x2160 at 120 and
+     144 Hz).
+5. **Display power management** — done on the card.
+   - ~~Display sleep (DPMS through `cscSetSync`, 2026-10-05/06): DP video
+     stream off and sink D3 over native-AUX `SET_POWER`; the HDMI second pipe
+     as amdgpu does DPMS off (`docs/second-pipe.md`); an HDMI boot display
+     through `ModeSet::buildSleep` and a mode set to wake~~
+   - ~~System sleep (2026-11-15, on by default, `rdna4-syssleep=0` turns it
+     off): macOS no longer refuses it; the runtime quiesced while the card has power, the paravirtual GPU's
+     host writing back what lives only in VRAM; after the wake the card brought
+     up from nothing (PSP, SMU, DMUB, clocks, cold start) with both displays
+     lit and the desktop back~~
+   - ~~IOGraphics' own power work (2026-11-15, `src/plugin.cpp`): every
+     framebuffer in its controller's table (the expander's wrappers on this
+     board left gaps: 45 s per framebuffer at boot, sleep and wake), the
+     controller's state recomputed for framebuffers without a WindowServer
+     port (a 90 s wait before every sleep), no deadlock in a dark wake, and
+     power states for the paravirtual display (a 30 s WindowServer wait)~~
+   - ~~Two DisplayPort displays through sleep and wake (2026-11-15): both
+     back about 2 s after a key press~~
+   - ~~A key press wakes to the desktop (2026-11-15): on this board it wakes
+     the system through GPE 8 (reported as GPP2, shared with the GPU's port),
+     which macOS took for a dark wake; an `SSDT-USBW` on that GPE with
+     USBWakeFixup (in the rig's OpenCore config, not this repository) makes it
+     a user wake~~
+   - ~~System sleep on by default (2026-11-15)~~
+6. **Power / clocks** — done on the card, but for the items below the
+   struck ones.
+   - ~~SMU firmware handshake: the power-management firmware loaded through
+     the PSP, its mailbox answering, its features turned on (GFXCLK and UCLK
+     DPM among them), so the card is not stuck at boot clocks: the graphics
+     clock goes from 3195 MHz under load to 249 MHz idle within a third of a
+     second (2026-11-15)~~
+   - ~~The display clocks held at what a 4K pipe needs (DISPCLK and DPPCLK
+     650 MHz, DCFCLK 600 MHz, UCLK at its top level, through the display
+     mailbox as amdgpu's DCN 4.01 clock manager asks for them)~~
+   - Open: the features held back so that they do not retune clocks under the
+     lit displays (DCN DPM, the memory, fabric and DCEF deep sleeps, GFXOFF;
+     the display then takes part in memory clock switches, with watermarks for
+     the SMU); fan and thermal behaviour.
 7. **Acceleration** — the GFX12 command processor, rings, memory management
    and a compute runtime run on the card (*User-space compute*), and Vulkan
    through RADV. Metal runs through Apple's paravirtual GPU, served on the card
@@ -606,6 +626,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       deasserted, RAM out of light sleep, DDC clock enabled — before
       arbitration is requested)
 - [x] Display sleep verified on hardware with the standalone build
+- [x] System sleep and wake with the desktop back (on by default,
+      `rdna4-syssleep=0` turns it off; verified on hardware 2026-11-15,
+      Tahoe 26.6.2, with one and with two displays)
 - [x] Plugin build verified on hardware (RX 9070 XT, Tahoe 26.6 recovery, 2026-09-27)
 - [x] **Compute written from scratch, running on the real card** (2026-09-28,
       `docs/hw-logs/2026-09-28-recovery-stage7-runtime-pass.txt`): PSP secure OS
@@ -679,10 +702,11 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       second display on either HDMI connector, mode switching on both
       displays, hot-plug of the second. `rdna4-head2=0`,
       `rdna4-modeset=0` and `rdna4-hotplug=0` turn them off. A second
-      display on DisplayPort stays behind `rdna4-head2dp=1` until it
-      has run on the card.
-- [ ] DisplayPort link training, for a second DisplayPort display and
-      for a boot display that was unplugged. First part done on the
+      display on DisplayPort stays behind `rdna4-head2dp=1` (it ran on
+      the card 2026-11-15, its sleep and wake 2026-11-16).
+- [x] DisplayPort link training, for a second DisplayPort display and
+      for a boot display that was unplugged (the second display's trained
+      at the first attempt on the card, 2026-11-15). First part done on the
       host: `src/dptrain.cpp` trains a link through callbacks and
       `make test` holds its DPCD transfers, patterns, lane drive and
       delays against Linux's own code run on ten simulated monitors
@@ -693,10 +717,9 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       2026-10-06), so `rdna4-dptrain` only watches, and `=2` runs the
       kext's training once as a test. That training completed on the
       card 2026-10-06 (4 lanes at HBR2, all lanes locked), and the
-      video was back 0.57 s after the link was taken down. The second
-      DisplayPort display itself needs a second cable to try:
-      `docs/todo-dptest.md` has the tests still to run. Third part written, not yet run on the card:
-      a second DisplayPort display (`rdna4-head2=4`), lit from tables
+      video was back 0.57 s after the link was taken down. Third part, run
+      on the card 2026-11-15: a second DisplayPort display (`rdna4-head2=4`
+      with `rdna4-head2dp=1`), lit from tables
       generated like the HDMI ones (`src/pipe2_linux_dp1.inc`,
       `_dp2.inc`) whose training step runs `src/dptrain.cpp` on the
       smallest link of the monitor's that carries the mode. With
@@ -714,4 +737,7 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       verified on hardware 2026-11-10 to 2026-11-12, Tahoe 26.6.2): a Metal
       desktop, the Dock, Liquid Glass and apps' windows; Sequoia 15 tested by
       Jan Claußen. Experimental (*Metal* above)
+- [x] Metal 3D through it (verified on hardware 2026-11-17, Tahoe 26.6.2):
+      MetalQuake at 3840x1878 in HDR at 60 frames a second, WebGL in Safari
+      (`rdna4-pvmac2=1`), `mtlprobe cube` with Apple's GPU's pixels
 - [ ] Native Metal and 3D acceleration (the goal: every feature of the card)

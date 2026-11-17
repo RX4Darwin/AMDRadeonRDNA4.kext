@@ -126,6 +126,10 @@ struct Target {
 	// Light: the DET segments to give the plane, when the plan's (DML's for
 	// this pipe alone) do not fit next to the other pipes; 0 = the plan's.
 	uint8_t detSegments;
+	// Light of a pipe with no lit pipe beside it (pipe 0 after the display hardware was started from nothing,
+	// rdna4-dcninit): the VM aperture is not copied from a lit HUBP but left as the hardware has it, as amdgpu leaves
+	// it on a discrete card (litHubp is then the plan's own pipe).
+	bool alone;
 };
 
 constexpr size_t kMaxSteps = 448;

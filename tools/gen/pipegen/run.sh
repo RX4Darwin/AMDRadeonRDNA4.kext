@@ -92,6 +92,16 @@ for pass in 1 2; do
 		done < "$B/undef.txt"; } > "$B/stubs.c"
 done
 
+# "init": dcn401_init_hw on display hardware with nothing running (pipegen.c sequence_init), into
+# src/dcn_init_linux.inc (mkinit.py); nothing else is made.
+if [ "${1:-}" = init ]; then
+	"$B/pipegen" init > "$B/init.txt"
+	python3 "$here/mkinit.py" "$HDR" "$B/init.txt" "$(git -C "$L" rev-parse HEAD)" > "$B/dcn_init_linux.inc"
+	cp -f "$B/dcn_init_linux.inc" "$repo/src/dcn_init_linux.inc"
+	echo "wrote src/dcn_init_linux.inc"
+	exit 0
+fi
+
 # table <file under src> [dplink <sink>] <configuration>: one table. With "dplink a 0 0" it is for a DisplayPort
 # stream, the link trained against the simulated sink that needs no lane adjustment.
 table() {
@@ -120,7 +130,7 @@ table() {
 			grep -q 'DML: mode not supported' "$B/mode.err" || { cat "$B/mode.err" >&2; exit 1; }
 			echo "modes.txt: DML does not support${line##*#}: it stays on the 25 % rule"
 		fi
-	done < "$here/modes.txt"
+	done < <(cat "$here/modes.txt" ${MODES_MORE:+"$here/$MODES_MORE"})
 
 	# A 4:2:0 table also gets what changes with the encoding: the same pipe and timing lit in RGB.
 	rgb=""
@@ -170,6 +180,10 @@ if [ $# -eq 0 ]; then
 		table pipe2_linux_p${p}_dp1_uhd.inc   dplink a 0 0  $p 0 0 1  3840 48 32 80  2160 3 5 54  533250 1 0 0
 		table pipe2_linux_p${p}_dp2_uhd.inc   dplink a 0 0  $p 1 1 2  3840 48 32 80  2160 3 5 54  533250 1 0 0
 	done
+	# Pipe 0 itself on the first DisplayPort connector, at the timing the GOP lights the boot display with: what
+	# lights it again after the display hardware was started from nothing (src/dcninit.cpp, rdna4-dcninit).
+	# Its own monitor's modes besides modes.txt (MODES_MORE): the boot display's mode switches use this table's.
+	MODES_MORE=modes-boot-dp.txt table pipe2_linux_p0_dp1_uhd.inc   dplink a 0 0  0 0 0 1  3840 48 32 80  2160 3 5 54  533250 1 0 0
 else
 	table pipe2_linux.inc "$@"
 fi

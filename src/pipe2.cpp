@@ -108,6 +108,12 @@ namespace P3Hpd2Tmds {
 }
 
 // The HDMI connectors lit at 3840x2160@60, for each pipe.
+// Pipe 0 itself on the first DisplayPort connector at the GOP's boot timing: lit again after the display
+// hardware was started from nothing (rdna4-dcninit, src/dcninit.cpp).
+namespace P0Hpd1Uhd {
+#include "pipe2_linux_p0_dp1_uhd.inc"
+}
+
 namespace P1Hpd3Uhd {
 #include "pipe2_linux_p1_hpd3_uhd.inc"
 }
@@ -247,6 +253,8 @@ constexpr Table kTables[] = {
 	      countOf(P3Hpd2::kAux)),
 	table(P3Hpd1Tmds::kConfig, P3Hpd1Tmds::kGen, P3Hpd1Tmds::kModeRegs, P3Hpd1Tmds::kModeTimings, P3Hpd1Tmds::kModeValues),
 	table(P3Hpd2Tmds::kConfig, P3Hpd2Tmds::kGen, P3Hpd2Tmds::kModeRegs, P3Hpd2Tmds::kModeTimings, P3Hpd2Tmds::kModeValues),
+	table(P0Hpd1Uhd::kConfig, P0Hpd1Uhd::kGen, P0Hpd1Uhd::kModeRegs, P0Hpd1Uhd::kModeTimings, P0Hpd1Uhd::kModeValues, P0Hpd1Uhd::kAux,
+	      countOf(P0Hpd1Uhd::kAux)),
 	table(P1Hpd3Uhd::kConfig, P1Hpd3Uhd::kGen, P1Hpd3Uhd::kModeRegs, P1Hpd3Uhd::kModeTimings, P1Hpd3Uhd::kModeValues),
 	table(P1Hpd4Uhd::kConfig, P1Hpd4Uhd::kGen, P1Hpd4Uhd::kModeRegs, P1Hpd4Uhd::kModeTimings, P1Hpd4Uhd::kModeValues),
 	table(P2Hpd3Uhd::kConfig, P2Hpd3Uhd::kGen, P2Hpd3Uhd::kModeRegs, P2Hpd3Uhd::kModeTimings, P2Hpd3Uhd::kModeValues),
@@ -463,7 +471,7 @@ bool build(const Target &t, Plan &out, const char **why) {
 	out.naux = 0;
 
 	if (t.part == Part::Light) {
-		if (t.litHubp >= 4 || t.litHubp == c.pipe) {
+		if (t.litHubp >= 4 || (t.litHubp == c.pipe && !t.alone)) {
 			err = "the lit pipe uses the HUBP this plan lights";
 			return false;
 		}
@@ -558,7 +566,9 @@ bool build(const Target &t, Plan &out, const char **why) {
 			break;
 		}
 		case 'C':
-			ok = step(ModeSet::Op::Copy, g, 0, 0, g.dword - (c.pipe - t.litHubp) * g.arg);
+			// The VM aperture as the lit pipe has it; a pipe alone leaves it as the hardware has it (amdgpu does)
+			if (!t.alone)
+				ok = step(ModeSet::Op::Copy, g, 0, 0, g.dword - (c.pipe - t.litHubp) * g.arg);
 			break;
 		case 'H': ok = step(ModeSet::Op::Write, g, 0, static_cast<uint32_t>(t.surface >> 32), 0); break;
 		case 'L': ok = step(ModeSet::Op::Write, g, 0, static_cast<uint32_t>(t.surface), 0); break;
@@ -578,6 +588,14 @@ bool build(const Target &t, Plan &out, const char **why) {
 			ok = step(ModeSet::Op::Update, g, g.mask, ModeSet::dpVidM(khz, DpTrain::symbolClockKHz(t.linkRate)), 0);
 			break;
 		case 'O':
+			// ponytail: left out on a DisplayPort link other than 0: there DMUB's transmitter disable (Linux's own
+			// step, dcn10_link_encoder_disable_output) stopped the whole card a fraction of a second after it ran
+			// (card, 2026-11-15, link 1: every register 0xffffffff, then a hard hang; the same command on link 0 is
+			// fine). The rest of the sleep (stream blanked, sink in D3, encoder and its symbol clock off) runs, and the
+			// wake trains the link again on a transmitter that was left on (card-verified). Cause unknown: find it if
+			// the PHY must really go off.
+			if (c.dp && c.link != 0)
+				break;
 			if (Dmub::Cmd *cmd = dmub(g))
 				DpPhy::buildDisable(*cmd, c.link, c.hpd, t.connectorObjId);
 			else

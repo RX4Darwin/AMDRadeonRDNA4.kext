@@ -47,6 +47,9 @@
 #include "llvm/Support/xxhash.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/InferAddressSpaces.h"
+#include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <IOKit/IOKitLib.h>
 #include <array>
@@ -862,7 +865,7 @@ static std::string legalize(Function &k) {
 }
 
 // The entry (a kernel or shader wrapping the AIR function `air`) as an object for gfx1201: the AIR function inlined, legalised, optimised.
-static std::string compile(Module &m, Function *entry, Function *air, bool pal, SmallVectorImpl<char> &object) {
+static std::string compile(Module &m, Function *entry, Function *air, bool pal, SmallVectorImpl<char> &object, bool *localArrays = nullptr) {
 	// The AIR function and whatever it calls inlined into the entry; the module's other entry points go (they need not translate).
 	for (const char *list : {"air.kernel", "air.vertex", "air.fragment"})
 		for (unsigned i = 0; m.getNamedMetadata(list) && i < m.getNamedMetadata(list)->getNumOperands(); i++)
@@ -929,9 +932,25 @@ static std::string compile(Module &m, Function *entry, Function *air, bool pal, 
 	pb.registerLoopAnalyses(lam);
 	pb.crossRegisterProxies(lam, fam, cam, mam);
 	pb.buildPerModuleDefaultPipeline(OptimizationLevel::O2).run(m, mam);
-	for (Instruction &i : instructions(*entry))
-		if (isa<AllocaInst>(i))
-			return "private memory (an alloca in AIR's address space 0) is not supported yet";
+
+	// A local array read at an index known only at run time (a shader's table of colours) stays an alloca, reached through flat pointers
+	// (legalize's casts) that keep AMDGPU from promoting it into registers: for a shader, the pointers are made private again and the
+	// backend promotes it. One whose array still needs scratch (which draws do not have) is refused after code generation by its stages'
+	// .scratch_memory_size (*localArrays). Only shaders with such an array: run on all of them, the passes gave one of WindowServer's 16
+	// bytes of scratch, and the size is set without any scratch used in 29 of WindowServer's that run (2026-11-17).
+	const bool allocas = any_of(instructions(*entry), [](const Instruction &i) { return isa<AllocaInst>(i); });
+
+	if (allocas && !pal)
+		return "private memory (an alloca in AIR's address space 0) is not supported yet";
+	if (localArrays)
+		*localArrays = allocas;
+	if (allocas) {
+		FunctionPassManager fpm;
+		fpm.addPass(InferAddressSpacesPass(0));
+		fpm.addPass(SROAPass(SROAOptions::ModifyCFG));
+		fpm.addPass(InstCombinePass());
+		fpm.run(*entry, fam);
+	}
 
 	raw_svector_ostream objectOut(object);
 	legacy::PassManager cg;
@@ -981,7 +1000,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	if (!outputs || !inputs)
 		return "the AIR shader's metadata is not as expected";
 	// The inputs: index -> where its value comes from (-1: unused, poison).
-	// 0 vertex id, 1 instance id, 3 the fragment's position, 4 colour attachment 0, 5 front facing, 100 + n buffer n, 200 + n texture n, 300 + n sampler n,
+	// 0 vertex id, 1 instance id, 2 base instance, 3 the fragment's position, 4 colour attachment 0, 5 front facing, 100 + n buffer n, 200 + n texture n, 300 + n sampler n,
 	// 400 + n input n
 	std::map<unsigned, int> from;
 	// A value between the stages (index: its argument or member); sprite: the point's coordinate, which the hardware makes (no name)
@@ -1014,6 +1033,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		}
 		else if (vertex && kind == "air.instance_id")
 			from[index] = 1;
+		else if (vertex && kind == "air.base_instance")   // ANGLE's vertex shaders (WebGL) read it
+			from[index] = 2;
 		else if (!vertex && kind == "air.fragment_input" && !unused) {
 			// The interpolation: air.flat, or air.center / air.centroid with air.perspective / air.no_perspective; the hardware's
 			// barycentric inputs PERSP_CENTER 4 and LINEAR_CENTER 8 (the arguments below).
@@ -1057,11 +1078,13 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			from[index] = 100 + location;
 			written |= writes ? 1u << location : 0;
 		} else if ((kind == "air.texture" || kind == "air.sampler") && !unused) {
-			int location = -1;
+			int location = -1, count = 1;   // count: of an array (array<texture2d, n>), its n
 			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
-				if (mdString(a, k) == "air.location_index")
+				if (mdString(a, k) == "air.location_index") {
 					location = static_cast<int>(mdInt(a, k + 1));
-			if (location < 0 || location > 15)
+					count = k + 2 < a->getNumOperands() ? static_cast<int>(mdInt(a, k + 2)) : 1;
+				}
+			if (location < 0 || count < 1 || location + count > 16)
 				return kind + " argument " + std::to_string(index) + ": only indices 0-15 so far";
 			from[index] = (kind == "air.texture" ? 200 : 300) + location;
 		}
@@ -1307,6 +1330,22 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		}
 		return r;
 	};
+	// A texture or sampler argument: its handle, the address of its T# or S# in the table. An array of them (array<texture2d, n>: AIR passes a
+	// pointer to n handles, byval) as such an array, made here: MetalQuake's UI shader picks one of 16 by a vertex value, and with the first
+	// T#'s address in its place it read the T#'s bytes as handles and faulted at 0, the ring with it (2026-11-17).
+	auto resource = [&](unsigned k, uint64_t at, uint64_t stride) -> Value * {
+		auto *array = air->getArg(k)->hasByValAttr() ? dyn_cast<ArrayType>(air->getParamByValType(k)) : nullptr;
+
+		if (!array)
+			return handle(at, air->getArg(k)->getType());
+
+		IRBuilder<> entry(&f->getEntryBlock(), f->getEntryBlock().getFirstInsertionPt());
+		AllocaInst *handles = entry.CreateAlloca(array);
+
+		for (unsigned i = 0; i < array->getNumElements(); i++)
+			b.CreateStore(handle(at + stride * i, array->getElementType()), b.CreateConstInBoundsGEP2_32(array, handles, 0, i));
+		return handles;
+	};
 	auto callAir = [&](Value *vid) {
 		SmallVector<Value *, 4> args;
 		for (unsigned k = 0; k < air->arg_size(); k++)
@@ -1314,12 +1353,13 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			                                          air->getArg(k)->getType())
 			               : from[k] == 0 ? b.CreateZExtOrTrunc(vid, air->getArg(k)->getType())   // uint or ushort
 			               : from[k] == 1 ? b.CreateZExtOrTrunc(b.CreateAdd(f->getArg(kInstanceId), f->getArg(kBaseInstance)), air->getArg(k)->getType())   // with the base instance
+			               : from[k] == 2 ? b.CreateZExtOrTrunc(f->getArg(kBaseInstance), air->getArg(k)->getType())
 			               : from[k] >= 400 ? fromVec4(inValues[static_cast<unsigned>(from[k] - 400)], air->getArg(k)->getType())
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
 			               : from[k] == 4 ? fromVec4(framebuffer(), air->getArg(k)->getType())
 			               : from[k] == 5 ? b.CreateZExtOrTrunc(b.CreateFCmpOGT(f->getArg(kFrontFace), ConstantFP::get(f32, 0.0)), air->getArg(k)->getType())
-			               : from[k] >= 300 ? handle(RDNA4_MTLC_TABLE_SAMPLERS + 16 * static_cast<unsigned>(from[k] - 300), air->getArg(k)->getType())
-			               : from[k] >= 200 ? handle(RDNA4_MTLC_TABLE_TEXTURES + 32 * static_cast<unsigned>(from[k] - 200), air->getArg(k)->getType())
+			               : from[k] >= 300 ? resource(k, RDNA4_MTLC_TABLE_SAMPLERS + 16 * static_cast<unsigned>(from[k] - 300), 16)
+			               : from[k] >= 200 ? resource(k, RDNA4_MTLC_TABLE_TEXTURES + 32 * static_cast<unsigned>(from[k] - 200), 32)
 			               : from[k] >= 100 ? buffer(static_cast<unsigned>(from[k] - 100), air->getArg(k)->getType())
 			                              : PoisonValue::get(air->getArg(k)->getType()));
 		return b.CreateCall(air, args);
@@ -1417,7 +1457,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	b.CreateRetVoid();
 
 	SmallVector<char, 0> object;
-	if (std::string why = compile(m, f, air, true, object); !why.empty())
+	bool localArrays = false;
+	if (std::string why = compile(m, f, air, true, object, &localArrays); !why.empty())
 		return why;
 	// The code and the registers LLVM chose (PAL metadata: amdpal.pipelines[0].registers, register number -> value).
 	auto obj = object::ObjectFile::createObjectFile(MemoryBufferRef(StringRef(object.data(), object.size()), "shader"));
@@ -1442,6 +1483,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			if (auto v = sym.getValue(); !v || *v != 0)
 				return "the shader's entry is not at the start of its code";
 	uint32_t regs[4] = {};   // RSRC1, RSRC2, SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR
+	uint64_t scratch = 0;    // the bytes of scratch its stages reserve
 	const uint64_t want[4] = {vertex ? 0x2c8au : 0x2c0au, vertex ? 0x2c8bu : 0x2c0bu, 0xa1b3, 0xa1b4};
 	const auto &ef = elf->getELFFile();
 	if (auto shdrs = ef.sections())
@@ -1456,6 +1498,10 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 				msgpack::DocNode &pipes = doc.getRoot().getMap(true)["amdpal.pipelines"];
 				if (!pipes.isArray() || pipes.getArray().size() < 1)
 					continue;
+				for (auto &stage : pipes.getArray()[0].getMap(true)[".hardware_stages"].getMap(true))
+					if (stage.second.isMap())
+						if (auto &size = stage.second.getMap(true)[".scratch_memory_size"]; size.getKind() == msgpack::Type::UInt)
+							scratch = std::max<uint64_t>(scratch, size.getUInt());
 				for (auto &kv : pipes.getArray()[0].getMap(true)[".registers"].getMap(true))
 					for (unsigned k = 0; k < 4; k++)
 						if (kv.first.getKind() == msgpack::Type::UInt && kv.first.getUInt() == want[k])
@@ -1465,6 +1511,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		}
 	if (code.empty() || !regs[0])
 		return "no code or no register values in the shader object";
+	if (localArrays && scratch)
+		return "the shader needs " + std::to_string(scratch) + " bytes of scratch memory (a local array not kept in registers)";
 	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3],
 	                          static_cast<uint32_t>(vars.size()) | writes << 20 | (attachment > 0 ? static_cast<uint32_t>(attachment) << 28 : 0) |
 	                          (noColour ? 1u << 31 : 0) | (f->hasFnAttribute("rdna4-levels") ? 1u << 16 : 0)};

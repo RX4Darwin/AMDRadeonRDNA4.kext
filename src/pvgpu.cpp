@@ -181,6 +181,16 @@ static bool glWanted() {
 
 static bool glRendererPatchable();
 
+// Mac GPU family 2 claimed by the paravirtual device (rdna4-pvmac2=1, off unless asked): routeGlPagesNow's patch of AppleParavirtGPUMetal.
+// Off by default: with it Chrome takes its Dawn path, whose shaders do not translate yet, and WindowServer hung (watchdog) while it ran
+// (2026-11-17).
+static bool mac2Wanted() {
+	uint32_t mac2 = 0;
+
+	(void)PE_parse_boot_argn("rdna4-pvmac2", &mac2, sizeof(mac2));
+	return mac2 != 0;
+}
+
 // OpenGL.framework (libGFXShared) loads a renderer for an accelerator only if it names one in IOGLBundleName, which Apple's paravirtual
 // accelerator does not: GL then has its software renderer alone. This names Apple's GL-on-Metal renderer (AppleMetalOpenGLRenderer.bundle)
 // on the accelerator when it is published. On its own it would abort every GL process (the renderer asserts in
@@ -226,6 +236,7 @@ struct GlPagePatch {
 	uint32_t at, size;
 	const uint8_t *find, *replace;
 	const char *what;
+	bool mac2;       // AppleParavirtGPUMetal's (rdna4-pvmac2), else the GL renderer's
 };
 
 const uint8_t kGlVendorFind[16] = {'E', 'R', '_', 'S', 'I', 'Z', 'E', 0, 'A', 'M', 'D', 0, 'A', 'T', 'I', 0};
@@ -233,10 +244,19 @@ const uint8_t kGlVendorReplace[16] = {'E', 'R', '_', 'S', 'I', 'Z', 'E', 0, 'A',
 const uint8_t kGlRasterFind[10] = {0x48, 0x8b, 0x35, 0x4f, 0x54, 0x04, 0x00, 0x41, 0xff, 0xd6};      // movq sel(%rip), %rsi; callq *%r14
 const uint8_t kGlRasterReplace[10] = {0x48, 0x8b, 0x35, 0x4f, 0x54, 0x04, 0x00, 0x0f, 0x1f, 0x00};   // ...; nopl (%rax)
 
+// - AppleParavirtGPUMetal's -[AppleParavirtDevice featureProfile] (Tahoe 26.6.2, x86_64 slice at 0x4000, +0xacc3) returns 0x2710, which
+//   Metal (getSupportedFamilies) gives Common1, Common2 and Mac1 alone; 0x2711 adds Common3 and Mac2, which ANGLE (WebGL in Safari and
+//   Chrome) requires: without it the context is lost at creation (2026-11-17). AppleParavirtGPUIOGPUFamily, whose bundle claims it from
+//   the host's device info, is ARM only.
+const uint8_t kMac2Find[11] = {0x55, 0x48, 0x89, 0xe5, 0xb8, 0x10, 0x27, 0x00, 0x00, 0x5d, 0xc3};      // movl $0x2710, %eax; ret
+const uint8_t kMac2Replace[11] = {0x55, 0x48, 0x89, 0xe5, 0xb8, 0x11, 0x27, 0x00, 0x00, 0x5d, 0xc3};   // movl $0x2711, %eax; ret
+
 const GlPagePatch kGlPagePatches[] = {
-	{0x5c000, 0x698, sizeof(kGlVendorFind), kGlVendorFind, kGlVendorReplace, "vendor test: \"AMD\" now \"App\""},
-	{0x2c000, 0x492, sizeof(kGlRasterFind), kGlRasterFind, kGlRasterReplace, "setDefaultRasterSampleCount: call now a nop"},
+	{0x5c000, 0x698, sizeof(kGlVendorFind), kGlVendorFind, kGlVendorReplace, "vendor test: \"AMD\" now \"App\"", false},
+	{0x2c000, 0x492, sizeof(kGlRasterFind), kGlRasterFind, kGlRasterReplace, "setDefaultRasterSampleCount: call now a nop", false},
+	{0xe000, 0xcc3, sizeof(kMac2Find), kMac2Find, kMac2Replace, "AppleParavirtGPUMetal: featureProfile 0x2711 (Mac2)", true},
 };
+bool gGlPatches, gMac2Patch;   // which of them are wanted (routeGlPagesNow)
 
 using ValidatePage = void (*)(void *vnode, void *pager, uint64_t offset, const void *data, int *validated, int *tainted, int *nx);
 mach_vm_address_t orgValidatePage;
@@ -250,10 +270,10 @@ void wrapValidatePage(void *vnode, void *pager, uint64_t offset, const void *dat
 	for (const GlPagePatch &p : kGlPagePatches) {
 		auto *page = const_cast<uint8_t *>(static_cast<const uint8_t *>(data));
 
-		if (offset == p.page && !memcmp(page + p.at, p.find, p.size)) {
+		if (offset == p.page && (p.mac2 ? gMac2Patch : gGlPatches) && !memcmp(page + p.at, p.find, p.size)) {
 			memcpy(page + p.at, p.replace, p.size);
 			if (__atomic_fetch_add(&glPagesPatched, 1u, __ATOMIC_RELAXED) < 8)
-				IOLog("AMDRadeonRDNA4: pvgpu: OpenGL: AppleMetalOpenGLRenderer page +0x%llx: %s\n", offset, p.what);
+				IOLog("AMDRadeonRDNA4: pvgpu: page +0x%llx patched: %s\n", offset, p.what);
 		}
 	}
 }
@@ -271,6 +291,8 @@ static bool glRendererPatchable() {
 	for (const GlPagePatch &p : kGlPagePatches) {
 		uint8_t bytes[16];
 
+		if (p.mac2)
+			continue;
 		ok = ok && p.size <= sizeof(bytes) && !FileIO::readFileData(bytes, static_cast<off_t>(p.page + p.at), p.size, vn, ctx) &&
 		     !memcmp(bytes, p.find, p.size);
 	}
@@ -282,7 +304,9 @@ static bool glRendererPatchable() {
 }
 
 void routeGlPagesNow(KernelPatcher &patcher) {
-	if (!glWanted())
+	gGlPatches = glWanted();
+	gMac2Patch = mac2Wanted();
+	if (!gGlPatches && !gMac2Patch)
 		return;
 
 	KernelPatcher::RouteRequest request {"_cs_validate_page", wrapValidatePage, orgValidatePage};
@@ -290,8 +314,11 @@ void routeGlPagesNow(KernelPatcher &patcher) {
 
 	if (!ok)
 		patcher.clearError();
-	pvlog("OpenGL: cs_validate_page %s: AppleMetalOpenGLRenderer %s", ok ? "wrapped" : "NOT wrapped",
-	      ok ? "is patched where its pages come in" : "stays as it is");
+	if (gGlPatches)
+		pvlog("OpenGL: cs_validate_page %s: AppleMetalOpenGLRenderer %s", ok ? "wrapped" : "NOT wrapped",
+		      ok ? "is patched where its pages come in" : "stays as it is");
+	if (gMac2Patch)
+		pvlog("rdna4-pvmac2: cs_validate_page %s: AppleParavirtGPUMetal %s", ok ? "wrapped" : "NOT wrapped", ok ? "claims Mac2" : "stays as it is");
 }
 
 // The PCI class code the nub reports (rdna4-pvgpu-class=<24 bits>, default 0x030000 = display controller). Apple's driver matches by IOPCIMatch alone.
@@ -407,6 +434,7 @@ private:
 	};
 	Jit &jitSlot();
 	const Jit *translated(uint32_t task, uint64_t lib, const char *name, const uint8_t hash[32]);
+	void translatePipeline(uint32_t task, uint32_t pipeline);
 	static void placeShaders(uint32_t *code, const Jit *const shader[3], uint64_t rings, uint32_t outs);
 	bool bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len);
 	bool textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len, uint32_t *bytesPerRow = nullptr, uint32_t *width = nullptr,
@@ -546,6 +574,15 @@ private:
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void completeStamp(uint32_t index, uint32_t value);
+	// A system sleep (RDNA4Compute::powerSleepRequest, the card still powered and taking submissions): what lives only in VRAM
+	// written back to the guest, then everything held of the runtime given back, as the card loses its power and VRAM with it;
+	// it is all made again on use once the wake has brought the runtime up again.
+	static void sleepHook(void *ctx);
+	static IOReturn forgetAction(OSObject *owner, void *, void *, void *, void *);
+	void forgetRuntime();
+	bool openRuntime();   // the host as a client of the runtime (once, and again after a sleep's wake)
+	bool mRtAway { false };        // given back at a sleep (forgetRuntime): not opened again before the wake rebuilt the runtime
+	uint32_t mRtAwayGen { 0 };     // RDNA4Compute::rtGeneration then
 	// display pipes (docs/m1-stream.md s.1b): the shared-state pages the guest announced, the events the host puts into them
 	void dropPipes();
 	void dropPipe(uint32_t port, const char *why);
@@ -557,7 +594,18 @@ private:
 	void defineChannel(uint32_t n);
 	void freeChannel(uint32_t n);
 	void dropChannels();
-	void pollChannels();
+	void pollChannels(bool displayOnly = false);
+	// A tick's display half between the slices of a translation's wait (translated): the display pipes' channels, the stamps, flips, VBLs
+	// and the interrupt. Apple's display pipe resets the GPU when a transaction is not complete within 300 ms (IOAccelDisplayPipe,
+	// "IOAccelDisplayPipeTransaction time out after 300ms"); with the channels alone it still did (2026-11-15: no VBL or stamp for 1.8 s).
+	void serveDisplay();
+	void dropIrqBits();
+	// Set around translations that run before anything is built (scanPipelines; runDraw and runCompute before their batch): a present may
+	// run meanwhile, mid-command-buffer showing its surface as the draws so far left it.
+	bool mServeDisplay { false };
+	bool mInDisplayPoll { false };
+	uint32_t mConsuming { 0 };   // the channel pollChannels is in: never entered again from inside it
+	uint32_t mBlockingTranslations { 0 };   // translations waited for inside a command buffer, the display channels not served
 	void selfTest();
 
 	RDNA4PvNub *mNub { nullptr };
@@ -837,6 +885,7 @@ private:
 	// The draws by their target: a surface on the card, one in the guest's memory, a Metal texture shared, managed or private; their
 	// scissor rectangles' bytes.
 	uint32_t mTargetDraws[5] {};
+	uint32_t mHowDrawn[4] {}, mHoldFailed { 0 };   // draws into a held target, in place, staged, multisampled; holds refused
 	struct CopiedTop { uint64_t at, bytes; uint32_t task, width, height, rowBytes, times; bool surface; };
 	CopiedTop mCopiedTop[8] {};
 	uint64_t mTargetBytes[5] {};
@@ -875,13 +924,34 @@ private:
 	uint32_t mTexLines { 0 };            // textures and samplers refused, described in this stats period
 	const char *mNotRunWhy { nullptr };
 	char mNotRunName[64] {};
+	// The same since the boot, by reason (debug.rdna4_pvnotrun): which missing piece costs the most draws.
+	struct NotRunReason { const char *why; uint64_t count; char name[48]; };
+	static constexpr uint32_t kNotRunReasons = 24;
+	NotRunReason mNotRunCensus[kNotRunReasons] {};
+	uint64_t mNotRunOther { 0 };   // reasons past the table's size
 	void noteNotRun(const char *why, const char *name)
 	{
 		if (!mNotRun++) {
 			mNotRunWhy = why;
 			strlcpy(mNotRunName, name, sizeof(mNotRunName));
 		}
+		for (NotRunReason &r : mNotRunCensus) {
+			if (r.why == why) {
+				r.count++;
+				return;
+			}
+			if (!r.why) {
+				r.why = why;
+				r.count = 1;
+				strlcpy(r.name, name ? name : "", sizeof(r.name));
+				return;
+			}
+		}
+		mNotRunOther++;
 	}
+public:
+	int notRunCensus(struct sysctl_req *req);
+private:
 	uint32_t mStale[4] {};                               // shadows filled again: dropped, too old, the surface locked since, rewritten
 	uint64_t mDrawSerial { 0 };          // draws submitted
 	bool shadowIdle(const Shadow &s) const;
@@ -1003,6 +1073,7 @@ private:
 	static constexpr uint32_t kRecordOffset = 0x400, kRecordBytes = 20;   // channel n's state record: root page + 0x400 + (n - 1) * 20
 	struct Channel {
 		bool live { false };
+		bool display { false };            // a display pipe's: its commands came in (presents, cursor; consume)
 		uint32_t kind { 0 };               // the record's u16 at +0xc: the channel's stamp index
 		uint32_t ringBytes { 0 };
 		IOMemoryDescriptor *desc { nullptr };
@@ -1098,6 +1169,39 @@ static int frameSysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvframe, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, frameSysctl, "S",
 	    "AMDRadeonRDNA4: the next presented frame at half size");
 
+// debug.rdna4_pvnotrun: the draws the host could not run since the boot, by reason, the most first: "count reason (first function)".
+static int notRunSysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	return gHost ? gHost->notRunCensus(req) : ENOENT;
+}
+
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvnotrun, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, notRunSysctl, "A",
+	    "AMDRadeonRDNA4: the draws not run since the boot, by reason");
+
+int RDNA4PvHost::notRunCensus(struct sysctl_req *req)
+{
+	// A copy, sorted: the host thread keeps counting meanwhile (ponytail: the copy can be a count behind).
+	NotRunReason sorted[kNotRunReasons];
+	memcpy(sorted, mNotRunCensus, sizeof(sorted));
+	for (uint32_t i = 1; i < kNotRunReasons; i++)
+		for (uint32_t j = i; j > 0 && sorted[j].count > sorted[j - 1].count; j--) {
+			const NotRunReason t = sorted[j];
+			sorted[j] = sorted[j - 1];
+			sorted[j - 1] = t;
+		}
+	static char text[4096];
+	size_t at = 0;
+	for (const NotRunReason &r : sorted)
+		if (r.why && at < sizeof(text) - 1)
+			at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at, "%llu %s (first \"%s\")\n", r.count, r.why, r.name));
+	if (mNotRunOther && at < sizeof(text) - 1)
+		at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at, "%llu other reasons\n", mNotRunOther));
+	if (at >= sizeof(text))
+		at = sizeof(text) - 1;
+	return SYSCTL_OUT(req, text, at + 1);
+}
+
 
 RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	auto *h = OSTypeAlloc(RDNA4PvHost);
@@ -1139,6 +1243,8 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 		return nullptr;
 	}
 	h->mTimer->setTimeoutMS(500);   // first tick after the nub had time to register and match
+	if (gCompute)
+		gCompute->setSleepHook(sleepHook, h);
 
 	// The card has no wake path unless rdna4-pm (docs/power-gfx.md: a sleep left both displays dark until a restart), and macOS sleeps
 	// after a minute idle here: while the heads are the displays, system idle sleep is held off. Display sleep goes on as before.
@@ -1153,6 +1259,127 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	return h;
 }
 
+void RDNA4PvHost::sleepHook(void *ctx) {
+	auto *h = static_cast<RDNA4PvHost *>(ctx);
+	if (h && h->mLoop)
+		h->mLoop->runAction(forgetAction, h);   // on the host's work loop: never beside a tick
+}
+
+IOReturn RDNA4PvHost::forgetAction(OSObject *owner, void *, void *, void *, void *) {
+	static_cast<RDNA4PvHost *>(owner)->forgetRuntime();
+	return kIOReturnSuccess;
+}
+
+void RDNA4PvHost::forgetRuntime() {
+	// VRAM does not survive the sleep: what lives only on the card (held targets, kept surfaces) is written back to the guest
+	// first, while the card still takes submissions, so the guest's copies are current after the wake.
+	const uint32_t backs = mCardBacks, flushes = mCardFlushes;
+
+	if (mRtOpen) {
+		flushHeld();
+		for (CardSurface &c : mCardSurface)
+			if (c.surface && c.loaded)
+				cardToMemory(c.surface);
+		waitDraws();
+		completeLate();
+	}
+	// What is still in flight (a failed wait above) is not waited for: the guest is told what it waits for (its stamps), and
+	// the waits in the drops below return at once. The fences start again with the ring the wake's bring-up makes anew.
+	for (uint32_t i = 0; i < mLateCount; i++)
+		completeStamp(mLate[i].index, mLate[i].value);
+	mLateCount = 0;
+	mBatchDraws = mBatchDwords = 0;
+	mPending = mFlightAt = 0;
+	memset(mFlight, 0, sizeof(mFlight));
+	mSubmits = mLastFence = 0;
+	memset(mSubmitFence, 0, sizeof(mSubmitFence));
+	memset(mSlotSubmit, 0, sizeof(mSlotSubmit));
+	memset(mPoolChunkSubmit, 0, sizeof(mPoolChunkSubmit));
+	mSlot = mBatchSlot = mDmaSlot = 0;
+	mRingWriteCount = 0;
+	mPoolUsed = 0;
+	mUsedMapCount = mUsedShadowCount = 0;
+	for (HeldTarget &h : mHelds)   // written back above; their shadows go below
+		h = HeldTarget {};
+	mHeld = nullptr;
+
+	for (Mapping &m : mMap)
+		dropMapping(m);
+	for (Shadow &s : mShadows)
+		freeShadow(s);
+	for (CardSurface &c : mCardSurface)
+		dropCardSurface(c);
+	for (ScanoutMap &sm : mScanout)
+		dropScanout(sm);
+	for (StencilBuf &b : mStencil) {
+		if (b.handle)
+			gCompute->rtFree(this, b.handle);
+		b = StencilBuf {};
+	}
+	for (MsaaSurface &m : mMsaa) {
+		if (m.handle)
+			gCompute->rtFree(this, m.handle);
+		m = MsaaSurface {};
+	}
+	GfxBuffers *const buffers[] = {&mGfxCode, &mGfxRings, &mGfxMisc, &mGfxIb, &mGfxSpare, &mPresentIb, &mFillCode, &mDmaIb,
+	                               &mBatchIb, &mDispatchArgs, &mTimes, &mIdle, &mGfxPool};
+	for (GfxBuffers *g : buffers) {
+		if (g->handle)
+			gCompute->rtFree(this, g->handle);
+		*g = GfxBuffers {};
+	}
+	if (mHeldCopy.handle)
+		gCompute->rtFree(this, mHeldCopy.handle);
+	mHeldCopy = {};
+	if (mGrab.handle)
+		gCompute->rtFree(this, mGrab.handle);
+	mGrab = FrameGrab {};
+	if (mScale.code)
+		gCompute->rtUnload(this, mScale.code);
+	if (mScale.argsHandle)
+		gCompute->rtFree(this, mScale.argsHandle);
+	mScale = ScaleKernel {};
+	for (CodeSlot &c : mCode)   // the shader pairs placed in mGfxCode, which is gone
+		c.valid = false;
+	uint32_t programs = 0;
+	for (uint32_t i = 0; i < mJits; i++) {   // the kernels loaded into the runtime: translated and loaded again on use
+		Jit &j = mJit[i];
+		if (!j.program)
+			continue;
+		gCompute->rtUnload(this, j.program);
+		programs++;
+		if (j.gfx)
+			IOFree(j.gfx, j.gfxLen);
+		j = Jit {};
+	}
+	gCompute->rtRelease(this);   // what is left of ours, and the client itself: rtOpen makes a new one after the wake
+	mRtOpen = false;
+	mRtAway = true;
+	mRtAwayGen = gCompute->rtGeneration;
+	pvstat("host: system sleep: %u kept surface(s) and %u held target(s) written back, everything of the runtime given back "
+	      "(%u kernels to load again); made again on use after the wake", mCardBacks - backs, mCardFlushes - flushes, programs);
+}
+
+bool RDNA4PvHost::openRuntime() {
+	if (mRtOpen)
+		return true;
+	if (mRtAway && gCompute->rtGeneration == mRtAwayGen)   // the sleep's runtime: a client opened now would be lost at the wake
+		return false;
+	mRtAway = false;
+	gCompute->rtPreferCpuTables(this);
+	gCompute->rtFreesWhenIdle(this);
+	mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;   // ponytail: closed only at a sleep, the host lives as long as the boot
+	return mRtOpen;
+}
+
+void RDNA4PvHost::dropIrqBits() {
+	if (mIrqBits && !mNub->interruptBusy(0)) {
+		if (volatile uint32_t *c = mNub->ctrl())
+			c[kRegIntrStatusGpu / 4] &= ~mIrqBits;
+		mIrqBits = 0;
+	}
+}
+
 void RDNA4PvHost::tick() {
 	if (mTicks++ < 3)
 		pvlog("host: tick %llu", mTicks);
@@ -1162,11 +1389,7 @@ void RDNA4PvHost::tick() {
 	// the line disabled from the interrupt until its work loop has read the status. Dropped a tick after the raise, a raise that came while the
 	// line was disabled reached the driver with no bits left, and it only saw its stamps and VBLs after IOAccelEventMachine2::waitForStamp's 1 s
 	// timed wait (most raises of a session: animations stood still, frames came late).
-	if (mIrqBits && !mNub->interruptBusy(0)) {
-		if (volatile uint32_t *c = mNub->ctrl())
-			c[kRegIntrStatusGpu / 4] &= ~mIrqBits;
-		mIrqBits = 0;
-	}
+	dropIrqBits();
 	const uint32_t cmds = mCmds;
 
 	completeLate();
@@ -1372,6 +1595,10 @@ void RDNA4PvHost::scanPipelines() {
 	if (!mSeenRec && !(mSeenRec = static_cast<uint32_t *>(IOMallocZero(64 * kScanIds * 12))))   // kept for the boot, as the host is
 		return;
 
+	// Outside any command buffer: while the helper translates what this finds (keepFunction's kernels, the pipelines' functions), the
+	// display channels go on (translated), so that no present outlasts Apple's 300 ms.
+	mServeDisplay = true;
+
 	for (uint32_t t = 0; t < 64; t++) {
 		if (!mTaskRoot[t] || now - mTaskActiveNs[t] > kActiveNs || !readGuest(t, heapRecord(t, 0), reinterpret_cast<uint8_t *>(rec), sizeof(rec)))
 			continue;
@@ -1409,14 +1636,20 @@ void RDNA4PvHost::scanPipelines() {
 			if ((r[0] & 0xff) != 7)
 				continue;
 
-			// its functions translated now too, while their libraries are still the app's (a draw may come after they are freed)
-			const PipelineInfo &p = pipelineInfo(t, id);
-
-			for (unsigned k = 1; k <= 2; k++)
-				if (p.named[k])
-					(void)translated(t, p.lib[k], p.name[k], p.hash[k]);
+			translatePipeline(t, id);   // now too, while its functions' libraries are still the app's (a draw may come after they are freed)
 		}
 	}
+	mServeDisplay = false;
+}
+
+// A render pipeline's vertex and fragment functions translated (translated keeps them).
+void RDNA4PvHost::translatePipeline(uint32_t task, uint32_t pipeline)
+{
+	const PipelineInfo &p = pipelineInfo(task, pipeline);
+
+	for (unsigned k = 1; k <= 2; k++)
+		if (p.named[k])
+			(void)translated(task, p.lib[k], p.name[k], p.hash[k]);
 }
 
 // A draw's target whose record is a free slot: was the texture deleted or unmapped yet, and are its pages still in the task's page table?
@@ -1538,7 +1771,10 @@ void RDNA4PvHost::pollFifo() {
 // value. A present's transaction waits so for the render that drew its surface on another channel; run before that render, it showed the
 // surface's older frame (windows and the cursor jumped back and forth). A barrier still unmet after kBarrierWait is logged and let go.
 bool RDNA4PvHost::barriersMet(const CmdSource &src, const uint8_t *cmd, const pvstream::FifoCommand &c) {
-	static constexpr uint64_t kBarrierWait = 1000000000;   // ns
+	// A display command (a present) runs past its barriers sooner: its transaction must be complete within 300 ms, or Apple's display pipe
+	// resets the GPU (a present of the surface as it is instead: the frame before, at worst).
+	static constexpr uint64_t kBarrierWait = 1000000000, kDisplayBarrierWait = 150000000;   // ns
+	const uint64_t wait = src.channel && src.channel <= kMaxChannels && mCh[src.channel].display ? kDisplayBarrierWait : kBarrierWait;
 	const volatile uint32_t *stamps = reinterpret_cast<const volatile uint32_t *>(mFifoMap->getVirtualAddress());
 	uint64_t &since = mBarrierSince[src.channel];
 	uint64_t now;
@@ -1554,7 +1790,7 @@ bool RDNA4PvHost::barriersMet(const CmdSource &src, const uint8_t *cmd, const pv
 		if (!since)
 			since = now;
 
-		if (now - since < kBarrierWait)
+		if (now - since < wait)
 			return false;
 
 		pvlog("host: %s: cmd 0x%02x waited %llu ms for stamp[%u] to reach %u (it is %u): run anyway", src.tag, c.id, (now - since) / 1000000,
@@ -1600,6 +1836,10 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			break;
 		}
 
+		const bool display = c.id == 0x02 || (c.id >= 0x04 && c.id <= 0x07) || c.id == 0x1e;   // the display pipe's commands keep being shown
+		if (mInDisplayPoll && !display && c.id != 0x01)
+			break;   // from inside a translation's wait (serveDisplay): the rest when the channels are polled next
+
 		if (c.barriers && src.channel && c.payloadOffset <= sizeof(mWin)) {
 			uint32_t b[2];
 
@@ -1616,7 +1856,8 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 		}
 
 		mCmds++;
-		const bool display = c.id == 0x02 || (c.id >= 0x04 && c.id <= 0x07) || c.id == 0x1e;   // the display pipe's commands keep being shown
+		if ((display || c.id == 0x01) && src.channel && src.channel <= kMaxChannels)
+			mCh[src.channel].display = true;
 		if (mCmds <= kLoggedCmds || (display && (mDispCmdLines++ < 60 || gTalk))) {
 			char line[200];
 			if (c.length <= sizeof(mWin)) {
@@ -2771,6 +3012,15 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		}
 		if (wide)
 			d.type = ~0u;   // beyond 32 bits: refused as an unknown primitive
+
+		static uint32_t typeLines;   // diag: what the "unknown primitive type" draws carry
+
+		if (d.type > 4 && typeLines++ < 12) {
+			uint32_t w[12] = {};
+			memcpy(w, payload, drawBytes(id) < sizeof(w) ? drawBytes(id) : sizeof(w));
+			pvstat("host: render: task %u pipeline %u: draw 0x%03x (%u bytes, wide %d) type 0x%x: %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+			       t->task, t->renderPipeline, id, bytes, wide != 0, d.type, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8]);
+		}
 		memcpy(d.blendColor, t->blendColor, sizeof(d.blendColor));
 		memcpy(d.attachments, t->attachments, sizeof(d.attachments));
 		memcpy(d.viewport, t->viewport, sizeof(d.viewport));
@@ -3488,7 +3738,9 @@ const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t t
 
 bool RDNA4PvHost::clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_t bytes, uint32_t pattern)
 {
-	static constexpr uint32_t kChunk = 1u << 20;
+	// DMA_DATA's BYTE_COUNT holds 26 bits. With 1 MiB a packet the page held some 144 MiB: a 4K RGBA16Float surface of 4 samples (255 MiB, the
+	// animated wallpapers') was never cleared, its memory made and freed again by every draw, 48 ms each (2026-11-17).
+	static constexpr uint32_t kChunk = 1u << 25;
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];   // ponytail: one host, draws run one at a time on its work loop
 	uint32_t n = 0;
 	uint64_t at = 0;
@@ -4878,8 +5130,14 @@ bool RDNA4PvHost::holdTarget(uint32_t task, uint32_t target, uint64_t va, const 
 	if (!s || !shadowCurrent(*s)) {
 		s = s ? s : makeShadow(key);
 
-		if (!s || !fillShadow(*s, surface.memory, drawing(task, target)))
+		static uint32_t refusedLines;
+
+		if (!s || !fillShadow(*s, surface.memory, drawing(task, target))) {
+			if (refusedLines++ < 12)
+				pvstat("host: render: target %u of task %u (%ux%u, %u bytes a pixel, %u per row) not held: %s", target, task, width, height, tp, bpr,
+				       s ? "its shadow not filled" : "no shadow (larger than kShadowMax, or all busy)");
 			return false;
+		}
 	}
 
 	if (surface.memory && surface.memory->prepare() != kIOReturnSuccess)
@@ -5218,7 +5476,7 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 	uint64_t h = 0;
 	bool ok = copy && gCompute->rtMapPages(this, pages, count, h, gpu) == kIOReturnSuccess;
 
-	// The cache holds the client's GPU VA (1 GiB) and host quota: make room by dropping the least recently used mappings.
+	// The cache holds the client's GPU VA (rtMapPages fails when it is full): make room by dropping the least recently used mappings.
 	for (uint32_t tries = 0; copy && !ok && tries < kMappings; tries++) {
 		Mapping *oldest = nullptr;
 
@@ -5753,6 +6011,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	static constexpr uint32_t kDrawWait = 50;   // ms
 	const uint64_t drawFrom = nowNs();
 
+	mServeDisplay = true;   // its functions translated before any of it is built, the display served meanwhile (the lookups below find them)
+	translatePipeline(task, pipeline);
+	mServeDisplay = false;
+
 	mMapFloor = mMapClock;
 	mBuilding = true;
 	mUsedMapCount = mUsedShadowCount = 0;
@@ -5998,11 +6260,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		return true;
 	};
-	if (!mRtOpen) {
-		gCompute->rtPreferCpuTables(this);
-		gCompute->rtFreesWhenIdle(this);
-		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;
-	}
+	(void)openRuntime();
 	GfxBuffers tgt {};
 	uint8_t *pooledTarget = nullptr;
 
@@ -6032,6 +6290,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint64_t slotAt = static_cast<uint64_t>(slot) * RDNA4_TRIRUN_PAGE;
 
 	const bool staged = !inPlace && !held && !ms;
+
+	mHowDrawn[held ? 0 : inPlace ? 1 : ms ? 3 : 2]++;
+	mHoldFailed += hold && !held;
 	const bool pooled = staged && mRtOpen && poolTake(targetBytes, tgt.gpu, pooledTarget);
 	uint32_t *stage = nullptr;
 
@@ -7159,10 +7420,7 @@ bool RDNA4PvHost::functionName(uint32_t task, uint32_t fn, char *name, size_t na
 uint32_t RDNA4PvHost::load(const uint8_t *elf, uint32_t size, const char *name, uint64_t *launch) {
 	if (!gCompute)
 		return 0;
-	if (!mRtOpen)
-		gCompute->rtPreferCpuTables(this);
-		gCompute->rtFreesWhenIdle(this);
-		mRtOpen = gCompute->rtOpen(this) == kIOReturnSuccess;   // ponytail: never closed, the host lives as long as the boot
+	(void)openRuntime();
 	uint64_t out[9] = {};
 	const bool ok = mRtOpen && gCompute->rtLoad(this, kernel_task, reinterpret_cast<mach_vm_address_t>(elf), size, name, out) == kIOReturnSuccess;
 	pvlog("host: compute: %s %s (program 0x%llx)", name, ok ? "loaded into the runtime" : "did NOT load", out[0]);
@@ -7256,9 +7514,24 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	strlcpy(gTr.name, name, sizeof(gTr.name));
 	IOLockWakeup(gTr.lock, &gTr.id, false);
 	static constexpr uint32_t kTranslateWait = 15;   // seconds
+	static constexpr uint32_t kSliceMs = 20;           // the display channels served between slices (mServeDisplay)
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(kTranslateWait, kSecondScale, &deadline);
-	while (!gTr.done && IOLockSleepDeadline(gTr.lock, &gTr.done, deadline, THREAD_UNINT) == THREAD_AWAKENED) {
+	if (!mServeDisplay)
+		mBlockingTranslations++;
+	while (!gTr.done) {
+		uint64_t slice = 0, now = mach_absolute_time();
+		clock_interval_to_deadline(kSliceMs, kMillisecondScale, &slice);
+		if (now >= deadline)
+			break;
+		const wait_result_t w = IOLockSleepDeadline(gTr.lock, &gTr.done, slice < deadline ? slice : deadline, THREAD_UNINT);
+		if (w != THREAD_AWAKENED && w != THREAD_TIMED_OUT)
+			break;
+		if (!gTr.done && mServeDisplay) {
+			IOLockUnlock(gTr.lock);
+			serveDisplay();
+			IOLockLock(gTr.lock);
+		}
 	}
 	const bool done = gTr.done;
 	uint8_t *elf = gTr.elf;
@@ -7357,6 +7630,9 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	uint64_t lib = 0;
 	if (!functionOf(task, pipeline, name, sizeof(name), hash, &lib))
 		return;
+	mServeDisplay = true;   // translated before any of it is built, the display channels served meanwhile (runDraw)
+	(void)translated(task, lib, name, hash);
+	mServeDisplay = false;
 	flushHeld();   // the kernel reads and writes the guest's memory
 	pvlog("host: compute: task %u dispatches \"%s\" (hash %02x%02x%02x%02x%02x%02x%02x%02x...), %llu x %llu x %llu threads in groups of %llu x %llu x %llu",
 	      task, name, hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], size[0], size[1], size[2], size[3], size[4], size[5]);
@@ -7627,7 +7903,9 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	const uint32_t frameW = md ? gSurfaceFns.width(s) : 0, frameH = md ? gSurfaceFns.height(s) : 0;
 	const uint32_t format = md ? gSurfaceFns.pixelFormat(s) : 0;
 
-	if (frameW && frameH && (frameW != h.width || frameH != h.height) && (frameW != sm.triedW || frameH != sm.triedH)) {
+	// The same size in another mode than macOS was told (a boot display the GOP lit at 30 Hz) as well. Once a size.
+	if (frameW && frameH && (frameW != sm.triedW || frameH != sm.triedH) &&
+	    (frameW != h.width || frameH != h.height || PvScanout::wantsMode(port, frameW, frameH))) {
 		uint32_t bigW = 0, bigH = 0;
 		const bool larger = PvScanout::largest(port, bigW, bigH) && frameW > bigW && frameH > bigH;
 
@@ -7636,7 +7914,8 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 
 		if (!larger && PvScanout::setMode(port, frameW, frameH) && PvScanout::head(port, h))
 			pvlog("host: present: port %u now %ux%u for frames of that size", port, h.width, h.height);
-		else if (larger && (h.width != bigW || h.height != bigH) && PvScanout::setMode(port, bigW, bigH) && PvScanout::head(port, h))
+		else if (larger && (h.width != bigW || h.height != bigH || PvScanout::wantsMode(port, bigW, bigH)) &&
+		         PvScanout::setMode(port, bigW, bigH) && PvScanout::head(port, h))
 			pvlog("host: present: port %u now %ux%u for frames of %ux%u (format 0x%08x), scaled down", port, h.width, h.height, frameW, frameH,
 			      format);
 	}
@@ -8277,6 +8556,9 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	if (mNotRun)
 		pvstat("host: render:   %u draws not run, the first with \"%s\": %s", mNotRun, mNotRunName, mNotRunWhy);
 
+	if (mBlockingTranslations)   // since the boot: each held every channel, the display's too (Apple's 300 ms)
+		pvstat("host: render:   %u translations waited for inside a command buffer, the display channels not served", mBlockingTranslations);
+
 	// where the waits for the card came from (pvgpu.cpp lines), the most first
 	char sites[160] = "";
 	for (uint32_t k = 0, at = 0; k < 6 && at < sizeof(sites) - 16; k++) {
@@ -8332,6 +8614,10 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	       "private %u (%llu MiB)", mTargetDraws[0], mTargetBytes[0] >> 20, mTargetDraws[1], mTargetBytes[1] >> 20, mTargetDraws[2], mTargetBytes[2] >> 20,
 	       mTargetDraws[3], mTargetBytes[3] >> 20, mTargetDraws[4], mTargetBytes[4] >> 20);
 	memset(mTargetDraws, 0, sizeof(mTargetDraws));
+	pvstat("host: render:   draws into targets held %u, in place %u, staged %u, multisampled %u; holds refused %u", mHowDrawn[0], mHowDrawn[1],
+	       mHowDrawn[2], mHowDrawn[3], mHoldFailed);
+	memset(mHowDrawn, 0, sizeof(mHowDrawn));
+	mHoldFailed = 0;
 
 	for (uint32_t k = 0; k < 4; k++) {
 		CopiedTop *top = nullptr;
@@ -8656,13 +8942,27 @@ void RDNA4PvHost::defineChannel(uint32_t n) {
 	      rec[0], rec[1]);
 }
 
-void RDNA4PvHost::pollChannels() {
+void RDNA4PvHost::serveDisplay() {
+	if (mInDisplayPoll)
+		return;
+	mInDisplayPoll = true;
+	dropIrqBits();
+	completeLate();
+	pollChannels(true);
+	flushBatch();
+	flipDone();
+	pollDisplay();
+	completeLate();
+	mInDisplayPoll = false;
+}
+
+void RDNA4PvHost::pollChannels(bool displayOnly) {
 	if (!mRootMap)
 		return;
 	uint8_t *root = reinterpret_cast<uint8_t *>(mRootMap->getVirtualAddress());
 	for (uint32_t n = 1; n <= kMaxChannels; n++) {
 		Channel &ch = mCh[n];
-		if (!ch.live)
+		if (!ch.live || (displayOnly && (!ch.display || n == mConsuming)))
 			continue;
 		volatile uint32_t *rec = reinterpret_cast<volatile uint32_t *>(root + kRecordOffset + (n - 1) * kRecordBytes);
 		const uint32_t written = rec[0], read = rec[1];
@@ -8677,8 +8977,11 @@ void RDNA4PvHost::pollChannels() {
 		char tag[12];
 		snprintf(tag, sizeof(tag), "ch%u", n);
 		mChannelPolls++;
+		const uint32_t outer = mConsuming;
+		mConsuming = n;
 		// the guest compares the read counter with the write counter to see that the ring is empty and how much room is left
 		rec[1] = read + consume(CmdSource { tag, reinterpret_cast<const uint8_t *>(ch.map->getVirtualAddress()), ch.ringBytes, ch.kind, n }, read, pending);
+		mConsuming = outer;
 	}
 }
 
@@ -9206,6 +9509,7 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtex);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvframeport);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvframe);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvnotrun);
 	// publish() is reached from two threads (the GPU path in attach() and RDNA4PvLate's work loop): claim the single slot atomically before building
 	// anything, give it back on the paths that can be retried.
 	static bool claimed = false;

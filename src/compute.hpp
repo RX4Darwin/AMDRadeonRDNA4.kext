@@ -130,6 +130,9 @@ public:
 		// Once the power-management firmware runs its features (stage 3), on the bring-up thread before
 		// it sends anything else: the display device may talk to the firmware (ctx: cursorProbeCtx).
 		void (*smuReady)(void *ctx) { nullptr };
+		// The VBIOS image the display device read (rdna4-dmubload: the display firmware gets a copy).
+		const uint8_t *vbios { nullptr };
+		size_t vbiosSize { 0 };
 	};
 
 	enum Stage : uint32_t {
@@ -154,6 +157,18 @@ public:
 	void powerWillSleep();
 	void powerSleepRequest();   // P7: setPowerState(0) / the debug sleep selector call this first, without rtLock (src/pmidle.cpp)
 	void powerDidWake();
+	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
+	// flushed before each step that could hang the GPU (also the display
+	// side's, RDNA4Device::breadcrumb), so the step a hard
+	// hang stopped at survives the reset. Logged by the next boot's survey.
+	void trail(const char *step);
+	// Run first by powerSleepRequest, while the card has its power, still takes gfx submissions and the runtime's lock is
+	// free: a kernel client that holds the runtime's objects writes back what lives only in VRAM and gives them back (the
+	// paravirtual GPU's host); it opens again once the wake has brought the runtime up (rtGeneration has moved on).
+	void setSleepHook(void (*hook)(void *), void *ctx) { sleepHook = hook; sleepHookCtx = ctx; }
+	void (*sleepHook)(void *) = nullptr;
+	void *sleepHookCtx = nullptr;
+	uint32_t rtGeneration = 0;   // counts the runtime's rebuilds after a sleep (resetRuntimeForResume)
 
 	// Snapshot of the engines, as read by the survey.
 	struct Survey {
@@ -244,10 +259,6 @@ private:
 	bool bringupStepAllowed(const char *step);
 	void resetRuntimeForResume();
 
-	// Breadcrumb in NVRAM (Lilu vendor GUID, key rdna4-trail), written and
-	// flushed before each step that could hang the GPU, so the step a hard
-	// hang stopped at survives the reset. Logged by the next boot's survey.
-	void trail(const char *step);
 	// The pre-Metal features past the compute stages (W1-W5) name their
 	// trail steps "<feature>: ..." (gfx, ih, vm, flip). If the previous
 	// boot died in one of those, only that feature sits this boot out; the
@@ -269,6 +280,11 @@ private:
 	// Stage 2.
 	Psp::Driver psp;
 	bool stagePsp();
+	// rdna4-dmubload=1, after stage 2: the display microcontroller started on the kext's own firmware
+	// (dcn_4_0_1_dmcub.bin through the PSP, src/dmubload.cpp), its windows in the pool at kDmubOffset.
+	void stageDmub();
+	static uint32_t dmubRead(void *ctx, uint32_t reg);
+	static void dmubWrite(void *ctx, uint32_t reg, uint32_t value);
 
 	// Stage 3.
 	bool stageGfx();
@@ -294,6 +310,7 @@ private:
 	static constexpr uint32_t kSdmaFenceOffset = kSdmaTestOffset + 0x40;    // FENCE target
 	static constexpr uint32_t kFillOffset     = 16u << 20;            // CONST_FILL target
 	static constexpr uint32_t kFillBytes      = 1u << 20;
+	static constexpr uint32_t kDmubOffset     = 18u << 20;            // display firmware windows (DmubLoad::kBlockBytes)
 	uint64_t poolMc(uint32_t off) const { return pool.mcAddress + off; }
 	volatile uint32_t *poolDw(uint32_t off) const {
 		return reinterpret_cast<volatile uint32_t *>(poolCpu + off);
@@ -826,6 +843,7 @@ private:
 		bool        device { false };          // from the device heap
 		bool        host { false };
 		bool        foreign { false };         // VRAM that is not the runtime's (rtMapVram): only the VA is given back
+		bool        mapped { false };          // rtMapPages: pages the runtime did not allocate, not counted in the host quota
 		IOBufferMemoryDescriptor *hostMemory { nullptr };
 		IODMACommand *hostDma { nullptr };
 		IOMemoryMap *hostMap { nullptr };

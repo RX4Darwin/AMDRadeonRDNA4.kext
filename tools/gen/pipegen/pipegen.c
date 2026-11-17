@@ -53,7 +53,12 @@ static enum bp_result bios_set_pixel_clock(struct dc_bios *bp, struct bp_pixel_c
 	rec_mark("dmub:set_pixel_clock", 0);
 	return BP_RESULT_OK;
 }
+/* The GOP lit a display: amdgpu takes the hardware over from a running VBIOS ("accelerated mode"); in the
+ * "init" scenario nothing runs (after a power loss the VBIOS has not run). */
+static bool g_cold;
+static bool bios_accelerated(struct dc_bios *bp) { return !g_cold; }
 static const struct dc_vbios_funcs bios_funcs = {
+	.is_accelerated_mode = bios_accelerated,
 	.encoder_control = bios_encoder_control,
 	.transmitter_control = bios_transmitter_control,
 	.set_pixel_clock = bios_set_pixel_clock,
@@ -553,7 +558,7 @@ static struct ev run0[8192]; static int n0;
 
 static void emit(void)
 {
-	static const char *k[] = { "W", "U", "WAIT", "DELAY", "MARK" };
+	static const char *k[] = { "W", "U", "WAIT", "DELAY", "MARK", "COPY" };
 	if (n0 != nev) {
 		fprintf(stderr, "DIVERGED: %d events vs %d\n", n0, nev);
 		for (int i = 0; i < n0 && i < nev; i++)
@@ -576,10 +581,120 @@ static void emit(void)
 			fprintf(stderr, "DIVERGED value at event %d (%s)\n", i, a.label); exit(1);
 		}
 		if (a.kind == EV_MARK) printf("MARK  %s 0x%x\n", a.label, a.arg);
+		else if (a.kind == EV_COPY) printf("COPY  %u 0x%04x %u 0x%04x ; %s\n", (a.addr >> 24) - 1, a.addr & 0xffffff,
+						 (a.arg >> 24) - 1, a.arg & 0xffffff, a.label);
 		else if (a.kind == EV_DELAY) printf("DELAY %u ; %s\n", a.arg, a.label);
 		else printf("%-5s %u 0x%04x %08x %08x %u ; %s\n", k[a.kind], (a.addr >> 24) - 1,
 			    a.addr & 0xffffff, a.mask, a.value, a.arg, a.label);
 	}
+}
+
+/* ---- the "init" scenario: dcn401_init_hw on display hardware with nothing running ----
+ *
+ * What amdgpu does to the display hardware when it starts it, here as after a power loss (resume from S3): the
+ * card's four connectors as links (DisplayPort on links 0 and 1, HPD1-2; HDMI on 2 and 3, HPD3-4), every pipe
+ * off, an empty committed state, and the clocks left to the kext's own SMU requests (src/clk.cpp): the clock
+ * manager's update_clocks is a mark. The part of lighting the displays from nothing that comes before
+ * lighting a pipe. */
+static void clk_update(struct clk_mgr *c, struct dc_state *s, bool safe) { rec_mark("clk:update_clocks", 0); }
+static int clk_dentist(struct clk_mgr *c) { return 0; }
+static struct clk_mgr_funcs init_clk_funcs = { .update_clocks = clk_update, .get_dispclk_from_dentist = clk_dentist };
+static struct clk_bw_params g_bw;
+/* hubbub401_init_watermarks copies watermark set A into the others: recorded as copies (rec_copy_mode). */
+static struct hubbub_funcs g_hubbub_funcs;
+static void (*g_init_watermarks)(struct hubbub *);
+static void init_watermarks_as_copies(struct hubbub *hubbub)
+{
+	rec_copy_mode = 1;
+	g_init_watermarks(hubbub);
+	rec_copy_mode = 0;
+}
+/* dc.c's: this card has no eDP panel. */
+void dc_get_edp_links(const struct dc *dc, struct dc_link **edp_links, unsigned int *edp_num) { *edp_num = 0; }
+/* dc.c's: on this card it only turns idle power features (MALL as a cache, through DMUB) off and on again,
+ * nothing a display needs to light: a mark. */
+void dc_allow_idle_optimizations_internal(struct dc *dc, bool allow, char const *caller_name)
+{
+	rec_mark(allow ? "dc:allow_idle_optimizations:on" : "dc:allow_idle_optimizations:off", allow);
+}
+
+static void sequence_init(void)
+{
+	struct dc *dc = &g_dc;
+
+	dc->current_state = calloc(1, sizeof(*dc->current_state));
+	dc->link_srv = link_create_link_service();
+	for (int l = 0; l < 4; l++) {
+		struct dc_link *link = calloc(1, sizeof(*link));
+		struct encoder_init_data eid = { 0 };
+		const bool dp = l < 2;
+
+		eid.channel = CHANNEL_ID_DDC1 + l;
+		eid.hpd_source = HPD_SOURCEID1 + l;
+		eid.transmitter = TRANSMITTER_UNIPHY_A + l;
+		eid.encoder.type = OBJECT_TYPE_ENCODER;
+		eid.encoder.id = ENCODER_ID_INTERNAL_UNIPHY + l / 2;
+		eid.encoder.enum_id = ENUM_ID_1 + (l & 1);
+		eid.connector.type = OBJECT_TYPE_CONNECTOR;
+		eid.connector.id = dp ? CONNECTOR_ID_DISPLAY_PORT : CONNECTOR_ID_HDMI_TYPE_A;
+		eid.connector.enum_id = ENUM_ID_1 + (l & 1);
+		eid.ctx = &g_ctx;
+		link->dc = dc; link->ctx = &g_ctx; link->link_index = l;
+		link->connector_signal = dp ? SIGNAL_TYPE_DISPLAY_PORT : SIGNAL_TYPE_HDMI_TYPE_A;
+		link->ep_type = DISPLAY_ENDPOINT_PHY;
+		link->link_enc = dcn401_link_encoder_create(&g_ctx, &eid);
+		link->link_id = eid.connector;
+		link->ddc_hw_inst = l;
+		dc->links[l] = link;
+	}
+	dc->link_count = 4;
+	for (int i = 0; i < 4; i++) {
+		g_pool.dscs[i] = dcn401_dsc_create(&g_ctx, i);
+		g_pool.clock_sources[i] = dcn401_clock_source_create(&g_ctx, &g_bios, CLOCK_SOURCE_COMBO_PHY_PLL0 + i,
+								     &clk_src_regs[i], false);
+	}
+	g_pool.clk_src_count = DCN401_CLK_SRC_TOTAL;
+	g_pool.dp_clock_source = dcn401_clock_source_create(&g_ctx, &g_bios, CLOCK_SOURCE_ID_DP_DTO, &clk_src_regs[0], true);
+	g_clk_mgr.funcs = &init_clk_funcs;
+	g_clk_mgr.bw_params = &g_bw;
+	g_hubbub_funcs = *g_pool.hubbub->funcs;
+	g_init_watermarks = g_hubbub_funcs.init_watermarks;
+	g_hubbub_funcs.init_watermarks = init_watermarks_as_copies;
+	g_pool.hubbub->funcs = &g_hubbub_funcs;
+	g_bios.fw_info.pll_info.crystal_frequency = 100000;   /* the card's reference clock, kHz */
+
+	/* Nothing running, as after a power loss: every timing generator and DIG back end off (enable bits at
+	 * their reset value, 0), the IP request window closed, no VBIOS display (g_cold: not "accelerated"). */
+	rec_poke_field(hwseq_reg.DC_IP_REQUEST_CNTL, DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK, 0);
+	for (int i = 0; i < 4; i++) {
+		struct optc *tg = DCN10TG_FROM_TG(g_pool.timing_generators[i]);
+		struct dcn10_link_encoder *enc = TO_DCN10_LINK_ENC(dc->links[i]->link_enc);
+
+		rec_poke_field(tg->tg_regs->OTG_CONTROL, tg->tg_mask->OTG_MASTER_EN, 0);
+		rec_poke_field(enc->link_regs->DIG_BE_CLK_CNTL, enc->link_mask->DIG_BE_CLK_EN, 0);
+		rec_poke_field(enc->link_regs->DIG_BE_EN_CNTL, enc->link_mask->DIG_BE_ENABLE, 0);
+		/* no blender feeds an OPP */
+		rec_poke_field(TO_DCN10_MPC(g_pool.mpc)->mpc_regs->MPCC_OPP_ID[i], 0xf, 0xf);
+		/* hubp2_set_blank_regs waits for the HUBP's requests to drain unless it reads 0 (power gated): it is
+		 * not gated, and the plan waits as Linux polls */
+		struct dcn20_hubp *hubp = TO_DCN20_HUBP(g_pool.hubps[i]);
+		rec_poll("hubp2_set_blank_regs", hubp->hubp_regs->DCHUBP_CNTL, hubp->hubp_mask->HUBP_NO_OUTSTANDING_REQ,
+			 hubp->hubp_mask->HUBP_NO_OUTSTANDING_REQ, 100000);
+	}
+	g_cold = true;
+
+	/* On a warm card the timing generators lit before are still running (a pipe put to sleep keeps its own):
+	 * stopped first the way Linux stops one (optc401_disable_crtc), recorded on its own for each OTG. */
+	for (int i = 0; i < 4; i++) {
+		char mark[16];
+		snprintf(mark, sizeof(mark), "begin:otgoff%d", i);
+		rec_mark(mark, 0);
+		g_pool.timing_generators[i]->funcs->disable_crtc(g_pool.timing_generators[i]);
+	}
+
+	rec_mark("begin:init_hw", 0);
+	dc->hwss.init_hw(dc);
+	rec_mark("end", 0);
 }
 
 static void setup(void)
@@ -629,6 +744,17 @@ int main(int argc, char **argv)
 	unsigned v[16];
 	bool verbose;
 
+	if (argc > 1 && !strcmp(argv[1], "init")) {
+		for (int run = 0; run < 2; run++) {
+			rec_reset(run ? 0xffffffff : 0);
+			rec_log_reads = argc > 2 && run == 0;
+			setup();
+			sequence_init();
+			if (run == 0) { memcpy(run0, evs, sizeof(struct ev) * nev); n0 = nev; }
+		}
+		emit();
+		return 0;
+	}
 	if (argc > 1 && !strcmp(argv[1], "dp")) { c.dp = true; argv++; argc--; }
 	else if (argc > 1 && !strcmp(argv[1], "dpdual")) { c.dual = true; argv++; argc--; }
 	if (argc > 1 && !strcmp(argv[1], "y420")) { c.y420 = true; argv++; argc--; }

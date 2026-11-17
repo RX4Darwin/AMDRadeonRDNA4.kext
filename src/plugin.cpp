@@ -156,6 +156,12 @@ KernelPatcher::KextInfo kextIONDRVSupport {
 	KernelPatcher::KextInfo::Unloaded,
 };
 
+const char *kPathIOGraphics = "/System/Library/Extensions/IOGraphicsFamily.kext/IOGraphicsFamily";
+KernelPatcher::KextInfo kextIOGraphics {
+	"com.apple.iokit.IOGraphicsFamily", &kPathIOGraphics, 1, {true}, {},
+	KernelPatcher::KextInfo::Unloaded,
+};
+
 #ifdef AMDRadeonRDNA4_PVGPU
 // The IOSurface kext (boot kernel collection, loaded before Lilu): the fake GPU's host draws into IOSurface-backed render targets with it.
 const char *kPathIOSurface = "/System/Library/Extensions/IOSurface.kext/Contents/MacOS/IOSurface";
@@ -180,6 +186,9 @@ uint32_t accelCensus { 0 };     // rdna4-accelcensus=1|2: the E1 impostor-IOAcce
 // that none of our framebuffers has one
 bool pvHeads { false };
 bool pvScaledModes { true };   // rdna4-pvscaled=0: no scaled modes above a head's 3840x2160
+// rdna4-pvfast=1: the boot display's paravirtual modes at each size's fastest refresh, not the one nearest 60 Hz. macOS
+// picks a size there, not a refresh (its paravirtual display tells the host the size alone): one refresh a size.
+bool pvFastModes { false };
 
 // What we keep for one of our framebuffers.
 struct FbState {
@@ -306,8 +315,16 @@ void deviceCursorProbe(void *ctx, const char *why) {
 	static_cast<RDNA4Device *>(ctx)->cursorRegProbe(why);
 }
 
+void coldStartHeads(RDNA4Device &dev);
+
 void deviceSmuReady(void *ctx) {
-	static_cast<RDNA4Device *>(ctx)->smuStarted();
+	RDNA4Device &dev = *static_cast<RDNA4Device *>(ctx);
+
+	dev.breadcrumb("smuReady: display clocks");
+	dev.smuStarted();
+	dev.breadcrumb("smuReady: cold start");
+	coldStartHeads(dev);   // rdna4-dcninit=1 only
+	dev.breadcrumb("smuReady: done");
 }
 
 int32_t deviceGetHardwareCursorDrawState(void *ctx,
@@ -384,6 +401,7 @@ struct Head2 {
 	// Its display can be lit at 3840x2160 once the compute bring-up has raised the display clocks: it waits
 	// offline for that, then is plugged in (or after kClockWaitPolls at the size it can have).
 	bool             waitClocks { false };
+	bool             coldPending { false };   // rdna4-coldboot=1: its pipe lit by coldStartHeads, not at start
 	uint32_t         waitPolls { 0 };
 };
 #define HLOG(h, fmt, ...)  FBLOG("head%u: " fmt, static_cast<unsigned>((h)->slot + 2), ## __VA_ARGS__)
@@ -421,6 +439,7 @@ bool head2SurfaceFor(void *ctx, const Modes::Mode &m, bool, Ndrv::Surface &out) 
 
 int32_t head2SwitchTo(void *ctx, const Modes::Mode &m, bool) {
 	auto *h = static_cast<Head2 *>(ctx);
+	RDNA4Device::ExtraHold hold(*h->dev);
 	h->dev->selectExtra(h->slot);
 	return h->dev->applySecondPipeMode(m);
 }
@@ -431,6 +450,7 @@ void head2SetPower(void *ctx, bool on) {
 	if (pvHeads && !on)
 		return;
 
+	RDNA4Device::ExtraHold hold(*h->dev);
 	h->dev->selectExtra(h->slot);
 	if (h->connected || !on)             // the link of an unplugged display stays off
 		h->dev->setSecondPipePower(on);
@@ -657,7 +677,10 @@ void fillHead(Head2 *h, RDNA4Device &dev) {
 			HLOG(h, "nothing to serve: no mode of the sink fits behind the console");
 		return;
 	}
-	if (!offline && head2Level >= 2 && dev.isAmd)
+	// After the cold-boot reset nothing can light a pipe before the SMU and DMUB run: coldStartHeads does.
+	const bool lights = !offline && head2Level >= 2 && dev.isAmd;
+	h->coldPending = lights && dev.coldBoot;
+	if (lights && !dev.coldBoot)
 		dev.lightSecondPipe(head2Level, h->surface.physBase);
 	head2Init(h, dev, mode, n);
 	h->connected = !offline;
@@ -722,7 +745,39 @@ void takeBootDisplay(Head2 *h, RDNA4Device &dev) {
 	HLOG(h, "boot4k: the boot display %s", h->connected ? "is the head's now" : "did NOT come up on the head");
 }
 
+// rdna4-dcninit=1: the cold-start test, once the kext's DMUB firmware runs and the clocks are raised; the extra
+// pipes it put to sleep lit again by their heads' plans, as at boot.
+void coldStartHeads(RDNA4Device &dev) {
+	RDNA4Device::ExtraHold hold(dev);
+	uint32_t relight = 0;
+
+	(void)dev.coldStart(relight);
+	for (size_t i = 0; i < headCount; i++) {
+		Head2 *h = heads[i];
+
+		if (!(relight & 1u << h->slot) && !h->coldPending)
+			continue;
+		const bool pending = h->coldPending;
+		h->coldPending = false;
+		dev.selectExtra(h->slot);
+		char step[48];
+		snprintf(step, sizeof(step), "cold start: head %zu lit again", h->slot + 2);
+		dev.breadcrumb(step);
+		dev.extraAuxPadsAfterPowerLoss();
+		dev.lightSecondPipe(head2Level, h->surface.physBase);
+		// A head the cold boot left dark at start (fillHead) set up as a lit one: its modes, switching and power.
+		size_t n = 0;
+		const Modes::Mode *mode = pending && dev.xp().lit ? head2BuildTable(h, dev, n) : nullptr;
+		if (mode)
+			head2Init(h, dev, mode, n);
+		HLOG(h, "dcninit: lit again: %s%s; surface %ux%u at 0x%llx", dev.xp().lit && dev.xp().on ? "on" : "NOT on",
+		      mode ? ", its modes set up" : "", h->surface.width, h->surface.height, h->surface.physBase);
+	}
+	dev.selectExtra(0);
+}
+
 void fillHeads(RDNA4Device &dev) {
+	RDNA4Device::ExtraHold hold(dev);
 	for (size_t i = 0; i < headCount; i++)
 		fillHead(heads[i], dev);
 	pickBootHead(dev);
@@ -748,6 +803,7 @@ void head2ConnectChanged(Head2 *h) {
 // starts.
 void head2Plugged(Head2 *h, uint8_t hpd) {
 	RDNA4Device &dev = *h->dev;
+	RDNA4Device::ExtraHold hold(dev);
 	dev.selectExtra(h->slot);
 	if (!dev.readSecondEdid(hpd)) {
 		HLOG(h, "hotplug: HPD%u is high but there is no EDID on DDC (yet)", hpd);
@@ -811,6 +867,7 @@ void head2Plugged(Head2 *h, uint8_t hpd) {
 }
 
 void head2Unplugged(Head2 *h) {
+	RDNA4Device::ExtraHold hold(*h->dev);
 	h->dev->selectExtra(h->slot);
 	h->dev->setSecondPipePower(false);
 	h->connected = false;
@@ -844,6 +901,7 @@ void hotplugPoll(OSObject *owner, IOTimerEventSource *timer) {
 	if (!h)
 		return;
 	RDNA4Device &dev = *h->dev;
+	RDNA4Device::ExtraHold hold(dev);
 	dev.selectExtra(h->slot);
 	// A display that is gone may come back on another connector.
 	const uint8_t hpd = dev.secondSinkHpd(!h->connected);
@@ -946,6 +1004,7 @@ void startBootDpPoll(IOService *fb, RDNA4Device &dev) {
 }
 
 void startHead2Hotplug(Head2 *h, IOService *fb, void (*proc)(OSObject *, void *), OSObject *target, void *ref) {
+	RDNA4Device::ExtraHold hold(*h->dev);
 	h->dev->selectExtra(h->slot);
 	IOWorkLoop *loop = fb->getWorkLoop();
 	h->hpdTimer = loop ? IOTimerEventSource::timerEventSource(fb, hotplugPoll) : nullptr;
@@ -984,7 +1043,7 @@ IOReturn wrapRegisterForInterruptType(void *fb, IOSelect type, void (*proc)(OSOb
 		return ret;
 	}
 	FbEntry *e = fbEntry(fb);
-	if (e && e->ours && e->state && e->state->dev.bootDpLinkKnown && !bootDp.timer)
+	if (e && e->ours && e->state && e->state->dev.bootDpLinkKnown && !e->state->dev.coldBoot && !bootDp.timer)
 		startBootDpPoll(service, e->state->dev);
 	return ret;
 }
@@ -1117,6 +1176,11 @@ void attach(FbEntry &e) {
 	(void)Trial::option("rdna4-pvscaled", scaled);
 	pvScaledModes = scaled != 0;
 
+	uint32_t fast = 0;
+
+	(void)Trial::option("rdna4-pvfast", fast);
+	pvFastModes = fast != 0;
+
 	if (pvHeads) {
 		st->ndrv.setConnected(false);
 		FBLOG("ndrv: the heads are the paravirtual displays: no display on our framebuffers for macOS");
@@ -1159,6 +1223,8 @@ void attach(FbEntry &e) {
 		                        dev.fbPhysBase, dev.fbLength, dev.liveFramePeriodNs(),
 		                        createVblankService, deviceCursorProbe, &dev };
 		env.smuReady = deviceSmuReady;
+		dev.compute = &st->compute;   // its sleep and wake from the device's notifiers (rdna4-syssleep without rdna4-pm)
+		env.vbios = dev.vbiosBytes(env.vbiosSize);
 		st->compute.start(env, computeStage);
 	}
 }
@@ -1174,6 +1240,8 @@ const char *commandName(UInt32 code) {
 	default:                       return "?";
 	}
 }
+
+bool sysSleepLog = false;   // rdna4-syssleep: the framebuffers' power calls logged
 
 IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 commandCode,
                         UInt32 commandKind) {
@@ -1227,7 +1295,14 @@ IOReturn wrapDoDriverIO(void *fb, UInt32 commandID, void *contents, UInt32 comma
 		      answered ? "rdna4" : "boot");
 	}
 
-	if (traceEnabled && traceBudget) {
+	// The power calls (cscGetPowerState / cscSetPowerState, 25) and the NDRV's lifecycle, always: what system sleep
+	// asks of the framebuffer (rdna4-syssleep, roadmap item 5).
+	const bool lifecycle = !csc && commandCode != kIONDRVControlCommand && commandCode != kIONDRVStatusCommand;
+	if (sysSleepLog && ((csc && code == 25) || lifecycle)) {
+		const auto *ps = csc ? static_cast<const VDPowerStateRec *>(static_cast<NdrvControlParameters *>(contents)->params) : nullptr;
+		FBLOG("power: %p %s%s -> 0x%x (%s)%s state %u flags 0x%x", fb, commandName(commandCode), csc ? " csc 25 (power state)" : "",
+		      ret, answered ? "rdna4" : "boot", ps ? "," : "", ps ? ps->powerState : 0, ps ? ps->powerFlags : 0);
+	} else if (traceEnabled && traceBudget) {
 		traceBudget--;
 		if (csc)
 			FBLOG("ndrv: %s csc %u -> 0x%x (%s)", commandName(commandCode), code, ret,
@@ -1269,6 +1344,240 @@ int32_t wrapVslDo(void *service) {
 bool wrapVslPrepareCursor(void *cursorRef, void *descriptor, void *info) {
 	auto org = FunctionCast(wrapVslPrepareCursor, orgVslPrepareCursor);
 	return org(cursorRef, descriptor, info);
+}
+
+// rdna4-syssleep=1 (roadmap item 5, stage 1): system sleep no longer refused for the card. IONDRVFramebuffer::initForPM
+// sets kIOPMPreventSystemSleep in its power states whenever its NDRV is IOBootNDRV (as ours always is), or the NDRV's
+// cscGetPowerState fails or lacks kPowerStateSleepCanPowerOff (IONDRVSupport, Tahoe 26.6.2, disassembled 2026-11-15);
+// a service whose power state carries that flag is one of IOPMrootDomain's "system sleep preventers". For our
+// framebuffers the flag is taken out of the table they register; what sleep and wake then do is what stage 1 looks at.
+constexpr IOPMPowerFlags kPreventSystemSleep = 0x0010;   // kIOPMPreventSystemSleep (IOPM.h, private flags)
+mach_vm_address_t orgRegisterPowerDriver;
+
+IOReturn wrapRegisterPowerDriver(IOService *that, IOService *driver, IOPMPowerState *states, unsigned long n) {
+	auto org = FunctionCast(wrapRegisterPowerDriver, orgRegisterPowerDriver);
+	if (!that || !states || !n || n > 8 || !that->metaCast("IONDRVFramebuffer") ||
+	    !(isOurDevice(that->getProvider()) || headFor(that)))
+		return org(that, driver, states, n);
+	IOPMPowerState copy[8];   // registerPowerDriver copies the table itself (an OSData of it)
+	uint32_t cleared = 0;
+	for (unsigned long i = 0; i < n; i++) {
+		copy[i] = states[i];
+		if (copy[i].capabilityFlags & kPreventSystemSleep) {
+			copy[i].capabilityFlags &= ~kPreventSystemSleep;
+			cleared |= 1u << i;
+		}
+	}
+	FBLOG("power: %s %p: %lu power state(s), kIOPMPreventSystemSleep taken out of 0x%x: system sleep allowed",
+	      that->getName(), that, n, cleared);
+	return org(that, driver, copy, n);
+}
+
+// Our framebuffers' slots in their IOFBController. On boards whose BIOS names the card's PCI device VGA rather than display,
+// IONDRVSupport's expander runs (the IONDRVFramebuffer on the PCI device that is not name-matched): it numbers every
+// device-tree child of type display 0, 1, ... (our head nubs, over createHead's index) and wraps each in an IONDRVDevice of its
+// own, so six framebuffers share IOFBDependentIndex 0..2, and some are never opened. IOFramebuffer::open puts a framebuffer
+// into its controller's table at its index (+0x18, a pointer per slot), and IOFBController::checkPowerWork walks that table
+// as a list that ends at the first empty slot (IOGraphicsFamily, Tahoe 26.6.2, disassembled 2026-11-15). A framebuffer that
+// lost its slot, or stands behind an empty one, never has a power change done: each waited out its 45 s acknowledgement
+// timeout, at boot, at every sleep and every wake. So each of our framebuffers opens into the first free slot: the table
+// holds the open framebuffers without a gap. (The never opened ones acknowledge power changes at once.)
+mach_vm_address_t orgFbOpen;
+
+// A framebuffer's IOFBController (IOFramebuffer::__private at +0x1c8, the controller its first field), or null.
+uint8_t *fbController(IOService *fb) {
+	auto *priv = fb ? *reinterpret_cast<uint8_t **>(reinterpret_cast<uint8_t *>(fb) + 0x1c8) : nullptr;
+	return priv ? *reinterpret_cast<uint8_t **>(priv) : nullptr;
+}
+
+// The paravirtual GPU's framebuffer (Apple's driver, on our nub).
+bool isParavirtFb(IOService *fb) {
+	const OSMetaClass *meta = fb ? fb->getMetaClass() : nullptr;
+	return meta && !strcmp(meta->getClassName(), "AppleParavirtFramebuffer");
+}
+
+// The controller of one of our card's IONDRVFramebuffers, or null for any other framebuffer.
+uint8_t *ourFbController(IOService *fb) {
+	return fb && fb->metaCast("IONDRVFramebuffer") && isOurDevice(fb->getProvider()) ? fbController(fb) : nullptr;
+}
+
+IOReturn wrapFbOpen(IOService *fb) {
+	if (uint8_t *ctl = ourFbController(fb)) {
+		auto *index = OSDynamicCast(OSNumber, fb->getProperty("IOFBDependentIndex"));
+		if (index) {
+			auto *const *table = reinterpret_cast<IOService *const *>(ctl + 0x18);
+			uint32_t slot = 0;
+			while (slot < 32 && table[slot] && table[slot] != fb)
+				slot++;
+			if (slot < 32 && slot != index->unsigned32BitValue()) {
+				FBLOG("ndrv: %s %llx opens as dependent %u, the first free slot (was %u)", fb->getName(),
+				      fb->getRegistryEntryID(), slot, index->unsigned32BitValue());
+				fb->setProperty("IOFBDependentIndex", static_cast<unsigned long long>(slot), 32);
+			}
+		}
+	}
+	const IOReturn r = FunctionCast(wrapFbOpen, orgFbOpen)(fb);
+	// A framebuffer whose open failed (the expander's wrappers of our head nubs: IOBootNDRV refuses a nub index other than
+	// 0, and we do not answer for them) is dead, but open had already put it into its controller's table. It is never in
+	// gAllFramebuffers, so never told a server state: it stays "on" (sent/acked 1/1), the controller's state keeps bit
+	// 0x40, and IOFramebuffer::systemWork then (a) holds the system sleep's acknowledgement until gIOGNotifyTO (90 s) and
+	// (b) at the wake skips telling WindowServer the displays are on: no desktop (card, 2026-11-15, trace of 10000056f).
+	// So it leaves the table again, and the next framebuffer to open takes its slot.
+	uint8_t *ctl = ourFbController(fb);
+	if (r != kIOReturnSuccess && ctl) {
+		auto **table = reinterpret_cast<IOService **>(ctl + 0x18);
+		for (uint32_t slot = 0; slot < 32; slot++)
+			if (table[slot] == fb) {
+				table[slot] = nullptr;
+				if (slot < 8)
+					ctl[0x1b4] &= static_cast<uint8_t>(~(1u << slot));
+				// ponytail: a gap left before live slots would end the controller's walks early; open fills slots in
+				// order, so the failed one is the last taken unless a dependent opened inside it (logged)
+				const bool gap = slot + 1 < 32 && table[slot + 1];
+				FBLOG("ndrv: %s %llx did not open (0x%x): out of its controller's slot %u again%s", fb->getName(),
+				      fb->getRegistryEntryID(), r, slot, gap ? " -- LEAVES A GAP before live slots" : "");
+			}
+	}
+	// The controller's byte at +0x1b4 has a bit per framebuffer opened but not yet told by WindowServer that it is up
+	// (extGetAttribute 'wsup', through the framebuffer's user client; nothing else clears it). While a bit is set, the
+	// controller's state has bit 0x8 and IOFramebuffer::systemWork holds back the servers' notification of a system sleep
+	// until gIOGNotifyTO (90 s) runs out. With the heads as the paravirtual displays our framebuffers are hidden from
+	// WindowServer, which never comes for them: their bits are cleared here (pvHeads is decided while the boot one opens).
+	if (pvHeads && ctl && ctl[0x1b4]) {
+		FBLOG("ndrv: %s %llx: controller's framebuffers 0x%02x marked up for WindowServer (it never opens them)",
+		      fb->getName(), fb->getRegistryEntryID(), ctl[0x1b4]);
+		ctl[0x1b4] = 0;
+	}
+	return r;
+}
+
+// IOFramebuffer::notifyServer(state) tells a framebuffer's server (WindowServer) of a system power change. One without a
+// server port, as ours always are with the heads as the paravirtual displays, has its server state set at once, but its
+// controller is not marked: IOFBController::computeState keeps returning its cached state (recomputed only when +0x1b6 or
+// +0x19c is set), with bit 0x40 (a server still on) from before the sleep. IOFramebuffer::systemWork then holds the system
+// sleep's acknowledgement until gIOGNotifyTO, 90 s (card, 2026-11-15: our controller's state stayed 0x44 for the whole wait
+// while the paravirtual one, marked by WindowServer's acknowledgement, changed within a second). So the controller is
+// marked as didWork(1) marks it (didWork itself wants the controller's gate, which notifyServer has let go of by now) and
+// systemWork is run again, to recompute.
+mach_vm_address_t orgFbNotifyServer, fbStartThread;
+
+void wrapFbNotifyServer(IOService *fb, uint8_t state) {
+	FunctionCast(wrapFbNotifyServer, orgFbNotifyServer)(fb, state);
+	uint8_t *ctl = ourFbController(fb);
+	if (!ctl || !fbStartThread)
+		return;
+	auto *msg = *reinterpret_cast<uint8_t **>(reinterpret_cast<uint8_t *>(fb) + 0x1a0);   // the server message; +0x8 its port
+	if (!(msg && *reinterpret_cast<void **>(msg + 0x8))) {
+		__atomic_fetch_or(ctl + 0x1b6, static_cast<uint8_t>(1), __ATOMIC_SEQ_CST);
+		reinterpret_cast<void (*)(bool)>(fbStartThread)(false);
+	}
+}
+
+// IOFramebuffer::_extEntry, the gate every user-client call of a framebuffer passes, waits (sleepGate) while the framebuffer
+// is not on (this+0x198 bit 13, cleared for every framebuffer at a system sleep and set again by handleEvent(4), the wake a
+// framebuffer's driver delivers on its power-on). In a dark wake WindowServer's main thread asks the paravirtual framebuffer for
+// its mode (extGetCurrentDisplayMode) and waits there; at the full wake it cannot acknowledge the wake's notification, and the
+// watchdog kills WindowServer and then panics (card, 2026-11-15, its spin report and Kernel-...-194833.panic). The paravirtual
+// framebuffer has no hardware a sleep has to keep calls away from (our host answers at any time), so it is let through: marked
+// on before the check (the next sleep clears the bit again).
+// Then the wake is delivered as IONDRVSupport delivers it for its own framebuffers on their power-on: handleEvent(4, 1)
+// (kIOFBNotifyDidWake: restoreFramebuffer, the framebuffer marked on, its waiters woken, notification 4 to its clients).
+// The paravirtual framebuffer has no power states, so nothing else delivers it: its display pipe, powered off at the sleep
+// (IOAccelDisplayPipe::framebuffer_will_power_off), stayed off, and every frame WindowServer submitted was refused
+// ("Fallback GPU Display Pipe transaction submission failed"; card, 2026-11-15). handleEvent wants the controller's gate,
+// which _extEntry has taken when it returns (it is let go in _extExit).
+mach_vm_address_t orgExtEntry, fbHandleEvent;
+
+IOReturn wrapExtEntry(IOService *fb, bool system, bool allowOffline, uint32_t apiBit, const char *where) {
+	bool woken = false;
+	if (isParavirtFb(fb)) {
+		auto *flags = reinterpret_cast<uint8_t *>(fb) + 0x199;   // the high byte of this+0x198
+		if (!(*flags & 0x20)) {
+			__atomic_fetch_or(flags, static_cast<uint8_t>(0x20), __ATOMIC_SEQ_CST);
+			woken = true;
+		}
+	}
+	const IOReturn r = FunctionCast(wrapExtEntry, orgExtEntry)(fb, system, allowOffline, apiBit, where);
+	if (woken) {
+		IOReturn w = kIOReturnUnsupported;
+		// handleEvent acts only on the thread its controller has at +0x188 (set by checkPowerWork around a framebuffer's
+		// power work, where IONDRVSupport's calls come from): set here the same way, and put back.
+		uint8_t *ctl = fbController(fb);
+		if (r == kIOReturnSuccess && fbHandleEvent && ctl) {
+			auto *owner = reinterpret_cast<thread_t *>(ctl + 0x188);
+			const thread_t was = *owner;
+			*owner = current_thread();
+			w = reinterpret_cast<IOReturn (*)(IOService *, int32_t, void *)>(fbHandleEvent)(fb, 4, reinterpret_cast<void *>(1));
+			*owner = was;
+		}
+		FBLOG("pvgpu: %s %llx: a call while it is off for a sleep (%s): let through, marked on, the wake delivered (0x%x/0x%x)",
+		      fb->getName(), fb->getRegistryEntryID(), where ? where : "?", r, w);
+	}
+	return r;
+}
+
+// The paravirtual framebuffer joins the power tree (under the card's PCI device) without power states: its AppleDisplay can
+// never change its power, so WindowServer's display sleep never completes, and WindowServer holds back its answer to the
+// system sleep ("Display sleep not yet completed, defer ack of IOPM sleep") until powerd gives up after 30 s ("WindowServer
+// timed out(30000 ms)"; card, 2026-11-15). With rdna4-syssleep it is given the two states a framebuffer has, as IONDRVSupport
+// gives ours (IONDRVFramebuffer::initForPM), for its AppleDisplay to follow; its changes are acknowledged at once
+// (wrapFbSetPowerState).
+mach_vm_address_t orgFbStart;
+
+bool wrapFbStart(IOService *fb, IOService *provider) {
+	const bool started = FunctionCast(wrapFbStart, orgFbStart)(fb, provider);
+	if (started && sysSleepLog && isParavirtFb(fb)) {
+		static IOPMPowerState states[2] = {
+			{ kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+			{ kIOPMPowerStateVersion1, kIOPMDeviceUsable | kIOPMPowerOn | kIOPMMaxPerformance, kIOPMPowerOn, kIOPMPowerOn,
+			  0, 0, 0, 0, 0, 0, 0, 0 },
+		};
+		const IOReturn r = fb->registerPowerDriver(fb, states, 2);
+		FBLOG("pvgpu: %s %llx: power states registered (0x%x): its display can sleep and wake", fb->getName(),
+		      fb->getRegistryEntryID(), r);
+	}
+	return started;
+}
+
+// Its power changes are only for its AppleDisplay to follow: acknowledged at once, without IOFramebuffer's power work (which
+// it never had before it had states). With two paravirtual displays that work never ran for one of them, and each of its
+// changes waited out the 45 s acknowledgement timeout, at boot, sleep and wake (card, 2026-11-15).
+mach_vm_address_t orgFbSetPowerState;
+
+IOReturn wrapFbSetPowerState(IOService *fb, unsigned long state, IOService *device) {
+	if (sysSleepLog && isParavirtFb(fb))
+		return kIOPMAckImplied;
+	return FunctionCast(wrapFbSetPowerState, orgFbSetPowerState)(fb, state, device);
+}
+
+void processGraphics(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (index != kextIOGraphics.loadIndex)
+		return;
+	KernelPatcher::RouteRequest start[] {
+		{"__ZN13IOFramebuffer5startEP9IOService", wrapFbStart, orgFbStart},
+		{"__ZN13IOFramebuffer13setPowerStateEmP9IOService", wrapFbSetPowerState, orgFbSetPowerState},
+	};
+	if (!patcher.routeMultiple(index, start, 2, address, size))
+		FBLOG("ndrv: IOFramebuffer::start/setPowerState not routed (error %d): the paravirtual display keeps a sleep waiting 30 s",
+		      patcher.getError());
+	patcher.clearError();
+	KernelPatcher::RouteRequest open {"__ZN13IOFramebuffer4openEv", wrapFbOpen, orgFbOpen};
+	if (!patcher.routeMultiple(index, &open, 1, address, size))
+		FBLOG("ndrv: IOFramebuffer::open not routed (error %d): framebuffers can lose their power work", patcher.getError());
+	patcher.clearError();
+	fbHandleEvent = patcher.solveSymbol(index, "__ZN13IOFramebuffer11handleEventEiPv", address, size);
+	patcher.clearError();
+	fbStartThread = patcher.solveSymbol(index, "__ZN13IOFramebuffer11startThreadEb", address, size);
+	patcher.clearError();
+	KernelPatcher::RouteRequest extEntry {"__ZN13IOFramebuffer9_extEntryEbbjPKc", wrapExtEntry, orgExtEntry};
+	if (!patcher.routeMultiple(index, &extEntry, 1, address, size))
+		FBLOG("ndrv: IOFramebuffer::_extEntry not routed (error %d): a dark wake can leave WindowServer waiting", patcher.getError());
+	patcher.clearError();
+	KernelPatcher::RouteRequest notify {"__ZN13IOFramebuffer12notifyServerEh", wrapFbNotifyServer, orgFbNotifyServer};
+	if (!fbStartThread || !patcher.routeMultiple(index, &notify, 1, address, size))
+		FBLOG("ndrv: IOFramebuffer::notifyServer not routed (error %d): a system sleep waits 90 s for our framebuffers",
+		      patcher.getError());
+	patcher.clearError();
 }
 
 bool ndrvRouted = false;   // processKext ran: by Lilu's load notice, or by lateNdrvCheck
@@ -1462,6 +1771,7 @@ void pluginStart() {
 	FBLOG("Lilu plugin started (trace %s, compute stage %u%s%s)", traceEnabled ? "on" : "off",
 	      computeStage, accelCensus ? ", ACCEL CENSUS (emulator only)" : "", pvGpu ? ", FAKE PARAVIRT GPU (VM only)" : "");
 	lilu.onKextLoadForce(&kextIONDRVSupport, 1, processKext, nullptr);
+	lilu.onKextLoadForce(&kextIOGraphics, 1, processGraphics, nullptr);
 #ifdef AMDRadeonRDNA4_PVGPU
 	// whether this boot has the fake GPU is only known once NVRAM is (rdna4-trial): the functions are resolved in any case
 	lilu.onKextLoadForce(&kextIOSurface, 1, [](void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
@@ -1489,6 +1799,16 @@ void pluginStart() {
 #endif
 	lilu.onPatcherLoadForce([](void *, KernelPatcher &patcher) {
 		gPatcher = &patcher;
+		if (RDNA4Device::systemSleepWanted()) {
+			KernelPatcher::RouteRequest power {
+				"__ZN9IOService19registerPowerDriverEPS_P14IOPMPowerStatem", wrapRegisterPowerDriver,
+				orgRegisterPowerDriver,
+			};
+			const bool routed = patcher.routeMultiple(KernelPatcher::KernelID, &power, 1);
+			sysSleepLog = true;
+			FBLOG("power: rdna4-syssleep: IOService::registerPowerDriver %s", routed ? "routed" : "NOT routed");
+			patcher.clearError();
+		}
 #ifdef AMDRadeonRDNA4_PVGPU
 		auto **base = reinterpret_cast<uint8_t **>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_base"));
 		auto **max = reinterpret_cast<uint8_t **>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_max"));
@@ -1614,6 +1934,19 @@ const Modes::Mode *nearest60(const Modes::Mode *table, size_t n, uint32_t width,
 	return best;
 }
 
+// The mode of that size with the highest refresh (the boot display's, rdna4-pvfast=1), or nullptr.
+const Modes::Mode *fastest(const Modes::Mode *table, size_t n, uint32_t width, uint32_t height)
+{
+	const Modes::Mode *best = nullptr;
+
+	for (size_t i = 0; i < n; i++)
+		if (table[i].t.hActive == width && table[i].t.vActive == height &&
+		    (!best || table[i].refreshMilliHz > best->refreshMilliHz))
+			best = &table[i];
+
+	return best;
+}
+
 // Port 0 when no head took the boot display over (a DisplayPort boot display: boot4k takes only an HDMI one behind an adapter): the boot
 // framebuffer's own modes (its NDRV table, at most the console's size, scanned from the console's memory at its pitch) and the size it
 // runs in now; its mode switches go through its mode-set engine (RDNA4Device::applyMode: on DisplayPort the stream retimed, the link as
@@ -1694,8 +2027,10 @@ uint32_t PvScanout::modes(uint32_t port, Mode *out, uint32_t cap)
 	for (size_t i = 0; bigW >= 3840 && pvScaledModes && i < sizeof(kSteps) / sizeof(kSteps[0]); i++)
 		all[total++] = { 2 * bigW * kSteps[i][0] / kSteps[i][1], 2 * bigH * kSteps[i][0] / kSteps[i][1], 60000 };
 
+	const bool fast = !h && pvFastModes;   // the boot display's (port 0)
+
 	for (size_t i = 0; i < n && total < Modes::MaxModes + 7; i++) {
-		const Modes::Mode *best = nearest60(table, n, table[i].t.hActive, table[i].t.vActive);
+		const Modes::Mode *best = (fast ? fastest : nearest60)(table, n, table[i].t.hActive, table[i].t.vActive);
 		bool seen = false;
 
 		for (uint32_t k = 0; k < total; k++)
@@ -1758,6 +2093,21 @@ bool PvScanout::largest(uint32_t port, uint32_t &width, uint32_t &height)
 	return width && height;
 }
 
+bool PvScanout::wantsMode(uint32_t port, uint32_t width, uint32_t height)
+{
+	const Modes::Mode *table = nullptr;
+	size_t n = 0;
+	uint32_t liveW, liveH;
+
+	if (port || pvHead(0) || !bootModes(table, n, liveW, liveH))   // the boot display's: the heads light their own
+		return false;
+
+	const Modes::Mode *m = (pvFastModes ? fastest : nearest60)(table, n, width, height);
+	const Edid::DetailedTiming *live = bootState->dev.liveMode();
+
+	return m && live && Modes::match(m, 1, *live) < 0;
+}
+
 bool PvScanout::setMode(uint32_t port, uint32_t width, uint32_t height)
 {
 	Head2 *h = pvHead(port);
@@ -1766,7 +2116,7 @@ bool PvScanout::setMode(uint32_t port, uint32_t width, uint32_t height)
 	uint32_t liveW, liveH;
 
 	if (port == 0 && !h && bootModes(table, n, liveW, liveH)) {
-		const Modes::Mode *m = nearest60(table, n, width, height);
+		const Modes::Mode *m = (pvFastModes ? fastest : nearest60)(table, n, width, height);
 		const IOReturn r = m ? bootState->dev.applyMode(*m) : kIOReturnUnsupported;
 
 		FBLOG("pvgpu: port 0: the boot display switched to %ux%u for macOS's mode: %s", width, height,
@@ -1781,6 +2131,7 @@ bool PvScanout::setMode(uint32_t port, uint32_t width, uint32_t height)
 		return false;
 	}
 
+	RDNA4Device::ExtraHold hold(*h->dev);
 	h->dev->selectExtra(h->slot);
 
 	const IOReturn r = h->dev->applySecondPipeMode(*m);

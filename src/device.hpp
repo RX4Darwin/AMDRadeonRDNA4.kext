@@ -19,6 +19,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IOPlatformExpert.h>
+#include <IOKit/IOLocks.h>
 #include <pexpert/pexpert.h>
 
 #include "atombios.hpp"
@@ -58,6 +59,8 @@ public:
 		height = liveTiming.vActive;
 		return liveTimingValid;
 	}
+	// The boot pipe's running mode, or nullptr before it is known.
+	const Edid::DetailedTiming *liveMode() const { return liveTimingValid ? &liveTiming : nullptr; }
 	uint32_t            fbRowBytes { 0 };
 	uint32_t            fbDepth    { 32 };
 
@@ -65,6 +68,10 @@ public:
 	// present. 0 length = no DDC sink found.
 	uint8_t edidData[256] {};
 	size_t  edidLen { 0 };
+	// Its blocks 2 and 3 (E-DDC segment 1; DisplayID on a 144 Hz DisplayPort monitor), for the mode table only:
+	// macOS is given the two above.
+	uint8_t edidMore[256] {};
+	size_t  edidMoreLen { 0 };
 	// A display beyond the boot one (rdna4-head2, plugin.cpp): the sink on
 	// another connector, the pipe it is lit on and what the kext lit for it.
 	// The second-pipe functions below act on the selected one (selectExtra).
@@ -91,11 +98,27 @@ public:
 	static constexpr size_t kMaxExtra = 3;
 	ExtraPipe extra[kMaxExtra] { { 1 }, { 2 }, { 3 } };
 	size_t extraSlot { 0 };
-	ExtraPipe &xp() { return extra[extraSlot]; }
-	const ExtraPipe &xp() const { return extra[extraSlot]; }
+	// coldStart: while it lights pipe 0 itself from a second-pipe table, the plan's training and AUX writes take
+	// the boot display's sink and link from this entry instead of a slot's (held under extraLock).
+	ExtraPipe *xpOverride { nullptr };
+	ExtraPipe &xp() { return xpOverride ? *xpOverride : extra[extraSlot]; }
+	const ExtraPipe &xp() const { return xpOverride ? *xpOverride : extra[extraSlot]; }
 	// The one the second-pipe functions act on, and its connector's table
 	// (Pipe2::use) once it has a sink.
 	void selectExtra(size_t slot);
+	void useSlotTable();   // the selected slot's connector's table (Pipe2::use)
+	// Held from a selectExtra through everything done with the pipe it selects (ExtraHold): the hot-plug poll
+	// (a timer on each head's work loop), macOS's mode switches (the paravirtual host's thread, or NDRV) and
+	// the heads' start-up each select a pipe and use it, and did so under one another (card, 2026-11-14: a
+	// mode switch logged another slot's empty mode). Recursive: the poll's plug and unplug take it again.
+	IORecursiveLock *extraLock { nullptr };
+	struct ExtraHold {
+		IORecursiveLock *lock;
+		explicit ExtraHold(RDNA4Device &dev) : lock(dev.extraLock) { if (lock) IORecursiveLockLock(lock); }
+		~ExtraHold() { if (lock) IORecursiveLockUnlock(lock); }
+		ExtraHold(const ExtraHold &) = delete;
+		ExtraHold &operator=(const ExtraHold &) = delete;
+	};
 	// How many displays beside the boot one this boot may light (1 to 3,
 	// rdna4-heads); the first extra pipe without a sink (kMaxExtra if none);
 	// whether another extra pipe than the selected one has that connector.
@@ -237,7 +260,49 @@ public:
 	// the kext's own training on that link: stream off, transmitter off,
 	// DpTrain::bringUp, stream encoder tied to the link, video restarted.
 	void noteBootDpLink();
+	bool readBootDpLink(DpTrain::Sink &sink, DpTrain::Link &link);
+	// What a DisplayPort boot display's mode may clock at: what its trained link carries at 8 bpc, and the DISPCLK
+	// the kext holds (dispclkTargetKHz); the boot pixel clock if either is not known. The link is not retrained.
+	uint32_t bootDpMaxKHz();
+	uint32_t bootDpLinkKHz { 0 };   // what the firmware's link carries at 8 bpc, read when the mode table is built
+	uint32_t dispclkTargetKHz();
 	DpTrain::Result retrainBootLink(const char *why);
+	// rdna4-dcninit=1, a test of lighting the displays when nothing set them up, on a warm card, in a cold start's
+	// order: once the kext's DMUB firmware runs and the display clocks are raised (smuStarted). The lit extra pipes
+	// are put to sleep, the firmware's boot pipe (DisplayPort, pipe 0, DIG0, link 0, at its 3840x2160 timing) taken
+	// down, the display hardware started as Linux's dcn401_init_hw does from nothing (src/dcninit.cpp), and pipe 0
+	// lit again from a Linux-generated table with the kext's own link training. `relight`: the extra slots that were
+	// lit, now off, for the heads to light again. False when not asked or not done.
+	bool coldStart(uint32_t &relight);
+	// An NVRAM breadcrumb (the compute runtime's rdna4-trail) for a step that can hang the machine, with the timing
+	// generators running now (OTG0-3 master enables) after it: the next boot logs where the last one stopped.
+	void breadcrumb(const char *step);
+	// rdna4-syssleep: system sleep with the card (on unless =0; not in VM test builds, which have no card to sleep).
+	static bool systemSleepWanted();
+	// debug.rdna4_head2sleep: 1 puts the second display's pipe to sleep (setSecondPipePower(false)), 2 wakes it, with an
+	// NVRAM breadcrumb before each register step and a stop when the card no longer answers (OTG0 reads 0xffffffff):
+	// the test of a DisplayPort extra pipe's sleep sequence, which hung the card in the cold start (2026-11-15).
+	void head2SleepTest(int what);
+	const char *stepTrail { nullptr };   // set while head2SleepTest runs: runSteps' per-step breadcrumbs
+	// After a power loss, the selected DisplayPort extra pipe's DDC pads in AUX mode again before it is lit (as the cold
+	// start sets the boot display's): a reset leaves them in I2C mode, and no AUX transaction gets a reply.
+	void extraAuxPadsAfterPowerLoss();
+	// rdna4-coldprobe=1 and `sudo sysctl debug.rdna4_coldreset=1`: the card reset (mode 1) and brought back as far
+	// as Linux does before its IP blocks start (stage (b) of a real cold start). The displays go dark; reboot after.
+	bool coldReset();
+	// rdna4-coldboot=1: a real cold start at boot. What the GOP left is read first (the pipes, EDIDs, the boot link,
+	// the scanout address and the DCHUB timer below), then the card reset; the displays light once the SMU runs
+	// (coldStartHeads), as after a power loss. True from the reset on.
+	class RDNA4Compute *compute { nullptr };   // the runtime beside this device (its sleep and wake: see sleepWakeMessage)
+	bool coldBoot { false };   // also from a wake (rdna4-syssleep): the card lost its power and its state
+	void captureGopState();    // the GOP's scanout address, DCHUB timer and boot link, for a later cold start
+	uint32_t vramMark { 0 };   // what sleepWakeMessage wrote into VRAM before sleep (0: nothing)
+	uint64_t coldGopSurface { 0 };
+	// Where HUBP0 scans (HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS and _HIGH): the GOP's console on a warm card.
+	uint64_t bootScanout() const { return regReadDmu(2, 0x060a) | static_cast<uint64_t>(regReadDmu(2, 0x060b) & 0xffff) << 32; }
+	uint32_t coldGopTimer { 0 };
+	void takeExtraDown();
+	bool consoleMcAddress(uint64_t &mc);
 	void logBootLink(const char *when);
 	const char *auxWhy { "" };   // why the last AUX transaction gave no reply, and the status it ended with
 	uint32_t    auxSts { 0 };
@@ -289,6 +354,9 @@ private:
 	size_t    vbiosSize { 0 };
 	AtomBios  atomBios;
 	bool loadVBIOS();
+public:
+	const uint8_t *vbiosBytes(size_t &size) const { size = vbiosSize; return vbiosData; }
+private:
 	bool copyVBIOSFromProperty();
 	bool copyVBIOSFromExpansionROM();
 	void publishVBIOSInfo();
@@ -316,6 +384,18 @@ private:
 
 	void tryForce8bpc();
 	void probeMemSize();
+	void coldProbe();   // rdna4-coldprobe=1: what a mode-1 reset and asic_init depend on, read only
+	// The card's PCI config space (and its PCIe link, power state, Resizable BAR), the two bridges of its own PCIe
+	// switch above it, and three registers over MMIO: what a reset or a sleep leaves (`when` names the moment).
+	void logPciState(const char *when);
+	// rdna4-syssleep=1: logPciState at the system's sleep and wake (roadmap item 5, stage 2).
+	IONotifier *sleepWakeNotifier { nullptr };
+	// Without rdna4-pm the runtime's own sleep and wake are driven from here: powerWillSleep at the system's sleep
+	// notice, powerDidWake once the card's PCI device has powered on again (its config space restored).
+	IONotifier *pciPowerNotifier { nullptr };
+	bool drivesRuntimePower() const;
+	static IOReturn pciPowerMessage(void *target, void *ref, UInt32 type, IOService *provider, void *arg, vm_size_t size);
+	static IOReturn sleepWakeMessage(void *target, void *ref, UInt32 type, IOService *provider, void *arg, vm_size_t size);
 	void dumpDCN();
 
 	// DP AUX software engine and DC_I2C hardware engine (EDID).
@@ -323,7 +403,8 @@ private:
 	int auxTransaction(uint8_t inst, uint8_t action, uint32_t address,
 	                   const uint8_t *data, uint8_t len,
 	                   uint8_t *reply, uint8_t replyCap, uint8_t *replyBytes);
-	bool readEDID(uint8_t inst, uint8_t *edid, size_t count, uint8_t start);
+	bool readEDID(uint8_t inst, uint8_t *edid, size_t count, uint8_t start, uint8_t segment = 0);
+	void readMoreEdidBlocks(uint8_t inst, uint8_t blocks);
 	bool readEDIDI2C(uint8_t line, uint8_t *edid, size_t count, uint8_t start);
 	// A DisplayPort connector's DDC pads in I2C (true) or AUX (false) mode.
 	// A passive DP++ (DP-to-HDMI) adapter carries the sink's DDC on them,
@@ -382,6 +463,9 @@ private:
 	bool dmubRing(DmubRing &ring);
 	bool dmubSubmit(const Dmub::Cmd *cmds, uint32_t count, const char *tag,
 	                uint64_t *firstSlot = nullptr);
+	// rdna4-dmubload: the entries the kext's own DMUB firmware added to its trace buffer since the last call.
+	void dmubTrace(const char *tag);
+	uint32_t dmubTraceSeen { 0 };
 
 	// The display pipe the GOP lit (see pipe.hpp).
 	Pipe::State pipe;
@@ -409,6 +493,9 @@ private:
 	// The timing on the pipe now: the boot timing, then each mode applied.
 	Edid::DetailedTiming liveTiming {};
 	bool liveTimingValid { false };
+	// The mode whose request timing (HUBP DLG/TTU) the boot plane has: the GOP's, until a switch with Linux's values.
+	Edid::DetailedTiming reqTiming {};
+	bool reqTimingValid { false };
 	ModeSet::Plan modePlan {};
 	bool pathForHpd(uint8_t hpdPin, AtomBios::DisplayPath &out, uint8_t *ddcLine = nullptr);
 	// The lit pipe and its connector's wiring as a mode-set target (timings not filled in).

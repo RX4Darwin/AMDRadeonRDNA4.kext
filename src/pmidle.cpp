@@ -234,6 +234,8 @@ void RDNA4Compute::idleStop() {
 // The very first thing a power callback does, BEFORE powerWillSleep takes rtLock: a client waiting inside a runtime call holds rtLock for up to
 // RDNA4_MAX_TIMEOUT_MS (10 s), so the sleep handler would sit behind it, and a wait that then timed out would wedge the gfx ring.
 void RDNA4Compute::powerSleepRequest() {
+	if (sleepHook && !powerSleeping)   // the paravirtual host writes back and lets go first, while gfx submissions still run
+		sleepHook(sleepHookCtx);
 	sleepAbortOn = requestedSleepAbort();
 	__atomic_store_n(&sleepRequested, 1u, __ATOMIC_RELEASE);
 	idleStop();   // P2: no poll timer across the sleep. NOT under rtLock: removing an event source from the work loop can wait for the work-loop thread, and

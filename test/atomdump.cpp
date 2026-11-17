@@ -51,6 +51,7 @@
 #include "../src/gfxregs.hpp"
 #include "../src/linuxref.hpp"
 #include "../src/trial.hpp"
+#include "../src/dcninit.hpp"
 #include "rdna4compute.h"
 
 #include <cstdarg>
@@ -474,6 +475,69 @@ static int testModes() {
 	                  sc.dtds[1].pixelClockKHz == 497750 && sc.dtds[2].pixelClockKHz == 297000,
 	                  "Samsung CTA DTDs (all three)");
 
+	// A DisplayID 1.3 block with one Type I timing: the Samsung's own 4K60 (each field minus one, 10 kHz clock).
+	uint8_t did[128] = { 0x70, 0x13, 23, 0x00, 0x00, 0x03, 0x00, 20,
+	                     0x4c, 0xd0, 0x00, 0x80, 0xff, 0x0e, 0x9f, 0x00, 0x2f, 0x80, 0x1f, 0x00,
+	                     0x6f, 0x08, 0x3d, 0x00, 0x02, 0x00, 0x04, 0x00 };
+	Edid::DetailedTiming dt[2], pref {};
+	const size_t dn = Edid::displayIdTimings(did, dt, 2);
+	failures += check(dn == 1 && Edid::preferredTiming(samsung, 128, pref) && Edid::sameTiming(dt[0], pref) && dt[0].pixelClockKHz == 533250 &&
+	                  dt[0].hSyncPositive && !dt[0].vSyncPositive,
+	                  "DisplayID Type I timing: %zu, %ux%u %u kHz", dn, dn ? dt[0].hActive : 0,
+	                  dn ? dt[0].vActive : 0, dn ? dt[0].pixelClockKHz : 0);
+	did[5] = 0x22;   // the same as Type VII (DisplayID 2.0): 1 kHz units
+	failures += check(Edid::displayIdTimings(did, dt, 2) == 1 && dt[0].pixelClockKHz == 53325,
+	                  "DisplayID Type VII clock %u kHz", dt[0].pixelClockKHz);
+	did[0] = 0x02;
+	failures += check(Edid::displayIdTimings(did, dt, 2) == 0, "a CTA block has no DisplayID timings");
+
+	// The Samsung's block 2 as the card read it (2026-11-15): five Type I timings. Its modes on the 4-lane HBR2 link
+	// with DISPCLK at 650 MHz: 2560x1440@144 (604.25 MHz) and 1920x1080@144 join, 3840x2160@120 and @144 do not.
+	{
+		static const uint32_t five[5][7] = {   // kHz, h active/blank/fp/sw, v active/blank (v fp/sw below)
+			{ 1188000, 3840, 560, 176, 88, 2160, 90 }, { 1332750, 3840, 160, 48, 32, 2160, 154 },
+			{ 533250, 3840, 160, 48, 32, 2160, 62 }, { 604250, 2560, 160, 48, 32, 1440, 103 },
+			{ 346500, 1920, 160, 48, 32, 1080, 77 } };
+		static const uint32_t vsync[5][2] = { { 8, 10 }, { 3, 5 }, { 3, 5 }, { 3, 5 }, { 3, 5 } };
+		uint8_t full[384] = {};
+		memcpy(full, samsung, 256);
+		uint8_t *b2 = full + 256;
+		b2[0] = 0x70; b2[1] = 0x13; b2[2] = 3 + 5 * 20; b2[5] = 0x03; b2[7] = 5 * 20;
+		for (int i = 0; i < 5; i++) {
+			uint8_t *d = b2 + 8 + 20 * i;
+			const uint32_t f[8] = { five[i][1], five[i][2], five[i][3] | 0x8000u, five[i][4], five[i][5], five[i][6],
+			                        vsync[i][0], vsync[i][1] };
+			const uint32_t clock = five[i][0] / 10 - 1;
+			d[0] = clock & 0xff; d[1] = (clock >> 8) & 0xff; d[2] = clock >> 16;
+			for (int k = 0; k < 8; k++) {
+				const uint32_t v = f[k] - 1;   // the polarity bit survives: fp is at least 1
+				d[4 + 2 * k] = v & 0xff;
+				d[5 + 2 * k] = (v >> 8) & 0xff;
+			}
+		}
+		uint8_t sum = 0;
+		for (int i = 0; i < 127; i++)
+			sum += b2[i];
+		b2[127] = static_cast<uint8_t>(-sum);
+		full[126] = 2;   // the base block announces both extensions
+		uint8_t s0 = 0;
+		for (int i = 0; i < 127; i++)
+			s0 += full[i];
+		full[127] = static_cast<uint8_t>(-s0);
+		Modes::Limits hbr2 { 3840, 2160, 650000 };
+		Mode dm[Modes::MaxModes];
+		const size_t dmn = Modes::build(full, 384, hbr2, dm, Modes::MaxModes);
+		bool q144 = false, f144 = false, uhdFast = false;
+		for (size_t i = 0; i < dmn; i++) {
+			q144 |= dm[i].t.hActive == 2560 && dm[i].t.pixelClockKHz == 604250 && dm[i].source == Modes::SourceDisplayId;
+			f144 |= dm[i].t.hActive == 1920 && dm[i].t.pixelClockKHz == 346500 && dm[i].source == Modes::SourceDisplayId;
+			uhdFast |= dm[i].t.hActive == 3840 && dm[i].t.pixelClockKHz > 533250;
+		}
+		failures += check(q144 && f144 && !uhdFast && dm[0].native && dm[0].t.pixelClockKHz == 533250,
+		                  "Samsung with its DisplayID block on HBR2: 1440p144 %d, 1080p144 %d, a faster 4K %d (%zu modes)",
+		                  q144, f144, uhdFast, dmn);
+	}
+
 	Mode sm[Modes::MaxModes];
 	size_t sn = Modes::build(samsung, sizeof(samsung), unlimited, sm, Modes::MaxModes);
 	printModes("unlimited", sm, sn);
@@ -797,9 +861,9 @@ static const char *tableNames[AtomBios::MaxDataTable] = {
 	"sw_datatable13", "gfx_info", "powerplayinfo", "sw_datatable16",
 	"sw_datatable17", "sw_datatable18", "sw_datatable19", "sw_datatable20",
 	"sw_datatable21", "displayobjectinfo", "indirectioaccess", "umc_info",
-	"sw_datatable24", "dce_info", "vram_info", "sw_datatable27",
+	"sw_datatable25", "sw_datatable26", "dce_info", "vram_info", "sw_datatable29",
 	"integratedsysteminfo", "asic_profiling_info", "voltageobject_info",
-	"sw_datatable32", "sw_datatable33", "sw_datatable34",
+	"sw_datatable33", "sw_datatable34",
 };
 
 // ---------------------------------------------------------------------------
@@ -1639,6 +1703,8 @@ static int testPipe2Table() {
 
 	Pipe2::Target t {};
 	t.litHubp = 0;
+	// Pipe 0 lit again (rdna4-dcninit) has no lit pipe beside it: its VM aperture is left alone
+	t.alone = c.pipe == 0;
 	t.encoderObjId = kEncoderObj;
 	t.surface = 0x8002100000ull;
 	t.depth = Pipe2::Depth::Plane;
@@ -1648,7 +1714,7 @@ static int testPipe2Table() {
 	if (!Pipe2::build(t, plan, &why))
 		return check(false, "pipe2: plan refused: %s", why);
 
-	size_t requires = 0, writes = 0, outside = 0;
+	size_t requires = 0, writes = 0, outside = 0, vmWrites = 0;
 	bool wrote = false;
 	// Every register step of a plan stays in the pipe's blocks.
 	auto stepsInBlocks = [&](const ModeSet::Step *steps, size_t count) {
@@ -1688,6 +1754,9 @@ static int testPipe2Table() {
 				                  "and not an allowed shared bit", i, s.what, s.seg, s.dword, mask);
 			}
 		}
+		if (s.seg == 2 && (s.dword == 0x062c + 0xdcu * c.pipe || s.dword == 0x062d + 0xdcu * c.pipe ||
+		                   s.dword == 0x063a + 0xdcu * c.pipe))   // HUBPREQn_DCN_VM_SYSTEM_APERTURE_*, _MX_L1_TLB_CNTL
+			vmWrites++;
 		if (s.op == ModeSet::Op::Copy) {
 			const Family *src = nullptr;
 			failures += check(instanceOf(s.seg, s.arg, &src) == t.litHubp && src == &families[0] &&
@@ -1700,6 +1769,8 @@ static int testPipe2Table() {
 	auto inBlocks = [&](const Pipe2::Plan &p) { stepsInBlocks(p.steps, p.count); };
 	inBlocks(plan);
 	const size_t lightWrites = writes;
+	failures += check(vmWrites == (t.alone ? 0u : 3u), "pipe2: the plan touches the VM aperture %zu times, expected %u",
+	                  vmWrites, t.alone ? 0u : 3u);
 	failures += check(requires == 5, "pipe2: %zu requirements, expected 5", requires);
 
 	if (!c.dp) {
@@ -1823,7 +1894,7 @@ static int testPipe2Table() {
 			const ModeSet::DpDto now { (r.get(1, 0x006f) >> (1 + 5 * c.pipe)) & 0xf, r.get(1, 0x0081 + 4 * c.pipe),
 			                           r.get(1, 0x0082 + 4 * c.pipe) };
 			mt.dp = true;
-			mt.dpMaxKHz = 600000;
+			mt.dpMaxKHz = DpTrain::bandwidthKbps(DpTrain::Link { 4, DpTrain::kHbr2 }) / 24;   // as the device, on this link
 			mt.vidM = ModeSet::dpVidM(to.pixelClockKHz, DpTrain::symbolClockKHz(DpTrain::kHbr2));
 			if (!ModeSet::scaleDpDto(now, from.pixelClockKHz, to.pixelClockKHz, mt.dto))
 				return check(false, "pipe2: no DP DTO for %u kHz from %u + %u / %u", to.pixelClockKHz, now.integer,
@@ -1960,7 +2031,9 @@ static int testPipe2Table() {
 		regs.run(dpms);
 		const size_t sleepSteps = dpms.count;
 		failures += check(slept && dpms.naux == 1 && dpms.aux[0].address == 0x600 && dpms.aux[0].len == 1 &&
-		                  dpms.aux[0].data[0] == 0x02 && dpms.ncmds == 1 && memcmp(dpms.cmds[0], off, sizeof(off)) == 0 &&
+		                  dpms.aux[0].data[0] == 0x02 &&
+		                  // the transmitter disable only on link 0 (pipe2.cpp 'O': on link 1 it stopped the card)
+		                  (c.link != 0 ? dpms.ncmds == 0 : dpms.ncmds == 1 && memcmp(dpms.cmds[0], off, sizeof(off)) == 0) &&
 		                  count(dpms, ModeSet::Op::Train) == 0 && (regs.get(2, kFeEn) & 1) == 0 &&
 		                  (regs.get(2, kOtgCtl) & 1) == 1 && regs.get(2, kSurfLo) == lit.get(2, kSurfLo),
 		                  "pipe2: DisplayPort sleep: %s, %zu AUX writes, %zu DMUB commands, DIG FE %08x",
@@ -2645,7 +2718,7 @@ static int testN48N() {
 static int testPipe2() {
 	int failures = 0;
 	const uint8_t first = Pipe2::config().hpd;
-	failures += check(Pipe2::configCount() == 42 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
+	failures += check(Pipe2::configCount() == 43 && !Pipe2::use(5) && !Pipe2::use(3, false, 4) &&
 	                  Pipe2::config().hpd == first,
 	                  "pipe2: %zu tables, the one in use is for HPD%u", Pipe2::configCount(), Pipe2::config().hpd);
 	// A DisplayPort connector has its DisplayPort table and an HDMI one (a passive DP++ adapter); an HDMI
@@ -5018,6 +5091,14 @@ static int testRom(const char *path) {
 		{ AtomBios::CmdDig1TransmitterControl, "dig1transmittercontrol",  false },
 		{ AtomBios::CmdProcessAuxChannel,      "processauxchanneltransaction", false },
 	};
+	uint32_t refKHz = 0;
+	if (!bios.getDceRefClock(refKHz) || refKHz != 100000) {
+		fprintf(stderr, "FAIL: dce_info's reference clock %u kHz, expected 100000 (Linux: 100 MHz expected)\n", refKHz);
+		failures++;
+	} else {
+		printf("dce_info: display reference clock %u kHz\n", refKHz);
+	}
+
 	printf("\ncommand functions (bytecode):\n");
 	for (auto &c : cmds) {
 		AtomBios::CmdTableInfo info;
@@ -5085,6 +5166,82 @@ static int testDpDual() {
 	return failures;
 }
 
+// The cold display start-up (src/dcninit.cpp, Linux's dcn401_init_hw from pipegen): the table becomes steps of the
+// display segments only, and run against registers that hold what was written (all 0 before, the waits met) it
+// leaves what Linux leaves: the IP request window closed again, every HUBP blanked, the watermark sets B
+// copied from A.
+static int testDcnInit() {
+	int failures = 0;
+	static ModeSet::Step steps[256];
+	size_t n = 0;
+	static ModeSet::Step off[16];
+	size_t noff = 0;
+	for (uint32_t o = 0; o < DcnInit::kOtgs; o++)   // OTGn_OTG_CONTROL.OTG_MASTER_EN = 0
+		if (!DcnInit::steps(off, 16, noff, DcnInit::Table::OtgOff, o) || noff != DcnInit::count(DcnInit::Table::OtgOff) ||
+		    off[2].dword != 0x1b43 + 0x80 * o || off[2].mask != 1 || off[2].value != 0) {
+			printf("FAIL dcninit: the OTG%u stop does not become steps that clear OTG%u's master enable\n", o, o);
+			return 1;
+		}
+	if (DcnInit::steps(off, 16, noff, DcnInit::Table::OtgOff, DcnInit::kOtgs)) {
+		printf("FAIL dcninit: a fifth OTG's stop became steps\n");
+		return 1;
+	}
+	if (!DcnInit::steps(steps, 256, n) || n != DcnInit::count() || n < 100) {
+		printf("FAIL dcninit: the table does not become steps (%zu of %zu)\n", n, DcnInit::count());
+		return 1;
+	}
+	static uint32_t reg[4][0x4000];
+	memset(reg, 0, sizeof(reg));
+	reg[2][0x04fe] = 0x1234;   // DCHUBBUB_ARB_DATA_URGENCY_WATERMARK_A: what set B is to get
+	size_t waits = 0, copies = 0;
+	for (size_t i = 0; i < n; i++) {
+		const ModeSet::Step &s = steps[i];
+		if (s.seg < 1 || s.seg > 3 || s.dword >= 0x4000) {
+			printf("FAIL dcninit: step %zu (%s) outside the display segments\n", i, s.what);
+			failures++;
+			continue;
+		}
+		uint32_t &r = reg[s.seg][s.dword];
+		switch (s.op) {
+		case ModeSet::Op::Write: r = s.value; break;
+		case ModeSet::Op::Update: r = (r & ~s.mask) | s.value; break;
+		case ModeSet::Op::Copy: r = reg[s.seg][s.arg]; copies++; break;
+		case ModeSet::Op::WaitValue: r = (r & ~s.mask) | s.value; waits++; break;
+		case ModeSet::Op::Delay: break;
+		default: printf("FAIL dcninit: step %zu has an op the table does not make\n", i); failures++;
+		}
+	}
+	const bool closed = (reg[2][0x00a0] & 1) == 0;                         // DC_IP_REQUEST_CNTL.IP_REQUEST_EN
+	bool blanked = true;
+	for (uint32_t p = 0; p < 4; p++)
+		blanked &= (reg[2][0x05f4 + p * 0xdc] & 1) != 0;                    // HUBPn_DCHUBP_CNTL.HUBP_BLANK_EN
+	const bool copied = reg[2][0x0511] == 0x1234;                         // ..._DATA_URGENCY_WATERMARK_B
+	if (!closed || !blanked || !copied || !waits || copies != 25) {
+		printf("FAIL dcninit: window %s, HUBPs %s, watermark B %s (0x%x), %zu waits, %zu copies\n",
+		       closed ? "closed" : "OPEN", blanked ? "blanked" : "NOT all blanked", copied ? "copied" : "NOT copied",
+		       reg[2][0x0511], waits, copies);
+		failures++;
+	}
+	// The global timer from stopped, for this card's 100 MHz reference: divided by 2 (50 MHz), its INIT bits kept.
+	ModeSet::Step timer[2];
+	size_t nt = 0;
+	uint32_t cntl = 0xabcd0000;
+	const bool built = DcnInit::timerSteps(100000, timer, 2, nt);
+	for (size_t i = 0; built && i < nt; i++)
+		cntl = (cntl & ~timer[i].mask) | timer[i].value;
+	if (!built || cntl != (0xabcd0000 | DcnInit::kTimerEnable | 2) || DcnInit::timerRefDiv(48000) != 1 ||
+	    DcnInit::timerRefDiv(150000) != 0) {
+		printf("FAIL dcninit: the global timer's steps leave 0x%08x (want 0x%08x), divider 1 for 48 MHz %u, none for "
+		       "150 MHz %u\n", cntl, 0xabcd0000 | DcnInit::kTimerEnable | 2, DcnInit::timerRefDiv(48000),
+		       DcnInit::timerRefDiv(150000));
+		failures++;
+	}
+	if (!failures)
+		printf("dcninit: %zu steps of Linux's dcn401_init_hw (%zu waits, %zu copies) leave what it leaves; the global "
+		       "timer started at 50 MHz\n", n, waits, copies);
+	return failures;
+}
+
 int main(int argc, char **argv) {
 	if (argc > 2) {
 		fprintf(stderr, "usage: %s [vbios.rom]\n", argv[0]);
@@ -5107,6 +5264,7 @@ int main(int argc, char **argv) {
 	failures += testDpRetime();
 	failures += testPipe2();
 	failures += testDpTrain();
+	failures += testDcnInit();
 	failures += testDpDual();
 	failures += testN48N();
 	failures += testPsp();
