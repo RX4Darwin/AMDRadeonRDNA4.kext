@@ -42,7 +42,7 @@ static inline uint32_t doubleAsHalf(uint64_t bits) {
 
 // A colour target's CB_COLOR0_INFO by its Metal pixel format (gfx12.json: FORMAT 0-4, NUMBER_TYPE 8-10, COMP_SWAP 11-12, BLEND_CLAMP 15,
 // BLEND_BYPASS 16, SIMPLE_FLOAT 17; as Mesa's ac_formats.c maps them): 16_16_16_16 float, 16_16 float, 8 unorm, 16 float, 2_10_10_10 unorm,
-// 32_32 uint and sint; else
+// 32_32 uint and sint, 16_16 uint; else
 // 8_8_8_8 unorm, with COMP_SWAP ALT when BGRA8 is drawn as the guest has it (`swap`), and NUMBER_SRGB (6) for RGBA8 and BGRA8 sRGB: the
 // hardware encodes the shader's linear colour as Metal does (unencoded, the Sequoia wallpaper came out dark and dull, 2026-11-14).
 static inline uint32_t colourInfo(uint32_t format, bool swap) {
@@ -55,6 +55,7 @@ static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	case 90: return 0x00020009u;    // RGB10A2Unorm
 	case 103: return 0x0003040bu;   // RG32Uint: 32_32 UINT, BLEND_BYPASS as Mesa's for integers (WindowServer's brim_init_lpf, Tahoe)
 	case 104: return 0x0003050bu;   // RG32Sint
+	case 63: return 0x00030405u;    // RG16Uint: 16_16 UINT, BLEND_BYPASS (WindowServer's brim_init_lpf at 4K, Tahoe)
 	default: return (swap ? 0x0002880au : 0x0002800au) | (format == 71 || format == 81 ? 6u << 8 : 0u);
 	}
 }
@@ -116,6 +117,14 @@ static inline bool clearPattern(uint32_t format, const uint64_t rgba[4], uint32_
 		if (!wholeDouble(rgba[0], x) || !wholeDouble(rgba[1], y) || x != y || (format == 103 && x < 0))
 			return false;
 		pattern = static_cast<uint32_t>(x);
+		return true;
+	}
+	case 63: {   // RG16Uint: two 16-bit halves, each a whole number that fits
+		int64_t x, y;
+		pattern = 0;
+		if (!wholeDouble(rgba[0], x) || !wholeDouble(rgba[1], y) || x < 0 || y < 0 || x > 0xffff || y > 0xffff)
+			return false;
+		pattern = static_cast<uint32_t>(x) | static_cast<uint32_t>(y) << 16;
 		return true;
 	}
 	default: pattern = 0; return !(rgba[0] | rgba[1] | rgba[2] | rgba[3]);   // RGBA16Float's four halves do not fit in 32 bits

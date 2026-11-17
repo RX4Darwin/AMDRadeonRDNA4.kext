@@ -5,6 +5,15 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.3.0 (on `next`, no number yet)
 
+**Metal (`make PVGPU=1`)**
+- The blend colour on BGRA8 targets: drawn with the colour block's channel swap (`COMP_SWAP ALT`, how the host draws
+  them in place and held since 2026-10), green took the alpha blend constant; no order of the `CB_BLEND_*` registers
+  fixes it (green and alpha both read alpha's). A draw whose colour factors use the blend colour, with green and alpha
+  differing, is now staged and swapped by the CPU. Card (Tahoe 26.6.2, 2026-11-17): `mtlprobe blendx` 0 of 16 channels
+  off (2 before), `mtlprobe all` passes.
+- RG16Uint render targets (WindowServer's `brim_init_lpf` and `brim_jump_lpf` at 4K, about 7000 draws not run in a
+  session with a full-screen game before): 16_16 UINT, its clears as two 16-bit halves.
+
 ## 0.3.0 (2026-11-17)
 
 **Displays**

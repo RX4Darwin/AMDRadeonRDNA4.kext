@@ -128,6 +128,11 @@ int main() {
 		CHECK(clearPattern(103, seven, p) && p == 7 && clearPattern(104, minus, p) && p == 0xfffffffdu && !clearPattern(103, minus, p) && !clearPattern(103, c, p));
 		CHECK(colourInfo(65, true) == 0x00020705u && colourInfo(80, true) == 0x0002880au && colourInfo(0, false) == 0x0002800au);
 		CHECK(colourInfo(103, false) == 0x0003040bu && colourInfo(104, true) == 0x0003050bu);   // RG32Uint, RG32Sint: 32_32, BLEND_BYPASS
+		CHECK(colourInfo(63, false) == 0x00030405u);   // RG16Uint: 16_16 UINT, BLEND_BYPASS
+		{
+			const uint64_t two[4] = {bitsOf(5.0), bitsOf(9.0), 0, 0}, big[4] = {bitsOf(65536.0), 0, 0, 0};
+			CHECK(clearPattern(63, two, p) && p == (5u | 9u << 16) && !clearPattern(63, big, p) && !clearPattern(63, minus, p));
+		}
 		CHECK(colourInfo(81, true) == 0x00028e0au && colourInfo(71, false) == 0x0002860au);   // BGRA8 and RGBA8 sRGB: NUMBER_SRGB
 		{   // sRGB clears: the linear colour encoded (0.5 -> 188 after 128), alpha as it is; 0 and 1 unchanged
 			const uint64_t half[4] = {0x3fe0000000000000ull, 0, 0x3ff0000000000000ull, 0x3fe0000000000000ull};

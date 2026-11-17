@@ -6147,7 +6147,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// 65: RG16Float; 10: R8Unorm, 25: R16Float, 90: RGB10A2Unorm (CoreAnimation's masks and icons on Tahoe)
 	// 110: RGBA16Unorm (kitty's offscreen target through AppleMetalOpenGLRenderer, 2026-11-12)
 	// 103, 104: RG32Uint, RG32Sint (WindowServer's brim_init_lpf and brim_jump_lpf on Tahoe: the shader's integers exported as they are)
-	const auto known = [](uint32_t f) { return f == 10 || f == 25 || f == 65 || f == 70 || f == 71 || f == 80 || f == 81 || f == 90 || f == 103 || f == 104 ||
+	// 63: RG16Uint (brim_init_lpf and brim_jump_lpf at 4K, 2026-11-17)
+	const auto known = [](uint32_t f) { return f == 10 || f == 25 || f == 63 || f == 65 || f == 70 || f == 71 || f == 80 || f == 81 || f == 90 || f == 103 || f == 104 ||
 	                                           f == 110 || f == 115; };
 	const auto pixelBytes = [](uint32_t f) { const TextureFormat *fm = textureFormat(f); return fm ? fm->bpp : 4; };
 	uint32_t storage = 0;
@@ -6231,7 +6232,12 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// aligned): no staging, no copies, and BGRA8 swapped by the colour block (COMP_SWAP) instead of the CPU. Else held or staged at a pitch
 	// of its own.
 	const uint32_t tp = pixelBytes(targetFormat);   // bytes a pixel
-	const bool placeable = (gInPlace & 2) && !(bpr % 128) && !((surface.memory ? surface.base : va) & 0xff);
+	// A BGRA8 target drawn with COMP_SWAP ALT gives green the alpha blend constant (card, 2026-11-17: mtlprobe blendx; no order of the
+	// CB_BLEND_* registers fixes it, green and alpha both read ALPHA's): a draw whose colour factors use the blend colour, its green and
+	// alpha differing, is staged, the swap done by the CPU. ponytail: a multisampled one is not (its samples are drawn with the swap).
+	const bool stageBlendColour = bgra && blend[2] && (blend[3] == 11 || blend[3] == 12 || blend[4] == 11 || blend[4] == 12) &&
+	                        draw.blendColor[1] != draw.blendColor[3];
+	const bool placeable = !stageBlendColour && (gInPlace & 2) && !(bpr % 128) && !((surface.memory ? surface.base : va) & 0xff);
 
 	if (sx2 <= sx || sy2 <= sy) {
 		if (talk)
@@ -6271,11 +6277,11 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// drawn as one sample, the Sequoia wallpaper's edges were rough
 	MsaaSurface *ms = !targetLevel && !surface.memory ? msaaTarget(task, targetId, width, height, bpr, tp) : nullptr;
 	const uint32_t logSamples = !ms ? 0 : ms->samples == 4 ? 2 : 1;
-	const bool hold = !ms && mRtOpen && !(gInPlace & 16) && (!placeable || (!surface.memory && !(gInPlace & 8192)));
+	const bool hold = !stageBlendColour && !ms && mRtOpen && !(gInPlace & 16) && (!placeable || (!surface.memory && !(gInPlace & 8192)));
 	const bool held = hold && holdTarget(task, target, va, surface, width, height, bpr, tp);
 	const bool inPlace = !ms && placeable && !held;
 
-	if (inPlace)   // a target in place over a held one's memory: that one written back first, the draw's rows then go over it
+	if (inPlace || stageBlendColour)   // a target in place (or staged) over a held one's memory: that one written back first
 		flushHeldIn(surface.surface, task, surface.memory ? surface.base : va, static_cast<uint64_t>(bpr) * height);
 
 	const uint32_t pitch = ms ? width : inPlace ? bpr / tp : (width * tp + 127) / 128 * 128 / tp;   // pixels; else a multiple of 128 bytes
