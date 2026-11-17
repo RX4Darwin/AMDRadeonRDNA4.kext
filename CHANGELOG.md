@@ -165,6 +165,15 @@ otherwise). The newest version is on top. How versions and branches work is in `
   They now count against the address space only. The 4K wallpaper is now drawn with its 4 samples (before, as one).
   Card (Tahoe 26.6.2, 2026-11-17): the host's time 4.5 s of every 5 -> 0.6 s, about 42 frames a second (was 6-10),
   the card 97 % busy at about 1.5 GHz. `debug.rdna4_pvnotrun` lists the draws not run since the boot by reason.
+- 3D: shaders with a small local array read at a run-time index (a table of colours) translate: the array stayed in private
+  memory behind flat pointers, which the translator refused; the pointers are now made private again so that AMDGPU keeps
+  the array in registers (selects), and a shader whose array still needs scratch is refused by its scratch size. Only
+  shaders that kept such an array get this, so those that translated before stay as they were (run on all of them, the
+  passes gave one of WindowServer's 16 bytes of scratch). `mtlprobe cube` (a cube in perspective, a Depth32Float buffer,
+  an indexed draw with its hidden faces last, each pixel's face checked against the CPU) and `mtlprobe spin` (nine lit,
+  textured cubes in a window). Card (Tahoe 26.6.2, 2026-11-17): `cube` passes with the same pixels as Apple's GPU, `spin`
+  runs at 60 frames a second (1920x1200), `mtlprobe all` passes but for `blendx` (the blend colour's green, 32 for 64:
+  not from this change, its shaders keep no array; it passed in 2026-10).
 
 ## 0.2.2 (2026-11-14)
 

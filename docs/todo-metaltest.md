@@ -30,7 +30,7 @@ make metal-helper
 ```
 
 ```bash
-clang -arch x86_64 -mmacosx-version-min=11.0 -fobjc-arc tools/metal/m1/mtlprobe.m -framework Foundation -framework Metal -framework IOSurface -o Build/mtlprobe
+clang -arch x86_64 -mmacosx-version-min=11.0 -fobjc-arc tools/metal/m1/mtlprobe.m -framework Foundation -framework Metal -framework IOSurface -framework AppKit -framework QuartzCore -o Build/mtlprobe
 ```
 
 Outputs: `Build/AMDRadeonRDNA4-0.1.0-RELEASE/AMDRadeonRDNA4.kext`, `Build/m3/x86_64/air2amdgpu`, `Build/mtlprobe`. Copy the

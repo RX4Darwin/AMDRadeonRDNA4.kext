@@ -55,10 +55,19 @@
 //   mtlprobe varyings  five values from the vertex to the fragment function over a 64x64 quad: float3 perspective (red), float without
 //                      perspective (alpha), half2 centroid (green), uint and bool flat (blue: 0 in the first triangle, 0.65 in the second,
 //                      from its first vertex); checked away from the diagonal
+//   mtlprobe cube      3D: a cube in perspective (a matrix by setVertexBytes, positions from a buffer, an indexed draw, its hidden faces
+//                      drawn last) with a Depth32Float buffer (less, written) into 64x64; each pixel's face checked against the CPU's
+//                      rasterisation of the same triangles (a hidden face's colour must not appear)
+//   mtlprobe spin [S]  3D in a window for S seconds (10): nine lit, textured cubes spinning with a depth buffer through a CAMetalLayer, the
+//                      frames a second in the title and printed every second; not checked
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
 //
-// Build: clang -arch x86_64 -mmacosx-version-min=11.0 -fobjc-arc tools/metal/m1/mtlprobe.m -framework Foundation -framework Metal -framework IOSurface -o mtlprobe
+// Build: clang -arch x86_64 -mmacosx-version-min=11.0 -fobjc-arc tools/metal/m1/mtlprobe.m -framework Foundation -framework Metal -framework IOSurface \
+//        -framework AppKit -framework QuartzCore -o mtlprobe
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
+#import <QuartzCore/CAMetalLayer.h>
+#include <simd/simd.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurface.h>
 #include <sys/wait.h>
@@ -1857,12 +1866,333 @@ static void varyings(id<MTLDevice> d, id<MTLCommandQueue> q) {
 	    checked, worst, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
 }
 
+// The cube's 24 corners (4 a face, faces +x -x +y -y +z -z) and the matrix of a cube turned (pitch, yaw) and set 3 units in front of a camera
+// with a 60-degree field of view (Metal's clip space: depth 0..1 from near 1 to far 10).
+static void cubeCorners(simd_float3 out[24], simd_float3 normals[6]) {
+	static const int axes[6][3] = {{0, 1, 2}, {0, 1, 2}, {1, 2, 0}, {1, 2, 0}, {2, 0, 1}, {2, 0, 1}};
+	static const float corner[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+	for (int f = 0; f < 6; f++) {
+		const float sgn = (f & 1) ? -1 : 1;
+		simd_float3 n = 0;
+		n[axes[f][0]] = sgn;
+		normals[f] = n;
+		for (int k = 0; k < 4; k++) {
+			simd_float3 v = 0;
+			v[axes[f][0]] = sgn * 0.6f;
+			v[axes[f][1]] = corner[k][0] * 0.6f;
+			v[axes[f][2]] = corner[k][1] * 0.6f * sgn;   // the winding the same seen from outside
+			out[f * 4 + k] = v;
+		}
+	}
+}
+
+static simd_float4x4 cubeRotation(float pitch, float yaw) {
+	const float cp = cosf(pitch), sp = sinf(pitch), cy = cosf(yaw), sy = sinf(yaw);
+	const simd_float4x4 rx = {{{1, 0, 0, 0}, {0, cp, sp, 0}, {0, -sp, cp, 0}, {0, 0, 0, 1}}};
+	const simd_float4x4 ry = {{{cy, 0, -sy, 0}, {0, 1, 0, 0}, {sy, 0, cy, 0}, {0, 0, 0, 1}}};
+	return simd_mul(rx, ry);
+}
+
+static simd_float4x4 cubeMatrix(float pitch, float yaw, float aspect, simd_float3 at) {
+	const float f = 1 / tanf(M_PI / 6), n = 1, z = 10;
+	const simd_float4x4 tr = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {at.x, at.y, at.z, 1}}};
+	const simd_float4x4 pr = {{{f / aspect, 0, 0, 0}, {0, f, 0, 0}, {0, 0, z / (z - n), 1}, {0, 0, -n * z / (z - n), 0}}};
+	return simd_mul(pr, simd_mul(tr, cubeRotation(pitch, yaw)));
+}
+
+static void cube(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "struct CV { float4 pos [[position]]; uint face [[flat]]; };\n"
+	                                              "vertex CV cube_v(uint vid [[vertex_id]], const device packed_float3 *p [[buffer(0)]],"
+	                                              " constant float4x4 &m [[buffer(1)]]) { CV o; o.pos = m * float4(float3(p[vid]), 1); o.face = vid / 4; return o; }\n"
+	                                              "fragment float4 cube_f(CV in [[stage_in]]) { const float4 c[6] = {float4(1, 0, 0, 1), float4(0, 1, 0, 1),"
+	                                              " float4(0, 0, 1, 1), float4(1, 1, 0, 1), float4(1, 0, 1, 1), float4(0, 1, 1, 1)}; return c[in.face]; }"
+	                                     options:nil
+	                                       error:&err];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"cube_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"cube_f"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	if (!ps) {
+		OUT("cube: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+	dd.depthCompareFunction = MTLCompareFunctionLess;
+	dd.depthWriteEnabled = YES;
+	id<MTLDepthStencilState> ds = [d newDepthStencilStateWithDescriptor:dd];
+
+	simd_float3 corners[24], normals[6];
+	cubeCorners(corners, normals);
+	float packed[72];
+	for (int i = 0; i < 24; i++)
+		for (int c = 0; c < 3; c++)
+			packed[i * 3 + c] = corners[i][c];
+	const simd_float4x4 m = cubeMatrix(0.45f, 0.6f, 1, simd_make_float3(0, 0, 3));
+
+	// The faces turned away from the camera last: without the depth test they would be drawn over the others.
+	simd_float4 clip[24];
+	for (int i = 0; i < 24; i++)
+		clip[i] = simd_mul(m, simd_make_float4(corners[i], 1));
+	uint16_t idx[36];
+	int ni = 0;
+	for (int pass = 0; pass < 2; pass++)
+		for (int f = 0; f < 6; f++) {
+			const simd_float4 a = clip[f * 4], b = clip[f * 4 + 1], c = clip[f * 4 + 2];
+			const float area = (b.x / b.w - a.x / a.w) * (c.y / c.w - a.y / a.w) - (b.y / b.w - a.y / a.w) * (c.x / c.w - a.x / a.w);
+			if ((area < 0) == (pass == 0)) {   // y up: a face seen from outside turns clockwise here
+				const uint16_t q4[6] = {0, 1, 2, 0, 2, 3};
+				for (int k = 0; k < 6; k++)
+					idx[ni++] = (uint16_t)(f * 4 + q4[k]);
+			}
+		}
+
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	MTLTextureDescriptor *zd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:64 height:64 mipmapped:NO];
+	zd.usage = MTLTextureUsageRenderTarget;
+	zd.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> z = [d newTextureWithDescriptor:zd];
+	id<MTLBuffer> vb = [d newBufferWithBytes:packed length:sizeof(packed) options:MTLResourceStorageModeShared];
+	id<MTLBuffer> ib = [d newBufferWithBytes:idx length:sizeof(idx) options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out = [d newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = t;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+	rp.depthAttachment.texture = z;
+	rp.depthAttachment.loadAction = MTLLoadActionClear;
+	rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+	rp.depthAttachment.clearDepth = 1;
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	cb.label = @"mtlprobe cube";
+	id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+	[re setRenderPipelineState:ps];
+	[re setDepthStencilState:ds];
+	[re setVertexBuffer:vb offset:0 atIndex:0];
+	[re setVertexBytes:&m length:sizeof(m) atIndex:1];
+	[re drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:36 indexType:MTLIndexTypeUInt16 indexBuffer:ib indexBufferOffset:0];
+	[re endEncoding];
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 64, 1) toBuffer:out
+	      destinationOffset:0 destinationBytesPerRow:64 * 4 destinationBytesPerImage:64 * 64 * 4];
+	[e endEncoding];
+	run(cb, "cube");
+
+	// The CPU's rasterisation: pixel centres, the depth (z / w, linear on the screen) tested less, the faces in the same order.
+	int want[64 * 64];
+	float depth[64 * 64];
+	for (int i = 0; i < 64 * 64; i++) {
+		want[i] = -1;
+		depth[i] = 1;
+	}
+	for (int tri = 0; tri < 12; tri++) {
+		float sx[3], sy[3], sz[3];
+		for (int k = 0; k < 3; k++) {
+			const simd_float4 c = clip[idx[tri * 3 + k]];
+			sx[k] = (c.x / c.w * 0.5f + 0.5f) * 64;
+			sy[k] = (0.5f - c.y / c.w * 0.5f) * 64;
+			sz[k] = c.z / c.w;
+		}
+		const float area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sy[1] - sy[0]) * (sx[2] - sx[0]);
+		if (fabsf(area) < 1e-6f)
+			continue;
+		for (int y = 0; y < 64; y++)
+			for (int x = 0; x < 64; x++) {
+				const float px = x + 0.5f, py = y + 0.5f;
+				const float w0 = ((sx[1] - px) * (sy[2] - py) - (sy[1] - py) * (sx[2] - px)) / area;
+				const float w1 = ((sx[2] - px) * (sy[0] - py) - (sy[2] - py) * (sx[0] - px)) / area;
+				const float w2 = 1 - w0 - w1;
+				if (w0 < 0 || w1 < 0 || w2 < 0)
+					continue;
+				const float dz = w0 * sz[0] + w1 * sz[1] + w2 * sz[2];
+				if (dz < depth[y * 64 + x]) {
+					depth[y * 64 + x] = dz;
+					want[y * 64 + x] = idx[tri * 3] / 4;
+				}
+			}
+	}
+	static const uint8_t bgr[6][3] = {{0, 0, 255}, {0, 255, 0}, {255, 0, 0}, {0, 255, 255}, {255, 0, 255}, {255, 255, 0}};
+	const uint8_t *px = out.contents;
+	int wrong = 0, covered = 0, hiddenSeen = 0, perFace[7] = {0};
+	bool hidden[6] = {false};
+	for (int i = 18; i < 36; i += 6)
+		hidden[idx[i] / 4] = true;
+	for (int i = 0; i < 64 * 64; i++) {
+		const uint8_t *p = px + i * 4;
+		int got = -2;
+		if (!p[0] && !p[1] && !p[2])
+			got = -1;
+		for (int f = 0; f < 6 && got == -2; f++)
+			if (p[0] == bgr[f][0] && p[1] == bgr[f][1] && p[2] == bgr[f][2])
+				got = f;
+		covered += want[i] >= 0;
+		wrong += got != want[i];
+		hiddenSeen += got >= 0 && hidden[got];
+		perFace[got < 0 ? 6 : got]++;
+	}
+	OUT("cube: %d of 4096 pixels not the CPU's face (%d covered; edges may differ by a pixel), %d of a hidden face; pixels a face +x %d -x %d +y %d "
+	    "-y %d +z %d -z %d, none or other %d: %s", wrong, covered, hiddenSeen, perFace[0], perFace[1], perFace[2], perFace[3], perFace[4], perFace[5],
+	    perFace[6], !hiddenSeen && covered && wrong * 50 <= covered ? "PASS" : "FAIL");
+}
+
+// Nine lit, textured cubes spinning in a window; the frames a second in the title.
+static void spin(id<MTLDevice> d, id<MTLCommandQueue> q, double seconds) {
+	[NSApplication sharedApplication];
+	[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+	NSWindow *w = [[NSWindow alloc] initWithContentRect:NSMakeRect(200, 200, 960, 600)
+	                                          styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
+	                                            backing:NSBackingStoreBuffered
+	                                              defer:NO];
+	w.title = @"mtlprobe spin";
+	CAMetalLayer *layer = [CAMetalLayer layer];
+	layer.device = d;
+	layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+	w.contentView.wantsLayer = YES;
+	w.contentView.layer = layer;
+	[w makeKeyAndOrderFront:nil];
+	[NSApp activateIgnoringOtherApps:YES];
+
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "struct SV { float4 pos [[position]]; float3 n; float2 uv; float3 tint [[flat]]; };\n"
+	                                              "struct SU { float4x4 m; float4x4 rot; float4 tint; };\n"
+	                                              "vertex SV spin_v(uint vid [[vertex_id]], uint iid [[instance_id]], const device packed_float3 *p [[buffer(0)]],"
+	                                              " const device packed_float3 *n [[buffer(1)]], constant SU *u [[buffer(2)]]) {"
+	                                              " SV o; o.pos = u[iid].m * float4(float3(p[vid]), 1); o.n = (u[iid].rot * float4(float3(n[vid / 4]), 0)).xyz;"
+	                                              " uint k = vid & 3; o.uv = float2(k == 1 || k == 2, k >= 2); o.tint = u[iid].tint.rgb; return o; }\n"
+	                                              "fragment float4 spin_f(SV in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {"
+	                                              " float l = 0.25 + 0.75 * max(dot(normalize(in.n), normalize(float3(-0.4, 0.6, -0.7))), 0.0);"
+	                                              " return float4(t.sample(s, in.uv).rgb * in.tint * l, 1); }"
+	                                     options:nil
+	                                       error:&err];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"spin_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"spin_f"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	if (!ps) {
+		OUT("spin: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+	dd.depthCompareFunction = MTLCompareFunctionLess;
+	dd.depthWriteEnabled = YES;
+	id<MTLDepthStencilState> ds = [d newDepthStencilStateWithDescriptor:dd];
+	MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+	sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+	id<MTLSamplerState> ss = [d newSamplerStateWithDescriptor:sd];
+
+	// A 64x64 checkerboard with a border: which way each face's texture runs shows.
+	uint32_t tex[64 * 64];
+	for (int y = 0; y < 64; y++)
+		for (int x = 0; x < 64; x++)
+			tex[y * 64 + x] = x < 3 || y < 3 ? 0xff202020u : ((x / 8 + y / 8) & 1) ? 0xffffffffu : 0xffb0b0b0u;
+	MTLTextureDescriptor *xd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	id<MTLTexture> checker = [d newTextureWithDescriptor:xd];
+	[checker replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:tex bytesPerRow:64 * 4];
+
+	simd_float3 corners[24], normals[6];
+	cubeCorners(corners, normals);
+	float packed[72], packedN[18];
+	for (int i = 0; i < 24; i++)
+		for (int c = 0; c < 3; c++)
+			packed[i * 3 + c] = corners[i][c];
+	for (int i = 0; i < 6; i++)
+		for (int c = 0; c < 3; c++)
+			packedN[i * 3 + c] = normals[i][c];
+	uint16_t idx[36];
+	for (int f = 0; f < 6; f++) {
+		const uint16_t q4[6] = {0, 1, 2, 0, 2, 3};
+		for (int k = 0; k < 6; k++)
+			idx[f * 6 + k] = (uint16_t)(f * 4 + q4[k]);
+	}
+	id<MTLBuffer> vb = [d newBufferWithBytes:packed length:sizeof(packed) options:MTLResourceStorageModeShared];
+	id<MTLBuffer> nb = [d newBufferWithBytes:packedN length:sizeof(packedN) options:MTLResourceStorageModeShared];
+	id<MTLBuffer> ib = [d newBufferWithBytes:idx length:sizeof(idx) options:MTLResourceStorageModeShared];
+	struct SU { simd_float4x4 m, rot; simd_float4 tint; };
+
+	id<MTLTexture> zt = nil;
+	NSDate *start = [NSDate date], *second = start;
+	int frames = 0, total = 0;
+	while (-[start timeIntervalSinceNow] < seconds && w.isVisible) {
+		@autoreleasepool {
+			for (NSEvent *ev; (ev = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:nil inMode:NSDefaultRunLoopMode dequeue:YES]);)
+				[NSApp sendEvent:ev];
+			const CGSize size = CGSizeMake(w.contentView.bounds.size.width * w.backingScaleFactor, w.contentView.bounds.size.height * w.backingScaleFactor);
+			if (size.width < 1 || size.height < 1)
+				continue;
+			layer.drawableSize = size;
+			if (!zt || zt.width != (NSUInteger)size.width || zt.height != (NSUInteger)size.height) {
+				MTLTextureDescriptor *zd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:(NSUInteger)size.width
+				                                                                            height:(NSUInteger)size.height mipmapped:NO];
+				zd.usage = MTLTextureUsageRenderTarget;
+				zd.storageMode = MTLStorageModePrivate;
+				zt = [d newTextureWithDescriptor:zd];
+			}
+			id<CAMetalDrawable> dr = [layer nextDrawable];
+			if (!dr)
+				continue;
+			const float time = (float)-[start timeIntervalSinceNow], aspect = (float)(size.width / size.height);
+			struct SU u[9];
+			for (int i = 0; i < 9; i++) {
+				const float pitch = time * (0.7f + 0.1f * i), yaw = time * (1.1f - 0.07f * i);
+				const simd_float3 at = simd_make_float3((i % 3 - 1) * 1.6f, (1 - i / 3) * 1.6f, 5 + (i % 2) * 0.8f);
+				u[i].m = cubeMatrix(pitch, yaw, aspect, at);
+				u[i].rot = cubeRotation(pitch, yaw);
+				u[i].tint = simd_make_float4(0.5f + 0.5f * (i % 3 == 0), 0.5f + 0.5f * (i % 3 == 1), 0.5f + 0.5f * (i % 3 == 2), 1);
+			}
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = dr.texture;
+			rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+			rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+			rp.colorAttachments[0].clearColor = MTLClearColorMake(0.08, 0.1, 0.14, 1);
+			rp.depthAttachment.texture = zt;
+			rp.depthAttachment.loadAction = MTLLoadActionClear;
+			rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+			rp.depthAttachment.clearDepth = 1;
+			id<MTLCommandBuffer> cb = [q commandBuffer];
+			cb.label = @"mtlprobe spin";
+			id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+			[re setRenderPipelineState:ps];
+			[re setDepthStencilState:ds];
+			[re setVertexBuffer:vb offset:0 atIndex:0];
+			[re setVertexBuffer:nb offset:0 atIndex:1];
+			[re setVertexBytes:u length:sizeof(u) atIndex:2];
+			[re setFragmentTexture:checker atIndex:0];
+			[re setFragmentSamplerState:ss atIndex:0];
+			[re drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:36 indexType:MTLIndexTypeUInt16 indexBuffer:ib indexBufferOffset:0
+			            instanceCount:9];
+			[re endEncoding];
+			[cb presentDrawable:dr];
+			[cb commit];
+			frames++;
+			total++;
+			if (-[second timeIntervalSinceNow] >= 1) {
+				const double fps = frames / -[second timeIntervalSinceNow];
+				w.title = [NSString stringWithFormat:@"mtlprobe spin: %.0f frames a second, %.0fx%.0f", fps, size.width, size.height];
+				OUT("spin: %.1f frames a second at %.0fx%.0f", fps, size.width, size.height);
+				frames = 0;
+				second = [NSDate date];
+			}
+		}
+	}
+	OUT("spin: %d frames in %.1f s", total, -[start timeIntervalSinceNow]);
+}
+
 int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend", "blendx", "varyings", "texsize", "surfdraw", "manyinst", "viewport", "texlinear", "fragpos", "glyphs", "coverage2", "ctex", "fbfetch"};
-			for (int i = 0; i < 29; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend", "blendx", "varyings", "texsize", "surfdraw", "manyinst", "viewport", "texlinear", "fragpos", "glyphs", "coverage2", "ctex", "fbfetch", "cube"};
+			for (int i = 0; i < 30; i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -1949,8 +2279,12 @@ int main(int argc, char **argv) {
 			blendinfo(d, q);
 		else if (!strcmp(mode, "drawargs"))
 			drawargs(d, q);
+		else if (!strcmp(mode, "cube"))
+			cube(d, q);
+		else if (!strcmp(mode, "spin"))
+			spin(d, q, argc > 2 ? atof(argv[2]) : 10);
 		else {
-			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, blend, blendx, varyings, texsize, surfdraw, manyinst, viewport, texlinear, fragpos, glyphs, glyphs2 F, coverage2, ctex, fbfetch, texinfo, blendinfo, drawargs, all)", mode);
+			OUT("unknown mode %s (info, blit, compute, grid, mix, two, twolib, feat, bytes, simd, render, tri, tricol, vbuf, drawmodes, texdraw, blend, blendx, varyings, texsize, surfdraw, manyinst, viewport, texlinear, fragpos, glyphs, glyphs2 F, coverage2, ctex, fbfetch, cube, spin [S], texinfo, blendinfo, drawargs, all)", mode);
 			return 2;
 		}
 	}
