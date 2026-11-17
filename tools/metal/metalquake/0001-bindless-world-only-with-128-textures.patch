@@ -1,0 +1,49 @@
+diff --git a/MetalEngine/mq_world_vbo.h b/MetalEngine/mq_world_vbo.h
+index d962c63..4c73680 100644
+--- a/MetalEngine/mq_world_vbo.h
++++ b/MetalEngine/mq_world_vbo.h
+@@ -46,6 +46,10 @@ void MQ_WorldVBO_Clear(void);
+ // Indicates whether the static world VBO is allocated and ready for rendering.
+ bool MQ_WorldVBO_IsReady(void);
+ 
++// Whether the device takes the bindless world shader's 128 fragment textures (96 diffuse + 32 lightmaps): Metal guarantees
++// 128 textures per stage on Mac GPU family 2 and Apple family 6 and later, 31 on others (e.g. a paravirtual GPU).
++bool MQ_WorldVBO_BindlessSupported(void);
++
+ // Returns a pointer to the static world MTLBuffer.
+ #if defined(__OBJC__)
+ id<MTLBuffer> MQ_WorldVBO_GetBuffer(void);
+diff --git a/MetalEngine/mq_world_vbo.m b/MetalEngine/mq_world_vbo.m
+index 164d0ca..8947bdc 100644
+--- a/MetalEngine/mq_world_vbo.m
++++ b/MetalEngine/mq_world_vbo.m
+@@ -59,6 +59,16 @@ bool MQ_WorldVBO_IsReady(void)
+     return s_worldVBO != nil && s_totalVertexCount > 0;
+ }
+ 
++bool MQ_WorldVBO_BindlessSupported(void)
++{
++    static int supported = -1;
++    if (supported < 0 && g_device) {
++        supported = [g_device supportsFamily:MTLGPUFamilyMac2] || [g_device supportsFamily:MTLGPUFamilyApple6];
++        MLog(MQ_LVL_ALWAYS, "Metal3D", "Bindless world (128 textures per stage): %s", supported ? "supported" : "NOT supported, per-texture batches");
++    }
++    return supported > 0;
++}
++
+ id<MTLBuffer> MQ_WorldVBO_GetBuffer(void)
+ {
+     return s_worldVBO;
+diff --git a/QuakeCore/r_world.c b/QuakeCore/r_world.c
+index bbd8bdf..2799f7a 100644
+--- a/QuakeCore/r_world.c
++++ b/QuakeCore/r_world.c
+@@ -536,7 +536,7 @@ void R_DrawTextureChains_Multitexture (qmodel_t *model, entity_t *ent, texchain_
+     int         i, lm;
+     msurface_t *s;
+     texture_t  *t;
+-    qboolean    useWorldVBO = (model == cl.worldmodel) && MQ_WorldVBO_IsReady();
++    qboolean    useWorldVBO = (model == cl.worldmodel) && MQ_WorldVBO_IsReady() && MQ_WorldVBO_BindlessSupported();
+     
+     // =========================================================================
+     // Bindless fast-path: render all opaque static world geometry in 1 draw call

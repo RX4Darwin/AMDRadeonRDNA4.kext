@@ -1078,11 +1078,13 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			from[index] = 100 + location;
 			written |= writes ? 1u << location : 0;
 		} else if ((kind == "air.texture" || kind == "air.sampler") && !unused) {
-			int location = -1;
+			int location = -1, count = 1;   // count: of an array (array<texture2d, n>), its n
 			for (unsigned k = 2; k + 1 < a->getNumOperands(); k++)
-				if (mdString(a, k) == "air.location_index")
+				if (mdString(a, k) == "air.location_index") {
 					location = static_cast<int>(mdInt(a, k + 1));
-			if (location < 0 || location > 15)
+					count = k + 2 < a->getNumOperands() ? static_cast<int>(mdInt(a, k + 2)) : 1;
+				}
+			if (location < 0 || count < 1 || location + count > 16)
 				return kind + " argument " + std::to_string(index) + ": only indices 0-15 so far";
 			from[index] = (kind == "air.texture" ? 200 : 300) + location;
 		}
@@ -1328,6 +1330,22 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		}
 		return r;
 	};
+	// A texture or sampler argument: its handle, the address of its T# or S# in the table. An array of them (array<texture2d, n>: AIR passes a
+	// pointer to n handles, byval) as such an array, made here: MetalQuake's UI shader picks one of 16 by a vertex value, and with the first
+	// T#'s address in its place it read the T#'s bytes as handles and faulted at 0, the ring with it (2026-11-17).
+	auto resource = [&](unsigned k, uint64_t at, uint64_t stride) -> Value * {
+		auto *array = air->getArg(k)->hasByValAttr() ? dyn_cast<ArrayType>(air->getParamByValType(k)) : nullptr;
+
+		if (!array)
+			return handle(at, air->getArg(k)->getType());
+
+		IRBuilder<> entry(&f->getEntryBlock(), f->getEntryBlock().getFirstInsertionPt());
+		AllocaInst *handles = entry.CreateAlloca(array);
+
+		for (unsigned i = 0; i < array->getNumElements(); i++)
+			b.CreateStore(handle(at + stride * i, array->getElementType()), b.CreateConstInBoundsGEP2_32(array, handles, 0, i));
+		return handles;
+	};
 	auto callAir = [&](Value *vid) {
 		SmallVector<Value *, 4> args;
 		for (unsigned k = 0; k < air->arg_size(); k++)
@@ -1340,8 +1358,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
 			               : from[k] == 4 ? fromVec4(framebuffer(), air->getArg(k)->getType())
 			               : from[k] == 5 ? b.CreateZExtOrTrunc(b.CreateFCmpOGT(f->getArg(kFrontFace), ConstantFP::get(f32, 0.0)), air->getArg(k)->getType())
-			               : from[k] >= 300 ? handle(RDNA4_MTLC_TABLE_SAMPLERS + 16 * static_cast<unsigned>(from[k] - 300), air->getArg(k)->getType())
-			               : from[k] >= 200 ? handle(RDNA4_MTLC_TABLE_TEXTURES + 32 * static_cast<unsigned>(from[k] - 200), air->getArg(k)->getType())
+			               : from[k] >= 300 ? resource(k, RDNA4_MTLC_TABLE_SAMPLERS + 16 * static_cast<unsigned>(from[k] - 300), 16)
+			               : from[k] >= 200 ? resource(k, RDNA4_MTLC_TABLE_TEXTURES + 32 * static_cast<unsigned>(from[k] - 200), 32)
 			               : from[k] >= 100 ? buffer(static_cast<unsigned>(from[k] - 100), air->getArg(k)->getType())
 			                              : PoisonValue::get(air->getArg(k)->getType()));
 		return b.CreateCall(air, args);

@@ -885,6 +885,7 @@ private:
 	// The draws by their target: a surface on the card, one in the guest's memory, a Metal texture shared, managed or private; their
 	// scissor rectangles' bytes.
 	uint32_t mTargetDraws[5] {};
+	uint32_t mHowDrawn[4] {}, mHoldFailed { 0 };   // draws into a held target, in place, staged, multisampled; holds refused
 	struct CopiedTop { uint64_t at, bytes; uint32_t task, width, height, rowBytes, times; bool surface; };
 	CopiedTop mCopiedTop[8] {};
 	uint64_t mTargetBytes[5] {};
@@ -5129,8 +5130,14 @@ bool RDNA4PvHost::holdTarget(uint32_t task, uint32_t target, uint64_t va, const 
 	if (!s || !shadowCurrent(*s)) {
 		s = s ? s : makeShadow(key);
 
-		if (!s || !fillShadow(*s, surface.memory, drawing(task, target)))
+		static uint32_t refusedLines;
+
+		if (!s || !fillShadow(*s, surface.memory, drawing(task, target))) {
+			if (refusedLines++ < 12)
+				pvstat("host: render: target %u of task %u (%ux%u, %u bytes a pixel, %u per row) not held: %s", target, task, width, height, tp, bpr,
+				       s ? "its shadow not filled" : "no shadow (larger than kShadowMax, or all busy)");
 			return false;
+		}
 	}
 
 	if (surface.memory && surface.memory->prepare() != kIOReturnSuccess)
@@ -6283,6 +6290,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint64_t slotAt = static_cast<uint64_t>(slot) * RDNA4_TRIRUN_PAGE;
 
 	const bool staged = !inPlace && !held && !ms;
+
+	mHowDrawn[held ? 0 : inPlace ? 1 : ms ? 3 : 2]++;
+	mHoldFailed += hold && !held;
 	const bool pooled = staged && mRtOpen && poolTake(targetBytes, tgt.gpu, pooledTarget);
 	uint32_t *stage = nullptr;
 
@@ -8604,6 +8614,10 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	       "private %u (%llu MiB)", mTargetDraws[0], mTargetBytes[0] >> 20, mTargetDraws[1], mTargetBytes[1] >> 20, mTargetDraws[2], mTargetBytes[2] >> 20,
 	       mTargetDraws[3], mTargetBytes[3] >> 20, mTargetDraws[4], mTargetBytes[4] >> 20);
 	memset(mTargetDraws, 0, sizeof(mTargetDraws));
+	pvstat("host: render:   draws into targets held %u, in place %u, staged %u, multisampled %u; holds refused %u", mHowDrawn[0], mHowDrawn[1],
+	       mHowDrawn[2], mHowDrawn[3], mHoldFailed);
+	memset(mHowDrawn, 0, sizeof(mHowDrawn));
+	mHoldFailed = 0;
 
 	for (uint32_t k = 0; k < 4; k++) {
 		CopiedTop *top = nullptr;

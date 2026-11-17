@@ -183,6 +183,12 @@ otherwise). The newest version is on top. How versions and branches work is in `
   Safari the cube passes with Apple's GPU's pixels and the cubes run at 60 frames a second at 3840x1836. Off by default
   because Chrome then takes its Dawn path, whose shaders do not translate yet (buffer slots above 27, scratch memory), and
   WindowServer hung while it ran (the watchdog restarted it twice).
+- MetalQuake runs on the card (`tools/metal/metalquake/`: a patch to the game and how to build it for Intel). The
+  translator passes an array of textures or samplers (`array<texture2d, 16>`, AIR's pointer to n handles) as such an
+  array: with the first T#'s address in its place, MetalQuake's UI shader read the T#'s bytes as handles, faulted at 0
+  and hung the graphics ring at the game's first frame. The host's statistics count the draws into targets held on the
+  card, in place, staged and multisampled. Card (Tahoe 26.6.2, 2026-11-17): the demo and e1m1 at 3840x1878 in HDR, 60
+  frames a second on the display, the card at about 2.8 GHz.
 
 ## 0.2.2 (2026-11-14)
 
