@@ -157,6 +157,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
   barriers, then shows its surface as it is. Card (Tahoe 26.6.2, 2026-11-15): with every translation moved aside
   (408 made again after the boot) no reset, two presents ran at 150 and 163 ms; the boot before, with the display
   channels alone, still reset at 44 s.
+- The animated wallpapers (Tahoe's "Macintosh"; Jan saw the same on Sequoia) no longer slow everything down. Two host
+  costs, found with timers on the draw path: a 4K RGBA16Float surface of 4 samples (255 MiB) was never cleared (the
+  clear's 1 MiB packets did not fit its page), so every draw into it made and freed its memory again, 48 ms each;
+  the clear now uses 32 MiB packets. And mappings of the guest's pages counted against the 1 GiB a client may pin,
+  though nothing is allocated: the wallpaper's 66-130 MiB textures were mapped again every frame (2.5 s of every 5).
+  They now count against the address space only. The 4K wallpaper is now drawn with its 4 samples (before, as one).
+  Card (Tahoe 26.6.2, 2026-11-17): the host's time 4.5 s of every 5 -> 0.6 s, about 42 frames a second (was 6-10),
+  the card 97 % busy at about 1.5 GHz. `debug.rdna4_pvnotrun` lists the draws not run since the boot by reason.
 
 ## 0.2.2 (2026-11-14)
 

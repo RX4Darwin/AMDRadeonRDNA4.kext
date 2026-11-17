@@ -896,13 +896,34 @@ private:
 	uint32_t mTexLines { 0 };            // textures and samplers refused, described in this stats period
 	const char *mNotRunWhy { nullptr };
 	char mNotRunName[64] {};
+	// The same since the boot, by reason (debug.rdna4_pvnotrun): which missing piece costs the most draws.
+	struct NotRunReason { const char *why; uint64_t count; char name[48]; };
+	static constexpr uint32_t kNotRunReasons = 24;
+	NotRunReason mNotRunCensus[kNotRunReasons] {};
+	uint64_t mNotRunOther { 0 };   // reasons past the table's size
 	void noteNotRun(const char *why, const char *name)
 	{
 		if (!mNotRun++) {
 			mNotRunWhy = why;
 			strlcpy(mNotRunName, name, sizeof(mNotRunName));
 		}
+		for (NotRunReason &r : mNotRunCensus) {
+			if (r.why == why) {
+				r.count++;
+				return;
+			}
+			if (!r.why) {
+				r.why = why;
+				r.count = 1;
+				strlcpy(r.name, name ? name : "", sizeof(r.name));
+				return;
+			}
+		}
+		mNotRunOther++;
 	}
+public:
+	int notRunCensus(struct sysctl_req *req);
+private:
 	uint32_t mStale[4] {};                               // shadows filled again: dropped, too old, the surface locked since, rewritten
 	uint64_t mDrawSerial { 0 };          // draws submitted
 	bool shadowIdle(const Shadow &s) const;
@@ -1119,6 +1140,39 @@ static int frameSysctl SYSCTL_HANDLER_ARGS
 
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvframe, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, frameSysctl, "S",
 	    "AMDRadeonRDNA4: the next presented frame at half size");
+
+// debug.rdna4_pvnotrun: the draws the host could not run since the boot, by reason, the most first: "count reason (first function)".
+static int notRunSysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	return gHost ? gHost->notRunCensus(req) : ENOENT;
+}
+
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvnotrun, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, notRunSysctl, "A",
+	    "AMDRadeonRDNA4: the draws not run since the boot, by reason");
+
+int RDNA4PvHost::notRunCensus(struct sysctl_req *req)
+{
+	// A copy, sorted: the host thread keeps counting meanwhile (ponytail: the copy can be a count behind).
+	NotRunReason sorted[kNotRunReasons];
+	memcpy(sorted, mNotRunCensus, sizeof(sorted));
+	for (uint32_t i = 1; i < kNotRunReasons; i++)
+		for (uint32_t j = i; j > 0 && sorted[j].count > sorted[j - 1].count; j--) {
+			const NotRunReason t = sorted[j];
+			sorted[j] = sorted[j - 1];
+			sorted[j - 1] = t;
+		}
+	static char text[4096];
+	size_t at = 0;
+	for (const NotRunReason &r : sorted)
+		if (r.why && at < sizeof(text) - 1)
+			at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at, "%llu %s (first \"%s\")\n", r.count, r.why, r.name));
+	if (mNotRunOther && at < sizeof(text) - 1)
+		at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at, "%llu other reasons\n", mNotRunOther));
+	if (at >= sizeof(text))
+		at = sizeof(text) - 1;
+	return SYSCTL_OUT(req, text, at + 1);
+}
 
 
 RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
@@ -2930,6 +2984,15 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		}
 		if (wide)
 			d.type = ~0u;   // beyond 32 bits: refused as an unknown primitive
+
+		static uint32_t typeLines;   // diag: what the "unknown primitive type" draws carry
+
+		if (d.type > 4 && typeLines++ < 12) {
+			uint32_t w[12] = {};
+			memcpy(w, payload, drawBytes(id) < sizeof(w) ? drawBytes(id) : sizeof(w));
+			pvstat("host: render: task %u pipeline %u: draw 0x%03x (%u bytes, wide %d) type 0x%x: %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+			       t->task, t->renderPipeline, id, bytes, wide != 0, d.type, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8]);
+		}
 		memcpy(d.blendColor, t->blendColor, sizeof(d.blendColor));
 		memcpy(d.attachments, t->attachments, sizeof(d.attachments));
 		memcpy(d.viewport, t->viewport, sizeof(d.viewport));
@@ -3647,7 +3710,9 @@ const RDNA4PvHost::StencilBuf *RDNA4PvHost::stencilFor(uint32_t task, uint32_t t
 
 bool RDNA4PvHost::clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_t bytes, uint32_t pattern)
 {
-	static constexpr uint32_t kChunk = 1u << 20;
+	// DMA_DATA's BYTE_COUNT holds 26 bits. With 1 MiB a packet the page held some 144 MiB: a 4K RGBA16Float surface of 4 samples (255 MiB, the
+	// animated wallpapers') was never cleared, its memory made and freed again by every draw, 48 ms each (2026-11-17).
+	static constexpr uint32_t kChunk = 1u << 25;
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];   // ponytail: one host, draws run one at a time on its work loop
 	uint32_t n = 0;
 	uint64_t at = 0;
@@ -5377,7 +5442,7 @@ bool RDNA4PvHost::mapPages(const uint64_t *pages, uint64_t count, uint64_t &hand
 	uint64_t h = 0;
 	bool ok = copy && gCompute->rtMapPages(this, pages, count, h, gpu) == kIOReturnSuccess;
 
-	// The cache holds the client's GPU VA (1 GiB) and host quota: make room by dropping the least recently used mappings.
+	// The cache holds the client's GPU VA (rtMapPages fails when it is full): make room by dropping the least recently used mappings.
 	for (uint32_t tries = 0; copy && !ok && tries < kMappings; tries++) {
 		Mapping *oldest = nullptr;
 
@@ -9403,6 +9468,7 @@ bool RDNA4PvNub::publish(IOService *parent, uint32_t level) {
 	sysctl_register_oid(&sysctl__debug_rdna4_pvtex);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvframeport);
 	sysctl_register_oid(&sysctl__debug_rdna4_pvframe);
+	sysctl_register_oid(&sysctl__debug_rdna4_pvnotrun);
 	// publish() is reached from two threads (the GPU path in attach() and RDNA4PvLate's work loop): claim the single slot atomically before building
 	// anything, give it back on the paths that can be retried.
 	static bool claimed = false;

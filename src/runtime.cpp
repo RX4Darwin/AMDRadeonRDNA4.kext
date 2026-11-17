@@ -2695,9 +2695,10 @@ IOReturn RDNA4Compute::rtMapPages(const void *owner, const uint64_t *pageBuses, 
 		return kIOReturnUnsupported;
 	if (!pageBuses || !pages || pages > kHostMaxBuffer / GpuVm::kPageBytes)   // the count first: the product could wrap
 		return pages ? kIOReturnNoResources : kIOReturnBadArgument;
+	/* Not counted in the host quota (kHostMaxClient): nothing is allocated, the pages are the guest's, and with 1 GiB the paravirtual host's
+	 * cache lost the animated wallpapers' 4K textures (66-130 MiB each) every frame and mapped them again, 2.5 s of every 5 (2026-11-17).
+	 * The VA is the limit (vaTake); the host's cache gives up its least recently used mappings when it runs out. */
 	const uint64_t bytes = pages * GpuVm::kPageBytes;
-	if (bytes > kHostMaxClient - c->hostBytes || bytes > kHostMaxTotal - hostBytesTotal)
-		return kIOReturnNoResources;
 	uint32_t slot = 0;
 	while (slot < bufferCap() && buffers[slot].owner)
 		slot++;
@@ -2712,6 +2713,7 @@ IOReturn RDNA4Compute::rtMapPages(const void *owner, const uint64_t *pageBuses, 
 	b.va = vaTake(*c, bytes);
 	b.gen = generation;
 	b.host = true;   // unmapped like a host buffer; it has no memory of its own to release
+	b.mapped = true;
 	if (!b.va || b.va + bytes < b.va || b.va + bytes > GpuVm::kVaEnd || !vmMapHost(*c, b.va, pageBuses, bytes, false)) {
 		if (b.va) {
 			vmUnmap(*c, b.va, bytes);
@@ -2722,8 +2724,6 @@ IOReturn RDNA4Compute::rtMapPages(const void *owner, const uint64_t *pageBuses, 
 	}
 	/* No invalidation: the range held no translation since rtFree invalidated it after its last unmap (or it was never mapped), as amdgpu
 	 * flushes on unmapping and changing entries, not on adding them. */
-	c->hostBytes += bytes;
-	hostBytesTotal += bytes;
 	handle = makeHandle(slot, b.gen);
 	gpu = b.va;
 	return kIOReturnSuccess;
@@ -2761,7 +2761,7 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	if (c && b->va && forgotten)
 		vaGive(*c, b->va, b->bytes);   // after the invalidation: nothing cached reaches the range when it is mapped again
 	if (host) {
-		if (c) {
+		if (c && !b->mapped) {
 			const uint64_t rounded = (b->bytes + GpuVm::kPageBytes - 1) &
 			                         ~(GpuVm::kPageBytes - 1);
 			if (c->hostBytes >= rounded)
@@ -4045,8 +4045,8 @@ void RDNA4Compute::rtRelease(const void *owner) {
 
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner && b.host) {
-			const uint64_t rounded = (b.bytes + GpuVm::kPageBytes - 1) &
-			                         ~(GpuVm::kPageBytes - 1);
+			const uint64_t rounded = b.mapped ? 0 : (b.bytes + GpuVm::kPageBytes - 1) &
+			                                        ~(GpuVm::kPageBytes - 1);
 			if (c && c->hostBytes >= rounded)
 				c->hostBytes -= rounded;
 			if (hostBytesTotal >= rounded)

@@ -843,6 +843,7 @@ private:
 		bool        device { false };          // from the device heap
 		bool        host { false };
 		bool        foreign { false };         // VRAM that is not the runtime's (rtMapVram): only the VA is given back
+		bool        mapped { false };          // rtMapPages: pages the runtime did not allocate, not counted in the host quota
 		IOBufferMemoryDescriptor *hostMemory { nullptr };
 		IODMACommand *hostDma { nullptr };
 		IOMemoryMap *hostMap { nullptr };
