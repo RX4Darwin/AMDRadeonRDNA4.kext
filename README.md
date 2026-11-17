@@ -31,7 +31,9 @@ macOS Tahoe 26.6.2 a Metal desktop on the card: WindowServer composites through
 the card, and the Dock and apps draw with Metal; Liquid Glass's kernels run
 since 2026-11-11 (Sequoia 15 tested by Jan Claußen), and since 2026-11-14 its blurred
 glass (Finder's sidebar) too. OpenGL apps draw on the card as well
-(Apple's GL-on-Metal renderer; kitty and Mixxx run). See [Metal](#metal-on-macos-tahoe-and-sequoia-experimental).
+(Apple's GL-on-Metal renderer; kitty and Mixxx run). Since 2026-11-17 Metal 3D runs on it too: MetalQuake at
+3840x1878 in HDR at 60 frames a second, and WebGL in Safari (with `rdna4-pvmac2=1`). See
+[Metal](#metal-on-macos-tahoe-and-sequoia-experimental).
 
 > **Why a Lilu plugin?** The earlier build was a standalone `IOFramebuffer`
 > subclass. That links against `com.apple.iokit.IOGraphicsFamily`, whose code
@@ -261,8 +263,18 @@ What runs (card, macOS Tahoe 26.6.2, 2026-11-10 to 2026-11-12; Sequoia 15 by Jan
 desktop composited on the card, the Dock with every icon, apps' windows (Finder, iTerm2, ...), Liquid Glass with its
 blurred glass (Finder's sidebar), Metal compute, blits and draws of every form with vertex descriptors, textures, mip
 levels (drawn into, sampled at explicit LODs) and mip-level views, 2D array textures, blending, stencil, the depth
-test (Depth32Float), RG32 integer targets, sRGB targets, 2x and 4x multisampling, up to eight colour attachments. `tools/metal/m1/mtlprobe.m` (`mtlprobe all`)
-checks blits, compute and drawing.
+test (Depth32Float), RG32 integer targets, sRGB targets, 2x and 4x multisampling, up to eight colour attachments,
+and the animated wallpapers (Tahoe's "Macintosh") at about 42 frames a second. `tools/metal/m1/mtlprobe.m` (`mtlprobe all`)
+checks blits, compute and drawing; `mtlprobe cube` checks a depth-tested cube in perspective against the CPU, `mtlprobe spin`
+shows nine lit, textured cubes in a window. `sysctl debug.rdna4_pvnotrun` lists the draws the host could not run since
+the boot, by reason.
+
+**3D** (card, 2026-11-17): MetalQuake (`tools/metal/metalquake/`: a patch to the game and how to build it for Intel)
+plays its demo and its levels at 3840x1878 in HDR at 60 frames a second. WebGL runs in Safari with `rdna4-pvmac2=1`:
+Tahoe's Intel build of the paravirtual Metal driver reports a device without Mac GPU family 2, which WebGL (ANGLE)
+requires, and the boot-arg patches that one value as the driver loads. It is off by default: Chrome then takes its
+Dawn path, whose shaders do not translate yet, and WindowServer hung while it ran. `tools/metal/webgl/` has the cube
+check and the spinning cubes as a WebGL page.
 
 **OpenGL** (on unless `rdna4-pvgl=0`, card 2026-11-12 to 2026-11-14): macOS's OpenGL 4.1 on Metal
 (`AppleMetalOpenGLRenderer.bundle`) runs on the paravirtual GPU, so unmodified OpenGL programs draw on the card:
@@ -316,10 +328,15 @@ rdna4-compute=7 rdna4-gfx=2 rdna4-vm=1 rdna4-pvgpu=1 rdna4-pvgpu-disp=7 rdna4-pv
 | `rdna4-pvgpu-match=0` | The device is published but no driver may take it (diagnostics). |
 | `rdna4-pvscaled=0` | No scaled modes above a head's 3840x2160. |
 | `rdna4-pvgl=0` | OpenGL in software. By default OpenGL is on the card: `AppleMetalOpenGLRenderer` named on the accelerator and patched as it loads, when it is Tahoe 26.6.2's. |
+| `rdna4-pvmac2=1` | The paravirtual device reports Mac GPU family 2 and Common3 (`AppleParavirtGPUMetal`'s feature profile patched as it loads, Tahoe 26.6.2): WebGL in Safari. Off by default: Chrome's Dawn path does not run yet, and WindowServer hung while Chrome ran with it. |
 
 **Limits.** It is Apple's paravirtual Metal, with that device's limits and the features the host does not offer
 yet: no Metal heaps, no argument buffers, no indirect command buffers, no texture swizzles (the Intel build of the
-guest driver drops them); OpenGL only with Tahoe 26.6.2's renderer. Apps started before the device is published draw on the CPU until
+guest driver drops them); OpenGL only with Tahoe 26.6.2's renderer. The shader translator takes 16 textures and
+samplers a stage, buffer slots 0-27 and no scratch memory (a local array the compiler cannot keep in registers):
+Chrome's Dawn shaders and MetalQuake's bindless world shader need more. Known open issues: flickering lines and squares
+over Safari's active tab on the display (not in screenshots), and WindowServer's `brim_init_lpf` draws into a format
+the host does not take yet. Apps started before the device is published draw on the CPU until
 they are restarted. The IOSurface lookup depends on Tahoe 25G83's IOSurface internals. Without the card's firmware in the
 build (`firmware/amdgpu/`) the runtime does not come up and no device is published. The design notes and every
 measurement are in `docs/m0-pvgpu.md` and `docs/m1-stream.md`.
@@ -720,4 +737,7 @@ hardware; the `.rom` (NAVI48.bin AtomBIOS) in `firmware/` and the Linux
       verified on hardware 2026-11-10 to 2026-11-12, Tahoe 26.6.2): a Metal
       desktop, the Dock, Liquid Glass and apps' windows; Sequoia 15 tested by
       Jan Claußen. Experimental (*Metal* above)
+- [x] Metal 3D through it (verified on hardware 2026-11-17, Tahoe 26.6.2):
+      MetalQuake at 3840x1878 in HDR at 60 frames a second, WebGL in Safari
+      (`rdna4-pvmac2=1`), `mtlprobe cube` with Apple's GPU's pixels
 - [ ] Native Metal and 3D acceleration (the goal: every feature of the card)
