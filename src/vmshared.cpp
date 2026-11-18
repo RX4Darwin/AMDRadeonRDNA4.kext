@@ -276,16 +276,23 @@ uint32_t RDNA4Compute::vmAcquire(RtClient &c) {
 			return 0;
 		}
 		wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, c.pasid);      // IH_VMID_n_LUT = PASID: a fault vector from this VMID names the client
-		(void)vmInvalidate(g.vmid, "vmpool rebind");
-		if (g.stolen)
-			SLOG("VMID %u: rebound from client slot %d to slot %d (PASID %u)", g.vmid,
-			     reinterpret_cast<const RtClient *>(g.prevOwner) >= clients ? static_cast<int>(reinterpret_cast<const RtClient *>(g.prevOwner) - clients) : -1,
-			     static_cast<int>(&c - clients), c.pasid);
 	} else {
 		c.vmid = g.vmid;
-		if (g.flush)
-			(void)vmInvalidate(g.vmid, "vmpool flush");
 	}
+	/* Do not let the pool forget a flush until the GPU has acknowledged it. On timeout the binding
+	 * remains owned and flush-pending, so the next grab retries instead of submitting with stale TLBs. */
+	if (g.flush) {
+		if (!vmInvalidate(g.vmid, g.rebind ? "vmpool rebind" : "vmpool flush") ||
+		    !vmPool.flushComplete(reinterpret_cast<uintptr_t>(&c), g.vmid)) {
+			SLOG("VMID %u: client slot %d submission refused; TLB invalidation remains pending", g.vmid,
+			     static_cast<int>(&c - clients));
+			return 0;
+		}
+	}
+	if (g.stolen)
+		SLOG("VMID %u: rebound from client slot %d to slot %d (PASID %u)", g.vmid,
+		     reinterpret_cast<const RtClient *>(g.prevOwner) >= clients ? static_cast<int>(reinterpret_cast<const RtClient *>(g.prevOwner) - clients) : -1,
+		     static_cast<int>(&c - clients), c.pasid);
 	return g.vmid;
 }
 
