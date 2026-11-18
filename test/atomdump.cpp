@@ -3999,13 +3999,15 @@ static int testVmidPool() {
 	           "vmid: tlbSeq advanced -> flush, still no rebind");
 	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.flush,
 	           "vmid: failed/unacknowledged flush remains pending on retry");
+	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && g.flush,
+	           "vmid: a newer PTE-removal sequence extends an outstanding flush");
 	f += check(pool.flushComplete(1, v1), "vmid: the flush is cleared only after acknowledgement");
-	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && !g.flush, "vmid: acknowledged flush is not repeated");
+	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && !g.flush, "vmid: acknowledged latest flush is not repeated");
 	// Negative control: a pool that ignored tlbSeq or acknowledged before hardware completion would fail these checks.
 
 	// A flush does not need an idle VMID (an invalidation only drops cached translations).
 	pool.noteSubmit(v1, 0, 10);
-	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && g.vmid == v1 && g.flush && !g.rebind,
+	f += check(pool.grab(1, 0x1000, 5, g) == Result::Ok && g.vmid == v1 && g.flush && !g.rebind,
 	           "vmid: a busy VMID may be flushed");
 	fences.now[0] = 10;
 
