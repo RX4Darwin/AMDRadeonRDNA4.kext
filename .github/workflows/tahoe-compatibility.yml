@@ -61,7 +61,8 @@ jobs:
           BIN="$KEXT/Contents/MacOS/AMDRadeonRDNA4"
           file "$BIN"
           # The PVGPU build must contain its paravirtual host implementation.
-          strings "$BIN" | grep -q 'AMDRadeonRDNA4: pvgpu:'
+          strings "$BIN" > "$RUNNER_TEMP/pvgpu-strings.txt"
+          grep -q 'AMDRadeonRDNA4: pvgpu:' "$RUNNER_TEMP/pvgpu-strings.txt"
           mkdir -p "$RUNNER_TEMP/rdna4-artifacts/pvgpu"
           cp -R "$KEXT" "$RUNNER_TEMP/rdna4-artifacts/pvgpu/"
           # The compute firmware is required for the stage-7 runtime on real hardware.
