@@ -205,7 +205,7 @@ install the PVGPU artifact on the user's daily system or treat its successful bu
 as a boot test. The standard artifact is also unvalidated on the exact 26.7.3
 hardware and is not a substitute for the controlled test sequence above.
 
-The `rdna4-compute=1` option selects a read-only *compute survey*; it does not
+The `rdna4-compute=1` option selects a survey-only *compute diagnostic*; it does not
 disable the Lilu plugin's display hooks. Only `rdna4-off=1` makes plugin startup
 return before registering the display hooks. These two options test different
 things and must not be described as equivalent.
