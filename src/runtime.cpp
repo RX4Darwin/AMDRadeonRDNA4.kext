@@ -664,7 +664,14 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 		/* Sparse tables: GpuVmTable::treeMapVram creates the directories and PT pages the range needs; the pages it changed are synced. */
 		TreeCtx tc { this, &c };
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
-		return GpuVmTable::treeMapVram(tree, vmPolicy(), va, end, physical, executable) && sparseSync(c);
+		if (!GpuVmTable::treeMapVram(tree, vmPolicy(), va, end, physical, executable)) {
+			/* treeMapVram rolls back its written prefix in the shadow. Push those
+			 * cleared PTEs too: otherwise VRAM could retain a partially installed map. */
+			if (!sparseSync(c))
+				RLOG("vmid %u: failed to sync sparse VRAM-map rollback", c.vmid);
+			return false;
+		}
+		return sparseSync(c);
 	}
 	/* The entries are written by GpuVmTable::mapVram (src/gpuvmtable.cpp): the pre-S8 loop, byte-compared against the old code by the host test. */
 	PtCtx ctx { this, &c };
@@ -696,7 +703,14 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 	if (c.sp) {
 		TreeCtx tc { this, &c };
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
-		return GpuVmTable::treeMapHost(tree, vmPolicy(), va, end, pageBuses, executable) && sparseSync(c);
+		if (!GpuVmTable::treeMapHost(tree, vmPolicy(), va, end, pageBuses, executable)) {
+			/* Flush the rollback as well as the successful path. Shadow-only
+			 * cleanup is not enough when an earlier PTE already reached VRAM. */
+			if (!sparseSync(c))
+				RLOG("vmid %u: failed to sync sparse host-map rollback", c.vmid);
+			return false;
+		}
+		return sparseSync(c);
 	}
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
