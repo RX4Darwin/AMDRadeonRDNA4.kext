@@ -78,6 +78,10 @@ public:
 	// `owner` must be non-zero.
 	Result grab(uintptr_t owner, uint64_t pd, uint64_t tlbSeq, Grant &out);
 
+	// The hardware acknowledged the TLB invalidation requested by the latest grab/bind.
+	// Until this is called, every grab for this binding continues to request a flush.
+	bool flushComplete(uintptr_t owner, uint32_t vmid);
+
 	// A job was queued on `vmid` and will signal `seq` on `domain`.
 	void noteSubmit(uint32_t vmid, uint32_t domain, uint32_t seq);
 
@@ -103,8 +107,10 @@ private:
 	struct Slot {
 		uintptr_t owner;           // 0 = unbound
 		uint64_t pd;
-		uint64_t boundSeq;         // client tlbSeq the last flush covered
+		uint64_t boundSeq;         // client tlbSeq the last acknowledged flush covered
+		uint64_t flushSeq;         // newest tlbSeq the pending invalidation must cover
 		uint64_t lastUse;
+		bool flushPending;
 		bool pinned;
 		bool pending[kMaxDomains];
 		uint32_t pendingSeq[kMaxDomains];
