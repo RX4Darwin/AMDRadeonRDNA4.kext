@@ -2810,7 +2810,28 @@ struct FakeBackend {
 	}
 };
 
-static int testNdrv() {
+static int testNdrvRouteGate() {
+	int failures = 0;
+	Ndrv::RouteGate gate;
+
+	failures += check(gate.begin(), "ndrv route gate: first attempt did not acquire Idle state");
+	failures += check(!gate.begin(), "ndrv route gate: concurrent attempt entered while Routing");
+	failures += check(!gate.installed(), "ndrv route gate: Routing was reported as Installed");
+
+	gate.finish(false);
+	failures += check(!gate.installed(), "ndrv route gate: failed attempt was marked Installed");
+	failures += check(gate.begin(), "ndrv route gate: failed attempt did not return to retryable Idle");
+
+	gate.finish(true);
+	failures += check(gate.installed(), "ndrv route gate: successful attempt was not marked Installed");
+	failures += check(!gate.begin(), "ndrv route gate: installed route was allowed to patch twice");
+
+	if (!failures)
+		printf("ndrv route gate: failed attempts remain retryable; successful route is terminal\\n");
+	return failures;
+}
+
+int testNdrv() {
 	int failures = 0;
 
 	// Record layouts (LP64; the kext build also static_asserts them against
@@ -5362,6 +5383,7 @@ int main(int argc, char **argv) {
 	failures += testModes();
 	failures += testPipeDiscovery();
 	failures += testDmubPayloads();
+	failures += testNdrvRouteGate();
 	failures += testNdrv();
 	failures += testModeSet();
 	failures += testDpRetime();
