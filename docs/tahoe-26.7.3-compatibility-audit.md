@@ -87,11 +87,17 @@ A GitHub Actions workflow has been added at
 runner OS and SDK, runs `make test`, builds the x86_64 kext, verifies bundle metadata,
 and uploads the bundle as an artifact.
 
-The workflow targets GitHub's `macos-26-intel` runner. The latest runner image
-information available during this audit reports macOS 26.7.2 (build 25G332), not the
-user's 26.7.3 (25G342). Therefore even a green run on that runner is useful build/test
-evidence but is **not** an exact-build 26.7.3 certification. The workflow has been
-committed but no run result is available yet.
+The workflow targets GitHub's `macos-26-intel` runner. It now builds and archives
+both the standard kext (`PVGPU=0`) and the experimental Metal/paravirtual-GPU kext
+(`PVGPU=1`), in addition to running host tests and checking the x86_64 bundle
+metadata. The PVGPU artifact is checked for its paravirtual-host implementation.
+The workflow also reports whether all ten firmware blobs required for stage-7
+compute bring-up are present.
+
+The latest runner image information available during this audit reports macOS
+26.7.2 (build 25G332), not the user's 26.7.3 (25G342). Therefore even a green run
+is useful compile/test evidence but is **not** exact-build 26.7.3 certification.
+Neither build variant is tested against a physical RX 9070 XT by GitHub Actions.
 
 ## Decision
 
@@ -137,3 +143,41 @@ functionality. Do not treat a successful stage-1 boot as proof that the GPU is
 accelerated, and do not enable stages 3+ until the stage-1 result and logs are
 reviewed. The user's known-good EFI remains separate; this branch build is not
 to be installed over it.
+
+
+## Full Metal acceleration path (experimental)
+
+The upstream 0.3.1 README documents the current full Metal route as Apple's
+`AppleParavirtGPU` / `AppleParavirtGPUMetal` guest driver backed by the RX 9070 XT
+through this kext. It is not native AMD Metal support. The card executes the
+paravirtual driver's translated command stream; Apple's AIR shaders are translated
+to gfx1201 by the separate `air2amdgpu` helper.
+
+The documented runtime prerequisites are:
+
+- Build with `make PVGPU=1`.
+- Include all ten AMD firmware blobs from `firmware/amdgpu/`; without them the
+  compute runtime cannot complete bring-up.
+- Bring up the compute runtime through stage 7, enable the GFX ring at level 2,
+  and enable the GPU VM: `rdna4-compute=7 rdna4-gfx=2 rdna4-vm=1`.
+- Only then publish the paravirtual device with `rdna4-pvgpu=1`. The upstream
+  display configuration uses `rdna4-pvgpu-disp=7` and a short publication delay.
+- Build and install the separate userspace shader translator/helper. Vulkan through
+  MoltenVK additionally requires its documented argument-buffer workaround.
+
+The exact boot-argument profile is documented in the upstream README and is
+**not** a recommendation to apply it to the user's working EFI yet. The earlier
+0.3.0 reboot and the lack of a 26.7.3 physical-card test mean the first hardware
+validation must remain isolated and reversible.
+
+The 0.3.1 release reports a physical RX 9070 XT test on Tahoe 26.6.2, including
+WindowServer compositing, Metal compute/blits/draws, MetalQuake, Safari WebGL under
+an optional patch, and vkQuake through MoltenVK. It also lists material limitations:
+no Metal argument buffers/heaps/indirect command buffers, Chrome's Dawn path not
+working, OpenGL renderer patches tied to Tahoe 26.6.2's binary, and known rendering
+artifacts. This is experimental acceleration, not complete native GPU feature parity.
+
+The purpose of the updated CI is to prove that both the standard and PVGPU source
+configurations compile and package correctly. It cannot prove stage-7 runtime
+bring-up, shader translation, WindowServer stability, or physical-card acceleration.
+Those require the user's exact 26.7.3 machine and logs from a controlled test.
