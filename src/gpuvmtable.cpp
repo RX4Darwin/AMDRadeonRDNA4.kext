@@ -57,7 +57,13 @@ void denseRoot(uint64_t *shadow, uint64_t rootPhys) {
 
 bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, uint64_t physical, bool executable, Span &out) {
 	out = Span {};
-	if (end > GpuVm::kVaStart + denseVa(tableBytes))
+	if (!a.entry || !a.phys || end < va ||
+	    ((va | end | physical) & (GpuVm::kPageBytes - 1)) ||
+	    va < GpuVm::kVaStart || end > GpuVm::kVaStart + denseVa(tableBytes) ||
+	    physical > GpuVm::kPhysicalMask)
+		return false;
+	const uint64_t pageCount = (end - va) / GpuVm::kPageBytes;
+	if (pageCount && pageCount - 1 > (GpuVm::kPhysicalMask - physical) / GpuVm::kPageBytes)
 		return false;
 
 	for (uint64_t at = va, phys = physical; at < end;
@@ -89,14 +95,15 @@ bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 	out = Span {};
 	if (!a.entry || !a.phys || !pageBuses || end < va ||
 	    ((va | end) & (GpuVm::kPageBytes - 1)) ||
-	    end > GpuVm::kVaStart + denseVa(tableBytes))
+	    va < GpuVm::kVaStart || end > GpuVm::kVaStart + denseVa(tableBytes))
 		return false;
 
 	/* Validate the complete bus-page list before touching a PTE. A bad page
 	 * late in the range must not leave earlier pages mapped in the shadow. */
 	const uint64_t pageCount = (end - va) / GpuVm::kPageBytes;
 	for (uint64_t page = 0; page < pageCount; page++)
-		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
+		if ((pageBuses[page] & (GpuVm::kPageBytes - 1)) ||
+		    pageBuses[page] > GpuVm::kPhysicalMask)
 			return false;
 
 	uint64_t page = 0;
@@ -168,6 +175,15 @@ static bool treePath(const Tree &t, uint64_t at, bool create, uint64_t *&ptEntri
 }
 
 bool treeMapVram(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, uint64_t physical, bool executable) {
+	if (!t.page || !t.dirty || end < va ||
+	    ((va | end | physical) & (GpuVm::kPageBytes - 1)) ||
+	    va < GpuVm::kVaStart || end > GpuVm::kVaEnd ||
+	    physical > GpuVm::kPhysicalMask)
+		return false;
+	const uint64_t pageCount = (end - va) / GpuVm::kPageBytes;
+	if (pageCount && pageCount - 1 > (GpuVm::kPhysicalMask - physical) / GpuVm::kPageBytes)
+		return false;
+
 	uint64_t *pt = nullptr;
 	uint32_t ptId = 0;
 	uint64_t ptKey = ~0ull;
@@ -200,7 +216,8 @@ bool treeMapHost(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, co
 	 * has passed alignment validation. */
 	const uint64_t pageCount = (end - va) / GpuVm::kPageBytes;
 	for (uint64_t page = 0; page < pageCount; page++)
-		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
+		if ((pageBuses[page] & (GpuVm::kPageBytes - 1)) ||
+		    pageBuses[page] > GpuVm::kPhysicalMask)
 			return false;
 
 	uint64_t *pt = nullptr;
