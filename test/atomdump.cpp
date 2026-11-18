@@ -5008,6 +5008,26 @@ static int testSparseTree() {
 		           !q.translate(partial, partialPhys) && !q.translate(partial + 0x1000, partialPhys) && earlierStill,
 		           "quota: a map that runs out of pages mid-range rolls back its mapped prefix and preserves earlier mappings");
 		q.close();
+
+		// The same mid-range failure path for host bus pages: the first new PT
+		// page is available, the second is not, so no prefix may remain mapped.
+		q = TreeEnv {};
+		q.open(8);
+		four = true;
+		for (uint32_t i = 0; i < 4; i++)
+			four &= treeMap(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		std::vector<uint64_t> partialBuses {
+			0x104050000ull, 0x104051000ull, 0x104052000ull
+		};
+		const bool hostPartialRejected = !GpuVmTable::treeMapHost(
+			q.tree(), GpuVmTable::Policy {}, partial, partial + 0x3000, partialBuses.data(), false);
+		q.sync();
+		f += check(four && hostPartialRejected && q.sp.pages() == 8 &&
+		           !q.translate(partial, partialPhys) && !q.translate(partial + 0x1000, partialPhys) &&
+		           treeResolves(q, V + 3 * 0x200000ull, MC + 3 * 0x10000, 0x1000),
+		           "quota: a host map that runs out of pages mid-range rolls back its mapped prefix");
+		q.close();
+
 		// host memory exhaustion behaves like the quota
 		q = TreeEnv {};
 		q.shadowLimit = 3;
