@@ -4189,6 +4189,20 @@ static int testVmidPool() {
 	f += check(pool.forget(1, true, released) && released == g.vmid && pool.ownerOf(g.vmid) == 0 && pool.idle(g.vmid),
 	           "vmid: a forced forget releases it and clears the pending work");
 
+	// A VMID whose hardware state cannot be trusted is quarantined until a GPU reset.
+	pool.init(fakeReached, &fences);
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t quarantined = g.vmid;
+	f += check(pool.quarantine(1, quarantined) && pool.ownerOf(quarantined) == 0 && pool.pinned(quarantined),
+	           "vmid: quarantine drops ownership and pins an uncertain hardware VMID");
+	bool avoided = true;
+	for (uintptr_t o = 2; o <= 15; o++)
+		avoided &= pool.grab(o, o * 0x1000, 0, g) == Result::Ok && g.vmid != quarantined;
+	f += check(avoided, "vmid: no client can receive a quarantined VMID");
+	pool.unbindAll();
+	f += check(!pool.pinned(quarantined) && pool.grab(16, 0x16000, 0, g) == Result::Ok,
+	           "vmid: GPU reset unbindAll releases quarantined VMIDs");
+
 	// Reserved VMIDs are never granted.
 	pool.init(fakeReached, &fences, 1u << 8);
 	fences = FakeFences {};
