@@ -145,16 +145,20 @@ The compatibility branch preserves the upstream runtime default:
 `rdna4-compute` argument is supplied. This retains the normal GFX/SMU firmware
 bring-up behavior rather than silently changing it for every user.
 
-For a read-only diagnostic survey, explicitly pass `rdna4-compute=1`.
-Stage 1 runs inline and reads status/register information without loading GPU
-firmware or starting the later bring-up thread. Other explicit
-`rdna4-compute=<stage>` values retain their documented meaning.
+For a survey-only diagnostic, explicitly pass `rdna4-compute=1`.
+Stage 1 runs inline and records status/register information without loading GPU
+firmware, starting the later bring-up thread, or running the defensive engine
+quiesce routine. It still performs the GFXOFF safety preflight: if a previous
+boot left the GFXOFF breadcrumb set, the code asks the SMU to disallow GFXOFF
+before reading GC registers. That safety handshake is a limited SMU state
+change, so stage 1 is not literally read-only at the whole-device level.
 
 A successful stage-1 survey is diagnostic evidence only: it is not proof of
-display takeover or GPU acceleration. Keep the first injection-only boot
-separate and inert with `rdna4-off=1`; test active display/compute stages only
-in a separate reversible EFI after that boot is stable. The known-good EFI
-must remain untouched.
+display takeover or GPU acceleration. It is intended to separate the basic
+display path from the later engine-quiesce and firmware-start sequence. Keep
+the first injection-only boot separate and inert with `rdna4-off=1`; test
+active display/compute stages only in a separate reversible EFI after that
+boot is stable. The known-good EFI must remain untouched.
 
 
 ## Full Metal acceleration path (experimental)
