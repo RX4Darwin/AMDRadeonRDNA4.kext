@@ -113,12 +113,10 @@ void RDNA4Compute::publishResult(const char *feature, const char *value) {
 }
 
 uint32_t RDNA4Compute::requestedStage() {
-	// EXPERIMENTAL Tahoe compatibility diagnostic: default to the read-only
-	// survey so a boot test can separate NDRV/display takeover from GPU
-	// firmware bring-up. Explicit rdna4-compute=<stage> still overrides this;
-	// use rdna4-compute=3 to request the original GFX/SMU firmware stage.
-	// This conservative default is not a claim that full display clocks work.
-	uint32_t stage = StageSurvey;
+	// Preserve the upstream GFX/SMU firmware bring-up default. For an
+	// inert, read-only diagnostic survey, explicitly pass rdna4-compute=1.
+	// Other explicit rdna4-compute=<stage> values retain their normal meaning.
+	uint32_t stage = StageGfx;
 
 	(void)Trial::option("rdna4-compute", stage);
 
