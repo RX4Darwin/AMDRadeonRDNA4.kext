@@ -4991,6 +4991,23 @@ static int testSparseTree() {
 		f += check(still, "quota: what was mapped before the refusal still translates");
 		q.close();
 		f += check(q.chunksLive == 0 && q.shadowLive == 0, "quota: close returns every chunk and shadow page");
+			// A multi-page map can succeed in one new PT page, then run out of quota
+		// on the next. Its already-written prefix must be cleared before failure returns.
+		q = TreeEnv {};
+		q.open(8);
+		bool four = true;
+		for (uint32_t i = 0; i < 4; i++)
+			four &= treeMap(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		const uint64_t partial = V + 6 * 0x200000ull + 0x1ff000;
+		const bool partialRejected = !treeMap(q, partial, MC + 0x900000, 0x3000);
+		uint64_t partialPhys = 0;
+		bool earlierStill = true;
+		for (uint32_t i = 0; i < 4; i++)
+			earlierStill &= treeResolves(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		f += check(four && partialRejected && q.sp.pages() == 8 &&
+		           !q.translate(partial, partialPhys) && !q.translate(partial + 0x1000, partialPhys) && earlierStill,
+		           "quota: a map that runs out of pages mid-range rolls back its mapped prefix and preserves earlier mappings");
+		q.close();
 		// host memory exhaustion behaves like the quota
 		q = TreeEnv {};
 		q.shadowLimit = 3;
