@@ -4494,7 +4494,13 @@ struct Pair {
 		compare("map", a, b);
 	}
 	void mapHost(uint64_t va, const std::vector<uint64_t> &buses, uint64_t bytes, bool exec) {
-		const bool a = !beyondDense(va, bytes) && legacyVmMapHost(ref, va, buses.data(), bytes, exec),
+		const uint64_t mapped = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+		bool aligned = mapped >= bytes && buses.size() >= mapped / GpuVm::kPageBytes;
+		for (uint64_t i = 0; aligned && i < mapped / GpuVm::kPageBytes; i++)
+			aligned = !(buses[i] & (GpuVm::kPageBytes - 1));
+		/* The pre-S8 implementation could partially write before discovering a
+		 * misaligned later page. The new contract rejects that range atomically. */
+		const bool a = aligned && !beyondDense(va, bytes) && legacyVmMapHost(ref, va, buses.data(), bytes, exec),
 		           b = newVmMapHost(nw, va, buses.data(), bytes, exec);
 		(a ? okHost : failedHost)++;
 		compare("mapHost", a, b);
@@ -4545,6 +4551,10 @@ static int testVmTableDifferential() {
 			for (uint32_t i = 0; i < 16; i++)
 				buses[i] = 0x104048000ull + 0x3000ull * i;
 			P.mapHost(V + 0xb0000, buses, 0x10000, false);
+			// A bad final bus page must reject the whole map without leaving the first 15 PTEs behind.
+			std::vector<uint64_t> badBuses = buses;
+			badBuses.back() |= 0x40;
+			P.mapHost(V + 0xc0000, badBuses, 0x10000, false);
 			P.unmap(V + 0xb0000, 0x10000);                       // the freed buffer; the next dispatch through it must fault
 			P.mapHost(V + 0xd0000, buses, 0x10000, true);
 			P.unmap(V + 0x10000, 0x3000);                        // the program is unloaded
@@ -4856,7 +4866,11 @@ static int testSparseTree() {
 		f += check(hm2 && e.translate(hv2, phys) && phys == buses[0] && e.translate(hv2 + 0x1000, phys) && phys == buses[1],
 		           "tree: a later host mapping into an existing PT page reaches VRAM");
 		buses[3] |= 0x40;
-		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, hv + 0x20000, hv + 0x28000, buses.data(), false), "tree: a misaligned bus address is refused");
+		const uint32_t pagesBeforeBadMap = e.sp.pages();
+		const uint64_t badVa = hv + 0x20000;
+		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, badVa, badVa + 0x8000, buses.data(), false) &&
+		           e.sp.pages() == pagesBeforeBadMap && !e.translate(badVa, phys) && !e.translate(badVa + 0x2000, phys),
+		           "tree: a misaligned later bus page is refused before allocating tables or writing any PTE");
 	}
 
 	// Quota: the VA limit is the page quota. Nothing half-made, earlier mappings survive.
