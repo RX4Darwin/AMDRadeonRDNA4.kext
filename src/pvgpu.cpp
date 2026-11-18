@@ -6275,7 +6275,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint64_t targetAt = nowNs();
 
 	mPhaseNs[4] += targetAt - drawFrom;
-	// The colour attachment: a linear 32-bit or RGBA16Float texture, or a BGRA8 IOSurface (surfaceRange; its rows width * 4 bytes, bpr apart).
+	// The colour attachment: a linear texture of a known format, or an IOSurface of one (surfaceRange; its rows bpr apart).
 	uint64_t va = 0, len = 0;
 	uint32_t bpr = 0, width = 0, height = 0;
 	Surface surface;
@@ -6303,9 +6303,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		height = targetFormat || texHeight ? texHeight : static_cast<uint32_t>(len / bpr);
 		bgra = !targetFormat || targetFormat == 80 || targetFormat == 81;
 	}
-	else if (!why && !targetLevel && surfaceRange(task, targetId, surface) && known(surface.format) && surface.format != 70 && surface.format != 71) {
+	else if (!why && !targetLevel && surfaceRange(task, targetId, surface) && known(surface.format)) {
 		// BGRA8 (sRGB as unorm, as a texture of it: CAMetalLayer's drawables of Maps), or as the texture of that format (115:
-		// CoreAnimation's extended-range layers on Tahoe)
+		// CoreAnimation's extended-range layers on Tahoe; 70: WindowServer's RGBA8 copy of an inactive window's material, Safari's Downloads
+		// popover with another app in front: refused, the popover's background stayed empty and its text was drawn over itself, 2026-11-18)
 		bpr = surface.bytesPerRow;
 		width = surface.width;
 		height = surface.height;

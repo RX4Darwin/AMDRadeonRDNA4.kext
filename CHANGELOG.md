@@ -5,6 +5,11 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.3.1 (on `next`, no number yet)
 
+**Metal (`make PVGPU=1`)**
+- RGBA8 IOSurfaces as colour attachments (only BGRA8 ones before): WindowServer renders an inactive window's material into
+  one, and Safari's Downloads popover with another app in front kept an empty background, its text drawn over itself.
+  Card (Tahoe 26.6.2, 2026-11-18): the popover's background stays.
+
 ## 0.3.1 (2026-11-18)
 
 **Cards**
