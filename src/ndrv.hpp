@@ -34,6 +34,31 @@
 
 namespace Ndrv {
 
+// Serializes the essential IONDRVSupport route across Lilu's load callback
+// and the late-load retry. A failed attempt returns to Idle; only a successful
+// route enters Installed, so a transient symbol/patcher failure remains retryable.
+class RouteGate {
+public:
+	bool begin() {
+		uint32_t expected = Idle;
+		return __atomic_compare_exchange_n(&state, &expected, Routing, false,
+		                                   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+	}
+
+	void finish(bool success) {
+		__atomic_store_n(&state, success ? Installed : Idle, __ATOMIC_SEQ_CST);
+	}
+
+	bool installed() const {
+		return __atomic_load_n(&state, __ATOMIC_SEQ_CST) == Installed;
+	}
+
+private:
+	enum : uint32_t { Idle = 0, Routing = 1, Installed = 2 };
+	uint32_t state { Idle };
+};
+
+
 // csc selectors (IOMacOSVideo.h).
 enum : uint16_t {
 	// Status
