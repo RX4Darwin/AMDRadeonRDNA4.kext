@@ -81,6 +81,8 @@ public:
 	// The hardware acknowledged the TLB invalidation requested by the latest grab/bind.
 	// Until this is called, every grab for this binding continues to request a flush.
 	bool flushComplete(uintptr_t owner, uint32_t vmid);
+	// Permanently withhold a VMID until unbindAll() after reset when hardware state is uncertain.
+	bool quarantine(uintptr_t owner, uint32_t vmid);
 
 	// A job was queued on `vmid` and will signal `seq` on `domain`.
 	void noteSubmit(uint32_t vmid, uint32_t domain, uint32_t seq);
