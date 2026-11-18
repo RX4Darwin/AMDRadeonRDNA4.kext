@@ -76,7 +76,7 @@ the monitor. Every request that driver makes of its NDRV — Initialize, Open an
 each `csc` Control/Status call — goes through `IONDRVFramebuffer::doDriverIO`.
 
 1. **Hook** (`src/plugin.cpp`): Lilu routes `doDriverIO`. Framebuffers whose
-   PCI device is the Navi 48 family (`0x7550` RX 9070/9070 XT, `0x7551`
+   PCI device is the Navi 48 family (`0x7550` RX 9070 XT/9070/9070 GRE, `0x7551`
    R9700) are ours; everything else goes straight to Apple's code.
 2. **Device** (`src/device.cpp`): when Apple's driver opens our framebuffer,
    AMDRadeonRDNA4 reads the console geometry, maps BAR5, loads the VBIOS and IP

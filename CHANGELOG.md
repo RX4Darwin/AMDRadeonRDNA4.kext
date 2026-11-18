@@ -5,6 +5,13 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.3.0 (on `next`, no number yet)
 
+**Cards**
+- The RX 9070 GRE (device 0x7550, PCI revision 0xC2) is told apart: System Report and ioreg name it "AMD Radeon RX
+  9070 GRE", and the fake paravirtual GPU reports its 48 compute units (`src/sku.hpp`). It is the same Navi 48 with
+  12 GB on a 192-bit bus; the VRAM size, shader engines, display paths and the compute pool's place are read from the
+  card, and a second-display plan whose link the VBIOS does not have is refused. The revision is from a driver
+  database's hardware IDs, not from a card: not run on one yet.
+
 **Metal (`make PVGPU=1`)**
 - The blend colour on BGRA8 targets: drawn with the colour block's channel swap (`COMP_SWAP ALT`, how the host draws
   them in place and held since 2026-10), green took the alpha blend constant; no order of the `CB_BLEND_*` registers

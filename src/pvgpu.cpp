@@ -82,11 +82,11 @@ constexpr uint32_t kTargetId = 0xffffff;
 constexpr uint32_t kLevelsAt = 0x1000, kMiscPage = 0x5000;
 static_assert(kLevelsAt + RDNA4_MTLC_LEVEL_STRIDE * (RDNA4_MTLC_LEVELS - 2) + 0x400 + 32 * 16 <= kMiscPage, "the levels fit the state page");
 static_assert(0x400 + RDNA4_MTLC_TABLE_TEXTURES + RDNA4_MTLC_LEVEL_FIRST == kLevelsAt, "level 1 of the vertex stage's texture 0");
-// GpuCoreCount: the compute units of the card, 64 on the RX 9070 XT and 56 on
-// the RX 9070 (sku.hpp). From the product specification, not read from the
-// card: the kext's IP discovery has shader-engine and render-backend counts
-// only. publish() sets it from the GPU the nub hangs under; a VM without the
-// card keeps the XT's.
+// GpuCoreCount: the compute units of the card, 64 on the RX 9070 XT, 56 on
+// the RX 9070 and 48 on the RX 9070 GRE (sku.hpp). From the product
+// specification, not read from the card: the kext's IP discovery has
+// shader-engine and render-backend counts only. publish() sets it from the GPU
+// the nub hangs under; a VM without the card keeps the XT's.
 uint32_t gGpuCoreCount { Sku::computeUnits(Sku::kNavi48, Sku::kRevRx9070Xt) };
 uint32_t gLogLines { 0 };
 RDNA4PvNub *gNub { nullptr };
