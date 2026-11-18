@@ -113,9 +113,12 @@ void RDNA4Compute::publishResult(const char *feature, const char *value) {
 }
 
 uint32_t RDNA4Compute::requestedStage() {
-	// Stage 3 runs the power-management firmware, which the display clocks of
-	// a 3840x2160 pipe need (clk.cpp).
-	uint32_t stage = StageGfx;
+	// EXPERIMENTAL Tahoe compatibility diagnostic: default to the read-only
+	// survey so a boot test can separate NDRV/display takeover from GPU
+	// firmware bring-up. Explicit rdna4-compute=<stage> still overrides this;
+	// use rdna4-compute=3 to request the original GFX/SMU firmware stage.
+	// This conservative default is not a claim that full display clocks work.
+	uint32_t stage = StageSurvey;
 
 	(void)Trial::option("rdna4-compute", stage);
 
