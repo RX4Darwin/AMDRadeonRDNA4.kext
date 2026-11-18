@@ -60,6 +60,7 @@ jobs:
           test -d "$KEXT"
           BIN="$KEXT/Contents/MacOS/AMDRadeonRDNA4"
           file "$BIN"
+          lipo -archs "$BIN" | grep -qw x86_64
           # The PVGPU build must contain its paravirtual host implementation.
           strings "$BIN" > "$RUNNER_TEMP/pvgpu-strings.txt"
           grep -q 'AMDRadeonRDNA4: pvgpu:' "$RUNNER_TEMP/pvgpu-strings.txt"
@@ -79,15 +80,28 @@ jobs:
         run: |
           for variant in standard pvgpu; do
             KEXT="$RUNNER_TEMP/rdna4-artifacts/$variant/AMDRadeonRDNA4.kext"
-            /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KEXT/Contents/Info.plist"
-            /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$KEXT/Contents/Info.plist"
+            ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KEXT/Contents/Info.plist")
+            VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$KEXT/Contents/Info.plist")
+            test "$ID" = "com.hackintosh.AMDRadeonRDNA4"
+            test "$VERSION" = "0.3.1"
             file "$KEXT/Contents/MacOS/AMDRadeonRDNA4"
+            lipo -archs "$KEXT/Contents/MacOS/AMDRadeonRDNA4" | grep -qw x86_64
           done
 
-      - name: Upload standard and PVGPU build artifacts
+      - name: Label artifacts as build-validation only
+        run: |
+          cat > "$RUNNER_TEMP/rdna4-artifacts/BUILD-VALIDATION-ONLY.txt" <<'EOF'
+          These bundles are CI build/package outputs, not hardware-validated releases.
+          The PVGPU=1 bundle is experimental. The upstream Makefile documents a Tahoe
+          Restart/Shut Down freeze when PVGPU classes are present, even with rdna4-off=1.
+          Do not install the PVGPU bundle on a daily-use system.
+          Neither bundle is certified for macOS Tahoe 26.7.3 build 25G342 or an RX 9070 XT.
+          EOF
+
+      - name: Upload build-validation-only artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: AMDRadeonRDNA4-tahoe26-x86_64
+          name: AMDRadeonRDNA4-tahoe26-build-validation-only-x86_64
           path: ${{ runner.temp }}/rdna4-artifacts/
           if-no-files-found: error
           retention-days: 14
