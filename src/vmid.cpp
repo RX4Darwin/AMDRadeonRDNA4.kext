@@ -183,6 +183,17 @@ bool Pool::flushComplete(uintptr_t owner, uint32_t vmid) {
 	return true;
 }
 
+bool Pool::quarantine(uintptr_t owner, uint32_t vmid) {
+	if (!owner || vmid < kFirst || vmid > kLast)
+		return false;
+	Slot &s = slot[vmid];
+	if (s.owner != owner)
+		return false;
+	s = Slot {};
+	s.pinned = true;                 // unavailable to every client until unbindAll() after GPU reset
+	return true;
+}
+
 void Pool::noteSubmit(uint32_t vmid, uint32_t domain, uint32_t seq) {
 	if (vmid < kFirst || vmid > kLast || domain >= kMaxDomains)
 		return;
