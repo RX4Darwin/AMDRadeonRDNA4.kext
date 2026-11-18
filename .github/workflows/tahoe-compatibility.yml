@@ -1,0 +1,53 @@
+name: Tahoe compatibility build
+
+on:
+  push:
+    branches:
+      - tahoe-26.7.3-compat-audit
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-host-tests:
+    # Intel runner matches the kext's x86_64 target and runs macOS 26.
+    runs-on: macos-26-intel
+    timeout-minutes: 45
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Record runner environment
+        run: |
+          sw_vers
+          uname -a
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Run host-side regression tests
+        run: make test
+
+      - name: Build x86_64 release kext
+        run: make
+
+      - name: Verify built bundle metadata
+        run: |
+          KEXT="$(find Build -maxdepth 3 -type d -name 'AMDRadeonRDNA4.kext' -print -quit)"
+          test -n "$KEXT"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KEXT/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$KEXT/Contents/Info.plist"
+          file "$KEXT/Contents/MacOS/AMDRadeonRDNA4"
+
+      - name: Upload build artifact for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: AMDRadeonRDNA4-tahoe26-x86_64
+          path: Build/**/AMDRadeonRDNA4.kext
+          if-no-files-found: error
+          retention-days: 14
