@@ -227,6 +227,15 @@ re-registers the GPU after the essential NDRV route succeeds. Optional
 secondary-display, hot-plug and VSL hooks remain non-fatal and are attempted
 only after the primary route is installed.
 
+
+The retry state is now a small shared `Ndrv::RouteGate` state machine
+(`Idle -> Routing -> Installed`). Failed patch attempts return to `Idle`;
+only a successful primary route enters the terminal `Installed` state.
+The host regression suite tests that an in-progress attempt cannot be entered
+twice, a failed attempt can be retried, and a successful route cannot be
+patched a second time. This tests the retry bookkeeping, not Lilu's binary
+patching against the actual Tahoe kernel.
+
 This is a concrete load-order/recovery bug fix, not proof that build 25G342
 caused the original reboot. If the required symbol is genuinely absent or its
 ABI changed, retries cannot manufacture compatibility: the boot log must show
