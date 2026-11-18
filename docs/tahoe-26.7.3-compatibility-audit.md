@@ -100,3 +100,22 @@ The release 0.3.1 baseline is the sensible candidate for further testing; the 0.
 `next` branch changes the version/changelog but does not add a source-code fix for
 26.7.3. The next evidence needed is a successful build/test run, followed by a
 controlled test on the actual 26.7.3 machine.
+
+## Startup-path review
+
+The plugin's `pluginStart()` reads `rdna4-off=1` before registering its NDRV hooks.
+When that argument is present, it logs that it is disabled and returns. This is the
+project's documented kill switch and is suitable for a first, inert injection check.
+It does **not** test display takeover or GPU operation.
+
+Without the kill switch, `requestedStage()` defaults to `StageGfx` unless overridden
+by the project's trial-option mechanism. The device then proceeds into compute
+bring-up after the framebuffer path is reached. This makes the user's earlier
+0.3.0 reboot especially important to investigate: the plugin's startup is not merely
+a passive version check.
+
+For any eventual controlled boot test, retain a separate known-good EFI and use the
+documented `rdna4-off=1` kill switch for the first injection-only check. Remove the
+kill switch only after the inert boot is stable and the test configuration has been
+reviewed. Do not combine the first active test with `PVGPU=1`, extra experimental
+boot arguments, or changes to WhateverGreen.
