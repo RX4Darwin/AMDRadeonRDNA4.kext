@@ -657,7 +657,10 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	uint64_t physical = 0;
 	if (!gpuPhysical(mc, physical))
 		return false;
-	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
+	const uint64_t mapped = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	if (mapped < bytes)
+		return false;                         // the round-up itself overflowed
+	const uint64_t end = va + mapped;
 	if (end < va || end > GpuVm::kVaEnd)
 		return false;
 	if (c.sp) {
