@@ -4642,7 +4642,7 @@ static int testVmTableDifferential() {
 				const GpuVmTable::Access access { newEntry, newPhys, &P.nw };
 				GpuVmTable::Span span;
 				const uint64_t highPhysical = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
-				f += check(!GpuVmTable::mapVram(access, P.nw.pol, kTableBytes,
+				failures += check(!GpuVmTable::mapVram(access, P.nw.pol, kTableBytes,
 				                                GpuVm::kVaStart + 0x10000, GpuVm::kVaStart + 0x11000,
 				                                highPhysical, false, span) && span.firstPt == ~0ull,
 				           "dense: an aligned VRAM address above the hardware physical mask is rejected before writing PTEs");
