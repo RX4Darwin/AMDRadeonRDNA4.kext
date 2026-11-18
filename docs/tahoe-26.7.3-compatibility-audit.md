@@ -232,6 +232,15 @@ caused the original reboot. If the required symbol is genuinely absent or its
 ABI changed, retries cannot manufacture compatibility: the boot log must show
 the route error and the target binary's symbol table must be checked.
 
+
+The GFXOFF preflight also now distinguishes a successful SMU
+`DisallowGfxOff` response from a successful NVRAM breadcrumb clear. If the SMU
+wakes the GC but the breadcrumb cannot be cleared/read back, the log explicitly
+says it will retry on the next boot. This avoids reporting a persistent-state
+write as successful when the generic IORegistry/NVRAM path did not confirm it.
+The safety behavior is unchanged: failure to wake the SMU still holds GC
+register and doorbell access for the rest of the boot.
+
 ## 26.7.3 kernel-version comparison
 
 The final 26.7.3 build is `25G342`. Its catalogued XNU version is
