@@ -55,6 +55,7 @@ enum class Result {
 
 struct Grant {
 	uint32_t vmid { 0 };
+	uint64_t flushSeq { 0 };   // exact PTE-removal sequence this grant's invalidation must cover
 	bool rebind { false };     // the caller must write this client's page directory into the VMID's context (and IH LUT)
 	bool flush { false };      // the caller must invalidate the VMID's TLB (always true with rebind)
 	bool stolen { false };     // rebind took the VMID from another owner (for logs)
@@ -80,7 +81,7 @@ public:
 
 	// The hardware acknowledged the TLB invalidation requested by the latest grab/bind.
 	// Until this is called, every grab for this binding continues to request a flush.
-	bool flushComplete(uintptr_t owner, uint32_t vmid);
+	bool flushComplete(uintptr_t owner, uint32_t vmid, uint64_t coveredSeq);
 	// Permanently withhold a VMID until unbindAll() after reset when hardware state is uncertain.
 	bool quarantine(uintptr_t owner, uint32_t vmid);
 
