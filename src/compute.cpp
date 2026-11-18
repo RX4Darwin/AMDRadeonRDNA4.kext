@@ -1210,8 +1210,9 @@ void RDNA4Compute::gfxOffPreflight(bool attach) {
 	for (int attempt = 0; attempt < 2 && resp != kSmuRespOk; attempt++)
 		resp = smuSend(kSmuMsgDisallowGfxOff, 0, ret, 100);
 	if (resp == kSmuRespOk) {
-		gfxOffFlagSet(false);
-		CLOG("gfxoff: DisallowGfxOff -> 0x%02x; flag cleared", resp);
+		const bool cleared = gfxOffFlagSet(false);
+		CLOG("gfxoff: DisallowGfxOff -> 0x%02x; previous-boot flag %s", resp,
+		     cleared ? "cleared" : "could not be cleared (will retry next boot)");
 		return;
 	}
 	gcState = kGcHold;
@@ -1521,7 +1522,8 @@ bool RDNA4Compute::gfxOffAllow() {
 			ok = true;
 		} else {
 			gcState = kGcOn;
-			gfxOffFlagSet(false);
+			if (!gfxOffFlagSet(false))
+				CLOG("gfxoff: AllowGfxOff was rejected and the persistent flag could not be cleared; next boot will retry DisallowGfxOff");
 		}
 	}
 	IOLockUnlock(gcLock);
