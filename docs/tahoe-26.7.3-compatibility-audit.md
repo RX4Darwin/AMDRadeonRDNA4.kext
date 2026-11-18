@@ -50,10 +50,10 @@ VM test proves physical GPU compatibility.
 6. Only after the inert boot is stable, prepare a separate reversible test entry
    without `rdna4-off=1` for an active display-path test. Keep the known-good EFI
    untouched and retain the kill switch as the recovery path.
-6. Only patch source when the failure is tied to a specific incompatibility in the
+7. Only patch source when the failure is tied to a specific incompatibility in the
    26.7.3 kernel environment. Add a regression test where the affected code can be
    exercised on the host.
-7. Record physical-card results separately from VM results. Do not label the build
+8. Record physical-card results separately from VM results. Do not label the build
    26.7.3-compatible until it boots and the intended display path is verified on the
    RX 9070 XT.
 
