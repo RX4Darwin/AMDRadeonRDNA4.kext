@@ -61,3 +61,42 @@ VM test proves physical GPU compatibility.
   mean it is automatically compatible with every later kernel release.
 - The experimental paravirtual GPU build (`PVGPU=1`) is a separate feature path and
   must not be enabled merely to test basic framebuffer/display support.
+
+## Source comparison: 0.3.0 to 0.3.1
+
+The release merge from 0.3.0 to 0.3.1 contains eight commits. The changed source files
+are:
+
+- `src/sku.hpp`: adds RX 9070 GRE identification and compute-unit reporting.
+- `include/rdna4mtlc.h`, `src/pvdraw.hpp`, `src/pvgpu.cpp`, and
+  `tools/metal/m3/air2amdgpu.cpp`: extend the experimental paravirtual Metal path,
+  including additional Metal/Vulkan shader and draw support.
+- `src/compute.cpp` and `src/ih.cpp`: small changes in the compute and interrupt
+  paths; these require particular care because they interact with kernel/IOKit APIs.
+- `test/pvdraw-test.cpp`: adds a corresponding host-side test.
+- `userspace/moltenvk/install.sh`: adds a userspace configuration helper.
+
+This is a meaningful update from 0.3.0, but the release notes attribute most of the
+new work to GPU/Metal functionality, not to a Tahoe 26.7.3 kernel compatibility fix.
+The diff alone does not establish that the earlier boot failure is fixed.
+
+## Automated validation
+
+A GitHub Actions workflow has been added at
+`.github/workflows/tahoe-compatibility.yml`. It checks out submodules, records the
+runner OS and SDK, runs `make test`, builds the x86_64 kext, verifies bundle metadata,
+and uploads the bundle as an artifact.
+
+The workflow targets GitHub's `macos-26-intel` runner. The latest runner image
+information available during this audit reports macOS 26.7.2 (build 25G332), not the
+user's 26.7.3 (25G342). Therefore even a green run on that runner is useful build/test
+evidence but is **not** an exact-build 26.7.3 certification. The workflow has been
+committed but no run result is available yet.
+
+## Decision
+
+Do not add speculative kernel patches or bump the kext's version to imply support.
+The release 0.3.1 baseline is the sensible candidate for further testing; the 0.4.0
+`next` branch changes the version/changelog but does not add a source-code fix for
+26.7.3. The next evidence needed is a successful build/test run, followed by a
+controlled test on the actual 26.7.3 machine.
