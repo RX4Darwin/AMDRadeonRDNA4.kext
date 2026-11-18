@@ -4638,6 +4638,15 @@ static int testVmTableDifferential() {
 			pair = Pair {};
 			pair.setup(pol, fbOffset);
 			Pair &P = pair;
+			{
+				const GpuVmTable::Access access { newEntry, newPhys, &P.nw };
+				GpuVmTable::Span span;
+				const uint64_t highPhysical = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+				f += check(!GpuVmTable::mapVram(access, P.nw.pol, kTableBytes,
+				                                GpuVm::kVaStart + 0x10000, GpuVm::kVaStart + 0x11000,
+				                                highPhysical, false, span) && span.firstPt == ~0ull,
+				           "dense: an aligned VRAM address above the hardware physical mask is rejected before writing PTEs");
+			}
 
 			// 1. The boot self-test / rtOpen layout: ring (executable), EOP, rptr, wptr, fence, kernarg, then user buffers.
 			P.map(V + 0x0000, MC + 0x1a000000, 0x1000, true);
