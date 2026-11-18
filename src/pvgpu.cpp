@@ -477,6 +477,8 @@ public:
 	MsaaSurface *msaaSurface(uint32_t task, uint32_t tex, uint32_t width, uint32_t height, uint32_t samples, uint32_t bpp);
 	MsaaSurface *msaaTarget(uint32_t task, uint32_t tex, uint32_t width, uint32_t height, uint32_t bpr, uint32_t bpp);
 	void runDraw(uint32_t task, uint32_t target, uint32_t pipeline, const Draw &draw, const Bindings *stage);
+	bool indirectArgs(uint32_t task, uint32_t buffer, uint64_t offset, uint32_t (&args)[5]);
+	uint32_t viewedTexture(uint32_t task, uint32_t id);
 	void runCompute(uint32_t task, uint32_t pipeline, const Bindings &bound, const uint64_t *size);
 	// staged: a runtime buffer or the pool; an IOSurface the kernel writes held (prepared) until its rows are written back into it
 	struct StagedTexture { uint64_t handle, va; uint8_t *cpu; uint32_t rowBytes, pitch, rowLen, height; bool writable; OSObject *surface;
@@ -2837,6 +2839,7 @@ struct ExecTally {
 	uint32_t target, renderPipeline;    // Render: colour attachment 0's texture (writeDescriptor), setRenderPipelineState
 	uint32_t attachments[8];            // Render: all eight colour attachments' textures (writeDescriptor; 0 = none)
 	uint32_t resolve[8][2];             // Render: {texture, resolve texture} the pass resolves at its end (writeDescriptor; 0 = none)
+	uint32_t resolvable[8][2];          // the same for each attachment with a resolve texture, whatever its store action (setColorStoreAction)
 	RDNA4PvHost::Bindings stage[2];     // Render.setVertexBuffers, setFragmentBuffers
 	uint32_t blendColor[4];             // Render.setBlendColorRed: four floats' bits
 	uint64_t viewport[6];               // Render.setViewport: originX, originY, width, height, znear, zfar as doubles' bits
@@ -2855,7 +2858,7 @@ uint32_t drawBytes(uint32_t id) {
 	case 0x009: return 16;
 	case 0x000: case 0x00b: case 0x01d: return 20;
 	case 0x006: return 24;
-	case 0x002: return 28;
+	case 0x002: case 0x011: return 28;
 	case 0x008: return 32;
 	case 0x004: return 36;
 	case 0x00a: case 0x01c: return 48;
@@ -2892,9 +2895,11 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 				memcpy(&store, a + 0x16, 2);
 				// MTLStoreActionMultisampleResolve, StoreAndMultisampleResolve: the multisampled texture is drawn as one sample, so its
 				// resolve is a copy (level 0, as Blit.copyFromTexture's); the Sequoia and Macintosh wallpapers' drawables were never written (black)
-				const bool resolves = (store == 2 || store == 3) && resolve && !level && !resolveLevel;
+				const bool resolvable = resolve && !level && !resolveLevel, resolves = (store == 2 || store == 3) && resolvable;
 				t->resolve[k][0] = resolves ? t->attachments[k] : 0;
 				t->resolve[k][1] = resolves ? resolve : 0;
+				t->resolvable[k][0] = resolvable ? t->attachments[k] : 0;
+				t->resolvable[k][1] = resolvable ? resolve : 0;
 				t->attachments[k] = t->host->viewParent(t->task, t->attachments[k]);
 				if (level > 15)   // a level past 15: no attachment (its draws refused)
 					t->attachments[k] = 0;
@@ -2903,6 +2908,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			} else {
 				t->attachments[k] = 0;
 				t->resolve[k][0] = t->resolve[k][1] = 0;
+				t->resolvable[k][0] = t->resolvable[k][1] = 0;
 			}
 		if (t->target == (t->attachments[0] & kTargetId))
 			t->target = t->attachments[0];
@@ -2923,6 +2929,10 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			memcpy(&load, payload + 0x3c, 2);
 			memcpy(&clear, payload + 0x44, 4);
 		}
+		// a view's own texture: the buffers on the card are the texture's, which a shader may sample (MoltenVK draws vkQuake's depth
+		// through a view, 291, and its kernels and passes read the texture, 293)
+		t->depth = t->depth ? t->host->viewedTexture(t->task, t->depth) : 0;
+		t->stencil = t->stencil ? t->host->viewedTexture(t->task, t->stencil) : 0;
 		t->stencilState = 0;
 		t->stencilRef[0] = t->stencilRef[1] = 0;
 		if (t->stencil)
@@ -2935,6 +2945,19 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		if (t->depth && depthLines++ < 8)
 			pvstat("host: render: task %u: a pass with depth texture %u, load action %u, clear 0x%08x", t->task, t->depth, depthLoad,
 			       doubleAsFloat(depthClear));
+	}
+	else if (id == 0x066 && bytes >= 8) {
+		// Render.setColorStoreAction {u32 action, u32 index}: a store action given at the pass's end (MoltenVK starts its passes with an
+		// unknown one: vkQuake's world was never resolved into the texture its frame is made from, the world black); a resolve (2, 3) of an
+		// attachment with a resolve texture as writeDescriptor's, anything else none
+		uint32_t action, index;
+		memcpy(&action, payload, 4);
+		memcpy(&index, payload + 4, 4);
+		if (index < 8) {
+			const bool resolves = (action == 2 || action == 3) && t->resolvable[index][0];
+			t->resolve[index][0] = resolves ? t->resolvable[index][0] : 0;
+			t->resolve[index][1] = resolves ? t->resolvable[index][1] : 0;
+		}
 	}
 	else if (id == 0x068 && bytes >= 4)   // Render.setDepthStencilState {u32 state id}
 		memcpy(&t->stencilState, payload, 4);
@@ -2969,6 +2992,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		};
 		RDNA4PvHost::Draw d = {};
 		d.instances = 1;
+		bool culled = false;   // an indirect draw its arguments leave empty: nothing to draw, not a draw refused
 		if (id <= 0x005) {
 			const uint32_t w = id & 1 ? 2 : 8;   // the odd ones carry u16 fields
 			if (id <= 0x001) {
@@ -2988,7 +3012,23 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 			d.type = field(0, 2);
 			d.indexBytes = field(2, 2) ? 4 : 2;
 			d.indexBuffer = field(4, 4);
-			if (id == 0x00b || id == 0x01d || id == 0x00a || id == 0x01c) {
+			if (id == 0x011) {
+				// drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset: {u16 type, u16 index type,
+				// u32 index buffer, u32 indirect buffer, u64 index buffer offset, u64 indirect offset} (vkQuake's world, Tahoe 26.6.2); its
+				// arguments from the indirect buffer, which kernels before it wrote (none read: no vertices, not run)
+				uint32_t a[5] = {};
+
+				if (t->host->indirectArgs(t->task, field(8, 4), field(20, 8), a)) {
+					d.count = a[0];
+					d.instances = a[1];
+					d.indexOffset = field(12, 8) + a[2] * d.indexBytes;
+					d.start = a[3];   // the base vertex, signed as 0x00a's
+					d.baseInstance = a[4];
+					culled = !a[0] || !a[1];
+				} else {
+					d.count = 0;
+				}
+			} else if (id == 0x00b || id == 0x01d || id == 0x00a || id == 0x01c) {
 				const uint32_t w = id == 0x00b || id == 0x01d ? 2 : 8;
 				d.indexOffset = field(8, w);
 				d.count = field(8 + w, w);
@@ -3033,7 +3073,8 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		d.depth = t->depth;
 		memcpy(d.stencilRef, t->stencilRef, sizeof(d.stencilRef));
 		const uint64_t start = nowNs();
-		t->host->runDraw(t->task, t->target, t->renderPipeline, d, t->stage);
+		if (!culled)
+			t->host->runDraw(t->task, t->target, t->renderPipeline, d, t->stage);
 		t->host->noteDraw(nowNs() - start);
 	} else if ((id == 0x0cb || id == 0x07d || id == 0x06e) && bytes >= 8) {
 		// Compute.setBuffers, Render.setVertexBuffers, setFragmentBuffers {u32 first index, u32 count, count x {u32 resource id, u64 offset}}
@@ -3176,6 +3217,27 @@ void RDNA4PvHost::decodeExec(uint32_t task, const uint64_t (*chunks)[2], uint32_
 // M2: a buffer's GPU range, from the task's resource heap (SetResourceHeap: first 1 MiB at VA 0x1000; measured on the rig, 2026-10-21): 12-byte records
 // indexed by resource id, {u32 (descriptor bytes << 8) | type, u32 descriptor address, u32 0}; a buffer (type 1) has a 16-byte descriptor
 // {u64 length, u64 page number of its start} (mtlprobe's two 4 KiB buffers: {0x1000, 0x101}, {0x1000, 0x102}).
+// An indirect draw's MTLDrawIndexedPrimitivesIndirectArguments {u32 index count, instance count, first index, i32 base vertex, u32 base
+// instance} at offset of a buffer, read once the work before it is done (the kernels that wrote it run on the card into the guest's memory).
+// ponytail: the CPU waits for the ring at each indirect draw; DRAW_INDEX_INDIRECT from the buffer on the card when that is too slow.
+bool RDNA4PvHost::indirectArgs(uint32_t task, uint32_t buffer, uint64_t offset, uint32_t (&args)[5]) {
+	uint64_t va = 0, len = 0;
+
+	if (!bufferRange(task, buffer, &va, &len) || offset > len || len - offset < sizeof(args))
+		return false;
+	waitDraws();
+
+	const bool ok = readGuest(task, va + offset, reinterpret_cast<uint8_t *>(args), sizeof(args));
+	static uint32_t lines;   // diag: what the first indirect draws of a boot read
+
+	if (lines++ < 12 || gTalk)
+		pvstat("host: render: indirect draw: buffer %u +0x%llx (%llu bytes at 0x%llx): %s %u indices x %u from %u, base vertex %d, base instance %u",
+		       buffer, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(len), static_cast<unsigned long long>(va),
+		       ok ? "read" : "NOT read", args[0], args[1], args[2], static_cast<int32_t>(args[3]), args[4]);
+
+	return ok;
+}
+
 bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t *len) {
 	uint32_t rec[3];
 	uint64_t desc[2];
@@ -3429,7 +3491,7 @@ static void logPassDescriptor(const uint8_t *p, uint32_t bytes)
 
 // A render target that is a plain view of another texture (a heap type 8 or 27 record of kind 8, textureSource: level 0, slice 0, no
 // swizzle, the format its texture has): that texture, which the draws and clears then write; else the target itself. AppleMetalOpenGLRenderer
-// draws into a BGRA8 view of its drawable's IOSurface (Mixxx's waveforms, 2026-11-12).
+// draws into a BGRA8 view of its drawable's IOSurface (Mixxx's waveforms, 2026-11-12). (viewedTexture: any view's texture.)
 uint32_t RDNA4PvHost::viewParent(uint32_t task, uint32_t id) {
 	uint32_t rec[3], v[11] = {}, prec[3], d[14] = {};
 
@@ -4117,6 +4179,7 @@ struct RDNA4PvHost::TextureSource {
 	uint64_t sliceBytes = 0;
 	uint32_t swizzle = 0;                           // a view's MTLTextureSwizzleChannels (red .. alpha a byte each), 0: none
 	uint32_t samples = 1;                           // a multisampled texture's (2, 4 or 8): its memory holds them side by side in a row
+	uint32_t texture = 0;                           // the texture itself: a view's (MoltenVK's views of a depth attachment), else its own id
 	Surface surface;
 };
 
@@ -4145,6 +4208,7 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, 
 	}
 
 	out.type = rec[0] & 0xff;
+	out.texture = id;   // a view's parent sets it again below
 
 	// Textures of another's memory (heap types 8 and 27; AppleParavirtGPUMetal's PGSerializer, Tahoe 26.6.2), by their record's kind (its
 	// first dword). Legacy icons' bitmaps reach the icon service's shader as the first.
@@ -4379,7 +4443,10 @@ bool RDNA4PvHost::resolveMsaa(uint32_t task, uint32_t tex)
 		return false;
 
 	static uint32_t table[0x400 / 4];   // ponytail: one host, its work loop only
-	const uint32_t raw = ms->bpp == 8 ? 57 : 42, sel = 4 | 5 << 3 | 6 << 6 | 7 << 9;   // 16_16_16_16 float or 8_8_8_8 unorm, as stored
+	// 16_16_16_16 float or 8_8_8_8 unorm, as stored; 10_10_10_2 unorm for RGB10A2 and BGR10A2 (vkQuake's scene: averaged as 8-bit
+	// channels its bit fields were mixed)
+	const TextureFormat *fm = textureFormat(ts.format);
+	const uint32_t raw = fm && fm->gfx == 36 ? 36 : ms->bpp == 8 ? 57 : 42, sel = 4 | 5 << 3 | 6 << 6 | 7 << 9;
 
 	memset(table, 0, sizeof(table));
 	msaaImage(table + RDNA4_MTLC_TABLE_TEXTURES / 4, ms->gpu, raw, sel, ms->width, ms->height, ms->samples == 4 ? 2 : 1);
@@ -4407,6 +4474,17 @@ bool RDNA4PvHost::resolveMsaa(uint32_t task, uint32_t tex)
 	dropShadows(nullptr, task, ts.va);
 
 	return ok;
+}
+
+// The texture any view is made from, else the id itself: what a depth or stencil buffer on the card is kept by, which a shader may sample
+// through another view (viewParent takes plain views of the same format only: the draws go into their parent). Also of a view textureSource
+// refuses (a depth-only view of Depth32Float_Stencil8 has another pixel size), which notes its texture before it does.
+uint32_t RDNA4PvHost::viewedTexture(uint32_t task, uint32_t id) {
+	TextureSource src;
+
+	(void)textureSource(task, id, src);
+
+	return src.texture ? src.texture : id;
 }
 
 // Row y's first `bytes` bytes of a texture textureSource found; of a 3D texture, row y % height of slice y / height.
@@ -4498,16 +4576,29 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		const uint32_t format = src.format, usage = src.usage;
 		const TextureFormat *fm = textureFormat(format);
 		const uint32_t w = src.width, h = src.height, depth = src.depth, rowBytes = src.rowBytes;
-		// A depth texture a pass drew into (Depth32Float or Depth32Float_Stencil8: vkQuake's scene depth, read by its ambient-occlusion
-		// pass): on the card only (mStencil), so read there as the depth block wrote it, 64KB_2D at the target's size, Z_32_FLOAT as
-		// 32_FLOAT, the depth in x; after the draws into it (their caches flushed). ponytail: a clear still pending on it (clear >= 0) is not
-		// seen; a depth texture never drawn into is refused as before.
+		// A depth texture (Depth32Float, Depth32Float_Stencil8: vkQuake's scene depth, which its depth pyramid and ambient-occlusion pass
+		// read): on the card only (mStencil, kept by the texture a pass's view is of), so read there as the depth block wrote it: 64KB_2D at
+		// the target's size, Z_32_FLOAT as 32_FLOAT with the depth in x, after the draws into it (their caches flushed). One no draw has used
+		// yet is made, with its pass's clear (refused, the pyramid culled every surface). textureSource refuses such a private texture, with
+		// no guest memory to read, after noting its format, size and samples.
+		const bool depthTexture = (format == 252 || format == 260) && src.type == 2 && w && h && src.texture;
 		const StencilBuf *zb = nullptr;
-		if (ok && (format == 252 || format == 260))
+		if (depthTexture)
 			for (const StencilBuf &b : mStencil)
-				if (b.handle && b.task == task && b.tex == id && b.bpp == 4 && w <= b.width && h <= b.height)
+				if (b.handle && b.task == task && b.tex == src.texture && b.bpp == 4 && w <= b.width && h <= b.height)
 					zb = &b;
+		if (depthTexture && !zb)
+			zb = stencilFor(task, src.texture, 4, w, h, src.samples);
+		static uint32_t depthLines;   // diag: why a depth texture is not read from the card
+		if ((format == 252 || format == 260) && !zb && depthLines++ < 8) {
+			uint32_t held = 0;
+			for (const StencilBuf &b : mStencil)
+				held += b.handle && b.task == task ? 1 : 0;
+			pvstat("host: render: %s texture %u (resource %u, the texture %u, type %u): depth %ux%u x%u not on the card (textureSource %s, %u of "
+			       "the task's depth and stencil buffers there)", stageName, k, id, src.texture, src.type, w, h, src.samples, ok ? "ok" : "refused", held);
+		}
 		if (zb) {
+			ok = true;
 			waitDraws();
 			msaaImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, zb->gpu, 22, 4 | 1u << 9, w, h, static_cast<uint32_t>(__builtin_ctz(zb->samples)));
 			continue;
@@ -7587,7 +7678,7 @@ const RDNA4PvHost::Jit *RDNA4PvHost::translated(uint32_t task, uint64_t lib, con
 	j.used = mJitClock;
 	const bool shader = elf && elfLen >= 32 && !memcmp(elf, "RGFX", 4);
 	memset(j.launch, 0, sizeof(j.launch));
-	j.program = elf && !shader && buffers <= 8 ? load(elf, elfLen, name, j.launch) : 0;
+	j.program = elf && !shader && buffers <= RDNA4_MTLC_MAX_BUFFERS ? load(elf, elfLen, name, j.launch) : 0;   // as runCompute takes them
 	j.buffers = buffers;
 	j.written = written;
 	j.texturesWritten = texturesWritten;
@@ -7677,6 +7768,7 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 
 		if (texturesWritten)
 			pvlog("host: compute: \"%s\" writes textures 0x%x", name, texturesWritten);
+		pvlog("host: compute: \"%s\": %u buffers, writes 0x%x", name, nb, written);
 	} else {
 		for (unsigned i = 0; i < kMtlKernelCount && !prog; i++)
 			if (!strcmp(name, kMtlKernels[i].name)) {
@@ -7686,7 +7778,9 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 				from = "from the table";
 			}
 	}
-	bool ok = prog && nb <= 8 && size[3] * size[4] * size[5] <= 1024;
+	// up to buffer 30 as a draw's (MoltenVK's push constants at 28: vkQuake's kernels, which build its world, reported 29 and were refused);
+	// past 27 buffers the arguments outgrow a batch's slot (kDispatchArgs): dispatched alone
+	bool ok = prog && nb <= RDNA4_MTLC_MAX_BUFFERS && size[3] * size[4] * size[5] <= 1024;
 	for (unsigned d = 0; d < 3 && ok; d++)
 		ok = size[d] && size[d] < (1ull << 31) && size[d + 3];
 	if (!ok) {
@@ -7697,7 +7791,7 @@ void RDNA4PvHost::runCompute(uint32_t task, uint32_t pipeline, const Bindings &b
 	mUsedMapCount = mUsedShadowCount = 0;
 	mUsedChunks = 0;
 	mBuildSlot = ~0u;
-	uint64_t handle[8] = {}, gpu[8] = {}, va[8] = {}, bytes[8] = {};
+	uint64_t handle[RDNA4_MTLC_MAX_BUFFERS] = {}, gpu[RDNA4_MTLC_MAX_BUFFERS] = {}, va[RDNA4_MTLC_MAX_BUFFERS] = {}, bytes[RDNA4_MTLC_MAX_BUFFERS] = {};
 	for (unsigned b = 0; b < nb && ok; b++) {
 		uint64_t len = 0;
 

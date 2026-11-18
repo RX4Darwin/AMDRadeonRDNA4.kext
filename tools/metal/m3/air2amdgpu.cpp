@@ -673,6 +673,42 @@ static std::string legalize(Function &k) {
 			if (half)
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (tex.starts_with("atomic_fetch_") && tex.contains("_explicit_texture_2d.")) {
+			// atomic_fetch_<op>_explicit_texture_2d.{u,s}.v4i32 (texture, uint2 coord, uint4 value, i32 order, i32 scope): the old texel in x
+			// (vkQuake's depth pyramid ORs into an R32Uint image); the image atomic on .x, relaxed as Metal's texture atomics are
+			static const std::map<std::string, Intrinsic::ID> ops = {
+				{"or", Intrinsic::amdgcn_image_atomic_or_2d}, {"and", Intrinsic::amdgcn_image_atomic_and_2d},
+				{"xor", Intrinsic::amdgcn_image_atomic_xor_2d}, {"add", Intrinsic::amdgcn_image_atomic_add_2d},
+				{"sub", Intrinsic::amdgcn_image_atomic_sub_2d}, {"min", Intrinsic::amdgcn_image_atomic_umin_2d},
+				{"max", Intrinsic::amdgcn_image_atomic_umax_2d}};
+			StringRef rest = tex.drop_front(strlen("atomic_fetch_"));
+			const std::string what = rest.substr(0, rest.find("_explicit")).str();
+			auto it = ops.find(what);
+			auto *vt = dyn_cast<FixedVectorType>(c->getType());
+			if (it == ops.end() || !vt || !vt->getElementType()->isIntegerTy(32) || c->arg_size() < 3)
+				return f->getName().str() + " is not supported yet";
+			Intrinsic::ID op = it->second;   // an int texture's min and max are signed
+			if (tex.contains("_texture_2d.s.") && what == "min")
+				op = Intrinsic::amdgcn_image_atomic_smin_2d;
+			else if (tex.contains("_texture_2d.s.") && what == "max")
+				op = Intrinsic::amdgcn_image_atomic_smax_2d;
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(1);
+			Value *x = b.CreateZExtOrTrunc(b.CreateExtractElement(xy, uint64_t(0)), b.getInt32Ty());
+			Value *y = b.CreateZExtOrTrunc(b.CreateExtractElement(xy, 1), b.getInt32Ty());
+			Value *value = b.CreateExtractElement(c->getArgOperand(2), uint64_t(0));
+			Value *old = b.CreateIntrinsic(op, {b.getInt32Ty(), b.getInt32Ty(), t->getType()},
+			                               {value, x, y, t, b.getInt32(0), b.getInt32(0)});
+			r = b.CreateInsertElement(PoisonValue::get(vt), old, uint64_t(0));
+		} else if (tex.starts_with("read_texture_buffer_1d.v4f")) {
+			// (texture, uint coord, i32): a texture made from a buffer (vkQuake's palette), which the host gives as one linear row
+			const bool half = tex.starts_with("read_texture_buffer_1d.v4f16");
+			Value *t = descriptor(c->getArgOperand(0), 8), *x = b.CreateZExtOrTrunc(c->getArgOperand(1), b.getInt32Ty());
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
+			Value *texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {v4f, b.getInt32Ty(), t->getType()},
+			                                 {b.getInt32(15), x, b.getInt32(0), t, b.getInt32(0), b.getInt32(0)});
+			if (half)
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
 		} else if (tex.starts_with("sample_texture_1d_array.v4f")) {
 			// (texture, sampler, float x, uint slice, i1, int offset, i1 level, float bias or LOD, float min LOD, i32): WindowServer's colour
 			// lookup tables, one mip level, so read at level 0 (sample_lz); the slice is the T#'s array layer, given as a float.
@@ -1854,6 +1890,23 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 		// A constant buffer (AIR's address space 2) is cast here and made global memory again by legalize().
 		Value *table = kernel->getArg(nBuffers + 6);
 		const unsigned slot = static_cast<unsigned>(a.location);   // a texture's or sampler's index (0-15)
+		// An array of textures or samplers (array<texture2d, n>: AIR passes a pointer to n handles, byval) as such an array, made here as
+		// translateShader's resource() does: with the first T#'s address in its place, vkQuake's lightmap kernel (three textures) read the
+		// T#'s bytes as handles and the compute queue hung on the garbage descriptors, the desktop flashing until a reboot (2026-11-18).
+		auto *array = (a.role == Texture || a.role == Sampler) && air->getArg(i)->hasByValAttr() ? dyn_cast<ArrayType>(air->getParamByValType(i)) : nullptr;
+		if (array) {
+			const uint64_t stride = a.role == Texture ? 32 : 16;
+			const uint64_t at = (a.role == Texture ? RDNA4_MTLC_TABLE_TEXTURES : RDNA4_MTLC_TABLE_SAMPLERS) + stride * slot;
+			if (slot + array->getNumElements() > 16)
+				return "argument " + std::to_string(i) + ": an array of " + std::to_string(array->getNumElements()) + " past index 15";
+			IRBuilder<> entry(&kernel->getEntryBlock(), kernel->getEntryBlock().getFirstInsertionPt());
+			AllocaInst *handles = entry.CreateAlloca(array);
+			for (unsigned e = 0; e < array->getNumElements(); e++)
+				b.CreateStore(b.CreateIntToPtr(b.CreateAdd(table, b.getInt64(at + stride * e)), array->getElementType()),
+				              b.CreateConstInBoundsGEP2_32(array, handles, 0, e));
+			callArgs.push_back(handles);
+			continue;
+		}
 		Value *v = a.role == Buffer      ? b.CreateAddrSpaceCast(kernel->getArg(static_cast<unsigned>(a.location)), air->getArg(i)->getType())
 		         : a.role == Texture     ? b.CreateIntToPtr(b.CreateAdd(table, b.getInt64(RDNA4_MTLC_TABLE_TEXTURES + 32 * slot)), air->getArg(i)->getType())
 		         : a.role == Sampler     ? b.CreateIntToPtr(b.CreateAdd(table, b.getInt64(RDNA4_MTLC_TABLE_SAMPLERS + 16 * slot)), air->getArg(i)->getType())

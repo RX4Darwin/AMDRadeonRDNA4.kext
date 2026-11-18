@@ -24,11 +24,17 @@ otherwise). The newest version is on top. How versions and branches work is in `
     integer `texture2d_ms` reads; the layer a vertex shader writes dropped (MoltenVK's layered blit);
   - viewports in fractions of a pixel rounded to whole ones, draw 0x005's primitive type read as 16 bits (vkQuake's
     carry 0x0004 or 0x010a above it);
-  - depth textures (`Depth32Float`, `Depth32Float_Stencil8`) a pass drew into, sampled from the card's depth buffer.
-  Card (Tahoe 26.6.2, 2026-11-18): vkQuake started from LaunchServices runs; in 40 s of play no draw is left unrun
-  but about one a frame for the depth texture (that fix not run on the card yet). Two compute kernels still do not
-  translate (`read_texture_buffer_1d`, texture atomics). Failed libraries are now kept in
-  `/var/db/rdna4-air2amdgpu/failed` for translating them again by hand.
+  - depth textures (`Depth32Float`, `Depth32Float_Stencil8`) sampled from the card's depth buffer, which is kept by
+    the texture a pass's view is of, and made with the pass's clear when no draw has used it yet;
+  - its world: compute kernels with up to 31 buffers (8 before) and with arrays of textures (with the first
+    descriptor's address in their place, the lightmap kernel hung the compute queue), texture atomics (the depth
+    pyramid), texture-buffer reads; indirect indexed draws (0x011), their arguments read once the culling kernels
+    that write them are done; resolves set at a pass's end (`setColorStoreAction`, how MoltenVK ends its passes),
+    RGB10A2 samples resolved in their own format.
+  Card (Tahoe 26.6.2, 2026-11-18): vkQuake started from the Finder plays, its world in the right colours; no draw
+  left unrun but the culled ones. Not measured: its frame rate (each indirect draw waits for the card; the depth
+  pyramid takes about 22 ms). Failed libraries are now kept in `/var/db/rdna4-air2amdgpu/failed` for translating
+  them again by hand.
 - A shadow of an IOSurface kept on the card is refreshed from the card copy, not from its memory (it had the pixels
   from before the draws). Safari's hovered tab still flickers (vertical lines).
 - The blend colour on BGRA8 targets: drawn with the colour block's channel swap (`COMP_SWAP ALT`, how the host draws
