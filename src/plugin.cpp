@@ -1731,6 +1731,17 @@ void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
 	const size_t size = gPatcher->updateRunningInfo(kextIONDRVSupport.loadIndex, ndrv->address, ndrv->size);
 	gPatcher->clearError();
 	processKext(nullptr, *gPatcher, kextIONDRVSupport.loadIndex, ndrv->address, size);
+	if (!__atomic_load_n(&ndrvRouted, __ATOMIC_SEQ_CST)) {
+		if (up < 120ull * NSEC_PER_SEC) {
+			FBLOG("ndrv: primary route is not installed yet; retrying late-load check");
+			uint64_t deadline;
+			clock_interval_to_deadline(2, kSecondScale, &deadline);
+			thread_call_enter_delayed(gLateNdrv, deadline);
+		} else {
+			FBLOG("ndrv: primary route could not be installed within 120 s; leaving Apple's framebuffer untouched");
+		}
+		return;
+	}
 	// The GPU again: IONDRVFramebuffer matches again (its first instance did not start without our routes).
 	OSDictionary *match = IOService::serviceMatching("IOPCIDevice");
 	OSIterator *it = match ? IOService::getMatchingServices(match) : nullptr;
