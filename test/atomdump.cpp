@@ -4025,7 +4025,7 @@ static int testVmidPool() {
 	           "vmid: a newer PTE-removal sequence extends an outstanding flush");
 	f += check(!pool.flushComplete(1, v1, flush3),
 	           "vmid: an acknowledgement for an older sequence cannot clear a newer pending flush");
-	f += check(pool.flushComplete(1, v1), "vmid: the flush is cleared only after acknowledgement");
+	f += check(pool.flushComplete(1, v1, g.flushSeq), "vmid: the flush is cleared only after acknowledgement");
 	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && !g.flush, "vmid: acknowledged latest flush is not repeated");
 	// Negative control: a pool that ignored tlbSeq or acknowledged before hardware completion would fail these checks.
 
