@@ -285,7 +285,7 @@ uint32_t RDNA4Compute::vmAcquire(RtClient &c) {
 	 * remains owned and flush-pending, so the next grab retries instead of submitting with stale TLBs. */
 	if (g.flush) {
 		if (!vmInvalidate(g.vmid, g.rebind ? "vmpool rebind" : "vmpool flush") ||
-		    !vmPool.flushComplete(reinterpret_cast<uintptr_t>(&c), g.vmid)) {
+		    !vmPool.flushComplete(reinterpret_cast<uintptr_t>(&c), g.vmid, g.flushSeq)) {
 			SLOG("VMID %u: client slot %d submission refused; TLB invalidation remains pending", g.vmid,
 			     static_cast<int>(&c - clients));
 			return 0;
