@@ -2827,7 +2827,7 @@ static int testNdrvRouteGate() {
 	failures += check(!gate.begin(), "ndrv route gate: installed route was allowed to patch twice");
 
 	if (!failures)
-		printf("ndrv route gate: failed attempts remain retryable; successful route is terminal\\n");
+		printf("ndrv route gate: failed attempts remain retryable; successful route is terminal\n");
 	return failures;
 }
 
