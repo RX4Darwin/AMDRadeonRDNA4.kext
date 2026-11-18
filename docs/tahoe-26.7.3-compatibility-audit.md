@@ -94,10 +94,13 @@ PVGPU artifact is checked for its paravirtual-host implementation, x86_64
 architecture, bundle metadata, and all ten firmware blobs required for stage-7
 compute bring-up.
 
-The latest runner image information available during this audit reports macOS
-26.7.2 (build 25G332), not the user's 26.7.3 (25G342). Therefore even a green run
-is useful compile/test evidence but is **not** exact-build 26.7.3 certification.
-Neither build variant is tested against a physical RX 9070 XT by GitHub Actions.
+The completed dual-variant run 44395678253 actually ran on macOS 26.6.1
+(build 25G76), Darwin 25.6.0, not the user's 26.7.3 (25G342). It passed host tests,
+firmware fetching, both kext builds, metadata/architecture checks, and artifact
+upload. Therefore it is useful compile/test evidence but is **not** exact-build
+26.7.3 certification. Neither build variant is tested against a physical RX 9070 XT
+by GitHub Actions. A subsequent workflow edit only removes a harmless broken-pipe
+diagnostic from the binary-string check and is being revalidated.
 
 ## Decision
 
