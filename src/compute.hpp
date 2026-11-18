@@ -148,7 +148,7 @@ public:
 		StageKernel   = 7,
 	};
 
-	// rdna4-compute=<stage>, clamped to StageKernel. StageGfx when absent.
+	// rdna4-compute=<stage>, clamped to StageKernel. StageGfx when absent; StageSurvey is explicit (rdna4-compute=1).
 	static uint32_t requestedStage();
 	static bool requestedVm();
 	static bool requestedPowerManagement();
