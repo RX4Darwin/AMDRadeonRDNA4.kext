@@ -79,8 +79,9 @@ public:
 	// `owner` must be non-zero.
 	Result grab(uintptr_t owner, uint64_t pd, uint64_t tlbSeq, Grant &out);
 
-	// The hardware acknowledged the TLB invalidation requested by the latest grab/bind.
-	// Until this is called, every grab for this binding continues to request a flush.
+	// The hardware acknowledged the TLB invalidation requested by a grab/bind.
+	// coveredSeq must match that grant's flushSeq; a newer PTE-removal sequence
+	// cannot be marked covered by an older in-flight invalidation.
 	bool flushComplete(uintptr_t owner, uint32_t vmid, uint64_t coveredSeq);
 	// Permanently withhold a VMID until unbindAll() after reset when hardware state is uncertain.
 	bool quarantine(uintptr_t owner, uint32_t vmid);
