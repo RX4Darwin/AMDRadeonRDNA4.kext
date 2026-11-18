@@ -13,8 +13,10 @@
 //  up, the normal driver path needs no GPU reset, so the display that
 //  RDNA4Device drives stays lit:
 //
-//    stage 1  survey    read-only: state of every engine, both hubs, the PSP,
-//                       and the VRAM layout the compute side can use.
+//    stage 1  survey    inspect engine, hub, PSP and VRAM state without
+//                       defensive engine quiescing or firmware bring-up.
+//                       The GFXOFF safety preflight may ask the SMU to
+//                       disallow GFXOFF if the previous boot left it flagged.
 //    stage 2  psp       sOS components through the bootloader, the GPCOM
 //                       ring, LOAD_TOC, then the SMU firmware (LOAD_IP_FW);
 //                       verified by the SMU answering its mailbox.
