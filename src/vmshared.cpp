@@ -270,9 +270,11 @@ uint32_t RDNA4Compute::vmAcquire(RtClient &c) {
 		}
 		c.vmid = g.vmid;
 		if (!vmContextInit(c)) {
-			SLOG("VMID %u: context programming for client slot %d failed", g.vmid, static_cast<int>(&c - clients));
-			uint32_t dropped = 0;
-			vmPool.forget(reinterpret_cast<uintptr_t>(&c), true, dropped);
+			SLOG("VMID %u: context programming for client slot %d failed; quarantining until GPU reset", g.vmid, static_cast<int>(&c - clients));
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + g.vmid - 1 }, 0);
+			wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, 0);
+			vmPool.quarantine(reinterpret_cast<uintptr_t>(&c), g.vmid);
+			c.vmid = 0;
 			return 0;
 		}
 		wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, c.pasid);      // IH_VMID_n_LUT = PASID: a fault vector from this VMID names the client
@@ -304,7 +306,12 @@ void RDNA4Compute::vmReleaseVmids(RtClient &c) {
 			continue;
 		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + v - 1 }, 0);
 		wr(IpDiscovery::HwOsssys, Reg { 0, v }, 0);
-		(void)vmInvalidate(v, "vmpool release");
+		if (!vmInvalidate(v, "vmpool release")) {
+			/* A stale translation may still name memory the client is about to free.
+			 * Keep this hardware VMID unavailable until a GPU reset clears its TLB. */
+			SLOG("VMID %u: release invalidation failed; quarantining until GPU reset", v);
+			vmPool.quarantine(owner, v);
+		}
 	}
 	uint32_t first = 0;
 	vmPool.forget(owner, true, first);
