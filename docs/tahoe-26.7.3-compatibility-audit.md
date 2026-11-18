@@ -205,3 +205,45 @@ The `rdna4-compute=1` option selects a read-only *compute survey*; it does not
 disable the Lilu plugin's display hooks. Only `rdna4-off=1` makes plugin startup
 return before registering the display hooks. These two options test different
 things and must not be described as equivalent.
+
+## Tahoe load-order hardening
+
+The primary display hook is `IONDRVFramebuffer::doDriverIO` in
+`IONDRVSupport`. Previously, `processKext()` marked the hook as installed
+before asking Lilu's `routeMultiple()` to install it. If symbol resolution or
+routing failed on the first callback, the late-load recovery path saw the
+"already routed" flag and stopped retrying. That could leave the stock
+framebuffer running without the plugin's NDRV handler even though the kext
+itself had loaded.
+
+The compatibility branch now keeps separate routing/in-progress and
+successfully-routed states. A failed primary route leaves the retry available;
+the late-load check retries every two seconds, for up to 120 seconds, and only
+re-registers the GPU after the essential NDRV route succeeds. Optional
+secondary-display, hot-plug and VSL hooks remain non-fatal and are attempted
+only after the primary route is installed.
+
+This is a concrete load-order/recovery bug fix, not proof that build 25G342
+caused the original reboot. If the required symbol is genuinely absent or its
+ABI changed, retries cannot manufacture compatibility: the boot log must show
+the route error and the target binary's symbol table must be checked.
+
+## 26.7.3 kernel-version comparison
+
+The final 26.7.3 build is `25G342`. Its catalogued XNU version is
+`25.6.0 (xnu-12377.161.15.701.48~2)`, the same XNU version catalogued for
+26.7.2 build `25G332`. The final 26.7.3 build differs from its own RC
+`25G416` in XNU build metadata, but the final XNU version matches 26.7.2.
+This reduces the likelihood of a broad KPI/XNU-version change between 26.7.2
+and 26.7.3; it does not rule out changes in individual system binaries or
+hardware-specific behavior.
+
+References:
+- https://ravel.dbg.re/build/25G342
+- https://ravel.dbg.re/build/25G332
+- https://support.apple.com/en-us/149719
+
+The GitHub Actions runner currently reports macOS 26.6.1 build `25G76` and
+SDK 26.5. Its successful builds validate compilation and host tests only.
+They are not a 26.7.3 runtime test. Exact-build and physical-card validation
+remain outstanding.
