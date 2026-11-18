@@ -1580,21 +1580,29 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index, mach_vm_addre
 	patcher.clearError();
 }
 
-bool ndrvRouted = false;   // processKext ran: by Lilu's load notice, or by lateNdrvCheck
+bool ndrvRouted = false;    // the essential NDRV route is installed
+bool ndrvRouting = false;   // serializes Lilu's load callback and the late-load retry
 
 void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address,
                  size_t size) {
-	if (index != kextIONDRVSupport.loadIndex || __atomic_exchange_n(&ndrvRouted, true, __ATOMIC_SEQ_CST))
+	if (index != kextIONDRVSupport.loadIndex ||
+	    __atomic_load_n(&ndrvRouted, __ATOMIC_SEQ_CST) ||
+	    __atomic_exchange_n(&ndrvRouting, true, __ATOMIC_SEQ_CST))
 		return;
 	KernelPatcher::RouteRequest request {
 		"__ZN17IONDRVFramebuffer10doDriverIOEjPvjj", wrapDoDriverIO, orgDoDriverIO,
 	};
-	if (patcher.routeMultiple(index, &request, 1, address, size))
-		FBLOG("ndrv: routed IONDRVFramebuffer::doDriverIO");
-	else
-		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d)",
+	if (!patcher.routeMultiple(index, &request, 1, address, size)) {
+		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d); leaving late-load retry armed",
 		      patcher.getError());
+		patcher.clearError();
+		__atomic_store_n(&ndrvRouting, false, __ATOMIC_SEQ_CST);
+		return;
+	}
+	FBLOG("ndrv: routed IONDRVFramebuffer::doDriverIO");
 	patcher.clearError();
+	__atomic_store_n(&ndrvRouted, true, __ATOMIC_SEQ_CST);
+	__atomic_store_n(&ndrvRouting, false, __ATOMIC_SEQ_CST);
 	// The second display and its hot-plug are on unless turned off: lit at
 	// boot, mode switching, display sleep and hot-plug ran on the card for an
 	// HDMI monitor on either connector (2026-10-04..06). Not in VM test
