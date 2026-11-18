@@ -2,11 +2,11 @@
 //  compute.cpp
 //  AMDRadeonRDNA4
 //
-//  See compute.hpp. Stage 1 (survey) only reads compute/display status
-//  registers; it does not make the whole plugin inert or disable its display
-//  hooks. Stage 2 is the first compute stage to write: PSP mailbox/ring
-//  registers, the HDP flush, and the compute pool in VRAM.
-//
+//  See compute.hpp. Stage 1 (survey) reads compute/display status registers
+//  and deliberately skips defensive engine quiescing and firmware bring-up.
+//  The GFXOFF safety preflight may send DisallowGfxOff to the SMU if a prior
+//  boot left that state flagged; it does not reprogram the display or GC
+//  engines. Stage 2 is the first compute stage to start firmware bring-up.
 
 #include "codeobj.hpp"
 #include "trial.hpp"
@@ -477,9 +477,18 @@ uint32_t RDNA4Compute::start(const Env &e, uint32_t stage) {
 		return StageOff;
 	if (!survey())
 		return StageOff;
-	// A warm restart can leave the GOP's engine state live. Survey first so a
-	// cold card's reset values never cause writes into engines still in reset.
-	defensiveStart();
+	// Stage 1 is the compatibility-isolation path: inspect the existing
+	// hardware state, but do not quiesce/reprogram a live engine. The
+	// GFXOFF preflight above is retained because reading GC registers while
+	// GFXOFF is still allowed can hang the machine; it only asks the SMU to
+	// disallow GFXOFF when the previous-boot breadcrumb says it may be active.
+	if (stage > StageSurvey) {
+		// A warm restart can leave the GOP's engine state live. Survey first
+		// so a cold card's reset values never cause writes into engines in reset.
+		defensiveStart();
+	} else {
+		CLOG("survey-only: skipping defensive engine quiesce and firmware bring-up");
+	}
 	choosePool();
 	logSurvey();
 	publishSurvey();
