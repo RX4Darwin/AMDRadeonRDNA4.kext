@@ -3987,14 +3987,21 @@ static int testVmidPool() {
 	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.rebind && g.flush && !g.stolen &&
 	           g.vmid >= kFirst && g.vmid <= kLast, "vmid: first grab binds a fresh VMID");
 	const uint32_t v1 = g.vmid;
+	f += check(!pool.flushComplete(2, v1), "vmid: another owner cannot acknowledge this VMID's flush");
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid == v1 && !g.rebind && g.flush,
+	           "vmid: a bind keeps its flush pending until hardware acknowledgement");
+	f += check(pool.flushComplete(1, v1), "vmid: successful hardware invalidation acknowledges the bind flush");
 	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid == v1 && !g.rebind && !g.flush,
-	           "vmid: same owner and PD reuse the VMID with no rebind and no flush");
+	           "vmid: same owner and PD reuse the acknowledged VMID without another flush");
 
-	// A flush is owed only when the client removed PTEs (its tlbSeq moved) since the last flush.
+	// A flush is owed only when the client removed PTEs (its tlbSeq moved) since the last acknowledged flush.
 	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.vmid == v1 && !g.rebind && g.flush,
 	           "vmid: tlbSeq advanced -> flush, still no rebind");
-	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && !g.flush, "vmid: the flush is owed once");
-	// Negative control: a pool that ignored tlbSeq would fail the two checks above.
+	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.flush,
+	           "vmid: failed/unacknowledged flush remains pending on retry");
+	f += check(pool.flushComplete(1, v1), "vmid: the flush is cleared only after acknowledgement");
+	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && !g.flush, "vmid: acknowledged flush is not repeated");
+	// Negative control: a pool that ignored tlbSeq or acknowledged before hardware completion would fail these checks.
 
 	// A flush does not need an idle VMID (an invalidation only drops cached translations).
 	pool.noteSubmit(v1, 0, 10);
