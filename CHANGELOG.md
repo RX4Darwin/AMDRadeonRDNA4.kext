@@ -35,6 +35,13 @@ otherwise). The newest version is on top. How versions and branches work is in `
   left unrun but the culled ones. Not measured: its frame rate (each indirect draw waits for the card; the depth
   pyramid takes about 22 ms). Failed libraries are now kept in `/var/db/rdna4-air2amdgpu/failed` for translating
   them again by hand.
+- Faster 3D: vkQuake's `timedemo demo1` at 4K, 30.0 frames a second with vsync and 41.8 without, now 43.7 and 43.5.
+  An indirect draw waits for the card only when a pending dispatch writes its arguments (it waited at each: 2200 of
+  the host's 2700 waits in 5 s); clears of buffers on the card (depth, multisampled colour) are drawn by the colour
+  block as one linear R32Uint image between idle barriers, not filled by CP DMA (681 ms of each 5 s on the card, now
+  211 ms; 37-39 frames a second for 41 with only this changed); the waits for a kernel poll for 20 ms before they
+  sleep (2 ms before; 42.0 for 43.5). Left: the depth-pyramid kernel takes 8 ms a frame on the card (its mip
+  textures are in the Mac's memory).
 - A shadow of an IOSurface kept on the card is refreshed from the card copy, not from its memory (it had the pixels
   from before the draws). Safari's hovered tab still flickers (vertical lines).
 - The blend colour on BGRA8 targets: drawn with the colour block's channel swap (`COMP_SWAP ALT`, how the host draws

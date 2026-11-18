@@ -758,7 +758,7 @@ private:
 	bool clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_t bytes, uint32_t pattern);
 	GfxBuffers mFillCode {};   // nggfill.s and psfill.s, as a shader pair's slot
 	bool clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_t pitch, uint32_t width, uint32_t height, uint32_t format, bool swap,
-	                 const uint64_t rgba[4]);
+	                 const uint64_t rgba[4], const uint32_t *fill = nullptr);
 	// Copies by the card (CP DMA in the graphics ring, after the work before them), each with an IB of its own of kDmaIbBytes, taken in turn.
 	static constexpr uint32_t kDmaSlots = 8, kDmaIbBytes = 64 * 1024;
 	static constexpr uint32_t kDmaRows = kDmaIbBytes / 28 - 8;   // DMA_DATA packets an IB holds, the idle barrier besides
@@ -3218,14 +3218,15 @@ void RDNA4PvHost::decodeExec(uint32_t task, const uint64_t (*chunks)[2], uint32_
 // indexed by resource id, {u32 (descriptor bytes << 8) | type, u32 descriptor address, u32 0}; a buffer (type 1) has a 16-byte descriptor
 // {u64 length, u64 page number of its start} (mtlprobe's two 4 KiB buffers: {0x1000, 0x101}, {0x1000, 0x102}).
 // An indirect draw's MTLDrawIndexedPrimitivesIndirectArguments {u32 index count, instance count, first index, i32 base vertex, u32 base
-// instance} at offset of a buffer, read once the work before it is done (the kernels that wrote it run on the card into the guest's memory).
-// ponytail: the CPU waits for the ring at each indirect draw; DRAW_INDEX_INDIRECT from the buffer on the card when that is too slow.
+// instance} at offset of a buffer, read from the guest's memory: copyGuest waits for the batch first when a dispatch in it writes them
+// (vkQuake's culling kernels; a dispatch run alone is done when it returns). Waiting at each, its world drew at 31 frames a second, 2200 of
+// the host's 2700 waits in 5 s (2026-11-18). ponytail: a draw's own writes to the buffer are not seen (none so far); DRAW_INDEX_INDIRECT
+// from the buffer on the card when the frame's one wait is too slow.
 bool RDNA4PvHost::indirectArgs(uint32_t task, uint32_t buffer, uint64_t offset, uint32_t (&args)[5]) {
 	uint64_t va = 0, len = 0;
 
 	if (!bufferRange(task, buffer, &va, &len) || offset > len || len - offset < sizeof(args))
 		return false;
-	waitDraws();
 
 	const bool ok = readGuest(task, va + offset, reinterpret_cast<uint8_t *>(args), sizeof(args));
 	static uint32_t lines;   // diag: what the first indirect draws of a boot read
@@ -3808,7 +3809,18 @@ bool RDNA4PvHost::clearOnCard(uint32_t task, uint32_t tex, uint64_t gpu, uint64_
 	uint32_t n = 0;
 	uint64_t at = 0;
 
-	if (!mGfxIb.cpu || !bytes || (bytes & 3) || !(n = idleBarrier(ib)))
+	if (!mGfxIb.cpu || !bytes || (bytes & 3))
+		return false;
+
+	// By the colour block, as a linear R32Uint image of 64 KiB rows: one value everywhere does not see the tiling, and the buffers on the
+	// card are whole such rows. CP DMA below fills about 80 GB/s: vkQuake's 4K multisampled depth and colour, cleared some 4.6 times a
+	// frame, took 681 ms of each 5 s on the card, 211 ms so; its timedemo 37-39 frames a second for 41 (2026-11-18).
+	const uint32_t fill[4] = {pattern, pattern, pattern, pattern};
+
+	if (!(bytes & 0xffff) && !(gpu & 0xff) && bytes >> 16 <= 16384 && clearByDraw(task, tex, gpu, 16384, 16384, static_cast<uint32_t>(bytes >> 16), 53, false, nullptr, fill))
+		return true;
+
+	if (!(n = idleBarrier(ib)))
 		return false;
 
 	const bool timed = profiling();
@@ -3853,8 +3865,11 @@ static uint32_t *streamReg(uint32_t *ib, uint32_t n, uint32_t opcode, uint32_t r
 // the host's draws, drawn by nggfill.s and psfill.s with the colour (Metal's doubles, as floats) in the pixel shader's user SGPRs, the colour
 // block converting it to the target's format. CP DMA filled 23 GB/s, and WindowServer clears each frame's 4K target and its intermediate
 // textures: 9.8 GB in five seconds of a window drag. Left in flight like a draw. False when the target is not one the colour block writes.
+// With `fill` (clearOnCard's): its four 32-bit values exported as they are (an integer target writes them unchanged; rgba unused), between
+// idle barriers: after the work before it with its caches written back (the depth block's lines of the buffer would land on the fill), and
+// done with the colour block's written back before the draws after it (the depth block reads it).
 bool RDNA4PvHost::clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_t pitch, uint32_t width, uint32_t height, uint32_t format,
-                              bool swap, const uint64_t rgba[4])
+                              bool swap, const uint64_t rgba[4], const uint32_t *fill)
 {
 	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];   // ponytail: one host, draws run one at a time on its work loop
 	const TextureFormat *fm = textureFormat(format);
@@ -3937,13 +3952,26 @@ bool RDNA4PvHost::clearByDraw(uint32_t task, uint32_t tex, uint64_t gpu, uint32_
 		ib[i] = 0xc0047600u;
 		ib[i + 1] = 0x0c;
 		for (uint32_t c = 0; c < 4; c++)
-			ib[i + 2 + c] = doubleAsFloat(rgba[c]);
+			ib[i + 2 + c] = fill ? fill[c] : doubleAsFloat(rgba[c]);
 		n += 6;
 		coloured = true;
 	}
 
 	if (!coloured)
 		return false;
+
+	if (fill) {
+		uint32_t idle[16];
+		const uint32_t m = idleBarrier(idle);
+
+		if (!m || m > sizeof(idle) / 4 || n + 2 * m > sizeof(ib) / 4)
+			return false;
+
+		memmove(ib + m, ib, n * 4);
+		memcpy(ib, idle, m * 4);
+		n += m;
+		n += idleBarrier(ib + n);
+	}
 
 	if (profiling()) {   // timed: its start and end
 		memmove(ib + 8, ib, n * 4);

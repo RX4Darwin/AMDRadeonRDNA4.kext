@@ -56,6 +56,7 @@ static inline uint32_t colourInfo(uint32_t format, bool swap) {
 	case 103: return 0x0003040bu;   // RG32Uint: 32_32 UINT, BLEND_BYPASS as Mesa's for integers (WindowServer's brim_init_lpf, Tahoe)
 	case 104: return 0x0003050bu;   // RG32Sint
 	case 63: return 0x00030405u;    // RG16Uint: 16_16 UINT, BLEND_BYPASS (WindowServer's brim_init_lpf at 4K, Tahoe)
+	case 53: return 0x00030404u;    // R32Uint: 32 UINT, BLEND_BYPASS (clearOnCard's fills: the bits as exported)
 	default: return (swap ? 0x0002880au : 0x0002800au) | (format == 71 || format == 81 ? 6u << 8 : 0u);
 	}
 }
