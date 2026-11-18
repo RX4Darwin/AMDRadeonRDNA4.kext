@@ -312,6 +312,14 @@ Optionally, keep each boot's kernel log in `/var/log/rdna4`:
 sudo userspace/rdna4-logd/install.sh
 ```
 
+For Vulkan apps through MoltenVK (vkQuake): run as yourself, not with sudo, once. It turns MoltenVK's Metal argument
+buffers off in your login session; Apple's paravirtual Metal driver has none, and MoltenVK aborts at start without it.
+`--remove` undoes it.
+
+```bash
+userspace/moltenvk/install.sh
+```
+
 Then boot with these boot-args (in OpenCore's `boot-args`, next to the others). `rdna4-pvgpu-delay=5` publishes the
 device early; it waits for the card, up to 2 minutes after the delay:
 

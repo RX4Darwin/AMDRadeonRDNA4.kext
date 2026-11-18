@@ -19,6 +19,9 @@ int main() {
 		CHECK(wholeDouble(bitsOf(0.0), v) && v == 0);
 		CHECK(wholeDouble(bitsOf(-0.0), v) && v == 0);
 		CHECK(wholeDouble(bitsOf(-400.0), v) && v == -400);   // iTerm2's viewport origin (rig, 2026-10-22)
+		CHECK(roundedDouble(bitsOf(0.4), v) && v == 0 && roundedDouble(bitsOf(0.5), v) && v == 1 && roundedDouble(bitsOf(-0.5), v) && v == -1);
+		CHECK(roundedDouble(bitsOf(1279.6), v) && v == 1280 && roundedDouble(bitsOf(-719.4), v) && v == -719 && roundedDouble(bitsOf(3.0), v) && v == 3);
+		CHECK(!roundedDouble(bitsOf(3e9), v) && roundedDouble(bitsOf(-0.0), v) && v == 0);
 		CHECK(wholeDouble(bitsOf(1174.0), v) && v == 1174);
 		CHECK(wholeDouble(bitsOf(536870912.0), v) && v == 536870912);   // 2^29
 		CHECK(!wholeDouble(bitsOf(1073741824.0), v));                  // 2^30
@@ -144,6 +147,11 @@ int main() {
 			uint32_t t[8];
 			msaaImage(t, 0x1234500ull, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 3840, 2160, 2);
 			CHECK((t[1] >> 12 & 0x1f) == 2 && (t[3] >> 15 & 0x1f) == 2 && (t[3] >> 20 & 0x1f) == 3 && t[3] >> 28 == 14 && t[4] == 0);
+		}
+		{   // a depth buffer of one sample: 64KB_2D, TYPE 2D, no levels
+			uint32_t t[8];
+			msaaImage(t, 0x1234500ull, 22, 4 | 1u << 9, 2560, 1440, 0);
+			CHECK((t[1] >> 12 & 0x1f) == 0 && (t[3] >> 15 & 0x1f) == 0 && (t[3] >> 20 & 0x1f) == 3 && t[3] >> 28 == 9);
 		}
 	}
 	// linearImage: a 64x32 RGBA8 image at a 64-pixel pitch.

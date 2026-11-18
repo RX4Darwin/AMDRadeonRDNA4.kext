@@ -13,6 +13,24 @@ otherwise). The newest version is on top. How versions and branches work is in `
   database's hardware IDs, not from a card: not run on one yet.
 
 **Metal (`make PVGPU=1`)**
+- Vulkan games through MoltenVK (vkQuake). MoltenVK aborted at start: it makes a Metal argument encoder, which Apple's
+  x86 paravirtual Metal driver does not have (`newIndirectArgumentEncoderWithLayout:` calls `abort()`), and Metal
+  reports argument buffers on every device. `userspace/moltenvk/install.sh` sets `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0`
+  in the login session (a LaunchAgent), so apps started from the Finder have it. What its shaders and draws needed:
+  - buffers 28-30 (MoltenVK's push constants at 28, its vertex buffers from 30 down), past the stage tables;
+  - local arrays indexed at run time made into selects (a matrix's column, padded float3s), also in compute kernels,
+    which are refused if they still need scratch; threadgroup variables' initial values dropped;
+  - `[[sample_id]]` read as 0, `[[sample_mask]]` 0 discarding the pixel, `get_sample_position` the pixel's centre,
+    integer `texture2d_ms` reads; the layer a vertex shader writes dropped (MoltenVK's layered blit);
+  - viewports in fractions of a pixel rounded to whole ones, draw 0x005's primitive type read as 16 bits (vkQuake's
+    carry 0x0004 or 0x010a above it);
+  - depth textures (`Depth32Float`, `Depth32Float_Stencil8`) a pass drew into, sampled from the card's depth buffer.
+  Card (Tahoe 26.6.2, 2026-11-18): vkQuake started from LaunchServices runs; in 40 s of play no draw is left unrun
+  but about one a frame for the depth texture (that fix not run on the card yet). Two compute kernels still do not
+  translate (`read_texture_buffer_1d`, texture atomics). Failed libraries are now kept in
+  `/var/db/rdna4-air2amdgpu/failed` for translating them again by hand.
+- A shadow of an IOSurface kept on the card is refreshed from the card copy, not from its memory (it had the pixels
+  from before the draws). Safari's hovered tab still flickers (vertical lines).
 - The blend colour on BGRA8 targets: drawn with the colour block's channel swap (`COMP_SWAP ALT`, how the host draws
   them in place and held since 2026-10), green took the alpha blend constant; no order of the `CB_BLEND_*` registers
   fixes it (green and alpha both read alpha's). A draw whose colour factors use the blend colour, with green and alpha

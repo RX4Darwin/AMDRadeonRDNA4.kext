@@ -2947,7 +2947,7 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 		// The draws (measured, docs/m1-stream.md s.5b; rdna4-mtlindexed 2026-11-05; the rest from AppleParavirtGPUMetal's
 		// PGSerializerRenderCommandEncoder, Tahoe 26.6.2, 2026-11-11). drawPrimitives: 0x001 {u32 type, u16 start, u16 count}, 0x000 {u32 type,
 		// u64 start, u64 count}; with instances 0x003 {u16 start, count, instances, type}, 0x002 {u64 start, count, instances, u16 type}; with
-		// a base instance 0x005 {u16 start, count, instances, base instance, u32 type}, 0x004 {u64 start, count, instances, base instance,
+		// a base instance 0x005 {u16 start, count, instances, base instance, u16 type, u16 not read}, 0x004 {u64 start, count, instances, base instance,
 		// u16 type}. drawIndexedPrimitives {u16 type, u16 index type (1: 32-bit), u32 index buffer, ...}: 0x007 {u16 count, u16 offset}, 0x006
 		// {u64 count, u64 offset}; with instances 0x009 {u16 count, offset, instances}, 0x008 {u64 count, offset, instances}; with a base vertex
 		// and base instance 0x00b and 0x01d {u16 offset, count, instances, i16 base vertex, u16 base instance}, 0x00a and 0x01c {u64 offset,
@@ -2981,7 +2981,8 @@ void execSink(void *user, uint32_t id, const char *name, const uint8_t *payload,
 				d.instances = field(2 * w, w);
 				if (id >= 0x004)
 					d.baseInstance = field(3 * w, w);
-				d.type = field((id >= 0x004 ? 4 : 3) * w, id == 0x005 ? 4 : 2);
+				// a u16 also in 0x005: vkQuake's draws through MoltenVK carry 0x0004 or 0x010a above it (Tahoe 26.6.2)
+				d.type = field((id >= 0x004 ? 4 : 3) * w, 2);
 			}
 		} else {
 			d.type = field(0, 2);
@@ -4497,6 +4498,20 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		const uint32_t format = src.format, usage = src.usage;
 		const TextureFormat *fm = textureFormat(format);
 		const uint32_t w = src.width, h = src.height, depth = src.depth, rowBytes = src.rowBytes;
+		// A depth texture a pass drew into (Depth32Float or Depth32Float_Stencil8: vkQuake's scene depth, read by its ambient-occlusion
+		// pass): on the card only (mStencil), so read there as the depth block wrote it, 64KB_2D at the target's size, Z_32_FLOAT as
+		// 32_FLOAT, the depth in x; after the draws into it (their caches flushed). ponytail: a clear still pending on it (clear >= 0) is not
+		// seen; a depth texture never drawn into is refused as before.
+		const StencilBuf *zb = nullptr;
+		if (ok && (format == 252 || format == 260))
+			for (const StencilBuf &b : mStencil)
+				if (b.handle && b.task == task && b.tex == id && b.bpp == 4 && w <= b.width && h <= b.height)
+					zb = &b;
+		if (zb) {
+			waitDraws();
+			msaaImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, zb->gpu, 22, 4 | 1u << 9, w, h, static_cast<uint32_t>(__builtin_ctz(zb->samples)));
+			continue;
+		}
 		if (talk)
 			pvlog("host: render:   %s texture %u: resource %u (type %u), format %u, %ux%ux%u, %u bytes per row, %d bytes not 0", stageName, k, id,
 			      src.type, format, w, h, depth, rowBytes, ok && fm ? inkedBytes(task, src, fm->bpp) : -1);
@@ -4884,15 +4899,20 @@ bool RDNA4PvHost::refreshShadow(Shadow &s, IOMemoryDescriptor *memory)
 	if (x1 <= x0 || y1 <= y0)
 		return true;
 
-	if (s.depth > 1 || x1 > s.width || y1 > s.height || (memory && memory->prepare() != kIOReturnSuccess))
+	// An IOSurface kept on the card: the draws went into its card copy and its memory has what it had before them, so the rows come from
+	// that copy (from its memory they were the old pixels: squares flickering over Safari's hovered tab, 2026-11-17).
+	const CardSurface *card = s.surface ? cardSurface(s.surface) : nullptr;
+	const bool fromCard = card && card->loaded && s.at >= card->base && s.at + span <= card->base + card->bytes;
+
+	if (s.depth > 1 || x1 > s.width || y1 > s.height || (!fromCard && memory && memory->prepare() != kIOReturnSuccess))
 		return false;
 
-	bool ok = memory ? mapMemory(memory, s.at & ~0xffull, span + (s.at & 0xff), handle, src) : mapGuest(s.task, s.at, span, handle, src);
+	bool ok = fromCard || (memory ? mapMemory(memory, s.at & ~0xffull, span + (s.at & 0xff), handle, src) : mapGuest(s.task, s.at, span, handle, src));
 
-	if (memory)
+	if (!fromCard && memory)
 		memory->complete();
 
-	src += memory ? s.at & 0xff : 0;
+	src = fromCard ? card->gpu + (s.at - card->base) : src + (memory ? s.at & 0xff : 0);
 	ok = ok && rowsOnCard(src + static_cast<uint64_t>(y0) * s.rowBytes + x0 * s.bpp, s.rowBytes,
 	                      s.gpu + static_cast<uint64_t>(y0) * s.pitch + x0 * s.bpp, s.pitch, (x1 - x0) * s.bpp, y1 - y0);
 
@@ -5664,7 +5684,8 @@ uint32_t ringLiteral(uint32_t dw, uint64_t rings, uint32_t outs)
 // The misc page's qword for stage `st`'s buffer `k`: the vertex stage's table at +0x400, the fragment stage's at +0x800 (include/rdna4mtlc.h).
 uint32_t bufferSlot(unsigned st, unsigned k)
 {
-	const uint32_t at = 0x400 + 0x400 * st + (k < 8 ? 8 * k : RDNA4_MTLC_TABLE_MORE_BUFFERS + 8 * (k - 8));
+	const uint32_t at = k >= 28 ? RDNA4_MTLC_HIGH_BUFFERS + 0x20 * st + 8 * (k - 28)
+	                            : 0x400 + 0x400 * st + (k < 8 ? 8 * k : RDNA4_MTLC_TABLE_MORE_BUFFERS + 8 * (k - 8));
 
 	return at / 8;
 }
@@ -6212,11 +6233,13 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	}
 	// The viewport: Render.setViewport's, else the whole target; whole pixels only so far (window = origin + (ndc + 1) * size / 2, y down;
 	// a negative height flips y).
+	// ponytail: a viewport in fractions of a pixel (vkQuake's through MoltenVK) to the nearest whole ones: up to half a pixel off
 	int64_t vx = 0, vy = 0, vw = width, vh = height;
 	if (!why && draw.viewportSet &&
-	    !(wholeDouble(draw.viewport[0], vx) && wholeDouble(draw.viewport[1], vy) && wholeDouble(draw.viewport[2], vw) && wholeDouble(draw.viewport[3], vh) &&
-	      vw > 0 && vh != 0 && vw <= 32768 && vh >= -32768 && vh <= 32768 && vx > -32768 && vx < 32768 && vy > -32768 && vy < 32768))
-		why = "a viewport not in whole pixels, or too large (so far)";
+	    !(roundedDouble(draw.viewport[0], vx) && roundedDouble(draw.viewport[1], vy) && roundedDouble(draw.viewport[2], vw) &&
+	      roundedDouble(draw.viewport[3], vh) && vw > 0 && vh != 0 && vw <= 32768 && vh >= -32768 && vh <= 32768 && vx > -32768 && vx < 32768 &&
+	      vy > -32768 && vy < 32768))
+		why = "a viewport too large, or empty";
 	if (why) {
 		noteNotRun(why, name[2]);
 		if (talk)

@@ -78,6 +78,21 @@ static inline bool wholeDouble(uint64_t bits, int64_t &out) {
 	return true;
 }
 
+// A double (its bits) rounded to the nearest whole number (halves away from zero), of magnitude below 2^30; false if larger.
+static inline bool roundedDouble(uint64_t bits, int64_t &out) {
+	out = 0;
+	const uint32_t e = static_cast<uint32_t>(bits >> 52) & 0x7ff;
+	if (e < 1022)
+		return true;   // below 0.5 in magnitude (+-0 too)
+	if (e > 1023 + 29)
+		return false;
+	const uint32_t shift = 52 - (e - 1023);   // 53 for 0.5 <= |x| < 1
+	const uint64_t m = (bits & ((1ull << 52) - 1)) | (1ull << 52);
+	const uint64_t v = (m + (1ull << (shift - 1))) >> shift;
+	out = bits >> 63 ? -static_cast<int64_t>(v) : static_cast<int64_t>(v);
+	return true;
+}
+
 // An 8-bit linear value as 8-bit sRGB (round(255 * encode(i / 255))): a clear colour for an sRGB target, which Metal gives linear.
 static const uint8_t kSrgbOf[256] = {
 	  0,  13,  22,  28,  34,  38,  42,  46,  50,  53,  56,  59,  61,  64,  66,  69,
@@ -171,11 +186,12 @@ static inline void linearImage(uint32_t *t, uint64_t gpu, uint32_t format, uint3
 }
 
 // A multisampled 2D image's T# (as ac_build_gfx12_texture_descriptor for num_samples > 1): log2 of the samples in MAX_MIP and LAST_LEVEL,
-// BASE_LEVEL 0, SW_MODE 64KB_2D (3, the colour surface runDraw draws a multisampled attachment into), TYPE 2D_MSAA (14).
+// BASE_LEVEL 0, SW_MODE 64KB_2D (3, the colour surface runDraw draws a multisampled attachment into, and its depth), TYPE 2D_MSAA (14);
+// of one sample (logSamples 0: a depth buffer) TYPE 2D (9).
 static inline void msaaImage(uint32_t *t, uint64_t gpu, uint32_t format, uint32_t sel, uint32_t w, uint32_t h, uint32_t logSamples) {
 	linearImage(t, gpu, format, sel, w, h, 1);
 	t[1] |= logSamples << 12;
-	t[3] = sel | logSamples << 15 | 3u << 20 | 14u << 28;
+	t[3] = sel | logSamples << 15 | 3u << 20 | (logSamples ? 14u : 9u) << 28;
 	t[4] = 0;
 }
 
