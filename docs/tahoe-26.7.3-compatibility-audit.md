@@ -188,3 +188,15 @@ The purpose of the updated CI is to prove that both the standard and PVGPU sourc
 configurations compile and package correctly. It cannot prove stage-7 runtime
 bring-up, shader translation, WindowServer stability, or physical-card acceleration.
 Those require the user's exact 26.7.3 machine and logs from a controlled test.
+
+**Artifact handling warning:** the PVGPU artifact is produced for compile/package
+validation only. The upstream Makefile explicitly documents a Tahoe Restart/Shut
+Down freeze when the PVGPU classes are present, even with `rdna4-off=1`. Do not
+install the PVGPU artifact on the user's daily system or treat its successful build
+as a boot test. The standard artifact is also unvalidated on the exact 26.7.3
+hardware and is not a substitute for the controlled test sequence above.
+
+The `rdna4-compute=1` option selects a read-only *compute survey*; it does not
+disable the Lilu plugin's display hooks. Only `rdna4-off=1` makes plugin startup
+return before registering the display hooks. These two options test different
+things and must not be described as equivalent.
