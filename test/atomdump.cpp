@@ -4646,6 +4646,10 @@ static int testVmTableDifferential() {
 				                                GpuVm::kVaStart + 0x10000, GpuVm::kVaStart + 0x11000,
 				                                highPhysical, false, span) && span.firstPt == ~0ull,
 				           "dense: an aligned VRAM address above the hardware physical mask is rejected before writing PTEs");
+				f += check(!GpuVmTable::mapVram(access, P.nw.pol, kTableBytes,
+				                                GpuVm::kVaStart + 0x12000, GpuVm::kVaStart + 0x14000,
+				                                GpuVm::kPhysicalMask, false, span) && span.firstPt == ~0ull,
+				           "dense: a VRAM range that crosses the hardware physical limit is rejected before writing its first PTE");
 			}
 
 			// 1. The boot self-test / rtOpen layout: ring (executable), EOP, rptr, wptr, fence, kernarg, then user buffers.
@@ -4955,6 +4959,9 @@ static int testSparseTree() {
 	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x500000, V + 0x501000, highPhysical, false) &&
 	           e.sp.pages() == pagesBeforeHighPhysical,
 	           "tree: an aligned VRAM address above the hardware physical mask is rejected before allocating tables");
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x502000, V + 0x504000, GpuVm::kPhysicalMask, false) &&
+	           e.sp.pages() == pagesBeforeHighPhysical,
+	           "tree: a VRAM range crossing the physical limit is rejected before allocating tables");
 	f += check(treeResolves(e, cross, crossMc, 0x20000) && treeResolves(e, V + 0x1000, MC, 0x3000), "tree: the earlier mappings are undisturbed by the later ones");
 
 	// Unmap: PTEs go (through the dirty path), pages stay, nothing is created for a range that was never mapped.
