@@ -568,6 +568,7 @@ private:
 	void stampLater(uint32_t index, uint32_t value);
 	void completeLate();
 	bool drawing(uint32_t task, uint32_t id) const;
+	bool drawnInBatch(uint32_t task, uint32_t id) const;
 	struct BlitRegion;
 	bool copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex, uint32_t buf, const BlitRegion &r);
 	bool copyTexture(uint32_t task, uint32_t from, const uint64_t at[3], uint32_t to, const uint64_t into[3], const uint64_t size[3]);
@@ -961,6 +962,8 @@ private:
 	// shadow filled) goes out before it, and a batch is closed by it, so the draw can go out later than nextSubmit() said.
 	static constexpr uint32_t kUsedMax = 64;
 	bool mBuilding { false };
+	bool mReadsBatched { false };   // the draw being put together samples a texture a draw before it in the open batch drew into
+	uint64_t mBatchedReads { 0 };   // such draws since the boot (debug.rdna4_pvnotrun's last line)
 	Mapping *mUsedMaps[kUsedMax] {};
 	Shadow *mUsedShadows[kUsedMax] {};
 	uint32_t mUsedMapCount { 0 }, mUsedShadowCount { 0 }, mBuildSlot { ~0u };
@@ -1199,6 +1202,9 @@ int RDNA4PvHost::notRunCensus(struct sysctl_req *req)
 			at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at, "%llu %s (first \"%s\")\n", r.count, r.why, r.name));
 	if (mNotRunOther && at < sizeof(text) - 1)
 		at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at, "%llu other reasons\n", mNotRunOther));
+	if (mBatchedReads && at < sizeof(text) - 1)   // run, not refused: how often a draw waited for the batch's draws before it
+		at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at, "(%llu draws run after a barrier: a texture drawn earlier in their batch)\n",
+		                                   static_cast<unsigned long long>(mBatchedReads)));
 	if (at >= sizeof(text))
 		at = sizeof(text) - 1;
 	return SYSCTL_OUT(req, text, at + 1);
@@ -2450,7 +2456,15 @@ bool RDNA4PvHost::drawing(uint32_t task, uint32_t id) const
 		if (mDirty[i].key == key)
 			return true;
 
-	for (uint32_t i = 0; i < mBatchDraws; i++)   // put together, not submitted yet: waitDraws submits them first
+	return drawnInBatch(task, id);   // put together, not submitted yet: waitDraws submits them first
+}
+
+// Whether a draw put together in the open batch (not submitted yet) draws into texture `id`.
+bool RDNA4PvHost::drawnInBatch(uint32_t task, uint32_t id) const
+{
+	const uint32_t key = task << 16 | (id & 0xffff);
+
+	for (uint32_t i = 0; i < mBatchDraws; i++)
 		if (mBatchDirty[i] == key)
 			return true;
 
@@ -2567,13 +2581,15 @@ void RDNA4PvHost::flushBatch()
 			dirtied(dirty[i] >> 16, dirty[i] & 0xffff, fence);
 }
 
+// GCR_CNTL: GLK, GLV and GL1 invalidated (ACQUIRE_MEM): what the card wrote outside a shader's caches read fresh by the work after it.
+static constexpr uint32_t kGcrShaderCaches = 1u << 7 | 1u << 8 | 1u << 9;
+
 // A dispatch of a translated kernel put into the batch (false: the runtime's own dispatch takes it). After it the compute work is waited
 // for and the shader caches dropped, so that the draws after it read what it wrote (GL's fixed indices).
 bool RDNA4PvHost::batchDispatch(const Jit &j, const uint8_t *args, uint32_t argBytes, const uint32_t groups[3], const uint32_t groupSize[3])
 {
 	static constexpr uint32_t kMaxDwords = 64;
 	static constexpr uint32_t kCsPartialFlush = 7 | 4u << 8;   // EVENT_WRITE CS_PARTIAL_FLUSH, EVENT_INDEX 4
-	static constexpr uint32_t kGcrShaderCaches = 1u << 7 | 1u << 8 | 1u << 9;   // GCR_CNTL: GLK, GLV and GL1 invalidated
 	const uint64_t *l = j.launch;
 	const uint32_t rsrc2 = static_cast<uint32_t>(l[4]);
 	const uint32_t bytes = (static_cast<uint32_t>(l[1] > argBytes ? l[1] : argBytes) + 3) & ~3u;
@@ -4576,6 +4592,8 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			continue;
 
 		ok = textureSource(task, id, src);
+
+		mReadsBatched |= id && drawnInBatch(task, id);   // (copies are in the batch as task and target 0)
 
 		// Over a held target's memory: what was drawn into it written back first. The draw's own held target is read from a copy instead
 		// (copyHeld).
@@ -6602,6 +6620,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	StagedTexture stagedTextures[2][16] = {};
 	const uint64_t texturesFrom = nowNs();
 	mDrawTarget = target;
+	mReadsBatched = false;
 	// a stage that samples at explicit LODs (its header's bit 16): its textures' levels (levelImages)
 	static uint32_t levels[(kMiscPage - kLevelsAt) / 4];   // ponytail: one host, its work loop only
 	const uint32_t levelStages = (vs[7] >> 16 & 1) | (ps[7] >> 16 & 1) << 1;
@@ -6948,6 +6967,23 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		if (r == kIOReturnSuccess && levelStages)   // the levels' T#s, for a shader that reads them
 			r = upload(mGfxMisc, levels, sizeof(levels), miscAt + kLevelsAt);
+		}
+
+		// A texture a draw before it in the open batch drew into, sampled (in place: a display's frame on the card, which Tahoe's glass reads
+		// around the pointer): those draws done and the colour block's caches written back first, the shader caches dropped. Else it read
+		// pixels from before them (old pixels flickering in Safari's tab bar while the pointer moved near it, gone with each draw submitted
+		// alone, 2026-11-18). A batch's end does the same for the batches after it.
+		if (r == kIOReturnSuccess && mReadsBatched) {
+			uint32_t idle[16];
+			const uint32_t m = idleBarrier(idle);
+
+			if (m && m <= sizeof(idle) / 4 && total + m + 8 <= sizeof(ib) / 4) {
+				memmove(ib + m + 8, ib, total * 4);
+				memcpy(ib, idle, m * 4);
+				Pm4::acquireMem(ib + m, kGcrShaderCaches);
+				total += m + 8;
+				mBatchedReads++;
+			}
 		}
 
 		if (profiling() && total + 16 <= sizeof(ib) / 4) {   // timed: its start and end

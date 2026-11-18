@@ -9,6 +9,12 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - RGBA8 IOSurfaces as colour attachments (only BGRA8 ones before): WindowServer renders an inactive window's material into
   one, and Safari's Downloads popover with another app in front kept an empty background, its text drawn over itself.
   Card (Tahoe 26.6.2, 2026-11-18): the popover's background stays.
+- A draw that samples a texture an earlier draw in the same batch drew into waits for it first (an idle barrier, the
+  shader caches dropped): Tahoe's glass reads the display's frame around the pointer just after drawing into it, and
+  read pixels from before those draws, blocks of old screen content flickering in Safari's tab bar while the pointer
+  moved near it. Card (2026-11-18): the blocks are gone; about 660 draws a second take the barrier, vkQuake's timedemo
+  unchanged (41.7-43.9 fps). Left: the edges of a box around the pointer show as lines over glass, since the paravirtual
+  displays have no hardware cursor and WindowServer redraws the pointer's rectangle into each frame.
 
 ## 0.3.1 (2026-11-18)
 
