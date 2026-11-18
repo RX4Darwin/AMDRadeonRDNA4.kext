@@ -4597,7 +4597,8 @@ struct Pair {
 		const uint64_t mapped = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
 		bool aligned = mapped >= bytes && buses.size() >= mapped / GpuVm::kPageBytes;
 		for (uint64_t i = 0; aligned && i < mapped / GpuVm::kPageBytes; i++)
-			aligned = !(buses[i] & (GpuVm::kPageBytes - 1));
+			aligned = !(buses[i] & (GpuVm::kPageBytes - 1)) &&
+			          buses[i] <= GpuVm::kPhysicalMask;
 		/* The pre-S8 implementation could partially write before discovering a
 		 * misaligned later page. The new contract rejects that range atomically. */
 		const bool a = aligned && !beyondDense(va, bytes) && legacyVmMapHost(ref, va, buses.data(), bytes, exec),
@@ -4655,6 +4656,9 @@ static int testVmTableDifferential() {
 			std::vector<uint64_t> badBuses = buses;
 			badBuses.back() |= 0x40;
 			P.mapHost(V + 0xc0000, badBuses, 0x10000, false);
+			badBuses = buses;
+			badBuses.back() = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+			P.mapHost(V + 0xe0000, badBuses, 0x10000, false);
 			P.unmap(V + 0xb0000, 0x10000);                       // the freed buffer; the next dispatch through it must fault
 			P.mapHost(V + 0xd0000, buses, 0x10000, true);
 			P.unmap(V + 0x10000, 0x3000);                        // the program is unloaded
@@ -4937,6 +4941,11 @@ static int testSparseTree() {
 	const uint64_t top = GpuVm::kVaEnd - 0x2000;
 	f += check(treeMap(e, top, MC + 0x300000, 0x2000) && treeResolves(e, top, MC + 0x300000, 0x2000), "tree: the last two pages of the 48-bit space translate");
 	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V - 0x1000, V + 0x1000, 0x1000, false), "tree: a map starting below kVaStart is refused");
+	const uint32_t pagesBeforeHighPhysical = e.sp.pages();
+	const uint64_t highPhysical = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x500000, V + 0x501000, highPhysical, false) &&
+	           e.sp.pages() == pagesBeforeHighPhysical,
+	           "tree: an aligned VRAM address above the hardware physical mask is rejected before allocating tables");
 	f += check(treeResolves(e, cross, crossMc, 0x20000) && treeResolves(e, V + 0x1000, MC, 0x3000), "tree: the earlier mappings are undisturbed by the later ones");
 
 	// Unmap: PTEs go (through the dirty path), pages stay, nothing is created for a range that was never mapped.
@@ -4971,6 +4980,10 @@ static int testSparseTree() {
 		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, badVa, badVa + 0x8000, buses.data(), false) &&
 		           e.sp.pages() == pagesBeforeBadMap && !e.translate(badVa, phys) && !e.translate(badVa + 0x2000, phys),
 		           "tree: a misaligned later bus page is refused before allocating tables or writing any PTE");
+		buses[3] = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, badVa, badVa + 0x8000, buses.data(), false) &&
+		           e.sp.pages() == pagesBeforeBadMap && !e.translate(badVa, phys),
+		           "tree: an aligned host bus address above the hardware physical mask is rejected before allocation");
 	}
 
 	// Quota: the VA limit is the page quota. Nothing half-made, earlier mappings survive.
