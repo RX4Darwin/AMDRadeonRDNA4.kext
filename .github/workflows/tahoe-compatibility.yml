@@ -29,6 +29,15 @@ jobs:
           uname -a
           xcodebuild -version
           xcrun --sdk macosx --show-sdk-version
+          echo "Target macOS: 26.7.3 (25G342)"
+          ACTUAL_VERSION="$(sw_vers -productVersion)"
+          ACTUAL_BUILD="$(sw_vers -buildVersion)"
+          if [ "$ACTUAL_VERSION" != "26.7.3" ] || [ "$ACTUAL_BUILD" != "25G342" ]; then
+            echo "::warning::This runner is $ACTUAL_VERSION ($ACTUAL_BUILD), not the exact target 26.7.3 (25G342). Build/test results are not exact-build certification."
+          else
+            echo "Exact target OS build matched."
+          fi
+          test "$(uname -m)" = "x86_64"
 
       - name: Run host-side regression tests
         run: make test
