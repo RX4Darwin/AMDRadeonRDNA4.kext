@@ -4546,7 +4546,7 @@ static int testVmTableDifferential() {
 				                                GpuVm::kVaStart + 0x10000, GpuVm::kVaStart + 0x11000,
 				                                highPhysical, false, span) && span.firstPt == ~0ull,
 				           "dense: an aligned VRAM address above the hardware physical mask is rejected before writing PTEs");
-				f += check(!GpuVmTable::mapVram(access, P.nw.pol, kTableBytes,
+				failures += check(!GpuVmTable::mapVram(access, P.nw.pol, kTableBytes,
 				                                GpuVm::kVaStart + 0x12000, GpuVm::kVaStart + 0x14000,
 				                                GpuVm::kPhysicalMask, false, span) && span.firstPt == ~0ull,
 				           "dense: a VRAM range that crosses the hardware physical limit is rejected before writing its first PTE");
