@@ -38,13 +38,18 @@ VM test proves physical GPU compatibility.
 1. Record the exact OpenCore version, Lilu version, WhateverGreen version, and the
    currently installed kext's build string.
 2. Build the upstream 0.3.1 baseline without `PVGPU=1` first. Preserve the existing
-   working EFI and keep the new kext entry disabled.
+   known-good EFI unchanged and keep its new kext entry disabled.
 3. Run the repository's host-side tests (`make test`) and retain the complete output.
    Build the kext separately and inspect its architecture, bundle metadata, and linked
    symbols before any boot test.
 4. If host tests and static checks pass, prepare a separate test EFI copy and a
-   reversible boot entry. Do not overwrite the known-good EFI.
-5. First perform an injection-only boot with `rdna4-off=1` and verbose logging.
+   reversible boot entry. Enable the kext entry in this test EFI only; do not
+   overwrite or enable it in the known-good EFI. Confirm OpenCore actually injects
+   the bundle and verify the kernel log contains
+   `AMDRadeonRDNA4: disabled by rdna4-off boot-arg`.
+5. With that test EFI, perform an injection-only boot using `rdna4-off=1` and
+   verbose logging. A successful boot without the disabled log is not evidence
+   that the plugin was injected.
    This must remain inert: it verifies injection/boot stability only, not display
    takeover or GPU operation. Capture complete panic/reboot evidence if it fails.
 6. Only after the inert boot is stable, prepare a separate reversible test entry
