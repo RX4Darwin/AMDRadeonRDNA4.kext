@@ -87,12 +87,12 @@ A GitHub Actions workflow has been added at
 runner OS and SDK, runs `make test`, builds the x86_64 kext, verifies bundle metadata,
 and uploads the bundle as an artifact.
 
-The workflow targets GitHub's `macos-26-intel` runner. It now builds and archives
-both the standard kext (`PVGPU=0`) and the experimental Metal/paravirtual-GPU kext
-(`PVGPU=1`), in addition to running host tests and checking the x86_64 bundle
-metadata. The PVGPU artifact is checked for its paravirtual-host implementation.
-The workflow also reports whether all ten firmware blobs required for stage-7
-compute bring-up are present.
+The workflow targets GitHub's `macos-26-intel` runner. It now runs host tests,
+fetches the upstream AMD firmware blobs, and builds and archives both the standard
+kext (`PVGPU=0`) and experimental Metal/paravirtual-GPU kext (`PVGPU=1`). The
+PVGPU artifact is checked for its paravirtual-host implementation, x86_64
+architecture, bundle metadata, and all ten firmware blobs required for stage-7
+compute bring-up.
 
 The latest runner image information available during this audit reports macOS
 26.7.2 (build 25G332), not the user's 26.7.3 (25G342). Therefore even a green run
