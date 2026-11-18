@@ -32,7 +32,10 @@ enum { kMtlcNext = 0, kMtlcDeliver = 1 };
 #define RDNA4_MTLC_TABLE_FRAMEBUFFER 832u
 /* Buffers 8-27's addresses (indices 0-7 are at +0). */
 #define RDNA4_MTLC_TABLE_MORE_BUFFERS 864u
-#define RDNA4_MTLC_MAX_BUFFERS 28u
+/* Buffers 28-30's addresses (MoltenVK's push constants at 28, Dawn's lengths at 30), past the tables: at this offset of the state page for
+ * the vertex stage, 0x20 after it for the fragment stage (the vertex table is at +0x400 of the page, the fragment table at +0x800). */
+#define RDNA4_MTLC_HIGH_BUFFERS 0xe00u
+#define RDNA4_MTLC_MAX_BUFFERS 31u
 /* The vertex stage's vertex descriptor: attribute n (0-15) at RDNA4_MTLC_TABLE_ATTRIBUTES + 16 n, {u32 offset in the element, u32 stride,
  * u32 buffer index | kind << 8 | components << 12 | BGRA << 15 | step function << 16 (MTLVertexStepFunction), u32 step rate}; kind:
  * 0 float, 1 half, 2 unorm8, 3 snorm8, 4 uint8, 5 sint8, 6 unorm16, 7 snorm16, 8 uint16, 9 sint16, 10 int, 11 uint (the host's

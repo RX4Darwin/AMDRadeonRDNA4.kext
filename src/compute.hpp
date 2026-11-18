@@ -420,6 +420,7 @@ private:
 	static constexpr uint32_t kCodeObjCodeMax = 0x10000 - 0x100;          // + prefetch pad
 	static constexpr uint32_t kKernargOffset  = kShaderOffset + 0x20000;   // up to 4 KiB
 	static constexpr uint32_t kKernargMax     = 0x1000;
+	static constexpr uint32_t kSpinPolls      = 2000;     // a fence polled every 10 us for 20 ms before the waits sleep
 	static constexpr uint32_t kVaddA          = 24u << 20;            // a, b, c: 64 KiB apart
 	static constexpr uint32_t kVaddB          = kVaddA + 0x10000;
 	static constexpr uint32_t kVaddC          = kVaddA + 0x20000;

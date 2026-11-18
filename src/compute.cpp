@@ -3384,7 +3384,9 @@ bool RDNA4Compute::launch(const Launch &l, const char *tag, uint64_t &ns) {
 				waitFaulted = true;
 				break;
 			}
-			if (polls < 200)
+			// spun for 20 ms, then asleep a millisecond at a time: with 2 ms, a kernel a little longer (vkQuake's depth pyramid, 8 ms) ended
+			// at the next sleep's end, and its timedemo ran 42.0 frames a second for 43.5 (2026-11-18)
+			if (polls < kSpinPolls)
 				IODelay(10);
 			else
 				IOSleep(1);

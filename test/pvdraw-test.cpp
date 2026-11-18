@@ -19,6 +19,9 @@ int main() {
 		CHECK(wholeDouble(bitsOf(0.0), v) && v == 0);
 		CHECK(wholeDouble(bitsOf(-0.0), v) && v == 0);
 		CHECK(wholeDouble(bitsOf(-400.0), v) && v == -400);   // iTerm2's viewport origin (rig, 2026-10-22)
+		CHECK(roundedDouble(bitsOf(0.4), v) && v == 0 && roundedDouble(bitsOf(0.5), v) && v == 1 && roundedDouble(bitsOf(-0.5), v) && v == -1);
+		CHECK(roundedDouble(bitsOf(1279.6), v) && v == 1280 && roundedDouble(bitsOf(-719.4), v) && v == -719 && roundedDouble(bitsOf(3.0), v) && v == 3);
+		CHECK(!roundedDouble(bitsOf(3e9), v) && roundedDouble(bitsOf(-0.0), v) && v == 0);
 		CHECK(wholeDouble(bitsOf(1174.0), v) && v == 1174);
 		CHECK(wholeDouble(bitsOf(536870912.0), v) && v == 536870912);   // 2^29
 		CHECK(!wholeDouble(bitsOf(1073741824.0), v));                  // 2^30
@@ -128,6 +131,11 @@ int main() {
 		CHECK(clearPattern(103, seven, p) && p == 7 && clearPattern(104, minus, p) && p == 0xfffffffdu && !clearPattern(103, minus, p) && !clearPattern(103, c, p));
 		CHECK(colourInfo(65, true) == 0x00020705u && colourInfo(80, true) == 0x0002880au && colourInfo(0, false) == 0x0002800au);
 		CHECK(colourInfo(103, false) == 0x0003040bu && colourInfo(104, true) == 0x0003050bu);   // RG32Uint, RG32Sint: 32_32, BLEND_BYPASS
+		CHECK(colourInfo(63, false) == 0x00030405u);   // RG16Uint: 16_16 UINT, BLEND_BYPASS
+		{
+			const uint64_t two[4] = {bitsOf(5.0), bitsOf(9.0), 0, 0}, big[4] = {bitsOf(65536.0), 0, 0, 0};
+			CHECK(clearPattern(63, two, p) && p == (5u | 9u << 16) && !clearPattern(63, big, p) && !clearPattern(63, minus, p));
+		}
 		CHECK(colourInfo(81, true) == 0x00028e0au && colourInfo(71, false) == 0x0002860au);   // BGRA8 and RGBA8 sRGB: NUMBER_SRGB
 		{   // sRGB clears: the linear colour encoded (0.5 -> 188 after 128), alpha as it is; 0 and 1 unchanged
 			const uint64_t half[4] = {0x3fe0000000000000ull, 0, 0x3ff0000000000000ull, 0x3fe0000000000000ull};
@@ -139,6 +147,11 @@ int main() {
 			uint32_t t[8];
 			msaaImage(t, 0x1234500ull, 42, 4 | 5 << 3 | 6 << 6 | 7 << 9, 3840, 2160, 2);
 			CHECK((t[1] >> 12 & 0x1f) == 2 && (t[3] >> 15 & 0x1f) == 2 && (t[3] >> 20 & 0x1f) == 3 && t[3] >> 28 == 14 && t[4] == 0);
+		}
+		{   // a depth buffer of one sample: 64KB_2D, TYPE 2D, no levels
+			uint32_t t[8];
+			msaaImage(t, 0x1234500ull, 22, 4 | 1u << 9, 2560, 1440, 0);
+			CHECK((t[1] >> 12 & 0x1f) == 0 && (t[3] >> 15 & 0x1f) == 0 && (t[3] >> 20 & 0x1f) == 3 && t[3] >> 28 == 9);
 		}
 	}
 	// linearImage: a 64x32 RGBA8 image at a 64-pixel pitch.

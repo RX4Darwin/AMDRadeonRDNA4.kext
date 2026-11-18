@@ -3,6 +3,55 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
+## 0.3.1 (2026-11-18)
+
+**Cards**
+- The RX 9070 GRE (device 0x7550, PCI revision 0xC2) is told apart: System Report and ioreg name it "AMD Radeon RX
+  9070 GRE", and the fake paravirtual GPU reports its 48 compute units (`src/sku.hpp`). It is the same Navi 48 with
+  12 GB on a 192-bit bus; the VRAM size, shader engines, display paths and the compute pool's place are read from the
+  card, and a second-display plan whose link the VBIOS does not have is refused. The revision is from a driver
+  database's hardware IDs, not from a card: not run on one yet.
+
+**Metal (`make PVGPU=1`)**
+- Vulkan games through MoltenVK (vkQuake). MoltenVK aborted at start: it makes a Metal argument encoder, which Apple's
+  x86 paravirtual Metal driver does not have (`newIndirectArgumentEncoderWithLayout:` calls `abort()`), and Metal
+  reports argument buffers on every device. `userspace/moltenvk/install.sh` sets `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0`
+  in the login session (a LaunchAgent), so apps started from the Finder have it. What its shaders and draws needed:
+  - buffers 28-30 (MoltenVK's push constants at 28, its vertex buffers from 30 down), past the stage tables;
+  - local arrays indexed at run time made into selects (a matrix's column, padded float3s), also in compute kernels,
+    which are refused if they still need scratch; threadgroup variables' initial values dropped;
+  - `[[sample_id]]` read as 0, `[[sample_mask]]` 0 discarding the pixel, `get_sample_position` the pixel's centre,
+    integer `texture2d_ms` reads; the layer a vertex shader writes dropped (MoltenVK's layered blit);
+  - viewports in fractions of a pixel rounded to whole ones, draw 0x005's primitive type read as 16 bits (vkQuake's
+    carry 0x0004 or 0x010a above it);
+  - depth textures (`Depth32Float`, `Depth32Float_Stencil8`) sampled from the card's depth buffer, which is kept by
+    the texture a pass's view is of, and made with the pass's clear when no draw has used it yet;
+  - its world: compute kernels with up to 31 buffers (8 before) and with arrays of textures (with the first
+    descriptor's address in their place, the lightmap kernel hung the compute queue), texture atomics (the depth
+    pyramid), texture-buffer reads; indirect indexed draws (0x011), their arguments read once the culling kernels
+    that write them are done; resolves set at a pass's end (`setColorStoreAction`, how MoltenVK ends its passes),
+    RGB10A2 samples resolved in their own format.
+  Card (Tahoe 26.6.2, 2026-11-18): vkQuake started from the Finder plays, its world in the right colours; no draw
+  left unrun but the culled ones. Not measured: its frame rate (each indirect draw waits for the card; the depth
+  pyramid takes about 22 ms). Failed libraries are now kept in `/var/db/rdna4-air2amdgpu/failed` for translating
+  them again by hand.
+- Faster 3D: vkQuake's `timedemo demo1` at 4K, 30.0 frames a second with vsync and 41.8 without, now 43.7 and 43.5.
+  An indirect draw waits for the card only when a pending dispatch writes its arguments (it waited at each: 2200 of
+  the host's 2700 waits in 5 s); clears of buffers on the card (depth, multisampled colour) are drawn by the colour
+  block as one linear R32Uint image between idle barriers, not filled by CP DMA (681 ms of each 5 s on the card, now
+  211 ms; 37-39 frames a second for 41 with only this changed); the waits for a kernel poll for 20 ms before they
+  sleep (2 ms before; 42.0 for 43.5). Left: the depth-pyramid kernel takes 8 ms a frame on the card (its mip
+  textures are in the Mac's memory).
+- A shadow of an IOSurface kept on the card is refreshed from the card copy, not from its memory (it had the pixels
+  from before the draws). Safari's hovered tab still flickers (vertical lines).
+- The blend colour on BGRA8 targets: drawn with the colour block's channel swap (`COMP_SWAP ALT`, how the host draws
+  them in place and held since 2026-10), green took the alpha blend constant; no order of the `CB_BLEND_*` registers
+  fixes it (green and alpha both read alpha's). A draw whose colour factors use the blend colour, with green and alpha
+  differing, is now staged and swapped by the CPU. Card (Tahoe 26.6.2, 2026-11-17): `mtlprobe blendx` 0 of 16 channels
+  off (2 before), `mtlprobe all` passes.
+- RG16Uint render targets (WindowServer's `brim_init_lpf` and `brim_jump_lpf` at 4K, about 7000 draws not run in a
+  session with a full-screen game before): 16_16 UINT, its clears as two 16-bit halves.
+
 ## 0.3.0 (2026-11-17)
 
 **Displays**

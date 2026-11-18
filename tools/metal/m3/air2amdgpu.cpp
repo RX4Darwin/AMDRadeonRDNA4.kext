@@ -601,6 +601,30 @@ static std::string legalize(Function &k) {
 				texel = b.CreateIntCast(b.CreateBitCast(texel, FixedVectorType::get(b.getInt32Ty(), 4)),
 				                        cast<StructType>(c->getType())->getElementType(0), tex.starts_with("read_texture_2d.s"));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (tex.starts_with("gather_texture_2d.v4f")) {
+			// (texture, sampler, float2 coord, i1, int2 offset, i32 component, i32): one component of the four texels around the coordinate
+			// (MoltenVK's shaders from vkQuake, 2026-11-17), image_gather4 at level 0 with that component's dmask; the order of the four is
+			// Metal's and the hardware's alike. A constant offset only.
+			auto *offset = dyn_cast<Constant>(c->getArgOperand(4));
+			auto *component = dyn_cast<ConstantInt>(c->getArgOperand(5));
+			if (!offset || !component || component->getZExtValue() > 3)
+				return f->getName().str() + " with a run-time offset or component is not supported yet";
+			uint32_t packed = 0;
+			for (unsigned k = 0; k < 2; k++)
+				if (auto *e = dyn_cast_or_null<ConstantInt>(offset->getAggregateElement(k)))
+					packed |= (static_cast<uint32_t>(e->getSExtValue()) & 0x3f) << (8 * k);
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(2);
+			Value *sm = constSampler.count(c) ? static_cast<Value *>(constSampler[c]) : descriptor(c->getArgOperand(1), 4);
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
+			SmallVector<Value *, 10> args = {b.getInt32(1u << component->getZExtValue())};
+			if (packed)
+				args.push_back(b.getInt32(packed));
+			args.append({b.CreateExtractElement(xy, uint64_t(0)), b.CreateExtractElement(xy, 1), t, sm, b.getFalse(), b.getInt32(0), b.getInt32(0)});
+			Value *texel = b.CreateIntrinsic(packed ? Intrinsic::amdgcn_image_gather4_lz_o_2d : Intrinsic::amdgcn_image_gather4_lz_2d,
+			                                 {v4f, b.getFloatTy(), t->getType(), sm->getType()}, args);
+			if (tex.starts_with("gather_texture_2d.v4f16"))
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
 		} else if (tex.starts_with("sample_texture_2d_array.v4f")) {
 			// (texture, sampler, float2 coord, uint slice, i1, int2 offset, i1 level, float bias or LOD, float min LOD, i32): kitty's glyph
 			// atlas through AppleMetalOpenGLRenderer (2026-11-12). The slice is the T#'s array layer, given as a float. An explicit LOD as
@@ -649,6 +673,42 @@ static std::string legalize(Function &k) {
 			if (half)
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
+		} else if (tex.starts_with("atomic_fetch_") && tex.contains("_explicit_texture_2d.")) {
+			// atomic_fetch_<op>_explicit_texture_2d.{u,s}.v4i32 (texture, uint2 coord, uint4 value, i32 order, i32 scope): the old texel in x
+			// (vkQuake's depth pyramid ORs into an R32Uint image); the image atomic on .x, relaxed as Metal's texture atomics are
+			static const std::map<std::string, Intrinsic::ID> ops = {
+				{"or", Intrinsic::amdgcn_image_atomic_or_2d}, {"and", Intrinsic::amdgcn_image_atomic_and_2d},
+				{"xor", Intrinsic::amdgcn_image_atomic_xor_2d}, {"add", Intrinsic::amdgcn_image_atomic_add_2d},
+				{"sub", Intrinsic::amdgcn_image_atomic_sub_2d}, {"min", Intrinsic::amdgcn_image_atomic_umin_2d},
+				{"max", Intrinsic::amdgcn_image_atomic_umax_2d}};
+			StringRef rest = tex.drop_front(strlen("atomic_fetch_"));
+			const std::string what = rest.substr(0, rest.find("_explicit")).str();
+			auto it = ops.find(what);
+			auto *vt = dyn_cast<FixedVectorType>(c->getType());
+			if (it == ops.end() || !vt || !vt->getElementType()->isIntegerTy(32) || c->arg_size() < 3)
+				return f->getName().str() + " is not supported yet";
+			Intrinsic::ID op = it->second;   // an int texture's min and max are signed
+			if (tex.contains("_texture_2d.s.") && what == "min")
+				op = Intrinsic::amdgcn_image_atomic_smin_2d;
+			else if (tex.contains("_texture_2d.s.") && what == "max")
+				op = Intrinsic::amdgcn_image_atomic_smax_2d;
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(1);
+			Value *x = b.CreateZExtOrTrunc(b.CreateExtractElement(xy, uint64_t(0)), b.getInt32Ty());
+			Value *y = b.CreateZExtOrTrunc(b.CreateExtractElement(xy, 1), b.getInt32Ty());
+			Value *value = b.CreateExtractElement(c->getArgOperand(2), uint64_t(0));
+			Value *old = b.CreateIntrinsic(op, {b.getInt32Ty(), b.getInt32Ty(), t->getType()},
+			                               {value, x, y, t, b.getInt32(0), b.getInt32(0)});
+			r = b.CreateInsertElement(PoisonValue::get(vt), old, uint64_t(0));
+		} else if (tex.starts_with("read_texture_buffer_1d.v4f")) {
+			// (texture, uint coord, i32): a texture made from a buffer (vkQuake's palette), which the host gives as one linear row
+			const bool half = tex.starts_with("read_texture_buffer_1d.v4f16");
+			Value *t = descriptor(c->getArgOperand(0), 8), *x = b.CreateZExtOrTrunc(c->getArgOperand(1), b.getInt32Ty());
+			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
+			Value *texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {v4f, b.getInt32Ty(), t->getType()},
+			                                 {b.getInt32(15), x, b.getInt32(0), t, b.getInt32(0), b.getInt32(0)});
+			if (half)
+				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
 		} else if (tex.starts_with("sample_texture_1d_array.v4f")) {
 			// (texture, sampler, float x, uint slice, i1, int offset, i1 level, float bias or LOD, float min LOD, i32): WindowServer's colour
 			// lookup tables, one mip level, so read at level 0 (sample_lz); the slice is the T#'s array layer, given as a float.
@@ -678,6 +738,10 @@ static std::string legalize(Function &k) {
 				value = b.CreateFPExt(value, v4f);
 			Value *x = b.CreateZExt(b.CreateExtractElement(xy, uint64_t(0)), b.getInt32Ty()), *y = b.CreateZExt(b.CreateExtractElement(xy, 1), b.getInt32Ty());
 			b.CreateIntrinsic(Intrinsic::amdgcn_image_store_2d, {v4f, b.getInt32Ty(), t->getType()}, {value, b.getInt32(15), x, y, t, b.getInt32(0), b.getInt32(0)});
+		} else if (name == "fence_texture_2d") {   // the thread's texture writes seen by its reads after: their memory, in order
+			b.CreateFence(AtomicOrdering::AcquireRelease, ctx.getOrInsertSyncScopeID("agent"));
+		} else if (name.starts_with("get_sample_position.")) {   // ponytail: the pixel's centre, as [[sample_id]] is 0 (see there)
+			r = ConstantFP::get(c->getType(), 0.5);
 		} else if (name == "discard_fragment") {   // fragment only: the lane ends
 			b.CreateIntrinsic(Intrinsic::amdgcn_kill, {}, {b.getFalse()});
 		} else if (name == "get_read_sampler") {
@@ -751,16 +815,21 @@ static std::string legalize(Function &k) {
 			// ac_build_gfx12_texture_descriptor)
 			Value *w3 = b.CreateExtractElement(descriptor(c->getArgOperand(0), 8), 3);
 			r = b.CreateShl(b.getInt32(1), b.CreateAnd(b.CreateLShr(w3, 15), 0x1f));
-		} else if (tex.starts_with("read_texture_2d_ms.v4f")) {
-			// (texture, sampler, uint2 coord, uint sample, i32): that sample of the texel, float or half (the resolve the host runs for a
-			// pass's multisampled attachment, and shaders reading a texture2d_ms)
+		} else if (tex.starts_with("read_texture_2d_ms.v4f") || tex.starts_with("read_texture_2d_ms.u.v4i") || tex.starts_with("read_texture_2d_ms.s.v4i")) {
+			// (texture, sampler, uint2 coord, uint sample, i32), or without the sampler (MoltenVK's, 2026-11-17): that sample of the texel,
+			// float or half (the resolve the host runs for a pass's multisampled attachment, and shaders reading a texture2d_ms); an integer
+			// texture's as the bits (vkQuake's entity mask), as read_texture_2d's
 			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
-			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(2);
+			const unsigned at = c->getArgOperand(1)->getType()->isVectorTy() ? 1 : 2;   // the coordinate's operand
+			Value *t = descriptor(c->getArgOperand(0), 8), *xy = c->getArgOperand(at);
 			Value *x = b.CreateZExt(b.CreateExtractElement(xy, uint64_t(0)), b.getInt32Ty()), *y = b.CreateZExt(b.CreateExtractElement(xy, 1), b.getInt32Ty());
 			Value *texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2dmsaa, {v4f, b.getInt32Ty(), t->getType()},
-			                                 {b.getInt32(15), x, y, b.CreateZExtOrTrunc(c->getArgOperand(3), b.getInt32Ty()), t, b.getInt32(0), b.getInt32(0)});
+			                                 {b.getInt32(15), x, y, b.CreateZExtOrTrunc(c->getArgOperand(at + 1), b.getInt32Ty()), t, b.getInt32(0), b.getInt32(0)});
 			if (tex.starts_with("read_texture_2d_ms.v4f16"))
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
+			else if (!tex.starts_with("read_texture_2d_ms.v4f"))
+				texel = b.CreateIntCast(b.CreateBitCast(texel, FixedVectorType::get(b.getInt32Ty(), 4)),
+				                        cast<StructType>(c->getType())->getElementType(0), tex.starts_with("read_texture_2d_ms.s"));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
 		} else if (auto cl = clampOps.find(op.str()); cl != clampOps.end()) {   // (x, low, high): min(max(x, low), high)
 			Value *lo = b.CreateIntrinsic(cl->second.first, {c->getType()}, {c->getArgOperand(0), c->getArgOperand(1)});
@@ -865,6 +934,90 @@ static std::string legalize(Function &k) {
 }
 
 // The entry (a kernel or shader wrapping the AIR function `air`) as an object for gfx1201: the AIR function inlined, legalised, optimised.
+// A small local array read or written at an index known only at run time (SPIR-V's through MoltenVK: a matrix's column, an array of float3s):
+// each access made into one at every constant index, the right one chosen by selects (a store: each element written with itself or the
+// value), so that SROA keeps the array in registers; AMDGPU's promotion leaves such arrays in scratch (padded float3s, a matrix's columns).
+// Arrays of at most 16 elements, accessed by plain loads and stores only.
+static void constantIndices(Function &f) {
+	SmallVector<GetElementPtrInst *, 16> geps;
+	for (Instruction &i : instructions(f))
+		if (auto *g = dyn_cast<GetElementPtrInst>(&i); g && isa<AllocaInst>(g->getPointerOperand()->stripPointerCasts()))
+			geps.push_back(g);
+	const DataLayout &dl = f.getParent()->getDataLayout();
+	for (GetElementPtrInst *g : geps) {
+		unsigned variable = 0, at = 0;
+		for (unsigned k = 1; k < g->getNumOperands(); k++)
+			if (!isa<Constant>(g->getOperand(k))) {
+				variable++;
+				at = k;
+			}
+		if (variable != 1)
+			continue;
+		// the elements: of the array the index selects in, or (O2's canonical form, `gep [16 x i8], %array, %j`) the alloca's size over the
+		// stride of the first index, the GEP on the alloca itself
+		uint64_t elements = 0;
+		if (at >= 2) {
+			SmallVector<Value *, 4> before(g->op_begin() + 2, g->op_begin() + at);
+			if (auto *array = dyn_cast_or_null<ArrayType>(GetElementPtrInst::getIndexedType(g->getSourceElementType(), before));
+			    array && isa<Constant>(g->getOperand(1)))
+				elements = array->getNumElements();
+		} else if (auto *a = dyn_cast<AllocaInst>(g->getPointerOperand()); a && a->getAllocationSize(dl)) {
+			const uint64_t stride = dl.getTypeAllocSize(g->getSourceElementType()).getFixedValue();
+			elements = stride ? a->getAllocationSize(dl)->getFixedValue() / stride : 0;
+		}
+		// the accesses: plain loads and stores of the element, or of a part of it at a constant offset (a matrix's column)
+		auto direct = [](User *u, Value *p) {
+			return (isa<LoadInst>(u) && cast<LoadInst>(u)->isSimple()) ||
+			       (isa<StoreInst>(u) && cast<StoreInst>(u)->isSimple() && cast<StoreInst>(u)->getPointerOperand() == p);
+		};
+		SmallVector<std::pair<Instruction *, uint64_t>, 8> accesses;   // the load or store, the offset in the element
+		bool plain = elements && elements <= 16;
+		for (User *u : g->users()) {
+			auto *part = dyn_cast<GetElementPtrInst>(u);
+			if (direct(u, g))
+				accesses.push_back({cast<Instruction>(u), 0});
+			else if (part && part->getSourceElementType()->isIntegerTy(8) && part->getNumIndices() == 1 && isa<ConstantInt>(part->getOperand(1)) &&
+			         all_of(part->users(), [&](User *v) { return direct(v, part); }))
+				for (User *v : part->users())
+					accesses.push_back({cast<Instruction>(v), cast<ConstantInt>(part->getOperand(1))->getZExtValue()});
+			else
+				plain = false;
+		}
+		if (!plain)
+			continue;
+		Value *index = g->getOperand(at);
+		for (auto [i, offset] : accesses) {
+			IRBuilder<> b(i);
+			auto element = [&](uint64_t k) {
+				SmallVector<Value *, 6> indices(g->op_begin() + 1, g->op_end());
+				indices[at - 1] = ConstantInt::get(index->getType(), k);
+				Value *p = b.CreateInBoundsGEP(g->getSourceElementType(), g->getPointerOperand(), indices);
+				return offset ? b.CreateInBoundsGEP(b.getInt8Ty(), p, b.getInt64(offset)) : p;
+			};
+			if (auto *load = dyn_cast<LoadInst>(i)) {
+				Value *v = b.CreateAlignedLoad(load->getType(), element(0), load->getAlign());
+				for (uint64_t k = 1; k < elements; k++)
+					v = b.CreateSelect(b.CreateICmpEQ(index, ConstantInt::get(index->getType(), k)),
+					                   b.CreateAlignedLoad(load->getType(), element(k), load->getAlign()), v);
+				load->replaceAllUsesWith(v);
+			} else {
+				auto *store = cast<StoreInst>(i);
+				Value *value = store->getValueOperand();
+				for (uint64_t k = 0; k < elements; k++) {
+					Value *p = element(k), *old = b.CreateAlignedLoad(value->getType(), p, store->getAlign());
+					b.CreateAlignedStore(b.CreateSelect(b.CreateICmpEQ(index, ConstantInt::get(index->getType(), k)), value, old), p, store->getAlign());
+				}
+			}
+			i->eraseFromParent();
+		}
+		for (User *u : make_early_inc_range(g->users()))   // the parts' GEPs, used no more
+			if (u->use_empty())
+				cast<Instruction>(u)->eraseFromParent();
+		if (g->use_empty())
+			g->eraseFromParent();
+	}
+}
+
 static std::string compile(Module &m, Function *entry, Function *air, bool pal, SmallVectorImpl<char> &object, bool *localArrays = nullptr) {
 	// The AIR function and whatever it calls inlined into the entry; the module's other entry points go (they need not translate).
 	for (const char *list : {"air.kernel", "air.vertex", "air.fragment"})
@@ -873,6 +1026,11 @@ static std::string compile(Module &m, Function *entry, Function *air, bool pal, 
 				k->replaceAllUsesWith(PoisonValue::get(k->getType()));
 				k->eraseFromParent();
 			}
+	// Threadgroup variables have no initial value in Metal, but AIR can carry one (vkQuake's SPIRV-Cross light_mask: zeros), which
+	// AMDGPU refuses for LDS: dropped.
+	for (GlobalVariable &g : m.globals())
+		if (g.getAddressSpace() == 3 && g.hasInitializer() && !isa<UndefValue>(g.getInitializer()))
+			g.setInitializer(UndefValue::get(g.getValueType()));
 	for (bool again = true; again;) {
 		again = false;
 		for (Instruction &i : instructions(*entry))
@@ -940,16 +1098,16 @@ static std::string compile(Module &m, Function *entry, Function *air, bool pal, 
 	// bytes of scratch, and the size is set without any scratch used in 29 of WindowServer's that run (2026-11-17).
 	const bool allocas = any_of(instructions(*entry), [](const Instruction &i) { return isa<AllocaInst>(i); });
 
-	if (allocas && !pal)
-		return "private memory (an alloca in AIR's address space 0) is not supported yet";
 	if (localArrays)
 		*localArrays = allocas;
 	if (allocas) {
-		FunctionPassManager fpm;
-		fpm.addPass(InferAddressSpacesPass(0));
-		fpm.addPass(SROAPass(SROAOptions::ModifyCFG));
-		fpm.addPass(InstCombinePass());
-		fpm.run(*entry, fam);
+		FunctionPassManager infer, split;
+		infer.addPass(InferAddressSpacesPass(0));
+		infer.run(*entry, fam);
+		constantIndices(*entry);
+		split.addPass(SROAPass(SROAOptions::ModifyCFG));
+		split.addPass(InstCombinePass());
+		split.run(*entry, fam);
 	}
 
 	raw_svector_ostream objectOut(object);
@@ -957,6 +1115,35 @@ static std::string compile(Module &m, Function *entry, Function *air, bool pal, 
 	if (tm->addPassesToEmitFile(cg, objectOut, nullptr, CodeGenFileType::ObjectFile))
 		return "this LLVM cannot emit an AMDGPU object";
 	cg.run(m);
+	// A kernel's local array that still needs scratch: refused (the runtime's dispatches have none), by its descriptor's
+	// private_segment_fixed_size (<kernel>.kd + 4).
+	if (allocas && !pal) {
+		auto obj = object::ObjectFile::createObjectFile(MemoryBufferRef(StringRef(object.data(), object.size()), "kernel"));
+		if (!obj) {
+			consumeError(obj.takeError());
+			return "the kernel object cannot be read";
+		}
+		for (const object::SymbolRef &sym : (*obj)->symbols()) {
+			auto name = sym.getName();
+			auto sec = sym.getSection();
+			if (!name || *name != (entry->getName() + ".kd").str() || !sec || *sec == (*obj)->section_end()) {
+				if (!name) consumeError(name.takeError());
+				if (!sec) consumeError(sec.takeError());
+				continue;
+			}
+			auto bytes = (*sec)->getContents();
+			auto at = sym.getValue();
+			uint32_t scratch = 0;
+			if (!bytes || !at || *at + 8 > bytes->size()) {
+				if (!bytes) consumeError(bytes.takeError());
+				if (!at) consumeError(at.takeError());
+				return "the kernel's descriptor cannot be read";
+			}
+			memcpy(&scratch, bytes->data() + *at + 4, 4);
+			if (scratch)
+				return "the kernel needs " + std::to_string(scratch) + " bytes of scratch memory (a local array not kept in registers)";
+		}
+	}
 	return "";
 }
 
@@ -1062,6 +1249,10 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			from[index] = 3;
 		else if (!vertex && kind == "air.front_facing" && !unused)
 			from[index] = 5;   // FRONT_FACE: > 0 for a front-facing primitive (Mesa's ac_nir_lower_intrinsics_to_args)
+		// ponytail: no per-sample shading, [[sample_id]] is 0: exact on targets of one sample, on MSAA ones each pixel reads its first
+		// sample (vkQuake's transparency resolve); PS_ITER_SAMPLES and the ancillary VGPR's sample when that shows
+		else if (!vertex && kind == "air.sample_id" && !unused)
+			from[index] = 6;
 		else if (!vertex && kind == "air.render_target" && !unused && mdInt(a, 2) == 0)
 			from[index] = 4;   // colour attachment 0 as it is (programmable blending): read at the pixel from the host's staged target
 		else if (kind == "air.buffer" && !unused) {
@@ -1072,9 +1263,14 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 					location = static_cast<int>(mdInt(a, k + 1));
 				writes |= mdString(a, k) == "air.read_write" || mdString(a, k) == "air.write";
 			}
-			if (location < 0 || location >= static_cast<int>(RDNA4_MTLC_MAX_BUFFERS) || index >= air->arg_size() ||
-			    (air->getArg(index)->getType() != PointerType::get(ctx, 1) && air->getArg(index)->getType() != PointerType::get(ctx, 2)))
-				return "buffer argument " + std::to_string(index) + ": only device and constant buffers at indices 0-27 so far";
+			Type *argType = index < air->arg_size() ? air->getArg(index)->getType() : nullptr;
+			if (location < 0 || location >= static_cast<int>(RDNA4_MTLC_MAX_BUFFERS) || !argType ||
+			    (argType != PointerType::get(ctx, 1) && argType != PointerType::get(ctx, 2))) {
+				// its address space in the message (99: not a pointer, ?: no such argument)
+				const std::string space = !argType ? "?" : std::to_string(argType->isPointerTy() ? argType->getPointerAddressSpace() : 99u);
+				return "buffer argument " + std::to_string(index) + " (index " + std::to_string(location) + ", " + space +
+				       "): only device and constant buffers at indices 0-30 so far";
+			}
 			from[index] = 100 + location;
 			written |= writes ? 1u << location : 0;
 		} else if ((kind == "air.texture" || kind == "air.sampler") && !unused) {
@@ -1110,7 +1306,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	};
 	// (Read now: compile() below deletes the AIR function once it is inlined.)
 	const bool noColour = !vertex && air->getReturnType()->isVoidTy();
-	int position = -1;
+	int position = -1, maskMember = -1;
 	bool colourZero = false;
 	// Its colour attachment: 0 when it writes that one (the others' values are dropped), else the one other it writes (CoreGraphics' path
 	// coverage and a CoreAnimation mask write a half2 to attachment 1 only, Tahoe 26.6.2): the host draws into that attachment's texture.
@@ -1126,6 +1322,14 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			vars.push_back({k, fnv(mdString(o, 1)), false, 0});
 		else if (vertex && kind == "air.point_size")
 			continue;   // only triangles are drawn: a point's size is not used
+		// ponytail: the layer is dropped: right for targets of one layer (MoltenVK's vtxCmdBlitImageLayered into vkQuake's 2D images),
+		// an array target's draws all land in its first layer; export it in the misc position (PA_CL_VS_OUT_CNTL) when one needs it
+		else if (vertex && kind == "air.render_target_array_index")
+			continue;
+		// ponytail: [[sample_mask]] only as "none": a pixel whose mask is 0 is discarded, the others write every sample (exact for one
+		// sample; vkQuake's ambient-occlusion pass on MSAA); the mask export (DB_SHADER_CONTROL.MASK_EXPORT_ENABLE, MRTZ) when that shows
+		else if (!vertex && kind == "air.sample_mask")
+			maskMember = static_cast<int>(k);
 		else if (!vertex && kind == "air.render_target" && mdInt(o, 1) == 0) {
 			memberOf[0] = static_cast<int>(k);
 			colourMember = k;
@@ -1235,7 +1439,10 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	auto table = [&]() {   // the stage's table address, from its two user SGPRs
 		return b.CreateOr(b.CreateZExt(f->getArg(kTable), b.getInt64Ty()), b.CreateShl(b.CreateZExt(f->getArg(kTable + 1), b.getInt64Ty()), 32));
 	};
-	auto bufferSlot = [](unsigned n) -> uint64_t { return n < 8 ? 8 * n : RDNA4_MTLC_TABLE_MORE_BUFFERS + 8 * (n - 8); };
+	// buffer n's place in the stage's table (28-30 past both tables: RDNA4_MTLC_HIGH_BUFFERS, from the vertex table at +0x400 of the state
+	// page or the fragment table at +0x800)
+	const uint64_t high = vertex ? RDNA4_MTLC_HIGH_BUFFERS - 0x400 : RDNA4_MTLC_HIGH_BUFFERS + 0x20 - 0x800;
+	auto bufferSlot = [&](unsigned n) -> uint64_t { return n < 8 ? 8 * n : n < 28 ? RDNA4_MTLC_TABLE_MORE_BUFFERS + 8 * (n - 8) : high + 8 * (n - 28); };
 	auto buffer = [&](unsigned n, Type *t) -> Value * {   // buffer n's address from the stage's table (constant memory, scalar loads)
 		Value *at = b.CreateIntToPtr(b.CreateAdd(table(), b.getInt64(bufferSlot(n))), PointerType::get(ctx, 4));
 		Value *address = b.CreateIntToPtr(b.CreateAlignedLoad(b.getInt64Ty(), at, Align(8)), PointerType::get(ctx, 1));
@@ -1266,9 +1473,12 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		Value *rate = b.CreateExtractElement(rec, 3);
 		Value *slot = b.CreateAnd(info, 31), *kind = b.CreateAnd(b.CreateLShr(info, 8), 15), *count = b.CreateAnd(b.CreateLShr(info, 12), 7);
 		Value *bgra = b.CreateICmpNE(b.CreateAnd(info, 1u << 15), b.getInt32(0)), *step = b.CreateAnd(b.CreateLShr(info, 16), 3);
-		// the buffer's address: indices 0-7 at +8 n, 8-27 at RDNA4_MTLC_TABLE_MORE_BUFFERS
+		// the buffer's address: indices 0-7 at +8 n, 8-27 at RDNA4_MTLC_TABLE_MORE_BUFFERS, 28-30 at RDNA4_MTLC_HIGH_BUFFERS (MoltenVK binds
+		// vertex buffers from 30 down)
 		Value *slotAt = b.CreateSelect(b.CreateICmpULT(slot, b.getInt32(8)), b.CreateShl(slot, 3),
-		                               b.CreateAdd(b.getInt32(RDNA4_MTLC_TABLE_MORE_BUFFERS - 64), b.CreateShl(slot, 3)));
+		                               b.CreateSelect(b.CreateICmpULT(slot, b.getInt32(28)),
+		                                              b.CreateAdd(b.getInt32(RDNA4_MTLC_TABLE_MORE_BUFFERS - 64), b.CreateShl(slot, 3)),
+		                                              b.CreateAdd(b.getInt32(static_cast<uint32_t>(high) - 8 * 28), b.CreateShl(slot, 3))));
 		Value *base = b.CreateAlignedLoad(b.getInt64Ty(), b.CreateIntToPtr(b.CreateAdd(table(), b.CreateZExt(slotAt, b.getInt64Ty())),
 		                                                                  PointerType::get(ctx, 4)), Align(8));
 		// the element: per vertex, per instance (step rate 0: always the first), or constant
@@ -1358,6 +1568,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			               : from[k] == 3 ? fromVec4(fragPosition(), air->getArg(k)->getType())
 			               : from[k] == 4 ? fromVec4(framebuffer(), air->getArg(k)->getType())
 			               : from[k] == 5 ? b.CreateZExtOrTrunc(b.CreateFCmpOGT(f->getArg(kFrontFace), ConstantFP::get(f32, 0.0)), air->getArg(k)->getType())
+			               : from[k] == 6 ? Constant::getNullValue(air->getArg(k)->getType())
 			               : from[k] >= 300 ? resource(k, RDNA4_MTLC_TABLE_SAMPLERS + 16 * static_cast<unsigned>(from[k] - 300), 16)
 			               : from[k] >= 200 ? resource(k, RDNA4_MTLC_TABLE_TEXTURES + 32 * static_cast<unsigned>(from[k] - 200), 32)
 			               : from[k] >= 100 ? buffer(static_cast<unsigned>(from[k] - 100), air->getArg(k)->getType())
@@ -1439,6 +1650,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			inValues.push_back(v);
 		}
 		Value *colour = callAir(nullptr);
+		if (maskMember >= 0)
+			b.CreateIntrinsic(Intrinsic::amdgcn_kill, {}, {b.CreateICmpNE(b.CreateExtractValue(colour, static_cast<unsigned>(maskMember)), b.getInt32(0))});
 		if (colour->getType()->isVoidTy()) {   // no colour (it writes textures, say): an mrt0 export with no channels ends the shader (gfx11+
 			Value *undef = PoisonValue::get(f32);   // has no null target; the host sets SPI_SHADER_COL_FORMAT to none)
 			b.CreateIntrinsic(Intrinsic::amdgcn_exp, {f32}, {b.getInt32(0), b.getInt32(0), undef, undef, undef, undef, b.getTrue(), b.getTrue()});
@@ -1677,6 +1890,23 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 		// A constant buffer (AIR's address space 2) is cast here and made global memory again by legalize().
 		Value *table = kernel->getArg(nBuffers + 6);
 		const unsigned slot = static_cast<unsigned>(a.location);   // a texture's or sampler's index (0-15)
+		// An array of textures or samplers (array<texture2d, n>: AIR passes a pointer to n handles, byval) as such an array, made here as
+		// translateShader's resource() does: with the first T#'s address in its place, vkQuake's lightmap kernel (three textures) read the
+		// T#'s bytes as handles and the compute queue hung on the garbage descriptors, the desktop flashing until a reboot (2026-11-18).
+		auto *array = (a.role == Texture || a.role == Sampler) && air->getArg(i)->hasByValAttr() ? dyn_cast<ArrayType>(air->getParamByValType(i)) : nullptr;
+		if (array) {
+			const uint64_t stride = a.role == Texture ? 32 : 16;
+			const uint64_t at = (a.role == Texture ? RDNA4_MTLC_TABLE_TEXTURES : RDNA4_MTLC_TABLE_SAMPLERS) + stride * slot;
+			if (slot + array->getNumElements() > 16)
+				return "argument " + std::to_string(i) + ": an array of " + std::to_string(array->getNumElements()) + " past index 15";
+			IRBuilder<> entry(&kernel->getEntryBlock(), kernel->getEntryBlock().getFirstInsertionPt());
+			AllocaInst *handles = entry.CreateAlloca(array);
+			for (unsigned e = 0; e < array->getNumElements(); e++)
+				b.CreateStore(b.CreateIntToPtr(b.CreateAdd(table, b.getInt64(at + stride * e)), array->getElementType()),
+				              b.CreateConstInBoundsGEP2_32(array, handles, 0, e));
+			callArgs.push_back(handles);
+			continue;
+		}
 		Value *v = a.role == Buffer      ? b.CreateAddrSpaceCast(kernel->getArg(static_cast<unsigned>(a.location)), air->getArg(i)->getType())
 		         : a.role == Texture     ? b.CreateIntToPtr(b.CreateAdd(table, b.getInt64(RDNA4_MTLC_TABLE_TEXTURES + 32 * slot)), air->getArg(i)->getType())
 		         : a.role == Sampler     ? b.CreateIntToPtr(b.CreateAdd(table, b.getInt64(RDNA4_MTLC_TABLE_SAMPLERS + 16 * slot)), air->getArg(i)->getType())
@@ -1762,6 +1992,22 @@ static void dump(uint64_t req, const char *name, StringRef lib, const std::strin
 
 	dumpFile(base + ".metallib", lib);
 	dumpFile(base + ".rgfx", out);
+}
+
+// A library a function of which could not be translated, kept beside the cache (failed/<hash>-<name>.metallib, at most 256 of them), to
+// translate it again by hand (air2amdgpu <lib> <name> <out>) on another machine: an app's shaders cannot be made without the app.
+static void keepFailed(StringRef lib, const char *name) {
+	static unsigned kept;
+	const std::string dir = "/var/db/rdna4-air2amdgpu/failed";
+
+	if (kept >= 256)
+		return;
+	sys::fs::create_directories(dir);
+	const std::string path = dir + "/" + Twine::utohexstr(xxh3_64bits(arrayRefFromStringRef(lib))).str() + "-" + name + ".metallib";
+	if (!sys::fs::exists(path)) {
+		dumpFile(path, lib);
+		kept++;
+	}
 }
 
 // The translations of earlier runs, by library, function and this build of the translator: WindowServer asks for its 70-odd shaders on every
@@ -1869,6 +2115,8 @@ static int serve() {
 
 		errs() << "air2amdgpu: request " << req[0] << ": " << name << ": " << (why.empty() ? what : why) << "\n";
 		dump(req[0], name, StringRef(lib.data(), req[1]), k.hsaco);
+		if (!why.empty())
+			keepFailed(library, name);
 		const uint64_t reply[6] = {req[0], reinterpret_cast<uint64_t>(k.hsaco.data()), why.empty() ? k.hsaco.size() : 0, k.buffers, k.written,
 		                           k.texturesWritten};
 		IOConnectCallScalarMethod(conn, kMtlcDeliver, reply, 6, nullptr, nullptr);

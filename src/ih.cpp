@@ -923,7 +923,7 @@ bool RDNA4Compute::ihWaitFence(volatile uint32_t *fence, uint32_t value, uint32_
 				waitAborted = true;
 				break;
 			}
-			if (polls < 200)
+			if (polls < kSpinPolls)   // as launch's
 				IODelay(10);
 			else
 				IOSleep(1);
