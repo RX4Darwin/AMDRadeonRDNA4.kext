@@ -32,7 +32,8 @@ the card, and the Dock and apps draw with Metal; Liquid Glass's kernels run
 since 2026-11-11 (Sequoia 15 tested by Jan Claußen), and since 2026-11-14 its blurred
 glass (Finder's sidebar) too. OpenGL apps draw on the card as well
 (Apple's GL-on-Metal renderer; kitty and Mixxx run). Since 2026-11-17 Metal 3D runs on it too: MetalQuake at
-3840x1878 in HDR at 60 frames a second, and WebGL in Safari (with `rdna4-pvmac2=1`). See
+3840x1878 in HDR at 60 frames a second, and WebGL in Safari (with `rdna4-pvmac2=1`); since 2026-11-18 Vulkan
+through MoltenVK as well: vkQuake plays at 4K, about 44 frames a second. See
 [Metal](#metal-on-macos-tahoe-and-sequoia-experimental).
 
 > **Why a Lilu plugin?** The earlier build was a standalone `IOFramebuffer`
@@ -274,7 +275,9 @@ plays its demo and its levels at 3840x1878 in HDR at 60 frames a second. WebGL r
 Tahoe's Intel build of the paravirtual Metal driver reports a device without Mac GPU family 2, which WebGL (ANGLE)
 requires, and the boot-arg patches that one value as the driver loads. It is off by default: Chrome then takes its
 Dawn path, whose shaders do not translate yet, and WindowServer hung while it ran. `tools/metal/webgl/` has the cube
-check and the spinning cubes as a WebGL page.
+check and the spinning cubes as a WebGL page. Vulkan games run through MoltenVK (card, 2026-11-18): vkQuake 1.37
+plays at 3840x2160, its `timedemo demo1` at 43.7 frames a second, once `userspace/moltenvk/install.sh` has turned
+MoltenVK's Metal argument buffers off (the paravirtual driver has none; below).
 
 **OpenGL** (on unless `rdna4-pvgl=0`, card 2026-11-12 to 2026-11-14): macOS's OpenGL 4.1 on Metal
 (`AppleMetalOpenGLRenderer.bundle`) runs on the paravirtual GPU, so unmodified OpenGL programs draw on the card:
