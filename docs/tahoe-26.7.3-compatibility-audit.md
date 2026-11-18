@@ -44,8 +44,12 @@ VM test proves physical GPU compatibility.
    symbols before any boot test.
 4. If host tests and static checks pass, prepare a separate test EFI copy and a
    reversible boot entry. Do not overwrite the known-good EFI.
-5. Perform one controlled boot test with verbose logging and the project's documented
-   kill switch available. Capture the complete panic/reboot evidence if it fails.
+5. First perform an injection-only boot with `rdna4-off=1` and verbose logging.
+   This must remain inert: it verifies injection/boot stability only, not display
+   takeover or GPU operation. Capture complete panic/reboot evidence if it fails.
+6. Only after the inert boot is stable, prepare a separate reversible test entry
+   without `rdna4-off=1` for an active display-path test. Keep the known-good EFI
+   untouched and retain the kill switch as the recovery path.
 6. Only patch source when the failure is tied to a specific incompatibility in the
    26.7.3 kernel environment. Add a regression test where the affected code can be
    exercised on the host.
@@ -129,23 +133,23 @@ kill switch only after the inert boot is stable and the test configuration has b
 reviewed. Do not combine the first active test with `PVGPU=1`, extra experimental
 boot arguments, or changes to WhateverGreen.
 
-## Experimental code change: conservative compute default
+## Compute-stage selection and diagnostic boot
 
-The compatibility branch now differs from upstream source in one runtime behavior:
-`RDNA4Compute::requestedStage()` defaults to `StageSurvey` (stage 1) rather than
-`StageGfx` (stage 3). Stage 1 is documented as read-only and runs inline; it
-does not load the GPU firmware or start the later bring-up thread. An explicit
-`rdna4-compute=<stage>` boot argument still overrides the default, so
-`rdna4-compute=3` requests the previous GFX/SMU firmware stage.
+The compatibility branch preserves the upstream runtime default:
+`RDNA4Compute::requestedStage()` selects `StageGfx` (stage 3) when no
+`rdna4-compute` argument is supplied. This retains the normal GFX/SMU firmware
+bring-up behavior rather than silently changing it for every user.
 
-This is a **diagnostic experiment**, not a proven Tahoe fix. It is intended to
-separate the NDRV/display takeover path from the later GPU firmware bring-up
-that may be involved in the user's earlier reboot. It may leave the display
-path without the display clocks needed for higher resolutions or full
-functionality. Do not treat a successful stage-1 boot as proof that the GPU is
-accelerated, and do not enable stages 3+ until the stage-1 result and logs are
-reviewed. The user's known-good EFI remains separate; this branch build is not
-to be installed over it.
+For a read-only diagnostic survey, explicitly pass `rdna4-compute=1`.
+Stage 1 runs inline and reads status/register information without loading GPU
+firmware or starting the later bring-up thread. Other explicit
+`rdna4-compute=<stage>` values retain their documented meaning.
+
+A successful stage-1 survey is diagnostic evidence only: it is not proof of
+display takeover or GPU acceleration. Keep the first injection-only boot
+separate and inert with `rdna4-off=1`; test active display/compute stages only
+in a separate reversible EFI after that boot is stable. The known-good EFI
+must remain untouched.
 
 
 ## Full Metal acceleration path (experimental)
