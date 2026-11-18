@@ -85,6 +85,7 @@ void Pool::bind(uint32_t v, uintptr_t owner, uint64_t pd, uint64_t tlbSeq, Grant
 	for (uint32_t d = 0; d < kMaxDomains; d++)
 		s.pending[d] = false;           // idle by construction
 	out.vmid = v;
+	out.flushSeq = tlbSeq;
 	out.rebind = true;
 	out.flush = true;
 	counters.binds++;
@@ -153,6 +154,7 @@ Result Pool::grab(uintptr_t owner, uint64_t pd, uint64_t tlbSeq, Grant &out) {
 			s.flushPending = true;
 			s.flushSeq = tlbSeq;
 		}
+		out.flushSeq = s.flushSeq;
 		out.flush = s.flushPending;
 		s.lastUse = ++tick;
 		counters.reuses++;
@@ -172,13 +174,13 @@ Result Pool::pin(uintptr_t owner, uint64_t pd, uint64_t tlbSeq, Grant &out) {
 	return takeNew(owner, pd, tlbSeq, true, out);
 }
 
-bool Pool::flushComplete(uintptr_t owner, uint32_t vmid) {
+bool Pool::flushComplete(uintptr_t owner, uint32_t vmid, uint64_t coveredSeq) {
 	if (vmid < kFirst || vmid > kLast)
 		return false;
 	Slot &s = slot[vmid];
-	if (!owner || s.owner != owner || !s.flushPending)
+	if (!owner || s.owner != owner || !s.flushPending || s.flushSeq != coveredSeq)
 		return false;
-	s.boundSeq = s.flushSeq;
+	s.boundSeq = coveredSeq;
 	s.flushPending = false;
 	return true;
 }
