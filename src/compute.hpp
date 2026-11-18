@@ -33,7 +33,7 @@
 //
 //  Selected with rdna4-compute=<stage>, a boot-arg or a test boot's option
 //  (trial.hpp); absent = stage 3 (GFX/SMU firmware needed for display clocks);
-//  explicitly request stage 1 for the read-only survey. 0 = off, and the
+//  explicitly request stage 1 for the survey-only diagnostic. 0 = off, and the
 //  plugin behaves exactly as without this file.
 //  Each stage runs the ones before it. Stage 1 runs inline;
 //  stages 2+ run on their own kernel thread a few seconds later, so the
