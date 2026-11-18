@@ -2,9 +2,10 @@
 //  compute.cpp
 //  AMDRadeonRDNA4
 //
-//  See compute.hpp. Stage 1 (survey) only reads registers. Stage 2 is the
-//  first to write: PSP mailbox/ring registers, the HDP flush, and the compute
-//  pool in VRAM — never DCN, the MM hub or the scanout.
+//  See compute.hpp. Stage 1 (survey) only reads compute/display status
+//  registers; it does not make the whole plugin inert or disable its display
+//  hooks. Stage 2 is the first compute stage to write: PSP mailbox/ring
+//  registers, the HDP flush, and the compute pool in VRAM.
 //
 
 #include "codeobj.hpp"
