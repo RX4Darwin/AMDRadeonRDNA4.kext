@@ -42,6 +42,9 @@ jobs:
       - name: Run host-side regression tests
         run: make test
 
+      - name: Fetch AMD firmware blobs for compute bring-up
+        run: tools/build/fetch-firmware.sh
+
       - name: Build standard x86_64 kext
         run: |
           make PVGPU=0
@@ -62,22 +65,14 @@ jobs:
           mkdir -p "$RUNNER_TEMP/rdna4-artifacts/pvgpu"
           cp -R "$KEXT" "$RUNNER_TEMP/rdna4-artifacts/pvgpu/"
           # The compute firmware is required for the stage-7 runtime on real hardware.
-          missing=0
           for f in firmware/amdgpu/psp_14_0_3_sos.bin firmware/amdgpu/smu_14_0_3.bin \
                    firmware/amdgpu/sdma_7_0_1.bin firmware/amdgpu/gc_12_0_1_pfp.bin \
                    firmware/amdgpu/gc_12_0_1_me.bin firmware/amdgpu/gc_12_0_1_mec.bin \
                    firmware/amdgpu/gc_12_0_1_uni_mes.bin firmware/amdgpu/gc_12_0_1_imu.bin \
                    firmware/amdgpu/gc_12_0_1_rlc.bin firmware/amdgpu/dcn_4_0_1_dmcub.bin; do
-            if [ ! -f "$f" ]; then
-              echo "::warning::Missing firmware blob: $f"
-              missing=1
-            fi
+            test -s "$f" || { echo "::error::Missing compute firmware blob: $f"; exit 1; }
           done
-          if [ "$missing" -eq 0 ]; then
-            echo "All compute firmware blobs are present."
-          else
-            echo "::warning::This artifact can compile but cannot complete the documented stage-7 bring-up without the missing firmware."
-          fi
+          echo "All ten compute firmware blobs are present in the PVGPU build."
 
       - name: Verify both bundle metadata and architecture
         run: |
