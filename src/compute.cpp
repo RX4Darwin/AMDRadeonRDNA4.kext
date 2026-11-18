@@ -114,8 +114,8 @@ void RDNA4Compute::publishResult(const char *feature, const char *value) {
 }
 
 uint32_t RDNA4Compute::requestedStage() {
-	// Preserve the upstream GFX/SMU firmware bring-up default. For an
-	// inert, read-only diagnostic survey, explicitly pass rdna4-compute=1.
+	// Preserve the upstream GFX/SMU firmware bring-up default. For a
+	// read-only compute diagnostic survey, explicitly pass rdna4-compute=1.
 	// Other explicit rdna4-compute=<stage> values retain their normal meaning.
 	uint32_t stage = StageGfx;
 
