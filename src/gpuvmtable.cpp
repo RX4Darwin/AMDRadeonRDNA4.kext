@@ -87,8 +87,17 @@ bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 
 bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable, Span &out) {
 	out = Span {};
-	if (end > GpuVm::kVaStart + denseVa(tableBytes))
+	if (!a.entry || !a.phys || !pageBuses || end < va ||
+	    ((va | end) & (GpuVm::kPageBytes - 1)) ||
+	    end > GpuVm::kVaStart + denseVa(tableBytes))
 		return false;
+
+	/* Validate the complete bus-page list before touching a PTE. A bad page
+	 * late in the range must not leave earlier pages mapped in the shadow. */
+	const uint64_t pageCount = (end - va) / GpuVm::kPageBytes;
+	for (uint64_t page = 0; page < pageCount; page++)
+		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
+			return false;
 
 	uint64_t page = 0;
 	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes, page++) {
@@ -177,15 +186,23 @@ bool treeMapVram(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, ui
 }
 
 bool treeMapHost(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, const uint64_t *pageBuses, bool executable) {
+	if (!t.page || !t.dirty || !pageBuses || end < va ||
+	    ((va | end) & (GpuVm::kPageBytes - 1)) ||
+	    va < GpuVm::kVaStart || end > GpuVm::kVaEnd)
+		return false;
+
+	/* Do not allocate directories or write leaves until every host bus page
+	 * has passed alignment validation. */
+	const uint64_t pageCount = (end - va) / GpuVm::kPageBytes;
+	for (uint64_t page = 0; page < pageCount; page++)
+		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
+			return false;
+
 	uint64_t *pt = nullptr;
 	uint32_t ptId = 0;
 	uint64_t ptKey = ~0ull;
 	uint64_t page = 0;
 	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes, page++) {
-		if (pageBuses[page] & (GpuVm::kPageBytes - 1))
-			return false;
-		if (at < GpuVm::kVaStart || at >= GpuVm::kVaEnd)
-			return false;
 		if ((at >> 21) != ptKey) {
 			if (!treePath(t, at, true, pt, ptId))
 				return false;
