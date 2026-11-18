@@ -1580,14 +1580,11 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index, mach_vm_addre
 	patcher.clearError();
 }
 
-bool ndrvRouted = false;    // the essential NDRV route is installed
-bool ndrvRouting = false;   // serializes Lilu's load callback and the late-load retry
+Ndrv::RouteGate ndrvRouteGate;
 
 void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address,
                  size_t size) {
-	if (index != kextIONDRVSupport.loadIndex ||
-	    __atomic_load_n(&ndrvRouted, __ATOMIC_SEQ_CST) ||
-	    __atomic_exchange_n(&ndrvRouting, true, __ATOMIC_SEQ_CST))
+	if (index != kextIONDRVSupport.loadIndex || !ndrvRouteGate.begin())
 		return;
 	KernelPatcher::RouteRequest request {
 		"__ZN17IONDRVFramebuffer10doDriverIOEjPvjj", wrapDoDriverIO, orgDoDriverIO,
@@ -1596,13 +1593,12 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
 		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d); leaving late-load retry armed",
 		      patcher.getError());
 		patcher.clearError();
-		__atomic_store_n(&ndrvRouting, false, __ATOMIC_SEQ_CST);
+		ndrvRouteGate.finish(false);
 		return;
 	}
 	FBLOG("ndrv: routed IONDRVFramebuffer::doDriverIO");
 	patcher.clearError();
-	__atomic_store_n(&ndrvRouted, true, __ATOMIC_SEQ_CST);
-	__atomic_store_n(&ndrvRouting, false, __ATOMIC_SEQ_CST);
+	ndrvRouteGate.finish(true);
 	// The second display and its hot-plug are on unless turned off: lit at
 	// boot, mode switching, display sleep and hot-plug ran on the card for an
 	// HDMI monitor on either connector (2026-10-04..06). Not in VM test
@@ -1705,7 +1701,7 @@ KernelPatcher *gPatcher = nullptr;
 thread_call_t gLateNdrv = nullptr;
 
 void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
-	if (__atomic_load_n(&ndrvRouted, __ATOMIC_SEQ_CST) || !gPatcher)
+	if (ndrvRouteGate.installed() || !gPatcher)
 		return;
 	kmod_info_t *ndrv = nullptr;
 	if (auto **kmods = reinterpret_cast<kmod_info_t **>(gPatcher->solveSymbol(KernelPatcher::KernelID, "_kmod")))
@@ -1731,7 +1727,7 @@ void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
 	const size_t size = gPatcher->updateRunningInfo(kextIONDRVSupport.loadIndex, ndrv->address, ndrv->size);
 	gPatcher->clearError();
 	processKext(nullptr, *gPatcher, kextIONDRVSupport.loadIndex, ndrv->address, size);
-	if (!__atomic_load_n(&ndrvRouted, __ATOMIC_SEQ_CST)) {
+	if (!ndrvRouteGate.installed()) {
 		if (up < 120ull * NSEC_PER_SEC) {
 			FBLOG("ndrv: primary route is not installed yet; retrying late-load check");
 			uint64_t deadline;
