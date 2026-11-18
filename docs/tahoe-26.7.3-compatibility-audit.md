@@ -119,3 +119,21 @@ documented `rdna4-off=1` kill switch for the first injection-only check. Remove 
 kill switch only after the inert boot is stable and the test configuration has been
 reviewed. Do not combine the first active test with `PVGPU=1`, extra experimental
 boot arguments, or changes to WhateverGreen.
+
+## Experimental code change: conservative compute default
+
+The compatibility branch now differs from upstream source in one runtime behavior:
+`RDNA4Compute::requestedStage()` defaults to `StageSurvey` (stage 1) rather than
+`StageGfx` (stage 3). Stage 1 is documented as read-only and runs inline; it
+does not load the GPU firmware or start the later bring-up thread. An explicit
+`rdna4-compute=<stage>` boot argument still overrides the default, so
+`rdna4-compute=3` requests the previous GFX/SMU firmware stage.
+
+This is a **diagnostic experiment**, not a proven Tahoe fix. It is intended to
+separate the NDRV/display takeover path from the later GPU firmware bring-up
+that may be involved in the user's earlier reboot. It may leave the display
+path without the display clocks needed for higher resolutions or full
+functionality. Do not treat a successful stage-1 boot as proof that the GPU is
+accelerated, and do not enable stages 3+ until the stage-1 result and logs are
+reviewed. The user's known-good EFI remains separate; this branch build is not
+to be installed over it.
