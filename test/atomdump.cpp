@@ -4008,20 +4008,23 @@ static int testVmidPool() {
 	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.rebind && g.flush && !g.stolen &&
 	           g.vmid >= kFirst && g.vmid <= kLast, "vmid: first grab binds a fresh VMID");
 	const uint32_t v1 = g.vmid;
-	f += check(!pool.flushComplete(2, v1), "vmid: another owner cannot acknowledge this VMID's flush");
+	f += check(!pool.flushComplete(2, v1, g.flushSeq), "vmid: another owner cannot acknowledge this VMID's flush");
 	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid == v1 && !g.rebind && g.flush,
 	           "vmid: a bind keeps its flush pending until hardware acknowledgement");
-	f += check(pool.flushComplete(1, v1), "vmid: successful hardware invalidation acknowledges the bind flush");
+	f += check(pool.flushComplete(1, v1, g.flushSeq), "vmid: successful hardware invalidation acknowledges the bind flush");
 	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid == v1 && !g.rebind && !g.flush,
 	           "vmid: same owner and PD reuse the acknowledged VMID without another flush");
 
 	// A flush is owed only when the client removed PTEs (its tlbSeq moved) since the last acknowledged flush.
 	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.vmid == v1 && !g.rebind && g.flush,
 	           "vmid: tlbSeq advanced -> flush, still no rebind");
+	const uint64_t flush3 = g.flushSeq;
 	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.flush,
 	           "vmid: failed/unacknowledged flush remains pending on retry");
 	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && g.flush,
 	           "vmid: a newer PTE-removal sequence extends an outstanding flush");
+	f += check(!pool.flushComplete(1, v1, flush3),
+	           "vmid: an acknowledgement for an older sequence cannot clear a newer pending flush");
 	f += check(pool.flushComplete(1, v1), "vmid: the flush is cleared only after acknowledgement");
 	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && !g.flush, "vmid: acknowledged latest flush is not repeated");
 	// Negative control: a pool that ignored tlbSeq or acknowledged before hardware completion would fail these checks.
