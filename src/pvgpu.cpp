@@ -568,6 +568,7 @@ private:
 	void stampLater(uint32_t index, uint32_t value);
 	void completeLate();
 	bool drawing(uint32_t task, uint32_t id) const;
+	bool drawnInBatch(uint32_t task, uint32_t id) const;
 	struct BlitRegion;
 	bool copyTextureRegion(uint32_t task, bool toTexture, uint32_t tex, uint32_t buf, const BlitRegion &r);
 	bool copyTexture(uint32_t task, uint32_t from, const uint64_t at[3], uint32_t to, const uint64_t into[3], const uint64_t size[3]);
@@ -575,6 +576,11 @@ private:
 	void presentTransaction(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
+	void updateCursorGlyph(const pvstream::FifoCommand &c, const uint8_t *cmd);
+	// The cursor size the pages announce, and the head's cursor plane's (cursor.cpp; DCN 4.01's limit, Linux's max_cursor_size). Announced
+	// larger: at 64 WindowServer drew the pointer itself on a HiDPI display (its 2x images need more); each image is cropped to what it
+	// covers, which for the arrow fits the plane.
+	static constexpr uint16_t kPvCursorAnnounced = 128, kPvCursorPixels = 64;
 	void completeStamp(uint32_t index, uint32_t value);
 	// A system sleep (RDNA4Compute::powerSleepRequest, the card still powered and taking submissions): what lives only in VRAM
 	// written back to the guest, then everything held of the runtime given back, as the card loses its power and VRAM with it;
@@ -961,6 +967,9 @@ private:
 	// shadow filled) goes out before it, and a batch is closed by it, so the draw can go out later than nextSubmit() said.
 	static constexpr uint32_t kUsedMax = 64;
 	bool mBuilding { false };
+	bool mReadsBatched { false };   // the draw being put together samples a texture a draw before it in the open batch drew into
+	uint64_t mBatchedReads { 0 };   // such draws since the boot (debug.rdna4_pvnotrun's last line)
+	uint64_t mFractionalViewports { 0 };   // draws whose viewport is in fractions of a pixel (debug.rdna4_pvnotrun)
 	Mapping *mUsedMaps[kUsedMax] {};
 	Shadow *mUsedShadows[kUsedMax] {};
 	uint32_t mUsedMapCount { 0 }, mUsedShadowCount { 0 }, mBuildSlot { ~0u };
@@ -1199,6 +1208,12 @@ int RDNA4PvHost::notRunCensus(struct sysctl_req *req)
 			at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at, "%llu %s (first \"%s\")\n", r.count, r.why, r.name));
 	if (mNotRunOther && at < sizeof(text) - 1)
 		at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at, "%llu other reasons\n", mNotRunOther));
+	if (mFractionalViewports && at < sizeof(text) - 1)
+		at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at, "(%llu draws run with a viewport in fractions of a pixel)\n",
+		                                   static_cast<unsigned long long>(mFractionalViewports)));
+	if (mBatchedReads && at < sizeof(text) - 1)   // run, not refused: how often a draw waited for the batch's draws before it
+		at += static_cast<size_t>(snprintf(text + at, sizeof(text) - at, "(%llu draws run after a barrier: a texture drawn earlier in their batch)\n",
+		                                   static_cast<unsigned long long>(mBatchedReads)));
 	if (at >= sizeof(text))
 		at = sizeof(text) - 1;
 	return SYSCTL_OUT(req, text, at + 1);
@@ -2068,6 +2083,10 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			mCursorCmds++;
 		else if (c.id == 0x1e)
 			mFlushes++;
+		if (c.id == 0x04 && c.length <= sizeof(mWin)) {
+			copy(at, mWin, c.length);
+			updateCursorGlyph(c, mWin);
+		}
 		if (c.signal) {
 			// the command asks for a stamp when it completes (AppleParavirtCommandAllocator::addSignal): remember the last value of this batch
 			lastSignal = c.signal;
@@ -2450,7 +2469,15 @@ bool RDNA4PvHost::drawing(uint32_t task, uint32_t id) const
 		if (mDirty[i].key == key)
 			return true;
 
-	for (uint32_t i = 0; i < mBatchDraws; i++)   // put together, not submitted yet: waitDraws submits them first
+	return drawnInBatch(task, id);   // put together, not submitted yet: waitDraws submits them first
+}
+
+// Whether a draw put together in the open batch (not submitted yet) draws into texture `id`.
+bool RDNA4PvHost::drawnInBatch(uint32_t task, uint32_t id) const
+{
+	const uint32_t key = task << 16 | (id & 0xffff);
+
+	for (uint32_t i = 0; i < mBatchDraws; i++)
 		if (mBatchDirty[i] == key)
 			return true;
 
@@ -2567,13 +2594,15 @@ void RDNA4PvHost::flushBatch()
 			dirtied(dirty[i] >> 16, dirty[i] & 0xffff, fence);
 }
 
+// GCR_CNTL: GLK, GLV and GL1 invalidated (ACQUIRE_MEM): what the card wrote outside a shader's caches read fresh by the work after it.
+static constexpr uint32_t kGcrShaderCaches = 1u << 7 | 1u << 8 | 1u << 9;
+
 // A dispatch of a translated kernel put into the batch (false: the runtime's own dispatch takes it). After it the compute work is waited
 // for and the shader caches dropped, so that the draws after it read what it wrote (GL's fixed indices).
 bool RDNA4PvHost::batchDispatch(const Jit &j, const uint8_t *args, uint32_t argBytes, const uint32_t groups[3], const uint32_t groupSize[3])
 {
 	static constexpr uint32_t kMaxDwords = 64;
 	static constexpr uint32_t kCsPartialFlush = 7 | 4u << 8;   // EVENT_WRITE CS_PARTIAL_FLUSH, EVENT_INDEX 4
-	static constexpr uint32_t kGcrShaderCaches = 1u << 7 | 1u << 8 | 1u << 9;   // GCR_CNTL: GLK, GLV and GL1 invalidated
 	const uint64_t *l = j.launch;
 	const uint32_t rsrc2 = static_cast<uint32_t>(l[4]);
 	const uint32_t bytes = (static_cast<uint32_t>(l[1] > argBytes ? l[1] : argBytes) + 3) & ~3u;
@@ -4577,6 +4606,8 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 
 		ok = textureSource(task, id, src);
 
+		mReadsBatched |= id && drawnInBatch(task, id);   // (copies are in the batch as task and target 0)
+
 		// Over a held target's memory: what was drawn into it written back first. The draw's own held target is read from a copy instead
 		// (copyHeld).
 		if (ok)
@@ -6275,7 +6306,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint64_t targetAt = nowNs();
 
 	mPhaseNs[4] += targetAt - drawFrom;
-	// The colour attachment: a linear 32-bit or RGBA16Float texture, or a BGRA8 IOSurface (surfaceRange; its rows width * 4 bytes, bpr apart).
+	// The colour attachment: a linear texture of a known format, or an IOSurface of one (surfaceRange; its rows bpr apart).
 	uint64_t va = 0, len = 0;
 	uint32_t bpr = 0, width = 0, height = 0;
 	Surface surface;
@@ -6303,9 +6334,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		height = targetFormat || texHeight ? texHeight : static_cast<uint32_t>(len / bpr);
 		bgra = !targetFormat || targetFormat == 80 || targetFormat == 81;
 	}
-	else if (!why && !targetLevel && surfaceRange(task, targetId, surface) && known(surface.format) && surface.format != 70 && surface.format != 71) {
+	else if (!why && !targetLevel && surfaceRange(task, targetId, surface) && known(surface.format)) {
 		// BGRA8 (sRGB as unorm, as a texture of it: CAMetalLayer's drawables of Maps), or as the texture of that format (115:
-		// CoreAnimation's extended-range layers on Tahoe)
+		// CoreAnimation's extended-range layers on Tahoe; 70: WindowServer's RGBA8 copy of an inactive window's material, Safari's Downloads
+		// popover with another app in front: refused, the popover's background stayed empty and its text was drawn over itself, 2026-11-18)
 		bpr = surface.bytesPerRow;
 		width = surface.width;
 		height = surface.height;
@@ -6350,15 +6382,20 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 					      d[i + 11], d[i + 12], d[i + 13], d[i + 14], d[i + 15]);
 		}
 	}
-	// The viewport: Render.setViewport's, else the whole target; whole pixels only so far (window = origin + (ndc + 1) * size / 2, y down;
-	// a negative height flips y).
-	// ponytail: a viewport in fractions of a pixel (vkQuake's through MoltenVK) to the nearest whole ones: up to half a pixel off
+	// The viewport: Render.setViewport's, else the whole target (window = origin + (ndc + 1) * size / 2, y down; a negative height flips y).
+	// A viewport in fractions of a pixel (vkQuake's through MoltenVK: 7890 draws in a timedemo, 2026-11-19; WindowServer's are whole) checked
+	// in whole pixels and set in 1/256 pixel (qx..qh); rounded to whole pixels before, up to half a pixel off.
 	int64_t vx = 0, vy = 0, vw = width, vh = height;
+	int64_t qx = 0, qy = 0, qw = static_cast<int64_t>(width) << 8, qh = static_cast<int64_t>(height) << 8;
 	if (!why && draw.viewportSet &&
 	    !(roundedDouble(draw.viewport[0], vx) && roundedDouble(draw.viewport[1], vy) && roundedDouble(draw.viewport[2], vw) &&
 	      roundedDouble(draw.viewport[3], vh) && vw > 0 && vh != 0 && vw <= 32768 && vh >= -32768 && vh <= 32768 && vx > -32768 && vx < 32768 &&
 	      vy > -32768 && vy < 32768))
 		why = "a viewport too large, or empty";
+	if (!why && draw.viewportSet && !(roundedDouble(draw.viewport[0], qx, 8) && roundedDouble(draw.viewport[1], qy, 8) &&
+	                                  roundedDouble(draw.viewport[2], qw, 8) && roundedDouble(draw.viewport[3], qh, 8)))
+		why = "a viewport too large, or empty";
+	mFractionalViewports += !why && ((qx | qy | qw | qh) & 0xff) ? 1 : 0;
 	if (why) {
 		noteNotRun(why, name[2]);
 		if (talk)
@@ -6515,10 +6552,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x82, (width - 1) | (height - 1) << 16},                    // PA_SC_WINDOW_SCISSOR_BR: inclusive on gfx12
 		{0x69, 0x94, sx | sy << 16},                                       // PA_SC_VPORT_SCISSOR_0_TL, _BR: Metal's scissor rectangle, BR inclusive
 		{0x69, 0x95, (sx2 - 1) | (sy2 - 1) << 16},
-		{0x69, 0x10f, halfAsFloat(static_cast<uint32_t>(vw), false)},     // PA_CL_VPORT_XSCALE: width / 2
-		{0x69, 0x110, halfAsFloat(2 * vx + vw)},                            // XOFFSET: originX + width / 2
-		{0x69, 0x111, halfAsFloat(-vh)},                                    // YSCALE: -height / 2 (Metal's y points up)
-		{0x69, 0x112, halfAsFloat(2 * vy + vh)},                            // YOFFSET: originY + height / 2
+		{0x69, 0x10f, fixedAsFloat(qw, 9)},                                 // PA_CL_VPORT_XSCALE: width / 2 (1/256 pixel units, halved)
+		{0x69, 0x110, fixedAsFloat(2 * qx + qw, 9)},                        // XOFFSET: originX + width / 2
+		{0x69, 0x111, fixedAsFloat(-qh, 9)},                                // YSCALE: -height / 2 (Metal's y points up)
+		{0x69, 0x112, fixedAsFloat(2 * qy + qh, 9)},                        // YOFFSET: originY + height / 2
 		{0x79, 0x242, kPrimitive[draw.type][0]},                           // VGT_PRIMITIVE_TYPE
 		{0x79, 0x266, kPrimitive[draw.type][1]},                           // VGT_GS_OUT_PRIM_TYPE
 		{0x76, 0x31, outs ? (outs - 1) | ins << 11 : 0x400u},              // SPI_SHADER_GS_OUT_CONFIG_PS: VS_EXPORT_COUNT, NUM_INTERP; NO_PC_EXPORT
@@ -6601,6 +6638,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	StagedTexture stagedTextures[2][16] = {};
 	const uint64_t texturesFrom = nowNs();
 	mDrawTarget = target;
+	mReadsBatched = false;
 	// a stage that samples at explicit LODs (its header's bit 16): its textures' levels (levelImages)
 	static uint32_t levels[(kMiscPage - kLevelsAt) / 4];   // ponytail: one host, its work loop only
 	const uint32_t levelStages = (vs[7] >> 16 & 1) | (ps[7] >> 16 & 1) << 1;
@@ -6947,6 +6985,23 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 
 		if (r == kIOReturnSuccess && levelStages)   // the levels' T#s, for a shader that reads them
 			r = upload(mGfxMisc, levels, sizeof(levels), miscAt + kLevelsAt);
+		}
+
+		// A texture a draw before it in the open batch drew into, sampled (in place: a display's frame on the card, which Tahoe's glass reads
+		// around the pointer): those draws done and the colour block's caches written back first, the shader caches dropped. Else it read
+		// pixels from before them (old pixels flickering in Safari's tab bar while the pointer moved near it, gone with each draw submitted
+		// alone, 2026-11-18). A batch's end does the same for the batches after it.
+		if (r == kIOReturnSuccess && mReadsBatched) {
+			uint32_t idle[16];
+			const uint32_t m = idleBarrier(idle);
+
+			if (m && m <= sizeof(idle) / 4 && total + m + 8 <= sizeof(ib) / 4) {
+				memmove(ib + m + 8, ib, total * 4);
+				memcpy(ib, idle, m * 4);
+				Pm4::acquireMem(ib + m, kGcrShaderCaches);
+				total += m + 8;
+				mBatchedReads++;
+			}
 		}
 
 		if (profiling() && total + 16 <= sizeof(ib) / 4) {   // timed: its start and end
@@ -8596,10 +8651,13 @@ void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const
 		if (PvScanout::enabled())
 			info.txnProtocol = 1;
 
-		// No hardware cursor: the host draws none (the pipe's cursor fields are only logged), and with one WindowServer leaves the pointer
-		// out of the frames it presents: invisible once the displays were told apart and no longer mirrored. Without, it draws the pointer.
+		// A hardware cursor where the head has one (PvScanout::cursorReady: port 0 with rdna4-cursor=1): WindowServer then leaves the
+		// pointer out of the frames, sends its image (FIFO 0x04) and keeps its position in the page, and the head's cursor plane shows it.
+		// Elsewhere none: with one announced and no plane, the pointer was invisible; without, WindowServer draws it into each frame, and
+		// redraws only the rectangle around it as it moves (its edges showed over Tahoe's glass, which follows the pointer, 2026-11-18).
 		if (PvScanout::enabled())
-			info.cursorWidth = info.cursorHeight = 0;
+			info.cursorWidth = info.cursorHeight = PvScanout::cursorReady(port) || PvScanout::cursorReady(0) ? kPvCursorAnnounced : 0;   // all or none:
+			// WindowServer takes a hardware cursor only when every display has one, and an extra head may not be lit yet when its page is
 		pvstream::disp::fillInfo(va, port, info);
 		__sync_synchronize();
 		__atomic_fetch_or(reinterpret_cast<uint32_t *>(va + pvstream::disp::kPending), pvstream::disp::kEventOnline, __ATOMIC_SEQ_CST);
@@ -8631,6 +8689,60 @@ void RDNA4PvHost::answerDisplayOnline(const pvstream::FifoCommand &c, const uint
 	memcpy(&cookie, pl + 4, 4);
 	mOnlineAcks++;
 	pvlog("host: display pipe %u acknowledged the online event (cookie 0x%x, %s)", port, cookie, cookie == mDispInfo.cookie ? "as filled" : "NOT the filled value");
+}
+
+// FIFO 0x04 DisplayUpdateCursorGlyph (AppleParavirtDisplayPipe::updateCursorGlyph's block, Tahoe 26.6.2), 0x2c bytes: {u32 port, u32 task,
+// u64 the glyph's address in the task's space, u64 [INFER: its size], u64 bytes per row, u16 width, height, hot spot x, y, u32 status}: rows
+// of straight ARGB8888 as AppleParavirtFramebuffer::processCursorImage made them, at most the cursor size the page announced.
+void RDNA4PvHost::updateCursorGlyph(const pvstream::FifoCommand &c, const uint8_t *cmd) {
+	const uint8_t *pl = cmd + c.payloadOffset;
+	static uint32_t pixels[kPvCursorAnnounced * kPvCursorAnnounced];   // ponytail: one host, its work loop only
+	static uint32_t lines;
+	uint32_t port, task;
+	uint64_t va, size, bpr;
+	uint16_t w, h, hotX, hotY;
+
+	if (c.length - c.payloadOffset < 0x2c)
+		return;
+	memcpy(&port, pl, 4);
+	memcpy(&task, pl + 4, 4);
+	memcpy(&va, pl + 8, 8);
+	memcpy(&size, pl + 0x10, 8);
+	memcpy(&bpr, pl + 0x18, 8);
+	memcpy(&w, pl + 0x20, 2);
+	memcpy(&h, pl + 0x22, 2);
+	memcpy(&hotX, pl + 0x24, 2);
+	memcpy(&hotY, pl + 0x26, 2);
+
+	bool ok = port < pvstream::disp::kMaxPorts && PvScanout::cursorReady(port) && w && h && w <= kPvCursorAnnounced && h <= kPvCursorAnnounced &&
+	          bpr >= w * 4u && bpr < (1u << 16);
+
+	for (uint32_t y = 0; ok && y < h; y++)
+		ok = readGuest(task, va + y * bpr, reinterpret_cast<uint8_t *>(pixels + y * kPvCursorAnnounced), w * 4u);
+
+	// What the image covers (alpha above 0) and its hot spot: the rectangle the plane is given, when it fits.
+	uint32_t x0 = hotX < w ? hotX : w - 1, y0 = hotY < h ? hotY : h - 1, x1 = x0, y1 = y0;
+
+	for (uint32_t y = 0; ok && y < h; y++)
+		for (uint32_t x = 0; x < w; x++)
+			if (pixels[y * kPvCursorAnnounced + x] >> 24) {
+				x0 = x < x0 ? x : x0;
+				x1 = x > x1 ? x : x1;
+				y0 = y < y0 ? y : y0;
+				y1 = y > y1 ? y : y1;
+			}
+	const uint32_t cw = x1 - x0 + 1, ch = y1 - y0 + 1;
+
+	ok = ok && cw <= kPvCursorPixels && ch <= kPvCursorPixels &&
+	     PvScanout::cursorImage(port, pixels + y0 * kPvCursorAnnounced + x0, cw, ch, kPvCursorAnnounced, hotX - x0, hotY - y0);
+
+	if (ok)
+		mPipe[port].cursorPos = ~1u;   // its position again with the new hot spot (pollDisplay)
+
+	if (lines++ < 8 || !ok)
+		pvstat("host: display pipe %u cursor glyph: task %u, 0x%llx (0x%llx), %llu bytes a row, %ux%u, hot spot %u,%u, covering %ux%u at %u,%u: %s",
+		       port, task, static_cast<unsigned long long>(va), static_cast<unsigned long long>(size), static_cast<unsigned long long>(bpr), w, h, hotX,
+		       hotY, cw, ch, x0, y0, ok ? "on the head's cursor plane" : "NOT shown (larger than the plane's 64x64?)");
 }
 
 void RDNA4PvHost::dropPipes() {
@@ -8894,6 +9006,9 @@ void RDNA4PvHost::pollDisplay() {
 		const uint8_t visible = va[pvstream::disp::kCursorVisible];
 		if ((pos != p.cursorPos || visible != p.cursorVisible) && p.cursorLines++ < 12)
 			pvlog("host: display pipe %u cursor: position (%u, %u)%s, %s", port, pos & 0xffff, pos >> 16, pos == 0xffffffff ? " [unset]" : "", visible ? "visible" : "hidden");
+		// onto the head's cursor plane (the page holds the hot spot's position)
+		if ((pos != p.cursorPos || visible != p.cursorVisible) && pos != 0xffffffff && PvScanout::cursorReady(port))
+			PvScanout::cursorMove(port, static_cast<int32_t>(pos & 0xffff), static_cast<int32_t>(pos >> 16), visible);
 		p.cursorPos = pos;
 		p.cursorVisible = visible;
 	}

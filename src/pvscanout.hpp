@@ -102,6 +102,16 @@ bool present(uint32_t port, uint32_t surface, uint32_t task);
  */
 bool copySurface(uint32_t sid, uint8_t *dst, uint32_t pitch, uint32_t width, uint32_t height);
 
+/*
+ * The hardware cursor of head `port` (the host, pvgpu.cpp): whether it has
+ * one (rdna4-pvcursor=1 or rdna4-cursor=1, the head lit), its image
+ * (straight ARGB8888, `pitch` pixels a row, at most 64x64) and where its hot
+ * spot is, in the head's pixels.
+ */
+bool cursorReady(uint32_t port);
+bool cursorImage(uint32_t port, const uint32_t *argb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t hotX, uint32_t hotY);
+bool cursorMove(uint32_t port, int32_t x, int32_t y, bool visible);
+
 } /* namespace PvScanout */
 
 #endif /* PvScanout_hpp */

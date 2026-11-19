@@ -327,8 +327,14 @@ public:
 	// NDRV hardware-cursor csc backend. Cursor memory and register programming
 	// are enabled only by rdna4-cursor=1; the default remains software cursor.
 	bool supportsHardwareCursor() const { return hwCursorReady; }
+	bool ndrvHardwareCursor() const { return hwCursorReady && ndrvCursorRequested; }   // IONDRV's cscSupportsHardwareCursor: rdna4-cursor=1 only
 	IOReturn setHardwareCursor(void *cursorRef);
 	IOReturn drawHardwareCursor(int32_t x, int32_t y, uint32_t visible);
+	// The paravirtual display's cursor (PvScanout::cursorImage): straight ARGB pixels, `pitch` pixels a row, at most 64x64.
+	IOReturn setCursorPixels(const uint32_t *argb, uint32_t w, uint32_t h, uint32_t pitch, uint32_t hotX, uint32_t hotY);
+	void setCursorPipe(uint8_t p) { cursorPipe = p; }   // 0xff: the device's own again
+	uint32_t cursorHotX() const { return hwCursorHot[cursorIndex()][0]; }   // the hot spot of the pipe the cursor calls program
+	uint32_t cursorHotY() const { return hwCursorHot[cursorIndex()][1]; }
 	// Once the power-management firmware runs its features (compute stage
 	// 3's thread calls it): the display clocks, logged with rdna4-clocks=1,
 	// raised for a 3840x2160 pipe (rdna4-dispclk=<MHz> overrides, 0 = off).
@@ -524,11 +530,13 @@ private:
 	bool initHardwareCursor();
 	void freeHardwareCursor();
 	bool hwCursorRequested { false };
+	bool ndrvCursorRequested { false };   // rdna4-cursor=1: the plane for IONDRV's framebuffers too (else only the paravirtual displays')
+	IOReturn loadCursorStage(uint32_t w, uint32_t h, uint32_t hotX, uint32_t hotY);   // cursorStage into the sprite and the plane
 	bool hwCursorReady { false };
 	bool hwCursorSet { false };
 	bool hwCursorVisible { false };
 	int32_t hwCursorX { 0 }, hwCursorY { 0 };
-	uint16_t hwCursorHotX { 0 }, hwCursorHotY { 0 };
+	uint16_t hwCursorHot[Pipe::kMaxOtg][2] {};   // each pipe's hot spot (x, y): the paravirtual displays' images differ (1x, 2x)
 	uint32_t cursorDrawCalls { 0 }, cursorDrawLogs { 0 };
 	uint32_t *cursorStage { nullptr };
 	volatile uint32_t *cursorVram { nullptr };
@@ -537,7 +545,16 @@ private:
 	uint64_t cursorMcAddr { 0 };
 	uint32_t cursorWidth { 0 }, cursorHeight { 0 };
 	uint32_t cursorCtlBase { 0 };                // HUBP CURSOR_CONTROL without the enable bit
-	bool hwCursorEnabledHw { false };            // the enable bits as last written to the hardware
+	// The pipe the cursor calls program: the device's own (0xff), or an extra head's for the paravirtual display on it
+	// (PvScanout::cursorImage / cursorMove, under ExtraHold); the sprite is shared, the enable bits are each pipe's.
+	uint8_t cursorPipe { 0xff };
+	bool cursorEnabledHw[Pipe::kMaxOtg] {};      // the enable bits as last written to each pipe's cursor
+	uint32_t cursorIndex() const { return cursorPipe < Pipe::kMaxOtg ? cursorPipe : pipe.hubp < Pipe::kMaxOtg ? pipe.hubp : 0; }
+	uint32_t cursorHubpOff() const { return cursorPipe < Pipe::kMaxOtg ? cursorPipe * Pipe::Reg::kHubpStride : hubpOff(); }
+	uint32_t cursorDppOff() const { return cursorPipe < Pipe::kMaxOtg ? cursorPipe * 0x16bu : dppOff(); }
+	uint32_t cursorOpp() const { return cursorPipe < Pipe::kMaxOtg ? cursorPipe : pipe.opp < Pipe::kMaxOtg ? pipe.opp : 0; }
+	volatile uint32_t *cursorSlot() const;   // the sprite of that pipe in VRAM (cursor.cpp: one slot a pipe), and its MC address
+	uint64_t cursorSlotMc() const;
 	uint32_t cursorVisChanges { 0 };
 	// Evidence that survives the kernel log wrapping: registry property
 	// AMDRadeonRDNA4,Cursor (cursor.cpp cursorNote).

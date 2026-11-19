@@ -2575,9 +2575,18 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	uint32_t vd = pciDevice->configRead32(kIOPCIConfigVendorID);
 	isAmd = (vd & 0xffff) == 0x1002;
 	uint32_t cursor = 0;
-	hwCursorRequested = PE_parse_boot_argn("rdna4-cursor", &cursor, sizeof(cursor)) && cursor != 0;
+	ndrvCursorRequested = PE_parse_boot_argn("rdna4-cursor", &cursor, sizeof(cursor)) && cursor != 0;
+	// The plane for the paravirtual displays' cursor (PvScanout::cursorReady), without rdna4-cursor's NDRV routes: on where the paravirtual
+	// GPU is built in (card-verified 2026-11-19: one arrow per display, Safari's box around the pointer gone), rdna4-pvcursor=0 turns it off.
+#ifdef AMDRadeonRDNA4_PVGPU
+	uint32_t pvCursor = 1;
+#else
+	uint32_t pvCursor = 0;
+#endif
+	PE_parse_boot_argn("rdna4-pvcursor", &pvCursor, sizeof(pvCursor));
+	hwCursorRequested = ndrvCursorRequested || pvCursor != 0;
 	if (hwCursorRequested)
-		FBLOG("cursor: hardware cursor requested by rdna4-cursor=1");
+		FBLOG("cursor: hardware cursor plane requested (%s)", ndrvCursorRequested ? "rdna4-cursor=1" : "the paravirtual displays'");
 
 	const uint16_t device = static_cast<uint16_t>(vd >> 16);
 	const uint8_t revision = pciDevice->configRead8(kIOPCIConfigRevisionID);

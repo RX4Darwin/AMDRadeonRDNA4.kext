@@ -300,7 +300,7 @@ void createVblankService(IOService *framebuffer) {
 }
 
 bool deviceSupportsHardwareCursor(void *ctx) {
-	return static_cast<RDNA4Device *>(ctx)->supportsHardwareCursor();
+	return static_cast<RDNA4Device *>(ctx)->ndrvHardwareCursor();
 }
 
 int32_t deviceSetHardwareCursor(void *ctx, void *cursorRef) {
@@ -1206,6 +1206,8 @@ void attach(FbEntry &e) {
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
 	if (accelCensus && dev.isAmd)
 		RDNA4AccelCensus::publish(pci, accelCensus);
+	if (dev.isAmd)   // the native-Metal spike: published later by debug.rdna4_nativemtl=1, never at boot
+		RDNA4AccelCensus::setProvider(pci);
 	// M0: the fake paravirtual GPU, independent of everything else here, after the heads it may drive.
 #ifdef AMDRadeonRDNA4_PVGPU
 	if (pvGpu && dev.isAmd && !pvDelay)
@@ -2187,6 +2189,63 @@ bool PvScanout::edid(uint32_t port, const uint8_t *&data, size_t &len)
 	len = bootState->dev.extra[h->slot].edidLen;
 
 	return true;
+}
+
+// A head's hardware cursor: the boot head's on the boot device's own pipe (not a placeholder head standing in for it), an extra head's on
+// its pipe, the device's cursor calls pointed at it (setCursorPipe) under its ExtraHold; one sprite for all. WindowServer takes a hardware
+// cursor only when every display has one: with port 0's alone it went on drawing the pointer into the frames (2026-11-18).
+static RDNA4Device *pvCursorDevice(uint32_t port, Head2 *&extra)
+{
+	extra = port ? pvHead(port) : nullptr;
+
+	if (port == 0)
+		return !pvBootHead && bootState && bootState->dev.supportsHardwareCursor() ? &bootState->dev : nullptr;
+
+	return extra && extra->connected && extra->dev && extra->dev->supportsHardwareCursor() ? extra->dev : nullptr;
+}
+
+bool PvScanout::cursorReady(uint32_t port)
+{
+	Head2 *extra;
+
+	return pvCursorDevice(port, extra) != nullptr;
+}
+
+// `call` with the device's cursor calls on the head's pipe.
+template <typename Call>
+static bool pvOnCursorPipe(uint32_t port, Call call)
+{
+	Head2 *extra;
+	RDNA4Device *dev = pvCursorDevice(port, extra);
+
+	if (!dev)
+		return false;
+	if (!extra)
+		return call(*dev);
+
+	RDNA4Device::ExtraHold hold(*dev);
+	dev->selectExtra(extra->slot);
+	dev->setCursorPipe(dev->xp().pipe);
+	const bool ok = call(*dev);
+	dev->setCursorPipe(0xff);
+
+	return ok;
+}
+
+bool PvScanout::cursorImage(uint32_t port, const uint32_t *argb, uint32_t width, uint32_t height, uint32_t pitch, uint32_t hotX, uint32_t hotY)
+{
+	return pvOnCursorPipe(port, [&](RDNA4Device &dev) {
+		return dev.setCursorPixels(argb, width, height, pitch, hotX, hotY) == kIOReturnSuccess;
+	});
+}
+
+// x, y: the hot spot's position (what the guest's page holds); drawHardwareCursor takes the image's top-left corner.
+bool PvScanout::cursorMove(uint32_t port, int32_t x, int32_t y, bool visible)
+{
+	return pvOnCursorPipe(port, [&](RDNA4Device &dev) {
+		return dev.drawHardwareCursor(x - static_cast<int32_t>(dev.cursorHotX()), y - static_cast<int32_t>(dev.cursorHotY()), visible) ==
+		       kIOReturnSuccess;
+	});
 }
 
 bool PvScanout::head(uint32_t port, Head &out)

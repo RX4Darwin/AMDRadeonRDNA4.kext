@@ -3,6 +3,48 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
+## 0.3.2 (2026-11-19)
+
+**Metal (`make PVGPU=1`)**
+- RGBA8 IOSurfaces as colour attachments (only BGRA8 ones before): WindowServer renders an inactive window's material into
+  one, and Safari's Downloads popover with another app in front kept an empty background, its text drawn over itself.
+  Card (Tahoe 26.6.2, 2026-11-18): the popover's background stays.
+- Viewports in fractions of a pixel set exactly (to 1/256 pixel), no longer rounded to whole pixels (up to half a pixel off):
+  vkQuake through MoltenVK draws thousands of them. Card (2026-11-19): 7890 in a timedemo, 43.4 fps as before.
+- A draw that samples a texture an earlier draw in the same batch drew into waits for it first (an idle barrier, the
+  shader caches dropped): Tahoe's glass reads the display's frame around the pointer just after drawing into it, and
+  read pixels from before those draws, blocks of old screen content flickering in Safari's tab bar while the pointer
+  moved near it. Card (2026-11-18): the blocks are gone; about 660 draws a second take the barrier, vkQuake's timedemo
+  unchanged (41.7-43.9 fps). The edges of a box around the pointer that were left went with the hardware cursor
+  (below).
+
+**Cursor**
+- A hardware cursor for the paravirtual displays (on in `PVGPU=1` builds, `rdna4-pvcursor=0` turns it off): WindowServer's pointer
+  image goes onto each display's cursor plane, and WindowServer stops redrawing the rectangle around the pointer as it
+  moves (the lines along a box around the pointer over Tahoe's glass in Safari). HiDPI displays too: the host announces
+  a 128-pixel cursor and crops each image to what it covers, as DCN 4.01's plane holds 64x64. Card (2026-11-19):
+  WindowServer reports a hardware cursor, with a HiDPI and a 1x display, and moving the pointer no longer makes it
+  redraw (about 15 frames in 5 s instead of about 250); one arrow on each display, and the box in Safari is gone.
+
+**Native Metal (spike, `docs/native-metal-spike.md`)**
+- First step towards our own Metal driver beside the paravirtual one (needed for ray tracing, which the paravirtual route
+  cannot carry). `sudo sysctl debug.rdna4_nativemtl=1` publishes an `IOAccelerator` service
+  naming our bundle (`tools/metal/native/`, installed into `/Library/GPUBundles`), and Metal loads it: its device class
+  only has to be a `_MTLDevice`, not speak Apple's private accelerator protocol. The device exists only in processes
+  started with `RDNA4_NATIVE_MTL=1`. Card (Tahoe 26.6.2, 2026-11-19): `mtlprobe devices` lists it beside the paravirtual
+  device.
+- The native device computes: buffers, metallib libraries, compute pipelines (the AIR translator in file mode) and command
+  buffers run through the kext's runtime client (root only for now). Card (2026-11-19): `mtlprobe native` runs two
+  dispatches (an add, then a scale by a `setBytes` constant) over 1000 floats, all right.
+- The native device renders: 2D RGBA8 / BGRA8 textures, render pipelines (vertex and fragment functions through the
+  translator) and render passes whose draws go to the card as the device's own gfx IBs, built as the paravirtual host
+  builds its draws. Card (2026-11-19): `mtlprobe native` draws the kext's colour triangle into a cleared texture,
+  8192 pixels, colours within half a step.
+- Ray tracing on the native device: acceleration structures of triangles (a BVH the CPU builds, in a format of the
+  device's own) and ray queries in kernels (`intersector<triangle_data>`), which the translator turns into a stackless
+  traversal it links in (`tools/metal/m3/rtlib.c`). The paravirtual GPU has no way to build them. Card (2026-11-19):
+  1024 rays against 300 triangles, every hit the same as the CPU's.
+
 ## 0.3.1 (2026-11-18)
 
 **Cards**

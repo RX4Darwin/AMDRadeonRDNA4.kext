@@ -36,6 +36,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
+#include "llvm/Linker/Linker.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -52,6 +53,7 @@
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <IOKit/IOKitLib.h>
+#include "rtlib.h"   // kRtlib: rtlib.c as gfx1201 bitcode (build.sh)
 #include <array>
 #include <grp.h>
 #include <map>
@@ -401,6 +403,60 @@ static void lowerTables(Function &k) {
 	}
 }
 
+// Metal's ray query (air.intersect.triangle_data: origin, direction, minimum and maximum distance, the acceleration structure, the
+// intersection function table, a payload, ..., accept any intersection as the last i1) as a call of rtlib.c's rdna4_rt_intersect, which
+// linkRayQueries links in after retargeting; its eight floats into AIR's result {i32 type, float distance, i32 primitive id, i32
+// geometry index, ptr primitive data (null), <2 x float> barycentrics, i1 front facing}. Null when the call is not of that shape.
+static Value *rayQuery(IRBuilder<> &b, CallInst *c) {
+	Module &m = *c->getModule();
+	LLVMContext &ctx = m.getContext();
+	Type *f32 = b.getFloatTy(), *i32 = b.getInt32Ty();
+	auto *st = dyn_cast<StructType>(c->getType());
+	auto *v3 = FixedVectorType::get(f32, 3);
+	if (!st || st->getNumElements() != 7 || st->getElementType(0) != i32 || st->getElementType(1) != f32 || !st->getElementType(4)->isPointerTy() ||
+	    st->getElementType(5) != FixedVectorType::get(f32, 2) || !st->getElementType(6)->isIntegerTy(1) || c->arg_size() < 6 ||
+	    c->getArgOperand(0)->getType() != v3 || c->getArgOperand(1)->getType() != v3 || !c->getArgOperand(4)->getType()->isPointerTy() ||
+	    !c->getArgOperand(c->arg_size() - 1)->getType()->isIntegerTy(1))
+		return nullptr;
+	Type *global = PointerType::get(ctx, 1);
+	FunctionCallee fn = m.getOrInsertFunction("rdna4_rt_intersect", FunctionType::get(FixedVectorType::get(f32, 8),
+	                                                                                 {f32, f32, f32, f32, f32, f32, f32, f32, global, i32}, false));
+	SmallVector<Value *, 10> args;
+	for (unsigned v = 0; v < 2; v++)
+		for (unsigned i = 0; i < 3; i++)
+			args.push_back(b.CreateExtractElement(c->getArgOperand(v), i));
+	args.push_back(c->getArgOperand(2));
+	args.push_back(c->getArgOperand(3));
+	args.push_back(b.CreatePointerCast(c->getArgOperand(4), global));
+	args.push_back(b.CreateZExt(c->getArgOperand(c->arg_size() - 1), i32));
+	Value *h = b.CreateCall(fn, args);
+	auto lane = [&](unsigned i) { return b.CreateExtractElement(h, i); };
+	auto bitsOf = [&](unsigned i) { return b.CreateBitCast(lane(i), i32); };
+	Value *bary = b.CreateInsertElement(b.CreateInsertElement(PoisonValue::get(st->getElementType(5)), lane(4), uint64_t(0)), lane(5), 1);
+	Value *r = PoisonValue::get(st);
+	r = b.CreateInsertValue(r, bitsOf(0), 0);
+	r = b.CreateInsertValue(r, lane(1), 1);
+	r = b.CreateInsertValue(r, bitsOf(2), 2);
+	r = b.CreateInsertValue(r, bitsOf(3), 3);
+	r = b.CreateInsertValue(r, ConstantPointerNull::get(cast<PointerType>(st->getElementType(4))), 4);
+	r = b.CreateInsertValue(r, bary, 5);
+	return b.CreateInsertValue(r, b.CreateTrunc(bitsOf(6), b.getInt1Ty()), 6);
+}
+
+// rtlib.c into a module that calls it (rayQuery), as gfx1201 bitcode of the same LLVM; the optimiser inlines it. "" or the reason.
+static std::string linkRayQueries(Module &m) {
+	Function *rq = m.getFunction("rdna4_rt_intersect");
+	if (!rq || !rq->isDeclaration())
+		return "";
+	SMDiagnostic diag;
+	std::unique_ptr<Module> lib = parseIR(MemoryBufferRef(StringRef(reinterpret_cast<const char *>(kRtlib), sizeof(kRtlib)), "rtlib"), diag, m.getContext());
+	if (!lib)
+		return "the ray query library does not load: " + diag.getMessage().str();
+	lib->setTargetTriple(m.getTargetTriple());
+	lib->setDataLayout(m.getDataLayout());
+	return Linker::linkModules(m, std::move(lib), Linker::LinkOnlyNeeded) ? "the ray query library does not link" : "";
+}
+
 static std::string legalize(Function &k) {
 	LLVMContext &ctx = k.getContext();
 	PointerType *global = PointerType::get(ctx, 1);
@@ -485,6 +541,19 @@ static std::string legalize(Function &k) {
 		IRBuilder<> b(c);
 		Value *r = nullptr;
 		const auto [op, type] = name.rsplit('.');   // e.g. "min.s" and "i32", "sqrt" and "f32", "wg" and "barrier"
+		if (name == "get_null_intersection_function_table") {   // no intersection functions: rtlib.c's traversal takes none
+			c->replaceAllUsesWith(ConstantPointerNull::get(cast<PointerType>(c->getType())));
+			gone.push_back(c);
+			continue;
+		}
+		if (name == "intersect.triangle_data") {
+			Value *hit = rayQuery(b, c);
+			if (!hit)
+				return f->getName().str() + " of a form not supported yet";
+			c->replaceAllUsesWith(hit);
+			gone.push_back(c);
+			continue;
+		}
 		// A descriptor (T# 8 dwords, S# 4) at the handle's address, through the constant address space so it lands in SGPRs.
 		auto descriptor = [&](Value *handle, unsigned dwords) {
 			Value *at = b.CreateIntToPtr(b.CreatePtrToInt(handle, b.getInt64Ty()), PointerType::get(ctx, 4));
@@ -1064,6 +1133,8 @@ static std::string compile(Module &m, Function *entry, Function *air, bool pal, 
 	std::unique_ptr<TargetMachine> tm(target->createTargetMachine(triple, "gfx1201", "", TargetOptions(), std::nullopt));
 	m.setTargetTriple(triple);
 	m.setDataLayout(tm->createDataLayout());
+	if (std::string why = linkRayQueries(m); !why.empty())
+		return why;
 	SmallVector<NamedMDNode *, 8> airMd;
 	for (NamedMDNode &n : m.named_metadata())
 		if (n.getName().starts_with("air."))
@@ -1782,7 +1853,7 @@ static std::string translate(StringRef input, StringRef requested, Kernel &out) 
 		if (kind == "air.buffer" && index < air->arg_size() && air->getArg(index)->getType() == PointerType::get(ctx, 3)) {
 			roles[index] = {GroupBuffer, -1};   // threadgroup memory the app sizes at dispatch (setThreadgroupMemoryLength): LDS below
 			groupBuffers++;
-		} else if (kind == "air.buffer") {
+		} else if (kind == "air.buffer" || kind == "air.primitive_acceleration_structure") {   // the latter: its address, as a buffer's
 			int location = -1;
 			bool writes = false;
 			for (unsigned k = 2; k < a->getNumOperands(); k++) {
