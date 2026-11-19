@@ -1206,6 +1206,8 @@ void attach(FbEntry &e) {
 	// E1 of docs/metal-spike.md: an IOAccelerator-shaped service that only logs what Metal asks of it. Independent of the compute bring-up.
 	if (accelCensus && dev.isAmd)
 		RDNA4AccelCensus::publish(pci, accelCensus);
+	if (dev.isAmd)   // the native-Metal spike: published later by debug.rdna4_nativemtl=1, never at boot
+		RDNA4AccelCensus::setProvider(pci);
 	// M0: the fake paravirtual GPU, independent of everything else here, after the heads it may drive.
 #ifdef AMDRadeonRDNA4_PVGPU
 	if (pvGpu && dev.isAmd && !pvDelay)

@@ -18,6 +18,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
   unchanged (41.7-43.9 fps). Left: the edges of a box around the pointer show as lines over glass, since the paravirtual
   displays have no hardware cursor and WindowServer redraws the pointer's rectangle into each frame.
 
+**Native Metal (spike, `docs/native-metal-spike.md`)**
+- First step towards our own Metal driver beside the paravirtual one (needed for ray tracing and a hardware cursor, which
+  the paravirtual route cannot carry). `sudo sysctl debug.rdna4_nativemtl=1` publishes an `IOAccelerator` service
+  naming our bundle (`tools/metal/native/`, installed into `/Library/GPUBundles`), and Metal loads it: its device class
+  only has to be a `_MTLDevice`, not speak Apple's private accelerator protocol. The device exists only in processes
+  started with `RDNA4_NATIVE_MTL=1` and does nothing yet. Card (Tahoe 26.6.2, 2026-11-19): `mtlprobe devices` lists it
+  beside the paravirtual device.
+
 ## 0.3.1 (2026-11-18)
 
 **Cards**

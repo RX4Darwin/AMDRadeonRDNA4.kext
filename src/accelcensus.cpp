@@ -16,6 +16,8 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSCollectionIterator.h>
+#include <sys/errno.h>
+#include <sys/sysctl.h>
 
 extern "C" {
 int proc_selfpid(void);
@@ -131,17 +133,22 @@ bool RDNA4AccelCensus::publish(IOService *provider, uint32_t level) {
 		rdna4Log("AMDRadeonRDNA4: accelcensus: could not create the service\n");
 		return false;
 	}
-	svc->setName("RDNA4AccelCensus");
+	svc->setName(level == 3 ? "RDNA4NativeMetal" : "RDNA4AccelCensus");
 	svc->setProperty("IOUserClientClass", "RDNA4AccelCensusClient");
 	svc->setProperty("IOMatchCategory", "IOAccelerator");
-	svc->setProperty("MetalPluginName", "RDNA4CensusMTLDriver");
-	svc->setProperty("MetalPluginClassName", "RDNA4CensusMtlDevice");
-	svc->setProperty("MetalStatisticsName", "RDNA4CensusStatistics");
-	svc->setProperty("IOGLBundleName", "RDNA4CensusGLDriver");
-	svc->setProperty("IOOCDBundleName", "RDNA4CensusGLDriver");
-	svc->setProperty("GPURawCounterBundleName", "RDNA4CensusRawCounterPlugin");
-	svc->setProperty("GPURawCounterPluginClassName", "RDNA4CensusRawCounterSourceGroup");
-	svc->setProperty("IODVDBundleName", "RDNA4CensusVADriver");
+	if (level == 3) {   // Metal's loader: gpu_bundle_find_trusted("AMDRadeonRDNA4Metal"), the class a subclass of _MTLDevice (docs/native-metal-spike.md)
+		svc->setProperty("MetalPluginName", "AMDRadeonRDNA4Metal");
+		svc->setProperty("MetalPluginClassName", "RDNA4MTLDevice");
+	} else {
+		svc->setProperty("MetalPluginName", "RDNA4CensusMTLDriver");
+		svc->setProperty("MetalPluginClassName", "RDNA4CensusMtlDevice");
+		svc->setProperty("MetalStatisticsName", "RDNA4CensusStatistics");
+		svc->setProperty("IOGLBundleName", "RDNA4CensusGLDriver");
+		svc->setProperty("IOOCDBundleName", "RDNA4CensusGLDriver");
+		svc->setProperty("GPURawCounterBundleName", "RDNA4CensusRawCounterPlugin");
+		svc->setProperty("GPURawCounterPluginClassName", "RDNA4CensusRawCounterSourceGroup");
+		svc->setProperty("IODVDBundleName", "RDNA4CensusVADriver");
+	}
 	svc->setProperty("IOAccelRevision", static_cast<uint64_t>(2), 32);
 	svc->setProperty("CensusLevel", static_cast<uint64_t>(level), 32);
 	svc->setProperty("CensusLog", "");
@@ -154,8 +161,38 @@ bool RDNA4AccelCensus::publish(IOService *provider, uint32_t level) {
 	svc->registerService();
 	svc->release();            // the registry keeps it
 	rdna4Log("AMDRadeonRDNA4: accelcensus: IOAccelerator service published under %s (level %u: %s); no GPU action\n", provider->getName(), level,
-	      level == 1 ? "every call refused" : "every selector succeeds with zeroed outputs");
+	      level == 2 ? "every selector succeeds with zeroed outputs" : level == 3 ? "the native-Metal spike, every call refused" : "every call refused");
 	return true;
+}
+
+namespace {
+IOService *gNativeGpu { nullptr };   // retained once, kept for the boot
+
+// debug.rdna4_nativemtl: 1 publishes the native-Metal spike's service (level 3) under the GPU; reads 1 once it is published.
+int nativeMtlSysctl SYSCTL_HANDLER_ARGS
+{
+	int value = gService && gLevel == 3 ? 1 : 0;
+	const int err = sysctl_handle_int(oidp, &value, 0, req);
+
+	if (err || !req->newptr)
+		return err;
+	if (value != 1)
+		return EINVAL;
+
+	return RDNA4AccelCensus::publish(gNativeGpu, 3) ? 0 : EBUSY;
+}
+
+SYSCTL_PROC(_debug, OID_AUTO, rdna4_nativemtl, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, nativeMtlSysctl, "I",
+            "AMDRadeonRDNA4: 1 publishes the native-Metal spike's IOAccelerator service (docs/native-metal-spike.md)");
+}
+
+void RDNA4AccelCensus::setProvider(IOService *gpu)
+{
+	if (gNativeGpu || !gpu)
+		return;
+	gpu->retain();
+	gNativeGpu = gpu;
+	sysctl_register_oid(&sysctl__debug_rdna4_nativemtl);
 }
 
 IOReturn RDNA4AccelCensus::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
@@ -281,7 +318,7 @@ IOReturn RDNA4AccelCensusClient::externalMethod(uint32_t selector, IOExternalMet
 	       args->structureInputSize, args->structureInputDescriptor ? " (descriptor)" : "", bytes[0] ? " bytes " : "", bytes,
 	       args->scalarOutputCount, args->structureOutputSize, args->structureOutputDescriptor ? " (descriptor)" : "",
 	       args->asyncWakePort ? ", async" : "");
-	if (RDNA4AccelCensus::level() < 2)
+	if (RDNA4AccelCensus::level() != 2)   // 1 and the native spike's 3 refuse
 		return kIOReturnUnsupported;
 	// Level 2: succeed with zeros, never touch anything.
 	if (args->scalarOutput)

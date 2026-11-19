@@ -9,6 +9,7 @@
 //   mtlprobe mix       out[i] = 3 * in[i] + 100000 * group + 1000 * thread in group + group size over 100 threads in groups of 32 (the
 //                      last group has 4, and Metal reports 4 as its size); a kernel that is not in the kext's table: it runs only if
 //                      translated at run time
+//   mtlprobe devices   every Metal device MTLCopyAllDevices returns, its class and registry ID (docs/native-metal-spike.md)
 //   mtlprobe two       two kernels of one library in one command buffer: out[i] = in[i] + 1, then out[i] *= 3 (64 threads)
 //   mtlprobe twolib    the same with two libraries of one kernel each: out[i] = in[i] + 7, then out[i] *= out[i]
 //   mtlprobe feat      one kernel per Metal language feature (constant buffers, math, threadgroup memory and barriers, atomics, local
@@ -2207,6 +2208,14 @@ int main(int argc, char **argv) {
 				waitpid(pid, &st, 0);
 				OUT("%s: child ended, %s %d", modes[i], WIFSIGNALED(st) ? "signal" : "exit", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
 			}
+			return 0;
+		}
+		if (!strcmp(mode, "devices")) {   // every Metal device, its class and registry ID (the native-Metal spike's gate 1)
+			NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
+			OUT("devices: %lu", (unsigned long)all.count);
+			for (id<MTLDevice> dev in all)
+				OUT("devices: \"%s\" (class %s), registry ID 0x%llx", dev.name.UTF8String, NSStringFromClass([(id)dev class]).UTF8String,
+				    (unsigned long long)dev.registryID);
 			return 0;
 		}
 		id<MTLDevice> d = MTLCreateSystemDefaultDevice();
