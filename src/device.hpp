@@ -327,6 +327,7 @@ public:
 	// NDRV hardware-cursor csc backend. Cursor memory and register programming
 	// are enabled only by rdna4-cursor=1; the default remains software cursor.
 	bool supportsHardwareCursor() const { return hwCursorReady; }
+	bool ndrvHardwareCursor() const { return hwCursorReady && ndrvCursorRequested; }   // IONDRV's cscSupportsHardwareCursor: rdna4-cursor=1 only
 	IOReturn setHardwareCursor(void *cursorRef);
 	IOReturn drawHardwareCursor(int32_t x, int32_t y, uint32_t visible);
 	// The paravirtual display's cursor (PvScanout::cursorImage): straight ARGB pixels, `pitch` pixels a row, at most 64x64.
@@ -529,6 +530,7 @@ private:
 	bool initHardwareCursor();
 	void freeHardwareCursor();
 	bool hwCursorRequested { false };
+	bool ndrvCursorRequested { false };   // rdna4-cursor=1: the plane for IONDRV's framebuffers too (else only the paravirtual displays')
 	IOReturn loadCursorStage(uint32_t w, uint32_t h, uint32_t hotX, uint32_t hotY);   // cursorStage into the sprite and the plane
 	bool hwCursorReady { false };
 	bool hwCursorSet { false };

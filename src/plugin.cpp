@@ -300,7 +300,7 @@ void createVblankService(IOService *framebuffer) {
 }
 
 bool deviceSupportsHardwareCursor(void *ctx) {
-	return static_cast<RDNA4Device *>(ctx)->supportsHardwareCursor();
+	return static_cast<RDNA4Device *>(ctx)->ndrvHardwareCursor();
 }
 
 int32_t deviceSetHardwareCursor(void *ctx, void *cursorRef) {
