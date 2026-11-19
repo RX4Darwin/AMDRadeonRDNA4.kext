@@ -870,6 +870,8 @@ private:
 	// serialized work-loop path, so these counters need no separate lock.
 	uint64_t mSubmitNs { 0 }, mSubmitMaxNs { 0 }, mSubmitCalls { 0 }, mSubmitSlow { 0 };
 	uint64_t mSubmitBusyRetries { 0 }, mSubmitNotReadyMs { 0 };
+	uint32_t mSubmitBusyMaxRetries { 0 }, mSubmitNotReadyMaxMs { 0 };
+	uint32_t mSubmitBusyExhausted { 0 }, mSubmitNotReadyExhausted { 0 }, mSubmitFailed { 0 };
 	// Time spent inside the 250 us host timer callback, which also services display events.
 	uint64_t mTickNs { 0 }, mTickMaxNs { 0 }, mTickCalls { 0 }, mTickOver250us { 0 }, mTickOver1ms { 0 };
 	uint64_t mTickPhaseNs[6] {}, mTickPhaseMaxNs[6] {};   // IRQ/late, guest FIFO, pipelines, channels+submit, display, finish
@@ -2266,6 +2268,14 @@ IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 	mSubmitMaxNs = elapsed > mSubmitMaxNs ? elapsed : mSubmitMaxNs;
 	mSubmitBusyRetries += busyRetries;
 	mSubmitNotReadyMs += notReadyWaited;
+	mSubmitBusyMaxRetries = busyRetries > mSubmitBusyMaxRetries ? busyRetries : mSubmitBusyMaxRetries;
+	mSubmitNotReadyMaxMs = notReadyWaited > mSubmitNotReadyMaxMs ? notReadyWaited : mSubmitNotReadyMaxMs;
+	if (r == kIOReturnBusy)
+		mSubmitBusyExhausted++;
+	else if (r == kIOReturnNotReady)
+		mSubmitNotReadyExhausted++;
+	else if (r != kIOReturnSuccess)
+		mSubmitFailed++;
 	if (elapsed >= 2000000)
 		mSubmitSlow++;
 
@@ -8828,8 +8838,12 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	      (now - mDrawStatSince) / 1000000, mDrawStatNs / 1000000, mDrawStatMaxNs / 1000000, mPhaseNs[0] / 1000000, mPhaseNs[1] / 1000000,
 	      mPhaseNs[2] / 1000000, mPhaseNs[3] / 1000000, mPhaseNs[4] / 1000000, mPhaseNs[5] / 1000000, mWaits, mCodeIns, mTranslations);
 	if (mSubmitCalls)
-		pvstat("host: render:   GPU submits %llu, slow (>=2 ms) %llu, average %llu us, max %llu us, busy retries %llu, not-ready wait %llu ms",
-		       mSubmitCalls, mSubmitSlow, mSubmitNs / mSubmitCalls / 1000, mSubmitMaxNs / 1000, mSubmitBusyRetries, mSubmitNotReadyMs);
+		pvstat("host: render:   GPU submits %llu, slow (>=2 ms) %llu, average %llu us, max %llu us, busy retries %llu (max %u), not-ready wait %llu ms (max %u ms)",
+		       mSubmitCalls, mSubmitSlow, mSubmitNs / mSubmitCalls / 1000, mSubmitMaxNs / 1000, mSubmitBusyRetries,
+		       mSubmitBusyMaxRetries, mSubmitNotReadyMs, mSubmitNotReadyMaxMs);
+	if (mSubmitBusyExhausted || mSubmitNotReadyExhausted || mSubmitFailed)
+		pvstat("host: render:   GPU submit failures: busy timeout %u, ring not-ready timeout %u, other errors %u",
+		       mSubmitBusyExhausted, mSubmitNotReadyExhausted, mSubmitFailed);
 	if (mTickCalls) {
 		pvstat("host: render:   host ticks %llu, average %llu us, max %llu us, >=250 us %llu, >=1 ms %llu",
 		       mTickCalls, mTickNs / mTickCalls / 1000, mTickMaxNs / 1000, mTickOver250us, mTickOver1ms);
@@ -8980,6 +8994,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mDrawStatMaxNs = 0;
 	mSubmitNs = mSubmitMaxNs = mSubmitCalls = mSubmitSlow = 0;
 	mSubmitBusyRetries = mSubmitNotReadyMs = 0;
+	mSubmitBusyMaxRetries = mSubmitNotReadyMaxMs = 0;
+	mSubmitBusyExhausted = mSubmitNotReadyExhausted = mSubmitFailed = 0;
 	mTickNs = mTickMaxNs = mTickCalls = mTickOver250us = mTickOver1ms = 0;
 	memset(mTickPhaseNs, 0, sizeof(mTickPhaseNs));
 	memset(mTickPhaseMaxNs, 0, sizeof(mTickPhaseMaxNs));
