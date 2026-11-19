@@ -2307,17 +2307,32 @@ IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 
 	static constexpr uint32_t kGfxWait = 10000;   // ms
 	static constexpr uint32_t kGfxPoll = 20;      // ms
-	static constexpr uint32_t kBusyPolls = 20000; // of 10 us: the ring full of draws in flight drains in well under 200 ms
+	static constexpr uint32_t kBusyPolls = 20000; // of 10 us: preserve the existing retry window until submissions can be deferred safely
+	const uint64_t submitAt = nowNs();
+	uint32_t busyRetries = 0, notReadyWaited = 0;
 	IOReturn r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
 
-	for (uint32_t polls = 0; r == kIOReturnBusy && polls < kBusyPolls; polls++) {
+	while (r == kIOReturnBusy && busyRetries < kBusyPolls) {
+		busyRetries++;
 		IODelay(10);
 		r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
 	}
 
-	for (uint32_t waited = 0; r == kIOReturnNotReady && waited < kGfxWait; waited += kGfxPoll) {
+	while (r == kIOReturnNotReady && notReadyWaited < kGfxWait) {
+		notReadyWaited += kGfxPoll;
 		IOSleep(kGfxPoll);
 		r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
+	}
+
+	// This runs from the host's work-loop path. Keep a small, bounded sample of slow submits so
+	// real hardware can show whether ring pressure is delaying display/FIFO events. Do not log
+	// every submit: logging itself would perturb the timing being measured.
+	const uint64_t elapsed = nowNs() - submitAt;
+	if (elapsed >= 2000000) {
+		static uint32_t slowSubmitLogs = 0;
+		if (__atomic_fetch_add(&slowSubmitLogs, 1u, __ATOMIC_RELAXED) < 32)
+			pvstat("host: render: slow GPU submit: %llu us, result 0x%x, busy retries %u, not-ready wait %u ms",
+			       static_cast<unsigned long long>(elapsed / 1000), r, busyRetries, notReadyWaited);
 	}
 
 	return r;
