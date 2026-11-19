@@ -2576,6 +2576,10 @@ bool RDNA4Device::init(IOPCIDevice *pci, IOService *ownerService) {
 	isAmd = (vd & 0xffff) == 0x1002;
 	uint32_t cursor = 0;
 	hwCursorRequested = PE_parse_boot_argn("rdna4-cursor", &cursor, sizeof(cursor)) && cursor != 0;
+	// rdna4-pvcursor=1: the plane for the paravirtual display's cursor (PvScanout::cursorReady), without rdna4-cursor's NDRV routes
+	uint32_t pvCursor = 0;
+	if (!hwCursorRequested && PE_parse_boot_argn("rdna4-pvcursor", &pvCursor, sizeof(pvCursor)) && pvCursor != 0)
+		hwCursorRequested = true;
 	if (hwCursorRequested)
 		FBLOG("cursor: hardware cursor requested by rdna4-cursor=1");
 

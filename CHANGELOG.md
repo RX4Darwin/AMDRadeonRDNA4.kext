@@ -18,6 +18,14 @@ otherwise). The newest version is on top. How versions and branches work is in `
   unchanged (41.7-43.9 fps). Left: the edges of a box around the pointer show as lines over glass, since the paravirtual
   displays have no hardware cursor and WindowServer redraws the pointer's rectangle into each frame.
 
+**Cursor**
+- A hardware cursor for the paravirtual displays (boot-arg `rdna4-pvcursor=1`, off by default): WindowServer's pointer
+  image goes onto each display's cursor plane, and WindowServer stops redrawing the rectangle around the pointer as it
+  moves (the lines along a box around the pointer over Tahoe's glass in Safari). HiDPI displays too: the host announces
+  a 128-pixel cursor and crops each image to what it covers, as DCN 4.01's plane holds 64x64. Card (2026-11-19):
+  WindowServer reports a hardware cursor, with a HiDPI and a 1x display, and moving the pointer no longer makes it
+  redraw (about 15 frames in 5 s instead of about 250); not yet looked at by eye.
+
 **Native Metal (spike, `docs/native-metal-spike.md`)**
 - First step towards our own Metal driver beside the paravirtual one (needed for ray tracing and a hardware cursor, which
   the paravirtual route cannot carry). `sudo sysctl debug.rdna4_nativemtl=1` publishes an `IOAccelerator` service

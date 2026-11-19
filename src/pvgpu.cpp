@@ -576,6 +576,11 @@ private:
 	void presentTransaction(const pvstream::FifoCommand &c, const uint8_t *cmd);
 	void answerDisplaySharedState(const pvstream::FifoCommand &c, const uint8_t *cmd, uint32_t channel);
 	void answerDisplayOnline(const pvstream::FifoCommand &c, const uint8_t *cmd);
+	void updateCursorGlyph(const pvstream::FifoCommand &c, const uint8_t *cmd);
+	// The cursor size the pages announce, and the head's cursor plane's (cursor.cpp; DCN 4.01's limit, Linux's max_cursor_size). Announced
+	// larger: at 64 WindowServer drew the pointer itself on a HiDPI display (its 2x images need more); each image is cropped to what it
+	// covers, which for the arrow fits the plane.
+	static constexpr uint16_t kPvCursorAnnounced = 128, kPvCursorPixels = 64;
 	void completeStamp(uint32_t index, uint32_t value);
 	// A system sleep (RDNA4Compute::powerSleepRequest, the card still powered and taking submissions): what lives only in VRAM
 	// written back to the guest, then everything held of the runtime given back, as the card loses its power and VRAM with it;
@@ -2078,6 +2083,10 @@ uint32_t RDNA4PvHost::consume(const CmdSource &src, uint32_t read, uint32_t n) {
 			mCursorCmds++;
 		else if (c.id == 0x1e)
 			mFlushes++;
+		if (c.id == 0x04 && c.length <= sizeof(mWin)) {
+			copy(at, mWin, c.length);
+			updateCursorGlyph(c, mWin);
+		}
 		if (c.signal) {
 			// the command asks for a stamp when it completes (AppleParavirtCommandAllocator::addSignal): remember the last value of this batch
 			lastSignal = c.signal;
@@ -8642,10 +8651,13 @@ void RDNA4PvHost::answerDisplaySharedState(const pvstream::FifoCommand &c, const
 		if (PvScanout::enabled())
 			info.txnProtocol = 1;
 
-		// No hardware cursor: the host draws none (the pipe's cursor fields are only logged), and with one WindowServer leaves the pointer
-		// out of the frames it presents: invisible once the displays were told apart and no longer mirrored. Without, it draws the pointer.
+		// A hardware cursor where the head has one (PvScanout::cursorReady: port 0 with rdna4-cursor=1): WindowServer then leaves the
+		// pointer out of the frames, sends its image (FIFO 0x04) and keeps its position in the page, and the head's cursor plane shows it.
+		// Elsewhere none: with one announced and no plane, the pointer was invisible; without, WindowServer draws it into each frame, and
+		// redraws only the rectangle around it as it moves (its edges showed over Tahoe's glass, which follows the pointer, 2026-11-18).
 		if (PvScanout::enabled())
-			info.cursorWidth = info.cursorHeight = 0;
+			info.cursorWidth = info.cursorHeight = PvScanout::cursorReady(port) || PvScanout::cursorReady(0) ? kPvCursorAnnounced : 0;   // all or none:
+			// WindowServer takes a hardware cursor only when every display has one, and an extra head may not be lit yet when its page is
 		pvstream::disp::fillInfo(va, port, info);
 		__sync_synchronize();
 		__atomic_fetch_or(reinterpret_cast<uint32_t *>(va + pvstream::disp::kPending), pvstream::disp::kEventOnline, __ATOMIC_SEQ_CST);
@@ -8677,6 +8689,60 @@ void RDNA4PvHost::answerDisplayOnline(const pvstream::FifoCommand &c, const uint
 	memcpy(&cookie, pl + 4, 4);
 	mOnlineAcks++;
 	pvlog("host: display pipe %u acknowledged the online event (cookie 0x%x, %s)", port, cookie, cookie == mDispInfo.cookie ? "as filled" : "NOT the filled value");
+}
+
+// FIFO 0x04 DisplayUpdateCursorGlyph (AppleParavirtDisplayPipe::updateCursorGlyph's block, Tahoe 26.6.2), 0x2c bytes: {u32 port, u32 task,
+// u64 the glyph's address in the task's space, u64 [INFER: its size], u64 bytes per row, u16 width, height, hot spot x, y, u32 status}: rows
+// of straight ARGB8888 as AppleParavirtFramebuffer::processCursorImage made them, at most the cursor size the page announced.
+void RDNA4PvHost::updateCursorGlyph(const pvstream::FifoCommand &c, const uint8_t *cmd) {
+	const uint8_t *pl = cmd + c.payloadOffset;
+	static uint32_t pixels[kPvCursorAnnounced * kPvCursorAnnounced];   // ponytail: one host, its work loop only
+	static uint32_t lines;
+	uint32_t port, task;
+	uint64_t va, size, bpr;
+	uint16_t w, h, hotX, hotY;
+
+	if (c.length - c.payloadOffset < 0x2c)
+		return;
+	memcpy(&port, pl, 4);
+	memcpy(&task, pl + 4, 4);
+	memcpy(&va, pl + 8, 8);
+	memcpy(&size, pl + 0x10, 8);
+	memcpy(&bpr, pl + 0x18, 8);
+	memcpy(&w, pl + 0x20, 2);
+	memcpy(&h, pl + 0x22, 2);
+	memcpy(&hotX, pl + 0x24, 2);
+	memcpy(&hotY, pl + 0x26, 2);
+
+	bool ok = port < pvstream::disp::kMaxPorts && PvScanout::cursorReady(port) && w && h && w <= kPvCursorAnnounced && h <= kPvCursorAnnounced &&
+	          bpr >= w * 4u && bpr < (1u << 16);
+
+	for (uint32_t y = 0; ok && y < h; y++)
+		ok = readGuest(task, va + y * bpr, reinterpret_cast<uint8_t *>(pixels + y * kPvCursorAnnounced), w * 4u);
+
+	// What the image covers (alpha above 0) and its hot spot: the rectangle the plane is given, when it fits.
+	uint32_t x0 = hotX < w ? hotX : w - 1, y0 = hotY < h ? hotY : h - 1, x1 = x0, y1 = y0;
+
+	for (uint32_t y = 0; ok && y < h; y++)
+		for (uint32_t x = 0; x < w; x++)
+			if (pixels[y * kPvCursorAnnounced + x] >> 24) {
+				x0 = x < x0 ? x : x0;
+				x1 = x > x1 ? x : x1;
+				y0 = y < y0 ? y : y0;
+				y1 = y > y1 ? y : y1;
+			}
+	const uint32_t cw = x1 - x0 + 1, ch = y1 - y0 + 1;
+
+	ok = ok && cw <= kPvCursorPixels && ch <= kPvCursorPixels &&
+	     PvScanout::cursorImage(port, pixels + y0 * kPvCursorAnnounced + x0, cw, ch, kPvCursorAnnounced, hotX - x0, hotY - y0);
+
+	if (ok)
+		mPipe[port].cursorPos = ~1u;   // its position again with the new hot spot (pollDisplay)
+
+	if (lines++ < 8 || !ok)
+		pvstat("host: display pipe %u cursor glyph: task %u, 0x%llx (0x%llx), %llu bytes a row, %ux%u, hot spot %u,%u, covering %ux%u at %u,%u: %s",
+		       port, task, static_cast<unsigned long long>(va), static_cast<unsigned long long>(size), static_cast<unsigned long long>(bpr), w, h, hotX,
+		       hotY, cw, ch, x0, y0, ok ? "on the head's cursor plane" : "NOT shown (larger than the plane's 64x64?)");
 }
 
 void RDNA4PvHost::dropPipes() {
@@ -8940,6 +9006,9 @@ void RDNA4PvHost::pollDisplay() {
 		const uint8_t visible = va[pvstream::disp::kCursorVisible];
 		if ((pos != p.cursorPos || visible != p.cursorVisible) && p.cursorLines++ < 12)
 			pvlog("host: display pipe %u cursor: position (%u, %u)%s, %s", port, pos & 0xffff, pos >> 16, pos == 0xffffffff ? " [unset]" : "", visible ? "visible" : "hidden");
+		// onto the head's cursor plane (the page holds the hot spot's position)
+		if ((pos != p.cursorPos || visible != p.cursorVisible) && pos != 0xffffffff && PvScanout::cursorReady(port))
+			PvScanout::cursorMove(port, static_cast<int32_t>(pos & 0xffff), static_cast<int32_t>(pos >> 16), visible);
 		p.cursorPos = pos;
 		p.cursorVisible = visible;
 	}

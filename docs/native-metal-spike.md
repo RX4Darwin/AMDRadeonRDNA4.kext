@@ -115,5 +115,44 @@ Check (the same command as gate 2): the kext's colour triangle (vertex 0 red, 1 
 
 Not yet: blending, depth and stencil, textures and samplers in shaders, MSAA, indexed draws, other formats, the GPU doing the clear.
 
-Next gates: then WindowServer's pairing with a native
-display (the hardware cursor), then acceleration structures.
+## Gate 4: the hardware cursor (WindowServer and a display)
+
+The gate as first planned, WindowServer showing a display of the native device, needs WindowServer to composite on that device: every
+format, blend mode, IOSurface and shader the compositor uses (`docs/metal-spike.md` rates that device at 1-2+ years). So gate 4 first
+asks the cheaper question: **does the hardware cursor need a native display at all?** (The box lines around the pointer in Safari come
+from one draw re-rendering slightly differently each time; they show only because WindowServer redraws the pointer's rectangle: with
+a hardware cursor it would not.)
+
+How Tahoe's WindowServer decides (x86_64, read from CoreDisplay and SkyLight, 2026-11-19):
+
+- `WS::Displays::CDDisplay::supports_hardware_cursor()` is `!WSDisplayGetAcceleratorForcingSWCursor()`, which returns CoreDisplay's
+  global `gAcceleratorBackedModeForcingSWCursor`. `reconfigureDisplays` sets that global from the displays' "forcing a software
+  cursor" flag (bit 19 of the display's flags at +0x64).
+- That flag is set by `MPSelectMode` for HDR output (dynamic range traditional-gamma HDR or SDR always; HDR10 unless the CoreDisplay
+  preference `preferHWCursor` is set) and by `setup_hardware` for a display whose mode is scaled (a non-identity transform between
+  its framebuffer and the mode). SDR displays in unscaled modes do not force it.
+- Under IOPresentment (the paravirtual displays need it: `userspace/rdna4-iop`), the cursor still goes through the framebuffer's
+  shared cursor (`IOFBCreateSharedCursor`, CoreDisplay's `MappedCursor.cpp`, `CGXMP*Cursor`): the legacy IOFramebuffer cursor that the
+  paravirtual framebuffer passes to the host as FIFO 0x04 (stash "experiment: PV hardware cursor").
+- On the rig: `SLSHardwareCursorActive()` is 0; the Samsung runs 1920x1080 points at 3840x2160 pixels (HiDPI), the Lenovo 1920x1080 at
+  1x, both SDR.
+
+**Answer: no native display is needed.** Measured on the rig, 2026-11-19, with the stashed PV hardware cursor (`rdna4-pvcursor=1`):
+
+| setup | `SLSHardwareCursorActive` | glyphs WindowServer sends | port 0 frames / draws per 5 s, pointer circling |
+| --- | --- | --- | --- |
+| cursor size 64 announced, Samsung HiDPI | 0 | only the kernel's busy cursor (16x16) | ~252 / ~2900 |
+| same, Samsung switched to 1x (`kCGConfigureForAppOnly`) | 1 | its arrow, 32x64 | 13-15 / ~650 (idle) |
+| cursor size 128 announced, each glyph cropped, Samsung HiDPI | 1 | 2x arrow 64x128 (covers 29x43) to the Samsung, 1x 32x64 (15x22) to the Lenovo | 15-18 / ~650-1200 |
+
+- With a hardware cursor WindowServer no longer redraws the pointer's rectangle as it moves (the frame rate drops to the idle rate),
+  which is what made the box lines.
+- At HiDPI WindowServer needs a cursor larger than 64 (its 2x images are 64x128). DCN 4.01's cursor is 64x64 at most (Linux:
+  `dcn401_resource.c` `max_cursor_size = 64`, cursor cache 64x64x8 bytes; 128x128 would need MALL). So the host announces 128 and
+  crops each image to what it covers (alpha above 0, the hot spot included): the arrow, 2x, fits.
+- The two displays get different images (2x, 1x): each pipe has its own sprite slot and hot spot (`cursor.cpp` `cursorSlot`).
+- Not yet seen by eye (the cursor plane is in no screen capture): `rdna4-pvcursor=1` stays default off until it is.
+
+Next gate: acceleration structures (ray tracing) on the native device.
+
+
