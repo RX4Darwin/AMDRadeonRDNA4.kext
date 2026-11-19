@@ -13,7 +13,8 @@
 //   mtlprobe native <probe.metallib>   the native-Metal spike on our own device (RDNA4MTLDevice; as root, RDNA4_NATIVE_MTL=1): gate 2,
 //                      c = a + b over 1000 floats in groups of 64 (dispatchThreads: the last group is partial), then c *= 3 with setBytes;
 //                      gate 3, a render pass: the kext's colour triangle into a 256x256 RGBA8 texture filled with 0x55 and cleared to 0,
-//                      checked as rdna4-run tricol checks its own (userspace/rdna4-run/gfx12tricol.h)
+//                      checked as rdna4-run tricol checks its own (userspace/rdna4-run/gfx12tricol.h); gate 5, ray queries: 1024 rays
+//                      against 300 random triangles in an acceleration structure, each hit checked against the CPU's nearest triangle
 //   mtlprobe two       two kernels of one library in one command buffer: out[i] = in[i] + 1, then out[i] *= 3 (64 threads)
 //   mtlprobe twolib    the same with two libraries of one kernel each: out[i] = in[i] + 7, then out[i] *= out[i]
 //   mtlprobe feat      one kernel per Metal language feature (constant buffers, math, threadgroup memory and barriers, atomics, local
@@ -2199,6 +2200,118 @@ static void spin(id<MTLDevice> d, id<MTLCommandQueue> q, double seconds) {
 	OUT("spin: %d frames in %.1f s", total, -[start timeIntervalSinceNow]);
 }
 
+static float nativeRandom(uint32_t *seed)   // a fixed sequence (LCG), the same on every run
+{
+	*seed = *seed * 1664525u + 1013904223u;
+	return (float)(*seed >> 8) / 16777216.0f;
+}
+
+// The native-Metal spike's gate 5: `kRays` rays from a grid at z = 0, tilted, against `kTris` random triangles at z 2-6 (a fixed seed), in
+// an acceleration structure; each ray's hit (distance, barycentrics, primitive id) against the nearest one by the CPU (Moller-Trumbore,
+// no structure). A distance within 1e-4 counts as the same hit (the primitive may then differ: two triangles at that distance).
+static BOOL nativeRays(id<MTLDevice> d, id<MTLLibrary> lib)
+{
+	enum { kTris = 300, kRays = 1024 };
+	static float verts[kTris * 9], org[kRays * 4], dir[kRays * 4], cpu[kRays * 4];
+	uint32_t seed = 12345;
+#define rnd() nativeRandom(&seed)
+	for (int t = 0; t < kTris; t++) {
+		const float cx = 2.4f * rnd() - 1.2f, cy = 2.4f * rnd() - 1.2f, cz = 2 + 4 * rnd();
+		for (int k = 0; k < 3; k++) {
+			verts[9 * t + 3 * k] = cx + 0.5f * rnd() - 0.25f;
+			verts[9 * t + 3 * k + 1] = cy + 0.5f * rnd() - 0.25f;
+			verts[9 * t + 3 * k + 2] = cz + 0.5f * rnd() - 0.25f;
+		}
+	}
+	for (int i = 0; i < kRays; i++) {
+		org[4 * i] = 2.4f * (i % 32) / 31 - 1.2f;
+		org[4 * i + 1] = 2.4f * (i / 32) / 31 - 1.2f;
+		org[4 * i + 2] = org[4 * i + 3] = 0;
+		dir[4 * i] = 0.1f * rnd() - 0.05f;
+		dir[4 * i + 1] = 0.1f * rnd() - 0.05f;
+		dir[4 * i + 2] = 1;
+		dir[4 * i + 3] = 0;
+		float best = 100;
+		cpu[4 * i] = cpu[4 * i + 1] = cpu[4 * i + 2] = cpu[4 * i + 3] = -1;
+		const float *o = &org[4 * i], *dd = &dir[4 * i];
+		for (int t = 0; t < kTris; t++) {
+			const float *v = &verts[9 * t];
+			const float e1[3] = { v[3] - v[0], v[4] - v[1], v[5] - v[2] }, e2[3] = { v[6] - v[0], v[7] - v[1], v[8] - v[2] };
+			const float p[3] = { dd[1] * e2[2] - dd[2] * e2[1], dd[2] * e2[0] - dd[0] * e2[2], dd[0] * e2[1] - dd[1] * e2[0] };
+			const float det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+			if (fabsf(det) < 1e-12f)
+				continue;
+			const float inv = 1 / det, s[3] = { o[0] - v[0], o[1] - v[1], o[2] - v[2] };
+			const float u = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) * inv;
+			const float q[3] = { s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0] };
+			const float w = (dd[0] * q[0] + dd[1] * q[1] + dd[2] * q[2]) * inv, dist = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
+			if (u < 0 || u > 1 || w < 0 || u + w > 1 || dist < 0 || dist > best)
+				continue;
+			best = dist;
+			cpu[4 * i] = dist;
+			cpu[4 * i + 1] = u;
+			cpu[4 * i + 2] = w;
+			cpu[4 * i + 3] = t;
+		}
+	}
+	NSError *err = nil;
+	id<MTLComputePipelineState> rays = [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rays"] error:&err];
+	id<MTLBuffer> vb = [d newBufferWithBytes:verts length:sizeof verts options:MTLResourceStorageModeShared];
+	id<MTLBuffer> ob = [d newBufferWithBytes:org length:sizeof org options:MTLResourceStorageModeShared];
+	id<MTLBuffer> db = [d newBufferWithBytes:dir length:sizeof dir options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out = [d newBufferWithLength:sizeof cpu options:MTLResourceStorageModeShared];
+	if (!rays || !vb || !ob || !db || !out) {
+		OUT("native: rays FAIL: %s", rays ? "no buffers" : err.localizedDescription.UTF8String);
+		return NO;
+	}
+	MTLAccelerationStructureTriangleGeometryDescriptor *geo = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+	geo.vertexBuffer = vb;
+	geo.vertexStride = 12;
+	geo.triangleCount = kTris;
+	MTLPrimitiveAccelerationStructureDescriptor *desc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+	desc.geometryDescriptors = @[ geo ];
+	const MTLAccelerationStructureSizes sizes = [d accelerationStructureSizesWithDescriptor:desc];
+	id<MTLAccelerationStructure> as = [d newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+	id<MTLBuffer> scratch = [d newBufferWithLength:sizes.buildScratchBufferSize ?: 16 options:MTLResourceStorageModePrivate];
+	id<MTLCommandBuffer> cb = [[d newCommandQueue] commandBuffer];
+	id<MTLAccelerationStructureCommandEncoder> ae = [cb accelerationStructureCommandEncoder];
+	[ae buildAccelerationStructure:as descriptor:desc scratchBuffer:scratch scratchBufferOffset:0];
+	[ae endEncoding];
+	id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+	[ce setComputePipelineState:rays];
+	[ce setAccelerationStructure:as atBufferIndex:0];
+	[ce setBuffer:ob offset:0 atIndex:1];
+	[ce setBuffer:db offset:0 atIndex:2];
+	[ce setBuffer:out offset:0 atIndex:3];
+	[ce dispatchThreads:MTLSizeMake(kRays, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	[ce endEncoding];
+	const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	[cb commit];
+	[cb waitUntilCompleted];
+	const double ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6;
+	const float *gpu = out.contents;
+	int hits = 0, bad = 0, firstBad = -1;
+	for (int i = 0; i < kRays; i++) {
+		const BOOL hitCpu = cpu[4 * i] >= 0, hitGpu = gpu[4 * i] >= 0;
+		hits += hitCpu;
+		const BOOL same = hitCpu == hitGpu && (!hitCpu || (fabsf(cpu[4 * i] - gpu[4 * i]) < 1e-4f &&
+		                                                   (cpu[4 * i + 3] != gpu[4 * i + 3] ||
+		                                                    (fabsf(cpu[4 * i + 1] - gpu[4 * i + 1]) < 1e-4f && fabsf(cpu[4 * i + 2] - gpu[4 * i + 2]) < 1e-4f))));
+		if (!same && !bad++)
+			firstBad = i;
+	}
+	const uint32_t *head = ((id<MTLBuffer>)[(id)as valueForKey:@"memory"]).contents;
+	OUT("native: rays %s: %d of %d rays wrong, %d hit (CPU); structure %u nodes, %u triangles, %lu bytes; commit %.1f ms (status %ld%s%s)%s",
+	    !bad && cb.status == MTLCommandBufferStatusCompleted && hits > 0 && hits < kRays ? "PASS" : "FAIL", bad, kRays, hits, head ? head[1] : 0,
+	    head ? head[2] : 0, (unsigned long)sizes.accelerationStructureSize, ms, (long)cb.status, cb.error ? ", " : "",
+	    cb.error ? cb.error.localizedDescription.UTF8String : "",
+	    firstBad >= 0 ? [NSString stringWithFormat:@"; first wrong ray %d: CPU %g %g %g %g, GPU %g %g %g %g", firstBad, cpu[4 * firstBad],
+	                     cpu[4 * firstBad + 1], cpu[4 * firstBad + 2], cpu[4 * firstBad + 3], gpu[4 * firstBad], gpu[4 * firstBad + 1],
+	                     gpu[4 * firstBad + 2], gpu[4 * firstBad + 3]].UTF8String : "");
+	return !bad && cb.status == MTLCommandBufferStatusCompleted && hits > 0 && hits < kRays;
+#undef rnd
+}
+
 int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
@@ -2315,7 +2428,8 @@ int main(int argc, char **argv) {
 			    "near the vertices 0x%08x 0x%08x 0x%08x, pixel (0,0) 0x%08x (status %ld%s%s)", renderOk ? "PASS" : "FAIL", tr.covered, tr.minX, tr.maxX,
 			    tr.minY, tr.maxY, tr.maxChannelErr256 / 256.0, tr.maxSumErr, tr.centroid, tr.near0, tr.near1, tr.near2, img[0], (long)rb.status,
 			    rb.error ? ", " : "", rb.error ? rb.error.localizedDescription.UTF8String : "");
-			return computeOk && renderOk ? 0 : 1;
+			const BOOL raysOk = nativeRays(d, lib);
+			return computeOk && renderOk && raysOk ? 0 : 1;
 		}
 		if (!strcmp(mode, "devices")) {   // every Metal device, its class and registry ID (the native-Metal spike's gate 1)
 			NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();

@@ -29,6 +29,10 @@
  * ponytail: synchronous commit, one draw at a time, no blending, depth, textures in shaders, MSAA or indexed draws; one host allocation
  * per set*Bytes. A real queue (IBs batched, fences, completion on a thread) when a gate needs overlap.
  *
+ * Gate 5: ray queries. Acceleration structures of triangle geometry are the device's own format (a stackless BVH, built by the CPU
+ * as a command buffer's step, below); a kernel's intersect is translated into tools/metal/m3/rtlib.c's traversal of it.
+ * ponytail: primitive structures only (no instances), no refit, compaction, masks, cull modes or intersection functions.
+ *
  * The device exists only in processes started with RDNA4_NATIVE_MTL=1 (the init returns nil elsewhere, which Metal skips): published
  * for every process, it was made in ControlCenter and the like, which crashed on the first missing message (2026-11-19).
  */
@@ -270,6 +274,148 @@ static BOOL isBgra(MTLPixelFormat f) { return f == MTLPixelFormatBGRA8Unorm || f
 RDNA4_ANSWER_MISSING
 @end
 
+// ---- acceleration structures (gate 5)
+
+// The device's own format, which tools/metal/m3/rtlib.c traverses: a header {'RAS1', nodes, triangles, 0}, the nodes depth first (32 bytes:
+// lo[3], escape, hi[3], tris: 0 for an inner node, else first << 4 | count) and the triangles (48 bytes: v0, v1, v2, primitive id,
+// geometry index, 0). Built by the CPU, as a command buffer's step, from shared vertex (and index) buffers.
+typedef struct { float lo[3]; uint32_t escape; float hi[3]; uint32_t tris; } RtNode;
+typedef struct { float v[9]; uint32_t prim, geom, zero; } RtTri;
+enum { kRtHeader = 16, kRtLeaf = 4 };
+
+static uint64_t rtBytes(uint64_t triangles) { return kRtHeader + sizeof(RtNode) * (2 * triangles + 1) + sizeof(RtTri) * triangles; }
+
+static int gRtAxis;   // ponytail: qsort's axis; builds run one at a time (synchronous commit)
+static int rtCompare(const void *a, const void *b)
+{
+	const RtTri *x = a, *y = b;
+	const float cx = x->v[gRtAxis] + x->v[3 + gRtAxis] + x->v[6 + gRtAxis], cy = y->v[gRtAxis] + y->v[3 + gRtAxis] + y->v[6 + gRtAxis];
+	return cx < cy ? -1 : cx > cy;
+}
+
+// The subtree of tris[first, first + count) from nodes[*used] on, depth first; leaves of at most kRtLeaf triangles, split at the median
+// of the widest axis of their centres.
+static void rtBuild(RtTri *tris, uint32_t first, uint32_t count, RtNode *nodes, uint32_t *used)
+{
+	RtNode *n = &nodes[(*used)++];
+	float clo[3] = { INFINITY, INFINITY, INFINITY }, chi[3] = { -INFINITY, -INFINITY, -INFINITY };
+	for (int a = 0; a < 3; a++) {
+		n->lo[a] = INFINITY;
+		n->hi[a] = -INFINITY;
+	}
+	for (uint32_t i = first; i < first + count; i++)
+		for (int a = 0; a < 3; a++) {
+			const float c = tris[i].v[a] + tris[i].v[3 + a] + tris[i].v[6 + a];
+			clo[a] = fminf(clo[a], c);
+			chi[a] = fmaxf(chi[a], c);
+			for (int k = 0; k < 3; k++) {
+				n->lo[a] = fminf(n->lo[a], tris[i].v[3 * k + a]);
+				n->hi[a] = fmaxf(n->hi[a], tris[i].v[3 * k + a]);
+			}
+		}
+	if (count <= kRtLeaf) {
+		n->tris = first << 4 | count;
+		n->escape = *used;
+		return;
+	}
+	gRtAxis = chi[1] - clo[1] > chi[0] - clo[0] ? 1 : 0;
+	gRtAxis = chi[2] - clo[2] > chi[gRtAxis] - clo[gRtAxis] ? 2 : gRtAxis;
+	qsort(tris + first, count, sizeof(RtTri), rtCompare);
+	rtBuild(tris, first, count / 2, nodes, used);
+	rtBuild(tris, first + count / 2, count - count / 2, nodes, used);
+	n->tris = 0;
+	n->escape = *used;
+}
+
+// The triangles a descriptor describes, or an error: triangle geometry of float3 vertices, with or without 16- or 32-bit indices.
+static NSError *rtTriangles(MTLPrimitiveAccelerationStructureDescriptor *d, NSMutableData *out)
+{
+	uint32_t geom = 0;
+	for (MTLAccelerationStructureGeometryDescriptor *g in d.geometryDescriptors) {
+		if (![g isKindOfClass:[MTLAccelerationStructureTriangleGeometryDescriptor class]])
+			return rdna4Error(@"only triangle geometry so far", 0);
+		MTLAccelerationStructureTriangleGeometryDescriptor *t = (MTLAccelerationStructureTriangleGeometryDescriptor *)g;
+		if (t.vertexFormat != MTLAttributeFormatFloat3 || t.transformationMatrixBuffer || ![(id)t.vertexBuffer isKindOfClass:[RDNA4MTLBuffer class]] ||
+		    (t.indexBuffer && ![(id)t.indexBuffer isKindOfClass:[RDNA4MTLBuffer class]]))
+			return rdna4Error(@"a triangle geometry of other than float3 vertices in buffers of this device, or with a transform: not yet", 0);
+		const NSUInteger stride = t.vertexStride ?: 12;
+		const uint8_t *vb = (const uint8_t *)t.vertexBuffer.contents + t.vertexBufferOffset;
+		const uint8_t *ib = t.indexBuffer ? (const uint8_t *)t.indexBuffer.contents + t.indexBufferOffset : NULL;
+		const BOOL wide = t.indexType == MTLIndexTypeUInt32;
+		const NSUInteger vertices = (t.vertexBuffer.length - t.vertexBufferOffset) / stride;
+		for (NSUInteger i = 0; i < t.triangleCount; i++) {
+			RtTri tri = { .prim = (uint32_t)i, .geom = geom };
+			for (int k = 0; k < 3; k++) {
+				const NSUInteger j = 3 * i + k;
+				if (ib && (wide ? 4 : 2) * (j + 1) > t.indexBuffer.length - t.indexBufferOffset)
+					return rdna4Error([NSString stringWithFormat:@"triangle %lu of geometry %u reads past its index buffer", (unsigned long)i, geom], 0);
+				const NSUInteger v = !ib ? j : wide ? ((const uint32_t *)ib)[j] : ((const uint16_t *)ib)[j];
+				if (v >= vertices)
+					return rdna4Error([NSString stringWithFormat:@"triangle %lu of geometry %u reads past its vertex buffer", (unsigned long)i, geom], 0);
+				memcpy(&tri.v[3 * k], vb + v * stride, 12);
+			}
+			[out appendBytes:&tri length:sizeof tri];
+		}
+		geom++;
+	}
+	return nil;
+}
+
+@interface RDNA4MTLAccelerationStructure : NSObject <MTLAccelerationStructure>
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device size:(NSUInteger)size;
+- (NSError *)build:(MTLPrimitiveAccelerationStructureDescriptor *)descriptor;
+@property (readonly) RDNA4MTLBuffer *memory;
+@end
+
+@implementation RDNA4MTLAccelerationStructure {
+	RDNA4MTLDevice *_device;
+}
+@synthesize label;
+
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device size:(NSUInteger)size
+{
+	if (!(self = [super init]))
+		return nil;
+	_memory = [[RDNA4MTLBuffer alloc] initWithDevice:device length:MAX(size, (NSUInteger)kRtHeader) options:MTLResourceStorageModeShared];
+	_device = device;
+	return _memory ? self : nil;
+}
+
+- (NSError *)build:(MTLPrimitiveAccelerationStructureDescriptor *)d
+{
+	if (![d isKindOfClass:[MTLPrimitiveAccelerationStructureDescriptor class]])
+		return rdna4Error(@"only primitive acceleration structures so far (no instances)", 0);
+	NSMutableData *tris = [NSMutableData data];
+	NSError *why = rtTriangles(d, tris);
+	const uint32_t count = (uint32_t)(tris.length / sizeof(RtTri));
+	if (why)
+		return why;
+	if (rtBytes(count) > _memory.length || count >= (1u << 27))
+		return rdna4Error([NSString stringWithFormat:@"%u triangles do not fit an acceleration structure of %lu bytes", count,
+		                                             (unsigned long)_memory.length], 0);
+	uint32_t *head = _memory.contents;
+	RtNode *nodes = (RtNode *)(head + 4);
+	uint32_t used = 0;
+	if (count)
+		rtBuild(tris.mutableBytes, 0, count, nodes, &used);
+	memcpy(nodes + used, tris.bytes, tris.length);
+	head[0] = 0x31534152u;   // 'RAS1'
+	head[1] = used;
+	head[2] = count;
+	head[3] = 0;
+	return nil;
+}
+
+- (id<MTLDevice>)device { return _device; }
+- (NSUInteger)size { return _memory.length; }
+- (NSUInteger)allocatedSize { return _memory.allocatedSize; }
+- (MTLStorageMode)storageMode { return MTLStorageModeShared; }
+- (MTLResourceID)gpuResourceID { return (MTLResourceID){ ._impl = _memory.gpuAddress }; }
+- (uint64_t)gpuAddress { return _memory.gpuAddress; }
+
+RDNA4_ANSWER_MISSING
+@end
+
 // ---- libraries and functions
 
 @interface RDNA4MTLLibrary : NSObject <MTLLibrary>
@@ -328,11 +474,13 @@ RDNA4_ANSWER_MISSING
 
 // ---- translation
 
-// `function` translated by the translator in file mode (/usr/local/libexec/rdna4-air2amdgpu, or $RDNA4_AIR2AMDGPU): a kernel's code
+// `function` translated by the translator in file mode ($RDNA4_AIR2AMDGPU, the bundle's own, or /usr/local/libexec/rdna4-air2amdgpu): a kernel's code
 // object, or a vertex or fragment function's RGFX blob (tools/metal/m3/air2amdgpu.cpp), and a kernel's count of buffer addresses.
 static NSError *translateFunction(RDNA4MTLFunction *function, NSData **blob, uint32_t *buffers)
 {
-	NSString *tool = NSProcessInfo.processInfo.environment[@"RDNA4_AIR2AMDGPU"] ?: @"/usr/local/libexec/rdna4-air2amdgpu";
+	// the bundle's own (build.sh: the translator these functions need, ray queries say), else the paravirtual GPU's helper
+	NSString *own = [[NSBundle bundleForClass:[RDNA4MTLFunction class]] pathForResource:@"air2amdgpu" ofType:nil];
+	NSString *tool = NSProcessInfo.processInfo.environment[@"RDNA4_AIR2AMDGPU"] ?: own ?: @"/usr/local/libexec/rdna4-air2amdgpu";
 	NSString *out = [NSTemporaryDirectory() stringByAppendingPathComponent:
 	                                            [NSString stringWithFormat:@"rdna4mtl-%d-%@.bin", getpid(), function.name]];
 	NSTask *task = [NSTask new];
@@ -604,6 +752,12 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: commit runs them in or
 	[self setBuffer:copy offset:0 atIndex:index];
 }
 
+- (void)setAccelerationStructure:(id<MTLAccelerationStructure>)as atBufferIndex:(NSUInteger)index
+{
+	[self setBuffer:[(id)as isKindOfClass:[RDNA4MTLAccelerationStructure class]] ? ((RDNA4MTLAccelerationStructure *)as).memory : nil offset:0
+	        atIndex:index];
+}
+
 - (void)record:(MTLSize)groups groupSize:(MTLSize)groupSize grid:(MTLSize)grid
 {
 	if (!_pipeline) {
@@ -759,6 +913,40 @@ RDNA4_ANSWER_MISSING
 RDNA4_ANSWER_MISSING
 @end
 
+@interface RDNA4MTLAccelerationStructureEncoder : NSObject <MTLAccelerationStructureCommandEncoder>
+- (instancetype)initWithCommandBuffer:(RDNA4MTLCommandBuffer *)commandBuffer;
+@end
+
+@implementation RDNA4MTLAccelerationStructureEncoder {
+	RDNA4MTLCommandBuffer *_commandBuffer;
+}
+@synthesize label;
+
+- (instancetype)initWithCommandBuffer:(RDNA4MTLCommandBuffer *)commandBuffer
+{
+	if ((self = [super init]))
+		_commandBuffer = commandBuffer;
+	return self;
+}
+
+- (id<MTLDevice>)device { return _commandBuffer.device; }
+
+- (void)buildAccelerationStructure:(id<MTLAccelerationStructure>)as descriptor:(MTLAccelerationStructureDescriptor *)descriptor
+                     scratchBuffer:(id<MTLBuffer>)scratch scratchBufferOffset:(NSUInteger)offset
+{
+	MTLAccelerationStructureDescriptor *d = [descriptor copy];   // as it is now: the app may change it before the commit
+	[_commandBuffer record:^NSError * {
+		if (![(id)as isKindOfClass:[RDNA4MTLAccelerationStructure class]])
+			return rdna4Error(@"an acceleration structure of another device", 0);
+		return [(RDNA4MTLAccelerationStructure *)as build:(MTLPrimitiveAccelerationStructureDescriptor *)d];
+	}];
+}
+
+- (void)endEncoding { }
+
+RDNA4_ANSWER_MISSING
+@end
+
 @implementation RDNA4MTLCommandBuffer {
 	RDNA4MTLCommandQueue *_queue;
 	NSMutableArray<RDNA4Op> *_ops;
@@ -804,6 +992,11 @@ RDNA4_ANSWER_MISSING
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)pass
 {
 	return [[RDNA4MTLRenderEncoder alloc] initWithCommandBuffer:self pass:pass];
+}
+
+- (id<MTLAccelerationStructureCommandEncoder>)accelerationStructureCommandEncoder
+{
+	return [[RDNA4MTLAccelerationStructureEncoder alloc] initWithCommandBuffer:self];
 }
 
 - (void)commit
@@ -1083,6 +1276,28 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 	if (b && length)
 		memcpy(b.contents, pointer, length);
 	return b;
+}
+
+- (BOOL)supportsRaytracing { return YES; }
+
+- (MTLAccelerationStructureSizes)accelerationStructureSizesWithDescriptor:(MTLAccelerationStructureDescriptor *)d
+{
+	NSUInteger triangles = 0;
+	if ([d isKindOfClass:[MTLPrimitiveAccelerationStructureDescriptor class]])
+		for (MTLAccelerationStructureGeometryDescriptor *g in ((MTLPrimitiveAccelerationStructureDescriptor *)d).geometryDescriptors)
+			if ([g isKindOfClass:[MTLAccelerationStructureTriangleGeometryDescriptor class]])
+				triangles += ((MTLAccelerationStructureTriangleGeometryDescriptor *)g).triangleCount;
+	return (MTLAccelerationStructureSizes){ .accelerationStructureSize = (NSUInteger)rtBytes(triangles), .buildScratchBufferSize = 16 };
+}
+
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithSize:(NSUInteger)size
+{
+	return [[RDNA4MTLAccelerationStructure alloc] initWithDevice:self size:size];
+}
+
+- (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d
+{
+	return [self newAccelerationStructureWithSize:[self accelerationStructureSizesWithDescriptor:d].accelerationStructureSize];
 }
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor

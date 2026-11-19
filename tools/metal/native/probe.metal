@@ -1,5 +1,6 @@
 // The native-Metal spike's test functions (mtlprobe native <probe.metallib>, docs/native-metal-spike.md): gate 2's kernels, gate 3's
-// triangle (the kext's colour triangle: vertex 0 red, 1 green, 2 blue at pixels (64,64), (192,64), (128,192) of a 256x256 target).
+// triangle (the kext's colour triangle: vertex 0 red, 1 green, 2 blue at pixels (64,64), (192,64), (128,192) of a 256x256 target),
+// gate 5's ray query (each ray's nearest triangle: distance, barycentrics, primitive id, or -1 for a miss).
 kernel void vadd(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device float *c [[buffer(2)]],
                  uint i [[thread_position_in_grid]]) {
 	c[i] = a[i] + b[i];
@@ -8,6 +9,9 @@ kernel void vadd(device const float *a [[buffer(0)]], device const float *b [[bu
 kernel void scale(device float *o [[buffer(0)]], constant float &k [[buffer(1)]], uint i [[thread_position_in_grid]]) {
 	o[i] *= k;
 }
+
+#include <metal_stdlib>
+using namespace metal;
 
 struct TriOut {
 	float4 position [[position]];
@@ -23,4 +27,13 @@ vertex TriOut tri_v(uint vid [[vertex_id]], device const float2 *pos [[buffer(0)
 
 fragment float4 tri_f(TriOut in [[stage_in]]) {
 	return in.colour;
+}
+
+kernel void rays(raytracing::primitive_acceleration_structure accel [[buffer(0)]], device const float4 *origins [[buffer(1)]],
+                 device const float4 *directions [[buffer(2)]], device float4 *out [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+	raytracing::ray r(origins[i].xyz, directions[i].xyz, 0.0f, 100.0f);
+	raytracing::intersector<raytracing::triangle_data> isect;
+	raytracing::intersection_result<raytracing::triangle_data> hit = isect.intersect(r, accel);
+	out[i] = hit.type == raytracing::intersection_type::triangle ? float4(hit.distance, hit.triangle_barycentric_coord, float(hit.primitive_id))
+	                                                              : float4(-1);
 }

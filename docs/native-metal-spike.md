@@ -153,6 +153,34 @@ How Tahoe's WindowServer decides (x86_64, read from CoreDisplay and SkyLight, 20
 - The two displays get different images (2x, 1x): each pipe has its own sprite slot and hot spot (`cursor.cpp` `cursorSlot`).
 - Not yet seen by eye (the cursor plane is in no screen capture): `rdna4-pvcursor=1` stays default off until it is.
 
-Next gate: acceleration structures (ray tracing) on the native device.
+## Gate 5: ray queries (acceleration structures)
+
+What Metal compiles a ray query to (Xcode's toolchain, AIR 2.8): `intersector<triangle_data>::intersect(ray, accel)` is one call,
+`air.intersect.triangle_data(float3 origin, float3 direction, float min, float max, ptr addrspace(1) accel, ptr function table,
+ptr payload, i64, i32 x 9, i1 accept any)` returning `{i32 type (1 triangle), float distance, i32 primitive id, i32 geometry index, ptr,
+<2 x float> barycentrics, i1}`, with `air.get_null_intersection_function_table()` for the table. The structure is a kernel argument
+`air.primitive_acceleration_structure` at a buffer location: an opaque pointer, so **the device chooses its format**.
+
+- The format (`tools/metal/native/RDNA4MTLDevice.m`, `tools/metal/m3/rtlib.c`): a header, a BVH of 32-byte nodes in depth-first
+  order, each with the index after its subtree (its escape), and 48-byte triangles. The traversal is stackless (next node on a hit,
+  escape on a miss): kernels have no scratch memory for a stack.
+- The build: `buildAccelerationStructure:descriptor:...` records a step the CPU runs at commit, from shared float3 vertex (and 16- or
+  32-bit index) buffers: leaves of at most 4 triangles, median splits along the widest axis of the centres.
+- The translator (`air2amdgpu.cpp`): the acceleration structure argument is a buffer slot; `intersect.triangle_data` becomes a call of
+  `rdna4_rt_intersect` (`rtlib.c`: slab test, Moller-Trumbore), linked in after retargeting from gfx1201 bitcode that `build.sh` makes
+  with Homebrew's clang (`rtlib.h`, committed), and inlined. The native bundle carries its own translator (`Contents/Resources`), so
+  the system helper the paravirtual GPU uses is not touched.
+- The compute encoder binds a structure with `setAccelerationStructure:atBufferIndex:`; the device answers `supportsRaytracing`,
+  `accelerationStructureSizesWithDescriptor:` and `newAccelerationStructureWith{Size,Descriptor}:`.
+
+Check: `mtlprobe native` (as gates 2 and 3): 1024 rays from a grid, slightly tilted, against 300 random triangles (a fixed seed), each
+hit compared with the CPU's nearest triangle (distance, barycentrics, primitive id).
+
+**Gate 5 PASSED on the rig, 2026-11-19, first run**: `rays PASS: 0 of 1024 rays wrong, 556 hit (CPU); structure 215 nodes, 300
+triangles, 33648 bytes; commit 0.3 ms`.
+
+Not yet: instances (instance acceleration structures), bounding-box geometry and intersection functions, masks and cull modes,
+refit and compaction, ray queries in vertex and fragment functions, RDNA4's hardware BVH instructions (`image_bvh*_intersect_ray`,
+which want the hardware's node format), building on the GPU.
 
 

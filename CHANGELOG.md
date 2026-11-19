@@ -40,6 +40,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
   translator) and render passes whose draws go to the card as the device's own gfx IBs, built as the paravirtual host
   builds its draws. Card (2026-11-19): `mtlprobe native` draws the kext's colour triangle into a cleared texture,
   8192 pixels, colours within half a step.
+- Ray tracing on the native device: acceleration structures of triangles (a BVH the CPU builds, in a format of the
+  device's own) and ray queries in kernels (`intersector<triangle_data>`), which the translator turns into a stackless
+  traversal it links in (`tools/metal/m3/rtlib.c`). The paravirtual GPU has no way to build them. Card (2026-11-19):
+  1024 rays against 300 triangles, every hit the same as the CPU's.
 
 ## 0.3.1 (2026-11-18)
 
