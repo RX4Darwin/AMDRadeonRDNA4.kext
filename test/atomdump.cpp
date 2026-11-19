@@ -2810,7 +2810,28 @@ struct FakeBackend {
 	}
 };
 
-static int testNdrv() {
+static int testNdrvRouteGate() {
+	int failures = 0;
+	Ndrv::RouteGate gate;
+
+	failures += check(gate.begin(), "ndrv route gate: first attempt did not acquire Idle state");
+	failures += check(!gate.begin(), "ndrv route gate: concurrent attempt entered while Routing");
+	failures += check(!gate.installed(), "ndrv route gate: Routing was reported as Installed");
+
+	gate.finish(false);
+	failures += check(!gate.installed(), "ndrv route gate: failed attempt was marked Installed");
+	failures += check(gate.begin(), "ndrv route gate: failed attempt did not return to retryable Idle");
+
+	gate.finish(true);
+	failures += check(gate.installed(), "ndrv route gate: successful attempt was not marked Installed");
+	failures += check(!gate.begin(), "ndrv route gate: installed route was allowed to patch twice");
+
+	if (!failures)
+		printf("ndrv route gate: failed attempts remain retryable; successful route is terminal\n");
+	return failures;
+}
+
+int testNdrv() {
 	int failures = 0;
 
 	// Record layouts (LP64; the kext build also static_asserts them against
@@ -3987,18 +4008,30 @@ static int testVmidPool() {
 	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.rebind && g.flush && !g.stolen &&
 	           g.vmid >= kFirst && g.vmid <= kLast, "vmid: first grab binds a fresh VMID");
 	const uint32_t v1 = g.vmid;
+	f += check(!pool.flushComplete(2, v1, g.flushSeq), "vmid: another owner cannot acknowledge this VMID's flush");
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid == v1 && !g.rebind && g.flush,
+	           "vmid: a bind keeps its flush pending until hardware acknowledgement");
+	f += check(pool.flushComplete(1, v1, g.flushSeq), "vmid: successful hardware invalidation acknowledges the bind flush");
 	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok && g.vmid == v1 && !g.rebind && !g.flush,
-	           "vmid: same owner and PD reuse the VMID with no rebind and no flush");
+	           "vmid: same owner and PD reuse the acknowledged VMID without another flush");
 
-	// A flush is owed only when the client removed PTEs (its tlbSeq moved) since the last flush.
+	// A flush is owed only when the client removed PTEs (its tlbSeq moved) since the last acknowledged flush.
 	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.vmid == v1 && !g.rebind && g.flush,
 	           "vmid: tlbSeq advanced -> flush, still no rebind");
-	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && !g.flush, "vmid: the flush is owed once");
-	// Negative control: a pool that ignored tlbSeq would fail the two checks above.
+	const uint64_t flush3 = g.flushSeq;
+	f += check(pool.grab(1, 0x1000, 3, g) == Result::Ok && g.flush,
+	           "vmid: failed/unacknowledged flush remains pending on retry");
+	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && g.flush,
+	           "vmid: a newer PTE-removal sequence extends an outstanding flush");
+	f += check(!pool.flushComplete(1, v1, flush3),
+	           "vmid: an acknowledgement for an older sequence cannot clear a newer pending flush");
+	f += check(pool.flushComplete(1, v1, g.flushSeq), "vmid: the flush is cleared only after acknowledgement");
+	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && !g.flush, "vmid: acknowledged latest flush is not repeated");
+	// Negative control: a pool that ignored tlbSeq or acknowledged before hardware completion would fail these checks.
 
 	// A flush does not need an idle VMID (an invalidation only drops cached translations).
 	pool.noteSubmit(v1, 0, 10);
-	f += check(pool.grab(1, 0x1000, 4, g) == Result::Ok && g.vmid == v1 && g.flush && !g.rebind,
+	f += check(pool.grab(1, 0x1000, 5, g) == Result::Ok && g.vmid == v1 && g.flush && !g.rebind,
 	           "vmid: a busy VMID may be flushed");
 	fences.now[0] = 10;
 
@@ -4181,6 +4214,20 @@ static int testVmidPool() {
 	f += check(!pool.forget(1, false, released) && pool.ownerOf(g.vmid) == 1, "vmid: forget is refused with a job in flight");
 	f += check(pool.forget(1, true, released) && released == g.vmid && pool.ownerOf(g.vmid) == 0 && pool.idle(g.vmid),
 	           "vmid: a forced forget releases it and clears the pending work");
+
+	// A VMID whose hardware state cannot be trusted is quarantined until a GPU reset.
+	pool.init(fakeReached, &fences);
+	pool.grab(1, 0x1000, 0, g);
+	const uint32_t quarantined = g.vmid;
+	f += check(pool.quarantine(1, quarantined) && pool.ownerOf(quarantined) == 0 && pool.pinned(quarantined),
+	           "vmid: quarantine drops ownership and pins an uncertain hardware VMID");
+	bool avoided = true;
+	for (uintptr_t o = 2; o <= 15; o++)
+		avoided &= pool.grab(o, o * 0x1000, 0, g) == Result::Ok && g.vmid != quarantined;
+	f += check(avoided, "vmid: no client can receive a quarantined VMID");
+	pool.unbindAll();
+	f += check(!pool.pinned(quarantined) && pool.grab(16, 0x16000, 0, g) == Result::Ok,
+	           "vmid: GPU reset unbindAll releases quarantined VMIDs");
 
 	// Reserved VMIDs are never granted.
 	pool.init(fakeReached, &fences, 1u << 8);
@@ -4494,7 +4541,14 @@ struct Pair {
 		compare("map", a, b);
 	}
 	void mapHost(uint64_t va, const std::vector<uint64_t> &buses, uint64_t bytes, bool exec) {
-		const bool a = !beyondDense(va, bytes) && legacyVmMapHost(ref, va, buses.data(), bytes, exec),
+		const uint64_t mapped = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+		bool aligned = mapped >= bytes && buses.size() >= mapped / GpuVm::kPageBytes;
+		for (uint64_t i = 0; aligned && i < mapped / GpuVm::kPageBytes; i++)
+			aligned = !(buses[i] & (GpuVm::kPageBytes - 1)) &&
+			          buses[i] <= GpuVm::kPhysicalMask;
+		/* The pre-S8 implementation could partially write before discovering a
+		 * misaligned later page. The new contract rejects that range atomically. */
+		const bool a = aligned && !beyondDense(va, bytes) && legacyVmMapHost(ref, va, buses.data(), bytes, exec),
 		           b = newVmMapHost(nw, va, buses.data(), bytes, exec);
 		(a ? okHost : failedHost)++;
 		compare("mapHost", a, b);
@@ -4531,6 +4585,19 @@ static int testVmTableDifferential() {
 			pair = Pair {};
 			pair.setup(pol, fbOffset);
 			Pair &P = pair;
+			{
+				const GpuVmTable::Access access { newEntry, newPhys, &P.nw };
+				GpuVmTable::Span span;
+				const uint64_t highPhysical = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+				failures += check(!GpuVmTable::mapVram(access, P.nw.pol, kTableBytes,
+				                                GpuVm::kVaStart + 0x10000, GpuVm::kVaStart + 0x11000,
+				                                highPhysical, false, span) && span.firstPt == ~0ull,
+				           "dense: an aligned VRAM address above the hardware physical mask is rejected before writing PTEs");
+				failures += check(!GpuVmTable::mapVram(access, P.nw.pol, kTableBytes,
+				                                GpuVm::kVaStart + 0x12000, GpuVm::kVaStart + 0x14000,
+				                                GpuVm::kPhysicalMask, false, span) && span.firstPt == ~0ull,
+				           "dense: a VRAM range that crosses the hardware physical limit is rejected before writing its first PTE");
+			}
 
 			// 1. The boot self-test / rtOpen layout: ring (executable), EOP, rptr, wptr, fence, kernarg, then user buffers.
 			P.map(V + 0x0000, MC + 0x1a000000, 0x1000, true);
@@ -4545,6 +4612,13 @@ static int testVmTableDifferential() {
 			for (uint32_t i = 0; i < 16; i++)
 				buses[i] = 0x104048000ull + 0x3000ull * i;
 			P.mapHost(V + 0xb0000, buses, 0x10000, false);
+			// A bad final bus page must reject the whole map without leaving the first 15 PTEs behind.
+			std::vector<uint64_t> badBuses = buses;
+			badBuses.back() |= 0x40;
+			P.mapHost(V + 0xc0000, badBuses, 0x10000, false);
+			badBuses = buses;
+			badBuses.back() = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+			P.mapHost(V + 0xe0000, badBuses, 0x10000, false);
 			P.unmap(V + 0xb0000, 0x10000);                       // the freed buffer; the next dispatch through it must fault
 			P.mapHost(V + 0xd0000, buses, 0x10000, true);
 			P.unmap(V + 0x10000, 0x3000);                        // the program is unloaded
@@ -4827,6 +4901,14 @@ static int testSparseTree() {
 	const uint64_t top = GpuVm::kVaEnd - 0x2000;
 	f += check(treeMap(e, top, MC + 0x300000, 0x2000) && treeResolves(e, top, MC + 0x300000, 0x2000), "tree: the last two pages of the 48-bit space translate");
 	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V - 0x1000, V + 0x1000, 0x1000, false), "tree: a map starting below kVaStart is refused");
+	const uint32_t pagesBeforeHighPhysical = e.sp.pages();
+	const uint64_t highPhysical = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x500000, V + 0x501000, highPhysical, false) &&
+	           e.sp.pages() == pagesBeforeHighPhysical,
+	           "tree: an aligned VRAM address above the hardware physical mask is rejected before allocating tables");
+	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x502000, V + 0x504000, GpuVm::kPhysicalMask, false) &&
+	           e.sp.pages() == pagesBeforeHighPhysical,
+	           "tree: a VRAM range crossing the physical limit is rejected before allocating tables");
 	f += check(treeResolves(e, cross, crossMc, 0x20000) && treeResolves(e, V + 0x1000, MC, 0x3000), "tree: the earlier mappings are undisturbed by the later ones");
 
 	// Unmap: PTEs go (through the dirty path), pages stay, nothing is created for a range that was never mapped.
@@ -4856,7 +4938,15 @@ static int testSparseTree() {
 		f += check(hm2 && e.translate(hv2, phys) && phys == buses[0] && e.translate(hv2 + 0x1000, phys) && phys == buses[1],
 		           "tree: a later host mapping into an existing PT page reaches VRAM");
 		buses[3] |= 0x40;
-		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, hv + 0x20000, hv + 0x28000, buses.data(), false), "tree: a misaligned bus address is refused");
+		const uint32_t pagesBeforeBadMap = e.sp.pages();
+		const uint64_t badVa = hv + 0x20000;
+		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, badVa, badVa + 0x8000, buses.data(), false) &&
+		           e.sp.pages() == pagesBeforeBadMap && !e.translate(badVa, phys) && !e.translate(badVa + 0x2000, phys),
+		           "tree: a misaligned later bus page is refused before allocating tables or writing any PTE");
+		buses[3] = GpuVm::kPhysicalMask + GpuVm::kPageBytes;
+		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, badVa, badVa + 0x8000, buses.data(), false) &&
+		           e.sp.pages() == pagesBeforeBadMap && !e.translate(badVa, phys),
+		           "tree: an aligned host bus address above the hardware physical mask is rejected before allocation");
 	}
 
 	// Quota: the VA limit is the page quota. Nothing half-made, earlier mappings survive.
@@ -4877,6 +4967,43 @@ static int testSparseTree() {
 		f += check(still, "quota: what was mapped before the refusal still translates");
 		q.close();
 		f += check(q.chunksLive == 0 && q.shadowLive == 0, "quota: close returns every chunk and shadow page");
+			// A multi-page map can succeed in one new PT page, then run out of quota
+		// on the next. Its already-written prefix must be cleared before failure returns.
+		q = TreeEnv {};
+		q.open(8);
+		bool four = true;
+		for (uint32_t i = 0; i < 4; i++)
+			four &= treeMap(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		const uint64_t partial = V + 6 * 0x200000ull + 0x1ff000;
+		const bool partialRejected = !treeMap(q, partial, MC + 0x900000, 0x3000);
+		uint64_t partialPhys = 0;
+		bool earlierStill = true;
+		for (uint32_t i = 0; i < 4; i++)
+			earlierStill &= treeResolves(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		f += check(four && partialRejected && q.sp.pages() == 8 &&
+		           !q.translate(partial, partialPhys) && !q.translate(partial + 0x1000, partialPhys) && earlierStill,
+		           "quota: a map that runs out of pages mid-range rolls back its mapped prefix and preserves earlier mappings");
+		q.close();
+
+		// The same mid-range failure path for host bus pages: the first new PT
+		// page is available, the second is not, so no prefix may remain mapped.
+		q = TreeEnv {};
+		q.open(8);
+		four = true;
+		for (uint32_t i = 0; i < 4; i++)
+			four &= treeMap(q, V + i * 0x200000ull, MC + i * 0x10000, 0x1000);
+		std::vector<uint64_t> partialBuses {
+			0x104050000ull, 0x104051000ull, 0x104052000ull
+		};
+		const bool hostPartialRejected = !GpuVmTable::treeMapHost(
+			q.tree(), GpuVmTable::Policy {}, partial, partial + 0x3000, partialBuses.data(), false);
+		q.sync();
+		f += check(four && hostPartialRejected && q.sp.pages() == 8 &&
+		           !q.translate(partial, partialPhys) && !q.translate(partial + 0x1000, partialPhys) &&
+		           treeResolves(q, V + 3 * 0x200000ull, MC + 3 * 0x10000, 0x1000),
+		           "quota: a host map that runs out of pages mid-range rolls back its mapped prefix");
+		q.close();
+
 		// host memory exhaustion behaves like the quota
 		q = TreeEnv {};
 		q.shadowLimit = 3;
@@ -5259,6 +5386,7 @@ int main(int argc, char **argv) {
 	failures += testModes();
 	failures += testPipeDiscovery();
 	failures += testDmubPayloads();
+	failures += testNdrvRouteGate();
 	failures += testNdrv();
 	failures += testModeSet();
 	failures += testDpRetime();

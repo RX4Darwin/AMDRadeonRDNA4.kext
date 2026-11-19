@@ -1,0 +1,107 @@
+name: Tahoe compatibility build
+
+on:
+  push:
+    branches:
+      - tahoe-26.7.3-compat-audit
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-host-tests:
+    # Intel runner matches the kext's x86_64 target and runs macOS 26.
+    runs-on: macos-26-intel
+    timeout-minutes: 60
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Record runner environment
+        run: |
+          sw_vers
+          uname -a
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          echo "Target macOS: 26.7.3 (25G342)"
+          ACTUAL_VERSION="$(sw_vers -productVersion)"
+          ACTUAL_BUILD="$(sw_vers -buildVersion)"
+          if [ "$ACTUAL_VERSION" != "26.7.3" ] || [ "$ACTUAL_BUILD" != "25G342" ]; then
+            echo "::warning::This runner is $ACTUAL_VERSION ($ACTUAL_BUILD), not the exact target 26.7.3 (25G342). Build/test results are not exact-build certification."
+          else
+            echo "Exact target OS build matched."
+          fi
+          test "$(uname -m)" = "x86_64"
+
+      - name: Run host-side regression tests
+        run: make test
+
+      - name: Fetch AMD firmware blobs for compute bring-up
+        run: tools/build/fetch-firmware.sh
+
+      - name: Build standard x86_64 kext
+        run: |
+          make PVGPU=0
+          KEXT="Build/AMDRadeonRDNA4-0.3.1-RELEASE/AMDRadeonRDNA4.kext"
+          test -d "$KEXT"
+          mkdir -p "$RUNNER_TEMP/rdna4-artifacts/standard"
+          cp -R "$KEXT" "$RUNNER_TEMP/rdna4-artifacts/standard/"
+
+      - name: Build experimental Metal/PVGPU x86_64 kext
+        run: |
+          make PVGPU=1
+          KEXT="Build/AMDRadeonRDNA4-0.3.1-RELEASE/AMDRadeonRDNA4.kext"
+          test -d "$KEXT"
+          BIN="$KEXT/Contents/MacOS/AMDRadeonRDNA4"
+          file "$BIN"
+          lipo -archs "$BIN" | grep -qw x86_64
+          # The PVGPU build must contain its paravirtual host implementation.
+          strings "$BIN" > "$RUNNER_TEMP/pvgpu-strings.txt"
+          grep -q 'AMDRadeonRDNA4: pvgpu:' "$RUNNER_TEMP/pvgpu-strings.txt"
+          mkdir -p "$RUNNER_TEMP/rdna4-artifacts/pvgpu"
+          cp -R "$KEXT" "$RUNNER_TEMP/rdna4-artifacts/pvgpu/"
+          # The compute firmware is required for the stage-7 runtime on real hardware.
+          for f in firmware/amdgpu/psp_14_0_3_sos.bin firmware/amdgpu/smu_14_0_3.bin \
+                   firmware/amdgpu/sdma_7_0_1.bin firmware/amdgpu/gc_12_0_1_pfp.bin \
+                   firmware/amdgpu/gc_12_0_1_me.bin firmware/amdgpu/gc_12_0_1_mec.bin \
+                   firmware/amdgpu/gc_12_0_1_uni_mes.bin firmware/amdgpu/gc_12_0_1_imu.bin \
+                   firmware/amdgpu/gc_12_0_1_rlc.bin firmware/amdgpu/dcn_4_0_1_dmcub.bin; do
+            test -s "$f" || { echo "::error::Missing compute firmware blob: $f"; exit 1; }
+          done
+          echo "All ten compute firmware blobs are present in the PVGPU build."
+
+      - name: Verify both bundle metadata and architecture
+        run: |
+          for variant in standard pvgpu; do
+            KEXT="$RUNNER_TEMP/rdna4-artifacts/$variant/AMDRadeonRDNA4.kext"
+            ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KEXT/Contents/Info.plist")
+            VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$KEXT/Contents/Info.plist")
+            test "$ID" = "com.hackintosh.AMDRadeonRDNA4"
+            test "$VERSION" = "0.3.1"
+            file "$KEXT/Contents/MacOS/AMDRadeonRDNA4"
+            lipo -archs "$KEXT/Contents/MacOS/AMDRadeonRDNA4" | grep -qw x86_64
+          done
+
+      - name: Label artifacts as build-validation only
+        run: |
+          cat > "$RUNNER_TEMP/rdna4-artifacts/BUILD-VALIDATION-ONLY.txt" <<'EOF'
+          These bundles are CI build/package outputs, not hardware-validated releases.
+          The PVGPU=1 bundle is experimental. The upstream Makefile documents a Tahoe
+          Restart/Shut Down freeze when PVGPU classes are present, even with rdna4-off=1.
+          Do not install the PVGPU bundle on a daily-use system.
+          Neither bundle is certified for macOS Tahoe 26.7.3 build 25G342 or an RX 9070 XT.
+          EOF
+
+      - name: Upload build-validation-only artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AMDRadeonRDNA4-tahoe26-build-validation-only-x86_64
+          path: ${{ runner.temp }}/rdna4-artifacts/
+          if-no-files-found: error
+          retention-days: 14

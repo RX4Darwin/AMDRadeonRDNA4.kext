@@ -1,0 +1,69 @@
+name: Build and publish Tahoe release
+
+on:
+  push:
+    tags:
+      - "tahoe-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    # The kext Makefile targets x86_64; use an Intel macOS runner.
+    runs-on: macos-26-intel
+    timeout-minutes: 60
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Record build environment
+        run: |
+          sw_vers
+          uname -a
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          test "$(uname -m)" = "x86_64"
+
+      - name: Run host-side regression tests
+        run: make test
+
+      - name: Fetch firmware blobs
+        run: tools/build/fetch-firmware.sh
+
+      - name: Build standard x86_64 kext
+        run: |
+          make PVGPU=0
+          KEXT="Build/AMDRadeonRDNA4-0.3.1-RELEASE/AMDRadeonRDNA4.kext"
+          test -d "$KEXT"
+          ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KEXT/Contents/Info.plist")
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$KEXT/Contents/Info.plist")
+          test "$ID" = "com.hackintosh.AMDRadeonRDNA4"
+          test "$VERSION" = "0.3.1"
+          file "$KEXT/Contents/MacOS/AMDRadeonRDNA4"
+          lipo -archs "$KEXT/Contents/MacOS/AMDRadeonRDNA4" | grep -qw x86_64
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$KEXT" "dist/AMDRadeonRDNA4-${GITHUB_REF_NAME}-RELEASE.zip"
+          shasum -a 256 "dist/AMDRadeonRDNA4-${GITHUB_REF_NAME}-RELEASE.zip" > "dist/AMDRadeonRDNA4-${GITHUB_REF_NAME}-RELEASE.zip.sha256"
+
+      - name: Publish prerelease and attach the standard kext
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "AMDRadeonRDNA4 ${{ github.ref_name }}"
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            **Experimental community build for macOS Tahoe compatibility work.**
+
+            This release contains the standard `PVGPU=0` x86_64 kext only.
+            The experimental PVGPU build is deliberately excluded.
+
+            A successful CI build and host-side tests do not establish hardware
+            compatibility. This build has not been certified on macOS Tahoe
+            26.7.3 (25G342) or an RX 9070 XT. Keep a known-good boot entry and
+            backup before testing; do not treat this as a production driver.
+          files: |
+            dist/AMDRadeonRDNA4-${{ github.ref_name }}-RELEASE.zip
+            dist/AMDRadeonRDNA4-${{ github.ref_name }}-RELEASE.zip.sha256

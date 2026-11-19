@@ -55,6 +55,7 @@ enum class Result {
 
 struct Grant {
 	uint32_t vmid { 0 };
+	uint64_t flushSeq { 0 };   // exact PTE-removal sequence this grant's invalidation must cover
 	bool rebind { false };     // the caller must write this client's page directory into the VMID's context (and IH LUT)
 	bool flush { false };      // the caller must invalidate the VMID's TLB (always true with rebind)
 	bool stolen { false };     // rebind took the VMID from another owner (for logs)
@@ -77,6 +78,13 @@ public:
 	// sequence is `tlbSeq` (bumped by the client each time it removes PTEs).
 	// `owner` must be non-zero.
 	Result grab(uintptr_t owner, uint64_t pd, uint64_t tlbSeq, Grant &out);
+
+	// The hardware acknowledged the TLB invalidation requested by a grab/bind.
+	// coveredSeq must match that grant's flushSeq; a newer PTE-removal sequence
+	// cannot be marked covered by an older in-flight invalidation.
+	bool flushComplete(uintptr_t owner, uint32_t vmid, uint64_t coveredSeq);
+	// Permanently withhold a VMID until unbindAll() after reset when hardware state is uncertain.
+	bool quarantine(uintptr_t owner, uint32_t vmid);
 
 	// A job was queued on `vmid` and will signal `seq` on `domain`.
 	void noteSubmit(uint32_t vmid, uint32_t domain, uint32_t seq);
@@ -103,8 +111,10 @@ private:
 	struct Slot {
 		uintptr_t owner;           // 0 = unbound
 		uint64_t pd;
-		uint64_t boundSeq;         // client tlbSeq the last flush covered
+		uint64_t boundSeq;         // client tlbSeq the last acknowledged flush covered
+		uint64_t flushSeq;         // newest tlbSeq the pending invalidation must cover
 		uint64_t lastUse;
+		bool flushPending;
 		bool pinned;
 		bool pending[kMaxDomains];
 		uint32_t pendingSeq[kMaxDomains];

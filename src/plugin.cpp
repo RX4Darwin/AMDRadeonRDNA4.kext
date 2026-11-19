@@ -1580,21 +1580,25 @@ void processGraphics(void *, KernelPatcher &patcher, size_t index, mach_vm_addre
 	patcher.clearError();
 }
 
-bool ndrvRouted = false;   // processKext ran: by Lilu's load notice, or by lateNdrvCheck
+Ndrv::RouteGate ndrvRouteGate;
 
 void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address,
                  size_t size) {
-	if (index != kextIONDRVSupport.loadIndex || __atomic_exchange_n(&ndrvRouted, true, __ATOMIC_SEQ_CST))
+	if (index != kextIONDRVSupport.loadIndex || !ndrvRouteGate.begin())
 		return;
 	KernelPatcher::RouteRequest request {
 		"__ZN17IONDRVFramebuffer10doDriverIOEjPvjj", wrapDoDriverIO, orgDoDriverIO,
 	};
-	if (patcher.routeMultiple(index, &request, 1, address, size))
-		FBLOG("ndrv: routed IONDRVFramebuffer::doDriverIO");
-	else
-		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d)",
+	if (!patcher.routeMultiple(index, &request, 1, address, size)) {
+		FBLOG("ndrv: failed to route IONDRVFramebuffer::doDriverIO (error %d); leaving late-load retry armed",
 		      patcher.getError());
+		patcher.clearError();
+		ndrvRouteGate.finish(false);
+		return;
+	}
+	FBLOG("ndrv: routed IONDRVFramebuffer::doDriverIO");
 	patcher.clearError();
+	ndrvRouteGate.finish(true);
 	// The second display and its hot-plug are on unless turned off: lit at
 	// boot, mode switching, display sleep and hot-plug ran on the card for an
 	// HDMI monitor on either connector (2026-10-04..06). Not in VM test
@@ -1697,7 +1701,7 @@ KernelPatcher *gPatcher = nullptr;
 thread_call_t gLateNdrv = nullptr;
 
 void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
-	if (__atomic_load_n(&ndrvRouted, __ATOMIC_SEQ_CST) || !gPatcher)
+	if (ndrvRouteGate.installed() || !gPatcher)
 		return;
 	kmod_info_t *ndrv = nullptr;
 	if (auto **kmods = reinterpret_cast<kmod_info_t **>(gPatcher->solveSymbol(KernelPatcher::KernelID, "_kmod")))
@@ -1723,6 +1727,17 @@ void lateNdrvCheck(thread_call_param_t, thread_call_param_t) {
 	const size_t size = gPatcher->updateRunningInfo(kextIONDRVSupport.loadIndex, ndrv->address, ndrv->size);
 	gPatcher->clearError();
 	processKext(nullptr, *gPatcher, kextIONDRVSupport.loadIndex, ndrv->address, size);
+	if (!ndrvRouteGate.installed()) {
+		if (up < 120ull * NSEC_PER_SEC) {
+			FBLOG("ndrv: primary route is not installed yet; retrying late-load check");
+			uint64_t deadline;
+			clock_interval_to_deadline(2, kSecondScale, &deadline);
+			thread_call_enter_delayed(gLateNdrv, deadline);
+		} else {
+			FBLOG("ndrv: primary route could not be installed within 120 s; leaving Apple's framebuffer untouched");
+		}
+		return;
+	}
 	// The GPU again: IONDRVFramebuffer matches again (its first instance did not start without our routes).
 	OSDictionary *match = IOService::serviceMatching("IOPCIDevice");
 	OSIterator *it = match ? IOService::getMatchingServices(match) : nullptr;

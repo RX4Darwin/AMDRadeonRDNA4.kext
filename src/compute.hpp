@@ -13,8 +13,10 @@
 //  up, the normal driver path needs no GPU reset, so the display that
 //  RDNA4Device drives stays lit:
 //
-//    stage 1  survey    read-only: state of every engine, both hubs, the PSP,
-//                       and the VRAM layout the compute side can use.
+//    stage 1  survey    inspect engine, hub, PSP and VRAM state without
+//                       defensive engine quiescing or firmware bring-up.
+//                       The GFXOFF safety preflight may ask the SMU to
+//                       disallow GFXOFF if the previous boot left it flagged.
 //    stage 2  psp       sOS components through the bootloader, the GPCOM
 //                       ring, LOAD_TOC, then the SMU firmware (LOAD_IP_FW);
 //                       verified by the SMU answering its mailbox.
@@ -30,8 +32,10 @@
 //    stage 7  kernel    a clang-built kernel launched from its code object.
 //
 //  Selected with rdna4-compute=<stage>, a boot-arg or a test boot's option
-//  (trial.hpp); absent = stage 3 (the firmware the display clocks need),
-//  0 = off, and the plugin behaves exactly as without this file. Each stage runs the ones before it. Stage 1 runs inline;
+//  (trial.hpp); absent = stage 3 (GFX/SMU firmware needed for display clocks);
+//  explicitly request stage 1 for the survey-only diagnostic. 0 = off, and the
+//  plugin behaves exactly as without this file.
+//  Each stage runs the ones before it. Stage 1 runs inline;
 //  stages 2+ run on their own kernel thread a few seconds later, so the
 //  desktop never waits on (or for) them.
 //
@@ -146,7 +150,7 @@ public:
 		StageKernel   = 7,
 	};
 
-	// rdna4-compute=<stage>, clamped to StageKernel. StageGfx when absent.
+	// rdna4-compute=<stage>, clamped to StageKernel. StageGfx when absent; StageSurvey is explicit (rdna4-compute=1).
 	static uint32_t requestedStage();
 	static bool requestedVm();
 	static bool requestedPowerManagement();
