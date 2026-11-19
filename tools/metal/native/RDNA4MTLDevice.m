@@ -35,6 +35,9 @@
  * Gate 9: on the screen. IOSurfaces (CAMetalLayer's drawables) and newBufferWithBytesNoCopy: memory are the app's own pages, mapped into
  * its GPU address space by the kext (rdna4_import_host); a command buffer presents its drawables once its work has run.
  *
+ * Gate 10: 3D. Depth32Float textures in VRAM (64KB_2D, cleared by a copy of the value), the depth test and write; textures (linear RGBA8 /
+ * BGRA8) and samplers in shaders, as T#s and S#s in the stages' tables; indexed and instanced draws.
+ *
  * Gate 5: ray queries. Acceleration structures of triangle geometry are the device's own format (a stackless BVH, built by the CPU
  * as a command buffer's step, below); a kernel's intersect is translated into tools/metal/m3/rtlib.c's traversal of it.
  * ponytail: primitive structures only (no instances), no refit, compaction, masks, cull modes or intersection functions.
@@ -218,12 +221,31 @@ static BOOL isColourFormat(MTLPixelFormat f)   // what a target may be so far: R
 
 static BOOL isBgra(MTLPixelFormat f) { return f == MTLPixelFormatBGRA8Unorm || f == MTLPixelFormatBGRA8Unorm_sRGB; }
 
+// A linear 2D image's T# (src/pvdraw.hpp linearImage, as ac_build_gfx12_texture_descriptor: one mip level, a custom pitch): the gfx12
+// format and DST_SEL of an RGBA8 / BGRA8 texture (src/pvgpu.cpp textureFormat), width, height, pitch in pixels.
+static void linearImage(uint32_t t[8], uint64_t gpu, MTLPixelFormat f, uint32_t w, uint32_t h, uint32_t pitchPx)
+{
+	const BOOL srgb = f == MTLPixelFormatRGBA8Unorm_sRGB || f == MTLPixelFormatBGRA8Unorm_sRGB;
+	const uint32_t format = srgb ? 66 : 42, sel = isBgra(f) ? 6 | 5 << 3 | 4 << 6 | 7 << 9 : 4 | 5 << 3 | 6 << 6 | 7 << 9;
+	t[0] = (uint32_t)(gpu >> 8);
+	t[1] = (uint32_t)((gpu >> 40) & 0xff) | format << 17 | ((w - 1) & 3) << 30;   // MAX_MIP 0, FORMAT, BASE_LEVEL 0, WIDTH_LO
+	t[2] = (w - 1) >> 2 | (h - 1) << 14;                                          // WIDTH_HI, HEIGHT
+	t[3] = sel | 9u << 28;                                                        // DST_SEL, LAST_LEVEL 0, SW_MODE linear, TYPE 2D
+	t[4] = ((pitchPx - 1) & 0x3fff) | ((pitchPx - 1) >> 14 & 3) << 14;             // DEPTH = pitch - 1 low, PITCH_MSB
+	t[5] = 4u << 20;                                                              // PERF_MOD 4
+	t[6] = 1u << 15;                                                              // MAX_UNCOMPRESSED_BLOCK_SIZE 256 B
+	t[7] = 0;
+}
+
 @interface RDNA4MTLTexture : NSObject <MTLTexture>
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)descriptor;
 // Over an IOSurface (CAMetalLayer's drawables): its memory mapped into the GPU, its rows as the surface has them.
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface
                          plane:(NSUInteger)plane;
 - (void)clearTo:(MTLClearColor)colour;
+- (NSError *)clearDepthTo:(double)depth;   // a Depth32Float texture: every pixel (the tiling does not matter for one value)
+- (void)descriptor:(uint32_t[8])t;          // its T# for shaders
+@property (readonly) BOOL isDepth;        // Depth32Float in VRAM, 64KB_2D (as the PV host's depth buffers), for the depth block only
 @property (readonly) uint64_t gpuBase;    // the first row's GPU address (page aligned)
 @property (readonly) NSUInteger rowBytes; // a multiple of 256
 @end
@@ -235,8 +257,50 @@ static BOOL isBgra(MTLPixelFormat f) { return f == MTLPixelFormatBGRA8Unorm || f
 	MTLPixelFormat _format;
 	MTLTextureUsage _usage;
 	IOSurfaceRef _surface;
+	rdna4_buffer_t _vram;   // a depth texture's
 }
 @synthesize label;
+
+- (instancetype)initDepthWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)d
+{
+	if (!(self = [super init]) || !device.gpu)
+		return nil;
+	// whole 256x256-pixel blocks, as the PV host's (src/pvgpu.cpp stencilFor): the depth block's 64KB_2D layout fits in them
+	const uint64_t bytes = (uint64_t)((d.width + 255) & ~(NSUInteger)255) * ((d.height + 255) & ~(NSUInteger)255) * 4;
+	const kern_return_t kr = rdna4_alloc(device.gpu, bytes, &_vram);
+	if (kr) {
+		rdna4Error([NSString stringWithFormat:@"a %lux%lu depth texture", (unsigned long)d.width, (unsigned long)d.height], kr);
+		return nil;
+	}
+	_isDepth = YES;
+	_device = device;
+	_width = d.width;
+	_height = d.height;
+	_format = d.pixelFormat;
+	_usage = d.usage;
+	return self;
+}
+
+- (NSError *)clearDepthTo:(double)depth
+{
+	static NSMutableData *pattern;   // ponytail: one buffer of the value, grown to the largest depth texture; a GPU fill when it shows
+	static float patternValue = -1;
+	const float value = (float)depth;
+	if (!pattern || pattern.length < _vram.bytes || patternValue != value) {
+		pattern = [NSMutableData dataWithLength:(NSUInteger)_vram.bytes];
+		float *p = pattern.mutableBytes;
+		for (NSUInteger i = 0; i < _vram.bytes / 4; i++)
+			p[i] = value;
+		patternValue = value;
+	}
+	const kern_return_t kr = rdna4_write(_device.gpu, &_vram, 0, pattern.bytes, _vram.bytes);
+	return kr ? rdna4Error(@"a depth clear", kr) : nil;
+}
+
+- (void)descriptor:(uint32_t[8])t
+{
+	linearImage(t, self.gpuBase, _format, (uint32_t)_width, (uint32_t)_height, (uint32_t)(_rowBytes / 4));
+}
 
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
 {
@@ -306,7 +370,13 @@ static BOOL isBgra(MTLPixelFormat f) { return f == MTLPixelFormatBGRA8Unorm || f
 - (MTLStorageMode)storageMode { return MTLStorageModeShared; }
 - (NSUInteger)allocatedSize { return _memory.allocatedSize; }
 - (BOOL)isFramebufferOnly { return NO; }
-- (uint64_t)gpuBase { return _memory.gpuAddress; }
+- (uint64_t)gpuBase { return _isDepth ? _vram.gpu : _memory.gpuAddress; }
+
+- (void)dealloc
+{
+	if (_vram.handle)
+		rdna4_free(_device.gpu, &_vram);
+}
 
 - (BOOL)fits:(MTLRegion)r level:(NSUInteger)level
 {
@@ -656,10 +726,17 @@ enum { kRgfxMagic = 0x58464752u, kHead = 8 };
 @end
 
 // One draw as recorded: everything the device needs to run it.
+enum { kStageTextures = 16 };   // a stage's table holds textures and samplers 0-15 (include/rdna4mtlc.h)
+
 typedef struct {
 	uint64_t table[2][kTableBuffers];   // per stage, its buffers' GPU addresses by index (0: unbound)
+	uint32_t textures[2][kStageTextures][8], samplers[2][kStageTextures][4];   // per stage, T#s and S#s (0: unbound)
 	uint32_t type, start, count, instances, baseInstance;
 	float viewport[4];                  // x, y, width, height in pixels
+	uint64_t indexGpu;                  // an indexed draw's indices (0: not indexed), 16- or 32-bit
+	uint32_t indexBytes;
+	uint64_t depthGpu;                  // the pass's Depth32Float attachment (0: none), its size, the state's test and write
+	uint32_t depthWidth, depthHeight, depthCompare, depthWrite;
 } RDNA4Draw;
 
 @interface RDNA4MTLDevice ()
@@ -695,6 +772,8 @@ typedef struct {
 		return rdna4Error(@"a render pipeline needs a vertex and a fragment function of this device so far", 0);
 	MTLRenderPipelineColorAttachmentDescriptor *a = desc.colorAttachments[0];
 	_format = a.pixelFormat;
+	if (desc.depthAttachmentPixelFormat != MTLPixelFormatInvalid && desc.depthAttachmentPixelFormat != MTLPixelFormatDepth32Float)
+		return rdna4Error(@"a depth attachment other than Depth32Float: not yet", 0);
 	if (!isColourFormat(_format) || a.blendingEnabled)
 		return rdna4Error([NSString stringWithFormat:@"colour attachment 0 of format %lu%s: only RGBA8 / BGRA8 without blending so far",
 		                                             (unsigned long)_format, a.blendingEnabled ? ", blended" : ""], 0);
@@ -766,6 +845,66 @@ typedef struct {
 - (uint64_t)code { return _codeBuffer.gpu; }
 - (id<MTLDevice>)device { return _device; }
 - (NSString *)label { return nil; }
+
+RDNA4_ANSWER_MISSING
+@end
+
+// ---- sampler and depth-stencil states
+
+@interface RDNA4MTLSamplerState : NSObject <MTLSamplerState>
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLSamplerDescriptor *)d;
+@property (readonly) const uint32_t *words;   // its S# (SQ_IMG_SAMP_WORD0-3)
+@end
+
+@implementation RDNA4MTLSamplerState {
+	RDNA4MTLDevice *_device;
+	uint32_t _s[4];
+}
+@synthesize label;
+
+// As the PV host's (src/pvgpu.cpp stageTextures): Metal's address modes as the hardware's CLAMP_*, the filters, unnormalised coordinates.
+// ponytail: no anisotropy, LOD unclamped, border transparent black.
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLSamplerDescriptor *)d
+{
+	if (!(self = [super init]))
+		return nil;
+	static const uint32_t clamp[8] = { 2, 3, 0, 1, 6, 6, 2, 2 };   // edge, mirror-clamp-to-edge, repeat, mirror, zero, border
+	_device = device;
+	_s[0] = clamp[d.sAddressMode & 7] | clamp[d.tAddressMode & 7] << 3 | clamp[d.rAddressMode & 7] << 6 | (d.normalizedCoordinates ? 0 : 1u << 15);
+	_s[1] = 0xfffu << 13;
+	_s[2] = (uint32_t)(d.magFilter & 3) << 20 | (uint32_t)(d.minFilter & 3) << 22 | (uint32_t)(d.mipFilter & 3) << 26;
+	_s[3] = 0;
+	return self;
+}
+
+- (const uint32_t *)words { return _s; }
+- (id<MTLDevice>)device { return _device; }
+
+RDNA4_ANSWER_MISSING
+@end
+
+@interface RDNA4MTLDepthStencilState : NSObject <MTLDepthStencilState>
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLDepthStencilDescriptor *)d;
+@property (readonly) uint32_t compare;   // Metal's compare function: the hardware's ZFUNC
+@property (readonly) BOOL write;
+@end
+
+@implementation RDNA4MTLDepthStencilState {
+	RDNA4MTLDevice *_device;
+}
+@synthesize label;
+
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLDepthStencilDescriptor *)d
+{
+	if ((self = [super init])) {
+		_device = device;
+		_compare = (uint32_t)d.depthCompareFunction & 7;
+		_write = d.depthWriteEnabled;
+	}
+	return self;
+}
+
+- (id<MTLDevice>)device { return _device; }
 
 RDNA4_ANSWER_MISSING
 @end
@@ -900,6 +1039,10 @@ RDNA4_ANSWER_MISSING
 	RDNA4MTLRenderPipeline *_pipeline;
 	uint64_t _addresses[2][kTableBuffers];
 	id<MTLBuffer> _bound[2][kTableBuffers];
+	id<MTLTexture> _textures[2][kStageTextures];
+	id<MTLSamplerState> _samplers[2][kStageTextures];
+	RDNA4MTLTexture *_depth;
+	RDNA4MTLDepthStencilState *_depthState;
 	MTLViewport _viewport;
 }
 @synthesize label;
@@ -923,7 +1066,37 @@ RDNA4_ANSWER_MISSING
 			return nil;
 		}];
 	}
+	MTLRenderPassDepthAttachmentDescriptor *z = pass.depthAttachment;
+	if ([(id)z.texture isKindOfClass:[RDNA4MTLTexture class]] && ((RDNA4MTLTexture *)z.texture).isDepth) {
+		_depth = (RDNA4MTLTexture *)z.texture;
+		RDNA4MTLTexture *t = _depth;
+		const double clear = z.clearDepth;
+		if (z.loadAction == MTLLoadActionClear)
+			[commandBuffer record:^NSError * { return [t clearDepthTo:clear]; }];
+	}
 	return self;
+}
+
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)state
+{
+	_depthState = [(id)state isKindOfClass:[RDNA4MTLDepthStencilState class]] ? (RDNA4MTLDepthStencilState *)state : nil;
+}
+
+- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kStageTextures) _textures[0][i] = t; }
+- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < kStageTextures) _textures[1][i] = t; }
+- (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < kStageTextures) _samplers[0][i] = s; }
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < kStageTextures) _samplers[1][i] = s; }
+
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)indexType
+                  indexBuffer:(id<MTLBuffer>)indexBuffer indexBufferOffset:(NSUInteger)offset instanceCount:(NSUInteger)instances
+{
+	[self record:type start:0 count:count instances:instances baseInstance:0 indices:indexBuffer offset:offset type:indexType];
+}
+
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)indexType
+                  indexBuffer:(id<MTLBuffer>)indexBuffer indexBufferOffset:(NSUInteger)offset
+{
+	[self record:type start:0 count:count instances:1 baseInstance:0 indices:indexBuffer offset:offset type:indexType];
 }
 
 - (id<MTLDevice>)device { return _commandBuffer.device; }
@@ -961,15 +1134,44 @@ RDNA4_ANSWER_MISSING
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instances
           baseInstance:(NSUInteger)baseInstance
 {
+	[self record:type start:start count:count instances:instances baseInstance:baseInstance indices:nil offset:0 type:MTLIndexTypeUInt16];
+}
+
+// One draw with everything bound now: buffers, textures and samplers (as T#s and S#s), the viewport, the depth attachment and state, indices.
+- (void)record:(MTLPrimitiveType)type start:(NSUInteger)start count:(NSUInteger)count instances:(NSUInteger)instances
+    baseInstance:(NSUInteger)baseInstance indices:(id<MTLBuffer>)indexBuffer offset:(NSUInteger)indexOffset type:(MTLIndexType)indexType
+{
 	RDNA4Draw d = { .type = (uint32_t)type, .start = (uint32_t)start, .count = (uint32_t)count, .instances = (uint32_t)instances,
 		            .baseInstance = (uint32_t)baseInstance,
 		            .viewport = { (float)_viewport.originX, (float)_viewport.originY, (float)_viewport.width, (float)_viewport.height } };
 	memcpy(d.table, _addresses, sizeof d.table);
-	NSMutableArray *held = [NSMutableArray array];   // the bound buffers, kept until the draw ran
-	for (int st = 0; st < 2; st++)
+	NSMutableArray *held = [NSMutableArray array];   // what the draw uses, kept until it ran
+	for (int st = 0; st < 2; st++) {
 		for (int i = 0; i < kTableBuffers; i++)
 			if (_bound[st][i])
 				[held addObject:_bound[st][i]];
+		for (int i = 0; i < kStageTextures; i++) {
+			if ([(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] && !((RDNA4MTLTexture *)_textures[st][i]).isDepth) {
+				[(RDNA4MTLTexture *)_textures[st][i] descriptor:d.textures[st][i]];
+				[held addObject:_textures[st][i]];
+			}
+			if ([(id)_samplers[st][i] isKindOfClass:[RDNA4MTLSamplerState class]])
+				memcpy(d.samplers[st][i], ((RDNA4MTLSamplerState *)_samplers[st][i]).words, 16);
+		}
+	}
+	if (indexBuffer) {
+		d.indexGpu = indexBuffer.gpuAddress + indexOffset;
+		d.indexBytes = indexType == MTLIndexTypeUInt32 ? 4 : 2;
+		[held addObject:indexBuffer];
+	}
+	if (_depth && _depthState) {
+		d.depthGpu = _depth.gpuBase;
+		d.depthWidth = (uint32_t)_depth.width;
+		d.depthHeight = (uint32_t)_depth.height;
+		d.depthCompare = _depthState.compare;
+		d.depthWrite = _depthState.write;
+		[held addObject:_depth];
+	}
 	RDNA4MTLRenderPipeline *pipeline = _pipeline;
 	RDNA4MTLTexture *target = _target;
 	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
@@ -1285,10 +1487,31 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 			const uint32_t at = 0x400 + 0x400 * st + (k < 8 ? 8 * k : RDNA4_MTLC_TABLE_MORE_BUFFERS + 8 * (k - 8));
 			misc[at / 8] = d->table[st][k] ?: _spare.gpu;
 		}
+	for (unsigned st = 0; st < 2; st++)   // the T#s at +64 + 32 n, the S#s at +576 + 16 n of the stage's table (include/rdna4mtlc.h)
+		for (unsigned k = 0; k < kStageTextures; k++) {
+			memcpy((uint8_t *)misc + 0x400 + 0x400 * st + RDNA4_MTLC_TABLE_TEXTURES + 32 * k, d->textures[st][k], 32);
+			memcpy((uint8_t *)misc + 0x400 + 0x400 * st + RDNA4_MTLC_TABLE_SAMPLERS + 16 * k, d->samplers[st][k], 16);
+		}
 	// The draw in place of the template's DRAW_INDEX_AUTO: blend colour, the fragment inputs, the stages' tables (USER_DATA_GS_0/1, _PS_0/1),
 	// the first vertex and base instance (USER_DATA_GS_2/3), NUM_INSTANCES, DRAW_INDEX_AUTO.
-	uint32_t seq[48], m = 0;
+	uint32_t seq[96], m = 0;
 #define PUT(x) (seq[m++] = (x))
+	if (d->depthGpu) {   // the depth test, as the PV host's (src/pvgpu.cpp runDraw): Z_32_FLOAT, SW_64KB_2D, Metal's 0..1 depth range
+		PUT(0xc0026900u), PUT(0x001), PUT(0), PUT(0);   // DB_DEPTH_VIEW, DB_DEPTH_VIEW1: slice 0, mip 0
+		PUT(0xc00b6900u), PUT(0x005);                   // DB_DEPTH_SIZE_XY, DB_Z_INFO, DB_STENCIL_INFO, Z read/write and stencil bases
+		PUT((d->depthWidth - 1) | (d->depthHeight - 1) << 16);
+		PUT(3 | 3u << 4);                              // Z_32_FLOAT, SW_64KB_2D, one sample
+		PUT(0);                                         // STENCIL_INVALID
+		for (int i = 0; i < 4; i++) {
+			const uint64_t base = i < 2 ? d->depthGpu : 0;
+			PUT((uint32_t)(base >> 8)), PUT((uint32_t)(base >> 40));
+		}
+		PUT(0xc0026900u), PUT(0x01c);                   // DB_DEPTH_CONTROL: Z_ENABLE, Z_WRITE_ENABLE, ZFUNC; DB_STENCIL_CONTROL
+		PUT(2u | (d->depthWrite ? 4u : 0u) | d->depthCompare << 4), PUT(0);
+		PUT(0xc0026900u), PUT(0x113), PUT(0x3f800000u), PUT(0);   // PA_CL_VPORT_ZSCALE 1, ZOFFSET 0: z = ndc z (Metal's 0..1)
+		PUT(0xc0026900u), PUT(0x115), PUT(0), PUT(0x3f800000u);   // PA_SC_VPORT_ZMIN_0, ZMAX_0
+		PUT(0xc0016900u), PUT(0x204), PUT(1u << 24 | 1u << 19);   // PA_CL_CLIP_CNTL: DX_LINEAR_ATTR_CLIP_ENA, DX_CLIP_SPACE_DEF
+	}
 	PUT(0xc0046900u), PUT(0x105), PUT(0), PUT(0), PUT(0), PUT(0);
 	if (ins) {
 		PUT(0xc0006900u | ins << 16), PUT(0x199);
@@ -1302,7 +1525,12 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 	}
 	PUT(0xc0027600u), PUT(0x8e), PUT(d->start), PUT(d->baseInstance);
 	PUT(0xc0002f00u), PUT(d->instances);
-	PUT(0xc0012d00u), PUT(d->count), PUT(2);
+	if (d->indexGpu) {   // VGT_INDEX_TYPE (SET_UCONFIG_REG_INDEX, as RADV), DRAW_INDEX_2 {max indices, address, count, initiator}
+		PUT(0xc0017a00u), PUT(0x243 | 2u << 28), PUT(d->indexBytes == 4 ? 1 : 0);
+		PUT(0xc0042700u), PUT(d->count), PUT((uint32_t)d->indexGpu), PUT((uint32_t)(d->indexGpu >> 32)), PUT(d->count), PUT(0);
+	} else {
+		PUT(0xc0012d00u), PUT(d->count), PUT(2);
+	}
 #undef PUT
 	uint32_t total = 0;
 	for (uint32_t i = 0; i + 3 <= n; i++)
@@ -1403,6 +1631,9 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {
+	if (descriptor.pixelFormat == MTLPixelFormatDepth32Float && descriptor.textureType == MTLTextureType2D && descriptor.sampleCount == 1 &&
+	    descriptor.width && descriptor.height && descriptor.width <= 16384 && descriptor.height <= 16384)
+		return [[RDNA4MTLTexture alloc] initDepthWithDevice:self descriptor:descriptor];
 	return [[RDNA4MTLTexture alloc] initWithDevice:self descriptor:descriptor];
 }
 
@@ -1451,6 +1682,16 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 	if (reflection)
 		*reflection = nil;
 	return [self newComputePipelineStateWithFunction:function error:error];
+}
+
+- (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)descriptor
+{
+	return [[RDNA4MTLSamplerState alloc] initWithDevice:self descriptor:descriptor];
+}
+
+- (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)descriptor
+{
+	return [[RDNA4MTLDepthStencilState alloc] initWithDevice:self descriptor:descriptor];
 }
 
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error

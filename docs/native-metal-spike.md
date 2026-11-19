@@ -221,6 +221,19 @@ runs it: 0 of 256 wrong, as a user that is not root.
 **Gate 9 PASSED on the rig, 2026-11-19**: 1207 frames in 20 s (60 a second), none failed, as the logged-in user; the frame grab shows
 the window with the triangle on the desktop, composited by WindowServer (still on the paravirtual GPU) beside everything else.
 
+## Gate 10: 3D
+
+- `Depth32Float` textures in VRAM, laid out 64KB_2D in whole 256x256-pixel blocks as the PV host's depth buffers; a clear load action
+  writes the value everywhere (one value does not see the tiling). The depth test and write (`newDepthStencilStateWithDescriptor:`,
+  Metal's compare functions are the hardware's ZFUNC) with the PV host's depth-block registers and Metal's 0..1 depth range.
+- Textures (linear RGBA8 / BGRA8) and samplers in vertex and fragment functions: their T#s and S#s in the stages' tables
+  (`RDNA4_MTLC_TABLE_TEXTURES`, `_SAMPLERS`), the T# as the PV host's `linearImage`, the S# as its sampler conversion.
+- Indexed draws (16- and 32-bit indices: `VGT_INDEX_TYPE`, `DRAW_INDEX_2`), with instances.
+
+**Gate 10 PASSED on the rig, 2026-11-19**: `mtlprobe nativespin` (the paravirtual GPU's `spin` on the native device): nine lit,
+textured cubes with a depth buffer, drawn with one indexed draw of nine instances, at 1920x1200 and 60 frames a second (1202 frames in
+20 s), as the logged-in user; the frame grab shows them right.
+
 Next gates: a real queue (command buffers submitted as IBs with fences, completion on a thread, VRAM and private storage, blits); then
 IOSurface textures and `CAMetalLayer` drawables (a Metal app on the native device shown on the screen while WindowServer stays on the
 paravirtual GPU); then the device for every app (no `RDNA4_NATIVE_MTL`) once it answers what ordinary apps ask.

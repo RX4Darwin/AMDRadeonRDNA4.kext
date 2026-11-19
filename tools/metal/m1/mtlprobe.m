@@ -10,6 +10,7 @@
 //                      last group has 4, and Metal reports 4 as its size); a kernel that is not in the kext's table: it runs only if
 //                      translated at run time
 //   mtlprobe nativewin [S]  a window whose CAMetalLayer draws on our own device for S seconds (10): the colour triangle each frame
+//   mtlprobe nativespin [S]  spin on our own device (3D: depth test, a texture and sampler, indexed instanced draws)
 //   mtlprobe nativesrc a kernel compiled from source (Metal's own compiler) on our own device, run and checked (as native)
 //   mtlprobe dualsrc   dual-source blending: every pixel of a quad whose colour and second source depend on its parity, checked
 //   mtlprobe devices   every Metal device MTLCopyAllDevices returns, its class and registry ID (docs/native-metal-spike.md)
@@ -2521,6 +2522,18 @@ int main(int argc, char **argv) {
 			    rb.error ? ", " : "", rb.error ? rb.error.localizedDescription.UTF8String : "");
 			const BOOL raysOk = nativeRays(d, lib);
 			return computeOk && renderOk && raysOk ? 0 : 1;
+		}
+		if (!strcmp(mode, "nativespin")) {   // the native-Metal spike's gate 10: spin (3D: depth, textures, instances) on our own device
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			if (!d) {
+				OUT("nativespin: FAIL: no RDNA4MTLDevice");
+				return 1;
+			}
+			spin(d, [d newCommandQueue], argc > 2 ? atof(argv[2]) : 10);
+			return 0;
 		}
 		if (!strcmp(mode, "nativewin")) {   // the native-Metal spike's gate 9: a CAMetalLayer on our own device, on the screen
 			id<MTLDevice> d = nil;

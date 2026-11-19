@@ -14,6 +14,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - On the screen: an app's window drawn by the native device through `CAMetalLayer`. The kext maps an app's own memory (its
   IOSurfaces, `newBufferWithBytesNoCopy:`) into its GPU address space (`rdna4_import_host`). Card (2026-11-19): `mtlprobe
   nativewin` draws a window at 60 frames a second, composited by WindowServer beside the rest of the desktop.
+- 3D on the native device: depth buffers and the depth test, textures and samplers in shaders, indexed and instanced draws.
+  Card (2026-11-19): `mtlprobe nativespin` shows nine lit, textured, depth-tested cubes in a window at 1920x1200 and 60 frames
+  a second.
 
 ## 0.3.3 (2026-11-19)
 
