@@ -876,6 +876,10 @@ private:
 	};
 	Pipe mPipe[pvstream::disp::kMaxPorts];
 	uint64_t mDrawStatSince { 0 }, mDrawStatNs { 0 }, mDrawStatMaxNs { 0 };   // noteDraw: the draws of the last 5 s
+	// GPU command submission pressure in the same reporting window. submitGfx runs on this host's
+	// serialized work-loop path, so these counters need no separate lock.
+	uint64_t mSubmitNs { 0 }, mSubmitMaxNs { 0 }, mSubmitCalls { 0 }, mSubmitSlow { 0 };
+	uint64_t mSubmitBusyRetries { 0 }, mSubmitNotReadyMs { 0 };
 	uint64_t mPhaseNs[6] {};            // of those: textures in, target in and submit, the card, target out and the rest; the pipeline and
 	                                     // its shaders, the target and the buffers
 	uint64_t mMapNs { 0 };              // mapPages' share
@@ -2324,16 +2328,16 @@ IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 		r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
 	}
 
-	// This runs from the host's work-loop path. Keep a small, bounded sample of slow submits so
-	// real hardware can show whether ring pressure is delaying display/FIFO events. Do not log
-	// every submit: logging itself would perturb the timing being measured.
+	// Aggregate rather than logging each submit: this path shares the display work loop, and
+	// per-submit logging would add noise to the very latency being measured.
 	const uint64_t elapsed = nowNs() - submitAt;
-	if (elapsed >= 2000000) {
-		static uint32_t slowSubmitLogs = 0;
-		if (__atomic_fetch_add(&slowSubmitLogs, 1u, __ATOMIC_RELAXED) < 32)
-			pvstat("host: render: slow GPU submit: %llu us, result 0x%x, busy retries %u, not-ready wait %u ms",
-			       static_cast<unsigned long long>(elapsed / 1000), r, busyRetries, notReadyWaited);
-	}
+	mSubmitCalls++;
+	mSubmitNs += elapsed;
+	mSubmitMaxNs = elapsed > mSubmitMaxNs ? elapsed : mSubmitMaxNs;
+	mSubmitBusyRetries += busyRetries;
+	mSubmitNotReadyMs += notReadyWaited;
+	if (elapsed >= 2000000)
+		mSubmitSlow++;
 
 	return r;
 }
@@ -9016,6 +9020,9 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	      "out %llu, pipeline %llu, target and buffers %llu ms; %u waits, %u shader pairs in, %u translations", mDrawStatCount, mPresents,
 	      (now - mDrawStatSince) / 1000000, mDrawStatNs / 1000000, mDrawStatMaxNs / 1000000, mPhaseNs[0] / 1000000, mPhaseNs[1] / 1000000,
 	      mPhaseNs[2] / 1000000, mPhaseNs[3] / 1000000, mPhaseNs[4] / 1000000, mPhaseNs[5] / 1000000, mWaits, mCodeIns, mTranslations);
+	if (mSubmitCalls)
+		pvstat("host: render:   GPU submits %llu, slow (>=2 ms) %llu, average %llu us, max %llu us, busy retries %llu, not-ready wait %llu ms",
+		       mSubmitCalls, mSubmitSlow, mSubmitNs / mSubmitCalls / 1000, mSubmitMaxNs / 1000, mSubmitBusyRetries, mSubmitNotReadyMs);
 	pvstat("host: render:   %u textures in place, %u copied, mapping %llu ms (%u new, %llu pages), rows %llu ms (%llu KiB, %u copies reused); "
 	      "shadows: %u made, %u freed, %llu MiB; stale %u dropped, %u old, %u locked, %u rewritten", mInPlace, mCopied, mMapNs / 1000000, mMapMisses, mMapPages, mCopyNs / 1000000, mCopiedBytes >> 10,
 	      mCopiesReused, mShadowsMade, mShadowsFreed, mShadowBytes >> 20, mStale[0], mStale[1], mStale[2], mStale[3]);
@@ -9156,6 +9163,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mDrawStatCount = 0;
 	mDrawStatNs = 0;
 	mDrawStatMaxNs = 0;
+	mSubmitNs = mSubmitMaxNs = mSubmitCalls = mSubmitSlow = 0;
+	mSubmitBusyRetries = mSubmitNotReadyMs = 0;
 }
 
 void RDNA4PvHost::pollDisplay() {
