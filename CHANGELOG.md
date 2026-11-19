@@ -3,6 +3,11 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
+## Unreleased (2026-11-19)
+
+**Desktop pacing (experimental; not yet card-verified)**
+- Paravirtual display vblank scheduling now learns each physical head's refresh period from successive hardware vblanks instead of permanently converting scan-line position with a 60 Hz assumption. The first interval still uses 60 Hz as a safe bootstrap; plausible measurements from 4–50 ms are smoothed to reject scheduler jitter and stalls. This should improve frame scheduling on monitors running above or below 60 Hz without changing the reported display modes. Needs a Tahoe 26.7.3 card test with frame-pacing measurements.
+
 ## 0.3.1 (2026-11-18)
 
 **Cards**
