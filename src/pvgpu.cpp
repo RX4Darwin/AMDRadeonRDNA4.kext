@@ -893,7 +893,7 @@ private:
 	// Time spent inside the 250 us host timer callback, which also services display events.
 	uint64_t mTickNs { 0 }, mTickMaxNs { 0 }, mTickCalls { 0 }, mTickOver250us { 0 }, mTickOver1ms { 0 };
 	uint64_t mTickPhaseNs[6] {}, mTickPhaseMaxNs[6] {};   // IRQ/late, guest FIFO, pipelines, channels+submit, display, finish
-	uint64_t mTickSubphaseNs[5] {}, mTickSubphaseMaxNs[5] {};   // register poll, root map, FIFO poll, channels, batch flush
+	uint64_t mTickSubphaseNs[7] {}, mTickSubphaseMaxNs[7] {};   // register poll, root map, FIFO poll, channels, batch flush, flip completion, display polling
 	uint64_t mTickLastAt { 0 }, mTickGapNs { 0 }, mTickGapMaxNs { 0 }, mTickGapCalls { 0 };
 	uint64_t mTickGapOver500us { 0 }, mTickGapOver1ms { 0 }, mTickGapOver2ms { 0 };
 	// Deadline-based lateness excludes the callback's own runtime: it measures how late the scheduler starts the next work-loop action.
@@ -1637,8 +1637,12 @@ void RDNA4PvHost::tick() {
 	mTickPhaseMaxNs[3] = phaseNs > mTickPhaseMaxNs[3] ? phaseNs : mTickPhaseMaxNs[3];
 
 	phaseAt = nowNs();
+	subphaseAt = phaseAt;
 	flipDone();
+	recordSubphase(5, subphaseAt);
+	subphaseAt = nowNs();
 	pollDisplay();
+	recordSubphase(6, subphaseAt);
 	phaseNs = nowNs() - phaseAt;
 	mTickPhaseNs[4] += phaseNs;
 	mTickPhaseMaxNs[4] = phaseNs > mTickPhaseMaxNs[4] ? phaseNs : mTickPhaseMaxNs[4];
@@ -9204,6 +9208,9 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		pvstat("host: render:   tick detail avg/max us: channels %llu/%llu, batch flush %llu/%llu",
 		       mTickSubphaseNs[3] / mTickCalls / 1000, mTickSubphaseMaxNs[3] / 1000,
 		       mTickSubphaseNs[4] / mTickCalls / 1000, mTickSubphaseMaxNs[4] / 1000);
+		pvstat("host: render:   tick detail avg/max us: flip completion %llu/%llu, display polling %llu/%llu",
+		       mTickSubphaseNs[5] / mTickCalls / 1000, mTickSubphaseMaxNs[5] / 1000,
+		       mTickSubphaseNs[6] / mTickCalls / 1000, mTickSubphaseMaxNs[6] / 1000);
 	}
 	if (mTickGapCalls)
 		pvstat("host: render:   tick start gaps %llu, average %llu us, max %llu us, >=500 us %llu, >=1 ms %llu, >=2 ms %llu",
