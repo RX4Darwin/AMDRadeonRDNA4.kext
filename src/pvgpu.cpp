@@ -1538,6 +1538,7 @@ void RDNA4PvHost::tick() {
 	// the line disabled from the interrupt until its work loop has read the status. Dropped a tick after the raise, a raise that came while the
 	// line was disabled reached the driver with no bits left, and it only saw its stamps and VBLs after IOAccelEventMachine2::waitForStamp's 1 s
 	// timed wait (most raises of a session: animations stood still, frames came late).
+	uint64_t phaseAt = nowNs();
 	dropIrqBits();
 	const uint32_t cmds = mCmds;
 	// a tick that came 100 ms or more late: logged (the pointer stood at times, 2026-11-20)
@@ -1545,7 +1546,6 @@ void RDNA4PvHost::tick() {
 		pvstat("host: tick %llu ms after the one before (%u commands since)", (tickAt - mTickAt) / 1000000, cmds - mCmdsAtTick);
 	mTickAt = tickAt;
 	mCmdsAtTick = cmds;
-	uint64_t phaseAt = nowNs();
 
 	// The runtime opened here, on the tick's own shallow stack, once the guest is talking (then once a second until it opens): opened first from
 	// runDraw, 10 KB down the command walk, IOLog's os_log path ran the timer thread's 16 KB kernel stack out (double fault panic, 2026-11-20).
