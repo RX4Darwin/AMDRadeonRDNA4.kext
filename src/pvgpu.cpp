@@ -1059,6 +1059,7 @@ private:
 	// phase against the heads' vblanks (and drifted: 60.000 Hz against 59.997 and 60.001), and frames copied close to a vblank were shown
 	// one or two vblanks later in turn.
 	uint64_t mPortVblNs[8] {};
+	uint64_t mPortPeriodNs[8] {};        // measured per-head scanout period; starts at 60 Hz until two real vblanks are observed
 	uint64_t mVblSoonest { 0 };          // the earliest VBL event due, shared or a port's
 	bool vblDue(uint32_t port, uint64_t now, bool tick);
 	uint64_t mLastDispIrqNs { 0 };
@@ -8929,12 +8930,16 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 	if (!sm || !sm->flips || sm->otg >= 8 || !gCompute->rtScanoutScan(sm->otg, line, lines, blankStart) || !lines) {
 		*due = 0;
 	} else {
-		const uint64_t toBlank = static_cast<uint64_t>((blankStart + lines - line) % lines) * kVblPeriodNs / lines;
+		// The paravirtual display's first estimate is 60 Hz, but the real head may be 75/120/144 Hz.
+		// Once two hardware vblanks have been observed, use that head's measured period when converting
+		// scan lines to time. A fixed 16.67 ms estimate makes high-refresh heads' wakeups drift badly.
+		const uint64_t period = mPortPeriodNs[port] ? mPortPeriodNs[port] : kVblPeriodNs;
+		const uint64_t toBlank = static_cast<uint64_t>((blankStart + lines - line) % lines) * period / lines;
 
 		uint64_t requested = 0, inUse = 0;
 
 		// an early wake-up (the tick runs every 250 us to 1 ms): the vblank is still to come
-		fire = *due && toBlank > kVblPeriodNs / 8;
+		fire = *due && toBlank > period / 8;
 		*due = now + toBlank;
 
 		if (fire && gCompute->rtScanoutShown(sm->hubp, requested, inUse) && inUse != mPortTiming[port].inUse) {
@@ -8943,8 +8948,16 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 		}
 	}
 
-	if (fire)
-		mPortTiming[port].vblAt = now;
+	if (fire) {
+		PortTiming &timing = mPortTiming[port];
+		if (timing.vblAt) {
+			const uint64_t measured = now - timing.vblAt;
+			// Reject scheduler stalls and implausible readings; smooth normal jitter rather than chasing it.
+			if (measured >= 4000000ull && measured <= 50000000ull)
+				mPortPeriodNs[port] = mPortPeriodNs[port] ? (3 * mPortPeriodNs[port] + measured) / 4 : measured;
+		}
+		timing.vblAt = now;
+	}
 
 	return fire;
 }
