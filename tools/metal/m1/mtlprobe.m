@@ -2301,6 +2301,83 @@ static float nativeRandom(uint32_t *seed)   // a fixed sequence (LCG), the same 
 // The native-Metal spike's gate 5: `kRays` rays from a grid at z = 0, tilted, against `kTris` random triangles at z 2-6 (a fixed seed), in
 // an acceleration structure; each ray's hit (distance, barycentrics, primitive id) against the nearest one by the CPU (Moller-Trumbore,
 // no structure). A distance within 1e-4 counts as the same hit (the primitive may then differ: two triangles at that distance).
+// Gate 8: the queue. Command buffers committed without waiting complete in order; blits; many draws in one command buffer, timed.
+static BOOL nativeQueue(id<MTLDevice> d, id<MTLComputePipelineState> scale, id<MTLRenderPipelineState> rps, MTLRenderPassDescriptor *pass,
+                        id<MTLTexture> tex)
+{
+	enum { n = 4096, buffers = 4, draws = 1000 };
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	id<MTLBuffer> a = [d newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> b = [d newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+	float *pa = a.contents, *pb = b.contents;
+	for (int i = 0; i < n; i++)
+		pa[i] = i, pb[i] = -1;
+	static int order[buffers];
+	__block int done = 0;
+	const float two = 2;
+	const double t0 = CACurrentMediaTime();
+	id<MTLCommandBuffer> last = nil;
+	for (int k = 0; k < buffers; k++) {   // b = a, then b *= 2 four times, the first copy and the last fill by blits
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		if (!k) {
+			id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+			[bl copyFromBuffer:a sourceOffset:0 toBuffer:b destinationOffset:0 size:n * 4];
+			[bl endEncoding];
+		}
+		id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+		[e setComputePipelineState:scale];
+		[e setBuffer:b offset:0 atIndex:0];
+		[e setBytes:&two length:4 atIndex:1];
+		[e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+		[e endEncoding];
+		if (k == buffers - 1) {
+			id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+			[bl fillBuffer:b range:NSMakeRange(0, 4) value:0];
+			[bl endEncoding];
+		}
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> c) { order[__atomic_fetch_add(&done, 1, __ATOMIC_SEQ_CST)] = k; }];
+		[cb commit];
+		last = cb;
+	}
+	const double committed = CACurrentMediaTime() - t0;
+	[last waitUntilCompleted];
+	int bad = pb[0] != 0, inOrder = done == buffers;
+	for (int i = 1; i < n; i++)
+		bad += pb[i] != 16.0f * i;
+	for (int k = 0; k < done; k++)
+		inOrder &= order[k] == k;
+	const BOOL asyncOk = !bad && inOrder && last.status == MTLCommandBufferStatusCompleted;
+	OUT("native: queue %s: %d buffers completed %s, %d of %d wrong, commits took %.2f ms, all done in %.2f ms", asyncOk ? "PASS" : "FAIL", done,
+	    inOrder ? "in order" : "OUT OF ORDER", bad, n, 1e3 * committed, 1e3 * (CACurrentMediaTime() - t0));
+
+	// many draws: the triangle 1000 times, then the texture read back through a blit into a buffer
+	const float pos[6] = { -0.5f, 0.5f, 0.5f, 0.5f, 0, -0.5f };
+	const float col[12] = { 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1 };
+	id<MTLBuffer> back = [d newBufferWithLength:256 * 1024 options:MTLResourceStorageModeShared];
+	id<MTLCommandBuffer> rb = [q commandBuffer];
+	id<MTLRenderCommandEncoder> re = [rb renderCommandEncoderWithDescriptor:pass];
+	[re setRenderPipelineState:rps];
+	[re setVertexBytes:pos length:sizeof pos atIndex:0];
+	[re setVertexBytes:col length:sizeof col atIndex:1];
+	for (int i = 0; i < draws; i++)
+		[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[re endEncoding];
+	id<MTLBlitCommandEncoder> bl = [rb blitCommandEncoder];
+	[bl copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(256, 256, 1) toBuffer:back
+	    destinationOffset:0 destinationBytesPerRow:1024 destinationBytesPerImage:256 * 1024];
+	[bl endEncoding];
+	const double t1 = CACurrentMediaTime();
+	[rb commit];
+	[rb waitUntilCompleted];
+	const double took = CACurrentMediaTime() - t1;
+	rdna4_tricol_result tr;
+	const BOOL drawsOk = rdna4_tricol_check(back.contents, &tr) && rb.status == MTLCommandBufferStatusCompleted;
+	OUT("native: draws %s: %d draws in %.1f ms (%.1f us each), %u px (want 8192), max channel error %.2f (status %ld%s%s)", drawsOk ? "PASS" : "FAIL",
+	    draws, 1e3 * took, 1e6 * took / draws, tr.covered, tr.maxChannelErr256 / 256.0, (long)rb.status, rb.error ? ", " : "",
+	    rb.error ? rb.error.localizedDescription.UTF8String : "");
+	return asyncOk && drawsOk;
+}
+
 static BOOL nativeRays(id<MTLDevice> d, id<MTLLibrary> lib)
 {
 	enum { kTris = 300, kRays = 1024 };
@@ -2521,7 +2598,8 @@ int main(int argc, char **argv) {
 			    tr.minY, tr.maxY, tr.maxChannelErr256 / 256.0, tr.maxSumErr, tr.centroid, tr.near0, tr.near1, tr.near2, img[0], (long)rb.status,
 			    rb.error ? ", " : "", rb.error ? rb.error.localizedDescription.UTF8String : "");
 			const BOOL raysOk = nativeRays(d, lib);
-			return computeOk && renderOk && raysOk ? 0 : 1;
+			const BOOL queueOk = nativeQueue(d, scale, rps, pass, tex);
+			return computeOk && renderOk && raysOk && queueOk ? 0 : 1;
 		}
 		if (!strcmp(mode, "nativespin")) {   // the native-Metal spike's gate 10: spin (3D: depth, textures, instances) on our own device
 			id<MTLDevice> d = nil;

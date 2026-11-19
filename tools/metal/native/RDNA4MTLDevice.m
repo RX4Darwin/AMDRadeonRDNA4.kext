@@ -20,14 +20,19 @@
  *   - libraries: a metallib (file, URL or data), kept as it is; functions are names in it;
  *   - compute pipelines: the function translated from AIR by the translator in file mode (/usr/local/libexec/rdna4-air2amdgpu, or
  *     $RDNA4_AIR2AMDGPU) into a code object, loaded with rdna4_load; kernargs are the translator's ABI (tools/metal/m3/air2amdgpu.cpp);
- *   - command buffers run their dispatches on commit, one rdna4_dispatch each, in order, on the committing thread.
+ *   - command buffers run their dispatches in order, one rdna4_dispatch each (gate 8: on the device's work queue).
  * Gate 3: a render pass. Textures are linear 2D RGBA8 / BGRA8 in shared memory; a render pipeline's vertex and fragment functions are
  * translated into RGFX blobs (air2amdgpu.cpp translateShader); each draw is the PV host's (src/pvgpu.cpp runDraw), cut down: the proven
  * triangle stream (userspace/rdna4-run/gfx12tri.h, gfx12tricol.h with values between the stages) with the shaders' registers, target,
  * viewport and draw patched in, the stages' buffer tables in a state page, submitted as the client's own gfx IB (rdna4_submit_gfx_ib, a
  * boot with rdna4-gfx=2). A clear load action is done by the CPU (shared memory).
- * ponytail: synchronous commit, one draw at a time, no blending, depth, textures in shaders, MSAA or indexed draws; one host allocation
- * per set*Bytes. A real queue (IBs batched, fences, completion on a thread) when a gate needs overlap.
+ * ponytail: one host allocation per set*Bytes.
+ *
+ * Gate 8: a queue. commit returns at once; one serial work queue per device runs the committed command buffers in commit order, calls
+ * their scheduled and completed handlers and presents their drawables. Draws go out behind each other without waiting, each with its own
+ * IB page and state page out of kSlots; anything else (a dispatch, a CPU clear, blit or build) first waits for the draws before it
+ * (drainGfx), and so does the end of a command buffer. Blits are the CPU's (shared memory).
+ * ponytail: one IB per draw (two rdna4_write calls and a submit each, ~64 us); one IB for a command buffer's draws when that matters.
  *
  * Gate 7: libraries from source. Metal's own compiler makes them for this device (_MTLDevice's newLibraryWithSource: and the rest, not
  * overridden): their functions (_MTLFunctionInternal) give their AIR as -bitcodeData, which the translator takes as it takes a metallib.
@@ -248,6 +253,7 @@ static void linearImage(uint32_t t[8], uint64_t gpu, MTLPixelFormat f, uint32_t 
 @property (readonly) BOOL isDepth;        // Depth32Float in VRAM, 64KB_2D (as the PV host's depth buffers), for the depth block only
 @property (readonly) uint64_t gpuBase;    // the first row's GPU address (page aligned)
 @property (readonly) NSUInteger rowBytes; // a multiple of 256
+@property (readonly) RDNA4MTLBuffer *memory;   // a colour texture's pixels
 @end
 
 @implementation RDNA4MTLTexture {
@@ -743,6 +749,8 @@ typedef struct {
 - (BOOL)gfx;   // the client may submit gfx IBs and the device's gfx buffers exist
 - (uint64_t)gfxRings;
 - (NSError *)draw:(const RDNA4Draw *)draw pipeline:(RDNA4MTLRenderPipeline *)pipeline target:(RDNA4MTLTexture *)target;
+- (NSError *)drainGfx;
+- (dispatch_queue_t)work;
 @end
 
 @implementation RDNA4MTLRenderPipeline {
@@ -911,14 +919,15 @@ RDNA4_ANSWER_MISSING
 
 // ---- command queues, buffers and encoders
 
-typedef NSError * (^RDNA4Op)(void);   // a recorded step: commit runs them in order and stops at the first error
+typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs them in order and stops at the first error
 
 @interface RDNA4MTLCommandQueue : NSObject <MTLCommandQueue>
 @end
 
 @interface RDNA4MTLCommandBuffer : NSObject <MTLCommandBuffer>
 - (instancetype)initWithQueue:(RDNA4MTLCommandQueue *)queue;
-- (void)record:(RDNA4Op)op;
+- (void)record:(RDNA4Op)op;       // runs once the draws before it have finished
+- (void)recordDraw:(RDNA4Op)op;   // a draw: submitted behind the draws before it, not waited for
 @end
 
 @interface RDNA4MTLComputeEncoder : NSObject <MTLComputeCommandEncoder>
@@ -1175,7 +1184,7 @@ RDNA4_ANSWER_MISSING
 	RDNA4MTLRenderPipeline *pipeline = _pipeline;
 	RDNA4MTLTexture *target = _target;
 	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
-	[_commandBuffer record:^NSError * {
+	[_commandBuffer recordDraw:^NSError * {
 		(void)held;
 		if (!pipeline || !target)
 			return rdna4Error(@"a draw without a render pipeline or a colour attachment of this device", 0);
@@ -1232,12 +1241,138 @@ RDNA4_ANSWER_MISSING
 RDNA4_ANSWER_MISSING
 @end
 
+@interface RDNA4MTLBlitEncoder : NSObject <MTLBlitCommandEncoder>
+- (instancetype)initWithCommandBuffer:(RDNA4MTLCommandBuffer *)commandBuffer;
+@end
+
+// Blits by the CPU, in order with the rest: every buffer and colour texture of this device is shared memory. Depth textures (VRAM) are not
+// blitted. ponytail: CPU copies; a DMA or compute copy when they show up in a profile.
+@implementation RDNA4MTLBlitEncoder {
+	RDNA4MTLCommandBuffer *_commandBuffer;
+}
+@synthesize label;
+
+- (instancetype)initWithCommandBuffer:(RDNA4MTLCommandBuffer *)commandBuffer
+{
+	if ((self = [super init]))
+		_commandBuffer = commandBuffer;
+	return self;
+}
+
+- (id<MTLDevice>)device { return _commandBuffer.device; }
+
+static NSError *colourOnly(id<MTLTexture> t)
+{
+	return [(id)t isKindOfClass:[RDNA4MTLTexture class]] && !((RDNA4MTLTexture *)t).isDepth ? nil
+	                                                                                         : rdna4Error(@"a blit of a texture that is not a colour texture of this device", 0);
+}
+
+- (void)copyFromBuffer:(id<MTLBuffer>)from sourceOffset:(NSUInteger)fromOffset toBuffer:(id<MTLBuffer>)to
+     destinationOffset:(NSUInteger)toOffset size:(NSUInteger)size
+{
+	[_commandBuffer record:^NSError * {
+		if (fromOffset + size > from.length || toOffset + size > to.length)
+			return rdna4Error(@"a buffer copy past a buffer's end", 0);
+		memmove((uint8_t *)to.contents + toOffset, (const uint8_t *)from.contents + fromOffset, size);
+		return nil;
+	}];
+}
+
+- (void)fillBuffer:(id<MTLBuffer>)buffer range:(NSRange)range value:(uint8_t)value
+{
+	[_commandBuffer record:^NSError * {
+		if (NSMaxRange(range) > buffer.length)
+			return rdna4Error(@"a buffer fill past its end", 0);
+		memset((uint8_t *)buffer.contents + range.location, value, range.length);
+		return nil;
+	}];
+}
+
+- (void)copyFromBuffer:(id<MTLBuffer>)from sourceOffset:(NSUInteger)offset sourceBytesPerRow:(NSUInteger)bpr
+   sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)to destinationSlice:(NSUInteger)slice
+      destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin
+{
+	[_commandBuffer record:^NSError * {
+		NSError *why = colourOnly(to);
+		if (!why && offset + bpr * (size.height - 1) + 4 * size.width > from.length)
+			why = rdna4Error(@"a buffer-to-texture copy past the buffer's end", 0);
+		if (!why)
+			[to replaceRegion:MTLRegionMake2D(origin.x, origin.y, size.width, size.height) mipmapLevel:level
+			        withBytes:(const uint8_t *)from.contents + offset bytesPerRow:bpr];
+		return why;
+	}];
+}
+
+- (void)copyFromBuffer:(id<MTLBuffer>)from sourceOffset:(NSUInteger)offset sourceBytesPerRow:(NSUInteger)bpr
+   sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)to destinationSlice:(NSUInteger)slice
+      destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin options:(MTLBlitOption)options
+{
+	[self copyFromBuffer:from sourceOffset:offset sourceBytesPerRow:bpr sourceBytesPerImage:bpi sourceSize:size toTexture:to
+	    destinationSlice:slice destinationLevel:level destinationOrigin:origin];
+}
+
+- (void)copyFromTexture:(id<MTLTexture>)from sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)origin
+             sourceSize:(MTLSize)size toBuffer:(id<MTLBuffer>)to destinationOffset:(NSUInteger)offset
+ destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi
+{
+	[_commandBuffer record:^NSError * {
+		NSError *why = colourOnly(from);
+		if (!why && offset + bpr * (size.height - 1) + 4 * size.width > to.length)
+			why = rdna4Error(@"a texture-to-buffer copy past the buffer's end", 0);
+		if (!why)
+			[from getBytes:(uint8_t *)to.contents + offset bytesPerRow:bpr
+			    fromRegion:MTLRegionMake2D(origin.x, origin.y, size.width, size.height) mipmapLevel:level];
+		return why;
+	}];
+}
+
+- (void)copyFromTexture:(id<MTLTexture>)from sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)origin
+             sourceSize:(MTLSize)size toBuffer:(id<MTLBuffer>)to destinationOffset:(NSUInteger)offset
+ destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi options:(MTLBlitOption)options
+{
+	[self copyFromTexture:from sourceSlice:slice sourceLevel:level sourceOrigin:origin sourceSize:size toBuffer:to destinationOffset:offset
+	    destinationBytesPerRow:bpr destinationBytesPerImage:bpi];
+}
+
+- (void)copyFromTexture:(id<MTLTexture>)from sourceSlice:(NSUInteger)fromSlice sourceLevel:(NSUInteger)fromLevel
+           sourceOrigin:(MTLOrigin)fromOrigin sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)to
+       destinationSlice:(NSUInteger)toSlice destinationLevel:(NSUInteger)toLevel destinationOrigin:(MTLOrigin)toOrigin
+{
+	[_commandBuffer record:^NSError * {
+		NSError *why = colourOnly(from) ?: colourOnly(to);
+		if (why)
+			return why;
+		RDNA4MTLTexture *f = (RDNA4MTLTexture *)from;
+		[to replaceRegion:MTLRegionMake2D(toOrigin.x, toOrigin.y, size.width, size.height) mipmapLevel:toLevel
+		        withBytes:(const uint8_t *)f.memory.contents + fromOrigin.y * f.rowBytes + 4 * fromOrigin.x bytesPerRow:f.rowBytes];
+		return nil;
+	}];
+}
+
+- (void)copyFromTexture:(id<MTLTexture>)from toTexture:(id<MTLTexture>)to
+{
+	[self copyFromTexture:from sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+	           sourceSize:MTLSizeMake(MIN(from.width, to.width), MIN(from.height, to.height), 1) toTexture:to destinationSlice:0
+	     destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+}
+
+- (void)synchronizeResource:(id<MTLResource>)resource { }   // shared memory: nothing to do
+- (void)synchronizeTexture:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level { }
+- (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture { }
+- (void)optimizeContentsForCPUAccess:(id<MTLTexture>)texture { }
+- (void)endEncoding { }
+
+RDNA4_ANSWER_MISSING
+@end
+
 @implementation RDNA4MTLCommandBuffer {
 	RDNA4MTLCommandQueue *_queue;
 	NSMutableArray<RDNA4Op> *_ops;
+	NSMutableIndexSet *_draws;   // which of _ops are draws
 	NSMutableArray<MTLCommandBufferHandler> *_completed, *_scheduled;
-	NSMutableArray<id<MTLDrawable>> *_drawables;   // presented once the commit has run
-	MTLCommandBufferStatus _status;
+	NSMutableArray<id<MTLDrawable>> *_drawables;   // presented once the work has run
+	dispatch_group_t _scheduledGroup, _done;
+	_Atomic MTLCommandBufferStatus _status;
 	NSError *_error;
 }
 @synthesize label;
@@ -1247,9 +1382,12 @@ RDNA4_ANSWER_MISSING
 	if ((self = [super init])) {
 		_queue = queue;
 		_ops = [NSMutableArray array];
+		_draws = [NSMutableIndexSet indexSet];
 		_completed = [NSMutableArray array];
 		_scheduled = [NSMutableArray array];
 		_drawables = [NSMutableArray array];
+		_scheduledGroup = dispatch_group_create();
+		_done = dispatch_group_create();
 	}
 	return self;
 }
@@ -1257,16 +1395,26 @@ RDNA4_ANSWER_MISSING
 - (id<MTLDevice>)device { return _queue.device; }
 - (void)presentDrawable:(id<MTLDrawable>)drawable { [_drawables addObject:drawable]; }
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time { [_drawables addObject:drawable]; }
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration { [_drawables addObject:drawable]; }
 - (id<MTLCommandQueue>)commandQueue { return _queue; }
 - (MTLCommandBufferStatus)status { return _status; }
 - (NSError *)error { return _error; }
 - (BOOL)retainedReferences { return YES; }
 - (void)record:(RDNA4Op)op { [_ops addObject:op]; }
+- (void)recordDraw:(RDNA4Op)op
+{
+	[_draws addIndex:_ops.count];
+	[_ops addObject:op];
+}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block { [_completed addObject:block]; }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block { [_scheduled addObject:block]; }
-- (void)enqueue { _status = MAX(_status, MTLCommandBufferStatusEnqueued); }
-- (void)waitUntilScheduled { }
-- (void)waitUntilCompleted { }   // commit has run everything
+- (void)enqueue { if (_status < MTLCommandBufferStatusEnqueued) _status = MTLCommandBufferStatusEnqueued; }
+- (void)waitUntilScheduled { if (_status >= MTLCommandBufferStatusCommitted) dispatch_group_wait(_scheduledGroup, DISPATCH_TIME_FOREVER); }
+- (void)waitUntilCompleted { if (_status >= MTLCommandBufferStatusCommitted) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
+- (CFTimeInterval)GPUStartTime { return 0; }
+- (CFTimeInterval)GPUEndTime { return 0; }
+- (CFTimeInterval)kernelStartTime { return 0; }
+- (CFTimeInterval)kernelEndTime { return 0; }
 
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder
 {
@@ -1288,21 +1436,45 @@ RDNA4_ANSWER_MISSING
 	return [[RDNA4MTLAccelerationStructureEncoder alloc] initWithCommandBuffer:self];
 }
 
+- (id<MTLBlitCommandEncoder>)blitCommandEncoder
+{
+	return [[RDNA4MTLBlitEncoder alloc] initWithCommandBuffer:self];
+}
+
+// The work queue runs the steps in order: a draw is submitted behind the draws before it; anything else (a dispatch, a CPU clear, copy or
+// build) first waits for them. The command buffer completes once its last draw has, then presents its drawables.
 - (void)commit
 {
-	_status = MTLCommandBufferStatusScheduled;
-	for (MTLCommandBufferHandler h in _scheduled)
-		h(self);
-	for (RDNA4Op op in _ops)
-		if ((_error = op()))
-			break;
-	[_ops removeAllObjects];
-	for (id<MTLDrawable> d in _drawables)   // the GPU's work for them is done (synchronous commit)
-		[d present];
-	[_drawables removeAllObjects];
-	_status = _error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
-	for (MTLCommandBufferHandler h in _completed)
-		h(self);
+	if (_status >= MTLCommandBufferStatusCommitted)
+		return;
+	_status = MTLCommandBufferStatusCommitted;
+	dispatch_group_enter(_scheduledGroup);
+	dispatch_group_enter(_done);
+	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
+	dispatch_async(device.work, ^{
+		self->_status = MTLCommandBufferStatusScheduled;
+		for (MTLCommandBufferHandler h in self->_scheduled)
+			h(self);
+		dispatch_group_leave(self->_scheduledGroup);
+		NSError *why = nil;
+		for (NSUInteger i = 0; i < self->_ops.count && !why; i++) {
+			if (![self->_draws containsIndex:i])
+				why = [device drainGfx];
+			if (!why)
+				why = self->_ops[i]();
+		}
+		NSError *drained = [device drainGfx];
+		self->_error = why ?: drained;
+		[self->_ops removeAllObjects];
+		for (id<MTLDrawable> d in self->_drawables)
+			[d present];
+		[self->_drawables removeAllObjects];
+		self->_status = self->_error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
+		for (MTLCommandBufferHandler h in self->_completed)
+			h(self);
+		[self->_completed removeAllObjects];
+		dispatch_group_leave(self->_done);
+	});
 }
 
 RDNA4_ANSWER_MISSING
@@ -1358,6 +1530,7 @@ static uint32_t colourInfo(MTLPixelFormat f)
 }
 
 enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the vertex stage's table at +0x400, the fragment stage's at +0x800
+enum { kSlots = 16 };           // draws in flight: each has its own IB page and state page until its fence has come
 
 @implementation RDNA4MTLDevice {
 	io_service_t _service;
@@ -1365,9 +1538,12 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 	__weak id _accelService;   // Metal's MTLIOAccelService for our service
 	rdna4_t _gpu;
 	BOOL _open;
-	// gfx: made by the first render pipeline; draws run one at a time (synchronous commit), so one state page and one IB serve them all
+	dispatch_queue_t _work;   // runs committed command buffers, in commit order (every queue's)
+	// gfx: made by the first render pipeline; _misc and _ib hold kSlots state pages and IB pages, used in turn by the draws
 	BOOL _gfxReady;
 	rdna4_buffer_t _rings, _spare, _misc, _ib;
+	uint64_t _slotFence[kSlots], _lastFence;   // a slot's draw's fence, while it may still run; the last draw's
+	uint32_t _slot, _lastSlot;
 }
 
 + (void)load
@@ -1387,6 +1563,7 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 	IORegistryEntryGetRegistryEntryID(service, &_registryID);
 	const kern_return_t kr = rdna4_open(&_gpu);
 	_open = kr == KERN_SUCCESS;
+	_work = dispatch_queue_create("RDNA4MTL work", DISPATCH_QUEUE_SERIAL);
 	NSLog(@"RDNA4MTLDevice: made for service 0x%x (registry ID 0x%llx); the kext's runtime client: %s", service, _registryID,
 	      _open ? "open" : rdna4_error(kr));
 	return self;
@@ -1418,8 +1595,8 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 	const uint64_t ringBytes = rdna4_tri_ring_bytes() + RDNA4_TRIRUN_RING_SLACK;
 	static const uint8_t zeros[65536];
 	if ((kr = rdna4_alloc(&_gpu, ringBytes, &_rings)) || (kr = rdna4_alloc(&_gpu, sizeof zeros, &_spare)) ||
-	    (kr = rdna4_write(&_gpu, &_spare, 0, zeros, sizeof zeros)) || (kr = rdna4_alloc(&_gpu, kMiscBytes, &_misc)) ||
-	    (kr = rdna4_alloc(&_gpu, RDNA4_TRIRUN_PAGE, &_ib))) {
+	    (kr = rdna4_write(&_gpu, &_spare, 0, zeros, sizeof zeros)) || (kr = rdna4_alloc(&_gpu, kSlots * kMiscBytes, &_misc)) ||
+	    (kr = rdna4_alloc(&_gpu, kSlots * RDNA4_TRIRUN_PAGE, &_ib))) {
 		rdna4Error(@"the gfx buffers", kr);
 		return NO;
 	}
@@ -1431,21 +1608,48 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 }
 
 - (uint64_t)gfxRings { return rdna4_trirun_rings_va(_rings.gpu); }
+- (dispatch_queue_t)work { return _work; }
 
-// One draw: the PV host's runDraw for a single-sampled RGBA8 / BGRA8 target without blending, depth or textures, non-indexed.
+// Waits for the draws submitted so far (on the work queue: before the CPU or the compute queue touches what they wrote, and at the end of
+// a command buffer). The gfx fences are ordered, so the last one is enough; its stream's own fence word says the stream ran to its end.
+- (NSError *)drainGfx
+{
+	if (!_lastFence)
+		return nil;
+	const uint64_t fence = _lastFence;
+	uint32_t streamFence = 0;
+	_lastFence = 0;
+	memset(_slotFence, 0, sizeof _slotFence);
+	kern_return_t kr = rdna4_wait_gfx_fence(&_gpu, fence, 2000, NULL);
+	if (!kr)
+		kr = rdna4_read(&_gpu, &_misc, (uint64_t)_lastSlot * kMiscBytes, &streamFence, 4);
+	if (kr)
+		return rdna4Error([NSString stringWithFormat:@"waiting for the draws (fence %llu)", fence], kr);
+	if (streamFence != 1)
+		return rdna4Error([NSString stringWithFormat:@"the draws finished but the last stream's fence reads %u", streamFence], 0);
+	return nil;
+}
+
+// One draw, submitted (not waited for: drainGfx): the PV host's runDraw for a single-sampled RGBA8 / BGRA8 target without blending.
 - (NSError *)draw:(const RDNA4Draw *)d pipeline:(RDNA4MTLRenderPipeline *)p target:(RDNA4MTLTexture *)t
 {
 	if (d->type > 4 || !d->count || !d->instances || d->count > (1u << 24))
 		return rdna4Error([NSString stringWithFormat:@"a draw of %u vertices, type %u, %u instances: not run", d->count, d->type, d->instances], 0);
 	if (p.format != t.pixelFormat)
 		return rdna4Error(@"the pipeline's colour format is not the target's", 0);
-	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];   // ponytail: one draw at a time (synchronous commit)
+	static uint32_t ib[RDNA4_TRIRUN_PAGE / 4];   // built here and copied into the slot's pages: draws are made on the work queue only
 	static uint64_t misc[kMiscBytes / 8];
+	const uint32_t slot = _slot++ % kSlots;
+	kern_return_t kr = _slotFence[slot] ? rdna4_wait_gfx_fence(&_gpu, _slotFence[slot], 2000, NULL) : KERN_SUCCESS;
+	if (kr)
+		return rdna4Error([NSString stringWithFormat:@"waiting for slot %u's earlier draw", slot], kr);
+	_slotFence[slot] = 0;
+	const uint64_t miscGpu = _misc.gpu + (uint64_t)slot * kMiscBytes, ibOffset = (uint64_t)slot * RDNA4_TRIRUN_PAGE;
 	const uint32_t *vs = p.vs, *ps = p.ps, outs = p.outs, ins = p.ins;
 	const BOOL noColour = ps[7] >> 31;
 	const uint64_t rings = self.gfxRings;
-	const rdna4_tri_va where = { p.code, t.gpuBase, rings, _misc.gpu };
-	const rdna4_tricol_va whereCol = { p.code, t.gpuBase, rings, _misc.gpu };
+	const rdna4_tri_va where = { p.code, t.gpuBase, rings, miscGpu };
+	const rdna4_tricol_va whereCol = { p.code, t.gpuBase, rings, miscGpu };
 	const uint32_t n = outs ? rdna4_tricol_record(ib, &whereCol) : rdna4_tri_record(ib, &where);
 	if (!n)
 		return rdna4Error(@"the stream builder refused the draw's addresses", 0);
@@ -1520,7 +1724,7 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 	}
 	PUT(0xc0016900u), PUT(0x191), PUT(p.sprite ? 0x86bu : 0x869u);   // SPI_INTERP_CONTROL_0
 	for (unsigned st = 0; st < 2; st++) {
-		const uint64_t table = _misc.gpu + 0x400 + 0x400 * st;
+		const uint64_t table = miscGpu + 0x400 + 0x400 * st;
 		PUT(0xc0027600u), PUT(st ? 0x0c : 0x8c), PUT((uint32_t)table), PUT((uint32_t)(table >> 32));
 	}
 	PUT(0xc0027600u), PUT(0x8e), PUT(d->start), PUT(d->baseInstance);
@@ -1550,21 +1754,16 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 			return rdna4Error(@"the stream lacks a shader's RSRC2", 0);
 		*at = (*at & ~0x3003eu) | rsrc2[i][1] << 1 | rsrc2[i][2];
 	}
-	uint64_t fence = 0, ns = 0;
-	uint32_t streamFence = 0;
-	kern_return_t kr = rdna4_write(&_gpu, &_misc, 0, misc, sizeof misc);
+	uint64_t fence = 0;
+	kr = rdna4_write(&_gpu, &_misc, (uint64_t)slot * kMiscBytes, misc, sizeof misc);
 	if (!kr)
-		kr = rdna4_write(&_gpu, &_ib, 0, ib, total * 4);
+		kr = rdna4_write(&_gpu, &_ib, ibOffset, ib, total * 4);
 	if (!kr)
-		kr = rdna4_submit_gfx_ib(&_gpu, &_ib, 0, total, &fence);
-	if (!kr)
-		kr = rdna4_wait_gfx_fence(&_gpu, fence, 2000, &ns);
-	if (!kr)
-		kr = rdna4_read(&_gpu, &_misc, 0, &streamFence, 4);
+		kr = rdna4_submit_gfx_ib(&_gpu, &_ib, ibOffset, total, &fence);
 	if (kr)
-		return rdna4Error([NSString stringWithFormat:@"a draw of %u vertices (%u dwords, fence %llu)", d->count, total, fence], kr);
-	if (streamFence != 1)
-		return rdna4Error([NSString stringWithFormat:@"a draw finished but its stream's fence reads %u", streamFence], 0);
+		return rdna4Error([NSString stringWithFormat:@"a draw of %u vertices (%u dwords)", d->count, total], kr);
+	_slotFence[slot] = _lastFence = fence;
+	_lastSlot = slot;
 	return nil;
 }
 

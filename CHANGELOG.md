@@ -17,6 +17,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - 3D on the native device: depth buffers and the depth test, textures and samplers in shaders, indexed and instanced draws.
   Card (2026-11-19): `mtlprobe nativespin` shows nine lit, textured, depth-tested cubes in a window at 1920x1200 and 60 frames
   a second.
+- A real queue on the native device: `commit` returns at once, command buffers complete in order on a work thread, draws go out
+  without waiting for each other, and a blit encoder. Card (2026-11-19): four command buffers in flight complete in order and right,
+  1000 draws in one command buffer at 64 us each, `nativespin` still at 60 frames a second.
 
 ## 0.3.3 (2026-11-19)
 

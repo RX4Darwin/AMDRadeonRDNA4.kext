@@ -234,7 +234,21 @@ the window with the triangle on the desktop, composited by WindowServer (still o
 textured cubes with a depth buffer, drawn with one indexed draw of nine instances, at 1920x1200 and 60 frames a second (1202 frames in
 20 s), as the logged-in user; the frame grab shows them right.
 
-Next gates: a real queue (command buffers submitted as IBs with fences, completion on a thread, VRAM and private storage, blits); then
-IOSurface textures and `CAMetalLayer` drawables (a Metal app on the native device shown on the screen while WindowServer stays on the
-paravirtual GPU); then the device for every app (no `RDNA4_NATIVE_MTL`) once it answers what ordinary apps ask.
+## Gate 8: a queue
 
+- `commit` returns at once. One serial work queue per device runs the committed command buffers of all its queues in commit order: it
+  calls the scheduled handlers, runs the recorded steps, presents the drawables and calls the completed handlers. `waitUntilScheduled`
+  and `waitUntilCompleted` wait for those points.
+- Draws are submitted behind each other without waiting. Each one takes the next of 16 slots (an IB page and a state page; a slot's
+  earlier draw is waited for before reuse). Every other step (a dispatch, a CPU clear, blit or acceleration-structure build) first waits
+  for the draws before it, as does the end of a command buffer: the gfx fences are ordered, so the last one is enough, and the last
+  stream's own fence word is checked.
+- A blit encoder: buffer copies and fills, buffer-to-texture, texture-to-buffer and texture-to-texture copies, by the CPU (every buffer
+  and colour texture is shared memory; depth textures are not blitted).
+
+**Gate 8 PASSED on the rig, 2026-11-19**: `mtlprobe native`'s queue check commits four command buffers (a blit copy, a dispatch each,
+a blit fill) without waiting: they complete in order with the right results, the four commits return in 1 ms. Its draws check: 1000
+draws in one command buffer, read back by a blit, right, 64 us a draw (two `rdna4_write` calls and a submit each: one IB per command
+buffer when that matters). `nativespin` still presents at 60 frames a second from the work queue.
+
+Next: the device for every app (no `RDNA4_NATIVE_MTL`) once it answers what ordinary apps ask, and WindowServer on it.
