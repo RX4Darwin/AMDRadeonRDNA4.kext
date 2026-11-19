@@ -7,9 +7,8 @@
 | `main` | What is released. Every commit on it is a tagged version or a fix to one. |
 | `next` | What is to be merged into `main` next. Work arrives here when it is finished. |
 | `devel/*` | Development work, one branch a subject (`devel/vulkan`, `devel/multi-display`, ...). |
-| `premetal/*` | Preparation for Metal support, etc. |
 
-Work moves one way: `devel/*` or `premetal/*` into `next`, `next` into `main`.
+Work moves one way: `devel/*` into `next`, `next` into `main`.
 
 - Start a branch from `next`.
 - Bring a branch into `next` with a merge (`git merge --no-ff devel/x`), and bring `next` into a long-running branch
