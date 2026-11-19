@@ -55,6 +55,7 @@ private:
 	IOLock       *gate;     // guards calls and closed
 	uint32_t      calls;    // externalMethod calls in flight
 	bool          closed;   // released: no more calls
+	bool          privileged;   // root: every selector; else (rdna4-client-policy=local) the ones a graphics client needs, in its own VM
 
 	void release();
 

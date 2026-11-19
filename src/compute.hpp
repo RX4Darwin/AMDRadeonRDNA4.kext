@@ -694,6 +694,8 @@ public:
 	const void *idleFreeOwner { nullptr };
 	bool runtimeReady() const { return rtReady; }   // the bring-up reached a dispatching stage
 	IOReturn rtInfo(const void *owner, uint64_t out[9]);
+	// The client runs in a GPU address space of its own (rdna4-vm=1): what a client that is not root needs (userclient.cpp).
+	bool rtClientIsolated(const void *owner);
 	IOReturn rtSensors(const void *owner, RDNA4Sensors &out);
 	IOReturn rtSensorsEx(const void *owner, RDNA4SensorsEx &out);
 	// GRBM perf counters 0 and 1 counting GFX clocks (GRBM_PERF_SEL_COUNT) and busy clocks (GUI_ACTIVE): the counts since the call

@@ -183,4 +183,31 @@ Not yet: instances (instance acceleration structures), bounding-box geometry and
 refit and compaction, ray queries in vertex and fragment functions, RDNA4's hardware BVH instructions (`image_bvh*_intersect_ray`,
 which want the hardware's node format), building on the GPU.
 
+## Gate 6: apps, not only root
+
+The device drives the card through the kext's runtime client, which was root only (a client's kernels ran in VMID 0 then and reached
+all of VRAM). Following `docs/w13-client-access.md`:
+
+- `rdna4-client-policy=local` (default: root only) also lets in the user logged in at the console
+  (`kIOClientPrivilegeLocalUser`), **only in a GPU address space of its own**: a client that is not root and gets none (no
+  `rdna4-vm=1`) is refused at its start (`RDNA4Compute::rtClientIsolated`).
+- Such a client has the selectors a graphics client needs (its buffers, copies into and out of them, code objects, dispatches, compute
+  and gfx IBs and their fences: `kLocalSelectors` in `src/userclient.cpp`); the display (present, restore, vblank), the sensors, the
+  sleep test and the quiesce answer `kIOReturnNotPrivileged`.
+
+**Gate 6 PASSED on the rig, 2026-11-19**: as the logged-in user (not root) `mtlprobe native` passes compute, the render pass and the
+ray queries; `rdna4-run selftest` passes in VMID 9; `rdna4-run sensors` is refused (privilege violation).
+
+## Gate 7: libraries from source
+
+Metal's own compiler makes libraries for this device: `_MTLDevice` (which the device does not override there) answers
+`newLibraryWithSource:` and the other library calls with an `_MTLLibrary` whose functions (`_MTLFunctionInternal`) give their AIR as
+`-bitcodeData`. The pipelines take such a function: its bitcode is written to a file and translated as a metallib is.
+
+**Gate 7 PASSED on the rig, 2026-11-19**: `mtlprobe nativesrc` compiles a kernel from Metal source for the device, makes its pipeline and
+runs it: 0 of 256 wrong, as a user that is not root.
+
+Next gates: a real queue (command buffers submitted as IBs with fences, completion on a thread, VRAM and private storage, blits); then
+IOSurface textures and `CAMetalLayer` drawables (a Metal app on the native device shown on the screen while WindowServer stays on the
+paravirtual GPU); then the device for every app (no `RDNA4_NATIVE_MTL`) once it answers what ordinary apps ask.
 

@@ -46,12 +46,20 @@ bool RDNA4ComputeService::registerPowerManagement(IOService *provider) {
 	return registerPowerDriver(this, kComputePowerStates, 2) == kIOReturnSuccess;
 }
 
-// A kernel runs in VMID0 and can reach all of VRAM: only root may open.
+// Who may open (docs/w13-client-access.md): root, with every selector. With rdna4-client-policy=local also the user logged in at the
+// console (the native Metal device's apps, docs/native-metal-spike.md), only in a GPU address space of its own (start: rtClientIsolated) and
+// only with the selectors a graphics client needs (kLocalSelectors): without the VM a kernel runs in VMID0 and reaches all of VRAM.
+static bool localClientsAllowed() {
+	char policy[8] = {};
+	return PE_parse_boot_argn("rdna4-client-policy", policy, sizeof(policy)) && !strncmp(policy, "local", sizeof(policy));
+}
+
 bool RDNA4ComputeClient::initWithTask(task_t owningTask, void *securityToken, UInt32 type,
                                       OSDictionary *properties) {
 	if (!IOUserClient::initWithTask(owningTask, securityToken, type, properties))
 		return false;
-	if (clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
+	privileged = clientHasPrivilege(securityToken, kIOClientPrivilegeAdministrator) == kIOReturnSuccess;
+	if (!privileged && !(localClientsAllowed() && clientHasPrivilege(securityToken, kIOClientPrivilegeLocalUser) == kIOReturnSuccess))
 		return false;
 	gate = IOLockAlloc();
 	task = owningTask;
@@ -71,7 +79,15 @@ bool RDNA4ComputeClient::start(IOService *provider) {
 	if (!svc || !svc->compute || !IOUserClient::start(provider))
 		return false;
 	compute = svc->compute;
-	return compute->rtOpen(this) == kIOReturnSuccess;
+	if (compute->rtOpen(this) != kIOReturnSuccess)
+		return false;
+	if (!privileged && !compute->rtClientIsolated(this)) {   // a local client in VMID0 would reach all of VRAM
+		rdna4Log("AMDRadeonRDNA4: user client: a client that is not root, without an address space of its own (rdna4-vm=1): refused\n");
+		compute->rtRelease(this);
+		compute = nullptr;
+		return false;
+	}
+	return true;
 }
 
 // Once, after the calls in flight: they use the client's buffers, and compute stays set for them.
@@ -131,10 +147,20 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 };
 static_assert(kRDNA4MethodCount == 22, "kMethods has one entry per selector");
 
+// What a client that is not root may call: its own buffers, programs and submissions. Not the display (present, restore, vblank), the
+// sensors, the sleep test or the quiesce.
+static constexpr uint32_t kLocalSelectors = 1u << kRDNA4MethodInfo | 1u << kRDNA4MethodAlloc | 1u << kRDNA4MethodFree |
+                                            1u << kRDNA4MethodWrite | 1u << kRDNA4MethodRead | 1u << kRDNA4MethodLoad |
+                                            1u << kRDNA4MethodUnload | 1u << kRDNA4MethodDispatch | 1u << kRDNA4MethodAllocHost |
+                                            1u << kRDNA4MethodSubmitIb | 1u << kRDNA4MethodWaitFence |
+                                            1u << kRDNA4MethodSubmitGfxIb | 1u << kRDNA4MethodWaitGfxFence;
+
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                                             IOExternalMethodDispatch *, OSObject *, void *) {
 	if (selector >= kRDNA4MethodCount || !compute)
 		return kIOReturnUnsupported;
+	if (!privileged && !(kLocalSelectors >> selector & 1))
+		return kIOReturnNotPrivileged;
 
 	IOLockLock(gate);
 	if (closed) {

@@ -29,6 +29,9 @@
  * ponytail: synchronous commit, one draw at a time, no blending, depth, textures in shaders, MSAA or indexed draws; one host allocation
  * per set*Bytes. A real queue (IBs batched, fences, completion on a thread) when a gate needs overlap.
  *
+ * Gate 7: libraries from source. Metal's own compiler makes them for this device (_MTLDevice's newLibraryWithSource: and the rest, not
+ * overridden): their functions (_MTLFunctionInternal) give their AIR as -bitcodeData, which the translator takes as it takes a metallib.
+ *
  * Gate 5: ray queries. Acceleration structures of triangle geometry are the device's own format (a stackless BVH, built by the CPU
  * as a command buffer's step, below); a kernel's intersect is translated into tools/metal/m3/rtlib.c's traversal of it.
  * ponytail: primitive structures only (no instances), no refit, compaction, masks, cull modes or intersection functions.
@@ -476,17 +479,30 @@ RDNA4_ANSWER_MISSING
 
 // `function` translated by the translator in file mode ($RDNA4_AIR2AMDGPU, the bundle's own, or /usr/local/libexec/rdna4-air2amdgpu): a kernel's code
 // object, or a vertex or fragment function's RGFX blob (tools/metal/m3/air2amdgpu.cpp), and a kernel's count of buffer addresses.
-static NSError *translateFunction(RDNA4MTLFunction *function, NSData **blob, uint32_t *buffers)
+static NSError *translateFunction(id<MTLFunction> function, NSData **blob, uint32_t *buffers)
 {
 	// the bundle's own (build.sh: the translator these functions need, ray queries say), else the paravirtual GPU's helper
 	NSString *own = [[NSBundle bundleForClass:[RDNA4MTLFunction class]] pathForResource:@"air2amdgpu" ofType:nil];
 	NSString *tool = NSProcessInfo.processInfo.environment[@"RDNA4_AIR2AMDGPU"] ?: own ?: @"/usr/local/libexec/rdna4-air2amdgpu";
 	NSString *out = [NSTemporaryDirectory() stringByAppendingPathComponent:
 	                                            [NSString stringWithFormat:@"rdna4mtl-%d-%@.bin", getpid(), function.name]];
+	// The input: our library's metallib, or the AIR bitcode of a function Metal's own compiler made (newLibraryWithSource: and the other
+	// library calls _MTLDevice answers: an _MTLFunctionInternal, its -bitcodeData)
+	NSString *input = nil, *scratch = nil;
+	if ([(id)function isKindOfClass:[RDNA4MTLFunction class]]) {
+		input = ((RDNA4MTLFunction *)function).library.path;
+	} else if ([(id)function respondsToSelector:@selector(bitcodeData)]) {
+		NSData *bitcode = [(id)function performSelector:@selector(bitcodeData)];
+		scratch = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"rdna4mtl-%d-%@.bc", getpid(), function.name]];
+		if ([bitcode isKindOfClass:[NSData class]] && [bitcode writeToFile:scratch atomically:NO])
+			input = scratch;
+	}
+	if (!input)
+		return rdna4Error([NSString stringWithFormat:@"%@: a function of class %@ with no AIR to translate", function.name, [(id)function class]], 0);
 	NSTask *task = [NSTask new];
 	NSPipe *pipe = [NSPipe pipe];
 	task.executableURL = [NSURL fileURLWithPath:tool];
-	task.arguments = @[ function.library.path, function.name, out ];
+	task.arguments = @[ input, function.name, out ];
 	task.standardOutput = pipe;
 	task.standardError = pipe;
 	NSError *runError = nil;
@@ -494,6 +510,8 @@ static NSError *translateFunction(RDNA4MTLFunction *function, NSData **blob, uin
 		return rdna4Error([NSString stringWithFormat:@"cannot run %@: %@", tool, runError.localizedDescription], 0);
 	NSData *said = [pipe.fileHandleForReading readDataToEndOfFile];
 	[task waitUntilExit];
+	if (scratch)
+		[NSFileManager.defaultManager removeItemAtPath:scratch error:nil];
 	NSString *text = [[NSString alloc] initWithData:said encoding:NSUTF8StringEncoding];
 	NSArray *words = [text componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];   // "<name> <buffers> <written>"
 	*blob = [NSData dataWithContentsOfFile:out];
@@ -516,7 +534,7 @@ static NSError *translateFunction(RDNA4MTLFunction *function, NSData **blob, uin
 }
 
 // Translate `function` and load its code object; nil and *error on failure.
-- (instancetype)initWithDevice:(RDNA4MTLDevice *)device function:(RDNA4MTLFunction *)function error:(NSError **)error
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device function:(id<MTLFunction>)function error:(NSError **)error
 {
 	if (!(self = [super init]))
 		return nil;
@@ -527,7 +545,7 @@ static NSError *translateFunction(RDNA4MTLFunction *function, NSData **blob, uin
 	return why ? nil : self;
 }
 
-- (NSError *)loadFunction:(RDNA4MTLFunction *)function
+- (NSError *)loadFunction:(id<MTLFunction>)function
 {
 	if (!_device.gpu)
 		return rdna4Error(@"the kext's runtime client is not open (root only)", 0);
@@ -608,7 +626,7 @@ typedef struct {
 	if (!_device.gfx)
 		return rdna4Error(@"no gfx IBs: the kext's runtime client is not open (root only), or the boot has no client gfx IBs (rdna4-gfx=2)", 0);
 	id<MTLFunction> fn[2] = { desc.vertexFunction, desc.fragmentFunction };
-	if (![(id)fn[0] isKindOfClass:[RDNA4MTLFunction class]] || ![(id)fn[1] isKindOfClass:[RDNA4MTLFunction class]])
+	if (!fn[0] || !fn[1] || fn[0].device != _device || fn[1].device != _device)
 		return rdna4Error(@"a render pipeline needs a vertex and a fragment function of this device so far", 0);
 	MTLRenderPipelineColorAttachmentDescriptor *a = desc.colorAttachments[0];
 	_format = a.pixelFormat;
@@ -618,7 +636,7 @@ typedef struct {
 	for (int k = 0; k < 2; k++) {
 		uint32_t unused;
 		NSData *blob = nil;
-		NSError *why = translateFunction((RDNA4MTLFunction *)fn[k], &blob, &unused);
+		NSError *why = translateFunction(fn[k], &blob, &unused);
 		if (why)
 			return why;
 		_blob[k] = blob;
@@ -1334,12 +1352,12 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error
 {
-	if (![(id)function isKindOfClass:[RDNA4MTLFunction class]]) {
+	if (function.device != self) {
 		if (error)
 			*error = rdna4Error(@"a function of another device", 0);
 		return nil;
 	}
-	return [[RDNA4MTLComputePipeline alloc] initWithDevice:self function:(RDNA4MTLFunction *)function error:error];
+	return [[RDNA4MTLComputePipeline alloc] initWithDevice:self function:function error:error];
 }
 
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function

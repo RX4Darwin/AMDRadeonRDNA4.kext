@@ -5,6 +5,13 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.3.3 (on `next`, no number yet)
 
+**Native Metal (spike, `docs/native-metal-spike.md`)**
+- Apps, not only root: `rdna4-client-policy=local` lets the logged-in user open the kext's runtime client, only in a GPU address
+  space of its own and only with what a graphics client needs (no display, sensors, sleep test or quiesce). Card (Tahoe 26.6.2,
+  2026-11-19): the native device's compute, render and ray-query checks pass as a normal user; `rdna4-run sensors` is refused.
+- Libraries from Metal source on the native device: Metal's own compiler makes them, and the device translates their AIR. Card
+  (2026-11-19): `mtlprobe nativesrc` compiles a kernel from source and runs it, all right.
+
 ## 0.3.3 (2026-11-19)
 
 **Metal (`make PVGPU=1`)**

@@ -209,6 +209,7 @@ All without a leading dash (`name=1`). The features above are on by default; the
 | `rdna4-dmubload=1`, `rdna4-dcninit=1`, `rdna4-coldboot=1` | The display firmware of the kext's own; the display engine started from nothing; a real cold start from a reset card. |
 | `rdna4-dispclk=<MHz>`, `rdna4-dcfclk=<MHz>`, `rdna4-uclk=<MHz>`, `rdna4-fclk=<MHz>` | The clock minimums asked of the power-management firmware (`rdna4-dispclk=0`: clocks left alone, no 4K). |
 | `rdna4-vmshared=<0-2>`, `rdna4-hang=0` | Where compute jobs run (1, the default: two shared kernel queues); recovery from a hung job off. |
+| `rdna4-client-policy=local` | The compute runtime's client for the logged-in user too, not only root (the native Metal device's apps): only in a GPU address space of its own (`rdna4-vm=1`) and without the display, sensor and power calls. |
 | `rdna4-cursor=1` | A hardware cursor without the paravirtual GPU (through Apple's framebuffer driver). |
 | `rdna4-trace=1` | Log every request Apple's framebuffer driver makes of ours. |
 | `-rdna4dbg` | Lilu's debug logging for the plugin (Lilu DEBUG builds). |

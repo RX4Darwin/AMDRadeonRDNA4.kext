@@ -9,6 +9,7 @@
 //   mtlprobe mix       out[i] = 3 * in[i] + 100000 * group + 1000 * thread in group + group size over 100 threads in groups of 32 (the
 //                      last group has 4, and Metal reports 4 as its size); a kernel that is not in the kext's table: it runs only if
 //                      translated at run time
+//   mtlprobe nativesrc a kernel compiled from source (Metal's own compiler) on our own device, run and checked (as native)
 //   mtlprobe dualsrc   dual-source blending: every pixel of a quad whose colour and second source depend on its parity, checked
 //   mtlprobe devices   every Metal device MTLCopyAllDevices returns, its class and registry ID (docs/native-metal-spike.md)
 //   mtlprobe native <probe.metallib>   the native-Metal spike on our own device (RDNA4MTLDevice; as root, RDNA4_NATIVE_MTL=1): gate 2,
@@ -2519,6 +2520,51 @@ int main(int argc, char **argv) {
 			    rb.error ? ", " : "", rb.error ? rb.error.localizedDescription.UTF8String : "");
 			const BOOL raysOk = nativeRays(d, lib);
 			return computeOk && renderOk && raysOk ? 0 : 1;
+		}
+		if (!strcmp(mode, "nativesrc")) {   // the native-Metal spike's gate 7: does Metal's own compiler make a library for RDNA4MTLDevice?
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			if (!d) {
+				OUT("nativesrc: FAIL: no RDNA4MTLDevice");
+				return 1;
+			}
+			NSError *err = nil;
+			id<MTLLibrary> lib = [d newLibraryWithSource:@"kernel void add1(device uint *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] += 1; }"
+			                                     options:nil
+			                                       error:&err];
+			OUT("nativesrc: library %s (class %s)%s%s", lib ? "made" : "NOT made", lib ? NSStringFromClass([(id)lib class]).UTF8String : "-",
+			    err ? ": " : "", err ? err.localizedDescription.UTF8String : "");
+			if (!lib)
+				return 1;
+			OUT("nativesrc: functions %s", [lib.functionNames componentsJoinedByString:@", "].UTF8String);
+			id<MTLFunction> f = [lib newFunctionWithName:@"add1"];
+			OUT("nativesrc: function %s (class %s)", f ? "made" : "NOT made", f ? NSStringFromClass([(id)f class]).UTF8String : "-");
+			id<MTLComputePipelineState> ps = f ? [d newComputePipelineStateWithFunction:f error:&err] : nil;
+			enum { n = 256 };
+			id<MTLBuffer> b = [d newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+			if (!ps || !b) {
+				OUT("nativesrc: FAIL: %s", ps ? "no buffer" : err.localizedDescription.UTF8String);
+				return 1;
+			}
+			uint32_t *o = b.contents;
+			for (int i = 0; i < n; i++)
+				o[i] = 7 * i;
+			id<MTLCommandBuffer> cb = [[d newCommandQueue] commandBuffer];
+			id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+			[e setComputePipelineState:ps];
+			[e setBuffer:b offset:0 atIndex:0];
+			[e dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+			[e endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			int bad = 0;
+			for (int i = 0; i < n; i++)
+				bad += o[i] != 7u * i + 1;
+			OUT("nativesrc: %s: a kernel compiled from source by Metal for the device, run on it: %d of %d wrong (status %ld)", bad ||
+			    cb.status != MTLCommandBufferStatusCompleted ? "FAIL" : "PASS", bad, n, (long)cb.status);
+			return bad ? 1 : 0;
 		}
 		if (!strcmp(mode, "devices")) {   // every Metal device, its class and registry ID (the native-Metal spike's gate 1)
 			NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();

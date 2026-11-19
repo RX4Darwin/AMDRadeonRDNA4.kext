@@ -1757,6 +1757,11 @@ void rdna4Step(const char *what) {
 	IOSleep(ms);
 }
 
+bool RDNA4Compute::rtClientIsolated(const void *owner) {
+	Locked g(rtLock);
+	return vmEnabled && vmClientFor(owner);
+}
+
 IOReturn RDNA4Compute::rtOpen(const void *owner) {
 	rdna4Step("rtOpen: taking rtLock");
 	const IOReturn r = rtOpenInner(owner);
