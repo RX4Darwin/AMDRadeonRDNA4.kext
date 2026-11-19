@@ -10,6 +10,8 @@
 //                      last group has 4, and Metal reports 4 as its size); a kernel that is not in the kext's table: it runs only if
 //                      translated at run time
 //   mtlprobe devices   every Metal device MTLCopyAllDevices returns, its class and registry ID (docs/native-metal-spike.md)
+//   mtlprobe native <gate2.metallib>   gate 2 of the native-Metal spike on our own device (RDNA4MTLDevice; as root, RDNA4_NATIVE_MTL=1):
+//                      c = a + b over 1000 floats in groups of 64 (dispatchThreads: the last group is partial), then c *= 3 with setBytes
 //   mtlprobe two       two kernels of one library in one command buffer: out[i] = in[i] + 1, then out[i] *= 3 (64 threads)
 //   mtlprobe twolib    the same with two libraries of one kernel each: out[i] = in[i] + 7, then out[i] *= out[i]
 //   mtlprobe feat      one kernel per Metal language feature (constant buffers, math, threadgroup memory and barriers, atomics, local
@@ -2209,6 +2211,65 @@ int main(int argc, char **argv) {
 				OUT("%s: child ended, %s %d", modes[i], WIFSIGNALED(st) ? "signal" : "exit", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
 			}
 			return 0;
+		}
+		if (!strcmp(mode, "native")) {   // the native-Metal spike's gate 2: buffers and two compute dispatches on RDNA4MTLDevice
+			if (argc < 3) {
+				OUT("native: usage: mtlprobe native <gate2.metallib>");
+				return 2;
+			}
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			if (!d) {
+				OUT("native: FAIL: no RDNA4MTLDevice (RDNA4_NATIVE_MTL=1? sysctl debug.rdna4_nativemtl=1? the bundle installed?)");
+				return 1;
+			}
+			NSError *err = nil;
+			id<MTLLibrary> lib = [d newLibraryWithURL:[NSURL fileURLWithPath:@(argv[2])] error:&err];
+			id<MTLComputePipelineState> vadd = lib ? [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"vadd"] error:&err] : nil;
+			id<MTLComputePipelineState> scale = vadd ? [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"scale"] error:&err] : nil;
+			if (!scale) {
+				OUT("native: FAIL: %s", err.localizedDescription.UTF8String ?: "no library or pipeline");
+				return 1;
+			}
+			enum { n = 1000 };
+			id<MTLBuffer> a = [d newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+			id<MTLBuffer> b = [d newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+			id<MTLBuffer> c = [d newBufferWithLength:n * 4 options:MTLResourceStorageModeShared];
+			if (!a || !b || !c) {
+				OUT("native: FAIL: no buffers");
+				return 1;
+			}
+			float *pa = a.contents, *pb = b.contents, *pc = c.contents;
+			for (int i = 0; i < n; i++) {
+				pa[i] = i;
+				pb[i] = 0.5f * i + 1;
+				pc[i] = -1;
+			}
+			const float k = 3;
+			id<MTLCommandBuffer> cb = [[d newCommandQueue] commandBuffer];
+			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+			[enc setComputePipelineState:vadd];
+			[enc setBuffer:a offset:0 atIndex:0];
+			[enc setBuffer:b offset:0 atIndex:1];
+			[enc setBuffer:c offset:0 atIndex:2];
+			[enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+			[enc setComputePipelineState:scale];
+			[enc setBuffer:c offset:0 atIndex:0];
+			[enc setBytes:&k length:sizeof k atIndex:1];
+			[enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+			[enc endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			int bad = 0, firstBad = -1;
+			for (int i = 0; i < n; i++)
+				if (pc[i] != 3 * (pa[i] + pb[i]) && !bad++)
+					firstBad = i;
+			OUT("native: %s: %d of %d wrong (status %ld%s%s); c[0] %g, c[999] %g%s", bad || cb.status != MTLCommandBufferStatusCompleted ? "FAIL" : "PASS",
+			    bad, n, (long)cb.status, cb.error ? ", " : "", cb.error ? cb.error.localizedDescription.UTF8String : "", pc[0], pc[n - 1],
+			    firstBad >= 0 ? [NSString stringWithFormat:@"; first wrong c[%d] = %g", firstBad, pc[firstBad]].UTF8String : "");
+			return bad ? 1 : 0;
 		}
 		if (!strcmp(mode, "devices")) {   // every Metal device, its class and registry ID (the native-Metal spike's gate 1)
 			NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();

@@ -69,5 +69,29 @@ the loader found the bundle:
   crashed on the first missing message (ControlCenter, TextInputMenuAgent, AMD Power Gadget). The bundle now makes the device only
   where `RDNA4_NATIVE_MTL` is set; that stays until the device answers everything an ordinary app asks.
 
-Next gates: a buffer and a compute dispatch through our kext (gate 2), then a render pass, then WindowServer's pairing with a native
+## Gate 2: buffers and compute
+
+The bundle drives the card through the kext's runtime client (`librdna4`, `RDNA4ComputeService`, root only):
+
+- `newBuffer*` -> `rdna4_alloc_host`: snooped system memory mapped into the task and the client's GPU address space (shared storage,
+  `contents` and `gpuAddress` straight from it; at most 64 MiB a buffer).
+- `newLibraryWithURL:` / `newLibraryWithFile:` / `newLibraryWithData:` keep the metallib; `newFunctionWithName:` is a name in it.
+- `newComputePipelineStateWithFunction:` runs the translator in file mode (`/usr/local/libexec/rdna4-air2amdgpu <metallib> <name>
+  <out.hsaco>`, it prints the buffer count) and loads the code object with `rdna4_load`.
+- The compute encoder records each dispatch with the translator's kernargs (buffer addresses, threads per group, threads in the grid,
+  texture table 0); `commit` runs them in order with `rdna4_dispatch` and then the completion handlers.
+- Every class answers a message it lacks with zeros of the protocol method's own return type (from the protocol's type encoding) and
+  logs it once: `RDNA4MTL: <class> does not implement <selector>`.
+
+Check: `sudo sh ~/rdna4/native/gate2.sh` on the rig (`tools/metal/native/gate2.sh`: publishes the service, runs `mtlprobe native
+gate2.metallib`): c = a + b over 1000 floats in groups of 64 (dispatchThreads, a partial last group), then c *= 3 with `setBytes`.
+
+**Gate 2 PASSED on the rig, 2026-11-19**: `mtlprobe: native: PASS: 0 of 1000 wrong (status 4); c[0] 3, c[999] 4498.5`. The only message
+Metal sent that the device lacks is `featureProfile`.
+
+Open for later gates: the root-only client (an app cannot be root: the native device needs a user client of its own on the
+`RDNA4NativeMetal` service, a GPU address space per process); `newLibraryWithSource:` (needs Metal's compiler service for our device,
+or AIR from elsewhere); a real queue (IBs and fences instead of a synchronous commit); VRAM buffers.
+
+Next gates: a render pass, then WindowServer's pairing with a native
 display (the hardware cursor), then acceleration structures.
