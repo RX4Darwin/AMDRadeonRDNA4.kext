@@ -1400,9 +1400,9 @@ void RDNA4PvHost::tick() {
 	// the line disabled from the interrupt until its work loop has read the status. Dropped a tick after the raise, a raise that came while the
 	// line was disabled reached the driver with no bits left, and it only saw its stamps and VBLs after IOAccelEventMachine2::waitForStamp's 1 s
 	// timed wait (most raises of a session: animations stood still, frames came late).
+	uint64_t phaseAt = nowNs();
 	dropIrqBits();
 	const uint32_t cmds = mCmds;
-	uint64_t phaseAt = nowNs();
 
 	completeLate();
 	uint64_t phaseNs = nowNs() - phaseAt;
