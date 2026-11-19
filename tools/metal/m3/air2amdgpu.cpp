@@ -769,12 +769,13 @@ static std::string legalize(Function &k) {
 			                               {value, x, y, t, b.getInt32(0), b.getInt32(0)});
 			r = b.CreateInsertElement(PoisonValue::get(vt), old, uint64_t(0));
 		} else if (tex.starts_with("read_texture_buffer_1d.v4f")) {
-			// (texture, uint coord, i32): a texture made from a buffer (vkQuake's palette), which the host gives as one linear row
+			// (texture, uint coord, i32): a texture made from a buffer (vkQuake's palette, Sublime Text's GL buffer textures), which the host
+			// gives as one linear row, or as rows of 16384 texels when longer (a T# holds at most 16384): texel x at (x % 16384, x / 16384)
 			const bool half = tex.starts_with("read_texture_buffer_1d.v4f16");
 			Value *t = descriptor(c->getArgOperand(0), 8), *x = b.CreateZExtOrTrunc(c->getArgOperand(1), b.getInt32Ty());
 			Type *v4f = FixedVectorType::get(b.getFloatTy(), 4);
 			Value *texel = b.CreateIntrinsic(Intrinsic::amdgcn_image_load_2d, {v4f, b.getInt32Ty(), t->getType()},
-			                                 {b.getInt32(15), x, b.getInt32(0), t, b.getInt32(0), b.getInt32(0)});
+			                                 {b.getInt32(15), b.CreateAnd(x, 16383), b.CreateLShr(x, 14), t, b.getInt32(0), b.getInt32(0)});
 			if (half)
 				texel = b.CreateFPTrunc(texel, FixedVectorType::get(b.getHalfTy(), 4));
 			r = b.CreateInsertValue(b.CreateInsertValue(PoisonValue::get(c->getType()), texel, 0), b.getInt8(0), 1);   // {texel, i8 0}
@@ -1230,7 +1231,7 @@ struct Kernel {
 // A vertex or fragment function as a gfx12 shader with the hardware ABI of the kext's hand-written triangle shaders, for the host's draws
 // (src/pvgpu.cpp), as an RGFX blob: {char[4] "RGFX", u32 stage (1 vertex, 2 fragment), u32 code bytes, u32 SPI_SHADER_PGM_RSRC1, u32 RSRC2,
 // u32 SPI_PS_INPUT_ENA, u32 SPI_PS_INPUT_ADDR, u32 attributes (bits 0-15 the values between the stages; bit 16 its textures' levels read
-// (RDNA4_MTLC_LEVEL_FIRST); bits 20-27 the colour attachments
+// (RDNA4_MTLC_LEVEL_FIRST); bit 18 dual-source blending (the colour and [[color(0), index(1)]] to the dual-source targets); bits 20-27 the colour attachments
 // written when several, chosen by the host; bits 28-30 the one attachment other than 0 written; bit 31: a fragment shader without a colour)}, then the code
 // (relocation-free, the entry at its start), then per attribute
 // {u32 hash of its AIR name (FNV-1a), u32 flags: bit 0 flat, bit 1 the point's coordinate (no name)}: the vertex function's outputs in ring-slot order, the fragment function's
@@ -1384,6 +1385,9 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	int attachment = -1, other = -1, otherIndex = 0;
 	unsigned others = 0;
 	int memberOf[8] = {-1, -1, -1, -1, -1, -1, -1, -1};   // the struct member of each colour attachment it writes
+	// Dual-source blending: [[color(0), index(1)]], the blend's second source (Sublime Text's subpixel text through AppleMetalOpenGLRenderer
+	// blends with Source1Color): exported beside the colour (header bit 18), not as it
+	int dualMember = -1;
 	for (unsigned k = 0; k < outputs->getNumOperands(); k++) {
 		const auto *o = cast<MDNode>(outputs->getOperand(k));
 		const std::string kind = mdString(o, 0);
@@ -1401,6 +1405,8 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		// sample; vkQuake's ambient-occlusion pass on MSAA); the mask export (DB_SHADER_CONTROL.MASK_EXPORT_ENABLE, MRTZ) when that shows
 		else if (!vertex && kind == "air.sample_mask")
 			maskMember = static_cast<int>(k);
+		else if (!vertex && kind == "air.render_target" && mdInt(o, 1) == 0 && o->getNumOperands() > 2 && mdInt(o, 2) == 1)
+			dualMember = static_cast<int>(k);
 		else if (!vertex && kind == "air.render_target" && mdInt(o, 1) == 0) {
 			memberOf[0] = static_cast<int>(k);
 			colourMember = k;
@@ -1735,7 +1741,27 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 					if ((writes >> n & 1) && static_cast<unsigned>(memberOf[n]) != colourMember)
 						out = b.CreateSelect(b.CreateICmpEQ(sel, b.getInt32(n)), toVec4(b.CreateExtractValue(colour, static_cast<unsigned>(memberOf[n]))), out);
 			}
-			exportF32(0, out, true);   // mrt0: as four floats (half widened; missing components 0, alpha 1)
+			if (dualMember >= 0 && colour->getType()->isStructTy()) {
+				// Both sources to the dual-source targets (21, 22), swizzled as gfx11+ wants them: Mesa's ac_build_dual_src_blend_swizzle (the
+				// first source's odd and even lanes swapped, the even lanes swapped between the sources, the first's lanes swapped back)
+				Value *second = toVec4(b.CreateExtractValue(colour, static_cast<unsigned>(dualMember)));
+				Value *lane = b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_hi, {}, {b.getInt32(-1), b.CreateIntrinsic(Intrinsic::amdgcn_mbcnt_lo, {}, {b.getInt32(-1), b.getInt32(0)})});
+				Value *even = b.CreateICmpEQ(b.CreateAnd(lane, 1), b.getInt32(0));
+				auto swapPairs = [&](Value *v) { return b.CreateIntrinsic(Intrinsic::amdgcn_mov_dpp8, {i32}, {v, b.getInt32(0xde54c1)}); };
+				Value *c0[4], *c1[4];
+				for (unsigned k = 0; k < 4; k++) {
+					Value *s0 = swapPairs(b.CreateBitCast(b.CreateExtractElement(out, k), i32)), *s1 = b.CreateBitCast(b.CreateExtractElement(second, k), i32);
+					Value *t0 = s0;
+					s0 = b.CreateSelect(even, s1, s0);
+					s1 = b.CreateSelect(even, t0, s1);
+					c0[k] = b.CreateBitCast(swapPairs(s0), f32);
+					c1[k] = b.CreateBitCast(s1, f32);
+				}
+				b.CreateIntrinsic(Intrinsic::amdgcn_exp, {f32}, {b.getInt32(21), b.getInt32(15), c0[0], c0[1], c0[2], c0[3], b.getFalse(), b.getTrue()});
+				b.CreateIntrinsic(Intrinsic::amdgcn_exp, {f32}, {b.getInt32(22), b.getInt32(15), c1[0], c1[1], c1[2], c1[3], b.getTrue(), b.getTrue()});
+			} else {
+				exportF32(0, out, true);   // mrt0: as four floats (half widened; missing components 0, alpha 1)
+			}
 		}
 	}
 	b.CreateRetVoid();
@@ -1799,7 +1825,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		return "the shader needs " + std::to_string(scratch) + " bytes of scratch memory (a local array not kept in registers)";
 	const uint32_t head[8] = {0x58464752 /* "RGFX" */, vertex ? 1u : 2u, static_cast<uint32_t>(code.size()), regs[0], regs[1], regs[2], regs[3],
 	                          static_cast<uint32_t>(vars.size()) | writes << 20 | (attachment > 0 ? static_cast<uint32_t>(attachment) << 28 : 0) |
-	                          (noColour ? 1u << 31 : 0) | (f->hasFnAttribute("rdna4-levels") ? 1u << 16 : 0)};
+	                          (noColour ? 1u << 31 : 0) | (f->hasFnAttribute("rdna4-levels") ? 1u << 16 : 0) | (dualMember >= 0 ? 1u << 18 : 0)};
 	out.hsaco.assign(reinterpret_cast<const char *>(head), sizeof(head));
 	out.hsaco += code.str();
 	for (const Var &v : vars) {

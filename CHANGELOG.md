@@ -3,6 +3,22 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
+## 0.3.3 (2026-11-19)
+
+**Metal (`make PVGPU=1`)**
+- Sublime Text draws (through OpenGL on Metal, `AppleMetalOpenGLRenderer`). Its window stayed black: its draws read
+  their data from GL buffer textures, Metal texture buffers of 24576 RGBA32Float texels, wider than a T# holds (16384),
+  and were refused. Such a row is now given as rows of 16384 texels, which the translator's texture-buffer reads index
+  (x % 16384, x / 16384). Then its text came out as solid blocks: it blends subpixel text with dual-source blending
+  (`Source1Color`), and the shader's second output (`[[color(0), index(1)]]`) replaced its colour. Both now go to the
+  dual-source export targets, swizzled across lanes as gfx11+ wants (Mesa's), with the registers RADV sets for it
+  (`SPI_SHADER_COL_FORMAT` and `CB_SHADER_MASK` for both, `DISABLE_DUAL_QUAD`, no SX blend optimisation). Without the
+  second source's channels in `CB_SHADER_MASK`, every pixel at an even x was blended twice, the second time with its
+  neighbour's values: subpixel text on a 1x display (the Lenovo) looked coarse, in Sublime Text and elsewhere.
+  `mtlprobe dualsrc` checks every pixel of a dual-source draw. Card (Tahoe 26.6.2, 2026-11-19): Sublime Text readable,
+  `mtlprobe dualsrc` and `mtlprobe all` pass.
+- `debug.rdna4_pvframeport` plus 256: `debug.rdna4_pvframe` grabs the frame at full size (to look at single pixels).
+
 ## 0.3.2 (2026-11-19)
 
 **Metal (`make PVGPU=1`)**
