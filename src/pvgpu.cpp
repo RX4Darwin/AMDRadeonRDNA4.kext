@@ -893,6 +893,7 @@ private:
 	// Time spent inside the 250 us host timer callback, which also services display events.
 	uint64_t mTickNs { 0 }, mTickMaxNs { 0 }, mTickCalls { 0 }, mTickOver250us { 0 }, mTickOver1ms { 0 };
 	uint64_t mTickPhaseNs[6] {}, mTickPhaseMaxNs[6] {};   // IRQ/late, guest FIFO, pipelines, channels+submit, display, finish
+	uint64_t mTickSubphaseNs[5] {}, mTickSubphaseMaxNs[5] {};   // register poll, root map, FIFO poll, channels, batch flush
 	uint64_t mTickLastAt { 0 }, mTickGapNs { 0 }, mTickGapMaxNs { 0 }, mTickGapCalls { 0 };
 	uint64_t mTickGapOver500us { 0 }, mTickGapOver1ms { 0 }, mTickGapOver2ms { 0 };
 	// Deadline-based lateness excludes the callback's own runtime: it measures how late the scheduler starts the next work-loop action.
@@ -1580,6 +1581,11 @@ void RDNA4PvHost::tick() {
 	// line was disabled reached the driver with no bits left, and it only saw its stamps and VBLs after IOAccelEventMachine2::waitForStamp's 1 s
 	// timed wait (most raises of a session: animations stood still, frames came late).
 	uint64_t phaseAt = nowNs();
+	auto recordSubphase = [this](uint32_t phase, uint64_t from) {
+		const uint64_t elapsed = nowNs() - from;
+		mTickSubphaseNs[phase] += elapsed;
+		mTickSubphaseMaxNs[phase] = elapsed > mTickSubphaseMaxNs[phase] ? elapsed : mTickSubphaseMaxNs[phase];
+	};
 	dropIrqBits();
 	const uint32_t cmds = mCmds;
 	// a tick that came 100 ms or more late: logged (the pointer stood at times, 2026-11-20)
@@ -1600,9 +1606,15 @@ void RDNA4PvHost::tick() {
 	mTickPhaseMaxNs[0] = phaseNs > mTickPhaseMaxNs[0] ? phaseNs : mTickPhaseMaxNs[0];
 
 	phaseAt = nowNs();
+	uint64_t subphaseAt = phaseAt;
 	pollRegisters();
+	recordSubphase(0, subphaseAt);
+	subphaseAt = nowNs();
 	mapRoot();
+	recordSubphase(1, subphaseAt);
+	subphaseAt = nowNs();
 	pollFifo();
+	recordSubphase(2, subphaseAt);
 	phaseNs = nowNs() - phaseAt;
 	mTickPhaseNs[1] += phaseNs;
 	mTickPhaseMaxNs[1] = phaseNs > mTickPhaseMaxNs[1] ? phaseNs : mTickPhaseMaxNs[1];
@@ -1614,8 +1626,12 @@ void RDNA4PvHost::tick() {
 	mTickPhaseMaxNs[2] = phaseNs > mTickPhaseMaxNs[2] ? phaseNs : mTickPhaseMaxNs[2];
 
 	phaseAt = nowNs();
+	subphaseAt = phaseAt;
 	pollChannels();
+	recordSubphase(3, subphaseAt);
+	subphaseAt = nowNs();
 	flushBatch();   // what the commands drew, on the card while the host waits for more
+	recordSubphase(4, subphaseAt);
 	phaseNs = nowNs() - phaseAt;
 	mTickPhaseNs[3] += phaseNs;
 	mTickPhaseMaxNs[3] = phaseNs > mTickPhaseMaxNs[3] ? phaseNs : mTickPhaseMaxNs[3];
@@ -9182,6 +9198,14 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		       mTickPhaseNs[2] / mTickCalls / 1000, mTickPhaseMaxNs[2] / 1000, mTickPhaseNs[3] / mTickCalls / 1000, mTickPhaseMaxNs[3] / 1000,
 		       mTickPhaseNs[4] / mTickCalls / 1000, mTickPhaseMaxNs[4] / 1000, mTickPhaseNs[5] / mTickCalls / 1000, mTickPhaseMaxNs[5] / 1000);
 	}
+		pvstat("host: render:   tick detail avg/max us: registers %llu/%llu, root map %llu/%llu, FIFO %llu/%llu",
+		       mTickSubphaseNs[0] / mTickCalls / 1000, mTickSubphaseMaxNs[0] / 1000,
+		       mTickSubphaseNs[1] / mTickCalls / 1000, mTickSubphaseMaxNs[1] / 1000,
+		       mTickSubphaseNs[2] / mTickCalls / 1000, mTickSubphaseMaxNs[2] / 1000);
+		pvstat("host: render:   tick detail avg/max us: channels %llu/%llu, batch flush %llu/%llu",
+		       mTickSubphaseNs[3] / mTickCalls / 1000, mTickSubphaseMaxNs[3] / 1000,
+		       mTickSubphaseNs[4] / mTickCalls / 1000, mTickSubphaseMaxNs[4] / 1000);
+	}
 	if (mTickGapCalls)
 		pvstat("host: render:   tick start gaps %llu, average %llu us, max %llu us, >=500 us %llu, >=1 ms %llu, >=2 ms %llu",
 		       mTickGapCalls, mTickGapNs / mTickGapCalls / 1000, mTickGapMaxNs / 1000, mTickGapOver500us, mTickGapOver1ms, mTickGapOver2ms);
@@ -9341,6 +9365,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mTickNs = mTickMaxNs = mTickCalls = mTickOver250us = mTickOver1ms = 0;
 	memset(mTickPhaseNs, 0, sizeof(mTickPhaseNs));
 	memset(mTickPhaseMaxNs, 0, sizeof(mTickPhaseMaxNs));
+	memset(mTickSubphaseNs, 0, sizeof(mTickSubphaseNs));
+	memset(mTickSubphaseMaxNs, 0, sizeof(mTickSubphaseMaxNs));
 	mTickGapNs = mTickGapMaxNs = mTickGapCalls = 0;
 	mTickGapOver500us = mTickGapOver1ms = mTickGapOver2ms = 0;
 	mTickLateNs = mTickLateMaxNs = mTickLateCalls = 0;
