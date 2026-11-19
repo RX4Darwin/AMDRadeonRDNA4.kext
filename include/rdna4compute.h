@@ -92,6 +92,9 @@ enum {
 	kRDNA4MethodSubmitGfxIb,
 	/* gfx fence value, timeout milliseconds -> elapsed nanoseconds */
 	kRDNA4MethodWaitGfxFence,
+	/* page-aligned address in the caller's task, bytes, flags (RDNA4_HOST_*) -> handle, GPU VA. The caller's own memory (an
+	 * IOSurface's) wired and mapped into its GPU address space; freed with Free, which unwires it. */
+	kRDNA4MethodImportHost,
 	kRDNA4MethodCount
 };
 

@@ -896,9 +896,12 @@ void RDNA4Compute::releaseHost(RtBuffer &b) {
 		b.hostDma = nullptr;
 	}
 	if (b.hostMemory) {
+		if (b.hostImported)   // the client's own pages, wired by rtImportHost
+			b.hostMemory->complete();
 		b.hostMemory->release();
 		b.hostMemory = nullptr;
 	}
+	b.hostImported = false;
 	b.hostUser = 0;
 	b.host = false;
 }
@@ -2568,6 +2571,44 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
                                    uint64_t flags, uint64_t &handle, uint64_t &gpu,
                                    uint64_t &user) {
 	Locked g(rtLock);
+	IOReturn r = hostChecks(owner, bytes, flags);
+	if (r != kIOReturnSuccess)
+		return r;
+	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithOptions(
+		kernel_task, kIODirectionInOut, rounded, GpuVm::kPageBytes);
+	if (!memory)
+		return kIOReturnNoMemory;
+	IOMemoryMap *map = memory->createMappingInTask(task, 0, kIOMapAnywhere);
+	if (!map) {
+		memory->release();
+		return kIOReturnNoMemory;
+	}
+	return mapHostLocked(owner, memory, map, map->getAddress(), false, bytes, flags, handle, gpu, user);
+}
+
+// A range of the caller's own memory (an IOSurface's, the native Metal device's drawables: docs/native-metal-spike.md) wired and mapped
+// into its GPU address space, as rtAllocHost maps the memory it allocates; unwired when the buffer is freed.
+IOReturn RDNA4Compute::rtImportHost(const void *owner, task_t task, uint64_t address, uint64_t bytes, uint64_t flags,
+                                    uint64_t &handle, uint64_t &gpu) {
+	Locked g(rtLock);
+	IOReturn r = (address & (GpuVm::kPageBytes - 1)) ? kIOReturnBadArgument : hostChecks(owner, bytes, flags);
+	if (r != kIOReturnSuccess)
+		return r;
+	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	IOMemoryDescriptor *memory = IOMemoryDescriptor::withAddressRange(address, rounded, kIODirectionInOut, task);
+	if (!memory)
+		return kIOReturnNoMemory;
+	if ((r = memory->prepare()) != kIOReturnSuccess) {
+		memory->release();
+		return r;
+	}
+	uint64_t user = 0;
+	return mapHostLocked(owner, memory, nullptr, address, true, bytes, flags, handle, gpu, user);
+}
+
+// What a host buffer may be: a client with its own VM and DMA, flags the API knows, the per-buffer, per-client and total limits, a free slot.
+IOReturn RDNA4Compute::hostChecks(const void *owner, uint64_t bytes, uint64_t flags) {
 	const IOReturn state = ownerStateLocked(owner);
 	if (state != kIOReturnSuccess)
 		return state;
@@ -2578,33 +2619,40 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 		return kIOReturnUnsupported;
 	if (!bytes || bytes > kHostMaxBuffer || (flags & ~static_cast<uint64_t>(RDNA4_HOST_EXECUTABLE)))
 		return bytes > kHostMaxBuffer ? kIOReturnNoResources : kIOReturnBadArgument;
-	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) &
-	                         ~(GpuVm::kPageBytes - 1);
-	if (rounded < bytes || rounded > kHostMaxBuffer ||
-	    rounded > kHostMaxClient - c->hostBytes ||
-	    rounded > kHostMaxTotal - hostBytesTotal)
+	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	if (rounded < bytes || rounded > kHostMaxBuffer || rounded > kHostMaxClient - c->hostBytes || rounded > kHostMaxTotal - hostBytesTotal)
 		return kIOReturnNoResources;
 	uint32_t slot = 0;
 	while (slot < bufferCap() && buffers[slot].owner)
 		slot++;
-	if (slot == bufferCap() || clientOverQuota(owner, false))
-		return kIOReturnNoResources;
+	return slot == bufferCap() || clientOverQuota(owner, false) ? kIOReturnNoResources : kIOReturnSuccess;
+}
 
-	IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithOptions(
-		kernel_task, kIODirectionInOut, rounded, GpuVm::kPageBytes);
-	if (!memory)
-		return kIOReturnNoMemory;
-	IOMemoryMap *map = memory->createMappingInTask(task, 0, kIOMapAnywhere);
-	if (!map) {
+// `memory` (wired; `imported`: prepared here, completed when freed) and its user view (`map`, or none for the caller's own range at
+// `userAddress`) into a buffer slot and the client's GPU address space. Takes `memory` and `map` whatever happens.
+IOReturn RDNA4Compute::mapHostLocked(const void *owner, IOMemoryDescriptor *memory, IOMemoryMap *map, uint64_t userAddress, bool imported,
+                                     uint64_t bytes, uint64_t flags, uint64_t &handle, uint64_t &gpu, uint64_t &user) {
+	RtClient *c = vmClientFor(owner);
+	const uint64_t rounded = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
+	uint32_t slot = 0;
+	while (slot < bufferCap() && buffers[slot].owner)
+		slot++;
+	auto drop = [&]() {
+		if (map)
+			map->release();
+		if (imported)
+			memory->complete();
 		memory->release();
-		return kIOReturnNoMemory;
+	};
+	if (!c || slot == bufferCap()) {
+		drop();
+		return kIOReturnNoResources;
 	}
 	const uint64_t pageCount = rounded / GpuVm::kPageBytes;
 	IODMACommand *dma = IODMACommand::withSpecification(
 		kIODMACommandOutputHost64, 48, 0, IODMACommand::kMapped, 0, GpuVm::kPageBytes);
 	if (!dma) {
-		map->release();
-		memory->release();
+		drop();
 		return kIOReturnNoMemory;
 	}
 	const uint64_t segBytes = pageCount * sizeof(IODMACommand::Segment64);
@@ -2638,8 +2686,7 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 		dma->release();
 		if (pageBuses)
 			IOFree(pageBuses, pageCount * sizeof(uint64_t));
-		map->release();
-		memory->release();
+		drop();
 		return kIOReturnNoResources;
 	}
 
@@ -2652,9 +2699,10 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 	b.gen = generation;
 	b.host = true;
 	b.hostMemory = memory;
+	b.hostImported = imported;
 	b.hostDma = dma;
 	b.hostMap = map;
-	b.hostUser = map->getAddress();
+	b.hostUser = userAddress;
 	if (!b.hostUser || !b.va ||
 	    b.va + rounded < b.va || b.va + rounded > GpuVm::kVaEnd ||
 	    !vmMapHost(*c, b.va, pageBuses, rounded,
@@ -2683,8 +2731,8 @@ IOReturn RDNA4Compute::rtAllocHost(const void *owner, task_t task, uint64_t byte
 	handle = makeHandle(slot, b.gen);
 	gpu = b.va;
 	user = b.hostUser;
-	RLOG("vmid %u: host buffer %llu bytes mapped at GPU VA 0x%llx, user 0x%llx, %llu pages",
-	     c->vmid, bytes, b.va, b.hostUser, pageCount);
+	RLOG("vmid %u: host buffer %llu bytes %s at GPU VA 0x%llx, user 0x%llx, %llu pages",
+	     c->vmid, bytes, imported ? "imported from the client and mapped" : "mapped", b.va, b.hostUser, pageCount);
 	return kIOReturnSuccess;
 }
 

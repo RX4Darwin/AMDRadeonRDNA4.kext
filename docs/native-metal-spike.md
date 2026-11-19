@@ -207,6 +207,20 @@ Metal's own compiler makes libraries for this device: `_MTLDevice` (which the de
 **Gate 7 PASSED on the rig, 2026-11-19**: `mtlprobe nativesrc` compiles a kernel from Metal source for the device, makes its pipeline and
 runs it: 0 of 256 wrong, as a user that is not root.
 
+## Gate 9: on the screen
+
+- The kext maps a page-aligned range of the client's **own** memory into its GPU address space (`kRDNA4MethodImportHost`,
+  `rdna4_import_host`, `RDNA4Compute::rtImportHost`: wired with `IOMemoryDescriptor::withAddressRange` + `prepare`, unwired when the
+  buffer is freed; the host-buffer limits apply), sharing the mapping code with `rtAllocHost` (`mapHostLocked`).
+- The device: `newBufferWithBytesNoCopy:length:options:deallocator:` and `newTextureWithDescriptor:iosurface:plane:` (one plane of
+  RGBA8 / BGRA8, rows a multiple of 256 bytes so far) over such imported memory; `CAMetalLayer`'s drawables are such textures. A command
+  buffer presents its drawables (`presentDrawable:`) once its work has run.
+- `NativeWin.app` (`mtlprobe nativewin` in a bundle whose `LSEnvironment` sets `RDNA4_NATIVE_MTL=1`, started with `open`): a window
+  whose `CAMetalLayer` uses `RDNA4MTLDevice`, its shaders compiled from source, the colour triangle drawn each frame.
+
+**Gate 9 PASSED on the rig, 2026-11-19**: 1207 frames in 20 s (60 a second), none failed, as the logged-in user; the frame grab shows
+the window with the triangle on the desktop, composited by WindowServer (still on the paravirtual GPU) beside everything else.
+
 Next gates: a real queue (command buffers submitted as IBs with fences, completion on a thread, VRAM and private storage, blits); then
 IOSurface textures and `CAMetalLayer` drawables (a Metal app on the native device shown on the screen while WindowServer stays on the
 paravirtual GPU); then the device for every app (no `RDNA4_NATIVE_MTL`) once it answers what ordinary apps ask.

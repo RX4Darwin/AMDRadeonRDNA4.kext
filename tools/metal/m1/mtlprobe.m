@@ -9,6 +9,7 @@
 //   mtlprobe mix       out[i] = 3 * in[i] + 100000 * group + 1000 * thread in group + group size over 100 threads in groups of 32 (the
 //                      last group has 4, and Metal reports 4 as its size); a kernel that is not in the kext's table: it runs only if
 //                      translated at run time
+//   mtlprobe nativewin [S]  a window whose CAMetalLayer draws on our own device for S seconds (10): the colour triangle each frame
 //   mtlprobe nativesrc a kernel compiled from source (Metal's own compiler) on our own device, run and checked (as native)
 //   mtlprobe dualsrc   dual-source blending: every pixel of a quad whose colour and second source depend on its parity, checked
 //   mtlprobe devices   every Metal device MTLCopyAllDevices returns, its class and registry ID (docs/native-metal-spike.md)
@@ -2520,6 +2521,89 @@ int main(int argc, char **argv) {
 			    rb.error ? ", " : "", rb.error ? rb.error.localizedDescription.UTF8String : "");
 			const BOOL raysOk = nativeRays(d, lib);
 			return computeOk && renderOk && raysOk ? 0 : 1;
+		}
+		if (!strcmp(mode, "nativewin")) {   // the native-Metal spike's gate 9: a CAMetalLayer on our own device, on the screen
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			if (!d) {
+				OUT("nativewin: FAIL: no RDNA4MTLDevice");
+				return 1;
+			}
+			const double seconds = argc > 2 ? atof(argv[2]) : 10;
+			NSError *err = nil;
+			id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+			                                              "struct TriOut { float4 position [[position]]; float4 colour; };\n"
+			                                              "vertex TriOut tri_v(uint vid [[vertex_id]], device const float2 *pos [[buffer(0)]],"
+			                                              " device const float4 *colour [[buffer(1)]]) { TriOut o; o.position = float4(pos[vid], 0, 1);"
+			                                              " o.colour = colour[vid]; return o; }\n"
+			                                              "fragment float4 tri_f(TriOut in [[stage_in]]) { return in.colour; }"
+			                                     options:nil
+			                                       error:&err];
+			MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+			rd.vertexFunction = [lib newFunctionWithName:@"tri_v"];
+			rd.fragmentFunction = [lib newFunctionWithName:@"tri_f"];
+			rd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+			id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:rd error:&err] : nil;
+			if (!ps) {
+				OUT("nativewin: FAIL: %s", err.localizedDescription.UTF8String);
+				return 1;
+			}
+			[NSApplication sharedApplication];
+			[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+			NSWindow *w = [[NSWindow alloc] initWithContentRect:NSMakeRect(160, 160, 512, 512) styleMask:NSWindowStyleMaskTitled
+			                                            backing:NSBackingStoreBuffered defer:NO];
+			w.title = @"mtlprobe nativewin: RDNA4MTLDevice";
+			CAMetalLayer *layer = [CAMetalLayer layer];
+			layer.device = d;
+			layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+			w.contentView.wantsLayer = YES;
+			w.contentView.layer = layer;
+			[w makeKeyAndOrderFront:nil];
+			[NSApp activateIgnoringOtherApps:YES];
+			id<MTLCommandQueue> q = [d newCommandQueue];
+			const float pos[6] = { -0.5f, 0.5f, 0.5f, 0.5f, 0, -0.5f };
+			const float col[12] = { 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1 };
+			NSDate *start = [NSDate date];
+			int frames = 0, failed = 0;
+			while (-[start timeIntervalSinceNow] < seconds) {
+				@autoreleasepool {
+					NSEvent *ev;
+					while ((ev = [NSApp nextEventMatchingMask:NSEventMaskAny untilDate:nil inMode:NSDefaultRunLoopMode dequeue:YES]))
+						[NSApp sendEvent:ev];
+					const CGSize size = layer.drawableSize;
+					id<CAMetalDrawable> dr = [layer nextDrawable];
+					if (!dr) {
+						usleep(5000);
+						continue;
+					}
+					const double t = -[start timeIntervalSinceNow];
+					MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+					rp.colorAttachments[0].texture = dr.texture;
+					rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+					rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+					rp.colorAttachments[0].clearColor = MTLClearColorMake(0.1, 0.1 + 0.1 * sin(t), 0.25, 1);
+					id<MTLCommandBuffer> cb = [q commandBuffer];
+					id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+					[re setRenderPipelineState:ps];
+					[re setVertexBytes:pos length:sizeof pos atIndex:0];
+					[re setVertexBytes:col length:sizeof col atIndex:1];
+					[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+					[re endEncoding];
+					[cb presentDrawable:dr];
+					[cb commit];
+					[cb waitUntilCompleted];
+					failed += cb.status != MTLCommandBufferStatusCompleted;
+					if (!frames++)
+						OUT("nativewin: first frame: drawable %.0fx%.0f, texture %s %lux%lu, status %ld%s%s", size.width, size.height,
+						    NSStringFromClass([(id)dr.texture class]).UTF8String, (unsigned long)dr.texture.width, (unsigned long)dr.texture.height,
+						    (long)cb.status, cb.error ? ": " : "", cb.error ? cb.error.localizedDescription.UTF8String : "");
+				}
+			}
+			OUT("nativewin: %s: %d frames in %.1f s (%.1f a second), %d failed", frames && !failed ? "PASS (check the window)" : "FAIL", frames,
+			    -[start timeIntervalSinceNow], frames / -[start timeIntervalSinceNow], failed);
+			return failed || !frames;
 		}
 		if (!strcmp(mode, "nativesrc")) {   // the native-Metal spike's gate 7: does Metal's own compiler make a library for RDNA4MTLDevice?
 			id<MTLDevice> d = nil;

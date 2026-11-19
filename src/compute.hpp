@@ -735,6 +735,8 @@ public:
 	                     uint64_t &handle, uint64_t &gpu, uint64_t &user);
 	// Pages that are not the runtime's (the paravirtual host's guest memory, pvgpu.cpp) at a fresh GPU VA of the client, by bus address; rtFree
 	// unmaps them. The caller keeps the pages alive meanwhile.
+	// A page-aligned range of the client's own memory into its GPU address space (an IOSurface's: the native Metal device's drawables).
+	IOReturn rtImportHost(const void *owner, task_t task, uint64_t address, uint64_t bytes, uint64_t flags, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtMapPages(const void *owner, const uint64_t *pageBuses, uint64_t pages, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtFree(const void *owner, uint64_t handle);
 	IOReturn rtMapVram(const void *owner, uint64_t barPhys, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
@@ -847,7 +849,8 @@ private:
 		bool        host { false };
 		bool        foreign { false };         // VRAM that is not the runtime's (rtMapVram): only the VA is given back
 		bool        mapped { false };          // rtMapPages: pages the runtime did not allocate, not counted in the host quota
-		IOBufferMemoryDescriptor *hostMemory { nullptr };
+		IOMemoryDescriptor *hostMemory { nullptr };
+		bool        hostImported { false };   // rtImportHost: the client's own range, prepared (wired) here
 		IODMACommand *hostDma { nullptr };
 		IOMemoryMap *hostMap { nullptr };
 		uint64_t    hostUser { 0 };
@@ -1107,6 +1110,9 @@ private:
 	bool vmInvalidateOwned(RtClient &c, const char *tag);
 	void logClientFault(RtClient &client, const char *tag);
 	void scrubFaultPage();
+	IOReturn hostChecks(const void *owner, uint64_t bytes, uint64_t flags);
+	IOReturn mapHostLocked(const void *owner, IOMemoryDescriptor *memory, IOMemoryMap *map, uint64_t userAddress, bool imported, uint64_t bytes,
+	                       uint64_t flags, uint64_t &handle, uint64_t &gpu, uint64_t &user);
 	void releaseHost(RtBuffer &buffer);
 	void leakHost(RtBuffer &buffer);
 	void retireIbFences(RtClient &client);

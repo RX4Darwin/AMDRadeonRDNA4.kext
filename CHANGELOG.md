@@ -11,6 +11,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
   2026-11-19): the native device's compute, render and ray-query checks pass as a normal user; `rdna4-run sensors` is refused.
 - Libraries from Metal source on the native device: Metal's own compiler makes them, and the device translates their AIR. Card
   (2026-11-19): `mtlprobe nativesrc` compiles a kernel from source and runs it, all right.
+- On the screen: an app's window drawn by the native device through `CAMetalLayer`. The kext maps an app's own memory (its
+  IOSurfaces, `newBufferWithBytesNoCopy:`) into its GPU address space (`rdna4_import_host`). Card (2026-11-19): `mtlprobe
+  nativewin` draws a window at 60 frames a second, composited by WindowServer beside the rest of the desktop.
 
 ## 0.3.3 (2026-11-19)
 

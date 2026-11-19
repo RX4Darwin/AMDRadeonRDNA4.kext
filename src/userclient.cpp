@@ -144,8 +144,9 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sSensorsEx,  0,          0,                          0,           sizeof(RDNA4SensorsEx) },
 	{ sSubmitGfxIb, 3,         0,                          1,           0 },
 	{ sWaitGfxFence, 2,        0,                          1,           0 },
+	{ sImportHost, 3,          0,                          2,           0 },
 };
-static_assert(kRDNA4MethodCount == 22, "kMethods has one entry per selector");
+static_assert(kRDNA4MethodCount == 23, "kMethods has one entry per selector");
 
 // What a client that is not root may call: its own buffers, programs and submissions. Not the display (present, restore, vblank), the
 // sensors, the sleep test or the quiesce.
@@ -153,7 +154,7 @@ static constexpr uint32_t kLocalSelectors = 1u << kRDNA4MethodInfo | 1u << kRDNA
                                             1u << kRDNA4MethodWrite | 1u << kRDNA4MethodRead | 1u << kRDNA4MethodLoad |
                                             1u << kRDNA4MethodUnload | 1u << kRDNA4MethodDispatch | 1u << kRDNA4MethodAllocHost |
                                             1u << kRDNA4MethodSubmitIb | 1u << kRDNA4MethodWaitFence |
-                                            1u << kRDNA4MethodSubmitGfxIb | 1u << kRDNA4MethodWaitGfxFence;
+                                            1u << kRDNA4MethodSubmitGfxIb | 1u << kRDNA4MethodWaitGfxFence | 1u << kRDNA4MethodImportHost;
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                                             IOExternalMethodDispatch *, OSObject *, void *) {
@@ -299,6 +300,11 @@ IOReturn RDNA4ComputeClient::sWaitFence(OSObject *t, void *, IOExternalMethodArg
 IOReturn RDNA4ComputeClient::sSubmitGfxIb(OSObject *t, void *, IOExternalMethodArguments *a) {
 	return self(t)->compute->rtSubmitGfxIb(t, a->scalarInput[0], a->scalarInput[1],
 	                                       a->scalarInput[2], a->scalarOutput[0]);
+}
+
+IOReturn RDNA4ComputeClient::sImportHost(OSObject *t, void *, IOExternalMethodArguments *a) {
+	return self(t)->compute->rtImportHost(t, self(t)->task, a->scalarInput[0], a->scalarInput[1], a->scalarInput[2], a->scalarOutput[0],
+	                                      a->scalarOutput[1]);
 }
 
 IOReturn RDNA4ComputeClient::sWaitGfxFence(OSObject *t, void *, IOExternalMethodArguments *a) {

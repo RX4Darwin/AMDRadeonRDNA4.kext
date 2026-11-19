@@ -32,6 +32,9 @@
  * Gate 7: libraries from source. Metal's own compiler makes them for this device (_MTLDevice's newLibraryWithSource: and the rest, not
  * overridden): their functions (_MTLFunctionInternal) give their AIR as -bitcodeData, which the translator takes as it takes a metallib.
  *
+ * Gate 9: on the screen. IOSurfaces (CAMetalLayer's drawables) and newBufferWithBytesNoCopy: memory are the app's own pages, mapped into
+ * its GPU address space by the kext (rdna4_import_host); a command buffer presents its drawables once its work has run.
+ *
  * Gate 5: ray queries. Acceleration structures of triangle geometry are the device's own format (a stackless BVH, built by the CPU
  * as a command buffer's step, below); a kernel's intersect is translated into tools/metal/m3/rtlib.c's traversal of it.
  * ponytail: primitive structures only (no instances), no refit, compaction, masks, cull modes or intersection functions.
@@ -42,6 +45,8 @@
 
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
+#import <IOSurface/IOSurface.h>
+#import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 
@@ -131,6 +136,9 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 
 @interface RDNA4MTLBuffer : NSObject <MTLBuffer>
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device length:(NSUInteger)length options:(MTLResourceOptions)options;
+// The caller's own page-aligned memory (newBufferWithBytesNoCopy:, an IOSurface's), mapped into the GPU (rdna4_import_host), not copied.
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device bytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options
+                   deallocator:(void (^)(void *, NSUInteger))deallocator;
 @end
 
 @implementation RDNA4MTLBuffer {
@@ -139,8 +147,28 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 	void *_cpu;
 	NSUInteger _length;
 	MTLResourceOptions _options;
+	void (^_deallocator)(void *, NSUInteger);   // an imported buffer's owner's
 }
 @synthesize label;
+
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device bytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options
+                   deallocator:(void (^)(void *, NSUInteger))deallocator
+{
+	if (!(self = [super init]) || !device.gpu)
+		return nil;
+	const uint64_t bytes = ((length ?: 1) + 4095) & ~4095ull;
+	const kern_return_t kr = ((uintptr_t)pointer & 4095) ? kIOReturnBadArgument : rdna4_import_host(device.gpu, pointer, bytes, 0, &_buf);
+	if (kr) {
+		rdna4Error([NSString stringWithFormat:@"%lu bytes at %p into the GPU", (unsigned long)length, pointer], kr);
+		return nil;
+	}
+	_cpu = pointer;
+	_device = device;
+	_length = length;
+	_options = options;
+	_deallocator = deallocator;
+	return self;
+}
 
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device length:(NSUInteger)length options:(MTLResourceOptions)options
 {
@@ -161,7 +189,9 @@ static NSError *rdna4Error(NSString *what, kern_return_t kr)
 - (void)dealloc
 {
 	if (_cpu)
-		rdna4_free(_device.gpu, &_buf);
+		rdna4_free(_device.gpu, &_buf);   // an imported range unmapped and unwired, not freed
+	if (_deallocator)
+		_deallocator(_cpu, _length);
 }
 
 - (id<MTLDevice>)device { return _device; }
@@ -190,6 +220,9 @@ static BOOL isBgra(MTLPixelFormat f) { return f == MTLPixelFormatBGRA8Unorm || f
 
 @interface RDNA4MTLTexture : NSObject <MTLTexture>
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)descriptor;
+// Over an IOSurface (CAMetalLayer's drawables): its memory mapped into the GPU, its rows as the surface has them.
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface
+                         plane:(NSUInteger)plane;
 - (void)clearTo:(MTLClearColor)colour;
 @property (readonly) uint64_t gpuBase;    // the first row's GPU address (page aligned)
 @property (readonly) NSUInteger rowBytes; // a multiple of 256
@@ -201,8 +234,40 @@ static BOOL isBgra(MTLPixelFormat f) { return f == MTLPixelFormatBGRA8Unorm || f
 	NSUInteger _width, _height;
 	MTLPixelFormat _format;
 	MTLTextureUsage _usage;
+	IOSurfaceRef _surface;
 }
 @synthesize label;
+
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
+{
+	if (!(self = [super init]))
+		return nil;
+	const size_t bpr = IOSurfaceGetBytesPerRow(surface), bytes = IOSurfaceGetAllocSize(surface);
+	void *base = IOSurfaceGetBaseAddress(surface);
+	if (plane || IOSurfaceGetPlaneCount(surface) > 1 || !isColourFormat(d.pixelFormat) || IOSurfaceGetBytesPerElement(surface) != 4 ||
+	    !d.width || !d.height || d.width > IOSurfaceGetWidth(surface) || d.height > IOSurfaceGetHeight(surface) || (bpr & 255)) {
+		rdna4Error([NSString stringWithFormat:@"an IOSurface texture of format %lu, %lux%lu, %zu bytes a row (plane %lu): only one plane of "
+		                                      @"RGBA8 / BGRA8, rows a multiple of 256 bytes, so far", (unsigned long)d.pixelFormat,
+		                                      (unsigned long)d.width, (unsigned long)d.height, bpr, (unsigned long)plane], 0);
+		return nil;
+	}
+	CFRetain(surface);
+	_memory = [[RDNA4MTLBuffer alloc] initWithDevice:device bytesNoCopy:base length:bytes options:MTLResourceStorageModeShared
+	                                     deallocator:^(void *p, NSUInteger n) { CFRelease(surface); }];
+	if (!_memory)
+		return nil;
+	_surface = surface;
+	_rowBytes = bpr;
+	_device = device;
+	_width = d.width;
+	_height = d.height;
+	_format = d.pixelFormat;
+	_usage = d.usage;
+	return self;
+}
+
+- (IOSurfaceRef)iosurface { return _surface; }
+- (NSUInteger)iosurfacePlane { return 0; }
 
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)d
 {
@@ -969,6 +1034,7 @@ RDNA4_ANSWER_MISSING
 	RDNA4MTLCommandQueue *_queue;
 	NSMutableArray<RDNA4Op> *_ops;
 	NSMutableArray<MTLCommandBufferHandler> *_completed, *_scheduled;
+	NSMutableArray<id<MTLDrawable>> *_drawables;   // presented once the commit has run
 	MTLCommandBufferStatus _status;
 	NSError *_error;
 }
@@ -981,11 +1047,14 @@ RDNA4_ANSWER_MISSING
 		_ops = [NSMutableArray array];
 		_completed = [NSMutableArray array];
 		_scheduled = [NSMutableArray array];
+		_drawables = [NSMutableArray array];
 	}
 	return self;
 }
 
 - (id<MTLDevice>)device { return _queue.device; }
+- (void)presentDrawable:(id<MTLDrawable>)drawable { [_drawables addObject:drawable]; }
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time { [_drawables addObject:drawable]; }
 - (id<MTLCommandQueue>)commandQueue { return _queue; }
 - (MTLCommandBufferStatus)status { return _status; }
 - (NSError *)error { return _error; }
@@ -1026,6 +1095,9 @@ RDNA4_ANSWER_MISSING
 		if ((_error = op()))
 			break;
 	[_ops removeAllObjects];
+	for (id<MTLDrawable> d in _drawables)   // the GPU's work for them is done (synchronous commit)
+		[d present];
+	[_drawables removeAllObjects];
 	_status = _error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
 	for (MTLCommandBufferHandler h in _completed)
 		h(self);
@@ -1316,6 +1388,17 @@ enum { kMiscBytes = 0x2000 };   // the state page: the stream's fence at +0, the
 - (id<MTLAccelerationStructure>)newAccelerationStructureWithDescriptor:(MTLAccelerationStructureDescriptor *)d
 {
 	return [self newAccelerationStructureWithSize:[self accelerationStructureSizesWithDescriptor:d].accelerationStructureSize];
+}
+
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
+{
+	return [[RDNA4MTLTexture alloc] initWithDevice:self descriptor:descriptor iosurface:surface plane:plane];
+}
+
+- (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options
+                              deallocator:(void (^)(void *, NSUInteger))deallocator
+{
+	return [[RDNA4MTLBuffer alloc] initWithDevice:self bytesNoCopy:pointer length:length options:options deallocator:deallocator];
 }
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
