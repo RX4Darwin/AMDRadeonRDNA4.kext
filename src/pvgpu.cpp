@@ -8921,7 +8921,6 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		       mTickPhaseNs[0] / mTickCalls / 1000, mTickPhaseMaxNs[0] / 1000, mTickPhaseNs[1] / mTickCalls / 1000, mTickPhaseMaxNs[1] / 1000,
 		       mTickPhaseNs[2] / mTickCalls / 1000, mTickPhaseMaxNs[2] / 1000, mTickPhaseNs[3] / mTickCalls / 1000, mTickPhaseMaxNs[3] / 1000,
 		       mTickPhaseNs[4] / mTickCalls / 1000, mTickPhaseMaxNs[4] / 1000, mTickPhaseNs[5] / mTickCalls / 1000, mTickPhaseMaxNs[5] / 1000);
-	}
 		pvstat("host: render:   tick detail avg/max us: registers %llu/%llu, root map %llu/%llu, FIFO %llu/%llu",
 		       mTickSubphaseNs[0] / mTickCalls / 1000, mTickSubphaseMaxNs[0] / 1000,
 		       mTickSubphaseNs[1] / mTickCalls / 1000, mTickSubphaseMaxNs[1] / 1000,
