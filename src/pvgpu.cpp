@@ -3346,16 +3346,29 @@ bool PvScanout::copySurface(uint32_t sid, uint8_t *dst, uint32_t pitch, uint32_t
 	void *s = retainSurface(sid);
 	IOMemoryDescriptor *md = s ? gSurfaceFns.memory(s) : nullptr;
 	bool ok = false;
-	if (md) {
+	if (md && dst) {
 		const uint64_t base = gSurfaceFns.baseOffset(s), bpr = gSurfaceFns.bytesPerRow(s);
-		if (bpr) {
+		const uint32_t surfaceHeight = gSurfaceFns.height(s);
+		if (bpr && surfaceHeight) {
 			width = width < bpr / 4 ? width : static_cast<uint32_t>(bpr / 4);
-			height = height < gSurfaceFns.height(s) ? height : gSurfaceFns.height(s);
+			height = height < surfaceHeight ? height : surfaceHeight;
 		}
-		if (bpr && width && height && base + bpr * height <= md->getLength() && md->prepare() == kIOReturnSuccess) {
+		const uint64_t rowBytes = 4ull * width;
+		const uint64_t length = md->getLength();
+		// Validate with subtraction/division so a malformed descriptor cannot wrap base + bpr * height.
+		const bool rangeFits = bpr && width && height && pitch >= rowBytes && base <= length &&
+		                       bpr <= (length - base) / height;
+		if (rangeFits && md->prepare() == kIOReturnSuccess) {
 			ok = true;
-			for (uint32_t y = 0; y < height && ok; y++)
-				ok = md->readBytes(base + bpr * y, dst + static_cast<uint64_t>(pitch) * y, 4ull * width) == 4ull * width;
+			// The common case is tightly packed BGRA: one descriptor transfer instead of one call per scanline.
+			// Cropped or padded rows still use the stride-aware path below.
+			if (pitch == bpr && rowBytes == bpr) {
+				const uint64_t bytes = rowBytes * height;
+				ok = md->readBytes(base, dst, bytes) == bytes;
+			} else {
+				for (uint32_t y = 0; y < height && ok; y++)
+					ok = md->readBytes(base + bpr * y, dst + static_cast<uint64_t>(pitch) * y, rowBytes) == rowBytes;
+			}
 			md->complete();
 		}
 	}
