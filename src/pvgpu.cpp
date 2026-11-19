@@ -883,6 +883,8 @@ private:
 	// Time spent inside the 250 us host timer callback, which also services display events.
 	uint64_t mTickNs { 0 }, mTickMaxNs { 0 }, mTickCalls { 0 }, mTickOver250us { 0 }, mTickOver1ms { 0 };
 	uint64_t mTickPhaseNs[6] {}, mTickPhaseMaxNs[6] {};   // IRQ/late, guest FIFO, pipelines, channels+submit, display, finish
+	uint64_t mTickLastAt { 0 }, mTickGapNs { 0 }, mTickGapMaxNs { 0 }, mTickGapCalls { 0 };
+	uint64_t mTickGapOver500us { 0 }, mTickGapOver1ms { 0 }, mTickGapOver2ms { 0 };
 	uint64_t mPhaseNs[6] {};            // of those: textures in, target in and submit, the card, target out and the rest; the pipeline and
 	                                     // its shaders, the target and the buffers
 	uint64_t mMapNs { 0 };              // mapPages' share
@@ -1530,6 +1532,19 @@ void RDNA4PvHost::tick() {
 		return;
 	}
 	const uint64_t tickAt = nowNs();
+	if (mTickLastAt) {
+		const uint64_t gapNs = tickAt - mTickLastAt;
+		mTickGapCalls++;
+		mTickGapNs += gapNs;
+		mTickGapMaxNs = gapNs > mTickGapMaxNs ? gapNs : mTickGapMaxNs;
+		if (gapNs >= 500000)
+			mTickGapOver500us++;
+		if (gapNs >= 1000000)
+			mTickGapOver1ms++;
+		if (gapNs >= 2000000)
+			mTickGapOver2ms++;
+	}
+	mTickLastAt = tickAt;
 	if (mTicks++ < 3)
 		pvlog("host: tick %llu", mTicks);
 	if (mTicks == 1)
@@ -9080,6 +9095,10 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		       mTickPhaseNs[2] / mTickCalls / 1000, mTickPhaseMaxNs[2] / 1000, mTickPhaseNs[3] / mTickCalls / 1000, mTickPhaseMaxNs[3] / 1000,
 		       mTickPhaseNs[4] / mTickCalls / 1000, mTickPhaseMaxNs[4] / 1000, mTickPhaseNs[5] / mTickCalls / 1000, mTickPhaseMaxNs[5] / 1000);
 	}
+	if (mTickGapCalls)
+		pvstat("host: render:   tick start gaps %llu, average %llu us, max %llu us, >=500 us %llu, >=1 ms %llu, >=2 ms %llu",
+		       mTickGapCalls, mTickGapNs / mTickGapCalls / 1000, mTickGapMaxNs / 1000, mTickGapOver500us, mTickGapOver1ms, mTickGapOver2ms);
+	}
 	pvstat("host: render:   %u textures in place, %u copied, mapping %llu ms (%u new, %llu pages), rows %llu ms (%llu KiB, %u copies reused); "
 	      "shadows: %u made, %u freed, %llu MiB; stale %u dropped, %u old, %u locked, %u rewritten", mInPlace, mCopied, mMapNs / 1000000, mMapMisses, mMapPages, mCopyNs / 1000000, mCopiedBytes >> 10,
 	      mCopiesReused, mShadowsMade, mShadowsFreed, mShadowBytes >> 20, mStale[0], mStale[1], mStale[2], mStale[3]);
@@ -9225,6 +9244,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mTickNs = mTickMaxNs = mTickCalls = mTickOver250us = mTickOver1ms = 0;
 	memset(mTickPhaseNs, 0, sizeof(mTickPhaseNs));
 	memset(mTickPhaseMaxNs, 0, sizeof(mTickPhaseMaxNs));
+	mTickGapNs = mTickGapMaxNs = mTickGapCalls = 0;
+	mTickGapOver500us = mTickGapOver1ms = mTickGapOver2ms = 0;
 }
 
 void RDNA4PvHost::pollDisplay() {
