@@ -151,7 +151,7 @@ How Tahoe's WindowServer decides (x86_64, read from CoreDisplay and SkyLight, 20
   `dcn401_resource.c` `max_cursor_size = 64`, cursor cache 64x64x8 bytes; 128x128 would need MALL). So the host announces 128 and
   crops each image to what it covers (alpha above 0, the hot spot included): the arrow, 2x, fits.
 - The two displays get different images (2x, 1x): each pipe has its own sprite slot and hot spot (`cursor.cpp` `cursorSlot`).
-- Not yet seen by eye (the cursor plane is in no screen capture): `rdna4-pvcursor=1` stays default off until it is.
+- Seen by eye (Sunneva, 2026-11-19): one arrow per display, right, and the box around the pointer in Safari is gone.
 
 ## Gate 5: ray queries (acceleration structures)
 

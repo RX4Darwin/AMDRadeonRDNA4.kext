@@ -24,7 +24,7 @@ otherwise). The newest version is on top. How versions and branches work is in `
   moves (the lines along a box around the pointer over Tahoe's glass in Safari). HiDPI displays too: the host announces
   a 128-pixel cursor and crops each image to what it covers, as DCN 4.01's plane holds 64x64. Card (2026-11-19):
   WindowServer reports a hardware cursor, with a HiDPI and a 1x display, and moving the pointer no longer makes it
-  redraw (about 15 frames in 5 s instead of about 250); not yet looked at by eye.
+  redraw (about 15 frames in 5 s instead of about 250); one arrow on each display, and the box in Safari is gone.
 
 **Native Metal (spike, `docs/native-metal-spike.md`)**
 - First step towards our own Metal driver beside the paravirtual one (needed for ray tracing and a hardware cursor, which
