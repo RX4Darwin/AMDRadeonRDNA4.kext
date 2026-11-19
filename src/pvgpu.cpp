@@ -885,6 +885,9 @@ private:
 	// Time spent inside rtSubmitGfxIb itself, separate from explicit retry delays.
 	uint64_t mSubmitRuntimeNs { 0 }, mSubmitRuntimeMaxNs { 0 }, mSubmitRuntimeCalls { 0 };
 	uint64_t mSubmitRuntimeOver250us { 0 }, mSubmitRuntimeOver1ms { 0 };
+	// Fence waits are distinct from submit retries: they measure GPU completion back-pressure.
+	uint64_t mFenceWaitNs { 0 }, mFenceWaitMaxNs { 0 }, mFenceWaitCalls { 0 }, mFenceWaitFailures { 0 };
+	uint64_t mFenceBatchWaitNs { 0 }, mFenceOldestWaitNs { 0 };
 	uint32_t mSubmitBusyMaxRetries { 0 }, mSubmitNotReadyMaxMs { 0 };
 	uint32_t mSubmitBusyExhausted { 0 }, mSubmitNotReadyExhausted { 0 }, mSubmitFailed { 0 };
 	// Time spent inside the 250 us host timer callback, which also services display events.
@@ -2473,9 +2476,16 @@ void RDNA4PvHost::waitDraws(uint32_t line)
 
 	const uint64_t from = nowNs();
 	const IOReturn r = waitFence(mLastFence, kBatchWait, ns);
+	const uint64_t waited = nowNs() - from;
+	mFenceWaitCalls++;
+	mFenceWaitNs += waited;
+	mFenceBatchWaitNs += waited;
+	mFenceWaitMaxNs = waited > mFenceWaitMaxNs ? waited : mFenceWaitMaxNs;
+	if (r != kIOReturnSuccess)
+		mFenceWaitFailures++;
 
 	noteWait(line);
-	mPhaseNs[2] += nowNs() - from;
+	mPhaseNs[2] += waited;
 
 	if (r != kIOReturnSuccess && mGfxHangLines++ < 12) {
 		pvstat("host: render: %u draws in flight did not finish (fence %llu): 0x%x; the last ones submitted:", mPending,
@@ -2593,9 +2603,16 @@ void RDNA4PvHost::waitFor(uint64_t fence, uint32_t line)
 	uint64_t ns = 0;
 	const uint64_t from = nowNs();
 	const IOReturn r = waitFence(fence, kOldestWait, ns);
+	const uint64_t waited = nowNs() - from;
+	mFenceWaitCalls++;
+	mFenceWaitNs += waited;
+	mFenceOldestWaitNs += waited;
+	mFenceWaitMaxNs = waited > mFenceWaitMaxNs ? waited : mFenceWaitMaxNs;
+	if (r != kIOReturnSuccess)
+		mFenceWaitFailures++;
 
 	noteWait(line);
-	mPhaseNs[2] += nowNs() - from;
+	mPhaseNs[2] += waited;
 
 	if (r != kIOReturnSuccess) {   // a hang: ended (and told) by waiting for all of them
 		waitDraws(line);
@@ -9150,6 +9167,10 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		pvstat("host: render:   runtime submit calls %llu, average %llu us, max %llu us, >=250 us %llu, >=1 ms %llu",
 		       mSubmitRuntimeCalls, mSubmitRuntimeNs / mSubmitRuntimeCalls / 1000, mSubmitRuntimeMaxNs / 1000,
 		       mSubmitRuntimeOver250us, mSubmitRuntimeOver1ms);
+	if (mFenceWaitCalls)
+		pvstat("host: render:   fence waits %llu, average %llu us, max %llu us, failures %llu (batch %llu ms, oldest %llu ms)",
+		       mFenceWaitCalls, mFenceWaitNs / mFenceWaitCalls / 1000, mFenceWaitMaxNs / 1000, mFenceWaitFailures,
+		       mFenceBatchWaitNs / 1000000, mFenceOldestWaitNs / 1000000);
 	if (mSubmitBusyExhausted || mSubmitNotReadyExhausted || mSubmitFailed)
 		pvstat("host: render:   GPU submit failures: busy timeout %u, ring not-ready timeout %u, other errors %u",
 		       mSubmitBusyExhausted, mSubmitNotReadyExhausted, mSubmitFailed);
@@ -9313,6 +9334,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mSubmitBusyWaitMaxNs = mSubmitNotReadyWaitMaxNs = 0;
 	mSubmitRuntimeNs = mSubmitRuntimeMaxNs = mSubmitRuntimeCalls = 0;
 	mSubmitRuntimeOver250us = mSubmitRuntimeOver1ms = 0;
+	mFenceWaitNs = mFenceWaitMaxNs = mFenceWaitCalls = mFenceWaitFailures = 0;
+	mFenceBatchWaitNs = mFenceOldestWaitNs = 0;
 	mSubmitBusyMaxRetries = mSubmitNotReadyMaxMs = 0;
 	mSubmitBusyExhausted = mSubmitNotReadyExhausted = mSubmitFailed = 0;
 	mTickNs = mTickMaxNs = mTickCalls = mTickOver250us = mTickOver1ms = 0;
