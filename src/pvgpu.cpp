@@ -1161,8 +1161,9 @@ static int texSysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_debug, OID_AUTO, rdna4_pvtex, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, texSysctl, "S",
 	    "AMDRadeonRDNA4: a guest texture's pixels");
 
-// debug.rdna4_pvframe: the next frame presented on port debug.rdna4_pvframeport as WindowServer composed it, at half size: {u32 width,
-// u32 height}, then BGRA rows. The scanout (rdna4_pvshot) changes while it is read; this is copied by the card with the frame.
+// debug.rdna4_pvframe: the next frame presented on port debug.rdna4_pvframeport as WindowServer composed it, at half size (every
+// other pixel; the port + 256: at full size, to look at single pixels: text): {u32 width, u32 height}, then BGRA rows. The scanout
+// (rdna4_pvshot) changes while it is read; this is copied by the card with the frame.
 static int gFramePort;
 
 SYSCTL_INT(_debug, OID_AUTO, rdna4_pvframeport, CTLFLAG_RW | CTLFLAG_LOCKED, &gFramePort, 0,
@@ -6278,7 +6279,8 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint32_t outs = vs ? vs[7] : 0, ins = ps ? ps[7] & 0xffff : 0;
 	const bool noColour = ps && ps[7] >> 31;   // the fragment shader writes no colour (air2amdgpu.cpp: textures, say)
 	// dual-source blending (air2amdgpu.cpp, bit 18: the colour and its [[color(0), index(1)]] to the dual-source targets; Sublime Text's
-	// subpixel text blends with Source1Color): both exports in the colour's format, DISABLE_DUAL_QUAD, no SX blend optimisation (RADV's)
+	// subpixel text blends with Source1Color): both exports in the colour's format and in CB_SHADER_MASK, DISABLE_DUAL_QUAD, no SX blend
+	// optimisation (RADV's)
 	const bool dualSource = ps && (ps[7] >> 18 & 1) && !noColour;
 	// the one attachment other than 0 it writes (air2amdgpu.cpp, bits 28-30: CoreGraphics' path coverage into attachment 1): drawn into
 	// that attachment's texture
@@ -6579,6 +6581,7 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x216, dualSource ? 0x00cc0011u : 0x00cc0010u},             // CB_COLOR_CONTROL: the template's (ROP3 copy, MODE normal), DISABLE_DUAL_QUAD
 		{0x69, 0x214, noColour ? 0 : split ? mask & 7 : mask},             // CB_TARGET_MASK
 		{0x69, 0x195, noColour ? 0u : dualSource ? 0x99u : 9u},            // SPI_SHADER_COL_FORMAT: 32_ABGR (both sources), or none
+		{0x69, 0x215, dualSource ? 0xffu : 0xfu},                          // CB_SHADER_MASK: the exports' channels (ac_get_cb_shader_mask), both sources'
 		// DB_SHADER_CONTROL: a shader without a colour writes memory, which runs only with EXEC_ON_HIER_FAIL and EXEC_ON_NOOP, after the depth
 		// test (LATE_Z; RADV's for writes_memory, gfx12.json); else the template's EARLY_Z_THEN_LATE_Z
 		{0x69, 0x1b, noColour ? 0x600u : 0x10u},
@@ -8461,6 +8464,9 @@ int RDNA4PvHost::grabFrame(uint32_t port, struct sysctl_req *req)
 
 int RDNA4PvHost::grabFrameOnce(uint32_t port, struct sysctl_req *req)
 {
+	const uint32_t step = port & 256 ? 1 : 2;   // every pixel, or every other one
+
+	port &= 255;
 	mGrabReady = false;
 	mGrabWant = port + 1;
 
@@ -8472,15 +8478,15 @@ int RDNA4PvHost::grabFrameOnce(uint32_t port, struct sysctl_req *req)
 	if (!mGrabReady)
 		return ETIMEDOUT;
 
-	const uint32_t size[2] = {mGrab.width / 2, mGrab.height / 2};
+	const uint32_t size[2] = {mGrab.width / step, mGrab.height / step};
 	auto *row = static_cast<uint32_t *>(IOMalloc(size[0] * 4));
 	int err = row ? SYSCTL_OUT(req, size, sizeof(size)) : ENOMEM;
 
 	for (uint32_t y = 0; y < size[1] && !err; y++) {
-		const auto *line = reinterpret_cast<const uint32_t *>(mGrab.cpu + static_cast<uint64_t>(2 * y) * mGrab.pitch);
+		const auto *line = reinterpret_cast<const uint32_t *>(mGrab.cpu + static_cast<uint64_t>(step * y) * mGrab.pitch);
 
 		for (uint32_t x = 0; x < size[0]; x++)
-			row[x] = line[2 * x];
+			row[x] = line[step * x];
 
 		err = SYSCTL_OUT(req, row, size[0] * 4);
 	}

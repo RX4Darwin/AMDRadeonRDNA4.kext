@@ -9,6 +9,7 @@
 //   mtlprobe mix       out[i] = 3 * in[i] + 100000 * group + 1000 * thread in group + group size over 100 threads in groups of 32 (the
 //                      last group has 4, and Metal reports 4 as its size); a kernel that is not in the kext's table: it runs only if
 //                      translated at run time
+//   mtlprobe dualsrc   dual-source blending: every pixel of a quad whose colour and second source depend on its parity, checked
 //   mtlprobe devices   every Metal device MTLCopyAllDevices returns, its class and registry ID (docs/native-metal-spike.md)
 //   mtlprobe native <probe.metallib>   the native-Metal spike on our own device (RDNA4MTLDevice; as root, RDNA4_NATIVE_MTL=1): gate 2,
 //                      c = a + b over 1000 floats in groups of 64 (dispatchThreads: the last group is partial), then c *= 3 with setBytes;
@@ -928,6 +929,94 @@ static void blend(id<MTLDevice> d, id<MTLCommandQueue> q, bool x) {   // x: the 
 		snprintf(expect + strlen(expect), sizeof(expect) - strlen(expect), "%s%s %d %d %d %d", k ? ", " : "", names[x][k], w[0], w[1], w[2], w[3]);
 	}
 	OUT("%s: RGBA%s %d of 16 channels off by more than 2 (%s)", x ? "blendx" : "blend", line, wrong, expect);
+}
+
+// Dual-source blending (Sublime Text's subpixel text): a quad whose colour and second source ([[color(0), index(1)]]) depend on each
+// pixel's x and y parity, blended RGB = colour * source1 + destination * (1 - source1) over a known clear; every pixel checked, the
+// mismatches counted by parity (gfx11+ exports the two sources swizzled across lane pairs: a wrong swizzle shows on alternate pixels).
+static void dualsrc(id<MTLDevice> d, id<MTLCommandQueue> q) {
+	NSError *err = nil;
+	id<MTLLibrary> lib = [d newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+	                                              "struct V { float4 pos [[position]]; };\n"
+	                                              "struct O { float4 c [[color(0), index(0)]]; float4 k [[color(0), index(1)]]; };\n"
+	                                              "vertex V ds_v(uint vid [[vertex_id]]) {"
+	                                              " float x = (vid == 1 || vid == 3 || vid == 4) ? 1.0 : -1.0, y = (vid == 2 || vid == 4 || vid == 5) ? 1.0 : -1.0;"
+	                                              " V v; v.pos = float4(x, y, 0, 1); return v; }\n"
+	                                              "fragment O ds_f(V in [[stage_in]], constant uint &m [[buffer(0)]]) { uint x = uint(in.pos.x), y = uint(in.pos.y); O o;"
+	                                              " o.c = float4((x & 1) ? 1.0 : 0.0, (y & 1) ? 1.0 : 0.0, (x & 2) ? 1.0 : 0.5, 1.0);"
+	                                              " o.k = float4((x & 1) ? 0.25 : 0.75, (y & 1) ? 0.5 : 1.0, (x & 2) ? 0.0 : 1.0, 1.0);"
+	                                              " if (m == 1) o.k = float4(1.0); if (m == 2) o.c = float4(1.0); return o; }"
+	                                     options:nil
+	                                       error:&err];
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [lib newFunctionWithName:@"ds_v"];
+	pd.fragmentFunction = [lib newFunctionWithName:@"ds_f"];
+	MTLRenderPipelineColorAttachmentDescriptor *a = pd.colorAttachments[0];
+	a.pixelFormat = MTLPixelFormatBGRA8Unorm;
+	a.blendingEnabled = YES;
+	a.sourceRGBBlendFactor = MTLBlendFactorSource1Color;
+	a.destinationRGBBlendFactor = MTLBlendFactorOneMinusSource1Color;
+	a.sourceAlphaBlendFactor = MTLBlendFactorSource1Color;
+	a.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSource1Color;
+	id<MTLRenderPipelineState> ps = lib ? [d newRenderPipelineStateWithDescriptor:pd error:&err] : nil;
+	if (!ps) {
+		OUT("dualsrc: pipeline NOT created: %s", err.localizedDescription.UTF8String);
+		return;
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:64 mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	id<MTLBuffer> out = [d newBufferWithLength:64 * 64 * 4 options:MTLResourceStorageModeShared];
+	int total = 0;
+	// m 0: as designed; 1: second source 1 everywhere (the result is the colour each pixel got); 2: colour 1 over black (the result is
+	// the second source each pixel got)
+	for (uint32_t m = 0; m < 3; m++) {
+		const double dst[4] = {m == 2 ? 0 : 0.2, m == 2 ? 0 : 0.4, m == 2 ? 0 : 0.6, m == 2 ? 0 : 1};
+		MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+		rp.colorAttachments[0].texture = t;
+		rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+		rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+		rp.colorAttachments[0].clearColor = MTLClearColorMake(dst[0], dst[1], dst[2], dst[3]);
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+		[re setRenderPipelineState:ps];
+		[re setFragmentBytes:&m length:4 atIndex:0];
+		[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+		[re endEncoding];
+		id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+		[e copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(64, 64, 1) toBuffer:out
+		      destinationOffset:0 destinationBytesPerRow:64 * 4 destinationBytesPerImage:64 * 64 * 4];
+		[e endEncoding];
+		run(cb, "dualsrc");
+		int wrong[4] = {0};
+		for (int y = 0; y < 64; y++)
+			for (int x = 0; x < 64; x++) {
+				double c[4] = {(x & 1) ? 1.0 : 0.0, (y & 1) ? 1.0 : 0.0, (x & 2) ? 1.0 : 0.5, 1.0};
+				double k[4] = {(x & 1) ? 0.25 : 0.75, (y & 1) ? 0.5 : 1.0, (x & 2) ? 0.0 : 1.0, 1.0};
+				for (int ch = 0; ch < 4; ch++) {
+					k[ch] = m == 1 ? 1 : k[ch];
+					c[ch] = m == 2 ? 1 : c[ch];
+				}
+				const uint8_t *p = (const uint8_t *)out.contents + (y * 64 + x) * 4;   // B, G, R, A
+				const int got[4] = {p[2], p[1], p[0], p[3]};
+				int bad = 0;
+				for (int ch = 0; ch < 4; ch++)
+					bad |= abs(got[ch] - (int)lround((c[ch] * k[ch] + dst[ch] * (1 - k[ch])) * 255)) > 2;
+				wrong[(x & 1) | (y & 1) << 1] += bad;
+			}
+		total += wrong[0] + wrong[1] + wrong[2] + wrong[3];
+		char row[2][160] = {"", ""};
+		for (int y = 0; y < 2; y++)
+			for (int x = 0; x < 4; x++) {
+				const uint8_t *p = (const uint8_t *)out.contents + (y * 64 + x) * 4;
+				snprintf(row[y] + strlen(row[y]), sizeof(row[y]) - strlen(row[y]), " (%3d %3d %3d %3d)", p[2], p[1], p[0], p[3]);
+			}
+		OUT("dualsrc: m %u (%s): wrong by parity (x even y even, x odd y even, x even y odd, x odd y odd) %d %d %d %d; pixels y0%s; y1%s", m,
+		    m == 0 ? "as designed" : m == 1 ? "source1 = 1: shows the colour" : "colour 1 over black: shows source1", wrong[0], wrong[1], wrong[2],
+		    wrong[3], row[0], row[1]);
+	}
+	OUT("dualsrc: %s", total ? "FAIL" : "PASS");
 }
 
 static void blendinfo(id<MTLDevice> d, id<MTLCommandQueue> q) {
@@ -2316,8 +2405,8 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		const char *mode = argc > 1 ? argv[1] : "info";
 		if (!strcmp(mode, "all")) {
-			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend", "blendx", "varyings", "texsize", "surfdraw", "manyinst", "viewport", "texlinear", "fragpos", "glyphs", "coverage2", "ctex", "fbfetch", "cube"};
-			for (int i = 0; i < 30; i++) {
+			const char *modes[] = {"info", "blit", "compute", "grid", "mix", "two", "twolib", "feat", "bytes", "simd", "render", "tri", "tricol", "vbuf", "drawmodes", "texdraw", "blend", "blendx", "varyings", "texsize", "surfdraw", "manyinst", "viewport", "texlinear", "fragpos", "glyphs", "coverage2", "ctex", "fbfetch", "cube", "dualsrc"};
+			for (unsigned i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
 				pid_t pid = fork();
 				if (pid == 0) {
 					execl(argv[0], argv[0], modes[i], (char *)NULL);
@@ -2512,6 +2601,8 @@ int main(int argc, char **argv) {
 			blend(d, q, mode[5] == 'x');
 		else if (!strcmp(mode, "blendinfo"))
 			blendinfo(d, q);
+		else if (!strcmp(mode, "dualsrc"))
+			dualsrc(d, q);
 		else if (!strcmp(mode, "drawargs"))
 			drawargs(d, q);
 		else if (!strcmp(mode, "cube"))
