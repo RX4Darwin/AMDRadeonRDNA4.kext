@@ -3,7 +3,7 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
-## After 0.3.1 (on `next`, no number yet)
+## 0.3.2 (2026-11-19)
 
 **Metal (`make PVGPU=1`)**
 - RGBA8 IOSurfaces as colour attachments (only BGRA8 ones before): WindowServer renders an inactive window's material into
@@ -15,8 +15,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
   shader caches dropped): Tahoe's glass reads the display's frame around the pointer just after drawing into it, and
   read pixels from before those draws, blocks of old screen content flickering in Safari's tab bar while the pointer
   moved near it. Card (2026-11-18): the blocks are gone; about 660 draws a second take the barrier, vkQuake's timedemo
-  unchanged (41.7-43.9 fps). Left: the edges of a box around the pointer show as lines over glass, since the paravirtual
-  displays have no hardware cursor and WindowServer redraws the pointer's rectangle into each frame.
+  unchanged (41.7-43.9 fps). The edges of a box around the pointer that were left went with the hardware cursor
+  (below).
 
 **Cursor**
 - A hardware cursor for the paravirtual displays (on in `PVGPU=1` builds, `rdna4-pvcursor=0` turns it off): WindowServer's pointer
@@ -27,8 +27,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
   redraw (about 15 frames in 5 s instead of about 250); one arrow on each display, and the box in Safari is gone.
 
 **Native Metal (spike, `docs/native-metal-spike.md`)**
-- First step towards our own Metal driver beside the paravirtual one (needed for ray tracing and a hardware cursor, which
-  the paravirtual route cannot carry). `sudo sysctl debug.rdna4_nativemtl=1` publishes an `IOAccelerator` service
+- First step towards our own Metal driver beside the paravirtual one (needed for ray tracing, which the paravirtual route
+  cannot carry). `sudo sysctl debug.rdna4_nativemtl=1` publishes an `IOAccelerator` service
   naming our bundle (`tools/metal/native/`, installed into `/Library/GPUBundles`), and Metal loads it: its device class
   only has to be a `_MTLDevice`, not speak Apple's private accelerator protocol. The device exists only in processes
   started with `RDNA4_NATIVE_MTL=1`. Card (Tahoe 26.6.2, 2026-11-19): `mtlprobe devices` lists it beside the paravirtual
