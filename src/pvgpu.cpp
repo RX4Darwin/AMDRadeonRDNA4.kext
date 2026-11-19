@@ -872,6 +872,9 @@ private:
 	uint64_t mSubmitBusyRetries { 0 }, mSubmitNotReadyMs { 0 };
 	uint64_t mSubmitBusyWaitNs { 0 }, mSubmitNotReadyWaitNs { 0 };
 	uint64_t mSubmitBusyWaitMaxNs { 0 }, mSubmitNotReadyWaitMaxNs { 0 };
+	// Time spent inside rtSubmitGfxIb itself, separate from explicit retry delays.
+	uint64_t mSubmitRuntimeNs { 0 }, mSubmitRuntimeMaxNs { 0 }, mSubmitRuntimeCalls { 0 };
+	uint64_t mSubmitRuntimeOver250us { 0 }, mSubmitRuntimeOver1ms { 0 };
 	uint32_t mSubmitBusyMaxRetries { 0 }, mSubmitNotReadyMaxMs { 0 };
 	uint32_t mSubmitBusyExhausted { 0 }, mSubmitNotReadyExhausted { 0 }, mSubmitFailed { 0 };
 	// Time spent inside the 250 us host timer callback, which also services display events.
@@ -2248,13 +2251,24 @@ IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 	static constexpr uint32_t kBusyPolls = 20000; // of 10 us: preserve the existing retry window until submissions can be deferred safely
 	const uint64_t submitAt = nowNs();
 	uint32_t busyRetries = 0, notReadyWaited = 0;
-	IOReturn r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
+	auto submitOnce = [this, ib, dwords, &fence]() {
+		const uint64_t at = nowNs();
+		const IOReturn result = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
+		const uint64_t elapsed = nowNs() - at;
+		mSubmitRuntimeCalls++;
+		mSubmitRuntimeNs += elapsed;
+		mSubmitRuntimeMaxNs = elapsed > mSubmitRuntimeMaxNs ? elapsed : mSubmitRuntimeMaxNs;
+		if (elapsed >= 250000) mSubmitRuntimeOver250us++;
+		if (elapsed >= 1000000) mSubmitRuntimeOver1ms++;
+		return result;
+	};
+	IOReturn r = submitOnce();
 
 	const uint64_t busyWaitAt = nowNs();
 	while (r == kIOReturnBusy && busyRetries < kBusyPolls) {
 		busyRetries++;
 		IODelay(10);
-		r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
+		r = submitOnce();
 	}
 	const uint64_t busyWaitNs = nowNs() - busyWaitAt;
 
@@ -2262,7 +2276,7 @@ IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 	while (r == kIOReturnNotReady && notReadyWaited < kGfxWait) {
 		notReadyWaited += kGfxPoll;
 		IOSleep(kGfxPoll);
-		r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
+		r = submitOnce();
 	}
 	const uint64_t notReadyWaitNs = nowNs() - notReadyWaitAt;
 
@@ -8851,9 +8865,15 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 		pvstat("host: render:   GPU submits %llu, slow (>=2 ms) %llu, average %llu us, max %llu us, busy retries %llu (max %u), not-ready requested %llu ms (max %u ms)",
 		       mSubmitCalls, mSubmitSlow, mSubmitNs / mSubmitCalls / 1000, mSubmitMaxNs / 1000, mSubmitBusyRetries,
 		       mSubmitBusyMaxRetries, mSubmitNotReadyMs, mSubmitNotReadyMaxMs);
+	if (mSubmitCalls) {
 		pvstat("host: render:   submit wait actual: busy %llu ms (max %llu us), ring-not-ready %llu ms (max %llu us)",
 		       mSubmitBusyWaitNs / 1000000, mSubmitBusyWaitMaxNs / 1000,
 		       mSubmitNotReadyWaitNs / 1000000, mSubmitNotReadyWaitMaxNs / 1000);
+	}
+	if (mSubmitRuntimeCalls)
+		pvstat("host: render:   runtime submit calls %llu, average %llu us, max %llu us, >=250 us %llu, >=1 ms %llu",
+		       mSubmitRuntimeCalls, mSubmitRuntimeNs / mSubmitRuntimeCalls / 1000, mSubmitRuntimeMaxNs / 1000,
+		       mSubmitRuntimeOver250us, mSubmitRuntimeOver1ms);
 	if (mSubmitBusyExhausted || mSubmitNotReadyExhausted || mSubmitFailed)
 		pvstat("host: render:   GPU submit failures: busy timeout %u, ring not-ready timeout %u, other errors %u",
 		       mSubmitBusyExhausted, mSubmitNotReadyExhausted, mSubmitFailed);
@@ -9009,6 +9029,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mSubmitBusyRetries = mSubmitNotReadyMs = 0;
 	mSubmitBusyWaitNs = mSubmitNotReadyWaitNs = 0;
 	mSubmitBusyWaitMaxNs = mSubmitNotReadyWaitMaxNs = 0;
+	mSubmitRuntimeNs = mSubmitRuntimeMaxNs = mSubmitRuntimeCalls = 0;
+	mSubmitRuntimeOver250us = mSubmitRuntimeOver1ms = 0;
 	mSubmitBusyMaxRetries = mSubmitNotReadyMaxMs = 0;
 	mSubmitBusyExhausted = mSubmitNotReadyExhausted = mSubmitFailed = 0;
 	mTickNs = mTickMaxNs = mTickCalls = mTickOver250us = mTickOver1ms = 0;
