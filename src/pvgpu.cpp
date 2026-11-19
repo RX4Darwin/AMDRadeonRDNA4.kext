@@ -870,6 +870,8 @@ private:
 	// serialized work-loop path, so these counters need no separate lock.
 	uint64_t mSubmitNs { 0 }, mSubmitMaxNs { 0 }, mSubmitCalls { 0 }, mSubmitSlow { 0 };
 	uint64_t mSubmitBusyRetries { 0 }, mSubmitNotReadyMs { 0 };
+	uint64_t mSubmitBusyWaitNs { 0 }, mSubmitNotReadyWaitNs { 0 };
+	uint64_t mSubmitBusyWaitMaxNs { 0 }, mSubmitNotReadyWaitMaxNs { 0 };
 	uint32_t mSubmitBusyMaxRetries { 0 }, mSubmitNotReadyMaxMs { 0 };
 	uint32_t mSubmitBusyExhausted { 0 }, mSubmitNotReadyExhausted { 0 }, mSubmitFailed { 0 };
 	// Time spent inside the 250 us host timer callback, which also services display events.
@@ -2248,17 +2250,21 @@ IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 	uint32_t busyRetries = 0, notReadyWaited = 0;
 	IOReturn r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
 
+	const uint64_t busyWaitAt = nowNs();
 	while (r == kIOReturnBusy && busyRetries < kBusyPolls) {
 		busyRetries++;
 		IODelay(10);
 		r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
 	}
+	const uint64_t busyWaitNs = nowNs() - busyWaitAt;
 
+	const uint64_t notReadyWaitAt = nowNs();
 	while (r == kIOReturnNotReady && notReadyWaited < kGfxWait) {
 		notReadyWaited += kGfxPoll;
 		IOSleep(kGfxPoll);
 		r = gCompute->rtSubmitGfxIb(this, ib, dwords, 0, fence);
 	}
+	const uint64_t notReadyWaitNs = nowNs() - notReadyWaitAt;
 
 	// Aggregate rather than logging each submit: this path shares the display work loop, and
 	// per-submit logging would add noise to the very latency being measured.
@@ -2268,6 +2274,10 @@ IOReturn RDNA4PvHost::submitGfx(uint64_t ib, uint32_t dwords, uint64_t &fence)
 	mSubmitMaxNs = elapsed > mSubmitMaxNs ? elapsed : mSubmitMaxNs;
 	mSubmitBusyRetries += busyRetries;
 	mSubmitNotReadyMs += notReadyWaited;
+	mSubmitBusyWaitNs += busyWaitNs;
+	mSubmitNotReadyWaitNs += notReadyWaitNs;
+	mSubmitBusyWaitMaxNs = busyWaitNs > mSubmitBusyWaitMaxNs ? busyWaitNs : mSubmitBusyWaitMaxNs;
+	mSubmitNotReadyWaitMaxNs = notReadyWaitNs > mSubmitNotReadyWaitMaxNs ? notReadyWaitNs : mSubmitNotReadyWaitMaxNs;
 	mSubmitBusyMaxRetries = busyRetries > mSubmitBusyMaxRetries ? busyRetries : mSubmitBusyMaxRetries;
 	mSubmitNotReadyMaxMs = notReadyWaited > mSubmitNotReadyMaxMs ? notReadyWaited : mSubmitNotReadyMaxMs;
 	if (r == kIOReturnBusy)
@@ -8838,9 +8848,12 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	      (now - mDrawStatSince) / 1000000, mDrawStatNs / 1000000, mDrawStatMaxNs / 1000000, mPhaseNs[0] / 1000000, mPhaseNs[1] / 1000000,
 	      mPhaseNs[2] / 1000000, mPhaseNs[3] / 1000000, mPhaseNs[4] / 1000000, mPhaseNs[5] / 1000000, mWaits, mCodeIns, mTranslations);
 	if (mSubmitCalls)
-		pvstat("host: render:   GPU submits %llu, slow (>=2 ms) %llu, average %llu us, max %llu us, busy retries %llu (max %u), not-ready wait %llu ms (max %u ms)",
+		pvstat("host: render:   GPU submits %llu, slow (>=2 ms) %llu, average %llu us, max %llu us, busy retries %llu (max %u), not-ready requested %llu ms (max %u ms)",
 		       mSubmitCalls, mSubmitSlow, mSubmitNs / mSubmitCalls / 1000, mSubmitMaxNs / 1000, mSubmitBusyRetries,
 		       mSubmitBusyMaxRetries, mSubmitNotReadyMs, mSubmitNotReadyMaxMs);
+		pvstat("host: render:   submit wait actual: busy %llu ms (max %llu us), ring-not-ready %llu ms (max %llu us)",
+		       mSubmitBusyWaitNs / 1000000, mSubmitBusyWaitMaxNs / 1000,
+		       mSubmitNotReadyWaitNs / 1000000, mSubmitNotReadyWaitMaxNs / 1000);
 	if (mSubmitBusyExhausted || mSubmitNotReadyExhausted || mSubmitFailed)
 		pvstat("host: render:   GPU submit failures: busy timeout %u, ring not-ready timeout %u, other errors %u",
 		       mSubmitBusyExhausted, mSubmitNotReadyExhausted, mSubmitFailed);
@@ -8994,6 +9007,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mDrawStatMaxNs = 0;
 	mSubmitNs = mSubmitMaxNs = mSubmitCalls = mSubmitSlow = 0;
 	mSubmitBusyRetries = mSubmitNotReadyMs = 0;
+	mSubmitBusyWaitNs = mSubmitNotReadyWaitNs = 0;
+	mSubmitBusyWaitMaxNs = mSubmitNotReadyWaitMaxNs = 0;
 	mSubmitBusyMaxRetries = mSubmitNotReadyMaxMs = 0;
 	mSubmitBusyExhausted = mSubmitNotReadyExhausted = mSubmitFailed = 0;
 	mTickNs = mTickMaxNs = mTickCalls = mTickOver250us = mTickOver1ms = 0;
