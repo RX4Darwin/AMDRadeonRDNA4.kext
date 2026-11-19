@@ -879,7 +879,7 @@ private:
 	// shown: vblanks after which the head showed another buffer (a port flipping its frames: each frame shown, none dropped, if as many)
 	struct PortTiming { uint64_t last, vblNs, vblMaxNs; uint32_t frames, missed, gaps[4], underflows, shown; uint64_t vblAt, inUse; };
 	PortTiming mPortTiming[8] {};
-	void timePresent(PortTiming &t);
+	void timePresent(uint32_t port, PortTiming &t);
 	uint64_t mLateNs { 0 }, mLateMaxNs { 0 };
 	uint64_t mVblLateNs { 0 }, mVblLateMaxNs { 0 };   // how late the VBL events fired (the host's tick was busy)
 	uint32_t mVbls { 0 }, mVblsLate { 0 };            // VBL events, those 2 ms or more late
@@ -7995,7 +7995,7 @@ void RDNA4PvHost::presentTransaction(const pvstream::FifoCommand &c, const uint8
 	mPresents += ok;
 
 	if (ok && port < 8)
-		timePresent(mPortTiming[port]);
+		timePresent(port, mPortTiming[port]);
 
 	if (gTalk)
 		pvlog("host: present: port %u, IOSurface %u (task %u): %s", port, surface, task, ok ? "copied" : "NOT copied");
@@ -8015,16 +8015,19 @@ static uint32_t dmaData(uint32_t *out, uint64_t src, uint64_t dst, uint32_t byte
 	return 7;
 }
 
-void RDNA4PvHost::timePresent(PortTiming &t)
+void RDNA4PvHost::timePresent(uint32_t port, PortTiming &t)
 {
 	const uint64_t now = nowNs();
 	const uint64_t sinceVbl = now - t.vblAt;
+	// Use the same per-head period as VBL scheduling. Fixed 60 Hz thresholds misclassify frames
+	// on 75/120/144 Hz displays and make the driver's own smoothness counters misleading.
+	const uint64_t period = port < 8 && mPortPeriodNs[port] ? mPortPeriodNs[port] : kVblPeriodNs;
 
-	if (t.last && now - t.last > kVblPeriodNs * 3 / 2 && now - t.last < 4 * kVblPeriodNs)   // an animation, one frame or more missed
+	if (t.last && now - t.last > period * 3 / 2 && now - t.last < 4 * period)   // an animation, one frame or more missed
 		t.missed++;
 
 	// How smooth an animation was: the time since the last frame in VBLs (rounded), longer gaps an idle display's
-	const uint64_t gap = t.last ? (now - t.last + kVblPeriodNs / 2) / kVblPeriodNs : 0;
+	const uint64_t gap = t.last ? (now - t.last + period / 2) / period : 0;
 
 	if (gap >= 1 && gap <= 8)
 		t.gaps[gap < 4 ? gap - 1 : 3]++;
@@ -8032,7 +8035,7 @@ void RDNA4PvHost::timePresent(PortTiming &t)
 	t.last = now;
 	t.frames++;
 
-	if (t.vblAt && sinceVbl < 4 * kVblPeriodNs) {
+	if (t.vblAt && sinceVbl < 4 * period) {
 		t.vblNs += sinceVbl;
 		t.vblMaxNs = sinceVbl > t.vblMaxNs ? sinceVbl : t.vblMaxNs;
 	}
@@ -8495,6 +8498,14 @@ void RDNA4PvHost::dropScanout(ScanoutMap &sm)
 	for (uint64_t handle : handles)
 		if (handle)
 			gCompute->rtFree(this, handle);
+
+	// A new physical head or mode starts a new timing epoch. Do not carry a learned refresh period,
+	// pending VBL deadline, or frame-gap history across a modeset / scanout remap.
+	if (port < 8) {
+		mPortVblNs[port] = 0;
+		mPortPeriodNs[port] = 0;
+		mPortTiming[port] = {};
+	}
 
 	sm = {};
 }
