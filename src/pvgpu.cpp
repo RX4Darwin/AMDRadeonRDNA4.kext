@@ -8931,6 +8931,8 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 	uint64_t *due = port < 8 ? &mPortVblNs[port] : nullptr;
 	uint32_t line = 0, lines = 0, blankStart = 0;
 	bool fire = tick;
+	bool haveScanoutTiming = false;
+	uint64_t vblTimestamp = now;
 
 	if (!due)
 		return tick;
@@ -8938,7 +8940,8 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 	if (sm && sm->flips && *due && now < *due)
 		return false;
 
-	if (!sm || !sm->flips || sm->otg >= 8 || !gCompute->rtScanoutScan(sm->otg, line, lines, blankStart) || !lines) {
+	if (!sm || !sm->flips || sm->otg >= 8 || !gCompute->rtScanoutScan(sm->otg, line, lines, blankStart) ||
+	    !lines || line >= lines || blankStart >= lines) {
 		*due = 0;
 	} else {
 		// The paravirtual display's first estimate is 60 Hz, but the real head may be 75/120/144 Hz.
@@ -8946,6 +8949,12 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 		// scan lines to time. A fixed 16.67 ms estimate makes high-refresh heads' wakeups drift badly.
 		const uint64_t period = mPortPeriodNs[port] ? mPortPeriodNs[port] : kVblPeriodNs;
 		const uint64_t toBlank = static_cast<uint64_t>((blankStart + lines - line) % lines) * period / lines;
+		const uint64_t sinceBlank = static_cast<uint64_t>((line + lines - blankStart) % lines) * period / lines;
+
+		// Reconstruct the vblank timestamp from the sampled scanline. Using now when the timer
+		// happens to run folds work-loop scheduling jitter into the refresh estimate and present latency.
+		vblTimestamp = now > sinceBlank ? now - sinceBlank : 0;
+		haveScanoutTiming = vblTimestamp != 0;
 
 		uint64_t requested = 0, inUse = 0;
 
@@ -8961,13 +8970,14 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 
 	if (fire) {
 		PortTiming &timing = mPortTiming[port];
-		if (timing.vblAt) {
-			const uint64_t measured = now - timing.vblAt;
-			// Reject scheduler stalls and implausible readings; smooth normal jitter rather than chasing it.
+		const uint64_t sample = haveScanoutTiming ? vblTimestamp : now;
+		if (timing.vblAt && sample > timing.vblAt) {
+			const uint64_t measured = sample - timing.vblAt;
+			// Reject implausible readings; scanline-derived timestamps already remove most timer jitter.
 			if (measured >= 4000000ull && measured <= 50000000ull)
 				mPortPeriodNs[port] = mPortPeriodNs[port] ? (3 * mPortPeriodNs[port] + measured) / 4 : measured;
 		}
-		timing.vblAt = now;
+		timing.vblAt = sample;
 	}
 
 	return fire;
