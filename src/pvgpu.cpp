@@ -4665,7 +4665,18 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		if (talk)
 			pvlog("host: render:   %s texture %u: resource %u (type %u), format %u, %ux%ux%u, %u bytes per row, %d bytes not 0", stageName, k, id,
 			      src.type, format, w, h, depth, rowBytes, ok && fm ? inkedBytes(task, src, fm->bpp) : -1);
-		ok = ok && fm && w && h && w <= 16384 && h <= 16384 && rowBytes >= w * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= src.length;
+		// A single row wider than a T# holds (16384 texels): a texture buffer (Sublime Text's through AppleMetalOpenGLRenderer, 24576 RGBA32Float
+		// texels from a GL buffer texture), which the translator reads as rows of 16384 (air2amdgpu.cpp read_texture_buffer_1d): given as
+		// such rows, the linear row exactly.
+		const bool wideRow = h == 1 && depth == 1 && w > 16384 && !array1d && !array2d;
+		auto image = [&](uint32_t *t, uint64_t at, uint32_t pitchPx) {
+			if (wideRow)
+				linearImage(t, at, fm->gfx, viewSel(fm->sel, src.swizzle), 16384, (w + 16383) / 16384, 16384);
+			else
+				linearImage(t, at, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, pitchPx);
+		};
+		ok = ok && fm && w && h && (w <= 16384 || (wideRow && w <= 16384u * 16384u)) && h <= 16384 && rowBytes >= w * fm->bpp &&
+		     static_cast<uint64_t>(rowBytes) * h <= src.length;
 		ok = ok && (depth == 1 || (depth <= 2048 && src.imageBytes >= static_cast<uint64_t>(rowBytes) * h && src.imageBytes * depth <= src.length));
 		if (!ok) {
 			if (talk || mTexLines++ < 2)   // per stats period
@@ -4708,7 +4719,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		                                   : mapGuest(task, src.va, used, out[k].handle, gpu, shaderWrites))) {
 			out[k].va = 0;   // nothing to copy back: the card writes the guest's memory itself
 			out[k].writable = false;
-			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, h == 1 ? w : rowBytes / fm->bpp);
+			image(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, h == 1 ? w : rowBytes / fm->bpp);
 			mInPlace++;
 			continue;
 		}
@@ -4724,7 +4735,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			else if (depth > 1)
 				linearVolume(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 			else
-				linearImage(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, shadowPitch / fm->bpp);
+				image(t, gpu, shadowPitch / fm->bpp);
 
 			mCopied++;
 			continue;
@@ -4811,7 +4822,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		else if (depth > 1)
 			linearVolume(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 		else
-			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, pitchPx);
+			image(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, pitchPx);
 	}
 	for (unsigned k = 0; k < 16 && ok; k++) {
 		const uint32_t id = bound.sampler[k];
@@ -6266,6 +6277,9 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	const uint32_t *vs = why ? nullptr : reinterpret_cast<const uint32_t *>(shader[1]->gfx), *ps = why ? nullptr : reinterpret_cast<const uint32_t *>(shader[2]->gfx);
 	const uint32_t outs = vs ? vs[7] : 0, ins = ps ? ps[7] & 0xffff : 0;
 	const bool noColour = ps && ps[7] >> 31;   // the fragment shader writes no colour (air2amdgpu.cpp: textures, say)
+	// dual-source blending (air2amdgpu.cpp, bit 18: the colour and its [[color(0), index(1)]] to the dual-source targets; Sublime Text's
+	// subpixel text blends with Source1Color): both exports in the colour's format, DISABLE_DUAL_QUAD, no SX blend optimisation (RADV's)
+	const bool dualSource = ps && (ps[7] >> 18 & 1) && !noColour;
 	// the one attachment other than 0 it writes (air2amdgpu.cpp, bits 28-30: CoreGraphics' path coverage into attachment 1): drawn into
 	// that attachment's texture
 	// a shader that writes several (bits 20-27): the first of them the pipeline writes (its mask) and the pass has a texture for, told to it
@@ -6561,9 +6575,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x76, 0x31, outs ? (outs - 1) | ins << 11 : 0x400u},              // SPI_SHADER_GS_OUT_CONFIG_PS: VS_EXPORT_COUNT, NUM_INTERP; NO_PC_EXPORT
 		{0x69, 0x207, 0x00000244u},                                        // PA_SU_SC_MODE_CNTL: the template's, without PROVOKING_VTX_LAST (Metal's is the first); FACE: clockwise is the front (Metal's default winding; only front_facing reads it, nothing is culled)
 		{0x69, 0x1e0, blend[2] ? first.control : 0},                       // CB_BLEND0_CONTROL
-		{0x69, 0x1d8, blend[2] ? first.opt : 0x06000600u},                 // SX_MRT0_BLEND_OPT: else BLEND_DISABLED
+		{0x69, 0x1d8, dualSource ? 0u : blend[2] ? first.opt : 0x06000600u},   // SX_MRT0_BLEND_OPT: else BLEND_DISABLED; NONE for dual source
+		{0x69, 0x216, dualSource ? 0x00cc0011u : 0x00cc0010u},             // CB_COLOR_CONTROL: the template's (ROP3 copy, MODE normal), DISABLE_DUAL_QUAD
 		{0x69, 0x214, noColour ? 0 : split ? mask & 7 : mask},             // CB_TARGET_MASK
-		{0x69, 0x195, noColour ? 0u : 9u},                                 // SPI_SHADER_COL_FORMAT: 32_ABGR, or none
+		{0x69, 0x195, noColour ? 0u : dualSource ? 0x99u : 9u},            // SPI_SHADER_COL_FORMAT: 32_ABGR (both sources), or none
 		// DB_SHADER_CONTROL: a shader without a colour writes memory, which runs only with EXEC_ON_HIER_FAIL and EXEC_ON_NOOP, after the depth
 		// test (LATE_Z; RADV's for writes_memory, gfx12.json); else the template's EARLY_Z_THEN_LATE_Z
 		{0x69, 0x1b, noColour ? 0x600u : 0x10u},

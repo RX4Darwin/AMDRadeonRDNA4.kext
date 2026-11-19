@@ -5,6 +5,16 @@ otherwise). The newest version is on top. How versions and branches work is in `
 
 ## After 0.3.2 (on `next`, no number yet)
 
+**Metal (`make PVGPU=1`)**
+- Sublime Text draws (through OpenGL on Metal, `AppleMetalOpenGLRenderer`). Its window stayed black: its draws read
+  their data from GL buffer textures, Metal texture buffers of 24576 RGBA32Float texels, wider than a T# holds (16384),
+  and were refused. Such a row is now given as rows of 16384 texels, which the translator's texture-buffer reads index
+  (x % 16384, x / 16384). Then its text came out as solid blocks: it blends subpixel text with dual-source blending
+  (`Source1Color`), and the shader's second output (`[[color(0), index(1)]]`) replaced its colour. Both now go to the
+  dual-source export targets, swizzled across lanes as gfx11+ wants (Mesa's), with the registers RADV sets for it
+  (`SPI_SHADER_COL_FORMAT` for both, `DISABLE_DUAL_QUAD`, no SX blend optimisation). Card (Tahoe 26.6.2, 2026-11-19):
+  Sublime Text's window, tabs, text and status bar all readable.
+
 ## 0.3.2 (2026-11-19)
 
 **Metal (`make PVGPU=1`)**
