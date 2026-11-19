@@ -1,11 +1,11 @@
 # W19: why does GFX sit at max clock? (audit and readout)
 
-Branch `premetal/pm` (off `premetal/int` 610746e). Sources: amdgpu in
+Branch `pm` (off `int` 610746e). Sources: amdgpu in
 `~/src/linux-amd/drivers/gpu/drm/amd` (paths below are relative to it; `smu14_driver_if` is
 `pm/swsmu/inc/pmfw_if/smu14_driver_if_v14_0.h`, `ppsmc` is `.../smu_v14_0_2_ppsmc.h`).
 Kext line numbers are this branch's `src/compute.cpp`.
 
-The observation (`premetal/r2-sensors-review.md`): on the real card, in Recovery, the SMU metrics
+The observation (`r2-sensors-review.md`): on the real card, in Recovery, the SMU metrics
 table reads about 300 W socket power, GFXCLK about 3200 MHz, hotspot about 90 C, and the decode is
 correct. This document is what we send the SMU compared with amdgpu, and a ranked list of causes.
 **Nothing here is proven on silicon yet**: the new readout below is what decides.
@@ -164,7 +164,7 @@ a `-> 0xfd/0xfc/0xff` answer (refused), or the last `pm:` trail after a hang.
 
 ## 8. Round 3 (real card) and W24
 
-Logs `premetal/hw-logs/rdna4fb-diag-20260929-01*.txt` (boot 7 = `...-015441.txt`).
+Logs `rdna4fb-diag-20260929-01*.txt` (boot 7 = `...-015441.txt`).
 
 - **The SMU reports GFX activity 97-100 % from the earliest sample (22.7 s) on every boot**, average GFXCLK about
   3200 MHz, 285-313 W. So section 6 hypothesis 1 (bench tail) is dead, and hypotheses 2 and 3 need reading with
@@ -191,7 +191,7 @@ Logs `premetal/hw-logs/rdna4fb-diag-20260929-01*.txt` (boot 7 = `...-015441.txt`
   (`RLC_STAT`, `RLC_GPM_STAT`, `RLC_SAFE_MODE`), our MEC queue polling its wptr (`CP_HQD_ACTIVE` per pipe/queue,
   `CPC_STATUS/BUSY`), the gfx ring (`CP_GFX_HQD_ACTIVE`, `CP_ME_CNTL`), SDMA (`SDMA_STATUS`, `GRBM_STATUS2`).
 
-### W24 additions (`premetal/pm2`)
+### W24 additions (`pm2`)
 
 - **`rdna4-gfxpm` bit 16 (`gfxpm=31` = boot 7)**: read-only `pm: survey <stage>:` lines after stages 3, 4, 5, 6, 7,
   the gfx ring, the pm baseline and the end of bring-up. Each survey logs: `GRBM_STATUS`, `GRBM_STATUS2`,
@@ -223,7 +223,7 @@ Logs `premetal/hw-logs/rdna4fb-diag-20260929-01*.txt` (boot 7 = `...-015441.txt`
   boot-arg logs a reminder that a soft max survives warm reboots; `set-boot.sh 10` (`rdna4-gfxcap=0`) lifts it.
   A cap-less boot with no pm boot-arg cannot know a cap is in force, so it stays silent by design.
 
-## 9. W27: opt-in clock gating and GFXOFF (`premetal/pm3`)
+## 9. W27: opt-in clock gating and GFXOFF (`pm3`)
 
 ### rdna4-gfxcg=<mask>
 
@@ -280,7 +280,7 @@ is counted and logged as `GC ... while GFXOFF is allowed (violation N)` (reads r
 metrics report activity 0 and 8 W while allowed (the model's numbers, not silicon's). The dry run must show zero
 violations with the guard (verified: 0 in the dry runs). The negative case (guard compiled out, expecting violations) was NOT run.
 
-### Review B1/S1/S3 fixes (`premetal/pm3`)
+### Review B1/S1/S3 fixes (`pm3`)
 
 - **B1, the guard across boots.** A fresh kext instance starts with `gcState == On`, so the first GC read (the
   stage-1 survey, `defensiveStart`) was unguarded if a previous boot left GFXOFF allowed and the ASIC kept it.
@@ -306,7 +306,7 @@ violations with the guard (verified: 0 in the dry runs). The negative case (guar
 - **S6:** a timed-out `AllowGfxOff` (response 0) is treated as possibly allowed: the flag stays set and `gcState` is Off, so the first GC access goes through the guard and sends `DisallowGfxOff`. Explicit refusals clear the flag as before.
 - **Hooks:** the real Allow needs exactly `rdna4-gfxoff=1` (any other value, e.g. 10, is ignored). `=2` and `=3` are honoured only when CPUID reports a hypervisor (the emulated device); on hardware they log "TEST HOOK ... ignored".
 
-## 10. W29: clock gating on by default, GFXOFF wake (`premetal/pm4`)
+## 10. W29: clock gating on by default, GFXOFF wake (`pm4`)
 
 - **Default on.** Real card, round 4, boot 14 (`hw-logs/rdna4fb-diag-20260929-083313.txt`): the coarse/medium/fine
   sequence of section 9 took the card from 2541 MHz / 100 % activity / 131 W to 803 MHz / 3 % / 20 W, the

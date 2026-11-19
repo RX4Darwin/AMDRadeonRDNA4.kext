@@ -48,7 +48,7 @@ appended (the log is how the run is observed) and `--extra` after that.
 Plus ~10 s to rebuild the OpenCore image unless `--no-build`. One-time setup: QEMU build
 ~1.5 min on 16 threads, edk2 clone several minutes (2.4 GB with submodules), the rest seconds.
 
-## What boot 1 and boot 3 print (kext of `premetal/g4`, `789606f`; measured)
+## What boot 1 and boot 3 print (kext of `g4`, `789606f`; measured)
 
 Boot 1: Recovery reached, `compute: bring-up finished at stage 7`, `runtime: user-space
 runtime up`, vblank/flip self-tests pass. Table: runtime, ih, vblank, flip, anim, sensors,

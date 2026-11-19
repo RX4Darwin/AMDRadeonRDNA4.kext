@@ -1,6 +1,6 @@
 # M3 track (b) spike: Apple AIR -> gfx1201 through upstream LLVM
 
-hub-task-433 (Lathe), branch `premetal/m3-air` (base `premetal/metal-spike` ce583c4). Everything here runs on Linux; no macOS, no reboot, no download.
+hub-task-433 (Lathe), branch `m3-air` (base `metal-spike` ce583c4). Everything here runs on Linux; no macOS, no reboot, no download.
 Status words: **card** = measured on the RX 9070 XT; **host** = measured on this machine without the card (LLVM 22.1.8 tools, the extracted Apple files);
 **code** = written, never run; **INFER** = reasoning, not measured; **UNKNOWN**. Apple's binaries and their disassembly stay in `~/work/tools/macos-full/25G83/metallib/`
 (outside the repo); nothing derived beyond aggregate counts, entry-point names and the hand-written sample kernel is in git. The tools were written from the bytes of the

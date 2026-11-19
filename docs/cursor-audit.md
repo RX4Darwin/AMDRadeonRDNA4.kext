@@ -5,7 +5,7 @@ hardware cursor is showing). `hw-logs/rdna4fb-diag-20260928-205336.txt` has no c
 kernel message buffer wrapped, so the "HW cursor" and "compute bring-up" sections came out empty.
 
 amdgpu paths below are under `drivers/gpu/drm/amd/display/dc/` (`hubp/...`, `dpp/dcn401/...`) and
-`include/asic_reg/dcn/dcn_4_1_0_sh_mask.h`. Kext lines are `src/cursor.cpp` on `premetal/cursor`.
+`include/asic_reg/dcn/dcn_4_1_0_sh_mask.h`. Kext lines are `src/cursor.cpp` on `cursor`.
 
 ## History that bounds the search
 

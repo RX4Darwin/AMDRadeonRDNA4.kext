@@ -132,7 +132,7 @@ client). Only the kernel's boot VM test passes, and it runs no shader. Candidate
   A kext injected by OpenCore cannot link IOGraphicsFamily/IOAcceleratorFamily2, which hurts route B (subclassing
   IOGraphicsAccelerator2 from our kext), not B' (Apple's paravirt kext does that).
 
-Metal-phase plan with milestones and gates: `docs/metal-phase-plan.md` (premetal/metal-spike): M0 fake paravirt device in a
+Metal-phase plan with milestones and gates: `docs/metal-phase-plan.md`: M0 fake paravirt device in a
 full-install VM, M1 command-stream decode, M2 compute on the card (needs the client-VM blocker solved), M3 AIR compiler,
 M4 WindowServer.
 

@@ -1,4 +1,4 @@
-# W40 vmfix6: round-5 VM fault 0x00800880 = EXECUTE permission on the EOP page (branch premetal/vmfix6, off int bacb27b)
+# W40 vmfix6: round-5 VM fault 0x00800880 = EXECUTE permission on the EOP page (branch vmfix6, off int bacb27b)
 
 Round 5 (E:\rdna4fb-diag-20260930-053316/053346): after the W36 IS_PTE fix the first VMID 8 access still faulted:
 `fault status 0x00800880 (VMID 8, CID 0x4, read), VA 0x100001000`, IV src_data 0x00100001 0x00000050.

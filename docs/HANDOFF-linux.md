@@ -10,7 +10,7 @@ AMDRadeonRDNA4, a Lilu plugin (display) plus from-scratch compute/gfx bring-up i
 the kext. Metal is a long-term goal; we are building the hardware foundation.
 Repo: https://github.com/RX4Darwin/AMDRadeonRDNA4.kext (PRIVATE). Remote `private` = that
 repo. `origin` = public upstream somestupidgirl/AMDRadeonRDNA4: NEVER push there.
-Working branch: `premetal/int`. Dev setup (osxcross, QEMU emulator of the card,
+Working branch: `int`. Dev setup (osxcross, QEMU emulator of the card,
 Tahoe VM) lives in WSL Debian on the Windows box, not on this Linux.
 
 ## State on real card (rounds 5-6, 2026-09-30)
@@ -37,7 +37,7 @@ Put results on the stick (`linux/`), then plug it into Windows and tell Claude t
 Stick OPENCORE (E: on Windows): boot Recovery, `bash /Volumes/OPENCORE/diagnostic-log.sh` IMMEDIATELY (dmesg window rotates), then `bash /Volumes/OPENCORE/set-boot.sh <n>`. Boots: 1 base+cursor (daily, safe), 2 = +VM, 3 = +triangle (last, can wedge the GPU), 5 GFXOFF (optional, then set-boot 1 and power off), 6/7 isolation, 0 = known-good. Logs: amdradeonrdna4-diag-*.txt on the stick (round 6: 20260930-06*).
 
 ## Agents / tooling (Windows only)
-A Relay canvas on the Windows box has Claude agents (pm, gfx, vmfix, review) and this lead session. From Linux you cannot `relay ask` them. Work in flight at handoff: gfx agent on `hub-task-288` (persist gfx verdicts to NVRAM, rethink what zeroes C_PRIMITIVES, probe idling); its result lands in a local Windows worktree branch. Nothing after commit bacb27b on premetal/int was pushed until the user says so; local head has the merges cursor7, vmfix6, gfx7 and set-boot.sh changes (42a1e96).
+A Relay canvas on the Windows box has Claude agents (pm, gfx, vmfix, review) and this lead session. From Linux you cannot `relay ask` them. Work in flight at handoff: gfx agent on `hub-task-288` (persist gfx verdicts to NVRAM, rethink what zeroes C_PRIMITIVES, probe idling); its result lands in a local Windows worktree branch. Nothing after commit bacb27b on int was pushed until the user says so; local head has the merges cursor7, vmfix6, gfx7 and set-boot.sh changes (42a1e96).
 User rules: reply in the user's language (Portuguese), recruited agents are Claude Code Sonnet 5.5 at /effort medium, ask before pushing, never push to origin.
 
 ## Resume the exact conversation

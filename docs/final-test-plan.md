@@ -1,15 +1,15 @@
-# Final real-card test plan (branch `premetal/final`)
+# Final real-card test plan (branch `final`)
 
 Author: Anvil (hub-task-331/334). One document for the user: the exact order, what each boot is for, what it should print, what a FAIL means and whether to go on.
 Everything below was built and dry-checked off the card only (kext + `rdna4-run` build, `nm -u` unchanged, `make test`, userspace host tests, `tools/vm/emu-qtest-vm.py` 35/35, `bash -n`);
 **no boot here has run on the card**, and the emulator dry run of the whole plan is Kiln's (result in the hub-task-331 report / its doc). Evidence tags: [M] measured on the card in an earlier round, [I] inferred, [U] unknown.
 
-## 0. What `premetal/final` contains
+## 0. What `final` contains
 
-`premetal/vmdiag` (= `premetal/w13` d9ec129: S0 invalidate fix, S1 VMID/queue diagnostic round 2, S7-lite shared queues `rdna4-vmshared=1`, ptpages; + boots 9/9b) + `premetal/power` (P2 idle
-accounting, P3 post-client idle row, P7 sleep/wake hardening, on `premetal/w12k` f43d3c9: W12k client gfx IBs, G4 colour triangle) + `premetal/emu-linux` 658e1a2 and Kiln's script commits 762bf45, 8080095.
-Not included: Forge's S8 (hub-task-329) and any stale-TLB correctness fix Forge may still commit to `premetal/w13` (hub-task-334): `git merge premetal/w13` refreshes the tree when it lands; this
-document does not change. **Build the kext from `premetal/final`'s tip** (`OSXCROSS=$HOME/.local/share/osxcross bash tools/build/build-osxcross.sh`, then copy `Build/AMDRadeonRDNA4-<version>-RELEASE/AMDRadeonRDNA4.kext` and `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run` to the stick
+`vmdiag` (= `w13` d9ec129: S0 invalidate fix, S1 VMID/queue diagnostic round 2, S7-lite shared queues `rdna4-vmshared=1`, ptpages; + boots 9/9b) + `power` (P2 idle
+accounting, P3 post-client idle row, P7 sleep/wake hardening, on `w12k` f43d3c9: W12k client gfx IBs, G4 colour triangle) + `emu-linux` 658e1a2 and Kiln's script commits 762bf45, 8080095.
+Not included: Forge's S8 (hub-task-329) and any stale-TLB correctness fix Forge may still commit to `w13` (hub-task-334): `git merge w13` refreshes the tree when it lands; this
+document does not change. **Build the kext from `final`'s tip** (`OSXCROSS=$HOME/.local/share/osxcross bash tools/build/build-osxcross.sh`, then copy `Build/AMDRadeonRDNA4-<version>-RELEASE/AMDRadeonRDNA4.kext` and `Build/AMDRadeonRDNA4-<version>-RELEASE/bin/rdna4-run` to the stick
 together with `tools/rig/set-boot.sh` and `tools/rig/diagnostic-log.sh`).
 
 ## 1. How to run one boot (unchanged loop)

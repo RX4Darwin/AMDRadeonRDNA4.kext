@@ -1,6 +1,6 @@
-# W30 vmfix4: round 4 re-read, fault default page, remaining candidates (branch premetal/vmfix4, off int 4f8bca4)
+# W30 vmfix4: round 4 re-read, fault default page, remaining candidates (branch vmfix4, off int 4f8bca4)
 
-Log: premetal/hw-logs/rdna4fb-diag-20260929-081555.txt (boot 8). amdgpu paths are relative to drivers/gpu/drm/amd.
+Log: rdna4fb-diag-20260929-081555.txt (boot 8). amdgpu paths are relative to drivers/gpu/drm/amd.
 
 ## 1. The round-4 premise ("after the first fault the whole MEC stops") is not shown by the log
 

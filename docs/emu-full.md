@@ -1,6 +1,6 @@
 # A full macOS 26.6.2 (25G83) in a plain QEMU VM (`tools/vm/emu-full.sh`)
 
-Author: Anvil, branch `premetal/emu-full` (hub-task-428 / 432). Evidence tags as elsewhere: [M] measured here, [I] inferred, [U] unknown.
+Author: Anvil, branch `emu-full` (hub-task-428 / 432). Evidence tags as elsewhere: [M] measured here, [I] inferred, [U] unknown.
 
 Why: the Metal phase (M0, `docs/metal-spike.md`) needs Apple's `AppleParavirtGPU.kext`, which exists only in a **full** install's kernel
 collections, not in Recovery (the Recovery/`BaseSystem` VMs of `tools/vm/emu-linux.sh` have no such kext). This VM is the base for that: a

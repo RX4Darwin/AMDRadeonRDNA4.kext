@@ -1,7 +1,7 @@
-# W37: the first draw after `premetal/rootcause-draw.md` — what the kext now does and what round 5 shows
+# W37: the first draw after `docs/rootcause/rootcause-draw.md` — what the kext now does and what round 5 shows
 
-Round 4 drew 0 pixels on the card, the PS marker was not written, and the emulator drew. `premetal/rootcause-draw.md` ranks four causes. This branch
-(`premetal/gfx5`) acts on all of them; boot 3 (`rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11`) carries every new piece.
+Round 4 drew 0 pixels on the card, the PS marker was not written, and the emulator drew. `docs/rootcause/rootcause-draw.md` ranks four causes. This branch
+(`gfx5`) acts on all of them; boot 3 (`rdna4-gfx=2 rdna4-gfxprobe=1 rdna4-gfxdiag=11`) carries every new piece.
 
 ## 1. #1: the clear state never lands (about 35%)
 
@@ -82,7 +82,7 @@ This encodes the round-4 hypothesis (like `gfx-golden-strict`): a pass says the 
 
 The `draw probe mid` clear-state line is read AFTER the replay: with the replay on it reads 0 whatever SRM did, so only boot 6 (no replay) or the pre-replay line attribute #1. The 1024-register context dump runs for the baseline and the first variant only.
 
-## 8. W41 (premetal/verify-draw.md): the clean boot 3
+## 8. W41 (verify-draw.md): the clean boot 3
 
 An adversarial verification rates the SRM/CSB fix **DOUBTFUL (~12%)**: of the 49 CSB registers the stream never writes, 32 are gfx12's implicit viewport scissor (off in the stream), most of the
 rest are gated off by the stream's own state (HiZ off, ZCLIP_PROG_NEAR off, CLIPRECT_RULE 0xffff, binning disabled); only `PA_RATE_CNTL` and `CONTEXT_RESERVED_REG0/1` could matter. SRM is amdgpu's

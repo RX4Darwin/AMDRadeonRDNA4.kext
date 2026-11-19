@@ -1,6 +1,6 @@
 # W32/W34: cursor request scheduling and DLG mission mode — evidence and tests
 
-Source: `premetal/cursor-invisible-analysis.md` (rank 1) and `premetal/w32-review.md`. Round 4 showed the cursor plane enabled and latched (`LATCHED`, no lock held, all cursor
+Source: `cursor-invisible-analysis.md` (rank 1) and `w32-review.md`. Round 4 showed the cursor plane enabled and latched (`LATCHED`, no lock held, all cursor
 registers as amdgpu writes them) yet neither the pointer (`rdna4-cursor=1`) nor the magenta square (`rdna4-cursor=2`) ever appeared.
 
 ## 1. The correction (W32 review S1): amdgpu does not program a cursor rate on DCN 4.01
@@ -60,7 +60,7 @@ contradicts; a VM pass with it says only that the kext writes the register (`rdn
 
 ## 7. W38: DSCL / pipe state, per-update fields and the CRC self-check (`rdna4-cursor=2`)
 
-Source: premetal/rootcause-cursor.md (candidates #1 DSCL stage, #3 cursor-only state, #4 MPCC lock-set mapping). Everything logs into `AMDRadeonRDNA4,Cursor`, every wait is bounded (<= 50 ms),
+Source: docs/rootcause/rootcause-cursor.md (candidates #1 DSCL stage, #3 cursor-only state, #4 MPCC lock-set mapping). Everything logs into `AMDRadeonRDNA4,Cursor`, every wait is bounded (<= 50 ms),
 only display registers are touched, the GPU is never reset.
 
 Order inside the self-test: `dscl:`/`pipe:` dump (`selftest pre`) -> per-update fields -> `DSCL decision:` -> mission mode (W34) -> arm -> `dscl:`/`pipe:` dump (`selftest post`) -> CRC check.
@@ -103,7 +103,7 @@ with `desktop-churn=on` every run must still end in `cursor pixels reach the out
 
 ## 8. W40: CM bypass (`rdna4-cursorcm=1`, `rdna4-cursor=2` only)
 
-Source: premetal/verify-cursor.md sections 2, 7.1 and 8. The card logs `latch domains: ... cm ctl=0x00000001` (hw-logs/rdna4fb-diag-20260929-082237.txt:245): the GOP left `CM0_CM_CONTROL.CM_BYPASS = 1`.
+Source: docs/rootcause/verify-cursor.md sections 2, 7.1 and 8. The card logs `latch domains: ... cm ctl=0x00000001` (hw-logs/rdna4fb-diag-20260929-082237.txt:245): the GOP left `CM0_CM_CONTROL.CM_BYPASS = 1`.
 amdgpu clears it whenever a plane is enabled (`dcn401_dpp.c:223` `.dpp_program_gamcor_lut = dpp3_program_gamcor_lut` -> `dpp3_enable_cm_block`, `dcn30_dpp_cm.c:43-54, 219-227`, `REG_UPDATE(CM_CONTROL, CM_BYPASS, 0)`;
 `debug.cm_in_bypass` is never set for DCN401), and on DCN4 the cursor unit (`CM_CUR0`) sits inside the CM block. Whether the bypass mux sits before or after the cursor blend is undocumented: the CRC A/B decides.
 

@@ -17,7 +17,7 @@ never writes to the GPU.
   `amdgpu_regs` / `amdgpu_vram` are refused under `lockdown=confidentiality`).
 - Optional: `vkcube` (package `vulkan-tools`) for the 3D capture.
 - This repository on the machine (clone the `private` remote, branch
-  `premetal/int`), or just copy the two scripts in `tools/linux/`.
+  `int`), or just copy the two scripts in `tools/linux/`.
 
 ## The captures (about 5 minutes in total)
 

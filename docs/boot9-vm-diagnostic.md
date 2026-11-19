@@ -1,6 +1,6 @@
 # Boot 9: the VM-client diagnostic (final real-card plan entry)
 
-Author: Anvil, branch `premetal/vmdiag` (from `premetal/w13` adf24e0; scripts and this document only, no kext code). Context: `docs/vm-client-rootcause.md`
+Author: Anvil, branch `vmdiag` (from `w13` adf24e0; scripts and this document only, no kext code). Context: `docs/vm-client-rootcause.md`
 (hub-task-311), Forge's S1 diagnostic `docs/w13-vmid.md` s.8.1 / `src/vmtest.cpp` (`rdna4-vmid-test`). Evidence tags as there: [M] measured, [I] inferred, [U] unknown.
 
 ## 0. Why two boots, and an erratum to hub-task-311
@@ -27,7 +27,7 @@ confound; every other hypothesis (H1-H8) is read from either boot's survey/probe
 - **Round 6's boot 2 minus `rdna4-vbl=1 rdna4-cursor=1`**: both flood the kernel log (the round 6 window began 146 s into the boot and held no bring-up line [M]).
 - **`rdna4-compute=7` stays.** (The lead's question: "compute=1 stops at the survey stage".) `rdna4-compute=<stage>` runs bring-up up to that stage and **1 is the survey stage only**; 7 is
   the full bring-up whose `compute:` lines (mec/vm/runtime/pm) this boot needs [M: `runStages`, `kFeatures`]. My hub-task-311 note "+ `rdna4-compute=1`" was a mistake.
-- **`rdna4-vmid-test=15`** = Forge's mask (S1 round 2, `premetal/w13` 0cfa416: hub/L2 + SMU in every survey, `Compute,VMSurvey`/`Compute,VMOps` persistence, refusal traces, **bit 8 = the client-style probes T4a/T4d/T5b repeated after clock gating**, row `vmidtest-late`): 1 probes (T0 SH_MEM + SPI_GDBG readback, T1/T2 slot reuse, T3 U1/U2, T5 vadd via IB, T4a/b/c client-style queue first activation / reactivation /
+- **`rdna4-vmid-test=15`** = Forge's mask (S1 round 2, `w13` 0cfa416: hub/L2 + SMU in every survey, `Compute,VMSurvey`/`Compute,VMOps` persistence, refusal traces, **bit 8 = the client-style probes T4a/T4d/T5b repeated after clock gating**, row `vmidtest-late`): 1 probes (T0 SH_MEM + SPI_GDBG readback, T1/T2 slot reuse, T3 U1/U2, T5 vadd via IB, T4a/b/c client-style queue first activation / reactivation /
   VMID 3, **T5c incremental stream bisect + sibling queues**, T5b launch-exact stream, T6 no-EXEC page, T7 negative control), 2 read-only surveys of engines and all 8 MEC HQDs at the
   flow points (before and after `vmBootSelfTest`, after the flip test, after clock gating, after the first client opens), 4 a bounded (64-line) client-operation trace.
 - **`rdna4-gfxpm=24`** = sample (8) + per-stage survey (16) and nothing else: the existing `pm: survey ...` lines after stages 3-7 and the `cg before/after` samples with SMU activity and
@@ -81,7 +81,7 @@ early and late. Until they land, the script's rows degrade gracefully (messages 
 ## 5. Emulator dry run (Kiln)
 Expected on the emulator (from Forge's doc and the round 6 analysis): clients work there (round 6 card failures are not modelled), so the dry run checks that the boot's **extraction
 works end to end**: `vm-survey` prints 5+ points (all `0x0000382c`-shaped), `vmidtest` row PASS or names a modelling gap, `vm-trace` has lines, `idle-pin` PASS (emulator sensors), no row
-crashes on missing registry properties. A run is requested from Kiln for boot 9 and 9b on `premetal/dryrun` + this branch's scripts; the result is in the hub-task-322 report.
+crashes on missing registry properties. A run is requested from Kiln for boot 9 and 9b on `dryrun` + this branch's scripts; the result is in the hub-task-322 report.
 
 ## 6. What is not done / not claimed
 No kext code here; no GPU run; nothing about boot 9 has been run on the card or (yet) on the emulator. H9 is a hypothesis: F is active during the round 6 boot test and I could not

@@ -1,6 +1,6 @@
-# W36 vmfix5: IS_PTE (bit 63) on leaf PTEs (branch premetal/vmfix5, off premetal/int 6e996d7)
+# W36 vmfix5: IS_PTE (bit 63) on leaf PTEs (branch vmfix5, off int 6e996d7)
 
-Root cause per premetal/rootcause-vm.md, re-verified in the source: `amdgpu_ttm_tt_pte_flags()` does
+Root cause per docs/rootcause/rootcause-vm.md, re-verified in the source: `amdgpu_ttm_tt_pte_flags()` does
 `flags |= adev->gart.gart_pte_flags` (amdgpu_ttm.c:1477) and gmc_v12_0.c:794-796 defines that as MTYPE_UC | EXECUTABLE | IS_PTE, so every
 normal GC 12 leaf PTE carries bit 63; nothing clears it. My W22 finding ("not set on normal PTB leaves") was wrong: I read
 gmc_v12_0_get_vm_pte and amdgpu_vm_pt.c but not the body of amdgpu_ttm_tt_pte_flags.

@@ -142,7 +142,7 @@ amdgpu/W12e), a real gfx hang and what the wedge leaves behind (halt + reboot is
 The "no ring-side VM flush" decision above rests on one invariant: **a VMID's translations are invalidated (over MMIO, `vmInvalidate`) whenever a mapping goes away**, so the CP/UTCL
 never walks a stale PTE of a freed buffer that has been reused. Forge found, and the lead verified, that `rtFree` does **not** do this for **device** buffers today (it calls `vmUnmap` and frees the heap
 range; `vmInvalidate` only runs for host buffers). For compute that hole already exists; for gfx it would let a client's stream reach freed-and-reallocated VRAM. The fix is W13 step S0 on
-`premetal/w13` (not made here, to avoid a conflict). **Do not enable W12k (boot 8, `rdna4-run tri/tricol` against a real card) or merge `premetal/w12k` without S0.** `rtRelease` is not affected: it clears the
+`w13` (not made here, to avoid a conflict). **Do not enable W12k (boot 8, `rdna4-run tri/tricol` against a real card) or merge `w12k` without S0.** `rtRelease` is not affected: it clears the
 whole table and invalidates (`vmInvalidate(vmid, "client close")`) before the VMID is reused.
 
 ### One place for the IB's VMID (W13 contract, docs/w13-vmid.md 5.6)
@@ -173,4 +173,4 @@ printed), **`gfx-app-tri` PASS** (the same stream the replay proves; the emulato
 ## Integration note (hub-task-357): shared-queue clients need the gfx fence fields
 
 `rtOpenInner` sets `c->gfxFenceCpu` / `c->gfxFenceMc` (the client's gfx fence dword, `kVmFence + kGfxFenceSlot`); `rtOpenShared` (W13 S7-lite, `rdna4-vmshared=1`) did not, so boot 13 failed (`gfx-client FAIL setup`,
-`SubmitGfxIb: resource shortage`, Kiln's whole-plan dry run). Fixed on `premetal/final` (4365f84). **S8's open path (`rdna4-vmshared=2`) must set the same two fields** when S8 merges.
+`SubmitGfxIb: resource shortage`, Kiln's whole-plan dry run). Fixed on `final` (4365f84). **S8's open path (`rdna4-vmshared=2`) must set the same two fields** when S8 merges.

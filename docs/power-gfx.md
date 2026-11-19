@@ -1,6 +1,6 @@
 # Power after graphics work: idle, GFXOFF, sleep/wake with the gfx ring and clients (design, phase 1)
 
-2026-09-30, branch `premetal/power` (from `premetal/w12k` fdf174a + f43d3c9). **Design only: no kext code, no GPU runs.** Everything is
+2026-09-30, branch `power` (from `w12k` fdf174a + f43d3c9). **Design only: no kext code, no GPU runs.** Everything is
 labelled **[M]** measured (with a file:line), **[I]** inferred (reasoning from code/docs, not observed), **[U]** unknown (needs the card). Log
 citations are to `docs/hw-logs/2026-09-30-power-evidence/idle-power-by-boot.txt` (first-occurrence extracts, same file:line numbering as
 the originals on the OPENCORE stick, `rdna4fb-diag-20260930-<time>.txt`); source citations are to this tree; amdgpu citations are to
@@ -250,7 +250,7 @@ If the machine does not come back: power-cycle; the last `rdna4-trail` names the
 
 ## 9. Implemented (hub-task-328): P2 idle accounting, P3 post-client idle row, P7 sleep/wake hardening
 
-Branch `premetal/power` on `premetal/w12k` (f43d3c9). New file `src/pmidle.cpp`; call sites are one-liners (`IdleUse` guards, abort checks, three guards in `runStages`). **Nothing here has run on the card or
+Branch `power` on `w12k` (f43d3c9). New file `src/pmidle.cpp`; call sites are one-liners (`IdleUse` guards, abort checks, three guards in `runStages`). **Nothing here has run on the card or
 (yet) on the emulator**; build and `nm -u` are the only verification so far (§9.5).
 
 ### 9.1 P2 — idle accounting (`rdna4-gfxidle=1`, default off)
@@ -300,10 +300,10 @@ What is **not** guaranteed: that the display is blanked before the GPU's MEC/PFP
 
 - Kext + `rdna4-run` build (`OSXCROSS=$HOME/.local/share/osxcross bash tools/build/build-osxcross.sh`, exit 0; one pre-existing warning `cgArg`); `nm -u` of the new kext identical to `AMDRadeonRDNA4-int`'s; `bash -n` on the scripts.
 - Emulator dry runs requested from Kiln (boot 8 + `rdna4-gfxidle=1`; `rdna4-sleeptest=1` sleep path with and without `rdna4-resume-tests=1`; a wait in flight during the debug sleep selector): results in the hub-task-328 report.
-- **Emulator runs on the final tree (Kiln, hub-task-330, `premetal/final` 20c2997, bin/final3)**: boot 10: `gfx-idle-acct PASS` with the expected `idle:` transitions (e.g. `busy -> idle after 1373 ms busy (last use: copy ...)`, `idle -> busy after 3812 ms idle (dispatch)`), no timer/lock hang, clients PASS; `post-idle` FAILs only because the emulator's SMU is a constant 3 % / 120 W. Boot 11s: `sleep PASS`, `power: sleep requested`, `gfx: no client gfx IB in flight`, the wake skips the G3/G4 draws and the flip test; with `rdna4-resume-tests=1` the draws and the flip test run again after the wake (old behaviour back); with `rdna4-sleepabort=0` the cycle also passes (the emulator's sleeptest op is too short to show the old waiting-to-timeout behaviour). **Still not exercised**: an abort of a long/hung dispatch in flight during the sleep selector (the emulator does not model that), and everything on the real card.
+- **Emulator runs on the final tree (Kiln, hub-task-330, `final` 20c2997, bin/final3)**: boot 10: `gfx-idle-acct PASS` with the expected `idle:` transitions (e.g. `busy -> idle after 1373 ms busy (last use: copy ...)`, `idle -> busy after 3812 ms idle (dispatch)`), no timer/lock hang, clients PASS; `post-idle` FAILs only because the emulator's SMU is a constant 3 % / 120 W. Boot 11s: `sleep PASS`, `power: sleep requested`, `gfx: no client gfx IB in flight`, the wake skips the G3/G4 draws and the flip test; with `rdna4-resume-tests=1` the draws and the flip test run again after the wake (old behaviour back); with `rdna4-sleepabort=0` the cycle also passes (the emulator's sleeptest op is too short to show the old waiting-to-timeout behaviour). **Still not exercised**: an abort of a long/hung dispatch in flight during the sleep selector (the emulator does not model that), and everything on the real card.
 - Not verified anywhere: the idle state machine against a real client mix; that `removeEventSource` in `powerWillSleep` (under `rtLock`) cannot deadlock against `idleTick` (it only `TryLock`s; the present timer's stop path has the same shape) [I]; the abort while a real wave runs.
 - Real-card boots (`tools/rig/set-boot.sh`): **10** = boot 8 + `rdna4-gfxidle=1` (P2/P3, no hardware change); **11** = boot 8 + `rdna4-pm=1 rdna4-gfxidle=1`, the sleep/wake boot: **never run on the card, run it last**,
-  power-cycle after. (Boot numbers 9/9b belong to the VM diagnostic on `premetal/vmdiag`; the numbering in §7 above predates that and its "boot 9/10/11" are superseded by this list and by `docs/boot9-vm-diagnostic.md`.)
+  power-cycle after. (Boot numbers 9/9b belong to the VM diagnostic on `vmdiag`; the numbering in §7 above predates that and its "boot 9/10/11" are superseded by this list and by `docs/boot9-vm-diagnostic.md`.)
 
 ### 9.6 SDMA across a wake: what the kext does with the engine's pointers (hub-task-357)
 

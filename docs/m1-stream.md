@@ -1,6 +1,6 @@
 # M1 prep: the command stream of Apple's paravirtual GPU (hub-task-440)
 
-Static map of what the guest writes for the host, from Apple's own binaries: `AppleParavirtGPU.kext` (kernel driver; the full 26.6.2 install's `SystemKernelExtensions.kc`) and `AppleParavirtGPUMetal.bundle` (the x86_64 slice of the user-space Metal device; `PGSerializer*` encoders). Branch `premetal/m0`.
+Static map of what the guest writes for the host, from Apple's own binaries: `AppleParavirtGPU.kext` (kernel driver; the full 26.6.2 install's `SystemKernelExtensions.kc`) and `AppleParavirtGPUMetal.bundle` (the x86_64 slice of the user-space Metal device; `PGSerializer*` encoders). Branch `m0`.
 Status words: **measured** = read from the binaries (instruction level) or from a run; **INFER** = reasoned, not shown; **code** = written and compiled/tested on the host, not yet run against Apple's driver.
 Clean-room: everything below was derived from Apple's binaries with the tools in `tools/metal/m0` and `tools/metal/m1`; the only other source consulted was the register map already in `docs/metal-spike.md` s.6.1 (which cites reims-vgpu's public documentation, LGPL, as the pointer to look at the control block). No reims code, table or structure was used. No Apple bytes are in git: tables contain ids, sizes and names we derived.
 

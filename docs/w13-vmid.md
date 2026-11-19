@@ -1,6 +1,6 @@
 # W13: more than 8 GPU clients — design (phase 1, no kext code)
 
-Branch `premetal/w13` (from `premetal/g4` 789606f). Written 2026-09-30 on the Linux box, from the code and from amdgpu in
+Branch `w13` (from `g4` 789606f). Written 2026-09-30 on the Linux box, from the code and from amdgpu in
 Linux 7.2.2 (the Windows-side "design A = per-job VMIDs" notes are not available; this redoes the design).
 
 Evidence tags used throughout:
@@ -31,7 +31,7 @@ the vadd check on buffers past them, 256 results correct (`bigva.txt`; its "afte
 wording, nothing was reset). The rest of this document is as written.
 
 **Status after the lead's review (hub-task-307, 2026-09-30/10-01):** design B approved; two shared queues, C deferred, old fixed-VMID path kept
-behind a boot-arg until S9, root-only userclient unchanged for pre-Metal. Done on `premetal/w13`: **S0** (`3b8df07`, the `rtFree`/`rtUnload` invalidate),
+behind a boot-arg until S9, root-only userclient unchanged for pre-Metal. Done on `w13`: **S0** (`3b8df07`, the `rtFree`/`rtUnload` invalidate),
 **S5** (`4386290`, `src/vmid.{hpp,cpp}` + 36 host checks, mutation-checked), **S4** (`2867f86` emulator E1-E6, `3fc6950` `tools/vm/emu-qtest-vm.py`, 32 checks
 that run on the built emulator with no guest), and the compute replay for U1 (`446e48c`, written, **not run**). Not done: S1-S3, S6-S10. Section 6 has the
 per-step status, section 7 what the emulator now models, section 8.1 the final real-card boot plan.
@@ -101,7 +101,7 @@ SDMA path that writes tables (`vmTableSync`, `runtime.cpp:635-664`). The design 
 
 ### 1.1 What the real card has shown about the current client path
 
-[MEASURED], from `rdna4fb-diag-20260930-061829.txt` (round 6, VM boot, kext = `premetal/int`; excerpt in `docs/hw-logs/2026-09-30-round6-client-paths-fail.txt`):
+[MEASURED], from `rdna4fb-diag-20260930-061829.txt` (round 6, VM boot, kext = `int`; excerpt in `docs/hw-logs/2026-09-30-round6-client-paths-fail.txt`):
 
 - `AMDRadeonRDNA4,Results`: `vm = PASS boot self-test`, `runtime = PASS service ready`. The boot self-test is **one** translated MEC queue (VMID 8, pipe 0 queue 1,
   doorbell 0x1a, `vmBootSelfTest`, `runtime.cpp:742`): a ring `WRITE_DATA` and a `RELEASE_MEM` fence. It runs **no shader**.
@@ -441,7 +441,7 @@ Host tests (`testSparseTree`, test/atomdump.cpp): every mapped VA is checked by 
 **Negative control**: the same crossing map on the contiguous layout succeeds and the far side does not translate. **Mutants that fail the tests**: PDB0 page shared between GiB, PDB1 PDE never written, new PDE not marked dirty, unmap or map (VRAM and host) not marking an existing PT page dirty. Not run: the kext path (no guest); `sparseSync` per call copies only dirty pages, which is fewer copies than the old fixed three plus the touched PT pages.
 What is still reviewed, not executed: the wrappers around the module (argument checks, sync order: mirrored in the test), `launch()`'s `put`/`viaIb` split, `rtRelease`'s sparse branch; the legacy paths are otherwise unchanged except `clientCap()`, `bufferCap()/programCap()` (256/32 in modes 0/1), larger arrays, `vmInvalidateOwned` (= `vmInvalidate(c.vmid)` in modes 0/1).
 **Shared-queue doorbells (hub-task-347):** dwords 74 and 76, no longer 42/44, which the S1 probe queues at (0,1)/(1,1) also use (client slots use 26-40); the emulator had routed the shared queues' doorbells to a dequeued probe HQD (the first queue ever used with the dword) and the jobs silently never ran. The emulator now routes only to ACTIVE HQDs (qtest `test_doorbell_routes_to_active_queue`).
-**Open integration item with W12k (from Kiln's whole-plan dry run, hub-task-349/350):** `premetal/w13` predates the W12k merge, so neither `rtOpenShared` nor `rtOpenPooled` here sets a client's gfx fence (`gfxFenceCpu` / `gfxFenceMc`, the dword at `kVmFence + kGfxFenceSlot`). On `premetal/final` the S7-lite open (`rtOpenShared`) needed exactly that (boot 13: "gfx-app-tri FAIL: resource shortage", fixed there). **When S8 is merged onto final, `rtOpenPooled` must set them too, and the W12k gfx submit path (`rtSubmitGfxIb`: the gfx ring takes the VMID from the packet) must go through `vmAcquire`/the VMID pool like the compute path does; neither is written or tested.** The emulator dry run also cannot validate the resume path (its simulated power reset does not reset SDMA rptr/wptr).
+**Open integration item with W12k (from Kiln's whole-plan dry run, hub-task-349/350):** `w13` predates the W12k merge, so neither `rtOpenShared` nor `rtOpenPooled` here sets a client's gfx fence (`gfxFenceCpu` / `gfxFenceMc`, the dword at `kVmFence + kGfxFenceSlot`). On `final` the S7-lite open (`rtOpenShared`) needed exactly that (boot 13: "gfx-app-tri FAIL: resource shortage", fixed there). **When S8 is merged onto final, `rtOpenPooled` must set them too, and the W12k gfx submit path (`rtSubmitGfxIb`: the gfx ring takes the VMID from the packet) must go through `vmAcquire`/the VMID pool like the compute path does; neither is written or tested.** The emulator dry run also cannot validate the resume path (its simulated power reset does not reset SDMA rptr/wptr).
 **Not run**: the kext paths themselves (no guest); ring accounting, recovery after a hang with other clients queued, the 5 s all-VMIDs-busy wait and sparse-table memory pressure have never executed.
 
 ## 6. Implementation plan — small steps, each with a test
@@ -542,7 +542,7 @@ Use `rdna4-compute=1`-style minimal extras (no vblank/cursor) so the dmesg windo
 table below: it adds **T2** (a never-used slot), **T4a/b/c** (client-style queue: first activation, reactivation of the same slot, HQD VMID 3 instead of 8), **T5c** (the incremental
 stream WRITE_DATA, +ACQUIRE_MEM, +SET_SH_REGs, +DISPATCH of an `s_endpgm`-only kernel, +vadd, +RELEASE_MEM on one fresh queue, with rptr/HIT/CPC/fault after each step, the first stalled
 step named, then sibling queues probed on the same and the other pipe) and **T5b** (the `launch()`-exact stream, only if T5c passed). Anvil's H1/H2/H3 requests (hub-task-317) shaped these.
-**Added after Anvil's review (hub-task-323, `premetal/w13`):** mask bit 8 = **late probes** after clock gating (T4a, T4d, T5b repeated, results key `vmidtest-late`, log lines tagged `vmidtest late:`), so the boot plan uses `rdna4-vmid-test=15`;
+**Added after Anvil's review (hub-task-323, `w13`):** mask bit 8 = **late probes** after clock gating (T4a, T4d, T5b repeated, results key `vmidtest-late`, log lines tagged `vmidtest late:`), so the boot plan uses `rdna4-vmid-test=15`;
 **T4d** (a client-style HQD activated, idle 50 ms, dequeued with *no packet at all*: separates "drain times out with no work" from every shader/fence explanation); every survey now also prints the GC hub L2 state
 (`GCVM_L2_CNTL` incl. bit 11 default-page-to-system, fault default address, `L2_STATUS` busy bits, fault status, which VMID contexts are enabled) — the round-6 boots ran with `rdna4-vm-diag=4065`, whose bit 512 points the fault default page at a system page
 during the baseline attempt, so "a clean vm=1 boot pins the GPU" was never shown — and an SMU line (avg GFXCLK, activity, socket W; 300 ms settle before the point after `vmBootSelfTest`, 1 s after clock gating);
@@ -574,7 +574,7 @@ with `0x00800880`-like status; with the new TLB model a missing `vmInvalidate` b
 
 ## 9. Sources read
 
-Kext (this worktree, `premetal/g4`): `src/runtime.cpp` (rtOpen/rtRelease/rtDispatch/rtSubmitIb/rtWaitFence/vm*/power), `src/compute.cpp` (`hqdInitFor`,
+Kext (this worktree, `g4`): `src/runtime.cpp` (rtOpen/rtRelease/rtDispatch/rtSubmitIb/rtWaitFence/vm*/power), `src/compute.cpp` (`hqdInitFor`,
 `recoverComputeQueue`, `launch`, `gfxOffAllowedNow`), `src/compute.hpp`, `src/gpuvm.*`, `src/userclient.*`, `src/ih.*`/`ihdecode.cpp`, `src/gfxring.cpp`, `src/pm4.*`,
 `src/gfxregs.hpp`, `include/rdna4compute.h`, `userspace/rdna4-run/rdna4-run.c`; docs `rootcause/verify-vm.md`, `w12k-gfx-submit.md`, `linux-replay.md`, `hw-logs/2026-09-30-linux-gfx-ring/`;
 `w36-report.md`, `w40-report.md`; `emu/qemu/rdna4.c` (VM walk `:2113-2420`, banked registers `:745-800`, MEC `:3789-4225`, gfx stream `:5560-5720`).
