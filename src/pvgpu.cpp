@@ -880,6 +880,8 @@ private:
 	// serialized work-loop path, so these counters need no separate lock.
 	uint64_t mSubmitNs { 0 }, mSubmitMaxNs { 0 }, mSubmitCalls { 0 }, mSubmitSlow { 0 };
 	uint64_t mSubmitBusyRetries { 0 }, mSubmitNotReadyMs { 0 };
+	// Time spent inside the 250 us host timer callback, which also services display events.
+	uint64_t mTickNs { 0 }, mTickMaxNs { 0 }, mTickCalls { 0 }, mTickOver250us { 0 }, mTickOver1ms { 0 };
 	uint64_t mPhaseNs[6] {};            // of those: textures in, target in and submit, the card, target out and the rest; the pipeline and
 	                                     // its shaders, the target and the buffers
 	uint64_t mMapNs { 0 };              // mapPages' share
@@ -1526,6 +1528,7 @@ void RDNA4PvHost::tick() {
 		displayTick();
 		return;
 	}
+	const uint64_t tickAt = nowNs();
 	if (mTicks++ < 3)
 		pvlog("host: tick %llu", mTicks);
 	if (mTicks == 1)
@@ -1577,6 +1580,17 @@ void RDNA4PvHost::tick() {
 		mTimer->setTimeoutUS(250);
 	else
 		mTimer->setTimeoutMS(1);
+
+	// Measure the complete callback, including submissions and any waits it incurred.
+	// This makes work-loop stalls visible beside the existing VBL-lateness statistics.
+	const uint64_t tickNs = nowNs() - tickAt;
+	mTickCalls++;
+	mTickNs += tickNs;
+	mTickMaxNs = tickNs > mTickMaxNs ? tickNs : mTickMaxNs;
+	if (tickNs >= 250000)
+		mTickOver250us++;
+	if (tickNs >= 1000000)
+		mTickOver1ms++;
 }
 
 // A texture whose heap slot the guest freed before the host read the draw that samples it, and that no scan kept (the icon service on Tahoe
@@ -9023,6 +9037,9 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	if (mSubmitCalls)
 		pvstat("host: render:   GPU submits %llu, slow (>=2 ms) %llu, average %llu us, max %llu us, busy retries %llu, not-ready wait %llu ms",
 		       mSubmitCalls, mSubmitSlow, mSubmitNs / mSubmitCalls / 1000, mSubmitMaxNs / 1000, mSubmitBusyRetries, mSubmitNotReadyMs);
+	if (mTickCalls)
+		pvstat("host: render:   host ticks %llu, average %llu us, max %llu us, >=250 us %llu, >=1 ms %llu",
+		       mTickCalls, mTickNs / mTickCalls / 1000, mTickMaxNs / 1000, mTickOver250us, mTickOver1ms);
 	pvstat("host: render:   %u textures in place, %u copied, mapping %llu ms (%u new, %llu pages), rows %llu ms (%llu KiB, %u copies reused); "
 	      "shadows: %u made, %u freed, %llu MiB; stale %u dropped, %u old, %u locked, %u rewritten", mInPlace, mCopied, mMapNs / 1000000, mMapMisses, mMapPages, mCopyNs / 1000000, mCopiedBytes >> 10,
 	      mCopiesReused, mShadowsMade, mShadowsFreed, mShadowBytes >> 20, mStale[0], mStale[1], mStale[2], mStale[3]);
@@ -9165,6 +9182,7 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mDrawStatMaxNs = 0;
 	mSubmitNs = mSubmitMaxNs = mSubmitCalls = mSubmitSlow = 0;
 	mSubmitBusyRetries = mSubmitNotReadyMs = 0;
+	mTickNs = mTickMaxNs = mTickCalls = mTickOver250us = mTickOver1ms = 0;
 }
 
 void RDNA4PvHost::pollDisplay() {
