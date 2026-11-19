@@ -3,7 +3,7 @@
 What each version adds, and what of it has run on the card (RX 9070 XT, macOS Big Sur 11.6.6 unless a line says
 otherwise). The newest version is on top. How versions and branches work is in `CONTRIBUTING.md`.
 
-## After 0.3.2 (on `next`, no number yet)
+## 0.3.3 (2026-11-19)
 
 **Metal (`make PVGPU=1`)**
 - Sublime Text draws (through OpenGL on Metal, `AppleMetalOpenGLRenderer`). Its window stayed black: its draws read
