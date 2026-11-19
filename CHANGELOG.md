@@ -9,6 +9,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - RGBA8 IOSurfaces as colour attachments (only BGRA8 ones before): WindowServer renders an inactive window's material into
   one, and Safari's Downloads popover with another app in front kept an empty background, its text drawn over itself.
   Card (Tahoe 26.6.2, 2026-11-18): the popover's background stays.
+- Viewports in fractions of a pixel set exactly (to 1/256 pixel), no longer rounded to whole pixels (up to half a pixel off):
+  vkQuake through MoltenVK draws thousands of them. Card (2026-11-19): 7890 in a timedemo, 43.4 fps as before.
 - A draw that samples a texture an earlier draw in the same batch drew into waits for it first (an idle barrier, the
   shader caches dropped): Tahoe's glass reads the display's frame around the pointer just after drawing into it, and
   read pixels from before those draws, blocks of old screen content flickering in Safari's tab bar while the pointer
