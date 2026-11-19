@@ -882,6 +882,7 @@ private:
 	uint64_t mSubmitBusyRetries { 0 }, mSubmitNotReadyMs { 0 };
 	// Time spent inside the 250 us host timer callback, which also services display events.
 	uint64_t mTickNs { 0 }, mTickMaxNs { 0 }, mTickCalls { 0 }, mTickOver250us { 0 }, mTickOver1ms { 0 };
+	uint64_t mTickPhaseNs[6] {}, mTickPhaseMaxNs[6] {};   // IRQ/late, guest FIFO, pipelines, channels+submit, display, finish
 	uint64_t mPhaseNs[6] {};            // of those: textures in, target in and submit, the card, target out and the rest; the pipeline and
 	                                     // its shaders, the target and the buffers
 	uint64_t mMapNs { 0 };              // mapPages' share
@@ -1539,11 +1540,12 @@ void RDNA4PvHost::tick() {
 	// timed wait (most raises of a session: animations stood still, frames came late).
 	dropIrqBits();
 	const uint32_t cmds = mCmds;
-	const uint64_t tickAt = nowNs();   // a tick that came 100 ms or more late: logged (the pointer stood at times, 2026-11-20)
+	// a tick that came 100 ms or more late: logged (the pointer stood at times, 2026-11-20)
 	if (mTickAt && tickAt - mTickAt >= 100000000)
 		pvstat("host: tick %llu ms after the one before (%u commands since)", (tickAt - mTickAt) / 1000000, cmds - mCmdsAtTick);
 	mTickAt = tickAt;
 	mCmdsAtTick = cmds;
+	uint64_t phaseAt = nowNs();
 
 	// The runtime opened here, on the tick's own shallow stack, once the guest is talking (then once a second until it opens): opened first from
 	// runDraw, 10 KB down the command walk, IOLog's os_log path ran the timer thread's 16 KB kernel stack out (double fault panic, 2026-11-20).
@@ -1552,17 +1554,45 @@ void RDNA4PvHost::tick() {
 		(void)openRuntime();
 	}
 	completeLate();
+	uint64_t phaseNs = nowNs() - phaseAt;
+	mTickPhaseNs[0] += phaseNs;
+	mTickPhaseMaxNs[0] = phaseNs > mTickPhaseMaxNs[0] ? phaseNs : mTickPhaseMaxNs[0];
+
+	phaseAt = nowNs();
 	pollRegisters();
 	mapRoot();
 	pollFifo();
+	phaseNs = nowNs() - phaseAt;
+	mTickPhaseNs[1] += phaseNs;
+	mTickPhaseMaxNs[1] = phaseNs > mTickPhaseMaxNs[1] ? phaseNs : mTickPhaseMaxNs[1];
+
+	phaseAt = nowNs();
 	scanPipelines();   // before the command buffers that may draw with them
+	phaseNs = nowNs() - phaseAt;
+	mTickPhaseNs[2] += phaseNs;
+	mTickPhaseMaxNs[2] = phaseNs > mTickPhaseMaxNs[2] ? phaseNs : mTickPhaseMaxNs[2];
+
+	phaseAt = nowNs();
 	pollChannels();
 	flushBatch();   // what the commands drew, on the card while the host waits for more
+	phaseNs = nowNs() - phaseAt;
+	mTickPhaseNs[3] += phaseNs;
+	mTickPhaseMaxNs[3] = phaseNs > mTickPhaseMaxNs[3] ? phaseNs : mTickPhaseMaxNs[3];
+
+	phaseAt = nowNs();
 	flipDone();
 	pollDisplay();
+	phaseNs = nowNs() - phaseAt;
+	mTickPhaseNs[4] += phaseNs;
+	mTickPhaseMaxNs[4] = phaseNs > mTickPhaseMaxNs[4] ? phaseNs : mTickPhaseMaxNs[4];
+
+	phaseAt = nowNs();
 	if (mLevel >= 2)
 		selfTest();
 	completeLate();   // what finished meanwhile: its stamps now, not a tick later
+	phaseNs = nowNs() - phaseAt;
+	mTickPhaseNs[5] += phaseNs;
+	mTickPhaseMaxNs[5] = phaseNs > mTickPhaseMaxNs[5] ? phaseNs : mTickPhaseMaxNs[5];
 
 	// While the guest is busy, every 250 us: each command waited for the next tick and each stamp for the one after, up to 10 ms a frame at
 	// 5 ms (two displays did not get past 35 frames a second each). Idle again after kBusyNs.
@@ -1572,8 +1602,21 @@ void RDNA4PvHost::tick() {
 	if (mCmds != cmds || mLateCount || mPending)
 		mBusySince = now;
 
-	if (!mTimer)
+	auto recordTick = [this, tickAt]() {
+		const uint64_t tickNs = nowNs() - tickAt;
+		mTickCalls++;
+		mTickNs += tickNs;
+		mTickMaxNs = tickNs > mTickMaxNs ? tickNs : mTickMaxNs;
+		if (tickNs >= 250000)
+			mTickOver250us++;
+		if (tickNs >= 1000000)
+			mTickOver1ms++;
+	};
+
+	if (!mTimer) {
+		recordTick();
 		return;
+	}
 
 	// Idle every 1 ms: the first frame of an animation started up to a 5 ms tick late, its VBL events as late (they are set by the tick).
 	if (now - mBusySince < kBusyNs)
@@ -1581,16 +1624,8 @@ void RDNA4PvHost::tick() {
 	else
 		mTimer->setTimeoutMS(1);
 
-	// Measure the complete callback, including submissions and any waits it incurred.
-	// This makes work-loop stalls visible beside the existing VBL-lateness statistics.
-	const uint64_t tickNs = nowNs() - tickAt;
-	mTickCalls++;
-	mTickNs += tickNs;
-	mTickMaxNs = tickNs > mTickMaxNs ? tickNs : mTickMaxNs;
-	if (tickNs >= 250000)
-		mTickOver250us++;
-	if (tickNs >= 1000000)
-		mTickOver1ms++;
+	// Include submission waits in the callback measurement: this is the time other work-loop events cannot run.
+	recordTick();
 }
 
 // A texture whose heap slot the guest freed before the host read the draw that samples it, and that no scan kept (the icon service on Tahoe
@@ -9037,9 +9072,14 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	if (mSubmitCalls)
 		pvstat("host: render:   GPU submits %llu, slow (>=2 ms) %llu, average %llu us, max %llu us, busy retries %llu, not-ready wait %llu ms",
 		       mSubmitCalls, mSubmitSlow, mSubmitNs / mSubmitCalls / 1000, mSubmitMaxNs / 1000, mSubmitBusyRetries, mSubmitNotReadyMs);
-	if (mTickCalls)
+	if (mTickCalls) {
 		pvstat("host: render:   host ticks %llu, average %llu us, max %llu us, >=250 us %llu, >=1 ms %llu",
 		       mTickCalls, mTickNs / mTickCalls / 1000, mTickMaxNs / 1000, mTickOver250us, mTickOver1ms);
+		pvstat("host: render:   tick phases avg/max us: IRQ %llu/%llu, FIFO %llu/%llu, pipelines %llu/%llu, submit %llu/%llu, display %llu/%llu, finish %llu/%llu",
+		       mTickPhaseNs[0] / mTickCalls / 1000, mTickPhaseMaxNs[0] / 1000, mTickPhaseNs[1] / mTickCalls / 1000, mTickPhaseMaxNs[1] / 1000,
+		       mTickPhaseNs[2] / mTickCalls / 1000, mTickPhaseMaxNs[2] / 1000, mTickPhaseNs[3] / mTickCalls / 1000, mTickPhaseMaxNs[3] / 1000,
+		       mTickPhaseNs[4] / mTickCalls / 1000, mTickPhaseMaxNs[4] / 1000, mTickPhaseNs[5] / mTickCalls / 1000, mTickPhaseMaxNs[5] / 1000);
+	}
 	pvstat("host: render:   %u textures in place, %u copied, mapping %llu ms (%u new, %llu pages), rows %llu ms (%llu KiB, %u copies reused); "
 	      "shadows: %u made, %u freed, %llu MiB; stale %u dropped, %u old, %u locked, %u rewritten", mInPlace, mCopied, mMapNs / 1000000, mMapMisses, mMapPages, mCopyNs / 1000000, mCopiedBytes >> 10,
 	      mCopiesReused, mShadowsMade, mShadowsFreed, mShadowBytes >> 20, mStale[0], mStale[1], mStale[2], mStale[3]);
@@ -9183,6 +9223,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	mSubmitNs = mSubmitMaxNs = mSubmitCalls = mSubmitSlow = 0;
 	mSubmitBusyRetries = mSubmitNotReadyMs = 0;
 	mTickNs = mTickMaxNs = mTickCalls = mTickOver250us = mTickOver1ms = 0;
+	memset(mTickPhaseNs, 0, sizeof(mTickPhaseNs));
+	memset(mTickPhaseMaxNs, 0, sizeof(mTickPhaseMaxNs));
 }
 
 void RDNA4PvHost::pollDisplay() {
