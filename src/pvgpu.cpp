@@ -8822,7 +8822,6 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	if (mTickGapCalls)
 		pvstat("host: render:   tick start gaps %llu, average %llu us, max %llu us, >=500 us %llu, >=1 ms %llu, >=2 ms %llu",
 		       mTickGapCalls, mTickGapNs / mTickGapCalls / 1000, mTickGapMaxNs / 1000, mTickGapOver500us, mTickGapOver1ms, mTickGapOver2ms);
-	}
 	pvstat("host: render:   %u textures in place, %u copied, mapping %llu ms (%u new, %llu pages), rows %llu ms (%llu KiB, %u copies reused); "
 	      "shadows: %u made, %u freed, %llu MiB; stale %u dropped, %u old, %u locked, %u rewritten", mInPlace, mCopied, mMapNs / 1000000, mMapMisses, mMapPages, mCopyNs / 1000000, mCopiedBytes >> 10,
 	      mCopiesReused, mShadowsMade, mShadowsFreed, mShadowBytes >> 20, mStale[0], mStale[1], mStale[2], mStale[3]);
