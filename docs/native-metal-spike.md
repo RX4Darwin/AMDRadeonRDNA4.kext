@@ -83,8 +83,8 @@ The bundle drives the card through the kext's runtime client (`librdna4`, `RDNA4
 - Every class answers a message it lacks with zeros of the protocol method's own return type (from the protocol's type encoding) and
   logs it once: `RDNA4MTL: <class> does not implement <selector>`.
 
-Check: `sudo sh ~/rdna4/native/gate2.sh` on the rig (`tools/metal/native/gate2.sh`: publishes the service, runs `mtlprobe native
-gate2.metallib`): c = a + b over 1000 floats in groups of 64 (dispatchThreads, a partial last group), then c *= 3 with `setBytes`.
+Check: `sudo sh ~/rdna4/native/probe.sh` on the rig (`tools/metal/native/probe.sh`: publishes the service, runs `mtlprobe native
+probe.metallib`; unattended: `sudo -n /usr/local/libexec/rdna4-native-run.sh native ~/rdna4/native/probe.metallib`): c = a + b over 1000 floats in groups of 64 (dispatchThreads, a partial last group), then c *= 3 with `setBytes`.
 
 **Gate 2 PASSED on the rig, 2026-11-19**: `mtlprobe: native: PASS: 0 of 1000 wrong (status 4); c[0] 3, c[999] 4498.5`. The only message
 Metal sent that the device lacks is `featureProfile`.
@@ -93,5 +93,27 @@ Open for later gates: the root-only client (an app cannot be root: the native de
 `RDNA4NativeMetal` service, a GPU address space per process); `newLibraryWithSource:` (needs Metal's compiler service for our device,
 or AIR from elsewhere); a real queue (IBs and fences instead of a synchronous commit); VRAM buffers.
 
-Next gates: a render pass, then WindowServer's pairing with a native
+## Gate 3: a render pass
+
+- `newTextureWithDescriptor:`: linear 2D RGBA8 / BGRA8 (unorm or sRGB), one level, one sample, in shared memory (`rdna4_alloc_host`), rows
+  256-byte multiples; `replaceRegion:` / `getBytes:` copy rows.
+- `newRenderPipelineStateWithDescriptor:`: the vertex and fragment functions translated into RGFX blobs (file mode again), the values
+  between the stages matched by name (`SPI_PS_INPUT_CNTL_n`), the code placed as the PV host does (VS at +0, PS at
+  `RDNA4_TRI_PS_OFFSET`, `s_code_end` around them, the attribute ring literals patched) in a code buffer of the pipeline's own.
+- The render encoder records buffers per stage (`set{Vertex,Fragment}{Buffer,Bytes}`), the viewport and `drawPrimitives`; a clear load
+  action is done by the CPU (shared memory). Each draw is the PV host's `runDraw` cut down: the proven triangle stream
+  (`gfx12tri.h`, `gfx12tricol.h` with values between the stages), its registers patched as the PV host's table (shaders, target,
+  viewport, primitive, one sample, no blending), the stages' tables in a state page, the draw spliced in for the template's
+  `DRAW_INDEX_AUTO`, submitted as the client's own gfx IB (`rdna4_submit_gfx_ib`, `rdna4-gfx=2`) and waited for.
+
+Check (the same command as gate 2): the kext's colour triangle (vertex 0 red, 1 green, 2 blue at (64,64), (192,64), (128,192)) into a
+256x256 RGBA8 texture filled with 0x55 and cleared to 0, checked with `rdna4-run tricol`'s own check (`rdna4_tricol_check`).
+
+**Gate 3 PASSED on the rig, 2026-11-19, first run**: `render PASS: 8192 px (want 8192), bounds x 64..191 y 64..190, max channel error
+0.50, max |R+G+B-255| 1, centroid 0xff555654`, pixel (0,0) cleared to 0. The desktop's paravirtual drawing on the same gfx ring went on
+(no fault or timeout in the kext's log).
+
+Not yet: blending, depth and stencil, textures and samplers in shaders, MSAA, indexed draws, other formats, the GPU doing the clear.
+
+Next gates: then WindowServer's pairing with a native
 display (the hardware cursor), then acceleration structures.

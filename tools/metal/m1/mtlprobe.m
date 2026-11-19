@@ -10,8 +10,10 @@
 //                      last group has 4, and Metal reports 4 as its size); a kernel that is not in the kext's table: it runs only if
 //                      translated at run time
 //   mtlprobe devices   every Metal device MTLCopyAllDevices returns, its class and registry ID (docs/native-metal-spike.md)
-//   mtlprobe native <gate2.metallib>   gate 2 of the native-Metal spike on our own device (RDNA4MTLDevice; as root, RDNA4_NATIVE_MTL=1):
-//                      c = a + b over 1000 floats in groups of 64 (dispatchThreads: the last group is partial), then c *= 3 with setBytes
+//   mtlprobe native <probe.metallib>   the native-Metal spike on our own device (RDNA4MTLDevice; as root, RDNA4_NATIVE_MTL=1): gate 2,
+//                      c = a + b over 1000 floats in groups of 64 (dispatchThreads: the last group is partial), then c *= 3 with setBytes;
+//                      gate 3, a render pass: the kext's colour triangle into a 256x256 RGBA8 texture filled with 0x55 and cleared to 0,
+//                      checked as rdna4-run tricol checks its own (userspace/rdna4-run/gfx12tricol.h)
 //   mtlprobe two       two kernels of one library in one command buffer: out[i] = in[i] + 1, then out[i] *= 3 (64 threads)
 //   mtlprobe twolib    the same with two libraries of one kernel each: out[i] = in[i] + 7, then out[i] *= out[i]
 //   mtlprobe feat      one kernel per Metal language feature (constant buffers, math, threadgroup memory and barriers, atomics, local
@@ -75,6 +77,8 @@
 #import <IOSurface/IOSurface.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "../../../userspace/rdna4-run/gfx12tricol.h"   // rdna4_tricol_check: mtlprobe native
 
 #define OUT(fmt, ...) do { printf("mtlprobe: " fmt "\n", ##__VA_ARGS__); fflush(stdout); } while (0)
 
@@ -2214,7 +2218,7 @@ int main(int argc, char **argv) {
 		}
 		if (!strcmp(mode, "native")) {   // the native-Metal spike's gate 2: buffers and two compute dispatches on RDNA4MTLDevice
 			if (argc < 3) {
-				OUT("native: usage: mtlprobe native <gate2.metallib>");
+				OUT("native: usage: mtlprobe native <probe.metallib>");
 				return 2;
 			}
 			id<MTLDevice> d = nil;
@@ -2266,10 +2270,52 @@ int main(int argc, char **argv) {
 			for (int i = 0; i < n; i++)
 				if (pc[i] != 3 * (pa[i] + pb[i]) && !bad++)
 					firstBad = i;
-			OUT("native: %s: %d of %d wrong (status %ld%s%s); c[0] %g, c[999] %g%s", bad || cb.status != MTLCommandBufferStatusCompleted ? "FAIL" : "PASS",
+			const BOOL computeOk = !bad && cb.status == MTLCommandBufferStatusCompleted;
+			OUT("native: compute %s: %d of %d wrong (status %ld%s%s); c[0] %g, c[999] %g%s", computeOk ? "PASS" : "FAIL",
 			    bad, n, (long)cb.status, cb.error ? ", " : "", cb.error ? cb.error.localizedDescription.UTF8String : "", pc[0], pc[n - 1],
 			    firstBad >= 0 ? [NSString stringWithFormat:@"; first wrong c[%d] = %g", firstBad, pc[firstBad]].UTF8String : "");
-			return bad ? 1 : 0;
+
+			// Gate 3: the colour triangle in a render pass whose clear replaces the 0x55 the texture was filled with.
+			MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:256 height:256 mipmapped:NO];
+			td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+			td.storageMode = MTLStorageModeShared;
+			id<MTLTexture> tex = [d newTextureWithDescriptor:td];
+			static uint32_t img[256 * 256];
+			memset(img, 0x55, sizeof img);
+			[tex replaceRegion:MTLRegionMake2D(0, 0, 256, 256) mipmapLevel:0 withBytes:img bytesPerRow:1024];
+			MTLRenderPipelineDescriptor *rd = [MTLRenderPipelineDescriptor new];
+			rd.vertexFunction = [lib newFunctionWithName:@"tri_v"];
+			rd.fragmentFunction = [lib newFunctionWithName:@"tri_f"];
+			rd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+			id<MTLRenderPipelineState> rps = tex ? [d newRenderPipelineStateWithDescriptor:rd error:&err] : nil;
+			if (!rps) {
+				OUT("native: render FAIL: %s", tex ? err.localizedDescription.UTF8String : "no texture");
+				return 1;
+			}
+			const float pos[6] = { -0.5f, 0.5f, 0.5f, 0.5f, 0, -0.5f };   // pixels (64,64), (192,64), (128,192)
+			const float col[12] = { 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1 };
+			MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+			pass.colorAttachments[0].texture = tex;
+			pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+			pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+			pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+			id<MTLCommandBuffer> rb = [[d newCommandQueue] commandBuffer];
+			id<MTLRenderCommandEncoder> re = [rb renderCommandEncoderWithDescriptor:pass];
+			[re setRenderPipelineState:rps];
+			[re setVertexBytes:pos length:sizeof pos atIndex:0];
+			[re setVertexBytes:col length:sizeof col atIndex:1];
+			[re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			[re endEncoding];
+			[rb commit];
+			[rb waitUntilCompleted];
+			[tex getBytes:img bytesPerRow:1024 fromRegion:MTLRegionMake2D(0, 0, 256, 256) mipmapLevel:0];
+			rdna4_tricol_result tr;
+			const BOOL renderOk = rdna4_tricol_check(img, &tr) && rb.status == MTLCommandBufferStatusCompleted;
+			OUT("native: render %s: %u px (want 8192), bounds x %u..%u y %u..%u, max channel error %.2f, max |R+G+B-255| %u, centroid 0x%08x, "
+			    "near the vertices 0x%08x 0x%08x 0x%08x, pixel (0,0) 0x%08x (status %ld%s%s)", renderOk ? "PASS" : "FAIL", tr.covered, tr.minX, tr.maxX,
+			    tr.minY, tr.maxY, tr.maxChannelErr256 / 256.0, tr.maxSumErr, tr.centroid, tr.near0, tr.near1, tr.near2, img[0], (long)rb.status,
+			    rb.error ? ", " : "", rb.error ? rb.error.localizedDescription.UTF8String : "");
+			return computeOk && renderOk ? 0 : 1;
 		}
 		if (!strcmp(mode, "devices")) {   // every Metal device, its class and registry ID (the native-Metal spike's gate 1)
 			NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();

@@ -28,6 +28,10 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - The native device computes: buffers, metallib libraries, compute pipelines (the AIR translator in file mode) and command
   buffers run through the kext's runtime client (root only for now). Card (2026-11-19): `mtlprobe native` runs two
   dispatches (an add, then a scale by a `setBytes` constant) over 1000 floats, all right.
+- The native device renders: 2D RGBA8 / BGRA8 textures, render pipelines (vertex and fragment functions through the
+  translator) and render passes whose draws go to the card as the device's own gfx IBs, built as the paravirtual host
+  builds its draws. Card (2026-11-19): `mtlprobe native` draws the kext's colour triangle into a cleared texture,
+  8192 pixels, colours within half a step.
 
 ## 0.3.1 (2026-11-18)
 

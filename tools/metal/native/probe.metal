@@ -1,0 +1,26 @@
+// The native-Metal spike's test functions (mtlprobe native <probe.metallib>, docs/native-metal-spike.md): gate 2's kernels, gate 3's
+// triangle (the kext's colour triangle: vertex 0 red, 1 green, 2 blue at pixels (64,64), (192,64), (128,192) of a 256x256 target).
+kernel void vadd(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device float *c [[buffer(2)]],
+                 uint i [[thread_position_in_grid]]) {
+	c[i] = a[i] + b[i];
+}
+
+kernel void scale(device float *o [[buffer(0)]], constant float &k [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+	o[i] *= k;
+}
+
+struct TriOut {
+	float4 position [[position]];
+	float4 colour;
+};
+
+vertex TriOut tri_v(uint vid [[vertex_id]], device const float2 *pos [[buffer(0)]], device const float4 *colour [[buffer(1)]]) {
+	TriOut o;
+	o.position = float4(pos[vid], 0, 1);
+	o.colour = colour[vid];
+	return o;
+}
+
+fragment float4 tri_f(TriOut in [[stage_in]]) {
+	return in.colour;
+}
