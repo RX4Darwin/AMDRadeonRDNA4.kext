@@ -875,6 +875,9 @@ private:
 	uint64_t mTickPhaseNs[6] {}, mTickPhaseMaxNs[6] {};   // IRQ/late, guest FIFO, pipelines, channels+submit, display, finish
 	uint64_t mTickLastAt { 0 }, mTickGapNs { 0 }, mTickGapMaxNs { 0 }, mTickGapCalls { 0 };
 	uint64_t mTickGapOver500us { 0 }, mTickGapOver1ms { 0 }, mTickGapOver2ms { 0 };
+	// Deadline-based lateness excludes the callback's own runtime: it measures how late the scheduler starts the next work-loop action.
+	uint64_t mTickDeadlineNs { 0 }, mTickLateNs { 0 }, mTickLateMaxNs { 0 }, mTickLateCalls { 0 };
+	uint64_t mTickLateOver250us { 0 }, mTickLateOver1ms { 0 }, mTickLateOver2ms { 0 };
 	uint64_t mPhaseNs[6] {};            // of those: textures in, target in and submit, the card, target out and the rest; the pipeline and
 	                                     // its shaders, the target and the buffers
 	uint64_t mMapNs { 0 };              // mapPages' share
@@ -1255,6 +1258,7 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 		return nullptr;
 	}
 	h->mTimer->setTimeoutMS(500);   // first tick after the nub had time to register and match
+	h->mTickDeadlineNs = nowNs() + 500000000ull;
 	if (gCompute)
 		gCompute->setSleepHook(sleepHook, h);
 
@@ -1394,6 +1398,18 @@ void RDNA4PvHost::dropIrqBits() {
 
 void RDNA4PvHost::tick() {
 	const uint64_t tickAt = nowNs();
+	if (mTickDeadlineNs) {
+		const uint64_t lateNs = tickAt > mTickDeadlineNs ? tickAt - mTickDeadlineNs : 0;
+		mTickLateCalls++;
+		mTickLateNs += lateNs;
+		mTickLateMaxNs = lateNs > mTickLateMaxNs ? lateNs : mTickLateMaxNs;
+		if (lateNs >= 250000)
+			mTickLateOver250us++;
+		if (lateNs >= 1000000)
+			mTickLateOver1ms++;
+		if (lateNs >= 2000000)
+			mTickLateOver2ms++;
+	}
 	if (mTickLastAt) {
 		const uint64_t gapNs = tickAt - mTickLastAt;
 		mTickGapCalls++;
@@ -1485,10 +1501,13 @@ void RDNA4PvHost::tick() {
 	}
 
 	// Idle every 1 ms: the first frame of an animation started up to a 5 ms tick late, its VBL events as late (they are set by the tick).
-	if (now - mBusySince < kBusyNs)
+	if (now - mBusySince < kBusyNs) {
 		mTimer->setTimeoutUS(250);
-	else
+		mTickDeadlineNs = nowNs() + 250000ull;
+	} else {
 		mTimer->setTimeoutMS(1);
+		mTickDeadlineNs = nowNs() + 1000000ull;
+	}
 
 	// Include submission waits in the callback measurement: this is the time other work-loop events cannot run.
 	recordTick();
@@ -8822,6 +8841,9 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	if (mTickGapCalls)
 		pvstat("host: render:   tick start gaps %llu, average %llu us, max %llu us, >=500 us %llu, >=1 ms %llu, >=2 ms %llu",
 		       mTickGapCalls, mTickGapNs / mTickGapCalls / 1000, mTickGapMaxNs / 1000, mTickGapOver500us, mTickGapOver1ms, mTickGapOver2ms);
+	if (mTickLateCalls)
+		pvstat("host: render:   timer scheduling lateness avg/max %llu/%llu us, >=250 us %llu, >=1 ms %llu, >=2 ms %llu",
+		       mTickLateNs / mTickLateCalls / 1000, mTickLateMaxNs / 1000, mTickLateOver250us, mTickLateOver1ms, mTickLateOver2ms);
 	pvstat("host: render:   %u textures in place, %u copied, mapping %llu ms (%u new, %llu pages), rows %llu ms (%llu KiB, %u copies reused); "
 	      "shadows: %u made, %u freed, %llu MiB; stale %u dropped, %u old, %u locked, %u rewritten", mInPlace, mCopied, mMapNs / 1000000, mMapMisses, mMapPages, mCopyNs / 1000000, mCopiedBytes >> 10,
 	      mCopiesReused, mShadowsMade, mShadowsFreed, mShadowBytes >> 20, mStale[0], mStale[1], mStale[2], mStale[3]);
@@ -8963,6 +8985,8 @@ void RDNA4PvHost::noteDraw(uint64_t ns) {
 	memset(mTickPhaseMaxNs, 0, sizeof(mTickPhaseMaxNs));
 	mTickGapNs = mTickGapMaxNs = mTickGapCalls = 0;
 	mTickGapOver500us = mTickGapOver1ms = mTickGapOver2ms = 0;
+	mTickLateNs = mTickLateMaxNs = mTickLateCalls = 0;
+	mTickLateOver250us = mTickLateOver1ms = mTickLateOver2ms = 0;
 }
 
 void RDNA4PvHost::pollDisplay() {
