@@ -89,7 +89,25 @@ RDNA4_ACCEL_BASE(IOAccelDisplayPipe)
 // memory map's three (the GPU page table) are for submissions through the family, which nothing makes yet: they do nothing.
 class RDNA4EventMachine : public IOAccelEventMachineFast2 {
 	OSDeclareDefaultStructors(RDNA4EventMachine)
+	using super = IOAccelEventMachineFast2;
+	void *stamps = nullptr;   // the stamps' memory (never freed: the machine lives as long as the accelerator)
+
 public:
+	// The family's init, then the stamps' memory: as AMD's, setStampBaseAddress (each stamp's address from it); without it the family's
+	// GPU progress check read through a null array 17 s into a boot with our accelerator (2026-11-20). Zeroed: nothing completes yet.
+	// ponytail: 64 KiB, far more than the stamps' offsets reach; IOMallocZero, not shared with user space (getStampMemory: none)
+	bool init(IOGraphicsAccelerator2 *accel, unsigned int count, int flags) APPLE_KEXT_OVERRIDE
+	{
+		if (!super::init(accel, count, flags))
+			return false;
+		if (!(stamps = IOMallocZero(kStampBytes)))
+			return false;
+		setStampBaseAddress(static_cast<volatile unsigned int *>(stamps));
+		rdna4Log("AMDRadeonRDNA4: accel: event machine: %u stamps at %p\n", count, stamps);
+		return true;
+	}
+	static constexpr size_t kStampBytes = 64 * 1024;
+
 	uintptr_t writeStamp(int, vendevtCommandRec *, unsigned int) APPLE_KEXT_OVERRIDE { return 0; }
 	uintptr_t prepareBarrier(vendevtBarrierRec *) APPLE_KEXT_OVERRIDE { return 0; }
 	uintptr_t completeBarrier(vendevtBarrierRec *) APPLE_KEXT_OVERRIDE { return 0; }
