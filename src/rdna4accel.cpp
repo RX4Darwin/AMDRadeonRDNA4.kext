@@ -332,8 +332,12 @@ public:
 	// its display count; the default took one, "trying to init too many framebuffers" for the others)
 	void populateAccelConfig(IOAccelConfig *config) APPLE_KEXT_OVERRIDE
 	{
-		if (config)
-			*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(config) + 0x28) = kMaxFramebuffers;
+		if (!config)
+			return;
+		*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(config) + 0x28) = kMaxFramebuffers;
+		// display pipe user clients allowed (+0x47, AMD's first store; the family's newUserClient refused type 4 without it, and
+		// IOPresentment's IOAccelDisplayPipeCreate failed: "Unable to create IOAccelDisplayPipe", 2026-11-20)
+		reinterpret_cast<uint8_t *>(config)[0x47] = 1;
 	}
 	static constexpr uint32_t kMaxFramebuffers = 8;
 	bool configureDevice(IOPCIDevice *) APPLE_KEXT_OVERRIDE { return true; }
