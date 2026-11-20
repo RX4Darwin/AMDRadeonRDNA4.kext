@@ -7,8 +7,8 @@
 #   3. no raw SOPP-looking literal (0xbf8/9/a/b/c......) is written in src/*.cpp outside isa.hpp: hand-written words go through src/isa.hpp.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-# The stale-header check needs the LLVM the headers were made with (19, tools/gen/build-shaders.sh): LLVM 23 encodes an unused VOP3
-# operand (src2 of v_cmp_*_e64) as the constant 0 instead of s0, which the hardware ignores but the byte compare does not.
+# The stale-header check needs the LLVM the headers were made with (23, Homebrew's llvm; tools/gen/build-shaders.sh): LLVM 19 encodes
+# an unused VOP3 operand (src2 of v_cmp_*_e64) as s0 instead of the constant 0 (the hardware ignores it, the byte compare does not).
 MC=${LLVM_MC:-llvm-mc}
 OBJCOPY=${LLVM_OBJCOPY:-$(dirname "$(command -v "$MC" 2>/dev/null || echo .)")/llvm-objcopy}   # beside llvm-mc (Homebrew's llvm is not on PATH)
 command -v "$OBJCOPY" >/dev/null 2>&1 || OBJCOPY=llvm-objcopy

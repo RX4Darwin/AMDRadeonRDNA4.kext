@@ -28,10 +28,10 @@ jobs:
       - name: Toolchain
         run: |
           sw_vers; xcodebuild -version; uname -m
-          # LLVM 19: what tools/gen/build-shaders.sh made the committed shader headers with (check-isa compares them with a
-          # fresh assembly; LLVM 23 encodes an unused VOP3 operand differently)
-          brew install llvm@19
-          echo "LLVM_MC=$(brew --prefix llvm@19)/bin/llvm-mc" >> "$GITHUB_ENV"
+          # Homebrew's llvm (23): what the committed shader headers were made with (check-isa compares them with a fresh assembly;
+          # LLVM 19 encodes an unused VOP3 operand differently and cannot decode nggfill's VOP3 literals)
+          brew install llvm
+          echo "LLVM_MC=$(brew --prefix llvm)/bin/llvm-mc" >> "$GITHUB_ENV"
           # Xcode 26 ships the Metal compiler as a separate component (the bundle's probe.metallib)
           xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
 

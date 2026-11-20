@@ -5,7 +5,8 @@
 #   src/shaders/<name>.cl  -> src/<name>_codeobj.h  a whole code object (clang + ld.lld)
 # The generated headers are committed, so building the kext needs no LLVM.
 #
-#   tools/gen/build-shaders.sh            (LLVM 19+: LLVM=/usr/lib/llvm-19 by default)
+#   tools/gen/build-shaders.sh            (LLVM=/usr/lib/llvm-19 by default; the .s headers are LLVM 23's: LLVM=$(brew --prefix llvm),
+#                                          which check-isa and CI compare them with; ld.lld for the .cl ones is in Homebrew's lld)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 LLVM=${LLVM:-/usr/lib/llvm-19}

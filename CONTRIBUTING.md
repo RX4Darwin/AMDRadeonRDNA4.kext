@@ -44,7 +44,7 @@ commands and where the results go. Two rules keep it working for both makes and 
   directories, not files, and needs no change.
 
 - CI (`.github/workflows/ci.yml`) builds the kext three ways, the tools and the Metal bundle, and runs `make test`
-  with LLVM 19, on every push and pull request; a second job does the same with the linux-firmware blobs. It has no
+  with Homebrew's LLVM (23), on every push and pull request; a second job does the same with the linux-firmware blobs. It has no
   card: a change that touches the GPU still needs a run on one.
 
 ## Releasing
