@@ -264,16 +264,6 @@ class RDNA4DeviceControl : public AppleGraphicsDeviceControl {
 	}
 
 public:
-	// Not AppleGraphicsDevicePolicy's provider (it matches every AppleGraphicsDeviceControl): its start panicked on ours, at a boot's
-	// 18 s (safeMetaCast in AppleGraphicsDevicePolicy, 2026-11-20). ponytail: refused outright; what it wants of a controller is unknown.
-	bool matchPropertyTable(OSDictionary *table, SInt32 *score) APPLE_KEXT_OVERRIDE
-	{
-		auto *cls = table ? OSDynamicCast(OSString, table->getObject("IOClass")) : nullptr;
-		if (cls && cls->isEqualTo("AppleGraphicsDevicePolicy"))
-			return false;
-		return IOService::matchPropertyTable(table, score);
-	}
-
 	IOReturn vendor_doDeviceAttribute(unsigned int attribute, unsigned long *in, unsigned long inLength, unsigned long *out,
 	                                  unsigned long *outLength, IOExternalMethodArguments *) APPLE_KEXT_OVERRIDE
 	{
@@ -291,17 +281,18 @@ public:
 			*reinterpret_cast<uint32_t *>(o) = 0;                   // GPU's 3: it makes its own framebuffers when asked; ours exist)
 			r = kIOReturnSuccess;
 		} else if (attribute == 0x980 && size == 0xdc && o) {   // its framebuffers, as the paravirtual GPU's: four masks of n bits (from
-			IORegistryEntry *fb[20];                             // bit 1), n five times, the provider, then one entry each (its object:
-			const uint32_t n = framebuffers(fb, 20);              // here its registry ID, no kernel address to user space)
+			IORegistryEntry *fb[20];                             // bit 1), n five times, the provider, then each framebuffer: objects,
+			const uint32_t n = framebuffers(fb, 20);              // which AppleGraphicsDeviceControl's filtered_doDeviceAttribute turns
+			                                                     // into registry IDs for user space (IDs here it took for objects: panic)
 			const uint64_t mask = static_cast<uint64_t>(~(0xffffffffu << n)) * 2;
 			bzero(o, 0xdc);
 			for (int i = 0; i < 4; i++)
 				*reinterpret_cast<uint64_t *>(o + 8 * i) = mask;
 			for (int i = 0; i < 5; i++)
 				*reinterpret_cast<uint32_t *>(o + 0x20 + 4 * i) = n;
-			*reinterpret_cast<uint64_t *>(o + 0x34) = getProvider() ? getProvider()->getRegistryEntryID() : 0;
-			for (uint32_t i = 0; i < n; i++) {
-				*reinterpret_cast<uint64_t *>(o + 0x3c + 8 * i) = fb[i]->getRegistryEntryID();
+			*reinterpret_cast<uint64_t *>(o + 0x34) = reinterpret_cast<uint64_t>(getProvider());
+			for (uint32_t i = 0; i < n; i++) {   // (the framebuffers outlive the call: the registry holds them)
+				*reinterpret_cast<uint64_t *>(o + 0x3c + 8 * i) = reinterpret_cast<uint64_t>(fb[i]);
 				fb[i]->release();
 			}
 			r = kIOReturnSuccess;
