@@ -10340,14 +10340,16 @@ void RDNA4PvNub::tahoeConfigWrite(UInt32 width, UInt8 offset, UInt32 data) {
 }
 IOReturn RDNA4PvNub::tahoeDeviceMemoryRead(UInt8, UInt64 offset, void *data, UInt8 size) {
 	PVCALL("tahoeDeviceMemoryRead");
-	if (!mBar0 || !data || !size || offset + size > kBar0Size)
+	// Check the offset before subtracting so a wrapped offset cannot pass the BAR bounds check.
+	if (!mBar0 || !data || !size || offset > kBar0Size || size > kBar0Size - offset)
 		return kIOReturnBadArgument;
 	memcpy(data, static_cast<uint8_t *>(mBar0) + offset, size);
 	return kIOReturnSuccess;
 }
 IOReturn RDNA4PvNub::tahoeDeviceMemoryWrite(UInt8, UInt64 offset, UInt64 data, UInt8 size) {
 	PVCALL("tahoeDeviceMemoryWrite");
-	if (!mBar0 || !size || size > 8 || offset + size > kBar0Size)
+	// Check the offset before subtracting so a wrapped offset cannot pass the BAR bounds check.
+	if (!mBar0 || !size || size > 8 || offset > kBar0Size || size > kBar0Size - offset)
 		return kIOReturnBadArgument;
 	memcpy(static_cast<uint8_t *>(mBar0) + offset, &data, size);
 	return kIOReturnSuccess;
