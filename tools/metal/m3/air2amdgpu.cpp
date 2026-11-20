@@ -1235,7 +1235,8 @@ struct Kernel {
 // written when several, chosen by the host; bits 28-30 the one attachment other than 0 written; bit 31: a fragment shader without a colour)}, then the code
 // (relocation-free, the entry at its start), then per attribute
 // {u32 hash of its AIR name (FNV-1a), u32 flags: bit 0 flat, bit 1 the point's coordinate (no name)}: the vertex function's outputs in ring-slot order, the fragment function's
-// inputs in hardware-input order; the host matches them by name (SPI_PS_INPUT_CNTL_n).
+// inputs in hardware-input order; the host matches them by name (SPI_PS_INPUT_CNTL_n). Then {"TXRD", u32 bit n: texture n is used}, and for a
+// vertex shader whose position is a buffer's float4x4 times an attribute, {"POSM", u32 the attribute, u32 the buffer}.
 // Both stages get two user SGPRs, the address of the stage's table (the host's): 64-bit buffer addresses by Metal buffer index at +0, and in
 // both stages the textures' T#s (8 dwords) at +64 + 32 n and the samplers' S#s (4 dwords) at +576 + 16 n (n 0-15).
 //   vertex   amdgpu_gs, an NGG shader as src/shaders/nggcol.s: s3 = merged_wave_info ([7:0] vertices, [15:8] primitives, [27:24] wave in
@@ -1266,6 +1267,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 	struct Var { unsigned index; uint32_t hash; bool flat; unsigned bary; bool sprite = false; };
 	std::vector<Var> vars;
 	uint32_t written = 0;   // bit n: buffer n is device memory the shader may write (the host maps it for writing)
+	uint32_t texturesRead = 0;   // bit n: texture n is an argument the shader uses (the blob's "TXRD" record)
 	auto fnv = [](const std::string &name) {
 		uint32_t h = 2166136261u;
 		for (unsigned char c : name)
@@ -1355,6 +1357,7 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			if (location < 0 || count < 1 || location + count > 16)
 				return kind + " argument " + std::to_string(index) + ": only indices 0-15 so far";
 			from[index] = (kind == "air.texture" ? 200 : 300) + location;
+			texturesRead |= kind == "air.texture" ? ((1u << count) - 1) << location : 0;
 		}
 		else if (unused)
 			from[index] = -1;
@@ -1421,6 +1424,55 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 			return std::string(vertex ? "vertex" : "fragment") + " output " + kind + " is not supported yet";
 		}
 	}
+	// A position that is a float4x4 in a buffer times a [[stage_in]] attribute (Core Animation's mvp_matrix * position): {"POSM", attribute,
+	// buffer} after the TXRD record, for the native device to bound the draw's pixels from its vertices (the rows a draw reading its own
+	// target needs copied: Core Animation's menu-bar blends are quads of the bar's rows with a scissor of the whole 4K target, 2026-11-20).
+	uint32_t posm[3] = {};
+	if (vertex && position >= 0)
+		for (BasicBlock &bb : *air)
+			if (auto *ret = dyn_cast<ReturnInst>(bb.getTerminator()); ret && ret->getReturnValue()) {
+				Value *pos = ret->getReturnValue();
+				while (auto *iv = dyn_cast<InsertValueInst>(pos))   // the struct's position member
+					pos = iv->getIndices()[0] == static_cast<unsigned>(position) ? iv->getInsertedValueOperand() : iv->getAggregateOperand();
+				if (isa<StructType>(pos->getType()))
+					continue;
+				SmallVector<Value *, 8> work{pos}, terms;
+				while (!work.empty() && terms.size() <= 4) {
+					Value *v = work.pop_back_val();
+					if (auto *add = dyn_cast<BinaryOperator>(v); add && add->getOpcode() == Instruction::FAdd)
+						work.append({add->getOperand(0), add->getOperand(1)});
+					else
+						terms.push_back(v);
+				}
+				unsigned seen = 0;
+				const Argument *buf = nullptr, *attr = nullptr;
+				for (Value *t : terms) {
+					auto *mul = dyn_cast<BinaryOperator>(t);
+					if (!mul || mul->getOpcode() != Instruction::FMul)
+						break;
+					for (unsigned o = 0; o < 2; o++) {   // column c of the matrix times a splat of the attribute's component c, either way round
+						auto *col = dyn_cast<LoadInst>(mul->getOperand(o));
+						auto *splat = dyn_cast<ShuffleVectorInst>(mul->getOperand(1 - o));
+						if (!col || !splat || !col->getType()->isVectorTy() || splat->getShuffleMask().size() != 4)
+							continue;
+						const int c = splat->getShuffleMask()[0];
+						bool same = c >= 0 && c < 4;
+						for (int e : splat->getShuffleMask())
+							same &= e == c;
+						APInt off(64, 0);
+						const auto *base = dyn_cast<Argument>(col->getPointerOperand()->stripAndAccumulateConstantOffsets(m.getDataLayout(), off, true));
+						const auto *a = dyn_cast<Argument>(splat->getOperand(0));
+						if (!same || !base || !a || off != 16 * c || (buf && buf != base) || (attr && attr != a))
+							continue;
+						buf = base, attr = a, seen |= 1u << c;
+						break;
+					}
+				}
+				const int b = buf ? from[buf->getArgNo()] : -1, v = attr ? from[attr->getArgNo()] : -1;
+				if (terms.size() == 4 && seen == 15 && b >= 100 && b < 100 + static_cast<int>(RDNA4_MTLC_MAX_BUFFERS) && v >= 500 && v < 516)
+					posm[0] = 0x4d534f50 /* "POSM" */, posm[1] = static_cast<uint32_t>(v - 500), posm[2] = static_cast<uint32_t>(b - 100);
+				break;
+			}
 	if (!vertex && !noColour && attachment < 0 && others == 1) {
 		colourMember = static_cast<unsigned>(other);
 		colourZero = colourType(air->getReturnType());
@@ -1832,6 +1884,12 @@ static std::string translateShader(Module &m, Function *air, const MDNode *md, b
 		const uint32_t entry[2] = {v.hash, (v.flat ? 1u : 0u) | (v.sprite ? 2u : 0u)};
 		out.hsaco.append(reinterpret_cast<const char *>(entry), sizeof(entry));
 	}
+	// after the values: {"TXRD", u32 the textures it uses}: the native device copies or waits for those only (a texture left bound from an
+	// earlier draw, Core Animation's own target, cost a copy of it a draw, 2026-11-20); the PV host reads up to the values only
+	const uint32_t reads[2] = {0x44525854 /* "TXRD" */, texturesRead};
+	out.hsaco.append(reinterpret_cast<const char *>(reads), sizeof(reads));
+	if (posm[0])
+		out.hsaco.append(reinterpret_cast<const char *>(posm), sizeof(posm));
 	out.buffers = 0;
 	out.written = written;
 	out.texturesWritten = 0;

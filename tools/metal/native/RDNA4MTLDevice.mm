@@ -329,7 +329,8 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 - (void)wroteAll;                                // all of its memory written (wrote())
 - (void)written:(uint64_t)lo to:(uint64_t)hi;    // identity addresses written (wrote()): where its copy is behind
 enum { kWrittenRanges = 8 };   // ranges kept apart (more: the two nearest merged); the menu bar's rows and the Dock's are two, not all between
-- (uint32_t)takeWritten:(uint64_t[kWrittenRanges][2])out;   // those ranges (their count), forgotten: the copy is to be made of them now
+- (uint32_t)takeWritten:(uint64_t[kWrittenRanges][2])out from:(uint64_t)lo to:(uint64_t)hi;   // those ranges' parts in [lo, hi) (their count),
+                                                                                           // forgotten: the copy is to be made of them now
 - (uint32_t)sampleOr;                       // the OR of some of its pixels' first 4 bytes (the trace)
 - (NSString *)origin;                       // where its pixels are (the trace)
 - (RDNA4MTLTexture *)level:(NSUInteger)level;   // level `level` as a texture of its own (kept): a render pass's attachment level
@@ -379,6 +380,8 @@ static void wrote(uint64_t lo, uint64_t hi)
 	NSUInteger _levels, _levelOffset[16], _levelRow[16];   // a mipmapped 2D texture's levels: each an image of its own in _memory
 	const uint8_t *_surfaceRows;   // shadowed: the IOSurface's own pixels, _surfaceRowBytes apart; _memory is the GPU's copy
 	NSUInteger _surfaceRowBytes;
+	uint32_t _shadowSeed;   // a planar surface's seed when last refreshed (_shadowSeeded)
+	BOOL _shadowSeeded;
 	RDNA4MTLTexture *_parent;   // a view's
 	rdna4_buffer_t _vram;   // a depth texture's
 }
@@ -517,12 +520,23 @@ static char gCopyKey;
 	memcpy(_written, r, m * sizeof r[0]);
 	_writtenCount = m;
 }
-- (uint32_t)takeWritten:(uint64_t[kWrittenRanges][2])out
+- (uint32_t)takeWritten:(uint64_t[kWrittenRanges][2])out from:(uint64_t)lo to:(uint64_t)hi
 {
 	@synchronized([RDNA4MTLTexture class]) {
-		const uint32_t n = _writtenCount;
-		memcpy(out, _written, n * sizeof _written[0]);
+		uint64_t keep[2 * kWrittenRanges][2];   // the parts outside [lo, hi): still to be copied, by a later draw that reads them
+		uint32_t n = 0, k = 0;
+		for (uint32_t i = 0; i < _writtenCount; i++) {
+			const uint64_t a = _written[i][0], b = _written[i][1];
+			if (MAX(a, lo) < MIN(b, hi))
+				out[n][0] = MAX(a, lo), out[n++][1] = MIN(b, hi);
+			if (a < lo)
+				keep[k][0] = a, keep[k++][1] = MIN(b, lo);
+			if (b > hi)
+				keep[k][0] = MAX(a, hi), keep[k++][1] = b;
+		}
 		_writtenCount = 0;
+		for (uint32_t i = 0; i < k; i++)
+			[self written:keep[i][0] to:keep[i][1]];
 		return n;
 	}
 }
@@ -553,6 +567,15 @@ static char gCopyKey;
 {
 	if (!_surfaceRows || self.root->_shadowAhead)
 		return;
+	// A planar surface (video: the wallpaper's 4K 10-bit frame, 25 MB, copied for every command buffer while nothing changed it,
+	// 2026-11-20) again only when its seed moved: its writers are decoders, through the CPU (lock and unlock move the seed).
+	// ponytail: planar only; a surface drawn by the GPU (an app's, through the paravirtual GPU) need not move its seed.
+	if (_surface && IOSurfaceGetPlaneCount(_surface) > 0) {
+		const uint32_t seed = IOSurfaceGetSeed(_surface);
+		if (_shadowSeeded && seed == _shadowSeed)
+			return;
+		_shadowSeed = seed, _shadowSeeded = YES;
+	}
 	const uint64_t t0 = nowUs();
 	for (NSUInteger y = 0; y < _height; y++)
 		memcpy(self.bytes + y * _rowBytes, _surfaceRows + y * _surfaceRowBytes, _width * self.bpp);
@@ -1253,13 +1276,18 @@ RDNA4_ANSWER_MISSING
 enum { kMaxBufferIndex = 31, kTableBuffers = 28 };   // a stage's table holds buffers 0-27 (RDNA4_MTLC_HIGH_BUFFERS, 28-30, not yet)
 
 // The RGFX header (air2amdgpu.cpp): {"RGFX", stage, code bytes, RSRC1, RSRC2, SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR, attributes}, the code,
-// then per value between the stages {u32 name hash, u32 flags: bit 0 flat, bit 1 the point's coordinate}.
-enum { kRgfxMagic = 0x58464752u, kHead = 8 };
+// then per value between the stages {u32 name hash, u32 flags: bit 0 flat, bit 1 the point's coordinate}, then {"TXRD", u32 bit n: texture n
+// is used} (older translations have none: all used), and {"POSM", u32 attribute, u32 buffer} for a vertex shader whose position is that buffer's
+// float4x4 times that attribute.
+enum { kRgfxMagic = 0x58464752u, kHead = 8, kTxrd = 0x44525854u, kPosm = 0x4d534f50u };
 
 @interface RDNA4MTLRenderPipeline : NSObject <MTLRenderPipelineState>
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error;
 @property (readonly) const uint32_t *vs, *ps;   // the RGFX blobs
 @property (readonly) BOOL broken;                // a shader did not translate: draws with it are left out
+- (uint32_t)texturesOf:(int)stage;               // bit n: the stage's shader uses texture n (its blob's TXRD record)
+// its vertex shader's position is the float4x4 in vertex buffer `buffer` times attribute `attribute` (its blob's POSM record)
+- (BOOL)positionFrom:(uint32_t *)attribute matrix:(uint32_t *)buffer;
 @property (readonly) NSString *names;            // "vertex / fragment" (the trace)
 @property BOOL described;                         // its first draw was logged
 @property (readonly) uint32_t outs, ins;        // values the vertex function writes, the fragment function reads
@@ -1283,6 +1311,7 @@ typedef struct {
 	uint32_t type, start, count, instances, baseInstance;
 	float viewport[4];                  // x, y, width, height in pixels
 	uint32_t scissor[4];                // x, y, width, height in pixels (the whole target when none was set)
+	uint32_t covered[4];                // what of it the draw can write: its vertices' bounds where those are known (bound:), else the scissor
 	uint32_t attachment;                // the colour attachment the draw goes into (RDNA4_MTLC_TABLE_ATTACHMENT)
 	const uint8_t *levelT;              // for shaders that sample explicit levels: per stage, levels 1-7, textures 0-15, a T# each (else NULL)
 	float blendColour[4];
@@ -1315,6 +1344,14 @@ typedef struct { uint64_t src, dst, bytes; } RDNA4Copy;   // GPU addresses
 	uint32_t _blends[8][10], _attributeRecords[16][4];
 	BOOL _broken;   // a shader did not translate: its draws are left out
 	MTLPixelFormat _formats[8];
+	uint32_t _textures[2], _posm[2];   // _posm: 0 or 1 + the attribute, the buffer
+}
+
+- (uint32_t)texturesOf:(int)stage { return _textures[stage & 1]; }
+- (BOOL)positionFrom:(uint32_t *)attribute matrix:(uint32_t *)buffer
+{
+	*attribute = _posm[0] - 1, *buffer = _posm[1];
+	return _posm[0] != 0;
 }
 
 - (const uint32_t *)blendOf:(NSUInteger)k { return _blends[k & 7]; }
@@ -1399,6 +1436,14 @@ typedef struct { uint64_t src, dst, bytes; } RDNA4Copy;   // GPU addresses
 			return rdna4Error([NSString stringWithFormat:@"%@: not a %s shader that fits its slot", fn[k].name, k ? "fragment" : "vertex"], 0);
 		if (h[7] & 0x7fff0000u & ~(k ? 0x7ff10000u : 0x00010000u))   // dual source: not yet (several attachments: the PV host's choice)
 			return rdna4Error([NSString stringWithFormat:@"%@: attributes 0x%x not supported yet", fn[k].name, h[7]], 0);
+	}
+	for (int k = 0; k < 2; k++) {   // the records after the values (TXRD, POSM)
+		const uint32_t *h = (const uint32_t *)_blob[k].bytes, *rec = h + kHead + h[2] / 4 + 2 * (h[7] & 0xffff);
+		const uint8_t *end = (const uint8_t *)h + _blob[k].length;
+		const BOOL txrd = (const uint8_t *)(rec + 2) <= end && rec[0] == kTxrd;
+		_textures[k] = txrd ? rec[1] : 0xffff;
+		if (!k && txrd && (const uint8_t *)(rec + 5) <= end && rec[2] == kPosm && rec[3] < 16 && rec[4] < kTableBuffers)
+			_posm[0] = rec[3] + 1, _posm[1] = rec[4];
 	}
 	// A fragment function whose colour LLVM left out entirely (Core Animation's TkfhBvcmA2Xh_IsrcM1 is s_endpgm alone) has no export, while its
 	// header says it has a colour: drawn with a colour format the hardware waits for an export forever (WindowServer's gfx ring hung,
@@ -1825,6 +1870,54 @@ RDNA4_ANSWER_MISSING
 	_addresses[stage][index] = buffer ? buffer.gpuAddress + offset : 0;
 }
 
+// What of the target a draw can write (d->covered): for a vertex shader whose position is a buffer's matrix times an attribute (POSM), its
+// vertices so transformed, bounded, a pixel around them, within the scissor. Left the scissor: more than 256 vertices, a vertex at or behind
+// the eye (w <= 0), an attribute not of floats or not per vertex, data the CPU does not see. ponytail: read when the draw is encoded, so
+// vertices written after it and before the commit are not seen (Core Animation writes them first).
+- (void)bound:(RDNA4Draw *)d pipeline:(RDNA4MTLRenderPipeline *)p indices:(id<MTLBuffer>)ib offset:(NSUInteger)io type:(MTLIndexType)it
+{
+	uint32_t a, m;
+	if (![p positionFrom:&a matrix:&m] || !d->count || d->count > 256)
+		return;
+	const uint32_t *rec = p.attributes + 4 * a, bi = rec[2] & 0xff, kind = rec[2] >> 8 & 15, comps = rec[2] >> 12 & 7;
+	if (kind || comps < 2 || comps > 4 || (rec[2] >> 16 & 0xff) != MTLVertexStepFunctionPerVertex || bi >= kTableBuffers)
+		return;
+	id<MTLBuffer> vb = _bound[0][bi], mb = _bound[0][m];
+	const uint8_t *vp = (const uint8_t *)vb.contents, *mp = (const uint8_t *)mb.contents, *ix = (const uint8_t *)ib.contents;
+	const NSUInteger vo = (NSUInteger)(_addresses[0][bi] - vb.gpuAddress), mo = (NSUInteger)(_addresses[0][m] - mb.gpuAddress);
+	const NSUInteger ixBytes = it == MTLIndexTypeUInt32 ? 4 : 2;
+	if (!vp || !mp || mo + 64 > mb.length || (ib && (!ix || io + d->count * ixBytes > ib.length)))
+		return;
+	float M[16], lo[2] = { INFINITY, INFINITY }, hi[2] = { -INFINITY, -INFINITY };   // M: column-major
+	memcpy(M, mp + mo, sizeof M);
+	for (uint32_t i = 0; i < d->count; i++) {
+		const uint32_t v = !ib ? d->start + i : ixBytes == 4 ? ((const uint32_t *)(ix + io))[i] : ((const uint16_t *)(ix + io))[i];
+		if (ib && v == (ixBytes == 4 ? 0xffffffffu : 0xffffu))   // a strip's restart
+			continue;
+		const NSUInteger at = vo + (NSUInteger)v * rec[1] + rec[0];
+		if (at + 4 * comps > vb.length)
+			return;
+		float x[4] = { 0, 0, 0, 1 }, c[4];
+		memcpy(x, vp + at, 4 * comps);
+		for (int r = 0; r < 4; r++)
+			c[r] = M[r] * x[0] + M[4 + r] * x[1] + M[8 + r] * x[2] + M[12 + r] * x[3];
+		if (!(c[3] > 1e-6f))
+			return;
+		const float px = d->viewport[0] + (c[0] / c[3] + 1) * 0.5f * d->viewport[2], py = d->viewport[1] + (1 - c[1] / c[3]) * 0.5f * d->viewport[3];
+		if (!isfinite(px) || !isfinite(py))
+			return;
+		lo[0] = fminf(lo[0], px), lo[1] = fminf(lo[1], py), hi[0] = fmaxf(hi[0], px), hi[1] = fmaxf(hi[1], py);
+	}
+	const int64_t sx = d->scissor[0], sy = d->scissor[1], sx2 = sx + d->scissor[2], sy2 = sy + d->scissor[3];
+	const int64_t x0 = MAX((int64_t)floorf(lo[0]) - 1, sx), y0 = MAX((int64_t)floorf(lo[1]) - 1, sy);
+	const int64_t x1 = MIN((int64_t)ceilf(hi[0]) + 1, sx2), y1 = MIN((int64_t)ceilf(hi[1]) + 1, sy2);
+	if (!(lo[0] <= hi[0]) || x0 >= x1 || y0 >= y1) {   // nothing (every index a restart, or all outside the scissor)
+		d->covered[2] = d->covered[3] = 0;
+		return;
+	}
+	d->covered[0] = (uint32_t)x0, d->covered[1] = (uint32_t)y0, d->covered[2] = (uint32_t)(x1 - x0), d->covered[3] = (uint32_t)(y1 - y0);
+}
+
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { [self bind:0 buffer:b offset:o index:i]; }
 - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { [self bind:1 buffer:b offset:o index:i]; }
 
@@ -1889,8 +1982,11 @@ RDNA4_ANSWER_MISSING
 		for (int i = 0; i < kTableBuffers; i++)
 			if (_bound[st][i])
 				[held addObject:_bound[st][i]];
+		// the textures its shaders use only: one left bound by an earlier draw is not read, made current, waited for or copied (Core
+		// Animation's target, left bound, was a copy of it for every draw of Vfx / Xc, 2026-11-20)
+		const uint32_t uses = _pipeline ? [_pipeline texturesOf:st] : 0xffff;
 		for (int i = 0; i < kStageTextures; i++) {
-			if ([(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] && !((RDNA4MTLTexture *)_textures[st][i]).isDepth) {
+			if ((uses >> i & 1) && [(id)_textures[st][i] isKindOfClass:[RDNA4MTLTexture class]] && !((RDNA4MTLTexture *)_textures[st][i]).isDepth) {
 				RDNA4MTLTexture *t = (RDNA4MTLTexture *)_textures[st][i];
 				[t descriptor:d.textures[st][i]];
 				for (NSUInteger l = 1; levelT && l < 8; l++)
@@ -1929,6 +2025,9 @@ RDNA4_ANSWER_MISSING
 		}
 	RDNA4MTLTexture *target = _targets[d.attachment];
 	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
+	memcpy(d.covered, d.scissor, sizeof d.covered);
+	if (pipeline)
+		[self bound:&d pipeline:pipeline indices:indexBuffer offset:indexOffset type:indexType];
 	d.levelT = (const uint8_t *)levelT.bytes;
 	if (pipeline && !pipeline.described) {   // what each pipeline's first draw binds: a hang's draw named (drainGfx), this says what it read
 		pipeline.described = YES;
@@ -1986,7 +2085,13 @@ RDNA4_ANSWER_MISSING
 			}
 		}
 		uint64_t ranges[kWrittenRanges][2];
-		const uint32_t n = fresh ? [fresh takeWritten:ranges] : 0;   // none: nothing written since its last copy
+		// The rows it covers only, and a few around them (a sample a little outside them): it writes there only, and Core Animation's
+		// backdrops are a window's or a menu's rectangle of a 4K target (all of it copied, 10 GB/s on the card while windows moved,
+		// 2026-11-20). ponytail: a draw sampling further outside what it covers reads those rows as last copied.
+		enum { kReadMargin = 16 };
+		const uint64_t row = fresh.rowBytes, y0 = dd.covered[1] > kReadMargin ? dd.covered[1] - kReadMargin : 0,
+		               y1 = MIN((uint64_t)dd.covered[1] + dd.covered[3] + kReadMargin, (uint64_t)fresh.height);
+		const uint32_t n = fresh ? [fresh takeWritten:ranges from:fresh.identity + y0 * row to:fresh.identity + y1 * row] : 0;   // 0: copied
 		RDNA4Copy copies[kWrittenRanges];
 		for (uint32_t i = 0; i < n; i++)
 			copies[i] = (RDNA4Copy){ fresh.gpuBase + (ranges[i][0] - fresh.identity), fresh.readCopy.gpuBase + (ranges[i][0] - fresh.identity),
@@ -2371,15 +2476,7 @@ RDNA4_ANSWER_MISSING
 {
 	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
 	dispatch_async(device.work, ^{
-		self->_status = MTLCommandBufferStatusScheduled;
-		dispatch_group_leave(self->_scheduledGroup);
 		dispatch_queue_t handlers = self->_queue.handlers;
-		NSArray<MTLCommandBufferHandler> *scheduled = [self->_scheduled copy];
-		if (scheduled.count)
-			dispatch_async(handlers, ^{
-				for (MTLCommandBufferHandler h in scheduled)
-					h(self);
-			});
 		NSError *why = nil;
 		for (NSUInteger i = 0; i < self->_ops.count && !why; i++) {
 			if (![self->_draws containsIndex:i])
@@ -2392,6 +2489,17 @@ RDNA4_ANSWER_MISSING
 		for (RDNA4MTLTexture *t in self->_drawnShadows)   // the draws done: their pixels into the surfaces
 			[t writeBack];
 		[self->_drawnShadows removeAllObjects];
+		// Scheduled once its draws are done, not when they start: WindowServer hands its frame to the display when its command buffer is
+		// scheduled (Apple's GPUs: the display waits for the GPU's writes), and the display showed frames half drawn, a moving window torn
+		// between its old and new places (2026-11-20).
+		self->_status = MTLCommandBufferStatusScheduled;
+		dispatch_group_leave(self->_scheduledGroup);
+		NSArray<MTLCommandBufferHandler> *scheduled = [self->_scheduled copy];
+		if (scheduled.count)
+			dispatch_async(handlers, ^{
+				for (MTLCommandBufferHandler h in scheduled)
+					h(self);
+			});
 		RTRACE(60, @"command buffer %@: %lu steps, %lu draws, %lu drawables%@%@", self.label ?: @"-", (unsigned long)self->_ops.count,
 		       (unsigned long)self->_draws.count, (unsigned long)self->_drawables.count, self->_error ? @": " : @"",
 		       self->_error.localizedDescription ?: @"");
@@ -2899,7 +3007,9 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 	_slotFence[slot] = _lastFence = fence;
 	_lastSlot = slot;
 	_drawsInFlight = YES;
-	wrote(t.identity + sy * t.rowBytes, t.identity + (uint64_t)(sy2 - 1) * t.rowBytes + sx2 * t.bpp);
+	const uint32_t cx = d->covered[0], cy = d->covered[1], cx2 = MIN(cx + d->covered[2], (uint32_t)t.width), cy2 = MIN(cy + d->covered[3], (uint32_t)t.height);
+	if (cx < cx2 && cy < cy2)
+		wrote(t.identity + cy * t.rowBytes, t.identity + (uint64_t)(cy2 - 1) * t.rowBytes + cx2 * t.bpp);
 	if (!_drawnInFlight)
 		_drawnInFlight = [NSHashTable weakObjectsHashTable];
 	[_drawnInFlight addObject:t];

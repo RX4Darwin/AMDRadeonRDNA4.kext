@@ -350,3 +350,25 @@ and their costs, copies, barriers, host memory, live textures) found where the t
 Open: a draw reading its own target still copies all rows its scissor covers (Core Animation's are full-target quads of 6 vertices:
 about 9 MB a copy, 1500 copies a second), the card is the limit now; textures live in host memory (Core Animation's private surfaces
 would belong in VRAM); colour matching of DeviceRGB images (`nativeca`); MSAA, stencil not yet.
+
+**Tearing and the remaining copies (2026-11-20, evening):** Sunneva: menu bars and the Dock fixed, windows better but still glitchy,
+drags smoother but a bit laggy. A test window with a toolbar and a translucent sidebar (`wmove 12 0 glass`) showed frames torn
+between the window's old and new places. Fixed:
+
+- Tearing: a command buffer reported itself scheduled when the work queue started it; WindowServer hands the frame to the display then
+  (on Apple's GPUs the display waits for the GPU), so the display read frames half drawn. Scheduled now comes after its draws are done:
+  no torn frame in the grabs since (all were before). WindowServer makes about 63 command buffers a second while a window moves (it
+  made about 100, frames no one saw); the window still moves 56-59 times a second.
+- The translator writes two records after an RGFX blob's values (the PV host stops reading before them): `TXRD`, the textures a shader
+  uses (a texture left bound from an earlier draw, Core Animation's own target, had cost a copy of it for every draw), and `POSM` when
+  the vertex position is a buffer's float4x4 times an attribute (Core Animation's `Vfx*` vertex shaders: `mvp_matrix * position`). For
+  those the device transforms the draw's vertices (up to 256) on the CPU: the rectangle it covers is what it marks written and what a
+  draw reading its own target has copied (with 16 rows around). The menu-bar blends (`TcimBdrkXc_Isrc`, `TmuaBpldXc_Isrc_Isrc`, three
+  a frame per display) are full-target quads with full scissors but cover the bar's 60-182 rows: 32 MB a copy each before.
+- A planar IOSurface's shadow (the wallpaper's 4K 10-bit video frame, 25 MB) is refreshed again only when its seed moves: it was
+  copied for every command buffer (6.4 GB per 5 s of CPU memcpy while a window moved, now under 0.1 GB).
+
+Card, moving the glass window on the 4K display: copies for draws reading their target 50 -> 11 GB per 5 s, CPU shadow refreshes
+6.4 -> 0.07 GB per 5 s. Open: `VfxXgb` (vertex pulling, three layouts) is not bounded, its full-target `Xgc` draws still copy all
+written rows; each draw is still a kext call (submit about 9 us) and each self-read an idle barrier on the card; textures still in host
+memory.

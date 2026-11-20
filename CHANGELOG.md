@@ -24,6 +24,9 @@ otherwise). The newest version is on top. How versions and branches work is in `
   run in enqueue order (no more flashing or stale parts of windows); no more logouts to the login window (a texture leak and
   shaders that did not translate aborted WindowServer); about 3.5x the frames a second while windows move (draws written in
   place, a draw's own target copied on the card). Card (2026-11-20): 11 apps open, windows moved on both displays, no crash.
+- Native WindowServer: no more torn frames while a window moves (a command buffer counts as scheduled once its draws are done);
+  draws that read their own target copy only the rows they cover (the translator records the textures a shader uses and a
+  matrix-times-attribute vertex position), and the wallpaper's video frame is no longer copied on the CPU every frame.
 - The paravirtual host opens the runtime from its tick (from a draw, IOLog ran the timer thread's stack out: a double fault).
 
 ## 0.3.3 (2026-11-19)
