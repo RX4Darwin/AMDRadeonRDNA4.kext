@@ -740,6 +740,7 @@ private:
 	ScanoutMap mScanout[kScanoutPorts] {};
 	GfxBuffers mPresentIb {};
 	bool presentOnCard(uint32_t port, uint32_t sid);
+	uint64_t presentSource(uint32_t sid, uint64_t bytes);   // surface sid's frame in VRAM (pvPresentSource): its GPU address of ours, else 0
 	// A frame of macOS's scaled modes, larger than any mode of the head ("looks like 2560x1440" draws 5120x2880 on a 3840x2160
 	// monitor): scale.cl puts it into the scanout, dispatched in the frame's IB. Its kernargs a slot per port.
 	struct ScaleKernel { uint64_t code, argsHandle, argsGpu; uint8_t *argsCpu; uint32_t rsrc[3]; bool wave32, tried; };
@@ -1130,6 +1131,13 @@ OSDefineMetaClassAndStructors(RDNA4PvHost, OSObject)
 
 namespace {
 RDNA4PvHost *gHost { nullptr };
+
+// Frames the native device keeps in VRAM (pvPresentSource): surface sid presented from the client's buffer, mapped into the host's GPU
+// address space when it is first presented (on the host's thread), the mapping dropped there too once the source is (dead).
+struct PresentSource { uint32_t sid; const void *client; uint64_t clientHandle, handle, gpu, bytes; bool dead; };
+constexpr uint32_t kPresentSources = 32;
+PresentSource gSources[kPresentSources];
+IOLock *gSourceLock { IOLockAlloc() };
 void hostTick(OSObject *owner, IOTimerEventSource *) {
 	if (auto *h = OSDynamicCast(RDNA4PvHost, owner))
 		h->tick();
@@ -1293,6 +1301,10 @@ IOReturn RDNA4PvHost::forgetAction(OSObject *owner, void *, void *, void *, void
 }
 
 void RDNA4PvHost::forgetRuntime() {
+	IOLockLock(gSourceLock);   // the present sources' mappings go with the runtime: made again when presented
+	for (PresentSource &p : gSources)
+		p.handle = p.gpu = 0;
+	IOLockUnlock(gSourceLock);
 	// VRAM does not survive the sleep: what lives only on the card (held targets, kept surfaces) is written back to the guest
 	// first, while the card still takes submissions, so the guest's copies are current after the wake.
 	const uint32_t backs = mCardBacks, flushes = mCardFlushes;
@@ -8098,6 +8110,32 @@ void RDNA4PvHost::timePresent(PortTiming &t)
 	}
 }
 
+uint64_t RDNA4PvHost::presentSource(uint32_t sid, uint64_t bytes)
+{
+	uint64_t gpu = 0;
+
+	IOLockLock(gSourceLock);
+	for (PresentSource &p : gSources) {
+		if (p.dead) {
+			if (p.handle)
+				gCompute->rtFree(this, p.handle);   // the mapping only: the VRAM is the client's
+			p = {};
+			continue;
+		}
+		if (!p.sid || p.sid != sid)
+			continue;
+		if (!p.handle && gCompute->rtMapClientVram(this, p.client, p.clientHandle, p.handle, p.gpu, p.bytes) != kIOReturnSuccess) {
+			pvlog("host: present: surface %u's frames in the native device's VRAM: its buffer could not be mapped; from its memory", sid);
+			p = {};
+			continue;
+		}
+		gpu = bytes <= p.bytes ? p.gpu : 0;
+	}
+	IOLockUnlock(gSourceLock);
+
+	return gpu;
+}
+
 bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 {
 	static constexpr uint32_t kChunk = 1u << 20;
@@ -8169,8 +8207,12 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	uint64_t handle = 0, src = 0;
 	const CardSurface *card = cardSurface(s);
 	bool ok = md && width && height && base + bpr * height <= md->getLength();
+	const uint64_t inVram = ok ? presentSource(sid, base + bpr * height) : 0;
 
-	if (ok && card && card->loaded && card->base == base) {   // the frame on the card already
+	if (inVram) {   // the native device's frame, in its VRAM
+		src = inVram + base;
+	}
+	else if (ok && card && card->loaded && card->base == base) {   // the frame on the card already
 		src = card->gpu;
 	}
 	else if (ok && md->prepare() == kIOReturnSuccess) {
@@ -8181,7 +8223,7 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 		ok = false;
 	}
 
-	if (ok)
+	if (ok && !inVram)
 		keepOnCard(s);   // its next frame drawn on the card
 
 	if (s)
@@ -10504,3 +10546,34 @@ IOReturn pvTranslateForClient(const uint8_t *lib, uint32_t libLen, const char *n
 	return out ? kIOReturnSuccess : kIOReturnUnsupported;   // delivered empty: the helper could not translate it
 }
 #endif
+
+IOReturn pvPresentSource(const void *client, uint32_t sid, uint64_t handle)
+{
+	if (!client || !sid)
+		return kIOReturnBadArgument;
+
+	IOReturn r = handle ? kIOReturnNoResources : kIOReturnSuccess;
+
+	IOLockLock(gSourceLock);
+	for (PresentSource &p : gSources)   // the surface's source before (any client's) gone
+		if (p.sid == sid && !p.dead)
+			p.dead = true;
+	for (PresentSource &p : gSources)
+		if (handle && !p.sid && !p.dead) {
+			p = {sid, client, handle, 0, 0, 0, false};
+			r = kIOReturnSuccess;
+			break;
+		}
+	IOLockUnlock(gSourceLock);
+
+	return r;
+}
+
+void pvPresentSourcesOf(const void *client)
+{
+	IOLockLock(gSourceLock);
+	for (PresentSource &p : gSources)
+		if (p.sid && p.client == client)
+			p.dead = true;
+	IOLockUnlock(gSourceLock);
+}

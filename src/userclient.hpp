@@ -83,6 +83,7 @@ private:
 	static IOReturn sWaitGfxFence(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sImportHost(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sTranslate(OSObject *t, void *, IOExternalMethodArguments *a);
+	static IOReturn sPresentSource(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPvNext(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPvAccess(OSObject *t, void *, IOExternalMethodArguments *a);
 	static IOReturn sPvDone(OSObject *t, void *, IOExternalMethodArguments *a);

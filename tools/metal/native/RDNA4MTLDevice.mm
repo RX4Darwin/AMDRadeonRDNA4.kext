@@ -60,6 +60,7 @@
 #import <os/log.h>
 #include <atomic>
 #include <mutex>
+#include <sys/sysctl.h>
 #include <vector>
 
 // NSLog's %@ arguments are <private> in the unified log (WindowServer's messages were unreadable): the text, formatted, as public
@@ -72,7 +73,7 @@ extern "C" {
 }
 // Where WindowServer's time goes (window drags were slow, 2026-11-20): totals, logged every 5 s while there is work ("RDNA4MTL stats: ...").
 enum RDNA4Stat { kStatBuffers, kStatDraws, kStatDrawUs, kStatDrainUs, kStatShadowBytes, kStatShadowUs, kStatSelfReads, kStatSelfReadBytes,
-	             kStatDispatches, kStatDispatchUs, kStatSlotUs, kStatBuildUs, kStatWriteUs, kStatSubmitUs, kStatBarriers, kStatWaitUs, kStatRunUs, kStatEncodeUs, kStatRecordUs, kStatAllocs, kStatAllocUs, kStatFreeUs, kStatImports, kStatImportBytes, kStatAllocBytes, kStatSteps, kStatStepUs, kStatCount };
+	             kStatDispatches, kStatDispatchUs, kStatSlotUs, kStatBuildUs, kStatWriteUs, kStatSubmitUs, kStatBarriers, kStatWaitUs, kStatRunUs, kStatEncodeUs, kStatRecordUs, kStatAllocs, kStatAllocUs, kStatFreeUs, kStatImports, kStatImportBytes, kStatAllocBytes, kStatSteps, kStatStepUs, kStatDrawnSurface, kStatDrawnOwn, kStatHeldIn, kStatHeldOut, kStatCount };
 static std::atomic<uint64_t> gStats[kStatCount], gLatencyMaxUs, gEncodeMaxUs, gStepMaxUs;   // gLatencyMaxUs: the longest commit to done since the last report
 static std::atomic<int64_t> gHostLive, gHostCount, gOrderWaiting, gShadowLive, gShadowCount, gTexturesLive, gBuffersLive;   // gauges: host memory allocated (bytes, buffers), command buffers held back
 static uint64_t nowUs(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000; }
@@ -111,6 +112,8 @@ static void statReport(void)
 	RLOG(@"RDNA4MTL stats: a command buffer from commit to done %.2f ms (%.2f waiting for the queue, %.2f running), at most %.2f ms; "
 	     @"made to committed %.2f ms (%.2f in its draw calls), at most %.2f", (v[kStatWaitUs] + v[kStatRunUs]) / 1e3 / n, v[kStatWaitUs] / 1e3 / n,
 	     v[kStatRunUs] / 1e3 / n, worst / 1e3, v[kStatEncodeUs] / 1e3 / n, v[kStatRecordUs] / 1e3 / n, worstEncode / 1e3);
+	RLOG(@"RDNA4MTL stats: drawn (covered) %.1f MB into IOSurfaces, %.1f MB into the device's own textures; surfaces held in VRAM: %.1f MB "
+	     @"filled, %.1f MB written back", v[kStatDrawnSurface] / 1e6, v[kStatDrawnOwn] / 1e6, v[kStatHeldIn] / 1e6, v[kStatHeldOut] / 1e6);
 	RLOG(@"RDNA4MTL stats: %llu steps other than draws (%.1f ms, the longest %.2f ms)", v[kStatSteps], v[kStatStepUs] / 1e3, worstStep / 1e3);
 	RLOG(@"RDNA4MTL stats: %llu buffers allocated (%.1f MB), %llu imported (%.1f MB): %.1f ms, freeing %.1f ms", v[kStatAllocs] - v[kStatImports],
 	     v[kStatAllocBytes] / 1e6, v[kStatImports], v[kStatImportBytes] / 1e6, v[kStatAllocUs] / 1e3, v[kStatFreeUs] / 1e3);
@@ -401,6 +404,22 @@ static BOOL isTargetFormat(MTLPixelFormat f)
 	}
 }
 
+// An IOSurface that WindowServer draws into (a display's frame: textures made as render targets), held in VRAM (rdna4-nativeheld=1, off
+// by default): drawn and read there, and presented from there by the kext (rdna4_present_source). The rows drawn are written back into the
+// surface when WindowServer goes idle, at least each second, and before a step of the CPU; the copy is filled from the surface again when
+// its seed moved (the CPU wrote it) or the CPU touched it here. Drawn into in host memory, a blended 4K quad took 0.92 ms on the card, in
+// VRAM 0.17 ms (2026-11-20); written back after every command buffer instead of presented from VRAM, the write-backs (3 GB/s) made it
+// slower. One per surface, the same layout as the surface, decided when a texture is made (all its draws agree).
+@interface RDNA4Held : NSObject
+@property (readonly) uint64_t gpu;   // the surface's first byte, in VRAM
+- (NSError *)sync;                   // (work queue) the VRAM copy current before a use on the card
+- (void)dirty:(uint64_t)lo to:(uint64_t)hi;   // (work queue) bytes of the surface drawn in VRAM
+- (BOOL)writeBack:(NSError **)why;    // (work queue) the drawn bytes into the surface (on the card, not waited for): whether any were
+- (void)present:(BOOL)on;             // the kext presents the surface's frames from the VRAM copy (or from its memory again)
+- (void)cpuTouched;                   // the CPU may have written the surface: filled again before the next use
+@end
+static RDNA4Held *heldFor(IOSurfaceRef surface, BOOL make, RDNA4MTLDevice *device, RDNA4MTLBuffer *host);
+
 @interface RDNA4MTLTexture : NSObject <MTLTexture>
 - (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLTextureDescriptor *)descriptor;
 // Over an IOSurface (CAMetalLayer's drawables): its memory mapped into the GPU, its rows as the surface has them.
@@ -434,6 +453,9 @@ enum { kWrittenRanges = 8 };   // ranges kept apart (more: the two nearest merge
 - (NSString *)origin;                       // where its pixels are (the trace)
 - (RDNA4MTLTexture *)level:(NSUInteger)level;   // level `level` as a texture of its own (kept): a render pass's attachment level
 @property (readonly) BOOL shadowed;         // the GPU reads a copy of an IOSurface's pixels (refresh)
+@property (readonly) BOOL onSurface;        // an IOSurface's
+@property (readonly) RDNA4Held *held;        // its IOSurface's pixels the GPU uses are in VRAM (rdna4-nativeheld=1)
+- (void)heldRows:(uint32_t)y0 to:(uint32_t)y1 width:(uint32_t)x1;   // (work queue) rows drawn into its held copy (columns up to x1)
 // A view of a buffer's memory (newLinearTextureWithDescriptor:): rows `bpr` apart from `offset`.
 - (instancetype)initWithBuffer:(RDNA4MTLBuffer *)buffer descriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset
                    bytesPerRow:(NSUInteger)bpr;
@@ -451,6 +473,35 @@ enum { kWrittenRanges = 8 };   // ranges kept apart (more: the two nearest merge
 // own import at its own GPU address: by GPU address, their writes missed each other's copies, stale blocks in Safari's toolbar, 2026-11-20).
 // Draws mark their scissor's rows; clears, CPU writes, compute and blits all of what they touch.
 // ponytail: a write the device does not see (another process's, the CPU's through a buffer's contents) leaves its copy behind there.
+// [lo, hi) into the sorted ranges r (n of them, kept apart: those that touch merged, the two nearest made one past kWrittenRanges)
+static void rangesAdd(uint64_t r[kWrittenRanges][2], uint32_t *count, uint64_t lo, uint64_t hi)
+{
+	uint64_t t[kWrittenRanges + 1][2];
+	uint32_t n = 0, k = 0;
+	for (; k < *count && r[k][0] < lo; k++)
+		memcpy(t[n++], r[k], sizeof t[0]);
+	t[n][0] = lo, t[n++][1] = hi;
+	for (; k < *count; k++)
+		memcpy(t[n++], r[k], sizeof t[0]);
+	uint32_t m = 0;
+	for (uint32_t i = 0; i < n; i++)
+		if (m && t[i][0] <= t[m - 1][1])
+			t[m - 1][1] = MAX(t[m - 1][1], t[i][1]);
+		else
+			memcpy(t[m++], t[i], sizeof t[0]);
+	if (m > kWrittenRanges) {
+		uint32_t best = 0;
+		for (uint32_t i = 1; i + 1 < m; i++)
+			if (t[i + 1][0] - t[i][1] < t[best + 1][0] - t[best][1])
+				best = i;
+		t[best][1] = t[best + 1][1];
+		memmove(t[best + 1], t[best + 2], (m - best - 2) * sizeof t[0]);
+		m--;
+	}
+	memcpy(r, t, m * sizeof t[0]);
+	*count = m;
+}
+
 static NSHashTable<RDNA4MTLTexture *> *gCopied;
 static void wrote(uint64_t lo, uint64_t hi)
 {
@@ -518,6 +569,7 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 	uint32_t _shadowSeed;   // a planar surface's seed when last refreshed (_shadowSeeded)
 	BOOL _shadowSeeded;
 	RDNA4MTLTexture *_parent;   // a view's
+	RDNA4Held *_held;
 	rdna4_buffer_t _vram;   // a depth texture's
 }
 @synthesize label;
@@ -570,6 +622,7 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 }
 
 - (BOOL)shadowed { return _surfaceRows != NULL; }
+- (BOOL)onSurface { return self.root->_surface != NULL; }
 
 - (NSString *)origin
 {
@@ -630,30 +683,7 @@ static char gCopyKey;
 	lo = MAX(lo, base), hi = MIN(hi, end);
 	if (lo >= hi)
 		return;
-	uint64_t r[kWrittenRanges + 1][2];   // the ranges with this one, sorted, those that touch merged
-	uint32_t n = 0, k = 0;
-	for (; k < _writtenCount && _written[k][0] < lo; k++)
-		memcpy(r[n++], _written[k], sizeof r[0]);
-	r[n][0] = lo, r[n++][1] = hi;
-	for (; k < _writtenCount; k++)
-		memcpy(r[n++], _written[k], sizeof r[0]);
-	uint32_t m = 0;
-	for (uint32_t i = 0; i < n; i++)
-		if (m && r[i][0] <= r[m - 1][1])
-			r[m - 1][1] = MAX(r[m - 1][1], r[i][1]);
-		else
-			memcpy(r[m++], r[i], sizeof r[0]);
-	if (m > kWrittenRanges) {   // the two nearest made one
-		uint32_t best = 0;
-		for (uint32_t i = 1; i + 1 < m; i++)
-			if (r[i + 1][0] - r[i][1] < r[best + 1][0] - r[best][1])
-				best = i;
-		r[best][1] = r[best + 1][1];
-		memmove(r[best + 1], r[best + 2], (m - best - 2) * sizeof r[0]);
-		m--;
-	}
-	memcpy(_written, r, m * sizeof r[0]);
-	_writtenCount = m;
+	rangesAdd(_written, &_writtenCount, lo, hi);
 }
 - (uint32_t)takeWritten:(uint64_t[kWrittenRanges][2])out from:(uint64_t)lo to:(uint64_t)hi
 {
@@ -770,6 +800,9 @@ static char gCopyKey;
 		_memory = importedSurface(device, surface, base, bytes);
 		CFRelease(surface);   // the import holds it
 		_rowBytes = bpr;
+		// a target of WindowServer's (its displays' frames, the menu bars: made as render targets; the apps' windows it only reads)
+		if (_memory && !planar && _fm->bpp == 4 && (d.usage & MTLTextureUsageRenderTarget) && bytes >= (1u << 20))
+			_held = heldFor(surface, YES, device, _memory);
 	}
 	if (!_memory)
 		return nil;
@@ -796,6 +829,7 @@ static char gCopyKey;
 	}
 	_device = t->_device;
 	_memory = t->_memory;
+	_held = t->_held;
 	_surface = t->_surface;
 	_plane = t->_plane;
 	_surfaceRows = l ? NULL : t->_surfaceRows;   // a level of a shadowed texture: ponytail, level 0 only is kept current
@@ -952,8 +986,18 @@ static char gCopyKey;
 - (MTLStorageMode)storageMode { return MTLStorageModeShared; }
 - (NSUInteger)allocatedSize { return _memory.allocatedSize; }
 - (BOOL)isFramebufferOnly { return NO; }
-- (uint64_t)gpuBase { return _vram.handle ? _vram.gpu + _offset : _memory.gpuAddress + _offset; }
-- (uint8_t *)bytes { return (uint8_t *)_memory.contents + _offset; }
+- (uint64_t)gpuBase { return _held ? _held.gpu + _offset : _vram.handle ? _vram.gpu + _offset : _memory.gpuAddress + _offset; }
+- (uint8_t *)bytes
+{
+	[_held cpuTouched];
+	return (uint8_t *)_memory.contents + _offset;
+}
+- (RDNA4Held *)held { return _held; }
+- (void)heldRows:(uint32_t)y0 to:(uint32_t)y1 width:(uint32_t)x1
+{
+	if (_held && y0 < y1)
+		[_held dirty:_offset + (uint64_t)y0 * _rowBytes to:_offset + (uint64_t)(y1 - 1) * _rowBytes + (uint64_t)x1 * self.bpp];
+}
 
 + (instancetype)allocWithZone:(NSZone *)zone
 {
@@ -1489,6 +1533,180 @@ typedef struct { uint64_t src, dst, bytes; uint32_t pattern; } RDNA4Copy;   // G
 - (NSError *)gpuBarrier:(const RDNA4Copy *)copies count:(uint32_t)count;
 @end
 
+@implementation RDNA4Held {
+	RDNA4MTLDevice *_device;
+	RDNA4MTLBuffer *_host;   // the surface's import (its GPU address: what is copied from and into)
+	IOSurfaceRef _surface;   // (the import holds it)
+	rdna4_buffer_t _vram;
+	uint64_t _bytes, _dirty[kWrittenRanges][2];   // bytes drawn in VRAM since the last write-back
+	uint32_t _dirtyCount;
+	uint32_t _seed;
+	std::atomic<bool> _valid;
+	BOOL _presented;   // the kext presents the surface's frames from _vram (rdna4_present_source)
+}
+
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device surface:(IOSurfaceRef)surface host:(RDNA4MTLBuffer *)host
+{
+	if (!(self = [super init]))
+		return nil;
+	_bytes = (host.length + 255) & ~255ull;
+	if (rdna4_alloc(device.gpu, _bytes, &_vram)) {
+		rdna4Error([NSString stringWithFormat:@"%llu bytes of VRAM for IOSurface %u", _bytes, IOSurfaceGetID(surface)], 0);
+		return nil;
+	}
+	_device = device, _host = host, _surface = surface;
+	return self;
+}
+
+- (void)dealloc
+{
+	[self present:NO];
+	rdna4_free(_device.gpu, &_vram);
+}
+
+- (uint64_t)gpu { return _vram.gpu; }
+
+// The kext presents the surface's frames from the VRAM copy, or from the surface's memory again.
+- (void)present:(BOOL)on
+{
+	@synchronized(self) {
+		if (on == _presented)
+			return;
+		const kern_return_t kr = rdna4_present_source(_device.gpu, IOSurfaceGetID(_surface), on ? &_vram : NULL);
+		_presented = on && !kr;
+		if (kr && on)
+			RTRACE(4, @"IOSurface %u not presented from VRAM (0x%x)", IOSurfaceGetID(_surface), kr);
+	}
+}
+
+// ponytail: what the card drew and is not written back yet is lost when the CPU writes the surface outside a step of the device's
+// (a step writes it back first); WindowServer does not write its frames with the CPU.
+- (void)cpuTouched
+{
+	_valid = false;
+	[self present:NO];
+}
+
+- (NSError *)sync
+{
+	const uint32_t seed = IOSurfaceGetSeed(_surface);
+	if (_valid && seed == _seed)
+		return nil;
+	_dirtyCount = 0;   // (the surface is what counts now)
+	const RDNA4Copy in = { _host.gpuAddress, _vram.gpu, _host.length & ~3ull };
+	NSError *why = [_device gpuBarrier:&in count:1];
+	if (!why) {
+		_valid = true, _seed = seed;
+		statAdd(kStatHeldIn, in.bytes);
+		[self present:YES];
+	}
+	return why;
+}
+
+- (void)dirty:(uint64_t)lo to:(uint64_t)hi
+{
+	hi = MIN((hi + 3) & ~3ull, _host.length & ~3ull);
+	if ((lo & ~3ull) < hi)
+		rangesAdd(_dirty, &_dirtyCount, lo & ~3ull, hi);
+}
+
+- (BOOL)writeBack:(NSError **)why
+{
+	const uint32_t n = _valid ? _dirtyCount : 0;   // nothing drawn, or the CPU wrote the surface since: it counts
+	_dirtyCount = 0;
+	if (!n)
+		return NO;
+	RDNA4Copy out[kWrittenRanges];
+	for (uint32_t i = 0; i < n; i++) {
+		out[i] = (RDNA4Copy){ _vram.gpu + _dirty[i][0], _host.gpuAddress + _dirty[i][0], _dirty[i][1] - _dirty[i][0] };
+		statAdd(kStatHeldOut, out[i].bytes);
+	}
+	*why = [_device gpuBarrier:out count:n];
+	return YES;
+}
+@end
+
+// rdna4-nativeheld=1 in the boot arguments
+static BOOL heldOn(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		char args[1024] = {};
+		size_t n = sizeof args - 1;
+		on = !sysctlbyname("kern.bootargs", args, &n, NULL, 0) && strstr(args, "rdna4-nativeheld=1") != NULL;
+	}
+	return on;
+}
+
+// The surface's held copy (`make`: made if there is none). Kept 5 s after it was last asked for, and
+// as long as a texture uses it: one copy a surface.
+static NSMapTable<NSNumber *, RDNA4Held *> *gHeldAlive;   // weak: while a texture or `kept` holds it (@synchronized RDNA4Held)
+
+static RDNA4Held *heldFor(IOSurfaceRef surface, BOOL make, RDNA4MTLDevice *device, RDNA4MTLBuffer *host)
+{
+	if (!heldOn())
+		return nil;
+	static NSMutableDictionary<NSNumber *, NSArray *> *kept;   // ID -> {held, last asked for (s)}
+	static CFAbsoluteTime swept;
+	const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+	NSNumber *key = @(IOSurfaceGetID(surface));
+	@synchronized([RDNA4Held class]) {
+		gHeldAlive = gHeldAlive ?: [NSMapTable strongToWeakObjectsMapTable];
+		kept = kept ?: [NSMutableDictionary dictionary];
+		if (now - swept > 1) {
+			swept = now;
+			for (NSNumber *k in kept.allKeys)
+				if (now - [kept[k][1] doubleValue] > 5)
+					[kept removeObjectForKey:k];
+		}
+		RDNA4Held *h = [gHeldAlive objectForKey:key];
+		if (!h && make && host && (h = [[RDNA4Held alloc] initWithDevice:device surface:surface host:host]))
+			[gHeldAlive setObject:h forKey:key];
+		if (h)
+			kept[key] = @[ h, @(now) ];
+		return h;
+	}
+}
+
+// (work queue) What the card drew into every held surface written back into it, waited for: the frames are presented from VRAM, and the
+// surfaces' memory (what other processes and the CPU read) kept current when WindowServer goes idle and at least each second.
+static NSError *heldWriteBackAll(RDNA4MTLDevice *device)
+{
+	NSArray<RDNA4Held *> *all;
+	@synchronized([RDNA4Held class]) {
+		all = gHeldAlive.objectEnumerator.allObjects;
+	}
+	NSError *why = nil;
+	BOOL any = NO;
+	for (RDNA4Held *h in all)
+		if (!why)
+			any |= [h writeBack:&why];
+	if (any && !why)
+		why = [device gpuBarrier:NULL count:0];   // the L2 written back (RELEASE_MEM) after the copies
+	return why ?: any ? [device drainGfx] : nil;
+}
+
+// (work queue, after each command buffer) The held surfaces written back 100 ms after the last command buffer, or now if a second went
+// by without (an animation that never stops).
+static void heldIdle(RDNA4MTLDevice *device)
+{
+	static uint64_t generation, lastBack;
+	if (!heldOn())
+		return;
+	const uint64_t now = nowUs(), mine = ++generation;
+	if (now - lastBack > 1000000) {
+		lastBack = now;
+		(void)heldWriteBackAll(device);
+		return;
+	}
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), device.work, ^{
+		if (generation != mine)
+			return;
+		lastBack = nowUs();
+		(void)heldWriteBackAll(device);
+	});
+}
+
 @implementation RDNA4MTLRenderPipeline {
 	RDNA4MTLDevice *_device;
 	NSData *_blob[2];
@@ -1890,10 +2108,22 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 		const uint32_t s[3] = { (uint32_t)groupSize.width, (uint32_t)groupSize.height, (uint32_t)groupSize.depth };
 		(void)held;
 		[cb refreshLate:late];
+		BOOL synced = NO;
+		for (RDNA4MTLTexture *t in kernelTextures) {
+			NSError *why = t.held ? [t.held sync] : nil;
+			if (why)
+				return why;
+			synced |= t.held != nil;
+		}
+		NSError *drained = synced ? [device drainGfx] : nil;   // (the fills went to the gfx ring, the dispatch to a compute queue)
+		if (drained)
+			return drained;
 		const uint64_t t0 = nowUs();
 		const kern_return_t kr = device.gpu ? rdna4_dispatch(device.gpu, &prog, g, s, args.bytes, (uint32_t)args.length, 1000, NULL) : kIOReturnNotOpen;
-		for (RDNA4MTLTexture *t in kernelTextures)   // what the kernel may have written
+		for (RDNA4MTLTexture *t in kernelTextures) {   // what the kernel may have written
 			[t wroteAll];
+			[t heldRows:0 to:(uint32_t)t.height width:(uint32_t)t.width];
+		}
 		statAdd(kStatDispatches, 1);
 		statAdd(kStatDispatchUs, nowUs() - t0);
 		return kr ? rdna4Error(@"a dispatch", kr) : nil;
@@ -1969,8 +2199,12 @@ RDNA4_ANSWER_MISSING
 			continue;
 		if ([t fillFor:c pattern:&pattern bytes:&bytes])
 			[commandBuffer recordDraw:^NSError * {
+				NSError *why = [t.held sync];
+				if (why)
+					return why;
 				[t wroteAll];
 				[commandBuffer drewInto:t];
+				[t heldRows:0 to:(uint32_t)t.height width:(uint32_t)t.width];
 				const RDNA4Copy fill = { 0, t.gpuBase, bytes, pattern };
 				return [device gpuBarrier:&fill count:1];
 			}];
@@ -2233,7 +2467,11 @@ RDNA4_ANSWER_MISSING
 		// draw's own target, read as a texture (Core Animation's backdrops), is read from a copy the card makes (the PV host's staged copy);
 		// read in place while drawn, WindowServer's first native frames hung the gfx ring (2026-11-20).
 		RDNA4Draw dd = d;
-		NSError *why = nil;
+		NSError *why = [target.held sync];
+		for (NSUInteger i = 0; i < reads.count && !why; i++)
+			why = [((RDNA4MTLTexture *)reads[i][2]).held sync];
+		if (why)
+			return why;
 		BOOL barrier = NO;
 		RDNA4MTLTexture *fresh = nil;   // the target, copied before this draw
 		for (NSArray *r in reads) {
@@ -2542,6 +2780,9 @@ RDNA4_ANSWER_MISSING
 }
 - (void)drewInto:(RDNA4MTLTexture *)target
 {
+	// a texture of a held surface that is not held itself drew into the surface: the held copy filled again before its next use
+	if (heldOn() && !target.held && target.onSurface)
+		[heldFor(target.root.iosurface, NO, nil, nil) cpuTouched];
 	if (!target.shadowed || !target.iosurface)   // (one over a buffer: Core Animation's memory may be gone by the end)
 		return;
 	[target drewIntoShadow];
@@ -2656,7 +2897,7 @@ RDNA4_ANSWER_MISSING
 		for (NSUInteger i = 0; i < self->_ops.count && !why; i++) {
 			const BOOL draw = [self->_draws containsIndex:i];
 			if (!draw)
-				why = [device drainGfx];
+				why = [device drainGfx] ?: heldWriteBackAll(device);   // (a CPU step may read a held surface's memory)
 			const uint64_t t0 = draw ? 0 : nowUs();
 			if (!why)
 				why = self->_ops[i]();
@@ -2703,6 +2944,7 @@ RDNA4_ANSWER_MISSING
 				h(self);
 			dispatch_group_leave(self->_done);
 		});
+		heldIdle(device);
 	});
 }
 
@@ -3194,6 +3436,9 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 	_lastSlot = slot;
 	_drawsInFlight = YES;
 	const uint32_t cx = d->covered[0], cy = d->covered[1], cx2 = MIN(cx + d->covered[2], (uint32_t)t.width), cy2 = MIN(cy + d->covered[3], (uint32_t)t.height);
+	if (cx < cx2 && cy < cy2)
+		statAdd(t.onSurface ? kStatDrawnSurface : kStatDrawnOwn, (uint64_t)(cx2 - cx) * (cy2 - cy) * t.bpp);
+	[t heldRows:cy to:cy2 width:cx2];
 	if (cx < cx2 && cy < cy2)
 		wrote(t.identity + cy * t.rowBytes, t.identity + (uint64_t)(cy2 - 1) * t.rowBytes + cx2 * t.bpp);
 	if (!_drawnInFlight)

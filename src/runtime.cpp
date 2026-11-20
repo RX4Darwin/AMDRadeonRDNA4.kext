@@ -2903,6 +2903,29 @@ IOReturn RDNA4Compute::rtMapVram(const void *owner, uint64_t barPhys, uint64_t b
 	if (!c || !bytes || bytes > sv.bar0Size || barPhys < sv.bar0Phys || barPhys - sv.bar0Phys > sv.bar0Size - bytes ||
 	    (barPhys & (GpuVm::kPageBytes - 1)))
 		return kIOReturnBadArgument;
+	return mapMcLocked(owner, vramMc(barPhys - sv.bar0Phys), bytes, handle, gpu);
+}
+
+IOReturn RDNA4Compute::rtMapClientVram(const void *owner, const void *client, uint64_t clientHandle, uint64_t &handle, uint64_t &gpu,
+                                       uint64_t &bytes) {
+	Locked g(rtLock);
+	const IOReturn state = ownerStateLocked(owner);
+	if (state != kIOReturnSuccess)
+		return state;
+	if (!vmEnabled)
+		return kIOReturnUnsupported;
+	const RtBuffer *b = bufferFor(client, clientHandle);
+	if (!b || b->host || b->foreign || !b->mc)   // VRAM the runtime gave the client (either heap) only
+		return kIOReturnBadArgument;
+	bytes = b->bytes;
+	return mapMcLocked(owner, b->mc, b->bytes, handle, gpu);
+}
+
+// (rtLock held) `bytes` of VRAM at MC address `mc` mapped into owner's GPU address space, as a buffer of its that frees only the mapping.
+IOReturn RDNA4Compute::mapMcLocked(const void *owner, uint64_t mc, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
+	RtClient *c = vmClientFor(owner);
+	if (!c)
+		return kIOReturnBadArgument;
 	uint32_t slot = 0;
 	while (slot < bufferCap() && buffers[slot].owner)
 		slot++;
@@ -2914,7 +2937,7 @@ IOReturn RDNA4Compute::rtMapVram(const void *owner, uint64_t barPhys, uint64_t b
 	b = RtBuffer {};
 	b.owner = owner;
 	b.bytes = (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1);
-	b.mc = vramMc(barPhys - sv.bar0Phys);
+	b.mc = mc;
 	b.va = vaTake(*c, b.bytes);
 	b.gen = generation;
 	b.foreign = true;

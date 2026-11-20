@@ -30,6 +30,8 @@ otherwise). The newest version is on top. How versions and branches work is in `
 - Native WindowServer: a moving window's display at about 59 frames a second, not 30: IOSurface imports kept and shared between the
   textures made of them every frame, and freed host memory reused (each import, allocation and free was a kext call of about 1 ms).
 - Native WindowServer: render-pass clears filled on the card in order with the draws, not by the CPU after waiting for all of them.
+- Native WindowServer, `rdna4-nativeheld=1` (off by default): the displays' frames drawn in VRAM and presented from there (new runtime
+  call `PresentSource`, WindowServer only); with many apps open a moving window's display 74 % -> 98 % of frames on time.
 - The paravirtual host opens the runtime from its tick (from a draw, IOLog ran the timer thread's stack out: a double fault).
 
 ## 0.3.3 (2026-11-19)

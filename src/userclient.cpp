@@ -8,6 +8,7 @@
 //  of the handlers below runs.
 //
 
+#include <sys/proc.h>
 #include "userclient.hpp"
 #include "klog.hpp"
 #include "compute.hpp"
@@ -109,6 +110,9 @@ void RDNA4ComputeClient::release() {
 		IOLockSleep(gate, &calls, THREAD_UNINT);
 	IOLockUnlock(gate);
 
+#ifdef AMDRadeonRDNA4_PVGPU
+	pvPresentSourcesOf(this);
+#endif
 	if (compute)
 		compute->rtRelease(this);
 }
@@ -152,8 +156,9 @@ const IOExternalMethodDispatch RDNA4ComputeClient::kMethods[kRDNA4MethodCount] =
 	{ sWaitGfxFence, 2,        0,                          1,           0 },
 	{ sImportHost, 3,          0,                          2,           0 },
 	{ sTranslate,  5,          0,                          2,           0 },
+	{ sPresentSource, 2,       0,                          0,           0 },
 };
-static_assert(kRDNA4MethodCount == 24, "kMethods has one entry per selector");
+static_assert(kRDNA4MethodCount == 25, "kMethods has one entry per selector");
 
 // What a client that is not root may call: its own buffers, programs and submissions. Not the display (present, restore, vblank), the
 // sensors, the sleep test or the quiesce.
@@ -162,7 +167,7 @@ static constexpr uint32_t kLocalSelectors = 1u << kRDNA4MethodInfo | 1u << kRDNA
                                             1u << kRDNA4MethodUnload | 1u << kRDNA4MethodDispatch | 1u << kRDNA4MethodAllocHost |
                                             1u << kRDNA4MethodSubmitIb | 1u << kRDNA4MethodWaitFence |
                                             1u << kRDNA4MethodSubmitGfxIb | 1u << kRDNA4MethodWaitGfxFence | 1u << kRDNA4MethodImportHost |
-                                            1u << kRDNA4MethodTranslate;
+                                            1u << kRDNA4MethodTranslate | 1u << kRDNA4MethodPresentSource;
 
 IOReturn RDNA4ComputeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                                             IOExternalMethodDispatch *, OSObject *, void *) {
@@ -308,6 +313,20 @@ IOReturn RDNA4ComputeClient::sWaitFence(OSObject *t, void *, IOExternalMethodArg
 IOReturn RDNA4ComputeClient::sSubmitGfxIb(OSObject *t, void *, IOExternalMethodArguments *a) {
 	return self(t)->compute->rtSubmitGfxIb(t, a->scalarInput[0], a->scalarInput[1],
 	                                       a->scalarInput[2], a->scalarOutput[0]);
+}
+
+// What the displays show comes from the caller's VRAM: WindowServer only (another process could put its own pixels on the screen so).
+IOReturn RDNA4ComputeClient::sPresentSource(OSObject *t, void *, IOExternalMethodArguments *a) {
+#ifdef AMDRadeonRDNA4_PVGPU
+	char name[32] = {};
+	proc_selfname(name, sizeof(name));
+	if (strcmp(name, "WindowServer"))
+		return kIOReturnNotPrivileged;
+	return pvPresentSource(t, static_cast<uint32_t>(a->scalarInput[0]), a->scalarInput[1]);
+#else
+	(void)t, (void)a;
+	return kIOReturnUnsupported;
+#endif
 }
 
 // The caller's AIR copied in, translated by the helper (pvTranslateForClient), the result copied out to the caller's room.

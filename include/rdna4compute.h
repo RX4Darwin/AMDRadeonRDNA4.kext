@@ -100,6 +100,10 @@ enum {
 	 * by the translator helper (include/rdna4mtlc.h): a kernel's code object or a shader's RGFX blob. For callers that cannot start the
 	 * translator themselves (WindowServer's sandbox); kIOReturnUnsupported in builds without the paravirtual GPU. */
 	kRDNA4MethodTranslate,
+	/* IOSurface ID, handle of a VRAM buffer of the caller's (0: none) -> : the surface's frames presented from that buffer, laid out as the
+	 * surface (the native Metal device keeps WindowServer's frames in VRAM). WindowServer only; kIOReturnUnsupported without the
+	 * paravirtual GPU. */
+	kRDNA4MethodPresentSource,
 	kRDNA4MethodCount
 };
 

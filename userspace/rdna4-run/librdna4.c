@@ -130,6 +130,11 @@ kern_return_t rdna4_import_host(rdna4_t *dev, void *address, uint64_t bytes, uin
 	return kr;
 }
 
+kern_return_t rdna4_present_source(rdna4_t *dev, uint32_t surface, const rdna4_buffer_t *buf) {
+	const uint64_t in[2] = { surface, buf ? buf->handle : 0 };
+	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodPresentSource, in, 2, NULL, NULL);
+}
+
 kern_return_t rdna4_free(rdna4_t *dev, const rdna4_buffer_t *buf) {
 	return IOConnectCallScalarMethod(dev->conn, kRDNA4MethodFree, &buf->handle, 1, NULL, NULL);
 }

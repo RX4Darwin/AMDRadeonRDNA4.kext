@@ -206,5 +206,9 @@ IOReturn pvTranslateForClient(const uint8_t *lib, uint32_t libLen, const char *n
 // WindowServer draws the displays' frames with the native device (accelcensus.cpp routePv): the host scans them out of their memory and
 // keeps none on the card (debug.rdna4_pvinplace bits 32 and 16), whose copies only Apple's driver's draws update.
 void pvFramesInMemory(bool on);
+// The native device keeps WindowServer's frames in VRAM: surface `sid`'s frames are presented from runtime client `client`'s VRAM buffer
+// `handle` (0: from the surface's memory again). pvPresentSourcesOf: a client gone, its sources dropped.
+IOReturn pvPresentSource(const void *client, uint32_t sid, uint64_t handle);
+void pvPresentSourcesOf(const void *client);
 
 #endif /* RDNA4PvGpu_hpp */

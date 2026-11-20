@@ -403,3 +403,18 @@ held display surfaces in VRAM (rdna4-nativeheld=1) + mtlprobe nativebench". What
 (no write-back; other readers, screenshots, given the surface on demand), and bounds for `VfxXgb` (vertex pulling, three layouts) so its
 full-frame self-read copies shrink.
 
+**Presented from VRAM (2026-11-20, evening; `rdna4-nativeheld=1`, off by default):** WindowServer's render-target IOSurfaces (its
+displays' frames, the menu bars: made as render targets, at least 1 MB, BGRA8, one plane) are held in VRAM by the native device and
+the kext presents them from there. Kext: `kRDNA4MethodPresentSource` (IOSurface ID, a VRAM buffer of the caller's; WindowServer only,
+by process name: another process could put its own pixels on the screen), a table of present sources in the paravirtual host, mapped
+into its GPU address space when first presented (`rtMapClientVram`: the client buffer's MC range, a mapping of the host's that frees
+only the mapping), dropped when the device unregisters, the client closes or the runtime goes (sleep). Device (`RDNA4Held`): one VRAM
+copy a surface, the surface's layout; filled from the surface when first used or when its seed moved, registered once current,
+unregistered when the CPU touches the surface; the drawn rows (up to 8 ranges) written back when WindowServer goes idle (100 ms), at
+least each second, and before a CPU step, not after every command buffer.
+
+Card, the glass window moving on the 4K display with 8 apps open: frames at the next vblank 74 % -> 98 % (705 of 721), a command buffer
+commit to done 4.5 -> 2.2 ms (at most 6), write-backs about 80 MB a second; the 1080p display 695 of 702; Mission Control right.
+Not tested: system sleep with held surfaces (VRAM is lost in sleep; the device does not refill on wake yet), a CPU screenshot
+(`screencapture` cannot capture over ssh), display mode changes.
+

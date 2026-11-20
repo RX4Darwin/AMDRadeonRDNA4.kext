@@ -740,6 +740,10 @@ public:
 	IOReturn rtMapPages(const void *owner, const uint64_t *pageBuses, uint64_t pages, uint64_t &handle, uint64_t &gpu);
 	IOReturn rtFree(const void *owner, uint64_t handle);
 	IOReturn rtMapVram(const void *owner, uint64_t barPhys, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
+	// `client`'s VRAM buffer `clientHandle` mapped into `owner`'s GPU address space too (the paravirtual host presenting the native Metal
+	// device's frames): a handle of `owner`'s (freed with rtFree, the VRAM stays the client's), its VA and bytes.
+	IOReturn rtMapClientVram(const void *owner, const void *client, uint64_t clientHandle, uint64_t &handle, uint64_t &gpu, uint64_t &bytes);
+	IOReturn mapMcLocked(const void *owner, uint64_t mc, uint64_t bytes, uint64_t &handle, uint64_t &gpu);
 	// The paravirtual displays' frames flipped at vblank (pvgpu.cpp, presentOnCard): the HUBP showing a head's scanout at `barPhys` and
 	// the scanout's MC address; a VRAM runtime buffer's MC address (0 for another); a flip requested; what the HUBP was asked to show
 	// and what it reads now (Flip::shown).
