@@ -89,6 +89,8 @@ is prelinked against the system collection's copies.
   panicked: no check), registers a framebuffer notification and sets `IOAccelTypes` (our accelerator's path), `IOAccelIndex` 0 and
   `IOAccelRevision` on that IONDRVFramebuffer: how WindowServer ties a display to its accelerator. The other five: "trying to init too
   many framebuffers": the config's display count (accelerator +0xc88 config, +0x28; AMD sets its display count) defaulted to 1; now 8.
+  With 8 (kext 8dc2bab3): all six IONDRV framebuffers get a pipe (IOAccelIndex 0-5), desktop unaffected. `IOAccelDisplayMachine::init`
+  and `start` return nothing (rax holds the lock's address): judge them by the framebuffers' properties, not their "result".
   The "IOAccelResource2::map(): resource already has a map" faults in the log are the paravirtual path's (thousands a boot without ours).
 - Next: WindowServer on these framebuffers through our pipes: today the kext hides the IONDRV framebuffers from it (the paravirtual
   displays are its displays) and our accelerator refuses user clients (`IOAccelDisplayPipeUserClient2` and the rest); the family's

@@ -326,13 +326,11 @@ int accelSysctl SYSCTL_HANDLER_ARGS
 		RDNA4DisplayMachine *dm = gAccel->displayMachine;
 		if (!dm)
 			return ENODEV;
-		rdna4Log("AMDRadeonRDNA4: accel: display machine init\n");
-		const bool inited = dm->init(gAccel);
-		rdna4Log("AMDRadeonRDNA4: accel: display machine init %s; start on the GPU\n", inited ? "done" : "FAILED");
-		if (!inited)
-			return EIO;
-		const uintptr_t started = dm->start(reinterpret_cast<IOPCIDevice *>(gpu));   // (gpu is the GPU's IOPCIDevice)
-		rdna4Log("AMDRadeonRDNA4: accel: display machine start returned 0x%lx\n", static_cast<unsigned long>(started));
+		// (init and start return nothing: what rax held, the lock's address: not a result; the framebuffers' IOAccelIndex tell)
+		rdna4Log("AMDRadeonRDNA4: accel: display machine init and start on the GPU\n");
+		dm->init(gAccel);
+		dm->start(reinterpret_cast<IOPCIDevice *>(gpu));   // (gpu is the GPU's IOPCIDevice)
+		rdna4Log("AMDRadeonRDNA4: accel: display machine started\n");
 		gDisplays = true;
 	}
 	return 0;
