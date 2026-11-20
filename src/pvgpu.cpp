@@ -132,7 +132,7 @@ static uint8_t *physPtr(uint64_t pa, uint64_t bytes)
 // M3: the one request slot between the host and the translator helper (include/rdna4mtlc.h). The host posts a function (id != 0) and
 // waits on &done; the helper's kMtlcNext waits on &id, copies the metallib out and sets taken; kMtlcDeliver fills elf and sets done.
 struct Translation {
-	IOLock *lock;                 // allocated with the host (RDNA4PvHost::start)
+	IOLock *lock;                 // allocated with the host or our accelerator (pvTranslatorInit)
 	bool helper;                  // a helper is connected
 	bool gaveUp;                  // the host waited for one in vain: it does not wait again until one connects
 	uint32_t helpers;             // helpers connected so far: failures cached under an older one are asked again
@@ -1252,8 +1252,7 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	}
 	h->mNub = nub;
 	h->mLevel = level;
-	if (!gTr.lock)
-		gTr.lock = IOLockAlloc();   // ponytail: never freed, like the host
+	pvTranslatorInit();
 	uint32_t disp = 0;
 	if (Trial::option("rdna4-pvgpu-disp", disp))
 		h->mDisp = disp & 3;
@@ -10555,11 +10554,19 @@ IOReturn RDNA4MtlcClient::deliver(IOExternalMethodArguments *a) {
 	return current ? kIOReturnSuccess : kIOReturnNotFound;   // NotFound: the host stopped waiting for it
 }
 
+void pvTranslatorInit() {
+	if (__atomic_load_n(&gTr.lock, __ATOMIC_ACQUIRE))
+		return;
+	IOLock *lock = IOLockAlloc(), *none = nullptr;   // ponytail: never freed, like the host
+	if (lock && !__atomic_compare_exchange_n(&gTr.lock, &none, lock, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+		IOLockFree(lock);
+}
+
 IOReturn pvTranslatorClient(IOService *service, task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) {
 	if (IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
 		return kIOReturnNotPrivileged;
 	if (!gTr.lock)
-		return kIOReturnNotReady;   // the host has not started yet (rdna4-pvgpu-delay)
+		return kIOReturnNotReady;   // neither the host nor our accelerator has started yet (rdna4-pvgpu-delay)
 	auto *client = OSTypeAlloc(RDNA4MtlcClient);
 	if (!client)
 		return kIOReturnNoMemory;
@@ -10586,8 +10593,10 @@ IOReturn pvTranslateForClient(const uint8_t *lib, uint32_t libLen, const char *n
 {
 	out = nullptr;
 	outLen = buffers = 0;
-	if (!gTr.lock || !waitForHelper())
+	if (!gTr.lock || !waitForHelper()) {
+		pvlog("translator: \"%s\" for a runtime client: %s", name, gTr.lock ? "no helper (waited in vain)" : "no request slot yet");
 		return kIOReturnNotReady;
+	}
 	IOLockLock(gTr.lock);
 	waitForSlot();
 	gTr.id = ++gTr.seq ? gTr.seq : ++gTr.seq;

@@ -22,6 +22,7 @@
 
 #include "accelcensus.hpp"
 #ifdef AMDRadeonRDNA4_PVGPU
+#include "pvgpu.hpp"
 #include "pvscanout.hpp"
 #endif
 #include "rdna4compute.h"
@@ -639,6 +640,9 @@ int accelTo(int value)
 			agdc->registerService();
 		rdna4Log("AMDRadeonRDNA4: accel: AGDC service %s\n", agdcUp ? "started" : "NOT started");
 		OSSafeReleaseNULL(agdc);   // (the registry keeps a started one)
+#ifdef AMDRadeonRDNA4_PVGPU
+		pvTranslatorInit();   // the Metal device's shaders go through the translator helper (none without the paravirtual host)
+#endif
 		gAccel->registerService();
 		rdna4Log("AMDRadeonRDNA4: accel: registered for WindowServer: our Metal bundle, the family's user clients\n");
 	}

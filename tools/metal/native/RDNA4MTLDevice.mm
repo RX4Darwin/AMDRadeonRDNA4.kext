@@ -3254,6 +3254,8 @@ enum { kSlots = 128, kBatchSlots = 32 };   // a batch is submitted at kBatchSlot
 	rdna4_program_t _resolve[2];
 }
 
+static NSString *serviceString(io_service_t service, CFStringRef key);
+
 + (void)load
 {
 	Protocol *spi = objc_getProtocol("MTLDeviceSPI");   // Metal's private protocol, also asserted by MTLAddDevice
@@ -3263,7 +3265,8 @@ enum { kSlots = 128, kBatchSlots = 32 };   // a batch is submitted at kBatchSlot
 
 - (instancetype)initWithAcceleratorPort:(io_service_t)service
 {
-	if (!getenv("RDNA4_NATIVE_MTL")) {
+	// always on our own accelerator (rdna4accel.cpp: no other device there), else only with RDNA4_NATIVE_MTL
+	if (!getenv("RDNA4_NATIVE_MTL") && !serviceString(service, CFSTR("RDNA4Accelerator"))) {
 		self = [super init];   // before the nil return: _MTLDevice's dealloc expects its init to have run
 		return nil;
 	}
@@ -3926,7 +3929,15 @@ enum { kSlots = 128, kBatchSlots = 32 };   // a batch is submitted at kBatchSlot
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
 {
-	return [[RDNA4MTLTexture alloc] initWithDevice:self descriptor:descriptor iosurface:surface plane:plane];
+	RDNA4MTLTexture *t = [[RDNA4MTLTexture alloc] initWithDevice:self descriptor:descriptor iosurface:surface plane:plane];
+	if (!t) {   // Core Animation then has a surface it does not track (push_surface asserts "found != slist->end ()")
+		const OSType f = surface ? IOSurfaceGetPixelFormat(surface) : 0;
+		RTRACE(20, @"no texture of IOSurface %u ('%c%c%c%c' %zux%zu plane %lu) as format %lu type %lu %lux%lu usage 0x%lx", surface ? IOSurfaceGetID(surface) : 0,
+		       (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f, surface ? IOSurfaceGetWidth(surface) : 0, surface ? IOSurfaceGetHeight(surface) : 0,
+		       (unsigned long)plane, (unsigned long)descriptor.pixelFormat, (unsigned long)descriptor.textureType, (unsigned long)descriptor.width,
+		       (unsigned long)descriptor.height, (unsigned long)descriptor.usage);
+	}
+	return t;
 }
 
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options
@@ -3951,7 +3962,12 @@ enum { kSlots = 128, kBatchSlots = 32 };   // a batch is submitted at kBatchSlot
 	    ((descriptor.textureType == MTLTextureType2D && n == 1) || (descriptor.textureType == MTLTextureType2DMultisample && (n == 2 || n == 4))) &&
 	    descriptor.width && descriptor.height && descriptor.width <= 16384 && descriptor.height <= 16384)
 		return [[RDNA4MTLTexture alloc] initDepthWithDevice:self descriptor:descriptor];
-	return [[RDNA4MTLTexture alloc] initWithDevice:self descriptor:descriptor];
+	RDNA4MTLTexture *t = [[RDNA4MTLTexture alloc] initWithDevice:self descriptor:descriptor];
+	if (!t)
+		RTRACE(20, @"no texture of format %lu type %lu %lux%lux%lu, %lu levels, %lu samples, storage %lu", (unsigned long)f,
+		       (unsigned long)descriptor.textureType, (unsigned long)descriptor.width, (unsigned long)descriptor.height,
+		       (unsigned long)descriptor.depth, (unsigned long)descriptor.mipmapLevelCount, (unsigned long)n, (unsigned long)descriptor.storageMode);
+	return t;
 }
 
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error

@@ -200,6 +200,8 @@ private:
 	IOLock *mLock { nullptr };
 };
 
+// The translator helper's request slot made (once): by the host and by our own accelerator (rdna4accel.cpp), whichever starts first
+void pvTranslatorInit();
 // M3: the Metal kernel translator's user client (include/rdna4mtlc.h), handed out by RDNA4ComputeService::newUserClient.
 IOReturn pvTranslatorClient(IOService *service, task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler);
 IOReturn pvTranslateForClient(const uint8_t *lib, uint32_t libLen, const char *name, uint8_t *&out, uint32_t &outLen, uint32_t &buffers);
