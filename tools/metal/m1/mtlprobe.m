@@ -12,6 +12,7 @@
 //   mtlprobe nativewin [S]  a window whose CAMetalLayer draws on our own device for S seconds (10): the colour triangle each frame
 //   mtlprobe nativespin [S]  spin on our own device (3D: depth test, a texture and sampler, indexed instanced draws)
 //   mtlprobe nativestencil [1|4]  stencil (Depth32Float_Stencil8) and 4x multisampling with a resolve on our own device
+//   mtlprobe nativeevent          a shared event: one queue waits for another queue's signal on our own device
 //   mtlprobe nativesrc a kernel compiled from source (Metal's own compiler) on our own device, run and checked (as native)
 //   mtlprobe dualsrc   dual-source blending: every pixel of a quad whose colour and second source depend on its parity, checked
 //   mtlprobe devices   every Metal device MTLCopyAllDevices returns, its class and registry ID (docs/native-metal-spike.md)
@@ -74,7 +75,7 @@
 //   mtlprobe all       all of them, each in its own child process (a crash or hang in one does not hide the others)
 //
 // Build: clang -arch x86_64 -mmacosx-version-min=11.0 -fobjc-arc tools/metal/m1/mtlprobe.m -framework Foundation -framework Metal -framework IOSurface \
-//        -framework AppKit -framework QuartzCore -o mtlprobe
+//        -framework AppKit -framework QuartzCore -framework IOKit -o mtlprobe
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -2850,6 +2851,33 @@ int main(int argc, char **argv) {
 			const char *only = argc > 2 ? argv[2] : NULL;   // one of the passes alone: mtlprobe nativestencil 1 or 4
 			const BOOL ok = (only && atoi(only) == 4 ? YES : stencilPass(d, q, lib, 1, MTLPixelFormatBGRA8Unorm)) &
 			                (only && atoi(only) == 1 ? YES : stencilPass(d, q, lib, 4, MTLPixelFormatBGRA8Unorm));
+			return ok ? 0 : 1;
+		}
+		if (!strcmp(mode, "nativeevent")) {   // shared events on our own device: a queue's wait for another queue's signal (RDNA4MTLCommandBuffer)
+			id<MTLDevice> d = nil;
+			for (id<MTLDevice> dev in MTLCopyAllDevices())
+				if ([NSStringFromClass([(id)dev class]) isEqualToString:@"RDNA4MTLDevice"])
+					d = dev;
+			id<MTLSharedEvent> e = [d newSharedEvent];
+			if (!e) {
+				OUT("nativeevent: FAIL: %s", d ? "no shared event" : "no RDNA4MTLDevice");
+				return 1;
+			}
+			id<MTLCommandQueue> q1 = [d newCommandQueue], q2 = [d newCommandQueue];
+			id<MTLCommandBuffer> waiter = [q1 commandBuffer], signaller = [q2 commandBuffer];
+			[waiter encodeWaitForEvent:e value:1];
+			[waiter commit];
+			usleep(100000);
+			const BOOL held = waiter.status < MTLCommandBufferStatusCompleted;   // still waiting: nobody signalled
+			const double t0 = CACurrentMediaTime();
+			[signaller encodeSignalEvent:e value:1];
+			[signaller commit];
+			[signaller waitUntilCompleted];
+			[waiter waitUntilCompleted];
+			const double ms = (CACurrentMediaTime() - t0) * 1e3;
+			const BOOL ok = held && e.signaledValue == 1 && ms < 500;   // the wait gives up after 1 s
+			OUT("nativeevent: %s: held before the signal %s, value %llu, the waiter done %.1f ms after the signal's commit", ok ? "PASS" : "FAIL",
+			    held ? "yes" : "NO", e.signaledValue, ms);
 			return ok ? 0 : 1;
 		}
 		if (!strcmp(mode, "nativespin")) {   // the native-Metal spike's gate 10: spin (3D: depth, textures, instances) on our own device

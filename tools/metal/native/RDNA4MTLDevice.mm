@@ -2007,6 +2007,7 @@ typedef NSError * (^RDNA4Op)(void);   // a recorded step: the work queue runs th
 
 @interface RDNA4MTLCommandQueue : NSObject <MTLCommandQueue>
 @property (readonly) dispatch_queue_t handlers;   // where its command buffers' handlers run: the app's (setCompletionQueue:) or its own
+@property (readonly) dispatch_queue_t gate;       // its command buffers on their way to the work queue, in order (events waited for there)
 - (void)reserve:(id)commandBuffer;     // enqueue: its place in the queue's order
 - (void)committed:(id)commandBuffer;   // commit: it and the committed ones after it go to the work queue, in enqueue order
 @end
@@ -2861,6 +2862,30 @@ static NSError *colourOnly(id<MTLTexture> t)
 RDNA4_ANSWER_MISSING
 @end
 
+// An event's value: a shared event's own (signaledValue), else one kept with the event (a plain MTLEvent has none it shows).
+static const void *const kEventValue = &kEventValue;
+static void eventSignal(id event, uint64_t value)
+{
+	if ([event respondsToSelector:@selector(setSignaledValue:)])
+		[event setSignaledValue:value];
+	else
+		objc_setAssociatedObject(event, kEventValue, @(value), OBJC_ASSOCIATION_RETAIN);
+}
+static void eventWait(id event, uint64_t value)
+{
+	enum { kTimeoutMs = 1000 };   // ponytail: a signal that never comes costs a second, not the queue (another process's, say)
+	BOOL reached;
+	if ([event respondsToSelector:@selector(waitUntilSignaledValue:timeoutMS:)])
+		reached = [event waitUntilSignaledValue:value timeoutMS:kTimeoutMs];
+	else {
+		uint64_t waited = 0;
+		while (!(reached = [objc_getAssociatedObject(event, kEventValue) unsignedLongLongValue] >= value) && waited < kTimeoutMs * 1000)
+			usleep(200), waited += 200;
+	}
+	if (!reached)
+		RTRACE(20, @"event %p: value %llu not reached within %d ms: the work after the wait goes on", event, value, kTimeoutMs);
+}
+
 @implementation RDNA4MTLCommandBuffer {
 	RDNA4MTLCommandQueue *_queue;
 	NSMutableArray<RDNA4Op> *_ops;
@@ -2868,6 +2893,8 @@ RDNA4_ANSWER_MISSING
 	NSMutableArray<MTLCommandBufferHandler> *_completed, *_scheduled;
 	NSMutableSet *_refreshed, *_refreshedLate, *_drawnShadows;
 	NSMutableArray<id<MTLDrawable>> *_drawables;   // presented once the work has run
+	NSMutableArray *_signals, *_waits;   // encodeSignalEvent: {event, value}: signalled once the work has run; encodeWaitForEvent: waited
+	                                     // for before it runs (its queue's gate)
 	dispatch_group_t _scheduledGroup, _done;
 	NSMutableDictionary *_userDictionary;
 	id<MTLBuffer> _chunk;   // set*Bytes data (stage:)
@@ -2893,6 +2920,8 @@ RDNA4_ANSWER_MISSING
 		_completed = [NSMutableArray array];
 		_scheduled = [NSMutableArray array];
 		_drawables = [NSMutableArray array];
+		_signals = [NSMutableArray array];
+		_waits = [NSMutableArray array];
 		_scheduledGroup = dispatch_group_create();
 		_createdUs = nowUs();
 		_done = dispatch_group_create();
@@ -2979,6 +3008,21 @@ RDNA4_ANSWER_MISSING
 	[_ops addObject:op];
 }
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block { [_completed addObject:block]; }
+// Events: what Core Animation synchronises WindowServer's frames with its clients' drawing by (IOSurfaceSharedEvent-backed MTLSharedEvents,
+// _MTLDevice's own). Answered as no-ops before, no client's signal ever came: WindowServer's "synchronize timed out" on our accelerator,
+// then Core Animation's transient surface assert (2026-11-20). A signal after all of the buffer's work (its shadows written back), a wait
+// before all of it, on the queue's gate (submit): on the device's one work queue it would hold up the signal another queue of the process
+// owes it.
+- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value
+{
+	if (event)
+		[_signals addObject:@[ event, @(value) ]];
+}
+- (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value
+{
+	if (event)
+		[_waits addObject:@[ event, @(value) ]];
+}
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block { [_scheduled addObject:block]; }
 // Metal runs a queue's command buffers in the order they were enqueued (commit enqueues if enqueue was not called): Core Animation enqueues
 // one, then another, and may commit the second first. Run in commit order, a frame's draws could land under the ones meant to be below them.
@@ -3046,7 +3090,8 @@ RDNA4_ANSWER_MISSING
 - (void)submit
 {
 	RDNA4MTLDevice *device = (RDNA4MTLDevice *)self.device;
-	dispatch_async(device.work, ^{
+	NSArray *waits = [_waits copy];   // (a command buffer is submitted once)
+	dispatch_block_t run = ^{
 		const uint64_t started = nowUs();
 		statAdd(kStatWaitUs, started - self->_committedUs);
 		dispatch_queue_t handlers = self->_queue.handlers;
@@ -3111,6 +3156,9 @@ RDNA4_ANSWER_MISSING
 		for (id<MTLDrawable> d in self->_drawables)
 			[d present];
 		[self->_drawables removeAllObjects];
+		for (NSArray *s in self->_signals)
+			eventSignal(s[0], [s[1] unsignedLongLongValue]);
+		[self->_signals removeAllObjects];
 		self->_status = self->_error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
 		statAdd(kStatBuffers, 1);
 		statReport();
@@ -3124,6 +3172,12 @@ RDNA4_ANSWER_MISSING
 			dispatch_group_leave(self->_done);
 		});
 		heldIdle(device);
+	};
+	// through the queue's gate, in order: the events it waits for first, there (its queue's later buffers wait behind it, others do not)
+	dispatch_async(_queue.gate, ^{
+		for (NSArray *w in waits)
+			eventWait(w[0], [w[1] unsignedLongLongValue]);
+		dispatch_async(device.work, run);
 	});
 }
 
@@ -3132,7 +3186,7 @@ RDNA4_ANSWER_MISSING
 
 @implementation RDNA4MTLCommandQueue {
 	RDNA4MTLDevice *_device;
-	dispatch_queue_t _own, _app;
+	dispatch_queue_t _own, _app, _gate;
 	NSMutableArray *_order;   // enqueued, not yet submitted, in enqueue order
 }
 
@@ -3165,11 +3219,13 @@ RDNA4_ANSWER_MISSING
 	if ((self = [super init])) {
 		_device = device;
 		_own = dispatch_queue_create("RDNA4MTL handlers", DISPATCH_QUEUE_SERIAL);
+		_gate = dispatch_queue_create("RDNA4MTL gate", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
 	}
 	return self;
 }
 
 - (dispatch_queue_t)handlers { return _app ?: _own; }
+- (dispatch_queue_t)gate { return _gate; }
 - (void)setCompletionQueue:(dispatch_queue_t)queue { _app = queue; }
 - (void)setSubmissionQueue:(dispatch_queue_t)queue { }
 - (void)setGPUPriority:(NSUInteger)priority { }
