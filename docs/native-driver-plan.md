@@ -76,7 +76,14 @@ is prelinked against the system collection's copies.
   `ioreg -c IOAccelerator` and `-c IOGraphicsAccelerator2` list `RDNA4Accelerator` beside AppleParavirtAccelerator; the desktop kept
   running, nobody asked it for a user client. (A boot with the UR22 plugged in never got a desktop: XH00 re-enumerated it in a loop and
   WindowServer waited in IOKitWaitQuiet: USB, not graphics.)
-- Next (milestone 2): the family's own `start` (from `RDNA4Accelerator::start`), with what it calls implemented: configureDevice (312),
+- **The family's own `start` runs on the card (2026-11-20, kext c8e05023):** `debug.rdna4_accel=2` after `=1`: `IOGraphicsAccelerator2::start`
+  succeeds with our event machine (an `IOAccelEventMachineFast2` subclass; the family's init), display machine (`IOAccelDisplayMachine`
+  subclass, kept, not started), kernel task (`IOAccelTask` subclass, `init(this, 0, nullptr)`), `configureDevice` true and the family's
+  default config; it sets IOAccelRevision 2, AccelCaps, PerformanceStatistics, IOCFPlugInTypes; it does not register the service
+  (AMD's driver does that after it). System stable. On the way: in `-fapple-kext` code `Base::f()` is a call through the base's vtable
+  symbol, so every family class's vtable must be emitted in our kext (key function `getMetaClass`, `RDNA4_ACCEL_BASE`): undefined, it
+  was bound to junk and panicked; the build now fails on any undefined IOAcceleratorFamily2 symbol.
+- Was planned as milestone 2: the family's own `start` (from `RDNA4Accelerator::start`), with what it calls implemented: configureDevice (312),
   populateAccelConfig (310), createEventMachine/newEventMachine (272/273), newDisplayMachine (320), createKernelGPUTask (314),
   calcMaxGPUPhysicalMemoryBytes (311), newStatistics (336) and the memory/command-descriptor factories. Each object it asks for is a
   family class to derive the same way (IOAccelEventMachine2, IOAccelDisplayMachine2, IOAccelTask, ...): `tools/gen/accelgen.py`'s

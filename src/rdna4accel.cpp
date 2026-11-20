@@ -1,5 +1,5 @@
 //
-//  rdna4accel.cpp — our own IOGraphicsAccelerator2 (docs/native-driver-plan.md, option D), milestone 1: a skeleton.
+//  rdna4accel.cpp — our own IOGraphicsAccelerator2 (docs/native-driver-plan.md, option D), milestone 2: the family's own start.
 //
 //  Our kext is in the boot kernel collection; IOAcceleratorFamily2 is in the system one, which a boot-collection kext cannot link
 //  to. So the base class is declared from the KDK (src/ioaccel.hpp, tools/gen/accelgen.py) and every base function our class reaches
@@ -9,8 +9,9 @@
 //  - the running class has the KDK's size;
 //  - our metaclass's superclass link and size are where OSMetaClass keeps them (+16, +32), then the link is set to the real class.
 //
-//  debug.rdna4_accel=1 makes one and attaches it to the GPU (RDNA4AccelCensus::gpu); 2 starts and publishes it. Milestone 1: IOService::start only (not the family's
-//  start), no user clients; the 17 functions every accelerator must have return nothing.
+//  debug.rdna4_accel=1 makes one and attaches it to the GPU (RDNA4AccelCensus::gpu); 2 starts it: the family's start, which asks for
+//  an event machine, a display machine and a kernel task (our subclasses of the family's, stubs), no user clients yet. Milestone 1
+//  (IOService::start only) passed on the card on 2026-11-20.
 //
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_patcher.hpp>
@@ -50,6 +51,64 @@ KernelPatcher::KextInfo kextAccel {
 };
 }   // namespace
 
+// OSDefineMetaClassAndStructors(cls, base) written out, without the class's superClass pointer: OpenCore's linker patches every class
+// that has one against its superclass's vtable, which must be one it linked itself; IOAcceleratorFamily2's are not (not in the boot
+// collection), so it refused the whole kext (the rig booted without it, 2026-11-20). The MetaClass gets the placeholder as its
+// superclass here and the real one in familyLoaded (kDerived).
+#define RDNA4_ACCEL_STRUCTORS(cls, base)                                                                                                  \
+	cls::MetaClass cls::gMetaClass;                                                                                                      \
+	const OSMetaClass *const cls::metaClass = &cls::gMetaClass;                                                                          \
+	cls::cls(const OSMetaClass *meta) : base(meta) {}                                                                                    \
+	cls::~cls() {}                                                                                                                       \
+	const OSMetaClass *cls::getMetaClass() const { return &gMetaClass; }                                                                 \
+	cls::MetaClass::MetaClass() : OSMetaClass(#cls, &base::gMetaClass, sizeof(cls)) {}                                                   \
+	OSObject *cls::MetaClass::alloc() const { return new cls; }                                                                          \
+	cls::cls() : base(&gMetaClass) { gMetaClass.instanceConstructed(); }
+
+// The family classes' key functions (src/ioaccel.hpp): their vtables are emitted here, for Base::f() calls. No base object is made here.
+#define RDNA4_ACCEL_BASE(cls) \
+	const OSMetaClass *cls::getMetaClass() const { return nullptr; }
+RDNA4_ACCEL_BASE(IOGraphicsAccelerator2)
+RDNA4_ACCEL_BASE(IOAccelTask)
+RDNA4_ACCEL_BASE(IOAccelMemoryMap)
+RDNA4_ACCEL_BASE(IOAccelEventMachine2)
+RDNA4_ACCEL_BASE(IOAccelEventMachineFast2)
+RDNA4_ACCEL_BASE(IOAccelDisplayMachine)
+
+// The family objects the family's start asks for. The event machine's four (its stamps and barriers in command buffers) and the
+// memory map's three (the GPU page table) are for submissions through the family, which nothing makes yet: they do nothing.
+class RDNA4EventMachine : public IOAccelEventMachineFast2 {
+	OSDeclareDefaultStructors(RDNA4EventMachine)
+public:
+	uintptr_t writeStamp(int, vendevtCommandRec *, unsigned int) APPLE_KEXT_OVERRIDE { return 0; }
+	uintptr_t prepareBarrier(vendevtBarrierRec *) APPLE_KEXT_OVERRIDE { return 0; }
+	uintptr_t completeBarrier(vendevtBarrierRec *) APPLE_KEXT_OVERRIDE { return 0; }
+	uintptr_t writeBarrierElement(vendevtBarrierRec *, int, unsigned int) APPLE_KEXT_OVERRIDE { return 0; }
+};
+RDNA4_ACCEL_STRUCTORS(RDNA4EventMachine, IOAccelEventMachineFast2)
+
+class RDNA4DisplayMachine : public IOAccelDisplayMachine {
+	OSDeclareDefaultStructors(RDNA4DisplayMachine)
+public:
+	uintptr_t displayModeWillChange() APPLE_KEXT_OVERRIDE { return 0; }
+	uintptr_t displayModeDidChange() APPLE_KEXT_OVERRIDE { return 0; }
+};
+RDNA4_ACCEL_STRUCTORS(RDNA4DisplayMachine, IOAccelDisplayMachine)
+
+class RDNA4Task : public IOAccelTask {
+	OSDeclareDefaultStructors(RDNA4Task)
+};
+RDNA4_ACCEL_STRUCTORS(RDNA4Task, IOAccelTask)
+
+class RDNA4MemoryMap : public IOAccelMemoryMap {
+	OSDeclareDefaultStructors(RDNA4MemoryMap)
+public:
+	uintptr_t commitIntoGPUPageTable() APPLE_KEXT_OVERRIDE { return 0; }
+	uintptr_t releaseFromGPUPageTable() APPLE_KEXT_OVERRIDE { return 0; }
+	uintptr_t updateGPUPageTable() APPLE_KEXT_OVERRIDE { return 0; }
+};
+RDNA4_ACCEL_STRUCTORS(RDNA4MemoryMap, IOAccelMemoryMap)
+
 class RDNA4Accelerator : public IOGraphicsAccelerator2 {
 	OSDeclareDefaultStructors(RDNA4Accelerator)
 	using super = IOGraphicsAccelerator2;
@@ -59,15 +118,17 @@ public:
 	void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
 	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 
-	// what every accelerator must have (IOGraphicsAccelerator2's pure virtuals): nothing yet
+	// what every accelerator must have (IOGraphicsAccelerator2's pure virtuals). The family's start needs the device configured (the
+	// kext's own: nothing to do), the config (the family's defaults), an event machine (its init by the family), a display machine
+	// (kept: nothing starts it yet) and a kernel task (no GPU address ranges yet); the rest is for user clients, refused.
 	void *getStampMemory(unsigned int *) APPLE_KEXT_OVERRIDE { return nullptr; }
-	IOAccelEventMachine2 *newEventMachine() APPLE_KEXT_OVERRIDE { return nullptr; }
+	IOAccelEventMachine2 *newEventMachine() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4EventMachine); }
 	IOAccelTask *createUserGPUTask() APPLE_KEXT_OVERRIDE { return nullptr; }
 	void populateAccelConfig(IOAccelConfig *) APPLE_KEXT_OVERRIDE {}
-	bool configureDevice(IOPCIDevice *) APPLE_KEXT_OVERRIDE { return false; }
+	bool configureDevice(IOPCIDevice *) APPLE_KEXT_OVERRIDE { return true; }
 	void teardownDevice(IOPCIDevice *) APPLE_KEXT_OVERRIDE {}
-	IOAccelTask *createKernelGPUTask() APPLE_KEXT_OVERRIDE { return nullptr; }
-	IOAccelDisplayMachine2 *newDisplayMachine() APPLE_KEXT_OVERRIDE { return nullptr; }
+	IOAccelTask *createKernelGPUTask() APPLE_KEXT_OVERRIDE;
+	IOAccelDisplayMachine *newDisplayMachine() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4DisplayMachine); }
 	IOAccelContext2 *newGLContext() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelContext2 *newCLContext() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelSurface *newSurface() APPLE_KEXT_OVERRIDE { return nullptr; }
@@ -76,36 +137,36 @@ public:
 	IOAccelSysMemory *newSysMemory() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelVidMemory *newVidMemory() APPLE_KEXT_OVERRIDE { return nullptr; }
 	IOAccelResource2 *newResource() APPLE_KEXT_OVERRIDE { return nullptr; }
-	IOAccelMemoryMap *newMemoryMap() APPLE_KEXT_OVERRIDE { return nullptr; }
+	IOAccelMemoryMap *newMemoryMap() APPLE_KEXT_OVERRIDE { return OSTypeAlloc(RDNA4MemoryMap); }
 };
 
-// OSDefineMetaClassAndStructors(RDNA4Accelerator, IOGraphicsAccelerator2) written out, without the class's superClass pointer: OpenCore's
-// linker patches every class that has one against its superclass's vtable, which must be one it linked itself; IOAcceleratorFamily2's
-// is not (not in the boot collection), so it refused the whole kext (the rig booted without it, 2026-11-20). The MetaClass gets the
-// placeholder as its superclass here and the real one in familyLoaded.
-RDNA4Accelerator::MetaClass RDNA4Accelerator::gMetaClass;
-const OSMetaClass *const RDNA4Accelerator::metaClass = &RDNA4Accelerator::gMetaClass;
-RDNA4Accelerator::RDNA4Accelerator(const OSMetaClass *meta) : IOGraphicsAccelerator2(meta) {}
-RDNA4Accelerator::~RDNA4Accelerator() {}
-const OSMetaClass *RDNA4Accelerator::getMetaClass() const { return &gMetaClass; }
-RDNA4Accelerator::MetaClass::MetaClass() : OSMetaClass("RDNA4Accelerator", &IOGraphicsAccelerator2::gMetaClass, sizeof(RDNA4Accelerator)) {}
-OSObject *RDNA4Accelerator::MetaClass::alloc() const { return new RDNA4Accelerator; }
-RDNA4Accelerator::RDNA4Accelerator() : IOGraphicsAccelerator2(&gMetaClass) { gMetaClass.instanceConstructed(); }
+RDNA4_ACCEL_STRUCTORS(RDNA4Accelerator, IOGraphicsAccelerator2)
+
+// As AMD's: a task of its own with the accelerator's (the family's init: no GPU address ranges, count 0); the event machine is made by
+// then (IOAccelTask::init registers with it).
+IOAccelTask *RDNA4Accelerator::createKernelGPUTask()
+{
+	RDNA4Task *t = OSTypeAlloc(RDNA4Task);
+	if (t && !t->init(this, 0, nullptr))
+		OSSafeReleaseNULL(t);
+	rdna4Log("AMDRadeonRDNA4: accel: kernel task %s\n", t ? "made" : "NOT made");
+	return t;
+}
 
 bool RDNA4Accelerator::start(IOService *provider)
 {
-	if (!IOService::start(provider))   // milestone 1: not the family's start (it sets the GPU up through the functions above)
-		return false;
-	setProperty("RDNA4Accelerator", "skeleton (milestone 1)");
-	registerService();
-	rdna4Log("AMDRadeonRDNA4: accel: RDNA4Accelerator published (class %s, a kind of IOGraphicsAccelerator2: %s)\n",
-	         getMetaClass()->getClassName(), metaCast("IOGraphicsAccelerator2") ? "yes" : "NO");
-	return true;
+	rdna4Log("AMDRadeonRDNA4: accel: the family's start\n");
+	const bool ok = super::start(provider);
+	rdna4Log("AMDRadeonRDNA4: accel: the family's start %s (class %s, registered %s)\n", ok ? "succeeded" : "FAILED", getMetaClass()->getClassName(),
+	         isInactive() ? "-" : getProperty("IOAccelRevision") ? "with its properties" : "without its properties");
+	if (ok)
+		setProperty("RDNA4Accelerator", "milestone 2: the family's start");
+	return ok;
 }
 
 void RDNA4Accelerator::stop(IOService *provider)
 {
-	IOService::stop(provider);
+	super::stop(provider);
 }
 
 IOReturn RDNA4Accelerator::newUserClient(task_t, void *, UInt32 type, IOUserClient **)
@@ -115,7 +176,26 @@ IOReturn RDNA4Accelerator::newUserClient(task_t, void *, UInt32 type, IOUserClie
 }
 
 namespace {
-// The thunks filled from the loaded family, checked; our metaclass given the real superclass.
+// Our classes: their metaclass, the base's real metaclass (the symbol) and our placeholder for it, our size, the base's KDK size
+struct Derived {
+	const OSMetaClass *ours;
+	const char *baseMeta;
+	const OSMetaClass *placeholder;
+	uint32_t ourSize;
+	uint32_t baseSize;
+};
+#define RDNA4_DERIVED(cls, base, n) \
+	{ &cls::gMetaClass, "__ZN" #n #base "10gMetaClassE", &base::gMetaClass, sizeof(cls), k##base##Size }
+const Derived kDerived[] = {
+	RDNA4_DERIVED(RDNA4Accelerator, IOGraphicsAccelerator2, 22),
+	RDNA4_DERIVED(RDNA4EventMachine, IOAccelEventMachineFast2, 24),
+	RDNA4_DERIVED(RDNA4DisplayMachine, IOAccelDisplayMachine, 21),
+	RDNA4_DERIVED(RDNA4Task, IOAccelTask, 11),
+	RDNA4_DERIVED(RDNA4MemoryMap, IOAccelMemoryMap, 16),
+};
+constexpr size_t kDerivedCount = sizeof(kDerived) / sizeof(kDerived[0]);
+
+// The thunks filled from the loaded family, checked; our metaclasses given the real superclasses.
 void familyLoaded(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size)
 {
 	uint32_t missing = 0, wrongSlots = 0;
@@ -134,20 +214,30 @@ void familyLoaded(KernelPatcher &patcher, size_t index, mach_vm_address_t addres
 		if (inSlot != rdna4AccelThunks[s.thunk] && wrongSlots++ < 4)
 			rdna4Log("AMDRadeonRDNA4: accel: slot %u of %s does not hold %s\n", s.slot, s.vtable, kSymbols[s.thunk]);
 	}
-	auto *real = reinterpret_cast<const OSMetaClass *>(patcher.solveSymbol(index, "__ZN22IOGraphicsAccelerator210gMetaClassE", address, size));
-	patcher.clearError();
-	auto *ours = reinterpret_cast<uint8_t *>(&RDNA4Accelerator::gMetaClass);
-	auto **link = reinterpret_cast<const OSMetaClass **>(ours + 16);
-	const uint32_t ourSize = *reinterpret_cast<const uint32_t *>(ours + 32);
-	const bool layout = *link == &IOGraphicsAccelerator2::gMetaClass && ourSize == sizeof(RDNA4Accelerator);
-	// (the class's size is checked when one is made: here the family's static constructors have not run yet, its metaclass reads 0)
-	if (!missing && !wrongSlots && layout && real) {
-		*link = real;
+	// each of our classes: its metaclass's superclass link and size where OSMetaClass keeps them, then the real base's metaclass
+	// (the base's size is checked when one is made: here the family's static constructors have not run yet, its metaclass reads 0)
+	uint32_t bad = 0;
+	const OSMetaClass *real[kDerivedCount] = {};
+	for (size_t i = 0; i < kDerivedCount; i++) {
+		const Derived &d = kDerived[i];
+		real[i] = reinterpret_cast<const OSMetaClass *>(patcher.solveSymbol(index, d.baseMeta, address, size));
+		patcher.clearError();
+		auto *ours = reinterpret_cast<const uint8_t *>(d.ours);
+		const bool layout = *reinterpret_cast<const OSMetaClass *const *>(ours + 16) == d.placeholder &&
+		                    *reinterpret_cast<const uint32_t *>(ours + 32) == d.ourSize;
+		if (!layout || !real[i]) {
+			bad++;
+			rdna4Log("AMDRadeonRDNA4: accel: %s: %s\n", d.baseMeta, real[i] ? "our metaclass NOT as expected" : "NOT found");
+		}
+	}
+	if (!missing && !wrongSlots && !bad) {
+		for (size_t i = 0; i < kDerivedCount; i++)
+			*reinterpret_cast<const OSMetaClass **>(reinterpret_cast<uint8_t *>(const_cast<OSMetaClass *>(kDerived[i].ours)) + 16) = real[i];
 		gReady = true;
 	}
-	rdna4Log("AMDRadeonRDNA4: accel: IOAcceleratorFamily2: %zu thunks, %u not found, %u slots not the KDK's; the class %s, "
-	         "our metaclass %s: %s\n", kThunks, missing, wrongSlots, real ? "found" : "NOT found", layout ? "as expected" : "NOT as expected",
-	         gReady ? "ready (debug.rdna4_accel=1 makes one, 2 publishes it)" : "NOT usable");
+	rdna4Log("AMDRadeonRDNA4: accel: IOAcceleratorFamily2: %zu thunks, %u not found, %u slots not the KDK's, %u of %zu classes not as "
+	         "expected: %s\n", kThunks, missing, wrongSlots, bad, kDerivedCount,
+	         gReady ? "ready (debug.rdna4_accel=1 makes one, 2 starts it)" : "NOT usable");
 }
 
 RDNA4Accelerator *gAccel;   // made and attached (debug.rdna4_accel=1)
@@ -168,11 +258,13 @@ int accelSysctl SYSCTL_HANDLER_ARGS
 	if (!gReady || !gpu)
 		return ENODEV;
 	if (!gAccel) {
-		const OSMetaClass *base = RDNA4Accelerator::gMetaClass.getSuperClass();
-		if (base->getClassSize() != kIOGraphicsAccelerator2Size) {
-			rdna4Log("AMDRadeonRDNA4: accel: IOGraphicsAccelerator2 is 0x%x bytes here, the KDK's 0x%zx: not made\n", base->getClassSize(),
-			         static_cast<size_t>(kIOGraphicsAccelerator2Size));
-			return ENODEV;
+		for (const Derived &d : kDerived) {
+			const OSMetaClass *base = d.ours->getSuperClass();
+			if (base->getClassSize() != d.baseSize) {
+				rdna4Log("AMDRadeonRDNA4: accel: %s is 0x%x bytes here, the KDK's 0x%x: not made\n", base->getClassName(), base->getClassSize(),
+				         d.baseSize);
+				return ENODEV;
+			}
 		}
 		rdna4Log("AMDRadeonRDNA4: accel: making one (the family's constructor)\n");
 		auto *a = OSTypeAlloc(RDNA4Accelerator);

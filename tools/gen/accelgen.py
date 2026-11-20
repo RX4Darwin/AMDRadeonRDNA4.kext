@@ -17,46 +17,65 @@ import argparse, glob, os, re, struct, subprocess, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 IOSERVICE_SLOTS = 266   # IOService's vtable slots (OSObject's first): the first a direct subclass of IOService adds (checked with the SDK)
 
-# IOService virtuals a class overrides, as IOService.h declares them (the mangled names come from the KDK)
+# SDK classes' virtuals a family class overrides, as the SDK's headers declare them, by "name(demangled parameters)"; the mangled names
+# come from the KDK. The destructor is declared separately.
 OVERRIDES = {
-    'D1Ev': None, 'D0Ev': None,   # the destructor (declared below)
-    'getMetaClass': 'virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;',
-    'free': 'virtual void free() APPLE_KEXT_OVERRIDE;',
-    'setProperties': 'virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;',
-    'requestTerminate': 'virtual bool requestTerminate(IOService *provider, IOOptionBits options) APPLE_KEXT_OVERRIDE;',
-    'didTerminate': 'virtual bool didTerminate(IOService *provider, IOOptionBits options, bool *defer) APPLE_KEXT_OVERRIDE;',
-    'configureReport': 'virtual IOReturn configureReport(IOReportChannelList *channels, IOReportConfigureAction action, void *result, '
-                       'void *destination) APPLE_KEXT_OVERRIDE;',
-    'updateReport': 'virtual IOReturn updateReport(IOReportChannelList *channels, IOReportUpdateAction action, void *result, '
-                    'void *destination) APPLE_KEXT_OVERRIDE;',
-    'start': 'virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;',
-    'stop': 'virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;',
-    'terminate': 'virtual bool terminate(IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;',
-    'finalize': 'virtual bool finalize(IOOptionBits options) APPLE_KEXT_OVERRIDE;',
-    'getWorkLoop': 'virtual IOWorkLoop *getWorkLoop() const APPLE_KEXT_OVERRIDE;',
-    'requestProbe': 'virtual IOReturn requestProbe(IOOptionBits options) APPLE_KEXT_OVERRIDE;',
-    'message': 'virtual IOReturn message(UInt32 type, IOService *provider, void *argument = 0) APPLE_KEXT_OVERRIDE;',
-    'newUserClient': 'virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) '
-                     'APPLE_KEXT_OVERRIDE;',
+    'getMetaClass() const': 'virtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;',
+    'free()': 'virtual void free() APPLE_KEXT_OVERRIDE;',
+    'release() const': 'virtual void release() const APPLE_KEXT_OVERRIDE;',
+    'setProperties(OSObject*)': 'virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;',
+    'requestTerminate(IOService*, unsigned int)': 'virtual bool requestTerminate(IOService *provider, IOOptionBits options) APPLE_KEXT_OVERRIDE;',
+    'didTerminate(IOService*, unsigned int, bool*)': 'virtual bool didTerminate(IOService *provider, IOOptionBits options, bool *defer) '
+                                                     'APPLE_KEXT_OVERRIDE;',
+    'configureReport(IOReportChannelList*, unsigned int, void*, void*)':
+        'virtual IOReturn configureReport(IOReportChannelList *channels, IOReportConfigureAction action, void *result, void *destination) '
+        'APPLE_KEXT_OVERRIDE;',
+    'updateReport(IOReportChannelList*, unsigned int, void*, void*)':
+        'virtual IOReturn updateReport(IOReportChannelList *channels, IOReportUpdateAction action, void *result, void *destination) '
+        'APPLE_KEXT_OVERRIDE;',
+    'start(IOService*)': 'virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;',
+    'stop(IOService*)': 'virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;',
+    'terminate(unsigned int)': 'virtual bool terminate(IOOptionBits options = 0) APPLE_KEXT_OVERRIDE;',
+    'finalize(unsigned int)': 'virtual bool finalize(IOOptionBits options) APPLE_KEXT_OVERRIDE;',
+    'getWorkLoop() const': 'virtual IOWorkLoop *getWorkLoop() const APPLE_KEXT_OVERRIDE;',
+    'requestProbe(unsigned int)': 'virtual IOReturn requestProbe(IOOptionBits options) APPLE_KEXT_OVERRIDE;',
+    'message(unsigned int, IOService*, void*)': 'virtual IOReturn message(UInt32 type, IOService *provider, void *argument = 0) '
+                                                'APPLE_KEXT_OVERRIDE;',
+    'newUserClient(task*, void*, unsigned int, IOUserClient**)':
+        'virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;',
 }
+SDK_SLOTS = {'OSObject': 35, 'IOService': 266}   # the SDK's vtable sizes (checked: the same as Tahoe 26.6.2's)
 
-# Return types of the base's own virtuals where they matter to us (we override or call them); the rest are declared uintptr_t (only
-# their slots and mangled names matter)
+# Return types of the family's own virtuals where they matter to us (we override or call them); the rest are declared uintptr_t (only
+# their slots and mangled names matter). One type per name, so that a base's declaration and a subclass's override agree.
 RETURNS = {
     'getStampMemory': 'void *', 'newEventMachine': 'IOAccelEventMachine2 *', 'createUserGPUTask': 'IOAccelTask *',
     'populateAccelConfig': 'void', 'configureDevice': 'bool', 'teardownDevice': 'void', 'createKernelGPUTask': 'IOAccelTask *',
-    'newDisplayMachine': 'IOAccelDisplayMachine2 *', 'newGLContext': 'IOAccelContext2 *', 'newCLContext': 'IOAccelContext2 *',
+    'newDisplayMachine': 'IOAccelDisplayMachine *', 'newGLContext': 'IOAccelContext2 *', 'newCLContext': 'IOAccelContext2 *',
     'newSurface': 'IOAccelSurface *', 'new2DContext': 'IOAccelContext2 *', 'newVideoContext': 'IOAccelContext2 *',
     'newSysMemory': 'IOAccelSysMemory *', 'newVidMemory': 'IOAccelVidMemory *', 'newResource': 'IOAccelResource2 *',
-    'newMemoryMap': 'IOAccelMemoryMap *',
+    'newMemoryMap': 'IOAccelMemoryMap *', 'init': 'bool',
 }
 
-# Classes the KDK names whose ancestors are other KDK names (a full class list would also come from the metaclass constructors)
+# The family classes we derive from (each after its base): (class, its base, a subclass in the KDK that implements its pure virtuals:
+# binary, vtable symbol; None if it has none)
+FAMILY = 'IOAcceleratorFamily2'
+AMD = 'AMDRadeonX6000'
 CLASSES = [
-    # (class, binary in the KDK, its base, a subclass that implements every pure virtual: binary, vtable symbol)
-    ('IOGraphicsAccelerator2', 'IOAcceleratorFamily2', 'IOService',
-     ('AMDRadeonX6000', '__ZTV43AMDRadeonX6000_AMDNavi21GraphicsAccelerator')),
+    ('IOGraphicsAccelerator2', 'IOService', (AMD, '__ZTV43AMDRadeonX6000_AMDNavi21GraphicsAccelerator')),
+    ('IOAccelTask', 'OSObject', None),
+    ('IOAccelMemoryMap', 'OSObject', (AMD, '__ZTV32AMDRadeonX6000_AMDAccelMemoryMap')),
+    ('IOAccelEventMachine2', 'OSObject', (AMD, '__ZTV35AMDRadeonX6000_AMDAccelEventMachine')),
+    ('IOAccelEventMachineFast2', 'IOAccelEventMachine2', (AMD, '__ZTV35AMDRadeonX6000_AMDAccelEventMachine')),
+    ('IOAccelDisplayMachine', 'IOService', (AMD, '__ZTV37AMDRadeonX6000_AMDAccelDisplayMachine')),
 ]
+
+
+KNOWN_TYPES = {'UInt32', 'UInt64', 'IOOptionBits', 'IOReturn', 'OSObject', 'IOService', 'OSDictionary', 'OSArray', 'OSString', 'OSData',
+               'OSNumber', 'OSSymbol', 'IOMemoryDescriptor', 'IOBufferMemoryDescriptor', 'IOWorkLoop', 'IOPCIDevice', 'IOUserClient',
+               'IOFramebuffer', 'IOReportChannelList', 'IORangeAllocator', 'IOInterruptEventSource', 'IOTimerEventSource', 'IOCommandGate',
+               'IOEventSource', 'IOLock', 'IORecursiveLock', 'IOSimpleLock', 'OSSet', 'OSCollection', 'OSIterator', 'OSBoolean',
+               'IOMemoryMap', 'IODMACommand', 'IOGeneralMemoryDescriptor', 'IOSubMemoryDescriptor', 'IOMultiMemoryDescriptor'}
 
 
 def run(*args):
@@ -136,64 +155,84 @@ def main():
         sys.exit('accelgen: no KDK (/Library/Developer/KDKs)')
     ext = os.path.join(a.kdk, 'System/Library/Extensions')
     decls, thunks, forward, slotted = [], [], set(), []   # slotted: (thunk index, vtable symbol, slot) to check at run time
+    bins, sdk_root, nslots = {}, {}, dict(SDK_SLOTS)
 
-    for cls, binname, base, (implbin, implvt) in CLASSES:
-        b = Binary(os.path.join(ext, binname + '.kext/Contents/MacOS', binname))
-        impl = Binary(os.path.join(ext, implbin + '.kext/Contents/MacOS', implbin))
+    def binary(name):
+        if name not in bins:
+            bins[name] = Binary(os.path.join(ext, name + '.kext/Contents/MacOS', name))
+        return bins[name]
+
+    def note_types(text):   # the classes and structs it names (pointers and references to them)
+        for t in re.findall(r'\b([A-Za-z_]\w*)(?: const)?\s*[*&]', text):
+            if t not in KNOWN_TYPES and t not in ('char', 'int', 'void', 'long', 'short', 'bool', 'float', 'double', 'unsigned', 'signed',
+                                                  'task', 'volatile', 'const'):
+                forward.add(t)
+
+    for cls, base, impl in CLASSES:
+        b = binary(FAMILY)
         n = len(cls)
-        slots = b.vtable('__ZTV%d%s' % (n, cls))
-        implslots = impl.vtable(implvt)
+        vt = '__ZTV%d%s' % (n, cls)
+        slots = b.vtable(vt)
+        implslots = binary(impl[0]).vtable(impl[1]) if impl else []
         size = b.class_size(cls)
+        sdk = base if base in SDK_SLOTS else sdk_root[base]
+        sdk_root[cls] = sdk
+        first = nslots[base]   # this class's first own slot
+        nslots[cls] = len(slots)
         prefix = ('__ZN%d%s' % (n, cls), '__ZNK%d%s' % (n, cls))
-        own = []
-        body = []
+        entries = []   # (slot, symbol to name it by, pure, overriding)
         for i, sym in enumerate(slots):
-            mine = sym.startswith(prefix)
-            if i < IOSERVICE_SLOTS:
-                if not mine:
-                    continue
-                key = sym[len(prefix[0] if sym.startswith(prefix[0]) else prefix[1]):]
-                name = 'D1Ev' if key == 'D1Ev' else 'D0Ev' if key == 'D0Ev' else re.sub(r'^\d+', '', re.match(r'\d+(\w+?)E', key).group(0))[:-1]
-                if name not in OVERRIDES:
-                    sys.exit('accelgen: %s overrides %s (slot %d): not in OVERRIDES' % (cls, sym, i))
-                if OVERRIDES[name]:
-                    body.append('\t' + OVERRIDES[name])
-                if name not in ('D1Ev', 'D0Ev'):
-                    slotted.append((len(thunks), '__ZTV%d%s' % (n, cls), i))
-                    thunks.append(sym)
+            if i < first and not sym.startswith(prefix):
+                continue   # inherited unchanged
+            if sym.startswith(prefix) and (sym.endswith('D1Ev') or sym.endswith('D0Ev')):
+                thunks.append(sym)   # the destructor (declared below): the base's vtable, emitted in our kext, holds them
                 continue
+            if sym == '__ZNK%d%s12getMetaClassEv' % (n, cls):
+                continue   # declared first, defined in our kext: the key function (below)
             pure = sym == '___cxa_pure_virtual'
-            src = implslots[i] if pure else sym
-            own.append((i, src, pure))
-        dem = demangle([s for _, s, _ in own])
-        body.append('')
-        body.append('\t// its own virtuals, slots %d-%d (the KDK\'s order); pure ones named after %s\'s' % (IOSERVICE_SLOTS, len(slots) - 1, implvt))
-        for (i, sym, pure), d in zip(own, dem):
+            if pure and not (impl and i < len(implslots)):
+                sys.exit('accelgen: %s slot %d is pure and no subclass names it' % (cls, i))
+            entries.append((i, implslots[i] if pure else sym, pure, i < first))
+        body = ['\t// slots %d-%d its own (the KDK\'s order), the rest overrides; pure ones named after %s\'s'
+                % (first, len(slots) - 1, impl[1] if impl else '-')]
+        for (i, sym, pure, over), d in zip(entries, demangle([e[1] for e in entries])):
             name, params, const = params_of(d)
             if not name:
                 sys.exit('accelgen: cannot read %s (slot %d)' % (d, i))
-            for t in re.findall(r'\b([A-Z]\w+)\b', params):
-                if t not in ('UInt32', 'UInt64', 'IOOptionBits', 'IOReturn', 'OSObject', 'IOService', 'OSDictionary', 'OSArray', 'OSString',
-                             'OSData', 'OSNumber', 'OSSymbol', 'IOMemoryDescriptor', 'IOBufferMemoryDescriptor', 'IOWorkLoop', 'IOPCIDevice',
-                             'IOUserClient', 'IOFramebuffer', 'IOReportChannelList'):
-                    forward.add(t)
-            params = params.replace('task*', 'task_t')
-            ret = RETURNS.get(name, 'uintptr_t')
-            for t in re.findall(r'\b([A-Z]\w+)\b', ret):
-                forward.add(t)
-            body.append('\tvirtual %s %s(%s)%s%s; // %d' % (ret, name, params, ' const' if const else '', ' = 0' if pure else '', i))
+            key = '%s(%s)%s' % (name, params, ' const' if const else '')
+            if over and i < SDK_SLOTS[sdk]:   # an SDK class's virtual: its own declaration
+                if key not in OVERRIDES:
+                    sys.exit('accelgen: %s overrides %s (slot %d): not in OVERRIDES' % (cls, key, i))
+                body.append('\t' + OVERRIDES[key] + ' // %d' % i)
+            else:
+                note_types(params)
+                ret = RETURNS.get(name, 'uintptr_t')
+                note_types(ret)
+                body.append('\tvirtual %s %s(%s)%s%s%s; // %d' % (ret, name, params.replace('task*', 'task_t'), ' const' if const else '',
+                                                               ' APPLE_KEXT_OVERRIDE' if over else '', ' = 0' if pure else '', i))
             if not pure:
-                slotted.append((len(thunks), '__ZTV%d%s' % (n, cls), i))
+                slotted.append((len(thunks), vt, i))
                 thunks.append(sym)
-        thunks += ['__ZN%d%sC2EPK11OSMetaClass' % (n, cls), '__ZN%d%sD2Ev' % (n, cls)]
+        for extra in ('__ZN%d%sC2EPK11OSMetaClass' % (n, cls), '__ZN%d%sD2Ev' % (n, cls)):
+            if extra not in b.byname:
+                sys.exit('accelgen: %s has no %s' % (cls, extra))
+            thunks.append(extra)
         decls.append((cls, base, size, body, '__ZN%d%s10gMetaClassE' % (n, cls)))
+        forward.discard(cls)
 
+    forward -= {c for c, _, _ in CLASSES}
     hpp = ['// Generated by tools/gen/accelgen.py from %s: do not edit.' % os.path.basename(a.kdk),
            '// IOAcceleratorFamily2\'s classes as our kext derives from them (src/rdna4accel.cpp fills the thunks).',
-           '#pragma once', '#include <IOKit/IOService.h>', '#include <IOKit/IOUserClient.h>', '', 'class IOPCIDevice;', 'class IOFramebuffer;']
+           '#pragma once', '#include <IOKit/IOService.h>', '#include <IOKit/IOUserClient.h>', '#include <IOKit/IORangeAllocator.h>', '',
+           'class IOPCIDevice;', 'class IOFramebuffer;']
+    hpp += ['class %s;' % c for c, _, _ in CLASSES]
     hpp += ['class %s;' % t for t in sorted(forward)]
     for cls, base, size, body, gmeta in decls:
+        # getMetaClass first and defined in our kext (rdna4accel.cpp RDNA4_ACCEL_BASE): the key function, so that the compiler emits the
+        # class's vtable in our kext. A subclass's Base::f() calls go through it (-fapple-kext: the base's vtable symbol, never a direct
+        # call); undefined, it was bound to junk and the family's start panicked (2026-11-20).
         hpp += ['', 'class %s : public %s {' % (cls, base), 'public:',
+                '\tvirtual const OSMetaClass *getMetaClass() const APPLE_KEXT_OVERRIDE;   // the key function (see accelgen.py)',
                 '\tclass MetaClass : public OSMetaClass { public: OSObject *alloc() const APPLE_KEXT_OVERRIDE; };',
                 '\tstatic MetaClass gMetaClass;   // a placeholder in our kext (ioaccel_thunks.S): our subclasses\' superclass link is patched',
                 'protected:', '\t%s(const OSMetaClass *meta);' % cls, '\tvirtual ~%s() APPLE_KEXT_OVERRIDE;' % cls, 'public:']

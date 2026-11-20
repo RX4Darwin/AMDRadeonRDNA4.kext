@@ -2,341 +2,889 @@
 // Each base function our classes reach: a jump through _rdna4AccelThunks (filled by src/rdna4accel.cpp), else to rdna4AccelMissing.
 	.text
 	.p2align 4
-	.private_extern __ZNK22IOGraphicsAccelerator212getMetaClassEv
-__ZNK22IOGraphicsAccelerator212getMetaClassEv:
+	.private_extern __ZN22IOGraphicsAccelerator2D1Ev
+__ZN22IOGraphicsAccelerator2D1Ev:
 	jmpq *_rdna4AccelThunks+0(%rip)
+	.p2align 4
+	.private_extern __ZN22IOGraphicsAccelerator2D0Ev
+__ZN22IOGraphicsAccelerator2D0Ev:
+	jmpq *_rdna4AccelThunks+8(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator24freeEv
 __ZN22IOGraphicsAccelerator24freeEv:
-	jmpq *_rdna4AccelThunks+8(%rip)
+	jmpq *_rdna4AccelThunks+16(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator213setPropertiesEP8OSObject
 __ZN22IOGraphicsAccelerator213setPropertiesEP8OSObject:
-	jmpq *_rdna4AccelThunks+16(%rip)
+	jmpq *_rdna4AccelThunks+24(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator216requestTerminateEP9IOServicej
 __ZN22IOGraphicsAccelerator216requestTerminateEP9IOServicej:
-	jmpq *_rdna4AccelThunks+24(%rip)
+	jmpq *_rdna4AccelThunks+32(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator212didTerminateEP9IOServicejPb
 __ZN22IOGraphicsAccelerator212didTerminateEP9IOServicejPb:
-	jmpq *_rdna4AccelThunks+32(%rip)
+	jmpq *_rdna4AccelThunks+40(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator215configureReportEP19IOReportChannelListjPvS2_
 __ZN22IOGraphicsAccelerator215configureReportEP19IOReportChannelListjPvS2_:
-	jmpq *_rdna4AccelThunks+40(%rip)
+	jmpq *_rdna4AccelThunks+48(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator212updateReportEP19IOReportChannelListjPvS2_
 __ZN22IOGraphicsAccelerator212updateReportEP19IOReportChannelListjPvS2_:
-	jmpq *_rdna4AccelThunks+48(%rip)
+	jmpq *_rdna4AccelThunks+56(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator25startEP9IOService
 __ZN22IOGraphicsAccelerator25startEP9IOService:
-	jmpq *_rdna4AccelThunks+56(%rip)
+	jmpq *_rdna4AccelThunks+64(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator24stopEP9IOService
 __ZN22IOGraphicsAccelerator24stopEP9IOService:
-	jmpq *_rdna4AccelThunks+64(%rip)
+	jmpq *_rdna4AccelThunks+72(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator29terminateEj
 __ZN22IOGraphicsAccelerator29terminateEj:
-	jmpq *_rdna4AccelThunks+72(%rip)
+	jmpq *_rdna4AccelThunks+80(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator28finalizeEj
 __ZN22IOGraphicsAccelerator28finalizeEj:
-	jmpq *_rdna4AccelThunks+80(%rip)
+	jmpq *_rdna4AccelThunks+88(%rip)
 	.p2align 4
 	.private_extern __ZNK22IOGraphicsAccelerator211getWorkLoopEv
 __ZNK22IOGraphicsAccelerator211getWorkLoopEv:
-	jmpq *_rdna4AccelThunks+88(%rip)
+	jmpq *_rdna4AccelThunks+96(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator212requestProbeEj
 __ZN22IOGraphicsAccelerator212requestProbeEj:
-	jmpq *_rdna4AccelThunks+96(%rip)
+	jmpq *_rdna4AccelThunks+104(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator27messageEjP9IOServicePv
 __ZN22IOGraphicsAccelerator27messageEjP9IOServicePv:
-	jmpq *_rdna4AccelThunks+104(%rip)
+	jmpq *_rdna4AccelThunks+112(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator213newUserClientEP4taskPvjPP12IOUserClient
 __ZN22IOGraphicsAccelerator213newUserClientEP4taskPvjPP12IOUserClient:
-	jmpq *_rdna4AccelThunks+112(%rip)
+	jmpq *_rdna4AccelThunks+120(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator218acceleratorDidLockEPKci
 __ZN22IOGraphicsAccelerator218acceleratorDidLockEPKci:
-	jmpq *_rdna4AccelThunks+120(%rip)
+	jmpq *_rdna4AccelThunks+128(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator221acceleratorWillUnlockEPKci
 __ZN22IOGraphicsAccelerator221acceleratorWillUnlockEPKci:
-	jmpq *_rdna4AccelThunks+128(%rip)
+	jmpq *_rdna4AccelThunks+136(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator212tmpTotalVRAMEv
 __ZN22IOGraphicsAccelerator212tmpTotalVRAMEv:
-	jmpq *_rdna4AccelThunks+136(%rip)
+	jmpq *_rdna4AccelThunks+144(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator218totalTextureMemoryEv
 __ZN22IOGraphicsAccelerator218totalTextureMemoryEv:
-	jmpq *_rdna4AccelThunks+144(%rip)
+	jmpq *_rdna4AccelThunks+152(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator26isIdleEv
 __ZN22IOGraphicsAccelerator26isIdleEv:
-	jmpq *_rdna4AccelThunks+152(%rip)
+	jmpq *_rdna4AccelThunks+160(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator218createEventMachineEv
 __ZN22IOGraphicsAccelerator218createEventMachineEv:
-	jmpq *_rdna4AccelThunks+160(%rip)
+	jmpq *_rdna4AccelThunks+168(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator217newClientSharedROEv
 __ZN22IOGraphicsAccelerator217newClientSharedROEv:
-	jmpq *_rdna4AccelThunks+168(%rip)
+	jmpq *_rdna4AccelThunks+176(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator217newClientSharedRWEv
 __ZN22IOGraphicsAccelerator217newClientSharedRWEv:
-	jmpq *_rdna4AccelThunks+176(%rip)
+	jmpq *_rdna4AccelThunks+184(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator220deleteClientSharedROEP21IOAccelClientSharedRO
 __ZN22IOGraphicsAccelerator220deleteClientSharedROEP21IOAccelClientSharedRO:
-	jmpq *_rdna4AccelThunks+184(%rip)
+	jmpq *_rdna4AccelThunks+192(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator220deleteClientSharedRWEP21IOAccelClientSharedRW
 __ZN22IOGraphicsAccelerator220deleteClientSharedRWEP21IOAccelClientSharedRW:
-	jmpq *_rdna4AccelThunks+192(%rip)
+	jmpq *_rdna4AccelThunks+200(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator212createSharedEP4task
 __ZN22IOGraphicsAccelerator212createSharedEP4task:
-	jmpq *_rdna4AccelThunks+200(%rip)
+	jmpq *_rdna4AccelThunks+208(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator215createSysMemoryEv
 __ZN22IOGraphicsAccelerator215createSysMemoryEv:
-	jmpq *_rdna4AccelThunks+208(%rip)
+	jmpq *_rdna4AccelThunks+216(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator215createVidMemoryEP14IOAccelShared2P16IOAccelResource2yPv
 __ZN22IOGraphicsAccelerator215createVidMemoryEP14IOAccelShared2P16IOAccelResource2yPv:
-	jmpq *_rdna4AccelThunks+216(%rip)
+	jmpq *_rdna4AccelThunks+224(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator215createMemoryMapEP11IOAccelTaskP13IOAccelMemoryj
 __ZN22IOGraphicsAccelerator215createMemoryMapEP11IOAccelTaskP13IOAccelMemoryj:
-	jmpq *_rdna4AccelThunks+224(%rip)
+	jmpq *_rdna4AccelThunks+232(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator214createResourceEP14IOAccelShared2j
 __ZN22IOGraphicsAccelerator214createResourceEP14IOAccelShared2j:
-	jmpq *_rdna4AccelThunks+232(%rip)
+	jmpq *_rdna4AccelThunks+240(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator223createCommandDescriptorEv
 __ZN22IOGraphicsAccelerator223createCommandDescriptorEv:
-	jmpq *_rdna4AccelThunks+240(%rip)
+	jmpq *_rdna4AccelThunks+248(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator223deleteCommandDescriptorEP24IOAccelCommandDescriptor
 __ZN22IOGraphicsAccelerator223deleteCommandDescriptorEP24IOAccelCommandDescriptor:
-	jmpq *_rdna4AccelThunks+248(%rip)
+	jmpq *_rdna4AccelThunks+256(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator213newBlockFenceEv
 __ZN22IOGraphicsAccelerator213newBlockFenceEv:
-	jmpq *_rdna4AccelThunks+256(%rip)
+	jmpq *_rdna4AccelThunks+264(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator211scrubEventsEv
 __ZN22IOGraphicsAccelerator211scrubEventsEv:
-	jmpq *_rdna4AccelThunks+264(%rip)
+	jmpq *_rdna4AccelThunks+272(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator214createDrawableEP14IOAccelSurfaceP14IOAccelShared2b
 __ZN22IOGraphicsAccelerator214createDrawableEP14IOAccelSurfaceP14IOAccelShared2b:
-	jmpq *_rdna4AccelThunks+272(%rip)
+	jmpq *_rdna4AccelThunks+280(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator224resourceTypeForIOSurfaceEP9IOSurface
 __ZN22IOGraphicsAccelerator224resourceTypeForIOSurfaceEP9IOSurface:
-	jmpq *_rdna4AccelThunks+280(%rip)
+	jmpq *_rdna4AccelThunks+288(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator217createDisplayPipeEP13IOFramebufferj
 __ZN22IOGraphicsAccelerator217createDisplayPipeEP13IOFramebufferj:
-	jmpq *_rdna4AccelThunks+288(%rip)
+	jmpq *_rdna4AccelThunks+296(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator238createMemoryDescriptorWithAddressRangeEyyjP4task
 __ZN22IOGraphicsAccelerator238createMemoryDescriptorWithAddressRangeEyyjP4task:
-	jmpq *_rdna4AccelThunks+296(%rip)
+	jmpq *_rdna4AccelThunks+304(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator252createMemoryDescriptorWithPersistentMemoryDescriptorEP18IOMemoryDescriptor
 __ZN22IOGraphicsAccelerator252createMemoryDescriptorWithPersistentMemoryDescriptorEP18IOMemoryDescriptor:
-	jmpq *_rdna4AccelThunks+304(%rip)
+	jmpq *_rdna4AccelThunks+312(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator239createBufferMemoryDescriptorWithOptionsEjmm
 __ZN22IOGraphicsAccelerator239createBufferMemoryDescriptorWithOptionsEjmm:
-	jmpq *_rdna4AccelThunks+312(%rip)
+	jmpq *_rdna4AccelThunks+320(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator245createBufferMemoryDescriptorInTaskWithOptionsEP4taskjmm
 __ZN22IOGraphicsAccelerator245createBufferMemoryDescriptorInTaskWithOptionsEP4taskjmm:
-	jmpq *_rdna4AccelThunks+320(%rip)
+	jmpq *_rdna4AccelThunks+328(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator218freeAllGPUMappingsEv
 __ZN22IOGraphicsAccelerator218freeAllGPUMappingsEv:
-	jmpq *_rdna4AccelThunks+328(%rip)
+	jmpq *_rdna4AccelThunks+336(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator226freeWaitToPrepareVidMemoryEP16IOAccelVidMemorybb
 __ZN22IOGraphicsAccelerator226freeWaitToPrepareVidMemoryEP16IOAccelVidMemorybb:
-	jmpq *_rdna4AccelThunks+336(%rip)
+	jmpq *_rdna4AccelThunks+344(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator223freeWaitToPrepareVidMapEP16IOAccelMemoryMapbb
 __ZN22IOGraphicsAccelerator223freeWaitToPrepareVidMapEP16IOAccelMemoryMapbb:
-	jmpq *_rdna4AccelThunks+344(%rip)
+	jmpq *_rdna4AccelThunks+352(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator218unwireAllVidMemoryEv
 __ZN22IOGraphicsAccelerator218unwireAllVidMemoryEv:
-	jmpq *_rdna4AccelThunks+352(%rip)
+	jmpq *_rdna4AccelThunks+360(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator224freeAllVidMemoryMappingsEv
 __ZN22IOGraphicsAccelerator224freeAllVidMemoryMappingsEv:
-	jmpq *_rdna4AccelThunks+360(%rip)
+	jmpq *_rdna4AccelThunks+368(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator222pageoffSurfaceInLinearEv
 __ZN22IOGraphicsAccelerator222pageoffSurfaceInLinearEv:
-	jmpq *_rdna4AccelThunks+368(%rip)
+	jmpq *_rdna4AccelThunks+376(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator226freeWaitToPrepareSysMemoryEP16IOAccelSysMemoryb
 __ZN22IOGraphicsAccelerator226freeWaitToPrepareSysMemoryEP16IOAccelSysMemoryb:
-	jmpq *_rdna4AccelThunks+376(%rip)
+	jmpq *_rdna4AccelThunks+384(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator223freeWaitToPrepareSysMapEP16IOAccelMemoryMapb
 __ZN22IOGraphicsAccelerator223freeWaitToPrepareSysMapEP16IOAccelMemoryMapb:
-	jmpq *_rdna4AccelThunks+384(%rip)
+	jmpq *_rdna4AccelThunks+392(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator218collectGartWiringsEv
 __ZN22IOGraphicsAccelerator218collectGartWiringsEv:
-	jmpq *_rdna4AccelThunks+392(%rip)
+	jmpq *_rdna4AccelThunks+400(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator218unwireAllSysMemoryEv
 __ZN22IOGraphicsAccelerator218unwireAllSysMemoryEv:
-	jmpq *_rdna4AccelThunks+400(%rip)
+	jmpq *_rdna4AccelThunks+408(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator224freeAllSysMemoryMappingsEv
 __ZN22IOGraphicsAccelerator224freeAllSysMemoryMappingsEv:
-	jmpq *_rdna4AccelThunks+408(%rip)
+	jmpq *_rdna4AccelThunks+416(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator225getMaxSingleSysMemorySizeEv
 __ZN22IOGraphicsAccelerator225getMaxSingleSysMemorySizeEv:
-	jmpq *_rdna4AccelThunks+416(%rip)
+	jmpq *_rdna4AccelThunks+424(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator224getMaxWiredSysMemorySizeEv
 __ZN22IOGraphicsAccelerator224getMaxWiredSysMemorySizeEv:
-	jmpq *_rdna4AccelThunks+424(%rip)
+	jmpq *_rdna4AccelThunks+432(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator219acceleratorFinalizeEv
 __ZN22IOGraphicsAccelerator219acceleratorFinalizeEv:
-	jmpq *_rdna4AccelThunks+432(%rip)
+	jmpq *_rdna4AccelThunks+440(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator214submitSwapCopyEP12IOAccelEventP16IOAccelResource2S3_
 __ZN22IOGraphicsAccelerator214submitSwapCopyEP12IOAccelEventP16IOAccelResource2S3_:
-	jmpq *_rdna4AccelThunks+440(%rip)
+	jmpq *_rdna4AccelThunks+448(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator229calcMaxGPUPhysicalMemoryBytesEy
 __ZN22IOGraphicsAccelerator229calcMaxGPUPhysicalMemoryBytesEy:
-	jmpq *_rdna4AccelThunks+448(%rip)
+	jmpq *_rdna4AccelThunks+456(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator215systemWillSleepEv
 __ZN22IOGraphicsAccelerator215systemWillSleepEv:
-	jmpq *_rdna4AccelThunks+456(%rip)
+	jmpq *_rdna4AccelThunks+464(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator213systemDidWakeEv
 __ZN22IOGraphicsAccelerator213systemDidWakeEv:
-	jmpq *_rdna4AccelThunks+464(%rip)
+	jmpq *_rdna4AccelThunks+472(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator221systemWillChangeSpeedEv
 __ZN22IOGraphicsAccelerator221systemWillChangeSpeedEv:
-	jmpq *_rdna4AccelThunks+472(%rip)
+	jmpq *_rdna4AccelThunks+480(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator220systemDidChangeSpeedEv
 __ZN22IOGraphicsAccelerator220systemDidChangeSpeedEv:
-	jmpq *_rdna4AccelThunks+480(%rip)
+	jmpq *_rdna4AccelThunks+488(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator216configIsHeadlessEv
 __ZN22IOGraphicsAccelerator216configIsHeadlessEv:
-	jmpq *_rdna4AccelThunks+488(%rip)
+	jmpq *_rdna4AccelThunks+496(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator29newSharedEv
 __ZN22IOGraphicsAccelerator29newSharedEv:
-	jmpq *_rdna4AccelThunks+496(%rip)
+	jmpq *_rdna4AccelThunks+504(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator219newSharedUserClientEv
 __ZN22IOGraphicsAccelerator219newSharedUserClientEv:
-	jmpq *_rdna4AccelThunks+504(%rip)
+	jmpq *_rdna4AccelThunks+512(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator29newDeviceEv
 __ZN22IOGraphicsAccelerator29newDeviceEv:
-	jmpq *_rdna4AccelThunks+512(%rip)
+	jmpq *_rdna4AccelThunks+520(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator214newDisplayPipeEv
 __ZN22IOGraphicsAccelerator214newDisplayPipeEv:
-	jmpq *_rdna4AccelThunks+520(%rip)
+	jmpq *_rdna4AccelThunks+528(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator211newDrawableEv
 __ZN22IOGraphicsAccelerator211newDrawableEv:
-	jmpq *_rdna4AccelThunks+528(%rip)
+	jmpq *_rdna4AccelThunks+536(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator210newContextEj
 __ZN22IOGraphicsAccelerator210newContextEj:
-	jmpq *_rdna4AccelThunks+536(%rip)
+	jmpq *_rdna4AccelThunks+544(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator220newCommandDescriptorEv
 __ZN22IOGraphicsAccelerator220newCommandDescriptorEv:
-	jmpq *_rdna4AccelThunks+544(%rip)
+	jmpq *_rdna4AccelThunks+552(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator213newStatisticsEv
 __ZN22IOGraphicsAccelerator213newStatisticsEv:
-	jmpq *_rdna4AccelThunks+552(%rip)
+	jmpq *_rdna4AccelThunks+560(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator218getMaxResourceSizeEv
 __ZN22IOGraphicsAccelerator218getMaxResourceSizeEv:
-	jmpq *_rdna4AccelThunks+560(%rip)
+	jmpq *_rdna4AccelThunks+568(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator215newRemoteMemoryEv
 __ZN22IOGraphicsAccelerator215newRemoteMemoryEv:
-	jmpq *_rdna4AccelThunks+568(%rip)
+	jmpq *_rdna4AccelThunks+576(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator218createRemoteMemoryEP14IOAccelShared2yjj
 __ZN22IOGraphicsAccelerator218createRemoteMemoryEP14IOAccelShared2yjj:
-	jmpq *_rdna4AccelThunks+576(%rip)
+	jmpq *_rdna4AccelThunks+584(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator220newContextEventFenceEv
 __ZN22IOGraphicsAccelerator220newContextEventFenceEv:
-	jmpq *_rdna4AccelThunks+584(%rip)
+	jmpq *_rdna4AccelThunks+592(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator218createIODMACommandEv
 __ZN22IOGraphicsAccelerator218createIODMACommandEv:
-	jmpq *_rdna4AccelThunks+592(%rip)
+	jmpq *_rdna4AccelThunks+600(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator26triageEPPcPy
 __ZN22IOGraphicsAccelerator26triageEPPcPy:
-	jmpq *_rdna4AccelThunks+600(%rip)
+	jmpq *_rdna4AccelThunks+608(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator231_RESERVEDIOGraphicsAccelerator3Ev
 __ZN22IOGraphicsAccelerator231_RESERVEDIOGraphicsAccelerator3Ev:
-	jmpq *_rdna4AccelThunks+608(%rip)
+	jmpq *_rdna4AccelThunks+616(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator231_RESERVEDIOGraphicsAccelerator4Ev
 __ZN22IOGraphicsAccelerator231_RESERVEDIOGraphicsAccelerator4Ev:
-	jmpq *_rdna4AccelThunks+616(%rip)
+	jmpq *_rdna4AccelThunks+624(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator231_RESERVEDIOGraphicsAccelerator5Ev
 __ZN22IOGraphicsAccelerator231_RESERVEDIOGraphicsAccelerator5Ev:
-	jmpq *_rdna4AccelThunks+624(%rip)
+	jmpq *_rdna4AccelThunks+632(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator225describeDriverAllocationsEP21IOAccelAllocationInfo
 __ZN22IOGraphicsAccelerator225describeDriverAllocationsEP21IOAccelAllocationInfo:
-	jmpq *_rdna4AccelThunks+632(%rip)
+	jmpq *_rdna4AccelThunks+640(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator215newCommandQueueEv
 __ZN22IOGraphicsAccelerator215newCommandQueueEv:
-	jmpq *_rdna4AccelThunks+640(%rip)
+	jmpq *_rdna4AccelThunks+648(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator218ktraceStateChangedEv
 __ZN22IOGraphicsAccelerator218ktraceStateChangedEv:
-	jmpq *_rdna4AccelThunks+648(%rip)
+	jmpq *_rdna4AccelThunks+656(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator2C2EPK11OSMetaClass
 __ZN22IOGraphicsAccelerator2C2EPK11OSMetaClass:
-	jmpq *_rdna4AccelThunks+656(%rip)
+	jmpq *_rdna4AccelThunks+664(%rip)
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator2D2Ev
 __ZN22IOGraphicsAccelerator2D2Ev:
-	jmpq *_rdna4AccelThunks+664(%rip)
+	jmpq *_rdna4AccelThunks+672(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTaskD1Ev
+__ZN11IOAccelTaskD1Ev:
+	jmpq *_rdna4AccelThunks+680(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTaskD0Ev
+__ZN11IOAccelTaskD0Ev:
+	jmpq *_rdna4AccelThunks+688(%rip)
+	.p2align 4
+	.private_extern __ZNK11IOAccelTask7releaseEv
+__ZNK11IOAccelTask7releaseEv:
+	jmpq *_rdna4AccelThunks+696(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask4freeEv
+__ZN11IOAccelTask4freeEv:
+	jmpq *_rdna4AccelThunks+704(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask4initEP22IOGraphicsAccelerator2jPP16IORangeAllocator
+__ZN11IOAccelTask4initEP22IOGraphicsAccelerator2jPP16IORangeAllocator:
+	jmpq *_rdna4AccelThunks+712(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask21freeToAllocGPUAddressEP16IOAccelMemoryMap
+__ZN11IOAccelTask21freeToAllocGPUAddressEP16IOAccelMemoryMap:
+	jmpq *_rdna4AccelThunks+720(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask18freeAllGPUMappingsEv
+__ZN11IOAccelTask18freeAllGPUMappingsEv:
+	jmpq *_rdna4AccelThunks+728(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask24freeAllSysMemoryMappingsEv
+__ZN11IOAccelTask24freeAllSysMemoryMappingsEv:
+	jmpq *_rdna4AccelThunks+736(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask24freeAllVidMemoryMappingsEv
+__ZN11IOAccelTask24freeAllVidMemoryMappingsEv:
+	jmpq *_rdna4AccelThunks+744(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask8allocateEPK16IOAccelMemoryMap
+__ZN11IOAccelTask8allocateEPK16IOAccelMemoryMap:
+	jmpq *_rdna4AccelThunks+752(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask10deallocateEPK16IOAccelMemoryMapy
+__ZN11IOAccelTask10deallocateEPK16IOAccelMemoryMapy:
+	jmpq *_rdna4AccelThunks+760(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask7reserveEjyy
+__ZN11IOAccelTask7reserveEjyy:
+	jmpq *_rdna4AccelThunks+768(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask25describeDriverAllocationsEP21IOAccelAllocationInfo
+__ZN11IOAccelTask25describeDriverAllocationsEP21IOAccelAllocationInfo:
+	jmpq *_rdna4AccelThunks+776(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask21_RESERVEDIOAccelTask0Ev
+__ZN11IOAccelTask21_RESERVEDIOAccelTask0Ev:
+	jmpq *_rdna4AccelThunks+784(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask21_RESERVEDIOAccelTask1Ev
+__ZN11IOAccelTask21_RESERVEDIOAccelTask1Ev:
+	jmpq *_rdna4AccelThunks+792(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask21_RESERVEDIOAccelTask2Ev
+__ZN11IOAccelTask21_RESERVEDIOAccelTask2Ev:
+	jmpq *_rdna4AccelThunks+800(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask21_RESERVEDIOAccelTask3Ev
+__ZN11IOAccelTask21_RESERVEDIOAccelTask3Ev:
+	jmpq *_rdna4AccelThunks+808(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask21_RESERVEDIOAccelTask4Ev
+__ZN11IOAccelTask21_RESERVEDIOAccelTask4Ev:
+	jmpq *_rdna4AccelThunks+816(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask21_RESERVEDIOAccelTask5Ev
+__ZN11IOAccelTask21_RESERVEDIOAccelTask5Ev:
+	jmpq *_rdna4AccelThunks+824(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTask25freeWaitToAllocGPUAddressEP16IOAccelMemoryMapb
+__ZN11IOAccelTask25freeWaitToAllocGPUAddressEP16IOAccelMemoryMapb:
+	jmpq *_rdna4AccelThunks+832(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTaskC2EPK11OSMetaClass
+__ZN11IOAccelTaskC2EPK11OSMetaClass:
+	jmpq *_rdna4AccelThunks+840(%rip)
+	.p2align 4
+	.private_extern __ZN11IOAccelTaskD2Ev
+__ZN11IOAccelTaskD2Ev:
+	jmpq *_rdna4AccelThunks+848(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMapD1Ev
+__ZN16IOAccelMemoryMapD1Ev:
+	jmpq *_rdna4AccelThunks+856(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMapD0Ev
+__ZN16IOAccelMemoryMapD0Ev:
+	jmpq *_rdna4AccelThunks+864(%rip)
+	.p2align 4
+	.private_extern __ZNK16IOAccelMemoryMap7releaseEv
+__ZNK16IOAccelMemoryMap7releaseEv:
+	jmpq *_rdna4AccelThunks+872(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap4freeEv
+__ZN16IOAccelMemoryMap4freeEv:
+	jmpq *_rdna4AccelThunks+880(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap4initEP22IOGraphicsAccelerator2P11IOAccelTaskP13IOAccelMemoryj
+__ZN16IOAccelMemoryMap4initEP22IOGraphicsAccelerator2P11IOAccelTaskP13IOAccelMemoryj:
+	jmpq *_rdna4AccelThunks+888(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap15matchOptionBitsEj
+__ZN16IOAccelMemoryMap15matchOptionBitsEj:
+	jmpq *_rdna4AccelThunks+896(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap20getGPUVirtualAddressEv
+__ZN16IOAccelMemoryMap20getGPUVirtualAddressEv:
+	jmpq *_rdna4AccelThunks+904(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap34getGPUVirtualAddressForUserProcessEv
+__ZN16IOAccelMemoryMap34getGPUVirtualAddressForUserProcessEv:
+	jmpq *_rdna4AccelThunks+912(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap7prepareEv
+__ZN16IOAccelMemoryMap7prepareEv:
+	jmpq *_rdna4AccelThunks+920(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap8completeEv
+__ZN16IOAccelMemoryMap8completeEv:
+	jmpq *_rdna4AccelThunks+928(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap14compatibleWithEPS_
+__ZN16IOAccelMemoryMap14compatibleWithEPS_:
+	jmpq *_rdna4AccelThunks+936(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap22allocGPUVirtualAddressEv
+__ZN16IOAccelMemoryMap22allocGPUVirtualAddressEv:
+	jmpq *_rdna4AccelThunks+944(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap24reserveGPUVirtualAddressEyy
+__ZN16IOAccelMemoryMap24reserveGPUVirtualAddressEyy:
+	jmpq *_rdna4AccelThunks+952(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap21freeGPUVirtualAddressEv
+__ZN16IOAccelMemoryMap21freeGPUVirtualAddressEv:
+	jmpq *_rdna4AccelThunks+960(%rip)
+	.p2align 4
+	.private_extern __ZNK16IOAccelMemoryMap9getLengthEv
+__ZNK16IOAccelMemoryMap9getLengthEv:
+	jmpq *_rdna4AccelThunks+968(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap40getGPUVirtualAddressLengthForUserProcessEv
+__ZN16IOAccelMemoryMap40getGPUVirtualAddressLengthForUserProcessEv:
+	jmpq *_rdna4AccelThunks+976(%rip)
+	.p2align 4
+	.private_extern __ZNK16IOAccelMemoryMap34getAssignedGPUVirtualAddressLengthEv
+__ZNK16IOAccelMemoryMap34getAssignedGPUVirtualAddressLengthEv:
+	jmpq *_rdna4AccelThunks+984(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap26_RESERVEDIOAccelMemoryMap1Ev
+__ZN16IOAccelMemoryMap26_RESERVEDIOAccelMemoryMap1Ev:
+	jmpq *_rdna4AccelThunks+992(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap26_RESERVEDIOAccelMemoryMap2Ev
+__ZN16IOAccelMemoryMap26_RESERVEDIOAccelMemoryMap2Ev:
+	jmpq *_rdna4AccelThunks+1000(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap26_RESERVEDIOAccelMemoryMap3Ev
+__ZN16IOAccelMemoryMap26_RESERVEDIOAccelMemoryMap3Ev:
+	jmpq *_rdna4AccelThunks+1008(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap26_RESERVEDIOAccelMemoryMap4Ev
+__ZN16IOAccelMemoryMap26_RESERVEDIOAccelMemoryMap4Ev:
+	jmpq *_rdna4AccelThunks+1016(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap26_RESERVEDIOAccelMemoryMap5Ev
+__ZN16IOAccelMemoryMap26_RESERVEDIOAccelMemoryMap5Ev:
+	jmpq *_rdna4AccelThunks+1024(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap8redirectEP13IOAccelMemory
+__ZN16IOAccelMemoryMap8redirectEP13IOAccelMemory:
+	jmpq *_rdna4AccelThunks+1032(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMapC2EPK11OSMetaClass
+__ZN16IOAccelMemoryMapC2EPK11OSMetaClass:
+	jmpq *_rdna4AccelThunks+1040(%rip)
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMapD2Ev
+__ZN16IOAccelMemoryMapD2Ev:
+	jmpq *_rdna4AccelThunks+1048(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine2D1Ev
+__ZN20IOAccelEventMachine2D1Ev:
+	jmpq *_rdna4AccelThunks+1056(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine2D0Ev
+__ZN20IOAccelEventMachine2D0Ev:
+	jmpq *_rdna4AccelThunks+1064(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine24freeEv
+__ZN20IOAccelEventMachine24freeEv:
+	jmpq *_rdna4AccelThunks+1072(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine24initEP22IOGraphicsAccelerator2ji
+__ZN20IOAccelEventMachine24initEP22IOGraphicsAccelerator2ji:
+	jmpq *_rdna4AccelThunks+1080(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine212getNumStampsEv
+__ZN20IOAccelEventMachine212getNumStampsEv:
+	jmpq *_rdna4AccelThunks+1088(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine219setStampBaseAddressEPVj
+__ZN20IOAccelEventMachine219setStampBaseAddressEPVj:
+	jmpq *_rdna4AccelThunks+1096(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine214getStampOffsetEi
+__ZN20IOAccelEventMachine214getStampOffsetEi:
+	jmpq *_rdna4AccelThunks+1104(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine211signalStampEij
+__ZN20IOAccelEventMachine211signalStampEij:
+	jmpq *_rdna4AccelThunks+1112(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine227collectAllLiveEventIfNeededEv
+__ZN20IOAccelEventMachine227collectAllLiveEventIfNeededEv:
+	jmpq *_rdna4AccelThunks+1120(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine212waitForStampEijPj
+__ZN20IOAccelEventMachine212waitForStampEijPj:
+	jmpq *_rdna4AccelThunks+1128(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine220enableStampInterruptEi
+__ZN20IOAccelEventMachine220enableStampInterruptEi:
+	jmpq *_rdna4AccelThunks+1136(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine221disableStampInterruptEi
+__ZN20IOAccelEventMachine221disableStampInterruptEi:
+	jmpq *_rdna4AccelThunks+1144(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine224deviceTerminatedUnlockedEv
+__ZN20IOAccelEventMachine224deviceTerminatedUnlockedEv:
+	jmpq *_rdna4AccelThunks+1152(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine24stopEv
+__ZN20IOAccelEventMachine24stopEv:
+	jmpq *_rdna4AccelThunks+1160(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine229_RESERVEDIOAccelEventMachine2Ev
+__ZN20IOAccelEventMachine229_RESERVEDIOAccelEventMachine2Ev:
+	jmpq *_rdna4AccelThunks+1168(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine229_RESERVEDIOAccelEventMachine3Ev
+__ZN20IOAccelEventMachine229_RESERVEDIOAccelEventMachine3Ev:
+	jmpq *_rdna4AccelThunks+1176(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine229_RESERVEDIOAccelEventMachine4Ev
+__ZN20IOAccelEventMachine229_RESERVEDIOAccelEventMachine4Ev:
+	jmpq *_rdna4AccelThunks+1184(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine229_RESERVEDIOAccelEventMachine5Ev
+__ZN20IOAccelEventMachine229_RESERVEDIOAccelEventMachine5Ev:
+	jmpq *_rdna4AccelThunks+1192(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine2C2EPK11OSMetaClass
+__ZN20IOAccelEventMachine2C2EPK11OSMetaClass:
+	jmpq *_rdna4AccelThunks+1200(%rip)
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine2D2Ev
+__ZN20IOAccelEventMachine2D2Ev:
+	jmpq *_rdna4AccelThunks+1208(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast2D1Ev
+__ZN24IOAccelEventMachineFast2D1Ev:
+	jmpq *_rdna4AccelThunks+1216(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast2D0Ev
+__ZN24IOAccelEventMachineFast2D0Ev:
+	jmpq *_rdna4AccelThunks+1224(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast24freeEv
+__ZN24IOAccelEventMachineFast24freeEv:
+	jmpq *_rdna4AccelThunks+1232(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast24initEP22IOGraphicsAccelerator2ji
+__ZN24IOAccelEventMachineFast24initEP22IOGraphicsAccelerator2ji:
+	jmpq *_rdna4AccelThunks+1240(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast222getClientTestEventFuncEv
+__ZN24IOAccelEventMachineFast222getClientTestEventFuncEv:
+	jmpq *_rdna4AccelThunks+1248(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast29initEventEP12IOAccelEvent
+__ZN24IOAccelEventMachineFast29initEventEP12IOAccelEvent:
+	jmpq *_rdna4AccelThunks+1256(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast210cleanEventEP12IOAccelEvent
+__ZN24IOAccelEventMachineFast210cleanEventEP12IOAccelEvent:
+	jmpq *_rdna4AccelThunks+1264(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast211finishStampEi
+__ZN24IOAccelEventMachineFast211finishStampEi:
+	jmpq *_rdna4AccelThunks+1272(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast215finishAllStampsEv
+__ZN24IOAccelEventMachineFast215finishAllStampsEv:
+	jmpq *_rdna4AccelThunks+1280(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast29testStampEi
+__ZN24IOAccelEventMachineFast29testStampEi:
+	jmpq *_rdna4AccelThunks+1288(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast213testAllStampsEv
+__ZN24IOAccelEventMachineFast213testAllStampsEv:
+	jmpq *_rdna4AccelThunks+1296(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast221testAllStampsUnlockedEv
+__ZN24IOAccelEventMachineFast221testAllStampsUnlockedEv:
+	jmpq *_rdna4AccelThunks+1304(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast219finishEventUnlockedEP12IOAccelEvent
+__ZN24IOAccelEventMachineFast219finishEventUnlockedEP12IOAccelEvent:
+	jmpq *_rdna4AccelThunks+1312(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast217testEventUnlockedEP12IOAccelEvent
+__ZN24IOAccelEventMachineFast217testEventUnlockedEP12IOAccelEvent:
+	jmpq *_rdna4AccelThunks+1320(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast211finishEventEP12IOAccelEvent
+__ZN24IOAccelEventMachineFast211finishEventEP12IOAccelEvent:
+	jmpq *_rdna4AccelThunks+1328(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast29testEventEP12IOAccelEvent
+__ZN24IOAccelEventMachineFast29testEventEP12IOAccelEvent:
+	jmpq *_rdna4AccelThunks+1336(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast220finishEventExcludingEP12IOAccelEventi
+__ZN24IOAccelEventMachineFast220finishEventExcludingEP12IOAccelEventi:
+	jmpq *_rdna4AccelThunks+1344(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast218testEventExcludingEP12IOAccelEventi
+__ZN24IOAccelEventMachineFast218testEventExcludingEP12IOAccelEventi:
+	jmpq *_rdna4AccelThunks+1352(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast29moveEventEP12IOAccelEventS1_
+__ZN24IOAccelEventMachineFast29moveEventEP12IOAccelEventS1_:
+	jmpq *_rdna4AccelThunks+1360(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast29copyEventEP12IOAccelEventS1_
+__ZN24IOAccelEventMachineFast29copyEventEP12IOAccelEventS1_:
+	jmpq *_rdna4AccelThunks+1368(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast210mergeEventEP12IOAccelEventS1_
+__ZN24IOAccelEventMachineFast210mergeEventEP12IOAccelEventS1_:
+	jmpq *_rdna4AccelThunks+1376(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast218copyEventExcludingEP12IOAccelEventS1_i
+__ZN24IOAccelEventMachineFast218copyEventExcludingEP12IOAccelEventS1_i:
+	jmpq *_rdna4AccelThunks+1384(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast219mergeEventExcludingEP12IOAccelEventS1_i
+__ZN24IOAccelEventMachineFast219mergeEventExcludingEP12IOAccelEventS1_i:
+	jmpq *_rdna4AccelThunks+1392(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast213setEventStampEiP12IOAccelEvent
+__ZN24IOAccelEventMachineFast213setEventStampEiP12IOAccelEvent:
+	jmpq *_rdna4AccelThunks+1400(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast214incrementStampEi
+__ZN24IOAccelEventMachineFast214incrementStampEi:
+	jmpq *_rdna4AccelThunks+1408(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast217writeStampCommandEiP17IOAccelEventQueueP17vendevtCommandRec
+__ZN24IOAccelEventMachineFast217writeStampCommandEiP17IOAccelEventQueueP17vendevtCommandRec:
+	jmpq *_rdna4AccelThunks+1416(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast222writeEventStampCommandEiP17IOAccelEventQueueP12IOAccelEventP17vendevtCommandRec
+__ZN24IOAccelEventMachineFast222writeEventStampCommandEiP17IOAccelEventQueueP12IOAccelEventP17vendevtCommandRec:
+	jmpq *_rdna4AccelThunks+1424(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast224writeEventBarrierCommandEP17IOAccelEventQueueP12IOAccelEventP17vendevtBarrierReci
+__ZN24IOAccelEventMachineFast224writeEventBarrierCommandEP17IOAccelEventQueueP12IOAccelEventP17vendevtBarrierReci:
+	jmpq *_rdna4AccelThunks+1432(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast220logCommandSubmissionEi
+__ZN24IOAccelEventMachineFast220logCommandSubmissionEi:
+	jmpq *_rdna4AccelThunks+1440(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast218stampIsIncrementedEv
+__ZN24IOAccelEventMachineFast218stampIsIncrementedEv:
+	jmpq *_rdna4AccelThunks+1448(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast28getStampEi
+__ZN24IOAccelEventMachineFast28getStampEi:
+	jmpq *_rdna4AccelThunks+1456(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast216checkGPUProgressEv
+__ZN24IOAccelEventMachineFast216checkGPUProgressEv:
+	jmpq *_rdna4AccelThunks+1464(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast220checkChannelProgressEi
+__ZN24IOAccelEventMachineFast220checkChannelProgressEi:
+	jmpq *_rdna4AccelThunks+1472(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast212eventTimeoutEi
+__ZN24IOAccelEventMachineFast212eventTimeoutEi:
+	jmpq *_rdna4AccelThunks+1480(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast224deviceTerminatedUnlockedEv
+__ZN24IOAccelEventMachineFast224deviceTerminatedUnlockedEv:
+	jmpq *_rdna4AccelThunks+1488(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast226enableEventStampInterruptsEPK12IOAccelEvent
+__ZN24IOAccelEventMachineFast226enableEventStampInterruptsEPK12IOAccelEvent:
+	jmpq *_rdna4AccelThunks+1496(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast227disableEventStampInterruptsEPK12IOAccelEvent
+__ZN24IOAccelEventMachineFast227disableEventStampInterruptsEPK12IOAccelEvent:
+	jmpq *_rdna4AccelThunks+1504(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast210scrubEventEP12IOAccelEvent
+__ZN24IOAccelEventMachineFast210scrubEventEP12IOAccelEvent:
+	jmpq *_rdna4AccelThunks+1512(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast26triageEPPcPy
+__ZN24IOAccelEventMachineFast26triageEPPcPy:
+	jmpq *_rdna4AccelThunks+1520(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast215waitForAnyStampEP12IOAccelEventPi
+__ZN24IOAccelEventMachineFast215waitForAnyStampEP12IOAccelEventPi:
+	jmpq *_rdna4AccelThunks+1528(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast0Ev
+__ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast0Ev:
+	jmpq *_rdna4AccelThunks+1536(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast1Ev
+__ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast1Ev:
+	jmpq *_rdna4AccelThunks+1544(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast2Ev
+__ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast2Ev:
+	jmpq *_rdna4AccelThunks+1552(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast3Ev
+__ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast3Ev:
+	jmpq *_rdna4AccelThunks+1560(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast4Ev
+__ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast4Ev:
+	jmpq *_rdna4AccelThunks+1568(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast5Ev
+__ZN24IOAccelEventMachineFast233_RESERVEDIOAccelEventMachineFast5Ev:
+	jmpq *_rdna4AccelThunks+1576(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast2C2EPK11OSMetaClass
+__ZN24IOAccelEventMachineFast2C2EPK11OSMetaClass:
+	jmpq *_rdna4AccelThunks+1584(%rip)
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast2D2Ev
+__ZN24IOAccelEventMachineFast2D2Ev:
+	jmpq *_rdna4AccelThunks+1592(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachineD1Ev
+__ZN21IOAccelDisplayMachineD1Ev:
+	jmpq *_rdna4AccelThunks+1600(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachineD0Ev
+__ZN21IOAccelDisplayMachineD0Ev:
+	jmpq *_rdna4AccelThunks+1608(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine4freeEv
+__ZN21IOAccelDisplayMachine4freeEv:
+	jmpq *_rdna4AccelThunks+1616(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine4initEP22IOGraphicsAccelerator2
+__ZN21IOAccelDisplayMachine4initEP22IOGraphicsAccelerator2:
+	jmpq *_rdna4AccelThunks+1624(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine5startEP11IOPCIDevice
+__ZN21IOAccelDisplayMachine5startEP11IOPCIDevice:
+	jmpq *_rdna4AccelThunks+1632(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine4stopEv
+__ZN21IOAccelDisplayMachine4stopEv:
+	jmpq *_rdna4AccelThunks+1640(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine23initFramebufferResourceEjjP13IOFramebufferP16IOAccelResource2
+__ZN21IOAccelDisplayMachine23initFramebufferResourceEjjP13IOFramebufferP16IOAccelResource2:
+	jmpq *_rdna4AccelThunks+1648(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine26destroyFramebufferResourceEjjP13IOFramebufferP16IOAccelResource2
+__ZN21IOAccelDisplayMachine26destroyFramebufferResourceEjjP13IOFramebufferP16IOAccelResource2:
+	jmpq *_rdna4AccelThunks+1656(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine6triageEPPcPy
+__ZN21IOAccelDisplayMachine6triageEPPcPy:
+	jmpq *_rdna4AccelThunks+1664(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine31_RESERVEDIOAccelDisplayMachine1Ev
+__ZN21IOAccelDisplayMachine31_RESERVEDIOAccelDisplayMachine1Ev:
+	jmpq *_rdna4AccelThunks+1672(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine31_RESERVEDIOAccelDisplayMachine2Ev
+__ZN21IOAccelDisplayMachine31_RESERVEDIOAccelDisplayMachine2Ev:
+	jmpq *_rdna4AccelThunks+1680(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine31_RESERVEDIOAccelDisplayMachine3Ev
+__ZN21IOAccelDisplayMachine31_RESERVEDIOAccelDisplayMachine3Ev:
+	jmpq *_rdna4AccelThunks+1688(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine31_RESERVEDIOAccelDisplayMachine4Ev
+__ZN21IOAccelDisplayMachine31_RESERVEDIOAccelDisplayMachine4Ev:
+	jmpq *_rdna4AccelThunks+1696(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine31_RESERVEDIOAccelDisplayMachine5Ev
+__ZN21IOAccelDisplayMachine31_RESERVEDIOAccelDisplayMachine5Ev:
+	jmpq *_rdna4AccelThunks+1704(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine26framebuffer_will_power_offEj
+__ZN21IOAccelDisplayMachine26framebuffer_will_power_offEj:
+	jmpq *_rdna4AccelThunks+1712(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine24framebuffer_did_power_onEj
+__ZN21IOAccelDisplayMachine24framebuffer_did_power_onEj:
+	jmpq *_rdna4AccelThunks+1720(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine24display_mode_will_changeEj
+__ZN21IOAccelDisplayMachine24display_mode_will_changeEj:
+	jmpq *_rdna4AccelThunks+1728(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine23display_mode_did_changeEj
+__ZN21IOAccelDisplayMachine23display_mode_did_changeEj:
+	jmpq *_rdna4AccelThunks+1736(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine17found_framebufferEP13IOFramebuffer
+__ZN21IOAccelDisplayMachine17found_framebufferEP13IOFramebuffer:
+	jmpq *_rdna4AccelThunks+1744(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachineC2EPK11OSMetaClass
+__ZN21IOAccelDisplayMachineC2EPK11OSMetaClass:
+	jmpq *_rdna4AccelThunks+1752(%rip)
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachineD2Ev
+__ZN21IOAccelDisplayMachineD2Ev:
+	jmpq *_rdna4AccelThunks+1760(%rip)
 
 	.data
 	.p2align 3
@@ -426,7 +974,164 @@ _rdna4AccelThunks:
 	.quad _rdna4AccelMissing
 	.quad _rdna4AccelMissing
 	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
+	.quad _rdna4AccelMissing
 	.p2align 4
 	.private_extern __ZN22IOGraphicsAccelerator210gMetaClassE
 __ZN22IOGraphicsAccelerator210gMetaClassE:
+	.space 64
+	.p2align 4
+	.private_extern __ZN11IOAccelTask10gMetaClassE
+__ZN11IOAccelTask10gMetaClassE:
+	.space 64
+	.p2align 4
+	.private_extern __ZN16IOAccelMemoryMap10gMetaClassE
+__ZN16IOAccelMemoryMap10gMetaClassE:
+	.space 64
+	.p2align 4
+	.private_extern __ZN20IOAccelEventMachine210gMetaClassE
+__ZN20IOAccelEventMachine210gMetaClassE:
+	.space 64
+	.p2align 4
+	.private_extern __ZN24IOAccelEventMachineFast210gMetaClassE
+__ZN24IOAccelEventMachineFast210gMetaClassE:
+	.space 64
+	.p2align 4
+	.private_extern __ZN21IOAccelDisplayMachine10gMetaClassE
+__ZN21IOAccelDisplayMachine10gMetaClassE:
 	.space 64
