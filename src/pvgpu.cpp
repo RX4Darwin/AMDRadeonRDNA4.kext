@@ -111,16 +111,19 @@ uint8_t *gPhysmap { nullptr }, *gPhysmapEnd { nullptr };
 // Physical memory at `pa` for `bytes` through the physmap, or nullptr without one or past its end.
 static uint8_t *physPtr(uint64_t pa, uint64_t bytes)
 {
-	// Check the mapping before subtracting its pointers: null (or absent) physmap bounds
-	// must never reach pointer arithmetic, even when the caller only wants a rejected range.
-	if (!gPhysmap || !gPhysmapEnd || pa + bytes < pa)
+	// Validate the bounds as integer addresses before deriving a span. A reversed
+	// or empty range must not underflow into an apparently enormous mapping.
+	const uintptr_t base = reinterpret_cast<uintptr_t>(gPhysmap);
+	const uintptr_t end = reinterpret_cast<uintptr_t>(gPhysmapEnd);
+	if (!base || end <= base)
 		return nullptr;
 
-	const uint64_t mapped = static_cast<uint64_t>(gPhysmapEnd - gPhysmap);
-	if (pa + bytes > mapped)
+	const uint64_t mapped = static_cast<uint64_t>(end - base);
+	// Subtraction-based checks avoid overflow in pa + bytes.
+	if (pa > mapped || bytes > mapped - pa)
 		return nullptr;
 
-	return gPhysmap + pa;
+	return reinterpret_cast<uint8_t *>(base + static_cast<uintptr_t>(pa));
 }
 
 // M3: the one request slot between the host and the translator helper (include/rdna4mtlc.h). The host posts a function (id != 0) and
