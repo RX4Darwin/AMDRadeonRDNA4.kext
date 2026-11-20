@@ -2815,6 +2815,79 @@ enum { kSlots = 16 };           // draws in flight: each has its own IB page and
 RDNA4_ANSWER_MISSING
 @end
 
+// ---- heaps
+
+// A heap whose resources are allocated each on its own from the device (no placement, no aliasing): what Core Animation asks of one, so
+// that it does not go without (newHeapWithDescriptor: answered nil before). ponytail: size is a budget only, used size counted roughly.
+@interface RDNA4MTLHeap : NSObject <MTLHeap>
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLHeapDescriptor *)descriptor;
+@end
+
+@implementation RDNA4MTLHeap {
+	RDNA4MTLDevice *_device;
+	NSUInteger _size, _used;
+	MTLStorageMode _storage;
+}
+@synthesize label;
+
+- (instancetype)initWithDevice:(RDNA4MTLDevice *)device descriptor:(MTLHeapDescriptor *)d
+{
+	if ((self = [super init])) {
+		_device = device;
+		_size = d.size;
+		_storage = d.storageMode;
+	}
+	return self;
+}
+
+- (id<MTLDevice>)device { return _device; }
+- (MTLStorageMode)storageMode { return _storage; }
+- (MTLCPUCacheMode)cpuCacheMode { return MTLCPUCacheModeDefaultCache; }
+- (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeTracked; }
+- (MTLResourceOptions)resourceOptions { return (MTLResourceOptions)_storage << MTLResourceStorageModeShift; }
+- (MTLHeapType)type { return MTLHeapTypeAutomatic; }
+- (NSUInteger)size { return _size; }
+- (NSUInteger)usedSize { return MIN(_used, _size); }
+- (NSUInteger)currentAllocatedSize { return _size; }
+- (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment { return _size > _used ? _size - _used : 0; }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
+
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
+{
+	_used += length;
+	return [_device newBufferWithLength:length options:options];
+}
+
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+{
+	_used += descriptor.width * descriptor.height * 4;
+	return [_device newTextureWithDescriptor:descriptor];
+}
+
+RDNA4_ANSWER_MISSING
+@end
+
+@implementation RDNA4MTLDevice (Heaps)
+
+- (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)descriptor
+{
+	return [[RDNA4MTLHeap alloc] initWithDevice:self descriptor:descriptor];
+}
+
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d
+{
+	const TextureFormat *fm = textureFormat((uint32_t)d.pixelFormat);
+	const NSUInteger row = (d.width * (fm ? fm->bpp : 4) + 255) & ~(NSUInteger)255;
+	return (MTLSizeAndAlign){ .size = row * d.height * MAX(d.depth, (NSUInteger)1) * MAX(d.arrayLength, (NSUInteger)1) * 2, .align = 256 };
+}
+
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options
+{
+	return (MTLSizeAndAlign){ .size = (length + 4095) & ~(NSUInteger)4095, .align = 4096 };
+}
+
+@end
+
 // ---- the router (the native desktop)
 
 // The paravirtual accelerator's Metal plug-in class while the kext routes it here (src/accelcensus.cpp routePv: debug.rdna4_nativemtl=2 or 3,
