@@ -474,3 +474,9 @@ names besides WindowServer that get the native device (with `rdna4-nativews=3`).
 - **Maps** (`Safari,Maps`): VectorKit aborted ("Metal returned null texture"): cube textures (type 5) are not supported yet, `newFence`
   is missing. Taken off the list.
 
+Maps on the native device, round 2: 2D array and cube textures (one level; their images laid out as a 3D texture's slices, the T#
+`linearArray2d`, typed CUBE for cubes; `replaceRegion` / `getBytes` by slice), `newFence` (an `RDNA4MTLFence`: nothing to wait for on
+one work queue), `commandBufferWithDescriptor:`. Maps then runs, its interface right, the map black: its pipelines have a
+Depth32Float_Stencil8 attachment, refused ("not yet"), and it makes 2D multisample textures. Stencil and MSAA (the PV host has both) are
+what the native device needs next for Maps and 3D apps; Maps stays off the list until then.
+

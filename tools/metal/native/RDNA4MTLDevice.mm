@@ -568,6 +568,7 @@ static RDNA4MTLBuffer *importedSurface(RDNA4MTLDevice *device, IOSurfaceRef surf
 	const TextureFormat *_fm;
 	MTLTextureType _type;   // 2D, or 1D (one row), or a 1D array (a row a layer), or 3D
 	NSUInteger _layers, _depth, _slicePitch;   // a 1D array's layers; a 3D texture's slices and the bytes from one to the next
+	NSUInteger _slices;   // a 2D array's, a cube's (6) or a cube array's 2D images, laid out as a 3D texture's slices (_slicePitch)
 	NSUInteger _levels, _levelOffset[16], _levelRow[16];   // a mipmapped 2D texture's levels: each an image of its own in _memory
 	const uint8_t *_surfaceRows;   // shadowed: the IOSurface's own pixels, _surfaceRowBytes apart; _memory is the GPU's copy
 	NSUInteger _surfaceRowBytes;
@@ -755,6 +756,12 @@ static char gCopyKey;
 
 - (void)descriptor:(uint32_t[8])t
 {
+	if (_slices) {   // a 2D array's T#, a cube's typed CUBE (11): the hardware's own pitches as a 3D image's
+		linearArray2d(t, self.gpuBase, _fm->gfx, _fm->sel, (uint32_t)_width, (uint32_t)_height, (uint32_t)_slices);
+		if (_type == MTLTextureTypeCube || _type == MTLTextureTypeCubeArray)
+			t[3] = (t[3] & 0x0fffffffu) | 11u << 28;
+		return;
+	}
 	if (_type == MTLTextureType3D) {   // the hardware's own pitches (pvdraw.hpp linearVolume; the memory laid out so in the init)
 		linearVolume(t, self.gpuBase, _fm->gfx, _fm->sel, (uint32_t)_width, (uint32_t)_height, (uint32_t)_depth);
 		return;
@@ -941,23 +948,31 @@ static char gCopyKey;
 	                  d.height == 1;
 	const BOOL threeD = d.textureType == MTLTextureType3D && d.mipmapLevelCount == 1 && d.depth >= 1 && d.depth <= 2048;
 	const BOOL twoD = d.textureType == MTLTextureType2D && d.mipmapLevelCount >= 1 && d.mipmapLevelCount <= 15;
-	if ((!twoD && !threeD && !(oneD && d.mipmapLevelCount == 1)) || d.sampleCount != 1 || !_fm || !d.width || !d.height ||
+	// 2D arrays and cubes (VectorKit's: Maps aborted on a nil 8x8 cube, 2026-11-20), one level: their images as a 3D texture's slices
+	const BOOL cube = d.textureType == MTLTextureTypeCube || d.textureType == MTLTextureTypeCubeArray;
+	NSUInteger slices = 0;
+	if (d.mipmapLevelCount == 1 && cube)
+		slices = 6 * MAX(d.arrayLength, (NSUInteger)1);
+	else if (d.mipmapLevelCount == 1 && d.textureType == MTLTextureType2DArray)
+		slices = d.arrayLength;
+	if ((!twoD && !threeD && !(oneD && d.mipmapLevelCount == 1) && !(slices && slices <= 2048)) || d.sampleCount != 1 || !_fm || !d.width || !d.height ||
 	    d.width > 16384 || d.height > 16384) {
 		rdna4Error([NSString stringWithFormat:@"a texture of type %lu, format %lu, %lux%lu, %lu layers, %lu levels, %lu samples: only 2D and 1D of "
-		                                      @"pvdraw.hpp's formats with one level and one sample so far", (unsigned long)d.textureType,
+		                                      @"pvdraw.hpp's formats with one level and one sample so far (arrays and cubes too)", (unsigned long)d.textureType,
 		                                      (unsigned long)d.pixelFormat, (unsigned long)d.width, (unsigned long)d.height,
 		                                      (unsigned long)d.arrayLength, (unsigned long)d.mipmapLevelCount, (unsigned long)d.sampleCount], 0);
 		return nil;
 	}
 	_type = d.textureType;
-	_layers = _type == MTLTextureType1DArray ? d.arrayLength : 1;
+	_layers = _type == MTLTextureType1DArray || slices ? MAX(d.arrayLength, (NSUInteger)1) : 1;
+	_slices = slices;
 	_depth = threeD ? d.depth : 1;
 	_rowBytes = (d.width * _fm->bpp + 255) & ~(NSUInteger)255;   // the colour block's pitch in whole 256-byte rows (the PV host: a multiple of 128)
 	NSUInteger bytes = _rowBytes * d.height * _layers;
-	if (threeD) {   // the hardware's pitches for a linear 3D image (pvdraw.hpp linearVolume): rows at 128 bytes, slices at 256
+	if (threeD || slices) {   // the hardware's pitches for a linear 3D image (pvdraw.hpp linearVolume): rows at 128 bytes, slices at 256
 		_rowBytes = (d.width * _fm->bpp + 127) & ~(NSUInteger)127;
 		_slicePitch = (_rowBytes * d.height + 255) & ~(NSUInteger)255;
-		bytes = _slicePitch * _depth;
+		bytes = _slicePitch * (slices ?: _depth);
 	}
 	_levels = twoD ? d.mipmapLevelCount : 1;
 	_levelRow[0] = _rowBytes;
@@ -979,7 +994,7 @@ static char gCopyKey;
 }
 
 - (id<MTLDevice>)device { return _device; }
-- (MTLTextureType)textureType { return _type == MTLTextureType1D || _type == MTLTextureType1DArray || _type == MTLTextureType3D ? _type : MTLTextureType2D; }
+- (MTLTextureType)textureType { return _type == MTLTextureType1D || _type == MTLTextureType1DArray || _type == MTLTextureType3D || _slices ? _type : MTLTextureType2D; }
 - (MTLPixelFormat)pixelFormat { return _format; }
 - (NSUInteger)width { return _width; }
 - (NSUInteger)height { return _height; }
@@ -1065,6 +1080,9 @@ static char gCopyKey;
 {
 	if (_type == MTLTextureType1DArray && slice < _layers && !level && r.origin.x + r.size.width <= _width)   // a layer is a row
 		memcpy(self.bytes + slice * _rowBytes + r.origin.x * self.bpp, bytes, r.size.width * self.bpp);
+	else if (_slices && slice < _slices && !level && [self fits:r level:0])   // an array's or cube's image: a slice
+		for (NSUInteger y = 0; y < r.size.height; y++)
+			memcpy([self at:0 x:r.origin.x y:r.origin.y + y z:slice], (const uint8_t *)bytes + y * bpr, r.size.width * self.bpp);
 	else if (_type == MTLTextureType3D && [self fits:r level:level])
 		for (NSUInteger z = 0; z < MAX(r.size.depth, (NSUInteger)1); z++)
 			for (NSUInteger y = 0; y < r.size.height; y++)
@@ -1076,7 +1094,10 @@ static char gCopyKey;
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level
            slice:(NSUInteger)slice
 {
-	if (!slice)
+	if (_slices && slice < _slices && !level && [self fits:r level:0])
+		for (NSUInteger y = 0; y < r.size.height; y++)
+			memcpy((uint8_t *)bytes + y * bpr, [self at:0 x:r.origin.x y:r.origin.y + y z:slice], r.size.width * self.bpp);
+	else if (!slice)
 		[self getBytes:bytes bytesPerRow:bpr fromRegion:r mipmapLevel:level];
 }
 
@@ -3026,6 +3047,7 @@ RDNA4_ANSWER_MISSING
 - (id<MTLDevice>)device { return _device; }
 - (id<MTLCommandBuffer>)commandBuffer { return [[RDNA4MTLCommandBuffer alloc] initWithQueue:self]; }
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
+- (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d { return [self commandBuffer]; }   // (its options: none apply)
 
 RDNA4_ANSWER_MISSING
 @end
@@ -3059,6 +3081,25 @@ enum { kMiscBytes = 0x5000, kMiscTables = 0x1000 };
 // draws in flight: each has its own IB page and state page until its fence has come. 16 kept the submit loop waiting for the card for
 // most of a frame of 80 draws, and WindowServer's main thread with it (commitAndWaitUntilSubmitted: 25 % of a window drag, 2026-11-20)
 enum { kSlots = 128, kBatchSlots = 32 };   // a batch is submitted at kBatchSlots: up to 96 slots in flight while the next is written
+
+// A fence: nothing to wait for, a command buffer's steps run in order on the device's one work queue (VectorKit makes one: Maps,
+// 2026-11-20). Encoders' updateFence: / waitForFence: are answered by RDNA4_ANSWER_MISSING (nothing).
+@interface RDNA4MTLFence : NSObject <MTLFence>
+- (instancetype)initWithDevice:(id<MTLDevice>)device;
+@end
+
+@implementation RDNA4MTLFence {
+	id<MTLDevice> __weak _device;
+}
+@synthesize label;
+- (instancetype)initWithDevice:(id<MTLDevice>)device
+{
+	if ((self = [super init]))
+		_device = device;
+	return self;
+}
+- (id<MTLDevice>)device { return _device; }
+@end
 
 @implementation RDNA4MTLDevice {
 	io_service_t _service;
@@ -3820,6 +3861,8 @@ enum { kSlots = 128, kBatchSlots = 32 };   // a batch is submitted at kBatchSlot
 		*reflection = nil;
 	return [self newComputePipelineStateWithFunction:function error:error];
 }
+
+- (id<MTLFence>)newFence { return [[RDNA4MTLFence alloc] initWithDevice:self]; }
 
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)descriptor
 {
